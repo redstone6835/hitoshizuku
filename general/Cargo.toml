@@ -1,0 +1,7 @@
+[package]
+name = "general"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libs = { path = "../libs" }

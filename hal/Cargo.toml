@@ -1,0 +1,8 @@
+[package]
+name = "hal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+arch = { path = "../arch" }
+general = { path = "../general" }

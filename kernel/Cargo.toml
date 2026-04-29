@@ -1,0 +1,9 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+general = { path = "../general" }
+hal = { path = "../hal" }
+libs = { path = "../libs" }
