@@ -1,0 +1,11 @@
+[package]
+name = "errno"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]

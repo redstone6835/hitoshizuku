@@ -1,11 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "kernel",
-    "arch",
-    "hal",
-    "general",
-    "libs",
+    "libs/errno",
+    "libs/log"
 ]
 
 [workspace.package]
