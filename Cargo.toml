@@ -2,7 +2,8 @@
 resolver = "2"
 members = [
     "libs/errno",
-    "libs/log"
+    "libs/log",
+    "libs/efi"
 ]
 
 [workspace.package]

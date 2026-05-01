@@ -1,0 +1,14 @@
+[package]
+name = "efi"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
