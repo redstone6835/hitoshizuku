@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "libs/errno",
     "libs/log",
-    "libs/efi"
+    "libs/efi",
+    "libs/elf"
 ]
 
 [workspace.package]
