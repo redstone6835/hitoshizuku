@@ -1,0 +1,13 @@
+[package]
+name = "mm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+errno = { path = "../errno" }
+log = { path = "../log" }
