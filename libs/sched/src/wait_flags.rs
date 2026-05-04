@@ -1,0 +1,143 @@
+//! `wait4` / `waitid` 的标志、目标选择、状态编码。
+//!
+//! POSIX `wstatus` 的 32 位编码：
+//!
+//! | 字段 | 位 | 含义 |
+//! |---|---|---|
+//! | 退出码 | bits 8..15 | 正常 exit(code) 时填 `(code & 0xff) << 8` |
+//! | 终止信号 | bits 0..6 | 被信号 N 杀死时填 `N` |
+//! | 核心转储位 | bit 7 | core dump 标志 |
+//! | 0x7f | bits 0..7 全 1 | WIFSTOPPED 标识 |
+//! | 0xffff | 全位 | WIFCONTINUED |
+//!
+//! 调度器内部使用 `WaitStatus(i32)`，构造器封装上述位运算；外部按需提供解码。
+
+use crate::pid::PidT;
+use crate::signal::SignalNumber;
+
+/// `wait4` / `waitid` 的标志位。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WaitOptions(pub u32);
+
+impl WaitOptions {
+    pub const WNOHANG: u32 = 0x00000001;
+    pub const WUNTRACED: u32 = 0x00000002;
+    pub const WSTOPPED: u32 = Self::WUNTRACED;
+    pub const WEXITED: u32 = 0x00000004;
+    pub const WCONTINUED: u32 = 0x00000008;
+    pub const WNOWAIT: u32 = 0x01000000;
+    pub const __WCLONE: u32 = 0x80000000;
+    pub const __WALL: u32 = 0x40000000;
+
+    pub const EMPTY: Self = Self(0);
+    pub const fn from_raw(bits: u32) -> Self {
+        Self(bits)
+    }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub const fn has(self, bit: u32) -> bool {
+        (self.0 & bit) != 0
+    }
+}
+
+/// `wait4(pid, ...)` 的 pid 参数解释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitId {
+    /// pid > 0：精确匹配。
+    Pid(PidT),
+    /// pid == -1：任意子。
+    All,
+    /// pid == 0：与调用者同 pgroup 的子。
+    SameGroup,
+    /// pid < -1：pgid == -pid 的子。
+    Pgid(PidT),
+    /// `waitid` 的 P_PIDFD（占位）。
+    Pidfd(i32),
+}
+
+impl WaitId {
+    /// 把 `wait4` 风格的 `pid` 参数解析成 [`WaitId`]。
+    pub const fn from_wait4_pid(pid: PidT) -> Self {
+        if pid > 0 {
+            Self::Pid(pid)
+        } else if pid == 0 {
+            Self::SameGroup
+        } else if pid == -1 {
+            Self::All
+        } else {
+            Self::Pgid(-pid)
+        }
+    }
+}
+
+/// POSIX `wstatus` 编码。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitStatus(pub i32);
+
+impl WaitStatus {
+    pub const fn from_raw(v: i32) -> Self {
+        Self(v)
+    }
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// 子进程正常 exit。
+    pub const fn from_exit(code: i32) -> Self {
+        Self((code & 0xff) << 8)
+    }
+
+    /// 子进程被信号 N 终止（不带 core）。
+    pub const fn from_signal(sig: SignalNumber) -> Self {
+        Self(sig.raw() as i32 & 0x7f)
+    }
+
+    /// 子进程被信号 N 终止并 core。
+    pub const fn from_signal_core(sig: SignalNumber) -> Self {
+        Self((sig.raw() as i32 & 0x7f) | 0x80)
+    }
+
+    /// 子进程被信号 N 停止（WIFSTOPPED）。
+    pub const fn from_stop(sig: SignalNumber) -> Self {
+        Self(((sig.raw() as i32) << 8) | 0x7f)
+    }
+
+    /// 子进程从停止状态恢复。
+    pub const fn continued() -> Self {
+        Self(0xffff)
+    }
+
+    pub const fn wifexited(self) -> bool {
+        (self.0 & 0x7f) == 0
+    }
+    pub const fn wexitstatus(self) -> i32 {
+        (self.0 >> 8) & 0xff
+    }
+    pub const fn wifsignaled(self) -> bool {
+        let lo = self.0 & 0x7f;
+        lo != 0 && lo != 0x7f
+    }
+    pub const fn wtermsig(self) -> i32 {
+        self.0 & 0x7f
+    }
+    pub const fn wcoredump(self) -> bool {
+        (self.0 & 0x80) != 0
+    }
+    pub const fn wifstopped(self) -> bool {
+        (self.0 & 0xff) == 0x7f
+    }
+    pub const fn wstopsig(self) -> i32 {
+        (self.0 >> 8) & 0xff
+    }
+    pub const fn wifcontinued(self) -> bool {
+        self.0 == 0xffff
+    }
+}
+
+/// `wait4` / `waitid` 的返回值。
+#[derive(Debug, Clone, Copy)]
+pub struct WaitResult {
+    pub pid: PidT,
+    pub status: WaitStatus,
+}

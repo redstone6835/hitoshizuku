@@ -5,7 +5,8 @@ members = [
     "libs/log",
     "libs/efi",
     "libs/elf",
-    "libs/mm"
+    "libs/mm",
+    "libs/sched"
 ]
 
 [workspace.package]
