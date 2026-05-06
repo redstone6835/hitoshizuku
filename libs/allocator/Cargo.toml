@@ -1,0 +1,13 @@
+[package]
+name = "allocator"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+log = { path = "../log" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
