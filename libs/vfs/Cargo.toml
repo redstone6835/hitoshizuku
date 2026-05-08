@@ -1,0 +1,13 @@
+[package]
+name = "vfs"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+errno = { path = "../errno" }
+mm = { path = "../mm" }

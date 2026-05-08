@@ -1,0 +1,639 @@
+//! 打开文件描述符（File）与文件操作接口（FileOps）。
+//!
+//! 当进程调用 `open(2)` 时，内核创建一个 [`File`] 对象并将其编号（fd）返回给
+//! 用户空间。此后进程通过 fd 进行所有 I/O 操作，而不再直接接触路径或 Inode。
+//!
+//! ### 安全设计
+//!
+//! - **能力冻结**：`File` 在创建时固化了打开标志（[`OpenOptions`]）和调用者凭据
+//!   （[`Credentials`]）。后续的 `read`/`write` 调用不再重新检查路径权限，只验证
+//!   描述符标志是否允许该操作，从而消除 TOCTOU（检查时间与使用时间之间的竞争）。
+//!   凭据以 `Arc<Credentials>` 存储，与 `VfsContext::cred` 保持一致，避免克隆。
+//!
+//! - **无裸 Inode 暴露**：`File` 持有 `Arc<Inode>` 但不对外暴露。用户空间只能
+//!   通过 fd 编号操作文件，无法直接访问内核的 Inode 结构。
+//!
+//! - **位置串行化**：文件读写偏移量（`pos`）用 `AtomicU64` 保护。
+//!   `load(Acquire)` / `store(Release)` 提供了与原先 Spinlock 相同的可见性保证，
+//!   且无锁开销。多线程并发读写同一描述符时，调用方应使用 `pread`/`pwrite`
+//!   以避免位置竞争，这与 POSIX 语义一致。
+//!
+//! - **release 语义**：[`File`] 实现 `Drop`，在析构时自动调用 [`FileOps::release`]，
+//!   保证驱动私有状态（缓冲区、打开计数等）在最后一个引用消失时被正确清理。
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::ops::ControlFlow;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use errno::Errno;
+
+use crate::vfs::dentry::SmallStr;
+
+use crate::vfs::cred::Credentials;
+use crate::vfs::error::VfsResult;
+use crate::vfs::inode::Inode;
+use crate::vfs::stat::FileStat;
+
+// ── 打开选项（Open Options） ──────────────────────────────────────────────────
+
+/// 文件访问模式，对应 `open(2)` `flags` 参数的低 2 位语义。
+///
+/// 此枚举与任何平台 ABI 数值**完全解耦**。Linux ABI 到本枚举的映射在
+/// `arch/` 层的 syscall 入口完成，VFS 内部只使用此枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessMode {
+    /// 只读打开（`O_RDONLY`）。
+    #[default]
+    ReadOnly,
+    /// 只写打开（`O_WRONLY`）。
+    WriteOnly,
+    /// 读写打开（`O_RDWR`）。
+    ReadWrite,
+}
+
+/// 文件打开选项（平台无关语义表示）。
+///
+/// 此结构体是平台无关的语义表示：每个字段对应一个独立的 `open(2)` 语义选项，
+/// 不携带任何 Linux 或具体架构 ABI 的位编号。
+/// Linux ABI 到本结构的解码在 arch 层的 `decode_open_flags` 中完成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenOptions {
+    /// 访问模式：只读/只写/读写。
+    pub access: AccessMode,
+    /// 若文件不存在则创建（`O_CREAT`）。
+    pub create: bool,
+    /// 与 `create` 合用，若文件已存在则失败（`O_EXCL`）。
+    pub exclusive: bool,
+    /// 打开时截断文件大小为 0（`O_TRUNC`）。
+    pub truncate: bool,
+    /// 每次 `write` 前原子地将偏移定位到文件末尾（`O_APPEND`）。
+    pub append: bool,
+    /// 若末端分量是符号链接，不跟随（`O_NOFOLLOW`）。
+    pub nofollow: bool,
+    /// 要求末端分量必须是目录（`O_DIRECTORY`）。
+    pub directory: bool,
+    /// 不更新 atime（`O_NOATIME`）。
+    pub noatime: bool,
+    /// 仅获取路径引用，不可 read/write（`O_PATH`）。
+    pub path_only: bool,
+    /// 非阻塞 I/O（`O_NONBLOCK`）。
+    pub nonblock: bool,
+    /// 同步写（`O_SYNC`）。
+    pub sync: bool,
+    /// 执行后关闭（`O_CLOEXEC`）。
+    pub cloexec: bool,
+}
+
+impl OpenOptions {
+    /// 判断是否可读（`ReadOnly` 或 `ReadWrite`，且非 `path_only`）。
+    pub const fn readable(self) -> bool {
+        if self.path_only {
+            return false;
+        }
+        matches!(self.access, AccessMode::ReadOnly | AccessMode::ReadWrite)
+    }
+
+    /// 判断是否可写（`WriteOnly` 或 `ReadWrite`，且非 `path_only`）。
+    pub const fn writable(self) -> bool {
+        if self.path_only {
+            return false;
+        }
+        matches!(self.access, AccessMode::WriteOnly | AccessMode::ReadWrite)
+    }
+}
+
+// ── 文件定位 ──────────────────────────────────────────────────────────────────
+
+/// `lseek(2)` 的基准点，对应 `SEEK_SET`/`SEEK_CUR`/`SEEK_END`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekFrom {
+    /// 从文件开头计算（`SEEK_SET`），`offset` 必须 ≥ 0。
+    Start(u64),
+    /// 从当前位置计算（`SEEK_CUR`），`offset` 可以为负（向前移动）。
+    Current(i64),
+    /// 从文件末尾计算（`SEEK_END`），`offset` 通常 ≤ 0。
+    End(i64),
+}
+
+// ── I/O 事件掩码（poll/select/epoll） ────────────────────────────────────────
+
+/// I/O 事件掩码，对应 `poll(2)` 的 `events`/`revents` 字段。
+///
+/// 数值与 Linux `<poll.h>` 保持一致，以便系统调用层直接透传。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PollEvents(pub u16);
+
+impl PollEvents {
+    /// 描述符可读（有数据到达，或连接关闭的 EOF）。
+    pub const POLLIN: Self = Self(0x0001);
+    /// 有高优先级数据可读（out-of-band）。
+    pub const POLLPRI: Self = Self(0x0002);
+    /// 描述符可写（发送缓冲区有空间）。
+    pub const POLLOUT: Self = Self(0x0004);
+    /// 发生错误（仅在 `revents` 中出现，`events` 中无意义）。
+    pub const POLLERR: Self = Self(0x0008);
+    /// 对端关闭连接（仅在 `revents` 中出现）。
+    pub const POLLHUP: Self = Self(0x0010);
+    /// 描述符无效（仅在 `revents` 中出现，通常表示传入了无效的 fd）。
+    pub const POLLNVAL: Self = Self(0x0020);
+
+    /// 将两个事件掩码合并。
+    pub const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    /// 判断是否包含指定事件。
+    pub const fn has(self, event: Self) -> bool {
+        self.0 & event.0 != 0
+    }
+    /// 对两个掩码求交集（常用于 interest ∩ ready）。
+    pub const fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+    /// 从当前掩码中移除指定事件。
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+    /// 返回原始位字。
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+    /// 判断是否没有任何事件就绪。
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+// ── ioctl 命令号（Linux _IOC 编码）──────────────────────────────────────────
+
+/// `ioctl(2)` 命令号的统一表示。
+///
+/// VFS 只携带和解码命令号；具体命令到设备语义的翻译由对应的 [`FileOps`]
+/// 实现完成。这样 syscall 层不需要知道底层设备类型，底层驱动也不需要直接暴露
+/// Linux ABI 号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoctlCmd(usize);
+
+impl IoctlCmd {
+    pub const IOC_NONE: usize = 0;
+    pub const IOC_WRITE: usize = 1;
+    pub const IOC_READ: usize = 2;
+
+    const IOC_NRBITS: usize = 8;
+    const IOC_TYPEBITS: usize = 8;
+    const IOC_SIZEBITS: usize = 14;
+    const IOC_DIRBITS: usize = 2;
+
+    const IOC_NRMASK: usize = (1 << Self::IOC_NRBITS) - 1;
+    const IOC_TYPEMASK: usize = (1 << Self::IOC_TYPEBITS) - 1;
+    const IOC_SIZEMASK: usize = (1 << Self::IOC_SIZEBITS) - 1;
+    const IOC_DIRMASK: usize = (1 << Self::IOC_DIRBITS) - 1;
+
+    const IOC_NRSHIFT: usize = 0;
+    const IOC_TYPESHIFT: usize = Self::IOC_NRSHIFT + Self::IOC_NRBITS;
+    const IOC_SIZESHIFT: usize = Self::IOC_TYPESHIFT + Self::IOC_TYPEBITS;
+    const IOC_DIRSHIFT: usize = Self::IOC_SIZESHIFT + Self::IOC_SIZEBITS;
+
+    pub const fn new(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    pub const fn from_parts(dir: usize, ty: usize, nr: usize, size: usize) -> Self {
+        Self(
+            ((dir & Self::IOC_DIRMASK) << Self::IOC_DIRSHIFT)
+                | ((ty & Self::IOC_TYPEMASK) << Self::IOC_TYPESHIFT)
+                | ((nr & Self::IOC_NRMASK) << Self::IOC_NRSHIFT)
+                | ((size & Self::IOC_SIZEMASK) << Self::IOC_SIZESHIFT),
+        )
+    }
+
+    pub const fn raw(self) -> usize {
+        self.0
+    }
+
+    pub const fn dir(self) -> usize {
+        (self.0 >> Self::IOC_DIRSHIFT) & Self::IOC_DIRMASK
+    }
+
+    pub const fn ty(self) -> usize {
+        (self.0 >> Self::IOC_TYPESHIFT) & Self::IOC_TYPEMASK
+    }
+
+    pub const fn nr(self) -> usize {
+        (self.0 >> Self::IOC_NRSHIFT) & Self::IOC_NRMASK
+    }
+
+    pub const fn size(self) -> usize {
+        (self.0 >> Self::IOC_SIZESHIFT) & Self::IOC_SIZEMASK
+    }
+}
+
+// ── 目录项（readdir 结果） ────────────────────────────────────────────────────
+
+/// `readdir(3)` / `getdents(2)` 返回的单个目录项。
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    /// 该条目的 inode 号。
+    pub ino: u64,
+    /// 条目名称（不含路径分隔符）。
+    ///
+    /// 使用 [`SmallStr`] 存储：≤15 字节的常见名称（`"."`, `".."`, `"bin"` 等）
+    /// 零堆分配；超过阈值时透明退化为堆字符串。
+    pub name: SmallStr,
+    /// 文件类型（用于 `d_type` 字段；部分文件系统填 `Unknown` 需调用方 stat）。
+    pub kind: crate::vfs::stat::FileType,
+}
+
+// ── 打开文件描述符 ────────────────────────────────────────────────────────────
+
+/// 打开的文件描述符，持有对文件系统对象的引用与操作方法。
+///
+/// 一个 `File` 实例在调用 `open`/`openat` 时创建，并被包装进进程的文件描述符表
+/// (`FdTable`) 中，以 `Arc<File>` 持有。`dup`/`dup2` 克隆的是 `Arc` 而不是
+/// `File` 本身，因此多个 fd 可以共享同一个 `File`（共享偏移量）。
+///
+/// 析构时（最后一个 `Arc<File>` drop）自动调用 [`FileOps::release`]，确保驱动
+/// 私有状态被正确清理，无需调用方手动关闭。
+pub struct File {
+    /// 该文件对应的 Inode（含文件系统元数据与操作）。
+    ///
+    /// 持有 Arc 确保即使文件被 `unlink` 删除，只要仍有打开的 fd，inode 就不会
+    /// 被回收（POSIX 语义：文件数据在最后一个 fd 关闭时才真正消失）。
+    pub(crate) inode: Arc<Inode>,
+
+    /// 打开时使用的选项（已经过 VFS 层验证与规范化）。
+    ///
+    /// 后续 I/O 操作只依据此字段判断权限，不再重新查询路径。
+    pub(crate) flags: OpenOptions,
+
+    /// 当前文件读写偏移量（字节），受自旋锁保护。
+    ///
+    /// 文件读写偏移量。
+    ///
+    /// 使用 `AtomicU64` 替代 `Spinlock<u64>`：实际实现中 pos 的读写已经是
+    /// "先拷贝 pos → 释放锁 → I/O → 再加锁写回"的非原子语义，`AtomicU64`
+    /// 的 `load(Acquire)` / `store(Release)` 提供相同的保证且无锁开销。
+    /// 多线程并发读写同一描述符时，调用方应使用 `pread`/`pwrite` 以避免位置竞争。
+    pub(crate) pos: AtomicU64,
+
+    /// 打开时保存的进程凭据快照（共享引用）。
+    ///
+    /// 使用 `Arc<Credentials>` 与 `VfsContext::cred` 保持一致：`open` 时从
+    /// context 克隆 Arc（增加引用计数），不复制整个 `Credentials` 结构。
+    /// 凭据冻结确保后续 I/O 不受进程后续 `setuid`/`setgid` 的影响。
+    pub(crate) cred: Arc<Credentials>,
+
+    /// 文件系统特定的打开状态与操作（如缓冲区、设备私有数据等）。
+    pub(crate) ops: Box<dyn FileOps + Send + Sync>,
+
+    /// 此文件对应的 Dentry（路径解析时的定位信息）。
+    ///
+    /// 当 `Dirfd::Fd(file)` 作为 `openat` 等系统调用的基准目录时，路径解析器
+    /// 需要知道此 File 对应哪个 Dentry（而非仅有 Inode），以便从该 Dentry 继续
+    /// 向下解析相对路径。`O_PATH` 描述符主要用于此目的。
+    pub(crate) dentry: Arc<crate::vfs::dentry::Dentry>,
+
+    /// 此文件所在的挂载点。
+    ///
+    /// `File::drop` 时自动调用 `mount.dec_open()`，保证卸载安全检查（`is_busy()`）
+    /// 的准确性：只要有打开的 fd，挂载点就不会被误判为空闲而被强制卸载。
+    pub(crate) mount: Arc<crate::vfs::mount::Mount>,
+}
+
+impl File {
+    /// 构造一个新的打开文件描述符。
+    ///
+    /// 由 VFS 层在 `InodeOps::open` 返回后调用；`dentry` 是打开的文件对应的 Dentry，
+    /// 用于 `Dirfd::Fd` 场景下的路径解析基准。
+    pub fn new(
+        inode: Arc<Inode>,
+        flags: OpenOptions,
+        cred: Arc<Credentials>,
+        ops: Box<dyn FileOps + Send + Sync>,
+        dentry: Arc<crate::vfs::dentry::Dentry>,
+        mount: Arc<crate::vfs::mount::Mount>,
+    ) -> Self {
+        Self {
+            inode,
+            flags,
+            pos: AtomicU64::new(0),
+            cred,
+            ops,
+            dentry,
+            mount,
+        }
+    }
+
+    /// 返回此文件所在挂载点的共享引用。
+    pub fn mount(&self) -> &Arc<crate::vfs::mount::Mount> {
+        &self.mount
+    }
+
+    /// 返回当前读写偏移量。
+    pub fn pos(&self) -> u64 {
+        self.pos.load(Ordering::Acquire)
+    }
+
+    /// 返回打开选项。
+    pub fn flags(&self) -> OpenOptions {
+        self.flags
+    }
+
+    /// 返回打开时冻结的凭据。
+    pub fn cred(&self) -> &Arc<Credentials> {
+        &self.cred
+    }
+
+    /// 返回对应 Inode 的共享引用。
+    pub fn inode(&self) -> &Arc<Inode> {
+        &self.inode
+    }
+
+    /// 读取数据到 `buf`，从当前偏移量开始，读完后推进偏移量。
+    ///
+    /// 对 `O_PATH` 描述符调用 `read` 将返回 `VfsError::BadFileDescriptor`。
+    pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
+        if !self.flags.readable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        let offset = self.pos.load(Ordering::Acquire);
+        let n = self.ops.read_at(buf, offset)?;
+        self.pos
+            .store(offset.saturating_add(n as u64), Ordering::Release);
+        Ok(n)
+    }
+
+    /// 将 `buf` 中的数据写入文件，从当前偏移量（或文件末尾，若 `O_APPEND`）开始。
+    pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
+        if !self.flags.writable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        if self.flags.append {
+            let n = self.ops.write_at(buf, u64::MAX)?;
+            let new_eof = self.inode.size();
+            self.pos.store(new_eof, Ordering::Release);
+            Ok(n)
+        } else {
+            let offset = self.pos.load(Ordering::Acquire);
+            let n = self.ops.write_at(buf, offset)?;
+            self.pos
+                .store(offset.saturating_add(n as u64), Ordering::Release);
+            Ok(n)
+        }
+    }
+
+    /// 在指定偏移量处读取，不改变描述符的当前偏移量（`pread64`）。
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        if !self.flags.readable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        self.ops.read_at(buf, offset)
+    }
+
+    /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。
+    pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        if !self.flags.writable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        self.ops.write_at(buf, offset)
+    }
+
+    /// 移动文件偏移量（`lseek`）。返回移动后的绝对偏移量。
+    pub fn seek(&self, from: SeekFrom) -> VfsResult<u64> {
+        let new_pos = match from {
+            SeekFrom::Start(n) => n,
+            SeekFrom::Current(n) => {
+                let cur = self.pos.load(Ordering::Acquire);
+                if n >= 0 {
+                    cur.checked_add(n as u64)
+                        .ok_or(crate::vfs::error::VfsError::InvalidArgument)?
+                } else {
+                    let abs = n.unsigned_abs();
+                    if abs > cur {
+                        return Err(crate::vfs::error::VfsError::InvalidArgument);
+                    }
+                    cur - abs
+                }
+            }
+            SeekFrom::End(n) => {
+                let size = self.inode.size();
+                if n >= 0 {
+                    size.checked_add(n as u64)
+                        .ok_or(crate::vfs::error::VfsError::InvalidArgument)?
+                } else {
+                    let abs = n.unsigned_abs();
+                    if abs > size {
+                        return Err(crate::vfs::error::VfsError::InvalidArgument);
+                    }
+                    size - abs
+                }
+            }
+        };
+        self.pos.store(new_pos, Ordering::Release);
+        Ok(new_pos)
+    }
+
+    /// 枚举目录项（`getdents`），逐条调用 `sink`。仅对 `FileType::Directory` 有效。
+    ///
+    /// 从当前内部游标（`pos`）起，将每条 [`DirEntry`] 传给 `sink`：
+    /// - `sink` 返回 `ControlFlow::Continue(())` 时继续枚举下一条；
+    /// - `sink` 返回 `ControlFlow::Break(())` 时提前停止枚举（满缓冲区场景）。
+    ///
+    /// 函数返回枚举实际停止时的新游标值（可用于下次 `readdir` 的起始位置）。
+    /// 游标语义由驱动自定义（通常为已枚举条目数；不同文件系统实现可能不同）。
+    pub fn readdir(&self, sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
+        if !self.flags.readable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        if self.inode.kind != crate::vfs::stat::FileType::Directory {
+            return Err(crate::vfs::error::VfsError::NotADirectory);
+        }
+        let pos = self.pos.load(Ordering::Acquire);
+        let new_pos = self.ops.readdir(pos, sink)?;
+        self.pos.store(new_pos, Ordering::Release);
+        Ok(new_pos)
+    }
+
+    /// 将文件操作对象向下转型为具体驱动类型 `T`。
+    ///
+    /// 这是从通用 [`File`] 恢复 [`crate::dev::char::DriverControl`] 能力的安全路径，
+    /// 与 [`crate::dev::char::CharDev::downcast_driver`] 语义完全对称。
+    ///
+    /// 对于字符设备，先转型为 [`crate::vfs::dev::CharDevAdapter`]，再调用其
+    /// [`downcast_driver`](crate::vfs::dev::CharDevAdapter::downcast_driver)：
+    ///
+    /// ```rust,ignore
+    /// if let Some(adapter) = file.downcast_ops::<CharDevAdapter>() {
+    ///     if let Some(uart) = adapter.downcast_driver::<Uart16550>() {
+    ///         uart.control(UartRequest::SetBaudRate { clock_hz: 100_000_000, baud: 9600 })?;
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// 通过 `dyn FileOps` 的通用路径不应调用设备特定命令——类型安全由此保证。
+    pub fn downcast_ops<T: 'static>(&self) -> Option<&T> {
+        self.ops.as_any().downcast_ref::<T>()
+    }
+
+    /// 将文件内容刷入底层存储（`fsync`）：等待数据和元数据均落盘。
+    pub fn sync(&self) -> VfsResult<()> {
+        self.ops.sync()?;
+        self.inode.ops.sync_metadata(&self.inode)
+    }
+
+    /// 仅将数据刷盘，不保证元数据（如 mtime）同步（`fdatasync`）。
+    pub fn datasync(&self) -> VfsResult<()> {
+        self.ops.sync()
+    }
+
+    /// 获取文件当前元数据快照（`fstat`）。
+    pub fn stat(&self) -> VfsResult<FileStat> {
+        self.inode.stat()
+    }
+
+    /// 检查文件当前就绪的 I/O 事件（`poll(2)`/`select(2)`/`epoll` 的核心）。
+    ///
+    /// `interest` 指定调用方感兴趣的事件掩码；返回值为当前已就绪的事件子集
+    /// （`interest` 与实际就绪事件的交集）。若无就绪事件，调用方应将此
+    /// 描述符加入内核等待队列（等待队列由调度器层实现，此处不涉及）。
+    pub fn poll(&self, interest: PollEvents) -> PollEvents {
+        let ready = self.ops.poll(interest);
+        // POLLERR/POLLHUP/POLLNVAL 始终返回，不受 interest 过滤（POSIX 语义）。
+        let always = PollEvents::POLLERR
+            .with(PollEvents::POLLHUP)
+            .with(PollEvents::POLLNVAL);
+        ready.intersect(interest.with(always))
+    }
+
+    /// 执行设备或文件系统特定的控制命令（`ioctl(2)`）。
+    pub fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
+        if self.flags.path_only {
+            return Err(Errno::EBADF);
+        }
+        self.ops.ioctl(cmd, arg)
+    }
+}
+
+impl Drop for File {
+    /// 析构时自动调用 `FileOps::release`，释放驱动私有的打开状态。
+    ///
+    /// 这保证了无论通过何种路径（正常 `close`、进程退出、`execve` 的 CLOEXEC）
+    /// 关闭描述符，驱动的清理逻辑都会被调用且只调用一次（Arc 的唯一性保证）。
+    fn drop(&mut self) {
+        self.ops.release();
+        // 自动递减挂载引用计数，保证 is_busy() 正确反映活跃 fd 数量。
+        self.mount.dec_open();
+    }
+}
+
+// ── libs/mm::FileLike 适配 ───────────────────────────────────────────────────
+//
+// 让 VMA 的 file backing 可以持 `Arc<File>` 作为 `Arc<dyn FileLike>`。方向
+// 是 `libs/vfs → libs/mm`（被允许），反向不成立。只实现 loader / demand
+// paging 实际用的两个方法；错误按"读失败一律 Errno::EIO"降级——这里没有
+// 语义上"短读 / 超时 / 权限拒绝"的细分诉求，缺页处理拿到错误直接 SIGBUS。
+
+impl ::mm::FileLike for File {
+    fn cache_key(&self) -> usize {
+        Arc::as_ptr(&self.inode) as usize
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, errno::Errno> {
+        // File::read_at 会检查 readable flag；loader / mmap 场景打开时必然带
+        // O_RDONLY，返错说明文件描述符状态异常——映回 EIO。
+        File::read_at(self, buf, offset).map_err(|_| errno::Errno::EIO)
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, errno::Errno> {
+        File::write_at(self, buf, offset).map_err(|_| errno::Errno::EIO)
+    }
+
+    fn sync(&self) -> Result<(), errno::Errno> {
+        File::sync(self).map_err(|_| errno::Errno::EIO)
+    }
+
+    fn size(&self) -> u64 {
+        File::stat(self).map(|s| s.size as u64).unwrap_or(0)
+    }
+}
+
+// ── 文件操作接口 ──────────────────────────────────────────────────────────────
+
+/// 文件系统特定的文件操作接口（对应 Linux `struct file_operations`）。
+///
+/// 具体文件系统驱动为每种文件类型提供一份实现，由 [`crate::vfs::inode::InodeOps::open`]
+/// 创建并注入到 [`File::ops`] 中。
+///
+/// ### 并发模型
+///
+/// 所有方法取 `&self`（共享引用），要求驱动内部通过 `Spinlock` 或其他内部可变
+/// 性原语保护可变状态。这与 `Sync` 约束配合，允许多线程共享同一 `File`。
+pub trait FileOps {
+    /// 在指定 `offset` 处读取最多 `buf.len()` 字节，返回实际读取字节数。
+    ///
+    /// 返回 `Ok(0)` 表示到达文件末尾（EOF）。不应修改文件的当前偏移量，
+    /// 偏移量的推进由 [`File::read`] 统一处理。
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
+
+    /// 在指定 `offset` 处写入 `buf`，返回实际写入字节数。
+    ///
+    /// ### 特殊值 `offset = u64::MAX`（O_APPEND 语义）
+    ///
+    /// 当 `offset` 为 `u64::MAX` 时，驱动必须**原子地**将数据追加到文件末尾：
+    /// 即在持有 inode 写保护（如 `inode.meta` 锁或驱动内部锁）的情况下，
+    /// 同时完成"读取当前 EOF → 在 EOF 处写入"这两步，消除 TOCTOU 竞争。
+    ///
+    /// VFS 层在 O_APPEND 写入时传入此值，而不是在 VFS 层预读 `inode.meta.size`
+    /// 再传给驱动——那样做会因锁被提前释放而引入竞争（两次写入可能获得相同的
+    /// EOF 偏移量，导致数据被覆盖而非追加）。
+    fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
+
+    /// 枚举从 `pos` 起的目录条目，逐条传给 `sink`（用于 `getdents`）。
+    ///
+    /// 对非目录文件返回 `VfsError::NotADirectory`。`pos` 是由 [`File::readdir`] 传入
+    /// 的目录游标，驱动应从该位置起枚举条目：
+    /// - `sink` 返回 `ControlFlow::Continue(())` 时继续；
+    /// - `sink` 返回 `ControlFlow::Break(())` 时停止（通常表示目标缓冲区已满）。
+    ///
+    /// 返回枚举结束后的新游标值（`Continue` 路径枚举完所有条目时为最终位置；
+    /// `Break` 路径为最后一条**未**被 sink 消费的条目对应的游标）。
+    /// 调用方（[`File::readdir`]）负责将此值写回 `File::pos`。
+    fn readdir(
+        &self,
+        pos: u64,
+        sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64>;
+
+    /// 将该文件的脏缓冲区刷入存储。
+    fn sync(&self) -> VfsResult<()>;
+
+    /// 检查当前就绪的 I/O 事件（`poll(2)`/`epoll` 的底层接口）。
+    ///
+    /// 返回当前已就绪的事件掩码。驱动应结合内部状态（接收缓冲区是否有数据、
+    /// 发送缓冲区是否有空间等）决定返回哪些事件。若无就绪事件，返回空掩码。
+    fn poll(&self, interest: PollEvents) -> PollEvents;
+
+    /// 执行文件或设备控制命令。
+    ///
+    /// 默认返回 `ENOTTY`，表示该文件类型没有可处理的 ioctl。具体设备适配层可在
+    /// 这里把 Linux ioctl ABI 翻译成自身的 typed control / metadata 操作。
+    fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// 文件描述符最后一次引用消失时调用，由 [`File`] 的 `Drop` 自动触发。
+    ///
+    /// 驱动应在此释放所有打开状态（如引用计数递减、缓冲区释放等）。
+    ///
+    /// 与 `Inode::evict` 的区别：`release` 在每次最终 `close`（Arc 计数归零）
+    /// 时调用；`evict` 只在 inode 引用计数降至零时调用一次。
+    fn release(&self);
+
+    /// 返回 `self` 的 `&dyn Any` 引用，用于向下转型到具体驱动类型。
+    ///
+    /// 这是 [`crate::dev::char::DriverControl`] 在通用路径上的"类型恢复桥梁"，
+    /// 与 [`crate::dev::char::CharDriver::as_any`] 语义完全对称。
+    ///
+    /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
+    fn as_any(&self) -> &dyn core::any::Any;
+}
