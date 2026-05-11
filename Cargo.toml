@@ -9,7 +9,8 @@ members = [
     "libs/sched",
     "libs/allocator",
     "libs/vfs",
-    "libs/acpi"
+    "libs/acpi",
+    "libs/fatfs"
 ]
 
 [workspace.package]
