@@ -1,8 +1,18 @@
 [package]
 name = "arch"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
 
 [dependencies]
 general = { path = "../general" }
-libs = { path = "../libs" }
+allocator = { path = "../libs/allocator" }
+efi = { path = "../libs/efi" }
+log = { path = "../libs/log" }
+mm = { path = "../libs/mm" }
+sched = { path = "../libs/sched" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
