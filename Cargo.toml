@@ -12,7 +12,8 @@ members = [
     "libs/acpi",
     "libs/fatfs",
     "libs/extfs",
-    "arch"
+    "arch",
+    "hal"
 ]
 
 [workspace.package]
