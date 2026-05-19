@@ -13,7 +13,8 @@ members = [
     "libs/fatfs",
     "libs/extfs",
     "arch",
-    "hal"
+    "hal",
+    "general"
 ]
 
 [workspace.package]

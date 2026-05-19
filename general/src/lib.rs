@@ -1,8 +1,36 @@
-#![no_std]
-#![deny(missing_docs)]
-#![deny(unsafe_op_in_unsafe_fn)]
-
-//! 通用基础设施与标准接口层。
+//! # General 层
 //!
-//! 本 crate 定义平台无关 trait，并承载依赖这些 trait 的通用算法。
-//! 具体 ISA 实现只能通过 trait 契约接入。
+//! General 层为平台具体实现提供了一个标准接口，使得平台有关的功能方法签名得到高度统一。
+//! 我们引出了一般性的功能模块 trait，如分页、任务、异常处理等，并将其具体实现交给
+//! arch crate 来完成。这样，arch crate 只需专注于实现这些 trait 的方法，而不需要关心上层
+//! 接口的设计和调用细节。
+//!
+//! 这些 trait 不依赖于特定的架构或硬件平台，可以被不同的架构和平台共享使用。并且我们希望
+//! 内核支持的每一个平台都能实现这些 trait，以保证内核功能的完整性和代码层次的一致性。
+
+#![no_std]
+
+extern crate alloc;
+
+mod page_walk;
+mod paging;
+mod platform;
+mod start;
+mod task;
+mod trap;
+
+pub use page_walk::*;
+pub use paging::*;
+pub use platform::*;
+pub use start::*;
+pub use task::*;
+pub use trap::*;
+
+pub mod mm;
+pub mod syscall;
+pub mod vfs;
+
+pub mod console;
+pub mod dev;
+pub mod dtb;
+pub mod firmware;

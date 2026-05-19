@@ -1,7 +1,22 @@
 [package]
 name = "general"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
 
 [dependencies]
-libs = { path = "../libs" }
+acpi = { path = "../libs/acpi", default-features = false }
+allocator = { path = "../libs/allocator" }
+efi = { path = "../libs/efi" }
+errno = { path = "../libs/errno" }
+extfs = { path = "../libs/extfs" }
+fatfs = { path = "../libs/fatfs" }
+log = { path = "../libs/log" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+mm = { path = "../libs/mm" }
+sched = { path = "../libs/sched" }
+vfs = { path = "../libs/vfs" }
