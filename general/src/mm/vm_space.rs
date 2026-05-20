@@ -1,0 +1,978 @@
+//! VmSpace —— 进程地址空间的顶层对象。
+//!
+//! `VmSpace` 负责把纯 VMA 代数、用户页表 ops、用户数据页生命周期三件事收束在
+//! general 层。arch 只提供页表机械动作，COW / `MAP_SHARED` / 脏页写回这些策略
+//! 都在这里处理，避免未来把 MM 逻辑散到具体架构里。
+
+use alloc::collections::BTreeMap;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::ops::Range;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use errno::Errno;
+use mm::{FileLike, VmArea, VmBacking, VmFlags, VmaSet};
+
+use crate::mm::fault::{FaultKind, FaultOutcome, KernelFaultReason};
+use crate::mm::ops::{PgdHandle, UserVmLayoutOps, user_pgd_ops, user_vm_layout};
+
+#[inline]
+fn vm_layout() -> &'static UserVmLayoutOps {
+    user_vm_layout().expect("[mm] user_vm_layout_ops not registered")
+}
+
+/// 当前架构注入的用户页粒度。
+#[inline]
+pub fn page_size() -> usize {
+    vm_layout().page_size
+}
+
+#[inline]
+fn page_base(addr: usize) -> usize {
+    let page_size = page_size();
+    addr & !(page_size - 1)
+}
+
+static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
+    spin::Mutex::new(BTreeMap::new());
+static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, Weak<ResidentPage>>> =
+    spin::Mutex::new(BTreeMap::new());
+static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SharedFilePageKey {
+    file_key: usize,
+    offset: u64,
+}
+
+impl SharedFilePageKey {
+    fn new(file: &Arc<dyn FileLike>, offset: u64) -> Self {
+        Self {
+            file_key: file.cache_key(),
+            offset,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SharedAnonPageKey {
+    id: usize,
+    offset: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageAccess {
+    ReadOnly,
+    Writable,
+    Cow,
+    SharedTracked,
+}
+
+impl PageAccess {
+    fn pte_writable(self) -> bool {
+        matches!(self, Self::Writable)
+    }
+}
+
+#[derive(Clone)]
+struct PageMapping {
+    page: Arc<ResidentPage>,
+    access: PageAccess,
+}
+
+enum ResidentPageKind {
+    Anon,
+    PrivateFile,
+    SharedFile {
+        file: Arc<dyn FileLike>,
+        offset: u64,
+    },
+    Direct,
+}
+
+struct ResidentPage {
+    paddr: usize,
+    kind: ResidentPageKind,
+    dirty: AtomicBool,
+}
+
+impl ResidentPage {
+    fn new_anon(paddr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            paddr,
+            kind: ResidentPageKind::Anon,
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    fn new_private_file(paddr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            paddr,
+            kind: ResidentPageKind::PrivateFile,
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    fn new_shared_file(paddr: usize, file: Arc<dyn FileLike>, offset: u64) -> Arc<Self> {
+        Arc::new(Self {
+            paddr,
+            kind: ResidentPageKind::SharedFile { file, offset },
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    fn new_direct(paddr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            paddr,
+            kind: ResidentPageKind::Direct,
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    fn paddr(&self) -> usize {
+        self.paddr
+    }
+
+    fn is_direct(&self) -> bool {
+        matches!(self.kind, ResidentPageKind::Direct)
+    }
+
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn flush_to_backing(&self) -> Result<(), Errno> {
+        if !self.dirty.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let ResidentPageKind::SharedFile { file, offset } = &self.kind else {
+            return Ok(());
+        };
+        let file_size = file.size();
+        if *offset >= file_size {
+            return Ok(());
+        }
+        let page_size = page_size();
+        let len = (file_size - *offset).min(page_size as u64) as usize;
+        let virt = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        let buf = unsafe { core::slice::from_raw_parts(virt(self.paddr) as *const u8, len) };
+        let mut written = 0usize;
+        while written < len {
+            let n = file.write_at(*offset + written as u64, &buf[written..])?;
+            if n == 0 {
+                return Err(Errno::EIO);
+            }
+            written += n;
+        }
+        file.sync()
+    }
+}
+
+impl Drop for ResidentPage {
+    fn drop(&mut self) {
+        if let Err(err) = self.flush_to_backing() {
+            log::error!(
+                "[mm] failed to flush shared mmap page paddr={:#x}: {:?}",
+                self.paddr,
+                err
+            );
+        }
+        if !matches!(self.kind, ResidentPageKind::Direct) {
+            free_user_page(self.paddr);
+        }
+    }
+}
+
+/// 进程地址空间。
+pub struct VmSpace {
+    vmas: spin::Mutex<VmaSet>,
+    pages: spin::Mutex<BTreeMap<usize, PageMapping>>,
+    pgd: PgdHandle,
+    brk_start: usize,
+    brk_current: AtomicUsize,
+    mmap_next: AtomicUsize,
+    /// 诊断辅助：记录当前已建立页表映射的用户页数。
+    mapped_pages: AtomicUsize,
+}
+
+// Safety: PgdHandle 是 arch opaque 句柄；VMA 与 resident page map 均由锁保护。
+unsafe impl Send for VmSpace {}
+unsafe impl Sync for VmSpace {}
+
+impl VmSpace {
+    /// 新建一个空地址空间。必须在 `register_user_pgd` 完成之后调用。
+    pub fn new() -> Self {
+        let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
+        let layout = vm_layout();
+        let pgd = (ops.new_pgd_for_user)();
+        Self {
+            vmas: spin::Mutex::new(VmaSet::new()),
+            pages: spin::Mutex::new(BTreeMap::new()),
+            pgd,
+            brk_start: layout.user_heap_base,
+            brk_current: AtomicUsize::new(layout.user_heap_base),
+            mmap_next: AtomicUsize::new(layout.user_mmap_base),
+            mapped_pages: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn pgd(&self) -> PgdHandle {
+        self.pgd
+    }
+
+    pub fn mapped_pages(&self) -> usize {
+        self.mapped_pages.load(Ordering::Acquire)
+    }
+
+    pub fn current_brk(&self) -> usize {
+        self.brk_current.load(Ordering::Acquire)
+    }
+
+    /// ELF loader 装载完成后调用：将 brk 起点对齐到已装载段末尾的下一页。
+    pub fn init_brk_after_load(&self, max_segment_end: usize) {
+        let page_size = page_size();
+        let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
+        // brk 必须不低于当前最小值，并跟随段尾上移
+        let brk = new_brk.max(self.brk_start);
+        self.brk_current.store(brk, Ordering::Release);
+    }
+
+    pub fn set_brk(&self, requested: usize) -> usize {
+        if requested == 0 {
+            return self.current_brk();
+        }
+        if requested < self.brk_start {
+            return self.current_brk();
+        }
+
+        let old = self.current_brk();
+        let page_size = page_size();
+        let old_end = align_up(old, page_size).unwrap_or(old);
+        let new_end = match align_up(requested, page_size) {
+            Some(v) => v,
+            None => return old,
+        };
+
+        let result = if new_end > old_end {
+            self.map_anon(
+                old_end..new_end,
+                VmFlags::EMPTY
+                    .with(VmFlags::READ)
+                    .with(VmFlags::WRITE)
+                    .with(VmFlags::USER),
+            )
+        } else if new_end < old_end {
+            self.unmap(new_end..old_end)
+        } else {
+            Ok(())
+        };
+
+        if result.is_ok() {
+            self.brk_current.store(requested, Ordering::Release);
+            requested
+        } else {
+            old
+        }
+    }
+
+    pub fn alloc_mmap_range(&self, len: usize) -> Result<Range<usize>, Errno> {
+        let layout = vm_layout();
+        let page_size = layout.page_size;
+        let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let cursor = align_up(self.mmap_next.load(Ordering::Acquire), page_size)
+            .unwrap_or(layout.user_mmap_base)
+            .clamp(layout.user_mmap_base, layout.user_mmap_limit);
+        let set = self.vmas.lock();
+        let candidates = [
+            (cursor, layout.user_mmap_limit),
+            (layout.user_mmap_base, cursor),
+        ];
+        for (start, end) in candidates {
+            if start >= end {
+                continue;
+            }
+            if let Some(range) = set.find_gap(start..end, len) {
+                self.mmap_next.store(range.end, Ordering::Release);
+                return Ok(range);
+            }
+        }
+        Err(Errno::ENOMEM)
+    }
+
+    pub fn is_range_free(&self, range: Range<usize>) -> bool {
+        self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
+    }
+
+    /// 注册一段匿名 VMA。不立即分配物理页。
+    pub fn map_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let backing = if flags.has(VmFlags::SHARED) {
+            VmBacking::SharedAnon {
+                id: NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed),
+                offset: 0,
+            }
+        } else {
+            VmBacking::Anon
+        };
+        let area = VmArea {
+            range,
+            flags: flags.with(VmFlags::ANON),
+            backing,
+        };
+        self.vmas.lock().insert(area)
+    }
+
+    /// 注册一段 file-backed VMA。缺页时按 offset + (addr - range.start) 读文件。
+    pub fn map_file(
+        &self,
+        range: Range<usize>,
+        file: Arc<dyn FileLike>,
+        offset: u64,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let area = VmArea {
+            range,
+            flags,
+            backing: VmBacking::File { file, offset },
+        };
+        self.vmas.lock().insert(area)
+    }
+
+    /// MAP_FIXED 原子操作：在同一把 VMA 锁内先 unmap 再 insert，消除竞态窗口。
+    pub fn map_fixed_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let backing = if flags.has(VmFlags::SHARED) {
+            VmBacking::SharedAnon {
+                id: NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed),
+                offset: 0,
+            }
+        } else {
+            VmBacking::Anon
+        };
+        let area = VmArea {
+            range: range.clone(),
+            flags: flags.with(VmFlags::ANON),
+            backing,
+        };
+        let mut vmas = self.vmas.lock();
+        vmas.unmap_range(&range);
+        vmas.insert(area)?;
+        drop(vmas);
+        let removed = self.remove_page_mappings(range.clone());
+        for (va, _mapping) in &removed {
+            let _ = self.unmap_page(*va);
+        }
+        Ok(())
+    }
+
+    pub fn map_fixed_file(
+        &self,
+        range: Range<usize>,
+        file: Arc<dyn FileLike>,
+        offset: u64,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let area = VmArea {
+            range: range.clone(),
+            flags,
+            backing: VmBacking::File { file, offset },
+        };
+        let mut vmas = self.vmas.lock();
+        vmas.unmap_range(&range);
+        vmas.insert(area)?;
+        drop(vmas);
+        let removed = self.remove_page_mappings(range.clone());
+        for (va, _mapping) in &removed {
+            let _ = self.unmap_page(*va);
+        }
+        Ok(())
+    }
+
+    /// 注册并立即建立一段 direct physical mapping。
+    pub fn map_direct(
+        &self,
+        range: Range<usize>,
+        paddr: usize,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let page_size = page_size();
+        if paddr % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let area_flags = flags.with(VmFlags::USER);
+        let area = VmArea {
+            range: range.clone(),
+            flags: area_flags,
+            backing: VmBacking::Direct(paddr),
+        };
+        self.vmas.lock().insert(area)?;
+
+        let mut pages = self.pages.lock();
+        let mut va = range.start;
+        while va < range.end {
+            let off = va - range.start;
+            let page = ResidentPage::new_direct(paddr + off);
+            let access = access_for_new_page(area_flags, &page);
+            self.map_page(va, page.paddr(), pte_flags_for(area_flags, access))?;
+            pages.insert(va, PageMapping { page, access });
+            va += page_size;
+        }
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        Ok(())
+    }
+
+    /// 取消映射。同时把已 commit 的页表项摘掉；物理页由 resident page refcount 回收。
+    pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        self.vmas.lock().unmap_range(&range);
+        let removed = self.remove_page_mappings(range);
+        for (va, _mapping) in &removed {
+            self.unmap_page(*va)?;
+        }
+        drop(removed);
+        Ok(())
+    }
+
+    /// 修改权限。要求整个 range 已被 VMA 连续覆盖。
+    pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let mut set = self.vmas.lock();
+        if !set.contains_range(&range) {
+            return Err(Errno::ENOMEM);
+        }
+        set.protect_range(&range, new_flags.with(VmFlags::USER));
+
+        let mut pages = self.pages.lock();
+        let keys: Vec<usize> = pages.range(range.clone()).map(|(k, _)| *k).collect();
+        for va in keys {
+            let Some(area) = set.find(va) else {
+                continue;
+            };
+            let Some(mapping) = pages.get_mut(&va) else {
+                continue;
+            };
+            mapping.access = access_for_existing_page(area.flags, &mapping.page);
+            self.protect_page(va, pte_flags_for(area.flags, mapping.access))?;
+        }
+        Ok(())
+    }
+
+    /// fork：克隆 VMA 元数据，已驻留的页按 private-COW / shared 语义重建页表。
+    pub fn fork(&self) -> Self {
+        let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
+        let new_pgd = (ops.new_pgd_for_user)();
+        let cloned_set = self.vmas.lock().deep_clone_metadata();
+        let mut child_pages = BTreeMap::new();
+        let mut child_maps = Vec::new();
+
+        {
+            let mut parent_pages = self.pages.lock();
+            for (va, mapping) in parent_pages.iter_mut() {
+                let Some(area) = cloned_set.find(*va) else {
+                    continue;
+                };
+                let old_access = mapping.access;
+                mapping.access = access_after_fork(area.flags, &mapping.page);
+                if old_access != mapping.access {
+                    self.protect_page(*va, pte_flags_for(area.flags, mapping.access))
+                        .expect("[mm] fork parent protect failed");
+                }
+                let child_mapping = mapping.clone();
+                child_maps.push((
+                    *va,
+                    child_mapping.page.clone(),
+                    area.flags,
+                    child_mapping.access,
+                ));
+                child_pages.insert(*va, child_mapping);
+            }
+        }
+
+        for (va, page, flags, access) in &child_maps {
+            unsafe {
+                (ops.map)(
+                    new_pgd,
+                    *va,
+                    page.paddr(),
+                    pte_flags_for(*flags, *access).with(VmFlags::USER),
+                );
+            }
+        }
+
+        let mapped_pages = child_pages.len();
+        Self {
+            vmas: spin::Mutex::new(cloned_set),
+            pages: spin::Mutex::new(child_pages),
+            pgd: new_pgd,
+            brk_start: self.brk_start,
+            brk_current: AtomicUsize::new(self.current_brk()),
+            mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
+            mapped_pages: AtomicUsize::new(mapped_pages),
+        }
+    }
+
+    /// 切到本地址空间（`schedule_once` 调；写 PGDL 并 flush TLB）。
+    pub fn activate(&self) {
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.activate)(self.pgd) };
+        }
+    }
+
+    /// page-fault 分派进来的入口。按 VMA backing / 权限决定该做什么。
+    pub fn handle_fault(&self, addr: usize, kind: FaultKind) -> FaultOutcome {
+        if user_pgd_ops().is_none() {
+            return FaultOutcome::Kernel(KernelFaultReason::NotInitialized);
+        }
+        let page = page_base(addr);
+        let set = self.vmas.lock();
+        let Some(area) = set.find(page) else {
+            drop(set);
+            let mut set = self.vmas.lock();
+            let Some((_added, flags)) = set.grow_down_to(page, vm_layout().max_grows_down_bytes)
+            else {
+                return FaultOutcome::Segv;
+            };
+            drop(set);
+            return self.commit_fault_page(page, VmBacking::Anon, flags, page, kind);
+        };
+        if !permits(area.flags, kind) {
+            return FaultOutcome::Segv;
+        }
+        let backing = area.backing.clone();
+        let flags = area.flags;
+        let area_start = area.range.start;
+        drop(set);
+
+        {
+            let mut pages = self.pages.lock();
+            if let Some(mapping) = pages.get_mut(&page) {
+                return self.handle_resident_fault(page, flags, kind, mapping);
+            }
+        }
+
+        self.commit_fault_page(page, backing, flags, area_start, kind)
+    }
+
+    /// 立即为一个 ELF 段分配并填充物理页。
+    pub fn commit_segment(
+        &self,
+        vaddr: usize,
+        memsz: usize,
+        file_size: usize,
+        data: &[u8],
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        if memsz == 0 {
+            return Ok(());
+        }
+        if file_size > memsz || data.len() != file_size {
+            return Err(Errno::EINVAL);
+        }
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+
+        let page_size = page_size();
+        let start = page_base(vaddr);
+        let end_unaligned = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
+        let end = align_up(end_unaligned, page_size).ok_or(Errno::EINVAL)?;
+        let area_flags = flags.with(VmFlags::USER).with(VmFlags::ANON);
+
+        self.map_anon(start..end, area_flags)?;
+
+        let file_end_vaddr = vaddr + file_size;
+        let mut pages = self.pages.lock();
+        let mut page_va = start;
+        while page_va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let copy_start_va = page_va.max(vaddr);
+            let copy_end_va = (page_va + page_size).min(file_end_vaddr);
+            if copy_end_va > copy_start_va {
+                let seg_off = copy_start_va - vaddr;
+                let len = copy_end_va - copy_start_va;
+                let dst_off_in_page = copy_start_va - page_va;
+                let kva = virt_fn(paddr) + dst_off_in_page;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(data.as_ptr().add(seg_off), kva as *mut u8, len);
+                }
+            }
+            let page = ResidentPage::new_anon(paddr);
+            let access = access_for_new_page(area_flags, &page);
+            self.map_page(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
+            pages.insert(page_va, PageMapping { page, access });
+            page_va += page_size;
+        }
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        Ok(())
+    }
+
+    fn validate_range(&self, range: &Range<usize>) -> Result<(), Errno> {
+        let page_size = page_size();
+        if range.start % page_size != 0 || range.end % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if range.start >= range.end {
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    fn commit_fault_page(
+        &self,
+        page_va: usize,
+        backing: VmBacking,
+        flags: VmFlags,
+        area_start: usize,
+        kind: FaultKind,
+    ) -> FaultOutcome {
+        let page = match backing {
+            VmBacking::Anon => alloc_zeroed_user_page()
+                .map(ResidentPage::new_anon)
+                .ok_or(Errno::ENOMEM),
+            VmBacking::SharedAnon { id, offset } => {
+                let object_off = offset + (page_va - area_start) as u64;
+                shared_anon_page(id, object_off)
+            }
+            VmBacking::File { file, offset } => {
+                let file_off = offset + (page_va - area_start) as u64;
+                if flags.has(VmFlags::SHARED) {
+                    shared_file_page(file, file_off)
+                } else {
+                    load_file_page(&*file, file_off).map(ResidentPage::new_private_file)
+                }
+            }
+            VmBacking::Direct(base) => {
+                let paddr = base + (page_va - area_start);
+                Ok(ResidentPage::new_direct(paddr))
+            }
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(err) => return fault_from_errno(err),
+        };
+        let mut access = access_for_new_page(flags, &page);
+        if is_write_fault(kind) && matches!(access, PageAccess::SharedTracked) {
+            page.mark_dirty();
+            access = PageAccess::Writable;
+        }
+
+        let mut pages = self.pages.lock();
+        if let Some(mapping) = pages.get_mut(&page_va) {
+            return self.handle_resident_fault(page_va, flags, kind, mapping);
+        }
+        if let Err(err) = self.map_page(page_va, page.paddr(), pte_flags_for(flags, access)) {
+            return fault_from_errno(err);
+        }
+        pages.insert(page_va, PageMapping { page, access });
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        FaultOutcome::Fixed
+    }
+
+    fn handle_resident_fault(
+        &self,
+        page_va: usize,
+        flags: VmFlags,
+        kind: FaultKind,
+        mapping: &mut PageMapping,
+    ) -> FaultOutcome {
+        if !is_write_fault(kind) {
+            return FaultOutcome::Fixed;
+        }
+        match mapping.access {
+            PageAccess::Writable => FaultOutcome::Fixed,
+            PageAccess::SharedTracked => {
+                mapping.page.mark_dirty();
+                mapping.access = PageAccess::Writable;
+                match self.protect_page(page_va, pte_flags_for(flags, mapping.access)) {
+                    Ok(()) => FaultOutcome::Fixed,
+                    Err(err) => fault_from_errno(err),
+                }
+            }
+            PageAccess::Cow => {
+                let new_page = match clone_page_to_anon(&mapping.page) {
+                    Ok(page) => page,
+                    Err(err) => return fault_from_errno(err),
+                };
+                if let Err(err) = self.replace_page(
+                    page_va,
+                    new_page.paddr(),
+                    pte_flags_for(flags, PageAccess::Writable),
+                ) {
+                    return fault_from_errno(err);
+                }
+                mapping.page = new_page;
+                mapping.access = PageAccess::Writable;
+                FaultOutcome::Fixed
+            }
+            PageAccess::ReadOnly => FaultOutcome::Segv,
+        }
+    }
+
+    fn map_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        unsafe {
+            (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
+        }
+        Ok(())
+    }
+
+    fn unmap_page(&self, vaddr: usize) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        unsafe {
+            (ops.unmap)(self.pgd, vaddr, page_size);
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
+        }
+        Ok(())
+    }
+
+    fn protect_page(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        unsafe { (ops.protect)(self.pgd, vaddr, page_size(), flags.with(VmFlags::USER)) };
+        Ok(())
+    }
+
+    fn replace_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        unsafe {
+            (ops.unmap)(self.pgd, vaddr, page_size);
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
+            (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
+        }
+        Ok(())
+    }
+
+    fn remove_page_mappings(&self, range: Range<usize>) -> Vec<(usize, PageMapping)> {
+        let mut pages = self.pages.lock();
+        let keys: Vec<usize> = pages.range(range).map(|(k, _)| *k).collect();
+        let mut removed = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(mapping) = pages.remove(&key) {
+                removed.push((key, mapping));
+            }
+        }
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        removed
+    }
+}
+
+impl Drop for VmSpace {
+    fn drop(&mut self) {
+        self.pages.lock().clear();
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.drop_pgd)(self.pgd) };
+        }
+    }
+}
+
+fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
+    if page.is_direct() {
+        return if flags.has(VmFlags::WRITE) {
+            PageAccess::Writable
+        } else {
+            PageAccess::ReadOnly
+        };
+    }
+    if !flags.has(VmFlags::WRITE) {
+        PageAccess::ReadOnly
+    } else if flags.has(VmFlags::SHARED) {
+        PageAccess::SharedTracked
+    } else {
+        PageAccess::Writable
+    }
+}
+
+fn access_for_existing_page(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
+    if page.is_direct() {
+        return if flags.has(VmFlags::WRITE) {
+            PageAccess::Writable
+        } else {
+            PageAccess::ReadOnly
+        };
+    }
+    if !flags.has(VmFlags::WRITE) {
+        PageAccess::ReadOnly
+    } else if flags.has(VmFlags::SHARED) {
+        PageAccess::SharedTracked
+    } else if Arc::strong_count(page) > 1 {
+        PageAccess::Cow
+    } else {
+        PageAccess::Writable
+    }
+}
+
+fn access_after_fork(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
+    if page.is_direct() {
+        return if flags.has(VmFlags::WRITE) {
+            PageAccess::Writable
+        } else {
+            PageAccess::ReadOnly
+        };
+    }
+    if !flags.has(VmFlags::WRITE) {
+        PageAccess::ReadOnly
+    } else if flags.has(VmFlags::SHARED) {
+        PageAccess::SharedTracked
+    } else {
+        PageAccess::Cow
+    }
+}
+
+fn pte_flags_for(flags: VmFlags, access: PageAccess) -> VmFlags {
+    let flags = flags.with(VmFlags::USER);
+    if access.pte_writable() {
+        flags
+    } else {
+        flags.without(VmFlags::WRITE)
+    }
+}
+
+fn shared_file_page(file: Arc<dyn FileLike>, file_off: u64) -> Result<Arc<ResidentPage>, Errno> {
+    let key = SharedFilePageKey::new(&file, file_off);
+    {
+        let mut cache = SHARED_FILE_PAGES.lock();
+        if let Some(weak) = cache.get(&key) {
+            if let Some(page) = weak.upgrade() {
+                return Ok(page);
+            }
+            cache.remove(&key);
+        }
+    }
+    let paddr = load_file_page(&*file, file_off)?;
+    let page = ResidentPage::new_shared_file(paddr, Arc::clone(&file), file_off);
+    SHARED_FILE_PAGES.lock().insert(key, Arc::downgrade(&page));
+    Ok(page)
+}
+
+fn shared_anon_page(id: usize, offset: u64) -> Result<Arc<ResidentPage>, Errno> {
+    let key = SharedAnonPageKey { id, offset };
+    {
+        let mut cache = SHARED_ANON_PAGES.lock();
+        if let Some(weak) = cache.get(&key) {
+            if let Some(page) = weak.upgrade() {
+                return Ok(page);
+            }
+            cache.remove(&key);
+        }
+    }
+    let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+    let page = ResidentPage::new_anon(paddr);
+    SHARED_ANON_PAGES.lock().insert(key, Arc::downgrade(&page));
+    Ok(page)
+}
+
+fn load_file_page(file: &dyn FileLike, file_off: u64) -> Result<usize, Errno> {
+    let file_size = file.size();
+    if file_off >= file_size {
+        return Err(Errno::EINVAL);
+    }
+    let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+    let result = (|| {
+        let virt = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        let len = (file_size - file_off).min(page_size as u64) as usize;
+        let kbuf = unsafe { core::slice::from_raw_parts_mut(virt(paddr) as *mut u8, page_size) };
+        file.read_at(file_off, &mut kbuf[..len])?;
+        Ok(())
+    })();
+    if result.is_err() {
+        free_user_page(paddr);
+    }
+    result.map(|()| paddr)
+}
+
+fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno> {
+    let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+    let result = (|| {
+        let virt = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                virt(source.paddr()) as *const u8,
+                virt(paddr) as *mut u8,
+                page_size(),
+            );
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        free_user_page(paddr);
+    }
+    result.map(|()| ResidentPage::new_anon(paddr))
+}
+
+fn fault_from_errno(err: Errno) -> FaultOutcome {
+    match err {
+        Errno::ENOMEM => FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess),
+        _ => FaultOutcome::Segv,
+    }
+}
+
+fn is_write_fault(kind: FaultKind) -> bool {
+    matches!(kind, FaultKind::Store | FaultKind::PermWrite)
+}
+
+/// flags 是否允许该类访问。
+fn permits(flags: VmFlags, kind: FaultKind) -> bool {
+    match kind {
+        FaultKind::Load | FaultKind::PermRead => flags.has(VmFlags::READ),
+        FaultKind::Store | FaultKind::PermWrite => flags.has(VmFlags::WRITE),
+        FaultKind::Exec | FaultKind::PermExec => flags.has(VmFlags::EXEC),
+    }
+}
+
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    Some(value.checked_add(align - 1)? & !(align - 1))
+}
+
+fn alloc_zeroed_user_page() -> Option<usize> {
+    let order = user_page_order()?;
+    let paddr = allocator::KERNEL_ALLOCATOR.buddy_alloc_pages(order)?;
+    let Some(virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
+        free_user_page(paddr);
+        return None;
+    };
+    unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, page_size()) };
+    Some(paddr)
+}
+
+fn free_user_page(paddr: usize) {
+    let order = user_page_order().expect("[mm] invalid user page layout");
+    let _ = allocator::KERNEL_ALLOCATOR.buddy_free_pages(paddr, order);
+}
+
+fn user_page_order() -> Option<usize> {
+    let page_size = page_size();
+    if page_size < allocator::PAGE_SIZE || page_size % allocator::PAGE_SIZE != 0 {
+        return None;
+    }
+    let allocator_pages = page_size / allocator::PAGE_SIZE;
+    if !allocator_pages.is_power_of_two() {
+        return None;
+    }
+    Some(allocator_pages.trailing_zeros() as usize)
+}
+
+/// 获取 Vec<Range<usize>> 视图，方便调试打印 / smoketest。
+pub fn dump_vmas(vm: &VmSpace) -> Vec<(Range<usize>, VmFlags)> {
+    vm.vmas
+        .lock()
+        .iter()
+        .map(|a| (a.range.clone(), a.flags))
+        .collect()
+}
