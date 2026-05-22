@@ -1,0 +1,12 @@
+[build]
+target = "loongarch64-unknown-none"
+
+[target.loongarch64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker/qemu-loongarch64.ld",
+    "-C", "link-arg=--fatal-warnings",
+]
+
+[env]
+CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
