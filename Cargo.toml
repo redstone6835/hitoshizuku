@@ -14,7 +14,8 @@ members = [
     "libs/extfs",
     "arch",
     "hal",
-    "general"
+    "general",
+    "kernel"
 ]
 
 [workspace.package]

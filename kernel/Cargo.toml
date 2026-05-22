@@ -1,9 +1,29 @@
 [package]
 name = "kernel"
-version.workspace = true
-edition.workspace = true
+version = "0.1.0"
+edition = "2024"
+
+[features]
+embedded-initramfs = []
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
 
 [dependencies]
+acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
+arch = { path = "../arch" }
+extfs = { path = "../libs/extfs" }
+fatfs = { path = "../libs/fatfs" }
 general = { path = "../general" }
+log = { path = "../libs/log" }
+allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
-libs = { path = "../libs" }
+elf = { path = "../libs/elf" }
+errno = { path = "../libs/errno" }
+mm = { path = "../libs/mm" }
+sched = { path = "../libs/sched" }
+vfs = { path = "../libs/vfs" }
