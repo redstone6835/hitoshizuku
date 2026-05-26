@@ -18,6 +18,6 @@ fn main() {
         .flag_if_supported("-mno-lsx")
         .flag_if_supported("-mno-lasx")
         .opt_level(2)
-        .flag("-Wall")
+        .warnings(false)
         .compile("efi_c");
 }

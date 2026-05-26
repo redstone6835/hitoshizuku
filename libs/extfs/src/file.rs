@@ -27,6 +27,9 @@ use crate::layout::{
 use crate::state::{FsState, map_err};
 use crate::{extent_wr, map_wr};
 
+const I_BLOCK_BYTES: usize = 60;
+const MAP_CACHE_MAX_BLOCKS: u32 = 256 * 1024;
+
 // ── 目录 ────────────────────────────────────────────────────────────────
 
 pub struct ExtDirFileOps {
@@ -112,8 +115,41 @@ pub struct ExtRegFileOps {
     state: Arc<FsState>,
     sb: Arc<VfsSuperblock>,
     ino: u32,
+    map_cache: Spinlock<BlockMapCache>,
     /// 串行化 append / 扩容。
     io_mu: Spinlock<()>,
+}
+
+struct BlockMapCache {
+    valid: bool,
+    epoch: u64,
+    flags: u32,
+    size: u64,
+    i_block: [u8; I_BLOCK_BYTES],
+    ranges: Vec<(u32, u32, u64)>,
+}
+
+impl Default for BlockMapCache {
+    fn default() -> Self {
+        Self {
+            valid: false,
+            epoch: 0,
+            flags: 0,
+            size: 0,
+            i_block: [0u8; I_BLOCK_BYTES],
+            ranges: Vec::new(),
+        }
+    }
+}
+
+impl BlockMapCache {
+    fn matches(&self, epoch: u64, flags: u32, size: u64, i_block: &[u8; I_BLOCK_BYTES]) -> bool {
+        self.valid
+            && self.epoch == epoch
+            && self.flags == flags
+            && self.size == size
+            && self.i_block == *i_block
+    }
 }
 
 impl ExtRegFileOps {
@@ -122,6 +158,7 @@ impl ExtRegFileOps {
             state,
             sb,
             ino,
+            map_cache: Spinlock::new(BlockMapCache::default()),
             io_mu: Spinlock::new(()),
         }
     }
@@ -144,6 +181,130 @@ impl ExtRegFileOps {
             .ok_or(VfsError::InvalidArgument)?;
         f(&inode, ops)
     }
+
+    fn map_ranges(
+        &self,
+        flags: u32,
+        size: u64,
+        i_block: &[u8; I_BLOCK_BYTES],
+        first_lb: u32,
+        lb_count: u32,
+    ) -> Result<Vec<(u32, u32, u64)>, crate::state::BlockBackendError> {
+        if lb_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let block_size = self.state.ext_sb.block_size as u64;
+        let total_blocks_u64 = size.div_ceil(block_size);
+        if total_blocks_u64 > u32::MAX as u64 {
+            return Err(crate::state::BlockBackendError::OutOfRange);
+        }
+        let total_blocks = total_blocks_u64 as u32;
+        let epoch = self.state.io_epoch();
+        {
+            let cache = self.map_cache.lock();
+            if cache.matches(epoch, flags, size, i_block) {
+                return Ok(clip_ranges(&cache.ranges, first_lb, lb_count));
+            }
+        }
+
+        let map_all = total_blocks != 0 && total_blocks <= MAP_CACHE_MAX_BLOCKS;
+        let (map_start, map_count) = if map_all {
+            (0, total_blocks)
+        } else {
+            (first_lb, lb_count)
+        };
+        let mapped = if flags & crate::layout::EXT4_EXTENTS_FL != 0 {
+            crate::extent::map_contiguous(&self.state, i_block, map_start, map_count)?
+        } else {
+            crate::map::map_contiguous(&self.state, i_block, map_start, map_count)?
+        };
+
+        if map_all && self.state.io_epoch() == epoch {
+            let mut cache = self.map_cache.lock();
+            cache.valid = true;
+            cache.epoch = epoch;
+            cache.flags = flags;
+            cache.size = size;
+            cache.i_block = *i_block;
+            cache.ranges.clear();
+            cache.ranges.extend_from_slice(&mapped);
+        }
+
+        Ok(if map_all {
+            clip_ranges(&mapped, first_lb, lb_count)
+        } else {
+            mapped
+        })
+    }
+
+    fn invalidate_map_cache(&self) {
+        self.map_cache.lock().valid = false;
+    }
+
+    fn read_mapped_bytes(
+        &self,
+        scratch: &mut Vec<u8>,
+        range_byte_start: u64,
+        phys_start: u64,
+        read_start: u64,
+        read_end: u64,
+        request_offset: u64,
+        dst: &mut [u8],
+    ) -> VfsResult<()> {
+        let block_size = self.state.ext_sb.block_size as u64;
+        let mut cur = read_start;
+
+        if cur % block_size != 0 {
+            let block_off = (cur % block_size) as usize;
+            let take = ((block_size as usize - block_off) as u64).min(read_end - cur) as usize;
+            let phys = phys_start + (cur - range_byte_start) / block_size;
+            read_partial_block(
+                &self.state,
+                scratch,
+                phys,
+                block_off,
+                take,
+                cur,
+                request_offset,
+                dst,
+            )
+            .map_err(map_err)?;
+            cur += take as u64;
+        }
+
+        let aligned_bytes = ((read_end - cur) / block_size) * block_size;
+        if aligned_bytes != 0 {
+            let phys = phys_start + (cur - range_byte_start) / block_size;
+            let dst_pos = (cur - request_offset) as usize;
+            self.state
+                .read_blocks(
+                    phys,
+                    (aligned_bytes / block_size) as u32,
+                    &mut dst[dst_pos..dst_pos + aligned_bytes as usize],
+                )
+                .map_err(map_err)?;
+            cur += aligned_bytes;
+        }
+
+        if cur < read_end {
+            let take = (read_end - cur) as usize;
+            let phys = phys_start + (cur - range_byte_start) / block_size;
+            read_partial_block(
+                &self.state,
+                scratch,
+                phys,
+                0,
+                take,
+                cur,
+                request_offset,
+                dst,
+            )
+            .map_err(map_err)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl FileOps for ExtRegFileOps {
@@ -151,11 +312,9 @@ impl FileOps for ExtRegFileOps {
         self.with_ops(|_inode, ops| {
             let (flags, size, i_block) = {
                 let g = ops.raw.lock();
-                (
-                    g.flags(),
-                    g.size(),
-                    crate::inode::i_block_slice(&g.bytes).to_vec(),
-                )
+                let mut i_block = [0u8; I_BLOCK_BYTES];
+                i_block.copy_from_slice(crate::inode::i_block_slice(&g.bytes));
+                (g.flags(), g.size(), i_block)
             };
             if offset >= size || buf.is_empty() {
                 return Ok(0);
@@ -182,15 +341,12 @@ impl FileOps for ExtRegFileOps {
             let last_lb = ((offset + remaining as u64 - 1) / block_size) as u32;
             let lb_count = last_lb - first_lb + 1;
 
-            let ranges = if flags & crate::layout::EXT4_EXTENTS_FL != 0 {
-                crate::extent::map_contiguous(&self.state, &i_block, first_lb, lb_count)
-                    .map_err(map_err)?
-            } else {
-                crate::map::map_contiguous(&self.state, &i_block, first_lb, lb_count)
-                    .map_err(map_err)?
-            };
+            let ranges = self
+                .map_ranges(flags, size, &i_block, first_lb, lb_count)
+                .map_err(map_err)?;
 
             let mut filled_until = 0usize;
+            let mut scratch = Vec::new();
             for (range_lb, range_count, phys_start) in &ranges {
                 let range_byte_start = *range_lb as u64 * block_size;
                 let range_byte_end = range_byte_start + *range_count as u64 * block_size;
@@ -201,29 +357,20 @@ impl FileOps for ExtRegFileOps {
                 }
                 let overlap_bytes = (read_end - read_start) as usize;
                 let buf_pos = (read_start - offset) as usize;
-                let in_range_offset = (read_start - range_byte_start) as usize;
-                let total_range_bytes = *range_count as usize * block_size as usize;
 
                 if filled_until < buf_pos {
                     zero_bytes(&mut buf[filled_until..buf_pos]);
                 }
 
-                if in_range_offset == 0 && overlap_bytes == total_range_bytes {
-                    self.state
-                        .read_blocks(
-                            *phys_start,
-                            *range_count,
-                            &mut buf[buf_pos..buf_pos + overlap_bytes],
-                        )
-                        .map_err(map_err)?;
-                } else {
-                    let mut blk = vec![0u8; total_range_bytes];
-                    self.state
-                        .read_blocks(*phys_start, *range_count, &mut blk)
-                        .map_err(map_err)?;
-                    buf[buf_pos..buf_pos + overlap_bytes]
-                        .copy_from_slice(&blk[in_range_offset..in_range_offset + overlap_bytes]);
-                }
+                self.read_mapped_bytes(
+                    &mut scratch,
+                    range_byte_start,
+                    *phys_start,
+                    read_start,
+                    read_end,
+                    offset,
+                    buf,
+                )?;
                 filled_until = filled_until.max(buf_pos + overlap_bytes);
             }
             if filled_until < remaining {
@@ -300,6 +447,48 @@ impl FileOps for ExtRegFileOps {
             let last_lb = (end - 1) / block_size;
             let mut written = 0usize;
             let mut file_off = start;
+
+            if flags & crate::layout::EXT4_EXTENTS_FL != 0
+                && start.is_multiple_of(block_size)
+                && buf.len().is_multiple_of(block_size as usize)
+            {
+                while written < buf.len() {
+                    let lb = (file_off / block_size) as u32;
+                    let remain_blocks = ((buf.len() - written) as u64 / block_size) as u32;
+                    let Some((phys, run_blocks)) = extent_wr::ensure_extent_run(
+                        &self.state,
+                        &mut i_block,
+                        lb,
+                        remain_blocks,
+                    )
+                    .map_err(map_err)?
+                    else {
+                        break;
+                    };
+                    let bytes = run_blocks as usize * block_size as usize;
+                    self.state
+                        .write_blocks(phys, run_blocks, &buf[written..written + bytes])
+                        .map_err(map_err)?;
+                    written += bytes;
+                    file_off += bytes as u64;
+                }
+                if written == buf.len() {
+                    raw_guard.i_block_mut().copy_from_slice(&i_block);
+                    raw_guard.set_flags(flags);
+                    if end > raw_guard.size() {
+                        raw_guard.set_size(end);
+                    }
+                    let blocks512 = (raw_guard.size() + 511) / 512;
+                    raw_guard.set_blocks_lo(blocks512 as u32);
+                    write_raw(&self.state, &raw_guard).map_err(map_err)?;
+                    inode.set_size(raw_guard.size());
+                    self.invalidate_map_cache();
+                    return Ok(written);
+                }
+            }
+
+            written = 0;
+            file_off = start;
             let mut cur_blk_buf = vec![0u8; block_size as usize];
             let mut cur_lb: Option<u32> = None;
             let mut cur_phys: u64 = 0;
@@ -348,6 +537,7 @@ impl FileOps for ExtRegFileOps {
             raw_guard.set_blocks_lo(blocks512 as u32);
             write_raw(&self.state, &raw_guard).map_err(map_err)?;
             inode.set_size(raw_guard.size());
+            self.invalidate_map_cache();
 
             Ok(written)
         })
@@ -411,4 +601,49 @@ fn zero_bytes(buf: &mut [u8]) {
             core::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
         }
     }
+}
+
+fn read_partial_block(
+    state: &FsState,
+    scratch: &mut Vec<u8>,
+    phys: u64,
+    block_off: usize,
+    take: usize,
+    cur: u64,
+    request_offset: u64,
+    dst: &mut [u8],
+) -> Result<(), crate::state::BlockBackendError> {
+    let block_size = state.ext_sb.block_size as usize;
+    if scratch.len() != block_size {
+        scratch.resize(block_size, 0);
+    }
+    state.read_block(phys, scratch)?;
+    let dst_pos = (cur - request_offset) as usize;
+    dst[dst_pos..dst_pos + take].copy_from_slice(&scratch[block_off..block_off + take]);
+    Ok(())
+}
+
+fn clip_ranges(ranges: &[(u32, u32, u64)], first_lb: u32, lb_count: u32) -> Vec<(u32, u32, u64)> {
+    if lb_count == 0 {
+        return Vec::new();
+    }
+    let end_lb = first_lb.saturating_add(lb_count);
+    let mut out = Vec::new();
+    for &(range_lb, range_count, phys_start) in ranges {
+        let range_end = range_lb.saturating_add(range_count);
+        if range_end <= first_lb || range_lb >= end_lb {
+            continue;
+        }
+        let overlap_start = range_lb.max(first_lb);
+        let overlap_end = range_end.min(end_lb);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        out.push((
+            overlap_start,
+            overlap_end - overlap_start,
+            phys_start + (overlap_start - range_lb) as u64,
+        ));
+    }
+    out
 }

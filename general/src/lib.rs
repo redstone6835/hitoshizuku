@@ -26,11 +26,10 @@ pub use start::*;
 pub use task::*;
 pub use trap::*;
 
-pub mod mm;
-pub mod syscall;
-pub mod vfs;
-
 pub mod console;
 pub mod dev;
 pub mod dtb;
 pub mod firmware;
+pub mod mm;
+pub mod syscall;
+pub mod vfs;

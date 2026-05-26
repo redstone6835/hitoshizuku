@@ -10,6 +10,7 @@
 /// 超级块起始字节(不随 block_size 变化)。
 pub(crate) const SUPERBLOCK_OFFSET: u64 = 1024;
 pub(crate) const SUPERBLOCK_SIZE: usize = 1024;
+pub(crate) const SUPERBLOCK_CHECKSUM_OFFSET: usize = 0x3fc;
 pub(crate) const SUPERBLOCK_MAGIC: u16 = 0xef53;
 
 /// 根目录的 inode 号。

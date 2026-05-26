@@ -1,28 +1,35 @@
-//! `acpi` 是一个与 ACPI（高级配置与电源接口）交互的 Rust 库。ACPI 是用于电源管理、
-//! 设备发现与配置的复杂框架，广泛用于现代 x64、ARM 和 RISC-V 平台。操作系统需要通过
-//! ACPI 正确设置平台的中断控制器、执行电源管理并支持其他平台能力。
+//! `acpi` is a Rust library for interacting with the Advanced Configuration and Power Interface, a
+//! complex framework for power management and device discovery and configuration. ACPI is used on
+//! modern x64, as well as some ARM and RISC-V platforms. An operating system needs to interact with
+//! ACPI to correctly set up a platform's interrupt controllers, perform power management, and fully
+//! support many other platform capabilities.
 //!
-//! 本 crate 提供无需分配器的受限 API，可在引导加载程序中使用。这部分 API 支持搜索
-//! RSDP、枚举可用表以及使用表的原始结构。其他功能位于 `alloc` feature 之后（默认启用），
-//! 需要分配器支持。
+//! This crate provides a limited API that can be used without an allocator, for example for use
+//! from a bootloader. This API will allow you to search for the RSDP, enumerate over the available
+//! tables, and interact with the tables using their raw structures. All other functionality is
+//! behind an `alloc` feature (enabled by default) and requires an allocator.
 //!
-//! 在有分配器时，本 crate 还提供静态表的高层接口以及 AML（编码在 DSDT 和 SSDT 中的
-//! 字节码格式）的动态解释器。
+//! With an allocator, this crate also provides higher-level interfaces to the static tables, as
+//! well as a dynamic interpreter for AML - the bytecode format encoded in the DSDT and SSDT
+//! tables.
 //!
-//! ### 使用方式
-//! 使用本库需要提供 [`Handler`] trait 的实现，该 trait 允许库请求将物理内存区域映射
-//! 到虚拟地址空间等操作。
+//! ### Usage
+//! To use the library, you will need to provide an implementation of the [`Handler`] trait,
+//! which allows the library to make requests such as mapping a particular region of physical
+//! memory into the virtual address space.
 //!
-//! 接下来需要获取 RSDP 或 RSDT/XSDT 的物理地址。获取方法取决于运行平台和启动方式。
-//! 如果系统通过 BIOS 启动，可以使用 [`rsdp::Rsdp::search_for_on_bios`]。UEFI 提供了
-//! 获取 RSDP 地址的单独机制。
+//! Next, you'll need to get the physical address of either the RSDP, or the RSDT/XSDT. The method
+//! for doing this depends on the platform you're running on and how you were booted. If you know
+//! the system was booted via the BIOS, you can use [`rsdp::Rsdp::search_for_on_bios`]. UEFI provides a
+//! separate mechanism for getting the address of the RSDP.
 //!
-//! 然后需要构造 [`AcpiTables`] 实例，根据已有信息可选择：
-//! * 如果有 RSDP 物理地址，使用 [`AcpiTables::from_rsdp`]
-//! * 如果有 RSDT/XSDT 物理地址，使用 [`AcpiTables::from_rsdt`]
+//! You then need to construct an instance of [`AcpiTables`], which can be done in a few ways
+//! depending on how much information you have:
+//! * Use [`AcpiTables::from_rsdp`] if you have the physical address of the RSDP
+//! * Use [`AcpiTables::from_rsdt`] if you have the physical address of the RSDT/XSDT
 //!
-//! 获取 [`AcpiTables`] 后即可搜索相关表，或使用高层接口如 [`PlatformInfo`]、
-//! [`PciConfigRegions`] 或 [`HpetInfo`]。
+//! Once you have an [`AcpiTables`], you can search for relevant tables, or use the higher-level
+//! interfaces, such as [`PlatformInfo`], [`PciConfigRegions`], or [`HpetInfo`].
 
 #![no_std]
 
@@ -48,7 +55,8 @@ use core::{
 use log::warning as warn;
 use rsdp::Rsdp;
 
-/// 在找到 RSDP 或 RSDT/XSDT 后构造，用于枚举系统的 ACPI 表。
+/// `AcpiTables` should be constructed after finding the RSDP or RSDT/XSDT and allows enumeration
+/// of the system's ACPI tables.
 pub struct AcpiTables<H: Handler> {
     rsdt_mapping: PhysicalMapping<H, SdtHeader>,
     pub rsdp_revision: u8,
@@ -62,10 +70,10 @@ impl<H> AcpiTables<H>
 where
     H: Handler,
 {
-    /// 从 RSDP 的**物理**地址构造 `AcpiTables`。
+    /// Construct an `AcpiTables` from the **physical** address of the RSDP.
     ///
     /// # Safety
-    /// RSDP 的地址必须有效。
+    /// The address of the RSDP must be valid.
     pub unsafe fn from_rsdp(handler: H, rsdp_address: usize) -> Result<AcpiTables<H>, AcpiError> {
         let rsdp_mapping = unsafe { handler.map_physical_region::<Rsdp>(rsdp_address, mem::size_of::<Rsdp>()) };
 
@@ -98,10 +106,11 @@ where
         unsafe { Self::from_rsdt(handler, rsdp_revision, rsdt_address) }
     }
 
-    /// 从 RSDT/XSDT 的**物理**地址和 RSDP 中的版本号构造 `AcpiTables`。
+    /// Construct an `AcpiTables` from the **physical** address of the RSDT/XSDT, and the revision
+    /// found in the RSDP.
     ///
     /// # Safety
-    /// RSDT 的地址必须有效。
+    /// The address of the RSDT must be valid.
     pub unsafe fn from_rsdt(
         handler: H,
         rsdp_revision: u8,
@@ -114,7 +123,7 @@ where
         Ok(Self { rsdt_mapping, rsdp_revision, handler })
     }
 
-    /// 遍历 SDT 的**物理**地址列表。
+    /// Iterate over the **physical** addresses of the SDTs.
     pub fn table_entries(&self) -> impl Iterator<Item = usize> {
         let entry_size = if self.rsdp_revision == 0 { 4 } else { 8 };
         let mut table_entries_ptr =
@@ -140,7 +149,7 @@ where
         })
     }
 
-    /// 遍历每个 SDT 的头部及其**物理**地址。
+    /// Iterate over the headers of each SDT, along with their **physical** addresses.
     pub fn table_headers(&self) -> impl Iterator<Item = (usize, SdtHeader)> {
         self.table_entries().map(|table_phys_address| {
             let mapping = unsafe {
@@ -150,7 +159,7 @@ where
         })
     }
 
-    /// 查找所有签名为 `T::SIGNATURE` 的表。
+    /// Find all tables with the signature `T::SIGNATURE`.
     pub fn find_tables<T>(&self) -> impl Iterator<Item = PhysicalMapping<H, T>>
     where
         T: AcpiTable,
@@ -170,7 +179,7 @@ where
         })
     }
 
-    /// 查找第一个签名为 `T::SIGNATURE` 的表。
+    /// Find the first table with the signature `T::SIGNATURE`.
     pub fn find_table<T>(&self) -> Option<PhysicalMapping<H, T>>
     where
         T: AcpiTable,
@@ -201,19 +210,22 @@ where
 
 #[derive(Clone, Copy, Debug)]
 pub struct AmlTable {
-    /// 表的起始物理地址。加上 `mem::size_of::<SdtHeader>()` 即为 AML 流的起始物理地址。
+    /// The physical address of the start of the table. Add `mem::size_of::<SdtHeader>()` to this
+    /// to get the physical address of the start of the AML stream.
     pub phys_address: usize,
-    /// 表的长度，包含头部。
+    /// The length of the table, including the header.
     pub length: u32,
     pub revision: u8,
 }
 
-/// 所有表示 ACPI 表的类型都应实现此 trait。
+/// All types representing ACPI tables should implement this trait.
 ///
 /// ### Safety
-/// 表的内存被直接解释，因此必须提供能正确表示表结构的类型。无论提供的类型大小如何，
-/// 映射的区域大小始终按 SDT 头中的指定值。如果表定义可能大于有效 SDT 的大小，
-/// 应使用 [`ExtendedField`](sdt::ExtendedField) 来定义可能存在也可能不存在的字段。
+/// The table's memory is naively interpreted, so you must be careful in providing a type that
+/// correctly represents the table's structure. Regardless of the provided type's size, the region mapped will
+/// be the size specified in the SDT's header. If a table's definition may be larger than a valid
+/// SDT's size, [`ExtendedField`](sdt::ExtendedField) should be used to define fields that may or
+/// may not exist.
 pub unsafe trait AcpiTable {
     const SIGNATURE: Signature;
 

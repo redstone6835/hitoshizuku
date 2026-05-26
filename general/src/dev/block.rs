@@ -244,6 +244,31 @@ pub trait BlockIo: Send + Sync {
     /// 请求可以在没有外部中断入口时被回收并触发 completion。
     fn poll(&self) {}
 
+    /// 同步读若干扇区到虚拟地址缓冲区。
+    ///
+    /// 驱动内部负责地址转换（RAM 设备直接 memcpy，VirtIO 设备自行 virt_to_phys）。
+    /// 跳过 `Box<[u8]>` 分配和完成回调的全部开销。
+    ///
+    /// 默认实现返回 `Unsupported`，调用方应回退到 `submit` 路径。
+    fn read_sectors_sync(
+        &self,
+        _lba: u64,
+        _count: u32,
+        _buf: &mut [u8],
+    ) -> Result<(), BlockIoError> {
+        Err(BlockIoError::Unsupported)
+    }
+
+    /// 同步写若干扇区，对称于 `read_sectors_sync`。
+    fn write_sectors_sync(
+        &self,
+        _lba: u64,
+        _count: u32,
+        _buf: &[u8],
+    ) -> Result<(), BlockIoError> {
+        Err(BlockIoError::Unsupported)
+    }
+
     /// 同步读若干扇区到物理地址 `phys`(长度 `len`)的内存范围。
     ///
     /// 这是 FS 层调用 [`SyncBlockBackend`](super::block_sync::SyncBlockBackend) 的
@@ -470,6 +495,81 @@ impl BlockDevice {
             return None;
         }
         self.io.as_any().downcast_ref::<T>()
+    }
+
+    /// 同步读扇区到虚拟地址缓冲区（零拷贝快速路径）。
+    ///
+    /// 驱动内部负责地址转换。跳过 Box 分配和完成回调。
+    /// 不支持时返回 `Unsupported`，调用方回退到 `submit` 路径。
+    pub fn read_sync(
+        self: &Arc<Self>,
+        lba: u64,
+        count: u32,
+        buf: &mut [u8],
+    ) -> Result<(), BlockSubmitError> {
+        if !self.is_active() {
+            return Err(BlockSubmitError::DeviceGone);
+        }
+        if count == 0 {
+            return Err(BlockSubmitError::InvalidRequest(BlockRequestError::EmptyRange));
+        }
+        let bps = self.geometry.logical_block_size().get() as usize;
+        let want = (count as usize).checked_mul(bps)
+            .ok_or(BlockSubmitError::InvalidRequest(BlockRequestError::BufferSizeMismatch))?;
+        if buf.len() < want {
+            return Err(BlockSubmitError::InvalidRequest(BlockRequestError::BufferSizeMismatch));
+        }
+        if let Some(total) = self.geometry.block_count() {
+            let end = lba.checked_add(count as u64)
+                .ok_or(BlockSubmitError::InvalidRequest(BlockRequestError::OutOfBounds))?;
+            if end > total {
+                return Err(BlockSubmitError::InvalidRequest(BlockRequestError::OutOfBounds));
+            }
+        }
+        let token = self.try_begin_io()?;
+        let res = self.io.read_sectors_sync(lba, count, buf);
+        token.finish();
+        match res {
+            Ok(()) => Ok(()),
+            Err(BlockIoError::Unsupported) => Err(BlockSubmitError::Unsupported),
+            Err(_) => Err(BlockSubmitError::InvalidRequest(BlockRequestError::OutOfBounds)),
+        }
+    }
+
+    /// 同步写扇区（对称于 `read_sync`）。
+    pub fn write_sync(
+        self: &Arc<Self>,
+        lba: u64,
+        count: u32,
+        buf: &[u8],
+    ) -> Result<(), BlockSubmitError> {
+        if !self.is_active() {
+            return Err(BlockSubmitError::DeviceGone);
+        }
+        if count == 0 {
+            return Err(BlockSubmitError::InvalidRequest(BlockRequestError::EmptyRange));
+        }
+        let bps = self.geometry.logical_block_size().get() as usize;
+        let want = (count as usize).checked_mul(bps)
+            .ok_or(BlockSubmitError::InvalidRequest(BlockRequestError::BufferSizeMismatch))?;
+        if buf.len() < want {
+            return Err(BlockSubmitError::InvalidRequest(BlockRequestError::BufferSizeMismatch));
+        }
+        if let Some(total) = self.geometry.block_count() {
+            let end = lba.checked_add(count as u64)
+                .ok_or(BlockSubmitError::InvalidRequest(BlockRequestError::OutOfBounds))?;
+            if end > total {
+                return Err(BlockSubmitError::InvalidRequest(BlockRequestError::OutOfBounds));
+            }
+        }
+        let token = self.try_begin_io()?;
+        let res = self.io.write_sectors_sync(lba, count, buf);
+        token.finish();
+        match res {
+            Ok(()) => Ok(()),
+            Err(BlockIoError::Unsupported) => Err(BlockSubmitError::Unsupported),
+            Err(_) => Err(BlockSubmitError::InvalidRequest(BlockRequestError::OutOfBounds)),
+        }
     }
 
     /// 同步读扇区到物理地址 `phys` 的内存范围。

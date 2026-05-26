@@ -154,47 +154,28 @@ impl AllocationRegistry {
 
         let bucket = bucket_index(record.ptr, inner.bucket_count);
         let head = bucket_head(&inner, bucket);
-        if find_node(head, record.ptr).is_some() {
-            inner.insert_failures += 1;
-            inner.duplicate_inserts += 1;
-            return Err(RegistryError::DuplicatePointer);
-        }
-
-        if inner.free_nodes != 0 {
-            let node_addr = pop_free_node(&mut inner);
-            if head != 0 {
-                inner.collisions += 1;
-            }
-            insert_node(&mut inner, bucket, head, node_addr, record);
-            return Ok(());
-        }
-        drop(inner);
-
-        let Some(node_addr) = alloc_fresh_node(boot) else {
-            let mut inner = self.inner.lock();
-            inner.insert_failures += 1;
-            return Err(RegistryError::MetadataOutOfMemory);
-        };
-
-        let mut inner = self.inner.lock();
-        if !inner.initialized {
-            recycle_node(&mut inner, node_addr, record);
-            inner.insert_failures += 1;
-            return Err(RegistryError::NotInitialized);
-        }
-        let bucket = bucket_index(record.ptr, inner.bucket_count);
-        let head = bucket_head(&inner, bucket);
         if head != 0 {
             inner.collisions += 1;
         }
         if find_node(head, record.ptr).is_some() {
-            recycle_node(&mut inner, node_addr, record);
             inner.insert_failures += 1;
             inner.duplicate_inserts += 1;
             return Err(RegistryError::DuplicatePointer);
         }
 
-        insert_node(&mut inner, bucket, head, node_addr, record);
+        let Some(node_addr) = alloc_node(&mut inner, boot) else {
+            inner.insert_failures += 1;
+            return Err(RegistryError::MetadataOutOfMemory);
+        };
+
+        write_node(node_addr, RegistryNode { record, next: head });
+        set_bucket_head(&inner, bucket, node_addr);
+        inner.live_records += 1;
+        inner.live_by_kind[kind_index(record.kind)] += 1;
+        let chain_len = 1 + chain_len(head);
+        if chain_len > inner.max_chain_len {
+            inner.max_chain_len = chain_len;
+        }
         Ok(())
     }
 
@@ -335,14 +316,14 @@ impl AllocationRegistry {
     }
 }
 
-fn pop_free_node(inner: &mut AllocationRegistryInner) -> usize {
-    let node_addr = inner.free_nodes;
-    let node = read_node(node_addr);
-    inner.free_nodes = node.next;
-    node_addr
-}
+fn alloc_node(inner: &mut AllocationRegistryInner, boot: &BootAllocator) -> Option<usize> {
+    if inner.free_nodes != 0 {
+        let node_addr = inner.free_nodes;
+        let node = read_node(node_addr);
+        inner.free_nodes = node.next;
+        return Some(node_addr);
+    }
 
-fn alloc_fresh_node(boot: &BootAllocator) -> Option<usize> {
     let ptr = {
         let ptr = crate::alloc_internal_metadata(Layout::new::<RegistryNode>()) as usize;
         if ptr == 0 {
@@ -352,38 +333,6 @@ fn alloc_fresh_node(boot: &BootAllocator) -> Option<usize> {
         }
     };
     (ptr != 0).then_some(ptr)
-}
-
-fn recycle_node(
-    inner: &mut AllocationRegistryInner,
-    node_addr: usize,
-    record: AllocationRecord,
-) {
-    write_node(
-        node_addr,
-        RegistryNode {
-            record,
-            next: inner.free_nodes,
-        },
-    );
-    inner.free_nodes = node_addr;
-}
-
-fn insert_node(
-    inner: &mut AllocationRegistryInner,
-    bucket: usize,
-    head: usize,
-    node_addr: usize,
-    record: AllocationRecord,
-) {
-    write_node(node_addr, RegistryNode { record, next: head });
-    set_bucket_head(inner, bucket, node_addr);
-    inner.live_records += 1;
-    inner.live_by_kind[kind_index(record.kind)] += 1;
-    let chain_len = 1 + chain_len(head);
-    if chain_len > inner.max_chain_len {
-        inner.max_chain_len = chain_len;
-    }
 }
 
 fn bucket_index(ptr: usize, bucket_count: usize) -> usize {

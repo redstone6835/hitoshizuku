@@ -15,15 +15,14 @@ bench = false
 
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
-arch = { path = "../arch" }
+elf = { path = "../libs/elf" }
+errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
 general = { path = "../general" }
 log = { path = "../libs/log" }
 allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
-elf = { path = "../libs/elf" }
-errno = { path = "../libs/errno" }
 mm = { path = "../libs/mm" }
 sched = { path = "../libs/sched" }
 vfs = { path = "../libs/vfs" }

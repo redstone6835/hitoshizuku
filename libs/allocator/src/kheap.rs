@@ -88,11 +88,6 @@ impl KernelHeap {
         self.realloc_requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[inline]
-    fn is_debug_enabled() -> bool {
-        log::get_log_level() >= log::LogLevel::Debug
-    }
-
     pub fn alloc_range(
         &self,
         layout: Layout,
@@ -100,20 +95,8 @@ impl KernelHeap {
         phys: &crate::Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> Result<BackedRange, AllocationError> {
-        let aligned = layout.pad_to_align();
         let (order, page_policy) = effective_layout_policy(layout, page_policy);
         let block_pages = 1usize << order;
-
-        if Self::is_debug_enabled() {
-            log::debug!(
-                "[alloc][kheap] request size={} align={} order={} pages={} page_policy={:?}",
-                aligned.size(),
-                aligned.align(),
-                order,
-                block_pages,
-                page_policy,
-            );
-        }
 
         if !self.is_initialized() {
             self.alloc_failures.fetch_add(1, Ordering::Relaxed);
@@ -127,15 +110,6 @@ impl KernelHeap {
                 self.alloc_failures.fetch_add(1, Ordering::Relaxed);
                 self.address_reservation_failures
                     .fetch_add(1, Ordering::Relaxed);
-                if Self::is_debug_enabled() {
-                    log::debug!(
-                        "[alloc][kheap] failed size={} align={} order={} err={:?}",
-                        aligned.size(),
-                        aligned.align(),
-                        order,
-                        err,
-                    );
-                }
                 return Err(AllocationError::AddressSpace(err));
             }
         };
@@ -145,16 +119,6 @@ impl KernelHeap {
         self.active_bytes
             .fetch_add(block_pages * PAGE_SIZE, Ordering::Relaxed);
 
-        if Self::is_debug_enabled() {
-            log::debug!(
-                "[alloc][kheap] success vaddr={:#x} paddr={:#x} size={} order={} pages={}",
-                range.vaddr,
-                range.paddr,
-                range.size,
-                range.order,
-                block_pages,
-            );
-        }
         Ok(range)
     }
 
@@ -178,16 +142,6 @@ impl KernelHeap {
             }
         };
         let order = record.order;
-
-        if Self::is_debug_enabled() {
-            log::debug!(
-                "[alloc][kheap] free ptr={:#x} paddr={:#x} order={} size={}",
-                record.ptr,
-                paddr,
-                order,
-                (1usize << order) * PAGE_SIZE,
-            );
-        }
 
         vmem.free_kernel_backed_range(
             BackedRange {

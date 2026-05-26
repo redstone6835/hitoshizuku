@@ -397,15 +397,6 @@ impl BuddyAllocator {
 
         let order = required_order_for_request(request)?;
         let page_size = (1usize << order) * PAGE_SIZE;
-        log::debug!(
-            "[alloc][buddy] request size={} align={} order={} page_size={} page_policy={:?} placement={:?}",
-            request.size,
-            request.align,
-            order,
-            page_size,
-            request.page_policy,
-            request.placement,
-        );
 
         let paddr = match request.placement {
             MemoryPlacement::ExactPhys(addr) => self.alloc_pages_exact(addr, order)?,
@@ -786,9 +777,10 @@ impl BuddyAllocator {
         let mut current = range_start;
         while current < range_end {
             let available = range_end - current;
-            let order = best_seed_order(seg.max_order, current, available);
-            let block_pages = 1usize << order;
             let start = seg.range.start + current * PAGE_SIZE;
+            let pfn = start / PAGE_SIZE;
+            let order = best_seed_order(seg.max_order, pfn, available);
+            let block_pages = 1usize << order;
             let node_addr = self
                 .new_node(start, order, seg_idx, seg.fl_type, true)
                 .ok_or(BuddyInitError::MetadataOutOfMemory)?;
@@ -1257,16 +1249,11 @@ impl<'a> Iterator for BuddyFreeBlockIter<'a> {
 
 #[inline]
 fn node_ref(addr: usize) -> &'static BlockNode {
-    // Safety: addr 指向已初始化、正确对齐的有效 BlockNode。所有调用方传入的地址
-    // 均来自 alloc_node_raw（boot 驱动的 bump 分配）或 node_freelist，
-    // 这些地址一定有效。返回的引用不可变，且节点不会被并发修改。
     unsafe { &*(addr as *const BlockNode) }
 }
 
 #[inline]
 fn node_mut(addr: usize) -> &'static mut BlockNode {
-    // Safety: 前提条件同 node_ref，且额外保证独占访问。调用方必须持有
-    // BuddyAllocator 的 &mut self，从而序列化所有对 BlockNode 的修改。
     unsafe { &mut *(addr as *mut BlockNode) }
 }
 

@@ -66,7 +66,7 @@ pub struct BackedRange {
 
 /// 地址空间层统计信息。
 ///
-/// 它分别描述 direct-map、kernel、managed 三个 arena 的使用状态，并额外给出
+/// 它分别描述 linear-map、kernel、managed 三个 arena 的使用状态，并额外给出
 /// managed 子系统是否已经启用。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AddressSpaceStats {
@@ -179,7 +179,7 @@ impl KernelAddressSpace {
             // 由 `kernel` arena + buddy 共同决定，direct_map 只承担“物理 span 视图”
             // 与统计角色。此时再把 kernel/metadata carve-out 逐个同步到 direct_map，
             // 既不会提升分配正确性，反而会把启动路径重新拉回脆弱且高开销的
-            // reserve-from-tag 逻辑。只有在 kernel arena 退化为 direct-map 模式时，
+            // reserve-from-tag 逻辑。只有在 kernel arena 退化为 linear-map 模式时，
             // direct_map 的精确保留才真正影响地址分配结果。
             if kernel_heap_region.1 == 0 {
                 for &(start, end) in reserved_phys {
@@ -416,12 +416,6 @@ impl KernelAddressSpace {
             });
         }
         self.managed_enabled.store(true, Ordering::Release);
-        log::debug!(
-            "[alloc][vmem] managed heap initialized base={:#x} size={} order={}",
-            range.vaddr,
-            range.size,
-            order,
-        );
         Ok(BackedRange {
             arena: ArenaKind::Managed,
             ..range
@@ -464,12 +458,6 @@ impl KernelAddressSpace {
                 _ => AddressSpaceError::InvalidRange,
             });
         }
-        log::debug!(
-            "[alloc][vmem] managed heap expanded base={:#x} size={} order={}",
-            range.vaddr,
-            range.size,
-            order,
-        );
         Ok(BackedRange {
             arena: ArenaKind::Managed,
             ..range
@@ -484,35 +472,14 @@ impl KernelAddressSpace {
         if !self.managed_enabled() {
             return Err(AddressSpaceError::ManagedUnavailable);
         }
-        log::debug!(
-            "[alloc][vmem] managed alloc request size={} align={}",
-            size,
-            align,
-        );
         let result = self
             .managed
             .lock()
             .alloc_result(size, align)
             .map_err(AddressSpaceError::from);
         match result {
-            Ok(addr) => {
-                log::debug!(
-                    "[alloc][vmem] managed alloc success addr={:#x} size={} align={}",
-                    addr,
-                    size,
-                    align,
-                );
-                Ok(addr)
-            }
-            Err(err) => {
-                log::debug!(
-                    "[alloc][vmem] managed alloc failed size={} align={} err={:?}",
-                    size,
-                    align,
-                    err,
-                );
-                Err(err)
-            }
+            Ok(addr) => Ok(addr),
+            Err(err) => Err(err),
         }
     }
 
@@ -526,41 +493,14 @@ impl KernelAddressSpace {
         if !self.managed_enabled() {
             return Err(AddressSpaceError::ManagedUnavailable);
         }
-        log::debug!(
-            "[alloc][vmem] managed ranged alloc request start={:#x} end={:#x} size={} align={}",
-            range_start,
-            range_end,
-            size,
-            align,
-        );
         let result = self
             .managed
             .lock()
             .alloc_in_range_result(range_start, range_end, size, align)
             .map_err(AddressSpaceError::from);
         match result {
-            Ok(addr) => {
-                log::debug!(
-                    "[alloc][vmem] managed ranged alloc success addr={:#x} start={:#x} end={:#x} size={} align={}",
-                    addr,
-                    range_start,
-                    range_end,
-                    size,
-                    align,
-                );
-                Ok(addr)
-            }
-            Err(err) => {
-                log::debug!(
-                    "[alloc][vmem] managed ranged alloc failed start={:#x} end={:#x} size={} align={} err={:?}",
-                    range_start,
-                    range_end,
-                    size,
-                    align,
-                    err,
-                );
-                Err(err)
-            }
+            Ok(addr) => Ok(addr),
+            Err(err) => Err(err),
         }
     }
 
@@ -572,7 +512,6 @@ impl KernelAddressSpace {
             .lock()
             .free_result(addr, size)
             .map_err(AddressSpaceError::from)?;
-        log::debug!("[alloc][vmem] managed free addr={:#x} size={}", addr, size,);
         Ok(())
     }
 
@@ -661,13 +600,6 @@ impl KernelAddressSpace {
         let order = effective_order_for_page_policy(order, page_policy);
         let block_pages = 1usize << order;
         let size = block_pages * PAGE_SIZE;
-        log::debug!(
-            "[alloc][vmem] backed request arena={:?} order={} pages={} size={}",
-            arena,
-            order,
-            block_pages,
-            size,
-        );
 
         // 第一步：分配虚拟地址（短暂持有 arena_lock）
         let vaddr = {
@@ -676,25 +608,10 @@ impl KernelAddressSpace {
             match arena_state.alloc(size, size) {
                 Some(vaddr) => vaddr,
                 None => {
-                    log::debug!(
-                        "[alloc][vmem] arena alloc failed arena={:?} order={} size={}",
-                        arena,
-                        order,
-                        size,
-                    );
                     return Err(AddressSpaceError::OutOfVirtualAddressSpace);
                 }
             }
         }; // arena_lock released here
-
-        log::debug!(
-            "[alloc][vmem] arena alloc success arena={:?} vaddr={:#x} size={} align={} page_policy={:?}",
-            arena,
-            vaddr,
-            size,
-            size,
-            page_policy,
-        );
 
         let placement =
             if arena == ArenaKind::Kernel && self.kernel_direct_map.load(Ordering::Acquire) {
@@ -719,16 +636,9 @@ impl KernelAddressSpace {
 
         let allocation = match allocation {
             Ok(alloc) => alloc,
-            Err(err) => {
+            Err(_) => {
                 // 回滚：释放虚拟地址
                 let _ = self.arena_lock(arena).lock().free(vaddr, size);
-                log::debug!(
-                    "[alloc][vmem] phys alloc failed arena={:?} vaddr={:#x} size={} err={:?}",
-                    arena,
-                    vaddr,
-                    size,
-                    err,
-                );
                 return Err(AddressSpaceError::PhysicalRangeUnavailable);
             }
         };
@@ -745,29 +655,12 @@ impl KernelAddressSpace {
                 return Err(AddressSpaceError::MappingUnavailable);
             };
 
-            log::debug!(
-                "[alloc][vmem] map request arena={:?} vaddr={:#x} paddr={:#x} size={} page_policy={:?}",
-                arena,
-                vaddr,
-                allocation.paddr,
-                allocation.size,
-                page_policy,
-            );
-
             // 在没有任何 allocator 锁的情况下调用 map_fn
             if !map_fn(vaddr, allocation.paddr, allocation.size, page_policy) {
                 // 回滚：同时释放虚拟地址和物理页
                 let _ = self.arena_lock(arena).lock().free(vaddr, size);
                 let mut phys = phys.lock();
                 let _ = phys.free_pages(allocation.paddr, allocation.order);
-                log::debug!(
-                    "[alloc][vmem] map failed arena={:?} vaddr={:#x} paddr={:#x} size={} page_policy={:?}",
-                    arena,
-                    vaddr,
-                    allocation.paddr,
-                    allocation.size,
-                    page_policy,
-                );
                 return Err(AddressSpaceError::MappingFailed);
             }
         }
@@ -779,14 +672,6 @@ impl KernelAddressSpace {
             size: allocation.size, // 使用 buddy 分配器返回的 allocation.size
             order: allocation.order,
         };
-        log::debug!(
-            "[alloc][vmem] backed success arena={:?} vaddr={:#x} paddr={:#x} order={} size={}",
-            backed.arena,
-            backed.vaddr,
-            backed.paddr,
-            backed.order,
-            backed.size,
-        );
         Ok(backed)
     }
 
@@ -805,14 +690,6 @@ impl KernelAddressSpace {
         let order = effective_order_for_page_policy(order, page_policy);
         let block_pages = 1usize << order;
         let size = block_pages * PAGE_SIZE;
-        log::debug!(
-            "[alloc][vmem] backed exact request arena={:?} vaddr={:#x} order={} pages={} size={}",
-            arena,
-            vaddr,
-            order,
-            block_pages,
-            size,
-        );
 
         {
             let arena_lock = self.arena_lock(arena);
@@ -874,14 +751,6 @@ impl KernelAddressSpace {
             size: allocation.size,
             order: allocation.order,
         };
-        log::debug!(
-            "[alloc][vmem] backed exact success arena={:?} vaddr={:#x} paddr={:#x} order={} size={}",
-            backed.arena,
-            backed.vaddr,
-            backed.paddr,
-            backed.order,
-            backed.size,
-        );
         Ok(backed)
     }
 
@@ -891,26 +760,8 @@ impl KernelAddressSpace {
         phys: &Mutex<BuddyAllocator>,
     ) -> Result<(), AddressSpaceError> {
         if !self.is_initialized() {
-            log::debug!(
-                "[alloc][vmem] backed free rejected arena={:?} vaddr={:#x} paddr={:#x} order={} size={} err={:?}",
-                range.arena,
-                range.vaddr,
-                range.paddr,
-                range.order,
-                range.size,
-                AddressSpaceError::NotInitialized,
-            );
             return Err(AddressSpaceError::NotInitialized);
         }
-
-        log::debug!(
-            "[alloc][vmem] backed free request arena={:?} vaddr={:#x} paddr={:#x} order={} size={}",
-            range.arena,
-            range.vaddr,
-            range.paddr,
-            range.order,
-            range.size,
-        );
 
         if range.arena != ArenaKind::DirectMap
             && !(range.arena == ArenaKind::Kernel && self.kernel_direct_map.load(Ordering::Acquire))
@@ -948,14 +799,6 @@ impl KernelAddressSpace {
             );
         }
 
-        log::debug!(
-            "[alloc][vmem] backed free arena={:?} vaddr={:#x} paddr={:#x} order={} size={}",
-            range.arena,
-            range.vaddr,
-            range.paddr,
-            range.order,
-            range.size,
-        );
         Ok(())
     }
 }

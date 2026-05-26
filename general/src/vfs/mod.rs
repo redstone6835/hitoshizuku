@@ -44,8 +44,8 @@ pub fn namespace_path(
     dentry: &Arc<Dentry>,
     mount: &Arc<Mount>,
 ) -> Option<String> {
-    let root_mount = ctx.root_mount();
-    let visible_root = ctx.root_dentry();
+    let root_mount = ctx.root.mount();
+    let visible_root = ctx.root.root();
     let mut current_mount = Arc::clone(mount);
     let mut path = if Arc::ptr_eq(&current_mount, &root_mount) {
         dentry.full_path(&visible_root)?

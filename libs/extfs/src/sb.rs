@@ -182,15 +182,8 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
 
     // 若启用 METADATA_CSUM,校验超级块自身:字段 0x3fc..0x400 是 s_checksum
     if metadata_csum {
-        let expect = le32(sb, 0x3fc);
-        let mut buf = [0u8; SUPERBLOCK_SIZE];
-        buf.copy_from_slice(sb);
-        // 把 checksum 字段清零后对整个超级块做 crc32c,seed = 0xFFFFFFFF
-        buf[0x3fc] = 0;
-        buf[0x3fd] = 0;
-        buf[0x3fe] = 0;
-        buf[0x3ff] = 0;
-        let actual = crc::crc32c(&buf);
+        let expect = le32(sb, SUPERBLOCK_CHECKSUM_OFFSET);
+        let actual = crc::crc32c(&sb[..SUPERBLOCK_CHECKSUM_OFFSET]);
         if actual != expect {
             return Err(BlockBackendError::OutOfRange);
         }

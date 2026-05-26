@@ -792,6 +792,26 @@ impl BlockIo for VirtioBlkPciIo {
         self.driver.poll();
     }
 
+    fn read_sectors_sync_phys(
+        &self,
+        lba: u64,
+        _count: u32,
+        phys: u64,
+        len: usize,
+    ) -> Result<(), BlockIoError> {
+        self.sync_io_phys(VIRTIO_BLK_T_IN, lba, phys, len as u32, true)
+    }
+
+    fn write_sectors_sync_phys(
+        &self,
+        lba: u64,
+        _count: u32,
+        phys: u64,
+        len: usize,
+    ) -> Result<(), BlockIoError> {
+        self.sync_io_phys(VIRTIO_BLK_T_OUT, lba, phys, len as u32, false)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -802,6 +822,96 @@ impl VirtioBlkPciIo {
     #[allow(dead_code)]
     pub fn on_interrupt(&self) {
         self.driver.handle_interrupt();
+    }
+
+    /// 同步零拷贝 I/O：直接用调用方的物理地址做 DMA，自旋等完成。
+    /// 跳过 Box 分配、completion 回调、Arc 等所有异步开销。
+    fn sync_io_phys(
+        &self,
+        req_type: u32,
+        sector: u64,
+        data_phys: u64,
+        data_len: u32,
+        device_writes_data: bool,
+    ) -> Result<(), BlockIoError> {
+        let meta = VirtioBlkReqMeta {
+            header: VirtioBlkReqHeader {
+                req_type,
+                reserved: 0,
+                sector,
+            },
+            status: 0xff,
+            _pad: [0; 7],
+        };
+        let header_phys =
+            (self.virt_to_phys)(&meta.header as *const _ as usize) as u64;
+        let status_phys =
+            (self.virt_to_phys)(&meta.status as *const _ as usize) as u64;
+
+        let mut queue = self.driver.inner.queue.lock();
+        if queue.free_desc.len() < 3 {
+            return Err(BlockIoError::Unavailable);
+        }
+        let d0 = queue.free_desc.pop().unwrap();
+        let d1 = queue.free_desc.pop().unwrap();
+        let d2 = queue.free_desc.pop().unwrap();
+
+        unsafe {
+            *queue.desc_table.add(d0 as usize) = VirtqDesc {
+                addr: header_phys,
+                len: mem::size_of::<VirtioBlkReqHeader>() as u32,
+                flags: VIRTQ_DESC_F_NEXT,
+                next: d1,
+            };
+            let data_flags = if device_writes_data {
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
+            } else {
+                VIRTQ_DESC_F_NEXT
+            };
+            *queue.desc_table.add(d1 as usize) = VirtqDesc {
+                addr: data_phys,
+                len: data_len,
+                flags: data_flags,
+                next: d2,
+            };
+            *queue.desc_table.add(d2 as usize) = VirtqDesc {
+                addr: status_phys,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            };
+
+            let avail = &mut *queue.avail_ring;
+            let idx = avail.idx;
+            avail.ring[idx as usize % queue.queue_size as usize] = d0;
+            core::sync::atomic::fence(Ordering::Release);
+            avail.idx = idx.wrapping_add(1);
+        }
+
+        let last_used_idx = unsafe { (*queue.used_ring).idx };
+        drop(queue);
+        self.notify_queue();
+
+        // 自旋等设备完成（used ring idx 前进）
+        loop {
+            let cur = unsafe { (*self.driver.inner.queue.lock().used_ring).idx };
+            if cur != last_used_idx {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // 回收描述符
+        let mut queue = self.driver.inner.queue.lock();
+        queue.free_desc.push(d0);
+        queue.free_desc.push(d1);
+        queue.free_desc.push(d2);
+
+        if meta.status == 0 {
+            Ok(())
+        } else {
+            Err(BlockIoError::MediaError)
+        }
     }
 }
 

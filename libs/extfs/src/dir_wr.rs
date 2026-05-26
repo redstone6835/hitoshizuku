@@ -7,8 +7,9 @@
 
 use alloc::vec;
 
-use crate::map_wr;
+use crate::layout::EXT4_EXTENTS_FL;
 use crate::state::{BlockBackendError, FsState};
+use crate::{extent_wr, map_wr};
 
 /// 给定 `name` + 文件类型,返回一个整条 dir_entry_2 的字节序(已 4-byte 对齐 rec_len)。
 ///
@@ -65,19 +66,21 @@ fn try_insert_in_block(block: &mut [u8], new_entry: &[u8], has_filetype: bool) -
             // 1) 把当前条目的 rec_len 缩到 real(或如果 ino==0,则完全替换)
             if ino == 0 {
                 // 整条替换
-                let mut new = alloc::vec::Vec::from(new_entry);
+                let mut new = alloc::vec![0u8; rec_len];
+                new[..new_entry.len()].copy_from_slice(new_entry);
                 // 新 entry 继承原 rec_len,填满 slack
                 let new_rec = rec_len as u16;
                 new[4..6].copy_from_slice(&new_rec.to_le_bytes());
-                block[off..off + rec_len].copy_from_slice(&new[..rec_len]);
+                block[off..off + rec_len].copy_from_slice(&new);
                 return true;
             } else {
                 block[off + 4..off + 6].copy_from_slice(&real.to_le_bytes());
                 // 2) 在当前条目后写新条目,rec_len 扩大到吃掉 slack
-                let mut new = alloc::vec::Vec::from(new_entry);
+                let mut new = alloc::vec![0u8; slack as usize];
+                new[..new_entry.len()].copy_from_slice(new_entry);
                 new[4..6].copy_from_slice(&slack.to_le_bytes());
                 let start = off + real as usize;
-                block[start..start + slack as usize].copy_from_slice(&new[..slack as usize]);
+                block[start..start + slack as usize].copy_from_slice(&new);
                 return true;
             }
         }
@@ -93,6 +96,7 @@ fn try_insert_in_block(block: &mut [u8], new_entry: &[u8], has_filetype: bool) -
 pub(crate) fn insert_entry(
     state: &FsState,
     i_block: &mut [u8],
+    flags: &mut u32,
     size: u64,
     ino: u32,
     file_type: u8,
@@ -105,7 +109,7 @@ pub(crate) fn insert_entry(
 
     let mut buf = vec![0u8; bs];
     for lb in 0..total_blocks {
-        let phys = crate::dir::resolve_block(state, i_block, 0, lb as u32)?;
+        let phys = crate::dir::resolve_block(state, i_block, *flags, lb as u32)?;
         match phys {
             Some(p) => {
                 state.read_block(p, &mut buf)?;
@@ -120,7 +124,12 @@ pub(crate) fn insert_entry(
 
     // 需要追加一个新目录块
     let new_lb = total_blocks as u32;
-    let new_phys = map_wr::ensure_block(state, i_block, new_lb)?;
+    let new_phys = if *flags & EXT4_EXTENTS_FL != 0 {
+        extent_wr::ensure_block_in_extent(state, i_block, new_lb)?
+            .ok_or(BlockBackendError::Unsupported)?
+    } else {
+        map_wr::ensure_block(state, i_block, new_lb)?
+    };
     let mut blk = vec![0u8; bs];
     // 新块里先放一条占满整个块的 entry
     let rec_len = bs as u16;
@@ -136,6 +145,7 @@ pub(crate) fn insert_entry(
 pub(crate) fn remove_entry(
     state: &FsState,
     i_block: &[u8],
+    flags: u32,
     size: u64,
     name: &str,
 ) -> Result<bool, BlockBackendError> {
@@ -144,7 +154,7 @@ pub(crate) fn remove_entry(
     let has_filetype = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
     let mut buf = vec![0u8; bs];
     for lb in 0..total_blocks {
-        let phys = crate::dir::resolve_block(state, i_block, 0, lb as u32)?;
+        let phys = crate::dir::resolve_block(state, i_block, flags, lb as u32)?;
         let p = match phys {
             Some(p) => p,
             None => continue,
@@ -230,11 +240,12 @@ pub(crate) fn make_init_dir_block(
 pub(crate) fn update_dotdot(
     state: &FsState,
     i_block: &[u8],
+    flags: u32,
     new_parent_ino: u32,
 ) -> Result<(), BlockBackendError> {
     let bs = state.ext_sb.block_size as usize;
     // 第一个逻辑块号(目录起始块)
-    let phys = crate::dir::resolve_block(state, i_block, 0, 0)?;
+    let phys = crate::dir::resolve_block(state, i_block, flags, 0)?;
     let phys = match phys {
         Some(p) => p,
         None => return Err(BlockBackendError::OutOfRange),

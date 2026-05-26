@@ -5,3 +5,8 @@ Cargo.lock
 # IDE
 .idea
 .vscode
+.claude
+.codex
+.deepseek
+
+build

@@ -161,7 +161,6 @@ impl Slab {
         // 一个 slab 初始化时，核心工作不是“构造对象”，而是把一段连续页解释成固定大小的
         // 槽位数组，并把所有状态压进位图。后续对象生命周期全靠位图位翻转推进。
         if obj_size == 0 {
-            log::debug!("[alloc][slab] invalid obj_size=0 in init");
             self.active = false;
             return;
         }
@@ -190,7 +189,6 @@ impl Slab {
         // 指针要想映射成有效槽位，必须同时满足：落在 slab 范围内、位于对象边界上、索引
         // 不超过 `total_objects`。这三个条件一起定义了“一个对象指针在 slab 语义下成立”。
         if obj_size == 0 {
-            log::debug!("[alloc][slab] invalid obj_size=0 in object_index");
             return None;
         }
 
@@ -512,11 +510,6 @@ fn allocate_slab_node(
     phys: &Mutex<BuddyAllocator>,
     vmem: &KernelAddressSpace,
 ) -> Result<usize, SlabGrowError> {
-    log::debug!(
-        "[alloc][slab] grow request class={} pages_per_slab={}",
-        obj_size,
-        pages_per_slab,
-    );
     let node_addr = {
         let ptr = crate::alloc_internal_metadata(Layout::new::<SlabNode>()) as usize;
         if ptr != 0 {
@@ -532,16 +525,10 @@ fn allocate_slab_node(
     let order = pages_to_order(pages_per_slab);
     let range = vmem
         .alloc_kernel_backed_range(order, phys, crate::PagePolicy::BaseOnly)
-        .map_err(|_| {
-            // Safety: node_addr 刚刚在上方分配。清零防止 use-after-free，
-            // 重新分配时内容会被覆盖。
-            unsafe { core::ptr::write_bytes(node_addr as *mut u8, 0, size_of::<SlabNode>()) };
-            SlabGrowError::BackedRange
-        })?;
+        .map_err(|_| SlabGrowError::BackedRange)?;
     let block_pages = 1usize << order;
     if range.paddr & (PAGE_SIZE - 1) != 0 {
         let _ = vmem.free_kernel_backed_range(range, phys);
-        unsafe { core::ptr::write_bytes(node_addr as *mut u8, 0, size_of::<SlabNode>()) };
         return Err(SlabGrowError::InvalidBacking);
     }
 
@@ -553,19 +540,9 @@ fn allocate_slab_node(
     node.next = 0;
     if !node.slab.active {
         let _ = vmem.free_kernel_backed_range(range, phys);
-        unsafe { core::ptr::write_bytes(node_addr as *mut u8, 0, size_of::<SlabNode>()) };
         return Err(SlabGrowError::Inactive);
     }
 
-    log::debug!(
-        "[alloc][slab] grow success class={} base={:#x} paddr={:#x} node={:#x} pages={} objects={}",
-        obj_size,
-        range.vaddr,
-        range.paddr,
-        node_addr,
-        block_pages,
-        node.slab.total_objects,
-    );
     Ok(node_addr)
 }
 
@@ -608,23 +585,11 @@ impl Zone {
         // 第二步：现在只持有 state 锁
         let mut state = self.state.lock();
         state.stats.alloc_requests += 1;
-        log::debug!(
-            "[alloc][slab] zone request class={} cpu={} slabs={}",
-            self.size_class,
-            cpu,
-            state.slab_count,
-        );
 
         // 尝试使用缓存的条目
         if let Some(entry) = cache_entry {
             if state.commit_cache_alloc(entry, self.size_class) {
                 state.stats.cache_hits += 1;
-                log::debug!(
-                    "[alloc][slab] cache hit class={} cpu={} ptr={:#x}",
-                    self.size_class,
-                    cpu,
-                    entry.ptr,
-                );
                 return entry.ptr as *mut u8;
             }
             state.stats.invalid_frees += 1;
@@ -635,12 +600,6 @@ impl Zone {
         }
 
         state.stats.cache_misses += 1;
-        log::debug!(
-            "[alloc][slab] cache miss class={} cpu={} slabs={}",
-            self.size_class,
-            cpu,
-            state.slab_count,
-        );
         let ptr = if let Some(ptr) = state.try_allocate_user_object(self.size_class) {
             drop(state);
             ptr
@@ -652,11 +611,6 @@ impl Zone {
                     let mut state = self.state.lock();
                     state.stats.grow_failures += 1;
                     drop(state);
-                    log::debug!(
-                        "[alloc][slab] max grow attempts reached class={} attempts={}",
-                        self.size_class,
-                        grow_attempts
-                    );
                     self.reclaim_empty_slabs(Some((phys, vmem)));
                     return null_mut();
                 }
@@ -672,24 +626,12 @@ impl Zone {
                     Err(err) => {
                         let mut state = self.state.lock();
                         state.note_grow_failure(err);
-                        log::debug!(
-                            "[alloc][slab] grow failed class={} pages_per_slab={} err={:?}",
-                            self.size_class,
-                            self.pages_per_slab,
-                            err,
-                        );
                         return null_mut();
                     }
                 }
                 grow_attempts += 1;
             }
         };
-        log::debug!(
-            "[alloc][slab] direct alloc class={} cpu={} ptr={:#x}",
-            self.size_class,
-            cpu,
-            ptr,
-        );
 
         // 第三步：为缓存补货（重新获取 cache 锁）
         let cache_slots = {
@@ -717,13 +659,6 @@ impl Zone {
                         overflow_count += 1;
                     }
                 }
-                log::debug!(
-                    "[alloc][slab] refill class={} cpu={} produced={} cache_count={}",
-                    self.size_class,
-                    cpu,
-                    produced,
-                    cache_guard.count,
-                );
             }
             if overflow_count > 0 {
                 let mut state = self.state.lock();
@@ -807,13 +742,6 @@ impl Zone {
                     self.size_class, range.vaddr, range.paddr, range.size, err
                 );
             }
-            log::debug!(
-                "[alloc][slab] reclaimed empty slab class={} vaddr={:#x} paddr={:#x} size={}",
-                self.size_class,
-                range.vaddr,
-                range.paddr,
-                range.size,
-            );
         }
     }
 
@@ -900,38 +828,15 @@ impl SlabAllocator {
         // `SlabAllocator` 自己不处理对象位图细节，它更像总调度器：根据 layout 选择
         // size class，再把请求转交给对应 zone。
         if !self.is_initialized() {
-            log::debug!(
-                "[alloc][slab] allocator not initialized size={} align={}",
-                layout.pad_to_align().size(),
-                layout.align(),
-            );
             return null_mut();
         }
         let Some(zone_idx) = Self::class_index_for(layout) else {
-            log::debug!(
-                "[alloc][slab] no size class size={} align={}",
-                layout.pad_to_align().size(),
-                layout.align(),
-            );
             return null_mut();
         };
         let cpu = self.normalize_cpu(cpu_id);
         let Some(boot) = self.load_metadata_source() else {
-            log::debug!(
-                "[alloc][slab] metadata source missing class={} cpu={}",
-                self.zones[zone_idx].size_class,
-                cpu,
-            );
             return null_mut();
         };
-        log::debug!(
-            "[alloc][slab] dispatch size={} align={} class={} zone={} cpu={}",
-            layout.pad_to_align().size(),
-            layout.align(),
-            self.zones[zone_idx].size_class,
-            zone_idx,
-            cpu,
-        );
         self.zones[zone_idx].alloc(cpu, boot, phys, vmem)
     }
 
@@ -1080,12 +985,6 @@ fn bit_is_set(bits: &[u64; BITMAP_WORDS], idx: usize) -> bool {
     // 切换控制在非常低的常数开销内。
     let word = idx / 64;
     if word >= BITMAP_WORDS {
-        log::debug!(
-            "[alloc][slab] bitmap index out of bounds: idx={} word={} max={}",
-            idx,
-            word,
-            BITMAP_WORDS
-        );
         return false;
     }
     let bit = idx % 64;
@@ -1098,12 +997,6 @@ fn set_bit(bits: &mut [u64; BITMAP_WORDS], idx: usize, set: bool) {
     // 可以保证 alloc/cache 两套位图操作拥有一致的边界检查与写入语义。
     let word = idx / 64;
     if word >= BITMAP_WORDS {
-        log::debug!(
-            "[alloc][slab] bitmap index out of bounds in set_bit: idx={} word={} max={}",
-            idx,
-            word,
-            BITMAP_WORDS
-        );
         return;
     }
     let bit = idx % 64;

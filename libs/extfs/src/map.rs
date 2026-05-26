@@ -211,9 +211,6 @@ pub(crate) fn map_contiguous(
             let first_mid = (seg_start - bound2) / ppb;
             let last_mid = ((seg_end - 1) - bound2) / ppb;
             for mid_idx in first_mid..=last_mid {
-                if (mid_idx as usize) >= l2_ptrs.len() {
-                    break;
-                }
                 let mid = l2_ptrs[mid_idx as usize];
                 let lb_base = bound2 + mid_idx * ppb;
                 let s = seg_start.max(lb_base);
@@ -238,9 +235,6 @@ pub(crate) fn map_contiguous(
             let first_top = (seg_start - bound3) / a;
             let last_top = ((end_lb - 1) - bound3) / a;
             for top_idx in first_top..=last_top {
-                if (top_idx as usize) >= l3_ptrs.len() {
-                    break;
-                }
                 let top = l3_ptrs[top_idx as usize];
                 let top_base = bound3 + top_idx * a;
                 let ts = seg_start.max(top_base);
@@ -252,9 +246,6 @@ pub(crate) fn map_contiguous(
                 let first_mid = (ts - top_base) / ppb;
                 let last_mid = ((te - 1) - top_base) / ppb;
                 for mid_idx in first_mid..=last_mid {
-                    if (mid_idx as usize) >= top_ptrs.len() {
-                        break;
-                    }
                     let mid = top_ptrs[mid_idx as usize];
                     let lb_base = top_base + mid_idx * ppb;
                     let s = ts.max(lb_base);
