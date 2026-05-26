@@ -15,20 +15,19 @@
 //! 6. `early_console`：正式控制台建立前的最小输出路径，用于启动阶段调试。
 //! 7. `abi`：平台 ABI 转换层，用于把 LoongArch64/Linux 风格的整数参数翻译为
 //!    内核内部的类型语义。
-//!
 pub mod abi;
 mod boot;
 mod early_console;
 mod efi_stub;
 mod heap_vm;
 mod loader;
-mod paging;
-mod specific;
-mod trap;
 mod mm;
+mod paging;
 mod sched_ctx;
+mod specific;
 mod syscall;
 mod task;
+mod trap;
 
 pub use boot::*;
 pub use early_console::*;
@@ -36,7 +35,7 @@ pub use early_console::*;
 pub use heap_vm::*;
 pub use loader::*;
 pub use paging::*;
-pub use specific::*;
 pub use sched_ctx::register as register_sched_ctx;
+pub use specific::*;
 pub use task::*;
 pub use trap::*;

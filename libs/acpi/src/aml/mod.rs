@@ -964,7 +964,7 @@ where
                             context.retire_op(op);
                         }
                     }
-                    _ => return Err(AmlError::LibUnimplemented),
+                    _ => panic!("Unexpected operation has created in-flight op!"),
                 }
             }
 
@@ -1141,10 +1141,11 @@ where
                 Opcode::StringPrefix => {
                     let str_start = context.current_block.pc;
                     while context.next()? != b'\0' {}
-                    let str = String::from_utf8_lossy(
-                        &context.current_block.stream()[str_start..(context.current_block.pc - 1)],
-                    )
-                    .into_owned();
+                    // TODO: handle err
+                    let str = String::from(
+                        str::from_utf8(&context.current_block.stream()[str_start..(context.current_block.pc - 1)])
+                            .unwrap(),
+                    );
                     context.last_op()?.arguments.push(Argument::Object(Object::String(str).wrap()));
                 }
                 Opcode::QWordPrefix => {

@@ -50,6 +50,11 @@ impl SyncBlockBackend {
         Self { dev }
     }
 
+    /// 兼容旧 API，忽略 virt_to_phys（快速路径不再需要地址转换）。
+    pub fn with_virt_to_phys(dev: Arc<BlockDevice>, _v2p: fn(usize) -> usize) -> Self {
+        Self { dev }
+    }
+
     fn run<R>(
         &self,
         build_req: impl FnOnce() -> BlockIoRequest,
@@ -100,12 +105,27 @@ impl SyncBlockBackend {
     }
 
     /// 同步读若干扇区到 `buf`。
+    ///
+    /// 优先使用 `read_sectors_sync` 零拷贝快速路径（无 Box 分配、无回调、无 spin-wait）。
+    /// 仅当驱动不支持时回退到 submit/completion 慢路径。
     pub fn read(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), SyncIoError> {
         let bps = self.sector_size_bytes() as u64;
         let want = (count as u64 * bps) as usize;
         if buf.len() < want {
             return Err(SyncIoError::BufferTooSmall);
         }
+        if count == 0 {
+            return Err(SyncIoError::InvalidRange);
+        }
+
+        // 快速路径：直接传 buffer 给驱动，零分配零拷贝。
+        match self.dev.read_sync(lba, count, buf) {
+            Ok(()) => return Ok(()),
+            Err(BlockSubmitError::Unsupported) => {}
+            Err(_) => return Err(SyncIoError::Io(BlockIoError::MediaError)),
+        }
+
+        // 慢路径：Box 分配 + submit/completion
         let range = match self.build_range(lba, count) {
             Some(r) => r,
             None => return Err(SyncIoError::InvalidRange),
@@ -133,12 +153,26 @@ impl SyncBlockBackend {
     }
 
     /// 同步写若干扇区。
+    ///
+    /// 优先使用 `write_sectors_sync` 零拷贝快速路径。
     pub fn write(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), SyncIoError> {
         let bps = self.sector_size_bytes() as u64;
         let want = (count as u64 * bps) as usize;
         if buf.len() < want {
             return Err(SyncIoError::BufferTooSmall);
         }
+        if count == 0 {
+            return Err(SyncIoError::InvalidRange);
+        }
+
+        // 快速路径
+        match self.dev.write_sync(lba, count, buf) {
+            Ok(()) => return Ok(()),
+            Err(BlockSubmitError::Unsupported) => {}
+            Err(_) => return Err(SyncIoError::Io(BlockIoError::MediaError)),
+        }
+
+        // 慢路径
         let range = match self.build_range(lba, count) {
             Some(r) => r,
             None => return Err(SyncIoError::InvalidRange),

@@ -33,6 +33,12 @@ pub fn register_console(dev: CharDevice) {
     *CONSOLE.lock() = Some(dev);
 }
 
+/// 取已注册的 console 字符设备。供 devtmpfs 把 `/dev/console` 重定向到当前
+/// console，使用户态进程通过固定路径打开它。
+pub fn console_dev() -> Option<CharDevice> {
+    get_console()
+}
+
 // ── 公开 I/O 接口 ─────────────────────────────────────────────────────────────
 
 /// 向 console 写入字节缓冲区（阻塞直到全部写入）。

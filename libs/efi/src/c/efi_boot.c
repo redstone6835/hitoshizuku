@@ -420,7 +420,7 @@ EfiStatus efi_prepare_boot_handoff(
         return EFI_OUT_OF_RESOURCES_VALUE;
     }
 
-    // 尽力而为：缺少看门狗支持不应阻塞启动交接
+    // Best effort: missing watchdog support must not block the handoff.
     (void)efi_disable_watchdog(st);
 
     status = efi_loaded_image_protocol(st, image_handle, &loaded_image);

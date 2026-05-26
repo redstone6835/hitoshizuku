@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -64,7 +64,7 @@ impl FsDriver for TmpfsDriver {
             };
 
             let root_ops = Arc::new(TmpfsInodeOps {
-                data: Arc::new(Spinlock::new(TmpfsInodeData::Directory(BTreeMap::new()))),
+                data: Spinlock::new(TmpfsInodeData::Directory(BTreeMap::new())),
             });
 
             let root_inode = Inode::new(
@@ -94,7 +94,6 @@ impl FsDriver for TmpfsDriver {
             }
         });
 
-        sb.insert_inode(Arc::clone(&sb.root_inode));
         Ok(sb)
     }
 
@@ -167,7 +166,7 @@ enum TmpfsInodeData {
 }
 
 struct TmpfsInodeOps {
-    data: Arc<Spinlock<TmpfsInodeData>>,
+    data: Spinlock<TmpfsInodeData>,
 }
 
 impl InodeOps for TmpfsInodeOps {
@@ -242,7 +241,7 @@ impl InodeOps for TmpfsInodeOps {
             sb.dev_id,
             meta,
             Arc::new(TmpfsInodeOps {
-                data: Arc::new(Spinlock::new(TmpfsInodeData::File(Vec::new()))),
+                data: Spinlock::new(TmpfsInodeData::File(Vec::new())),
             }),
             sb.self_weak.clone(),
         );
@@ -308,7 +307,7 @@ impl InodeOps for TmpfsInodeOps {
             sb.dev_id,
             meta,
             Arc::new(TmpfsInodeOps {
-                data: Arc::new(Spinlock::new(TmpfsInodeData::Directory(BTreeMap::new()))),
+                data: Spinlock::new(TmpfsInodeData::Directory(BTreeMap::new())),
             }),
             sb.self_weak.clone(),
         );
@@ -367,6 +366,7 @@ impl InodeOps for TmpfsInodeOps {
         if !child_entries.is_empty() {
             return Err(VfsError::DirectoryNotEmpty);
         }
+        drop(child_data);
 
         let mut data = self.data.lock();
         let entries = match &mut *data {
@@ -380,8 +380,6 @@ impl InodeOps for TmpfsInodeOps {
         dir.touch_ctime();
         child.set_nlink(0);
         child.touch_ctime();
-        drop(data);
-        drop(child_data);
 
         Ok(())
     }
@@ -439,7 +437,7 @@ impl InodeOps for TmpfsInodeOps {
             sb.dev_id,
             meta,
             Arc::new(TmpfsInodeOps {
-                data: Arc::new(Spinlock::new(TmpfsInodeData::Symlink(target.to_string()))),
+                data: Spinlock::new(TmpfsInodeData::Symlink(target.to_string())),
             }),
             sb.self_weak.clone(),
         );
@@ -492,6 +490,9 @@ impl InodeOps for TmpfsInodeOps {
         if inode.kind() != FileType::Regular {
             return Err(VfsError::InvalidArgument);
         }
+        if new_size > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
 
         let mut data = self.data.lock();
         let file_data = match &mut *data {
@@ -499,8 +500,7 @@ impl InodeOps for TmpfsInodeOps {
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        let new_len = usize::try_from(new_size).map_err(|_| VfsError::FileTooLarge)?;
-        file_data.resize(new_len, 0);
+        file_data.resize(new_size as usize, 0);
         inode.set_size(new_size);
         inode.touch_mtime();
         inode.touch_ctime();
@@ -514,18 +514,13 @@ impl InodeOps for TmpfsInodeOps {
         _options: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        let inode_arc = inode
-            .superblock()
-            .and_then(|sb| sb.find_inode(inode.ino()))
-            .ok_or(VfsError::InvalidArgument)?;
+        let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
         Ok(Box::new(TmpfsFileOps {
-            inode: inode_arc,
-            data: Arc::clone(
-                &inode
-                    .downcast_ops::<TmpfsInodeOps>()
-                    .ok_or(VfsError::InvalidArgument)?
-                    .data,
-            ),
+            inode_ops: inode
+                .downcast_ops::<TmpfsInodeOps>()
+                .ok_or(VfsError::InvalidArgument)? as *const TmpfsInodeOps,
+            sb: Arc::downgrade(&sb),
+            ino: inode.ino(),
         }))
     }
 
@@ -541,29 +536,49 @@ impl InodeOps for TmpfsInodeOps {
 // ── File 操作 ─────────────────────────────────────────────────────────────────
 
 struct TmpfsFileOps {
-    inode: Arc<Inode>,
-    data: Arc<Spinlock<TmpfsInodeData>>,
+    inode_ops: *const TmpfsInodeOps,
+    sb: Weak<Superblock>,
+    ino: u64,
+}
+
+unsafe impl Send for TmpfsFileOps {}
+unsafe impl Sync for TmpfsFileOps {}
+
+impl TmpfsFileOps {
+    fn inode(&self) -> Option<Arc<Inode>> {
+        self.sb.upgrade().and_then(|sb| sb.find_inode(self.ino))
+    }
 }
 
 impl FileOps for TmpfsFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let data = self.data.lock();
+        let ops = unsafe { &*self.inode_ops };
+        let data = ops.data.lock();
         let file_data = match &*data {
             TmpfsInodeData::File(data) => data,
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        let offset = usize::try_from(offset).map_err(|_| VfsError::FileTooLarge)?;
-        let start = offset.min(file_data.len());
+        if offset > usize::MAX as u64 {
+            return Ok(0);
+        }
+
+        let start = (offset as usize).min(file_data.len());
         let end = (start + buf.len()).min(file_data.len());
         let n = end - start;
 
         buf[..n].copy_from_slice(&file_data[start..end]);
+        if n != 0
+            && let Some(inode) = self.inode()
+        {
+            inode.touch_atime();
+        }
         Ok(n)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        let mut data = self.data.lock();
+        let ops = unsafe { &*self.inode_ops };
+        let mut data = ops.data.lock();
         let file_data = match &mut *data {
             TmpfsInodeData::File(data) => data,
             _ => return Err(VfsError::InvalidArgument),
@@ -571,8 +586,10 @@ impl FileOps for TmpfsFileOps {
 
         let start = if offset == u64::MAX {
             file_data.len()
+        } else if offset > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
         } else {
-            usize::try_from(offset).map_err(|_| VfsError::FileTooLarge)?
+            offset as usize
         };
         let end = start.checked_add(buf.len()).ok_or(VfsError::FileTooLarge)?;
 
@@ -581,11 +598,15 @@ impl FileOps for TmpfsFileOps {
         }
 
         file_data[start..end].copy_from_slice(buf);
-        let new_size = file_data.len() as u64;
-        drop(data);
-        self.inode.set_size(new_size);
-        self.inode.touch_mtime();
-        self.inode.touch_ctime();
+        if let Some(inode) = self.inode() {
+            if inode.size() != file_data.len() as u64 {
+                inode.set_size(file_data.len() as u64);
+            }
+            if !buf.is_empty() {
+                inode.touch_mtime();
+                inode.touch_ctime();
+            }
+        }
         Ok(buf.len())
     }
 
@@ -594,15 +615,15 @@ impl FileOps for TmpfsFileOps {
         pos: u64,
         sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
     ) -> VfsResult<u64> {
-        let data = self.data.lock();
+        let ops = unsafe { &*self.inode_ops };
+        let data = ops.data.lock();
         let entries = match &*data {
             TmpfsInodeData::Directory(entries) => entries,
             _ => return Err(VfsError::NotADirectory),
         };
 
         let mut current_pos = pos;
-        let start_pos = usize::try_from(pos).map_err(|_| VfsError::InvalidArgument)?;
-        for (name, ino) in entries.iter().skip(start_pos) {
+        for (name, ino) in entries.iter().skip(pos as usize) {
             let entry = DirEntry {
                 ino: *ino,
                 name: SmallStr::from(name.as_str()),

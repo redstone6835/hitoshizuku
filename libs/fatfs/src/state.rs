@@ -116,6 +116,31 @@ impl FsState {
         Ok(c)
     }
 
+    pub(crate) fn alloc_cluster_run(
+        &self,
+        prev: Option<u32>,
+        count: u32,
+    ) -> Result<(u32, u32), BlockBackendError> {
+        let (first, last) = self
+            .fat
+            .alloc_cluster_run(self.backend.as_ref(), prev, count)?;
+        if let Some(fi) = &self.fs_info {
+            let prev_count = fi.free_count.load(Ordering::Acquire);
+            fi.free_count
+                .store(prev_count.saturating_sub(count), Ordering::Release);
+            let total_with_2 = self.total_clusters.saturating_add(2);
+            let next_candidate = last.saturating_add(1);
+            let next = if next_candidate >= total_with_2 {
+                2
+            } else {
+                next_candidate
+            };
+            fi.next_free.store(next, Ordering::Release);
+            *fi.dirty.lock() = true;
+        }
+        Ok((first, last))
+    }
+
     pub(crate) fn free_chain(&self, head: u32) -> Result<u32, BlockBackendError> {
         let count = self.fat.free_chain(self.backend.as_ref(), head)?;
         if count > 0
@@ -329,7 +354,7 @@ fn mount_impl(backend: Arc<dyn BlockBackend>, force_ro: bool) -> VfsResult<Arc<S
         info.num_fats,
         info.bytes_per_sector,
         info.total_clusters,
-        64,
+        256,
         fat_hint,
     );
 

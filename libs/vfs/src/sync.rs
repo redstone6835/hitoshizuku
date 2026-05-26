@@ -30,7 +30,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// # 中断安全
 ///
 /// 此自旋锁不会自动禁用中断。若中断处理程序可能获取同一把锁，调用方必须
-/// 在 `lock()` 前手动禁用中断（如 `arch::irq_save()`），否则会导致死锁。
+/// 在 `lock()` 前手动禁用中断，否则会导致死锁。
 /// 对于仅在进程上下文中使用的锁（如 `FdTable`），无需额外处理。
 ///
 /// # 公平性
@@ -65,7 +65,7 @@ impl<T> Spinlock<T> {
     ///
     /// 若锁已被其他核持有，当前核将在此自旋等待，直到锁被释放。
     /// 等待期间调用 `core::hint::spin_loop()`，在支持的架构上会发出
-    /// pause/yield 提示（LoongArch64 上对应 `nop` 或 `pause` 等价指令），
+    /// pause/yield 提示，
     /// 降低总线争用，提高超线程系统的整体吞吐量。
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
         // 使用 Acquire 语义获取锁：确保临界区内对受保护数据的读写操作，

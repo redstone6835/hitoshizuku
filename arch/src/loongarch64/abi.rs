@@ -126,11 +126,13 @@ pub fn decode_mount_flags(raw: u32) -> MountFlags {
 
 // ── 字符设备号映射 ────────────────────────────────────────────────────────────
 
-/// 将 [`general::dev::char::CharDevKind`] 映射到 Linux 标准 major/minor 号。
+/// 将 [`general::dev::char::CharDeviceKind`] 映射到 Linux 标准 major/minor 号。
 ///
 /// Linux 字符设备号（`<linux/major.h>`）是 ABI 知识，只允许存在于 `arch/` 层。
 /// VFS 层通过 [`general::vfs::stat::DevId`] 表示设备号，不感知具体数值。
-pub fn char_dev_kind_to_dev_id(kind: general::dev::char::CharDeviceKind) -> general::vfs::stat::DevId {
+pub fn char_dev_kind_to_dev_id(
+    kind: general::dev::char::CharDeviceKind,
+) -> general::vfs::stat::DevId {
     use general::dev::char::CharDeviceKind;
     use general::vfs::stat::DevId;
     match kind {

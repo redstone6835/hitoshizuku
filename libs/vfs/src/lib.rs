@@ -17,9 +17,9 @@ pub mod file;
 pub mod inode;
 pub mod limits;
 pub mod mount;
-pub mod pipe;
 pub mod operation;
 pub mod path;
+pub mod pipe;
 pub mod stat;
 pub mod superblock;
 pub mod sync;
@@ -65,7 +65,7 @@ struct CwdState {
 /// 进程的 VFS 上下文，封装了路径解析所需的全部进程级状态。
 pub struct VfsContext {
     cwd_state: sync::Spinlock<CwdState>,
-    root_state: sync::Spinlock<VfsRoot>,
+    pub root: VfsRoot,
     pub mount_ns: Arc<MountNamespace>,
     pub cred: Arc<Credentials>,
     umask: sync::Spinlock<FileMode>,
@@ -84,7 +84,7 @@ impl VfsContext {
     ) -> Self {
         Self {
             cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
-            root_state: sync::Spinlock::new(root),
+            root,
             mount_ns,
             cred,
             umask: sync::Spinlock::new(umask),
@@ -122,18 +122,8 @@ impl VfsContext {
         } else {
             return Err(VfsError::NotFound);
         }
-        let mut state = self.root_state.lock();
-        state.root_dentry = new_root;
-        state.mount = new_mount;
+        self.root.set(new_root, new_mount);
         Ok(())
-    }
-
-    pub fn root_dentry(&self) -> Arc<Dentry> {
-        Arc::clone(&self.root_state.lock().root_dentry)
-    }
-
-    pub fn root_mount(&self) -> Arc<mount::Mount> {
-        Arc::clone(&self.root_state.lock().mount)
     }
 
     pub fn set_cred(&mut self, new_cred: Arc<Credentials>) {
@@ -153,16 +143,12 @@ impl VfsContext {
 
     pub fn fork(&self) -> VfsResult<Self> {
         let cwd_st = self.cwd_state.lock();
-        let root_dentry = self.root_dentry();
         Ok(Self {
             cwd_state: sync::Spinlock::new(CwdState {
                 cwd: Arc::clone(&cwd_st.cwd),
                 cwd_mount: Arc::clone(&cwd_st.cwd_mount),
             }),
-            root_state: sync::Spinlock::new(VfsRoot {
-                root_dentry,
-                mount: self.root_mount(),
-            }),
+            root: VfsRoot::new(self.root.root(), self.root.mount()),
             mount_ns: Arc::clone(&self.mount_ns),
             cred: Arc::clone(&self.cred),
             umask: sync::Spinlock::new(*self.umask.lock()),
@@ -173,19 +159,19 @@ impl VfsContext {
     pub fn clone_with_new_ns(&self) -> VfsResult<Self> {
         let new_ns = self.mount_ns.clone_namespace()?;
         let cwd_st = self.cwd_state.lock();
-        let root_dentry = self.root_dentry();
         let new_cwd_mount = new_ns
             .find_mount_for_root(&cwd_st.cwd_mount.mount_root)
+            .unwrap_or_else(|| Arc::clone(&new_ns.root.lock()));
+        let root_dentry = self.root.root();
+        let new_root_mount = new_ns
+            .find_mount_for_root(&self.root.mount().mount_root)
             .unwrap_or_else(|| Arc::clone(&new_ns.root.lock()));
         Ok(Self {
             cwd_state: sync::Spinlock::new(CwdState {
                 cwd: Arc::clone(&cwd_st.cwd),
                 cwd_mount: new_cwd_mount,
             }),
-            root_state: sync::Spinlock::new(VfsRoot {
-                root_dentry,
-                mount: self.root_mount(),
-            }),
+            root: VfsRoot::new(root_dentry, new_root_mount),
             mount_ns: new_ns,
             cred: Arc::clone(&self.cred),
             umask: sync::Spinlock::new(*self.umask.lock()),

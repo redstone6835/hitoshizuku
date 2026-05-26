@@ -448,16 +448,14 @@ impl FileInodeOps {
         let mut first = self.first_cluster.load(Ordering::Acquire);
 
         if cur_clusters == 0 && need_clusters > 0 {
-            let c = self
+            let (head, _tail) = self
                 .state
-                .fat
-                .alloc_cluster(self.state.backend.as_ref(), None)
+                .alloc_cluster_run(None, need_clusters as u32)
                 .map_err(backend_to_vfs)?;
-            first = c;
-            self.first_cluster.store(c, Ordering::Release);
-        }
-        if cur_clusters > 0 {
-            let mut tail = match self
+            first = head;
+            self.first_cluster.store(head, Ordering::Release);
+        } else if cur_clusters > 0 {
+            let tail = match self
                 .state
                 .fat
                 .walk_chain(self.state.backend.as_ref(), first, cur_clusters as u32 - 1)
@@ -466,23 +464,12 @@ impl FileInodeOps {
                 Some(c) => c,
                 None => return Err(VfsError::Io),
             };
-            for _ in cur_clusters..need_clusters {
-                let new_c = self
+            let add = (need_clusters - cur_clusters) as u32;
+            if add > 0 {
+                let _ = self
                     .state
-                    .fat
-                    .alloc_cluster(self.state.backend.as_ref(), Some(tail))
+                    .alloc_cluster_run(Some(tail), add)
                     .map_err(backend_to_vfs)?;
-                tail = new_c;
-            }
-        } else {
-            let mut tail = first;
-            for _ in 1..need_clusters.min(self.state.total_clusters as u64 + 1) {
-                let new_c = self
-                    .state
-                    .fat
-                    .alloc_cluster(self.state.backend.as_ref(), Some(tail))
-                    .map_err(backend_to_vfs)?;
-                tail = new_c;
             }
         }
         self.size.store(new_size as u32, Ordering::Release);

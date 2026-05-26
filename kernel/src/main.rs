@@ -3,7 +3,6 @@
 
 extern crate alloc;
 extern crate allocator;
-extern crate arch;
 extern crate hal;
 
 mod acpi;
@@ -23,6 +22,14 @@ fn main() -> ! {
 
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    /*
+    #[cfg(debug_assertions)]
+    sched::smoketest();
+    // mm / syscall 子系统烟雾测：在 sched 已就绪、ops 已注入之后跑一遍，
+    // 验证 VmSpace 基本操作与 syscall 骨架可用。失败会 panic，kernel 直接挂。
+    #[cfg(debug_assertions)]
+    general::mm::smoketest::run();
+    */
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
     // bench::run();

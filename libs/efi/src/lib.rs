@@ -1,7 +1,7 @@
-//! EFI (UEFI) FFI 绑定层。
+//! EFI (UEFI) C wrapper crate.
 //!
-//! ABI 定义和协议逻辑位于 `src/c` 目录，Rust 侧仅保留 FFI 所需的
-//! `repr(C)` 类型镜像和类型安全的包装函数。
+//! The ABI definitions and protocol logic live in `src/c`. Rust keeps only
+//! `repr(C)` mirrors required for FFI plus small, typed wrapper functions.
 
 #![no_std]
 
@@ -293,6 +293,28 @@ pub struct EfiSystemTable {
     pub configuration_table: *mut EfiConfigTable,
 }
 
+impl EfiSystemTable {
+    pub unsafe fn config_tables(&self) -> Option<&'static [EfiConfigTable]> {
+        unsafe { config_tables(self as *const EfiSystemTable) }
+    }
+
+    pub unsafe fn find_config_table(&self, guid: &EfiGuid) -> Option<*mut c_void> {
+        unsafe { find_config_table(self as *const EfiSystemTable, guid) }
+    }
+
+    pub unsafe fn firmware_vendor_cstr16(&self, max_len: usize) -> Option<&'static [EfiChar16]> {
+        unsafe { firmware_vendor(self as *const EfiSystemTable, max_len) }
+    }
+
+    pub unsafe fn find_acpi_rsdp(&self) -> Option<*mut c_void> {
+        unsafe { find_acpi_rsdp(self as *const EfiSystemTable) }
+    }
+
+    pub unsafe fn find_fdt(&self) -> Option<*mut c_void> {
+        unsafe { find_fdt(self as *const EfiSystemTable) }
+    }
+}
+
 #[repr(C)]
 pub struct EfiLoadedImageProtocol {
     pub revision: u32,
@@ -321,6 +343,81 @@ pub struct EfiBootHandoff {
     pub map_key: usize,
     pub descriptor_size: usize,
     pub descriptor_version: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EfiSystemTableView {
+    ptr: *const EfiSystemTable,
+}
+
+impl EfiSystemTableView {
+    pub unsafe fn from_ptr(ptr: usize) -> Option<Self> {
+        if ptr == 0 {
+            return None;
+        }
+        let st = ptr as *const EfiSystemTable;
+        if unsafe { efi_system_table_is_valid(st) } == 0 {
+            return None;
+        }
+        Some(EfiSystemTableView { ptr: st })
+    }
+
+    pub unsafe fn table(&self) -> &EfiSystemTable {
+        unsafe { &*self.ptr }
+    }
+
+    pub fn as_ptr(&self) -> *const EfiSystemTable {
+        self.ptr
+    }
+}
+
+const EFI_SYSTEM_TABLE_SNAPSHOT_CONFIG_CAPACITY: usize = 64;
+const EFI_SYSTEM_TABLE_SNAPSHOT_VENDOR_CAPACITY: usize = 128;
+
+static mut SNAPSHOT_EFI_SYSTEM_TABLE: MaybeUninit<EfiSystemTable> = MaybeUninit::uninit();
+static mut SNAPSHOT_EFI_RUNTIME_SERVICES: MaybeUninit<EfiRuntimeServices> = MaybeUninit::uninit();
+static mut SNAPSHOT_EFI_BOOT_SERVICES: MaybeUninit<EfiBootServices> = MaybeUninit::uninit();
+static mut SNAPSHOT_EFI_CONFIG_TABLE: MaybeUninit<
+    [EfiConfigTable; EFI_SYSTEM_TABLE_SNAPSHOT_CONFIG_CAPACITY],
+> = MaybeUninit::uninit();
+static mut SNAPSHOT_EFI_FIRMWARE_VENDOR: MaybeUninit<
+    [EfiChar16; EFI_SYSTEM_TABLE_SNAPSHOT_VENDOR_CAPACITY],
+> = MaybeUninit::uninit();
+
+pub fn snapshot_system_table_static(
+    view: EfiSystemTableView,
+) -> Result<&'static EfiSystemTable, &'static str> {
+    let system_table_ptr = addr_of_mut!(SNAPSHOT_EFI_SYSTEM_TABLE).cast::<EfiSystemTable>();
+    let config_table_ptr = addr_of_mut!(SNAPSHOT_EFI_CONFIG_TABLE).cast::<EfiConfigTable>();
+    let runtime_services_ptr =
+        addr_of_mut!(SNAPSHOT_EFI_RUNTIME_SERVICES).cast::<EfiRuntimeServices>();
+    let boot_services_ptr = addr_of_mut!(SNAPSHOT_EFI_BOOT_SERVICES).cast::<EfiBootServices>();
+    let firmware_vendor_ptr = addr_of_mut!(SNAPSHOT_EFI_FIRMWARE_VENDOR).cast::<EfiChar16>();
+    let mut config_table_count = 0usize;
+
+    let ok = unsafe {
+        snapshot_system_table(
+            view.as_ptr(),
+            system_table_ptr,
+            config_table_ptr,
+            EFI_SYSTEM_TABLE_SNAPSHOT_CONFIG_CAPACITY,
+            runtime_services_ptr,
+            boot_services_ptr,
+            firmware_vendor_ptr,
+            EFI_SYSTEM_TABLE_SNAPSHOT_VENDOR_CAPACITY,
+            Some(&mut config_table_count),
+        )
+    };
+    if !ok {
+        return Err("[efi] failed to snapshot EFI system table");
+    }
+
+    let table = unsafe { (*addr_of_mut!(SNAPSHOT_EFI_SYSTEM_TABLE)).assume_init_ref() };
+    let _snapshot_view = unsafe { EfiSystemTableView::from_ptr(table as *const _ as usize) }
+        .ok_or("[efi] kernel EFI table snapshot validation failed")?;
+
+    let _ = config_table_count;
+    Ok(table)
 }
 
 unsafe extern "C" {
@@ -455,6 +552,15 @@ unsafe extern "C" {
     ) -> EfiStatus;
 }
 
+fn c_ascii_str(ptr: *const u8, max_len: usize) -> &'static str {
+    if ptr.is_null() {
+        return "";
+    }
+    let len = unsafe { efi_ascii_strlen(ptr, max_len) };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    core::str::from_utf8(bytes).unwrap_or("")
+}
+
 pub fn status_success() -> EfiStatus {
     unsafe { EFI_STATUS_SUCCESS }
 }
@@ -491,15 +597,14 @@ pub fn status_is_success(status: EfiStatus) -> bool {
     unsafe { efi_status_is_success(status) != 0 }
 }
 
+pub fn status_name(status: EfiStatus) -> &'static str {
+    let ptr = unsafe { efi_status_name(status) };
+    c_ascii_str(ptr, 96)
+}
+
 pub fn memory_type_name(type_: u32) -> &'static str {
     let ptr = unsafe { efi_memory_type_name(type_) };
-    // SAFETY: C 侧返回静态字符串字面量或 null
-    if ptr.is_null() {
-        return "";
-    }
-    let len = unsafe { efi_ascii_strlen(ptr, 96) };
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    core::str::from_utf8(bytes).unwrap_or("")
+    c_ascii_str(ptr, 96)
 }
 
 pub fn memory_type_is_usable_after_exit_boot_services(type_: u32) -> bool {
@@ -562,139 +667,10 @@ pub fn guid_equal(lhs: &EfiGuid, rhs: &EfiGuid) -> bool {
     unsafe { efi_guid_equal(lhs as *const EfiGuid, rhs as *const EfiGuid) != 0 }
 }
 
-pub fn status_name(status: EfiStatus) -> &'static str {
-    let ptr = unsafe { efi_status_name(status) };
-    c_ascii_str(ptr, 96)
-}
-
 pub fn known_config_table_name(guid: &EfiGuid) -> &'static str {
     let ptr = unsafe { efi_known_config_table_name(guid as *const EfiGuid) };
     c_ascii_str(ptr, 128)
 }
-
-// ============================================================================
-// EfiSystemTableView
-// ============================================================================
-
-#[derive(Clone, Copy, Debug)]
-pub struct EfiSystemTableView {
-    ptr: *const EfiSystemTable,
-}
-
-impl EfiSystemTableView {
-    pub unsafe fn from_ptr(ptr: usize) -> Option<Self> {
-        if ptr == 0 {
-            return None;
-        }
-        let st = ptr as *const EfiSystemTable;
-        if unsafe { efi_system_table_is_valid(st) } == 0 {
-            return None;
-        }
-        Some(EfiSystemTableView { ptr: st })
-    }
-
-    pub unsafe fn table(&self) -> &EfiSystemTable {
-        unsafe { &*self.ptr }
-    }
-
-    pub fn as_ptr(&self) -> *const EfiSystemTable {
-        self.ptr
-    }
-}
-
-// ============================================================================
-// EfiSystemTable 方法
-// ============================================================================
-
-impl EfiSystemTable {
-    pub unsafe fn config_tables(&self) -> Option<&'static [EfiConfigTable]> {
-        unsafe { config_tables(self as *const EfiSystemTable) }
-    }
-
-    pub unsafe fn find_config_table(&self, guid: &EfiGuid) -> Option<*mut c_void> {
-        unsafe { find_config_table(self as *const EfiSystemTable, guid) }
-    }
-
-    pub unsafe fn firmware_vendor_cstr16(&self, max_len: usize) -> Option<&'static [EfiChar16]> {
-        unsafe { firmware_vendor(self as *const EfiSystemTable, max_len) }
-    }
-
-    pub unsafe fn find_acpi_rsdp(&self) -> Option<*mut c_void> {
-        unsafe { find_acpi_rsdp(self as *const EfiSystemTable) }
-    }
-
-    pub unsafe fn find_fdt(&self) -> Option<*mut c_void> {
-        unsafe { find_fdt(self as *const EfiSystemTable) }
-    }
-}
-
-// ============================================================================
-// 系统表快照
-// ============================================================================
-
-const EFI_SYSTEM_TABLE_SNAPSHOT_CONFIG_CAPACITY: usize = 64;
-const EFI_SYSTEM_TABLE_SNAPSHOT_VENDOR_CAPACITY: usize = 128;
-
-static mut SNAPSHOT_EFI_SYSTEM_TABLE: MaybeUninit<EfiSystemTable> = MaybeUninit::uninit();
-static mut SNAPSHOT_EFI_RUNTIME_SERVICES: MaybeUninit<EfiRuntimeServices> = MaybeUninit::uninit();
-static mut SNAPSHOT_EFI_BOOT_SERVICES: MaybeUninit<EfiBootServices> = MaybeUninit::uninit();
-static mut SNAPSHOT_EFI_CONFIG_TABLE: MaybeUninit<
-    [EfiConfigTable; EFI_SYSTEM_TABLE_SNAPSHOT_CONFIG_CAPACITY],
-> = MaybeUninit::uninit();
-static mut SNAPSHOT_EFI_FIRMWARE_VENDOR: MaybeUninit<
-    [EfiChar16; EFI_SYSTEM_TABLE_SNAPSHOT_VENDOR_CAPACITY],
-> = MaybeUninit::uninit();
-
-pub fn snapshot_system_table_static(
-    view: EfiSystemTableView,
-) -> Result<&'static EfiSystemTable, &'static str> {
-    let system_table_ptr = addr_of_mut!(SNAPSHOT_EFI_SYSTEM_TABLE).cast::<EfiSystemTable>();
-    let config_table_ptr = addr_of_mut!(SNAPSHOT_EFI_CONFIG_TABLE).cast::<EfiConfigTable>();
-    let runtime_services_ptr =
-        addr_of_mut!(SNAPSHOT_EFI_RUNTIME_SERVICES).cast::<EfiRuntimeServices>();
-    let boot_services_ptr = addr_of_mut!(SNAPSHOT_EFI_BOOT_SERVICES).cast::<EfiBootServices>();
-    let firmware_vendor_ptr = addr_of_mut!(SNAPSHOT_EFI_FIRMWARE_VENDOR).cast::<EfiChar16>();
-    let mut config_table_count = 0usize;
-
-    let ok = unsafe {
-        snapshot_system_table(
-            view.as_ptr(),
-            system_table_ptr,
-            config_table_ptr,
-            EFI_SYSTEM_TABLE_SNAPSHOT_CONFIG_CAPACITY,
-            runtime_services_ptr,
-            boot_services_ptr,
-            firmware_vendor_ptr,
-            EFI_SYSTEM_TABLE_SNAPSHOT_VENDOR_CAPACITY,
-            Some(&mut config_table_count),
-        )
-    };
-    if !ok {
-        return Err("[efi] failed to snapshot EFI system table");
-    }
-
-    let table = unsafe { (*addr_of_mut!(SNAPSHOT_EFI_SYSTEM_TABLE)).assume_init_ref() };
-
-    let _ = config_table_count;
-    Ok(table)
-}
-
-// ============================================================================
-// 内部辅助
-// ============================================================================
-
-fn c_ascii_str(ptr: *const u8, max_len: usize) -> &'static str {
-    if ptr.is_null() {
-        return "";
-    }
-    let len = unsafe { efi_ascii_strlen(ptr, max_len) };
-    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    core::str::from_utf8(bytes).unwrap_or("")
-}
-
-// ============================================================================
-// FFI 包装函数
-// ============================================================================
 
 pub unsafe fn config_tables(
     system_table: *const EfiSystemTable,

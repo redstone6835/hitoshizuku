@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vfs::cred::{Gid, Uid};
 use vfs::dentry::Dentry;
@@ -128,6 +128,7 @@ pub(crate) struct FsState {
     pub(crate) sb_free_inodes: core::sync::atomic::AtomicU32,
     pub(crate) block_alloc_hint: core::sync::atomic::AtomicU64,
     pub(crate) inode_alloc_hint: core::sync::atomic::AtomicU32,
+    pub(crate) alloc_meta_dirty: AtomicBool,
     /// 只读挂载标志(由驱动 flags 或 remount 控制)。
     pub(crate) read_only: core::sync::atomic::AtomicBool,
 }
@@ -166,7 +167,9 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.free_blocks = apply_delta(c.free_blocks, delta);
         }
-        crate::alloc_mod::flush_group_desc(self, group)
+        let _ = group;
+        self.alloc_meta_dirty.store(true, Ordering::Release);
+        Ok(())
     }
     pub(crate) fn adjust_group_free_inodes(
         &self,
@@ -180,7 +183,9 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.free_inodes = apply_delta(c.free_inodes, delta);
         }
-        crate::alloc_mod::flush_group_desc(self, group)
+        let _ = group;
+        self.alloc_meta_dirty.store(true, Ordering::Release);
+        Ok(())
     }
     pub(crate) fn adjust_group_used_dirs(
         &self,
@@ -194,7 +199,9 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.used_dirs = apply_delta(c.used_dirs, delta);
         }
-        crate::alloc_mod::flush_group_desc(self, group)
+        let _ = group;
+        self.alloc_meta_dirty.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn adjust_sb_free_blocks(&self, delta: i64) -> Result<(), BlockBackendError> {
@@ -208,7 +215,8 @@ impl FsState {
         };
         self.sb_free_blocks
             .store(next, core::sync::atomic::Ordering::Release);
-        crate::alloc_mod::write_superblock(self)
+        self.alloc_meta_dirty.store(true, Ordering::Release);
+        Ok(())
     }
     pub(crate) fn adjust_sb_free_inodes(&self, delta: i32) -> Result<(), BlockBackendError> {
         let prev = self
@@ -217,7 +225,8 @@ impl FsState {
         let next = apply_delta(prev, delta);
         self.sb_free_inodes
             .store(next, core::sync::atomic::Ordering::Release);
-        crate::alloc_mod::write_superblock(self)
+        self.alloc_meta_dirty.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub(crate) fn ext_sb_free_blocks(&self) -> u64 {
@@ -281,6 +290,39 @@ impl FsState {
             return self.read_block(start_block, out);
         }
         bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, out)
+    }
+
+    pub(crate) fn write_blocks(
+        &self,
+        start_block: u64,
+        count: u32,
+        data: &[u8],
+    ) -> Result<(), BlockBackendError> {
+        let expected = self.ext_sb.block_size as usize * count as usize;
+        if data.len() != expected {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if count == 1 {
+            return self.write_block(start_block, data);
+        }
+        bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, data)?;
+        self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    pub(crate) fn flush_alloc_metadata(&self) -> Result<(), BlockBackendError> {
+        if !self.alloc_meta_dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        for group in 0..self.ext_sb.groups_count {
+            crate::alloc_mod::flush_group_desc(self, group)?;
+        }
+        crate::alloc_mod::write_superblock(self)
+    }
+
+    #[inline]
+    pub(crate) fn io_epoch(&self) -> u64 {
+        self.block_cache_epoch.load(Ordering::Acquire)
     }
 
     /// 定位一个 inode 号所在的块号与块内字节偏移。
@@ -391,7 +433,7 @@ impl SuperblockOps for ExtFsSuperblockOps {
         })
     }
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
-        Ok(())
+        self.state.flush_alloc_metadata().map_err(map_err)
     }
     fn remount(&self, _sb: &Arc<VfsSuperblock>, _flags: MountFlags) -> VfsResult<()> {
         // 只读驱动,remount 忽略写标志
@@ -427,6 +469,7 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         sb_free_inodes: core::sync::atomic::AtomicU32::new(free_inodes),
         block_alloc_hint: core::sync::atomic::AtomicU64::new(0),
         inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
+        alloc_meta_dirty: AtomicBool::new(false),
         read_only: core::sync::atomic::AtomicBool::new(false),
     });
 

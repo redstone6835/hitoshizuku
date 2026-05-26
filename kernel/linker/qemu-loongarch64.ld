@@ -145,6 +145,7 @@ SECTIONS
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - LOAD_OFFSET) {
         *(.rodata .rodata.*)
         *(.srodata .srodata.*)
+        . = ALIGN(8);
         PROVIDE(__ex_table_start = .);
         KEEP(*(__ex_table))
         PROVIDE(__ex_table_end = .);

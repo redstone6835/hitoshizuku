@@ -875,16 +875,6 @@ impl VmemArena {
             return None;
         }
 
-        let allocated = read_tag(tag_idx);
-        log::debug!(
-            "[alloc][vmem-core] allocated tag_idx={} base={:#x} size={} requested_size={} seg_prev={} seg_next={}",
-            tag_idx,
-            allocated.base,
-            allocated.size,
-            size,
-            allocated.seg_prev,
-            allocated.seg_next
-        );
         Some(aligned_base)
     }
 
@@ -995,10 +985,6 @@ impl VmemArena {
         // 释放路径的重点是“按地址和大小找到对应 allocated tag”，然后把它标成
         // free，并与左右相邻空闲段即时合并。即时合并能显著降低地址空间碎片化速度。
         if !self.initialized {
-            log::debug!(
-                "[alloc][vmem-core] free rejected addr={:#x}: arena not initialized",
-                addr
-            );
             return Err(VmemError::NotInitialized);
         }
         let Some(expected_size) = align_up(size, self.quantum) else {
@@ -1028,13 +1014,6 @@ impl VmemArena {
         let tag_size = current.size;
         if tag_size != expected_size {
             self.stats.size_mismatch_failures += 1;
-            log::debug!(
-                "[alloc][vmem-core] free size mismatch addr={:#x} requested={} aligned={} actual={}",
-                addr,
-                size,
-                expected_size,
-                tag_size,
-            );
             return Err(VmemError::SizeMismatch {
                 expected: expected_size,
                 actual: tag_size,

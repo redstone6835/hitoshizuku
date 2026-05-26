@@ -12,8 +12,8 @@
 //!
 //! ELF loader / mmap / fork / mprotect 都要用到同一份 VMA 代数。把它抽出来
 //! 让 `general::mm::VmSpace` 只组合这里的算法 + 注入的 `UserPgdOps`，避免在
-//! arch / kernel 层重复 rebuild 一整套"按地址查 VMA"的代码。
-
+//! arch / kernel 层重复 rebuild 一整套"按地址查 VMA".的代码。
+//!
 extern crate alloc;
 
 pub mod area;

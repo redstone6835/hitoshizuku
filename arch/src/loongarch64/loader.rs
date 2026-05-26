@@ -11,7 +11,7 @@
 //! 构建 `StartContext` 时读取。
 
 use core::ptr::{addr_of, addr_of_mut};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, compiler_fence};
 use core::{fmt, fmt::Write};
 
 use super::efi_stub;
@@ -302,6 +302,7 @@ fn store_kernel_command_line(raw_ptr: usize) -> Option<&'static [u8]> {
         let dst = addr_of_mut!(KERNEL_FIRMWARE_BUFFERS.command_line).cast::<u8>();
         core::ptr::copy_nonoverlapping(src, dst, len);
         dst.add(len).write(0);
+        erase_original_cmdline(src.cast_mut(), len + 1, dst, CMDLINE_BUF_SIZE);
     }
     KERNEL_FIRMWARE_STATE
         .cmdline_valid_len
@@ -315,6 +316,25 @@ fn store_kernel_command_line(raw_ptr: usize) -> Option<&'static [u8]> {
     }
 
     kernel_command_line()
+}
+
+fn ranges_overlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) -> bool {
+    let a_end = a_start.saturating_add(a_len);
+    let b_end = b_start.saturating_add(b_len);
+    a_start < b_end && b_start < a_end
+}
+
+unsafe fn erase_original_cmdline(src: *mut u8, len: usize, saved: *const u8, saved_len: usize) {
+    if len == 0 || ranges_overlap(src as usize, len, saved as usize, saved_len) {
+        return;
+    }
+
+    for offset in 0..len {
+        unsafe {
+            src.add(offset).write_volatile(0);
+        }
+    }
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// 从指定的物理地址拷贝 DTB 到内核缓冲区，并返回 DTB 视图。

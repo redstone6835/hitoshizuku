@@ -362,6 +362,21 @@ impl Inode {
         self.ops.mkdir(self, name, mode, cred)
     }
 
+    /// 在此目录 Inode 中创建一个普通文件，委托给底层 `InodeOps::create`。
+    pub fn create(
+        &self,
+        name: &str,
+        mode: crate::stat::FileMode,
+        cred: &crate::cred::Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        self.ops.create(self, name, mode, cred)
+    }
+
+    /// 从目录中删除 `child` 对应的 `name` 条目，委托给底层 `InodeOps::unlink`。
+    pub fn unlink(&self, name: &str, child: &Inode) -> VfsResult<()> {
+        self.ops.unlink(self, name, child)
+    }
+
     /// 在此目录 Inode 中按名称查找子项，委托给底层 `InodeOps::lookup`。
     pub fn lookup(&self, name: &str) -> VfsResult<Arc<Inode>> {
         self.ops.lookup(self, name)
