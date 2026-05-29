@@ -30,6 +30,7 @@ pub mod mm;
 pub mod syscall;
 pub mod vfs;
 
+pub mod cmdline;
 pub mod console;
 pub mod dev;
 pub mod dtb;

@@ -343,9 +343,12 @@ pub const ARCH_ID_LOONGARCH64: usize = 2;
 /// 核心的内核异常栈栈顶。
 pub const PER_CPU_KSTACK_OFFSET: usize = 0;
 
+/// 默认定时器中断频率（Hz）。可通过内核命令行 `timer_hz=N` 覆盖。
+pub const DEFAULT_TIMER_HZ: usize = 100;
+
 #[inline]
 /// 读取稳定计数器并换算为纳秒。
-///
+
 /// `rdtime.d` 返回的是硬件计数器值，不是直接的时间单位。这里结合平台初始化阶段探测
 /// 得到的稳定频率，把计数值换算成纳秒时间戳。
 pub fn kernel_timestamp_ns() -> u64 {

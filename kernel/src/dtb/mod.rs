@@ -136,7 +136,7 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
-    let cmdline = context.boot.command_line.map(crate::cmdline::Cmdline::new);
+    let cmdline = context.boot.command_line.map(general::cmdline::Cmdline::new);
     let external_initramfs = external_initramfs_range.map(|(start, end)| {
         let virt = (context.address.phys_to_virt)(start);
         let len = end - start;
@@ -284,7 +284,7 @@ pub fn kernel_start_init(context: &StartContext) {
     let console_registered = {
         let cmdline_dev = cmdline
             .as_ref()
-            .and_then(|cl| cl.console_device())
+            .and_then(|cl| cl.find("console").map(|v| v.split_once(',').map_or(v, |(d, _)| d)))
             .and_then(|name| resolve_cmdline_console(&vfs_ctx, dev_ops, name));
 
         let dev = if let Some(dev) = cmdline_dev {

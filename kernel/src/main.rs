@@ -8,7 +8,6 @@ extern crate hal;
 
 mod acpi;
 mod bench;
-mod cmdline;
 mod dtb;
 mod initramfs;
 mod panic;

@@ -311,7 +311,7 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
-    let cmdline = context.boot.command_line.map(crate::cmdline::Cmdline::new);
+    let cmdline = context.boot.command_line.map(general::cmdline::Cmdline::new);
 
     // ── Step 4: discover and register ACPI devices ───────────────────────────
 
@@ -540,7 +540,7 @@ pub fn kernel_start_init(context: &StartContext) {
     let console_registered = {
         let cmdline_dev = cmdline
             .as_ref()
-            .and_then(|cl| cl.console_device())
+            .and_then(|cl| cl.find("console").map(|v| v.split_once(',').map_or(v, |(d, _)| d)))
             .and_then(|name| resolve_cmdline_console(&vfs_ctx, dev_ops, name));
 
         printk!(
