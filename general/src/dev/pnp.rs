@@ -157,7 +157,11 @@ impl fmt::Display for PnpId {
                 bus,
                 device,
                 function,
-            } => write!(f, "pci:{:04x}:{:02x}:{:02x}.{}", segment, bus, device, function),
+            } => write!(
+                f,
+                "pci:{:04x}:{:02x}:{:02x}.{}",
+                segment, bus, device, function
+            ),
             PnpId::Usb {
                 bus_id,
                 address,
@@ -289,11 +293,7 @@ impl Debug for PnpDevice {
 }
 
 impl PnpDevice {
-    pub fn new(
-        id: PnpId,
-        name: Box<str>,
-        info: Box<dyn PnpBusInfo>,
-    ) -> Arc<Self> {
+    pub fn new(id: PnpId, name: Box<str>, info: Box<dyn PnpBusInfo>) -> Arc<Self> {
         Arc::new(Self {
             id,
             name,
@@ -474,8 +474,7 @@ impl PnpDriverRegistry {
                 Ok(())
             }
             Err(err) => {
-                let drained: Vec<PnpFunction> =
-                    dev.inner.lock().functions.drain(..).collect();
+                let drained: Vec<PnpFunction> = dev.inner.lock().functions.drain(..).collect();
                 for func in &drained {
                     func.mark_gone();
                     dev.unregister_function_external(func);
@@ -518,7 +517,10 @@ impl PnpDeviceList {
     pub fn push(&self, dev: Arc<PnpDevice>) -> Result<Arc<PnpDevice>, PnpError> {
         let mut list = self.devices.lock();
         list.retain(|d| d.state() != PnpState::Gone);
-        if list.iter().any(|d| d.id == dev.id && d.state() != PnpState::Gone) {
+        if list
+            .iter()
+            .any(|d| d.id == dev.id && d.state() != PnpState::Gone)
+        {
             return Err(PnpError::NameConflict);
         }
         list.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;

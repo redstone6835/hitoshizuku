@@ -16,7 +16,7 @@
 //! use general::page_walk::{find_leaf, walk_and_map, unmap_range_entries, MapError};
 //! use general::PagingArch;
 //!
-//! let result = walk_and_map::<LoongArch64Paging>(
+//! let result = walk_and_map::<MyPagingArch>(
 //!     root_vaddr, vaddr, paddr, target_level,
 //!     true, true, false, false, true,
 //!     phys_to_virt,
@@ -216,10 +216,8 @@ pub fn walk_and_map<P: PagingArch>(
     // 在目标层级创建叶子映射
     let index = P::level_index(vaddr, target_level);
     let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
-
-    // 防止在已有映射上重复映射，避免页表损坏
-    let old_pte_val = unsafe { core::ptr::read_volatile(pte_ptr) };
-    if P::pte_is_valid(P::pte_from_usize(old_pte_val)) {
+    let old_pte = P::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) });
+    if P::pte_is_valid(old_pte) {
         return Err(MapError::AlreadyMapped);
     }
 

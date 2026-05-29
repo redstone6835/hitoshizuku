@@ -361,6 +361,9 @@ pub struct StartContext {
     pub allocator: Option<StartAllocatorOps>,
 }
 
+/// 运行期保存的启动命令行快照。
+static mut START_CMDLINE: Option<&'static [u8]> = None;
+
 impl StartContext {
     /// 返回当前启动上下文所选定的固件来源。
     pub const fn firmware_source(&self) -> StartFirmwareSource {
@@ -407,4 +410,16 @@ impl StartContext {
 
         Ok(())
     }
+}
+
+/// 安装运行期启动命令行快照。
+pub fn set_start_cmdline(cmdline: Option<&'static [u8]>) {
+    unsafe {
+        START_CMDLINE = cmdline;
+    }
+}
+
+/// 读取运行期启动命令行快照。
+pub fn start_cmdline() -> Option<&'static [u8]> {
+    unsafe { START_CMDLINE }
 }

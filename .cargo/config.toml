@@ -1,5 +1,13 @@
 [build]
+#target = "riscv64gc-unknown-none-elf"
 target = "loongarch64-unknown-none"
+
+[target.riscv64gc-unknown-none-elf]
+linker = "rust-lld"
+rustflags = [
+    "-Clink-arg=-Tkernel/linker/qemu-riscv64.ld",
+    "-C", "link-arg=--fatal-warnings",
+]
 
 [target.loongarch64-unknown-none]
 linker = "rust-lld"
@@ -9,4 +17,5 @@ rustflags = [
 ]
 
 [env]
-CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
+CC_loongarch64_unknown_none = "loongarch64-unknown-linux-gnu-gcc"
+CC_riscv64gc_unknown_none_elf = "riscv64-linux-gnu-gcc"

@@ -68,11 +68,9 @@ fn cache_new_inode(
     name: &str,
     inode: Arc<Inode>,
 ) -> Arc<dentry::Dentry> {
-    let inode = if let Some(sb) = inode.superblock.upgrade() {
-        sb.insert_inode(Arc::clone(&inode))
-    } else {
-        inode
-    };
+    if let Some(sb) = inode.superblock.upgrade() {
+        sb.insert_inode(Arc::clone(&inode));
+    }
     let new_dentry = dentry::Dentry::new_positive(name, Some(Arc::clone(parent)), inode);
     DCACHE.insert(new_dentry)
 }

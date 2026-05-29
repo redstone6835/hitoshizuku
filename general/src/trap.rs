@@ -9,7 +9,7 @@ pub enum TrapType {
 /// 异常类型详细分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exception {
-    // RISC-V oriented
+    // Common trap categories
     InstructionMisaligned,
     InstructionAccessFault,
     IllegalInstruction,
@@ -24,7 +24,7 @@ pub enum Exception {
     StorePageFault,
     AddressError,
     AddressAlignmentError,
-    // LoongArch64 专用
+    // Architecture-specific categories normalized for upper layers
     PageModified,
     PageNoRead,
     PageNoExecute,
@@ -41,7 +41,7 @@ pub enum Exception {
 /// 中断类型详细分类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interrupt {
-    // RISC-V oriented
+    // Common interrupt categories
     UserSoftware,
     SupervisorSoftware,
     MachineMode,
@@ -51,7 +51,7 @@ pub enum Interrupt {
     UserExternal,
     SupervisorExternal,
     MachineExternal,
-    // LoongArch64 专用
+    // Architecture-specific categories normalized for upper layers
     Timer,
     Ipi,
     Hardware(usize),

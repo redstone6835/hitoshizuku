@@ -264,10 +264,6 @@ pub(crate) fn ensure_block_in_extent(
     }
     // 没覆盖到:需要新开一条叶子。先分配一个物理块,再尝试 append。
     let new_phys = crate::alloc_mod::alloc_block(state)?;
-    // 清零新块
-    let bs = state.ext_sb.block_size as usize;
-    let z = alloc::vec![0u8; bs];
-    state.write_block(new_phys, &z)?;
     if try_append_leaf(i_block, lb, new_phys, 1) {
         Ok(Some(new_phys))
     } else {
@@ -275,4 +271,87 @@ pub(crate) fn ensure_block_in_extent(
         crate::alloc_mod::free_block(state, new_phys)?;
         Ok(None)
     }
+}
+
+pub(crate) fn ensure_extent_run(
+    state: &crate::state::FsState,
+    i_block: &mut [u8],
+    start_lb: u32,
+    count: u32,
+) -> Result<Option<(u64, u32)>, BlockBackendError> {
+    if count == 0 {
+        return Ok(None);
+    }
+    if i_block.len() < EXT_HEADER_SIZE {
+        return Ok(None);
+    }
+    let magic = u16::from_le_bytes([i_block[0], i_block[1]]);
+    let depth = u16::from_le_bytes([i_block[6], i_block[7]]);
+    if magic != EXT4_EXT_MAGIC || depth != 0 {
+        return Ok(None);
+    }
+
+    // 先检查 start_lb 是否已有映射（覆盖写场景）
+    if let Some(phys) = lookup_extent_phys(i_block, start_lb) {
+        // 已映射，找连续 run 长度
+        let mut run = 1u32;
+        while run < count {
+            if let Some(p) = lookup_extent_phys(i_block, start_lb + run) {
+                if p != phys + run as u64 {
+                    break;
+                }
+                run += 1;
+            } else {
+                break;
+            }
+        }
+        return Ok(Some((phys, run)));
+    }
+
+    // 未映射：批量分配连续物理块
+    let (new_phys, got) = crate::alloc_mod::alloc_blocks_run(state, count)?;
+    if try_append_leaf(i_block, start_lb, new_phys, got as u16) {
+        Ok(Some((new_phys, got)))
+    } else {
+        // extent 叶子满了，尝试只插入 1 个块
+        if got > 1 {
+            // 释放多余的块
+            for i in 1..got {
+                let _ = crate::alloc_mod::free_block(state, new_phys + i as u64);
+            }
+        }
+        if try_append_leaf(i_block, start_lb, new_phys, 1) {
+            Ok(Some((new_phys, 1)))
+        } else {
+            crate::alloc_mod::free_block(state, new_phys)?;
+            Ok(None)
+        }
+    }
+}
+
+/// 在 extent 叶子中查找 lb 对应的物理块号。
+fn lookup_extent_phys(i_block: &[u8], lb: u32) -> Option<u64> {
+    let entries = u16::from_le_bytes([i_block[2], i_block[3]]);
+    for i in 0..entries as usize {
+        let off = EXT_HEADER_SIZE + i * EXT_ENTRY_SIZE;
+        if off + EXT_ENTRY_SIZE > i_block.len() {
+            break;
+        }
+        let ee_block = u32::from_le_bytes([
+            i_block[off], i_block[off + 1], i_block[off + 2], i_block[off + 3],
+        ]);
+        let ee_len = u16::from_le_bytes([i_block[off + 4], i_block[off + 5]]);
+        let real_len = if ee_len > 0x8000 { ee_len - 0x8000 } else { ee_len };
+        if lb >= ee_block && lb < ee_block + real_len as u32 {
+            if ee_len > 0x8000 {
+                return None; // uninitialized extent
+            }
+            let start_hi = u16::from_le_bytes([i_block[off + 6], i_block[off + 7]]) as u64;
+            let start_lo = u32::from_le_bytes([
+                i_block[off + 8], i_block[off + 9], i_block[off + 10], i_block[off + 11],
+            ]) as u64;
+            return Some(((start_hi << 32) | start_lo) + (lb - ee_block) as u64);
+        }
+    }
+    None
 }

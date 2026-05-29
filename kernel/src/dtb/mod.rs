@@ -375,7 +375,7 @@ fn resolve_cmdline_console(
     if name.starts_with('/') {
         return path::lookup(vfs_ctx, &Dirfd::Cwd, name, LookupFlags::default())
             .ok()
-            .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root_dentry()))
+            .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root.root()))
             .and_then(|resolved| {
                 resolved
                     .strip_prefix("/dev/")
@@ -569,13 +569,14 @@ fn register_dtb_serial_node(
     let fw_name: &'static str = node
         .name()
         .unwrap_or_else(|| leak_str(&alloc::format!("serial@{:#x}", phys_addr)));
-    let user_name: &'static str = leak_str(&alloc::format!("uart{}", idx));
+    let user_name: &'static str = leak_str(&alloc::format!("{}{}", CharDeviceKind::Ns16550.name(), idx));
 
     let dev = CharDevice::new(CharDeviceKind::Ns16550, fw_name, uart);
     if let Err(err) = DEVICES.char_devs.push(dev.clone()) {
         printk!(
-            "[kernel-start][dtb] failed to register {} (uart{}) at {:#x}: {:?}",
+            "[kernel-start][dtb] failed to register {} ({}{}) at {:#x}: {:?}",
             fw_name,
+            CharDeviceKind::Ns16550.name(),
             idx,
             phys_addr,
             err

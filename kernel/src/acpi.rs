@@ -636,7 +636,7 @@ fn resolve_cmdline_console(
     if name.starts_with('/') {
         return path::lookup(vfs_ctx, &Dirfd::Cwd, name, LookupFlags::default())
             .ok()
-            .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root_dentry()))
+            .and_then(|lookup| lookup.dentry.full_path(&vfs_ctx.root.root()))
             .and_then(|resolved| {
                 resolved
                     .strip_prefix("/dev/")

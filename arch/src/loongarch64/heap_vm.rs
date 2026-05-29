@@ -376,14 +376,14 @@ pub fn kernel_virt_to_phys(vaddr: usize) -> usize {
 ///
 /// 这些信息有助于诊断页表初始化问题，例如地址不合法、VALEN 配置错误等。
 pub fn init_kernel_page_table() {
-    log::debug!("[arch][heap_vm] initializing kernel page table");
-    log::debug!(
-        "[arch][heap_vm] kernel heap base={:#x} size={:#x} effective_valen={} canonical={}",
-        KERNEL_HEAP_BASE,
-        KERNEL_HEAP_SIZE,
-        LoongArch64Paging::effective_valen(),
-        LoongArch64Paging::is_canonical_vaddr(KERNEL_HEAP_BASE)
-    );
+    // log::debug!("[arch][heap_vm] initializing kernel page table");
+    // log::debug!(
+    //     "[arch][heap_vm] kernel heap base={:#x} size={:#x} effective_valen={} canonical={}",
+    //     KERNEL_HEAP_BASE,
+    //     KERNEL_HEAP_SIZE,
+    //     LoongArch64Paging::effective_valen(),
+    //     LoongArch64Paging::is_canonical_vaddr(KERNEL_HEAP_BASE)
+    // );
 
     // 分配根页表页
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
@@ -566,17 +566,20 @@ fn map_range_with_policy(
         return map_range_with_policy(vaddr, paddr, size, PagePolicy::BaseOnly);
     }
 
-    log::debug!(
-        "[arch][heap_vm] mapping range vaddr={:#x} paddr={:#x} size={:#x} level={} page_size={:#x} policy={:?}",
-        vaddr,
-        paddr,
-        size,
-        target_level,
-        page_size,
-        page_policy
-    );
+    // log::debug!(
+    //     "[arch][heap_vm] mapping range vaddr={:#x} paddr={:#x} size={:#x} level={} page_size={:#x} policy={:?}",
+    //     vaddr,
+    //     paddr,
+    //     size,
+    //     target_level,
+    //     page_size,
+    //     page_policy
+    // );
 
-    // 遍历地址范围，逐页映射
+    // 遍历地址范围，逐页映射。PreferLarge 是性能策略，不是正确性要求：
+    // 动态 kernel heap 可能先在同一个 2 MiB 区间建立过 4 KiB 下级页表，
+    // 即使叶子映射已解除，中间页表也会保留。此时不能直接覆盖为 huge leaf，
+    // 应回退到 base page 映射继续满足分配请求。
     let mut current_vaddr = vaddr;
     let mut current_paddr = paddr;
     let end_vaddr = vaddr + size;
@@ -595,25 +598,35 @@ fn map_range_with_policy(
             phys_to_virt,
             allocate_page_table_page,
         ) {
-            if current_vaddr != vaddr {
-                let mapped_size = current_vaddr - vaddr;
-                if let Err(unmap_err) = unmap_range_entries::<LoongArch64Paging>(
+            let mapped_size = current_vaddr - vaddr;
+            let mut rollback_failed = false;
+            if mapped_size != 0
+                && let Err(unmap_err) = unmap_range_entries::<LoongArch64Paging>(
                     root_vaddr,
                     vaddr,
                     mapped_size,
                     true,
                     phys_to_virt,
-                ) {
-                    log::error!(
-                        "[arch][heap_vm] failed to rollback partial mapping: vaddr={:#x} size={:#x} error={:?}",
-                        vaddr,
-                        mapped_size,
-                        unmap_err
-                    );
-                }
+                )
+            {
+                log::error!(
+                    "[arch][heap_vm] failed to rollback partial mapping: vaddr={:#x} size={:#x} error={:?}",
+                    vaddr,
+                    mapped_size,
+                    unmap_err
+                );
+                rollback_failed = true;
+            }
+            if mapped_size != 0 {
                 unsafe {
                     LoongArch64Paging::flush_tlb(None);
                 }
+            }
+            if !rollback_failed
+                && matches!(page_policy, PagePolicy::PreferLarge)
+                && matches!(err, MapError::AlreadyMapped)
+            {
+                return map_range_with_policy(vaddr, paddr, size, PagePolicy::BaseOnly);
             }
             return Err(err);
         }
@@ -627,12 +640,12 @@ fn map_range_with_policy(
         LoongArch64Paging::flush_tlb(None); // 全局刷新
     }
 
-    log::debug!(
-        "[arch][heap_vm] mapping complete: vaddr={:#x} paddr={:#x} size={:#x}",
-        vaddr,
-        paddr,
-        size
-    );
+    // log::debug!(
+    //     "[arch][heap_vm] mapping complete: vaddr={:#x} paddr={:#x} size={:#x}",
+    //     vaddr,
+    //     paddr,
+    //     size
+    // );
 
     Ok(())
 }
@@ -716,13 +729,13 @@ pub fn map_kernel_heap_range(
 
     match map_range_with_policy(vaddr, paddr, size, page_policy) {
         Ok(()) => {
-            log::debug!(
-                "[arch][heap_vm] mapped kernel heap range: vaddr={:#x} paddr={:#x} size={:#x} policy={:?}",
-                vaddr,
-                paddr,
-                size,
-                page_policy
-            );
+            // log::debug!(
+            //     "[arch][heap_vm] mapped kernel heap range: vaddr={:#x} paddr={:#x} size={:#x} policy={:?}",
+            //     vaddr,
+            //     paddr,
+            //     size,
+            //     page_policy
+            // );
             true
         }
         Err(e) => {
@@ -845,10 +858,10 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
         LoongArch64Paging::flush_tlb(None);
     }
 
-    log::debug!(
-        "[arch][heap_vm] unmapped kernel heap range: vaddr={:#x} size={:#x}",
-        vaddr,
-        size
-    );
+    // log::debug!(
+    //     "[arch][heap_vm] unmapped kernel heap range: vaddr={:#x} size={:#x}",
+    //     vaddr,
+    //     size
+    // );
     true
 }

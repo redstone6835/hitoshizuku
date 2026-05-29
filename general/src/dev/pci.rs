@@ -31,9 +31,7 @@ use core::fmt;
 
 use vfs::sync::Spinlock;
 
-use super::pnp::{
-    PnpBusInfo, PnpDevice, PnpError, PnpId, PNP_DEVICES, PNP_DRIVERS,
-};
+use super::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
 
 // ── PciInfo ──────────────────────────────────────────────────────────────
 
@@ -53,11 +51,7 @@ pub struct PciInfo {
 
 impl PciInfo {
     pub const fn class_code(self) -> (u8, u8, u8) {
-        (
-            (self.class >> 16) as u8,
-            self.subclass,
-            self.prog_if,
-        )
+        ((self.class >> 16) as u8, self.subclass, self.prog_if)
     }
 
     pub fn is_storage_controller(&self) -> bool {
@@ -263,8 +257,8 @@ impl PciDevice {
 
         let (bar_type, phys_addr, size_mask) = if is_mmio {
             let bar_type = match (bar_val >> 1) & 0x3 {
-                0 => PciBarType::Memory,   // 32-bit
-                2 => PciBarType::Memory,   // 64-bit (lower half returned here)
+                0 => PciBarType::Memory, // 32-bit
+                2 => PciBarType::Memory, // 64-bit (lower half returned here)
                 _ => return None,
             };
             let phys_addr = (bar_val & 0xFFFF_FFF0) as u64;
@@ -362,11 +356,7 @@ impl PciDevice {
 
     pub fn irq_pin(&self) -> Option<u8> {
         let pin = self.read_config_u8(0x3D);
-        if pin == 0 {
-            None
-        } else {
-            Some(pin)
-        }
+        if pin == 0 { None } else { Some(pin) }
     }
 
     // ── capability 遍历 ──
@@ -473,12 +463,7 @@ impl PciDevice {
     ///
     /// 需要 `PCI_CONFIG` 已设置。返回 `None` 表示设备不存在
     /// （vendor == 0xFFFF）或无法访问 config space。
-    pub fn read_device_info(
-        segment: u16,
-        bus: u8,
-        device: u8,
-        function: u8,
-    ) -> Option<PciInfo> {
+    pub fn read_device_info(segment: u16, bus: u8, device: u8, function: u8) -> Option<PciInfo> {
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref()?;
 

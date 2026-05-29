@@ -130,8 +130,10 @@ impl FatTable {
         sector_bytes: u32,
     ) -> Result<&'a mut FatSlot, BlockBackendError> {
         if let Some(pos) = slots.iter().position(|s| s.lba == lba) {
-            let slot = slots.remove(pos);
-            slots.insert(0, slot);
+            if pos != 0 {
+                let slot = slots.remove(pos);
+                slots.insert(0, slot);
+            }
             return Ok(&mut slots[0]);
         }
         let mut data = alloc::vec![0u8; sector_bytes as usize];
@@ -162,9 +164,13 @@ impl FatTable {
         sector_bytes: u32,
     ) -> Result<&'a mut FatSlot, BlockBackendError> {
         if let Some(pos) = slots.iter().position(|s| s.lba == lba) {
-            let mut slot = slots.remove(pos);
-            slot.dirty = true;
-            slots.insert(0, slot);
+            if pos != 0 {
+                let mut slot = slots.remove(pos);
+                slot.dirty = true;
+                slots.insert(0, slot);
+            } else {
+                slots[0].dirty = true;
+            }
             return Ok(&mut slots[0]);
         }
         let mut data = alloc::vec![0u8; sector_bytes as usize];
@@ -185,6 +191,86 @@ impl FatTable {
             },
         );
         Ok(&mut slots[0])
+    }
+
+    fn read_entry_locked(
+        &self,
+        slots: &mut Vec<FatSlot>,
+        backend: &dyn BlockBackend,
+        cluster: u32,
+    ) -> Result<u32, BlockBackendError> {
+        self.validate_cluster(cluster)?;
+        let bps = self.bytes_per_sector as u64;
+        let off = self.byte_offset(cluster);
+        let sector_no = off / bps;
+        let in_sector = (off % bps) as usize;
+        let base_lba = self.first_fat_sector + sector_no;
+        let slot = Self::ensure_slot_present(
+            slots,
+            backend,
+            self.capacity,
+            base_lba,
+            self.bytes_per_sector,
+        )?;
+        match self.kind {
+            FatKind::Fat16 => {
+                Ok(u16::from_le_bytes([slot.data[in_sector], slot.data[in_sector + 1]]) as u32)
+            }
+            FatKind::Fat32 => Ok(u32::from_le_bytes([
+                slot.data[in_sector],
+                slot.data[in_sector + 1],
+                slot.data[in_sector + 2],
+                slot.data[in_sector + 3],
+            ]) & 0x0fff_ffff),
+            FatKind::Fat12 => self.get(backend, cluster),
+        }
+    }
+
+    fn write_entry_locked(
+        &self,
+        slots: &mut Vec<FatSlot>,
+        backend: &dyn BlockBackend,
+        cluster: u32,
+        value: u32,
+    ) -> Result<(), BlockBackendError> {
+        self.validate_cluster(cluster)?;
+        let bps = self.bytes_per_sector as u64;
+        let off = self.byte_offset(cluster);
+        let sector_no = off / bps;
+        let in_sector = (off % bps) as usize;
+        let base_lba = self.first_fat_sector + sector_no;
+        let slot = Self::ensure_slot_present_mut(
+            slots,
+            backend,
+            self.capacity,
+            base_lba,
+            self.bytes_per_sector,
+        )?;
+        match self.kind {
+            FatKind::Fat16 => {
+                let bytes = (value as u16).to_le_bytes();
+                slot.data[in_sector] = bytes[0];
+                slot.data[in_sector + 1] = bytes[1];
+            }
+            FatKind::Fat32 => {
+                let prev = u32::from_le_bytes([
+                    slot.data[in_sector],
+                    slot.data[in_sector + 1],
+                    slot.data[in_sector + 2],
+                    slot.data[in_sector + 3],
+                ]);
+                let new = (prev & 0xf000_0000) | (value & 0x0fff_ffff);
+                let bytes = new.to_le_bytes();
+                slot.data[in_sector] = bytes[0];
+                slot.data[in_sector + 1] = bytes[1];
+                slot.data[in_sector + 2] = bytes[2];
+                slot.data[in_sector + 3] = bytes[3];
+            }
+            FatKind::Fat12 => {
+                return self.set(backend, cluster, value);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn get(
@@ -531,6 +617,134 @@ impl FatTable {
             self.set(backend, p, new_cluster)?;
         }
         Ok(new_cluster)
+    }
+
+    pub(crate) fn alloc_cluster_run(
+        &self,
+        backend: &dyn BlockBackend,
+        prev: Option<u32>,
+        count: u32,
+    ) -> Result<(u32, u32), BlockBackendError> {
+        if count == 0 || count > self.total_clusters {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if matches!(self.kind, FatKind::Fat12) {
+            let first = self.alloc_cluster(backend, prev)?;
+            let mut last = first;
+            for _ in 1..count {
+                last = self.alloc_cluster(backend, Some(last))?;
+            }
+            return Ok((first, last));
+        }
+
+        let start = (*self.next_free_hint.lock()).max(2);
+        let total_with_2 = self.total_clusters.saturating_add(2);
+        let bps = self.bytes_per_sector as usize;
+        let entries_per_sector = bps / 4; // FAT32: 4 bytes per entry
+
+        // 按 sector 批量扫描：一次读整个 sector，在内存中找连续空闲区
+        let (first, last, next_hint) = self.with_slots_lock(|slots| {
+            let mut c = start;
+            let mut probed = 0u32;
+
+            while probed < self.total_clusters {
+                if c < 2 { c = 2; }
+                if c >= total_with_2 { c = 2; }
+                if c.saturating_add(count) > total_with_2 {
+                    probed += total_with_2.saturating_sub(c);
+                    c = 2;
+                    continue;
+                }
+
+                // 批量检查：按 sector 读取，在内存中扫描
+                let mut all_free = true;
+                let mut checked = 0u32;
+                while checked < count {
+                    let cluster = c + checked;
+                    let off = self.byte_offset(cluster);
+                    let sector_no = off / bps as u64;
+                    let in_sector = (off % bps as u64) as usize;
+                    let base_lba = self.first_fat_sector + sector_no;
+
+                    let slot = Self::ensure_slot_present(
+                        slots, backend, self.capacity, base_lba, self.bytes_per_sector,
+                    )?;
+
+                    // 在同一 sector 内批量检查多个 entry
+                    while checked < count {
+                        let cl = c + checked;
+                        let cl_off = self.byte_offset(cl);
+                        let cl_sector = cl_off / bps as u64;
+                        if self.first_fat_sector + cl_sector != base_lba {
+                            break; // 跨 sector 了
+                        }
+                        let cl_in = (cl_off % bps as u64) as usize;
+                        let val = u32::from_le_bytes([
+                            slot.data[cl_in],
+                            slot.data[cl_in + 1],
+                            slot.data[cl_in + 2],
+                            slot.data[cl_in + 3],
+                        ]) & 0x0fff_ffff;
+                        if val != 0 {
+                            all_free = false;
+                            break;
+                        }
+                        checked += 1;
+                    }
+                    if !all_free { break; }
+                }
+
+                if !all_free {
+                    c += 1;
+                    probed += 1;
+                    continue;
+                }
+
+                // 找到连续空闲区，批量写入 FAT 链
+                if let Some(p) = prev {
+                    self.write_entry_locked(slots, backend, p, c)?;
+                }
+                let mut written = 0u32;
+                while written < count {
+                    let cluster = c + written;
+                    let off = self.byte_offset(cluster);
+                    let sector_no = off / bps as u64;
+                    let base_lba = self.first_fat_sector + sector_no;
+
+                    let slot = Self::ensure_slot_present_mut(
+                        slots, backend, self.capacity, base_lba, self.bytes_per_sector,
+                    )?;
+
+                    // 在同一 sector 内批量写入
+                    while written < count {
+                        let cl = c + written;
+                        let cl_off = self.byte_offset(cl);
+                        let cl_sector = cl_off / bps as u64;
+                        if self.first_fat_sector + cl_sector != base_lba {
+                            break;
+                        }
+                        let cl_in = (cl_off % bps as u64) as usize;
+                        let value = if written + 1 == count {
+                            self.eoc_marker()
+                        } else {
+                            cl + 1
+                        };
+                        let bytes = value.to_le_bytes();
+                        slot.data[cl_in] = bytes[0];
+                        slot.data[cl_in + 1] = bytes[1];
+                        slot.data[cl_in + 2] = bytes[2];
+                        slot.data[cl_in + 3] = (slot.data[cl_in + 3] & 0xf0) | bytes[3];
+                        written += 1;
+                    }
+                }
+
+                let next = if c + count >= total_with_2 { 2 } else { c + count };
+                return Ok((c, c + count - 1, next));
+            }
+            Err(BlockBackendError::OutOfRange)
+        })?;
+        *self.next_free_hint.lock() = next_hint;
+        Ok((first, last))
     }
 
     pub(crate) fn free_chain(

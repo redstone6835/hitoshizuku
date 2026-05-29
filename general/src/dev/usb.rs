@@ -37,9 +37,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::pnp::{
-    PnpBusInfo, PnpDevice, PnpError, PnpId, PNP_DEVICES, PNP_DRIVERS,
-};
+use super::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
 
 // ── UsbDeviceInfo ────────────────────────────────────────────────────────
 
@@ -350,9 +348,7 @@ impl UsbInterface {
     }
 
     pub fn endpoints(&self) -> Vec<UsbEndpointDesc> {
-        self.info()
-            .map(|i| i.endpoints.clone())
-            .unwrap_or_default()
+        self.info().map(|i| i.endpoints.clone()).unwrap_or_default()
     }
 
     /// 查找父 [`UsbDevice`]。
@@ -446,13 +442,8 @@ impl UsbDevice {
     ) -> usize {
         let mut count = 0usize;
         for info in interfaces {
-            let name: Box<str> = alloc::format!(
-                "{}{}.{}",
-                name_prefix,
-                info.interface_number,
-                info.class
-            )
-            .into();
+            let name: Box<str> =
+                alloc::format!("{}{}.{}", name_prefix, info.interface_number, info.class).into();
             if self
                 .register_interface_and_probe(info.interface_number, name, info.clone())
                 .is_ok()

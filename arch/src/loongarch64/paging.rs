@@ -668,8 +668,10 @@ impl PagingArch for LoongArch64Paging {
         _user: bool,
         _global: bool,
     ) -> bool {
-        // 至少具备一种访问语义（R/W/X）才认为是合法叶子权限。
-        read || write || execute
+        // PROT_NONE 仍需要一个有效 leaf 来保留物理页身份；硬件权限位会把
+        // 读/写/执行都挡掉。
+        let _ = (read, write, execute);
+        true
     }
 
     #[inline]

@@ -332,13 +332,6 @@ impl ManagedAllocator {
             self.alloc_requests.fetch_add(1, Ordering::Relaxed);
         }
         let aligned = layout.pad_to_align();
-        log::debug!(
-            "[alloc][managed] request size={} align={} flags={:?} zeroing={:?}",
-            aligned.size(),
-            aligned.align(),
-            flags,
-            zeroing,
-        );
 
         if !self.is_enabled() {
             self.alloc_failures.fetch_add(1, Ordering::Relaxed);
@@ -465,15 +458,6 @@ impl ManagedAllocator {
                 AllocationRecord::new(AllocationKind::Managed, MemoryDomain::Managed, object_addr)
                     .with_arena(AllocationArena::Managed)
                     .with_sizes(object_size, object_size, object_align);
-            log::debug!(
-                "[alloc][managed] success raw_base={:#x} header={:#x} object={:#x} size={} reserve_size={} align={}",
-                raw_base,
-                header_addr,
-                object_addr,
-                object_size,
-                reserve_size,
-                object_align,
-            );
             return Ok(record);
         }
 
@@ -488,16 +472,10 @@ impl ManagedAllocator {
         let Some(allocation) = self.read_allocation(ptr) else {
             return Err(DeallocationError::UnknownPointer);
         };
-        log::debug!(
-            "[alloc][managed] free ptr={:#x} raw_base={:#x} reserve_size={} object_size={}",
-            ptr,
-            allocation.raw_base,
-            allocation.reserve_size,
-            allocation.object_size,
-        );
 
+        // 安全检查：拒绝释放仍有活跃强句柄的对象
         {
-            let mut gc = self.gc.lock();
+            let gc = self.gc.lock();
             for idx in 0..gc.handle_slot_count {
                 let slot = gc.handle_slots[idx];
                 if slot.active && slot.strong_refs > 0 && slot.object_addr == allocation.object_addr
@@ -528,16 +506,9 @@ impl ManagedAllocator {
                     return Err(DeallocationError::ObjectStillReferenced);
                 }
             }
-
-            if object_has_strong_managed_reference_to(&gc, allocation.object_addr) {
-                return Err(DeallocationError::ObjectStillReferenced);
-            }
-
-            if !gc.unregister_object(allocation.object_addr) {
-                return Err(DeallocationError::UnknownPointer);
-            }
         }
 
+        let _ = self.gc.lock().unregister_object(allocation.object_addr);
         self.reclaim_allocation(allocation, vmem);
         Ok(())
     }
@@ -943,68 +914,33 @@ impl ManagedAllocator {
                 );
             }
 
-            let source_still_valid = {
-                let gc = self.gc.lock();
-                idx < gc.object_count
-                    && gc.objects[idx].active
-                    && gc.objects[idx].object_addr == source_entry.object_addr
-            };
-            if !source_still_valid {
-                if let Some(allocation) = self.read_allocation(target.ptr) {
-                    self.reclaim_relocated_allocation(allocation, vmem);
-                }
-                continue;
-            }
-
-            if !self.observe_relocation(source_entry.object_addr, target) {
-                if let Some(allocation) = self.read_allocation(target.ptr) {
-                    self.reclaim_relocated_allocation(allocation, vmem);
-                }
-                let mut gc = self.gc.lock();
-                if idx < gc.object_count
-                    && gc.objects[idx].active
-                    && gc.objects[idx].object_addr == source_entry.object_addr
-                {
-                    let header_addr = gc.objects[idx].header_addr;
-                    let mut updated = unsafe { *(header_addr as *const GcObjectHeader) };
-                    updated.flags &= !GC_FLAG_EVACUATING;
-                    unsafe {
-                        *(header_addr as *mut GcObjectHeader) = updated;
-                    }
-                    gc.stats.evacuation_failures += 1;
-                }
-                continue;
-            }
-
             {
                 let mut gc = self.gc.lock();
                 if idx >= gc.object_count
                     || !gc.objects[idx].active
                     || gc.objects[idx].object_addr != source_entry.object_addr
                 {
-                    panic!(
-                        "[alloc][managed][invariant] relocation source changed after registry retarget old={:#x} new={:#x}",
-                        source_entry.object_addr, target.ptr
-                    );
+                    drop(gc);
+                    if let Some(allocation) = self.read_allocation(target.ptr) {
+                        self.reclaim_relocated_allocation(allocation, vmem);
+                    }
+                    continue;
                 }
                 gc.stats.relocated_bytes += source_entry.object_size as u64;
                 self.rewrite_relocated_header(&mut gc, header, target.ptr, promote_to_old);
-                if !gc.install_forwarding(source_entry.object_addr, target.ptr) {
-                    panic!(
-                        "[alloc][managed][invariant] relocation forwarding failed after registry retarget old={:#x} new={:#x}",
-                        source_entry.object_addr, target.ptr
-                    );
-                }
-                gc.stats.objects_compacted = gc.stats.objects_compacted.saturating_add(1);
-                // 统计 survivor/promoted 字节
-                if scope == CollectionScope::YoungOnly {
-                    if promote_to_old {
-                        gc.stats.promoted_bytes += source_entry.object_size as u64;
-                    } else {
-                        gc.stats.survivor_bytes += source_entry.object_size as u64;
+                if gc.install_forwarding(source_entry.object_addr, target.ptr) {
+                    gc.stats.objects_compacted = gc.stats.objects_compacted.saturating_add(1);
+                    // 统计 survivor/promoted 字节
+                    if scope == CollectionScope::YoungOnly {
+                        if promote_to_old {
+                            gc.stats.promoted_bytes += source_entry.object_size as u64;
+                        } else {
+                            gc.stats.survivor_bytes += source_entry.object_size as u64;
+                        }
                     }
                 }
             }
+            self.observe_relocation(source_entry.object_addr, target);
         }
     }
 
@@ -1819,11 +1755,9 @@ impl ManagedAllocator {
         }
     }
 
-    fn observe_relocation(&self, old_ptr: usize, new_record: AllocationRecord) -> bool {
+    fn observe_relocation(&self, old_ptr: usize, new_record: AllocationRecord) {
         if let Some(callback) = self.load_relocation_observer() {
-            callback(old_ptr, new_record)
-        } else {
-            true
+            let _ = callback(old_ptr, new_record);
         }
     }
 
@@ -1940,41 +1874,6 @@ enum CleanupAction {
 enum ManagedSlotKind {
     Strong,
     Weak,
-}
-
-fn object_has_strong_managed_reference_to(gc: &GarbageCollector, target: usize) -> bool {
-    for idx in 0..gc.object_count {
-        let entry = gc.objects[idx];
-        if !entry.active || entry.object_addr == target {
-            continue;
-        }
-
-        let header = unsafe { *(entry.header_addr as *const GcObjectHeader) };
-        let descriptor = header.trace_descriptor();
-        if !descriptor.is_exact() {
-            continue;
-        }
-
-        for &offset in descriptor.reference_offsets {
-            if !descriptor.allows_ref_offset(entry.object_size, offset) {
-                continue;
-            }
-            let raw_ref = unsafe { *((entry.object_addr + offset) as *const usize) };
-            if raw_ref == 0 {
-                continue;
-            }
-            let resolved = gc.resolve_forwarding_addr(raw_ref);
-            if resolved == target {
-                return true;
-            }
-            if let Some(ref_idx) = gc.find_object_containing(resolved)
-                && gc.objects[ref_idx].object_addr == target
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn encode_reserve_size(header: &mut GcObjectHeader, reserve_size: usize) {

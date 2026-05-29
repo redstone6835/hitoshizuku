@@ -9,7 +9,7 @@ use core::sync::atomic::Ordering;
 
 use crate::bgd;
 use crate::crc;
-use crate::layout::SUPERBLOCK_OFFSET;
+use crate::layout::{SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET};
 use crate::state::{BlockBackendError, FsState};
 use vfs::sync::Spinlock;
 
@@ -83,6 +83,13 @@ fn clear_bit_in_bitmap(
 /// 分配一个数据块。按组顺序扫描 `s_free_blocks`;找到则更新 gd/sb 回写。
 /// 返回物理块号(绝对)。
 pub(crate) fn alloc_block(state: &FsState) -> Result<u64, BlockBackendError> {
+    let r = alloc_blocks_run(state, 1)?;
+    Ok(r.0)
+}
+
+/// 批量分配最多 `want` 个连续数据块。返回 (起始物理块号, 实际分配数量)。
+/// 至少分配 1 个块，否则返回错误。
+pub(crate) fn alloc_blocks_run(state: &FsState, want: u32) -> Result<(u64, u32), BlockBackendError> {
     let _g = ALLOC_LOCK.lock();
     let sb = &state.ext_sb;
     let start_rel = state.block_alloc_hint.load(Ordering::Relaxed);
@@ -99,7 +106,6 @@ pub(crate) fn alloc_block(state: &FsState) -> Result<u64, BlockBackendError> {
         let gd = state.group_desc_mut(group)?;
         let bmap = gd.block_bitmap;
         let bits_in_group = if group == sb.groups_count - 1 {
-            // 最后一组可能不满
             let used_before = group as u64 * sb.blocks_per_group as u64;
             let remain = sb.blocks_count.saturating_sub(used_before);
             remain.min(sb.blocks_per_group as u64) as u32
@@ -111,19 +117,79 @@ pub(crate) fn alloc_block(state: &FsState) -> Result<u64, BlockBackendError> {
         } else {
             0
         };
-        let nr = alloc_bit_in_bitmap(state, bmap, bits_in_group, start_bit)?;
-        if let Some(nr) = nr {
+        let got = alloc_run_in_bitmap(state, bmap, bits_in_group, start_bit, want)?;
+        if let Some((nr, count)) = got {
             let phys =
                 sb.first_data_block as u64 + group as u64 * sb.blocks_per_group as u64 + nr as u64;
-            let next_rel = group as u64 * sb.blocks_per_group as u64 + nr as u64 + 1;
+            let next_rel = group as u64 * sb.blocks_per_group as u64 + nr as u64 + count as u64;
             state.block_alloc_hint.store(next_rel, Ordering::Relaxed);
-            // 更新计数(这两个操作必须都落盘)
-            state.adjust_group_free_blocks(group, -1)?;
-            state.adjust_sb_free_blocks(-1)?;
-            return Ok(phys);
+            state.adjust_group_free_blocks(group, -(count as i32))?;
+            state.adjust_sb_free_blocks(-(count as i64))?;
+            return Ok((phys, count));
         }
     }
     Err(BlockBackendError::OutOfRange)
+}
+
+/// 在位图中找最多 `want` 个连续空闲 bit 并置位。返回 (起始位号, 数量)。
+fn alloc_run_in_bitmap(
+    state: &FsState,
+    bitmap_block: u64,
+    bits_in_group: u32,
+    start_hint: u32,
+    want: u32,
+) -> Result<Option<(u32, u32)>, BlockBackendError> {
+    let mut bm = vec![0u8; state.ext_sb.block_size as usize];
+    state.read_block(bitmap_block, &mut bm)?;
+
+    let start = start_hint.min(bits_in_group);
+    let result = find_zero_run(&bm, start, bits_in_group, want)
+        .or_else(|| (start > 0).then(|| find_zero_run(&bm, 0, start, want)).flatten());
+    if let Some((nr, count)) = result {
+        for i in 0..count {
+            let bit = nr + i;
+            let byte_idx = (bit / 8) as usize;
+            bm[byte_idx] |= 1 << ((bit % 8) as u8);
+        }
+        state.write_block(bitmap_block, &bm)?;
+        return Ok(Some((nr, count)));
+    }
+    Ok(None)
+}
+
+/// 在位图中找最多 `want` 个连续的 0-bit，至少找到 1 个才返回。
+fn find_zero_run(bm: &[u8], start: u32, end: u32, want: u32) -> Option<(u32, u32)> {
+    let mut nr = start;
+    while nr < end {
+        let byte_idx = (nr / 8) as usize;
+        let bit_off = nr % 8;
+        let b = bm.get(byte_idx).copied().unwrap_or(0xff);
+        if b == 0xff && bit_off == 0 {
+            nr = ((byte_idx + 1) as u32) * 8;
+            continue;
+        }
+        if b & (1 << (bit_off as u8)) != 0 {
+            nr += 1;
+            continue;
+        }
+        // 找到一个空闲 bit，尝试扩展连续 run
+        let run_start = nr;
+        let mut count = 0u32;
+        while count < want && nr < end {
+            let bi = (nr / 8) as usize;
+            let bo = (nr % 8) as u8;
+            if bm.get(bi).copied().unwrap_or(0xff) & (1 << bo) != 0 {
+                break;
+            }
+            count += 1;
+            nr += 1;
+        }
+        if count > 0 {
+            return Some((run_start, count));
+        }
+        nr += 1;
+    }
+    None
 }
 
 /// 释放一个数据块。宽松:允许重复释放(do nothing if bitmap bit 已 0)。
@@ -230,12 +296,9 @@ pub(crate) fn write_superblock(state: &FsState) -> Result<(), BlockBackendError>
 
     // Recompute checksum
     if state.ext_sb.metadata_csum {
-        sb_slice[0x3fc] = 0;
-        sb_slice[0x3fd] = 0;
-        sb_slice[0x3fe] = 0;
-        sb_slice[0x3ff] = 0;
-        let sum = crc::crc32c(sb_slice);
-        sb_slice[0x3fc..0x400].copy_from_slice(&sum.to_le_bytes());
+        let sum = crc::crc32c(&sb_slice[..SUPERBLOCK_CHECKSUM_OFFSET]);
+        sb_slice[SUPERBLOCK_CHECKSUM_OFFSET..SUPERBLOCK_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&sum.to_le_bytes());
     }
     state
         .backend

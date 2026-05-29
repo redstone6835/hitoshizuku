@@ -33,7 +33,6 @@ use crate::vfs::dentry::Dentry;
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::file::File;
 use crate::vfs::mount::Mount;
-use crate::vfs::stat::FileType;
 
 /// 符号链接最大跟随深度的默认值，在 [`crate::vfs::limits::VfsLimits::symlink_max_depth`]
 /// 未显式配置时作为后备值。
@@ -166,7 +165,7 @@ impl<'a> Iterator for PathComponents<'a> {
 /// 解析路径，返回最终分量对应的 [`LookupResult`]（Dentry + 所在 Mount）。
 ///
 /// 这是所有 `*at` 系统调用的基础，实现了完整的路径解析语义：
-/// - 绝对路径：从进程可见根（`ctx.root_dentry()`）开始；
+/// - 绝对路径：从进程可见根（`ctx.root`）开始；
 /// - 相对路径：从 `dirfd`（cwd 或指定 fd 目录）开始；
 /// - 每个分量：通过 dentry 缓存或 `InodeOps::lookup` 解析；
 /// - 挂载穿越：每次解析后检查并跳过挂载边界，同步更新 `current_mount`；
@@ -188,9 +187,6 @@ pub fn lookup(
     if path.is_empty() {
         return Err(VfsError::NotFound);
     }
-    if path.len() > ctx.limits.path_max {
-        return Err(VfsError::NameTooLong);
-    }
     // 拒绝包含 NUL 字节的路径（防止字符串截断攻击）。
     if path.contains('\0') {
         return Err(VfsError::InvalidArgument);
@@ -198,17 +194,12 @@ pub fn lookup(
 
     // 确定解析起点及对应的挂载点
     let (start, start_mount) = if PathComponents::is_absolute(path) {
-        (ctx.root_dentry(), Arc::clone(&ctx.mount_ns.root.lock()))
+        (ctx.root.root(), ctx.root.mount())
     } else {
         match dirfd {
             Dirfd::Cwd => (ctx.cwd(), ctx.cwd_mount()),
             // File 已在 open 时记录了所在挂载点，直接复用
-            Dirfd::Fd(file) => {
-                if file.inode.kind() != FileType::Directory {
-                    return Err(VfsError::NotADirectory);
-                }
-                (Arc::clone(&file.dentry), Arc::clone(&file.mount))
-            }
+            Dirfd::Fd(file) => (Arc::clone(&file.dentry), Arc::clone(&file.mount)),
         }
     };
 
@@ -310,12 +301,6 @@ pub fn lookup_parent<'p>(
     if path.is_empty() {
         return Err(VfsError::InvalidArgument);
     }
-    if path.len() > ctx.limits.path_max {
-        return Err(VfsError::NameTooLong);
-    }
-    if path.contains('\0') {
-        return Err(VfsError::InvalidArgument);
-    }
 
     let components: alloc::vec::Vec<&str> = PathComponents::new(path).collect();
     if components.is_empty() {
@@ -329,24 +314,20 @@ pub fn lookup_parent<'p>(
     if components.len() == 1 {
         // 单分量路径，父目录为 dirfd 指定的目录
         let (parent, parent_mount) = if PathComponents::is_absolute(path) {
-            (ctx.root_dentry(), Arc::clone(&ctx.mount_ns.root.lock()))
+            (ctx.root.root(), ctx.root.mount())
         } else {
             match dirfd {
                 Dirfd::Cwd => (ctx.cwd(), ctx.cwd_mount()),
-                Dirfd::Fd(f) => {
-                    if f.inode.kind() != FileType::Directory {
-                        return Err(VfsError::NotADirectory);
-                    }
-                    (Arc::clone(&f.dentry), Arc::clone(&f.mount))
-                }
+                Dirfd::Fd(f) => (Arc::clone(&f.dentry), Arc::clone(&f.mount)),
             }
         };
-        let result = LookupResult {
-            dentry: parent,
-            mount: parent_mount,
-        };
-        validate_basename(ctx, &result.dentry, last_name)?;
-        return Ok((result, last_name));
+        return Ok((
+            LookupResult {
+                dentry: parent,
+                mount: parent_mount,
+            },
+            last_name,
+        ));
     }
 
     // 构造父目录路径（去掉最后一个分量）
@@ -361,109 +342,7 @@ pub fn lookup_parent<'p>(
     };
 
     let result = lookup(ctx, dirfd, parent_path, LookupFlags::default())?;
-    validate_basename(ctx, &result.dentry, last_name)?;
     Ok((result, last_name))
-}
-
-fn validate_basename(ctx: &VfsContext, parent: &Arc<Dentry>, name: &str) -> VfsResult<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
-        return Err(VfsError::InvalidArgument);
-    }
-    if name.len() > ctx.limits.path_max {
-        return Err(VfsError::NameTooLong);
-    }
-    let parent_inode = parent.inode().ok_or(VfsError::NotFound)?;
-    if parent_inode.kind() != FileType::Directory {
-        return Err(VfsError::NotADirectory);
-    }
-    if let Some(sb) = parent_inode.superblock()
-        && name.len() > sb.name_max as usize
-    {
-        return Err(VfsError::NameTooLong);
-    }
-    Ok(())
-}
-
-fn checked_start_from_dirfd(
-    ctx: &VfsContext,
-    dirfd: &Dirfd,
-) -> VfsResult<(Arc<Dentry>, Arc<Mount>)> {
-    match dirfd {
-        Dirfd::Cwd => Ok((ctx.cwd(), ctx.cwd_mount())),
-        Dirfd::Fd(file) => {
-            if file.inode.kind() != FileType::Directory {
-                return Err(VfsError::NotADirectory);
-            }
-            Ok((Arc::clone(&file.dentry), Arc::clone(&file.mount)))
-        }
-    }
-}
-
-fn searchable_directory(
-    state: &WalkState<'_>,
-    dentry: &Arc<Dentry>,
-) -> VfsResult<Arc<crate::vfs::inode::Inode>> {
-    let inode = dentry.inode().ok_or(VfsError::NotFound)?;
-    if inode.kind() != FileType::Directory {
-        return Err(VfsError::NotADirectory);
-    }
-    let meta = inode.meta_snapshot();
-    if !state.ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
-        return Err(VfsError::PermissionDenied);
-    }
-    Ok(inode)
-}
-
-pub(crate) fn lookup_mountpoint(
-    ctx: &VfsContext,
-    dirfd: &Dirfd,
-    path: &str,
-) -> VfsResult<LookupResult> {
-    if path.is_empty() {
-        return Err(VfsError::InvalidArgument);
-    }
-    if path.len() > ctx.limits.path_max {
-        return Err(VfsError::NameTooLong);
-    }
-    if path.contains('\0') {
-        return Err(VfsError::InvalidArgument);
-    }
-
-    let components: alloc::vec::Vec<&str> = PathComponents::new(path).collect();
-    if components.is_empty() {
-        return Ok(LookupResult {
-            dentry: ctx.root_dentry(),
-            mount: Arc::clone(&ctx.mount_ns.root.lock()),
-        });
-    }
-    let name = *components.last().ok_or(VfsError::InvalidArgument)?;
-    if name == "." {
-        let (dentry, mount) = if PathComponents::is_absolute(path) {
-            (ctx.root_dentry(), Arc::clone(&ctx.mount_ns.root.lock()))
-        } else {
-            checked_start_from_dirfd(ctx, dirfd)?
-        };
-        return Ok(LookupResult { dentry, mount });
-    }
-
-    let (parent_result, name) = lookup_parent(ctx, dirfd, path)?;
-    let parent_inode = parent_result.dentry.inode().ok_or(VfsError::NotFound)?;
-    let child = match crate::vfs::DCACHE.get(&parent_result.dentry, name) {
-        Some(cached) if cached.is_positive() => cached,
-        _ => {
-            let child_inode = parent_inode.lookup(name)?;
-            let dentry = crate::vfs::dentry::Dentry::new_positive(
-                name,
-                Some(Arc::clone(&parent_result.dentry)),
-                child_inode,
-            );
-            crate::vfs::DCACHE.insert(dentry)
-        }
-    };
-    Ok(LookupResult {
-        dentry: child,
-        mount: parent_result.mount,
-    })
 }
 
 /// 解析单个路径分量 `name`（`.`、`..` 或普通名称），在 `parent` 目录下查找。
@@ -477,15 +356,12 @@ fn walk_component(
     use crate::vfs::DCACHE;
 
     if name == "." {
-        let _ = searchable_directory(state, &state.current)?;
         return Ok((Arc::clone(&state.current), None));
     }
 
     if name == ".." {
-        let _ = searchable_directory(state, &state.current)?;
-        let root = state.ctx.root_dentry();
         // 不超过进程可见根
-        if Arc::ptr_eq(&state.current, &root) {
+        if state.ctx.root.is_at_root(&state.current) {
             return Ok((Arc::clone(&state.current), None));
         }
         // 若当前处于某挂载文件系统的根（mount_root），需先跨越挂载边界回到
@@ -494,7 +370,7 @@ fn walk_component(
         let mut effective = Arc::clone(&state.current);
         while let Some(mp) = state.ctx.mount_ns.find_mountpoint(&effective) {
             // 已跨到进程可见根，不能再向上
-            if Arc::ptr_eq(&mp, &root) {
+            if state.ctx.root.is_at_root(&mp) {
                 return Ok((Arc::clone(&mp), None));
             }
             effective = mp;
@@ -514,7 +390,6 @@ fn walk_component(
     if !state.current.is_positive() {
         return Err(VfsError::NotFound);
     }
-    let parent_inode = searchable_directory(state, &state.current)?;
 
     // 1. 查 dentry 缓存
     if let Some(cached) = DCACHE.get(&state.current, name) {
@@ -531,8 +406,10 @@ fn walk_component(
     }
 
     // 2. 缓存未命中：检查 name_max 并调用 InodeOps::lookup
+    let parent_inode = state.current.inode().ok_or(VfsError::NotFound)?;
+
     // 检查文件名长度
-    if let Some(sb) = parent_inode.superblock()
+    if let Some(sb) = parent_inode.superblock.upgrade()
         && name.len() > sb.name_max as usize
     {
         return Err(VfsError::NameTooLong);
@@ -586,8 +463,8 @@ fn follow_symlink(state: &mut WalkState<'_>, link_dentry: &Arc<Dentry>) -> VfsRe
 
     if PathComponents::is_absolute(&target) {
         // 绝对链接：从进程根重新开始，同步重置挂载上下文
-        state.current = state.ctx.root_dentry();
-        state.current_mount = Arc::clone(&state.ctx.mount_ns.root.lock());
+        state.current = state.ctx.root.root();
+        state.current_mount = state.ctx.root.mount();
     } else {
         // 相对链接：从链接所在目录（链接的父目录）开始解析，而非链接本身。
         // 调用方在 step() 后 state.current 已被设为链接 dentry，若不修正，
@@ -607,12 +484,6 @@ fn follow_symlink(state: &mut WalkState<'_>, link_dentry: &Arc<Dentry>) -> VfsRe
         state.current = dentry;
         if let Some(m) = new_mount {
             state.current_mount = m;
-        }
-        if let Some(inode) = state.current.inode()
-            && inode.kind == FileType::Symlink
-        {
-            let link = Arc::clone(&state.current);
-            state.current = follow_symlink(state, &link)?;
         }
     }
 

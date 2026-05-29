@@ -130,7 +130,6 @@ impl VfsError {
     pub fn to_errno(self) -> Errno {
         match self {
             VfsError::NotFound => Errno::ENOENT,
-            VfsError::BrokenPipe => Errno::EPIPE,
             VfsError::NotADirectory => Errno::ENOTDIR,
             VfsError::IsADirectory => Errno::EISDIR,
             VfsError::NameTooLong => Errno::ENAMETOOLONG,
@@ -156,6 +155,7 @@ impl VfsError {
             VfsError::Interrupted => Errno::EINTR,
             VfsError::WouldBlock => Errno::EAGAIN,
             VfsError::TimedOut => Errno::ETIMEDOUT,
+            VfsError::BrokenPipe => Errno::EPIPE,
         }
     }
 }

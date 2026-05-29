@@ -263,7 +263,12 @@ fn create_disk_inode(
     raw.set_nlink(initial_nlink);
     raw.set_size(0);
     raw.set_blocks_lo(0);
-    raw.set_flags(0);
+    if mode & S_IFMT == S_IFREG && state.ext_sb.feature_incompat & INCOMPAT_EXTENTS != 0 {
+        raw.set_flags(EXT4_EXTENTS_FL);
+        extent_wr::init_empty_root(raw.i_block_mut());
+    } else {
+        raw.set_flags(0);
+    }
     // 若 inode_size >= 256,要设好 i_extra_isize(否则 csum 不对)
     if state.ext_sb.inode_size >= 256 {
         // linux 默认 32(至少覆盖 atime_extra/ctime_extra/...);我们用 32
@@ -320,12 +325,11 @@ impl InodeOps for ExtInodeOps {
         // 在父目录插 entry
         let mut parent = self.raw.lock();
         let mut i_block = parent.i_block().to_vec();
-        // 父目录如果是 extent,降级为间接,然后插入
         let mut pflags = parent.flags();
-        extent_wr::demote_if_extent(&self.state, &mut pflags, &mut i_block).map_err(map_err)?;
         let new_size = dir_wr::insert_entry(
             &self.state,
             &mut i_block,
+            &mut pflags,
             parent.size(),
             new_raw.ino,
             DT_REG,
@@ -382,10 +386,10 @@ impl InodeOps for ExtInodeOps {
         let mut parent = self.raw.lock();
         let mut pi_block = parent.i_block().to_vec();
         let mut pflags = parent.flags();
-        extent_wr::demote_if_extent(&self.state, &mut pflags, &mut pi_block).map_err(map_err)?;
         let new_size = dir_wr::insert_entry(
             &self.state,
             &mut pi_block,
+            &mut pflags,
             parent.size(),
             new_raw.ino,
             DT_DIR,
@@ -414,11 +418,10 @@ impl InodeOps for ExtInodeOps {
         }
         // 1) 从父目录移除 entry
         let mut parent = self.raw.lock();
-        let mut pi_block = parent.i_block().to_vec();
-        let mut pflags = parent.flags();
-        extent_wr::demote_if_extent(&self.state, &mut pflags, &mut pi_block).map_err(map_err)?;
-        let ok =
-            dir_wr::remove_entry(&self.state, &pi_block, parent.size(), name).map_err(map_err)?;
+        let pi_block = parent.i_block().to_vec();
+        let pflags = parent.flags();
+        let ok = dir_wr::remove_entry(&self.state, &pi_block, pflags, parent.size(), name)
+            .map_err(map_err)?;
         if !ok {
             return Err(VfsError::NotFound);
         }
@@ -481,10 +484,9 @@ impl InodeOps for ExtInodeOps {
         }
         // 从父目录移除
         let mut parent = self.raw.lock();
-        let mut pib = parent.i_block().to_vec();
-        let mut pflags = parent.flags();
-        extent_wr::demote_if_extent(&self.state, &mut pflags, &mut pib).map_err(map_err)?;
-        dir_wr::remove_entry(&self.state, &pib, parent.size(), name).map_err(map_err)?;
+        let pib = parent.i_block().to_vec();
+        let pflags = parent.flags();
+        dir_wr::remove_entry(&self.state, &pib, pflags, parent.size(), name).map_err(map_err)?;
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
         let pn = parent.nlink().saturating_sub(1);
@@ -556,10 +558,10 @@ impl InodeOps for ExtInodeOps {
         let mut parent = self.raw.lock();
         let mut pib = parent.i_block().to_vec();
         let mut pflags = parent.flags();
-        extent_wr::demote_if_extent(&self.state, &mut pflags, &mut pib).map_err(map_err)?;
         let new_size = dir_wr::insert_entry(
             &self.state,
             &mut pib,
+            &mut pflags,
             parent.size(),
             new_raw.ino,
             DT_LNK,
@@ -613,10 +615,10 @@ impl InodeOps for ExtInodeOps {
         let mut parent = self.raw.lock();
         let mut pib = parent.i_block().to_vec();
         let mut pflags = parent.flags();
-        extent_wr::demote_if_extent(&self.state, &mut pflags, &mut pib).map_err(map_err)?;
         let new_size = dir_wr::insert_entry(
             &self.state,
             &mut pib,
+            &mut pflags,
             parent.size(),
             t_ops.ino,
             file_type_val,
@@ -699,10 +701,10 @@ impl InodeOps for ExtInodeOps {
             let mut ndir = new_dir_ops.raw.lock();
             let mut ib = ndir.i_block().to_vec();
             let mut flags = ndir.flags();
-            extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
             let new_size = dir_wr::insert_entry(
                 &self.state,
                 &mut ib,
+                &mut flags,
                 ndir.size(),
                 entry_target.ino() as u32,
                 ft,
@@ -725,13 +727,14 @@ impl InodeOps for ExtInodeOps {
             let mut parent = self.raw.lock();
             let mut ib = parent.i_block().to_vec();
             let mut flags = parent.flags();
-            extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
-            dir_wr::remove_entry(&self.state, &ib, parent.size(), old_name).map_err(map_err)?;
+            dir_wr::remove_entry(&self.state, &ib, flags, parent.size(), old_name)
+                .map_err(map_err)?;
             // 同目录 rename:就地改名,需要新增 new_name 条目(上面跨目录分支已插过)
             if !cross_dir {
                 let new_size = dir_wr::insert_entry(
                     &self.state,
                     &mut ib,
+                    &mut flags,
                     parent.size(),
                     entry_target.ino() as u32,
                     ft,
@@ -757,9 +760,9 @@ impl InodeOps for ExtInodeOps {
                 .ok_or(VfsError::InvalidArgument)?;
             let tib = {
                 let g = tops.raw.lock();
-                i_block_slice(&g.bytes).to_vec()
+                (i_block_slice(&g.bytes).to_vec(), g.flags())
             };
-            dir_wr::update_dotdot(&self.state, &tib, new_dir_ops.ino).map_err(map_err)?;
+            dir_wr::update_dotdot(&self.state, &tib.0, tib.1, new_dir_ops.ino).map_err(map_err)?;
         }
         Ok(())
     }

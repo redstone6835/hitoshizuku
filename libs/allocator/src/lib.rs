@@ -592,37 +592,11 @@ impl KernelMemorySubsystem {
         &self,
         request: PhysicalAllocRequest,
     ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
-        log::debug!(
-            "[alloc][phys] request size={} align={} page_policy={:?} placement={:?}",
-            request.size,
-            request.align,
-            request.page_policy,
-            request.placement,
-        );
         let mut phys = self.phys.lock();
         let result = phys.alloc_pages_with(&request);
         match result {
-            Ok(allocation) => {
-                log::debug!(
-                    "[alloc][phys] success paddr={:#x} size={} order={} page_size={}",
-                    allocation.paddr,
-                    allocation.size,
-                    allocation.order,
-                    allocation.page_size,
-                );
-                Ok(allocation)
-            }
-            Err(err) => {
-                log::debug!(
-                    "[alloc][phys] failed size={} align={} page_policy={:?} placement={:?} err={:?}",
-                    request.size,
-                    request.align,
-                    request.page_policy,
-                    request.placement,
-                    err,
-                );
-                Err(err)
-            }
+            Ok(allocation) => Ok(allocation),
+            Err(err) => Err(err),
         }
     }
 
@@ -643,7 +617,6 @@ impl KernelMemorySubsystem {
 
     pub fn allocate(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
         let active = self.active.load(Ordering::Acquire);
-        log_request_phase("begin", request, active);
 
         if !active {
             return self.allocate_boot(request);
@@ -655,31 +628,12 @@ impl KernelMemorySubsystem {
             && self.managed.is_enabled()
         {
             let pressure = self.pressure_level();
-            log::debug!(
-                "[alloc][reclaim] trigger managed_gc pressure={} request_domain={:?} size={} align={}",
-                pressure,
-                request.domain,
-                request.size,
-                request.align,
-            );
             self.managed.collect_on_pressure(pressure);
             allocation = self.allocate_active_once(request);
         }
         match allocation {
-            Ok(record) => {
-                log_record_phase("complete", record);
-                Ok(record)
-            }
-            Err(err) => {
-                log::debug!(
-                    "[alloc][complete] failed domain={:?} size={} align={} err={:?}",
-                    request.domain,
-                    request.size,
-                    request.align,
-                    err,
-                );
-                Err(err)
-            }
+            Ok(record) => Ok(record),
+            Err(err) => Err(err),
         }
     }
 
@@ -769,12 +723,6 @@ impl KernelMemorySubsystem {
             }
             AllocationKind::Managed => {
                 if let Err(err) = self.managed.free(ptr, &self.vmem) {
-                    if let Err(rollback_err) = self.registry.register_result(&self.boot, record) {
-                        panic!(
-                            "[alloc][invariant] managed free failed and registry rollback failed: ptr={:#x} free_err={:?} rollback_err={:?}",
-                            ptr, err, rollback_err
-                        );
-                    }
                     // 允许 ObjectStillReferenced 错误传播（例如由上层处理）
                     Err(err)
                 } else {
@@ -802,22 +750,11 @@ impl KernelMemorySubsystem {
 
     fn allocate_boot(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
         if !matches!(request.domain, MemoryDomain::Kernel) {
-            log::debug!(
-                "[alloc][boot] rejected non-kernel request domain={:?} size={} align={}",
-                request.domain,
-                request.size,
-                request.align,
-            );
             return Err(AllocationError::NotInitialized);
         }
         let layout = layout_from_request(request)?;
         let ptr = self.boot.alloc(layout) as usize;
         if ptr == 0 {
-            log::debug!(
-                "[alloc][boot] out of memory size={} align={}",
-                request.size,
-                request.align,
-            );
             return Err(AllocationError::OutOfMemory);
         }
         if matches!(request.zeroing, Zeroing::Zeroed) {
@@ -827,7 +764,6 @@ impl KernelMemorySubsystem {
         }
         let record = AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr)
             .with_sizes(request.size, request.size, request.align);
-        log_record_phase("boot", record);
         Ok(record)
     }
 
@@ -849,13 +785,6 @@ impl KernelMemorySubsystem {
                 let layout = layout_from_request(request)?;
                 let force_large = matches!(request.page_policy, PagePolicy::RequireLarge);
                 let alloc_large = || -> Result<AllocationRecord, AllocationError> {
-                    log::debug!(
-                        "[alloc][route] domain=Kernel path=kheap size={} align={} cpu={} page_policy={:?}",
-                        request.size,
-                        request.align,
-                        cpu,
-                        request.page_policy,
-                    );
                     let range = match self.kheap.alloc_range(
                         layout,
                         request.page_policy,
@@ -864,12 +793,6 @@ impl KernelMemorySubsystem {
                     ) {
                         Ok(range) => range,
                         Err(err) => {
-                            log::debug!(
-                                "[alloc] kheap alloc_range failed size={} align={} err={:?}",
-                                request.size,
-                                request.align,
-                                err,
-                            );
                             return Err(err);
                         }
                     };
@@ -904,19 +827,8 @@ impl KernelMemorySubsystem {
 
                     if let Some(zone_idx) = zone_idx_opt {
                         let usable_size = self.slab.zone_size_class(zone_idx);
-                        log::debug!(
-                            "[alloc][route] domain=Kernel path=slab-first size={} align={} cpu={}",
-                            request.size,
-                            request.align,
-                            cpu,
-                        );
                         let ptr = self.slab.alloc(layout, cpu, &self.phys, &self.vmem);
                         if ptr.is_null() {
-                            log::debug!(
-                                "[alloc] slab returned null for size={} align={}, trying kheap fallback",
-                                request.size,
-                                request.align,
-                            );
                             return alloc_large();
                         }
                         if matches!(request.zeroing, Zeroing::Zeroed) {
@@ -945,40 +857,14 @@ impl KernelMemorySubsystem {
                         Ok(record)
                     } else {
                         // slab 无法满足此对齐要求，回退到 kheap
-                        log::debug!(
-                            "[alloc][route] domain=Kernel path=kheap-fallback size={} align={} cpu={} reason=slab-alignment-unsupported",
-                            request.size,
-                            request.align,
-                            cpu,
-                        );
                         alloc_large()
                     }
                 } else {
-                    log::debug!(
-                        "[alloc][route] domain=Kernel path=kheap-direct size={} align={} cpu={} page_policy={:?}",
-                        request.size,
-                        request.align,
-                        cpu,
-                        request.page_policy,
-                    );
                     alloc_large()
                 }
             }
             MemoryDomain::Managed => {
-                log::debug!(
-                    "[alloc][route] domain=Managed size={} align={} flags={:?} zeroing={:?}",
-                    request.size,
-                    request.align,
-                    request.managed,
-                    request.zeroing,
-                );
                 if let Err(err) = self.ensure_default_managed() {
-                    log::debug!(
-                        "[alloc][managed] lazy default heap init failed size={} align={} err={:?}",
-                        request.size,
-                        request.align,
-                        err,
-                    );
                     return Err(match err {
                         InitError::MetadataOutOfMemory | InitError::ManagedRegionUnavailable => {
                             AllocationError::OutOfMemory
@@ -996,13 +882,7 @@ impl KernelMemorySubsystem {
                         Err(AllocationError::AddressSpace(
                             AddressSpaceError::OutOfVirtualAddressSpace,
                         )) => {
-                            if let Err(err) = self.maybe_grow_managed() {
-                                log::debug!(
-                                    "[alloc][managed] heap growth failed size={} align={} err={:?}",
-                                    request.size,
-                                    request.align,
-                                    err,
-                                );
+                            if self.maybe_grow_managed().is_err() {
                                 return Err(AllocationError::OutOfMemory);
                             }
                             self.managed.alloc(
@@ -1020,13 +900,6 @@ impl KernelMemorySubsystem {
                 Ok(record)
             }
             MemoryDomain::Physical => {
-                log::debug!(
-                    "[alloc][route] domain=Physical size={} align={} page_policy={:?} placement={:?}",
-                    request.size,
-                    request.align,
-                    request.page_policy,
-                    request.placement,
-                );
                 let allocation = self
                     .allocate_physical(
                         PhysicalAllocRequest::new(request.size, request.align)
@@ -1121,20 +994,15 @@ impl KernelMemorySubsystem {
         if raw == 0 {
             None
         } else {
-            // Safety: raw 来自有效的 PhysToVirtFn，通过 bind_address_translation 写入。
-            // Acquire 加载与 Release 存储同步，保证函数指针值完整可见。
-            // transmute 前的 null 检查（raw == 0）确保函数指针非空。
             Some(unsafe { core::mem::transmute::<usize, PhysToVirtFn>(raw) })
         }
     }
 
-    fn load_virt_to_phys(&self) -> Option<VirtToPhysFn> {
+    pub fn load_virt_to_phys(&self) -> Option<VirtToPhysFn> {
         let raw = self.virt_to_phys.load(Ordering::Acquire);
         if raw == 0 {
             None
         } else {
-            // Safety: 与 load_phys_to_virt 模式相同——raw 是有效的 VirtToPhysFn，
-            // 由 bind_address_translation 写入，通过 Acquire/Release 同步。
             Some(unsafe { core::mem::transmute::<usize, VirtToPhysFn>(raw) })
         }
     }
@@ -1144,8 +1012,6 @@ impl KernelMemorySubsystem {
         if raw == 0 {
             None
         } else {
-            // Safety: raw 来自有效的 CpuIdFn，通过 bind_cpu_id 写入。
-            // Acquire/Release 配对确保可见性。
             Some(unsafe { core::mem::transmute::<usize, CpuIdFn>(raw) })
         }
     }
@@ -1155,8 +1021,6 @@ impl KernelMemorySubsystem {
         if raw == 0 {
             None
         } else {
-            // Safety: raw 来自有效的 KernelHeapRegionFn，通过 bind_kernel_heap_ops 写入。
-            // Acquire/Release 配对确保可见性。
             Some(unsafe { core::mem::transmute::<usize, KernelHeapRegionFn>(raw) })
         }
     }
@@ -1166,8 +1030,6 @@ impl KernelMemorySubsystem {
         if raw == 0 {
             None
         } else {
-            // Safety: raw 来自有效的 MapKernelHeapRangeFn，通过 bind_kernel_heap_ops 写入。
-            // Acquire/Release 配对确保可见性。
             Some(unsafe { core::mem::transmute::<usize, MapKernelHeapRangeFn>(raw) })
         }
     }
@@ -1177,8 +1039,6 @@ impl KernelMemorySubsystem {
         if raw == 0 {
             None
         } else {
-            // Safety: raw 来自有效的 UnmapKernelHeapRangeFn，通过 bind_kernel_heap_ops 写入。
-            // Acquire/Release 配对确保可见性。
             Some(unsafe { core::mem::transmute::<usize, UnmapKernelHeapRangeFn>(raw) })
         }
     }
@@ -1231,21 +1091,8 @@ impl KernelMemorySubsystem {
                 if can_remove {
                     let _ = self.registry.remove(record.ptr);
                     // 重试插入
-                    match self.registry.register_result(&self.boot, record) {
-                        Ok(()) => {
-                            log::debug!(
-                                "[alloc][registry] recovered from stale duplicate: ptr={:#x}",
-                                record.ptr
-                            );
-                            return Ok(());
-                        }
-                        Err(err) => {
-                            log::debug!(
-                                "[alloc] registry re-insert after cleanup failed ptr={:#x} err={:?}",
-                                record.ptr,
-                                err
-                            );
-                        }
+                    if self.registry.register_result(&self.boot, record).is_ok() {
+                        return Ok(());
                     }
                 }
                 // 无法清除则回滚
@@ -1280,58 +1127,6 @@ fn is_small_request(request: MemoryRequest) -> bool {
 fn layout_from_request(request: MemoryRequest) -> Result<Layout, AllocationError> {
     Layout::from_size_align(request.size.max(1), request.align.max(1))
         .map_err(|_| AllocationError::InvalidLayout)
-}
-
-fn log_request_phase(phase: &str, request: MemoryRequest, active: bool) {
-    log::debug!(
-        "[alloc][{}] active={} domain={:?} size={} align={} zeroing={:?} reclaim={:?} page_policy={:?} placement={:?} managed={:?}",
-        phase,
-        active,
-        request.domain,
-        request.size,
-        request.align,
-        request.zeroing,
-        request.reclaim,
-        request.page_policy,
-        request.placement,
-        request.managed,
-    );
-}
-
-fn log_record_phase(phase: &str, record: AllocationRecord) {
-    match record.paddr {
-        Some(paddr) => {
-            log::debug!(
-                "[alloc][{}] kind={:?} domain={:?} arena={:?} ptr={:#x} paddr={:#x} size={} usable={} align={} order={} page_size={}",
-                phase,
-                record.kind,
-                record.domain,
-                record.arena,
-                record.ptr,
-                paddr,
-                record.size,
-                record.usable_size,
-                record.align,
-                record.order,
-                record.page_size,
-            );
-        }
-        None => {
-            log::debug!(
-                "[alloc][{}] kind={:?} domain={:?} arena={:?} ptr={:#x} size={} usable={} align={} order={} page_size={}",
-                phase,
-                record.kind,
-                record.domain,
-                record.arena,
-                record.ptr,
-                record.size,
-                record.usable_size,
-                record.align,
-                record.order,
-                record.page_size,
-            );
-        }
-    }
 }
 
 fn managed_gc_reclaim(ptr: usize, size: usize) {

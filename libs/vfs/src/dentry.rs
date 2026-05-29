@@ -53,6 +53,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crate::vfs::inode::Inode;
+use crate::vfs::mount::Mount;
 use crate::vfs::sync::Spinlock;
 
 /// 父链遍历允许的最大深度，用于防御性环检测。
@@ -89,7 +90,7 @@ fn assert_valid_dentry_name(name: &str, is_root: bool) {
 // ── SmallStr：短路径分量的零堆分配表示 ────────────────────────────────────────
 //
 // 路径解析中最频繁处理的数据之一就是“单个路径分量”。现实系统里的大多数名称都很短，
-// 例如 "etc"、"tmp"、"bin"、"passwd"、"ttyS0" 等，长度通常远小于 16 字节。
+// 例如 "etc"、"tmp"、"bin"、"passwd"、"uart0" 等，长度通常远小于 16 字节。
 // 若对这些短字符串一律使用 heap `String`，则每次创建 dentry 时都要承担堆分配、
 // 元数据头部和缓存局部性变差的成本。SmallStr 的目的就是把这一类高频短名称内联到
 // 结构体内部，在不改变调用方语义的前提下减少分配次数和内存碎片。
@@ -981,26 +982,29 @@ impl DentryCache {
     /// 缓存键，并把这些旧节点全部标记为 `INVALID`，防止外部仍持有旧 `Arc` 时继续把
     /// 已删除/已卸载的命名空间对象当成有效路径继续遍历。
     pub fn invalidate_subtree(&self, root: &Arc<Dentry>) {
-        let mut snapshot: Vec<Arc<Dentry>> = Vec::new();
+        let mut removed: Vec<Arc<Dentry>> = Vec::new();
+        let mut removed_count = 0usize;
+
         for shard_lock in self.shards.iter() {
-            let shard = shard_lock.lock();
-            for bucket in shard.buckets.iter().flatten() {
-                snapshot.push(Arc::clone(&bucket.dentry));
+            let mut shard = shard_lock.lock();
+            let mut idx = 0usize;
+            while idx < shard.capacity() {
+                let should_remove = shard.buckets[idx]
+                    .as_ref()
+                    .is_some_and(|bucket| bucket.dentry.is_descendant_of(root));
+                if should_remove {
+                    removed.push(shard.remove_at(idx));
+                    removed_count += 1;
+                } else {
+                    idx += 1;
+                }
             }
         }
 
-        let mut victims: Vec<Arc<Dentry>> = Vec::new();
-        for dentry in snapshot {
-            if dentry.is_descendant_of(root) {
-                victims.push(dentry);
-            }
+        if removed_count != 0 {
+            self.total_count.fetch_sub(removed_count, Ordering::Relaxed);
         }
-        if !victims.iter().any(|dentry| Arc::ptr_eq(dentry, root)) {
-            victims.push(Arc::clone(root));
-        }
-
-        for dentry in victims {
-            self.invalidate_dentry(&dentry);
+        for dentry in removed {
             dentry.invalidate();
         }
         self.debug_verify_count();
@@ -1121,21 +1125,35 @@ impl Default for DentryCache {
 /// `pivot_root` 或进入新的挂载命名空间之后，它可以变成全局目录树中的任意子树。
 /// 路径解析在处理绝对路径和 `..` 向上回溯时都会依赖这个对象，因此它实际上定义了
 /// 进程所能观察到的命名空间边界。
+struct VfsRootState {
+    root_dentry: Arc<Dentry>,
+    root_mount: Arc<Mount>,
+}
+
 pub struct VfsRoot {
-    /// 当前进程可见的根目录 Dentry。
-    ///
-    /// 路径解析遇到绝对路径时会从这里出发；解析 `..` 时若已经到达该节点，则必须停止
-    /// 继续向上，以防越过命名空间边界。换句话说，这个字段既是绝对路径的起点，也是
-    /// 向上遍历的上界。
-    pub root_dentry: Arc<Dentry>,
-    /// 根目录所在的挂载点。
-    pub mount: Arc<crate::mount::Mount>,
+    state: Spinlock<VfsRootState>,
 }
 
 impl VfsRoot {
     /// 构造一个新的 VFS 根。
-    pub fn new(root_dentry: Arc<Dentry>, mount: Arc<crate::mount::Mount>) -> Self {
-        Self { root_dentry, mount }
+    pub fn new(root_dentry: Arc<Dentry>, root_mount: Arc<Mount>) -> Self {
+        Self {
+            state: Spinlock::new(VfsRootState {
+                root_dentry,
+                root_mount,
+            }),
+        }
+    }
+
+    /// 切换当前进程可见根目录。
+    ///
+    /// `root_mount` 必须是包含 `root_dentry` 的挂载点。调用方通常应使用路径解析
+    /// 返回的 [`LookupResult`](crate::vfs::path::LookupResult) 同时取得两者。
+    pub fn set(&self, root_dentry: Arc<Dentry>, root_mount: Arc<Mount>) {
+        *self.state.lock() = VfsRootState {
+            root_dentry,
+            root_mount,
+        };
     }
 
     /// 判断给定的 dentry 是否为当前进程的根目录。
@@ -1143,18 +1161,18 @@ impl VfsRoot {
     /// 用于路径解析中判断是否应该停止向上回溯（处理 `..`）。
     #[inline]
     pub fn is_at_root(&self, dentry: &Arc<Dentry>) -> bool {
-        Arc::ptr_eq(&self.root_dentry, dentry)
+        Arc::ptr_eq(&self.state.lock().root_dentry, dentry)
     }
 
     /// 返回根目录的克隆引用。
     #[inline]
     pub fn root(&self) -> Arc<Dentry> {
-        Arc::clone(&self.root_dentry)
+        Arc::clone(&self.state.lock().root_dentry)
     }
 
-    /// 返回根挂载点的克隆引用。
+    /// 返回根目录所在挂载点的克隆引用。
     #[inline]
-    pub fn mount(&self) -> Arc<crate::mount::Mount> {
-        Arc::clone(&self.mount)
+    pub fn mount(&self) -> Arc<Mount> {
+        Arc::clone(&self.state.lock().root_mount)
     }
 }

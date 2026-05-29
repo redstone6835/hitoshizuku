@@ -163,7 +163,7 @@ where
                     16 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u16) as u64 },
                     32 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u32) as u64 },
                     64 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u64) },
-                    _ => return Err(AcpiError::LibUnimplemented),
+                    _ => panic!(),
                 };
                 Ok(value)
             }
@@ -172,11 +172,11 @@ where
                     8 => self.handler.read_io_u8(self.gas.address as u16) as u64,
                     16 => self.handler.read_io_u16(self.gas.address as u16) as u64,
                     32 => self.handler.read_io_u32(self.gas.address as u16) as u64,
-                    _ => return Err(AcpiError::LibUnimplemented),
+                    _ => panic!(),
                 };
                 Ok(value)
             }
-            _ => Err(AcpiError::LibUnimplemented),
+            _ => unimplemented!(),
         }
     }
 
@@ -197,7 +197,7 @@ where
                         core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u32, value as u32);
                     },
                     64 => unsafe { core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u64, value) },
-                    _ => return Err(AcpiError::LibUnimplemented),
+                    _ => panic!(),
                 }
                 Ok(())
             }
@@ -206,11 +206,11 @@ where
                     8 => self.handler.write_io_u8(self.gas.address as u16, value as u8),
                     16 => self.handler.write_io_u16(self.gas.address as u16, value as u16),
                     32 => self.handler.write_io_u32(self.gas.address as u16, value as u32),
-                    _ => return Err(AcpiError::LibUnimplemented),
+                    _ => panic!(),
                 }
                 Ok(())
             }
-            _ => Err(AcpiError::LibUnimplemented),
+            _ => unimplemented!(),
         }
     }
 }

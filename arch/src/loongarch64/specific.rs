@@ -126,8 +126,8 @@ pub const CSR_ASID_BIT_WIDTH: usize = 8;
 pub const CSR_ASID_BIT_MASK: usize = ((1usize << CSR_ASID_BIT_WIDTH) - 1) << CSR_ASID_BIT_OFFSET;
 
 // CSR_CPUID 寄存器字段定义。
-pub const CSR_CPUID_COREID_WIDTH: usize = 11;
-pub const CSR_CPUID_COREID_MASK: usize = (1usize << CSR_CPUID_COREID_WIDTH) - 1;
+pub const CSR_CPUID_COREID_WIDTH: usize = 9;
+pub const CSR_CPUID_COREID_MASK: usize = (1 << CSR_CPUID_COREID_WIDTH) - 1;
 
 // CSR_MSGIR 编码字段（预留给多核消息中断 API）。
 pub const CSR_MSGIR_DATA_OFFSET: usize = 0;

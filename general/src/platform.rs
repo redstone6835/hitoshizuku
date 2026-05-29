@@ -1,8 +1,7 @@
 //! 对平台相关基本操作（如CPU、内存等）的抽象接口定义。
 //!
 //! 这些 trait 定义了平台相关的操作接口，规范化平台具体操作实现的功能和语义，以
-//! 便其他上层接口直接调用，而不需要使用平台特定如 `[cfg(target_arch = "...")]`
-//! 的条件编译。
+//! 便其他上层接口直接调用，而不需要在调用点散落平台特定条件编译。
 
 /// Physical address value passed across HAL boundaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
