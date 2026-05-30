@@ -149,3 +149,6 @@ impl From<Errno> for i32 {
         errno.as_i32()
     }
 }
+
+#[cfg(test)]
+mod tests;
