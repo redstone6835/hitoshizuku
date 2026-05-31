@@ -30,6 +30,13 @@ fn main() -> ! {
     general::mm::smoketest::run();
     */
 
+    #[cfg(feature = "kernel-tests")]
+    {
+        ktest::runner::set_writer(arch::e_write_bytes);
+        let report = ktest::runner::run_all();
+        let _ = report;
+    }
+
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
     // bench::run();
 

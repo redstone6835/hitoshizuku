@@ -9,7 +9,8 @@ doctest = false
 bench = false
 
 [features]
-kernel = ["ktest-macro/kernel"]
+kernel = ["ktest-macro/kernel", "dep:spin"]
 
 [dependencies]
 ktest-macro = { path = "./ktest-macro" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"], optional = true }

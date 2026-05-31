@@ -2,7 +2,10 @@
 //!
 //! 验证所有 ElfError 变体统一映射为 ENOEXEC，与 Linux execve(2) 行为一致。
 
+#[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
+#[cfg(feature = "ktest-kernel")]
+extern crate alloc;
 
 use crate::ElfError;
 use errno::Errno;

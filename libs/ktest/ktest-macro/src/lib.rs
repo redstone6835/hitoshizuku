@@ -30,19 +30,22 @@ fn generate_host_test(input: ItemFn) -> TokenStream {
 
 fn generate_kernel_entry(input: ItemFn) -> TokenStream {
     let fn_name = &input.sig.ident;
+    let wrapper_name = quote::format_ident!("__ktest_wrapper_{}", fn_name);
     let static_name = quote::format_ident!("__KTEST_{}", fn_name);
-    let name_str = fn_name.to_string();
 
     let output = quote! {
         #input
 
+        fn #wrapper_name() { #fn_name(); }
+
+        #[allow(non_upper_case_globals)]
         #[unsafe(link_section = ".ktest")]
         #[used]
         static #static_name: ktest::KtestEntry = ktest::KtestEntry {
-            name: #name_str,
+            name: concat!(module_path!(), "::", stringify!(#fn_name)),
             file: file!(),
             line: line!(),
-            func: || { #fn_name() },
+            func: #wrapper_name,
         };
     };
     output.into()

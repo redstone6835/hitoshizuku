@@ -3,7 +3,10 @@
 //! 验证单个虚拟内存区域的地址包含、区间重叠、以及 split_at 分裂操作。
 //! 所有测试使用匿名映射（VmBacking::Anon）构造，不依赖物理页或文件。
 
+#[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
+#[cfg(feature = "ktest-kernel")]
+extern crate alloc;
 
 use ktest::ktest;
 use crate::{VmArea, VmBacking, VmFlags};

@@ -8,10 +8,14 @@ test = true
 doctest = false
 bench = false
 
+[features]
+ktest-kernel = ["ktest/kernel"]
+
 [dependencies]
 errno = { path = "../errno" }
 log = { path = "../log" }
 mm = { path = "../mm" }
+ktest = { path = "../ktest", optional = true }
 
 [dev-dependencies]
 ktest = { path = "../ktest" }

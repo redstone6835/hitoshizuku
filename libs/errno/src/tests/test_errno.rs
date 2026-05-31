@@ -1,4 +1,7 @@
+#[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
+#[cfg(feature = "ktest-kernel")]
+extern crate alloc;
 
 use crate::Errno;
 use ktest::ktest;

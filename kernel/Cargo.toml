@@ -5,6 +5,13 @@ edition = "2024"
 
 [features]
 embedded-initramfs = []
+kernel-tests = [
+    "ktest/kernel",
+    "errno/ktest-kernel",
+    "elf/ktest-kernel",
+    "mm/ktest-kernel",
+    "log/ktest-kernel",
+]
 
 [[bin]]
 name = "kernel"
@@ -19,7 +26,9 @@ elf = { path = "../libs/elf" }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
+arch = { path = "../arch" }
 general = { path = "../general" }
+ktest = { path = "../libs/ktest" }
 log = { path = "../libs/log" }
 allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }

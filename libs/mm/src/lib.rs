@@ -28,5 +28,5 @@ pub use file_like::FileLike;
 pub use flags::VmFlags;
 pub use set::VmaSet;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "ktest-kernel"))]
 mod tests;

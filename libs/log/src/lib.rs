@@ -771,5 +771,5 @@ impl<const N: usize> fmt::Write for StackMessageBuffer<N> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "ktest-kernel"))]
 mod tests;

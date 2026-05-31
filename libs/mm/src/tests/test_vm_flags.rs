@@ -2,7 +2,10 @@
 //!
 //! 验证自定义 u32 位域的基本操作：构造、has/with/without、权限掩码、子集检查。
 
+#[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
+#[cfg(feature = "ktest-kernel")]
+extern crate alloc;
 
 use ktest::ktest;
 use crate::VmFlags;

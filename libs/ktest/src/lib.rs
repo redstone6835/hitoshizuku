@@ -3,6 +3,7 @@
 pub mod runner;
 
 /// 测试入口描述。内核端由 linker section 自动收集。
+#[repr(C)]
 pub struct KtestEntry {
     pub name: &'static str,
     pub file: &'static str,

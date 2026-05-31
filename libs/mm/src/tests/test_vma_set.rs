@@ -2,7 +2,10 @@
 //!
 //! 验证按起址排序的 VMA 集合的插入、查找、空洞搜索、取消映射、范围检查与邻接合并。
 
+#[cfg(not(feature = "ktest-kernel"))]
 extern crate std;
+#[cfg(feature = "ktest-kernel")]
+extern crate alloc;
 
 use errno::Errno;
 use ktest::ktest;

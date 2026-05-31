@@ -150,5 +150,5 @@ impl From<Errno> for i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "ktest-kernel"))]
 mod tests;
