@@ -15,9 +15,9 @@
 )
 
 #let song-font = (
+  "Times New Roman",
   "SimSun",
   "NSimSun",
-  "Times New Roman",
 )
 
 #let mono-font = (
