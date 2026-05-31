@@ -27,3 +27,6 @@ pub use error::UserAccessError;
 pub use file_like::FileLike;
 pub use flags::VmFlags;
 pub use set::VmaSet;
+
+#[cfg(test)]
+mod tests;
