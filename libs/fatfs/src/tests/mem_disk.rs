@@ -1,4 +1,4 @@
-//! fatfs::BlockBackend 适配器。
+//!fatfs::BlockBackend 适配器。
 
 extern crate std;
 
