@@ -2,8 +2,8 @@
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
@@ -19,7 +19,7 @@ use vfs::mount::MountFlags;
 use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 
-use super::current_vfs_context;
+use super::{current_vfs_context, namespace_path};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -65,6 +65,9 @@ impl SuperblockOps for ProcSuperblockOps {
 #[derive(Clone, Copy)]
 enum ProcFileKind { Filesystems, Mounts, Version, CpuInfo, MemInfo, Uptime, Stat, Devices }
 
+#[derive(Clone, Copy)]
+enum ProcLinkKind { Exe, Cwd, Root }
+
 fn root_inode(fs_id: FsId, weak_sb: &alloc::sync::Weak<Superblock>, now: Timespec) -> Arc<Inode> {
     let mk = |ino, kind: ProcFileKind| {
         let meta = InodeMeta { size: 0, nlink: 1, mode: FileMode::new(0o444),
@@ -91,21 +94,163 @@ fn root_inode(fs_id: FsId, weak_sb: &alloc::sync::Weak<Superblock>, now: Timespe
     let root_meta = InodeMeta { size: 4096, nlink: 2, mode: FileMode::new(0o555),
         uid: Uid::ROOT, gid: Gid::ROOT, atime: now, mtime: now, ctime: now, blocks: 0 };
     Inode::new(InodeId { fs_id, ino: 1 }, FileType::Directory, DevId::new(0, 0), 4096,
-        None, root_meta, Arc::new(ProcRootOps { entries }), weak_sb.clone())
+        None, root_meta, Arc::new(ProcRootOps { entries, fs_id, weak_sb: weak_sb.clone() }), weak_sb.clone())
 }
 
-struct ProcRootOps { entries: Vec<(&'static str, Arc<Inode>)> }
+struct ProcRootOps {
+    entries: Vec<(&'static str, Arc<Inode>)>,
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
 impl InodeOps for ProcRootOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
-        self.entries.iter().find(|(n, _)| *n == name).map(|(_, i)| Arc::clone(i)).ok_or(VfsError::NotFound)
+        if let Some((_, inode)) = self.entries.iter().find(|(n, _)| *n == name) {
+            return Ok(Arc::clone(inode));
+        }
+        let pid = current_pid_for_name(name).ok_or(VfsError::NotFound)?;
+        Ok(proc_task_dir_inode(self.fs_id, &self.weak_sb, pid))
     }
     fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        let mut snapshot: Vec<DirEntry> = self.entries.iter().map(|(n, i)| DirEntry {
+            ino: i.ino(),
+            name: SmallStr::new(n),
+            kind: i.kind(),
+        }).collect();
+        if sched::is_ready()
+            && let Some(pid) = sched::current_task().pid_root()
+        {
+            snapshot.push(DirEntry {
+                ino: proc_task_dir_ino(pid as u32),
+                name: SmallStr::new(&format!("{}", pid)),
+                kind: FileType::Directory,
+            });
+        }
         Ok(Box::new(ProcDirFile {
-            snapshot: self.entries.iter().map(|(n, i)| DirEntry { ino: i.ino(), name: SmallStr::new(n), kind: i.kind() }).collect(),
+            snapshot,
         }))
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
     fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+fn current_pid_for_name(name: &str) -> Option<u32> {
+    let pid = parse_pid_component(name)?;
+    if !sched::is_ready() {
+        return None;
+    }
+    (sched::current_task().pid_root() == Some(pid as i32)).then_some(pid)
+}
+
+fn parse_pid_component(name: &str) -> Option<u32> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut value = 0u32;
+    for b in name.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+fn proc_task_dir_ino(pid: u32) -> u64 {
+    1_000 + pid as u64
+}
+
+fn proc_task_link_ino(pid: u32, kind: ProcLinkKind) -> u64 {
+    let slot = match kind {
+        ProcLinkKind::Exe => 1,
+        ProcLinkKind::Cwd => 2,
+        ProcLinkKind::Root => 3,
+    };
+    10_000 + pid as u64 * 10 + slot
+}
+
+fn proc_task_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: u32) -> Arc<Inode> {
+    let now = Timespec::now();
+    let meta = InodeMeta { size: 4096, nlink: 2, mode: FileMode::new(0o555),
+        uid: Uid::ROOT, gid: Gid::ROOT, atime: now, mtime: now, ctime: now, blocks: 0 };
+    Inode::new(InodeId { fs_id, ino: proc_task_dir_ino(pid) }, FileType::Directory,
+        DevId::new(0, 0), 4096, None, meta,
+        Arc::new(ProcTaskDirOps { fs_id, weak_sb: weak_sb.clone(), pid }), weak_sb.clone())
+}
+
+fn proc_task_link_inode(
+    fs_id: FsId,
+    weak_sb: &Weak<Superblock>,
+    pid: u32,
+    kind: ProcLinkKind,
+) -> Arc<Inode> {
+    let now = Timespec::now();
+    let meta = InodeMeta { size: 0, nlink: 1, mode: FileMode::new(0o777),
+        uid: Uid::ROOT, gid: Gid::ROOT, atime: now, mtime: now, ctime: now, blocks: 0 };
+    Inode::new(InodeId { fs_id, ino: proc_task_link_ino(pid, kind) }, FileType::Symlink,
+        DevId::new(0, 0), 4096, None, meta,
+        Arc::new(ProcTaskLinkOps { kind }), weak_sb.clone())
+}
+
+struct ProcTaskDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+    pid: u32,
+}
+impl InodeOps for ProcTaskDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        let kind = match name {
+            "exe" => ProcLinkKind::Exe,
+            "cwd" => ProcLinkKind::Cwd,
+            "root" => ProcLinkKind::Root,
+            _ => return Err(VfsError::NotFound),
+        };
+        Ok(proc_task_link_inode(self.fs_id, &self.weak_sb, self.pid, kind))
+    }
+    fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![
+                DirEntry { ino: proc_task_link_ino(self.pid, ProcLinkKind::Exe), name: SmallStr::new("exe"), kind: FileType::Symlink },
+                DirEntry { ino: proc_task_link_ino(self.pid, ProcLinkKind::Cwd), name: SmallStr::new("cwd"), kind: FileType::Symlink },
+                DirEntry { ino: proc_task_link_ino(self.pid, ProcLinkKind::Root), name: SmallStr::new("root"), kind: FileType::Symlink },
+            ],
+        }))
+    }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+struct ProcTaskLinkOps { kind: ProcLinkKind }
+impl InodeOps for ProcTaskLinkOps {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
+    fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> { Err(VfsError::NotFound) }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        match self.kind {
+            ProcLinkKind::Exe => current_exec_path(),
+            ProcLinkKind::Cwd => current_cwd_path(),
+            ProcLinkKind::Root => Ok(String::from("/")),
+        }
+    }
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+fn current_exec_path() -> VfsResult<String> {
+    if !sched::is_ready() {
+        return Err(VfsError::NotFound);
+    }
+    sched::current_task()
+        .ext_lookup(sched::TASKEXT_EXEC_PATH)
+        .and_then(|payload| payload.downcast::<String>().ok())
+        .map(|path| (*path).clone())
+        .ok_or(VfsError::NotFound)
+}
+
+fn current_cwd_path() -> VfsResult<String> {
+    let ctx = current_vfs_context().ok_or(VfsError::NotFound)?;
+    let mut cwd = namespace_path(&ctx, &ctx.cwd(), &ctx.cwd_mount()).unwrap_or_else(|| String::from("/"));
+    if cwd.is_empty() {
+        cwd.push('/');
+    }
+    Ok(cwd)
 }
 
 struct ProcSelfOps;

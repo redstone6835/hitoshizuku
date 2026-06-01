@@ -40,7 +40,7 @@ static BOOT_VFS_PARTS: Spinlock<Option<BootVfsParts>> = Spinlock::new(None);
 /// install_stdio 用它走 openat 路径打开 fd 0/1/2。
 static BOOT_CONSOLE_NAME: Spinlock<Option<alloc::string::String>> = Spinlock::new(None);
 
-pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
+pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = sched::TASKEXT_EXEC_PATH;
 
 pub fn stash_boot_console_name(name: alloc::string::String) {
     *BOOT_CONSOLE_NAME.lock() = Some(name);
@@ -278,6 +278,7 @@ fn process_execve(
     let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
         Ok(loaded) => loaded,
         Err(err) => {
+            log::info!("[exec] load failed: path={:?} err={:?}", path, err);
             if let Some(vm) = old_vm {
                 vm.activate();
             }

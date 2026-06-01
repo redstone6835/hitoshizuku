@@ -26,16 +26,47 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+setup_dynamic_linker() {
+    glibc_lib=/mnt/glibc/lib
+
+    if [ ! -e /lib ] && [ ! -L /lib ]; then
+        ln -s "$glibc_lib" /lib 2>/dev/null || true
+    fi
+    if [ ! -e /lib64 ] && [ ! -L /lib64 ]; then
+        ln -s "$glibc_lib" /lib64 2>/dev/null || true
+    fi
+
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *:"$glibc_lib":*) ;;
+        *) LD_LIBRARY_PATH="$glibc_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+    export LD_LIBRARY_PATH
+
+    echo "[init] dynamic linker path prepared"
+}
+
 run_test_scripts() {
-    set -- /mnt/*_testcode.sh
-    if [ "$1" = "/mnt/*_testcode.sh" ]; then
+    set -- /mnt/*_testcode.sh /mnt/*/*_testcode.sh
+    # filter out unexpanded globs
+    found=0
+    for f in "$@"; do
+        [ -e "$f" ] && found=1 && break
+    done
+    if [ "$found" = "0" ]; then
         return 1
     fi
 
     echo "[init] found test scripts on /mnt"
+    setup_dynamic_linker
+    echo "[init] dynamic linker setup done"
+    echo "[init] trying /mnt/glibc/busybox echo hello"
+    /mnt/glibc/busybox echo hello
+    echo "[init] busybox returned $?"
     for script in "$@"; do
-        echo "[init] run $(basename "$script")"
-        /bin/sh "$script"
+        [ -e "$script" ] || continue
+        dir=$(dirname "$script")
+        echo "[init] run $(basename "$script") in $dir"
+        (cd "$dir" && /bin/sh "$script")
     done
     return 0
 }
@@ -45,10 +76,16 @@ shutdown_after_tests() {
     poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || reboot -f >/dev/null 2>&1 || true
 }
 
-if run_test_scripts; then
-    echo "[init] test scripts finished"
-    shutdown_after_tests
+if [ -e /dev/vd0 ]; then
+    if mount -t ext4 /dev/vd0 /mnt; then
+        echo "[init] mount /dev/vd0 -> /mnt OK"
+        ls /mnt
+    else
+        echo "[init] mount /dev/vd0 FAILED"
+    fi
 fi
+
+setup_dynamic_linker
 
 echo "[init] no test scripts found, entering shell"
 exec /bin/sh -i

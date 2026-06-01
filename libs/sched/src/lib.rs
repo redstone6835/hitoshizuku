@@ -99,8 +99,9 @@ pub use spawn::{
     reparent_to_init, spawn_child,
 };
 pub use task::{
-    ExitCode, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE,
-    Task, TaskExt, TaskExtCloneHook, TaskExtKey, TaskState, ext_clone_hook,
+    ExitCode, TASKEXT_EXEC_PATH, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT,
+    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook, TaskExtKey,
+    TaskState, ext_clone_hook,
     register_ext_clone_hook,
 };
 pub use wait::WaitQueue;

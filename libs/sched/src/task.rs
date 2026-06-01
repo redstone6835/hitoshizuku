@@ -706,6 +706,8 @@ pub const TASKEXT_VFS_FDTABLE: TaskExtKey = 0x0001_0001;
 pub const TASKEXT_VM_SPACE: TaskExtKey = 0x0001_0002;
 /// 已保存的用户 trap frame（kernel/hal 通过此键挂在 Task 的 ext 表上）。
 pub const TASKEXT_USER_TRAP_FRAME: TaskExtKey = 0x0001_0003;
+/// 当前任务的可执行路径（kernel execve 安装，procfs `/proc/self/exe` 读取）。
+pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 
 /// 单条子系统挂载。
 pub struct TaskExt {

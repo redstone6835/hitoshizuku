@@ -282,14 +282,16 @@ impl FsState {
         count: u32,
         out: &mut [u8],
     ) -> Result<(), BlockBackendError> {
-        let expected = self.ext_sb.block_size as usize * count as usize;
+        let bs = self.ext_sb.block_size as usize;
+        let expected = bs * count as usize;
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        if count == 1 {
-            return self.read_block(start_block, out);
+        for i in 0..count {
+            let off = i as usize * bs;
+            self.read_block(start_block + i as u64, &mut out[off..off + bs])?;
         }
-        bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, out)
+        Ok(())
     }
 
     pub(crate) fn write_blocks(
