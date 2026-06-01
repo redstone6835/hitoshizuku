@@ -248,6 +248,8 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
 
         ".Lresume_skip_fpu:",
 
+        "ld.d $r12, $r31, {euen_off}",
+        "bstrins.d $r12, $r0, 4, 4",
         "csrwr $r12, {csr_euen}",
 
         "ld.d $r12, $r31, {llbctl_off}",

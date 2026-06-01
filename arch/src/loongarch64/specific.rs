@@ -103,6 +103,10 @@ pub const CSR_ECFG_VS_MASK: usize = ((1usize << CSR_ECFG_VS_WIDTH) - 1) << CSR_E
 
 // CSR_EUEN 寄存器中扩展功能使能位字段定义。
 pub const EUEN_FPE: usize = 0x1;
+
+/// EUEN bit 4（保留位）：内核内部标志，记录异常入口时是否保存了 FPU 上下文。
+/// 写入 CSR_EUEN 前必须清除。
+pub const FPU_SAVED: usize = 0x10;
 pub const EUEN_SXE: usize = 0x2;
 pub const EUEN_ASXE: usize = 0x4;
 pub const EUEN_BTE: usize = 0x8;
