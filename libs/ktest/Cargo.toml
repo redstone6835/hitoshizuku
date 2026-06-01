@@ -9,7 +9,7 @@ doctest = false
 bench = false
 
 [features]
-kernel = ["ktest-macro/kernel", "dep:spin"]
+kernel = ["dep:spin"]
 
 [dependencies]
 ktest-macro = { path = "./ktest-macro" }

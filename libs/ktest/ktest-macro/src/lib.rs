@@ -1,43 +1,45 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn};
+use syn::{parse_macro_input, Attribute, ItemFn};
 
 /// 统一测试属性宏。
 ///
-/// # 主机端（默认）
-/// 展开为 `#[test]`，供 `cargo test` 使用。
+/// 同时生成两条路径，由调用方 rustc 根据 `cfg(test)` 选择：
 ///
-/// # 内核端（feature = "kernel"）
-/// 展开为 linker section 注册代码，供内核 test runner 遍历。
+/// - **主机端**（cargo test）：`#[cfg(test)]` + `#[test]` 展开为标准测试
+/// - **内核端**（cargo build，test=false）：`#[cfg(not(test))]` 展开为
+///   linker section 注册代码（`.ktest`），供内核 test runner 遍历
+///
+/// 内核二进制设置 `test = false`，因此 `cfg(test)` 永远不会在内核构建中
+/// 成立，不存在 proc-macro `cfg!()` 的编译时求值歧义。
 #[proc_macro_attribute]
 pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
-
-    if cfg!(feature = "kernel") {
-        generate_kernel_entry(input)
-    } else {
-        generate_host_test(input)
-    }
-}
-
-fn generate_host_test(input: ItemFn) -> TokenStream {
-    let output = quote! {
-        #[test]
-        #input
-    };
-    output.into()
-}
-
-fn generate_kernel_entry(input: ItemFn) -> TokenStream {
     let fn_name = &input.sig.ident;
-    let wrapper_name = quote::format_ident!("__ktest_wrapper_{}", fn_name);
+    let host_name = quote::format_ident!("__ktest_host_{}", fn_name);
     let static_name = quote::format_ident!("__KTEST_{}", fn_name);
 
+    // 收集需要传播给 host wrapper 的测试属性
+    let test_attrs: Vec<&Attribute> = input
+        .attrs
+        .iter()
+        .filter(|a| {
+            a.path().is_ident("should_panic")
+                || a.path().is_ident("ignore")
+        })
+        .collect();
+
     let output = quote! {
         #input
 
-        fn #wrapper_name() { #fn_name(); }
+        // 主机端：cargo test
+        #[cfg(test)]
+        #( #test_attrs )*
+        #[test]
+        fn #host_name() { #fn_name(); }
 
+        // 内核端：linker section 注册
+        #[cfg(not(test))]
         #[allow(non_upper_case_globals)]
         #[unsafe(link_section = ".ktest")]
         #[used]
@@ -45,7 +47,7 @@ fn generate_kernel_entry(input: ItemFn) -> TokenStream {
             name: concat!(module_path!(), "::", stringify!(#fn_name)),
             file: file!(),
             line: line!(),
-            func: #wrapper_name,
+            func: #fn_name,
         };
     };
     output.into()

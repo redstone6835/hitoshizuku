@@ -32,7 +32,7 @@ fn main() -> ! {
 
     #[cfg(feature = "kernel-tests")]
     {
-        ktest::runner::set_writer(arch::e_write_bytes);
+        ktest::runner::set_writer(hal::console::early_write_bytes);
         let report = ktest::runner::run_all();
         let _ = report;
     }
