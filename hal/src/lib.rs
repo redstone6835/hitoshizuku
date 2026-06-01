@@ -10,6 +10,7 @@
 
 extern crate arch;
 
+pub mod console;
 pub mod memory;
 pub mod platform;
 pub mod sched;

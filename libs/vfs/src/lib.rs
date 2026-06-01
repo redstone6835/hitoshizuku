@@ -179,3 +179,6 @@ impl VfsContext {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -29,3 +29,6 @@ pub use error::ElfError;
 pub use image::Image;
 pub use linux::LinuxElfImage;
 pub use types::{AddressWidth, Arch, Segment, SegmentPerms};
+
+#[cfg(any(test, feature = "ktest-kernel"))]
+mod tests;

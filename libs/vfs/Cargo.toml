@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-test = false
+test = true
 doctest = false
 bench = false
 
 [dependencies]
 errno = { path = "../errno" }
 mm = { path = "../mm" }
+
+[dev-dependencies]
+ktest = { path = "../ktest" }

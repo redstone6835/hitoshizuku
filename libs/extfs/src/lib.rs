@@ -49,3 +49,6 @@ mod state;
 mod symlink;
 
 pub use state::{BlockBackend, BlockBackendError, ExtFsDriver};
+
+#[cfg(test)]
+mod tests;

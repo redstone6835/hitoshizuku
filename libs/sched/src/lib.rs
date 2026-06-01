@@ -105,3 +105,6 @@ pub use task::{
 };
 pub use wait::WaitQueue;
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
+
+#[cfg(test)]
+mod tests;

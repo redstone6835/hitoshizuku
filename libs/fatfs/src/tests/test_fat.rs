@@ -1,0 +1,64 @@
+//! FAT 表操作测试。
+
+extern crate std;
+
+use ktest::ktest;
+use ktest_mock::MemDisk;
+use std::sync::Arc;
+use std::vec;
+use crate::bpb::FatKind;
+use crate::fat::FatTable;
+
+/// 构造 FAT 表测试盘：预留扇区 0（引导扇区），从扇区 1 起为 FAT 数据。
+/// `entries` 为按 cluster 编号索引的 FAT 条目数组，索引 0/1 保留未用。
+fn make_fat_disk(entries: &[u32], kind: FatKind) -> (Arc<MemDisk>, FatTable) {
+    let entry_size: u32 = match kind { FatKind::Fat32 => 4, _ => 2 };
+    let total_clusters = entries.len() as u32;
+    let data_len = total_clusters * entry_size;
+    let sectors_needed = (data_len + 511) / 512;
+    let mut data = vec![0u8; 512];
+    data.resize(512 + sectors_needed as usize * 512, 0);
+    for (cluster, &v) in entries.iter().enumerate() {
+        let off = 512 + cluster * entry_size as usize;
+        match kind {
+            FatKind::Fat32 => data[off..off+4].copy_from_slice(&v.to_le_bytes()),
+            _ => data[off..off+2].copy_from_slice(&(v as u16).to_le_bytes()),
+        }
+    }
+    let disk = Arc::new(MemDisk::from_bytes(data, 512));
+    let table = FatTable::new(kind, 1, sectors_needed, 1, 512,
+                              total_clusters, 16, 2);
+    (disk, table)
+}
+
+/// get 从 FAT 表中读取指定簇号的值，validate_cluster 检查簇号范围。
+#[ktest]
+fn get_cluster_value() {
+    let (disk, table) = make_fat_disk(&[0, 0, 3, 4, 0x0ffffff8], FatKind::Fat32);
+    let v = table.get(&*disk, 2).expect("get cluster 2");
+    assert_eq!(v, 3);
+}
+
+/// next_cluster 返回簇链中的下一个簇号，到达 EOC 返回 None。
+#[ktest]
+fn next_cluster_linear() {
+    let (disk, table) = make_fat_disk(&[0, 0, 3, 4, 0x0ffffff8], FatKind::Fat32);
+    let n = table.next_cluster(&*disk, 2).expect("next");
+    assert_eq!(n, Some(3));
+}
+
+/// is_eoc 对大于等于 EOC 标记的值返回 true，正常簇号返回 false。
+#[ktest]
+fn is_eoc_marker() {
+    let table = FatTable::new(FatKind::Fat32, 1, 1, 1, 512, 100, 16, 2);
+    assert!(table.is_eoc(0x0ffffff8));
+    assert!(!table.is_eoc(5));
+}
+
+/// walk_chain 从起始簇走 N 步，返回最终簇号。
+#[ktest]
+fn walk_chain_n_steps() {
+    let (disk, table) = make_fat_disk(&[0, 0, 3, 4, 0x0ffffff8], FatKind::Fat32);
+    let end = table.walk_chain(&*disk, 2, 2).expect("walk");
+    assert_eq!(end, Some(4));
+}

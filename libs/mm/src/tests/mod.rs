@@ -1,0 +1,8 @@
+#[cfg(not(feature = "ktest-kernel"))]
+extern crate std;
+#[cfg(feature = "ktest-kernel")]
+extern crate alloc;
+
+mod test_vm_area;
+mod test_vm_flags;
+mod test_vma_set;
