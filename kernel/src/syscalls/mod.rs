@@ -130,6 +130,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_GETTIMEOFDAY, process::sys_gettimeofday);
     register_syscall(nr::SYS_GETPRIORITY, process::sys_getpriority);
     register_syscall(nr::SYS_SETPRIORITY, process::sys_setpriority);
+    register_syscall(nr::SYS_REBOOT, process::sys_reboot);
     register_syscall(nr::SYS_SCHED_GETPARAM, process::sys_sched_getparam);
     register_syscall(nr::SYS_SCHED_SETPARAM, process::sys_sched_setparam);
     register_syscall(nr::SYS_SCHED_GETSCHEDULER, process::sys_sched_getscheduler);

@@ -30,7 +30,7 @@ pub enum InitramfsError {
     BadArchive,
     UnsupportedEntry,
     Utf8,
-    Vfs(vfs::error::VfsError),
+    Vfs( #[allow(dead_code)] vfs::error::VfsError),
 }
 
 impl From<vfs::error::VfsError> for InitramfsError {
