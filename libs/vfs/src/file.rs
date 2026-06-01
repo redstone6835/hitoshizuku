@@ -329,6 +329,11 @@ impl File {
         &self.mount
     }
 
+    /// 返回此文件对应的 Dentry。
+    pub fn dentry(&self) -> &Arc<crate::vfs::dentry::Dentry> {
+        &self.dentry
+    }
+
     /// 返回当前读写偏移量。
     pub fn pos(&self) -> u64 {
         self.pos.load(Ordering::Acquire)
