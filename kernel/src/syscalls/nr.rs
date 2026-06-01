@@ -92,6 +92,7 @@ pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
 pub const SYS_RT_SIGRETURN: usize = 139;
 pub const SYS_SETPRIORITY: usize = 140;
 pub const SYS_GETPRIORITY: usize = 141;
+pub const SYS_REBOOT: usize = 142;
 pub const SYS_SETREGID: usize = 143;
 pub const SYS_SETGID: usize = 144;
 pub const SYS_SETREUID: usize = 145;
