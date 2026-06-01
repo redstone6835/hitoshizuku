@@ -282,7 +282,7 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "fst.d $f28, $r12, 28 * 8",   "fst.d $f29, $r12, 29 * 8",
         "fst.d $f30, $r12, 30 * 8",   "fst.d $f31, $r12, 31 * 8",
 
-        "j .L_fpu_save_done",
+        "b .L_fpu_save_done",
 
         ".L_no_fpu_save:",
         "st.d $r12, $r3, {euen_offset}",
