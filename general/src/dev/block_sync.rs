@@ -50,11 +50,6 @@ impl SyncBlockBackend {
         Self { dev }
     }
 
-    /// 兼容旧 API，忽略 virt_to_phys（快速路径不再需要地址转换）。
-    pub fn with_virt_to_phys(dev: Arc<BlockDevice>, _v2p: fn(usize) -> usize) -> Self {
-        Self { dev }
-    }
-
     fn run<R>(
         &self,
         build_req: impl FnOnce() -> BlockIoRequest,
@@ -118,7 +113,7 @@ impl SyncBlockBackend {
             return Err(SyncIoError::InvalidRange);
         }
 
-        // 快速路径：直接传 buffer 给驱动，零分配零拷贝。
+        // 快速路径 1：直接传 buffer 给驱动，零分配零拷贝。
         match self.dev.read_sync(lba, count, buf) {
             Ok(()) => return Ok(()),
             Err(BlockSubmitError::Unsupported) => {}
@@ -165,7 +160,7 @@ impl SyncBlockBackend {
             return Err(SyncIoError::InvalidRange);
         }
 
-        // 快速路径
+        // 快速路径 1
         match self.dev.write_sync(lba, count, buf) {
             Ok(()) => return Ok(()),
             Err(BlockSubmitError::Unsupported) => {}

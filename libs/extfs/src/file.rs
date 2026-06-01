@@ -345,6 +345,12 @@ impl FileOps for ExtRegFileOps {
                 .map_ranges(flags, size, &i_block, first_lb, lb_count)
                 .map_err(map_err)?;
 
+            // if ranges.is_empty() && offset == 0 {
+            //     log::info!("[extfs] read_at offset=0 size={} flags={:#x} ranges EMPTY first_lb={} lb_count={}", size, flags, first_lb, lb_count);
+            // } else if offset == 0 {
+            //     log::info!("[extfs] read_at offset=0 size={} ranges={} first=({},{},{:#x})", size, ranges.len(), ranges[0].0, ranges[0].1, ranges[0].2);
+            // }
+
             let mut filled_until = 0usize;
             let mut scratch = Vec::new();
             for (range_lb, range_count, phys_start) in &ranges {
