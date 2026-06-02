@@ -2,17 +2,20 @@
 
 extern crate std;
 
+use crate::bpb::FatKind;
+use crate::fat::FatTable;
 use ktest::ktest;
 use ktest_mock::MemDisk;
 use std::sync::Arc;
 use std::vec;
-use crate::bpb::FatKind;
-use crate::fat::FatTable;
 
 /// 构造 FAT 表测试盘：预留扇区 0（引导扇区），从扇区 1 起为 FAT 数据。
 /// `entries` 为按 cluster 编号索引的 FAT 条目数组，索引 0/1 保留未用。
 fn make_fat_disk(entries: &[u32], kind: FatKind) -> (Arc<MemDisk>, FatTable) {
-    let entry_size: u32 = match kind { FatKind::Fat32 => 4, _ => 2 };
+    let entry_size: u32 = match kind {
+        FatKind::Fat32 => 4,
+        _ => 2,
+    };
     let total_clusters = entries.len() as u32;
     let data_len = total_clusters * entry_size;
     let sectors_needed = (data_len + 511) / 512;
@@ -21,13 +24,12 @@ fn make_fat_disk(entries: &[u32], kind: FatKind) -> (Arc<MemDisk>, FatTable) {
     for (cluster, &v) in entries.iter().enumerate() {
         let off = 512 + cluster * entry_size as usize;
         match kind {
-            FatKind::Fat32 => data[off..off+4].copy_from_slice(&v.to_le_bytes()),
-            _ => data[off..off+2].copy_from_slice(&(v as u16).to_le_bytes()),
+            FatKind::Fat32 => data[off..off + 4].copy_from_slice(&v.to_le_bytes()),
+            _ => data[off..off + 2].copy_from_slice(&(v as u16).to_le_bytes()),
         }
     }
     let disk = Arc::new(MemDisk::from_bytes(data, 512));
-    let table = FatTable::new(kind, 1, sectors_needed, 1, 512,
-                              total_clusters, 16, 2);
+    let table = FatTable::new(kind, 1, sectors_needed, 1, 512, total_clusters, 16, 2);
     (disk, table)
 }
 

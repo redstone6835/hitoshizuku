@@ -5,8 +5,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::signal::{SigSet, SignalNumber};
+use ktest::ktest;
 
 /// 空集不包含任何信号。
 #[ktest]
@@ -45,7 +45,9 @@ fn sigset_union() {
 /// intersection 仅保留双方共有的信号。
 #[ktest]
 fn sigset_intersection() {
-    let a = SigSet::EMPTY.with(SignalNumber::SIGKILL).with(SignalNumber::SIGTERM);
+    let a = SigSet::EMPTY
+        .with(SignalNumber::SIGKILL)
+        .with(SignalNumber::SIGTERM);
     let b = SigSet::EMPTY.with(SignalNumber::SIGKILL);
     let i = a.intersection(b);
     assert!(i.has(SignalNumber::SIGKILL));

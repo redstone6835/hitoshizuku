@@ -83,7 +83,11 @@ mod stable_alloc {
             Self {
                 ptr: NonNull::dangling(),
                 len: 0,
-                cap: if mem::size_of::<T>() == 0 { usize::MAX } else { 0 },
+                cap: if mem::size_of::<T>() == 0 {
+                    usize::MAX
+                } else {
+                    0
+                },
                 allocator,
                 _marker: PhantomData,
             }
@@ -108,7 +112,13 @@ mod stable_alloc {
                 .allocate(layout)
                 .unwrap_or_else(|_| alloc::alloc::handle_alloc_error(layout))
                 .cast::<T>();
-            Self { ptr, len: 0, cap: capacity, allocator, _marker: PhantomData }
+            Self {
+                ptr,
+                len: 0,
+                cap: capacity,
+                allocator,
+                _marker: PhantomData,
+            }
         }
 
         pub fn push(&mut self, value: T) {
@@ -135,8 +145,11 @@ mod stable_alloc {
                 return;
             }
 
-            let new_cap =
-                if self.cap == 0 { 4 } else { self.cap.checked_mul(2).expect("ACPI Vec capacity overflow") };
+            let new_cap = if self.cap == 0 {
+                4
+            } else {
+                self.cap.checked_mul(2).expect("ACPI Vec capacity overflow")
+            };
             let new_layout = Layout::array::<T>(new_cap).expect("ACPI Vec capacity overflow");
             let new_ptr = self
                 .allocator
@@ -147,7 +160,8 @@ mod stable_alloc {
             unsafe {
                 ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.len);
                 if self.cap != 0 {
-                    let old_layout = Layout::array::<T>(self.cap).expect("ACPI Vec capacity overflow");
+                    let old_layout =
+                        Layout::array::<T>(self.cap).expect("ACPI Vec capacity overflow");
                     self.allocator.deallocate(self.ptr.cast::<u8>(), old_layout);
                 }
             }
@@ -262,7 +276,9 @@ impl<H: Handler> AcpiPlatform<H, Global> {
 
 impl<H: Handler, A: Allocator> AcpiPlatform<H, A> {
     pub fn new_in(tables: AcpiTables<H>, handler: H, allocator: A) -> Result<Self, AcpiError> {
-        let Some(fadt) = tables.find_table::<Fadt>() else { Err(AcpiError::TableNotFound(Signature::FADT))? };
+        let Some(fadt) = tables.find_table::<Fadt>() else {
+            Err(AcpiError::TableNotFound(Signature::FADT))?
+        };
         let power_profile = fadt.power_profile();
 
         let (interrupt_model, processor_info) = InterruptModel::new_in(&tables, allocator)?;
@@ -286,13 +302,27 @@ impl<H: Handler, A: Allocator> AcpiPlatform<H, A> {
         /*
          * Disable all fixed events to start.
          */
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::Timer, false)?;
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::GlobalLock, false)?;
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::PowerButton, false)?;
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::SleepButton, false)?;
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::Rtc, false)?;
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::PciEWake, false)?;
-        self.registers.pm1_event_registers.set_event_enabled(Pm1Event::Wake, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::Timer, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::GlobalLock, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::PowerButton, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::SleepButton, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::Rtc, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::PciEWake, false)?;
+        self.registers
+            .pm1_event_registers
+            .set_event_enabled(Pm1Event::Wake, false)?;
 
         // TODO: deal with GPEs
 
@@ -300,7 +330,11 @@ impl<H: Handler, A: Allocator> AcpiPlatform<H, A> {
     }
 
     pub fn read_mode(&self) -> Result<AcpiMode, AcpiError> {
-        if self.registers.pm1_control_registers.read_bit(Pm1ControlBit::SciEnable)? {
+        if self
+            .registers
+            .pm1_control_registers
+            .read_bit(Pm1ControlBit::SciEnable)?
+        {
             Ok(AcpiMode::Acpi)
         } else {
             Ok(AcpiMode::Legacy)
@@ -323,8 +357,11 @@ impl<H: Handler, A: Allocator> AcpiPlatform<H, A> {
             return Ok(());
         }
 
-        let Some(fadt) = self.tables.find_table::<Fadt>() else { Err(AcpiError::TableNotFound(Signature::FADT))? };
-        self.handler.write_io_u8(fadt.smi_cmd_port as u16, fadt.acpi_enable);
+        let Some(fadt) = self.tables.find_table::<Fadt>() else {
+            Err(AcpiError::TableNotFound(Signature::FADT))?
+        };
+        self.handler
+            .write_io_u8(fadt.smi_cmd_port as u16, fadt.acpi_enable);
 
         /*
          * We now have to spin and wait for the firmware to yield control. We'll wait up to 3
@@ -353,26 +390,40 @@ impl<H: Handler, A: Allocator> AcpiPlatform<H, A> {
     /// # Safety
     /// An appropriate environment must exist for the AP to boot into at the given address, or the
     /// AP could fault or cause unexpected behaviour.
-    pub unsafe fn wake_aps(&self, apic_id: u32, wakeup_vector: u64, timeout_loops: u64) -> Result<(), AcpiError> {
-        let Some(madt) = self.tables.find_table::<Madt>() else { Err(AcpiError::TableNotFound(Signature::MADT))? };
+    pub unsafe fn wake_aps(
+        &self,
+        apic_id: u32,
+        wakeup_vector: u64,
+        timeout_loops: u64,
+    ) -> Result<(), AcpiError> {
+        let Some(madt) = self.tables.find_table::<Madt>() else {
+            Err(AcpiError::TableNotFound(Signature::MADT))?
+        };
         let mailbox_addr = madt.get().get_mpwk_mailbox_addr()?;
         let mut mpwk_mapping = unsafe {
-            self.handler.map_physical_region::<MultiprocessorWakeupMailbox>(
-                mailbox_addr as usize,
-                mem::size_of::<MultiprocessorWakeupMailbox>(),
-            )
+            self.handler
+                .map_physical_region::<MultiprocessorWakeupMailbox>(
+                    mailbox_addr as usize,
+                    mem::size_of::<MultiprocessorWakeupMailbox>(),
+                )
         };
 
         // Reset command
         unsafe {
-            ptr::write_volatile(&mut mpwk_mapping.command, MpProtectedModeWakeupCommand::Noop as u16);
+            ptr::write_volatile(
+                &mut mpwk_mapping.command,
+                MpProtectedModeWakeupCommand::Noop as u16,
+            );
         }
 
         // Fill the mailbox
         mpwk_mapping.apic_id = apic_id;
         mpwk_mapping.wakeup_vector = wakeup_vector;
         unsafe {
-            ptr::write_volatile(&mut mpwk_mapping.command, MpProtectedModeWakeupCommand::Wakeup as u16);
+            ptr::write_volatile(
+                &mut mpwk_mapping.command,
+                MpProtectedModeWakeupCommand::Wakeup as u16,
+            );
         }
 
         // Wait to join
@@ -437,8 +488,15 @@ pub struct ProcessorInfo<A: Allocator = Global> {
 }
 
 impl<A: Allocator> ProcessorInfo<A> {
-    pub(crate) fn new_in(boot_processor: Processor, application_processors: Vec<Processor, A>) -> Self {
-        Self { boot_processor, application_processors, _allocator: PhantomData }
+    pub(crate) fn new_in(
+        boot_processor: Processor,
+        application_processors: Vec<Processor, A>,
+    ) -> Self {
+        Self {
+            boot_processor,
+            application_processors,
+            _allocator: PhantomData,
+        }
     }
 }
 
@@ -454,7 +512,10 @@ pub struct PmTimer {
 impl PmTimer {
     pub fn new(fadt: &Fadt) -> Result<Option<PmTimer>, AcpiError> {
         match fadt.pm_timer_block()? {
-            Some(base) => Ok(Some(PmTimer { base, supports_32bit: { fadt.flags }.pm_timer_is_32_bit() })),
+            Some(base) => Ok(Some(PmTimer {
+                base,
+                supports_32bit: { fadt.flags }.pm_timer_is_32_bit(),
+            })),
             None => Ok(None),
         }
     }

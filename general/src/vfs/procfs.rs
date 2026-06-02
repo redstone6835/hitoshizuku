@@ -71,8 +71,12 @@ const TASK_SLOT_MOUNTINFO: u64 = 14;
 pub struct ProcFsDriver;
 
 impl FsDriver for ProcFsDriver {
-    fn name(&self) -> &'static str { "proc" }
-    fn flags(&self) -> FsDriverFlags { FsDriverFlags::NODEV.with(FsDriverFlags::SINGLE) }
+    fn name(&self) -> &'static str {
+        "proc"
+    }
+    fn flags(&self) -> FsDriverFlags {
+        FsDriverFlags::NODEV.with(FsDriverFlags::SINGLE)
+    }
 
     fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
         let fs_id = FsId::new(PROCFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
@@ -81,22 +85,34 @@ impl FsDriver for ProcFsDriver {
             let root_inode = root_inode(fs_id, &weak_sb, now);
             let root_dentry = Dentry::new_positive("", None, Arc::clone(&root_inode));
             Superblock {
-                fs_type: "proc", fs_id, dev_id: None, block_size: 4096, name_max: 255,
-                root_inode, root_dentry,
+                fs_type: "proc",
+                fs_id,
+                dev_id: None,
+                block_size: 4096,
+                name_max: 255,
+                root_inode,
+                root_dentry,
                 inode_cache: vfs::superblock::InodeCache::new(),
-                ops: Box::new(ProcSuperblockOps), self_weak: weak_sb,
+                ops: Box::new(ProcSuperblockOps),
+                self_weak: weak_sb,
             }
         }))
     }
 
     fn kill_sb(&self, _sb: Arc<Superblock>) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcSuperblockOps;
 impl SuperblockOps for ProcSuperblockOps {
-    fn alloc_inode(&self, _: &Arc<Superblock>) -> VfsResult<Arc<Inode>> { Err(VfsError::ReadOnlyFilesystem) }
-    fn write_inode(&self, _: &Arc<Inode>) -> VfsResult<()> { Ok(()) }
+    fn alloc_inode(&self, _: &Arc<Superblock>) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+    fn write_inode(&self, _: &Arc<Inode>) -> VfsResult<()> {
+        Ok(())
+    }
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
         Ok(FsStat {
             fs_type: 0x9fa0,
@@ -110,9 +126,15 @@ impl SuperblockOps for ProcSuperblockOps {
             name_max: sb.name_max,
         })
     }
-    fn sync_fs(&self, _: &Arc<Superblock>) -> VfsResult<()> { Ok(()) }
-    fn remount(&self, _: &Arc<Superblock>, _: MountFlags) -> VfsResult<()> { Ok(()) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn sync_fs(&self, _: &Arc<Superblock>) -> VfsResult<()> {
+        Ok(())
+    }
+    fn remount(&self, _: &Arc<Superblock>, _: MountFlags) -> VfsResult<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -239,9 +261,15 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         }),
     );
     let static_entries: Vec<(&str, Arc<Inode>)> = vec![
-        ("filesystems", mk_root_file(FILESYSTEMS_INO, RootFileKind::Filesystems)),
+        (
+            "filesystems",
+            mk_root_file(FILESYSTEMS_INO, RootFileKind::Filesystems),
+        ),
         ("mounts", mk_root_file(MOUNTS_INO, RootFileKind::Mounts)),
-        ("mountinfo", mk_root_file(MOUNTINFO_INO, RootFileKind::Mountinfo)),
+        (
+            "mountinfo",
+            mk_root_file(MOUNTINFO_INO, RootFileKind::Mountinfo),
+        ),
         ("version", mk_root_file(VERSION_INO, RootFileKind::Version)),
         ("cpuinfo", mk_root_file(CPUINFO_INO, RootFileKind::CpuInfo)),
         ("meminfo", mk_root_file(MEMINFO_INO, RootFileKind::MemInfo)),
@@ -253,7 +281,10 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("sys", sys_inode),
     ];
     Inode::new(
-        InodeId { fs_id, ino: ROOT_INO },
+        InodeId {
+            fs_id,
+            ino: ROOT_INO,
+        },
         FileType::Directory,
         DevId::new(0, 0),
         4096,
@@ -314,34 +345,56 @@ impl InodeOps for ProcRootOps {
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcSelfOps;
 impl InodeOps for ProcSelfOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
-    fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Err(VfsError::NotFound)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         let (tgid, _) = current_tgid_tid()?;
         Ok(format!("{}", tgid))
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcThreadSelfOps;
 impl InodeOps for ProcThreadSelfOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
-    fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Err(VfsError::NotFound)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         let (tgid, tid) = current_tgid_tid()?;
         Ok(format!("{}/task/{}", tgid, tid))
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcSysDirOps {
@@ -372,8 +425,12 @@ impl InodeOps for ProcSysDirOps {
         }))
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn proc_sys_kernel_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
@@ -419,8 +476,12 @@ impl InodeOps for ProcSysKernelDirOps {
         }))
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn proc_sys_hotplug_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
@@ -573,12 +634,7 @@ fn proc_task_list_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: PidT) 
     )
 }
 
-fn proc_fd_link_inode(
-    fs_id: FsId,
-    weak_sb: &Weak<Superblock>,
-    pid: PidT,
-    fd: u32,
-) -> Arc<Inode> {
+fn proc_fd_link_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, pid: PidT, fd: u32) -> Arc<Inode> {
     mk_inode(
         fs_id,
         weak_sb,
@@ -600,20 +656,72 @@ struct ProcTaskDirOps {
 impl InodeOps for ProcTaskDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
-            "exe" => Ok(proc_task_link_inode(self.fs_id, &self.weak_sb, self.pid, TaskLinkKind::Exe)),
-            "cwd" => Ok(proc_task_link_inode(self.fs_id, &self.weak_sb, self.pid, TaskLinkKind::Cwd)),
-            "root" => Ok(proc_task_link_inode(self.fs_id, &self.weak_sb, self.pid, TaskLinkKind::Root)),
-            "status" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Status)),
-            "stat" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Stat)),
-            "cmdline" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Cmdline)),
-            "environ" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Environ)),
-            "comm" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Comm)),
-            "maps" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Maps)),
-            "mountinfo" => Ok(proc_task_file_inode(self.fs_id, &self.weak_sb, self.pid, TaskFileKind::Mountinfo)),
+            "exe" => Ok(proc_task_link_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskLinkKind::Exe,
+            )),
+            "cwd" => Ok(proc_task_link_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskLinkKind::Cwd,
+            )),
+            "root" => Ok(proc_task_link_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskLinkKind::Root,
+            )),
+            "status" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Status,
+            )),
+            "stat" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Stat,
+            )),
+            "cmdline" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Cmdline,
+            )),
+            "environ" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Environ,
+            )),
+            "comm" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Comm,
+            )),
+            "maps" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Maps,
+            )),
+            "mountinfo" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Mountinfo,
+            )),
             "fd" => Ok(proc_fd_dir_inode(self.fs_id, &self.weak_sb, self.pid)),
-            "task" if self.view == TaskDirView::Process => {
-                Ok(proc_task_list_dir_inode(self.fs_id, &self.weak_sb, self.pid))
-            }
+            "task" if self.view == TaskDirView::Process => Ok(proc_task_list_dir_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+            )),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -692,8 +800,12 @@ impl InodeOps for ProcTaskDirOps {
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcTaskListDirOps {
@@ -736,8 +848,12 @@ impl InodeOps for ProcTaskListDirOps {
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcFdDirOps {
@@ -780,8 +896,12 @@ impl InodeOps for ProcFdDirOps {
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcTaskLinkOps {
@@ -790,8 +910,15 @@ struct ProcTaskLinkOps {
 }
 
 impl InodeOps for ProcTaskLinkOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
-    fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Err(VfsError::NotFound)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
@@ -803,7 +930,9 @@ impl InodeOps for ProcTaskLinkOps {
             TaskLinkKind::Root => task_root_path(&task),
         }
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcFdLinkOps {
@@ -812,8 +941,15 @@ struct ProcFdLinkOps {
 }
 
 impl InodeOps for ProcFdLinkOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
-    fn open(&self, _: &Inode, _: &OpenOptions, _: &Credentials) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Err(VfsError::NotFound)
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
@@ -825,7 +961,9 @@ impl InodeOps for ProcFdLinkOps {
             .ok_or(VfsError::NotFound)?;
         Ok(fd_target_path(&task, &file))
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcDirFile {
@@ -833,8 +971,12 @@ struct ProcDirFile {
 }
 
 impl FileOps for ProcDirFile {
-    fn read_at(&self, _: &mut [u8], _: u64) -> VfsResult<usize> { Err(VfsError::IsADirectory) }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> { Err(VfsError::IsADirectory) }
+    fn read_at(&self, _: &mut [u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::IsADirectory)
+    }
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::IsADirectory)
+    }
     fn readdir(
         &self,
         pos: u64,
@@ -848,10 +990,16 @@ impl FileOps for ProcDirFile {
         }
         Ok(self.snapshot.len() as u64)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcRegularInodeOps {
@@ -859,7 +1007,9 @@ struct ProcRegularInodeOps {
 }
 
 impl InodeOps for ProcRegularInodeOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
 
     fn open(
         &self,
@@ -885,8 +1035,12 @@ impl InodeOps for ProcRegularInodeOps {
         }
     }
 
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcRegularFile {
@@ -918,10 +1072,16 @@ impl FileOps for ProcRegularFile {
         Err(VfsError::NotADirectory)
     }
 
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn slice_bytes(buf: &mut [u8], offset: u64, content: &[u8]) -> VfsResult<usize> {
@@ -1105,8 +1265,8 @@ fn task_root_path(task: &Arc<Task>) -> VfsResult<String> {
 
 fn task_cwd_path(task: &Arc<Task>) -> VfsResult<String> {
     let ctx = task_vfs_context(task).ok_or(VfsError::NotFound)?;
-    let mut cwd = namespace_path(&ctx, &ctx.cwd(), &ctx.cwd_mount())
-        .unwrap_or_else(|| String::from("/"));
+    let mut cwd =
+        namespace_path(&ctx, &ctx.cwd(), &ctx.cwd_mount()).unwrap_or_else(|| String::from("/"));
     if cwd.is_empty() {
         cwd.push('/');
     }
@@ -1114,7 +1274,9 @@ fn task_cwd_path(task: &Arc<Task>) -> VfsResult<String> {
 }
 
 fn basename(path: &str) -> &str {
-    path.rsplit('/').find(|part| !part.is_empty()).unwrap_or(path)
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
 }
 
 fn fd_target_path(task: &Arc<Task>, file: &Arc<File>) -> String {
@@ -1177,7 +1339,9 @@ fn task_state_char(state: TaskState) -> char {
 
 fn task_state_name(state: TaskState) -> &'static str {
     match state {
-        TaskState::New | TaskState::Runnable | TaskState::Running | TaskState::Continued => "running",
+        TaskState::New | TaskState::Runnable | TaskState::Running | TaskState::Continued => {
+            "running"
+        }
         TaskState::Sleeping => "sleeping",
         TaskState::Uninterruptible => "disk sleep",
         TaskState::Stopped => "stopped",
@@ -1197,7 +1361,12 @@ fn task_pgrp(task: &Arc<Task>) -> PidT {
     task.process_group()
         .snapshot()
         .iter()
-        .find_map(|member| member.thread_group().leader().and_then(|leader| leader.pid_root()))
+        .find_map(|member| {
+            member
+                .thread_group()
+                .leader()
+                .and_then(|leader| leader.pid_root())
+        })
         .unwrap_or(0)
 }
 
@@ -1213,9 +1382,9 @@ fn task_memory_usage(task: &Arc<Task>) -> (u64, u64) {
     let Some(vm) = task_vm_space(task) else {
         return (0, 0);
     };
-    let vsize = dump_vmas(&vm)
-        .into_iter()
-        .fold(0u64, |acc, (range, _)| acc.saturating_add((range.end - range.start) as u64));
+    let vsize = dump_vmas(&vm).into_iter().fold(0u64, |acc, (range, _)| {
+        acc.saturating_add((range.end - range.start) as u64)
+    });
     let rss = vm.mapped_pages() as u64 * page_size() as u64;
     (vsize, rss)
 }
@@ -1231,7 +1400,9 @@ fn render_task_status(task: &Arc<Task>) -> String {
     let pid = task.pid_root().unwrap_or(0);
     let ppid = task_parent_pid(task);
     let creds = task.credentials();
-    let fd_count = task_fdtable(task).map(|fdt| fdt.snapshot_fds().len()).unwrap_or(0);
+    let fd_count = task_fdtable(task)
+        .map(|fdt| fdt.snapshot_fds().len())
+        .unwrap_or(0);
     let (vsize, rss) = task_memory_usage(task);
     format!(
         "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t{}\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\n",
@@ -1270,22 +1441,16 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     //       cutime, cstime, priority, nice, starttime, signal, blocked, sigignore, sigcatch 等字段
     format!(
         "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-        pid,
-        comm,
-        state,
-        ppid,
-        pgrp,
-        session,
-        num_threads,
-        vsize,
-        rss_pages,
+        pid, comm, state, ppid, pgrp, session, num_threads, vsize, rss_pages,
     )
 }
 
 fn render_task_cmdline(task: &Arc<Task>) -> Vec<u8> {
     let args = match task_exec_args(task) {
         Some(args) if !args.is_empty() => args,
-        _ => task_exec_path(task).map(|path| vec![path]).unwrap_or_default(),
+        _ => task_exec_path(task)
+            .map(|path| vec![path])
+            .unwrap_or_default(),
     };
     let mut out = Vec::new();
     for arg in args {
@@ -1339,10 +1504,7 @@ fn render_task_maps(task: &Arc<Task>) -> String {
         };
         out.push_str(&format!(
             "{:016x}-{:016x} {} 00000000 00:00 0{}\n",
-            range.start,
-            range.end,
-            perms,
-            suffix,
+            range.start, range.end, perms, suffix,
         ));
     }
     out
@@ -1359,7 +1521,11 @@ fn vm_flags_to_maps_perms(flags: VmFlags) -> String {
     if flags.has(VmFlags::EXEC) {
         out[2] = b'x';
     }
-    out[3] = if flags.has(VmFlags::SHARED) { b's' } else { b'p' };
+    out[3] = if flags.has(VmFlags::SHARED) {
+        b's'
+    } else {
+        b'p'
+    };
     String::from_utf8(out.to_vec()).unwrap_or_else(|_| String::from("----"))
 }
 
@@ -1401,7 +1567,10 @@ fn render_mounts() -> String {
 
 fn render_mountinfo_root() -> String {
     current_vfs_context()
-        .map(|ctx| ctx.mount_ns.dump_mountinfo(&ctx.root.root(), &ctx.root.mount()))
+        .map(|ctx| {
+            ctx.mount_ns
+                .dump_mountinfo(&ctx.root.root(), &ctx.root.mount())
+        })
         .unwrap_or_default()
 }
 
@@ -1476,12 +1645,12 @@ fn render_meminfo() -> String {
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(overview.free_physical),
-        0usize, // TODO: 实现 Buffers（块设备缓冲区统计）
-        0usize, // TODO: 实现 Cached（页缓存统计）
-        0usize, // TODO: 实现 SwapCached
+        0usize,                        // TODO: 实现 Buffers（块设备缓冲区统计）
+        0usize,                        // TODO: 实现 Cached（页缓存统计）
+        0usize,                        // TODO: 实现 SwapCached
         kb(overview.kernel_heap_used), // Slab: 暂用 kernel heap 近似
-        0usize, // TODO: 实现 KernelStack（内核栈统计）
-        0usize, // TODO: 实现 PageTables（页表统计）
+        0usize,                        // TODO: 实现 KernelStack（内核栈统计）
+        0usize,                        // TODO: 实现 PageTables（页表统计）
         kb(overview.kernel_vmem_total),
         kb(overview.kernel_vmem_allocated),
         kb(overview.kernel_vmem_free),
@@ -1521,7 +1690,10 @@ fn render_stat() -> String {
             };
             processes += 1;
             match task.state() {
-                TaskState::New | TaskState::Runnable | TaskState::Running | TaskState::Continued => {
+                TaskState::New
+                | TaskState::Runnable
+                | TaskState::Running
+                | TaskState::Continued => {
                     running += 1;
                 }
                 TaskState::Uninterruptible => blocked += 1,
@@ -1534,9 +1706,7 @@ fn render_stat() -> String {
     format!(
         "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n\
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
-        processes,
-        running,
-        blocked
+        processes, running, blocked
     )
 }
 

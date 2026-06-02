@@ -31,7 +31,8 @@ impl Mcfg {
         let num_entries = length / mem::size_of::<McfgEntry>();
 
         unsafe {
-            let pointer = (self as *const Mcfg as *const u8).add(mem::size_of::<Mcfg>()) as *const McfgEntry;
+            let pointer =
+                (self as *const Mcfg as *const u8).add(mem::size_of::<Mcfg>()) as *const McfgEntry;
             slice::from_raw_parts(pointer, num_entries)
         }
     }
@@ -39,7 +40,11 @@ impl Mcfg {
 
 impl fmt::Debug for Mcfg {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Mcfg").field("header", &self.header).field("entries", &self.entries()).finish()
+        formatter
+            .debug_struct("Mcfg")
+            .field("header", &self.header)
+            .field("entries", &self.entries())
+            .finish()
     }
 }
 

@@ -168,11 +168,7 @@ fn zero_block(state: &FsState, block: u64) -> Result<(), BlockBackendError> {
 }
 
 /// 把 buf 清零并写回 block,同时填充缓存。供新分配的间接块走这条路径。
-fn cache_zero_block(
-    state: &FsState,
-    block: u64,
-    buf: &mut [u8],
-) -> Result<(), BlockBackendError> {
+fn cache_zero_block(state: &FsState, block: u64, buf: &mut [u8]) -> Result<(), BlockBackendError> {
     for b in buf.iter_mut() {
         *b = 0;
     }

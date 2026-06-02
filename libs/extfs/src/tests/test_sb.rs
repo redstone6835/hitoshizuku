@@ -2,24 +2,28 @@
 
 extern crate std;
 
+use crate::layout::{ExtKind, INCOMPAT_EXTENTS};
+use crate::sb;
 use ktest::ktest;
 use ktest_mock::MemDisk;
 use std::sync::Arc;
 use std::vec;
 use std::vec::Vec;
-use crate::layout::{ExtKind, INCOMPAT_EXTENTS};
-use crate::sb;
 
-fn make_sb_bytes(magic: u16, s_log_block_size: u32, inode_size: u32,
-                  feature_incompat: u32) -> Vec<u8> {
+fn make_sb_bytes(
+    magic: u16,
+    s_log_block_size: u32,
+    inode_size: u32,
+    feature_incompat: u32,
+) -> Vec<u8> {
     let mut raw = vec![0u8; 1024];
-    raw[0..4].copy_from_slice(&100u32.to_le_bytes());     // s_inodes_count
-    raw[4..8].copy_from_slice(&2048u32.to_le_bytes());     // s_blocks_count_lo
+    raw[0..4].copy_from_slice(&100u32.to_le_bytes()); // s_inodes_count
+    raw[4..8].copy_from_slice(&2048u32.to_le_bytes()); // s_blocks_count_lo
     raw[24..28].copy_from_slice(&s_log_block_size.to_le_bytes());
-    raw[32..36].copy_from_slice(&8192u32.to_le_bytes());   // s_blocks_per_group
-    raw[40..44].copy_from_slice(&2048u32.to_le_bytes());   // s_inodes_per_group
+    raw[32..36].copy_from_slice(&8192u32.to_le_bytes()); // s_blocks_per_group
+    raw[40..44].copy_from_slice(&2048u32.to_le_bytes()); // s_inodes_per_group
     raw[56..58].copy_from_slice(&magic.to_le_bytes());
-    raw[76..80].copy_from_slice(&1u32.to_le_bytes());      // s_rev_level
+    raw[76..80].copy_from_slice(&1u32.to_le_bytes()); // s_rev_level
     raw[88..90].copy_from_slice(&(inode_size as u16).to_le_bytes());
     raw[96..100].copy_from_slice(&feature_incompat.to_le_bytes());
     if inode_size >= 256 {
@@ -28,8 +32,12 @@ fn make_sb_bytes(magic: u16, s_log_block_size: u32, inode_size: u32,
     raw
 }
 
-fn make_sb_disk(magic: u16, s_log_block_size: u32, inode_size: u32,
-                feature_incompat: u32) -> Arc<MemDisk> {
+fn make_sb_disk(
+    magic: u16,
+    s_log_block_size: u32,
+    inode_size: u32,
+    feature_incompat: u32,
+) -> Arc<MemDisk> {
     let sb = make_sb_bytes(magic, s_log_block_size, inode_size, feature_incompat);
     let sb_offset = 1024;
     let mut data = vec![0u8; sb_offset];

@@ -111,7 +111,10 @@ pub(crate) fn alloc_block(state: &FsState) -> Result<u64, BlockBackendError> {
 
 /// 批量分配最多 `want` 个连续数据块。返回 (起始物理块号, 实际分配数量)。
 /// 至少分配 1 个块，否则返回错误。
-pub(crate) fn alloc_blocks_run(state: &FsState, want: u32) -> Result<(u64, u32), BlockBackendError> {
+pub(crate) fn alloc_blocks_run(
+    state: &FsState,
+    want: u32,
+) -> Result<(u64, u32), BlockBackendError> {
     let _g = ALLOC_LOCK.lock();
     let sb = &state.ext_sb;
     let start_rel = state.block_alloc_hint.load(Ordering::Relaxed);
@@ -165,8 +168,11 @@ fn alloc_run_in_bitmap(
     state.read_block(bitmap_block, &mut bm)?;
 
     let start = start_hint.min(bits_in_group);
-    let result = find_zero_run(&bm, start, bits_in_group, want)
-        .or_else(|| (start > 0).then(|| find_zero_run(&bm, 0, start, want)).flatten());
+    let result = find_zero_run(&bm, start, bits_in_group, want).or_else(|| {
+        (start > 0)
+            .then(|| find_zero_run(&bm, 0, start, want))
+            .flatten()
+    });
     if let Some((nr, count)) = result {
         for i in 0..count {
             let bit = nr + i;

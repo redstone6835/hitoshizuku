@@ -2,8 +2,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::crc;
+use ktest::ktest;
 
 /// 空输入返回初值 0xFFFFFFFF（无字节处理，无 final XOR）。
 #[ktest]

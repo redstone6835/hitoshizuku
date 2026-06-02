@@ -676,8 +676,12 @@ impl FatTable {
             let mut probed = 0u32;
 
             while probed < self.total_clusters {
-                if c < 2 { c = 2; }
-                if c >= total_with_2 { c = 2; }
+                if c < 2 {
+                    c = 2;
+                }
+                if c >= total_with_2 {
+                    c = 2;
+                }
                 if c.saturating_add(count) > total_with_2 {
                     probed += total_with_2.saturating_sub(c);
                     c = 2;
@@ -695,7 +699,11 @@ impl FatTable {
                     let base_lba = self.first_fat_sector + sector_no;
 
                     let slot = Self::ensure_slot_present(
-                        slots, backend, self.capacity, base_lba, self.bytes_per_sector,
+                        slots,
+                        backend,
+                        self.capacity,
+                        base_lba,
+                        self.bytes_per_sector,
                     )?;
 
                     // 在同一 sector 内批量检查多个 entry
@@ -719,7 +727,9 @@ impl FatTable {
                         }
                         checked += 1;
                     }
-                    if !all_free { break; }
+                    if !all_free {
+                        break;
+                    }
                 }
 
                 if !all_free {
@@ -740,7 +750,11 @@ impl FatTable {
                     let base_lba = self.first_fat_sector + sector_no;
 
                     let slot = Self::ensure_slot_present_mut(
-                        slots, backend, self.capacity, base_lba, self.bytes_per_sector,
+                        slots,
+                        backend,
+                        self.capacity,
+                        base_lba,
+                        self.bytes_per_sector,
                     )?;
 
                     // 在同一 sector 内批量写入
@@ -766,7 +780,11 @@ impl FatTable {
                     }
                 }
 
-                let next = if c + count >= total_with_2 { 2 } else { c + count };
+                let next = if c + count >= total_with_2 {
+                    2
+                } else {
+                    c + count
+                };
                 return Ok((c, c + count - 1, next));
             }
             Err(BlockBackendError::OutOfRange)

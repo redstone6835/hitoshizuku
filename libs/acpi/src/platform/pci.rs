@@ -33,19 +33,30 @@ impl<A: Allocator> PciConfigRegions<A> {
     where
         H: Handler,
     {
-        let Some(mcfg) = tables.find_table::<Mcfg>() else { Err(AcpiError::TableNotFound(Signature::MCFG))? };
+        let Some(mcfg) = tables.find_table::<Mcfg>() else {
+            Err(AcpiError::TableNotFound(Signature::MCFG))?
+        };
         let mcfg_entries = mcfg.entries();
         let mut regions = Vec::with_capacity_in(mcfg_entries.len(), allocator);
         for entry in mcfg_entries {
             regions.push(*entry);
         }
 
-        Ok(Self { regions, _allocator: PhantomData })
+        Ok(Self {
+            regions,
+            _allocator: PhantomData,
+        })
     }
 
     /// Get the **physical** address of the start of the configuration space for a given PCIe device
     /// function. Returns `None` if there isn't an entry in the MCFG that manages that device.
-    pub fn physical_address(&self, segment_group_no: u16, bus: u8, device: u8, function: u8) -> Option<u64> {
+    pub fn physical_address(
+        &self,
+        segment_group_no: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+    ) -> Option<u64> {
         /*
          * First, find the memory region that handles this segment and bus. This method is fine
          * because there should only be one region that handles each segment group + bus

@@ -6,8 +6,8 @@
 
 extern crate std;
 
+use crate::eevdf::{DEFAULT_BASE_SLICE_NS, NICE_0_WEIGHT, SchedParams, weight_from_nice};
 use ktest::ktest;
-use crate::eevdf::{weight_from_nice, SchedParams, NICE_0_WEIGHT, DEFAULT_BASE_SLICE_NS};
 
 /// nice=-20 对应最高权重 88761。
 #[ktest]
@@ -47,20 +47,29 @@ fn default_fair_params() {
 /// SchedParams.weight() 委托 weight_from_nice，行为一致。
 #[ktest]
 fn params_weight_delegates() {
-    let p = SchedParams { nice: 5, slice_ns: 0 };
+    let p = SchedParams {
+        nice: 5,
+        slice_ns: 0,
+    };
     assert_eq!(p.weight(), weight_from_nice(5));
 }
 
 /// slice_ns 为 0 时 slice() 返回默认基准时间片。
 #[ktest]
 fn params_slice_defaults_when_zero() {
-    let p = SchedParams { nice: 0, slice_ns: 0 };
+    let p = SchedParams {
+        nice: 0,
+        slice_ns: 0,
+    };
     assert_eq!(p.slice(), DEFAULT_BASE_SLICE_NS);
 }
 
 /// slice_ns 显式设置时 slice() 返回该值。
 #[ktest]
 fn params_slice_uses_explicit() {
-    let p = SchedParams { nice: 0, slice_ns: 10_000_000 };
+    let p = SchedParams {
+        nice: 0,
+        slice_ns: 10_000_000,
+    };
     assert_eq!(p.slice(), 10_000_000);
 }

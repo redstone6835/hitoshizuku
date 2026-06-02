@@ -4,8 +4,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::fdtable::{Fd, FdFlags};
+use ktest::ktest;
 
 /// 标准流 STDIN=0, STDOUT=1, STDERR=2 与 POSIX 一致。
 #[ktest]

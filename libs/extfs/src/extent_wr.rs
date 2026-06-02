@@ -338,17 +338,27 @@ fn lookup_extent_phys(i_block: &[u8], lb: u32) -> Option<u64> {
             break;
         }
         let ee_block = u32::from_le_bytes([
-            i_block[off], i_block[off + 1], i_block[off + 2], i_block[off + 3],
+            i_block[off],
+            i_block[off + 1],
+            i_block[off + 2],
+            i_block[off + 3],
         ]);
         let ee_len = u16::from_le_bytes([i_block[off + 4], i_block[off + 5]]);
-        let real_len = if ee_len > 0x8000 { ee_len - 0x8000 } else { ee_len };
+        let real_len = if ee_len > 0x8000 {
+            ee_len - 0x8000
+        } else {
+            ee_len
+        };
         if lb >= ee_block && lb < ee_block + real_len as u32 {
             if ee_len > 0x8000 {
                 return None; // uninitialized extent
             }
             let start_hi = u16::from_le_bytes([i_block[off + 6], i_block[off + 7]]) as u64;
             let start_lo = u32::from_le_bytes([
-                i_block[off + 8], i_block[off + 9], i_block[off + 10], i_block[off + 11],
+                i_block[off + 8],
+                i_block[off + 9],
+                i_block[off + 10],
+                i_block[off + 11],
             ]) as u64;
             return Some(((start_hi << 32) | start_lo) + (lb - ee_block) as u64);
         }

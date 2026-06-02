@@ -110,6 +110,9 @@ pub enum VfsError {
     /// 当前文件系统或驱动不支持该操作（ENOSYS / EOPNOTSUPP）。
     NotSupported,
 
+    /// 文件类型不支持按偏移定位的 I/O（ESPIPE）。
+    IllegalSeek,
+
     /// 操作被信号中断（EINTR）。
     ///
     /// 调用方应当根据 `SA_RESTART` 语义决定是否重试。
@@ -152,6 +155,7 @@ impl VfsError {
             VfsError::DeviceBusy => Errno::EBUSY,
             VfsError::InvalidArgument => Errno::EINVAL,
             VfsError::NotSupported => Errno::EOPNOTSUPP,
+            VfsError::IllegalSeek => Errno::ESPIPE,
             VfsError::Interrupted => Errno::EINTR,
             VfsError::WouldBlock => Errno::EAGAIN,
             VfsError::TimedOut => Errno::ETIMEDOUT,

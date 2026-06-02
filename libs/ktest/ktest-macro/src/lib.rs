@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Attribute, ItemFn};
+use syn::{Attribute, ItemFn, parse_macro_input};
 
 /// 统一测试属性宏。
 ///
@@ -23,10 +23,7 @@ pub fn ktest(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let test_attrs: Vec<&Attribute> = input
         .attrs
         .iter()
-        .filter(|a| {
-            a.path().is_ident("should_panic")
-                || a.path().is_ident("ignore")
-        })
+        .filter(|a| a.path().is_ident("should_panic") || a.path().is_ident("ignore"))
         .collect();
 
     let output = quote! {

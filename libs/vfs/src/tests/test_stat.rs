@@ -4,8 +4,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::stat::{FileMode, FileType};
+use ktest::ktest;
 
 /// Regular 文件的模式位为 0o100000 (S_IFREG)。
 #[ktest]

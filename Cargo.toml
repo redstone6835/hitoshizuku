@@ -10,6 +10,8 @@ members = [
     "libs/mm",
     "libs/sched",
     "libs/allocator",
+    "libs/socket",
+    "libs/net",
     "libs/vfs",
     "libs/acpi",
     "libs/fatfs",

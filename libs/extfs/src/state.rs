@@ -139,11 +139,7 @@ impl BlockCache {
         }
         let end = start.saturating_add(count as u64);
         // 收集需要移除的 block 号（避免在借用 self.index 时修改它）
-        let to_remove: Vec<u64> = self
-            .index
-            .range(start..end)
-            .map(|(&b, _)| b)
-            .collect();
+        let to_remove: Vec<u64> = self.index.range(start..end).map(|(&b, _)| b).collect();
         for block in to_remove {
             if let Some(idx) = self.index.remove(&block) {
                 let slot = &mut self.slots[idx];
@@ -360,7 +356,13 @@ impl FsState {
         let mut block = start_block;
         while remaining > 0 {
             let n = remaining.min(MAX_CHUNK_BLOCKS);
-            bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, block, n, &mut out[off..off + bs * n as usize])?;
+            bgd::read_blocks(
+                self.backend.as_ref(),
+                &self.ext_sb,
+                block,
+                n,
+                &mut out[off..off + bs * n as usize],
+            )?;
             off += bs * n as usize;
             block += n as u64;
             remaining -= n;
@@ -381,7 +383,13 @@ impl FsState {
         if count == 0 {
             return Ok(());
         }
-        bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, data)?;
+        bgd::write_blocks(
+            self.backend.as_ref(),
+            &self.ext_sb,
+            start_block,
+            count,
+            data,
+        )?;
         self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
         self.block_cache.lock().invalidate_range(start_block, count);
         Ok(())

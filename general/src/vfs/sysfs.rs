@@ -526,9 +526,13 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
 pub struct SysFsDriver;
 
 impl FsDriver for SysFsDriver {
-    fn name(&self) -> &'static str { "sysfs" }
+    fn name(&self) -> &'static str {
+        "sysfs"
+    }
     fn flags(&self) -> FsDriverFlags {
-        FsDriverFlags::NODEV.with(FsDriverFlags::SINGLE).with(FsDriverFlags::RDONLY)
+        FsDriverFlags::NODEV
+            .with(FsDriverFlags::SINGLE)
+            .with(FsDriverFlags::RDONLY)
     }
 
     fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
@@ -553,7 +557,9 @@ impl FsDriver for SysFsDriver {
     }
 
     fn kill_sb(&self, _sb: Arc<Superblock>) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct SysSuperblockOps;
@@ -561,7 +567,9 @@ impl SuperblockOps for SysSuperblockOps {
     fn alloc_inode(&self, _: &Arc<Superblock>) -> VfsResult<Arc<Inode>> {
         Err(VfsError::ReadOnlyFilesystem)
     }
-    fn write_inode(&self, _: &Arc<Inode>) -> VfsResult<()> { Ok(()) }
+    fn write_inode(&self, _: &Arc<Inode>) -> VfsResult<()> {
+        Ok(())
+    }
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
         Ok(FsStat {
             fs_type: SYSFS_MAGIC,
@@ -575,15 +583,26 @@ impl SuperblockOps for SysSuperblockOps {
             name_max: sb.name_max,
         })
     }
-    fn sync_fs(&self, _: &Arc<Superblock>) -> VfsResult<()> { Ok(()) }
-    fn remount(&self, _: &Arc<Superblock>, _: MountFlags) -> VfsResult<()> { Ok(()) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn sync_fs(&self, _: &Arc<Superblock>) -> VfsResult<()> {
+        Ok(())
+    }
+    fn remount(&self, _: &Arc<Superblock>, _: MountFlags) -> VfsResult<()> {
+        Ok(())
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 // ─── File / Dir FileOps ─────────────────────────────────────
 
-struct SysDirFile { snapshot: Vec<DirEntry> }
-struct SysRegFileOps { kind: SysRegFile, snap: Arc<SysSnapshot> }
+struct SysDirFile {
+    snapshot: Vec<DirEntry>,
+}
+struct SysRegFileOps {
+    kind: SysRegFile,
+    snap: Arc<SysSnapshot>,
+}
 struct SysEmptyFile; // /sys/dev/char/.../uevent 等目前无可读内容
 
 fn feed_dir_entries(
@@ -601,8 +620,12 @@ fn feed_dir_entries(
 }
 
 impl FileOps for SysDirFile {
-    fn read_at(&self, _: &mut [u8], _: u64) -> VfsResult<usize> { Err(VfsError::IsADirectory) }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> { Err(VfsError::IsADirectory) }
+    fn read_at(&self, _: &mut [u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::IsADirectory)
+    }
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::IsADirectory)
+    }
     fn readdir(
         &self,
         pos: u64,
@@ -610,13 +633,19 @@ impl FileOps for SysDirFile {
     ) -> VfsResult<u64> {
         feed_dir_entries(&self.snapshot, pos, sink)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)
     }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl FileOps for SysRegFileOps {
@@ -625,45 +654,57 @@ impl FileOps for SysRegFileOps {
         let bytes = s.as_bytes();
         let total = bytes.len();
         let off = offset as usize;
-        if off >= total { return Ok(0); }
+        if off >= total {
+            return Ok(0);
+        }
         let n = core::cmp::min(buf.len(), total - off);
         buf[..n].copy_from_slice(&bytes[off..off + n]);
         Ok(n)
     }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> { Err(VfsError::ReadOnlyFilesystem) }
-    fn readdir(
-        &self,
-        _: u64,
-        _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)
     }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl FileOps for SysEmptyFile {
-    fn read_at(&self, _: &mut [u8], _: u64) -> VfsResult<usize> { Ok(0) }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> { Err(VfsError::ReadOnlyFilesystem) }
-    fn readdir(
-        &self,
-        _: u64,
-        _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
+    fn read_at(&self, _: &mut [u8], _: u64) -> VfsResult<usize> {
+        Ok(0)
+    }
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::ReadOnlyFilesystem)
+    }
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)
     }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 // ─── 目录/文件 InodeOps 统一工厂宏 ───────────────────────────
@@ -680,7 +721,15 @@ fn build_child_inode(
         kind,
         snap: Arc::clone(snap),
     });
-    Some(mk_inode(fs_id, weak_sb, ino, FileType::Regular, 0o444, 1, ops))
+    Some(mk_inode(
+        fs_id,
+        weak_sb,
+        ino,
+        FileType::Regular,
+        0o444,
+        1,
+        ops,
+    ))
 }
 
 fn build_dir_inode(
@@ -738,8 +787,13 @@ enum SysDirKind {
 
 // ─── InodeOps ────────────────────────────────────────────────
 
-struct SysRegInodeOps { kind: SysRegFile, snap: Arc<SysSnapshot> }
-struct SysLinkInodeOps { target: String }
+struct SysRegInodeOps {
+    kind: SysRegFile,
+    snap: Arc<SysSnapshot>,
+}
+struct SysLinkInodeOps {
+    target: String,
+}
 struct SysDirInodeOps {
     kind: SysDirKind,
     fs_id: FsId,
@@ -748,7 +802,9 @@ struct SysDirInodeOps {
 }
 
 impl InodeOps for SysRegInodeOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
     fn open(
         &self,
         _: &Inode,
@@ -758,14 +814,23 @@ impl InodeOps for SysRegInodeOps {
         if matches!(self.kind, SysRegFile::UeventPlaceholder) {
             return Ok(Box::new(SysEmptyFile));
         }
-        Ok(Box::new(SysRegFileOps { kind: self.kind, snap: Arc::clone(&self.snap) }))
+        Ok(Box::new(SysRegFileOps {
+            kind: self.kind,
+            snap: Arc::clone(&self.snap),
+        }))
     }
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl InodeOps for SysLinkInodeOps {
-    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> { Err(VfsError::NotADirectory) }
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
     fn open(
         &self,
         _: &Inode,
@@ -774,8 +839,12 @@ impl InodeOps for SysLinkInodeOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Err(VfsError::NotFound)
     }
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Ok(self.target.clone()) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Ok(self.target.clone())
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 impl InodeOps for SysDirInodeOps {
@@ -788,10 +857,16 @@ impl InodeOps for SysDirInodeOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        Ok(Box::new(SysDirFile { snapshot: self.readdir_entries() }))
+        Ok(Box::new(SysDirFile {
+            snapshot: self.readdir_entries(),
+        }))
     }
-    fn readlink(&self, _: &Inode) -> VfsResult<String> { Err(VfsError::InvalidArgument) }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 impl SysDirInodeOps {
     fn lookup_child(&self, name: &str) -> VfsResult<Arc<Inode>> {
@@ -799,8 +874,7 @@ impl SysDirInodeOps {
         let weak_sb = &self.weak_sb;
         let snap = &self.snap;
         let mk_reg = |ino: u64, kind: SysRegFile| -> VfsResult<Arc<Inode>> {
-            build_child_inode(fs_id, weak_sb, snap, ino, kind)
-                .ok_or(VfsError::OutOfMemory)
+            build_child_inode(fs_id, weak_sb, snap, ino, kind).ok_or(VfsError::OutOfMemory)
         };
         let mk_dir = |ino: u64, k: SysDirKind| -> Arc<Inode> {
             build_dir_inode(fs_id, weak_sb, snap, ino, k)
@@ -824,7 +898,10 @@ impl SysDirInodeOps {
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::Block => {
-                let idx = snap.blocks.iter().position(|b| b.sysfs_name == name)
+                let idx = snap
+                    .blocks
+                    .iter()
+                    .position(|b| b.sysfs_name == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(block_dev_ino(idx), SysDirKind::BlockDev { idx }))
             }
@@ -848,12 +925,20 @@ impl SysDirInodeOps {
                 if let Some(ci) = snap.chars.iter().position(|c| c.sysfs_name == name) {
                     Ok(mk_dir(device_ino(ci), SysDirKind::Device { idx: ci }))
                 } else if let Some(bi) = snap.blocks.iter().position(|b| b.sysfs_name == name) {
-                    Ok(mk_dir(device_ino(total_chars + bi), SysDirKind::Device { idx: total_chars + bi }))
+                    Ok(mk_dir(
+                        device_ino(total_chars + bi),
+                        SysDirKind::Device {
+                            idx: total_chars + bi,
+                        },
+                    ))
                 } else if name == "system" {
                     Ok(mk_dir(DEVICES_SYSTEM_INO, SysDirKind::DevicesSystem))
                 } else if name == "virtual" {
                     // TODO: 实现 /sys/devices/virtual/ 目录（包含 tty, mem, misc 等虚拟设备子目录）
-                    Ok(mk_dir(DEVICES_VIRTUAL_INO, SysDirKind::Firmware /* 复用空目录实现 */))
+                    Ok(mk_dir(
+                        DEVICES_VIRTUAL_INO,
+                        SysDirKind::Firmware, /* 复用空目录实现 */
+                    ))
                 } else {
                     Err(VfsError::NotFound)
                 }
@@ -866,7 +951,11 @@ impl SysDirInodeOps {
                     Ok(mk_dir(ino, SysDirKind::Module))
                 } else if matches!(slot, DeviceSlot::Subsystem) {
                     // 子系统链接：直接指向 /sys/<bus|class|...>
-                    let target = if idx < snap.chars.len() { "..".to_string() } else { "..".to_string() };
+                    let target = if idx < snap.chars.len() {
+                        "..".to_string()
+                    } else {
+                        "..".to_string()
+                    };
                     Ok(mk_link(ino, target))
                 } else {
                     mk_reg(ino, SysRegFile::Device { idx, slot })
@@ -878,22 +967,35 @@ impl SysDirInodeOps {
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::DevBlock => {
-                let idx = snap.blocks.iter().position(|b| b.sysfs_name == name)
+                let idx = snap
+                    .blocks
+                    .iter()
+                    .position(|b| b.sysfs_name == name)
                     .ok_or(VfsError::NotFound)?;
-                Ok(mk_link(dev_block_link_ino(idx), format!("../../block/{}", snap.blocks[idx].sysfs_name)))
+                Ok(mk_link(
+                    dev_block_link_ino(idx),
+                    format!("../../block/{}", snap.blocks[idx].sysfs_name),
+                ))
             }
             SysDirKind::DevChar => {
-                let idx = snap.chars.iter().position(|c| c.sysfs_name == name)
+                let idx = snap
+                    .chars
+                    .iter()
+                    .position(|c| c.sysfs_name == name)
                     .ok_or(VfsError::NotFound)?;
-                Ok(mk_dir(dev_char_dir_ino(idx), SysDirKind::DevCharInner { idx }))
+                Ok(mk_dir(
+                    dev_char_dir_ino(idx),
+                    SysDirKind::DevCharInner { idx },
+                ))
             }
             SysDirKind::DevCharInner { idx } => {
                 let slot = dev_char_inner_slot_by_name(name).ok_or(VfsError::NotFound)?;
                 let ino = dev_char_inner_ino(idx, slot.to_u64());
                 match slot {
-                    DevCharInnerSlot::DeviceLink => {
-                        Ok(mk_link(ino, format!("../../devices/{}", snap.chars[idx].sysfs_name)))
-                    }
+                    DevCharInnerSlot::DeviceLink => Ok(mk_link(
+                        ino,
+                        format!("../../devices/{}", snap.chars[idx].sysfs_name),
+                    )),
                     DevCharInnerSlot::SubsystemLink => Ok(mk_link(ino, "../../class".into())),
                     _ => mk_reg(ino, SysRegFile::DevCharInner { idx, slot }),
                 }
@@ -919,8 +1021,11 @@ impl SysDirInodeOps {
             //   Module: 已加载内核模块列表
             //   Power: 电源管理状态和控制
             //   Firmware: 固件相关（ACPI, DMI 等）
-            SysDirKind::Bus | SysDirKind::Class | SysDirKind::Module |
-            SysDirKind::Power | SysDirKind::Firmware => Err(VfsError::NotFound),
+            SysDirKind::Bus
+            | SysDirKind::Class
+            | SysDirKind::Module
+            | SysDirKind::Power
+            | SysDirKind::Firmware => Err(VfsError::NotFound),
             SysDirKind::DevicesSystem => match name {
                 "cpu" => Ok(mk_dir(DEVICES_SYSTEM_CPU_INO, SysDirKind::DevicesSystemCpu)),
                 _ => Err(VfsError::NotFound),
@@ -935,22 +1040,41 @@ impl SysDirInodeOps {
                 } else if let Some(rest) = name.strip_prefix("cpu") {
                     let cpu_id: usize = rest.parse().map_err(|_| VfsError::NotFound)?;
                     let mask = online_cpu_mask();
-                    if mask & (1u64 << cpu_id) == 0 { return Err(VfsError::NotFound); }
+                    if mask & (1u64 << cpu_id) == 0 {
+                        return Err(VfsError::NotFound);
+                    }
                     Ok(mk_dir(cpu_ino(cpu_id), SysDirKind::Cpu { cpu_id }))
                 } else {
                     Err(VfsError::NotFound)
                 }
             }
             SysDirKind::Cpu { cpu_id } => match name {
-                "online" => mk_reg(cpu_slot_ino(cpu_id, CpuSlot::Online.to_u64()),
-                                  SysRegFile::Cpu { cpu_id, slot: CpuSlot::Online }),
-                "possible" => mk_reg(cpu_slot_ino(cpu_id, CpuSlot::Possible.to_u64()),
-                                     SysRegFile::Cpu { cpu_id, slot: CpuSlot::Possible }),
-                "present" => mk_reg(cpu_slot_ino(cpu_id, CpuSlot::Present.to_u64()),
-                                    SysRegFile::Cpu { cpu_id, slot: CpuSlot::Present }),
-                "topology" => Ok(mk_dir(cpu_slot_ino(cpu_id, CpuSlot::TopoDir.to_u64()),
-                                        // TODO: 实现 CPU topology 目录（core_id, physical_package_id 等）
-                                        SysDirKind::Module /* 复用空目录 */)),
+                "online" => mk_reg(
+                    cpu_slot_ino(cpu_id, CpuSlot::Online.to_u64()),
+                    SysRegFile::Cpu {
+                        cpu_id,
+                        slot: CpuSlot::Online,
+                    },
+                ),
+                "possible" => mk_reg(
+                    cpu_slot_ino(cpu_id, CpuSlot::Possible.to_u64()),
+                    SysRegFile::Cpu {
+                        cpu_id,
+                        slot: CpuSlot::Possible,
+                    },
+                ),
+                "present" => mk_reg(
+                    cpu_slot_ino(cpu_id, CpuSlot::Present.to_u64()),
+                    SysRegFile::Cpu {
+                        cpu_id,
+                        slot: CpuSlot::Present,
+                    },
+                ),
+                "topology" => Ok(mk_dir(
+                    cpu_slot_ino(cpu_id, CpuSlot::TopoDir.to_u64()),
+                    // TODO: 实现 CPU topology 目录（core_id, physical_package_id 等）
+                    SysDirKind::Module, /* 复用空目录 */
+                )),
                 _ => Err(VfsError::NotFound),
             },
         }
@@ -978,62 +1102,183 @@ impl SysDirInodeOps {
                 mk_dir_entry(POWER_DIR_INO, "power", FileType::Directory),
                 mk_dir_entry(FIRMWARE_DIR_INO, "firmware", FileType::Directory),
             ],
-            SysDirKind::Block => snap.blocks.iter().enumerate()
+            SysDirKind::Block => snap
+                .blocks
+                .iter()
+                .enumerate()
                 .map(|(i, b)| mk_dir_entry(block_dev_ino(i), &b.sysfs_name, FileType::Directory))
                 .collect(),
             SysDirKind::BlockDev { idx } => vec![
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Size.to_u64()), "size", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Ro.to_u64()), "ro", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Removable.to_u64()), "removable", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Dev.to_u64()), "dev", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Range.to_u64()), "range", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::QueueDir.to_u64()), "queue", FileType::Directory),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Holders.to_u64()), "holders", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Stat.to_u64()), "stat", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Inflight.to_u64()), "inflight", FileType::Regular),
-                mk_dir_entry(block_dev_slot_ino(idx, BlockDevSlot::Periodic.to_u64()), "periodic", FileType::Regular),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Size.to_u64()),
+                    "size",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Ro.to_u64()),
+                    "ro",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Removable.to_u64()),
+                    "removable",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Dev.to_u64()),
+                    "dev",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Range.to_u64()),
+                    "range",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::QueueDir.to_u64()),
+                    "queue",
+                    FileType::Directory,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Holders.to_u64()),
+                    "holders",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Stat.to_u64()),
+                    "stat",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Inflight.to_u64()),
+                    "inflight",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_dev_slot_ino(idx, BlockDevSlot::Periodic.to_u64()),
+                    "periodic",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::BlockQueue { idx } => vec![
-                mk_dir_entry(block_queue_slot_ino(idx, BlockQueueSlot::Lbs.to_u64()), "logical_block_size", FileType::Regular),
-                mk_dir_entry(block_queue_slot_ino(idx, BlockQueueSlot::Pbs.to_u64()), "physical_block_size", FileType::Regular),
-                mk_dir_entry(block_queue_slot_ino(idx, BlockQueueSlot::Rotational.to_u64()), "rotational", FileType::Regular),
-                mk_dir_entry(block_queue_slot_ino(idx, BlockQueueSlot::NrRequests.to_u64()), "nr_requests", FileType::Regular),
-                mk_dir_entry(block_queue_slot_ino(idx, BlockQueueSlot::HwSectorSize.to_u64()), "hw_sector_size", FileType::Regular),
-                mk_dir_entry(block_queue_slot_ino(idx, BlockQueueSlot::DiscardZeroes.to_u64()), "discard_zeroes_data", FileType::Regular),
+                mk_dir_entry(
+                    block_queue_slot_ino(idx, BlockQueueSlot::Lbs.to_u64()),
+                    "logical_block_size",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_queue_slot_ino(idx, BlockQueueSlot::Pbs.to_u64()),
+                    "physical_block_size",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_queue_slot_ino(idx, BlockQueueSlot::Rotational.to_u64()),
+                    "rotational",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_queue_slot_ino(idx, BlockQueueSlot::NrRequests.to_u64()),
+                    "nr_requests",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_queue_slot_ino(idx, BlockQueueSlot::HwSectorSize.to_u64()),
+                    "hw_sector_size",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    block_queue_slot_ino(idx, BlockQueueSlot::DiscardZeroes.to_u64()),
+                    "discard_zeroes_data",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::Devices => {
-                let mut v: Vec<DirEntry> = snap.chars.iter().enumerate()
+                let mut v: Vec<DirEntry> = snap
+                    .chars
+                    .iter()
+                    .enumerate()
                     .map(|(i, c)| mk_dir_entry(device_ino(i), &c.sysfs_name, FileType::Directory))
                     .collect();
                 let total = snap.chars.len();
-                v.extend(snap.blocks.iter().enumerate()
-                    .map(|(i, b)| mk_dir_entry(device_ino(total + i), &b.sysfs_name, FileType::Directory)));
-                v.push(mk_dir_entry(DEVICES_SYSTEM_INO, "system", FileType::Directory));
-                v.push(mk_dir_entry(DEVICES_VIRTUAL_INO, "virtual", FileType::Directory));
+                v.extend(snap.blocks.iter().enumerate().map(|(i, b)| {
+                    mk_dir_entry(device_ino(total + i), &b.sysfs_name, FileType::Directory)
+                }));
+                v.push(mk_dir_entry(
+                    DEVICES_SYSTEM_INO,
+                    "system",
+                    FileType::Directory,
+                ));
+                v.push(mk_dir_entry(
+                    DEVICES_VIRTUAL_INO,
+                    "virtual",
+                    FileType::Directory,
+                ));
                 v
             }
             SysDirKind::Device { idx } => vec![
-                mk_dir_entry(device_slot_ino(idx, DeviceSlot::Name.to_u64()), "name", FileType::Regular),
-                mk_dir_entry(device_slot_ino(idx, DeviceSlot::Dev.to_u64()), "dev", FileType::Regular),
-                mk_dir_entry(device_slot_ino(idx, DeviceSlot::Driver.to_u64()), "driver", FileType::Symlink),
-                mk_dir_entry(device_slot_ino(idx, DeviceSlot::Subsystem.to_u64()), "subsystem", FileType::Symlink),
-                mk_dir_entry(device_slot_ino(idx, DeviceSlot::PwrDir.to_u64()), "power", FileType::Directory),
+                mk_dir_entry(
+                    device_slot_ino(idx, DeviceSlot::Name.to_u64()),
+                    "name",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    device_slot_ino(idx, DeviceSlot::Dev.to_u64()),
+                    "dev",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    device_slot_ino(idx, DeviceSlot::Driver.to_u64()),
+                    "driver",
+                    FileType::Symlink,
+                ),
+                mk_dir_entry(
+                    device_slot_ino(idx, DeviceSlot::Subsystem.to_u64()),
+                    "subsystem",
+                    FileType::Symlink,
+                ),
+                mk_dir_entry(
+                    device_slot_ino(idx, DeviceSlot::PwrDir.to_u64()),
+                    "power",
+                    FileType::Directory,
+                ),
             ],
             SysDirKind::Dev => vec![
                 mk_dir_entry(DEV_BLOCK_DIR_INO, "block", FileType::Directory),
                 mk_dir_entry(DEV_CHAR_DIR_INO, "char", FileType::Directory),
             ],
-            SysDirKind::DevBlock => snap.blocks.iter().enumerate()
+            SysDirKind::DevBlock => snap
+                .blocks
+                .iter()
+                .enumerate()
                 .map(|(i, b)| mk_dir_entry(dev_block_link_ino(i), &b.sysfs_name, FileType::Symlink))
                 .collect(),
-            SysDirKind::DevChar => snap.chars.iter().enumerate()
+            SysDirKind::DevChar => snap
+                .chars
+                .iter()
+                .enumerate()
                 .map(|(i, c)| mk_dir_entry(dev_char_dir_ino(i), &c.sysfs_name, FileType::Directory))
                 .collect(),
             SysDirKind::DevCharInner { idx } => vec![
-                mk_dir_entry(dev_char_inner_ino(idx, DevCharInnerSlot::Dev.to_u64()), "dev", FileType::Regular),
-                mk_dir_entry(dev_char_inner_ino(idx, DevCharInnerSlot::DeviceLink.to_u64()), "device", FileType::Symlink),
-                mk_dir_entry(dev_char_inner_ino(idx, DevCharInnerSlot::SubsystemLink.to_u64()), "subsystem", FileType::Symlink),
-                mk_dir_entry(dev_char_inner_ino(idx, DevCharInnerSlot::Uevent.to_u64()), "uevent", FileType::Regular),
+                mk_dir_entry(
+                    dev_char_inner_ino(idx, DevCharInnerSlot::Dev.to_u64()),
+                    "dev",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    dev_char_inner_ino(idx, DevCharInnerSlot::DeviceLink.to_u64()),
+                    "device",
+                    FileType::Symlink,
+                ),
+                mk_dir_entry(
+                    dev_char_inner_ino(idx, DevCharInnerSlot::SubsystemLink.to_u64()),
+                    "subsystem",
+                    FileType::Symlink,
+                ),
+                mk_dir_entry(
+                    dev_char_inner_ino(idx, DevCharInnerSlot::Uevent.to_u64()),
+                    "uevent",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::Kernel => vec![
                 mk_dir_entry(KERNEL_HOSTNAME_INO, "hostname", FileType::Regular),
@@ -1042,34 +1287,61 @@ impl SysDirInodeOps {
                 mk_dir_entry(KERNEL_VERSION_INO, "version", FileType::Regular),
                 mk_dir_entry(KERNEL_CMDLINE_INO, "cmdline", FileType::Regular),
             ],
-            SysDirKind::Fs => vec![
-                mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory),
-            ],
+            SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
-            SysDirKind::Bus | SysDirKind::Class | SysDirKind::Module |
-            SysDirKind::Power | SysDirKind::Firmware => Vec::new(),
-            SysDirKind::DevicesSystem => vec![
-                mk_dir_entry(DEVICES_SYSTEM_CPU_INO, "cpu", FileType::Directory),
-            ],
+            SysDirKind::Bus
+            | SysDirKind::Class
+            | SysDirKind::Module
+            | SysDirKind::Power
+            | SysDirKind::Firmware => Vec::new(),
+            SysDirKind::DevicesSystem => vec![mk_dir_entry(
+                DEVICES_SYSTEM_CPU_INO,
+                "cpu",
+                FileType::Directory,
+            )],
             SysDirKind::DevicesSystemCpu => {
                 let mask = online_cpu_mask();
                 let mut v = vec![
                     mk_dir_entry(DEVICES_SYSTEM_CPU_ONLINE_INO, "online", FileType::Regular),
-                    mk_dir_entry(DEVICES_SYSTEM_CPU_POSSIBLE_INO, "possible", FileType::Regular),
+                    mk_dir_entry(
+                        DEVICES_SYSTEM_CPU_POSSIBLE_INO,
+                        "possible",
+                        FileType::Regular,
+                    ),
                     mk_dir_entry(DEVICES_SYSTEM_CPU_PRESENT_INO, "present", FileType::Regular),
                 ];
                 for cpu in 0..64 {
                     if mask & (1u64 << cpu) != 0 {
-                        v.push(mk_dir_entry(cpu_ino(cpu), &format!("cpu{}", cpu), FileType::Directory));
+                        v.push(mk_dir_entry(
+                            cpu_ino(cpu),
+                            &format!("cpu{}", cpu),
+                            FileType::Directory,
+                        ));
                     }
                 }
                 v
             }
             SysDirKind::Cpu { cpu_id } => vec![
-                mk_dir_entry(cpu_slot_ino(cpu_id, CpuSlot::Online.to_u64()), "online", FileType::Regular),
-                mk_dir_entry(cpu_slot_ino(cpu_id, CpuSlot::Possible.to_u64()), "possible", FileType::Regular),
-                mk_dir_entry(cpu_slot_ino(cpu_id, CpuSlot::Present.to_u64()), "present", FileType::Regular),
-                mk_dir_entry(cpu_slot_ino(cpu_id, CpuSlot::TopoDir.to_u64()), "topology", FileType::Directory),
+                mk_dir_entry(
+                    cpu_slot_ino(cpu_id, CpuSlot::Online.to_u64()),
+                    "online",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    cpu_slot_ino(cpu_id, CpuSlot::Possible.to_u64()),
+                    "possible",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    cpu_slot_ino(cpu_id, CpuSlot::Present.to_u64()),
+                    "present",
+                    FileType::Regular,
+                ),
+                mk_dir_entry(
+                    cpu_slot_ino(cpu_id, CpuSlot::TopoDir.to_u64()),
+                    "topology",
+                    FileType::Directory,
+                ),
             ],
         }
     }
@@ -1127,11 +1399,7 @@ fn dev_char_inner_slot_by_name(name: &str) -> Option<DevCharInnerSlot> {
 
 // ─── 根 inode 工厂 ───────────────────────────────────────────
 
-fn build_root_inode(
-    fs_id: FsId,
-    weak_sb: &Weak<Superblock>,
-    snap: Arc<SysSnapshot>,
-) -> Arc<Inode> {
+fn build_root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, snap: Arc<SysSnapshot>) -> Arc<Inode> {
     let ops: Arc<dyn InodeOps + Send + Sync> = Arc::new(SysDirInodeOps {
         kind: SysDirKind::Root,
         fs_id,
@@ -1139,7 +1407,10 @@ fn build_root_inode(
         snap,
     });
     Inode::new(
-        InodeId { fs_id, ino: ROOT_INO },
+        InodeId {
+            fs_id,
+            ino: ROOT_INO,
+        },
         FileType::Directory,
         DevId::new(0, 0),
         4096,
@@ -1152,4 +1423,6 @@ fn build_root_inode(
 
 // 显式标注 arc 克隆以保留弱引用别名检查
 #[allow(dead_code)]
-fn _arc_clone<T>(a: &Arc<T>) -> Arc<T> { Arc::clone(a) }
+fn _arc_clone<T>(a: &Arc<T>) -> Arc<T> {
+    Arc::clone(a)
+}

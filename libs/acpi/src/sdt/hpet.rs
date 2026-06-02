@@ -36,7 +36,9 @@ impl HpetInfo {
     where
         H: Handler,
     {
-        let Some(hpet) = tables.find_table::<HpetTable>() else { Err(AcpiError::TableNotFound(Signature::HPET))? };
+        let Some(hpet) = tables.find_table::<HpetTable>() else {
+            Err(AcpiError::TableNotFound(Signature::HPET))?
+        };
 
         if hpet.base_address.address_space != 0 {
             warn!("HPET reported as not in system memory; tables invalid?");

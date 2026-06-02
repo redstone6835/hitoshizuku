@@ -11,7 +11,10 @@ pub struct KtestReport {
 
 #[cfg(not(feature = "kernel"))]
 pub fn run_all() -> KtestReport {
-    KtestReport { total: 0, passed: 0 }
+    KtestReport {
+        total: 0,
+        passed: 0,
+    }
 }
 
 #[cfg(not(feature = "kernel"))]
@@ -72,5 +75,8 @@ pub fn run_all() -> KtestReport {
         tap_write(ok_line.as_bytes());
     }
 
-    KtestReport { total: count, passed }
+    KtestReport {
+        total: count,
+        passed,
+    }
 }
