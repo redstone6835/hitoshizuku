@@ -45,6 +45,7 @@ use general::vfs::stat::FileMode;
 use general::{StartContext, StartFirmware};
 use log::{LogRecord, LogSink, printk};
 
+use crate::dtb::ensure_dir;
 use crate::start;
 
 const ACPI_MADT_TYPE_LOCAL_APIC: u8 = 0;
@@ -430,6 +431,9 @@ pub fn kernel_start_init(context: &StartContext) {
     FS_REGISTRY
         .register(Box::leak(Box::new(general::vfs::ProcFsDriver)))
         .expect("[kernel-start][acpi] failed to register procfs driver");
+    FS_REGISTRY
+        .register(Box::leak(Box::new(general::vfs::SysFsDriver)))
+        .expect("[kernel-start][acpi] failed to register sysfs driver");
     general::vfs::register_block_filesystems();
 
     let root_sb = FS_REGISTRY
@@ -536,6 +540,24 @@ pub fn kernel_start_init(context: &StartContext) {
         Arc::clone(&mount_ns),
         Arc::new(cred.clone()),
     );
+
+    ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
+        .expect("[kernel-start][acpi] failed to ensure /sys directory");
+    let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
+        .expect("[kernel-start][acpi] failed to resolve /sys")
+        .dentry;
+    let sys_sb = FS_REGISTRY
+        .find("sysfs")
+        .expect("[kernel-start][acpi] sysfs driver not found")
+        .mount(None, "")
+        .expect("[kernel-start][acpi] failed to mount sysfs");
+    mount_ns
+        .mount(
+            Arc::clone(&sys_dentry),
+            Arc::clone(&sys_sb),
+            MountFlags::default(),
+        )
+        .expect("[kernel-start][acpi] failed to mount sysfs on /sys");
 
     let console_registered = {
         let cmdline_dev = cmdline

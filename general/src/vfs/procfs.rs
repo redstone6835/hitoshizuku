@@ -1266,6 +1266,8 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let num_threads = task_thread_count(task);
     let (vsize, rss_bytes) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
+    // TODO: 填充真实的 tty_nr, minflt, cminflt, majflt, cmajflt, utime, stime,
+    //       cutime, cstime, priority, nice, starttime, signal, blocked, sigignore, sigcatch 等字段
     format!(
         "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid,
@@ -1407,7 +1409,7 @@ fn render_version() -> String {
     format!("MyGo kernel version 0.1.0 (loongarch64)\n")
 }
 
-// todo: CPU info
+// TODO: 从硬件读取真实 CPU 特征标志、BogoMIPS、cache 信息等
 fn render_cpuinfo() -> String {
     let mut out = String::new();
     let mut online_mask = sched::online_cpu_mask();
@@ -1474,17 +1476,17 @@ fn render_meminfo() -> String {
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(overview.free_physical),
-        0usize,
-        0usize,
-        0usize,
-        kb(overview.kernel_heap_used),
-        0usize,
-        0usize,
+        0usize, // TODO: 实现 Buffers（块设备缓冲区统计）
+        0usize, // TODO: 实现 Cached（页缓存统计）
+        0usize, // TODO: 实现 SwapCached
+        kb(overview.kernel_heap_used), // Slab: 暂用 kernel heap 近似
+        0usize, // TODO: 实现 KernelStack（内核栈统计）
+        0usize, // TODO: 实现 PageTables（页表统计）
         kb(overview.kernel_vmem_total),
         kb(overview.kernel_vmem_allocated),
         kb(overview.kernel_vmem_free),
-        0usize,
-        0usize,
+        0usize, // TODO: 实现 SwapTotal
+        0usize, // TODO: 实现 SwapFree
         kb(overview.direct_map_total),
         kb(overview.direct_map_allocated),
         kb(overview.direct_map_free),
@@ -1498,6 +1500,7 @@ fn render_meminfo() -> String {
 fn render_uptime() -> String {
     let ns = sched::now_ns_public();
     let secs = ns / 1_000_000_000;
+    // TODO: 第二个字段是 idle 时间，需要从调度器读取累计 idle 累积值
     format!(
         "{}.{:02} {}.{:02}\n",
         secs,
@@ -1526,6 +1529,8 @@ fn render_stat() -> String {
             }
         }
     }
+    // TODO: 实现 cpu jiffies 统计（user/nice/system/idle/iowait/irq/softirq/steal/guest/guest_nice）
+    //       以及 intr、ctxt、btime；当前所有字段为 0
     format!(
         "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n\
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
@@ -1536,6 +1541,7 @@ fn render_stat() -> String {
 }
 
 fn render_devices() -> String {
+    // TODO: 当前所有 char/block 设备硬编码 major=254，需要从设备注册表中读取真实主设备号
     let mut out = String::from("Character devices:\n");
     for dev in crate::dev::enumerate::DEVICES.char_devs.iter() {
         out.push_str(&format!("  254 {}\n", dev.fw_name()));

@@ -41,7 +41,7 @@ impl From<vfs::error::VfsError> for InitramfsError {
 
 #[cfg(feature = "embedded-initramfs")]
 pub fn embedded_image() -> Option<InitramfsImage> {
-    let bytes = include_bytes!("../../build/initramfs-la.cpio");
+    let bytes = include_bytes!("../../build/initramfs.cpio");
     (!bytes.is_empty()).then_some(InitramfsImage {
         bytes,
         source: InitramfsSource::Embedded,
