@@ -353,13 +353,19 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        if count == 0 {
-            return Ok(());
+        // 分批读取，每批不超过 MAX_CHUNK_BLOCKS，避免超出 VirtIO 队列限制
+        const MAX_CHUNK_BLOCKS: u32 = 128; // 128×4KB=512KB，VirtIO 256 descriptor 安全范围内
+        let mut off = 0usize;
+        let mut remaining = count;
+        let mut block = start_block;
+        while remaining > 0 {
+            let n = remaining.min(MAX_CHUNK_BLOCKS);
+            bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, block, n, &mut out[off..off + bs * n as usize])?;
+            off += bs * n as usize;
+            block += n as u64;
+            remaining -= n;
         }
-        if count == 1 {
-            return self.read_block(start_block, out);
-        }
-        bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, out)
+        Ok(())
     }
 
     pub(crate) fn write_blocks(

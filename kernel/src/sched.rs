@@ -342,13 +342,17 @@ fn process_clone_user_context(
         write_user_usize(args.parent_tid, child_tid)?;
     }
     if args.flags.has(CloneFlags::CLONE_CHILD_SETTID) && args.child_tid != 0 {
-        let parent_vm = task_vm_space(parent);
-        if let Some(child_vm) = task_vm_space(child) {
-            child_vm.activate();
+        // CLONE_VM 时父子共享同一 VmSpace，无需切换页表
+        if !args.flags.has(CloneFlags::CLONE_VM) {
+            if let Some(ref vm) = task_vm_space(child) {
+                vm.activate();
+            }
         }
         let result = write_user_usize(args.child_tid, child_tid);
-        if let Some(vm) = parent_vm {
-            vm.activate();
+        if !args.flags.has(CloneFlags::CLONE_VM) {
+            if let Some(ref vm) = task_vm_space(parent) {
+                vm.activate();
+            }
         }
         result?;
     }

@@ -174,6 +174,7 @@ pub(super) fn sys_reboot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
         LINUX_REBOOT_CMD_HALT => {
             log::emergency!("[syscall][reboot] halt requested");
+            power::shutdown().map_err(map_power_error)?;
             halt_after_power_request()
         }
         LINUX_REBOOT_CMD_POWER_OFF => {

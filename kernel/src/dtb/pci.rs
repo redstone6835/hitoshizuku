@@ -3,10 +3,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use general::dev::pci::{PciConfigAccess, PciDevice, pci_scan_raw, set_pci_config_access};
-use general::dtb::DtbNode;
-
-const DTB_COMPAT_PCI_ECAM: &[u8] = b"pci-host-ecam-generic";
-const DTB_COMPAT_PCIE_ECAM: &[u8] = b"pcie-host-ecam-generic";
 
 /// ECAM 全局状态:base(虚拟地址)+ 总线范围。
 ///
@@ -72,66 +68,6 @@ fn ecam_write_u32(_seg: u16, bus: u8, dev: u8, func: u8, offset: u16, v: u32) {
     }
 }
 
-/// 扫描 DTB 根找 `pci-host-ecam-generic`(或 `pcie-host-ecam-generic`),解析
-/// 出 ECAM 的物理基址/大小与 bus-range。
-///
-/// 成功时返回 `Some((phys_base, size, bus_start, bus_end))`;DTB 里没有
-/// pcie 节点时返回 `None`。
-pub(crate) fn parse_pcie_node(dtb: general::dtb::Dtb<'static>) -> Option<(u64, u64, u8, u8)> {
-    let root = dtb.root()?;
-    walk_for_pcie(root)
-}
-
-fn walk_for_pcie(node: DtbNode<'static>) -> Option<(u64, u64, u8, u8)> {
-    if node_compatible_is(node, DTB_COMPAT_PCI_ECAM)
-        || node_compatible_is(node, DTB_COMPAT_PCIE_ECAM)
-    {
-        let reg = node.find_property("reg")?;
-        let (base, size) = parse_two_cells_reg(reg.value())?;
-        let (bstart, bend) = match node.find_property("bus-range") {
-            Some(p) => {
-                let v = p.value();
-                if v.len() < 8 {
-                    (0u8, 0xffu8)
-                } else {
-                    let s = u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as u8;
-                    let e = u32::from_be_bytes([v[4], v[5], v[6], v[7]]) as u8;
-                    (s, e)
-                }
-            }
-            None => (0u8, 0xffu8),
-        };
-        return Some((base, size, bstart, bend));
-    }
-    for child in node.children() {
-        if let Some(r) = walk_for_pcie(child) {
-            return Some(r);
-        }
-    }
-    None
-}
-
-fn node_compatible_is(node: DtbNode<'static>, needle: &[u8]) -> bool {
-    let Some(prop) = node.find_property("compatible") else {
-        return false;
-    };
-    prop.value().split(|&b| b == 0).any(|entry| entry == needle)
-}
-
-fn parse_two_cells_reg(reg: &[u8]) -> Option<(u64, u64)> {
-    if reg.len() >= 16 {
-        let base = u64::from_be_bytes(reg[0..8].try_into().ok()?);
-        let size = u64::from_be_bytes(reg[8..16].try_into().ok()?);
-        Some((base, size))
-    } else if reg.len() >= 8 {
-        let base = u32::from_be_bytes(reg[0..4].try_into().ok()?) as u64;
-        let size = u32::from_be_bytes(reg[4..8].try_into().ok()?) as u64;
-        Some((base, size))
-    } else {
-        None
-    }
-}
-
 // ECAM config access 转发的 device_mmio_to_virt —— 装载时由启动上下文传入,
 // 用于把 BAR 物理地址转成当前平台可访问的内核虚拟地址。
 // 默认 identity(装载前不会被用到,只是为了让类型检查通过)。
@@ -178,10 +114,10 @@ pub(crate) fn install_ecam(
     true
 }
 
-// ── BAR 资源分配 ────────────────────────────────────────────────────────
-//
-// 直接 `-kernel` 引导下没有 UEFI/SeaBIOS,PCI BAR 基址都是 0。本模块用一个
-// 简单的 bump allocator 按顺序切片 PCI MMIO 窗口给每个设备的每个 BAR。
+// 这一段处理直接 `-kernel` 启动时常见的 PCI BAR 未预分配问题。由于缺少
+// UEFI 或 SeaBIOS 之类的前置固件，很多设备在进入内核时 BAR 仍然保持为 0，
+// 所以这里使用一个简单的顺序分配器，从平台提供的 PCI MMIO 窗口中依次切分
+// 地址空间，为每个需要 MMIO BAR 的设备补上可用映射。
 //
 /// 扫一遍 PCI 总线并给每个 MMIO BAR 分配一段物理地址。必须在
 /// [`install_ecam`] 之后、`pci_scan_and_register` 之前调用。
