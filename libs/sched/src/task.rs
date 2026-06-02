@@ -86,9 +86,8 @@ impl TaskState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
 
-/// 默认内核栈大小：16 KiB。足够走完 trap → syscall → 浅层函数链。需要时上层
-/// 可以给长栈深的内核线程显式指定更大的 [`KernelStack::with_size`]。
-pub const DEFAULT_KERNEL_STACK_SIZE: usize = 16 * 1024;
+/// 默认内核栈大小：64 KiB。fork 等深层调用需要足够空间，避免栈溢出损坏堆。
+pub const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
 /// 内核栈对齐：16 字节，匹配所有现用 ISA 的 ABI 栈对齐要求。
 pub const KERNEL_STACK_ALIGN: usize = 16;
 
