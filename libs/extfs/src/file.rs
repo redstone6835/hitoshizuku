@@ -502,7 +502,6 @@ impl FileOps for ExtRegFileOps {
                             self.state
                                 .write_block(cur_phys, &cur_blk_buf)
                                 .map_err(map_err)?;
-                            cur_blk_buf.iter_mut().for_each(|x| *x = 0);
                         }
                     }
                     if cur_lb != Some(lb) {
@@ -510,9 +509,8 @@ impl FileOps for ExtRegFileOps {
                             self.state
                                 .read_block(phys, &mut cur_blk_buf)
                                 .map_err(map_err)?;
-                        } else {
-                            cur_blk_buf.iter_mut().for_each(|x| *x = 0);
                         }
+                        // 整块覆盖时 buf 内容会被随后的 copy_from_slice 完整改写,无需清零
                         cur_lb = Some(lb);
                         cur_phys = phys;
                     }

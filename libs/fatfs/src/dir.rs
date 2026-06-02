@@ -439,6 +439,25 @@ pub(crate) fn find_entry(
     Ok(found)
 }
 
+/// 单次遍历同时完成:按名称查找 + 收集所有已用 SFN。
+/// 用于 create/mkdir/rename 路径,合并冲突检查与 SFN 冲突避让两次全扫描。
+pub(crate) fn find_entry_and_sfns(
+    state: &FsState,
+    backing: DirBacking,
+    name: &str,
+) -> Result<(Option<DirEntryView>, Vec<[u8; 11]>), BlockBackendError> {
+    let mut found: Option<DirEntryView> = None;
+    let mut sfns: Vec<[u8; 11]> = Vec::new();
+    parse_dir_entries(state, backing, |entry| {
+        sfns.push(entry.short_name);
+        if found.is_none() && entry.name.eq_ignore_ascii_case(name) {
+            found = Some(entry);
+        }
+        true
+    })?;
+    Ok((found, sfns))
+}
+
 /// 在目录中查找连续 `need` 个空闲(或 0x00 终止)槽,从 0 号槽开始扫描。
 /// 若 backing 是簇链且没找到,会返回 `Ok(end_slot)` 标记需要扩容的起点。
 pub(crate) fn find_free_slots(
