@@ -37,6 +37,73 @@ use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::superblock::Superblock;
 use crate::vfs::sync::Spinlock;
 
+fn join_abs_paths(prefix: &str, suffix: &str) -> alloc::string::String {
+    if prefix == "/" {
+        let mut out = alloc::string::String::with_capacity(1 + suffix.len());
+        out.push('/');
+        out.push_str(suffix.trim_start_matches('/'));
+        return out;
+    }
+    if suffix == "/" {
+        return alloc::string::String::from(prefix);
+    }
+    let mut out = alloc::string::String::with_capacity(prefix.len() + 1 + suffix.len());
+    out.push_str(prefix.trim_end_matches('/'));
+    out.push('/');
+    out.push_str(suffix.trim_start_matches('/'));
+    out
+}
+
+fn visible_path(
+    dentry: &Arc<Dentry>,
+    mount: &Arc<Mount>,
+    root_mount: &Arc<Mount>,
+    visible_root: &Arc<Dentry>,
+) -> Option<alloc::string::String> {
+    let mut current_mount = Arc::clone(mount);
+    let mut path = if Arc::ptr_eq(&current_mount, root_mount) {
+        dentry.full_path(visible_root)?
+    } else {
+        dentry.full_path(&current_mount.mount_root)?
+    };
+
+    while !Arc::ptr_eq(&current_mount, root_mount) {
+        let (mountpoint, parent) = {
+            let location = current_mount.location.lock();
+            let parent = location.parent.as_ref()?.upgrade()?;
+            (Arc::clone(&location.mountpoint), parent)
+        };
+        let prefix = if Arc::ptr_eq(&parent, root_mount) {
+            mountpoint.full_path(visible_root)?
+        } else {
+            mountpoint.full_path(&parent.mount_root)?
+        };
+        path = join_abs_paths(&prefix, &path);
+        current_mount = parent;
+    }
+
+    Some(path)
+}
+
+fn mount_options(flags: MountFlags) -> alloc::string::String {
+    let mut opts = alloc::string::String::new();
+    opts.push_str(if flags.is_rdonly() { "ro" } else { "rw" });
+    for (flag, text) in [
+        (MountFlags::NOSUID, "nosuid"),
+        (MountFlags::NODEV, "nodev"),
+        (MountFlags::NOEXEC, "noexec"),
+        (MountFlags::SYNCHRONOUS, "sync"),
+        (MountFlags::NOATIME, "noatime"),
+        (MountFlags::NODIRATIME, "nodiratime"),
+    ] {
+        if flags.has(flag) {
+            opts.push(',');
+            opts.push_str(text);
+        }
+    }
+    opts
+}
+
 /// 挂载标志，对应 `mount(2)` 的 `mountflags` 参数。
 ///
 /// 这些标志描述文件系统以何种约束挂载，影响该挂载上所有文件操作的行为。
@@ -694,6 +761,68 @@ impl MountNamespace {
                 fs_type,
                 mp_path,
                 rw
+            ));
+        }
+        out
+    }
+
+    /// 将当前所有挂载信息格式化为 Linux `/proc/*/mountinfo` 风格。
+    pub fn dump_mountinfo(
+        &self,
+        visible_root: &Arc<Dentry>,
+        root_mount: &Arc<Mount>,
+    ) -> alloc::string::String {
+        let data = self.data.lock();
+        let mut mount_ids = BTreeMap::new();
+        for (idx, mount) in data.mounts.iter().enumerate() {
+            mount_ids.insert(Arc::as_ptr(mount) as usize, idx as u64 + 1);
+        }
+
+        let mut out = alloc::string::String::new();
+        for mount in data.mounts.iter() {
+            let mount_id = mount_ids
+                .get(&(Arc::as_ptr(mount) as usize))
+                .copied()
+                .unwrap_or(0);
+            let (mountpoint, parent) = {
+                let location = mount.location.lock();
+                (
+                    Arc::clone(&location.mountpoint),
+                    location.parent.as_ref().and_then(|w| w.upgrade()),
+                )
+            };
+            let parent_id = parent
+                .as_ref()
+                .and_then(|m| mount_ids.get(&(Arc::as_ptr(m) as usize)).copied())
+                .unwrap_or(mount_id);
+            let mount_point = match parent.as_ref() {
+                Some(parent_mount) => visible_path(&mountpoint, parent_mount, root_mount, visible_root),
+                None => visible_path(&mountpoint, root_mount, root_mount, visible_root),
+            }
+            .unwrap_or_else(|| alloc::string::String::from("?"));
+            let root = mount
+                .mount_root
+                .full_path(&mount.superblock.root_dentry)
+                .unwrap_or_else(|| alloc::string::String::from("/"));
+            let dev = mount.superblock.dev_id.unwrap_or_default();
+            let opts = mount_options(mount.flags_snapshot());
+            let source = if mount.superblock.dev_id.is_some() {
+                alloc::format!("{}:{}", dev.major, dev.minor)
+            } else {
+                alloc::string::String::from("none")
+            };
+            out.push_str(&alloc::format!(
+                "{} {} {}:{} {} {} {} - {} {} {}\n",
+                mount_id,
+                parent_id,
+                dev.major,
+                dev.minor,
+                root,
+                mount_point,
+                opts,
+                mount.superblock.fs_type,
+                source,
+                opts,
             ));
         }
         out

@@ -708,6 +708,10 @@ pub const TASKEXT_VM_SPACE: TaskExtKey = 0x0001_0002;
 pub const TASKEXT_USER_TRAP_FRAME: TaskExtKey = 0x0001_0003;
 /// 当前任务的可执行路径（kernel execve 安装，procfs `/proc/self/exe` 读取）。
 pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
+/// 当前任务的 argv 快照（kernel execve 安装，procfs `/proc/[pid]/cmdline` 读取）。
+pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
+/// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
+pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
 
 /// 单条子系统挂载。
 pub struct TaskExt {

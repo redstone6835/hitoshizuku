@@ -5,6 +5,7 @@
 //! 的 [`Superblock`](vfs::superblock::Superblock)。
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -26,25 +27,31 @@ use crate::inode::{ExtInodeOps, load_inode};
 use crate::layout::{EXT4_ROOT_INO, ExtKind};
 use crate::sb::{self, Superblock as ExtSb};
 
-const BLOCK_CACHE_CAP: usize = 128;
+const BLOCK_CACHE_CAP: usize = 512;
 
-struct BlockCacheEntry {
+struct BlockCacheSlot {
     block: u64,
     data: Vec<u8>,
-    last_used: u64,
+    referenced: bool,
+    occupied: bool,
 }
 
+/// O(log n) 块缓存：BTreeMap 索引 + Clock eviction。
 struct BlockCache {
-    entries: Vec<BlockCacheEntry>,
-    tick: u64,
+    slots: Vec<BlockCacheSlot>,
+    /// block_no → slot 索引。
+    index: BTreeMap<u64, usize>,
+    /// Clock eviction 指针（循环扫描）。
+    hand: usize,
     block_size: usize,
 }
 
 impl BlockCache {
     fn new(block_size: u32) -> Self {
         Self {
-            entries: Vec::new(),
-            tick: 0,
+            slots: Vec::new(),
+            index: BTreeMap::new(),
+            hand: 0,
             block_size: block_size as usize,
         }
     }
@@ -53,10 +60,10 @@ impl BlockCache {
         if out.len() != self.block_size {
             return false;
         }
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.block == block) {
-            self.tick = self.tick.wrapping_add(1);
-            entry.last_used = self.tick;
-            out.copy_from_slice(&entry.data);
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            slot.referenced = true;
+            out.copy_from_slice(&slot.data);
             return true;
         }
         false
@@ -66,24 +73,83 @@ impl BlockCache {
         if data.len() != self.block_size {
             return;
         }
-        self.tick = self.tick.wrapping_add(1);
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.block == block) {
-            entry.data.copy_from_slice(data);
-            entry.last_used = self.tick;
+        // 命中：原地更新
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            slot.data.copy_from_slice(data);
+            slot.referenced = true;
             return;
         }
-        if self.entries.len() < BLOCK_CACHE_CAP {
-            self.entries.push(BlockCacheEntry {
+        // 未满：直接 push
+        if self.slots.len() < BLOCK_CACHE_CAP {
+            let idx = self.slots.len();
+            self.slots.push(BlockCacheSlot {
                 block,
                 data: Vec::from(data),
-                last_used: self.tick,
+                referenced: true,
+                occupied: true,
             });
+            self.index.insert(block, idx);
             return;
         }
-        if let Some(victim) = self.entries.iter_mut().min_by_key(|e| e.last_used) {
-            victim.block = block;
-            victim.data.copy_from_slice(data);
-            victim.last_used = self.tick;
+        // 已满：Clock eviction
+        let cap = self.slots.len();
+        let mut steps = 0usize;
+        loop {
+            let i = self.hand;
+            self.hand = (self.hand + 1) % cap;
+            let slot = &mut self.slots[i];
+            if !slot.occupied {
+                slot.block = block;
+                slot.data.copy_from_slice(data);
+                slot.referenced = true;
+                slot.occupied = true;
+                self.index.insert(block, i);
+                return;
+            }
+            if slot.referenced {
+                slot.referenced = false;
+                steps += 1;
+                if steps > cap * 2 {
+                    // 保险：兜底 LRU 化淘汰
+                    let old_block = slot.block;
+                    self.index.remove(&old_block);
+                    slot.block = block;
+                    slot.data.copy_from_slice(data);
+                    slot.referenced = true;
+                    self.index.insert(block, i);
+                    return;
+                }
+                continue;
+            }
+            // 命中淘汰
+            let old_block = slot.block;
+            self.index.remove(&old_block);
+            slot.block = block;
+            slot.data.copy_from_slice(data);
+            slot.referenced = true;
+            self.index.insert(block, i);
+            return;
+        }
+    }
+
+    fn invalidate_range(&mut self, start: u64, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let end = start.saturating_add(count as u64);
+        // 收集需要移除的 block 号（避免在借用 self.index 时修改它）
+        let to_remove: Vec<u64> = self
+            .index
+            .range(start..end)
+            .map(|(&b, _)| b)
+            .collect();
+        for block in to_remove {
+            if let Some(idx) = self.index.remove(&block) {
+                let slot = &mut self.slots[idx];
+                slot.occupied = false;
+                slot.referenced = false;
+            }
         }
     }
 }
@@ -287,11 +353,13 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        for i in 0..count {
-            let off = i as usize * bs;
-            self.read_block(start_block + i as u64, &mut out[off..off + bs])?;
+        if count == 0 {
+            return Ok(());
         }
-        Ok(())
+        if count == 1 {
+            return self.read_block(start_block, out);
+        }
+        bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, out)
     }
 
     pub(crate) fn write_blocks(
@@ -304,11 +372,12 @@ impl FsState {
         if data.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        if count == 1 {
-            return self.write_block(start_block, data);
+        if count == 0 {
+            return Ok(());
         }
         bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, data)?;
         self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.block_cache.lock().invalidate_range(start_block, count);
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 //! Linux asm-generic syscall 号。
 //!
-//! LoongArch64 走 asm-generic 编号；这里按数字顺序维护，避免重复注册和错号。
+//! 这里按数字顺序维护，避免重复注册和错号。
 
 pub const SYS_GETCWD: usize = 17;
 pub const SYS_EVENTFD2: usize = 19;

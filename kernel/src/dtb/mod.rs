@@ -181,6 +181,9 @@ pub fn kernel_start_init(context: &StartContext) {
     FS_REGISTRY
         .register(Box::leak(Box::new(general::vfs::ProcFsDriver)))
         .expect("[kernel-start][dtb] failed to register procfs driver");
+    FS_REGISTRY
+        .register(Box::leak(Box::new(general::vfs::SysFsDriver)))
+        .expect("[kernel-start][dtb] failed to register sysfs driver");
     general::vfs::register_block_filesystems();
 
     let dev_sb = FS_REGISTRY
@@ -265,8 +268,22 @@ pub fn kernel_start_init(context: &StartContext) {
 
     bind_boot_devices_to_devtmpfs(dev_ops, &char_dev_bindings);
 
+    ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
+        .expect("[kernel-start][dtb] failed to ensure /sys directory");
+    let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
+        .expect("[kernel-start][dtb] failed to resolve /sys")
+        .dentry;
+    let sys_sb = FS_REGISTRY
+        .find("sysfs")
+        .expect("[kernel-start][dtb] sysfs driver not found")
+        .mount(None, "")
+        .expect("[kernel-start][dtb] failed to mount sysfs");
+    mount_ns
+        .mount(Arc::clone(&sys_dentry), Arc::clone(&sys_sb), MountFlags::default())
+        .expect("[kernel-start][dtb] failed to mount sysfs on /sys");
+
     printk!(
-        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev'",
+        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + sysfs '/sys'",
         root_source
     );
 
@@ -411,7 +428,7 @@ fn mount_block_root(
     Err("unsupported or invalid root filesystem")
 }
 
-fn ensure_dir(ctx: &VfsContext, path: &str, mode: FileMode) -> general::vfs::error::VfsResult<()> {
+pub(crate) fn ensure_dir(ctx: &VfsContext, path: &str, mode: FileMode) -> general::vfs::error::VfsResult<()> {
     match path::lookup(ctx, &Dirfd::Cwd, path, LookupFlags::DIRECTORY) {
         Ok(_) => Ok(()),
         Err(VfsError::NotFound) => general::vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode),
