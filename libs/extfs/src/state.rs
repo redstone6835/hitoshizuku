@@ -86,6 +86,15 @@ impl BlockCache {
             victim.last_used = self.tick;
         }
     }
+
+    fn invalidate_range(&mut self, start: u64, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let end = start.saturating_add(count as u64);
+        self.entries
+            .retain(|entry| entry.block < start || entry.block >= end);
+    }
 }
 
 /// 块设备同步 I/O 错误。
@@ -287,11 +296,13 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        for i in 0..count {
-            let off = i as usize * bs;
-            self.read_block(start_block + i as u64, &mut out[off..off + bs])?;
+        if count == 0 {
+            return Ok(());
         }
-        Ok(())
+        if count == 1 {
+            return self.read_block(start_block, out);
+        }
+        bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, out)
     }
 
     pub(crate) fn write_blocks(
@@ -304,11 +315,12 @@ impl FsState {
         if data.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        if count == 1 {
-            return self.write_block(start_block, data);
+        if count == 0 {
+            return Ok(());
         }
         bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, start_block, count, data)?;
         self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
+        self.block_cache.lock().invalidate_range(start_block, count);
         Ok(())
     }
 
