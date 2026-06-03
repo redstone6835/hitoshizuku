@@ -1,0 +1,10 @@
+[package]
+name = "ktest-mock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+spin = "0.9"
+
+[dev-dependencies]
+ktest = { path = ".." }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-test = false
+test = true
 doctest = false
 bench = false
 
@@ -13,3 +13,7 @@ vfs = { path = "../vfs" }
 errno = { path = "../errno" }
 log = { path = "../log" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+[dev-dependencies]
+ktest = { path = "../ktest" }
+ktest-mock = { path = "../ktest/ktest-mock" }

@@ -45,96 +45,119 @@ pub(crate) fn ensure_block(
     }
 
     let bs = state.ext_sb.block_size as usize;
+    // 各级间接块共用同一个 scratch buffer,避免重复堆分配。
+    let mut buf = vec![0u8; bs];
     let rem = logical - DIRECT_COUNT;
     if rem < p {
-        let mut l1 = read_u32(i_block, 12);
-        if l1 == 0 {
-            l1 = alloc_mod::alloc_block(state)? as u32;
-            zero_block(state, l1 as u64)?;
-            write_u32(i_block, 12, l1);
-        }
-        let mut blk = vec![0u8; bs];
-        state.read_block(l1 as u64, &mut blk)?;
-        let cur = read_u32(&blk, rem);
-        if cur != 0 {
-            return Ok(cur as u64);
-        }
-        let new = alloc_mod::alloc_block(state)?;
-        zero_block(state, new)?;
-        write_u32(&mut blk, rem, new as u32);
-        state.write_block(l1 as u64, &blk)?;
-        return Ok(new);
+        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, &mut buf)?;
+        return Ok(new_data);
     }
 
     let rem = rem - p;
     if rem < p * p {
-        let mut l2 = read_u32(i_block, 13);
-        if l2 == 0 {
-            l2 = alloc_mod::alloc_block(state)? as u32;
-            zero_block(state, l2 as u64)?;
-            write_u32(i_block, 13, l2);
-        }
-        let mut l2_blk = vec![0u8; bs];
-        state.read_block(l2 as u64, &mut l2_blk)?;
+        // 二级间接:先确保 L2 索引块存在,把它读到 buf
+        let l2 = ensure_indirect_slot(state, i_block, 13, &mut buf)?;
         let mid_idx = rem / p;
-        let mut mid = read_u32(&l2_blk, mid_idx);
+        let mut mid = read_u32(&buf, mid_idx);
         if mid == 0 {
             mid = alloc_mod::alloc_block(state)? as u32;
-            zero_block(state, mid as u64)?;
-            write_u32(&mut l2_blk, mid_idx, mid);
-            state.write_block(l2 as u64, &l2_blk)?;
+            // 新 mid 块逻辑上为零,直接写零到磁盘后续不再 read_block
+            write_u32(&mut buf, mid_idx, mid);
+            state.write_block(l2, &buf)?;
+            // mid 块需要置零 (因为我们随后会读它),走 cache insert
+            cache_zero_block(state, mid as u64, &mut buf)?;
+        } else {
+            state.read_block(mid as u64, &mut buf)?;
         }
-        let mut mid_blk = vec![0u8; bs];
-        state.read_block(mid as u64, &mut mid_blk)?;
-        let cur = read_u32(&mid_blk, rem % p);
+        let inner = rem % p;
+        let cur = read_u32(&buf, inner);
         if cur != 0 {
             return Ok(cur as u64);
         }
         let new = alloc_mod::alloc_block(state)?;
         zero_block(state, new)?;
-        write_u32(&mut mid_blk, rem % p, new as u32);
-        state.write_block(mid as u64, &mid_blk)?;
+        write_u32(&mut buf, inner, new as u32);
+        state.write_block(mid as u64, &buf)?;
         return Ok(new);
     }
 
+    // 三级间接
     let rem = rem - p * p;
-    let mut l3 = read_u32(i_block, 14);
-    if l3 == 0 {
-        l3 = alloc_mod::alloc_block(state)? as u32;
-        zero_block(state, l3 as u64)?;
-        write_u32(i_block, 14, l3);
-    }
     let a = p * p;
-    let mut l3_blk = vec![0u8; bs];
-    state.read_block(l3 as u64, &mut l3_blk)?;
+    let l3 = ensure_indirect_slot(state, i_block, 14, &mut buf)?;
     let top_idx = rem / a;
-    let mut top = read_u32(&l3_blk, top_idx);
+    let mut top = read_u32(&buf, top_idx);
     if top == 0 {
         top = alloc_mod::alloc_block(state)? as u32;
-        zero_block(state, top as u64)?;
-        write_u32(&mut l3_blk, top_idx, top);
-        state.write_block(l3 as u64, &l3_blk)?;
+        write_u32(&mut buf, top_idx, top);
+        state.write_block(l3, &buf)?;
+        cache_zero_block(state, top as u64, &mut buf)?;
+    } else {
+        state.read_block(top as u64, &mut buf)?;
     }
-    let mut top_blk = vec![0u8; bs];
-    state.read_block(top as u64, &mut top_blk)?;
     let mid_idx = (rem % a) / p;
-    let mut mid = read_u32(&top_blk, mid_idx);
+    let mut mid = read_u32(&buf, mid_idx);
     if mid == 0 {
         mid = alloc_mod::alloc_block(state)? as u32;
-        zero_block(state, mid as u64)?;
-        write_u32(&mut top_blk, mid_idx, mid);
-        state.write_block(top as u64, &top_blk)?;
+        write_u32(&mut buf, mid_idx, mid);
+        state.write_block(top as u64, &buf)?;
+        cache_zero_block(state, mid as u64, &mut buf)?;
+    } else {
+        state.read_block(mid as u64, &mut buf)?;
     }
-    let mut mid_blk = vec![0u8; bs];
-    state.read_block(mid as u64, &mut mid_blk)?;
-    let cur = read_u32(&mid_blk, rem % p);
+    let inner = rem % p;
+    let cur = read_u32(&buf, inner);
     if cur != 0 {
         return Ok(cur as u64);
     }
     let new = alloc_mod::alloc_block(state)?;
     zero_block(state, new)?;
-    write_u32(&mut mid_blk, rem % p, new as u32);
-    state.write_block(mid as u64, &mid_blk)?;
+    write_u32(&mut buf, inner, new as u32);
+    state.write_block(mid as u64, &buf)?;
+    Ok(new)
+}
+
+/// 处理一级间接块的分配/查找。`slot` 是 i_block 中索引(12 = 一级)。
+/// 返回数据块物理号。`buf` 长度必须等于 block_size,内容会被覆盖。
+fn alloc_or_walk_l1(
+    state: &FsState,
+    i_block: &mut [u8],
+    slot: u32,
+    inner: u32,
+    buf: &mut [u8],
+) -> Result<u64, BlockBackendError> {
+    let l1 = ensure_indirect_slot(state, i_block, slot, buf)?;
+    let cur = read_u32(buf, inner);
+    if cur != 0 {
+        return Ok(cur as u64);
+    }
+    let new = alloc_mod::alloc_block(state)?;
+    zero_block(state, new)?;
+    write_u32(buf, inner, new as u32);
+    state.write_block(l1, buf)?;
+    Ok(new)
+}
+
+/// 确保 i_block[slot] 指向一个存在的间接块。`buf` 出参为该间接块的内容。
+/// 若新分配则写零并把 buf 设为全零。
+fn ensure_indirect_slot(
+    state: &FsState,
+    i_block: &mut [u8],
+    slot: u32,
+    buf: &mut [u8],
+) -> Result<u64, BlockBackendError> {
+    let cur = read_u32(i_block, slot);
+    if cur != 0 {
+        state.read_block(cur as u64, buf)?;
+        return Ok(cur as u64);
+    }
+    let new = alloc_mod::alloc_block(state)?;
+    write_u32(i_block, slot, new as u32);
+    // 新块全零;直接把 buf 清零并写回磁盘
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    state.write_block(new, buf)?;
     Ok(new)
 }
 
@@ -142,6 +165,14 @@ fn zero_block(state: &FsState, block: u64) -> Result<(), BlockBackendError> {
     let bs = state.ext_sb.block_size as usize;
     let z = vec![0u8; bs];
     state.write_block(block, &z)
+}
+
+/// 把 buf 清零并写回 block,同时填充缓存。供新分配的间接块走这条路径。
+fn cache_zero_block(state: &FsState, block: u64, buf: &mut [u8]) -> Result<(), BlockBackendError> {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    state.write_block(block, buf)
 }
 
 /// 释放逻辑块号 ≥ `from_lb` 的所有间接指针对应的物理块。用于 partial truncate。

@@ -1,6 +1,7 @@
 pub mod blockfs;
 pub mod devtmpfs;
 pub mod procfs;
+pub mod sysfs;
 pub mod tmpfs;
 
 use alloc::string::String;
@@ -9,6 +10,7 @@ pub use ::vfs::*;
 pub use blockfs::register_block_filesystems;
 pub use devtmpfs::DevTmpfsDriver;
 pub use procfs::ProcFsDriver;
+pub use sysfs::SysFsDriver;
 pub use tmpfs::TmpfsDriver;
 
 pub use ::vfs::cred::Credentials;

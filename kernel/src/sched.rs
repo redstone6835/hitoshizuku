@@ -40,7 +40,9 @@ static BOOT_VFS_PARTS: Spinlock<Option<BootVfsParts>> = Spinlock::new(None);
 /// install_stdio 用它走 openat 路径打开 fd 0/1/2。
 static BOOT_CONSOLE_NAME: Spinlock<Option<alloc::string::String>> = Spinlock::new(None);
 
-pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
+pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = sched::TASKEXT_EXEC_PATH;
+pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
+pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
 
 pub fn stash_boot_console_name(name: alloc::string::String) {
     *BOOT_CONSOLE_NAME.lock() = Some(name);
@@ -193,6 +195,16 @@ fn install_exec_path(task: &Arc<Task>, path: &str) {
     task.ext_install(TASKEXT_EXEC_PATH, Arc::new(String::from(path)));
 }
 
+fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[String]) {
+    install_exec_path(task, path);
+
+    let _ = task.ext_remove(TASKEXT_EXEC_ARGS);
+    task.ext_install(TASKEXT_EXEC_ARGS, Arc::new(argv.to_vec()));
+
+    let _ = task.ext_remove(TASKEXT_EXEC_ENVP);
+    task.ext_install(TASKEXT_EXEC_ENVP, Arc::new(envp.to_vec()));
+}
+
 fn read_user_usize(user: usize) -> Result<usize, Errno> {
     let mut raw = [0u8; size_of::<usize>()];
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
@@ -278,6 +290,7 @@ fn process_execve(
     let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
         Ok(loaded) => loaded,
         Err(err) => {
+            log::info!("[exec] load failed: path={:?} err={:?}", path, err);
             if let Some(vm) = old_vm {
                 vm.activate();
             }
@@ -287,7 +300,7 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
-    install_exec_path(task, &loaded.exec_path);
+    install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }
@@ -329,13 +342,17 @@ fn process_clone_user_context(
         write_user_usize(args.parent_tid, child_tid)?;
     }
     if args.flags.has(CloneFlags::CLONE_CHILD_SETTID) && args.child_tid != 0 {
-        let parent_vm = task_vm_space(parent);
-        if let Some(child_vm) = task_vm_space(child) {
-            child_vm.activate();
+        // CLONE_VM 时父子共享同一 VmSpace，无需切换页表
+        if !args.flags.has(CloneFlags::CLONE_VM) {
+            if let Some(ref vm) = task_vm_space(child) {
+                vm.activate();
+            }
         }
         let result = write_user_usize(args.child_tid, child_tid);
-        if let Some(vm) = parent_vm {
-            vm.activate();
+        if !args.flags.has(CloneFlags::CLONE_VM) {
+            if let Some(ref vm) = task_vm_space(parent) {
+                vm.activate();
+            }
         }
         result?;
     }
@@ -560,7 +577,7 @@ pub fn start_init_process(init: &Arc<Task>) -> ! {
         match crate::user::load_user_image_from_path(init, path, &argv, &envp) {
             Ok(loaded) => {
                 log::info!("[sched][init] starting user init '{}'", path);
-                enter_loaded_user_image(init, loaded)
+                enter_loaded_user_image(init, loaded, &argv, &envp)
             }
             Err(err) => {
                 last_error = err;
@@ -575,11 +592,16 @@ pub fn start_init_process(init: &Arc<Task>) -> ! {
     );
 }
 
-fn enter_loaded_user_image(task: &Arc<Task>, loaded: crate::user::LoadedUserImage) -> ! {
+fn enter_loaded_user_image(
+    task: &Arc<Task>,
+    loaded: crate::user::LoadedUserImage,
+    argv: &[String],
+    envp: &[String],
+) -> ! {
     let exec_path = loaded.exec_path.clone();
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
-    install_exec_path(task, &exec_path);
+    install_exec_metadata(task, &exec_path, argv, envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }

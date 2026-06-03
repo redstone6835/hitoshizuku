@@ -209,18 +209,22 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "csrrd $r12, {csr_prmd}",
         "st.d $r12, $r3, {status_offset}",
         "csrrd $r12, {csr_euen}",
-        "st.d $r12, $r3, {euen_offset}",
-        "csrrd $r12, {csr_llbctl}",
-        "st.d $r12, $r3, {llbctl_offset}",
+        "csrrd $r14, {csr_llbctl}",
+        "st.d $r14, $r3, {llbctl_offset}",
 
         // 当前内核不使用 LSX/LASX 寄存器，用户态启用 SXE/ASXE 时 trap 路径只保存
         // EUEN 并在返回时恢复。BTE 仍未接入上下文管理，保留 fail-closed。
         "andi $r13, $r12, {euen_unsupported_context_mask}",
         "bnez $r13, .L_halt",
 
-        // 检查是否需要保存 FPU 状态。使用陷阱帧中保存的 EUEN 快照来决定是否保存。
-        "andi $r12, $r12, {euen_fpe}",
-        "beqz $r12, .L_skip_fpu_save",
+        // 基于入口 FPE 决定是否保存 FPU，结果以 FPU_SAVED 标志存在 bit 4。
+        // 恢复路径据此判断，不受 handler 改写 tf.euen 影响。
+        "andi $r13, $r12, {euen_fpe}",
+        "beqz $r13, .L_no_fpu_save",
+
+        // 入口 FPE=1: 置标志后存 EUEN。
+        "ori $r12, $r12, {fpu_saved}",
+        "st.d $r12, $r3, {euen_offset}",
 
         // 保存 FCSR 寄存器的值到陷阱帧中。FCSR 包含了浮点异常标志和控制位。
         "movfcsr2gr $r12, $fcsr0",
@@ -278,7 +282,12 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "fst.d $f28, $r12, 28 * 8",   "fst.d $f29, $r12, 29 * 8",
         "fst.d $f30, $r12, 30 * 8",   "fst.d $f31, $r12, 31 * 8",
 
-        ".L_skip_fpu_save:",
+        "b .L_fpu_save_done",
+
+        ".L_no_fpu_save:",
+        "st.d $r12, $r3, {euen_offset}",
+
+        ".L_fpu_save_done:",
 
         // 将参数按照 ABI 规范准备好后调用异常报告函数，将异常信息传递给 Rust 代
         // 码进行处理。
@@ -302,10 +311,10 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         "ld.d $r12, $r31, {pc_offset}",
         "csrwr $r12, {csr_era}",
 
-        // 先基于陷阱帧 EUEN 快照判断是否需要恢复 FPU 状态。
-        // EUEN 在 FPU 上下文恢复完成后统一写回，避免过早暴露未恢复状态。
+        // 检查 FPU_SAVED 标志决定是否恢复 FPU。
+        // 不能用 FPE 位 − handler 在 FPD 路径把它从 0 改成了 1。
         "ld.d $r12, $r31, {euen_offset}",
-        "andi $r13, $r12, {euen_fpe}",
+        "andi $r13, $r12, {fpu_saved}",
         "beqz $r13, .L_skip_fpu_restore",
 
         // 在执行任何浮点恢复指令前，临时开启当前 CPU 的 FPE 使能位。
@@ -364,8 +373,9 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
 
         ".L_skip_fpu_restore:",
 
-        // 恢复 EUEN。
+        // 恢复 EUEN。先清除内部 FPU_SAVED 标志再写硬件。
         "ld.d $r12, $r31, {euen_offset}",
+        "bstrins.d $r12, $r0, 4, 4",
         "csrwr $r12, {csr_euen}",
 
         // 恢复 LLBit 相关控制位。
@@ -428,6 +438,7 @@ pub unsafe extern "C" fn __loongarch_exception_entry() {
         csr_ks1 = const CSR_KS1,
         prmd_pplv_mask = const CSR_PRMD_PPLV_MASK,
         euen_fpe = const EUEN_FPE,
+        fpu_saved = const FPU_SAVED,
         euen_unsupported_context_mask = const EUEN_BTE,
 
         ra_offset = const RA_OFFSET,

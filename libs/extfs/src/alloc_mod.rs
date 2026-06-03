@@ -38,26 +38,48 @@ fn alloc_bit_in_bitmap(
     Ok(None)
 }
 
+/// 读取 bitmap 中以 `byte_off` 起始的 8 字节作为 u64 (LE)。越界字节按 0xff 处理。
+#[inline]
+fn read_bitmap_u64(bm: &[u8], byte_off: usize) -> u64 {
+    let mut buf = [0xffu8; 8];
+    let avail = bm.len().saturating_sub(byte_off).min(8);
+    if avail > 0 {
+        buf[..avail].copy_from_slice(&bm[byte_off..byte_off + avail]);
+    }
+    u64::from_le_bytes(buf)
+}
+
+#[inline]
+fn bit_is_zero(bm: &[u8], nr: u32) -> bool {
+    let byte_idx = (nr / 8) as usize;
+    let mask = 1u8 << ((nr % 8) as u8);
+    bm.get(byte_idx).copied().unwrap_or(0xff) & mask == 0
+}
+
 fn find_zero_bit(bm: &[u8], start: u32, end: u32) -> Option<u32> {
     let mut nr = start;
+    // 对齐到 64-bit 字边界前逐位扫描
+    while nr < end && nr % 64 != 0 {
+        if bit_is_zero(bm, nr) {
+            return Some(nr);
+        }
+        nr += 1;
+    }
+    // 主循环：按 u64 字扫描
+    while nr + 64 <= end {
+        let word = read_bitmap_u64(bm, (nr / 8) as usize);
+        if word != u64::MAX {
+            let bit = (!word).trailing_zeros();
+            return Some(nr + bit);
+        }
+        nr += 64;
+    }
+    // 尾部逐位扫描
     while nr < end {
-        let byte_idx = (nr / 8) as usize;
-        let bit_start = (nr % 8) as u8;
-        let b = bm.get(byte_idx).copied().unwrap_or(0xff);
-        if b == 0xff && bit_start == 0 {
-            nr = ((byte_idx + 1) as u32) * 8;
-            continue;
+        if bit_is_zero(bm, nr) {
+            return Some(nr);
         }
-        for bit in bit_start..8 {
-            let cur = (byte_idx as u32) * 8 + bit as u32;
-            if cur >= end {
-                return None;
-            }
-            if b & (1 << bit) == 0 {
-                return Some(cur);
-            }
-        }
-        nr = ((byte_idx + 1) as u32) * 8;
+        nr += 1;
     }
     None
 }
@@ -89,7 +111,10 @@ pub(crate) fn alloc_block(state: &FsState) -> Result<u64, BlockBackendError> {
 
 /// 批量分配最多 `want` 个连续数据块。返回 (起始物理块号, 实际分配数量)。
 /// 至少分配 1 个块，否则返回错误。
-pub(crate) fn alloc_blocks_run(state: &FsState, want: u32) -> Result<(u64, u32), BlockBackendError> {
+pub(crate) fn alloc_blocks_run(
+    state: &FsState,
+    want: u32,
+) -> Result<(u64, u32), BlockBackendError> {
     let _g = ALLOC_LOCK.lock();
     let sb = &state.ext_sb;
     let start_rel = state.block_alloc_hint.load(Ordering::Relaxed);
@@ -143,8 +168,11 @@ fn alloc_run_in_bitmap(
     state.read_block(bitmap_block, &mut bm)?;
 
     let start = start_hint.min(bits_in_group);
-    let result = find_zero_run(&bm, start, bits_in_group, want)
-        .or_else(|| (start > 0).then(|| find_zero_run(&bm, 0, start, want)).flatten());
+    let result = find_zero_run(&bm, start, bits_in_group, want).or_else(|| {
+        (start > 0)
+            .then(|| find_zero_run(&bm, 0, start, want))
+            .flatten()
+    });
     if let Some((nr, count)) = result {
         for i in 0..count {
             let bit = nr + i;
@@ -159,37 +187,27 @@ fn alloc_run_in_bitmap(
 
 /// 在位图中找最多 `want` 个连续的 0-bit，至少找到 1 个才返回。
 fn find_zero_run(bm: &[u8], start: u32, end: u32, want: u32) -> Option<(u32, u32)> {
-    let mut nr = start;
-    while nr < end {
-        let byte_idx = (nr / 8) as usize;
-        let bit_off = nr % 8;
-        let b = bm.get(byte_idx).copied().unwrap_or(0xff);
-        if b == 0xff && bit_off == 0 {
-            nr = ((byte_idx + 1) as u32) * 8;
-            continue;
-        }
-        if b & (1 << (bit_off as u8)) != 0 {
-            nr += 1;
-            continue;
-        }
-        // 找到一个空闲 bit，尝试扩展连续 run
-        let run_start = nr;
-        let mut count = 0u32;
-        while count < want && nr < end {
-            let bi = (nr / 8) as usize;
-            let bo = (nr % 8) as u8;
-            if bm.get(bi).copied().unwrap_or(0xff) & (1 << bo) != 0 {
-                break;
+    let first = find_zero_bit(bm, start, end)?;
+    let run_start = first;
+    let mut count = 1u32;
+    let mut nr = first + 1;
+    while count < want && nr < end {
+        // 对齐后的全零 u64 可直接累加 64
+        if nr % 64 == 0 && nr + 64 <= end && count + 64 <= want {
+            let word = read_bitmap_u64(bm, (nr / 8) as usize);
+            if word == 0 {
+                count += 64;
+                nr += 64;
+                continue;
             }
-            count += 1;
-            nr += 1;
         }
-        if count > 0 {
-            return Some((run_start, count));
+        if !bit_is_zero(bm, nr) {
+            break;
         }
+        count += 1;
         nr += 1;
     }
-    None
+    Some((run_start, count))
 }
 
 /// 释放一个数据块。宽松:允许重复释放(do nothing if bitmap bit 已 0)。

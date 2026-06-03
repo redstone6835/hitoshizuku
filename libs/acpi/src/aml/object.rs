@@ -9,19 +9,42 @@ type NativeMethod = dyn Fn(&[WrappedObject]) -> Result<WrappedObject, AmlError>;
 pub enum Object {
     Uninitialized,
     Buffer(Vec<u8>),
-    BufferField { buffer: WrappedObject, offset: usize, length: usize },
+    BufferField {
+        buffer: WrappedObject,
+        offset: usize,
+        length: usize,
+    },
     Device,
     Event(Arc<AtomicU64>),
     FieldUnit(FieldUnit),
     Integer(u64),
-    Method { code: Vec<u8>, flags: MethodFlags },
-    NativeMethod { f: Arc<NativeMethod>, flags: MethodFlags },
-    Mutex { mutex: Handle, sync_level: u8 },
-    Reference { kind: ReferenceKind, inner: WrappedObject },
+    Method {
+        code: Vec<u8>,
+        flags: MethodFlags,
+    },
+    NativeMethod {
+        f: Arc<NativeMethod>,
+        flags: MethodFlags,
+    },
+    Mutex {
+        mutex: Handle,
+        sync_level: u8,
+    },
+    Reference {
+        kind: ReferenceKind,
+        inner: WrappedObject,
+    },
     OpRegion(OpRegion),
     Package(Vec<WrappedObject>),
-    PowerResource { system_level: u8, resource_order: u16 },
-    Processor { proc_id: u8, pblk_address: u32, pblk_length: u8 },
+    PowerResource {
+        system_level: u8,
+        resource_order: u16,
+    },
+    Processor {
+        proc_id: u8,
+        pblk_address: u32,
+        pblk_length: u8,
+    },
     RawDataBuffer,
     String(String),
     ThermalZone,
@@ -35,7 +58,10 @@ impl Object {
     {
         let mut flags = 0;
         flags.set_bits(0..3, num_args);
-        Object::NativeMethod { f: Arc::new(f), flags: MethodFlags(flags) }
+        Object::NativeMethod {
+            f: Arc::new(f),
+            flags: MethodFlags(flags),
+        }
     }
 }
 
@@ -93,7 +119,9 @@ impl ObjectToken {
     /// Create an [`ObjectToken`]. This should **only** be done **once** by the main interpreter,
     /// as contructing your own token allows invalid mutable access to objects.
     pub(super) unsafe fn create_interpreter_token() -> ObjectToken {
-        ObjectToken { _dont_construct_me: () }
+        ObjectToken {
+            _dont_construct_me: (),
+        }
     }
 }
 
@@ -181,7 +209,10 @@ impl Object {
         if let Object::Integer(value) = self {
             Ok(*value)
         } else {
-            Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::Integer, got: self.typ() })
+            Err(AmlError::ObjectNotOfExpectedType {
+                expected: ObjectType::Integer,
+                got: self.typ(),
+            })
         }
     }
 
@@ -189,7 +220,10 @@ impl Object {
         if let Object::String(value) = self {
             Ok(Cow::from(value))
         } else {
-            Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::String, got: self.typ() })
+            Err(AmlError::ObjectNotOfExpectedType {
+                expected: ObjectType::String,
+                got: self.typ(),
+            })
         }
     }
 
@@ -197,7 +231,10 @@ impl Object {
         if let Object::Buffer(bytes) = self {
             Ok(bytes)
         } else {
-            Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::Buffer, got: self.typ() })
+            Err(AmlError::ObjectNotOfExpectedType {
+                expected: ObjectType::Buffer,
+                got: self.typ(),
+            })
         }
     }
 
@@ -225,12 +262,20 @@ impl Object {
                 _ => panic!(),
             },
             Object::String(value) => Ok(value.as_bytes().to_vec()),
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ConvertToBuffer, typ: self.typ() }),
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::ConvertToBuffer,
+                typ: self.typ(),
+            }),
         }
     }
 
     pub fn read_buffer_field(&self, dst: &mut [u8]) -> Result<(), AmlError> {
-        if let Self::BufferField { buffer, offset, length } = self {
+        if let Self::BufferField {
+            buffer,
+            offset,
+            length,
+        } = self
+        {
             let buffer = match **buffer {
                 Object::Buffer(ref buffer) => buffer.as_slice(),
                 Object::String(ref string) => string.as_bytes(),
@@ -240,13 +285,25 @@ impl Object {
             copy_bits(buffer, *offset, dst, 0, *length);
             Ok(())
         } else {
-            Err(AmlError::InvalidOperationOnObject { op: Operation::ReadBufferField, typ: self.typ() })
+            Err(AmlError::InvalidOperationOnObject {
+                op: Operation::ReadBufferField,
+                typ: self.typ(),
+            })
         }
     }
 
-    pub fn write_buffer_field(&mut self, value: &[u8], token: &ObjectToken) -> Result<(), AmlError> {
+    pub fn write_buffer_field(
+        &mut self,
+        value: &[u8],
+        token: &ObjectToken,
+    ) -> Result<(), AmlError> {
         // TODO: bounds check the buffer first to avoid panicking
-        if let Self::BufferField { buffer, offset, length } = self {
+        if let Self::BufferField {
+            buffer,
+            offset,
+            length,
+        } = self
+        {
             let buffer = match unsafe { buffer.gain_mut(token) } {
                 Object::Buffer(buffer) => buffer.as_mut_slice(),
                 // XXX: this unfortunately requires us to trust AML to keep the string as valid
@@ -257,7 +314,10 @@ impl Object {
             copy_bits(value, 0, buffer, *offset, *length);
             Ok(())
         } else {
-            Err(AmlError::InvalidOperationOnObject { op: Operation::WriteBufferField, typ: self.typ() })
+            Err(AmlError::InvalidOperationOnObject {
+                op: Operation::WriteBufferField,
+                typ: self.typ(),
+            })
         }
     }
 
@@ -298,9 +358,18 @@ pub struct FieldUnit {
 
 #[derive(Clone, Debug)]
 pub enum FieldUnitKind {
-    Normal { region: WrappedObject },
-    Bank { region: WrappedObject, bank: WrappedObject, bank_value: u64 },
-    Index { index: WrappedObject, data: WrappedObject },
+    Normal {
+        region: WrappedObject,
+    },
+    Bank {
+        region: WrappedObject,
+        bank: WrappedObject,
+        bank_value: u64,
+    },
+    Index {
+        index: WrappedObject,
+        data: WrappedObject,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -459,7 +528,11 @@ pub(crate) fn copy_bits(
         }
 
         let dst_shift = dst_index & 7;
-        let mut dst_mask: u16 = if length < 8 { ((1 << length) - 1) as u16 } else { 0xff_u16 } << dst_shift;
+        let mut dst_mask: u16 = if length < 8 {
+            ((1 << length) - 1) as u16
+        } else {
+            0xff_u16
+        } << dst_shift;
         dst[dst_index / 8] =
             (dst[dst_index / 8] & !(dst_mask as u8)) | ((src_bits << dst_shift) & (dst_mask as u8));
 

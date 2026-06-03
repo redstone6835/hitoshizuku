@@ -17,6 +17,7 @@
 //! 当前永远只有 CPU 0 被填充。
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch_hooks;
@@ -52,6 +53,13 @@ static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
 /// 每核抢占请求标志。定时器发现 `Runqueue::tick` 需要抢占时置位；trap 返回
 /// 路径 / 主动 yield 入口读到 true 即调一次 [`schedule_once`]。
 static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+
+struct TimedSleeper {
+    deadline_ns: u64,
+    task: Weak<Task>,
+}
+
+static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
 
 /// 已上线 CPU 位图。CPU0 在 init 前后始终视为 online；AP 启动后通过
 /// [`register_cpu`] 打开对应 bit。
@@ -331,6 +339,70 @@ pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
     cpu_id
 }
 
+/// Register a sleeping task for deadline-based wakeup.
+///
+/// The caller owns the actual sleep transition and must cancel the registration
+/// after it resumes. This helper only records the timeout side channel used by
+/// timer ticks to move an expired sleeper back to Runnable.
+pub fn register_sleep_deadline(task: &Arc<Task>, deadline_ns: u64) -> bool {
+    if now_ns_internal() >= deadline_ns {
+        return false;
+    }
+    let mut sleepers = TIMED_SLEEPERS.lock();
+    sleepers.retain(|entry| entry.task.upgrade().is_some());
+    if let Some(entry) = sleepers.iter_mut().find(|entry| {
+        entry
+            .task
+            .upgrade()
+            .as_ref()
+            .is_some_and(|queued| Arc::ptr_eq(queued, task))
+    }) {
+        entry.deadline_ns = entry.deadline_ns.min(deadline_ns);
+        return true;
+    }
+    sleepers.push(TimedSleeper {
+        deadline_ns,
+        task: Arc::downgrade(task),
+    });
+    true
+}
+
+/// Remove all deadline wakeups registered for `task`.
+pub fn cancel_sleep_deadline(task: &Arc<Task>) {
+    let mut sleepers = TIMED_SLEEPERS.lock();
+    sleepers.retain(|entry| {
+        entry
+            .task
+            .upgrade()
+            .as_ref()
+            .is_some_and(|queued| !Arc::ptr_eq(queued, task))
+    });
+}
+
+fn wake_expired_sleepers(now_ns: u64) {
+    let expired = {
+        let mut sleepers = TIMED_SLEEPERS.lock();
+        let mut expired = Vec::new();
+        sleepers.retain(|entry| {
+            let Some(task) = entry.task.upgrade() else {
+                return false;
+            };
+            if entry.deadline_ns <= now_ns {
+                expired.push(task);
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    };
+    for task in expired {
+        if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+            enqueue_task(task, now_ns);
+        }
+    }
+}
+
 pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
     if target_cpu >= NR_CPUS || !is_cpu_online(target_cpu) {
         return Err(errno::Errno::EINVAL);
@@ -532,6 +604,7 @@ pub fn on_timer_tick(now_ns: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
+    wake_expired_sleepers(now_ns);
     let cpu_id = cpu();
     if RUNQUEUES[cpu_id].tick(now_ns) {
         request_resched(cpu_id);

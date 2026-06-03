@@ -697,6 +697,61 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             cc_div,
             STABLE_TIMER_HZ.load(Ordering::Relaxed),
         ));
+
+        // 步骤 1.1b：配置定时器中断，使其按配置频率产生中断。
+        // 默认 100 Hz，可通过内核命令行 "timer_hz=N" 覆盖。
+        let timer_hz = {
+            let mut hz = DEFAULT_TIMER_HZ;
+            let raw = CMDLINE_PTR.load(Ordering::Acquire);
+            if raw != 0 {
+                let cmd = unsafe {
+                    general::cmdline::Cmdline::from_raw_until_nul(
+                        reset_to_virt(raw) as *const u8,
+                        4096,
+                    )
+                };
+                if let Some(val) = cmd.find("timer_hz").and_then(|v| v.parse().ok()) {
+                    hz = val;
+                }
+            }
+            hz.max(1).min(10000)
+        };
+        let stable_hz = STABLE_TIMER_HZ.load(Ordering::Relaxed) as u64;
+        let period = stable_hz / timer_hz as u64;
+        let tcfg_val = (period << 2) | (1 << 1) | 1;
+        // ECFG.LIE[11] (定时器中断使能) 与 LIE[12] (IPI)
+        const LIE_TIMER: usize = 1 << 11;
+        const LIE_IPI: usize = 1 << 12;
+        let lie_val = LIE_TIMER | LIE_IPI;
+        let lie_mask = LIE_TIMER | LIE_IPI;
+        unsafe {
+            // 开 ECFG 里的定时器/IPI 中断使能位
+            core::arch::asm!(
+                "csrxchg {val}, {mask}, {csr_ecfg}",
+                val = inout(reg) lie_val => _,
+                mask = in(reg) lie_mask,
+                csr_ecfg = const CSR_ECFG,
+                options(nostack, preserves_flags)
+            );
+            // 清理 pending
+            core::arch::asm!(
+                "csrwr {val}, {csr_ticlr}",
+                val = in(reg) 1usize,
+                csr_ticlr = const CSR_TICLR,
+                options(nostack, preserves_flags)
+            );
+            // 使能定时器
+            core::arch::asm!(
+                "csrwr {val}, {csr_tcfg}",
+                val = in(reg) tcfg_val,
+                csr_tcfg = const CSR_TCFG,
+                options(nostack, preserves_flags)
+            );
+        }
+        e_print(format_args!(
+            "[{:6}.{:06}] [loader] timer configured: hz={} period={}\n",
+            0, 0, timer_hz, period,
+        ));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

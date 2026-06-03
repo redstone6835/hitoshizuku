@@ -1,0 +1,6 @@
+# BusyBox init configuration for Shiori (loongarch64)
+
+::sysinit:/bin/sh /etc/init.d/rcS
+console::respawn:/bin/sh -i
+::ctrlaltdel:/bin/umount -a -r
+::shutdown:/bin/umount -a -r

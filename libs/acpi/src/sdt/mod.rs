@@ -23,7 +23,11 @@ impl<T: Copy, const MIN_REVISION: u8> ExtendedField<T, MIN_REVISION> {
     /// ### Safety
     /// If a bogus ACPI version is passed, this function may access uninitialised data.
     pub unsafe fn access(&self, revision: u8) -> Option<T> {
-        if revision >= MIN_REVISION { Some(unsafe { self.0.assume_init() }) } else { None }
+        if revision >= MIN_REVISION {
+            Some(unsafe { self.0.assume_init() })
+        } else {
+            None
+        }
     }
 }
 
@@ -140,9 +144,15 @@ impl SdtHeader {
         }
 
         // Check the checksum
-        let table_bytes =
-            unsafe { core::slice::from_raw_parts((self as *const SdtHeader).cast::<u8>(), self.length as usize) };
-        let sum = table_bytes.iter().fold(0u8, |sum, &byte| sum.wrapping_add(byte));
+        let table_bytes = unsafe {
+            core::slice::from_raw_parts(
+                (self as *const SdtHeader).cast::<u8>(),
+                self.length as usize,
+            )
+        };
+        let sum = table_bytes
+            .iter()
+            .fold(0u8, |sum, &byte| sum.wrapping_add(byte));
         if sum != 0 {
             return Err(AcpiError::SdtInvalidChecksum(signature));
         }

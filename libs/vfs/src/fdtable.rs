@@ -431,6 +431,23 @@ impl FdTable {
         }
     }
 
+    pub fn snapshot_fds(&self) -> Vec<(u32, Arc<File>)> {
+        let inner = self.inner.lock();
+        let mut out = Vec::with_capacity(inner.count);
+        for (i, &word) in inner.bitmap.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                let fd = i as u32 * 64 + bit;
+                w &= w - 1;
+                if let Some(entry) = inner.get(fd) {
+                    out.push((fd, Arc::clone(&entry.file)));
+                }
+            }
+        }
+        out
+    }
+
     /// 返回当前打开的描述符数量。
     pub fn len(&self) -> usize {
         self.inner.lock().count

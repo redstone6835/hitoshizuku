@@ -7,7 +7,6 @@ extern crate hal;
 
 mod acpi;
 mod bench;
-mod cmdline;
 mod dtb;
 mod initramfs;
 mod panic;
@@ -30,6 +29,13 @@ fn main() -> ! {
     #[cfg(debug_assertions)]
     general::mm::smoketest::run();
     */
+
+    #[cfg(feature = "kernel-tests")]
+    {
+        ktest::runner::set_writer(hal::console::early_write_bytes);
+        let report = ktest::runner::run_all();
+        let _ = report;
+    }
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
     // bench::run();

@@ -1,0 +1,87 @@
+//! 套接字阻塞等待原语。
+//!
+//! 提供条件等待 (`wait_while`) 和唤醒 (`wake_task`) 操作,
+//! 支持超时截止时间和信号中断。
+
+use alloc::sync::Arc;
+
+use sched::{
+    Task, TaskState, WaitQueue, cancel_sleep_deadline, current_task, enqueue_task, is_ready,
+    now_ns_public, register_sleep_deadline, schedule_once,
+};
+
+use crate::types::SocketError;
+
+/// 唤醒等待队列中的一个任务(将其重新入调度器就绪队列)。
+pub(crate) fn wake_task(task: &Arc<Task>) {
+    if is_ready() && task.state() == TaskState::Runnable {
+        enqueue_task(Arc::clone(task), now_ns_public());
+    }
+}
+
+/// 检查任务是否有待处理的非阻塞信号。
+fn has_pending_signal(task: &Arc<Task>) -> bool {
+    let blocked = task.signal.blocked_snapshot().raw();
+    let pending =
+        task.signal.pending_snapshot().raw() | task.shared_signal().pending_snapshot().raw();
+    (pending & !blocked) != 0
+}
+
+/// 检查超时截止时间是否已过期。
+fn deadline_expired(deadline: Option<u64>) -> bool {
+    deadline.is_some_and(|dl| now_ns_public() >= dl)
+}
+
+/// 条件等待:阻塞当前任务直到 `predicate` 返回 false、超时或收到信号。
+///
+/// 返回值:
+/// - `Ok(())` — 条件已满足
+/// - `Err(TemporaryUnavailable)` — 超时
+/// - `Err(Interrupted)` — 被信号中断
+pub(crate) fn wait_while(
+    queue: &WaitQueue,
+    predicate: impl Fn() -> bool,
+    deadline: Option<u64>,
+) -> Result<(), SocketError> {
+    loop {
+        if !predicate() {
+            return Ok(());
+        }
+        if deadline_expired(deadline) {
+            return Err(SocketError::TemporaryUnavailable);
+        }
+        let task = current_task();
+        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
+        let _ = task.cas_state(TaskState::Runnable, TaskState::Sleeping);
+        queue.enqueue(&task);
+        let deadline_armed =
+            deadline.is_some_and(|deadline| register_sleep_deadline(&task, deadline));
+        if !predicate() {
+            queue.remove(&task);
+            if deadline_armed {
+                cancel_sleep_deadline(&task);
+            }
+            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            return Ok(());
+        }
+        if deadline_expired(deadline) {
+            queue.remove(&task);
+            if deadline_armed {
+                cancel_sleep_deadline(&task);
+            }
+            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            return Err(SocketError::TemporaryUnavailable);
+        }
+        schedule_once(0);
+        queue.remove(&task);
+        if deadline_armed {
+            cancel_sleep_deadline(&task);
+        }
+        if has_pending_signal(&task) {
+            return Err(SocketError::Interrupted);
+        }
+        if deadline_expired(deadline) {
+            return Err(SocketError::TemporaryUnavailable);
+        }
+    }
+}

@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use allocator::{KERNEL_ALLOCATOR, MemorySegment};
+use allocator::KERNEL_ALLOCATOR;
 use general::dev::block::{BlockDevice, BlockDeviceKind};
 use general::dev::block_sync::SyncBlockBackend;
 use general::dev::char::{CharDevice, CharDeviceKind};
@@ -18,11 +18,7 @@ use general::dev::drivers::{Uart16550, VirtioBlk, VirtioPciBlkDriver};
 use general::dev::enumerate::DEVICES;
 use general::dev::pci::pci_scan_and_register;
 use general::dev::pnp::{PNP_DRIVERS, PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
-use general::dtb::{Dtb, DtbNode, DtbReserveEntry};
-use general::firmware::SerialPortInfo;
-use general::firmware::power::{
-    PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
-};
+use general::firmware::dtb as firmware_dtb;
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
@@ -41,11 +37,6 @@ use crate::start;
 
 mod pci;
 
-// DTB 兼容字符串常量
-const DTB_COMPAT_SYSCON_POWEROFF: &[u8] = b"syscon-poweroff";
-const DTB_COMPAT_SYSCON_REBOOT: &[u8] = b"syscon-reboot";
-const DTB_COMPAT_VIRTIO_MMIO: &[u8] = b"virtio,mmio";
-
 /// DTB 启动路径的主入口。
 ///
 /// 从 `StartContext` 中提取 DTB 固件视图，依次完成平台基础信息解析、
@@ -54,23 +45,46 @@ const DTB_COMPAT_VIRTIO_MMIO: &[u8] = b"virtio,mmio";
 pub fn kernel_start_init(context: &StartContext) {
     log::debug!("[kernel-start][dtb] jumped into kernel_start_init()");
 
-    // 取出 DTB 视图
+    // 步骤 0 先确认本次启动确实走的是 DTB 固件路径，并拿到稳定 DTB 视图。
+    // 只有在这里把 DTB 视图固定下来，后续所有解析步骤才有共同的语义起点。
     let dtb = match context.firmware {
         StartFirmware::Dtb(dtb) => dtb,
         StartFirmware::Acpi(_) => {
             panic!("[kernel-start][dtb] StartContext firmware does not match DTB path")
         }
     };
+    // 步骤 1 先把原始 DTB 交给平台无关的固件解析器。解析器会统一建立全树索引、
+    // 处理 aliases/phandle/status/reg/ranges，并产出内核启动需要的标准描述符；
+    // 这里不再假设设备一定挂在根节点或 `/soc` 下。
+    let firmware = firmware_dtb::parse(dtb).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][dtb] failed to parse DTB firmware info: {:?}",
+            err
+        )
+    });
+    let firmware_dtb::DtbFirmwareInfo {
+        cpu_count,
+        mut memory_segments,
+        reserved_segments,
+        external_initramfs_range,
+        stdout_serial,
+        power_controls,
+        serial_ports,
+        virtio_mmio_devices,
+        pcie_hosts,
+    } = firmware;
 
-    // ── 步骤 1：解析 DTB 平台信息 ────────────────────────────────────────
+    printk!(
+        "[kernel-start][dtb] firmware parsed: cpu={} memory={} reserved={} serial={} virtio-mmio={} pcie-host={}",
+        cpu_count,
+        memory_segments.len(),
+        reserved_segments.len(),
+        serial_ports.len(),
+        virtio_mmio_devices.len(),
+        pcie_hosts.len()
+    );
 
-    let cpu_count = count_cpus(dtb);
-    let (serial_ports, console_serial_port_index) = parse_stdout_serial(dtb);
-    let power_controls = parse_power_controls(dtb);
-    let external_initramfs_range = parse_initramfs_range(dtb);
-    let mut memory_segments = parse_memory_segments(dtb)
-        .unwrap_or_else(|err| panic!("[kernel-start][dtb] failed to parse DTB memory: {}", err));
-
+    // 如果引导器额外提供了可用内存图，这里再做一次交叉过滤。
     if let Some(boot_segments) = context.memory.boot_map.usable_segments() {
         memory_segments = start::intersect_memory_segments(&memory_segments, &boot_segments)
             .unwrap_or_else(|| {
@@ -80,15 +94,23 @@ pub fn kernel_start_init(context: &StartContext) {
             });
     }
 
-    // ── 步骤 2：安装电源控制回调 ─────────────────────────────────────────
+    // 步骤 2 把刚刚解析好的电源控制信息安装到固件抽象层。这样内核后续无论是
+    // 正常关机、重启还是错误路径上的兜底退出，都能通过统一接口回到本平台提供的
+    // syscon 寄存器写入方案，而不需要再次接触 DTB 原始节点。
 
     general::firmware::power::install(power_controls, context.address.phys_to_virt);
 
-    // ── 步骤 3：初始化分层内存分配器 ─────────────────────────────────────
+    // 步骤 3 初始化分层分配器。这个阶段会消费上面整理好的内存段、内核镜像占用区
+    // 以及可选的外部 initramfs 范围。这里先建立物理地址与虚拟地址转换关系，再
+    // 逐层启用物理页、内核虚拟内存、堆和 slab，使后续驱动注册与 VFS 挂载都能在
+    // 同一套分配框架中进行。
 
+    // 小步骤 3.1 先绑定平台提供的物理地址与虚拟地址转换函数。
     KERNEL_ALLOCATOR
         .bind_address_translation(context.address.phys_to_virt, context.address.virt_to_phys);
 
+    // 小步骤 3.2 然后整理启动早期必须避开的保留区，包括内核镜像本身以及可选的
+    // 外部 initramfs 地址范围。
     let kernel_image = context.memory.kernel_image;
     let mut kernel_reserved = Vec::new();
     kernel_reserved.push((kernel_image.start, kernel_image.end));
@@ -102,6 +124,8 @@ pub fn kernel_start_init(context: &StartContext) {
         );
     }
 
+    // 小步骤 3.3 先初始化物理页分配器，使之后的页级资源请求可以建立在 DTB 解析出的
+    // 可用 RAM 之上。
     KERNEL_ALLOCATOR
         .init_phys(&memory_segments, &kernel_reserved)
         .unwrap_or_else(|err| {
@@ -111,6 +135,8 @@ pub fn kernel_start_init(context: &StartContext) {
             )
         });
 
+    // 小步骤 3.4 如果当前平台提供了完整的虚拟内存初始化回调，这里继续把内核页表、
+    // 虚拟内存、堆和 slab 一次性拉起来，并在最后切换全局分配器。
     if let Some(alloc_ops) = context.allocator {
         KERNEL_ALLOCATOR.bind_kernel_heap_ops(
             alloc_ops.kernel_heap_region,
@@ -136,7 +162,10 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
-    let cmdline = context.boot.command_line.map(crate::cmdline::Cmdline::new);
+    let cmdline = context
+        .boot
+        .command_line
+        .map(general::cmdline::Cmdline::new);
     let external_initramfs = external_initramfs_range.map(|(start, end)| {
         let virt = (context.address.phys_to_virt)(start);
         let len = end - start;
@@ -147,21 +176,97 @@ pub fn kernel_start_init(context: &StartContext) {
         }
     });
 
-    // ── 步骤 4：发现并注册 DTB 设备 ─────────────────────────────────────
+    // 步骤 4 开始注册 DTB 固件解析器已经标准化好的设备描述。kernel 只负责把
+    // 物理 MMIO 地址转换为当前平台的可访问虚拟地址，并实例化对应驱动；设备位于
+    // 哪一层 bus、经过哪几层 ranges 翻译，都已经由固件解析层处理完毕。
 
     let mut uart_index = 0usize;
     let mut block_index = 0usize;
     let mut char_dev_bindings: Vec<(&'static str, CharDevice)> = Vec::new();
 
-    for node in dtb.children().into_iter().flatten() {
-        register_dtb_device_node(
-            node,
-            context.address.device_mmio_to_virt,
-            context.address.virt_to_phys,
-            &mut uart_index,
-            &mut block_index,
-            &mut char_dev_bindings,
-        );
+    // 小步骤 4.1 先注册所有标准化后的 ns16550 串口。
+    for port in &serial_ports {
+        let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
+        let uart: &'static Uart16550 = if let Some(clock_hz) = port.clock_hz {
+            Box::leak(Box::new(Uart16550::new(virt_base, clock_hz, 115_200)))
+        } else {
+            Box::leak(Box::new(Uart16550::new_preconfigured(virt_base)))
+        };
+
+        let idx = uart_index;
+        uart_index += 1;
+        let user_name: &'static str =
+            alloc::format!("{}{}", CharDeviceKind::Ns16550.name(), idx).leak();
+
+        let dev = CharDevice::new(CharDeviceKind::Ns16550, port.name, uart);
+        if let Err(err) = DEVICES.char_devs.push(dev.clone()) {
+            printk!(
+                "[kernel-start][dtb] failed to register {} ({}{}) at {:#x}: {:?}",
+                port.name,
+                CharDeviceKind::Ns16550.name(),
+                idx,
+                port.phys_addr,
+                err
+            );
+        } else {
+            char_dev_bindings.push((user_name, dev));
+            printk!(
+                "[kernel-start][dtb] registered {} -> /dev/{} at phys={:#x}",
+                port.name,
+                user_name,
+                port.phys_addr
+            );
+        }
+    }
+
+    // 小步骤 4.2 再注册所有标准化后的 virtio-mmio 块设备。
+    for device in &virtio_mmio_devices {
+        let virt_base = (context.address.device_mmio_to_virt)(device.phys_addr);
+        match VirtioBlk::new(virt_base, context.address.virt_to_phys) {
+            Ok(driver) => {
+                let user_name =
+                    alloc::format!("{}{}", BlockDeviceKind::VirtioBlk.name(), block_index);
+                match driver.into_block_dev(&user_name, context.address.virt_to_phys) {
+                    Ok(block_dev) => match DEVICES.block_devs.push(&block_dev) {
+                        Ok(dev) => {
+                            printk!(
+                                "[kernel-start][dtb] registered virtio-blk {} -> /dev/{} at phys={:#x} size={:#x}",
+                                device.name,
+                                dev.name(),
+                                device.phys_addr,
+                                device.size
+                            );
+                            block_index += 1;
+                        }
+                        Err(err) => {
+                            printk!(
+                                "[kernel-start][dtb] failed to register virtio-blk {} at {:#x}: {:?}",
+                                device.name,
+                                device.phys_addr,
+                                err
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        printk!(
+                            "[kernel-start][dtb] failed to create block dev for {} at {:#x}: {}",
+                            device.name,
+                            device.phys_addr,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                printk!(
+                    "[kernel-start][dtb] skipped virtio-mmio {} at {:#x} size={:#x}: {}",
+                    device.name,
+                    device.phys_addr,
+                    device.size,
+                    err
+                );
+            }
+        }
     }
 
     printk!(
@@ -170,8 +275,12 @@ pub fn kernel_start_init(context: &StartContext) {
         block_index
     );
 
-    // ── 步骤 5：先确认根目录来源，再挂载根文件系统与 /dev ─────────────
+    // 步骤 5 进入文件系统准备阶段。启动代码会先准备好 tmpfs、devtmpfs、procfs
+    // 和 sysfs 所需的驱动与 superblock，然后根据是否存在 initramfs 或块设备根盘
+    // 来决定最终 `/` 的来源。devtmpfs 会被提前建立，以便总线扫描和设备注册期间
+    // 就能为后续 `/dev` 挂载准备好节点。
 
+    // 小步骤 5.1 先注册启动阶段一定会用到的文件系统驱动。
     FS_REGISTRY
         .register(Box::leak(Box::new(general::vfs::TmpfsDriver)))
         .expect("[kernel-start][dtb] failed to register tmpfs driver");
@@ -181,6 +290,9 @@ pub fn kernel_start_init(context: &StartContext) {
     FS_REGISTRY
         .register(Box::leak(Box::new(general::vfs::ProcFsDriver)))
         .expect("[kernel-start][dtb] failed to register procfs driver");
+    FS_REGISTRY
+        .register(Box::leak(Box::new(general::vfs::SysFsDriver)))
+        .expect("[kernel-start][dtb] failed to register sysfs driver");
     general::vfs::register_block_filesystems();
 
     let dev_sb = FS_REGISTRY
@@ -193,15 +305,88 @@ pub fn kernel_start_init(context: &StartContext) {
         .expect("[kernel-start][dtb] failed to downcast devtmpfs ops");
     bind_standard_devtmpfs_nodes(dev_ops);
 
-    // devtmpfs superblock 先建好并注入给 PnP。它不需要先挂载到某个临时根；
-    // 总线扫描期间发现的设备节点会写入 devtmpfs，等根目录确定后再挂到 /dev。
-    init_pnp_and_pci(
-        dtb,
-        &dev_sb,
-        context.address.device_mmio_to_virt,
-        context.address.virt_to_phys,
-    );
+    // 小步骤 5.2 接着把 devtmpfs 与 PnP 层连接起来。这样 PCI 扫描过程中一旦发现
+    // 可驱动设备，对应的字符设备或块设备节点就能直接写入 devtmpfs；等最终根文件
+    // 系统选定之后，再把这份已经填充好的 devtmpfs 挂到 `/dev` 即可。
+    fn pnp_bind_block_cb(name: &str, dev: Arc<BlockDevice>) -> Result<(), PnpError> {
+        let sb = devtmpfs_sb();
+        let ops = sb
+            .downcast_ops::<general::vfs::devtmpfs::DevTmpfsSuperblockOps>()
+            .ok_or(PnpError::NoDevtmpfs)?;
+        ops.bind_block(name, dev)
+            .map_err(|_| PnpError::DevtmpfsError)
+    }
+    fn pnp_bind_char_cb(name: &str, dev: CharDevice) -> Result<(), PnpError> {
+        let sb = devtmpfs_sb();
+        let ops = sb
+            .downcast_ops::<general::vfs::devtmpfs::DevTmpfsSuperblockOps>()
+            .ok_or(PnpError::NoDevtmpfs)?;
+        ops.bind_char(name, dev)
+            .map_err(|_| PnpError::DevtmpfsError)
+    }
+    fn pnp_unbind_cb(name: &str) -> Result<(), PnpError> {
+        let sb = devtmpfs_sb();
+        let ops = sb
+            .downcast_ops::<general::vfs::devtmpfs::DevTmpfsSuperblockOps>()
+            .ok_or(PnpError::NoDevtmpfs)?;
+        ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
+    }
 
+    let sb_leaked: &'static Arc<general::vfs::superblock::Superblock> =
+        Box::leak(Box::new(Arc::clone(&dev_sb)));
+    set_pnp_devtmpfs_sb(sb_leaked);
+    set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
+        bind_block: pnp_bind_block_cb,
+        bind_char: pnp_bind_char_cb,
+        unbind: pnp_unbind_cb,
+    });
+    printk!("[kernel-start][dtb] PnP devtmpfs callbacks installed");
+
+    // 小步骤 5.3 然后尝试使用标准化后的 PCIe host bridge 描述完成 ECAM 安装、
+    // virtio-pci 驱动注册、BAR 分配以及总线扫描。
+    if let Some(host) = pcie_hosts.first() {
+        if pcie_hosts.len() > 1 {
+            printk!(
+                "[kernel-start][dtb] multiple pcie hosts found ({}); using first ECAM host {}",
+                pcie_hosts.len(),
+                host.path
+            );
+        }
+        printk!(
+            "[kernel-start][dtb] pcie ECAM {} phys={:#x} size={:#x} bus=[{:#x},{:#x}]",
+            host.path,
+            host.ecam_phys,
+            host.ecam_size,
+            host.bus_start,
+            host.bus_end
+        );
+        pci::install_ecam(
+            host.ecam_phys as u64,
+            host.ecam_size as u64,
+            host.bus_start,
+            host.bus_end,
+            context.address.device_mmio_to_virt,
+        );
+
+        let drv = Box::leak(Box::new(VirtioPciBlkDriver::new(
+            context.address.virt_to_phys,
+        )));
+        PNP_DRIVERS.register(drv);
+        printk!("[kernel-start][dtb] registered PnpDriver 'virtio-pci-blk'");
+
+        pci::assign_bars(host.bus_start, host.bus_end);
+
+        let count = pci_scan_and_register(0, host.bus_start, host.bus_end, "pci-");
+        printk!(
+            "[kernel-start][dtb] pci_scan_and_register probed {} device(s)",
+            count
+        );
+    } else {
+        printk!("[kernel-start][dtb] no pcie node in DTB; skipping PCI init");
+    }
+
+    // 小步骤 5.4 再决定根文件系统的来源。优先级是外部/内建 initramfs，其次才是
+    // 已经注册好的块设备根盘。
     let selected_initramfs = external_initramfs.or_else(crate::initramfs::embedded_image);
     let cred = Credentials::root();
     let (root_sb, root_source) = if let Some(image) = selected_initramfs {
@@ -228,6 +413,8 @@ pub fn kernel_start_init(context: &StartContext) {
     };
     printk!("[kernel-start][dtb] root source selected: {}", root_source);
 
+    // 小步骤 5.5 在确定根 superblock 之后，创建 mount namespace 和启动期 VFS
+    // 上下文，并在需要时把 initramfs 内容解包到最终根目录。
     let root_mount = Mount::new(
         Arc::clone(&root_sb),
         Arc::clone(&root_sb.root_dentry),
@@ -254,6 +441,8 @@ pub fn kernel_start_init(context: &StartContext) {
         printk!("[kernel-start][dtb] initramfs unpacked into root");
     }
 
+    // 小步骤 5.6 最后把 devtmpfs 和 sysfs 挂到标准路径，同时把之前登记好的启动
+    // 设备节点批量同步进 `/dev`。
     ensure_dir(&vfs_ctx, "/dev", FileMode::new(0o755))
         .expect("[kernel-start][dtb] failed to ensure /dev directory");
     let dev_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/dev", LookupFlags::DIRECTORY)
@@ -265,15 +454,35 @@ pub fn kernel_start_init(context: &StartContext) {
 
     bind_boot_devices_to_devtmpfs(dev_ops, &char_dev_bindings);
 
+    ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
+        .expect("[kernel-start][dtb] failed to ensure /sys directory");
+    let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
+        .expect("[kernel-start][dtb] failed to resolve /sys")
+        .dentry;
+    let sys_sb = FS_REGISTRY
+        .find("sysfs")
+        .expect("[kernel-start][dtb] sysfs driver not found")
+        .mount(None, "")
+        .expect("[kernel-start][dtb] failed to mount sysfs");
+    mount_ns
+        .mount(
+            Arc::clone(&sys_dentry),
+            Arc::clone(&sys_sb),
+            MountFlags::default(),
+        )
+        .expect("[kernel-start][dtb] failed to mount sysfs on /sys");
+
     printk!(
-        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev'",
+        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + sysfs '/sys'",
         root_source
     );
 
-    // ── 步骤 6：注册控制台并绑定日志输出 ────────────────────────────────
+    // 步骤 6 最后确定启动期控制台，并把日志出口绑定到已经就绪的字符设备上。
+    // 这里优先尊重命令行显式指定的 console，其次回退到 DTB 的 stdout-path 结果。
+    // 一旦控制台建立成功，后续 printk 与日志系统都会共享同一条稳定的输出路径。
 
-    // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
-    // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
+    // 小步骤 6.1 先把根目录、挂载点和凭据等 VFS 组件交给 sched shim 保管；随后
+    // sched::boot_init 会据此给 init 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
     crate::sched::stash_boot_vfs_parts(
         Arc::clone(&root_sb.root_dentry),
         Arc::clone(&root_mount),
@@ -281,10 +490,15 @@ pub fn kernel_start_init(context: &StartContext) {
         Arc::new(cred.clone()),
     );
 
+    // 小步骤 6.2 然后解析控制台来源。这里优先看命令行 console 参数，找不到时再
+    // 用 stdout-path 反查已经注册好的串口驱动实例。
     let console_registered = {
         let cmdline_dev = cmdline
             .as_ref()
-            .and_then(|cl| cl.console_device())
+            .and_then(|cl| {
+                cl.find("console")
+                    .map(|v| v.split_once(',').map_or(v, |(d, _)| d))
+            })
             .and_then(|name| resolve_cmdline_console(&vfs_ctx, dev_ops, name));
 
         let dev = if let Some(dev) = cmdline_dev {
@@ -293,7 +507,7 @@ pub fn kernel_start_init(context: &StartContext) {
                 dev.fw_name()
             );
             Some(dev)
-        } else if let Some(port) = console_serial_port_index.and_then(|i| serial_ports.get(i)) {
+        } else if let Some(port) = stdout_serial.as_ref() {
             let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
             let found = DEVICES.char_devs.iter().find(|dev| {
                 dev.downcast_driver::<Uart16550>()
@@ -301,7 +515,7 @@ pub fn kernel_start_init(context: &StartContext) {
             });
             if let Some(dev) = found.as_ref() {
                 printk!(
-                    "[kernel-start][dtb] console from firmware: {}",
+                    "[kernel-start][dtb] console from stdout-path: {}",
                     dev.fw_name()
                 );
             }
@@ -312,8 +526,8 @@ pub fn kernel_start_init(context: &StartContext) {
 
         if let Some(dev) = dev {
             general::console::register_console(dev.clone());
-            // 在 devtmpfs 里把当前 console 重定向为固定路径 /dev/console，让
-            // 用户态进程通过稳定路径打开它。
+            // 小步骤 6.2.1 在 devtmpfs 里把当前 console 重定向为固定路径
+            // `/dev/console`，让用户态进程通过稳定路径打开它。
             match dev_ops.bind_char("console", dev.clone()) {
                 Ok(()) => {
                     printk!(
@@ -341,6 +555,7 @@ pub fn kernel_start_init(context: &StartContext) {
         }
     };
 
+    // 小步骤 6.3 如果控制台已经可用，就把日志系统的 sink 也切换到这条设备路径上。
     if console_registered {
         static LOG_SINK: LogSink = LogSink {
             write_record: write_log_record_to_console,
@@ -411,7 +626,11 @@ fn mount_block_root(
     Err("unsupported or invalid root filesystem")
 }
 
-fn ensure_dir(ctx: &VfsContext, path: &str, mode: FileMode) -> general::vfs::error::VfsResult<()> {
+pub(crate) fn ensure_dir(
+    ctx: &VfsContext,
+    path: &str,
+    mode: FileMode,
+) -> general::vfs::error::VfsResult<()> {
     match path::lookup(ctx, &Dirfd::Cwd, path, LookupFlags::DIRECTORY) {
         Ok(_) => Ok(()),
         Err(VfsError::NotFound) => general::vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode),
@@ -474,793 +693,6 @@ fn bind_standard_devtmpfs_nodes(dev_ops: &DevTmpfsSuperblockOps) {
             }
         }
     }
-}
-
-fn parse_initramfs_range(dtb: Dtb<'static>) -> Option<(usize, usize)> {
-    let chosen = dtb.find_child("chosen")?;
-    let start = read_dtb_usize(chosen.find_property("linux,initrd-start")?.value())?;
-    let end = read_dtb_usize(chosen.find_property("linux,initrd-end")?.value())?;
-    (end > start).then_some((start, end))
-}
-
-fn read_dtb_usize(value: &[u8]) -> Option<usize> {
-    match value.len() {
-        4 => Some(u32::from_be_bytes([value[0], value[1], value[2], value[3]]) as usize),
-        8 => {
-            let raw = u64::from_be_bytes([
-                value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
-            ]);
-            if raw > usize::MAX as u64 {
-                None
-            } else {
-                Some(raw as usize)
-            }
-        }
-        _ => None,
-    }
-}
-
-/// 递归遍历 DTB 节点，注册串口和 virtio 块设备。
-fn register_dtb_device_node(
-    node: DtbNode<'static>,
-    device_mmio_to_virt: fn(usize) -> usize,
-    virt_to_phys: fn(usize) -> usize,
-    uart_index: &mut usize,
-    block_index: &mut usize,
-    char_dev_bindings: &mut Vec<(&'static str, CharDevice)>,
-) {
-    register_dtb_serial_node(node, device_mmio_to_virt, uart_index, char_dev_bindings);
-    register_dtb_virtio_mmio_node(node, device_mmio_to_virt, virt_to_phys, block_index);
-    for child in node.children() {
-        register_dtb_device_node(
-            child,
-            device_mmio_to_virt,
-            virt_to_phys,
-            uart_index,
-            block_index,
-            char_dev_bindings,
-        );
-    }
-}
-
-/// 注册一个 DTB 串口节点为 ns16550 字符设备。
-fn register_dtb_serial_node(
-    node: DtbNode<'static>,
-    device_mmio_to_virt: fn(usize) -> usize,
-    uart_index: &mut usize,
-    char_dev_bindings: &mut Vec<(&'static str, CharDevice)>,
-) {
-    if node.base_name_bytes() != b"serial" {
-        return;
-    }
-    let reg_prop = match node.find_property("reg") {
-        Some(p) => p,
-        None => return,
-    };
-    let phys_addr = match parse_reg_addr(reg_prop.value()) {
-        Some(a) => a,
-        None => return,
-    };
-
-    let clock_hz = node
-        .find_property("clock-frequency")
-        .and_then(|p| {
-            let v = p.value();
-            if v.len() >= 4 {
-                Some(u32::from_be_bytes(v[0..4].try_into().ok()?))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-
-    let virt_base = device_mmio_to_virt(phys_addr);
-
-    // 通过 Box::leak 产生静态引用，伴随内核整个生命周期
-    let uart: &'static Uart16550 = if clock_hz != 0 {
-        Box::leak(Box::new(Uart16550::new(virt_base, clock_hz, 115_200)))
-    } else {
-        Box::leak(Box::new(Uart16550::new_preconfigured(virt_base)))
-    };
-
-    let idx = *uart_index;
-    *uart_index += 1;
-
-    let fw_name: &'static str = node
-        .name()
-        .unwrap_or_else(|| leak_str(&alloc::format!("serial@{:#x}", phys_addr)));
-    let user_name: &'static str = leak_str(&alloc::format!("{}{}", CharDeviceKind::Ns16550.name(), idx));
-
-    let dev = CharDevice::new(CharDeviceKind::Ns16550, fw_name, uart);
-    if let Err(err) = DEVICES.char_devs.push(dev.clone()) {
-        printk!(
-            "[kernel-start][dtb] failed to register {} ({}{}) at {:#x}: {:?}",
-            fw_name,
-            CharDeviceKind::Ns16550.name(),
-            idx,
-            phys_addr,
-            err
-        );
-    } else {
-        char_dev_bindings.push((user_name, dev));
-        printk!(
-            "[kernel-start][dtb] registered {} -> /dev/{} at phys={:#x}",
-            fw_name,
-            user_name,
-            phys_addr
-        );
-    }
-}
-
-/// 将字符串转换为 `&'static str`，用于内核中需要静态字符串的场合。
-/// 实现采用 `Box::leak`，这会导致内存永久泄漏，仅用于启动阶段一次性分配。
-fn leak_str(s: &str) -> &'static str {
-    let boxed: Box<str> = s.into();
-    Box::leak(boxed)
-}
-
-/// 注册 virtio-mmio 块设备。
-fn register_dtb_virtio_mmio_node(
-    node: DtbNode<'static>,
-    device_mmio_to_virt: fn(usize) -> usize,
-    virt_to_phys: fn(usize) -> usize,
-    block_index: &mut usize,
-) {
-    if !node_compatible_contains(node, DTB_COMPAT_VIRTIO_MMIO) {
-        return;
-    }
-
-    let reg_prop = match node.find_property("reg") {
-        Some(prop) => prop,
-        None => return,
-    };
-    let (phys_addr, size) = match parse_reg_addr_size(reg_prop.value()) {
-        Some(range) => range,
-        None => return,
-    };
-    if size == 0 {
-        return;
-    }
-
-    let virt_base = device_mmio_to_virt(phys_addr);
-    let driver = match VirtioBlk::new(virt_base, virt_to_phys) {
-        Ok(driver) => driver,
-        Err(err) => {
-            printk!(
-                "[kernel-start][dtb] skipped virtio-mmio {} at {:#x}: {}",
-                node.name().unwrap_or("<unnamed>"),
-                phys_addr,
-                err
-            );
-            return;
-        }
-    };
-
-    let user_name = alloc::format!("{}{}", BlockDeviceKind::VirtioBlk.name(), *block_index);
-    let block_dev = match driver.into_block_dev(&user_name, virt_to_phys) {
-        Ok(dev) => dev,
-        Err(err) => {
-            printk!(
-                "[kernel-start][dtb] failed to create block dev for {} at {:#x}: {}",
-                node.name().unwrap_or("<unnamed>"),
-                phys_addr,
-                err
-            );
-            return;
-        }
-    };
-
-    match DEVICES.block_devs.push(&block_dev) {
-        Ok(dev) => {
-            printk!(
-                "[kernel-start][dtb] registered virtio-blk {} -> /dev/{} at phys={:#x}",
-                node.name().unwrap_or("<unnamed>"),
-                dev.name(),
-                phys_addr
-            );
-            *block_index += 1;
-        }
-        Err(err) => {
-            printk!(
-                "[kernel-start][dtb] failed to register virtio-blk {} at {:#x}: {:?}",
-                node.name().unwrap_or("<unnamed>"),
-                phys_addr,
-                err
-            );
-        }
-    }
-}
-
-// ───────────────────── 内存段辅助函数 ─────────────────────────────────
-
-/// 合并、排序并去除零大小的内存段，返回规范化的段列表。
-fn normalize_segments(mut segments: Vec<MemorySegment>) -> Option<Vec<MemorySegment>> {
-    if segments.is_empty() {
-        return None;
-    }
-
-    segments.sort_unstable_by_key(|segment| segment.start);
-    let mut merged: Vec<MemorySegment> = Vec::with_capacity(segments.len());
-    for segment in segments {
-        if segment.size == 0 {
-            continue;
-        }
-        if let Some(last) = merged.last_mut() {
-            let last_end = last.start.saturating_add(last.size);
-            if last_end >= segment.start {
-                let merged_end = last_end.max(segment.start.saturating_add(segment.size));
-                last.size = merged_end.saturating_sub(last.start);
-                continue;
-            }
-        }
-        merged.push(segment);
-    }
-
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
-}
-
-/// 根据 `reg` 属性的字节长度推断地址、大小单元数。
-fn infer_reg_cells(reg: &[u8], addr_cells: usize, size_cells: usize) -> Option<(usize, usize)> {
-    let entry_bytes = (addr_cells + size_cells) * 4;
-    if entry_bytes != 0 && reg.len().is_multiple_of(entry_bytes) {
-        return Some((addr_cells, size_cells));
-    }
-    if reg.len().is_multiple_of(16) {
-        return Some((2, 2));
-    }
-    if reg.len().is_multiple_of(8) {
-        return Some((1, 1));
-    }
-    None
-}
-
-/// 从字节切片中读取指定 cell 数量的值。
-fn read_cells(bytes: &[u8], cells: usize) -> Option<usize> {
-    match cells {
-        1 => Some(u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize),
-        2 => Some(u64::from_be_bytes(bytes.get(..8)?.try_into().ok()?) as usize),
-        _ => None,
-    }
-}
-
-/// 读取 DTB 节点中 `#address-cells` 或 `#size-cells` 的值。
-fn read_cells_count(node: DtbNode<'static>, name: &str, default: usize) -> usize {
-    node.find_property(name)
-        .and_then(|prop| read_be_u32_prop(prop.value()))
-        .map(|value| value as usize)
-        .filter(|&value| matches!(value, 1 | 2))
-        .unwrap_or(default)
-}
-
-/// 将 `reg` 属性追加为 `MemorySegment` 列表。
-fn append_ranges_from_reg(
-    reg: &[u8],
-    default_addr_cells: usize,
-    default_size_cells: usize,
-    segments: &mut Vec<MemorySegment>,
-) {
-    let Some((addr_cells, size_cells)) =
-        infer_reg_cells(reg, default_addr_cells, default_size_cells)
-    else {
-        return;
-    };
-    let entry_bytes = (addr_cells + size_cells) * 4;
-    let mut cursor = 0usize;
-    while cursor + entry_bytes <= reg.len() {
-        let addr_end = cursor + addr_cells * 4;
-        let size_end = addr_end + size_cells * 4;
-        let Some(start) = read_cells(&reg[cursor..addr_end], addr_cells) else {
-            break;
-        };
-        let Some(size) = read_cells(&reg[addr_end..size_end], size_cells) else {
-            break;
-        };
-        cursor = size_end;
-
-        if size != 0 {
-            segments.push(MemorySegment { start, size });
-        }
-    }
-}
-
-/// 收集所有保留内存（memreserve 块 + reserved-memory 节点）。
-fn collect_reserved_segments(
-    dtb: Dtb<'static>,
-    root: DtbNode<'static>,
-    root_addr_cells: usize,
-    root_size_cells: usize,
-) -> Vec<MemorySegment> {
-    let mut reserved = Vec::new();
-
-    if let Some(entries) = dtb.mem_reservations() {
-        for DtbReserveEntry { address, size } in entries {
-            if size != 0 {
-                reserved.push(MemorySegment {
-                    start: address,
-                    size,
-                });
-            }
-        }
-    }
-
-    if let Some(reserved_memory) = root.find_child("reserved-memory") {
-        let addr_cells = read_cells_count(reserved_memory, "#address-cells", root_addr_cells);
-        let size_cells = read_cells_count(reserved_memory, "#size-cells", root_size_cells);
-        for child in reserved_memory.children() {
-            let Some(reg) = child.find_property("reg").map(|prop| prop.value()) else {
-                continue;
-            };
-            append_ranges_from_reg(reg, addr_cells, size_cells, &mut reserved);
-        }
-    }
-
-    normalize_segments(reserved).unwrap_or_default()
-}
-
-/// 从可用段中扣除保留段，返回剩余的可用内存段。
-fn subtract_reserved_segments(
-    segments: Vec<MemorySegment>,
-    reserved: &[MemorySegment],
-) -> Option<Vec<MemorySegment>> {
-    let segments = normalize_segments(segments)?;
-    if reserved.is_empty() {
-        return Some(segments);
-    }
-
-    let mut result = Vec::new();
-    for segment in segments {
-        let mut cursor = segment.start;
-        let segment_end = segment.end();
-
-        for hole in reserved {
-            let hole_start = hole.start;
-            let hole_end = hole.end();
-            if hole_end <= cursor {
-                continue;
-            }
-            if hole_start >= segment_end {
-                break;
-            }
-            if cursor < hole_start {
-                result.push(MemorySegment {
-                    start: cursor,
-                    size: hole_start - cursor,
-                });
-            }
-            cursor = cursor.max(hole_end.min(segment_end));
-            if cursor >= segment_end {
-                break;
-            }
-        }
-
-        if cursor < segment_end {
-            result.push(MemorySegment {
-                start: cursor,
-                size: segment_end - cursor,
-            });
-        }
-    }
-
-    normalize_segments(result)
-}
-
-/// 解析 DTB 的 `/memory` 节点，获得系统可用物理内存段。
-fn parse_memory_segments(dtb: Dtb<'static>) -> Result<Vec<MemorySegment>, &'static str> {
-    let root = dtb
-        .root()
-        .ok_or("[kernel-start][dtb] missing or invalid DTB root node")?;
-    let root_addr_cells = read_cells_count(root, "#address-cells", 2);
-    let root_size_cells = read_cells_count(root, "#size-cells", 2);
-    let mut segments = Vec::new();
-
-    for node in dtb
-        .children()
-        .ok_or("[kernel-start][dtb] failed to iterate DTB root children")?
-    {
-        if node.base_name_bytes() != b"memory" {
-            continue;
-        }
-
-        let Some(reg) = node.find_property("reg").map(|prop| prop.value()) else {
-            continue;
-        };
-        append_ranges_from_reg(reg, root_addr_cells, root_size_cells, &mut segments);
-    }
-
-    let Some(raw_segments) = normalize_segments(segments) else {
-        return Err("[kernel-start][dtb] no usable memory node found");
-    };
-    let reserved = collect_reserved_segments(dtb, root, root_addr_cells, root_size_cells);
-    let memory_segments = subtract_reserved_segments(raw_segments, &reserved)
-        .ok_or("[kernel-start][dtb] no usable RAM remains after subtracting reserved regions")?;
-
-    printk!(
-        "[kernel-start][dtb] memory segments: usable={} reserved={} root-cells=({},{})",
-        memory_segments.len(),
-        reserved.len(),
-        root_addr_cells,
-        root_size_cells,
-    );
-
-    Ok(memory_segments)
-}
-
-/// 统计 CPU 核心数。
-fn count_cpus(dtb: Dtb<'static>) -> usize {
-    dtb.find_child("cpus")
-        .map(|cpus| {
-            cpus.children()
-                .filter(|node| node.base_name_bytes() == b"cpu")
-                .count()
-        })
-        .unwrap_or(1)
-        .max(1)
-}
-
-/// 解析 `reg` 属性中的单个地址（大端序）。
-fn parse_reg_addr(reg: &[u8]) -> Option<usize> {
-    if reg.len() >= 16 {
-        Some(u64::from_be_bytes(reg[0..8].try_into().ok()?) as usize)
-    } else if reg.len() >= 4 {
-        Some(u32::from_be_bytes(reg[0..4].try_into().ok()?) as usize)
-    } else {
-        None
-    }
-}
-
-/// 解析 `reg` 属性中的地址/大小对。
-fn parse_reg_addr_size(reg: &[u8]) -> Option<(usize, usize)> {
-    if reg.len() >= 16 {
-        Some((
-            u64::from_be_bytes(reg[0..8].try_into().ok()?) as usize,
-            u64::from_be_bytes(reg[8..16].try_into().ok()?) as usize,
-        ))
-    } else if reg.len() >= 8 {
-        Some((
-            u32::from_be_bytes(reg[0..4].try_into().ok()?) as usize,
-            u32::from_be_bytes(reg[4..8].try_into().ok()?) as usize,
-        ))
-    } else {
-        None
-    }
-}
-
-/// 解析关机/重启等电源控制方法。
-fn parse_power_controls(dtb: Dtb<'static>) -> PowerControlInfo {
-    let shutdown = parse_syscon_power_action(dtb, DTB_COMPAT_SYSCON_POWEROFF);
-    let reboot = parse_syscon_power_action(dtb, DTB_COMPAT_SYSCON_REBOOT);
-
-    printk!(
-        "[kernel-start][dtb] power controls: shutdown={} reboot={}",
-        shutdown.is_some() as usize,
-        reboot.is_some() as usize
-    );
-
-    PowerControlInfo { shutdown, reboot }
-}
-
-/// 解析 syscon 类型的电源控制（开关机/重启）。
-fn parse_syscon_power_action(dtb: Dtb<'static>, compatible: &[u8]) -> Option<PowerControlMethod> {
-    let action_node = find_node_by_compatible(dtb, compatible)?;
-    let regmap_phandle = read_be_u32_prop(action_node.find_property("regmap")?.value())?;
-    let offset = read_be_usize_prop(action_node.find_property("offset")?.value())?;
-    let value = read_be_u64_prop(action_node.find_property("value")?.value())?;
-    let regmap_node = find_node_by_phandle(dtb, regmap_phandle)?;
-    let (base, size) = parse_reg_addr_size(regmap_node.find_property("reg")?.value())?;
-    let width_bytes = regmap_node
-        .find_property("reg-io-width")
-        .and_then(|prop| read_be_usize_prop(prop.value()))
-        .or_else(|| {
-            if size != 0 && offset < size && size - offset < 4 {
-                Some(1)
-            } else {
-                Some(4)
-            }
-        })?;
-    let access_width = PowerAccessWidth::from_bytes(width_bytes)?;
-    let address = base.checked_add(offset)?;
-
-    printk!(
-        "[kernel-start][dtb] power {:?}: syscon={} phys={:#x} offset={:#x} value={:#x} width={}B",
-        core::str::from_utf8(compatible).unwrap_or("<invalid>"),
-        regmap_node.name().unwrap_or("<unnamed>"),
-        address,
-        offset,
-        value,
-        width_bytes
-    );
-
-    Some(PowerControlMethod::RegisterWrite {
-        register: PowerRegister {
-            space: PowerRegisterSpace::SystemMemory,
-            address,
-            access_width,
-        },
-        value,
-    })
-}
-
-/// 读大端 u32 属性值。
-fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
-    Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
-}
-
-/// 读大端 usize 属性值（兼容 u32 和 u64）。
-fn read_be_usize_prop(value: &[u8]) -> Option<usize> {
-    if value.len() < 4 {
-        None
-    } else if value.len() < 8 {
-        read_be_u32_prop(value).map(|value| value as usize)
-    } else {
-        Some(u64::from_be_bytes(value.get(..8)?.try_into().ok()?) as usize)
-    }
-}
-
-/// 读大端 u64 属性值。
-fn read_be_u64_prop(value: &[u8]) -> Option<u64> {
-    if value.len() < 4 {
-        None
-    } else if value.len() < 8 {
-        read_be_u32_prop(value).map(|value| value as u64)
-    } else {
-        Some(u64::from_be_bytes(value.get(..8)?.try_into().ok()?))
-    }
-}
-
-/// 按 compatible 字符串查找节点（深度优先）。
-fn find_node_by_compatible(dtb: Dtb<'static>, compatible: &[u8]) -> Option<DtbNode<'static>> {
-    for node in dtb.children()? {
-        if node_compatible_contains(node, compatible) {
-            return Some(node);
-        }
-        if let Some(found) = find_child_by_compatible(node, compatible) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn find_child_by_compatible(node: DtbNode<'static>, compatible: &[u8]) -> Option<DtbNode<'static>> {
-    for child in node.children() {
-        if node_compatible_contains(child, compatible) {
-            return Some(child);
-        }
-        if let Some(found) = find_child_by_compatible(child, compatible) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// 检查节点的 compatible 属性是否包含指定的字符串。
-fn node_compatible_contains(node: DtbNode<'static>, compatible: &[u8]) -> bool {
-    let Some(prop) = node.find_property("compatible") else {
-        return false;
-    };
-    prop.value()
-        .split(|&byte| byte == 0)
-        .any(|entry| entry == compatible)
-}
-
-/// 按 phandle 值查找节点。
-fn find_node_by_phandle(dtb: Dtb<'static>, phandle: u32) -> Option<DtbNode<'static>> {
-    for node in dtb.children()? {
-        if node_phandle_matches(node, phandle) {
-            return Some(node);
-        }
-        if let Some(found) = find_child_by_phandle(node, phandle) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn find_child_by_phandle(node: DtbNode<'static>, phandle: u32) -> Option<DtbNode<'static>> {
-    for child in node.children() {
-        if node_phandle_matches(child, phandle) {
-            return Some(child);
-        }
-        if let Some(found) = find_child_by_phandle(child, phandle) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn node_phandle_matches(node: DtbNode<'static>, phandle: u32) -> bool {
-    ["phandle", "linux,phandle"].iter().any(|name| {
-        node.find_property(name)
-            .and_then(|prop| read_be_u32_prop(prop.value()))
-            == Some(phandle)
-    })
-}
-
-/// 解析 stdout-path 获得控制台串口信息和索引。
-fn parse_stdout_serial(dtb: Dtb<'static>) -> (Vec<SerialPortInfo>, Option<usize>) {
-    let Some(console_path) = parse_console_path(dtb) else {
-        printk!("[kernel-start][dtb] stdout-path not present; serial not registered");
-        return (Vec::new(), None);
-    };
-    let Some(node) = find_node_by_path(dtb, console_path) else {
-        printk!(
-            "[kernel-start][dtb] stdout-path '{}' does not resolve to a node",
-            console_path,
-        );
-        return (Vec::new(), None);
-    };
-    let Some(port) = serial_port_from_node(node, console_path) else {
-        printk!(
-            "[kernel-start][dtb] stdout-path '{}' is not a complete ns16550 node",
-            console_path,
-        );
-        return (Vec::new(), None);
-    };
-
-    if let Some(clock_hz) = port.clock_hz {
-        printk!(
-            "[kernel-start][dtb] stdout serial: {} phys={:#x} clock={}Hz",
-            port.name,
-            port.phys_addr,
-            clock_hz,
-        );
-    } else {
-        printk!(
-            "[kernel-start][dtb] stdout serial: {} phys={:#x} clock=<firmware-configured>",
-            port.name,
-            port.phys_addr,
-        );
-    }
-
-    (alloc::vec![port], Some(0))
-}
-
-/// 从节点提取 SerialPortInfo。
-fn serial_port_from_node(node: DtbNode<'static>, path: &'static str) -> Option<SerialPortInfo> {
-    if node.base_name_bytes() != b"serial" {
-        return None;
-    }
-    let reg_prop = node.find_property("reg")?;
-    let phys_addr = parse_reg_addr(reg_prop.value())?;
-    let clock_hz = node.find_property("clock-frequency").and_then(|p| {
-        let v = p.value();
-        if v.len() >= 4 {
-            Some(u32::from_be_bytes(v[0..4].try_into().ok()?))
-        } else {
-            None
-        }
-    });
-
-    Some(SerialPortInfo {
-        name: node.name().unwrap_or(path),
-        phys_addr,
-        clock_hz,
-    })
-}
-
-/// 解析 stdout-path 属性，去掉可能的冒号和参数部分。
-fn parse_stdout_path(val: &'static [u8]) -> Option<&'static str> {
-    let trimmed_end = val
-        .iter()
-        .rposition(|&b| b != 0)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let s = core::str::from_utf8(&val[..trimmed_end]).ok()?;
-    let s = s.trim_start_matches('/');
-    Some(s.split(':').next().unwrap_or(s))
-}
-
-/// 从 DTB 的 chosen 节点或 aliases 中获取控制台路径。
-fn parse_console_path(dtb: Dtb<'static>) -> Option<&'static str> {
-    let chosen = dtb.find_child("chosen")?;
-    let stdout_prop = chosen.find_property("stdout-path")?;
-    let requested = parse_stdout_path(stdout_prop.value())?;
-
-    if let Some(alias_node) = dtb.find_child("aliases")
-        && let Some(alias_prop) = alias_node.find_property(requested)
-        && let Some(resolved) = parse_stdout_path(alias_prop.value())
-    {
-        return Some(resolved);
-    }
-
-    Some(requested)
-}
-
-/// 根据路径字符串在 DTB 中查找节点。
-fn find_node_by_path(dtb: Dtb<'static>, path: &str) -> Option<DtbNode<'static>> {
-    let mut components = path
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|component| !component.is_empty());
-    let first = components.next()?;
-    let mut node = dtb.find_child(first)?;
-    for component in components {
-        node = node.find_child(component)?;
-    }
-    Some(node)
-}
-
-// ── PnP + PCI 初始化 ────────────────────────────────────────────────────
-
-/// 装 devtmpfs 回调、解析 DTB pcie 节点、注册 virtio-pci 驱动,最后扫描总线。
-///
-/// 调用前提:
-/// - devtmpfs superblock 已创建；它可以尚未挂到最终 `/dev`。
-/// - 任何在 bus 扫描过程中被匹配上的驱动都会调用
-///   [`PnpDevice::register_block_function`](general::dev::pnp::PnpDevice::register_block_function),
-///   其中转发给 devtmpfs 的路径靠本函数注入的回调完成。
-fn init_pnp_and_pci(
-    dtb: Dtb<'static>,
-    dev_sb: &Arc<general::vfs::superblock::Superblock>,
-    device_mmio_to_virt: fn(usize) -> usize,
-    virt_to_phys: fn(usize) -> usize,
-) {
-    // (a) 给 PnP 注入 devtmpfs 回调。DevTmpfsSuperblockOps 通过 Arc<Superblock>
-    //     downcast 获取,所以先把 ops 指针以 'static 形式存到一个 static 里。
-    //     这里用 Box::leak 的方式把一份克隆的 Arc 泄漏到静态生命周期。
-    use general::vfs::devtmpfs::DevTmpfsSuperblockOps as DtOps;
-    let sb_leaked: &'static Arc<general::vfs::superblock::Superblock> =
-        Box::leak(Box::new(Arc::clone(dev_sb)));
-
-    fn bind_block_cb(name: &str, dev: Arc<BlockDevice>) -> Result<(), PnpError> {
-        let sb = devtmpfs_sb();
-        let ops = sb.downcast_ops::<DtOps>().ok_or(PnpError::NoDevtmpfs)?;
-        ops.bind_block(name, dev)
-            .map_err(|_| PnpError::DevtmpfsError)
-    }
-    fn bind_char_cb(name: &str, dev: CharDevice) -> Result<(), PnpError> {
-        let sb = devtmpfs_sb();
-        let ops = sb.downcast_ops::<DtOps>().ok_or(PnpError::NoDevtmpfs)?;
-        ops.bind_char(name, dev)
-            .map_err(|_| PnpError::DevtmpfsError)
-    }
-    fn unbind_cb(name: &str) -> Result<(), PnpError> {
-        let sb = devtmpfs_sb();
-        let ops = sb.downcast_ops::<DtOps>().ok_or(PnpError::NoDevtmpfs)?;
-        ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
-    }
-
-    // 用静态闭包无法捕获 sb,只能靠静态变量共享引用。
-    set_pnp_devtmpfs_sb(sb_leaked);
-    set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
-        bind_block: bind_block_cb,
-        bind_char: bind_char_cb,
-        unbind: unbind_cb,
-    });
-    printk!("[kernel-start][dtb] PnP devtmpfs callbacks installed");
-
-    // (b) 解析 pcie 节点。没有就跳过。
-    let Some((phys, size, bus_s, bus_e)) = pci::parse_pcie_node(dtb) else {
-        printk!("[kernel-start][dtb] no pcie node in DTB; skipping PCI init");
-        return;
-    };
-    printk!(
-        "[kernel-start][dtb] pcie ECAM phys={:#x} size={:#x} bus=[{:#x},{:#x}]",
-        phys,
-        size,
-        bus_s,
-        bus_e
-    );
-    pci::install_ecam(phys, size, bus_s, bus_e, device_mmio_to_virt);
-
-    // (c) 注册 virtio-pci 块设备驱动。
-    let drv = Box::leak(Box::new(VirtioPciBlkDriver::new(virt_to_phys)));
-    PNP_DRIVERS.register(drv);
-    printk!("[kernel-start][dtb] registered PnpDriver 'virtio-pci-blk'");
-
-    // (c.5) 直接 `-kernel` 引导下 QEMU 不会为 PCI 设备分配 BAR,
-    //       这里遍历一次,从 PCI MMIO 窗口按需切片。
-    pci::assign_bars(bus_s, bus_e);
-
-    // (d) 扫描总线。每个被匹配的设备会自动经 PnP → devtmpfs 挂到 /dev/vd*。
-    let count = pci_scan_and_register(0, bus_s, bus_e, "pci-");
-    printk!(
-        "[kernel-start][dtb] pci_scan_and_register probed {} device(s)",
-        count
-    );
 }
 
 // devtmpfs superblock 全局桥梁,PnP 回调由 static fn 实现,需要从这里拿 sb。

@@ -1,6 +1,6 @@
 //! Linux asm-generic syscall 号。
 //!
-//! LoongArch64 走 asm-generic 编号；这里按数字顺序维护，避免重复注册和错号。
+//! 这里按数字顺序维护，避免重复注册和错号。
 
 pub const SYS_GETCWD: usize = 17;
 pub const SYS_EVENTFD2: usize = 19;
@@ -92,6 +92,7 @@ pub const SYS_RT_SIGTIMEDWAIT: usize = 137;
 pub const SYS_RT_SIGRETURN: usize = 139;
 pub const SYS_SETPRIORITY: usize = 140;
 pub const SYS_GETPRIORITY: usize = 141;
+pub const SYS_REBOOT: usize = 142;
 pub const SYS_SETREGID: usize = 143;
 pub const SYS_SETGID: usize = 144;
 pub const SYS_SETREUID: usize = 145;
@@ -121,12 +122,17 @@ pub const SYS_GETEGID: usize = 177;
 pub const SYS_GETTID: usize = 178;
 pub const SYS_SYSINFO: usize = 179;
 pub const SYS_SOCKET: usize = 198;
+pub const SYS_SOCKETPAIR: usize = 199;
 pub const SYS_BIND: usize = 200;
 pub const SYS_LISTEN: usize = 201;
 pub const SYS_ACCEPT: usize = 202;
 pub const SYS_CONNECT: usize = 203;
 pub const SYS_GETSOCKNAME: usize = 204;
+pub const SYS_GETPEERNAME: usize = 205;
+pub const SYS_SENDTO: usize = 206;
+pub const SYS_RECVFROM: usize = 207;
 pub const SYS_SETSOCKOPT: usize = 208;
+pub const SYS_GETSOCKOPT: usize = 209;
 pub const SYS_SHUTDOWN: usize = 210;
 pub const SYS_SENDMSG: usize = 211;
 pub const SYS_RECVMSG: usize = 212;
@@ -140,8 +146,11 @@ pub const SYS_MMAP: usize = 222;
 pub const SYS_FADVISE64: usize = 223;
 pub const SYS_MPROTECT: usize = 226;
 pub const SYS_MADVISE: usize = 233;
+pub const SYS_ACCEPT4: usize = 242;
+pub const SYS_RECVMMSG: usize = 243;
 pub const SYS_WAIT4: usize = 260;
 pub const SYS_PRLIMIT64: usize = 261;
+pub const SYS_SENDMMSG: usize = 269;
 pub const SYS_SYNCFS: usize = 267;
 pub const SYS_RENAMEAT2: usize = 276;
 pub const SYS_GETRANDOM: usize = 278;

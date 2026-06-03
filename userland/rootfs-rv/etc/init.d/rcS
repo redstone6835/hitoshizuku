@@ -1,0 +1,55 @@
+#!/bin/sh
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+echo "[init] Welcome to Shiori"
+
+for dir in /dev /sys /proc /var /var/log /run /mnt /tmp; do
+  [ -d "$dir" ] || mkdir -p "$dir"
+  echo "[init] mkdir $dir OK"
+done
+
+mount -t proc proc /proc 2>/dev/null || true
+echo "[init] mount /proc OK"
+
+mount -t sysfs sysfs /sys 2>/dev/null || true
+echo "[init] mount /sys OK"
+
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+echo "[init] mount /dev OK"
+
+
+if [ -x /sbin/mdev ]; then
+  if [ -e /proc/sys/kernel/hotplug ]; then
+    echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+  fi
+  /sbin/mdev -s 2>/dev/null || true
+fi
+
+run_test_scripts() {
+  set -- /mnt/*_testcode.sh
+  if [ "$1" = "/mnt/*_testcode.sh" ]; then
+    return 1
+  fi
+
+  echo "[init] found test scripts on /mnt"
+  for script in "$@"; do
+    echo "[init] run $(basename "$script")"
+    /bin/sh "$script"
+  done
+  return 0
+}
+
+shutdown_after_tests() {
+  sync || true
+  poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || reboot -f >/dev/null 2>&1 || true
+}
+
+if run_test_scripts; then
+  echo "[init] test scripts finished"
+  shutdown_after_tests
+fi
+
+echo "[init] no test scripts found, entering shell"
+exec /bin/sh -i

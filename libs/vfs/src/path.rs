@@ -209,65 +209,7 @@ pub fn lookup(
         symlink_remaining: ctx.limits.symlink_max_depth,
         ctx,
     };
-
-    /// 辅助：处理 walk_component 返回的 (dentry, Option<mount>)，更新 state
-    fn step(state: &mut WalkState<'_>, name: &str) -> VfsResult<()> {
-        let (dentry, new_mount) = walk_component(state, name)?;
-        state.current = dentry;
-        if let Some(m) = new_mount {
-            state.current_mount = m;
-        }
-        Ok(())
-    }
-
-    let mut components = PathComponents::new(path).peekable();
-
-    while let Some(component) = components.next() {
-        let is_last = components.peek().is_none();
-
-        if !is_last {
-            step(&mut state, component)?;
-            // 检查中间分量类型，并验证执行（搜索）权限
-            if let Some(inode) = state.current.inode() {
-                // 每个中间目录分量必须有执行（搜索）权限。
-                // 缺少此检查将导致 DAC 绕过：攻击者可穿越无 x 权限的目录。
-                {
-                    let meta = inode.meta_snapshot();
-                    if !state.ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
-                        return Err(VfsError::PermissionDenied);
-                    }
-                }
-                if inode.kind == crate::vfs::stat::FileType::Symlink {
-                    if flags.has(LookupFlags::NO_SYMLINKS) {
-                        return Err(VfsError::NotADirectory);
-                    }
-                    let link = Arc::clone(&state.current);
-                    state.current = follow_symlink(&mut state, &link)?;
-                } else if inode.kind != crate::vfs::stat::FileType::Directory {
-                    return Err(VfsError::NotADirectory);
-                }
-            }
-        } else {
-            match step(&mut state, component) {
-                Ok(()) => {
-                    // 最后分量若是符号链接，且未设置 NO_FOLLOW，则跟随
-                    if !flags.has(LookupFlags::NO_FOLLOW)
-                        && let Some(inode) = state.current.inode()
-                        && inode.kind == crate::vfs::stat::FileType::Symlink
-                    {
-                        let link = Arc::clone(&state.current);
-                        state.current = follow_symlink(&mut state, &link)?;
-                    }
-                }
-                Err(VfsError::NotFound) if flags.has(LookupFlags::ALLOW_MISSING_LAST) => {
-                    // 允许最后分量不存在（open(O_CREAT) 等场景）：
-                    // state.current 此时仍为父目录，直接 break 跳出循环，
-                    // 后续返回父目录的 LookupResult。
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
+    walk_path(&mut state, path, flags)?;
 
     // 检查 DIRECTORY 标志
     if flags.has(LookupFlags::DIRECTORY)
@@ -281,6 +223,61 @@ pub fn lookup(
         dentry: state.current,
         mount: state.current_mount,
     })
+}
+
+fn step(state: &mut WalkState<'_>, name: &str) -> VfsResult<()> {
+    let (dentry, new_mount) = walk_component(state, name)?;
+    state.current = dentry;
+    if let Some(m) = new_mount {
+        state.current_mount = m;
+    }
+    Ok(())
+}
+
+fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsResult<()> {
+    let mut components = PathComponents::new(path).peekable();
+
+    while let Some(component) = components.next() {
+        let is_last = components.peek().is_none();
+
+        if !is_last {
+            step(state, component)?;
+            if let Some(inode) = state.current.inode() {
+                {
+                    let meta = inode.meta_snapshot();
+                    if !state.ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                        return Err(VfsError::PermissionDenied);
+                    }
+                }
+                if inode.kind == crate::vfs::stat::FileType::Symlink {
+                    if flags.has(LookupFlags::NO_SYMLINKS) {
+                        return Err(VfsError::NotADirectory);
+                    }
+                    let link = Arc::clone(&state.current);
+                    state.current = follow_symlink(state, &link)?;
+                } else if inode.kind != crate::vfs::stat::FileType::Directory {
+                    return Err(VfsError::NotADirectory);
+                }
+            }
+            continue;
+        }
+
+        match step(state, component) {
+            Ok(()) => {
+                if !flags.has(LookupFlags::NO_FOLLOW)
+                    && let Some(inode) = state.current.inode()
+                    && inode.kind == crate::vfs::stat::FileType::Symlink
+                {
+                    let link = Arc::clone(&state.current);
+                    state.current = follow_symlink(state, &link)?;
+                }
+            }
+            Err(VfsError::NotFound) if flags.has(LookupFlags::ALLOW_MISSING_LAST) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(())
 }
 
 /// 解析路径直到最后一个分量的 **父目录**，同时返回最后分量的名称字符串。
@@ -479,12 +476,8 @@ fn follow_symlink(state: &mut WalkState<'_>, link_dentry: &Arc<Dentry>) -> VfsRe
         // 若 link_dentry 无父（根 dentry 不应是符号链接），维持不变
     }
 
-    for component in PathComponents::new(&target) {
-        let (dentry, new_mount) = walk_component(state, component)?;
-        state.current = dentry;
-        if let Some(m) = new_mount {
-            state.current_mount = m;
-        }
+    if !target.is_empty() {
+        walk_path(state, &target, LookupFlags::default())?;
     }
 
     Ok(Arc::clone(&state.current))

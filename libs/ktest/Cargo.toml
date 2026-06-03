@@ -1,0 +1,16 @@
+[package]
+name = "ktest"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[features]
+kernel = ["dep:spin"]
+
+[dependencies]
+ktest-macro = { path = "./ktest-macro" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"], optional = true }

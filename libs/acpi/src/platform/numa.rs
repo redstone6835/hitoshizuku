@@ -33,39 +33,46 @@ impl<A: Allocator> NumaInfo<A> {
         if let Some(srat) = tables.find_table::<Srat>() {
             for entry in srat.get().entries() {
                 match entry {
-                    SratEntry::LocalApicAffinity(entry) => processor_affinity.push(ProcessorAffinity {
-                        local_apic_id: entry.apic_id as u32,
-                        proximity_domain: entry.proximity_domain(),
-                        is_enabled: { entry.flags }.contains(LocalApicAffinityFlags::ENABLED),
-                    }),
-                    SratEntry::LocalApicX2Affinity(entry) => processor_affinity.push(ProcessorAffinity {
-                        local_apic_id: entry.x2apic_id,
-                        proximity_domain: entry.proximity_domain,
-                        is_enabled: { entry.flags }.contains(LocalApicAffinityFlags::ENABLED),
-                    }),
+                    SratEntry::LocalApicAffinity(entry) => {
+                        processor_affinity.push(ProcessorAffinity {
+                            local_apic_id: entry.apic_id as u32,
+                            proximity_domain: entry.proximity_domain(),
+                            is_enabled: { entry.flags }.contains(LocalApicAffinityFlags::ENABLED),
+                        })
+                    }
+                    SratEntry::LocalApicX2Affinity(entry) => {
+                        processor_affinity.push(ProcessorAffinity {
+                            local_apic_id: entry.x2apic_id,
+                            proximity_domain: entry.proximity_domain,
+                            is_enabled: { entry.flags }.contains(LocalApicAffinityFlags::ENABLED),
+                        })
+                    }
                     SratEntry::MemoryAffinity(entry) => memory_affinity.push(MemoryAffinity {
                         base_address: entry.base_address(),
                         length: entry.length(),
                         proximity_domain: entry.proximity_domain,
                         is_enabled: { entry.flags }.contains(MemoryAffinityFlags::ENABLED),
-                        is_hot_pluggable: { entry.flags }.contains(MemoryAffinityFlags::HOT_PLUGGABLE),
-                        is_non_volatile: { entry.flags }.contains(MemoryAffinityFlags::NON_VOLATILE),
+                        is_hot_pluggable: { entry.flags }
+                            .contains(MemoryAffinityFlags::HOT_PLUGGABLE),
+                        is_non_volatile: { entry.flags }
+                            .contains(MemoryAffinityFlags::NON_VOLATILE),
                     }),
                     _ => (),
                 }
             }
         }
 
-        let (num_proximity_domains, distance_matrix) = if let Some(slit) = tables.find_table::<Slit>() {
-            let matrix = slit.get().matrix_raw();
-            let mut distance_matrix = Vec::with_capacity_in(matrix.len(), allocator.clone());
-            for byte in matrix {
-                distance_matrix.push(*byte);
-            }
-            (slit.get().num_proximity_domains as usize, distance_matrix)
-        } else {
-            (0, Vec::new_in(allocator.clone()))
-        };
+        let (num_proximity_domains, distance_matrix) =
+            if let Some(slit) = tables.find_table::<Slit>() {
+                let matrix = slit.get().matrix_raw();
+                let mut distance_matrix = Vec::with_capacity_in(matrix.len(), allocator.clone());
+                for byte in matrix {
+                    distance_matrix.push(*byte);
+                }
+                (slit.get().num_proximity_domains as usize, distance_matrix)
+            } else {
+                (0, Vec::new_in(allocator.clone()))
+            };
 
         NumaInfo {
             processor_affinity,
@@ -77,7 +84,10 @@ impl<A: Allocator> NumaInfo<A> {
     }
 
     pub fn distance_matrix(&self) -> DistanceMatrix<'_> {
-        DistanceMatrix { num_proximity_domains: self.num_proximity_domains as u64, matrix: &self.distance_matrix }
+        DistanceMatrix {
+            num_proximity_domains: self.num_proximity_domains as u64,
+            matrix: &self.distance_matrix,
+        }
     }
 }
 
