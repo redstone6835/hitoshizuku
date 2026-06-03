@@ -19,3 +19,9 @@ rustflags = [
 [env]
 CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
 CC_riscv64gc_unknown_none_elf = "riscv64-linux-gnu-gcc"
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
