@@ -17,8 +17,9 @@ mod state;
 mod types;
 mod wait;
 
-pub use state::{Socket, snapshot_sockets};
+pub use state::{Socket, snapshot_sockets, unregister_path_socket};
 pub use types::{
-    SocketError, SocketHandle, PathKey, PeerIdentity, Readiness, ReceiveOptions, ReceiveResult, SendOptions,
-    SharedHandle, SocketShutdown, SocketLinger, SocketTimeval, SocketType, UnixAddress,
+    HandleIdentity, PathKey, PeerIdentity, Readiness, ReceiveOptions, ReceiveResult, SendOptions,
+    SharedHandle, SocketError, SocketHandle, SocketLinger, SocketShutdown, SocketTimeval,
+    SocketType, UnixAddress,
 };

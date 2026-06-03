@@ -9,9 +9,9 @@ use core::ops::ControlFlow;
 use errno::Errno;
 use sched::{Task, current_task, now_ns_public};
 use socket::{
-    SocketError, SocketHandle, PeerIdentity, Readiness, ReceiveOptions,
-    SendOptions, SocketShutdown, Socket as CoreSocket, SocketLinger, SocketTimeval,
-    SocketType, UnixAddress,
+    HandleIdentity, PeerIdentity, Readiness, ReceiveOptions, SendOptions, Socket as CoreSocket,
+    SocketError, SocketHandle, SocketLinger, SocketShutdown, SocketTimeval, SocketType,
+    UnixAddress,
 };
 
 use crate::operation;
@@ -197,11 +197,16 @@ impl SuperblockOps for SocketSuperblockOps {
 
 struct SocketHandleRef {
     file: Arc<File>,
+    identity: Option<HandleIdentity>,
 }
 
 impl SocketHandle for SocketHandleRef {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn identity(&self) -> Option<HandleIdentity> {
+        self.identity
     }
 }
 
@@ -275,6 +280,9 @@ impl FileOps for SocketFileOps {
         }
         if ready.has(Readiness::HANGUP) {
             events = events.with(PollEvents::POLLHUP);
+        }
+        if ready.has(Readiness::READ_HANGUP) {
+            events = events.with(PollEvents::POLLRDHUP);
         }
         if ready.has(Readiness::FAULT) {
             events = events.with(PollEvents::POLLERR);
@@ -393,6 +401,11 @@ fn socket_from_file(file: &Arc<File>) -> Result<CoreSocket, Errno> {
     Ok(ops.socket())
 }
 
+fn socket_handle_identity(file: &Arc<File>) -> Option<HandleIdentity> {
+    file.downcast_ops::<SocketFileOps>()
+        .map(|ops| HandleIdentity::Socket(ops.socket().id()))
+}
+
 fn readiness_from_poll(interest: PollEvents) -> Readiness {
     let mut out = Readiness::empty();
     if interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI) {
@@ -403,6 +416,9 @@ fn readiness_from_poll(interest: PollEvents) -> Readiness {
     }
     if interest.has(PollEvents::POLLHUP) {
         out = out.with(Readiness::HANGUP);
+    }
+    if interest.has(PollEvents::POLLRDHUP) {
+        out = out.with(Readiness::READ_HANGUP);
     }
     if interest.has(PollEvents::POLLERR) {
         out = out.with(Readiness::FAULT);
@@ -496,8 +512,20 @@ pub fn socketpair(
 pub fn bind(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
     let socket = socket_from_file(&file)?;
-    let address = resolve_bind_address(ctx, raw_addr)?;
-    socket.bind(address).map_err(map_socket_error)
+    let resolved = resolve_bind_address(ctx, raw_addr)?;
+    match socket.bind(resolved.address) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if let Some(path) = resolved.created_path {
+                let _ = operation::unlink(ctx, &Dirfd::Cwd, &path);
+            }
+            Err(map_socket_error(err))
+        }
+    }
+}
+
+pub fn unregister_path_socket(fs: u64, ino: u64) {
+    socket::unregister_path_socket(socket::PathKey { fs, ino });
 }
 
 pub fn listen(fdt: &FdTable, fd: Fd, backlog: usize) -> Result<(), Errno> {
@@ -604,7 +632,7 @@ pub fn send(
     validate_send_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
     let socket = socket_from_file(&file)?;
-    let decoded = decode_send_control(ctx, fdt, &file, control)?;
+    let decoded = decode_send_control(ctx, fdt, &file, &socket, control)?;
     let address = match raw_addr {
         Some(raw) => Some(resolve_connect_address(ctx, raw)?),
         None => None,
@@ -807,6 +835,11 @@ struct DecodedControl {
     credentials: Option<PeerIdentity>,
 }
 
+struct ResolvedBindAddress {
+    address: UnixAddress,
+    created_path: Option<String>,
+}
+
 fn parse_sockaddr_un(raw: &[u8]) -> Result<ParsedUnixAddress, Errno> {
     if raw.len() < 2 || raw.len() > MAX_SOCKADDR_LEN {
         return Err(Errno::EINVAL);
@@ -834,10 +867,13 @@ fn parse_sockaddr_un(raw: &[u8]) -> Result<ParsedUnixAddress, Errno> {
     })
 }
 
-fn resolve_bind_address(ctx: &VfsContext, raw: &[u8]) -> Result<UnixAddress, Errno> {
+fn resolve_bind_address(ctx: &VfsContext, raw: &[u8]) -> Result<ResolvedBindAddress, Errno> {
     match parse_sockaddr_un(raw)? {
         ParsedUnixAddress::Unnamed => Err(Errno::EINVAL),
-        ParsedUnixAddress::Abstract(name) => Ok(UnixAddress::Abstract(name)),
+        ParsedUnixAddress::Abstract(name) => Ok(ResolvedBindAddress {
+            address: UnixAddress::Abstract(name),
+            created_path: None,
+        }),
         ParsedUnixAddress::Path { path, display } => {
             match operation::mknodat(
                 ctx,
@@ -854,12 +890,15 @@ fn resolve_bind_address(ctx: &VfsContext, raw: &[u8]) -> Result<UnixAddress, Err
             let result = path::lookup(ctx, &Dirfd::Cwd, &path, LookupFlags::default())
                 .map_err(|e| e.to_errno())?;
             let inode = result.dentry.inode().ok_or(Errno::ENOENT)?;
-            Ok(UnixAddress::Path {
-                key: socket::PathKey {
-                    fs: inode.fs_id().raw(),
-                    ino: inode.ino(),
+            Ok(ResolvedBindAddress {
+                address: UnixAddress::Path {
+                    key: socket::PathKey {
+                        fs: inode.fs_id().raw(),
+                        ino: inode.ino(),
+                    },
+                    display,
                 },
-                display,
+                created_path: Some(path),
             })
         }
     }
@@ -918,6 +957,7 @@ fn decode_send_control(
     ctx: &VfsContext,
     fdt: &FdTable,
     source_file: &Arc<File>,
+    source_socket: &CoreSocket,
     control: &[u8],
 ) -> Result<DecodedControl, Errno> {
     let identity = current_identity(ctx);
@@ -963,7 +1003,15 @@ fn decode_send_control(
                         if Arc::ptr_eq(&file, source_file) {
                             return Err(Errno::EINVAL);
                         }
-                        out.push(Arc::new(SocketHandleRef { file }) as socket::SharedHandle);
+                        let identity = socket_handle_identity(&file);
+                        if identity.is_some_and(|identity| {
+                            source_socket.would_create_handle_cycle(identity)
+                        }) {
+                            return Err(Errno::EINVAL);
+                        }
+                        out.push(
+                            Arc::new(SocketHandleRef { file, identity }) as socket::SharedHandle
+                        );
                     }
                 }
                 SCM_CREDENTIALS => {

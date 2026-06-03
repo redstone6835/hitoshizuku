@@ -14,7 +14,9 @@ use crate::state::{
     SeqpacketConnectedState, SequencedSocket, SequencedState, Socket, SocketKind, SocketOptions,
     StreamQueue, StreamSocket, StreamState, registry_lookup,
 };
-use crate::types::{SocketError, PeerIdentity, ReceiveOptions, SendOptions, SocketType, UnixAddress};
+use crate::types::{
+    PeerIdentity, ReceiveOptions, SendOptions, SocketError, SocketType, UnixAddress,
+};
 use crate::wait::{wait_while, wake_task};
 
 /// 连接型套接字的通用状态机操作 trait。
