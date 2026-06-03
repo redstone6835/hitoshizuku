@@ -22,6 +22,7 @@ use crate::vfs::sync::Spinlock;
 pub const EPOLL_CTL_ADD: i32 = 1;
 pub const EPOLL_CTL_DEL: i32 = 2;
 pub const EPOLL_CTL_MOD: i32 = 3;
+pub const EPOLLRDHUP: u32 = PollEvents::POLLRDHUP.0 as u32;
 pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
 pub const EPOLLET: u32 = 1 << 31;
 pub const EPOLLONESHOT: u32 = 1 << 30;
@@ -229,6 +230,11 @@ impl EpollFileOps {
         Ok(())
     }
 
+    fn remove_closed_fd(&self, fd: Fd) {
+        let mut state = self.state.lock();
+        state.watches.retain(|watch| watch.fd != fd);
+    }
+
     fn any_ready(&self) -> bool {
         let state = self.state.lock();
         state.watches.iter().any(|watch| peek_watch_ready(watch))
@@ -344,6 +350,7 @@ impl FileOps for EpollFileOps {
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
         if !(interest.has(PollEvents::POLLIN)
             || interest.has(PollEvents::POLLPRI)
+            || interest.has(PollEvents::POLLRDHUP)
             || interest.has(PollEvents::POLLHUP)
             || interest.has(PollEvents::POLLERR))
         {
@@ -361,6 +368,10 @@ impl FileOps for EpollFileOps {
         for (file, _) in &sources {
             file.poll_remove_waiter(task);
         }
+    }
+
+    fn on_fd_closed(&self, fd: u32) {
+        self.remove_closed_fd(Fd::from_raw(fd));
     }
 
     fn is_seekable(&self) -> bool {
@@ -500,8 +511,12 @@ pub fn create(fdt: &FdTable, cred: Arc<Credentials>, cloexec: bool) -> Result<Fd
     } else {
         FdFlags::default()
     };
-    fdt.alloc_fd(new_epoll_file(cred), flags)
-        .map_err(|e| e.to_errno())
+    let file = new_epoll_file(cred);
+    let fd = fdt
+        .alloc_fd(Arc::clone(&file), flags)
+        .map_err(|e| e.to_errno())?;
+    fdt.register_close_observer(&file);
+    Ok(fd)
 }
 
 pub fn ctl(

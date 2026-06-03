@@ -14,7 +14,9 @@ use crate::state::{
     SeqpacketConnectedState, SequencedSocket, SequencedState, Socket, SocketKind, SocketOptions,
     StreamQueue, StreamSocket, StreamState, registry_lookup,
 };
-use crate::types::{SocketError, PeerIdentity, ReceiveOptions, SendOptions, SocketType, UnixAddress};
+use crate::types::{
+    PeerIdentity, ReceiveOptions, SendOptions, SocketError, SocketType, UnixAddress,
+};
 use crate::wait::{wait_while, wake_task};
 
 /// 连接型套接字的通用状态机操作 trait。
@@ -247,7 +249,7 @@ fn make_seqpacket_states(
         rx: Arc::clone(&a_rx),
         tx: Arc::clone(&b_rx),
         peer_name: b_local.clone(),
-        peer_identity: b_peer,
+        peer_identity: a_peer,
         read_shutdown: false,
         write_shutdown: false,
     };
@@ -256,7 +258,7 @@ fn make_seqpacket_states(
         rx: b_rx,
         tx: a_rx,
         peer_name: a_local,
-        peer_identity: a_peer,
+        peer_identity: b_peer,
         read_shutdown: false,
         write_shutdown: false,
     };

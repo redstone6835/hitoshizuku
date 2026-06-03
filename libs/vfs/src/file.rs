@@ -138,6 +138,8 @@ impl PollEvents {
     pub const POLLHUP: Self = Self(0x0010);
     /// 描述符无效（仅在 `revents` 中出现，通常表示传入了无效的 fd）。
     pub const POLLNVAL: Self = Self(0x0020);
+    /// 对端关闭写半边（Linux POLLRDHUP / EPOLLRDHUP）。
+    pub const POLLRDHUP: Self = Self(0x2000);
 
     /// 将两个事件掩码合并。
     pub const fn with(self, other: Self) -> Self {
@@ -573,6 +575,10 @@ impl File {
         self.ops.poll_remove_waiter(task)
     }
 
+    pub fn on_fd_closed(&self, fd: u32) {
+        self.ops.on_fd_closed(fd)
+    }
+
     pub fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
         self.ops.io_timeout_deadline(interest)
     }
@@ -699,6 +705,12 @@ pub trait FileOps {
 
     /// 显式移除之前登记的等待者。
     fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
+
+    /// 某个 fd 号从 fdtable 中关闭或被替换时调用。
+    ///
+    /// 这是描述符级通知，不等同于 [`FileOps::release`]；同一个 `File` 可能仍被
+    /// 其他 dup 出来的 fd 或 epoll/SCM_RIGHTS 持有。
+    fn on_fd_closed(&self, _fd: u32) {}
 
     /// 返回普通 read/write 等待对应的超时 deadline。
     ///

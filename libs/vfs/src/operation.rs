@@ -60,6 +60,12 @@ fn apply_create_mode(ctx: &VfsContext, mode: FileMode) -> FileMode {
     m
 }
 
+fn unregister_socket_inode(inode: &Inode) {
+    if inode.kind == stat::FileType::Socket {
+        crate::socket::unregister_path_socket(inode.fs_id().raw(), inode.ino());
+    }
+}
+
 /// 将新创建的 inode 插入 inode cache 和 dentry cache。
 ///
 /// 返回经过 DCACHE 去重后的规范 Dentry（若并发插入，返回先到的那个）。
@@ -296,6 +302,7 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.unlink(&parent_inode, name, &child_inode)?;
+    unregister_socket_inode(&child_inode);
     DCACHE.invalidate_dentry(&target.dentry);
     target.dentry.invalidate();
     retire_inode(child_inode);
@@ -385,6 +392,9 @@ pub fn renameat(
 
     // 若替换了已有文件，清理被替换的 inode
     if let Some((_, replaced_inode)) = new_existing {
+        if !Arc::ptr_eq(&old_inode, &replaced_inode) {
+            unregister_socket_inode(&replaced_inode);
+        }
         retire_inode(replaced_inode);
     }
     Ok(())

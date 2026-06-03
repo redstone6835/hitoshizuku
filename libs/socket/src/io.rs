@@ -15,7 +15,7 @@ use crate::state::{
     StreamChunk, StreamSocket, StreamState,
 };
 use crate::types::{
-    SocketError, PeerIdentity, Readiness, ReceiveOptions, ReceiveResult, SendOptions, SharedHandle,
+    PeerIdentity, Readiness, ReceiveOptions, ReceiveResult, SendOptions, SharedHandle, SocketError,
     SocketShutdown, UnixAddress,
 };
 use crate::wait::{wait_while, wake_task};
@@ -79,13 +79,19 @@ pub(crate) fn register_stream_waiter(
     let state = stream.state.lock();
     match &*state {
         StreamState::Listening(_) => {
-            if interest.has(Readiness::READABLE) || interest.has(Readiness::HANGUP) {
+            if interest.has(Readiness::READABLE)
+                || interest.has(Readiness::HANGUP)
+                || interest.has(Readiness::READ_HANGUP)
+            {
                 stream.accept_wait.enqueue(task);
             }
             true
         }
         StreamState::Connected(conn) => {
-            if interest.has(Readiness::READABLE) || interest.has(Readiness::HANGUP) {
+            if interest.has(Readiness::READABLE)
+                || interest.has(Readiness::HANGUP)
+                || interest.has(Readiness::READ_HANGUP)
+            {
                 conn.rx.read_wait.enqueue(task);
             }
             if interest.has(Readiness::WRITABLE)
@@ -120,13 +126,19 @@ pub(crate) fn register_seqpacket_waiter(
     let state = seq.state.lock();
     match &*state {
         SequencedState::Listening(_) => {
-            if interest.has(Readiness::READABLE) || interest.has(Readiness::HANGUP) {
+            if interest.has(Readiness::READABLE)
+                || interest.has(Readiness::HANGUP)
+                || interest.has(Readiness::READ_HANGUP)
+            {
                 seq.accept_wait.enqueue(task);
             }
             true
         }
         SequencedState::Connected(conn) => {
-            if interest.has(Readiness::READABLE) || interest.has(Readiness::HANGUP) {
+            if interest.has(Readiness::READABLE)
+                || interest.has(Readiness::HANGUP)
+                || interest.has(Readiness::READ_HANGUP)
+            {
                 conn.rx.read_wait.enqueue(task);
             }
             if interest.has(Readiness::WRITABLE)
@@ -159,7 +171,10 @@ pub(crate) fn register_datagram_waiter(
     interest: Readiness,
 ) -> bool {
     let state = dgram.state.lock();
-    if interest.has(Readiness::READABLE) || interest.has(Readiness::HANGUP) {
+    if interest.has(Readiness::READABLE)
+        || interest.has(Readiness::HANGUP)
+        || interest.has(Readiness::READ_HANGUP)
+    {
         dgram.read_wait.enqueue(task);
     }
     if interest.has(Readiness::WRITABLE) || interest.has(Readiness::FAULT) {
@@ -188,7 +203,10 @@ pub(crate) fn unregister_datagram_waiter(dgram: &DatagramSocket, task: &Arc<Task
 }
 
 /// 关闭 Stream 套接字的读/写端。
-pub(crate) fn shutdown_stream(stream: &StreamSocket, how: SocketShutdown) -> Result<(), SocketError> {
+pub(crate) fn shutdown_stream(
+    stream: &StreamSocket,
+    how: SocketShutdown,
+) -> Result<(), SocketError> {
     let mut state = stream.state.lock();
     let Some(conn) = state.connected_mut() else {
         return if state.is_closed() {
@@ -215,7 +233,10 @@ pub(crate) fn shutdown_stream(stream: &StreamSocket, how: SocketShutdown) -> Res
 }
 
 /// 关闭 Datagram 套接字的读/写端。
-pub(crate) fn shutdown_datagram(dgram: &DatagramSocket, how: SocketShutdown) -> Result<(), SocketError> {
+pub(crate) fn shutdown_datagram(
+    dgram: &DatagramSocket,
+    how: SocketShutdown,
+) -> Result<(), SocketError> {
     let mut state = dgram.state.lock();
     if matches!(how, SocketShutdown::Read | SocketShutdown::Both) {
         state.read_shutdown = true;
@@ -230,7 +251,10 @@ pub(crate) fn shutdown_datagram(dgram: &DatagramSocket, how: SocketShutdown) -> 
 }
 
 /// 关闭 Sequenced 套接字的读/写端。
-pub(crate) fn shutdown_seqpacket(seq: &SequencedSocket, how: SocketShutdown) -> Result<(), SocketError> {
+pub(crate) fn shutdown_seqpacket(
+    seq: &SequencedSocket,
+    how: SocketShutdown,
+) -> Result<(), SocketError> {
     let mut state = seq.state.lock();
     let Some(conn) = state.connected_mut() else {
         return if state.is_closed() {
@@ -468,7 +492,11 @@ pub(crate) fn recv_stream(
                 options.deadline_ns,
             ) {
                 Ok(()) => continue,
-                Err(SocketError::Interrupted | SocketError::TemporaryUnavailable) if copied != 0 => break,
+                Err(SocketError::Interrupted | SocketError::TemporaryUnavailable)
+                    if copied != 0 =>
+                {
+                    break;
+                }
                 Err(err) => return Err(err),
             }
         }
