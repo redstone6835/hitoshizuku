@@ -105,7 +105,10 @@ fn stream_accept_without_pending_is_nonblocking_eagain() {
     let listener = socket(SocketType::Stream, 107);
     listener.listen(1).expect("listen");
 
-    assert_socket_err(listener.accept(recv_nb()), SocketError::TemporaryUnavailable);
+    assert_socket_err(
+        listener.accept(recv_nb()),
+        SocketError::TemporaryUnavailable,
+    );
 }
 
 #[ktest]
@@ -138,7 +141,10 @@ fn stream_shutdown_write_reports_peer_rdhup_and_eof() {
 
     let out = b.receive(&mut buf, recv_nb()).expect("eof");
     assert_eq!(out.length, 0);
-    assert_eq!(a.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        a.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]
@@ -148,7 +154,10 @@ fn stream_shutdown_read_makes_peer_write_fail() {
     assert_eq!(b.shutdown(SocketShutdown::Read), Ok(()));
     assert_ready_has(&a, Readiness::HANGUP);
     assert_ready_has(&a, Readiness::FAULT);
-    assert_eq!(a.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        a.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]
@@ -161,7 +170,10 @@ fn stream_close_propagates_hup_fault_and_eof() {
     assert_ready_has(&b, Readiness::READ_HANGUP);
     assert_ready_has(&b, Readiness::FAULT);
     assert_eq!(b.receive(&mut buf, recv_nb()).expect("eof").length, 0);
-    assert_eq!(b.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        b.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]
@@ -174,6 +186,9 @@ fn stream_unconnected_operations_fail_cleanly() {
         sock.send(b"x", &[], None, send_nb()),
         Err(SocketError::ConnectionMissing)
     );
-    assert_socket_err(sock.receive(&mut buf, recv_nb()), SocketError::ConnectionMissing);
+    assert_socket_err(
+        sock.receive(&mut buf, recv_nb()),
+        SocketError::ConnectionMissing,
+    );
     assert_socket_err(sock.accept(recv_nb()), SocketError::ListenerRequired);
 }

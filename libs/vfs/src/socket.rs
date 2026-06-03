@@ -7,7 +7,9 @@ use core::any::Any;
 use core::ops::ControlFlow;
 
 use errno::Errno;
-use sched::{Task, current_task, now_ns_public};
+#[cfg(not(test))]
+use sched::current_task;
+use sched::{Task, now_ns_public};
 use socket::{
     HandleIdentity, PeerIdentity, Readiness, ReceiveOptions, SendOptions, Socket as CoreSocket,
     SocketError, SocketHandle, SocketLinger, SocketShutdown, SocketTimeval, SocketType,
@@ -366,10 +368,20 @@ fn map_socket_error(err: SocketError) -> Errno {
     }
 }
 
+#[cfg(not(test))]
 fn current_identity(ctx: &VfsContext) -> PeerIdentity {
     let pid = current_task().pid_root().unwrap_or(0) as u32;
     PeerIdentity {
         process: pid,
+        user: ctx.cred.euid.0,
+        group: ctx.cred.egid.0,
+    }
+}
+
+#[cfg(test)]
+fn current_identity(ctx: &VfsContext) -> PeerIdentity {
+    PeerIdentity {
+        process: 0,
         user: ctx.cred.euid.0,
         group: ctx.cred.egid.0,
     }

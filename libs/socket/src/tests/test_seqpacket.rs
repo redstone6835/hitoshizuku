@@ -87,7 +87,10 @@ fn seqpacket_nonblocking_errors_match_state() {
         Err(SocketError::ConnectionRejected)
     );
     assert_socket_err(listener.accept(recv_nb()), SocketError::ListenerRequired);
-    assert_socket_err(client.receive(&mut buf, recv_nb()), SocketError::ConnectionMissing);
+    assert_socket_err(
+        client.receive(&mut buf, recv_nb()),
+        SocketError::ConnectionMissing,
+    );
 }
 
 #[ktest]
@@ -99,7 +102,10 @@ fn seqpacket_shutdown_write_reports_peer_rdhup_and_eof() {
     assert_ready_has(&b, Readiness::READABLE);
     assert_ready_has(&b, Readiness::READ_HANGUP);
     assert_eq!(b.receive(&mut buf, recv_nb()).expect("eof").length, 0);
-    assert_eq!(a.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        a.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]
@@ -108,7 +114,10 @@ fn seqpacket_shutdown_read_makes_peer_write_fail() {
 
     assert_eq!(b.shutdown(SocketShutdown::Read), Ok(()));
     assert_ready_has(&a, Readiness::FAULT);
-    assert_eq!(a.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        a.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]
@@ -121,7 +130,10 @@ fn seqpacket_close_propagates_peer_closed() {
     assert_ready_has(&b, Readiness::READ_HANGUP);
     assert_ready_has(&b, Readiness::FAULT);
     assert_eq!(b.receive(&mut buf, recv_nb()).expect("eof").length, 0);
-    assert_eq!(b.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        b.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]

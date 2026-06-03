@@ -16,8 +16,22 @@ fn stream_transfers_empty_data_with_rights() {
     let out = b.receive(&mut buf, recv_nb()).expect("recv rights");
     assert_eq!(out.length, 0);
     assert_eq!(out.handles.len(), 2);
-    assert_eq!(out.handles[0].as_any().downcast_ref::<TestHandle>().unwrap().tag, 11);
-    assert_eq!(out.handles[1].as_any().downcast_ref::<TestHandle>().unwrap().tag, 12);
+    assert_eq!(
+        out.handles[0]
+            .as_any()
+            .downcast_ref::<TestHandle>()
+            .unwrap()
+            .tag,
+        11
+    );
+    assert_eq!(
+        out.handles[1]
+            .as_any()
+            .downcast_ref::<TestHandle>()
+            .unwrap()
+            .tag,
+        12
+    );
 }
 
 #[ktest]
@@ -29,7 +43,14 @@ fn datagram_transfers_multiple_rights() {
     assert_eq!(a.send(b"x", &handles, None, send_nb()), Ok(1));
     let out = b.receive(&mut buf, recv_nb()).expect("recv");
     assert_eq!(out.handles.len(), 3);
-    assert_eq!(out.handles[2].as_any().downcast_ref::<TestHandle>().unwrap().tag, 23);
+    assert_eq!(
+        out.handles[2]
+            .as_any()
+            .downcast_ref::<TestHandle>()
+            .unwrap()
+            .tag,
+        23
+    );
 }
 
 #[ktest]
@@ -46,7 +67,10 @@ fn indirect_socket_handle_cycle_is_detected_through_stream_queue() {
     let (holder, holder_peer) = pair(SocketType::Stream, 404);
     let handle_to_source = [socket_handle(&source)];
 
-    assert_eq!(holder_peer.send(b"x", &handle_to_source, None, send_nb()), Ok(1));
+    assert_eq!(
+        holder_peer.send(b"x", &handle_to_source, None, send_nb()),
+        Ok(1)
+    );
     assert!(source.would_create_handle_cycle(HandleIdentity::Socket(holder.id())));
 }
 
@@ -56,7 +80,10 @@ fn indirect_socket_handle_cycle_is_detected_through_datagram_queue() {
     let (holder, holder_peer) = pair(SocketType::Datagram, 406);
     let handle_to_source = [socket_handle(&source)];
 
-    assert_eq!(holder_peer.send(b"x", &handle_to_source, None, send_nb()), Ok(1));
+    assert_eq!(
+        holder_peer.send(b"x", &handle_to_source, None, send_nb()),
+        Ok(1)
+    );
     assert!(source.would_create_handle_cycle(HandleIdentity::Socket(holder.id())));
 }
 

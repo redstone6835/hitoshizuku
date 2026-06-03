@@ -70,7 +70,10 @@ fn datagram_bind_connect_send_and_disconnect() {
     assert_eq!(out.length, 4);
     assert_eq!(&buf[..4], b"ping");
 
-    assert_eq!(client.connect(UnixAddress::Unnamed, ident(204), send_nb()), Ok(()));
+    assert_eq!(
+        client.connect(UnixAddress::Unnamed, ident(204), send_nb()),
+        Ok(())
+    );
     assert_eq!(
         client.send(b"again", &[], None, send_nb()),
         Err(SocketError::DestinationRequired)
@@ -154,7 +157,10 @@ fn datagram_shutdown_read_causes_peer_closed_for_senders() {
     assert_eq!(b.shutdown(SocketShutdown::Read), Ok(()));
     assert_ready_has(&b, Readiness::READABLE);
     assert_ready_has(&b, Readiness::HANGUP);
-    assert_eq!(a.send(b"x", &[], None, send_nb()), Err(SocketError::PeerClosed));
+    assert_eq!(
+        a.send(b"x", &[], None, send_nb()),
+        Err(SocketError::PeerClosed)
+    );
 }
 
 #[ktest]

@@ -82,10 +82,7 @@ pub fn assert_ready_has(socket: &Socket, event: Readiness) {
 }
 
 pub fn assert_ready_lacks(socket: &Socket, event: Readiness) {
-    assert!(
-        !socket.readiness().has(event),
-        "unexpected readiness event"
-    );
+    assert!(!socket.readiness().has(event), "unexpected readiness event");
 }
 
 pub fn assert_socket_err<T>(result: Result<T, SocketError>, expected: SocketError) {

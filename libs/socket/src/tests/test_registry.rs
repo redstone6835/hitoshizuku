@@ -44,7 +44,10 @@ fn explicit_path_unregister_allows_rebind() {
     };
 
     assert_eq!(first.bind(addr.clone()), Ok(()));
-    assert_eq!(second.bind(addr.clone()), Err(SocketError::NameAlreadyBound));
+    assert_eq!(
+        second.bind(addr.clone()),
+        Err(SocketError::NameAlreadyBound)
+    );
     unregister_path_socket(key);
     assert_eq!(second.bind(addr), Ok(()));
 }

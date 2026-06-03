@@ -1,6 +1,6 @@
 use ktest::ktest;
 
-use crate::{SocketError, SocketLinger, SocketShutdown, SocketTimeval, SocketType};
+use crate::{SocketError, SocketLinger, SocketTimeval, SocketType};
 
 use super::support::{ident, pair, socket};
 
@@ -25,14 +25,8 @@ fn options_setters_are_observable() {
         enabled: true,
         seconds: 4,
     };
-    let recv_timeout = SocketTimeval {
-        secs: 1,
-        micros: 2,
-    };
-    let send_timeout = SocketTimeval {
-        secs: 3,
-        micros: 4,
-    };
+    let recv_timeout = SocketTimeval { secs: 1, micros: 2 };
+    let send_timeout = SocketTimeval { secs: 3, micros: 4 };
 
     sock.set_send_buffer_size(0);
     sock.set_recv_buffer_size(0);
@@ -66,7 +60,11 @@ fn last_error_latches_and_clears_only_latchable_errors() {
     let sock = socket(SocketType::Stream, 15);
 
     assert_eq!(
-        sock.connect(crate::UnixAddress::Unnamed, ident(16), super::support::send_nb()),
+        sock.connect(
+            crate::UnixAddress::Unnamed,
+            ident(16),
+            super::support::send_nb()
+        ),
         Err(SocketError::InvalidInput)
     );
     assert_eq!(sock.take_last_error(), None);
@@ -79,7 +77,10 @@ fn last_error_latches_and_clears_only_latchable_errors() {
         ),
         Err(SocketError::ConnectionRejected)
     );
-    assert_eq!(sock.take_last_error(), Some(SocketError::ConnectionRejected));
+    assert_eq!(
+        sock.take_last_error(),
+        Some(SocketError::ConnectionRejected)
+    );
     assert_eq!(sock.take_last_error(), None);
 }
 
