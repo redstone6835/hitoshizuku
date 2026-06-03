@@ -2,13 +2,13 @@
 //!
 //! 验证纳秒值到 (秒, 纳秒) 元组的纯函数分解。
 
-#[cfg(not(feature = "ktest-kernel"))]
-extern crate std;
 #[cfg(feature = "ktest-kernel")]
 extern crate alloc;
+#[cfg(not(feature = "ktest-kernel"))]
+extern crate std;
 
-use ktest::ktest;
 use crate::format_timestamp;
+use ktest::ktest;
 
 /// 零纳秒映射为 (0, 0)。
 #[ktest]

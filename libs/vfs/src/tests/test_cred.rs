@@ -6,10 +6,10 @@
 
 extern crate std;
 
-use std::vec;
-use ktest::ktest;
 use crate::cred::{CapSet, Capability, Credentials, Gid, Uid};
 use crate::stat::FileMode;
+use ktest::ktest;
+use std::vec;
 
 /// 构造指定 uid/gid 和能力集的凭据，用于 DAC 测试。
 fn cred_with_caps(uid: u32, gid: u32, caps: CapSet) -> Credentials {
@@ -118,8 +118,12 @@ fn can_read_dac_read_search() {
 #[ktest]
 fn can_read_supplementary_group() {
     let c = Credentials {
-        uid: Uid(2000), euid: Uid(2000), suid: Uid(2000),
-        gid: Gid(2000), egid: Gid(2000), sgid: Gid(2000),
+        uid: Uid(2000),
+        euid: Uid(2000),
+        suid: Uid(2000),
+        gid: Gid(2000),
+        egid: Gid(2000),
+        sgid: Gid(2000),
         groups: vec![Gid(3000)],
         caps: CapSet::EMPTY,
     };

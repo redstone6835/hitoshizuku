@@ -796,7 +796,9 @@ impl MountNamespace {
                 .and_then(|m| mount_ids.get(&(Arc::as_ptr(m) as usize)).copied())
                 .unwrap_or(mount_id);
             let mount_point = match parent.as_ref() {
-                Some(parent_mount) => visible_path(&mountpoint, parent_mount, root_mount, visible_root),
+                Some(parent_mount) => {
+                    visible_path(&mountpoint, parent_mount, root_mount, visible_root)
+                }
                 None => visible_path(&mountpoint, root_mount, root_mount, visible_root),
             }
             .unwrap_or_else(|| alloc::string::String::from("?"));

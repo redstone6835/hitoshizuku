@@ -5,8 +5,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::ids::{CapSet, Capability, Credentials, Gid, Uid};
+use ktest::ktest;
 
 /// single 构造的集合包含该能力。
 #[ktest]

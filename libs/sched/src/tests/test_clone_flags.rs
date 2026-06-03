@@ -5,8 +5,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::clone_flags::CloneFlags;
+use ktest::ktest;
 
 /// CLONE_THREAD 位被正确检测。
 #[ktest]

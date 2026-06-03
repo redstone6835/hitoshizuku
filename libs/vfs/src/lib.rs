@@ -11,6 +11,7 @@ pub use alloc::sync::Arc;
 
 pub mod cred;
 pub mod dentry;
+pub mod epoll;
 pub mod error;
 pub mod fdtable;
 pub mod file;
@@ -20,6 +21,7 @@ pub mod mount;
 pub mod operation;
 pub mod path;
 pub mod pipe;
+pub mod socket;
 pub mod stat;
 pub mod superblock;
 pub mod sync;

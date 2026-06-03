@@ -62,9 +62,7 @@ impl MemDisk {
     /// 读取扇区。成功返回 true，越界或缓冲区长度不足返回 false。
     pub fn read_sectors(&self, lba: u64, count: u32, buf: &mut [u8]) -> bool {
         let sector_size = self.sector_size as u64;
-        let needed = sector_size
-            .checked_mul(count as u64)
-            .unwrap_or(u64::MAX);
+        let needed = sector_size.checked_mul(count as u64).unwrap_or(u64::MAX);
         if (buf.len() as u64) < needed {
             return false;
         }
@@ -86,9 +84,7 @@ impl MemDisk {
     /// 失败时不修改任何数据。
     pub fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> bool {
         let sector_size = self.sector_size as u64;
-        let needed = sector_size
-            .checked_mul(count as u64)
-            .unwrap_or(u64::MAX);
+        let needed = sector_size.checked_mul(count as u64).unwrap_or(u64::MAX);
         if (buf.len() as u64) < needed {
             return false;
         }

@@ -5,10 +5,10 @@
 
 extern crate std;
 
-use crate::{parse, AddressWidth, Arch};
+use crate::{AddressWidth, Arch, parse};
 use ktest::ktest;
-use std::vec::Vec;
 use std::vec;
+use std::vec::Vec;
 
 /// 构造最小合法 ELF64 header。
 fn elf64_header(entry: u64, phnum: u16, e_type: u16, e_machine: u16) -> [u8; 64] {

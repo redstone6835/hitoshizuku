@@ -11,6 +11,8 @@ bench = false
 [dependencies]
 errno = { path = "../errno" }
 mm = { path = "../mm" }
+sched = { path = "../sched" }
+socket = { path = "../socket" }
 
 [dev-dependencies]
 ktest = { path = "../ktest" }

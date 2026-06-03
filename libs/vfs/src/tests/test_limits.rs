@@ -4,8 +4,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::limits::VfsLimits;
+use ktest::ktest;
 
 /// 默认符号链接深度限制为 40（Linux 默认值）。
 #[ktest]

@@ -4,9 +4,9 @@
 
 extern crate std;
 
+use crate::MemDisk;
 use ktest::ktest;
 use std::vec;
-use crate::MemDisk;
 
 #[ktest]
 fn new_creates_zeroed_disk() {

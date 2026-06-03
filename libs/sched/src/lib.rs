@@ -81,12 +81,13 @@ pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
     RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
 };
+pub use scheduler::cancel_sleep_deadline;
 pub use scheduler::{
     NR_CPUS, balance_once, current_cpu_id, current_task, current_task_on, enqueue_task, idle_task,
     init, init_task, install_idle, is_cpu_online, is_ready, migrate_task, needs_resched,
     now_ns_public, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
-    request_resched, root_pid_ns, runqueue, runqueue_of, schedule_once, signal_wakeup,
-    spawn_idle_for,
+    register_sleep_deadline, request_resched, root_pid_ns, runqueue, runqueue_of, schedule_once,
+    signal_wakeup, spawn_idle_for,
 };
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
 pub use signal::{
@@ -99,10 +100,9 @@ pub use spawn::{
     reparent_to_init, spawn_child,
 };
 pub use task::{
-    ExitCode, TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT,
-    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook, TaskExtKey,
-    TaskState, ext_clone_hook,
-    register_ext_clone_hook,
+    ExitCode, TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_USER_TRAP_FRAME,
+    TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook,
+    TaskExtKey, TaskState, ext_clone_hook, register_ext_clone_hook,
 };
 pub use wait::WaitQueue;
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};

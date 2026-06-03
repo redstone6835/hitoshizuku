@@ -23,18 +23,49 @@ pub struct Namespace {
 impl Namespace {
     /// Create a new AML namespace, with the expected pre-defined objects.
     pub fn new(global_lock_mutex: Handle) -> Namespace {
-        let mut namespace = Namespace { root: NamespaceLevel::new(NamespaceLevelKind::Scope) };
+        let mut namespace = Namespace {
+            root: NamespaceLevel::new(NamespaceLevelKind::Scope),
+        };
 
-        namespace.add_level(AmlName::from_str("\\_GPE").unwrap(), NamespaceLevelKind::Scope).unwrap();
-        namespace.add_level(AmlName::from_str("\\_SB").unwrap(), NamespaceLevelKind::Scope).unwrap();
-        namespace.add_level(AmlName::from_str("\\_SI").unwrap(), NamespaceLevelKind::Scope).unwrap();
-        namespace.add_level(AmlName::from_str("\\_PR").unwrap(), NamespaceLevelKind::Scope).unwrap();
-        namespace.add_level(AmlName::from_str("\\_TZ").unwrap(), NamespaceLevelKind::Scope).unwrap();
+        namespace
+            .add_level(
+                AmlName::from_str("\\_GPE").unwrap(),
+                NamespaceLevelKind::Scope,
+            )
+            .unwrap();
+        namespace
+            .add_level(
+                AmlName::from_str("\\_SB").unwrap(),
+                NamespaceLevelKind::Scope,
+            )
+            .unwrap();
+        namespace
+            .add_level(
+                AmlName::from_str("\\_SI").unwrap(),
+                NamespaceLevelKind::Scope,
+            )
+            .unwrap();
+        namespace
+            .add_level(
+                AmlName::from_str("\\_PR").unwrap(),
+                NamespaceLevelKind::Scope,
+            )
+            .unwrap();
+        namespace
+            .add_level(
+                AmlName::from_str("\\_TZ").unwrap(),
+                NamespaceLevelKind::Scope,
+            )
+            .unwrap();
 
         namespace
             .insert(
                 AmlName::from_str("\\_GL").unwrap(),
-                Object::Mutex { mutex: global_lock_mutex, sync_level: 0 }.wrap(),
+                Object::Mutex {
+                    mutex: global_lock_mutex,
+                    sync_level: 0,
+                }
+                .wrap(),
             )
             .unwrap();
 
@@ -47,7 +78,10 @@ impl Namespace {
          * See https://www.kernel.org/doc/html/latest/firmware-guide/acpi/osi.html for more information.
          */
         namespace
-            .insert(AmlName::from_str("\\_OS").unwrap(), Object::String("Microsoft Windows NT".to_string()).wrap())
+            .insert(
+                AmlName::from_str("\\_OS").unwrap(),
+                Object::String("Microsoft Windows NT".to_string()).wrap(),
+            )
             .unwrap();
 
         /*
@@ -130,7 +164,12 @@ impl Namespace {
          * return `2`), and so they switched to just returning `2` (as we'll also do). `_REV` should be considered
          * useless and deprecated (this is mirrored in newer specs, which claim `2` means "ACPI 2 or greater").
          */
-        namespace.insert(AmlName::from_str("\\_REV").unwrap(), Object::Integer(2).wrap()).unwrap();
+        namespace
+            .insert(
+                AmlName::from_str("\\_REV").unwrap(),
+                Object::Integer(2).wrap(),
+            )
+            .unwrap();
 
         namespace
     }
@@ -147,7 +186,10 @@ impl Namespace {
              * If the level has already been added, we don't need to add it again. The parser can try to add it
              * multiple times if the ASL contains multiple blocks that add to the same scope/device.
              */
-            level.children.entry(last_seg).or_insert_with(|| NamespaceLevel::new(kind));
+            level
+                .children
+                .entry(last_seg)
+                .or_insert_with(|| NamespaceLevel::new(kind));
         }
 
         Ok(())
@@ -172,7 +214,10 @@ impl Namespace {
         let path = path.normalize()?;
 
         let (level, last_seg) = self.get_level_for_path_mut(&path)?;
-        match level.values.insert(last_seg, (ObjectFlags::new(false), object)) {
+        match level
+            .values
+            .insert(last_seg, (ObjectFlags::new(false), object))
+        {
             None => Ok(()),
             Some(_) => {
                 /*
@@ -190,7 +235,10 @@ impl Namespace {
         let path = path.normalize()?;
 
         let (level, last_seg) = self.get_level_for_path_mut(&path)?;
-        match level.values.insert(last_seg, (ObjectFlags::new(true), object)) {
+        match level
+            .values
+            .insert(last_seg, (ObjectFlags::new(true), object))
+        {
             None => Ok(()),
             Some(_) => Err(AmlError::NameCollision(path)),
         }
@@ -210,7 +258,11 @@ impl Namespace {
     /// Search for an object at the given path of the namespace, applying the search rules described in §5.3 of the
     /// ACPI specification, if they are applicable. Returns the resolved name, and the handle of the first valid
     /// object, if found.
-    pub fn search(&self, path: &AmlName, starting_scope: &AmlName) -> Result<(AmlName, WrappedObject), AmlError> {
+    pub fn search(
+        &self,
+        path: &AmlName,
+        starting_scope: &AmlName,
+    ) -> Result<(AmlName, WrappedObject), AmlError> {
         if path.search_rules_apply() {
             /*
              * If search rules apply, we need to recursively look through the namespace. If the
@@ -235,7 +287,9 @@ impl Namespace {
                 // If we don't find it, go up a level in the namespace and search for it there recursively
                 match scope.parent() {
                     Ok(parent) => scope = parent,
-                    Err(AmlError::RootHasNoParent) => return Err(AmlError::ObjectDoesNotExist(path.clone())),
+                    Err(AmlError::RootHasNoParent) => {
+                        return Err(AmlError::ObjectDoesNotExist(path.clone()));
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -252,7 +306,11 @@ impl Namespace {
         }
     }
 
-    pub fn search_for_level(&self, level_name: &AmlName, starting_scope: &AmlName) -> Result<AmlName, AmlError> {
+    pub fn search_for_level(
+        &self,
+        level_name: &AmlName,
+        starting_scope: &AmlName,
+    ) -> Result<AmlName, AmlError> {
         if level_name.search_rules_apply() {
             let mut scope = starting_scope.clone().normalize()?;
             assert!(scope.is_absolute());
@@ -268,7 +326,9 @@ impl Namespace {
                 // If we don't find it, move the scope up a level and search for it there recursively
                 match scope.parent() {
                     Ok(parent) => scope = parent,
-                    Err(AmlError::RootHasNoParent) => return Err(AmlError::LevelDoesNotExist(level_name.clone())),
+                    Err(AmlError::RootHasNoParent) => {
+                        return Err(AmlError::LevelDoesNotExist(level_name.clone()));
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -297,8 +357,10 @@ impl Namespace {
             let NameComponent::Segment(segment) = level else {
                 panic!();
             };
-            current_level =
-                current_level.children.get(segment).ok_or(AmlError::LevelDoesNotExist(traversed_path.clone()))?;
+            current_level = current_level
+                .children
+                .get(segment)
+                .ok_or(AmlError::LevelDoesNotExist(traversed_path.clone()))?;
         }
 
         Ok((current_level, *last_seg))
@@ -306,7 +368,10 @@ impl Namespace {
 
     /// Split an absolute path into a bunch of level segments (used to traverse the level data structure), and a
     /// last segment to index into that level. This must not be called on `\\`.
-    fn get_level_for_path_mut(&mut self, path: &AmlName) -> Result<(&mut NamespaceLevel, NameSeg), AmlError> {
+    fn get_level_for_path_mut(
+        &mut self,
+        path: &AmlName,
+    ) -> Result<(&mut NamespaceLevel, NameSeg), AmlError> {
         assert_ne!(*path, AmlName::root());
 
         let (last_seg, levels) = path.0[1..].split_last().unwrap();
@@ -342,7 +407,11 @@ impl Namespace {
     where
         F: FnMut(&AmlName, &NamespaceLevel) -> Result<bool, AmlError>,
     {
-        fn traverse_level<F>(level: &NamespaceLevel, scope: &AmlName, f: &mut F) -> Result<(), AmlError>
+        fn traverse_level<F>(
+            level: &NamespaceLevel,
+            scope: &AmlName,
+            f: &mut F,
+        ) -> Result<(), AmlError>
         where
             F: FnMut(&AmlName, &NamespaceLevel) -> Result<bool, AmlError>,
         {
@@ -371,10 +440,19 @@ impl fmt::Display for Namespace {
         const BRANCH: &str = "├── ";
         const END: &str = "└── ";
 
-        fn print_level(f: &mut fmt::Formatter<'_>, level: &NamespaceLevel, indent_stack: String) -> fmt::Result {
+        fn print_level(
+            f: &mut fmt::Formatter<'_>,
+            level: &NamespaceLevel,
+            indent_stack: String,
+        ) -> fmt::Result {
             for (i, (name, (flags, object))) in level.values.iter().enumerate() {
                 let end = (i == level.values.len() - 1)
-                    && level.children.iter().filter(|(_, l)| l.kind == NamespaceLevelKind::Scope).count() == 0;
+                    && level
+                        .children
+                        .iter()
+                        .filter(|(_, l)| l.kind == NamespaceLevelKind::Scope)
+                        .count()
+                        == 0;
                 writeln!(
                     f,
                     "{}{}{}: {}{}",
@@ -390,16 +468,29 @@ impl fmt::Display for Namespace {
                     print_level(
                         f,
                         child_level,
-                        if end { indent_stack.clone() + "    " } else { indent_stack.clone() + STEM },
+                        if end {
+                            indent_stack.clone() + "    "
+                        } else {
+                            indent_stack.clone() + STEM
+                        },
                     )?;
                 }
             }
 
-            let remaining_scopes: Vec<_> =
-                level.children.iter().filter(|(_, l)| l.kind == NamespaceLevelKind::Scope).collect();
+            let remaining_scopes: Vec<_> = level
+                .children
+                .iter()
+                .filter(|(_, l)| l.kind == NamespaceLevelKind::Scope)
+                .collect();
             for (i, (name, sub_level)) in remaining_scopes.iter().enumerate() {
                 let end = i == remaining_scopes.len() - 1;
-                writeln!(f, "{}{}{}:", &indent_stack, if end { END } else { BRANCH }, name.as_str())?;
+                writeln!(
+                    f,
+                    "{}{}{}:",
+                    &indent_stack,
+                    if end { END } else { BRANCH },
+                    name.as_str()
+                )?;
                 print_level(f, sub_level, indent_stack.clone() + STEM)?;
             }
 
@@ -445,7 +536,11 @@ impl ObjectFlags {
 
 impl NamespaceLevel {
     pub fn new(kind: NamespaceLevelKind) -> NamespaceLevel {
-        NamespaceLevel { kind, values: BTreeMap::new(), children: BTreeMap::new() }
+        NamespaceLevel {
+            kind,
+            values: BTreeMap::new(),
+            children: BTreeMap::new(),
+        }
     }
 }
 
@@ -515,26 +610,29 @@ impl AmlName {
             return Ok(self);
         }
 
-        Ok(AmlName(self.0.iter().try_fold(Vec::new(), |mut name, &component| match component {
-            seg @ NameComponent::Segment(_) => {
-                name.push(seg);
-                Ok(name)
-            }
-
-            NameComponent::Root => {
-                name.push(NameComponent::Root);
-                Ok(name)
-            }
-
-            NameComponent::Prefix => {
-                if let Some(NameComponent::Segment(_)) = name.iter().last() {
-                    name.pop().unwrap();
+        Ok(AmlName(self.0.iter().try_fold(
+            Vec::new(),
+            |mut name, &component| match component {
+                seg @ NameComponent::Segment(_) => {
+                    name.push(seg);
                     Ok(name)
-                } else {
-                    Err(AmlError::InvalidNormalizedName(self.clone()))
                 }
-            }
-        })?))
+
+                NameComponent::Root => {
+                    name.push(NameComponent::Root);
+                    Ok(name)
+                }
+
+                NameComponent::Prefix => {
+                    if let Some(NameComponent::Segment(_)) = name.iter().last() {
+                        name.pop().unwrap();
+                        Ok(name)
+                    } else {
+                        Err(AmlError::InvalidNormalizedName(self.clone()))
+                    }
+                }
+            },
+        )?))
     }
 
     /// Get the parent of this `AmlName`. For example, the parent of `\_SB.PCI0._PRT` is `\_SB.PCI0`. The root
@@ -648,14 +746,18 @@ impl FromStr for NameSeg {
 
         // Manually do the first one, because we have to check it's a LeadNameChar
         if !is_lead_name_char(bytes[0]) {
-            return Err(AmlError::InvalidNameSeg([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            return Err(AmlError::InvalidNameSeg([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]));
         }
         seg[0] = bytes[0];
 
         // Copy the rest of the chars, checking that they're NameChars
         for i in 1..bytes.len() {
             if !is_name_char(bytes[i]) {
-                return Err(AmlError::InvalidNameSeg([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                return Err(AmlError::InvalidNameSeg([
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                ]));
             }
             seg[i] = bytes[i];
         }

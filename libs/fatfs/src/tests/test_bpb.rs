@@ -2,30 +2,38 @@
 
 extern crate std;
 
+use crate::bpb;
 use ktest::ktest;
 use ktest_mock::MemDisk;
 use std::sync::Arc;
 use std::vec;
 use std::vec::Vec;
-use crate::bpb;
 
-fn boot_sector(bytes_per_sector: u16, sec_per_cluster: u8, num_fats: u8,
-               root_entries: u16, total_sec_16: u16, fat_size_16: u16,
-               total_sec_32: u32, fat_size_32: u32, root_cluster: u32,
-               sector_size: u32) -> Vec<u8> {
+fn boot_sector(
+    bytes_per_sector: u16,
+    sec_per_cluster: u8,
+    num_fats: u8,
+    root_entries: u16,
+    total_sec_16: u16,
+    fat_size_16: u16,
+    total_sec_32: u32,
+    fat_size_32: u32,
+    root_cluster: u32,
+    sector_size: u32,
+) -> Vec<u8> {
     let mut b = vec![0u8; sector_size as usize];
     b[11..13].copy_from_slice(&bytes_per_sector.to_le_bytes());
     b[13] = sec_per_cluster;
-    b[14..16].copy_from_slice(&1u16.to_le_bytes());      // reserved_sectors = 1
+    b[14..16].copy_from_slice(&1u16.to_le_bytes()); // reserved_sectors = 1
     b[16] = num_fats;
     b[17..19].copy_from_slice(&root_entries.to_le_bytes());
     b[19..21].copy_from_slice(&total_sec_16.to_le_bytes());
-    b[21] = 0xf8;                                        // media descriptor
+    b[21] = 0xf8; // media descriptor
     b[22..24].copy_from_slice(&fat_size_16.to_le_bytes());
     b[32..36].copy_from_slice(&total_sec_32.to_le_bytes());
     b[36..40].copy_from_slice(&fat_size_32.to_le_bytes());
     b[44..48].copy_from_slice(&root_cluster.to_le_bytes());
-    b[48..50].copy_from_slice(&1u16.to_le_bytes());      // fs_info_sector
+    b[48..50].copy_from_slice(&1u16.to_le_bytes()); // fs_info_sector
     b[510] = 0x55;
     b[511] = 0xaa;
     b

@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use allocator::MemorySegment;
 
 pub mod acpi;
+pub mod dtb;
 pub mod power;
 
 #[derive(Clone, Copy, Debug)]

@@ -5,9 +5,9 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::signal::SignalNumber;
 use crate::wait_flags::{WaitId, WaitStatus};
+use ktest::ktest;
 
 /// from_exit 构造的 wstatus 满足 wifexited，退出码正确。
 #[ktest]

@@ -6,9 +6,9 @@
 
 extern crate std;
 
+use crate::sched_class::{SchedAttr, SchedClass, SchedPolicy};
 use errno::Errno;
 use ktest::ktest;
-use crate::sched_class::{SchedAttr, SchedClass, SchedPolicy};
 
 /// from_raw 对已知策略值返回 Some。
 #[ktest]
@@ -92,10 +92,7 @@ fn attr_validate_deadline_runtime_gt_deadline() {
 /// validate 拒绝 deadline > period 的 deadline 属性。
 #[ktest]
 fn attr_validate_deadline_deadline_gt_period() {
-    assert_eq!(
-        SchedAttr::deadline(1, 10, 5).validate(),
-        Err(Errno::EINVAL)
-    );
+    assert_eq!(SchedAttr::deadline(1, 10, 5).validate(), Err(Errno::EINVAL));
 }
 
 /// Fair 属性无论 nice 值如何，validate 始终通过（normalized 会钳制）。

@@ -37,7 +37,9 @@ impl<A: Allocator> InterruptModel<A> {
         tables: &AcpiTables<H>,
         _allocator: A,
     ) -> Result<(InterruptModel<A>, Option<ProcessorInfo<A>>), AcpiError> {
-        let Some(madt) = tables.find_table::<Madt>() else { Err(AcpiError::TableNotFound(Signature::MADT))? };
+        let Some(madt) = tables.find_table::<Madt>() else {
+            Err(AcpiError::TableNotFound(Signature::MADT))?
+        };
 
         /*
          * We first do a pass through the MADT to determine which interrupt model is being used.
@@ -54,7 +56,9 @@ impl<A: Allocator> InterruptModel<A> {
                     return Self::from_apic_model_in(madt.get(), _allocator);
                 }
 
-                MadtEntry::IoSapic(_) | MadtEntry::LocalSapic(_) | MadtEntry::PlatformInterruptSource(_) => {}
+                MadtEntry::IoSapic(_)
+                | MadtEntry::LocalSapic(_)
+                | MadtEntry::PlatformInterruptSource(_) => {}
 
                 MadtEntry::Gicc(_)
                 | MadtEntry::Gicd(_)
@@ -98,8 +102,10 @@ impl<A: Allocator> InterruptModel<A> {
         let mut io_apics = Vec::with_capacity_in(io_apic_count, allocator.clone());
         let mut interrupt_source_overrides = Vec::with_capacity_in(iso_count, allocator.clone());
         let mut nmi_sources = Vec::with_capacity_in(nmi_source_count, allocator.clone());
-        let mut local_apic_nmi_lines = Vec::with_capacity_in(local_nmi_line_count, allocator.clone());
-        let mut application_processors = Vec::with_capacity_in(processor_count.saturating_sub(1), allocator); // Subtract one for the BSP
+        let mut local_apic_nmi_lines =
+            Vec::with_capacity_in(local_nmi_line_count, allocator.clone());
+        let mut application_processors =
+            Vec::with_capacity_in(processor_count.saturating_sub(1), allocator); // Subtract one for the BSP
         let mut boot_processor = None;
 
         for entry in madt.entries() {
@@ -166,7 +172,9 @@ impl<A: Allocator> InterruptModel<A> {
 
                 MadtEntry::InterruptSourceOverride(entry) => {
                     if entry.bus != 0 {
-                        return Err(AcpiError::InvalidMadt(MadtError::InterruptOverrideEntryHasInvalidBus));
+                        return Err(AcpiError::InvalidMadt(
+                            MadtError::InterruptOverrideEntryHasInvalidBus,
+                        ));
                     }
 
                     let (polarity, trigger_mode) = parse_mps_inti_flags(entry.flags)?;
@@ -199,7 +207,9 @@ impl<A: Allocator> InterruptModel<A> {
                         line: match entry.nmi_line {
                             0 => LocalInterruptLine::Lint0,
                             1 => LocalInterruptLine::Lint1,
-                            _ => return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine)),
+                            _ => {
+                                return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine));
+                            }
                         },
                     });
                 }
@@ -214,7 +224,9 @@ impl<A: Allocator> InterruptModel<A> {
                         line: match entry.nmi_line {
                             0 => LocalInterruptLine::Lint0,
                             1 => LocalInterruptLine::Lint1,
-                            _ => return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine)),
+                            _ => {
+                                return Err(AcpiError::InvalidMadt(MadtError::InvalidLocalNmiLine));
+                            }
                         },
                     });
                 }
@@ -240,7 +252,10 @@ impl<A: Allocator> InterruptModel<A> {
                 nmi_sources,
                 madt.supports_8259(),
             )),
-            Some(ProcessorInfo::new_in(boot_processor.unwrap(), application_processors)),
+            Some(ProcessorInfo::new_in(
+                boot_processor.unwrap(),
+                application_processors,
+            )),
         ))
     }
 }

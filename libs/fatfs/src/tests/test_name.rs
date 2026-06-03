@@ -2,8 +2,8 @@
 
 extern crate std;
 
-use ktest::ktest;
 use crate::name;
+use ktest::ktest;
 
 /// 简单 ASCII 大写名直接编码为 8.3 SFN，不足部分空格填充。
 #[ktest]

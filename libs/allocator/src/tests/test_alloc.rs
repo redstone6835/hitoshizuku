@@ -4,9 +4,9 @@
 
 extern crate alloc;
 
-use ktest::ktest;
-use crate::request::{AllocationKind, MemoryDomain, MemoryRequest, Zeroing};
 use crate::KERNEL_ALLOCATOR;
+use crate::request::{AllocationKind, MemoryDomain, MemoryRequest, Zeroing};
+use ktest::ktest;
 
 /// 分配 8 字节小对象，验证指针非空且走 slab 路径。
 #[ktest]
@@ -41,8 +41,7 @@ fn allocate_various_sizes() {
 /// Zeroing::Zeroed 分配的内存应全为 0。
 #[ktest]
 fn allocate_zeroed() {
-    let req = MemoryRequest::new(MemoryDomain::Kernel, 64, 8)
-        .with_zeroing(Zeroing::Zeroed);
+    let req = MemoryRequest::new(MemoryDomain::Kernel, 64, 8).with_zeroing(Zeroing::Zeroed);
     let record = KERNEL_ALLOCATOR.allocate(req).expect("allocate zeroed");
     let slice = unsafe { core::slice::from_raw_parts(record.ptr as *const u8, 64) };
     assert!(slice.iter().all(|&b| b == 0));

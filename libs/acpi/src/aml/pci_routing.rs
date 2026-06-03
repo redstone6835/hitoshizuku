@@ -92,8 +92,14 @@ impl PciRoutingTable {
                     let Object::Integer(address) = *pin_package[0] else {
                         return Err(AmlError::PrtInvalidAddress);
                     };
-                    let device = address.get_bits(16..32).try_into().map_err(|_| AmlError::PrtInvalidAddress)?;
-                    let function = address.get_bits(0..16).try_into().map_err(|_| AmlError::PrtInvalidAddress)?;
+                    let device = address
+                        .get_bits(16..32)
+                        .try_into()
+                        .map_err(|_| AmlError::PrtInvalidAddress)?;
+                    let function = address
+                        .get_bits(0..16)
+                        .try_into()
+                        .map_err(|_| AmlError::PrtInvalidAddress)?;
                     let pin = match *pin_package[1] {
                         Object::Integer(0) => Pin::IntA,
                         Object::Integer(1) => Pin::IntB,
@@ -133,13 +139,19 @@ impl PciRoutingTable {
                         _ => return Err(AmlError::PrtInvalidSource),
                     }
                 } else {
-                    return Err(AmlError::InvalidOperationOnObject { op: Operation::DecodePrt, typ: value.typ() });
+                    return Err(AmlError::InvalidOperationOnObject {
+                        op: Operation::DecodePrt,
+                        typ: value.typ(),
+                    });
                 }
             }
 
             Ok(PciRoutingTable { entries })
         } else {
-            Err(AmlError::InvalidOperationOnObject { op: Operation::DecodePrt, typ: prt.typ() })
+            Err(AmlError::InvalidOperationOnObject {
+                op: Operation::DecodePrt,
+                typ: prt.typ(),
+            })
         }
     }
 

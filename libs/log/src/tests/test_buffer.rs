@@ -5,8 +5,8 @@
 
 extern crate std;
 
+use crate::{LOGGER, LogLevel, logger_entry};
 use ktest::ktest;
-use crate::{logger_entry, LogLevel, LOGGER};
 use std::string::String;
 use std::vec::Vec;
 

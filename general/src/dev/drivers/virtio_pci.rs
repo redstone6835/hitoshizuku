@@ -384,10 +384,7 @@ fn dma_vaddr(allocation: PhysicalAllocation) -> usize {
 
 impl VirtioBlkPci {
     /// 在已绑定 PCI capabilities 的前提下完成 VirtIO 1.0+ probe 流程。
-    pub fn probe(
-        pci: &PciDevice,
-        virt_to_phys: fn(usize) -> usize,
-    ) -> Result<Self, &'static str> {
+    pub fn probe(pci: &PciDevice, virt_to_phys: fn(usize) -> usize) -> Result<Self, &'static str> {
         // 先打开 bus master + memory space decode —— 没这两个 BAR 根本不响应。
         pci.enable_mmio();
         pci.enable_bus_master();
@@ -489,7 +486,10 @@ impl VirtioBlkPci {
 
         // 写 queue_desc/driver/device 物理地址
         wr_u64(caps.common.vaddr + CC_QUEUE_DESC, desc_alloc.paddr as u64);
-        wr_u64(caps.common.vaddr + CC_QUEUE_DRIVER, avail_alloc.paddr as u64);
+        wr_u64(
+            caps.common.vaddr + CC_QUEUE_DRIVER,
+            avail_alloc.paddr as u64,
+        );
         wr_u64(caps.common.vaddr + CC_QUEUE_DEVICE, used_alloc.paddr as u64);
 
         // notify offset
@@ -536,7 +536,10 @@ impl VirtioBlkPci {
             irq_count: AtomicUsize::new(0),
         });
 
-        Ok(Self { inner, virt_to_phys })
+        Ok(Self {
+            inner,
+            virt_to_phys,
+        })
     }
 
     /// 轮询并处理已完成的请求。与 MMIO 版对称。
@@ -598,10 +601,7 @@ impl VirtioBlkPci {
         self.poll();
     }
 
-    pub fn into_block_dev(
-        self,
-        name: &str,
-    ) -> Result<Arc<BlockDevice>, &'static str> {
+    pub fn into_block_dev(self, name: &str) -> Result<Arc<BlockDevice>, &'static str> {
         let capacity = self.inner.capacity;
         let block_size = self.inner.block_size;
         let logical = NonZeroU32::new(block_size).ok_or("virtio-pci: invalid block size")?;
@@ -843,10 +843,8 @@ impl VirtioBlkPciIo {
             status: 0xff,
             _pad: [0; 7],
         };
-        let header_phys =
-            (self.virt_to_phys)(&meta.header as *const _ as usize) as u64;
-        let status_phys =
-            (self.virt_to_phys)(&meta.status as *const _ as usize) as u64;
+        let header_phys = (self.virt_to_phys)(&meta.header as *const _ as usize) as u64;
+        let status_phys = (self.virt_to_phys)(&meta.status as *const _ as usize) as u64;
 
         let mut queue = self.driver.inner.queue.lock();
         if queue.free_desc.len() < 3 {
@@ -954,8 +952,7 @@ impl PnpDriver for VirtioPciBlkDriver {
         let Some(pci_info) = info.as_any().downcast_ref::<PciInfo>() else {
             return false;
         };
-        pci_info.vendor == 0x1af4
-            && (pci_info.device_id == 0x1001 || pci_info.device_id == 0x1042)
+        pci_info.vendor == 0x1af4 && (pci_info.device_id == 0x1001 || pci_info.device_id == 0x1042)
     }
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {

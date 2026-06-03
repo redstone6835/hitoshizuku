@@ -174,7 +174,8 @@ fn run_memcpy_baseline() {
     let mibps = (size as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
         "[bench][L0-hot] memcpy 4 MiB (cache hot): {} ns ({} MiB/s)",
-        dt, mibps
+        dt,
+        mibps
     );
 }
 
@@ -193,7 +194,8 @@ fn run_memcpy_cold() {
     let mibps = (dst.len() as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
         "[bench][L0-cold] memcpy 4 MiB (from 64 MiB cold): {} ns ({} MiB/s)  <-- 真实内存带宽",
-        dt, mibps
+        dt,
+        mibps
     );
 }
 
@@ -211,7 +213,8 @@ fn run_software_overhead_only() {
             NonZeroU32::new(LBS).unwrap(),
             NonZeroU32::new(LBS).unwrap(),
             Some(block_count),
-        ).expect("geom");
+        )
+        .expect("geom");
         Arc::new(BlockDevice::new(
             BlockDeviceInit {
                 name: "ramd-tiny",
@@ -236,7 +239,8 @@ fn run_software_overhead_only() {
     let avg = dt / count;
     log::info!(
         "[bench][SW-overhead] 1000x read 512B: total {} ns (avg {} ns/op)  <-- 纯软件开销/op",
-        dt, avg
+        dt,
+        avg
     );
 }
 
@@ -249,7 +253,9 @@ fn run_block_seq_read(dev: &Arc<BlockDevice>) {
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
-    if chunk % lbs != 0 { return; }
+    if chunk % lbs != 0 {
+        return;
+    }
     let blocks_per_chunk = (chunk / lbs) as u32;
     let iters = total_bytes / chunk;
     let mut buf = vec![0u8; chunk];
@@ -265,7 +271,8 @@ fn run_block_seq_read(dev: &Arc<BlockDevice>) {
     let mibps = (total_bytes as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
         "[bench][L1-blk] seq read 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
-        dt, mibps
+        dt,
+        mibps
     );
 }
 
@@ -276,7 +283,9 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
-    if chunk % lbs != 0 { return; }
+    if chunk % lbs != 0 {
+        return;
+    }
     let blocks_per_chunk = (chunk / lbs) as u32;
     let iters = total_bytes / chunk;
 
@@ -322,24 +331,26 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     let dt_raw = hal::time::monotonic_ns().saturating_sub(t0);
 
     let overhead = dt_full.saturating_sub(dt_direct);
-    log::info!(
-        "[bench][PROOF] same device, cache hot, 4 MiB x3:"
-    );
+    log::info!("[bench][PROOF] same device, cache hot, 4 MiB x3:");
     log::info!(
         "[bench][PROOF]   full path (SyncBlockBackend): {} ns ({} MiB/s)",
-        dt_full, (total_bytes as u64) * 1_000_000_000 / dt_full.max(1) / (1024 * 1024)
+        dt_full,
+        (total_bytes as u64) * 1_000_000_000 / dt_full.max(1) / (1024 * 1024)
     );
     log::info!(
         "[bench][PROOF]   direct BlockIo::read_sectors_sync: {} ns ({} MiB/s)",
-        dt_direct, (total_bytes as u64) * 1_000_000_000 / dt_direct.max(1) / (1024 * 1024)
+        dt_direct,
+        (total_bytes as u64) * 1_000_000_000 / dt_direct.max(1) / (1024 * 1024)
     );
     log::info!(
         "[bench][PROOF]   raw lock+memcpy: {} ns ({} MiB/s)",
-        dt_raw, (total_bytes as u64) * 1_000_000_000 / dt_raw.max(1) / (1024 * 1024)
+        dt_raw,
+        (total_bytes as u64) * 1_000_000_000 / dt_raw.max(1) / (1024 * 1024)
     );
     log::info!(
         "[bench][PROOF]   software overhead (full - direct): {} ns ({} ns/op)",
-        overhead, overhead / iters as u64
+        overhead,
+        overhead / iters as u64
     );
 }
 
@@ -348,7 +359,9 @@ fn run_block_seq_write(dev: &Arc<BlockDevice>) {
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
-    if chunk % lbs != 0 { return; }
+    if chunk % lbs != 0 {
+        return;
+    }
     let blocks_per_chunk = (chunk / lbs) as u32;
     let iters = total_bytes / chunk;
     let buf = vec![0x55; chunk];
@@ -364,7 +377,8 @@ fn run_block_seq_write(dev: &Arc<BlockDevice>) {
     let mibps = (total_bytes as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
         "[bench][L1-blk] seq write 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
-        dt, mibps
+        dt,
+        mibps
     );
 }
 
@@ -377,10 +391,14 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
     let lbs = dev.geometry().logical_block_size().get() as usize;
     let block = 4096usize;
     let count = 100u64;
-    if block % lbs != 0 { return; }
+    if block % lbs != 0 {
+        return;
+    }
     let blocks_per_op = (block / lbs) as u32;
     let max_lba = dev.geometry().block_count().unwrap_or(0) - blocks_per_op as u64;
-    if max_lba == 0 { return; }
+    if max_lba == 0 {
+        return;
+    }
     let mut buf = vec![0u8; block];
     let mut rng = 0xdeadbeefu32;
     let t0 = hal::time::monotonic_ns();
@@ -393,7 +411,9 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
     let avg_ns = dt / count;
     log::info!(
         "[bench][L2-blk] rand read {} x 4 KiB: total {} ns (avg {} ns/op)  <-- 裸块随机延迟",
-        count, dt, avg_ns
+        count,
+        dt,
+        avg_ns
     );
 }
 
@@ -407,17 +427,27 @@ fn run_fat_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
     let total = 4 * 1024 * 1024usize;
     let wbuf = vec![0xDD; total];
 
-    log::info!("[bench][{}][FAT-BREAKDOWN] ---- write path analysis ----", tag);
+    log::info!(
+        "[bench][{}][FAT-BREAKDOWN] ---- write path analysis ----",
+        tag
+    );
 
     // ── Test 1: 单次 4 MiB write（grow_to + write 一起） ──
     {
         let fname = "._bk1_";
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
         let t0 = hal::time::monotonic_ns();
-        let inode = root.create(fname, vfs::stat::FileMode::new(0o644), &cred).unwrap();
+        let inode = root
+            .create(fname, vfs::stat::FileMode::new(0o644), &cred)
+            .unwrap();
         let dt_create = hal::time::monotonic_ns().saturating_sub(t0);
 
-        let opts = OpenOptions { access: vfs::file::AccessMode::WriteOnly, ..OpenOptions::default() };
+        let opts = OpenOptions {
+            access: vfs::file::AccessMode::WriteOnly,
+            ..OpenOptions::default()
+        };
         let f = inode.open_ops(&opts, &cred).unwrap();
         let t0 = hal::time::monotonic_ns();
         let _ = f.write_at(&wbuf, 0);
@@ -426,18 +456,30 @@ fn run_fat_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
 
         log::info!(
             "[bench][{}][FAT-BREAKDOWN] 1x4MiB: create {} ns | write {} ns (total {} ns, {} MiB/s)",
-            tag, dt_create, dt_write, dt_create + dt_write,
+            tag,
+            dt_create,
+            dt_write,
+            dt_create + dt_write,
             (total as u64) * 1_000_000_000 / dt_write.max(1) / (1024 * 1024)
         );
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
     }
 
     // ── Test 2: 预分配后纯写（分离 grow_to 和 data write） ──
     {
         let fname = "._bk2_";
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
-        let inode = root.create(fname, vfs::stat::FileMode::new(0o644), &cred).unwrap();
-        let opts = OpenOptions { access: vfs::file::AccessMode::WriteOnly, ..OpenOptions::default() };
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
+        let inode = root
+            .create(fname, vfs::stat::FileMode::new(0o644), &cred)
+            .unwrap();
+        let opts = OpenOptions {
+            access: vfs::file::AccessMode::WriteOnly,
+            ..OpenOptions::default()
+        };
         let f = inode.open_ops(&opts, &cred).unwrap();
 
         // 先写 1 字节触发 grow_to 4 MiB（预分配全部簇）
@@ -457,21 +499,36 @@ fn run_fat_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
         let pct_data = dt_overwrite * 100 / dt_first_write.max(1);
         log::info!(
             "[bench][{}][FAT-BREAKDOWN] first write (grow+data): {} ns | overwrite (data only): {} ns",
-            tag, dt_first_write, dt_overwrite
+            tag,
+            dt_first_write,
+            dt_overwrite
         );
         log::info!(
             "[bench][{}][FAT-BREAKDOWN] => grow_to overhead: ~{} ns ({}%) | pure data: ~{} ns ({}%)",
-            tag, dt_grow, pct_grow, dt_overwrite, pct_data
+            tag,
+            dt_grow,
+            pct_grow,
+            dt_overwrite,
+            pct_data
         );
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
     }
 
     // ── Test 3: 不同块大小写入（看 per-call 开销） ──
     {
         let fname = "._bk3_";
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
-        let inode = root.create(fname, vfs::stat::FileMode::new(0o644), &cred).unwrap();
-        let opts = OpenOptions { access: vfs::file::AccessMode::WriteOnly, ..OpenOptions::default() };
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
+        let inode = root
+            .create(fname, vfs::stat::FileMode::new(0o644), &cred)
+            .unwrap();
+        let opts = OpenOptions {
+            access: vfs::file::AccessMode::WriteOnly,
+            ..OpenOptions::default()
+        };
         let f = inode.open_ops(&opts, &cred).unwrap();
 
         // 先预分配
@@ -502,15 +559,23 @@ fn run_fat_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
         let avg_1m = dt_1m / iters_1m as u64;
         log::info!(
             "[bench][{}][FAT-BREAKDOWN] overwrite 4MiB as 4K x {}: {} ns (avg {} ns/call, {} MiB/s)",
-            tag, iters, dt_4k, avg_4k,
+            tag,
+            iters,
+            dt_4k,
+            avg_4k,
             (total as u64) * 1_000_000_000 / dt_4k.max(1) / (1024 * 1024)
         );
         log::info!(
             "[bench][{}][FAT-BREAKDOWN] overwrite 4MiB as 1M x {}: {} ns (avg {} ns/call, {} MiB/s)",
-            tag, iters_1m, dt_1m, avg_1m,
+            tag,
+            iters_1m,
+            dt_1m,
+            avg_1m,
             (total as u64) * 1_000_000_000 / dt_1m.max(1) / (1024 * 1024)
         );
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
     }
 }
 
@@ -524,17 +589,27 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
     let total = 4 * 1024 * 1024usize;
     let wbuf = vec![0xDD; total];
 
-    log::info!("[bench][{}][EXT-BREAKDOWN] ---- write path analysis ----", tag);
+    log::info!(
+        "[bench][{}][EXT-BREAKDOWN] ---- write path analysis ----",
+        tag
+    );
 
     // ── Test 1: 单次 4 MiB write（alloc + data） ──
     {
         let fname = "._ek1_";
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
         let t0 = hal::time::monotonic_ns();
-        let inode = root.create(fname, vfs::stat::FileMode::new(0o644), &cred).unwrap();
+        let inode = root
+            .create(fname, vfs::stat::FileMode::new(0o644), &cred)
+            .unwrap();
         let dt_create = hal::time::monotonic_ns().saturating_sub(t0);
 
-        let opts = OpenOptions { access: vfs::file::AccessMode::WriteOnly, ..OpenOptions::default() };
+        let opts = OpenOptions {
+            access: vfs::file::AccessMode::WriteOnly,
+            ..OpenOptions::default()
+        };
         let f = inode.open_ops(&opts, &cred).unwrap();
         let t0 = hal::time::monotonic_ns();
         let _ = f.write_at(&wbuf, 0);
@@ -543,18 +618,29 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
 
         log::info!(
             "[bench][{}][EXT-BREAKDOWN] 1x4MiB: create {} ns | write {} ns ({} MiB/s)",
-            tag, dt_create, dt_write,
+            tag,
+            dt_create,
+            dt_write,
             (total as u64) * 1_000_000_000 / dt_write.max(1) / (1024 * 1024)
         );
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
     }
 
     // ── Test 2: 预分配后纯覆盖写 ──
     {
         let fname = "._ek2_";
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
-        let inode = root.create(fname, vfs::stat::FileMode::new(0o644), &cred).unwrap();
-        let opts = OpenOptions { access: vfs::file::AccessMode::WriteOnly, ..OpenOptions::default() };
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
+        let inode = root
+            .create(fname, vfs::stat::FileMode::new(0o644), &cred)
+            .unwrap();
+        let opts = OpenOptions {
+            access: vfs::file::AccessMode::WriteOnly,
+            ..OpenOptions::default()
+        };
         let f = inode.open_ops(&opts, &cred).unwrap();
 
         let grow_buf = vec![0u8; total];
@@ -571,11 +657,17 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
         let pct_data = dt_over * 100 / dt_first.max(1);
         log::info!(
             "[bench][{}][EXT-BREAKDOWN] first write: {} ns | overwrite: {} ns",
-            tag, dt_first, dt_over
+            tag,
+            dt_first,
+            dt_over
         );
         log::info!(
             "[bench][{}][EXT-BREAKDOWN] => alloc: ~{} ns ({}%) | data: ~{} ns ({}%)",
-            tag, dt_alloc, pct_alloc, dt_over, pct_data
+            tag,
+            dt_alloc,
+            pct_alloc,
+            dt_over,
+            pct_data
         );
 
         // 覆盖写 per-call 开销
@@ -596,15 +688,21 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
 
         log::info!(
             "[bench][{}][EXT-BREAKDOWN] overwrite 4K x 1024: {} ns (avg {} ns/call, {} MiB/s)",
-            tag, dt_4k, dt_4k / 1024,
+            tag,
+            dt_4k,
+            dt_4k / 1024,
             (total as u64) * 1_000_000_000 / dt_4k.max(1) / (1024 * 1024)
         );
         log::info!(
             "[bench][{}][EXT-BREAKDOWN] overwrite 1M x 4: {} ns (avg {} ns/call, {} MiB/s)",
-            tag, dt_1m, dt_1m / 4,
+            tag,
+            dt_1m,
+            dt_1m / 4,
             (total as u64) * 1_000_000_000 / dt_1m.max(1) / (1024 * 1024)
         );
-        if let Ok(c) = root.lookup(fname) { let _ = root.unlink(fname, &*c); }
+        if let Ok(c) = root.lookup(fname) {
+            let _ = root.unlink(fname, &*c);
+        }
     }
 }
 
@@ -620,7 +718,9 @@ fn run_fs_seq_read(tag: &str, sb: &Arc<Superblock>) {
         None => return,
     };
     let want = core::cmp::min(size, 4 * 1024 * 1024) as usize;
-    if want == 0 { return; }
+    if want == 0 {
+        return;
+    }
     let mut buf = vec![0u8; want];
     let t0 = hal::time::monotonic_ns();
     if file.read_at(&mut buf, 0).is_err() {
@@ -631,7 +731,10 @@ fn run_fs_seq_read(tag: &str, sb: &Arc<Superblock>) {
     let mibps = (want as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
         "[bench][{}][L5-seq] seq read {} bytes in {} ns ({} MiB/s)",
-        tag, want, dt, mibps
+        tag,
+        want,
+        dt,
+        mibps
     );
 }
 
@@ -648,7 +751,9 @@ fn run_fs_rand_read(tag: &str, sb: &Arc<Superblock>) {
     };
     let block = 4096usize;
     let count = 100u64;
-    if size < block as u64 { return; }
+    if size < block as u64 {
+        return;
+    }
     let mut buf = vec![0u8; block];
     let mut rng = 0xbeefdeadu32;
     let t0 = hal::time::monotonic_ns();
@@ -662,7 +767,9 @@ fn run_fs_rand_read(tag: &str, sb: &Arc<Superblock>) {
     let avg_ns = dt / count;
     log::info!(
         "[bench][{}][L6-rand] rand read {} x 4 KiB: avg {} ns/op",
-        tag, count, avg_ns
+        tag,
+        count,
+        avg_ns
     );
 }
 
@@ -713,7 +820,9 @@ fn run_fs_seq_write_read(tag: &str, sb: &Arc<Superblock>) {
     let mibps_w = (total_bytes as u64) * 1_000_000_000 / dt_w.max(1) / (1024 * 1024);
     log::info!(
         "[bench][{}][L7-write] seq write 4 MiB: {} ns ({} MiB/s)",
-        tag, dt_w, mibps_w
+        tag,
+        dt_w,
+        mibps_w
     );
 
     // ── 顺序读 4 MiB ──
@@ -733,7 +842,10 @@ fn run_fs_seq_write_read(tag: &str, sb: &Arc<Superblock>) {
             let mibps_r = (n as u64) * 1_000_000_000 / dt_r.max(1) / (1024 * 1024);
             log::info!(
                 "[bench][{}][L5-read] seq read {} bytes: {} ns ({} MiB/s)",
-                tag, n, dt_r, mibps_r
+                tag,
+                n,
+                dt_r,
+                mibps_r
             );
         }
         Err(e) => {
@@ -773,7 +885,9 @@ fn run_fs_meta(tag: &str, sb: &Arc<Superblock>) {
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
         "[bench][{}][L8-meta] readdir {} entries in {} ns",
-        tag, count, dt
+        tag,
+        count,
+        dt
     );
 
     let mut create_total = 0u64;
@@ -798,7 +912,9 @@ fn run_fs_meta(tag: &str, sb: &Arc<Superblock>) {
     if create_total > 0 {
         log::info!(
             "[bench][{}][L8-meta] 10x create: avg {} ns  10x delete: avg {} ns",
-            tag, create_total / 10, delete_total / 10
+            tag,
+            create_total / 10,
+            delete_total / 10
         );
     }
 }
@@ -853,7 +969,9 @@ struct RamBlockIo {
 
 impl RamBlockIo {
     fn new(data: Vec<u8>) -> Self {
-        Self { data: Spinlock::new(data) }
+        Self {
+            data: Spinlock::new(data),
+        }
     }
 }
 
@@ -913,37 +1031,37 @@ impl BlockIo for RamBlockIo {
         Ok(())
     }
 
-    fn read_sectors_sync(
-        &self,
-        lba: u64,
-        count: u32,
-        buf: &mut [u8],
-    ) -> Result<(), BlockIoError> {
+    fn read_sectors_sync(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlockIoError> {
         const LBS: usize = 512;
         let want = count as usize * LBS;
-        if buf.len() < want { return Err(BlockIoError::MediaError); }
+        if buf.len() < want {
+            return Err(BlockIoError::MediaError);
+        }
         let off = lba as usize * LBS;
         let data = self.data.lock();
-        if off + want > data.len() { return Err(BlockIoError::MediaError); }
+        if off + want > data.len() {
+            return Err(BlockIoError::MediaError);
+        }
         buf[..want].copy_from_slice(&data[off..off + want]);
         Ok(())
     }
 
-    fn write_sectors_sync(
-        &self,
-        lba: u64,
-        count: u32,
-        buf: &[u8],
-    ) -> Result<(), BlockIoError> {
+    fn write_sectors_sync(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlockIoError> {
         const LBS: usize = 512;
         let want = count as usize * LBS;
-        if buf.len() < want { return Err(BlockIoError::MediaError); }
+        if buf.len() < want {
+            return Err(BlockIoError::MediaError);
+        }
         let off = lba as usize * LBS;
         let mut data = self.data.lock();
-        if off + want > data.len() { return Err(BlockIoError::MediaError); }
+        if off + want > data.len() {
+            return Err(BlockIoError::MediaError);
+        }
         data[off..off + want].copy_from_slice(&buf[..want]);
         Ok(())
     }
 
-    fn as_any(&self) -> &dyn Any { self }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }

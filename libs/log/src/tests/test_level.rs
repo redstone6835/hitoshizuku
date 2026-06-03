@@ -4,8 +4,8 @@
 
 extern crate std;
 
+use crate::{LogLevel, get_log_level, set_log_level};
 use ktest::ktest;
-use crate::{get_log_level, set_log_level, LogLevel};
 
 /// set_log_level 后 get_log_level 返回一致值。
 #[ktest]

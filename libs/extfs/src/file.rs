@@ -466,13 +466,9 @@ impl FileOps for ExtRegFileOps {
                 while written < buf.len() {
                     let lb = (file_off / block_size) as u32;
                     let remain_blocks = ((buf.len() - written) as u64 / block_size) as u32;
-                    let Some((phys, run_blocks)) = extent_wr::ensure_extent_run(
-                        &self.state,
-                        &mut i_block,
-                        lb,
-                        remain_blocks,
-                    )
-                    .map_err(map_err)?
+                    let Some((phys, run_blocks)) =
+                        extent_wr::ensure_extent_run(&self.state, &mut i_block, lb, remain_blocks)
+                            .map_err(map_err)?
                     else {
                         break;
                     };

@@ -60,36 +60,49 @@ impl Rsdp {
             // Map the search area for the RSDP followed by `RSDP_V2_EXT_LENGTH` bytes so an ACPI 1.0 RSDP at the
             // end of the area can be read as an `Rsdp` (which always has the size of an ACPI 2.0 RSDP)
             let mapping = unsafe {
-                handler.map_physical_region::<u8>(area.start, area.end - area.start + RSDP_V2_EXT_LENGTH)
+                handler.map_physical_region::<u8>(
+                    area.start,
+                    area.end - area.start + RSDP_V2_EXT_LENGTH,
+                )
             };
 
-            let extended_area_bytes =
-                unsafe { slice::from_raw_parts(mapping.virtual_start.as_ptr(), mapping.region_length) };
+            let extended_area_bytes = unsafe {
+                slice::from_raw_parts(mapping.virtual_start.as_ptr(), mapping.region_length)
+            };
 
             // Search `Rsdp`-sized windows at 16-byte boundaries relative to the base of the area (which is also
             // aligned to 16 bytes due to the implementation of `find_search_areas`)
-            extended_area_bytes.windows(mem::size_of::<Rsdp>()).step_by(16).find_map(|maybe_rsdp_bytes_slice| {
-                let maybe_rsdp_virt_ptr = maybe_rsdp_bytes_slice.as_ptr().cast::<Rsdp>();
-                let maybe_rsdp_phys_start = maybe_rsdp_virt_ptr as usize - mapping.virtual_start.as_ptr() as usize
-                    + mapping.physical_start;
-                // SAFETY: `maybe_rsdp_virt_ptr` points to an aligned, readable `Rsdp`-sized value, and the `Rsdp`
-                // struct's fields are always initialized.
-                let maybe_rsdp = unsafe { &*maybe_rsdp_virt_ptr };
+            extended_area_bytes
+                .windows(mem::size_of::<Rsdp>())
+                .step_by(16)
+                .find_map(|maybe_rsdp_bytes_slice| {
+                    let maybe_rsdp_virt_ptr = maybe_rsdp_bytes_slice.as_ptr().cast::<Rsdp>();
+                    let maybe_rsdp_phys_start = maybe_rsdp_virt_ptr as usize
+                        - mapping.virtual_start.as_ptr() as usize
+                        + mapping.physical_start;
+                    // SAFETY: `maybe_rsdp_virt_ptr` points to an aligned, readable `Rsdp`-sized value, and the `Rsdp`
+                    // struct's fields are always initialized.
+                    let maybe_rsdp = unsafe { &*maybe_rsdp_virt_ptr };
 
-                match maybe_rsdp.validate() {
-                    Ok(()) => Some(maybe_rsdp_phys_start),
-                    Err(AcpiError::RsdpIncorrectSignature) => None,
-                    Err(err) => {
-                        log::warning!("Invalid RSDP found at {:#x}: {:?}", maybe_rsdp_phys_start, err);
-                        None
+                    match maybe_rsdp.validate() {
+                        Ok(()) => Some(maybe_rsdp_phys_start),
+                        Err(AcpiError::RsdpIncorrectSignature) => None,
+                        Err(err) => {
+                            log::warning!(
+                                "Invalid RSDP found at {:#x}: {:?}",
+                                maybe_rsdp_phys_start,
+                                err
+                            );
+                            None
+                        }
                     }
-                }
-            })
+                })
         });
 
         match rsdp_address {
             Some(address) => {
-                let rsdp_mapping = unsafe { handler.map_physical_region::<Rsdp>(address, mem::size_of::<Rsdp>()) };
+                let rsdp_mapping =
+                    unsafe { handler.map_physical_region::<Rsdp>(address, mem::size_of::<Rsdp>()) };
                 Ok(rsdp_mapping)
             }
             None => Err(AcpiError::NoValidRsdp),
@@ -153,17 +166,26 @@ impl Rsdp {
     }
 
     pub fn length(&self) -> u32 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(
+            self.revision > 0,
+            "Tried to read extended RSDP field with ACPI Version 1.0"
+        );
         self.length
     }
 
     pub fn xsdt_address(&self) -> u64 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(
+            self.revision > 0,
+            "Tried to read extended RSDP field with ACPI Version 1.0"
+        );
         self.xsdt_address
     }
 
     pub fn ext_checksum(&self) -> u8 {
-        assert!(self.revision > 0, "Tried to read extended RSDP field with ACPI Version 1.0");
+        assert!(
+            self.revision > 0,
+            "Tried to read extended RSDP field with ACPI Version 1.0"
+        );
         self.ext_checksum
     }
 }
@@ -177,8 +199,9 @@ where
      * Read the base address of the EBDA from its location in the BDA (BIOS Data Area). Not all BIOSs fill this out
      * unfortunately, so we might not get a sensible result. We shift it left 4, as it's a segment address.
      */
-    let ebda_start_mapping =
-        unsafe { handler.map_physical_region::<u16>(EBDA_START_SEGMENT_PTR, mem::size_of::<u16>()) };
+    let ebda_start_mapping = unsafe {
+        handler.map_physical_region::<u16>(EBDA_START_SEGMENT_PTR, mem::size_of::<u16>())
+    };
     let ebda_start = (*ebda_start_mapping as usize) << 4;
 
     [

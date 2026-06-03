@@ -1,7 +1,7 @@
-#[cfg(not(feature = "ktest-kernel"))]
-extern crate std;
 #[cfg(feature = "ktest-kernel")]
 extern crate alloc;
+#[cfg(not(feature = "ktest-kernel"))]
+extern crate std;
 
 use crate::Errno;
 use ktest::ktest;
@@ -67,9 +67,8 @@ fn from_i32_unknown_positive() {
 #[ktest]
 fn as_i32_roundtrip_known() {
     let codes: &[i32] = &[
-        0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20,
-        21, 22, 23, 24, 25, 27, 28, 30, 31, 32, 34, 36, 38, 39, 40, 95,
-        97, 104, 110, 111,
+        0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28,
+        30, 31, 32, 34, 36, 38, 39, 40, 95, 97, 104, 110, 111,
     ];
     for &code in codes {
         let e = Errno::from_i32(code);

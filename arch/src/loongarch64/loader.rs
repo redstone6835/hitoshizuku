@@ -750,10 +750,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
         }
         e_print(format_args!(
             "[{:6}.{:06}] [loader] timer configured: hz={} period={}\n",
-            0,
-            0,
-            timer_hz,
-            period,
+            0, 0, timer_hz, period,
         ));
     }
 

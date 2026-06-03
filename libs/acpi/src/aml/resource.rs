@@ -33,7 +33,10 @@ pub fn resource_descriptor_list(descriptor: WrappedObject) -> Result<Vec<Resourc
 
         Ok(descriptors)
     } else {
-        Err(AmlError::InvalidOperationOnObject { op: Operation::ParseResource, typ: descriptor.typ() })
+        Err(AmlError::InvalidOperationOnObject {
+            op: Operation::ParseResource,
+            typ: descriptor.typ(),
+        })
     }
 }
 
@@ -182,7 +185,11 @@ pub struct AddressSpaceDescriptor {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MemoryRangeDescriptor {
-    FixedLocation { is_writable: bool, base_address: u32, range_length: u32 },
+    FixedLocation {
+        is_writable: bool,
+        base_address: u32,
+        range_length: u32,
+    },
 }
 
 fn fixed_memory_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
@@ -216,7 +223,13 @@ fn fixed_memory_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
     let base_address = LittleEndian::read_u32(&bytes[4..=7]);
     let range_length = LittleEndian::read_u32(&bytes[8..=11]);
 
-    Ok(Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation { is_writable, base_address, range_length }))
+    Ok(Resource::MemoryRange(
+        MemoryRangeDescriptor::FixedLocation {
+            is_writable,
+            base_address,
+            range_length,
+        },
+    ))
 }
 
 fn address_space_descriptor<T>(bytes: &[u8]) -> Result<Resource, AmlError> {
@@ -468,7 +481,12 @@ pub fn dma_format_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
         _ => unreachable!(),
     };
 
-    Ok(Resource::Dma(DMADescriptor { channel_mask, supported_speeds, is_bus_master, transfer_type_preference }))
+    Ok(Resource::Dma(DMADescriptor {
+        channel_mask,
+        supported_speeds,
+        is_bus_master,
+        transfer_type_preference,
+    }))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -510,7 +528,12 @@ fn io_port_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
     let base_alignment = bytes[6];
     let range_length = bytes[7];
 
-    Ok(Resource::IOPort(IOPortDescriptor { decodes_full_address, memory_range, base_alignment, range_length }))
+    Ok(Resource::IOPort(IOPortDescriptor {
+        decodes_full_address,
+        memory_range,
+        base_alignment,
+        range_length,
+    }))
 }
 
 fn extended_interrupt_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
@@ -540,8 +563,16 @@ fn extended_interrupt_descriptor(bytes: &[u8]) -> Result<Resource, AmlError> {
 
     Ok(Resource::Irq(IrqDescriptor {
         is_consumer: bytes[3].get_bit(0),
-        trigger: if bytes[3].get_bit(1) { InterruptTrigger::Edge } else { InterruptTrigger::Level },
-        polarity: if bytes[3].get_bit(2) { InterruptPolarity::ActiveLow } else { InterruptPolarity::ActiveHigh },
+        trigger: if bytes[3].get_bit(1) {
+            InterruptTrigger::Edge
+        } else {
+            InterruptTrigger::Level
+        },
+        polarity: if bytes[3].get_bit(2) {
+            InterruptPolarity::ActiveLow
+        } else {
+            InterruptPolarity::ActiveHigh
+        },
         is_shared: bytes[3].get_bit(3),
         is_wake_capable: bytes[3].get_bit(4),
         irq,

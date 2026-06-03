@@ -44,8 +44,8 @@ use core::{
 };
 use namespace::{AmlName, Namespace, NamespaceLevelKind};
 use object::{
-    DeviceStatus, FieldFlags, FieldUnit, FieldUnitKind, FieldUpdateRule, MethodFlags, Object, ObjectToken,
-    ObjectType, ReferenceKind, WrappedObject,
+    DeviceStatus, FieldFlags, FieldUnit, FieldUnitKind, FieldUpdateRule, MethodFlags, Object,
+    ObjectToken, ObjectType, ReferenceKind, WrappedObject,
 };
 use op_region::{OpRegion, RegionHandler, RegionSpace};
 use pci_types::PciAddress;
@@ -106,13 +106,21 @@ where
     /// Construct a new `Interpreter` with the given set of ACPI tables. This will automatically
     /// load the DSDT and any SSDTs in the supplied [`AcpiTables`].
     pub fn new_from_platform(platform: &AcpiPlatform<H>) -> Result<Interpreter<H>, AcpiError> {
-        fn load_table(interpreter: &Interpreter<impl AmlHandler>, table: AmlTable) -> Result<(), AcpiError> {
+        fn load_table(
+            interpreter: &Interpreter<impl AmlHandler>,
+            table: AmlTable,
+        ) -> Result<(), AcpiError> {
             let mapping = unsafe {
-                interpreter.handler.map_physical_region::<SdtHeader>(table.phys_address, table.length as usize)
+                interpreter
+                    .handler
+                    .map_physical_region::<SdtHeader>(table.phys_address, table.length as usize)
             };
             let stream = unsafe {
                 slice::from_raw_parts(
-                    mapping.virtual_start.as_ptr().byte_add(mem::size_of::<SdtHeader>()) as *const u8,
+                    mapping
+                        .virtual_start
+                        .as_ptr()
+                        .byte_add(mem::size_of::<SdtHeader>()) as *const u8,
                     table.length as usize - mem::size_of::<SdtHeader>(),
                 )
             };
@@ -125,15 +133,20 @@ where
 
         let registers = platform.registers.clone();
         let facs = {
-            platform.tables.find_table::<Fadt>().and_then(|fadt| fadt.facs_address().ok()).map(
-                |facs_address| unsafe {
-                    platform.handler.map_physical_region(facs_address, mem::size_of::<Facs>())
-                },
-            )
+            platform
+                .tables
+                .find_table::<Fadt>()
+                .and_then(|fadt| fadt.facs_address().ok())
+                .map(|facs_address| unsafe {
+                    platform
+                        .handler
+                        .map_physical_region(facs_address, mem::size_of::<Facs>())
+                })
         };
 
         let dsdt = platform.tables.dsdt()?;
-        let interpreter = Interpreter::new(platform.handler.clone(), dsdt.revision, registers, facs);
+        let interpreter =
+            Interpreter::new(platform.handler.clone(), dsdt.revision, registers, facs);
         load_table(&interpreter, dsdt)?;
 
         for ssdt in platform.tables.ssdts() {
@@ -154,11 +167,17 @@ where
 
     /// Evaluate an object at the given path in the namespace. If the object is a method, this
     /// invokes the method with the given set of arguments.
-    pub fn evaluate(&self, path: AmlName, args: Vec<WrappedObject>) -> Result<WrappedObject, AmlError> {
+    pub fn evaluate(
+        &self,
+        path: AmlName,
+        args: Vec<WrappedObject>,
+    ) -> Result<WrappedObject, AmlError> {
         let object = self.namespace.lock().get(path.clone())?.clone();
         match &*object {
             Object::Method { .. } => {
-                self.namespace.lock().add_level(path.clone(), NamespaceLevelKind::MethodLocals)?;
+                self.namespace
+                    .lock()
+                    .add_level(path.clone(), NamespaceLevelKind::MethodLocals)?;
                 let context = MethodContext::new_from_method(object, args, path)?;
                 self.do_execute_method(context)
             }
@@ -190,7 +209,10 @@ where
         RH: RegionHandler + 'static,
     {
         let mut handlers = self.region_handlers.lock();
-        assert!(handlers.get(&space).is_none(), "Tried to install handler for same space twice!");
+        assert!(
+            handlers.get(&space).is_none(),
+            "Tried to install handler for same space twice!"
+        );
         handlers.insert(space, Box::new(handler));
     }
 
@@ -204,7 +226,8 @@ where
         if let Err(err) = self.evaluate_if_present(AmlName::from_str("\\_INI").unwrap(), vec![]) {
             panic!("[acpi] Invoking \\_INI failed: {:?}", err);
         }
-        if let Err(err) = self.evaluate_if_present(AmlName::from_str("\\_SB._INI").unwrap(), vec![]) {
+        if let Err(err) = self.evaluate_if_present(AmlName::from_str("\\_SB._INI").unwrap(), vec![])
+        {
             panic!("[acpi] Invoking \\_SB._INI failed: {:?}", err);
         }
 
@@ -233,26 +256,36 @@ where
                 | NamespaceLevelKind::Processor
                 | NamespaceLevelKind::ThermalZone
                 | NamespaceLevelKind::PowerResource => {
-                    let should_initialize = match self
-                        .evaluate_if_present(AmlName::from_str("_STA").unwrap().resolve(path)?, vec![])
-                    {
+                    let should_initialize = match self.evaluate_if_present(
+                        AmlName::from_str("_STA").unwrap().resolve(path)?,
+                        vec![],
+                    ) {
                         Ok(Some(result)) => {
-                            let Object::Integer(result) = *result else { panic!() };
+                            let Object::Integer(result) = *result else {
+                                panic!()
+                            };
                             let status = DeviceStatus(result);
                             status.present() && status.functioning()
                         }
                         Ok(None) => true,
                         Err(err) => {
-                            panic!("[acpi] Failed to evaluate _STA for device {}: {:?}", path, err);
+                            panic!(
+                                "[acpi] Failed to evaluate _STA for device {}: {:?}",
+                                path, err
+                            );
                         }
                     };
 
                     if should_initialize {
                         num_devices_initialized += 1;
-                        if let Err(err) =
-                            self.evaluate_if_present(AmlName::from_str("_INI").unwrap().resolve(path)?, vec![])
-                        {
-                            panic!("[acpi] Failed to evaluate _INI for device {}: {:?}", path, err);
+                        if let Err(err) = self.evaluate_if_present(
+                            AmlName::from_str("_INI").unwrap().resolve(path)?,
+                            vec![],
+                        ) {
+                            panic!(
+                                "[acpi] Failed to evaluate _INI for device {}: {:?}",
+                                path, err
+                            );
                         }
                         Ok(true)
                     } else {
@@ -266,7 +299,10 @@ where
             }
         });
         if let Err(err) = init_status {
-            panic!("[acpi] Error while traversing namespace for devices: {:?}", err);
+            panic!(
+                "[acpi] Error while traversing namespace for devices: {:?}",
+                err
+            );
         }
     }
 
@@ -325,7 +361,10 @@ where
     pub fn release_global_lock(&self) -> Result<(), AmlError> {
         let is_pending = self.do_release_firmware_lock();
         if is_pending {
-            self.registers.pm1_control_registers.set_bit(Pm1ControlBit::GlobalLockRelease, true).unwrap();
+            self.registers
+                .pm1_control_registers
+                .set_bit(Pm1ControlBit::GlobalLockRelease, true)
+                .unwrap();
         }
         Ok(())
     }
@@ -379,7 +418,10 @@ where
             /*
              * First, see if we've gathered enough arguments to complete some in-flight operations.
              */
-            while let Some(op) = context.in_flight.pop_if(|op| op.arguments.len() == op.expected_arguments) {
+            while let Some(op) = context
+                .in_flight
+                .pop_if(|op| op.arguments.len() == op.expected_arguments)
+            {
                 match op.op {
                     Opcode::Add
                     | Opcode::Subtract
@@ -399,7 +441,9 @@ where
                         self.do_unary_maths(&mut context, op)?;
                     }
                     Opcode::Increment | Opcode::Decrement => {
-                        let [Argument::Object(operand)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(operand)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         let token = self.object_token.lock();
                         let Object::Integer(operand) = (unsafe { operand.gain_mut(&token) }) else {
                             Err(AmlError::ObjectNotOfExpectedType {
@@ -437,7 +481,8 @@ where
                     Opcode::Mid => self.do_mid(&mut context, op)?,
                     Opcode::Concat => self.do_concat(&mut context, op)?,
                     Opcode::ConcatRes => {
-                        let [Argument::Object(source1), Argument::Object(source2), target] = &op.arguments[..]
+                        let [Argument::Object(source1), Argument::Object(source2), target] =
+                            &op.arguments[..]
                         else {
                             panic!()
                         };
@@ -488,7 +533,9 @@ where
                         }
                     }
                     Opcode::Wait => {
-                        let [Argument::Object(sync_object), Argument::Object(timeout)] = &op.arguments[..] else {
+                        let [Argument::Object(sync_object), Argument::Object(timeout)] =
+                            &op.arguments[..]
+                        else {
                             panic!();
                         };
                         let sync_object = sync_object.clone().unwrap_reference();
@@ -517,7 +564,12 @@ where
                                         break;
                                     }
                                     if counter
-                                        .compare_exchange(value, value - 1, Ordering::AcqRel, Ordering::Acquire)
+                                        .compare_exchange(
+                                            value,
+                                            value - 1,
+                                            Ordering::AcqRel,
+                                            Ordering::Acquire,
+                                        )
                                         .is_ok()
                                     {
                                         timed_out = false;
@@ -545,7 +597,9 @@ where
                     Opcode::FromBCD => self.do_from_bcd(&mut context, op)?,
                     Opcode::ToBCD => self.do_to_bcd(&mut context, op)?,
                     Opcode::Name => {
-                        let [Argument::Namestring(name), Argument::Object(object)] = &op.arguments[..] else {
+                        let [Argument::Namestring(name), Argument::Object(object)] =
+                            &op.arguments[..]
+                        else {
                             panic!()
                         };
 
@@ -554,8 +608,11 @@ where
                         context.retire_op(op);
                     }
                     Opcode::Fatal => {
-                        let [Argument::ByteData(typ), Argument::DWordData(code), Argument::Object(arg)] =
-                            &op.arguments[..]
+                        let [
+                            Argument::ByteData(typ),
+                            Argument::DWordData(code),
+                            Argument::Object(arg),
+                        ] = &op.arguments[..]
                         else {
                             panic!()
                         };
@@ -583,7 +640,9 @@ where
                             length: region_length.as_integer()?,
                             parent_device_path: context.current_scope.clone(),
                         });
-                        self.namespace.lock().insert(name.resolve(&context.current_scope)?, region.wrap())?;
+                        self.namespace
+                            .lock()
+                            .insert(name.resolve(&context.current_scope)?, region.wrap())?;
                         context.retire_op(op);
                     }
                     Opcode::DataRegion => {
@@ -611,7 +670,9 @@ where
                             length: 0,
                             parent_device_path: context.current_scope.clone(),
                         });
-                        self.namespace.lock().insert(name.resolve(&context.current_scope)?, region.wrap())?;
+                        self.namespace
+                            .lock()
+                            .insert(name.resolve(&context.current_scope)?, region.wrap())?;
                         context.retire_op(op);
                     }
                     Opcode::Buffer => {
@@ -623,7 +684,10 @@ where
                         else {
                             panic!()
                         };
-                        let buffer_size = buffer_size.clone().unwrap_transparent_reference().as_integer()?;
+                        let buffer_size = buffer_size
+                            .clone()
+                            .unwrap_transparent_reference()
+                            .as_integer()?;
 
                         let buffer_len = pkg_length - (context.current_block.pc - start_pc);
                         let mut buffer = vec![0; buffer_size as usize];
@@ -639,7 +703,9 @@ where
                     Opcode::Package => {
                         let mut elements = Vec::with_capacity(op.expected_arguments);
                         for arg in &op.arguments {
-                            let Argument::Object(object) = arg else { panic!() };
+                            let Argument::Object(object) = arg else {
+                                panic!()
+                            };
                             elements.push(object.clone());
                         }
 
@@ -661,13 +727,19 @@ where
                         context.retire_op(op);
                     }
                     Opcode::VarPackage => {
-                        let Argument::Object(total_elements) = &op.arguments[0] else { panic!() };
-                        let total_elements =
-                            total_elements.clone().unwrap_transparent_reference().as_integer()? as usize;
+                        let Argument::Object(total_elements) = &op.arguments[0] else {
+                            panic!()
+                        };
+                        let total_elements = total_elements
+                            .clone()
+                            .unwrap_transparent_reference()
+                            .as_integer()? as usize;
 
                         let mut elements = Vec::with_capacity(total_elements);
                         for arg in &op.arguments[1..] {
-                            let Argument::Object(object) = arg else { panic!() };
+                            let Argument::Object(object) = arg else {
+                                panic!()
+                            };
                             elements.push(object.clone());
                         }
 
@@ -691,7 +763,8 @@ where
                             panic!()
                         };
                         let predicate = predicate.as_integer()?;
-                        let remaining_then_length = then_length - (context.current_block.pc - start_pc);
+                        let remaining_then_length =
+                            then_length - (context.current_block.pc - start_pc);
 
                         if predicate > 0 {
                             context.start_new_block(BlockKind::IfThenBranch, remaining_then_length);
@@ -721,7 +794,8 @@ where
                     | opcode @ Opcode::CreateWordField
                     | opcode @ Opcode::CreateDWordField
                     | opcode @ Opcode::CreateQWordField => {
-                        let [Argument::Object(buffer), Argument::Object(index)] = &op.arguments[..] else {
+                        let [Argument::Object(buffer), Argument::Object(index)] = &op.arguments[..]
+                        else {
                             panic!()
                         };
                         let name = context.namestring()?;
@@ -736,13 +810,21 @@ where
                         };
                         self.namespace.lock().insert(
                             name.resolve(&context.current_scope)?,
-                            Object::BufferField { buffer: buffer.clone(), offset: offset as usize, length }.wrap(),
+                            Object::BufferField {
+                                buffer: buffer.clone(),
+                                offset: offset as usize,
+                                length,
+                            }
+                            .wrap(),
                         )?;
                         context.retire_op(op);
                     }
                     Opcode::CreateField => {
-                        let [Argument::Object(buffer), Argument::Object(bit_index), Argument::Object(num_bits)] =
-                            &op.arguments[..]
+                        let [
+                            Argument::Object(buffer),
+                            Argument::Object(bit_index),
+                            Argument::Object(num_bits),
+                        ] = &op.arguments[..]
                         else {
                             panic!()
                         };
@@ -762,24 +844,40 @@ where
                         context.retire_op(op);
                     }
                     Opcode::Store => {
-                        let [Argument::Object(object), target] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object), target] = &op.arguments[..] else {
+                            panic!()
+                        };
                         self.do_store(target, object.clone())?;
                         context.retire_op(op);
                     }
                     Opcode::RefOf => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
-                        let reference =
-                            Object::Reference { kind: ReferenceKind::RefOf, inner: object.clone() }.wrap();
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            panic!()
+                        };
+                        let reference = Object::Reference {
+                            kind: ReferenceKind::RefOf,
+                            inner: object.clone(),
+                        }
+                        .wrap();
                         context.contribute_arg(Argument::Object(reference));
                         context.retire_op(op);
                     }
                     Opcode::CondRefOf => {
-                        let [Argument::Object(object), target] = &op.arguments[..] else { panic!() };
-                        let result = if let Object::Reference { kind: ReferenceKind::Unresolved, .. } = **object {
+                        let [Argument::Object(object), target] = &op.arguments[..] else {
+                            panic!()
+                        };
+                        let result = if let Object::Reference {
+                            kind: ReferenceKind::Unresolved,
+                            ..
+                        } = **object
+                        {
                             Object::Integer(0)
                         } else {
-                            let reference =
-                                Object::Reference { kind: ReferenceKind::RefOf, inner: object.clone() }.wrap();
+                            let reference = Object::Reference {
+                                kind: ReferenceKind::RefOf,
+                                inner: object.clone(),
+                            }
+                            .wrap();
                             self.do_store(target, reference)?;
                             Object::Integer(u64::MAX)
                         };
@@ -787,7 +885,9 @@ where
                         context.retire_op(op);
                     }
                     Opcode::DerefOf => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         let result = if object.typ() == ObjectType::Reference {
                             object.clone().unwrap_reference()
                         } else if object.typ() == ObjectType::String {
@@ -804,19 +904,32 @@ where
                         context.retire_op(op);
                     }
                     Opcode::Sleep => {
-                        let [Argument::Object(msec)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(msec)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         self.handler.sleep(msec.as_integer()?);
                         context.retire_op(op);
                     }
                     Opcode::Stall => {
-                        let [Argument::Object(usec)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(usec)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         self.handler.stall(usec.as_integer()?);
                         context.retire_op(op);
                     }
                     Opcode::Acquire => {
-                        let [Argument::Object(mutex)] = &op.arguments[..] else { panic!() };
-                        let Object::Mutex { mutex, sync_level: _ } = **mutex else {
-                            Err(AmlError::InvalidOperationOnObject { op: Operation::Acquire, typ: mutex.typ() })?
+                        let [Argument::Object(mutex)] = &op.arguments[..] else {
+                            panic!()
+                        };
+                        let Object::Mutex {
+                            mutex,
+                            sync_level: _,
+                        } = **mutex
+                        else {
+                            Err(AmlError::InvalidOperationOnObject {
+                                op: Operation::Acquire,
+                                typ: mutex.typ(),
+                            })?
                         };
                         let timeout = context.next_u16()?;
 
@@ -830,9 +943,18 @@ where
                         context.retire_op(op);
                     }
                     Opcode::Release => {
-                        let [Argument::Object(mutex)] = &op.arguments[..] else { panic!() };
-                        let Object::Mutex { mutex, sync_level: _ } = **mutex else {
-                            Err(AmlError::InvalidOperationOnObject { op: Operation::Release, typ: mutex.typ() })?
+                        let [Argument::Object(mutex)] = &op.arguments[..] else {
+                            panic!()
+                        };
+                        let Object::Mutex {
+                            mutex,
+                            sync_level: _,
+                        } = **mutex
+                        else {
+                            Err(AmlError::InvalidOperationOnObject {
+                                op: Operation::Release,
+                                typ: mutex.typ(),
+                            })?
                         };
 
                         // TODO: should we do something with the sync level??
@@ -845,7 +967,8 @@ where
                         context.retire_op(op);
                     }
                     Opcode::InternalMethodCall => {
-                        let [Argument::Object(method), Argument::Namestring(method_scope)] = &op.arguments[0..2]
+                        let [Argument::Object(method), Argument::Namestring(method_scope)] =
+                            &op.arguments[0..2]
                         else {
                             panic!()
                         };
@@ -862,12 +985,16 @@ where
                             .collect();
 
                         if let Object::Method { .. } = **method {
-                            self.namespace
-                                .lock()
-                                .add_level(method_scope.clone(), NamespaceLevelKind::MethodLocals)?;
+                            self.namespace.lock().add_level(
+                                method_scope.clone(),
+                                NamespaceLevelKind::MethodLocals,
+                            )?;
 
-                            let new_context =
-                                MethodContext::new_from_method(method.clone(), args, method_scope.clone())?;
+                            let new_context = MethodContext::new_from_method(
+                                method.clone(),
+                                args,
+                                method_scope.clone(),
+                            )?;
                             let old_context = mem::replace(&mut context, new_context);
                             self.context_stack.lock().push(old_context);
                             context.retire_op(op);
@@ -879,7 +1006,9 @@ where
                         }
                     }
                     Opcode::Return => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         let object = object.clone().unwrap_transparent_reference();
 
                         if let Some(last) = self.context_stack.lock().pop() {
@@ -895,7 +1024,9 @@ where
                         }
                     }
                     Opcode::ObjectType => {
-                        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(object)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         // TODO: this should technically support scopes as well - this is less easy
                         // (they should return `0`)
                         let typ = match object.typ() {
@@ -941,13 +1072,24 @@ where
 
                         let (region, bank) = {
                             let namespace = self.namespace.lock();
-                            let (_, region) = namespace.search(region_name, &context.current_scope)?;
+                            let (_, region) =
+                                namespace.search(region_name, &context.current_scope)?;
                             let (_, bank) = namespace.search(bank_name, &context.current_scope)?;
                             (region, bank)
                         };
 
-                        let kind = FieldUnitKind::Bank { region, bank, bank_value };
-                        self.parse_field_list(&mut context, kind, *start_pc, *pkg_length, field_flags)?;
+                        let kind = FieldUnitKind::Bank {
+                            region,
+                            bank,
+                            bank_value,
+                        };
+                        self.parse_field_list(
+                            &mut context,
+                            kind,
+                            *start_pc,
+                            *pkg_length,
+                            field_flags,
+                        )?;
                         context.retire_op(op);
                     }
                     Opcode::While => {
@@ -955,7 +1097,9 @@ where
                          * We've just evaluated the predicate for an iteration of a while loop. If
                          * false, skip over the rest of the loop, otherwise carry on.
                          */
-                        let [Argument::Object(predicate)] = &op.arguments[..] else { panic!() };
+                        let [Argument::Object(predicate)] = &op.arguments[..] else {
+                            panic!()
+                        };
                         let predicate = predicate.as_integer()?;
 
                         if predicate == 0 {
@@ -1019,9 +1163,12 @@ where
                             if let Some(package_op) = context.in_flight.last_mut()
                                 && package_op.op == Opcode::Package
                             {
-                                let num_elements_left = package_op.expected_arguments - package_op.arguments.len();
+                                let num_elements_left =
+                                    package_op.expected_arguments - package_op.arguments.len();
                                 for _ in 0..num_elements_left {
-                                    package_op.arguments.push(Argument::Object(Object::Uninitialized.wrap()));
+                                    package_op
+                                        .arguments
+                                        .push(Argument::Object(Object::Uninitialized.wrap()));
                                 }
                             }
 
@@ -1036,12 +1183,15 @@ where
                                 && package_op.op == Opcode::VarPackage
                             {
                                 let num_elements_left = {
-                                    let Argument::Object(total_elements) = &package_op.arguments[0] else {
+                                    let Argument::Object(total_elements) = &package_op.arguments[0]
+                                    else {
                                         panic!()
                                     };
-                                    let total_elements =
-                                        total_elements.clone().unwrap_transparent_reference().as_integer()?
-                                            as usize;
+                                    let total_elements = total_elements
+                                        .clone()
+                                        .unwrap_transparent_reference()
+                                        .as_integer()?
+                                        as usize;
 
                                     // Update the expected number of arguments to terminate the in-flight op
                                     package_op.expected_arguments = package_op.arguments.len();
@@ -1049,7 +1199,9 @@ where
                                 };
 
                                 for _ in 0..num_elements_left {
-                                    package_op.arguments.push(Argument::Object(Object::Uninitialized.wrap()));
+                                    package_op
+                                        .arguments
+                                        .push(Argument::Object(Object::Uninitialized.wrap()));
                                 }
                             }
 
@@ -1086,7 +1238,10 @@ where
                              * predicate.
                              */
                             context.current_block.pc = start_pc;
-                            context.start(OpInFlight::new(Opcode::While, &[ResolveBehaviour::TermArg]));
+                            context.start(OpInFlight::new(
+                                Opcode::While,
+                                &[ResolveBehaviour::TermArg],
+                            ));
                             continue;
                         }
                     }
@@ -1103,18 +1258,26 @@ where
                     if context.last_op()?.resolve_behaviour() == ResolveBehaviour::Target {
                         context.last_op()?.arguments.push(Argument::Null);
                     } else {
-                        context.last_op()?.arguments.push(Argument::Object(Object::Integer(0).wrap()));
+                        context
+                            .last_op()?
+                            .arguments
+                            .push(Argument::Object(Object::Integer(0).wrap()));
                     }
                 }
                 Opcode::One => {
-                    context.last_op()?.arguments.push(Argument::Object(Object::Integer(1).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::Integer(1).wrap()));
                 }
                 Opcode::Alias => {
                     let source = context.namestring()?;
                     let alias = context.namestring()?;
 
                     let mut namespace = self.namespace.lock();
-                    let object = namespace.get(source.resolve(&context.current_scope)?)?.clone();
+                    let object = namespace
+                        .get(source.resolve(&context.current_scope)?)?
+                        .clone();
                     let alias = alias.resolve(&context.current_scope)?;
                     namespace.create_alias(alias, object)?;
                 }
@@ -1128,29 +1291,47 @@ where
                 }
                 Opcode::BytePrefix => {
                     let value = context.next()?;
-                    context.last_op()?.arguments.push(Argument::Object(Object::Integer(value as u64).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::Integer(value as u64).wrap()));
                 }
                 Opcode::WordPrefix => {
                     let value = context.next_u16()?;
-                    context.last_op()?.arguments.push(Argument::Object(Object::Integer(value as u64).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::Integer(value as u64).wrap()));
                 }
                 Opcode::DWordPrefix => {
                     let value = context.next_u32()?;
-                    context.last_op()?.arguments.push(Argument::Object(Object::Integer(value as u64).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::Integer(value as u64).wrap()));
                 }
                 Opcode::StringPrefix => {
                     let str_start = context.current_block.pc;
                     while context.next()? != b'\0' {}
                     // TODO: handle err
                     let str = String::from(
-                        str::from_utf8(&context.current_block.stream()[str_start..(context.current_block.pc - 1)])
-                            .unwrap(),
+                        str::from_utf8(
+                            &context.current_block.stream()
+                                [str_start..(context.current_block.pc - 1)],
+                        )
+                        .unwrap(),
                     );
-                    context.last_op()?.arguments.push(Argument::Object(Object::String(str).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::String(str).wrap()));
                 }
                 Opcode::QWordPrefix => {
                     let value = context.next_u64()?;
-                    context.last_op()?.arguments.push(Argument::Object(Object::Integer(value).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::Integer(value).wrap()));
                 }
                 Opcode::Scope => {
                     let start_pc = context.current_block.pc;
@@ -1160,7 +1341,9 @@ where
                     let remaining_length = pkg_length - (context.current_block.pc - start_pc);
 
                     let new_scope = name.resolve(&context.current_scope)?;
-                    self.namespace.lock().add_level(new_scope.clone(), NamespaceLevelKind::Scope)?;
+                    self.namespace
+                        .lock()
+                        .add_level(new_scope.clone(), NamespaceLevelKind::Scope)?;
 
                     let old_scope = mem::replace(&mut context.current_scope, new_scope);
                     context.start_new_block(BlockKind::Scope { old_scope }, remaining_length);
@@ -1170,8 +1353,15 @@ where
                     let pkg_length = context.pkglength()?;
                     context.start(OpInFlight::new_with(
                         Opcode::Buffer,
-                        vec![Argument::TrackedPc(start_pc), Argument::PkgLength(pkg_length)],
-                        &[ResolveBehaviour::Placeholder, ResolveBehaviour::Placeholder, ResolveBehaviour::TermArg],
+                        vec![
+                            Argument::TrackedPc(start_pc),
+                            Argument::PkgLength(pkg_length),
+                        ],
+                        &[
+                            ResolveBehaviour::Placeholder,
+                            ResolveBehaviour::Placeholder,
+                            ResolveBehaviour::TermArg,
+                        ],
                     ));
                 }
                 Opcode::Package => {
@@ -1209,7 +1399,10 @@ where
                     context.start(OpInFlight::new_dynamic(
                         Opcode::VarPackage,
                         usize::MAX,
-                        &[ResolveBehaviour::TermArg, ResolveBehaviour::AsPackageElements],
+                        &[
+                            ResolveBehaviour::TermArg,
+                            ResolveBehaviour::AsPackageElements,
+                        ],
                     ));
                     context.start_new_block(BlockKind::VarPackage, remaining_length);
                 }
@@ -1226,7 +1419,9 @@ where
                     context.current_block.pc += code_len;
 
                     let name = name.resolve(&context.current_scope)?;
-                    self.namespace.lock().insert(name, Object::Method { code, flags }.wrap())?;
+                    self.namespace
+                        .lock()
+                        .insert(name, Object::Method { code, flags }.wrap())?;
                 }
                 Opcode::External => {
                     let _name = context.namestring()?;
@@ -1239,31 +1434,54 @@ where
 
                     let name = name.resolve(&context.current_scope)?;
                     let mutex = self.handler.create_mutex();
-                    self.namespace.lock().insert(name, Object::Mutex { mutex, sync_level }.wrap())?;
+                    self.namespace
+                        .lock()
+                        .insert(name, Object::Mutex { mutex, sync_level }.wrap())?;
                 }
                 Opcode::Event => {
                     let name = context.namestring()?;
 
                     let name = name.resolve(&context.current_scope)?;
-                    self.namespace.lock().insert(name, Object::Event(Arc::new(AtomicU64::new(0))).wrap())?;
+                    self.namespace
+                        .lock()
+                        .insert(name, Object::Event(Arc::new(AtomicU64::new(0))).wrap())?;
                 }
                 Opcode::LoadTable => todo!(),
                 Opcode::Load => todo!(),
-                Opcode::Stall => context.start(OpInFlight::new(Opcode::Stall, &[ResolveBehaviour::TermArg])),
-                Opcode::Sleep => context.start(OpInFlight::new(Opcode::Sleep, &[ResolveBehaviour::TermArg])),
-                Opcode::Acquire => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
-                Opcode::Release => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
-                Opcode::Signal => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
-                Opcode::Wait => context
-                    .start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName, ResolveBehaviour::TermArg])),
-                Opcode::Reset => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
-                Opcode::Notify => context
-                    .start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName, ResolveBehaviour::TermArg])),
-                Opcode::FromBCD | Opcode::ToBCD => {
-                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg, ResolveBehaviour::Target]))
+                Opcode::Stall => {
+                    context.start(OpInFlight::new(Opcode::Stall, &[ResolveBehaviour::TermArg]))
                 }
+                Opcode::Sleep => {
+                    context.start(OpInFlight::new(Opcode::Sleep, &[ResolveBehaviour::TermArg]))
+                }
+                Opcode::Acquire => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
+                }
+                Opcode::Release => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
+                }
+                Opcode::Signal => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
+                }
+                Opcode::Wait => context.start(OpInFlight::new(
+                    opcode,
+                    &[ResolveBehaviour::SuperName, ResolveBehaviour::TermArg],
+                )),
+                Opcode::Reset => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
+                }
+                Opcode::Notify => context.start(OpInFlight::new(
+                    opcode,
+                    &[ResolveBehaviour::SuperName, ResolveBehaviour::TermArg],
+                )),
+                Opcode::FromBCD | Opcode::ToBCD => context.start(OpInFlight::new(
+                    opcode,
+                    &[ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                )),
                 Opcode::Revision => {
-                    context.contribute_arg(Argument::Object(Object::Integer(INTERPRETER_REVISION).wrap()));
+                    context.contribute_arg(Argument::Object(
+                        Object::Integer(INTERPRETER_REVISION).wrap(),
+                    ));
                 }
                 Opcode::Debug => {
                     context.contribute_arg(Argument::Object(Object::Debug.wrap()));
@@ -1274,7 +1492,11 @@ where
                     context.start(OpInFlight::new_with(
                         Opcode::Fatal,
                         vec![Argument::ByteData(typ), Argument::DWordData(code)],
-                        &[ResolveBehaviour::Placeholder, ResolveBehaviour::Placeholder, ResolveBehaviour::TermArg],
+                        &[
+                            ResolveBehaviour::Placeholder,
+                            ResolveBehaviour::Placeholder,
+                            ResolveBehaviour::TermArg,
+                        ],
                     ));
                 }
                 Opcode::Timer => {
@@ -1315,7 +1537,11 @@ where
                     let region_name = context.namestring()?;
                     let field_flags = context.next()?;
 
-                    let region = self.namespace.lock().get(region_name.resolve(&context.current_scope)?)?.clone();
+                    let region = self
+                        .namespace
+                        .lock()
+                        .get(region_name.resolve(&context.current_scope)?)?
+                        .clone();
                     let kind = FieldUnitKind::Normal { region };
                     self.parse_field_list(&mut context, kind, start_pc, pkg_length, field_flags)?;
                 }
@@ -1368,7 +1594,9 @@ where
                     let new_scope = name.resolve(&context.current_scope)?;
                     let (kind, object) = match opcode {
                         Opcode::Device => (NamespaceLevelKind::Device, Object::Device),
-                        Opcode::ThermalZone => (NamespaceLevelKind::ThermalZone, Object::ThermalZone),
+                        Opcode::ThermalZone => {
+                            (NamespaceLevelKind::ThermalZone, Object::ThermalZone)
+                        }
                         _ => unreachable!(),
                     };
                     let mut namespace = self.namespace.lock();
@@ -1389,7 +1617,11 @@ where
                     let remaining_length = pkg_length - (context.current_block.pc - start_pc);
 
                     let new_scope = name.resolve(&context.current_scope)?;
-                    let object = Object::Processor { proc_id, pblk_address, pblk_length };
+                    let object = Object::Processor {
+                        proc_id,
+                        pblk_address,
+                        pblk_length,
+                    };
                     let mut namespace = self.namespace.lock();
                     namespace.add_level(new_scope.clone(), NamespaceLevelKind::Processor)?;
                     namespace.insert(new_scope.clone(), object.wrap())?;
@@ -1407,7 +1639,10 @@ where
                     let remaining_length = pkg_length - (context.current_block.pc - start_pc);
 
                     let new_scope = name.resolve(&context.current_scope)?;
-                    let object = Object::PowerResource { system_level, resource_order };
+                    let object = Object::PowerResource {
+                        system_level,
+                        resource_order,
+                    };
                     let mut namespace = self.namespace.lock();
                     namespace.add_level(new_scope.clone(), NamespaceLevelKind::PowerResource)?;
                     namespace.insert(new_scope.clone(), object.wrap())?;
@@ -1418,23 +1653,37 @@ where
                 Opcode::Local(local) => {
                     let local = context.locals[local as usize].clone();
                     context.last_op()?.arguments.push(Argument::Object(
-                        Object::Reference { kind: ReferenceKind::LocalOrArg, inner: local }.wrap(),
+                        Object::Reference {
+                            kind: ReferenceKind::LocalOrArg,
+                            inner: local,
+                        }
+                        .wrap(),
                     ));
                 }
                 Opcode::Arg(arg) => {
                     let arg = context.args[arg as usize].clone();
                     context.last_op()?.arguments.push(Argument::Object(
-                        Object::Reference { kind: ReferenceKind::LocalOrArg, inner: arg }.wrap(),
+                        Object::Reference {
+                            kind: ReferenceKind::LocalOrArg,
+                            inner: arg,
+                        }
+                        .wrap(),
                     ));
                 }
                 Opcode::Store => context.start(OpInFlight::new(
                     Opcode::Store,
                     &[ResolveBehaviour::TermArg, ResolveBehaviour::SuperName],
                 )),
-                Opcode::RefOf => context.start(OpInFlight::new(Opcode::RefOf, &[ResolveBehaviour::SuperName])),
+                Opcode::RefOf => context.start(OpInFlight::new(
+                    Opcode::RefOf,
+                    &[ResolveBehaviour::SuperName],
+                )),
                 Opcode::CondRefOf => context.start(OpInFlight::new(
                     opcode,
-                    &[ResolveBehaviour::SuperNameIfExists, ResolveBehaviour::Target],
+                    &[
+                        ResolveBehaviour::SuperNameIfExists,
+                        ResolveBehaviour::Target,
+                    ],
                 )),
 
                 Opcode::DualNamePrefix
@@ -1454,7 +1703,8 @@ where
                     match behaviour {
                         // XXX: `NullName` is handled separately given its ambiguity with `Zero`
                         ResolveBehaviour::SuperName | ResolveBehaviour::Target => {
-                            let object = self.namespace.lock().search(&name, &context.current_scope);
+                            let object =
+                                self.namespace.lock().search(&name, &context.current_scope);
                             match object {
                                 Ok((_resolved_name, object)) => {
                                     context.last_op()?.arguments.push(Argument::Object(object));
@@ -1463,7 +1713,8 @@ where
                             }
                         }
                         ResolveBehaviour::SuperNameIfExists => {
-                            let object = self.namespace.lock().search(&name, &context.current_scope);
+                            let object =
+                                self.namespace.lock().search(&name, &context.current_scope);
                             match object {
                                 Ok((_resolved_name, object)) => {
                                     context.last_op()?.arguments.push(Argument::Object(object));
@@ -1473,21 +1724,28 @@ where
                                         kind: ReferenceKind::Unresolved,
                                         inner: Object::String(name.to_string()).wrap(),
                                     };
-                                    context.last_op()?.arguments.push(Argument::Object(reference.wrap()));
+                                    context
+                                        .last_op()?
+                                        .arguments
+                                        .push(Argument::Object(reference.wrap()));
                                 }
                                 Err(err) => Err(err)?,
                             }
                         }
                         ResolveBehaviour::TermArg => {
-                            let object = self.namespace.lock().search(&name, &context.current_scope);
+                            let object =
+                                self.namespace.lock().search(&name, &context.current_scope);
                             match object {
                                 Ok((resolved_name, object)) => {
-                                    if let Object::Method { flags, .. } | Object::NativeMethod { flags, .. } =
-                                        *object
+                                    if let Object::Method { flags, .. }
+                                    | Object::NativeMethod { flags, .. } = *object
                                     {
                                         context.start(OpInFlight::new_with_dynamic(
                                             Opcode::InternalMethodCall,
-                                            vec![Argument::Object(object), Argument::Namestring(resolved_name)],
+                                            vec![
+                                                Argument::Object(object),
+                                                Argument::Namestring(resolved_name),
+                                            ],
                                             flags.arg_count(),
                                             &[
                                                 ResolveBehaviour::Placeholder,
@@ -1538,7 +1796,11 @@ where
                 | Opcode::Concat => {
                     context.start(OpInFlight::new(
                         opcode,
-                        &[ResolveBehaviour::TermArg, ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                        &[
+                            ResolveBehaviour::TermArg,
+                            ResolveBehaviour::TermArg,
+                            ResolveBehaviour::Target,
+                        ],
                     ));
                 }
 
@@ -1554,20 +1816,35 @@ where
                 Opcode::Increment | Opcode::Decrement => {
                     context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
                 }
-                Opcode::Not => context
-                    .start(OpInFlight::new(Opcode::Not, &[ResolveBehaviour::TermArg, ResolveBehaviour::Target])),
-                Opcode::FindSetLeftBit | Opcode::FindSetRightBit => {
-                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg, ResolveBehaviour::Target]))
+                Opcode::Not => context.start(OpInFlight::new(
+                    Opcode::Not,
+                    &[ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                )),
+                Opcode::FindSetLeftBit | Opcode::FindSetRightBit => context.start(OpInFlight::new(
+                    opcode,
+                    &[ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                )),
+                Opcode::DerefOf => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg]))
                 }
-                Opcode::DerefOf => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg])),
                 Opcode::ConcatRes => context.start(OpInFlight::new(
                     opcode,
-                    &[ResolveBehaviour::TermArg, ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                    &[
+                        ResolveBehaviour::TermArg,
+                        ResolveBehaviour::TermArg,
+                        ResolveBehaviour::Target,
+                    ],
                 )),
-                Opcode::SizeOf => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
+                Opcode::SizeOf => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
+                }
                 Opcode::Index => context.start(OpInFlight::new(
                     opcode,
-                    &[ResolveBehaviour::TermArg, ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                    &[
+                        ResolveBehaviour::TermArg,
+                        ResolveBehaviour::TermArg,
+                        ResolveBehaviour::Target,
+                    ],
                 )),
                 /*
                  * TODO
@@ -1585,9 +1862,10 @@ where
                 | Opcode::CreateQWordField => {
                     context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg; 2]))
                 }
-                Opcode::CreateField => {
-                    context.start(OpInFlight::new(Opcode::CreateField, &[ResolveBehaviour::TermArg; 3]))
-                }
+                Opcode::CreateField => context.start(OpInFlight::new(
+                    Opcode::CreateField,
+                    &[ResolveBehaviour::TermArg; 3],
+                )),
 
                 Opcode::LAnd
                 | Opcode::LOr
@@ -1601,15 +1879,25 @@ where
                     context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg; 2]));
                 }
 
-                Opcode::ToBuffer | Opcode::ToDecimalString | Opcode::ToHexString | Opcode::ToInteger => {
-                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::TermArg, ResolveBehaviour::Target]))
-                }
+                Opcode::ToBuffer
+                | Opcode::ToDecimalString
+                | Opcode::ToHexString
+                | Opcode::ToInteger => context.start(OpInFlight::new(
+                    opcode,
+                    &[ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                )),
                 Opcode::ToString => context.start(OpInFlight::new(
                     opcode,
-                    &[ResolveBehaviour::TermArg, ResolveBehaviour::TermArg, ResolveBehaviour::Target],
+                    &[
+                        ResolveBehaviour::TermArg,
+                        ResolveBehaviour::TermArg,
+                        ResolveBehaviour::Target,
+                    ],
                 )),
 
-                Opcode::ObjectType => context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName])),
+                Opcode::ObjectType => {
+                    context.start(OpInFlight::new(opcode, &[ResolveBehaviour::SuperName]))
+                }
                 Opcode::CopyObject => todo!(),
                 Opcode::Mid => context.start(OpInFlight::new(
                     Opcode::Mid,
@@ -1625,8 +1913,15 @@ where
                     let then_length = context.pkglength()?;
                     context.start(OpInFlight::new_with(
                         Opcode::If,
-                        vec![Argument::TrackedPc(start_pc), Argument::PkgLength(then_length)],
-                        &[ResolveBehaviour::Placeholder, ResolveBehaviour::Placeholder, ResolveBehaviour::TermArg],
+                        vec![
+                            Argument::TrackedPc(start_pc),
+                            Argument::PkgLength(then_length),
+                        ],
+                        &[
+                            ResolveBehaviour::Placeholder,
+                            ResolveBehaviour::Placeholder,
+                            ResolveBehaviour::TermArg,
+                        ],
                     ));
                 }
                 Opcode::Else => return Err(AmlError::ElseFoundWithoutCorrespondingIf),
@@ -1635,7 +1930,9 @@ where
                     let pkg_length = context.pkglength()?;
                     let remaining_length = pkg_length - (context.current_block.pc - start_pc);
                     context.start_new_block(
-                        BlockKind::While { start_pc: context.current_block.pc },
+                        BlockKind::While {
+                            start_pc: context.current_block.pc,
+                        },
                         remaining_length,
                     );
                     context.start(OpInFlight::new(Opcode::While, &[ResolveBehaviour::TermArg]));
@@ -1671,13 +1968,19 @@ where
                         }
                     }
                 }
-                Opcode::Return => context.start(OpInFlight::new(Opcode::Return, &[ResolveBehaviour::TermArg])),
+                Opcode::Return => context.start(OpInFlight::new(
+                    Opcode::Return,
+                    &[ResolveBehaviour::TermArg],
+                )),
                 Opcode::Noop => {}
                 Opcode::Breakpoint => {
                     self.handler.breakpoint();
                 }
                 Opcode::Ones => {
-                    context.last_op()?.arguments.push(Argument::Object(Object::Integer(u64::MAX).wrap()));
+                    context
+                        .last_op()?
+                        .arguments
+                        .push(Argument::Object(Object::Integer(u64::MAX).wrap()));
                 }
 
                 Opcode::InternalMethodCall => panic!(),
@@ -1736,7 +2039,9 @@ where
                         bit_length: field_length,
                         flags: FieldFlags(flags),
                     });
-                    self.namespace.lock().insert(field_name.resolve(&context.current_scope)?, field.wrap())?;
+                    self.namespace
+                        .lock()
+                        .insert(field_name.resolve(&context.current_scope)?, field.wrap())?;
 
                     field_offset += field_length;
                 }
@@ -1747,8 +2052,14 @@ where
     }
 
     fn do_binary_maths(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(left), Argument::Object(right), target] = &op.arguments[0..3] else { panic!() };
-        let target2 = if op.op == Opcode::Divide { Some(&op.arguments[3]) } else { None };
+        let [Argument::Object(left), Argument::Object(right), target] = &op.arguments[0..3] else {
+            panic!()
+        };
+        let target2 = if op.op == Opcode::Divide {
+            Some(&op.arguments[3])
+        } else {
+            None
+        };
 
         let left = left.clone().unwrap_transparent_reference().as_integer()?;
         let right = right.clone().unwrap_transparent_reference().as_integer()?;
@@ -1782,8 +2093,13 @@ where
     }
 
     fn do_unary_maths(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand)] = &op.arguments[..] else { panic!() };
-        let operand = operand.clone().unwrap_transparent_reference().as_integer()?;
+        let [Argument::Object(operand)] = &op.arguments[..] else {
+            panic!()
+        };
+        let operand = operand
+            .clone()
+            .unwrap_transparent_reference()
+            .as_integer()?;
 
         let result = match op.op {
             Opcode::FindSetLeftBit => {
@@ -1825,8 +2141,13 @@ where
 
     fn do_logical_op(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
         if op.op == Opcode::LNot {
-            let [Argument::Object(operand)] = &op.arguments[..] else { panic!() };
-            let operand = operand.clone().unwrap_transparent_reference().as_integer()?;
+            let [Argument::Object(operand)] = &op.arguments[..] else {
+                panic!()
+            };
+            let operand = operand
+                .clone()
+                .unwrap_transparent_reference()
+                .as_integer()?;
             let result = if operand == 0 { u64::MAX } else { 0 };
 
             context.contribute_arg(Argument::Object(Object::Integer(result).wrap()));
@@ -1834,7 +2155,9 @@ where
             return Ok(());
         }
 
-        let [Argument::Object(left), Argument::Object(right)] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(left), Argument::Object(right)] = &op.arguments[..] else {
+            panic!()
+        };
         let left = left.clone().unwrap_transparent_reference();
         let right = right.clone().unwrap_transparent_reference();
 
@@ -1864,7 +2187,9 @@ where
                 (left, right)
             }
             Object::Buffer(ref left) => {
-                let Object::Buffer(ref right) = *right else { panic!() };
+                let Object::Buffer(ref right) = *right else {
+                    panic!()
+                };
                 let left = {
                     let mut bytes = [0u8; 4];
                     (bytes[0..left.len()]).copy_from_slice(left);
@@ -1877,7 +2202,10 @@ where
                 };
                 (left, right)
             }
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::LogicalOp, typ: left.typ() })?,
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::LogicalOp,
+                typ: left.typ(),
+            })?,
         };
 
         let result = match op.op {
@@ -1891,7 +2219,11 @@ where
             Opcode::LLess => left < right,
             _ => panic!(),
         };
-        let result = if result { Object::Integer(u64::MAX) } else { Object::Integer(0) };
+        let result = if result {
+            Object::Integer(u64::MAX)
+        } else {
+            Object::Integer(0)
+        };
 
         context.contribute_arg(Argument::Object(result.wrap()));
         context.retire_op(op);
@@ -1899,7 +2231,9 @@ where
     }
 
     fn do_to_buffer(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(operand), target] = &op.arguments[..] else {
+            panic!()
+        };
         let operand = operand.clone().unwrap_transparent_reference();
 
         let result = match *operand {
@@ -1921,7 +2255,10 @@ where
                     Object::Buffer(bytes)
                 }
             }
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ToBuffer, typ: operand.typ() })?,
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::ToBuffer,
+                typ: operand.typ(),
+            })?,
         }
         .wrap();
 
@@ -1932,7 +2269,9 @@ where
     }
 
     fn do_to_integer(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(operand), target] = &op.arguments[..] else {
+            panic!()
+        };
         let operand = operand.clone().unwrap_transparent_reference();
 
         let result = match *operand {
@@ -1955,18 +2294,26 @@ where
                  */
                 if let Some(value) = value.strip_prefix("0x") {
                     let parsed = u64::from_str_radix(value, 16).map_err(|_| {
-                        AmlError::InvalidOperationOnObject { op: Operation::ToInteger, typ: ObjectType::String }
+                        AmlError::InvalidOperationOnObject {
+                            op: Operation::ToInteger,
+                            typ: ObjectType::String,
+                        }
                     })?;
                     Object::Integer(parsed)
                 } else {
-                    let parsed = str::parse::<u64>(value).map_err(|_| AmlError::InvalidOperationOnObject {
-                        op: Operation::ToInteger,
-                        typ: ObjectType::String,
+                    let parsed = str::parse::<u64>(value).map_err(|_| {
+                        AmlError::InvalidOperationOnObject {
+                            op: Operation::ToInteger,
+                            typ: ObjectType::String,
+                        }
                     })?;
                     Object::Integer(parsed)
                 }
             }
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ToBuffer, typ: operand.typ() })?,
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::ToBuffer,
+                typ: operand.typ(),
+            })?,
         }
         .wrap();
 
@@ -1977,7 +2324,9 @@ where
     }
 
     fn do_to_string(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(source), Argument::Object(length), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(source), Argument::Object(length), target] = &op.arguments[..] else {
+            panic!()
+        };
         let source = source.clone().unwrap_transparent_reference();
         let source = source.as_buffer()?;
         let length = length.clone().unwrap_transparent_reference().as_integer()? as usize;
@@ -1989,10 +2338,11 @@ where
             if length < usize::MAX {
                 buffer = &buffer[0..usize::min(length, buffer.len())];
             }
-            let string = str::from_utf8(buffer).map_err(|_| AmlError::InvalidOperationOnObject {
-                op: Operation::ToString,
-                typ: ObjectType::Buffer,
-            })?;
+            let string =
+                str::from_utf8(buffer).map_err(|_| AmlError::InvalidOperationOnObject {
+                    op: Operation::ToString,
+                    typ: ObjectType::Buffer,
+                })?;
             Object::String(string.to_string())
         }
         .wrap();
@@ -2004,8 +2354,14 @@ where
     }
 
     /// Perform a `ToDecimalString` or `ToHexString` operation
-    fn do_to_dec_hex_string(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(operand), target] = &op.arguments[..] else { panic!() };
+    fn do_to_dec_hex_string(
+        &self,
+        context: &mut MethodContext,
+        op: OpInFlight,
+    ) -> Result<(), AmlError> {
+        let [Argument::Object(operand), target] = &op.arguments[..] else {
+            panic!()
+        };
         let operand = operand.clone().unwrap_transparent_reference();
 
         let result = match *operand {
@@ -2035,7 +2391,10 @@ where
                     Object::String(string)
                 }
             }
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::ToDecOrHexString, typ: operand.typ() })?,
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::ToDecOrHexString,
+                typ: operand.typ(),
+            })?,
         }
         .wrap();
 
@@ -2046,8 +2405,12 @@ where
     }
 
     fn do_mid(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(source), Argument::Object(index), Argument::Object(length), target] =
-            &op.arguments[..]
+        let [
+            Argument::Object(source),
+            Argument::Object(index),
+            Argument::Object(length),
+            target,
+        ] = &op.arguments[..]
         else {
             panic!()
         };
@@ -2073,7 +2436,10 @@ where
                     Object::Buffer(bytes.to_vec())
                 }
             }
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::Mid, typ: source.typ() })?,
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::Mid,
+                typ: source.typ(),
+            })?,
         }
         .wrap();
 
@@ -2084,7 +2450,10 @@ where
     }
 
     fn do_concat(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(source1), Argument::Object(source2), target] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(source1), Argument::Object(source2), target] = &op.arguments[..]
+        else {
+            panic!()
+        };
         let source1 = source1.clone().unwrap_transparent_reference();
         let source2 = source2.clone().unwrap_transparent_reference();
 
@@ -2097,9 +2466,13 @@ where
                 Object::Event(_) => "[Event]".to_string(),
                 Object::FieldUnit(_) => "[Field]".to_string(),
                 Object::Integer(value) => value.to_string(),
-                Object::Method { .. } | Object::NativeMethod { .. } => "[Control Method]".to_string(),
+                Object::Method { .. } | Object::NativeMethod { .. } => {
+                    "[Control Method]".to_string()
+                }
                 Object::Mutex { .. } => "[Mutex]".to_string(),
-                Object::Reference { inner, .. } => resolve_as_string(&(inner.clone().unwrap_reference())),
+                Object::Reference { inner, .. } => {
+                    resolve_as_string(&(inner.clone().unwrap_reference()))
+                }
                 Object::OpRegion(_) => "[Operation Region]".to_string(),
                 Object::Package(_) => "[Package]".to_string(),
                 Object::PowerResource { .. } => "[Power Resource]".to_string(),
@@ -2145,7 +2518,9 @@ where
     }
 
     fn do_from_bcd(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(value)] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(value)] = &op.arguments[..] else {
+            panic!()
+        };
         let mut value = value.clone().unwrap_transparent_reference().as_integer()?;
 
         let mut result = 0;
@@ -2162,7 +2537,9 @@ where
     }
 
     fn do_to_bcd(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(value)] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(value)] = &op.arguments[..] else {
+            panic!()
+        };
         let mut value = value.clone().unwrap_transparent_reference().as_integer()?;
 
         let mut result = 0;
@@ -2179,14 +2556,19 @@ where
     }
 
     fn do_size_of(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(object)] = &op.arguments[..] else { panic!() };
+        let [Argument::Object(object)] = &op.arguments[..] else {
+            panic!()
+        };
         let object = object.clone().unwrap_transparent_reference();
 
         let result = match *object {
             Object::Buffer(ref buffer) => buffer.len(),
             Object::String(ref str) => str.len(),
             Object::Package(ref package) => package.len(),
-            _ => Err(AmlError::InvalidOperationOnObject { op: Operation::SizeOf, typ: object.typ() })?,
+            _ => Err(AmlError::InvalidOperationOnObject {
+                op: Operation::SizeOf,
+                typ: object.typ(),
+            })?,
         };
 
         context.contribute_arg(Argument::Object(Object::Integer(result as u64).wrap()));
@@ -2195,11 +2577,19 @@ where
     }
 
     fn do_index(&self, context: &mut MethodContext, op: OpInFlight) -> Result<(), AmlError> {
-        let [Argument::Object(object), Argument::Object(index_value), target] = &op.arguments[..] else {
+        let [
+            Argument::Object(object),
+            Argument::Object(index_value),
+            target,
+        ] = &op.arguments[..]
+        else {
             panic!()
         };
         let object = object.clone().unwrap_transparent_reference();
-        let index_value = index_value.clone().unwrap_transparent_reference().as_integer()?;
+        let index_value = index_value
+            .clone()
+            .unwrap_transparent_reference()
+            .as_integer()?;
 
         let result = match *object {
             Object::Buffer(ref buffer) => {
@@ -2233,8 +2623,13 @@ where
                 }
             }
             Object::Package(ref package) => {
-                let Some(element) = package.get(index_value as usize) else { Err(AmlError::IndexOutOfBounds)? };
-                Object::Reference { kind: ReferenceKind::RefOf, inner: element.clone() }
+                let Some(element) = package.get(index_value as usize) else {
+                    Err(AmlError::IndexOutOfBounds)?
+                };
+                Object::Reference {
+                    kind: ReferenceKind::RefOf,
+                    inner: element.clone(),
+                }
             }
             _ => Err(AmlError::IndexOutOfBounds)?,
         }
@@ -2246,7 +2641,11 @@ where
         Ok(())
     }
 
-    fn do_store(&self, target: &Argument, object: WrappedObject) -> Result<WrappedObject, AmlError> {
+    fn do_store(
+        &self,
+        target: &Argument,
+        object: WrappedObject,
+    ) -> Result<WrappedObject, AmlError> {
         let object = object.unwrap_transparent_reference();
         let token = self.object_token.lock();
 
@@ -2280,16 +2679,19 @@ where
                         *target = self.do_field_read(field)?.as_integer()?;
                     }
                     _ => {
-                        let as_integer = object.to_integer(if self.dsdt_revision >= 2 { 8 } else { 4 })?;
+                        let as_integer =
+                            object.to_integer(if self.dsdt_revision >= 2 { 8 } else { 4 })?;
                         *target = as_integer;
                     }
                 },
                 Object::BufferField { .. } => match unsafe { object.gain_mut(&token) } {
                     Object::Integer(value) => {
-                        unsafe { target.gain_mut(&token) }.write_buffer_field(&value.to_le_bytes(), &token)?;
+                        unsafe { target.gain_mut(&token) }
+                            .write_buffer_field(&value.to_le_bytes(), &token)?;
                     }
                     Object::Buffer(value) => {
-                        unsafe { target.gain_mut(&token) }.write_buffer_field(value.as_slice(), &token)?;
+                        unsafe { target.gain_mut(&token) }
+                            .write_buffer_field(value.as_slice(), &token)?;
                     }
                     _ => panic!(),
                 },
@@ -2298,7 +2700,11 @@ where
                     match kind {
                         ReferenceKind::RefOf => todo!(),
                         ReferenceKind::LocalOrArg => {
-                            if let Object::Reference { kind: _inner_kind, inner: inner_inner } = &**inner {
+                            if let Object::Reference {
+                                kind: _inner_kind,
+                                inner: inner_inner,
+                            } = &**inner
+                            {
                                 // TODO: this should store into the reference, potentially doing an
                                 // implicit cast
                                 unsafe {
@@ -2321,7 +2727,10 @@ where
             },
 
             Argument::Namestring(_) => todo!(),
-            Argument::ByteData(_) | Argument::DWordData(_) | Argument::TrackedPc(_) | Argument::PkgLength(_) => {
+            Argument::ByteData(_)
+            | Argument::DWordData(_)
+            | Argument::TrackedPc(_)
+            | Argument::PkgLength(_) => {
                 panic!()
             }
         }
@@ -2334,7 +2743,11 @@ where
     /// return either an `Integer` or `Buffer` as appropriate, guided by the size of the field
     /// and expected integer size (as per the DSDT revision).
     fn do_field_read(&self, field: &FieldUnit) -> Result<WrappedObject, AmlError> {
-        let needs_buffer = if self.dsdt_revision >= 2 { field.bit_length > 64 } else { field.bit_length > 32 };
+        let needs_buffer = if self.dsdt_revision >= 2 {
+            field.bit_length > 64
+        } else {
+            field.bit_length > 32
+        };
         let access_width_bits = field.flags.access_type_bytes()? * 8;
 
         // TODO: if the field needs to be locked, acquire/release a global mutex?
@@ -2366,7 +2779,9 @@ where
                 todo!();
             }
         };
-        let Object::OpRegion(ref read_region) = **read_region else { panic!() };
+        let Object::OpRegion(ref read_region) = **read_region else {
+            panic!()
+        };
 
         /*
          * TODO: it might be worth having a fast path here for reads that don't do weird
@@ -2383,17 +2798,32 @@ where
             / access_width_bits;
         let mut read_so_far = 0;
         for i in 0..native_accesses_needed {
-            let aligned_offset = object::align_down(field.bit_index + i * access_width_bits, access_width_bits);
-            let raw = self.do_native_region_read(read_region, aligned_offset / 8, access_width_bits / 8)?;
-            let src_index = if i == 0 { field.bit_index % access_width_bits } else { 0 };
+            let aligned_offset =
+                object::align_down(field.bit_index + i * access_width_bits, access_width_bits);
+            let raw =
+                self.do_native_region_read(read_region, aligned_offset / 8, access_width_bits / 8)?;
+            let src_index = if i == 0 {
+                field.bit_index % access_width_bits
+            } else {
+                0
+            };
             let remaining_length = field.bit_length - read_so_far;
             let length = if i == 0 {
-                usize::min(remaining_length, access_width_bits - (field.bit_index % access_width_bits))
+                usize::min(
+                    remaining_length,
+                    access_width_bits - (field.bit_index % access_width_bits),
+                )
             } else {
                 usize::min(remaining_length, access_width_bits)
             };
 
-            object::copy_bits(&raw.to_le_bytes(), src_index, output_bytes, read_so_far, length);
+            object::copy_bits(
+                &raw.to_le_bytes(),
+                src_index,
+                output_bytes,
+                read_so_far,
+                length,
+            );
             read_so_far += length;
         }
 
@@ -2407,7 +2837,10 @@ where
         let value_bytes = match &*value {
             Object::Integer(value) => &value.to_le_bytes() as &[u8],
             Object::Buffer(bytes) => bytes,
-            _ => Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::Integer, got: value.typ() })?,
+            _ => Err(AmlError::ObjectNotOfExpectedType {
+                expected: ObjectType::Integer,
+                got: value.typ(),
+            })?,
         };
         let access_width_bits = field.flags.access_type_bytes()? * 8;
 
@@ -2424,7 +2857,9 @@ where
                 todo!();
             }
         };
-        let Object::OpRegion(ref write_region) = **write_region else { panic!() };
+        let Object::OpRegion(ref write_region) = **write_region else {
+            panic!()
+        };
 
         // TODO: if the region wants locking, do that
 
@@ -2436,29 +2871,42 @@ where
         let mut written_so_far = 0;
 
         for i in 0..native_accesses_needed {
-            let aligned_offset = object::align_down(field.bit_index + i * access_width_bits, access_width_bits);
-            let dst_index = if i == 0 { field.bit_index % access_width_bits } else { 0 };
+            let aligned_offset =
+                object::align_down(field.bit_index + i * access_width_bits, access_width_bits);
+            let dst_index = if i == 0 {
+                field.bit_index % access_width_bits
+            } else {
+                0
+            };
 
             /*
              * If we're not going to write a whole native access, respect the field's
              * update rule. If we're meant to preserve the surrounding bits, we need to do
              * a read first.
              */
-            let mut bytes = if dst_index > 0 || (field.bit_length - written_so_far) < access_width_bits {
-                match field.flags.update_rule() {
-                    FieldUpdateRule::Preserve => self
-                        .do_native_region_read(write_region, aligned_offset / 8, access_width_bits / 8)?
-                        .to_le_bytes(),
-                    FieldUpdateRule::WriteAsOnes => [0xff; 8],
-                    FieldUpdateRule::WriteAsZeros => [0; 8],
-                }
-            } else {
-                [0; 8]
-            };
+            let mut bytes =
+                if dst_index > 0 || (field.bit_length - written_so_far) < access_width_bits {
+                    match field.flags.update_rule() {
+                        FieldUpdateRule::Preserve => self
+                            .do_native_region_read(
+                                write_region,
+                                aligned_offset / 8,
+                                access_width_bits / 8,
+                            )?
+                            .to_le_bytes(),
+                        FieldUpdateRule::WriteAsOnes => [0xff; 8],
+                        FieldUpdateRule::WriteAsZeros => [0; 8],
+                    }
+                } else {
+                    [0; 8]
+                };
 
             let remaining_length = field.bit_length - written_so_far;
             let length = if i == 0 {
-                usize::min(remaining_length, access_width_bits - (field.bit_index % access_width_bits))
+                usize::min(
+                    remaining_length,
+                    access_width_bits - (field.bit_index % access_width_bits),
+                )
             } else {
                 usize::min(remaining_length, access_width_bits)
             };
@@ -2479,7 +2927,12 @@ where
     /// Performs an actual read from an operation region. `offset` and `length` must respect the
     /// access requirements of the field being read, and are supplied in **bytes**. This may call
     /// AML methods if required, and may invoke user-supplied handlers.
-    fn do_native_region_read(&self, region: &OpRegion, offset: usize, length: usize) -> Result<u64, AmlError> {
+    fn do_native_region_read(
+        &self,
+        region: &OpRegion,
+        offset: usize,
+        length: usize,
+    ) -> Result<u64, AmlError> {
         match region.space {
             RegionSpace::SystemMemory => Ok({
                 let address = region.base as usize + offset;
@@ -2563,9 +3016,15 @@ where
             RegionSpace::PciConfig => {
                 let address = self.pci_address_for_device(&region.parent_device_path)?;
                 match length {
-                    1 => self.handler.write_pci_u8(address, offset as u16, value as u8),
-                    2 => self.handler.write_pci_u16(address, offset as u16, value as u16),
-                    4 => self.handler.write_pci_u32(address, offset as u16, value as u32),
+                    1 => self
+                        .handler
+                        .write_pci_u8(address, offset as u16, value as u8),
+                    2 => self
+                        .handler
+                        .write_pci_u16(address, offset as u16, value as u16),
+                    4 => self
+                        .handler
+                        .write_pci_u32(address, offset as u16, value as u32),
                     _ => panic!(),
                 }
                 Ok(())
@@ -2594,23 +3053,33 @@ where
          * TODO: it's not ideal to do these reads for every native access. See if we can
          * cache them somewhere?
          */
-        let seg = match self.evaluate_if_present(AmlName::from_str("_SEG").unwrap().resolve(path)?, vec![])? {
+        let seg = match self
+            .evaluate_if_present(AmlName::from_str("_SEG").unwrap().resolve(path)?, vec![])?
+        {
             Some(value) => value.as_integer()?,
             None => 0,
         };
-        let bus = match self.evaluate_if_present(AmlName::from_str("_BBR").unwrap().resolve(path)?, vec![])? {
+        let bus = match self
+            .evaluate_if_present(AmlName::from_str("_BBR").unwrap().resolve(path)?, vec![])?
+        {
             Some(value) => value.as_integer()?,
             None => 0,
         };
         let (device, function) = {
-            let adr = self.evaluate_if_present(AmlName::from_str("_ADR").unwrap().resolve(path)?, vec![])?;
+            let adr = self
+                .evaluate_if_present(AmlName::from_str("_ADR").unwrap().resolve(path)?, vec![])?;
             let adr = match adr {
                 Some(adr) => adr.as_integer()?,
                 None => 0,
             };
             (adr.get_bits(16..32), adr.get_bits(0..16))
         };
-        Ok(PciAddress::new(seg as u16, bus as u8, device as u8, function as u8))
+        Ok(PciAddress::new(
+            seg as u16,
+            bus as u8,
+            device as u8,
+            function as u8,
+        ))
     }
 }
 
@@ -2715,7 +3184,12 @@ impl OpInFlight {
     /// Creates a new `OpInFlight`. The number of expected arguments is inferred from the number of
     /// `ResolveBehaviour`s passed.
     pub fn new(op: Opcode, resolve_behaviour: &'static [ResolveBehaviour]) -> OpInFlight {
-        OpInFlight { op, expected_arguments: resolve_behaviour.len(), arguments: Vec::new(), resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments: resolve_behaviour.len(),
+            arguments: Vec::new(),
+            resolve_behaviour,
+        }
     }
 
     /// Creates a new `OpInFlight` with the given number of expected arguments. This should be used
@@ -2726,7 +3200,12 @@ impl OpInFlight {
         expected_arguments: usize,
         resolve_behaviour: &'static [ResolveBehaviour],
     ) -> OpInFlight {
-        OpInFlight { op, expected_arguments, arguments: Vec::new(), resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments,
+            arguments: Vec::new(),
+            resolve_behaviour,
+        }
     }
 
     /// Creates a new `OpInFlight` with a number of arguments that have already been interpreted,
@@ -2737,7 +3216,12 @@ impl OpInFlight {
         more: usize,
         resolve_behaviour: &'static [ResolveBehaviour],
     ) -> OpInFlight {
-        OpInFlight { op, expected_arguments: arguments.len() + more, arguments, resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments: arguments.len() + more,
+            arguments,
+            resolve_behaviour,
+        }
     }
 
     /// Creates a new `OpInFlight` with a number of arguments that have already been interpreted,
@@ -2749,24 +3233,38 @@ impl OpInFlight {
         arguments: Vec<Argument>,
         resolve_behaviour: &'static [ResolveBehaviour],
     ) -> OpInFlight {
-        OpInFlight { op, expected_arguments: resolve_behaviour.len(), arguments, resolve_behaviour }
+        OpInFlight {
+            op,
+            expected_arguments: resolve_behaviour.len(),
+            arguments,
+            resolve_behaviour,
+        }
     }
 
     /// Get the desired `ResolveBehaviour` for the argument currently being interpreted
     fn resolve_behaviour(&self) -> ResolveBehaviour {
         if let Some(behaviour) = self.resolve_behaviour.get(self.arguments.len()) {
             *behaviour
-        } else if self.op == Opcode::Package || (self.op == Opcode::VarPackage && self.arguments.len() > 0) {
+        } else if self.op == Opcode::Package
+            || (self.op == Opcode::VarPackage && self.arguments.len() > 0)
+        {
             ResolveBehaviour::AsPackageElements
         } else {
-            panic!("Tried to get resolving behaviour for unexpected argument for operation of type {:?}", self.op);
+            panic!(
+                "Tried to get resolving behaviour for unexpected argument for operation of type {:?}",
+                self.op
+            );
         }
     }
 }
 
 impl MethodContext {
     unsafe fn new_from_table(stream: &[u8]) -> MethodContext {
-        let block = Block { stream: stream as *const [u8], pc: 0, kind: BlockKind::Table };
+        let block = Block {
+            stream: stream as *const [u8],
+            pc: 0,
+            kind: BlockKind::Table,
+        };
         MethodContext {
             current_block: block,
             block_stack: Vec::new(),
@@ -2790,10 +3288,16 @@ impl MethodContext {
             let block = Block {
                 stream: code as &[u8] as *const [u8],
                 pc: 0,
-                kind: BlockKind::Method { method_scope: scope.clone() },
+                kind: BlockKind::Method {
+                    method_scope: scope.clone(),
+                },
             };
             let args = core::array::from_fn(|i| {
-                if let Some(arg) = args.get(i) { arg.clone() } else { Object::Uninitialized.wrap() }
+                if let Some(arg) = args.get(i) {
+                    arg.clone()
+                } else {
+                    Object::Uninitialized.wrap()
+                }
             });
             let context = MethodContext {
                 current_block: block,
@@ -2806,7 +3310,10 @@ impl MethodContext {
             };
             Ok(context)
         } else {
-            Err(AmlError::ObjectNotOfExpectedType { expected: ObjectType::Method, got: method.typ() })
+            Err(AmlError::ObjectNotOfExpectedType {
+                expected: ObjectType::Method,
+                got: method.typ(),
+            })
         }
     }
 
@@ -2836,12 +3343,14 @@ impl MethodContext {
 
     fn start_new_block(&mut self, kind: BlockKind, length: usize) {
         let block = Block {
-            stream: &self.current_block.stream()[..(self.current_block.pc + length)] as *const [u8],
+            stream: &self.current_block.stream()[..(self.current_block.pc + length)]
+                as *const [u8],
             pc: self.current_block.pc,
             kind,
         };
         self.current_block.pc += length;
-        self.block_stack.push(mem::replace(&mut self.current_block, block));
+        self.block_stack
+            .push(mem::replace(&mut self.current_block, block));
     }
 
     fn opcode(&mut self) -> Result<Opcode, AmlError> {
@@ -2871,7 +3380,7 @@ impl MethodContext {
             0x15 => Opcode::External,
             0x2e => Opcode::DualNamePrefix,
             0x2f => Opcode::MultiNamePrefix,
-            0x30..=0x39 => Opcode::Digit(opcode as u8),    // b'0'..=b'9'
+            0x30..=0x39 => Opcode::Digit(opcode as u8), // b'0'..=b'9'
             0x41..=0x5a => Opcode::NameChar(opcode as u8), // b'A'..=b'Z'
             0x5b01 => Opcode::Mutex,
             0x5b02 => Opcode::Event,
@@ -3055,7 +3564,9 @@ impl MethodContext {
                     self.current_block.pc -= 1;
                 }
                 let name_seg = [first_char, self.next()?, self.next()?, self.next()?];
-                components.push(namespace::NameComponent::Segment(namespace::NameSeg::from_bytes(name_seg)?));
+                components.push(namespace::NameComponent::Segment(
+                    namespace::NameSeg::from_bytes(name_seg)?,
+                ));
             }
         }
 
@@ -3078,7 +3589,12 @@ impl MethodContext {
     }
 
     fn next_u32(&mut self) -> Result<u32, AmlError> {
-        Ok(u32::from_le_bytes([self.next()?, self.next()?, self.next()?, self.next()?]))
+        Ok(u32::from_le_bytes([
+            self.next()?,
+            self.next()?,
+            self.next()?,
+            self.next()?,
+        ]))
     }
 
     fn next_u64(&mut self) -> Result<u64, AmlError> {

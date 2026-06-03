@@ -27,12 +27,16 @@ unsafe impl AcpiTable for Slit {
 
 impl Slit {
     pub fn matrix(self: Pin<&Self>) -> DistanceMatrix<'_> {
-        DistanceMatrix { num_proximity_domains: self.num_proximity_domains, matrix: self.matrix_raw() }
+        DistanceMatrix {
+            num_proximity_domains: self.num_proximity_domains,
+            matrix: self.matrix_raw(),
+        }
     }
 
     pub fn matrix_raw(self: Pin<&Self>) -> &[u8] {
         let mut num_entries = self.num_proximity_domains * self.num_proximity_domains;
-        if (mem::size_of::<Slit>() + num_entries as usize * num_entries as usize * mem::size_of::<u8>())
+        if (mem::size_of::<Slit>()
+            + num_entries as usize * num_entries as usize * mem::size_of::<u8>())
             > self.header.length as usize
         {
             warn!("SLIT too short for given number of proximity domains! Returning empty matrix");
