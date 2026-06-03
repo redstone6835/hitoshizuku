@@ -1,14 +1,23 @@
-.PHONY: all clean cargo-setup kernel-la kernel-rv
+.PHONY: all clean cargo-setup busybox-la lua-la initramfs-la kernel-la kernel-rv
 
-all: cargo-setup kernel-la
+all: cargo-setup busybox-la lua-la initramfs-la kernel-la
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
 		cp -r cargo-config .cargo; \
-		echo "cargo-config -> .cargo"; \
+		echo "cargo-config → .cargo"; \
 	fi
 
-kernel-la: cargo-setup
+busybox-la:
+	sh scripts/build-busybox.sh la
+
+lua-la:
+	sh scripts/build-lua.sh la
+
+initramfs-la: busybox-la lua-la
+	sh scripts/build-initramfs.sh la
+
+kernel-la: initramfs-la
 	cargo build -p kernel --target loongarch64-unknown-none --features embedded-initramfs --release
 	cp target/loongarch64-unknown-none/release/kernel kernel-la
 
