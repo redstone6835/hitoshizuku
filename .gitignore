@@ -1,6 +1,8 @@
 # 构建输出
 target/
 Cargo.lock
+kernel-la
+kernel-rv
 
 # IDE
 .idea
