@@ -23,3 +23,6 @@ pub use types::{
     SharedHandle, SocketError, SocketHandle, SocketLinger, SocketShutdown, SocketTimeval,
     SocketType, UnixAddress,
 };
+
+#[cfg(test)]
+mod tests;
