@@ -65,7 +65,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.pc = entry_pc;
         tf.sp = kernel_sp;
         tf.status = PRMD_KERNEL_IE;
-        tf.euen = 0;
+        tf.euen = EUEN_FPE | EUEN_SXE;
     }
 
     fn init_user_trap_frame(
@@ -80,7 +80,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = user_sp;
         tf.a0 = arg0;
         tf.status = PRMD_USER_IE;
-        tf.euen = 0;
+        tf.euen = EUEN_FPE | EUEN_SXE;
     }
 
     fn set_user_trap_frame_args(
