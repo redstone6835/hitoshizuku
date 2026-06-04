@@ -287,7 +287,8 @@ impl BlockDevice {
 
     /// 同步提交并阻塞等待（类似 Linux `submit_bio_wait`）。
     ///
-    /// 调度器就绪时通过 WaitQueue 让出 CPU；否则自旋。
+    /// 当前实现通过主动 drain 推进硬件完成，不依赖中断。
+    /// 调度器就绪时在 drain 间让出 CPU（yield）；否则纯 spin。
     pub fn submit_bio_wait(
         self: &Arc<Self>,
         op: BioOp,
@@ -300,9 +301,11 @@ impl BlockDevice {
             .queue_bio(bio)
             .map_err(|(e, _)| BioError::Submit(e))?;
 
-        if !sched::is_ready() {
-            while !completion.is_done() {
-                self.driver.drain();
+        while !completion.is_done() {
+            self.driver.drain();
+            if sched::is_ready() {
+                sched::schedule_once(0);
+            } else {
                 core::hint::spin_loop();
             }
         }
