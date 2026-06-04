@@ -300,6 +300,7 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
