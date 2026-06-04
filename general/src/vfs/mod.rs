@@ -7,7 +7,10 @@ pub mod tmpfs;
 use alloc::string::String;
 
 pub use ::vfs::*;
-pub use blockfs::register_block_filesystems;
+pub use blockfs::{
+    BlockFsDriver, BlockFsProbe, mount_block_device_auto, mount_block_source_auto,
+    register_block_filesystems, register_block_fs_driver,
+};
 pub use devtmpfs::DevTmpfsDriver;
 pub use procfs::ProcFsDriver;
 pub use sysfs::SysFsDriver;

@@ -1,4 +1,7 @@
-//! Sysfs: `/sys` virtual filesystem.
+//! sysfs：`/sys` 虚拟文件系统。
+//!
+//! 当前实现以挂载时快照呈现内核对象，设备视图通过 function 注册表的兼容层
+//! helper 收集字符/块设备，不向 sysfs 泄露具体 function 类型。
 
 #![allow(dead_code, unused_variables)]
 
@@ -25,6 +28,7 @@ use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
 use crate::dev::enumerate::DEVICES;
+use crate::dev::function::{active_block_devices, active_char_devices};
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
 const ROOT_INO: u64 = 1;
@@ -150,17 +154,13 @@ struct SysSnapshot {
 impl SysSnapshot {
     fn collect() -> Self {
         let mut snap = SysSnapshot::default();
-        if let Ok(list) = DEVICES.block_devs.list() {
-            for dev in list {
-                let sysfs_name = dev.name().to_string();
-                snap.blocks.push(BlockDevSnapshot { sysfs_name, dev });
-            }
+        for dev in active_block_devices(&DEVICES.functions) {
+            let sysfs_name = dev.name().to_string();
+            snap.blocks.push(BlockDevSnapshot { sysfs_name, dev });
         }
-        if let Ok(list) = DEVICES.char_devs.list() {
-            for dev in list {
-                let sysfs_name = dev.fw_name().to_string();
-                snap.chars.push(CharDevSnapshot { sysfs_name, dev });
-            }
+        for dev in active_char_devices(&DEVICES.functions) {
+            let sysfs_name = dev.fw_name().to_string();
+            snap.chars.push(CharDevSnapshot { sysfs_name, dev });
         }
         snap
     }
@@ -417,9 +417,8 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
             // TODO: 实现完整 diskstats 统计（reads/writes/sectors/iotime 等 11 字段），
-            //       当前只填充 in_flight，其余为 0
-            let r = dev.in_flight();
-            format!("{} 0 {} 0 0 0 0 0 0 0 0 0 0\n", r, r)
+            //       当前新架构不再追踪 in_flight 计数，全填 0
+            format!("0 0 0 0 0 0 0 0 0 0 0 0 0\n")
         }
         // TODO: inflight 字段也需要真实统计（目前硬编码 0）
         BlockDevSlot::Inflight => format!(" 0       0\n"),

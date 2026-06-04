@@ -11,12 +11,16 @@
 //! `device number -> driver` 查找职责；这些若仍有需要，只能存在于
 //! ABI/VFS 兼容边界，而不能回流到 `dev` 层。
 
+pub mod bio;
 pub mod block;
 pub mod block_sync;
 pub mod char;
+pub mod completion;
 pub mod drivers;
 pub mod enumerate;
+pub mod function;
 pub mod pci;
+pub mod platform;
 pub mod pnp;
 pub mod usb;
 

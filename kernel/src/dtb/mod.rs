@@ -11,13 +11,17 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use allocator::KERNEL_ALLOCATOR;
-use general::dev::block::{BlockDevice, BlockDeviceKind};
-use general::dev::block_sync::SyncBlockBackend;
-use general::dev::char::{CharDevice, CharDeviceKind};
-use general::dev::drivers::{Uart16550, VirtioBlk, VirtioPciBlkDriver};
+use general::dev::block::BlockDevice;
+use general::dev::char::CharDevice;
+use general::dev::drivers;
 use general::dev::enumerate::DEVICES;
+use general::dev::function::{find_char_device_by_fw_name, lookup_block_device_by_node};
 use general::dev::pci::pci_scan_and_register;
-use general::dev::pnp::{PNP_DRIVERS, PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
+use general::dev::platform::{
+    DeviceMatchId, DeviceProperties, DeviceResource, PlatformDeviceInfo,
+    register_and_probe_platform_device,
+};
+use general::dev::pnp::{DevInitContext, set_dev_init_context};
 use general::firmware::dtb as firmware_dtb;
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
@@ -29,7 +33,7 @@ use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
-use general::vfs::superblock::{FsDriver, Superblock};
+use general::vfs::superblock::Superblock;
 use general::{StartContext, StartFirmware};
 use log::{LogRecord, LogSink, printk};
 
@@ -176,106 +180,7 @@ pub fn kernel_start_init(context: &StartContext) {
         }
     });
 
-    // 步骤 4 开始注册 DTB 固件解析器已经标准化好的设备描述。kernel 只负责把
-    // 物理 MMIO 地址转换为当前平台的可访问虚拟地址，并实例化对应驱动；设备位于
-    // 哪一层 bus、经过哪几层 ranges 翻译，都已经由固件解析层处理完毕。
-
-    let mut uart_index = 0usize;
-    let mut block_index = 0usize;
-    let mut char_dev_bindings: Vec<(&'static str, CharDevice)> = Vec::new();
-
-    // 小步骤 4.1 先注册所有标准化后的 ns16550 串口。
-    for port in &serial_ports {
-        let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
-        let uart: &'static Uart16550 = if let Some(clock_hz) = port.clock_hz {
-            Box::leak(Box::new(Uart16550::new(virt_base, clock_hz, 115_200)))
-        } else {
-            Box::leak(Box::new(Uart16550::new_preconfigured(virt_base)))
-        };
-
-        let idx = uart_index;
-        uart_index += 1;
-        let user_name: &'static str =
-            alloc::format!("{}{}", CharDeviceKind::Ns16550.name(), idx).leak();
-
-        let dev = CharDevice::new(CharDeviceKind::Ns16550, port.name, uart);
-        if let Err(err) = DEVICES.char_devs.push(dev.clone()) {
-            printk!(
-                "[kernel-start][dtb] failed to register {} ({}{}) at {:#x}: {:?}",
-                port.name,
-                CharDeviceKind::Ns16550.name(),
-                idx,
-                port.phys_addr,
-                err
-            );
-        } else {
-            char_dev_bindings.push((user_name, dev));
-            printk!(
-                "[kernel-start][dtb] registered {} -> /dev/{} at phys={:#x}",
-                port.name,
-                user_name,
-                port.phys_addr
-            );
-        }
-    }
-
-    // 小步骤 4.2 再注册所有标准化后的 virtio-mmio 块设备。
-    for device in &virtio_mmio_devices {
-        let virt_base = (context.address.device_mmio_to_virt)(device.phys_addr);
-        match VirtioBlk::new(virt_base, context.address.virt_to_phys) {
-            Ok(driver) => {
-                let user_name =
-                    alloc::format!("{}{}", BlockDeviceKind::VirtioBlk.name(), block_index);
-                match driver.into_block_dev(&user_name, context.address.virt_to_phys) {
-                    Ok(block_dev) => match DEVICES.block_devs.push(&block_dev) {
-                        Ok(dev) => {
-                            printk!(
-                                "[kernel-start][dtb] registered virtio-blk {} -> /dev/{} at phys={:#x} size={:#x}",
-                                device.name,
-                                dev.name(),
-                                device.phys_addr,
-                                device.size
-                            );
-                            block_index += 1;
-                        }
-                        Err(err) => {
-                            printk!(
-                                "[kernel-start][dtb] failed to register virtio-blk {} at {:#x}: {:?}",
-                                device.name,
-                                device.phys_addr,
-                                err
-                            );
-                        }
-                    },
-                    Err(err) => {
-                        printk!(
-                            "[kernel-start][dtb] failed to create block dev for {} at {:#x}: {}",
-                            device.name,
-                            device.phys_addr,
-                            err
-                        );
-                    }
-                }
-            }
-            Err(err) => {
-                printk!(
-                    "[kernel-start][dtb] skipped virtio-mmio {} at {:#x} size={:#x}: {}",
-                    device.name,
-                    device.phys_addr,
-                    device.size,
-                    err
-                );
-            }
-        }
-    }
-
-    printk!(
-        "[kernel-start][dtb] device discovery complete: {} uart(s), {} block device(s)",
-        uart_index,
-        block_index
-    );
-
-    // 步骤 5 进入文件系统准备阶段。启动代码会先准备好 tmpfs、devtmpfs、procfs
+    // 步骤 4 进入文件系统准备阶段。启动代码会先准备好 tmpfs、devtmpfs、procfs
     // 和 sysfs 所需的驱动与 superblock，然后根据是否存在 initramfs 或块设备根盘
     // 来决定最终 `/` 的来源。devtmpfs 会被提前建立，以便总线扫描和设备注册期间
     // 就能为后续 `/dev` 挂载准备好节点。
@@ -303,44 +208,70 @@ pub fn kernel_start_init(context: &StartContext) {
     let dev_ops = dev_sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .expect("[kernel-start][dtb] failed to downcast devtmpfs ops");
-    bind_standard_devtmpfs_nodes(dev_ops);
 
     // 小步骤 5.2 接着把 devtmpfs 与 PnP 层连接起来。这样 PCI 扫描过程中一旦发现
     // 可驱动设备，对应的字符设备或块设备节点就能直接写入 devtmpfs；等最终根文件
     // 系统选定之后，再把这份已经填充好的 devtmpfs 挂到 `/dev` 即可。
-    fn pnp_bind_block_cb(name: &str, dev: Arc<BlockDevice>) -> Result<(), PnpError> {
-        let sb = devtmpfs_sb();
-        let ops = sb
-            .downcast_ops::<general::vfs::devtmpfs::DevTmpfsSuperblockOps>()
-            .ok_or(PnpError::NoDevtmpfs)?;
-        ops.bind_block(name, dev)
-            .map_err(|_| PnpError::DevtmpfsError)
-    }
-    fn pnp_bind_char_cb(name: &str, dev: CharDevice) -> Result<(), PnpError> {
-        let sb = devtmpfs_sb();
-        let ops = sb
-            .downcast_ops::<general::vfs::devtmpfs::DevTmpfsSuperblockOps>()
-            .ok_or(PnpError::NoDevtmpfs)?;
-        ops.bind_char(name, dev)
-            .map_err(|_| PnpError::DevtmpfsError)
-    }
-    fn pnp_unbind_cb(name: &str) -> Result<(), PnpError> {
-        let sb = devtmpfs_sb();
-        let ops = sb
-            .downcast_ops::<general::vfs::devtmpfs::DevTmpfsSuperblockOps>()
-            .ok_or(PnpError::NoDevtmpfs)?;
-        ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
-    }
-
-    let sb_leaked: &'static Arc<general::vfs::superblock::Superblock> =
-        Box::leak(Box::new(Arc::clone(&dev_sb)));
-    set_pnp_devtmpfs_sb(sb_leaked);
-    set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
-        bind_block: pnp_bind_block_cb,
-        bind_char: pnp_bind_char_cb,
-        unbind: pnp_unbind_cb,
-    });
+    general::vfs::devtmpfs::install_pnp_bridge(Arc::clone(&dev_sb))
+        .expect("[kernel-start][dtb] failed to install PnP devtmpfs bridge");
     printk!("[kernel-start][dtb] PnP devtmpfs callbacks installed");
+
+    set_dev_init_context(DevInitContext::new(
+        context.address.device_mmio_to_virt,
+        context.address.virt_to_phys,
+    ));
+    drivers::register_builtin_drivers()
+        .expect("[kernel-start][dtb] failed to register built-in PnP drivers");
+    printk!("[kernel-start][dtb] registered built-in PnP drivers");
+
+    let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
+    let mut platform_bound = 0usize;
+    for port in &serial_ports {
+        let mut ids = Vec::new();
+        ids.push(DeviceMatchId::DtbCompatible("ns16550a".into()));
+        ids.push(DeviceMatchId::DtbCompatible("ns16550".into()));
+        let mut resources = Vec::new();
+        resources.push(DeviceResource::Mmio {
+            phys: port.phys_addr,
+            size: 0x100,
+        });
+        let info = PlatformDeviceInfo {
+            fw_name: port.name.into(),
+            ids,
+            resources,
+            properties: DeviceProperties {
+                clock_hz: port.clock_hz,
+                baud: Some(115_200),
+                stdout: stdout_phys == Some(port.phys_addr),
+            },
+        };
+        if register_platform_device(info, "dtb") {
+            platform_bound += 1;
+        }
+    }
+    for device in &virtio_mmio_devices {
+        let mut ids = Vec::new();
+        ids.push(DeviceMatchId::DtbCompatible("virtio,mmio".into()));
+        let mut resources = Vec::new();
+        resources.push(DeviceResource::Mmio {
+            phys: device.phys_addr,
+            size: device.size,
+        });
+        let info = PlatformDeviceInfo {
+            fw_name: device.name.into(),
+            ids,
+            resources,
+            properties: DeviceProperties::default(),
+        };
+        if register_platform_device(info, "dtb") {
+            platform_bound += 1;
+        }
+    }
+    printk!(
+        "[kernel-start][dtb] platform PnP discovery complete: {} candidate(s), {} bound",
+        serial_ports.len() + virtio_mmio_devices.len(),
+        platform_bound
+    );
 
     // 小步骤 5.3 然后尝试使用标准化后的 PCIe host bridge 描述完成 ECAM 安装、
     // virtio-pci 驱动注册、BAR 分配以及总线扫描。
@@ -368,12 +299,6 @@ pub fn kernel_start_init(context: &StartContext) {
             context.address.device_mmio_to_virt,
         );
 
-        let drv = Box::leak(Box::new(VirtioPciBlkDriver::new(
-            context.address.virt_to_phys,
-        )));
-        PNP_DRIVERS.register(drv);
-        printk!("[kernel-start][dtb] registered PnpDriver 'virtio-pci-blk'");
-
         pci::assign_bars(host.bus_start, host.bus_end);
 
         let count = pci_scan_and_register(0, host.bus_start, host.bus_end, "pci-");
@@ -399,9 +324,7 @@ pub fn kernel_start_init(context: &StartContext) {
             },
         )
     } else {
-        let dev = DEVICES
-            .block_devs
-            .lookup("vd0")
+        let dev = lookup_block_devnode("vd0")
             .unwrap_or_else(|| panic!("[kernel-start][dtb] no initramfs and /dev/vd0 not found"));
         mount_block_root(Arc::clone(&dev)).unwrap_or_else(|err| {
             panic!(
@@ -451,8 +374,6 @@ pub fn kernel_start_init(context: &StartContext) {
     mount_ns
         .mount(dev_dentry, Arc::clone(&dev_sb), MountFlags::default())
         .expect("[kernel-start][dtb] failed to mount devtmpfs on /dev");
-
-    bind_boot_devices_to_devtmpfs(dev_ops, &char_dev_bindings);
 
     ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
         .expect("[kernel-start][dtb] failed to ensure /sys directory");
@@ -508,11 +429,7 @@ pub fn kernel_start_init(context: &StartContext) {
             );
             Some(dev)
         } else if let Some(port) = stdout_serial.as_ref() {
-            let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
-            let found = DEVICES.char_devs.iter().find(|dev| {
-                dev.downcast_driver::<Uart16550>()
-                    .is_some_and(|uart| uart.base() == virt_base)
-            });
+            let found = lookup_char_fw_name(port.name);
             if let Some(dev) = found.as_ref() {
                 printk!(
                     "[kernel-start][dtb] console from stdout-path: {}",
@@ -597,7 +514,15 @@ fn resolve_cmdline_console(
                     .and_then(|dev_name| dev_ops.char_dev(dev_name))
             });
     }
-    DEVICES.char_devs.lookup(name)
+    lookup_char_fw_name(name)
+}
+
+fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
+    find_char_device_by_fw_name(&DEVICES.functions, name)
+}
+
+fn lookup_block_devnode(name: &str) -> Option<Arc<BlockDevice>> {
+    lookup_block_device_by_node(&DEVICES.functions, name)
 }
 
 fn mount_tmpfs_superblock() -> Arc<Superblock> {
@@ -611,19 +536,30 @@ fn mount_tmpfs_superblock() -> Arc<Superblock> {
 fn mount_block_root(
     dev: Arc<BlockDevice>,
 ) -> Result<(Arc<Superblock>, &'static str), &'static str> {
-    let ext_driver = Box::leak(Box::new(extfs::ExtFsDriver::new()));
-    ext_driver.bind_backend(Arc::new(SyncBlockBackend::new(Arc::clone(&dev))));
-    if let Ok(sb) = ext_driver.mount(None, "") {
-        return Ok((sb, "/dev/vd0 (extfs)"));
-    }
+    general::vfs::mount_block_device_auto(dev, "")
+        .map_err(|_| "unsupported or invalid root filesystem")
+}
 
-    let fat_driver = Box::leak(Box::new(fatfs::FatFsDriver::new()));
-    fat_driver.bind_backend(Arc::new(SyncBlockBackend::new(dev)));
-    if let Ok(sb) = fat_driver.mount(None, "") {
-        return Ok((sb, "/dev/vd0 (fatfs)"));
+fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
+    match register_and_probe_platform_device(info) {
+        Ok(reg) if reg.bound => true,
+        Ok(reg) => {
+            printk!(
+                "[kernel-start][{}] no platform driver for {}",
+                tag,
+                reg.device.id
+            );
+            false
+        }
+        Err(err) => {
+            printk!(
+                "[kernel-start][{}] failed to register/probe platform device: {:?}",
+                tag,
+                err
+            );
+            false
+        }
     }
-
-    Err("unsupported or invalid root filesystem")
 }
 
 pub(crate) fn ensure_dir(
@@ -636,74 +572,4 @@ pub(crate) fn ensure_dir(
         Err(VfsError::NotFound) => general::vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode),
         Err(err) => Err(err),
     }
-}
-
-fn bind_boot_devices_to_devtmpfs(
-    dev_ops: &DevTmpfsSuperblockOps,
-    char_dev_bindings: &[(&'static str, CharDevice)],
-) {
-    for (user_name, dev) in char_dev_bindings {
-        match dev_ops.bind_char(user_name, dev.clone()) {
-            Ok(()) | Err(VfsError::AlreadyExists) => {}
-            Err(err) => {
-                printk!(
-                    "[kernel-start][dtb] failed to bind char dev '{}' (fw: {}) to /dev: {:?}",
-                    user_name,
-                    dev.fw_name(),
-                    err
-                );
-            }
-        }
-    }
-
-    match DEVICES.block_devs.list() {
-        Ok(block_devs) => {
-            for dev in block_devs {
-                match dev_ops.bind_block(dev.name(), Arc::clone(&dev)) {
-                    Ok(()) | Err(VfsError::AlreadyExists) => {}
-                    Err(err) => {
-                        printk!(
-                            "[kernel-start][dtb] failed to bind block dev '{}' to /dev: {:?}",
-                            dev.name(),
-                            err
-                        );
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            printk!(
-                "[kernel-start][dtb] failed to enumerate block devices for devtmpfs: {:?}",
-                err
-            );
-        }
-    }
-}
-
-fn bind_standard_devtmpfs_nodes(dev_ops: &DevTmpfsSuperblockOps) {
-    for (name, dev) in [("null", CharDevice::null()), ("zero", CharDevice::zero())] {
-        match dev_ops.bind_char(name, dev) {
-            Ok(()) | Err(VfsError::AlreadyExists) => {}
-            Err(err) => {
-                printk!(
-                    "[kernel-start][dtb] failed to bind standard /dev/{}: {:?}",
-                    name,
-                    err
-                );
-            }
-        }
-    }
-}
-
-// devtmpfs superblock 全局桥梁,PnP 回调由 static fn 实现,需要从这里拿 sb。
-static PNP_DEVTMPFS_SB: vfs::sync::Spinlock<
-    Option<&'static Arc<general::vfs::superblock::Superblock>>,
-> = vfs::sync::Spinlock::new(None);
-
-fn set_pnp_devtmpfs_sb(sb: &'static Arc<general::vfs::superblock::Superblock>) {
-    *PNP_DEVTMPFS_SB.lock() = Some(sb);
-}
-
-fn devtmpfs_sb() -> &'static Arc<general::vfs::superblock::Superblock> {
-    PNP_DEVTMPFS_SB.lock().expect("devtmpfs sb not installed")
 }
