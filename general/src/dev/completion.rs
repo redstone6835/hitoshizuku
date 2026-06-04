@@ -1,0 +1,100 @@
+//! 通用完成变量。
+//!
+//! `Completion<T>` 是块设备同步/异步接口的核心枢纽：
+//! - 同步路径调 `.wait()` 阻塞当前任务（调度器就绪时用 WaitQueue，否则 spin）。
+//! - 异步路径注册 `Waker`，由 `.complete()` 触发唤醒。
+//! - 驱动完成请求时先 drop 自己的锁，再调 `bio.complete()`，彻底避免重入死锁。
+
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll, Waker};
+
+use sched::WaitQueue;
+use vfs::sync::Spinlock;
+
+/// 通用完成变量。
+///
+/// 生产者调用 `complete(value)` 存入结果并唤醒所有等待者；
+/// 消费者通过 `wait()`（同步）或 `poll()`（Future）获取结果。
+pub struct Completion<T> {
+    done: AtomicBool,
+    result: Spinlock<Option<T>>,
+    waker: Spinlock<Option<Waker>>,
+    wait_queue: WaitQueue,
+}
+
+impl<T> Completion<T> {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            done: AtomicBool::new(false),
+            result: Spinlock::new(None),
+            waker: Spinlock::new(None),
+            wait_queue: WaitQueue::new(),
+        })
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    /// 标记完成，存储结果，唤醒所有等待者。
+    pub fn complete(&self, value: T) {
+        *self.result.lock() = Some(value);
+        self.done.store(true, Ordering::Release);
+        if let Some(w) = self.waker.lock().take() {
+            w.wake();
+        }
+        self.wait_queue.wake_all();
+    }
+
+    /// 同步阻塞等待结果。调度器就绪时用 WaitQueue 让出 CPU；否则 spin。
+    pub fn wait(&self) -> T {
+        if sched::is_ready() {
+            self.wait_blocking()
+        } else {
+            self.wait_spinning()
+        }
+    }
+
+    /// 供 Future::poll 使用。
+    pub fn poll(&self, cx: &mut Context<'_>) -> Poll<T> {
+        if self.done.load(Ordering::Acquire) {
+            return Poll::Ready(self.result.lock().take().unwrap());
+        }
+        *self.waker.lock() = Some(cx.waker().clone());
+        // 二次检查：避免注册和完成之间的竞争
+        if self.done.load(Ordering::Acquire) {
+            Poll::Ready(self.result.lock().take().unwrap())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn wait_blocking(&self) -> T {
+        let task = sched::current_task();
+        loop {
+            if self.done.load(Ordering::Acquire) {
+                return self.result.lock().take().unwrap();
+            }
+            let _ = task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping);
+            let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
+            self.wait_queue.enqueue(&task);
+            if self.done.load(Ordering::Acquire) {
+                self.wait_queue.remove(&task);
+                let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+                return self.result.lock().take().unwrap();
+            }
+            sched::schedule_once(0);
+            self.wait_queue.remove(&task);
+        }
+    }
+
+    fn wait_spinning(&self) -> T {
+        loop {
+            if self.done.load(Ordering::Acquire) {
+                return self.result.lock().take().unwrap();
+            }
+            core::hint::spin_loop();
+        }
+    }
+}

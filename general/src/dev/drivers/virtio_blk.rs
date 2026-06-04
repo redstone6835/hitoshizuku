@@ -1,12 +1,16 @@
-//! VirtIO Block Device (MMIO) 驱动
+//! VirtIO MMIO 块设备驱动。
 //!
-//! 实现 VirtIO 1.0 规范的块设备驱动，支持：
+//! 实现 VirtIO 1.0 规范中的 MMIO 传输层块设备，支持：
 //! - MMIO 传输层
 //! - 异步 I/O 完成回调
-//! - Read / Write / Flush 操作
+//! - 读、写、flush 操作
 //! - 多队列支持（当前实现单队列）
+//!
+//! PnP 适配层只负责匹配固件枚举的 `virtio,mmio` / `LNRO0005` 设备，并把成功
+//! 初始化的块设备封装成通用 function 注册给设备 core。
 
 use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
@@ -18,11 +22,20 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
+use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
-    BlockClass, BlockCompletion, BlockDevice, BlockDeviceInit, BlockDeviceKind, BlockFeatures,
-    BlockGeometry, BlockIo, BlockIoCompletion, BlockIoError, BlockIoRequest, BlockLimits,
-    BlockSubmitError,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
+    BlockGeometry, BlockLimits,
 };
+use crate::dev::function::BlockFunction;
+use crate::dev::platform::PlatformDeviceInfo;
+use crate::dev::pnp::{
+    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
+    register_driver_factory,
+};
+
+/// `/dev` 节点命名前缀。VirtIO 块设备显示为 `vd0`、`vd1`……
+const DEV_PREFIX: &str = "vd";
 
 // ───────── VirtIO MMIO 寄存器布局 ─────────
 
@@ -175,8 +188,7 @@ impl Drop for DmaBuffer {
 
 struct PendingVirtioRequest {
     head: u16,
-    completion: BlockCompletion,
-    request: BlockIoRequest,
+    bio: Bio,
     meta_dma: DmaBuffer,
     data_dma: Option<DmaBuffer>,
     desc_count: usize,
@@ -525,54 +537,57 @@ impl VirtioBlk {
 
         while let Some((desc_head, _len)) = queue.poll_used() {
             // 查找对应的待处理请求
-            if let Some(pos) = queue
+            let Some(pos) = queue
                 .pending
                 .iter()
                 .position(|pending| pending.head == desc_head)
-            {
-                let PendingVirtioRequest {
-                    completion,
-                    mut request,
-                    meta_dma,
-                    data_dma,
-                    desc_count,
-                    ..
-                } = queue.pending.remove(pos).unwrap();
-                core::sync::atomic::fence(Ordering::Acquire);
-                let meta = unsafe { &*(meta_dma.vaddr as *const VirtioBlkReqMeta) };
-                let result = match meta.status {
-                    VIRTIO_BLK_S_OK => Ok(()),
-                    VIRTIO_BLK_S_UNSUPP => Err(BlockIoError::Unsupported),
-                    _ => Err(BlockIoError::MediaError),
-                };
-                if result.is_ok()
-                    && let BlockIoRequest::Read { buffer, .. } = &mut request
-                    && let Some(data_dma) = data_dma.as_ref()
+            else {
+                continue;
+            };
+            let PendingVirtioRequest {
+                mut bio,
+                meta_dma,
+                data_dma,
+                desc_count,
+                ..
+            } = queue.pending.remove(pos).unwrap();
+            core::sync::atomic::fence(Ordering::Acquire);
+            let meta = unsafe { &*(meta_dma.vaddr as *const VirtioBlkReqMeta) };
+            let result = match meta.status {
+                VIRTIO_BLK_S_OK => Ok(()),
+                VIRTIO_BLK_S_UNSUPP => Err(BioIoError::Unsupported),
+                _ => Err(BioIoError::MediaError),
+            };
+            // 读请求成功时把 DMA 区数据回拷到 Bio buffer
+            if result.is_ok() && bio.op == BioOp::Read {
+                if let (BioBuffer::Owned(buf), Some(dma)) =
+                    (&mut bio.buffer, data_dma.as_ref())
                 {
-                    buffer.copy_from_slice(data_dma.as_slice());
+                    buf.copy_from_slice(dma.as_slice());
                 }
+            }
 
-                // 释放描述符链
-                let mut chain = Vec::new();
-                let mut idx = desc_head;
-                for _ in 0..desc_count {
-                    chain.push(idx);
-                    unsafe {
-                        let desc = &*queue.desc_table.add(idx as usize);
-                        if desc.flags & VIRTQ_DESC_F_NEXT != 0 {
-                            idx = desc.next;
-                        } else {
-                            break;
-                        }
+            // 释放描述符链
+            let mut chain = Vec::new();
+            let mut idx = desc_head;
+            for _ in 0..desc_count {
+                chain.push(idx);
+                unsafe {
+                    let desc = &*queue.desc_table.add(idx as usize);
+                    if desc.flags & VIRTQ_DESC_F_NEXT != 0 {
+                        idx = desc.next;
+                    } else {
+                        break;
                     }
                 }
-                queue.free_desc_chain(&chain);
-
-                // 调用完成回调
-                drop(queue);
-                completion(BlockIoCompletion { request, result });
-                queue = self.inner.queue.lock();
             }
+            queue.free_desc_chain(&chain);
+
+            // 释放 queue 锁后再 complete bio——避免 completion 路径
+            // （包括 Waker::wake 和 WaitQueue::wake_all）持队列锁重入。
+            drop(queue);
+            bio.complete(result);
+            queue = self.inner.queue.lock();
         }
     }
 
@@ -622,7 +637,7 @@ impl VirtioBlk {
         Ok(Arc::new(BlockDevice::new(
             BlockDeviceInit {
                 name,
-                kind: BlockDeviceKind::VirtioBlk,
+                subsystem: "virtio-blk",
                 class: BlockClass::Whole,
                 geometry,
                 limits,
@@ -634,106 +649,94 @@ impl VirtioBlk {
     }
 }
 
-// ───────── BlockIo 实现 ─────────
+// ───────── BlockDriver 实现 ─────────
 
+/// VirtIO-MMIO 块设备的 [`BlockDriver`] 包装。
+///
+/// 接受 `Bio` 请求，构造 VirtIO 描述符链，提交后立即返回；完成由 `poll`
+/// 路径触发 `bio.complete(...)`。
 struct VirtioBlkIo {
     driver: Arc<VirtioBlk>,
 }
 
-impl BlockIo for VirtioBlkIo {
-    fn submit(
-        &self,
-        req: BlockIoRequest,
-        completion: BlockCompletion,
-    ) -> Result<(), (BlockSubmitError, BlockIoRequest, BlockCompletion)> {
+impl BlockDriver for VirtioBlkIo {
+    fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
+        // 进来先尝试 drain 一下硬件已完成的请求，给后面的提交腾描述符。
         self.driver.poll();
         let mut queue = self.driver.inner.queue.lock();
 
-        // 根据请求类型确定需要的描述符数量
-        let desc_count = match &req {
-            BlockIoRequest::Read { .. } | BlockIoRequest::Write { .. } => 3,
-            BlockIoRequest::Flush => 2,
-            _ => return Err((BlockSubmitError::Unsupported, req, completion)),
+        // 根据请求类型确定描述符数量
+        let desc_count = match bio.op {
+            BioOp::Read | BioOp::Write => 3,
+            BioOp::Flush => 2,
+            _ => return Err((SubmitError::Unsupported, bio)),
         };
 
         // 分配描述符链
         let chain = match queue.alloc_desc_chain(desc_count) {
             Some(c) => c,
-            None => return Err((BlockSubmitError::QueueFull, req, completion)),
+            None => return Err((SubmitError::QueueFull, bio)),
         };
-
         let head_idx = chain[0];
 
+        // 元数据 DMA 缓冲区（请求头 + 状态字节）
         let meta_dma = match DmaBuffer::new(mem::size_of::<VirtioBlkReqMeta>()) {
             Ok(buffer) => buffer,
             Err(_) => {
                 queue.free_desc_chain(&chain);
-                return Err((BlockSubmitError::OutOfMemory, req, completion));
+                return Err((SubmitError::OutOfMemory, bio));
             }
         };
         let sector_scale = self.driver.inner.block_size as u64 / 512;
-        let meta = match &req {
-            BlockIoRequest::Read { range, .. } => VirtioBlkReqMeta {
-                header: VirtioBlkReqHeader {
-                    req_type: VIRTIO_BLK_T_IN,
-                    reserved: 0,
-                    sector: range.lba.saturating_mul(sector_scale),
-                },
-                status: 0xff,
-                _pad: [0; 7],
+        let req_type = match bio.op {
+            BioOp::Read => VIRTIO_BLK_T_IN,
+            BioOp::Write => VIRTIO_BLK_T_OUT,
+            BioOp::Flush => VIRTIO_BLK_T_FLUSH,
+            _ => unreachable!(),
+        };
+        let sector = match bio.op {
+            BioOp::Flush => 0,
+            _ => bio.range.lba.saturating_mul(sector_scale),
+        };
+        let meta = VirtioBlkReqMeta {
+            header: VirtioBlkReqHeader {
+                req_type,
+                reserved: 0,
+                sector,
             },
-            BlockIoRequest::Write { range, .. } => VirtioBlkReqMeta {
-                header: VirtioBlkReqHeader {
-                    req_type: VIRTIO_BLK_T_OUT,
-                    reserved: 0,
-                    sector: range.lba.saturating_mul(sector_scale),
-                },
-                status: 0xff,
-                _pad: [0; 7],
-            },
-            BlockIoRequest::Flush => VirtioBlkReqMeta {
-                header: VirtioBlkReqHeader {
-                    req_type: VIRTIO_BLK_T_FLUSH,
-                    reserved: 0,
-                    sector: 0,
-                },
-                status: 0xff,
-                _pad: [0; 7],
-            },
-            _ => {
-                queue.free_desc_chain(&chain);
-                return Err((BlockSubmitError::Unsupported, req, completion));
-            }
+            status: 0xff,
+            _pad: [0; 7],
         };
         unsafe {
             core::ptr::write(meta_dma.vaddr as *mut VirtioBlkReqMeta, meta);
         }
 
-        let data_dma = match &req {
-            BlockIoRequest::Read { buffer, .. } | BlockIoRequest::Write { buffer, .. } => {
-                match DmaBuffer::new(buffer.len()) {
+        // 数据 DMA 缓冲区（仅 Read/Write 需要）
+        let data_dma = match bio.op {
+            BioOp::Read | BioOp::Write => {
+                let buf_len = bio.buffer.len();
+                match DmaBuffer::new(buf_len) {
                     Ok(mut dma) => {
-                        if let BlockIoRequest::Write { buffer, .. } = &req {
-                            dma.as_mut_slice().copy_from_slice(buffer);
+                        if bio.op == BioOp::Write {
+                            dma.as_mut_slice().copy_from_slice(bio.buffer.as_slice());
                         }
                         Some(dma)
                     }
                     Err(_) => {
                         queue.free_desc_chain(&chain);
-                        return Err((BlockSubmitError::OutOfMemory, req, completion));
+                        return Err((SubmitError::OutOfMemory, bio));
                     }
                 }
             }
-            BlockIoRequest::Flush => None,
             _ => None,
         };
 
         let header_phys = meta_dma.paddr();
         let status_phys = meta_dma.paddr() + mem::size_of::<VirtioBlkReqHeader>() as u64;
 
-        // 构造请求
-        match &req {
-            BlockIoRequest::Read { range, buffer } => {
+        // 构造描述符链
+        match bio.op {
+            BioOp::Read => {
                 let buffer_phys = data_dma
                     .as_ref()
                     .expect("read request must have a DMA data buffer")
@@ -748,14 +751,13 @@ impl BlockIo for VirtioBlkIo {
                 queue.write_desc(
                     chain[1],
                     buffer_phys,
-                    buffer.len() as u32,
+                    bio.buffer.len() as u32,
                     VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
                     chain[2],
                 );
                 queue.write_desc(chain[2], status_phys, 1, VIRTQ_DESC_F_WRITE, 0);
-                let _ = range;
             }
-            BlockIoRequest::Write { range, buffer, .. } => {
+            BioOp::Write => {
                 let buffer_phys = data_dma
                     .as_ref()
                     .expect("write request must have a DMA data buffer")
@@ -770,14 +772,13 @@ impl BlockIo for VirtioBlkIo {
                 queue.write_desc(
                     chain[1],
                     buffer_phys,
-                    buffer.len() as u32,
+                    bio.buffer.len() as u32,
                     VIRTQ_DESC_F_NEXT,
                     chain[2],
                 );
                 queue.write_desc(chain[2], status_phys, 1, VIRTQ_DESC_F_WRITE, 0);
-                let _ = range;
             }
-            BlockIoRequest::Flush => {
+            BioOp::Flush => {
                 queue.write_desc(
                     chain[0],
                     header_phys,
@@ -787,18 +788,14 @@ impl BlockIo for VirtioBlkIo {
                 );
                 queue.write_desc(chain[1], status_phys, 1, VIRTQ_DESC_F_WRITE, 0);
             }
-            _ => {
-                queue.free_desc_chain(&chain);
-                return Err((BlockSubmitError::Unsupported, req, completion));
-            }
+            _ => unreachable!(),
         }
 
         // 提交到设备
         queue.submit_to_device(head_idx);
         queue.pending.push_back(PendingVirtioRequest {
             head: head_idx,
-            completion,
-            request: req,
+            bio,
             meta_dma,
             data_dma,
             desc_count,
@@ -807,15 +804,117 @@ impl BlockIo for VirtioBlkIo {
         // 通知设备
         drop(queue);
         self.driver.inner.write_reg(MMIO_QUEUE_NOTIFY, 0);
-
         Ok(())
+    }
+
+    fn drain(&self) {
+        self.driver.poll();
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
 
-    fn poll(&self) {
-        self.driver.poll();
+
+// ───────── Platform PnP 绑定 ─────────
+
+/// VirtIO-MMIO platform PnP 驱动。
+///
+/// probe 时根据固件资源读取 MMIO 基址，初始化 VirtIO 队列，并把块设备包装成
+/// 通用 function 注册到设备 core。
+pub struct VirtioMmioBlkDriver {
+    device_mmio_to_virt: fn(usize) -> usize,
+    virt_to_phys: fn(usize) -> usize,
+    next_index: AtomicUsize,
+}
+
+impl VirtioMmioBlkDriver {
+    /// 创建 VirtIO-MMIO PnP 驱动。
+    pub const fn new(
+        device_mmio_to_virt: fn(usize) -> usize,
+        virt_to_phys: fn(usize) -> usize,
+    ) -> Self {
+        Self {
+            device_mmio_to_virt,
+            virt_to_phys,
+            next_index: AtomicUsize::new(0),
+        }
     }
+
+    fn matches_platform(info: &PlatformDeviceInfo) -> bool {
+        info.has_id("virtio,mmio") || info.has_id("LNRO0005")
+    }
+}
+
+impl PnpDriver for VirtioMmioBlkDriver {
+    fn name(&self) -> &'static str {
+        "platform-virtio-mmio-blk"
+    }
+
+    fn bus_type(&self) -> BusType {
+        BusType::PLATFORM
+    }
+
+    fn matches(&self, id: &PnpId, info: &dyn PnpBusInfo) -> bool {
+        if !matches!(id, PnpId::Platform { .. }) {
+            return false;
+        }
+        info.as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .is_some_and(Self::matches_platform)
+    }
+
+    fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        let info = dev
+            .info
+            .as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .ok_or(PnpError::InvalidState)?;
+        let Some((phys, _size)) = info.first_mmio() else {
+            return Err(PnpError::ProbeFailed);
+        };
+        let virt_base = (self.device_mmio_to_virt)(phys);
+        let driver = VirtioBlk::new(virt_base, self.virt_to_phys).map_err(|msg| {
+            log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
+            PnpError::ProbeFailed
+        })?;
+        let idx = self.next_index.fetch_add(1, Ordering::Relaxed);
+        let dev_name = format!("{}{}", DEV_PREFIX, idx);
+        let block_dev = driver
+            .into_block_dev(&dev_name, self.virt_to_phys)
+            .map_err(|_| PnpError::ProbeFailed)?;
+        dev.register_function(Arc::new(BlockFunction::new(&dev_name, block_dev)))?;
+        log::printk!(
+            "[platform-virtio-mmio-blk] bound {} phys={:#x} -> /dev/{}",
+            dev.id,
+            phys,
+            dev_name
+        );
+        Ok(())
+    }
+
+    fn remove(&self, dev: &Arc<PnpDevice>) {
+        log::printk!("[platform-virtio-mmio-blk] removed {}", dev.id);
+    }
+}
+
+struct VirtioMmioBlkFactory;
+
+impl DriverFactory for VirtioMmioBlkFactory {
+    fn name(&self) -> &'static str {
+        "platform-virtio-mmio-blk"
+    }
+
+    fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
+        Ok(Arc::new(VirtioMmioBlkDriver::new(
+            ctx.device_mmio_to_virt,
+            ctx.virt_to_phys,
+        )))
+    }
+}
+
+/// 注册 VirtIO-MMIO block 内建驱动 factory。
+pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
+    register_driver_factory(Arc::new(VirtioMmioBlkFactory)).map(|_| ())
 }

@@ -545,19 +545,36 @@ pub fn mount(
     if !ctx.cred.has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
     }
-    // 空 fstype 时按常见块文件系统顺序尝试自动检测
-    const CANDIDATES: &[&str] = &["ext2", "ext3", "ext4", "vfat"];
-    let candidates: &[&str] = if fs_type.is_empty() {
-        CANDIDATES
-    } else {
-        core::slice::from_ref(&fs_type)
-    };
-
     let mut last_error = VfsError::NoDevice;
-    for &candidate in candidates {
-        let Some(driver) = FS_REGISTRY.find(candidate) else {
-            continue;
-        };
+    if fs_type.is_empty() {
+        for wanted_probe in [superblock::FsProbe::Strong, superblock::FsProbe::Weak] {
+            for entry in FS_REGISTRY.iter() {
+                let driver = entry.driver;
+                let flags = driver.flags();
+                if !flags.has(superblock::FsDriverFlags::BLOCK)
+                    || !flags.has(superblock::FsDriverFlags::AUTO_DETECT)
+                    || driver.probe(dev) != wanted_probe
+                {
+                    continue;
+                }
+                match driver.mount(dev, data) {
+                    Ok(superblock) => {
+                        let mountpoint =
+                            path::lookup(ctx, dirfd, mountpoint_path, LookupFlags::DIRECTORY)?
+                                .dentry;
+                        return ctx.mount_ns.mount(mountpoint, superblock, mount_flags);
+                    }
+                    Err(e) => {
+                        last_error = e;
+                        continue;
+                    }
+                }
+            }
+        }
+        return Err(last_error);
+    }
+
+    if let Some(driver) = FS_REGISTRY.find(fs_type) {
         match driver.mount(dev, data) {
             Ok(superblock) => {
                 let mountpoint =
@@ -566,10 +583,10 @@ pub fn mount(
             }
             Err(e) => {
                 last_error = e;
-                continue;
             }
         }
     }
+
     Err(last_error)
 }
 

@@ -2,17 +2,17 @@
 //!
 //! # 设计要点
 //!
-//! 设备节点的 inode 直接持有设备对象引用（`CharDev` 或 `Arc<BlockDev>`），
+//! 设备节点的 inode 直接持有设备对象引用（`CharDevice` 或 `Arc<BlockDevice>`），
 //! 而非设备名称字符串。`open()` 时零查找：已在绑定时解析，运行时直接调用。
 //!
 //! ```text
-//! bind_char("uart0", dev: CharDev)
+//! bind_char("uart0", dev: CharDevice)
 //!   └─ 创建 Inode，InodeOps = DevCharOps { dev }
-//!         └─ open() → CharDevAdapter::new(dev)   // 无查找，直接构造
+//!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //!
-//! bind_block("vda", dev: Arc<BlockDev>)
-//!   └─ 创建 Inode，InodeOps = DevBlockOps { dev: Arc<BlockDev> }
-//!         └─ open() → BlockDevAdapter::new(dev)  // 无查找，直接构造
+//! bind_block("vda", dev: Arc<BlockDevice>)
+//!   └─ 创建 Inode，InodeOps = DevBlockOps { dev: Arc<BlockDevice> }
+//!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //! ```
 //!
 //! # 文件系统结构
@@ -45,16 +45,64 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::dev::block::{
-    BlockCompletion, BlockDevice, BlockFeatures, BlockIoCompletion, BlockIoError, BlockIoRequest,
-    BlockRange, BlockSubmitError,
-};
-use crate::dev::char::{CharDevice, CharDeviceKind, CharIoError};
+use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
+use crate::dev::block::{BlockDevice, BlockFeatures};
+use crate::dev::char::{CharDevice, CharIoError};
+use crate::dev::function::DevNodeSpec;
+use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
 use crate::mm::{copy_from_user, copy_to_user};
 
 // ───────── 全局实例计数器 ─────────
 
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+static PNP_DEVTMPFS_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
+
+/// 安装 PnP 到 devtmpfs 的桥接。
+///
+/// 安装后，PnpDevice 注册带 [`DevNodeSpec`] 的 function 时，会自动在这个
+/// devtmpfs superblock 中创建或删除对应 `/dev` 节点。桥接只消费 `DevNodeSpec`
+/// 携带的设备对象，不 downcast 具体 function 类型。
+pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
+    dev_sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+
+    let sb_leaked: &'static Arc<Superblock> = Box::leak(Box::new(dev_sb));
+    *PNP_DEVTMPFS_SB.lock() = Some(sb_leaked);
+    set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
+        bind: pnp_bind_cb,
+        unbind: pnp_unbind_cb,
+    });
+    Ok(())
+}
+
+fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
+    PNP_DEVTMPFS_SB.lock().ok_or(PnpError::NoDevtmpfs)
+}
+
+fn pnp_bind_cb(spec: &DevNodeSpec) -> Result<(), PnpError> {
+    let sb = pnp_devtmpfs_sb()?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+    match spec {
+        DevNodeSpec::Char { name, dev } => ops
+            .bind_char(name.as_ref(), dev.clone())
+            .map_err(|_| PnpError::DevtmpfsError),
+        DevNodeSpec::Block { name, dev } => ops
+            .bind_block(name.as_ref(), Arc::clone(dev))
+            .map_err(|_| PnpError::DevtmpfsError),
+    }
+}
+
+fn pnp_unbind_cb(name: &str) -> Result<(), PnpError> {
+    let sb = pnp_devtmpfs_sb()?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+    ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
+}
 
 // ───────── 字符设备 FileOps（内联适配器） ─────────
 
@@ -358,13 +406,7 @@ impl CharDevFileOps {
     }
 
     fn is_tty(&self) -> bool {
-        matches!(
-            self.dev.kind(),
-            CharDeviceKind::StandardSerial
-                | CharDeviceKind::Ns16550
-                | CharDeviceKind::VirtualTerminal
-                | CharDeviceKind::Console
-        )
+        self.dev.is_tty()
     }
 
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
@@ -754,26 +796,31 @@ struct BlockDevFileOps {
     sync_writes: bool,
 }
 
-fn map_block_submit_err(err: BlockSubmitError) -> VfsError {
+fn map_bio_err(err: BioError) -> VfsError {
     match err {
-        BlockSubmitError::Unsupported => VfsError::NotSupported,
-        BlockSubmitError::ReadOnly => VfsError::ReadOnlyFilesystem,
-        BlockSubmitError::QueueFull => VfsError::WouldBlock,
-        BlockSubmitError::DeviceGone => VfsError::NoDevice,
-        BlockSubmitError::OutOfMemory => VfsError::OutOfMemory,
-        BlockSubmitError::InvalidRequest(_) => VfsError::InvalidArgument,
+        BioError::Submit(s) => match s {
+            crate::dev::bio::SubmitError::Unsupported => VfsError::NotSupported,
+            crate::dev::bio::SubmitError::ReadOnly => VfsError::ReadOnlyFilesystem,
+            crate::dev::bio::SubmitError::QueueFull => VfsError::WouldBlock,
+            crate::dev::bio::SubmitError::DeviceGone => VfsError::NoDevice,
+            crate::dev::bio::SubmitError::OutOfMemory => VfsError::OutOfMemory,
+            crate::dev::bio::SubmitError::InvalidRequest(_) => VfsError::InvalidArgument,
+        },
+        BioError::Io(i) => match i {
+            crate::dev::bio::BioIoError::MediaError => VfsError::Io,
+            crate::dev::bio::BioIoError::Unavailable => VfsError::NoDevice,
+            crate::dev::bio::BioIoError::Timeout => VfsError::TimedOut,
+            crate::dev::bio::BioIoError::ReadOnly => VfsError::ReadOnlyFilesystem,
+            crate::dev::bio::BioIoError::Unsupported => VfsError::NotSupported,
+        },
     }
 }
 
-fn map_block_io_err(err: BlockIoError) -> VfsError {
-    match err {
-        BlockIoError::MediaError => VfsError::Io,
-        BlockIoError::Unavailable => VfsError::NoDevice,
-        BlockIoError::Timeout => VfsError::TimedOut,
-        BlockIoError::ReadOnly => VfsError::ReadOnlyFilesystem,
-        BlockIoError::Unsupported => VfsError::NotSupported,
-    }
+fn map_block_io_err(err: BioError) -> VfsError {
+    map_bio_err(err)
 }
+
+
 
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
     let mut data = Vec::new();
@@ -810,66 +857,34 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
-fn submit_block_sync(dev: &Arc<BlockDevice>, req: BlockIoRequest) -> VfsResult<BlockIoCompletion> {
-    let done = Arc::new(AtomicBool::new(false));
-    let slot = Arc::new(Spinlock::new(None));
-    let done_for_completion = Arc::clone(&done);
-    let slot_for_completion = Arc::clone(&slot);
-    let completion: BlockCompletion = Box::new(move |completion| {
-        *slot_for_completion.lock() = Some(completion);
-        done_for_completion.store(true, Ordering::Release);
-    });
 
-    if let Err((err, _req, _completion)) = dev.submit(req, completion) {
-        return Err(map_block_submit_err(err));
-    }
-
-    while !done.load(Ordering::Acquire) {
-        dev.poll();
-        core::hint::spin_loop();
-    }
-
-    slot.lock().take().ok_or(VfsError::Io)
-}
 
 impl FileOps for BlockDevFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
             return Ok(0);
         };
-        let completion = submit_block_sync(
-            &self.dev,
-            BlockIoRequest::Read {
-                range,
-                buffer: boxed_zeroed(buf.len())?,
-            },
-        )?;
-        completion.result.map_err(map_block_io_err)?;
-        match completion.request {
-            BlockIoRequest::Read { buffer, .. } => {
-                buf.copy_from_slice(&buffer);
-                Ok(buf.len())
-            }
-            _ => Err(VfsError::Io),
-        }
+        let owned = boxed_zeroed(buf.len())?;
+        let bio = self
+            .dev
+            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+            .map_err(map_bio_err)?;
+        buf.copy_from_slice(bio.buffer.as_slice());
+        Ok(buf.len())
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
             return Ok(0);
         };
-        let completion = submit_block_sync(
-            &self.dev,
-            BlockIoRequest::Write {
-                range,
-                buffer: boxed_copy(buf)?,
-                fua: false,
-            },
-        )?;
-        completion.result.map_err(map_block_io_err)?;
+        let owned = boxed_copy(buf)?;
+        self.dev
+            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .map_err(map_bio_err)?;
         if self.sync_writes {
-            let completion = submit_block_sync(&self.dev, BlockIoRequest::Flush)?;
-            completion.result.map_err(map_block_io_err)?;
+            self.dev
+                .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
+                .map_err(map_bio_err)?;
         }
         Ok(buf.len())
     }
@@ -886,8 +901,10 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
-        let completion = submit_block_sync(&self.dev, BlockIoRequest::Flush)?;
-        completion.result.map_err(map_block_io_err)
+        self.dev
+            .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
+            .map_err(map_bio_err)?;
+        Ok(())
     }
 
     fn poll(&self, _interest: PollEvents) -> PollEvents {

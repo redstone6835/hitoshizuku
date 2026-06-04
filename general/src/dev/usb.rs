@@ -37,7 +37,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
+use super::pnp::{BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
 
 // ── UsbDeviceInfo ────────────────────────────────────────────────────────
 
@@ -63,8 +63,8 @@ impl UsbDeviceInfo {
 }
 
 impl PnpBusInfo for UsbDeviceInfo {
-    fn bus_type(&self) -> &'static str {
-        "usb"
+    fn bus_type(&self) -> BusType {
+        BusType::USB
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -105,8 +105,8 @@ impl UsbInterfaceInfo {
 }
 
 impl PnpBusInfo for UsbInterfaceInfo {
-    fn bus_type(&self) -> &'static str {
-        "usb"
+    fn bus_type(&self) -> BusType {
+        BusType::USB
     }
 
     fn as_any(&self) -> &dyn core::any::Any {

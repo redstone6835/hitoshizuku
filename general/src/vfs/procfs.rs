@@ -1,4 +1,7 @@
-//! Procfs: /proc virtual filesystem.
+//! procfs：`/proc` 虚拟文件系统。
+//!
+//! 本模块提供进程、挂载、内存和设备等运行时状态的文本视图。设备相关视图通过
+//! function 注册表的兼容层 helper 获取字符/块设备快照，不直接依赖具体 function 类型。
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -30,6 +33,7 @@ use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
 use super::{current_vfs_context, namespace_path};
+use crate::dev::function::{active_block_devices, active_char_devices};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
@@ -1713,14 +1717,12 @@ fn render_stat() -> String {
 fn render_devices() -> String {
     // TODO: 当前所有 char/block 设备硬编码 major=254，需要从设备注册表中读取真实主设备号
     let mut out = String::from("Character devices:\n");
-    for dev in crate::dev::enumerate::DEVICES.char_devs.iter() {
+    for dev in active_char_devices(&crate::dev::enumerate::DEVICES.functions) {
         out.push_str(&format!("  254 {}\n", dev.fw_name()));
     }
     out.push_str("\nBlock devices:\n");
-    if let Ok(devs) = crate::dev::enumerate::DEVICES.block_devs.list() {
-        for dev in &devs {
-            out.push_str(&format!("  254 {}\n", dev.name()));
-        }
+    for dev in active_block_devices(&crate::dev::enumerate::DEVICES.functions) {
+        out.push_str(&format!("  254 {}\n", dev.name()));
     }
     out
 }

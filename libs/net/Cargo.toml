@@ -10,3 +10,13 @@ bench = false
 
 [dependencies]
 socket = { path = "../socket" }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+] }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }

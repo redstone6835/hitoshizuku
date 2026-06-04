@@ -25,9 +25,15 @@ use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
 use acpi::{AcpiTable, AmlHandler, Handle, Handler, PhysicalMapping};
 
 use allocator::KERNEL_ALLOCATOR;
-use general::dev::char::{CharDevice, CharDeviceKind};
-use general::dev::drivers::{Uart16550, VirtioBlk};
+use general::dev::char::CharDevice;
+use general::dev::drivers;
 use general::dev::enumerate::DEVICES;
+use general::dev::function::find_char_device_by_fw_name;
+use general::dev::platform::{
+    DeviceMatchId, DeviceProperties, DeviceResource, PlatformDeviceInfo,
+    register_and_probe_platform_device,
+};
+use general::dev::pnp::{DevInitContext, set_dev_init_context};
 use general::firmware::power::{
     PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
@@ -252,7 +258,7 @@ pub fn kernel_start_init(context: &StartContext) {
         tables.rsdp_revision,
     );
 
-    // ── Step 1: parse ACPI firmware tables ───────────────────────────────────
+    // ── 阶段 1：解析 ACPI 固件表 ───────────────────────────────────────────
 
     let cpu_count = cpu_count_from_madt(&tables).unwrap_or(1).max(1);
     let serial_port = serial_port_from_spcr(&tables);
@@ -266,11 +272,11 @@ pub fn kernel_start_init(context: &StartContext) {
             panic!("[kernel-start][acpi] ACPI firmware requires usable boot memory segments")
         });
 
-    // ── Step 2: install power controls ───────────────────────────────────────
+    // ── 阶段 2：安装电源控制入口 ───────────────────────────────────────────
 
     general::firmware::power::install(power_controls, context.address.phys_to_virt);
 
-    // ── Step 3: initialize layered memory allocator ───────────────────────────
+    // ── 阶段 3：初始化分层内存分配器 ───────────────────────────────────────
 
     KERNEL_ALLOCATOR
         .bind_address_translation(context.address.phys_to_virt, context.address.virt_to_phys);
@@ -317,7 +323,7 @@ pub fn kernel_start_init(context: &StartContext) {
         .command_line
         .map(general::cmdline::Cmdline::new);
 
-    // ── Step 4: discover and register ACPI devices ───────────────────────────
+    // ── 阶段 4：发现并登记 ACPI 设备描述 ──────────────────────────────────
 
     let mut serial_ports: Vec<SerialPortInfo> = Vec::new();
     let mut virtio_mmio_devices: Vec<FirmwareMmioDevice> = Vec::new();
@@ -332,98 +338,13 @@ pub fn kernel_start_init(context: &StartContext) {
     let console_serial_port_index = console_serial_port_phys
         .and_then(|phys| serial_ports.iter().position(|port| port.phys_addr == phys));
 
-    let mut block_index = 0usize;
-    for device in &virtio_mmio_devices {
-        let virt_base = (context.address.device_mmio_to_virt)(device.phys_addr);
-        let driver = match VirtioBlk::new(virt_base, context.address.virt_to_phys) {
-            Ok(driver) => driver,
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] skipped virtio-mmio {} at {:#x}: {}",
-                    device.name,
-                    device.phys_addr,
-                    err
-                );
-                continue;
-            }
-        };
-        let user_name = alloc::format!(
-            "{}{}",
-            general::dev::block::BlockDeviceKind::VirtioBlk.name(),
-            block_index
-        );
-        let block_dev = match driver.into_block_dev(&user_name, context.address.virt_to_phys) {
-            Ok(dev) => dev,
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] failed to create block dev for {} at {:#x}: {}",
-                    device.name,
-                    device.phys_addr,
-                    err
-                );
-                continue;
-            }
-        };
-        match DEVICES.block_devs.push(&block_dev) {
-            Ok(dev) => {
-                printk!(
-                    "[kernel-start][acpi] registered virtio-blk {} → /dev/{} at phys={:#x} size={:#x}",
-                    device.name,
-                    dev.name(),
-                    device.phys_addr,
-                    device.size
-                );
-                block_index += 1;
-            }
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] failed to register virtio-blk {} at {:#x}: {:?}",
-                    device.name,
-                    device.phys_addr,
-                    err
-                );
-            }
-        }
-    }
-
-    let mut char_dev_bindings: alloc::vec::Vec<(&'static str, general::dev::char::CharDevice)> =
-        alloc::vec::Vec::new();
-    for (idx, port) in serial_ports.iter().enumerate() {
-        let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
-        let uart: &'static Uart16550 = if let Some(clock_hz) = port.clock_hz {
-            Box::leak(Box::new(Uart16550::new(virt_base, clock_hz, 115_200)))
-        } else {
-            Box::leak(Box::new(Uart16550::new_preconfigured(virt_base)))
-        };
-        let fw_name: &'static str = port.name;
-        let user_name: &'static str = alloc::format!("uart{}", idx).leak();
-        let dev = CharDevice::new(CharDeviceKind::Ns16550, fw_name, uart);
-        if let Err(err) = DEVICES.char_devs.push(dev.clone()) {
-            printk!(
-                "[kernel-start][acpi] failed to register {} (uart{}) at {:#x}: {:?}",
-                fw_name,
-                idx,
-                port.phys_addr,
-                err
-            );
-        } else {
-            char_dev_bindings.push((user_name, dev));
-            printk!(
-                "[kernel-start][acpi] registered {} -> /dev/{} at phys={:#x}",
-                fw_name,
-                user_name,
-                port.phys_addr
-            );
-        }
-    }
-
     printk!(
         "[kernel-start][acpi] device discovery complete: {} uart(s), {} virtio block candidate(s)",
         serial_ports.len(),
         virtio_mmio_devices.len()
     );
 
-    // ── Step 5: mount root filesystem (tmpfs) and devtmpfs on /dev ───────────
+    // ── 阶段 5：挂载根文件系统并准备 /dev ─────────────────────────────────
 
     FS_REGISTRY
         .register(Box::leak(Box::new(general::vfs::TmpfsDriver)))
@@ -485,45 +406,70 @@ pub fn kernel_start_init(context: &StartContext) {
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .expect("[kernel-start][acpi] failed to downcast devtmpfs ops");
 
-    for (name, dev) in [("null", CharDevice::null()), ("zero", CharDevice::zero())] {
-        match dev_ops.bind_char(name, dev) {
-            Ok(()) | Err(VfsError::AlreadyExists) => {}
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] failed to bind standard /dev/{}: {:?}",
-                    name,
-                    err
-                );
-            }
-        }
-    }
+    general::vfs::devtmpfs::install_pnp_bridge(Arc::clone(&dev_sb))
+        .expect("[kernel-start][acpi] failed to install PnP devtmpfs bridge");
+    printk!("[kernel-start][acpi] PnP devtmpfs callbacks installed");
 
-    for (user_name, dev) in &char_dev_bindings {
-        if let Err(err) = dev_ops.bind_char(user_name, dev.clone()) {
-            printk!(
-                "[kernel-start][acpi] failed to bind char dev '{}' (fw: {}) to /dev: {:?}",
-                user_name,
-                dev.fw_name(),
-                err
-            );
-        }
-    }
+    set_dev_init_context(DevInitContext::new(
+        context.address.device_mmio_to_virt,
+        context.address.virt_to_phys,
+    ));
+    drivers::register_builtin_drivers()
+        .expect("[kernel-start][acpi] failed to register built-in PnP drivers");
+    printk!("[kernel-start][acpi] registered built-in PnP drivers");
 
-    if let Ok(block_devs) = DEVICES.block_devs.list() {
-        for dev in block_devs {
-            if let Err(err) = dev_ops.bind_block(dev.name(), Arc::clone(&dev)) {
-                printk!(
-                    "[kernel-start][acpi] failed to bind block dev '{}' to /dev: {:?}",
-                    dev.name(),
-                    err
-                );
-            }
+    let stdout_phys = console_serial_port_phys;
+    let mut platform_bound = 0usize;
+    for port in &serial_ports {
+        let mut ids = Vec::new();
+        ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0500.into()));
+        ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
+        let mut resources = Vec::new();
+        resources.push(DeviceResource::Mmio {
+            phys: port.phys_addr,
+            size: 0x100,
+        });
+        let info = PlatformDeviceInfo {
+            fw_name: port.name.into(),
+            ids,
+            resources,
+            properties: DeviceProperties {
+                clock_hz: port.clock_hz,
+                baud: Some(115_200),
+                stdout: stdout_phys == Some(port.phys_addr),
+            },
+        };
+        if register_platform_device(info, "acpi") {
+            platform_bound += 1;
         }
     }
+    for device in &virtio_mmio_devices {
+        let mut ids = Vec::new();
+        ids.push(DeviceMatchId::AcpiHid(ACPI_HID_VIRTIO_MMIO.into()));
+        let mut resources = Vec::new();
+        resources.push(DeviceResource::Mmio {
+            phys: device.phys_addr,
+            size: device.size,
+        });
+        let info = PlatformDeviceInfo {
+            fw_name: device.name.into(),
+            ids,
+            resources,
+            properties: DeviceProperties::default(),
+        };
+        if register_platform_device(info, "acpi") {
+            platform_bound += 1;
+        }
+    }
+    printk!(
+        "[kernel-start][acpi] platform PnP discovery complete: {} candidate(s), {} bound",
+        serial_ports.len() + virtio_mmio_devices.len(),
+        platform_bound
+    );
 
     printk!("[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev'");
 
-    // ── Step 6: register console and bind log sink ────────────────────────────
+    // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
 
     let vfs_ctx = VfsContext::new(
         Arc::clone(&root_sb.root_dentry),
@@ -583,11 +529,7 @@ pub fn kernel_start_init(context: &StartContext) {
             );
             Some(dev)
         } else if let Some(port) = console_serial_port_index.and_then(|i| serial_ports.get(i)) {
-            let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
-            let found = DEVICES.char_devs.iter().find(|dev| {
-                dev.downcast_driver::<Uart16550>()
-                    .is_some_and(|uart| uart.base() == virt_base)
-            });
+            let found = lookup_char_fw_name(port.name);
             if let Some(dev) = found.as_ref() {
                 printk!(
                     "[kernel-start][acpi] console from firmware: {}",
@@ -671,7 +613,33 @@ fn resolve_cmdline_console(
                     .and_then(|dev_name| dev_ops.char_dev(dev_name))
             });
     }
-    DEVICES.char_devs.lookup(name)
+    lookup_char_fw_name(name)
+}
+
+fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
+    find_char_device_by_fw_name(&DEVICES.functions, name)
+}
+
+fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
+    match register_and_probe_platform_device(info) {
+        Ok(reg) if reg.bound => true,
+        Ok(reg) => {
+            printk!(
+                "[kernel-start][{}] no platform driver for {}",
+                tag,
+                reg.device.id
+            );
+            false
+        }
+        Err(err) => {
+            printk!(
+                "[kernel-start][{}] failed to register/probe platform device: {:?}",
+                tag,
+                err
+            );
+            false
+        }
+    }
 }
 
 fn unsupported_host_operation(operation: &str) -> ! {

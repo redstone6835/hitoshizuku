@@ -1,13 +1,23 @@
 //! NS16550A 兼容 UART 驱动程序。
 //!
-//! 纯硬件操作与驱动 trait 实现，不含任何静态池、名称分配或注册逻辑。
-//! 实例的分配与注册由调用方（如 `arch` 初始化代码）负责。
+//! 模块内包含两层能力：底层 [`Uart16550`] 负责直接访问寄存器；PnP 适配层
+//! [`Uart16550PlatformDriver`] 负责匹配固件枚举的 platform 串口并注册字符
+//! function。内建注册入口只提交 factory，不参与固件扫描。
 
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::sync::Arc;
 use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::dev::char::*;
+use crate::dev::function::CharFunction;
+use crate::dev::platform::PlatformDeviceInfo;
+use crate::dev::pnp::{
+    BusType, DevInitContext, DriverFactory, PnpDevice, PnpDriver, PnpError, PnpId,
+    register_driver_factory,
+};
 
 // ─────────────────────── UART 寄存器偏移与标志 ───────────────────────────
 
@@ -255,6 +265,14 @@ impl CharDriver for Uart16550 {
         self
     }
 
+    fn is_tty(&self) -> bool {
+        true
+    }
+
+    fn is_console(&self) -> bool {
+        true
+    }
+
     fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
         if buf.is_empty() {
             return Ok(0);
@@ -393,4 +411,108 @@ impl DriverControl for Uart16550 {
             }
         }
     }
+}
+
+// ──────────────────────── Platform PnP 绑定 ──────────────────────────────
+
+/// NS16550A platform PnP 驱动。
+///
+/// 驱动只匹配固件枚举的串口节点，probe 时把 MMIO 基址映射为 [`Uart16550`]
+/// 实例，并注册字符设备 function。
+pub struct Uart16550PlatformDriver {
+    device_mmio_to_virt: fn(usize) -> usize,
+    next_index: AtomicUsize,
+}
+
+impl Uart16550PlatformDriver {
+    /// 创建 platform 串口驱动。
+    pub const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
+        Self {
+            device_mmio_to_virt,
+            next_index: AtomicUsize::new(0),
+        }
+    }
+
+    fn matches_platform(info: &PlatformDeviceInfo) -> bool {
+        info.has_id("ns16550")
+            || info.has_id("ns16550a")
+            || info.has_id("PNP0500")
+            || info.has_id("PNP0501")
+    }
+}
+
+impl PnpDriver for Uart16550PlatformDriver {
+    fn name(&self) -> &'static str {
+        "platform-uart16550"
+    }
+
+    fn bus_type(&self) -> BusType {
+        BusType::PLATFORM
+    }
+
+    fn matches(&self, id: &PnpId, info: &dyn crate::dev::pnp::PnpBusInfo) -> bool {
+        if !matches!(id, PnpId::Platform { .. }) {
+            return false;
+        }
+        info.as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .is_some_and(Self::matches_platform)
+    }
+
+    fn probe(&self, dev: &alloc::sync::Arc<PnpDevice>) -> Result<(), PnpError> {
+        let info = dev
+            .info
+            .as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .ok_or(PnpError::InvalidState)?;
+        let Some((phys, _size)) = info.first_mmio() else {
+            return Err(PnpError::ProbeFailed);
+        };
+        let virt_base = (self.device_mmio_to_virt)(phys);
+        let uart: &'static Uart16550 = if let Some(clock_hz) = info.properties.clock_hz {
+            Box::leak(Box::new(Uart16550::new(
+                virt_base,
+                clock_hz,
+                info.properties.baud.unwrap_or(115_200),
+            )))
+        } else {
+            Box::leak(Box::new(Uart16550::new_preconfigured(virt_base)))
+        };
+
+        let idx = self.next_index.fetch_add(1, Ordering::Relaxed);
+        let dev_name = format!("uart{}", idx);
+        let fw_name: &'static str = Box::leak(info.fw_name.clone());
+        let ch = CharDevice::new(fw_name, uart);
+        dev.register_function(Arc::new(CharFunction::new(&dev_name, ch)))?;
+        log::printk!(
+            "[platform-uart16550] bound {} phys={:#x} -> /dev/{}",
+            dev.id,
+            phys,
+            dev_name
+        );
+        Ok(())
+    }
+
+    fn remove(&self, dev: &alloc::sync::Arc<PnpDevice>) {
+        log::printk!("[platform-uart16550] removed {}", dev.id);
+    }
+}
+
+struct Uart16550Factory;
+
+impl DriverFactory for Uart16550Factory {
+    fn name(&self) -> &'static str {
+        "platform-uart16550"
+    }
+
+    fn create(&self, ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
+        Ok(Arc::new(Uart16550PlatformDriver::new(
+            ctx.device_mmio_to_virt,
+        )))
+    }
+}
+
+/// 注册 NS16550A platform 内建驱动 factory。
+pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
+    register_driver_factory(Arc::new(Uart16550Factory)).map(|_| ())
 }

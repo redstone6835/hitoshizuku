@@ -28,10 +28,10 @@ use vfs::file::{DirEntry, OpenOptions};
 use vfs::superblock::{FsDriver, Superblock};
 use vfs::sync::Spinlock;
 
+use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use general::dev::block::{
-    BlockClass, BlockCompletion, BlockDevice, BlockDeviceInit, BlockDeviceKind, BlockFeatures,
-    BlockGeometry, BlockIo, BlockIoCompletion, BlockIoError, BlockIoRequest, BlockLimits,
-    BlockSubmitError,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
+    BlockGeometry, BlockLimits,
 };
 use general::dev::block_sync::SyncBlockBackend;
 
@@ -116,7 +116,7 @@ fn make_ram_device(name: &str, image: &'static [u8]) -> Arc<BlockDevice> {
     Arc::new(BlockDevice::new(
         BlockDeviceInit {
             name,
-            kind: BlockDeviceKind::RamDisk,
+            subsystem: "ramdisk",
             class: BlockClass::Whole,
             geometry: geom,
             limits: BlockLimits::unrestricted(),
@@ -218,7 +218,7 @@ fn run_software_overhead_only() {
         Arc::new(BlockDevice::new(
             BlockDeviceInit {
                 name: "ramd-tiny",
-                kind: BlockDeviceKind::RamDisk,
+                subsystem: "ramdisk",
                 class: BlockClass::Whole,
                 geometry: geom,
                 limits: BlockLimits::unrestricted(),
@@ -308,18 +308,17 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     core::hint::black_box(&buf);
     let dt_full = hal::time::monotonic_ns().saturating_sub(t0);
 
-    // ── 测量 B: 直接通过 BlockIo trait 调用（绕过 SyncBlockBackend + BlockDevice） ──
-    let io: &dyn BlockIo = dev.downcast_io::<RamBlockIo>().unwrap();
+    // ── 测量 B: 直接路径（旧 read_sectors_sync 快路径已移除，与 backend 同等） ──
     let t0 = hal::time::monotonic_ns();
     for i in 0..iters {
         let lba = (i as u64) * blocks_per_chunk as u64;
-        let _ = io.read_sectors_sync(lba, blocks_per_chunk, &mut buf);
+        let _ = backend.read(lba, blocks_per_chunk, &mut buf);
     }
     core::hint::black_box(&buf);
     let dt_direct = hal::time::monotonic_ns().saturating_sub(t0);
 
     // ── 测量 C: 纯 memcpy（同一 backing store，手动 lock） ──
-    let io_ref = dev.downcast_io::<RamBlockIo>().unwrap();
+    let io_ref = dev.downcast_driver::<RamBlockIo>().unwrap();
     let t0 = hal::time::monotonic_ns();
     for i in 0..iters {
         let off = i * chunk;
@@ -975,89 +974,46 @@ impl RamBlockIo {
     }
 }
 
-impl BlockIo for RamBlockIo {
-    fn submit(
-        &self,
-        req: BlockIoRequest,
-        completion: BlockCompletion,
-    ) -> Result<(), (BlockSubmitError, BlockIoRequest, BlockCompletion)> {
+impl BlockDriver for RamBlockIo {
+    fn queue_bio(&self, mut bio: Bio) -> Result<(), (SubmitError, Bio)> {
         const LBS: usize = 512;
-        let result = match &req {
-            BlockIoRequest::Read { range, .. } | BlockIoRequest::Write { range, .. } => {
-                let off = range.lba as usize * LBS;
-                let want = range.blocks as usize * LBS;
+        let off = bio.range.lba as usize * LBS;
+        let want = bio.range.blocks as usize * LBS;
+
+        match bio.op {
+            BioOp::Read => {
                 let data = self.data.lock();
-                if off.saturating_add(want) > data.len() {
-                    Err(BlockIoError::MediaError)
-                } else {
-                    Ok((off, want))
+                if off + want > data.len() {
+                    drop(data);
+                    bio.complete(Err(BioIoError::MediaError));
+                    return Ok(());
                 }
-            }
-            _ => Ok((0, 0)),
-        };
-        let done = match (req, result) {
-            (BlockIoRequest::Read { range, mut buffer }, Ok((off, want))) => {
-                let data = self.data.lock();
-                buffer[..want].copy_from_slice(&data[off..off + want]);
+                if let BioBuffer::Owned(buf) = &mut bio.buffer {
+                    buf[..want].copy_from_slice(&data[off..off + want]);
+                }
                 drop(data);
-                BlockIoCompletion {
-                    request: BlockIoRequest::Read { range, buffer },
-                    result: Ok(()),
-                }
+                bio.complete(Ok(()));
             }
-            (BlockIoRequest::Write { range, buffer, fua }, Ok((off, want))) => {
+            BioOp::Write => {
                 let mut data = self.data.lock();
-                data[off..off + want].copy_from_slice(&buffer[..want]);
-                drop(data);
-                BlockIoCompletion {
-                    request: BlockIoRequest::Write { range, buffer, fua },
-                    result: Ok(()),
+                if off + want > data.len() {
+                    drop(data);
+                    bio.complete(Err(BioIoError::MediaError));
+                    return Ok(());
                 }
+                if let BioBuffer::Owned(buf) = &bio.buffer {
+                    data[off..off + want].copy_from_slice(&buf[..want]);
+                }
+                drop(data);
+                bio.complete(Ok(()));
             }
-            (req @ BlockIoRequest::Flush, _) => BlockIoCompletion {
-                request: req,
-                result: Ok(()),
-            },
-            (req, Err(err)) => BlockIoCompletion {
-                request: req,
-                result: Err(err),
-            },
-            (req, _) => BlockIoCompletion {
-                request: req,
-                result: Ok(()),
-            },
-        };
-        completion(done);
-        Ok(())
-    }
-
-    fn read_sectors_sync(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), BlockIoError> {
-        const LBS: usize = 512;
-        let want = count as usize * LBS;
-        if buf.len() < want {
-            return Err(BlockIoError::MediaError);
+            BioOp::Flush => {
+                bio.complete(Ok(()));
+            }
+            _ => {
+                bio.complete(Err(BioIoError::Unsupported));
+            }
         }
-        let off = lba as usize * LBS;
-        let data = self.data.lock();
-        if off + want > data.len() {
-            return Err(BlockIoError::MediaError);
-        }
-        buf[..want].copy_from_slice(&data[off..off + want]);
-        Ok(())
-    }
-
-    fn write_sectors_sync(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlockIoError> {
-        const LBS: usize = 512;
-        let want = count as usize * LBS;
-        if buf.len() < want {
-            return Err(BlockIoError::MediaError);
-        }
-        let off = lba as usize * LBS;
-        let mut data = self.data.lock();
-        if off + want > data.len() {
-            return Err(BlockIoError::MediaError);
-        }
-        data[off..off + want].copy_from_slice(&buf[..want]);
         Ok(())
     }
 

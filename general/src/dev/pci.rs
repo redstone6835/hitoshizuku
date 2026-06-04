@@ -31,7 +31,7 @@ use core::fmt;
 
 use vfs::sync::Spinlock;
 
-use super::pnp::{PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
+use super::pnp::{BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
 
 // ── PciInfo ──────────────────────────────────────────────────────────────
 
@@ -72,8 +72,8 @@ impl PciInfo {
 }
 
 impl PnpBusInfo for PciInfo {
-    fn bus_type(&self) -> &'static str {
-        "pci"
+    fn bus_type(&self) -> BusType {
+        BusType::PCI
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
