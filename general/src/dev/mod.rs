@@ -19,6 +19,7 @@ pub mod completion;
 pub mod drivers;
 pub mod enumerate;
 pub mod function;
+pub mod net;
 pub mod pci;
 pub mod platform;
 pub mod pnp;
