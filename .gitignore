@@ -1,7 +1,6 @@
 # 构建输出
-target/
+/target/
 Cargo.lock
-!vendor/**/Cargo.lock
 kernel-la
 kernel-rv
 disk.img
@@ -17,3 +16,6 @@ disk-la.img
 build
 userland/rootfs-la/bin/
 userland/rootfs-rv/bin/
+
+# vendor 不受上述规则限制
+!vendor/
