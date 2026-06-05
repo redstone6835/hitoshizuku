@@ -6,6 +6,7 @@ extern crate allocator;
 extern crate hal;
 
 mod acpi;
+#[cfg(feature = "bench")]
 mod bench;
 mod dtb;
 mod initramfs;
