@@ -86,9 +86,8 @@ impl TaskState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
 
-/// 默认内核栈大小：16 KiB。足够走完 trap → syscall → 浅层函数链。需要时上层
-/// 可以给长栈深的内核线程显式指定更大的 [`KernelStack::with_size`]。
-pub const DEFAULT_KERNEL_STACK_SIZE: usize = 16 * 1024;
+/// 默认内核栈大小：64 KiB。fork 等深层调用需要足够空间，避免栈溢出损坏堆。
+pub const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
 /// 内核栈对齐：16 字节，匹配所有现用 ISA 的 ABI 栈对齐要求。
 pub const KERNEL_STACK_ALIGN: usize = 16;
 
@@ -706,6 +705,12 @@ pub const TASKEXT_VFS_FDTABLE: TaskExtKey = 0x0001_0001;
 pub const TASKEXT_VM_SPACE: TaskExtKey = 0x0001_0002;
 /// 已保存的用户 trap frame（kernel/hal 通过此键挂在 Task 的 ext 表上）。
 pub const TASKEXT_USER_TRAP_FRAME: TaskExtKey = 0x0001_0003;
+/// 当前任务的可执行路径（kernel execve 安装，procfs `/proc/self/exe` 读取）。
+pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
+/// 当前任务的 argv 快照（kernel execve 安装，procfs `/proc/[pid]/cmdline` 读取）。
+pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
+/// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
+pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
 
 /// 单条子系统挂载。
 pub struct TaskExt {

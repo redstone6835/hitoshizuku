@@ -60,6 +60,12 @@ fn apply_create_mode(ctx: &VfsContext, mode: FileMode) -> FileMode {
     m
 }
 
+fn unregister_socket_inode(inode: &Inode) {
+    if inode.kind == stat::FileType::Socket {
+        crate::socket::unregister_path_socket(inode.fs_id().raw(), inode.ino());
+    }
+}
+
 /// 将新创建的 inode 插入 inode cache 和 dentry cache。
 ///
 /// 返回经过 DCACHE 去重后的规范 Dentry（若并发插入，返回先到的那个）。
@@ -296,6 +302,7 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.unlink(&parent_inode, name, &child_inode)?;
+    unregister_socket_inode(&child_inode);
     DCACHE.invalidate_dentry(&target.dentry);
     target.dentry.invalidate();
     retire_inode(child_inode);
@@ -385,6 +392,9 @@ pub fn renameat(
 
     // 若替换了已有文件，清理被替换的 inode
     if let Some((_, replaced_inode)) = new_existing {
+        if !Arc::ptr_eq(&old_inode, &replaced_inode) {
+            unregister_socket_inode(&replaced_inode);
+        }
         retire_inode(replaced_inode);
     }
     Ok(())
@@ -535,19 +545,36 @@ pub fn mount(
     if !ctx.cred.has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
     }
-    // 空 fstype 时按常见块文件系统顺序尝试自动检测
-    const CANDIDATES: &[&str] = &["ext2", "ext3", "ext4", "vfat"];
-    let candidates: &[&str] = if fs_type.is_empty() {
-        CANDIDATES
-    } else {
-        core::slice::from_ref(&fs_type)
-    };
-
     let mut last_error = VfsError::NoDevice;
-    for &candidate in candidates {
-        let Some(driver) = FS_REGISTRY.find(candidate) else {
-            continue;
-        };
+    if fs_type.is_empty() {
+        for wanted_probe in [superblock::FsProbe::Strong, superblock::FsProbe::Weak] {
+            for entry in FS_REGISTRY.iter() {
+                let driver = entry.driver;
+                let flags = driver.flags();
+                if !flags.has(superblock::FsDriverFlags::BLOCK)
+                    || !flags.has(superblock::FsDriverFlags::AUTO_DETECT)
+                    || driver.probe(dev) != wanted_probe
+                {
+                    continue;
+                }
+                match driver.mount(dev, data) {
+                    Ok(superblock) => {
+                        let mountpoint =
+                            path::lookup(ctx, dirfd, mountpoint_path, LookupFlags::DIRECTORY)?
+                                .dentry;
+                        return ctx.mount_ns.mount(mountpoint, superblock, mount_flags);
+                    }
+                    Err(e) => {
+                        last_error = e;
+                        continue;
+                    }
+                }
+            }
+        }
+        return Err(last_error);
+    }
+
+    if let Some(driver) = FS_REGISTRY.find(fs_type) {
         match driver.mount(dev, data) {
             Ok(superblock) => {
                 let mountpoint =
@@ -556,10 +583,10 @@ pub fn mount(
             }
             Err(e) => {
                 last_error = e;
-                continue;
             }
         }
     }
+
     Err(last_error)
 }
 

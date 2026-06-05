@@ -97,14 +97,20 @@ impl Spcr {
     /// The PC-AT-compatible IRQ used by the UART, if the UART supports it.
     /// Support is indicated by the [`interrupt_type`](Self::interrupt_type).
     pub fn irq(&self) -> Option<u8> {
-        self.interrupt_type().contains(SpcrInterruptType::DUAL_8259).then_some(self.irq)
+        self.interrupt_type()
+            .contains(SpcrInterruptType::DUAL_8259)
+            .then_some(self.irq)
     }
 
     /// The Global System Interrupt (GSIV) used by the UART, if the UART
     /// supports it. Support is indicated by the
     /// [`interrupt_type`](Self::interrupt_type).
     pub fn global_system_interrupt(&self) -> Option<u32> {
-        if self.interrupt_type().difference(SpcrInterruptType::DUAL_8259).is_empty() {
+        if self
+            .interrupt_type()
+            .difference(SpcrInterruptType::DUAL_8259)
+            .is_empty()
+        {
             return None;
         }
         Some(self.global_system_interrupt)

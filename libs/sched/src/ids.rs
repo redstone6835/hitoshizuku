@@ -70,6 +70,7 @@ pub enum Capability {
     Setgid = 6,
     Setuid = 7,
     Setpcap = 8,
+    SysBoot = 22,
     SysNice = 23,
     SysResource = 24,
 }

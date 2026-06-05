@@ -345,6 +345,12 @@ impl FileOps for ExtRegFileOps {
                 .map_ranges(flags, size, &i_block, first_lb, lb_count)
                 .map_err(map_err)?;
 
+            // if ranges.is_empty() && offset == 0 {
+            //     log::info!("[extfs] read_at offset=0 size={} flags={:#x} ranges EMPTY first_lb={} lb_count={}", size, flags, first_lb, lb_count);
+            // } else if offset == 0 {
+            //     log::info!("[extfs] read_at offset=0 size={} ranges={} first=({},{},{:#x})", size, ranges.len(), ranges[0].0, ranges[0].1, ranges[0].2);
+            // }
+
             let mut filled_until = 0usize;
             let mut scratch = Vec::new();
             for (range_lb, range_count, phys_start) in &ranges {
@@ -389,13 +395,18 @@ impl FileOps for ExtRegFileOps {
         }
         let _io = self.io_mu.lock();
         self.with_ops(|inode, ops| {
-            let cur_size = ops.raw.lock().size();
-            let start = if offset == u64::MAX { cur_size } else { offset };
-            let end = start + buf.len() as u64;
-
             let mut raw_guard = ops.raw.lock();
-            let mut flags = raw_guard.flags();
+            let old_size = raw_guard.size();
+            let start = if offset == u64::MAX { old_size } else { offset };
+            let end = start
+                .checked_add(buf.len() as u64)
+                .ok_or(VfsError::FileTooLarge)?;
+
+            let old_flags = raw_guard.flags();
+            let old_blocks_lo = raw_guard.blocks_lo();
+            let mut flags = old_flags;
             let mut i_block = raw_guard.i_block().to_vec();
+            let old_i_block = i_block.clone();
 
             // inline_data 无损迁移:先把现有 inline 字节读出来,再清 flag,
             // 之后把旧内容作为普通数据块写回,最后执行用户写入。
@@ -455,13 +466,9 @@ impl FileOps for ExtRegFileOps {
                 while written < buf.len() {
                     let lb = (file_off / block_size) as u32;
                     let remain_blocks = ((buf.len() - written) as u64 / block_size) as u32;
-                    let Some((phys, run_blocks)) = extent_wr::ensure_extent_run(
-                        &self.state,
-                        &mut i_block,
-                        lb,
-                        remain_blocks,
-                    )
-                    .map_err(map_err)?
+                    let Some((phys, run_blocks)) =
+                        extent_wr::ensure_extent_run(&self.state, &mut i_block, lb, remain_blocks)
+                            .map_err(map_err)?
                     else {
                         break;
                     };
@@ -472,72 +479,65 @@ impl FileOps for ExtRegFileOps {
                     written += bytes;
                     file_off += bytes as u64;
                 }
-                if written == buf.len() {
-                    raw_guard.i_block_mut().copy_from_slice(&i_block);
-                    raw_guard.set_flags(flags);
-                    if end > raw_guard.size() {
-                        raw_guard.set_size(end);
+            }
+
+            if written != buf.len() {
+                written = 0;
+                file_off = start;
+                let mut cur_blk_buf = vec![0u8; block_size as usize];
+                let mut cur_lb: Option<u32> = None;
+                let mut cur_phys: u64 = 0;
+                for lb in first_lb..=last_lb {
+                    let lb = lb as u32;
+                    let in_block = (file_off % block_size) as usize;
+                    let want = ((block_size - in_block as u64) as usize).min(buf.len() - written);
+                    let phys = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
+                        .map_err(map_err)?;
+                    if let Some(prev_lb) = cur_lb {
+                        if prev_lb != lb {
+                            self.state
+                                .write_block(cur_phys, &cur_blk_buf)
+                                .map_err(map_err)?;
+                        }
                     }
-                    let blocks512 = (raw_guard.size() + 511) / 512;
-                    raw_guard.set_blocks_lo(blocks512 as u32);
-                    write_raw(&self.state, &raw_guard).map_err(map_err)?;
-                    inode.set_size(raw_guard.size());
-                    self.invalidate_map_cache();
-                    return Ok(written);
+                    if cur_lb != Some(lb) {
+                        if in_block != 0 || want < block_size as usize {
+                            self.state
+                                .read_block(phys, &mut cur_blk_buf)
+                                .map_err(map_err)?;
+                        }
+                        // 整块覆盖时 buf 内容会被随后的 copy_from_slice 完整改写,无需清零
+                        cur_lb = Some(lb);
+                        cur_phys = phys;
+                    }
+                    cur_blk_buf[in_block..in_block + want]
+                        .copy_from_slice(&buf[written..written + want]);
+                    written += want;
+                    file_off += want as u64;
+                }
+                if cur_lb.is_some() {
+                    self.state
+                        .write_block(cur_phys, &cur_blk_buf)
+                        .map_err(map_err)?;
                 }
             }
 
-            written = 0;
-            file_off = start;
-            let mut cur_blk_buf = vec![0u8; block_size as usize];
-            let mut cur_lb: Option<u32> = None;
-            let mut cur_phys: u64 = 0;
-            for lb in first_lb..=last_lb {
-                let lb = lb as u32;
-                let in_block = (file_off % block_size) as usize;
-                let want = ((block_size - in_block as u64) as usize).min(buf.len() - written);
-                let phys =
-                    ensure_block_any(&self.state, &mut flags, &mut i_block, lb).map_err(map_err)?;
-                if let Some(prev_lb) = cur_lb {
-                    if prev_lb != lb {
-                        self.state
-                            .write_block(cur_phys, &cur_blk_buf)
-                            .map_err(map_err)?;
-                        cur_blk_buf.iter_mut().for_each(|x| *x = 0);
-                    }
-                }
-                if cur_lb != Some(lb) {
-                    if in_block != 0 || want < block_size as usize {
-                        self.state
-                            .read_block(phys, &mut cur_blk_buf)
-                            .map_err(map_err)?;
-                    } else {
-                        cur_blk_buf.iter_mut().for_each(|x| *x = 0);
-                    }
-                    cur_lb = Some(lb);
-                    cur_phys = phys;
-                }
-                cur_blk_buf[in_block..in_block + want]
-                    .copy_from_slice(&buf[written..written + want]);
-                written += want;
-                file_off += want as u64;
+            let new_size = raw_guard.size().max(end);
+            let blocks512 = (new_size + 511) / 512;
+            let new_blocks_lo = blocks512 as u32;
+            let metadata_changed = new_size != old_size
+                || new_blocks_lo != old_blocks_lo
+                || flags != old_flags
+                || i_block != old_i_block;
+            if metadata_changed {
+                raw_guard.i_block_mut().copy_from_slice(&i_block);
+                raw_guard.set_flags(flags);
+                raw_guard.set_size(new_size);
+                raw_guard.set_blocks_lo(new_blocks_lo);
+                write_raw(&self.state, &raw_guard).map_err(map_err)?;
+                inode.set_size(new_size);
+                self.invalidate_map_cache();
             }
-            if let Some(_) = cur_lb {
-                self.state
-                    .write_block(cur_phys, &cur_blk_buf)
-                    .map_err(map_err)?;
-            }
-
-            raw_guard.i_block_mut().copy_from_slice(&i_block);
-            raw_guard.set_flags(flags);
-            if end > raw_guard.size() {
-                raw_guard.set_size(end);
-            }
-            let blocks512 = (raw_guard.size() + 511) / 512;
-            raw_guard.set_blocks_lo(blocks512 as u32);
-            write_raw(&self.state, &raw_guard).map_err(map_err)?;
-            inode.set_size(raw_guard.size());
-            self.invalidate_map_cache();
 
             Ok(written)
         })

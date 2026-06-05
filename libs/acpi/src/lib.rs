@@ -75,7 +75,8 @@ where
     /// # Safety
     /// The address of the RSDP must be valid.
     pub unsafe fn from_rsdp(handler: H, rsdp_address: usize) -> Result<AcpiTables<H>, AcpiError> {
-        let rsdp_mapping = unsafe { handler.map_physical_region::<Rsdp>(rsdp_address, mem::size_of::<Rsdp>()) };
+        let rsdp_mapping =
+            unsafe { handler.map_physical_region::<Rsdp>(rsdp_address, mem::size_of::<Rsdp>()) };
 
         /*
          * If the address given does not have a correct RSDP signature, the user has probably given
@@ -84,7 +85,9 @@ where
          */
         match rsdp_mapping.validate() {
             Ok(()) => (),
-            Err(AcpiError::RsdpIncorrectSignature) => return Err(AcpiError::RsdpIncorrectSignature),
+            Err(AcpiError::RsdpIncorrectSignature) => {
+                return Err(AcpiError::RsdpIncorrectSignature);
+            }
             Err(AcpiError::RsdpInvalidOemId) | Err(AcpiError::RsdpInvalidChecksum) => {
                 warn!("RSDP has invalid checksum or OEM ID. Continuing.");
             }
@@ -116,19 +119,31 @@ where
         rsdp_revision: u8,
         rsdt_address: usize,
     ) -> Result<AcpiTables<H>, AcpiError> {
-        let rsdt_mapping =
-            unsafe { handler.map_physical_region::<SdtHeader>(rsdt_address, mem::size_of::<SdtHeader>()) };
+        let rsdt_mapping = unsafe {
+            handler.map_physical_region::<SdtHeader>(rsdt_address, mem::size_of::<SdtHeader>())
+        };
         let rsdt_length = rsdt_mapping.length;
-        let rsdt_mapping = unsafe { handler.map_physical_region::<SdtHeader>(rsdt_address, rsdt_length as usize) };
-        Ok(Self { rsdt_mapping, rsdp_revision, handler })
+        let rsdt_mapping =
+            unsafe { handler.map_physical_region::<SdtHeader>(rsdt_address, rsdt_length as usize) };
+        Ok(Self {
+            rsdt_mapping,
+            rsdp_revision,
+            handler,
+        })
     }
 
     /// Iterate over the **physical** addresses of the SDTs.
     pub fn table_entries(&self) -> impl Iterator<Item = usize> {
         let entry_size = if self.rsdp_revision == 0 { 4 } else { 8 };
-        let mut table_entries_ptr =
-            unsafe { self.rsdt_mapping.virtual_start.as_ptr().byte_add(mem::size_of::<SdtHeader>()) }.cast::<u8>();
-        let mut num_entries = (self.rsdt_mapping.region_length - mem::size_of::<SdtHeader>()) / entry_size;
+        let mut table_entries_ptr = unsafe {
+            self.rsdt_mapping
+                .virtual_start
+                .as_ptr()
+                .byte_add(mem::size_of::<SdtHeader>())
+        }
+        .cast::<u8>();
+        let mut num_entries =
+            (self.rsdt_mapping.region_length - mem::size_of::<SdtHeader>()) / entry_size;
 
         core::iter::from_fn(move || {
             if num_entries > 0 {
@@ -153,7 +168,10 @@ where
     pub fn table_headers(&self) -> impl Iterator<Item = (usize, SdtHeader)> {
         self.table_entries().map(|table_phys_address| {
             let mapping = unsafe {
-                self.handler.map_physical_region::<SdtHeader>(table_phys_address, mem::size_of::<SdtHeader>())
+                self.handler.map_physical_region::<SdtHeader>(
+                    table_phys_address,
+                    mem::size_of::<SdtHeader>(),
+                )
             };
             (table_phys_address, *mapping)
         })
@@ -166,13 +184,19 @@ where
     {
         self.table_entries().filter_map(|table_phys_address| {
             let header_mapping = unsafe {
-                self.handler.map_physical_region::<SdtHeader>(table_phys_address, mem::size_of::<SdtHeader>())
+                self.handler.map_physical_region::<SdtHeader>(
+                    table_phys_address,
+                    mem::size_of::<SdtHeader>(),
+                )
             };
             if header_mapping.signature == T::SIGNATURE {
                 // Extend the mapping to the entire table
                 let length = header_mapping.length;
                 drop(header_mapping);
-                Some(unsafe { self.handler.map_physical_region::<T>(table_phys_address, length as usize) })
+                Some(unsafe {
+                    self.handler
+                        .map_physical_region::<T>(table_phys_address, length as usize)
+                })
             } else {
                 None
             }
@@ -192,15 +216,25 @@ where
             Err(AcpiError::TableNotFound(Signature::FADT))?
         };
         let phys_address = fadt.dsdt_address()?;
-        let header =
-            unsafe { self.handler.map_physical_region::<SdtHeader>(phys_address, mem::size_of::<SdtHeader>()) };
-        Ok(AmlTable { phys_address, length: header.length, revision: header.revision })
+        let header = unsafe {
+            self.handler
+                .map_physical_region::<SdtHeader>(phys_address, mem::size_of::<SdtHeader>())
+        };
+        Ok(AmlTable {
+            phys_address,
+            length: header.length,
+            revision: header.revision,
+        })
     }
 
     pub fn ssdts(&self) -> impl Iterator<Item = AmlTable> {
         self.table_headers().filter_map(|(phys_address, header)| {
             if header.signature == Signature::SSDT {
-                Some(AmlTable { phys_address, length: header.length, revision: header.revision })
+                Some(AmlTable {
+                    phys_address,
+                    length: header.length,
+                    revision: header.revision,
+                })
             } else {
                 None
             }
@@ -387,7 +421,11 @@ pub trait Handler: Clone {
     ///
     /// - `physical_address` must point to a valid `T` in physical memory.
     /// - `size` must be at least `size_of::<T>()`.
-    unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T>;
+    unsafe fn map_physical_region<T>(
+        &self,
+        physical_address: usize,
+        size: usize,
+    ) -> PhysicalMapping<Self, T>;
 
     /// Unmap the given physical mapping. This is called when a `PhysicalMapping` is dropped, you should **not** manually call this.
     ///

@@ -65,7 +65,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.pc = entry_pc;
         tf.sp = kernel_sp;
         tf.status = PRMD_KERNEL_IE;
-        tf.euen = 0;
+        tf.euen = EUEN_FPE | EUEN_SXE;
     }
 
     fn init_user_trap_frame(
@@ -80,7 +80,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = user_sp;
         tf.a0 = arg0;
         tf.status = PRMD_USER_IE;
-        tf.euen = 0;
+        tf.euen = EUEN_FPE | EUEN_SXE;
     }
 
     fn set_user_trap_frame_args(
@@ -248,6 +248,8 @@ unsafe extern "C" fn __loongarch64_resume_to_trap_frame(_tf_ptr: usize) {
 
         ".Lresume_skip_fpu:",
 
+        "ld.d $r12, $r31, {euen_off}",
+        "bstrins.d $r12, $r0, 4, 4",
         "csrwr $r12, {csr_euen}",
 
         "ld.d $r12, $r31, {llbctl_off}",

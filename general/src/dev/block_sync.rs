@@ -1,99 +1,45 @@
-//! 把异步 [`BlockDevice`] 包成同步 [`fatfs::BlockBackend`] / [`extfs::BlockBackend`]。
+//! 块设备到文件系统后端的同步适配器。
 //!
-//! 文件系统驱动需要按扇区同步读写;块设备核心暴露的是 submit + 完成回调。
-//! 本适配器在一次调用里:
-//! 1. 分配 `Box<[u8]>` 作为 DMA 缓冲区;
-//! 2. 构造 [`BlockIoRequest`] 提交;
-//! 3. 自旋 `dev.poll()` 直到完成回调触发;
-//! 4. 拷贝结果回用户 slice,或把用户数据搬进 Box 再提交写。
-//!
-//! 适用于早期启动 / bench 场景 —— 一次只有一条请求,不与其它线程竞争。
+//! `FsBlockAdapter` 把 [`BlockDevice`] 的 Bio-based API 桥接为
+//! `fatfs::BlockBackend` / `extfs::BlockBackend` 要求的同步 `read_sectors` /
+//! `write_sectors` 接口。内部调用 [`BlockDevice::submit_bio_wait`]，自动根据
+//! 调度器状态选择 WaitQueue 阻塞或自旋等待。
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU8, Ordering};
+use alloc::vec;
 
-use vfs::sync::Spinlock;
+use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
+use crate::dev::block::BlockDevice;
 
-use crate::dev::block::{
-    BlockDevice, BlockIoCompletion, BlockIoError, BlockIoRequest, BlockRange, BlockSubmitError,
-};
-
-const STATE_PENDING: u8 = 0;
-const STATE_OK: u8 = 1;
-const STATE_ERR: u8 = 2;
-
-struct SyncSlot {
-    state: AtomicU8,
-    /// 写路径时不使用;读路径在完成回调里回填 `Box<[u8]>` 数据。
-    buffer: Spinlock<Option<Box<[u8]>>>,
-}
-
-impl SyncSlot {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: AtomicU8::new(STATE_PENDING),
-            buffer: Spinlock::new(None),
-        })
-    }
-}
-
-/// 把 [`BlockDevice`] 的异步 `submit` 封装成一次同步操作。
-///
-/// 内部自旋 `dev.poll()` 直到完成回调运行。
-pub struct SyncBlockBackend {
+/// 把 [`BlockDevice`] 适配为文件系统同步 BlockBackend。
+pub struct FsBlockAdapter {
     dev: Arc<BlockDevice>,
 }
 
-impl SyncBlockBackend {
+/// 兼容别名。
+pub type SyncBlockBackend = FsBlockAdapter;
+
+/// 兼容错误类型。
+#[derive(Debug, Clone, Copy)]
+pub enum SyncIoError {
+    Submit(crate::dev::bio::SubmitError),
+    Io(crate::dev::bio::BioIoError),
+    BufferTooSmall,
+    InvalidRange,
+}
+
+impl From<BioError> for SyncIoError {
+    fn from(e: BioError) -> Self {
+        match e {
+            BioError::Submit(s) => SyncIoError::Submit(s),
+            BioError::Io(i) => SyncIoError::Io(i),
+        }
+    }
+}
+
+impl FsBlockAdapter {
     pub fn new(dev: Arc<BlockDevice>) -> Self {
         Self { dev }
-    }
-
-    /// 兼容旧 API，忽略 virt_to_phys（快速路径不再需要地址转换）。
-    pub fn with_virt_to_phys(dev: Arc<BlockDevice>, _v2p: fn(usize) -> usize) -> Self {
-        Self { dev }
-    }
-
-    fn run<R>(
-        &self,
-        build_req: impl FnOnce() -> BlockIoRequest,
-        on_done: impl FnOnce(&mut Option<Box<[u8]>>) -> R,
-    ) -> Result<R, SyncIoError> {
-        let slot = SyncSlot::new();
-        let slot_for_cb = Arc::clone(&slot);
-        let completion: Box<dyn FnOnce(BlockIoCompletion) + Send> =
-            Box::new(move |done: BlockIoCompletion| {
-                match done.result {
-                    Ok(()) => {
-                        // 读请求才会需要把 buffer 交回来
-                        if let BlockIoRequest::Read { buffer, .. } = done.request {
-                            *slot_for_cb.buffer.lock() = Some(buffer);
-                        }
-                        slot_for_cb.state.store(STATE_OK, Ordering::Release);
-                    }
-                    Err(_) => {
-                        slot_for_cb.state.store(STATE_ERR, Ordering::Release);
-                    }
-                }
-            });
-        if let Err((err, _req, _cb)) = self.dev.submit(build_req(), completion) {
-            return Err(SyncIoError::Submit(err));
-        }
-        // 自旋等完成。生产代码里会让出 CPU,这里 bench 初期 OK。
-        loop {
-            let s = slot.state.load(Ordering::Acquire);
-            if s == STATE_OK {
-                break;
-            }
-            if s == STATE_ERR {
-                return Err(SyncIoError::Io(BlockIoError::MediaError));
-            }
-            self.dev.poll();
-            core::hint::spin_loop();
-        }
-        let mut guard = slot.buffer.lock();
-        Ok(on_done(&mut guard))
     }
 
     pub fn sector_size_bytes(&self) -> u32 {
@@ -104,175 +50,136 @@ impl SyncBlockBackend {
         self.dev.geometry().block_count().unwrap_or(0)
     }
 
-    /// 同步读若干扇区到 `buf`。
-    ///
-    /// 优先使用 `read_sectors_sync` 零拷贝快速路径（无 Box 分配、无回调、无 spin-wait）。
-    /// 仅当驱动不支持时回退到 submit/completion 慢路径。
     pub fn read(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), SyncIoError> {
-        let bps = self.sector_size_bytes() as u64;
-        let want = (count as u64 * bps) as usize;
+        let bps = self.sector_size_bytes() as usize;
+        let want = count as usize * bps;
         if buf.len() < want {
             return Err(SyncIoError::BufferTooSmall);
         }
-        if count == 0 {
-            return Err(SyncIoError::InvalidRange);
-        }
-
-        // 快速路径：直接传 buffer 给驱动，零分配零拷贝。
-        match self.dev.read_sync(lba, count, buf) {
-            Ok(()) => return Ok(()),
-            Err(BlockSubmitError::Unsupported) => {}
-            Err(_) => return Err(SyncIoError::Io(BlockIoError::MediaError)),
-        }
-
-        // 慢路径：Box 分配 + submit/completion
-        let range = match self.build_range(lba, count) {
-            Some(r) => r,
-            None => return Err(SyncIoError::InvalidRange),
-        };
-        let backing: Box<[u8]> = alloc::vec![0u8; want].into_boxed_slice();
-        let copied = self.run(
-            || BlockIoRequest::Read {
-                range,
-                buffer: backing,
-            },
-            |done_buf| {
-                if let Some(data) = done_buf.take() {
-                    buf[..want].copy_from_slice(&data[..want]);
-                    true
-                } else {
-                    false
-                }
-            },
-        )?;
-        if copied {
-            Ok(())
-        } else {
-            Err(SyncIoError::Io(BlockIoError::MediaError))
-        }
-    }
-
-    /// 同步写若干扇区。
-    ///
-    /// 优先使用 `write_sectors_sync` 零拷贝快速路径。
-    pub fn write(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), SyncIoError> {
-        let bps = self.sector_size_bytes() as u64;
-        let want = (count as u64 * bps) as usize;
-        if buf.len() < want {
-            return Err(SyncIoError::BufferTooSmall);
-        }
-        if count == 0 {
-            return Err(SyncIoError::InvalidRange);
-        }
-
-        // 快速路径
-        match self.dev.write_sync(lba, count, buf) {
-            Ok(()) => return Ok(()),
-            Err(BlockSubmitError::Unsupported) => {}
-            Err(_) => return Err(SyncIoError::Io(BlockIoError::MediaError)),
-        }
-
-        // 慢路径
-        let range = match self.build_range(lba, count) {
-            Some(r) => r,
-            None => return Err(SyncIoError::InvalidRange),
-        };
-        let mut backing: Box<[u8]> = alloc::vec![0u8; want].into_boxed_slice();
-        backing.copy_from_slice(&buf[..want]);
-        self.run(
-            || BlockIoRequest::Write {
-                range,
-                buffer: backing,
-                fua: false,
-            },
-            |_| (),
-        )?;
+        let owned = alloc::vec![0u8; want].into_boxed_slice();
+        let range = BlockRange { lba, blocks: count };
+        let bio = self
+            .dev
+            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+            .map_err(SyncIoError::from)?;
+        buf[..want].copy_from_slice(bio.buffer.as_slice());
         Ok(())
     }
 
-    fn build_range(&self, lba: u64, count: u32) -> Option<BlockRange> {
-        if count == 0 {
-            return None;
+    pub fn write(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), SyncIoError> {
+        let bps = self.sector_size_bytes() as usize;
+        let want = count as usize * bps;
+        if buf.len() < want {
+            return Err(SyncIoError::BufferTooSmall);
         }
-        Some(BlockRange { lba, blocks: count })
+        let mut owned = alloc::vec![0u8; want].into_boxed_slice();
+        owned.copy_from_slice(&buf[..want]);
+        let range = BlockRange { lba, blocks: count };
+        self.dev
+            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .map_err(SyncIoError::from)?;
+        Ok(())
     }
 }
 
-/// 适配器内部错误。
-#[derive(Debug, Clone, Copy)]
-pub enum SyncIoError {
-    Submit(BlockSubmitError),
-    Io(BlockIoError),
-    BufferTooSmall,
-    InvalidRange,
-}
-
-// ── FS-facing impls ──────────────────────────────────────────────────────
-
-impl fatfs::BlockBackend for SyncBlockBackend {
+impl fatfs::BlockBackend for FsBlockAdapter {
     fn sector_size(&self) -> u32 {
         self.sector_size_bytes()
     }
+
     fn sector_count(&self) -> u64 {
         self.sector_count_total()
     }
+
     fn read_sectors(
         &self,
         lba: u64,
         count: u32,
         buf: &mut [u8],
     ) -> Result<(), fatfs::BlockBackendError> {
-        self.read(lba, count, buf).map_err(map_err_fat)
+        let bps = self.sector_size_bytes() as usize;
+        let want = count as usize * bps;
+        if buf.len() < want {
+            return Err(fatfs::BlockBackendError::OutOfRange);
+        }
+        let owned = vec![0u8; want].into_boxed_slice();
+        let range = BlockRange { lba, blocks: count };
+        let bio = self
+            .dev
+            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+            .map_err(|_| fatfs::BlockBackendError::Io)?;
+        buf[..want].copy_from_slice(bio.buffer.as_slice());
+        Ok(())
     }
+
     fn write_sectors(
         &self,
         lba: u64,
         count: u32,
         buf: &[u8],
     ) -> Result<(), fatfs::BlockBackendError> {
-        self.write(lba, count, buf).map_err(map_err_fat)
+        let bps = self.sector_size_bytes() as usize;
+        let want = count as usize * bps;
+        if buf.len() < want {
+            return Err(fatfs::BlockBackendError::OutOfRange);
+        }
+        let mut owned = vec![0u8; want].into_boxed_slice();
+        owned.copy_from_slice(&buf[..want]);
+        let range = BlockRange { lba, blocks: count };
+        self.dev
+            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .map_err(|_| fatfs::BlockBackendError::Io)?;
+        Ok(())
     }
 }
 
-impl extfs::BlockBackend for SyncBlockBackend {
+impl extfs::BlockBackend for FsBlockAdapter {
     fn sector_size(&self) -> u32 {
         self.sector_size_bytes()
     }
+
     fn sector_count(&self) -> u64 {
         self.sector_count_total()
     }
+
     fn read_sectors(
         &self,
         lba: u64,
         count: u32,
         buf: &mut [u8],
     ) -> Result<(), extfs::BlockBackendError> {
-        self.read(lba, count, buf).map_err(map_err_ext)
+        let bps = self.sector_size_bytes() as usize;
+        let want = count as usize * bps;
+        if buf.len() < want {
+            return Err(extfs::BlockBackendError::OutOfRange);
+        }
+        let owned = vec![0u8; want].into_boxed_slice();
+        let range = BlockRange { lba, blocks: count };
+        let bio = self
+            .dev
+            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+            .map_err(|_| extfs::BlockBackendError::Io)?;
+        buf[..want].copy_from_slice(bio.buffer.as_slice());
+        Ok(())
     }
+
     fn write_sectors(
         &self,
         lba: u64,
         count: u32,
         buf: &[u8],
     ) -> Result<(), extfs::BlockBackendError> {
-        self.write(lba, count, buf).map_err(map_err_ext)
-    }
-}
-
-fn map_err_fat(e: SyncIoError) -> fatfs::BlockBackendError {
-    match e {
-        SyncIoError::BufferTooSmall | SyncIoError::InvalidRange => {
-            fatfs::BlockBackendError::OutOfRange
+        let bps = self.sector_size_bytes() as usize;
+        let want = count as usize * bps;
+        if buf.len() < want {
+            return Err(extfs::BlockBackendError::OutOfRange);
         }
-        SyncIoError::Submit(_) | SyncIoError::Io(_) => fatfs::BlockBackendError::Io,
-    }
-}
-
-fn map_err_ext(e: SyncIoError) -> extfs::BlockBackendError {
-    match e {
-        SyncIoError::BufferTooSmall | SyncIoError::InvalidRange => {
-            extfs::BlockBackendError::OutOfRange
-        }
-        SyncIoError::Submit(_) | SyncIoError::Io(_) => extfs::BlockBackendError::Io,
+        let mut owned = vec![0u8; want].into_boxed_slice();
+        owned.copy_from_slice(&buf[..want]);
+        let range = BlockRange { lba, blocks: count };
+        self.dev
+            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .map_err(|_| extfs::BlockBackendError::Io)?;
+        Ok(())
     }
 }

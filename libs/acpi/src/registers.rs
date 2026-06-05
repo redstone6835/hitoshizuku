@@ -17,7 +17,11 @@ where
                 Some(gas) => Some(unsafe { MappedGas::map_gas(gas, &handler)? }),
                 None => None,
             };
-            Pm1EventRegisterBlock { pm1_event_length: fadt.pm1_event_length as usize, pm1a, pm1b }
+            Pm1EventRegisterBlock {
+                pm1_event_length: fadt.pm1_event_length as usize,
+                pm1a,
+                pm1b,
+            }
         };
         let pm1_control_registers = {
             let pm1a = unsafe { MappedGas::map_gas(fadt.pm1a_control_block()?, &handler)? };
@@ -28,7 +32,10 @@ where
             Pm1ControlRegisterBlock { pm1a, pm1b }
         };
 
-        Ok(FixedRegisters { pm1_event_registers, pm1_control_registers })
+        Ok(FixedRegisters {
+            pm1_event_registers,
+            pm1_control_registers,
+        })
     }
 }
 
@@ -91,7 +98,11 @@ where
         let pm1_len = self.pm1_event_length * 8;
 
         let pm1a = self.pm1a.read()?.get_bits(0..pm1_len);
-        let pm1b = if let Some(pm1b) = &self.pm1b { pm1b.read()?.get_bits(0..pm1_len) } else { 0 };
+        let pm1b = if let Some(pm1b) = &self.pm1b {
+            pm1b.read()?.get_bits(0..pm1_len)
+        } else {
+            0
+        };
 
         Ok(pm1a | pm1b)
     }
@@ -133,7 +144,11 @@ where
         };
 
         let pm1a = self.pm1a.read()?;
-        let pm1b = if let Some(ref pm1b) = self.pm1b { pm1b.read()? } else { 0 };
+        let pm1b = if let Some(ref pm1b) = self.pm1b {
+            pm1b.read()?
+        } else {
+            0
+        };
         let pm1 = pm1a | pm1b;
         Ok(pm1.get_bit(control_bit))
     }

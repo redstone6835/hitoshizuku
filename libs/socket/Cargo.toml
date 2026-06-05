@@ -1,0 +1,15 @@
+[package]
+name = "socket"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = true
+doctest = false
+bench = false
+
+[dependencies]
+sched = { path = "../sched" }
+
+[dev-dependencies]
+ktest = { path = "../ktest" }

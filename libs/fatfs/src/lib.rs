@@ -39,3 +39,6 @@ mod sync_layer;
 mod time;
 
 pub use state::{BlockBackend, BlockBackendError, FatFsDriver};
+
+#[cfg(test)]
+mod tests;

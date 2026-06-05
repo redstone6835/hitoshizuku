@@ -98,41 +98,16 @@ pub trait CharDriver: Send + Sync {
         }
         Ok(())
     }
-}
 
-// ─────────────────────────── 字符设备种类 ─────────────────────────────────
+    /// 设备是否具备 TTY/终端语义。覆盖返回 `true` 的设备会被 devtmpfs
+    /// 创建为可交互终端节点（支持 termios/ioctl/job control 等）。
+    fn is_tty(&self) -> bool {
+        false
+    }
 
-/// 字符设备的具体类型。
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CharDeviceKind {
-    /// 一般串口。
-    StandardSerial,
-    /// UART NS16550。
-    Ns16550,
-    /// 虚拟终端（VTY / PTY）。
-    VirtualTerminal,
-    /// 空设备（`/dev/null` 语义）。
-    Null,
-    /// 全零设备（`/dev/zero` 语义）。
-    Zero,
-    /// 随机数设备（`/dev/random` 语义）。
-    Random,
-    /// 内核控制台抽象设备。
-    Console,
-}
-
-impl CharDeviceKind {
-    pub fn name(&self) -> &'static str {
-        match self {
-            CharDeviceKind::StandardSerial => "serial",
-            CharDeviceKind::Ns16550 => "uart",
-            CharDeviceKind::VirtualTerminal => "vty",
-            CharDeviceKind::Null => "null",
-            CharDeviceKind::Zero => "zero",
-            CharDeviceKind::Random => "random",
-            CharDeviceKind::Console => "console",
-        }
+    /// 设备是否可作为内核控制台输出。
+    fn is_console(&self) -> bool {
+        false
     }
 }
 
@@ -146,7 +121,6 @@ pub enum CharDeviceState {
 }
 
 struct CharDeviceInner {
-    kind: CharDeviceKind,
     fw_name: &'static str,
     driver: &'static dyn CharDriver,
     state: AtomicU8,
@@ -199,14 +173,9 @@ impl CharDriver for ZeroCharDriver {
 
 impl CharDevice {
     #[inline]
-    pub fn new(
-        kind: CharDeviceKind,
-        fw_name: &'static str,
-        driver: &'static dyn CharDriver,
-    ) -> Self {
+    pub fn new(fw_name: &'static str, driver: &'static dyn CharDriver) -> Self {
         Self {
             inner: Arc::new(CharDeviceInner {
-                kind,
                 fw_name,
                 driver,
                 state: AtomicU8::new(CharDeviceState::Active as u8),
@@ -215,16 +184,23 @@ impl CharDevice {
     }
 
     pub fn null() -> Self {
-        Self::new(CharDeviceKind::Null, "null", &NULL_CHAR_DRIVER)
+        Self::new("null", &NULL_CHAR_DRIVER)
     }
 
     pub fn zero() -> Self {
-        Self::new(CharDeviceKind::Zero, "zero", &ZERO_CHAR_DRIVER)
+        Self::new("zero", &ZERO_CHAR_DRIVER)
     }
 
+    /// 是否具备 TTY 语义（终端）。委托至底层驱动。
     #[inline]
-    pub fn kind(&self) -> CharDeviceKind {
-        self.inner.kind
+    pub fn is_tty(&self) -> bool {
+        self.inner.driver.is_tty()
+    }
+
+    /// 是否可作为内核控制台输出。委托至底层驱动。
+    #[inline]
+    pub fn is_console(&self) -> bool {
+        self.inner.driver.is_console()
     }
 
     #[inline]
@@ -318,7 +294,7 @@ impl CharDevice {
 impl core::fmt::Debug for CharDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CharDev")
-            .field("kind", &self.kind())
+            .field("fw_name", &self.fw_name())
             .field("fw_name", &self.fw_name())
             .field("state", &self.state())
             .finish()

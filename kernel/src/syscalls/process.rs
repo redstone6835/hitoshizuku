@@ -4,10 +4,11 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use errno::Errno;
+use general::firmware::power;
 use general::mm::{copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::ids::{Gid, Uid};
+use sched::ids::{Capability, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
 use sched::task::{Task, TaskState};
@@ -17,6 +18,21 @@ const CLOCK_REALTIME: usize = 0;
 const CLOCK_MONOTONIC: usize = 1;
 const CLOCK_BOOTTIME: usize = 7;
 const MAX_CPUSET_BYTES: usize = 1024;
+
+const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
+const LINUX_REBOOT_MAGIC2: u32 = 672_274_793;
+const LINUX_REBOOT_MAGIC2A: u32 = 85_072_278;
+const LINUX_REBOOT_MAGIC2B: u32 = 369_367_448;
+const LINUX_REBOOT_MAGIC2C: u32 = 537_993_216;
+
+const LINUX_REBOOT_CMD_RESTART: u32 = 0x0123_4567;
+const LINUX_REBOOT_CMD_HALT: u32 = 0xcdef_0123;
+const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ab_cdef;
+const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x0000_0000;
+const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_fedc;
+const LINUX_REBOOT_CMD_RESTART2: u32 = 0xa1b2_c3d4;
+const LINUX_REBOOT_CMD_SW_SUSPEND: u32 = 0xd000_fce2;
+const LINUX_REBOOT_CMD_KEXEC: u32 = 0x4558_4543;
 
 pub(super) fn sys_getpid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(sched::operation::getpid() as usize)
@@ -125,6 +141,61 @@ pub(super) fn sys_execve(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     sched::operation::execve_with_context(request, UserContextRef::new(ctx.tf.as_usize()))?;
     ctx.finalize_frame();
     Ok(0)
+}
+
+pub(super) fn sys_reboot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let magic1 = ctx.args[0] as u32;
+    let magic2 = ctx.args[1] as u32;
+    let cmd = ctx.args[2] as u32;
+
+    if magic1 != LINUX_REBOOT_MAGIC1
+        || !matches!(
+            magic2,
+            LINUX_REBOOT_MAGIC2
+                | LINUX_REBOOT_MAGIC2A
+                | LINUX_REBOOT_MAGIC2B
+                | LINUX_REBOOT_MAGIC2C
+        )
+    {
+        return Err(Errno::EINVAL);
+    }
+
+    let creds = ctx.task.credentials();
+    if !creds.has_cap(Capability::SysBoot) {
+        return Err(Errno::EPERM);
+    }
+
+    match cmd {
+        LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
+        LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
+            log::emergency!("[syscall][reboot] restart requested");
+            power::reboot().map_err(map_power_error)?;
+            halt_after_power_request()
+        }
+        LINUX_REBOOT_CMD_HALT => {
+            log::emergency!("[syscall][reboot] halt requested");
+            power::shutdown().map_err(map_power_error)?;
+            halt_after_power_request()
+        }
+        LINUX_REBOOT_CMD_POWER_OFF => {
+            log::emergency!("[syscall][reboot] poweroff requested");
+            power::shutdown().map_err(map_power_error)?;
+            halt_after_power_request()
+        }
+        LINUX_REBOOT_CMD_SW_SUSPEND | LINUX_REBOOT_CMD_KEXEC => Err(Errno::EOPNOTSUPP),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn map_power_error(err: power::PowerError) -> Errno {
+    log::warning!("[syscall][reboot] power control failed: {:?}", err);
+    Errno::EOPNOTSUPP
+}
+
+fn halt_after_power_request() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 pub(super) fn sys_wait4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -341,7 +412,8 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
                 let remaining_ns = deadline.saturating_sub(now) as i64;
                 let rem_sec = remaining_ns / 1_000_000_000;
                 let rem_nsec = remaining_ns % 1_000_000_000;
-                let rem_buf = rem_sec.to_le_bytes()
+                let rem_buf = rem_sec
+                    .to_le_bytes()
                     .into_iter()
                     .chain(rem_nsec.to_le_bytes())
                     .collect::<Vec<_>>();
@@ -393,7 +465,8 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
                 let remaining_ns = deadline.saturating_sub(now) as i64;
                 let rem_sec = remaining_ns / 1_000_000_000;
                 let rem_nsec = remaining_ns % 1_000_000_000;
-                let rem_buf = rem_sec.to_le_bytes()
+                let rem_buf = rem_sec
+                    .to_le_bytes()
                     .into_iter()
                     .chain(rem_nsec.to_le_bytes())
                     .collect::<Vec<_>>();
@@ -951,9 +1024,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                     continue;
                 }
                 let mut cur = [0u8; 4];
-                if copy_from_user(uaddr, &mut cur).is_err()
-                    || u32::from_le_bytes(cur) != val
-                {
+                if copy_from_user(uaddr, &mut cur).is_err() || u32::from_le_bytes(cur) != val {
                     let mut table = FUTEX_TABLE.lock();
                     if let Some(bucket) = table.get_mut(&uaddr) {
                         bucket.waiters.retain(|w| !Arc::ptr_eq(w, &me));
@@ -1055,7 +1126,8 @@ fn put_i64(out: &mut [u8], off: usize, v: i64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
 
-static PRNG_STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0xDEAD_BEEF_CAFE_BABEu64);
+static PRNG_STATE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0xDEAD_BEEF_CAFE_BABEu64);
 
 fn prng_fill(buf: &mut [u8]) {
     let mut state = PRNG_STATE.load(core::sync::atomic::Ordering::Relaxed);

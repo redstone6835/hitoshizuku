@@ -773,7 +773,7 @@ pub fn deliver_pending_signals_with_context(user_ctx: UserContextRef) -> Option<
     }
 }
 
-fn apply_default_action(info: SigInfo) {
+pub fn apply_default_action(info: SigInfo) {
     match default_action(info.sig) {
         DefaultAction::Term | DefaultAction::Core => {
             // 用"被信号杀死"编码 exit status。

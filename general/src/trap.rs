@@ -98,6 +98,3 @@ pub enum TrapAction {
     Halt,
     Panic,
 }
-
-pub const ARCH_ID_RISCV64: usize = 1;
-pub const ARCH_ID_LOONGARCH64: usize = 2;

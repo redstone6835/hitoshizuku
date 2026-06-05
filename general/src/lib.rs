@@ -26,6 +26,7 @@ pub use start::*;
 pub use task::*;
 pub use trap::*;
 
+pub mod cmdline;
 pub mod console;
 pub mod dev;
 pub mod dtb;

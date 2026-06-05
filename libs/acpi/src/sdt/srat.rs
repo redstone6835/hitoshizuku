@@ -71,7 +71,10 @@ impl<'a> Iterator for SratEntryIter<'a> {
             let header = unsafe { *(self.pointer as *const EntryHeader) };
 
             if header.length as u32 > self.remaining_length {
-                warn!("Invalid entry of type {} in SRAT - extending past length of table. Ignoring", header.typ);
+                warn!(
+                    "Invalid entry of type {} in SRAT - extending past length of table. Ignoring",
+                    header.typ
+                );
                 return None;
             }
 
@@ -85,16 +88,24 @@ impl<'a> Iterator for SratEntryIter<'a> {
                     }));
                 }
                 1 => {
-                    return Some(SratEntry::MemoryAffinity(unsafe { &*(entry_pointer as *const MemoryAffinity) }));
+                    return Some(SratEntry::MemoryAffinity(unsafe {
+                        &*(entry_pointer as *const MemoryAffinity)
+                    }));
                 }
                 2 => {
                     return Some(SratEntry::LocalApicX2Affinity(unsafe {
                         &*(entry_pointer as *const LocalApicX2Affinity)
                     }));
                 }
-                3 => return Some(SratEntry::GiccAffinity(unsafe { &*(entry_pointer as *const GiccAffinity) })),
+                3 => {
+                    return Some(SratEntry::GiccAffinity(unsafe {
+                        &*(entry_pointer as *const GiccAffinity)
+                    }));
+                }
                 4 => {
-                    return Some(SratEntry::GicItsAffinity(unsafe { &*(entry_pointer as *const GicItsAffinity) }));
+                    return Some(SratEntry::GicItsAffinity(unsafe {
+                        &*(entry_pointer as *const GicItsAffinity)
+                    }));
                 }
                 5 => {
                     return Some(SratEntry::GicInitiatorAffinity(unsafe {

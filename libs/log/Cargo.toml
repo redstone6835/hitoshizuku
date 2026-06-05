@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-test = false
+test = true
 doctest = false
 bench = false
 
+[features]
+ktest-kernel = ["ktest/kernel"]
+
 [dependencies]
+ktest = { path = "../ktest", optional = true }
+
+[dev-dependencies]
+ktest = { path = "../ktest" }

@@ -1,6 +1,10 @@
 # 构建输出
 target/
 Cargo.lock
+kernel-la
+kernel-rv
+disk.img
+disk-la.img
 
 # IDE
 .idea
@@ -10,3 +14,5 @@ Cargo.lock
 .deepseek
 
 build
+userland/rootfs-la/bin/
+userland/rootfs-rv/bin/

@@ -90,7 +90,13 @@ fn load_user_image_from_path_inner(
     envp: &[String],
     shebang_depth: usize,
 ) -> Result<LoadedUserImage, errno::Errno> {
-    let bytes = load_file_from_task_vfs(task, path)?;
+    let bytes = match load_file_from_task_vfs(task, path) {
+        Ok(b) => b,
+        Err(e) => {
+            log::debug!("[user] load path={:?} read failed: {:?}", path, e);
+            return Err(e);
+        }
+    };
     if bytes.starts_with(b"#!") {
         let script = parse_shebang(path, argv, &bytes, shebang_depth)?;
         return load_user_image_from_path_inner(
@@ -102,7 +108,34 @@ fn load_user_image_from_path_inner(
         );
     }
 
-    let img = elf::parse(&bytes).map_err(|_| errno::Errno::ENOEXEC)?;
+    let img = match elf::parse(&bytes) {
+        Ok(i) => i,
+        Err(e) => {
+            log::debug!("[user] elf parse failed for {:?}: {:?}", path, e);
+            if bytes.len() >= 16 {
+                log::debug!(
+                    "[user]   first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                    bytes[4],
+                    bytes[5],
+                    bytes[6],
+                    bytes[7],
+                    bytes[8],
+                    bytes[9],
+                    bytes[10],
+                    bytes[11],
+                    bytes[12],
+                    bytes[13],
+                    bytes[14],
+                    bytes[15],
+                );
+            }
+            return Err(errno::Errno::ENOEXEC);
+        }
+    };
     if validate_user_image_result(&*img).is_err() {
         return Err(errno::Errno::ENOEXEC);
     }
@@ -471,9 +504,15 @@ fn read_u64_at(bytes: &[u8], off: usize) -> u64 {
 
 fn validate_user_image_result(img: &dyn Image<'_>) -> Result<(), ()> {
     if img.arch() != hal::platform::elf_arch() {
+        log::info!(
+            "[user] validate: arch mismatch got={:?} expect={:?}",
+            img.arch(),
+            hal::platform::elf_arch()
+        );
         return Err(());
     }
     if img.load_vaddr_range().is_none() {
+        log::info!("[user] validate: load_vaddr_range is None");
         return Err(());
     }
     Ok(())

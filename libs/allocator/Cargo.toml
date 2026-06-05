@@ -8,6 +8,10 @@ test = false
 doctest = false
 bench = false
 
+[features]
+ktest-kernel = ["ktest/kernel"]
+
 [dependencies]
 log = { path = "../log" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+ktest = { path = "../ktest", optional = true }

@@ -7,7 +7,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
+
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -68,11 +68,6 @@ impl DirInodeOps {
     /// 在 inode 指向的目录里查找名称(忽略大小写,先尝试用户原始名)。
     fn find_entry(&self, name: &str) -> VfsResult<Option<DirEntryView>> {
         dir::find_entry(&self.state, self.backing, name).map_err(backend_to_vfs)
-    }
-
-    fn collect_used_sfns(&self) -> VfsResult<Vec<[u8; 11]>> {
-        let entries = dir::read_all_entries(&self.state, self.backing).map_err(backend_to_vfs)?;
-        Ok(entries.into_iter().map(|e| e.short_name).collect())
     }
 }
 
@@ -190,10 +185,11 @@ impl InodeOps for DirInodeOps {
         if name.is_empty() || name == "." || name == ".." {
             return Err(VfsError::InvalidArgument);
         }
-        if self.find_entry(name)?.is_some() {
+        let (existing, used) =
+            dir::find_entry_and_sfns(&self.state, self.backing, name).map_err(backend_to_vfs)?;
+        if existing.is_some() {
             return Err(VfsError::AlreadyExists);
         }
-        let used = self.collect_used_sfns()?;
         let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
         let entry = dir::build_sfn_entry(sfn, ATTR_ARCHIVE, 0, 0);
         let sfn_slot = dir::insert_new_entry(&self.state, self.backing, &lfn_entries, &entry)
@@ -225,7 +221,9 @@ impl InodeOps for DirInodeOps {
         if name.is_empty() || name == "." || name == ".." {
             return Err(VfsError::InvalidArgument);
         }
-        if self.find_entry(name)?.is_some() {
+        let (existing, used) =
+            dir::find_entry_and_sfns(&self.state, self.backing, name).map_err(backend_to_vfs)?;
+        if existing.is_some() {
             return Err(VfsError::AlreadyExists);
         }
         let new_c = self.state.alloc_cluster(None).map_err(backend_to_vfs)?;
@@ -262,7 +260,6 @@ impl InodeOps for DirInodeOps {
             dir::write_slot(&self.state, new_backing, 0, &dot_entry).map_err(backend_to_vfs)?;
             dir::write_slot(&self.state, new_backing, 1, &dotdot_entry).map_err(backend_to_vfs)?;
 
-            let used = self.collect_used_sfns()?;
             let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
             let entry = dir::build_sfn_entry(sfn, ATTR_DIRECTORY, new_c, 0);
             let sfn_slot = dir::insert_new_entry(&self.state, self.backing, &lfn_entries, &entry)
@@ -366,7 +363,11 @@ impl InodeOps for DirInodeOps {
             return Err(VfsError::CrossDevice);
         }
         // 如果新名字已存在则覆盖(unlink 之);本实现拒绝覆盖目录。
-        if let Some(existing) = new_dir_ops.find_entry(new_name)? {
+        // 单次扫描同时检测冲突 + 收集 SFN
+        let (existing, mut used) =
+            dir::find_entry_and_sfns(&self.state, new_dir_ops.backing, new_name)
+                .map_err(backend_to_vfs)?;
+        if let Some(existing) = existing {
             if existing.is_dir() {
                 return Err(VfsError::IsADirectory);
             }
@@ -382,9 +383,9 @@ impl InodeOps for DirInodeOps {
                 existing.slot_sfn,
             )
             .map_err(backend_to_vfs)?;
+            used.retain(|s| *s != existing.short_name);
         }
         // 在目标目录写新条目
-        let used = new_dir_ops.collect_used_sfns()?;
         let (sfn, lfn_entries) = dir::build_entries_for_name(new_name, &used);
         let attr = entry.attr;
         let new_entry = dir::build_sfn_entry(sfn, attr, entry.first_cluster, entry.size);

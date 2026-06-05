@@ -103,6 +103,10 @@ pub const CSR_ECFG_VS_MASK: usize = ((1usize << CSR_ECFG_VS_WIDTH) - 1) << CSR_E
 
 // CSR_EUEN 寄存器中扩展功能使能位字段定义。
 pub const EUEN_FPE: usize = 0x1;
+
+/// EUEN bit 4（保留位）：内核内部标志，记录异常入口时是否保存了 FPU 上下文。
+/// 写入 CSR_EUEN 前必须清除。
+pub const FPU_SAVED: usize = 0x10;
 pub const EUEN_SXE: usize = 0x2;
 pub const EUEN_ASXE: usize = 0x4;
 pub const EUEN_BTE: usize = 0x8;
@@ -343,9 +347,12 @@ pub const ARCH_ID_LOONGARCH64: usize = 2;
 /// 核心的内核异常栈栈顶。
 pub const PER_CPU_KSTACK_OFFSET: usize = 0;
 
+/// 默认定时器中断频率（Hz）。可通过内核命令行 `timer_hz=N` 覆盖。
+pub const DEFAULT_TIMER_HZ: usize = 100;
+
 #[inline]
 /// 读取稳定计数器并换算为纳秒。
-///
+
 /// `rdtime.d` 返回的是硬件计数器值，不是直接的时间单位。这里结合平台初始化阶段探测
 /// 得到的稳定频率，把计数值换算成纳秒时间戳。
 pub fn kernel_timestamp_ns() -> u64 {

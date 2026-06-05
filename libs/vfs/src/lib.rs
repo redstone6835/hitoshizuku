@@ -9,17 +9,22 @@ extern crate alloc;
 
 pub use alloc::sync::Arc;
 
+pub mod addr;
 pub mod cred;
 pub mod dentry;
+pub mod epoll;
 pub mod error;
 pub mod fdtable;
 pub mod file;
 pub mod inode;
 pub mod limits;
 pub mod mount;
+pub mod net_socket;
+pub mod netlink_socket;
 pub mod operation;
 pub mod path;
 pub mod pipe;
+pub mod socket;
 pub mod stat;
 pub mod superblock;
 pub mod sync;
@@ -179,3 +184,6 @@ impl VfsContext {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

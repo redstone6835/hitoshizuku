@@ -4,9 +4,7 @@
 //!
 //! ```text
 //! devices()               → &'static DeviceList
-//!   ├── .char_devs        → CharDevList   （动态字符设备注册表）
-//!   │     每项: CharDev 共享句柄
-//!   └── .block_devs       → BlockDevList  （动态块设备注册表）
+//!   └── .functions        → FunctionRegistry（开放设备 function 注册表）
 //! ```
 //!
 //! # PnP 设备与驱动
@@ -16,49 +14,40 @@
 //! PNP_DRIVERS             → PnpDriverRegistry（PnP 驱动注册表）
 //! ```
 //!
-//! # 注册字符设备
-//!
-//! ```rust,ignore
-//! use general::dev::{char::{CharDev, CharDevKind}, enumerate::DEVICES, drivers::Uart16550};
-//!
-//! let uart: &'static Uart16550 = /* ... */;
-//! DEVICES
-//!     .char_devs
-//!     .push(CharDev::new(CharDevKind::Ns16550, "serial@9000000", uart))
-//!     .expect("char dev registration failed");
-//! ```
-//!
-//! # 遍历所有字符设备
-//!
-//! ```rust,ignore
-//! use general::dev::enumerate::DEVICES;
-//!
-//! for dev in DEVICES.char_devs.iter() {
-//!     println!("{:?} -> {}", dev.kind(), dev.fw_name());
-//! }
-//! ```
+//! 固件或总线发现路径只注册 `PnpDevice`。具体驱动通过 PnP probe 认领设备，
+//! 创建对应 function 并调用 `PnpDevice::register_function()`。
 
 // ─────────────────────────── 顶层设备列表 ─────────────────────────────────
 
-use crate::dev::*;
+use alloc::sync::Arc;
+
+use crate::dev::function::{DeviceFunction, FunctionRegistry, FunctionRegistryError};
 
 /// 全局设备列表，包含各类设备的对象注册表。
 ///
 /// 此层只管理"已注册的设备对象"，不再维护设备号分配或
 /// `major/minor -> driver` 映射。
 pub struct DeviceList {
-    /// 字符设备子列表。
-    pub char_devs: char::CharDeviceList,
-    /// 块设备子列表。
-    pub block_devs: block::BlockDeviceList,
+    /// 开放设备 function 注册表。
+    pub functions: FunctionRegistry,
 }
 
 impl DeviceList {
     const fn new() -> Self {
         Self {
-            char_devs: char::CharDeviceList::new(),
-            block_devs: block::BlockDeviceList::new(),
+            functions: FunctionRegistry::new(),
         }
+    }
+
+    pub fn register_function(
+        &self,
+        func: Arc<dyn DeviceFunction>,
+    ) -> Result<(), FunctionRegistryError> {
+        self.functions.push(func)
+    }
+
+    pub fn unregister_function(&self, func: &Arc<dyn DeviceFunction>) {
+        let _ = self.functions.remove(func.class_id(), func.dev_name());
     }
 }
 

@@ -15,7 +15,7 @@
 //!   父子进程共享 `File` 对象（即共享偏移量）；`clone(CLONE_FILES)` 则共享同
 //!   一个 `FdTable` 引用，此时需要在整张表上加锁，此处暂不支持（留待扩展）。
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use crate::vfs::error::{VfsError, VfsResult};
@@ -96,6 +96,10 @@ struct FdEntry {
     flags: FdFlags,
 }
 
+fn notify_fd_closed(fd: u32, entry: &FdEntry) {
+    entry.file.on_fd_closed(fd);
+}
+
 #[inline]
 const fn bitmap_words(limit: u32) -> usize {
     (limit as usize).div_ceil(64)
@@ -121,6 +125,8 @@ struct FdTableInner {
     hard_limit: u32,
     /// fd 分配位图：第 i 位为 1 表示 fd=i 已被占用。
     bitmap: Vec<u64>,
+    /// 观察本 fdtable 中 fd 关闭/替换事件的文件（典型是 epoll fd）。
+    close_observers: Vec<Weak<File>>,
 }
 
 impl FdTableInner {
@@ -131,6 +137,7 @@ impl FdTableInner {
             limit,
             hard_limit,
             bitmap: alloc::vec![0u64; bitmap_words(hard_limit)],
+            close_observers: Vec::new(),
         }
     }
 
@@ -265,6 +272,41 @@ impl FdTable {
         Ok(Fd(fd))
     }
 
+    pub fn register_close_observer(&self, file: &Arc<File>) {
+        let mut inner = self.inner.lock();
+        inner
+            .close_observers
+            .retain(|weak| weak.upgrade().is_some());
+        if inner.close_observers.iter().any(|weak| {
+            weak.upgrade()
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, file))
+        }) {
+            return;
+        }
+        inner.close_observers.push(Arc::downgrade(file));
+    }
+
+    fn notify_fd_closed(&self, fd: u32, entry: &FdEntry) {
+        notify_fd_closed(fd, entry);
+        let observers = {
+            let mut inner = self.inner.lock();
+            let mut observers = Vec::new();
+            inner.close_observers.retain(|weak| {
+                if let Some(file) = weak.upgrade() {
+                    observers.push(file);
+                    true
+                } else {
+                    false
+                }
+            });
+            observers
+        };
+        for observer in observers {
+            observer.on_fd_closed(fd);
+        }
+    }
+
     /// 在指定 fd 编号上安装 `file`（用于 `dup2`/`dup3`/标准 fd 初始化）。
     pub fn install_fd(&self, fd: Fd, file: Arc<File>, flags: FdFlags) -> VfsResult<()> {
         let fd = fd.0;
@@ -275,6 +317,9 @@ impl FdTable {
             }
             inner.insert(fd, FdEntry { file, flags })
         };
+        if let Some(old) = old.as_ref() {
+            self.notify_fd_closed(fd, old);
+        }
         drop(old);
         Ok(())
     }
@@ -282,9 +327,11 @@ impl FdTable {
     /// 关闭指定 fd。
     pub fn close_fd(&self, fd: Fd) -> VfsResult<()> {
         let removed = self.inner.lock().remove(fd.0);
-        if removed.is_none() {
+        let Some(removed) = removed else {
             return Err(VfsError::BadFileDescriptor);
-        }
+        };
+        self.notify_fd_closed(fd.0, &removed);
+        drop(removed);
         Ok(())
     }
 
@@ -341,6 +388,9 @@ impl FdTable {
                 .ok_or(VfsError::BadFileDescriptor)?;
             inner.insert(new_fd.0, FdEntry { file, flags })
         };
+        if let Some(replaced) = replaced.as_ref() {
+            self.notify_fd_closed(new_fd.0, replaced);
+        }
         drop(replaced);
         Ok(new_fd)
     }
@@ -391,7 +441,7 @@ impl FdTable {
         // 栈上固定大小缓冲区，避免按硬限制做线性堆分配。
         // 无论进程硬限制多大，每轮都只在锁外批量 drop 最多 64 个条目。
         const BATCH: usize = 64;
-        let mut batch_buf: [Option<FdEntry>; BATCH] = core::array::from_fn(|_| None);
+        let mut batch_buf: [Option<(u32, FdEntry)>; BATCH] = core::array::from_fn(|_| None);
 
         loop {
             let mut batch_count = 0;
@@ -409,7 +459,7 @@ impl FdTable {
                             && entry.flags.has(FdFlags::CLOEXEC)
                             && let Some(removed) = inner.remove(fd)
                         {
-                            batch_buf[batch_count] = Some(removed);
+                            batch_buf[batch_count] = Some((fd, removed));
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -423,12 +473,32 @@ impl FdTable {
             }
             // 锁已释放，安全 drop
             for entry in batch_buf[..batch_count].iter_mut() {
-                drop(entry.take());
+                if let Some((fd, entry)) = entry.take() {
+                    self.notify_fd_closed(fd, &entry);
+                    drop(entry);
+                }
             }
             if batch_count < BATCH {
                 break; // 没有更多 CLOEXEC fd
             }
         }
+    }
+
+    pub fn snapshot_fds(&self) -> Vec<(u32, Arc<File>)> {
+        let inner = self.inner.lock();
+        let mut out = Vec::with_capacity(inner.count);
+        for (i, &word) in inner.bitmap.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                let fd = i as u32 * 64 + bit;
+                w &= w - 1;
+                if let Some(entry) = inner.get(fd) {
+                    out.push((fd, Arc::clone(&entry.file)));
+                }
+            }
+        }
+        out
     }
 
     /// 返回当前打开的描述符数量。
@@ -455,7 +525,7 @@ impl FdTable {
 
     pub fn close_range(&self, first: u32, last: u32, cloexec_only: bool) {
         const BATCH: usize = 64;
-        let mut batch_buf: [Option<FdEntry>; BATCH] = core::array::from_fn(|_| None);
+        let mut batch_buf: [Option<(u32, FdEntry)>; BATCH] = core::array::from_fn(|_| None);
         loop {
             let mut batch_count = 0;
             {
@@ -482,7 +552,7 @@ impl FdTable {
                             }
                         }
                         if let Some(removed) = inner.remove(fd) {
-                            batch_buf[batch_count] = Some(removed);
+                            batch_buf[batch_count] = Some((fd, removed));
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -495,7 +565,10 @@ impl FdTable {
                 }
             }
             for entry in batch_buf[..batch_count].iter_mut() {
-                drop(entry.take());
+                if let Some((fd, entry)) = entry.take() {
+                    self.notify_fd_closed(fd, &entry);
+                    drop(entry);
+                }
             }
             if batch_count < BATCH {
                 break;
@@ -523,6 +596,7 @@ impl FdTable {
                 limit: inner.limit,
                 hard_limit: inner.hard_limit,
                 bitmap: inner.bitmap.clone(),
+                close_observers: inner.close_observers.clone(),
             }),
         }
     }

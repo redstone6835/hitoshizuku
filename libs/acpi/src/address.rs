@@ -139,9 +139,17 @@ where
             AddressSpace::SystemMemory => {
                 // TODO: how to know total size needed?
                 let mapping = unsafe { handler.map_physical_region(gas.address as usize, 0x1000) };
-                Ok(MappedGas { gas, handler: handler.clone(), mapping: Some(mapping) })
+                Ok(MappedGas {
+                    gas,
+                    handler: handler.clone(),
+                    mapping: Some(mapping),
+                })
             }
-            AddressSpace::SystemIo => Ok(MappedGas { gas, handler: handler.clone(), mapping: None }),
+            AddressSpace::SystemIo => Ok(MappedGas {
+                gas,
+                handler: handler.clone(),
+                mapping: None,
+            }),
             other => {
                 warn!("Tried to map GAS of unsupported type {:?}", other);
                 Err(AcpiError::LibUnimplemented)
@@ -159,10 +167,20 @@ where
             AddressSpace::SystemMemory => {
                 let mapping = self.mapping.as_ref().unwrap();
                 let value = match access_size_bits {
-                    8 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u8) as u64 },
-                    16 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u16) as u64 },
-                    32 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u32) as u64 },
-                    64 => unsafe { core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u64) },
+                    8 => unsafe {
+                        core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u8) as u64
+                    },
+                    16 => unsafe {
+                        core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u16)
+                            as u64
+                    },
+                    32 => unsafe {
+                        core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u32)
+                            as u64
+                    },
+                    64 => unsafe {
+                        core::ptr::read_volatile(mapping.virtual_start.as_ptr() as *const u64)
+                    },
                     _ => panic!(),
                 };
                 Ok(value)
@@ -191,21 +209,35 @@ where
                         core::ptr::write_volatile(mapping.virtual_start.as_ptr(), value as u8);
                     },
                     16 => unsafe {
-                        core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u16, value as u16);
+                        core::ptr::write_volatile(
+                            mapping.virtual_start.as_ptr() as *mut u16,
+                            value as u16,
+                        );
                     },
                     32 => unsafe {
-                        core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u32, value as u32);
+                        core::ptr::write_volatile(
+                            mapping.virtual_start.as_ptr() as *mut u32,
+                            value as u32,
+                        );
                     },
-                    64 => unsafe { core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u64, value) },
+                    64 => unsafe {
+                        core::ptr::write_volatile(mapping.virtual_start.as_ptr() as *mut u64, value)
+                    },
                     _ => panic!(),
                 }
                 Ok(())
             }
             AddressSpace::SystemIo => {
                 match access_size_bits {
-                    8 => self.handler.write_io_u8(self.gas.address as u16, value as u8),
-                    16 => self.handler.write_io_u16(self.gas.address as u16, value as u16),
-                    32 => self.handler.write_io_u32(self.gas.address as u16, value as u32),
+                    8 => self
+                        .handler
+                        .write_io_u8(self.gas.address as u16, value as u8),
+                    16 => self
+                        .handler
+                        .write_io_u16(self.gas.address as u16, value as u16),
+                    32 => self
+                        .handler
+                        .write_io_u32(self.gas.address as u16, value as u32),
                     _ => panic!(),
                 }
                 Ok(())

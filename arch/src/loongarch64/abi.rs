@@ -126,24 +126,18 @@ pub fn decode_mount_flags(raw: u32) -> MountFlags {
 
 // ── 字符设备号映射 ────────────────────────────────────────────────────────────
 
-/// 将 [`general::dev::char::CharDeviceKind`] 映射到 Linux 标准 major/minor 号。
+/// 将字符设备映射到 Linux 标准 major/minor 号。
 ///
-/// Linux 字符设备号（`<linux/major.h>`）是 ABI 知识，只允许存在于 `arch/` 层。
-/// VFS 层通过 [`general::vfs::stat::DevId`] 表示设备号，不感知具体数值。
-pub fn char_dev_kind_to_dev_id(
-    kind: general::dev::char::CharDeviceKind,
-) -> general::vfs::stat::DevId {
-    use general::dev::char::CharDeviceKind;
+/// 通过 `fw_name` + 驱动能力（`is_tty()`）判定，不再依赖闭枚举。
+/// 新设备类型无需改此函数——未识别设备默认分配 major=0。
+pub fn char_dev_to_dev_id(dev: &general::dev::char::CharDevice) -> general::vfs::stat::DevId {
     use general::vfs::stat::DevId;
-    match kind {
-        CharDeviceKind::Null => DevId::new(1, 3),
-        CharDeviceKind::Zero => DevId::new(1, 5),
-        CharDeviceKind::Random => DevId::new(1, 8),
-        CharDeviceKind::Console => DevId::new(5, 1),
-        CharDeviceKind::StandardSerial => DevId::new(4, 64),
-        CharDeviceKind::Ns16550 => DevId::new(4, 64),
-        CharDeviceKind::VirtualTerminal => DevId::new(4, 1),
-        // #[non_exhaustive]：未来新增的 CharDevKind 变体默认分配 major=0（未知设备）
+    match dev.fw_name() {
+        "null" => DevId::new(1, 3),
+        "zero" => DevId::new(1, 5),
+        "random" | "urandom" => DevId::new(1, 8),
+        "console" => DevId::new(5, 1),
+        _ if dev.is_tty() => DevId::new(4, 64),
         _ => DevId::new(0, 0),
     }
 }

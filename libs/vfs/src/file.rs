@@ -24,9 +24,10 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use errno::Errno;
+use sched::Task;
 
 use crate::vfs::dentry::SmallStr;
 
@@ -137,6 +138,8 @@ impl PollEvents {
     pub const POLLHUP: Self = Self(0x0010);
     /// 描述符无效（仅在 `revents` 中出现，通常表示传入了无效的 fd）。
     pub const POLLNVAL: Self = Self(0x0020);
+    /// 对端关闭写半边（Linux POLLRDHUP / EPOLLRDHUP）。
+    pub const POLLRDHUP: Self = Self(0x2000);
 
     /// 将两个事件掩码合并。
     pub const fn with(self, other: Self) -> Self {
@@ -161,6 +164,36 @@ impl PollEvents {
     /// 判断是否没有任何事件就绪。
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct StatusFlags(u32);
+
+impl StatusFlags {
+    const APPEND: u32 = 1 << 0;
+    const NONBLOCK: u32 = 1 << 1;
+    const SYNC: u32 = 1 << 2;
+
+    fn from_open_options(opts: OpenOptions) -> Self {
+        let mut bits = 0u32;
+        if opts.append {
+            bits |= Self::APPEND;
+        }
+        if opts.nonblock {
+            bits |= Self::NONBLOCK;
+        }
+        if opts.sync {
+            bits |= Self::SYNC;
+        }
+        Self(bits)
+    }
+
+    fn apply(self, mut opts: OpenOptions) -> OpenOptions {
+        opts.append = (self.0 & Self::APPEND) != 0;
+        opts.nonblock = (self.0 & Self::NONBLOCK) != 0;
+        opts.sync = (self.0 & Self::SYNC) != 0;
+        opts
     }
 }
 
@@ -266,6 +299,9 @@ pub struct File {
     /// 后续 I/O 操作只依据此字段判断权限，不再重新查询路径。
     pub(crate) flags: OpenOptions,
 
+    /// 可通过 `fcntl(F_SETFL)` 变更的状态位（当前支持 APPEND/NONBLOCK/SYNC）。
+    status_flags: AtomicU32,
+
     /// 当前文件读写偏移量（字节），受自旋锁保护。
     ///
     /// 文件读写偏移量。
@@ -316,6 +352,7 @@ impl File {
         Self {
             inode,
             flags,
+            status_flags: AtomicU32::new(StatusFlags::from_open_options(flags).0),
             pos: AtomicU64::new(0),
             cred,
             ops,
@@ -329,6 +366,11 @@ impl File {
         &self.mount
     }
 
+    /// 返回此文件对应的 Dentry。
+    pub fn dentry(&self) -> &Arc<crate::vfs::dentry::Dentry> {
+        &self.dentry
+    }
+
     /// 返回当前读写偏移量。
     pub fn pos(&self) -> u64 {
         self.pos.load(Ordering::Acquire)
@@ -336,7 +378,21 @@ impl File {
 
     /// 返回打开选项。
     pub fn flags(&self) -> OpenOptions {
-        self.flags
+        StatusFlags(self.status_flags.load(Ordering::Acquire)).apply(self.flags)
+    }
+
+    pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool) {
+        let mut bits = 0u32;
+        if append {
+            bits |= StatusFlags::APPEND;
+        }
+        if nonblock {
+            bits |= StatusFlags::NONBLOCK;
+        }
+        if sync {
+            bits |= StatusFlags::SYNC;
+        }
+        self.status_flags.store(bits, Ordering::Release);
     }
 
     /// 返回打开时冻结的凭据。
@@ -387,6 +443,9 @@ impl File {
         if !self.flags.readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
+        if !self.ops.is_seekable() {
+            return Err(crate::vfs::error::VfsError::IllegalSeek);
+        }
         self.ops.read_at(buf, offset)
     }
 
@@ -394,6 +453,9 @@ impl File {
     pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         if !self.flags.writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        if !self.ops.is_seekable() {
+            return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
         self.ops.write_at(buf, offset)
     }
@@ -505,6 +567,26 @@ impl File {
         ready.intersect(interest.with(always))
     }
 
+    pub fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
+        self.ops.poll_add_waiter(task, interest)
+    }
+
+    pub fn poll_remove_waiter(&self, task: &Arc<Task>) {
+        self.ops.poll_remove_waiter(task)
+    }
+
+    pub fn on_fd_closed(&self, fd: u32) {
+        self.ops.on_fd_closed(fd)
+    }
+
+    pub fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
+        self.ops.io_timeout_deadline(interest)
+    }
+
+    pub fn is_seekable(&self) -> bool {
+        self.ops.is_seekable()
+    }
+
     /// 执行设备或文件系统特定的控制命令（`ioctl(2)`）。
     pub fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         if self.flags.path_only {
@@ -612,6 +694,36 @@ pub trait FileOps {
     /// 返回当前已就绪的事件掩码。驱动应结合内部状态（接收缓冲区是否有数据、
     /// 发送缓冲区是否有空间等）决定返回哪些事件。若无就绪事件，返回空掩码。
     fn poll(&self, interest: PollEvents) -> PollEvents;
+
+    /// 将一个任务登记为当前文件的 I/O 等待者。
+    ///
+    /// 返回 `true` 表示实现方已经把该任务挂到了自身等待源上，调用方随后可以睡眠；
+    /// 返回 `false` 表示该文件类型没有专门的唤醒机制，调用方需要自行退化处理。
+    fn poll_add_waiter(&self, _task: &Arc<Task>, _interest: PollEvents) -> bool {
+        false
+    }
+
+    /// 显式移除之前登记的等待者。
+    fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
+
+    /// 某个 fd 号从 fdtable 中关闭或被替换时调用。
+    ///
+    /// 这是描述符级通知，不等同于 [`FileOps::release`]；同一个 `File` 可能仍被
+    /// 其他 dup 出来的 fd 或 epoll/SCM_RIGHTS 持有。
+    fn on_fd_closed(&self, _fd: u32) {}
+
+    /// 返回普通 read/write 等待对应的超时 deadline。
+    ///
+    /// `poll(2)`/`epoll_wait(2)` 的显式 timeout 不走这里；这个 hook 只服务于
+    /// socket `SO_RCVTIMEO`/`SO_SNDTIMEO` 这类描述符自身的阻塞 I/O 超时。
+    fn io_timeout_deadline(&self, _interest: PollEvents) -> Option<u64> {
+        None
+    }
+
+    /// 是否支持 `lseek(2)`。
+    fn is_seekable(&self) -> bool {
+        true
+    }
 
     /// 执行文件或设备控制命令。
     ///

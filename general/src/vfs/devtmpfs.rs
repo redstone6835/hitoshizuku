@@ -2,17 +2,17 @@
 //!
 //! # 设计要点
 //!
-//! 设备节点的 inode 直接持有设备对象引用（`CharDev` 或 `Arc<BlockDev>`），
+//! 设备节点的 inode 直接持有设备对象引用（`CharDevice` 或 `Arc<BlockDevice>`），
 //! 而非设备名称字符串。`open()` 时零查找：已在绑定时解析，运行时直接调用。
 //!
 //! ```text
-//! bind_char("uart0", dev: CharDev)
+//! bind_char("uart0", dev: CharDevice)
 //!   └─ 创建 Inode，InodeOps = DevCharOps { dev }
-//!         └─ open() → CharDevAdapter::new(dev)   // 无查找，直接构造
+//!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //!
-//! bind_block("vda", dev: Arc<BlockDev>)
-//!   └─ 创建 Inode，InodeOps = DevBlockOps { dev: Arc<BlockDev> }
-//!         └─ open() → BlockDevAdapter::new(dev)  // 无查找，直接构造
+//! bind_block("vda", dev: Arc<BlockDevice>)
+//!   └─ 创建 Inode，InodeOps = DevBlockOps { dev: Arc<BlockDevice> }
+//!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //! ```
 //!
 //! # 文件系统结构
@@ -26,6 +26,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -33,7 +34,7 @@ use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use errno::Errno;
-use sched::operation as sched_operation;
+use sched::operation;
 use vfs::cred::{Credentials, Gid, Uid};
 use vfs::dentry::{Dentry, SmallStr};
 use vfs::error::{VfsError, VfsResult};
@@ -44,16 +45,64 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::dev::block::{
-    BlockCompletion, BlockDevice, BlockFeatures, BlockIoCompletion, BlockIoError, BlockIoRequest,
-    BlockRange, BlockSubmitError,
-};
-use crate::dev::char::{CharDevice, CharDeviceKind, CharIoError};
+use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
+use crate::dev::block::{BlockDevice, BlockFeatures};
+use crate::dev::char::{CharDevice, CharIoError};
+use crate::dev::function::DevNodeSpec;
+use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
 use crate::mm::{copy_from_user, copy_to_user};
 
 // ───────── 全局实例计数器 ─────────
 
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+static PNP_DEVTMPFS_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
+
+/// 安装 PnP 到 devtmpfs 的桥接。
+///
+/// 安装后，PnpDevice 注册带 [`DevNodeSpec`] 的 function 时，会自动在这个
+/// devtmpfs superblock 中创建或删除对应 `/dev` 节点。桥接只消费 `DevNodeSpec`
+/// 携带的设备对象，不 downcast 具体 function 类型。
+pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
+    dev_sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+
+    let sb_leaked: &'static Arc<Superblock> = Box::leak(Box::new(dev_sb));
+    *PNP_DEVTMPFS_SB.lock() = Some(sb_leaked);
+    set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
+        bind: pnp_bind_cb,
+        unbind: pnp_unbind_cb,
+    });
+    Ok(())
+}
+
+fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
+    PNP_DEVTMPFS_SB.lock().ok_or(PnpError::NoDevtmpfs)
+}
+
+fn pnp_bind_cb(spec: &DevNodeSpec) -> Result<(), PnpError> {
+    let sb = pnp_devtmpfs_sb()?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+    match spec {
+        DevNodeSpec::Char { name, dev } => ops
+            .bind_char(name.as_ref(), dev.clone())
+            .map_err(|_| PnpError::DevtmpfsError),
+        DevNodeSpec::Block { name, dev } => ops
+            .bind_block(name.as_ref(), Arc::clone(dev))
+            .map_err(|_| PnpError::DevtmpfsError),
+    }
+}
+
+fn pnp_unbind_cb(name: &str) -> Result<(), PnpError> {
+    let sb = pnp_devtmpfs_sb()?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+    ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
+}
 
 // ───────── 字符设备 FileOps（内联适配器） ─────────
 
@@ -120,6 +169,24 @@ const BLKGETDISKSEQ: usize =
 const LINUX_TERMIOS_LEN: usize = 36;
 const LINUX_TERMIOS2_LEN: usize = 44;
 const LINUX_WINSIZE_LEN: usize = 8;
+const NCCS_OFFSET: usize = 17;
+const NCCS_VINTR: usize = 0;
+const NCCS_VQUIT: usize = 1;
+const NCCS_VERASE: usize = 2;
+const NCCS_VKILL: usize = 3;
+const NCCS_VEOF: usize = 4;
+const NCCS_VTIME: usize = 5;
+const NCCS_VMIN: usize = 6;
+
+const ICRNL: u32 = 0x0100;
+const IXON: u32 = 0x0400;
+const OPOST: u32 = 0x0001;
+const ONLCR: u32 = 0x0004;
+const ISIG: u32 = 0x0001;
+const ICANON: u32 = 0x0002;
+const ECHO: u32 = 0x0008;
+const ECHOE: u32 = 0x0010;
+const ECHOK: u32 = 0x0020;
 
 #[derive(Clone, Copy)]
 struct LinuxTermios {
@@ -152,6 +219,82 @@ impl LinuxTermios {
         put_u32(&mut out, 36, 38400);
         put_u32(&mut out, 40, 38400);
         out
+    }
+
+    fn iflag(&self) -> u32 {
+        u32::from_le_bytes(self.raw[0..4].try_into().unwrap())
+    }
+
+    fn oflag(&self) -> u32 {
+        u32::from_le_bytes(self.raw[4..8].try_into().unwrap())
+    }
+
+    fn lflag(&self) -> u32 {
+        u32::from_le_bytes(self.raw[12..16].try_into().unwrap())
+    }
+
+    fn cc(&self, index: usize) -> u8 {
+        self.raw[NCCS_OFFSET + index]
+    }
+
+    fn canonical(&self) -> bool {
+        (self.lflag() & ICANON) != 0
+    }
+
+    fn echo(&self) -> bool {
+        (self.lflag() & ECHO) != 0
+    }
+
+    fn echoe(&self) -> bool {
+        (self.lflag() & ECHOE) != 0
+    }
+
+    fn echok(&self) -> bool {
+        (self.lflag() & ECHOK) != 0
+    }
+
+    fn isig(&self) -> bool {
+        (self.lflag() & ISIG) != 0
+    }
+
+    fn icrnl(&self) -> bool {
+        (self.iflag() & ICRNL) != 0
+    }
+
+    fn ixon(&self) -> bool {
+        (self.iflag() & IXON) != 0
+    }
+
+    fn opost_onlcr(&self) -> bool {
+        (self.oflag() & (OPOST | ONLCR)) == (OPOST | ONLCR)
+    }
+
+    fn vintr(&self) -> u8 {
+        self.cc(NCCS_VINTR)
+    }
+
+    fn vquit(&self) -> u8 {
+        self.cc(NCCS_VQUIT)
+    }
+
+    fn verase(&self) -> u8 {
+        self.cc(NCCS_VERASE)
+    }
+
+    fn vkill(&self) -> u8 {
+        self.cc(NCCS_VKILL)
+    }
+
+    fn veof(&self) -> u8 {
+        self.cc(NCCS_VEOF)
+    }
+
+    fn vtime(&self) -> u8 {
+        self.cc(NCCS_VTIME)
+    }
+
+    fn vmin(&self) -> u8 {
+        self.cc(NCCS_VMIN)
     }
 }
 
@@ -226,12 +369,28 @@ fn put_u32(out: &mut [u8], off: usize, value: u32) {
     out[off..off + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+#[derive(Default)]
+struct TtyLineState {
+    line: Vec<u8>,
+    ready: VecDeque<u8>,
+    eof_pending: bool,
+}
+
+impl TtyLineState {
+    fn clear(&mut self) {
+        self.line.clear();
+        self.ready.clear();
+        self.eof_pending = false;
+    }
+}
+
 struct CharDevFileOps {
     dev: CharDevice,
     nonblock: AtomicBool,
     termios: Spinlock<LinuxTermios>,
     winsize: Spinlock<LinuxWinSize>,
     foreground_pgrp: Spinlock<i32>,
+    line_state: Spinlock<TtyLineState>,
 }
 
 impl CharDevFileOps {
@@ -242,17 +401,12 @@ impl CharDevFileOps {
             termios: Spinlock::new(LinuxTermios::new_default()),
             winsize: Spinlock::new(LinuxWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
+            line_state: Spinlock::new(TtyLineState::default()),
         }
     }
 
     fn is_tty(&self) -> bool {
-        matches!(
-            self.dev.kind(),
-            CharDeviceKind::StandardSerial
-                | CharDeviceKind::Ns16550
-                | CharDeviceKind::VirtualTerminal
-                | CharDeviceKind::Console
-        )
+        self.dev.is_tty()
     }
 
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
@@ -260,7 +414,182 @@ impl CharDevFileOps {
         if stored > 0 {
             Ok(stored)
         } else {
-            sched_operation::getpgid(0)
+            operation::getpgid(0)
+        }
+    }
+
+    fn write_tty_bytes(&self, buf: &[u8], termios: LinuxTermios) -> VfsResult<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if !termios.opost_onlcr() {
+            return self.dev.write_all(buf).map_err(map_char_err);
+        }
+
+        let mut cooked = Vec::with_capacity(buf.len());
+        for &byte in buf {
+            if byte == b'\n' {
+                cooked.push(b'\r');
+                cooked.push(b'\n');
+            } else {
+                cooked.push(byte);
+            }
+        }
+        self.dev.write_all(&cooked).map_err(map_char_err)
+    }
+
+    fn dequeue_ready(&self, buf: &mut [u8]) -> Option<usize> {
+        let mut state = self.line_state.lock();
+        if state.eof_pending {
+            state.eof_pending = false;
+            return Some(0);
+        }
+        if state.ready.is_empty() {
+            return None;
+        }
+        let mut n = 0usize;
+        while n < buf.len() {
+            let Some(byte) = state.ready.pop_front() else {
+                break;
+            };
+            buf[n] = byte;
+            n += 1;
+        }
+        Some(n)
+    }
+
+    fn send_fg_signal(&self, sig: sched::SignalNumber) {
+        let Ok(pgrp) = self.current_or_stored_pgrp() else {
+            return;
+        };
+        if pgrp > 0 {
+            let _ = operation::kill(-pgrp, Some(sig));
+        }
+    }
+
+    fn read_tty_canonical(&self, buf: &mut [u8], termios: LinuxTermios) -> VfsResult<usize> {
+        loop {
+            if let Some(n) = self.dequeue_ready(buf) {
+                return Ok(n);
+            }
+
+            let mut byte = [0u8; 1];
+            let n = self.dev.read(&mut byte).map_err(map_char_err)?;
+            if n == 0 {
+                let _ = operation::sched_yield();
+                core::hint::spin_loop();
+                continue;
+            }
+
+            let mut ch = byte[0];
+            if termios.icrnl() && ch == b'\r' {
+                ch = b'\n';
+            }
+            if termios.ixon() && (ch == 17 || ch == 19) {
+                continue;
+            }
+            if termios.isig() {
+                if ch == termios.vintr() && ch != 0 {
+                    self.send_fg_signal(sched::SignalNumber::SIGINT);
+                    let mut state = self.line_state.lock();
+                    state.line.clear();
+                    drop(state);
+                    if termios.echo() {
+                        let _ = self.write_tty_bytes(b"^C\n", termios);
+                    }
+                    continue;
+                }
+                if ch == termios.vquit() && ch != 0 {
+                    continue;
+                }
+            }
+
+            let mut echo_bytes: Option<Vec<u8>> = None;
+            {
+                let mut state = self.line_state.lock();
+                if ch == termios.verase() && ch != 0 {
+                    if state.line.pop().is_some() && termios.echo() {
+                        echo_bytes = Some(if termios.echoe() {
+                            Vec::from(&b"\x08 \x08"[..])
+                        } else {
+                            Vec::from(&[ch][..])
+                        });
+                    }
+                } else if ch == termios.vkill() && ch != 0 {
+                    let erased = state.line.len();
+                    state.line.clear();
+                    if erased != 0 && termios.echo() {
+                        let mut out = Vec::new();
+                        if termios.echoe() {
+                            out.reserve(erased * 3);
+                            for _ in 0..erased {
+                                out.extend_from_slice(b"\x08 \x08");
+                            }
+                        }
+                        if termios.echok() {
+                            out.push(b'\n');
+                        }
+                        if !out.is_empty() {
+                            echo_bytes = Some(out);
+                        }
+                    }
+                } else if ch == termios.veof() && ch != 0 {
+                    if state.line.is_empty() {
+                        state.eof_pending = true;
+                    } else {
+                        while let Some(byte) = state.line.first().copied() {
+                            state.ready.push_back(byte);
+                            state.line.remove(0);
+                        }
+                    }
+                } else {
+                    state.line.push(ch);
+                    if termios.echo() {
+                        echo_bytes = Some(Vec::from(&[ch][..]));
+                    }
+                    if ch == b'\n' {
+                        while let Some(byte) = state.line.first().copied() {
+                            state.ready.push_back(byte);
+                            state.line.remove(0);
+                        }
+                    }
+                }
+            }
+
+            if let Some(bytes) = echo_bytes.as_deref() {
+                let _ = self.write_tty_bytes(bytes, termios);
+            }
+        }
+    }
+
+    fn read_tty_raw(&self, buf: &mut [u8], termios: LinuxTermios) -> VfsResult<usize> {
+        let want = termios.vmin().max(1) as usize;
+        let mut filled = 0usize;
+        loop {
+            let n = self.dev.read(&mut buf[filled..]).map_err(map_char_err)?;
+            if n != 0 {
+                let start = filled;
+                filled += n;
+                if termios.icrnl() {
+                    for byte in &mut buf[start..filled] {
+                        if *byte == b'\r' {
+                            *byte = b'\n';
+                        }
+                    }
+                }
+                if termios.echo() {
+                    let _ = self.write_tty_bytes(&buf[start..filled], termios);
+                }
+                if filled >= want || filled == buf.len() {
+                    return Ok(filled);
+                }
+            } else {
+                if filled != 0 && termios.vtime() == 0 {
+                    return Ok(filled);
+                }
+                let _ = operation::sched_yield();
+                core::hint::spin_loop();
+            }
         }
     }
 }
@@ -270,18 +599,20 @@ impl FileOps for CharDevFileOps {
         if buf.is_empty() || self.nonblock.load(Ordering::Acquire) || !self.is_tty() {
             return self.dev.read(buf).map_err(map_char_err);
         }
-
-        loop {
-            let n = self.dev.read(buf).map_err(map_char_err)?;
-            if n != 0 {
-                return Ok(n);
-            }
-            let _ = sched_operation::sched_yield();
-            core::hint::spin_loop();
+        let termios = *self.termios.lock();
+        if termios.canonical() {
+            self.read_tty_canonical(buf, termios)
+        } else {
+            self.read_tty_raw(buf, termios)
         }
     }
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        self.dev.write(buf).map_err(map_char_err)
+        if !self.is_tty() || self.nonblock.load(Ordering::Acquire) {
+            return self.dev.write(buf).map_err(map_char_err);
+        }
+        let termios = *self.termios.lock();
+        self.write_tty_bytes(buf, termios)?;
+        Ok(buf.len())
     }
     fn readdir(
         &self,
@@ -322,6 +653,9 @@ impl FileOps for CharDevFileOps {
                 let mut raw = [0u8; LINUX_TERMIOS_LEN];
                 read_bytes_from_user(arg, &mut raw)?;
                 *self.termios.lock() = LinuxTermios { raw };
+                if matches!(cmd.raw(), TCSETSF) {
+                    self.line_state.lock().clear();
+                }
                 if matches!(cmd.raw(), TCSETSW | TCSETSF) {
                     self.dev.flush().map_err(map_char_errno)?;
                 }
@@ -333,6 +667,9 @@ impl FileOps for CharDevFileOps {
                 let mut termios = [0u8; LINUX_TERMIOS_LEN];
                 termios.copy_from_slice(&raw[..LINUX_TERMIOS_LEN]);
                 *self.termios.lock() = LinuxTermios { raw: termios };
+                if matches!(cmd.raw(), TCSETSF2) {
+                    self.line_state.lock().clear();
+                }
                 if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {
                     self.dev.flush().map_err(map_char_errno)?;
                 }
@@ -366,7 +703,7 @@ impl FileOps for CharDevFileOps {
                 Ok(0)
             }
             TIOCGSID => {
-                write_i32_to_user(arg, sched_operation::getsid(0)?)?;
+                write_i32_to_user(arg, operation::getsid(0)?)?;
                 Ok(0)
             }
             TIOCGETD => {
@@ -385,7 +722,11 @@ impl FileOps for CharDevFileOps {
                 self.dev.flush().map_err(map_char_errno)?;
                 Ok(0)
             }
-            TCXONC | TCFLSH | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
+            TCFLSH => {
+                self.line_state.lock().clear();
+                Ok(0)
+            }
+            TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
             FIONBIO => {
                 self.nonblock
                     .store(read_i32_from_user(arg)? != 0, Ordering::Release);
@@ -455,26 +796,31 @@ struct BlockDevFileOps {
     sync_writes: bool,
 }
 
-fn map_block_submit_err(err: BlockSubmitError) -> VfsError {
+fn map_bio_err(err: BioError) -> VfsError {
     match err {
-        BlockSubmitError::Unsupported => VfsError::NotSupported,
-        BlockSubmitError::ReadOnly => VfsError::ReadOnlyFilesystem,
-        BlockSubmitError::QueueFull => VfsError::WouldBlock,
-        BlockSubmitError::DeviceGone => VfsError::NoDevice,
-        BlockSubmitError::OutOfMemory => VfsError::OutOfMemory,
-        BlockSubmitError::InvalidRequest(_) => VfsError::InvalidArgument,
+        BioError::Submit(s) => match s {
+            crate::dev::bio::SubmitError::Unsupported => VfsError::NotSupported,
+            crate::dev::bio::SubmitError::ReadOnly => VfsError::ReadOnlyFilesystem,
+            crate::dev::bio::SubmitError::QueueFull => VfsError::WouldBlock,
+            crate::dev::bio::SubmitError::DeviceGone => VfsError::NoDevice,
+            crate::dev::bio::SubmitError::OutOfMemory => VfsError::OutOfMemory,
+            crate::dev::bio::SubmitError::InvalidRequest(_) => VfsError::InvalidArgument,
+        },
+        BioError::Io(i) => match i {
+            crate::dev::bio::BioIoError::MediaError => VfsError::Io,
+            crate::dev::bio::BioIoError::Unavailable => VfsError::NoDevice,
+            crate::dev::bio::BioIoError::Timeout => VfsError::TimedOut,
+            crate::dev::bio::BioIoError::ReadOnly => VfsError::ReadOnlyFilesystem,
+            crate::dev::bio::BioIoError::Unsupported => VfsError::NotSupported,
+        },
     }
 }
 
-fn map_block_io_err(err: BlockIoError) -> VfsError {
-    match err {
-        BlockIoError::MediaError => VfsError::Io,
-        BlockIoError::Unavailable => VfsError::NoDevice,
-        BlockIoError::Timeout => VfsError::TimedOut,
-        BlockIoError::ReadOnly => VfsError::ReadOnlyFilesystem,
-        BlockIoError::Unsupported => VfsError::NotSupported,
-    }
+fn map_block_io_err(err: BioError) -> VfsError {
+    map_bio_err(err)
 }
+
+
 
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
     let mut data = Vec::new();
@@ -511,66 +857,34 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
-fn submit_block_sync(dev: &Arc<BlockDevice>, req: BlockIoRequest) -> VfsResult<BlockIoCompletion> {
-    let done = Arc::new(AtomicBool::new(false));
-    let slot = Arc::new(Spinlock::new(None));
-    let done_for_completion = Arc::clone(&done);
-    let slot_for_completion = Arc::clone(&slot);
-    let completion: BlockCompletion = Box::new(move |completion| {
-        *slot_for_completion.lock() = Some(completion);
-        done_for_completion.store(true, Ordering::Release);
-    });
 
-    if let Err((err, _req, _completion)) = dev.submit(req, completion) {
-        return Err(map_block_submit_err(err));
-    }
-
-    while !done.load(Ordering::Acquire) {
-        dev.poll();
-        core::hint::spin_loop();
-    }
-
-    slot.lock().take().ok_or(VfsError::Io)
-}
 
 impl FileOps for BlockDevFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
             return Ok(0);
         };
-        let completion = submit_block_sync(
-            &self.dev,
-            BlockIoRequest::Read {
-                range,
-                buffer: boxed_zeroed(buf.len())?,
-            },
-        )?;
-        completion.result.map_err(map_block_io_err)?;
-        match completion.request {
-            BlockIoRequest::Read { buffer, .. } => {
-                buf.copy_from_slice(&buffer);
-                Ok(buf.len())
-            }
-            _ => Err(VfsError::Io),
-        }
+        let owned = boxed_zeroed(buf.len())?;
+        let bio = self
+            .dev
+            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+            .map_err(map_bio_err)?;
+        buf.copy_from_slice(bio.buffer.as_slice());
+        Ok(buf.len())
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
         let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
             return Ok(0);
         };
-        let completion = submit_block_sync(
-            &self.dev,
-            BlockIoRequest::Write {
-                range,
-                buffer: boxed_copy(buf)?,
-                fua: false,
-            },
-        )?;
-        completion.result.map_err(map_block_io_err)?;
+        let owned = boxed_copy(buf)?;
+        self.dev
+            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .map_err(map_bio_err)?;
         if self.sync_writes {
-            let completion = submit_block_sync(&self.dev, BlockIoRequest::Flush)?;
-            completion.result.map_err(map_block_io_err)?;
+            self.dev
+                .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
+                .map_err(map_bio_err)?;
         }
         Ok(buf.len())
     }
@@ -587,8 +901,10 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
-        let completion = submit_block_sync(&self.dev, BlockIoRequest::Flush)?;
-        completion.result.map_err(map_block_io_err)
+        self.dev
+            .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
+            .map_err(map_bio_err)?;
+        Ok(())
     }
 
     fn poll(&self, _interest: PollEvents) -> PollEvents {

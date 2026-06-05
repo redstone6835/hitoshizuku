@@ -6,6 +6,7 @@ use core::any::Any;
 use core::ops::ControlFlow;
 
 use errno::Errno;
+use sched::{Task, WaitQueue};
 
 use crate::vfs::cred::Credentials;
 use crate::vfs::dentry::Dentry;
@@ -29,6 +30,8 @@ struct PipeInner {
 
 pub struct Pipe {
     inner: Spinlock<PipeInner>,
+    read_wait: WaitQueue,
+    write_wait: WaitQueue,
 }
 
 impl Pipe {
@@ -41,6 +44,8 @@ impl Pipe {
                 reader_count: 1,
                 writer_count: 1,
             }),
+            read_wait: WaitQueue::new(),
+            write_wait: WaitQueue::new(),
         }
     }
 
@@ -105,6 +110,8 @@ impl FileOps for PipeReadEnd {
         let avail = self.pipe.available(&inner);
         if avail > 0 {
             let n = self.pipe.read_data(&mut inner, buf);
+            drop(inner);
+            self.pipe.write_wait.wake_all();
             return Ok(n);
         }
         if inner.writer_count == 0 {
@@ -141,6 +148,24 @@ impl FileOps for PipeReadEnd {
         ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
     }
 
+    fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
+        if interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI) {
+            self.pipe.read_wait.enqueue(task);
+        }
+        if interest.has(PollEvents::POLLHUP) || interest.has(PollEvents::POLLERR) {
+            self.pipe.read_wait.enqueue(task);
+        }
+        true
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<Task>) {
+        self.pipe.read_wait.remove(task);
+    }
+
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
     fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
         Err(Errno::ENOTTY)
     }
@@ -148,6 +173,11 @@ impl FileOps for PipeReadEnd {
     fn release(&self) {
         let mut inner = self.pipe.inner.lock();
         inner.reader_count = inner.reader_count.saturating_sub(1);
+        let last = inner.reader_count == 0;
+        drop(inner);
+        if last {
+            self.pipe.write_wait.wake_all();
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -178,6 +208,8 @@ impl FileOps for PipeWriteEnd {
         let free = self.pipe.free_space(&inner);
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
+            drop(inner);
+            self.pipe.read_wait.wake_all();
             return Ok(n);
         }
         Err(VfsError::WouldBlock)
@@ -207,6 +239,24 @@ impl FileOps for PipeWriteEnd {
         ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
     }
 
+    fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
+        if interest.has(PollEvents::POLLOUT) {
+            self.pipe.write_wait.enqueue(task);
+        }
+        if interest.has(PollEvents::POLLHUP) || interest.has(PollEvents::POLLERR) {
+            self.pipe.write_wait.enqueue(task);
+        }
+        true
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<Task>) {
+        self.pipe.write_wait.remove(task);
+    }
+
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
     fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
         Err(Errno::ENOTTY)
     }
@@ -214,6 +264,11 @@ impl FileOps for PipeWriteEnd {
     fn release(&self) {
         let mut inner = self.pipe.inner.lock();
         inner.writer_count = inner.writer_count.saturating_sub(1);
+        let last = inner.writer_count == 0;
+        drop(inner);
+        if last {
+            self.pipe.read_wait.wake_all();
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

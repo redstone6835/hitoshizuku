@@ -163,6 +163,7 @@ enum TmpfsInodeData {
     File(Vec<u8>),
     Directory(BTreeMap<String, u64>),
     Symlink(String),
+    Special,
 }
 
 struct TmpfsInodeOps {
@@ -448,6 +449,74 @@ impl InodeOps for TmpfsInodeOps {
         Ok(sb.insert_inode(new_inode))
     }
 
+    fn mknod(
+        &self,
+        dir: &Inode,
+        name: &str,
+        kind: FileType,
+        mode: FileMode,
+        dev: DevId,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .ops
+            .as_any()
+            .downcast_ref::<TmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+
+        let mut data = self.data.lock();
+        let entries = match &mut *data {
+            TmpfsInodeData::Directory(entries) => entries,
+            _ => return Err(VfsError::NotADirectory),
+        };
+
+        if entries.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+
+        let ino = sb_ops.alloc_ino();
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: 0,
+            nlink: 1,
+            mode,
+            uid: cred.euid,
+            gid: cred.egid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+
+        let new_inode = Inode::new(
+            InodeId {
+                fs_id: sb.fs_id,
+                ino,
+            },
+            kind,
+            dev,
+            4096,
+            sb.dev_id,
+            meta,
+            Arc::new(TmpfsInodeOps {
+                data: Spinlock::new(TmpfsInodeData::Special),
+            }),
+            sb.self_weak.clone(),
+        );
+
+        entries.insert(name.to_string(), ino);
+        dir.touch_mtime();
+        dir.touch_ctime();
+        drop(data);
+
+        Ok(sb.insert_inode(new_inode))
+    }
+
     fn link(&self, dir: &Inode, target: &Inode, name: &str) -> VfsResult<()> {
         if dir.kind() != FileType::Directory {
             return Err(VfsError::NotADirectory);
@@ -514,6 +583,12 @@ impl InodeOps for TmpfsInodeOps {
         _options: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        {
+            let data = self.data.lock();
+            if matches!(&*data, TmpfsInodeData::Special) {
+                return Err(VfsError::NotSupported);
+            }
+        }
         let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
         Ok(Box::new(TmpfsFileOps {
             inode_ops: inode

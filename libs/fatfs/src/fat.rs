@@ -12,6 +12,7 @@
 //! 所有 FAT 表访问都经过 `with_slots_lock`,它在一次锁持有内完成扇区加载、修改、
 //! 驱逐,消除 FAT12 跨扇区读-改-写过程中锁释放带来的 TOCTOU 窗口。
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use vfs::sync::Spinlock;
 
@@ -40,6 +41,9 @@ pub(crate) struct FatTable {
     bytes_per_sector: u32,
     total_clusters: u32,
     next_free_hint: Spinlock<u32>,
+    /// 全局簇链缓存:start_cluster → 已知的簇序列。
+    /// 保守失效:任何 set/alloc/free 都清空整张缓存。
+    chain_cache: Spinlock<BTreeMap<u32, Vec<u32>>>,
 }
 
 impl FatTable {
@@ -63,6 +67,7 @@ impl FatTable {
             bytes_per_sector,
             total_clusters,
             next_free_hint: Spinlock::new(hint.max(2)),
+            chain_cache: Spinlock::new(BTreeMap::new()),
         }
     }
 
@@ -350,6 +355,8 @@ impl FatTable {
         value: u32,
     ) -> Result<(), BlockBackendError> {
         self.validate_cluster(cluster)?;
+        // 任何 FAT 条目修改都使簇链缓存失效
+        self.chain_cache.lock().clear();
         let bps = self.bytes_per_sector as u64;
         let off = self.byte_offset(cluster);
         let sector_no = off / bps;
@@ -482,13 +489,32 @@ impl FatTable {
         if start < 2 {
             return Ok(None);
         }
+        // 查缓存
+        {
+            let cache = self.chain_cache.lock();
+            if let Some(chain) = cache.get(&start) {
+                if (steps as usize) < chain.len() {
+                    return Ok(Some(chain[steps as usize]));
+                }
+            }
+        }
+        // 缓存未命中或不够长:从头走并建立缓存
+        let mut chain = Vec::with_capacity(steps as usize + 1);
+        chain.push(start);
         let mut cur = start;
         for _ in 0..steps {
             match self.next_cluster(backend, cur)? {
-                Some(n) => cur = n,
-                None => return Ok(None),
+                Some(n) => {
+                    chain.push(n);
+                    cur = n;
+                }
+                None => {
+                    self.chain_cache.lock().insert(start, chain);
+                    return Ok(None);
+                }
             }
         }
+        self.chain_cache.lock().insert(start, chain);
         Ok(Some(cur))
     }
 
@@ -628,6 +654,8 @@ impl FatTable {
         if count == 0 || count > self.total_clusters {
             return Err(BlockBackendError::OutOfRange);
         }
+        // 直接修改 slot.data 绕过 set(),需要主动失效簇链缓存
+        self.chain_cache.lock().clear();
         if matches!(self.kind, FatKind::Fat12) {
             let first = self.alloc_cluster(backend, prev)?;
             let mut last = first;
@@ -648,8 +676,12 @@ impl FatTable {
             let mut probed = 0u32;
 
             while probed < self.total_clusters {
-                if c < 2 { c = 2; }
-                if c >= total_with_2 { c = 2; }
+                if c < 2 {
+                    c = 2;
+                }
+                if c >= total_with_2 {
+                    c = 2;
+                }
                 if c.saturating_add(count) > total_with_2 {
                     probed += total_with_2.saturating_sub(c);
                     c = 2;
@@ -667,7 +699,11 @@ impl FatTable {
                     let base_lba = self.first_fat_sector + sector_no;
 
                     let slot = Self::ensure_slot_present(
-                        slots, backend, self.capacity, base_lba, self.bytes_per_sector,
+                        slots,
+                        backend,
+                        self.capacity,
+                        base_lba,
+                        self.bytes_per_sector,
                     )?;
 
                     // 在同一 sector 内批量检查多个 entry
@@ -691,7 +727,9 @@ impl FatTable {
                         }
                         checked += 1;
                     }
-                    if !all_free { break; }
+                    if !all_free {
+                        break;
+                    }
                 }
 
                 if !all_free {
@@ -712,7 +750,11 @@ impl FatTable {
                     let base_lba = self.first_fat_sector + sector_no;
 
                     let slot = Self::ensure_slot_present_mut(
-                        slots, backend, self.capacity, base_lba, self.bytes_per_sector,
+                        slots,
+                        backend,
+                        self.capacity,
+                        base_lba,
+                        self.bytes_per_sector,
                     )?;
 
                     // 在同一 sector 内批量写入
@@ -738,7 +780,11 @@ impl FatTable {
                     }
                 }
 
-                let next = if c + count >= total_with_2 { 2 } else { c + count };
+                let next = if c + count >= total_with_2 {
+                    2
+                } else {
+                    c + count
+                };
                 return Ok((c, c + count - 1, next));
             }
             Err(BlockBackendError::OutOfRange)
