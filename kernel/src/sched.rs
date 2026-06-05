@@ -24,6 +24,7 @@ use hal::user_context::UserTrapFrame;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
+use sched::operation::apply_default_action;
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
 use sched::task::{TaskExtCloneHook, TaskExtKey};
@@ -300,6 +301,7 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
@@ -342,14 +344,28 @@ fn process_clone_user_context(
         write_user_usize(args.parent_tid, child_tid)?;
     }
     if args.flags.has(CloneFlags::CLONE_CHILD_SETTID) && args.child_tid != 0 {
-        // CLONE_VM 时父子共享同一 VmSpace，无需切换页表
-        if !args.flags.has(CloneFlags::CLONE_VM) {
-            if let Some(ref vm) = task_vm_space(child) {
+        // 切换到子进程页表写 child_tid；缺页处理依赖 current_task_vm_space()，
+        // 必须临时把 parent 的 TASKEXT_VM_SPACE 换成 child 的，否则硬件用 child
+        // 的 PGD 但缺页 handler 修改 parent 的页表，导致修复不生效而陷入死循环。
+        let saved_vm = if !args.flags.has(CloneFlags::CLONE_VM) {
+            let child_vm = task_vm_space(child);
+            if let Some(ref vm) = child_vm {
                 vm.activate();
             }
-        }
+            let old = parent.ext_remove(TASKEXT_VM_SPACE);
+            if let Some(ref vm) = child_vm {
+                parent.ext_install(TASKEXT_VM_SPACE, vm.clone());
+            }
+            old
+        } else {
+            None
+        };
         let result = write_user_usize(args.child_tid, child_tid);
         if !args.flags.has(CloneFlags::CLONE_VM) {
+            parent.ext_remove(TASKEXT_VM_SPACE);
+            if let Some(old) = saved_vm {
+                parent.ext_install(TASKEXT_VM_SPACE, old);
+            }
             if let Some(ref vm) = task_vm_space(parent) {
                 vm.activate();
             }
@@ -414,6 +430,19 @@ fn process_setup_signal_frame(
     let SigHandler::Handler(handler_pc) = action.handler else {
         return Err(Errno::EINVAL);
     };
+
+    // TODO(vDSO): 当前方案在 restorer 无效时退化为 SIG_DFL。
+    // 静态链接的 glibc 依赖内核 vDSO 自动填充 sa_restorer，
+    // 栈上残值若 VA[63]=1 会在信号返回时跳入内核
+    // 正确做法：实现 vDSO 暴露 __kernel_rt_sigreturn，glibc 会自动从 vDSO 读取 restorer。
+    if action.restorer >> 63 != 0 {
+        log::debug!(
+            "[sigframe] bad restorer={:#x} for sig={} handler={:#x} — falling back to SIG_DFL",
+            action.restorer, info.sig.raw(), handler_pc
+        );
+        apply_default_action(info);
+        return Ok(());
+    }
 
     let saved = UserTrapFrame::from_context(user_ctx.as_usize());
     let old_mask = task.signal.blocked_snapshot();

@@ -11,12 +11,12 @@ SRC="$ROOT/third/busybox-1.36.1"
 
 case "$ARCH" in
     la)
-        CROSS_PREFIX="loongarch64-linux-musl-"
-        DEST="$ROOT/userland/rootfs-la/bin"
+        CROSS_PREFIX="loongarch64-linux-gnu-"
+        DEST="$ROOT/userland/rootfs-la"
         ;;
     rv)
         CROSS_PREFIX="riscv64-linux-musl-"
-        DEST="$ROOT/userland/rootfs-rv/bin"
+        DEST="$ROOT/userland/rootfs-rv"
         ;;
     *)
         echo "用法: $0 la|rv" >&2
@@ -51,7 +51,10 @@ make -C "$SRC" CROSS_COMPILE="$CROSS_PREFIX" -j"$(nproc)"
 
 # 安装到 userland
 mkdir -p "$DEST"
-cp "$SRC/busybox" "$DEST/busybox"
-"${CROSS_PREFIX}strip" "$DEST/busybox"
+make -C "$SRC" CROSS_COMPILE="$CROSS_PREFIX" CONFIG_PREFIX="$DEST" install
+"${CROSS_PREFIX}strip" "$DEST/bin/busybox" 2>/dev/null || true
 
-echo "busybox ($ARCH) → $DEST/busybox ($(stat -c%s "$DEST/busybox") bytes)"
+echo "busybox ($ARCH) → $DEST/bin/busybox ($(stat -c%s "$DEST/bin/busybox") bytes)"
+
+# 清理构建产物
+make -C "$SRC" distclean
