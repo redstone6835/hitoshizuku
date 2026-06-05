@@ -477,7 +477,7 @@ fn wait_common(
     let nowait = options.has(WaitOptions::WNOWAIT);
 
     loop {
-        // 1. 先看是否有退出事件匹配。wait4 的 options=0 隐含 WEXITED；
+        // 1. 先看是否有退出事件匹配。
         //    waitid 必须由调用方显式传 WEXITED/WSTOPPED/WCONTINUED。
         let pred = |c: &Arc<Task>| matches_waitid(c, target, &me);
         if wait_exited {
@@ -540,12 +540,40 @@ fn wait_common(
             });
         }
 
-        // 5. 阻塞：挂到 me.exit_waiters，让出 CPU，被唤醒后重试。
+        // 5. 阻塞：挂到每个匹配子进程的 exit_waiters，让出 CPU。
+        //    子进程 mark_exited 时唤醒自身的 exit_waiters，父进程随后被调度
+        //    回来，循环顶部的 snapshot_children 会找到 Zombie。
+        let matched_children: alloc::vec::Vec<_> = me
+            .snapshot_children()
+            .into_iter()
+            .filter(|c| matches_waitid(c, target, &me))
+            .collect();
+        if matched_children.is_empty() {
+            return Err(Errno::ECHILD);
+        }
         let _ = me.cas_state(TaskState::Running, TaskState::Sleeping);
         let _ = me.cas_state(TaskState::Runnable, TaskState::Sleeping);
-        me.exit_waiters.enqueue(&me);
-        schedule_once(0);
-        // 唤醒后回到 Runnable，重新轮询。
+        for child in &matched_children {
+            child.exit_waiters.enqueue(&me);
+        }
+        // 二次检查：enqueue 之后、yield 之前，子进程可能已经退出并调过
+        // wake_all，此时直接收回自己即可，不必走完整 schedule 往返。
+        let already_exited = {
+            let children = me.snapshot_children();
+            children.iter().any(|c| c.state() == TaskState::Zombie && matches_waitid(c, target, &me))
+        };
+        if already_exited {
+            for child in &matched_children {
+                child.exit_waiters.remove(&me);
+            }
+            let _ = me.cas_state(TaskState::Sleeping, TaskState::Runnable);
+        } else {
+            schedule_once(0);
+        }
+        // 唤醒后把自己从所有子进程的队列中摘掉，回到 Runnable 重新轮询。
+        for child in &matched_children {
+            child.exit_waiters.remove(&me);
+        }
     }
 }
 
