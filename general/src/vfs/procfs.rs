@@ -436,6 +436,42 @@ impl InodeOps for ProcNetDirOps {
                 1,
                 Arc::new(ProcNetDevOps),
             )),
+            "tcp" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO + 1,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetStubOps("tcp")),
+            )),
+            "udp" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO + 2,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetStubOps("udp")),
+            )),
+            "route" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO + 3,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetStubOps("route")),
+            )),
+            "unix" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO + 4,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetStubOps("unix")),
+            )),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -444,11 +480,33 @@ impl InodeOps for ProcNetDirOps {
         &self, _: &Inode, _: &OpenOptions, _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
-            snapshot: vec![DirEntry {
-                ino: NET_DEV_INO,
-                name: SmallStr::new("dev"),
-                kind: FileType::Regular,
-            }],
+            snapshot: vec![
+                DirEntry {
+                    ino: NET_DEV_INO,
+                    name: SmallStr::new("dev"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 1,
+                    name: SmallStr::new("tcp"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 2,
+                    name: SmallStr::new("udp"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 3,
+                    name: SmallStr::new("route"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 4,
+                    name: SmallStr::new("unix"),
+                    kind: FileType::Regular,
+                },
+            ],
         }))
     }
 
@@ -456,6 +514,94 @@ impl InodeOps for ProcNetDirOps {
         Err(VfsError::InvalidArgument)
     }
     fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+struct ProcNetStubOps(&'static str);
+
+impl InodeOps for ProcNetStubOps {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        // TODO: 实现 /proc/net/{tcp,udp,route,unix} 的真实内容
+        Ok(Box::new(ProcNetStubFile(self.0)))
+    }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+struct ProcNetStubFile(&'static str);
+
+impl FileOps for ProcNetStubFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let content = match self.0 {
+            "tcp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
+            "udp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
+            "route" => render_proc_net_route(),
+            "unix" => "Num       RefCount Protocol Flags    Type St Inode Path\n".into(),
+            _ => String::new(),
+        };
+        let offset = offset as usize;
+        if offset >= content.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(content.len() - offset);
+        buf[..len].copy_from_slice(&content.as_bytes()[offset..offset + len]);
+        Ok(len)
+    }
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::PermissionDenied)
+    }
+    fn readdir(
+        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+    fn sync(&self) -> VfsResult<()> { Ok(()) }
+    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn release(&self) {}
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+fn render_proc_net_route() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT");
+    let ifaces = net::stack().snapshot_interfaces();
+    for iface in &ifaces {
+        // 每个配置的 CIDR 地址生成一条 connected route
+        for cidr in &iface.addresses {
+            if let net::config::IpAddr::V4(v4) = cidr.addr {
+                let prefix = cidr.prefix_len.min(32);
+                let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+                let dst = u32::from_be_bytes(v4.0) & mask;
+                let _ = writeln!(
+                    out,
+                    "{}\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0",
+                    iface.name, dst.to_be(), mask.to_be()
+                );
+            }
+        }
+        // default route via gateway
+        if let Some(ref gw) = iface.gateway {
+            let gw_ip = match gw {
+                net::config::Gateway::V4(v4) => u32::from_be_bytes(v4.0),
+                _ => 0,
+            };
+            if gw_ip != 0 {
+                let _ = writeln!(
+                    out,
+                    "{}\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0",
+                    iface.name, gw_ip.to_be()
+                );
+            }
+        }
+    }
+    out
 }
 
 struct ProcNetDevOps;
@@ -509,10 +655,13 @@ fn render_proc_net_dev() -> String {
     let _ = writeln!(out, " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed");
     let ifaces = net::stack().snapshot_interfaces();
     for iface in &ifaces {
+        let s = &iface.stats;
         let _ = writeln!(
             out,
             "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
-            iface.name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+            iface.name,
+            s.rx_bytes, s.rx_packets, s.rx_errors, s.rx_dropped, 0, 0, 0, 0,
+            s.tx_bytes, s.tx_packets, s.tx_errors, s.tx_dropped, 0, 0, 0, 0
         );
     }
     out

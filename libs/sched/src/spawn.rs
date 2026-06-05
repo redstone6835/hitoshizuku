@@ -39,7 +39,17 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
 
     let (tgroup, pgroup) = match kind {
         SpawnKind::Thread => (parent.thread_group(), parent.process_group()),
-        SpawnKind::Process => (ThreadGroup::new(), parent.process_group()),
+        SpawnKind::Process => {
+            // 不共享：新建 TG，并拷贝父进程 rlimit。
+            let parent_tg = parent.thread_group();
+            let tg = ThreadGroup::new();
+            {
+                let src = parent_tg.rlimits().lock();
+                let mut dst = tg.rlimits().lock();
+                *dst = src.fork_copy();
+            }
+            (tg, parent.process_group())
+        }
     };
 
     let child = Task::new(

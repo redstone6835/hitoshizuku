@@ -95,6 +95,7 @@ impl Socket {
                 accept_wait: sched::WaitQueue::new(),
                 connect_wait: sched::WaitQueue::new(),
             }),
+            SocketType::Raw => return Err(SocketError::InvalidInput),
         };
         let socket = Self {
             inner: Arc::new(SocketInner {
@@ -133,6 +134,7 @@ impl Socket {
                 connection::install_seqpacket_pair(&a, &b)?;
                 Ok((a, b))
             }
+            SocketType::Raw => Err(SocketError::InvalidInput),
         }
     }
 
@@ -1029,7 +1031,7 @@ fn socket_inflight_reaches_socket(start_id: u64, needle_id: u64) -> bool {
 pub(crate) fn default_socket_options(kind: SocketType) -> SocketOptions {
     match kind {
         SocketType::Stream => SocketOptions::default(),
-        SocketType::Datagram | SocketType::Sequenced => SocketOptions {
+        SocketType::Datagram | SocketType::Sequenced | SocketType::Raw => SocketOptions {
             send_buffer_size: DEFAULT_MESSAGE_BUFFER_SIZE,
             recv_buffer_size: DEFAULT_MESSAGE_BUFFER_SIZE,
             ..SocketOptions::default()

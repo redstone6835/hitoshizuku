@@ -104,7 +104,71 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 }
 
 pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+    // Linux ABI:
+    //   long sys_rt_sigtimedwait(
+    //       const sigset_t *uthese,    // a0
+    //       siginfo_t *uinfo,          // a1
+    //       const struct __kernel_timespec *uts,  // a2
+    //       size_t sigsetsize          // a3
+    //   );
+    let uthese = ctx.args[0];
+    let uinfo_user = ctx.args[1];
+    let uts = ctx.args[2];
+    let sigset_size = ctx.args[3];
+    if sigset_size != SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    if uthese == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    // 1. 读 these 信号集。
+    let mut raw = [0u8; 8];
+    copy_from_user(uthese, &mut raw).map_err(|e| e.as_errno())?;
+    let these = SigSet::from_raw(u64::from_le_bytes(raw));
+    if these.0 == 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    // 2. 解析 timeout。NULL 表示永久等待；其它按 timespec 解释。
+    let timeout_ns: Option<u64> = if uts == 0 {
+        None
+    } else {
+        let mut ts = [0u8; 16];
+        copy_from_user(uts, &mut ts).map_err(|e| e.as_errno())?;
+        let sec = i64::from_le_bytes(ts[0..8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(ts[8..16].try_into().unwrap());
+        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+            return Err(Errno::EINVAL);
+        }
+        // {0,0} → 永久等待；其它 → ns 总数。
+        if sec == 0 && nsec == 0 {
+            None
+        } else {
+            Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
+        }
+    };
+
+    // 3. 先非阻塞轮询；命中则直接返回。
+    if let Some(info) = sched::operation::sigtimedwait_poll(these) {
+        if uinfo_user != 0 {
+            write_siginfo(uinfo_user, &info)?;
+        }
+        return Ok(info.sig.as_usize());
+    }
+
+    // 4. 没命中 → 让出调度等待，限时 timeout_ns。
+    let got = sched::operation::sigtimedwait_wait(these, timeout_ns);
+    if !got {
+        return Err(Errno::EAGAIN);
+    }
+    // 再次轮询；理论上 wait 出来应该命中。
+    let info = sched::operation::sigtimedwait_poll(these)
+        .expect("[sigtimedwait] wait returned but poll found nothing");
+    if uinfo_user != 0 {
+        write_siginfo(uinfo_user, &info)?;
+    }
+    Ok(info.sig.as_usize())
 }
 
 pub(super) fn sys_sigaltstack(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

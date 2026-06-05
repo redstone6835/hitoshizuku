@@ -131,6 +131,55 @@ impl ManagedInterface {
         self.net_device.driver().mac_address()
     }
 
+    pub fn config(&self) -> &IfConfig {
+        &self.config
+    }
+
+    /// 底层 NetDevice 引用（用于查询 driver 状态：MTU、链路状态等）。
+    pub fn net_device(&self) -> &Arc<NetDevice> {
+        &self.net_device
+    }
+
+    /// 当前驱动报告的 MTU。
+    pub fn mtu(&self) -> usize {
+        self.net_device.driver().mtu()
+    }
+
+    /// 添加或替换默认 IPv4 路由。
+    pub fn add_default_route_v4(&mut self, gateway: Ipv4Addr) {
+        self.iface
+            .routes_mut()
+            .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+            .ok();
+    }
+
+    /// 移除默认 IPv4 路由。
+    pub fn remove_default_route_v4(&mut self) {
+        self.iface.routes_mut().remove_default_ipv4_route();
+    }
+
+    /// 返回邻居缓存中所有条目（ARP/NDP 表查询）。
+    pub fn neighbor_entries(&self) -> Vec<crate::stack::NeighborEntry> {
+        use smoltcp::wire::{HardwareAddress, IpAddress};
+        let mut out = Vec::new();
+        for (ip, neigh) in self.iface.neighbor_cache().iter() {
+            let hw = match neigh.hardware_addr {
+                HardwareAddress::Ethernet(eth) => eth.0,
+                _ => [0u8; 6],
+            };
+            let ip_addr = match ip {
+                IpAddress::Ipv4(v4) => crate::config::IpAddr::V4(crate::Ipv4Addr(v4.octets())),
+                IpAddress::Ipv6(v6) => crate::config::IpAddr::V6(crate::Ipv6Addr(v6.octets())),
+            };
+            out.push(crate::stack::NeighborEntry {
+                ip_addr,
+                hw_addr: hw,
+                expires_at_ms: neigh.expires_at.total_millis(),
+            });
+        }
+        out
+    }
+
     /// 检查 socket 是否已被 soft-close 标记为移除。
     pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
         self.meta.get(&handle).map_or(false, |m| m.is_removed())
@@ -231,6 +280,57 @@ impl ManagedInterface {
         &self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::udp::Socket<'static> {
+        self.sockets.get(handle)
+    }
+
+    /// 创建一个 raw IP socket（指定 IP 版本和协议号）。
+    pub fn add_raw_socket(&mut self, ip_version: u8, protocol: u8) -> SocketHandle {
+        use smoltcp::socket::raw;
+        use smoltcp::wire::{IpVersion, IpProtocol};
+        let ip_ver = if ip_version == 6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 };
+        let proto = IpProtocol::from(protocol);
+        let rx_buf = raw::PacketBuffer::new(
+            alloc::vec![raw::PacketMetadata::EMPTY; 8],
+            alloc::vec![0u8; 8192],
+        );
+        let tx_buf = raw::PacketBuffer::new(
+            alloc::vec![raw::PacketMetadata::EMPTY; 8],
+            alloc::vec![0u8; 8192],
+        );
+        let socket = raw::Socket::new(Some(ip_ver), Some(proto), rx_buf, tx_buf);
+        let handle = self.sockets.add(socket);
+        self.meta.insert(handle, SocketMeta::new());
+        handle
+    }
+
+    /// 创建一个 ICMP socket。
+    pub fn add_icmp_socket(&mut self) -> SocketHandle {
+        use smoltcp::socket::icmp;
+        let rx_buf = icmp::PacketBuffer::new(
+            alloc::vec![icmp::PacketMetadata::EMPTY; 8],
+            alloc::vec![0u8; 8192],
+        );
+        let tx_buf = icmp::PacketBuffer::new(
+            alloc::vec![icmp::PacketMetadata::EMPTY; 8],
+            alloc::vec![0u8; 8192],
+        );
+        let socket = icmp::Socket::new(rx_buf, tx_buf);
+        let handle = self.sockets.add(socket);
+        self.meta.insert(handle, SocketMeta::new());
+        handle
+    }
+
+    /// 获取 raw socket 的可变引用。
+    pub fn raw_socket_mut(
+        &mut self, handle: smoltcp::iface::SocketHandle,
+    ) -> &mut smoltcp::socket::raw::Socket<'static> {
+        self.sockets.get_mut(handle)
+    }
+
+    /// 获取 raw socket 的只读引用。
+    pub fn raw_socket(
+        &self, handle: smoltcp::iface::SocketHandle,
+    ) -> &smoltcp::socket::raw::Socket<'static> {
         self.sockets.get(handle)
     }
 }

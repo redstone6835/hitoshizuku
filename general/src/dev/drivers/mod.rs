@@ -16,6 +16,9 @@ pub use virtio_net::*;
 mod virtio_pci;
 pub use virtio_pci::*;
 
+mod random;
+pub use random::*;
+
 use crate::dev::pnp::PnpError;
 
 /// 注册当前内核镜像内建的所有 PnP 驱动。
@@ -26,5 +29,6 @@ pub fn register_builtin_drivers() -> Result<(), PnpError> {
     virtio_blk::register_builtin_driver()?;
     virtio_net::register_builtin_driver()?;
     virtio_pci::register_builtin_driver()?;
+    random::register_builtin_driver()?;
     Ok(())
 }

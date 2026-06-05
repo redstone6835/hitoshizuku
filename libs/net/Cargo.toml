@@ -10,7 +10,7 @@ bench = false
 
 [dependencies]
 socket = { path = "../socket" }
-smoltcp = { version = "0.12", default-features = false, features = [
+smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "proto-ipv4",
@@ -18,5 +18,6 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
     "socket-icmp",
+    "socket-raw",
 ] }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }

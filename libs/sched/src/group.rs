@@ -23,6 +23,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::rlimit::Rlimits;
 use crate::signal::SharedSignal;
 use crate::sync::Spinlock;
 use crate::task::Task;
@@ -37,6 +38,8 @@ pub struct ThreadGroup {
     members: Spinlock<Vec<Weak<Task>>>,
     /// 线程组共享的信号表（sigaction + shared pending）。
     shared_signal: Arc<SharedSignal>,
+    /// 进程级资源限制（per-tg 共享；fork 时复制一份）。
+    rlimits: Spinlock<Rlimits>,
 }
 
 impl ThreadGroup {
@@ -46,6 +49,7 @@ impl ThreadGroup {
             leader: Spinlock::new(Weak::new()),
             members: Spinlock::new(Vec::new()),
             shared_signal: Arc::new(SharedSignal::new()),
+            rlimits: Spinlock::new(Rlimits::new_with_defaults()),
         })
     }
 
@@ -55,6 +59,7 @@ impl ThreadGroup {
             leader: Spinlock::new(Weak::new()),
             members: Spinlock::new(Vec::new()),
             shared_signal: shared,
+            rlimits: Spinlock::new(Rlimits::new_with_defaults()),
         })
     }
 
@@ -88,6 +93,11 @@ impl ThreadGroup {
     pub fn shared_signal(&self) -> &Arc<SharedSignal> {
         &self.shared_signal
     }
+
+    /// 访问 rlimit 表。锁顺序与 `shared_signal`/`members` 平行，不嵌套。
+    pub fn rlimits(&self) -> &Spinlock<Rlimits> {
+        &self.rlimits
+    }
 }
 
 impl Default for ThreadGroup {
@@ -96,6 +106,7 @@ impl Default for ThreadGroup {
             leader: Spinlock::new(Weak::new()),
             members: Spinlock::new(Vec::new()),
             shared_signal: Arc::new(SharedSignal::new()),
+            rlimits: Spinlock::new(Rlimits::new_with_defaults()),
         }
     }
 }

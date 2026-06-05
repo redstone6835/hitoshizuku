@@ -127,6 +127,8 @@ pub fn register_all() {
     register_syscall(nr::SYS_GETGID, process::sys_getgid);
     register_syscall(nr::SYS_GETEGID, process::sys_getegid);
     register_syscall(nr::SYS_PRLIMIT64, process::sys_prlimit64);
+    register_syscall(nr::SYS_GETRLIMIT, process::sys_getrlimit);
+    register_syscall(nr::SYS_SETRLIMIT, process::sys_setrlimit);
     register_syscall(nr::SYS_GETRANDOM, process::sys_getrandom);
     register_syscall(nr::SYS_NANOSLEEP, process::sys_nanosleep);
     register_syscall(nr::SYS_CLOCK_NANOSLEEP, process::sys_clock_nanosleep);
