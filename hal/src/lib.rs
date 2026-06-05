@@ -13,6 +13,7 @@ extern crate arch;
 pub mod console;
 pub mod memory;
 pub mod platform;
+pub mod random;
 pub mod sched;
 pub mod time;
 pub mod user;

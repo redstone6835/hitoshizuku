@@ -23,6 +23,7 @@ pub mod net;
 pub mod pci;
 pub mod platform;
 pub mod pnp;
+pub mod random_source;
 pub mod usb;
 
 // ─────────────────────────── 共享设备控制 trait ──────────────────────────────
