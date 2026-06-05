@@ -300,6 +300,7 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
@@ -342,14 +343,28 @@ fn process_clone_user_context(
         write_user_usize(args.parent_tid, child_tid)?;
     }
     if args.flags.has(CloneFlags::CLONE_CHILD_SETTID) && args.child_tid != 0 {
-        // CLONE_VM 时父子共享同一 VmSpace，无需切换页表
-        if !args.flags.has(CloneFlags::CLONE_VM) {
-            if let Some(ref vm) = task_vm_space(child) {
+        // 切换到子进程页表写 child_tid；缺页处理依赖 current_task_vm_space()，
+        // 必须临时把 parent 的 TASKEXT_VM_SPACE 换成 child 的，否则硬件用 child
+        // 的 PGD 但缺页 handler 修改 parent 的页表，导致修复不生效而陷入死循环。
+        let saved_vm = if !args.flags.has(CloneFlags::CLONE_VM) {
+            let child_vm = task_vm_space(child);
+            if let Some(ref vm) = child_vm {
                 vm.activate();
             }
-        }
+            let old = parent.ext_remove(TASKEXT_VM_SPACE);
+            if let Some(ref vm) = child_vm {
+                parent.ext_install(TASKEXT_VM_SPACE, vm.clone());
+            }
+            old
+        } else {
+            None
+        };
         let result = write_user_usize(args.child_tid, child_tid);
         if !args.flags.has(CloneFlags::CLONE_VM) {
+            parent.ext_remove(TASKEXT_VM_SPACE);
+            if let Some(old) = saved_vm {
+                parent.ext_install(TASKEXT_VM_SPACE, old);
+            }
             if let Some(ref vm) = task_vm_space(parent) {
                 vm.activate();
             }
