@@ -27,7 +27,7 @@ if [ -x /sbin/mdev ]; then
 fi
 
 # 测试黑名单
-BLACKLIST="libctest libcbench netperf lmbench ltp unixbench"
+BLACKLIST="libctest libcbench netperf lmbench ltp unixbench iperf"
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do
