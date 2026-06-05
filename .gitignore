@@ -18,4 +18,4 @@ userland/rootfs-la/bin/
 userland/rootfs-rv/bin/
 
 # vendor 不受上述规则限制
-!vendor/
+!vendor/**
