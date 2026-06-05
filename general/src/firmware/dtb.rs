@@ -20,7 +20,6 @@ use super::{SerialPortInfo, normalize_segments};
 
 const COMPAT_SYSCON_POWEROFF: &[u8] = b"syscon-poweroff";
 const COMPAT_SYSCON_REBOOT: &[u8] = b"syscon-reboot";
-const COMPAT_VIRTIO_MMIO: &[u8] = b"virtio,mmio";
 const COMPAT_NS16550: &[u8] = b"ns16550";
 const COMPAT_NS16550A: &[u8] = b"ns16550a";
 const COMPAT_PCI_ECAM: &[u8] = b"pci-host-ecam-generic";
@@ -31,11 +30,18 @@ const COMPAT_SIMPLE_MFD: &[u8] = b"simple-mfd";
 pub type NodeId = usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DtbMmioDeviceInfo {
-    pub name: &'static str,
-    pub path: &'static str,
+pub struct DtbMmioRangeInfo {
     pub phys_addr: usize,
     pub size: usize,
+}
+
+#[derive(Debug)]
+pub struct DtbPlatformDeviceInfo {
+    pub name: &'static str,
+    pub path: &'static str,
+    pub compatible: Vec<&'static str>,
+    pub reg_ranges: Vec<DtbMmioRangeInfo>,
+    pub clock_hz: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,7 +63,7 @@ pub struct DtbFirmwareInfo {
     pub stdout_serial: Option<SerialPortInfo>,
     pub power_controls: PowerControlInfo,
     pub serial_ports: Vec<SerialPortInfo>,
-    pub virtio_mmio_devices: Vec<DtbMmioDeviceInfo>,
+    pub platform_devices: Vec<DtbPlatformDeviceInfo>,
     pub pcie_hosts: Vec<DtbPcieHostInfo>,
 }
 
@@ -135,7 +141,7 @@ pub fn parse(dtb: Dtb<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
         stdout_serial,
         power_controls,
         serial_ports: tree.serial_ports(),
-        virtio_mmio_devices: tree.virtio_mmio_devices(),
+        platform_devices: tree.platform_devices(),
         pcie_hosts: tree.pcie_hosts(),
     })
 }
@@ -407,27 +413,33 @@ impl DtbTree {
         ports
     }
 
-    fn virtio_mmio_devices(&self) -> Vec<DtbMmioDeviceInfo> {
+    fn platform_devices(&self) -> Vec<DtbPlatformDeviceInfo> {
         let mut devices = Vec::new();
         for node_id in 0..self.nodes.len() {
             let entry = &self.nodes[node_id];
-            if !entry.enabled || !compatible_contains(entry.node, COMPAT_VIRTIO_MMIO) {
+            if !entry.enabled || node_id == 0 || self.node_is_pcie_host(node_id) {
                 continue;
             }
-            let Some(range) = self.first_reg_range(node_id) else {
+            let compatible = compatible_strings(entry.node);
+            if compatible.is_empty() {
                 continue;
             };
-            if devices
-                .iter()
-                .any(|dev: &DtbMmioDeviceInfo| dev.phys_addr == range.start)
-            {
+            let Ok(ranges) = self.reg_ranges(node_id) else {
                 continue;
-            }
-            devices.push(DtbMmioDeviceInfo {
+            };
+            let reg_ranges = ranges
+                .into_iter()
+                .map(|range| DtbMmioRangeInfo {
+                    phys_addr: range.start,
+                    size: range.size,
+                })
+                .collect();
+            devices.push(DtbPlatformDeviceInfo {
                 name: self.node_name_or_path(node_id),
                 path: entry.path,
-                phys_addr: range.start,
-                size: range.size,
+                compatible,
+                reg_ranges,
+                clock_hz: read_clock_hz(entry.node),
             });
         }
         devices
@@ -704,6 +716,17 @@ fn compatible_contains(node: DtbNode<'static>, compatible: &[u8]) -> bool {
     prop.value()
         .split(|&byte| byte == 0)
         .any(|entry| entry == compatible)
+}
+
+fn compatible_strings(node: DtbNode<'static>) -> Vec<&'static str> {
+    let Some(prop) = node.find_property("compatible") else {
+        return Vec::new();
+    };
+    prop.value()
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| str::from_utf8(entry).ok())
+        .collect()
 }
 
 fn property_first_string_eq(node: DtbNode<'static>, name: &str, expected: &str) -> bool {

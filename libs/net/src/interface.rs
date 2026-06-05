@@ -57,6 +57,8 @@ impl ManagedInterface {
         );
 
         // 配置 IP 地址（支持 IPv4 + IPv6 混合）
+        // TODO: IfMode::Auto 当前不会触发 DHCP/SLAAC，这里只会把已有
+        // config.addresses 静态写入 smoltcp。
         let cidrs: Vec<IpCidr> = config
             .addresses
             .iter()
@@ -241,6 +243,8 @@ impl ManagedInterface {
         rx_buf_size: usize,
         tx_buf_size: usize,
     ) -> SocketHandle {
+        // TODO: 缓冲区大小由调用方固定传入，缺少 SO_SNDBUF/SO_RCVBUF
+        // 动态调整和内存压力下的 backpressure 策略。
         let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(
             alloc::vec![0u8; rx_buf_size],
         );
@@ -261,6 +265,8 @@ impl ManagedInterface {
         rx_meta_count: usize,
         tx_meta_count: usize,
     ) -> SocketHandle {
+        // TODO: UDP packet metadata 数量固定，队列满时只能 WouldBlock；
+        // 还没有按 socket option 或负载自动调节。
         let rx_buf = smoltcp::socket::udp::PacketBuffer::new(
             alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; rx_meta_count],
             alloc::vec![0u8; rx_buf_size],
@@ -290,6 +296,8 @@ impl ManagedInterface {
         &mut self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::tcp::Socket<'static> {
+        // FIXME: typed accessor 直接下转 SocketSet handle，依赖外层先检查
+        // meta 和 socket 类型；旧 handle 误用仍可能触发 smoltcp panic。
         self.sockets.get_mut(handle)
     }
 
@@ -306,6 +314,7 @@ impl ManagedInterface {
         &mut self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::udp::Socket<'static> {
+        // FIXME: 同 tcp_socket_mut，缺少 generation/type guard。
         self.sockets.get_mut(handle)
     }
 
@@ -321,6 +330,8 @@ impl ManagedInterface {
     pub fn add_raw_socket(&mut self, ip_version: u8, protocol: u8) -> SocketHandle {
         use smoltcp::socket::raw;
         use smoltcp::wire::{IpVersion, IpProtocol};
+        // TODO: raw buffer/meta 容量写死，且缺少协议过滤以外的 socket option
+        // 支持，例如 IP_HDRINCL、TTL/TOS 和接收控制消息。
         let ip_ver = if ip_version == 6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 };
         let proto = IpProtocol::from(protocol);
         let rx_buf = raw::PacketBuffer::new(
@@ -340,6 +351,8 @@ impl ManagedInterface {
     /// 创建一个 ICMP socket。
     pub fn add_icmp_socket(&mut self) -> SocketHandle {
         use smoltcp::socket::icmp;
+        // TODO: ICMP 当前是最小 echo 能力，未建模 identifier、sequence
+        // 分发、错误报文队列和 IPv6 ICMP 差异。
         let rx_buf = icmp::PacketBuffer::new(
             alloc::vec![icmp::PacketMetadata::EMPTY; 8],
             alloc::vec![0u8; 8192],

@@ -46,6 +46,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// 同时也避免在每个 timer tick 都重做"遍历所有 socket + 检查状态"
 /// 这种即便空载也要花时间的工作。
 const NET_POLL_INTERVAL_NS: u64 = 5 * 1_000_000; // 5ms
+// FIXME: 5ms 固定节流会影响 TCP 握手、重传、accept 唤醒和高频 UDP
+// 延迟；后续应由 smoltcp poll_at/网卡 IRQ/等待队列 deadline 共同驱动。
 
 /// 上一次 poll 的时间戳（纳秒）。初值 0 保证第一次 tick 一定执行。
 static LAST_POLL_NS: AtomicU64 = AtomicU64::new(0);
@@ -70,6 +72,8 @@ pub fn tick_net_poll(now_ns: u64) {
         return;
     }
     // smoltcp 的 Instant::from_millis 取毫秒，向下取整即可。
+    // TODO: 这里把 ns 向下取整到 ms，短超时和连续 tick 下的协议栈时间
+    // 精度会丢失。
     net::stack().poll_ms((now_ns / 1_000_000) as i64);
 }
 

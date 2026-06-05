@@ -406,10 +406,7 @@ pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     copy_from_user(rlim_user, &mut raw).map_err(|e| e.as_errno())?;
     let cur = u64::from_le_bytes(raw[0..8].try_into().unwrap());
     let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-    let new = sched::RlimitPair::new(
-        sched::Rlim::from_raw(cur),
-        sched::Rlim::from_raw(max),
-    );
+    let new = sched::RlimitPair::new(sched::Rlim::from_raw(cur), sched::Rlim::from_raw(max));
     let _old = sched::operation::set_rlimit(resource, new)?;
     Ok(0)
 }
@@ -544,7 +541,12 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         return Ok(0);
     }
     loop {
-        if sched::now_ns_public() >= deadline {
+        let now = if absolute {
+            crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)?
+        } else {
+            sched::now_ns_public()
+        };
+        if now >= deadline {
             return Ok(0);
         }
         sched::operation::sched_yield()?;

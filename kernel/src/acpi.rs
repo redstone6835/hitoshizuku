@@ -410,10 +410,13 @@ pub fn kernel_start_init(context: &StartContext) {
         .expect("[kernel-start][acpi] failed to install PnP devtmpfs bridge");
     printk!("[kernel-start][acpi] PnP devtmpfs callbacks installed");
 
-    set_dev_init_context(DevInitContext::new(
-        context.address.device_mmio_to_virt,
-        context.address.virt_to_phys,
-    ));
+    set_dev_init_context(
+        DevInitContext::new(
+            context.address.device_mmio_to_virt,
+            context.address.virt_to_phys,
+        )
+        .with_realtime_clock(crate::vdso::set_realtime_ns),
+    );
     drivers::register_builtin_drivers()
         .expect("[kernel-start][acpi] failed to register built-in PnP drivers");
     printk!("[kernel-start][acpi] registered built-in PnP drivers");

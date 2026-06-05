@@ -222,6 +222,8 @@ pub struct DevInitContext {
     pub device_mmio_to_virt: fn(usize) -> usize,
     /// 将内核虚拟地址转换为设备 DMA 可使用的物理地址。
     pub virt_to_phys: fn(usize) -> usize,
+    /// 用硬件 RTC 读出的 Unix 纳秒时间更新内核 realtime 时钟。
+    pub set_realtime_ns: Option<fn(u64)>,
 }
 
 impl DevInitContext {
@@ -232,7 +234,13 @@ impl DevInitContext {
         Self {
             device_mmio_to_virt,
             virt_to_phys,
+            set_realtime_ns: None,
         }
+    }
+
+    pub const fn with_realtime_clock(mut self, set_realtime_ns: fn(u64)) -> Self {
+        self.set_realtime_ns = Some(set_realtime_ns);
+        self
     }
 }
 

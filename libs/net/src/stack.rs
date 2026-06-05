@@ -20,7 +20,6 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -70,6 +69,9 @@ pub struct NetStack {
     /// 简单的"全唤醒"策略在大量任务阻塞时会有一次惊群，但内核场景
     /// （几十~几百个 task）完全可接受；比 smoltcp Waker 路径少一组
     /// RawWaker/VTable，零外部依赖。
+    ///
+    /// FIXME: 这里是粗粒度全局唤醒，不能区分具体 socket/事件类型；
+    /// 高并发网络负载下会惊群，也会掩盖遗漏精确 readiness 通知的问题。
     notify_waiters: sched::WaitQueue,
 }
 
@@ -128,6 +130,9 @@ impl NetStack {
             }
         }
         drop(table);
+        // FIXME: 当前每次协议栈 poll 都唤醒所有 socket 等待者，应该改为
+        // 按 socket handle 和事件类型精确唤醒，避免 accept/connect/recv/send
+        // 互相误唤醒。
         self.wake_socket_waiters();
     }
 
@@ -147,6 +152,8 @@ impl NetStack {
             iface_lock.lock().poll(timestamp);
         }
         drop(table);
+        // FIXME: 中断快速路径也走全局唤醒，多个接口/多个 socket 时会把
+        // 与本接口无关的等待任务一并唤醒。
         self.wake_socket_waiters();
     }
 
@@ -187,6 +194,8 @@ impl NetStack {
     ///
     /// 返回句柄用于后续操作。socket 初始处于 Closed 状态。
     /// 如果没有任何已注册接口，返回 `InterfaceNotFound`。
+    /// FIXME: 默认接口当前由 `default_iface_id()` 取注册表第一个条目，
+    /// 没有根据目标地址、bind 地址或路由表选接口。
     pub fn socket_tcp(&self) -> Result<NetSocketHandle, NetError> {
         self.socket_tcp_on(self.default_iface_id()?)
     }
@@ -226,6 +235,8 @@ impl NetStack {
 
     /// 创建一个 raw IP socket（指定 IP 协议号）。
     pub fn socket_raw(&self, ip_version: u8, protocol: u8) -> Result<NetSocketHandle, NetError> {
+        // FIXME: raw socket 也使用默认接口，缺少 SO_BINDTODEVICE、路由
+        // 查找和按地址族选择接口的能力。
         let iface_id = self.default_iface_id()?;
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
@@ -240,6 +251,8 @@ impl NetStack {
 
     /// 创建一个 ICMP socket。
     pub fn socket_icmp(&self) -> Result<NetSocketHandle, NetError> {
+        // FIXME: ICMP socket 也固定落到默认接口，ping 外部地址时可能错误
+        // 走 loopback 或其它非目标路由接口。
         let iface_id = self.default_iface_id()?;
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
@@ -268,6 +281,8 @@ impl NetStack {
         }
         match handle.sock_type {
             SocketType::Raw => {
+                // TODO: raw IP 发送目前忽略 remote，缺少 per-packet 目的地址、
+                // 路由元信息和 IP_HDRINCL 等 Linux raw socket 语义。
                 let socket = managed.raw_socket_mut(handle.inner);
                 let tx_buf = socket.send(data.len()).map_err(|_| NetError::WouldBlock)?;
                 tx_buf.copy_from_slice(data);
@@ -275,6 +290,8 @@ impl NetStack {
             }
             SocketType::Icmp => {
                 let remote = remote.ok_or(NetError::InvalidArgument)?;
+                // TODO: ICMP 仅把 remote addr 传给 smoltcp，尚未支持 identifier
+                // 绑定、IPv6 ICMP 细分语义和 socket 级过滤。
                 let socket = managed.icmp_socket_mut(handle.inner);
                 socket
                     .send_slice(data, endpoint_to_smoltcp(&remote).addr)
@@ -299,6 +316,8 @@ impl NetStack {
             SocketType::Raw => {
                 let socket = managed.raw_socket_mut(handle.inner);
                 let data = socket.recv().map_err(|_| NetError::WouldBlock)?;
+                // FIXME: raw::Socket::recv() 的来源/接口元信息在这里被丢弃，
+                // VFS recvfrom 无法返回 peer 地址。
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
                 Ok(n)
@@ -306,6 +325,7 @@ impl NetStack {
             SocketType::Icmp => {
                 let socket = managed.icmp_socket_mut(handle.inner);
                 let (data, _) = socket.recv().map_err(|_| NetError::WouldBlock)?;
+                // FIXME: ICMP recv 丢弃 endpoint，导致 recvfrom 只能返回 None。
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
                 Ok(n)
@@ -349,6 +369,8 @@ impl NetStack {
     /// 调用后 socket 进入 `Connecting` 状态，需要 poll 驱动握手完成。
     /// 上层用 `socket_state()` 轮询直到 `Established` 或超时。
     pub fn tcp_connect(&self, handle: NetSocketHandle, remote: Endpoint) -> Result<(), NetError> {
+        // FIXME: connect 不做路由选择，也没有处理本地地址/端口冲突；
+        // ephemeral port 只是全局递增，可能与已有连接或监听端口碰撞。
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
@@ -702,6 +724,8 @@ impl NetStack {
         data: &[u8],
         remote: Endpoint,
     ) -> Result<usize, NetError> {
+        // FIXME: UDP 发送沿用 socket 创建时的接口，缺少按 remote 路由选路
+        // 和 connected UDP 的协议栈状态校验。
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
@@ -784,6 +808,8 @@ impl NetStack {
     /// 调用者需要保证此刻没有其它代码路径仍持有该 handle 的引用（典型
     /// 场景是文件 fd 即将被 drop、`NetSocketFileOps::handle` 已被 take）。
     pub fn socket_close_and_remove(&self, handle: NetSocketHandle) {
+        // FIXME: 这里把"没有其它并发 handle 使用者"作为调用方约束，
+        // 网络层本身没有引用计数或 generation 校验来防止旧 handle 误用。
         // 关：让 smoltcp 把内部状态重置（TCP: Closed；UDP: 清 endpoint；RAW/ICMP:
         // release rx/tx buffer）。即使 socket 即将被删，也走一遍以释放 driver
         // 持有的 DMA / 缓冲区。
@@ -824,6 +850,8 @@ impl NetStack {
 
     /// 查询 socket 是否有数据可读。
     pub fn socket_can_recv(&self, handle: NetSocketHandle) -> bool {
+        // TODO: readiness 当前直接使用 smoltcp can_recv，TCP listen/half-close、
+        // UDP datagram 长度、raw/icmp 元信息等 POSIX poll 语义仍是近似值。
         let table = self.interfaces.read();
         let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
         let managed = iface_lock.lock();
@@ -838,6 +866,8 @@ impl NetStack {
 
     /// 查询 socket 是否可以发送数据。
     pub fn socket_can_send(&self, handle: NetSocketHandle) -> bool {
+        // TODO: can_send 只表示内部发送缓冲区可写，不等价于 connect 完成、
+        // 对端仍存活或错误队列为空。
         let table = self.interfaces.read();
         let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
         let managed = iface_lock.lock();
@@ -875,6 +905,9 @@ impl NetStack {
     ///   connection 返回；
     /// - 同时新建一个 socket 顶替 listen 角色，并把新的 listen handle 返回
     ///   给调用方，由 VFS 层直接替换原 listen fd 持有的 handle。
+    ///
+    /// FIXME: 这是 smoltcp listen socket 被连接原地转换后的补救模式，
+    /// 没有真正 backlog 队列；accept 和重新 listen 之间存在监听空窗。
     pub fn tcp_accept(
         &self,
         handle: NetSocketHandle,
@@ -917,6 +950,8 @@ impl NetStack {
         &self,
         listen_handle: NetSocketHandle,
     ) -> Result<(NetSocketHandle, NetSocketHandle), NetError> {
+        // FIXME: 替换监听 socket 不是原子化对外可见的 accept 队列模型；
+        // 多个 accept 任务并发时仍依赖上层 handle 交换顺序保持一致。
         let (accepted, new_listen) = {
             let table = self.interfaces.read();
             let iface_lock = table
@@ -935,10 +970,9 @@ impl NetStack {
                 return Err(NetError::WouldBlock);
             }
 
-            let listen_port = managed
+            let listen_endpoint = managed
                 .tcp_socket(listen_handle.inner)
-                .listen_endpoint()
-                .port;
+                .listen_endpoint();
 
             let new_listen_handle = managed.add_tcp_socket(TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE);
             let new_listen = NetSocketHandle {
@@ -948,7 +982,7 @@ impl NetStack {
             };
             managed
                 .tcp_socket_mut(new_listen_handle)
-                .listen(listen_port)
+                .listen(listen_endpoint)
                 .map_err(|_| NetError::AddressInUse)?;
             let accepted = NetSocketHandle {
                 iface_id: listen_handle.iface_id,
@@ -1017,6 +1051,8 @@ impl NetStack {
                 }
             }
             SocketType::Raw => {
+                // TODO: raw socket 没有连接态，这里用 can_recv/can_send 推导
+                // Established 只是为了兼容上层等待逻辑。
                 if managed.raw_socket(handle.inner).can_recv()
                     || managed.raw_socket(handle.inner).can_send()
                 {
@@ -1026,6 +1062,8 @@ impl NetStack {
                 }
             }
             SocketType::Icmp => {
+                // TODO: ICMP socket 也没有严格连接态，这里返回 Established
+                // 只是近似 readiness，不代表 peer/identifier 已绑定。
                 if managed.icmp_socket(handle.inner).can_recv()
                     || managed.icmp_socket(handle.inner).can_send()
                 {
@@ -1040,6 +1078,8 @@ impl NetStack {
     // ── 内部辅助 ─────────────────────────────────────────────────────────
 
     fn default_iface_id(&self) -> Result<InterfaceId, NetError> {
+        // FIXME: BTreeMap 第一个 key 不是 Linux 的默认路由语义；当前通常
+        // 会优先选 lo，导致外部连接/UDP/ICMP 可能走错接口。
         let table = self.interfaces.read();
         table
             .keys()

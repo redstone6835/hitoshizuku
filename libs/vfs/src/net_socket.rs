@@ -259,8 +259,11 @@ impl FileOps for NetSocketFileOps {
                 let handle = self.get_handle()?;
                 let n = match handle.socket_type() {
                     SocketType::Tcp => net::stack().tcp_recv_queue(handle),
+                    // TODO: UDP 应返回下一个 datagram 的长度或队列中可读字节数，
+                    // 当前固定 0 会误导 ioctl(FIONREAD) 调用者。
                     SocketType::Udp => 0,
                     SocketType::Raw | SocketType::Icmp => {
+                        // TODO: raw/icmp 这里只返回是否可读，未暴露实际 packet 长度。
                         if net::stack().raw_can_recv(handle) { 1 } else { 0 }
                     }
                 };
@@ -290,6 +293,8 @@ impl NetSocketFileOps {
     pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
         let ep = addr::parse_inet_sockaddr(sockaddr)?;
         let handle = self.get_handle()?;
+        // FIXME: local 是 VFS 层缓存，TCP bind 暂不下沉到协议栈，UDP/RAW/ICMP
+        // 的 getsockname 也不一定反映 smoltcp 真实 endpoint。
         *self.local.lock() = Some(ep);
         match handle.socket_type() {
             SocketType::Udp => net::stack().udp_bind(handle, ep).map_err(map_net_error),
@@ -299,6 +304,7 @@ impl NetSocketFileOps {
     }
 
     pub fn listen(&self, _backlog: u32) -> Result<(), Errno> {
+        // FIXME: backlog 参数被完全忽略；底层也没有真正的 pending accept 队列。
         let handle = self.get_handle()?;
         if handle.socket_type() != SocketType::Tcp {
             return Err(Errno::EOPNOTSUPP);
@@ -315,6 +321,9 @@ impl NetSocketFileOps {
         loop {
             match net::stack().tcp_accept(handle) {
                 Ok((accepted_handle, new_listen_handle)) => {
+                    // FIXME: listen fd 的 handle 在 accept 成功时被替换；并发
+                    // accept/poll 路径必须依赖外层文件锁与调度顺序，网络层没有
+                    // 独立 generation 校验。
                     *self.handle.lock() = Some(new_listen_handle);
                     let accepted = Self::new(
                         accepted_handle, self.family, self.sock_type, nonblock,
@@ -327,6 +336,8 @@ impl NetSocketFileOps {
                     if self.is_nonblock() || nonblock {
                         return Err(Errno::EAGAIN);
                     }
+                    // FIXME: 阻塞 accept 只依赖 timer poll 后的全局唤醒，
+                    // 若协议栈 poll 被节流或中断路径漏调，用户态可能长期睡眠。
                     self.yield_wait();
                 }
                 Err(e) => return Err(map_net_error(e)),
@@ -337,6 +348,8 @@ impl NetSocketFileOps {
     pub fn connect(&self, sockaddr: &[u8]) -> Result<(), Errno> {
         let ep = addr::parse_inet_sockaddr(sockaddr)?;
         let handle = self.get_handle()?;
+        // FIXME: remote 是 VFS 层缓存；UDP/RAW/ICMP connect 不会同步到底层
+        // socket，getpeername 可能返回一个协议栈并未验证过的地址。
         *self.remote.lock() = Some(ep);
         match handle.socket_type() {
             SocketType::Tcp => {
@@ -347,10 +360,14 @@ impl NetSocketFileOps {
                         match state {
                             net::SocketState::Established => return Ok(()),
                             net::SocketState::Closed => return Err(Errno::ECONNREFUSED),
+                            // FIXME: 阻塞 connect 没有独立超时或错误队列检查，
+                            // 依赖全局 poll 唤醒后再次读取粗粒度 SocketState。
                             _ => self.yield_wait(),
                         }
                     }
                 }
+                // TODO: 非阻塞 TCP connect 当前直接返回 Ok，缺少 EINPROGRESS /
+                // SO_ERROR 完成状态语义。
                 Ok(())
             }
             SocketType::Udp | SocketType::Raw | SocketType::Icmp => Ok(()),
@@ -389,6 +406,8 @@ impl NetSocketFileOps {
     pub fn sendto(&self, data: &[u8], addr: Option<&[u8]>) -> Result<usize, Errno> {
         if let Some(sockaddr) = addr {
             let ep = addr::parse_inet_sockaddr(sockaddr)?;
+            // FIXME: sendto 带地址会覆盖 socket 级 remote 缓存，导致无连接
+            // UDP 的一次性目的地址影响后续 write/send 行为。
             *self.remote.lock() = Some(ep);
         }
         self.do_send(data)
@@ -415,6 +434,8 @@ impl NetSocketFileOps {
             },
             SocketType::Raw | SocketType::Icmp => {
                 let n = self.do_recv(buf)?;
+                // FIXME: raw/icmp 接收路径丢弃来源 endpoint，recvfrom 无法返回
+                // remote 地址或入接口信息。
                 Ok((n, None))
             }
         }
@@ -427,6 +448,8 @@ impl NetSocketFileOps {
     pub fn getsockname(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let local = *self.local.lock();
         match local {
+            // FIXME: 对 TCP 已连接 socket 应优先查询协议栈真实 local endpoint；
+            // 对 UDP 自动绑定端口也不能只看 VFS 缓存。
             Some(ep) => addr::encode_inet_sockaddr(&ep, self.family, buf),
             None => {
                 let zero = Endpoint {
@@ -441,6 +464,8 @@ impl NetSocketFileOps {
     pub fn getpeername(&self, buf: &mut [u8]) -> Result<usize, Errno> {
         let remote = *self.remote.lock();
         match remote {
+            // FIXME: TCP 应返回协议栈真实 peer；UDP/RAW 当前只是 connect/sendto
+            // 写入的缓存值，不能代表底层连通性或路由结果。
             Some(ep) => addr::encode_inet_sockaddr(&ep, self.family, buf),
             None => Err(Errno::ENOTCONN),
         }
@@ -467,9 +492,12 @@ impl NetSocketFileOps {
             },
             SocketType::Udp => {
                 let remote = self.remote.lock().ok_or(Errno::EDESTADDRREQ)?;
+                // FIXME: connected UDP 由 VFS remote 缓存模拟，底层 UDP socket
+                // 没有 connect 状态，也不会过滤非 peer datagram。
                 net::stack().udp_send_to(handle, data, remote).map_err(map_net_error)
             }
             SocketType::Raw => {
+                // TODO: raw send 缺少目的地址、IP_HDRINCL、MSG_DONTROUTE 等语义。
                 net::stack().raw_send(handle, data, None).map_err(map_net_error)
             }
             SocketType::Icmp => {
@@ -521,6 +549,8 @@ impl NetSocketFileOps {
                     Err(NetError::WouldBlock) => {
                         if self.is_nonblock() { return Err(Errno::EAGAIN); }
                         if self.deadline_expired(deadline) { return Err(Errno::EAGAIN); }
+                        // FIXME: 阻塞 I/O 等待由全局 net poll 唤醒，缺少精确
+                        // socket readiness 订阅。
                         self.wait_with_deadline(deadline);
                     }
                     Err(e) => return Err(map_net_error(e)),
@@ -528,6 +558,8 @@ impl NetSocketFileOps {
             },
             SocketType::Udp => loop {
                 match net::stack().udp_recv_from(handle, buf) {
+                    // FIXME: read() on connected UDP 未过滤 remote，可能读到任意
+                    // 来源 datagram。
                     Ok((n, _)) => return Ok(n),
                     Err(NetError::WouldBlock) => {
                         if self.is_nonblock() { return Err(Errno::EAGAIN); }
@@ -597,6 +629,8 @@ pub fn create_net_socket(
 // ── 错误映射 ─────────────────────────────────────────────────────────────────
 
 fn map_net_error(e: NetError) -> Errno {
+    // TODO: 错误映射过粗，缺少 ENOTCONN/EHOSTUNREACH/ENETUNREACH/EISCONN
+    // 等网络语义；Closed 也不应在所有路径都映射成 EPIPE。
     match e {
         NetError::WouldBlock => Errno::EAGAIN,
         NetError::ConnectionRefused => Errno::ECONNREFUSED,

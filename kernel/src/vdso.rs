@@ -13,6 +13,8 @@ const CYCLE_TO_NS_SHIFT: u32 = 24;
 
 pub const CLOCK_REALTIME: usize = 0;
 pub const CLOCK_MONOTONIC: usize = 1;
+pub const CLOCK_REALTIME_COARSE: usize = 5;
+pub const CLOCK_MONOTONIC_COARSE: usize = 6;
 pub const CLOCK_BOOTTIME: usize = 7;
 
 #[repr(C)]
@@ -49,17 +51,31 @@ pub fn realtime_ns() -> u64 {
     apply_realtime_offset(monotonic_ns())
 }
 
+pub fn set_realtime_ns(realtime_ns: u64) {
+    let now_ns = monotonic_ns();
+    let offset = (realtime_ns as i128).saturating_sub(now_ns as i128);
+    let offset = offset.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    REALTIME_OFFSET_NS.store(offset, Ordering::Relaxed);
+    if let Some(data) = data_ptr() {
+        write_data(data, now_ns);
+    }
+}
+
 pub fn clock_time_ns(clock_id: usize) -> Option<u64> {
     match clock_id {
-        CLOCK_REALTIME => Some(realtime_ns()),
-        CLOCK_MONOTONIC | CLOCK_BOOTTIME => Some(monotonic_ns()),
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE => Some(realtime_ns()),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => Some(monotonic_ns()),
         _ => None,
     }
 }
 
 pub fn clock_getres_ns(clock_id: usize) -> Option<u32> {
     match clock_id {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => Some(1),
+        CLOCK_REALTIME
+        | CLOCK_MONOTONIC
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME => Some(1),
         _ => None,
     }
 }

@@ -756,6 +756,8 @@ pub fn send(
     validate_send_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        // FIXME: AF_INET/AF_INET6 net socket 路径当前忽略 control message 和
+        // 大部分 send flags，MSG_DONTWAIT/MSG_MORE/MSG_DONTROUTE 等没有下沉。
         return net_ops.sendto(data, raw_addr);
     }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
@@ -809,6 +811,8 @@ pub fn recv(
     }
 
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        // FIXME: AF_INET/AF_INET6 net socket 路径当前忽略 recv flags、deadline
+        // 和 control message，MSG_PEEK/MSG_WAITALL/MSG_TRUNC 等语义不完整。
         let (len, remote) = net_ops.recvfrom(data)?;
         let address = if want_addr {
             remote.and_then(|ep| {
