@@ -28,12 +28,14 @@ use crate::vfs::mount::{Mount, MountFlags};
 use crate::vfs::path::{self, Dirfd, LookupFlags};
 use crate::vfs::stat::{DevId, FileMode, FileType, FsId, Timespec};
 use crate::vfs::superblock::{InodeCache, Superblock, SuperblockOps};
+use crate::net_socket::NetSocketFileOps;
 use crate::vfs::sync::Spinlock;
 
 pub const AF_UNIX: u16 = 1;
 
 pub const SOCK_STREAM: usize = 1;
 pub const SOCK_DGRAM: usize = 2;
+pub const SOCK_RAW: usize = 3;
 pub const SOCK_SEQPACKET: usize = 5;
 pub const SOCK_TYPE_MASK: usize = 0xf;
 pub const SOCK_NONBLOCK: usize = 0o00004000;
@@ -41,6 +43,8 @@ pub const SOCK_CLOEXEC: usize = 0o02000000;
 
 pub const SOL_SOCKET: i32 = 1;
 pub const SO_REUSEADDR: i32 = 2;
+pub const SO_BROADCAST: i32 = 6;
+pub const SO_KEEPALIVE: i32 = 9;
 pub const SCM_RIGHTS: i32 = 1;
 pub const SCM_CREDENTIALS: i32 = 2;
 pub const SO_ERROR: i32 = 4;
@@ -406,6 +410,48 @@ fn new_socket_file(socket: CoreSocket, cred: Arc<Credentials>, nonblock: bool) -
     Arc::new(file)
 }
 
+fn new_net_socket_file(ops: NetSocketFileOps, cred: Arc<Credentials>, nonblock: bool) -> Arc<File> {
+    let (mount, inode, dentry) = get_or_init_socket_fs();
+    let flags = OpenOptions {
+        access: crate::vfs::file::AccessMode::ReadWrite,
+        nonblock,
+        ..Default::default()
+    };
+    let file = File::new(
+        inode,
+        flags,
+        cred,
+        Box::new(ops),
+        dentry,
+        Arc::clone(&mount),
+    );
+    mount.inc_open();
+    Arc::new(file)
+}
+
+fn new_netlink_socket_file(
+    ops: crate::netlink_socket::NetlinkSocketFileOps,
+    cred: Arc<Credentials>,
+    nonblock: bool,
+) -> Arc<File> {
+    let (mount, inode, dentry) = get_or_init_socket_fs();
+    let flags = OpenOptions {
+        access: crate::vfs::file::AccessMode::ReadWrite,
+        nonblock,
+        ..Default::default()
+    };
+    let file = File::new(
+        inode,
+        flags,
+        cred,
+        Box::new(ops),
+        dentry,
+        Arc::clone(&mount),
+    );
+    mount.inc_open();
+    Arc::new(file)
+}
+
 fn socket_from_file(file: &Arc<File>) -> Result<CoreSocket, Errno> {
     let Some(ops) = file.downcast_ops::<SocketFileOps>() else {
         return Err(Errno::ENOTSOCK);
@@ -464,21 +510,38 @@ pub fn socket(
     ty: usize,
     protocol: usize,
 ) -> Result<Fd, Errno> {
-    if domain as u16 != AF_UNIX {
-        return Err(Errno::EAFNOSUPPORT);
+    // AF_NETLINK 需要接受 SOCK_RAW/SOCK_DGRAM，单独处理
+    if domain as u16 == 16 {
+        let nonblock = (ty & SOCK_NONBLOCK) != 0;
+        let cloexec = (ty & SOCK_CLOEXEC) != 0;
+        let fd_flags = if cloexec { FdFlags::CLOEXEC } else { FdFlags::default() };
+        let ops = crate::netlink_socket::create_netlink_socket(protocol as u32, nonblock);
+        let file = new_netlink_socket_file(ops, Arc::clone(&ctx.cred), nonblock);
+        return fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno());
     }
-    if protocol != 0 {
-        return Err(Errno::EOPNOTSUPP);
-    }
+
     let (kind, nonblock, cloexec) = parse_type(ty)?;
-    let socket = CoreSocket::new_unix(kind, current_identity(ctx)).map_err(map_socket_error)?;
-    let file = new_socket_file(socket, Arc::clone(&ctx.cred), nonblock);
-    let fd_flags = if cloexec {
-        FdFlags::CLOEXEC
-    } else {
-        FdFlags::default()
-    };
-    fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
+    let fd_flags = if cloexec { FdFlags::CLOEXEC } else { FdFlags::default() };
+
+    match domain as u16 {
+        AF_UNIX => {
+            if protocol != 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            let socket = CoreSocket::new_unix(kind, current_identity(ctx))
+                .map_err(map_socket_error)?;
+            let file = new_socket_file(socket, Arc::clone(&ctx.cred), nonblock);
+            fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
+        }
+        crate::addr::AF_INET | crate::addr::AF_INET6 => {
+            let ops = crate::net_socket::create_net_socket(
+                domain as u16, ty as u16, protocol as u16, nonblock,
+            )?;
+            let file = new_net_socket_file(ops, Arc::clone(&ctx.cred), nonblock);
+            fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
+    }
 }
 
 pub fn socketpair(
@@ -523,6 +586,12 @@ pub fn socketpair(
 
 pub fn bind(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.bind(raw_addr);
+    }
+    if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        return nl_ops.bind(raw_addr);
+    }
     let socket = socket_from_file(&file)?;
     let resolved = resolve_bind_address(ctx, raw_addr)?;
     match socket.bind(resolved.address) {
@@ -542,6 +611,9 @@ pub fn unregister_path_socket(fs: u64, ino: u64) {
 
 pub fn listen(fdt: &FdTable, fd: Fd, backlog: usize) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.listen(backlog as u32);
+    }
     let socket = socket_from_file(&file)?;
     socket.listen(backlog).map_err(map_socket_error)
 }
@@ -553,8 +625,17 @@ pub fn accept(
     flags: usize,
 ) -> Result<(Fd, Option<Vec<u8>>), Errno> {
     let file = file_from_fd(fdt, fd)?;
-    let socket = socket_from_file(&file)?;
     let (nonblock, cloexec) = parse_accept_flags(flags)?;
+    let fd_flags = if cloexec { FdFlags::CLOEXEC } else { FdFlags::default() };
+
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        let accepted = net_ops.accept(file.flags().nonblock || nonblock)?;
+        let new_file = new_net_socket_file(accepted, Arc::clone(&ctx.cred), nonblock);
+        let new_fd = fdt.alloc_fd(new_file, fd_flags).map_err(|e| e.to_errno())?;
+        return Ok((new_fd, None));
+    }
+
+    let socket = socket_from_file(&file)?;
     let accepted = socket
         .accept(ReceiveOptions {
             nonblocking: file.flags().nonblock || nonblock,
@@ -567,11 +648,6 @@ pub fn accept(
         .peer_address()
         .ok()
         .map(|addr| encode_sockaddr_un(&addr));
-    let fd_flags = if cloexec {
-        FdFlags::CLOEXEC
-    } else {
-        FdFlags::default()
-    };
     let new_fd = fdt
         .alloc_fd(
             new_socket_file(accepted, Arc::clone(&ctx.cred), nonblock),
@@ -583,6 +659,9 @@ pub fn accept(
 
 pub fn connect(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.connect(raw_addr);
+    }
     let socket = socket_from_file(&file)?;
     let address = resolve_connect_address(ctx, raw_addr)?;
     socket
@@ -602,12 +681,24 @@ pub fn connect(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Resu
 
 pub fn getsockname(fdt: &FdTable, fd: Fd) -> Result<Vec<u8>, Errno> {
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        let mut buf = vec![0u8; 28];
+        let len = net_ops.getsockname(&mut buf)?;
+        buf.truncate(len);
+        return Ok(buf);
+    }
     let socket = socket_from_file(&file)?;
     Ok(encode_sockaddr_un(&socket.local_address()))
 }
 
 pub fn getpeername(fdt: &FdTable, fd: Fd) -> Result<Vec<u8>, Errno> {
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        let mut buf = vec![0u8; 28];
+        let len = net_ops.getpeername(&mut buf)?;
+        buf.truncate(len);
+        return Ok(buf);
+    }
     let socket = socket_from_file(&file)?;
     let addr = socket.peer_address().map_err(map_socket_error)?;
     Ok(encode_sockaddr_un(&addr))
@@ -615,6 +706,9 @@ pub fn getpeername(fdt: &FdTable, fd: Fd) -> Result<Vec<u8>, Errno> {
 
 pub fn shutdown(fdt: &FdTable, fd: Fd, how: usize) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.shutdown(how as u32);
+    }
     let socket = socket_from_file(&file)?;
     let how = match how {
         SHUT_RD => SocketShutdown::Read,
@@ -643,6 +737,12 @@ pub fn send(
 ) -> Result<usize, Errno> {
     validate_send_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return net_ops.sendto(data, raw_addr);
+    }
+    if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        return nl_ops.write_at(data, 0).map_err(|e| e.to_errno());
+    }
     let socket = socket_from_file(&file)?;
     let decoded = decode_send_control(ctx, fdt, &file, &socket, control)?;
     let address = match raw_addr {
@@ -676,6 +776,35 @@ pub fn recv(
 ) -> Result<RecvOutput, Errno> {
     validate_recv_flags(flags)?;
     let file = file_from_fd(fdt, fd)?;
+
+    if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
+        let len = nl_ops.read_at(data, 0).map_err(|e| e.to_errno())?;
+        // 返回 sockaddr_nl（12 字节）：family=AF_NETLINK(16), pad=0, pid=0, groups=0
+        let address = if want_addr {
+            let mut sa = vec![0u8; 12];
+            sa[0..2].copy_from_slice(&16u16.to_ne_bytes()); // nl_family = AF_NETLINK
+            Some(sa)
+        } else {
+            None
+        };
+        return Ok(RecvOutput { len, address, control: Vec::new(), msg_flags: 0 });
+    }
+
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        let (len, remote) = net_ops.recvfrom(data)?;
+        let address = if want_addr {
+            remote.and_then(|ep| {
+                let mut buf = vec![0u8; 28];
+                crate::addr::encode_inet_sockaddr(&ep, net_ops.family(), &mut buf)
+                    .ok()
+                    .map(|sz| { buf.truncate(sz); buf })
+            })
+        } else {
+            None
+        };
+        return Ok(RecvOutput { len, address, control: Vec::new(), msg_flags: 0 });
+    }
+
     let socket = socket_from_file(&file)?;
     let nonblocking = file.flags().nonblock || (flags & MSG_DONTWAIT) != 0;
     let peek = (flags & MSG_PEEK) != 0;
@@ -721,6 +850,16 @@ pub fn recv(
 
 pub fn getsockopt(fdt: &FdTable, fd: Fd, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
     let file = file_from_fd(fdt, fd)?;
+
+    // AF_NETLINK socket
+    if file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>().is_some() {
+        return netlink_getsockopt(level, optname);
+    }
+    // AF_INET/AF_INET6 socket
+    if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
+        return inet_getsockopt(net_ops, level, optname);
+    }
+
     let socket = socket_from_file(&file)?;
     if level != SOL_SOCKET {
         return Err(Errno::ENOPROTOOPT);
@@ -771,6 +910,14 @@ pub fn setsockopt(
     value: &[u8],
 ) -> Result<(), Errno> {
     let file = file_from_fd(fdt, fd)?;
+
+    if file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>().is_some() {
+        return netlink_setsockopt(level, optname, value);
+    }
+    if file.downcast_ops::<NetSocketFileOps>().is_some() {
+        return inet_setsockopt(level, optname, value);
+    }
+
     let socket = socket_from_file(&file)?;
     if level != SOL_SOCKET {
         return Err(Errno::ENOPROTOOPT);
@@ -818,6 +965,142 @@ fn parse_accept_flags(flags: usize) -> Result<(bool, bool), Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(((flags & SOCK_NONBLOCK) != 0, (flags & SOCK_CLOEXEC) != 0))
+}
+
+// ── AF_INET / AF_INET6 sockopt ──────────────────────────────────────────────
+
+const SOL_IP: i32 = 0;
+const SOL_TCP: i32 = 6;
+const SOL_IPV6: i32 = 41;
+
+const TCP_NODELAY: i32 = 1;
+const TCP_MAXSEG: i32 = 2;
+const TCP_CORK: i32 = 3;
+const TCP_KEEPIDLE: i32 = 4;
+const TCP_KEEPINTVL: i32 = 5;
+const TCP_KEEPCNT: i32 = 6;
+const TCP_INFO: i32 = 11;
+const TCP_CONGESTION: i32 = 13;
+
+const IP_TOS: i32 = 1;
+const IP_TTL: i32 = 2;
+const IP_MULTICAST_IF: i32 = 32;
+const IP_MULTICAST_TTL: i32 = 33;
+const IP_MULTICAST_LOOP: i32 = 34;
+const IP_ADD_MEMBERSHIP: i32 = 35;
+const IP_DROP_MEMBERSHIP: i32 = 36;
+
+const IPV6_V6ONLY: i32 = 26;
+const IPV6_UNICAST_HOPS: i32 = 16;
+
+fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
+    match level {
+        SOL_SOCKET => match optname {
+            SO_DOMAIN => Ok((net_ops.family() as i32).to_ne_bytes().to_vec()),
+            SO_TYPE => {
+                let ty = match net_ops.family() { _ => SOCK_STREAM as i32 };
+                Ok(ty.to_ne_bytes().to_vec())
+            }
+            SO_ERROR => Ok(0i32.to_ne_bytes().to_vec()),
+            SO_SNDBUF => Ok(212992i32.to_ne_bytes().to_vec()),
+            SO_RCVBUF => Ok(212992i32.to_ne_bytes().to_vec()),
+            SO_KEEPALIVE | SO_BROADCAST | SO_REUSEADDR | SO_REUSEPORT => {
+                Ok(0i32.to_ne_bytes().to_vec()) // TODO
+            }
+            SO_LINGER => Ok(vec![0u8; 8]), // TODO: struct linger
+            SO_RCVTIMEO | SO_SNDTIMEO => Ok(vec![0u8; 16]), // TODO: struct timeval
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_TCP => match optname {
+            TCP_NODELAY | TCP_CORK => Ok(0i32.to_ne_bytes().to_vec()), // TODO
+            TCP_MAXSEG => Ok(1460i32.to_ne_bytes().to_vec()),
+            TCP_KEEPIDLE => Ok(7200i32.to_ne_bytes().to_vec()), // TODO
+            TCP_KEEPINTVL => Ok(75i32.to_ne_bytes().to_vec()), // TODO
+            TCP_KEEPCNT => Ok(9i32.to_ne_bytes().to_vec()), // TODO
+            TCP_INFO => Err(Errno::ENOPROTOOPT), // TODO: complex struct
+            TCP_CONGESTION => Ok(b"cubic\0".to_vec()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_IP => match optname {
+            IP_TTL => Ok(64i32.to_ne_bytes().to_vec()), // TODO
+            IP_TOS => Ok(0i32.to_ne_bytes().to_vec()), // TODO
+            IP_MULTICAST_TTL => Ok(1i32.to_ne_bytes().to_vec()), // TODO
+            IP_MULTICAST_LOOP => Ok(1i32.to_ne_bytes().to_vec()), // TODO
+            IP_MULTICAST_IF => Ok(vec![0u8; 4]), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_IPV6 => match optname {
+            IPV6_V6ONLY => Ok(0i32.to_ne_bytes().to_vec()), // TODO
+            IPV6_UNICAST_HOPS => Ok(64i32.to_ne_bytes().to_vec()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
+fn inet_setsockopt(level: i32, optname: i32, _value: &[u8]) -> Result<(), Errno> {
+    match level {
+        SOL_SOCKET => match optname {
+            SO_KEEPALIVE | SO_BROADCAST | SO_REUSEADDR | SO_REUSEPORT
+            | SO_LINGER | SO_RCVTIMEO | SO_SNDTIMEO | SO_SNDBUF | SO_RCVBUF => Ok(()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_TCP => match optname {
+            TCP_NODELAY | TCP_CORK | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT
+            | TCP_CONGESTION => Ok(()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_IP => match optname {
+            IP_TTL | IP_TOS | IP_MULTICAST_TTL | IP_MULTICAST_LOOP
+            | IP_MULTICAST_IF | IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => Ok(()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_IPV6 => match optname {
+            IPV6_V6ONLY | IPV6_UNICAST_HOPS => Ok(()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
+// ── AF_NETLINK sockopt ──────────────────────────────────────────────────────
+
+const SOL_NETLINK: i32 = 270;
+const NETLINK_ADD_MEMBERSHIP: i32 = 1;
+const NETLINK_DROP_MEMBERSHIP: i32 = 2;
+
+fn netlink_getsockopt(level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
+    match level {
+        SOL_SOCKET => match optname {
+            SO_DOMAIN => Ok(16i32.to_ne_bytes().to_vec()), // AF_NETLINK
+            SO_TYPE => Ok((SOCK_RAW as i32).to_ne_bytes().to_vec()),
+            SO_PROTOCOL => Ok(0i32.to_ne_bytes().to_vec()),
+            SO_SNDBUF | SO_RCVBUF => Ok(212992i32.to_ne_bytes().to_vec()),
+            SO_ERROR => Ok(0i32.to_ne_bytes().to_vec()),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_NETLINK => match optname {
+            NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+                Ok(0i32.to_ne_bytes().to_vec())
+            }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        _ => Err(Errno::ENOPROTOOPT),
+    }
+}
+
+fn netlink_setsockopt(level: i32, optname: i32, _value: &[u8]) -> Result<(), Errno> {
+    match level {
+        SOL_SOCKET => match optname {
+            SO_SNDBUF | SO_RCVBUF | SO_PASSCRED => Ok(()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_NETLINK => match optname {
+            NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => Ok(()), // TODO
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        _ => Err(Errno::ENOPROTOOPT),
+    }
 }
 
 fn validate_send_flags(flags: usize) -> Result<(), Errno> {

@@ -53,6 +53,8 @@ const MOUNTINFO_INO: u64 = 12;
 const SYS_INO: u64 = 13;
 const SYS_KERNEL_INO: u64 = 14;
 const SYS_HOTPLUG_INO: u64 = 15;
+const NET_DIR_INO: u64 = 16;
+const NET_DEV_INO: u64 = 17;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -283,6 +285,15 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("self", self_inode),
         ("thread-self", thread_self_inode),
         ("sys", sys_inode),
+        ("net", mk_inode(
+            fs_id,
+            weak_sb,
+            NET_DIR_INO,
+            FileType::Directory,
+            0o555,
+            2,
+            Arc::new(ProcNetDirOps { fs_id, weak_sb: weak_sb.clone() }),
+        )),
     ];
     Inode::new(
         InodeId {
@@ -405,6 +416,109 @@ struct ProcSysDirOps {
     fs_id: FsId,
     weak_sb: Weak<Superblock>,
 }
+
+// ── /proc/net 目录 ────────────────────────────────────────────────────────────
+
+struct ProcNetDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcNetDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "dev" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetDevOps),
+            )),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![DirEntry {
+                ino: NET_DEV_INO,
+                name: SmallStr::new("dev"),
+                kind: FileType::Regular,
+            }],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+struct ProcNetDevOps;
+
+impl InodeOps for ProcNetDevOps {
+    fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+    fn open(
+        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcNetDevFile))
+    }
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+struct ProcNetDevFile;
+
+impl FileOps for ProcNetDevFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let content = render_proc_net_dev();
+        let offset = offset as usize;
+        if offset >= content.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(content.len() - offset);
+        buf[..len].copy_from_slice(&content.as_bytes()[offset..offset + len]);
+        Ok(len)
+    }
+    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+        Err(VfsError::PermissionDenied)
+    }
+    fn readdir(
+        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+    fn sync(&self) -> VfsResult<()> { Ok(()) }
+    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn release(&self) {}
+    fn as_any(&self) -> &dyn core::any::Any { self }
+}
+
+fn render_proc_net_dev() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Inter-|   Receive                                                |  Transmit");
+    let _ = writeln!(out, " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed");
+    let ifaces = net::stack().snapshot_interfaces();
+    for iface in &ifaces {
+        let _ = writeln!(
+            out,
+            "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
+            iface.name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        );
+    }
+    out
+}
+
+// ── /proc/sys 目录 ────────────────────────────────────────────────────────────
 
 impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {

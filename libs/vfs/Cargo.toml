@@ -11,8 +11,10 @@ bench = false
 [dependencies]
 errno = { path = "../errno" }
 mm = { path = "../mm" }
+net = { path = "../net" }
 sched = { path = "../sched" }
 socket = { path = "../socket" }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 [dev-dependencies]
 ktest = { path = "../ktest" }

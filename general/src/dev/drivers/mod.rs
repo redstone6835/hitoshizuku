@@ -10,6 +10,9 @@ pub use uart16550::*;
 mod virtio_blk;
 pub use virtio_blk::*;
 
+mod virtio_net;
+pub use virtio_net::*;
+
 mod virtio_pci;
 pub use virtio_pci::*;
 
@@ -21,6 +24,7 @@ use crate::dev::pnp::PnpError;
 pub fn register_builtin_drivers() -> Result<(), PnpError> {
     uart16550::register_builtin_driver()?;
     virtio_blk::register_builtin_driver()?;
+    virtio_net::register_builtin_driver()?;
     virtio_pci::register_builtin_driver()?;
     Ok(())
 }
