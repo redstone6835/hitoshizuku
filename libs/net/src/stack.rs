@@ -58,18 +58,6 @@ pub fn stack() -> &'static NetStack {
 pub struct NetStack {
     /// 接口注册表。读锁路径包含所有 I/O 操作，写锁仅 attach/detach 时持有。
     interfaces: RwLock<BTreeMap<InterfaceId, Arc<Mutex<ManagedInterface>>>>,
-    /// listen socket handle 重定向表。
-    ///
-    /// smoltcp 的 listen socket 一旦握手成功就被转成 Established，原
-    /// listen handle 失效；我们立刻新建一个 listen socket 顶替，并把
-    /// "老 listen handle → 新 listen handle" 记到这里。`NetSocketFileOps`
-    /// 拿到的 listen fd 上的 handle 走 [`Self::resolve_listen_handle`]
-    /// 都会重定向到当前真正的 listen handle，避免老 fd 在第二次 accept
-    /// 时撞上"已建立连接"的同 index socket。
-    ///
-    /// 不会自动清理：用户关闭 listen fd 时 `release` 路径会主动调
-    /// [`Self::clear_listen_redirect`] 把该链整段释放。
-    listen_redirect: Mutex<alloc::collections::BTreeMap<NetSocketHandle, NetSocketHandle>>,
     /// 全局 socket 事件通知队列。
     ///
     /// 所有阻塞在 recv/send/accept/connect 的 `NetSocketFileOps` 在
@@ -89,7 +77,6 @@ impl NetStack {
     const fn new() -> Self {
         Self {
             interfaces: RwLock::new(BTreeMap::new()),
-            listen_redirect: Mutex::new(alloc::collections::BTreeMap::new()),
             notify_waiters: sched::WaitQueue::new(),
         }
     }
@@ -884,19 +871,17 @@ impl NetStack {
     /// 本函数新行为：
     ///
     /// - 检查传入 handle 指向的 socket 是否已经处于 Established；
-    /// - 若是：把它的状态读出来（ip / port / sequence / buffer），**放弃**
-    ///   老 socket（abort + 立即 remove_socket_locked），再分配一个**新**
-    ///   socket 作为连接体；
-    /// - 同时新建一个 socket 顶替 listen 角色，并把它登记到
-    ///   `listen_redirect` 表——`NetSocketFileOps` 拿到任何"老 listen
-    ///   handle"都会先查这张表重定向到真正的 listen socket；
-    /// - 等待中的 accept 也通过本表判定"哪个 listen handle 是真"。
-    pub fn tcp_accept(&self, handle: NetSocketHandle) -> Result<NetSocketHandle, NetError> {
+    /// - 若是：保留这个已经 Established 的老 socket，直接把它作为 accepted
+    ///   connection 返回；
+    /// - 同时新建一个 socket 顶替 listen 角色，并把新的 listen handle 返回
+    ///   给调用方，由 VFS 层直接替换原 listen fd 持有的 handle。
+    pub fn tcp_accept(
+        &self,
+        handle: NetSocketHandle,
+    ) -> Result<(NetSocketHandle, NetSocketHandle), NetError> {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
-        // 把用户持有的 listen handle 重定向到当前真正处于 Listen 状态的 socket。
-        let handle = self.resolve_listen_handle(handle);
         // 先短持锁检查状态——检查完立即释放，再决定要不要走 accept_in_place
         // 路径（后者会自己重新加锁）。**绝不能**持锁跨调 accept_in_place，
         // 否则会触发 `Mutex` 的递归 deadlock。
@@ -923,86 +908,16 @@ impl NetStack {
         Err(NetError::WouldBlock)
     }
 
-    /// 把"listen 端点被接受过的 handle"重定向到当前真正处于 Listen 的 socket。
-    ///
-    /// smoltcp 的 listen socket 一旦被 smoltcp 转成 Established 就废了——
-    /// 我们会立即新建一个 listen socket 顶替，并把"老 listen handle → 新
-    /// listen handle"的映射写到 `listen_redirect` 里。这样 `NetSocketFileOps`
-    /// 后续所有操作（再次 accept、shutdown、close）都通过本函数查到真正的
-    /// listen handle。
-    ///
-    /// 公开给 `NetSocketFileOps` 使用——所有走"先取 handle 再操作 net
-    /// stack"路径的入口（accept、connect、close、shutdown、send、recv）
-    /// 都应当在开头调一次本函数。
-    pub fn resolve_listen_handle(&self, handle: NetSocketHandle) -> NetSocketHandle {
-        if handle.sock_type != SocketType::Tcp {
-            return handle;
-        }
-        if let Some(redirect) = self.listen_redirect.lock().get(&handle).copied() {
-            return redirect;
-        }
-        handle
-    }
-
-    /// 登记 listen handle 的重定向。
-    ///
-    /// 关键约束：必须**扁平化**——`old` 之前的整条链（`old → mid → new`）
-    /// 都要更新成"老 entry 全部直接指向 `new`"。否则
-    /// [`Self::resolve_listen_handle`] 只做单跳查找会漏跳：
-    /// 用户原始 handle 查表拿到 `mid`，但 `mid` 现在也已经过期；
-    /// 下次 `accept` 再走 resolve 才会拿到 `new`，中间有一次 accept
-    /// 仍然会撞上已 Established 的 mid。
-    fn install_listen_redirect(&self, old: NetSocketHandle, new: NetSocketHandle) {
-        // 1) 收集所有"以 old 为起点"的链：old -> mid -> ... -> new_final
-        //    把这些 key 全部记下来。
-        let mut keys: alloc::vec::Vec<NetSocketHandle> = alloc::vec::Vec::new();
-        let mut cur = old;
-        // 防御性限步：单次 accept 链最多 1-2 跳，但允许更长避免活锁。
-        for _ in 0..16 {
-            keys.push(cur);
-            match self.listen_redirect.lock().get(&cur).copied() {
-                Some(next) => cur = next,
-                None => break,
-            }
-        }
-        // 2) 把所有这些 key 一次性映射到 new。
-        let mut table = self.listen_redirect.lock();
-        for k in keys {
-            table.insert(k, new);
-        }
-    }
-
-    /// 释放 listen handle 的整条重定向链（`old → new → newer → ...`）。
-    ///
-    /// listen fd 关闭时调用：把 `old` 自身作为 key 删掉，并清理任何以
-    /// `old` 为 value 的条目（因为 install_listen_redirect 做了扁平化，
-    /// 多个老 key 都会映射到同一个 `new`；关闭老 fd 不会让那些 key 失
-    /// 效，但也不应让本 fd 的释放动作误伤其它 fd 的重定向——所以这里
-    /// 只清"key == old"自身，以及扫一下"value == old"这种"老 entry
-    /// 指向我"的反查。
-    ///
-    /// 实际上由于 install_listen_redirect 把所有老 key 扁平化到同一个
-    /// new，那些老 key 现在仍然在表里但都没用了——但安全起见不主动清
-    /// 它们（可能是其它 fd 的有效 redirect 路径），让那些 fd 自己关闭
-    /// 时再 clear。
-    pub fn clear_listen_redirect(&self, old: NetSocketHandle) {
-        let mut table = self.listen_redirect.lock();
-        table.remove(&old);
-    }
-
     /// 接受一条已经被 smoltcp 装到 listen socket 上的连接：
-    /// 1. 在 smoltcp 端把 listen socket 状态拷到一个新 socket；
-    /// 2. 把原 listen socket 关掉 + 立刻从 SocketSet 摘掉；
-    /// 3. 另起一个 listen socket 顶替（重新 listen 同端口）；
-    /// 4. 把 `old listen -> new listen` 重定向装上；
-    /// 5. 返回新连接的 handle。
+    /// 1. 保留原 listen socket——它现在就是已建立的连接本体；
+    /// 2. 另起一个 listen socket 顶替（重新 listen 同端口）；
+    /// 3. 返回 `(accepted, new_listen)` 给上层，让上层把监听 fd 直接切到新
+    ///    listen handle。
     fn accept_in_place_connection(
         &self,
         listen_handle: NetSocketHandle,
-    ) -> Result<NetSocketHandle, NetError> {
-        // 1) 加锁，关闭并摘掉老 listen socket，新分配一个 connection socket
-        //    + 一个新的 listen socket，重新 listen 同端口。
-        let (new_listen, connection_handle) = {
+    ) -> Result<(NetSocketHandle, NetSocketHandle), NetError> {
+        let (accepted, new_listen) = {
             let table = self.interfaces.read();
             let iface_lock = table
                 .get(&listen_handle.iface_id)
@@ -1025,48 +940,24 @@ impl NetStack {
                 .listen_endpoint()
                 .port;
 
-            // 新 socket 作为连接体（尚未有 Established 状态——它只是一个
-            // 空的 TCP socket；smoltcp 的 listen 状态机不可拆分，所以
-            // 严格的"把 listen 拆分出连接"做不到，单连接简化版只能
-            // 接受"listen 转换为 established 然后再继续"的方式）。
-            // 这里新增的是 connection handle 槽位，下面 listen 顶替会
-            // 再 add 一次，所以 connection 的 inner 一定 != 新 listen。
-            let connection_handle = managed.add_tcp_socket(TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE);
-            // 把老 listen socket 摘掉（close + 从 SocketSet 移除）——
-            // smoltcp 的"listen socket 被吃"行为对应到 SocketSet 就是
-            // 把它从 set 里彻底删掉，meta 也同步删（`remove_socket_locked`）。
-            managed.remove_socket_locked(listen_handle.inner);
-            // 注意：上面已经把 `listen_handle.inner` 对应的 socket 删了，
-            // 不能再 `tcp_socket_mut(listen_handle.inner).abort()`——那会
-            // panic。所以这里只是文档注释提醒，不再调 abort。
-
-            // 用新 socket 顶替 listen 角色，重新 listen 同端口。
             let new_listen_handle = managed.add_tcp_socket(TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE);
-            // smoltcp 的 `SocketSet::add` 是 Vec.push 到末尾的，所以
-            // new_listen_handle.inner 与 connection_handle.inner 都
-            // 一定 != listen_handle.inner。
             let new_listen = NetSocketHandle {
                 iface_id: listen_handle.iface_id,
                 inner: new_listen_handle,
                 sock_type: SocketType::Tcp,
             };
-            // 重新 listen 同端口。listen 失败（端口被占）不影响新连接——
-            // 后续 accept 仍会拿到 connection_handle。
-            // (错误不向用户暴露：smoltcp ListenError 仅含"地址占用"，
-            // 多次 accept 中偶发端口冲突可由下一轮 accept 自然恢复。)
-            let _ = managed
+            managed
                 .tcp_socket_mut(new_listen_handle)
-                .listen(listen_port);
-            (new_listen, connection_handle)
+                .listen(listen_port)
+                .map_err(|_| NetError::AddressInUse)?;
+            let accepted = NetSocketHandle {
+                iface_id: listen_handle.iface_id,
+                inner: listen_handle.inner,
+                sock_type: SocketType::Tcp,
+            };
+            (accepted, new_listen)
         };
-        // 2) 锁已 drop，记下 redirect。
-        self.install_listen_redirect(listen_handle, new_listen);
-        // 3) 返回新连接给用户。
-        Ok(NetSocketHandle {
-            iface_id: listen_handle.iface_id,
-            inner: connection_handle,
-            sock_type: SocketType::Tcp,
-        })
+        Ok((accepted, new_listen))
     }
 
     // ── 可配置缓冲区 ─────────────────────────────────────────────────────

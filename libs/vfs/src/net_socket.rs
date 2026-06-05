@@ -130,13 +130,7 @@ impl NetSocketFileOps {
     }
 
     fn get_handle(&self) -> Result<NetSocketHandle, Errno> {
-        // 关键：handle 在用户关闭 fd 之前一直可用（self.handle: Mutex<Option<...>>）。
-        // 这里把"用户持有的 handle"经过 listen_redirect 表重定向到"当前真
-        // 正在 Listen 状态的 socket"——smoltcp 的 listen socket 一旦握手
-        // 成功就被吃掉并新建一个顶替，user 侧 fd 上的 handle 仍指向老
-        // index，必须查表拿到真正可用的 listen handle。
-        let raw = self.handle.lock().ok_or(Errno::EBADF)?;
-        Ok(net::stack().resolve_listen_handle(raw))
+        self.handle.lock().ok_or(Errno::EBADF)
     }
 
     fn is_nonblock(&self) -> bool {
@@ -168,10 +162,7 @@ impl NetSocketFileOps {
     }
 
     pub fn get_handle_for_opts(&self) -> Option<NetSocketHandle> {
-        // 与 get_handle 一样走 listen_redirect 解析——setsockopt/getsockopt
-        // 路径上若不解析，操作 listen socket 时会撞上已被 smoltcp 转成
-        // Established 的同 index。
-        self.handle.lock().map(|h| net::stack().resolve_listen_handle(h))
+        *self.handle.lock()
     }
 
     fn yield_wait(&self) {
@@ -210,14 +201,23 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        // 走 get_handle：让 listen handle 走重定向
         let handle = match self.get_handle() {
             Ok(h) => h,
             Err(_) => return PollEvents::POLLHUP,
         };
         let mut events = PollEvents(0);
-        if interest.has(PollEvents::POLLIN) && net::stack().socket_can_recv(handle) {
-            events = events.with(PollEvents::POLLIN);
+        if interest.has(PollEvents::POLLIN) {
+            let is_listening_tcp = matches!(handle.socket_type(), SocketType::Tcp)
+                && self.local.lock().is_some()
+                && self.remote.lock().is_none();
+            let readable = if is_listening_tcp {
+                matches!(net::stack().socket_state(handle), net::SocketState::Established)
+            } else {
+                net::stack().socket_can_recv(handle)
+            };
+            if readable {
+                events = events.with(PollEvents::POLLIN);
+            }
         }
         if interest.has(PollEvents::POLLOUT) && net::stack().socket_can_send(handle) {
             events = events.with(PollEvents::POLLOUT);
@@ -227,6 +227,7 @@ impl FileOps for NetSocketFileOps {
 
     fn poll_add_waiter(&self, task: &Arc<Task>, _interest: PollEvents) -> bool {
         self.wait_queue.enqueue(task);
+        net::stack().enqueue_socket_waiter(task);
         true
     }
 
@@ -246,10 +247,6 @@ impl FileOps for NetSocketFileOps {
             // 走"关 + 立即摘"的同步路径，**不要** soft_remove 后等
             // 下次 poll——见 NetStack::socket_close_and_remove 的注释。
             net::stack().socket_close_and_remove(handle);
-            // 把 listen_redirect 表里以本 handle 为起点的整条链清掉。
-            // 这条链存在的前提是用户曾经在本 listen fd 上成功 accept 过；
-            // 即使没 accept，clear_listen_redirect 是 no-op，安全。
-            net::stack().clear_listen_redirect(handle);
         }
     }
 
@@ -317,10 +314,14 @@ impl NetSocketFileOps {
         }
         loop {
             match net::stack().tcp_accept(handle) {
-                Ok(new_handle) => {
-                    return Ok(Self::new(
-                        new_handle, self.family, self.sock_type, nonblock,
-                    ));
+                Ok((accepted_handle, new_listen_handle)) => {
+                    *self.handle.lock() = Some(new_listen_handle);
+                    let accepted = Self::new(
+                        accepted_handle, self.family, self.sock_type, nonblock,
+                    );
+                    *accepted.local.lock() = net::stack().tcp_local_endpoint(accepted_handle);
+                    *accepted.remote.lock() = net::stack().tcp_remote_endpoint(accepted_handle);
+                    return Ok(accepted);
                 }
                 Err(NetError::WouldBlock) => {
                     if self.is_nonblock() || nonblock {
