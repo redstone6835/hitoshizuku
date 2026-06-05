@@ -126,7 +126,11 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             }
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
-            sched::on_timer_tick(super::super::specific::kernel_timestamp_ns());
+            let now_ns = super::super::specific::kernel_timestamp_ns();
+            sched::on_timer_tick(now_ns);
+            super::super::vdso::run_timer_tick_hook(now_ns);
+            sched::preempt_if_needed(now_ns);
+            return arg4;
         }
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。

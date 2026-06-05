@@ -60,6 +60,100 @@ pub fn interp_base() -> usize {
     }
 }
 
+/// vDSO 映射基地址。
+pub fn vdso_base() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .vdso_base
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        todo!("riscv64 HAL vDSO layout is not implemented")
+    }
+}
+
+/// vDSO 数据页偏移。
+pub fn vdso_data_page_offset() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::VDSO_DATA_PAGE_OFFSET
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        todo!("riscv64 HAL vDSO layout is not implemented")
+    }
+}
+
+/// vDSO 第一页长度（ELF header + text）。
+pub fn vdso_text_page_len() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::VDSO_TEXT_PAGE_SIZE
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        todo!("riscv64 HAL vDSO layout is not implemented")
+    }
+}
+
+/// vDSO 总映射长度。
+pub fn vdso_total_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::VDSO_TOTAL_SIZE
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        todo!("riscv64 HAL vDSO layout is not implemented")
+    }
+}
+
+/// 生成 vDSO ELF 镜像字节。
+pub fn vdso_image() -> alloc::vec::Vec<u8> {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::vdso_image()
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        todo!("riscv64 HAL vDSO is not implemented")
+    }
+}
+
+/// vDSO 中 sigreturn trampoline 的用户态虚拟地址。
+pub fn sigreturn_entry_va() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        vdso_base() + arch::loongarch64::vdso::sigreturn_entry_offset()
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        todo!("riscv64 HAL vDSO sigreturn is not implemented")
+    }
+}
+
+/// 注册 LoongArch64 timer tick 时的 vDSO 数据页更新回调。
+pub fn register_vdso_tick_hook(hook: fn(u64)) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::register_timer_tick_hook(hook);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = hook;
+        todo!("riscv64 HAL vDSO timer hook is not implemented")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CloneRegisterArgs {
     pub flags: u64,

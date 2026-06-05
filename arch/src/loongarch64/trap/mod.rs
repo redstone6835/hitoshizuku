@@ -5,7 +5,7 @@
 //! 入口地址处编写了一个通用的异常处理器，它会根据当前的异常上下文（TrapFrame）和
 //! 异常状态寄存器（ESTAT）的值来分发异常到具体的处理器函数进行处理。异常处理器会
 //! 保存所有必要的寄存器状态，并将异常信息传递给 Rust 代码进行进一步的处理和决策。
-
+#![allow(named_asm_labels)]
 mod interrupt;
 pub use interrupt::*;
 
