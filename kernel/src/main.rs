@@ -10,6 +10,7 @@ mod acpi;
 mod bench;
 mod dtb;
 mod initramfs;
+mod net_poll;
 mod panic;
 mod sched;
 mod start;
@@ -21,6 +22,10 @@ mod vdso;
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
+    // 注册协议栈 tick 钩子——每个 timer tick 推一帧 `net::stack().poll()`，
+    // 否则整个协议栈不会推进任何状态（RX 帧进不来、TCP 状态机不前进、
+    // soft-remove 的 socket 永远占着槽位）。详见 [`net_poll`] 模块。
+    net_poll::register();
 
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
@@ -43,7 +48,7 @@ fn main() -> ! {
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
     // bench::run();
 
-    //log::set_log_level(log::LogLevel::Debug);
+    log::set_log_level(log::LogLevel::Debug);
     sched::start_init_process(&init)
 }
 

@@ -154,6 +154,24 @@ pub fn register_vdso_tick_hook(hook: fn(u64)) {
     }
 }
 
+/// 注册 LoongArch64 timer tick 时的网络协议栈 poll 回调。
+///
+/// 在 vDSO 的 timer tick hook 旁路加一个**独立**的钩子（同样接受
+/// `now_ns: u64`）——避免把网络 poll 强塞到 vDSO hook 里引发循环依赖
+/// （vDSO 路径应保持精简）。调用方应当只注册一次。
+pub fn register_net_poll_hook(hook: fn(u64)) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::register_net_poll_hook(hook);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = hook;
+        todo!("riscv64 HAL net poll hook is not implemented")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CloneRegisterArgs {
     pub flags: u64,

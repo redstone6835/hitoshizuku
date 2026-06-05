@@ -109,15 +109,19 @@ impl ManagedInterface {
         self.iface.poll(
             timestamp, &mut self.device, &mut self.sockets,
         );
-        // 延迟清理：移除标记为 removed 的 socket
+        // 延迟清理：移除标记为 removed 的 socket。
+        //
+        // 旧实现先 `sockets.remove` 再 `meta.remove`——若这两个动作之间
+        // 有任何其它持锁代码路径访问 `self.sockets[handle]`，会看到一个
+        // `None` 槽位从而 panic。新实现走 `remove_socket_locked` 同步删
+        // 两者，并且保证顺序。
         let to_remove: Vec<SocketHandle> = self.meta
             .iter()
             .filter(|(_, m)| m.is_removed())
             .map(|(h, _)| *h)
             .collect();
         for h in to_remove {
-            self.sockets.remove(h);
-            self.meta.remove(&h);
+            self.remove_socket_locked(h);
         }
     }
 
@@ -182,14 +186,39 @@ impl ManagedInterface {
 
     /// 检查 socket 是否已被 soft-close 标记为移除。
     pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
-        self.meta.get(&handle).map_or(false, |m| m.is_removed())
+        self.meta.get(&handle).map_or(true, |m| m.is_removed())
+    }
+
+    /// 检查 socket handle 当前是否仍存在于元数据表中。
+    pub fn has_socket(&self, handle: SocketHandle) -> bool {
+        self.meta.contains_key(&handle)
     }
 
     /// Soft-close：标记 socket 为已移除（延迟到下一轮 poll 时真正释放）。
+    ///
+    /// **本接口仅供内部 soft-close 协议使用**——上层关闭文件 fd 时应直接
+    /// 调用 [`Self::remove_socket_locked`]。soft_remove_socket 适合"延迟
+    /// 到下一次 poll"的场景（例如某条路径上需要立刻释放对端资源但又想避开
+    /// 持锁移除的复杂性）。
     pub fn soft_remove_socket(&self, handle: SocketHandle) {
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_removed();
         }
+    }
+
+    /// 同步从 `SocketSet` 中移除一个 socket（不依赖 poll 触发）。
+    ///
+    /// 这是文件描述符 `release` 路径应当使用的入口：调用方已确认 socket
+    /// 不再有并发访问，移除动作必须立即生效，否则同 index 会被后续新建的
+    /// 其它类型 socket 占用（smoltcp 的 `add` 不会复用 `Some(_)` 的槽位，
+    /// 但 `poll` 之后 `soft_remove_socket` 标记的 socket 也只是 `None`
+    /// 而真正释放——必须**自己**调本接口才安全）。
+    pub fn remove_socket_locked(&mut self, handle: SocketHandle) {
+        // 必须先删 meta，否则 `poll` 路径的 to_remove 列表里还会保留旧条目，
+        // 下次 poll 会对一个已经在 `SocketSet` 里被替换的 handle 再调
+        // `sockets.remove`，触发 "handle does not refer to a valid socket"。
+        self.meta.remove(&handle);
+        self.sockets.remove(handle);
     }
 
     /// TCP connect：内部同时访问 socket 和 iface context 避免借用冲突。
@@ -247,8 +276,13 @@ impl ManagedInterface {
     }
 
     /// 从 SocketSet 移除一个 socket。
+    ///
+    /// 旧实现只删 SocketSet 不删 meta，会导致下一次 `poll` 看到 `meta`
+    /// 里残留的 `is_removed=true` 条目然后去 `sockets.remove` 一个已经被
+    /// 释放的槽位，触发 smoltcp 的 "handle does not refer to a valid
+    /// socket" panic。统一走 `remove_socket_locked`。
     pub fn remove_socket(&mut self, handle: smoltcp::iface::SocketHandle) {
-        self.sockets.remove(handle);
+        self.remove_socket_locked(handle);
     }
 
     /// 获取 TCP socket 的可变引用（内部操作用）。
@@ -331,6 +365,20 @@ impl ManagedInterface {
     pub fn raw_socket(
         &self, handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::raw::Socket<'static> {
+        self.sockets.get(handle)
+    }
+
+    /// 获取 ICMP socket 的可变引用。
+    pub fn icmp_socket_mut(
+        &mut self, handle: smoltcp::iface::SocketHandle,
+    ) -> &mut smoltcp::socket::icmp::Socket<'static> {
+        self.sockets.get_mut(handle)
+    }
+
+    /// 获取 ICMP socket 的只读引用。
+    pub fn icmp_socket(
+        &self, handle: smoltcp::iface::SocketHandle,
+    ) -> &smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get(handle)
     }
 }

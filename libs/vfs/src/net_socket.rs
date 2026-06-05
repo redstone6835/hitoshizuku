@@ -130,7 +130,13 @@ impl NetSocketFileOps {
     }
 
     fn get_handle(&self) -> Result<NetSocketHandle, Errno> {
-        self.handle.lock().ok_or(Errno::EBADF)
+        // 关键：handle 在用户关闭 fd 之前一直可用（self.handle: Mutex<Option<...>>）。
+        // 这里把"用户持有的 handle"经过 listen_redirect 表重定向到"当前真
+        // 正在 Listen 状态的 socket"——smoltcp 的 listen socket 一旦握手
+        // 成功就被吃掉并新建一个顶替，user 侧 fd 上的 handle 仍指向老
+        // index，必须查表拿到真正可用的 listen handle。
+        let raw = self.handle.lock().ok_or(Errno::EBADF)?;
+        Ok(net::stack().resolve_listen_handle(raw))
     }
 
     fn is_nonblock(&self) -> bool {
@@ -162,12 +168,20 @@ impl NetSocketFileOps {
     }
 
     pub fn get_handle_for_opts(&self) -> Option<NetSocketHandle> {
-        *self.handle.lock()
+        // 与 get_handle 一样走 listen_redirect 解析——setsockopt/getsockopt
+        // 路径上若不解析，操作 listen socket 时会撞上已被 smoltcp 转成
+        // Established 的同 index。
+        self.handle.lock().map(|h| net::stack().resolve_listen_handle(h))
     }
 
     fn yield_wait(&self) {
+        // yield_wait 是"无超时无 deadline"的快速路径，只在
+        // accept 阻塞回退时用过（read/write 走 wait_with_deadline）。
         let task = sched::current_task();
         self.wait_queue.enqueue(&task);
+        // 同时挂到全局 socket 事件通知队列——下次 NetStack::poll() 完
+        // 成后会唤醒，让任务重新检查 socket 状态。
+        net::stack().enqueue_socket_waiter(&task);
         sched::schedule_once(sched::now_ns_public());
     }
 }
@@ -196,9 +210,10 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let handle = match *self.handle.lock() {
-            Some(h) => h,
-            None => return PollEvents::POLLHUP,
+        // 走 get_handle：让 listen handle 走重定向
+        let handle = match self.get_handle() {
+            Ok(h) => h,
+            Err(_) => return PollEvents::POLLHUP,
         };
         let mut events = PollEvents(0);
         if interest.has(PollEvents::POLLIN) && net::stack().socket_can_recv(handle) {
@@ -224,15 +239,17 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn release(&self) {
+        // 必须 take 完再调 net::stack()——否则在某些极端顺序下
+        // （如 release 路径里 wake 的 task 立刻再 open 新 socket），
+        // 旧 handle 的下转可能撞上新插入的同名 index。
         if let Some(handle) = self.handle.lock().take() {
-            match handle.socket_type() {
-                SocketType::Tcp => net::stack().tcp_close(handle),
-                SocketType::Udp => net::stack().udp_close(handle),
-                SocketType::Raw | SocketType::Icmp => {
-                    net::stack().socket_remove(handle);
-                }
-            }
-            net::stack().socket_remove(handle);
+            // 走"关 + 立即摘"的同步路径，**不要** soft_remove 后等
+            // 下次 poll——见 NetStack::socket_close_and_remove 的注释。
+            net::stack().socket_close_and_remove(handle);
+            // 把 listen_redirect 表里以本 handle 为起点的整条链清掉。
+            // 这条链存在的前提是用户曾经在本 listen fd 上成功 accept 过；
+            // 即使没 accept，clear_listen_redirect 是 no-op，安全。
+            net::stack().clear_listen_redirect(handle);
         }
     }
 
@@ -286,12 +303,18 @@ impl NetSocketFileOps {
 
     pub fn listen(&self, _backlog: u32) -> Result<(), Errno> {
         let handle = self.get_handle()?;
+        if handle.socket_type() != SocketType::Tcp {
+            return Err(Errno::EOPNOTSUPP);
+        }
         let local = self.local.lock().ok_or(Errno::EINVAL)?;
         net::stack().tcp_listen(handle, local).map_err(map_net_error)
     }
 
     pub fn accept(&self, nonblock: bool) -> Result<NetSocketFileOps, Errno> {
         let handle = self.get_handle()?;
+        if handle.socket_type() != SocketType::Tcp {
+            return Err(Errno::EOPNOTSUPP);
+        }
         loop {
             match net::stack().tcp_accept(handle) {
                 Ok(new_handle) => {
@@ -314,18 +337,23 @@ impl NetSocketFileOps {
         let ep = addr::parse_inet_sockaddr(sockaddr)?;
         let handle = self.get_handle()?;
         *self.remote.lock() = Some(ep);
-        net::stack().tcp_connect(handle, ep).map_err(map_net_error)?;
-        if !self.is_nonblock() {
-            loop {
-                let state = net::stack().socket_state(handle);
-                match state {
-                    net::SocketState::Established => return Ok(()),
-                    net::SocketState::Closed => return Err(Errno::ECONNREFUSED),
-                    _ => self.yield_wait(),
+        match handle.socket_type() {
+            SocketType::Tcp => {
+                net::stack().tcp_connect(handle, ep).map_err(map_net_error)?;
+                if !self.is_nonblock() {
+                    loop {
+                        let state = net::stack().socket_state(handle);
+                        match state {
+                            net::SocketState::Established => return Ok(()),
+                            net::SocketState::Closed => return Err(Errno::ECONNREFUSED),
+                            _ => self.yield_wait(),
+                        }
+                    }
                 }
+                Ok(())
             }
+            SocketType::Udp | SocketType::Raw | SocketType::Icmp => Ok(()),
         }
-        Ok(())
     }
 
     pub fn shutdown(&self, how: u32) -> Result<(), Errno> {
@@ -440,8 +468,12 @@ impl NetSocketFileOps {
                 let remote = self.remote.lock().ok_or(Errno::EDESTADDRREQ)?;
                 net::stack().udp_send_to(handle, data, remote).map_err(map_net_error)
             }
-            SocketType::Raw | SocketType::Icmp => {
-                net::stack().raw_send(handle, data).map_err(map_net_error)
+            SocketType::Raw => {
+                net::stack().raw_send(handle, data, None).map_err(map_net_error)
+            }
+            SocketType::Icmp => {
+                let remote = (*self.remote.lock()).ok_or(Errno::EDESTADDRREQ)?;
+                net::stack().raw_send(handle, data, Some(remote)).map_err(map_net_error)
             }
         }
     }
@@ -463,6 +495,9 @@ impl NetSocketFileOps {
     fn wait_with_deadline(&self, deadline: Option<u64>) {
         let task = sched::current_task();
         self.wait_queue.enqueue(&task);
+        // 同时挂到全局 socket 事件通知队列——下次 NetStack::poll() 完
+        // 成后会唤醒，让任务重新检查 socket 状态。
+        net::stack().enqueue_socket_waiter(&task);
         let armed = deadline
             .map(|dl| sched::register_sleep_deadline(&task, dl))
             .unwrap_or(false);

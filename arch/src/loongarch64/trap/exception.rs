@@ -129,6 +129,11 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             let now_ns = super::super::specific::kernel_timestamp_ns();
             sched::on_timer_tick(now_ns);
             super::super::vdso::run_timer_tick_hook(now_ns);
+            // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
+            // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
+            // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
+            // 路径在 RX 队列空时本身极快（一次 mutex + 几次状态查询）。
+            super::super::vdso::run_net_poll_hook(now_ns);
             sched::preempt_if_needed(now_ns);
             return arg4;
         }
@@ -202,9 +207,8 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         }
     } else {
         // 非中断、非 syscall 的路径通常代表真正的同步故障，例如页故障、地址错、非法指令。
-        // 当前内核尚未实现可恢复异常处理，因此除了断点外，一律记录现场后宣告不可恢复。
         let exc = decode_exception(ecode, esubcode);
-        log::debug!(
+        log::info!(
             "[trap] exception {:?} pc={:#x} sp={:#x} bad_addr={:#x} \
              ecode={} esubcode={} estat={:#x} from_user={}",
             TrapType::Exception(exc),
@@ -216,7 +220,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             estat,
             from_user
         );
-        log::debug!(
+        log::info!(
             "[trap] regs ra={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} \
              a4={:#x} a5={:#x} a6={:#x} a7={:#x} t0={:#x} t1={:#x}",
             tf.ra,

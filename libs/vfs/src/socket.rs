@@ -30,6 +30,9 @@ use crate::vfs::stat::{DevId, FileMode, FileType, FsId, Timespec};
 use crate::vfs::superblock::{InodeCache, Superblock, SuperblockOps};
 use crate::net_socket::NetSocketFileOps;
 use crate::vfs::sync::Spinlock;
+// 仅在 setsockopt dispatch 路径上需要按 handle.sock_type 严格分派；引入
+// SocketType 枚举以避免继续依赖裸的 SOCK_* 常量做比较（容易遗漏 RAW/ICMP）。
+use net::SocketType as NetSocketType;
 
 pub const AF_UNIX: u16 = 1;
 
@@ -1070,6 +1073,9 @@ fn timeval_from_ns(ns: u64) -> [u8; 16] {
 }
 
 fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
+    if level == SOL_TCP && net_ops.sock_type() != SOCK_STREAM as u16 {
+        return Err(Errno::ENOPROTOOPT);
+    }
     let opts = net_ops.options().lock();
     match level {
         SOL_SOCKET => match optname {
@@ -1156,13 +1162,16 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
 }
 
 fn inet_setsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32, value: &[u8]) -> Result<(), Errno> {
+    if level == SOL_TCP && net_ops.sock_type() != SOCK_STREAM as u16 {
+        return Err(Errno::ENOPROTOOPT);
+    }
     let mut opts = net_ops.options().lock();
     let handle = net_ops.get_handle_for_opts();
     match level {
         SOL_SOCKET => match optname {
             SO_KEEPALIVE => {
                 opts.keepalive = parse_int_opt(value)? != 0;
-                if let Some(h) = handle {
+                if let Some(h) = handle.filter(|h| h.socket_type() == NetSocketType::Tcp) {
                     let secs = if opts.keepalive { opts.keepidle as u64 } else { 0 };
                     net::stack().tcp_set_keepalive(h, secs);
                 }
@@ -1227,11 +1236,25 @@ fn inet_setsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32, value: 
             IP_TTL => {
                 opts.ttl = parse_int_opt(value)? as u8;
                 if let Some(h) = handle {
-                    let sock_type = net_ops.sock_type();
-                    if sock_type == crate::net_socket::SOCK_STREAM_PUB {
-                        net::stack().tcp_set_hop_limit(h, Some(opts.ttl));
-                    } else {
-                        net::stack().udp_set_hop_limit(h, Some(opts.ttl));
+                    // 必须严格按 handle.sock_type 分派：
+                    // - TCP   -> tcp_set_hop_limit
+                    // - UDP   -> udp_set_hop_limit
+                    // - RAW   -> smoltcp 的 raw socket 没有 hop_limit API，仅记录到 opts
+                    // - ICMP  -> 同 raw
+                    // 之前的实现把后两类也错走到 udp_set_hop_limit，调用
+                    // udp_socket_mut(handle.inner) 时下转失败触发
+                    // "handle refers to a socket of a wrong type" panic。
+                    match h.socket_type() {
+                        NetSocketType::Tcp => {
+                            net::stack().tcp_set_hop_limit(h, Some(opts.ttl));
+                        }
+                        NetSocketType::Udp => {
+                            net::stack().udp_set_hop_limit(h, Some(opts.ttl));
+                        }
+                        NetSocketType::Raw | NetSocketType::Icmp => {
+                            // TODO: smoltcp 没有 raw/icmp hop limit 概念；opts.ttl 已经在
+                            // 上层 opts 里保存，可供未来 raw send 时取用。
+                        }
                     }
                 }
                 Ok(())
@@ -1252,11 +1275,17 @@ fn inet_setsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32, value: 
             IPV6_UNICAST_HOPS => {
                 opts.hops_v6 = parse_int_opt(value)? as u8;
                 if let Some(h) = handle {
-                    let sock_type = net_ops.sock_type();
-                    if sock_type == crate::net_socket::SOCK_STREAM_PUB {
-                        net::stack().tcp_set_hop_limit(h, Some(opts.hops_v6));
-                    } else {
-                        net::stack().udp_set_hop_limit(h, Some(opts.hops_v6));
+                    // 严格按 handle.sock_type 分派，原因同上 IP_TTL。
+                    match h.socket_type() {
+                        NetSocketType::Tcp => {
+                            net::stack().tcp_set_hop_limit(h, Some(opts.hops_v6));
+                        }
+                        NetSocketType::Udp => {
+                            net::stack().udp_set_hop_limit(h, Some(opts.hops_v6));
+                        }
+                        NetSocketType::Raw | NetSocketType::Icmp => {
+                            // TODO: smoltcp 没有 raw/icmp hop limit 概念；opts.hops_v6 已保存。
+                        }
                     }
                 }
                 Ok(())

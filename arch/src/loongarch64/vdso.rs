@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 global_asm!(include_str!("vdso_text.S"));
 
 static TIMER_TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
+static NET_POLL_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 const TEXT_OFF: usize = 0x200;
 const DYNSYM_OFF: usize = 0x0B0;
@@ -63,6 +64,24 @@ pub fn register_timer_tick_hook(hook: fn(u64)) {
 
 pub fn run_timer_tick_hook(now_ns: u64) {
     let raw = TIMER_TICK_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        let hook: fn(u64) = unsafe { transmute(raw) };
+        hook(now_ns);
+    }
+}
+
+/// 注册网络协议栈 poll 回调（与 vDSO tick hook 并列的另一条独立路径）。
+pub fn register_net_poll_hook(hook: fn(u64)) {
+    NET_POLL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// 执行网络协议栈 poll 回调。
+///
+/// 陷阱入口 timer 中断处理路径上调 `run_timer_tick_hook` 之后调本函数；
+/// 由本函数的 hook 内部调 `net::stack().poll(now)` 推进协议栈一帧。
+/// 如果没注册 hook，本函数是 no-op。
+pub fn run_net_poll_hook(now_ns: u64) {
+    let raw = NET_POLL_HOOK.load(Ordering::Acquire);
     if raw != 0 {
         let hook: fn(u64) = unsafe { transmute(raw) };
         hook(now_ns);
