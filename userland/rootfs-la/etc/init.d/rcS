@@ -27,16 +27,16 @@ if [ -x /sbin/mdev ]; then
 fi
 
 run_test_scripts() {
-    set -- /mnt/*_testcode.sh
-    if [ "$1" = "/mnt/*_testcode.sh" ]; then
-        return 1
-    fi
-
-    echo "[init] found test scripts on /mnt"
-    cd /mnt
-    for script in "$@"; do
-        echo "[init] run ${script##*/}"
-        /bin/sh "$script"
+    for dir in /mnt/glibc /mnt/musl; do
+        set -- "$dir"/*_testcode.sh
+        if [ -f "$1" ]; then
+            echo "[init] found test scripts in $dir"
+            cd "$dir" || continue
+            for script in "$@"; do
+                echo "[init] run ${script##*/}"
+                /bin/sh "$script"
+            done
+        fi
     done
     return 0
 }
