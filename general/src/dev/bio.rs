@@ -1,4 +1,4 @@
-//! 块 I/O 请求结构体（对齐 Linux `struct bio` / FreeBSD `struct bio`）。
+//! 块 I/O 请求结构体。
 //!
 //! `Bio` 自包含：携带操作类型、块范围、数据缓冲区及完成槽位 `Arc<Completion<BioResult>>`。
 //! 提交后所有权交给驱动；驱动调用 [`Bio::complete`] 时把自身（含数据缓冲区）通过

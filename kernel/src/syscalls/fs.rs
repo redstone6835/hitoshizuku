@@ -395,6 +395,10 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let file = file_for_fd(fd_arg(ctx.args[0])?)?;
     let cmd = IoctlCmd::new(ctx.args[1] & u32::MAX as usize);
+    let raw_cmd = cmd.raw() as u32;
+    if general::dev::net::is_net_ioctl(raw_cmd) {
+        return general::dev::net::net_ioctl(raw_cmd, ctx.args[2]);
+    }
     file.ioctl(cmd, ctx.args[2])
 }
 

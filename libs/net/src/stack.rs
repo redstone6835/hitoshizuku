@@ -20,7 +20,9 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use spin::{Mutex, RwLock};
 use smoltcp::time::Instant;
@@ -452,6 +454,40 @@ impl NetStack {
             .copied()
             .ok_or(NetError::InterfaceNotFound)
     }
+
+    // ── 接口信息查询（供 procfs / netlink 使用）─────────────────────────
+
+    /// 快照所有已注册接口的信息。
+    pub fn snapshot_interfaces(&self) -> Vec<InterfaceSnapshot> {
+        let table = self.interfaces.read();
+        let mut out = Vec::with_capacity(table.len());
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            out.push(InterfaceSnapshot {
+                id,
+                name: managed.name(),
+                mac: managed.mac(),
+                mtu: 1500,
+                flags: IFF_UP | IFF_RUNNING,
+            });
+        }
+        out
+    }
+}
+
+// ── 接口快照类型 ─────────────────────────────────────────────────────────────
+
+pub const IFF_UP: u32 = 0x1;
+pub const IFF_RUNNING: u32 = 0x40;
+pub const IFF_BROADCAST: u32 = 0x2;
+pub const IFF_MULTICAST: u32 = 0x1000;
+
+pub struct InterfaceSnapshot {
+    pub id: InterfaceId,
+    pub name: alloc::string::String,
+    pub mac: [u8; 6],
+    pub mtu: usize,
+    pub flags: u32,
 }
 
 // ── 辅助函数 ─────────────────────────────────────────────────────────────────

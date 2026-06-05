@@ -21,7 +21,7 @@ use crate::driver::NetDriver;
 /// 由 [`NetDevice::new`] 时自动分配（全局单调递增）。用于
 /// [`NetStack`](crate::stack::NetStack) 中的 attach/detach 索引。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InterfaceId(u32);
+pub struct InterfaceId(pub u32);
 
 impl InterfaceId {
     /// 分配下一个接口 ID（全局唯一）。
