@@ -192,7 +192,7 @@ fn dispatch_message(
         RTM_GETLINK => handle_getlink(seq, pid, ifaces),
         RTM_GETADDR => handle_getaddr(seq, pid, ifaces),
         RTM_GETROUTE => handle_getroute(seq, pid, ifaces),
-        RTM_GETNEIGH => vec![build_nlmsg_done(seq)],
+        RTM_GETNEIGH => handle_getneigh(seq, pid, ifaces),
         RTM_NEWLINK | RTM_DELLINK
         | RTM_NEWADDR | RTM_DELADDR
         | RTM_NEWROUTE | RTM_DELROUTE => vec![build_nlmsg_error(seq, 0)],
@@ -255,6 +255,47 @@ fn handle_getroute(
                 }
                 _ => msgs.push(build_route_default(if_index, gw, seq, pid)),
             }
+        }
+    }
+    msgs.push(build_nlmsg_done(seq));
+    msgs
+}
+
+// ── GETNEIGH handler ───────────────────────────────────────────────────────
+
+fn handle_getneigh(
+    seq: u32, pid: u32, ifaces: &[InterfaceSnapshot],
+) -> Vec<Vec<u8>> {
+    const RTM_NEWNEIGH: u16 = 28;
+    const NLM_F_MULTI: u16 = 0x02;
+    const NDA_DST: u16 = 1;
+    const NDA_LLADDR: u16 = 2;
+    const NUD_REACHABLE: u16 = 0x02;
+    const AF_INET: u8 = 2;
+
+    let mut msgs = Vec::new();
+    let neighbors = net::stack().all_neighbors();
+    for (iface_id, entries) in &neighbors {
+        let if_index = ifaces.iter().position(|i| i.id == *iface_id)
+            .map(|i| i as i32 + 1).unwrap_or(1);
+        for entry in entries {
+            let mut payload = Vec::new();
+            // struct ndmsg (12 bytes)
+            payload.push(AF_INET); // ndm_family
+            payload.push(0);       // ndm_pad1
+            payload.extend_from_slice(&0u16.to_ne_bytes()); // ndm_pad2
+            payload.extend_from_slice(&(if_index as i32).to_ne_bytes()); // ndm_ifindex
+            payload.extend_from_slice(&NUD_REACHABLE.to_ne_bytes()); // ndm_state
+            payload.push(0); // ndm_flags
+            payload.push(0); // ndm_type
+            // NDA_DST attribute
+            match entry.ip_addr {
+                net::IpAddr::V4(v4) => put_nlattr(&mut payload, NDA_DST, &v4.0),
+                net::IpAddr::V6(v6) => put_nlattr(&mut payload, NDA_DST, &v6.0),
+            }
+            // NDA_LLADDR attribute
+            put_nlattr(&mut payload, NDA_LLADDR, &entry.hw_addr);
+            msgs.push(wrap_nlmsg(RTM_NEWNEIGH, NLM_F_MULTI, seq, pid, &payload));
         }
     }
     msgs.push(build_nlmsg_done(seq));

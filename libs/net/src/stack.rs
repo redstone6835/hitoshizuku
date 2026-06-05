@@ -174,6 +174,71 @@ impl NetStack {
         })
     }
 
+    /// 创建一个 raw IP socket（指定 IP 协议号）。
+    pub fn socket_raw(&self, ip_version: u8, protocol: u8) -> Result<NetSocketHandle, NetError> {
+        let iface_id = self.default_iface_id()?;
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        let inner = managed.add_raw_socket(ip_version, protocol);
+        Ok(NetSocketHandle {
+            iface_id,
+            inner,
+            sock_type: SocketType::Raw,
+        })
+    }
+
+    /// 创建一个 ICMP socket。
+    pub fn socket_icmp(&self) -> Result<NetSocketHandle, NetError> {
+        let iface_id = self.default_iface_id()?;
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        let inner = managed.add_icmp_socket();
+        Ok(NetSocketHandle {
+            iface_id,
+            inner,
+            sock_type: SocketType::Icmp,
+        })
+    }
+
+    // ── Raw / ICMP 操作 ─────────────────────────────────────────────────
+
+    pub fn raw_send(&self, handle: NetSocketHandle, data: &[u8]) -> Result<usize, NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        let socket = managed.raw_socket_mut(handle.inner);
+        let tx_buf = socket.send(data.len()).map_err(|_| NetError::WouldBlock)?;
+        tx_buf.copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    pub fn raw_recv(&self, handle: NetSocketHandle, buf: &mut [u8]) -> Result<usize, NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        let socket = managed.raw_socket_mut(handle.inner);
+        let data = socket.recv().map_err(|_| NetError::WouldBlock)?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
+        Ok(n)
+    }
+
+    pub fn raw_can_recv(&self, handle: NetSocketHandle) -> bool {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
+        let managed = iface_lock.lock();
+        managed.raw_socket(handle.inner).can_recv()
+    }
+
+    pub fn raw_can_send(&self, handle: NetSocketHandle) -> bool {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
+        let managed = iface_lock.lock();
+        managed.raw_socket(handle.inner).can_send()
+    }
+
     // ── TCP 操作 ─────────────────────────────────────────────────────────
 
     /// TCP connect（非阻塞）。发起三次握手。
@@ -259,6 +324,169 @@ impl NetStack {
         }
     }
 
+    // ── TCP 选项与状态查询 (供 socket option 路径使用) ────────────────────
+
+    /// 设置 TCP_NODELAY（禁用/启用 Nagle 算法）。
+    pub fn tcp_set_nodelay(&self, handle: NetSocketHandle, nodelay: bool) {
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            managed.tcp_socket_mut(handle.inner).set_nagle_enabled(!nodelay);
+        }
+    }
+
+    /// 设置 TCP keep-alive 间隔（秒，0 表示禁用）。
+    pub fn tcp_set_keepalive(&self, handle: NetSocketHandle, secs: u64) {
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            let interval = if secs == 0 {
+                None
+            } else {
+                Some(smoltcp::time::Duration::from_secs(secs))
+            };
+            managed.tcp_socket_mut(handle.inner).set_keep_alive(interval);
+        }
+    }
+
+    /// 设置 TCP idle abort 超时（秒，0 表示禁用）。
+    pub fn tcp_set_timeout(&self, handle: NetSocketHandle, secs: u64) {
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            let timeout = if secs == 0 {
+                None
+            } else {
+                Some(smoltcp::time::Duration::from_secs(secs))
+            };
+            managed.tcp_socket_mut(handle.inner).set_timeout(timeout);
+        }
+    }
+
+    /// 设置 TCP 出站 hop limit（IPv4 TTL / IPv6 hop limit）。
+    pub fn tcp_set_hop_limit(&self, handle: NetSocketHandle, ttl: Option<u8>) {
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            managed.tcp_socket_mut(handle.inner).set_hop_limit(ttl);
+        }
+    }
+
+    /// 查询 TCP 接收缓冲区可读字节数（FIONREAD）。
+    pub fn tcp_recv_queue(&self, handle: NetSocketHandle) -> usize {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&handle.iface_id) else { return 0 };
+        let managed = iface_lock.lock();
+        managed.tcp_socket(handle.inner).recv_queue()
+    }
+
+    /// 查询 TCP 发送缓冲区已排队字节数。
+    pub fn tcp_send_queue(&self, handle: NetSocketHandle) -> usize {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&handle.iface_id) else { return 0 };
+        let managed = iface_lock.lock();
+        managed.tcp_socket(handle.inner).send_queue()
+    }
+
+    /// TCP peek（窥视，不消费数据）。
+    pub fn tcp_peek(
+        &self, handle: NetSocketHandle, buf: &mut [u8],
+    ) -> Result<usize, NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        let socket = managed.tcp_socket_mut(handle.inner);
+        match socket.peek_slice(buf) {
+            Ok(n) => Ok(n),
+            Err(_) => Err(NetError::WouldBlock),
+        }
+    }
+
+    /// 查询 TCP socket 的本地端点（getsockname 真实值）。
+    pub fn tcp_local_endpoint(&self, handle: NetSocketHandle) -> Option<Endpoint> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id)?;
+        let managed = iface_lock.lock();
+        let ep = managed.tcp_socket(handle.inner).local_endpoint()?;
+        Some(endpoint_from_smoltcp(ep))
+    }
+
+    /// 查询 TCP socket 的远端端点（getpeername 真实值）。
+    pub fn tcp_remote_endpoint(&self, handle: NetSocketHandle) -> Option<Endpoint> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id)?;
+        let managed = iface_lock.lock();
+        let ep = managed.tcp_socket(handle.inner).remote_endpoint()?;
+        Some(endpoint_from_smoltcp(ep))
+    }
+
+    /// 设置 UDP 出站 hop limit。
+    pub fn udp_set_hop_limit(&self, handle: NetSocketHandle, ttl: Option<u8>) {
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            managed.udp_socket_mut(handle.inner).set_hop_limit(ttl);
+        }
+    }
+
+    /// UDP peek（窥视一个数据报，不消费）。
+    pub fn udp_peek_from(
+        &self, handle: NetSocketHandle, buf: &mut [u8],
+    ) -> Result<(usize, Endpoint), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        let socket = managed.udp_socket_mut(handle.inner);
+        let (n, meta) = socket.peek_slice(buf).map_err(|_| NetError::WouldBlock)?;
+        Ok((n, endpoint_from_smoltcp(meta.endpoint)))
+    }
+
+    // ── 路由管理 ─────────────────────────────────────────────────────────
+
+    /// 添加默认 IPv4 路由（gateway）到指定接口。
+    pub fn add_default_route_v4(
+        &self, iface_id: InterfaceId, gateway: crate::Ipv4Addr,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.add_default_route_v4(gateway);
+        Ok(())
+    }
+
+    /// 移除指定接口上的默认 IPv4 路由。
+    pub fn remove_default_route_v4(&self, iface_id: InterfaceId) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.remove_default_route_v4();
+        Ok(())
+    }
+
+    // ── 邻居表查询 ───────────────────────────────────────────────────────
+
+    /// 查询指定接口的 ARP/NDP 邻居表。
+    pub fn neighbor_table(&self, iface_id: InterfaceId) -> Result<Vec<NeighborEntry>, NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let managed = iface_lock.lock();
+        Ok(managed.neighbor_entries())
+    }
+
+    /// 查询所有接口的邻居表。
+    pub fn all_neighbors(&self) -> Vec<(InterfaceId, Vec<NeighborEntry>)> {
+        let table = self.interfaces.read();
+        let mut out = Vec::new();
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            let entries = managed.neighbor_entries();
+            if !entries.is_empty() {
+                out.push((id, entries));
+            }
+        }
+        out
+    }
+
     // ── UDP 操作 ─────────────────────────────────────────────────────────
 
     /// UDP bind。绑定本地端口后可收发数据报。
@@ -339,6 +567,7 @@ impl NetStack {
         match handle.sock_type {
             SocketType::Tcp => managed.tcp_socket(handle.inner).can_recv(),
             SocketType::Udp => managed.udp_socket(handle.inner).can_recv(),
+            SocketType::Raw | SocketType::Icmp => managed.raw_socket(handle.inner).can_recv(),
         }
     }
 
@@ -351,6 +580,7 @@ impl NetStack {
         match handle.sock_type {
             SocketType::Tcp => managed.tcp_socket(handle.inner).can_send(),
             SocketType::Udp => managed.udp_socket(handle.inner).can_send(),
+            SocketType::Raw | SocketType::Icmp => managed.raw_socket(handle.inner).can_send(),
         }
     }
 
@@ -441,6 +671,15 @@ impl NetStack {
                     SocketState::Closed
                 }
             }
+            SocketType::Raw | SocketType::Icmp => {
+                if managed.raw_socket(handle.inner).can_recv()
+                    || managed.raw_socket(handle.inner).can_send()
+                {
+                    SocketState::Established
+                } else {
+                    SocketState::Closed
+                }
+            }
         }
     }
 
@@ -467,10 +706,11 @@ impl NetStack {
                 id,
                 name: managed.name(),
                 mac: managed.mac(),
-                mtu: 1500,
-                flags: IFF_UP | IFF_RUNNING | IFF_MULTICAST,
+                mtu: managed.mtu(),
+                flags: compute_iface_flags(&managed),
                 addresses: managed.config().addresses.clone(),
                 gateway: managed.config().gateway.clone(),
+                stats: managed.net_device().driver().stats(),
             });
         }
         out
@@ -479,10 +719,29 @@ impl NetStack {
 
 // ── 接口快照类型 ─────────────────────────────────────────────────────────────
 
+/// ARP/NDP 邻居表条目。
+#[derive(Debug, Clone)]
+pub struct NeighborEntry {
+    pub ip_addr: IpAddr,
+    pub hw_addr: [u8; 6],
+    pub expires_at_ms: i64,
+}
+
 pub const IFF_UP: u32 = 0x1;
 pub const IFF_RUNNING: u32 = 0x40;
 pub const IFF_BROADCAST: u32 = 0x2;
 pub const IFF_MULTICAST: u32 = 0x1000;
+
+fn compute_iface_flags(managed: &ManagedInterface) -> u32 {
+    let mut flags = IFF_BROADCAST | IFF_MULTICAST;
+    match managed.net_device().driver().link_state() {
+        crate::driver::LinkState::Up { .. } => {
+            flags |= IFF_UP | IFF_RUNNING;
+        }
+        crate::driver::LinkState::Down => {}
+    }
+    flags
+}
 
 pub struct InterfaceSnapshot {
     pub id: InterfaceId,
@@ -492,6 +751,7 @@ pub struct InterfaceSnapshot {
     pub flags: u32,
     pub addresses: Vec<CidrAddress>,
     pub gateway: Option<Gateway>,
+    pub stats: crate::driver::NetStats,
 }
 
 // ── 辅助函数 ─────────────────────────────────────────────────────────────────
