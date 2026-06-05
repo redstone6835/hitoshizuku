@@ -56,6 +56,8 @@ pub enum SocketType {
     Datagram,
     /// 面向连接的有序报文(SOCK_SEQPACKET)
     Sequenced,
+    /// 原始套接字(SOCK_RAW)
+    Raw,
 }
 
 /// shutdown 方向。

@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use core::any::Any;
 
 use errno::Errno;
+use net::config::IpAddr;
 
 use crate::dev::function::{DeviceClassId, DeviceFunction, DevNodeSpec};
 use crate::mm::{copy_from_user, copy_to_user};
@@ -71,6 +72,9 @@ const SIOCGIFHWADDR: u32 = 0x8927;
 const SIOCGIFINDEX: u32 = 0x8933;
 const SIOCGIFTXQLEN: u32 = 0x8942;
 const SIOCSIFTXQLEN: u32 = 0x8943;
+const SIOCGARP: u32 = 0x8954;
+const SIOCSARP: u32 = 0x8955;
+const SIOCDARP: u32 = 0x8953;
 
 const IFREQ_SIZE: usize = 40;
 const IFNAMSIZ: usize = 16;
@@ -87,13 +91,54 @@ pub fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         SIOCGIFINDEX => ioctl_gifindex(arg),
         SIOCGIFTXQLEN => ioctl_giftxqlen(arg),
         SIOCGIFBRDADDR => ioctl_gifbrdaddr(arg),
-        // TODO: 设置类 ioctl
+        // 设置类 ioctl：当前只读栈，返回 EPERM（与 Linux 非 root 行为一致）
+        // TODO: 在 ManagedInterface 中引入可变 runtime config 以支持运行时修改
         SIOCSIFFLAGS | SIOCSIFADDR | SIOCSIFNETMASK
-        | SIOCSIFMTU | SIOCSIFTXQLEN => Err(Errno::EOPNOTSUPP),
-        // TODO: 路由管理
-        SIOCADDRT | SIOCDELRT => Err(Errno::EOPNOTSUPP),
+        | SIOCSIFMTU | SIOCSIFTXQLEN => Err(Errno::EPERM),
+        // 路由管理：尚未实现路由表修改
+        // TODO: 阶段 3 实现路由表管理
+        SIOCADDRT | SIOCDELRT => Err(Errno::EPERM),
+        // ARP 邻居表查询：通过 mygo-smoltcp 暴露的 neighbor_cache 获取真实数据
+        SIOCGARP => ioctl_get_arp(arg),
+        SIOCSARP | SIOCDARP => Err(Errno::EPERM),
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// 把 CIDR 前缀长度转换成 IPv4 子网掩码（network-order 字节）。
+fn prefix_to_netmask(prefix: u8) -> [u8; 4] {
+    let prefix = prefix.min(32);
+    let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+    mask.to_be_bytes()
+}
+
+/// SIOCGARP — 查询 ARP 邻居表中的 MAC 地址。
+/// struct arpreq 布局（简化）：sockaddr arp_pa(16) + sockaddr arp_ha(16) + flags(4) + ...
+fn ioctl_get_arp(arg: usize) -> Result<usize, Errno> {
+    // 读取 arpreq 前 16 字节 (arp_pa: struct sockaddr)
+    let mut pa_buf = [0u8; 16];
+    copy_from_user(arg, &mut pa_buf).map_err(|_| Errno::EFAULT)?;
+    // 提取目标 IPv4 地址 (sockaddr_in: family[2] + port[2] + addr[4])
+    let target_ip = [pa_buf[4], pa_buf[5], pa_buf[6], pa_buf[7]];
+    let target = net::IpAddr::V4(net::Ipv4Addr(target_ip));
+    // 遍历所有接口邻居表查找匹配
+    let neighbors = net::stack().all_neighbors();
+    for (_iface_id, entries) in &neighbors {
+        for entry in entries {
+            if entry.ip_addr == target {
+                // 写入 arp_ha (offset 16, struct sockaddr: family[2] + data[14])
+                let mut ha = [0u8; 16];
+                ha[0] = 1; // ARPHRD_ETHER
+                ha[2..8].copy_from_slice(&entry.hw_addr);
+                copy_to_user(arg + 16, &ha).map_err(|_| Errno::EFAULT)?;
+                // 写入 arp_flags (offset 32): ATF_COM (0x02) 表示 complete
+                let flags = 0x02u32.to_ne_bytes();
+                copy_to_user(arg + 32, &flags).map_err(|_| Errno::EFAULT)?;
+                return Ok(0);
+            }
+        }
+    }
+    Err(Errno::ENOENT)
 }
 
 /// 检查是否为网络 ioctl 命令。
@@ -105,7 +150,8 @@ pub fn is_net_ioctl(cmd: u32) -> bool {
         SIOCGIFNETMASK | SIOCSIFNETMASK |
         SIOCGIFMTU | SIOCSIFMTU |
         SIOCGIFHWADDR | SIOCGIFINDEX |
-        SIOCGIFTXQLEN | SIOCSIFTXQLEN
+        SIOCGIFTXQLEN | SIOCSIFTXQLEN |
+        SIOCGARP | SIOCSARP | SIOCDARP
     )
 }
 
@@ -163,19 +209,26 @@ fn ioctl_gifflags(arg: usize) -> Result<usize, Errno> {
 
 fn ioctl_gifaddr(arg: usize) -> Result<usize, Errno> {
     let name = read_ifreq_name(arg)?;
-    let _iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let mut sa = [0u8; 16];
-    sa[0] = 2;
+    sa[0] = 2; // AF_INET
+    if let Some(cidr) = iface.addresses.iter().find(|c| matches!(c.addr, IpAddr::V4(_))) {
+        if let IpAddr::V4(v4) = cidr.addr {
+            sa[4..8].copy_from_slice(&v4.0);
+        }
+    }
     write_ifreq_data(arg, IFNAMSIZ, &sa)?;
     Ok(0)
 }
 
 fn ioctl_gifnetmask(arg: usize) -> Result<usize, Errno> {
     let name = read_ifreq_name(arg)?;
-    let _iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let mut sa = [0u8; 16];
-    sa[0] = 2;
-    sa[4..8].copy_from_slice(&[255, 255, 255, 0]);
+    sa[0] = 2; // AF_INET
+    if let Some(cidr) = iface.addresses.iter().find(|c| matches!(c.addr, IpAddr::V4(_))) {
+        sa[4..8].copy_from_slice(&prefix_to_netmask(cidr.prefix_len));
+    }
     write_ifreq_data(arg, IFNAMSIZ, &sa)?;
     Ok(0)
 }
@@ -207,6 +260,7 @@ fn ioctl_gifindex(arg: usize) -> Result<usize, Errno> {
 }
 
 fn ioctl_giftxqlen(arg: usize) -> Result<usize, Errno> {
+    // Linux 默认 txqlen 为 1000，virtio-net 驱动无单独 txqlen 暴露
     let name = read_ifreq_name(arg)?;
     let _iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let txqlen = 1000i32.to_ne_bytes();
@@ -216,10 +270,17 @@ fn ioctl_giftxqlen(arg: usize) -> Result<usize, Errno> {
 
 fn ioctl_gifbrdaddr(arg: usize) -> Result<usize, Errno> {
     let name = read_ifreq_name(arg)?;
-    let _iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let mut sa = [0u8; 16];
-    sa[0] = 2;
-    sa[4..8].copy_from_slice(&[255, 255, 255, 255]);
+    sa[0] = 2; // AF_INET
+    if let Some(cidr) = iface.addresses.iter().find(|c| matches!(c.addr, IpAddr::V4(_))) {
+        if let IpAddr::V4(v4) = cidr.addr {
+            let mask = prefix_to_netmask(cidr.prefix_len);
+            for i in 0..4 {
+                sa[4 + i] = v4.0[i] | !mask[i];
+            }
+        }
+    }
     write_ifreq_data(arg, IFNAMSIZ, &sa)?;
     Ok(0)
 }

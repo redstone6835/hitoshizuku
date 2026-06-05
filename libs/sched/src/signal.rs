@@ -258,6 +258,29 @@ impl SignalState {
         Some(info)
     }
 
+    /// sigtimedwait 用：从 per-task pending 里取出一条属于 `these` 集合
+    /// **且**未被 `blocked` 屏蔽的信号。无匹配返回 None。
+    pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
+        let blocked = self.blocked.load(Ordering::Acquire);
+        let mut queue = self.pending_infos.lock();
+        let idx = queue.iter().position(|i| {
+            let bit = i.sig.bit();
+            (these & bit) != 0 && (blocked & bit) == 0
+        })?;
+        let info = queue.swap_remove(idx);
+        let still_has = queue.iter().any(|i| i.sig == info.sig);
+        if !still_has {
+            self.pending_bits
+                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+        }
+        Some(info)
+    }
+
+    /// 是否有 pending 信号（不限 these 集合）。
+    pub fn has_any_pending(&self) -> bool {
+        self.pending_bits.load(Ordering::Acquire) != 0
+    }
+
     /// 是否存在至少一条可投递信号（未屏蔽）。
     pub fn has_deliverable(&self) -> bool {
         let pending = self.pending_bits.load(Ordering::Acquire);
@@ -360,6 +383,26 @@ impl SharedSignal {
     pub fn dequeue_one(&self, blocked: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
         let idx = queue.iter().position(|i| (blocked & i.sig.bit()) == 0)?;
+        let info = queue.swap_remove(idx);
+        let still_has = queue.iter().any(|i| i.sig == info.sig);
+        if !still_has {
+            self.shared_pending_bits
+                .fetch_and(!info.sig.bit(), Ordering::AcqRel);
+        }
+        Some(info)
+    }
+
+    /// sigtimedwait 用：从 tg 共享 pending 里取出一条属于 `these` 集合
+    /// **且**未被 `blocked` 屏蔽的信号。无匹配返回 None。
+    ///
+    /// `these` 的含义是"调用方想要消费的信号集"——通常在
+    /// `rt_sigtimedwait(uthese, ...)` 中由用户态直接传入。
+    pub fn dequeue_one_in(&self, these: u64, blocked: u64) -> Option<SigInfo> {
+        let mut queue = self.shared_pending_infos.lock();
+        let idx = queue.iter().position(|i| {
+            let bit = i.sig.bit();
+            (these & bit) != 0 && (blocked & bit) == 0
+        })?;
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {

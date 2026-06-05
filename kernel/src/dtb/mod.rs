@@ -14,6 +14,7 @@ use allocator::KERNEL_ALLOCATOR;
 use general::dev::block::BlockDevice;
 use general::dev::char::CharDevice;
 use general::dev::drivers;
+use general::dev::drivers::{RANDOM_DRIVER, URANDOM_DRIVER};
 use general::dev::enumerate::DEVICES;
 use general::dev::function::{find_char_device_by_fw_name, lookup_block_device_by_node};
 use general::dev::pci::pci_scan_and_register;
@@ -220,9 +221,24 @@ pub fn kernel_start_init(context: &StartContext) {
         context.address.device_mmio_to_virt,
         context.address.virt_to_phys,
     ));
+
+    // 安装架构无关的熵源：random 子系统需要时间戳 / 栈指针等
+    // 启动期熵，这些只能由 arch 层提供。
+    hal::random::register_arch_hooks();
+    printk!("[kernel-start][dtb] registered arch entropy source for random subsystem");
+
     drivers::register_builtin_drivers()
         .expect("[kernel-start][dtb] failed to register built-in PnP drivers");
     printk!("[kernel-start][dtb] registered built-in PnP drivers");
+
+    // 把 random / urandom 字符设备绑定到 devtmpfs。
+    // 这两个节点不通过 PnP 枚举发现（既无 DTB compatible 节点，
+    // 也不是 PCI 设备），而是在启动时静态挂载：
+    //   - /dev/random   阻塞读、熵不足时 spin/yield
+    //   - /dev/urandom  永不阻塞、CSPRNG 持续可读
+    let _ = dev_ops.bind_char("random", CharDevice::new("random", &RANDOM_DRIVER));
+    let _ = dev_ops.bind_char("urandom", CharDevice::new("urandom", &URANDOM_DRIVER));
+    printk!("[kernel-start][dtb] bound /dev/random and /dev/urandom");
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;

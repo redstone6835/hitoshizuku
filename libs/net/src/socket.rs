@@ -21,6 +21,10 @@ pub enum SocketType {
     Tcp,
     /// UDP 数据报 socket（无连接，尽力而为消息传递）。
     Udp,
+    /// Raw IP socket（直接收发 IP 层数据包）。
+    Raw,
+    /// ICMP socket（仅处理 ICMP echo request/reply）。
+    Icmp,
 }
 
 // ── Socket 状态 ──────────────────────────────────────────────────────────────

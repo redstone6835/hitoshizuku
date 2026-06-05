@@ -7,6 +7,8 @@
 mod uart16550;
 pub use uart16550::*;
 
+mod loopback;
+
 mod virtio_blk;
 pub use virtio_blk::*;
 
@@ -16,15 +18,20 @@ pub use virtio_net::*;
 mod virtio_pci;
 pub use virtio_pci::*;
 
+mod random;
+pub use random::*;
+
 use crate::dev::pnp::PnpError;
 
 /// 注册当前内核镜像内建的所有 PnP 驱动。
 ///
 /// 调用前必须已经通过 `set_dev_init_context()` 安装驱动初始化上下文。
 pub fn register_builtin_drivers() -> Result<(), PnpError> {
+    loopback::register_builtin_driver()?;
     uart16550::register_builtin_driver()?;
     virtio_blk::register_builtin_driver()?;
     virtio_net::register_builtin_driver()?;
     virtio_pci::register_builtin_driver()?;
+    random::register_builtin_driver()?;
     Ok(())
 }
