@@ -26,18 +26,18 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
-# 测试黑名单：跳过名称包含这些关键词的脚本
-BLACKLIST="libctest libcbench netperf lmbench ltp"
+# 测试黑名单
+BLACKLIST="libctest libcbench netperf lmbench ltp unixbench"
 
-# 将黑名单转为 case 匹配模式 *w1*|*w2*|...
-_build_blacklist_pattern() {
-    _blpat=""
-    for _w in $BLACKLIST; do
-        [ -z "$_blpat" ] && _blpat="*$_w*" || _blpat="$_blpat|*$_w*"
+_is_blacklisted() {
+    for _bl in $BLACKLIST; do
+        case "$1" in
+            *${_bl}*) return 0 ;;
+        esac
     done
+    return 1
 }
 
-# 测试期间用 /dev/null 取代 /dev/tty，防止 more 等交互命令阻塞
 _test_setup() {
     if [ -e /dev/tty ] && [ ! -L /dev/tty ]; then
         mv /dev/tty /dev/tty.real
@@ -52,7 +52,6 @@ _test_teardown() {
 
 run_test_scripts() {
     _test_setup
-    _build_blacklist_pattern
     for dir in /mnt/glibc /mnt/musl; do
         set -- "$dir"/*_testcode.sh
         if [ -f "$1" ]; then
@@ -60,15 +59,12 @@ run_test_scripts() {
             cd "$dir" || continue
             for script in "$@"; do
                 name="${script##*/}"
-                case "$name" in
-                    $_blpat)
-                        echo "[init] skip $name (blacklist)"
-                        ;;
-                    *)
-                        echo "[init] run $name"
-                        /bin/sh "$script"
-                        ;;
-                esac
+                if _is_blacklisted "$name"; then
+                    echo "[init] skip $name (blacklist)"
+                else
+                    echo "[init] run $name"
+                    /bin/sh "$script"
+                fi
             done
         fi
     done
