@@ -24,6 +24,7 @@ use hal::user_context::UserTrapFrame;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
+use sched::operation::apply_default_action;
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
 use sched::task::{TaskExtCloneHook, TaskExtKey};
@@ -429,6 +430,19 @@ fn process_setup_signal_frame(
     let SigHandler::Handler(handler_pc) = action.handler else {
         return Err(Errno::EINVAL);
     };
+
+    // TODO(vDSO): 当前方案在 restorer 无效时退化为 SIG_DFL。
+    // 静态链接的 glibc 依赖内核 vDSO 自动填充 sa_restorer，
+    // 栈上残值若 VA[63]=1 会在信号返回时跳入内核
+    // 正确做法：实现 vDSO 暴露 __kernel_rt_sigreturn，glibc 会自动从 vDSO 读取 restorer。
+    if action.restorer >> 63 != 0 {
+        log::debug!(
+            "[sigframe] bad restorer={:#x} for sig={} handler={:#x} — falling back to SIG_DFL",
+            action.restorer, info.sig.raw(), handler_pc
+        );
+        apply_default_action(info);
+        return Ok(());
+    }
 
     let saved = UserTrapFrame::from_context(user_ctx.as_usize());
     let old_mask = task.signal.blocked_snapshot();
