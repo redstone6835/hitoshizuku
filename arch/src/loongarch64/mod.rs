@@ -29,6 +29,7 @@ mod specific;
 mod syscall;
 mod task;
 mod trap;
+pub mod vdso;
 
 pub use boot::*;
 pub use early_console::*;

@@ -14,9 +14,6 @@ use sched::sync::Spinlock;
 use sched::task::{Task, TaskState};
 use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatus};
 
-const CLOCK_REALTIME: usize = 0;
-const CLOCK_MONOTONIC: usize = 1;
-const CLOCK_BOOTTIME: usize = 7;
 const MAX_CPUSET_BYTES: usize = 1024;
 
 const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
@@ -438,11 +435,7 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let clock_id = ctx.args[0];
     let tp = ctx.args[1];
-    match clock_id {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME => {}
-        _ => return Err(Errno::EINVAL),
-    }
-    let ns = sched::now_ns_public();
+    let ns = crate::vdso::clock_time_ns(clock_id).ok_or(Errno::EINVAL)?;
     let sec = (ns / 1_000_000_000) as i64;
     let nsec = (ns % 1_000_000_000) as i64;
     let mut out = [0u8; 16];
@@ -524,7 +517,9 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let flags = ctx.args[1];
     let req_user = ctx.args[2];
     let rem_user = ctx.args[3];
-    if clock_id != 0 && clock_id != 1 {
+    if clock_id != crate::vdso::CLOCK_REALTIME as i32
+        && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
+    {
         return Err(Errno::EINVAL);
     }
     if req_user == 0 {
@@ -573,12 +568,13 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
 }
 
 pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _clock_id = ctx.args[0];
+    let clock_id = ctx.args[0];
     let tp = ctx.args[1];
+    let res_ns = crate::vdso::clock_getres_ns(clock_id).ok_or(Errno::EINVAL)? as i64;
     if tp != 0 {
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&0i64.to_le_bytes());
-        out[8..16].copy_from_slice(&1i64.to_le_bytes());
+        out[8..16].copy_from_slice(&res_ns.to_le_bytes());
         copy_to_user(tp, &out).map_err(|e| e.as_errno())?;
     }
     Ok(0)
@@ -631,7 +627,7 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let tv = ctx.args[0];
     let _tz = ctx.args[1];
     if tv != 0 {
-        let ns = sched::now_ns_public();
+        let ns = crate::vdso::realtime_ns();
         let mut out = [0u8; 16];
         out[0..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
         out[8..16].copy_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());

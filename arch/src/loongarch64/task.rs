@@ -1,5 +1,3 @@
-#![allow(named_asm_labels)]
-
 use general::{TaskOps, TrapFramePtr};
 
 use crate::loongarch64::*;

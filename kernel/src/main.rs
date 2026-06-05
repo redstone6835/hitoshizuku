@@ -6,7 +6,8 @@ extern crate allocator;
 extern crate hal;
 
 mod acpi;
-// mod bench;
+#[cfg(feature = "bench")]
+mod bench;
 mod dtb;
 mod initramfs;
 mod panic;
@@ -15,9 +16,11 @@ mod start;
 mod stdio;
 mod syscalls;
 mod user;
+mod vdso;
 
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
+    hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
 
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
@@ -39,7 +42,8 @@ fn main() -> ! {
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
     // bench::run();
-    
+
+    //log::set_log_level(log::LogLevel::Debug);
     sched::start_init_process(&init)
 }
 

@@ -15,4 +15,5 @@ pub(super) static USER_VM_LAYOUT_OPS: UserVmLayoutOps = UserVmLayoutOps {
     default_stack_size: 64 * 1024,
     main_pie_base: 0x0000_0001_0000_0000,
     interp_base: 0x0000_0002_0000_0000,
+    vdso_base: 0x0000_0000_7FFF_0000,
 };
