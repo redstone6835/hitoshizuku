@@ -14,6 +14,8 @@ linker = "rust-lld"
 rustflags = [
     "-C", "link-arg=-Tkernel/linker/qemu-loongarch64.ld",
     "-C", "link-arg=--fatal-warnings",
+    "-C", "link-arg=--no-gc-sections",
+    "-A", "named_asm_labels",
 ]
 
 [env]
