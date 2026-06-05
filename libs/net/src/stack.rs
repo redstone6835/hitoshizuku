@@ -28,7 +28,7 @@ use spin::{Mutex, RwLock};
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpEndpoint, IpAddress, Ipv4Address, Ipv6Address};
 
-use crate::config::{Endpoint, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::config::{CidrAddress, Endpoint, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::error::NetError;
 use crate::interface::ManagedInterface;
@@ -468,7 +468,9 @@ impl NetStack {
                 name: managed.name(),
                 mac: managed.mac(),
                 mtu: 1500,
-                flags: IFF_UP | IFF_RUNNING,
+                flags: IFF_UP | IFF_RUNNING | IFF_MULTICAST,
+                addresses: managed.config().addresses.clone(),
+                gateway: managed.config().gateway.clone(),
             });
         }
         out
@@ -488,6 +490,8 @@ pub struct InterfaceSnapshot {
     pub mac: [u8; 6],
     pub mtu: usize,
     pub flags: u32,
+    pub addresses: Vec<CidrAddress>,
+    pub gateway: Option<Gateway>,
 }
 
 // ── 辅助函数 ─────────────────────────────────────────────────────────────────

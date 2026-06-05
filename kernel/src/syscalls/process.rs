@@ -318,8 +318,103 @@ pub(super) fn sys_set_robust_list(_ctx: &mut SyscallContext<'_>) -> Result<usize
     Ok(0)
 }
 
-pub(super) fn sys_prlimit64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // Linux ABI:
+    //   long prlimit64(
+    //       pid_t pid,                    // a0
+    //       int resource,                 // a1
+    //       const struct rlimit64 *new,   // a2  (NULL 表示不改)
+    //       struct rlimit64 *old          // a3  (NULL 表示不读)
+    //   );
+    //
+    // struct rlimit64 {
+    //   uint64_t rlim_cur;   /* soft */
+    //   uint64_t rlim_max;   /* hard */
+    // };
+    let pid = ctx.args[0] as i32;
+    let resource_raw = ctx.args[1] as u32;
+    let new_user = ctx.args[2];
+    let old_user = ctx.args[3];
+
+    let resource = match sched::Resource::from_raw(resource_raw) {
+        Some(r) => r,
+        None => return Err(Errno::EINVAL),
+    };
+
+    // 读 new
+    let new_pair = if new_user != 0 {
+        let mut raw = [0u8; 16];
+        copy_from_user(new_user, &mut raw).map_err(|e| e.as_errno())?;
+        let cur = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        Some(sched::RlimitPair::new(
+            sched::Rlim::from_raw(cur),
+            sched::Rlim::from_raw(max),
+        ))
+    } else {
+        None
+    };
+
+    let old = sched::operation::prlimit64(pid, resource, new_pair)?;
+
+    if old_user != 0 {
+        let mut raw = [0u8; 16];
+        raw[0..8].copy_from_slice(&old.soft.raw().to_le_bytes());
+        raw[8..16].copy_from_slice(&old.hard.raw().to_le_bytes());
+        copy_to_user(old_user, &raw).map_err(|e| e.as_errno())?;
+    }
+    Ok(0)
+}
+
+/// `getrlimit(resource, rlim *)`—— 老 ABI，rlimit 结构体 16 字节。
+///
+/// struct rlimit {
+///     unsigned long rlim_cur;   /* soft */
+///     unsigned long rlim_max;   /* hard */
+/// };
+///
+/// 与 prlimit64 不同，old 结构体是 8 字节 rlim（无 64 扩展）。
+pub(super) fn sys_getrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let resource_raw = ctx.args[0] as u32;
+    let rlim_user = ctx.args[1];
+    let resource = match sched::Resource::from_raw(resource_raw) {
+        Some(r) => r,
+        None => return Err(Errno::EINVAL),
+    };
+    if rlim_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let pair = sched::operation::get_rlimit(resource)?;
+    // 老 rlimit 是 8 字节字段。在 64-bit 内核上 rlim_t == u64；本仓库
+    // 的硬件是 loongarch64/riscv64，所以使用 8 字节 rlim 与 16 字节结构。
+    let mut raw = [0u8; 16];
+    raw[0..8].copy_from_slice(&pair.soft.raw().to_le_bytes());
+    raw[8..16].copy_from_slice(&pair.hard.raw().to_le_bytes());
+    copy_to_user(rlim_user, &raw).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+/// `setrlimit(resource, const rlim *)`—— 老 ABI，写 new 同时也读 old 写回。
+pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let resource_raw = ctx.args[0] as u32;
+    let rlim_user = ctx.args[1];
+    let resource = match sched::Resource::from_raw(resource_raw) {
+        Some(r) => r,
+        None => return Err(Errno::EINVAL),
+    };
+    if rlim_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 16];
+    copy_from_user(rlim_user, &mut raw).map_err(|e| e.as_errno())?;
+    let cur = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let new = sched::RlimitPair::new(
+        sched::Rlim::from_raw(cur),
+        sched::Rlim::from_raw(max),
+    );
+    let _old = sched::operation::set_rlimit(resource, new)?;
+    Ok(0)
 }
 
 pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

@@ -18,6 +18,7 @@ use crate::group::{ProcessGroup, Session};
 use crate::ids::{Capability, Gid, Uid};
 use crate::pid::PidT;
 use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
+use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::sched_class::SchedAttr;
 use crate::scheduler::{
     continue_task, current_cpu_id, current_task, mark_task_stopped, root_pid_ns, runqueue_of,
@@ -721,6 +722,151 @@ pub fn sigpending() -> Result<SigSet, Errno> {
     let per_task = me.signal.pending_snapshot();
     let shared = me.shared_signal().pending_snapshot();
     Ok(SigSet(per_task.0 | shared.0))
+}
+
+/// `sigtimedwait(these)` 在不阻塞的情况下尝试消费一条属于 `these` 的信号。
+/// 命中即返回 Some(SigInfo)，无命中返回 None（不进入等待）。
+///
+/// 注意：调用方负责在调用前清掉 per-task 与 tg-shared 队列中的"非 these"
+/// 残留——本函数只检查 `these ∩ pending`。
+pub fn sigtimedwait_poll(these: SigSet) -> Option<SigInfo> {
+    let me = current_task();
+    // 先 per-task（更及时），再 tg-shared。
+    if let Some(info) = me.signal.dequeue_one_in(these.0) {
+        return Some(info);
+    }
+    let blocked = me.signal.blocked_snapshot().raw();
+    me.shared_signal().dequeue_one_in(these.0, blocked)
+}
+
+/// 等待 pending ∩ these 出现。返回 true 表示等到了，false 表示超时。
+///
+/// 与 `sys_rt_sigsuspend` 一样采用 `Running -> Sleeping -> yield` 自旋
+/// 让出；不引入新 waitqueue 路径，理由：`signal_wakeup` 命中 Sleeping
+/// 时会拉回 Runnable，下次 schedule 自然到达此处循环。
+pub fn sigtimedwait_wait(these: SigSet, timeout_ns: Option<u64>) -> bool {
+    use crate::scheduler::now_ns_public;
+    let me = current_task();
+    let deadline = timeout_ns.and_then(|ns| now_ns_public().checked_add(ns));
+    loop {
+        if sigtimedwait_poll(these).is_some() {
+            return true;
+        }
+        if let Some(d) = deadline {
+            if now_ns_public() >= d {
+                return false;
+            }
+        }
+        if !me.cas_state(TaskState::Running, TaskState::Sleeping) {
+            // 状态非 Running（被中断改成别的），重试。
+            continue;
+        }
+        let _ = sched_yield();
+    }
+}
+
+// ── rlimit: getrlimit / setrlimit / prlimit64 ────────────────────────────────
+
+fn rlimit_err_to_errno(e: RlimitError) -> Errno {
+    match e {
+        RlimitError::InvalidResource => Errno::EINVAL,
+        RlimitError::ExceedsHard => Errno::EINVAL,
+    }
+}
+
+/// `getrlimit(resource)` 拿到调用者 tg 的 (soft, hard)。
+pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
+    let me = current_task();
+    let pair = me.thread_group().rlimits().lock().get(resource);
+    Ok(pair)
+}
+
+/// `setrlimit(resource, new)` 写调用者 tg 的 rlimit。
+///
+/// 校验规则照搬 Linux 6.x `kernel/sys.c::do_prlimit`：
+///   1. `new.soft ≤ new.hard`（基础不变量）
+///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时硬限制不可逆降不到
+///      "原值以下"——但硬限制是允许降到任何更小的值，包括小于当前 soft）
+///   3. `new.soft ≤ cur.hard`（软限制不能超过当前硬限制）
+///
+/// 关键点：**不检查** `new.hard < cur.soft`。POSIX 允许"硬限制降到
+/// ≥ 0 的任意值"，glibc 旧 ABI setrlimit 也支持；libctest 的
+/// `setrlim.c:21` 典型用法 `setrlimit(RLIMIT_STACK, 102400)` 会把
+/// `rlim_max = 102400`，当前 soft 可能是 8MB，老式"hard 不能降到
+/// 软以下"校验会误返 EINVAL。
+pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Errno> {
+    let me = current_task();
+    let tg = me.thread_group();
+    let mut guard = tg.rlimits().lock();
+    let cur = guard.get(resource);
+
+    // (1) 软限制必须 ≤ 硬限制。
+    if new.soft.0 > new.hard.0 {
+        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    }
+    // (2) 无 CAP 时硬限制不可调高（只能降或保留）。
+    if new.hard.0 > cur.hard.0 {
+        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    }
+    // (3) 软限制不能超当前硬限制。
+    if new.soft.0 > cur.hard.0 {
+        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    }
+    let old = cur;
+    guard.set(resource, new);
+    Ok(old)
+}
+
+/// `prlimit64(pid, resource, new, old)`：
+/// - `pid == 0`：当前进程；
+/// - `pid > 0`：指定 TGID。
+/// `new == None` 表示只读；`old != None` 写到该地址（call-site 决定）。
+pub fn prlimit64(
+    pid: i32,
+    resource: Resource,
+    new: Option<RlimitPair>,
+) -> Result<RlimitPair, Errno> {
+    let me = current_task();
+    let target_tg = if pid == 0 {
+        me.thread_group()
+    } else if pid > 0 {
+        let root = root_pid_ns();
+        let Some(weak) = root.registry().lookup(pid) else {
+            return Err(Errno::ESRCH);
+        };
+        let Some(task) = weak.upgrade() else {
+            return Err(Errno::ESRCH);
+        };
+        task.thread_group()
+    } else {
+        return Err(Errno::EINVAL);
+    };
+    // 权限：调用方需是同 uid 或具 CAP_SYS_RESOURCE。本仓库尚未实现
+    // capability 模型，按"同进程/同 uid 直通"处理。
+    if let Some(n) = new {
+        let mut guard = target_tg.rlimits().lock();
+        let cur = guard.get(resource);
+        if n.soft.0 > n.hard.0 {
+            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+        }
+        if n.hard.0 > cur.hard.0 {
+            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+        }
+        if n.soft.0 > cur.hard.0 {
+            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+        }
+        let old = cur;
+        guard.set(resource, n);
+        Ok(old)
+    } else {
+        Ok(target_tg.rlimits().lock().get(resource))
+    }
+}
+
+/// 返回整个 rlimit 表（用于调试/procfs）。
+pub fn rlimits_snapshot() -> Rlimits {
+    let me = current_task();
+    *me.thread_group().rlimits().lock()
 }
 
 // ── 信号投递在内核边界的默认动作处理 ─────────────────────────────────────────

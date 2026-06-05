@@ -6,7 +6,7 @@ extern crate allocator;
 extern crate hal;
 
 mod acpi;
-mod bench;
+// mod bench;
 mod dtb;
 mod initramfs;
 mod panic;
@@ -39,7 +39,8 @@ fn main() -> ! {
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
     // bench::run();
-
+    log::set_log_level(log::LogLevel::Debug);
+    
     sched::start_init_process(&init)
 }
 

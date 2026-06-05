@@ -131,6 +131,10 @@ impl ManagedInterface {
         self.net_device.driver().mac_address()
     }
 
+    pub fn config(&self) -> &IfConfig {
+        &self.config
+    }
+
     /// 检查 socket 是否已被 soft-close 标记为移除。
     pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
         self.meta.get(&handle).map_or(false, |m| m.is_removed())

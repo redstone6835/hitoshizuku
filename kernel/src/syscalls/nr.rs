@@ -63,6 +63,11 @@ pub const SYS_EXIT: usize = 93;
 pub const SYS_EXIT_GROUP: usize = 94;
 pub const SYS_WAITID: usize = 95;
 pub const SYS_SET_TID_ADDRESS: usize = 96;
+// 注：97 在通用表里是 getrlimit，但本仓库以 prlimit64 为主入口。
+pub const SYS_GETRLIMIT: usize = 97;
+// 老 setrlimit 在通用表里与本表的 uname 同号（160）。这里用 162 避开
+// 冲突——glibc 走 prlimit64 路径，而 162 在本表上是空闲的。
+pub const SYS_SETRLIMIT: usize = 162;
 pub const SYS_FUTEX: usize = 98;
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const SYS_NANOSLEEP: usize = 101;
