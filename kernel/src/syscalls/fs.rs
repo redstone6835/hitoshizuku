@@ -20,6 +20,11 @@ use vfs::path::Dirfd;
 use vfs::socket as vfs_socket;
 use vfs::stat::{DevId, FileMode, FileStat, FileType, FsStat, Timespec};
 
+#[allow(dead_code)]
+#[path = "../../../arch/src/loongarch64/abi.rs"]
+mod loongarch64_abi;
+use loongarch64_abi::{decode_dev_t, encode_dev_t};
+
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
 const COPY_CHUNK: usize = 256;
 const PATH_MAX: usize = 4096;
@@ -541,10 +546,7 @@ pub(super) fn sys_mknodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         _ => return Err(Errno::EINVAL),
     };
     let file_mode = FileMode::new((mode & 0o7777) as u16);
-    let dev_id = DevId::new(
-        ((dev >> 8) & 0xfff) as u32,
-        (dev & 0xff | ((dev >> 12) & !0xff)) as u32,
-    );
+    let dev_id = decode_dev_t(dev);
     operation::mknodat(&vfs_ctx, &dirfd, &path, kind, file_mode, dev_id)
         .map_err(|e| e.to_errno())?;
     Ok(0)
@@ -2345,13 +2347,13 @@ fn getsockname_common(ctx: &mut SyscallContext<'_>, peer: bool) -> Result<usize,
 
 fn write_linux_stat(user: usize, st: &FileStat) -> Result<(), Errno> {
     let mut out = [0u8; 128];
-    put_u64(&mut out, 0, encode_dev(st.dev));
+    put_u64(&mut out, 0, encode_dev_t(st.dev));
     put_u64(&mut out, 8, st.ino);
     put_u32(&mut out, 16, st.mode);
     put_u32(&mut out, 20, st.nlink);
     put_u32(&mut out, 24, st.uid);
     put_u32(&mut out, 28, st.gid);
-    put_u64(&mut out, 32, encode_dev(st.rdev));
+    put_u64(&mut out, 32, encode_dev_t(st.rdev));
     put_i64(&mut out, 48, st.size);
     put_u32(&mut out, 56, st.blksize);
     put_u64(&mut out, 64, st.blocks);
@@ -2366,6 +2368,8 @@ fn write_linux_stat(user: usize, st: &FileStat) -> Result<(), Errno> {
 
 fn write_linux_statx(user: usize, st: &FileStat) -> Result<(), Errno> {
     let mut out = [0u8; 256];
+    let rdev = statx_dev_components(st.rdev);
+    let dev = statx_dev_components(st.dev);
     put_u32(&mut out, 0, STATX_BASIC_STATS);
     put_u32(&mut out, 4, st.blksize);
     put_u64(&mut out, 8, 0);
@@ -2380,22 +2384,20 @@ fn write_linux_statx(user: usize, st: &FileStat) -> Result<(), Errno> {
     put_statx_timestamp(&mut out, 64, st.atime);
     put_statx_timestamp(&mut out, 96, st.ctime);
     put_statx_timestamp(&mut out, 112, st.mtime);
-    put_u32(&mut out, 128, st.rdev.major);
-    put_u32(&mut out, 132, st.rdev.minor);
-    put_u32(&mut out, 136, st.dev.major);
-    put_u32(&mut out, 140, st.dev.minor);
+    put_u32(&mut out, 128, rdev.major);
+    put_u32(&mut out, 132, rdev.minor);
+    put_u32(&mut out, 136, dev.major);
+    put_u32(&mut out, 140, dev.minor);
     copy_to_user(user, &out).map_err(|e| e.as_errno())
+}
+
+fn statx_dev_components(dev: DevId) -> DevId {
+    decode_dev_t(encode_dev_t(dev))
 }
 
 fn put_statx_timestamp(out: &mut [u8], off: usize, ts: Timespec) {
     put_i64(out, off, ts.secs);
     put_u32(out, off + 8, ts.nsecs);
-}
-
-fn encode_dev(dev: DevId) -> u64 {
-    let major = dev.major as u64;
-    let minor = dev.minor as u64;
-    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
 fn put_u16(out: &mut [u8], off: usize, v: u16) {

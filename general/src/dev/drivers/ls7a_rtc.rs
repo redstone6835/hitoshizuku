@@ -5,12 +5,12 @@
 //! 内核 realtime 时钟回调。
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    RealtimeClockSource, register_driver_factory,
 };
 use crate::dev::rtc::RtcDateTime;
 
@@ -24,6 +24,28 @@ const MIN_REG_SIZE: usize = CTRL_REG + core::mem::size_of::<u32>();
 const CTRL_OSC_ENABLE: u32 = 1 << 8;
 const CTRL_TOY_ENABLE: u32 = 1 << 11;
 const CTRL_REQUIRED: u32 = CTRL_OSC_ENABLE | CTRL_TOY_ENABLE;
+const NO_REALTIME_SOURCE: usize = 0;
+
+/// LS7A TOY year 寄存器存储的是从 1900 开始的年偏移。
+const TOY_YEAR_BASE: u32 = 1900;
+/// 跨秒边界读取时 year/read0 可能不一致，重试几次再判定不稳定。
+const TOY_STABLE_READ_RETRIES: usize = 3;
+const TOY_SECOND_SHIFT: u32 = 4;
+const TOY_SECOND_MASK: u32 = 0x3f;
+const TOY_MINUTE_SHIFT: u32 = 10;
+const TOY_MINUTE_MASK: u32 = 0x3f;
+const TOY_HOUR_SHIFT: u32 = 16;
+const TOY_HOUR_MASK: u32 = 0x1f;
+const TOY_DAY_SHIFT: u32 = 21;
+const TOY_DAY_MASK: u32 = 0x1f;
+const TOY_MONTH_SHIFT: u32 = 26;
+const TOY_MONTH_MASK: u32 = 0x3f;
+
+fn realtime_source_id(phys: usize) -> usize {
+    // MMIO 基址正常是对齐地址；+1 只用于避开 0 这个“无 owner”哨兵。
+    // 极端溢出时保留 usize::MAX，仍然是非 0 的本次启动内标识。
+    phys.checked_add(1).unwrap_or(usize::MAX)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ls7aRtcError {
@@ -48,7 +70,7 @@ impl Ls7aRtc {
         self.ensure_register_window()?;
         self.enable_counter()?;
 
-        for _ in 0..3 {
+        for _ in 0..TOY_STABLE_READ_RETRIES {
             let year0 = self.read32(TOY_READ1_REG)?;
             let read0 = self.read32(TOY_READ0_REG)?;
             let year1 = self.read32(TOY_READ1_REG)?;
@@ -56,12 +78,14 @@ impl Ls7aRtc {
                 continue;
             }
 
-            let second = (read0 >> 4) & 0x3f;
-            let minute = (read0 >> 10) & 0x3f;
-            let hour = (read0 >> 16) & 0x1f;
-            let day = (read0 >> 21) & 0x1f;
-            let month = (read0 >> 26) & 0x3f;
-            let year = year0.checked_add(1900).ok_or(Ls7aRtcError::Overflow)?;
+            let second = (read0 >> TOY_SECOND_SHIFT) & TOY_SECOND_MASK;
+            let minute = (read0 >> TOY_MINUTE_SHIFT) & TOY_MINUTE_MASK;
+            let hour = (read0 >> TOY_HOUR_SHIFT) & TOY_HOUR_MASK;
+            let day = (read0 >> TOY_DAY_SHIFT) & TOY_DAY_MASK;
+            let month = (read0 >> TOY_MONTH_SHIFT) & TOY_MONTH_MASK;
+            let year = year0
+                .checked_add(TOY_YEAR_BASE)
+                .ok_or(Ls7aRtcError::Overflow)?;
             return RtcDateTime::new(year, month, day, hour, minute, second)
                 .and_then(RtcDateTime::unix_time_ns)
                 .ok_or(Ls7aRtcError::InvalidDate);
@@ -115,23 +139,107 @@ impl Ls7aRtc {
 pub struct Ls7aRtcPlatformDriver {
     device_mmio_to_virt: fn(usize) -> usize,
     set_realtime_ns: Option<fn(u64)>,
-    clock_installed: AtomicBool,
+    install_realtime_source: Option<fn(RealtimeClockSource) -> bool>,
+    unregister_realtime_source: Option<fn(usize)>,
+    realtime_owner: AtomicUsize,
 }
 
 impl Ls7aRtcPlatformDriver {
     pub const fn new(
         device_mmio_to_virt: fn(usize) -> usize,
         set_realtime_ns: Option<fn(u64)>,
+        install_realtime_source: Option<fn(RealtimeClockSource) -> bool>,
+        unregister_realtime_source: Option<fn(usize)>,
     ) -> Self {
         Self {
             device_mmio_to_virt,
             set_realtime_ns,
-            clock_installed: AtomicBool::new(false),
+            install_realtime_source,
+            unregister_realtime_source,
+            realtime_owner: AtomicUsize::new(NO_REALTIME_SOURCE),
         }
     }
 
     fn matches_platform(info: &PlatformDeviceInfo) -> bool {
         info.has_id(COMPAT_LOONGSON_LS7A_RTC)
+    }
+
+    fn install_realtime_clock(&self, dev: &PnpDevice, phys: usize, realtime_ns: u64) {
+        let source_id = realtime_source_id(phys);
+        if let Some(install) = self.install_realtime_source {
+            let source = RealtimeClockSource {
+                id: source_id,
+                name: "platform-ls7a-rtc",
+                realtime_ns,
+            };
+            if install(source) {
+                self.realtime_owner.store(source_id, Ordering::Release);
+                log::printk!(
+                    "[platform-ls7a-rtc] installed realtime source from {} phys={:#x} unix_ns={}",
+                    dev.id,
+                    phys,
+                    realtime_ns
+                );
+            } else {
+                log::printk!(
+                    "[platform-ls7a-rtc] realtime source from {} phys={:#x} ignored: another RTC owns realtime",
+                    dev.id,
+                    phys
+                );
+            }
+            return;
+        }
+
+        if let Some(set_realtime_ns) = self.set_realtime_ns {
+            // 兼容旧 hook：没有 unregister 回调时，只在驱动本地记录 owner。
+            // remove 时清掉该标记，允许同类或替代 RTC 后续重新设置 realtime。
+            let installed = self
+                .realtime_owner
+                .compare_exchange(
+                    NO_REALTIME_SOURCE,
+                    source_id,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+                || self.realtime_owner.load(Ordering::Acquire) == source_id;
+            if installed {
+                set_realtime_ns(realtime_ns);
+                log::printk!(
+                    "[platform-ls7a-rtc] installed legacy realtime clock from {} phys={:#x} unix_ns={}",
+                    dev.id,
+                    phys,
+                    realtime_ns
+                );
+            }
+        }
+    }
+
+    fn unregister_realtime_clock(&self, dev: &PnpDevice, phys: usize) {
+        let source_id = realtime_source_id(phys);
+        if self.realtime_owner.load(Ordering::Acquire) != source_id {
+            return;
+        }
+
+        if let Some(unregister) = self.unregister_realtime_source {
+            unregister(source_id);
+        }
+        if self
+            .realtime_owner
+            .compare_exchange(
+                source_id,
+                NO_REALTIME_SOURCE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            log::printk!(
+                "[platform-ls7a-rtc] unregistered realtime source from {} phys={:#x}",
+                dev.id,
+                phys
+            );
+        }
     }
 }
 
@@ -174,23 +282,18 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
             PnpError::ProbeFailed
         })?;
 
-        if let Some(set_realtime_ns) = self.set_realtime_ns
-            && !self.clock_installed.swap(true, Ordering::AcqRel)
-        {
-            set_realtime_ns(realtime_ns);
-            log::printk!(
-                "[platform-ls7a-rtc] installed realtime clock from {} phys={:#x} unix_ns={}",
-                dev.id,
-                phys,
-                realtime_ns
-            );
-        }
+        self.install_realtime_clock(dev, phys, realtime_ns);
 
         dev.set_driver_data(rtc);
         Ok(())
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
+        if let Some(info) = dev.info.as_any().downcast_ref::<PlatformDeviceInfo>()
+            && let Some((phys, _)) = info.first_mmio()
+        {
+            self.unregister_realtime_clock(dev, phys);
+        }
         let _ = dev.take_driver_data();
         log::printk!("[platform-ls7a-rtc] removed {}", dev.id);
     }
@@ -207,6 +310,8 @@ impl DriverFactory for Ls7aRtcFactory {
         Ok(Arc::new(Ls7aRtcPlatformDriver::new(
             ctx.device_mmio_to_virt,
             ctx.set_realtime_ns,
+            ctx.install_realtime_source,
+            ctx.unregister_realtime_source,
         )))
     }
 }

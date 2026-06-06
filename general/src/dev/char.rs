@@ -2,6 +2,7 @@
 //!
 //! SMP 多核并发安全，无未定义行为。
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -111,6 +112,70 @@ pub trait CharDriver: Send + Sync {
     }
 }
 
+impl<T: CharDriver + ?Sized> CharDriver for &'static T {
+    fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
+        (**self).write(buf)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
+        (**self).read(buf)
+    }
+
+    fn flush(&self) -> Result<(), CharIoError> {
+        (**self).flush()
+    }
+
+    fn poll_write(&self) {
+        (**self).poll_write();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
+    fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
+        (**self).write_all(buf)
+    }
+
+    fn is_tty(&self) -> bool {
+        (**self).is_tty()
+    }
+
+    fn is_console(&self) -> bool {
+        (**self).is_console()
+    }
+}
+
+/// [`CharDevice::new`] 的驱动输入转换 helper。
+#[doc(hidden)]
+pub trait IntoCharDriverArc {
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver>;
+}
+
+impl IntoCharDriverArc for Arc<dyn CharDriver> {
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        self
+    }
+}
+
+impl<T> IntoCharDriverArc for Arc<T>
+where
+    T: CharDriver + 'static,
+{
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        self
+    }
+}
+
+impl<T> IntoCharDriverArc for &'static T
+where
+    T: CharDriver + ?Sized + 'static,
+{
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        Arc::new(self)
+    }
+}
+
 // ─────────────────────────── 字符设备条目 ─────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,8 +186,8 @@ pub enum CharDeviceState {
 }
 
 struct CharDeviceInner {
-    fw_name: &'static str,
-    driver: &'static dyn CharDriver,
+    fw_name: Box<str>,
+    driver: Arc<dyn CharDriver>,
     state: AtomicU8,
 }
 
@@ -138,9 +203,6 @@ pub struct CharDevice {
 
 struct NullCharDriver;
 struct ZeroCharDriver;
-
-static NULL_CHAR_DRIVER: NullCharDriver = NullCharDriver;
-static ZERO_CHAR_DRIVER: ZeroCharDriver = ZeroCharDriver;
 
 impl CharDriver for NullCharDriver {
     fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
@@ -173,22 +235,26 @@ impl CharDriver for ZeroCharDriver {
 
 impl CharDevice {
     #[inline]
-    pub fn new(fw_name: &'static str, driver: &'static dyn CharDriver) -> Self {
+    pub fn new<N, D>(fw_name: N, driver: D) -> Self
+    where
+        N: Into<Box<str>>,
+        D: IntoCharDriverArc,
+    {
         Self {
             inner: Arc::new(CharDeviceInner {
-                fw_name,
-                driver,
+                fw_name: fw_name.into(),
+                driver: driver.into_char_driver_arc(),
                 state: AtomicU8::new(CharDeviceState::Active as u8),
             }),
         }
     }
 
     pub fn null() -> Self {
-        Self::new("null", &NULL_CHAR_DRIVER)
+        Self::new("null", Arc::new(NullCharDriver))
     }
 
     pub fn zero() -> Self {
-        Self::new("zero", &ZERO_CHAR_DRIVER)
+        Self::new("zero", Arc::new(ZeroCharDriver))
     }
 
     /// 是否具备 TTY 语义（终端）。委托至底层驱动。
@@ -204,8 +270,8 @@ impl CharDevice {
     }
 
     #[inline]
-    pub fn fw_name(&self) -> &'static str {
-        self.inner.fw_name
+    pub fn fw_name(&self) -> &str {
+        self.inner.fw_name.as_ref()
     }
 
     #[inline]
@@ -294,7 +360,6 @@ impl CharDevice {
 impl core::fmt::Debug for CharDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CharDev")
-            .field("fw_name", &self.fw_name())
             .field("fw_name", &self.fw_name())
             .field("state", &self.state())
             .finish()

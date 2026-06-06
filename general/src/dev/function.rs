@@ -36,6 +36,8 @@ impl DeviceClassId {
 ///
 /// 枚举变体直接携带 VFS 打开节点时需要的设备对象，因此 devtmpfs 不需要再把
 /// `DeviceFunction` downcast 回 `CharFunction` 或 `BlockFunction`。
+/// 这里描述的是 POSIX/VFS 命名空间里的投影，不是底层硬件 identity；底层身份
+/// 仍由 PnP id、function `class_id + dev_name` 和具体 typed device object 表达。
 ///
 /// 标记为 `#[non_exhaustive]` 以便未来扩展新 VFS 节点类型时保持 API 兼容；
 /// 但 POSIX 文件系统层只认 char/block 两种节点类型，新设备类别（网络等）
@@ -98,7 +100,7 @@ impl DevNodeSet {
 pub trait DeviceFunction: Send + Sync {
     /// function 类别，同一类别下 `dev_name` 必须唯一。
     fn class_id(&self) -> DeviceClassId;
-    /// function 在内核设备表中的名称，通常也作为 `/dev` 节点名。
+    /// function registry key 的名称；`/dev` 节点由 [`DevNodeSpec`]/[`DevNodeSet`] 决定。
     fn dev_name(&self) -> &str;
     /// 标记 function 已不可用，使旧句柄尽快停止访问底层设备。
     fn mark_gone(&self);
@@ -125,14 +127,24 @@ pub trait DeviceFunction: Send + Sync {
 /// 统一处理。
 pub struct CharFunction {
     dev_name: Box<str>,
+    devnode_name: Box<str>,
     dev: CharDevice,
 }
 
 impl CharFunction {
     /// 创建一个字符设备 function。
     pub fn new(dev_name: &str, dev: CharDevice) -> Self {
+        Self::with_devnode(dev_name, dev_name, dev)
+    }
+
+    /// 创建一个字符设备 function，并显式指定 `/dev` 投影名。
+    ///
+    /// `dev_name` 是设备 registry key，`devnode_name` 是 POSIX/VFS 兼容层路径名；
+    /// 两者允许相同，但底层设备抽象不再强制绑定二者。
+    pub fn with_devnode(dev_name: &str, devnode_name: &str, dev: CharDevice) -> Self {
         Self {
             dev_name: dev_name.into(),
+            devnode_name: devnode_name.into(),
             dev,
         }
     }
@@ -158,7 +170,7 @@ impl DeviceFunction for CharFunction {
 
     fn devnode(&self) -> Option<DevNodeSpec> {
         Some(DevNodeSpec::Char {
-            name: self.dev_name.clone(),
+            name: self.devnode_name.clone(),
             dev: self.dev(),
         })
     }
@@ -171,14 +183,24 @@ impl DeviceFunction for CharFunction {
 /// 块设备 function。
 pub struct BlockFunction {
     dev_name: Box<str>,
+    devnode_name: Box<str>,
     dev: Arc<BlockDevice>,
 }
 
 impl BlockFunction {
     /// 创建一个块设备 function。
     pub fn new(dev_name: &str, dev: Arc<BlockDevice>) -> Self {
+        Self::with_devnode(dev_name, dev_name, dev)
+    }
+
+    /// 创建一个块设备 function，并显式指定 `/dev` 投影名。
+    ///
+    /// `dev_name` 是 PnP/function registry key，`devnode_name` 只用于 devtmpfs
+    /// 暴露 POSIX 块设备节点，避免把底层设备身份和 `/dev` 命名策略混在一起。
+    pub fn with_devnode(dev_name: &str, devnode_name: &str, dev: Arc<BlockDevice>) -> Self {
         Self {
             dev_name: dev_name.into(),
+            devnode_name: devnode_name.into(),
             dev,
         }
     }
@@ -208,7 +230,7 @@ impl DeviceFunction for BlockFunction {
 
     fn devnode(&self) -> Option<DevNodeSpec> {
         Some(DevNodeSpec::Block {
-            name: self.dev_name.clone(),
+            name: self.devnode_name.clone(),
             dev: self.dev(),
         })
     }
@@ -388,11 +410,16 @@ impl FunctionRegistry {
         class_id: DeviceClassId,
         dev_name: &str,
     ) -> Option<Arc<dyn DeviceFunction>> {
-        let mut list = self.functions.lock();
-        let pos = list
-            .iter()
-            .position(|func| func.class_id() == class_id && func.dev_name() == dev_name)?;
-        Some(list.swap_remove(pos))
+        let func = {
+            let mut list = self.functions.lock();
+            let pos = list
+                .iter()
+                .position(|func| func.class_id() == class_id && func.dev_name() == dev_name)?;
+            list.swap_remove(pos)
+        };
+        func.mark_gone();
+        func.drain_io();
+        Some(func)
     }
 
     /// 查找指定类别和名称的 function。

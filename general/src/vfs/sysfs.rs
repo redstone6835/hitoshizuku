@@ -78,6 +78,7 @@ const CPU_SLOTS: u64 = 4;
 static SYSFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
+const SYSFS_DEFAULT_NR_REQUESTS: u32 = 64;
 
 // ─── 渲染辅助 ──────────────────────────────────────────────
 
@@ -135,6 +136,7 @@ fn slice_str(buf: &[u8], offset: usize, len: usize) -> &[u8] {
 struct CharDevSnapshot {
     /// /sys/devices/ 下的目录名 = `fw_name`（如 "serial@9000000"、"null"）。
     sysfs_name: String,
+    rdev: DevId,
     dev: CharDevice,
 }
 
@@ -142,7 +144,24 @@ struct CharDevSnapshot {
 struct BlockDevSnapshot {
     /// /sys/block/ 与 /sys/dev/block/ 下的目录名 = `dev.name()`（如 "vd0"）。
     sysfs_name: String,
+    rdev: DevId,
     dev: Arc<BlockDevice>,
+}
+
+#[derive(Clone)]
+struct CharDevNodeSnapshot {
+    /// /sys/devices/ 下的目标目录名。
+    sysfs_name: String,
+    /// devtmpfs 相对路径，用于 uevent DEVNAME。
+    devtmpfs_name: String,
+    rdev: DevId,
+}
+
+#[derive(Clone)]
+struct BlockDevNodeSnapshot {
+    /// /sys/block/ 下的目标目录名。
+    sysfs_name: String,
+    rdev: DevId,
 }
 
 /// 挂载时从 `DEVICES` 拷贝出的不可变快照；之后 `/sys` 的全部内容都基于此。
@@ -150,6 +169,8 @@ struct BlockDevSnapshot {
 struct SysSnapshot {
     chars: Vec<CharDevSnapshot>,
     blocks: Vec<BlockDevSnapshot>,
+    char_nodes: Vec<CharDevNodeSnapshot>,
+    block_nodes: Vec<BlockDevNodeSnapshot>,
 }
 
 impl SysSnapshot {
@@ -157,11 +178,40 @@ impl SysSnapshot {
         let mut snap = SysSnapshot::default();
         for dev in active_block_devices(&DEVICES.functions) {
             let sysfs_name = dev.name().to_string();
-            snap.blocks.push(BlockDevSnapshot { sysfs_name, dev });
+            if let Some(record) = device_numbers::lookup_block_record(&sysfs_name) {
+                snap.blocks.push(BlockDevSnapshot {
+                    sysfs_name,
+                    rdev: record.rdev,
+                    dev,
+                });
+            }
         }
         for dev in active_char_devices(&DEVICES.functions) {
             let sysfs_name = dev.fw_name().to_string();
-            snap.chars.push(CharDevSnapshot { sysfs_name, dev });
+            if let Some(record) = device_numbers::lookup_char_record(&sysfs_name) {
+                snap.chars.push(CharDevSnapshot {
+                    sysfs_name,
+                    rdev: record.rdev,
+                    dev,
+                });
+            }
+        }
+        for record in device_numbers::records() {
+            match record.kind {
+                device_numbers::PosixDeviceKind::Char => {
+                    snap.char_nodes.push(CharDevNodeSnapshot {
+                        sysfs_name: record.display_name,
+                        devtmpfs_name: record.node_name,
+                        rdev: record.rdev,
+                    })
+                }
+                device_numbers::PosixDeviceKind::Block => {
+                    snap.block_nodes.push(BlockDevNodeSnapshot {
+                        sysfs_name: record.display_name,
+                        rdev: record.rdev,
+                    })
+                }
+            }
         }
         snap
     }
@@ -411,8 +461,14 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
                 "0\n".into()
             }
         }
-        BlockDevSlot::Removable => "0\n".into(),
-        BlockDevSlot::Dev => format_block_rdev(&snap.blocks[idx].sysfs_name),
+        BlockDevSlot::Removable => {
+            if dev.attributes().removable() {
+                "1\n".into()
+            } else {
+                "0\n".into()
+            }
+        }
+        BlockDevSlot::Dev => format_rdev(snap.blocks[idx].rdev),
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
@@ -434,8 +490,22 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
     match slot {
         BlockQueueSlot::Lbs => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::Pbs => format!("{}\n", geom.physical_block_size().get()),
-        BlockQueueSlot::Rotational => "0\n".into(), // 全部按 SSD 报告：virtio-blk、NVMe 都不是机械盘
-        BlockQueueSlot::NrRequests => "64\n".into(),
+        BlockQueueSlot::Rotational => {
+            if dev.attributes().rotational() {
+                "1\n".into()
+            } else {
+                "0\n".into()
+            }
+        }
+        BlockQueueSlot::NrRequests => {
+            // 没有真实队列深度的设备使用兼容默认值；VirtIO 等驱动会填实际协商值。
+            let depth = dev
+                .attributes()
+                .queue_depth()
+                .map(|n| n.get())
+                .unwrap_or(SYSFS_DEFAULT_NR_REQUESTS);
+            format!("{}\n", depth)
+        }
         BlockQueueSlot::HwSectorSize => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::DiscardZeroes => {
             if features.contains(crate::dev::block::BlockFeatures::WRITE_ZEROES) {
@@ -454,7 +524,7 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
         let c = &snap.chars[idx];
         match slot {
             DeviceSlot::Name => format!("{}\n", c.sysfs_name),
-            DeviceSlot::Dev => format_char_rdev(&c.sysfs_name),
+            DeviceSlot::Dev => format_rdev(c.rdev),
             DeviceSlot::Driver => String::new(),
             // TODO: 实现真正的 subsystem 链接（指向 /sys/class/<class> 或 /sys/bus/<bus>）
             DeviceSlot::Subsystem => "(unimplemented)\n".into(),
@@ -465,7 +535,7 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
         let b = &snap.blocks[bi];
         match slot {
             DeviceSlot::Name => format!("{}\n", b.sysfs_name),
-            DeviceSlot::Dev => format_block_rdev(&b.sysfs_name),
+            DeviceSlot::Dev => format_rdev(b.rdev),
             DeviceSlot::Driver => String::new(),
             // TODO: 实现真正的 subsystem 链接（指向 /sys/class/block）
             DeviceSlot::Subsystem => "(unimplemented)\n".into(),
@@ -476,32 +546,30 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
 
 fn render_dev_char_inner(snap: &SysSnapshot, idx: usize, slot: DevCharInnerSlot) -> String {
     match slot {
-        DevCharInnerSlot::Dev => format_char_rdev(&snap.chars[idx].sysfs_name),
+        DevCharInnerSlot::Dev => format_rdev(snap.char_nodes[idx].rdev),
         DevCharInnerSlot::DeviceLink => String::new(), // symlink，不渲染
         DevCharInnerSlot::SubsystemLink => String::new(),
         DevCharInnerSlot::Uevent => {
-            if let Some(rdev) = device_numbers::lookup_char(&snap.chars[idx].sysfs_name) {
-                format!(
-                    "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
-                    rdev.major, rdev.minor, snap.chars[idx].sysfs_name
-                )
-            } else {
-                "MODALIAS=char:0:0\n".into()
-            }
+            let c = &snap.char_nodes[idx];
+            format!(
+                "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
+                c.rdev.major, c.rdev.minor, c.devtmpfs_name
+            )
         }
     }
 }
 
-fn format_char_rdev(name: &str) -> String {
-    device_numbers::lookup_char(name)
-        .map(|rdev| format!("{}:{}\n", rdev.major, rdev.minor))
-        .unwrap_or_else(|| "0:0\n".into())
+fn format_rdev(rdev: DevId) -> String {
+    format!("{}:{}\n", rdev.major, rdev.minor)
 }
 
-fn format_block_rdev(name: &str) -> String {
-    device_numbers::lookup_block(name)
-        .map(|rdev| format!("{}:{}\n", rdev.major, rdev.minor))
-        .unwrap_or_else(|| "0:0\n".into())
+fn rdev_name(rdev: DevId) -> String {
+    format!("{}:{}", rdev.major, rdev.minor)
+}
+
+fn parse_rdev_name(name: &str) -> Option<DevId> {
+    let (major, minor) = name.split_once(':')?;
+    Some(DevId::new(major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn render_cpu_file(_snap: &SysSnapshot, _cpu_id: usize, slot: CpuSlot) -> String {
@@ -983,21 +1051,23 @@ impl SysDirInodeOps {
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::DevBlock => {
+                let rdev = parse_rdev_name(name).ok_or(VfsError::NotFound)?;
                 let idx = snap
-                    .blocks
+                    .block_nodes
                     .iter()
-                    .position(|b| b.sysfs_name == name)
+                    .position(|b| b.rdev == rdev)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_link(
                     dev_block_link_ino(idx),
-                    format!("../../block/{}", snap.blocks[idx].sysfs_name),
+                    format!("../../block/{}", snap.block_nodes[idx].sysfs_name),
                 ))
             }
             SysDirKind::DevChar => {
+                let rdev = parse_rdev_name(name).ok_or(VfsError::NotFound)?;
                 let idx = snap
-                    .chars
+                    .char_nodes
                     .iter()
-                    .position(|c| c.sysfs_name == name)
+                    .position(|c| c.rdev == rdev)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
                     dev_char_dir_ino(idx),
@@ -1010,7 +1080,7 @@ impl SysDirInodeOps {
                 match slot {
                     DevCharInnerSlot::DeviceLink => Ok(mk_link(
                         ino,
-                        format!("../../devices/{}", snap.chars[idx].sysfs_name),
+                        format!("../../devices/{}", snap.char_nodes[idx].sysfs_name),
                     )),
                     DevCharInnerSlot::SubsystemLink => Ok(mk_link(ino, "../../class".into())),
                     _ => mk_reg(ino, SysRegFile::DevCharInner { idx, slot }),
@@ -1263,16 +1333,20 @@ impl SysDirInodeOps {
                 mk_dir_entry(DEV_CHAR_DIR_INO, "char", FileType::Directory),
             ],
             SysDirKind::DevBlock => snap
-                .blocks
+                .block_nodes
                 .iter()
                 .enumerate()
-                .map(|(i, b)| mk_dir_entry(dev_block_link_ino(i), &b.sysfs_name, FileType::Symlink))
+                .map(|(i, b)| {
+                    mk_dir_entry(dev_block_link_ino(i), &rdev_name(b.rdev), FileType::Symlink)
+                })
                 .collect(),
             SysDirKind::DevChar => snap
-                .chars
+                .char_nodes
                 .iter()
                 .enumerate()
-                .map(|(i, c)| mk_dir_entry(dev_char_dir_ino(i), &c.sysfs_name, FileType::Directory))
+                .map(|(i, c)| {
+                    mk_dir_entry(dev_char_dir_ino(i), &rdev_name(c.rdev), FileType::Directory)
+                })
                 .collect(),
             SysDirKind::DevCharInner { idx } => vec![
                 mk_dir_entry(
