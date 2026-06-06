@@ -16,10 +16,27 @@ const SOCKADDR_IN6_SIZE: usize = 28;
 ///
 /// 支持 `sockaddr_in`（16 字节）和 `sockaddr_in6`（28 字节）。
 pub fn parse_inet_sockaddr(data: &[u8]) -> Result<Endpoint, Errno> {
+    let family = sockaddr_family(data)?;
+    parse_inet_sockaddr_with_family(data, family)
+}
+
+/// 解析 sockaddr，并要求 sockaddr family 与当前 socket family 一致。
+pub fn parse_inet_sockaddr_for_socket(data: &[u8], socket_family: u16) -> Result<Endpoint, Errno> {
+    let family = sockaddr_family(data)?;
+    if family != socket_family {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    parse_inet_sockaddr_with_family(data, family)
+}
+
+pub fn sockaddr_family(data: &[u8]) -> Result<u16, Errno> {
     if data.len() < 2 {
         return Err(Errno::EINVAL);
     }
-    let family = u16::from_ne_bytes([data[0], data[1]]);
+    Ok(u16::from_ne_bytes([data[0], data[1]]))
+}
+
+fn parse_inet_sockaddr_with_family(data: &[u8], family: u16) -> Result<Endpoint, Errno> {
     match family {
         AF_INET => parse_sockaddr_in(data),
         AF_INET6 => parse_sockaddr_in6(data),
@@ -30,11 +47,7 @@ pub fn parse_inet_sockaddr(data: &[u8]) -> Result<Endpoint, Errno> {
 /// 序列化 `net::Endpoint` 为 sockaddr 二进制格式。
 ///
 /// 返回实际写入的字节数。
-pub fn encode_inet_sockaddr(
-    ep: &Endpoint,
-    family: u16,
-    buf: &mut [u8],
-) -> Result<usize, Errno> {
+pub fn encode_inet_sockaddr(ep: &Endpoint, family: u16, buf: &mut [u8]) -> Result<usize, Errno> {
     match family {
         AF_INET => encode_sockaddr_in(ep, buf),
         AF_INET6 => encode_sockaddr_in6(ep, buf),
@@ -48,7 +61,10 @@ fn parse_sockaddr_in(data: &[u8]) -> Result<Endpoint, Errno> {
     }
     let port = u16::from_be_bytes([data[2], data[3]]);
     let addr = Ipv4Addr([data[4], data[5], data[6], data[7]]);
-    Ok(Endpoint { addr: IpAddr::V4(addr), port })
+    Ok(Endpoint {
+        addr: IpAddr::V4(addr),
+        port,
+    })
 }
 
 fn parse_sockaddr_in6(data: &[u8]) -> Result<Endpoint, Errno> {
@@ -59,7 +75,10 @@ fn parse_sockaddr_in6(data: &[u8]) -> Result<Endpoint, Errno> {
     let mut octets = [0u8; 16];
     octets.copy_from_slice(&data[8..24]);
     let addr = Ipv6Addr(octets);
-    Ok(Endpoint { addr: IpAddr::V6(addr), port })
+    Ok(Endpoint {
+        addr: IpAddr::V6(addr),
+        port,
+    })
 }
 
 fn encode_sockaddr_in(ep: &Endpoint, buf: &mut [u8]) -> Result<usize, Errno> {

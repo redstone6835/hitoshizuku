@@ -51,13 +51,47 @@ pub enum DevNodeSpec {
         name: Box<str>,
         dev: Arc<BlockDevice>,
     },
+    Symlink {
+        name: Box<str>,
+        target: Box<str>,
+    },
 }
 
 impl DevNodeSpec {
     pub fn name(&self) -> &str {
         match self {
-            Self::Char { name, .. } | Self::Block { name, .. } => name,
+            Self::Char { name, .. } | Self::Block { name, .. } | Self::Symlink { name, .. } => name,
         }
+    }
+}
+
+/// 一个 function 在 devtmpfs 中需要投影出的节点集合。
+///
+/// 旧接口里 `function 名称 == /dev 节点名 == 解绑键`，这会把设备身份和 VFS
+/// 名字空间耦合在一起。节点集合把这三件事拆开：function 仍由 `class_id +
+/// dev_name` 唯一标识，devtmpfs 只消费这里声明的路径投影。
+#[derive(Clone)]
+pub struct DevNodeSet {
+    nodes: Vec<DevNodeSpec>,
+}
+
+impl DevNodeSet {
+    pub fn single(node: DevNodeSpec) -> Self {
+        let mut nodes = Vec::new();
+        nodes.push(node);
+        Self { nodes }
+    }
+
+    pub fn new(nodes: Vec<DevNodeSpec>) -> Option<Self> {
+        if nodes.is_empty() {
+            None
+        } else {
+            Some(Self { nodes })
+        }
+    }
+
+    pub fn nodes(&self) -> &[DevNodeSpec] {
+        &self.nodes
     }
 }
 
@@ -73,6 +107,13 @@ pub trait DeviceFunction: Send + Sync {
     /// 返回该 function 需要暴露到 devtmpfs 的节点规格。
     fn devnode(&self) -> Option<DevNodeSpec> {
         None
+    }
+    /// 返回该 function 需要暴露到 devtmpfs 的节点集合。
+    ///
+    /// 默认把旧的单节点接口提升为集合，已有驱动无需立即迁移；需要多个路径、别名
+    /// 或符号链接的驱动可以只覆盖此方法。
+    fn devnodes(&self) -> Option<DevNodeSet> {
+        self.devnode().map(DevNodeSet::single)
     }
     /// 向下转型支持。新设备类型通过此方法提供类型恢复路径。
     fn as_any(&self) -> &dyn core::any::Any;
@@ -196,17 +237,17 @@ pub fn function_as<T: 'static>(func: &dyn DeviceFunction) -> Option<&T> {
 }
 
 pub fn char_device_from_function(func: &dyn DeviceFunction) -> Option<CharDevice> {
-    match func.devnode()? {
-        DevNodeSpec::Char { dev, .. } => Some(dev),
-        DevNodeSpec::Block { .. } => None,
-    }
+    func.devnodes()?.nodes().iter().find_map(|node| match node {
+        DevNodeSpec::Char { dev, .. } => Some(dev.clone()),
+        DevNodeSpec::Block { .. } | DevNodeSpec::Symlink { .. } => None,
+    })
 }
 
 pub fn block_device_from_function(func: &dyn DeviceFunction) -> Option<Arc<BlockDevice>> {
-    match func.devnode()? {
-        DevNodeSpec::Block { dev, .. } => Some(dev),
-        DevNodeSpec::Char { .. } => None,
-    }
+    func.devnodes()?.nodes().iter().find_map(|node| match node {
+        DevNodeSpec::Block { dev, .. } => Some(Arc::clone(dev)),
+        DevNodeSpec::Char { .. } | DevNodeSpec::Symlink { .. } => None,
+    })
 }
 
 /// 列出当前仍处于 active 状态的字符设备节点。
@@ -253,9 +294,13 @@ pub fn lookup_block_device_by_node(
     functions
         .list()
         .into_iter()
-        .filter_map(|func| match func.devnode()? {
-            DevNodeSpec::Block { name, dev } if name.as_ref() == dev_name => Some(dev),
-            _ => None,
+        .filter_map(|func| {
+            func.devnodes()?.nodes().iter().find_map(|node| match node {
+                DevNodeSpec::Block { name, dev } if name.as_ref() == dev_name => {
+                    Some(Arc::clone(dev))
+                }
+                _ => None,
+            })
         })
         .find(|dev| dev.is_active())
 }

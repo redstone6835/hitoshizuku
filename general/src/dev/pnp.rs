@@ -39,7 +39,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vfs::sync::Spinlock;
 
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{DevNodeSpec, DeviceFunction, FunctionRegistryError};
+use crate::dev::function::{DevNodeSet, DeviceFunction, FunctionRegistryError};
 
 // ── PnP 错误类型 ─────────────────────────────────────────────────────────
 
@@ -724,11 +724,11 @@ impl Default for PnpDeviceList {
 
 /// PnP 与 devtmpfs 之间的最小桥接回调。
 ///
-/// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSpec`] 时，通过这里安装的
+/// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSet`] 时，通过这里安装的
 /// 回调把节点创建委托给 devtmpfs。
 pub struct PnpDevtmpfsCallbacks {
-    pub bind: fn(&DevNodeSpec) -> Result<(), PnpError>,
-    pub unbind: fn(&str) -> Result<(), PnpError>,
+    pub bind: fn(&DevNodeSet) -> Result<(), PnpError>,
+    pub unbind: fn(&DevNodeSet) -> Result<(), PnpError>,
 }
 
 static DEVTMPFS_CB: Spinlock<Option<PnpDevtmpfsCallbacks>> = Spinlock::new(None);
@@ -739,18 +739,18 @@ pub fn set_devtmpfs_callbacks(cb: PnpDevtmpfsCallbacks) {
 }
 
 fn devtmpfs_bind_function(func: &Arc<dyn DeviceFunction>) -> Result<(), PnpError> {
-    let Some(spec) = func.devnode() else {
+    let Some(nodes) = func.devnodes() else {
         return Ok(());
     };
     let guard = DEVTMPFS_CB.lock();
     let cb = guard.as_ref().ok_or(PnpError::NoDevtmpfs)?;
-    (cb.bind)(&spec)
+    (cb.bind)(&nodes)
 }
 
-fn devtmpfs_unbind(dev_name: &str) -> Result<(), PnpError> {
+fn devtmpfs_unbind(nodes: &DevNodeSet) -> Result<(), PnpError> {
     let guard = DEVTMPFS_CB.lock();
     let cb = guard.as_ref().ok_or(PnpError::NoDevtmpfs)?;
-    (cb.unbind)(dev_name)
+    (cb.unbind)(nodes)
 }
 
 // ── 功能注册 helpers ────────────────────────────────────────────────────
@@ -769,8 +769,8 @@ impl PnpDevice {
         }
 
         if let Err(e) = self.attach_function(Arc::clone(&func)) {
-            if let Some(spec) = func.devnode() {
-                let _ = devtmpfs_unbind(spec.name());
+            if let Some(nodes) = func.devnodes() {
+                let _ = devtmpfs_unbind(&nodes);
             }
             DEVICES.unregister_function(&func);
             return Err(e);
@@ -780,8 +780,8 @@ impl PnpDevice {
     }
 
     fn unregister_function_external(&self, func: &Arc<dyn DeviceFunction>) {
-        if let Some(spec) = func.devnode() {
-            let _ = devtmpfs_unbind(spec.name());
+        if let Some(nodes) = func.devnodes() {
+            let _ = devtmpfs_unbind(&nodes);
         }
         DEVICES.unregister_function(func);
     }

@@ -59,6 +59,7 @@ const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const FD_CLOEXEC: usize = 1;
+const FIONBIO: usize = 0x5421;
 
 const STATX_TYPE: u32 = 0x0001;
 const STATX_MODE: u32 = 0x0002;
@@ -108,7 +109,7 @@ pub(super) fn sys_pread64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fd = fd_arg(ctx.args[0])?;
     let buf = ctx.args[1];
     let len = ctx.args[2];
-    let offset = ctx.args[3] as u64;
+    let offset = nonnegative_i64_arg(ctx.args[3])?;
     let file = file_for_fd(fd)?;
     read_to_user(&file, buf, len, Some(offset))
 }
@@ -117,7 +118,7 @@ pub(super) fn sys_pwrite64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let fd = fd_arg(ctx.args[0])?;
     let buf = ctx.args[1];
     let len = ctx.args[2];
-    let offset = ctx.args[3] as u64;
+    let offset = nonnegative_i64_arg(ctx.args[3])?;
     let file = file_for_fd(fd)?;
     write_from_user_at(&file, buf, len, Some(offset))
 }
@@ -396,10 +397,16 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let file = file_for_fd(fd_arg(ctx.args[0])?)?;
     let cmd = IoctlCmd::new(ctx.args[1] & u32::MAX as usize);
     let raw_cmd = cmd.raw() as u32;
+    // FIONBIO 的 syscall ABI 是 int *；VFS ioctl 实现只接收已解码的值。
+    let arg = if cmd.raw() == FIONBIO {
+        read_user_i32(ctx.args[2])? as usize
+    } else {
+        ctx.args[2]
+    };
     if general::dev::net::is_net_ioctl(raw_cmd) {
-        return general::dev::net::net_ioctl(raw_cmd, ctx.args[2]);
+        return general::dev::net::net_ioctl(raw_cmd, arg);
     }
-    file.ioctl(cmd, ctx.args[2])
+    file.ioctl(cmd, arg)
 }
 
 pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -437,7 +444,11 @@ pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fds_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(fds.as_ptr() as *const u8, core::mem::size_of::<[i32; 2]>())
     };
-    copy_to_user(fds_user, fds_bytes).map_err(|e| e.as_errno())?;
+    if let Err(err) = copy_to_user(fds_user, fds_bytes) {
+        let _ = fdt.close_fd(write_fd);
+        let _ = fdt.close_fd(read_fd);
+        return Err(err.as_errno());
+    }
 
     Ok(0)
 }
@@ -613,7 +624,7 @@ pub(super) fn sys_truncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let _fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let path = copy_cstr_from_user(ctx.args[0], PATH_MAX).map_err(|e| e.as_errno())?;
-    let size = ctx.args[1] as u64;
+    let size = nonnegative_i64_arg(ctx.args[1])?;
     let dirfd = Dirfd::Cwd;
     operation::truncate(&vfs_ctx, &dirfd, &path, size).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -621,12 +632,12 @@ pub(super) fn sys_truncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
 pub(super) fn sys_ftruncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
-    let size = ctx.args[1] as u64;
+    let size = nonnegative_i64_arg(ctx.args[1])?;
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
-    file.inode().set_size(size);
+    file.truncate(size).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -651,7 +662,11 @@ pub(super) fn sys_getdents64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let file = file_for_fd(fd)?;
 
     let mut buf_pos = 0usize;
+    let mut copy_error = None;
     file.readdir(&mut |entry| {
+        if copy_error.is_some() {
+            return ControlFlow::Break(());
+        }
         if buf_pos >= count {
             return ControlFlow::Break(());
         }
@@ -671,13 +686,20 @@ pub(super) fn sys_getdents64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         raw[18] = file_type_to_d_type(entry.kind);
         raw[19..19 + name_len].copy_from_slice(&name_bytes[..name_len]);
         raw[19 + name_len] = 0;
-        if copy_to_user(dirent + buf_pos, &raw).is_err() {
+        if let Err(err) = copy_to_user(dirent + buf_pos, &raw) {
+            copy_error = Some(err.as_errno());
             return ControlFlow::Break(());
         }
         buf_pos += reclen;
         ControlFlow::Continue(())
     })
     .map_err(|e| e.to_errno())?;
+
+    if let Some(err) = copy_error
+        && buf_pos == 0
+    {
+        return Err(err);
+    }
 
     Ok(buf_pos)
 }
@@ -1022,18 +1044,17 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
 
 pub(super) fn sys_fallocate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
-    let _mode = ctx.args[1];
-    let offset = ctx.args[2] as u64;
-    let len = ctx.args[3] as u64;
+    let mode = ctx.args[1];
+    let offset = nonnegative_i64_arg(ctx.args[2])?;
+    let len = nonnegative_i64_arg(ctx.args[3])?;
+    if mode != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
-    let size = file.stat().map_err(|e| e.to_errno())?.size as u64;
-    let end = offset.saturating_add(len);
-    if end > size {
-        file.inode().set_size(end);
-    }
+    file.fallocate(offset, len).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -1426,7 +1447,7 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut pollfds = vec![0u8; total_bytes];
     copy_from_user(fds_user, &mut pollfds).map_err(|e| e.as_errno())?;
 
-    let timeout_ms = read_timespec_ms(timeout_user);
+    let timeout_ms = read_timespec_ms(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
 
     let deadline = timeout_deadline(timeout_ms);
@@ -1496,7 +1517,7 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let mut read_out = vec![0u8; set_len];
     let mut write_out = vec![0u8; set_len];
     let mut except_out = vec![0u8; set_len];
-    let timeout_ms = read_timespec_ms(timeout_user);
+    let timeout_ms = read_timespec_ms(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
     let deadline = timeout_deadline(timeout_ms);
 
@@ -1572,7 +1593,10 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
-        Some(sched::now_ns_public() + (timeout_ms as u64) * 1_000_000)
+        Some(
+            sched::now_ns_public()
+                .saturating_add((timeout_ms as u64).saturating_mul(1_000_000)),
+        )
     } else {
         None
     }
@@ -1742,6 +1766,14 @@ fn fd_arg(raw: usize) -> Result<Fd, Errno> {
         return Err(Errno::EBADF);
     }
     Ok(Fd::from_raw(fd as u32))
+}
+
+fn nonnegative_i64_arg(raw: usize) -> Result<u64, Errno> {
+    let value = raw as isize as i64;
+    if value < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value as u64)
 }
 
 fn dirfd_arg(raw: usize, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
@@ -2068,6 +2100,12 @@ fn read_iovec(iov: usize, index: usize) -> Result<(usize, usize), Errno> {
     let base = usize::from_le_bytes(raw[0..8].try_into().unwrap());
     let len = usize::from_le_bytes(raw[8..16].try_into().unwrap());
     Ok((base, len))
+}
+
+fn read_user_i32(user: usize) -> Result<i32, Errno> {
+    let mut raw = [0u8; 4];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(i32::from_ne_bytes(raw))
 }
 
 struct UserMsghdr {
@@ -2397,20 +2435,18 @@ fn write_linux_statfs(user: usize, st: &FsStat) -> Result<(), Errno> {
     copy_to_user(user, &out).map_err(|e| e.as_errno())
 }
 
-fn read_timespec_ms(user: usize) -> i64 {
+fn read_timespec_ms(user: usize) -> Result<i64, Errno> {
     if user == 0 {
-        return -1;
+        return Ok(-1);
     }
     let mut raw = [0u8; 16];
-    if copy_from_user(user, &mut raw).is_err() {
-        return -1;
-    }
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
     let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
-        return -1;
+        return Err(Errno::EINVAL);
     }
-    sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)
+    Ok(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000))
 }
 
 fn read_socket_timeout_deadline(user: usize) -> Result<Option<u64>, Errno> {

@@ -9,6 +9,7 @@
 //! Iterator` 关联的不透明类型泄漏到调用者签名里。
 
 use crate::error::ElfError;
+use core::convert::TryFrom;
 
 use super::raw::{
     PHDR_OFF_ALIGN, PHDR_OFF_FILESZ, PHDR_OFF_FLAGS, PHDR_OFF_MEMSZ, PHDR_OFF_OFFSET,
@@ -21,6 +22,10 @@ use super::raw::{
 pub(super) struct PhdrView<'a> {
     /// 整张 phdr 表的字节切片（`phnum * phentsize` 长）。
     table: &'a [u8],
+    /// phdr 表在原始 image 字节流中的起点。
+    file_offset: u64,
+    /// phdr 表在原始 image 字节流中的终点。
+    file_end: u64,
     /// 每条 phdr 的字节数。本 crate 拒绝 != 56。
     entsize: usize,
     count: usize,
@@ -36,18 +41,23 @@ impl<'a> PhdrView<'a> {
         if phentsize as usize != PHDR_SIZE {
             return Err(ElfError::TruncatedPhdr);
         }
-        let phoff = phoff as usize;
         let total = (phentsize as usize)
             .checked_mul(phnum as usize)
             .ok_or(ElfError::PhdrOffsetOverflow)?;
-        let end = phoff
+        let file_end = phoff
+            .checked_add(u64::try_from(total).map_err(|_| ElfError::PhdrOffsetOverflow)?)
+            .ok_or(ElfError::PhdrOffsetOverflow)?;
+        let phoff_usize = usize::try_from(phoff).map_err(|_| ElfError::PhdrOffsetOverflow)?;
+        let end = phoff_usize
             .checked_add(total)
             .ok_or(ElfError::PhdrOffsetOverflow)?;
         if end > bytes.len() {
             return Err(ElfError::TruncatedPhdr);
         }
         Ok(Self {
-            table: &bytes[phoff..end],
+            table: &bytes[phoff_usize..end],
+            file_offset: phoff,
+            file_end,
             entsize: phentsize as usize,
             count: phnum as usize,
         })
@@ -55,6 +65,14 @@ impl<'a> PhdrView<'a> {
 
     pub(super) fn count(&self) -> usize {
         self.count
+    }
+
+    pub(super) fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    pub(super) fn file_end(&self) -> u64 {
+        self.file_end
     }
 
     /// 第 `idx` 条 Phdr。`idx >= count` 返 None。

@@ -359,10 +359,7 @@ pub fn clone_with_context(args: CloneArgs, user_ctx: UserContextRef) -> Result<P
     }
 
     if args.flags.has(CloneFlags::CLONE_VFORK) {
-        let _ = parent.cas_state(TaskState::Running, TaskState::Sleeping);
-        let _ = parent.cas_state(TaskState::Runnable, TaskState::Sleeping);
-        child.vfork_done.enqueue(&parent);
-        schedule_once(0);
+        child.vfork_done.wait_event(&parent, || !child.is_vforking());
     }
 
     Ok(pid)
@@ -448,6 +445,36 @@ fn matches_waitid(child: &Arc<Task>, target: WaitId, parent: &Arc<Task>) -> bool
     }
 }
 
+fn wait_child_observable(
+    parent: &Arc<Task>,
+    target: WaitId,
+    wait_exited: bool,
+    wait_stopped: bool,
+    wait_continued: bool,
+) -> bool {
+    let children = parent.snapshot_children();
+    let mut any_match = false;
+    for child in children.iter().filter(|c| matches_waitid(c, target, parent)) {
+        any_match = true;
+        if wait_exited && child.state() == TaskState::Zombie {
+            return true;
+        }
+        if wait_stopped && child.wait_stopped_status(true).is_some() {
+            return true;
+        }
+        if wait_continued && child.wait_continued_status(true).is_some() {
+            return true;
+        }
+    }
+    !any_match
+}
+
+fn child_exit_status(child: &Arc<Task>, fallback: ExitCode) -> WaitStatus {
+    child
+        .exit_wait_status()
+        .unwrap_or_else(|| WaitStatus::from_exit(fallback.0))
+}
+
 /// `wait4(pid, &mut status, opts, _rusage)`：阻塞等待子退出。
 /// 返回 `(pid, status)`。`WNOHANG` 下无 zombie 返回 `WaitResult { pid: 0, ... }`。
 pub fn wait4(pid: PidT, options: WaitOptions) -> Result<WaitResult, Errno> {
@@ -492,13 +519,13 @@ fn wait_common(
                         .expect("[sched][wait] zombie without exit code");
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
-                        status: WaitStatus::from_exit(code.0),
+                        status: child_exit_status(&child, code),
                     });
                 }
             } else if let Some((child, code)) = reap_matching(&me, pred) {
                 return Ok(WaitResult {
                     pid: child.pid_root().unwrap_or(0),
-                    status: WaitStatus::from_exit(code.0),
+                    status: child_exit_status(&child, code),
                 });
             }
         }
@@ -540,12 +567,11 @@ fn wait_common(
             });
         }
 
-        // 5. 阻塞：挂到 me.exit_waiters，让出 CPU，被唤醒后重试。
-        let _ = me.cas_state(TaskState::Running, TaskState::Sleeping);
-        let _ = me.cas_state(TaskState::Runnable, TaskState::Sleeping);
-        me.exit_waiters.enqueue(&me);
-        schedule_once(0);
-        // 唤醒后回到 Runnable，重新轮询。
+        // 5. 阻塞：按 wait_event 协议挂到 me.exit_waiters，让出 CPU，被唤醒后重试。
+        me.exit_waiters.wait_event(&me, || {
+            wait_child_observable(&me, target, wait_exited, wait_stopped, wait_continued)
+        });
+        // 唤醒后重新轮询。
     }
 }
 
@@ -577,6 +603,10 @@ fn make_siginfo(sig: SignalNumber) -> SigInfo {
     }
 }
 
+fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
+    !task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig)
+}
+
 /// `kill(pid, sig)`：按 POSIX pid 语义投递信号。
 /// - pid > 0：送到整 thread-group（共享 pending）。
 /// - pid == 0：送到调用者同 pgroup 的所有进程。
@@ -592,7 +622,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
         target.thread_group().shared_signal().deliver(info);
         // 唤醒任一合适的 tg 成员。
         for m in target.thread_group().snapshot() {
-            if !m.signal.blocked_snapshot().has(sig) {
+            if should_wake_for_signal(&m, sig) {
                 signal_wakeup(&m, &info);
                 break;
             }
@@ -632,7 +662,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
             }
             t.thread_group().shared_signal().deliver(info);
             for x in t.thread_group().snapshot() {
-                if !x.signal.blocked_snapshot().has(sig) {
+                if should_wake_for_signal(&x, sig) {
                     signal_wakeup(&x, &info);
                     break;
                 }
@@ -657,7 +687,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
         if check_kill_permission(&m).is_ok() {
             m.thread_group().shared_signal().deliver(info);
             for x in m.thread_group().snapshot() {
-                if !x.signal.blocked_snapshot().has(sig) {
+                if should_wake_for_signal(&x, sig) {
                     signal_wakeup(&x, &info);
                     break;
                 }
@@ -727,41 +757,83 @@ pub fn sigpending() -> Result<SigSet, Errno> {
 /// `sigtimedwait(these)` 在不阻塞的情况下尝试消费一条属于 `these` 的信号。
 /// 命中即返回 Some(SigInfo)，无命中返回 None（不进入等待）。
 ///
-/// 注意：调用方负责在调用前清掉 per-task 与 tg-shared 队列中的"非 these"
-/// 残留——本函数只检查 `these ∩ pending`。
+/// 不匹配 `these` 的 pending 会保留在原队列中，等待常规投递或其它 sigwait。
 pub fn sigtimedwait_poll(these: SigSet) -> Option<SigInfo> {
     let me = current_task();
     // 先 per-task（更及时），再 tg-shared。
     if let Some(info) = me.signal.dequeue_one_in(these.0) {
         return Some(info);
     }
-    let blocked = me.signal.blocked_snapshot().raw();
-    me.shared_signal().dequeue_one_in(these.0, blocked)
+    me.shared_signal().dequeue_one_in(these.0)
+}
+
+fn sigtimedwait_pending(these: SigSet) -> bool {
+    let me = current_task();
+    me.signal.has_pending_in(these.0) || me.shared_signal().has_pending_in(these.0)
+}
+
+fn finish_current_signal_wait(me: &Arc<Task>) {
+    if !me.cas_state(TaskState::Sleeping, TaskState::Running) {
+        let _ = me.cas_state(TaskState::Runnable, TaskState::Running);
+    }
 }
 
 /// 等待 pending ∩ these 出现。返回 true 表示等到了，false 表示超时。
-///
-/// 与 `sys_rt_sigsuspend` 一样采用 `Running -> Sleeping -> yield` 自旋
-/// 让出；不引入新 waitqueue 路径，理由：`signal_wakeup` 命中 Sleeping
-/// 时会拉回 Runnable，下次 schedule 自然到达此处循环。
+/// 本函数只等待、不消费；调用方随后用 [`sigtimedwait_poll`] 取走 siginfo。
 pub fn sigtimedwait_wait(these: SigSet, timeout_ns: Option<u64>) -> bool {
-    use crate::scheduler::now_ns_public;
+    use crate::scheduler::{cancel_sleep_deadline, now_ns_public, register_sleep_deadline};
     let me = current_task();
-    let deadline = timeout_ns.and_then(|ns| now_ns_public().checked_add(ns));
+    let deadline = timeout_ns.map(|ns| now_ns_public().saturating_add(ns));
+    me.signal.begin_sigtimedwait(these);
     loop {
-        if sigtimedwait_poll(these).is_some() {
+        if sigtimedwait_pending(these) {
+            me.signal.end_sigtimedwait();
             return true;
         }
         if let Some(d) = deadline {
             if now_ns_public() >= d {
+                me.signal.end_sigtimedwait();
                 return false;
             }
         }
-        if !me.cas_state(TaskState::Running, TaskState::Sleeping) {
-            // 状态非 Running（被中断改成别的），重试。
+
+        if !me.cas_state(TaskState::Running, TaskState::Sleeping)
+            && !me.cas_state(TaskState::Runnable, TaskState::Sleeping)
+            && me.state() != TaskState::Sleeping
+        {
             continue;
         }
-        let _ = sched_yield();
+
+        if let Some(d) = deadline {
+            if !register_sleep_deadline(&me, d) {
+                finish_current_signal_wait(&me);
+                me.signal.end_sigtimedwait();
+                return false;
+            }
+        }
+
+        if sigtimedwait_pending(these) {
+            if deadline.is_some() {
+                cancel_sleep_deadline(&me);
+            }
+            finish_current_signal_wait(&me);
+            me.signal.end_sigtimedwait();
+            return true;
+        }
+        if let Some(d) = deadline {
+            if now_ns_public() >= d {
+                cancel_sleep_deadline(&me);
+                finish_current_signal_wait(&me);
+                me.signal.end_sigtimedwait();
+                return false;
+            }
+        }
+
+        schedule_once(0);
+        if deadline.is_some() {
+            cancel_sleep_deadline(&me);
+        }
+        finish_current_signal_wait(&me);
     }
 }
 
@@ -921,12 +993,15 @@ pub fn deliver_pending_signals_with_context(user_ctx: UserContextRef) -> Option<
 
 pub fn apply_default_action(info: SigInfo) {
     match default_action(info.sig) {
-        DefaultAction::Term | DefaultAction::Core => {
-            // 用"被信号杀死"编码 exit status。
+        DefaultAction::Term => {
             let me = current_task();
-            let status_code = (info.sig.raw() as i32) & 0x7f;
-            exit_task(&me, ExitCode(status_code));
-            // 如果返回——大多数调用点不会——继续执行（等 schedule_once 切走）。
+            me.mark_signaled_exit(info.sig, false);
+            exit_task(&me, ExitCode(info.sig.raw() as i32));
+        }
+        DefaultAction::Core => {
+            let me = current_task();
+            me.mark_signaled_exit(info.sig, true);
+            exit_task(&me, ExitCode(info.sig.raw() as i32));
         }
         DefaultAction::Stop => {
             let me = current_task();

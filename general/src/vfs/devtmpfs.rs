@@ -10,19 +10,25 @@
 //!   └─ 创建 Inode，InodeOps = DevCharOps { dev }
 //!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //!
-//! bind_block("vda", dev: Arc<BlockDevice>)
+//! bind_block("disk/root", dev: Arc<BlockDevice>)
 //!   └─ 创建 Inode，InodeOps = DevBlockOps { dev: Arc<BlockDevice> }
 //!         └─ open() → 直接访问 dev              // 无查找，直接构造
+//!
+//! bind_symlink("disk/by-name/root", "../root")
+//!   └─ 创建 Symlink Inode，InodeOps = DevSymlinkOps { target: "../root" }
+//!         └─ path lookup → readlink() → 按标准相对链接规则继续解析
 //! ```
 //!
 //! # 文件系统结构
 //!
-//! devtmpfs 只有一层目录（根目录下直接挂设备节点），根目录 inode 维护
+//! devtmpfs 是一棵普通目录树。每个目录 inode 维护本级
 //! `name → Arc<Inode>` 的 `BTreeMap`，作为 `lookup` 和 `readdir` 的数据源。
+//! 设备驱动可以声明主节点、目录化节点或符号链接节点；devtmpfs 不内建任何固定
+//! 设备别名。
 //!
 //! 整个文件系统通过 `mount -t devtmpfs` 挂载到 `/dev`，之后通过
-//! [`DevTmpfsSuperblockOps::bind_char`] / [`DevTmpfsSuperblockOps::bind_block`]
-//! 动态增删节点。
+//! [`DevTmpfsSuperblockOps::bind_char`] / [`DevTmpfsSuperblockOps::bind_block`] /
+//! [`DevTmpfsSuperblockOps::bind_symlink`] 动态增删节点。
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -48,7 +54,7 @@ use vfs::sync::Spinlock;
 use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
 use crate::dev::char::{CharDevice, CharIoError};
-use crate::dev::function::DevNodeSpec;
+use crate::dev::function::{DevNodeSet, DevNodeSpec};
 use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
 use crate::mm::{copy_from_user, copy_to_user};
 
@@ -57,6 +63,41 @@ use crate::mm::{copy_from_user, copy_to_user};
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static PNP_DEVTMPFS_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
+
+const DEVTMPFS_NAME_MAX: usize = 255;
+
+fn validate_devtmpfs_component(name: &str) -> VfsResult<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+        return Err(VfsError::InvalidArgument);
+    }
+    if name.len() > DEVTMPFS_NAME_MAX {
+        return Err(VfsError::NameTooLong);
+    }
+    Ok(())
+}
+
+fn split_devtmpfs_path(path: &str) -> VfsResult<Vec<&str>> {
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\0') {
+        return Err(VfsError::InvalidArgument);
+    }
+
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        validate_devtmpfs_component(component)?;
+        components.push(component);
+    }
+    if components.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    Ok(components)
+}
+
+fn validate_symlink_target(target: &str) -> VfsResult<()> {
+    if target.is_empty() || target.contains('\0') {
+        return Err(VfsError::InvalidArgument);
+    }
+    Ok(())
+}
 
 /// 安装 PnP 到 devtmpfs 的桥接。
 ///
@@ -81,27 +122,20 @@ fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
     PNP_DEVTMPFS_SB.lock().ok_or(PnpError::NoDevtmpfs)
 }
 
-fn pnp_bind_cb(spec: &DevNodeSpec) -> Result<(), PnpError> {
+fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
     let sb = pnp_devtmpfs_sb()?;
     let ops = sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(PnpError::NoDevtmpfs)?;
-    match spec {
-        DevNodeSpec::Char { name, dev } => ops
-            .bind_char(name.as_ref(), dev.clone())
-            .map_err(|_| PnpError::DevtmpfsError),
-        DevNodeSpec::Block { name, dev } => ops
-            .bind_block(name.as_ref(), Arc::clone(dev))
-            .map_err(|_| PnpError::DevtmpfsError),
-    }
+    ops.bind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
 }
 
-fn pnp_unbind_cb(name: &str) -> Result<(), PnpError> {
+fn pnp_unbind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
     let sb = pnp_devtmpfs_sb()?;
     let ops = sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(PnpError::NoDevtmpfs)?;
-    ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
+    ops.unbind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
 }
 
 // ───────── 字符设备 FileOps（内联适配器） ─────────
@@ -630,6 +664,11 @@ impl FileOps for CharDevFileOps {
         }
         PollEvents::POLLIN.with(PollEvents::POLLOUT)
     }
+
+    fn set_status_flags(&self, flags: OpenOptions) {
+        self.nonblock.store(flags.nonblock, Ordering::Release);
+    }
+
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
@@ -820,8 +859,6 @@ fn map_block_io_err(err: BioError) -> VfsError {
     map_bio_err(err)
 }
 
-
-
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
     let mut data = Vec::new();
     data.try_reserve(len).map_err(|_| VfsError::OutOfMemory)?;
@@ -857,8 +894,6 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
-
-
 impl FileOps for BlockDevFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
@@ -883,7 +918,11 @@ impl FileOps for BlockDevFileOps {
             .map_err(map_bio_err)?;
         if self.sync_writes {
             self.dev
-                .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
+                .submit_bio_wait(
+                    BioOp::Flush,
+                    BlockRange { lba: 0, blocks: 0 },
+                    BioBuffer::None,
+                )
                 .map_err(map_bio_err)?;
         }
         Ok(buf.len())
@@ -902,7 +941,11 @@ impl FileOps for BlockDevFileOps {
             return Err(VfsError::NoDevice);
         }
         self.dev
-            .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
+            .submit_bio_wait(
+                BioOp::Flush,
+                BlockRange { lba: 0, blocks: 0 },
+                BioBuffer::None,
+            )
             .map_err(map_bio_err)?;
         Ok(())
     }
@@ -1022,17 +1065,65 @@ impl InodeOps for DevBlockOps {
     }
 }
 
-// ───────── 根目录 InodeOps ─────────
-
-/// devtmpfs 根目录（`/dev`）的操作对象。
+/// 从 devtmpfs 块设备 inode 中恢复底层块设备对象。
 ///
-/// 维护 `user_name → Arc<Inode>` 映射，支持 `lookup` 和 `readdir`。
-/// 设备节点的增删通过 [`DevTmpfsSuperblockOps`] 对外暴露。
-pub struct DevRootOps {
+/// 这是给 blockfs 挂载源解析使用的窄接口：调用方仍然通过 VFS 解析路径和符号链接，
+/// 只有最终确认 inode 属于 devtmpfs 块设备节点后，才取出其内联保存的设备对象。
+pub fn block_device_from_inode(inode: &Inode) -> Option<Arc<BlockDevice>> {
+    if inode.kind() != FileType::BlockDevice {
+        return None;
+    }
+    let ops = inode.downcast_ops::<DevBlockOps>()?;
+    let dev = Arc::clone(&ops.dev);
+    dev.is_active().then_some(dev)
+}
+
+// ───────── 符号链接 InodeOps ─────────
+
+/// devtmpfs 符号链接节点的操作对象。
+///
+/// 只保存链接目标文本。相对目标由 VFS path walker 按“链接所在目录”继续解析。
+struct DevSymlinkOps {
+    target: String,
+}
+
+impl InodeOps for DevSymlinkOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn readlink(&self, inode: &Inode) -> VfsResult<String> {
+        if inode.kind() != FileType::Symlink {
+            return Err(VfsError::InvalidArgument);
+        }
+        Ok(self.target.clone())
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        _opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+// ───────── 目录 InodeOps ─────────
+
+/// devtmpfs 目录操作对象。
+///
+/// 每个目录只维护本级 `name → Arc<Inode>` 映射。设备节点的批量增删通过
+/// [`DevTmpfsSuperblockOps`] 对外暴露，普通符号链接和目录创建也走 VFS 标准入口。
+pub struct DevDirOps {
     pub(crate) children: Spinlock<BTreeMap<String, Arc<Inode>>>,
 }
 
-impl DevRootOps {
+impl DevDirOps {
     fn new() -> Self {
         Self {
             children: Spinlock::new(BTreeMap::new()),
@@ -1049,13 +1140,132 @@ impl DevRootOps {
     }
 }
 
-impl InodeOps for DevRootOps {
+impl InodeOps for DevDirOps {
     fn lookup(&self, _inode: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         self.children
             .lock()
             .get(name)
             .cloned()
             .ok_or(VfsError::NotFound)
+    }
+
+    fn mkdir(
+        &self,
+        dir: &Inode,
+        name: &str,
+        mode: FileMode,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        validate_devtmpfs_component(name)?;
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let inode = sb_ops.new_dir_inode(mode, cred.euid, cred.egid)?;
+
+        let mut children = self.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(String::from(name), Arc::clone(&inode));
+        drop(children);
+
+        dir.inc_nlink();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        Ok(inode)
+    }
+
+    fn symlink(
+        &self,
+        dir: &Inode,
+        name: &str,
+        target: &str,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        validate_devtmpfs_component(name)?;
+        validate_symlink_target(target)?;
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let inode = sb_ops.new_symlink_inode(target, cred.euid, cred.egid)?;
+
+        let mut children = self.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(String::from(name), Arc::clone(&inode));
+        drop(children);
+
+        dir.touch_mtime();
+        dir.touch_ctime();
+        Ok(inode)
+    }
+
+    fn rmdir(&self, dir: &Inode, name: &str, child: &Inode) -> VfsResult<()> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        if child.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+
+        let child_ops = child
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        if !child_ops.children.lock().is_empty() {
+            return Err(VfsError::DirectoryNotEmpty);
+        }
+
+        let mut children = self.children.lock();
+        let existing = children.get(name).ok_or(VfsError::NotFound)?;
+        if existing.fs_id() != child.fs_id() || existing.ino() != child.ino() {
+            return Err(VfsError::NotFound);
+        }
+        let removed = children.remove(name).ok_or(VfsError::NotFound)?;
+        drop(children);
+
+        dir.dec_nlink();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        removed.set_nlink(0);
+        removed.touch_ctime();
+        Ok(())
+    }
+
+    fn unlink(&self, dir: &Inode, name: &str, child: &Inode) -> VfsResult<()> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        if child.kind() == FileType::Directory {
+            return Err(VfsError::IsADirectory);
+        }
+        if child.kind() != FileType::Symlink {
+            return Err(VfsError::OperationNotPermitted);
+        }
+
+        let mut children = self.children.lock();
+        let existing = children.get(name).ok_or(VfsError::NotFound)?;
+        if existing.fs_id() != child.fs_id() || existing.ino() != child.ino() {
+            return Err(VfsError::NotFound);
+        }
+        let removed = children.remove(name).ok_or(VfsError::NotFound)?;
+        drop(children);
+
+        dir.touch_mtime();
+        dir.touch_ctime();
+        removed.set_nlink(0);
+        removed.touch_ctime();
+        Ok(())
     }
 
     fn open(
@@ -1131,12 +1341,10 @@ impl FileOps for DevRootFile {
 
 /// devtmpfs 超级块操作对象。
 ///
-/// 同时提供公开的 `bind_char` / `bind_block` / `unbind` API，
-/// 让设备驱动在设备注册/注销时同步更新 `/dev` 下的节点。
+/// 同时提供公开的 `bind_char` / `bind_block` / `bind_symlink` / `unbind` API，
+/// 让设备驱动或兼容层在设备注册/注销时同步更新 `/dev` 下的节点。
 pub struct DevTmpfsSuperblockOps {
     next_ino: AtomicU64,
-    /// 指向根目录 ops 的引用，用于 bind/unbind 时修改 children 表
-    root_ops: Arc<DevRootOps>,
     /// 超级块弱引用，创建 Inode 时需要
     sb: vfs::sync::Spinlock<Option<alloc::sync::Weak<Superblock>>>,
 }
@@ -1154,11 +1362,252 @@ impl DevTmpfsSuperblockOps {
         self.sb.lock().clone()
     }
 
-    /// 将字符设备绑定到 `/dev/<user_name>`。
+    fn root_inode(&self) -> VfsResult<Arc<Inode>> {
+        self.sb
+            .lock()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .map(|sb| Arc::clone(&sb.root_inode))
+            .ok_or(VfsError::InvalidArgument)
+    }
+
+    fn invalidate_path_dcache(&self, path: &str) {
+        let Some(sb) = self.sb.lock().as_ref().and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+
+        let mut parent = Arc::clone(&sb.root_dentry);
+        let mut components = path.split('/').peekable();
+        while let Some(component) = components.next() {
+            let Some(dentry) = vfs::DCACHE.get(&parent, component) else {
+                return;
+            };
+            if components.peek().is_none() {
+                vfs::DCACHE.invalidate_dentry(&dentry);
+                dentry.invalidate();
+                return;
+            }
+            if !dentry.is_positive() {
+                return;
+            }
+            parent = dentry;
+        }
+    }
+
+    fn new_dir_inode(&self, mode: FileMode, uid: Uid, gid: Gid) -> VfsResult<Arc<Inode>> {
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: 0,
+            nlink: 2,
+            mode,
+            uid,
+            gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            FileType::Directory,
+            DevId::new(0, 0),
+            512,
+            None,
+            meta,
+            Arc::new(DevDirOps::new()),
+            sb_weak,
+        ))
+    }
+
+    fn new_symlink_inode(&self, target: &str, uid: Uid, gid: Gid) -> VfsResult<Arc<Inode>> {
+        validate_symlink_target(target)?;
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: target.len() as u64,
+            nlink: 1,
+            mode: FileMode::new(0o777),
+            uid,
+            gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            FileType::Symlink,
+            DevId::new(0, 0),
+            512,
+            None,
+            meta,
+            Arc::new(DevSymlinkOps {
+                target: String::from(target),
+            }),
+            sb_weak,
+        ))
+    }
+
+    fn ensure_parent_dir(&self, components: &[&str]) -> VfsResult<Arc<Inode>> {
+        let mut dir_inode = self.root_inode()?;
+        let mut current_path = String::new();
+
+        for component in &components[..components.len().saturating_sub(1)] {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(component);
+
+            let dir_ops = dir_inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::NotADirectory)?;
+            let mut created = false;
+            let next = {
+                let mut children = dir_ops.children.lock();
+                if let Some(existing) = children.get(*component).cloned() {
+                    existing
+                } else {
+                    let child = self.new_dir_inode(FileMode::new(0o755), Uid::ROOT, Gid::ROOT)?;
+                    children.insert(String::from(*component), Arc::clone(&child));
+                    created = true;
+                    child
+                }
+            };
+
+            if next.kind() != FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            if created {
+                dir_inode.inc_nlink();
+                dir_inode.touch_mtime();
+                dir_inode.touch_ctime();
+                self.invalidate_path_dcache(&current_path);
+            }
+            dir_inode = next;
+        }
+
+        Ok(dir_inode)
+    }
+
+    fn lookup_parent_dir(&self, components: &[&str]) -> VfsResult<Arc<Inode>> {
+        let mut dir_inode = self.root_inode()?;
+        for component in &components[..components.len().saturating_sub(1)] {
+            let dir_ops = dir_inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::NotADirectory)?;
+            let next = dir_ops
+                .children
+                .lock()
+                .get(*component)
+                .cloned()
+                .ok_or(VfsError::NotFound)?;
+            if next.kind() != FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            dir_inode = next;
+        }
+        Ok(dir_inode)
+    }
+
+    fn insert_node_at(&self, path: &str, inode: Arc<Inode>) -> VfsResult<()> {
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = self.ensure_parent_dir(&components)?;
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+
+        let mut children = parent_ops.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(String::from(name), inode);
+        drop(children);
+
+        parent.touch_mtime();
+        parent.touch_ctime();
+        self.invalidate_path_dcache(path);
+        Ok(())
+    }
+
+    fn remove_node_at(&self, path: &str) -> VfsResult<Arc<Inode>> {
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = self.lookup_parent_dir(&components)?;
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+
+        let mut children = parent_ops.children.lock();
+        let inode = children.remove(name).ok_or(VfsError::NotFound)?;
+        drop(children);
+
+        if inode.kind() == FileType::Directory {
+            let dir_ops = inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::InvalidArgument)?;
+            if !dir_ops.children.lock().is_empty() {
+                let mut children = parent_ops.children.lock();
+                children.insert(String::from(name), Arc::clone(&inode));
+                return Err(VfsError::DirectoryNotEmpty);
+            }
+            parent.dec_nlink();
+        }
+
+        parent.touch_mtime();
+        parent.touch_ctime();
+        inode.set_nlink(0);
+        inode.touch_ctime();
+        if let Some(sb) = inode.superblock() {
+            sb.remove_inode(inode.ino());
+        }
+        self.invalidate_path_dcache(path);
+        Ok(inode)
+    }
+
+    fn lookup_node_at(&self, path: &str) -> VfsResult<Arc<Inode>> {
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = self.lookup_parent_dir(&components)?;
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+        parent_ops
+            .children
+            .lock()
+            .get(name)
+            .cloned()
+            .ok_or(VfsError::NotFound)
+    }
+
+    /// 将字符设备绑定到 devtmpfs 相对路径。
     ///
-    /// - `user_name`：用户空间可见的节点名称（如 `"uart0"`）
+    /// - `user_name`：用户空间可见的相对路径（如 `"console"` 或 `"tty/serial0"`）
     /// - `dev`：已注册的字符设备对象（直接存入 inode，不再保存名称）
     pub fn bind_char(&self, user_name: &str, dev: CharDevice) -> VfsResult<()> {
+        split_devtmpfs_path(user_name)?;
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
@@ -1193,19 +1642,15 @@ impl DevTmpfsSuperblockOps {
             sb_weak,
         );
 
-        let mut children = self.root_ops.children.lock();
-        if children.contains_key(user_name) {
-            return Err(VfsError::AlreadyExists);
-        }
-        children.insert(String::from(user_name), inode);
-        Ok(())
+        self.insert_node_at(user_name, inode)
     }
 
-    /// 将块设备绑定到 `/dev/<user_name>`。
+    /// 将块设备绑定到 devtmpfs 相对路径。
     ///
-    /// - `user_name`：用户空间可见的节点名称（如 `"vda"`）
+    /// - `user_name`：用户空间可见的相对路径（如 `"block/root"`）
     /// - `dev`：已注册的块设备对象（`Arc` 直接存入 inode）
     pub fn bind_block(&self, user_name: &str, dev: Arc<BlockDevice>) -> VfsResult<()> {
+        split_devtmpfs_path(user_name)?;
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
@@ -1240,47 +1685,76 @@ impl DevTmpfsSuperblockOps {
             sb_weak,
         );
 
-        let mut children = self.root_ops.children.lock();
-        if children.contains_key(user_name) {
-            return Err(VfsError::AlreadyExists);
+        self.insert_node_at(user_name, inode)
+    }
+
+    /// 在 devtmpfs 相对路径上创建一个符号链接节点。
+    ///
+    /// `target` 按标准符号链接文本保存，不在创建时验证目标是否存在。相对目标会按
+    /// VFS path walker 的规则以链接所在目录为基准继续解析。
+    pub fn bind_symlink(&self, user_name: &str, target: &str) -> VfsResult<()> {
+        split_devtmpfs_path(user_name)?;
+        let inode = self.new_symlink_inode(target, Uid::ROOT, Gid::ROOT)?;
+        self.insert_node_at(user_name, inode)
+    }
+
+    /// 批量绑定一个 function 声明的 devtmpfs 节点集合。
+    ///
+    /// 任一节点创建失败时，已经创建的节点会按逆序回滚。这样 PnP 注册要么完整暴露
+    /// 一个 function 的全部节点，要么不留下半完成名字空间状态。
+    pub fn bind_nodes(&self, nodes: &DevNodeSet) -> VfsResult<()> {
+        let mut bound: Vec<&str> = Vec::new();
+        for node in nodes.nodes() {
+            let result = match node {
+                DevNodeSpec::Char { name, dev } => self.bind_char(name, dev.clone()),
+                DevNodeSpec::Block { name, dev } => self.bind_block(name, Arc::clone(dev)),
+                DevNodeSpec::Symlink { name, target } => self.bind_symlink(name, target),
+            };
+            if let Err(err) = result {
+                for name in bound.iter().rev() {
+                    let _ = self.unbind(name);
+                }
+                return Err(err);
+            }
+            bound.push(node.name());
         }
-        children.insert(String::from(user_name), inode);
         Ok(())
     }
 
-    /// 解除设备绑定，删除 `/dev/<user_name>` 节点。
+    /// 解除设备绑定，删除 devtmpfs 中的相对路径节点。
     pub fn unbind(&self, user_name: &str) -> VfsResult<()> {
-        let inode = self
-            .root_ops
-            .children
-            .lock()
-            .remove(user_name)
-            .ok_or(VfsError::NotFound)?;
+        self.remove_node_at(user_name)?;
+        Ok(())
+    }
 
-        if let Some(ops) = inode.downcast_ops::<DevCharOps>() {
-            ops.dev.mark_gone();
-        }
-        if let Some(ops) = inode.downcast_ops::<DevBlockOps>() {
-            ops.dev.mark_gone();
-        }
-        inode.set_nlink(0);
-        inode.touch_ctime();
-        if let Some(sb) = inode.superblock() {
-            sb.remove_inode(inode.ino());
-            if let Some(dentry) = vfs::DCACHE.get(&sb.root_dentry, user_name) {
-                vfs::DCACHE.invalidate_dentry(&dentry);
-                dentry.invalidate();
+    /// 批量解绑一个 function 声明的 devtmpfs 节点集合。
+    pub fn unbind_nodes(&self, nodes: &DevNodeSet) -> VfsResult<()> {
+        let mut last_error = None;
+        for node in nodes.nodes().iter().rev() {
+            match self.unbind(node.name()) {
+                Ok(()) | Err(VfsError::NotFound) => {}
+                Err(err) => last_error = Some(err),
             }
         }
-        Ok(())
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
-    /// 根据 `/dev/<user_name>` 节点名恢复其绑定的字符设备对象。
+    /// 根据 devtmpfs 相对路径恢复其绑定的字符设备对象。
     pub fn char_dev(&self, user_name: &str) -> Option<CharDevice> {
-        let inode = self.root_ops.children.lock().get(user_name).cloned()?;
+        let inode = self.lookup_node_at(user_name).ok()?;
         let ops = inode.downcast_ops::<DevCharOps>()?;
         let dev = ops.dev();
         dev.is_active().then_some(dev)
+    }
+
+    /// 根据 devtmpfs 相对路径恢复其绑定的块设备对象。
+    pub fn block_dev(&self, user_name: &str) -> Option<Arc<BlockDevice>> {
+        let inode = self.lookup_node_at(user_name).ok()?;
+        block_device_from_inode(&inode)
     }
 }
 
@@ -1303,7 +1777,7 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
             total_inodes: self.next_ino.load(Ordering::Relaxed),
             free_inodes: 0,
             fs_id: sb.fs_id.raw(),
-            name_max: 255,
+            name_max: DEVTMPFS_NAME_MAX as u32,
         })
     }
 
@@ -1326,7 +1800,7 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
 ///
 /// 通过 `mount` 方法创建超级块，返回的 `Arc<Superblock>` 的
 /// `ops` 字段可通过 `downcast_ops::<DevTmpfsSuperblockOps>()` 取回，
-/// 供驱动调用 `bind_char` / `bind_block`。
+/// 供驱动调用 `bind_char` / `bind_block` / `bind_symlink` 或批量节点 API。
 ///
 /// # 典型初始化流程
 ///
@@ -1337,8 +1811,9 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
 ///
 /// // 2. 驱动注册后绑定设备
 /// let ops = sb.downcast_ops::<DevTmpfsSuperblockOps>().unwrap();
-/// ops.bind_char("uart0", char_dev)?;   // 直接绑定对象引用
-/// ops.bind_block("vda", block_dev)?;   // 直接绑定 Arc<BlockDev>
+/// ops.bind_char("console", char_dev)?;       // 直接绑定对象引用
+/// ops.bind_block("block/root", block_dev)?;  // 目录化块设备节点
+/// ops.bind_symlink("disk/root", "../block/root")?; // 可选符号链接投影
 /// ```
 pub struct DevTmpfsDriver;
 
@@ -1354,14 +1829,13 @@ impl FsDriver for DevTmpfsDriver {
     fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
         let fs_id = FsId::new(DEVTMPFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
-        let root_ops = Arc::new(DevRootOps::new());
+        let root_ops = Arc::new(DevDirOps::new());
 
         // 只构造一个 DevTmpfsSuperblockOps 实例，move 进 new_cyclic 闭包，
         // 写入 weak ref 后再 Box 化存入 Superblock。外层不再持有任何引用，
         // 后续通过 sb.downcast_ops::<DevTmpfsSuperblockOps>() 访问。
         let sb_ops = DevTmpfsSuperblockOps {
             next_ino: AtomicU64::new(2),
-            root_ops: Arc::clone(&root_ops),
             sb: vfs::sync::Spinlock::new(None),
         };
 
@@ -1399,7 +1873,7 @@ impl FsDriver for DevTmpfsDriver {
                 fs_id,
                 dev_id: None,
                 block_size: 512,
-                name_max: 255,
+                name_max: DEVTMPFS_NAME_MAX as u32,
                 root_inode,
                 root_dentry,
                 inode_cache: vfs::superblock::InodeCache::new(),

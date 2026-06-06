@@ -285,15 +285,21 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("self", self_inode),
         ("thread-self", thread_self_inode),
         ("sys", sys_inode),
-        ("net", mk_inode(
-            fs_id,
-            weak_sb,
-            NET_DIR_INO,
-            FileType::Directory,
-            0o555,
-            2,
-            Arc::new(ProcNetDirOps { fs_id, weak_sb: weak_sb.clone() }),
-        )),
+        (
+            "net",
+            mk_inode(
+                fs_id,
+                weak_sb,
+                NET_DIR_INO,
+                FileType::Directory,
+                0o555,
+                2,
+                Arc::new(ProcNetDirOps {
+                    fs_id,
+                    weak_sb: weak_sb.clone(),
+                }),
+            ),
+        ),
     ];
     Inode::new(
         InodeId {
@@ -477,7 +483,10 @@ impl InodeOps for ProcNetDirOps {
     }
 
     fn open(
-        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
             snapshot: vec![
@@ -513,7 +522,9 @@ impl InodeOps for ProcNetDirOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcNetStubOps(&'static str);
@@ -523,7 +534,10 @@ impl InodeOps for ProcNetStubOps {
         Err(VfsError::NotADirectory)
     }
     fn open(
-        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         // TODO: 实现 /proc/net/{tcp,udp,route,unix} 的真实内容
         Ok(Box::new(ProcNetStubFile(self.0)))
@@ -531,7 +545,9 @@ impl InodeOps for ProcNetStubOps {
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcNetStubFile(&'static str);
@@ -556,33 +572,46 @@ impl FileOps for ProcNetStubFile {
     fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
         Err(VfsError::PermissionDenied)
     }
-    fn readdir(
-        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn render_proc_net_route() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT");
+    let _ = writeln!(
+        out,
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"
+    );
     let ifaces = net::stack().snapshot_interfaces();
     for iface in &ifaces {
         // 每个配置的 CIDR 地址生成一条 connected route
         for cidr in &iface.addresses {
             if let net::config::IpAddr::V4(v4) = cidr.addr {
                 let prefix = cidr.prefix_len.min(32);
-                let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+                let mask: u32 = if prefix == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - prefix)
+                };
                 let dst = u32::from_be_bytes(v4.0) & mask;
                 let _ = writeln!(
                     out,
                     "{}\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0",
-                    iface.name, dst.to_be(), mask.to_be()
+                    iface.name,
+                    dst.to_be(),
+                    mask.to_be()
                 );
             }
         }
@@ -596,7 +625,8 @@ fn render_proc_net_route() -> String {
                 let _ = writeln!(
                     out,
                     "{}\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0",
-                    iface.name, gw_ip.to_be()
+                    iface.name,
+                    gw_ip.to_be()
                 );
             }
         }
@@ -611,14 +641,19 @@ impl InodeOps for ProcNetDevOps {
         Err(VfsError::NotADirectory)
     }
     fn open(
-        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcNetDevFile))
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcNetDevFile;
@@ -637,22 +672,32 @@ impl FileOps for ProcNetDevFile {
     fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
         Err(VfsError::PermissionDenied)
     }
-    fn readdir(
-        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn render_proc_net_dev() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "Inter-|   Receive                                                |  Transmit");
-    let _ = writeln!(out, " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed");
+    let _ = writeln!(
+        out,
+        "Inter-|   Receive                                                |  Transmit"
+    );
+    let _ = writeln!(
+        out,
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
+    );
     let ifaces = net::stack().snapshot_interfaces();
     for iface in &ifaces {
         let s = &iface.stats;
@@ -660,8 +705,22 @@ fn render_proc_net_dev() -> String {
             out,
             "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
             iface.name,
-            s.rx_bytes, s.rx_packets, s.rx_errors, s.rx_dropped, 0, 0, 0, 0,
-            s.tx_bytes, s.tx_packets, s.tx_errors, s.tx_dropped, 0, 0, 0, 0
+            s.rx_bytes,
+            s.rx_packets,
+            s.rx_errors,
+            s.rx_dropped,
+            0,
+            0,
+            0,
+            0,
+            s.tx_bytes,
+            s.tx_packets,
+            s.tx_errors,
+            s.tx_dropped,
+            0,
+            0,
+            0,
+            0
         );
     }
     out

@@ -33,7 +33,7 @@ impl SignalNumber {
         self.0 as usize
     }
     pub const fn bit(self) -> u64 {
-        1u64 << (self.0 as u64)
+        1u64 << ((self.0 - 1) as u64)
     }
 }
 
@@ -71,7 +71,7 @@ sig_const!(
     SIGWINCH = 28,
 );
 
-/// 64 位信号位集。位 0 保留不用（POSIX 约定）。
+/// 64 位信号位集。Linux/POSIX sigset 编码用 bit(signo - 1) 表示信号 signo。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SigSet(pub u64);
 
@@ -225,6 +225,7 @@ pub struct SignalState {
     pending_infos: Spinlock<Vec<SigInfo>>,
     blocked: AtomicU64,
     saved_blocked: AtomicU64,
+    sigtimedwait_mask: AtomicU64,
 }
 
 impl SignalState {
@@ -234,6 +235,7 @@ impl SignalState {
             pending_infos: Spinlock::new(Vec::new()),
             blocked: AtomicU64::new(0),
             saved_blocked: AtomicU64::new(0),
+            sigtimedwait_mask: AtomicU64::new(0),
         }
     }
 
@@ -258,15 +260,11 @@ impl SignalState {
         Some(info)
     }
 
-    /// sigtimedwait 用：从 per-task pending 里取出一条属于 `these` 集合
-    /// **且**未被 `blocked` 屏蔽的信号。无匹配返回 None。
+    /// sigtimedwait 用：从 per-task pending 里取出一条属于 `these` 集合的信号。
+    /// sigtimedwait 显式等待调用方给定集合，不再受当前 blocked mask 过滤。
     pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
-        let blocked = self.blocked.load(Ordering::Acquire);
         let mut queue = self.pending_infos.lock();
-        let idx = queue.iter().position(|i| {
-            let bit = i.sig.bit();
-            (these & bit) != 0 && (blocked & bit) == 0
-        })?;
+        let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
@@ -274,6 +272,11 @@ impl SignalState {
                 .fetch_and(!info.sig.bit(), Ordering::AcqRel);
         }
         Some(info)
+    }
+
+    /// 是否存在属于 `these` 的 pending 信号；不消费队列，不受 blocked mask 过滤。
+    pub fn has_pending_in(&self, these: u64) -> bool {
+        (self.pending_bits.load(Ordering::Acquire) & these) != 0
     }
 
     /// 是否有 pending 信号（不限 these 集合）。
@@ -296,6 +299,19 @@ impl SignalState {
     /// blocked 位图快照。
     pub fn blocked_snapshot(&self) -> SigSet {
         SigSet(self.blocked.load(Ordering::Acquire))
+    }
+
+    /// 记录当前线程正在 sigtimedwait 显式等待的集合，供共享信号投递路径唤醒。
+    pub fn begin_sigtimedwait(&self, set: SigSet) {
+        self.sigtimedwait_mask.store(set.0, Ordering::Release);
+    }
+
+    pub fn end_sigtimedwait(&self) {
+        self.sigtimedwait_mask.store(0, Ordering::Release);
+    }
+
+    pub fn sigtimedwait_wants(&self, sig: SignalNumber) -> bool {
+        (self.sigtimedwait_mask.load(Ordering::Acquire) & sig.bit()) != 0
     }
 
     /// sigprocmask 修改。SIGKILL/SIGSTOP 自动剥离。
@@ -392,17 +408,14 @@ impl SharedSignal {
         Some(info)
     }
 
-    /// sigtimedwait 用：从 tg 共享 pending 里取出一条属于 `these` 集合
-    /// **且**未被 `blocked` 屏蔽的信号。无匹配返回 None。
+    /// sigtimedwait 用：从 tg 共享 pending 里取出一条属于 `these` 集合的信号。
+    /// 不受调用线程当前 blocked mask 过滤。
     ///
     /// `these` 的含义是"调用方想要消费的信号集"——通常在
     /// `rt_sigtimedwait(uthese, ...)` 中由用户态直接传入。
-    pub fn dequeue_one_in(&self, these: u64, blocked: u64) -> Option<SigInfo> {
+    pub fn dequeue_one_in(&self, these: u64) -> Option<SigInfo> {
         let mut queue = self.shared_pending_infos.lock();
-        let idx = queue.iter().position(|i| {
-            let bit = i.sig.bit();
-            (these & bit) != 0 && (blocked & bit) == 0
-        })?;
+        let idx = queue.iter().position(|i| (these & i.sig.bit()) != 0)?;
         let info = queue.swap_remove(idx);
         let still_has = queue.iter().any(|i| i.sig == info.sig);
         if !still_has {
@@ -410,6 +423,11 @@ impl SharedSignal {
                 .fetch_and(!info.sig.bit(), Ordering::AcqRel);
         }
         Some(info)
+    }
+
+    /// 是否存在属于 `these` 的共享 pending 信号；不消费队列。
+    pub fn has_pending_in(&self, these: u64) -> bool {
+        (self.shared_pending_bits.load(Ordering::Acquire) & these) != 0
     }
 
     pub fn pending_snapshot(&self) -> SigSet {

@@ -156,7 +156,6 @@ impl SuperblockOps for EpollSuperblockOps {
 }
 
 struct EpollWatch {
-    fd: Fd,
     file: Arc<File>,
     interest: PollEvents,
     data: u64,
@@ -183,16 +182,19 @@ impl EpollFileOps {
         }
     }
 
-    fn ctl_add(&self, fd: Fd, file: Arc<File>, event: EpollEvent) -> Result<(), Errno> {
+    fn ctl_add(&self, _fd: Fd, file: Arc<File>, event: EpollEvent) -> Result<(), Errno> {
         if (event.events & EPOLLEXCLUSIVE) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         let mut state = self.state.lock();
-        if state.watches.iter().any(|watch| watch.fd == fd) {
+        if state
+            .watches
+            .iter()
+            .any(|watch| Arc::ptr_eq(&watch.file, &file))
+        {
             return Err(Errno::EEXIST);
         }
         state.watches.push(EpollWatch {
-            fd,
             file,
             interest: PollEvents(event.events as u16),
             data: event.data,
@@ -204,12 +206,16 @@ impl EpollFileOps {
         Ok(())
     }
 
-    fn ctl_mod(&self, fd: Fd, event: EpollEvent) -> Result<(), Errno> {
+    fn ctl_mod(&self, file: &Arc<File>, event: EpollEvent) -> Result<(), Errno> {
         if (event.events & EPOLLEXCLUSIVE) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         let mut state = self.state.lock();
-        let Some(watch) = state.watches.iter_mut().find(|watch| watch.fd == fd) else {
+        let Some(watch) = state
+            .watches
+            .iter_mut()
+            .find(|watch| Arc::ptr_eq(&watch.file, file))
+        else {
             return Err(Errno::ENOENT);
         };
         watch.interest = PollEvents(event.events as u16);
@@ -221,18 +227,24 @@ impl EpollFileOps {
         Ok(())
     }
 
-    fn ctl_del(&self, fd: Fd) -> Result<(), Errno> {
+    fn ctl_del(&self, file: &Arc<File>) -> Result<(), Errno> {
         let mut state = self.state.lock();
-        let Some(index) = state.watches.iter().position(|watch| watch.fd == fd) else {
+        let Some(index) = state
+            .watches
+            .iter()
+            .position(|watch| Arc::ptr_eq(&watch.file, file))
+        else {
             return Err(Errno::ENOENT);
         };
         state.watches.remove(index);
         Ok(())
     }
 
-    fn remove_closed_fd(&self, fd: Fd) {
+    fn remove_closed_file(&self, file: &Arc<File>) {
         let mut state = self.state.lock();
-        state.watches.retain(|watch| watch.fd != fd);
+        state
+            .watches
+            .retain(|watch| !Arc::ptr_eq(&watch.file, file));
     }
 
     fn any_ready(&self) -> bool {
@@ -370,8 +382,8 @@ impl FileOps for EpollFileOps {
         }
     }
 
-    fn on_fd_closed(&self, fd: u32) {
-        self.remove_closed_fd(Fd::from_raw(fd));
+    fn on_file_description_closed(&self, file: &Arc<File>) {
+        self.remove_closed_file(file);
     }
 
     fn is_seekable(&self) -> bool {
@@ -540,8 +552,8 @@ pub fn ctl(
     }
     match op {
         EPOLL_CTL_ADD => ops.ctl_add(fd, target, event.ok_or(Errno::EINVAL)?),
-        EPOLL_CTL_MOD => ops.ctl_mod(fd, event.ok_or(Errno::EINVAL)?),
-        EPOLL_CTL_DEL => ops.ctl_del(fd),
+        EPOLL_CTL_MOD => ops.ctl_mod(&target, event.ok_or(Errno::EINVAL)?),
+        EPOLL_CTL_DEL => ops.ctl_del(&target),
         _ => Err(Errno::EINVAL),
     }
 }

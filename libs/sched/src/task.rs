@@ -82,9 +82,14 @@ impl TaskState {
     }
 }
 
-/// 退出码，目前只承载原始数值；信号退出由上层组装成标准 `wstatus`。
+/// 退出码，承载正常 exit(code) 的原始数值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
+
+const EXIT_REASON_NONE: u8 = 0;
+const EXIT_REASON_EXITED: u8 = 1;
+const EXIT_REASON_SIGNALED: u8 = 2;
+const EXIT_REASON_CORE_DUMPED: u8 = 3;
 
 /// 默认内核栈大小：64 KiB。fork 等深层调用需要足够空间，避免栈溢出损坏堆。
 pub const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
@@ -211,6 +216,8 @@ pub struct Task {
     state: AtomicU8,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
+    exit_reason: AtomicU8,
+    exit_signal_number: AtomicI32,
     wait_stop_sig: AtomicI32,
     wait_stop_pending: AtomicU8,
     wait_continue_pending: AtomicU8,
@@ -263,6 +270,8 @@ impl Task {
             state: AtomicU8::new(TaskState::New as u8),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
+            exit_reason: AtomicU8::new(EXIT_REASON_NONE),
+            exit_signal_number: AtomicI32::new(0),
             wait_stop_sig: AtomicI32::new(0),
             wait_stop_pending: AtomicU8::new(0),
             wait_continue_pending: AtomicU8::new(0),
@@ -360,6 +369,10 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
+        if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
+            self.exit_reason
+                .store(EXIT_REASON_EXITED, Ordering::Release);
+        }
         self.has_exit_code.store(1, Ordering::Release);
         self.wait_stop_pending.store(0, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
@@ -372,6 +385,38 @@ impl Task {
             None
         } else {
             Some(ExitCode(self.exit_code.load(Ordering::Acquire)))
+        }
+    }
+
+    /// 标记下一次退出是信号终止。随后 [`mark_exited`] 会保留该原因，
+    /// wait4/waitid 按 WIFSIGNALED/WCOREDUMP 编码。
+    pub(crate) fn mark_signaled_exit(&self, sig: SignalNumber, core_dumped: bool) {
+        self.exit_signal_number
+            .store(sig.raw() as i32, Ordering::Release);
+        self.exit_reason.store(
+            if core_dumped {
+                EXIT_REASON_CORE_DUMPED
+            } else {
+                EXIT_REASON_SIGNALED
+            },
+            Ordering::Release,
+        );
+    }
+
+    /// 把已记录的退出原因转换成 wait4/waitid 的 `wstatus`。
+    pub fn exit_wait_status(&self) -> Option<WaitStatus> {
+        let code = self.exit_code()?;
+        match self.exit_reason.load(Ordering::Acquire) {
+            EXIT_REASON_SIGNALED | EXIT_REASON_CORE_DUMPED => {
+                let sig = SignalNumber::from_raw(self.exit_signal_number.load(Ordering::Acquire))
+                    .unwrap_or(SignalNumber::SIGTERM);
+                if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_CORE_DUMPED {
+                    Some(WaitStatus::from_signal_core(sig))
+                } else {
+                    Some(WaitStatus::from_signal(sig))
+                }
+            }
+            _ => Some(WaitStatus::from_exit(code.0)),
         }
     }
 

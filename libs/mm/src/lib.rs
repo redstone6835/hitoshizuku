@@ -26,7 +26,7 @@ pub use area::{VmArea, VmBacking};
 pub use error::UserAccessError;
 pub use file_like::FileLike;
 pub use flags::VmFlags;
-pub use set::VmaSet;
+pub use set::{VmAreaMut, VmaSet};
 
 #[cfg(any(test, feature = "ktest-kernel"))]
 mod tests;

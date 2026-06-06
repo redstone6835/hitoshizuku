@@ -26,7 +26,7 @@ use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::pid::PidNamespace;
 use crate::runqueue::Runqueue;
 use crate::sched_class::SchedAttr;
-use crate::signal::{SigInfo, SignalNumber};
+use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
 use crate::task::Task;
 use crate::{ExitCode, TaskState};
@@ -137,13 +137,21 @@ pub fn init() -> Arc<Task> {
     init_task.adopt_current_context();
 
     // 5) 在根 ns 分配 pid=1。
-    let init_pid = root_ns
-        .registry()
-        .allocate(&init_task)
-        .expect("[sched][init] failed to allocate pid for init");
-    debug_assert_eq!(init_pid, 1, "[sched][init] init pid must be 1");
-    init_task.register_pid(Arc::clone(&root_ns), init_pid);
-    root_ns.set_ns_init_pid(init_pid);
+    let init_pid = match root_ns.registry().allocate(&init_task) {
+        Some(pid) => {
+            debug_assert_eq!(pid, 1, "[sched][init] init pid must be 1");
+            init_task.register_pid(Arc::clone(&root_ns), pid);
+            root_ns.set_ns_init_pid(pid);
+            tgroup.set_tgid(pid);
+            pgroup.set_pgid(pid);
+            session.set_sid(pid);
+            pid
+        }
+        None => {
+            log::error!("[sched][init] failed to allocate pid for init");
+            crate::pid::PID_INVALID
+        }
+    };
 
     // 6) 登记为 CPU 0 的 current。其它核的 RUNQUEUES/CURRENT_TASKS 保持空槽，
     //    直到 AP 启动路径落地时各自 `adopt_current_context`。
@@ -417,11 +425,34 @@ pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Er
         task.set_current_cpu(target_cpu);
         return Ok(());
     }
-    for rq in RUNQUEUES.iter() {
-        let _ = rq.dequeue(task, now_ns_internal());
+    let now = now_ns_internal();
+    let mut removed = false;
+    let owner = task.current_cpu();
+    if owner < NR_CPUS {
+        removed = RUNQUEUES[owner].dequeue_queued(task, now);
+        if !removed && RUNQUEUES[owner].is_current(task) {
+            return Err(errno::Errno::EBUSY);
+        }
+    }
+    if !removed {
+        for (cpu_id, rq) in RUNQUEUES.iter().enumerate() {
+            if cpu_id == owner {
+                continue;
+            }
+            if rq.dequeue_queued(task, now) {
+                removed = true;
+                break;
+            }
+            if rq.is_current(task) {
+                return Err(errno::Errno::EBUSY);
+            }
+        }
+    }
+    if !removed {
+        return Err(errno::Errno::EBUSY);
     }
     task.set_current_cpu(target_cpu);
-    RUNQUEUES[target_cpu].enqueue(Arc::clone(task), now_ns_internal());
+    RUNQUEUES[target_cpu].enqueue(Arc::clone(task), now);
     request_resched(target_cpu);
     Ok(())
 }
@@ -467,6 +498,10 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;
     }
+    if target.state() == TaskState::Stopped && stopped_signal_is_fatal(target, info) {
+        crate::spawn::exit_task(target, ExitCode((info.sig.raw() as i32) & 0x7f));
+        return;
+    }
     if target.cas_state(TaskState::Sleeping, TaskState::Runnable) {
         enqueue_task(Arc::clone(target), now_ns_internal());
     }
@@ -477,13 +512,7 @@ pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
 
 /// 把任务切入停止态：从 runqueue/current 中摘掉并记录可等待的 stopped 事件。
 pub(crate) fn mark_task_stopped(task: &Arc<Task>, sig: SignalNumber) -> bool {
-    let mut removed = false;
-    for rq in RUNQUEUES.iter() {
-        if rq.dequeue(task, now_ns_internal()) {
-            removed = true;
-            break;
-        }
-    }
+    let removed = dequeue_for_state_change(task, now_ns_internal());
     let stopped = task.mark_stopped(sig);
     log::debug!(
         "[sched][signal] stop pid={:?} sig={} on_rq={} state={:?}",
@@ -694,15 +723,9 @@ pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
 /// 触发一次同步退出：标记 exit_code + Zombie + wake exit_waiters。
 /// 不切换 CPU；调用方随后自己调 [`schedule_once`]。
 pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
-    // 任务可能登记在任一 CPU 的 rq 上；目前只有 CPU 0，逐核 dequeue 保证
-    // 未来 SMP 接入也不用改。
-    let mut removed = false;
-    for rq in RUNQUEUES.iter() {
-        if rq.dequeue(task, 0) {
-            removed = true;
-            break;
-        }
-    }
+    // 任务可能登记在任一 CPU 的 rq 上；远端 current 不能被本 CPU 直接摘掉，
+    // 只能请求对方在调度边界观察到新状态后自行切走。
+    let removed = dequeue_for_state_change(task, 0);
     task.mark_exited(code);
     log::debug!(
         "[sched][exit] pid={:?} code={} on_rq={} state={:?}",
@@ -723,4 +746,56 @@ const fn cpu_mask_all() -> u64 {
 
 const fn cpu_bit(cpu_id: usize) -> u64 {
     if cpu_id >= 64 { 0 } else { 1u64 << cpu_id }
+}
+
+fn dequeue_for_state_change(task: &Arc<Task>, now_ns: u64) -> bool {
+    let local_cpu = cpu();
+    let owner = task.current_cpu();
+    if owner < NR_CPUS && dequeue_on_cpu_for_state_change(task, owner, local_cpu, now_ns) {
+        return true;
+    }
+    for cpu_id in 0..NR_CPUS {
+        if cpu_id == owner {
+            continue;
+        }
+        if dequeue_on_cpu_for_state_change(task, cpu_id, local_cpu, now_ns) {
+            return true;
+        }
+    }
+    false
+}
+
+fn dequeue_on_cpu_for_state_change(
+    task: &Arc<Task>,
+    cpu_id: usize,
+    local_cpu: usize,
+    now_ns: u64,
+) -> bool {
+    if cpu_id == local_cpu {
+        return RUNQUEUES[cpu_id].dequeue(task, now_ns);
+    }
+    if RUNQUEUES[cpu_id].dequeue_queued(task, now_ns) {
+        return true;
+    }
+    if RUNQUEUES[cpu_id].is_current(task) {
+        request_resched(cpu_id);
+    }
+    false
+}
+
+fn stopped_signal_is_fatal(target: &Arc<Task>, info: &SigInfo) -> bool {
+    if info.sig == SignalNumber::SIGKILL {
+        return true;
+    }
+    if target.signal.blocked_snapshot().has(info.sig) {
+        return false;
+    }
+    let action = target.shared_signal().get_action(info.sig);
+    if action.handler != SigHandler::Default {
+        return false;
+    }
+    matches!(
+        default_action(info.sig),
+        DefaultAction::Term | DefaultAction::Core
+    )
 }

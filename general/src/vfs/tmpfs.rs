@@ -685,6 +685,31 @@ impl FileOps for TmpfsFileOps {
         Ok(buf.len())
     }
 
+    fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+
+        let ops = unsafe { &*self.inode_ops };
+        let mut data = ops.data.lock();
+        let file_data = match &mut *data {
+            TmpfsInodeData::File(data) => data,
+            _ => return Err(VfsError::InvalidArgument),
+        };
+
+        let end = end as usize;
+        if end > file_data.len() {
+            file_data.resize(end, 0);
+            if let Some(inode) = self.inode() {
+                inode.set_size(end as u64);
+                inode.touch_mtime();
+                inode.touch_ctime();
+            }
+        }
+        Ok(())
+    }
+
     fn readdir(
         &self,
         pos: u64,

@@ -24,6 +24,7 @@
 //! 与本模块职责不重叠：这里只负责**内核线程的纯内核上下文切换**。用户
 //! 线程的 kernel-to-kernel 切换同样走这条通道。
 
+use core::alloc::Layout;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -76,12 +77,34 @@ unsafe impl Send for ArchContextOps {}
 /// 注入点。值为 `*const ArchContextOps`，`null` 表示未装载。
 static ARCH_OPS: AtomicPtr<ArchContextOps> = AtomicPtr::new(core::ptr::null_mut());
 
+fn register_once<T>(slot: &AtomicPtr<T>, ptr: *mut T, name: &str) {
+    match slot.compare_exchange(
+        core::ptr::null_mut(),
+        ptr,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(prev) if prev == ptr => {}
+        Err(_) => panic!("[sched] {} already registered", name),
+    }
+}
+
 /// 由 `arch` 层在启动早期调用一次，装入跨架构切换契约。
 ///
 /// 约定 `ops` 指向 `'static` 数据（由 `arch` 侧定义成 `static`）——本函数不取
 /// 任何所有权，仅保存裸指针以便后续 Acquire 读取。
 pub fn register(ops: &'static ArchContextOps) {
-    ARCH_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+    assert!(ops.context_size != 0, "[sched] arch context size is zero");
+    assert!(
+        ops.context_align != 0 && ops.context_align.is_power_of_two(),
+        "[sched] arch context align is invalid"
+    );
+    assert!(
+        Layout::from_size_align(ops.context_size, ops.context_align).is_ok(),
+        "[sched] arch context layout is invalid"
+    );
+    register_once(&ARCH_OPS, ops as *const _ as *mut _, "ArchContextOps");
 }
 
 /// 读取当前已注入的契约。未注入时返回 `None`。
@@ -133,7 +156,7 @@ static TIME_OPS: AtomicPtr<ArchTimeOps> = AtomicPtr::new(core::ptr::null_mut());
 
 /// 注入 [`ArchTimeOps`]。
 pub fn register_time(ops: &'static ArchTimeOps) {
-    TIME_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+    register_once(&TIME_OPS, ops as *const _ as *mut _, "ArchTimeOps");
 }
 
 /// 取已注入的时间契约。
@@ -164,7 +187,7 @@ unsafe impl Send for CpuControlOps {}
 static CPU_CONTROL_OPS: AtomicPtr<CpuControlOps> = AtomicPtr::new(core::ptr::null_mut());
 
 pub fn register_cpu_control(ops: &'static CpuControlOps) {
-    CPU_CONTROL_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+    register_once(&CPU_CONTROL_OPS, ops as *const _ as *mut _, "CpuControlOps");
 }
 
 pub fn cpu_control() -> Option<&'static CpuControlOps> {
@@ -203,7 +226,7 @@ static TRAP_OPS: AtomicPtr<ArchTrapOps> = AtomicPtr::new(core::ptr::null_mut());
 
 /// 注入 [`ArchTrapOps`]。
 pub fn register_trap(ops: &'static ArchTrapOps) {
-    TRAP_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+    register_once(&TRAP_OPS, ops as *const _ as *mut _, "ArchTrapOps");
 }
 
 /// 取已注入的 trap 契约。
@@ -239,7 +262,7 @@ unsafe impl Send for VmSwitchOps {}
 static VM_SWITCH_OPS: AtomicPtr<VmSwitchOps> = AtomicPtr::new(core::ptr::null_mut());
 
 pub fn register_vm_switch(ops: &'static VmSwitchOps) {
-    VM_SWITCH_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+    register_once(&VM_SWITCH_OPS, ops as *const _ as *mut _, "VmSwitchOps");
 }
 
 pub fn vm_switch() -> Option<&'static VmSwitchOps> {

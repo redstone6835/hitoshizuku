@@ -87,6 +87,7 @@ impl VfsContext {
         umask: FileMode,
         limits: Arc<VfsLimits>,
     ) -> Self {
+        cwd_mount.inc_open();
         Self {
             cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
             root,
@@ -113,9 +114,12 @@ impl VfsContext {
         } else {
             return Err(VfsError::NotFound);
         }
+        new_mount.inc_open();
         let mut state = self.cwd_state.lock();
+        let old_mount = Arc::clone(&state.cwd_mount);
         state.cwd = new_cwd;
         state.cwd_mount = new_mount;
+        old_mount.dec_open();
         Ok(())
     }
 
@@ -148,11 +152,11 @@ impl VfsContext {
 
     pub fn fork(&self) -> VfsResult<Self> {
         let cwd_st = self.cwd_state.lock();
+        let cwd = Arc::clone(&cwd_st.cwd);
+        let cwd_mount = Arc::clone(&cwd_st.cwd_mount);
+        cwd_mount.inc_open();
         Ok(Self {
-            cwd_state: sync::Spinlock::new(CwdState {
-                cwd: Arc::clone(&cwd_st.cwd),
-                cwd_mount: Arc::clone(&cwd_st.cwd_mount),
-            }),
+            cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
             root: VfsRoot::new(self.root.root(), self.root.mount()),
             mount_ns: Arc::clone(&self.mount_ns),
             cred: Arc::clone(&self.cred),
@@ -167,6 +171,7 @@ impl VfsContext {
         let new_cwd_mount = new_ns
             .find_mount_for_root(&cwd_st.cwd_mount.mount_root)
             .unwrap_or_else(|| Arc::clone(&new_ns.root.lock()));
+        new_cwd_mount.inc_open();
         let root_dentry = self.root.root();
         let new_root_mount = new_ns
             .find_mount_for_root(&self.root.mount().mount_root)
@@ -182,6 +187,12 @@ impl VfsContext {
             umask: sync::Spinlock::new(*self.umask.lock()),
             limits: Arc::clone(&self.limits),
         })
+    }
+}
+
+impl Drop for VfsContext {
+    fn drop(&mut self) {
+        self.cwd_state.lock().cwd_mount.dec_open();
     }
 }
 

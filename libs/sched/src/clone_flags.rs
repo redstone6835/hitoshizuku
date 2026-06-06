@@ -86,6 +86,19 @@ pub struct CloneArgs {
 }
 
 impl CloneArgs {
+    pub const fn exit_signal_checked(self) -> Option<u8> {
+        let raw = if self.exit_signal != 0 {
+            self.exit_signal
+        } else {
+            self.flags.exit_signal() as u64
+        };
+        if raw == 0 || raw <= 64 {
+            Some(raw as u8)
+        } else {
+            None
+        }
+    }
+
     pub const fn exit_signal_raw(self) -> u8 {
         if self.exit_signal != 0 {
             self.exit_signal as u8

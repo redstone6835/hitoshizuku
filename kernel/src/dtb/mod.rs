@@ -16,7 +16,7 @@ use general::dev::char::CharDevice;
 use general::dev::drivers;
 use general::dev::drivers::{RANDOM_DRIVER, URANDOM_DRIVER};
 use general::dev::enumerate::DEVICES;
-use general::dev::function::{find_char_device_by_fw_name, lookup_block_device_by_node};
+use general::dev::function::{active_block_devices, find_char_device_by_fw_name};
 use general::dev::pci::pci_scan_and_register;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, PlatformDeviceInfo,
@@ -308,15 +308,8 @@ pub fn kernel_start_init(context: &StartContext) {
             },
         )
     } else {
-        let dev = lookup_block_devnode("vd0")
-            .unwrap_or_else(|| panic!("[kernel-start][dtb] no initramfs and /dev/vd0 not found"));
-        mount_block_root(Arc::clone(&dev)).unwrap_or_else(|err| {
-            panic!(
-                "[kernel-start][dtb] failed to mount /dev/{} as root: {}",
-                dev.name(),
-                err
-            )
-        })
+        mount_first_block_root()
+            .unwrap_or_else(|err| panic!("[kernel-start][dtb] failed to mount block root: {}", err))
     };
     printk!("[kernel-start][dtb] root source selected: {}", root_source);
 
@@ -505,10 +498,6 @@ fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
     find_char_device_by_fw_name(&DEVICES.functions, name)
 }
 
-fn lookup_block_devnode(name: &str) -> Option<Arc<BlockDevice>> {
-    lookup_block_device_by_node(&DEVICES.functions, name)
-}
-
 fn mount_tmpfs_superblock() -> Arc<Superblock> {
     FS_REGISTRY
         .find("tmpfs")
@@ -522,6 +511,28 @@ fn mount_block_root(
 ) -> Result<(Arc<Superblock>, &'static str), &'static str> {
     general::vfs::mount_block_device_auto(dev, "")
         .map_err(|_| "unsupported or invalid root filesystem")
+}
+
+fn mount_first_block_root() -> Result<(Arc<Superblock>, &'static str), &'static str> {
+    let devices = active_block_devices(&DEVICES.functions);
+    if devices.is_empty() {
+        return Err("no initramfs and no active block device found");
+    }
+
+    for dev in devices {
+        match mount_block_root(Arc::clone(&dev)) {
+            Ok(root) => return Ok(root),
+            Err(err) => {
+                log::debug!(
+                    "[kernel-start][dtb] block device {} is not root candidate: {}",
+                    dev.name(),
+                    err
+                );
+            }
+        }
+    }
+
+    Err("no active block device contains a supported root filesystem")
 }
 
 fn platform_device_info_from_dtb(

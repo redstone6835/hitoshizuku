@@ -82,7 +82,17 @@ unsafe impl Send for ProcessImageOps {}
 static PROCESS_IMAGE_OPS: AtomicPtr<ProcessImageOps> = AtomicPtr::new(core::ptr::null_mut());
 
 pub fn register_process_image_ops(ops: &'static ProcessImageOps) {
-    PROCESS_IMAGE_OPS.store(ops as *const _ as *mut _, Ordering::Release);
+    let ptr = ops as *const _ as *mut _;
+    match PROCESS_IMAGE_OPS.compare_exchange(
+        core::ptr::null_mut(),
+        ptr,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => {}
+        Err(prev) if prev == ptr => {}
+        Err(_) => panic!("[sched] ProcessImageOps already registered"),
+    }
 }
 
 pub fn process_image_ops() -> Option<&'static ProcessImageOps> {

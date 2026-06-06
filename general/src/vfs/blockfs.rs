@@ -1,10 +1,9 @@
 //! 块设备承载的文件系统注册。
 //!
-//! 本模块只负责把 VFS mount 源（例如 `/dev/vd0`）解析为块设备，并把块设备
+//! 本模块只负责把 VFS mount 源解析为块设备，并把块设备
 //! 包装成同步后端。具体磁盘格式由注册进来的 [`BlockFsDriver`] 实现。
 
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::sync::Arc;
 
 use vfs::FS_REGISTRY;
@@ -13,8 +12,8 @@ use vfs::superblock::{FsDriver, FsDriverFlags, FsProbe, Superblock};
 
 use crate::dev::block::BlockDevice;
 use crate::dev::block_sync::{SyncBlockBackend, SyncIoError};
-use crate::dev::enumerate::DEVICES;
-use crate::dev::function::lookup_block_device_by_node;
+
+use super::mount_source::resolve_block_mount_source;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlockFsProbe {
@@ -137,18 +136,25 @@ pub fn mount_block_source_auto(
     source: &str,
     data: &str,
 ) -> VfsResult<(Arc<Superblock>, &'static str)> {
+    let dev = resolve_block_mount_source(source)?;
+    mount_block_device_auto(dev, data)
+}
+
+fn mount_block_backend_auto(
+    backend: Arc<SyncBlockBackend>,
+    data: &str,
+) -> VfsResult<(Arc<Superblock>, &'static str)> {
     let mut last_error = VfsError::NoDevice;
-    for wanted_probe in [FsProbe::Strong, FsProbe::Weak] {
+    for wanted_probe in [BlockFsProbe::Strong, BlockFsProbe::Weak] {
         for entry in FS_REGISTRY.iter() {
             let driver = entry.driver;
-            let flags = driver.flags();
-            if !flags.has(FsDriverFlags::BLOCK)
-                || !flags.has(FsDriverFlags::AUTO_DETECT)
-                || driver.probe(Some(source)) != wanted_probe
-            {
+            let Some(adapter) = driver.as_any().downcast_ref::<BlockFsAdapter>() else {
+                continue;
+            };
+            if !adapter.auto_detect || adapter.driver.probe(backend.as_ref()) != wanted_probe {
                 continue;
             }
-            match driver.mount(Some(source), data) {
+            match adapter.driver.mount_block(Arc::clone(&backend), data) {
                 Ok(sb) => return Ok((sb, driver.name())),
                 Err(err) => last_error = err,
             }
@@ -161,9 +167,10 @@ pub fn mount_block_device_auto(
     dev: Arc<BlockDevice>,
     data: &str,
 ) -> VfsResult<(Arc<Superblock>, &'static str)> {
-    let source = dev.name();
-    let (sb, fs_name) = mount_block_source_auto(source, data)?;
-    let root_source = format!("/dev/{} ({})", source, fs_name).leak();
+    let source = alloc::string::String::from(dev.name());
+    let backend = Arc::new(SyncBlockBackend::new(dev));
+    let (sb, fs_name) = mount_block_backend_auto(backend, data)?;
+    let root_source = alloc::format!("{} ({})", source, fs_name).leak();
     Ok((sb, root_source))
 }
 
@@ -175,15 +182,7 @@ pub fn register_block_filesystems() {
 }
 
 fn resolve_block_device(source: &str) -> VfsResult<Arc<BlockDevice>> {
-    let name = match source.strip_prefix("/dev/") {
-        Some(name) => name,
-        None if !source.starts_with('/') => source,
-        None => return Err(VfsError::NotFound),
-    };
-    if name.is_empty() || name.contains('/') {
-        return Err(VfsError::NotFound);
-    }
-    lookup_block_device_by_node(&DEVICES.functions, name).ok_or(VfsError::NotFound)
+    resolve_block_mount_source(source)
 }
 
 struct ExtBlockFsDriver;

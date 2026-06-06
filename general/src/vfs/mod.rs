@@ -1,5 +1,6 @@
 pub mod blockfs;
 pub mod devtmpfs;
+pub mod mount_source;
 pub mod procfs;
 pub mod sysfs;
 pub mod tmpfs;
@@ -12,6 +13,7 @@ pub use blockfs::{
     register_block_filesystems, register_block_fs_driver,
 };
 pub use devtmpfs::DevTmpfsDriver;
+pub use mount_source::{MountSource, resolve_block_mount_source};
 pub use procfs::ProcFsDriver;
 pub use sysfs::SysFsDriver;
 pub use tmpfs::TmpfsDriver;
