@@ -241,24 +241,26 @@ impl FileOps for NetSocketFileOps {
 
     fn release(&self) {
         if let Some(handle) = self.handle.lock().take() {
-            let options = self.options.lock();
-            if options.linger_on && options.linger_secs > 0 {
-                if matches!(handle.socket_type(), SocketType::Tcp) {
+            let linger_secs = {
+                let options = self.options.lock();
+                if options.linger_on && options.linger_secs > 0
+                    && matches!(handle.socket_type(), SocketType::Tcp)
+                {
                     net::stack().tcp_close(handle);
-                    let deadline = sched::now_ns_public()
-                        .saturating_add((options.linger_secs as u64) * 1_000_000_000);
-                    loop {
-                        if sched::now_ns_public() >= deadline {
-                            break;
-                        }
-                        if !net::stack().socket_can_send(handle) {
-                            break;
-                        }
-                        core::hint::spin_loop();
-                    }
+                    options.linger_secs
+                } else {
+                    0
+                }
+            };
+            if linger_secs > 0 {
+                let deadline = sched::now_ns_public()
+                    .saturating_add((linger_secs as u64) * 1_000_000_000);
+                while sched::now_ns_public() < deadline
+                    && net::stack().tcp_recv_queue(handle) > 0
+                {
+                    sched::schedule_once(sched::now_ns_public());
                 }
             }
-            drop(options);
             net::stack().socket_close_and_remove(handle);
         }
     }

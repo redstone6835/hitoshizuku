@@ -34,6 +34,7 @@ pub(crate) struct ManagedInterface {
     /// 已完成握手的 TCP socket 队列（accept backlog）。
     pending_accepted: Vec<SocketHandle>,
     max_backlog: usize,
+    inode_counter: core::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     config: IfConfig,
     #[allow(dead_code)]
@@ -99,9 +100,14 @@ impl ManagedInterface {
             meta: BTreeMap::new(),
             pending_accepted: Vec::new(),
             max_backlog: 128,
+            inode_counter: core::sync::atomic::AtomicU64::new(1),
             config,
             net_device,
         }
+
+    fn next_inode(&self) -> u64 {
+        self.inode_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
 
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
@@ -473,7 +479,7 @@ impl ManagedInterface {
                         state: tcp_state_to_u8(tcp_socket.state()),
                         tx_queue: tcp_socket.send_queue(),
                         rx_queue: tcp_socket.recv_queue(),
-                        inode: 0, // 由 procfs 渲染时填入 slot 号
+                        inode: self.next_inode(),
                     });
                 }
             }
@@ -513,7 +519,7 @@ impl ManagedInterface {
                     out.push(super::socket::UdpSockSnapshot {
                         local,
                         remote: None,
-                        inode: 0, // 由 procfs 渲染时填入 slot 号
+                        inode: self.next_inode(),
                     });
                 }
             }
