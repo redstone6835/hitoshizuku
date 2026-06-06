@@ -82,6 +82,8 @@ pub struct OpenOptions {
     pub nonblock: bool,
     /// 同步写（`O_SYNC`）。
     pub sync: bool,
+    /// 直接 I/O（`O_DIRECT`）。
+    pub direct: bool,
     /// 执行后关闭（`O_CLOEXEC`）。
     pub cloexec: bool,
 }
@@ -174,6 +176,7 @@ impl StatusFlags {
     const APPEND: u32 = 1 << 0;
     const NONBLOCK: u32 = 1 << 1;
     const SYNC: u32 = 1 << 2;
+    const DIRECT: u32 = 1 << 3;
 
     fn from_open_options(opts: OpenOptions) -> Self {
         let mut bits = 0u32;
@@ -186,6 +189,9 @@ impl StatusFlags {
         if opts.sync {
             bits |= Self::SYNC;
         }
+        if opts.direct {
+            bits |= Self::DIRECT;
+        }
         Self(bits)
     }
 
@@ -193,6 +199,7 @@ impl StatusFlags {
         opts.append = (self.0 & Self::APPEND) != 0;
         opts.nonblock = (self.0 & Self::NONBLOCK) != 0;
         opts.sync = (self.0 & Self::SYNC) != 0;
+        opts.direct = (self.0 & Self::DIRECT) != 0;
         opts
     }
 }
@@ -378,7 +385,7 @@ impl File {
         StatusFlags(self.status_flags.load(Ordering::Acquire)).apply(self.flags)
     }
 
-    pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool) {
+    pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool, direct: bool) {
         let mut bits = 0u32;
         if append {
             bits |= StatusFlags::APPEND;
@@ -388,6 +395,9 @@ impl File {
         }
         if sync {
             bits |= StatusFlags::SYNC;
+        }
+        if direct {
+            bits |= StatusFlags::DIRECT;
         }
         self.status_flags.store(bits, Ordering::Release);
         self.ops.set_status_flags(self.flags());

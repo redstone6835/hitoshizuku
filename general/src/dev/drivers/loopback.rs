@@ -15,6 +15,8 @@ use net::driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 
 use crate::dev::pnp::PnpError;
 
+const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
+
 struct LoopbackDriver {
     queue: Mutex<VecDeque<Box<[u8]>>>,
     stats: Mutex<NetStats>,
@@ -55,9 +57,12 @@ impl NetDriver for LoopbackDriver {
             stats.tx_packets += 1;
             stats.tx_bytes += len as u64;
         }
-        // FIXME: loopback 队列没有容量上限或 backpressure，持续发送会让
-        // 内存无界增长。
-        self.queue.lock().push_back(data);
+        let mut queue = self.queue.lock();
+        if queue.len() >= MAX_LOOPBACK_QUEUE_FRAMES {
+            self.stats.lock().tx_dropped += 1;
+            return;
+        }
+        queue.push_back(data);
     }
 
     fn link_state(&self) -> LinkState {

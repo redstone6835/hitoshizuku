@@ -510,9 +510,7 @@ impl CharDevFileOps {
             let mut byte = [0u8; 1];
             let n = self.dev.read(&mut byte).map_err(map_char_err)?;
             if n == 0 {
-                let _ = operation::sched_yield();
-                core::hint::spin_loop();
-                continue;
+                return Err(VfsError::WouldBlock);
             }
 
             let mut ch = byte[0];
@@ -621,8 +619,7 @@ impl CharDevFileOps {
                 if filled != 0 && termios.vtime() == 0 {
                     return Ok(filled);
                 }
-                let _ = operation::sched_yield();
-                core::hint::spin_loop();
+                return Err(VfsError::WouldBlock);
             }
         }
     }
@@ -661,6 +658,15 @@ impl FileOps for CharDevFileOps {
     fn poll(&self, _interest: PollEvents) -> PollEvents {
         if !self.dev.is_active() {
             return PollEvents::POLLERR.with(PollEvents::POLLHUP);
+        }
+        if self.is_tty() {
+            let state = self.line_state.lock();
+            let readable = state.eof_pending || !state.ready.is_empty();
+            return if readable {
+                PollEvents::POLLIN.with(PollEvents::POLLOUT)
+            } else {
+                PollEvents::POLLOUT
+            };
         }
         PollEvents::POLLIN.with(PollEvents::POLLOUT)
     }
@@ -767,8 +773,7 @@ impl FileOps for CharDevFileOps {
             }
             TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
             FIONBIO => {
-                self.nonblock
-                    .store(read_i32_from_user(arg)? != 0, Ordering::Release);
+                self.nonblock.store(arg != 0, Ordering::Release);
                 Ok(0)
             }
             _ => Err(Errno::ENOTTY),
@@ -833,6 +838,7 @@ struct DevBlockOps {
 struct BlockDevFileOps {
     dev: Arc<BlockDevice>,
     sync_writes: bool,
+    direct: bool,
 }
 
 fn map_bio_err(err: BioError) -> VfsError {
@@ -853,10 +859,6 @@ fn map_bio_err(err: BioError) -> VfsError {
             crate::dev::bio::BioIoError::Unsupported => VfsError::NotSupported,
         },
     }
-}
-
-fn map_block_io_err(err: BioError) -> VfsError {
-    map_bio_err(err)
 }
 
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
@@ -894,38 +896,181 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
+fn block_capacity_remaining(dev: &BlockDevice, offset: u64, len: usize) -> usize {
+    let Some(capacity) = dev.geometry().capacity_bytes() else {
+        return len;
+    };
+    if offset >= capacity {
+        return 0;
+    }
+    let remaining = capacity - offset;
+    len.min(remaining as usize)
+}
+
+fn max_blocks_per_io(dev: &BlockDevice) -> u32 {
+    dev.limits()
+        .max_blocks_per_io()
+        .map(|n| n.get())
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+fn block_read_exact(dev: &Arc<BlockDevice>, lba: u64, blocks: u32) -> VfsResult<Box<[u8]>> {
+    let block_size = dev.geometry().logical_block_size().get() as usize;
+    let len = (blocks as usize)
+        .checked_mul(block_size)
+        .ok_or(VfsError::InvalidArgument)?;
+    let owned = boxed_zeroed(len)?;
+    let bio = dev
+        .submit_bio_wait(
+            BioOp::Read,
+            BlockRange { lba, blocks },
+            BioBuffer::Owned(owned),
+        )
+        .map_err(map_bio_err)?;
+    match bio.buffer {
+        BioBuffer::Owned(buf) => Ok(buf),
+        BioBuffer::None => Err(VfsError::Io),
+    }
+}
+
+fn block_write_exact(dev: &Arc<BlockDevice>, lba: u64, data: Box<[u8]>) -> VfsResult<()> {
+    let block_size = dev.geometry().logical_block_size().get() as usize;
+    if data.len() == 0 || !data.len().is_multiple_of(block_size) {
+        return Err(VfsError::InvalidArgument);
+    }
+    let blocks = u32::try_from(data.len() / block_size).map_err(|_| VfsError::InvalidArgument)?;
+    dev.submit_bio_wait(
+        BioOp::Write,
+        BlockRange { lba, blocks },
+        BioBuffer::Owned(data),
+    )
+    .map_err(map_bio_err)?;
+    Ok(())
+}
+
+fn flush_if_supported(dev: &Arc<BlockDevice>) -> VfsResult<()> {
+    if !dev.features().contains(BlockFeatures::FLUSH) {
+        return Ok(());
+    }
+    dev.submit_bio_wait(
+        BioOp::Flush,
+        BlockRange { lba: 0, blocks: 0 },
+        BioBuffer::None,
+    )
+    .map_err(map_bio_err)?;
+    Ok(())
+}
+
 impl FileOps for BlockDevFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
+        let len = block_capacity_remaining(&self.dev, offset, buf.len());
+        if len == 0 {
             return Ok(0);
-        };
-        let owned = boxed_zeroed(buf.len())?;
-        let bio = self
-            .dev
-            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
-            .map_err(map_bio_err)?;
-        buf.copy_from_slice(bio.buffer.as_slice());
-        Ok(buf.len())
+        }
+        let block_size = self.dev.geometry().logical_block_size().get() as usize;
+        let mut done = 0usize;
+
+        if self.direct {
+            let Some(range) = block_range_for_io(&self.dev, offset, len)? else {
+                return Ok(0);
+            };
+            let mut lba = range.lba;
+            let mut remaining_blocks = range.blocks as usize;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let data = block_read_exact(&self.dev, lba, blocks)?;
+                let bytes = data.len();
+                buf[done..done + bytes].copy_from_slice(&data);
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+            return Ok(done);
+        }
+
+        if offset.is_multiple_of(block_size as u64) && len.is_multiple_of(block_size) {
+            let mut lba = offset / block_size as u64;
+            let mut remaining_blocks = len / block_size;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let data = block_read_exact(&self.dev, lba, blocks)?;
+                let bytes = data.len();
+                buf[done..done + bytes].copy_from_slice(&data);
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+            return Ok(done);
+        }
+
+        while done < len {
+            let abs = offset.saturating_add(done as u64);
+            let lba = abs / block_size as u64;
+            let in_block = (abs % block_size as u64) as usize;
+            let take = (block_size - in_block).min(len - done);
+            let data = block_read_exact(&self.dev, lba, 1)?;
+            buf[done..done + take].copy_from_slice(&data[in_block..in_block + take]);
+            done += take;
+        }
+        Ok(done)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
+        let len = block_capacity_remaining(&self.dev, offset, buf.len());
+        if len == 0 {
             return Ok(0);
-        };
-        let owned = boxed_copy(buf)?;
-        self.dev
-            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
-            .map_err(map_bio_err)?;
-        if self.sync_writes {
-            self.dev
-                .submit_bio_wait(
-                    BioOp::Flush,
-                    BlockRange { lba: 0, blocks: 0 },
-                    BioBuffer::None,
-                )
-                .map_err(map_bio_err)?;
         }
-        Ok(buf.len())
+        let block_size = self.dev.geometry().logical_block_size().get() as usize;
+        let mut done = 0usize;
+
+        if self.direct {
+            let Some(range) = block_range_for_io(&self.dev, offset, len)? else {
+                return Ok(0);
+            };
+            let mut lba = range.lba;
+            let mut remaining_blocks = range.blocks as usize;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let bytes = blocks as usize * block_size;
+                let owned = boxed_copy(&buf[done..done + bytes])?;
+                block_write_exact(&self.dev, lba, owned)?;
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+        } else if offset.is_multiple_of(block_size as u64) && len.is_multiple_of(block_size) {
+            let mut lba = offset / block_size as u64;
+            let mut remaining_blocks = len / block_size;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let bytes = blocks as usize * block_size;
+                let owned = boxed_copy(&buf[done..done + bytes])?;
+                block_write_exact(&self.dev, lba, owned)?;
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+        } else {
+            while done < len {
+                let abs = offset.saturating_add(done as u64);
+                let lba = abs / block_size as u64;
+                let in_block = (abs % block_size as u64) as usize;
+                let take = (block_size - in_block).min(len - done);
+                let mut data = block_read_exact(&self.dev, lba, 1)?;
+                data[in_block..in_block + take].copy_from_slice(&buf[done..done + take]);
+                block_write_exact(&self.dev, lba, data)?;
+                done += take;
+            }
+        }
+        if self.sync_writes {
+            flush_if_supported(&self.dev)?;
+        }
+        Ok(done)
     }
 
     fn readdir(
@@ -940,13 +1085,7 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
-        self.dev
-            .submit_bio_wait(
-                BioOp::Flush,
-                BlockRange { lba: 0, blocks: 0 },
-                BioBuffer::None,
-            )
-            .map_err(map_bio_err)?;
+        flush_if_supported(&self.dev)?;
         Ok(())
     }
 
@@ -1057,6 +1196,7 @@ impl InodeOps for DevBlockOps {
         Ok(Box::new(BlockDevFileOps {
             dev: Arc::clone(&self.dev),
             sync_writes: opts.sync,
+            direct: opts.direct,
         }))
     }
 
@@ -1611,8 +1751,12 @@ impl DevTmpfsSuperblockOps {
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        if self.lookup_node_at(user_name).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let rdev = super::device_numbers::register_char(user_name, dev.fw_name());
 
         let now = Timespec::now();
         let meta = InodeMeta {
@@ -1634,7 +1778,7 @@ impl DevTmpfsSuperblockOps {
                 ino: self.alloc_ino(),
             },
             FileType::CharDevice,
-            DevId::new(0, 0),
+            rdev,
             512,
             None,
             meta,
@@ -1642,7 +1786,11 @@ impl DevTmpfsSuperblockOps {
             sb_weak,
         );
 
-        self.insert_node_at(user_name, inode)
+        if let Err(err) = self.insert_node_at(user_name, inode) {
+            super::device_numbers::unregister_node(user_name);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 将块设备绑定到 devtmpfs 相对路径。
@@ -1654,8 +1802,12 @@ impl DevTmpfsSuperblockOps {
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        if self.lookup_node_at(user_name).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let rdev = super::device_numbers::register_block(user_name, dev.name());
 
         let now = Timespec::now();
         let meta = InodeMeta {
@@ -1677,7 +1829,7 @@ impl DevTmpfsSuperblockOps {
                 ino: self.alloc_ino(),
             },
             FileType::BlockDevice,
-            DevId::new(0, 0),
+            rdev,
             512,
             None,
             meta,
@@ -1685,7 +1837,11 @@ impl DevTmpfsSuperblockOps {
             sb_weak,
         );
 
-        self.insert_node_at(user_name, inode)
+        if let Err(err) = self.insert_node_at(user_name, inode) {
+            super::device_numbers::unregister_node(user_name);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 在 devtmpfs 相对路径上创建一个符号链接节点。
@@ -1724,6 +1880,7 @@ impl DevTmpfsSuperblockOps {
     /// 解除设备绑定，删除 devtmpfs 中的相对路径节点。
     pub fn unbind(&self, user_name: &str) -> VfsResult<()> {
         self.remove_node_at(user_name)?;
+        super::device_numbers::unregister_node(user_name);
         Ok(())
     }
 

@@ -156,7 +156,7 @@ impl DmaBuffer {
         let allocation = KERNEL_ALLOCATOR
             .allocate_physical(PhysicalAllocRequest::new(len, PAGE_SIZE))
             .map_err(|_| "Failed to allocate DMA buffer")?;
-        let vaddr = dma_vaddr(allocation);
+        let vaddr = dma_vaddr(allocation)?;
         unsafe {
             core::ptr::write_bytes(vaddr as *mut u8, 0, allocation.size);
         }
@@ -362,8 +362,11 @@ fn alloc_dma_page() -> Result<PhysicalAllocation, &'static str> {
         .map_err(|_| "Failed to allocate DMA page")
 }
 
-fn dma_vaddr(allocation: PhysicalAllocation) -> usize {
-    allocator::KERNEL_ALLOCATOR.load_phys_to_virt().unwrap()(allocation.paddr)
+fn dma_vaddr(allocation: PhysicalAllocation) -> Result<usize, &'static str> {
+    allocator::KERNEL_ALLOCATOR
+        .load_phys_to_virt()
+        .map(|phys_to_virt| phys_to_virt(allocation.paddr))
+        .ok_or("virtio-blk: phys_to_virt hook is not installed")
 }
 
 // ───────── 驱动初始化 ─────────
@@ -473,9 +476,9 @@ impl VirtioBlk {
         let desc_alloc = alloc_dma_page()?;
         let avail_alloc = alloc_dma_page()?;
         let used_alloc = alloc_dma_page()?;
-        let desc_table = dma_vaddr(desc_alloc) as *mut VirtqDesc;
-        let avail_ring = dma_vaddr(avail_alloc) as *mut VirtqAvail;
-        let used_ring = dma_vaddr(used_alloc) as *mut VirtqUsed;
+        let desc_table = dma_vaddr(desc_alloc)? as *mut VirtqDesc;
+        let avail_ring = dma_vaddr(avail_alloc)? as *mut VirtqAvail;
+        let used_ring = dma_vaddr(used_alloc)? as *mut VirtqUsed;
         unsafe {
             core::ptr::write_bytes(desc_table.cast::<u8>(), 0, PAGE_SIZE);
             core::ptr::write_bytes(avail_ring.cast::<u8>(), 0, PAGE_SIZE);
@@ -550,7 +553,10 @@ impl VirtioBlk {
                 data_dma,
                 desc_count,
                 ..
-            } = queue.pending.remove(pos).unwrap();
+            } = match queue.pending.remove(pos) {
+                Some(pending) => pending,
+                None => continue,
+            };
             core::sync::atomic::fence(Ordering::Acquire);
             let meta = unsafe { &*(meta_dma.vaddr as *const VirtioBlkReqMeta) };
             let result = match meta.status {
@@ -609,6 +615,9 @@ impl VirtioBlk {
         let capacity = self.inner.capacity;
         let block_size = self.inner.block_size;
         let sector_scale = (block_size / 512) as u64;
+        if sector_scale == 0 || capacity % sector_scale != 0 {
+            return Err("Invalid capacity for logical block size");
+        }
         let logical_blocks = capacity / sector_scale;
         if logical_blocks == 0 {
             return Err("Invalid capacity");

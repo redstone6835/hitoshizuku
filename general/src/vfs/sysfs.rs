@@ -29,6 +29,7 @@ use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
 use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{active_block_devices, active_char_devices};
+use crate::vfs::device_numbers;
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
 const ROOT_INO: u64 = 1;
@@ -411,8 +412,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             }
         }
         BlockDevSlot::Removable => "0\n".into(),
-        // TODO: 当前所有块设备硬编码 major:minor=254:0，需要从兼容层分配的真实编号读取
-        BlockDevSlot::Dev => "254:0\n".into(),
+        BlockDevSlot::Dev => format_block_rdev(&snap.blocks[idx].sysfs_name),
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
@@ -454,8 +454,7 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
         let c = &snap.chars[idx];
         match slot {
             DeviceSlot::Name => format!("{}\n", c.sysfs_name),
-            // TODO: 字符设备的 dev 字段硬编码 0:0，需要从兼容层读取真实 major:minor
-            DeviceSlot::Dev => "0:0\n".into(),
+            DeviceSlot::Dev => format_char_rdev(&c.sysfs_name),
             DeviceSlot::Driver => String::new(),
             // TODO: 实现真正的 subsystem 链接（指向 /sys/class/<class> 或 /sys/bus/<bus>）
             DeviceSlot::Subsystem => "(unimplemented)\n".into(),
@@ -466,8 +465,7 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
         let b = &snap.blocks[bi];
         match slot {
             DeviceSlot::Name => format!("{}\n", b.sysfs_name),
-            // TODO: 块设备的 dev 字段硬编码 0:0，需要从兼容层读取真实 major:minor
-            DeviceSlot::Dev => "0:0\n".into(),
+            DeviceSlot::Dev => format_block_rdev(&b.sysfs_name),
             DeviceSlot::Driver => String::new(),
             // TODO: 实现真正的 subsystem 链接（指向 /sys/class/block）
             DeviceSlot::Subsystem => "(unimplemented)\n".into(),
@@ -476,15 +474,34 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
     }
 }
 
-fn render_dev_char_inner(_snap: &SysSnapshot, _idx: usize, slot: DevCharInnerSlot) -> String {
+fn render_dev_char_inner(snap: &SysSnapshot, idx: usize, slot: DevCharInnerSlot) -> String {
     match slot {
-        // TODO: 字符设备 /sys/dev/char/<id>/dev 硬编码 0:0，需要兼容层指定的 major:minor
-        DevCharInnerSlot::Dev => "0:0\n".into(),
+        DevCharInnerSlot::Dev => format_char_rdev(&snap.chars[idx].sysfs_name),
         DevCharInnerSlot::DeviceLink => String::new(), // symlink，不渲染
         DevCharInnerSlot::SubsystemLink => String::new(),
-        // TODO: uevent 内容应包含真实的 MAJOR、MINOR、DEVNAME 等字段
-        DevCharInnerSlot::Uevent => "MODALIAS=char:0:0\n".into(),
+        DevCharInnerSlot::Uevent => {
+            if let Some(rdev) = device_numbers::lookup_char(&snap.chars[idx].sysfs_name) {
+                format!(
+                    "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
+                    rdev.major, rdev.minor, snap.chars[idx].sysfs_name
+                )
+            } else {
+                "MODALIAS=char:0:0\n".into()
+            }
+        }
     }
+}
+
+fn format_char_rdev(name: &str) -> String {
+    device_numbers::lookup_char(name)
+        .map(|rdev| format!("{}:{}\n", rdev.major, rdev.minor))
+        .unwrap_or_else(|| "0:0\n".into())
+}
+
+fn format_block_rdev(name: &str) -> String {
+    device_numbers::lookup_block(name)
+        .map(|rdev| format!("{}:{}\n", rdev.major, rdev.minor))
+        .unwrap_or_else(|| "0:0\n".into())
 }
 
 fn render_cpu_file(_snap: &SysSnapshot, _cpu_id: usize, slot: CpuSlot) -> String {

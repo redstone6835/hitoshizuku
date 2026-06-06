@@ -342,7 +342,12 @@ impl BlockDevice {
             return Err(BioError::Submit(SubmitError::ReadOnly));
         }
         match op {
-            BioOp::Flush => return Ok(()),
+            BioOp::Flush => {
+                if self.features.contains(BlockFeatures::FLUSH) {
+                    return Ok(());
+                }
+                return Err(BioError::Submit(SubmitError::Unsupported));
+            }
             BioOp::Discard | BioOp::WriteZeroes => {
                 if op == BioOp::Discard && !self.features.contains(BlockFeatures::DISCARD) {
                     return Err(BioError::Submit(SubmitError::Unsupported));

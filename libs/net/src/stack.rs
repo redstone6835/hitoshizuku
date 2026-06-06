@@ -1133,14 +1133,17 @@ impl NetStack {
     // ── 内部辅助 ─────────────────────────────────────────────────────────
 
     fn default_iface_id(&self) -> Result<InterfaceId, NetError> {
-        // FIXME: BTreeMap 第一个 key 不是 Linux 的默认路由语义；当前通常
-        // 会优先选 lo，导致外部连接/UDP/ICMP 可能走错接口。
         let table = self.interfaces.read();
-        table
-            .keys()
-            .next()
-            .copied()
-            .ok_or(NetError::InterfaceNotFound)
+        let mut fallback = None;
+        for (&id, iface_lock) in table.iter() {
+            if fallback.is_none() {
+                fallback = Some(id);
+            }
+            if iface_lock.lock().name() != "lo" {
+                return Ok(id);
+            }
+        }
+        fallback.ok_or(NetError::InterfaceNotFound)
     }
 
     // ── 接口信息查询（供 procfs / netlink 使用）─────────────────────────

@@ -33,7 +33,7 @@ use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
 use super::{current_vfs_context, namespace_path};
-use crate::dev::function::{active_block_devices, active_char_devices};
+use crate::vfs::device_numbers::{self, PosixDeviceKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
@@ -2037,14 +2037,25 @@ fn render_stat() -> String {
 }
 
 fn render_devices() -> String {
-    // TODO: 当前所有 char/block 设备硬编码 major=254，需要从设备注册表中读取真实主设备号
     let mut out = String::from("Character devices:\n");
-    for dev in active_char_devices(&crate::dev::enumerate::DEVICES.functions) {
-        out.push_str(&format!("  254 {}\n", dev.fw_name()));
+    for record in device_numbers::records()
+        .into_iter()
+        .filter(|record| record.kind == PosixDeviceKind::Char)
+    {
+        out.push_str(&format!(
+            "  {} {}\n",
+            record.rdev.major, record.display_name
+        ));
     }
     out.push_str("\nBlock devices:\n");
-    for dev in active_block_devices(&crate::dev::enumerate::DEVICES.functions) {
-        out.push_str(&format!("  254 {}\n", dev.name()));
+    for record in device_numbers::records()
+        .into_iter()
+        .filter(|record| record.kind == PosixDeviceKind::Block)
+    {
+        out.push_str(&format!(
+            "  {} {}\n",
+            record.rdev.major, record.display_name
+        ));
     }
     out
 }

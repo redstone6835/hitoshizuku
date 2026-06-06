@@ -386,6 +386,7 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 (arg & O_APPEND) != 0,
                 (arg & O_NONBLOCK) != 0,
                 (arg & O_SYNC) != 0,
+                (arg & O_DIRECT) != 0,
             );
             Ok(0)
         }
@@ -397,7 +398,6 @@ pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let file = file_for_fd(fd_arg(ctx.args[0])?)?;
     let cmd = IoctlCmd::new(ctx.args[1] & u32::MAX as usize);
     let raw_cmd = cmd.raw() as u32;
-    // FIONBIO 的 syscall ABI 是 int *；VFS ioctl 实现只接收已解码的值。
     let arg = if cmd.raw() == FIONBIO {
         read_user_i32(ctx.args[2])? as usize
     } else {
@@ -1898,6 +1898,9 @@ fn open_options_to_linux_flags(opts: &OpenOptions) -> usize {
     if opts.sync {
         raw |= O_SYNC;
     }
+    if opts.direct {
+        raw |= O_DIRECT;
+    }
     raw
 }
 
@@ -1919,7 +1922,8 @@ fn decode_open_options(raw: usize) -> Result<OpenOptions, Errno> {
         noatime: (raw & O_NOATIME) != 0,
         path_only: (raw & O_PATH) != 0,
         nonblock: (raw & O_NONBLOCK) != 0,
-        sync: false,
+        sync: (raw & O_SYNC) != 0,
+        direct: (raw & O_DIRECT) != 0,
         cloexec: (raw & O_CLOEXEC) != 0,
     })
 }
@@ -1941,7 +1945,13 @@ fn write_from_user_at(
     let mut tmp = [0u8; COPY_CHUNK];
     while remaining > 0 {
         let chunk = remaining.min(tmp.len());
-        copy_from_user(user_ptr, &mut tmp[..chunk]).map_err(|e| e.as_errno())?;
+        if let Err(e) = copy_from_user(user_ptr, &mut tmp[..chunk]) {
+            return if written > 0 {
+                Ok(written)
+            } else {
+                Err(e.as_errno())
+            };
+        }
         let n = match if offset.is_some() {
             file.write_at(&tmp[..chunk], pos)
         } else {
@@ -2001,7 +2011,13 @@ fn read_to_user(
         if n == 0 {
             break;
         }
-        copy_to_user(user_ptr, &tmp[..n]).map_err(|e| e.as_errno())?;
+        if let Err(e) = copy_to_user(user_ptr, &tmp[..n]) {
+            return if read > 0 {
+                Ok(read)
+            } else {
+                Err(e.as_errno())
+            };
+        }
         read += n;
         user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
         pos = pos.saturating_add(n as u64);

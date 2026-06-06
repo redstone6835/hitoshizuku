@@ -1,4 +1,5 @@
 pub mod blockfs;
+pub mod device_numbers;
 pub mod devtmpfs;
 pub mod mount_source;
 pub mod procfs;

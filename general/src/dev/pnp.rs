@@ -399,6 +399,24 @@ impl PnpDevice {
         Ok(())
     }
 
+    pub fn detach_child(self: &Arc<Self>, child: &Arc<PnpDevice>) {
+        {
+            let mut inner = self.inner.lock();
+            inner
+                .children
+                .retain(|existing| !Arc::ptr_eq(existing, child));
+        }
+        let mut child_inner = child.inner.lock();
+        if child_inner
+            .parent
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|parent| Arc::ptr_eq(&parent, self))
+        {
+            child_inner.parent = None;
+        }
+    }
+
     pub fn attach_function(&self, func: Arc<dyn DeviceFunction>) -> Result<(), PnpError> {
         let dev_name = func.dev_name();
         let mut inner = self.inner.lock();
@@ -578,18 +596,18 @@ impl PnpDriverRegistry {
 
         match driver.probe(dev) {
             Ok(()) => {
-                dev.inner.lock().bound_driver = Some(driver);
-                dev.transition(PnpState::Probing, PnpState::Bound)?;
+                let mut inner = dev.inner.lock();
+                if inner.state != PnpState::Probing {
+                    drop(inner);
+                    dev.rollback_probe_side_effects();
+                    return Err(PnpError::InvalidState);
+                }
+                inner.bound_driver = Some(driver);
+                inner.state = PnpState::Bound;
                 Ok(())
             }
             Err(err) => {
-                let drained: Vec<Arc<dyn DeviceFunction>> =
-                    dev.inner.lock().functions.drain(..).collect();
-                for func in &drained {
-                    func.mark_gone();
-                    dev.unregister_function_external(func);
-                }
-                let _ = dev.transition(PnpState::Probing, PnpState::Discovered);
+                dev.rollback_probe_side_effects();
                 Err(err)
             }
         }
@@ -761,22 +779,29 @@ impl PnpDevice {
         self: &Arc<Self>,
         func: Arc<dyn DeviceFunction>,
     ) -> Result<(), PnpError> {
-        DEVICES.register_function(Arc::clone(&func))?;
+        self.attach_function(Arc::clone(&func))?;
+
+        if let Err(e) = DEVICES.register_function(Arc::clone(&func)) {
+            self.detach_function(&func);
+            func.mark_gone();
+            return Err(e.into());
+        }
 
         if let Err(e) = devtmpfs_bind_function(&func) {
             DEVICES.unregister_function(&func);
-            return Err(e);
-        }
-
-        if let Err(e) = self.attach_function(Arc::clone(&func)) {
-            if let Some(nodes) = func.devnodes() {
-                let _ = devtmpfs_unbind(&nodes);
-            }
-            DEVICES.unregister_function(&func);
+            self.detach_function(&func);
+            func.mark_gone();
             return Err(e);
         }
 
         Ok(())
+    }
+
+    fn detach_function(&self, func: &Arc<dyn DeviceFunction>) {
+        let mut inner = self.inner.lock();
+        inner
+            .functions
+            .retain(|existing| !Arc::ptr_eq(existing, func));
     }
 
     fn unregister_function_external(&self, func: &Arc<dyn DeviceFunction>) {
@@ -784,6 +809,29 @@ impl PnpDevice {
             let _ = devtmpfs_unbind(&nodes);
         }
         DEVICES.unregister_function(func);
+    }
+
+    fn rollback_probe_side_effects(self: &Arc<Self>) {
+        let (functions, children) = {
+            let mut inner = self.inner.lock();
+            inner.bound_driver = None;
+            inner.driver_data = None;
+            let functions = core::mem::take(&mut inner.functions);
+            let children = inner.children.clone();
+            if inner.state == PnpState::Probing {
+                inner.state = PnpState::Discovered;
+            }
+            (functions, children)
+        };
+
+        for child in children.iter().rev() {
+            child.remove_device();
+        }
+
+        for func in &functions {
+            func.mark_gone();
+            self.unregister_function_external(func);
+        }
     }
 }
 
@@ -811,7 +859,7 @@ impl PnpDevice {
         }
 
         let current_state = self.state();
-        if current_state != PnpState::Bound && current_state != PnpState::Probing {
+        if current_state == PnpState::Gone || current_state == PnpState::Removing {
             self.removal_lock.store(false, Ordering::Release);
             return;
         }
@@ -857,9 +905,13 @@ impl PnpDevice {
         // 阶段 7/8：标记 Gone 并从全局列表移除
         {
             let mut inner = self.inner.lock();
+            inner.children.clear();
             inner.state = PnpState::Gone;
         }
         PNP_DEVICES.remove(&self.id);
+        if let Some(parent) = self.parent() {
+            parent.detach_child(self);
+        }
     }
 }
 

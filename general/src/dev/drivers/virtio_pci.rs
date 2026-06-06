@@ -24,7 +24,6 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
-use core::any::Any;
 use core::mem;
 use core::num::NonZeroU32;
 use core::ptr::{read_volatile, write_volatile};
@@ -32,7 +31,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
-use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
+use crate::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
     BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry,
     BlockLimits,
@@ -382,8 +381,11 @@ fn alloc_dma_page() -> Result<PhysicalAllocation, &'static str> {
         .map_err(|_| "virtio-pci: DMA page alloc failed")
 }
 
-fn dma_vaddr(allocation: PhysicalAllocation) -> usize {
-    allocator::KERNEL_ALLOCATOR.load_phys_to_virt().unwrap()(allocation.paddr)
+fn dma_vaddr(allocation: PhysicalAllocation) -> Result<usize, &'static str> {
+    allocator::KERNEL_ALLOCATOR
+        .load_phys_to_virt()
+        .map(|phys_to_virt| phys_to_virt(allocation.paddr))
+        .ok_or("virtio-pci: phys_to_virt hook is not installed")
 }
 
 // ── 初始化序列 ─────────────────────────────────────────────────────────
@@ -466,6 +468,10 @@ impl VirtioBlkPci {
         } else {
             512
         };
+        if block_size < 512 || !block_size.is_power_of_two() || !block_size.is_multiple_of(512) {
+            cc_set_status(&caps, STATUS_FAILED);
+            return Err("virtio-pci: invalid block size");
+        }
 
         // 5. 设置队列 0
         wr_u16(caps.common.vaddr + CC_QUEUE_SELECT, 0);
@@ -481,9 +487,9 @@ impl VirtioBlkPci {
         let desc_alloc = alloc_dma_page()?;
         let avail_alloc = alloc_dma_page()?;
         let used_alloc = alloc_dma_page()?;
-        let desc_table = dma_vaddr(desc_alloc) as *mut VirtqDesc;
-        let avail_ring = dma_vaddr(avail_alloc) as *mut VirtqAvail;
-        let used_ring = dma_vaddr(used_alloc) as *mut VirtqUsed;
+        let desc_table = dma_vaddr(desc_alloc)? as *mut VirtqDesc;
+        let avail_ring = dma_vaddr(avail_alloc)? as *mut VirtqAvail;
+        let used_ring = dma_vaddr(used_alloc)? as *mut VirtqUsed;
         unsafe {
             core::ptr::write_bytes(desc_table.cast::<u8>(), 0, PAGE_SIZE);
             core::ptr::write_bytes(avail_ring.cast::<u8>(), 0, PAGE_SIZE);
@@ -569,7 +575,9 @@ impl VirtioBlkPci {
                 .iter()
                 .position(|(head, _, _)| *head == desc_head)
             {
-                let (_, mut bio, meta) = queue.pending.remove(pos).unwrap();
+                let Some((_, bio, meta)) = queue.pending.remove(pos) else {
+                    continue;
+                };
                 core::sync::atomic::fence(Ordering::Acquire);
                 let result = match meta.status {
                     VIRTIO_BLK_S_OK => Ok(()),
@@ -610,8 +618,16 @@ impl VirtioBlkPci {
     pub fn into_block_dev(self, name: &str) -> Result<Arc<BlockDevice>, &'static str> {
         let capacity = self.inner.capacity;
         let block_size = self.inner.block_size;
+        let sector_scale = (block_size / 512) as u64;
+        if sector_scale == 0 || capacity % sector_scale != 0 {
+            return Err("virtio-pci: invalid capacity for logical block size");
+        }
+        let logical_blocks = capacity / sector_scale;
+        if logical_blocks == 0 {
+            return Err("virtio-pci: invalid capacity");
+        }
         let logical = NonZeroU32::new(block_size).ok_or("virtio-pci: invalid block size")?;
-        let geometry = BlockGeometry::new(logical, logical, Some(capacity))
+        let geometry = BlockGeometry::new(logical, logical, Some(logical_blocks))
             .ok_or("virtio-pci: invalid geometry")?;
         let limits = BlockLimits::unrestricted();
         let mut features = BlockFeatures(0);

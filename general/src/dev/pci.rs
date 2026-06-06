@@ -255,37 +255,60 @@ impl PciDevice {
         let is_mmio = bar_val & 0x1 == 0;
         let prefetchable = is_mmio && (bar_val & 0x8) != 0;
 
-        let (bar_type, phys_addr, size_mask) = if is_mmio {
-            let bar_type = match (bar_val >> 1) & 0x3 {
-                0 => PciBarType::Memory, // 32-bit
-                2 => PciBarType::Memory, // 64-bit (lower half returned here)
+        let (bar_type, phys_addr, size) = if is_mmio {
+            let is_64 = match (bar_val >> 1) & 0x3 {
+                0 => false,
+                2 if idx < 5 => true,
                 _ => return None,
             };
-            let phys_addr = (bar_val & 0xFFFF_FFF0) as u64;
-            (bar_type, phys_addr, !0xFu32)
+            let high_offset = offset + 4;
+            let high_val = if is_64 {
+                self.read_config_u32(high_offset)
+            } else {
+                0
+            };
+            let phys_addr = ((high_val as u64) << 32) | ((bar_val & 0xFFFF_FFF0) as u64);
+
+            let cmd = self.read_config_u16(0x04);
+            self.write_config_u16(0x04, cmd & !0x2);
+            if is_64 {
+                self.write_config_u32(high_offset, u32::MAX);
+            }
+            self.write_config_u32(offset, 0xFFFF_FFF0);
+            let size_lo = self.read_config_u32(offset) & 0xFFFF_FFF0;
+            let size_hi = if is_64 {
+                self.read_config_u32(high_offset)
+            } else {
+                0
+            };
+            self.write_config_u32(offset, bar_val);
+            if is_64 {
+                self.write_config_u32(high_offset, high_val);
+            }
+            self.write_config_u16(0x04, cmd | 0x2);
+
+            let size_bits = ((size_hi as u64) << 32) | size_lo as u64;
+            if size_bits == 0 {
+                return None;
+            }
+            (PciBarType::Memory, phys_addr, (!size_bits).wrapping_add(1))
         } else {
             let phys_addr = (bar_val & 0xFFFF_FFFC) as u64;
-            (PciBarType::Io, phys_addr, !0x3u32)
-        };
-
-        // Read the size by writing all 1s and reading back
-        self.write_config_u32(offset, size_mask);
-        let size_val = self.read_config_u32(offset) & size_mask;
-        self.write_config_u32(offset, bar_val);
-
-        let size = if size_val == 0 {
-            return None;
-        } else {
-            (!size_val).wrapping_add(1) as u64
-        };
-
-        // Enable memory/IO decode
-        let cmd = self.read_config_u16(0x04);
-        if is_mmio {
-            self.write_config_u16(0x04, cmd | 0x2);
-        } else {
+            let cmd = self.read_config_u16(0x04);
+            self.write_config_u16(0x04, cmd & !0x1);
+            self.write_config_u32(offset, 0xFFFF_FFFC);
+            let size_bits = self.read_config_u32(offset) & 0xFFFF_FFFC;
+            self.write_config_u32(offset, bar_val);
             self.write_config_u16(0x04, cmd | 0x1);
-        }
+            if size_bits == 0 {
+                return None;
+            }
+            (
+                PciBarType::Io,
+                phys_addr,
+                (!size_bits).wrapping_add(1) as u64,
+            )
+        };
 
         Some(PciBar {
             idx,
@@ -479,9 +502,9 @@ impl PciDevice {
         let subsystem_vendor = (cfg.read_u16)(segment, bus, device, function, 0x2C);
         let subsystem_id = (cfg.read_u16)(segment, bus, device, function, 0x2E);
 
-        let class = class_raw >> 8;
+        let class = (class_raw >> 8) & 0x00FF_FFFF;
         let subclass = (class_raw >> 16) as u8;
-        let prog_if = (class_raw >> 24) as u8;
+        let prog_if = (class_raw >> 8) as u8;
         let multi_function = header_type & 0x80 != 0;
 
         Some(PciInfo {
