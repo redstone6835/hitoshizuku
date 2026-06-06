@@ -31,6 +31,10 @@ pub(crate) struct ManagedInterface {
     sockets: SocketSet<'static>,
     /// 每个 socket 的元数据（soft-close 标志）。
     pub(crate) meta: BTreeMap<SocketHandle, SocketMeta>,
+    /// 已完成握手的 TCP socket 队列（accept backlog）。
+    pending_accepted: Vec<SocketHandle>,
+    max_backlog: usize,
+    inode_counter: core::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     config: IfConfig,
     #[allow(dead_code)]
@@ -94,9 +98,16 @@ impl ManagedInterface {
             device,
             sockets: SocketSet::new(Vec::new()),
             meta: BTreeMap::new(),
+            pending_accepted: Vec::new(),
+            max_backlog: 128,
+            inode_counter: core::sync::atomic::AtomicU64::new(1),
             config,
             net_device,
         }
+
+    fn next_inode(&self) -> u64 {
+        self.inode_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
 
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
@@ -157,6 +168,45 @@ impl ManagedInterface {
     /// 移除默认 IPv4 路由。
     pub fn remove_default_route_v4(&mut self) {
         self.iface.routes_mut().remove_default_ipv4_route();
+    }
+
+    // ── 运行时配置（供 ioctl / netlink 写操作使用）─────────────────────
+
+    /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
+    pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) {
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
+            let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(
+                smoltcp::wire::Ipv4Cidr::new(ipv4_to_smoltcp(addr), prefix_len),
+            ));
+        });
+    }
+
+    /// 添加 IPv4 路由（smoltcp 仅支持默认路由）。
+    pub fn add_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
+        let prefix_len = mask_to_prefix_len(mask);
+        if prefix_len == 0 {
+            self.iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+                .ok();
+        } else {
+            // smoltcp 不支持非默认路由，降级为默认网关
+            self.iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+                .ok();
+            let _ = (dest, prefix_len);
+        }
+    }
+
+    /// 删除 IPv4 路由。
+    pub fn remove_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) {
+        let prefix_len = mask_to_prefix_len(mask);
+        if prefix_len == 0 {
+            self.iface.routes_mut().remove_default_ipv4_route();
+        }
+        let _ = (dest, prefix_len);
     }
 
     /// 返回邻居缓存中所有条目（ARP/NDP 表查询）。
@@ -389,6 +439,107 @@ impl ManagedInterface {
     ) -> &smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get(handle)
     }
+
+    // ── Socket 快照遍历（供 /proc/net/ 使用）──────────────────────────
+
+    /// 遍历所有非监听 TCP socket，产出快照列表。
+    pub fn tcp_connection_snapshots(
+        &self,
+        _iface_id: super::device::InterfaceId,
+    ) -> Vec<super::socket::TcpConnSnapshot> {
+        let mut out = Vec::new();
+        for (handle, socket) in self.sockets.iter() {
+            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
+                if self
+                    .meta
+                    .get(&handle)
+                    .map_or(true, |m| m.is_removed())
+                {
+                    continue;
+                }
+                use smoltcp::socket::tcp::State;
+                if matches!(tcp_socket.state(), State::Listen) {
+                    continue;
+                }
+                let local = tcp_socket
+                    .local_endpoint()
+                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                let remote = tcp_socket
+                    .remote_endpoint()
+                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                if let (Some(local), Some(remote)) = (local, remote) {
+                    out.push(super::socket::TcpConnSnapshot {
+                        local,
+                        remote,
+                        state: tcp_state_to_u8(tcp_socket.state()),
+                        tx_queue: tcp_socket.send_queue(),
+                        rx_queue: tcp_socket.recv_queue(),
+                        inode: self.next_inode(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// 遍历所有 UDP socket，产出快照列表。
+    pub fn udp_socket_snapshots(
+        &self,
+        _iface_id: super::device::InterfaceId,
+    ) -> Vec<super::socket::UdpSockSnapshot> {
+        let mut out = Vec::new();
+        for (handle, socket) in self.sockets.iter() {
+            if let smoltcp::socket::Socket::Udp(udp_socket) = socket {
+                if self
+                    .meta
+                    .get(&handle)
+                    .map_or(true, |m| m.is_removed())
+                {
+                    continue;
+                }
+                let listen_ep = udp_socket.endpoint();
+                if let Some(smoltcp_addr) = listen_ep.addr {
+                    let local_addr = match smoltcp_addr {
+                        smoltcp::wire::IpAddress::Ipv4(v4) => {
+                            crate::config::IpAddr::V4(crate::config::Ipv4Addr(v4.octets()))
+                        }
+                        smoltcp::wire::IpAddress::Ipv6(v6) => {
+                            crate::config::IpAddr::V6(crate::config::Ipv6Addr(v6.octets()))
+                        }
+                    };
+                    let local = crate::Endpoint {
+                        addr: local_addr,
+                        port: listen_ep.port,
+                    };
+                    out.push(super::socket::UdpSockSnapshot {
+                        local,
+                        remote: None,
+                        inode: self.next_inode(),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+// ── TCP 状态→Linux 数值映射 ─────────────────────────────────────────────────
+
+fn tcp_state_to_u8(state: smoltcp::socket::tcp::State) -> u8 {
+    use smoltcp::socket::tcp::State;
+    match state {
+        State::Closed => 7,
+        State::Listen => 10,
+        State::SynSent => 2,
+        State::SynReceived => 3,
+        State::Established => 1,
+        State::FinWait1 => 4,
+        State::FinWait2 => 5,
+        State::CloseWait => 8,
+        State::TimeWait => 6,  // TCP_TIME_WAIT
+        State::Closing => 11,   // TCP_CLOSING
+        State::LastAck => 9,
+    }
 }
 
 // ── 类型转换 ─────────────────────────────────────────────────────────────────
@@ -421,4 +572,8 @@ fn cidr_to_smoltcp(cidr: &CidrAddress) -> IpCidr {
 fn generate_seed(id: InterfaceId) -> u64 {
     let raw = id.raw() as u64;
     raw.wrapping_mul(6364136223846793005).wrapping_add(1)
+}
+
+fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
+    u32::from_be_bytes(mask.0).leading_ones() as u8
 }

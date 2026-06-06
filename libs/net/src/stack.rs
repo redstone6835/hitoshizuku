@@ -708,6 +708,42 @@ impl NetStack {
         Ok(())
     }
 
+    // ── 运行时配置（供 ioctl / netlink 写操作使用）──────────────────────
+
+    /// 设置指定接口的 IPv4 地址。
+    pub fn set_iface_ipv4_addr(
+        &self, id: InterfaceId, addr: crate::Ipv4Addr, prefix: u8,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_ipv4_addr(addr, prefix);
+        Ok(())
+    }
+
+    /// 在指定接口上添加 IPv4 路由。
+    pub fn add_route(
+        &self, id: InterfaceId, dest: crate::Ipv4Addr, mask: crate::Ipv4Addr,
+        gw: crate::Ipv4Addr,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.add_route_v4(dest, mask, gw);
+        Ok(())
+    }
+
+    /// 在指定接口上删除 IPv4 路由。
+    pub fn remove_route(
+        &self, id: InterfaceId, dest: crate::Ipv4Addr, mask: crate::Ipv4Addr,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.remove_route_v4(dest, mask);
+        Ok(())
+    }
+
     // ── 邻居表查询 ───────────────────────────────────────────────────────
 
     /// 查询指定接口的 ARP/NDP 邻居表。
@@ -1132,6 +1168,67 @@ impl NetStack {
 
     // ── 内部辅助 ─────────────────────────────────────────────────────────
 
+    /// 按目标地址做最长前缀匹配选择出口接口（跳过 loopback）。
+    pub fn resolve_iface_for_remote(&self, remote: &crate::IpAddr) -> Option<InterfaceId> {
+        let table = self.interfaces.read();
+        let mut best: Option<(InterfaceId, u8)> = None;
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            if managed.name() == "lo" {
+                continue;
+            }
+            for cidr in &managed.config().addresses {
+                if ip_matches_cidr(remote, cidr) {
+                    if best.map_or(true, |(_, p)| cidr.prefix_len > p) {
+                        best = Some((id, cidr.prefix_len));
+                    }
+                }
+            }
+        }
+        if let Some((id, _)) = best {
+            return Some(id);
+        }
+        // 回退：第一个非 lo 接口
+        table
+            .iter()
+            .find(|&(_, lock)| lock.lock().name() != "lo")
+            .map(|(&id, _)| id)
+    }
+
+    // ── Socket 快照查询（供 /proc/net/ 使用）──────────────────────────────
+
+    /// 快照所有接口上所有非监听 TCP 连接的 socket 信息。
+    pub fn snapshot_tcp_connections(
+        &self,
+    ) -> Vec<(InterfaceId, Vec<crate::socket::TcpConnSnapshot>)> {
+        let table = self.interfaces.read();
+        let mut out = Vec::new();
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            let snapshots = managed.tcp_connection_snapshots(id);
+            if !snapshots.is_empty() {
+                out.push((id, snapshots));
+            }
+        }
+        out
+    }
+
+    /// 快照所有接口上所有 UDP socket 的绑定信息。
+    pub fn snapshot_udp_sockets(
+        &self,
+    ) -> Vec<(InterfaceId, Vec<crate::socket::UdpSockSnapshot>)> {
+        let table = self.interfaces.read();
+        let mut out = Vec::new();
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            let snapshots = managed.udp_socket_snapshots(id);
+            if !snapshots.is_empty() {
+                out.push((id, snapshots));
+            }
+        }
+        out
+    }
+
     fn default_iface_id(&self) -> Result<InterfaceId, NetError> {
         let table = self.interfaces.read();
         let mut fallback = None;
@@ -1228,7 +1325,7 @@ fn endpoint_to_smoltcp(ep: &Endpoint) -> IpEndpoint {
     IpEndpoint::new(addr, ep.port)
 }
 
-fn endpoint_from_smoltcp(ep: IpEndpoint) -> Endpoint {
+pub(crate) fn endpoint_from_smoltcp(ep: IpEndpoint) -> Endpoint {
     let addr = match ep.addr {
         IpAddress::Ipv4(v4) => {
             let o = v4.octets();
@@ -1254,6 +1351,21 @@ fn tcp_state_to_socket_state(state: smoltcp::socket::tcp::State) -> SocketState 
 }
 
 use core::sync::atomic::{AtomicU16, Ordering};
+
+fn ip_matches_cidr(addr: &crate::IpAddr, cidr: &crate::config::CidrAddress) -> bool {
+    match (addr, &cidr.addr) {
+        (crate::IpAddr::V4(a), crate::IpAddr::V4(c)) => {
+            if cidr.prefix_len == 0 {
+                return true;
+            }
+            let mask = !0u32 << (32 - cidr.prefix_len);
+            let a_int = u32::from_be_bytes(a.0);
+            let c_int = u32::from_be_bytes(c.0);
+            (a_int & mask) == (c_int & mask)
+        }
+        _ => false,
+    }
+}
 
 fn pick_ephemeral_port() -> u16 {
     static PORT: AtomicU16 = AtomicU16::new(49152);

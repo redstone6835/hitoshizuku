@@ -172,6 +172,7 @@ fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(PnpError::NoDevtmpfs)?;
     ops.bind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
+>>>>>>> dad207b (feat(sysfs): DevNodeSpec 新增 NetDev 变体，NetFunction 返回 sysfs class 节点)
 }
 
 fn pnp_unbind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {

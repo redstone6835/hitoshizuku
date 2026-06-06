@@ -478,6 +478,24 @@ impl InodeOps for ProcNetDirOps {
                 1,
                 Arc::new(ProcNetStubOps("unix")),
             )),
+            "arp" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO + 5,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetStubOps("arp")),
+            )),
+            "sockstat" => Ok(mk_inode(
+                self.fs_id,
+                &self.weak_sb,
+                NET_DEV_INO + 6,
+                FileType::Regular,
+                0o444,
+                1,
+                Arc::new(ProcNetStubOps("sockstat")),
+            )),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -513,6 +531,16 @@ impl InodeOps for ProcNetDirOps {
                 DirEntry {
                     ino: NET_DEV_INO + 4,
                     name: SmallStr::new("unix"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 5,
+                    name: SmallStr::new("arp"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 6,
+                    name: SmallStr::new("sockstat"),
                     kind: FileType::Regular,
                 },
             ],
@@ -555,10 +583,12 @@ struct ProcNetStubFile(&'static str);
 impl FileOps for ProcNetStubFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let content = match self.0 {
-            "tcp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
-            "udp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
+            "tcp" => render_proc_net_tcp(),
+            "udp" => render_proc_net_udp(),
             "route" => render_proc_net_route(),
-            "unix" => "Num       RefCount Protocol Flags    Type St Inode Path\n".into(),
+            "unix" => render_proc_net_unix(),
+            "arp" => render_proc_net_arp(),
+            "sockstat" => render_proc_net_sockstat(),
             _ => String::new(),
         };
         let offset = offset as usize;
@@ -631,6 +661,186 @@ fn render_proc_net_route() -> String {
             }
         }
     }
+    out
+}
+
+fn render_proc_net_tcp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    let connections = net::stack().snapshot_tcp_connections();
+    let mut slot: u64 = 0;
+    for (_iface_id, conns) in &connections {
+        for c in conns {
+            let local_hex = endpoint_to_hex(&c.local);
+            let remote_hex = endpoint_to_hex(&c.remote);
+            let _ = writeln!(
+                out,
+                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
+                slot, local_hex, remote_hex, c.state,
+                c.tx_queue, c.rx_queue,
+                0u8, 0u32, 0u32, 0u32, 0u32, c.inode,
+            );
+            slot += 1;
+        }
+    }
+    out
+}
+
+fn render_proc_net_udp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    let sockets = net::stack().snapshot_udp_sockets();
+    let mut slot: u64 = 0;
+    for (_iface_id, socks) in &sockets {
+        for s in socks {
+            let local_hex = endpoint_to_hex(&s.local);
+            let remote_hex = match &s.remote {
+                Some(ep) => endpoint_to_hex(ep),
+                None => "00000000:0000".into(),
+            };
+            let _ = writeln!(
+                out,
+                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
+                slot, local_hex, remote_hex,
+                7u8, // ESTABLISHED
+                0usize, 0usize, 0u8, 0u32, 0u32, 0u32, 0u32, s.inode,
+            );
+            slot += 1;
+        }
+    }
+    out
+}
+
+fn endpoint_to_hex(ep: &net::Endpoint) -> alloc::string::String {
+    use alloc::fmt::Write;
+    let mut s = alloc::string::String::new();
+    match ep.addr {
+        net::IpAddr::V4(v4) => {
+            let ip = u32::from_be_bytes(v4.0);
+            let _ = write!(s, "{:08X}:{:04X}", ip, ep.port);
+        }
+        net::IpAddr::V6(_v6) => {
+            let _ = write!(s, "00000000000000000000000000000000:{:04X}", ep.port);
+        }
+    }
+    s
+}
+
+fn render_proc_net_unix() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Num       RefCount Protocol Flags    Type St Inode Path"
+    );
+    let sockets = socket::snapshot_sockets();
+    for s in &sockets {
+        let (typ, state) = unix_socket_info(s);
+        let path = match s.local_address() {
+            socket::UnixAddress::Path { display, .. } => {
+                core::str::from_utf8(&display).unwrap_or("").to_string()
+            }
+            socket::UnixAddress::Abstract(name) => {
+                let mut s = String::with_capacity(name.len() + 1);
+                s.push('@');
+                if let Ok(text) = core::str::from_utf8(&name) {
+                    s.push_str(text);
+                }
+                s
+            }
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "{:016X}: {:08X} {:08X} {:08X} {:04X} {:02X} {:>8} {}",
+            s.id(),
+            2u32, // RefCount (至少 1: fd 引用 + snapshot 临时引用)
+            0u32, // Protocol
+            0u32, // Flags
+            typ, state, s.id(), path,
+        );
+    }
+    out
+}
+
+fn unix_socket_info(s: &socket::Socket) -> (u16, u8) {
+    let typ = match s.socket_type() {
+        socket::SocketType::Stream => 1u16,
+        socket::SocketType::Datagram => 2u16,
+        socket::SocketType::Sequenced => 5u16,
+        _ => 0u16,
+    };
+    // 近似状态：通过 socket 是否可读写判断
+    let readiness = s.readiness();
+    let state = if readiness.bits() == 0 { 1u8 } else { 3u8 }; // SS_UNCONNECTED or SS_CONNECTED
+    (typ, state)
+}
+
+fn render_proc_net_arp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "IP address       HW type     Flags       HW address            Mask     Device"
+    );
+    let neighbors = net::stack().all_neighbors();
+    for (iface_id, entries) in &neighbors {
+        let iface_name = net::stack()
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|i| i.id == *iface_id)
+            .map(|i| i.name)
+            .unwrap_or_else(|| alloc::string::String::from("?"));
+        for entry in entries {
+            let ip_str = match entry.ip_addr {
+                net::IpAddr::V4(v4) => {
+                    let mut s = alloc::string::String::new();
+                    let _ = write!(s, "{}.{}.{}.{}", v4.0[0], v4.0[1], v4.0[2], v4.0[3]);
+                    s
+                }
+                net::IpAddr::V6(_) => alloc::string::String::from("::1"),
+            };
+            let _ = writeln!(
+                out,
+                "{:<16} 0x1         0x2         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
+                ip_str,
+                entry.hw_addr[0], entry.hw_addr[1], entry.hw_addr[2],
+                entry.hw_addr[3], entry.hw_addr[4], entry.hw_addr[5],
+                iface_name,
+            );
+        }
+    }
+    out
+}
+
+fn render_proc_net_sockstat() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let tcp_total: usize = net::stack()
+        .snapshot_tcp_connections()
+        .iter()
+        .map(|(_, v)| v.len())
+        .sum();
+    let udp_total: usize = net::stack()
+        .snapshot_udp_sockets()
+        .iter()
+        .map(|(_, v)| v.len())
+        .sum();
+    let unix_total = socket::snapshot_sockets().len();
+    let total = tcp_total + udp_total + unix_total;
+    let _ = writeln!(out, "sockets: used {}", total);
+    let _ = writeln!(out, "TCP: inuse {} orphan 0 tw 0 alloc {} mem 0", tcp_total, tcp_total);
+    let _ = writeln!(out, "UDP: inuse {} mem 0", udp_total);
+    let _ = writeln!(out, "RAW: inuse 0");
+    let _ = writeln!(out, "FRAG: inuse 0 memory 0");
     out
 }
 

@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use errno::Errno;
 use net::config::{CidrAddress, Gateway, IpAddr};
 use net::stack::InterfaceSnapshot;
-use sched::{Task, TaskState, WaitQueue};
+use sched::{Task, WaitQueue};
 use spin::Mutex;
 
 use crate::error::{VfsError, VfsResult};
@@ -30,7 +30,6 @@ use crate::file::{DirEntry, FileOps, PollEvents};
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
-const AF_NETLINK: u16 = 16;
 
 const RTM_NEWLINK: u16 = 16;
 const RTM_DELLINK: u16 = 17;
@@ -100,94 +99,29 @@ impl NetlinkSocketFileOps {
         }
     }
 
-    pub fn bind(&self, addr: &[u8]) -> Result<(), Errno> {
-        if addr.len() < 2 {
-            return Err(Errno::EINVAL);
-        }
-        let family = u16::from_ne_bytes([addr[0], addr[1]]);
-        if family != AF_NETLINK {
-            return Err(Errno::EAFNOSUPPORT);
-        }
+    pub fn bind(&self, _addr: &[u8]) -> Result<(), Errno> {
         self.bound.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn recv(
-        &self,
-        buf: &mut [u8],
-        nonblocking: bool,
-        deadline_ns: Option<u64>,
-    ) -> Result<usize, Errno> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            let mut rx = self.rx_buf.lock();
-            if let Some(mut msg) = rx.pop_front() {
-                let len = msg.len().min(buf.len());
-                buf[..len].copy_from_slice(&msg[..len]);
-                if len < msg.len() {
-                    let tail = msg.split_off(len);
-                    rx.push_front(tail);
-                }
-                return Ok(len);
-            }
-            drop(rx);
-            if self.nonblock.load(Ordering::Relaxed) || nonblocking {
-                return Err(Errno::EAGAIN);
-            }
-            self.wait_with_deadline(deadline_ns)?;
-        }
-    }
-
-    fn wait_with_deadline(&self, deadline: Option<u64>) -> Result<(), Errno> {
-        let task = sched::current_task();
-        if has_unblocked_signal(&task) {
-            return Err(Errno::EINTR);
-        }
-        if deadline_expired(deadline) {
-            return Err(Errno::EAGAIN);
-        }
-        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
-        let _ = task.cas_state(TaskState::Runnable, TaskState::Sleeping);
-        self.wait_queue.enqueue(&task);
-        let armed = deadline
-            .map(|deadline| sched::register_sleep_deadline(&task, deadline))
-            .unwrap_or(false);
-        if !self.rx_buf.lock().is_empty() {
-            self.wait_queue.remove(&task);
-            if armed {
-                sched::cancel_sleep_deadline(&task);
-            }
-            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
-            return Ok(());
-        }
-        if deadline_expired(deadline) {
-            self.wait_queue.remove(&task);
-            if armed {
-                sched::cancel_sleep_deadline(&task);
-            }
-            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
-            return Err(Errno::EAGAIN);
-        }
-        sched::schedule_once(0);
-        self.wait_queue.remove(&task);
-        if armed {
-            sched::cancel_sleep_deadline(&task);
-        }
-        if has_unblocked_signal(&task) {
-            return Err(Errno::EINTR);
-        }
-        if deadline_expired(deadline) {
-            return Err(Errno::EAGAIN);
-        }
         Ok(())
     }
 }
 
 impl FileOps for NetlinkSocketFileOps {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        self.recv(buf, false, None).map_err(errno_to_vfs)
+        loop {
+            let mut rx = self.rx_buf.lock();
+            if let Some(msg) = rx.pop_front() {
+                let len = msg.len().min(buf.len());
+                buf[..len].copy_from_slice(&msg[..len]);
+                return Ok(len);
+            }
+            drop(rx);
+            if self.nonblock.load(Ordering::Relaxed) {
+                return Err(VfsError::WouldBlock);
+            }
+            let task = sched::current_task();
+            self.wait_queue.enqueue(&task);
+            sched::schedule_once(sched::now_ns_public());
+        }
     }
 
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
@@ -199,7 +133,8 @@ impl FileOps for NetlinkSocketFileOps {
         let pid = u32::from_ne_bytes([buf[12], buf[13], buf[14], buf[15]]);
 
         let ifaces = net::stack().snapshot_interfaces();
-        let responses = dispatch_message(msg_type, seq, pid, &ifaces);
+        let payload = if buf.len() > 16 { &buf[16..] } else { &[] };
+        let responses = dispatch_message(msg_type, seq, pid, &ifaces, payload);
 
         let mut rx = self.rx_buf.lock();
         let mut combined = Vec::new();
@@ -212,12 +147,12 @@ impl FileOps for NetlinkSocketFileOps {
         Ok(buf.len())
     }
 
-    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
+    fn readdir(
+        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> {
-        Ok(())
-    }
+    fn sync(&self) -> VfsResult<()> { Ok(()) }
     fn poll(&self, interest: PollEvents) -> PollEvents {
         let mut events = PollEvents(0);
         if interest.has(PollEvents::POLLIN) && !self.rx_buf.lock().is_empty() {
@@ -235,44 +170,153 @@ impl FileOps for NetlinkSocketFileOps {
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
         self.wait_queue.remove(task);
     }
-    fn is_seekable(&self) -> bool {
-        false
-    }
+    fn is_seekable(&self) -> bool { false }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 // ── 创建入口 ─────────────────────────────────────────────────────────────────
 
-pub fn create_netlink_socket(protocol: u32, nonblock: bool) -> NetlinkSocketFileOps {
+pub fn create_netlink_socket(
+    protocol: u32,
+    nonblock: bool,
+) -> NetlinkSocketFileOps {
     NetlinkSocketFileOps::new(protocol, nonblock)
 }
 
 // ── 消息分派 ─────────────────────────────────────────────────────────────────
 
 fn dispatch_message(
-    msg_type: u16,
-    seq: u32,
-    pid: u32,
-    ifaces: &[InterfaceSnapshot],
+    msg_type: u16, seq: u32, pid: u32, ifaces: &[InterfaceSnapshot], payload: &[u8],
 ) -> Vec<Vec<u8>> {
     match msg_type {
         RTM_GETLINK => handle_getlink(seq, pid, ifaces),
         RTM_GETADDR => handle_getaddr(seq, pid, ifaces),
         RTM_GETROUTE => handle_getroute(seq, pid, ifaces),
         RTM_GETNEIGH => handle_getneigh(seq, pid, ifaces),
-        RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE | RTM_DELROUTE => {
-            vec![build_nlmsg_error(seq, 0)]
-        }
-        _ => vec![build_nlmsg_error(seq, -(95i32))], // ENOTSUP
+        RTM_NEWADDR => handle_newaddr(seq, ifaces, payload),
+        RTM_DELADDR => vec![build_nlmsg_error(seq, 0)], // no-op
+        RTM_NEWROUTE => handle_newroute(seq, ifaces, payload),
+        RTM_DELROUTE => vec![build_nlmsg_error(seq, 0)], // no-op
+        RTM_NEWLINK | RTM_DELLINK => vec![build_nlmsg_error(seq, 0)], // no-op
+        _ => vec![build_nlmsg_error(seq, -(95i32))],
     }
+}
+
+fn handle_newaddr(seq: u32, ifaces: &[InterfaceSnapshot], payload: &[u8]) -> Vec<Vec<u8>> {
+    // ifaddrmsg: family(1) + pad(1) + prefixlen(1) + flags(1) + scope(1) + index(4) = 8 bytes
+    if payload.len() < 8 {
+        return vec![build_nlmsg_error(seq, -(22))]; // EINVAL
+    }
+    let prefix_len = payload[1];
+    let if_index = i32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let iface = ifaces.iter().find(|i| i.id.raw() as i32 == if_index - 1)
+        .or_else(|| ifaces.iter().find(|i| i.name != "lo"))
+        .or_else(|| ifaces.first());
+    match (iface, parse_nlattr_ipv4(&payload[8..])) {
+        (Some(iface), Some(addr)) => {
+            match net::stack().set_iface_ipv4_addr(iface.id, addr, prefix_len) {
+                Ok(()) => vec![build_nlmsg_error(seq, 0)],
+                Err(e) => vec![build_nlmsg_error(seq, -map_net_error(e))],
+            }
+        }
+        _ => vec![build_nlmsg_error(seq, -(19))], // ENODEV
+    }
+}
+
+fn handle_newroute(seq: u32, ifaces: &[InterfaceSnapshot], payload: &[u8]) -> Vec<Vec<u8>> {
+    // rtmsg: family(1) + dst_len(1) + src_len(1) + tos(1) + table(1) + protocol(1) +
+    //         scope(1) + type(1) + flags(4) = 12 bytes
+    if payload.len() < 12 {
+        return vec![build_nlmsg_error(seq, -(22))];
+    }
+    let dst_len = payload[1];
+    let (dest, gw) = parse_route_attrs(&payload[12..]);
+    // 使用 rtmsg.dst_len 作为前缀长度
+    let mask = match dest {
+        Some(d) if dst_len > 0 => {
+            let prefix = dst_len.min(32);
+            d
+        }
+        _ => return vec![build_nlmsg_error(seq, -(22))],
+    };
+    let target = ifaces.iter().find(|i| i.name != "lo").or(ifaces.first());
+    if let Some(iface) = target {
+        if let Some(gw) = gw {
+            let full_mask = net::Ipv4Addr(u32::MAX
+                .checked_shl(32 - dst_len as u32)
+                .unwrap_or(0)
+                .to_be_bytes());
+            match net::stack().add_route(iface.id, dest?, full_mask, gw) {
+                Ok(()) => vec![build_nlmsg_error(seq, 0)],
+                Err(e) => vec![build_nlmsg_error(seq, -map_net_error(e))],
+            }
+        } else {
+            vec![build_nlmsg_error(seq, -(22))]
+        }
+    } else {
+        vec![build_nlmsg_error(seq, -(19))]
+    }
+}
+
+fn map_net_error(e: net::NetError) -> i32 {
+    match e {
+        net::NetError::InterfaceNotFound => 19,  // ENODEV
+        net::NetError::AddressInUse => 98,        // EADDRINUSE
+        _ => 22,                                   // EINVAL
+    }
+}
+
+fn parse_nlattr_ipv4(attrs: &[u8]) -> Option<net::Ipv4Addr> {
+    let mut i = 0;
+    while i + 4 <= attrs.len() {
+        let len = u16::from_ne_bytes([attrs[i], attrs[i + 1]]) as usize;
+        if len < 4 || i + len > attrs.len() {
+            break;
+        }
+        let atype = u16::from_ne_bytes([attrs[i + 2], attrs[i + 3]]);
+        if (atype == 1 || atype == 2) && len >= 8 {
+            return Some(net::Ipv4Addr([
+                attrs[i + 4],
+                attrs[i + 5],
+                attrs[i + 6],
+                attrs[i + 7],
+            ]));
+        }
+        i += (len + 3) & !3;
+    }
+    None
+}
+
+fn parse_route_attrs(payload: &[u8]) -> (Option<net::Ipv4Addr>, Option<net::Ipv4Addr>) {
+    let mut dest = None;
+    let mut gw = None;
+    let mut i = 8;
+    while i + 4 <= payload.len() {
+        let len = u16::from_ne_bytes([payload[i], payload[i + 1]]) as usize;
+        if len < 4 || i + len > payload.len() {
+            break;
+        }
+        let atype = u16::from_ne_bytes([payload[i + 2], payload[i + 3]]);
+        if len >= 8 {
+            let ip =
+                net::Ipv4Addr([payload[i + 4], payload[i + 5], payload[i + 6], payload[i + 7]]);
+            match atype {
+                1 => dest = Some(ip),   // RTA_DST
+                5 => gw = Some(ip),     // RTA_GATEWAY
+                _ => {}
+            }
+        }
+        i += (len + 3) & !3;
+    }
+    (dest, gw)
 }
 
 // ── GETLINK handler ─────────────────────────────────────────────────────────
 
-fn handle_getlink(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u8>> {
+fn handle_getlink(
+    seq: u32, pid: u32, ifaces: &[InterfaceSnapshot],
+) -> Vec<Vec<u8>> {
     let mut msgs = Vec::new();
     for (idx, iface) in ifaces.iter().enumerate() {
         msgs.push(build_ifinfomsg(
@@ -281,8 +325,7 @@ fn handle_getlink(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u
             &iface.name,
             &iface.mac,
             iface.mtu,
-            seq,
-            pid,
+            seq, pid,
         ));
     }
     msgs.push(build_nlmsg_done(seq));
@@ -291,7 +334,9 @@ fn handle_getlink(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u
 
 // ── GETADDR handler ─────────────────────────────────────────────────────────
 
-fn handle_getaddr(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u8>> {
+fn handle_getaddr(
+    seq: u32, pid: u32, ifaces: &[InterfaceSnapshot],
+) -> Vec<Vec<u8>> {
     let mut msgs = Vec::new();
     for (idx, iface) in ifaces.iter().enumerate() {
         let if_index = idx as i32 + 1;
@@ -305,7 +350,9 @@ fn handle_getaddr(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u
 
 // ── GETROUTE handler ────────────────────────────────────────────────────────
 
-fn handle_getroute(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u8>> {
+fn handle_getroute(
+    seq: u32, pid: u32, ifaces: &[InterfaceSnapshot],
+) -> Vec<Vec<u8>> {
     let mut msgs = Vec::new();
     for (idx, iface) in ifaces.iter().enumerate() {
         let if_index = idx as i32 + 1;
@@ -328,7 +375,9 @@ fn handle_getroute(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<
 
 // ── GETNEIGH handler ───────────────────────────────────────────────────────
 
-fn handle_getneigh(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<u8>> {
+fn handle_getneigh(
+    seq: u32, pid: u32, ifaces: &[InterfaceSnapshot],
+) -> Vec<Vec<u8>> {
     const RTM_NEWNEIGH: u16 = 28;
     const NLM_F_MULTI: u16 = 0x02;
     const NDA_DST: u16 = 1;
@@ -339,16 +388,13 @@ fn handle_getneigh(seq: u32, pid: u32, ifaces: &[InterfaceSnapshot]) -> Vec<Vec<
     let mut msgs = Vec::new();
     let neighbors = net::stack().all_neighbors();
     for (iface_id, entries) in &neighbors {
-        let if_index = ifaces
-            .iter()
-            .position(|i| i.id == *iface_id)
-            .map(|i| i as i32 + 1)
-            .unwrap_or(1);
+        let if_index = ifaces.iter().position(|i| i.id == *iface_id)
+            .map(|i| i as i32 + 1).unwrap_or(1);
         for entry in entries {
             let mut payload = Vec::new();
             // struct ndmsg (12 bytes)
             payload.push(AF_INET); // ndm_family
-            payload.push(0); // ndm_pad1
+            payload.push(0);       // ndm_pad1
             payload.extend_from_slice(&0u16.to_ne_bytes()); // ndm_pad2
             payload.extend_from_slice(&(if_index as i32).to_ne_bytes()); // ndm_ifindex
             payload.extend_from_slice(&NUD_REACHABLE.to_ne_bytes()); // ndm_state
@@ -423,13 +469,8 @@ fn build_nlmsg_error(seq: u32, error: i32) -> Vec<u8> {
 // ── build_ifinfomsg ─────────────────────────────────────────────────────────
 
 fn build_ifinfomsg(
-    index: i32,
-    flags: u32,
-    name: &str,
-    mac: &[u8; 6],
-    mtu: usize,
-    seq: u32,
-    pid: u32,
+    index: i32, flags: u32, name: &str, mac: &[u8; 6], mtu: usize,
+    seq: u32, pid: u32,
 ) -> Vec<u8> {
     let mut payload = Vec::with_capacity(128);
     // struct ifinfomsg (16 bytes)
@@ -451,7 +492,9 @@ fn build_ifinfomsg(
 
 // ── build_ifaddrmsg ─────────────────────────────────────────────────────────
 
-fn build_ifaddrmsg(index: i32, cidr: &CidrAddress, seq: u32, pid: u32) -> Vec<u8> {
+fn build_ifaddrmsg(
+    index: i32, cidr: &CidrAddress, seq: u32, pid: u32,
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(64);
     let (family, addr_bytes): (u8, Vec<u8>) = match cidr.addr {
         IpAddr::V4(v4) => (AF_INET, v4.0.to_vec()),
@@ -472,7 +515,9 @@ fn build_ifaddrmsg(index: i32, cidr: &CidrAddress, seq: u32, pid: u32) -> Vec<u8
 
 // ── build_route_connected (on-link 路由) ────────────────────────────────────
 
-fn build_route_connected(if_index: i32, cidr: &CidrAddress, seq: u32, pid: u32) -> Vec<u8> {
+fn build_route_connected(
+    if_index: i32, cidr: &CidrAddress, seq: u32, pid: u32,
+) -> Vec<u8> {
     let (family, dst_bytes): (u8, Vec<u8>) = match cidr.addr {
         IpAddr::V4(v4) => (AF_INET, v4.0.to_vec()),
         IpAddr::V6(v6) => (AF_INET6, v6.0.to_vec()),
@@ -481,14 +526,14 @@ fn build_route_connected(if_index: i32, cidr: &CidrAddress, seq: u32, pid: u32) 
 
     let mut payload = Vec::with_capacity(64);
     // struct rtmsg (12 bytes)
-    payload.push(family); // rtm_family
+    payload.push(family);          // rtm_family
     payload.push(cidr.prefix_len); // rtm_dst_len
-    payload.push(0); // rtm_src_len
-    payload.push(0); // rtm_tos
-    payload.push(RT_TABLE_MAIN); // rtm_table
-    payload.push(RTPROT_KERNEL); // rtm_protocol
-    payload.push(RT_SCOPE_LINK); // rtm_scope
-    payload.push(RTN_UNICAST); // rtm_type
+    payload.push(0);               // rtm_src_len
+    payload.push(0);               // rtm_tos
+    payload.push(RT_TABLE_MAIN);   // rtm_table
+    payload.push(RTPROT_KERNEL);   // rtm_protocol
+    payload.push(RT_SCOPE_LINK);   // rtm_scope
+    payload.push(RTN_UNICAST);     // rtm_type
     payload.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
 
     put_nlattr(&mut payload, RTA_DST, &network);
@@ -499,7 +544,9 @@ fn build_route_connected(if_index: i32, cidr: &CidrAddress, seq: u32, pid: u32) 
 
 // ── build_route_default (默认网关路由) ──────────────────────────────────────
 
-fn build_route_default(if_index: i32, gw: &Gateway, seq: u32, pid: u32) -> Vec<u8> {
+fn build_route_default(
+    if_index: i32, gw: &Gateway, seq: u32, pid: u32,
+) -> Vec<u8> {
     let (family, gw_bytes): (u8, Vec<u8>) = match gw {
         Gateway::V4(v4) => (AF_INET, v4.0.to_vec()),
         Gateway::V6(v6) => (AF_INET6, v6.0.to_vec()),
@@ -511,9 +558,9 @@ fn build_route_default(if_index: i32, gw: &Gateway, seq: u32, pid: u32) -> Vec<u
     let mut payload = Vec::with_capacity(48);
     // struct rtmsg
     payload.push(family);
-    payload.push(0); // rtm_dst_len = 0 (默认路由)
-    payload.push(0); // rtm_src_len
-    payload.push(0); // rtm_tos
+    payload.push(0);                  // rtm_dst_len = 0 (默认路由)
+    payload.push(0);                  // rtm_src_len
+    payload.push(0);                  // rtm_tos
     payload.push(RT_TABLE_MAIN);
     payload.push(RTPROT_KERNEL);
     payload.push(RT_SCOPE_UNIVERSE);
@@ -542,25 +589,4 @@ fn mask_network(addr: &[u8], prefix_len: u8) -> Vec<u8> {
         }
     }
     out
-}
-
-fn deadline_expired(deadline: Option<u64>) -> bool {
-    deadline.is_some_and(|deadline| sched::now_ns_public() >= deadline)
-}
-
-fn has_unblocked_signal(task: &Arc<Task>) -> bool {
-    let blocked = task.signal.blocked_snapshot().raw();
-    let pending =
-        task.signal.pending_snapshot().raw() | task.shared_signal().pending_snapshot().raw();
-    (pending & !blocked) != 0
-}
-
-fn errno_to_vfs(errno: Errno) -> VfsError {
-    match errno {
-        Errno::EAGAIN => VfsError::WouldBlock,
-        Errno::EINTR => VfsError::Interrupted,
-        Errno::EINVAL | Errno::EFAULT => VfsError::InvalidArgument,
-        Errno::EAFNOSUPPORT => VfsError::InvalidArgument,
-        _ => VfsError::Io,
-    }
 }

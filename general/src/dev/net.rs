@@ -46,7 +46,10 @@ impl DeviceFunction for NetFunction {
     }
 
     fn devnode(&self) -> Option<DevNodeSpec> {
-        None
+        Some(DevNodeSpec::NetDev {
+            name: self.dev_name.clone(),
+            iface_id: self.dev.id().raw(),
+        })
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -106,14 +109,12 @@ pub fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         SIOCGIFINDEX => ioctl_gifindex(arg),
         SIOCGIFTXQLEN => ioctl_giftxqlen(arg),
         SIOCGIFBRDADDR => ioctl_gifbrdaddr(arg),
-        // 设置类 ioctl：当前只读栈，返回 EPERM（与 Linux 非 root 行为一致）
-        // TODO: 在 ManagedInterface 中引入可变 runtime config 以支持运行时修改
-        SIOCSIFFLAGS | SIOCSIFADDR | SIOCSIFNETMASK | SIOCSIFMTU | SIOCSIFTXQLEN => {
-            Err(Errno::EPERM)
-        }
-        // 路由管理：尚未实现路由表修改
-        // TODO: 阶段 3 实现路由表管理
-        SIOCADDRT | SIOCDELRT => Err(Errno::EPERM),
+        SIOCSIFFLAGS => Err(Errno::EPERM), // smoltcp 不支持接口 UP/DOWN 切换
+        SIOCSIFADDR => ioctl_sifaddr(arg),
+        SIOCSIFNETMASK => ioctl_sifnetmask(arg),
+        SIOCSIFMTU | SIOCSIFTXQLEN => Err(Errno::EPERM),
+        SIOCADDRT => ioctl_addrt(arg),
+        SIOCDELRT => ioctl_delrt(arg),
         // ARP 邻居表查询：通过 mygo-smoltcp 暴露的 neighbor_cache 获取真实数据
         SIOCGARP => ioctl_get_arp(arg),
         SIOCSARP | SIOCDARP => Err(Errno::EPERM),
@@ -338,4 +339,94 @@ fn ioctl_gifbrdaddr(arg: usize) -> Result<usize, Errno> {
     }
     write_ifreq_data(arg, IFREQ_DATA_OFFSET, &sa)?;
     Ok(0)
+}
+
+// ── 设置类 ioctl 实现 ─────────────────────────────────────────────────────
+
+fn ioctl_sifaddr(arg: usize) -> Result<usize, Errno> {
+    let name = read_ifreq_name(arg)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let mut sa = [0u8; 16];
+    copy_from_user(arg + IFNAMSIZ, &mut sa).map_err(|_| Errno::EFAULT)?;
+    if sa[0] != 2 {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let addr = net::Ipv4Addr([sa[4], sa[5], sa[6], sa[7]]);
+    let prefix = iface
+        .addresses
+        .iter()
+        .find(|c| matches!(c.addr, net::IpAddr::V4(_)))
+        .map(|c| c.prefix_len)
+        .unwrap_or(24);
+    net::stack()
+        .set_iface_ipv4_addr(iface.id, addr, prefix)
+        .map_err(|_| Errno::ENODEV)?;
+    Ok(0)
+}
+
+fn ioctl_sifnetmask(arg: usize) -> Result<usize, Errno> {
+    let name = read_ifreq_name(arg)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let mut sa = [0u8; 16];
+    copy_from_user(arg + IFNAMSIZ, &mut sa).map_err(|_| Errno::EFAULT)?;
+    if sa[0] != 2 {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    let mask = net::Ipv4Addr([sa[4], sa[5], sa[6], sa[7]]);
+    let prefix = mask_to_prefix_len_bytes(&mask.0);
+    let cidr = iface
+        .addresses
+        .iter()
+        .find(|c| matches!(c.addr, net::IpAddr::V4(_)))
+        .ok_or(Errno::EADDRNOTAVAIL)?;
+    if let net::IpAddr::V4(v4) = cidr.addr {
+        net::stack()
+            .set_iface_ipv4_addr(iface.id, v4, prefix)
+            .map_err(|_| Errno::ENODEV)?;
+    }
+    Ok(0)
+}
+
+fn ioctl_addrt(arg: usize) -> Result<usize, Errno> {
+    let mut buf = [0u8; 64];
+    copy_from_user(arg, &mut buf).map_err(|_| Errno::EFAULT)?;
+    let dest = extract_ipv4(&buf, 8);
+    let gw = extract_ipv4(&buf, 24);
+    let mask = extract_ipv4(&buf, 40);
+    let ifaces = net::stack().snapshot_interfaces();
+    let target = ifaces.iter().find(|i| i.name != "lo").or(ifaces.first());
+    if let Some(iface) = target {
+        net::stack()
+            .add_route(iface.id, dest, mask, gw)
+            .map_err(|_| Errno::EINVAL)?;
+    }
+    Ok(0)
+}
+
+fn ioctl_delrt(arg: usize) -> Result<usize, Errno> {
+    let mut buf = [0u8; 64];
+    copy_from_user(arg, &mut buf).map_err(|_| Errno::EFAULT)?;
+    let dest = extract_ipv4(&buf, 8);
+    let mask = extract_ipv4(&buf, 40);
+    let ifaces = net::stack().snapshot_interfaces();
+    let target = ifaces.iter().find(|i| i.name != "lo").or(ifaces.first());
+    if let Some(iface) = target {
+        net::stack()
+            .remove_route(iface.id, dest, mask)
+            .map_err(|_| Errno::EINVAL)?;
+    }
+    Ok(0)
+}
+
+fn extract_ipv4(buf: &[u8], offset: usize) -> net::Ipv4Addr {
+    net::Ipv4Addr([
+        buf[offset + 4],
+        buf[offset + 5],
+        buf[offset + 6],
+        buf[offset + 7],
+    ])
+}
+
+fn mask_to_prefix_len_bytes(mask: &[u8; 4]) -> u8 {
+    u32::from_be_bytes(*mask).leading_ones() as u8
 }
