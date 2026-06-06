@@ -324,12 +324,25 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn release(&self) {
-        // 必须 take 完再调 net::stack()——否则在某些极端顺序下
-        // （如 release 路径里 wake 的 task 立刻再 open 新 socket），
-        // 旧 handle 的下转可能撞上新插入的同名 index。
         if let Some(handle) = self.handle.lock().take() {
-            // 走"关 + 立即摘"的同步路径，**不要** soft_remove 后等
-            // 下次 poll——见 NetStack::socket_close_and_remove 的注释。
+            let options = self.options.lock();
+            if options.linger_on && options.linger_secs > 0 {
+                if matches!(handle.socket_type(), SocketType::Tcp) {
+                    net::stack().tcp_close(handle);
+                    let deadline = sched::now_ns_public()
+                        .saturating_add((options.linger_secs as u64) * 1_000_000_000);
+                    loop {
+                        if sched::now_ns_public() >= deadline {
+                            break;
+                        }
+                        if !net::stack().socket_can_send(handle) {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+            drop(options);
             net::stack().socket_close_and_remove(handle);
         }
     }
@@ -488,7 +501,8 @@ impl NetSocketFileOps {
                         }
                     }
                 }
-                Ok(())
+                // 非阻塞 connect：不等待握手完成，返回 EINPROGRESS
+                Err(Errno::EINPROGRESS)
             }
             SocketType::Udp | SocketType::Raw | SocketType::Icmp => {
                 // UDP/RAW/ICMP connect 只缓存默认 remote，不改变协议栈状态。
