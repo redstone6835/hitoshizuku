@@ -51,16 +51,25 @@ pub enum DevNodeSpec {
         name: Box<str>,
         dev: Arc<BlockDevice>,
     },
+    /// 网络设备 — 不需要 /dev 节点，但在 /sys/class/net/ 中创建目录。
+    NetDev {
+        name: Box<str>,
+        iface_id: u32,
+    },
     Symlink {
         name: Box<str>,
         target: Box<str>,
+
     },
 }
 
 impl DevNodeSpec {
     pub fn name(&self) -> &str {
         match self {
-            Self::Char { name, .. } | Self::Block { name, .. } | Self::Symlink { name, .. } => name,
+            Self::Char { name, .. }
+            | Self::Block { name, .. }
+            | Self::NetDev { name, .. }
+            | Self::Symlink { name, .. } => name,
         }
     }
 }
@@ -239,15 +248,20 @@ pub fn function_as<T: 'static>(func: &dyn DeviceFunction) -> Option<&T> {
 pub fn char_device_from_function(func: &dyn DeviceFunction) -> Option<CharDevice> {
     func.devnodes()?.nodes().iter().find_map(|node| match node {
         DevNodeSpec::Char { dev, .. } => Some(dev.clone()),
-        DevNodeSpec::Block { .. } | DevNodeSpec::Symlink { .. } => None,
+        DevNodeSpec::Block { .. }
+        | DevNodeSpec::NetDev { .. }
+        | DevNodeSpec::Symlink { .. } => None,
     })
 }
 
 pub fn block_device_from_function(func: &dyn DeviceFunction) -> Option<Arc<BlockDevice>> {
     func.devnodes()?.nodes().iter().find_map(|node| match node {
         DevNodeSpec::Block { dev, .. } => Some(Arc::clone(dev)),
-        DevNodeSpec::Char { .. } | DevNodeSpec::Symlink { .. } => None,
+        DevNodeSpec::Char { .. }
+        | DevNodeSpec::NetDev { .. }
+        | DevNodeSpec::Symlink { .. } => None,
     })
+}
 }
 
 /// 列出当前仍处于 active 状态的字符设备节点。

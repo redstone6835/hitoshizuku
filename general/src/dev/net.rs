@@ -46,7 +46,10 @@ impl DeviceFunction for NetFunction {
     }
 
     fn devnode(&self) -> Option<DevNodeSpec> {
-        None
+        Some(DevNodeSpec::NetDev {
+            name: self.dev_name.clone(),
+            iface_id: self.dev.id().raw(),
+        })
     }
 
     fn as_any(&self) -> &dyn Any {
