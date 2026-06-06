@@ -555,8 +555,8 @@ struct ProcNetStubFile(&'static str);
 impl FileOps for ProcNetStubFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let content = match self.0 {
-            "tcp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
-            "udp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
+            "tcp" => render_proc_net_tcp(),
+            "udp" => render_proc_net_udp(),
             "route" => render_proc_net_route(),
             "unix" => "Num       RefCount Protocol Flags    Type St Inode Path\n".into(),
             _ => String::new(),
@@ -632,6 +632,76 @@ fn render_proc_net_route() -> String {
         }
     }
     out
+}
+
+fn render_proc_net_tcp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    let connections = net::stack().snapshot_tcp_connections();
+    let mut slot: u64 = 0;
+    for (_iface_id, conns) in &connections {
+        for c in conns {
+            let local_hex = endpoint_to_hex(&c.local);
+            let remote_hex = endpoint_to_hex(&c.remote);
+            let _ = writeln!(
+                out,
+                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
+                slot, local_hex, remote_hex, c.state,
+                c.tx_queue, c.rx_queue,
+                0u8, 0u32, 0u32, 0u32, 0u32, c.inode,
+            );
+            slot += 1;
+        }
+    }
+    out
+}
+
+fn render_proc_net_udp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    let sockets = net::stack().snapshot_udp_sockets();
+    let mut slot: u64 = 0;
+    for (_iface_id, socks) in &sockets {
+        for s in socks {
+            let local_hex = endpoint_to_hex(&s.local);
+            let remote_hex = match &s.remote {
+                Some(ep) => endpoint_to_hex(ep),
+                None => "00000000:0000".into(),
+            };
+            let _ = writeln!(
+                out,
+                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
+                slot, local_hex, remote_hex,
+                7u8, // ESTABLISHED
+                0usize, 0usize, 0u8, 0u32, 0u32, 0u32, 0u32, s.inode,
+            );
+            slot += 1;
+        }
+    }
+    out
+}
+
+fn endpoint_to_hex(ep: &net::Endpoint) -> alloc::string::String {
+    use alloc::fmt::Write;
+    let mut s = alloc::string::String::new();
+    match ep.addr {
+        net::IpAddr::V4(v4) => {
+            let ip = u32::from_be_bytes(v4.0);
+            let _ = write!(s, "{:08X}:{:04X}", ip, ep.port);
+        }
+        net::IpAddr::V6(_v6) => {
+            let _ = write!(s, "00000000000000000000000000000000:{:04X}", ep.port);
+        }
+    }
+    s
 }
 
 struct ProcNetDevOps;
