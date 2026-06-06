@@ -4,6 +4,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering, fence};
 
 use errno::Errno;
+use general::dev::pnp::RealtimeClockSource;
 use sched::sync::Spinlock;
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -42,6 +43,7 @@ static DATA_PAGE_PADDR: AtomicUsize = AtomicUsize::new(0);
 static DATA_PAGE_KVA: AtomicUsize = AtomicUsize::new(0);
 static INIT_LOCK: Spinlock<()> = Spinlock::new(());
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
+static REALTIME_SOURCE_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn monotonic_ns() -> u64 {
     hal::time::monotonic_ns()
@@ -59,6 +61,38 @@ pub fn set_realtime_ns(realtime_ns: u64) {
     if let Some(data) = data_ptr() {
         write_data(data, now_ns);
     }
+}
+
+pub fn install_realtime_source(source: RealtimeClockSource) -> bool {
+    if source.id == 0 {
+        return false;
+    }
+
+    let current = REALTIME_SOURCE_ID.load(Ordering::Acquire);
+    if current == source.id {
+        set_realtime_ns(source.realtime_ns);
+        return true;
+    }
+    if current != 0 {
+        return false;
+    }
+    if REALTIME_SOURCE_ID
+        .compare_exchange(0, source.id, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        set_realtime_ns(source.realtime_ns);
+        return true;
+    }
+    false
+}
+
+pub fn unregister_realtime_source(source_id: usize) {
+    if source_id == 0 {
+        return;
+    }
+    // 只释放匹配 owner。已经设置过的 realtime offset 保留，避免 RTC 热移除
+    // 让 CLOCK_REALTIME 倒退；source id 清空后，替代 RTC 可以接管。
+    let _ = REALTIME_SOURCE_ID.compare_exchange(source_id, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 pub fn clock_time_ns(clock_id: usize) -> Option<u64> {
@@ -144,7 +178,12 @@ fn write_data(data: &mut VdsoData, now_ns: u64) {
 
     let hz = hal::time::stable_counter_hz();
     let cycle_last = hal::time::stable_counter_raw();
-    let (wall_time_sec, wall_time_nsec) = split_realtime_parts(now_ns);
+    let monotonic_base_ns = if hz == 0 {
+        now_ns
+    } else {
+        counter_to_ns(cycle_last, hz)
+    };
+    let (wall_time_sec, wall_time_nsec) = split_realtime_parts(monotonic_base_ns);
     data.clock_mode = if hz == 0 {
         VDSO_CLOCK_MODE_SYSCALL
     } else {
@@ -153,7 +192,7 @@ fn write_data(data: &mut VdsoData, now_ns: u64) {
     data.hz = hz;
     data.wall_time_sec = wall_time_sec;
     data.wall_time_nsec = wall_time_nsec;
-    data.monotonic_base_ns = now_ns;
+    data.monotonic_base_ns = monotonic_base_ns;
     data.cs_cycle_last = cycle_last;
     data.cs_mult = cycle_to_ns_mult(hz);
     data.cs_shift = CYCLE_TO_NS_SHIFT;
@@ -163,6 +202,12 @@ fn write_data(data: &mut VdsoData, now_ns: u64) {
 
     fence(Ordering::Release);
     data.seq.store(seq.wrapping_add(2), Ordering::Release);
+}
+
+fn counter_to_ns(cycle: u64, hz: u64) -> u64 {
+    let secs = cycle / hz;
+    let frac_ns = (cycle % hz) * NSEC_PER_SEC / hz;
+    secs * NSEC_PER_SEC + frac_ns
 }
 
 fn cycle_to_ns_mult(hz: u64) -> u64 {

@@ -54,6 +54,7 @@ use vfs::sync::Spinlock;
 use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
 use crate::dev::char::{CharDevice, CharIoError};
+use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{DevNodeSet, DevNodeSpec};
 use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
 use crate::mm::{copy_from_user, copy_to_user};
@@ -65,6 +66,38 @@ static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static PNP_DEVTMPFS_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
 
 const DEVTMPFS_NAME_MAX: usize = 255;
+
+fn devtmpfs_compat_default_dir_mode() -> FileMode {
+    FileMode::new(0o755)
+}
+
+fn devtmpfs_compat_default_symlink_mode() -> FileMode {
+    FileMode::new(0o777)
+}
+
+fn devtmpfs_compat_default_device_mode() -> FileMode {
+    FileMode::new(0o660)
+}
+
+fn devtmpfs_compat_default_uid() -> Uid {
+    Uid::ROOT
+}
+
+fn devtmpfs_compat_default_gid() -> Gid {
+    Gid::ROOT
+}
+
+fn devtmpfs_compat_block_size() -> u32 {
+    512
+}
+
+fn devtmpfs_compat_char_poll_default() -> PollEvents {
+    PollEvents::POLLIN.with(PollEvents::POLLOUT)
+}
+
+fn devtmpfs_compat_max_blocks_per_io() -> u32 {
+    1024
+}
 
 fn validate_devtmpfs_component(name: &str) -> VfsResult<()> {
     if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
@@ -115,6 +148,12 @@ pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
         bind: pnp_bind_cb,
         unbind: pnp_unbind_cb,
     });
+    for func in DEVICES.functions.list() {
+        if let Some(nodes) = func.devnodes() {
+            // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 安装后补齐 POSIX 节点投影。
+            pnp_bind_cb(&nodes)?;
+        }
+    }
     Ok(())
 }
 
@@ -668,7 +707,7 @@ impl FileOps for CharDevFileOps {
                 PollEvents::POLLOUT
             };
         }
-        PollEvents::POLLIN.with(PollEvents::POLLOUT)
+        devtmpfs_compat_char_poll_default()
     }
 
     fn set_status_flags(&self, flags: OpenOptions) {
@@ -911,7 +950,7 @@ fn max_blocks_per_io(dev: &BlockDevice) -> u32 {
     dev.limits()
         .max_blocks_per_io()
         .map(|n| n.get())
-        .unwrap_or(u32::MAX)
+        .unwrap_or_else(devtmpfs_compat_max_blocks_per_io)
         .max(1)
 }
 
@@ -1153,12 +1192,35 @@ impl FileOps for BlockDevFileOps {
                 write_u32_to_user(arg, optimal)?;
                 Ok(0)
             }
-            BLKALIGNOFF | BLKDISCARDZEROES | BLKROTATIONAL => {
-                write_i32_to_user(arg, 0)?;
+            BLKALIGNOFF => {
+                let align_off = self.dev.limits().buffer_alignment().map(|_| 0).unwrap_or(0);
+                write_i32_to_user(arg, align_off)?;
+                Ok(0)
+            }
+            BLKDISCARDZEROES => {
+                let discard_zeroes = if self.dev.features().contains(BlockFeatures::WRITE_ZEROES) {
+                    1
+                } else {
+                    0
+                };
+                write_i32_to_user(arg, discard_zeroes)?;
+                Ok(0)
+            }
+            BLKROTATIONAL => {
+                let rotational = if self.dev.attributes().rotational() {
+                    1
+                } else {
+                    0
+                };
+                write_i32_to_user(arg, rotational)?;
                 Ok(0)
             }
             BLKGETDISKSEQ => {
-                write_u64_to_user(arg, 0)?;
+                let Some(diskseq) = self.dev.attributes().diskseq() else {
+                    // disk sequence 是 Linux 兼容层的可选观测值；没有稳定来源时不伪造。
+                    return Err(Errno::ENOTTY);
+                };
+                write_u64_to_user(arg, diskseq)?;
                 Ok(0)
             }
             BLKFLSBUF => {
@@ -1558,7 +1620,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::Directory,
             DevId::new(0, 0),
-            512,
+            devtmpfs_compat_block_size(),
             None,
             meta,
             Arc::new(DevDirOps::new()),
@@ -1575,7 +1637,7 @@ impl DevTmpfsSuperblockOps {
         let meta = InodeMeta {
             size: target.len() as u64,
             nlink: 1,
-            mode: FileMode::new(0o777),
+            mode: devtmpfs_compat_default_symlink_mode(),
             uid,
             gid,
             atime: now,
@@ -1591,7 +1653,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::Symlink,
             DevId::new(0, 0),
-            512,
+            devtmpfs_compat_block_size(),
             None,
             meta,
             Arc::new(DevSymlinkOps {
@@ -1620,7 +1682,11 @@ impl DevTmpfsSuperblockOps {
                 if let Some(existing) = children.get(*component).cloned() {
                     existing
                 } else {
-                    let child = self.new_dir_inode(FileMode::new(0o755), Uid::ROOT, Gid::ROOT)?;
+                    let child = self.new_dir_inode(
+                        devtmpfs_compat_default_dir_mode(),
+                        devtmpfs_compat_default_uid(),
+                        devtmpfs_compat_default_gid(),
+                    )?;
                     children.insert(String::from(*component), Arc::clone(&child));
                     created = true;
                     child
@@ -1756,15 +1822,16 @@ impl DevTmpfsSuperblockOps {
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
-        let rdev = super::device_numbers::register_char(user_name, dev.fw_name());
+        let rdev = super::device_numbers::register_char(user_name, dev.fw_name())
+            .ok_or(VfsError::NoSpace)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: FileMode::new(0o660),
-            uid: Uid::ROOT,
-            gid: Gid::ROOT,
+            mode: devtmpfs_compat_default_device_mode(),
+            uid: devtmpfs_compat_default_uid(),
+            gid: devtmpfs_compat_default_gid(),
             atime: now,
             mtime: now,
             ctime: now,
@@ -1779,7 +1846,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::CharDevice,
             rdev,
-            512,
+            devtmpfs_compat_block_size(),
             None,
             meta,
             ops,
@@ -1807,15 +1874,16 @@ impl DevTmpfsSuperblockOps {
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
-        let rdev = super::device_numbers::register_block(user_name, dev.name());
+        let rdev = super::device_numbers::register_block(user_name, dev.name())
+            .ok_or(VfsError::NoSpace)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: FileMode::new(0o660),
-            uid: Uid::ROOT,
-            gid: Gid::ROOT,
+            mode: devtmpfs_compat_default_device_mode(),
+            uid: devtmpfs_compat_default_uid(),
+            gid: devtmpfs_compat_default_gid(),
             atime: now,
             mtime: now,
             ctime: now,
@@ -1830,7 +1898,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::BlockDevice,
             rdev,
-            512,
+            devtmpfs_compat_block_size(),
             None,
             meta,
             ops,
@@ -1850,7 +1918,11 @@ impl DevTmpfsSuperblockOps {
     /// VFS path walker 的规则以链接所在目录为基准继续解析。
     pub fn bind_symlink(&self, user_name: &str, target: &str) -> VfsResult<()> {
         split_devtmpfs_path(user_name)?;
-        let inode = self.new_symlink_inode(target, Uid::ROOT, Gid::ROOT)?;
+        let inode = self.new_symlink_inode(
+            target,
+            devtmpfs_compat_default_uid(),
+            devtmpfs_compat_default_gid(),
+        )?;
         self.insert_node_at(user_name, inode)
     }
 
@@ -1927,7 +1999,7 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
         Ok(FsStat {
             fs_type: 0x444f4445, // "devt" 魔数
-            block_size: 512,
+            block_size: devtmpfs_compat_block_size() as u64,
             total_blocks: 0,
             free_blocks: 0,
             avail_blocks: 0,
@@ -2003,9 +2075,9 @@ impl FsDriver for DevTmpfsDriver {
             let root_meta = InodeMeta {
                 size: 0,
                 nlink: 2,
-                mode: FileMode::new(0o755),
-                uid: Uid::ROOT,
-                gid: Gid::ROOT,
+                mode: devtmpfs_compat_default_dir_mode(),
+                uid: devtmpfs_compat_default_uid(),
+                gid: devtmpfs_compat_default_gid(),
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -2016,7 +2088,7 @@ impl FsDriver for DevTmpfsDriver {
                 InodeId { fs_id, ino: 1 },
                 FileType::Directory,
                 DevId::new(0, 0),
-                512,
+                devtmpfs_compat_block_size(),
                 None,
                 root_meta,
                 Arc::clone(&root_ops) as Arc<dyn InodeOps + Send + Sync>,
@@ -2029,7 +2101,7 @@ impl FsDriver for DevTmpfsDriver {
                 fs_type: "devtmpfs",
                 fs_id,
                 dev_id: None,
-                block_size: 512,
+                block_size: devtmpfs_compat_block_size(),
                 name_max: DEVTMPFS_NAME_MAX as u32,
                 root_inode,
                 root_dentry,

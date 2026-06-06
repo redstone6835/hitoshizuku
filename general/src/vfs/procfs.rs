@@ -2037,25 +2037,14 @@ fn render_stat() -> String {
 }
 
 fn render_devices() -> String {
+    // /proc/devices 只导出 POSIX 兼容投影的 major 汇总，不表示底层设备模型的寻址入口。
     let mut out = String::from("Character devices:\n");
-    for record in device_numbers::records()
-        .into_iter()
-        .filter(|record| record.kind == PosixDeviceKind::Char)
-    {
-        out.push_str(&format!(
-            "  {} {}\n",
-            record.rdev.major, record.display_name
-        ));
+    for summary in device_numbers::major_summaries(PosixDeviceKind::Char) {
+        out.push_str(&format!("  {} {}\n", summary.major, summary.display_name));
     }
     out.push_str("\nBlock devices:\n");
-    for record in device_numbers::records()
-        .into_iter()
-        .filter(|record| record.kind == PosixDeviceKind::Block)
-    {
-        out.push_str(&format!(
-            "  {} {}\n",
-            record.rdev.major, record.display_name
-        ));
+    for summary in device_numbers::major_summaries(PosixDeviceKind::Block) {
+        out.push_str(&format!("  {} {}\n", summary.major, summary.display_name));
     }
     out
 }

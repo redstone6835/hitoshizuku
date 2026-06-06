@@ -122,6 +122,50 @@ impl BlockLimits {
     }
 }
 
+/// 块设备可观测属性。
+///
+/// 这些字段用于 devtmpfs/sysfs/procfs 等兼容视图展示设备能力，不参与底层设备
+/// 身份判定；底层寻址仍由 PnP identity 和 typed device object 完成。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockAttributes {
+    removable: bool,
+    rotational: bool,
+    queue_depth: Option<NonZeroU32>,
+    diskseq: Option<u64>,
+}
+
+impl BlockAttributes {
+    pub const fn new(
+        removable: bool,
+        rotational: bool,
+        queue_depth: Option<NonZeroU32>,
+        diskseq: Option<u64>,
+    ) -> Self {
+        Self {
+            removable,
+            rotational,
+            queue_depth,
+            diskseq,
+        }
+    }
+
+    pub const fn removable(&self) -> bool {
+        self.removable
+    }
+
+    pub const fn rotational(&self) -> bool {
+        self.rotational
+    }
+
+    pub const fn queue_depth(&self) -> Option<NonZeroU32> {
+        self.queue_depth
+    }
+
+    pub const fn diskseq(&self) -> Option<u64> {
+        self.diskseq
+    }
+}
+
 /// 块设备功能标志
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct BlockFeatures(pub u32);
@@ -197,6 +241,7 @@ pub struct BlockDevice {
     class: BlockClass,
     geometry: BlockGeometry,
     limits: BlockLimits,
+    attributes: BlockAttributes,
     features: BlockFeatures,
     driver: Arc<dyn BlockDriver>,
     parent: Option<Arc<BlockDevice>>,
@@ -210,6 +255,7 @@ pub struct BlockDeviceInit<'a> {
     pub class: BlockClass,
     pub geometry: BlockGeometry,
     pub limits: BlockLimits,
+    pub attributes: BlockAttributes,
     pub features: BlockFeatures,
 }
 
@@ -225,6 +271,7 @@ impl BlockDevice {
             class: init.class,
             geometry: init.geometry,
             limits: init.limits,
+            attributes: init.attributes,
             features: init.features,
             driver,
             parent,
@@ -247,6 +294,9 @@ impl BlockDevice {
     }
     pub fn limits(&self) -> &BlockLimits {
         &self.limits
+    }
+    pub fn attributes(&self) -> BlockAttributes {
+        self.attributes
     }
     pub fn features(&self) -> BlockFeatures {
         self.features
@@ -343,10 +393,22 @@ impl BlockDevice {
         }
         match op {
             BioOp::Flush => {
-                if self.features.contains(BlockFeatures::FLUSH) {
-                    return Ok(());
+                if !self.features.contains(BlockFeatures::FLUSH) {
+                    return Err(BioError::Submit(SubmitError::Unsupported));
                 }
-                return Err(BioError::Submit(SubmitError::Unsupported));
+                // Flush 是设备级缓存同步命令，不携带 LBA 范围和数据缓冲区；
+                // 在这里统一拒绝带范围/缓冲区的请求，避免具体驱动各自猜测语义。
+                if range.blocks != 0 {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )));
+                }
+                if !matches!(buffer, BioBuffer::None) {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )));
+                }
+                return Ok(());
             }
             BioOp::Discard | BioOp::WriteZeroes => {
                 if op == BioOp::Discard && !self.features.contains(BlockFeatures::DISCARD) {
@@ -463,6 +525,9 @@ impl BlockDeviceList {
         if list.iter().any(|d| d.name() == dev.name()) {
             return Err(BlockRegistryError::NameExists);
         }
+        // 设备注册路径不能把 host Vec 扩容失败伪装成驱动成功。
+        list.try_reserve(1)
+            .map_err(|_| BlockRegistryError::OutOfMemory)?;
         list.push(Arc::clone(dev));
         Ok(Arc::clone(dev))
     }

@@ -207,8 +207,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         }
     } else {
         // 非中断、非 syscall 的路径通常代表真正的同步故障，例如页故障、地址错、非法指令。
+        // 当前内核尚未实现可恢复异常处理，因此除了断点外，一律记录现场后宣告不可恢复。
         let exc = decode_exception(ecode, esubcode);
-        log::info!(
+        log::debug!(
             "[trap] exception {:?} pc={:#x} sp={:#x} bad_addr={:#x} \
              ecode={} esubcode={} estat={:#x} from_user={}",
             TrapType::Exception(exc),
@@ -220,7 +221,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             estat,
             from_user
         );
-        log::info!(
+        log::debug!(
             "[trap] regs ra={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} \
              a4={:#x} a5={:#x} a6={:#x} a7={:#x} t0={:#x} t1={:#x}",
             tf.ra,

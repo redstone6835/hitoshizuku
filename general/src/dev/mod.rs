@@ -16,6 +16,7 @@ pub mod block;
 pub mod block_sync;
 pub mod char;
 pub mod completion;
+pub mod dma;
 pub mod drivers;
 pub mod enumerate;
 pub mod function;
@@ -26,6 +27,7 @@ pub mod pnp;
 pub mod random_source;
 pub mod rtc;
 pub mod usb;
+pub mod virtio;
 
 // ─────────────────────────── 共享设备控制 trait ──────────────────────────────
 

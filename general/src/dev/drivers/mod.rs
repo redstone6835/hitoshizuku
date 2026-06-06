@@ -23,7 +23,37 @@ pub use virtio_pci::*;
 mod random;
 pub use random::*;
 
+use alloc::string::String;
+use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::dev::block::BlockLimits;
 use crate::dev::pnp::PnpError;
+
+/// VirtIO block 的 POSIX `/dev/vd*` 投影名由所有传输层共享分配。
+///
+/// 这只是用户可见节点名，不参与底层设备身份；底层身份仍来自 PnP id。
+static NEXT_VIRTIO_BLK_DEV_INDEX: AtomicUsize = AtomicUsize::new(0);
+const VIRTIO_BLK_DEV_PREFIX: &str = "vd";
+/// VirtIO block request 的 sector 字段固定以 512 字节为单位；这是协议常量，
+/// 不是底层块设备逻辑块大小。
+pub(super) const VIRTIO_BLK_SECTOR_SIZE: u32 = 512;
+
+pub(super) fn alloc_virtio_blk_dev_name() -> String {
+    let idx = NEXT_VIRTIO_BLK_DEV_INDEX.fetch_add(1, Ordering::Relaxed);
+    alloc::format!("{}{}", VIRTIO_BLK_DEV_PREFIX, idx)
+}
+
+pub(super) fn virtio_blk_limits(block_size: u32) -> BlockLimits {
+    if block_size == 0 {
+        return BlockLimits::unrestricted();
+    }
+    let max_blocks = NonZeroU32::new(u32::MAX / block_size);
+    match BlockLimits::new(max_blocks, max_blocks, NonZeroU32::new(1)) {
+        Some(limits) => limits,
+        None => BlockLimits::unrestricted(),
+    }
+}
 
 /// 注册当前内核镜像内建的所有 PnP 驱动。
 ///

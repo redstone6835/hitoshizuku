@@ -224,7 +224,11 @@ pub fn kernel_start_init(context: &StartContext) {
             context.address.device_mmio_to_virt,
             context.address.virt_to_phys,
         )
-        .with_realtime_clock(crate::vdso::set_realtime_ns),
+        .with_realtime_clock(crate::vdso::set_realtime_ns)
+        .with_realtime_source_hooks(
+            crate::vdso::install_realtime_source,
+            crate::vdso::unregister_realtime_source,
+        ),
     );
 
     // 安装架构无关的熵源：random 子系统需要时间戳 / 栈指针等
@@ -287,7 +291,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
         pci::assign_bars(host.bus_start, host.bus_end);
 
-        let count = pci_scan_and_register(0, host.bus_start, host.bus_end, "pci-");
+        let count = pci_scan_and_register(0, host.bus_start, host.bus_end);
         printk!(
             "[kernel-start][dtb] pci_scan_and_register probed {} device(s)",
             count

@@ -211,6 +211,20 @@ pub trait PnpBusInfo: Send + Sync + Any + Debug {
 
 // ── 驱动初始化上下文 ─────────────────────────────────────────────────────
 
+/// 可撤销的 realtime 时钟源声明。
+///
+/// `id` 必须在当前启动期间唯一且非 0，通常可由 MMIO 物理基址派生。安装
+/// hook 接受后，驱动在 remove 时必须用同一个 `id` 调 unregister。安全语义
+/// 上，这只表示“这个 RTC 仍是当前可信来源”；卸载时不回滚已经设置的 realtime
+/// offset，避免拔掉 RTC 后时间倒退，只允许后续替代 RTC 接管来源身份。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RealtimeClockSource {
+    pub id: usize,
+    pub name: &'static str,
+    pub realtime_ns: u64,
+}
+
 /// 驱动 factory 创建内建驱动实例时需要的启动期能力。
 ///
 /// 该上下文由内核启动路径在注册内建驱动前设置。它只包含内建驱动初始化所需的
@@ -224,6 +238,10 @@ pub struct DevInitContext {
     pub virt_to_phys: fn(usize) -> usize,
     /// 用硬件 RTC 读出的 Unix 纳秒时间更新内核 realtime 时钟。
     pub set_realtime_ns: Option<fn(u64)>,
+    /// 安装一个可撤销 realtime 来源。返回 `true` 表示本来源成为当前 owner。
+    pub install_realtime_source: Option<fn(RealtimeClockSource) -> bool>,
+    /// 注销一个已安装 realtime 来源。只有 owner id 匹配时才应生效。
+    pub unregister_realtime_source: Option<fn(usize)>,
 }
 
 impl DevInitContext {
@@ -235,11 +253,23 @@ impl DevInitContext {
             device_mmio_to_virt,
             virt_to_phys,
             set_realtime_ns: None,
+            install_realtime_source: None,
+            unregister_realtime_source: None,
         }
     }
 
     pub const fn with_realtime_clock(mut self, set_realtime_ns: fn(u64)) -> Self {
         self.set_realtime_ns = Some(set_realtime_ns);
+        self
+    }
+
+    pub const fn with_realtime_source_hooks(
+        mut self,
+        install_realtime_source: fn(RealtimeClockSource) -> bool,
+        unregister_realtime_source: fn(usize),
+    ) -> Self {
+        self.install_realtime_source = Some(install_realtime_source);
+        self.unregister_realtime_source = Some(unregister_realtime_source);
         self
     }
 }
@@ -788,10 +818,14 @@ impl PnpDevice {
         }
 
         if let Err(e) = devtmpfs_bind_function(&func) {
-            DEVICES.unregister_function(&func);
-            self.detach_function(&func);
-            func.mark_gone();
-            return Err(e);
+            if e != PnpError::NoDevtmpfs {
+                DEVICES.unregister_function(&func);
+                self.detach_function(&func);
+                func.mark_gone();
+                return Err(e);
+            }
+            // devtmpfs 是 POSIX/VFS 投影层；桥接未安装时不能反向阻止底层设备注册。
+            // 启动路径通常会先安装 bridge，热插拔/特殊初始化路径可在之后补建节点。
         }
 
         Ok(())

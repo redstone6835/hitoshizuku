@@ -5,6 +5,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use vfs::FS_REGISTRY;
 use vfs::error::{VfsError, VfsResult};
@@ -88,13 +89,15 @@ impl FsDriver for BlockFsAdapter {
         let Ok(dev) = resolve_block_device(source) else {
             return FsProbe::None;
         };
-        let backend = SyncBlockBackend::new(dev);
+        let Ok(backend) = SyncBlockBackend::new(dev) else {
+            return FsProbe::None;
+        };
         self.driver.probe(&backend).into()
     }
 
     fn mount(&self, dev: Option<&str>, data: &str) -> VfsResult<Arc<Superblock>> {
         let dev = resolve_block_device(dev.ok_or(VfsError::NoDevice)?)?;
-        let backend = Arc::new(SyncBlockBackend::new(dev));
+        let backend = Arc::new(SyncBlockBackend::new(dev).map_err(|_| VfsError::NoDevice)?);
         if self.driver.probe(backend.as_ref()) == BlockFsProbe::None {
             return Err(VfsError::InvalidArgument);
         }
@@ -168,7 +171,7 @@ pub fn mount_block_device_auto(
     data: &str,
 ) -> VfsResult<(Arc<Superblock>, &'static str)> {
     let source = alloc::string::String::from(dev.name());
-    let backend = Arc::new(SyncBlockBackend::new(dev));
+    let backend = Arc::new(SyncBlockBackend::new(dev).map_err(|_| VfsError::NoDevice)?);
     let (sb, fs_name) = mount_block_backend_auto(backend, data)?;
     let root_source = alloc::format!("{} ({})", source, fs_name).leak();
     Ok((sb, root_source))
@@ -320,9 +323,17 @@ fn read_backend_bytes(
         .checked_add(out.len())
         .ok_or(VfsError::InvalidArgument)?;
     let sector_count = total.div_ceil(sector_size);
-    let mut buffer = alloc::vec![0u8; sector_count * sector_size];
+    let sector_count_u32 = u32::try_from(sector_count).map_err(|_| VfsError::InvalidArgument)?;
+    let buffer_len = sector_count
+        .checked_mul(sector_size)
+        .ok_or(VfsError::InvalidArgument)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(buffer_len)
+        .map_err(|_| VfsError::OutOfMemory)?;
+    buffer.resize(buffer_len, 0);
     backend
-        .read(start_lba, sector_count as u32, &mut buffer)
+        .read(start_lba, sector_count_u32, &mut buffer)
         .map_err(sync_error_to_vfs)?;
     out.copy_from_slice(&buffer[in_sector..in_sector + out.len()]);
     Ok(())
@@ -331,6 +342,9 @@ fn read_backend_bytes(
 fn sync_error_to_vfs(err: SyncIoError) -> VfsError {
     match err {
         SyncIoError::BufferTooSmall | SyncIoError::InvalidRange => VfsError::InvalidArgument,
+        SyncIoError::UnknownCapacity => VfsError::NoDevice,
+        SyncIoError::OutOfMemory
+        | SyncIoError::Submit(crate::dev::bio::SubmitError::OutOfMemory) => VfsError::OutOfMemory,
         SyncIoError::Submit(_) | SyncIoError::Io(_) => VfsError::Io,
     }
 }

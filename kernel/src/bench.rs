@@ -120,6 +120,7 @@ fn make_ram_device(name: &str, image: &'static [u8]) -> Arc<BlockDevice> {
             class: BlockClass::Whole,
             geometry: geom,
             limits: BlockLimits::unrestricted(),
+            attributes: Default::default(),
             features: BlockFeatures::FLUSH,
         },
         io,
@@ -128,7 +129,13 @@ fn make_ram_device(name: &str, image: &'static [u8]) -> Arc<BlockDevice> {
 }
 
 fn mount_fat(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
-    let backend = Arc::new(SyncBlockBackend::new(Arc::clone(&dev)));
+    let backend = match SyncBlockBackend::new(Arc::clone(&dev)) {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            log::error!("[bench][{}] backend unavailable: {:?}", tag, e);
+            return None;
+        }
+    };
     let driver = Box::leak(Box::new(fatfs::FatFsDriver::new()));
     driver.bind_backend(backend);
     match driver.mount(None, "") {
@@ -144,7 +151,13 @@ fn mount_fat(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
 }
 
 fn mount_ext(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
-    let backend = Arc::new(SyncBlockBackend::new(Arc::clone(&dev)));
+    let backend = match SyncBlockBackend::new(Arc::clone(&dev)) {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            log::error!("[bench][{}] backend unavailable: {:?}", tag, e);
+            return None;
+        }
+    };
     let driver = Box::leak(Box::new(extfs::ExtFsDriver::new()));
     driver.bind_backend(backend);
     match driver.mount(None, "") {
@@ -222,13 +235,20 @@ fn run_software_overhead_only() {
                 class: BlockClass::Whole,
                 geometry: geom,
                 limits: BlockLimits::unrestricted(),
+                attributes: Default::default(),
                 features: BlockFeatures::FLUSH,
             },
             io,
             None,
         ))
     };
-    let backend = SyncBlockBackend::new(Arc::clone(&dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(&dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][SW-overhead] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let mut buf = [0u8; 512];
     let count = 1000u64;
     let t0 = hal::time::monotonic_ns();
@@ -249,7 +269,13 @@ fn run_software_overhead_only() {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn run_block_seq_read(dev: &Arc<BlockDevice>) {
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][L1-blk] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
@@ -289,7 +315,13 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     let blocks_per_chunk = (chunk / lbs) as u32;
     let iters = total_bytes / chunk;
 
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][PROOF] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let mut buf = vec![0u8; chunk];
 
     // ── Warmup: 通过完整路径读一遍，把 backing store 拉入 cache ──
@@ -354,7 +386,13 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
 }
 
 fn run_block_seq_write(dev: &Arc<BlockDevice>) {
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][L1-blk] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
@@ -386,7 +424,13 @@ fn run_block_seq_write(dev: &Arc<BlockDevice>) {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn run_block_rand_read(dev: &Arc<BlockDevice>) {
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][L2-blk] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let lbs = dev.geometry().logical_block_size().get() as usize;
     let block = 4096usize;
     let count = 100u64;
@@ -394,7 +438,13 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
         return;
     }
     let blocks_per_op = (block / lbs) as u32;
-    let max_lba = dev.geometry().block_count().unwrap_or(0) - blocks_per_op as u64;
+    let Some(max_lba) = dev
+        .geometry()
+        .block_count()
+        .and_then(|total| total.checked_sub(blocks_per_op as u64))
+    else {
+        return;
+    };
     if max_lba == 0 {
         return;
     }
