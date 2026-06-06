@@ -53,10 +53,11 @@ const KERNEL_HOSTNAME_INO: u64 = 18;
 const KERNEL_OSTYPE_INO: u64 = 19;
 const KERNEL_OSRELEASE_INO: u64 = 20;
 const KERNEL_VERSION_INO: u64 = 21;
-const CLASS_NET_DIR_INO: u64 = 22;
-const CLASS_NET_IFACE_START_INO: u64 = 100; // 每个接口分配 16 个 inode(属性文件)
-const CLASS_NET_IFACE_SLOTS: u64 = 16;
 const KERNEL_CMDLINE_INO: u64 = 22;
+const CLASS_NET_DIR_INO: u64 = 23;
+const CLASS_NET_IFACE_START_INO: u64 = 100;
+const CLASS_NET_IFACE_SLOTS: u64 = 16;
+const CLASS_NET_STATS_SLOTS: u64 = 8;
 
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
@@ -375,6 +376,50 @@ impl NetDevSlot {
 
 fn netdev_slot_by_name(name: &str) -> Option<NetDevSlot> {
     NetDevSlot::ALL.iter().find(|s| s.file_name() == name).copied()
+}
+
+#[derive(Clone, Copy)]
+enum NetDevStatsSlot {
+    RxBytes,
+    TxBytes,
+    RxPackets,
+    TxPackets,
+    RxDropped,
+    TxDropped,
+    RxErrors,
+    TxErrors,
+}
+
+impl NetDevStatsSlot {
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::RxBytes => 0, Self::TxBytes => 1,
+            Self::RxPackets => 2, Self::TxPackets => 3,
+            Self::RxDropped => 4, Self::TxDropped => 5,
+            Self::RxErrors => 6, Self::TxErrors => 7,
+        }
+    }
+    fn to_netdev_slot(self) -> NetDevSlot {
+        match self {
+            Self::RxBytes => NetDevSlot::StatisticsRxBytes,
+            Self::TxBytes => NetDevSlot::StatisticsTxBytes,
+            Self::RxPackets => NetDevSlot::StatisticsRxPackets,
+            Self::TxPackets => NetDevSlot::StatisticsTxPackets,
+            Self::RxDropped => NetDevSlot::StatisticsRxDropped,
+            Self::TxDropped => NetDevSlot::StatisticsTxDropped,
+            Self::RxErrors => NetDevSlot::StatisticsRxErrors,
+            Self::TxErrors => NetDevSlot::StatisticsTxErrors,
+        }
+    }
+    fn file_name(self) -> &'static str { self.to_netdev_slot().file_name() }
+    const ALL: &'static [Self] = &[
+        Self::RxBytes, Self::TxBytes, Self::RxPackets, Self::TxPackets,
+        Self::RxDropped, Self::TxDropped, Self::RxErrors, Self::TxErrors,
+    ];
+}
+
+fn netdev_stats_slot_by_name(name: &str) -> Option<NetDevStatsSlot> {
+    NetDevStatsSlot::ALL.iter().find(|s| s.file_name() == name).copied()
 }
 
 fn class_net_iface_ino(iface_id: u32) -> u64 {
@@ -946,6 +991,7 @@ enum SysDirKind {
     Class,
     ClassNet,
     ClassNetIface { iface_id: u32 },
+    ClassNetStats { iface_id: u32 },
     Module,
     Power,
     Firmware,
@@ -1202,7 +1248,6 @@ impl SysDirInodeOps {
                 }
             }
             SysDirKind::ClassNetIface { iface_id } => {
-                // 查找属性文件
                 if let Some(slot) = netdev_slot_by_name(name) {
                     Ok(mk_file(
                         class_net_iface_slot_ino(iface_id, slot.to_u64()),
@@ -1211,7 +1256,17 @@ impl SysDirInodeOps {
                 } else if name == "statistics" {
                     Ok(mk_dir(
                         class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS,
-                        SysDirKind::ClassNetIface { iface_id },
+                        SysDirKind::ClassNetStats { iface_id },
+                    ))
+                } else {
+                    Err(VfsError::NotFound)
+                }
+            }
+            SysDirKind::ClassNetStats { iface_id } => {
+                if let Some(slot) = netdev_stats_slot_by_name(name) {
+                    Ok(mk_file(
+                        class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS + slot.to_u64(),
+                        SysRegFile::NetDev { iface_id, slot: slot.to_netdev_slot() },
                     ))
                 } else {
                     Err(VfsError::NotFound)
@@ -1512,6 +1567,13 @@ impl SysDirInodeOps {
                     ));
                 }
                 entries
+            }
+            SysDirKind::ClassNetStats { iface_id } => {
+                let base = class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS;
+                NetDevStatsSlot::ALL
+                    .iter()
+                    .map(|s| mk_dir_entry(base + s.to_u64(), s.file_name(), FileType::Regular))
+                    .collect()
             }
             SysDirKind::Bus
             | SysDirKind::Module

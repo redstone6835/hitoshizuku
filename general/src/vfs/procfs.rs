@@ -533,6 +533,16 @@ impl InodeOps for ProcNetDirOps {
                     name: SmallStr::new("unix"),
                     kind: FileType::Regular,
                 },
+                DirEntry {
+                    ino: NET_DEV_INO + 5,
+                    name: SmallStr::new("arp"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: NET_DEV_INO + 6,
+                    name: SmallStr::new("sockstat"),
+                    kind: FileType::Regular,
+                },
             ],
         }))
     }
