@@ -306,6 +306,9 @@ fn process_execve(
         fdt.close_on_exec();
     }
 
+    // exec 时将 caught 信号重置为 SIG_DFL
+    task.thread_group().shared_signal().reset_handlers_for_exec();
+
     let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.apply_to_context(user_ctx.as_usize());
     Ok(())
