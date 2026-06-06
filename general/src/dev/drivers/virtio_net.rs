@@ -285,6 +285,8 @@ fn alloc_dma_page() -> Result<PhysicalAllocation, &'static str> {
 }
 
 fn dma_vaddr(alloc: PhysicalAllocation) -> usize {
+    // FIXME: phys_to_virt hook 未初始化时会 panic；驱动 probe 路径应返回
+    // 错误而不是 unwrap。
     allocator::KERNEL_ALLOCATOR.load_phys_to_virt().unwrap()(alloc.paddr)
 }
 
@@ -635,6 +637,8 @@ impl VirtioNetPci {
             let desc_idx = elem.id as u16;
             // 在 pending_tx 中找到并释放对应的 DMA buffer
             if let Some(pos) = inner.pending_tx.iter().position(|(d, _)| *d == desc_idx) {
+                // FIXME: pending_tx 与 used ring 不一致时这里仍依赖 unwrap；
+                // 应把 ring 损坏/重复回收作为驱动错误处理。
                 let (_, alloc) = inner.pending_tx.remove(pos).unwrap();
                 let _ = KERNEL_ALLOCATOR.free_physical(alloc);
             }

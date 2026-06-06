@@ -55,6 +55,8 @@ impl NetDriver for LoopbackDriver {
             stats.tx_packets += 1;
             stats.tx_bytes += len as u64;
         }
+        // FIXME: loopback 队列没有容量上限或 backpressure，持续发送会让
+        // 内存无界增长。
         self.queue.lock().push_back(data);
     }
 

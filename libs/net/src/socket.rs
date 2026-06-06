@@ -15,7 +15,7 @@ use crate::device::InterfaceId;
 // ── Socket 类型 ──────────────────────────────────────────────────────────────
 
 /// 网络 socket 协议类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SocketType {
     /// TCP 流式 socket（面向连接，可靠有序字节流）。
     Tcp,
@@ -78,7 +78,7 @@ impl SocketMeta {
 ///
 /// 轻量标识符（`Copy`），持有它即可通过 `NetStack` 操作 socket。
 /// 内含接口 ID 以便 stack 直接路由到正确的 `ManagedInterface`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NetSocketHandle {
     pub(crate) iface_id: InterfaceId,
     pub(crate) inner: smoltcp::iface::SocketHandle,

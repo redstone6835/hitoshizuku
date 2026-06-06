@@ -142,6 +142,8 @@ impl IfConfig {
 
     /// 自动配置（DHCP + SLAAC）。
     pub fn auto() -> Self {
+        // FIXME: 这里只声明 Auto 模式并返回空地址/空网关，当前没有 DHCP
+        // 或 SLAAC 状态机负责后续填充配置。
         Self {
             addresses: Vec::new(),
             gateway: None,

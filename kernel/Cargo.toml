@@ -34,5 +34,6 @@ log = { path = "../libs/log" }
 allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
 mm = { path = "../libs/mm" }
+net = { path = "../libs/net" }
 sched = { path = "../libs/sched" }
 vfs = { path = "../libs/vfs" }

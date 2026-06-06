@@ -57,6 +57,8 @@ impl ManagedInterface {
         );
 
         // 配置 IP 地址（支持 IPv4 + IPv6 混合）
+        // TODO: IfMode::Auto 当前不会触发 DHCP/SLAAC，这里只会把已有
+        // config.addresses 静态写入 smoltcp。
         let cidrs: Vec<IpCidr> = config
             .addresses
             .iter()
@@ -109,15 +111,19 @@ impl ManagedInterface {
         self.iface.poll(
             timestamp, &mut self.device, &mut self.sockets,
         );
-        // 延迟清理：移除标记为 removed 的 socket
+        // 延迟清理：移除标记为 removed 的 socket。
+        //
+        // 旧实现先 `sockets.remove` 再 `meta.remove`——若这两个动作之间
+        // 有任何其它持锁代码路径访问 `self.sockets[handle]`，会看到一个
+        // `None` 槽位从而 panic。新实现走 `remove_socket_locked` 同步删
+        // 两者，并且保证顺序。
         let to_remove: Vec<SocketHandle> = self.meta
             .iter()
             .filter(|(_, m)| m.is_removed())
             .map(|(h, _)| *h)
             .collect();
         for h in to_remove {
-            self.sockets.remove(h);
-            self.meta.remove(&h);
+            self.remove_socket_locked(h);
         }
     }
 
@@ -182,14 +188,39 @@ impl ManagedInterface {
 
     /// 检查 socket 是否已被 soft-close 标记为移除。
     pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
-        self.meta.get(&handle).map_or(false, |m| m.is_removed())
+        self.meta.get(&handle).map_or(true, |m| m.is_removed())
+    }
+
+    /// 检查 socket handle 当前是否仍存在于元数据表中。
+    pub fn has_socket(&self, handle: SocketHandle) -> bool {
+        self.meta.contains_key(&handle)
     }
 
     /// Soft-close：标记 socket 为已移除（延迟到下一轮 poll 时真正释放）。
+    ///
+    /// **本接口仅供内部 soft-close 协议使用**——上层关闭文件 fd 时应直接
+    /// 调用 [`Self::remove_socket_locked`]。soft_remove_socket 适合"延迟
+    /// 到下一次 poll"的场景（例如某条路径上需要立刻释放对端资源但又想避开
+    /// 持锁移除的复杂性）。
     pub fn soft_remove_socket(&self, handle: SocketHandle) {
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_removed();
         }
+    }
+
+    /// 同步从 `SocketSet` 中移除一个 socket（不依赖 poll 触发）。
+    ///
+    /// 这是文件描述符 `release` 路径应当使用的入口：调用方已确认 socket
+    /// 不再有并发访问，移除动作必须立即生效，否则同 index 会被后续新建的
+    /// 其它类型 socket 占用（smoltcp 的 `add` 不会复用 `Some(_)` 的槽位，
+    /// 但 `poll` 之后 `soft_remove_socket` 标记的 socket 也只是 `None`
+    /// 而真正释放——必须**自己**调本接口才安全）。
+    pub fn remove_socket_locked(&mut self, handle: SocketHandle) {
+        // 必须先删 meta，否则 `poll` 路径的 to_remove 列表里还会保留旧条目，
+        // 下次 poll 会对一个已经在 `SocketSet` 里被替换的 handle 再调
+        // `sockets.remove`，触发 "handle does not refer to a valid socket"。
+        self.meta.remove(&handle);
+        self.sockets.remove(handle);
     }
 
     /// TCP connect：内部同时访问 socket 和 iface context 避免借用冲突。
@@ -212,6 +243,8 @@ impl ManagedInterface {
         rx_buf_size: usize,
         tx_buf_size: usize,
     ) -> SocketHandle {
+        // TODO: 缓冲区大小由调用方固定传入，缺少 SO_SNDBUF/SO_RCVBUF
+        // 动态调整和内存压力下的 backpressure 策略。
         let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(
             alloc::vec![0u8; rx_buf_size],
         );
@@ -232,6 +265,8 @@ impl ManagedInterface {
         rx_meta_count: usize,
         tx_meta_count: usize,
     ) -> SocketHandle {
+        // TODO: UDP packet metadata 数量固定，队列满时只能 WouldBlock；
+        // 还没有按 socket option 或负载自动调节。
         let rx_buf = smoltcp::socket::udp::PacketBuffer::new(
             alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; rx_meta_count],
             alloc::vec![0u8; rx_buf_size],
@@ -247,8 +282,13 @@ impl ManagedInterface {
     }
 
     /// 从 SocketSet 移除一个 socket。
+    ///
+    /// 旧实现只删 SocketSet 不删 meta，会导致下一次 `poll` 看到 `meta`
+    /// 里残留的 `is_removed=true` 条目然后去 `sockets.remove` 一个已经被
+    /// 释放的槽位，触发 smoltcp 的 "handle does not refer to a valid
+    /// socket" panic。统一走 `remove_socket_locked`。
     pub fn remove_socket(&mut self, handle: smoltcp::iface::SocketHandle) {
-        self.sockets.remove(handle);
+        self.remove_socket_locked(handle);
     }
 
     /// 获取 TCP socket 的可变引用（内部操作用）。
@@ -256,6 +296,8 @@ impl ManagedInterface {
         &mut self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::tcp::Socket<'static> {
+        // FIXME: typed accessor 直接下转 SocketSet handle，依赖外层先检查
+        // meta 和 socket 类型；旧 handle 误用仍可能触发 smoltcp panic。
         self.sockets.get_mut(handle)
     }
 
@@ -272,6 +314,7 @@ impl ManagedInterface {
         &mut self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::udp::Socket<'static> {
+        // FIXME: 同 tcp_socket_mut，缺少 generation/type guard。
         self.sockets.get_mut(handle)
     }
 
@@ -287,6 +330,8 @@ impl ManagedInterface {
     pub fn add_raw_socket(&mut self, ip_version: u8, protocol: u8) -> SocketHandle {
         use smoltcp::socket::raw;
         use smoltcp::wire::{IpVersion, IpProtocol};
+        // TODO: raw buffer/meta 容量写死，且缺少协议过滤以外的 socket option
+        // 支持，例如 IP_HDRINCL、TTL/TOS 和接收控制消息。
         let ip_ver = if ip_version == 6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 };
         let proto = IpProtocol::from(protocol);
         let rx_buf = raw::PacketBuffer::new(
@@ -306,6 +351,8 @@ impl ManagedInterface {
     /// 创建一个 ICMP socket。
     pub fn add_icmp_socket(&mut self) -> SocketHandle {
         use smoltcp::socket::icmp;
+        // TODO: ICMP 当前是最小 echo 能力，未建模 identifier、sequence
+        // 分发、错误报文队列和 IPv6 ICMP 差异。
         let rx_buf = icmp::PacketBuffer::new(
             alloc::vec![icmp::PacketMetadata::EMPTY; 8],
             alloc::vec![0u8; 8192],
@@ -331,6 +378,20 @@ impl ManagedInterface {
     pub fn raw_socket(
         &self, handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::raw::Socket<'static> {
+        self.sockets.get(handle)
+    }
+
+    /// 获取 ICMP socket 的可变引用。
+    pub fn icmp_socket_mut(
+        &mut self, handle: smoltcp::iface::SocketHandle,
+    ) -> &mut smoltcp::socket::icmp::Socket<'static> {
+        self.sockets.get_mut(handle)
+    }
+
+    /// 获取 ICMP socket 的只读引用。
+    pub fn icmp_socket(
+        &self, handle: smoltcp::iface::SocketHandle,
+    ) -> &smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get(handle)
     }
 }

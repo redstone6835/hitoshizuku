@@ -75,17 +75,17 @@ pub fn kernel_start_init(context: &StartContext) {
         stdout_serial,
         power_controls,
         serial_ports,
-        virtio_mmio_devices,
+        platform_devices,
         pcie_hosts,
     } = firmware;
 
     printk!(
-        "[kernel-start][dtb] firmware parsed: cpu={} memory={} reserved={} serial={} virtio-mmio={} pcie-host={}",
+        "[kernel-start][dtb] firmware parsed: cpu={} memory={} reserved={} serial={} platform={} pcie-host={}",
         cpu_count,
         memory_segments.len(),
         reserved_segments.len(),
         serial_ports.len(),
-        virtio_mmio_devices.len(),
+        platform_devices.len(),
         pcie_hosts.len()
     );
 
@@ -217,10 +217,13 @@ pub fn kernel_start_init(context: &StartContext) {
         .expect("[kernel-start][dtb] failed to install PnP devtmpfs bridge");
     printk!("[kernel-start][dtb] PnP devtmpfs callbacks installed");
 
-    set_dev_init_context(DevInitContext::new(
-        context.address.device_mmio_to_virt,
-        context.address.virt_to_phys,
-    ));
+    set_dev_init_context(
+        DevInitContext::new(
+            context.address.device_mmio_to_virt,
+            context.address.virt_to_phys,
+        )
+        .with_realtime_clock(crate::vdso::set_realtime_ns),
+    );
 
     // 安装架构无关的熵源：random 子系统需要时间戳 / 栈指针等
     // 启动期熵，这些只能由 arch 层提供。
@@ -242,50 +245,15 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
-    for port in &serial_ports {
-        let mut ids = Vec::new();
-        ids.push(DeviceMatchId::DtbCompatible("ns16550a".into()));
-        ids.push(DeviceMatchId::DtbCompatible("ns16550".into()));
-        let mut resources = Vec::new();
-        resources.push(DeviceResource::Mmio {
-            phys: port.phys_addr,
-            size: 0x100,
-        });
-        let info = PlatformDeviceInfo {
-            fw_name: port.name.into(),
-            ids,
-            resources,
-            properties: DeviceProperties {
-                clock_hz: port.clock_hz,
-                baud: Some(115_200),
-                stdout: stdout_phys == Some(port.phys_addr),
-            },
-        };
-        if register_platform_device(info, "dtb") {
-            platform_bound += 1;
-        }
-    }
-    for device in &virtio_mmio_devices {
-        let mut ids = Vec::new();
-        ids.push(DeviceMatchId::DtbCompatible("virtio,mmio".into()));
-        let mut resources = Vec::new();
-        resources.push(DeviceResource::Mmio {
-            phys: device.phys_addr,
-            size: device.size,
-        });
-        let info = PlatformDeviceInfo {
-            fw_name: device.name.into(),
-            ids,
-            resources,
-            properties: DeviceProperties::default(),
-        };
+    for device in &platform_devices {
+        let info = platform_device_info_from_dtb(device, stdout_phys);
         if register_platform_device(info, "dtb") {
             platform_bound += 1;
         }
     }
     printk!(
         "[kernel-start][dtb] platform PnP discovery complete: {} candidate(s), {} bound",
-        serial_ports.len() + virtio_mmio_devices.len(),
+        platform_devices.len(),
         platform_bound
     );
 
@@ -556,11 +524,42 @@ fn mount_block_root(
         .map_err(|_| "unsupported or invalid root filesystem")
 }
 
+fn platform_device_info_from_dtb(
+    device: &firmware_dtb::DtbPlatformDeviceInfo,
+    stdout_phys: Option<usize>,
+) -> PlatformDeviceInfo {
+    let ids = device
+        .compatible
+        .iter()
+        .map(|compatible| DeviceMatchId::DtbCompatible((*compatible).into()))
+        .collect();
+    let resources = device
+        .reg_ranges
+        .iter()
+        .map(|range| DeviceResource::Mmio {
+            phys: range.phys_addr,
+            size: range.size,
+        })
+        .collect();
+    let first_phys = device.reg_ranges.first().map(|range| range.phys_addr);
+
+    PlatformDeviceInfo {
+        fw_name: device.name.into(),
+        ids,
+        resources,
+        properties: DeviceProperties {
+            clock_hz: device.clock_hz,
+            baud: None,
+            stdout: first_phys == stdout_phys,
+        },
+    }
+}
+
 fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
     match register_and_probe_platform_device(info) {
         Ok(reg) if reg.bound => true,
         Ok(reg) => {
-            printk!(
+            log::debug!(
                 "[kernel-start][{}] no platform driver for {}",
                 tag,
                 reg.device.id

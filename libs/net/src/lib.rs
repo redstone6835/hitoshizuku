@@ -59,3 +59,6 @@ pub use error::NetError;
 pub use socket::{NetSocketHandle, SocketState, SocketType};
 pub use stack::stack;
 pub use stack::{IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, InterfaceSnapshot, NeighborEntry};
+// 把 smoltcp 的时间类型 re-export 出来，外部（kernel 侧的 net_poll 钩子）
+// 不用直接依赖 smoltcp。
+pub use smoltcp::time::Instant;
