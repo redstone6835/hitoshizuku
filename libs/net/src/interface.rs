@@ -389,6 +389,107 @@ impl ManagedInterface {
     ) -> &smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get(handle)
     }
+
+    // ── Socket 快照遍历（供 /proc/net/ 使用）──────────────────────────
+
+    /// 遍历所有非监听 TCP socket，产出快照列表。
+    pub fn tcp_connection_snapshots(
+        &self,
+        _iface_id: super::device::InterfaceId,
+    ) -> Vec<super::socket::TcpConnSnapshot> {
+        let mut out = Vec::new();
+        for (handle, socket) in self.sockets.iter() {
+            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
+                if self
+                    .meta
+                    .get(&handle)
+                    .map_or(true, |m| m.is_removed())
+                {
+                    continue;
+                }
+                use smoltcp::socket::tcp::State;
+                if matches!(tcp_socket.state(), State::Listen) {
+                    continue;
+                }
+                let local = tcp_socket
+                    .local_endpoint()
+                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                let remote = tcp_socket
+                    .remote_endpoint()
+                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                if let (Some(local), Some(remote)) = (local, remote) {
+                    out.push(super::socket::TcpConnSnapshot {
+                        local,
+                        remote,
+                        state: tcp_state_to_u8(tcp_socket.state()),
+                        tx_queue: tcp_socket.send_queue(),
+                        rx_queue: tcp_socket.recv_queue(),
+                        inode: 0, // 由 procfs 渲染时填入 slot 号
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// 遍历所有 UDP socket，产出快照列表。
+    pub fn udp_socket_snapshots(
+        &self,
+        _iface_id: super::device::InterfaceId,
+    ) -> Vec<super::socket::UdpSockSnapshot> {
+        let mut out = Vec::new();
+        for (handle, socket) in self.sockets.iter() {
+            if let smoltcp::socket::Socket::Udp(udp_socket) = socket {
+                if self
+                    .meta
+                    .get(&handle)
+                    .map_or(true, |m| m.is_removed())
+                {
+                    continue;
+                }
+                let listen_ep = udp_socket.endpoint();
+                if let Some(smoltcp_addr) = listen_ep.addr {
+                    let local_addr = match smoltcp_addr {
+                        smoltcp::wire::IpAddress::Ipv4(v4) => {
+                            crate::config::IpAddr::V4(crate::config::Ipv4Addr(v4.octets()))
+                        }
+                        smoltcp::wire::IpAddress::Ipv6(v6) => {
+                            crate::config::IpAddr::V6(crate::config::Ipv6Addr(v6.octets()))
+                        }
+                    };
+                    let local = crate::Endpoint {
+                        addr: local_addr,
+                        port: listen_ep.port,
+                    };
+                    out.push(super::socket::UdpSockSnapshot {
+                        local,
+                        remote: None,
+                        inode: 0, // 由 procfs 渲染时填入 slot 号
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+// ── TCP 状态→Linux 数值映射 ─────────────────────────────────────────────────
+
+fn tcp_state_to_u8(state: smoltcp::socket::tcp::State) -> u8 {
+    use smoltcp::socket::tcp::State;
+    match state {
+        State::Closed => 7,
+        State::Listen => 10,
+        State::SynSent => 2,
+        State::SynReceived => 3,
+        State::Established => 1,
+        State::FinWait1 => 4,
+        State::FinWait2 => 5,
+        State::CloseWait => 8,
+        State::Closing => 6,
+        State::LastAck => 9,
+        State::TimeWait => 7,
+    }
 }
 
 // ── 类型转换 ─────────────────────────────────────────────────────────────────

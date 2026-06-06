@@ -1132,6 +1132,40 @@ impl NetStack {
 
     // ── 内部辅助 ─────────────────────────────────────────────────────────
 
+    // ── Socket 快照查询（供 /proc/net/ 使用）──────────────────────────────
+
+    /// 快照所有接口上所有非监听 TCP 连接的 socket 信息。
+    pub fn snapshot_tcp_connections(
+        &self,
+    ) -> Vec<(InterfaceId, Vec<crate::socket::TcpConnSnapshot>)> {
+        let table = self.interfaces.read();
+        let mut out = Vec::new();
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            let snapshots = managed.tcp_connection_snapshots(id);
+            if !snapshots.is_empty() {
+                out.push((id, snapshots));
+            }
+        }
+        out
+    }
+
+    /// 快照所有接口上所有 UDP socket 的绑定信息。
+    pub fn snapshot_udp_sockets(
+        &self,
+    ) -> Vec<(InterfaceId, Vec<crate::socket::UdpSockSnapshot>)> {
+        let table = self.interfaces.read();
+        let mut out = Vec::new();
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            let snapshots = managed.udp_socket_snapshots(id);
+            if !snapshots.is_empty() {
+                out.push((id, snapshots));
+            }
+        }
+        out
+    }
+
     fn default_iface_id(&self) -> Result<InterfaceId, NetError> {
         let table = self.interfaces.read();
         let mut fallback = None;
@@ -1228,7 +1262,7 @@ fn endpoint_to_smoltcp(ep: &Endpoint) -> IpEndpoint {
     IpEndpoint::new(addr, ep.port)
 }
 
-fn endpoint_from_smoltcp(ep: IpEndpoint) -> Endpoint {
+pub(crate) fn endpoint_from_smoltcp(ep: IpEndpoint) -> Endpoint {
     let addr = match ep.addr {
         IpAddress::Ipv4(v4) => {
             let o = v4.octets();

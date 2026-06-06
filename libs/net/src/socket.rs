@@ -96,3 +96,24 @@ impl NetSocketHandle {
         self.sock_type
     }
 }
+
+// ── 快照类型（供 /proc/net/ 查询）─────────────────────────────────────────────
+
+/// /proc/net/tcp 渲染用的 TCP 连接快照。
+#[derive(Debug, Clone)]
+pub struct TcpConnSnapshot {
+    pub local: crate::Endpoint,
+    pub remote: crate::Endpoint,
+    pub state: u8,
+    pub tx_queue: usize,
+    pub rx_queue: usize,
+    pub inode: u64,
+}
+
+/// /proc/net/udp 渲染用的 UDP socket 快照。
+#[derive(Debug, Clone)]
+pub struct UdpSockSnapshot {
+    pub local: crate::Endpoint,
+    pub remote: Option<crate::Endpoint>,
+    pub inode: u64,
+}

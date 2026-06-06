@@ -54,7 +54,7 @@ pub use config::{CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4A
 pub use device::{InterfaceId, NetDevice};
 pub use driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 pub use error::NetError;
-pub use socket::{NetSocketHandle, SocketState, SocketType};
+pub use socket::{NetSocketHandle, SocketState, SocketType, TcpConnSnapshot, UdpSockSnapshot};
 pub use stack::stack;
 pub use stack::{
     IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, InterfaceSnapshot, NeighborEntry,
