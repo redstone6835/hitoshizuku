@@ -121,8 +121,8 @@ impl DhcpClient {
         let mut router: Option<Ipv4Addr> = None;
         let mut dns: Option<Ipv4Addr> = None;
 
-        if data.len() > 240 + 4 && data[240..244] == MAGIC_COOKIE {
-            let mut i = 244;
+        if data.len() > 236 + 4 && data[236..240] == MAGIC_COOKIE {
+            let mut i = 240;
             while i < data.len() {
                 let opt = data[i];
                 if opt == OPT_END {
@@ -211,14 +211,15 @@ impl DhcpClient {
 }
 
 fn fill_dhcp_header(pkt: &mut Vec<u8>, op: u8, mac: &[u8; 6], xid: u32) {
-    pkt.push(op);
-    pkt.push(1); // htype: Ethernet
-    pkt.push(6); // hlen
-    pkt.push(0); // hops
-    pkt.extend_from_slice(&xid.to_be_bytes());
-    pkt.extend_from_slice(&[0u8; 8]); // secs + flags
-    pkt.extend_from_slice(&[0u8; 16]); // ciaddr+yiaddr+siaddr+giaddr
-    pkt.extend_from_slice(mac);
-    pkt.resize(240, 0);
-    pkt.extend_from_slice(&MAGIC_COOKIE);
+    pkt.push(op);                        // 0
+    pkt.push(1);                         // 1 htype: Ethernet
+    pkt.push(6);                         // 2 hlen
+    pkt.push(0);                         // 3 hops
+    pkt.extend_from_slice(&xid.to_be_bytes()); // 4-7
+    pkt.extend_from_slice(&[0u8; 4]);    // 8-11 secs + flags
+    pkt.extend_from_slice(&[0u8; 16]);   // 12-27 ciaddr+yiaddr+siaddr+giaddr
+    pkt.extend_from_slice(mac);           // 28-33 chaddr[0..6]
+    pkt.extend_from_slice(&[0u8; 10]);   // 34-43 chaddr[6..16]
+    pkt.extend_from_slice(&[0u8; 192]);  // 44-235 sname(64)+file(128)
+    pkt.extend_from_slice(&MAGIC_COOKIE); // 236-239
 }
