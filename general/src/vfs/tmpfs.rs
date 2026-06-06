@@ -176,6 +176,11 @@ fn resize_file_data(file_data: &mut Vec<u8>, new_len: usize) -> VfsResult<()> {
     Ok(())
 }
 
+fn tmpfs_blocks_for_len(len: u64) -> u64 {
+    // stat.st_blocks 的单位固定为 512 字节，不等同于 tmpfs 的页大小。
+    len.saturating_add(511) / 512
+}
+
 fn ensure_empty_tmpfs_dir(inode: &Inode) -> VfsResult<()> {
     if inode.kind() != FileType::Directory {
         return Err(VfsError::NotADirectory);
@@ -509,7 +514,7 @@ impl InodeOps for TmpfsInodeOps {
             atime: now,
             mtime: now,
             ctime: now,
-            blocks: 0,
+            blocks: tmpfs_blocks_for_len(target.len() as u64),
         };
 
         let new_inode = Inode::new(
@@ -529,6 +534,8 @@ impl InodeOps for TmpfsInodeOps {
         );
 
         entries.insert(name.to_string(), ino);
+        dir.touch_mtime();
+        dir.touch_ctime();
         drop(data);
 
         Ok(sb.insert_inode(new_inode))
@@ -624,6 +631,8 @@ impl InodeOps for TmpfsInodeOps {
         entries.insert(name.to_string(), target.ino());
         target.inc_nlink();
         target.touch_ctime();
+        dir.touch_mtime();
+        dir.touch_ctime();
 
         Ok(())
     }
@@ -758,7 +767,9 @@ impl InodeOps for TmpfsInodeOps {
     }
 
     fn chown(&self, inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> VfsResult<()> {
-        inode.set_owner(uid, gid);
+        if uid.is_some() || gid.is_some() {
+            inode.set_owner(uid, gid);
+        }
         Ok(())
     }
 
@@ -787,7 +798,7 @@ impl InodeOps for TmpfsInodeOps {
         };
 
         resize_file_data(file_data, new_size as usize)?;
-        inode.set_size(new_size);
+        inode.set_size_and_blocks(new_size, tmpfs_blocks_for_len(new_size));
         inode.touch_mtime();
         inode.touch_ctime();
 
@@ -895,7 +906,8 @@ impl FileOps for TmpfsFileOps {
         file_data[start..end].copy_from_slice(buf);
         if let Some(inode) = self.inode() {
             if inode.size() != file_data.len() as u64 {
-                inode.set_size(file_data.len() as u64);
+                let size = file_data.len() as u64;
+                inode.set_size_and_blocks(size, tmpfs_blocks_for_len(size));
             }
             if !buf.is_empty() {
                 inode.touch_mtime();
@@ -922,7 +934,8 @@ impl FileOps for TmpfsFileOps {
         if end > file_data.len() {
             resize_file_data(file_data, end)?;
             if let Some(inode) = self.inode() {
-                inode.set_size(end as u64);
+                let size = end as u64;
+                inode.set_size_and_blocks(size, tmpfs_blocks_for_len(size));
                 inode.touch_mtime();
                 inode.touch_ctime();
             }

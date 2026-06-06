@@ -316,6 +316,14 @@ impl Inode {
         self.cached_size.store(new_size, Ordering::Release);
     }
 
+    /// 同时设置文件大小和块数，避免文件系统在常规写入/截断路径中拆开更新。
+    pub fn set_size_and_blocks(&self, new_size: u64, blocks: u64) {
+        let mut meta = self.meta.lock();
+        meta.size = new_size;
+        meta.blocks = blocks;
+        self.cached_size.store(new_size, Ordering::Release);
+    }
+
     /// 设置硬链接计数。
     pub fn set_nlink(&self, new_nlink: u32) {
         let mut meta = self.meta.lock();

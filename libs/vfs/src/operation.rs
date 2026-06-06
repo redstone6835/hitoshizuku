@@ -470,7 +470,7 @@ pub fn fchmodat(
     ctx: &VfsContext,
     dirfd: &Dirfd,
     path: &str,
-    mut mode: FileMode,
+    mode: FileMode,
     no_follow: bool,
 ) -> VfsResult<()> {
     let flags = if no_follow {
@@ -481,7 +481,20 @@ pub fn fchmodat(
     let result = path::lookup(ctx, dirfd, path, flags)?;
     result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    chmod_inode(ctx, &inode, mode)
+}
 
+/// `fchmod(2)` — 通过已打开 fd 修改文件权限位。
+pub fn fchmod(ctx: &VfsContext, fdt: &FdTable, fd: Fd, mode: FileMode) -> VfsResult<()> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    if file.flags().path_only {
+        return Err(VfsError::BadFileDescriptor);
+    }
+    file.mount().check_writable()?;
+    chmod_inode(ctx, file.inode(), mode)
+}
+
+fn chmod_inode(ctx: &VfsContext, inode: &Arc<Inode>, mut mode: FileMode) -> VfsResult<()> {
     let inode_uid = inode.meta_snapshot().uid;
     if !ctx.cred.is_owner(inode_uid) {
         return Err(VfsError::OperationNotPermitted);
@@ -492,7 +505,7 @@ pub fn fchmodat(
         mode = mode.without(FileMode::SUID_SGID);
     }
 
-    inode.ops.chmod(&inode, mode)
+    inode.ops.chmod(inode, mode)
 }
 
 // ── chown ─────────────────────────────────────────────────────────────────────
@@ -506,6 +519,10 @@ pub fn fchownat(
     gid: Option<cred::Gid>,
     no_follow: bool,
 ) -> VfsResult<()> {
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+
     let flags = if no_follow {
         LookupFlags::NO_FOLLOW
     } else {
@@ -514,7 +531,35 @@ pub fn fchownat(
     let result = path::lookup(ctx, dirfd, path, flags)?;
     result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    chown_inode(ctx, &inode, uid, gid)
+}
 
+/// `fchown(2)` — 通过已打开 fd 修改文件所有者或所属组。
+pub fn fchown(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    fd: Fd,
+    uid: Option<cred::Uid>,
+    gid: Option<cred::Gid>,
+) -> VfsResult<()> {
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    if file.flags().path_only {
+        return Err(VfsError::BadFileDescriptor);
+    }
+    file.mount().check_writable()?;
+    chown_inode(ctx, file.inode(), uid, gid)
+}
+
+fn chown_inode(
+    ctx: &VfsContext,
+    inode: &Arc<Inode>,
+    uid: Option<cred::Uid>,
+    gid: Option<cred::Gid>,
+) -> VfsResult<()> {
     let (inode_uid, inode_gid) = {
         let m = inode.meta_snapshot();
         (m.uid, m.gid)
@@ -538,14 +583,14 @@ pub fn fchownat(
         }
     }
 
-    inode.ops.chown(&inode, uid, gid)?;
+    inode.ops.chown(inode, uid, gid)?;
 
     // POSIX：chown 后必须清除 SUID/SGID，防止权限提升（除非 CAP_FSETID）
     if (uid.is_some() || gid.is_some()) && !ctx.cred.has_cap(cred::Capability::FSetId) {
         let current_mode = inode.meta_snapshot().mode;
         let new_mode = current_mode.without(FileMode::SUID_SGID);
         if new_mode != current_mode {
-            inode.ops.chmod(&inode, new_mode)?;
+            inode.ops.chmod(inode, new_mode)?;
         }
     }
 
@@ -609,6 +654,17 @@ pub fn mount(
     if let Some(driver) = FS_REGISTRY.find(fs_type) {
         match driver.mount(dev, data) {
             Ok(superblock) => {
+                if driver.flags().has(superblock::FsDriverFlags::SINGLE) {
+                    if let Some(existing) = ctx.mount_ns.lookup_mount(&mountpoint.dentry) {
+                        if Arc::ptr_eq(&existing.superblock, &superblock) {
+                            // SINGLE 文件系统（procfs/sysfs/devtmpfs）在同一挂载点重复
+                            // mount 时应表现为幂等操作。否则用户态 init 脚本再次挂载
+                            // /dev 会叠一层新 Mount，隐藏启动期已经挂好的 /dev/shm。
+                            existing.set_flags(mount_flags);
+                            return Ok(existing);
+                        }
+                    }
+                }
                 return ctx.mount_ns.mount_at(
                     mountpoint.dentry,
                     mountpoint.mount,

@@ -30,8 +30,10 @@ pub fn register_all() {
     register_syscall(nr::SYS_LINKAT, fs::sys_linkat);
     register_syscall(nr::SYS_SYMLINKAT, fs::sys_symlinkat);
     register_syscall(nr::SYS_MKNODAT, fs::sys_mknodat);
+    register_syscall(nr::SYS_FCHMOD, fs::sys_fchmod);
     register_syscall(nr::SYS_FCHMODAT, fs::sys_fchmodat);
     register_syscall(nr::SYS_FCHOWNAT, fs::sys_fchownat);
+    register_syscall(nr::SYS_FCHOWN, fs::sys_fchown);
     register_syscall(nr::SYS_UTIMENSAT, fs::sys_utimensat);
     register_syscall(nr::SYS_TRUNCATE, fs::sys_truncate);
     register_syscall(nr::SYS_FTRUNCATE, fs::sys_ftruncate);

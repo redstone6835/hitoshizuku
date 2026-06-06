@@ -161,6 +161,11 @@ fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
     PNP_DEVTMPFS_SB.lock().ok_or(PnpError::NoDevtmpfs)
 }
 
+fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
+    let guard = PNP_DEVTMPFS_SB.lock();
+    guard.as_ref().map(|sb| Arc::clone(*sb))
+}
+
 fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
     let sb = pnp_devtmpfs_sb()?;
     let ops = sb
@@ -699,8 +704,15 @@ impl FileOps for CharDevFileOps {
             return PollEvents::POLLERR.with(PollEvents::POLLHUP);
         }
         if self.is_tty() {
-            let state = self.line_state.lock();
-            let readable = state.eof_pending || !state.ready.is_empty();
+            let line_readable = {
+                let state = self.line_state.lock();
+                state.eof_pending || !state.ready.is_empty()
+            };
+            let termios = *self.termios.lock();
+            // 非规范模式下，用户程序通常先 poll/select 再 read 一个按键。
+            // 行缓冲为空时必须继续向下看 UART/字符设备的接收 FIFO，否则
+            // busybox ash/readline 会一直认为 stdin 不可读，表现为终端无法输入。
+            let readable = line_readable || (!termios.canonical() && self.dev.poll_read());
             return if readable {
                 PollEvents::POLLIN.with(PollEvents::POLLOUT)
             } else {
@@ -2056,6 +2068,13 @@ impl FsDriver for DevTmpfsDriver {
     }
 
     fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
+        // devtmpfs 是内核设备树的 POSIX 投影，不能像 tmpfs 一样每次 mount
+        // 都创建空实例。启动期 PnP bridge 安装后，用户态再次挂载 devtmpfs
+        // 应复用同一个 superblock，否则会覆盖掉已经绑定的 console/uart/vd0 等节点。
+        if let Some(sb) = mounted_devtmpfs_sb() {
+            return Ok(sb);
+        }
+
         let fs_id = FsId::new(DEVTMPFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
         let root_ops = Arc::new(DevDirOps::new());

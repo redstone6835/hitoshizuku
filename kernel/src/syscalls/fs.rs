@@ -11,6 +11,7 @@ use general::mm::{copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::{current_fdtable, current_vfs_context, namespace_path};
 use sched::{SigProcMaskHow, SigSet};
+use vfs::cred::{Gid, Uid};
 use vfs::error::VfsError;
 use vfs::fdtable::{Fd, FdFlags};
 use vfs::file::{AccessMode, IoctlCmd, OpenOptions, PollEvents, SeekFrom};
@@ -552,6 +553,15 @@ pub(super) fn sys_mknodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     Ok(0)
 }
 
+pub(super) fn sys_fchmod(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let mode = FileMode::new((ctx.args[1] & 0o7777) as u16);
+    operation::fchmod(&vfs_ctx, &fdt, fd, mode).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
 pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
@@ -563,15 +573,27 @@ pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 }
 
 pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    use vfs::cred::{Gid, Uid};
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_cstr_from_user(ctx.args[1], PATH_MAX).map_err(|e| e.as_errno())?;
-    let uid_raw = ctx.args[2] as u32;
-    let gid_raw = ctx.args[3] as u32;
+    let (uid, gid) = decode_optional_owner(ctx.args[2] as u32, ctx.args[3] as u32);
     let flags = ctx.args[4];
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
+    operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_fchown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let (uid, gid) = decode_optional_owner(ctx.args[1] as u32, ctx.args[2] as u32);
+    operation::fchown(&vfs_ctx, &fdt, fd, uid, gid).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+fn decode_optional_owner(uid_raw: u32, gid_raw: u32) -> (Option<Uid>, Option<Gid>) {
     let uid = if uid_raw == u32::MAX {
         None
     } else {
@@ -582,8 +604,7 @@ pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     } else {
         Some(Gid(gid_raw))
     };
-    operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
-    Ok(0)
+    (uid, gid)
 }
 
 pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

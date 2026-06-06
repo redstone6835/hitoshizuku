@@ -51,6 +51,14 @@ pub trait CharDriver: Send + Sync {
     /// 返回实际读取的字节数。`Ok(0)` 表示当前无可用数据。
     fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError>;
 
+    /// 查询设备底层当前是否有可读数据。
+    ///
+    /// 这是给 `poll(2)`/`select(2)` 的非破坏性快照接口；TTY 行规程仍由
+    /// devtmpfs 负责，驱动只暴露硬件接收 FIFO/软件接收队列是否非空。
+    fn poll_read(&self) -> bool {
+        false
+    }
+
     /// 阻塞等待设备内部写缓冲全部排空。
     ///
     /// 默认实现为空操作（无内部缓冲的设备）。
@@ -119,6 +127,10 @@ impl<T: CharDriver + ?Sized> CharDriver for &'static T {
 
     fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
         (**self).read(buf)
+    }
+
+    fn poll_read(&self) -> bool {
+        (**self).poll_read()
     }
 
     fn flush(&self) -> Result<(), CharIoError> {
@@ -228,6 +240,10 @@ impl CharDriver for ZeroCharDriver {
         Ok(buf.len())
     }
 
+    fn poll_read(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -310,6 +326,12 @@ impl CharDevice {
             return Err(CharIoError::Unavailable);
         }
         self.inner.driver.read(buf)
+    }
+
+    /// 查询底层设备当前是否有可读字节（委托至驱动）。
+    #[inline]
+    pub fn poll_read(&self) -> bool {
+        self.is_active() && self.inner.driver.poll_read()
     }
 
     /// 阻塞排空（委托至驱动）。
