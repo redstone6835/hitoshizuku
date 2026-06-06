@@ -721,15 +721,6 @@ impl NetStack {
         Ok(())
     }
 
-    /// 设置指定接口的标志。
-    pub fn set_iface_flags(&self, id: InterfaceId, flags: u32) -> Result<(), NetError> {
-        let table = self.interfaces.read();
-        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
-        let mut managed = iface_lock.lock();
-        managed.set_flags(flags);
-        Ok(())
-    }
-
     /// 在指定接口上添加 IPv4 路由。
     pub fn add_route(
         &self, id: InterfaceId, dest: crate::Ipv4Addr, mask: crate::Ipv4Addr,

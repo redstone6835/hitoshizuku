@@ -204,30 +204,67 @@ fn dispatch_message(
 }
 
 fn handle_newaddr(seq: u32, ifaces: &[InterfaceSnapshot], payload: &[u8]) -> Vec<Vec<u8>> {
-    if let Some(addr) = parse_payload_ipv4(payload) {
-        if let Some(iface) = ifaces.first() {
-            let _ = net::stack().set_iface_ipv4_addr(iface.id, addr, 24);
-        }
+    // ifaddrmsg: family(1) + pad(1) + prefixlen(1) + flags(1) + scope(1) + index(4) = 8 bytes
+    if payload.len() < 8 {
+        return vec![build_nlmsg_error(seq, -(22))]; // EINVAL
     }
-    vec![build_nlmsg_error(seq, 0)]
+    let prefix_len = payload[1];
+    let if_index = i32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let iface = ifaces.iter().find(|i| i.id.raw() as i32 == if_index - 1)
+        .or_else(|| ifaces.iter().find(|i| i.name != "lo"))
+        .or_else(|| ifaces.first());
+    match (iface, parse_nlattr_ipv4(&payload[8..])) {
+        (Some(iface), Some(addr)) => {
+            match net::stack().set_iface_ipv4_addr(iface.id, addr, prefix_len) {
+                Ok(()) => vec![build_nlmsg_error(seq, 0)],
+                Err(e) => vec![build_nlmsg_error(seq, -map_net_error(e))],
+            }
+        }
+        _ => vec![build_nlmsg_error(seq, -(19))], // ENODEV
+    }
 }
 
 fn handle_newroute(seq: u32, ifaces: &[InterfaceSnapshot], payload: &[u8]) -> Vec<Vec<u8>> {
-    if let (Some(dest), Some(gw)) = parse_route_attrs(payload) {
-        let mask = net::Ipv4Addr([255, 255, 255, 0]);
-        let target = ifaces.iter().find(|i| i.name != "lo").or(ifaces.first());
-        if let Some(iface) = target {
-            let _ = net::stack().add_route(iface.id, dest, mask, gw);
-        }
+    // rtmsg: family(1) + dst_len(1) + src_len(1) + tos(1) + table(1) + protocol(1) +
+    //         scope(1) + type(1) + flags(4) = 12 bytes
+    if payload.len() < 12 {
+        return vec![build_nlmsg_error(seq, -(22))];
     }
-    vec![build_nlmsg_error(seq, 0)]
+    let dst_len = payload[1];
+    let (dest, gw) = parse_route_attrs(&payload[12..]);
+    // 使用 rtmsg.dst_len 作为前缀长度
+    let mask = match dest {
+        Some(d) if dst_len > 0 => {
+            let prefix = dst_len.min(32);
+            d
+        }
+        _ => return vec![build_nlmsg_error(seq, -(22))],
+    };
+    let target = ifaces.iter().find(|i| i.name != "lo").or(ifaces.first());
+    if let Some(iface) = target {
+        if let Some(gw) = gw {
+            let full_mask = net::Ipv4Addr(u32::MAX
+                .checked_shl(32 - dst_len as u32)
+                .unwrap_or(0)
+                .to_be_bytes());
+            match net::stack().add_route(iface.id, dest?, full_mask, gw) {
+                Ok(()) => vec![build_nlmsg_error(seq, 0)],
+                Err(e) => vec![build_nlmsg_error(seq, -map_net_error(e))],
+            }
+        } else {
+            vec![build_nlmsg_error(seq, -(22))]
+        }
+    } else {
+        vec![build_nlmsg_error(seq, -(19))]
+    }
 }
 
-fn parse_payload_ipv4(payload: &[u8]) -> Option<net::Ipv4Addr> {
-    if payload.len() < 8 {
-        return None;
+fn map_net_error(e: net::NetError) -> i32 {
+    match e {
+        net::NetError::InterfaceNotFound => 19,  // ENODEV
+        net::NetError::AddressInUse => 98,        // EADDRINUSE
+        _ => 22,                                   // EINVAL
     }
-    parse_nlattr_ipv4(&payload[8..])
 }
 
 fn parse_nlattr_ipv4(attrs: &[u8]) -> Option<net::Ipv4Addr> {

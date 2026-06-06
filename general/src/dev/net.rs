@@ -94,7 +94,7 @@ pub fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         SIOCGIFINDEX => ioctl_gifindex(arg),
         SIOCGIFTXQLEN => ioctl_giftxqlen(arg),
         SIOCGIFBRDADDR => ioctl_gifbrdaddr(arg),
-        SIOCSIFFLAGS => ioctl_sifflags(arg),
+        SIOCSIFFLAGS => Err(Errno::EPERM), // smoltcp 不支持接口 UP/DOWN 切换
         SIOCSIFADDR => ioctl_sifaddr(arg),
         SIOCSIFNETMASK => ioctl_sifnetmask(arg),
         SIOCSIFMTU | SIOCSIFTXQLEN => Err(Errno::EPERM),
@@ -320,18 +320,6 @@ fn ioctl_gifbrdaddr(arg: usize) -> Result<usize, Errno> {
 
 // ── 设置类 ioctl 实现 ─────────────────────────────────────────────────────
 
-fn ioctl_sifflags(arg: usize) -> Result<usize, Errno> {
-    let name = read_ifreq_name(arg)?;
-    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
-    let mut flags_buf = [0u8; 2];
-    copy_from_user(arg + IFNAMSIZ, &mut flags_buf).map_err(|_| Errno::EFAULT)?;
-    let flags = i16::from_ne_bytes(flags_buf) as u32;
-    net::stack()
-        .set_iface_flags(iface.id, flags)
-        .map_err(|_| Errno::ENODEV)?;
-    Ok(0)
-}
-
 fn ioctl_sifaddr(arg: usize) -> Result<usize, Errno> {
     let name = read_ifreq_name(arg)?;
     let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
@@ -363,16 +351,15 @@ fn ioctl_sifnetmask(arg: usize) -> Result<usize, Errno> {
     }
     let mask = net::Ipv4Addr([sa[4], sa[5], sa[6], sa[7]]);
     let prefix = mask_to_prefix_len_bytes(&mask.0);
-    if let Some(cidr) = iface
+    let cidr = iface
         .addresses
         .iter()
         .find(|c| matches!(c.addr, net::IpAddr::V4(_)))
-    {
-        if let net::IpAddr::V4(v4) = cidr.addr {
-            net::stack()
-                .set_iface_ipv4_addr(iface.id, v4, prefix)
-                .map_err(|_| Errno::ENODEV)?;
-        }
+        .ok_or(Errno::EADDRNOTAVAIL)?;
+    if let net::IpAddr::V4(v4) = cidr.addr {
+        net::stack()
+            .set_iface_ipv4_addr(iface.id, v4, prefix)
+            .map_err(|_| Errno::ENODEV)?;
     }
     Ok(0)
 }
@@ -399,7 +386,8 @@ fn ioctl_delrt(arg: usize) -> Result<usize, Errno> {
     let dest = extract_ipv4(&buf, 8);
     let mask = extract_ipv4(&buf, 40);
     let ifaces = net::stack().snapshot_interfaces();
-    if let Some(iface) = ifaces.first() {
+    let target = ifaces.iter().find(|i| i.name != "lo").or(ifaces.first());
+    if let Some(iface) = target {
         net::stack()
             .remove_route(iface.id, dest, mask)
             .map_err(|_| Errno::EINVAL)?;

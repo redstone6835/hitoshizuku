@@ -182,11 +182,6 @@ impl ManagedInterface {
         });
     }
 
-    /// 设置接口标志。当前仅记录 IFF_UP 状态变更。
-    pub fn set_flags(&mut self, _flags: u32) {
-        // smoltcp 无接口 UP/DOWN 切换 API，标志仅通过 ioctl 返回。
-    }
-
     /// 添加 IPv4 路由（smoltcp 仅支持默认路由）。
     pub fn add_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
         let prefix_len = mask_to_prefix_len(mask);
