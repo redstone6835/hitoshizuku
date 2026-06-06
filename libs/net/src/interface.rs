@@ -31,6 +31,9 @@ pub(crate) struct ManagedInterface {
     sockets: SocketSet<'static>,
     /// 每个 socket 的元数据（soft-close 标志）。
     pub(crate) meta: BTreeMap<SocketHandle, SocketMeta>,
+    /// 已完成握手的 TCP socket 队列（accept backlog）。
+    pending_accepted: Vec<SocketHandle>,
+    max_backlog: usize,
     #[allow(dead_code)]
     config: IfConfig,
     #[allow(dead_code)]
@@ -94,6 +97,8 @@ impl ManagedInterface {
             device,
             sockets: SocketSet::new(Vec::new()),
             meta: BTreeMap::new(),
+            pending_accepted: Vec::new(),
+            max_backlog: 128,
             config,
             net_device,
         }

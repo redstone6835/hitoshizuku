@@ -1177,6 +1177,33 @@ impl NetStack {
 
     // ── 内部辅助 ─────────────────────────────────────────────────────────
 
+    /// 按目标地址做最长前缀匹配选择出口接口（跳过 loopback）。
+    pub fn resolve_iface_for_remote(&self, remote: &crate::IpAddr) -> Option<InterfaceId> {
+        let table = self.interfaces.read();
+        let mut best: Option<(InterfaceId, u8)> = None;
+        for (&id, iface_lock) in table.iter() {
+            let managed = iface_lock.lock();
+            if managed.name() == "lo" {
+                continue;
+            }
+            for cidr in &managed.config().addresses {
+                if ip_matches_cidr(remote, cidr) {
+                    if best.map_or(true, |(_, p)| cidr.prefix_len > p) {
+                        best = Some((id, cidr.prefix_len));
+                    }
+                }
+            }
+        }
+        if let Some((id, _)) = best {
+            return Some(id);
+        }
+        // 回退：第一个非 lo 接口
+        table
+            .iter()
+            .find(|&(_, lock)| lock.lock().name() != "lo")
+            .map(|(&id, _)| id)
+    }
+
     // ── Socket 快照查询（供 /proc/net/ 使用）──────────────────────────────
 
     /// 快照所有接口上所有非监听 TCP 连接的 socket 信息。
@@ -1333,6 +1360,21 @@ fn tcp_state_to_socket_state(state: smoltcp::socket::tcp::State) -> SocketState 
 }
 
 use core::sync::atomic::{AtomicU16, Ordering};
+
+fn ip_matches_cidr(addr: &crate::IpAddr, cidr: &crate::config::CidrAddress) -> bool {
+    match (addr, &cidr.addr) {
+        (crate::IpAddr::V4(a), crate::IpAddr::V4(c)) => {
+            if cidr.prefix_len == 0 {
+                return true;
+            }
+            let mask = !0u32 << (32 - cidr.prefix_len);
+            let a_int = u32::from_be_bytes(a.0);
+            let c_int = u32::from_be_bytes(c.0);
+            (a_int & mask) == (c_int & mask)
+        }
+        _ => false,
+    }
+}
 
 fn pick_ephemeral_port() -> u16 {
     static PORT: AtomicU16 = AtomicU16::new(49152);
