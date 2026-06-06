@@ -535,9 +535,9 @@ fn tcp_state_to_u8(state: smoltcp::socket::tcp::State) -> u8 {
         State::FinWait1 => 4,
         State::FinWait2 => 5,
         State::CloseWait => 8,
-        State::Closing => 6,
+        State::TimeWait => 6,  // TCP_TIME_WAIT
+        State::Closing => 11,   // TCP_CLOSING
         State::LastAck => 9,
-        State::TimeWait => 7,
     }
 }
 
