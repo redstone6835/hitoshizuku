@@ -249,8 +249,10 @@ impl EntropyPool {
 
     /// 增加熵估计，clamp 到 POOL_BITS。
     fn credit(&mut self, bits: u64) {
-        self.estimated_entropy_bits =
-            self.estimated_entropy_bits.saturating_add(bits).min(POOL_BITS);
+        self.estimated_entropy_bits = self
+            .estimated_entropy_bits
+            .saturating_add(bits)
+            .min(POOL_BITS);
     }
 
     /// 扣除熵估计，不允许下溢成负数。
@@ -388,7 +390,9 @@ impl Crng {
             }
             let block = cipher.block(self.counter);
             self.counter = self.counter.wrapping_add(1);
-            self.bytes_since_reseed = self.bytes_since_reseed.saturating_add(CHACHA20_BLOCK as u64);
+            self.bytes_since_reseed = self
+                .bytes_since_reseed
+                .saturating_add(CHACHA20_BLOCK as u64);
             let want = (out.len() - produced).min(CHACHA20_BLOCK);
             out[produced..produced + want].copy_from_slice(&block[..want]);
             produced += want;

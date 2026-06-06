@@ -359,7 +359,9 @@ pub fn clone_with_context(args: CloneArgs, user_ctx: UserContextRef) -> Result<P
     }
 
     if args.flags.has(CloneFlags::CLONE_VFORK) {
-        child.vfork_done.wait_event(&parent, || !child.is_vforking());
+        child
+            .vfork_done
+            .wait_event(&parent, || !child.is_vforking());
     }
 
     Ok(pid)
@@ -454,7 +456,10 @@ fn wait_child_observable(
 ) -> bool {
     let children = parent.snapshot_children();
     let mut any_match = false;
-    for child in children.iter().filter(|c| matches_waitid(c, target, parent)) {
+    for child in children
+        .iter()
+        .filter(|c| matches_waitid(c, target, parent))
+    {
         any_match = true;
         if wait_exited && child.state() == TaskState::Zombie {
             return true;

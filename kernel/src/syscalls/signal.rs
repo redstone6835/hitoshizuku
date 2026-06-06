@@ -145,7 +145,11 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
         if sec == 0 && nsec == 0 {
             None
         } else {
-            Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
+            Some(
+                (sec as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(nsec as u64),
+            )
         }
     };
 

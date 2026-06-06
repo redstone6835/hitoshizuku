@@ -201,8 +201,7 @@ fn load_user_image_from_path_inner(
     let vdso_data_flags = VmFlags::EMPTY.with(VmFlags::READ).with(VmFlags::USER);
     let vdso_data_paddr = crate::vdso::shared_data_page_paddr()?;
     vm.map_direct(
-        vdso_base + hal::user::vdso_data_page_offset()
-            ..vdso_base + hal::user::vdso_total_size(),
+        vdso_base + hal::user::vdso_data_page_offset()..vdso_base + hal::user::vdso_total_size(),
         vdso_data_paddr,
         vdso_data_flags,
     )?;

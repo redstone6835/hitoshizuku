@@ -43,15 +43,16 @@ use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::{Dentry, VfsRoot};
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
+use general::vfs::ensure_dir;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
+use general::vfs::mount_posix_shm_tmpfs;
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::{StartContext, StartFirmware};
 use log::{LogRecord, LogSink, printk};
 
-use crate::dtb::ensure_dir;
 use crate::start;
 
 const ACPI_MADT_TYPE_LOCAL_APIC: u8 = 0;
@@ -470,8 +471,6 @@ pub fn kernel_start_init(context: &StartContext) {
         platform_bound
     );
 
-    printk!("[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev'");
-
     // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
 
     let vfs_ctx = VfsContext::new(
@@ -483,6 +482,11 @@ pub fn kernel_start_init(context: &StartContext) {
         FileMode::new(0),
         VfsLimits::default_arc(),
     );
+
+    // /dev 已经由 devtmpfs 覆盖；此时在其中建立 /dev/shm 挂载点，再覆盖 tmpfs
+    // 作为 POSIX shm 的普通文件后端，避免引入特殊共享内存文件系统。
+    mount_posix_shm_tmpfs(&vfs_ctx)
+        .expect("[kernel-start][acpi] failed to mount tmpfs on /dev/shm");
 
     // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
     // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
@@ -510,6 +514,10 @@ pub fn kernel_start_init(context: &StartContext) {
             MountFlags::default(),
         )
         .expect("[kernel-start][acpi] failed to mount sysfs on /sys");
+
+    printk!(
+        "[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'"
+    );
 
     let console_registered = {
         let cmdline_dev = cmdline

@@ -1593,10 +1593,7 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
-        Some(
-            sched::now_ns_public()
-                .saturating_add((timeout_ms as u64).saturating_mul(1_000_000)),
-        )
+        Some(sched::now_ns_public().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
     } else {
         None
     }

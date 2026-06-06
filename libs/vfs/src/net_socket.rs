@@ -890,9 +890,7 @@ impl NetSocketFileOps {
                         if self.deadline_expired(deadline) {
                             return Err(Errno::EAGAIN);
                         }
-                        self.wait_with_deadline(deadline, || {
-                            net::stack().socket_can_recv(handle)
-                        })?;
+                        self.wait_with_deadline(deadline, || net::stack().socket_can_recv(handle))?;
                     }
                     Err(e) => {
                         let errno = map_net_error(e);
@@ -1043,7 +1041,7 @@ fn errno_to_vfs(e: Errno) -> VfsError {
         Errno::ERANGE | Errno::ECHILD | Errno::ENOEXEC | Errno::ESRCH | Errno::ESUCCESS => {
             VfsError::InvalidArgument
         }
-        Errno::Other(_) => VfsError::Io,
+        _ => VfsError::Io,
     }
 }
 

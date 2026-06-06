@@ -307,7 +307,9 @@ impl Socket {
                 match &*state {
                     StreamState::Init => Ok(()),
                     StreamState::Connected(_) => Err(SocketError::AlreadyConnected),
-                    StreamState::Listening(_) | StreamState::Closed => Err(SocketError::StateMismatch),
+                    StreamState::Listening(_) | StreamState::Closed => {
+                        Err(SocketError::StateMismatch)
+                    }
                 }
             }
             SocketKind::Datagram(dgram) => {

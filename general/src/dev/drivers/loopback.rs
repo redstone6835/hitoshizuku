@@ -9,9 +9,9 @@ use core::any::Any;
 
 use spin::Mutex;
 
-use net::driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 use net::config::{IfConfig, Ipv4Addr};
 use net::device::NetDevice;
+use net::driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 
 use crate::dev::pnp::PnpError;
 

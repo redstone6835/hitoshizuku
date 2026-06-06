@@ -329,7 +329,12 @@ impl BlockDevice {
 
     // ── 参数校验 ──────────────────────────────────────
 
-    fn validate_bio(&self, op: BioOp, range: BlockRange, buffer: &BioBuffer) -> Result<(), BioError> {
+    fn validate_bio(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        buffer: &BioBuffer,
+    ) -> Result<(), BioError> {
         if !self.is_active() {
             return Err(BioError::Submit(SubmitError::DeviceGone));
         }
@@ -342,7 +347,8 @@ impl BlockDevice {
                 if op == BioOp::Discard && !self.features.contains(BlockFeatures::DISCARD) {
                     return Err(BioError::Submit(SubmitError::Unsupported));
                 }
-                if op == BioOp::WriteZeroes && !self.features.contains(BlockFeatures::WRITE_ZEROES) {
+                if op == BioOp::WriteZeroes && !self.features.contains(BlockFeatures::WRITE_ZEROES)
+                {
                     return Err(BioError::Submit(SubmitError::Unsupported));
                 }
             }
@@ -350,33 +356,51 @@ impl BlockDevice {
         }
 
         if range.blocks == 0 {
-            return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::EmptyRange)));
+            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                BioReqError::EmptyRange,
+            )));
         }
         if let Some(max) = self.limits.max_blocks_per_io() {
             if range.blocks > max.get() {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::TooLarge)));
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::TooLarge,
+                )));
             }
         }
         if let Some(count) = self.geometry.block_count() {
-            let end = range.lba.checked_add(range.blocks as u64)
-                .ok_or(BioError::Submit(SubmitError::InvalidRequest(BioReqError::OutOfBounds)))?;
+            let end = range
+                .lba
+                .checked_add(range.blocks as u64)
+                .ok_or(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::OutOfBounds,
+                )))?;
             if end > count {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::OutOfBounds)));
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::OutOfBounds,
+                )));
             }
         }
 
         if op.needs_data() {
             let block_size = self.geometry.logical_block_size().get() as usize;
-            let expected = (range.blocks as usize).checked_mul(block_size)
-                .ok_or(BioError::Submit(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch)))?;
+            let expected =
+                (range.blocks as usize)
+                    .checked_mul(block_size)
+                    .ok_or(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )))?;
             if buffer.len() != expected {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch)));
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::BufferSizeMismatch,
+                )));
             }
             if let Some(alignment) = self.limits.buffer_alignment() {
                 let align = alignment.get() as usize;
                 if let BioBuffer::Owned(b) = buffer {
                     if !(b.as_ptr() as usize).is_multiple_of(align) {
-                        return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::Misaligned)));
+                        return Err(BioError::Submit(SubmitError::InvalidRequest(
+                            BioReqError::Misaligned,
+                        )));
                     }
                 }
             }

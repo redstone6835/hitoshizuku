@@ -34,8 +34,8 @@ use spin::mutex::Mutex;
 
 use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
-    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
-    BlockGeometry, BlockLimits,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry,
+    BlockLimits,
 };
 use crate::dev::function::BlockFunction;
 use crate::dev::pci::{PciBar, PciBarType, PciDevice, PciInfo};
@@ -652,7 +652,6 @@ impl VirtioBlkPciIo {
     }
 }
 
-
 impl BlockDriver for VirtioBlkPciIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
         self.driver.poll();
@@ -679,7 +678,11 @@ impl BlockDriver for VirtioBlkPciIo {
             _ => bio.range.lba.saturating_mul(sector_scale),
         };
         let meta = Box::new(VirtioBlkReqMeta {
-            header: VirtioBlkReqHeader { req_type, reserved: 0, sector },
+            header: VirtioBlkReqHeader {
+                req_type,
+                reserved: 0,
+                sector,
+            },
             status: 0xff,
             _pad: [0; 7],
         });
@@ -746,22 +749,20 @@ impl BlockDriver for VirtioBlkPciIo {
                     };
                 }
             }
-            BioOp::Flush => {
-                unsafe {
-                    *queue.desc_table.add(d0 as usize) = VirtqDesc {
-                        addr: header_phys,
-                        len: mem::size_of::<VirtioBlkReqHeader>() as u32,
-                        flags: VIRTQ_DESC_F_NEXT,
-                        next: d1,
-                    };
-                    *queue.desc_table.add(d1 as usize) = VirtqDesc {
-                        addr: status_phys,
-                        len: 1,
-                        flags: VIRTQ_DESC_F_WRITE,
-                        next: 0,
-                    };
-                }
-            }
+            BioOp::Flush => unsafe {
+                *queue.desc_table.add(d0 as usize) = VirtqDesc {
+                    addr: header_phys,
+                    len: mem::size_of::<VirtioBlkReqHeader>() as u32,
+                    flags: VIRTQ_DESC_F_NEXT,
+                    next: d1,
+                };
+                *queue.desc_table.add(d1 as usize) = VirtqDesc {
+                    addr: status_phys,
+                    len: 1,
+                    flags: VIRTQ_DESC_F_WRITE,
+                    next: 0,
+                };
+            },
             _ => unreachable!(),
         }
 
@@ -788,7 +789,6 @@ impl BlockDriver for VirtioBlkPciIo {
         self
     }
 }
-
 
 // ── PnpDriver 绑定 ──────────────────────────────────────────────────────
 

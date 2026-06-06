@@ -29,9 +29,11 @@ use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
+use general::vfs::ensure_dir;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
+use general::vfs::mount_posix_shm_tmpfs;
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
@@ -352,6 +354,10 @@ pub fn kernel_start_init(context: &StartContext) {
         .mount(dev_dentry, Arc::clone(&dev_sb), MountFlags::default())
         .expect("[kernel-start][dtb] failed to mount devtmpfs on /dev");
 
+    // POSIX shm 不需要专用驱动；把 tmpfs 覆盖到 /dev/shm 后，用户态通过普通
+    // open/ftruncate/mmap(MAP_SHARED) 就能得到共享内存文件后端。
+    mount_posix_shm_tmpfs(&vfs_ctx).expect("[kernel-start][dtb] failed to mount tmpfs on /dev/shm");
+
     ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
         .expect("[kernel-start][dtb] failed to ensure /sys directory");
     let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
@@ -371,7 +377,7 @@ pub fn kernel_start_init(context: &StartContext) {
         .expect("[kernel-start][dtb] failed to mount sysfs on /sys");
 
     printk!(
-        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + sysfs '/sys'",
+        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",
         root_source
     );
 
@@ -585,17 +591,5 @@ fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
             );
             false
         }
-    }
-}
-
-pub(crate) fn ensure_dir(
-    ctx: &VfsContext,
-    path: &str,
-    mode: FileMode,
-) -> general::vfs::error::VfsResult<()> {
-    match path::lookup(ctx, &Dirfd::Cwd, path, LookupFlags::DIRECTORY) {
-        Ok(_) => Ok(()),
-        Err(VfsError::NotFound) => general::vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode),
-        Err(err) => Err(err),
     }
 }

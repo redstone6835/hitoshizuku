@@ -23,9 +23,9 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::{Mutex, RwLock};
 use smoltcp::time::Instant;
-use smoltcp::wire::{IpEndpoint, IpAddress, Ipv4Address, Ipv6Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address, Ipv6Address};
+use spin::{Mutex, RwLock};
 
 use crate::config::{CidrAddress, Endpoint, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
@@ -49,7 +49,6 @@ static STACK: NetStack = NetStack::new();
 pub fn stack() -> &'static NetStack {
     &STACK
 }
-
 
 // ── NetStack ─────────────────────────────────────────────────────────────────
 
@@ -109,7 +108,10 @@ impl NetStack {
     /// **之前**调用，使正在进行的 RX/TX 立即看到设备失效。
     pub fn detach(&self, id: InterfaceId) -> Result<(), NetError> {
         let mut table = self.interfaces.write();
-        table.remove(&id).map(|_| ()).ok_or(NetError::InterfaceNotFound)
+        table
+            .remove(&id)
+            .map(|_| ())
+            .ok_or(NetError::InterfaceNotFound)
     }
 
     /// 驱动所有活跃接口进行一轮收发。
@@ -224,7 +226,10 @@ impl NetStack {
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         let inner = managed.add_udp_socket(
-            UDP_RX_BUF_SIZE, UDP_TX_BUF_SIZE, UDP_META_COUNT, UDP_META_COUNT,
+            UDP_RX_BUF_SIZE,
+            UDP_TX_BUF_SIZE,
+            UDP_META_COUNT,
+            UDP_META_COUNT,
         );
         Ok(NetSocketHandle {
             iface_id,
@@ -274,7 +279,9 @@ impl NetStack {
         remote: Option<Endpoint>,
     ) -> Result<usize, NetError> {
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -297,7 +304,9 @@ impl NetStack {
                     .send_slice(data, endpoint_to_smoltcp(&remote).addr)
                     .map_err(|err| match err {
                         smoltcp::socket::icmp::SendError::BufferFull => NetError::WouldBlock,
-                        smoltcp::socket::icmp::SendError::Unaddressable => NetError::InvalidArgument,
+                        smoltcp::socket::icmp::SendError::Unaddressable => {
+                            NetError::InvalidArgument
+                        }
                     })?;
                 Ok(data.len())
             }
@@ -307,7 +316,9 @@ impl NetStack {
 
     pub fn raw_recv(&self, handle: NetSocketHandle, buf: &mut [u8]) -> Result<usize, NetError> {
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -336,7 +347,9 @@ impl NetStack {
 
     pub fn raw_can_recv(&self, handle: NetSocketHandle) -> bool {
         let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return false;
+        };
         let managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return false;
@@ -350,7 +363,9 @@ impl NetStack {
 
     pub fn raw_can_send(&self, handle: NetSocketHandle) -> bool {
         let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return false;
+        };
         let managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return false;
@@ -375,7 +390,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -392,7 +409,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -410,7 +429,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -430,16 +451,14 @@ impl NetStack {
     /// - `Err(WouldBlock)`：当前无数据可读，稍后重试
     /// - `Err(ConnectionReset)`：连接被远端重置
     /// - `Err(Closed)`：socket 已关闭
-    pub fn tcp_recv(
-        &self,
-        handle: NetSocketHandle,
-        buf: &mut [u8],
-    ) -> Result<usize, NetError> {
+    pub fn tcp_recv(&self, handle: NetSocketHandle, buf: &mut [u8]) -> Result<usize, NetError> {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -486,7 +505,9 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let mut managed = iface_lock.lock();
             if !managed.is_socket_removed(handle.inner) {
-                managed.tcp_socket_mut(handle.inner).set_nagle_enabled(!nodelay);
+                managed
+                    .tcp_socket_mut(handle.inner)
+                    .set_nagle_enabled(!nodelay);
             }
         }
     }
@@ -505,7 +526,9 @@ impl NetStack {
                 Some(smoltcp::time::Duration::from_secs(secs))
             };
             if !managed.is_socket_removed(handle.inner) {
-                managed.tcp_socket_mut(handle.inner).set_keep_alive(interval);
+                managed
+                    .tcp_socket_mut(handle.inner)
+                    .set_keep_alive(interval);
             }
         }
     }
@@ -549,7 +572,9 @@ impl NetStack {
             return 0;
         }
         let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else { return 0 };
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return 0;
+        };
         let managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return 0;
@@ -563,7 +588,9 @@ impl NetStack {
             return 0;
         }
         let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else { return 0 };
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return 0;
+        };
         let managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return 0;
@@ -572,14 +599,14 @@ impl NetStack {
     }
 
     /// TCP peek（窥视，不消费数据）。
-    pub fn tcp_peek(
-        &self, handle: NetSocketHandle, buf: &mut [u8],
-    ) -> Result<usize, NetError> {
+    pub fn tcp_peek(&self, handle: NetSocketHandle, buf: &mut [u8]) -> Result<usize, NetError> {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -637,13 +664,17 @@ impl NetStack {
 
     /// UDP peek（窥视一个数据报，不消费）。
     pub fn udp_peek_from(
-        &self, handle: NetSocketHandle, buf: &mut [u8],
+        &self,
+        handle: NetSocketHandle,
+        buf: &mut [u8],
     ) -> Result<(usize, Endpoint), NetError> {
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -657,7 +688,9 @@ impl NetStack {
 
     /// 添加默认 IPv4 路由（gateway）到指定接口。
     pub fn add_default_route_v4(
-        &self, iface_id: InterfaceId, gateway: crate::Ipv4Addr,
+        &self,
+        iface_id: InterfaceId,
+        gateway: crate::Ipv4Addr,
     ) -> Result<(), NetError> {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
@@ -707,7 +740,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -730,7 +765,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -753,7 +790,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         let table = self.interfaces.read();
-        let iface_lock = table.get(&handle.iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
@@ -818,7 +857,8 @@ impl NetStack {
                 let table = self.interfaces.read();
                 if let Some(iface_lock) = table.get(&handle.iface_id) {
                     let mut managed = iface_lock.lock();
-                    if managed.has_socket(handle.inner) && !managed.is_socket_removed(handle.inner) {
+                    if managed.has_socket(handle.inner) && !managed.is_socket_removed(handle.inner)
+                    {
                         managed.tcp_socket_mut(handle.inner).close();
                     }
                 }
@@ -827,7 +867,8 @@ impl NetStack {
                 let table = self.interfaces.read();
                 if let Some(iface_lock) = table.get(&handle.iface_id) {
                     let mut managed = iface_lock.lock();
-                    if managed.has_socket(handle.inner) && !managed.is_socket_removed(handle.inner) {
+                    if managed.has_socket(handle.inner) && !managed.is_socket_removed(handle.inner)
+                    {
                         managed.udp_socket_mut(handle.inner).close();
                     }
                 }
@@ -853,9 +894,13 @@ impl NetStack {
         // TODO: readiness 当前直接使用 smoltcp can_recv，TCP listen/half-close、
         // UDP datagram 长度、raw/icmp 元信息等 POSIX poll 语义仍是近似值。
         let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return false;
+        };
         let managed = iface_lock.lock();
-        if managed.is_socket_removed(handle.inner) { return false; }
+        if managed.is_socket_removed(handle.inner) {
+            return false;
+        }
         match handle.sock_type {
             SocketType::Tcp => managed.tcp_socket(handle.inner).can_recv(),
             SocketType::Udp => managed.udp_socket(handle.inner).can_recv(),
@@ -869,9 +914,13 @@ impl NetStack {
         // TODO: can_send 只表示内部发送缓冲区可写，不等价于 connect 完成、
         // 对端仍存活或错误队列为空。
         let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else { return false };
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return false;
+        };
         let managed = iface_lock.lock();
-        if managed.is_socket_removed(handle.inner) { return false; }
+        if managed.is_socket_removed(handle.inner) {
+            return false;
+        }
         match handle.sock_type {
             SocketType::Tcp => managed.tcp_socket(handle.inner).can_send(),
             SocketType::Udp => managed.udp_socket(handle.inner).can_send(),
@@ -970,9 +1019,7 @@ impl NetStack {
                 return Err(NetError::WouldBlock);
             }
 
-            let listen_endpoint = managed
-                .tcp_socket(listen_handle.inner)
-                .listen_endpoint();
+            let listen_endpoint = managed.tcp_socket(listen_handle.inner).listen_endpoint();
 
             let new_listen_handle = managed.add_tcp_socket(TCP_RX_BUF_SIZE, TCP_TX_BUF_SIZE);
             let new_listen = NetSocketHandle {
@@ -1007,7 +1054,11 @@ impl NetStack {
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         let inner = managed.add_tcp_socket(rx_size, tx_size);
-        Ok(NetSocketHandle { iface_id, inner, sock_type: SocketType::Tcp })
+        Ok(NetSocketHandle {
+            iface_id,
+            inner,
+            sock_type: SocketType::Tcp,
+        })
     }
 
     /// 创建 UDP socket 并指定缓冲区大小。
@@ -1022,7 +1073,11 @@ impl NetStack {
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         let inner = managed.add_udp_socket(rx_size, tx_size, meta_count, meta_count);
-        Ok(NetSocketHandle { iface_id, inner, sock_type: SocketType::Udp })
+        Ok(NetSocketHandle {
+            iface_id,
+            inner,
+            sock_type: SocketType::Udp,
+        })
     }
 
     // ── Socket 状态查询 ──────────────────────────────────────────────────
@@ -1176,11 +1231,12 @@ fn endpoint_from_smoltcp(ep: IpEndpoint) -> Endpoint {
             let o = v4.octets();
             IpAddr::V4(Ipv4Addr(o))
         }
-        IpAddress::Ipv6(v6) => {
-            IpAddr::V6(Ipv6Addr(v6.octets()))
-        }
+        IpAddress::Ipv6(v6) => IpAddr::V6(Ipv6Addr(v6.octets())),
     };
-    Endpoint { addr, port: ep.port }
+    Endpoint {
+        addr,
+        port: ep.port,
+    }
 }
 
 fn tcp_state_to_socket_state(state: smoltcp::socket::tcp::State) -> SocketState {
@@ -1190,9 +1246,7 @@ fn tcp_state_to_socket_state(state: smoltcp::socket::tcp::State) -> SocketState 
         S::Listen => SocketState::Listen,
         S::SynSent | S::SynReceived => SocketState::Connecting,
         S::Established => SocketState::Established,
-        S::FinWait1 | S::FinWait2 | S::Closing | S::CloseWait | S::LastAck => {
-            SocketState::Closing
-        }
+        S::FinWait1 | S::FinWait2 | S::Closing | S::CloseWait | S::LastAck => SocketState::Closing,
     }
 }
 

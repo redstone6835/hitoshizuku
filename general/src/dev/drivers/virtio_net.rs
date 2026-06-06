@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, fence, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use spin::Mutex;
 
@@ -255,12 +255,20 @@ fn parse_virtio_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
 
             if let Some((_bar, bar_vaddr)) = pci.map_bar_virt(bar_idx as usize) {
                 let vaddr = bar_vaddr.wrapping_add(offset as usize);
-                let cap = VirtioCap { vaddr, length, notify_off_multiplier: 0 };
+                let cap = VirtioCap {
+                    vaddr,
+                    length,
+                    notify_off_multiplier: 0,
+                };
                 match cfg_type {
                     VIRTIO_PCI_CAP_COMMON_CFG => common = Some(cap),
                     VIRTIO_PCI_CAP_NOTIFY_CFG => {
                         let mult = pci.read_config_u32(ptr + 16);
-                        notify = Some(VirtioCap { vaddr, length, notify_off_multiplier: mult });
+                        notify = Some(VirtioCap {
+                            vaddr,
+                            length,
+                            notify_off_multiplier: mult,
+                        });
                     }
                     VIRTIO_PCI_CAP_ISR_CFG => isr = Some(cap),
                     VIRTIO_PCI_CAP_DEVICE_CFG => device = Some(cap),
@@ -273,7 +281,11 @@ fn parse_virtio_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
     }
 
     let _ = isr?;
-    Some(VirtioPciCaps { common: common?, notify: notify?, device })
+    Some(VirtioPciCaps {
+        common: common?,
+        notify: notify?,
+        device,
+    })
 }
 
 // ── DMA 分配助手 ──────────────────────────────────────────────────────
@@ -317,10 +329,7 @@ fn cc_set_driver_features(caps: &VirtioPciCaps, f: u64) {
 
 // ── 队列设置助手 ──────────────────────────────────────────────────────
 
-fn setup_queue(
-    caps: &VirtioPciCaps,
-    queue_idx: u16,
-) -> Result<VirtioNetQueue, &'static str> {
+fn setup_queue(caps: &VirtioPciCaps, queue_idx: u16) -> Result<VirtioNetQueue, &'static str> {
     wr_u16(caps.common.vaddr + CC_QUEUE_SELECT, queue_idx);
     let max_qsz = rd_u16(caps.common.vaddr + CC_QUEUE_SIZE);
     if max_qsz == 0 {
@@ -342,7 +351,10 @@ fn setup_queue(
     }
 
     wr_u64(caps.common.vaddr + CC_QUEUE_DESC, desc_alloc.paddr as u64);
-    wr_u64(caps.common.vaddr + CC_QUEUE_DRIVER, avail_alloc.paddr as u64);
+    wr_u64(
+        caps.common.vaddr + CC_QUEUE_DRIVER,
+        avail_alloc.paddr as u64,
+    );
     wr_u64(caps.common.vaddr + CC_QUEUE_DEVICE, used_alloc.paddr as u64);
 
     let notify_off = rd_u16(caps.common.vaddr + CC_QUEUE_NOTIFY_OFF) as usize;
@@ -458,7 +470,12 @@ impl VirtioNetPci {
 
         log::printk!(
             "[virtio-net] probe ok: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
 
         let has_status = drv_features & VIRTIO_NET_F_STATUS != 0;
@@ -491,9 +508,8 @@ impl net::NetDriver for VirtioNetPci {
         if rq.last_used_idx == used_idx {
             return None;
         }
-        let elem = unsafe {
-            (*rq.used_ring).ring[rq.last_used_idx as usize % rq.queue_size as usize]
-        };
+        let elem =
+            unsafe { (*rq.used_ring).ring[rq.last_used_idx as usize % rq.queue_size as usize] };
         rq.last_used_idx = rq.last_used_idx.wrapping_add(1);
 
         let desc_idx = elem.id as usize;
@@ -596,12 +612,18 @@ impl net::NetDriver for VirtioNetPci {
             if let Some(dev_cfg) = inner.caps.device {
                 let status = rd_u16(dev_cfg.vaddr + NET_CFG_STATUS);
                 if status & 1 != 0 {
-                    return net::LinkState::Up { speed_mbps: None, duplex: net::Duplex::Full };
+                    return net::LinkState::Up {
+                        speed_mbps: None,
+                        duplex: net::Duplex::Full,
+                    };
                 }
                 return net::LinkState::Down;
             }
         }
-        net::LinkState::Up { speed_mbps: None, duplex: net::Duplex::Full }
+        net::LinkState::Up {
+            speed_mbps: None,
+            duplex: net::Duplex::Full,
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -630,9 +652,8 @@ impl VirtioNetPci {
             if tq.last_used_idx == used_idx {
                 break;
             }
-            let elem = unsafe {
-                (*tq.used_ring).ring[tq.last_used_idx as usize % tq.queue_size as usize]
-            };
+            let elem =
+                unsafe { (*tq.used_ring).ring[tq.last_used_idx as usize % tq.queue_size as usize] };
             tq.last_used_idx = tq.last_used_idx.wrapping_add(1);
             let desc_idx = elem.id as u16;
             // 在 pending_tx 中找到并释放对应的 DMA buffer
@@ -674,8 +695,7 @@ impl PnpDriver for VirtioNetPciDriver {
             return false;
         };
         // VirtIO Network: legacy 0x1000, modern 0x1041
-        pci_info.vendor == 0x1af4
-            && (pci_info.device_id == 0x1000 || pci_info.device_id == 0x1041)
+        pci_info.vendor == 0x1af4 && (pci_info.device_id == 0x1000 || pci_info.device_id == 0x1041)
     }
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
@@ -692,11 +712,19 @@ impl PnpDriver for VirtioNetPciDriver {
         let driver = Arc::new(driver);
         let net_dev = Arc::new(net::NetDevice::new(&name, driver.clone()));
         let config = net::IfConfig::auto();
-        net::stack().attach(net_dev, config).map_err(|_| PnpError::ProbeFailed)?;
+        net::stack()
+            .attach(net_dev, config)
+            .map_err(|_| PnpError::ProbeFailed)?;
 
         log::printk!(
             "[virtio-net] attached {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            name,
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
         Ok(())
     }

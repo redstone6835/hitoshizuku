@@ -30,8 +30,8 @@ use vfs::sync::Spinlock;
 
 use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use general::dev::block::{
-    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
-    BlockGeometry, BlockLimits,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry,
+    BlockLimits,
 };
 use general::dev::block_sync::SyncBlockBackend;
 

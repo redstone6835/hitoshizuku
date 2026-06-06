@@ -76,7 +76,10 @@ impl RxBuf {
         );
         // 防御性截断：保护协议栈不被异常大帧攻击
         let safe_len = len.min(MAX_FRAME_LEN);
-        Self { data, len: safe_len }
+        Self {
+            data,
+            len: safe_len,
+        }
     }
 
     /// 帧数据切片（只读）。

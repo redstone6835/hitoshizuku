@@ -7,6 +7,7 @@
 //! `register_all()` 在 `kernel::sched::boot_init` 的末尾调用一次。
 
 mod fs;
+mod ipc;
 mod mm;
 mod nr;
 mod process;
@@ -178,6 +179,12 @@ pub fn register_all() {
     register_syscall(nr::SYS_MPROTECT, mm::sys_mprotect);
     register_syscall(nr::SYS_MADVISE, mm::sys_madvise);
     register_syscall(nr::SYS_MREMAP, mm::sys_mremap);
+
+    // SysV IPC
+    register_syscall(nr::SYS_SHMGET, ipc::sys_shmget);
+    register_syscall(nr::SYS_SHMCTL, ipc::sys_shmctl);
+    register_syscall(nr::SYS_SHMAT, ipc::sys_shmat);
+    register_syscall(nr::SYS_SHMDT, ipc::sys_shmdt);
 
     // 信号
     register_syscall(nr::SYS_RT_SIGACTION, signal::sys_rt_sigaction);

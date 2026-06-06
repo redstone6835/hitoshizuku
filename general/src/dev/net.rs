@@ -7,7 +7,7 @@ use core::any::Any;
 use errno::Errno;
 use net::config::IpAddr;
 
-use crate::dev::function::{DeviceClassId, DeviceFunction, DevNodeSpec};
+use crate::dev::function::{DevNodeSpec, DeviceClassId, DeviceFunction};
 use crate::mm::{copy_from_user, copy_to_user};
 
 /// 网络设备 function 类别 ID。
@@ -93,8 +93,9 @@ pub fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         SIOCGIFBRDADDR => ioctl_gifbrdaddr(arg),
         // 设置类 ioctl：当前只读栈，返回 EPERM（与 Linux 非 root 行为一致）
         // TODO: 在 ManagedInterface 中引入可变 runtime config 以支持运行时修改
-        SIOCSIFFLAGS | SIOCSIFADDR | SIOCSIFNETMASK
-        | SIOCSIFMTU | SIOCSIFTXQLEN => Err(Errno::EPERM),
+        SIOCSIFFLAGS | SIOCSIFADDR | SIOCSIFNETMASK | SIOCSIFMTU | SIOCSIFTXQLEN => {
+            Err(Errno::EPERM)
+        }
         // 路由管理：尚未实现路由表修改
         // TODO: 阶段 3 实现路由表管理
         SIOCADDRT | SIOCDELRT => Err(Errno::EPERM),
@@ -108,7 +109,11 @@ pub fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
 /// 把 CIDR 前缀长度转换成 IPv4 子网掩码（network-order 字节）。
 fn prefix_to_netmask(prefix: u8) -> [u8; 4] {
     let prefix = prefix.min(32);
-    let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
     mask.to_be_bytes()
 }
 
@@ -143,22 +148,35 @@ fn ioctl_get_arp(arg: usize) -> Result<usize, Errno> {
 
 /// 检查是否为网络 ioctl 命令。
 pub fn is_net_ioctl(cmd: u32) -> bool {
-    matches!(cmd,
-        SIOCADDRT | SIOCDELRT |
-        SIOCGIFCONF | SIOCGIFFLAGS | SIOCSIFFLAGS |
-        SIOCGIFADDR | SIOCSIFADDR | SIOCGIFBRDADDR |
-        SIOCGIFNETMASK | SIOCSIFNETMASK |
-        SIOCGIFMTU | SIOCSIFMTU |
-        SIOCGIFHWADDR | SIOCGIFINDEX |
-        SIOCGIFTXQLEN | SIOCSIFTXQLEN |
-        SIOCGARP | SIOCSARP | SIOCDARP
+    matches!(
+        cmd,
+        SIOCADDRT
+            | SIOCDELRT
+            | SIOCGIFCONF
+            | SIOCGIFFLAGS
+            | SIOCSIFFLAGS
+            | SIOCGIFADDR
+            | SIOCSIFADDR
+            | SIOCGIFBRDADDR
+            | SIOCGIFNETMASK
+            | SIOCSIFNETMASK
+            | SIOCGIFMTU
+            | SIOCSIFMTU
+            | SIOCGIFHWADDR
+            | SIOCGIFINDEX
+            | SIOCGIFTXQLEN
+            | SIOCSIFTXQLEN
+            | SIOCGARP
+            | SIOCSARP
+            | SIOCDARP
     )
 }
 
 fn find_iface_by_name(name: &[u8]) -> Option<net::InterfaceSnapshot> {
     let name_str = core::str::from_utf8(name).ok()?;
     let name_trimmed = name_str.trim_end_matches('\0');
-    net::stack().snapshot_interfaces()
+    net::stack()
+        .snapshot_interfaces()
         .into_iter()
         .find(|i| i.name == name_trimmed)
 }
@@ -185,7 +203,9 @@ fn ioctl_gifconf(arg: usize) -> Result<usize, Errno> {
     let ifaces = net::stack().snapshot_interfaces();
     let mut offset = 0usize;
     for iface in &ifaces {
-        if offset + IFREQ_SIZE > buf_len { break; }
+        if offset + IFREQ_SIZE > buf_len {
+            break;
+        }
         let mut ifreq = [0u8; IFREQ_SIZE];
         let name_bytes = iface.name.as_bytes();
         let copy_len = name_bytes.len().min(IFNAMSIZ - 1);
@@ -212,7 +232,11 @@ fn ioctl_gifaddr(arg: usize) -> Result<usize, Errno> {
     let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let mut sa = [0u8; 16];
     sa[0] = 2; // AF_INET
-    if let Some(cidr) = iface.addresses.iter().find(|c| matches!(c.addr, IpAddr::V4(_))) {
+    if let Some(cidr) = iface
+        .addresses
+        .iter()
+        .find(|c| matches!(c.addr, IpAddr::V4(_)))
+    {
         if let IpAddr::V4(v4) = cidr.addr {
             sa[4..8].copy_from_slice(&v4.0);
         }
@@ -226,7 +250,11 @@ fn ioctl_gifnetmask(arg: usize) -> Result<usize, Errno> {
     let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let mut sa = [0u8; 16];
     sa[0] = 2; // AF_INET
-    if let Some(cidr) = iface.addresses.iter().find(|c| matches!(c.addr, IpAddr::V4(_))) {
+    if let Some(cidr) = iface
+        .addresses
+        .iter()
+        .find(|c| matches!(c.addr, IpAddr::V4(_)))
+    {
         sa[4..8].copy_from_slice(&prefix_to_netmask(cidr.prefix_len));
     }
     write_ifreq_data(arg, IFNAMSIZ, &sa)?;
@@ -273,7 +301,11 @@ fn ioctl_gifbrdaddr(arg: usize) -> Result<usize, Errno> {
     let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let mut sa = [0u8; 16];
     sa[0] = 2; // AF_INET
-    if let Some(cidr) = iface.addresses.iter().find(|c| matches!(c.addr, IpAddr::V4(_))) {
+    if let Some(cidr) = iface
+        .addresses
+        .iter()
+        .find(|c| matches!(c.addr, IpAddr::V4(_)))
+    {
         if let IpAddr::V4(v4) = cidr.addr {
             let mask = prefix_to_netmask(cidr.prefix_len);
             for i in 0..4 {

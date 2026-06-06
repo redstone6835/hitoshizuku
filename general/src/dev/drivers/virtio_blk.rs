@@ -24,8 +24,8 @@ use spin::mutex::Mutex;
 
 use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
-    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
-    BlockGeometry, BlockLimits,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry,
+    BlockLimits,
 };
 use crate::dev::function::BlockFunction;
 use crate::dev::platform::PlatformDeviceInfo;
@@ -560,9 +560,7 @@ impl VirtioBlk {
             };
             // 读请求成功时把 DMA 区数据回拷到 Bio buffer
             if result.is_ok() && bio.op == BioOp::Read {
-                if let (BioBuffer::Owned(buf), Some(dma)) =
-                    (&mut bio.buffer, data_dma.as_ref())
-                {
+                if let (BioBuffer::Owned(buf), Some(dma)) = (&mut bio.buffer, data_dma.as_ref()) {
                     buf.copy_from_slice(dma.as_slice());
                 }
             }
@@ -815,7 +813,6 @@ impl BlockDriver for VirtioBlkIo {
         self
     }
 }
-
 
 // ───────── Platform PnP 绑定 ─────────
 

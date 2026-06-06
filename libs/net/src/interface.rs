@@ -14,14 +14,11 @@ use alloc::vec::Vec;
 use smoltcp::iface::{self, SocketHandle, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpCidr,
-    Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr,
+    EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr,
 };
 
 use crate::adapter::NetDeviceAdapter;
-use crate::config::{
-    CidrAddress, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr,
-};
+use crate::config::{CidrAddress, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::socket::SocketMeta;
 
@@ -52,18 +49,12 @@ impl ManagedInterface {
 
         let mut device = NetDeviceAdapter::new(driver, Arc::clone(&net_device));
         let now = Instant::from_millis(0);
-        let mut iface = iface::Interface::new(
-            iface_config, &mut device, now,
-        );
+        let mut iface = iface::Interface::new(iface_config, &mut device, now);
 
         // 配置 IP 地址（支持 IPv4 + IPv6 混合）
         // TODO: IfMode::Auto 当前不会触发 DHCP/SLAAC，这里只会把已有
         // config.addresses 静态写入 smoltcp。
-        let cidrs: Vec<IpCidr> = config
-            .addresses
-            .iter()
-            .map(cidr_to_smoltcp)
-            .collect();
+        let cidrs: Vec<IpCidr> = config.addresses.iter().map(cidr_to_smoltcp).collect();
         iface.update_ip_addrs(|addrs| {
             for cidr in cidrs {
                 let _ = addrs.push(cidr);
@@ -74,20 +65,24 @@ impl ManagedInterface {
         if let Some(ref gw) = config.gateway {
             match gw {
                 Gateway::V4(v4) => {
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv4_route(ipv4_to_smoltcp(*v4))
                         .ok();
                 }
                 Gateway::V6(v6) => {
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv6_route(ipv6_to_smoltcp(*v6))
                         .ok();
                 }
                 Gateway::DualStack { v4, v6 } => {
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv4_route(ipv4_to_smoltcp(*v4))
                         .ok();
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv6_route(ipv6_to_smoltcp(*v6))
                         .ok();
                 }
@@ -108,16 +103,16 @@ impl ManagedInterface {
     ///
     /// 同时清理已标记为 removed 的 socket。
     pub fn poll(&mut self, timestamp: Instant) {
-        self.iface.poll(
-            timestamp, &mut self.device, &mut self.sockets,
-        );
+        self.iface
+            .poll(timestamp, &mut self.device, &mut self.sockets);
         // 延迟清理：移除标记为 removed 的 socket。
         //
         // 旧实现先 `sockets.remove` 再 `meta.remove`——若这两个动作之间
         // 有任何其它持锁代码路径访问 `self.sockets[handle]`，会看到一个
         // `None` 槽位从而 panic。新实现走 `remove_socket_locked` 同步删
         // 两者，并且保证顺序。
-        let to_remove: Vec<SocketHandle> = self.meta
+        let to_remove: Vec<SocketHandle> = self
+            .meta
             .iter()
             .filter(|(_, m)| m.is_removed())
             .map(|(h, _)| *h)
@@ -238,19 +233,11 @@ impl ManagedInterface {
     // ── Socket 管理 ──────────────────────────────────────────────────────
 
     /// 创建一个 TCP socket 并加入本接口的 SocketSet。
-    pub fn add_tcp_socket(
-        &mut self,
-        rx_buf_size: usize,
-        tx_buf_size: usize,
-    ) -> SocketHandle {
+    pub fn add_tcp_socket(&mut self, rx_buf_size: usize, tx_buf_size: usize) -> SocketHandle {
         // TODO: 缓冲区大小由调用方固定传入，缺少 SO_SNDBUF/SO_RCVBUF
         // 动态调整和内存压力下的 backpressure 策略。
-        let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(
-            alloc::vec![0u8; rx_buf_size],
-        );
-        let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(
-            alloc::vec![0u8; tx_buf_size],
-        );
+        let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; rx_buf_size]);
+        let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tx_buf_size]);
         let socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
         self.meta.insert(handle, SocketMeta::new());
@@ -329,10 +316,14 @@ impl ManagedInterface {
     /// 创建一个 raw IP socket（指定 IP 版本和协议号）。
     pub fn add_raw_socket(&mut self, ip_version: u8, protocol: u8) -> SocketHandle {
         use smoltcp::socket::raw;
-        use smoltcp::wire::{IpVersion, IpProtocol};
+        use smoltcp::wire::{IpProtocol, IpVersion};
         // TODO: raw buffer/meta 容量写死，且缺少协议过滤以外的 socket option
         // 支持，例如 IP_HDRINCL、TTL/TOS 和接收控制消息。
-        let ip_ver = if ip_version == 6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 };
+        let ip_ver = if ip_version == 6 {
+            IpVersion::Ipv6
+        } else {
+            IpVersion::Ipv4
+        };
         let proto = IpProtocol::from(protocol);
         let rx_buf = raw::PacketBuffer::new(
             alloc::vec![raw::PacketMetadata::EMPTY; 8],
@@ -369,28 +360,32 @@ impl ManagedInterface {
 
     /// 获取 raw socket 的可变引用。
     pub fn raw_socket_mut(
-        &mut self, handle: smoltcp::iface::SocketHandle,
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::raw::Socket<'static> {
         self.sockets.get_mut(handle)
     }
 
     /// 获取 raw socket 的只读引用。
     pub fn raw_socket(
-        &self, handle: smoltcp::iface::SocketHandle,
+        &self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::raw::Socket<'static> {
         self.sockets.get(handle)
     }
 
     /// 获取 ICMP socket 的可变引用。
     pub fn icmp_socket_mut(
-        &mut self, handle: smoltcp::iface::SocketHandle,
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get_mut(handle)
     }
 
     /// 获取 ICMP socket 的只读引用。
     pub fn icmp_socket(
-        &self, handle: smoltcp::iface::SocketHandle,
+        &self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get(handle)
     }
@@ -418,12 +413,8 @@ fn ipv6_to_smoltcp(addr: Ipv6Addr) -> Ipv6Address {
 
 fn cidr_to_smoltcp(cidr: &CidrAddress) -> IpCidr {
     match cidr.addr {
-        IpAddr::V4(v4) => {
-            IpCidr::Ipv4(Ipv4Cidr::new(ipv4_to_smoltcp(v4), cidr.prefix_len))
-        }
-        IpAddr::V6(v6) => {
-            IpCidr::Ipv6(Ipv6Cidr::new(ipv6_to_smoltcp(v6), cidr.prefix_len))
-        }
+        IpAddr::V4(v4) => IpCidr::Ipv4(Ipv4Cidr::new(ipv4_to_smoltcp(v4), cidr.prefix_len)),
+        IpAddr::V6(v6) => IpCidr::Ipv6(Ipv6Cidr::new(ipv6_to_smoltcp(v6), cidr.prefix_len)),
     }
 }
 
