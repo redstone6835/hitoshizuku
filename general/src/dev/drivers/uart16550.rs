@@ -304,6 +304,10 @@ impl CharDriver for Uart16550 {
         Ok(buf.len())
     }
 
+    fn poll_read(&self) -> bool {
+        self.line_status() & LSR_DR != 0
+    }
+
     fn flush(&self) -> Result<(), CharIoError> {
         let mut retries = 0usize;
         loop {
