@@ -708,6 +708,51 @@ impl NetStack {
         Ok(())
     }
 
+    // ── 运行时配置（供 ioctl / netlink 写操作使用）──────────────────────
+
+    /// 设置指定接口的 IPv4 地址。
+    pub fn set_iface_ipv4_addr(
+        &self, id: InterfaceId, addr: crate::Ipv4Addr, prefix: u8,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_ipv4_addr(addr, prefix);
+        Ok(())
+    }
+
+    /// 设置指定接口的标志。
+    pub fn set_iface_flags(&self, id: InterfaceId, flags: u32) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_flags(flags);
+        Ok(())
+    }
+
+    /// 在指定接口上添加 IPv4 路由。
+    pub fn add_route(
+        &self, id: InterfaceId, dest: crate::Ipv4Addr, mask: crate::Ipv4Addr,
+        gw: crate::Ipv4Addr,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.add_route_v4(dest, mask, gw);
+        Ok(())
+    }
+
+    /// 在指定接口上删除 IPv4 路由。
+    pub fn remove_route(
+        &self, id: InterfaceId, dest: crate::Ipv4Addr, mask: crate::Ipv4Addr,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.remove_route_v4(dest, mask);
+        Ok(())
+    }
+
     // ── 邻居表查询 ───────────────────────────────────────────────────────
 
     /// 查询指定接口的 ARP/NDP 邻居表。

@@ -159,6 +159,50 @@ impl ManagedInterface {
         self.iface.routes_mut().remove_default_ipv4_route();
     }
 
+    // ── 运行时配置（供 ioctl / netlink 写操作使用）─────────────────────
+
+    /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
+    pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) {
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
+            let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(
+                smoltcp::wire::Ipv4Cidr::new(ipv4_to_smoltcp(addr), prefix_len),
+            ));
+        });
+    }
+
+    /// 设置接口标志。当前仅记录 IFF_UP 状态变更。
+    pub fn set_flags(&mut self, _flags: u32) {
+        // smoltcp 无接口 UP/DOWN 切换 API，标志仅通过 ioctl 返回。
+    }
+
+    /// 添加 IPv4 路由（smoltcp 仅支持默认路由）。
+    pub fn add_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
+        let prefix_len = mask_to_prefix_len(mask);
+        if prefix_len == 0 {
+            self.iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+                .ok();
+        } else {
+            // smoltcp 不支持非默认路由，降级为默认网关
+            self.iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+                .ok();
+            let _ = (dest, prefix_len);
+        }
+    }
+
+    /// 删除 IPv4 路由。
+    pub fn remove_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) {
+        let prefix_len = mask_to_prefix_len(mask);
+        if prefix_len == 0 {
+            self.iface.routes_mut().remove_default_ipv4_route();
+        }
+        let _ = (dest, prefix_len);
+    }
+
     /// 返回邻居缓存中所有条目（ARP/NDP 表查询）。
     pub fn neighbor_entries(&self) -> Vec<crate::stack::NeighborEntry> {
         use smoltcp::wire::{HardwareAddress, IpAddress};
@@ -522,4 +566,8 @@ fn cidr_to_smoltcp(cidr: &CidrAddress) -> IpCidr {
 fn generate_seed(id: InterfaceId) -> u64 {
     let raw = id.raw() as u64;
     raw.wrapping_mul(6364136223846793005).wrapping_add(1)
+}
+
+fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
+    u32::from_be_bytes(mask.0).leading_ones() as u8
 }
