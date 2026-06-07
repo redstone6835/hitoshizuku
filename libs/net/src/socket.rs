@@ -54,12 +54,24 @@ pub enum SocketState {
 pub(crate) struct SocketMeta {
     /// socket 是否已被标记为移除。
     pub removed: AtomicBool,
+    /// fd 已释放但 TCP 四次挥手还需要继续由协议栈推进。
+    ///
+    /// orphan socket 不再允许上层通过旧 handle 访问；它只保留在
+    /// `SocketSet` 里处理尾部数据、FIN/ACK 和 TIME-WAIT，等状态稳定后
+    /// 由 poll 路径统一回收。
+    pub orphaned: AtomicBool,
+    /// TCP listener 被 smoltcp 原地转换为 Established 后，是否已经交给
+    /// VFS accept 路径。smoltcp 没有独立 accept 队列，必须用这个标记避免
+    /// 按监听端点扫描时把同一条已接受连接重复返回。
+    pub accepted: AtomicBool,
 }
 
 impl SocketMeta {
     pub fn new() -> Self {
         Self {
             removed: AtomicBool::new(false),
+            orphaned: AtomicBool::new(false),
+            accepted: AtomicBool::new(false),
         }
     }
 
@@ -69,6 +81,22 @@ impl SocketMeta {
 
     pub fn mark_removed(&self) {
         self.removed.store(true, Ordering::Release);
+    }
+
+    pub fn is_orphaned(&self) -> bool {
+        self.orphaned.load(Ordering::Acquire)
+    }
+
+    pub fn mark_orphaned(&self) {
+        self.orphaned.store(true, Ordering::Release);
+    }
+
+    pub fn is_accepted(&self) -> bool {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    pub fn mark_accepted(&self) {
+        self.accepted.store(true, Ordering::Release);
     }
 }
 

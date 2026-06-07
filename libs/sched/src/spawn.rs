@@ -170,7 +170,6 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&new_tg),
         Arc::clone(&pg),
     );
-
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
 

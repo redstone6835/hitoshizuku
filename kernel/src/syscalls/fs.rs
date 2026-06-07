@@ -27,7 +27,7 @@ mod loongarch64_abi;
 use loongarch64_abi::{decode_dev_t, encode_dev_t};
 
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
-const COPY_CHUNK: usize = 256;
+const COPY_CHUNK: usize = 2048;
 const PATH_MAX: usize = 4096;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -403,16 +403,13 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let file = file_for_fd(fd_arg(ctx.args[0])?)?;
     let cmd = IoctlCmd::new(ctx.args[1] & u32::MAX as usize);
-    let raw_cmd = cmd.raw() as u32;
-    let arg = if cmd.raw() == FIONBIO {
-        read_user_i32(ctx.args[2])? as usize
-    } else {
-        ctx.args[2]
-    };
-    if general::dev::net::is_net_ioctl(raw_cmd) {
-        return general::dev::net::net_ioctl(raw_cmd, arg);
+    if cmd.raw() == FIONBIO {
+        let enabled = read_user_i32(ctx.args[2])? != 0;
+        let flags = file.flags();
+        file.set_status_flags(flags.append, enabled, flags.sync, flags.direct);
+        return Ok(0);
     }
-    file.ioctl(cmd, arg)
+    file.ioctl(cmd, ctx.args[2])
 }
 
 pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1626,10 +1623,17 @@ fn timeout_expired(deadline: Option<u64>) -> bool {
     deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
 }
 
+fn restore_current_task_after_wait(task: &Arc<sched::Task>) {
+    if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
+        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
+    }
+}
+
 fn wait_on_poll_sources(
     sources: &[(Arc<vfs::file::File>, PollEvents)],
     deadline: Option<u64>,
 ) -> Result<(), Errno> {
+    const POLL_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
@@ -1645,8 +1649,16 @@ fn wait_on_poll_sources(
     for (file, interest) in sources {
         registered_waiter |= file.poll_add_waiter(&task, *interest);
     }
+    // 当前网络 waiter 仍是全局粗粒度唤醒，存在丢失精确事件的窗口。
+    // poll/select 不能因此永久睡眠；即使没有收到 waiter 唤醒，也按短
+    // 周期重新检查 fd readiness，直到原始 timeout 到期。
+    let recheck_deadline = {
+        let now = sched::now_ns_public();
+        let quantum = now.saturating_add(POLL_RECHECK_NS);
+        Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
+    };
     let deadline_armed =
-        deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
+        recheck_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
 
     if sources
         .iter()
@@ -1658,7 +1670,7 @@ fn wait_on_poll_sources(
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
     if timeout_expired(deadline) {
@@ -1668,22 +1680,23 @@ fn wait_on_poll_sources(
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
 
     if !registered_waiter && !deadline_armed {
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return sched::operation::sched_yield();
     }
 
-    sched::schedule_once(0);
+    sched::schedule_once(sched::now_ns_public());
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
     if deadline_armed {
         sched::cancel_sleep_deadline(&task);
     }
+    restore_current_task_after_wait(&task);
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
     }
@@ -2053,6 +2066,7 @@ fn read_to_user(
 }
 
 fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Result<(), Errno> {
+    const IO_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
     let deadline = file.io_timeout_deadline(interest);
     if timeout_expired(deadline) {
@@ -2062,8 +2076,15 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
     let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
 
     let registered = file.poll_add_waiter(&task, interest);
-    let deadline_armed =
-        deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
+    // 不是所有文件都有专用唤醒源，例如 UART/TTY 当前是轮询设备。没有
+    // waiter 时也必须定期重检 readiness，否则阻塞 read/write 可能永久睡眠；
+    // 直接忙等又会饿死 QEMU/设备后端的输入投递。
+    let recheck_deadline = {
+        let now = sched::now_ns_public();
+        let quantum = now.saturating_add(IO_RECHECK_NS);
+        deadline.map_or(quantum, |dl| dl.min(quantum))
+    };
+    let deadline_armed = sched::register_sleep_deadline(&task, recheck_deadline);
     if !file.poll(interest).is_empty() {
         if registered {
             file.poll_remove_waiter(&task);
@@ -2071,7 +2092,7 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
     if timeout_expired(deadline) {
@@ -2081,20 +2102,21 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Err(Errno::EAGAIN);
     }
 
     if registered || deadline_armed {
-        sched::schedule_once(0);
+        sched::schedule_once(sched::now_ns_public());
         if registered {
             file.poll_remove_waiter(&task);
         }
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
+        restore_current_task_after_wait(&task);
     } else {
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         sched::operation::sched_yield()?;
     }
 
@@ -2108,10 +2130,7 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
 }
 
 fn has_unblocked_signal(task: &Arc<sched::Task>) -> bool {
-    let blocked = task.signal.blocked_snapshot().raw();
-    let pending =
-        task.signal.pending_snapshot().raw() | task.shared_signal().pending_snapshot().raw();
-    (pending & !blocked) != 0
+    sched::operation::has_interrupting_signal(task)
 }
 
 fn deliver_sigpipe() {

@@ -32,6 +32,7 @@ const REG_LSR: usize = 5; // Line Status Register
 const LSR_DR: u8 = 1 << 0; // Data Ready（接收缓冲非空）
 const LSR_THRE: u8 = 1 << 5; // TX Holding Register Empty（发送 FIFO 空）
 const LSR_TEMT: u8 = 1 << 6; // Transmitter Empty（FIFO + 移位寄存器均空）
+const IER_RDI: u8 = 1 << 0; // Received Data Available Interrupt
 const LCR_DLAB: u8 = 1 << 7; // Divisor Latch Access Bit
 const LCR_8N1: u8 = 0x03; // 8 数据位，无奇偶校验，1 停止位
 const FCR_ENABLE_FIFO: u8 = 0x01;
@@ -121,6 +122,8 @@ impl Drop for UartTxGuard<'_> {
 pub struct Uart16550 {
     /// UART 寄存器组的虚拟基地址。
     base: usize,
+    /// UART 输入时钟；固件预配置路径可能没有稳定来源。
+    clock_hz: Option<u32>,
     /// 软件发送缓冲区。日志路径先入队，再由轮询/flush 持续排空到 UART FIFO。
     tx: UartTxBuffer,
 }
@@ -137,6 +140,7 @@ impl Uart16550 {
     pub fn new(virt_base: usize, clock_hz: u32, baud: u32) -> Self {
         let uart = Self {
             base: virt_base,
+            clock_hz: Some(clock_hz),
             tx: UartTxBuffer::new(),
         };
         uart.init(clock_hz, baud);
@@ -151,6 +155,7 @@ impl Uart16550 {
     pub fn new_preconfigured(virt_base: usize) -> Self {
         let uart = Self {
             base: virt_base,
+            clock_hz: None,
             tx: UartTxBuffer::new(),
         };
         uart.attach_preconfigured();
@@ -205,10 +210,17 @@ impl Uart16550 {
 
     fn attach_preconfigured(&self) {
         unsafe {
-            core::ptr::write_volatile(self.reg(REG_IER), 0x00);
+            // 预配置串口通常已经被固件接到 QEMU stdio/console。保持 RX 可用
+            // 中断使能，避免后端因 guest 侧未声明可接收而不再投递输入；实际
+            // 消费仍走本驱动的轮询 read()，不依赖中断处理路径。
+            core::ptr::write_volatile(self.reg(REG_IER), IER_RDI);
             core::ptr::write_volatile(self.reg(REG_FCR), FCR_ENABLE_FIFO);
             core::ptr::write_volatile(self.reg(REG_MCR), MCR_DTR_RTS);
         }
+    }
+
+    fn queued_output_len(&self) -> u32 {
+        self.tx.lock().state_mut().len.min(u32::MAX as usize) as u32
     }
 
     #[inline]
@@ -332,6 +344,29 @@ impl CharDriver for Uart16550 {
         self.service_tx();
     }
 
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        match req {
+            CharControlRequest::FlushTx | CharControlRequest::FlushBoth => {
+                // TODO(uart-control): FlushBoth 还应 drain RX FIFO；当前只保证 TX flush。
+                self.flush().map_err(map_uart_char_error)?;
+                Ok(CharControlResponse::Done)
+            }
+            CharControlRequest::SetSerialConfig { baud: Some(baud) } => {
+                let clock_hz = self.clock_hz.ok_or(ControlError::Unsupported)?;
+                DriverControl::control(self, UartRequest::SetBaudRate { clock_hz, baud })
+                    .map_err(map_uart_control_error)?;
+                Ok(CharControlResponse::Done)
+            }
+            CharControlRequest::GetInputQueueLen => {
+                Ok(CharControlResponse::U32(u32::from(self.poll_read())))
+            }
+            CharControlRequest::GetOutputQueueLen => {
+                Ok(CharControlResponse::U32(self.queued_output_len()))
+            }
+            _ => Err(ControlError::Unsupported),
+        }
+    }
+
     fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
         let mut remaining = buf;
         let mut retries = 0usize;
@@ -386,6 +421,20 @@ pub enum UartResponse {
 pub enum UartError {
     /// 波特率为 0。
     InvalidBaudRate,
+}
+
+fn map_uart_char_error(err: CharIoError) -> ControlError {
+    match err {
+        CharIoError::HardwareError => ControlError::Io,
+        CharIoError::Unavailable => ControlError::NoDevice,
+        CharIoError::Timeout => ControlError::Busy,
+    }
+}
+
+fn map_uart_control_error(err: UartError) -> ControlError {
+    match err {
+        UartError::InvalidBaudRate => ControlError::Invalid,
+    }
 }
 
 impl DriverControl for Uart16550 {

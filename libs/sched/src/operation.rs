@@ -21,11 +21,13 @@ use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
 use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::sched_class::SchedAttr;
 use crate::scheduler::{
-    continue_task, current_cpu_id, current_task, mark_task_stopped, root_pid_ns, runqueue_of,
-    schedule_once, signal_wakeup,
+    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, is_cpu_online,
+    mark_task_stopped, migrate_task, request_post_syscall_handoff, request_resched, root_pid_ns,
+    runqueue_of, schedule_once, signal_wakeup, supported_cpu_mask,
 };
 use crate::signal::{
-    DefaultAction, SigAction, SigInfo, SigProcMaskHow, SigSet, SignalNumber, default_action,
+    DefaultAction, SigAction, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
+    default_action,
 };
 use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching};
 use crate::task::Task;
@@ -273,6 +275,39 @@ pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
     Ok(lookup_pid(pid)?.sched.sched_attr())
 }
 
+pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
+    Ok(lookup_pid(pid)?.cpu_affinity() & supported_cpu_mask())
+}
+
+fn affinity_cpu_bit(cpu_id: usize) -> u64 {
+    if cpu_id >= u64::BITS as usize {
+        0
+    } else {
+        1u64 << cpu_id
+    }
+}
+
+pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
+    let task = lookup_pid(pid)?;
+    let supported = mask & supported_cpu_mask();
+    if supported == 0 {
+        return Err(Errno::EINVAL);
+    }
+    task.set_cpu_affinity(supported);
+
+    let current_cpu = task.current_cpu();
+    if current_cpu < NR_CPUS && (supported & affinity_cpu_bit(current_cpu)) == 0 {
+        if let Some(target_cpu) = (0..NR_CPUS)
+            .find(|cpu_id| (supported & affinity_cpu_bit(*cpu_id)) != 0 && is_cpu_online(*cpu_id))
+        {
+            if migrate_task(&task, target_cpu).is_err() {
+                request_resched(current_cpu);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// getcpu：返回当前调度 CPU；NUMA node 暂按 UMA 返回 0。
 pub fn getcpu() -> Result<(u32, u32), Errno> {
     Ok((current_cpu_id() as u32, 0))
@@ -290,7 +325,12 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     (ops.execve)(&me, request, user_ctx)?;
     if me.is_vforking() {
         me.set_vforking(false);
-        me.vfork_done.wake_all();
+        // vfork 父进程到这里已经可以继续运行，但不要立刻抢占刚 exec 完成的
+        // child。让 child 先返回用户态跑到 daemon bind/listen，可以避免脚本
+        // 中 `server -D &; client` 在没有显式 sleep 时打到监听尚未建立的窗口。
+        me.vfork_done.wake_all_with(|task| {
+            enqueue_task_deferred(Arc::clone(task), crate::scheduler::now_ns_public());
+        });
     }
     Ok(())
 }
@@ -362,6 +402,11 @@ pub fn clone_with_context(args: CloneArgs, user_ctx: UserContextRef) -> Result<P
         child
             .vfork_done
             .wait_event(&parent, || !child.is_vforking());
+    } else {
+        // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
+        // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
+        // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
+        request_post_syscall_handoff();
     }
 
     Ok(pid)
@@ -411,6 +456,8 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         || args.set_tid_size != 0
         || args.cgroup != 0
     {
+        // TODO(threading): pidfd, namespace/cgroup flags and CLONE_IO need
+        // backing kernel objects before clone can expose them safely.
         return Err(Errno::EOPNOTSUPP);
     }
     if args.exit_signal > 64 {
@@ -759,6 +806,50 @@ pub fn sigpending() -> Result<SigSet, Errno> {
     Ok(SigSet(per_task.0 | shared.0))
 }
 
+/// 是否存在会打断阻塞 syscall 的 pending signal。
+///
+/// pending 位本身不够：SIGCHLD/SIGURG/SIGWINCH 等默认动作是忽略，若没有
+/// 用户 handler，不应让 select/poll/socket wait 返回 EINTR。否则 netserver
+/// 这类程序在子进程退出后会因为默认忽略的 SIGCHLD 直接跳出 accept loop。
+pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
+    let blocked = task.signal.blocked_snapshot().raw();
+    let pending = (task.signal.pending_snapshot().raw()
+        | task.shared_signal().pending_snapshot().raw())
+        & !blocked;
+    for raw in 1..crate::signal::NSIG as i32 {
+        let Some(sig) = SignalNumber::from_raw(raw) else {
+            continue;
+        };
+        if (pending & sig.bit()) == 0 {
+            continue;
+        }
+        let action = task.shared_signal().get_action(sig);
+        match action.handler {
+            SigHandler::Ignore => continue,
+            SigHandler::Handler(_) => return true,
+            SigHandler::Default => match default_action(sig) {
+                DefaultAction::Ign | DefaultAction::Cont => continue,
+                DefaultAction::Term | DefaultAction::Core | DefaultAction::Stop => {
+                    // 默认终止/停止类信号不能先把阻塞 syscall 退回用户态；
+                    // 否则 SIGKILL 会被用户程序观察成 EINTR。当前任务在
+                    // 内核态直接消费并执行默认动作，调度出口负责切走它。
+                    let current = current_task();
+                    if Arc::ptr_eq(&current, task) {
+                        let info = task
+                            .signal
+                            .dequeue_one_in(sig.bit())
+                            .or_else(|| task.shared_signal().dequeue_one_in(sig.bit()))
+                            .unwrap_or_else(|| make_siginfo(sig));
+                        apply_default_action(info);
+                    }
+                    return true;
+                }
+            },
+        }
+    }
+    false
+}
+
 /// `sigtimedwait(these)` 在不阻塞的情况下尝试消费一条属于 `these` 的信号。
 /// 命中即返回 Some(SigInfo)，无命中返回 None（不进入等待）。
 ///
@@ -834,7 +925,7 @@ pub fn sigtimedwait_wait(these: SigSet, timeout_ns: Option<u64>) -> bool {
             }
         }
 
-        schedule_once(0);
+        schedule_once(now_ns_public());
         if deadline.is_some() {
             cancel_sleep_deadline(&me);
         }

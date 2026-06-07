@@ -18,11 +18,12 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
+use crate::ids::Uid;
 use crate::pid::PidNamespace;
 use crate::runqueue::Runqueue;
 use crate::sched_class::SchedAttr;
@@ -54,12 +55,40 @@ static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
 /// 路径 / 主动 yield 入口读到 true 即调一次 [`schedule_once`]。
 static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
 
+/// 每核 syscall 收尾后的启动交接轮数。
+///
+/// clone/fork 成功时只登记这个计数；真正调度发生在 syscall 分发器已经写好
+/// 父任务返回值并推进 PC 之后。这样可以给新任务及其 daemon 子进程连续启动
+/// 的机会，同时避免在 clone syscall 内部切换导致父 trap frame 尚未收尾。
+static POST_SYSCALL_HANDOFF: [AtomicU8; NR_CPUS] = [const { AtomicU8::new(0) }; NR_CPUS];
+
+/// 单次 clone 后最多让渡的轮数。每轮仍由 runqueue 正常挑选任务；这不是忙等，
+/// 而是在安全边界多给刚唤醒/刚创建的任务几个调度机会。
+const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 16;
+
 struct TimedSleeper {
     deadline_ns: u64,
     task: Weak<Task>,
 }
 
 static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
+
+/// POSIX `ITIMER_REAL` 的纳秒级内核表示。
+///
+/// `value_ns == 0` 表示当前未 armed；`interval_ns != 0` 表示到期后按该周期重装。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RealtimeItimerSpec {
+    pub value_ns: u64,
+    pub interval_ns: u64,
+}
+
+struct RealtimeItimer {
+    deadline_ns: u64,
+    interval_ns: u64,
+    thread_group: Weak<ThreadGroup>,
+}
+
+static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
 
 /// 已上线 CPU 位图。CPU0 在 init 前后始终视为 online；AP 启动后通过
 /// [`register_cpu`] 打开对应 bit。
@@ -264,6 +293,10 @@ pub fn online_cpu_mask() -> u64 {
     CPU_ONLINE.load(Ordering::Acquire) & cpu_mask_all()
 }
 
+pub const fn supported_cpu_mask() -> u64 {
+    cpu_mask_all()
+}
+
 pub fn is_cpu_online(cpu_id: usize) -> bool {
     cpu_id < NR_CPUS && (online_cpu_mask() & cpu_bit(cpu_id)) != 0
 }
@@ -310,6 +343,38 @@ pub fn request_resched(cpu_id: usize) {
     }
 }
 
+pub fn request_post_syscall_handoff() {
+    let cpu_id = cpu();
+    let cell = &POST_SYSCALL_HANDOFF[cpu_id];
+    let mut cur = cell.load(Ordering::Acquire);
+    while cur < POST_SYSCALL_HANDOFF_ROUNDS {
+        match cell.compare_exchange(
+            cur,
+            POST_SYSCALL_HANDOFF_ROUNDS,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(next) => cur = next,
+        }
+    }
+    request_resched(cpu_id);
+}
+
+pub fn run_post_syscall_handoff(now_ns: u64) {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu_id = cpu();
+    let rounds = POST_SYSCALL_HANDOFF[cpu_id].swap(0, Ordering::AcqRel);
+    for _ in 0..rounds {
+        if RUNQUEUES[cpu_id].nr_running() <= 1 {
+            break;
+        }
+        schedule_once(now_ns_internal().max(now_ns));
+    }
+}
+
 /// 按亲和性和当前负载选择目标 CPU。没有匹配 online CPU 时回退到 CPU0。
 pub fn select_task_cpu(task: &Arc<Task>) -> usize {
     let allowed = task.cpu_affinity() & online_cpu_mask();
@@ -335,15 +400,28 @@ pub fn select_task_cpu(task: &Arc<Task>) -> usize {
 
 /// 统一入队入口：设置任务 CPU 归属、入目标 runqueue、请求该 CPU 调度。
 pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
+    let cpu_id = enqueue_task_locked(task, now_ns);
+    request_resched(cpu_id);
+    cpu_id
+}
+
+/// 只把任务放回 runqueue，不主动抢占当前任务。
+///
+/// vfork child 在 exec 完成时需要唤醒父进程，但 child 自己也刚拿到新的用户态
+/// 镜像；若立刻抢占，父 shell 会继续执行下一条命令，而后台 daemon 还没机会
+/// bind/listen。这个入口仅用于这类“父可运行，但当前 child 应先返回用户态”的
+/// 场景。
+pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
+    enqueue_task_locked(task, now_ns)
+}
+
+fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
     if task.sched.on_rq() {
-        let cpu_id = task.current_cpu().min(NR_CPUS - 1);
-        request_resched(cpu_id);
-        return cpu_id;
+        return task.current_cpu().min(NR_CPUS - 1);
     }
     let cpu_id = select_task_cpu(&task);
     task.set_current_cpu(cpu_id);
     RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
-    request_resched(cpu_id);
     cpu_id
 }
 
@@ -387,6 +465,65 @@ pub fn cancel_sleep_deadline(task: &Arc<Task>) {
     });
 }
 
+/// 查询当前线程组的 `ITIMER_REAL`。
+pub fn get_realtime_itimer(task: &Arc<Task>) -> RealtimeItimerSpec {
+    let tg = task.thread_group();
+    let now_ns = now_ns_internal();
+    let mut timers = REALTIME_ITIMERS.lock();
+    timers.retain(|entry| entry.thread_group.upgrade().is_some());
+    timers
+        .iter()
+        .find_map(|entry| {
+            let queued = entry.thread_group.upgrade()?;
+            if Arc::ptr_eq(&queued, &tg) {
+                Some(RealtimeItimerSpec {
+                    value_ns: entry.deadline_ns.saturating_sub(now_ns),
+                    interval_ns: entry.interval_ns,
+                })
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// 设置当前线程组的 `ITIMER_REAL`，返回旧值。
+pub fn set_realtime_itimer(
+    task: &Arc<Task>,
+    value_ns: u64,
+    interval_ns: u64,
+) -> RealtimeItimerSpec {
+    let tg = task.thread_group();
+    let now_ns = now_ns_internal();
+    let mut timers = REALTIME_ITIMERS.lock();
+    timers.retain(|entry| entry.thread_group.upgrade().is_some());
+
+    let mut old = RealtimeItimerSpec::default();
+    if let Some(pos) = timers.iter().position(|entry| {
+        entry
+            .thread_group
+            .upgrade()
+            .as_ref()
+            .is_some_and(|queued| Arc::ptr_eq(queued, &tg))
+    }) {
+        let entry = timers.swap_remove(pos);
+        old = RealtimeItimerSpec {
+            value_ns: entry.deadline_ns.saturating_sub(now_ns),
+            interval_ns: entry.interval_ns,
+        };
+    }
+
+    // POSIX: value 为 0 时取消计时器；interval 仅在 value 非 0 时有意义。
+    if value_ns != 0 {
+        timers.push(RealtimeItimer {
+            deadline_ns: now_ns.saturating_add(value_ns),
+            interval_ns,
+            thread_group: Arc::downgrade(&tg),
+        });
+    }
+    old
+}
+
 fn wake_expired_sleepers(now_ns: u64) {
     let expired = {
         let mut sleepers = TIMED_SLEEPERS.lock();
@@ -407,6 +544,66 @@ fn wake_expired_sleepers(now_ns: u64) {
     for task in expired {
         if task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
             enqueue_task(task, now_ns);
+        }
+    }
+}
+
+fn fire_expired_realtime_itimers(now_ns: u64) {
+    let expired = {
+        let mut timers = REALTIME_ITIMERS.lock();
+        let mut expired = Vec::new();
+        let mut idx = 0;
+        while idx < timers.len() {
+            let Some(tg) = timers[idx].thread_group.upgrade() else {
+                timers.swap_remove(idx);
+                continue;
+            };
+            if timers[idx].deadline_ns > now_ns {
+                idx += 1;
+                continue;
+            }
+
+            expired.push(tg);
+            let interval_ns = timers[idx].interval_ns;
+            if interval_ns == 0 {
+                timers.swap_remove(idx);
+                continue;
+            }
+
+            let mut next_deadline = timers[idx].deadline_ns.saturating_add(interval_ns);
+            while next_deadline <= now_ns {
+                let advanced = next_deadline.saturating_add(interval_ns);
+                if advanced == next_deadline {
+                    break;
+                }
+                next_deadline = advanced;
+            }
+            timers[idx].deadline_ns = next_deadline;
+            idx += 1;
+        }
+        expired
+    };
+
+    for tg in expired {
+        deliver_sigalrm_to_thread_group(&tg);
+    }
+}
+
+fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
+    let info = SigInfo {
+        sig: SignalNumber::SIGALRM,
+        // SI_KERNEL 的精简编码；当前 SigInfo 只保留最小字段集。
+        code: 128,
+        sender_pid: 0,
+        sender_uid: Uid::ROOT,
+    };
+    tg.shared_signal().deliver(info);
+    for task in tg.snapshot() {
+        if !task.signal.blocked_snapshot().has(SignalNumber::SIGALRM)
+            || task.signal.sigtimedwait_wants(SignalNumber::SIGALRM)
+        {
+            signal_wakeup(&task, &info);
+            break;
         }
     }
 }
@@ -634,6 +831,7 @@ pub fn on_timer_tick(now_ns: u64) {
         return;
     }
     wake_expired_sleepers(now_ns);
+    fire_expired_realtime_itimers(now_ns);
     let cpu_id = cpu();
     if RUNQUEUES[cpu_id].tick(now_ns) {
         request_resched(cpu_id);
@@ -662,7 +860,11 @@ unsafe extern "C" fn idle_entry(_cpu_arg: usize) -> ! {
         // 队列空时 schedule_once 也会走"idle == prev"的快路径直接返回；
         // 一旦有 runnable 任务进来，下一次 schedule_once 会把 idle 切走。
         schedule_once(now_ns_internal());
-        core::hint::spin_loop();
+        if let Some(ops) = arch_hooks::idle() {
+            (ops.idle_relax)();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 

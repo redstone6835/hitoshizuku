@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use spin::mutex::Mutex;
 
-pub use super::DriverControl;
+pub use super::control::{CharControlRequest, CharControlResponse, ControlError, DriverControl};
 
 // ─────────────────────────── I/O 错误 ────────────────────────────────────
 /// 字符设备 I/O 错误。
@@ -72,15 +72,30 @@ pub trait CharDriver: Send + Sync {
     /// 对无内部发送缓冲的设备，默认实现为空操作。
     fn poll_write(&self) {}
 
+    /// 执行字符设备类 typed control。
+    ///
+    /// 默认只把通用 flush 请求接到底层 [`flush`](Self::flush)，其它请求返回
+    /// `Unsupported`。具体驱动可覆盖此方法，把设备类请求转换为自己的
+    /// [`DriverControl`] typed request。
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        match req {
+            CharControlRequest::FlushTx | CharControlRequest::FlushBoth => {
+                // TODO(char-control): `flush()` 只保证驱动已有的 flush 语义，
+                // 不能代表所有字符设备都支持清空 RX 队列。
+                self.flush().map_err(map_char_control_error)?;
+                Ok(CharControlResponse::Done)
+            }
+            _ => Err(ControlError::Unsupported),
+        }
+    }
+
     /// 返回 `self` 的 `&dyn Any` 引用，用于向下转型到具体驱动类型。
     ///
-    /// 这是 `DriverControl` 在通用路径上的"类型恢复桥梁"：
+    /// 类型安全控制路径应优先使用 [`CharDevice::control`]；`as_any` 只作为
+    /// 少数调试或内部恢复具体驱动类型的逃生口。
     ///
     /// ```rust,ignore
-    /// // VFS / ioctl 路径：手持 CharDev，想修改波特率
-    /// if let Some(uart) = dev.downcast_driver::<Uart16550>() {
-    ///     uart.control(UartRequest::SetBaudRate { ... })?;
-    /// }
+    /// let _ = dev.control(CharControlRequest::FlushTx)?;
     /// ```
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
@@ -141,6 +156,10 @@ impl<T: CharDriver + ?Sized> CharDriver for &'static T {
         (**self).poll_write();
     }
 
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        (**self).control(req)
+    }
+
     fn as_any(&self) -> &dyn Any {
         (**self).as_any()
     }
@@ -185,6 +204,14 @@ where
 {
     fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
         Arc::new(self)
+    }
+}
+
+fn map_char_control_error(err: CharIoError) -> ControlError {
+    match err {
+        CharIoError::HardwareError => ControlError::Io,
+        CharIoError::Unavailable => ControlError::NoDevice,
+        CharIoError::Timeout => ControlError::Busy,
     }
 }
 
@@ -360,15 +387,24 @@ impl CharDevice {
         }
     }
 
+    /// 执行字符设备类 typed control。
+    #[inline]
+    pub fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+        self.inner.driver.control(req)
+    }
+
     /// 尝试将驱动向下转型为具体类型 `T`。
     ///
     /// 成功时返回 `Some(&T)`，类型不匹配时返回 `None`。
-    /// 这是从通用 `CharDev` 恢复 [`DriverControl`] 能力的安全路径。
+    /// 通用 ioctl/VFS 路径不应使用此方法做设备类型分派；它们应调用
+    /// [`CharDevice::control`]。本方法仅保留给少数确实需要具体驱动类型的
+    /// 内核内部路径。
     ///
     /// ```rust,ignore
-    /// if let Some(uart) = dev.downcast_driver::<Uart16550>() {
-    ///     uart.control(UartRequest::SetBaudRate { clock_hz: 100_000_000, baud: 9600 })?;
-    /// }
+    /// assert!(dev.downcast_driver::<MyDebugDriver>().is_none());
     /// ```
     #[inline]
     pub fn downcast_driver<T: 'static>(&self) -> Option<&T> {

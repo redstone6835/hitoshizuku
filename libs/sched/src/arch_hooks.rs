@@ -274,3 +274,34 @@ pub fn vm_switch() -> Option<&'static VmSwitchOps> {
         Some(unsafe { &*(ptr as *const VmSwitchOps) })
     }
 }
+
+// ── ArchIdleOps ──────────────────────────────────────────────────────────────
+
+/// 架构相关的 idle 等待契约。
+///
+/// 调度器不知道具体 ISA 的低功耗/等待中断指令，也不知道内核态 idle 是否需要
+/// 临时打开本地中断。由 arch 注入这个 hook，保持 sched crate 不直接依赖
+/// LoongArch/RISC-V CSR 细节。
+#[repr(C)]
+pub struct ArchIdleOps {
+    pub idle_relax: fn(),
+}
+
+unsafe impl Sync for ArchIdleOps {}
+unsafe impl Send for ArchIdleOps {}
+
+static IDLE_OPS: AtomicPtr<ArchIdleOps> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_idle(ops: &'static ArchIdleOps) {
+    register_once(&IDLE_OPS, ops as *const _ as *mut _, "ArchIdleOps");
+}
+
+pub fn idle() -> Option<&'static ArchIdleOps> {
+    let ptr = IDLE_OPS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: register_idle only stores 'static ops.
+        Some(unsafe { &*(ptr as *const ArchIdleOps) })
+    }
+}

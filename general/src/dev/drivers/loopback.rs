@@ -11,7 +11,7 @@ use spin::Mutex;
 
 use net::config::{IfConfig, Ipv4Addr};
 use net::device::NetDevice;
-use net::driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
+use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 
 use crate::dev::pnp::PnpError;
 
@@ -36,6 +36,12 @@ impl LoopbackDriver {
 }
 
 impl NetDriver for LoopbackDriver {
+    fn medium(&self) -> LinkMedium {
+        // loopback 没有 Ethernet 二层头，也不需要 ARP/邻居解析；
+        // 直接以 IP packet 形式交给 smoltcp，127.0.0.1 才能在本机闭环。
+        LinkMedium::Ip
+    }
+
     fn poll_rx(&self) -> Option<RxBuf> {
         let mut q = self.queue.lock();
         let frame = q.pop_front()?;

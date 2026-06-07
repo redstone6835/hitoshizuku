@@ -126,6 +126,9 @@ pub enum VfsError {
 
     /// 管道写端已关闭，读端返回 EOF；或读端已关闭，写端收到 SIGPIPE（EPIPE）。
     BrokenPipe,
+
+    /// 连接被对端重置（ECONNRESET）。
+    ConnectionReset,
 }
 
 impl VfsError {
@@ -160,6 +163,7 @@ impl VfsError {
             VfsError::WouldBlock => Errno::EAGAIN,
             VfsError::TimedOut => Errno::ETIMEDOUT,
             VfsError::BrokenPipe => Errno::EPIPE,
+            VfsError::ConnectionReset => Errno::ECONNRESET,
         }
     }
 }

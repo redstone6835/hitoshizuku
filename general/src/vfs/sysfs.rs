@@ -425,7 +425,10 @@ impl NetDevSlot {
 }
 
 fn netdev_slot_by_name(name: &str) -> Option<NetDevSlot> {
-    NetDevSlot::ALL.iter().find(|s| s.file_name() == name).copied()
+    NetDevSlot::ALL
+        .iter()
+        .find(|s| s.file_name() == name)
+        .copied()
 }
 
 #[derive(Clone, Copy)]
@@ -443,10 +446,14 @@ enum NetDevStatsSlot {
 impl NetDevStatsSlot {
     fn to_u64(self) -> u64 {
         match self {
-            Self::RxBytes => 0, Self::TxBytes => 1,
-            Self::RxPackets => 2, Self::TxPackets => 3,
-            Self::RxDropped => 4, Self::TxDropped => 5,
-            Self::RxErrors => 6, Self::TxErrors => 7,
+            Self::RxBytes => 0,
+            Self::TxBytes => 1,
+            Self::RxPackets => 2,
+            Self::TxPackets => 3,
+            Self::RxDropped => 4,
+            Self::TxDropped => 5,
+            Self::RxErrors => 6,
+            Self::TxErrors => 7,
         }
     }
     fn to_netdev_slot(self) -> NetDevSlot {
@@ -461,15 +468,26 @@ impl NetDevStatsSlot {
             Self::TxErrors => NetDevSlot::StatisticsTxErrors,
         }
     }
-    fn file_name(self) -> &'static str { self.to_netdev_slot().file_name() }
+    fn file_name(self) -> &'static str {
+        self.to_netdev_slot().file_name()
+    }
     const ALL: &'static [Self] = &[
-        Self::RxBytes, Self::TxBytes, Self::RxPackets, Self::TxPackets,
-        Self::RxDropped, Self::TxDropped, Self::RxErrors, Self::TxErrors,
+        Self::RxBytes,
+        Self::TxBytes,
+        Self::RxPackets,
+        Self::TxPackets,
+        Self::RxDropped,
+        Self::TxDropped,
+        Self::RxErrors,
+        Self::TxErrors,
     ];
 }
 
 fn netdev_stats_slot_by_name(name: &str) -> Option<NetDevStatsSlot> {
-    NetDevStatsSlot::ALL.iter().find(|s| s.file_name() == name).copied()
+    NetDevStatsSlot::ALL
+        .iter()
+        .find(|s| s.file_name() == name)
+        .copied()
 }
 
 fn class_net_iface_ino(iface_id: u32) -> u64 {
@@ -495,26 +513,58 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             );
         }
-        NetDevSlot::Mtu => { let _ = writeln!(s, "{}", iface.mtu); }
-        NetDevSlot::Flags => { let _ = writeln!(s, "0x{:x}", iface.flags); }
-        NetDevSlot::IfIndex => { let _ = writeln!(s, "{}", iface.id.raw() + 1); }
-        NetDevSlot::TxQueueLen => { let _ = writeln!(s, "1000"); }
+        NetDevSlot::Mtu => {
+            let _ = writeln!(s, "{}", iface.mtu);
+        }
+        NetDevSlot::Flags => {
+            let _ = writeln!(s, "0x{:x}", iface.flags);
+        }
+        NetDevSlot::IfIndex => {
+            let _ = writeln!(s, "{}", iface.id.raw() + 1);
+        }
+        NetDevSlot::TxQueueLen => {
+            let _ = writeln!(s, "1000");
+        }
         NetDevSlot::Carrier => {
-            let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 { "1" } else { "0" };
+            let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 {
+                "1"
+            } else {
+                "0"
+            };
             let _ = writeln!(s, "{}", carrier);
         }
         NetDevSlot::Operstate => {
-            let state = if iface.flags & net::stack::IFF_UP != 0 { "up" } else { "down" };
+            let state = if iface.flags & net::stack::IFF_UP != 0 {
+                "up"
+            } else {
+                "down"
+            };
             let _ = writeln!(s, "{}", state);
         }
-        NetDevSlot::StatisticsRxBytes => { let _ = writeln!(s, "{}", iface.stats.rx_bytes); }
-        NetDevSlot::StatisticsTxBytes => { let _ = writeln!(s, "{}", iface.stats.tx_bytes); }
-        NetDevSlot::StatisticsRxPackets => { let _ = writeln!(s, "{}", iface.stats.rx_packets); }
-        NetDevSlot::StatisticsTxPackets => { let _ = writeln!(s, "{}", iface.stats.tx_packets); }
-        NetDevSlot::StatisticsRxDropped => { let _ = writeln!(s, "{}", iface.stats.rx_dropped); }
-        NetDevSlot::StatisticsTxDropped => { let _ = writeln!(s, "{}", iface.stats.tx_dropped); }
-        NetDevSlot::StatisticsRxErrors => { let _ = writeln!(s, "{}", iface.stats.rx_errors); }
-        NetDevSlot::StatisticsTxErrors => { let _ = writeln!(s, "{}", iface.stats.tx_errors); }
+        NetDevSlot::StatisticsRxBytes => {
+            let _ = writeln!(s, "{}", iface.stats.rx_bytes);
+        }
+        NetDevSlot::StatisticsTxBytes => {
+            let _ = writeln!(s, "{}", iface.stats.tx_bytes);
+        }
+        NetDevSlot::StatisticsRxPackets => {
+            let _ = writeln!(s, "{}", iface.stats.rx_packets);
+        }
+        NetDevSlot::StatisticsTxPackets => {
+            let _ = writeln!(s, "{}", iface.stats.tx_packets);
+        }
+        NetDevSlot::StatisticsRxDropped => {
+            let _ = writeln!(s, "{}", iface.stats.rx_dropped);
+        }
+        NetDevSlot::StatisticsTxDropped => {
+            let _ = writeln!(s, "{}", iface.stats.tx_dropped);
+        }
+        NetDevSlot::StatisticsRxErrors => {
+            let _ = writeln!(s, "{}", iface.stats.rx_errors);
+        }
+        NetDevSlot::StatisticsTxErrors => {
+            let _ = writeln!(s, "{}", iface.stats.tx_errors);
+        }
     }
     s
 }
@@ -1319,10 +1369,10 @@ impl SysDirInodeOps {
             }
             SysDirKind::ClassNetIface { iface_id } => {
                 if let Some(slot) = netdev_slot_by_name(name) {
-                    Ok(mk_file(
+                    mk_reg(
                         class_net_iface_slot_ino(iface_id, slot.to_u64()),
                         SysRegFile::NetDev { iface_id, slot },
-                    ))
+                    )
                 } else if name == "statistics" {
                     Ok(mk_dir(
                         class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS,
@@ -1334,18 +1384,20 @@ impl SysDirInodeOps {
             }
             SysDirKind::ClassNetStats { iface_id } => {
                 if let Some(slot) = netdev_stats_slot_by_name(name) {
-                    Ok(mk_file(
+                    mk_reg(
                         class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS + slot.to_u64(),
-                        SysRegFile::NetDev { iface_id, slot: slot.to_netdev_slot() },
-                    ))
+                        SysRegFile::NetDev {
+                            iface_id,
+                            slot: slot.to_netdev_slot(),
+                        },
+                    )
                 } else {
                     Err(VfsError::NotFound)
                 }
             }
-            SysDirKind::Bus
-            | SysDirKind::Module
-            | SysDirKind::Power
-            | SysDirKind::Firmware => Err(VfsError::NotFound),
+            SysDirKind::Bus | SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => {
+                Err(VfsError::NotFound)
+            }
             SysDirKind::DevicesSystem => match name {
                 "cpu" => Ok(mk_dir(DEVICES_SYSTEM_CPU_INO, SysDirKind::DevicesSystemCpu)),
                 _ => Err(VfsError::NotFound),
@@ -1649,10 +1701,9 @@ impl SysDirInodeOps {
                     .map(|s| mk_dir_entry(base + s.to_u64(), s.file_name(), FileType::Regular))
                     .collect()
             }
-            SysDirKind::Bus
-            | SysDirKind::Module
-            | SysDirKind::Power
-            | SysDirKind::Firmware => Vec::new(),
+            SysDirKind::Bus | SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => {
+                Vec::new()
+            }
             SysDirKind::DevicesSystem => vec![mk_dir_entry(
                 DEVICES_SYSTEM_CPU_INO,
                 "cpu",

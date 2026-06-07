@@ -72,7 +72,7 @@ pub(crate) fn wait_while(
             let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
             return Err(SocketError::TemporaryUnavailable);
         }
-        schedule_once(0);
+        schedule_once(now_ns_public());
         queue.remove(&task);
         if deadline_armed {
             cancel_sleep_deadline(&task);

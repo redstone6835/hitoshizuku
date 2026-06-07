@@ -79,7 +79,7 @@ impl WaitQueue {
                 self.finish_wait(task);
                 return;
             }
-            crate::scheduler::schedule_once(0);
+            crate::scheduler::schedule_once(crate::scheduler::now_ns_public());
             self.finish_wait(task);
         }
     }

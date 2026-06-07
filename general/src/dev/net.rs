@@ -7,7 +7,8 @@ use core::any::Any;
 use errno::Errno;
 use net::config::IpAddr;
 
-use crate::dev::function::{DevNodeSpec, DeviceClassId, DeviceFunction};
+use crate::dev::control::{ControlError, DriverControl, NetControlRequest, NetControlResponse};
+use crate::dev::function::{DeviceClassId, DeviceFunction};
 use crate::mm::{copy_from_user, copy_to_user};
 
 /// 网络设备 function 类别 ID。
@@ -21,6 +22,7 @@ pub struct NetFunction {
 
 impl NetFunction {
     pub fn new(dev_name: &str, dev: Arc<net::NetDevice>) -> Self {
+        vfs::net_socket::install_net_ioctl_handler(net_ioctl);
         Self {
             dev_name: dev_name.into(),
             dev,
@@ -29,6 +31,10 @@ impl NetFunction {
 
     pub fn net_device(&self) -> &Arc<net::NetDevice> {
         &self.dev
+    }
+
+    pub fn control(&self, req: NetControlRequest) -> Result<NetControlResponse, ControlError> {
+        control_net_device(&self.dev, req)
     }
 }
 
@@ -45,15 +51,55 @@ impl DeviceFunction for NetFunction {
         self.dev.mark_gone();
     }
 
-    fn devnode(&self) -> Option<DevNodeSpec> {
-        Some(DevNodeSpec::NetDev {
-            name: self.dev_name.clone(),
-            iface_id: self.dev.id().raw(),
-        })
-    }
-
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+impl DriverControl for NetFunction {
+    type Request = NetControlRequest;
+    type Response = NetControlResponse;
+    type Error = ControlError;
+
+    fn control(&self, req: Self::Request) -> Result<Self::Response, Self::Error> {
+        NetFunction::control(self, req)
+    }
+}
+
+impl DriverControl for Arc<net::NetDevice> {
+    type Request = NetControlRequest;
+    type Response = NetControlResponse;
+    type Error = ControlError;
+
+    fn control(&self, req: Self::Request) -> Result<Self::Response, Self::Error> {
+        control_net_device(self, req)
+    }
+}
+
+fn control_net_device(
+    dev: &Arc<net::NetDevice>,
+    req: NetControlRequest,
+) -> Result<NetControlResponse, ControlError> {
+    if !dev.is_active() {
+        return Err(ControlError::NoDevice);
+    }
+
+    match req {
+        NetControlRequest::GetInterfaceId => Ok(NetControlResponse::U32(dev.id().raw())),
+        NetControlRequest::GetName => Ok(NetControlResponse::Name(dev.name().into())),
+        NetControlRequest::GetMedium => Ok(NetControlResponse::Medium(dev.driver().medium())),
+        NetControlRequest::GetLinkState => {
+            Ok(NetControlResponse::LinkState(dev.driver().link_state()))
+        }
+        NetControlRequest::GetMacAddress => {
+            Ok(NetControlResponse::MacAddress(dev.driver().mac_address()))
+        }
+        NetControlRequest::GetMtu => Ok(NetControlResponse::Usize(dev.driver().mtu())),
+        NetControlRequest::GetTxDropped => Ok(NetControlResponse::U64(dev.tx_dropped())),
+        NetControlRequest::GetStats => Ok(NetControlResponse::Stats(dev.driver().stats())),
+        NetControlRequest::SetMtu { .. }
+        | NetControlRequest::SetFlags { .. }
+        | NetControlRequest::SetMacAddress { .. } => Err(ControlError::Unsupported),
     }
 }
 
@@ -167,32 +213,6 @@ fn ioctl_get_arp(arg: usize) -> Result<usize, Errno> {
     }
     // 不伪造 ARP fallback：neighbor cache 中没有完整项时按未命中返回。
     Err(Errno::ENOENT)
-}
-
-/// 检查是否为网络 ioctl 命令。
-pub fn is_net_ioctl(cmd: u32) -> bool {
-    matches!(
-        cmd,
-        SIOCADDRT
-            | SIOCDELRT
-            | SIOCGIFCONF
-            | SIOCGIFFLAGS
-            | SIOCSIFFLAGS
-            | SIOCGIFADDR
-            | SIOCSIFADDR
-            | SIOCGIFBRDADDR
-            | SIOCGIFNETMASK
-            | SIOCSIFNETMASK
-            | SIOCGIFMTU
-            | SIOCSIFMTU
-            | SIOCGIFHWADDR
-            | SIOCGIFINDEX
-            | SIOCGIFTXQLEN
-            | SIOCSIFTXQLEN
-            | SIOCGARP
-            | SIOCSARP
-            | SIOCDARP
-    )
 }
 
 fn find_iface_by_name(name: &[u8]) -> Option<net::InterfaceSnapshot> {

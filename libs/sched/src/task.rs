@@ -40,6 +40,27 @@ use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
 use crate::wait_flags::WaitStatus;
 
+/// Linux 线程名长度，包含结尾 NUL。
+pub const TASK_COMM_LEN: usize = 16;
+const DEFAULT_COMM: [u8; TASK_COMM_LEN] =
+    [b'm', b'y', b'g', b'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// 每线程 robust futex 链表注册状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RobustListState {
+    pub head: usize,
+    pub len: usize,
+}
+
+/// 每线程 rseq 注册状态。当前仅作为 ABI 占位，不执行 rseq 快路径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RseqRegistration {
+    pub ptr: usize,
+    pub len: u32,
+    pub signature: u32,
+    pub registered: bool,
+}
+
 /// 任务状态机。
 ///
 /// 状态转换由调度器内部原子 CAS 驱动，避免为"取状态"再持 rq 锁。
@@ -242,6 +263,12 @@ pub struct Task {
     vforking: AtomicBool,
     /// `CLONE_CHILD_CLEARTID` / `set_tid_address` 指定的用户态 TID 地址。
     clear_child_tid: AtomicUsize,
+    /// `set_robust_list` 注册的每线程 robust futex 链表。
+    robust_list: Spinlock<RobustListState>,
+    /// `rseq` 注册状态。完整 restartable sequence 语义后续由 arch/trap 接入。
+    rseq: Spinlock<RseqRegistration>,
+    /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
+    comm: Spinlock<[u8; TASK_COMM_LEN]>,
     /// CPU 亲和性位图。预留单 word，单 CPU 原型暂不强制。
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
@@ -292,6 +319,9 @@ impl Task {
             vfork_done: WaitQueue::new(),
             vforking: AtomicBool::new(false),
             clear_child_tid: AtomicUsize::new(0),
+            robust_list: Spinlock::new(RobustListState::default()),
+            rseq: Spinlock::new(RseqRegistration::default()),
+            comm: Spinlock::new(DEFAULT_COMM),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
             ext: Spinlock::new(Vec::new()),
@@ -678,6 +708,41 @@ impl Task {
 
     pub fn set_clear_child_tid(&self, user_addr: usize) {
         self.clear_child_tid.store(user_addr, Ordering::Release);
+    }
+
+    pub fn robust_list(&self) -> RobustListState {
+        *self.robust_list.lock()
+    }
+
+    pub fn set_robust_list(&self, head: usize, len: usize) {
+        *self.robust_list.lock() = RobustListState { head, len };
+    }
+
+    pub fn rseq_registration(&self) -> RseqRegistration {
+        *self.rseq.lock()
+    }
+
+    pub fn set_rseq_registration(&self, registration: RseqRegistration) {
+        *self.rseq.lock() = registration;
+    }
+
+    pub fn clear_rseq_registration(&self) {
+        *self.rseq.lock() = RseqRegistration::default();
+    }
+
+    pub fn comm(&self) -> [u8; TASK_COMM_LEN] {
+        *self.comm.lock()
+    }
+
+    pub fn set_comm(&self, name: &[u8]) {
+        let mut comm = [0u8; TASK_COMM_LEN];
+        let n = name
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(name.len())
+            .min(TASK_COMM_LEN - 1);
+        comm[..n].copy_from_slice(&name[..n]);
+        *self.comm.lock() = comm;
     }
 
     // ── CPU 亲和性 ───────────────────────────────────────────────────────

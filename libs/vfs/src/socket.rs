@@ -51,6 +51,7 @@ pub const SO_KEEPALIVE: i32 = 9;
 pub const SCM_RIGHTS: i32 = 1;
 pub const SCM_CREDENTIALS: i32 = 2;
 pub const SO_ERROR: i32 = 4;
+pub const SO_DONTROUTE: i32 = 5;
 pub const SO_TYPE: i32 = 3;
 pub const SO_SNDBUF: i32 = 7;
 pub const SO_RCVBUF: i32 = 8;
@@ -63,6 +64,7 @@ pub const SO_SNDTIMEO: i32 = 21;
 pub const SO_ACCEPTCONN: i32 = 30;
 pub const SO_PROTOCOL: i32 = 38;
 pub const SO_DOMAIN: i32 = 39;
+pub const SO_RXQ_OVFL: i32 = 40;
 
 pub const MSG_PEEK: usize = 0x0002;
 pub const MSG_TRUNC: usize = 0x0020;
@@ -662,9 +664,15 @@ pub fn accept(
 
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
         let accepted = net_ops.accept(file.flags().nonblock || nonblock)?;
+        let peer = {
+            let mut buf = vec![0u8; 28];
+            let len = accepted.getpeername(&mut buf)?;
+            buf.truncate(len);
+            Some(buf)
+        };
         let new_file = new_net_socket_file(accepted, Arc::clone(&ctx.cred), nonblock);
         let new_fd = fdt.alloc_fd(new_file, fd_flags).map_err(|e| e.to_errno())?;
-        return Ok((new_fd, None));
+        return Ok((new_fd, peer));
     }
 
     let socket = socket_from_file(&file)?;
@@ -1080,6 +1088,7 @@ const IP_TTL: i32 = 2;
 const IP_HDRINCL: i32 = 3;
 const IP_OPTIONS: i32 = 4;
 const IP_PKTINFO: i32 = 8;
+const IP_RECVERR: i32 = 11;
 const IP_RECVTTL: i32 = 12;
 const IP_RECVTOS: i32 = 13;
 const IP_FREEBIND: i32 = 15;
@@ -1095,6 +1104,7 @@ const IPV6_RECVPKTINFO: i32 = 49;
 const IPV6_RECVHOPLIMIT: i32 = 51;
 const IPV6_TCLASS: i32 = 67;
 const IPV6_ADD_MEMBERSHIP: i32 = 20;
+const IPV6_RECVERR: i32 = 25;
 const IPV6_MULTICAST_HOPS: i32 = 18;
 const IPV6_MULTICAST_IF: i32 = 17;
 const IPV6_MULTICAST_LOOP: i32 = 19;
@@ -1176,6 +1186,8 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 Ok(timeval_from_ns(ns).to_vec())
             }
             SO_TIMESTAMP => Ok((opts.timestamp as i32).to_ne_bytes().to_vec()),
+            SO_DONTROUTE => Ok((opts.dontroute as i32).to_ne_bytes().to_vec()),
+            SO_RXQ_OVFL => Ok((opts.rxq_ovfl as i32).to_ne_bytes().to_vec()),
             SO_MARK => Ok((opts.mark as i32).to_ne_bytes().to_vec()),
             SO_PRIORITY => Ok(opts.priority.to_ne_bytes().to_vec()),
             SO_OOBINLINE => Ok((opts.oobinline as i32).to_ne_bytes().to_vec()),
@@ -1189,10 +1201,7 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             TCP_KEEPIDLE => Ok((opts.keepidle as i32).to_ne_bytes().to_vec()),
             TCP_KEEPINTVL => Ok((opts.keepintvl as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 不支持单独设置 intvl
             TCP_KEEPCNT => Ok((opts.keepcnt as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 不支持探测次数
-            TCP_INFO => {
-                // TODO: 填充 struct tcp_info（state、rtt、cwnd、retrans 等 ~100 字段）
-                Err(Errno::ENOPROTOOPT)
-            }
+            TCP_INFO => Ok(tcp_info_minimal(net_ops)), // TODO: 仅填最小状态字段，缺少 RTT/cwnd/retrans 等完整 TCP 统计
             TCP_CONGESTION => Ok(b"cubic\0".to_vec()), // TODO: smoltcp 仅支持 Reno/Cubic 切换，未对接
             TCP_DEFER_ACCEPT => Ok((opts.defer_accept as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 无 defer accept
             TCP_QUICKACK => Ok((opts.quickack as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 无 quickack
@@ -1210,6 +1219,7 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             IP_PKTINFO => Ok((opts.pktinfo as i32).to_ne_bytes().to_vec()),
             IP_HDRINCL => Ok((opts.hdrincl as i32).to_ne_bytes().to_vec()),
             IP_OPTIONS => Ok(Vec::new()), // TODO: 返回当前 IP options（smoltcp 不支持 IP options）
+            IP_RECVERR => Ok((opts.recverr as i32).to_ne_bytes().to_vec()),
             IP_RECVTTL => Ok((opts.recvttl as i32).to_ne_bytes().to_vec()),
             IP_RECVTOS => Ok((opts.recvtos as i32).to_ne_bytes().to_vec()),
             IP_FREEBIND => Ok((opts.freebind as i32).to_ne_bytes().to_vec()),
@@ -1220,6 +1230,7 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             IPV6_UNICAST_HOPS => Ok((opts.hops_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_RECVPKTINFO => Ok((opts.recv_pktinfo_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_RECVHOPLIMIT => Ok((opts.recv_hoplimit_v6 as i32).to_ne_bytes().to_vec()),
+            IPV6_RECVERR => Ok((opts.recverr_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_TCLASS => Ok(opts.tclass.to_ne_bytes().to_vec()),
             IPV6_MULTICAST_HOPS => Ok((opts.mcast_hops_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_MULTICAST_IF => Ok(0i32.to_ne_bytes().to_vec()), // TODO: 返回当前 IPv6 组播出接口 index
@@ -1228,6 +1239,30 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
         },
         _ => Err(Errno::ENOPROTOOPT),
     }
+}
+
+fn tcp_info_minimal(net_ops: &NetSocketFileOps) -> Vec<u8> {
+    // Linux struct tcp_info 在不同内核版本里持续追加字段。iperf3 只要求
+    // getsockopt(TCP_INFO) 成功，并能读取开头的 state/基本计数；这里返回
+    // 104 字节的旧版基础布局，未实现的统计字段保持 0。
+    const TCP_INFO_MIN_LEN: usize = 104;
+    let mut info = vec![0u8; TCP_INFO_MIN_LEN];
+    let state = net_ops
+        .get_handle_for_opts()
+        .filter(|handle| handle.socket_type() == NetSocketType::Tcp)
+        .map(|handle| match net::stack().socket_state(handle) {
+            net::SocketState::Established => 1, // TCP_ESTABLISHED
+            net::SocketState::Connecting => 2,  // TCP_SYN_SENT/SYN_RECV 近似
+            net::SocketState::Closing => 4,     // TCP_FIN_WAIT1 近似
+            net::SocketState::Closed => 7,      // TCP_CLOSE
+            net::SocketState::Listen => 10,     // TCP_LISTEN
+        })
+        .unwrap_or(7);
+    info[0] = state;
+    // tcpi_snd_mss / tcpi_rcv_mss，避免用户程序把 0 当成异常路径。
+    info[16..20].copy_from_slice(&1460u32.to_ne_bytes());
+    info[20..24].copy_from_slice(&1460u32.to_ne_bytes());
+    info
 }
 
 fn inet_setsockopt(
@@ -1300,6 +1335,20 @@ fn inet_setsockopt(
             }
             SO_TIMESTAMP => {
                 opts.timestamp = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            SO_DONTROUTE => {
+                // 当前路由层还没有“只走直连链路”的独立策略；先保存开关
+                // 并按 no-op 成功返回，避免 netperf/traceroute 把兼容缺口
+                // 当成致命错误。
+                opts.dontroute = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            SO_RXQ_OVFL => {
+                // Linux 用该选项请求在控制消息中报告 socket RX 溢出计数。
+                // 本栈暂未生成 ancillary data，但接受并保存该开关可兼容
+                // netperf 的 enable_enobufs 探测路径。
+                opts.rxq_ovfl = parse_int_opt(value)? != 0;
                 Ok(())
             }
             SO_MARK => {
@@ -1411,6 +1460,13 @@ fn inet_setsockopt(
                 opts.hdrincl = parse_int_opt(value)? != 0;
                 Ok(())
             }
+            IP_RECVERR => {
+                // Linux 使用该选项把异步网络错误送入 MSG_ERRQUEUE。
+                // 当前栈尚未实现错误队列；先保存开关并返回成功，避免 netperf
+                // 的 enable_enobufs 探测路径因为 ENOPROTOOPT 中断。
+                opts.recverr = parse_int_opt(value)? != 0;
+                Ok(())
+            }
             IP_RECVTTL => {
                 opts.recvttl = parse_int_opt(value)? != 0;
                 Ok(())
@@ -1454,6 +1510,11 @@ fn inet_setsockopt(
             }
             IPV6_RECVHOPLIMIT => {
                 opts.recv_hoplimit_v6 = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            IPV6_RECVERR => {
+                // IPv6 error queue 语义同 IP_RECVERR；目前作为兼容开关保存。
+                opts.recverr_v6 = parse_int_opt(value)? != 0;
                 Ok(())
             }
             IPV6_TCLASS => {

@@ -18,6 +18,9 @@ use spin::mutex::Mutex;
 
 use crate::dev::bio::{Bio, BioBuffer, BioError, BioOp, BioReqError, BioResult, SubmitError};
 use crate::dev::completion::Completion;
+use crate::dev::control::{
+    BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError, DriverControl,
+};
 
 // ── 重导出 ──────────────────────────────────────────────────────────────────
 pub use crate::dev::bio::{
@@ -325,6 +328,65 @@ impl BlockDevice {
         self.driver.drain();
     }
 
+    /// 执行块设备类 typed control。
+    pub fn control(
+        self: &Arc<Self>,
+        req: BlockControlRequest,
+    ) -> Result<BlockControlResponse, ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+
+        match req {
+            BlockControlRequest::GetReadOnly => Ok(BlockControlResponse::Bool(
+                self.features.contains(BlockFeatures::READ_ONLY),
+            )),
+            BlockControlRequest::GetCapacityBytes => self
+                .geometry
+                .capacity_bytes()
+                .map(BlockControlResponse::U64)
+                .ok_or(ControlError::Invalid),
+            BlockControlRequest::GetLogicalBlockSize => Ok(BlockControlResponse::U32(
+                self.geometry.logical_block_size().get(),
+            )),
+            BlockControlRequest::GetPhysicalBlockSize => Ok(BlockControlResponse::U32(
+                self.geometry.physical_block_size().get(),
+            )),
+            BlockControlRequest::GetIoHints => {
+                let logical = self.geometry.logical_block_size().get();
+                let optimal = self
+                    .limits
+                    .optimal_blocks_per_io()
+                    .map(|blocks| blocks.get().saturating_mul(logical))
+                    .unwrap_or(0);
+                Ok(BlockControlResponse::IoHints(BlockIoHints {
+                    min_io_size: logical,
+                    optimal_io_size: optimal,
+                    alignment_offset: self.limits.buffer_alignment().map(|_| 0).unwrap_or(0),
+                    discard_zeroes: self.features.contains(BlockFeatures::WRITE_ZEROES),
+                    rotational: self.attributes.rotational(),
+                }))
+            }
+            BlockControlRequest::GetDiskSeq => self
+                .attributes
+                .diskseq()
+                .map(BlockControlResponse::U64)
+                .ok_or(ControlError::Unsupported),
+            BlockControlRequest::Flush => {
+                if !self.features.contains(BlockFeatures::FLUSH) {
+                    return Ok(BlockControlResponse::Done);
+                }
+                self.submit_bio_wait(
+                    BioOp::Flush,
+                    BlockRange { lba: 0, blocks: 0 },
+                    BioBuffer::None,
+                )
+                .map_err(map_bio_control_error)?;
+                Ok(BlockControlResponse::Done)
+            }
+        }
+    }
+
     /// 尝试将内部 `BlockDriver` 向下转型为具体类型。
     pub fn downcast_driver<T: 'static>(&self) -> Option<&T> {
         if !self.is_active() {
@@ -473,6 +535,29 @@ impl BlockDevice {
             }
         }
         Ok(())
+    }
+}
+
+impl DriverControl for Arc<BlockDevice> {
+    type Request = BlockControlRequest;
+    type Response = BlockControlResponse;
+    type Error = ControlError;
+
+    fn control(&self, req: Self::Request) -> Result<Self::Response, Self::Error> {
+        BlockDevice::control(self, req)
+    }
+}
+
+fn map_bio_control_error(err: BioError) -> ControlError {
+    match err {
+        BioError::Submit(SubmitError::DeviceGone) => ControlError::NoDevice,
+        BioError::Submit(SubmitError::QueueFull) => ControlError::Busy,
+        BioError::Submit(SubmitError::ReadOnly) => ControlError::Permission,
+        BioError::Submit(SubmitError::Unsupported) => ControlError::Unsupported,
+        BioError::Submit(SubmitError::OutOfMemory | SubmitError::InvalidRequest(_)) => {
+            ControlError::Invalid
+        }
+        BioError::Io(_) => ControlError::Io,
     }
 }
 

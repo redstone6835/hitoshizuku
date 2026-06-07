@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use errno::Errno;
 use general::firmware::power;
-use general::mm::{copy_from_user, copy_to_user};
+use general::mm::{VmSpace, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{Capability, Gid, Uid};
@@ -66,6 +66,7 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         ctx.task.pid_root(),
         code
     );
+    exit_robust_list(&ctx.task);
     clear_child_tid_and_wake(&ctx.task);
     sched::operation::exit(code);
 }
@@ -77,7 +78,10 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         ctx.task.pid_root(),
         code
     );
-    clear_child_tid_and_wake(&ctx.task);
+    for task in ctx.task.thread_group().snapshot() {
+        exit_robust_list(&task);
+        clear_child_tid_and_wake(&task);
+    }
     sched::operation::exit_group(code);
 }
 
@@ -103,12 +107,19 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let user = ctx.args[0];
     let size = ctx.args[1];
-    if user == 0 || size < 64 {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if size < LINUX_CLONE_ARGS_MIN_SIZE {
         return Err(Errno::EINVAL);
     }
-    let mut raw = [0u8; 88];
+    if size > LINUX_CLONE_ARGS_MAX_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    let mut raw = [0u8; LINUX_CLONE_ARGS_SIZE];
     let n = size.min(raw.len());
     copy_from_user(user, &mut raw[..n]).map_err(|e| e.as_errno())?;
+    validate_clone3_tail(user, size)?;
     let read_u64 = |idx: usize| -> u64 {
         let start = idx * 8;
         u64::from_le_bytes(raw[start..start + 8].try_into().unwrap())
@@ -127,6 +138,8 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         cgroup: read_u64(10) as usize,
     };
     if args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
+        // TODO(threading): clone3 pidfd/set_tid/cgroup need pidfd file
+        // objects, namespace-aware TID allocation and cgroup membership state.
         return Err(Errno::EOPNOTSUPP);
     }
     let pid = sched::operation::clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
@@ -289,6 +302,17 @@ pub(super) fn sys_tgkill(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(0)
 }
 
+pub(super) fn sys_rt_tgsigqueueinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let tgid = ctx.args[0] as i32;
+    let tid = ctx.args[1] as i32;
+    let sig = signal_arg(ctx.args[2])?;
+    let _uinfo = ctx.args[3];
+    // TODO(threading): preserve user-provided siginfo payload instead of
+    // degrading this ABI to tgkill-style delivery.
+    sched::operation::tgkill(tgid, tid, sig)?;
+    Ok(0)
+}
+
 pub(super) fn sys_setpgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     sched::operation::setpgid(ctx.args[0] as i32, ctx.args[1] as i32)?;
     Ok(0)
@@ -311,8 +335,47 @@ pub(super) fn sys_set_tid_address(ctx: &mut SyscallContext<'_>) -> Result<usize,
     Ok(sched::operation::gettid() as usize)
 }
 
-pub(super) fn sys_set_robust_list(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_set_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let head = ctx.args[0];
+    let len = ctx.args[1];
+    if len != ROBUST_LIST_HEAD_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    ctx.task.set_robust_list(head, len);
     Ok(0)
+}
+
+pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    let head_user = ctx.args[1];
+    let len_user = ctx.args[2];
+    if head_user == 0 || len_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let task = lookup_task_for_thread_syscall(pid, &ctx.task)?;
+    let robust = task.robust_list();
+    copy_to_user(head_user, &robust.head.to_ne_bytes()).map_err(|e| e.as_errno())?;
+    copy_to_user(len_user, &robust.len.to_ne_bytes()).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_rseq(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // TODO(threading): rseq cannot be safely advertised until context switch,
+    // signal delivery, preemption and future cross-CPU migration paths all abort
+    // active user critical sections. Returning ENOSYS makes libc disable rseq.
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const MEMBARRIER_CMD_QUERY: usize = 0;
+    match ctx.args[0] {
+        MEMBARRIER_CMD_QUERY => Ok(0),
+        _ => {
+            // TODO(threading): expedited/global membarrier needs cross-CPU
+            // rendezvous/IPI support after AP startup lands.
+            Err(Errno::EOPNOTSUPP)
+        }
+    }
 }
 
 pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -507,6 +570,40 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
             return Err(Errno::EINTR);
         }
     }
+}
+
+pub(super) fn sys_getitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let which = ctx.args[0];
+    let curr_value = ctx.args[1];
+    if curr_value == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if which != ITIMER_REAL {
+        return Err(Errno::EINVAL);
+    }
+    let spec = sched::get_realtime_itimer(&ctx.task);
+    write_itimerval(curr_value, spec)?;
+    Ok(0)
+}
+
+pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let which = ctx.args[0];
+    let new_value = ctx.args[1];
+    let old_value = ctx.args[2];
+    if which != ITIMER_REAL {
+        return Err(Errno::EINVAL);
+    }
+
+    let new_spec = if new_value == 0 {
+        sched::RealtimeItimerSpec::default()
+    } else {
+        read_itimerval(new_value)?
+    };
+    let old_spec = sched::set_realtime_itimer(&ctx.task, new_spec.value_ns, new_spec.interval_ns);
+    if old_value != 0 {
+        write_itimerval(old_value, old_spec)?;
+    }
+    Ok(0)
 }
 
 pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -729,32 +826,50 @@ pub(super) fn sys_sched_getaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let pid = ctx.args[0] as i32;
     let cpusetsize = ctx.args[1];
     let mask_user = ctx.args[2];
-    sched::operation::sched_getattr(pid)?;
-    if cpusetsize == 0 || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
+    let kernel_bytes = kernel_cpuset_bytes();
+    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
         return Err(Errno::EINVAL);
     }
 
+    let affinity = sched::operation::sched_getaffinity(pid)?;
     let mut mask = Vec::new();
     mask.resize(cpusetsize, 0);
-    mask[0] = 1;
+    write_cpuset_mask(&mut mask, affinity);
     copy_to_user(mask_user, &mask).map_err(|e| e.as_errno())?;
-    Ok(core::mem::size_of::<usize>())
+    Ok(kernel_bytes)
 }
 
 pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let cpusetsize = ctx.args[1];
     let mask_user = ctx.args[2];
-    sched::operation::sched_getattr(pid)?;
-    if cpusetsize == 0 || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
+    let kernel_bytes = kernel_cpuset_bytes();
+    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
         return Err(Errno::EINVAL);
     }
-    let mut first = [0u8; 1];
-    copy_from_user(mask_user, &mut first).map_err(|e| e.as_errno())?;
-    if (first[0] & 1) == 0 {
-        return Err(Errno::EINVAL);
-    }
+    let mut mask = Vec::new();
+    mask.resize(cpusetsize, 0);
+    copy_from_user(mask_user, &mut mask).map_err(|e| e.as_errno())?;
+    sched::operation::sched_setaffinity(pid, read_cpuset_mask(&mask))?;
     Ok(0)
+}
+
+fn kernel_cpuset_bytes() -> usize {
+    sched::NR_CPUS.div_ceil(8).max(1)
+}
+
+fn read_cpuset_mask(raw: &[u8]) -> u64 {
+    let mut mask = 0u64;
+    for (idx, byte) in raw.iter().take(8).enumerate() {
+        mask |= (*byte as u64) << (idx * 8);
+    }
+    mask
+}
+
+fn write_cpuset_mask(out: &mut [u8], mask: u64) {
+    let raw = mask.to_le_bytes();
+    let n = out.len().min(raw.len());
+    out[..n].copy_from_slice(&raw[..n]);
 }
 
 pub(super) fn sys_sched_get_priority_max(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -769,6 +884,53 @@ pub(super) fn sys_sched_get_priority_min(ctx: &mut SyscallContext<'_>) -> Result
         SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(1),
         _ => Ok(0),
     }
+}
+
+pub(super) fn sys_sched_rr_get_interval(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    let tp = ctx.args[1];
+    if tp == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let attr = sched::operation::sched_getattr(pid)?;
+    let interval_ns = if attr.slice_ns == 0 {
+        100_000_000
+    } else {
+        attr.slice_ns
+    };
+    write_timespec_ns(tp, interval_ns)?;
+    Ok(0)
+}
+
+pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    let attr_user = ctx.args[1];
+    let flags = ctx.args[2];
+    if attr_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let attr = read_linux_sched_attr(attr_user)?;
+    sched::operation::sched_setattr(pid, attr)?;
+    Ok(0)
+}
+
+pub(super) fn sys_sched_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    let attr_user = ctx.args[1];
+    let size = ctx.args[2];
+    let flags = ctx.args[3];
+    if attr_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let attr = sched::operation::sched_getattr(pid)?;
+    write_linux_sched_attr(attr_user, size, attr)?;
+    Ok(0)
 }
 
 fn decode_linux_sched_policy(raw: usize) -> Result<SchedPolicy, Errno> {
@@ -793,6 +955,95 @@ fn encode_linux_sched_policy(policy: SchedPolicy) -> usize {
     }
 }
 
+const LINUX_SCHED_ATTR_SIZE: usize = 56;
+const LINUX_SCHED_ATTR_BASE_SIZE: usize = 48;
+const LINUX_SCHED_ATTR_MAX_SIZE: usize = 4096;
+const LINUX_CLONE_ARGS_SIZE: usize = 88;
+const LINUX_CLONE_ARGS_MIN_SIZE: usize = 64;
+const LINUX_CLONE_ARGS_MAX_SIZE: usize = 4096;
+
+fn validate_clone3_tail(user: usize, size: usize) -> Result<(), Errno> {
+    if size <= LINUX_CLONE_ARGS_SIZE {
+        return Ok(());
+    }
+    // TODO(threading): accept future clone_args fields once pidfd/set_tid/cgroup
+    // backing state exists. For now, Linux-compatible probing requires unknown
+    // extension bytes to be zero.
+    validate_user_tail_zero(user, LINUX_CLONE_ARGS_SIZE, size - LINUX_CLONE_ARGS_SIZE)
+}
+
+fn validate_user_tail_zero(user: usize, offset: usize, len: usize) -> Result<(), Errno> {
+    let mut checked = 0usize;
+    let mut chunk = [0u8; 64];
+    while checked < len {
+        let n = (len - checked).min(chunk.len());
+        let addr = user
+            .checked_add(offset)
+            .and_then(|addr| addr.checked_add(checked))
+            .ok_or(Errno::EFAULT)?;
+        copy_from_user(addr, &mut chunk[..n]).map_err(|e| e.as_errno())?;
+        if chunk[..n].iter().any(|byte| *byte != 0) {
+            return Err(Errno::E2BIG);
+        }
+        checked += n;
+    }
+    Ok(())
+}
+
+fn read_linux_sched_attr(user: usize) -> Result<SchedAttr, Errno> {
+    let mut raw = [0u8; LINUX_SCHED_ATTR_SIZE];
+    copy_from_user(user, &mut raw[..4]).map_err(|e| e.as_errno())?;
+    let size = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+    if size < LINUX_SCHED_ATTR_BASE_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    if size > LINUX_SCHED_ATTR_MAX_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    let n = size.min(LINUX_SCHED_ATTR_SIZE);
+    copy_from_user(user, &mut raw[..n]).map_err(|e| e.as_errno())?;
+    if size > LINUX_SCHED_ATTR_SIZE {
+        // TODO(threading): newer sched_attr extensions must be modelled in
+        // SchedAttr before non-zero extension fields can be accepted.
+        validate_user_tail_zero(user, LINUX_SCHED_ATTR_SIZE, size - LINUX_SCHED_ATTR_SIZE)?;
+    }
+
+    let policy =
+        decode_linux_sched_policy(u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize)?;
+    let flags = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if flags != 0 {
+        // TODO(threading): sched_attr flags such as RESET_ON_FORK need per-task
+        // inheritance state. Reject them explicitly until that state exists.
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(SchedAttr {
+        policy,
+        nice: i32::from_le_bytes(raw[16..20].try_into().unwrap()) as i8,
+        slice_ns: 0,
+        priority: u32::from_le_bytes(raw[20..24].try_into().unwrap()) as u8,
+        runtime_ns: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+        deadline_ns: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
+        period_ns: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
+    })
+}
+
+fn write_linux_sched_attr(user: usize, size: usize, attr: SchedAttr) -> Result<(), Errno> {
+    if size < LINUX_SCHED_ATTR_BASE_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = [0u8; LINUX_SCHED_ATTR_SIZE];
+    raw[0..4].copy_from_slice(&(LINUX_SCHED_ATTR_SIZE as u32).to_le_bytes());
+    raw[4..8].copy_from_slice(&(encode_linux_sched_policy(attr.policy) as u32).to_le_bytes());
+    raw[8..16].copy_from_slice(&0u64.to_le_bytes());
+    raw[16..20].copy_from_slice(&(attr.nice as i32).to_le_bytes());
+    raw[20..24].copy_from_slice(&(attr.priority as u32).to_le_bytes());
+    raw[24..32].copy_from_slice(&attr.runtime_ns.to_le_bytes());
+    raw[32..40].copy_from_slice(&attr.deadline_ns.to_le_bytes());
+    raw[40..48].copy_from_slice(&attr.period_ns.to_le_bytes());
+    let n = size.min(LINUX_SCHED_ATTR_SIZE);
+    copy_to_user(user, &raw[..n]).map_err(|e| e.as_errno())
+}
+
 pub(super) fn sys_personality(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let _persona = ctx.args[0];
     Ok(0)
@@ -802,12 +1053,20 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
     match ctx.args[0] {
-        PR_SET_NAME => Ok(0),
+        PR_SET_NAME => {
+            let name_user = ctx.args[1];
+            if name_user == 0 {
+                return Err(Errno::EFAULT);
+            }
+            let mut raw = [0u8; sched::TASK_COMM_LEN];
+            copy_from_user(name_user, &mut raw).map_err(|e| e.as_errno())?;
+            ctx.task.set_comm(&raw);
+            Ok(0)
+        }
         PR_GET_NAME => {
             let buf = ctx.args[1];
             if buf != 0 {
-                let name = b"mygo\0";
-                copy_to_user(buf, name).map_err(|e| e.as_errno())?;
+                copy_to_user(buf, &ctx.task.comm()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -1035,27 +1294,89 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
+const FUTEX_REQUEUE: u32 = 3;
+const FUTEX_CMP_REQUEUE: u32 = 4;
+const FUTEX_WAIT_BITSET: u32 = 9;
+const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
+const FUTEX_CLOCK_REALTIME: u32 = 256;
+const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+const ROBUST_LIST_HEAD_SIZE: usize = 24;
+const ROBUST_LIST_LIMIT: usize = 2048;
 
-struct FutexBucket {
-    waiters: Vec<Arc<sched::Task>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct FutexKey {
+    owner: usize,
+    uaddr: usize,
+    shared: bool,
 }
 
-static FUTEX_TABLE: Spinlock<BTreeMap<usize, FutexBucket>> = Spinlock::new(BTreeMap::new());
+struct FutexWaiter {
+    task: Arc<sched::Task>,
+    bitset: u32,
+}
 
-fn futex_wake_addr(uaddr: usize, count: usize) -> usize {
+struct FutexBucket {
+    waiters: Vec<FutexWaiter>,
+}
+
+static FUTEX_TABLE: Spinlock<BTreeMap<FutexKey, FutexBucket>> = Spinlock::new(BTreeMap::new());
+
+fn futex_cmd(futex_op: u32) -> u32 {
+    futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
+}
+
+fn task_vm_identity(task: &Arc<Task>) -> Option<usize> {
+    let payload = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    let vm = payload.downcast::<VmSpace>().ok()?;
+    Some(Arc::as_ptr(&vm) as usize)
+}
+
+fn futex_key(task: &Arc<Task>, uaddr: usize, private: bool) -> FutexKey {
+    if private {
+        FutexKey {
+            owner: task_vm_identity(task).unwrap_or_else(|| Arc::as_ptr(task) as usize),
+            uaddr,
+            shared: false,
+        }
+    } else {
+        // TODO(threading): shared futex keys should be based on the mapped file
+        // object or physical page, not the numeric user VA. This placeholder
+        // keeps the ABI visible while private pthread futexes use precise keys.
+        FutexKey {
+            owner: 0,
+            uaddr,
+            shared: true,
+        }
+    }
+}
+
+fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
     let waiters = {
         let mut table = FUTEX_TABLE.lock();
-        let Some(bucket) = table.get_mut(&uaddr) else {
+        let Some(bucket) = table.get_mut(&key) else {
             return 0;
         };
-        let count = count.min(bucket.waiters.len());
-        let waiters: Vec<_> = bucket.waiters.drain(..count).collect();
+        let mut waiters = Vec::new();
+        let mut idx = 0;
+        while idx < bucket.waiters.len() && waiters.len() < count {
+            if (bucket.waiters[idx].bitset & bitset) != 0 {
+                waiters.push(bucket.waiters.remove(idx).task);
+            } else {
+                idx += 1;
+            }
+        }
         if bucket.waiters.is_empty() {
-            table.remove(&uaddr);
+            table.remove(&key);
         }
         waiters
     };
+    wake_futex_waiters(waiters)
+}
+
+fn wake_futex_waiters(waiters: Vec<Arc<sched::Task>>) -> usize {
     let mut woken = 0usize;
     for waiter in waiters {
         if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
@@ -1070,6 +1391,70 @@ fn futex_wake_addr(uaddr: usize, count: usize) -> usize {
     woken
 }
 
+fn futex_remove_waiter(key: FutexKey, task: &Arc<Task>) -> bool {
+    let mut table = FUTEX_TABLE.lock();
+    let Some(bucket) = table.get_mut(&key) else {
+        return false;
+    };
+    let before = bucket.waiters.len();
+    bucket.waiters.retain(|w| !Arc::ptr_eq(&w.task, task));
+    let removed = before != bucket.waiters.len();
+    if bucket.waiters.is_empty() {
+        table.remove(&key);
+    }
+    removed
+}
+
+fn futex_requeue_key(
+    src: FutexKey,
+    dst: FutexKey,
+    wake_count: usize,
+    requeue_count: usize,
+    bitset: u32,
+) -> usize {
+    let (wake, requeue) = {
+        let mut table = FUTEX_TABLE.lock();
+        let mut wake = Vec::new();
+        let mut requeue = Vec::new();
+        if let Some(bucket) = table.get_mut(&src) {
+            let mut idx = 0;
+            while idx < bucket.waiters.len()
+                && (wake.len() < wake_count || requeue.len() < requeue_count)
+            {
+                if (bucket.waiters[idx].bitset & bitset) == 0 {
+                    idx += 1;
+                    continue;
+                }
+                let waiter = bucket.waiters.remove(idx);
+                if wake.len() < wake_count {
+                    wake.push(waiter.task);
+                } else if requeue.len() < requeue_count {
+                    requeue.push(waiter);
+                }
+            }
+            if bucket.waiters.is_empty() {
+                table.remove(&src);
+            }
+        }
+        let requeued = requeue.len();
+        if !requeue.is_empty() {
+            table
+                .entry(dst)
+                .or_insert(FutexBucket {
+                    waiters: Vec::new(),
+                })
+                .waiters
+                .extend(requeue);
+        }
+        (wake, requeued)
+    };
+    wake_futex_waiters(wake) + requeue
+}
+
+fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
+    futex_wake_key(futex_key(task, uaddr, true), count, FUTEX_BITSET_MATCH_ANY)
+}
+
 fn clear_child_tid_and_wake(task: &Arc<Task>) {
     let tid_addr = task.clear_child_tid();
     if tid_addr == 0 {
@@ -1078,73 +1463,347 @@ fn clear_child_tid_and_wake(task: &Arc<Task>) {
     let zero = 0usize;
     let _ = copy_to_user(tid_addr, &zero.to_ne_bytes());
     task.set_clear_child_tid(0);
-    let _ = futex_wake_addr(tid_addr, 1);
+    let _ = futex_wake_addr(task, tid_addr, 1);
 }
 
 pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let uaddr = ctx.args[0];
     let futex_op = ctx.args[1] as u32;
     let val = ctx.args[2] as u32;
-    let _timeout = ctx.args[3];
-    let _uaddr2 = ctx.args[4];
-    let _val3 = ctx.args[5] as u32;
-
-    let cmd = futex_op & !FUTEX_PRIVATE_FLAG;
+    let timeout = ctx.args[3];
+    let uaddr2 = ctx.args[4];
+    let val3 = ctx.args[5] as u32;
+    let cmd = futex_cmd(futex_op);
+    let private = (futex_op & FUTEX_PRIVATE_FLAG) != 0;
 
     if uaddr % 4 != 0 {
         return Err(Errno::EINVAL);
     }
 
     match cmd {
-        FUTEX_WAIT => {
-            let me = Arc::clone(&ctx.task);
-            {
-                let mut table = FUTEX_TABLE.lock();
-                let mut cur = [0u8; 4];
-                copy_from_user(uaddr, &mut cur).map_err(|e| e.as_errno())?;
-                let cur_val = u32::from_le_bytes(cur);
-                if cur_val != val {
-                    return Err(Errno::EAGAIN);
-                }
-                let bucket = table.entry(uaddr).or_insert(FutexBucket {
-                    waiters: Vec::new(),
-                });
-                bucket.waiters.push(me.clone());
+        FUTEX_WAIT => futex_wait(
+            &ctx.task,
+            futex_key(&ctx.task, uaddr, private),
+            uaddr,
+            val,
+            FUTEX_BITSET_MATCH_ANY,
+            futex_wait_deadline(futex_op, cmd, timeout)?,
+        ),
+        FUTEX_WAIT_BITSET => {
+            if val3 == 0 {
+                return Err(Errno::EINVAL);
             }
-
-            loop {
-                if !ctx.task.cas_state(TaskState::Running, TaskState::Sleeping) {
-                    continue;
-                }
-                let mut cur = [0u8; 4];
-                if copy_from_user(uaddr, &mut cur).is_err() || u32::from_le_bytes(cur) != val {
-                    let mut table = FUTEX_TABLE.lock();
-                    if let Some(bucket) = table.get_mut(&uaddr) {
-                        bucket.waiters.retain(|w| !Arc::ptr_eq(w, &me));
-                        if bucket.waiters.is_empty() {
-                            table.remove(&uaddr);
-                        }
-                    }
-                    let _ = ctx.task.cas_state(TaskState::Sleeping, TaskState::Runnable);
-                    return Err(Errno::EAGAIN);
-                }
-                sched::operation::sched_yield()?;
-                let table = FUTEX_TABLE.lock();
-                let still_waiting = table
-                    .get(&uaddr)
-                    .map(|b| b.waiters.iter().any(|w| Arc::ptr_eq(w, &me)))
-                    .unwrap_or(false);
-                if !still_waiting {
-                    return Ok(0);
-                }
+            futex_wait(
+                &ctx.task,
+                futex_key(&ctx.task, uaddr, private),
+                uaddr,
+                val,
+                val3,
+                futex_wait_deadline(futex_op, cmd, timeout)?,
+            )
+        }
+        FUTEX_WAKE => Ok(futex_wake_key(
+            futex_key(&ctx.task, uaddr, private),
+            val as usize,
+            FUTEX_BITSET_MATCH_ANY,
+        )),
+        FUTEX_WAKE_BITSET => {
+            if val3 == 0 {
+                return Err(Errno::EINVAL);
             }
+            Ok(futex_wake_key(
+                futex_key(&ctx.task, uaddr, private),
+                val as usize,
+                val3,
+            ))
         }
-        FUTEX_WAKE => {
-            // val 是第 3 个参数，即 ctx.args[2]，不是 ctx.args[5]
-            Ok(futex_wake_addr(uaddr, val as usize))
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            if uaddr2 == 0 || uaddr2 % 4 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if cmd == FUTEX_CMP_REQUEUE && read_user_u32(uaddr)? != val3 {
+                return Err(Errno::EAGAIN);
+            }
+            Ok(futex_requeue_key(
+                futex_key(&ctx.task, uaddr, private),
+                futex_key(&ctx.task, uaddr2, private),
+                val as usize,
+                timeout,
+                FUTEX_BITSET_MATCH_ANY,
+            ))
         }
-        _ => Err(Errno::ENOSYS),
+        _ => {
+            // TODO(threading): PI futexes, FUTEX_WAKE_OP and requeue_pi need
+            // priority inheritance state attached to scheduler wait queues.
+            Err(Errno::EOPNOTSUPP)
+        }
     }
+}
+
+pub(super) fn sys_futex_waitv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // TODO(threading): futex_waitv needs vector validation and shared futex key
+    // support. Keep the syscall registered so userspace probing is explicit.
+    Err(Errno::EOPNOTSUPP)
+}
+
+pub(super) fn sys_futex_wake(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // TODO(threading): new futex2 wake ABI has a different argument layout from
+    // futex(2); implement it after the shared-key backend exists.
+    Err(Errno::EOPNOTSUPP)
+}
+
+pub(super) fn sys_futex_wait(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // TODO(threading): new futex2 wait ABI is intentionally not aliased to old
+    // futex because flags and timeout layout differ.
+    Err(Errno::EOPNOTSUPP)
+}
+
+pub(super) fn sys_futex_requeue(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    // TODO(threading): futex2 requeue should share the same future keyed wait
+    // queue backend as futex_waitv/futex_wake.
+    Err(Errno::EOPNOTSUPP)
+}
+
+fn futex_wait(
+    task: &Arc<Task>,
+    key: FutexKey,
+    uaddr: usize,
+    expected: u32,
+    bitset: u32,
+    deadline_ns: Option<u64>,
+) -> Result<usize, Errno> {
+    let me = Arc::clone(task);
+    if read_user_u32(uaddr)? != expected {
+        return Err(Errno::EAGAIN);
+    }
+    if let Some(deadline) = deadline_ns {
+        if !sched::register_sleep_deadline(task, deadline) {
+            return Err(Errno::ETIMEDOUT);
+        }
+    }
+    {
+        let mut table = FUTEX_TABLE.lock();
+        table
+            .entry(key)
+            .or_insert(FutexBucket {
+                waiters: Vec::new(),
+            })
+            .waiters
+            .push(FutexWaiter {
+                task: me.clone(),
+                bitset,
+            });
+    }
+
+    loop {
+        if let Some(deadline) = deadline_ns {
+            if sched::now_ns_public() >= deadline {
+                futex_remove_waiter(key, &me);
+                let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+                sched::cancel_sleep_deadline(task);
+                return Err(Errno::ETIMEDOUT);
+            }
+        }
+        if sched::operation::sigpending()?.raw() != 0 {
+            futex_remove_waiter(key, &me);
+            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            return Err(Errno::EINTR);
+        }
+        if read_user_u32(uaddr).map_or(true, |cur| cur != expected) {
+            futex_remove_waiter(key, &me);
+            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            return Err(Errno::EAGAIN);
+        }
+        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
+        sched::operation::sched_yield()?;
+        let table = FUTEX_TABLE.lock();
+        let still_waiting = table
+            .get(&key)
+            .map(|bucket| bucket.waiters.iter().any(|w| Arc::ptr_eq(&w.task, &me)))
+            .unwrap_or(false);
+        if !still_waiting {
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            return Ok(0);
+        }
+    }
+}
+
+fn futex_wait_deadline(futex_op: u32, cmd: u32, timeout_user: usize) -> Result<Option<u64>, Errno> {
+    if timeout_user == 0 {
+        return Ok(None);
+    }
+    let timeout_ns = read_timespec_ns(timeout_user)?;
+    let sched_now = sched::now_ns_public();
+    if cmd == FUTEX_WAIT {
+        return Ok(Some(sched_now.saturating_add(timeout_ns)));
+    }
+    let clock_id = if (futex_op & FUTEX_CLOCK_REALTIME) != 0 {
+        crate::vdso::CLOCK_REALTIME
+    } else {
+        crate::vdso::CLOCK_MONOTONIC
+    };
+    let clock_now = crate::vdso::clock_time_ns(clock_id).unwrap_or(sched_now);
+    Ok(Some(if timeout_ns <= clock_now {
+        sched_now
+    } else {
+        sched_now.saturating_add(timeout_ns - clock_now)
+    }))
+}
+
+fn read_timespec_ns(user: usize) -> Result<u64, Errno> {
+    let mut raw = [0u8; 16];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64))
+}
+
+fn write_timespec_ns(user: usize, ns: u64) -> Result<(), Errno> {
+    let mut raw = [0u8; 16];
+    raw[0..8].copy_from_slice(&((ns / 1_000_000_000).min(i64::MAX as u64) as i64).to_le_bytes());
+    raw[8..16].copy_from_slice(&((ns % 1_000_000_000) as i64).to_le_bytes());
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+}
+
+fn lookup_task_for_thread_syscall(pid: i32, current: &Arc<Task>) -> Result<Arc<Task>, Errno> {
+    if pid == 0 {
+        return Ok(Arc::clone(current));
+    }
+    // TODO(threading): Linux applies ptrace permission checks here. The current
+    // credential model lacks a common ptrace access helper, so we only validate
+    // that the TID exists.
+    sched::root_pid_ns()
+        .registry()
+        .lookup(pid)
+        .and_then(|weak| weak.upgrade())
+        .ok_or(Errno::ESRCH)
+}
+
+fn exit_robust_list(task: &Arc<Task>) {
+    let robust = task.robust_list();
+    if robust.head == 0 || robust.len != ROBUST_LIST_HEAD_SIZE {
+        return;
+    }
+    let tid = task.pid_root().unwrap_or(0) as u32;
+    let Ok(futex_offset) = read_user_isize(robust.head + 8) else {
+        return;
+    };
+    let pending = read_user_usize(robust.head + 16).unwrap_or(0);
+    let mut next = read_user_usize(robust.head).unwrap_or(0);
+    let mut walked = 0usize;
+    while next != 0 && next != robust.head && walked < ROBUST_LIST_LIMIT {
+        handle_robust_node(task, next, futex_offset, tid);
+        next = read_user_usize(next).unwrap_or(0);
+        walked += 1;
+    }
+    if walked == ROBUST_LIST_LIMIT {
+        log::warning!(
+            "[syscall][robust] pid={:?} robust list walk hit limit; TODO fault-safe cycle detection",
+            task.pid_root(),
+        );
+    }
+    if pending != 0 {
+        handle_robust_node(task, pending, futex_offset, tid);
+    }
+    task.set_robust_list(0, 0);
+}
+
+fn handle_robust_node(task: &Arc<Task>, node: usize, futex_offset: isize, tid: u32) {
+    let Some(uaddr) = robust_futex_addr(node, futex_offset) else {
+        return;
+    };
+    if uaddr % 4 != 0 {
+        return;
+    }
+    let Ok(cur) = read_user_u32(uaddr) else {
+        return;
+    };
+    if (cur & FUTEX_TID_MASK) != tid {
+        return;
+    }
+    let new = (cur & !FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
+    if write_user_u32(uaddr, new).is_ok() {
+        let _ = futex_wake_addr(task, uaddr, 1);
+    }
+}
+
+fn robust_futex_addr(node: usize, futex_offset: isize) -> Option<usize> {
+    let addr = (node as isize).checked_add(futex_offset)?;
+    if addr < 0 { None } else { Some(addr as usize) }
+}
+
+fn read_user_usize(user: usize) -> Result<usize, Errno> {
+    let mut raw = [0u8; core::mem::size_of::<usize>()];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(usize::from_ne_bytes(raw))
+}
+
+fn read_user_isize(user: usize) -> Result<isize, Errno> {
+    let mut raw = [0u8; core::mem::size_of::<isize>()];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(isize::from_ne_bytes(raw))
+}
+
+fn read_user_u32(user: usize) -> Result<u32, Errno> {
+    let mut raw = [0u8; 4];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(u32::from_ne_bytes(raw))
+}
+
+fn write_user_u32(user: usize, value: u32) -> Result<(), Errno> {
+    copy_to_user(user, &value.to_ne_bytes()).map_err(|e| e.as_errno())
+}
+
+const ITIMER_REAL: usize = 0;
+const ITIMERVAL_SIZE: usize = 32;
+const TIMEVAL_SIZE: usize = 16;
+const USEC_PER_SEC: i64 = 1_000_000;
+
+fn read_itimerval(user: usize) -> Result<sched::RealtimeItimerSpec, Errno> {
+    let mut raw = [0u8; ITIMERVAL_SIZE];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(sched::RealtimeItimerSpec {
+        interval_ns: timeval_to_ns(&raw[0..TIMEVAL_SIZE])?,
+        value_ns: timeval_to_ns(&raw[TIMEVAL_SIZE..ITIMERVAL_SIZE])?,
+    })
+}
+
+fn write_itimerval(user: usize, spec: sched::RealtimeItimerSpec) -> Result<(), Errno> {
+    let mut raw = [0u8; ITIMERVAL_SIZE];
+    write_timeval_ns(&mut raw[0..TIMEVAL_SIZE], spec.interval_ns);
+    write_timeval_ns(&mut raw[TIMEVAL_SIZE..ITIMERVAL_SIZE], spec.value_ns);
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+}
+
+fn timeval_to_ns(raw: &[u8]) -> Result<u64, Errno> {
+    let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let usec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if sec < 0 || !(0..USEC_PER_SEC).contains(&usec) {
+        return Err(Errno::EINVAL);
+    }
+    Ok((sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((usec as u64).saturating_mul(1_000)))
+}
+
+fn write_timeval_ns(out: &mut [u8], ns: u64) {
+    let sec = (ns / 1_000_000_000).min(i64::MAX as u64) as i64;
+    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    out[0..8].copy_from_slice(&sec.to_le_bytes());
+    out[8..16].copy_from_slice(&usec.to_le_bytes());
 }
 
 fn write_uts_field(out: &mut [u8], index: usize, value: &[u8]) {

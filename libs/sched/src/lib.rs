@@ -88,9 +88,11 @@ pub use scheduler::{
     NR_CPUS, balance_once, current_cpu_id, current_task, current_task_on, enqueue_task, idle_task,
     init, init_task, install_idle, is_cpu_online, is_ready, migrate_task, needs_resched,
     now_ns_public, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
-    register_sleep_deadline, request_resched, root_pid_ns, runqueue, runqueue_of, schedule_once,
-    signal_wakeup, spawn_idle_for,
+    register_sleep_deadline, request_post_syscall_handoff, request_resched, root_pid_ns,
+    run_post_syscall_handoff, runqueue, runqueue_of, schedule_once, set_realtime_itimer,
+    signal_wakeup, spawn_idle_for, supported_cpu_mask,
 };
+pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
@@ -102,9 +104,10 @@ pub use spawn::{
     reparent_to_init, spawn_child,
 };
 pub use task::{
-    ExitCode, TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_USER_TRAP_FRAME,
-    TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook,
-    TaskExtKey, TaskState, ext_clone_hook, register_ext_clone_hook,
+    ExitCode, RobustListState, RseqRegistration, TASK_COMM_LEN, TASKEXT_EXEC_ARGS,
+    TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT,
+    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook, TaskExtKey, TaskState,
+    ext_clone_hook, register_ext_clone_hook,
 };
 pub use wait::WaitQueue;
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};

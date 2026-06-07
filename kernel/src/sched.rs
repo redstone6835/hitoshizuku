@@ -197,6 +197,11 @@ fn install_exec_path(task: &Arc<Task>, path: &str) {
 
 fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[String]) {
     install_exec_path(task, path);
+    let comm = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path);
+    task.set_comm(comm.as_bytes());
 
     let _ = task.ext_remove(TASKEXT_EXEC_ARGS);
     task.ext_install(TASKEXT_EXEC_ARGS, Arc::new(argv.to_vec()));
@@ -290,7 +295,13 @@ fn process_execve(
     let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
         Ok(loaded) => loaded,
         Err(err) => {
-            log::info!("[exec] load failed: path={:?} err={:?}", path, err);
+            if err == Errno::ENOEXEC {
+                // shell 执行无 shebang 的脚本时会先尝试 execve，收到
+                // ENOEXEC 后回退为解释执行；这是用户态正常探测路径。
+                log::debug!("[exec] load failed: path={:?} err={:?}", path, err);
+            } else {
+                log::info!("[exec] load failed: path={:?} err={:?}", path, err);
+            }
             if let Some(vm) = old_vm {
                 vm.activate();
             }
@@ -430,11 +441,10 @@ fn process_setup_signal_frame(
         return Err(Errno::EINVAL);
     };
 
-    let restorer = if action.restorer >> 63 != 0 || action.restorer == 0 {
-        hal::user::sigreturn_entry_va()
-    } else {
-        action.restorer
-    };
+    // LoongArch64 用户态 libc 传入的 sa_restorer 在当前内核地址布局下不一定
+    // 是可执行入口（例如 musl 会传 0x2000）。信号返回必须统一落到本内核
+    // 映射的 vDSO trampoline，再由它发起 rt_sigreturn syscall。
+    let restorer = hal::user::sigreturn_entry_va();
 
     let saved = UserTrapFrame::from_context(user_ctx.as_usize());
     let old_mask = task.signal.blocked_snapshot();

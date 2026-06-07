@@ -9,6 +9,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use spin::mutex::Mutex;
+use vfs::cred::{Gid, Uid};
+use vfs::inode::InodeOps;
+use vfs::stat::{DevId, FileMode, FileType};
 
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
@@ -32,16 +35,131 @@ impl DeviceClassId {
     }
 }
 
+/// 自定义 devtmpfs 节点规格。
+///
+/// 新设备类型如果需要在 `/dev` 暴露特殊节点，不应修改 devtmpfs 的核心 match
+/// 逻辑，而应构造一个携带自身 [`InodeOps`] 的自定义节点。devtmpfs 只负责路径、
+/// inode 号、元数据和目录树管理，具体 open/ioctl/read/write 语义由该 ops 决定。
+#[derive(Clone)]
+pub struct CustomDevNodeSpec {
+    name: Box<str>,
+    kind: FileType,
+    rdev: DevId,
+    block_size: u32,
+    mode: FileMode,
+    uid: Uid,
+    gid: Gid,
+    size: u64,
+    blocks: u64,
+    nlink: u32,
+    ops: Arc<dyn InodeOps + Send + Sync>,
+}
+
+impl CustomDevNodeSpec {
+    pub fn new(name: &str, kind: FileType, ops: Arc<dyn InodeOps + Send + Sync>) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            rdev: DevId::new(0, 0),
+            block_size: 512,
+            mode: FileMode::new(0o660),
+            uid: Uid::ROOT,
+            gid: Gid::ROOT,
+            size: 0,
+            blocks: 0,
+            nlink: 1,
+            ops,
+        }
+    }
+
+    pub fn with_rdev(mut self, rdev: DevId) -> Self {
+        self.rdev = rdev;
+        self
+    }
+
+    pub fn with_block_size(mut self, block_size: u32) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    pub fn with_mode(mut self, mode: FileMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_owner(mut self, uid: Uid, gid: Gid) -> Self {
+        self.uid = uid;
+        self.gid = gid;
+        self
+    }
+
+    pub fn with_size(mut self, size: u64, blocks: u64) -> Self {
+        self.size = size;
+        self.blocks = blocks;
+        self
+    }
+
+    pub fn with_nlink(mut self, nlink: u32) -> Self {
+        self.nlink = nlink;
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn kind(&self) -> FileType {
+        self.kind
+    }
+
+    pub fn rdev(&self) -> DevId {
+        self.rdev
+    }
+
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    pub fn mode(&self) -> FileMode {
+        self.mode
+    }
+
+    pub fn uid(&self) -> Uid {
+        self.uid
+    }
+
+    pub fn gid(&self) -> Gid {
+        self.gid
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    pub fn nlink(&self) -> u32 {
+        self.nlink
+    }
+
+    pub fn ops(&self) -> Arc<dyn InodeOps + Send + Sync> {
+        Arc::clone(&self.ops)
+    }
+}
+
 /// devtmpfs 需要创建的兼容层设备节点。
 ///
-/// 枚举变体直接携带 VFS 打开节点时需要的设备对象，因此 devtmpfs 不需要再把
+/// 枚举变体直接携带 VFS 打开节点时需要的对象，因此 devtmpfs 不需要再把
 /// `DeviceFunction` downcast 回 `CharFunction` 或 `BlockFunction`。
 /// 这里描述的是 POSIX/VFS 命名空间里的投影，不是底层硬件 identity；底层身份
 /// 仍由 PnP id、function `class_id + dev_name` 和具体 typed device object 表达。
 ///
 /// 标记为 `#[non_exhaustive]` 以便未来扩展新 VFS 节点类型时保持 API 兼容；
-/// 但 POSIX 文件系统层只认 char/block 两种节点类型，新设备类别（网络等）
-/// 通常通过 `devnode() → None` 来表达"没有 `/dev` 节点"。
+/// 新设备类别如果没有 `/dev` 节点（网络等）应通过 `devnode() → None` 表达；
+/// 如果确实需要 `/dev` 投影，优先使用 [`DevNodeSpec::Custom`] 携带自己的
+/// [`InodeOps`]，而不是继续向 devtmpfs core 增加设备类型分支。
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum DevNodeSpec {
@@ -53,26 +171,23 @@ pub enum DevNodeSpec {
         name: Box<str>,
         dev: Arc<BlockDevice>,
     },
-    /// 网络设备 — 不需要 /dev 节点，但在 /sys/class/net/ 中创建目录。
-    NetDev {
-        name: Box<str>,
-        iface_id: u32,
-    },
     Symlink {
         name: Box<str>,
         target: Box<str>,
-
     },
+    Custom(CustomDevNodeSpec),
 }
 
 impl DevNodeSpec {
     pub fn name(&self) -> &str {
         match self {
-            Self::Char { name, .. }
-            | Self::Block { name, .. }
-            | Self::NetDev { name, .. }
-            | Self::Symlink { name, .. } => name,
+            Self::Char { name, .. } | Self::Block { name, .. } | Self::Symlink { name, .. } => name,
+            Self::Custom(spec) => spec.name(),
         }
+    }
+
+    pub fn custom(spec: CustomDevNodeSpec) -> Self {
+        Self::Custom(spec)
     }
 }
 
@@ -270,20 +385,15 @@ pub fn function_as<T: 'static>(func: &dyn DeviceFunction) -> Option<&T> {
 pub fn char_device_from_function(func: &dyn DeviceFunction) -> Option<CharDevice> {
     func.devnodes()?.nodes().iter().find_map(|node| match node {
         DevNodeSpec::Char { dev, .. } => Some(dev.clone()),
-        DevNodeSpec::Block { .. }
-        | DevNodeSpec::NetDev { .. }
-        | DevNodeSpec::Symlink { .. } => None,
+        DevNodeSpec::Block { .. } | DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => None,
     })
 }
 
 pub fn block_device_from_function(func: &dyn DeviceFunction) -> Option<Arc<BlockDevice>> {
     func.devnodes()?.nodes().iter().find_map(|node| match node {
         DevNodeSpec::Block { dev, .. } => Some(Arc::clone(dev)),
-        DevNodeSpec::Char { .. }
-        | DevNodeSpec::NetDev { .. }
-        | DevNodeSpec::Symlink { .. } => None,
+        DevNodeSpec::Char { .. } | DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => None,
     })
-}
 }
 
 /// 列出当前仍处于 active 状态的字符设备节点。

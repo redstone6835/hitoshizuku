@@ -476,7 +476,7 @@ fn wait_on_sources(
         return sched::operation::sched_yield();
     }
 
-    sched::schedule_once(0);
+    sched::schedule_once(sched::now_ns_public());
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
@@ -490,10 +490,7 @@ fn wait_on_sources(
 }
 
 fn has_unblocked_signal(task: &Arc<sched::Task>) -> bool {
-    let blocked = task.signal.blocked_snapshot().raw();
-    let pending =
-        task.signal.pending_snapshot().raw() | task.shared_signal().pending_snapshot().raw();
-    (pending & !blocked) != 0
+    sched::operation::has_interrupting_signal(task)
 }
 
 fn new_epoll_file(cred: Arc<Credentials>) -> Arc<File> {

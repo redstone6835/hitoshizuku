@@ -14,12 +14,14 @@ use alloc::vec::Vec;
 use smoltcp::iface::{self, SocketHandle, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr,
+    EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address,
+    Ipv6Cidr,
 };
 
 use crate::adapter::NetDeviceAdapter;
 use crate::config::{CidrAddress, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
+use crate::driver::LinkMedium;
 use crate::socket::SocketMeta;
 
 // ── ManagedInterface ─────────────────────────────────────────────────────────
@@ -45,8 +47,12 @@ impl ManagedInterface {
     /// 根据设备和配置创建受管理接口。
     pub fn new(net_device: Arc<NetDevice>, config: IfConfig) -> Self {
         let driver = Arc::clone(net_device.driver());
-        let mac = driver.mac_address();
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+        let hw_addr = match driver.medium() {
+            LinkMedium::Ethernet => {
+                HardwareAddress::Ethernet(EthernetAddress(driver.mac_address()))
+            }
+            LinkMedium::Ip => HardwareAddress::Ip,
+        };
 
         let mut iface_config = iface::Config::new(hw_addr);
         iface_config.random_seed = generate_seed(net_device.id());
@@ -104,6 +110,7 @@ impl ManagedInterface {
             config,
             net_device,
         }
+    }
 
     fn next_inode(&self) -> u64 {
         self.inode_counter
@@ -116,17 +123,25 @@ impl ManagedInterface {
     pub fn poll(&mut self, timestamp: Instant) {
         self.iface
             .poll(timestamp, &mut self.device, &mut self.sockets);
-        // 延迟清理：移除标记为 removed 的 socket。
+        // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的
+        // orphan socket。orphan 用于 fd 已释放但 FIN/ACK 仍需继续推进的
+        // 场景，不能像普通 remove 一样在 close 后立刻摘掉。
         //
         // 旧实现先 `sockets.remove` 再 `meta.remove`——若这两个动作之间
         // 有任何其它持锁代码路径访问 `self.sockets[handle]`，会看到一个
         // `None` 槽位从而 panic。新实现走 `remove_socket_locked` 同步删
         // 两者，并且保证顺序。
         let to_remove: Vec<SocketHandle> = self
-            .meta
+            .sockets
             .iter()
-            .filter(|(_, m)| m.is_removed())
-            .map(|(h, _)| *h)
+            .filter_map(|(h, socket)| {
+                let meta = self.meta.get(&h)?;
+                if meta.is_removed() || (meta.is_orphaned() && socket_can_reap_orphan(socket)) {
+                    Some(h)
+                } else {
+                    None
+                }
+            })
             .collect();
         for h in to_remove {
             self.remove_socket_locked(h);
@@ -176,9 +191,10 @@ impl ManagedInterface {
     pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) {
         self.iface.update_ip_addrs(|addrs| {
             addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
-            let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(
-                smoltcp::wire::Ipv4Cidr::new(ipv4_to_smoltcp(addr), prefix_len),
-            ));
+            let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
+                ipv4_to_smoltcp(addr),
+                prefix_len,
+            )));
         });
     }
 
@@ -233,7 +249,9 @@ impl ManagedInterface {
 
     /// 检查 socket 是否已被 soft-close 标记为移除。
     pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
-        self.meta.get(&handle).map_or(true, |m| m.is_removed())
+        self.meta
+            .get(&handle)
+            .map_or(true, |m| m.is_removed() || m.is_orphaned())
     }
 
     /// 检查 socket handle 当前是否仍存在于元数据表中。
@@ -251,6 +269,78 @@ impl ManagedInterface {
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_removed();
         }
+    }
+
+    /// 将 socket 标记为 orphan：上层 fd 已释放，但协议栈继续负责 TCP 收尾。
+    pub fn orphan_socket(&self, handle: SocketHandle) {
+        if let Some(meta) = self.meta.get(&handle) {
+            meta.mark_orphaned();
+        }
+    }
+
+    /// 标记 TCP 连接已被 accept 交付给 VFS。
+    pub fn mark_socket_accepted(&self, handle: SocketHandle) {
+        if let Some(meta) = self.meta.get(&handle) {
+            meta.mark_accepted();
+        }
+    }
+
+    /// 按监听端点查找一个已经由 smoltcp 原地转换为 Established、
+    /// 但尚未被 VFS accept 交付的 TCP socket。
+    ///
+    /// smoltcp 的 listen socket 会在收到 SYN 后直接变成连接 socket；
+    /// 内核随后再新建一个 listen socket 顶替。fork/close/handle 复用下，
+    /// 仅检查 fd 当前保存的单个 handle 容易漏掉这个已建立连接，因此这里
+    /// 允许按端点扫描整个 SocketSet。
+    pub fn pending_tcp_accept(
+        &self,
+        preferred: SocketHandle,
+        target: IpListenEndpoint,
+    ) -> Option<SocketHandle> {
+        if self.tcp_socket_is_pending_accept(preferred, target) {
+            return Some(preferred);
+        }
+        for (handle, socket) in self.sockets.iter() {
+            if handle == preferred {
+                continue;
+            }
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            if self.tcp_socket_is_pending_accept_with_socket(handle, tcp, target) {
+                return Some(handle);
+            }
+        }
+        None
+    }
+
+    fn tcp_socket_is_pending_accept(&self, handle: SocketHandle, target: IpListenEndpoint) -> bool {
+        if !self.meta.contains_key(&handle) {
+            return false;
+        }
+        let Some((socket_handle, socket)) = self.sockets.iter().find(|(h, _)| *h == handle) else {
+            return false;
+        };
+        let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+            return false;
+        };
+        self.tcp_socket_is_pending_accept_with_socket(socket_handle, tcp, target)
+    }
+
+    fn tcp_socket_is_pending_accept_with_socket(
+        &self,
+        handle: SocketHandle,
+        tcp: &smoltcp::socket::tcp::Socket<'static>,
+        target: IpListenEndpoint,
+    ) -> bool {
+        let Some(meta) = self.meta.get(&handle) else {
+            return false;
+        };
+        if meta.is_removed() || meta.is_orphaned() || meta.is_accepted() {
+            return false;
+        }
+        tcp.state() == smoltcp::socket::tcp::State::Established
+            && listen_endpoint_matches(tcp.listen_endpoint(), target)
     }
 
     /// 同步从 `SocketSet` 中移除一个 socket（不依赖 poll 触发）。
@@ -288,7 +378,12 @@ impl ManagedInterface {
         // 动态调整和内存压力下的 backpressure 策略。
         let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; rx_buf_size]);
         let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tx_buf_size]);
-        let socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
+        let mut socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
+        // 当前 syscall 层会分块搬运用户缓冲；在 loopback 大 MTU 下这些块
+        // 往往小于 MSS，若默认启用 Nagle，iperf/netperf 这类连续写会很快
+        // 被未确认的小段压住。先默认关闭 Nagle，后续可由 TCP_NODELAY
+        // setsockopt 再精细控制。
+        socket.set_nagle_enabled(false);
         let handle = self.sockets.add(socket);
         self.meta.insert(handle, SocketMeta::new());
         handle
@@ -453,7 +548,7 @@ impl ManagedInterface {
                 if self
                     .meta
                     .get(&handle)
-                    .map_or(true, |m| m.is_removed())
+                    .map_or(true, |m| m.is_removed() || m.is_orphaned())
                 {
                     continue;
                 }
@@ -493,7 +588,7 @@ impl ManagedInterface {
                 if self
                     .meta
                     .get(&handle)
-                    .map_or(true, |m| m.is_removed())
+                    .map_or(true, |m| m.is_removed() || m.is_orphaned())
                 {
                     continue;
                 }
@@ -536,9 +631,33 @@ fn tcp_state_to_u8(state: smoltcp::socket::tcp::State) -> u8 {
         State::FinWait1 => 4,
         State::FinWait2 => 5,
         State::CloseWait => 8,
-        State::TimeWait => 6,  // TCP_TIME_WAIT
-        State::Closing => 11,   // TCP_CLOSING
+        State::TimeWait => 6, // TCP_TIME_WAIT
+        State::Closing => 11, // TCP_CLOSING
         State::LastAck => 9,
+    }
+}
+
+fn socket_can_reap_orphan(socket: &smoltcp::socket::Socket<'_>) -> bool {
+    match socket {
+        smoltcp::socket::Socket::Tcp(tcp) => {
+            use smoltcp::socket::tcp::State;
+            // orphan TCP 必须至少推进到最终态再回收，否则 netperf 这类
+            // 依赖 EOF/控制连接结果回传的程序会因为 FIN 丢失而永久等待。
+            matches!(tcp.state(), State::Closed | State::TimeWait)
+        }
+        // 非 TCP 没有四次挥手，fd 释放后可以在下一轮 poll 直接回收。
+        _ => true,
+    }
+}
+
+fn listen_endpoint_matches(actual: IpListenEndpoint, target: IpListenEndpoint) -> bool {
+    if actual.port != target.port {
+        return false;
+    }
+    match (actual.addr, target.addr) {
+        // 监听端点为通配地址时，任意本地地址都属于同一个 listen fd。
+        (None, _) | (_, None) => true,
+        (Some(a), Some(b)) => a == b,
     }
 }
 

@@ -680,9 +680,18 @@ fn render_proc_net_tcp() -> String {
             let _ = writeln!(
                 out,
                 "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
-                slot, local_hex, remote_hex, c.state,
-                c.tx_queue, c.rx_queue,
-                0u8, 0u32, 0u32, 0u32, 0u32, c.inode,
+                slot,
+                local_hex,
+                remote_hex,
+                c.state,
+                c.tx_queue,
+                c.rx_queue,
+                0u8,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                c.inode,
             );
             slot += 1;
         }
@@ -709,9 +718,18 @@ fn render_proc_net_udp() -> String {
             let _ = writeln!(
                 out,
                 "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
-                slot, local_hex, remote_hex,
+                slot,
+                local_hex,
+                remote_hex,
                 7u8, // ESTABLISHED
-                0usize, 0usize, 0u8, 0u32, 0u32, 0u32, 0u32, s.inode,
+                0usize,
+                0usize,
+                0u8,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                s.inode,
             );
             slot += 1;
         }
@@ -765,7 +783,10 @@ fn render_proc_net_unix() -> String {
             2u32, // RefCount (至少 1: fd 引用 + snapshot 临时引用)
             0u32, // Protocol
             0u32, // Flags
-            typ, state, s.id(), path,
+            typ,
+            state,
+            s.id(),
+            path,
         );
     }
     out
@@ -812,8 +833,12 @@ fn render_proc_net_arp() -> String {
                 out,
                 "{:<16} 0x1         0x2         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
                 ip_str,
-                entry.hw_addr[0], entry.hw_addr[1], entry.hw_addr[2],
-                entry.hw_addr[3], entry.hw_addr[4], entry.hw_addr[5],
+                entry.hw_addr[0],
+                entry.hw_addr[1],
+                entry.hw_addr[2],
+                entry.hw_addr[3],
+                entry.hw_addr[4],
+                entry.hw_addr[5],
                 iface_name,
             );
         }
@@ -837,7 +862,11 @@ fn render_proc_net_sockstat() -> String {
     let unix_total = socket::snapshot_sockets().len();
     let total = tcp_total + udp_total + unix_total;
     let _ = writeln!(out, "sockets: used {}", total);
-    let _ = writeln!(out, "TCP: inuse {} orphan 0 tw 0 alloc {} mem 0", tcp_total, tcp_total);
+    let _ = writeln!(
+        out,
+        "TCP: inuse {} orphan 0 tw 0 alloc {} mem 0",
+        tcp_total, tcp_total
+    );
     let _ = writeln!(out, "UDP: inuse {} mem 0", udp_total);
     let _ = writeln!(out, "RAW: inuse 0");
     let _ = writeln!(out, "FRAG: inuse 0 memory 0");
@@ -1809,12 +1838,6 @@ fn task_cwd_path(task: &Arc<Task>) -> VfsResult<String> {
     Ok(cwd)
 }
 
-fn basename(path: &str) -> &str {
-    path.rsplit('/')
-        .find(|part| !part.is_empty())
-        .unwrap_or(path)
-}
-
 fn fd_target_path(task: &Arc<Task>, file: &Arc<File>) -> String {
     if let Some(ctx) = task_vfs_context(task) {
         if let Some(path) = namespace_path(&ctx, file.dentry(), file.mount()) {
@@ -2006,15 +2029,9 @@ fn render_task_environ(task: &Arc<Task>) -> Vec<u8> {
 }
 
 fn render_task_comm(task: &Arc<Task>) -> String {
-    if let Some(args) = task_exec_args(task)
-        && let Some(argv0) = args.first()
-        && !argv0.is_empty()
-    {
-        return format!("{}\n", basename(argv0));
-    }
-    let name = task_exec_path(task)
-        .map(|path| basename(&path).to_string())
-        .unwrap_or_else(|_| String::from("unknown"));
+    let comm = task.comm();
+    let len = comm.iter().position(|b| *b == 0).unwrap_or(comm.len());
+    let name = core::str::from_utf8(&comm[..len]).unwrap_or("unknown");
     format!("{}\n", name)
 }
 

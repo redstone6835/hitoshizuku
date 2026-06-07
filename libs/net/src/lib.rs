@@ -53,7 +53,7 @@ pub mod stack;
 
 pub use config::{CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 pub use device::{InterfaceId, NetDevice};
-pub use driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
+pub use driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 pub use error::NetError;
 pub use socket::{NetSocketHandle, SocketState, SocketType, TcpConnSnapshot, UdpSockSnapshot};
 pub use stack::stack;

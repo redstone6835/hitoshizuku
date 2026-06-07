@@ -111,6 +111,7 @@ pub fn register_all() {
     register_syscall(nr::SYS_WAITID, process::sys_waitid);
     register_syscall(nr::SYS_SET_TID_ADDRESS, process::sys_set_tid_address);
     register_syscall(nr::SYS_SET_ROBUST_LIST, process::sys_set_robust_list);
+    register_syscall(nr::SYS_GET_ROBUST_LIST, process::sys_get_robust_list);
     register_syscall(nr::SYS_SCHED_YIELD, process::sys_sched_yield);
     register_syscall(nr::SYS_KILL, process::sys_kill);
     register_syscall(nr::SYS_TKILL, process::sys_tkill);
@@ -134,6 +135,8 @@ pub fn register_all() {
     register_syscall(nr::SYS_SETRLIMIT, process::sys_setrlimit);
     register_syscall(nr::SYS_GETRANDOM, process::sys_getrandom);
     register_syscall(nr::SYS_NANOSLEEP, process::sys_nanosleep);
+    register_syscall(nr::SYS_GETITIMER, process::sys_getitimer);
+    register_syscall(nr::SYS_SETITIMER, process::sys_setitimer);
     register_syscall(nr::SYS_CLOCK_NANOSLEEP, process::sys_clock_nanosleep);
     register_syscall(nr::SYS_CLOCK_GETRES, process::sys_clock_getres);
     register_syscall(nr::SYS_TIMES, process::sys_times);
@@ -158,6 +161,10 @@ pub fn register_all() {
         nr::SYS_SCHED_GET_PRIORITY_MIN,
         process::sys_sched_get_priority_min,
     );
+    register_syscall(
+        nr::SYS_SCHED_RR_GET_INTERVAL,
+        process::sys_sched_rr_get_interval,
+    );
     register_syscall(nr::SYS_PERSONALITY, process::sys_personality);
     register_syscall(nr::SYS_PRCTL, process::sys_prctl);
     register_syscall(nr::SYS_CAPGET, process::sys_capget);
@@ -172,7 +179,21 @@ pub fn register_all() {
     register_syscall(nr::SYS_SETFSGID, process::sys_setfsgid);
     register_syscall(nr::SYS_GETGROUPS, process::sys_getgroups);
     register_syscall(nr::SYS_SETGROUPS, process::sys_setgroups);
+    register_syscall(nr::SYS_RT_TGSIGQUEUEINFO, process::sys_rt_tgsigqueueinfo);
+    register_syscall(nr::SYS_SCHED_SETATTR, process::sys_sched_setattr);
+    register_syscall(nr::SYS_SCHED_GETATTR, process::sys_sched_getattr);
+    register_syscall(nr::SYS_MEMBARRIER, process::sys_membarrier);
     register_syscall(nr::SYS_FUTEX, process::sys_futex);
+    register_syscall(nr::SYS_RSEQ, process::sys_rseq);
+    register_syscall(nr::SYS_FUTEX_TIME64, process::sys_futex);
+    register_syscall(
+        nr::SYS_SCHED_RR_GET_INTERVAL_TIME64,
+        process::sys_sched_rr_get_interval,
+    );
+    register_syscall(nr::SYS_FUTEX_WAITV, process::sys_futex_waitv);
+    register_syscall(nr::SYS_FUTEX_WAKE, process::sys_futex_wake);
+    register_syscall(nr::SYS_FUTEX_WAIT, process::sys_futex_wait);
+    register_syscall(nr::SYS_FUTEX_REQUEUE, process::sys_futex_requeue);
 
     // 内存
     register_syscall(nr::SYS_BRK, mm::sys_brk);
