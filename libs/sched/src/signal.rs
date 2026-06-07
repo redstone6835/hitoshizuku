@@ -388,6 +388,16 @@ impl SharedSignal {
         old
     }
 
+    /// exec 成功后重置所有捕获型 handler，忽略型 disposition 保持不变。
+    pub fn reset_caught_for_exec(&self) {
+        let mut guard = self.actions.lock();
+        for action in guard.iter_mut().skip(1) {
+            if matches!(action.handler, SigHandler::Handler(_)) {
+                *action = SigAction::default_new();
+            }
+        }
+    }
+
     /// 投一条信号到 tg 的共享 pending。
     pub fn deliver(&self, info: SigInfo) {
         self.shared_pending_bits

@@ -259,6 +259,37 @@ impl ManagedInterface {
         self.meta.contains_key(&handle)
     }
 
+    /// 检查同一监听端点是否已经被其它 TCP socket 占用。
+    pub fn tcp_listen_endpoint_in_use(
+        &self,
+        exclude: SocketHandle,
+        target: IpListenEndpoint,
+    ) -> bool {
+        for (handle, socket) in self.sockets.iter() {
+            if handle == exclude {
+                continue;
+            }
+            let Some(meta) = self.meta.get(&handle) else {
+                continue;
+            };
+            if meta.is_removed() || meta.is_orphaned() {
+                continue;
+            }
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            if tcp.state() == smoltcp::socket::tcp::State::Listen
+                && listen_endpoint_matches(tcp.listen_endpoint(), target)
+            {
+                return true;
+            }
+            if self.tcp_socket_is_pending_accept_with_socket(handle, tcp, target) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Soft-close：标记 socket 为已移除（延迟到下一轮 poll 时真正释放）。
     ///
     /// **本接口仅供内部 soft-close 协议使用**——上层关闭文件 fd 时应直接
