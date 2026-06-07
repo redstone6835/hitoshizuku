@@ -323,7 +323,7 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
-    me.shared_signal().reset_caught_for_exec();
+    me.shared_signal().reset_handlers_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);
         // vfork 父进程到这里已经可以继续运行，但不要立刻抢占刚 exec 完成的
@@ -557,7 +557,7 @@ fn wait_common(
     let nowait = options.has(WaitOptions::WNOWAIT);
 
     loop {
-        // 1. 先看是否有退出事件匹配。wait4 的 options=0 隐含 WEXITED；
+        // 1. 先看是否有退出事件匹配。
         //    waitid 必须由调用方显式传 WEXITED/WSTOPPED/WCONTINUED。
         let pred = |c: &Arc<Task>| matches_waitid(c, target, &me);
         if wait_exited {

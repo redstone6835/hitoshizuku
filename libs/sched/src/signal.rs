@@ -388,13 +388,30 @@ impl SharedSignal {
         old
     }
 
-    /// exec 成功后重置所有捕获型 handler，忽略型 disposition 保持不变。
-    pub fn reset_caught_for_exec(&self) {
+    /// execve 时按 POSIX 重置信号处理：所有 caught 信号恢复为 SIG_DFL，
+    /// SIG_IGN 保持（除 SIGCHLD 特殊情况）。SIGKILL/SIGSTOP 不可改，跳过。
+    pub fn reset_handlers_for_exec(&self) {
         let mut guard = self.actions.lock();
-        for action in guard.iter_mut().skip(1) {
-            if matches!(action.handler, SigHandler::Handler(_)) {
-                *action = SigAction::default_new();
+        for sig_idx in 0..guard.len() {
+            let sig = SignalNumber::from_raw(sig_idx as i32);
+            let action = guard[sig_idx];
+            match action.handler {
+                SigHandler::Handler(_) => {
+                    guard[sig_idx] = SigAction {
+                        handler: SigHandler::Default,
+                        flags: SigActionFlags(0),
+                        mask: SigSet(0),
+                        restorer: 0,
+                    };
+                }
+                SigHandler::Ignore => {
+                    // TODO: SIG_IGN 跨 exec 保持（SIGCHLD 有特殊语义但这里先保持）
+                }
+                SigHandler::Default => {
+                    // 已经 SIG_DFL，不变
+                }
             }
+            let _ = sig;
         }
     }
 
