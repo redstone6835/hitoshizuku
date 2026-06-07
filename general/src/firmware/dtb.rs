@@ -35,13 +35,37 @@ pub struct DtbMmioRangeInfo {
     pub size: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbInterruptInfo {
+    pub parent: Option<u32>,
+    pub specifier: Box<[u32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DtbPropertyValue {
+    Bool,
+    U32(u32),
+    StringList(Vec<&'static str>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbDeviceProperty {
+    pub name: &'static str,
+    pub value: DtbPropertyValue,
+}
+
 #[derive(Debug)]
 pub struct DtbPlatformDeviceInfo {
     pub name: &'static str,
     pub path: &'static str,
+    pub phandle: Option<u32>,
+    pub interrupt_parent: Option<u32>,
     pub compatible: Vec<&'static str>,
     pub reg_ranges: Vec<DtbMmioRangeInfo>,
+    pub interrupts: Vec<DtbInterruptInfo>,
+    pub interrupt_controller: bool,
     pub clock_hz: Option<u32>,
+    pub properties: Vec<DtbDeviceProperty>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,8 +448,11 @@ impl DtbTree {
             if compatible.is_empty() {
                 continue;
             };
-            let Ok(ranges) = self.reg_ranges(node_id) else {
-                continue;
+            let interrupt_controller = self.node_is_interrupt_controller(node_id);
+            let ranges = match self.reg_ranges(node_id) {
+                Ok(ranges) => ranges,
+                Err(DtbAddressError::MissingReg) if interrupt_controller => Vec::new(),
+                Err(_) => continue,
             };
             let reg_ranges = ranges
                 .into_iter()
@@ -437,9 +464,14 @@ impl DtbTree {
             devices.push(DtbPlatformDeviceInfo {
                 name: self.node_name_or_path(node_id),
                 path: entry.path,
+                phandle: self.phandle_for_node(node_id),
+                interrupt_parent: self.interrupt_parent_phandle(node_id),
                 compatible,
                 reg_ranges,
+                interrupts: self.interrupts(node_id),
+                interrupt_controller,
                 clock_hz: read_clock_hz(entry.node),
+                properties: scalar_properties(entry.node),
             });
         }
         devices
@@ -470,6 +502,104 @@ impl DtbTree {
 
     fn first_reg_range(&self, node_id: NodeId) -> Option<AddressRange> {
         self.reg_ranges(node_id).ok()?.into_iter().next()
+    }
+
+    fn interrupts(&self, node_id: NodeId) -> Vec<DtbInterruptInfo> {
+        let extended = self.interrupts_extended(node_id);
+        if !extended.is_empty() {
+            return extended;
+        }
+        self.interrupts_inherited(node_id)
+    }
+
+    fn interrupts_extended(&self, node_id: NodeId) -> Vec<DtbInterruptInfo> {
+        let Some(value) = self.nodes[node_id]
+            .node
+            .find_property("interrupts-extended")
+            .map(|prop| prop.value())
+        else {
+            return Vec::new();
+        };
+
+        let mut interrupts = Vec::new();
+        let mut offset = 0usize;
+        while offset < value.len() {
+            let Some(parent) = value
+                .get(offset..offset.saturating_add(4))
+                .and_then(read_be_u32_prop)
+            else {
+                break;
+            };
+            offset += 4;
+            let Some(parent_id) = self.lookup_phandle(parent) else {
+                break;
+            };
+            let cell_count =
+                read_cells_count(self.nodes[parent_id].node, "#interrupt-cells").unwrap_or(1);
+            let Some(byte_count) = cell_count.checked_mul(4) else {
+                break;
+            };
+            if byte_count == 0 {
+                break;
+            }
+            let Some(specifier_bytes) = value.get(offset..offset.saturating_add(byte_count)) else {
+                break;
+            };
+            let Some(specifier) = read_u32_cells(specifier_bytes) else {
+                break;
+            };
+            interrupts.push(DtbInterruptInfo {
+                parent: Some(parent),
+                specifier,
+            });
+            offset += byte_count;
+        }
+        interrupts
+    }
+
+    fn interrupts_inherited(&self, node_id: NodeId) -> Vec<DtbInterruptInfo> {
+        let Some(value) = self.nodes[node_id]
+            .node
+            .find_property("interrupts")
+            .map(|prop| prop.value())
+        else {
+            return Vec::new();
+        };
+        let parent = self.interrupt_parent_phandle(node_id);
+        let cell_count = parent
+            .and_then(|phandle| self.lookup_phandle(phandle))
+            .and_then(|parent_id| read_cells_count(self.nodes[parent_id].node, "#interrupt-cells"))
+            .unwrap_or(1);
+        let Some(byte_count) = cell_count.checked_mul(4) else {
+            return Vec::new();
+        };
+        if byte_count == 0 || !value.len().is_multiple_of(byte_count) {
+            return Vec::new();
+        }
+
+        let mut interrupts = Vec::new();
+        for chunk in value.chunks_exact(byte_count) {
+            let Some(specifier) = read_u32_cells(chunk) else {
+                continue;
+            };
+            interrupts.push(DtbInterruptInfo { parent, specifier });
+        }
+        interrupts
+    }
+
+    fn interrupt_parent_phandle(&self, node_id: NodeId) -> Option<u32> {
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            if let Some(value) = self.nodes[id]
+                .node
+                .find_property("interrupt-parent")
+                .and_then(|prop| read_be_u32_prop(prop.value()))
+            {
+                return Some(value);
+            }
+            current = self.nodes[id].parent;
+        }
+        None
     }
 
     fn reg_ranges(&self, node_id: NodeId) -> Result<Vec<AddressRange>, DtbAddressError> {
@@ -627,6 +757,13 @@ impl DtbTree {
         compatible_contains(node, COMPAT_PCI_ECAM) || compatible_contains(node, COMPAT_PCIE_ECAM)
     }
 
+    fn node_is_interrupt_controller(&self, node_id: NodeId) -> bool {
+        self.nodes[node_id]
+            .node
+            .find_property("interrupt-controller")
+            .is_some()
+    }
+
     fn node_name_or_path(&self, node_id: NodeId) -> &'static str {
         self.nodes[node_id]
             .node
@@ -660,6 +797,13 @@ impl DtbTree {
             .iter()
             .find(|entry| entry.value == value)
             .map(|entry| entry.node_id)
+    }
+
+    fn phandle_for_node(&self, node_id: NodeId) -> Option<u32> {
+        self.phandles
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .map(|entry| entry.value)
     }
 }
 
@@ -762,6 +906,42 @@ fn read_clock_hz(node: DtbNode<'static>) -> Option<u32> {
     read_be_u32_prop(node.find_property("clock-frequency")?.value())
 }
 
+fn scalar_properties(node: DtbNode<'static>) -> Vec<DtbDeviceProperty> {
+    let mut properties = Vec::new();
+    for property in node.properties() {
+        let Some(name) = property.name() else {
+            continue;
+        };
+        let value = property.value();
+        let value = if value.is_empty() {
+            DtbPropertyValue::Bool
+        } else if value.len() == 4 {
+            let Some(value) = read_be_u32_prop(value) else {
+                continue;
+            };
+            DtbPropertyValue::U32(value)
+        } else if name == "reg-names" {
+            let names = string_list(value);
+            if names.is_empty() {
+                continue;
+            }
+            DtbPropertyValue::StringList(names)
+        } else {
+            continue;
+        };
+        properties.push(DtbDeviceProperty { name, value });
+    }
+    properties
+}
+
+fn string_list(value: &'static [u8]) -> Vec<&'static str> {
+    value
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| str::from_utf8(entry).ok())
+        .collect()
+}
+
 fn read_bus_range(node: DtbNode<'static>) -> Option<(u8, u8)> {
     let value = node.find_property("bus-range")?.value();
     let start = read_be_u32_prop(value.get(..4)?)?;
@@ -781,6 +961,17 @@ fn read_cells_count(node: DtbNode<'static>, name: &str) -> Option<usize> {
 
 fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
+}
+
+fn read_u32_cells(value: &[u8]) -> Option<Box<[u32]>> {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut cells = Vec::new();
+    for chunk in value.chunks_exact(4) {
+        cells.push(read_be_u32_prop(chunk)?);
+    }
+    Some(cells.into_boxed_slice())
 }
 
 fn read_usize_scalar(value: &[u8]) -> Option<usize> {

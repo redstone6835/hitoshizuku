@@ -137,6 +137,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             sched::preempt_if_needed(now_ns);
             return arg4;
         }
+        let _ = general::dev::irq::dispatch_interrupt(intr);
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。
         sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());

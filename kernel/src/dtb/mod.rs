@@ -19,8 +19,8 @@ use general::dev::enumerate::DEVICES;
 use general::dev::function::{active_block_devices, find_char_device_by_fw_name};
 use general::dev::pci::pci_scan_and_register;
 use general::dev::platform::{
-    DeviceMatchId, DeviceProperties, DeviceResource, PlatformDeviceInfo,
-    register_and_probe_platform_device,
+    DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, FirmwarePropertyValue,
+    PlatformDeviceInfo, register_and_probe_platform_device,
 };
 use general::dev::pnp::{DevInitContext, set_dev_init_context};
 use general::firmware::dtb as firmware_dtb;
@@ -251,7 +251,47 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
+    // 中断控制器先注册，普通 platform 设备后注册。控制器之间仍可能存在
+    // `interrupt-parent` 级联关系，例如 PCH PIC → EIOINTC → CPUIC；因此这里对
+    // controller 节点做有限多轮重试，使父 domain 晚于子节点出现在 DTB 文本中
+    // 时也能最终完成绑定。
+    let mut pending_controllers: Vec<usize> = platform_devices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| device.interrupt_controller.then_some(index))
+        .collect();
+    let max_controller_passes = pending_controllers.len();
+    for _ in 0..max_controller_passes {
+        if pending_controllers.is_empty() {
+            break;
+        }
+        let before = pending_controllers.len();
+        let mut retry = Vec::new();
+        for index in pending_controllers {
+            let device = &platform_devices[index];
+            let info = platform_device_info_from_dtb(device, stdout_phys);
+            match register_platform_device_status(info, "dtb", false) {
+                PlatformRegisterStatus::Bound => platform_bound += 1,
+                PlatformRegisterStatus::Unbound => {}
+                PlatformRegisterStatus::Failed => retry.push(index),
+            }
+        }
+        if retry.len() == before {
+            pending_controllers = retry;
+            break;
+        }
+        pending_controllers = retry;
+    }
+    if !pending_controllers.is_empty() {
+        log::debug!(
+            "[kernel-start][dtb] {} interrupt-controller node(s) remained unbound after dependency retries",
+            pending_controllers.len()
+        );
+    }
     for device in &platform_devices {
+        if device.interrupt_controller {
+            continue;
+        }
         let info = platform_device_info_from_dtb(device, stdout_phys);
         if register_platform_device(info, "dtb") {
             platform_bound += 1;
@@ -554,7 +594,7 @@ fn platform_device_info_from_dtb(
         .iter()
         .map(|compatible| DeviceMatchId::DtbCompatible((*compatible).into()))
         .collect();
-    let resources = device
+    let mut resources: Vec<DeviceResource> = device
         .reg_ranges
         .iter()
         .map(|range| DeviceResource::Mmio {
@@ -562,7 +602,27 @@ fn platform_device_info_from_dtb(
             size: range.size,
         })
         .collect();
+    resources.extend(device.interrupts.iter().map(|irq| DeviceResource::Irq {
+        controller: irq.parent,
+        cells: irq.specifier.clone(),
+    }));
     let first_phys = device.reg_ranges.first().map(|range| range.phys_addr);
+    let fw_properties = device
+        .properties
+        .iter()
+        .map(|property| FirmwareProperty {
+            name: property.name.into(),
+            value: match &property.value {
+                firmware_dtb::DtbPropertyValue::Bool => FirmwarePropertyValue::Bool,
+                firmware_dtb::DtbPropertyValue::U32(value) => FirmwarePropertyValue::U32(*value),
+                firmware_dtb::DtbPropertyValue::StringList(values) => {
+                    FirmwarePropertyValue::StringList(
+                        values.iter().map(|value| (*value).into()).collect(),
+                    )
+                }
+            },
+        })
+        .collect();
 
     PlatformDeviceInfo {
         fw_name: device.name.into(),
@@ -571,29 +631,56 @@ fn platform_device_info_from_dtb(
         properties: DeviceProperties {
             clock_hz: device.clock_hz,
             baud: None,
+            fw_phandle: device.phandle,
+            fw_interrupt_parent: device.interrupt_parent,
+            interrupt_controller: device.interrupt_controller,
             stdout: first_phys == stdout_phys,
         },
+        fw_properties,
     }
 }
 
-fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformRegisterStatus {
+    Bound,
+    Unbound,
+    Failed,
+}
+
+fn register_platform_device_status(
+    info: PlatformDeviceInfo,
+    tag: &str,
+    noisy_failure: bool,
+) -> PlatformRegisterStatus {
     match register_and_probe_platform_device(info) {
-        Ok(reg) if reg.bound => true,
+        Ok(reg) if reg.bound => PlatformRegisterStatus::Bound,
         Ok(reg) => {
             log::debug!(
                 "[kernel-start][{}] no platform driver for {}",
                 tag,
                 reg.device.id
             );
-            false
+            PlatformRegisterStatus::Unbound
         }
         Err(err) => {
-            printk!(
-                "[kernel-start][{}] failed to register/probe platform device: {:?}",
-                tag,
-                err
-            );
-            false
+            if noisy_failure {
+                printk!(
+                    "[kernel-start][{}] failed to register/probe platform device: {:?}",
+                    tag,
+                    err
+                );
+            } else {
+                log::debug!(
+                    "[kernel-start][{}] deferred platform probe after failure: {:?}",
+                    tag,
+                    err
+                );
+            }
+            PlatformRegisterStatus::Failed
         }
     }
+}
+
+fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
+    register_platform_device_status(info, tag, true) == PlatformRegisterStatus::Bound
 }

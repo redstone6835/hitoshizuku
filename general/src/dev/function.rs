@@ -25,6 +25,7 @@ pub struct DeviceClassId(&'static str);
 impl DeviceClassId {
     pub const CHAR: Self = Self("char");
     pub const BLOCK: Self = Self("block");
+    pub const RTC: Self = Self("rtc");
 
     pub const fn new(name: &'static str) -> Self {
         Self(name)
