@@ -24,7 +24,7 @@
 //!  └─────────────────────────────┘
 //!           │
 //!           ▼
-//!     /dev/random  ── read：熵不足 spin/yield
+//!     /dev/random  ── read：熵不足挂 WaitQueue 睡眠等待
 //!     /dev/urandom ── read：永远走 CSPRNG（永不阻塞）
 //! ```
 //!
@@ -38,6 +38,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::dev::char::{CharDriver, CharIoError};
+use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
 
@@ -64,12 +65,15 @@ const RESEED_BYTES: u64 = 1u64 << 20;
 /// 滥用来"伪造"大量熵。
 const USER_WRITE_BITS_PER_BYTE: u64 = 1;
 
-/// TSC/IRQ 时间类硬件熵源的熵密度（更乐观，6 bit/byte）。
-const HARDWARE_BITS_PER_BYTE: u64 = 6;
-
-/// `/dev/random` 等待熵时的自旋-让出比例。
+/// 调度器尚未 ready 的极早期路径无法睡眠，只能短暂 spin 等待。
+/// 正常 `/dev/random` read 路径必须走 WaitQueue，不应忙等占用 CPU。
 const RANDOM_WAIT_RETRIES: usize = 4096;
-const RANDOM_YIELD_RETRIES: usize = 8;
+/// 自旋锁长时间争用时触发一次 best-effort yield 的门槛。
+const RANDOM_LOCK_SPIN_YIELD_LIMIT: usize = 10_000_000;
+/// 启动期采样缓冲区大小，容纳时间戳、栈指针和 self 地址提示。
+const STARTUP_SEED_BYTES: usize = 64;
+/// 启动期连续采几次 EntropySource 样本，靠时间差分增加不可复现性。
+const STARTUP_SOURCE_SAMPLES: usize = 2;
 
 // ──────────────────────── 自旋锁辅助 ──────────────────────────────────────
 
@@ -100,7 +104,7 @@ impl<T> SpinLock<T> {
                 return SpinLockGuard { lock: self };
             }
             spins += 1;
-            if spins > 10_000_000 {
+            if spins > RANDOM_LOCK_SPIN_YIELD_LIMIT {
                 // 与 uart 行为一致：长时间争用时让出调度。
                 sched_yield_best_effort();
                 spins = 0;
@@ -229,28 +233,12 @@ impl EntropyPool {
         self.mix(&buf);
     }
 
-    /// 抽 raw 字节到任意长度 buffer，不影响熵计数。
-    fn fill_raw(&mut self, out: &mut [u8]) {
-        let mut produced = 0usize;
-        let mut round = 0u64;
-        while produced < out.len() {
-            // 每次 fold 池子 + 输出 POOL_BYTES。
-            self.mix(&round.to_le_bytes());
-            round = round.wrapping_add(1);
-            let mut buf = [0u8; POOL_BYTES];
-            for (i, word) in self.state.iter().enumerate() {
-                buf[i * 8..(i + 1) * 8].copy_from_slice(&word.to_le_bytes());
-            }
-            let want = (out.len() - produced).min(POOL_BYTES);
-            out[produced..produced + want].copy_from_slice(&buf[..want]);
-            produced += want;
-        }
-    }
-
     /// 增加熵估计，clamp 到 POOL_BITS。
     fn credit(&mut self, bits: u64) {
-        self.estimated_entropy_bits =
-            self.estimated_entropy_bits.saturating_add(bits).min(POOL_BITS);
+        self.estimated_entropy_bits = self
+            .estimated_entropy_bits
+            .saturating_add(bits)
+            .min(POOL_BITS);
     }
 
     /// 扣除熵估计，不允许下溢成负数。
@@ -388,7 +376,9 @@ impl Crng {
             }
             let block = cipher.block(self.counter);
             self.counter = self.counter.wrapping_add(1);
-            self.bytes_since_reseed = self.bytes_since_reseed.saturating_add(CHACHA20_BLOCK as u64);
+            self.bytes_since_reseed = self
+                .bytes_since_reseed
+                .saturating_add(CHACHA20_BLOCK as u64);
             let want = (out.len() - produced).min(CHACHA20_BLOCK);
             out[produced..produced + want].copy_from_slice(&block[..want]);
             produced += want;
@@ -402,6 +392,11 @@ impl Crng {
 pub struct RandomCore {
     pool: SpinLock<EntropyPool>,
     crng: SpinLock<Crng>,
+    /// `/dev/random` 等待真实 entropy credit 的睡眠队列。
+    ///
+    /// 注意：队列只表示“可能有新 credit”，唤醒后仍必须重新检查并在池锁
+    /// 下扣减。这样多个 reader 同时被唤醒时不会重复消费同一份熵估计。
+    entropy_wait: WaitQueue,
     /// 输出字节统计。
     total_bytes_output: AtomicU64,
     /// 总熵注入次数。
@@ -415,6 +410,7 @@ impl RandomCore {
         Self {
             pool: SpinLock::new(EntropyPool::new()),
             crng: SpinLock::new(Crng::new()),
+            entropy_wait: WaitQueue::new(),
             total_bytes_output: AtomicU64::new(0),
             total_add_calls: AtomicU64::new(0),
             first_seed_done: AtomicBool::new(false),
@@ -440,24 +436,51 @@ impl RandomCore {
     /// 注入熵入口。
     ///
     /// - `data`：原始字节
-    /// - `bits_per_byte`：调用方对输入熵密度的乐观/悲观估计
-    ///   （用户态 write 传 1，硬件时间源传 6~8）。
-    /// - `credit_full_bits`：如果为 `true`，按 `data.len() * 8` 计入。
-    ///   专用于"bootloader 已提供硬件熵"等可信场景。
-    fn add_input(&self, data: &[u8], bits_per_byte: u64, credit_full_bits: bool) {
+    /// - `entropy_bits`：调用方显式声明本次最多可记入的熵 bit 数。
+    ///
+    /// 安全语义：mix 和 credit 分离。timestamp、地址、用户可控字节都可以
+    /// 混入池子扰动状态，但只有调用方明确给出的 `entropy_bits` 会影响
+    /// `/dev/random` 的阻塞条件。
+    fn add_input(&self, data: &[u8], entropy_bits: u64) {
         if data.is_empty() {
             return;
         }
         self.total_add_calls.fetch_add(1, Ordering::Relaxed);
+        let credited_bits = entropy_bits.min((data.len() as u64).saturating_mul(8));
+        {
+            let mut pool = self.pool.lock();
+            pool.mix(data);
+            pool.bytes_added = pool.bytes_added.saturating_add(data.len() as u64);
+            pool.credit(credited_bits);
+        }
+        if credited_bits != 0 {
+            self.wake_entropy_waiters();
+        }
+    }
+
+    fn wake_entropy_waiters(&self) {
+        self.entropy_wait.wake_all();
+    }
+
+    fn try_debit_entropy(&self, bits: u64) -> bool {
         let mut pool = self.pool.lock();
-        pool.mix(data);
-        pool.bytes_added = pool.bytes_added.saturating_add(data.len() as u64);
-        let credited_bits = if credit_full_bits {
-            (data.len() as u64).saturating_mul(8)
-        } else {
-            (data.len() as u64).saturating_mul(bits_per_byte)
-        };
-        pool.credit(credited_bits);
+        if pool.estimated_entropy_bits < bits {
+            return false;
+        }
+        pool.debit(bits);
+        true
+    }
+
+    fn wait_and_debit_entropy(&self, bits: u64, blocking: bool) -> bool {
+        loop {
+            if self.try_debit_entropy(bits) {
+                return true;
+            }
+            if !blocking {
+                return false;
+            }
+            self.wait_for_entropy(bits);
+        }
     }
 
     /// 估算可用熵。
@@ -467,23 +490,22 @@ impl RandomCore {
 
     /// 阻塞到至少有 `bits` 可用熵。
     fn wait_for_entropy(&self, bits: u64) {
-        let mut total = 0usize;
-        loop {
-            if self.estimated_entropy_bits() >= bits {
-                return;
-            }
+        if bits == 0 || self.estimated_entropy_bits() >= bits {
+            return;
+        }
+
+        if sched::is_ready() {
+            let task = sched::current_task();
+            self.entropy_wait
+                .wait_event(&task, || self.estimated_entropy_bits() >= bits);
+            return;
+        }
+
+        // 调度器启动前没有 current task 可挂队列，只能保留极早期兼容兜底；
+        // 调度器 ready 后的 `/dev/random` read 不会走到这里。
+        while self.estimated_entropy_bits() < bits {
             for _ in 0..RANDOM_WAIT_RETRIES {
                 core::hint::spin_loop();
-            }
-            total += 1;
-            if total % RANDOM_YIELD_RETRIES == 0 {
-                // 模拟"让出调度"。真正睡眠需要 waitqueue，这里与项目内
-                // tty canonical 读的等待风格保持一致。
-                sched_yield_best_effort();
-            }
-            // 防止极端情况下永远等不到熵，每隔一段时间自动 reseed。
-            if total % (RANDOM_WAIT_RETRIES * 32) == 0 {
-                self.reseed_locked();
             }
         }
     }
@@ -517,26 +539,26 @@ impl RandomCore {
 
     /// `/dev/random` 的 read 实现。
     ///
-    /// `blocking == true`：熵不足时 spin/yield。
+    /// `blocking == true`：熵不足时挂 WaitQueue 阻塞等待。
     /// `blocking == false`：立刻返回 0。
     fn read_blocking(&self, buf: &mut [u8], blocking: bool) -> usize {
         if buf.is_empty() {
             return 0;
         }
-        let need_bits = (buf.len() as u64).saturating_mul(8);
-        if !blocking {
-            if self.estimated_entropy_bits() < need_bits {
-                return 0;
+
+        let mut done = 0usize;
+        while done < buf.len() {
+            // 熵池最多只记 POOL_BITS；大读按池容量分段等待，避免要求一个
+            // 永远不可能同时满足的 credit 数。
+            let chunk = (buf.len() - done).min(POOL_BYTES);
+            let need_bits = (chunk as u64).saturating_mul(8);
+            if !self.wait_and_debit_entropy(need_bits, blocking) {
+                break;
             }
-            // 不扣熵，urandom 也不扣：保持简单一致。
-            self.crng_fill(buf);
-            self.pool.lock().debit(need_bits);
-            return buf.len();
+            self.crng_fill(&mut buf[done..done + chunk]);
+            done += chunk;
         }
-        self.wait_for_entropy(need_bits);
-        self.crng_fill(buf);
-        self.pool.lock().debit(need_bits);
-        buf.len()
+        done
     }
 
     /// `/dev/urandom` 的 read 实现（永不阻塞，从 CSPRNG 直接取）。
@@ -550,7 +572,8 @@ impl RandomCore {
 
     /// 用户态 `write` 注入熵（保守密度）。
     fn write_input(&self, buf: &[u8]) {
-        self.add_input(buf, USER_WRITE_BITS_PER_BYTE, false);
+        let entropy_bits = (buf.len() as u64).saturating_mul(USER_WRITE_BITS_PER_BYTE);
+        self.add_input(buf, entropy_bits);
     }
 }
 
@@ -573,15 +596,13 @@ pub fn random_core() -> &'static RandomCore {
 
 /// 添加"硬件时间源"型熵（TSC、IRQ 时间等）。
 ///
-/// `n_bits` 是调用方对本次采样的最佳熵估计，clamp 在 `[0, 64]`。
+/// `n_bits` 是调用方对本次采样的最佳熵估计，按本次 buffer 长度 clamp；
+/// 不再按 byte 向上折算，避免 1 bit jitter 被记成 8 bit。
 pub fn add_hw_randomness(data: &[u8], n_bits: u64) {
     if data.is_empty() {
         return;
     }
-    let bits_per_byte = (n_bits.saturating_add(data.len() as u64 - 1) / data.len() as u64)
-        .min(8)
-        .max(1);
-    random_core().add_input(data, bits_per_byte, false);
+    random_core().add_input(data, n_bits);
 }
 
 /// 添加启动期"已知熵"——这种来源调用方声称自己已验证熵密度为 100%。
@@ -590,7 +611,8 @@ pub fn add_bootloader_randomness(data: &[u8]) {
     if data.is_empty() {
         return;
     }
-    random_core().add_input(data, 0, true);
+    let entropy_bits = (data.len() as u64).saturating_mul(8);
+    random_core().add_input(data, entropy_bits);
 }
 
 /// 用户态 `write(/dev/{,u}random, buf)` 路径。
@@ -660,8 +682,8 @@ use crate::dev::pnp::PnpError;
 /// 注册 random 子系统。在 devtmpfs mount 之前调用。
 ///
 /// 内部会：
-///   1. 喂一次启动期熵（时间戳 + 栈地址 + cmdline 长度），并把 CSPRNG
-///      reseed 一次。
+///   1. 喂一次启动期样本（时间戳 + 栈地址 + self 地址），并按熵源显式
+///      credit reseed 一次。
 ///   2. 标记 `first_seed_done`，供诊断。
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     seed_from_startup();
@@ -671,36 +693,29 @@ pub fn register_builtin_driver() -> Result<(), PnpError> {
 /// 启动期喂熵 + 首次 reseed。
 ///
 /// 设计原则：使用任何"在启动时容易拿到、攻击者难以复现"的来源。
-/// - 两次时间戳（rdtime）
+/// - 时间戳（rdtime）
 /// - 栈指针（地址空间布局随机化的代理）
-/// - 静态 RANDOM_CORE 的虚拟地址（启动基址）
+/// - 熵源实现愿意提供的其它运行时 hint
 ///
 /// 所有这些都通过 [`crate::dev::random_source`] 的 `EntropySource` 取得，
 /// 避免 `general` 层出现 `cfg(target_arch = ...)` 的内联汇编。
 fn seed_from_startup() {
-    let mut buf = [0u8; 64];
+    let mut buf = [0u8; STARTUP_SEED_BYTES];
     let mut pos = 0usize;
+    let mut entropy_bits = 0u64;
 
     if let Some(src) = crate::dev::random_source::installed_source() {
-        // 1) 两次时间戳（让后续按位 XOR 后仍有差分）
-        for _ in 0..2 {
-            let ts_bytes = src.timestamp().to_le_bytes();
-            let n = ts_bytes.len().min(buf.len() - pos);
-            buf[pos..pos + n].copy_from_slice(&ts_bytes[..n]);
-            pos += n;
-        }
-
-        // 2) 栈指针（arch 暴露的代理）
-        let sp_bytes = src.stack_pointer_hint().to_le_bytes();
-        let n = sp_bytes.len().min(buf.len() - pos);
-        buf[pos..pos + n].copy_from_slice(&sp_bytes[..n]);
-        pos += n;
-
-        // 3) 启动期 self 地址（arch 可选提供）
-        let sa_bytes = src.self_address_hint().to_le_bytes();
-        let n = sa_bytes.len().min(buf.len() - pos);
-        if n != 0 {
-            buf[pos..pos + n].copy_from_slice(&sa_bytes[..n]);
+        for _ in 0..STARTUP_SOURCE_SAMPLES {
+            if pos >= buf.len() {
+                break;
+            }
+            let sample = src.sample_with_credit(&mut buf[pos..]);
+            let n = sample.bytes_written.min(buf.len() - pos);
+            if n == 0 {
+                break;
+            }
+            entropy_bits =
+                entropy_bits.saturating_add(sample.entropy_bits.min((n as u64).saturating_mul(8)));
             pos += n;
         }
     } else {
@@ -708,18 +723,11 @@ fn seed_from_startup() {
         // Linux 在 start_kernel 早期 `crng_init = 0` 的状态也是这样。
     }
 
-    // 把构造的样本当作"已知熵"喂入。
-    add_bootloader_randomness(&buf[..pos]);
+    // 启动 hint 可以 mix，但默认不 credit。只有 EntropySource 通过
+    // sample_with_credit() 明确声明的 bit 数才会解除 `/dev/random` 等待。
+    random_core().add_input(&buf[..pos], entropy_bits);
     random_core().reseed_locked();
 
-    // 让用户态 `write` 立刻可加熵，所以这里把估计熵设到一个最小门槛
-    // （>= 256 bit）保证 CRNG 的 key 真的"看起来"是熵源出来的。
-    if entropy_estimate_bits() < 256 {
-        // 直接从池中抽 32 字节后再混合一遍，然后 credit 256 bit。
-        let mut padding = [0u8; 32];
-        random_core().pool.lock().fill_raw(&mut padding);
-        random_core().pool.lock().credit(256);
-    }
     random_core().first_seed_done.store(true, Ordering::Release);
 }
 

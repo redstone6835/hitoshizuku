@@ -77,6 +77,7 @@ pub fn decode_open_flags(raw: u32) -> OpenOptions {
         truncate: raw & 0o1000 != 0,
         append: raw & 0o2000 != 0,
         nonblock: raw & 0o4000 != 0,
+        direct: raw & 0o40000 != 0,
         sync: raw & 0o4010000 != 0,
         directory: raw & 0o200000 != 0,
         nofollow: raw & 0o400000 != 0,
@@ -122,22 +123,4 @@ pub fn decode_mount_flags(raw: u32) -> MountFlags {
         flags = flags.with(MountFlags::REC);
     }
     flags
-}
-
-// ── 字符设备号映射 ────────────────────────────────────────────────────────────
-
-/// 将字符设备映射到 Linux 标准 major/minor 号。
-///
-/// 通过 `fw_name` + 驱动能力（`is_tty()`）判定，不再依赖闭枚举。
-/// 新设备类型无需改此函数——未识别设备默认分配 major=0。
-pub fn char_dev_to_dev_id(dev: &general::dev::char::CharDevice) -> general::vfs::stat::DevId {
-    use general::vfs::stat::DevId;
-    match dev.fw_name() {
-        "null" => DevId::new(1, 3),
-        "zero" => DevId::new(1, 5),
-        "random" | "urandom" => DevId::new(1, 8),
-        "console" => DevId::new(5, 1),
-        _ if dev.is_tty() => DevId::new(4, 64),
-        _ => DevId::new(0, 0),
-    }
 }

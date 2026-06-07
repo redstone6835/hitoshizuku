@@ -36,7 +36,7 @@ pub struct Ipv6Addr(pub [u8; 16]);
 
 impl Ipv6Addr {
     pub const UNSPECIFIED: Self = Self([0; 16]);
-    pub const LOCALHOST: Self = Self([0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1]);
+    pub const LOCALHOST: Self = Self([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
     pub fn new(segments: [u16; 8]) -> Self {
         let mut octets = [0u8; 16];
@@ -72,11 +72,17 @@ pub struct CidrAddress {
 
 impl CidrAddress {
     pub fn new_v4(addr: Ipv4Addr, prefix_len: u8) -> Self {
-        Self { addr: IpAddr::V4(addr), prefix_len }
+        Self {
+            addr: IpAddr::V4(addr),
+            prefix_len,
+        }
     }
 
     pub fn new_v6(addr: Ipv6Addr, prefix_len: u8) -> Self {
-        Self { addr: IpAddr::V6(addr), prefix_len }
+        Self {
+            addr: IpAddr::V6(addr),
+            prefix_len,
+        }
     }
 }
 
@@ -151,4 +157,3 @@ impl IfConfig {
         }
     }
 }
-

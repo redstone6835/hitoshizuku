@@ -14,15 +14,14 @@ use alloc::vec::Vec;
 use smoltcp::iface::{self, SocketHandle, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpCidr,
-    Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr,
+    EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address,
+    Ipv6Cidr,
 };
 
 use crate::adapter::NetDeviceAdapter;
-use crate::config::{
-    CidrAddress, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr,
-};
+use crate::config::{CidrAddress, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
+use crate::driver::LinkMedium;
 use crate::socket::SocketMeta;
 
 // ── ManagedInterface ─────────────────────────────────────────────────────────
@@ -34,6 +33,10 @@ pub(crate) struct ManagedInterface {
     sockets: SocketSet<'static>,
     /// 每个 socket 的元数据（soft-close 标志）。
     pub(crate) meta: BTreeMap<SocketHandle, SocketMeta>,
+    /// 已完成握手的 TCP socket 队列（accept backlog）。
+    pending_accepted: Vec<SocketHandle>,
+    max_backlog: usize,
+    inode_counter: core::sync::atomic::AtomicU64,
     #[allow(dead_code)]
     config: IfConfig,
     #[allow(dead_code)]
@@ -44,26 +47,24 @@ impl ManagedInterface {
     /// 根据设备和配置创建受管理接口。
     pub fn new(net_device: Arc<NetDevice>, config: IfConfig) -> Self {
         let driver = Arc::clone(net_device.driver());
-        let mac = driver.mac_address();
-        let hw_addr = HardwareAddress::Ethernet(EthernetAddress(mac));
+        let hw_addr = match driver.medium() {
+            LinkMedium::Ethernet => {
+                HardwareAddress::Ethernet(EthernetAddress(driver.mac_address()))
+            }
+            LinkMedium::Ip => HardwareAddress::Ip,
+        };
 
         let mut iface_config = iface::Config::new(hw_addr);
         iface_config.random_seed = generate_seed(net_device.id());
 
         let mut device = NetDeviceAdapter::new(driver, Arc::clone(&net_device));
         let now = Instant::from_millis(0);
-        let mut iface = iface::Interface::new(
-            iface_config, &mut device, now,
-        );
+        let mut iface = iface::Interface::new(iface_config, &mut device, now);
 
         // 配置 IP 地址（支持 IPv4 + IPv6 混合）
         // TODO: IfMode::Auto 当前不会触发 DHCP/SLAAC，这里只会把已有
         // config.addresses 静态写入 smoltcp。
-        let cidrs: Vec<IpCidr> = config
-            .addresses
-            .iter()
-            .map(cidr_to_smoltcp)
-            .collect();
+        let cidrs: Vec<IpCidr> = config.addresses.iter().map(cidr_to_smoltcp).collect();
         iface.update_ip_addrs(|addrs| {
             for cidr in cidrs {
                 let _ = addrs.push(cidr);
@@ -74,20 +75,24 @@ impl ManagedInterface {
         if let Some(ref gw) = config.gateway {
             match gw {
                 Gateway::V4(v4) => {
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv4_route(ipv4_to_smoltcp(*v4))
                         .ok();
                 }
                 Gateway::V6(v6) => {
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv6_route(ipv6_to_smoltcp(*v6))
                         .ok();
                 }
                 Gateway::DualStack { v4, v6 } => {
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv4_route(ipv4_to_smoltcp(*v4))
                         .ok();
-                    iface.routes_mut()
+                    iface
+                        .routes_mut()
                         .add_default_ipv6_route(ipv6_to_smoltcp(*v6))
                         .ok();
                 }
@@ -99,28 +104,44 @@ impl ManagedInterface {
             device,
             sockets: SocketSet::new(Vec::new()),
             meta: BTreeMap::new(),
+            pending_accepted: Vec::new(),
+            max_backlog: 128,
+            inode_counter: core::sync::atomic::AtomicU64::new(1),
             config,
             net_device,
         }
+    }
+
+    fn next_inode(&self) -> u64 {
+        self.inode_counter
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
 
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
     ///
     /// 同时清理已标记为 removed 的 socket。
     pub fn poll(&mut self, timestamp: Instant) {
-        self.iface.poll(
-            timestamp, &mut self.device, &mut self.sockets,
-        );
-        // 延迟清理：移除标记为 removed 的 socket。
+        self.iface
+            .poll(timestamp, &mut self.device, &mut self.sockets);
+        // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的
+        // orphan socket。orphan 用于 fd 已释放但 FIN/ACK 仍需继续推进的
+        // 场景，不能像普通 remove 一样在 close 后立刻摘掉。
         //
         // 旧实现先 `sockets.remove` 再 `meta.remove`——若这两个动作之间
         // 有任何其它持锁代码路径访问 `self.sockets[handle]`，会看到一个
         // `None` 槽位从而 panic。新实现走 `remove_socket_locked` 同步删
         // 两者，并且保证顺序。
-        let to_remove: Vec<SocketHandle> = self.meta
+        let to_remove: Vec<SocketHandle> = self
+            .sockets
             .iter()
-            .filter(|(_, m)| m.is_removed())
-            .map(|(h, _)| *h)
+            .filter_map(|(h, socket)| {
+                let meta = self.meta.get(&h)?;
+                if meta.is_removed() || (meta.is_orphaned() && socket_can_reap_orphan(socket)) {
+                    Some(h)
+                } else {
+                    None
+                }
+            })
             .collect();
         for h in to_remove {
             self.remove_socket_locked(h);
@@ -164,6 +185,46 @@ impl ManagedInterface {
         self.iface.routes_mut().remove_default_ipv4_route();
     }
 
+    // ── 运行时配置（供 ioctl / netlink 写操作使用）─────────────────────
+
+    /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
+    pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) {
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
+            let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
+                ipv4_to_smoltcp(addr),
+                prefix_len,
+            )));
+        });
+    }
+
+    /// 添加 IPv4 路由（smoltcp 仅支持默认路由）。
+    pub fn add_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
+        let prefix_len = mask_to_prefix_len(mask);
+        if prefix_len == 0 {
+            self.iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+                .ok();
+        } else {
+            // smoltcp 不支持非默认路由，降级为默认网关
+            self.iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
+                .ok();
+            let _ = (dest, prefix_len);
+        }
+    }
+
+    /// 删除 IPv4 路由。
+    pub fn remove_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) {
+        let prefix_len = mask_to_prefix_len(mask);
+        if prefix_len == 0 {
+            self.iface.routes_mut().remove_default_ipv4_route();
+        }
+        let _ = (dest, prefix_len);
+    }
+
     /// 返回邻居缓存中所有条目（ARP/NDP 表查询）。
     pub fn neighbor_entries(&self) -> Vec<crate::stack::NeighborEntry> {
         use smoltcp::wire::{HardwareAddress, IpAddress};
@@ -188,7 +249,9 @@ impl ManagedInterface {
 
     /// 检查 socket 是否已被 soft-close 标记为移除。
     pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
-        self.meta.get(&handle).map_or(true, |m| m.is_removed())
+        self.meta
+            .get(&handle)
+            .map_or(true, |m| m.is_removed() || m.is_orphaned())
     }
 
     /// 检查 socket handle 当前是否仍存在于元数据表中。
@@ -206,6 +269,78 @@ impl ManagedInterface {
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_removed();
         }
+    }
+
+    /// 将 socket 标记为 orphan：上层 fd 已释放，但协议栈继续负责 TCP 收尾。
+    pub fn orphan_socket(&self, handle: SocketHandle) {
+        if let Some(meta) = self.meta.get(&handle) {
+            meta.mark_orphaned();
+        }
+    }
+
+    /// 标记 TCP 连接已被 accept 交付给 VFS。
+    pub fn mark_socket_accepted(&self, handle: SocketHandle) {
+        if let Some(meta) = self.meta.get(&handle) {
+            meta.mark_accepted();
+        }
+    }
+
+    /// 按监听端点查找一个已经由 smoltcp 原地转换为 Established、
+    /// 但尚未被 VFS accept 交付的 TCP socket。
+    ///
+    /// smoltcp 的 listen socket 会在收到 SYN 后直接变成连接 socket；
+    /// 内核随后再新建一个 listen socket 顶替。fork/close/handle 复用下，
+    /// 仅检查 fd 当前保存的单个 handle 容易漏掉这个已建立连接，因此这里
+    /// 允许按端点扫描整个 SocketSet。
+    pub fn pending_tcp_accept(
+        &self,
+        preferred: SocketHandle,
+        target: IpListenEndpoint,
+    ) -> Option<SocketHandle> {
+        if self.tcp_socket_is_pending_accept(preferred, target) {
+            return Some(preferred);
+        }
+        for (handle, socket) in self.sockets.iter() {
+            if handle == preferred {
+                continue;
+            }
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            if self.tcp_socket_is_pending_accept_with_socket(handle, tcp, target) {
+                return Some(handle);
+            }
+        }
+        None
+    }
+
+    fn tcp_socket_is_pending_accept(&self, handle: SocketHandle, target: IpListenEndpoint) -> bool {
+        if !self.meta.contains_key(&handle) {
+            return false;
+        }
+        let Some((socket_handle, socket)) = self.sockets.iter().find(|(h, _)| *h == handle) else {
+            return false;
+        };
+        let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+            return false;
+        };
+        self.tcp_socket_is_pending_accept_with_socket(socket_handle, tcp, target)
+    }
+
+    fn tcp_socket_is_pending_accept_with_socket(
+        &self,
+        handle: SocketHandle,
+        tcp: &smoltcp::socket::tcp::Socket<'static>,
+        target: IpListenEndpoint,
+    ) -> bool {
+        let Some(meta) = self.meta.get(&handle) else {
+            return false;
+        };
+        if meta.is_removed() || meta.is_orphaned() || meta.is_accepted() {
+            return false;
+        }
+        tcp.state() == smoltcp::socket::tcp::State::Established
+            && listen_endpoint_matches(tcp.listen_endpoint(), target)
     }
 
     /// 同步从 `SocketSet` 中移除一个 socket（不依赖 poll 触发）。
@@ -238,20 +373,17 @@ impl ManagedInterface {
     // ── Socket 管理 ──────────────────────────────────────────────────────
 
     /// 创建一个 TCP socket 并加入本接口的 SocketSet。
-    pub fn add_tcp_socket(
-        &mut self,
-        rx_buf_size: usize,
-        tx_buf_size: usize,
-    ) -> SocketHandle {
+    pub fn add_tcp_socket(&mut self, rx_buf_size: usize, tx_buf_size: usize) -> SocketHandle {
         // TODO: 缓冲区大小由调用方固定传入，缺少 SO_SNDBUF/SO_RCVBUF
         // 动态调整和内存压力下的 backpressure 策略。
-        let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(
-            alloc::vec![0u8; rx_buf_size],
-        );
-        let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(
-            alloc::vec![0u8; tx_buf_size],
-        );
-        let socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
+        let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; rx_buf_size]);
+        let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tx_buf_size]);
+        let mut socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
+        // 当前 syscall 层会分块搬运用户缓冲；在 loopback 大 MTU 下这些块
+        // 往往小于 MSS，若默认启用 Nagle，iperf/netperf 这类连续写会很快
+        // 被未确认的小段压住。先默认关闭 Nagle，后续可由 TCP_NODELAY
+        // setsockopt 再精细控制。
+        socket.set_nagle_enabled(false);
         let handle = self.sockets.add(socket);
         self.meta.insert(handle, SocketMeta::new());
         handle
@@ -329,10 +461,14 @@ impl ManagedInterface {
     /// 创建一个 raw IP socket（指定 IP 版本和协议号）。
     pub fn add_raw_socket(&mut self, ip_version: u8, protocol: u8) -> SocketHandle {
         use smoltcp::socket::raw;
-        use smoltcp::wire::{IpVersion, IpProtocol};
+        use smoltcp::wire::{IpProtocol, IpVersion};
         // TODO: raw buffer/meta 容量写死，且缺少协议过滤以外的 socket option
         // 支持，例如 IP_HDRINCL、TTL/TOS 和接收控制消息。
-        let ip_ver = if ip_version == 6 { IpVersion::Ipv6 } else { IpVersion::Ipv4 };
+        let ip_ver = if ip_version == 6 {
+            IpVersion::Ipv6
+        } else {
+            IpVersion::Ipv4
+        };
         let proto = IpProtocol::from(protocol);
         let rx_buf = raw::PacketBuffer::new(
             alloc::vec![raw::PacketMetadata::EMPTY; 8],
@@ -369,30 +505,159 @@ impl ManagedInterface {
 
     /// 获取 raw socket 的可变引用。
     pub fn raw_socket_mut(
-        &mut self, handle: smoltcp::iface::SocketHandle,
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::raw::Socket<'static> {
         self.sockets.get_mut(handle)
     }
 
     /// 获取 raw socket 的只读引用。
     pub fn raw_socket(
-        &self, handle: smoltcp::iface::SocketHandle,
+        &self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::raw::Socket<'static> {
         self.sockets.get(handle)
     }
 
     /// 获取 ICMP socket 的可变引用。
     pub fn icmp_socket_mut(
-        &mut self, handle: smoltcp::iface::SocketHandle,
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get_mut(handle)
     }
 
     /// 获取 ICMP socket 的只读引用。
     pub fn icmp_socket(
-        &self, handle: smoltcp::iface::SocketHandle,
+        &self,
+        handle: smoltcp::iface::SocketHandle,
     ) -> &smoltcp::socket::icmp::Socket<'static> {
         self.sockets.get(handle)
+    }
+
+    // ── Socket 快照遍历（供 /proc/net/ 使用）──────────────────────────
+
+    /// 遍历所有非监听 TCP socket，产出快照列表。
+    pub fn tcp_connection_snapshots(
+        &self,
+        _iface_id: super::device::InterfaceId,
+    ) -> Vec<super::socket::TcpConnSnapshot> {
+        let mut out = Vec::new();
+        for (handle, socket) in self.sockets.iter() {
+            if let smoltcp::socket::Socket::Tcp(tcp_socket) = socket {
+                if self
+                    .meta
+                    .get(&handle)
+                    .map_or(true, |m| m.is_removed() || m.is_orphaned())
+                {
+                    continue;
+                }
+                use smoltcp::socket::tcp::State;
+                if matches!(tcp_socket.state(), State::Listen) {
+                    continue;
+                }
+                let local = tcp_socket
+                    .local_endpoint()
+                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                let remote = tcp_socket
+                    .remote_endpoint()
+                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                if let (Some(local), Some(remote)) = (local, remote) {
+                    out.push(super::socket::TcpConnSnapshot {
+                        local,
+                        remote,
+                        state: tcp_state_to_u8(tcp_socket.state()),
+                        tx_queue: tcp_socket.send_queue(),
+                        rx_queue: tcp_socket.recv_queue(),
+                        inode: self.next_inode(),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// 遍历所有 UDP socket，产出快照列表。
+    pub fn udp_socket_snapshots(
+        &self,
+        _iface_id: super::device::InterfaceId,
+    ) -> Vec<super::socket::UdpSockSnapshot> {
+        let mut out = Vec::new();
+        for (handle, socket) in self.sockets.iter() {
+            if let smoltcp::socket::Socket::Udp(udp_socket) = socket {
+                if self
+                    .meta
+                    .get(&handle)
+                    .map_or(true, |m| m.is_removed() || m.is_orphaned())
+                {
+                    continue;
+                }
+                let listen_ep = udp_socket.endpoint();
+                if let Some(smoltcp_addr) = listen_ep.addr {
+                    let local_addr = match smoltcp_addr {
+                        smoltcp::wire::IpAddress::Ipv4(v4) => {
+                            crate::config::IpAddr::V4(crate::config::Ipv4Addr(v4.octets()))
+                        }
+                        smoltcp::wire::IpAddress::Ipv6(v6) => {
+                            crate::config::IpAddr::V6(crate::config::Ipv6Addr(v6.octets()))
+                        }
+                    };
+                    let local = crate::Endpoint {
+                        addr: local_addr,
+                        port: listen_ep.port,
+                    };
+                    out.push(super::socket::UdpSockSnapshot {
+                        local,
+                        remote: None,
+                        inode: self.next_inode(),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+// ── TCP 状态→Linux 数值映射 ─────────────────────────────────────────────────
+
+fn tcp_state_to_u8(state: smoltcp::socket::tcp::State) -> u8 {
+    use smoltcp::socket::tcp::State;
+    match state {
+        State::Closed => 7,
+        State::Listen => 10,
+        State::SynSent => 2,
+        State::SynReceived => 3,
+        State::Established => 1,
+        State::FinWait1 => 4,
+        State::FinWait2 => 5,
+        State::CloseWait => 8,
+        State::TimeWait => 6, // TCP_TIME_WAIT
+        State::Closing => 11, // TCP_CLOSING
+        State::LastAck => 9,
+    }
+}
+
+fn socket_can_reap_orphan(socket: &smoltcp::socket::Socket<'_>) -> bool {
+    match socket {
+        smoltcp::socket::Socket::Tcp(tcp) => {
+            use smoltcp::socket::tcp::State;
+            // orphan TCP 必须至少推进到最终态再回收，否则 netperf 这类
+            // 依赖 EOF/控制连接结果回传的程序会因为 FIN 丢失而永久等待。
+            matches!(tcp.state(), State::Closed | State::TimeWait)
+        }
+        // 非 TCP 没有四次挥手，fd 释放后可以在下一轮 poll 直接回收。
+        _ => true,
+    }
+}
+
+fn listen_endpoint_matches(actual: IpListenEndpoint, target: IpListenEndpoint) -> bool {
+    if actual.port != target.port {
+        return false;
+    }
+    match (actual.addr, target.addr) {
+        // 监听端点为通配地址时，任意本地地址都属于同一个 listen fd。
+        (None, _) | (_, None) => true,
+        (Some(a), Some(b)) => a == b,
     }
 }
 
@@ -418,16 +683,16 @@ fn ipv6_to_smoltcp(addr: Ipv6Addr) -> Ipv6Address {
 
 fn cidr_to_smoltcp(cidr: &CidrAddress) -> IpCidr {
     match cidr.addr {
-        IpAddr::V4(v4) => {
-            IpCidr::Ipv4(Ipv4Cidr::new(ipv4_to_smoltcp(v4), cidr.prefix_len))
-        }
-        IpAddr::V6(v6) => {
-            IpCidr::Ipv6(Ipv6Cidr::new(ipv6_to_smoltcp(v6), cidr.prefix_len))
-        }
+        IpAddr::V4(v4) => IpCidr::Ipv4(Ipv4Cidr::new(ipv4_to_smoltcp(v4), cidr.prefix_len)),
+        IpAddr::V6(v6) => IpCidr::Ipv6(Ipv6Cidr::new(ipv6_to_smoltcp(v6), cidr.prefix_len)),
     }
 }
 
 fn generate_seed(id: InterfaceId) -> u64 {
     let raw = id.raw() as u64;
     raw.wrapping_mul(6364136223846793005).wrapping_add(1)
+}
+
+fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
+    u32::from_be_bytes(mask.0).leading_ones() as u8
 }

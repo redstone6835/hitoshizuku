@@ -31,6 +31,7 @@ pub mod console;
 pub mod dev;
 pub mod dtb;
 pub mod firmware;
+pub mod ipc;
 pub mod mm;
 pub mod syscall;
 pub mod vfs;

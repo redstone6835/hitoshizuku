@@ -109,7 +109,7 @@ impl WaitStatus {
     }
 
     pub const fn wifexited(self) -> bool {
-        (self.0 & 0x7f) == 0
+        self.0 != 0xffff && (self.0 & 0x7f) == 0
     }
     pub const fn wexitstatus(self) -> i32 {
         (self.0 >> 8) & 0xff

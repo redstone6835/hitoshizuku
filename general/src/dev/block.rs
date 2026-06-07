@@ -18,6 +18,9 @@ use spin::mutex::Mutex;
 
 use crate::dev::bio::{Bio, BioBuffer, BioError, BioOp, BioReqError, BioResult, SubmitError};
 use crate::dev::completion::Completion;
+use crate::dev::control::{
+    BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError, DriverControl,
+};
 
 // ── 重导出 ──────────────────────────────────────────────────────────────────
 pub use crate::dev::bio::{
@@ -122,6 +125,50 @@ impl BlockLimits {
     }
 }
 
+/// 块设备可观测属性。
+///
+/// 这些字段用于 devtmpfs/sysfs/procfs 等兼容视图展示设备能力，不参与底层设备
+/// 身份判定；底层寻址仍由 PnP identity 和 typed device object 完成。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockAttributes {
+    removable: bool,
+    rotational: bool,
+    queue_depth: Option<NonZeroU32>,
+    diskseq: Option<u64>,
+}
+
+impl BlockAttributes {
+    pub const fn new(
+        removable: bool,
+        rotational: bool,
+        queue_depth: Option<NonZeroU32>,
+        diskseq: Option<u64>,
+    ) -> Self {
+        Self {
+            removable,
+            rotational,
+            queue_depth,
+            diskseq,
+        }
+    }
+
+    pub const fn removable(&self) -> bool {
+        self.removable
+    }
+
+    pub const fn rotational(&self) -> bool {
+        self.rotational
+    }
+
+    pub const fn queue_depth(&self) -> Option<NonZeroU32> {
+        self.queue_depth
+    }
+
+    pub const fn diskseq(&self) -> Option<u64> {
+        self.diskseq
+    }
+}
+
 /// 块设备功能标志
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct BlockFeatures(pub u32);
@@ -197,6 +244,7 @@ pub struct BlockDevice {
     class: BlockClass,
     geometry: BlockGeometry,
     limits: BlockLimits,
+    attributes: BlockAttributes,
     features: BlockFeatures,
     driver: Arc<dyn BlockDriver>,
     parent: Option<Arc<BlockDevice>>,
@@ -210,6 +258,7 @@ pub struct BlockDeviceInit<'a> {
     pub class: BlockClass,
     pub geometry: BlockGeometry,
     pub limits: BlockLimits,
+    pub attributes: BlockAttributes,
     pub features: BlockFeatures,
 }
 
@@ -225,6 +274,7 @@ impl BlockDevice {
             class: init.class,
             geometry: init.geometry,
             limits: init.limits,
+            attributes: init.attributes,
             features: init.features,
             driver,
             parent,
@@ -247,6 +297,9 @@ impl BlockDevice {
     }
     pub fn limits(&self) -> &BlockLimits {
         &self.limits
+    }
+    pub fn attributes(&self) -> BlockAttributes {
+        self.attributes
     }
     pub fn features(&self) -> BlockFeatures {
         self.features
@@ -273,6 +326,65 @@ impl BlockDevice {
     /// 推进驱动完成队列。
     pub fn drain(&self) {
         self.driver.drain();
+    }
+
+    /// 执行块设备类 typed control。
+    pub fn control(
+        self: &Arc<Self>,
+        req: BlockControlRequest,
+    ) -> Result<BlockControlResponse, ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+
+        match req {
+            BlockControlRequest::GetReadOnly => Ok(BlockControlResponse::Bool(
+                self.features.contains(BlockFeatures::READ_ONLY),
+            )),
+            BlockControlRequest::GetCapacityBytes => self
+                .geometry
+                .capacity_bytes()
+                .map(BlockControlResponse::U64)
+                .ok_or(ControlError::Invalid),
+            BlockControlRequest::GetLogicalBlockSize => Ok(BlockControlResponse::U32(
+                self.geometry.logical_block_size().get(),
+            )),
+            BlockControlRequest::GetPhysicalBlockSize => Ok(BlockControlResponse::U32(
+                self.geometry.physical_block_size().get(),
+            )),
+            BlockControlRequest::GetIoHints => {
+                let logical = self.geometry.logical_block_size().get();
+                let optimal = self
+                    .limits
+                    .optimal_blocks_per_io()
+                    .map(|blocks| blocks.get().saturating_mul(logical))
+                    .unwrap_or(0);
+                Ok(BlockControlResponse::IoHints(BlockIoHints {
+                    min_io_size: logical,
+                    optimal_io_size: optimal,
+                    alignment_offset: self.limits.buffer_alignment().map(|_| 0).unwrap_or(0),
+                    discard_zeroes: self.features.contains(BlockFeatures::WRITE_ZEROES),
+                    rotational: self.attributes.rotational(),
+                }))
+            }
+            BlockControlRequest::GetDiskSeq => self
+                .attributes
+                .diskseq()
+                .map(BlockControlResponse::U64)
+                .ok_or(ControlError::Unsupported),
+            BlockControlRequest::Flush => {
+                if !self.features.contains(BlockFeatures::FLUSH) {
+                    return Ok(BlockControlResponse::Done);
+                }
+                self.submit_bio_wait(
+                    BioOp::Flush,
+                    BlockRange { lba: 0, blocks: 0 },
+                    BioBuffer::None,
+                )
+                .map_err(map_bio_control_error)?;
+                Ok(BlockControlResponse::Done)
+            }
+        }
     }
 
     /// 尝试将内部 `BlockDriver` 向下转型为具体类型。
@@ -329,7 +441,12 @@ impl BlockDevice {
 
     // ── 参数校验 ──────────────────────────────────────
 
-    fn validate_bio(&self, op: BioOp, range: BlockRange, buffer: &BioBuffer) -> Result<(), BioError> {
+    fn validate_bio(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        buffer: &BioBuffer,
+    ) -> Result<(), BioError> {
         if !self.is_active() {
             return Err(BioError::Submit(SubmitError::DeviceGone));
         }
@@ -337,12 +454,30 @@ impl BlockDevice {
             return Err(BioError::Submit(SubmitError::ReadOnly));
         }
         match op {
-            BioOp::Flush => return Ok(()),
+            BioOp::Flush => {
+                if !self.features.contains(BlockFeatures::FLUSH) {
+                    return Err(BioError::Submit(SubmitError::Unsupported));
+                }
+                // Flush 是设备级缓存同步命令，不携带 LBA 范围和数据缓冲区；
+                // 在这里统一拒绝带范围/缓冲区的请求，避免具体驱动各自猜测语义。
+                if range.blocks != 0 {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )));
+                }
+                if !matches!(buffer, BioBuffer::None) {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )));
+                }
+                return Ok(());
+            }
             BioOp::Discard | BioOp::WriteZeroes => {
                 if op == BioOp::Discard && !self.features.contains(BlockFeatures::DISCARD) {
                     return Err(BioError::Submit(SubmitError::Unsupported));
                 }
-                if op == BioOp::WriteZeroes && !self.features.contains(BlockFeatures::WRITE_ZEROES) {
+                if op == BioOp::WriteZeroes && !self.features.contains(BlockFeatures::WRITE_ZEROES)
+                {
                     return Err(BioError::Submit(SubmitError::Unsupported));
                 }
             }
@@ -350,38 +485,79 @@ impl BlockDevice {
         }
 
         if range.blocks == 0 {
-            return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::EmptyRange)));
+            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                BioReqError::EmptyRange,
+            )));
         }
         if let Some(max) = self.limits.max_blocks_per_io() {
             if range.blocks > max.get() {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::TooLarge)));
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::TooLarge,
+                )));
             }
         }
         if let Some(count) = self.geometry.block_count() {
-            let end = range.lba.checked_add(range.blocks as u64)
-                .ok_or(BioError::Submit(SubmitError::InvalidRequest(BioReqError::OutOfBounds)))?;
+            let end = range
+                .lba
+                .checked_add(range.blocks as u64)
+                .ok_or(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::OutOfBounds,
+                )))?;
             if end > count {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::OutOfBounds)));
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::OutOfBounds,
+                )));
             }
         }
 
         if op.needs_data() {
             let block_size = self.geometry.logical_block_size().get() as usize;
-            let expected = (range.blocks as usize).checked_mul(block_size)
-                .ok_or(BioError::Submit(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch)))?;
+            let expected =
+                (range.blocks as usize)
+                    .checked_mul(block_size)
+                    .ok_or(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )))?;
             if buffer.len() != expected {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch)));
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::BufferSizeMismatch,
+                )));
             }
             if let Some(alignment) = self.limits.buffer_alignment() {
                 let align = alignment.get() as usize;
                 if let BioBuffer::Owned(b) = buffer {
                     if !(b.as_ptr() as usize).is_multiple_of(align) {
-                        return Err(BioError::Submit(SubmitError::InvalidRequest(BioReqError::Misaligned)));
+                        return Err(BioError::Submit(SubmitError::InvalidRequest(
+                            BioReqError::Misaligned,
+                        )));
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+impl DriverControl for Arc<BlockDevice> {
+    type Request = BlockControlRequest;
+    type Response = BlockControlResponse;
+    type Error = ControlError;
+
+    fn control(&self, req: Self::Request) -> Result<Self::Response, Self::Error> {
+        BlockDevice::control(self, req)
+    }
+}
+
+fn map_bio_control_error(err: BioError) -> ControlError {
+    match err {
+        BioError::Submit(SubmitError::DeviceGone) => ControlError::NoDevice,
+        BioError::Submit(SubmitError::QueueFull) => ControlError::Busy,
+        BioError::Submit(SubmitError::ReadOnly) => ControlError::Permission,
+        BioError::Submit(SubmitError::Unsupported) => ControlError::Unsupported,
+        BioError::Submit(SubmitError::OutOfMemory | SubmitError::InvalidRequest(_)) => {
+            ControlError::Invalid
+        }
+        BioError::Io(_) => ControlError::Io,
     }
 }
 
@@ -434,6 +610,9 @@ impl BlockDeviceList {
         if list.iter().any(|d| d.name() == dev.name()) {
             return Err(BlockRegistryError::NameExists);
         }
+        // 设备注册路径不能把 host Vec 扩容失败伪装成驱动成功。
+        list.try_reserve(1)
+            .map_err(|_| BlockRegistryError::OutOfMemory)?;
         list.push(Arc::clone(dev));
         Ok(Arc::clone(dev))
     }

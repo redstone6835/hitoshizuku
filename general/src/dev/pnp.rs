@@ -39,7 +39,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vfs::sync::Spinlock;
 
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{DevNodeSpec, DeviceFunction, FunctionRegistryError};
+use crate::dev::function::{DevNodeSet, DeviceFunction, FunctionRegistryError};
 
 // ── PnP 错误类型 ─────────────────────────────────────────────────────────
 
@@ -211,6 +211,20 @@ pub trait PnpBusInfo: Send + Sync + Any + Debug {
 
 // ── 驱动初始化上下文 ─────────────────────────────────────────────────────
 
+/// 可撤销的 realtime 时钟源声明。
+///
+/// `id` 必须在当前启动期间唯一且非 0，通常可由 MMIO 物理基址派生。安装
+/// hook 接受后，驱动在 remove 时必须用同一个 `id` 调 unregister。安全语义
+/// 上，这只表示“这个 RTC 仍是当前可信来源”；卸载时不回滚已经设置的 realtime
+/// offset，避免拔掉 RTC 后时间倒退，只允许后续替代 RTC 接管来源身份。
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RealtimeClockSource {
+    pub id: usize,
+    pub name: &'static str,
+    pub realtime_ns: u64,
+}
+
 /// 驱动 factory 创建内建驱动实例时需要的启动期能力。
 ///
 /// 该上下文由内核启动路径在注册内建驱动前设置。它只包含内建驱动初始化所需的
@@ -224,6 +238,10 @@ pub struct DevInitContext {
     pub virt_to_phys: fn(usize) -> usize,
     /// 用硬件 RTC 读出的 Unix 纳秒时间更新内核 realtime 时钟。
     pub set_realtime_ns: Option<fn(u64)>,
+    /// 安装一个可撤销 realtime 来源。返回 `true` 表示本来源成为当前 owner。
+    pub install_realtime_source: Option<fn(RealtimeClockSource) -> bool>,
+    /// 注销一个已安装 realtime 来源。只有 owner id 匹配时才应生效。
+    pub unregister_realtime_source: Option<fn(usize)>,
 }
 
 impl DevInitContext {
@@ -235,11 +253,23 @@ impl DevInitContext {
             device_mmio_to_virt,
             virt_to_phys,
             set_realtime_ns: None,
+            install_realtime_source: None,
+            unregister_realtime_source: None,
         }
     }
 
     pub const fn with_realtime_clock(mut self, set_realtime_ns: fn(u64)) -> Self {
         self.set_realtime_ns = Some(set_realtime_ns);
+        self
+    }
+
+    pub const fn with_realtime_source_hooks(
+        mut self,
+        install_realtime_source: fn(RealtimeClockSource) -> bool,
+        unregister_realtime_source: fn(usize),
+    ) -> Self {
+        self.install_realtime_source = Some(install_realtime_source);
+        self.unregister_realtime_source = Some(unregister_realtime_source);
         self
     }
 }
@@ -397,6 +427,24 @@ impl PnpDevice {
         drop(child_inner);
         inner.children.push(Arc::clone(child));
         Ok(())
+    }
+
+    pub fn detach_child(self: &Arc<Self>, child: &Arc<PnpDevice>) {
+        {
+            let mut inner = self.inner.lock();
+            inner
+                .children
+                .retain(|existing| !Arc::ptr_eq(existing, child));
+        }
+        let mut child_inner = child.inner.lock();
+        if child_inner
+            .parent
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|parent| Arc::ptr_eq(&parent, self))
+        {
+            child_inner.parent = None;
+        }
     }
 
     pub fn attach_function(&self, func: Arc<dyn DeviceFunction>) -> Result<(), PnpError> {
@@ -578,18 +626,18 @@ impl PnpDriverRegistry {
 
         match driver.probe(dev) {
             Ok(()) => {
-                dev.inner.lock().bound_driver = Some(driver);
-                dev.transition(PnpState::Probing, PnpState::Bound)?;
+                let mut inner = dev.inner.lock();
+                if inner.state != PnpState::Probing {
+                    drop(inner);
+                    dev.rollback_probe_side_effects();
+                    return Err(PnpError::InvalidState);
+                }
+                inner.bound_driver = Some(driver);
+                inner.state = PnpState::Bound;
                 Ok(())
             }
             Err(err) => {
-                let drained: Vec<Arc<dyn DeviceFunction>> =
-                    dev.inner.lock().functions.drain(..).collect();
-                for func in &drained {
-                    func.mark_gone();
-                    dev.unregister_function_external(func);
-                }
-                let _ = dev.transition(PnpState::Probing, PnpState::Discovered);
+                dev.rollback_probe_side_effects();
                 Err(err)
             }
         }
@@ -724,11 +772,11 @@ impl Default for PnpDeviceList {
 
 /// PnP 与 devtmpfs 之间的最小桥接回调。
 ///
-/// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSpec`] 时，通过这里安装的
+/// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSet`] 时，通过这里安装的
 /// 回调把节点创建委托给 devtmpfs。
 pub struct PnpDevtmpfsCallbacks {
-    pub bind: fn(&DevNodeSpec) -> Result<(), PnpError>,
-    pub unbind: fn(&str) -> Result<(), PnpError>,
+    pub bind: fn(&DevNodeSet) -> Result<(), PnpError>,
+    pub unbind: fn(&DevNodeSet) -> Result<(), PnpError>,
 }
 
 static DEVTMPFS_CB: Spinlock<Option<PnpDevtmpfsCallbacks>> = Spinlock::new(None);
@@ -739,18 +787,18 @@ pub fn set_devtmpfs_callbacks(cb: PnpDevtmpfsCallbacks) {
 }
 
 fn devtmpfs_bind_function(func: &Arc<dyn DeviceFunction>) -> Result<(), PnpError> {
-    let Some(spec) = func.devnode() else {
+    let Some(nodes) = func.devnodes() else {
         return Ok(());
     };
     let guard = DEVTMPFS_CB.lock();
     let cb = guard.as_ref().ok_or(PnpError::NoDevtmpfs)?;
-    (cb.bind)(&spec)
+    (cb.bind)(&nodes)
 }
 
-fn devtmpfs_unbind(dev_name: &str) -> Result<(), PnpError> {
+fn devtmpfs_unbind(nodes: &DevNodeSet) -> Result<(), PnpError> {
     let guard = DEVTMPFS_CB.lock();
     let cb = guard.as_ref().ok_or(PnpError::NoDevtmpfs)?;
-    (cb.unbind)(dev_name)
+    (cb.unbind)(nodes)
 }
 
 // ── 功能注册 helpers ────────────────────────────────────────────────────
@@ -761,29 +809,63 @@ impl PnpDevice {
         self: &Arc<Self>,
         func: Arc<dyn DeviceFunction>,
     ) -> Result<(), PnpError> {
-        DEVICES.register_function(Arc::clone(&func))?;
+        self.attach_function(Arc::clone(&func))?;
 
-        if let Err(e) = devtmpfs_bind_function(&func) {
-            DEVICES.unregister_function(&func);
-            return Err(e);
+        if let Err(e) = DEVICES.register_function(Arc::clone(&func)) {
+            self.detach_function(&func);
+            func.mark_gone();
+            return Err(e.into());
         }
 
-        if let Err(e) = self.attach_function(Arc::clone(&func)) {
-            if let Some(spec) = func.devnode() {
-                let _ = devtmpfs_unbind(spec.name());
+        if let Err(e) = devtmpfs_bind_function(&func) {
+            if e != PnpError::NoDevtmpfs {
+                DEVICES.unregister_function(&func);
+                self.detach_function(&func);
+                func.mark_gone();
+                return Err(e);
             }
-            DEVICES.unregister_function(&func);
-            return Err(e);
+            // devtmpfs 是 POSIX/VFS 投影层；桥接未安装时不能反向阻止底层设备注册。
+            // 启动路径通常会先安装 bridge，热插拔/特殊初始化路径可在之后补建节点。
         }
 
         Ok(())
     }
 
+    fn detach_function(&self, func: &Arc<dyn DeviceFunction>) {
+        let mut inner = self.inner.lock();
+        inner
+            .functions
+            .retain(|existing| !Arc::ptr_eq(existing, func));
+    }
+
     fn unregister_function_external(&self, func: &Arc<dyn DeviceFunction>) {
-        if let Some(spec) = func.devnode() {
-            let _ = devtmpfs_unbind(spec.name());
+        if let Some(nodes) = func.devnodes() {
+            let _ = devtmpfs_unbind(&nodes);
         }
         DEVICES.unregister_function(func);
+    }
+
+    fn rollback_probe_side_effects(self: &Arc<Self>) {
+        let (functions, children) = {
+            let mut inner = self.inner.lock();
+            inner.bound_driver = None;
+            inner.driver_data = None;
+            let functions = core::mem::take(&mut inner.functions);
+            let children = inner.children.clone();
+            if inner.state == PnpState::Probing {
+                inner.state = PnpState::Discovered;
+            }
+            (functions, children)
+        };
+
+        for child in children.iter().rev() {
+            child.remove_device();
+        }
+
+        for func in &functions {
+            func.mark_gone();
+            self.unregister_function_external(func);
+        }
     }
 }
 
@@ -811,7 +893,7 @@ impl PnpDevice {
         }
 
         let current_state = self.state();
-        if current_state != PnpState::Bound && current_state != PnpState::Probing {
+        if current_state == PnpState::Gone || current_state == PnpState::Removing {
             self.removal_lock.store(false, Ordering::Release);
             return;
         }
@@ -857,9 +939,13 @@ impl PnpDevice {
         // 阶段 7/8：标记 Gone 并从全局列表移除
         {
             let mut inner = self.inner.lock();
+            inner.children.clear();
             inner.state = PnpState::Gone;
         }
         PNP_DEVICES.remove(&self.id);
+        if let Some(parent) = self.parent() {
+            parent.detach_child(self);
+        }
     }
 }
 

@@ -2,6 +2,7 @@
 //!
 //! SMP 多核并发安全，无未定义行为。
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -9,7 +10,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use spin::mutex::Mutex;
 
-pub use super::DriverControl;
+pub use super::control::{CharControlRequest, CharControlResponse, ControlError, DriverControl};
 
 // ─────────────────────────── I/O 错误 ────────────────────────────────────
 /// 字符设备 I/O 错误。
@@ -50,6 +51,14 @@ pub trait CharDriver: Send + Sync {
     /// 返回实际读取的字节数。`Ok(0)` 表示当前无可用数据。
     fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError>;
 
+    /// 查询设备底层当前是否有可读数据。
+    ///
+    /// 这是给 `poll(2)`/`select(2)` 的非破坏性快照接口；TTY 行规程仍由
+    /// devtmpfs 负责，驱动只暴露硬件接收 FIFO/软件接收队列是否非空。
+    fn poll_read(&self) -> bool {
+        false
+    }
+
     /// 阻塞等待设备内部写缓冲全部排空。
     ///
     /// 默认实现为空操作（无内部缓冲的设备）。
@@ -63,15 +72,30 @@ pub trait CharDriver: Send + Sync {
     /// 对无内部发送缓冲的设备，默认实现为空操作。
     fn poll_write(&self) {}
 
+    /// 执行字符设备类 typed control。
+    ///
+    /// 默认只把通用 flush 请求接到底层 [`flush`](Self::flush)，其它请求返回
+    /// `Unsupported`。具体驱动可覆盖此方法，把设备类请求转换为自己的
+    /// [`DriverControl`] typed request。
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        match req {
+            CharControlRequest::FlushTx | CharControlRequest::FlushBoth => {
+                // TODO(char-control): `flush()` 只保证驱动已有的 flush 语义，
+                // 不能代表所有字符设备都支持清空 RX 队列。
+                self.flush().map_err(map_char_control_error)?;
+                Ok(CharControlResponse::Done)
+            }
+            _ => Err(ControlError::Unsupported),
+        }
+    }
+
     /// 返回 `self` 的 `&dyn Any` 引用，用于向下转型到具体驱动类型。
     ///
-    /// 这是 `DriverControl` 在通用路径上的"类型恢复桥梁"：
+    /// 类型安全控制路径应优先使用 [`CharDevice::control`]；`as_any` 只作为
+    /// 少数调试或内部恢复具体驱动类型的逃生口。
     ///
     /// ```rust,ignore
-    /// // VFS / ioctl 路径：手持 CharDev，想修改波特率
-    /// if let Some(uart) = dev.downcast_driver::<Uart16550>() {
-    ///     uart.control(UartRequest::SetBaudRate { ... })?;
-    /// }
+    /// let _ = dev.control(CharControlRequest::FlushTx)?;
     /// ```
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
@@ -111,6 +135,86 @@ pub trait CharDriver: Send + Sync {
     }
 }
 
+impl<T: CharDriver + ?Sized> CharDriver for &'static T {
+    fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
+        (**self).write(buf)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
+        (**self).read(buf)
+    }
+
+    fn poll_read(&self) -> bool {
+        (**self).poll_read()
+    }
+
+    fn flush(&self) -> Result<(), CharIoError> {
+        (**self).flush()
+    }
+
+    fn poll_write(&self) {
+        (**self).poll_write();
+    }
+
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        (**self).control(req)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
+    fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
+        (**self).write_all(buf)
+    }
+
+    fn is_tty(&self) -> bool {
+        (**self).is_tty()
+    }
+
+    fn is_console(&self) -> bool {
+        (**self).is_console()
+    }
+}
+
+/// [`CharDevice::new`] 的驱动输入转换 helper。
+#[doc(hidden)]
+pub trait IntoCharDriverArc {
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver>;
+}
+
+impl IntoCharDriverArc for Arc<dyn CharDriver> {
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        self
+    }
+}
+
+impl<T> IntoCharDriverArc for Arc<T>
+where
+    T: CharDriver + 'static,
+{
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        self
+    }
+}
+
+impl<T> IntoCharDriverArc for &'static T
+where
+    T: CharDriver + ?Sized + 'static,
+{
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        Arc::new(self)
+    }
+}
+
+fn map_char_control_error(err: CharIoError) -> ControlError {
+    match err {
+        CharIoError::HardwareError => ControlError::Io,
+        CharIoError::Unavailable => ControlError::NoDevice,
+        CharIoError::Timeout => ControlError::Busy,
+    }
+}
+
 // ─────────────────────────── 字符设备条目 ─────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,8 +225,8 @@ pub enum CharDeviceState {
 }
 
 struct CharDeviceInner {
-    fw_name: &'static str,
-    driver: &'static dyn CharDriver,
+    fw_name: Box<str>,
+    driver: Arc<dyn CharDriver>,
     state: AtomicU8,
 }
 
@@ -138,9 +242,6 @@ pub struct CharDevice {
 
 struct NullCharDriver;
 struct ZeroCharDriver;
-
-static NULL_CHAR_DRIVER: NullCharDriver = NullCharDriver;
-static ZERO_CHAR_DRIVER: ZeroCharDriver = ZeroCharDriver;
 
 impl CharDriver for NullCharDriver {
     fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
@@ -166,6 +267,10 @@ impl CharDriver for ZeroCharDriver {
         Ok(buf.len())
     }
 
+    fn poll_read(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -173,22 +278,26 @@ impl CharDriver for ZeroCharDriver {
 
 impl CharDevice {
     #[inline]
-    pub fn new(fw_name: &'static str, driver: &'static dyn CharDriver) -> Self {
+    pub fn new<N, D>(fw_name: N, driver: D) -> Self
+    where
+        N: Into<Box<str>>,
+        D: IntoCharDriverArc,
+    {
         Self {
             inner: Arc::new(CharDeviceInner {
-                fw_name,
-                driver,
+                fw_name: fw_name.into(),
+                driver: driver.into_char_driver_arc(),
                 state: AtomicU8::new(CharDeviceState::Active as u8),
             }),
         }
     }
 
     pub fn null() -> Self {
-        Self::new("null", &NULL_CHAR_DRIVER)
+        Self::new("null", Arc::new(NullCharDriver))
     }
 
     pub fn zero() -> Self {
-        Self::new("zero", &ZERO_CHAR_DRIVER)
+        Self::new("zero", Arc::new(ZeroCharDriver))
     }
 
     /// 是否具备 TTY 语义（终端）。委托至底层驱动。
@@ -204,8 +313,8 @@ impl CharDevice {
     }
 
     #[inline]
-    pub fn fw_name(&self) -> &'static str {
-        self.inner.fw_name
+    pub fn fw_name(&self) -> &str {
+        self.inner.fw_name.as_ref()
     }
 
     #[inline]
@@ -246,6 +355,12 @@ impl CharDevice {
         self.inner.driver.read(buf)
     }
 
+    /// 查询底层设备当前是否有可读字节（委托至驱动）。
+    #[inline]
+    pub fn poll_read(&self) -> bool {
+        self.is_active() && self.inner.driver.poll_read()
+    }
+
     /// 阻塞排空（委托至驱动）。
     #[inline]
     pub fn flush(&self) -> Result<(), CharIoError> {
@@ -272,15 +387,24 @@ impl CharDevice {
         }
     }
 
+    /// 执行字符设备类 typed control。
+    #[inline]
+    pub fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+        self.inner.driver.control(req)
+    }
+
     /// 尝试将驱动向下转型为具体类型 `T`。
     ///
     /// 成功时返回 `Some(&T)`，类型不匹配时返回 `None`。
-    /// 这是从通用 `CharDev` 恢复 [`DriverControl`] 能力的安全路径。
+    /// 通用 ioctl/VFS 路径不应使用此方法做设备类型分派；它们应调用
+    /// [`CharDevice::control`]。本方法仅保留给少数确实需要具体驱动类型的
+    /// 内核内部路径。
     ///
     /// ```rust,ignore
-    /// if let Some(uart) = dev.downcast_driver::<Uart16550>() {
-    ///     uart.control(UartRequest::SetBaudRate { clock_hz: 100_000_000, baud: 9600 })?;
-    /// }
+    /// assert!(dev.downcast_driver::<MyDebugDriver>().is_none());
     /// ```
     #[inline]
     pub fn downcast_driver<T: 'static>(&self) -> Option<&T> {
@@ -294,7 +418,6 @@ impl CharDevice {
 impl core::fmt::Debug for CharDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CharDev")
-            .field("fw_name", &self.fw_name())
             .field("fw_name", &self.fw_name())
             .field("state", &self.state())
             .finish()

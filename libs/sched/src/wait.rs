@@ -50,6 +50,40 @@ impl WaitQueue {
         waiters.push(Arc::downgrade(task));
     }
 
+    /// 准备进入等待：先把当前任务标成睡眠态，再挂入等待队列。
+    ///
+    /// 调用方必须在 prepare 后重新检查条件；若条件已经满足，应立即
+    /// [`finish_wait`]，不要调度出去。这个协议覆盖"事件发生在首次检查和
+    /// 真正睡眠之间"的窗口。
+    pub fn prepare_to_wait(&self, task: &Arc<Task>, state: TaskState) {
+        debug_assert!(matches!(
+            state,
+            TaskState::Sleeping | TaskState::Uninterruptible
+        ));
+        task.set_state(state);
+        self.enqueue(task);
+    }
+
+    /// 结束等待：从队列移除，并把仍处于睡眠态的任务恢复为可运行态。
+    pub fn finish_wait(&self, task: &Arc<Task>) {
+        self.remove(task);
+        transition_from_wait(task);
+    }
+
+    /// 等到 `condition` 为真。每次真正让出 CPU 前都会在已经登记到队列、
+    /// 且任务处于 Sleeping 状态后重新检查一次条件。
+    pub fn wait_event(&self, task: &Arc<Task>, mut condition: impl FnMut() -> bool) {
+        while !condition() {
+            self.prepare_to_wait(task, TaskState::Sleeping);
+            if condition() {
+                self.finish_wait(task);
+                return;
+            }
+            crate::scheduler::schedule_once(crate::scheduler::now_ns_public());
+            self.finish_wait(task);
+        }
+    }
+
     /// 从队列中显式移除某个任务。常见于被信号打断、提前超时等场景。
     pub fn remove(&self, task: &Arc<Task>) {
         let mut w = self.waiters.lock();
@@ -169,6 +203,21 @@ fn transition_to_runnable(task: &Arc<Task>) {
     if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
         let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
     }
+}
+
+fn transition_from_wait(task: &Arc<Task>) {
+    if crate::scheduler::is_ready() {
+        let current = crate::scheduler::current_task();
+        if Arc::ptr_eq(&current, task) {
+            if !task.cas_state(TaskState::Sleeping, TaskState::Running)
+                && !task.cas_state(TaskState::Uninterruptible, TaskState::Running)
+            {
+                let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
+            }
+            return;
+        }
+    }
+    transition_to_runnable(task);
 }
 
 fn default_wake(task: &Arc<Task>) {

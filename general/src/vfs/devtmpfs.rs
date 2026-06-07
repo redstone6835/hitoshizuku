@@ -10,18 +10,25 @@
 //!   └─ 创建 Inode，InodeOps = DevCharOps { dev }
 //!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //!
-//! bind_block("vda", dev: Arc<BlockDevice>)
+//! bind_block("disk/root", dev: Arc<BlockDevice>)
 //!   └─ 创建 Inode，InodeOps = DevBlockOps { dev: Arc<BlockDevice> }
 //!         └─ open() → 直接访问 dev              // 无查找，直接构造
+//!
+//! bind_symlink("disk/by-name/root", "../root")
+//!   └─ 创建 Symlink Inode，InodeOps = DevSymlinkOps { target: "../root" }
+//!         └─ path lookup → readlink() → 按标准相对链接规则继续解析
 //! ```
 //!
 //! # 文件系统结构
 //!
-//! devtmpfs 只有一层目录（根目录下直接挂设备节点），根目录 inode 维护
+//! devtmpfs 是一棵普通目录树。每个目录 inode 维护本级
 //! `name → Arc<Inode>` 的 `BTreeMap`，作为 `lookup` 和 `readdir` 的数据源。
+//! 设备驱动可以声明主节点、目录化节点或符号链接节点；devtmpfs 不内建任何固定
+//! 设备别名。
 //!
 //! 整个文件系统通过 `mount -t devtmpfs` 挂载到 `/dev`，之后通过
-//! [`DevTmpfsSuperblockOps::bind_char`] / [`DevTmpfsSuperblockOps::bind_block`]
+//! [`DevTmpfsSuperblockOps::bind_char`] / [`DevTmpfsSuperblockOps::bind_block`] /
+//! [`DevTmpfsSuperblockOps::bind_symlink`] / [`DevTmpfsSuperblockOps::bind_node`]
 //! 动态增删节点。
 
 use alloc::boxed::Box;
@@ -47,8 +54,10 @@ use vfs::sync::Spinlock;
 
 use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
-use crate::dev::char::{CharDevice, CharIoError};
-use crate::dev::function::DevNodeSpec;
+use crate::dev::char::{CharControlRequest, CharControlResponse, CharDevice, CharIoError};
+use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError};
+use crate::dev::enumerate::DEVICES;
+use crate::dev::function::{CustomDevNodeSpec, DevNodeSet, DevNodeSpec};
 use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
 use crate::mm::{copy_from_user, copy_to_user};
 
@@ -57,6 +66,73 @@ use crate::mm::{copy_from_user, copy_to_user};
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static PNP_DEVTMPFS_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
+
+const DEVTMPFS_NAME_MAX: usize = 255;
+
+fn devtmpfs_compat_default_dir_mode() -> FileMode {
+    FileMode::new(0o755)
+}
+
+fn devtmpfs_compat_default_symlink_mode() -> FileMode {
+    FileMode::new(0o777)
+}
+
+fn devtmpfs_compat_default_device_mode() -> FileMode {
+    FileMode::new(0o660)
+}
+
+fn devtmpfs_compat_default_uid() -> Uid {
+    Uid::ROOT
+}
+
+fn devtmpfs_compat_default_gid() -> Gid {
+    Gid::ROOT
+}
+
+fn devtmpfs_compat_block_size() -> u32 {
+    512
+}
+
+fn devtmpfs_compat_char_poll_default() -> PollEvents {
+    PollEvents::POLLIN.with(PollEvents::POLLOUT)
+}
+
+fn devtmpfs_compat_max_blocks_per_io() -> u32 {
+    1024
+}
+
+fn validate_devtmpfs_component(name: &str) -> VfsResult<()> {
+    if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+        return Err(VfsError::InvalidArgument);
+    }
+    if name.len() > DEVTMPFS_NAME_MAX {
+        return Err(VfsError::NameTooLong);
+    }
+    Ok(())
+}
+
+fn split_devtmpfs_path(path: &str) -> VfsResult<Vec<&str>> {
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') || path.contains('\0') {
+        return Err(VfsError::InvalidArgument);
+    }
+
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        validate_devtmpfs_component(component)?;
+        components.push(component);
+    }
+    if components.is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    Ok(components)
+}
+
+fn validate_symlink_target(target: &str) -> VfsResult<()> {
+    if target.is_empty() || target.contains('\0') {
+        return Err(VfsError::InvalidArgument);
+    }
+    Ok(())
+}
 
 /// 安装 PnP 到 devtmpfs 的桥接。
 ///
@@ -74,6 +150,12 @@ pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
         bind: pnp_bind_cb,
         unbind: pnp_unbind_cb,
     });
+    for func in DEVICES.functions.list() {
+        if let Some(nodes) = func.devnodes() {
+            // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 安装后补齐 POSIX 节点投影。
+            pnp_bind_cb(&nodes)?;
+        }
+    }
     Ok(())
 }
 
@@ -81,27 +163,25 @@ fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
     PNP_DEVTMPFS_SB.lock().ok_or(PnpError::NoDevtmpfs)
 }
 
-fn pnp_bind_cb(spec: &DevNodeSpec) -> Result<(), PnpError> {
-    let sb = pnp_devtmpfs_sb()?;
-    let ops = sb
-        .downcast_ops::<DevTmpfsSuperblockOps>()
-        .ok_or(PnpError::NoDevtmpfs)?;
-    match spec {
-        DevNodeSpec::Char { name, dev } => ops
-            .bind_char(name.as_ref(), dev.clone())
-            .map_err(|_| PnpError::DevtmpfsError),
-        DevNodeSpec::Block { name, dev } => ops
-            .bind_block(name.as_ref(), Arc::clone(dev))
-            .map_err(|_| PnpError::DevtmpfsError),
-    }
+fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
+    let guard = PNP_DEVTMPFS_SB.lock();
+    guard.as_ref().map(|sb| Arc::clone(*sb))
 }
 
-fn pnp_unbind_cb(name: &str) -> Result<(), PnpError> {
+fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
     let sb = pnp_devtmpfs_sb()?;
     let ops = sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(PnpError::NoDevtmpfs)?;
-    ops.unbind(name).map_err(|_| PnpError::DevtmpfsError)
+    ops.bind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
+}
+
+fn pnp_unbind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
+    let sb = pnp_devtmpfs_sb()?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(PnpError::NoDevtmpfs)?;
+    ops.unbind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
 }
 
 // ───────── 字符设备 FileOps（内联适配器） ─────────
@@ -114,8 +194,8 @@ fn map_char_err(e: CharIoError) -> VfsError {
     }
 }
 
-fn map_char_errno(e: CharIoError) -> Errno {
-    map_char_err(e).to_errno()
+fn map_control_errno(e: ControlError) -> Errno {
+    e.to_errno()
 }
 
 const TCGETS: usize = 0x5401;
@@ -134,7 +214,6 @@ const TIOCOUTQ: usize = 0x5411;
 const TIOCGWINSZ: usize = 0x5413;
 const TIOCSWINSZ: usize = 0x5414;
 const FIONREAD: usize = 0x541b;
-const FIONBIO: usize = 0x5421;
 const TIOCNOTTY: usize = 0x5422;
 const TIOCSETD: usize = 0x5423;
 const TIOCGETD: usize = 0x5424;
@@ -418,6 +497,33 @@ impl CharDevFileOps {
         }
     }
 
+    fn control_done_ignore_unsupported(&self, req: CharControlRequest) -> Result<(), Errno> {
+        match self.dev.control(req) {
+            Ok(CharControlResponse::Done) | Err(ControlError::Unsupported) => Ok(()),
+            Ok(_) => Err(Errno::EINVAL),
+            Err(err) => Err(map_control_errno(err)),
+        }
+    }
+
+    fn control_u32_or_zero(&self, req: CharControlRequest) -> Result<u32, Errno> {
+        match self.dev.control(req) {
+            Ok(CharControlResponse::U32(value)) => Ok(value),
+            Ok(CharControlResponse::Done) => Err(Errno::EINVAL),
+            Err(ControlError::Unsupported) => Ok(0),
+            Err(err) => Err(map_control_errno(err)),
+        }
+    }
+
+    fn sync_termios2_hardware(&self, raw: &[u8; LINUX_TERMIOS2_LEN]) -> Result<(), Errno> {
+        let ospeed = u32::from_le_bytes(raw[40..44].try_into().unwrap());
+        if ospeed == 0 {
+            return Ok(());
+        }
+        self.control_done_ignore_unsupported(CharControlRequest::SetSerialConfig {
+            baud: Some(ospeed),
+        })
+    }
+
     fn write_tty_bytes(&self, buf: &[u8], termios: LinuxTermios) -> VfsResult<()> {
         if buf.is_empty() {
             return Ok(());
@@ -476,9 +582,7 @@ impl CharDevFileOps {
             let mut byte = [0u8; 1];
             let n = self.dev.read(&mut byte).map_err(map_char_err)?;
             if n == 0 {
-                let _ = operation::sched_yield();
-                core::hint::spin_loop();
-                continue;
+                return Err(VfsError::WouldBlock);
             }
 
             let mut ch = byte[0];
@@ -587,8 +691,7 @@ impl CharDevFileOps {
                 if filled != 0 && termios.vtime() == 0 {
                     return Ok(filled);
                 }
-                let _ = operation::sched_yield();
-                core::hint::spin_loop();
+                return Err(VfsError::WouldBlock);
             }
         }
     }
@@ -628,8 +731,30 @@ impl FileOps for CharDevFileOps {
         if !self.dev.is_active() {
             return PollEvents::POLLERR.with(PollEvents::POLLHUP);
         }
-        PollEvents::POLLIN.with(PollEvents::POLLOUT)
+        if self.is_tty() {
+            let line_readable = {
+                let state = self.line_state.lock();
+                state.eof_pending || !state.ready.is_empty()
+            };
+            // 规范模式同样要暴露底层 FIFO 的“有字节可取”状态。阻塞 read()
+            // 在无完整行时会先返回 WouldBlock，再由 syscall 层按 poll() 等待；
+            // 若这里只看行缓冲，UART 字节永远不会被重新拉进行规程，shell 会像
+            // 串口输入失效一样卡住。
+            let dev_readable = self.dev.poll_read();
+            let readable = line_readable || dev_readable;
+            return if readable {
+                PollEvents::POLLIN.with(PollEvents::POLLOUT)
+            } else {
+                PollEvents::POLLOUT
+            };
+        }
+        devtmpfs_compat_char_poll_default()
     }
+
+    fn set_status_flags(&self, flags: OpenOptions) {
+        self.nonblock.store(flags.nonblock, Ordering::Release);
+    }
+
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
@@ -657,7 +782,7 @@ impl FileOps for CharDevFileOps {
                     self.line_state.lock().clear();
                 }
                 if matches!(cmd.raw(), TCSETSW | TCSETSF) {
-                    self.dev.flush().map_err(map_char_errno)?;
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
                 }
                 Ok(0)
             }
@@ -667,11 +792,12 @@ impl FileOps for CharDevFileOps {
                 let mut termios = [0u8; LINUX_TERMIOS_LEN];
                 termios.copy_from_slice(&raw[..LINUX_TERMIOS_LEN]);
                 *self.termios.lock() = LinuxTermios { raw: termios };
+                self.sync_termios2_hardware(&raw)?;
                 if matches!(cmd.raw(), TCSETSF2) {
                     self.line_state.lock().clear();
                 }
                 if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {
-                    self.dev.flush().map_err(map_char_errno)?;
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
                 }
                 Ok(0)
             }
@@ -686,8 +812,14 @@ impl FileOps for CharDevFileOps {
                 *self.winsize.lock() = LinuxWinSize::from_bytes(raw);
                 Ok(0)
             }
-            FIONREAD | TIOCOUTQ => {
-                write_u32_to_user(arg, 0)?;
+            FIONREAD => {
+                let queued = self.control_u32_or_zero(CharControlRequest::GetInputQueueLen)?;
+                write_u32_to_user(arg, queued)?;
+                Ok(0)
+            }
+            TIOCOUTQ => {
+                let queued = self.control_u32_or_zero(CharControlRequest::GetOutputQueueLen)?;
+                write_u32_to_user(arg, queued)?;
                 Ok(0)
             }
             TIOCGPGRP => {
@@ -719,19 +851,16 @@ impl FileOps for CharDevFileOps {
                 }
             }
             TCSBRK | TCSBRKP => {
-                self.dev.flush().map_err(map_char_errno)?;
+                self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
+                self.control_done_ignore_unsupported(CharControlRequest::SendBreak)?;
                 Ok(0)
             }
             TCFLSH => {
                 self.line_state.lock().clear();
+                self.control_done_ignore_unsupported(CharControlRequest::FlushBoth)?;
                 Ok(0)
             }
             TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
-            FIONBIO => {
-                self.nonblock
-                    .store(read_i32_from_user(arg)? != 0, Ordering::Release);
-                Ok(0)
-            }
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -794,6 +923,7 @@ struct DevBlockOps {
 struct BlockDevFileOps {
     dev: Arc<BlockDevice>,
     sync_writes: bool,
+    direct: bool,
 }
 
 fn map_bio_err(err: BioError) -> VfsError {
@@ -815,12 +945,6 @@ fn map_bio_err(err: BioError) -> VfsError {
         },
     }
 }
-
-fn map_block_io_err(err: BioError) -> VfsError {
-    map_bio_err(err)
-}
-
-
 
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
     let mut data = Vec::new();
@@ -857,36 +981,191 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
+fn block_capacity_remaining(dev: &BlockDevice, offset: u64, len: usize) -> usize {
+    let Some(capacity) = dev.geometry().capacity_bytes() else {
+        return len;
+    };
+    if offset >= capacity {
+        return 0;
+    }
+    let remaining = capacity - offset;
+    len.min(remaining as usize)
+}
 
+fn max_blocks_per_io(dev: &BlockDevice) -> u32 {
+    dev.limits()
+        .max_blocks_per_io()
+        .map(|n| n.get())
+        .unwrap_or_else(devtmpfs_compat_max_blocks_per_io)
+        .max(1)
+}
+
+fn block_io_hints(dev: &Arc<BlockDevice>) -> Result<BlockIoHints, Errno> {
+    match dev
+        .control(BlockControlRequest::GetIoHints)
+        .map_err(map_control_errno)?
+    {
+        BlockControlResponse::IoHints(hints) => Ok(hints),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn block_read_exact(dev: &Arc<BlockDevice>, lba: u64, blocks: u32) -> VfsResult<Box<[u8]>> {
+    let block_size = dev.geometry().logical_block_size().get() as usize;
+    let len = (blocks as usize)
+        .checked_mul(block_size)
+        .ok_or(VfsError::InvalidArgument)?;
+    let owned = boxed_zeroed(len)?;
+    let bio = dev
+        .submit_bio_wait(
+            BioOp::Read,
+            BlockRange { lba, blocks },
+            BioBuffer::Owned(owned),
+        )
+        .map_err(map_bio_err)?;
+    match bio.buffer {
+        BioBuffer::Owned(buf) => Ok(buf),
+        BioBuffer::None => Err(VfsError::Io),
+    }
+}
+
+fn block_write_exact(dev: &Arc<BlockDevice>, lba: u64, data: Box<[u8]>) -> VfsResult<()> {
+    let block_size = dev.geometry().logical_block_size().get() as usize;
+    if data.len() == 0 || !data.len().is_multiple_of(block_size) {
+        return Err(VfsError::InvalidArgument);
+    }
+    let blocks = u32::try_from(data.len() / block_size).map_err(|_| VfsError::InvalidArgument)?;
+    dev.submit_bio_wait(
+        BioOp::Write,
+        BlockRange { lba, blocks },
+        BioBuffer::Owned(data),
+    )
+    .map_err(map_bio_err)?;
+    Ok(())
+}
+
+fn flush_if_supported(dev: &Arc<BlockDevice>) -> VfsResult<()> {
+    if !dev.features().contains(BlockFeatures::FLUSH) {
+        return Ok(());
+    }
+    dev.submit_bio_wait(
+        BioOp::Flush,
+        BlockRange { lba: 0, blocks: 0 },
+        BioBuffer::None,
+    )
+    .map_err(map_bio_err)?;
+    Ok(())
+}
 
 impl FileOps for BlockDevFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
+        let len = block_capacity_remaining(&self.dev, offset, buf.len());
+        if len == 0 {
             return Ok(0);
-        };
-        let owned = boxed_zeroed(buf.len())?;
-        let bio = self
-            .dev
-            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
-            .map_err(map_bio_err)?;
-        buf.copy_from_slice(bio.buffer.as_slice());
-        Ok(buf.len())
+        }
+        let block_size = self.dev.geometry().logical_block_size().get() as usize;
+        let mut done = 0usize;
+
+        if self.direct {
+            let Some(range) = block_range_for_io(&self.dev, offset, len)? else {
+                return Ok(0);
+            };
+            let mut lba = range.lba;
+            let mut remaining_blocks = range.blocks as usize;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let data = block_read_exact(&self.dev, lba, blocks)?;
+                let bytes = data.len();
+                buf[done..done + bytes].copy_from_slice(&data);
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+            return Ok(done);
+        }
+
+        if offset.is_multiple_of(block_size as u64) && len.is_multiple_of(block_size) {
+            let mut lba = offset / block_size as u64;
+            let mut remaining_blocks = len / block_size;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let data = block_read_exact(&self.dev, lba, blocks)?;
+                let bytes = data.len();
+                buf[done..done + bytes].copy_from_slice(&data);
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+            return Ok(done);
+        }
+
+        while done < len {
+            let abs = offset.saturating_add(done as u64);
+            let lba = abs / block_size as u64;
+            let in_block = (abs % block_size as u64) as usize;
+            let take = (block_size - in_block).min(len - done);
+            let data = block_read_exact(&self.dev, lba, 1)?;
+            buf[done..done + take].copy_from_slice(&data[in_block..in_block + take]);
+            done += take;
+        }
+        Ok(done)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        let Some(range) = block_range_for_io(&self.dev, offset, buf.len())? else {
+        let len = block_capacity_remaining(&self.dev, offset, buf.len());
+        if len == 0 {
             return Ok(0);
-        };
-        let owned = boxed_copy(buf)?;
-        self.dev
-            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
-            .map_err(map_bio_err)?;
-        if self.sync_writes {
-            self.dev
-                .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
-                .map_err(map_bio_err)?;
         }
-        Ok(buf.len())
+        let block_size = self.dev.geometry().logical_block_size().get() as usize;
+        let mut done = 0usize;
+
+        if self.direct {
+            let Some(range) = block_range_for_io(&self.dev, offset, len)? else {
+                return Ok(0);
+            };
+            let mut lba = range.lba;
+            let mut remaining_blocks = range.blocks as usize;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let bytes = blocks as usize * block_size;
+                let owned = boxed_copy(&buf[done..done + bytes])?;
+                block_write_exact(&self.dev, lba, owned)?;
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+        } else if offset.is_multiple_of(block_size as u64) && len.is_multiple_of(block_size) {
+            let mut lba = offset / block_size as u64;
+            let mut remaining_blocks = len / block_size;
+            let max_blocks = max_blocks_per_io(&self.dev) as usize;
+            while remaining_blocks != 0 {
+                let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
+                let bytes = blocks as usize * block_size;
+                let owned = boxed_copy(&buf[done..done + bytes])?;
+                block_write_exact(&self.dev, lba, owned)?;
+                done += bytes;
+                lba += blocks as u64;
+                remaining_blocks -= blocks as usize;
+            }
+        } else {
+            while done < len {
+                let abs = offset.saturating_add(done as u64);
+                let lba = abs / block_size as u64;
+                let in_block = (abs % block_size as u64) as usize;
+                let take = (block_size - in_block).min(len - done);
+                let mut data = block_read_exact(&self.dev, lba, 1)?;
+                data[in_block..in_block + take].copy_from_slice(&buf[done..done + take]);
+                block_write_exact(&self.dev, lba, data)?;
+                done += take;
+            }
+        }
+        if self.sync_writes {
+            flush_if_supported(&self.dev)?;
+        }
+        Ok(done)
     }
 
     fn readdir(
@@ -901,9 +1180,7 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
-        self.dev
-            .submit_bio_wait(BioOp::Flush, BlockRange { lba: 0, blocks: 0 }, BioBuffer::None)
-            .map_err(map_bio_err)?;
+        flush_if_supported(&self.dev)?;
         Ok(())
     }
 
@@ -919,71 +1196,121 @@ impl FileOps for BlockDevFileOps {
             return Err(Errno::ENODEV);
         }
 
-        let geometry = self.dev.geometry();
         match cmd.raw() {
             BLKROGET => {
-                let readonly = if self.dev.features().contains(BlockFeatures::READ_ONLY) {
-                    1
-                } else {
-                    0
+                let readonly = match self
+                    .dev
+                    .control(BlockControlRequest::GetReadOnly)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::Bool(value) => i32::from(value),
+                    _ => return Err(Errno::EINVAL),
                 };
                 write_i32_to_user(arg, readonly)?;
                 Ok(0)
             }
             BLKGETSIZE => {
-                let bytes = geometry.capacity_bytes().ok_or(Errno::EINVAL)?;
+                let bytes = match self
+                    .dev
+                    .control(BlockControlRequest::GetCapacityBytes)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::U64(value) => value,
+                    _ => return Err(Errno::EINVAL),
+                };
                 let sectors = usize::try_from(bytes / 512).map_err(|_| Errno::EINVAL)?;
                 write_usize_to_user(arg, sectors)?;
                 Ok(0)
             }
             BLKGETSIZE64 => {
-                let bytes = geometry.capacity_bytes().ok_or(Errno::EINVAL)?;
+                let bytes = match self
+                    .dev
+                    .control(BlockControlRequest::GetCapacityBytes)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::U64(value) => value,
+                    _ => return Err(Errno::EINVAL),
+                };
                 write_u64_to_user(arg, bytes)?;
                 Ok(0)
             }
             BLKSSZGET => {
-                write_u32_to_user(arg, geometry.logical_block_size().get())?;
+                let block_size = match self
+                    .dev
+                    .control(BlockControlRequest::GetLogicalBlockSize)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::U32(value) => value,
+                    _ => return Err(Errno::EINVAL),
+                };
+                write_u32_to_user(arg, block_size)?;
                 Ok(0)
             }
             BLKBSZGET => {
-                write_usize_to_user(arg, geometry.logical_block_size().get() as usize)?;
+                let block_size = match self
+                    .dev
+                    .control(BlockControlRequest::GetLogicalBlockSize)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::U32(value) => value,
+                    _ => return Err(Errno::EINVAL),
+                };
+                write_usize_to_user(arg, block_size as usize)?;
                 Ok(0)
             }
             BLKPBSZGET => {
-                write_u32_to_user(arg, geometry.physical_block_size().get())?;
+                let block_size = match self
+                    .dev
+                    .control(BlockControlRequest::GetPhysicalBlockSize)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::U32(value) => value,
+                    _ => return Err(Errno::EINVAL),
+                };
+                write_u32_to_user(arg, block_size)?;
                 Ok(0)
             }
             BLKIOMIN => {
-                write_u32_to_user(arg, geometry.logical_block_size().get())?;
+                let hints = block_io_hints(&self.dev)?;
+                write_u32_to_user(arg, hints.min_io_size)?;
                 Ok(0)
             }
             BLKIOOPT => {
-                let optimal = self
-                    .dev
-                    .limits()
-                    .optimal_blocks_per_io()
-                    .map(|blocks| {
-                        blocks
-                            .get()
-                            .saturating_mul(geometry.logical_block_size().get())
-                    })
-                    .unwrap_or(0);
-                write_u32_to_user(arg, optimal)?;
+                let hints = block_io_hints(&self.dev)?;
+                write_u32_to_user(arg, hints.optimal_io_size)?;
                 Ok(0)
             }
-            BLKALIGNOFF | BLKDISCARDZEROES | BLKROTATIONAL => {
-                write_i32_to_user(arg, 0)?;
+            BLKALIGNOFF => {
+                let hints = block_io_hints(&self.dev)?;
+                write_i32_to_user(arg, hints.alignment_offset)?;
+                Ok(0)
+            }
+            BLKDISCARDZEROES => {
+                let hints = block_io_hints(&self.dev)?;
+                write_i32_to_user(arg, i32::from(hints.discard_zeroes))?;
+                Ok(0)
+            }
+            BLKROTATIONAL => {
+                let hints = block_io_hints(&self.dev)?;
+                write_i32_to_user(arg, i32::from(hints.rotational))?;
                 Ok(0)
             }
             BLKGETDISKSEQ => {
-                write_u64_to_user(arg, 0)?;
+                let diskseq = match self
+                    .dev
+                    .control(BlockControlRequest::GetDiskSeq)
+                    .map_err(map_control_errno)?
+                {
+                    BlockControlResponse::U64(value) => value,
+                    _ => return Err(Errno::EINVAL),
+                };
+                write_u64_to_user(arg, diskseq)?;
                 Ok(0)
             }
             BLKFLSBUF => {
-                match self.sync() {
-                    Ok(()) | Err(VfsError::NotSupported) => {}
-                    Err(err) => return Err(err.to_errno()),
-                }
+                self.dev
+                    .control(BlockControlRequest::Flush)
+                    .map_err(map_control_errno)?;
                 Ok(0)
             }
             _ => Err(Errno::ENOTTY),
@@ -1014,6 +1341,7 @@ impl InodeOps for DevBlockOps {
         Ok(Box::new(BlockDevFileOps {
             dev: Arc::clone(&self.dev),
             sync_writes: opts.sync,
+            direct: opts.direct,
         }))
     }
 
@@ -1022,17 +1350,65 @@ impl InodeOps for DevBlockOps {
     }
 }
 
-// ───────── 根目录 InodeOps ─────────
-
-/// devtmpfs 根目录（`/dev`）的操作对象。
+/// 从 devtmpfs 块设备 inode 中恢复底层块设备对象。
 ///
-/// 维护 `user_name → Arc<Inode>` 映射，支持 `lookup` 和 `readdir`。
-/// 设备节点的增删通过 [`DevTmpfsSuperblockOps`] 对外暴露。
-pub struct DevRootOps {
+/// 这是给 blockfs 挂载源解析使用的窄接口：调用方仍然通过 VFS 解析路径和符号链接，
+/// 只有最终确认 inode 属于 devtmpfs 块设备节点后，才取出其内联保存的设备对象。
+pub fn block_device_from_inode(inode: &Inode) -> Option<Arc<BlockDevice>> {
+    if inode.kind() != FileType::BlockDevice {
+        return None;
+    }
+    let ops = inode.downcast_ops::<DevBlockOps>()?;
+    let dev = Arc::clone(&ops.dev);
+    dev.is_active().then_some(dev)
+}
+
+// ───────── 符号链接 InodeOps ─────────
+
+/// devtmpfs 符号链接节点的操作对象。
+///
+/// 只保存链接目标文本。相对目标由 VFS path walker 按“链接所在目录”继续解析。
+struct DevSymlinkOps {
+    target: String,
+}
+
+impl InodeOps for DevSymlinkOps {
+    fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn readlink(&self, inode: &Inode) -> VfsResult<String> {
+        if inode.kind() != FileType::Symlink {
+            return Err(VfsError::InvalidArgument);
+        }
+        Ok(self.target.clone())
+    }
+
+    fn open(
+        &self,
+        _inode: &Inode,
+        _opts: &OpenOptions,
+        _cred: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+// ───────── 目录 InodeOps ─────────
+
+/// devtmpfs 目录操作对象。
+///
+/// 每个目录只维护本级 `name → Arc<Inode>` 映射。设备节点的批量增删通过
+/// [`DevTmpfsSuperblockOps`] 对外暴露，普通符号链接和目录创建也走 VFS 标准入口。
+pub struct DevDirOps {
     pub(crate) children: Spinlock<BTreeMap<String, Arc<Inode>>>,
 }
 
-impl DevRootOps {
+impl DevDirOps {
     fn new() -> Self {
         Self {
             children: Spinlock::new(BTreeMap::new()),
@@ -1049,13 +1425,132 @@ impl DevRootOps {
     }
 }
 
-impl InodeOps for DevRootOps {
+impl InodeOps for DevDirOps {
     fn lookup(&self, _inode: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         self.children
             .lock()
             .get(name)
             .cloned()
             .ok_or(VfsError::NotFound)
+    }
+
+    fn mkdir(
+        &self,
+        dir: &Inode,
+        name: &str,
+        mode: FileMode,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        validate_devtmpfs_component(name)?;
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let inode = sb_ops.new_dir_inode(mode, cred.euid, cred.egid)?;
+
+        let mut children = self.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(String::from(name), Arc::clone(&inode));
+        drop(children);
+
+        dir.inc_nlink();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        Ok(inode)
+    }
+
+    fn symlink(
+        &self,
+        dir: &Inode,
+        name: &str,
+        target: &str,
+        cred: &Credentials,
+    ) -> VfsResult<Arc<Inode>> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        validate_devtmpfs_component(name)?;
+        validate_symlink_target(target)?;
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        let sb_ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        let inode = sb_ops.new_symlink_inode(target, cred.euid, cred.egid)?;
+
+        let mut children = self.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(String::from(name), Arc::clone(&inode));
+        drop(children);
+
+        dir.touch_mtime();
+        dir.touch_ctime();
+        Ok(inode)
+    }
+
+    fn rmdir(&self, dir: &Inode, name: &str, child: &Inode) -> VfsResult<()> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        if child.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+
+        let child_ops = child
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        if !child_ops.children.lock().is_empty() {
+            return Err(VfsError::DirectoryNotEmpty);
+        }
+
+        let mut children = self.children.lock();
+        let existing = children.get(name).ok_or(VfsError::NotFound)?;
+        if existing.fs_id() != child.fs_id() || existing.ino() != child.ino() {
+            return Err(VfsError::NotFound);
+        }
+        let removed = children.remove(name).ok_or(VfsError::NotFound)?;
+        drop(children);
+
+        dir.dec_nlink();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        removed.set_nlink(0);
+        removed.touch_ctime();
+        Ok(())
+    }
+
+    fn unlink(&self, dir: &Inode, name: &str, child: &Inode) -> VfsResult<()> {
+        if dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        if child.kind() == FileType::Directory {
+            return Err(VfsError::IsADirectory);
+        }
+        if child.kind() != FileType::Symlink {
+            return Err(VfsError::OperationNotPermitted);
+        }
+
+        let mut children = self.children.lock();
+        let existing = children.get(name).ok_or(VfsError::NotFound)?;
+        if existing.fs_id() != child.fs_id() || existing.ino() != child.ino() {
+            return Err(VfsError::NotFound);
+        }
+        let removed = children.remove(name).ok_or(VfsError::NotFound)?;
+        drop(children);
+
+        dir.touch_mtime();
+        dir.touch_ctime();
+        removed.set_nlink(0);
+        removed.touch_ctime();
+        Ok(())
     }
 
     fn open(
@@ -1131,12 +1626,10 @@ impl FileOps for DevRootFile {
 
 /// devtmpfs 超级块操作对象。
 ///
-/// 同时提供公开的 `bind_char` / `bind_block` / `unbind` API，
-/// 让设备驱动在设备注册/注销时同步更新 `/dev` 下的节点。
+/// 同时提供公开的 `bind_char` / `bind_block` / `bind_symlink` / `unbind` API，
+/// 让设备驱动或兼容层在设备注册/注销时同步更新 `/dev` 下的节点。
 pub struct DevTmpfsSuperblockOps {
     next_ino: AtomicU64,
-    /// 指向根目录 ops 的引用，用于 bind/unbind 时修改 children 表
-    root_ops: Arc<DevRootOps>,
     /// 超级块弱引用，创建 Inode 时需要
     sb: vfs::sync::Spinlock<Option<alloc::sync::Weak<Superblock>>>,
 }
@@ -1154,24 +1647,310 @@ impl DevTmpfsSuperblockOps {
         self.sb.lock().clone()
     }
 
-    /// 将字符设备绑定到 `/dev/<user_name>`。
-    ///
-    /// - `user_name`：用户空间可见的节点名称（如 `"uart0"`）
-    /// - `dev`：已注册的字符设备对象（直接存入 inode，不再保存名称）
-    pub fn bind_char(&self, user_name: &str, dev: CharDevice) -> VfsResult<()> {
-        if !dev.is_active() {
-            return Err(VfsError::NoDevice);
+    fn root_inode(&self) -> VfsResult<Arc<Inode>> {
+        self.sb
+            .lock()
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+            .map(|sb| Arc::clone(&sb.root_inode))
+            .ok_or(VfsError::InvalidArgument)
+    }
+
+    fn invalidate_path_dcache(&self, path: &str) {
+        let Some(sb) = self.sb.lock().as_ref().and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+
+        let mut parent = Arc::clone(&sb.root_dentry);
+        let mut components = path.split('/').peekable();
+        while let Some(component) = components.next() {
+            let Some(dentry) = vfs::DCACHE.get(&parent, component) else {
+                return;
+            };
+            if components.peek().is_none() {
+                vfs::DCACHE.invalidate_dentry(&dentry);
+                dentry.invalidate();
+                return;
+            }
+            if !dentry.is_positive() {
+                return;
+            }
+            parent = dentry;
         }
+    }
+
+    fn new_dir_inode(&self, mode: FileMode, uid: Uid, gid: Gid) -> VfsResult<Arc<Inode>> {
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
+            nlink: 2,
+            mode,
+            uid,
+            gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            FileType::Directory,
+            DevId::new(0, 0),
+            devtmpfs_compat_block_size(),
+            None,
+            meta,
+            Arc::new(DevDirOps::new()),
+            sb_weak,
+        ))
+    }
+
+    fn new_symlink_inode(&self, target: &str, uid: Uid, gid: Gid) -> VfsResult<Arc<Inode>> {
+        validate_symlink_target(target)?;
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: target.len() as u64,
             nlink: 1,
-            mode: FileMode::new(0o660),
-            uid: Uid::ROOT,
-            gid: Gid::ROOT,
+            mode: devtmpfs_compat_default_symlink_mode(),
+            uid,
+            gid,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: 0,
+        };
+
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            FileType::Symlink,
+            DevId::new(0, 0),
+            devtmpfs_compat_block_size(),
+            None,
+            meta,
+            Arc::new(DevSymlinkOps {
+                target: String::from(target),
+            }),
+            sb_weak,
+        ))
+    }
+
+    fn new_custom_inode(&self, spec: &CustomDevNodeSpec) -> VfsResult<Arc<Inode>> {
+        split_devtmpfs_path(spec.name())?;
+        if spec.block_size() == 0 || spec.nlink() == 0 {
+            return Err(VfsError::InvalidArgument);
+        }
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: spec.size(),
+            nlink: spec.nlink(),
+            mode: spec.mode(),
+            uid: spec.uid(),
+            gid: spec.gid(),
+            atime: now,
+            mtime: now,
+            ctime: now,
+            blocks: spec.blocks(),
+        };
+
+        Ok(Inode::new(
+            InodeId {
+                fs_id,
+                ino: self.alloc_ino(),
+            },
+            spec.kind(),
+            spec.rdev(),
+            spec.block_size(),
+            None,
+            meta,
+            spec.ops(),
+            sb_weak,
+        ))
+    }
+
+    fn ensure_parent_dir(&self, components: &[&str]) -> VfsResult<Arc<Inode>> {
+        let mut dir_inode = self.root_inode()?;
+        let mut current_path = String::new();
+
+        for component in &components[..components.len().saturating_sub(1)] {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(component);
+
+            let dir_ops = dir_inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::NotADirectory)?;
+            let mut created = false;
+            let next = {
+                let mut children = dir_ops.children.lock();
+                if let Some(existing) = children.get(*component).cloned() {
+                    existing
+                } else {
+                    let child = self.new_dir_inode(
+                        devtmpfs_compat_default_dir_mode(),
+                        devtmpfs_compat_default_uid(),
+                        devtmpfs_compat_default_gid(),
+                    )?;
+                    children.insert(String::from(*component), Arc::clone(&child));
+                    created = true;
+                    child
+                }
+            };
+
+            if next.kind() != FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            if created {
+                dir_inode.inc_nlink();
+                dir_inode.touch_mtime();
+                dir_inode.touch_ctime();
+                self.invalidate_path_dcache(&current_path);
+            }
+            dir_inode = next;
+        }
+
+        Ok(dir_inode)
+    }
+
+    fn lookup_parent_dir(&self, components: &[&str]) -> VfsResult<Arc<Inode>> {
+        let mut dir_inode = self.root_inode()?;
+        for component in &components[..components.len().saturating_sub(1)] {
+            let dir_ops = dir_inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::NotADirectory)?;
+            let next = dir_ops
+                .children
+                .lock()
+                .get(*component)
+                .cloned()
+                .ok_or(VfsError::NotFound)?;
+            if next.kind() != FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            dir_inode = next;
+        }
+        Ok(dir_inode)
+    }
+
+    fn insert_node_at(&self, path: &str, inode: Arc<Inode>) -> VfsResult<()> {
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = self.ensure_parent_dir(&components)?;
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+
+        let mut children = parent_ops.children.lock();
+        if children.contains_key(name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        children.insert(String::from(name), inode);
+        drop(children);
+
+        parent.touch_mtime();
+        parent.touch_ctime();
+        self.invalidate_path_dcache(path);
+        Ok(())
+    }
+
+    fn remove_node_at(&self, path: &str) -> VfsResult<Arc<Inode>> {
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = self.lookup_parent_dir(&components)?;
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+
+        let mut children = parent_ops.children.lock();
+        let inode = children.remove(name).ok_or(VfsError::NotFound)?;
+        drop(children);
+
+        if inode.kind() == FileType::Directory {
+            let dir_ops = inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::InvalidArgument)?;
+            if !dir_ops.children.lock().is_empty() {
+                let mut children = parent_ops.children.lock();
+                children.insert(String::from(name), Arc::clone(&inode));
+                return Err(VfsError::DirectoryNotEmpty);
+            }
+            parent.dec_nlink();
+        }
+
+        parent.touch_mtime();
+        parent.touch_ctime();
+        inode.set_nlink(0);
+        inode.touch_ctime();
+        if let Some(sb) = inode.superblock() {
+            sb.remove_inode(inode.ino());
+        }
+        self.invalidate_path_dcache(path);
+        Ok(inode)
+    }
+
+    fn lookup_node_at(&self, path: &str) -> VfsResult<Arc<Inode>> {
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = self.lookup_parent_dir(&components)?;
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+        parent_ops
+            .children
+            .lock()
+            .get(name)
+            .cloned()
+            .ok_or(VfsError::NotFound)
+    }
+
+    /// 将字符设备绑定到 devtmpfs 相对路径。
+    ///
+    /// - `user_name`：用户空间可见的相对路径（如 `"console"` 或 `"tty/serial0"`）
+    /// - `dev`：已注册的字符设备对象（直接存入 inode，不再保存名称）
+    pub fn bind_char(&self, user_name: &str, dev: CharDevice) -> VfsResult<()> {
+        split_devtmpfs_path(user_name)?;
+        if !dev.is_active() {
+            return Err(VfsError::NoDevice);
+        }
+        if self.lookup_node_at(user_name).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
+        let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
+        let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let rdev = super::device_numbers::register_char(user_name, dev.fw_name())
+            .ok_or(VfsError::NoSpace)?;
+
+        let now = Timespec::now();
+        let meta = InodeMeta {
+            size: 0,
+            nlink: 1,
+            mode: devtmpfs_compat_default_device_mode(),
+            uid: devtmpfs_compat_default_uid(),
+            gid: devtmpfs_compat_default_gid(),
             atime: now,
             mtime: now,
             ctime: now,
@@ -1185,40 +1964,45 @@ impl DevTmpfsSuperblockOps {
                 ino: self.alloc_ino(),
             },
             FileType::CharDevice,
-            DevId::new(0, 0),
-            512,
+            rdev,
+            devtmpfs_compat_block_size(),
             None,
             meta,
             ops,
             sb_weak,
         );
 
-        let mut children = self.root_ops.children.lock();
-        if children.contains_key(user_name) {
-            return Err(VfsError::AlreadyExists);
+        if let Err(err) = self.insert_node_at(user_name, inode) {
+            super::device_numbers::unregister_node(user_name);
+            return Err(err);
         }
-        children.insert(String::from(user_name), inode);
         Ok(())
     }
 
-    /// 将块设备绑定到 `/dev/<user_name>`。
+    /// 将块设备绑定到 devtmpfs 相对路径。
     ///
-    /// - `user_name`：用户空间可见的节点名称（如 `"vda"`）
+    /// - `user_name`：用户空间可见的相对路径（如 `"block/root"`）
     /// - `dev`：已注册的块设备对象（`Arc` 直接存入 inode）
     pub fn bind_block(&self, user_name: &str, dev: Arc<BlockDevice>) -> VfsResult<()> {
+        split_devtmpfs_path(user_name)?;
         if !dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        if self.lookup_node_at(user_name).is_ok() {
+            return Err(VfsError::AlreadyExists);
+        }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let rdev = super::device_numbers::register_block(user_name, dev.name())
+            .ok_or(VfsError::NoSpace)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: FileMode::new(0o660),
-            uid: Uid::ROOT,
-            gid: Gid::ROOT,
+            mode: devtmpfs_compat_default_device_mode(),
+            uid: devtmpfs_compat_default_uid(),
+            gid: devtmpfs_compat_default_gid(),
             atime: now,
             mtime: now,
             ctime: now,
@@ -1232,55 +2016,112 @@ impl DevTmpfsSuperblockOps {
                 ino: self.alloc_ino(),
             },
             FileType::BlockDevice,
-            DevId::new(0, 0),
-            512,
+            rdev,
+            devtmpfs_compat_block_size(),
             None,
             meta,
             ops,
             sb_weak,
         );
 
-        let mut children = self.root_ops.children.lock();
-        if children.contains_key(user_name) {
+        if let Err(err) = self.insert_node_at(user_name, inode) {
+            super::device_numbers::unregister_node(user_name);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// 在 devtmpfs 相对路径上创建一个符号链接节点。
+    ///
+    /// `target` 按标准符号链接文本保存，不在创建时验证目标是否存在。相对目标会按
+    /// VFS path walker 的规则以链接所在目录为基准继续解析。
+    pub fn bind_symlink(&self, user_name: &str, target: &str) -> VfsResult<()> {
+        split_devtmpfs_path(user_name)?;
+        let inode = self.new_symlink_inode(
+            target,
+            devtmpfs_compat_default_uid(),
+            devtmpfs_compat_default_gid(),
+        )?;
+        self.insert_node_at(user_name, inode)
+    }
+
+    /// 绑定一个自定义 devtmpfs 节点。
+    ///
+    /// 自定义节点用于未来 LKM 或新设备类别直接提供自己的 `InodeOps`，devtmpfs
+    /// 不需要知道该节点背后的设备类型。无法完整实现的设备语义应在对应 `InodeOps`
+    /// 或 `FileOps` 内部标记 TODO，而不是在 devtmpfs 中增加临时类型分支。
+    pub fn bind_custom(&self, spec: &CustomDevNodeSpec) -> VfsResult<()> {
+        split_devtmpfs_path(spec.name())?;
+        if self.lookup_node_at(spec.name()).is_ok() {
             return Err(VfsError::AlreadyExists);
         }
-        children.insert(String::from(user_name), inode);
+        let inode = self.new_custom_inode(spec)?;
+        self.insert_node_at(spec.name(), inode)
+    }
+
+    /// 绑定一个通用 devtmpfs 节点规格。
+    pub fn bind_node(&self, node: &DevNodeSpec) -> VfsResult<()> {
+        match node {
+            DevNodeSpec::Char { name, dev } => self.bind_char(name, dev.clone()),
+            DevNodeSpec::Block { name, dev } => self.bind_block(name, Arc::clone(dev)),
+            DevNodeSpec::Symlink { name, target } => self.bind_symlink(name, target),
+            DevNodeSpec::Custom(spec) => self.bind_custom(spec),
+        }
+    }
+
+    /// 批量绑定一个 function 声明的 devtmpfs 节点集合。
+    ///
+    /// 任一节点创建失败时，已经创建的节点会按逆序回滚。这样 PnP 注册要么完整暴露
+    /// 一个 function 的全部节点，要么不留下半完成名字空间状态。
+    pub fn bind_nodes(&self, nodes: &DevNodeSet) -> VfsResult<()> {
+        let mut bound: Vec<&str> = Vec::new();
+        for node in nodes.nodes() {
+            if let Err(err) = self.bind_node(node) {
+                for name in bound.iter().rev() {
+                    let _ = self.unbind(name);
+                }
+                return Err(err);
+            }
+            bound.push(node.name());
+        }
         Ok(())
     }
 
-    /// 解除设备绑定，删除 `/dev/<user_name>` 节点。
+    /// 解除设备绑定，删除 devtmpfs 中的相对路径节点。
     pub fn unbind(&self, user_name: &str) -> VfsResult<()> {
-        let inode = self
-            .root_ops
-            .children
-            .lock()
-            .remove(user_name)
-            .ok_or(VfsError::NotFound)?;
+        self.remove_node_at(user_name)?;
+        super::device_numbers::unregister_node(user_name);
+        Ok(())
+    }
 
-        if let Some(ops) = inode.downcast_ops::<DevCharOps>() {
-            ops.dev.mark_gone();
-        }
-        if let Some(ops) = inode.downcast_ops::<DevBlockOps>() {
-            ops.dev.mark_gone();
-        }
-        inode.set_nlink(0);
-        inode.touch_ctime();
-        if let Some(sb) = inode.superblock() {
-            sb.remove_inode(inode.ino());
-            if let Some(dentry) = vfs::DCACHE.get(&sb.root_dentry, user_name) {
-                vfs::DCACHE.invalidate_dentry(&dentry);
-                dentry.invalidate();
+    /// 批量解绑一个 function 声明的 devtmpfs 节点集合。
+    pub fn unbind_nodes(&self, nodes: &DevNodeSet) -> VfsResult<()> {
+        let mut last_error = None;
+        for node in nodes.nodes().iter().rev() {
+            match self.unbind(node.name()) {
+                Ok(()) | Err(VfsError::NotFound) => {}
+                Err(err) => last_error = Some(err),
             }
         }
-        Ok(())
+        if let Some(err) = last_error {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
-    /// 根据 `/dev/<user_name>` 节点名恢复其绑定的字符设备对象。
+    /// 根据 devtmpfs 相对路径恢复其绑定的字符设备对象。
     pub fn char_dev(&self, user_name: &str) -> Option<CharDevice> {
-        let inode = self.root_ops.children.lock().get(user_name).cloned()?;
+        let inode = self.lookup_node_at(user_name).ok()?;
         let ops = inode.downcast_ops::<DevCharOps>()?;
         let dev = ops.dev();
         dev.is_active().then_some(dev)
+    }
+
+    /// 根据 devtmpfs 相对路径恢复其绑定的块设备对象。
+    pub fn block_dev(&self, user_name: &str) -> Option<Arc<BlockDevice>> {
+        let inode = self.lookup_node_at(user_name).ok()?;
+        block_device_from_inode(&inode)
     }
 }
 
@@ -1296,14 +2137,14 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
         Ok(FsStat {
             fs_type: 0x444f4445, // "devt" 魔数
-            block_size: 512,
+            block_size: devtmpfs_compat_block_size() as u64,
             total_blocks: 0,
             free_blocks: 0,
             avail_blocks: 0,
             total_inodes: self.next_ino.load(Ordering::Relaxed),
             free_inodes: 0,
             fs_id: sb.fs_id.raw(),
-            name_max: 255,
+            name_max: DEVTMPFS_NAME_MAX as u32,
         })
     }
 
@@ -1326,7 +2167,7 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
 ///
 /// 通过 `mount` 方法创建超级块，返回的 `Arc<Superblock>` 的
 /// `ops` 字段可通过 `downcast_ops::<DevTmpfsSuperblockOps>()` 取回，
-/// 供驱动调用 `bind_char` / `bind_block`。
+/// 供驱动调用 `bind_char` / `bind_block` / `bind_symlink` 或批量节点 API。
 ///
 /// # 典型初始化流程
 ///
@@ -1337,8 +2178,9 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
 ///
 /// // 2. 驱动注册后绑定设备
 /// let ops = sb.downcast_ops::<DevTmpfsSuperblockOps>().unwrap();
-/// ops.bind_char("uart0", char_dev)?;   // 直接绑定对象引用
-/// ops.bind_block("vda", block_dev)?;   // 直接绑定 Arc<BlockDev>
+/// ops.bind_char("console", char_dev)?;       // 直接绑定对象引用
+/// ops.bind_block("block/root", block_dev)?;  // 目录化块设备节点
+/// ops.bind_symlink("disk/root", "../block/root")?; // 可选符号链接投影
 /// ```
 pub struct DevTmpfsDriver;
 
@@ -1352,16 +2194,22 @@ impl FsDriver for DevTmpfsDriver {
     }
 
     fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
+        // devtmpfs 是内核设备树的 POSIX 投影，不能像 tmpfs 一样每次 mount
+        // 都创建空实例。启动期 PnP bridge 安装后，用户态再次挂载 devtmpfs
+        // 应复用同一个 superblock，否则会覆盖掉已经绑定的 console/uart/vd0 等节点。
+        if let Some(sb) = mounted_devtmpfs_sb() {
+            return Ok(sb);
+        }
+
         let fs_id = FsId::new(DEVTMPFS_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed));
 
-        let root_ops = Arc::new(DevRootOps::new());
+        let root_ops = Arc::new(DevDirOps::new());
 
         // 只构造一个 DevTmpfsSuperblockOps 实例，move 进 new_cyclic 闭包，
         // 写入 weak ref 后再 Box 化存入 Superblock。外层不再持有任何引用，
         // 后续通过 sb.downcast_ops::<DevTmpfsSuperblockOps>() 访问。
         let sb_ops = DevTmpfsSuperblockOps {
             next_ino: AtomicU64::new(2),
-            root_ops: Arc::clone(&root_ops),
             sb: vfs::sync::Spinlock::new(None),
         };
 
@@ -1372,9 +2220,9 @@ impl FsDriver for DevTmpfsDriver {
             let root_meta = InodeMeta {
                 size: 0,
                 nlink: 2,
-                mode: FileMode::new(0o755),
-                uid: Uid::ROOT,
-                gid: Gid::ROOT,
+                mode: devtmpfs_compat_default_dir_mode(),
+                uid: devtmpfs_compat_default_uid(),
+                gid: devtmpfs_compat_default_gid(),
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -1385,7 +2233,7 @@ impl FsDriver for DevTmpfsDriver {
                 InodeId { fs_id, ino: 1 },
                 FileType::Directory,
                 DevId::new(0, 0),
-                512,
+                devtmpfs_compat_block_size(),
                 None,
                 root_meta,
                 Arc::clone(&root_ops) as Arc<dyn InodeOps + Send + Sync>,
@@ -1398,8 +2246,8 @@ impl FsDriver for DevTmpfsDriver {
                 fs_type: "devtmpfs",
                 fs_id,
                 dev_id: None,
-                block_size: 512,
-                name_max: 255,
+                block_size: devtmpfs_compat_block_size(),
+                name_max: DEVTMPFS_NAME_MAX as u32,
                 root_inode,
                 root_dentry,
                 inode_cache: vfs::superblock::InodeCache::new(),

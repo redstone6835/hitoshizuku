@@ -1,11 +1,11 @@
 //! 块设备承载的文件系统注册。
 //!
-//! 本模块只负责把 VFS mount 源（例如 `/dev/vd0`）解析为块设备，并把块设备
+//! 本模块只负责把 VFS mount 源解析为块设备，并把块设备
 //! 包装成同步后端。具体磁盘格式由注册进来的 [`BlockFsDriver`] 实现。
 
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use vfs::FS_REGISTRY;
 use vfs::error::{VfsError, VfsResult};
@@ -13,8 +13,8 @@ use vfs::superblock::{FsDriver, FsDriverFlags, FsProbe, Superblock};
 
 use crate::dev::block::BlockDevice;
 use crate::dev::block_sync::{SyncBlockBackend, SyncIoError};
-use crate::dev::enumerate::DEVICES;
-use crate::dev::function::lookup_block_device_by_node;
+
+use super::mount_source::resolve_block_mount_source;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BlockFsProbe {
@@ -89,13 +89,15 @@ impl FsDriver for BlockFsAdapter {
         let Ok(dev) = resolve_block_device(source) else {
             return FsProbe::None;
         };
-        let backend = SyncBlockBackend::new(dev);
+        let Ok(backend) = SyncBlockBackend::new(dev) else {
+            return FsProbe::None;
+        };
         self.driver.probe(&backend).into()
     }
 
     fn mount(&self, dev: Option<&str>, data: &str) -> VfsResult<Arc<Superblock>> {
         let dev = resolve_block_device(dev.ok_or(VfsError::NoDevice)?)?;
-        let backend = Arc::new(SyncBlockBackend::new(dev));
+        let backend = Arc::new(SyncBlockBackend::new(dev).map_err(|_| VfsError::NoDevice)?);
         if self.driver.probe(backend.as_ref()) == BlockFsProbe::None {
             return Err(VfsError::InvalidArgument);
         }
@@ -137,18 +139,25 @@ pub fn mount_block_source_auto(
     source: &str,
     data: &str,
 ) -> VfsResult<(Arc<Superblock>, &'static str)> {
+    let dev = resolve_block_mount_source(source)?;
+    mount_block_device_auto(dev, data)
+}
+
+fn mount_block_backend_auto(
+    backend: Arc<SyncBlockBackend>,
+    data: &str,
+) -> VfsResult<(Arc<Superblock>, &'static str)> {
     let mut last_error = VfsError::NoDevice;
-    for wanted_probe in [FsProbe::Strong, FsProbe::Weak] {
+    for wanted_probe in [BlockFsProbe::Strong, BlockFsProbe::Weak] {
         for entry in FS_REGISTRY.iter() {
             let driver = entry.driver;
-            let flags = driver.flags();
-            if !flags.has(FsDriverFlags::BLOCK)
-                || !flags.has(FsDriverFlags::AUTO_DETECT)
-                || driver.probe(Some(source)) != wanted_probe
-            {
+            let Some(adapter) = driver.as_any().downcast_ref::<BlockFsAdapter>() else {
+                continue;
+            };
+            if !adapter.auto_detect || adapter.driver.probe(backend.as_ref()) != wanted_probe {
                 continue;
             }
-            match driver.mount(Some(source), data) {
+            match adapter.driver.mount_block(Arc::clone(&backend), data) {
                 Ok(sb) => return Ok((sb, driver.name())),
                 Err(err) => last_error = err,
             }
@@ -161,9 +170,10 @@ pub fn mount_block_device_auto(
     dev: Arc<BlockDevice>,
     data: &str,
 ) -> VfsResult<(Arc<Superblock>, &'static str)> {
-    let source = dev.name();
-    let (sb, fs_name) = mount_block_source_auto(source, data)?;
-    let root_source = format!("/dev/{} ({})", source, fs_name).leak();
+    let source = alloc::string::String::from(dev.name());
+    let backend = Arc::new(SyncBlockBackend::new(dev).map_err(|_| VfsError::NoDevice)?);
+    let (sb, fs_name) = mount_block_backend_auto(backend, data)?;
+    let root_source = alloc::format!("{} ({})", source, fs_name).leak();
     Ok((sb, root_source))
 }
 
@@ -175,15 +185,7 @@ pub fn register_block_filesystems() {
 }
 
 fn resolve_block_device(source: &str) -> VfsResult<Arc<BlockDevice>> {
-    let name = match source.strip_prefix("/dev/") {
-        Some(name) => name,
-        None if !source.starts_with('/') => source,
-        None => return Err(VfsError::NotFound),
-    };
-    if name.is_empty() || name.contains('/') {
-        return Err(VfsError::NotFound);
-    }
-    lookup_block_device_by_node(&DEVICES.functions, name).ok_or(VfsError::NotFound)
+    resolve_block_mount_source(source)
 }
 
 struct ExtBlockFsDriver;
@@ -321,9 +323,17 @@ fn read_backend_bytes(
         .checked_add(out.len())
         .ok_or(VfsError::InvalidArgument)?;
     let sector_count = total.div_ceil(sector_size);
-    let mut buffer = alloc::vec![0u8; sector_count * sector_size];
+    let sector_count_u32 = u32::try_from(sector_count).map_err(|_| VfsError::InvalidArgument)?;
+    let buffer_len = sector_count
+        .checked_mul(sector_size)
+        .ok_or(VfsError::InvalidArgument)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(buffer_len)
+        .map_err(|_| VfsError::OutOfMemory)?;
+    buffer.resize(buffer_len, 0);
     backend
-        .read(start_lba, sector_count as u32, &mut buffer)
+        .read(start_lba, sector_count_u32, &mut buffer)
         .map_err(sync_error_to_vfs)?;
     out.copy_from_slice(&buffer[in_sector..in_sector + out.len()]);
     Ok(())
@@ -332,6 +342,9 @@ fn read_backend_bytes(
 fn sync_error_to_vfs(err: SyncIoError) -> VfsError {
     match err {
         SyncIoError::BufferTooSmall | SyncIoError::InvalidRange => VfsError::InvalidArgument,
+        SyncIoError::UnknownCapacity => VfsError::NoDevice,
+        SyncIoError::OutOfMemory
+        | SyncIoError::Submit(crate::dev::bio::SubmitError::OutOfMemory) => VfsError::OutOfMemory,
         SyncIoError::Submit(_) | SyncIoError::Io(_) => VfsError::Io,
     }
 }

@@ -60,9 +60,9 @@ impl VmFlags {
         Self(self.0 & !flag)
     }
 
-    /// 是否包含所有给定位。与 [`has`] 等价，但语义更明显。
+    /// 是否包含所有给定位。空 mask 返回 false，避免把“未要求任何位”误判为匹配。
     pub const fn contains_all(self, flags: u32) -> bool {
-        (self.0 & flags) == flags
+        flags != 0 && (self.0 & flags) == flags
     }
 }
 

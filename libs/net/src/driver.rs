@@ -43,6 +43,15 @@ pub enum LinkState {
     },
 }
 
+/// 设备向协议栈暴露的二层介质类型。
+///
+/// 普通网卡使用 Ethernet，loopback 这类没有二层头和 ARP 的虚拟接口使用 Ip。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkMedium {
+    Ethernet,
+    Ip,
+}
+
 // ── 缓冲区抽象 ───────────────────────────────────────────────────────────────
 
 /// 接收缓冲区。
@@ -76,7 +85,10 @@ impl RxBuf {
         );
         // 防御性截断：保护协议栈不被异常大帧攻击
         let safe_len = len.min(MAX_FRAME_LEN);
-        Self { data, len: safe_len }
+        Self {
+            data,
+            len: safe_len,
+        }
     }
 
     /// 帧数据切片（只读）。
@@ -216,6 +228,11 @@ pub struct NetStats {
 /// 资源不可用时返回 `None`。硬件级故障（DMA 错误、寄存器异常）应当
 /// 在驱动内部记录并通过 [`link_state`](Self::link_state) 切换为 `Down`。
 pub trait NetDriver: Send + Sync {
+    /// 当前驱动承载的链路介质。默认是普通以太网设备。
+    fn medium(&self) -> LinkMedium {
+        LinkMedium::Ethernet
+    }
+
     /// 尝试从接收队列取出一帧。
     ///
     /// 返回 `Some(buf)` 表示成功取出一帧，协议栈应当解析并消费。

@@ -10,11 +10,12 @@ use alloc::vec::Vec;
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use core::any::Any;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, fence, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use spin::Mutex;
 
-use crate::dev::pci::{PciBarType, PciDevice, PciInfo};
+use crate::dev::net::NetFunction;
+use crate::dev::pci::{PciDevice, PciInfo};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     register_driver_factory,
@@ -255,12 +256,20 @@ fn parse_virtio_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
 
             if let Some((_bar, bar_vaddr)) = pci.map_bar_virt(bar_idx as usize) {
                 let vaddr = bar_vaddr.wrapping_add(offset as usize);
-                let cap = VirtioCap { vaddr, length, notify_off_multiplier: 0 };
+                let cap = VirtioCap {
+                    vaddr,
+                    length,
+                    notify_off_multiplier: 0,
+                };
                 match cfg_type {
                     VIRTIO_PCI_CAP_COMMON_CFG => common = Some(cap),
                     VIRTIO_PCI_CAP_NOTIFY_CFG => {
                         let mult = pci.read_config_u32(ptr + 16);
-                        notify = Some(VirtioCap { vaddr, length, notify_off_multiplier: mult });
+                        notify = Some(VirtioCap {
+                            vaddr,
+                            length,
+                            notify_off_multiplier: mult,
+                        });
                     }
                     VIRTIO_PCI_CAP_ISR_CFG => isr = Some(cap),
                     VIRTIO_PCI_CAP_DEVICE_CFG => device = Some(cap),
@@ -273,7 +282,11 @@ fn parse_virtio_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
     }
 
     let _ = isr?;
-    Some(VirtioPciCaps { common: common?, notify: notify?, device })
+    Some(VirtioPciCaps {
+        common: common?,
+        notify: notify?,
+        device,
+    })
 }
 
 // ── DMA 分配助手 ──────────────────────────────────────────────────────
@@ -284,10 +297,11 @@ fn alloc_dma_page() -> Result<PhysicalAllocation, &'static str> {
         .map_err(|_| "virtio-net: DMA page alloc failed")
 }
 
-fn dma_vaddr(alloc: PhysicalAllocation) -> usize {
-    // FIXME: phys_to_virt hook 未初始化时会 panic；驱动 probe 路径应返回
-    // 错误而不是 unwrap。
-    allocator::KERNEL_ALLOCATOR.load_phys_to_virt().unwrap()(alloc.paddr)
+fn dma_vaddr(alloc: PhysicalAllocation) -> Result<usize, &'static str> {
+    allocator::KERNEL_ALLOCATOR
+        .load_phys_to_virt()
+        .map(|phys_to_virt| phys_to_virt(alloc.paddr))
+        .ok_or("virtio-net: phys_to_virt hook is not installed")
 }
 
 // ── 状态助手 ──────────────────────────────────────────────────────────
@@ -317,10 +331,7 @@ fn cc_set_driver_features(caps: &VirtioPciCaps, f: u64) {
 
 // ── 队列设置助手 ──────────────────────────────────────────────────────
 
-fn setup_queue(
-    caps: &VirtioPciCaps,
-    queue_idx: u16,
-) -> Result<VirtioNetQueue, &'static str> {
+fn setup_queue(caps: &VirtioPciCaps, queue_idx: u16) -> Result<VirtioNetQueue, &'static str> {
     wr_u16(caps.common.vaddr + CC_QUEUE_SELECT, queue_idx);
     let max_qsz = rd_u16(caps.common.vaddr + CC_QUEUE_SIZE);
     if max_qsz == 0 {
@@ -332,9 +343,9 @@ fn setup_queue(
     let desc_alloc = alloc_dma_page()?;
     let avail_alloc = alloc_dma_page()?;
     let used_alloc = alloc_dma_page()?;
-    let desc_table = dma_vaddr(desc_alloc) as *mut VirtqDesc;
-    let avail_ring = dma_vaddr(avail_alloc) as *mut VirtqAvail;
-    let used_ring = dma_vaddr(used_alloc) as *mut VirtqUsed;
+    let desc_table = dma_vaddr(desc_alloc)? as *mut VirtqDesc;
+    let avail_ring = dma_vaddr(avail_alloc)? as *mut VirtqAvail;
+    let used_ring = dma_vaddr(used_alloc)? as *mut VirtqUsed;
     unsafe {
         core::ptr::write_bytes(desc_table.cast::<u8>(), 0, PAGE_SIZE);
         core::ptr::write_bytes(avail_ring.cast::<u8>(), 0, PAGE_SIZE);
@@ -342,7 +353,10 @@ fn setup_queue(
     }
 
     wr_u64(caps.common.vaddr + CC_QUEUE_DESC, desc_alloc.paddr as u64);
-    wr_u64(caps.common.vaddr + CC_QUEUE_DRIVER, avail_alloc.paddr as u64);
+    wr_u64(
+        caps.common.vaddr + CC_QUEUE_DRIVER,
+        avail_alloc.paddr as u64,
+    );
     wr_u64(caps.common.vaddr + CC_QUEUE_DEVICE, used_alloc.paddr as u64);
 
     let notify_off = rd_u16(caps.common.vaddr + CC_QUEUE_NOTIFY_OFF) as usize;
@@ -458,7 +472,12 @@ impl VirtioNetPci {
 
         log::printk!(
             "[virtio-net] probe ok: mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
 
         let has_status = drv_features & VIRTIO_NET_F_STATUS != 0;
@@ -491,19 +510,27 @@ impl net::NetDriver for VirtioNetPci {
         if rq.last_used_idx == used_idx {
             return None;
         }
-        let elem = unsafe {
-            (*rq.used_ring).ring[rq.last_used_idx as usize % rq.queue_size as usize]
-        };
+        let elem =
+            unsafe { (*rq.used_ring).ring[rq.last_used_idx as usize % rq.queue_size as usize] };
         rq.last_used_idx = rq.last_used_idx.wrapping_add(1);
 
         let desc_idx = elem.id as usize;
+        if desc_idx >= rq.queue_size as usize || desc_idx >= inner.rx_buffers.len() {
+            return None;
+        }
         let total_len = (elem.len as usize).min(RX_BUF_SIZE);
         if total_len <= VIRTIO_NET_HDR_SIZE {
             Self::repost_rx_buffer(&mut inner, desc_idx);
             return None;
         }
 
-        let buf_vaddr = dma_vaddr(inner.rx_buffers[desc_idx]);
+        let buf_vaddr = match dma_vaddr(inner.rx_buffers[desc_idx]) {
+            Ok(vaddr) => vaddr,
+            Err(_) => {
+                Self::repost_rx_buffer(&mut inner, desc_idx);
+                return None;
+            }
+        };
         let frame_len = total_len - VIRTIO_NET_HDR_SIZE;
         let mut frame = alloc::vec![0u8; frame_len].into_boxed_slice();
         unsafe {
@@ -546,7 +573,14 @@ impl net::NetDriver for VirtioNetPci {
                 return;
             }
         };
-        let tx_vaddr = dma_vaddr(tx_buf_alloc);
+        let tx_vaddr = match dma_vaddr(tx_buf_alloc) {
+            Ok(vaddr) => vaddr,
+            Err(_) => {
+                inner.tx_free_descs.push_front(desc_idx);
+                let _ = KERNEL_ALLOCATOR.free_physical(tx_buf_alloc);
+                return;
+            }
+        };
         unsafe {
             // 清零 virtio_net_hdr
             core::ptr::write_bytes(tx_vaddr as *mut u8, 0, VIRTIO_NET_HDR_SIZE);
@@ -596,12 +630,18 @@ impl net::NetDriver for VirtioNetPci {
             if let Some(dev_cfg) = inner.caps.device {
                 let status = rd_u16(dev_cfg.vaddr + NET_CFG_STATUS);
                 if status & 1 != 0 {
-                    return net::LinkState::Up { speed_mbps: None, duplex: net::Duplex::Full };
+                    return net::LinkState::Up {
+                        speed_mbps: None,
+                        duplex: net::Duplex::Full,
+                    };
                 }
                 return net::LinkState::Down;
             }
         }
-        net::LinkState::Up { speed_mbps: None, duplex: net::Duplex::Full }
+        net::LinkState::Up {
+            speed_mbps: None,
+            duplex: net::Duplex::Full,
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -630,19 +670,33 @@ impl VirtioNetPci {
             if tq.last_used_idx == used_idx {
                 break;
             }
-            let elem = unsafe {
-                (*tq.used_ring).ring[tq.last_used_idx as usize % tq.queue_size as usize]
-            };
+            let elem =
+                unsafe { (*tq.used_ring).ring[tq.last_used_idx as usize % tq.queue_size as usize] };
             tq.last_used_idx = tq.last_used_idx.wrapping_add(1);
             let desc_idx = elem.id as u16;
+            if desc_idx >= tq.queue_size {
+                continue;
+            }
             // 在 pending_tx 中找到并释放对应的 DMA buffer
             if let Some(pos) = inner.pending_tx.iter().position(|(d, _)| *d == desc_idx) {
-                // FIXME: pending_tx 与 used ring 不一致时这里仍依赖 unwrap；
-                // 应把 ring 损坏/重复回收作为驱动错误处理。
-                let (_, alloc) = inner.pending_tx.remove(pos).unwrap();
-                let _ = KERNEL_ALLOCATOR.free_physical(alloc);
+                if let Some((_, alloc)) = inner.pending_tx.remove(pos) {
+                    let _ = KERNEL_ALLOCATOR.free_physical(alloc);
+                }
+                inner.tx_free_descs.push_back(desc_idx);
             }
-            inner.tx_free_descs.push_back(desc_idx);
+        }
+    }
+}
+
+impl Drop for VirtioNetPci {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        cc_set_status(&inner.caps, 0);
+        for alloc in inner.rx_buffers.drain(..) {
+            let _ = KERNEL_ALLOCATOR.free_physical(alloc);
+        }
+        while let Some((_, alloc)) = inner.pending_tx.pop_front() {
+            let _ = KERNEL_ALLOCATOR.free_physical(alloc);
         }
     }
 }
@@ -651,6 +705,12 @@ impl VirtioNetPci {
 
 pub struct VirtioNetPciDriver {
     virt_to_phys: fn(usize) -> usize,
+}
+
+struct VirtioNetPciBinding {
+    iface_id: net::InterfaceId,
+    net_dev: Arc<net::NetDevice>,
+    _driver: Arc<VirtioNetPci>,
 }
 
 impl VirtioNetPciDriver {
@@ -674,8 +734,7 @@ impl PnpDriver for VirtioNetPciDriver {
             return false;
         };
         // VirtIO Network: legacy 0x1000, modern 0x1041
-        pci_info.vendor == 0x1af4
-            && (pci_info.device_id == 0x1000 || pci_info.device_id == 0x1041)
+        pci_info.vendor == 0x1af4 && (pci_info.device_id == 0x1000 || pci_info.device_id == 0x1041)
     }
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
@@ -692,16 +751,42 @@ impl PnpDriver for VirtioNetPciDriver {
         let driver = Arc::new(driver);
         let net_dev = Arc::new(net::NetDevice::new(&name, driver.clone()));
         let config = net::IfConfig::auto();
-        net::stack().attach(net_dev, config).map_err(|_| PnpError::ProbeFailed)?;
+        net::stack()
+            .attach(Arc::clone(&net_dev), config)
+            .map_err(|_| PnpError::ProbeFailed)?;
+        if let Err(err) =
+            dev.register_function(Arc::new(NetFunction::new(&name, Arc::clone(&net_dev))))
+        {
+            net_dev.mark_gone();
+            let _ = net::stack().detach(net_dev.id());
+            return Err(err);
+        }
+        dev.set_driver_data(Arc::new(VirtioNetPciBinding {
+            iface_id: net_dev.id(),
+            net_dev: Arc::clone(&net_dev),
+            _driver: Arc::clone(&driver),
+        }));
 
         log::printk!(
             "[virtio-net] attached {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            name,
+            mac[0],
+            mac[1],
+            mac[2],
+            mac[3],
+            mac[4],
+            mac[5]
         );
         Ok(())
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
+        if let Some(data) = dev.take_driver_data() {
+            if let Ok(binding) = data.downcast::<VirtioNetPciBinding>() {
+                binding.net_dev.mark_gone();
+                let _ = net::stack().detach(binding.iface_id);
+            }
+        }
         log::printk!("[virtio-net] remove {}", dev.id);
     }
 }

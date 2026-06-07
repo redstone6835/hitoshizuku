@@ -31,6 +31,12 @@ pub enum ElfError {
     PhdrOffsetOverflow,
     /// p_offset + p_filesz 算出越界。
     SegmentOffsetOverflow,
+    /// program header 字段组合不合法（例如 PT_LOAD 对齐/重叠/大小关系错误）。
+    InvalidSegment,
+    /// PT_PHDR 未覆盖实际 program header table。
+    InvalidPhdr,
+    /// e_entry 不落在可执行的非空 PT_LOAD 中。
+    InvalidEntry,
     /// e_phoff 不符合最小对齐要求。
     MisalignedPhoff,
     /// PT_INTERP 区段不以 NUL 结尾或非 UTF-8。

@@ -96,6 +96,12 @@ struct FdEntry {
     flags: FdFlags,
 }
 
+struct RemovedFd {
+    fd: u32,
+    entry: FdEntry,
+    last_file_reference: bool,
+}
+
 fn notify_fd_closed(fd: u32, entry: &FdEntry) {
     entry.file.on_fd_closed(fd);
 }
@@ -211,6 +217,23 @@ impl FdTableInner {
         self.entries.get_mut(fd as usize).and_then(|e| e.as_mut())
     }
 
+    fn contains_file(&self, file: &Arc<File>) -> bool {
+        for (i, &word) in self.bitmap.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                let fd = i as u32 * 64 + bit;
+                w &= w - 1;
+                if let Some(entry) = self.get(fd)
+                    && Arc::ptr_eq(&entry.file, file)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// O(1) 插入条目，返回旧条目（若有）。
     #[inline]
     fn insert(&mut self, fd: u32, entry: FdEntry) -> Option<FdEntry> {
@@ -287,8 +310,11 @@ impl FdTable {
         inner.close_observers.push(Arc::downgrade(file));
     }
 
-    fn notify_fd_closed(&self, fd: u32, entry: &FdEntry) {
-        notify_fd_closed(fd, entry);
+    fn notify_fd_closed(&self, removed: &RemovedFd) {
+        notify_fd_closed(removed.fd, &removed.entry);
+        if !removed.last_file_reference {
+            return;
+        }
         let observers = {
             let mut inner = self.inner.lock();
             let mut observers = Vec::new();
@@ -303,7 +329,7 @@ impl FdTable {
             observers
         };
         for observer in observers {
-            observer.on_fd_closed(fd);
+            observer.on_file_description_closed(&removed.entry.file);
         }
     }
 
@@ -315,10 +341,15 @@ impl FdTable {
             if fd >= inner.limit {
                 return Err(VfsError::BadFileDescriptor);
             }
-            inner.insert(fd, FdEntry { file, flags })
+            let old = inner.insert(fd, FdEntry { file, flags });
+            old.map(|entry| RemovedFd {
+                fd,
+                last_file_reference: !inner.contains_file(&entry.file),
+                entry,
+            })
         };
         if let Some(old) = old.as_ref() {
-            self.notify_fd_closed(fd, old);
+            self.notify_fd_closed(old);
         }
         drop(old);
         Ok(())
@@ -326,11 +357,19 @@ impl FdTable {
 
     /// 关闭指定 fd。
     pub fn close_fd(&self, fd: Fd) -> VfsResult<()> {
-        let removed = self.inner.lock().remove(fd.0);
+        let removed = {
+            let mut inner = self.inner.lock();
+            let removed = inner.remove(fd.0);
+            removed.map(|entry| RemovedFd {
+                fd: fd.0,
+                last_file_reference: !inner.contains_file(&entry.file),
+                entry,
+            })
+        };
         let Some(removed) = removed else {
             return Err(VfsError::BadFileDescriptor);
         };
-        self.notify_fd_closed(fd.0, &removed);
+        self.notify_fd_closed(&removed);
         drop(removed);
         Ok(())
     }
@@ -386,10 +425,15 @@ impl FdTable {
                 .get(old_fd.0)
                 .map(|e| Arc::clone(&e.file))
                 .ok_or(VfsError::BadFileDescriptor)?;
-            inner.insert(new_fd.0, FdEntry { file, flags })
+            let old = inner.insert(new_fd.0, FdEntry { file, flags });
+            old.map(|entry| RemovedFd {
+                fd: new_fd.0,
+                last_file_reference: !inner.contains_file(&entry.file),
+                entry,
+            })
         };
         if let Some(replaced) = replaced.as_ref() {
-            self.notify_fd_closed(new_fd.0, replaced);
+            self.notify_fd_closed(replaced);
         }
         drop(replaced);
         Ok(new_fd)
@@ -441,7 +485,7 @@ impl FdTable {
         // 栈上固定大小缓冲区，避免按硬限制做线性堆分配。
         // 无论进程硬限制多大，每轮都只在锁外批量 drop 最多 64 个条目。
         const BATCH: usize = 64;
-        let mut batch_buf: [Option<(u32, FdEntry)>; BATCH] = core::array::from_fn(|_| None);
+        let mut batch_buf: [Option<RemovedFd>; BATCH] = core::array::from_fn(|_| None);
 
         loop {
             let mut batch_count = 0;
@@ -455,11 +499,16 @@ impl FdTable {
                         let fd = word_idx as u32 * 64 + bit;
                         word &= word - 1; // 清除最低位
 
-                        if let Some(entry) = inner.get(fd)
-                            && entry.flags.has(FdFlags::CLOEXEC)
-                            && let Some(removed) = inner.remove(fd)
-                        {
-                            batch_buf[batch_count] = Some((fd, removed));
+                        let should_remove = inner
+                            .get(fd)
+                            .is_some_and(|entry| entry.flags.has(FdFlags::CLOEXEC));
+                        if should_remove && let Some(removed) = inner.remove(fd) {
+                            let last_file_reference = !inner.contains_file(&removed.file);
+                            batch_buf[batch_count] = Some(RemovedFd {
+                                fd,
+                                entry: removed,
+                                last_file_reference,
+                            });
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -473,9 +522,9 @@ impl FdTable {
             }
             // 锁已释放，安全 drop
             for entry in batch_buf[..batch_count].iter_mut() {
-                if let Some((fd, entry)) = entry.take() {
-                    self.notify_fd_closed(fd, &entry);
-                    drop(entry);
+                if let Some(removed) = entry.take() {
+                    self.notify_fd_closed(&removed);
+                    drop(removed);
                 }
             }
             if batch_count < BATCH {
@@ -524,13 +573,43 @@ impl FdTable {
     }
 
     pub fn close_range(&self, first: u32, last: u32, cloexec_only: bool) {
+        if cloexec_only {
+            let mut inner = self.inner.lock();
+            if first >= inner.hard_limit {
+                return;
+            }
+            let upper = last.min(inner.hard_limit.saturating_sub(1));
+            for word_idx in 0..inner.bitmap.len() {
+                let word_start = word_idx as u32 * 64;
+                if word_start > upper {
+                    break;
+                }
+                let mut word = inner.bitmap[word_idx];
+                while word != 0 {
+                    let bit = word.trailing_zeros();
+                    let fd = word_idx as u32 * 64 + bit;
+                    word &= word - 1;
+                    if fd < first || fd > upper {
+                        continue;
+                    }
+                    if let Some(entry) = inner.get_mut(fd) {
+                        entry.flags = entry.flags.with(FdFlags::CLOEXEC);
+                    }
+                }
+            }
+            return;
+        }
+
         const BATCH: usize = 64;
-        let mut batch_buf: [Option<(u32, FdEntry)>; BATCH] = core::array::from_fn(|_| None);
+        let mut batch_buf: [Option<RemovedFd>; BATCH] = core::array::from_fn(|_| None);
         loop {
             let mut batch_count = 0;
             {
                 let mut inner = self.inner.lock();
-                let upper = last.min(inner.limit.saturating_sub(1));
+                if first >= inner.hard_limit {
+                    break;
+                }
+                let upper = last.min(inner.hard_limit.saturating_sub(1));
                 for word_idx in 0..inner.bitmap.len() {
                     let word_start = word_idx as u32 * 64;
                     if word_start > upper {
@@ -544,15 +623,13 @@ impl FdTable {
                         if fd < first || fd > upper {
                             continue;
                         }
-                        if cloexec_only {
-                            if let Some(entry) = inner.get(fd)
-                                && !entry.flags.has(FdFlags::CLOEXEC)
-                            {
-                                continue;
-                            }
-                        }
                         if let Some(removed) = inner.remove(fd) {
-                            batch_buf[batch_count] = Some((fd, removed));
+                            let last_file_reference = !inner.contains_file(&removed.file);
+                            batch_buf[batch_count] = Some(RemovedFd {
+                                fd,
+                                entry: removed,
+                                last_file_reference,
+                            });
                             batch_count += 1;
                             if batch_count >= BATCH {
                                 break;
@@ -565,9 +642,9 @@ impl FdTable {
                 }
             }
             for entry in batch_buf[..batch_count].iter_mut() {
-                if let Some((fd, entry)) = entry.take() {
-                    self.notify_fd_closed(fd, &entry);
-                    drop(entry);
+                if let Some(removed) = entry.take() {
+                    self.notify_fd_closed(&removed);
+                    drop(removed);
                 }
             }
             if batch_count < BATCH {

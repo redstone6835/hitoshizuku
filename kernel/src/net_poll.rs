@@ -36,21 +36,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// 协议栈 poll 节流：距上次 poll 不足此间隔则跳过。
-///
-/// timer tick 在 loongarch 上通常 100Hz~1kHz，但 smoltcp 的协议栈
-/// 状态推进在 RX/TX 队列空时成本极低——但锁还是要拿，wake_socket_waiters
-/// 也要走（即使队列空也走无害的 wake_all）。节流到 5ms 既能覆盖
-/// 100Mbit~1Gbit 链路，又不会让 wake_socket_waiters 路径成为热点。
-///
-/// 同时也避免在每个 timer tick 都重做"遍历所有 socket + 检查状态"
-/// 这种即便空载也要花时间的工作。
-const NET_POLL_INTERVAL_NS: u64 = 5 * 1_000_000; // 5ms
-// FIXME: 5ms 固定节流会影响 TCP 握手、重传、accept 唤醒和高频 UDP
-// 延迟；后续应由 smoltcp poll_at/网卡 IRQ/等待队列 deadline 共同驱动。
-
-/// 上一次 poll 的时间戳（纳秒）。初值 0 保证第一次 tick 一定执行。
-static LAST_POLL_NS: AtomicU64 = AtomicU64::new(0);
+/// 上一次 poll 的时间戳（纳秒），仅用于丢弃同一时间戳下的重复钩子。
+static LAST_POLL_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Timer-tick 钩子：每 tick 推一帧协议栈。
 ///
@@ -58,23 +45,23 @@ static LAST_POLL_NS: AtomicU64 = AtomicU64::new(0);
 /// [`arch::loongarch64::vdso::register_net_poll_hook`]。`now_ns` 是当前
 /// 物理时间戳（与 vDSO 那边一致），smoltcp 用 `Instant::from_millis` 接收。
 pub fn tick_net_poll(now_ns: u64) {
-    // 节流：与上次 poll 间隔不足 5ms 就跳过。
-    let prev = LAST_POLL_NS.load(Ordering::Acquire);
-    if now_ns.saturating_sub(prev) < NET_POLL_INTERVAL_NS && prev != 0 {
+    if LAST_POLL_NS.swap(now_ns, Ordering::AcqRel) == now_ns {
         return;
     }
-    // 竞争更新：只有先到的才记下 LAST_POLL_NS；后到的会发现 prev 已经
-    // 更新到比自己的 now_ns 还新的值，下一次 tick 才会被允许通过。
-    if LAST_POLL_NS
-        .compare_exchange(prev, now_ns, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    // 不再按固定 5ms 节流。netperf TCP_CRR 这类高频短连接在 accept/recv
+    // 睡眠后依赖 timer poll 唤醒，如果跳过多个 tick，每轮小请求都会被
+    // 人为放大成毫秒级延迟，严重时看起来像卡死。
+    if now_ns == 0 {
         return;
     }
     // smoltcp 的 Instant::from_millis 取毫秒，向下取整即可。
     // TODO: 这里把 ns 向下取整到 ms，短超时和连续 tick 下的协议栈时间
     // 精度会丢失。
     net::stack().poll_ms((now_ns / 1_000_000) as i64);
+    // 网络 poll 可能让对端任务变为 runnable（例如 TCP_CRR 的短连接
+    // accept/recv/send 交替）。即使没有显式 socket waiter，也请求一次
+    // 当前 CPU 重调度，避免对端等到其它定时任务触发后才运行。
+    sched::request_resched(sched::current_cpu_id());
 }
 
 /// 在 `main()` 早期注册本模块的钩子。重复注册会覆盖（与 vDSO hook 一致），

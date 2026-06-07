@@ -1137,6 +1137,7 @@ pub struct VfsRoot {
 impl VfsRoot {
     /// 构造一个新的 VFS 根。
     pub fn new(root_dentry: Arc<Dentry>, root_mount: Arc<Mount>) -> Self {
+        root_mount.inc_open();
         Self {
             state: Spinlock::new(VfsRootState {
                 root_dentry,
@@ -1150,10 +1151,16 @@ impl VfsRoot {
     /// `root_mount` 必须是包含 `root_dentry` 的挂载点。调用方通常应使用路径解析
     /// 返回的 [`LookupResult`](crate::vfs::path::LookupResult) 同时取得两者。
     pub fn set(&self, root_dentry: Arc<Dentry>, root_mount: Arc<Mount>) {
-        *self.state.lock() = VfsRootState {
-            root_dentry,
-            root_mount,
-        };
+        root_mount.inc_open();
+        let mut state = self.state.lock();
+        let old = core::mem::replace(
+            &mut *state,
+            VfsRootState {
+                root_dentry,
+                root_mount,
+            },
+        );
+        old.root_mount.dec_open();
     }
 
     /// 判断给定的 dentry 是否为当前进程的根目录。
@@ -1162,6 +1169,16 @@ impl VfsRoot {
     #[inline]
     pub fn is_at_root(&self, dentry: &Arc<Dentry>) -> bool {
         Arc::ptr_eq(&self.state.lock().root_dentry, dentry)
+    }
+
+    /// 判断给定的 dentry 与 mount 是否同时匹配当前进程根目录。
+    ///
+    /// 同一个 dentry 可能在不同 mount 上下文中出现；`..` 跨挂载边界时必须同时
+    /// 比较两者，避免把父文件系统中的 dentry 误判为子挂载的根。
+    #[inline]
+    pub fn is_at_root_in_mount(&self, dentry: &Arc<Dentry>, mount: &Arc<Mount>) -> bool {
+        let state = self.state.lock();
+        Arc::ptr_eq(&state.root_dentry, dentry) && Arc::ptr_eq(&state.root_mount, mount)
     }
 
     /// 返回根目录的克隆引用。
@@ -1174,5 +1191,11 @@ impl VfsRoot {
     #[inline]
     pub fn mount(&self) -> Arc<Mount> {
         Arc::clone(&self.state.lock().root_mount)
+    }
+}
+
+impl Drop for VfsRoot {
+    fn drop(&mut self) {
+        self.state.lock().root_mount.dec_open();
     }
 }
