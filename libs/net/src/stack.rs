@@ -145,17 +145,20 @@ impl NetStack {
     /// （即所有阻塞在 recv/send/accept/connect 的用户进程），让它们重
     /// 新检查 socket 状态。
     pub fn poll(&self, timestamp: Instant) {
+        let mut state_changed = false;
         let table = self.interfaces.read();
         for iface_lock in table.values() {
             if let Some(mut managed) = iface_lock.try_lock() {
-                managed.poll(timestamp);
+                state_changed |= managed.poll(timestamp);
             }
         }
         drop(table);
         // FIXME: 当前每次协议栈 poll 都唤醒所有 socket 等待者，应该改为
         // 按 socket handle 和事件类型精确唤醒，避免 accept/connect/recv/send
         // 互相误唤醒。
-        self.wake_socket_waiters();
+        if state_changed {
+            self.wake_socket_waiters();
+        }
     }
 
     /// 以毫秒时间戳驱动所有活跃接口——供 kernel timer tick 使用，
@@ -177,8 +180,26 @@ impl NetStack {
             for iface_lock in table.values() {
                 iface_lock.lock().poll(Instant::from_millis(millis));
             }
-            self.wake_socket_waiters();
         }
+        drop(table);
+        self.wake_socket_waiters();
+    }
+
+    fn poll_socket_now(&self, handle: NetSocketHandle) {
+        self.poll_iface_now(handle.iface_id);
+    }
+
+    fn poll_iface_now(&self, iface_id: InterfaceId) {
+        let now_ns = sched::now_ns_public();
+        let millis = (now_ns / 1_000_000) as i64;
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&iface_id) {
+            for _ in 0..ACTIVE_POLL_ROUNDS {
+                iface_lock.lock().poll(Instant::from_millis(millis));
+            }
+        }
+        drop(table);
+        self.wake_socket_waiters();
     }
 
     /// 仅 poll 指定接口（中断驱动的快速路径，零分配）。
@@ -187,13 +208,16 @@ impl NetStack {
     /// 推荐网卡 IRQ handler 调用此方法而非全局 `poll`。
     pub fn poll_interface(&self, id: InterfaceId, timestamp: Instant) {
         let table = self.interfaces.read();
+        let mut state_changed = false;
         if let Some(iface_lock) = table.get(&id) {
-            iface_lock.lock().poll(timestamp);
+            state_changed = iface_lock.lock().poll(timestamp);
         }
         drop(table);
         // FIXME: 中断快速路径也走全局唤醒，多个接口/多个 socket 时会把
         // 与本接口无关的等待任务一并唤醒。
-        self.wake_socket_waiters();
+        if state_changed {
+            self.wake_socket_waiters();
+        }
     }
 
     /// 把当前任务挂到全局 socket 事件通知队列。
@@ -358,7 +382,7 @@ impl NetStack {
                 _ => return Err(NetError::InvalidArgument),
             }
         };
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(sent)
     }
 
@@ -452,7 +476,7 @@ impl NetStack {
                 .tcp_connect(handle.inner, remote_ep, local_port)
                 .map_err(|_| NetError::ConnectionRefused)?;
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(())
     }
 
@@ -528,7 +552,7 @@ impl NetStack {
             }
             n
         };
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(sent)
     }
 
@@ -544,7 +568,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         let table = self.interfaces.read();
         let iface_lock = table
             .get(&handle.iface_id)
@@ -586,7 +610,7 @@ impl NetStack {
                 }
             }
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
     }
 
     // ── TCP 选项与状态查询 (供 socket option 路径使用) ────────────────────
@@ -698,7 +722,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         let table = self.interfaces.read();
         let iface_lock = table
             .get(&handle.iface_id)
@@ -949,7 +973,7 @@ impl NetStack {
                 .send_slice(data, remote_ep)
                 .map_err(|_| NetError::WouldBlock)?;
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(data.len())
     }
 
@@ -1080,7 +1104,7 @@ impl NetStack {
             // TCP close 只是把状态机切到发 FIN 的状态；如果立刻摘掉 socket，
             // 对端永远看不到 EOF。移除前主动 poll，至少把当前 FIN/已排队数据
             // 推到设备队列里，避免 netperf 这类控制连接收尾永久等待。
-            self.poll_now();
+            self.poll_socket_now(handle);
         }
         // 真正从 SocketSet 摘掉
         let table = self.interfaces.read();
@@ -1115,7 +1139,7 @@ impl NetStack {
                 }
             }
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
     }
 
     // ── Socket 就绪查询（为 poll/epoll 准备）──────────────────────────────
