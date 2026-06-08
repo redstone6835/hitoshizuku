@@ -194,7 +194,9 @@ pub struct DeviceProperties {
 pub enum FirmwarePropertyValue {
     Bool,
     U32(u32),
+    U32List(Box<[u32]>),
     StringList(Box<[Box<str>]>),
+    Bytes(Box<[u8]>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,7 +283,23 @@ impl PlatformDeviceInfo {
             .find(|property| property.name.as_ref() == name)
             .and_then(|property| match property.value {
                 FirmwarePropertyValue::U32(value) => Some(value),
-                FirmwarePropertyValue::Bool | FirmwarePropertyValue::StringList(_) => None,
+                FirmwarePropertyValue::Bool
+                | FirmwarePropertyValue::U32List(_)
+                | FirmwarePropertyValue::StringList(_)
+                | FirmwarePropertyValue::Bytes(_) => None,
+            })
+    }
+
+    pub fn u32_list_property(&self, name: &str) -> Option<&[u32]> {
+        self.fw_properties
+            .iter()
+            .find(|property| property.name.as_ref() == name)
+            .and_then(|property| match &property.value {
+                FirmwarePropertyValue::U32List(values) => Some(values.as_ref()),
+                FirmwarePropertyValue::Bool
+                | FirmwarePropertyValue::U32(_)
+                | FirmwarePropertyValue::StringList(_)
+                | FirmwarePropertyValue::Bytes(_) => None,
             })
     }
 
@@ -297,7 +315,23 @@ impl PlatformDeviceInfo {
             .find(|property| property.name.as_ref() == name)
             .and_then(|property| match &property.value {
                 FirmwarePropertyValue::StringList(values) => Some(values.as_ref()),
-                FirmwarePropertyValue::Bool | FirmwarePropertyValue::U32(_) => None,
+                FirmwarePropertyValue::Bool
+                | FirmwarePropertyValue::U32(_)
+                | FirmwarePropertyValue::U32List(_)
+                | FirmwarePropertyValue::Bytes(_) => None,
+            })
+    }
+
+    pub fn bytes_property(&self, name: &str) -> Option<&[u8]> {
+        self.fw_properties
+            .iter()
+            .find(|property| property.name.as_ref() == name)
+            .and_then(|property| match &property.value {
+                FirmwarePropertyValue::Bytes(values) => Some(values.as_ref()),
+                FirmwarePropertyValue::Bool
+                | FirmwarePropertyValue::U32(_)
+                | FirmwarePropertyValue::U32List(_)
+                | FirmwarePropertyValue::StringList(_) => None,
             })
     }
 

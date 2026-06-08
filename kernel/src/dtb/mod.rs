@@ -67,10 +67,12 @@ pub fn kernel_start_init(context: &StartContext) {
         )
     });
     let firmware_dtb::DtbFirmwareInfo {
+        root_compatible,
         cpu_count,
         mut memory_segments,
         reserved_segments,
         external_initramfs_range,
+        rng_seed,
         stdout_serial,
         power_controls,
         serial_ports,
@@ -79,7 +81,8 @@ pub fn kernel_start_init(context: &StartContext) {
     } = firmware;
 
     printk!(
-        "[kernel-start][dtb] firmware parsed: cpu={} memory={} reserved={} serial={} platform={} pcie-host={}",
+        "[kernel-start][dtb] firmware parsed: root-compatible={} cpu={} memory={} reserved={} serial={} platform={} pcie-host={}",
+        root_compatible.first().copied().unwrap_or("<none>"),
         cpu_count,
         memory_segments.len(),
         reserved_segments.len(),
@@ -205,6 +208,14 @@ pub fn kernel_start_init(context: &StartContext) {
             ),
     );
 
+    if let Some(seed) = rng_seed.as_ref() {
+        general::dev::drivers::add_bootloader_randomness(seed);
+        printk!(
+            "[kernel-start][dtb] mixed chosen/rng-seed into random pool: {} bytes",
+            seed.len()
+        );
+    }
+
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
     // 中断控制器先注册，普通 platform 设备后注册。控制器之间仍可能存在
@@ -272,12 +283,16 @@ pub fn kernel_start_init(context: &StartContext) {
             );
         }
         printk!(
-            "[kernel-start][dtb] pcie ECAM {} phys={:#x} size={:#x} bus=[{:#x},{:#x}]",
+            "[kernel-start][dtb] pcie ECAM {} domain={} phys={:#x} size={:#x} bus=[{:#x},{:#x}] ranges={} msi-map={} dma-coherent={}",
             host.path,
+            host.domain,
             host.ecam_phys,
             host.ecam_size,
             host.bus_start,
-            host.bus_end
+            host.bus_end,
+            host.ranges.len(),
+            host.msi_map.len(),
+            host.dma_coherent as usize
         );
         pci::install_ecam(
             host.ecam_phys as u64,
@@ -286,16 +301,22 @@ pub fn kernel_start_init(context: &StartContext) {
             host.bus_end,
             context.address.device_mmio_to_virt,
         );
-        if pci::install_irq_routing(0, host) {
+        if pci::install_irq_routing(host.domain, host) {
             printk!(
                 "[kernel-start][dtb] installed PCI IRQ routing: {} map entries",
                 host.interrupt_map.len()
             );
         }
+        if pci::install_msi_routing(host.domain, host) {
+            printk!(
+                "[kernel-start][dtb] installed PCI MSI routing: {} map entries",
+                host.msi_map.len()
+            );
+        }
 
-        pci::assign_bars(host.bus_start, host.bus_end);
+        pci::assign_bars(host);
 
-        let count = pci_scan_and_register(0, host.bus_start, host.bus_end);
+        let count = pci_scan_and_register(host.domain, host.bus_start, host.bus_end);
         printk!(
             "[kernel-start][dtb] pci_scan_and_register probed {} device(s)",
             count
@@ -578,10 +599,16 @@ fn platform_device_info_from_dtb(
             value: match &property.value {
                 firmware_dtb::DtbPropertyValue::Bool => FirmwarePropertyValue::Bool,
                 firmware_dtb::DtbPropertyValue::U32(value) => FirmwarePropertyValue::U32(*value),
+                firmware_dtb::DtbPropertyValue::U32List(values) => {
+                    FirmwarePropertyValue::U32List(values.clone())
+                }
                 firmware_dtb::DtbPropertyValue::StringList(values) => {
                     FirmwarePropertyValue::StringList(
                         values.iter().map(|value| (*value).into()).collect(),
                     )
+                }
+                firmware_dtb::DtbPropertyValue::Bytes(values) => {
+                    FirmwarePropertyValue::Bytes(values.clone())
                 }
             },
         })

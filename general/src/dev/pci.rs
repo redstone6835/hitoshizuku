@@ -32,6 +32,7 @@ use core::fmt;
 use vfs::sync::Spinlock;
 
 use super::irq::IrqLine;
+use super::msi;
 use super::pnp::{
     BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
 };
@@ -156,6 +157,12 @@ const PCI_MSI_CAPABILITY_ID: u8 = 0x05;
 const PCI_MSIX_CAPABILITY_ID: u8 = 0x11;
 const PCI_MSI_CONTROL_OFFSET: u16 = 2;
 const PCI_MSI_CONTROL_ENABLE: u16 = 0x0001;
+const PCI_MSI_CONTROL_MULTI_MESSAGE_ENABLE_MASK: u16 = 0x0070;
+const PCI_MSI_CONTROL_64BIT_CAPABLE: u16 = 0x0080;
+const PCI_MSI_MESSAGE_ADDRESS_LO_OFFSET: u16 = 0x04;
+const PCI_MSI_MESSAGE_ADDRESS_HI_OFFSET: u16 = 0x08;
+const PCI_MSI_MESSAGE_DATA_32_OFFSET: u16 = 0x08;
+const PCI_MSI_MESSAGE_DATA_64_OFFSET: u16 = 0x0c;
 /// PCI 常规配置空间每条 bus 最多有 32 个 device 编号。
 pub const PCI_DEVICES_PER_BUS: u8 = 32;
 /// 每个 PCI device 最多有 8 个 function，0 号 function 必须先探测。
@@ -176,6 +183,14 @@ pub type PciIrqResolver = fn(
     interrupt_pin: Option<u8>,
     interrupt_line: Option<u8>,
 ) -> Option<IrqLine>;
+
+/// PCI endpoint MSI 分配回调。
+///
+/// Host bridge 负责把 PCI requester id 经固件 `msi-map` 路由到具体 MSI
+/// controller。PCI 设备层只拿到已经分配好的 message/line，不理解平台 MSI
+/// doorbell 地址或 vector 池。
+pub type PciMsiAllocator =
+    fn(segment: u16, bus: u8, device: u8, function: u8) -> Option<msi::MsiHandle>;
 
 pub struct PciConfigAccess {
     pub read_u8: fn(
@@ -225,6 +240,7 @@ pub struct PciConfigAccess {
     ) -> Result<(), PciConfigError>,
     pub device_mmio_to_virt: fn(phys_addr: usize) -> usize,
     pub resolve_irq: Option<PciIrqResolver>,
+    pub allocate_msi: Option<PciMsiAllocator>,
 }
 
 static PCI_CONFIG: Spinlock<Option<PciConfigAccess>> = Spinlock::new(None);
@@ -238,6 +254,38 @@ pub enum PciConfigError {
     InvalidDevice,
     InvalidOffset,
     Uninitialized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciMsiError {
+    NotSupported,
+    NoAllocator,
+    AllocationFailed,
+    AddressUnsupported,
+    DataUnsupported,
+    Config(PciConfigError),
+}
+
+impl From<PciConfigError> for PciMsiError {
+    fn from(err: PciConfigError) -> Self {
+        Self::Config(err)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciMsiHandle {
+    cap_offset: u16,
+    allocation: msi::MsiHandle,
+}
+
+impl PciMsiHandle {
+    pub const fn line(self) -> IrqLine {
+        self.allocation.line()
+    }
+
+    pub const fn message(self) -> msi::MsiMessage {
+        self.allocation.message()
+    }
 }
 
 // ── PCI capability 遍历 ─────────────────────────────────────────────────
@@ -655,6 +703,46 @@ impl PciDevice {
         resolver(segment, bus, device, function, pin, line)
     }
 
+    pub fn try_configure_single_msi(&self) -> Result<PciMsiHandle, PciMsiError> {
+        let cap_offset = self.msi_capability().ok_or(PciMsiError::NotSupported)?;
+        let (segment, bus, device, function) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
+        let allocator = {
+            let guard = PCI_CONFIG.lock();
+            guard
+                .as_ref()
+                .and_then(|config| config.allocate_msi)
+                .ok_or(PciMsiError::NoAllocator)?
+        };
+        let allocation =
+            allocator(segment, bus, device, function).ok_or(PciMsiError::AllocationFailed)?;
+        if let Err(err) = self.program_single_msi(cap_offset, allocation.message()) {
+            let _ = msi::free_msi(allocation);
+            return Err(err);
+        }
+        Ok(PciMsiHandle {
+            cap_offset,
+            allocation,
+        })
+    }
+
+    pub fn configure_single_msi(&self) -> Option<PciMsiHandle> {
+        self.try_configure_single_msi().ok()
+    }
+
+    pub fn release_configured_msi(&self, handle: PciMsiHandle) {
+        let _ = self.try_msi_disable(handle.cap_offset);
+        let _ = msi::free_msi(handle.allocation);
+    }
+
+    pub fn try_enable_configured_msi(&self, handle: PciMsiHandle) -> Result<(), PciMsiError> {
+        let ctrl = self.try_read_config_u16(handle.cap_offset + PCI_MSI_CONTROL_OFFSET)?;
+        self.try_write_config_u16(
+            handle.cap_offset + PCI_MSI_CONTROL_OFFSET,
+            (ctrl & !PCI_MSI_CONTROL_MULTI_MESSAGE_ENABLE_MASK) | PCI_MSI_CONTROL_ENABLE,
+        )?;
+        Ok(())
+    }
+
     pub fn bar_count(&self) -> usize {
         self.info().map(PciInfo::bar_count).unwrap_or(0)
     }
@@ -707,6 +795,47 @@ impl PciDevice {
 
     pub fn msi_disable(&self, cap_offset: u16) {
         let _ = self.try_msi_disable(cap_offset);
+    }
+
+    fn program_single_msi(
+        &self,
+        cap_offset: u16,
+        message: msi::MsiMessage,
+    ) -> Result<(), PciMsiError> {
+        if message.data > u16::MAX as u32 {
+            return Err(PciMsiError::DataUnsupported);
+        }
+        let ctrl = self.try_read_config_u16(cap_offset + PCI_MSI_CONTROL_OFFSET)?;
+        let supports_64 = ctrl & PCI_MSI_CONTROL_64BIT_CAPABLE != 0;
+        if !supports_64 && message.address > u32::MAX as u64 {
+            return Err(PciMsiError::AddressUnsupported);
+        }
+
+        // 编程 MSI message 前先关 MSI enable，避免设备在 address/data 半更新时
+        // 发出旧/新混合消息。这里只启用单 vector，multiple message enable 清零。
+        self.try_write_config_u16(
+            cap_offset + PCI_MSI_CONTROL_OFFSET,
+            ctrl & !PCI_MSI_CONTROL_ENABLE,
+        )?;
+        self.try_write_config_u32(
+            cap_offset + PCI_MSI_MESSAGE_ADDRESS_LO_OFFSET,
+            message.address as u32,
+        )?;
+        let data_offset = if supports_64 {
+            self.try_write_config_u32(
+                cap_offset + PCI_MSI_MESSAGE_ADDRESS_HI_OFFSET,
+                (message.address >> 32) as u32,
+            )?;
+            PCI_MSI_MESSAGE_DATA_64_OFFSET
+        } else {
+            PCI_MSI_MESSAGE_DATA_32_OFFSET
+        };
+        self.try_write_config_u16(cap_offset + data_offset, message.data as u16)?;
+        self.try_write_config_u16(
+            cap_offset + PCI_MSI_CONTROL_OFFSET,
+            ctrl & !(PCI_MSI_CONTROL_MULTI_MESSAGE_ENABLE_MASK | PCI_MSI_CONTROL_ENABLE),
+        )?;
+        Ok(())
     }
 
     // ── MSI-X ──

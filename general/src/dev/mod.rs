@@ -22,6 +22,7 @@ pub mod drivers;
 pub mod enumerate;
 pub mod function;
 pub mod irq;
+pub mod msi;
 pub mod naming;
 pub mod net;
 pub mod pci;

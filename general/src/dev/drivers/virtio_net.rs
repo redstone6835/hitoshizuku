@@ -18,7 +18,7 @@ use crate::dev::dma::{DmaBuffer, DmaDirection};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::naming::StableNameAllocator;
 use crate::dev::net::NetFunction;
-use crate::dev::pci::{PciDevice, PciInfo};
+use crate::dev::pci::{PciDevice, PciInfo, PciMsiHandle};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     register_driver_factory,
@@ -617,8 +617,14 @@ pub struct VirtioNetPciDriver {}
 struct VirtioNetPciBinding {
     iface_id: net::InterfaceId,
     net_dev: Arc<net::NetDevice>,
-    irq_handle: Option<IrqHandle>,
+    irq: Option<VirtioNetPciIrqRegistration>,
     _driver: Arc<VirtioNetPci>,
+}
+
+#[derive(Clone, Copy)]
+struct VirtioNetPciIrqRegistration {
+    irq_handle: IrqHandle,
+    msi_handle: Option<PciMsiHandle>,
 }
 
 impl VirtioNetPciDriver {
@@ -655,16 +661,45 @@ fn register_virtio_net_irq(
     pci: &PciDevice,
     driver: Arc<VirtioNetPci>,
     iface_id: net::InterfaceId,
-) -> Option<IrqHandle> {
+) -> Option<VirtioNetPciIrqRegistration> {
+    let handler: Arc<dyn IrqHandler> = Arc::new(VirtioNetPciIrqHandler { driver, iface_id });
+
+    if let Ok(msi_handle) = pci.try_configure_single_msi() {
+        let line = msi_handle.line();
+        match irq::register_irq_handler(line, Arc::clone(&handler)) {
+            Ok(irq_handle) => {
+                if pci.try_enable_configured_msi(msi_handle).is_ok() {
+                    pci.disable_interrupts();
+                    return Some(VirtioNetPciIrqRegistration {
+                        irq_handle,
+                        msi_handle: Some(msi_handle),
+                    });
+                }
+                let _ = irq::unregister_irq_handler(irq_handle);
+                pci.release_configured_msi(msi_handle);
+            }
+            Err(err) => {
+                log::printk!(
+                    "[virtio-net] failed to register MSI irq {:?}: {}",
+                    line,
+                    map_irq_error(err)
+                );
+                pci.release_configured_msi(msi_handle);
+            }
+        }
+    }
+
     let Some(line) = pci.routed_irq_line() else {
         pci.disable_interrupts();
         return None;
     };
-    let handler: Arc<dyn IrqHandler> = Arc::new(VirtioNetPciIrqHandler { driver, iface_id });
     match irq::register_irq_handler(line, handler) {
         Ok(handle) => {
             pci.enable_interrupts();
-            Some(handle)
+            Some(VirtioNetPciIrqRegistration {
+                irq_handle: handle,
+                msi_handle: None,
+            })
         }
         Err(err) => {
             log::printk!(
@@ -675,6 +710,15 @@ fn register_virtio_net_irq(
             pci.disable_interrupts();
             None
         }
+    }
+}
+
+fn unregister_virtio_net_irq(pci: &PciDevice, registration: VirtioNetPciIrqRegistration) {
+    let _ = irq::unregister_irq_handler(registration.irq_handle);
+    if let Some(msi_handle) = registration.msi_handle {
+        pci.release_configured_msi(msi_handle);
+    } else {
+        pci.disable_interrupts();
     }
 }
 
@@ -711,14 +755,13 @@ impl PnpDriver for VirtioNetPciDriver {
         net::stack()
             .attach(Arc::clone(&net_dev), config)
             .map_err(|_| PnpError::ProbeFailed)?;
-        let irq_handle = register_virtio_net_irq(&pci, Arc::clone(&driver), net_dev.id());
+        let irq = register_virtio_net_irq(&pci, Arc::clone(&driver), net_dev.id());
         if let Err(err) =
             dev.register_function(Arc::new(NetFunction::new(&name, Arc::clone(&net_dev))))
         {
-            if let Some(handle) = irq_handle {
-                let _ = irq::unregister_irq_handler(handle);
+            if let Some(registration) = irq {
+                unregister_virtio_net_irq(&pci, registration);
             }
-            pci.disable_interrupts();
             net_dev.mark_gone();
             let _ = net::stack().detach(net_dev.id());
             return Err(err);
@@ -726,7 +769,7 @@ impl PnpDriver for VirtioNetPciDriver {
         dev.set_driver_data(Arc::new(VirtioNetPciBinding {
             iface_id: net_dev.id(),
             net_dev: Arc::clone(&net_dev),
-            irq_handle,
+            irq,
             _driver: Arc::clone(&driver),
         }));
 
@@ -746,8 +789,12 @@ impl PnpDriver for VirtioNetPciDriver {
     fn remove(&self, dev: &Arc<PnpDevice>) {
         if let Some(data) = dev.take_driver_data() {
             if let Ok(binding) = data.downcast::<VirtioNetPciBinding>() {
-                if let Some(handle) = binding.irq_handle {
-                    let _ = irq::unregister_irq_handler(handle);
+                if let Some(registration) = binding.irq {
+                    if let Some(pci) = PciDevice::from_pnp(dev) {
+                        unregister_virtio_net_irq(&pci, registration);
+                    } else {
+                        let _ = irq::unregister_irq_handler(registration.irq_handle);
+                    }
                 }
                 binding.net_dev.mark_gone();
                 let _ = net::stack().detach(binding.iface_id);
