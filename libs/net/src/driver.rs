@@ -185,7 +185,7 @@ impl TxBuf {
 /// 任何驱动报告 `len > MAX_FRAME_LEN` 的接收帧会被强制截断。
 /// 这是防御深度——即使硬件或驱动 bug 报告异常长度，协议栈也不会读出
 /// buffer 边界。
-pub const MAX_FRAME_LEN: usize = 16 * 1024;
+pub const MAX_FRAME_LEN: usize = 64 * 1024;
 
 // ── 设备统计 ─────────────────────────────────────────────────────────────────
 

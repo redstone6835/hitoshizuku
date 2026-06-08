@@ -36,17 +36,18 @@ use crate::socket::{NetSocketHandle, SocketState, SocketType};
 
 // ── 常量 ─────────────────────────────────────────────────────────────────────
 
-const TCP_RX_BUF_SIZE: usize = 65535;
-const TCP_TX_BUF_SIZE: usize = 65535;
+const TCP_RX_BUF_SIZE: usize = 512 * 1024;
+const TCP_TX_BUF_SIZE: usize = 512 * 1024;
 const UDP_RX_BUF_SIZE: usize = 512 * 1024;
 const UDP_TX_BUF_SIZE: usize = 512 * 1024;
 const UDP_META_COUNT: usize = 512;
-/// 主动 poll 的短循环次数。
+/// 主动 poll 的最大短循环次数。
 ///
 /// smoltcp 的一次 `Interface::poll()` 顺序是先处理 ingress，再处理 egress。
 /// loopback 的 TX 会直接回灌到同一接口 RX 队列，因此 TCP 三次握手至少需要
 /// 多轮 poll 才能把 SYN、SYN-ACK、ACK 全部从队列里读回并投递给 socket。
-const ACTIVE_POLL_ROUNDS: usize = 64;
+
+const ACTIVE_POLL_MAX_ROUNDS: usize = 128;
 
 // ── 全局单例 ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +56,14 @@ static STACK: NetStack = NetStack::new();
 /// 获取全局网络协议栈实例。
 pub fn stack() -> &'static NetStack {
     &STACK
+}
+
+fn active_poll_managed(managed: &mut ManagedInterface, timestamp: Instant) {
+    for _ in 0..ACTIVE_POLL_MAX_ROUNDS {
+        if !managed.poll(timestamp) {
+            break;
+        }
+    }
 }
 
 /// TCP accept 的结果快照。
@@ -176,10 +185,9 @@ impl NetStack {
         let now_ns = sched::now_ns_public();
         let millis = (now_ns / 1_000_000) as i64;
         let table = self.interfaces.read();
-        for _ in 0..ACTIVE_POLL_ROUNDS {
-            for iface_lock in table.values() {
-                iface_lock.lock().poll(Instant::from_millis(millis));
-            }
+        for iface_lock in table.values() {
+            let mut managed = iface_lock.lock();
+            active_poll_managed(&mut managed, Instant::from_millis(millis));
         }
         drop(table);
         self.wake_socket_waiters();
@@ -194,9 +202,8 @@ impl NetStack {
         let millis = (now_ns / 1_000_000) as i64;
         let table = self.interfaces.read();
         if let Some(iface_lock) = table.get(&iface_id) {
-            for _ in 0..ACTIVE_POLL_ROUNDS {
-                iface_lock.lock().poll(Instant::from_millis(millis));
-            }
+            let mut managed = iface_lock.lock();
+            active_poll_managed(&mut managed, Instant::from_millis(millis));
         }
         drop(table);
         self.wake_socket_waiters();
