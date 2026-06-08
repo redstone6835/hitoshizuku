@@ -20,6 +20,7 @@ use general::dev::platform::{
     PlatformDeviceInfo, PlatformProbeStatus, register_and_probe_platform_device,
 };
 use general::dev::pnp::DevInitContext;
+use general::dev::pnp::PnpDevice;
 use general::firmware::dtb as firmware_dtb;
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
@@ -69,6 +70,7 @@ pub fn kernel_start_init(context: &StartContext) {
     let firmware_dtb::DtbFirmwareInfo {
         root_compatible,
         cpu_count,
+        cpus,
         mut memory_segments,
         reserved_segments,
         external_initramfs_range,
@@ -169,6 +171,29 @@ pub fn kernel_start_init(context: &StartContext) {
         memory_segments.len()
     );
 
+    let cpu_topology: Vec<_> = cpus
+        .into_iter()
+        .map(|cpu| general::dev::cpu::CpuTopologyEntry {
+            logical_id: cpu.logical_id,
+            reg: cpu.reg,
+            phandle: cpu.phandle,
+            compatible: cpu
+                .compatible
+                .into_iter()
+                .map(|compatible| compatible.into())
+                .collect(),
+            socket_id: cpu.socket_id,
+            core_id: cpu.core_id,
+            thread_id: cpu.thread_id,
+        })
+        .collect();
+    let cpu_topology_count = cpu_topology.len();
+    general::dev::cpu::install_topology(cpu_topology);
+    printk!(
+        "[kernel-start][dtb] installed CPU topology: {} CPU node(s)",
+        cpu_topology_count
+    );
+
     let cmdline = context
         .boot
         .command_line
@@ -218,6 +243,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
+    let mut registered_platform_nodes = Vec::new();
     // 中断控制器先注册，普通 platform 设备后注册。控制器之间仍可能存在
     // `interrupt-parent` 级联关系，例如 PCH PIC → EIOINTC → CPUIC；因此这里对
     // controller 节点做有限多轮重试，使父 domain 晚于子节点出现在 DTB 文本中
@@ -237,7 +263,16 @@ pub fn kernel_start_init(context: &StartContext) {
         for index in pending_controllers {
             let device = &platform_devices[index];
             let info = platform_device_info_from_dtb(device, stdout_phys);
-            match register_platform_device_status(info, "dtb", false) {
+            let outcome = register_platform_device_status(info, "dtb", false);
+            if let Some(pnp_device) = outcome.device {
+                remember_registered_platform_node(
+                    &mut registered_platform_nodes,
+                    device.path,
+                    device.parent_path,
+                    pnp_device,
+                );
+            }
+            match outcome.status {
                 PlatformRegisterStatus::Bound => platform_bound += 1,
                 PlatformRegisterStatus::Unbound => {}
                 PlatformRegisterStatus::Deferred | PlatformRegisterStatus::Failed => {
@@ -262,14 +297,25 @@ pub fn kernel_start_init(context: &StartContext) {
             continue;
         }
         let info = platform_device_info_from_dtb(device, stdout_phys);
-        if register_platform_device(info, "dtb") {
+        let outcome = register_platform_device_status(info, "dtb", true);
+        if let Some(pnp_device) = outcome.device {
+            remember_registered_platform_node(
+                &mut registered_platform_nodes,
+                device.path,
+                device.parent_path,
+                pnp_device,
+            );
+        }
+        if outcome.status == PlatformRegisterStatus::Bound {
             platform_bound += 1;
         }
     }
+    let attached_platform_edges = attach_platform_topology(&registered_platform_nodes);
     printk!(
-        "[kernel-start][dtb] platform PnP discovery complete: {} candidate(s), {} bound",
+        "[kernel-start][dtb] platform PnP discovery complete: {} candidate(s), {} bound, {} topology edge(s)",
         platform_devices.len(),
-        platform_bound
+        platform_bound,
+        attached_platform_edges
     );
 
     // 小步骤 5.3 然后尝试使用标准化后的 PCIe host bridge 描述完成 ECAM 安装、
@@ -616,6 +662,8 @@ fn platform_device_info_from_dtb(
 
     PlatformDeviceInfo {
         fw_name: device.name.into(),
+        fw_path: Some(device.path.into()),
+        fw_parent_path: device.parent_path.map(Into::into),
         ids,
         resources,
         properties: DeviceProperties {
@@ -634,6 +682,10 @@ fn platform_device_info_from_dtb(
             fw_phandle: device.phandle,
             fw_interrupt_parent: device.interrupt_parent,
             interrupt_controller: device.interrupt_controller,
+            fw_address_cells: u8::try_from(device.address_cells).ok(),
+            fw_size_cells: u8::try_from(device.size_cells).ok(),
+            fw_parent_address_cells: u8::try_from(device.parent_address_cells).ok(),
+            fw_parent_size_cells: u8::try_from(device.parent_size_cells).ok(),
             stdout: first_phys == stdout_phys,
         },
         fw_properties,
@@ -648,21 +700,57 @@ enum PlatformRegisterStatus {
     Failed,
 }
 
+struct PlatformRegisterOutcome {
+    status: PlatformRegisterStatus,
+    device: Option<Arc<PnpDevice>>,
+}
+
+struct RegisteredPlatformNode {
+    path: &'static str,
+    parent_path: Option<&'static str>,
+    device: Arc<PnpDevice>,
+}
+
+fn remember_registered_platform_node(
+    nodes: &mut Vec<RegisteredPlatformNode>,
+    path: &'static str,
+    parent_path: Option<&'static str>,
+    device: Arc<PnpDevice>,
+) {
+    if nodes
+        .iter()
+        .any(|node| node.path == path && Arc::ptr_eq(&node.device, &device))
+    {
+        return;
+    }
+    nodes.push(RegisteredPlatformNode {
+        path,
+        parent_path,
+        device,
+    });
+}
+
 fn register_platform_device_status(
     info: PlatformDeviceInfo,
     tag: &str,
     noisy_failure: bool,
-) -> PlatformRegisterStatus {
+) -> PlatformRegisterOutcome {
     match register_and_probe_platform_device(info) {
         Ok(reg) => match reg.status {
-            PlatformProbeStatus::Bound => PlatformRegisterStatus::Bound,
+            PlatformProbeStatus::Bound => PlatformRegisterOutcome {
+                status: PlatformRegisterStatus::Bound,
+                device: Some(reg.device),
+            },
             PlatformProbeStatus::NoDriver => {
                 log::debug!(
                     "[kernel-start][{}] no platform driver for {}",
                     tag,
                     reg.device.id
                 );
-                PlatformRegisterStatus::Unbound
+                PlatformRegisterOutcome {
+                    status: PlatformRegisterStatus::Unbound,
+                    device: Some(reg.device),
+                }
             }
             PlatformProbeStatus::Deferred => {
                 log::debug!(
@@ -670,7 +758,10 @@ fn register_platform_device_status(
                     tag,
                     reg.device.id
                 );
-                PlatformRegisterStatus::Deferred
+                PlatformRegisterOutcome {
+                    status: PlatformRegisterStatus::Deferred,
+                    device: Some(reg.device),
+                }
             }
         },
         Err(err) => {
@@ -687,11 +778,41 @@ fn register_platform_device_status(
                     err
                 );
             }
-            PlatformRegisterStatus::Failed
+            PlatformRegisterOutcome {
+                status: PlatformRegisterStatus::Failed,
+                device: None,
+            }
         }
     }
 }
 
-fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
-    register_platform_device_status(info, tag, true) == PlatformRegisterStatus::Bound
+fn attach_platform_topology(nodes: &[RegisteredPlatformNode]) -> usize {
+    let mut attached = 0usize;
+    for child in nodes {
+        let Some(parent_path) = child.parent_path else {
+            continue;
+        };
+        let Some(parent) = nodes
+            .iter()
+            .find(|candidate| candidate.path == parent_path)
+            .map(|candidate| Arc::clone(&candidate.device))
+        else {
+            continue;
+        };
+        if Arc::ptr_eq(&parent, &child.device) || child.device.parent().is_some() {
+            continue;
+        }
+        match parent.attach_child(&child.device) {
+            Ok(()) => attached += 1,
+            Err(err) => {
+                log::debug!(
+                    "[kernel-start][dtb] failed to attach platform topology {} -> {}: {:?}",
+                    child.path,
+                    parent_path,
+                    err
+                );
+            }
+        }
+    }
+    attached
 }

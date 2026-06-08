@@ -187,6 +187,14 @@ pub struct DeviceProperties {
     pub fw_interrupt_parent: Option<u32>,
     /// 该 platform 节点是否声明为 interrupt-controller。
     pub interrupt_controller: bool,
+    /// 固件节点为子地址空间声明的 `#address-cells`。
+    pub fw_address_cells: Option<u8>,
+    /// 固件节点为子地址空间声明的 `#size-cells`。
+    pub fw_size_cells: Option<u8>,
+    /// 父总线解释本节点 `reg`/`ranges` parent address 所用的 address cell 数。
+    pub fw_parent_address_cells: Option<u8>,
+    /// 父总线解释本节点 `reg` 所用的 size cell 数。
+    pub fw_parent_size_cells: Option<u8>,
     pub stdout: bool,
 }
 
@@ -208,6 +216,14 @@ pub struct FirmwareProperty {
 #[derive(Debug)]
 pub struct PlatformDeviceInfo {
     pub fw_name: Box<str>,
+    /// 固件树中的完整路径。ACPI 等没有树形路径的来源可以保持 `None`。
+    ///
+    /// 该字段只用于设备拓扑和稳定 instance 区分，不参与 `/dev` 命名或 POSIX
+    /// 设备号投影。
+    pub fw_path: Option<Box<str>>,
+    /// 固件树中的父节点路径。父节点如果也被登记成 platform 设备，启动路径会用它
+    /// 建立 PnP parent/children 关系。
+    pub fw_parent_path: Option<Box<str>>,
     pub ids: Vec<DeviceMatchId>,
     pub resources: Vec<DeviceResource>,
     pub properties: DeviceProperties,
@@ -443,6 +459,10 @@ fn platform_instance_id(info: &PlatformDeviceInfo) -> u32 {
     // 生成稳定 instance。它只用于 PnP identity，不参与 `/dev`/POSIX 设备号投影。
     let mut hash = PLATFORM_ID_FNV_OFFSET;
     hash = fnv_mix_bytes(hash, info.fw_name.as_bytes());
+    if let Some(path) = info.fw_path.as_ref() {
+        hash = fnv_mix_u32(hash, 0);
+        hash = fnv_mix_bytes(hash, path.as_bytes());
+    }
     for id in &info.ids {
         match id {
             DeviceMatchId::DtbCompatible(value) => {

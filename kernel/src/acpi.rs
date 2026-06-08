@@ -424,6 +424,8 @@ pub fn kernel_start_init(context: &StartContext) {
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
         let info = PlatformDeviceInfo {
             fw_name: port.name.into(),
+            fw_path: None,
+            fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
             properties: DeviceProperties {
@@ -432,6 +434,10 @@ pub fn kernel_start_init(context: &StartContext) {
                 fw_phandle: None,
                 fw_interrupt_parent: None,
                 interrupt_controller: false,
+                fw_address_cells: None,
+                fw_size_cells: None,
+                fw_parent_address_cells: None,
+                fw_parent_size_cells: None,
                 stdout: stdout_phys == Some(port.phys_addr),
             },
             fw_properties: Vec::new(),
@@ -445,6 +451,8 @@ pub fn kernel_start_init(context: &StartContext) {
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_VIRTIO_MMIO.into()));
         let info = PlatformDeviceInfo {
             fw_name: device.name.into(),
+            fw_path: None,
+            fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
             properties: DeviceProperties::default(),

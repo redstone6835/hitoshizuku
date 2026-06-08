@@ -9,9 +9,17 @@ pub use uart16550::*;
 
 mod loopback;
 
+mod firmware_bus;
+
+mod syscon;
+
 mod loongson_irq;
 
 mod ls7a_rtc;
+
+mod fw_cfg;
+
+mod cfi_flash;
 
 mod virtio_blk;
 pub use virtio_blk::*;
@@ -63,8 +71,12 @@ pub(super) fn virtio_blk_limits(block_size: u32) -> BlockLimits {
 /// 调用前必须已经通过 `set_dev_init_context()` 安装驱动初始化上下文。
 pub fn register_builtin_drivers() -> Result<(), PnpError> {
     loopback::register_builtin_driver()?;
+    firmware_bus::register_builtin_driver()?;
+    syscon::register_builtin_driver()?;
     loongson_irq::register_builtin_driver()?;
     ls7a_rtc::register_builtin_driver()?;
+    fw_cfg::register_builtin_driver()?;
+    cfi_flash::register_builtin_driver()?;
     uart16550::register_builtin_driver()?;
     virtio_blk::register_builtin_driver()?;
     virtio_net::register_builtin_driver()?;

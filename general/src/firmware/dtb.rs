@@ -60,8 +60,13 @@ pub struct DtbDeviceProperty {
 pub struct DtbPlatformDeviceInfo {
     pub name: &'static str,
     pub path: &'static str,
+    pub parent_path: Option<&'static str>,
     pub phandle: Option<u32>,
     pub interrupt_parent: Option<u32>,
+    pub address_cells: usize,
+    pub size_cells: usize,
+    pub parent_address_cells: usize,
+    pub parent_size_cells: usize,
     pub compatible: Vec<&'static str>,
     pub reg_ranges: Vec<DtbMmioRangeInfo>,
     pub interrupts: Vec<DtbInterruptInfo>,
@@ -125,6 +130,7 @@ pub struct DtbPciInterruptMapEntry {
 pub struct DtbFirmwareInfo {
     pub root_compatible: Vec<&'static str>,
     pub cpu_count: usize,
+    pub cpus: Vec<DtbCpuInfo>,
     pub memory_segments: Vec<MemorySegment>,
     pub reserved_segments: Vec<MemorySegment>,
     pub external_initramfs_range: Option<(usize, usize)>,
@@ -134,6 +140,17 @@ pub struct DtbFirmwareInfo {
     pub serial_ports: Vec<SerialPortInfo>,
     pub platform_devices: Vec<DtbPlatformDeviceInfo>,
     pub pcie_hosts: Vec<DtbPcieHostInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbCpuInfo {
+    pub logical_id: u32,
+    pub reg: u64,
+    pub phandle: Option<u32>,
+    pub compatible: Vec<&'static str>,
+    pub socket_id: Option<u32>,
+    pub core_id: Option<u32>,
+    pub thread_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +199,14 @@ struct DtbPhandle {
     node_id: NodeId,
 }
 
+#[derive(Clone, Copy)]
+struct DtbCpuMapEntry {
+    cpu: u32,
+    socket_id: Option<u32>,
+    core_id: Option<u32>,
+    thread_id: Option<u32>,
+}
+
 struct DtbTree {
     nodes: Vec<DtbNodeInfo>,
     aliases: Vec<DtbAlias>,
@@ -193,6 +218,7 @@ pub fn parse(dtb: Dtb<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
 
     let root_compatible = tree.root_compatible();
     let cpu_count = tree.cpu_count();
+    let cpus = tree.cpus();
     let stdout_serial = tree.stdout_serial();
     let power_controls = tree.power_controls();
     let external_initramfs_range = tree.external_initramfs_range();
@@ -207,6 +233,7 @@ pub fn parse(dtb: Dtb<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
     Ok(DtbFirmwareInfo {
         root_compatible,
         cpu_count,
+        cpus,
         memory_segments,
         reserved_segments,
         external_initramfs_range,
@@ -335,6 +362,71 @@ impl DtbTree {
             .filter(|entry| entry.enabled && entry.node.base_name_bytes() == b"cpu")
             .count()
             .max(1)
+    }
+
+    fn cpus(&self) -> Vec<DtbCpuInfo> {
+        let topology = self.cpu_map_entries();
+        let mut cpus = Vec::new();
+        for node_id in 0..self.nodes.len() {
+            let entry = &self.nodes[node_id];
+            if !entry.enabled || !self.node_is_cpu(node_id) {
+                continue;
+            }
+            let phandle = self.phandle_for_node(node_id);
+            let topology = phandle
+                .and_then(|phandle| topology.iter().find(|entry| entry.cpu == phandle).copied());
+            let logical_id = u32::try_from(cpus.len()).unwrap_or(u32::MAX);
+            cpus.push(DtbCpuInfo {
+                logical_id,
+                reg: self.read_cpu_reg(node_id).unwrap_or(u64::from(logical_id)),
+                phandle,
+                compatible: compatible_strings(entry.node),
+                socket_id: topology.and_then(|entry| entry.socket_id),
+                core_id: topology.and_then(|entry| entry.core_id),
+                thread_id: topology.and_then(|entry| entry.thread_id),
+            });
+        }
+        cpus
+    }
+
+    fn cpu_map_entries(&self) -> Vec<DtbCpuMapEntry> {
+        let Some(root_id) = self
+            .nodes
+            .iter()
+            .position(|entry| entry.enabled && entry.node.base_name_bytes() == b"cpu-map")
+        else {
+            return Vec::new();
+        };
+
+        let mut entries = Vec::new();
+        let mut stack = Vec::new();
+        stack.push((root_id, None, None, None));
+        while let Some((node_id, socket_id, core_id, thread_id)) = stack.pop() {
+            let node = self.nodes[node_id].node;
+            let name = node.name().unwrap_or("");
+            let socket_id = indexed_name_suffix(name, "socket").or(socket_id);
+            let core_id = indexed_name_suffix(name, "core").or(core_id);
+            let thread_id = indexed_name_suffix(name, "thread").or(thread_id);
+
+            if let Some(cpu) = node
+                .find_property("cpu")
+                .and_then(|prop| read_be_u32_prop(prop.value()))
+            {
+                entries.push(DtbCpuMapEntry {
+                    cpu,
+                    socket_id,
+                    core_id,
+                    thread_id,
+                });
+            }
+
+            for child in self.nodes[node_id].children.iter().rev() {
+                if self.nodes[*child].enabled {
+                    stack.push((*child, socket_id, core_id, thread_id));
+                }
+            }
+        }
+        entries
     }
 
     fn stdout_serial(&self) -> Option<SerialPortInfo> {
@@ -535,8 +627,13 @@ impl DtbTree {
             devices.push(DtbPlatformDeviceInfo {
                 name: self.node_name_or_path(node_id),
                 path: entry.path,
+                parent_path: entry.parent.map(|parent| self.nodes[parent].path),
                 phandle: self.phandle_for_node(node_id),
                 interrupt_parent: self.interrupt_parent_phandle(node_id),
+                address_cells: entry.child_addr_cells,
+                size_cells: entry.child_size_cells,
+                parent_address_cells: entry.reg_addr_cells,
+                parent_size_cells: entry.reg_size_cells,
                 compatible,
                 reg_ranges,
                 interrupts: self.interrupts(node_id),
@@ -1051,6 +1148,11 @@ impl DtbTree {
             || property_first_string_eq(node, "device_type", "memory")
     }
 
+    fn node_is_cpu(&self, node_id: NodeId) -> bool {
+        let node = self.nodes[node_id].node;
+        node.base_name_bytes() == b"cpu" || property_first_string_eq(node, "device_type", "cpu")
+    }
+
     fn node_is_serial(&self, node_id: NodeId) -> bool {
         let node = self.nodes[node_id].node;
         node.base_name_bytes() == b"serial"
@@ -1110,6 +1212,17 @@ impl DtbTree {
             .iter()
             .find(|entry| entry.node_id == node_id)
             .map(|entry| entry.value)
+    }
+
+    fn read_cpu_reg(&self, node_id: NodeId) -> Option<u64> {
+        let entry = &self.nodes[node_id];
+        let value = entry.node.find_property("reg")?.value();
+        let byte_count = entry.reg_addr_cells.checked_mul(4)?;
+        if entry.reg_addr_cells == 0 || value.len() < byte_count {
+            return None;
+        }
+        let raw = read_cells_u128(&value[..byte_count], entry.reg_addr_cells).ok()?;
+        u64::try_from(raw).ok()
     }
 }
 
@@ -1296,6 +1409,14 @@ fn string_list(value: &'static [u8]) -> Vec<&'static str> {
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| str::from_utf8(entry).ok())
         .collect()
+}
+
+fn indexed_name_suffix(name: &str, prefix: &str) -> Option<u32> {
+    let suffix = name.strip_prefix(prefix)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
 }
 
 fn read_bus_range(node: DtbNode<'static>) -> Option<(u8, u8)> {
