@@ -27,7 +27,7 @@ mod loongarch64_abi;
 use loongarch64_abi::{decode_dev_t, encode_dev_t};
 
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
-const COPY_CHUNK: usize = 2048;
+const COPY_CHUNK: usize = 8192;
 const PATH_MAX: usize = 4096;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
