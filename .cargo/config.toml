@@ -17,5 +17,5 @@ rustflags = [
 ]
 
 [env]
-CC_loongarch64_unknown_none = "loongarch64-unknown-linux-gnu-gcc"
+CC_loongarch64_unknown_none = "loongarch64-linux-gnu-gcc"
 CC_riscv64gc_unknown_none_elf = "riscv64-linux-gnu-gcc"

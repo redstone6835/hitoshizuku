@@ -9,13 +9,11 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use core::arch::global_asm;
+use core::arch::naked_asm;
 use core::mem::transmute;
 use core::ptr::addr_of;
 use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
-
-global_asm!(include_str!("vdso_text.S"));
 
 static TIMER_TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NET_POLL_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -43,8 +41,319 @@ pub const VDSO_DATA_CPU_ID_OFFSET: usize = 0x3C;
 pub const VDSO_DATA_NODE_ID_OFFSET: usize = 0x40;
 pub const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET: usize = 0x44;
 
+const SYS_CLOCK_GETTIME: usize = 113;
+const SYS_CLOCK_GETRES: usize = 114;
+const SYS_GETTIMEOFDAY: usize = 169;
+const SYS_GETCPU: usize = 168;
+const SYS_RT_SIGRETURN: usize = 139;
+
+const CLOCK_REALTIME: usize = 0;
+const CLOCK_MONOTONIC: usize = 1;
+const CLOCK_REALTIME_COARSE: usize = 5;
+const CLOCK_MONOTONIC_COARSE: usize = 6;
+const CLOCK_BOOTTIME: usize = 7;
+
+const VDSO_CLOCK_MODE_RDTIME: usize = 0;
+
+const NSEC_PER_SEC: usize = 1_000_000_000;
+const USEC_PER_SEC: usize = 1_000_000;
+const NSEC_PER_USEC: usize = 1_000;
+const VDSO_TIME_REALTIME: usize = 0;
+const VDSO_TIME_MONOTONIC: usize = 1;
+const VDSO_BLOB_SIZE: usize = VDSO_DATA_PAGE_OFFSET - TEXT_OFF;
+
+// vDSO 的用户态入口不能由普通 Rust 函数直接生成：最终映射给用户态的是一段
+// 独立 ELF shared object，代码地址也不是内核自身的 text 地址。这里用一个
+// naked 函数把 LoongArch64 指令编译进 `.rodata.vdso`，再由 `build_text()`
+// 拷贝为 vDSO 镜像的代码页。
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".rodata.vdso")]
+#[allow(named_asm_labels)]
+pub unsafe extern "C" fn __mygo_vdso_blob_start() {
+    naked_asm!(
+        "",
+        ".balign 4",
+        "",
+        // Linux/LoongArch64 syscall ABI 中的系统调用号。vDSO 只在无法用户态完成时
+        // fallback 到这些 syscall；rt_sigreturn 必须回到内核，不能在用户态模拟。
+        ".equ SYS_CLOCK_GETTIME, {sys_clock_gettime}",
+        ".equ SYS_CLOCK_GETRES, {sys_clock_getres}",
+        ".equ SYS_GETTIMEOFDAY, {sys_gettimeofday}",
+        ".equ SYS_GETCPU, {sys_getcpu}",
+        ".equ SYS_RT_SIGRETURN, {sys_rt_sigreturn}",
+        "",
+        // 当前 vDSO 用户态快速路径支持的 clock id。coarse 时钟复用同一份共享数据页，
+        // 精度由内核写入的 realtime_res 控制。
+        ".equ CLOCK_REALTIME, {clock_realtime}",
+        ".equ CLOCK_MONOTONIC, {clock_monotonic}",
+        ".equ CLOCK_REALTIME_COARSE, {clock_realtime_coarse}",
+        ".equ CLOCK_MONOTONIC_COARSE, {clock_monotonic_coarse}",
+        ".equ CLOCK_BOOTTIME, {clock_boottime}",
+        "",
+        // data page 中 clock_mode == 0 表示用户态可以直接执行 rdtime.d。
+        ".equ VDSO_CLOCK_MODE_RDTIME, {vdso_clock_mode_rdtime}",
+        "",
+        // vdso_data 布局必须与内核侧共享页完全一致。汇编只读这些偏移，不理解 Rust
+        // 结构体布局；修改内核结构时必须同步这里和本文件顶部的 Rust 常量。
+        ".equ VDSO_DATA_SEQ_OFFSET, {vdso_data_seq_offset}",
+        ".equ VDSO_DATA_CLOCK_MODE_OFFSET, {vdso_data_clock_mode_offset}",
+        ".equ VDSO_DATA_HZ_OFFSET, {vdso_data_hz_offset}",
+        ".equ VDSO_DATA_WALL_TIME_SEC_OFFSET, {vdso_data_wall_time_sec_offset}",
+        ".equ VDSO_DATA_WALL_TIME_NSEC_OFFSET, {vdso_data_wall_time_nsec_offset}",
+        ".equ VDSO_DATA_MONOTONIC_BASE_NS_OFFSET, {vdso_data_monotonic_base_ns_offset}",
+        ".equ VDSO_DATA_CS_CYCLE_LAST_OFFSET, {vdso_data_cs_cycle_last_offset}",
+        ".equ VDSO_DATA_CS_MULT_OFFSET, {vdso_data_cs_mult_offset}",
+        ".equ VDSO_DATA_CS_SHIFT_OFFSET, {vdso_data_cs_shift_offset}",
+        ".equ VDSO_DATA_CLOCK_REALTIME_RES_OFFSET, {vdso_data_clock_realtime_res_offset}",
+        "",
+        ".equ NSEC_PER_SEC, {nsec_per_sec}",
+        ".equ USEC_PER_SEC, {usec_per_sec}",
+        ".equ NSEC_PER_USEC, {nsec_per_usec}",
+        ".equ VDSO_TIME_REALTIME, {vdso_time_realtime}",
+        ".equ VDSO_TIME_MONOTONIC, {vdso_time_monotonic}",
+        "",
+        ".global __mygo_vdso_rt_sigreturn",
+        "__mygo_vdso_rt_sigreturn:",
+        // sigreturn 必须由内核恢复上下文；这里仅提供 C 库期望的 trampoline。
+        "    li.w $a7, SYS_RT_SIGRETURN",
+        "    syscall 0",
+        "",
+        ".global __mygo_vdso_clock_gettime",
+        "__mygo_vdso_clock_gettime:",
+        // 先把支持的 clock id 归一成 realtime/monotonic 两类；其它 id 走 syscall。
+        "    li.w $r6, VDSO_TIME_REALTIME",
+        "    beq $a0, $zero, .Lclock_gettime_supported",
+        "    li.w $r12, CLOCK_REALTIME_COARSE",
+        "    beq $a0, $r12, .Lclock_gettime_supported",
+        "    li.w $r6, VDSO_TIME_MONOTONIC",
+        "    li.w $r12, CLOCK_MONOTONIC",
+        "    beq $a0, $r12, .Lclock_gettime_supported",
+        "    li.w $r12, CLOCK_MONOTONIC_COARSE",
+        "    beq $a0, $r12, .Lclock_gettime_supported",
+        "    li.w $r12, CLOCK_BOOTTIME",
+        "    beq $a0, $r12, .Lclock_gettime_supported",
+        "    b .Lclock_gettime_fallback",
+        "",
+        ".Lclock_gettime_supported:",
+        "    beqz $a1, .Lclock_gettime_fallback",
+        "    la.local $r12, __mygo_vdso_data_anchor",
+        "",
+        ".Lclock_gettime_retry:",
+        // seqlock 协议：奇数表示内核正在写共享页，偶数才可读取快照。
+        "    ld.wu $r13, $r12, VDSO_DATA_SEQ_OFFSET",
+        "    andi $r14, $r13, 1",
+        "    bnez $r14, .Lclock_gettime_retry",
+        "    dbar 0",
+        "",
+        // 读取共享页快照；clock_mode/hz 无效时直接回退 syscall，避免返回坏时间。
+        "    ld.wu $r14, $r12, VDSO_DATA_CLOCK_MODE_OFFSET",
+        "    bnez $r14, .Lclock_gettime_fallback",
+        "    ld.d $r15, $r12, VDSO_DATA_HZ_OFFSET",
+        "    beqz $r15, .Lclock_gettime_fallback",
+        "    ld.d $r16, $r12, VDSO_DATA_WALL_TIME_SEC_OFFSET",
+        "    ld.d $r17, $r12, VDSO_DATA_WALL_TIME_NSEC_OFFSET",
+        "    ld.d $r18, $r12, VDSO_DATA_MONOTONIC_BASE_NS_OFFSET",
+        "    ld.d $r19, $r12, VDSO_DATA_CS_CYCLE_LAST_OFFSET",
+        "    ld.d $r20, $r12, VDSO_DATA_CS_MULT_OFFSET",
+        "    ld.wu $r7, $r12, VDSO_DATA_CS_SHIFT_OFFSET",
+        "    rdtime.d $r8, $zero",
+        "",
+        // 再读 seq，若内核更新过共享页就丢弃快照重试。
+        "    dbar 0",
+        "    ld.wu $r9, $r12, VDSO_DATA_SEQ_OFFSET",
+        "    bne $r13, $r9, .Lclock_gettime_retry",
+        "",
+        // delta_ns = ((rdtime - cycle_last) * mult) >> shift。
+        // 这里用 64x64 -> 128 的低/高半结果拼出右移后的 64 位纳秒增量。
+        "    sub.d $r8, $r8, $r19",
+        "    mul.d $r9, $r8, $r20",
+        "    mulh.du $r10, $r8, $r20",
+        "    srl.d $r9, $r9, $r7",
+        "    li.w $r11, 64",
+        "    sub.d $r11, $r11, $r7",
+        "    sll.d $r10, $r10, $r11",
+        "    or $r9, $r9, $r10",
+        "",
+        "    bnez $r6, .Lclock_gettime_monotonic",
+        "",
+        // CLOCK_REALTIME：内核给出 epoch 秒和纳秒余数，用户态只补上 delta。
+        "    add.d $r17, $r17, $r9",
+        "    li.w $r10, NSEC_PER_SEC",
+        "    div.du $r18, $r17, $r10",
+        "    mod.du $r17, $r17, $r10",
+        "    add.d $r16, $r16, $r18",
+        "    b .Lclock_gettime_store",
+        "",
+        ".Lclock_gettime_monotonic:",
+        // CLOCK_MONOTONIC/BOOTTIME：单调基准是纳秒总量，最后拆成 timespec。
+        "    add.d $r18, $r18, $r9",
+        "    li.w $r10, NSEC_PER_SEC",
+        "    div.du $r16, $r18, $r10",
+        "    mod.du $r17, $r18, $r10",
+        "",
+        ".Lclock_gettime_store:",
+        "    st.d $r16, $a1, 0",
+        "    st.d $r17, $a1, 8",
+        "    addi.d $a0, $zero, 0",
+        "    ret",
+        "",
+        ".Lclock_gettime_fallback:",
+        "    li.w $a7, SYS_CLOCK_GETTIME",
+        "    syscall 0",
+        "    ret",
+        "",
+        ".global __mygo_vdso_gettimeofday",
+        "__mygo_vdso_gettimeofday:",
+        "    la.local $r12, __mygo_vdso_data_anchor",
+        "",
+        ".Lgettimeofday_retry:",
+        // gettimeofday 只需要 realtime；仍使用同一套 seqlock + rdtime 快照。
+        "    ld.wu $r13, $r12, VDSO_DATA_SEQ_OFFSET",
+        "    andi $r14, $r13, 1",
+        "    bnez $r14, .Lgettimeofday_retry",
+        "    dbar 0",
+        "",
+        "    ld.wu $r14, $r12, VDSO_DATA_CLOCK_MODE_OFFSET",
+        "    bnez $r14, .Lgettimeofday_fallback",
+        "    ld.d $r15, $r12, VDSO_DATA_HZ_OFFSET",
+        "    beqz $r15, .Lgettimeofday_fallback",
+        "    ld.d $r16, $r12, VDSO_DATA_WALL_TIME_SEC_OFFSET",
+        "    ld.d $r17, $r12, VDSO_DATA_WALL_TIME_NSEC_OFFSET",
+        "    ld.d $r19, $r12, VDSO_DATA_CS_CYCLE_LAST_OFFSET",
+        "    ld.d $r20, $r12, VDSO_DATA_CS_MULT_OFFSET",
+        "    ld.wu $r7, $r12, VDSO_DATA_CS_SHIFT_OFFSET",
+        "    rdtime.d $r8, $zero",
+        "",
+        "    dbar 0",
+        "    ld.wu $r9, $r12, VDSO_DATA_SEQ_OFFSET",
+        "    bne $r13, $r9, .Lgettimeofday_retry",
+        "",
+        "    sub.d $r8, $r8, $r19",
+        "    mul.d $r9, $r8, $r20",
+        "    mulh.du $r10, $r8, $r20",
+        "    srl.d $r9, $r9, $r7",
+        "    li.w $r11, 64",
+        "    sub.d $r11, $r11, $r7",
+        "    sll.d $r10, $r10, $r11",
+        "    or $r9, $r9, $r10",
+        "",
+        "    add.d $r17, $r17, $r9",
+        "    li.w $r10, NSEC_PER_SEC",
+        "    div.du $r18, $r17, $r10",
+        "    mod.du $r17, $r17, $r10",
+        "    add.d $r16, $r16, $r18",
+        "    li.w $r10, NSEC_PER_USEC",
+        "    div.du $r17, $r17, $r10",
+        "",
+        "    beqz $a0, .Lgettimeofday_success",
+        "    st.d $r16, $a0, 0",
+        "    st.d $r17, $a0, 8",
+        "",
+        ".Lgettimeofday_success:",
+        "    addi.d $a0, $zero, 0",
+        "    ret",
+        "",
+        ".Lgettimeofday_fallback:",
+        "    li.w $a7, SYS_GETTIMEOFDAY",
+        "    syscall 0",
+        "    ret",
+        "",
+        ".global __mygo_vdso_clock_getres",
+        "__mygo_vdso_clock_getres:",
+        // 支持的 clock id 直接读取共享页中的精度；未知 clock id 保持 syscall 语义。
+        "    beq $a0, $zero, .Lclock_getres_supported",
+        "    li.w $r12, CLOCK_REALTIME_COARSE",
+        "    beq $a0, $r12, .Lclock_getres_supported",
+        "    li.w $r12, CLOCK_MONOTONIC",
+        "    beq $a0, $r12, .Lclock_getres_supported",
+        "    li.w $r12, CLOCK_MONOTONIC_COARSE",
+        "    beq $a0, $r12, .Lclock_getres_supported",
+        "    li.w $r12, CLOCK_BOOTTIME",
+        "    beq $a0, $r12, .Lclock_getres_supported",
+        "    b .Lclock_getres_fallback",
+        "",
+        ".Lclock_getres_supported:",
+        "    la.local $r12, __mygo_vdso_data_anchor",
+        "",
+        ".Lclock_getres_retry:",
+        "    ld.wu $r13, $r12, VDSO_DATA_SEQ_OFFSET",
+        "    andi $r14, $r13, 1",
+        "    bnez $r14, .Lclock_getres_retry",
+        "    dbar 0",
+        "",
+        "    ld.wu $r14, $r12, VDSO_DATA_CLOCK_MODE_OFFSET",
+        "    bnez $r14, .Lclock_getres_fallback",
+        "    ld.d $r15, $r12, VDSO_DATA_HZ_OFFSET",
+        "    beqz $r15, .Lclock_getres_fallback",
+        "    ld.wu $r16, $r12, VDSO_DATA_CLOCK_REALTIME_RES_OFFSET",
+        "",
+        "    dbar 0",
+        "    ld.wu $r17, $r12, VDSO_DATA_SEQ_OFFSET",
+        "    bne $r13, $r17, .Lclock_getres_retry",
+        "",
+        "    beqz $a1, .Lclock_getres_success",
+        "    st.d $zero, $a1, 0",
+        "    st.d $r16, $a1, 8",
+        "",
+        ".Lclock_getres_success:",
+        "    addi.d $a0, $zero, 0",
+        "    ret",
+        "",
+        ".Lclock_getres_fallback:",
+        "    li.w $a7, SYS_CLOCK_GETRES",
+        "    syscall 0",
+        "    ret",
+        "",
+        ".global __mygo_vdso_getcpu",
+        "__mygo_vdso_getcpu:",
+        // getcpu 目前保持 syscall fallback；共享页已有 cpu/node 字段，后续可以
+        // 按同一 seqlock 模式改成纯用户态读取。
+        "    li.w $a7, SYS_GETCPU",
+        "    syscall 0",
+        "    ret",
+        "",
+        ".global __mygo_vdso_text_end",
+        "__mygo_vdso_text_end:",
+        "",
+        // 代码 blob 固定填充到 0xe00；Rust 侧从 TEXT_OFF(0x200) 放入后刚好占满
+        // 第一页到 0x1000。data_anchor 是用户态代码用 la.local 定位共享数据页的锚点。
+        ".org {vdso_blob_size}",
+        ".global __mygo_vdso_blob_end",
+        ".global __mygo_vdso_data_anchor",
+        "__mygo_vdso_blob_end:",
+        "__mygo_vdso_data_anchor:",
+        sys_clock_gettime = const SYS_CLOCK_GETTIME,
+        sys_clock_getres = const SYS_CLOCK_GETRES,
+        sys_gettimeofday = const SYS_GETTIMEOFDAY,
+        sys_getcpu = const SYS_GETCPU,
+        sys_rt_sigreturn = const SYS_RT_SIGRETURN,
+        clock_realtime = const CLOCK_REALTIME,
+        clock_monotonic = const CLOCK_MONOTONIC,
+        clock_realtime_coarse = const CLOCK_REALTIME_COARSE,
+        clock_monotonic_coarse = const CLOCK_MONOTONIC_COARSE,
+        clock_boottime = const CLOCK_BOOTTIME,
+        vdso_clock_mode_rdtime = const VDSO_CLOCK_MODE_RDTIME,
+        vdso_data_seq_offset = const VDSO_DATA_SEQ_OFFSET,
+        vdso_data_clock_mode_offset = const VDSO_DATA_CLOCK_MODE_OFFSET,
+        vdso_data_hz_offset = const VDSO_DATA_HZ_OFFSET,
+        vdso_data_wall_time_sec_offset = const VDSO_DATA_WALL_TIME_SEC_OFFSET,
+        vdso_data_wall_time_nsec_offset = const VDSO_DATA_WALL_TIME_NSEC_OFFSET,
+        vdso_data_monotonic_base_ns_offset = const VDSO_DATA_MONOTONIC_BASE_NS_OFFSET,
+        vdso_data_cs_cycle_last_offset = const VDSO_DATA_CS_CYCLE_LAST_OFFSET,
+        vdso_data_cs_mult_offset = const VDSO_DATA_CS_MULT_OFFSET,
+        vdso_data_cs_shift_offset = const VDSO_DATA_CS_SHIFT_OFFSET,
+        vdso_data_clock_realtime_res_offset = const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET,
+        nsec_per_sec = const NSEC_PER_SEC,
+        usec_per_sec = const USEC_PER_SEC,
+        nsec_per_usec = const NSEC_PER_USEC,
+        vdso_time_realtime = const VDSO_TIME_REALTIME,
+        vdso_time_monotonic = const VDSO_TIME_MONOTONIC,
+        vdso_blob_size = const VDSO_BLOB_SIZE,
+    )
+}
+
 unsafe extern "C" {
-    static __mygo_vdso_blob_start: u8;
     static __mygo_vdso_blob_end: u8;
     static __mygo_vdso_text_end: u8;
     static __mygo_vdso_rt_sigreturn: u8;
@@ -288,7 +597,7 @@ fn build_text(b: &mut [u8]) {
 }
 
 fn blob_bytes() -> &'static [u8] {
-    let start = addr_of!(__mygo_vdso_blob_start) as usize;
+    let start = __mygo_vdso_blob_start as usize;
     let end = addr_of!(__mygo_vdso_blob_end) as usize;
     unsafe { slice::from_raw_parts(start as *const u8, end - start) }
 }
@@ -314,7 +623,7 @@ fn symbol_layouts() -> [(usize, usize); 5] {
 }
 
 fn symbol_offset(sym: *const u8) -> usize {
-    let start = addr_of!(__mygo_vdso_blob_start) as usize;
+    let start = __mygo_vdso_blob_start as usize;
     TEXT_OFF + (sym as usize - start)
 }
 
