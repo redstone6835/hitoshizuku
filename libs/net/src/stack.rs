@@ -38,9 +38,9 @@ use crate::socket::{NetSocketHandle, SocketState, SocketType};
 
 const TCP_RX_BUF_SIZE: usize = 65535;
 const TCP_TX_BUF_SIZE: usize = 65535;
-const UDP_RX_BUF_SIZE: usize = 8192;
-const UDP_TX_BUF_SIZE: usize = 8192;
-const UDP_META_COUNT: usize = 16;
+const UDP_RX_BUF_SIZE: usize = 512 * 1024;
+const UDP_TX_BUF_SIZE: usize = 512 * 1024;
+const UDP_META_COUNT: usize = 512;
 /// 主动 poll 的短循环次数。
 ///
 /// smoltcp 的一次 `Interface::poll()` 顺序是先处理 ingress，再处理 egress。

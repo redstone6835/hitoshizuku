@@ -430,6 +430,8 @@ impl ManagedInterface {
     ) -> SocketHandle {
         // TODO: UDP packet metadata 数量固定，队列满时只能 WouldBlock；
         // 还没有按 socket option 或负载自动调节。
+        // TODO: VFS 层 SO_RCVBUF/SO_SNDBUF 目前只记录在 SocketOptions，
+        // 还没有下沉到这里动态决定 smoltcp PacketBuffer 的容量。
         let rx_buf = smoltcp::socket::udp::PacketBuffer::new(
             alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; rx_meta_count],
             alloc::vec![0u8; rx_buf_size],
