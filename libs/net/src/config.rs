@@ -36,7 +36,7 @@ pub struct Ipv6Addr(pub [u8; 16]);
 
 impl Ipv6Addr {
     pub const UNSPECIFIED: Self = Self([0; 16]);
-    pub const LOCALHOST: Self = Self([0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1]);
+    pub const LOCALHOST: Self = Self([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
     pub fn new(segments: [u16; 8]) -> Self {
         let mut octets = [0u8; 16];
@@ -72,11 +72,17 @@ pub struct CidrAddress {
 
 impl CidrAddress {
     pub fn new_v4(addr: Ipv4Addr, prefix_len: u8) -> Self {
-        Self { addr: IpAddr::V4(addr), prefix_len }
+        Self {
+            addr: IpAddr::V4(addr),
+            prefix_len,
+        }
     }
 
     pub fn new_v6(addr: Ipv6Addr, prefix_len: u8) -> Self {
-        Self { addr: IpAddr::V6(addr), prefix_len }
+        Self {
+            addr: IpAddr::V6(addr),
+            prefix_len,
+        }
     }
 }
 
@@ -142,6 +148,8 @@ impl IfConfig {
 
     /// 自动配置（DHCP + SLAAC）。
     pub fn auto() -> Self {
+        // FIXME: 这里只声明 Auto 模式并返回空地址/空网关，当前没有 DHCP
+        // 或 SLAAC 状态机负责后续填充配置。
         Self {
             addresses: Vec::new(),
             gateway: None,
@@ -149,4 +157,3 @@ impl IfConfig {
         }
     }
 }
-

@@ -8,11 +8,11 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dev::pnp::{BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
 
-static NEXT_PLATFORM_INDEX: AtomicU32 = AtomicU32::new(0);
+const PLATFORM_ID_FNV_OFFSET: u32 = 0x811c_9dc5;
+const PLATFORM_ID_FNV_PRIME: u32 = 0x0100_0193;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceMatchId {
@@ -84,7 +84,7 @@ pub fn register_and_probe_platform_device(
     info: PlatformDeviceInfo,
 ) -> Result<PlatformRegistration, PnpError> {
     let name = info.fw_name.clone();
-    let index = NEXT_PLATFORM_INDEX.fetch_add(1, Ordering::Relaxed);
+    let index = platform_instance_id(&info);
     let id = PnpId::Platform {
         name: name.clone(),
         index,
@@ -106,4 +106,57 @@ pub fn register_and_probe_platform_device(
             Err(err)
         }
     }
+}
+
+fn platform_instance_id(info: &PlatformDeviceInfo) -> u32 {
+    // Platform 设备没有 PCI BDF 这类天然地址，这里用固件名、match id 和资源 tuple
+    // 生成稳定 instance。它只用于 PnP identity，不参与 `/dev`/POSIX 设备号投影。
+    let mut hash = PLATFORM_ID_FNV_OFFSET;
+    hash = fnv_mix_bytes(hash, info.fw_name.as_bytes());
+    for id in &info.ids {
+        match id {
+            DeviceMatchId::DtbCompatible(value) => {
+                hash = fnv_mix_u32(hash, 1);
+                hash = fnv_mix_bytes(hash, value.as_bytes());
+            }
+            DeviceMatchId::AcpiHid(value) => {
+                hash = fnv_mix_u32(hash, 2);
+                hash = fnv_mix_bytes(hash, value.as_bytes());
+            }
+            DeviceMatchId::AcpiCid(value) => {
+                hash = fnv_mix_u32(hash, 3);
+                hash = fnv_mix_bytes(hash, value.as_bytes());
+            }
+        }
+    }
+    for resource in &info.resources {
+        match *resource {
+            DeviceResource::Mmio { phys, size } => {
+                hash = fnv_mix_u32(hash, 4);
+                hash = fnv_mix_usize(hash, phys);
+                hash = fnv_mix_usize(hash, size);
+            }
+            DeviceResource::Irq(irq) => {
+                hash = fnv_mix_u32(hash, 5);
+                hash = fnv_mix_u32(hash, irq);
+            }
+        }
+    }
+    hash
+}
+
+fn fnv_mix_bytes(mut hash: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(PLATFORM_ID_FNV_PRIME);
+    }
+    hash
+}
+
+fn fnv_mix_u32(hash: u32, value: u32) -> u32 {
+    fnv_mix_bytes(hash, &value.to_le_bytes())
+}
+
+fn fnv_mix_usize(hash: u32, value: usize) -> u32 {
+    fnv_mix_bytes(hash, &value.to_le_bytes())
 }

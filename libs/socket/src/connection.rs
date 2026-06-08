@@ -416,6 +416,16 @@ pub(crate) fn connect_stream(
     options: SendOptions,
 ) -> Result<(), SocketError> {
     let key = address.binding_key().ok_or(SocketError::InvalidInput)?;
+    {
+        let my_state = stream.state.lock();
+        if !my_state.is_init() {
+            return if my_state.connected_ref().is_some() {
+                Err(SocketError::AlreadyConnected)
+            } else {
+                Err(SocketError::StateMismatch)
+            };
+        }
+    }
     loop {
         let peer = registry_lookup(&key).ok_or(SocketError::ConnectionRejected)?;
         let SocketKind::Stream(peer_stream) = &peer.inner.kind_impl else {
@@ -481,6 +491,16 @@ pub(crate) fn connect_seqpacket(
     options: SendOptions,
 ) -> Result<(), SocketError> {
     let key = address.binding_key().ok_or(SocketError::InvalidInput)?;
+    {
+        let my_state = seq.state.lock();
+        if !my_state.is_init() {
+            return if my_state.connected_ref().is_some() {
+                Err(SocketError::AlreadyConnected)
+            } else {
+                Err(SocketError::StateMismatch)
+            };
+        }
+    }
     loop {
         let peer = registry_lookup(&key).ok_or(SocketError::ConnectionRejected)?;
         let SocketKind::Sequenced(peer_seq) = &peer.inner.kind_impl else {
@@ -544,6 +564,12 @@ pub(crate) fn connect_datagram(
     address: UnixAddress,
     _options: SendOptions,
 ) -> Result<(), SocketError> {
+    {
+        let state = dgram.state.lock();
+        if state.write_shutdown {
+            return Err(SocketError::PeerClosed);
+        }
+    }
     if matches!(address, UnixAddress::Unnamed) {
         let mut state = dgram.state.lock();
         state.connected = None;
@@ -556,9 +582,6 @@ pub(crate) fn connect_datagram(
         return Err(SocketError::StateMismatch);
     }
     let mut state = dgram.state.lock();
-    if state.write_shutdown {
-        return Err(SocketError::PeerClosed);
-    }
     state.connected = Some(DatagramPeer::Bound {
         address,
         target: Arc::downgrade(&peer.inner),

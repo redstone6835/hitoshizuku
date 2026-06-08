@@ -40,6 +40,27 @@ use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
 use crate::wait_flags::WaitStatus;
 
+/// Linux 线程名长度，包含结尾 NUL。
+pub const TASK_COMM_LEN: usize = 16;
+const DEFAULT_COMM: [u8; TASK_COMM_LEN] =
+    [b'm', b'y', b'g', b'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// 每线程 robust futex 链表注册状态。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RobustListState {
+    pub head: usize,
+    pub len: usize,
+}
+
+/// 每线程 rseq 注册状态。当前仅作为 ABI 占位，不执行 rseq 快路径。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RseqRegistration {
+    pub ptr: usize,
+    pub len: u32,
+    pub signature: u32,
+    pub registered: bool,
+}
+
 /// 任务状态机。
 ///
 /// 状态转换由调度器内部原子 CAS 驱动，避免为"取状态"再持 rq 锁。
@@ -82,9 +103,14 @@ impl TaskState {
     }
 }
 
-/// 退出码，目前只承载原始数值；信号退出由上层组装成标准 `wstatus`。
+/// 退出码，承载正常 exit(code) 的原始数值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
+
+const EXIT_REASON_NONE: u8 = 0;
+const EXIT_REASON_EXITED: u8 = 1;
+const EXIT_REASON_SIGNALED: u8 = 2;
+const EXIT_REASON_CORE_DUMPED: u8 = 3;
 
 /// 默认内核栈大小：64 KiB。fork 等深层调用需要足够空间，避免栈溢出损坏堆。
 pub const DEFAULT_KERNEL_STACK_SIZE: usize = 64 * 1024;
@@ -211,6 +237,8 @@ pub struct Task {
     state: AtomicU8,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
+    exit_reason: AtomicU8,
+    exit_signal_number: AtomicI32,
     wait_stop_sig: AtomicI32,
     wait_stop_pending: AtomicU8,
     wait_continue_pending: AtomicU8,
@@ -235,6 +263,12 @@ pub struct Task {
     vforking: AtomicBool,
     /// `CLONE_CHILD_CLEARTID` / `set_tid_address` 指定的用户态 TID 地址。
     clear_child_tid: AtomicUsize,
+    /// `set_robust_list` 注册的每线程 robust futex 链表。
+    robust_list: Spinlock<RobustListState>,
+    /// `rseq` 注册状态。完整 restartable sequence 语义后续由 arch/trap 接入。
+    rseq: Spinlock<RseqRegistration>,
+    /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
+    comm: Spinlock<[u8; TASK_COMM_LEN]>,
     /// CPU 亲和性位图。预留单 word，单 CPU 原型暂不强制。
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
@@ -263,6 +297,8 @@ impl Task {
             state: AtomicU8::new(TaskState::New as u8),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
+            exit_reason: AtomicU8::new(EXIT_REASON_NONE),
+            exit_signal_number: AtomicI32::new(0),
             wait_stop_sig: AtomicI32::new(0),
             wait_stop_pending: AtomicU8::new(0),
             wait_continue_pending: AtomicU8::new(0),
@@ -283,6 +319,9 @@ impl Task {
             vfork_done: WaitQueue::new(),
             vforking: AtomicBool::new(false),
             clear_child_tid: AtomicUsize::new(0),
+            robust_list: Spinlock::new(RobustListState::default()),
+            rseq: Spinlock::new(RseqRegistration::default()),
+            comm: Spinlock::new(DEFAULT_COMM),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
             ext: Spinlock::new(Vec::new()),
@@ -360,6 +399,10 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
+        if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
+            self.exit_reason
+                .store(EXIT_REASON_EXITED, Ordering::Release);
+        }
         self.has_exit_code.store(1, Ordering::Release);
         self.wait_stop_pending.store(0, Ordering::Release);
         self.wait_continue_pending.store(0, Ordering::Release);
@@ -372,6 +415,38 @@ impl Task {
             None
         } else {
             Some(ExitCode(self.exit_code.load(Ordering::Acquire)))
+        }
+    }
+
+    /// 标记下一次退出是信号终止。随后 [`mark_exited`] 会保留该原因，
+    /// wait4/waitid 按 WIFSIGNALED/WCOREDUMP 编码。
+    pub(crate) fn mark_signaled_exit(&self, sig: SignalNumber, core_dumped: bool) {
+        self.exit_signal_number
+            .store(sig.raw() as i32, Ordering::Release);
+        self.exit_reason.store(
+            if core_dumped {
+                EXIT_REASON_CORE_DUMPED
+            } else {
+                EXIT_REASON_SIGNALED
+            },
+            Ordering::Release,
+        );
+    }
+
+    /// 把已记录的退出原因转换成 wait4/waitid 的 `wstatus`。
+    pub fn exit_wait_status(&self) -> Option<WaitStatus> {
+        let code = self.exit_code()?;
+        match self.exit_reason.load(Ordering::Acquire) {
+            EXIT_REASON_SIGNALED | EXIT_REASON_CORE_DUMPED => {
+                let sig = SignalNumber::from_raw(self.exit_signal_number.load(Ordering::Acquire))
+                    .unwrap_or(SignalNumber::SIGTERM);
+                if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_CORE_DUMPED {
+                    Some(WaitStatus::from_signal_core(sig))
+                } else {
+                    Some(WaitStatus::from_signal(sig))
+                }
+            }
+            _ => Some(WaitStatus::from_exit(code.0)),
         }
     }
 
@@ -635,6 +710,41 @@ impl Task {
         self.clear_child_tid.store(user_addr, Ordering::Release);
     }
 
+    pub fn robust_list(&self) -> RobustListState {
+        *self.robust_list.lock()
+    }
+
+    pub fn set_robust_list(&self, head: usize, len: usize) {
+        *self.robust_list.lock() = RobustListState { head, len };
+    }
+
+    pub fn rseq_registration(&self) -> RseqRegistration {
+        *self.rseq.lock()
+    }
+
+    pub fn set_rseq_registration(&self, registration: RseqRegistration) {
+        *self.rseq.lock() = registration;
+    }
+
+    pub fn clear_rseq_registration(&self) {
+        *self.rseq.lock() = RseqRegistration::default();
+    }
+
+    pub fn comm(&self) -> [u8; TASK_COMM_LEN] {
+        *self.comm.lock()
+    }
+
+    pub fn set_comm(&self, name: &[u8]) {
+        let mut comm = [0u8; TASK_COMM_LEN];
+        let n = name
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(name.len())
+            .min(TASK_COMM_LEN - 1);
+        comm[..n].copy_from_slice(&name[..n]);
+        *self.comm.lock() = comm;
+    }
+
     // ── CPU 亲和性 ───────────────────────────────────────────────────────
 
     pub fn cpu_affinity(&self) -> u64 {
@@ -741,4 +851,24 @@ pub fn register_ext_clone_hook(hook: &'static dyn TaskExtCloneHook) {
 /// 取已注册的 hook；未注册返回 `None`。
 pub fn ext_clone_hook() -> Option<&'static dyn TaskExtCloneHook> {
     *EXT_CLONE_HOOK.lock()
+}
+
+/// 任务退出时由上层清理挂在 ext 表里的退出期资源。
+///
+/// sched 只保留 wait/reap 需要的 Task 元数据；fdtable 这类会保活外部对象的
+/// 资源不应被 Zombie 任务保活到父进程 wait 之后。
+pub trait TaskExtExitHook: Send + Sync {
+    fn cleanup_on_exit(&self, task: &Arc<Task>);
+}
+
+static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
+
+/// 注册全局 ext exit hook。kernel 启动期调用一次。
+pub fn register_ext_exit_hook(hook: &'static dyn TaskExtExitHook) {
+    *EXT_EXIT_HOOK.lock() = Some(hook);
+}
+
+/// 取已注册的 exit hook；未注册返回 `None`。
+pub fn ext_exit_hook() -> Option<&'static dyn TaskExtExitHook> {
+    *EXT_EXIT_HOOK.lock()
 }

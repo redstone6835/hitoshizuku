@@ -238,12 +238,8 @@ impl UserTrapFrame {
     pub unsafe fn resume(&self) -> ! {
         #[cfg(target_arch = "loongarch64")]
         {
-            let ptr = TrapFramePtr::new(
-                &self.inner as *const arch::TrapFrame as usize,
-            );
-            unsafe {
-                <arch::LoongArch64TaskOps as TaskOps>::resume_to_trap_frame(ptr)
-            }
+            let ptr = TrapFramePtr::new(&self.inner as *const arch::TrapFrame as usize);
+            unsafe { <arch::LoongArch64TaskOps as TaskOps>::resume_to_trap_frame(ptr) }
         }
 
         #[cfg(target_arch = "riscv64")]

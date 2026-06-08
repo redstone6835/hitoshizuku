@@ -15,7 +15,7 @@ use crate::device::InterfaceId;
 // ── Socket 类型 ──────────────────────────────────────────────────────────────
 
 /// 网络 socket 协议类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SocketType {
     /// TCP 流式 socket（面向连接，可靠有序字节流）。
     Tcp,
@@ -54,12 +54,24 @@ pub enum SocketState {
 pub(crate) struct SocketMeta {
     /// socket 是否已被标记为移除。
     pub removed: AtomicBool,
+    /// fd 已释放但 TCP 四次挥手还需要继续由协议栈推进。
+    ///
+    /// orphan socket 不再允许上层通过旧 handle 访问；它只保留在
+    /// `SocketSet` 里处理尾部数据、FIN/ACK 和 TIME-WAIT，等状态稳定后
+    /// 由 poll 路径统一回收。
+    pub orphaned: AtomicBool,
+    /// TCP listener 被 smoltcp 原地转换为 Established 后，是否已经交给
+    /// VFS accept 路径。smoltcp 没有独立 accept 队列，必须用这个标记避免
+    /// 按监听端点扫描时把同一条已接受连接重复返回。
+    pub accepted: AtomicBool,
 }
 
 impl SocketMeta {
     pub fn new() -> Self {
         Self {
             removed: AtomicBool::new(false),
+            orphaned: AtomicBool::new(false),
+            accepted: AtomicBool::new(false),
         }
     }
 
@@ -70,6 +82,22 @@ impl SocketMeta {
     pub fn mark_removed(&self) {
         self.removed.store(true, Ordering::Release);
     }
+
+    pub fn is_orphaned(&self) -> bool {
+        self.orphaned.load(Ordering::Acquire)
+    }
+
+    pub fn mark_orphaned(&self) {
+        self.orphaned.store(true, Ordering::Release);
+    }
+
+    pub fn is_accepted(&self) -> bool {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    pub fn mark_accepted(&self) {
+        self.accepted.store(true, Ordering::Release);
+    }
 }
 
 // ── Socket Handle ────────────────────────────────────────────────────────────
@@ -78,7 +106,7 @@ impl SocketMeta {
 ///
 /// 轻量标识符（`Copy`），持有它即可通过 `NetStack` 操作 socket。
 /// 内含接口 ID 以便 stack 直接路由到正确的 `ManagedInterface`。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NetSocketHandle {
     pub(crate) iface_id: InterfaceId,
     pub(crate) inner: smoltcp::iface::SocketHandle,
@@ -95,4 +123,25 @@ impl NetSocketHandle {
     pub fn socket_type(&self) -> SocketType {
         self.sock_type
     }
+}
+
+// ── 快照类型（供 /proc/net/ 查询）─────────────────────────────────────────────
+
+/// /proc/net/tcp 渲染用的 TCP 连接快照。
+#[derive(Debug, Clone)]
+pub struct TcpConnSnapshot {
+    pub local: crate::Endpoint,
+    pub remote: crate::Endpoint,
+    pub state: u8,
+    pub tx_queue: usize,
+    pub rx_queue: usize,
+    pub inode: u64,
+}
+
+/// /proc/net/udp 渲染用的 UDP socket 快照。
+#[derive(Debug, Clone)]
+pub struct UdpSockSnapshot {
+    pub local: crate::Endpoint,
+    pub remote: Option<crate::Endpoint>,
+    pub inode: u64,
 }

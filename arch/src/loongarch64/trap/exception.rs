@@ -126,7 +126,16 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             }
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
-            sched::on_timer_tick(super::super::specific::kernel_timestamp_ns());
+            let now_ns = super::super::specific::kernel_timestamp_ns();
+            sched::on_timer_tick(now_ns);
+            super::super::vdso::run_timer_tick_hook(now_ns);
+            // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
+            // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
+            // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
+            // 路径在 RX 队列空时本身极快（一次 mutex + 几次状态查询）。
+            super::super::vdso::run_net_poll_hook(now_ns);
+            sched::preempt_if_needed(now_ns);
+            return arg4;
         }
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。
@@ -137,6 +146,11 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         // general::syscall::dispatch 本轮全部返 ENOSYS；ELF loader 那轮再逐条加 arm。
         // log::debug!("[trap] syscall id={} pc={:#x} from_user={}", tf.a7, arg0, from_user);
         general::syscall::dispatch(general::TrapFramePtr::new(arg4));
+        // syscall 内部可能唤醒了其它任务或新建了子进程，并通过
+        // request_resched() 标记当前 CPU 需要重调度。系统调用返回用户态前
+        // 立即消费该标记，避免当前任务在同一时间片里连续启动 client，
+        // 而刚 fork/唤醒的 server 只能等下一次 timer tick。
+        sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
         arg4
     } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD | ECODE_ASXD) {
         let enable = match ecode {
@@ -167,12 +181,6 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         match general::mm::dispatch_page_fault(tf_ptr) {
             FaultOutcome::Fixed => arg4,
             FaultOutcome::Segv => {
-                log::info!(
-                    "[trap][mm] user SIGSEGV pc={:#x} badv={:#x} ecode={}",
-                    arg0,
-                    arg2,
-                    ecode
-                );
                 // 投 SIGSEGV 给当前线程；下一次调度边界 deliver_pending_signals
                 // 拿到默认 Term 动作即触发 exit_task。本轮 hello 跑通不应触发；
                 // 兜底替代旧的 halt 行为。

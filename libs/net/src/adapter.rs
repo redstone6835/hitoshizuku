@@ -21,7 +21,7 @@ use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
 use crate::device::NetDevice;
-use crate::driver::{NetDriver, RxBuf};
+use crate::driver::{LinkMedium, NetDriver, RxBuf};
 
 // ── 适配器 ───────────────────────────────────────────────────────────────────
 
@@ -65,8 +65,16 @@ impl Device for NetDeviceAdapter {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = self.driver.mtu() + 14;
+        caps.medium = match self.driver.medium() {
+            LinkMedium::Ethernet => Medium::Ethernet,
+            LinkMedium::Ip => Medium::Ip,
+        };
+        // Ethernet medium 的 MTU 是完整链路帧大小；IP medium 没有二层头，
+        // 直接把 driver 暴露的 IP MTU 交给 smoltcp。
+        caps.max_transmission_unit = match self.driver.medium() {
+            LinkMedium::Ethernet => self.driver.mtu() + 14,
+            LinkMedium::Ip => self.driver.mtu(),
+        };
         caps
     }
 }

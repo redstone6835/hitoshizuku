@@ -38,6 +38,7 @@ const AT_CLKTCK: usize = 17;
 const AT_SECURE: usize = 23;
 const AT_RANDOM: usize = 25;
 const AT_EXECFN: usize = 31;
+const AT_SYSINFO_EHDR: usize = 33;
 const MAX_SHEBANG_DEPTH: usize = 4;
 
 const ELF64_EHDR_SIZE: usize = 64;
@@ -181,6 +182,30 @@ fn load_user_image_from_path_inner(
         .with(VmFlags::GROWS_DOWN);
     vm.commit_segment(stack_bottom, stack_size, 0, &[], stack_flags)?;
 
+    // Map vDSO code page from the synthesized ELF image, then attach the shared
+    // data page as a direct read-only mapping for user-space fast paths.
+    let vdso_bytes = hal::user::vdso_image();
+    let vdso_base = hal::user::vdso_base();
+    let vdso_text_len = hal::user::vdso_text_page_len();
+    let vdso_code_flags = VmFlags::EMPTY
+        .with(VmFlags::READ)
+        .with(VmFlags::EXEC)
+        .with(VmFlags::USER);
+    vm.commit_segment(
+        vdso_base,
+        vdso_text_len,
+        vdso_text_len,
+        &vdso_bytes[..vdso_text_len],
+        vdso_code_flags,
+    )?;
+    let vdso_data_flags = VmFlags::EMPTY.with(VmFlags::READ).with(VmFlags::USER);
+    let vdso_data_paddr = crate::vdso::shared_data_page_paddr()?;
+    vm.map_direct(
+        vdso_base + hal::user::vdso_data_page_offset()..vdso_base + hal::user::vdso_total_size(),
+        vdso_data_paddr,
+        vdso_data_flags,
+    )?;
+
     unsafe {
         let ops = user_pgd_ops().expect("[user] user_pgd_ops not registered");
         (ops.activate)(vm.pgd());
@@ -206,6 +231,7 @@ fn load_user_image_from_path_inner(
         creds.euid.0,
         creds.gid.0,
         creds.egid.0,
+        hal::user::vdso_base(),
     )?;
 
     Ok(LoadedUserImage {
@@ -227,6 +253,7 @@ fn layout_user_stack(
     euid: u32,
     gid: u32,
     egid: u32,
+    vdso_base: usize,
 ) -> Result<usize, errno::Errno> {
     const MAX_STACK_ARG_BYTES: usize = 128 * 1024;
     let mut budget = 0usize;
@@ -299,6 +326,7 @@ fn layout_user_stack(
         (AT_SECURE, 0),
         (AT_RANDOM, random_ptr),
         (AT_EXECFN, execfn_ptr),
+        (AT_SYSINFO_EHDR, vdso_base),
         (AT_NULL, 0),
     ];
 

@@ -8,6 +8,7 @@
 //! **零 alloc 于解析本身**：所有缓存字段都是对原字节切片的借用或少量 `Copy`
 //! 标量。`Box<dyn Image>` 的堆分配只发生在 [`crate::parse`] 返回时。
 
+use core::convert::TryFrom;
 use core::ops::Range;
 use core::str;
 
@@ -50,15 +51,18 @@ impl<'a> LinuxElfImage<'a> {
         let ty = read_u16(bytes, EHDR_OFF_TYPE);
         accept_type(ty)?;
         let machine = read_u16(bytes, EHDR_OFF_MACHINE);
-        let entry = read_u64(bytes, EHDR_OFF_ENTRY) as usize;
+        let entry =
+            usize::try_from(read_u64(bytes, EHDR_OFF_ENTRY)).map_err(|_| ElfError::InvalidEntry)?;
         let phoff = read_u64(bytes, EHDR_OFF_PHOFF);
         let phentsize = read_u16(bytes, EHDR_OFF_PHENTSIZE);
         let phnum = read_u16(bytes, EHDR_OFF_PHNUM);
 
         let phdrs = PhdrView::new(bytes, phoff, phentsize, phnum)?;
         validate_load_segments(bytes, &phdrs)?;
+        validate_phdr_table(bytes, &phdrs)?;
+        validate_entry(entry, &phdrs)?;
         let interp = find_interp(bytes, &phdrs)?;
-        let phdr_vaddr = find_phdr_vaddr(phoff, &phdrs);
+        let phdr_vaddr = find_phdr_vaddr(&phdrs);
         let load_range = load_vaddr_range(&phdrs)?;
 
         Ok(Self {
@@ -162,14 +166,17 @@ impl<'a, 'b> Iterator for LinuxSegmentIter<'a, 'b> {
             if phdr.p_type != PT_LOAD {
                 continue;
             }
+            if phdr.p_memsz == 0 {
+                continue;
+            }
             // 切段数据：[p_offset, p_offset + p_filesz)。
-            let off = phdr.p_offset as usize;
-            let filesz = phdr.p_filesz as usize;
+            let off = usize::try_from(phdr.p_offset).ok()?;
+            let filesz = usize::try_from(phdr.p_filesz).ok()?;
             let end = off.checked_add(filesz)?;
             debug_assert!(end <= self.bytes.len());
             return Some(Segment {
-                vaddr: phdr.p_vaddr as usize,
-                memsz: phdr.p_memsz as usize,
+                vaddr: usize::try_from(phdr.p_vaddr).ok()?,
+                memsz: usize::try_from(phdr.p_memsz).ok()?,
                 file_offset: phdr.p_offset,
                 file_size: filesz,
                 perms: perms_from_phdr(&phdr),
@@ -211,68 +218,134 @@ fn find_interp<'a>(bytes: &'a [u8], view: &PhdrView<'a>) -> Result<Option<&'a st
         if ph.p_type != PT_INTERP {
             continue;
         }
-        let off = ph.p_offset as usize;
-        let len = ph.p_filesz as usize;
-        let end = off
-            .checked_add(len)
-            .ok_or(ElfError::SegmentOffsetOverflow)?;
-        if end > bytes.len() {
-            return Err(ElfError::SegmentOffsetOverflow);
-        }
-        // 去掉尾部 NUL（若存在）；空段视为无效解释器。
-        let raw = &bytes[off..end];
-        let trimmed = match raw.last() {
-            Some(&0) => &raw[..raw.len() - 1],
-            _ => raw,
-        };
-        if trimmed.is_empty() {
+        let range = file_range_in_image(bytes, ph.p_offset, ph.p_filesz)?;
+        let raw = &bytes[range];
+        if raw.len() <= 1 || raw.last() != Some(&0) {
             return Err(ElfError::InvalidInterp);
         }
-        let s = str::from_utf8(trimmed).map_err(|_| ElfError::InvalidInterp)?;
+        let path = &raw[..raw.len() - 1];
+        if path.is_empty() || path.contains(&0) {
+            return Err(ElfError::InvalidInterp);
+        }
+        let s = str::from_utf8(path).map_err(|_| ElfError::InvalidInterp)?;
         return Ok(Some(s));
     }
     Ok(None)
 }
 
 fn validate_load_segments(bytes: &[u8], view: &PhdrView<'_>) -> Result<(), ElfError> {
-    for ph in view.iter() {
+    for idx in 0..view.count() {
+        let ph = view.get(idx).ok_or(ElfError::TruncatedPhdr)?;
         if ph.p_type != PT_LOAD {
             continue;
         }
+        validate_load_alignment(&ph)?;
         if ph.p_filesz > ph.p_memsz {
-            return Err(ElfError::SegmentOffsetOverflow);
+            return Err(ElfError::InvalidSegment);
         }
-        let off = ph.p_offset as usize;
-        let filesz = ph.p_filesz as usize;
-        let end = off
-            .checked_add(filesz)
-            .ok_or(ElfError::SegmentOffsetOverflow)?;
-        if end > bytes.len() {
-            return Err(ElfError::SegmentOffsetOverflow);
-        }
-        let vaddr = ph.p_vaddr as usize;
-        let memsz = ph.p_memsz as usize;
-        let _ = vaddr
-            .checked_add(memsz)
-            .ok_or(ElfError::SegmentOffsetOverflow)?;
+        let _ = file_range_in_image(bytes, ph.p_offset, ph.p_filesz)?;
+        let _ = vaddr_range(ph.p_vaddr, ph.p_memsz)?;
+    }
+    validate_load_overlaps(view)
+}
+
+fn validate_load_alignment(ph: &Phdr64) -> Result<(), ElfError> {
+    if ph.p_align <= 1 {
+        return Ok(());
+    }
+    if !ph.p_align.is_power_of_two() {
+        return Err(ElfError::InvalidSegment);
+    }
+    if ph.p_vaddr % ph.p_align != ph.p_offset % ph.p_align {
+        return Err(ElfError::InvalidSegment);
     }
     Ok(())
 }
 
-fn find_phdr_vaddr(phoff: u64, view: &PhdrView<'_>) -> Option<usize> {
+fn validate_load_overlaps(view: &PhdrView<'_>) -> Result<(), ElfError> {
+    for i in 0..view.count() {
+        let left = view.get(i).ok_or(ElfError::TruncatedPhdr)?;
+        if left.p_type != PT_LOAD || left.p_memsz == 0 {
+            continue;
+        }
+        let left_range = vaddr_range(left.p_vaddr, left.p_memsz)?;
+        for j in (i + 1)..view.count() {
+            let right = view.get(j).ok_or(ElfError::TruncatedPhdr)?;
+            if right.p_type != PT_LOAD || right.p_memsz == 0 {
+                continue;
+            }
+            let right_range = vaddr_range(right.p_vaddr, right.p_memsz)?;
+            if ranges_overlap(&left_range, &right_range) {
+                return Err(ElfError::InvalidSegment);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_phdr_table(bytes: &[u8], view: &PhdrView<'_>) -> Result<(), ElfError> {
+    let mut seen = false;
+    for ph in view.iter() {
+        if ph.p_type != PT_PHDR {
+            continue;
+        }
+        if seen {
+            return Err(ElfError::InvalidPhdr);
+        }
+        seen = true;
+        if ph.p_filesz > ph.p_memsz {
+            return Err(ElfError::InvalidPhdr);
+        }
+        let _ = file_range_in_image(bytes, ph.p_offset, ph.p_filesz)?;
+        let end = ph
+            .p_offset
+            .checked_add(ph.p_filesz)
+            .ok_or(ElfError::PhdrOffsetOverflow)?;
+        if ph.p_offset > view.file_offset() || end < view.file_end() {
+            return Err(ElfError::InvalidPhdr);
+        }
+        let _ = vaddr_range(ph.p_vaddr, ph.p_memsz)?;
+    }
+    Ok(())
+}
+
+fn validate_entry(entry: usize, view: &PhdrView<'_>) -> Result<(), ElfError> {
+    for ph in view.iter() {
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 || ph.p_flags & PF_X == 0 {
+            continue;
+        }
+        let range = vaddr_range(ph.p_vaddr, ph.p_memsz)?;
+        if range.contains(&entry) {
+            return Ok(());
+        }
+    }
+    Err(ElfError::InvalidEntry)
+}
+
+fn find_phdr_vaddr(view: &PhdrView<'_>) -> Option<usize> {
     for ph in view.iter() {
         if ph.p_type == PT_PHDR {
-            return Some(ph.p_vaddr as usize);
+            return phdr_table_vaddr_in_segment(
+                view.file_offset(),
+                view.file_end(),
+                ph.p_offset,
+                ph.p_filesz,
+                ph.p_vaddr,
+            );
         }
     }
     for ph in view.iter() {
         if ph.p_type != PT_LOAD {
             continue;
         }
-        let start = ph.p_offset;
-        let end = ph.p_offset.checked_add(ph.p_filesz)?;
-        if phoff >= start && phoff < end {
-            return Some((ph.p_vaddr + (phoff - start)) as usize);
+        if let Some(vaddr) = phdr_table_vaddr_in_segment(
+            view.file_offset(),
+            view.file_end(),
+            ph.p_offset,
+            ph.p_filesz,
+            ph.p_vaddr,
+        ) {
+            return Some(vaddr);
         }
     }
     None
@@ -286,15 +359,55 @@ fn load_vaddr_range(view: &PhdrView<'_>) -> Result<Option<Range<usize>>, ElfErro
         if ph.p_type != PT_LOAD {
             continue;
         }
-        let seg_start = ph.p_vaddr as usize;
-        let seg_end = seg_start
-            .checked_add(ph.p_memsz as usize)
-            .ok_or(ElfError::SegmentOffsetOverflow)?;
-        start = start.min(seg_start);
-        end = end.max(seg_end);
+        if ph.p_memsz == 0 {
+            continue;
+        }
+        let range = vaddr_range(ph.p_vaddr, ph.p_memsz)?;
+        start = start.min(range.start);
+        end = end.max(range.end);
         seen = true;
     }
     Ok(if seen { Some(start..end) } else { None })
+}
+
+fn file_range_in_image(bytes: &[u8], offset: u64, size: u64) -> Result<Range<usize>, ElfError> {
+    let end = offset
+        .checked_add(size)
+        .ok_or(ElfError::SegmentOffsetOverflow)?;
+    let start = usize::try_from(offset).map_err(|_| ElfError::SegmentOffsetOverflow)?;
+    let end = usize::try_from(end).map_err(|_| ElfError::SegmentOffsetOverflow)?;
+    if end > bytes.len() {
+        return Err(ElfError::SegmentOffsetOverflow);
+    }
+    Ok(start..end)
+}
+
+fn vaddr_range(vaddr: u64, size: u64) -> Result<Range<usize>, ElfError> {
+    let end = vaddr
+        .checked_add(size)
+        .ok_or(ElfError::SegmentOffsetOverflow)?;
+    let start = usize::try_from(vaddr).map_err(|_| ElfError::SegmentOffsetOverflow)?;
+    let end = usize::try_from(end).map_err(|_| ElfError::SegmentOffsetOverflow)?;
+    Ok(start..end)
+}
+
+fn phdr_table_vaddr_in_segment(
+    table_start: u64,
+    table_end: u64,
+    seg_offset: u64,
+    seg_filesz: u64,
+    seg_vaddr: u64,
+) -> Option<usize> {
+    let seg_end = seg_offset.checked_add(seg_filesz)?;
+    if seg_offset > table_start || seg_end < table_end {
+        return None;
+    }
+    let delta = table_start.checked_sub(seg_offset)?;
+    usize::try_from(seg_vaddr.checked_add(delta)?).ok()
+}
+
+fn ranges_overlap(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
 }
 
 fn read_u16(s: &[u8], off: usize) -> u16 {

@@ -16,7 +16,7 @@ use general::dev::char::CharDevice;
 use general::dev::drivers;
 use general::dev::drivers::{RANDOM_DRIVER, URANDOM_DRIVER};
 use general::dev::enumerate::DEVICES;
-use general::dev::function::{find_char_device_by_fw_name, lookup_block_device_by_node};
+use general::dev::function::{active_block_devices, find_char_device_by_fw_name};
 use general::dev::pci::pci_scan_and_register;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, PlatformDeviceInfo,
@@ -29,9 +29,11 @@ use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
+use general::vfs::ensure_dir;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
+use general::vfs::mount_posix_shm_tmpfs;
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
@@ -75,17 +77,17 @@ pub fn kernel_start_init(context: &StartContext) {
         stdout_serial,
         power_controls,
         serial_ports,
-        virtio_mmio_devices,
+        platform_devices,
         pcie_hosts,
     } = firmware;
 
     printk!(
-        "[kernel-start][dtb] firmware parsed: cpu={} memory={} reserved={} serial={} virtio-mmio={} pcie-host={}",
+        "[kernel-start][dtb] firmware parsed: cpu={} memory={} reserved={} serial={} platform={} pcie-host={}",
         cpu_count,
         memory_segments.len(),
         reserved_segments.len(),
         serial_ports.len(),
-        virtio_mmio_devices.len(),
+        platform_devices.len(),
         pcie_hosts.len()
     );
 
@@ -217,10 +219,17 @@ pub fn kernel_start_init(context: &StartContext) {
         .expect("[kernel-start][dtb] failed to install PnP devtmpfs bridge");
     printk!("[kernel-start][dtb] PnP devtmpfs callbacks installed");
 
-    set_dev_init_context(DevInitContext::new(
-        context.address.device_mmio_to_virt,
-        context.address.virt_to_phys,
-    ));
+    set_dev_init_context(
+        DevInitContext::new(
+            context.address.device_mmio_to_virt,
+            context.address.virt_to_phys,
+        )
+        .with_realtime_clock(crate::vdso::set_realtime_ns)
+        .with_realtime_source_hooks(
+            crate::vdso::install_realtime_source,
+            crate::vdso::unregister_realtime_source,
+        ),
+    );
 
     // 安装架构无关的熵源：random 子系统需要时间戳 / 栈指针等
     // 启动期熵，这些只能由 arch 层提供。
@@ -242,50 +251,15 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
-    for port in &serial_ports {
-        let mut ids = Vec::new();
-        ids.push(DeviceMatchId::DtbCompatible("ns16550a".into()));
-        ids.push(DeviceMatchId::DtbCompatible("ns16550".into()));
-        let mut resources = Vec::new();
-        resources.push(DeviceResource::Mmio {
-            phys: port.phys_addr,
-            size: 0x100,
-        });
-        let info = PlatformDeviceInfo {
-            fw_name: port.name.into(),
-            ids,
-            resources,
-            properties: DeviceProperties {
-                clock_hz: port.clock_hz,
-                baud: Some(115_200),
-                stdout: stdout_phys == Some(port.phys_addr),
-            },
-        };
-        if register_platform_device(info, "dtb") {
-            platform_bound += 1;
-        }
-    }
-    for device in &virtio_mmio_devices {
-        let mut ids = Vec::new();
-        ids.push(DeviceMatchId::DtbCompatible("virtio,mmio".into()));
-        let mut resources = Vec::new();
-        resources.push(DeviceResource::Mmio {
-            phys: device.phys_addr,
-            size: device.size,
-        });
-        let info = PlatformDeviceInfo {
-            fw_name: device.name.into(),
-            ids,
-            resources,
-            properties: DeviceProperties::default(),
-        };
+    for device in &platform_devices {
+        let info = platform_device_info_from_dtb(device, stdout_phys);
         if register_platform_device(info, "dtb") {
             platform_bound += 1;
         }
     }
     printk!(
         "[kernel-start][dtb] platform PnP discovery complete: {} candidate(s), {} bound",
-        serial_ports.len() + virtio_mmio_devices.len(),
+        platform_devices.len(),
         platform_bound
     );
 
@@ -317,7 +291,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
         pci::assign_bars(host.bus_start, host.bus_end);
 
-        let count = pci_scan_and_register(0, host.bus_start, host.bus_end, "pci-");
+        let count = pci_scan_and_register(0, host.bus_start, host.bus_end);
         printk!(
             "[kernel-start][dtb] pci_scan_and_register probed {} device(s)",
             count
@@ -340,15 +314,8 @@ pub fn kernel_start_init(context: &StartContext) {
             },
         )
     } else {
-        let dev = lookup_block_devnode("vd0")
-            .unwrap_or_else(|| panic!("[kernel-start][dtb] no initramfs and /dev/vd0 not found"));
-        mount_block_root(Arc::clone(&dev)).unwrap_or_else(|err| {
-            panic!(
-                "[kernel-start][dtb] failed to mount /dev/{} as root: {}",
-                dev.name(),
-                err
-            )
-        })
+        mount_first_block_root()
+            .unwrap_or_else(|err| panic!("[kernel-start][dtb] failed to mount block root: {}", err))
     };
     printk!("[kernel-start][dtb] root source selected: {}", root_source);
 
@@ -391,6 +358,10 @@ pub fn kernel_start_init(context: &StartContext) {
         .mount(dev_dentry, Arc::clone(&dev_sb), MountFlags::default())
         .expect("[kernel-start][dtb] failed to mount devtmpfs on /dev");
 
+    // POSIX shm 不需要专用驱动；把 tmpfs 覆盖到 /dev/shm 后，用户态通过普通
+    // open/ftruncate/mmap(MAP_SHARED) 就能得到共享内存文件后端。
+    mount_posix_shm_tmpfs(&vfs_ctx).expect("[kernel-start][dtb] failed to mount tmpfs on /dev/shm");
+
     ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
         .expect("[kernel-start][dtb] failed to ensure /sys directory");
     let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
@@ -410,7 +381,7 @@ pub fn kernel_start_init(context: &StartContext) {
         .expect("[kernel-start][dtb] failed to mount sysfs on /sys");
 
     printk!(
-        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + sysfs '/sys'",
+        "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",
         root_source
     );
 
@@ -537,10 +508,6 @@ fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
     find_char_device_by_fw_name(&DEVICES.functions, name)
 }
 
-fn lookup_block_devnode(name: &str) -> Option<Arc<BlockDevice>> {
-    lookup_block_device_by_node(&DEVICES.functions, name)
-}
-
 fn mount_tmpfs_superblock() -> Arc<Superblock> {
     FS_REGISTRY
         .find("tmpfs")
@@ -556,11 +523,64 @@ fn mount_block_root(
         .map_err(|_| "unsupported or invalid root filesystem")
 }
 
+fn mount_first_block_root() -> Result<(Arc<Superblock>, &'static str), &'static str> {
+    let devices = active_block_devices(&DEVICES.functions);
+    if devices.is_empty() {
+        return Err("no initramfs and no active block device found");
+    }
+
+    for dev in devices {
+        match mount_block_root(Arc::clone(&dev)) {
+            Ok(root) => return Ok(root),
+            Err(err) => {
+                log::debug!(
+                    "[kernel-start][dtb] block device {} is not root candidate: {}",
+                    dev.name(),
+                    err
+                );
+            }
+        }
+    }
+
+    Err("no active block device contains a supported root filesystem")
+}
+
+fn platform_device_info_from_dtb(
+    device: &firmware_dtb::DtbPlatformDeviceInfo,
+    stdout_phys: Option<usize>,
+) -> PlatformDeviceInfo {
+    let ids = device
+        .compatible
+        .iter()
+        .map(|compatible| DeviceMatchId::DtbCompatible((*compatible).into()))
+        .collect();
+    let resources = device
+        .reg_ranges
+        .iter()
+        .map(|range| DeviceResource::Mmio {
+            phys: range.phys_addr,
+            size: range.size,
+        })
+        .collect();
+    let first_phys = device.reg_ranges.first().map(|range| range.phys_addr);
+
+    PlatformDeviceInfo {
+        fw_name: device.name.into(),
+        ids,
+        resources,
+        properties: DeviceProperties {
+            clock_hz: device.clock_hz,
+            baud: None,
+            stdout: first_phys == stdout_phys,
+        },
+    }
+}
+
 fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
     match register_and_probe_platform_device(info) {
         Ok(reg) if reg.bound => true,
         Ok(reg) => {
-            printk!(
+            log::debug!(
                 "[kernel-start][{}] no platform driver for {}",
                 tag,
                 reg.device.id
@@ -575,17 +595,5 @@ fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
             );
             false
         }
-    }
-}
-
-pub(crate) fn ensure_dir(
-    ctx: &VfsContext,
-    path: &str,
-    mode: FileMode,
-) -> general::vfs::error::VfsResult<()> {
-    match path::lookup(ctx, &Dirfd::Cwd, path, LookupFlags::DIRECTORY) {
-        Ok(_) => Ok(()),
-        Err(VfsError::NotFound) => general::vfs::operation::mkdirat(ctx, &Dirfd::Cwd, path, mode),
-        Err(err) => Err(err),
     }
 }

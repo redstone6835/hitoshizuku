@@ -13,6 +13,7 @@ socket = { path = "../socket" }
 smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "alloc",
     "medium-ethernet",
+    "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",
@@ -21,3 +22,5 @@ smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "socket-raw",
 ] }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }
+# 用于全局 socket 事件唤醒队列（WakeQueue）。
+sched = { path = "../sched" }

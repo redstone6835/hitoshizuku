@@ -27,7 +27,8 @@ if [ -x /sbin/mdev ]; then
 fi
 
 # 测试黑名单
-BLACKLIST="libctest libcbench netperf lmbench ltp unixbench iperf iozone"
+# basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
+BLACKLIST="iozone libctest libcbench lmbench ltp unixbench"
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do
@@ -72,12 +73,32 @@ run_test_scripts() {
     return 0
 }
 
+setup_dynamic_linker() {
+    glibc_lib=/mnt/glibc/lib
+
+    if [ ! -e /lib ] && [ ! -L /lib ]; then
+        ln -s "$glibc_lib" /lib 2>/dev/null || true
+    fi
+    if [ ! -e /lib64 ] && [ ! -L /lib64 ]; then
+        ln -s "$glibc_lib" /lib64 2>/dev/null || true
+    fi
+
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *:"$glibc_lib":*) ;;
+        *) LD_LIBRARY_PATH="$glibc_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+    export LD_LIBRARY_PATH
+
+    echo "[init] dynamic linker path prepared"
+}
+
 shutdown_after_tests() {
     sync || true
     poweroff -f >/dev/null 2>&1 || poweroff >/dev/null 2>&1 || reboot -f >/dev/null 2>&1 || true
 }
 
 mount -t ext4 /dev/vd0 /mnt 2>/dev/null || true
+setup_dynamic_linker
 echo "[init] mount testdisk OK (or skipped)"
 echo "[init] ls /mnt:"
 /bin/ls /mnt/ 2>&1 || true

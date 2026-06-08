@@ -16,7 +16,7 @@ use crate::scheduler::{
     schedule_once,
 };
 use crate::signal::SignalNumber;
-use crate::task::{Task, ext_clone_hook};
+use crate::task::{Task, ext_clone_hook, ext_exit_hook};
 use crate::{ExitCode, TaskState};
 
 /// 派生类型：新进程 vs 新线程。
@@ -67,11 +67,22 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
 
     parent.add_child(Arc::clone(&child));
 
-    let pid = root_ns
-        .registry()
-        .allocate(&child)
-        .expect("[sched][spawn] pid exhausted");
+    let Some(pid) = root_ns.registry().allocate(&child) else {
+        log::warning!(
+            "[sched][spawn] pid allocation failed kind={:?} parent_pid={:?}",
+            kind,
+            parent.pid_root(),
+        );
+        abort_new_task(&child);
+        return child;
+    };
     child.register_pid(Arc::clone(&root_ns), pid);
+    if matches!(kind, SpawnKind::Process) {
+        tgroup.set_tgid(pid);
+    }
+    if pgroup.pgid() <= 0 {
+        pgroup.set_pgid(pid);
+    }
 
     log::debug!(
         "[sched][spawn] kind={:?} pid={} parent_pid={:?}",
@@ -120,19 +131,26 @@ pub fn abort_new_task(task: &Arc<Task>) {
 pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> Arc<Task> {
     let flags = args.flags;
     let root_ns = root_pid_ns();
+    let parent_tg = parent.thread_group();
 
     // 1. 决定 thread group：CLONE_THREAD 共享，否则新建。
     let new_tg = if flags.has(CloneFlags::CLONE_THREAD) {
-        parent.thread_group()
+        parent_tg
     } else {
         // CLONE_SIGHAND 共享 SharedSignal（即便不 CLONE_THREAD）。
-        if flags.has(CloneFlags::CLONE_SIGHAND) {
-            ThreadGroup::new_sharing_signal(Arc::clone(parent.thread_group().shared_signal()))
+        let tg = if flags.has(CloneFlags::CLONE_SIGHAND) {
+            ThreadGroup::new_sharing_signal(Arc::clone(parent_tg.shared_signal()))
         } else {
             // 不共享 → 深拷一份 sigaction。
-            let copied = parent.thread_group().shared_signal().fork_copy();
+            let copied = parent_tg.shared_signal().fork_copy();
             ThreadGroup::new_sharing_signal(Arc::new(copied))
+        };
+        {
+            let src = parent_tg.rlimits().lock();
+            let mut dst = tg.rlimits().lock();
+            *dst = src.fork_copy();
         }
+        tg
     };
 
     // 2. 进程组：clone 不引入新 pgroup（setpgid 才会改）。
@@ -152,20 +170,34 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         Arc::clone(&new_tg),
         Arc::clone(&pg),
     );
-
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
 
     // 6. 退出信号：CLONE_THREAD 不发；否则取 flags 低 8 位（0 → SIGCHLD）。
+    let Some(raw_exit_sig) = args.exit_signal_checked() else {
+        log::warning!(
+            "[sched][clone] invalid exit_signal={} flags={:#x}",
+            args.exit_signal,
+            flags.raw(),
+        );
+        child.set_state(TaskState::Dead);
+        return child;
+    };
     let exit_sig = if flags.has(CloneFlags::CLONE_THREAD) {
-        0
-    } else {
-        let raw = args.exit_signal_raw();
-        if raw == 0 {
-            SignalNumber::SIGCHLD.raw() as i32
-        } else {
-            raw as i32
+        if raw_exit_sig != 0 {
+            log::warning!(
+                "[sched][clone] CLONE_THREAD with non-zero exit_signal={} flags={:#x}",
+                raw_exit_sig,
+                flags.raw(),
+            );
+            child.set_state(TaskState::Dead);
+            return child;
         }
+        0
+    } else if raw_exit_sig == 0 {
+        SignalNumber::SIGCHLD.raw() as i32
+    } else {
+        raw_exit_sig as i32
     };
     child.set_exit_signal(exit_sig);
 
@@ -176,15 +208,28 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     new_tg.add_member(&child);
     pg.add_member(&child);
 
-    // 8. 父登记（亲缘图保活）。
-    real_parent.add_child(Arc::clone(&child));
+    // 8. 父登记（亲缘图保活）。CLONE_THREAD 线程不进入普通 child/wait 模型。
+    if !flags.has(CloneFlags::CLONE_THREAD) {
+        real_parent.add_child(Arc::clone(&child));
+    }
 
     // 9. 分配 pid（根 ns 一次；多 ns 留待后续）。
-    let pid = root_ns
-        .registry()
-        .allocate(&child)
-        .expect("[sched][clone] pid exhausted");
+    let Some(pid) = root_ns.registry().allocate(&child) else {
+        log::warning!(
+            "[sched][clone] pid allocation failed parent_pid={:?} flags={:#x}",
+            real_parent.pid_root(),
+            flags.raw(),
+        );
+        abort_new_task(&child);
+        return child;
+    };
     child.register_pid(Arc::clone(&root_ns), pid);
+    if !flags.has(CloneFlags::CLONE_THREAD) {
+        new_tg.set_tgid(pid);
+    }
+    if pg.pgid() <= 0 {
+        pg.set_pgid(pid);
+    }
 
     // 10. ext clone hook：把上层注册的 VFS / fdtable 等子系统状态按 flags 拷贝。
     if let Some(hook) = ext_clone_hook() {
@@ -243,6 +288,10 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
         }
     }
 
+    if let Some(hook) = ext_exit_hook() {
+        hook.cleanup_on_exit(task);
+    }
+
     mark_task_exited(task, code);
 
     // 唤醒 vfork 父。
@@ -253,6 +302,15 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
 
     // 给父投递 exit_signal。
     let exit_sig = task.exit_signal();
+    if exit_sig == 0 {
+        for (ns, pid) in task.pid_namespaces_snapshot() {
+            ns.registry().release(pid);
+        }
+        task.thread_group().remove_member(task);
+        task.process_group().remove_member(task);
+        task.set_state(TaskState::Dead);
+        return;
+    }
     if exit_sig > 0 {
         if let Some(parent) = task.parent() {
             if let Some(sig) = SignalNumber::from_raw(exit_sig) {
@@ -325,6 +383,9 @@ pub fn list_zombie_children(parent: &Arc<Task>) -> Vec<Arc<Task>> {
 pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc<Task> {
     let init = init_task();
     let child = spawn_child(&init, SpawnKind::Thread, params);
+    if child.state() == TaskState::Dead {
+        return child;
+    }
     child.into_kernel_thread(entry, arg);
     child
 }
@@ -333,7 +394,14 @@ pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Ar
 /// `unsafe extern "C" fn(arg: usize) -> !`，内部以 [`kthread_finish`] 退出。
 pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc<Task> {
     let child = kthread_create(entry, arg, params);
-    activate_task(&child).expect("[sched][kthread] context missing before spawn");
+    if let Err(err) = activate_task(&child) {
+        log::warning!(
+            "[sched][kthread] spawn activation failed pid={:?} err={:?}",
+            child.pid_root(),
+            err,
+        );
+        return child;
+    }
     log::debug!(
         "[sched][kthread] spawned pid={:?} entry={:#x}",
         child.pid_root(),

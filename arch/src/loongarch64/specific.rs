@@ -351,11 +351,8 @@ pub const PER_CPU_KSTACK_OFFSET: usize = 0;
 pub const DEFAULT_TIMER_HZ: usize = 100;
 
 #[inline]
-/// 读取稳定计数器并换算为纳秒。
-
-/// `rdtime.d` 返回的是硬件计数器值，不是直接的时间单位。这里结合平台初始化阶段探测
-/// 得到的稳定频率，把计数值换算成纳秒时间戳。
-pub fn kernel_timestamp_ns() -> u64 {
+/// 读取稳定计数器原始周期值。
+pub fn stable_counter_raw() -> u64 {
     let cnt: u64;
     unsafe {
         core::arch::asm!(
@@ -363,7 +360,19 @@ pub fn kernel_timestamp_ns() -> u64 {
             cnt = out(reg) cnt,
         );
     }
-    let hz = super::STABLE_TIMER_HZ.load(core::sync::atomic::Ordering::Relaxed) as u64;
+    cnt
+}
+
+#[inline]
+/// 返回稳定计数器频率（Hz）。
+pub fn stable_counter_hz() -> u64 {
+    super::STABLE_TIMER_HZ.load(core::sync::atomic::Ordering::Relaxed) as u64
+}
+
+#[inline]
+/// 将稳定计数器周期值换算为纳秒。
+pub fn stable_counter_to_ns(cnt: u64) -> u64 {
+    let hz = stable_counter_hz();
     if hz == 0 {
         return 0;
     }
@@ -371,6 +380,16 @@ pub fn kernel_timestamp_ns() -> u64 {
     let secs = cnt / hz;
     let frac_ns = (cnt % hz) * 1_000_000_000 / hz;
     secs * 1_000_000_000 + frac_ns
+}
+
+#[inline]
+/// 读取稳定计数器并换算为纳秒。
+///
+/// `rdtime.d` 返回的是硬件计数器值，不是直接的时间单位。这里结合平台初始化阶段探测
+/// 得到的稳定频率，把计数值换算成纳秒时间戳。
+pub fn kernel_timestamp_ns() -> u64 {
+    let cnt = stable_counter_raw();
+    stable_counter_to_ns(cnt)
 }
 
 #[inline]

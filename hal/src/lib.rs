@@ -8,6 +8,7 @@
 
 #![no_std]
 
+extern crate alloc;
 extern crate arch;
 
 pub mod console;

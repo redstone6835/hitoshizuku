@@ -29,6 +29,7 @@ use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
 use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{active_block_devices, active_char_devices};
+use crate::vfs::device_numbers;
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
 const ROOT_INO: u64 = 1;
@@ -53,6 +54,10 @@ const KERNEL_OSTYPE_INO: u64 = 19;
 const KERNEL_OSRELEASE_INO: u64 = 20;
 const KERNEL_VERSION_INO: u64 = 21;
 const KERNEL_CMDLINE_INO: u64 = 22;
+const CLASS_NET_DIR_INO: u64 = 23;
+const CLASS_NET_IFACE_START_INO: u64 = 100;
+const CLASS_NET_IFACE_SLOTS: u64 = 16;
+const CLASS_NET_STATS_SLOTS: u64 = 8;
 
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
@@ -77,6 +82,7 @@ const CPU_SLOTS: u64 = 4;
 static SYSFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
+const SYSFS_DEFAULT_NR_REQUESTS: u32 = 64;
 
 // ─── 渲染辅助 ──────────────────────────────────────────────
 
@@ -134,6 +140,7 @@ fn slice_str(buf: &[u8], offset: usize, len: usize) -> &[u8] {
 struct CharDevSnapshot {
     /// /sys/devices/ 下的目录名 = `fw_name`（如 "serial@9000000"、"null"）。
     sysfs_name: String,
+    rdev: DevId,
     dev: CharDevice,
 }
 
@@ -141,7 +148,24 @@ struct CharDevSnapshot {
 struct BlockDevSnapshot {
     /// /sys/block/ 与 /sys/dev/block/ 下的目录名 = `dev.name()`（如 "vd0"）。
     sysfs_name: String,
+    rdev: DevId,
     dev: Arc<BlockDevice>,
+}
+
+#[derive(Clone)]
+struct CharDevNodeSnapshot {
+    /// /sys/devices/ 下的目标目录名。
+    sysfs_name: String,
+    /// devtmpfs 相对路径，用于 uevent DEVNAME。
+    devtmpfs_name: String,
+    rdev: DevId,
+}
+
+#[derive(Clone)]
+struct BlockDevNodeSnapshot {
+    /// /sys/block/ 下的目标目录名。
+    sysfs_name: String,
+    rdev: DevId,
 }
 
 /// 挂载时从 `DEVICES` 拷贝出的不可变快照；之后 `/sys` 的全部内容都基于此。
@@ -149,6 +173,8 @@ struct BlockDevSnapshot {
 struct SysSnapshot {
     chars: Vec<CharDevSnapshot>,
     blocks: Vec<BlockDevSnapshot>,
+    char_nodes: Vec<CharDevNodeSnapshot>,
+    block_nodes: Vec<BlockDevNodeSnapshot>,
 }
 
 impl SysSnapshot {
@@ -156,11 +182,40 @@ impl SysSnapshot {
         let mut snap = SysSnapshot::default();
         for dev in active_block_devices(&DEVICES.functions) {
             let sysfs_name = dev.name().to_string();
-            snap.blocks.push(BlockDevSnapshot { sysfs_name, dev });
+            if let Some(record) = device_numbers::lookup_block_record(&sysfs_name) {
+                snap.blocks.push(BlockDevSnapshot {
+                    sysfs_name,
+                    rdev: record.rdev,
+                    dev,
+                });
+            }
         }
         for dev in active_char_devices(&DEVICES.functions) {
             let sysfs_name = dev.fw_name().to_string();
-            snap.chars.push(CharDevSnapshot { sysfs_name, dev });
+            if let Some(record) = device_numbers::lookup_char_record(&sysfs_name) {
+                snap.chars.push(CharDevSnapshot {
+                    sysfs_name,
+                    rdev: record.rdev,
+                    dev,
+                });
+            }
+        }
+        for record in device_numbers::records() {
+            match record.kind {
+                device_numbers::PosixDeviceKind::Char => {
+                    snap.char_nodes.push(CharDevNodeSnapshot {
+                        sysfs_name: record.display_name,
+                        devtmpfs_name: record.node_name,
+                        rdev: record.rdev,
+                    })
+                }
+                device_numbers::PosixDeviceKind::Block => {
+                    snap.block_nodes.push(BlockDevNodeSnapshot {
+                        sysfs_name: record.display_name,
+                        rdev: record.rdev,
+                    })
+                }
+            }
         }
         snap
     }
@@ -284,6 +339,236 @@ impl BlockQueueSlot {
     }
 }
 
+// ── /sys/class/net/<name>/ 属性槽位 ──────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum NetDevSlot {
+    Type,
+    Address,
+    Mtu,
+    Flags,
+    IfIndex,
+    TxQueueLen,
+    Carrier,
+    Operstate,
+    StatisticsRxBytes,
+    StatisticsTxBytes,
+    StatisticsRxPackets,
+    StatisticsTxPackets,
+    StatisticsRxDropped,
+    StatisticsTxDropped,
+    StatisticsRxErrors,
+    StatisticsTxErrors,
+}
+
+impl NetDevSlot {
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::Type => 0,
+            Self::Address => 1,
+            Self::Mtu => 2,
+            Self::Flags => 3,
+            Self::IfIndex => 4,
+            Self::TxQueueLen => 5,
+            Self::Carrier => 6,
+            Self::Operstate => 7,
+            Self::StatisticsRxBytes => 8,
+            Self::StatisticsTxBytes => 9,
+            Self::StatisticsRxPackets => 10,
+            Self::StatisticsTxPackets => 11,
+            Self::StatisticsRxDropped => 12,
+            Self::StatisticsTxDropped => 13,
+            Self::StatisticsRxErrors => 14,
+            Self::StatisticsTxErrors => 15,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Type => "type",
+            Self::Address => "address",
+            Self::Mtu => "mtu",
+            Self::Flags => "flags",
+            Self::IfIndex => "ifindex",
+            Self::TxQueueLen => "tx_queue_len",
+            Self::Carrier => "carrier",
+            Self::Operstate => "operstate",
+            Self::StatisticsRxBytes => "rx_bytes",
+            Self::StatisticsTxBytes => "tx_bytes",
+            Self::StatisticsRxPackets => "rx_packets",
+            Self::StatisticsTxPackets => "tx_packets",
+            Self::StatisticsRxDropped => "rx_dropped",
+            Self::StatisticsTxDropped => "tx_dropped",
+            Self::StatisticsRxErrors => "rx_errors",
+            Self::StatisticsTxErrors => "tx_errors",
+        }
+    }
+
+    const ALL: &'static [Self] = &[
+        Self::Type,
+        Self::Address,
+        Self::Mtu,
+        Self::Flags,
+        Self::IfIndex,
+        Self::TxQueueLen,
+        Self::Carrier,
+        Self::Operstate,
+        Self::StatisticsRxBytes,
+        Self::StatisticsTxBytes,
+        Self::StatisticsRxPackets,
+        Self::StatisticsTxPackets,
+        Self::StatisticsRxDropped,
+        Self::StatisticsTxDropped,
+        Self::StatisticsRxErrors,
+        Self::StatisticsTxErrors,
+    ];
+}
+
+fn netdev_slot_by_name(name: &str) -> Option<NetDevSlot> {
+    NetDevSlot::ALL
+        .iter()
+        .find(|s| s.file_name() == name)
+        .copied()
+}
+
+#[derive(Clone, Copy)]
+enum NetDevStatsSlot {
+    RxBytes,
+    TxBytes,
+    RxPackets,
+    TxPackets,
+    RxDropped,
+    TxDropped,
+    RxErrors,
+    TxErrors,
+}
+
+impl NetDevStatsSlot {
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::RxBytes => 0,
+            Self::TxBytes => 1,
+            Self::RxPackets => 2,
+            Self::TxPackets => 3,
+            Self::RxDropped => 4,
+            Self::TxDropped => 5,
+            Self::RxErrors => 6,
+            Self::TxErrors => 7,
+        }
+    }
+    fn to_netdev_slot(self) -> NetDevSlot {
+        match self {
+            Self::RxBytes => NetDevSlot::StatisticsRxBytes,
+            Self::TxBytes => NetDevSlot::StatisticsTxBytes,
+            Self::RxPackets => NetDevSlot::StatisticsRxPackets,
+            Self::TxPackets => NetDevSlot::StatisticsTxPackets,
+            Self::RxDropped => NetDevSlot::StatisticsRxDropped,
+            Self::TxDropped => NetDevSlot::StatisticsTxDropped,
+            Self::RxErrors => NetDevSlot::StatisticsRxErrors,
+            Self::TxErrors => NetDevSlot::StatisticsTxErrors,
+        }
+    }
+    fn file_name(self) -> &'static str {
+        self.to_netdev_slot().file_name()
+    }
+    const ALL: &'static [Self] = &[
+        Self::RxBytes,
+        Self::TxBytes,
+        Self::RxPackets,
+        Self::TxPackets,
+        Self::RxDropped,
+        Self::TxDropped,
+        Self::RxErrors,
+        Self::TxErrors,
+    ];
+}
+
+fn netdev_stats_slot_by_name(name: &str) -> Option<NetDevStatsSlot> {
+    NetDevStatsSlot::ALL
+        .iter()
+        .find(|s| s.file_name() == name)
+        .copied()
+}
+
+fn class_net_iface_ino(iface_id: u32) -> u64 {
+    CLASS_NET_IFACE_START_INO + (iface_id as u64) * CLASS_NET_IFACE_SLOTS
+}
+
+fn class_net_iface_slot_ino(iface_id: u32, slot: u64) -> u64 {
+    class_net_iface_ino(iface_id) + slot
+}
+
+fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -> String {
+    use alloc::fmt::Write;
+    let mut s = String::new();
+    match slot {
+        NetDevSlot::Type => {
+            let _ = writeln!(s, "1"); // ARPHRD_ETHER
+        }
+        NetDevSlot::Address => {
+            let mac = iface.mac;
+            let _ = writeln!(
+                s,
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+        }
+        NetDevSlot::Mtu => {
+            let _ = writeln!(s, "{}", iface.mtu);
+        }
+        NetDevSlot::Flags => {
+            let _ = writeln!(s, "0x{:x}", iface.flags);
+        }
+        NetDevSlot::IfIndex => {
+            let _ = writeln!(s, "{}", iface.id.raw() + 1);
+        }
+        NetDevSlot::TxQueueLen => {
+            let _ = writeln!(s, "1000");
+        }
+        NetDevSlot::Carrier => {
+            let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 {
+                "1"
+            } else {
+                "0"
+            };
+            let _ = writeln!(s, "{}", carrier);
+        }
+        NetDevSlot::Operstate => {
+            let state = if iface.flags & net::stack::IFF_UP != 0 {
+                "up"
+            } else {
+                "down"
+            };
+            let _ = writeln!(s, "{}", state);
+        }
+        NetDevSlot::StatisticsRxBytes => {
+            let _ = writeln!(s, "{}", iface.stats.rx_bytes);
+        }
+        NetDevSlot::StatisticsTxBytes => {
+            let _ = writeln!(s, "{}", iface.stats.tx_bytes);
+        }
+        NetDevSlot::StatisticsRxPackets => {
+            let _ = writeln!(s, "{}", iface.stats.rx_packets);
+        }
+        NetDevSlot::StatisticsTxPackets => {
+            let _ = writeln!(s, "{}", iface.stats.tx_packets);
+        }
+        NetDevSlot::StatisticsRxDropped => {
+            let _ = writeln!(s, "{}", iface.stats.rx_dropped);
+        }
+        NetDevSlot::StatisticsTxDropped => {
+            let _ = writeln!(s, "{}", iface.stats.tx_dropped);
+        }
+        NetDevSlot::StatisticsRxErrors => {
+            let _ = writeln!(s, "{}", iface.stats.rx_errors);
+        }
+        NetDevSlot::StatisticsTxErrors => {
+            let _ = writeln!(s, "{}", iface.stats.tx_errors);
+        }
+    }
+    s
+}
+
 #[derive(Clone, Copy)]
 enum DeviceSlot {
     Name,
@@ -387,6 +672,7 @@ enum SysRegFile {
     Version,
     Cmdline,
     UeventPlaceholder,
+    NetDev { iface_id: u32, slot: NetDevSlot },
 }
 
 // ─── 内容渲染 ────────────────────────────────────────────────
@@ -410,9 +696,14 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
                 "0\n".into()
             }
         }
-        BlockDevSlot::Removable => "0\n".into(),
-        // TODO: 当前所有块设备硬编码 major:minor=254:0，需要从兼容层分配的真实编号读取
-        BlockDevSlot::Dev => "254:0\n".into(),
+        BlockDevSlot::Removable => {
+            if dev.attributes().removable() {
+                "1\n".into()
+            } else {
+                "0\n".into()
+            }
+        }
+        BlockDevSlot::Dev => format_rdev(snap.blocks[idx].rdev),
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
@@ -434,8 +725,22 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
     match slot {
         BlockQueueSlot::Lbs => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::Pbs => format!("{}\n", geom.physical_block_size().get()),
-        BlockQueueSlot::Rotational => "0\n".into(), // 全部按 SSD 报告：virtio-blk、NVMe 都不是机械盘
-        BlockQueueSlot::NrRequests => "64\n".into(),
+        BlockQueueSlot::Rotational => {
+            if dev.attributes().rotational() {
+                "1\n".into()
+            } else {
+                "0\n".into()
+            }
+        }
+        BlockQueueSlot::NrRequests => {
+            // 没有真实队列深度的设备使用兼容默认值；VirtIO 等驱动会填实际协商值。
+            let depth = dev
+                .attributes()
+                .queue_depth()
+                .map(|n| n.get())
+                .unwrap_or(SYSFS_DEFAULT_NR_REQUESTS);
+            format!("{}\n", depth)
+        }
         BlockQueueSlot::HwSectorSize => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::DiscardZeroes => {
             if features.contains(crate::dev::block::BlockFeatures::WRITE_ZEROES) {
@@ -454,8 +759,7 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
         let c = &snap.chars[idx];
         match slot {
             DeviceSlot::Name => format!("{}\n", c.sysfs_name),
-            // TODO: 字符设备的 dev 字段硬编码 0:0，需要从兼容层读取真实 major:minor
-            DeviceSlot::Dev => "0:0\n".into(),
+            DeviceSlot::Dev => format_rdev(c.rdev),
             DeviceSlot::Driver => String::new(),
             // TODO: 实现真正的 subsystem 链接（指向 /sys/class/<class> 或 /sys/bus/<bus>）
             DeviceSlot::Subsystem => "(unimplemented)\n".into(),
@@ -466,8 +770,7 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
         let b = &snap.blocks[bi];
         match slot {
             DeviceSlot::Name => format!("{}\n", b.sysfs_name),
-            // TODO: 块设备的 dev 字段硬编码 0:0，需要从兼容层读取真实 major:minor
-            DeviceSlot::Dev => "0:0\n".into(),
+            DeviceSlot::Dev => format_rdev(b.rdev),
             DeviceSlot::Driver => String::new(),
             // TODO: 实现真正的 subsystem 链接（指向 /sys/class/block）
             DeviceSlot::Subsystem => "(unimplemented)\n".into(),
@@ -476,15 +779,32 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
     }
 }
 
-fn render_dev_char_inner(_snap: &SysSnapshot, _idx: usize, slot: DevCharInnerSlot) -> String {
+fn render_dev_char_inner(snap: &SysSnapshot, idx: usize, slot: DevCharInnerSlot) -> String {
     match slot {
-        // TODO: 字符设备 /sys/dev/char/<id>/dev 硬编码 0:0，需要兼容层指定的 major:minor
-        DevCharInnerSlot::Dev => "0:0\n".into(),
+        DevCharInnerSlot::Dev => format_rdev(snap.char_nodes[idx].rdev),
         DevCharInnerSlot::DeviceLink => String::new(), // symlink，不渲染
         DevCharInnerSlot::SubsystemLink => String::new(),
-        // TODO: uevent 内容应包含真实的 MAJOR、MINOR、DEVNAME 等字段
-        DevCharInnerSlot::Uevent => "MODALIAS=char:0:0\n".into(),
+        DevCharInnerSlot::Uevent => {
+            let c = &snap.char_nodes[idx];
+            format!(
+                "MAJOR={}\nMINOR={}\nDEVNAME={}\n",
+                c.rdev.major, c.rdev.minor, c.devtmpfs_name
+            )
+        }
     }
+}
+
+fn format_rdev(rdev: DevId) -> String {
+    format!("{}:{}\n", rdev.major, rdev.minor)
+}
+
+fn rdev_name(rdev: DevId) -> String {
+    format!("{}:{}", rdev.major, rdev.minor)
+}
+
+fn parse_rdev_name(name: &str) -> Option<DevId> {
+    let (major, minor) = name.split_once(':')?;
+    Some(DevId::new(major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn render_cpu_file(_snap: &SysSnapshot, _cpu_id: usize, slot: CpuSlot) -> String {
@@ -517,6 +837,17 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
             String::new()
         }
         SysRegFile::UeventPlaceholder => String::new(),
+        SysRegFile::NetDev { iface_id, slot } => {
+            if let Some(iface) = net::stack()
+                .snapshot_interfaces()
+                .into_iter()
+                .find(|i| i.id.raw() == iface_id)
+            {
+                render_netdev_file(&iface, slot)
+            } else {
+                String::new()
+            }
+        }
     }
 }
 
@@ -776,6 +1107,9 @@ enum SysDirKind {
     FsCgroup,
     Bus,
     Class,
+    ClassNet,
+    ClassNetIface { iface_id: u32 },
+    ClassNetStats { iface_id: u32 },
     Module,
     Power,
     Firmware,
@@ -966,21 +1300,23 @@ impl SysDirInodeOps {
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::DevBlock => {
+                let rdev = parse_rdev_name(name).ok_or(VfsError::NotFound)?;
                 let idx = snap
-                    .blocks
+                    .block_nodes
                     .iter()
-                    .position(|b| b.sysfs_name == name)
+                    .position(|b| b.rdev == rdev)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_link(
                     dev_block_link_ino(idx),
-                    format!("../../block/{}", snap.blocks[idx].sysfs_name),
+                    format!("../../block/{}", snap.block_nodes[idx].sysfs_name),
                 ))
             }
             SysDirKind::DevChar => {
+                let rdev = parse_rdev_name(name).ok_or(VfsError::NotFound)?;
                 let idx = snap
-                    .chars
+                    .char_nodes
                     .iter()
-                    .position(|c| c.sysfs_name == name)
+                    .position(|c| c.rdev == rdev)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
                     dev_char_dir_ino(idx),
@@ -993,7 +1329,7 @@ impl SysDirInodeOps {
                 match slot {
                     DevCharInnerSlot::DeviceLink => Ok(mk_link(
                         ino,
-                        format!("../../devices/{}", snap.chars[idx].sysfs_name),
+                        format!("../../devices/{}", snap.char_nodes[idx].sysfs_name),
                     )),
                     DevCharInnerSlot::SubsystemLink => Ok(mk_link(ino, "../../class".into())),
                     _ => mk_reg(ino, SysRegFile::DevCharInner { idx, slot }),
@@ -1014,17 +1350,54 @@ impl SysDirInodeOps {
             },
             // TODO: /sys/fs/cgroup/ 目录内容为空，需要实现 cgroup 子系统
             SysDirKind::FsCgroup => Err(VfsError::NotFound),
-            // TODO: 以下顶层目录均为空占位，需要逐步实现：
-            //   Bus: PCI/USB/Platform 等总线设备枚举
-            //   Class: 设备分类（net, input, tty 等）
-            //   Module: 已加载内核模块列表
-            //   Power: 电源管理状态和控制
-            //   Firmware: 固件相关（ACPI, DMI 等）
-            SysDirKind::Bus
-            | SysDirKind::Class
-            | SysDirKind::Module
-            | SysDirKind::Power
-            | SysDirKind::Firmware => Err(VfsError::NotFound),
+            SysDirKind::Class => match name {
+                "net" => Ok(mk_dir(CLASS_NET_DIR_INO, SysDirKind::ClassNet)),
+                _ => Err(VfsError::NotFound),
+            },
+            SysDirKind::ClassNet => {
+                // 查找匹配的网络接口
+                let ifaces = net::stack().snapshot_interfaces();
+                if let Some(iface) = ifaces.iter().find(|i| i.name.as_str() == name) {
+                    let iface_id = iface.id.raw();
+                    Ok(mk_dir(
+                        class_net_iface_ino(iface_id),
+                        SysDirKind::ClassNetIface { iface_id },
+                    ))
+                } else {
+                    Err(VfsError::NotFound)
+                }
+            }
+            SysDirKind::ClassNetIface { iface_id } => {
+                if let Some(slot) = netdev_slot_by_name(name) {
+                    mk_reg(
+                        class_net_iface_slot_ino(iface_id, slot.to_u64()),
+                        SysRegFile::NetDev { iface_id, slot },
+                    )
+                } else if name == "statistics" {
+                    Ok(mk_dir(
+                        class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS,
+                        SysDirKind::ClassNetStats { iface_id },
+                    ))
+                } else {
+                    Err(VfsError::NotFound)
+                }
+            }
+            SysDirKind::ClassNetStats { iface_id } => {
+                if let Some(slot) = netdev_stats_slot_by_name(name) {
+                    mk_reg(
+                        class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS + slot.to_u64(),
+                        SysRegFile::NetDev {
+                            iface_id,
+                            slot: slot.to_netdev_slot(),
+                        },
+                    )
+                } else {
+                    Err(VfsError::NotFound)
+                }
+            }
+            SysDirKind::Bus | SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => {
+                Err(VfsError::NotFound)
+            }
             SysDirKind::DevicesSystem => match name {
                 "cpu" => Ok(mk_dir(DEVICES_SYSTEM_CPU_INO, SysDirKind::DevicesSystemCpu)),
                 _ => Err(VfsError::NotFound),
@@ -1246,16 +1619,20 @@ impl SysDirInodeOps {
                 mk_dir_entry(DEV_CHAR_DIR_INO, "char", FileType::Directory),
             ],
             SysDirKind::DevBlock => snap
-                .blocks
+                .block_nodes
                 .iter()
                 .enumerate()
-                .map(|(i, b)| mk_dir_entry(dev_block_link_ino(i), &b.sysfs_name, FileType::Symlink))
+                .map(|(i, b)| {
+                    mk_dir_entry(dev_block_link_ino(i), &rdev_name(b.rdev), FileType::Symlink)
+                })
                 .collect(),
             SysDirKind::DevChar => snap
-                .chars
+                .char_nodes
                 .iter()
                 .enumerate()
-                .map(|(i, c)| mk_dir_entry(dev_char_dir_ino(i), &c.sysfs_name, FileType::Directory))
+                .map(|(i, c)| {
+                    mk_dir_entry(dev_char_dir_ino(i), &rdev_name(c.rdev), FileType::Directory)
+                })
                 .collect(),
             SysDirKind::DevCharInner { idx } => vec![
                 mk_dir_entry(
@@ -1288,11 +1665,45 @@ impl SysDirInodeOps {
             ],
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
-            SysDirKind::Bus
-            | SysDirKind::Class
-            | SysDirKind::Module
-            | SysDirKind::Power
-            | SysDirKind::Firmware => Vec::new(),
+            SysDirKind::Class => {
+                vec![mk_dir_entry(CLASS_NET_DIR_INO, "net", FileType::Directory)]
+            }
+            SysDirKind::ClassNet => {
+                let mut entries = Vec::new();
+                for iface in &net::stack().snapshot_interfaces() {
+                    entries.push(mk_dir_entry(
+                        class_net_iface_ino(iface.id.raw()),
+                        &iface.name,
+                        FileType::Directory,
+                    ));
+                }
+                entries
+            }
+            SysDirKind::ClassNetIface { iface_id } => {
+                let mut entries = vec![mk_dir_entry(
+                    class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS,
+                    "statistics",
+                    FileType::Directory,
+                )];
+                for slot in NetDevSlot::ALL {
+                    entries.push(mk_dir_entry(
+                        class_net_iface_slot_ino(iface_id, slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ));
+                }
+                entries
+            }
+            SysDirKind::ClassNetStats { iface_id } => {
+                let base = class_net_iface_ino(iface_id) + CLASS_NET_IFACE_SLOTS;
+                NetDevStatsSlot::ALL
+                    .iter()
+                    .map(|s| mk_dir_entry(base + s.to_u64(), s.file_name(), FileType::Regular))
+                    .collect()
+            }
+            SysDirKind::Bus | SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => {
+                Vec::new()
+            }
             SysDirKind::DevicesSystem => vec![mk_dir_entry(
                 DEVICES_SYSTEM_CPU_INO,
                 "cpu",

@@ -24,10 +24,9 @@ use hal::user_context::UserTrapFrame;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
-use sched::operation::apply_default_action;
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
-use sched::task::{TaskExtCloneHook, TaskExtKey};
+use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey};
 use sched::{
     TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
@@ -137,6 +136,25 @@ impl TaskExtCloneHook for KernelExtCloneHook {
 
 static HOOK: KernelExtCloneHook = KernelExtCloneHook;
 
+struct KernelExtExitHook;
+
+impl TaskExtExitHook for KernelExtExitHook {
+    fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        // FIXME: 其它 task ext 条目，在明确退出后的所有权要求后,需要这里释放资源。
+        if let Some(payload) = task.ext_remove(TASKEXT_VFS_FDTABLE) {
+            if let Ok(fdtable) = payload.downcast::<FdTable>() {
+                log::debug!(
+                    "[sched][exit-ext] pid={:?} drop fdtable open_fds={}",
+                    task.pid_root(),
+                    fdtable.len(),
+                );
+            }
+        }
+    }
+}
+
+static EXIT_HOOK: KernelExtExitHook = KernelExtExitHook;
+
 // ── VmSwitchOps ──────────────────────────────────────────────────────────────
 //
 // sched 在 schedule_once 切换到 next 前调此回调；本函数从 next 的 ext 表
@@ -198,6 +216,11 @@ fn install_exec_path(task: &Arc<Task>, path: &str) {
 
 fn install_exec_metadata(task: &Arc<Task>, path: &str, argv: &[String], envp: &[String]) {
     install_exec_path(task, path);
+    let comm = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path);
+    task.set_comm(comm.as_bytes());
 
     let _ = task.ext_remove(TASKEXT_EXEC_ARGS);
     task.ext_install(TASKEXT_EXEC_ARGS, Arc::new(argv.to_vec()));
@@ -291,7 +314,13 @@ fn process_execve(
     let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
         Ok(loaded) => loaded,
         Err(err) => {
-            log::info!("[exec] load failed: path={:?} err={:?}", path, err);
+            if err == Errno::ENOEXEC {
+                // shell 执行无 shebang 的脚本时会先尝试 execve，收到
+                // ENOEXEC 后回退为解释执行；这是用户态正常探测路径。
+                log::debug!("[exec] load failed: path={:?} err={:?}", path, err);
+            } else {
+                log::info!("[exec] load failed: path={:?} err={:?}", path, err);
+            }
             if let Some(vm) = old_vm {
                 vm.activate();
             }
@@ -306,6 +335,9 @@ fn process_execve(
     if let Some(fdt) = task_fdtable(task) {
         fdt.close_on_exec();
     }
+
+    // exec 时将 caught 信号重置为 SIG_DFL
+    task.thread_group().shared_signal().reset_handlers_for_exec();
 
     let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.apply_to_context(user_ctx.as_usize());
@@ -431,18 +463,10 @@ fn process_setup_signal_frame(
         return Err(Errno::EINVAL);
     };
 
-    // TODO(vDSO): 当前方案在 restorer 无效时退化为 SIG_DFL。
-    // 静态链接的 glibc 依赖内核 vDSO 自动填充 sa_restorer，
-    // 栈上残值若 VA[63]=1 会在信号返回时跳入内核
-    // 正确做法：实现 vDSO 暴露 __kernel_rt_sigreturn，glibc 会自动从 vDSO 读取 restorer。
-    if action.restorer >> 63 != 0 {
-        log::debug!(
-            "[sigframe] bad restorer={:#x} for sig={} handler={:#x} — falling back to SIG_DFL",
-            action.restorer, info.sig.raw(), handler_pc
-        );
-        apply_default_action(info);
-        return Ok(());
-    }
+    // LoongArch64 用户态 libc 传入的 sa_restorer 在当前内核地址布局下不一定
+    // 是可执行入口（例如 musl 会传 0x2000）。信号返回必须统一落到本内核
+    // 映射的 vDSO trampoline，再由它发起 rt_sigreturn syscall。
+    let restorer = hal::user::sigreturn_entry_va();
 
     let saved = UserTrapFrame::from_context(user_ctx.as_usize());
     let old_mask = task.signal.blocked_snapshot();
@@ -493,7 +517,7 @@ fn process_setup_signal_frame(
         new_sp + SIGFRAME_SIGINFO_OFF,
         new_sp + SIGFRAME_UCONTEXT_OFF,
     );
-    next.set_ra(action.restorer);
+    next.set_ra(restorer);
     next.apply_to_context(user_ctx.as_usize());
     Ok(())
 }
@@ -540,6 +564,7 @@ pub fn boot_init() -> Arc<Task> {
     // 2. 注入 ext clone hook，必须在 sched::init 之前——否则 init 任务后续
     //    任何 fork/clone 都会落到无 hook 的"全共享"分支。
     sched::register_ext_clone_hook(&HOOK);
+    sched::register_ext_exit_hook(&EXIT_HOOK);
 
     // 3. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
     sched::register_process_image_ops(&PROCESS_IMAGE_OPS);

@@ -309,6 +309,63 @@ impl VmSpace {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
     }
 
+    /// 按 `shmdt` 的入口地址查找一整段 SysV shm 映射。
+    ///
+    /// SysV shm 通过普通 file-backed VMA 接入 VM，因此这里不引入新的 backing
+    /// 枚举；只要求底层 [`FileLike`] 暴露 shm id。`mprotect` 可能把同一段映射
+    /// 分裂成多个相邻 VMA，所以检查时按文件 offset 把整段重新拼起来，避免把
+    /// 其他文件或后来复用的地址误当成可 detach 的 shm。
+    pub fn sysv_shm_mapping_at(&self, addr: usize) -> Option<(Range<usize>, i32)> {
+        let set = self.vmas.lock();
+        let first = set.find(addr)?;
+        if first.range.start != addr {
+            return None;
+        }
+        let VmBacking::File { file, offset } = &first.backing else {
+            return None;
+        };
+        if *offset != 0 {
+            return None;
+        }
+        let shmid = file.sysv_shm_id()?;
+        let file_size = file.size();
+        if file_size == 0 || file_size > usize::MAX as u64 {
+            return None;
+        }
+        let len = align_up(file_size as usize, page_size())?;
+        let end = addr.checked_add(len)?;
+        let range = addr..end;
+        if !set.contains_range(&range) {
+            return None;
+        }
+
+        let mut cursor = range.start;
+        for area in set.iter_overlap(&range) {
+            if area.range.start > cursor {
+                return None;
+            }
+            let VmBacking::File {
+                file: area_file,
+                offset: area_offset,
+            } = &area.backing
+            else {
+                return None;
+            };
+            if area_file.sysv_shm_id() != Some(shmid) {
+                return None;
+            }
+            let expected_offset = (area.range.start - range.start) as u64;
+            if *area_offset != expected_offset {
+                return None;
+            }
+            cursor = cursor.max(area.range.end.min(range.end));
+            if cursor >= range.end {
+                return Some((range.clone(), shmid));
+            }
+        }
+        None
+    }
+
     /// 注册一段匿名 VMA。不立即分配物理页。
     pub fn map_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
@@ -337,12 +394,15 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        let mapped_file = Arc::clone(&file);
         let area = VmArea {
             range,
             flags,
             backing: VmBacking::File { file, offset },
         };
-        self.vmas.lock().insert(area)
+        self.vmas.lock().insert(area)?;
+        mapped_file.on_mapped();
+        Ok(())
     }
 
     /// MAP_FIXED 原子操作：在同一把 VMA 锁内先 unmap 再 insert，消除竞态窗口。
@@ -361,10 +421,17 @@ impl VmSpace {
             flags: flags.with(VmFlags::ANON),
             backing,
         };
-        let mut vmas = self.vmas.lock();
-        vmas.unmap_range(&range);
-        vmas.insert(area)?;
-        drop(vmas);
+        let removed_areas = {
+            let mut vmas = self.vmas.lock();
+            let removed_areas = vmas.unmap_range(&range);
+            if let Err(err) = vmas.insert(area) {
+                drop(vmas);
+                Self::notify_file_unmapped(&removed_areas);
+                return Err(err);
+            }
+            removed_areas
+        };
+        Self::notify_file_unmapped(&removed_areas);
         let removed = self.remove_page_mappings(range.clone());
         for (va, _mapping) in &removed {
             let _ = self.unmap_page(*va);
@@ -380,15 +447,24 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        let mapped_file = Arc::clone(&file);
         let area = VmArea {
             range: range.clone(),
             flags,
             backing: VmBacking::File { file, offset },
         };
-        let mut vmas = self.vmas.lock();
-        vmas.unmap_range(&range);
-        vmas.insert(area)?;
-        drop(vmas);
+        let removed_areas = {
+            let mut vmas = self.vmas.lock();
+            let removed_areas = vmas.unmap_range(&range);
+            if let Err(err) = vmas.insert(area) {
+                drop(vmas);
+                Self::notify_file_unmapped(&removed_areas);
+                return Err(err);
+            }
+            removed_areas
+        };
+        Self::notify_file_unmapped(&removed_areas);
+        mapped_file.on_mapped();
         let removed = self.remove_page_mappings(range.clone());
         for (va, _mapping) in &removed {
             let _ = self.unmap_page(*va);
@@ -433,7 +509,8 @@ impl VmSpace {
     /// 取消映射。同时把已 commit 的页表项摘掉；物理页由 resident page refcount 回收。
     pub fn unmap(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
-        self.vmas.lock().unmap_range(&range);
+        let removed_areas = self.vmas.lock().unmap_range(&range);
+        Self::notify_file_unmapped(&removed_areas);
         let removed = self.remove_page_mappings(range);
         for (va, _mapping) in &removed {
             self.unmap_page(*va)?;
@@ -471,6 +548,7 @@ impl VmSpace {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let new_pgd = (ops.new_pgd_for_user)();
         let cloned_set = self.vmas.lock().deep_clone_metadata();
+        let cloned_file_backings = Self::collect_file_backings(cloned_set.iter());
         let mut child_pages = BTreeMap::new();
         let mut child_maps = Vec::new();
 
@@ -507,6 +585,8 @@ impl VmSpace {
                 );
             }
         }
+
+        Self::notify_files_mapped(cloned_file_backings);
 
         let mapped_pages = child_pages.len();
         Self {
@@ -766,10 +846,46 @@ impl VmSpace {
         self.mapped_pages.store(pages.len(), Ordering::Release);
         removed
     }
+
+    /// 收集 VMA 上的 file backing，生命周期 hook 统一在锁外调用。
+    ///
+    /// 这样 VMA 树只负责描述已经生效的映射变化，SysV shm 等特殊 FileLike 在
+    /// hook 内维护 attach 计数时，不会反向持有或阻塞 VM 内部锁。
+    fn collect_file_backings<'a>(
+        areas: impl IntoIterator<Item = &'a VmArea>,
+    ) -> Vec<Arc<dyn FileLike>> {
+        let mut files = Vec::new();
+        for area in areas {
+            if let VmBacking::File { file, .. } = &area.backing {
+                files.push(Arc::clone(file));
+            }
+        }
+        files
+    }
+
+    fn notify_files_mapped(files: Vec<Arc<dyn FileLike>>) {
+        for file in files {
+            file.on_mapped();
+        }
+    }
+
+    fn notify_file_unmapped(areas: &[VmArea]) {
+        let files = Self::collect_file_backings(areas.iter());
+        for file in files {
+            file.on_unmapped();
+        }
+    }
 }
 
 impl Drop for VmSpace {
     fn drop(&mut self) {
+        let files = {
+            let vmas = self.vmas.lock();
+            Self::collect_file_backings(vmas.iter())
+        };
+        for file in files {
+            file.on_unmapped();
+        }
         self.pages.lock().clear();
         if let Some(ops) = user_pgd_ops() {
             unsafe { (ops.drop_pgd)(self.pgd) };
