@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FirmwareBusRange {
     pub child_start: u128,
@@ -30,6 +32,12 @@ pub struct FirmwareBusDescriptor {
 
 pub trait FirmwareBus: Send + Sync {
     fn descriptor(&self) -> &FirmwareBusDescriptor;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirmwareBusError {
+    NotFound,
+    OutOfMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,25 +72,28 @@ impl FirmwareBusRegistry {
 
 static FIRMWARE_BUSES: Spinlock<FirmwareBusRegistry> = Spinlock::new(FirmwareBusRegistry::new());
 
-pub fn register(bus: Arc<dyn FirmwareBus>) -> Result<FirmwareBusHandle, ()> {
+pub fn register(bus: Arc<dyn FirmwareBus>) -> Result<FirmwareBusHandle, FirmwareBusError> {
     let mut registry = FIRMWARE_BUSES.lock();
-    registry.buses.try_reserve(1).map_err(|_| ())?;
-    let handle = FirmwareBusHandle {
-        id: registry.next_id,
-    };
-    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+    registry
+        .buses
+        .try_reserve(1)
+        .map_err(|_| FirmwareBusError::OutOfMemory)?;
+    let id = registry_id::alloc_locked_id(&mut registry.next_id)
+        .map_err(|_| FirmwareBusError::OutOfMemory)?;
+    // 固件总线节点只在设备管理层内部表达拓扑；handle ID 用于区分每一次登记生命周期。
+    let handle = FirmwareBusHandle { id };
     registry.buses.push(FirmwareBusRegistration { handle, bus });
     Ok(handle)
 }
 
-pub fn unregister(handle: FirmwareBusHandle) -> Result<(), ()> {
+pub fn unregister(handle: FirmwareBusHandle) -> Result<(), FirmwareBusError> {
     let mut registry = FIRMWARE_BUSES.lock();
     let Some(index) = registry
         .buses
         .iter()
         .position(|registered| registered.handle == handle)
     else {
-        return Err(());
+        return Err(FirmwareBusError::NotFound);
     };
     registry.buses.swap_remove(index);
     Ok(())

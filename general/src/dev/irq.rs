@@ -7,10 +7,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
 use crate::Interrupt;
 
 #[derive(Clone, Copy)]
@@ -138,9 +139,9 @@ impl IrqRegistry {
         line: IrqLine,
         handler: Arc<dyn IrqHandler>,
     ) -> Result<IrqHandle, IrqError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut handlers = self.handlers.lock();
         handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
         handlers.push(IrqRegistration { id, line, handler });
         drop(handlers);
         enable_irq_line(line);
@@ -224,26 +225,36 @@ pub trait IrqDomain: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IrqDomainHandle {
     controller: u32,
+    id: u64,
 }
 
 impl IrqDomainHandle {
     pub const fn controller(self) -> u32 {
         self.controller
     }
+
+    pub const fn id(self) -> u64 {
+        self.id
+    }
 }
 
 struct IrqDomainRegistration {
     controller: u32,
+    // 同一个 controller 可以在热移除后重新注册。句柄必须带注册代次，旧句柄
+    // 不能注销后来安装的新 domain。
+    id: u64,
     domain: Arc<dyn IrqDomain>,
 }
 
 pub struct IrqDomainRegistry {
+    next_id: AtomicU64,
     domains: Spinlock<Vec<IrqDomainRegistration>>,
 }
 
 impl IrqDomainRegistry {
     pub const fn new() -> Self {
         Self {
+            next_id: AtomicU64::new(1),
             domains: Spinlock::new(Vec::new()),
         }
     }
@@ -258,15 +269,20 @@ impl IrqDomainRegistry {
             return Err(IrqError::AlreadyRegistered);
         }
         domains.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
-        domains.push(IrqDomainRegistration { controller, domain });
-        Ok(IrqDomainHandle { controller })
+        let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
+        domains.push(IrqDomainRegistration {
+            controller,
+            id,
+            domain,
+        });
+        Ok(IrqDomainHandle { controller, id })
     }
 
     pub fn unregister(&self, handle: IrqDomainHandle) -> Result<(), IrqError> {
         let mut domains = self.domains.lock();
         let Some(index) = domains
             .iter()
-            .position(|entry| entry.controller == handle.controller)
+            .position(|entry| entry.controller == handle.controller && entry.id == handle.id)
         else {
             return Err(IrqError::NotFound);
         };
@@ -424,7 +440,8 @@ pub fn register_default_irq_domain(
     if default.is_some() {
         return Err(IrqError::AlreadyRegistered);
     }
-    let id = NEXT_DEFAULT_IRQ_DOMAIN_ID.fetch_add(1, Ordering::Relaxed);
+    let id = registry_id::alloc_atomic_id(&NEXT_DEFAULT_IRQ_DOMAIN_ID)
+        .map_err(|_| IrqError::OutOfMemory)?;
     *default = Some(DefaultIrqDomainRegistration { id, domain });
     Ok(DefaultIrqDomainHandle { id })
 }

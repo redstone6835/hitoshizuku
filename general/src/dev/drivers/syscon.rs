@@ -370,6 +370,7 @@ fn map_syscon_error(err: SysconError) -> PnpError {
     match err {
         SysconError::AlreadyRegistered => PnpError::NameConflict,
         SysconError::Invalid | SysconError::OutOfRange => PnpError::ProbeFailed,
+        SysconError::OutOfMemory => PnpError::OutOfMemory,
         SysconError::NotFound => PnpError::ProbeDeferred,
     }
 }

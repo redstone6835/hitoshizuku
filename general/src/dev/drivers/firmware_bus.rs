@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::dev::firmware_bus::{
-    self, FirmwareBus, FirmwareBusDescriptor, FirmwareBusHandle, FirmwareBusRange,
+    self, FirmwareBus, FirmwareBusDescriptor, FirmwareBusError, FirmwareBusHandle, FirmwareBusRange,
 };
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
@@ -70,7 +70,7 @@ impl PnpDriver for FirmwareBusPlatformDriver {
         let info = platform_info(dev)?;
         let descriptor = firmware_bus_descriptor(info)?;
         let bus = Arc::new(DtbFirmwareBus { descriptor });
-        let handle = firmware_bus::register(bus.clone()).map_err(|_| PnpError::OutOfMemory)?;
+        let handle = firmware_bus::register(bus.clone()).map_err(map_firmware_bus_error)?;
         dev.set_driver_data(Arc::new(FirmwareBusBinding { handle }));
         log::printk!(
             "[firmware-bus] registered {} ranges={} dma-coherent={}",
@@ -87,6 +87,13 @@ impl PnpDriver for FirmwareBusPlatformDriver {
         {
             let _ = firmware_bus::unregister(binding.handle);
         }
+    }
+}
+
+fn map_firmware_bus_error(err: FirmwareBusError) -> PnpError {
+    match err {
+        FirmwareBusError::NotFound => PnpError::InvalidState,
+        FirmwareBusError::OutOfMemory => PnpError::OutOfMemory,
     }
 }
 

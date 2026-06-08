@@ -38,4 +38,6 @@ pub mod syscon;
 pub mod usb;
 pub mod virtio;
 
+mod registry_id;
+
 pub use control::DriverControl;

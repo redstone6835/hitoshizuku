@@ -4,9 +4,11 @@
 //! （MMIO、PIO 或 DMA），上层只通过 selector/key 读取字节流，不直接接触寄存器。
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 
 use vfs::sync::Spinlock;
+
+use super::registry_id;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FwCfgError {
@@ -15,6 +17,7 @@ pub enum FwCfgError {
     NotInstalled,
     AlreadyInstalled,
     NotFound,
+    OutOfMemory,
 }
 
 pub trait FwCfgDevice: Send + Sync {
@@ -49,7 +52,8 @@ pub fn install(dev: Arc<dyn FwCfgDevice>) -> Result<FwCfgHandle, FwCfgError> {
     if current.is_some() {
         return Err(FwCfgError::AlreadyInstalled);
     }
-    let id = NEXT_FW_CFG_ID.fetch_add(1, Ordering::Relaxed);
+    let id = registry_id::alloc_atomic_id(&NEXT_FW_CFG_ID).map_err(|_| FwCfgError::OutOfMemory)?;
+    // fw_cfg 当前是单实例资源，但 handle 仍表示一次安装生命周期，不能在卸载后复用。
     *current = Some(FwCfgRegistration { id, dev });
     Ok(FwCfgHandle { id })
 }

@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SysconAccessWidth {
     U8,
@@ -44,6 +46,7 @@ pub enum SysconError {
     OutOfRange,
     NotFound,
     AlreadyRegistered,
+    OutOfMemory,
 }
 
 pub trait SysconDevice: Send + Sync {
@@ -120,12 +123,11 @@ pub fn register(dev: Arc<dyn SysconDevice>) -> Result<SysconHandle, SysconError>
     registry
         .devices
         .try_reserve(1)
-        .map_err(|_| SysconError::Invalid)?;
-    let handle = SysconHandle {
-        phandle,
-        id: registry.next_id,
-    };
-    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+        .map_err(|_| SysconError::OutOfMemory)?;
+    let id = registry_id::alloc_locked_id(&mut registry.next_id)
+        .map_err(|_| SysconError::OutOfMemory)?;
+    // 同一个 phandle 被注销后可以再次登记，但旧 SysconHandle 不能继续拥有新对象。
+    let handle = SysconHandle { phandle, id };
     registry.devices.push(SysconRegistration { handle, dev });
     Ok(handle)
 }

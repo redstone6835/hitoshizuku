@@ -14,7 +14,7 @@ use general::dev::block::BlockDevice;
 use general::dev::char::CharDevice;
 use general::dev::enumerate::DEVICES;
 use general::dev::function::{active_block_devices, find_char_device_by_fw_name};
-use general::dev::pci::pci_scan_and_register;
+use general::dev::pci::pci_scan_and_register_summary;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, FirmwarePropertyValue,
     PlatformDeviceInfo, PlatformProbeStatus, register_and_probe_platform_device,
@@ -27,11 +27,9 @@ use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
-use general::vfs::ensure_dir;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::mount_posix_shm_tmpfs;
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
@@ -364,10 +362,14 @@ pub fn kernel_start_init(context: &StartContext) {
 
         pci::assign_bars(host);
 
-        let count = pci_scan_and_register(host.domain, host.bus_start, host.bus_end);
+        let summary = pci_scan_and_register_summary(host.domain, host.bus_start, host.bus_end);
         printk!(
-            "[kernel-start][dtb] pci_scan_and_register probed {} device(s)",
-            count
+            "[kernel-start][dtb] pci scan registered={} bound={} no-driver={} deferred={} failed={}",
+            summary.registered,
+            summary.bound,
+            summary.no_driver,
+            summary.deferred,
+            summary.failed
         );
     } else {
         printk!("[kernel-start][dtb] no pcie node in DTB; skipping PCI init");
@@ -420,38 +422,9 @@ pub fn kernel_start_init(context: &StartContext) {
         printk!("[kernel-start][dtb] initramfs unpacked into root");
     }
 
-    // 小步骤 5.6 最后把 devtmpfs 和 sysfs 挂到标准路径，同时把之前登记好的启动
-    // 设备节点批量同步进 `/dev`。
-    ensure_dir(&vfs_ctx, "/dev", FileMode::new(0o755))
-        .expect("[kernel-start][dtb] failed to ensure /dev directory");
-    let dev_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/dev", LookupFlags::DIRECTORY)
-        .expect("[kernel-start][dtb] failed to resolve /dev")
-        .dentry;
-    mount_ns
-        .mount(dev_dentry, Arc::clone(&dev_sb), MountFlags::default())
-        .expect("[kernel-start][dtb] failed to mount devtmpfs on /dev");
-
-    // POSIX shm 不需要专用驱动；把 tmpfs 覆盖到 /dev/shm 后，用户态通过普通
-    // open/ftruncate/mmap(MAP_SHARED) 就能得到共享内存文件后端。
-    mount_posix_shm_tmpfs(&vfs_ctx).expect("[kernel-start][dtb] failed to mount tmpfs on /dev/shm");
-
-    ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
-        .expect("[kernel-start][dtb] failed to ensure /sys directory");
-    let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
-        .expect("[kernel-start][dtb] failed to resolve /sys")
-        .dentry;
-    let sys_sb = FS_REGISTRY
-        .find("sysfs")
-        .expect("[kernel-start][dtb] sysfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][dtb] failed to mount sysfs");
-    mount_ns
-        .mount(
-            Arc::clone(&sys_dentry),
-            Arc::clone(&sys_sb),
-            MountFlags::default(),
-        )
-        .expect("[kernel-start][dtb] failed to mount sysfs on /sys");
+    // 小步骤 5.6 最后把 devtmpfs 和标准兼容层伪文件系统挂到公共路径。
+    crate::device_init::mount_devtmpfs_on_dev("dtb", &vfs_ctx, Arc::clone(&dev_sb));
+    crate::device_init::mount_standard_compat_filesystems("dtb", &vfs_ctx);
 
     printk!(
         "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",

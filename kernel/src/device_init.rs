@@ -9,14 +9,17 @@ use alloc::sync::Arc;
 
 use general::dev::drivers;
 use general::dev::pnp::{DevInitContext, set_dev_init_context};
-use general::vfs::FS_REGISTRY;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
+use general::vfs::mount::{Mount, MountFlags};
+use general::vfs::path::{self, Dirfd, LookupFlags};
+use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
+use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_posix_shm_tmpfs};
 use log::printk;
 
-// TODO(dev-init): DTB/ACPI 仍各自挂载 `/dev`、`/dev/shm` 和 `/sys`。
-// 后续应把标准设备/兼容层挂载收敛到本模块，并改为返回结构化启动错误，避免
-// 固件路径复制顺序约束。
+const SYSFS_DIR_PATH: &str = "/sys";
+const SYSFS_DIR_MODE: FileMode = FileMode::new(0o555);
+const SYSFS_FS_TYPE: &str = "sysfs";
 
 /// 注册启动期核心文件系统驱动。
 ///
@@ -85,6 +88,106 @@ pub fn devtmpfs_ops<'a>(dev_sb: &'a Arc<Superblock>, tag: &str) -> &'a DevTmpfsS
     dev_sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .unwrap_or_else(|| panic!("[kernel-start][{}] failed to downcast devtmpfs ops", tag))
+}
+
+/// 把全局 devtmpfs superblock 挂载到标准 `/dev` 路径。
+///
+/// devtmpfs 是设备模型的 VFS 投影载体，具体节点已经由 PnP bridge 和静态节点注册表
+/// 写入 superblock；这里仅负责把这份全局命名空间接到当前 mount namespace。
+pub fn mount_devtmpfs_on_dev(tag: &str, ctx: &VfsContext, dev_sb: Arc<Superblock>) -> Arc<Mount> {
+    ensure_dir(ctx, general::vfs::DEV_DIR_PATH, FileMode::new(0o755)).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to ensure /dev directory: {:?}",
+            tag, err
+        )
+    });
+
+    if let Ok(existing) = path::lookup(
+        ctx,
+        &Dirfd::Cwd,
+        general::vfs::DEV_DIR_PATH,
+        LookupFlags::DIRECTORY,
+    ) && Arc::ptr_eq(&existing.mount.superblock, &dev_sb)
+        && Arc::ptr_eq(&existing.dentry, &existing.mount.mount_root)
+    {
+        return existing.mount;
+    }
+
+    let mountpoint = path::lookup(
+        ctx,
+        &Dirfd::Cwd,
+        general::vfs::DEV_DIR_PATH,
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to resolve /dev mountpoint: {:?}",
+            tag, err
+        )
+    });
+    ctx.mount_ns
+        .mount(mountpoint.dentry, dev_sb, MountFlags::default())
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to mount devtmpfs on /dev: {:?}",
+                tag, err
+            )
+        })
+}
+
+/// 挂载依赖 `/dev` 的标准兼容层伪文件系统。
+///
+/// `/dev/shm` 和 `/sys` 不是底层设备身份的一部分，但它们依赖启动期设备文件系统
+/// 先就绪。集中到这里可以让 DTB/ACPI 等固件入口共享同一套顺序和幂等规则。
+pub fn mount_standard_compat_filesystems(tag: &str, ctx: &VfsContext) {
+    mount_posix_shm_tmpfs(ctx).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to mount tmpfs on /dev/shm: {:?}",
+            tag, err
+        )
+    });
+    mount_sysfs_on_sys(tag, ctx);
+}
+
+fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
+    ensure_dir(ctx, SYSFS_DIR_PATH, SYSFS_DIR_MODE).unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to ensure /sys directory: {:?}",
+            tag, err
+        )
+    });
+    if let Ok(existing) = path::lookup(ctx, &Dirfd::Cwd, SYSFS_DIR_PATH, LookupFlags::DIRECTORY)
+        && existing.mount.superblock.fs_type == SYSFS_FS_TYPE
+        && Arc::ptr_eq(&existing.dentry, &existing.mount.mount_root)
+    {
+        return existing.mount;
+    }
+
+    let mountpoint = path::lookup(
+        ctx,
+        &Dirfd::Cwd,
+        SYSFS_DIR_PATH,
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )
+    .unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to resolve /sys mountpoint: {:?}",
+            tag, err
+        )
+    });
+    let sys_sb = FS_REGISTRY
+        .find(SYSFS_FS_TYPE)
+        .unwrap_or_else(|| panic!("[kernel-start][{}] sysfs driver not found", tag))
+        .mount(None, "")
+        .unwrap_or_else(|err| panic!("[kernel-start][{}] failed to mount sysfs: {:?}", tag, err));
+    ctx.mount_ns
+        .mount(mountpoint.dentry, sys_sb, MountFlags::default())
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to mount sysfs on /sys: {:?}",
+                tag, err
+            )
+        })
 }
 
 /// 安装 PnP bridge、设备初始化上下文和内建驱动。

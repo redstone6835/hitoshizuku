@@ -9,7 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
-use crate::dev::irq::{self, IrqLine};
+use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine};
 use crate::dev::pnp::{
     BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
 };
@@ -175,6 +175,16 @@ pub enum PlatformIrqResolveError {
     Unresolved,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlatformIrqRegistrationError {
+    /// 固件没有给这个 platform 设备声明 IRQ 资源。
+    NoResource,
+    /// 固件声明了 IRQ，但对应 IRQ domain 暂未注册或无法翻译该 specifier。
+    Unresolved,
+    /// IRQ 已翻译成功，但注册 handler 失败。
+    RegistrationFailed { line: IrqLine, err: IrqError },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceProperties {
     pub clock_hz: Option<u32>,
@@ -293,6 +303,47 @@ impl PlatformDeviceInfo {
         })
     }
 
+    /// 使用第 `index` 个固件 IRQ 资源注册 handler。
+    ///
+    /// 驱动只声明“我要消费哪个固件 IRQ 资源”，翻译细节仍由 IRQ domain 完成；
+    /// platform 层负责把缺资源、依赖未就绪和 handler 注册失败拆成不同错误。
+    pub fn register_irq_handler_at(
+        &self,
+        index: usize,
+        handler: Arc<dyn IrqHandler>,
+    ) -> Result<IrqHandle, PlatformIrqRegistrationError> {
+        let line = self
+            .resolve_irq_line_at(index)
+            .map_err(map_irq_resolve_error)?;
+        irq::register_irq_handler(line, handler)
+            .map_err(|err| PlatformIrqRegistrationError::RegistrationFailed { line, err })
+    }
+
+    /// 使用第一个可翻译的固件 IRQ 资源注册 handler。
+    ///
+    /// 多个 IRQ 资源按固件声明顺序检查；已经声明但暂时无法翻译时返回
+    /// [`PlatformIrqRegistrationError::Unresolved`]，让 PnP core 保留设备并等待
+    /// interrupt-controller 驱动完成注册后重试 probe。
+    pub fn register_first_irq_handler(
+        &self,
+        handler: Arc<dyn IrqHandler>,
+    ) -> Result<IrqHandle, PlatformIrqRegistrationError> {
+        let mut saw_irq = false;
+        for irq_resource in self.irq_resources() {
+            saw_irq = true;
+            let Some(line) = irq_resource.resolve_line() else {
+                continue;
+            };
+            return irq::register_irq_handler(line, handler)
+                .map_err(|err| PlatformIrqRegistrationError::RegistrationFailed { line, err });
+        }
+        Err(if saw_irq {
+            PlatformIrqRegistrationError::Unresolved
+        } else {
+            PlatformIrqRegistrationError::NoResource
+        })
+    }
+
     pub fn u32_property(&self, name: &str) -> Option<u32> {
         self.fw_properties
             .iter()
@@ -367,6 +418,13 @@ impl PlatformDeviceInfo {
             mmio_index += 1;
         }
         None
+    }
+}
+
+fn map_irq_resolve_error(err: PlatformIrqResolveError) -> PlatformIrqRegistrationError {
+    match err {
+        PlatformIrqResolveError::NoResource => PlatformIrqRegistrationError::NoResource,
+        PlatformIrqResolveError::Unresolved => PlatformIrqRegistrationError::Unresolved,
     }
 }
 

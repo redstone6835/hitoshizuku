@@ -69,13 +69,11 @@ static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinl
 static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
     Spinlock::new(BTreeMap::new());
 static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
-static BUILTIN_STATIC_NODES_REGISTERED: AtomicBool = AtomicBool::new(false);
-
 /// devtmpfs 静态节点声明。
 ///
-/// 静态节点用于 random/null/zero 这类没有 PnP backing device、但又必须出现在
-/// `/dev` 的基础设备。声明只保存构造器，真正的 inode 仍通过 [`DevNodeSpec`]
-/// 进入统一绑定路径，避免 devtmpfs 为每种特殊设备增加分支。
+/// 静态节点用于没有 PnP backing device、但又必须出现在 `/dev` 的基础设备。
+/// 声明只保存构造器，真正的 inode 仍通过 [`DevNodeSpec`] 进入统一绑定路径，
+/// 避免 devtmpfs 为每种特殊设备增加分支。
 #[derive(Clone, Copy)]
 pub struct DevTmpfsStaticNode {
     owner: &'static str,
@@ -94,20 +92,6 @@ impl DevTmpfsStaticNode {
 
     pub const fn name(self) -> &'static str {
         self.name
-    }
-}
-
-fn null_static_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "null".into(),
-        dev: CharDevice::null(),
-    }
-}
-
-fn zero_static_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "zero".into(),
-        dev: CharDevice::zero(),
     }
 }
 
@@ -136,34 +120,6 @@ fn restore_static_dev_node_record(node: DevTmpfsStaticNode) -> VfsResult<()> {
     }
     nodes.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
     nodes.push(node);
-    Ok(())
-}
-
-fn ensure_builtin_static_nodes_registered() -> VfsResult<()> {
-    if BUILTIN_STATIC_NODES_REGISTERED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Ok(());
-    }
-
-    if let Err(err) = register_static_dev_node(DevTmpfsStaticNode::new(
-        "devtmpfs-core",
-        "null",
-        null_static_node,
-    )) {
-        BUILTIN_STATIC_NODES_REGISTERED.store(false, Ordering::Release);
-        return Err(err);
-    }
-    if let Err(err) = register_static_dev_node(DevTmpfsStaticNode::new(
-        "devtmpfs-core",
-        "zero",
-        zero_static_node,
-    )) {
-        let _ = unregister_static_dev_node("devtmpfs-core", "null");
-        BUILTIN_STATIC_NODES_REGISTERED.store(false, Ordering::Release);
-        return Err(err);
-    }
     Ok(())
 }
 
@@ -2639,8 +2595,6 @@ impl FsDriver for DevTmpfsDriver {
                 self_weak: weak_sb,
             }
         });
-
-        ensure_builtin_static_nodes_registered()?;
 
         let ops = sb
             .downcast_ops::<DevTmpfsSuperblockOps>()

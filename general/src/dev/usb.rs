@@ -367,26 +367,58 @@ impl UsbInterface {
 
 // ── 动态设备管理 ────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsbProbeStatus {
+    Bound,
+    NoDriver,
+    Deferred,
+}
+
+#[derive(Clone)]
+pub struct UsbRegistration {
+    pub device: Arc<PnpDevice>,
+    pub status: UsbProbeStatus,
+}
+
+impl UsbRegistration {
+    const fn new(device: Arc<PnpDevice>, status: UsbProbeStatus) -> Self {
+        Self { device, status }
+    }
+}
+
+fn rollback_usb_registration(pnp: &Arc<PnpDevice>, inserted: bool) {
+    if !inserted {
+        return;
+    }
+    if let Some(parent) = pnp.parent() {
+        parent.detach_child(pnp);
+    }
+    PNP_DEVICES.remove(&pnp.id);
+}
+
 fn probe_registered_usb_pnp(
     pnp: &Arc<PnpDevice>,
     inserted: bool,
-) -> Result<Option<Arc<PnpDevice>>, PnpError> {
+) -> Result<UsbRegistration, PnpError> {
     match pnp.state() {
-        PnpState::Bound => Ok(Some(Arc::clone(pnp))),
+        PnpState::Bound => Ok(UsbRegistration::new(Arc::clone(pnp), UsbProbeStatus::Bound)),
         PnpState::Discovered => match PNP_DRIVERS.probe_device(pnp) {
-            Ok(()) => Ok(Some(Arc::clone(pnp))),
-            Err(PnpError::NoDriver | PnpError::ProbeDeferred) => Ok(None),
+            Ok(()) => Ok(UsbRegistration::new(Arc::clone(pnp), UsbProbeStatus::Bound)),
+            Err(PnpError::NoDriver) => Ok(UsbRegistration::new(
+                Arc::clone(pnp),
+                UsbProbeStatus::NoDriver,
+            )),
+            Err(PnpError::ProbeDeferred) => Ok(UsbRegistration::new(
+                Arc::clone(pnp),
+                UsbProbeStatus::Deferred,
+            )),
             Err(err) => {
-                if inserted {
-                    PNP_DEVICES.remove(&pnp.id);
-                }
+                rollback_usb_registration(pnp, inserted);
                 Err(err)
             }
         },
         PnpState::Probing | PnpState::Removing | PnpState::Gone => {
-            if inserted {
-                PNP_DEVICES.remove(&pnp.id);
-            }
+            rollback_usb_registration(pnp, inserted);
             Err(PnpError::InvalidState)
         }
     }
@@ -399,13 +431,9 @@ impl UsbDevice {
     /// 1. 将 device 注册到 `PNP_DEVICES`，提供拓扑可见性
     /// 2. 为 hub 等全设备驱动提供 probe 机会
     ///
-    /// 对于无驱动绑定的设备返回 `Ok(None)`（不会视为错误）。
-    ///
-    /// # 返回
-    /// `Ok(Some(pnp))` — 注册成功且有驱动绑定
-    /// `Ok(None)` — 注册成功但无匹配驱动
-    /// `Err(_)` — 注册失败
-    pub fn register_and_probe(&self) -> Result<Option<Arc<PnpDevice>>, PnpError> {
+    /// `NoDriver` 和 `ProbeDeferred` 不视为硬失败，而是通过 [`UsbProbeStatus`]
+    /// 返回给调用方，便于扫描器统计和后续依赖恢复重试。
+    pub fn register_and_probe(&self) -> Result<UsbRegistration, PnpError> {
         let registration = PNP_DEVICES.get_or_insert(Arc::clone(&self.pnp))?;
         probe_registered_usb_pnp(&registration.device, registration.inserted)
     }
@@ -421,15 +449,12 @@ impl UsbDevice {
     /// - `info`: interface 描述符信息
     ///
     /// # 返回
-    /// `Ok(Some(pnp))` — 创建成功且有驱动绑定
-    /// `Ok(None)` — 创建成功但无匹配驱动
-    /// `Err(_)` — 创建或注册失败
     pub fn register_interface_and_probe(
         &self,
         num: u8,
         name: Box<str>,
         info: UsbInterfaceInfo,
-    ) -> Result<Option<Arc<PnpDevice>>, PnpError> {
+    ) -> Result<UsbRegistration, PnpError> {
         if let Some(existing) = self.find_interface(num) {
             return probe_registered_usb_pnp(&existing.pnp, false);
         }
@@ -494,7 +519,7 @@ impl UsbInterface {
     ///
     /// 适用于 interface PnpDevice 由外部构造的场景
     /// （如通过 [`UsbDevice::create_interface`] 分开创建和注册）。
-    pub fn register_and_probe(&self) -> Result<Option<Arc<PnpDevice>>, PnpError> {
+    pub fn register_and_probe(&self) -> Result<UsbRegistration, PnpError> {
         let registration = PNP_DEVICES.get_or_insert(Arc::clone(&self.pnp))?;
         probe_registered_usb_pnp(&registration.device, registration.inserted)
     }

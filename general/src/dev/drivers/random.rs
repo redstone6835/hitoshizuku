@@ -39,7 +39,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::dev::char::{CharDevice, CharDriver, CharIoError};
 use crate::dev::function::DevNodeSpec;
-use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_node};
+use crate::vfs::devtmpfs::{
+    DevTmpfsStaticNode, register_static_dev_node, unregister_static_dev_node,
+};
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -711,12 +713,16 @@ pub fn register_builtin_driver() -> Result<(), PnpError> {
         random_dev_node,
     ))
     .map_err(|_| PnpError::DevtmpfsError)?;
-    register_static_dev_node(DevTmpfsStaticNode::new(
+    if register_static_dev_node(DevTmpfsStaticNode::new(
         "random-driver",
         "urandom",
         urandom_dev_node,
     ))
-    .map_err(|_| PnpError::DevtmpfsError)?;
+    .is_err()
+    {
+        let _ = unregister_static_dev_node("random-driver", "random");
+        return Err(PnpError::DevtmpfsError);
+    }
     Ok(())
 }
 

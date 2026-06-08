@@ -207,6 +207,7 @@ fn map_flash_error(err: FlashError) -> PnpError {
             PnpError::ProbeFailed
         }
         FlashError::NotFound => PnpError::InvalidState,
+        FlashError::OutOfMemory => PnpError::OutOfMemory,
     }
 }
 

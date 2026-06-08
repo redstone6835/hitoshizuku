@@ -7,9 +7,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicU64;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
 use crate::dev::irq::IrqLine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,11 +49,16 @@ pub enum MsiError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsiControllerHandle {
     controller: u32,
+    id: u64,
 }
 
 impl MsiControllerHandle {
     pub const fn controller(self) -> u32 {
         self.controller
+    }
+
+    pub const fn id(self) -> u64 {
+        self.id
     }
 }
 
@@ -83,10 +90,12 @@ impl MsiHandle {
 
 struct MsiControllerRegistration {
     controller: u32,
+    id: u64,
     driver: Arc<dyn MsiController>,
 }
 
 static MSI_CONTROLLERS: Spinlock<Vec<MsiControllerRegistration>> = Spinlock::new(Vec::new());
+static NEXT_MSI_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn register_msi_controller(
     controller: u32,
@@ -102,15 +111,22 @@ pub fn register_msi_controller(
     controllers
         .try_reserve(1)
         .map_err(|_| MsiError::OutOfMemory)?;
-    controllers.push(MsiControllerRegistration { controller, driver });
-    Ok(MsiControllerHandle { controller })
+    let id =
+        registry_id::alloc_atomic_id(&NEXT_MSI_CONTROLLER_ID).map_err(|_| MsiError::OutOfMemory)?;
+    // controller 编号来自固件路由，可能在卸载后重新出现；handle ID 区分每一次注册生命周期。
+    controllers.push(MsiControllerRegistration {
+        controller,
+        id,
+        driver,
+    });
+    Ok(MsiControllerHandle { controller, id })
 }
 
 pub fn unregister_msi_controller(handle: MsiControllerHandle) -> Result<(), MsiError> {
     let mut controllers = MSI_CONTROLLERS.lock();
     let Some(index) = controllers
         .iter()
-        .position(|entry| entry.controller == handle.controller)
+        .position(|entry| entry.controller == handle.controller && entry.id == handle.id)
     else {
         return Err(MsiError::NotFound);
     };

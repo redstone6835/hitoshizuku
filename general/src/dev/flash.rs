@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlashWindow {
     pub phys: usize,
@@ -27,6 +29,7 @@ pub enum FlashError {
     OutOfRange,
     Unsupported,
     NotFound,
+    OutOfMemory,
 }
 
 pub trait FlashDevice: Send + Sync {
@@ -75,11 +78,12 @@ pub fn register(dev: Arc<dyn FlashDevice>) -> Result<FlashHandle, FlashError> {
     registry
         .devices
         .try_reserve(1)
-        .map_err(|_| FlashError::Invalid)?;
-    let handle = FlashHandle {
-        id: registry.next_id,
-    };
-    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+        .map_err(|_| FlashError::OutOfMemory)?;
+    let id =
+        registry_id::alloc_locked_id(&mut registry.next_id).map_err(|_| FlashError::OutOfMemory)?;
+    // FlashHandle 只证明一次注册关系的所有权；即使同一窗口后续重新 probe，
+    // 旧 handle 也不能注销新的 flash 对象。
+    let handle = FlashHandle { id };
     registry.devices.push(FlashRegistration { handle, dev });
     Ok(handle)
 }

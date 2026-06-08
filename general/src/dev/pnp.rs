@@ -44,6 +44,7 @@ use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{
     DevNodeNameAllocError, DevNodeSet, DeviceFunction, FunctionRegistryError,
 };
+use crate::dev::registry_id;
 
 // ── PnP 错误类型 ─────────────────────────────────────────────────────────
 
@@ -444,6 +445,12 @@ impl PnpDevice {
         if inner.state == PnpState::Gone || inner.state == PnpState::Removing {
             return Err(PnpError::InvalidState);
         }
+        // 父子关系是 remove/unbind 递归清理的基础结构，插入前先完成容量预留，
+        // 避免 OOM 时已经写入 child.parent 却没有进入 parent.children。
+        inner
+            .children
+            .try_reserve(1)
+            .map_err(|_| PnpError::OutOfMemory)?;
         let mut child_inner = child.inner.lock();
         // 正在移除或已经 Gone 的设备不能重新进入拓扑；这类对象的 function 和
         // driver_data 正在被清理，重新挂接会破坏热拔生命周期。
@@ -502,6 +509,12 @@ impl PnpDevice {
         {
             return Err(PnpError::FunctionExists);
         }
+        // function 注册后会继续进入 DEVICES 和 devtmpfs；这里先预留空间，
+        // 确保 attach 阶段失败时不会留下半注册状态。
+        inner
+            .functions
+            .try_reserve(1)
+            .map_err(|_| PnpError::OutOfMemory)?;
         inner.functions.push(func);
         Ok(())
     }
@@ -600,6 +613,13 @@ impl DriverHandle {
     }
 }
 
+fn alloc_driver_id(next_id: &AtomicU64) -> Result<DriverId, PnpError> {
+    // DriverHandle 可能跨热拔、驱动注销和重新注册流程存活，编号一旦发出就不能复用。
+    registry_id::alloc_atomic_id(next_id)
+        .map(DriverId)
+        .map_err(|_| PnpError::OutOfMemory)
+}
+
 pub trait DriverFactory: Send + Sync {
     /// factory 创建的驱动名称。
     fn name(&self) -> &'static str;
@@ -648,7 +668,7 @@ impl PnpDriverRegistry {
                 return Err(PnpError::NameConflict);
             }
             drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
-            let id = DriverId(self.next_driver_id.fetch_add(1, Ordering::Relaxed));
+            let id = alloc_driver_id(&self.next_driver_id)?;
             drivers.push(RegisteredDriver {
                 id,
                 driver: Arc::clone(&driver),
@@ -916,30 +936,10 @@ impl PnpDeviceList {
         }
     }
 
-    /// 插入一个新发现的设备。
-    ///
-    /// 同一个硬件身份在未进入 [`PnpState::Gone`] 前不能重复注册。
-    // TODO(pnp-core): 目前所有总线扫描路径应优先使用 `get_or_insert()`。
-    // 保留 strict `push()` 是为了少数测试或一次性插入语义；后续需要收紧可见性，
-    // 避免新总线绕过幂等注册入口。
-    pub fn push(&self, dev: Arc<PnpDevice>) -> Result<Arc<PnpDevice>, PnpError> {
-        let mut list = self.devices.lock();
-        list.retain(|d| d.state() != PnpState::Gone);
-        if list
-            .iter()
-            .any(|d| d.id == dev.id && d.state() != PnpState::Gone)
-        {
-            return Err(PnpError::NameConflict);
-        }
-        list.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
-        list.push(Arc::clone(&dev));
-        Ok(dev)
-    }
-
     /// 插入新设备；若同一硬件身份已经存在，则返回既有对象。
     ///
-    /// 这是总线扫描的幂等入口。与 [`PnpDeviceList::push`] 不同，它不会把重复发现
-    /// 视为错误，适合固件节点重试、热插拔重新扫描或驱动依赖恢复后的 probe retry。
+    /// 这是总线扫描唯一的登记入口。它不会把重复发现视为错误，适合固件节点重试、
+    /// 热插拔重新扫描或驱动依赖恢复后的 probe retry。
     pub fn get_or_insert(&self, dev: Arc<PnpDevice>) -> Result<PnpDeviceRegistration, PnpError> {
         let mut list = self.devices.lock();
         list.retain(|d| d.state() != PnpState::Gone);
@@ -1000,6 +1000,7 @@ impl Default for PnpDeviceList {
 ///
 /// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSet`] 时，通过这里安装的
 /// 回调把节点创建委托给 devtmpfs。
+#[derive(Clone, Copy)]
 pub struct PnpDevtmpfsCallbacks {
     pub bind: fn(&DevNodeSet) -> Result<(), PnpError>,
     pub unbind: fn(&DevNodeSet) -> Result<(), PnpError>,
@@ -1016,14 +1017,20 @@ fn devtmpfs_bind_function(func: &Arc<dyn DeviceFunction>) -> Result<(), PnpError
     let Some(nodes) = func.devnodes() else {
         return Ok(());
     };
-    let guard = DEVTMPFS_CB.lock();
-    let cb = guard.as_ref().ok_or(PnpError::NoDevtmpfs)?;
+    let cb = DEVTMPFS_CB
+        .lock()
+        .as_ref()
+        .copied()
+        .ok_or(PnpError::NoDevtmpfs)?;
     (cb.bind)(&nodes)
 }
 
 fn devtmpfs_unbind(nodes: &DevNodeSet) -> Result<(), PnpError> {
-    let guard = DEVTMPFS_CB.lock();
-    let cb = guard.as_ref().ok_or(PnpError::NoDevtmpfs)?;
+    let cb = DEVTMPFS_CB
+        .lock()
+        .as_ref()
+        .copied()
+        .ok_or(PnpError::NoDevtmpfs)?;
     (cb.unbind)(nodes)
 }
 

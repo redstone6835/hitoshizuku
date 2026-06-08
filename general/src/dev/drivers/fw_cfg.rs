@@ -159,6 +159,7 @@ fn map_fwcfg_error(err: FwCfgError) -> PnpError {
         FwCfgError::Invalid | FwCfgError::Io | FwCfgError::NotInstalled | FwCfgError::NotFound => {
             PnpError::ProbeFailed
         }
+        FwCfgError::OutOfMemory => PnpError::OutOfMemory,
     }
 }
 

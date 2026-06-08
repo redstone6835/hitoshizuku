@@ -37,6 +37,7 @@ use super::msi;
 use super::pnp::{
     BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
 };
+use super::registry_id;
 
 // ── PciInfo ──────────────────────────────────────────────────────────────
 
@@ -237,10 +238,11 @@ pub fn register_host_bridge(
         .bridges
         .try_reserve(1)
         .map_err(|_| PciHostBridgeError::OutOfMemory)?;
-    let handle = PciHostBridgeHandle {
-        id: registry.next_id,
-    };
-    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+    let id = registry_id::alloc_locked_id(&mut registry.next_id)
+        .map_err(|_| PciHostBridgeError::OutOfMemory)?;
+    // host bridge 句柄可能被启动期回滚或热移除路径保存；编号只增长不复用，
+    // 旧句柄就不会误注销后来重新登记的同一 domain/bus-range。
+    let handle = PciHostBridgeHandle { id };
     registry
         .bridges
         .push(PciHostBridgeRegistration { handle, info, pnp });
@@ -1117,20 +1119,53 @@ fn pci_hardware_name(segment: u16, bus: u8, device: u8, function: u8) -> Box<str
     alloc::format!("pci-{segment:04x}:{bus:02x}:{device:02x}.{function}").into()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciProbeStatus {
+    Bound,
+    NoDriver,
+    Deferred,
+}
+
+#[derive(Clone)]
+pub struct PciRegistration {
+    pub device: Arc<PnpDevice>,
+    pub status: PciProbeStatus,
+}
+
+impl PciRegistration {
+    const fn new(device: Arc<PnpDevice>, status: PciProbeStatus) -> Self {
+        Self { device, status }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciRegisterError {
+    NotPresent,
+    Pnp(PnpError),
+}
+
+fn rollback_pci_registration(dev: &Arc<PnpDevice>, inserted: bool) {
+    if !inserted {
+        return;
+    }
+    if let Some(parent) = dev.parent() {
+        parent.detach_child(dev);
+    }
+    PNP_DEVICES.remove(&dev.id);
+}
+
 impl PciDevice {
     /// 从 config space 读取 PCI 信息，构造 PnpDevice 并注册到全局列表，
     /// 然后自动 probe 驱动。一步完成设备的完整发现-绑定流程。
     ///
     /// PnP 设备名是稳定硬件名 `pci-{seg:04x}:{bus:02x}:{dev:02x}.{func}`，
     /// 不承载 `/dev` 节点命名前缀语义。
-    // TODO(pci-pnp): 该接口仍用 `Option` 抹平了 NoDriver、Deferred 和硬失败。
-    // 后续应改成结构化 probe 结果，让扫描器能统计真实失败并保留诊断信息。
     pub fn register_and_probe(
         segment: u16,
         bus: u8,
         device: u8,
         function: u8,
-    ) -> Option<Arc<PnpDevice>> {
+    ) -> Result<PciRegistration, PciRegisterError> {
         let id = PnpId::Pci {
             segment,
             bus,
@@ -1138,30 +1173,33 @@ impl PciDevice {
             function,
         };
 
-        let info = PciDevice::read_device_info(segment, bus, device, function)?;
+        let info = PciDevice::read_device_info(segment, bus, device, function)
+            .ok_or(PciRegisterError::NotPresent)?;
 
         let name = pci_hardware_name(segment, bus, device, function);
         let new_dev = PnpDevice::new(id, name, Box::new(info));
-        let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev)).ok()?;
+        let registration = PNP_DEVICES
+            .get_or_insert(Arc::clone(&new_dev))
+            .map_err(PciRegisterError::Pnp)?;
         let pnp = registration.device;
         attach_to_host_bridge(&pnp);
 
         match pnp.state() {
-            PnpState::Bound => Some(pnp),
+            PnpState::Bound => Ok(PciRegistration::new(pnp, PciProbeStatus::Bound)),
             PnpState::Discovered => match PNP_DRIVERS.probe_device(&pnp) {
-                Ok(()) | Err(PnpError::NoDriver | PnpError::ProbeDeferred) => Some(pnp),
-                Err(_) => {
-                    if registration.inserted {
-                        PNP_DEVICES.remove(&pnp.id);
-                    }
-                    None
+                Ok(()) => Ok(PciRegistration::new(pnp, PciProbeStatus::Bound)),
+                Err(PnpError::NoDriver) => Ok(PciRegistration::new(pnp, PciProbeStatus::NoDriver)),
+                Err(PnpError::ProbeDeferred) => {
+                    Ok(PciRegistration::new(pnp, PciProbeStatus::Deferred))
+                }
+                Err(err) => {
+                    rollback_pci_registration(&pnp, registration.inserted);
+                    Err(PciRegisterError::Pnp(err))
                 }
             },
             PnpState::Probing | PnpState::Removing | PnpState::Gone => {
-                if registration.inserted {
-                    PNP_DEVICES.remove(&pnp.id);
-                }
-                None
+                rollback_pci_registration(&pnp, registration.inserted);
+                Err(PciRegisterError::Pnp(PnpError::InvalidState))
             }
         }
     }
@@ -1318,12 +1356,61 @@ pub fn pci_scan_bus_range(
 pub fn pci_scan_and_register(segment: u16, start_bus: u8, end_bus: u8) -> usize {
     let mut count = 0usize;
     pci_scan_bus_range(segment, start_bus, end_bus, &mut |seg, bus, dev, func| {
-        if PciDevice::register_and_probe(seg, bus, dev, func).is_some() {
-            count += 1;
+        match PciDevice::register_and_probe(seg, bus, dev, func) {
+            Ok(_) => {
+                count += 1;
+            }
+            Err(PciRegisterError::NotPresent) => {}
+            Err(err) => {
+                log::debug!(
+                    "[pci] failed to register {seg:04x}:{bus:02x}:{dev:02x}.{func}: {:?}",
+                    err
+                );
+            }
         }
         true
     });
     count
+}
+
+/// 扫描 PCI bus 并统计注册/probe 的结构化结果。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PciScanRegisterSummary {
+    pub registered: usize,
+    pub bound: usize,
+    pub no_driver: usize,
+    pub deferred: usize,
+    pub failed: usize,
+}
+
+pub fn pci_scan_and_register_summary(
+    segment: u16,
+    start_bus: u8,
+    end_bus: u8,
+) -> PciScanRegisterSummary {
+    let mut summary = PciScanRegisterSummary::default();
+    pci_scan_bus_range(segment, start_bus, end_bus, &mut |seg, bus, dev, func| {
+        match PciDevice::register_and_probe(seg, bus, dev, func) {
+            Ok(registration) => {
+                summary.registered += 1;
+                match registration.status {
+                    PciProbeStatus::Bound => summary.bound += 1,
+                    PciProbeStatus::NoDriver => summary.no_driver += 1,
+                    PciProbeStatus::Deferred => summary.deferred += 1,
+                }
+            }
+            Err(PciRegisterError::NotPresent) => {}
+            Err(err) => {
+                summary.failed += 1;
+                log::debug!(
+                    "[pci] failed to register {seg:04x}:{bus:02x}:{dev:02x}.{func}: {:?}",
+                    err
+                );
+            }
+        }
+        true
+    });
+    summary
 }
 
 /// 扫描总线上的设备并只返回 BDF + vendor/device 的原始信息，
