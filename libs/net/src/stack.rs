@@ -196,6 +196,14 @@ impl NetStack {
         self.wake_socket_waiters();
     }
 
+    /// 以毫秒时间戳 poll 指定接口。
+    ///
+    /// 设备驱动层不应该直接暴露或依赖 smoltcp 的时间类型；中断处理路径只需
+    /// 传入调度器/时钟层提供的单调毫秒值，由协议栈内部完成类型转换。
+    pub fn poll_interface_ms(&self, id: InterfaceId, millis: i64) {
+        self.poll_interface(id, Instant::from_millis(millis));
+    }
+
     /// 把当前任务挂到全局 socket 事件通知队列。
     ///
     /// 阻塞在 `recv/send/accept/connect` 的任务在
@@ -284,9 +292,17 @@ impl NetStack {
 
     /// 创建一个 raw IP socket（指定 IP 协议号）。
     pub fn socket_raw(&self, ip_version: u8, protocol: u8) -> Result<NetSocketHandle, NetError> {
-        // FIXME: raw socket 也使用默认接口，缺少 SO_BINDTODEVICE、路由
-        // 查找和按地址族选择接口的能力。
         let iface_id = self.default_iface_id()?;
+        self.socket_raw_on(iface_id, ip_version, protocol)
+    }
+
+    /// 在指定接口上创建 raw IP socket。
+    pub fn socket_raw_on(
+        &self,
+        iface_id: InterfaceId,
+        ip_version: u8,
+        protocol: u8,
+    ) -> Result<NetSocketHandle, NetError> {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
@@ -300,9 +316,12 @@ impl NetStack {
 
     /// 创建一个 ICMP socket。
     pub fn socket_icmp(&self) -> Result<NetSocketHandle, NetError> {
-        // FIXME: ICMP socket 也固定落到默认接口，ping 外部地址时可能错误
-        // 走 loopback 或其它非目标路由接口。
         let iface_id = self.default_iface_id()?;
+        self.socket_icmp_on(iface_id)
+    }
+
+    /// 在指定接口上创建 ICMP socket。
+    pub fn socket_icmp_on(&self, iface_id: InterfaceId) -> Result<NetSocketHandle, NetError> {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
@@ -334,7 +353,7 @@ impl NetStack {
             match handle.sock_type {
                 SocketType::Raw => {
                     // TODO: raw IP 发送目前忽略 remote，缺少 per-packet 目的地址、
-                    // 路由元信息和 IP_HDRINCL 等 Linux raw socket 语义。
+                    // 路由元信息和 raw socket 头部包含语义。
                     let socket = managed.raw_socket_mut(handle.inner);
                     let tx_buf = socket.send(data.len()).map_err(|_| NetError::WouldBlock)?;
                     tx_buf.copy_from_slice(data);
@@ -820,6 +839,28 @@ impl NetStack {
         let mut managed = iface_lock.lock();
         managed.set_ipv4_addr(addr, prefix);
         Ok(())
+    }
+
+    /// 设置指定接口的管理态 UP/DOWN。
+    ///
+    /// 这只表达“协议栈是否应使用该接口”，不销毁底层设备，也不参与驱动
+    /// probe/remove 生命周期。
+    pub fn set_iface_admin_up(&self, id: InterfaceId, up: bool) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_admin_up(up);
+        Ok(())
+    }
+
+    /// 设置指定接口的运行期 MTU。
+    ///
+    /// 这是协议栈侧的软件 MTU 限制，不能超过底层设备声明的硬件上限。
+    pub fn set_iface_mtu(&self, id: InterfaceId, mtu: usize) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_mtu(mtu)
     }
 
     /// 在指定接口上添加 IPv4 路由。
@@ -1548,9 +1589,13 @@ pub const IFF_MULTICAST: u32 = 0x1000;
 
 fn compute_iface_flags(managed: &ManagedInterface) -> u32 {
     let mut flags = IFF_BROADCAST | IFF_MULTICAST;
+    if !managed.is_admin_up() {
+        return flags;
+    }
+    flags |= IFF_UP;
     match managed.net_device().driver().link_state() {
         crate::driver::LinkState::Up { .. } => {
-            flags |= IFF_UP | IFF_RUNNING;
+            flags |= IFF_RUNNING;
         }
         crate::driver::LinkState::Down => {}
     }

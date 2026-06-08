@@ -31,7 +31,10 @@ use core::fmt;
 
 use vfs::sync::Spinlock;
 
-use super::pnp::{BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
+use super::irq::IrqLine;
+use super::pnp::{
+    BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
+};
 
 // ── PciInfo ──────────────────────────────────────────────────────────────
 
@@ -69,6 +72,19 @@ impl PciInfo {
     pub fn is_bridge(&self) -> bool {
         (self.class >> 16) as u8 == 0x06
     }
+
+    /// 当前 header 类型实际提供的 BAR 槽数量。
+    ///
+    /// endpoint function 有 6 个普通 BAR；桥设备只有前 2 个 BAR，其余配置空间
+    /// 字段有桥接专用含义。未知 header 类型不参与通用 BAR 枚举，避免把其它字段
+    /// 误当成资源寄存器。
+    pub const fn bar_count(&self) -> usize {
+        match self.header_type {
+            PCI_HEADER_TYPE_ENDPOINT => PCI_ENDPOINT_BAR_COUNT,
+            PCI_HEADER_TYPE_BRIDGE => PCI_BRIDGE_BAR_COUNT,
+            _ => 0,
+        }
+    }
 }
 
 impl PnpBusInfo for PciInfo {
@@ -103,6 +119,8 @@ pub struct PciBar {
 const PCI_COMMAND_OFFSET: u16 = 0x04;
 const PCI_STATUS_OFFSET: u16 = 0x06;
 const PCI_CAPABILITY_LIST_OFFSET: u16 = 0x34;
+const PCI_INTERRUPT_LINE_OFFSET: u16 = 0x3c;
+const PCI_INTERRUPT_PIN_OFFSET: u16 = 0x3d;
 
 const PCI_COMMAND_IO_SPACE: u16 = 0x0001;
 const PCI_COMMAND_MEMORY_SPACE: u16 = 0x0002;
@@ -110,27 +128,103 @@ const PCI_COMMAND_BUS_MASTER: u16 = 0x0004;
 const PCI_COMMAND_INTERRUPT_DISABLE: u16 = 0x0400;
 const PCI_STATUS_CAPABILITIES_LIST: u16 = 0x0010;
 
-const PCI_STANDARD_CONFIG_SPACE_SIZE: u16 = 0x100;
+/// PCIe ECAM 下每个 function 暴露的完整配置空间大小。
+pub const PCI_EXTENDED_CONFIG_SPACE_SIZE: u16 = 0x1000;
 const PCI_CAPABILITY_MIN_OFFSET: u16 = 0x40;
 const PCI_CAPABILITY_MAX_OFFSET: u16 = 0xFC;
 const PCI_CAPABILITY_HEADER_SIZE: u16 = 2;
 const PCI_CAPABILITY_MAX_STEPS: usize =
     ((PCI_CAPABILITY_MAX_OFFSET - PCI_CAPABILITY_MIN_OFFSET) / 4 + 1) as usize;
-// PCI 常规配置空间每条 bus 最多有 32 个 device 编号。
-const PCI_DEVICES_PER_BUS: u8 = 32;
-// 每个 PCI device 最多有 8 个 function，0 号 function 必须先探测。
-const PCI_FUNCTIONS_PER_DEVICE: u8 = 8;
+const PCI_HEADER_TYPE_ENDPOINT: u8 = 0x00;
+const PCI_HEADER_TYPE_BRIDGE: u8 = 0x01;
+const PCI_ENDPOINT_BAR_COUNT: usize = 6;
+const PCI_BRIDGE_BAR_COUNT: usize = 2;
+const PCI_BAR0_OFFSET: u16 = 0x10;
+const PCI_BAR_STRIDE: u16 = 4;
+const PCI_BAR_IO_SPACE: u32 = 0x1;
+const PCI_BAR_IO_ADDR_MASK: u32 = 0xffff_fffc;
+const PCI_BAR_MEM_ADDR_MASK: u32 = 0xffff_fff0;
+const PCI_BAR_MEM_PREFETCHABLE: u32 = 0x8;
+const PCI_BAR_MEM_TYPE_SHIFT: u32 = 1;
+const PCI_BAR_MEM_TYPE_MASK: u32 = 0x3;
+const PCI_BAR_MEM_TYPE_32: u32 = 0;
+const PCI_BAR_MEM_TYPE_64: u32 = 2;
+const PCI_HEADER_TYPE_MULTI_FUNCTION: u8 = 0x80;
+const PCI_INVALID_VENDOR_ID: u16 = 0xffff;
+const PCI_INVALID_INTERRUPT_LINE: u8 = 0xff;
+const PCI_MSI_CAPABILITY_ID: u8 = 0x05;
+const PCI_MSIX_CAPABILITY_ID: u8 = 0x11;
+const PCI_MSI_CONTROL_OFFSET: u16 = 2;
+const PCI_MSI_CONTROL_ENABLE: u16 = 0x0001;
+/// PCI 常规配置空间每条 bus 最多有 32 个 device 编号。
+pub const PCI_DEVICES_PER_BUS: u8 = 32;
+/// 每个 PCI device 最多有 8 个 function，0 号 function 必须先探测。
+pub const PCI_FUNCTIONS_PER_DEVICE: u8 = 8;
 
 // ── PCI config space 访问回调 ────────────────────────────────────────────
 
+/// PCI endpoint 中断路由解析回调。
+///
+/// PCI 驱动只知道 function 自身的 interrupt pin/line 配置；真正应注册到哪条
+/// 规范化 IRQ line 由 host bridge 或固件路由决定。平台层可在安装 config
+/// access 时提供该回调，设备驱动只消费解析后的 [`IrqLine`]。
+pub type PciIrqResolver = fn(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    interrupt_pin: Option<u8>,
+    interrupt_line: Option<u8>,
+) -> Option<IrqLine>;
+
 pub struct PciConfigAccess {
-    pub read_u8: fn(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u8,
-    pub read_u16: fn(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u16,
-    pub read_u32: fn(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u32,
-    pub write_u8: fn(segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u8),
-    pub write_u16: fn(segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u16),
-    pub write_u32: fn(segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u32),
+    pub read_u8: fn(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+    ) -> Result<u8, PciConfigError>,
+    pub read_u16: fn(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+    ) -> Result<u16, PciConfigError>,
+    pub read_u32: fn(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+    ) -> Result<u32, PciConfigError>,
+    pub write_u8: fn(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u8,
+    ) -> Result<(), PciConfigError>,
+    pub write_u16: fn(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u16,
+    ) -> Result<(), PciConfigError>,
+    pub write_u32: fn(
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u32,
+    ) -> Result<(), PciConfigError>,
     pub device_mmio_to_virt: fn(phys_addr: usize) -> usize,
+    pub resolve_irq: Option<PciIrqResolver>,
 }
 
 static PCI_CONFIG: Spinlock<Option<PciConfigAccess>> = Spinlock::new(None);
@@ -142,6 +236,7 @@ pub fn set_pci_config_access(access: PciConfigAccess) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PciConfigError {
     InvalidDevice,
+    InvalidOffset,
     Uninitialized,
 }
 
@@ -162,8 +257,12 @@ pub struct PciCapabilityIter<'a> {
 }
 
 fn pci_config_range_valid(offset: u16, len: u16) -> bool {
-    offset <= PCI_STANDARD_CONFIG_SPACE_SIZE
-        && len <= PCI_STANDARD_CONFIG_SPACE_SIZE.saturating_sub(offset)
+    offset <= PCI_EXTENDED_CONFIG_SPACE_SIZE
+        && len <= PCI_EXTENDED_CONFIG_SPACE_SIZE.saturating_sub(offset)
+}
+
+fn pci_config_access_valid(offset: u16, len: u16, align: u16) -> bool {
+    pci_config_range_valid(offset, len) && (offset & (align - 1)) == 0
 }
 
 fn valid_capability_offset(offset: u16) -> bool {
@@ -244,48 +343,63 @@ impl PciDevice {
     // ── Config space 访问 ──
 
     pub fn try_read_config_u8(&self, offset: u16) -> Result<u8, PciConfigError> {
+        if !pci_config_access_valid(offset, 1, 1) {
+            return Err(PciConfigError::InvalidOffset);
+        }
         let (seg, bus, dev, func) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
-        Ok((cfg.read_u8)(seg, bus, dev, func, offset))
+        (cfg.read_u8)(seg, bus, dev, func, offset)
     }
 
     pub fn try_read_config_u16(&self, offset: u16) -> Result<u16, PciConfigError> {
+        if !pci_config_access_valid(offset, 2, 2) {
+            return Err(PciConfigError::InvalidOffset);
+        }
         let (seg, bus, dev, func) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
-        Ok((cfg.read_u16)(seg, bus, dev, func, offset))
+        (cfg.read_u16)(seg, bus, dev, func, offset)
     }
 
     pub fn try_read_config_u32(&self, offset: u16) -> Result<u32, PciConfigError> {
+        if !pci_config_access_valid(offset, 4, 4) {
+            return Err(PciConfigError::InvalidOffset);
+        }
         let (seg, bus, dev, func) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
-        Ok((cfg.read_u32)(seg, bus, dev, func, offset))
+        (cfg.read_u32)(seg, bus, dev, func, offset)
     }
 
     pub fn try_write_config_u8(&self, offset: u16, value: u8) -> Result<(), PciConfigError> {
+        if !pci_config_access_valid(offset, 1, 1) {
+            return Err(PciConfigError::InvalidOffset);
+        }
         let (seg, bus, dev, func) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
-        (cfg.write_u8)(seg, bus, dev, func, offset, value);
-        Ok(())
+        (cfg.write_u8)(seg, bus, dev, func, offset, value)
     }
 
     pub fn try_write_config_u16(&self, offset: u16, value: u16) -> Result<(), PciConfigError> {
+        if !pci_config_access_valid(offset, 2, 2) {
+            return Err(PciConfigError::InvalidOffset);
+        }
         let (seg, bus, dev, func) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
-        (cfg.write_u16)(seg, bus, dev, func, offset, value);
-        Ok(())
+        (cfg.write_u16)(seg, bus, dev, func, offset, value)
     }
 
     pub fn try_write_config_u32(&self, offset: u16, value: u32) -> Result<(), PciConfigError> {
+        if !pci_config_access_valid(offset, 4, 4) {
+            return Err(PciConfigError::InvalidOffset);
+        }
         let (seg, bus, dev, func) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
-        (cfg.write_u32)(seg, bus, dev, func, offset, value);
-        Ok(())
+        (cfg.write_u32)(seg, bus, dev, func, offset, value)
     }
 
     // 这些兼容读取只用于容错查询；probe/初始化路径需要区分错误时应使用 try_*。
@@ -316,32 +430,33 @@ impl PciDevice {
     // ── BAR ──
 
     pub fn map_bar(&self, idx: usize) -> Option<PciBar> {
-        if idx > 5 {
+        let bar_count = self.bar_count();
+        if idx >= bar_count {
             return None;
         }
-        let offset = 0x10u16 + (idx as u16) * 4;
+        let offset = PCI_BAR0_OFFSET + (idx as u16) * PCI_BAR_STRIDE;
         let bar_val = self.try_read_config_u32(offset).ok()?;
 
         if bar_val == 0 {
             return None;
         }
 
-        let is_mmio = bar_val & 0x1 == 0;
-        let prefetchable = is_mmio && (bar_val & 0x8) != 0;
+        let is_mmio = bar_val & PCI_BAR_IO_SPACE == 0;
+        let prefetchable = is_mmio && (bar_val & PCI_BAR_MEM_PREFETCHABLE) != 0;
 
         let (bar_type, phys_addr, size) = if is_mmio {
-            let is_64 = match (bar_val >> 1) & 0x3 {
-                0 => false,
-                2 if idx < 5 => true,
+            let is_64 = match (bar_val >> PCI_BAR_MEM_TYPE_SHIFT) & PCI_BAR_MEM_TYPE_MASK {
+                PCI_BAR_MEM_TYPE_32 => false,
+                PCI_BAR_MEM_TYPE_64 if idx + 1 < bar_count => true,
                 _ => return None,
             };
-            let high_offset = offset + 4;
+            let high_offset = offset + PCI_BAR_STRIDE;
             let high_val = if is_64 {
                 self.try_read_config_u32(high_offset).ok()?
             } else {
                 0
             };
-            let phys_addr = ((high_val as u64) << 32) | ((bar_val & 0xFFFF_FFF0) as u64);
+            let phys_addr = ((high_val as u64) << 32) | ((bar_val & PCI_BAR_MEM_ADDR_MASK) as u64);
 
             let cmd = self.try_read_config_u16(PCI_COMMAND_OFFSET).ok()?;
             self.try_write_config_u16(PCI_COMMAND_OFFSET, cmd & !PCI_COMMAND_MEMORY_SPACE)
@@ -351,8 +466,9 @@ impl PciDevice {
                 if is_64 {
                     self.try_write_config_u32(high_offset, u32::MAX).ok()?;
                 }
-                self.try_write_config_u32(offset, 0xFFFF_FFF0).ok()?;
-                let size_lo = self.try_read_config_u32(offset).ok()? & 0xFFFF_FFF0;
+                self.try_write_config_u32(offset, PCI_BAR_MEM_ADDR_MASK)
+                    .ok()?;
+                let size_lo = self.try_read_config_u32(offset).ok()? & PCI_BAR_MEM_ADDR_MASK;
                 let size_hi = if is_64 {
                     self.try_read_config_u32(high_offset).ok()?
                 } else {
@@ -373,14 +489,15 @@ impl PciDevice {
             }
             (PciBarType::Memory, phys_addr, (!size_bits).wrapping_add(1))
         } else {
-            let phys_addr = (bar_val & 0xFFFF_FFFC) as u64;
+            let phys_addr = (bar_val & PCI_BAR_IO_ADDR_MASK) as u64;
             let cmd = self.try_read_config_u16(PCI_COMMAND_OFFSET).ok()?;
             self.try_write_config_u16(PCI_COMMAND_OFFSET, cmd & !PCI_COMMAND_IO_SPACE)
                 .ok()?;
 
             let size_bits = (|| -> Option<u32> {
-                self.try_write_config_u32(offset, 0xFFFF_FFFC).ok()?;
-                Some(self.try_read_config_u32(offset).ok()? & 0xFFFF_FFFC)
+                self.try_write_config_u32(offset, PCI_BAR_IO_ADDR_MASK)
+                    .ok()?;
+                Some(self.try_read_config_u32(offset).ok()? & PCI_BAR_IO_ADDR_MASK)
             })();
 
             let _ = self.try_write_config_u32(offset, bar_val);
@@ -419,45 +536,101 @@ impl PciDevice {
 
     // ── 设备控制 ──
 
+    pub fn try_command(&self) -> Result<u16, PciConfigError> {
+        self.try_read_config_u16(PCI_COMMAND_OFFSET)
+    }
+
+    pub fn command(&self) -> u16 {
+        self.try_command().unwrap_or(0)
+    }
+
+    pub fn try_set_command(&self, command: u16) -> Result<(), PciConfigError> {
+        self.try_write_config_u16(PCI_COMMAND_OFFSET, command)
+    }
+
+    pub fn set_command(&self, command: u16) {
+        let _ = self.try_set_command(command);
+    }
+
+    fn try_update_command(&self, set: u16, clear: u16) -> Result<(), PciConfigError> {
+        let cmd = self.try_command()?;
+        self.try_set_command((cmd | set) & !clear)
+    }
+
+    pub fn try_enable_bus_master(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(PCI_COMMAND_BUS_MASTER, 0)
+    }
+
     pub fn enable_bus_master(&self) {
-        let cmd = self.read_config_u16(PCI_COMMAND_OFFSET);
-        self.write_config_u16(PCI_COMMAND_OFFSET, cmd | PCI_COMMAND_BUS_MASTER);
+        let _ = self.try_enable_bus_master();
+    }
+
+    pub fn try_disable_bus_master(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(0, PCI_COMMAND_BUS_MASTER)
     }
 
     pub fn disable_bus_master(&self) {
-        let cmd = self.read_config_u16(PCI_COMMAND_OFFSET);
-        self.write_config_u16(PCI_COMMAND_OFFSET, cmd & !PCI_COMMAND_BUS_MASTER);
+        let _ = self.try_disable_bus_master();
     }
 
     pub fn bus_master_enabled(&self) -> bool {
-        self.read_config_u16(PCI_COMMAND_OFFSET) & PCI_COMMAND_BUS_MASTER != 0
+        self.try_command()
+            .is_ok_and(|cmd| cmd & PCI_COMMAND_BUS_MASTER != 0)
+    }
+
+    pub fn try_enable_mmio(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(PCI_COMMAND_MEMORY_SPACE, 0)
     }
 
     pub fn enable_mmio(&self) {
-        let cmd = self.read_config_u16(PCI_COMMAND_OFFSET);
-        self.write_config_u16(PCI_COMMAND_OFFSET, cmd | PCI_COMMAND_MEMORY_SPACE);
+        let _ = self.try_enable_mmio();
+    }
+
+    pub fn try_disable_mmio(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(0, PCI_COMMAND_MEMORY_SPACE)
+    }
+
+    pub fn disable_mmio(&self) {
+        let _ = self.try_disable_mmio();
+    }
+
+    pub fn try_enable_io(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(PCI_COMMAND_IO_SPACE, 0)
     }
 
     pub fn enable_io(&self) {
-        let cmd = self.read_config_u16(PCI_COMMAND_OFFSET);
-        self.write_config_u16(PCI_COMMAND_OFFSET, cmd | PCI_COMMAND_IO_SPACE);
+        let _ = self.try_enable_io();
+    }
+
+    pub fn try_disable_io(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(0, PCI_COMMAND_IO_SPACE)
+    }
+
+    pub fn disable_io(&self) {
+        let _ = self.try_disable_io();
+    }
+
+    pub fn try_disable_interrupts(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(PCI_COMMAND_INTERRUPT_DISABLE, 0)
     }
 
     pub fn disable_interrupts(&self) {
-        let cmd = self.read_config_u16(PCI_COMMAND_OFFSET);
-        self.write_config_u16(PCI_COMMAND_OFFSET, cmd | PCI_COMMAND_INTERRUPT_DISABLE);
+        let _ = self.try_disable_interrupts();
+    }
+
+    pub fn try_enable_interrupts(&self) -> Result<(), PciConfigError> {
+        self.try_update_command(0, PCI_COMMAND_INTERRUPT_DISABLE)
     }
 
     pub fn enable_interrupts(&self) {
-        let cmd = self.read_config_u16(PCI_COMMAND_OFFSET);
-        self.write_config_u16(PCI_COMMAND_OFFSET, cmd & !PCI_COMMAND_INTERRUPT_DISABLE);
+        let _ = self.try_enable_interrupts();
     }
 
     // ── IRQ ──
 
     pub fn irq_line(&self) -> Option<u8> {
-        let irq = self.read_config_u8(0x3C);
-        if irq == 0 || irq == 0xFF {
+        let irq = self.try_read_config_u8(PCI_INTERRUPT_LINE_OFFSET).ok()?;
+        if irq == 0 || irq == PCI_INVALID_INTERRUPT_LINE {
             None
         } else {
             Some(irq)
@@ -465,8 +638,25 @@ impl PciDevice {
     }
 
     pub fn irq_pin(&self) -> Option<u8> {
-        let pin = self.read_config_u8(0x3D);
+        let pin = self.try_read_config_u8(PCI_INTERRUPT_PIN_OFFSET).ok()?;
         if pin == 0 { None } else { Some(pin) }
+    }
+
+    /// 返回平台已解析好的规范化 IRQ line。
+    ///
+    /// 这里不把 PCI config space 的 interrupt line 字节直接解释为 CPU 中断号；
+    /// 该字节只是一段桥接路由输入，具体含义必须由 host bridge/固件层解析。
+    pub fn routed_irq_line(&self) -> Option<IrqLine> {
+        let (segment, bus, device, function) = self.bdf()?;
+        let pin = self.irq_pin();
+        let line = self.irq_line();
+        let guard = PCI_CONFIG.lock();
+        let resolver = guard.as_ref()?.resolve_irq?;
+        resolver(segment, bus, device, function, pin, line)
+    }
+
+    pub fn bar_count(&self) -> usize {
+        self.info().map(PciInfo::bar_count).unwrap_or(0)
     }
 
     // ── capability 遍历 ──
@@ -492,23 +682,37 @@ impl PciDevice {
     // ── MSI ──
 
     pub fn msi_capability(&self) -> Option<u16> {
-        self.find_capability(0x05)
+        self.find_capability(PCI_MSI_CAPABILITY_ID)
+    }
+
+    pub fn try_msi_enable(&self, cap_offset: u16) -> Result<(), PciConfigError> {
+        let msg_ctrl = self.try_read_config_u16(cap_offset + PCI_MSI_CONTROL_OFFSET)?;
+        self.try_write_config_u16(
+            cap_offset + PCI_MSI_CONTROL_OFFSET,
+            msg_ctrl | PCI_MSI_CONTROL_ENABLE,
+        )
     }
 
     pub fn msi_enable(&self, cap_offset: u16) {
-        let msg_ctrl = self.read_config_u16(cap_offset + 2);
-        self.write_config_u16(cap_offset + 2, msg_ctrl | 0x1);
+        let _ = self.try_msi_enable(cap_offset);
+    }
+
+    pub fn try_msi_disable(&self, cap_offset: u16) -> Result<(), PciConfigError> {
+        let msg_ctrl = self.try_read_config_u16(cap_offset + PCI_MSI_CONTROL_OFFSET)?;
+        self.try_write_config_u16(
+            cap_offset + PCI_MSI_CONTROL_OFFSET,
+            msg_ctrl & !PCI_MSI_CONTROL_ENABLE,
+        )
     }
 
     pub fn msi_disable(&self, cap_offset: u16) {
-        let msg_ctrl = self.read_config_u16(cap_offset + 2);
-        self.write_config_u16(cap_offset + 2, msg_ctrl & !0x1);
+        let _ = self.try_msi_disable(cap_offset);
     }
 
     // ── MSI-X ──
 
     pub fn msix_capability(&self) -> Option<u16> {
-        self.find_capability(0x11)
+        self.find_capability(PCI_MSIX_CAPABILITY_ID)
     }
 }
 
@@ -581,6 +785,8 @@ impl PciDevice {
     ///
     /// PnP 设备名是稳定硬件名 `pci-{seg:04x}:{bus:02x}:{dev:02x}.{func}`，
     /// 不承载 `/dev` 节点命名前缀语义。
+    // TODO(pci-pnp): 该接口仍用 `Option` 抹平了 NoDriver、Deferred 和硬失败。
+    // 后续应改成结构化 probe 结果，让扫描器能统计真实失败并保留诊断信息。
     pub fn register_and_probe(
         segment: u16,
         bus: u8,
@@ -597,16 +803,25 @@ impl PciDevice {
         let info = PciDevice::read_device_info(segment, bus, device, function)?;
 
         let name = pci_hardware_name(segment, bus, device, function);
-        let pnp = PnpDevice::new(id, name, Box::new(info));
+        let new_dev = PnpDevice::new(id, name, Box::new(info));
+        let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev)).ok()?;
+        let pnp = registration.device;
 
-        if PNP_DEVICES.push(Arc::clone(&pnp)).is_err() {
-            return None;
-        }
-
-        match PNP_DRIVERS.probe_device(&pnp) {
-            Ok(()) | Err(PnpError::NoDriver) => Some(pnp),
-            Err(_) => {
-                PNP_DEVICES.remove(&pnp.id);
+        match pnp.state() {
+            PnpState::Bound => Some(pnp),
+            PnpState::Discovered => match PNP_DRIVERS.probe_device(&pnp) {
+                Ok(()) | Err(PnpError::NoDriver | PnpError::ProbeDeferred) => Some(pnp),
+                Err(_) => {
+                    if registration.inserted {
+                        PNP_DEVICES.remove(&pnp.id);
+                    }
+                    None
+                }
+            },
+            PnpState::Probing | PnpState::Removing | PnpState::Gone => {
+                if registration.inserted {
+                    PNP_DEVICES.remove(&pnp.id);
+                }
                 None
             }
         }
@@ -620,22 +835,22 @@ impl PciDevice {
         let guard = PCI_CONFIG.lock();
         let cfg = guard.as_ref()?;
 
-        let vendor = (cfg.read_u16)(segment, bus, device, function, 0x00);
-        if vendor == 0xFFFF {
+        let vendor = (cfg.read_u16)(segment, bus, device, function, 0x00).ok()?;
+        if vendor == PCI_INVALID_VENDOR_ID {
             return None;
         }
 
-        let device_id = (cfg.read_u16)(segment, bus, device, function, 0x02);
-        let class_raw = (cfg.read_u32)(segment, bus, device, function, 0x08);
-        let revision = (cfg.read_u8)(segment, bus, device, function, 0x08);
-        let header_type = (cfg.read_u8)(segment, bus, device, function, 0x0E);
-        let subsystem_vendor = (cfg.read_u16)(segment, bus, device, function, 0x2C);
-        let subsystem_id = (cfg.read_u16)(segment, bus, device, function, 0x2E);
+        let device_id = (cfg.read_u16)(segment, bus, device, function, 0x02).ok()?;
+        let class_raw = (cfg.read_u32)(segment, bus, device, function, 0x08).ok()?;
+        let revision = (cfg.read_u8)(segment, bus, device, function, 0x08).ok()?;
+        let header_type = (cfg.read_u8)(segment, bus, device, function, 0x0E).ok()?;
+        let subsystem_vendor = (cfg.read_u16)(segment, bus, device, function, 0x2C).ok()?;
+        let subsystem_id = (cfg.read_u16)(segment, bus, device, function, 0x2E).ok()?;
 
         let class = (class_raw >> 8) & 0x00FF_FFFF;
         let subclass = (class_raw >> 16) as u8;
         let prog_if = (class_raw >> 8) as u8;
-        let multi_function = header_type & 0x80 != 0;
+        let multi_function = header_type & PCI_HEADER_TYPE_MULTI_FUNCTION != 0;
 
         Some(PciInfo {
             vendor,
@@ -649,6 +864,27 @@ impl PciDevice {
             header_type: header_type & 0x7F,
             multi_function,
         })
+    }
+
+    /// 创建一个不注册到全局 PnP 表的 PCI 访问句柄。
+    ///
+    /// 启动早期可能需要在正式 probe 前先整理 BAR 等资源。该句柄仍通过
+    /// [`PciInfo`] 保存真实 config-space 信息，但不会出现在设备树、驱动匹配或
+    /// devtmpfs 中；完成资源整理后应继续走 [`register_and_probe`](Self::register_and_probe)。
+    pub fn new_unregistered(segment: u16, bus: u8, device: u8, function: u8) -> Option<Self> {
+        let id = PnpId::Pci {
+            segment,
+            bus,
+            device,
+            function,
+        };
+        let info = Self::read_device_info(segment, bus, device, function)?;
+        let pnp = PnpDevice::new(
+            id,
+            pci_hardware_name(segment, bus, device, function),
+            Box::new(info),
+        );
+        Some(Self { pnp })
     }
 
     /// 触发设备热拔移除。
@@ -694,8 +930,11 @@ pub fn pci_scan_bus_range(
 
     for bus in start_bus..=end_bus {
         for device in 0u8..PCI_DEVICES_PER_BUS {
-            let vendor = read_u16(segment, bus, device, 0, 0x00);
-            if vendor == 0xFFFF {
+            let vendor = match read_u16(segment, bus, device, 0, 0x00) {
+                Ok(vendor) => vendor,
+                Err(_) => continue,
+            };
+            if vendor == PCI_INVALID_VENDOR_ID {
                 continue;
             }
 
@@ -704,14 +943,20 @@ pub fn pci_scan_bus_range(
             }
             count += 1;
 
-            let header_type = read_u8(segment, bus, device, 0, 0x0E);
-            if header_type & 0x80 == 0 {
+            let header_type = match read_u8(segment, bus, device, 0, 0x0E) {
+                Ok(header_type) => header_type,
+                Err(_) => continue,
+            };
+            if header_type & PCI_HEADER_TYPE_MULTI_FUNCTION == 0 {
                 continue;
             }
 
             for function in 1u8..PCI_FUNCTIONS_PER_DEVICE {
-                let vendor = read_u16(segment, bus, device, function, 0x00);
-                if vendor == 0xFFFF {
+                let vendor = match read_u16(segment, bus, device, function, 0x00) {
+                    Ok(vendor) => vendor,
+                    Err(_) => continue,
+                };
+                if vendor == PCI_INVALID_VENDOR_ID {
                     continue;
                 }
                 if !on_device(segment, bus, device, function) {
@@ -759,6 +1004,20 @@ pub struct PciRawDevice {
     pub multi_function: bool,
 }
 
+impl PciRawDevice {
+    /// 原始扫描结果对应的 BAR 槽数量。
+    ///
+    /// 该方法只依据 header type 判断资源寄存器范围，供早期资源分配阶段在
+    /// 尚未注册 PnP 设备时使用。
+    pub const fn bar_count(&self) -> usize {
+        match self.header_type {
+            PCI_HEADER_TYPE_ENDPOINT => PCI_ENDPOINT_BAR_COUNT,
+            PCI_HEADER_TYPE_BRIDGE => PCI_BRIDGE_BAR_COUNT,
+            _ => 0,
+        }
+    }
+}
+
 pub fn pci_scan_raw(segment: u16, start_bus: u8, end_bus: u8) -> alloc::vec::Vec<PciRawDevice> {
     let mut devices = alloc::vec::Vec::new();
 
@@ -775,14 +1034,26 @@ pub fn pci_scan_raw(segment: u16, start_bus: u8, end_bus: u8) -> alloc::vec::Vec
 
     for bus in start_bus..=end_bus {
         for device in 0u8..PCI_DEVICES_PER_BUS {
-            let vendor = read_u16(segment, bus, device, 0, 0x00);
-            if vendor == 0xFFFF {
+            let vendor = match read_u16(segment, bus, device, 0, 0x00) {
+                Ok(vendor) => vendor,
+                Err(_) => continue,
+            };
+            if vendor == PCI_INVALID_VENDOR_ID {
                 continue;
             }
 
-            let device_id = read_u16(segment, bus, device, 0, 0x02);
-            let class_raw = read_u32(segment, bus, device, 0, 0x08);
-            let header_type_raw = read_u8(segment, bus, device, 0, 0x0E);
+            let device_id = match read_u16(segment, bus, device, 0, 0x02) {
+                Ok(device_id) => device_id,
+                Err(_) => continue,
+            };
+            let class_raw = match read_u32(segment, bus, device, 0, 0x08) {
+                Ok(class_raw) => class_raw,
+                Err(_) => continue,
+            };
+            let header_type_raw = match read_u8(segment, bus, device, 0, 0x0E) {
+                Ok(header_type_raw) => header_type_raw,
+                Err(_) => continue,
+            };
 
             devices.push(PciRawDevice {
                 segment,
@@ -791,24 +1062,36 @@ pub fn pci_scan_raw(segment: u16, start_bus: u8, end_bus: u8) -> alloc::vec::Vec
                 function: 0,
                 vendor,
                 device_id,
-                class: class_raw & 0x00FF_FFFF,
+                class: (class_raw >> 8) & 0x00FF_FFFF,
                 header_type: header_type_raw & 0x7F,
-                multi_function: header_type_raw & 0x80 != 0,
+                multi_function: header_type_raw & PCI_HEADER_TYPE_MULTI_FUNCTION != 0,
             });
 
-            if header_type_raw & 0x80 == 0 {
+            if header_type_raw & PCI_HEADER_TYPE_MULTI_FUNCTION == 0 {
                 continue;
             }
 
             for function in 1u8..PCI_FUNCTIONS_PER_DEVICE {
-                let vendor = read_u16(segment, bus, device, function, 0x00);
-                if vendor == 0xFFFF {
+                let vendor = match read_u16(segment, bus, device, function, 0x00) {
+                    Ok(vendor) => vendor,
+                    Err(_) => continue,
+                };
+                if vendor == PCI_INVALID_VENDOR_ID {
                     continue;
                 }
 
-                let device_id = read_u16(segment, bus, device, function, 0x02);
-                let class_raw = read_u32(segment, bus, device, function, 0x08);
-                let header_type = read_u8(segment, bus, device, function, 0x0E);
+                let device_id = match read_u16(segment, bus, device, function, 0x02) {
+                    Ok(device_id) => device_id,
+                    Err(_) => continue,
+                };
+                let class_raw = match read_u32(segment, bus, device, function, 0x08) {
+                    Ok(class_raw) => class_raw,
+                    Err(_) => continue,
+                };
+                let header_type = match read_u8(segment, bus, device, function, 0x0E) {
+                    Ok(header_type) => header_type,
+                    Err(_) => continue,
+                };
 
                 devices.push(PciRawDevice {
                     segment,
@@ -817,7 +1100,7 @@ pub fn pci_scan_raw(segment: u16, start_bus: u8, end_bus: u8) -> alloc::vec::Vec
                     function,
                     vendor,
                     device_id,
-                    class: class_raw & 0x00FF_FFFF,
+                    class: (class_raw >> 8) & 0x00FF_FFFF,
                     header_type: header_type & 0x7F,
                     multi_function: false,
                 });

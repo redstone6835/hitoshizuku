@@ -21,7 +21,7 @@ use vfs::sync::Spinlock;
 use crate::dev::irq::{
     self, IrqDomain, IrqDomainHandle, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus,
 };
-use crate::dev::platform::PlatformDeviceInfo;
+use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     register_driver_factory,
@@ -41,12 +41,19 @@ const IOCSR_MISC_FUNC_EXT_IOI_EN: u64 = 1u64 << 48;
 const EIOINTC_VECTOR_COUNT: u32 = 256;
 const EIOINTC_VECTOR_BITS_PER_REG: u32 = 32;
 const EIOINTC_VECTOR_BITS_PER_ISR: u32 = 64;
+const EIOINTC_IPMAP_PARENT_LIMIT: usize = 4;
+const EIOINTC_PACKED_FIELDS_PER_REG: u32 = 4;
+const EIOINTC_PACKED_FIELD_BITS: u32 = 8;
+const EIOINTC_NODEMAP_GROUP_STRIDE_BITS: u32 = 2;
+const EIOINTC_NODEMAP_MIRROR_SHIFT: u32 = 16;
 const EIOINTC_REG_NODEMAP: usize = 0x14a0;
 const EIOINTC_REG_IPMAP: usize = 0x14c0;
 const EIOINTC_REG_ENABLE: usize = 0x1600;
 const EIOINTC_REG_BOUNCE: usize = 0x1680;
 const EIOINTC_REG_ISR: usize = 0x1800;
 const EIOINTC_REG_ROUTE: usize = 0x1c00;
+const EIOINTC_DEFAULT_ROUTE_CPU: u8 = 1;
+const EIOINTC_PROP_ROUTE_CPU: &str = "loongson,eiointc-route-cpu";
 
 const PCH_PIC_IRQ_COUNT: u32 = 64;
 const PCH_PIC_IRQ_COUNT_USIZE: usize = PCH_PIC_IRQ_COUNT as usize;
@@ -59,7 +66,9 @@ const PCH_PIC_REG_AUTO_CTRL1: usize = 0xe0;
 const PCH_PIC_REG_ROUTE: usize = 0x100;
 const PCH_PIC_REG_HTVEC: usize = 0x200;
 const PCH_PIC_REG_POL: usize = 0x3e0;
-const PCH_PIC_ROUTE_HT0_LO: u8 = 1;
+const PCH_PIC_DEFAULT_ROUTE_TARGET: u8 = 1;
+const PCH_PIC_PROP_BASE_VECTOR: &str = "loongson,pic-base-vec";
+const PCH_PIC_PROP_ROUTE_TARGET: &str = "loongson,pic-route-target";
 
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
 const IRQ_TYPE_EDGE_FALLING: u32 = 2;
@@ -134,47 +143,81 @@ impl PnpDriver for LoongsonCpuIrqDriver {
     }
 }
 
+#[derive(Clone, Copy)]
+struct EioIntcRouteConfig {
+    parent_hwi: usize,
+    route_cpu: u8,
+}
+
+impl EioIntcRouteConfig {
+    fn from_platform(parent_hwi: usize, info: &PlatformDeviceInfo) -> Option<Self> {
+        if parent_hwi >= EIOINTC_IPMAP_PARENT_LIMIT {
+            return None;
+        }
+        let route_cpu = match info.u32_property(EIOINTC_PROP_ROUTE_CPU) {
+            Some(value) => u8::try_from(value).ok()?,
+            None => EIOINTC_DEFAULT_ROUTE_CPU,
+        };
+        Some(Self {
+            parent_hwi,
+            route_cpu,
+        })
+    }
+
+    fn ipmap_value(self) -> u32 {
+        let parent_bit = 1u8 << self.parent_hwi;
+        repeat_byte(parent_bit)
+    }
+
+    fn route_value(self) -> u32 {
+        repeat_byte(self.route_cpu)
+    }
+
+    fn nodemap_value(self, reg: u32) -> u32 {
+        // 当前固件只提供单节点路由信息时，按硬件分组格式生成节点选择位。
+        // 该逻辑集中在配置对象内，后续多节点拓扑只需要扩展这里的策略。
+        let node_bit = 1u32 << (reg * EIOINTC_NODEMAP_GROUP_STRIDE_BITS);
+        node_bit | (node_bit << EIOINTC_NODEMAP_MIRROR_SHIFT)
+    }
+}
+
 struct EioIntc {
     controller: u32,
-    parent_hwi: usize,
+    route: EioIntcRouteConfig,
 }
 
 impl EioIntc {
-    fn new(controller: u32, parent_hwi: usize) -> Self {
-        Self {
-            controller,
-            parent_hwi,
-        }
+    fn new(controller: u32, route: EioIntcRouteConfig) -> Self {
+        Self { controller, route }
     }
 
     fn initialize(&self) -> Result<(), PnpError> {
         let misc = iocsr_read64(LOONGARCH_IOCSR_MISC_FUNC)?;
         iocsr_write64(LOONGARCH_IOCSR_MISC_FUNC, misc | IOCSR_MISC_FUNC_EXT_IOI_EN)?;
-        self.route_vectors_to_boot_cpu()?;
+        self.program_route_tables()?;
         self.set_all_vectors_enabled(false)?;
         self.clear_pending()?;
         Ok(())
     }
 
-    fn route_vectors_to_boot_cpu(&self) -> Result<(), PnpError> {
-        if self.parent_hwi >= 4 {
-            return Err(PnpError::ProbeFailed);
-        }
-        let ip_bit = 1u32 << self.parent_hwi;
-        let ipmap = ip_bit | (ip_bit << 8) | (ip_bit << 16) | (ip_bit << 24);
-        for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG / 4 {
+    fn program_route_tables(&self) -> Result<(), PnpError> {
+        let ipmap = self.route.ipmap_value();
+        for reg in
+            0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG / EIOINTC_PACKED_FIELDS_PER_REG
+        {
             iocsr_write32(EIOINTC_REG_IPMAP + reg as usize * 4, ipmap)?;
         }
 
         for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_VECTOR_BITS_PER_REG {
-            let node_bit = 1u32 << (reg * 2);
-            let nodemap = node_bit | (node_bit << 16);
-            iocsr_write32(EIOINTC_REG_NODEMAP + reg as usize * 4, nodemap)?;
+            iocsr_write32(
+                EIOINTC_REG_NODEMAP + reg as usize * 4,
+                self.route.nodemap_value(reg),
+            )?;
         }
 
-        let boot_cpu_route = 1u32 | (1u32 << 8) | (1u32 << 16) | (1u32 << 24);
-        for reg in 0..EIOINTC_VECTOR_COUNT / 4 {
-            iocsr_write32(EIOINTC_REG_ROUTE + reg as usize * 4, boot_cpu_route)?;
+        let route = self.route.route_value();
+        for reg in 0..EIOINTC_VECTOR_COUNT / EIOINTC_PACKED_FIELDS_PER_REG {
+            iocsr_write32(EIOINTC_REG_ROUTE + reg as usize * 4, route)?;
         }
         Ok(())
     }
@@ -272,6 +315,14 @@ impl IrqHandler for EioIntcIrqHandler {
     }
 }
 
+fn repeat_byte(value: u8) -> u32 {
+    let mut out = 0u32;
+    for field in 0..EIOINTC_PACKED_FIELDS_PER_REG {
+        out |= (value as u32) << (field * EIOINTC_PACKED_FIELD_BITS);
+    }
+    out
+}
+
 struct EioIntcBinding {
     domain: IrqDomainHandle,
     parent_irq: IrqHandle,
@@ -312,11 +363,17 @@ impl PnpDriver for EioIntcDriver {
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
         let controller = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
-        let parent_line = info.first_irq_line().ok_or(PnpError::ProbeFailed)?;
+        let parent_line = match info.resolve_first_irq_line() {
+            Ok(line) => line,
+            Err(PlatformIrqResolveError::Unresolved) => return Err(PnpError::ProbeDeferred),
+            Err(PlatformIrqResolveError::NoResource) => return Err(PnpError::ProbeFailed),
+        };
         let IrqLine::Hardware(parent_hwi) = parent_line else {
             return Err(PnpError::ProbeFailed);
         };
-        let intc = Arc::new(EioIntc::new(controller, parent_hwi));
+        let route =
+            EioIntcRouteConfig::from_platform(parent_hwi, info).ok_or(PnpError::ProbeFailed)?;
+        let intc = Arc::new(EioIntc::new(controller, route));
         intc.initialize()?;
         let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
         let handler: Arc<dyn IrqHandler> = Arc::new(EioIntcIrqHandler {
@@ -355,8 +412,16 @@ impl PchPicMapping {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PchPicSlot {
+    /// 已被固件设备引用的 PCH source 映射。
+    mapping: PchPicMapping,
+    /// 对应父级 vector 上注册的级联 handler。slot 释放时必须同步注销。
+    parent_irq: IrqHandle,
+}
+
 struct PchPicInner {
-    slots: [Option<PchPicMapping>; PCH_PIC_IRQ_COUNT_USIZE],
+    slots: [Option<PchPicSlot>; PCH_PIC_IRQ_COUNT_USIZE],
 }
 
 impl PchPicInner {
@@ -367,21 +432,48 @@ impl PchPicInner {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PchPicRouteTarget {
+    raw: u8,
+}
+
+impl PchPicRouteTarget {
+    fn from_platform(info: &PlatformDeviceInfo) -> Option<Self> {
+        let raw = match info.u32_property(PCH_PIC_PROP_ROUTE_TARGET) {
+            Some(value) => u8::try_from(value).ok()?,
+            None => PCH_PIC_DEFAULT_ROUTE_TARGET,
+        };
+        Some(Self { raw })
+    }
+
+    const fn raw(self) -> u8 {
+        self.raw
+    }
+}
+
 struct PchPic {
     controller: u32,
     parent_controller: u32,
     base_vector: u32,
     mmio_base: usize,
+    route_target: PchPicRouteTarget,
     inner: Spinlock<PchPicInner>,
 }
 
 impl PchPic {
-    fn new(controller: u32, parent_controller: u32, base_vector: u32, mmio_base: usize) -> Self {
+    fn new(
+        controller: u32,
+        parent_controller: u32,
+        base_vector: u32,
+        mmio_base: usize,
+        route_target: PchPicRouteTarget,
+    ) -> Self {
         Self {
             controller,
             parent_controller,
             base_vector,
             mmio_base,
+            route_target,
             inner: Spinlock::new(PchPicInner::new()),
         }
     }
@@ -401,7 +493,7 @@ impl PchPic {
             self.write32(PCH_PIC_REG_AUTO_CTRL1 + offset, 0);
         }
         for source in 0..PCH_PIC_IRQ_COUNT {
-            self.write8(PCH_PIC_REG_ROUTE + source as usize, PCH_PIC_ROUTE_HT0_LO);
+            self.write8(PCH_PIC_REG_ROUTE + source as usize, self.route_target.raw());
             self.write8(PCH_PIC_REG_HTVEC + source as usize, source as u8);
         }
     }
@@ -411,7 +503,7 @@ impl PchPic {
         irq::translate_firmware_irq(Some(self.parent_controller), &[vector])
     }
 
-    fn translate_source(&self, cells: &[u32]) -> Option<IrqLine> {
+    fn translate_source(self: &Arc<Self>, cells: &[u32]) -> Option<IrqLine> {
         let (source, irq_type) = match cells {
             [source, irq_type] => (*source, *irq_type),
             [source] => (*source, IRQ_TYPE_LEVEL_HIGH),
@@ -420,12 +512,12 @@ impl PchPic {
         if source >= PCH_PIC_IRQ_COUNT {
             return None;
         }
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
         if let Some((slot, _)) = inner
             .slots
             .iter()
             .enumerate()
-            .find(|(_, mapping)| mapping.is_some_and(|mapping| mapping.source == source))
+            .find(|(_, entry)| entry.is_some_and(|entry| entry.mapping.source == source))
         {
             return Some(IrqLine::Controller {
                 controller: self.controller,
@@ -433,17 +525,71 @@ impl PchPic {
             });
         }
         let slot = inner.slots.iter().position(Option::is_none)? as u32;
+        drop(inner);
+
+        // 只有当某个设备 IRQ specifier 真正分配到本 slot 时，才在父级
+        // domain 上安装级联 handler。这样未使用的 PCH source 不会提前打开
+        // 上游 vector，也让热移除时可以按 slot 精确释放资源。
+        let parent_irq = self.register_parent_handler(slot)?;
         let vector = self.base_vector.checked_add(slot)?;
         if vector > u8::MAX as u32 {
+            let _ = irq::unregister_irq_handler(parent_irq);
             return None;
         }
         let mapping = PchPicMapping { source, irq_type };
-        self.program_source(slot, mapping)?;
-        inner.slots[slot as usize] = Some(mapping);
+        if self.program_source(slot, mapping).is_none() {
+            let _ = irq::unregister_irq_handler(parent_irq);
+            return None;
+        }
+
+        let mut inner = self.inner.lock();
+        if inner.slots[slot as usize].is_some() {
+            let _ = irq::unregister_irq_handler(parent_irq);
+            return inner
+                .slots
+                .iter()
+                .enumerate()
+                .find(|(_, entry)| entry.is_some_and(|entry| entry.mapping.source == source))
+                .map(|(existing_slot, _)| IrqLine::Controller {
+                    controller: self.controller,
+                    hwirq: existing_slot as u32,
+                });
+        }
+        inner.slots[slot as usize] = Some(PchPicSlot {
+            mapping,
+            parent_irq,
+        });
         Some(IrqLine::Controller {
             controller: self.controller,
             hwirq: slot,
         })
+    }
+
+    fn register_parent_handler(self: &Arc<Self>, slot: u32) -> Option<IrqHandle> {
+        let parent_line = self.parent_line(slot)?;
+        let handler: Arc<dyn IrqHandler> = Arc::new(PchPicCascadeHandler {
+            pic: Arc::clone(self),
+            slot,
+        });
+        irq::register_irq_handler(parent_line, handler).ok()
+    }
+
+    fn unregister_parent_handlers(&self) {
+        // 先从 slot 表里取走所有 handler 句柄，再在锁外注销。注销过程会回调
+        // IRQ registry 和父 domain，不能持有 PCH 内部锁进入外层基础设施。
+        let handles: Vec<IrqHandle> = {
+            let mut inner = self.inner.lock();
+            let mut handles = Vec::new();
+            for entry in inner.slots.iter_mut() {
+                if let Some(slot) = entry.take() {
+                    handles.push(slot.parent_irq);
+                }
+            }
+            handles
+        };
+        for handle in handles {
+            let _ = irq::unregister_irq_handler(handle);
+        }
     }
 
     fn program_source(&self, slot: u32, mapping: PchPicMapping) -> Option<()> {
@@ -454,7 +600,7 @@ impl PchPic {
         );
         self.write8(
             PCH_PIC_REG_ROUTE + mapping.source as usize,
-            PCH_PIC_ROUTE_HT0_LO,
+            self.route_target.raw(),
         );
         self.configure_type(mapping.source, mapping.irq_type);
         self.set_source_enabled(mapping.source, false);
@@ -502,7 +648,7 @@ impl PchPic {
         if slot >= PCH_PIC_IRQ_COUNT {
             return None;
         }
-        self.inner.lock().slots[slot as usize]
+        self.inner.lock().slots[slot as usize].map(|entry| entry.mapping)
     }
 
     fn set_source_enabled(&self, source: u32, enabled: bool) {
@@ -542,13 +688,17 @@ impl PchPic {
     }
 }
 
-impl IrqDomain for PchPic {
+struct PchPicDomain {
+    pic: Arc<PchPic>,
+}
+
+impl IrqDomain for PchPicDomain {
     fn translate(&self, cells: &[u32]) -> Option<IrqLine> {
-        self.translate_source(cells)
+        self.pic.translate_source(cells)
     }
 
     fn set_line_enabled(&self, hwirq: u32, enabled: bool) -> bool {
-        self.set_slot_enabled(hwirq, enabled)
+        self.pic.set_slot_enabled(hwirq, enabled)
     }
 }
 
@@ -565,7 +715,7 @@ impl IrqHandler for PchPicCascadeHandler {
 
 struct PchPicBinding {
     domain: IrqDomainHandle,
-    parent_irqs: Vec<IrqHandle>,
+    pic: Arc<PchPic>,
 }
 
 pub struct PchPicDriver {
@@ -581,38 +731,6 @@ impl PchPicDriver {
 
     fn matches_platform(info: &PlatformDeviceInfo) -> bool {
         info.properties.interrupt_controller && info.has_id(COMPAT_LOONGSON_PCH_PIC)
-    }
-
-    fn register_parent_handlers(pic: &Arc<PchPic>) -> Result<Vec<IrqHandle>, PnpError> {
-        let mut handles = Vec::new();
-        handles
-            .try_reserve(PCH_PIC_IRQ_COUNT_USIZE)
-            .map_err(|_| PnpError::OutOfMemory)?;
-        for slot in 0..PCH_PIC_IRQ_COUNT {
-            let parent_line = match pic.parent_line(slot) {
-                Some(line) => line,
-                None => {
-                    for handle in handles {
-                        let _ = irq::unregister_irq_handler(handle);
-                    }
-                    return Err(PnpError::ProbeFailed);
-                }
-            };
-            let handler: Arc<dyn IrqHandler> = Arc::new(PchPicCascadeHandler {
-                pic: Arc::clone(pic),
-                slot,
-            });
-            match irq::register_irq_handler(parent_line, handler) {
-                Ok(handle) => handles.push(handle),
-                Err(err) => {
-                    for handle in handles {
-                        let _ = irq::unregister_irq_handler(handle);
-                    }
-                    return Err(map_irq_error(err));
-                }
-            }
-        }
-        Ok(handles)
     }
 }
 
@@ -644,26 +762,24 @@ impl PnpDriver for PchPicDriver {
         let Some((phys, _size)) = info.first_mmio() else {
             return Err(PnpError::ProbeFailed);
         };
-        let base_vector = info.u32_property("loongson,pic-base-vec").unwrap_or(0);
+        let base_vector = info.u32_property(PCH_PIC_PROP_BASE_VECTOR).unwrap_or(0);
+        let route_target = PchPicRouteTarget::from_platform(info).ok_or(PnpError::ProbeFailed)?;
         let pic = Arc::new(PchPic::new(
             controller,
             parent_controller,
             base_vector,
             (self.device_mmio_to_virt)(phys),
+            route_target,
         ));
         pic.reset();
-        let domain = irq::register_irq_domain(controller, pic.clone()).map_err(map_irq_error)?;
-        let parent_irqs = match Self::register_parent_handlers(&pic) {
-            Ok(handles) => handles,
-            Err(err) => {
-                let _ = irq::unregister_irq_domain(domain);
-                return Err(err);
-            }
-        };
-        dev.set_driver_data(Arc::new(PchPicBinding {
-            domain,
-            parent_irqs,
-        }));
+        let domain = irq::register_irq_domain(
+            controller,
+            Arc::new(PchPicDomain {
+                pic: Arc::clone(&pic),
+            }),
+        )
+        .map_err(map_irq_error)?;
+        dev.set_driver_data(Arc::new(PchPicBinding { domain, pic }));
         Ok(())
     }
 
@@ -671,9 +787,11 @@ impl PnpDriver for PchPicDriver {
         if let Some(data) = dev.take_driver_data()
             && let Ok(binding) = data.downcast::<PchPicBinding>()
         {
-            for handle in binding.parent_irqs.iter().copied() {
-                let _ = irq::unregister_irq_handler(handle);
-            }
+            // 移除控制器时先把所有 source 重新屏蔽并清 pending，再拆掉父级
+            // handler/domain。这样即使设备侧仍有旧电平或残留边沿，也不会在
+            // 注销过程中继续向上游控制器冒泡。
+            binding.pic.reset();
+            binding.pic.unregister_parent_handlers();
             let _ = irq::unregister_irq_domain(binding.domain);
         }
     }

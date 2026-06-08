@@ -201,6 +201,7 @@ impl Default for IrqRegistry {
 static IRQ_REGISTRY: IrqRegistry = IrqRegistry::new();
 static IRQ_LINE_OPS: Spinlock<Option<IrqLineOps>> = Spinlock::new(None);
 static IOCSR_OPS: Spinlock<Option<IocsrOps>> = Spinlock::new(None);
+static DEFAULT_IRQ_DOMAIN: Spinlock<Option<Arc<dyn IrqDomain>>> = Spinlock::new(None);
 
 pub trait IrqDomain: Send + Sync {
     /// 将固件中断 specifier 翻译成规范化 [`IrqLine`]。
@@ -298,6 +299,9 @@ impl Default for IrqDomainRegistry {
 
 static IRQ_DOMAINS: IrqDomainRegistry = IrqDomainRegistry::new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultIrqDomainHandle;
+
 pub fn register_irq_handler(
     line: IrqLine,
     handler: Arc<dyn IrqHandler>,
@@ -393,6 +397,38 @@ pub fn unregister_irq_domain(handle: IrqDomainHandle) -> Result<(), IrqError> {
     IRQ_DOMAINS.unregister(handle)
 }
 
+/// 安装当前固件模型的默认 IRQ domain。
+///
+/// DTB 设备通常通过 phandle 指向具体 interrupt-controller；ACPI 这类固件模型
+/// 可能直接给出全局中断号，此时 `DeviceResource::Irq { controller: None, .. }`
+/// 会交给这里注册的默认 domain 翻译。该接口只表达资源解释策略，不把任何平台
+/// 的中断号布局硬编码进设备 core。
+pub fn register_default_irq_domain(
+    domain: Arc<dyn IrqDomain>,
+) -> Result<DefaultIrqDomainHandle, IrqError> {
+    let mut default = DEFAULT_IRQ_DOMAIN.lock();
+    if default.is_some() {
+        return Err(IrqError::AlreadyRegistered);
+    }
+    *default = Some(domain);
+    Ok(DefaultIrqDomainHandle)
+}
+
+pub fn unregister_default_irq_domain(_handle: DefaultIrqDomainHandle) -> Result<(), IrqError> {
+    let mut default = DEFAULT_IRQ_DOMAIN.lock();
+    if default.take().is_some() {
+        Ok(())
+    } else {
+        Err(IrqError::NotFound)
+    }
+}
+
 pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<IrqLine> {
-    IRQ_DOMAINS.translate(controller?, cells)
+    match controller {
+        Some(controller) => IRQ_DOMAINS.translate(controller, cells),
+        None => DEFAULT_IRQ_DOMAIN
+            .lock()
+            .as_ref()
+            .and_then(|domain| domain.translate(cells)),
+    }
 }

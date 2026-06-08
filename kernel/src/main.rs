@@ -6,8 +6,9 @@ extern crate allocator;
 extern crate hal;
 
 mod acpi;
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "allocator-bench"))]
 mod bench;
+mod device_init;
 mod dtb;
 mod initramfs;
 mod net_poll;
@@ -46,7 +47,10 @@ fn main() -> ! {
     }
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
-    // bench::run();
+    #[cfg(all(feature = "allocator-bench", not(feature = "bench")))]
+    bench::run_allocator_only();
+    #[cfg(feature = "bench")]
+    bench::run();
 
     log::set_log_level(log::LogLevel::Info);
     sched::start_init_process(&init)

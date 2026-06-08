@@ -16,7 +16,7 @@ use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxB
 use crate::dev::pnp::PnpError;
 
 const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
-/// Linux 兼容的 loopback MTU。
+/// loopback 接口使用的本地最大传输单元。
 const LOOPBACK_MTU: usize = 65_536;
 /// 保留传统 loopback 网段：lo 固定为 127.0.0.1/8。
 const LOOPBACK_IPV4_PREFIX: u8 = 8;
@@ -102,7 +102,7 @@ impl NetDriver for LoopbackDriver {
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     let driver: Arc<dyn NetDriver> = Arc::new(LoopbackDriver::new());
     let dev = Arc::new(NetDevice::new("lo", driver));
-    // lo 按 POSIX/Linux 习惯固定使用 127.0.0.1/8；这里不扩展完整路由策略。
+    // lo 固定使用保留的 127.0.0.1/8 本地回环网段；这里不扩展完整路由策略。
     let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, LOOPBACK_IPV4_PREFIX, None);
     net::stack()
         .attach(dev, config)

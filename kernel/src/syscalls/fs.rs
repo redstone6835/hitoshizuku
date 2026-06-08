@@ -2068,6 +2068,9 @@ fn read_to_user(
 fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Result<(), Errno> {
     const IO_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
+    if has_unblocked_signal(&task) {
+        return Err(Errno::EINTR);
+    }
     let deadline = file.io_timeout_deadline(interest);
     if timeout_expired(deadline) {
         return Err(Errno::EAGAIN);
@@ -2104,6 +2107,16 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         }
         restore_current_task_after_wait(&task);
         return Err(Errno::EAGAIN);
+    }
+    if has_unblocked_signal(&task) {
+        if registered {
+            file.poll_remove_waiter(&task);
+        }
+        if deadline_armed {
+            sched::cancel_sleep_deadline(&task);
+        }
+        restore_current_task_after_wait(&task);
+        return Err(Errno::EINTR);
     }
 
     if registered || deadline_armed {

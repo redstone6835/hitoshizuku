@@ -17,6 +17,14 @@
 //! 锁顺序和职责边界。文件头下面的 lock ordering 说明，就是为了保证这些层在组合
 //! 起来以后仍然能稳定工作。
 //!
+//! TODO(alloc-stabilization): 本轮收口后仍需继续完成以下事项：
+//! 1. 在 `loongarch64-unknown-none` 目标和 QEMU 中跑完 allocator-bench，补齐真实
+//!    ns/op 数据和瓶颈归因；
+//! 2. 对 buddy/kheap/managed GC 做与 registry/slab/vmem 同等级别的热点审计；
+//! 3. 引入多核压力测试，验证 registry shard、slab per-CPU cache 和回收路径无竞态；
+//! 4. 评估 NUMA/per-CPU page cache、自定义 arena/policy 注册等扩展 API 是否需要进入
+//!    对外稳定接口。
+//!
 //! # 锁顺序 (Lock Ordering)
 //!
 //! 为防止死锁，必须严格按照以下顺序获取锁：
@@ -25,7 +33,7 @@
 //! 2. `vmem` arena 锁 (direct_map, kernel, managed) — 虚拟地址空间
 //! 3. `metadata.inner` — 元数据分配器状态
 //! 4. `phys` (BuddyAllocator) — 物理内存分配器
-//! 5. `registry.inner` — 分配注册表
+//! 5. `registry.shard.inner` — 分片分配注册表
 //! 6. `slab.state` — Slab 分配器状态
 //! 7. `slab.cache.inner` — Per-CPU 缓存
 //! 8. `kheap.inner` — 大对象分配器
@@ -190,6 +198,12 @@ pub struct KernelMemorySubsystem {
 pub type KernelAllocator = KernelMemorySubsystem;
 
 unsafe impl Sync for KernelMemorySubsystem {}
+
+enum TrackedReallocProbe {
+    Updated,
+    NeedsMove(AllocationRecord),
+    Untracked,
+}
 
 impl KernelMemorySubsystem {
     pub const fn new() -> Self {
@@ -682,8 +696,79 @@ impl KernelMemorySubsystem {
         Err(OwnershipError::UnknownPointer)
     }
 
+    /// 查询逐对象注册表中的分配记录。
+    ///
+    /// 与 [`KernelMemorySubsystem::query_allocation`] 不同，这个 API 不把 boot bump
+    /// 区间作为 fallback。外部子系统需要判断“这个裸指针是否仍是一个可操作的对象”
+    /// 时应使用这里，因为 active 后 boot 分配没有逐对象边界，不能安全地从区间包含关系
+    /// 推导出对象所有权。
+    pub fn query_tracked_allocation(&self, ptr: usize) -> Result<AllocationRecord, OwnershipError> {
+        self.registry.get(ptr).ok_or(OwnershipError::UnknownPointer)
+    }
+
+    /// 判断裸指针是否属于当前 allocator 逐对象跟踪的活跃分配。
+    ///
+    /// 这是给外部子系统做防御性检查的窄 API。需要释放或调整大小时仍应调用
+    /// [`KernelMemorySubsystem::deallocate`] / [`KernelMemorySubsystem::reallocate`]，
+    /// 不能因为这里返回 `true` 就绕过 allocator 的账本更新。
+    ///
+    /// active 之后 boot 区域没有逐对象元数据，不能把“地址落在 boot bump 区间内”
+    /// 等价成“这是一个仍可操作的分配起始指针”；因此这里只信任注册表。
+    pub fn owns_allocation(&self, ptr: usize) -> bool {
+        ptr != 0 && self.query_tracked_allocation(ptr).is_ok()
+    }
+
     pub fn allocation_kind(&self, ptr: usize) -> Result<AllocationKind, OwnershipError> {
-        self.query_allocation(ptr).map(|record| record.kind)
+        self.query_tracked_allocation(ptr).map(|record| record.kind)
+    }
+
+    /// 返回调用方请求的逻辑大小。
+    ///
+    /// 该值不一定等于底层可用空间；slab 对象通常会向上取整到 size class。
+    pub fn allocation_size(&self, ptr: usize) -> Result<usize, OwnershipError> {
+        self.query_tracked_allocation(ptr).map(|record| record.size)
+    }
+
+    /// 返回 allocator 为该分配实际保留的可用大小。
+    ///
+    /// 调用方只能在自己持有对象所有权时使用这个值做容量优化，不能把它当作越界访问
+    /// 的授权；对象语义上的有效长度仍由上层数据结构维护。
+    pub fn allocation_usable_size(&self, ptr: usize) -> Result<usize, OwnershipError> {
+        self.query_tracked_allocation(ptr)
+            .map(|record| record.usable_size.max(record.size))
+    }
+
+    /// 返回分配记录中的对齐要求。
+    pub fn allocation_alignment(&self, ptr: usize) -> Result<usize, OwnershipError> {
+        self.query_tracked_allocation(ptr)
+            .map(|record| record.align)
+    }
+
+    /// 判断指定分配能否在不移动指针的前提下调整到新请求。
+    ///
+    /// 这个 API 只做账本和 size-class/order 判断，不会修改 allocator 状态。需要稳定
+    /// 指针的外部子系统可以先调用它：返回 `Ok(true)` 时 [`reallocate`] 会走原地更新，
+    /// 返回 `Ok(false)` 时则表示需要新分配、复制和释放旧对象。
+    pub fn can_reallocate_in_place(
+        &self,
+        ptr: usize,
+        request: MemoryRequest,
+    ) -> Result<bool, AllocationError> {
+        if ptr == 0
+            || !self.active.load(Ordering::Acquire)
+            || !matches!(request.domain, MemoryDomain::Kernel)
+        {
+            return Err(AllocationError::InvalidLayout);
+        }
+
+        let new_layout = layout_from_request(request)?;
+        let record = self
+            .query_tracked_allocation(ptr)
+            .map_err(|_| AllocationError::InvalidLayout)?;
+        if !matches!(record.kind, AllocationKind::Small | AllocationKind::Large) {
+            return Err(AllocationError::InvalidLayout);
+        }
+        Ok(self.can_reuse_allocation(record, new_layout))
     }
 
     pub fn deallocate(&self, ptr: usize) -> Result<(), DeallocationError> {
@@ -751,6 +836,68 @@ impl KernelMemorySubsystem {
                 }
             }
         }
+    }
+
+    /// 调整一个普通内核分配的大小，并返回更新后的分配记录。
+    ///
+    /// 这是给内核其它子系统使用的安全 resize API。它只支持 `Kernel` 域中由
+    /// slab/kheap 管理的对象；受管对象迁移必须走 GC 句柄语义，物理页也应使用
+    /// `allocate_physical/free_physical` 明确表达所有权。
+    ///
+    /// 和 `GlobalAlloc::realloc` 不同，这里不要求调用方提供旧 `Layout`，复制长度
+    /// 直接来自 allocator 注册表中的真实记录，避免外部 API 误传旧尺寸导致越界复制。
+    pub fn reallocate(
+        &self,
+        ptr: usize,
+        request: MemoryRequest,
+    ) -> Result<AllocationRecord, AllocationError> {
+        self.total_reallocs.fetch_add(1, Ordering::Relaxed);
+        self.kheap.record_realloc();
+
+        if ptr == 0 {
+            return self.allocate(request);
+        }
+        if !self.active.load(Ordering::Acquire) || !matches!(request.domain, MemoryDomain::Kernel) {
+            return Err(AllocationError::InvalidLayout);
+        }
+
+        let new_layout = layout_from_request(request)?;
+        let mut old_record = self
+            .query_tracked_allocation(ptr)
+            .map_err(|_| AllocationError::InvalidLayout)?;
+        if !matches!(
+            old_record.kind,
+            AllocationKind::Small | AllocationKind::Large
+        ) {
+            return Err(AllocationError::InvalidLayout);
+        }
+
+        if self.can_reuse_allocation(old_record, new_layout) {
+            if matches!(request.zeroing, Zeroing::Zeroed) && request.size > old_record.size {
+                let start = ptr
+                    .checked_add(old_record.size)
+                    .ok_or(AllocationError::InvalidLayout)?;
+                let len = request.size - old_record.size;
+                unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
+            }
+            old_record.size = request.size.max(1);
+            old_record.align = new_layout.align();
+            self.registry
+                .update_existing_result(ptr, old_record)
+                .map_err(allocation_error_from_registry)?;
+            return Ok(old_record);
+        }
+
+        let new_record = self.allocate(request)?;
+        let copy_len = old_record.size.min(new_record.size);
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr as *const u8, new_record.ptr as *mut u8, copy_len);
+        }
+        if self.deallocate(ptr).is_err() {
+            let _ = self.deallocate(new_record.ptr);
+            return Err(AllocationError::InvalidLayout);
+        }
+        Ok(new_record)
     }
 
     fn allocate_boot(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
@@ -1049,6 +1196,9 @@ impl KernelMemorySubsystem {
     }
 
     fn can_reuse_allocation(&self, record: AllocationRecord, new_layout: Layout) -> bool {
+        if !ptr_satisfies_align(record.ptr, new_layout.align()) {
+            return false;
+        }
         match record.kind {
             AllocationKind::Small => {
                 is_small(new_layout)
@@ -1060,6 +1210,33 @@ impl KernelMemorySubsystem {
             }
             AllocationKind::Managed => false,
             AllocationKind::Boot | AllocationKind::Physical => false,
+        }
+    }
+
+    fn probe_tracked_realloc(
+        &self,
+        ptr: usize,
+        new_layout: Layout,
+        new_size: usize,
+    ) -> Result<TrackedReallocProbe, RegistryError> {
+        // GlobalAlloc::realloc 是最热的 resize 入口之一。这里把“查记录 + 判断能否
+        // 原地复用 + 更新逻辑大小”合并到 registry 的单次 shard 加锁中，避免同一
+        // 指针连续两次哈希、加锁和链表扫描；无法原地复用时直接把旧记录带回，
+        // 后续搬迁复制也不需要再查一次账本。
+        match self
+            .registry
+            .update_existing_maybe_result(ptr, |mut record| {
+                if !self.can_reuse_allocation(record, new_layout) {
+                    return None;
+                }
+                record.size = new_size;
+                record.align = new_layout.align();
+                Some(record)
+            }) {
+            Ok((_, true)) => Ok(TrackedReallocProbe::Updated),
+            Ok((record, false)) => Ok(TrackedReallocProbe::NeedsMove(record)),
+            Err(RegistryError::UnknownPointer) => Ok(TrackedReallocProbe::Untracked),
+            Err(err) => Err(err),
         }
     }
 
@@ -1102,11 +1279,13 @@ impl KernelMemorySubsystem {
                 }
                 // 无法清除则回滚
                 rollback();
-                Err(AllocationError::OutOfMemory)
+                Err(allocation_error_from_registry(
+                    RegistryError::DuplicatePointer,
+                ))
             }
-            Err(_) => {
+            Err(err) => {
                 rollback();
-                Err(AllocationError::OutOfMemory)
+                Err(allocation_error_from_registry(err))
             }
         }
     }
@@ -1132,6 +1311,30 @@ fn is_small_request(request: MemoryRequest) -> bool {
 fn layout_from_request(request: MemoryRequest) -> Result<Layout, AllocationError> {
     Layout::from_size_align(request.size.max(1), request.align.max(1))
         .map_err(|_| AllocationError::InvalidLayout)
+}
+
+fn allocation_error_from_registry(err: RegistryError) -> AllocationError {
+    match err {
+        RegistryError::NotInitialized => AllocationError::NotInitialized,
+        RegistryError::MetadataOutOfMemory => AllocationError::OutOfMemory,
+        RegistryError::InvalidRecord
+        | RegistryError::DuplicatePointer
+        | RegistryError::UnknownPointer => AllocationError::InvalidLayout,
+    }
+}
+
+fn ptr_satisfies_align(ptr: usize, align: usize) -> bool {
+    align != 0 && align.is_power_of_two() && (ptr & (align - 1)) == 0
+}
+
+fn realloc_copy_source_size(record: AllocationRecord, fallback_layout_size: usize) -> usize {
+    // boot 分配没有逐对象账本，active 后只能合成 size=0 的记录；realloc 仍需按
+    // 调用方传入的旧 Layout 保留内容，其它路径则以 registry 真实大小为准。
+    if matches!(record.kind, AllocationKind::Boot) && record.size == 0 {
+        fallback_layout_size
+    } else {
+        record.size
+    }
 }
 
 fn managed_gc_reclaim(ptr: usize, size: usize) {
@@ -1205,7 +1408,19 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         };
         let active = self.active.load(Ordering::Acquire);
         let owner = if active {
-            self.query_allocation(ptr as usize).ok()
+            match self.probe_tracked_realloc(ptr as usize, new_layout, new_size) {
+                Ok(TrackedReallocProbe::Updated) => return ptr,
+                Ok(TrackedReallocProbe::NeedsMove(record)) => Some(record),
+                Ok(TrackedReallocProbe::Untracked) if self.boot.contains(ptr as usize) => Some(
+                    AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr as usize)
+                        .with_sizes(layout.size(), layout.size(), layout.align()),
+                ),
+                Ok(TrackedReallocProbe::Untracked) => None,
+                Err(_) => {
+                    self.record_ownership_failure();
+                    return null_mut();
+                }
+            }
         } else if self.boot.contains(ptr as usize) {
             Some(
                 AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr as usize)
@@ -1222,27 +1437,15 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             return null_mut();
         }
 
-        if active
-            && owner
-                .map(|record| self.can_reuse_allocation(record, new_layout))
-                .unwrap_or(false)
-        {
-            if let Some(mut record) = owner {
-                record.size = new_size;
-                record.align = new_layout.align();
-                if !self.registry.update_existing(ptr as usize, record) {
-                    self.record_ownership_failure();
-                }
-            }
-            return ptr;
-        }
-
         let new_ptr = unsafe { self.alloc(new_layout) };
         if new_ptr.is_null() {
             return null_mut();
         }
 
-        let copy_len = layout.size().min(new_size);
+        let old_size = owner
+            .map(|record| realloc_copy_source_size(record, layout.size()))
+            .unwrap_or_else(|| layout.size());
+        let copy_len = old_size.min(new_size);
         unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
 
         if active {

@@ -28,7 +28,7 @@ use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{active_block_devices, active_char_devices};
+use crate::dev::function::{active_block_devnode_projections, active_char_devnode_projections};
 use crate::vfs::device_numbers;
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
@@ -180,27 +180,55 @@ struct SysSnapshot {
 impl SysSnapshot {
     fn collect() -> Self {
         let mut snap = SysSnapshot::default();
-        for dev in active_block_devices(&DEVICES.functions) {
+        let records = device_numbers::records();
+
+        // `/sys/block` 和 `/sys/devices` 展示 typed device object；`rdev` 只从
+        // devtmpfs 已注册的 POSIX 投影补充而来，不能反过来当底层设备身份。
+        for projection in active_block_devnode_projections(&DEVICES.functions) {
+            let Some(record) = records.iter().find(|record| {
+                record.kind == device_numbers::PosixDeviceKind::Block
+                    && record.node_name == projection.node_name()
+            }) else {
+                continue;
+            };
+            let dev = Arc::clone(projection.dev());
             let sysfs_name = dev.name().to_string();
-            if let Some(record) = device_numbers::lookup_block_record(&sysfs_name) {
-                snap.blocks.push(BlockDevSnapshot {
-                    sysfs_name,
-                    rdev: record.rdev,
-                    dev,
-                });
+            if snap
+                .blocks
+                .iter()
+                .any(|block| block.sysfs_name == sysfs_name)
+            {
+                continue;
             }
+            snap.blocks.push(BlockDevSnapshot {
+                sysfs_name,
+                rdev: record.rdev,
+                dev,
+            });
         }
-        for dev in active_char_devices(&DEVICES.functions) {
+
+        for projection in active_char_devnode_projections(&DEVICES.functions) {
+            let Some(record) = records.iter().find(|record| {
+                record.kind == device_numbers::PosixDeviceKind::Char
+                    && record.node_name == projection.node_name()
+            }) else {
+                continue;
+            };
+            let dev = projection.dev().clone();
             let sysfs_name = dev.fw_name().to_string();
-            if let Some(record) = device_numbers::lookup_char_record(&sysfs_name) {
-                snap.chars.push(CharDevSnapshot {
-                    sysfs_name,
-                    rdev: record.rdev,
-                    dev,
-                });
+            if snap.chars.iter().any(|ch| ch.sysfs_name == sysfs_name) {
+                continue;
             }
+            snap.chars.push(CharDevSnapshot {
+                sysfs_name,
+                rdev: record.rdev,
+                dev,
+            });
         }
-        for record in device_numbers::records() {
+
+        // `/sys/dev/{char,block}` 是 POSIX `dev_t` 的兼容视图，来源只能是
+        // device_numbers registry；这里不向底层设备模型反向写入任何信息。
+        for record in records {
             match record.kind {
                 device_numbers::PosixDeviceKind::Char => {
                     snap.char_nodes.push(CharDevNodeSnapshot {
@@ -707,12 +735,30 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
-            // TODO: 实现完整 diskstats 统计（reads/writes/sectors/iotime 等 11 字段），
-            //       当前新架构不再追踪 in_flight 计数，全填 0
-            format!("0 0 0 0 0 0 0 0 0 0 0 0 0\n")
+            let stats = dev.io_stats();
+            // 这里输出通用块层维护的兼容 diskstats 字段。合并计数和队列总耗时
+            // 当前没有独立数据源，保持为 0；完成数、扇区数、inflight 和操作耗时
+            // 均来自 BlockDevice 的 BIO 统计。
+            format!(
+                "{} 0 {} {} {} 0 {} {} {} 0 0 {} 0 {} {} {} {}\n",
+                stats.read_ios,
+                stats.read_sectors,
+                ns_to_ms(stats.read_time_ns),
+                stats.write_ios,
+                stats.write_sectors,
+                ns_to_ms(stats.write_time_ns),
+                stats.read_inflight.saturating_add(stats.write_inflight),
+                stats.discard_ios,
+                stats.discard_sectors,
+                ns_to_ms(stats.discard_time_ns),
+                stats.flush_ios,
+                ns_to_ms(stats.flush_time_ns),
+            )
         }
-        // TODO: inflight 字段也需要真实统计（目前硬编码 0）
-        BlockDevSlot::Inflight => format!(" 0       0\n"),
+        BlockDevSlot::Inflight => {
+            let stats = dev.io_stats();
+            format!("{} {}\n", stats.read_inflight, stats.write_inflight)
+        }
         BlockDevSlot::Periodic => String::new(),
         BlockDevSlot::QueueDir => String::new(),
     }
@@ -796,6 +842,10 @@ fn render_dev_char_inner(snap: &SysSnapshot, idx: usize, slot: DevCharInnerSlot)
 
 fn format_rdev(rdev: DevId) -> String {
     format!("{}:{}\n", rdev.major, rdev.minor)
+}
+
+fn ns_to_ms(ns: u64) -> u64 {
+    ns / 1_000_000
 }
 
 fn rdev_name(rdev: DevId) -> String {
@@ -1283,7 +1333,6 @@ impl SysDirInodeOps {
                     // TODO: 实现设备 power 子目录（runtime_status, control, wakeup 等）
                     Ok(mk_dir(ino, SysDirKind::Module))
                 } else if matches!(slot, DeviceSlot::Subsystem) {
-                    // 子系统链接：直接指向 /sys/<bus|class|...>
                     let target = if idx < snap.chars.len() {
                         "..".to_string()
                     } else {

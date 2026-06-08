@@ -37,7 +37,9 @@ use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::dev::char::{CharDriver, CharIoError};
+use crate::dev::char::{CharDevice, CharDriver, CharIoError};
+use crate::dev::function::DevNodeSpec;
+use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_node};
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -55,8 +57,7 @@ const POOL_BYTES: usize = POOL_WORDS * core::mem::size_of::<u64>();
 /// 熵池满载时按 8 bit/byte 计入，约 1024 bit 熵。
 const POOL_BITS: u64 = (POOL_BYTES as u64) * 8;
 
-/// ChaCha20 输出 64 字节，reseed 间隔 Linux 5.x 默认 1 MiB，我们采用
-/// `64 * (1 << 14) = 1 MiB`。
+/// ChaCha20 输出 64 字节；每输出 1 MiB 后重新派生一次密钥流状态。
 const CHACHA20_BLOCK: usize = 64;
 const RESEED_BYTES: u64 = 1u64 << 20;
 
@@ -159,12 +160,12 @@ fn sched_yield_best_effort() {
 
 // ──────────────────────── 输入熵池 ────────────────────────────────────────
 
-/// 16 × u64 状态的熵池，模仿 Linux `input_pool` 的简化版。
+/// 16 × u64 状态的熵池。
 ///
 /// 状态本身是公开的 `s`，但只有 `mix_*` 知道怎么把外部字节喂进去；
 /// 直接访问 `state` 是私有 API。
 struct EntropyPool {
-    /// 池内 16 个 64-bit 字。Linux `pool` 数组按小端 `u64` 访问。
+    /// 池内 16 个 64-bit 字，按小端 `u64` 混入外部字节。
     state: [u64; POOL_WORDS],
     /// 估计可用熵 bit 数，初始 0。
     estimated_entropy_bits: u64,
@@ -186,7 +187,7 @@ impl EntropyPool {
 
     /// 把 `n` 字节按 8 字节小端展开后与池状态做 7-位移位混合。
     ///
-    /// 这一步的设计完全照搬 Linux `mix_pool_bytes` 的简化：
+    /// 混合步骤：
     ///   1. 每 8 字节折叠成 `u64`；
     ///   2. 在状态字之间做 (rotate-left, add, xor) 三角链；
     ///   3. 剩余 < 8 字节折叠到 state[0]；
@@ -672,21 +673,50 @@ impl CharDriver for UrandomDriver {
 pub static RANDOM_DRIVER: RandomDriver = RandomDriver;
 pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
 
+fn random_dev_node() -> DevNodeSpec {
+    DevNodeSpec::Char {
+        name: "random".into(),
+        dev: CharDevice::new("random", &RANDOM_DRIVER),
+    }
+}
+
+fn urandom_dev_node() -> DevNodeSpec {
+    DevNodeSpec::Char {
+        name: "urandom".into(),
+        dev: CharDevice::new("urandom", &URANDOM_DRIVER),
+    }
+}
+
 // ──────────────────────── 工厂入口（兼容 drivers/mod.rs 形态） ─────────────
 
 // 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以
 // 满足 `drivers::register_builtin_drivers()` 调用约定，但没有设备需要
-// 通过 PnP 枚举来发现这两个节点，它们是在 devtmpfs mount 时静态绑定的。
+// 通过 PnP 枚举来发现这两个节点，它们通过 devtmpfs 静态节点注册表声明。
 use crate::dev::pnp::PnpError;
 
-/// 注册 random 子系统。在 devtmpfs mount 之前调用。
+/// 注册 random 子系统。
 ///
 /// 内部会：
 ///   1. 喂一次启动期样本（时间戳 + 栈地址 + self 地址），并按熵源显式
 ///      credit reseed 一次。
 ///   2. 标记 `first_seed_done`，供诊断。
+///
+/// `/dev/random` 和 `/dev/urandom` 通过 devtmpfs 静态节点注册表声明；
+/// 驱动只提交 `DevNodeSpec`，实际 inode 创建仍由 devtmpfs 统一完成。
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     seed_from_startup();
+    register_static_dev_node(DevTmpfsStaticNode::new(
+        "random-driver",
+        "random",
+        random_dev_node,
+    ))
+    .map_err(|_| PnpError::DevtmpfsError)?;
+    register_static_dev_node(DevTmpfsStaticNode::new(
+        "random-driver",
+        "urandom",
+        urandom_dev_node,
+    ))
+    .map_err(|_| PnpError::DevtmpfsError)?;
     Ok(())
 }
 
@@ -720,7 +750,7 @@ fn seed_from_startup() {
         }
     } else {
         // 没有 arch 熵源：跳过硬件项，只靠用户态 write + reseed。
-        // Linux 在 start_kernel 早期 `crng_init = 0` 的状态也是这样。
+        // 这保持“无可信熵时不解除阻塞随机读”的内部不变量。
     }
 
     // 启动 hint 可以 mix，但默认不 credit。只有 EntropySource 通过

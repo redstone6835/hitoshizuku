@@ -4,11 +4,10 @@
 //! 本驱动通过 PCI capability list 定位 `common_cfg`/`notify_cfg`/`isr_cfg`/
 //! `device_cfg` 四个能力,在 probe 时完成:
 //!
-//! 1. 读取 [`PciInfo`],匹配 Red Hat vendor `0x1af4` + block device(ID 0x1001
-//!    legacy transitional 或 0x1042 modern non-transitional)。
+//! 1. 读取 [`PciInfo`]，按 VirtIO PCI 传输层设备类型匹配 block function。
 //! 2. 映射 BARs,把各 capability 偏移换算为寄存器虚拟地址。
 //! 3. reset → ACKNOWLEDGE → DRIVER → negotiate features → FEATURES_OK →
-//!    分配 DMA 物理页构造 virtqueue → DRIVER_OK。
+//!    分配 DMA 页构造 virtqueue → DRIVER_OK。
 //! 4. 按现有 [`virtio_blk`] 的 `VirtqDesc/VirtqAvail/VirtqUsed` 布局提交请求。
 //! 5. 封装成 [`BlockIo`](crate::dev::block::BlockIo) 并通过
 //!    [`PnpDevice::register_function`](crate::dev::pnp::PnpDevice::register_function)
@@ -16,14 +15,14 @@
 //!
 //! 内建注册入口只提交 factory；PCI host 初始化和总线扫描仍由启动路径负责。
 //!
-//! remove 路径把 device status 写 0,释放队列 DMA 页,`BlockDev` 的
+//! remove 路径把 device status 写 0，释放队列 DMA 页，`BlockDev` 的
 //! `mark_gone` 由 PnP 框架统一处理。
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::mem;
 use core::num::NonZeroU32;
-use core::ptr::{read_volatile, write_volatile};
+use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
@@ -36,57 +35,24 @@ use crate::dev::block::{
 };
 use crate::dev::dma::{DmaBuffer, DmaDirection};
 use crate::dev::function::BlockFunction;
-use crate::dev::pci::{PciBar, PciBarType, PciDevice, PciInfo};
+use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::pci::{PciBar, PciDevice, PciInfo};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     register_driver_factory,
 };
-use crate::dev::virtio::{SplitVirtQueue, VIRTQ_DESC_F_WRITE, choose_split_queue_size};
-
-// ── VirtIO PCI capability 类型 ──────────────────────────────────────────
-
-const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
-const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
-const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
-const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
-
-// ── common_cfg 寄存器布局(VIRTIO 1.2 §4.1.4.3) ────────────────────────
-
-const CC_DEVICE_FEATURE_SELECT: usize = 0x00; // u32 rw
-const CC_DEVICE_FEATURE: usize = 0x04; // u32 ro
-const CC_DRIVER_FEATURE_SELECT: usize = 0x08; // u32 rw
-const CC_DRIVER_FEATURE: usize = 0x0c; // u32 rw
-#[allow(dead_code)]
-const CC_CONFIG_MSIX_VECTOR: usize = 0x10; // u16 rw
-#[allow(dead_code)]
-const CC_NUM_QUEUES: usize = 0x12; // u16 ro
-const CC_DEVICE_STATUS: usize = 0x14; // u8 rw
-#[allow(dead_code)]
-const CC_CONFIG_GENERATION: usize = 0x15; // u8 ro
-const CC_QUEUE_SELECT: usize = 0x16; // u16 rw
-const CC_QUEUE_SIZE: usize = 0x18; // u16 rw
-#[allow(dead_code)]
-const CC_QUEUE_MSIX_VECTOR: usize = 0x1a; // u16 rw
-const CC_QUEUE_ENABLE: usize = 0x1c; // u16 rw
-const CC_QUEUE_NOTIFY_OFF: usize = 0x1e; // u16 ro
-const CC_QUEUE_DESC: usize = 0x20; // u64 rw
-const CC_QUEUE_DRIVER: usize = 0x28; // u64 rw
-const CC_QUEUE_DEVICE: usize = 0x30; // u64 rw
-
-// ── device status bits ─────────────────────────────────────────────────
-
-const STATUS_ACKNOWLEDGE: u8 = 1;
-const STATUS_DRIVER: u8 = 2;
-const STATUS_DRIVER_OK: u8 = 4;
-const STATUS_FEATURES_OK: u8 = 8;
-const STATUS_FAILED: u8 = 128;
+use crate::dev::virtio::{
+    SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTIO_PCI_FUNCTION_BLOCK, VIRTIO_PCI_RESET_SPIN_LIMIT,
+    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED,
+    VIRTIO_STATUS_FEATURES_OK, VIRTQ_DESC_F_WRITE, VirtioPciTransport, choose_split_queue_size,
+    parse_virtio_pci_caps,
+};
 
 // ── feature bits ───────────────────────────────────────────────────────
 
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 // ── device config(block) offsets(相对 device_cfg BAR 区域) ──────────
 
@@ -117,26 +83,6 @@ struct VirtioBlkReqMeta {
     _pad: [u8; 7],
 }
 
-// ── 解析出的 capability 定位信息 ────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
-struct VirtioCap {
-    /// 虚拟地址基址(BAR 的 MMIO 映射 + cap.offset)。
-    vaddr: usize,
-    /// 该 capability 在 BAR 内部可访问的长度。
-    length: u32,
-    /// notify 专用:notify_off_multiplier(其它 cap 忽略)。
-    notify_off_multiplier: u32,
-}
-
-struct VirtioPciCaps {
-    common: VirtioCap,
-    notify: VirtioCap,
-    _isr: VirtioCap,
-    device: Option<VirtioCap>,
-}
-
 // ── 队列状态 ────────────────────────────────────────────────────────────
 
 struct VirtioBlkQueue {
@@ -158,7 +104,7 @@ unsafe impl Sync for VirtioBlkQueue {}
 // ── 驱动主结构 ──────────────────────────────────────────────────────────
 
 struct VirtioBlkInner {
-    caps: VirtioPciCaps,
+    transport: VirtioPciTransport,
     /// 队列 0 的 notify 写地址。
     notify_addr: usize,
     capacity: u64,
@@ -175,184 +121,8 @@ pub struct VirtioBlkPci {
 
 impl Drop for VirtioBlkPci {
     fn drop(&mut self) {
-        // reset device
-        unsafe {
-            write_volatile(
-                (self.inner.caps.common.vaddr + CC_DEVICE_STATUS) as *mut u8,
-                0,
-            );
-        }
+        self.inner.transport.set_status(0);
     }
-}
-
-// ── capability 遍历 & 解析 ─────────────────────────────────────────────
-
-/// 在 PCI 能力链里找所有 VIRTIO 类型的 vendor-specific capability,按
-/// cfg_type 路由。
-fn parse_virtio_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
-    let mut common: Option<VirtioCap> = None;
-    let mut notify: Option<VirtioCap> = None;
-    let mut isr: Option<VirtioCap> = None;
-    let mut device: Option<VirtioCap> = None;
-
-    for cap_header in pci.capabilities().filter(|cap| cap.id == 0x09) {
-        let ptr = cap_header.offset;
-        let cap_len = pci.read_config_u8(ptr + 2);
-        let cfg_type = pci.read_config_u8(ptr + 3);
-        let min_len = if cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG {
-            20
-        } else {
-            16
-        };
-        if cap_len < min_len {
-            continue;
-        }
-
-        let bar_idx = pci.read_config_u8(ptr + 4) & 0x7;
-        let offset = pci.read_config_u32(ptr + 8);
-        let length = pci.read_config_u32(ptr + 12);
-        if length == 0 {
-            continue;
-        }
-
-        let Some((bar, bar_vaddr)) = pci.map_bar_virt(bar_idx as usize) else {
-            continue;
-        };
-        if !matches!(bar.bar_type, PciBarType::Memory) {
-            continue;
-        }
-        let Some(end) = (offset as u64).checked_add(length as u64) else {
-            continue;
-        };
-        if end > bar.size {
-            continue;
-        }
-
-        let Some(vaddr) = bar_vaddr.checked_add(offset as usize) else {
-            continue;
-        };
-        let cap = VirtioCap {
-            vaddr,
-            length,
-            notify_off_multiplier: 0,
-        };
-        match cfg_type {
-            VIRTIO_PCI_CAP_COMMON_CFG => common = Some(cap),
-            VIRTIO_PCI_CAP_NOTIFY_CFG => {
-                let notify_off_multiplier = pci.read_config_u32(ptr + 16);
-                notify = Some(VirtioCap {
-                    vaddr,
-                    length,
-                    notify_off_multiplier,
-                });
-            }
-            VIRTIO_PCI_CAP_ISR_CFG => isr = Some(cap),
-            VIRTIO_PCI_CAP_DEVICE_CFG => device = Some(cap),
-            _ => {}
-        }
-    }
-
-    Some(VirtioPciCaps {
-        common: common?,
-        notify: notify?,
-        _isr: isr?,
-        device,
-    })
-}
-
-fn cap_covers(cap: &VirtioCap, offset: usize, len: usize) -> bool {
-    offset
-        .checked_add(len)
-        .is_some_and(|end| end <= cap.length as usize)
-}
-
-fn validate_cap_range(
-    cap: &VirtioCap,
-    offset: usize,
-    len: usize,
-    error: &'static str,
-) -> Result<(), &'static str> {
-    if cap_covers(cap, offset, len) {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-fn validate_base_caps(caps: &VirtioPciCaps) -> Result<(), &'static str> {
-    // PCI capability 的 length 是传输层给出的 MMIO 窗口边界；
-    // 所有寄存器访问前先验证覆盖范围，避免坏固件/坏设备把硬编码偏移变成越界 MMIO。
-    validate_cap_range(
-        &caps.common,
-        0,
-        CC_QUEUE_DEVICE + mem::size_of::<u64>(),
-        "virtio-pci: common_cfg capability too short",
-    )?;
-    validate_cap_range(
-        &caps.notify,
-        0,
-        mem::size_of::<u16>(),
-        "virtio-pci: notify_cfg capability too short",
-    )
-}
-
-// ── MMIO 原子访问助手 ─────────────────────────────────────────────────
-
-#[inline]
-fn rd_u8(addr: usize) -> u8 {
-    unsafe { read_volatile(addr as *const u8) }
-}
-#[inline]
-fn wr_u8(addr: usize, v: u8) {
-    unsafe { write_volatile(addr as *mut u8, v) }
-}
-#[inline]
-fn rd_u16(addr: usize) -> u16 {
-    unsafe { read_volatile(addr as *const u16) }
-}
-#[inline]
-fn wr_u16(addr: usize, v: u16) {
-    unsafe { write_volatile(addr as *mut u16, v) }
-}
-#[inline]
-fn rd_u32(addr: usize) -> u32 {
-    unsafe { read_volatile(addr as *const u32) }
-}
-#[inline]
-fn wr_u32(addr: usize, v: u32) {
-    unsafe { write_volatile(addr as *mut u32, v) }
-}
-#[inline]
-fn wr_u64(addr: usize, v: u64) {
-    // VirtIO 允许 64 位 BAR 也按 2×u32 写(低位先),兼容更多 IOMMU 实现。
-    wr_u32(addr, v as u32);
-    wr_u32(addr + 4, (v >> 32) as u32);
-}
-
-fn cc_status(caps: &VirtioPciCaps) -> u8 {
-    rd_u8(caps.common.vaddr + CC_DEVICE_STATUS)
-}
-fn cc_set_status(caps: &VirtioPciCaps, v: u8) {
-    wr_u8(caps.common.vaddr + CC_DEVICE_STATUS, v);
-}
-fn cc_add_status(caps: &VirtioPciCaps, bit: u8) {
-    let cur = cc_status(caps);
-    cc_set_status(caps, cur | bit);
-}
-
-fn cc_device_features(caps: &VirtioPciCaps) -> u64 {
-    wr_u32(caps.common.vaddr + CC_DEVICE_FEATURE_SELECT, 0);
-    let lo = rd_u32(caps.common.vaddr + CC_DEVICE_FEATURE) as u64;
-    wr_u32(caps.common.vaddr + CC_DEVICE_FEATURE_SELECT, 1);
-    let hi = rd_u32(caps.common.vaddr + CC_DEVICE_FEATURE) as u64;
-    (hi << 32) | lo
-}
-
-fn cc_set_driver_features(caps: &VirtioPciCaps, f: u64) {
-    wr_u32(caps.common.vaddr + CC_DRIVER_FEATURE_SELECT, 0);
-    wr_u32(caps.common.vaddr + CC_DRIVER_FEATURE, f as u32);
-    wr_u32(caps.common.vaddr + CC_DRIVER_FEATURE_SELECT, 1);
-    wr_u32(caps.common.vaddr + CC_DRIVER_FEATURE, (f >> 32) as u32);
 }
 
 // ── 初始化序列 ─────────────────────────────────────────────────────────
@@ -361,11 +131,15 @@ impl VirtioBlkPci {
     /// 在已绑定 PCI capabilities 的前提下完成 VirtIO 1.0+ probe 流程。
     pub fn probe(pci: &PciDevice) -> Result<Self, &'static str> {
         // 先打开 bus master + memory space decode —— 没这两个 BAR 根本不响应。
-        pci.enable_mmio();
-        pci.enable_bus_master();
+        pci.try_enable_mmio()
+            .map_err(|_| "virtio-pci: failed to enable MMIO decode")?;
+        pci.try_enable_bus_master()
+            .map_err(|_| "virtio-pci: failed to enable bus master")?;
 
-        let caps = parse_virtio_caps(pci).ok_or("virtio-pci: missing VIRTIO caps")?;
-        validate_base_caps(&caps)?;
+        let raw_caps = parse_virtio_pci_caps(pci).ok_or("virtio-pci: missing VIRTIO caps")?;
+        let transport =
+            VirtioPciTransport::new(raw_caps).map_err(|_| "virtio-pci: invalid VIRTIO caps")?;
+        let caps = transport.caps();
         log::printk!(
             "[virtio-pci] caps: common vaddr={:#x} notify vaddr={:#x} mult={} device={}",
             caps.common.vaddr,
@@ -375,34 +149,27 @@ impl VirtioBlkPci {
         );
 
         // 1. reset
-        cc_set_status(&caps, 0);
-        // 自旋等 reset 生效。
-        let mut spin_cnt: u32 = 0;
-        while cc_status(&caps) != 0 {
-            core::hint::spin_loop();
-            spin_cnt = spin_cnt.wrapping_add(1);
-            if spin_cnt >= 1_000_000 {
-                log::printk!(
-                    "[virtio-pci] reset stuck: status still {:#x} after spin",
-                    cc_status(&caps)
-                );
-                return Err("virtio-pci: reset timeout");
-            }
+        if !transport.reset_wait(VIRTIO_PCI_RESET_SPIN_LIMIT) {
+            log::printk!(
+                "[virtio-pci] reset stuck: status still {:#x} after spin",
+                transport.status()
+            );
+            return Err("virtio-pci: reset timeout");
         }
 
         // 2. ACKNOWLEDGE + DRIVER
-        cc_add_status(&caps, STATUS_ACKNOWLEDGE);
-        cc_add_status(&caps, STATUS_DRIVER);
+        transport.add_status(VIRTIO_STATUS_ACKNOWLEDGE);
+        transport.add_status(VIRTIO_STATUS_DRIVER);
 
         // 3. 协商 feature
-        let device_features = cc_device_features(&caps);
+        let device_features = transport.device_features();
         log::printk!(
             "[virtio-pci] device_features={:#x} (status={:#x})",
             device_features,
-            cc_status(&caps)
+            transport.status()
         );
         if device_features & VIRTIO_F_VERSION_1 == 0 {
-            cc_set_status(&caps, STATUS_FAILED);
+            transport.set_status(VIRTIO_STATUS_FAILED);
             return Err("virtio-pci: device lacks VERSION_1");
         }
         let mut driver_features = VIRTIO_F_VERSION_1;
@@ -415,10 +182,10 @@ impl VirtioBlkPci {
         if device_features & VIRTIO_BLK_F_RO != 0 {
             driver_features |= VIRTIO_BLK_F_RO;
         }
-        cc_set_driver_features(&caps, driver_features);
-        cc_add_status(&caps, STATUS_FEATURES_OK);
-        if cc_status(&caps) & STATUS_FEATURES_OK == 0 {
-            cc_set_status(&caps, STATUS_FAILED);
+        transport.set_driver_features(driver_features);
+        transport.add_status(VIRTIO_STATUS_FEATURES_OK);
+        if transport.status() & VIRTIO_STATUS_FEATURES_OK == 0 {
+            transport.set_status(VIRTIO_STATUS_FAILED);
             return Err("virtio-pci: FEATURES_OK rejected");
         }
 
@@ -426,24 +193,18 @@ impl VirtioBlkPci {
         let device_cap = caps
             .device
             .ok_or("virtio-pci: missing device_cfg capability")?;
-        validate_cap_range(
-            &device_cap,
-            BLK_CFG_CAPACITY,
-            mem::size_of::<u64>(),
-            "virtio-pci: device_cfg capacity out of range",
-        )?;
+        if !device_cap.covers(BLK_CFG_CAPACITY, mem::size_of::<u64>()) {
+            return Err("virtio-pci: device_cfg capacity out of range");
+        }
         let capacity = unsafe {
             let lo = read_volatile((device_cap.vaddr + BLK_CFG_CAPACITY) as *const u32) as u64;
             let hi = read_volatile((device_cap.vaddr + BLK_CFG_CAPACITY + 4) as *const u32) as u64;
             (hi << 32) | lo
         };
         let block_size = if driver_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
-            validate_cap_range(
-                &device_cap,
-                BLK_CFG_BLK_SIZE,
-                mem::size_of::<u32>(),
-                "virtio-pci: device_cfg block size out of range",
-            )?;
+            if !device_cap.covers(BLK_CFG_BLK_SIZE, mem::size_of::<u32>()) {
+                return Err("virtio-pci: device_cfg block size out of range");
+            }
             unsafe { read_volatile((device_cap.vaddr + BLK_CFG_BLK_SIZE) as *const u32) }
         } else {
             VIRTIO_BLK_SECTOR_SIZE
@@ -452,64 +213,44 @@ impl VirtioBlkPci {
             || !block_size.is_power_of_two()
             || !block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)
         {
-            cc_set_status(&caps, STATUS_FAILED);
+            transport.set_status(VIRTIO_STATUS_FAILED);
             return Err("virtio-pci: invalid block size");
         }
 
         // 5. 设置队列 0
-        wr_u16(caps.common.vaddr + CC_QUEUE_SELECT, 0);
-        let max_qsz = rd_u16(caps.common.vaddr + CC_QUEUE_SIZE);
+        transport.select_queue(0);
+        let max_qsz = transport.selected_queue_size();
         if max_qsz == 0 {
-            cc_set_status(&caps, STATUS_FAILED);
+            transport.set_status(VIRTIO_STATUS_FAILED);
             return Err("virtio-pci: queue 0 size is zero");
         }
         let qsz =
             choose_split_queue_size(max_qsz, None).map_err(|_| "virtio-pci: invalid queue size")?;
         if qsz < VIRTIO_BLK_MIN_QUEUE_SIZE {
-            cc_set_status(&caps, STATUS_FAILED);
+            transport.set_status(VIRTIO_STATUS_FAILED);
             return Err("virtio-pci: queue 0 too small");
         }
-        wr_u16(caps.common.vaddr + CC_QUEUE_SIZE, qsz);
+        transport.set_selected_queue_size(qsz);
 
         let split_queue =
             SplitVirtQueue::new(qsz).map_err(|_| "virtio-pci: queue allocation failed")?;
 
-        // 写 queue_desc/driver/device 物理地址
-        wr_u64(
-            caps.common.vaddr + CC_QUEUE_DESC,
-            split_queue.desc_paddr() as u64,
-        );
-        wr_u64(
-            caps.common.vaddr + CC_QUEUE_DRIVER,
-            split_queue.avail_paddr() as u64,
-        );
-        wr_u64(
-            caps.common.vaddr + CC_QUEUE_DEVICE,
-            split_queue.used_paddr() as u64,
+        // 写入设备可见的 queue_desc/driver/device DMA 地址。
+        transport.set_selected_queue_addresses(
+            split_queue.desc_dma_addr() as u64,
+            split_queue.avail_dma_addr() as u64,
+            split_queue.used_dma_addr() as u64,
         );
 
-        // notify offset
-        let notify_off = rd_u16(caps.common.vaddr + CC_QUEUE_NOTIFY_OFF) as usize;
-        let notify_offset = notify_off
-            .checked_mul(caps.notify.notify_off_multiplier as usize)
-            .ok_or("virtio-pci: notify offset overflow")?;
-        validate_cap_range(
-            &caps.notify,
-            notify_offset,
-            mem::size_of::<u16>(),
-            "virtio-pci: notify offset out of range",
-        )?;
-        let notify_addr = caps
-            .notify
-            .vaddr
-            .checked_add(notify_offset)
-            .ok_or("virtio-pci: notify address overflow")?;
+        let notify_addr = transport
+            .selected_queue_notify_addr()
+            .map_err(|_| "virtio-pci: notify address invalid")?;
 
         // 启用队列
-        wr_u16(caps.common.vaddr + CC_QUEUE_ENABLE, 1);
+        transport.enable_selected_queue();
 
         // 6. DRIVER_OK
-        cc_add_status(&caps, STATUS_DRIVER_OK);
+        transport.add_status(VIRTIO_STATUS_DRIVER_OK);
 
         let read_only = driver_features & VIRTIO_BLK_F_RO != 0;
         let has_flush = driver_features & VIRTIO_BLK_F_FLUSH != 0;
@@ -520,7 +261,7 @@ impl VirtioBlkPci {
         };
 
         let inner = Arc::new(VirtioBlkInner {
-            caps,
+            transport,
             notify_addr,
             capacity,
             block_size,
@@ -545,10 +286,9 @@ impl VirtioBlkPci {
         reason: &'static str,
     ) -> VecDeque<PendingVirtioPciRequest> {
         log::printk!("[virtio-pci-blk] queue failed: {}", reason);
-        cc_set_status(
-            &self.inner.caps,
-            cc_status(&self.inner.caps) | STATUS_FAILED,
-        );
+        self.inner
+            .transport
+            .set_status(self.inner.transport.status() | VIRTIO_STATUS_FAILED);
 
         let mut failed = VecDeque::new();
         mem::swap(&mut failed, &mut queue.pending);
@@ -628,12 +368,17 @@ impl VirtioBlkPci {
         }
     }
 
-    fn handle_interrupt(&self) {
+    fn handle_interrupt(&self) -> bool {
+        let isr_status = self.inner.transport.isr_status();
+        if isr_status == 0 {
+            return false;
+        }
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
         self.poll();
+        true
     }
 
-    pub fn into_block_dev(self, name: &str) -> Result<Arc<BlockDevice>, &'static str> {
+    pub fn into_block_dev(self, name: &str) -> Result<(Arc<BlockDevice>, Arc<Self>), &'static str> {
         let capacity = self.inner.capacity;
         let block_size = self.inner.block_size;
         let sector_scale = u64::from(block_size / VIRTIO_BLK_SECTOR_SIZE);
@@ -657,8 +402,9 @@ impl VirtioBlkPci {
         if self.inner.read_only {
             features |= BlockFeatures::READ_ONLY;
         }
+        let driver = Arc::new(self);
         let io = Arc::new(VirtioBlkPciIo {
-            driver: Arc::new(self),
+            driver: Arc::clone(&driver),
         });
         let init = BlockDeviceInit {
             name,
@@ -669,7 +415,21 @@ impl VirtioBlkPci {
             attributes,
             features,
         };
-        Ok(Arc::new(BlockDevice::new(init, io, None)))
+        Ok((Arc::new(BlockDevice::new(init, io, None)), driver))
+    }
+}
+
+struct VirtioBlkPciIrqHandler {
+    driver: Arc<VirtioBlkPci>,
+}
+
+impl IrqHandler for VirtioBlkPciIrqHandler {
+    fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
+        if self.driver.handle_interrupt() {
+            IrqStatus::Handled
+        } else {
+            IrqStatus::Unhandled
+        }
     }
 }
 
@@ -681,8 +441,10 @@ struct VirtioBlkPciIo {
 
 impl VirtioBlkPciIo {
     fn notify_queue(&self) {
-        // Notify register is a u16 write at calculated address.
-        wr_u16(self.driver.inner.notify_addr, 0);
+        self.driver
+            .inner
+            .transport
+            .notify_queue(self.driver.inner.notify_addr, 0);
     }
 }
 
@@ -777,8 +539,8 @@ impl BlockDriver for VirtioBlkPciIo {
             }
         };
 
-        let header_phys = meta_dma.paddr() as u64;
-        let status_phys = meta_dma.paddr() as u64 + mem::size_of::<VirtioBlkReqHeader>() as u64;
+        let header_dma = meta_dma.dma_addr() as u64;
+        let status_dma = meta_dma.dma_addr() as u64 + mem::size_of::<VirtioBlkReqHeader>() as u64;
         let head_idx = chain.head();
 
         match bio.op {
@@ -802,7 +564,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .queue
                     .write_desc(
                         d0,
-                        header_phys,
+                        header_dma,
                         mem::size_of::<VirtioBlkReqHeader>() as u32,
                         0,
                         Some(d1),
@@ -810,7 +572,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .and_then(|_| {
                         queue.queue.write_desc(
                             d1,
-                            data_dma.paddr() as u64,
+                            data_dma.dma_addr() as u64,
                             data_len_u32,
                             VIRTQ_DESC_F_WRITE,
                             Some(d2),
@@ -819,7 +581,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .and_then(|_| {
                         queue
                             .queue
-                            .write_desc(d2, status_phys, 1, VIRTQ_DESC_F_WRITE, None)
+                            .write_desc(d2, status_dma, 1, VIRTQ_DESC_F_WRITE, None)
                     })
                     .is_err()
                 {
@@ -847,7 +609,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .queue
                     .write_desc(
                         d0,
-                        header_phys,
+                        header_dma,
                         mem::size_of::<VirtioBlkReqHeader>() as u32,
                         0,
                         Some(d1),
@@ -855,7 +617,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .and_then(|_| {
                         queue.queue.write_desc(
                             d1,
-                            data_dma.paddr() as u64,
+                            data_dma.dma_addr() as u64,
                             data_len_u32,
                             0,
                             Some(d2),
@@ -864,7 +626,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .and_then(|_| {
                         queue
                             .queue
-                            .write_desc(d2, status_phys, 1, VIRTQ_DESC_F_WRITE, None)
+                            .write_desc(d2, status_dma, 1, VIRTQ_DESC_F_WRITE, None)
                     })
                     .is_err()
                 {
@@ -884,7 +646,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .queue
                     .write_desc(
                         d0,
-                        header_phys,
+                        header_dma,
                         mem::size_of::<VirtioBlkReqHeader>() as u32,
                         0,
                         Some(d1),
@@ -892,7 +654,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     .and_then(|_| {
                         queue
                             .queue
-                            .write_desc(d1, status_phys, 1, VIRTQ_DESC_F_WRITE, None)
+                            .write_desc(d1, status_dma, 1, VIRTQ_DESC_F_WRITE, None)
                     })
                     .is_err()
                 {
@@ -906,7 +668,7 @@ impl BlockDriver for VirtioBlkPciIo {
             }
         }
 
-        // submit to available ring
+        // 提交到 available ring，交给设备消费。
         if queue.queue.push_avail(head_idx).is_err() {
             let _ = queue.queue.free_chain(chain);
             return Err((SubmitError::QueueFull, bio));
@@ -936,15 +698,48 @@ impl BlockDriver for VirtioBlkPciIo {
 
 /// VirtIO over PCI(modern)block 设备驱动。
 ///
-/// 匹配 Red Hat vendor `0x1af4`:
-/// - `0x1001`: legacy/transitional virtio-blk(仍可用 modern cap)
-/// - `0x1042`: modern non-transitional virtio-blk
+/// 匹配 VirtIO PCI block function；具体 vendor/device id 由 VirtIO 公共层维护。
 pub struct VirtioPciBlkDriver {}
+
+struct VirtioPciBlkBinding {
+    irq_handle: Option<IrqHandle>,
+}
 
 impl VirtioPciBlkDriver {
     /// 创建 VirtIO-PCI block PnP 驱动。
     pub const fn new() -> Self {
         Self {}
+    }
+}
+
+fn map_irq_error(err: IrqError) -> &'static str {
+    match err {
+        IrqError::OutOfMemory => "out of memory",
+        IrqError::NotFound => "not found",
+        IrqError::AlreadyRegistered => "already registered",
+    }
+}
+
+fn register_virtio_pci_irq(pci: &PciDevice, driver: Arc<VirtioBlkPci>) -> Option<IrqHandle> {
+    let Some(line) = pci.routed_irq_line() else {
+        pci.disable_interrupts();
+        return None;
+    };
+    let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkPciIrqHandler { driver });
+    match irq::register_irq_handler(line, handler) {
+        Ok(handle) => {
+            pci.enable_interrupts();
+            Some(handle)
+        }
+        Err(err) => {
+            log::printk!(
+                "[virtio-pci] failed to register irq {:?}: {}",
+                line,
+                map_irq_error(err)
+            );
+            pci.disable_interrupts();
+            None
+        }
     }
 }
 
@@ -964,7 +759,7 @@ impl PnpDriver for VirtioPciBlkDriver {
         let Some(pci_info) = info.as_any().downcast_ref::<PciInfo>() else {
             return false;
         };
-        pci_info.vendor == 0x1af4 && (pci_info.device_id == 0x1001 || pci_info.device_id == 0x1042)
+        VIRTIO_PCI_FUNCTION_BLOCK.matches_pci_ids(pci_info.vendor, pci_info.device_id)
     }
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
@@ -975,22 +770,36 @@ impl PnpDriver for VirtioPciBlkDriver {
             PnpError::ProbeFailed
         })?;
 
-        let dev_name = alloc_virtio_blk_dev_name();
-        let block_dev = driver
+        let dev_name = alloc_virtio_blk_dev_name(&dev.name)?;
+        let (block_dev, driver) = driver
             .into_block_dev(&dev_name)
             .map_err(|_| PnpError::ProbeFailed)?;
+        let irq_handle = register_virtio_pci_irq(&pci, Arc::clone(&driver));
 
-        dev.register_function(Arc::new(BlockFunction::with_devnode(
-            &dev.name, &dev_name, block_dev,
-        )))?;
+        let func = Arc::new(BlockFunction::with_devnode(&dev.name, &dev_name, block_dev));
+        if let Err(err) = dev.register_function(func) {
+            if let Some(handle) = irq_handle {
+                let _ = irq::unregister_irq_handler(handle);
+            }
+            pci.disable_interrupts();
+            return Err(err);
+        }
+        dev.set_driver_data(Arc::new(VirtioPciBlkBinding { irq_handle }));
         log::printk!("[virtio-pci] bound {} → /dev/{}", dev.id, dev_name);
         Ok(())
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
-        // VirtioBlkPci 的 Drop 会 reset device;PnpDevice::remove_device 在
-        // 清理 functions 后会调用驱动的 remove,然后释放 driver_data;这里
-        // 不持有 driver_data,只做日志。
+        if let Some(data) = dev.take_driver_data()
+            && let Ok(binding) = Arc::downcast::<VirtioPciBlkBinding>(data)
+        {
+            if let Some(handle) = binding.irq_handle {
+                let _ = irq::unregister_irq_handler(handle);
+            }
+        }
+        // VirtioBlkPci 的 Drop 会 reset device；PnpDevice::remove_device 在
+        // function drain 之后调用本 remove，因此这里先撤销 IRQ 入口，再让
+        // 设备对象按引用计数自然释放。
         log::printk!("[virtio-pci] remove {}", dev.id);
     }
 }

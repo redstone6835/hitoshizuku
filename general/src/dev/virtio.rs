@@ -1,8 +1,8 @@
-//! Common VirtIO split virtqueue support.
+//! VirtIO 公共传输与 split virtqueue 支持。
 //!
-//! This module owns only the split virtqueue memory and descriptor bookkeeping.
-//! Transports still select queue numbers, program device registers, and notify
-//! devices after [`SplitVirtQueue::push_avail`].
+//! 本模块只放 VirtIO 协议本身的公共概念：PCI 传输层设备匹配、capability 类型、
+//! device status 位，以及 split virtqueue 的 DMA 布局和描述符记账。具体驱动仍负责
+//! 选择队列编号、编程设备寄存器，并在 [`SplitVirtQueue::push_avail`] 后通知设备。
 
 use alloc::vec::Vec;
 use core::mem;
@@ -10,6 +10,7 @@ use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
 use crate::dev::dma::{DmaBuffer, DmaDirection};
+use crate::dev::pci::{PciBarType, PciDevice};
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -17,6 +18,417 @@ pub const VIRTQ_DESC_F_INDIRECT: u16 = 4;
 
 pub const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1;
 pub const VIRTQ_USED_F_NO_NOTIFY: u16 = 1;
+
+/// VirtIO over PCI 的 vendor id。
+pub const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
+
+/// 现代 VirtIO PCI capability 使用 PCI vendor-specific capability 承载。
+pub const VIRTIO_PCI_CAP_VENDOR_SPECIFIC: u8 = 0x09;
+pub const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+pub const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+/// VirtIO PCI capability 基础头长度；notify capability 额外包含 multiplier。
+pub const VIRTIO_PCI_CAP_BASE_LEN: u8 = 16;
+pub const VIRTIO_PCI_CAP_NOTIFY_LEN: u8 = 20;
+pub const VIRTIO_PCI_CAP_LEN_OFFSET: u16 = 2;
+pub const VIRTIO_PCI_CAP_CFG_TYPE_OFFSET: u16 = 3;
+pub const VIRTIO_PCI_CAP_BAR_OFFSET: u16 = 4;
+pub const VIRTIO_PCI_CAP_MMIO_OFFSET: u16 = 8;
+pub const VIRTIO_PCI_CAP_MMIO_LENGTH_OFFSET: u16 = 12;
+pub const VIRTIO_PCI_CAP_NOTIFY_MULT_OFFSET: u16 = 16;
+pub const VIRTIO_PCI_CAP_BAR_INDEX_MASK: u8 = 0x7;
+
+/// VirtIO common_cfg 中的 device status 位。
+pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;
+pub const VIRTIO_STATUS_DRIVER: u8 = 2;
+pub const VIRTIO_STATUS_DRIVER_OK: u8 = 4;
+pub const VIRTIO_STATUS_FEATURES_OK: u8 = 8;
+pub const VIRTIO_STATUS_FAILED: u8 = 128;
+
+/// 所有 modern VirtIO 设备都必须支持的基础 feature。
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+/// reset 后等待 status 清零的默认自旋上限。
+pub const VIRTIO_PCI_RESET_SPIN_LIMIT: u32 = 1_000_000;
+
+// ── common_cfg 寄存器布局 ──────────────────────────────────────────────
+
+const VIRTIO_CC_DEVICE_FEATURE_SELECT: usize = 0x00;
+const VIRTIO_CC_DEVICE_FEATURE: usize = 0x04;
+const VIRTIO_CC_DRIVER_FEATURE_SELECT: usize = 0x08;
+const VIRTIO_CC_DRIVER_FEATURE: usize = 0x0c;
+const VIRTIO_CC_DEVICE_STATUS: usize = 0x14;
+const VIRTIO_CC_QUEUE_SELECT: usize = 0x16;
+const VIRTIO_CC_QUEUE_SIZE: usize = 0x18;
+const VIRTIO_CC_QUEUE_ENABLE: usize = 0x1c;
+const VIRTIO_CC_QUEUE_NOTIFY_OFF: usize = 0x1e;
+const VIRTIO_CC_QUEUE_DESC: usize = 0x20;
+const VIRTIO_CC_QUEUE_DRIVER: usize = 0x28;
+const VIRTIO_CC_QUEUE_DEVICE: usize = 0x30;
+
+/// VirtIO PCI function 描述。
+///
+/// 这里描述的是 VirtIO over PCI 传输层的设备 ID 投影，不是 `/dev` 节点、
+/// 主次设备号或其它 POSIX 兼容层概念。驱动持有一个描述对象来表达“我要绑定
+/// 哪类 VirtIO function”，避免各驱动重复散落 vendor/device id 判断。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioPciFunction {
+    /// 调试和日志用的稳定名称。
+    pub name: &'static str,
+    /// transitional 设备使用的旧 ID。
+    pub legacy_transitional_device_id: u16,
+    /// non-transitional modern 设备使用的新 ID。
+    pub modern_device_id: u16,
+}
+
+impl VirtioPciFunction {
+    /// 创建一个 VirtIO PCI function 描述。
+    pub const fn new(
+        name: &'static str,
+        legacy_transitional_device_id: u16,
+        modern_device_id: u16,
+    ) -> Self {
+        Self {
+            name,
+            legacy_transitional_device_id,
+            modern_device_id,
+        }
+    }
+
+    /// 判断 PCI vendor/device id 是否属于该 VirtIO 设备类型。
+    pub const fn matches_pci_ids(self, vendor: u16, device_id: u16) -> bool {
+        vendor == VIRTIO_PCI_VENDOR_ID
+            && (device_id == self.legacy_transitional_device_id
+                || device_id == self.modern_device_id)
+    }
+}
+
+/// VirtIO PCI network function。
+pub const VIRTIO_PCI_FUNCTION_NETWORK: VirtioPciFunction =
+    VirtioPciFunction::new("network", 0x1000, 0x1041);
+/// VirtIO PCI block function。
+pub const VIRTIO_PCI_FUNCTION_BLOCK: VirtioPciFunction =
+    VirtioPciFunction::new("block", 0x1001, 0x1042);
+
+/// 当前公共层认识的 VirtIO PCI function 描述表。
+///
+/// 表本身只表达协议级 ID 映射；具体是否有驱动绑定由 PnP driver catalog 决定。
+pub const VIRTIO_PCI_FUNCTIONS: &[VirtioPciFunction] =
+    &[VIRTIO_PCI_FUNCTION_NETWORK, VIRTIO_PCI_FUNCTION_BLOCK];
+
+/// VirtIO PCI capability 对应的一段 BAR 内 MMIO 窗口。
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioPciCap {
+    /// 虚拟地址基址：BAR 映射基址加 capability offset。
+    pub vaddr: usize,
+    /// capability 声明的可访问字节长度。
+    pub length: u32,
+    /// notify capability 专用的队列通知偏移倍率；其它 capability 固定为 0。
+    pub notify_off_multiplier: u32,
+}
+
+impl VirtioPciCap {
+    /// 判断 `[offset, offset + len)` 是否完全落在该 capability 窗口内。
+    pub fn covers(self, offset: usize, len: usize) -> bool {
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.length as usize)
+    }
+
+    /// 计算窗口内偏移对应的虚拟地址，同时校验访问范围不会越过 capability 边界。
+    pub fn checked_addr(self, offset: usize, len: usize) -> Option<usize> {
+        if !self.covers(offset, len) {
+            return None;
+        }
+        self.vaddr.checked_add(offset)
+    }
+}
+
+/// 已解析的 VirtIO PCI capability 集合。
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioPciCaps {
+    pub common: VirtioPciCap,
+    pub notify: VirtioPciCap,
+    pub isr: VirtioPciCap,
+    pub device: Option<VirtioPciCap>,
+}
+
+/// 从 PCI capability chain 中解析 modern VirtIO 传输窗口。
+///
+/// 本函数只处理 VirtIO PCI 传输层通用规则：必须是 vendor-specific
+/// capability、长度满足基础结构要求、BAR 必须是 MMIO、offset/length 不能越过
+/// BAR 边界。各设备类型的寄存器访问范围仍由具体驱动按自己的 common/device
+/// config 使用方式继续校验。
+pub fn parse_virtio_pci_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
+    let mut common: Option<VirtioPciCap> = None;
+    let mut notify: Option<VirtioPciCap> = None;
+    let mut isr: Option<VirtioPciCap> = None;
+    let mut device: Option<VirtioPciCap> = None;
+
+    for cap_header in pci
+        .capabilities()
+        .filter(|cap| cap.id == VIRTIO_PCI_CAP_VENDOR_SPECIFIC)
+    {
+        let ptr = cap_header.offset;
+        let cap_len = match pci.try_read_config_u8(ptr + VIRTIO_PCI_CAP_LEN_OFFSET) {
+            Ok(cap_len) => cap_len,
+            Err(_) => continue,
+        };
+        let cfg_type = match pci.try_read_config_u8(ptr + VIRTIO_PCI_CAP_CFG_TYPE_OFFSET) {
+            Ok(cfg_type) => cfg_type,
+            Err(_) => continue,
+        };
+        let min_len = if cfg_type == VIRTIO_PCI_CAP_NOTIFY_CFG {
+            VIRTIO_PCI_CAP_NOTIFY_LEN
+        } else {
+            VIRTIO_PCI_CAP_BASE_LEN
+        };
+        if cap_len < min_len {
+            continue;
+        }
+
+        let bar_idx = match pci.try_read_config_u8(ptr + VIRTIO_PCI_CAP_BAR_OFFSET) {
+            Ok(raw) => raw & VIRTIO_PCI_CAP_BAR_INDEX_MASK,
+            Err(_) => continue,
+        };
+        let offset = match pci.try_read_config_u32(ptr + VIRTIO_PCI_CAP_MMIO_OFFSET) {
+            Ok(offset) => offset,
+            Err(_) => continue,
+        };
+        let length = match pci.try_read_config_u32(ptr + VIRTIO_PCI_CAP_MMIO_LENGTH_OFFSET) {
+            Ok(length) => length,
+            Err(_) => continue,
+        };
+        if length == 0 {
+            continue;
+        }
+
+        let Some((bar, bar_vaddr)) = pci.map_bar_virt(bar_idx as usize) else {
+            continue;
+        };
+        if !matches!(bar.bar_type, PciBarType::Memory) {
+            continue;
+        }
+        let Some(end) = (offset as u64).checked_add(length as u64) else {
+            continue;
+        };
+        if end > bar.size {
+            continue;
+        }
+        let Some(vaddr) = bar_vaddr.checked_add(offset as usize) else {
+            continue;
+        };
+
+        let cap = VirtioPciCap {
+            vaddr,
+            length,
+            notify_off_multiplier: 0,
+        };
+        match cfg_type {
+            VIRTIO_PCI_CAP_COMMON_CFG => common = Some(cap),
+            VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                let notify_off_multiplier =
+                    match pci.try_read_config_u32(ptr + VIRTIO_PCI_CAP_NOTIFY_MULT_OFFSET) {
+                        Ok(multiplier) => multiplier,
+                        Err(_) => continue,
+                    };
+                notify = Some(VirtioPciCap {
+                    notify_off_multiplier,
+                    ..cap
+                });
+            }
+            VIRTIO_PCI_CAP_ISR_CFG => isr = Some(cap),
+            VIRTIO_PCI_CAP_DEVICE_CFG => device = Some(cap),
+            _ => {}
+        }
+    }
+
+    Some(VirtioPciCaps {
+        common: common?,
+        notify: notify?,
+        isr: isr?,
+        device,
+    })
+}
+
+/// VirtIO PCI common_cfg 访问错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtioPciTransportError {
+    CommonTooShort,
+    NotifyTooShort,
+    IsrTooShort,
+    NotifyOffsetOverflow,
+    NotifyOutOfRange,
+    NotifyAddressOverflow,
+}
+
+/// 已校验的 VirtIO PCI transport 访问器。
+///
+/// 该类型只封装 transport 层标准寄存器访问；设备类型相关的 config 布局、
+/// feature 选择和队列中描述符语义仍由具体驱动负责。
+#[derive(Clone, Copy, Debug)]
+pub struct VirtioPciTransport {
+    caps: VirtioPciCaps,
+}
+
+impl VirtioPciTransport {
+    /// 创建 transport 访问器，并验证基础 common/notify/isr 窗口覆盖标准寄存器。
+    pub fn new(caps: VirtioPciCaps) -> Result<Self, VirtioPciTransportError> {
+        if !caps
+            .common
+            .covers(0, VIRTIO_CC_QUEUE_DEVICE + mem::size_of::<u64>())
+        {
+            return Err(VirtioPciTransportError::CommonTooShort);
+        }
+        if !caps.notify.covers(0, mem::size_of::<u16>()) {
+            return Err(VirtioPciTransportError::NotifyTooShort);
+        }
+        if !caps.isr.covers(0, mem::size_of::<u8>()) {
+            return Err(VirtioPciTransportError::IsrTooShort);
+        }
+        Ok(Self { caps })
+    }
+
+    pub const fn caps(&self) -> VirtioPciCaps {
+        self.caps
+    }
+
+    pub fn status(&self) -> u8 {
+        rd_u8(self.caps.common.vaddr + VIRTIO_CC_DEVICE_STATUS)
+    }
+
+    pub fn set_status(&self, value: u8) {
+        wr_u8(self.caps.common.vaddr + VIRTIO_CC_DEVICE_STATUS, value);
+    }
+
+    pub fn add_status(&self, bit: u8) {
+        self.set_status(self.status() | bit);
+    }
+
+    /// 写 0 reset，并在给定自旋次数内等待设备清零 status。
+    pub fn reset_wait(&self, spin_limit: u32) -> bool {
+        self.set_status(0);
+        for _ in 0..spin_limit {
+            if self.status() == 0 {
+                return true;
+            }
+            core::hint::spin_loop();
+        }
+        self.status() == 0
+    }
+
+    pub fn device_features(&self) -> u64 {
+        wr_u32(self.caps.common.vaddr + VIRTIO_CC_DEVICE_FEATURE_SELECT, 0);
+        let lo = rd_u32(self.caps.common.vaddr + VIRTIO_CC_DEVICE_FEATURE) as u64;
+        wr_u32(self.caps.common.vaddr + VIRTIO_CC_DEVICE_FEATURE_SELECT, 1);
+        let hi = rd_u32(self.caps.common.vaddr + VIRTIO_CC_DEVICE_FEATURE) as u64;
+        (hi << 32) | lo
+    }
+
+    pub fn set_driver_features(&self, features: u64) {
+        wr_u32(self.caps.common.vaddr + VIRTIO_CC_DRIVER_FEATURE_SELECT, 0);
+        wr_u32(
+            self.caps.common.vaddr + VIRTIO_CC_DRIVER_FEATURE,
+            features as u32,
+        );
+        wr_u32(self.caps.common.vaddr + VIRTIO_CC_DRIVER_FEATURE_SELECT, 1);
+        wr_u32(
+            self.caps.common.vaddr + VIRTIO_CC_DRIVER_FEATURE,
+            (features >> 32) as u32,
+        );
+    }
+
+    pub fn select_queue(&self, queue_idx: u16) {
+        wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_SELECT, queue_idx);
+    }
+
+    pub fn selected_queue_size(&self) -> u16 {
+        rd_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_SIZE)
+    }
+
+    pub fn set_selected_queue_size(&self, queue_size: u16) {
+        wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_SIZE, queue_size);
+    }
+
+    pub fn set_selected_queue_addresses(&self, desc: u64, driver: u64, device: u64) {
+        wr_u64(self.caps.common.vaddr + VIRTIO_CC_QUEUE_DESC, desc);
+        wr_u64(self.caps.common.vaddr + VIRTIO_CC_QUEUE_DRIVER, driver);
+        wr_u64(self.caps.common.vaddr + VIRTIO_CC_QUEUE_DEVICE, device);
+    }
+
+    pub fn selected_queue_notify_addr(&self) -> Result<usize, VirtioPciTransportError> {
+        let notify_off = rd_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_NOTIFY_OFF) as usize;
+        let notify_offset = notify_off
+            .checked_mul(self.caps.notify.notify_off_multiplier as usize)
+            .ok_or(VirtioPciTransportError::NotifyOffsetOverflow)?;
+        self.caps
+            .notify
+            .checked_addr(notify_offset, mem::size_of::<u16>())
+            .ok_or_else(|| {
+                if self
+                    .caps
+                    .notify
+                    .covers(notify_offset, mem::size_of::<u16>())
+                {
+                    VirtioPciTransportError::NotifyAddressOverflow
+                } else {
+                    VirtioPciTransportError::NotifyOutOfRange
+                }
+            })
+    }
+
+    pub fn enable_selected_queue(&self) {
+        wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_ENABLE, 1);
+    }
+
+    pub fn notify_queue(&self, notify_addr: usize, queue_idx: u16) {
+        wr_u16(notify_addr, queue_idx);
+    }
+
+    /// 读取 ISR capability。对 VirtIO PCI 来说该读操作同时完成设备侧 ack。
+    pub fn isr_status(&self) -> u8 {
+        rd_u8(self.caps.isr.vaddr)
+    }
+}
+
+#[inline]
+fn rd_u8(addr: usize) -> u8 {
+    unsafe { read_volatile(addr as *const u8) }
+}
+
+#[inline]
+fn wr_u8(addr: usize, value: u8) {
+    unsafe { write_volatile(addr as *mut u8, value) }
+}
+
+#[inline]
+fn rd_u16(addr: usize) -> u16 {
+    unsafe { read_volatile(addr as *const u16) }
+}
+
+#[inline]
+fn wr_u16(addr: usize, value: u16) {
+    unsafe { write_volatile(addr as *mut u16, value) }
+}
+
+#[inline]
+fn rd_u32(addr: usize) -> u32 {
+    unsafe { read_volatile(addr as *const u32) }
+}
+
+#[inline]
+fn wr_u32(addr: usize, value: u32) {
+    unsafe { write_volatile(addr as *mut u32, value) }
+}
+
+#[inline]
+fn wr_u64(addr: usize, value: u64) {
+    // common_cfg 中的 64 位队列地址按低 32 位、高 32 位顺序写入，避免依赖平台
+    // 对 MMIO u64 原子写的支持。
+    wr_u32(addr, value as u32);
+    wr_u32(addr + 4, (value >> 32) as u32);
+}
 
 const DESC_ALIGN: usize = 16;
 const AVAIL_ALIGN: usize = 2;
@@ -176,16 +588,16 @@ impl SplitVirtQueue {
         self.queue_size
     }
 
-    pub const fn desc_paddr(&self) -> usize {
-        self.desc.paddr()
+    pub const fn desc_dma_addr(&self) -> usize {
+        self.desc.dma_addr()
     }
 
-    pub const fn avail_paddr(&self) -> usize {
-        self.avail.paddr()
+    pub const fn avail_dma_addr(&self) -> usize {
+        self.avail.dma_addr()
     }
 
-    pub const fn used_paddr(&self) -> usize {
-        self.used.paddr()
+    pub const fn used_dma_addr(&self) -> usize {
+        self.used.dma_addr()
     }
 
     pub fn desc_len(&self) -> usize {

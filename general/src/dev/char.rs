@@ -59,6 +59,23 @@ pub trait CharDriver: Send + Sync {
         false
     }
 
+    /// 登记一个等待底层字符设备就绪的任务。
+    ///
+    /// 设备层只接收“读/写方向”这类通用 I/O 意图，不感知 `poll(2)` 的
+    /// POSIX 位图。没有中断或内部等待队列的驱动保持默认返回 `false`，
+    /// 上层会退化为定期重查 readiness。
+    fn poll_add_waiter(
+        &self,
+        _task: &Arc<sched::Task>,
+        _want_read: bool,
+        _want_write: bool,
+    ) -> bool {
+        false
+    }
+
+    /// 移除此前通过 [`CharDriver::poll_add_waiter`] 登记的等待者。
+    fn poll_remove_waiter(&self, _task: &Arc<sched::Task>) {}
+
     /// 阻塞等待设备内部写缓冲全部排空。
     ///
     /// 默认实现为空操作（无内部缓冲的设备）。
@@ -74,14 +91,12 @@ pub trait CharDriver: Send + Sync {
 
     /// 执行字符设备类 typed control。
     ///
-    /// 默认只把通用 flush 请求接到底层 [`flush`](Self::flush)，其它请求返回
-    /// `Unsupported`。具体驱动可覆盖此方法，把设备类请求转换为自己的
-    /// [`DriverControl`] typed request。
+    /// 默认只把通用 drain 请求接到底层 [`flush`](Self::flush)，其它请求返回
+    /// `Unsupported`。丢弃输入/输出队列需要驱动明确知道自己的缓冲结构，
+    /// 不能由类层假定完成。
     fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
         match req {
-            CharControlRequest::FlushTx | CharControlRequest::FlushBoth => {
-                // TODO(char-control): `flush()` 只保证驱动已有的 flush 语义，
-                // 不能代表所有字符设备都支持清空 RX 队列。
+            CharControlRequest::DrainTx => {
                 self.flush().map_err(map_char_control_error)?;
                 Ok(CharControlResponse::Done)
             }
@@ -95,7 +110,7 @@ pub trait CharDriver: Send + Sync {
     /// 少数调试或内部恢复具体驱动类型的逃生口。
     ///
     /// ```rust,ignore
-    /// let _ = dev.control(CharControlRequest::FlushTx)?;
+    /// let _ = dev.control(CharControlRequest::DrainTx)?;
     /// ```
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
@@ -146,6 +161,14 @@ impl<T: CharDriver + ?Sized> CharDriver for &'static T {
 
     fn poll_read(&self) -> bool {
         (**self).poll_read()
+    }
+
+    fn poll_add_waiter(&self, task: &Arc<sched::Task>, want_read: bool, want_write: bool) -> bool {
+        (**self).poll_add_waiter(task, want_read, want_write)
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        (**self).poll_remove_waiter(task)
     }
 
     fn flush(&self) -> Result<(), CharIoError> {
@@ -359,6 +382,29 @@ impl CharDevice {
     #[inline]
     pub fn poll_read(&self) -> bool {
         self.is_active() && self.inner.driver.poll_read()
+    }
+
+    /// 将任务挂到字符设备自己的 I/O 等待源上。
+    #[inline]
+    pub fn poll_add_waiter(
+        &self,
+        task: &Arc<sched::Task>,
+        want_read: bool,
+        want_write: bool,
+    ) -> bool {
+        self.is_active()
+            && self
+                .inner
+                .driver
+                .poll_add_waiter(task, want_read, want_write)
+    }
+
+    /// 从字符设备自己的 I/O 等待源移除任务。
+    #[inline]
+    pub fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        if self.is_active() {
+            self.inner.driver.poll_remove_waiter(task);
+        }
     }
 
     /// 阻塞排空（委托至驱动）。
