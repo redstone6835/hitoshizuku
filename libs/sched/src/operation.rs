@@ -323,6 +323,7 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
+    me.shared_signal().reset_handlers_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);
         // vfork 父进程到这里已经可以继续运行，但不要立刻抢占刚 exec 完成的

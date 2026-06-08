@@ -38,9 +38,9 @@ use crate::socket::{NetSocketHandle, SocketState, SocketType};
 
 const TCP_RX_BUF_SIZE: usize = 65535;
 const TCP_TX_BUF_SIZE: usize = 65535;
-const UDP_RX_BUF_SIZE: usize = 8192;
-const UDP_TX_BUF_SIZE: usize = 8192;
-const UDP_META_COUNT: usize = 16;
+const UDP_RX_BUF_SIZE: usize = 512 * 1024;
+const UDP_TX_BUF_SIZE: usize = 512 * 1024;
+const UDP_META_COUNT: usize = 512;
 /// 主动 poll 的短循环次数。
 ///
 /// smoltcp 的一次 `Interface::poll()` 顺序是先处理 ingress，再处理 egress。
@@ -473,9 +473,12 @@ impl NetStack {
         if managed.is_socket_removed(handle.inner) {
             return Err(NetError::Closed);
         }
-        let socket = managed.tcp_socket_mut(handle.inner);
         if local.port != 0 {
             let local_ep = endpoint_to_smoltcp_listen(&local);
+            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+                return Err(NetError::AddressInUse);
+            }
+            let socket = managed.tcp_socket_mut(handle.inner);
             socket
                 .listen(local_ep)
                 .map_err(|_| NetError::AddressInUse)?;
@@ -488,6 +491,10 @@ impl NetStack {
         for _ in 0..128 {
             local.port = pick_ephemeral_port();
             let local_ep = endpoint_to_smoltcp_listen(&local);
+            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+                continue;
+            }
+            let socket = managed.tcp_socket_mut(handle.inner);
             if socket.listen(local_ep).is_ok() {
                 return Ok(local);
             }
