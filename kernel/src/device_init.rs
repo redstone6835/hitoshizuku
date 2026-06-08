@@ -215,8 +215,10 @@ pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevIni
 
     drivers::register_builtin_drivers().unwrap_or_else(|err| {
         panic!(
-            "[kernel-start][{}] failed to register built-in PnP drivers: {:?}",
-            tag, err
+            "[kernel-start][{}] failed to register built-in PnP driver {}: {:?}",
+            tag,
+            err.driver(),
+            err.error()
         )
     });
     printk!("[kernel-start][{}] registered built-in PnP drivers", tag);

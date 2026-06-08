@@ -41,6 +41,52 @@ use crate::dev::block::BlockLimits;
 use crate::dev::function::{DevNodeNameAllocError, DevNodeNameAllocator};
 use crate::dev::pnp::PnpError;
 
+/// 一个编译进内核的内建设备驱动注册项。
+///
+/// catalog 只表达“启动期需要接入哪些驱动”和它们的依赖顺序；具体驱动仍通过
+/// 各自模块里的 factory 或静态节点声明接入设备子系统。这样新增驱动时只需要
+/// 增加一条表项，不需要在注册流程里继续堆叠分支。
+#[derive(Clone, Copy)]
+pub struct BuiltinDriverRegistration {
+    name: &'static str,
+    register: fn() -> Result<(), PnpError>,
+}
+
+impl BuiltinDriverRegistration {
+    pub const fn new(name: &'static str, register: fn() -> Result<(), PnpError>) -> Self {
+        Self { name, register }
+    }
+
+    /// 返回驱动注册项的稳定名称，供启动日志或诊断输出使用。
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    fn register(self) -> Result<(), PnpError> {
+        (self.register)()
+    }
+}
+
+/// 内建驱动注册失败的上下文。
+///
+/// 启动期注册失败通常需要直接停止启动；携带失败驱动名称可以让上层日志定位到
+/// 哪个 catalog 表项没有完成，而不是只看到一个泛化的 PnP 错误。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuiltinDriverRegisterError {
+    driver: &'static str,
+    error: PnpError,
+}
+
+impl BuiltinDriverRegisterError {
+    pub const fn driver(self) -> &'static str {
+        self.driver
+    }
+
+    pub const fn error(self) -> PnpError {
+        self.error
+    }
+}
+
 /// VirtIO block 的 POSIX `/dev/vd*` 投影名由所有传输层共享分配。
 ///
 /// 这只是用户可见节点名，不参与底层设备身份；底层身份仍来自 PnP id。
@@ -71,19 +117,35 @@ pub(super) fn virtio_blk_limits(block_size: u32) -> BlockLimits {
 /// 注册当前内核镜像内建的所有 PnP 驱动。
 ///
 /// 调用前必须已经通过 `set_dev_init_context()` 安装驱动初始化上下文。
-pub fn register_builtin_drivers() -> Result<(), PnpError> {
-    base_char::register_builtin_driver()?;
-    loopback::register_builtin_driver()?;
-    firmware_bus::register_builtin_driver()?;
-    syscon::register_builtin_driver()?;
-    loongson_irq::register_builtin_driver()?;
-    ls7a_rtc::register_builtin_driver()?;
-    fw_cfg::register_builtin_driver()?;
-    cfi_flash::register_builtin_driver()?;
-    uart16550::register_builtin_driver()?;
-    virtio_blk::register_builtin_driver()?;
-    virtio_net::register_builtin_driver()?;
-    virtio_pci::register_builtin_driver()?;
-    random::register_builtin_driver()?;
+const BUILTIN_DRIVER_CATALOG: &[BuiltinDriverRegistration] = &[
+    BuiltinDriverRegistration::new("base-char", base_char::register_builtin_driver),
+    BuiltinDriverRegistration::new("loopback", loopback::register_builtin_driver),
+    BuiltinDriverRegistration::new("firmware-bus", firmware_bus::register_builtin_driver),
+    BuiltinDriverRegistration::new("syscon", syscon::register_builtin_driver),
+    BuiltinDriverRegistration::new("loongson-irq", loongson_irq::register_builtin_driver),
+    BuiltinDriverRegistration::new("ls7a-rtc", ls7a_rtc::register_builtin_driver),
+    BuiltinDriverRegistration::new("fw-cfg", fw_cfg::register_builtin_driver),
+    BuiltinDriverRegistration::new("cfi-flash", cfi_flash::register_builtin_driver),
+    BuiltinDriverRegistration::new("uart16550", uart16550::register_builtin_driver),
+    BuiltinDriverRegistration::new("virtio-blk", virtio_blk::register_builtin_driver),
+    BuiltinDriverRegistration::new("virtio-net", virtio_net::register_builtin_driver),
+    BuiltinDriverRegistration::new("virtio-pci", virtio_pci::register_builtin_driver),
+    BuiltinDriverRegistration::new("random", random::register_builtin_driver),
+];
+
+/// 返回当前内核镜像内建驱动 catalog。
+pub fn builtin_driver_catalog() -> &'static [BuiltinDriverRegistration] {
+    BUILTIN_DRIVER_CATALOG
+}
+
+pub fn register_builtin_drivers() -> Result<(), BuiltinDriverRegisterError> {
+    for driver in builtin_driver_catalog() {
+        driver
+            .register()
+            .map_err(|error| BuiltinDriverRegisterError {
+                driver: driver.name(),
+                error,
+            })?;
+    }
     Ok(())
 }

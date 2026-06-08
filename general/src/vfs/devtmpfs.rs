@@ -93,6 +93,25 @@ impl DevTmpfsStaticNode {
     pub const fn name(self) -> &'static str {
         self.name
     }
+
+    pub const fn owner(self) -> &'static str {
+        self.owner
+    }
+}
+
+/// 静态 devtmpfs 节点注册结果。
+///
+/// `inserted=false` 表示同一 owner/name 已经登记过，本次只是幂等确认。批量注册
+/// 需要这个信息来避免失败回滚时误删早已存在的节点。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevTmpfsStaticNodeRegistration {
+    inserted: bool,
+}
+
+impl DevTmpfsStaticNodeRegistration {
+    pub const fn inserted(self) -> bool {
+        self.inserted
+    }
 }
 
 fn bind_static_node(ops: &DevTmpfsSuperblockOps, node: DevTmpfsStaticNode) -> VfsResult<()> {
@@ -128,13 +147,15 @@ fn restore_static_dev_node_record(node: DevTmpfsStaticNode) -> VfsResult<()> {
 /// 如果 devtmpfs 已经安装到 PnP bridge，注册会立即把节点补进现有 superblock；
 /// 否则节点会留在注册表中，首次 mount devtmpfs 时批量绑定。调用方不需要关心
 /// DTB/ACPI 等启动路径的先后顺序。
-pub fn register_static_dev_node(node: DevTmpfsStaticNode) -> VfsResult<()> {
+pub fn register_static_dev_node(
+    node: DevTmpfsStaticNode,
+) -> VfsResult<DevTmpfsStaticNodeRegistration> {
     split_devtmpfs_path(node.name)?;
     {
         let mut nodes = STATIC_DEV_NODES.lock();
         if let Some(existing) = nodes.iter().find(|existing| existing.name == node.name) {
             if existing.owner == node.owner {
-                return Ok(());
+                return Ok(DevTmpfsStaticNodeRegistration { inserted: false });
             }
             return Err(VfsError::AlreadyExists);
         }
@@ -154,6 +175,38 @@ pub fn register_static_dev_node(node: DevTmpfsStaticNode) -> VfsResult<()> {
         }
     }
 
+    Ok(DevTmpfsStaticNodeRegistration { inserted: true })
+}
+
+/// 批量注册同一组件声明的一组静态 devtmpfs 节点。
+///
+/// 如果中途失败，只回滚本轮实际新插入的节点；已经存在且由同一 owner 声明的节点
+/// 保持不动。这样重复初始化、部分重试和未来可卸载组件都能共享同一套事务语义。
+pub fn register_static_dev_nodes(nodes: &[DevTmpfsStaticNode]) -> VfsResult<()> {
+    let mut inserted: Vec<DevTmpfsStaticNode> = Vec::new();
+    for node in nodes.iter().copied() {
+        match register_static_dev_node(node) {
+            Ok(registration) => {
+                if registration.inserted() {
+                    if inserted.try_reserve(1).is_err() {
+                        let _ = unregister_static_dev_node(node.owner(), node.name());
+                        for registered in inserted.iter().rev().copied() {
+                            let _ =
+                                unregister_static_dev_node(registered.owner(), registered.name());
+                        }
+                        return Err(VfsError::NoSpace);
+                    }
+                    inserted.push(node);
+                }
+            }
+            Err(err) => {
+                for registered in inserted.iter().rev().copied() {
+                    let _ = unregister_static_dev_node(registered.owner(), registered.name());
+                }
+                return Err(err);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -414,10 +467,10 @@ struct LinuxTermios {
 impl LinuxTermios {
     fn new_default() -> Self {
         let mut raw = [0u8; LINUX_TERMIOS_LEN];
-        put_u32(&mut raw, 0, 0x0500); // ICRNL | IXON
-        put_u32(&mut raw, 4, 0x0005); // OPOST | ONLCR
-        put_u32(&mut raw, 8, 0x04bf); // B38400 | CS8 | CREAD | HUPCL
-        put_u32(&mut raw, 12, 0x803b); // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
+        let _ = put_u32(&mut raw, 0, 0x0500); // ICRNL | IXON
+        let _ = put_u32(&mut raw, 4, 0x0005); // OPOST | ONLCR
+        let _ = put_u32(&mut raw, 8, 0x04bf); // B38400 | CS8 | CREAD | HUPCL
+        let _ = put_u32(&mut raw, 12, 0x803b); // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
         raw[17] = 3; // VINTR
         raw[18] = 28; // VQUIT
         raw[19] = 127; // VERASE
@@ -433,22 +486,24 @@ impl LinuxTermios {
 
     fn as_termios2_bytes(&self) -> [u8; LINUX_TERMIOS2_LEN] {
         let mut out = [0u8; LINUX_TERMIOS2_LEN];
-        out[..LINUX_TERMIOS_LEN].copy_from_slice(&self.raw);
-        put_u32(&mut out, 36, 38400);
-        put_u32(&mut out, 40, 38400);
+        for (dst, src) in out.iter_mut().zip(self.raw.iter()) {
+            *dst = *src;
+        }
+        let _ = put_u32(&mut out, 36, 38400);
+        let _ = put_u32(&mut out, 40, 38400);
         out
     }
 
     fn iflag(&self) -> u32 {
-        u32::from_le_bytes(self.raw[0..4].try_into().unwrap())
+        read_u32(&self.raw, 0).unwrap_or(0)
     }
 
     fn oflag(&self) -> u32 {
-        u32::from_le_bytes(self.raw[4..8].try_into().unwrap())
+        read_u32(&self.raw, 4).unwrap_or(0)
     }
 
     fn lflag(&self) -> u32 {
-        u32::from_le_bytes(self.raw[12..16].try_into().unwrap())
+        read_u32(&self.raw, 12).unwrap_or(0)
     }
 
     fn cc(&self, index: usize) -> u8 {
@@ -564,10 +619,18 @@ impl LinuxWinSize {
 
     fn to_bytes(self) -> [u8; LINUX_WINSIZE_LEN] {
         let mut out = [0u8; LINUX_WINSIZE_LEN];
-        out[0..2].copy_from_slice(&self.rows.to_le_bytes());
-        out[2..4].copy_from_slice(&self.cols.to_le_bytes());
-        out[4..6].copy_from_slice(&self.xpixel.to_le_bytes());
-        out[6..8].copy_from_slice(&self.ypixel.to_le_bytes());
+        let rows = self.rows.to_le_bytes();
+        let cols = self.cols.to_le_bytes();
+        let xpixel = self.xpixel.to_le_bytes();
+        let ypixel = self.ypixel.to_le_bytes();
+        out[0] = rows[0];
+        out[1] = rows[1];
+        out[2] = cols[0];
+        out[3] = cols[1];
+        out[4] = xpixel[0];
+        out[5] = xpixel[1];
+        out[6] = ypixel[0];
+        out[7] = ypixel[1];
         out
     }
 }
@@ -602,8 +665,22 @@ fn write_usize_to_user(user: usize, value: usize) -> Result<(), Errno> {
     write_bytes_to_user(user, &value.to_le_bytes())
 }
 
-fn put_u32(out: &mut [u8], off: usize, value: u32) {
-    out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+fn put_u32(out: &mut [u8], off: usize, value: u32) -> Option<()> {
+    // 兼容层小结构按偏移写入，统一走范围检查，避免常量调整时形成越界 panic。
+    let end = off.checked_add(core::mem::size_of::<u32>())?;
+    let dst = out.get_mut(off..end)?;
+    dst.copy_from_slice(&value.to_le_bytes());
+    Some(())
+}
+
+fn read_u32(raw: &[u8], off: usize) -> Option<u32> {
+    // 兼容层 ioctl 结构来自用户态字节流，读取时显式校验范围，避免布局变更时
+    // 固定切片转换扩大成内核 panic。
+    let end = off.checked_add(core::mem::size_of::<u32>())?;
+    let bytes = raw.get(off..end)?;
+    let mut out = [0u8; core::mem::size_of::<u32>()];
+    out.copy_from_slice(bytes);
+    Some(u32::from_le_bytes(out))
 }
 
 #[derive(Default)]
@@ -711,7 +788,7 @@ impl CharDevFileOps {
     }
 
     fn sync_termios2_hardware(&self, raw: &[u8; LINUX_TERMIOS2_LEN]) -> Result<(), Errno> {
-        let ospeed = u32::from_le_bytes(raw[40..44].try_into().unwrap());
+        let ospeed = read_u32(raw, 40).ok_or(Errno::EINVAL)?;
         if ospeed == 0 {
             return Ok(());
         }
@@ -1054,7 +1131,9 @@ impl FileOps for CharDevFileOps {
                 let mut raw = [0u8; LINUX_TERMIOS2_LEN];
                 read_bytes_from_user(arg, &mut raw)?;
                 let mut termios = [0u8; LINUX_TERMIOS_LEN];
-                termios.copy_from_slice(&raw[..LINUX_TERMIOS_LEN]);
+                for (dst, src) in termios.iter_mut().zip(raw.iter()) {
+                    *dst = *src;
+                }
                 *tty.termios.lock() = LinuxTermios { raw: termios };
                 self.sync_termios2_hardware(&raw)?;
                 if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {

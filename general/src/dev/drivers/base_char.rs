@@ -6,11 +6,13 @@
 use crate::dev::char::CharDevice;
 use crate::dev::function::DevNodeSpec;
 use crate::dev::pnp::PnpError;
-use crate::vfs::devtmpfs::{
-    DevTmpfsStaticNode, register_static_dev_node, unregister_static_dev_node,
-};
+use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 
 const OWNER: &str = "base-char-driver";
+const STATIC_NODES: [DevTmpfsStaticNode; 2] = [
+    DevTmpfsStaticNode::new(OWNER, "null", null_dev_node),
+    DevTmpfsStaticNode::new(OWNER, "zero", zero_dev_node),
+];
 
 fn null_dev_node() -> DevNodeSpec {
     DevNodeSpec::Char {
@@ -31,11 +33,5 @@ fn zero_dev_node() -> DevNodeSpec {
 /// 这里保持事务语义：如果第二个节点注册失败，会撤销本轮已经提交的第一个节点，
 /// 避免 devtmpfs 中留下半套基础设备投影。
 pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
-    register_static_dev_node(DevTmpfsStaticNode::new(OWNER, "null", null_dev_node))
-        .map_err(|_| PnpError::DevtmpfsError)?;
-    if register_static_dev_node(DevTmpfsStaticNode::new(OWNER, "zero", zero_dev_node)).is_err() {
-        let _ = unregister_static_dev_node(OWNER, "null");
-        return Err(PnpError::DevtmpfsError);
-    }
-    Ok(())
+    register_static_dev_nodes(&STATIC_NODES).map_err(|_| PnpError::DevtmpfsError)
 }

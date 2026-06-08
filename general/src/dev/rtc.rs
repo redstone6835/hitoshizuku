@@ -1170,7 +1170,9 @@ fn write_user_u32(user: usize, value: u32) -> Result<(), Errno> {
 
 fn get_i32(raw: &[u8], offset: usize) -> Result<i32, Errno> {
     let bytes = raw.get(offset..offset + 4).ok_or(Errno::EINVAL)?;
-    Ok(i32::from_le_bytes(bytes.try_into().unwrap()))
+    let mut out = [0u8; core::mem::size_of::<i32>()];
+    out.copy_from_slice(bytes);
+    Ok(i32::from_le_bytes(out))
 }
 
 fn put_i32(raw: &mut [u8], offset: usize, value: i32) {
