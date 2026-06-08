@@ -50,16 +50,22 @@ impl ControlError {
 /// 字符设备类的通用控制请求。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CharControlRequest {
+    /// 等待已经提交到设备的输出全部发送完成。
+    DrainTx,
+    /// 丢弃尚未发送完成的输出队列。
     FlushTx,
-    /// TODO(char-control): 需要字符驱动暴露接收 FIFO/line discipline 清空能力后完整实现。
+    /// 丢弃尚未被上层消费的输入队列。
     FlushRx,
+    /// 同时丢弃输入队列和输出队列。
     FlushBoth,
     /// 配置串口类硬件。`baud == None` 表示调用方只同步其它行规程状态。
     SetSerialConfig {
         baud: Option<u32>,
     },
-    /// TODO(char-control): 需要底层驱动提供 break 条件保持时间与发送完成语义。
-    SendBreak,
+    /// 让发送线进入 break 条件并保持指定时长。
+    SendBreak {
+        duration_ms: u32,
+    },
     GetInputQueueLen,
     GetOutputQueueLen,
 }
@@ -89,7 +95,7 @@ pub enum BlockControlRequest {
     GetLogicalBlockSize,
     GetPhysicalBlockSize,
     GetIoHints,
-    /// TODO(block-control): 只有提供稳定 diskseq 的设备才应返回成功。
+    /// 返回块设备对象的稳定实例序列号。
     GetDiskSeq,
     Flush,
 }
@@ -115,17 +121,16 @@ pub enum NetControlRequest {
     GetMtu,
     GetTxDropped,
     GetStats,
-    /// TODO(net-control): 底层 [`net::NetDriver`] 还没有运行期 MTU 修改契约。
+    /// 设置接口运行期 MTU。该值只能在底层设备声明的硬件上限内下调。
     SetMtu {
         mtu: usize,
     },
-    /// TODO(net-control): 需要先定义 flags 与协议栈/驱动状态同步规则。
-    SetFlags {
-        flags: u32,
-    },
-    /// TODO(net-control): 需要先定义 MAC 地址修改对 ARP/NDP cache 的失效语义。
-    SetMacAddress {
-        mac: [u8; 6],
+    /// 设置接口的管理启用状态。
+    ///
+    /// 这里表达的是设备管理层的布尔语义；兼容层的原始 flags 位由
+    /// ioctl 适配代码解析，不能泄入底层设备控制接口。
+    SetAdminUp {
+        up: bool,
     },
 }
 

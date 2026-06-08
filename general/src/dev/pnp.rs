@@ -19,12 +19,14 @@
 //!      ↑            │  ↑        │                      │
 //!      └────────────┘  │        │                      │
 //!                      │        │                      │
-//!          probe 失败回退       └── 驱动卸载 ──────────→ (future)
+//!          probe 失败回退       └── 驱动注销 ──────────→ Discovered
+//!                                      │
+//!                                      └── 硬件移除 ───→ Gone
 //! ```
 //!
 //! # 热插拔
 //!
-//! 设备可以在任意时刻被创建（`PnpDevice::new` + `PNP_DEVICES.push` +
+//! 设备可以在任意时刻被创建（`PnpDevice::new` + `PNP_DEVICES.get_or_insert` +
 //! `PNP_DRIVERS.probe_device`）或移除（`dev.remove_device`）。
 //! remove 流程严格保证：先阻止新 I/O → 排空已有 I/O → 关闭硬件 → 清理注册。
 
@@ -39,7 +41,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vfs::sync::Spinlock;
 
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{DevNodeSet, DeviceFunction, FunctionRegistryError};
+use crate::dev::function::{
+    DevNodeNameAllocError, DevNodeSet, DeviceFunction, FunctionRegistryError,
+};
 
 // ── PnP 错误类型 ─────────────────────────────────────────────────────────
 
@@ -53,6 +57,10 @@ pub enum PnpError {
     NoDriver,
     /// 驱动 probe 失败
     ProbeFailed,
+    /// probe 依赖暂未就绪，设备应保留为 Discovered 等待后续重试
+    ProbeDeferred,
+    /// 多个驱动以相同优先级匹配同一设备
+    DriverAmbiguous,
     /// 同名 function 已存在
     FunctionExists,
     /// 设备名冲突
@@ -70,6 +78,14 @@ impl From<FunctionRegistryError> for PnpError {
         match e {
             FunctionRegistryError::NameExists => PnpError::NameConflict,
             FunctionRegistryError::OutOfMemory => PnpError::OutOfMemory,
+        }
+    }
+}
+
+impl From<DevNodeNameAllocError> for PnpError {
+    fn from(e: DevNodeNameAllocError) -> Self {
+        match e {
+            DevNodeNameAllocError::OutOfMemory => PnpError::OutOfMemory,
         }
     }
 }
@@ -228,14 +244,13 @@ pub struct RealtimeClockSource {
 /// 驱动 factory 创建内建驱动实例时需要的启动期能力。
 ///
 /// 该上下文由内核启动路径在注册内建驱动前设置。它只包含内建驱动初始化所需的
-/// 地址转换回调，不把固件解析或总线扫描逻辑暴露给驱动 catalog。
+/// MMIO 映射和时钟来源回调，不把固件解析、总线扫描或 DMA 地址策略暴露给
+/// 驱动 catalog。DMA 地址统一通过 [`crate::dev::dma`] 的平台 hook 管理。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DevInitContext {
     /// 将设备 MMIO 物理地址转换为可访问的内核虚拟地址。
     pub device_mmio_to_virt: fn(usize) -> usize,
-    /// 将内核虚拟地址转换为设备 DMA 可使用的物理地址。
-    pub virt_to_phys: fn(usize) -> usize,
     /// 用硬件 RTC 读出的 Unix 纳秒时间更新内核 realtime 时钟。
     pub set_realtime_ns: Option<fn(u64)>,
     /// 安装一个可撤销 realtime 来源。返回 `true` 表示本来源成为当前 owner。
@@ -245,13 +260,9 @@ pub struct DevInitContext {
 }
 
 impl DevInitContext {
-    pub const fn new(
-        device_mmio_to_virt: fn(usize) -> usize,
-        virt_to_phys: fn(usize) -> usize,
-    ) -> Self {
+    pub const fn new(device_mmio_to_virt: fn(usize) -> usize) -> Self {
         Self {
             device_mmio_to_virt,
-            virt_to_phys,
             set_realtime_ns: None,
             install_realtime_source: None,
             unregister_realtime_source: None,
@@ -298,7 +309,7 @@ pub enum PnpState {
     Probing,
     /// 已成功绑定驱动，function 已完成注册。
     Bound,
-    /// 正在执行热拔/移除流程。
+    /// 正在执行热拔或驱动解绑流程。
     Removing,
     /// 设备已从全局表移除，不再接受新操作。
     Gone,
@@ -315,6 +326,7 @@ impl PnpState {
                 | (Probing, Bound)
                 | (Probing, Removing)
                 | (Bound, Removing)
+                | (Removing, Discovered)
                 | (Removing, Gone)
         )
     }
@@ -384,6 +396,14 @@ impl PnpDevice {
     /// 返回当前绑定驱动的名称。
     pub fn bound_driver_name(&self) -> Option<&'static str> {
         self.inner.lock().bound_driver.as_ref().map(|d| d.name())
+    }
+
+    fn bound_to_driver(&self, driver: &Arc<dyn PnpDriver>) -> bool {
+        self.inner
+            .lock()
+            .bound_driver
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, driver))
     }
 
     /// 返回该设备已注册的 function 快照。
@@ -486,6 +506,15 @@ pub trait PnpDriver: Send + Sync {
     /// 驱动绑定的总线类型；返回 [`BusType::GENERIC`] 表示作为兜底驱动参与匹配。
     fn bus_type(&self) -> BusType;
 
+    /// 该驱动在同类匹配中的优先级。
+    ///
+    /// PnP core 先选择设备所属总线的驱动，再考虑 [`BusType::GENERIC`] 兜底；
+    /// 在同一层级内，优先级高的驱动胜出。驱动需要覆盖默认值时，应只表达
+    /// 自身匹配策略的强弱，不应依赖内建 catalog 的注册顺序。
+    fn priority(&self) -> PnpDriverPriority {
+        PnpDriverPriority::DEFAULT
+    }
+
     /// 判断该驱动是否支持给定 PnP 设备。
     fn matches(&self, id: &PnpId, info: &dyn PnpBusInfo) -> bool;
 
@@ -497,6 +526,32 @@ pub trait PnpDriver: Send + Sync {
 }
 
 // ── DriverFactory / PnP 驱动注册表 ───────────────────────────────────────
+
+/// PnP 驱动匹配优先级。
+///
+/// 该值只在多个驱动同时匹配同一设备、且 bus 层级相同时参与比较。它把“谁更
+/// 具体”显式写进驱动能力，而不是让注册顺序成为隐藏策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PnpDriverPriority(i16);
+
+impl PnpDriverPriority {
+    /// 兜底或弱匹配驱动使用的优先级。
+    pub const FALLBACK: Self = Self(-100);
+    /// 普通精确驱动的默认优先级。
+    pub const DEFAULT: Self = Self(0);
+    /// 更具体的驱动可使用的高优先级。
+    pub const SPECIFIC: Self = Self(100);
+
+    /// 构造一个自定义优先级。
+    pub const fn new(raw: i16) -> Self {
+        Self(raw)
+    }
+
+    /// 返回原始数值，供日志或诊断使用。
+    pub const fn raw(self) -> i16 {
+        self.0
+    }
+}
 
 /// 已注册驱动的运行时编号。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -541,6 +596,7 @@ struct RegisteredDriver {
 /// 设备发现路径只调用 [`PnpDriverRegistry::probe_device`]，不关心驱动来源。
 pub struct PnpDriverRegistry {
     next_driver_id: AtomicU64,
+    retrying_deferred: AtomicBool,
     drivers: Spinlock<Vec<RegisteredDriver>>,
 }
 
@@ -548,6 +604,7 @@ impl PnpDriverRegistry {
     pub const fn new() -> Self {
         Self {
             next_driver_id: AtomicU64::new(1),
+            retrying_deferred: AtomicBool::new(false),
             drivers: Spinlock::new(Vec::new()),
         }
     }
@@ -559,30 +616,78 @@ impl PnpDriverRegistry {
     ) -> Result<DriverHandle, PnpError> {
         let ctx = dev_init_context()?;
         let driver = factory.create(&ctx)?;
-        let mut drivers = self.drivers.lock();
-        if drivers
-            .iter()
-            .any(|registered| registered.driver.name() == driver.name())
-        {
-            return Err(PnpError::NameConflict);
+        let driver_name = driver.name();
+        let id = {
+            let mut drivers = self.drivers.lock();
+            if drivers
+                .iter()
+                .any(|registered| registered.driver.name() == driver_name)
+            {
+                return Err(PnpError::NameConflict);
+            }
+            drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+            let id = DriverId(self.next_driver_id.fetch_add(1, Ordering::Relaxed));
+            drivers.push(RegisteredDriver {
+                id,
+                driver: Arc::clone(&driver),
+            });
+            id
+        };
+
+        // 新驱动注册后立即尝试认领已经枚举但未绑定的设备。probe 失败属于单个
+        // 设备的运行时状态，不应反向撤销驱动注册；后续依赖就绪或手动 retry
+        // 仍可再次进入同一条 PnP 绑定路径。
+        match self.probe_existing_devices(id) {
+            Ok(bound) if bound != 0 => {
+                log::debug!(
+                    "[pnp] driver {} claimed {} existing device(s)",
+                    driver_name,
+                    bound
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::debug!(
+                    "[pnp] driver {} existing-device probe stopped with {:?}",
+                    driver_name,
+                    err
+                );
+            }
         }
-        drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
-        let id = DriverId(self.next_driver_id.fetch_add(1, Ordering::Relaxed));
-        drivers.push(RegisteredDriver {
-            id,
-            driver: Arc::clone(&driver),
-        });
+
         Ok(DriverHandle { id })
     }
 
-    /// 从后续匹配中移除一个驱动。
+    /// 注销驱动并解绑当前由它管理的设备。
+    ///
+    /// 驱动注销不同于硬件热拔：PnP 设备对象仍保留在全局表中，状态回到
+    /// `Discovered`，随后可以被剩余驱动重新 probe。这样动态驱动或后续更具体
+    /// 的驱动接入时，不需要重新执行固件/总线枚举。
     pub fn unregister(&self, handle: DriverHandle) -> Result<(), PnpError> {
-        let mut drivers = self.drivers.lock();
-        let pos = drivers
-            .iter()
-            .position(|registered| registered.id == handle.id)
-            .ok_or(PnpError::NoDriver)?;
-        drivers.swap_remove(pos);
+        let driver = {
+            let mut drivers = self.drivers.lock();
+            let pos = drivers
+                .iter()
+                .position(|registered| registered.id == handle.id)
+                .ok_or(PnpError::NoDriver)?;
+            drivers.swap_remove(pos).driver
+        };
+
+        let mut last_error = None;
+        for dev in PNP_DEVICES.list() {
+            if !dev.bound_to_driver(&driver) {
+                continue;
+            }
+            match dev.unbind_driver_if_matches(&driver) {
+                Ok(true) | Ok(false) => {}
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        let _ = self.retry_deferred_devices();
         Ok(())
     }
 
@@ -602,19 +707,68 @@ impl PnpDriverRegistry {
             }
             match self.bind_driver_to_device(&dev, Arc::clone(&driver)) {
                 Ok(()) => bound += 1,
-                Err(PnpError::InvalidState) => {}
+                Err(PnpError::InvalidState | PnpError::ProbeDeferred) => {}
                 Err(err) => return Err(err),
             }
+        }
+        if bound != 0 {
+            let _ = self.retry_deferred_devices();
         }
         Ok(bound)
     }
 
     /// 为一个新发现的设备寻找匹配驱动并执行 probe。
     pub fn probe_device(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
-        let Some(driver) = self.find_matching_driver(dev) else {
+        let result = self.probe_device_once(dev);
+        if result.is_ok() {
+            let _ = self.retry_deferred_devices();
+        }
+        result
+    }
+
+    fn probe_device_once(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        let Some(driver) = self.find_matching_driver(dev)? else {
             return Err(PnpError::NoDriver);
         };
         self.bind_driver_to_device(dev, driver)
+    }
+
+    /// 重试所有仍处于 Discovered 状态的设备。
+    ///
+    /// 典型场景是 interrupt-controller、桥设备或其它基础设施刚刚 probe 成功，
+    /// 之前返回 [`PnpError::ProbeDeferred`] 的普通设备现在可能已经具备依赖。
+    /// 本函数用一个轻量 reentry guard 防止 probe 链条中重复递归进入。
+    pub fn retry_deferred_devices(&self) -> Result<usize, PnpError> {
+        if self
+            .retrying_deferred
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(0);
+        }
+
+        let mut total_bound = 0usize;
+        loop {
+            let mut round_bound = 0usize;
+            for dev in PNP_DEVICES.list() {
+                if dev.state() != PnpState::Discovered {
+                    continue;
+                }
+                match self.probe_device_once(&dev) {
+                    Ok(()) => round_bound += 1,
+                    Err(PnpError::NoDriver | PnpError::ProbeDeferred | PnpError::InvalidState) => {}
+                    Err(err) => {
+                        self.retrying_deferred.store(false, Ordering::Release);
+                        return Err(err);
+                    }
+                }
+            }
+            if round_bound == 0 {
+                self.retrying_deferred.store(false, Ordering::Release);
+                return Ok(total_bound);
+            }
+            total_bound += round_bound;
+        }
     }
 
     fn bind_driver_to_device(
@@ -643,24 +797,37 @@ impl PnpDriverRegistry {
         }
     }
 
-    fn find_matching_driver(&self, dev: &Arc<PnpDevice>) -> Option<Arc<dyn PnpDriver>> {
+    fn find_matching_driver(
+        &self,
+        dev: &Arc<PnpDevice>,
+    ) -> Result<Option<Arc<dyn PnpDriver>>, PnpError> {
         let drivers = self.drivers.lock();
-        drivers
-            .iter()
-            .find(|registered| {
-                registered.driver.bus_type() == dev.info.bus_type()
-                    && registered.driver.matches(&dev.id, dev.info.as_ref())
-            })
-            .map(|registered| Arc::clone(&registered.driver))
-            .or_else(|| {
-                drivers
-                    .iter()
-                    .find(|registered| {
-                        driver_is_generic(registered.driver.as_ref())
-                            && registered.driver.matches(&dev.id, dev.info.as_ref())
-                    })
-                    .map(|registered| Arc::clone(&registered.driver))
-            })
+        let mut best: Option<((u8, PnpDriverPriority), Arc<dyn PnpDriver>)> = None;
+
+        for registered in drivers.iter() {
+            if !driver_can_probe_bus(registered.driver.as_ref(), dev.info.bus_type()) {
+                continue;
+            }
+            if !registered.driver.matches(&dev.id, dev.info.as_ref()) {
+                continue;
+            }
+            let bus_rank = if registered.driver.bus_type() == dev.info.bus_type() {
+                1
+            } else {
+                0
+            };
+            let key = (bus_rank, registered.driver.priority());
+            match best.as_ref() {
+                None => best = Some((key, Arc::clone(&registered.driver))),
+                Some((best_key, _)) if key > *best_key => {
+                    best = Some((key, Arc::clone(&registered.driver)));
+                }
+                Some((best_key, _)) if key == *best_key => return Err(PnpError::DriverAmbiguous),
+                _ => {}
+            }
+        }
+
+        Ok(best.map(|(_, driver)| driver))
     }
 
     fn driver_by_id(&self, id: DriverId) -> Option<Arc<dyn PnpDriver>> {
@@ -711,6 +878,15 @@ pub struct PnpDeviceList {
     devices: Spinlock<Vec<Arc<PnpDevice>>>,
 }
 
+/// PnP 设备登记结果。
+///
+/// 总线重新扫描或 deferred retry 可能再次提交同一个硬件身份。调用方需要知道本次
+/// 是新插入还是复用了既有对象，以便 probe 硬失败时只回滚新插入的设备。
+pub struct PnpDeviceRegistration {
+    pub device: Arc<PnpDevice>,
+    pub inserted: bool,
+}
+
 impl PnpDeviceList {
     pub const fn new() -> Self {
         Self {
@@ -721,6 +897,9 @@ impl PnpDeviceList {
     /// 插入一个新发现的设备。
     ///
     /// 同一个硬件身份在未进入 [`PnpState::Gone`] 前不能重复注册。
+    // TODO(pnp-core): 目前所有总线扫描路径应优先使用 `get_or_insert()`。
+    // 保留 strict `push()` 是为了少数测试或一次性插入语义；后续需要收紧可见性，
+    // 避免新总线绕过幂等注册入口。
     pub fn push(&self, dev: Arc<PnpDevice>) -> Result<Arc<PnpDevice>, PnpError> {
         let mut list = self.devices.lock();
         list.retain(|d| d.state() != PnpState::Gone);
@@ -733,6 +912,31 @@ impl PnpDeviceList {
         list.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
         list.push(Arc::clone(&dev));
         Ok(dev)
+    }
+
+    /// 插入新设备；若同一硬件身份已经存在，则返回既有对象。
+    ///
+    /// 这是总线扫描的幂等入口。与 [`PnpDeviceList::push`] 不同，它不会把重复发现
+    /// 视为错误，适合固件节点重试、热插拔重新扫描或驱动依赖恢复后的 probe retry。
+    pub fn get_or_insert(&self, dev: Arc<PnpDevice>) -> Result<PnpDeviceRegistration, PnpError> {
+        let mut list = self.devices.lock();
+        list.retain(|d| d.state() != PnpState::Gone);
+        if let Some(existing) = list
+            .iter()
+            .find(|existing| existing.id == dev.id && existing.state() != PnpState::Gone)
+            .cloned()
+        {
+            return Ok(PnpDeviceRegistration {
+                device: existing,
+                inserted: false,
+            });
+        }
+        list.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+        list.push(Arc::clone(&dev));
+        Ok(PnpDeviceRegistration {
+            device: dev,
+            inserted: true,
+        })
     }
 
     /// 从全局列表中移除指定设备。
@@ -866,6 +1070,70 @@ impl PnpDevice {
             func.mark_gone();
             self.unregister_function_external(func);
         }
+    }
+
+    fn unbind_driver_if_matches(
+        self: &Arc<Self>,
+        driver: &Arc<dyn PnpDriver>,
+    ) -> Result<bool, PnpError> {
+        if self
+            .removal_lock
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(PnpError::InvalidState);
+        }
+
+        let (bound_driver, functions, children) = {
+            let mut inner = self.inner.lock();
+            let matches_driver = inner
+                .bound_driver
+                .as_ref()
+                .is_some_and(|bound| Arc::ptr_eq(bound, driver));
+            if inner.state != PnpState::Bound || !matches_driver {
+                self.removal_lock.store(false, Ordering::Release);
+                return Ok(false);
+            }
+
+            let bound_driver = inner.bound_driver.take().ok_or(PnpError::InvalidState)?;
+            inner.state = PnpState::Removing;
+            let functions = core::mem::take(&mut inner.functions);
+            let children = inner.children.clone();
+            (bound_driver, functions, children)
+        };
+
+        // 子设备通常由当前驱动在 probe 期间枚举出来。驱动解绑时按叶子优先移除
+        // 这些派生设备，但保留当前硬件设备对象，供其它驱动重新匹配。
+        for child in children.iter().rev() {
+            child.remove_device();
+        }
+
+        for func in &functions {
+            func.mark_gone();
+        }
+        for func in &functions {
+            func.drain_io();
+        }
+
+        bound_driver.remove(self);
+        let _ = self.inner.lock().driver_data.take();
+
+        for func in &functions {
+            self.unregister_function_external(func);
+        }
+
+        {
+            let mut inner = self.inner.lock();
+            inner.children.clear();
+            if inner.state != PnpState::Removing {
+                self.removal_lock.store(false, Ordering::Release);
+                return Err(PnpError::InvalidState);
+            }
+            inner.state = PnpState::Discovered;
+        }
+
+        self.removal_lock.store(false, Ordering::Release);
+        Ok(true)
     }
 }
 

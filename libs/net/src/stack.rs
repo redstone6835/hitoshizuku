@@ -36,17 +36,18 @@ use crate::socket::{NetSocketHandle, SocketState, SocketType};
 
 // ── 常量 ─────────────────────────────────────────────────────────────────────
 
-const TCP_RX_BUF_SIZE: usize = 65535;
-const TCP_TX_BUF_SIZE: usize = 65535;
+const TCP_RX_BUF_SIZE: usize = 512 * 1024;
+const TCP_TX_BUF_SIZE: usize = 512 * 1024;
 const UDP_RX_BUF_SIZE: usize = 512 * 1024;
 const UDP_TX_BUF_SIZE: usize = 512 * 1024;
 const UDP_META_COUNT: usize = 512;
-/// 主动 poll 的短循环次数。
+/// 主动 poll 的最大短循环次数。
 ///
 /// smoltcp 的一次 `Interface::poll()` 顺序是先处理 ingress，再处理 egress。
 /// loopback 的 TX 会直接回灌到同一接口 RX 队列，因此 TCP 三次握手至少需要
 /// 多轮 poll 才能把 SYN、SYN-ACK、ACK 全部从队列里读回并投递给 socket。
-const ACTIVE_POLL_ROUNDS: usize = 64;
+
+const ACTIVE_POLL_MAX_ROUNDS: usize = 128;
 
 // ── 全局单例 ─────────────────────────────────────────────────────────────────
 
@@ -55,6 +56,14 @@ static STACK: NetStack = NetStack::new();
 /// 获取全局网络协议栈实例。
 pub fn stack() -> &'static NetStack {
     &STACK
+}
+
+fn active_poll_managed(managed: &mut ManagedInterface, timestamp: Instant) {
+    for _ in 0..ACTIVE_POLL_MAX_ROUNDS {
+        if !managed.poll(timestamp) {
+            break;
+        }
+    }
 }
 
 /// TCP accept 的结果快照。
@@ -145,17 +154,20 @@ impl NetStack {
     /// （即所有阻塞在 recv/send/accept/connect 的用户进程），让它们重
     /// 新检查 socket 状态。
     pub fn poll(&self, timestamp: Instant) {
+        let mut state_changed = false;
         let table = self.interfaces.read();
         for iface_lock in table.values() {
             if let Some(mut managed) = iface_lock.try_lock() {
-                managed.poll(timestamp);
+                state_changed |= managed.poll(timestamp);
             }
         }
         drop(table);
         // FIXME: 当前每次协议栈 poll 都唤醒所有 socket 等待者，应该改为
         // 按 socket handle 和事件类型精确唤醒，避免 accept/connect/recv/send
         // 互相误唤醒。
-        self.wake_socket_waiters();
+        if state_changed {
+            self.wake_socket_waiters();
+        }
     }
 
     /// 以毫秒时间戳驱动所有活跃接口——供 kernel timer tick 使用，
@@ -173,12 +185,28 @@ impl NetStack {
         let now_ns = sched::now_ns_public();
         let millis = (now_ns / 1_000_000) as i64;
         let table = self.interfaces.read();
-        for _ in 0..ACTIVE_POLL_ROUNDS {
-            for iface_lock in table.values() {
-                iface_lock.lock().poll(Instant::from_millis(millis));
-            }
-            self.wake_socket_waiters();
+        for iface_lock in table.values() {
+            let mut managed = iface_lock.lock();
+            active_poll_managed(&mut managed, Instant::from_millis(millis));
         }
+        drop(table);
+        self.wake_socket_waiters();
+    }
+
+    fn poll_socket_now(&self, handle: NetSocketHandle) {
+        self.poll_iface_now(handle.iface_id);
+    }
+
+    fn poll_iface_now(&self, iface_id: InterfaceId) {
+        let now_ns = sched::now_ns_public();
+        let millis = (now_ns / 1_000_000) as i64;
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&iface_id) {
+            let mut managed = iface_lock.lock();
+            active_poll_managed(&mut managed, Instant::from_millis(millis));
+        }
+        drop(table);
+        self.wake_socket_waiters();
     }
 
     /// 仅 poll 指定接口（中断驱动的快速路径，零分配）。
@@ -187,13 +215,24 @@ impl NetStack {
     /// 推荐网卡 IRQ handler 调用此方法而非全局 `poll`。
     pub fn poll_interface(&self, id: InterfaceId, timestamp: Instant) {
         let table = self.interfaces.read();
+        let mut state_changed = false;
         if let Some(iface_lock) = table.get(&id) {
-            iface_lock.lock().poll(timestamp);
+            state_changed = iface_lock.lock().poll(timestamp);
         }
         drop(table);
         // FIXME: 中断快速路径也走全局唤醒，多个接口/多个 socket 时会把
         // 与本接口无关的等待任务一并唤醒。
-        self.wake_socket_waiters();
+        if state_changed {
+            self.wake_socket_waiters();
+        }
+    }
+
+    /// 以毫秒时间戳 poll 指定接口。
+    ///
+    /// 设备驱动层不应该直接暴露或依赖 smoltcp 的时间类型；中断处理路径只需
+    /// 传入调度器/时钟层提供的单调毫秒值，由协议栈内部完成类型转换。
+    pub fn poll_interface_ms(&self, id: InterfaceId, millis: i64) {
+        self.poll_interface(id, Instant::from_millis(millis));
     }
 
     /// 把当前任务挂到全局 socket 事件通知队列。
@@ -284,9 +323,17 @@ impl NetStack {
 
     /// 创建一个 raw IP socket（指定 IP 协议号）。
     pub fn socket_raw(&self, ip_version: u8, protocol: u8) -> Result<NetSocketHandle, NetError> {
-        // FIXME: raw socket 也使用默认接口，缺少 SO_BINDTODEVICE、路由
-        // 查找和按地址族选择接口的能力。
         let iface_id = self.default_iface_id()?;
+        self.socket_raw_on(iface_id, ip_version, protocol)
+    }
+
+    /// 在指定接口上创建 raw IP socket。
+    pub fn socket_raw_on(
+        &self,
+        iface_id: InterfaceId,
+        ip_version: u8,
+        protocol: u8,
+    ) -> Result<NetSocketHandle, NetError> {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
@@ -300,9 +347,12 @@ impl NetStack {
 
     /// 创建一个 ICMP socket。
     pub fn socket_icmp(&self) -> Result<NetSocketHandle, NetError> {
-        // FIXME: ICMP socket 也固定落到默认接口，ping 外部地址时可能错误
-        // 走 loopback 或其它非目标路由接口。
         let iface_id = self.default_iface_id()?;
+        self.socket_icmp_on(iface_id)
+    }
+
+    /// 在指定接口上创建 ICMP socket。
+    pub fn socket_icmp_on(&self, iface_id: InterfaceId) -> Result<NetSocketHandle, NetError> {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
@@ -334,7 +384,7 @@ impl NetStack {
             match handle.sock_type {
                 SocketType::Raw => {
                     // TODO: raw IP 发送目前忽略 remote，缺少 per-packet 目的地址、
-                    // 路由元信息和 IP_HDRINCL 等 Linux raw socket 语义。
+                    // 路由元信息和 raw socket 头部包含语义。
                     let socket = managed.raw_socket_mut(handle.inner);
                     let tx_buf = socket.send(data.len()).map_err(|_| NetError::WouldBlock)?;
                     tx_buf.copy_from_slice(data);
@@ -358,7 +408,7 @@ impl NetStack {
                 _ => return Err(NetError::InvalidArgument),
             }
         };
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(sent)
     }
 
@@ -452,7 +502,7 @@ impl NetStack {
                 .tcp_connect(handle.inner, remote_ep, local_port)
                 .map_err(|_| NetError::ConnectionRefused)?;
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(())
     }
 
@@ -528,7 +578,7 @@ impl NetStack {
             }
             n
         };
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(sent)
     }
 
@@ -544,7 +594,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         let table = self.interfaces.read();
         let iface_lock = table
             .get(&handle.iface_id)
@@ -586,7 +636,7 @@ impl NetStack {
                 }
             }
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
     }
 
     // ── TCP 选项与状态查询 (供 socket option 路径使用) ────────────────────
@@ -698,7 +748,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         let table = self.interfaces.read();
         let iface_lock = table
             .get(&handle.iface_id)
@@ -820,6 +870,28 @@ impl NetStack {
         let mut managed = iface_lock.lock();
         managed.set_ipv4_addr(addr, prefix);
         Ok(())
+    }
+
+    /// 设置指定接口的管理态 UP/DOWN。
+    ///
+    /// 这只表达“协议栈是否应使用该接口”，不销毁底层设备，也不参与驱动
+    /// probe/remove 生命周期。
+    pub fn set_iface_admin_up(&self, id: InterfaceId, up: bool) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_admin_up(up);
+        Ok(())
+    }
+
+    /// 设置指定接口的运行期 MTU。
+    ///
+    /// 这是协议栈侧的软件 MTU 限制，不能超过底层设备声明的硬件上限。
+    pub fn set_iface_mtu(&self, id: InterfaceId, mtu: usize) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_mtu(mtu)
     }
 
     /// 在指定接口上添加 IPv4 路由。
@@ -949,7 +1021,7 @@ impl NetStack {
                 .send_slice(data, remote_ep)
                 .map_err(|_| NetError::WouldBlock)?;
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
         Ok(data.len())
     }
 
@@ -1080,7 +1152,7 @@ impl NetStack {
             // TCP close 只是把状态机切到发 FIN 的状态；如果立刻摘掉 socket，
             // 对端永远看不到 EOF。移除前主动 poll，至少把当前 FIN/已排队数据
             // 推到设备队列里，避免 netperf 这类控制连接收尾永久等待。
-            self.poll_now();
+            self.poll_socket_now(handle);
         }
         // 真正从 SocketSet 摘掉
         let table = self.interfaces.read();
@@ -1115,7 +1187,7 @@ impl NetStack {
                 }
             }
         }
-        self.poll_now();
+        self.poll_socket_now(handle);
     }
 
     // ── Socket 就绪查询（为 poll/epoll 准备）──────────────────────────────
@@ -1548,9 +1620,13 @@ pub const IFF_MULTICAST: u32 = 0x1000;
 
 fn compute_iface_flags(managed: &ManagedInterface) -> u32 {
     let mut flags = IFF_BROADCAST | IFF_MULTICAST;
+    if !managed.is_admin_up() {
+        return flags;
+    }
+    flags |= IFF_UP;
     match managed.net_device().driver().link_state() {
         crate::driver::LinkState::Up { .. } => {
-            flags |= IFF_UP | IFF_RUNNING;
+            flags |= IFF_RUNNING;
         }
         crate::driver::LinkState::Down => {}
     }

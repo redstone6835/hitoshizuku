@@ -21,7 +21,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
-use crate::boot::BootAllocator;
 use crate::buddy::{BuddyAllocator, PAGE_SIZE};
 use crate::request::AllocationRecord;
 use crate::space::{BackedRange, KernelAddressSpace};
@@ -56,6 +55,7 @@ pub struct SlabStats {
     pub cache_refills: u64,
     pub cache_flushes: u64,
     pub reclaimed_slabs: u64,
+    pub free_slab_nodes: usize,
 }
 
 /// 每 CPU 缓存中的一个槽位。
@@ -137,6 +137,12 @@ struct Slab {
     total_objects: u16,
     allocated_objects: u16,
     cached_objects: u16,
+    /// 下次位图扫描的起点。
+    ///
+    /// slab 对象通常按低地址递增分配；如果每次 cache miss 都从 0 开始扫描，活跃 slab
+    /// 越满，前缀已分配位带来的重复检查越多。这个 hint 让分配路径从上次命中位置之后
+    /// 继续，并在 flush 释放真实空槽时回退到被释放槽位。
+    next_free_hint: u16,
     alloc_bitmap: [u64; BITMAP_WORDS],
     cache_bitmap: [u64; BITMAP_WORDS],
     active: bool,
@@ -151,6 +157,7 @@ impl Slab {
             total_objects: 0,
             allocated_objects: 0,
             cached_objects: 0,
+            next_free_hint: 0,
             alloc_bitmap: [0; BITMAP_WORDS],
             cache_bitmap: [0; BITMAP_WORDS],
             active: false,
@@ -165,13 +172,23 @@ impl Slab {
             return;
         }
 
-        let total_objects = ((page_count * PAGE_SIZE) / obj_size).min(BITMAP_WORDS * 64);
+        let Some(span_size) = page_count.checked_mul(PAGE_SIZE) else {
+            self.active = false;
+            return;
+        };
+        if page_count > u16::MAX as usize {
+            self.active = false;
+            return;
+        }
+
+        let total_objects = (span_size / obj_size).min(BITMAP_WORDS * 64);
         self.base_addr = base_addr;
         self.paddr = paddr;
         self.page_count = page_count as u16;
         self.total_objects = total_objects as u16;
         self.allocated_objects = 0;
         self.cached_objects = 0;
+        self.next_free_hint = 0;
         self.alloc_bitmap = [0; BITMAP_WORDS];
         self.cache_bitmap = [0; BITMAP_WORDS];
         self.active = total_objects > 0;
@@ -180,9 +197,13 @@ impl Slab {
     fn contains(&self, ptr: usize) -> bool {
         // 这里只判断地址是否落在 slab 覆盖范围内，不验证它是不是对象边界。更严格的槽位
         // 合法性检查交给 `object_index` 统一处理。
-        self.active
-            && ptr >= self.base_addr
-            && ptr < self.base_addr + self.page_count as usize * PAGE_SIZE
+        let Some(span_size) = (self.page_count as usize).checked_mul(PAGE_SIZE) else {
+            return false;
+        };
+        let Some(end) = self.base_addr.checked_add(span_size) else {
+            return false;
+        };
+        self.active && ptr >= self.base_addr && ptr < end
     }
 
     fn object_index(&self, ptr: usize, obj_size: usize) -> Option<usize> {
@@ -210,18 +231,19 @@ impl Slab {
             return None;
         }
 
-        for idx in 0..self.total_objects as usize {
-            if !self.alloc_bit(idx) {
-                self.set_alloc_bit(idx, true);
-                self.set_cache_bit(idx, cached);
-                self.allocated_objects += 1;
-                if cached {
-                    self.cached_objects += 1;
-                }
-                return Some(self.base_addr + idx * obj_size);
-            }
+        let Some(idx) = self.find_free_slot() else {
+            self.next_free_hint = self.total_objects;
+            return None;
+        };
+
+        self.set_alloc_bit(idx, true);
+        self.set_cache_bit(idx, cached);
+        self.allocated_objects += 1;
+        if cached {
+            self.cached_objects += 1;
         }
-        None
+        self.next_free_hint = next_hint_after(idx, self.total_objects as usize) as u16;
+        Some(self.base_addr + idx * obj_size)
     }
 
     fn stage_cached_free(&mut self, ptr: usize, obj_size: usize) -> bool {
@@ -265,6 +287,7 @@ impl Slab {
         self.set_alloc_bit(idx, false);
         self.allocated_objects = self.allocated_objects.saturating_sub(1);
         self.cached_objects = self.cached_objects.saturating_sub(1);
+        self.next_free_hint = idx.min(self.next_free_hint as usize) as u16;
         true
     }
 
@@ -287,6 +310,17 @@ impl Slab {
     fn set_cache_bit(&mut self, idx: usize, set: bool) {
         set_bit(&mut self.cache_bitmap, idx, set);
     }
+
+    fn find_free_slot(&self) -> Option<usize> {
+        let total = self.total_objects as usize;
+        if total == 0 {
+            return None;
+        }
+
+        let start = (self.next_free_hint as usize).min(total.saturating_sub(1));
+        find_clear_bit_in_range(&self.alloc_bitmap, start, total)
+            .or_else(|| find_clear_bit_in_range(&self.alloc_bitmap, 0, start))
+    }
 }
 
 struct SlabNode {
@@ -297,6 +331,12 @@ struct SlabNode {
 
 struct ZoneState {
     slab_head: usize,
+    /// 回收空 slab 后留下的 SlabNode 元数据 freelist。
+    ///
+    /// metadata allocator 目前只支持分配、不支持归还；因此空 slab 被释放 backing
+    /// range 后，节点本身必须在 zone 内复用，避免频繁 grow/reclaim 导致元数据单调膨胀。
+    free_node_head: usize,
+    free_node_count: usize,
     slab_count: usize,
     stats: SlabStats,
 }
@@ -305,6 +345,8 @@ impl ZoneState {
     const fn new() -> Self {
         Self {
             slab_head: 0,
+            free_node_head: 0,
+            free_node_count: 0,
             slab_count: 0,
             stats: SlabStats {
                 alloc_requests: 0,
@@ -321,6 +363,7 @@ impl ZoneState {
                 cache_refills: 0,
                 cache_flushes: 0,
                 reclaimed_slabs: 0,
+                free_slab_nodes: 0,
             },
         }
     }
@@ -386,6 +429,28 @@ impl ZoneState {
         self.slab_count += 1;
         self.stats.active_slabs = self.slab_count;
         self.stats.active_pages += block_pages;
+    }
+
+    fn pop_reusable_slab_node(&mut self) -> Option<usize> {
+        if self.free_node_head == 0 {
+            return None;
+        }
+        let node_addr = self.free_node_head;
+        let node = slab_node_mut(node_addr);
+        self.free_node_head = node.next;
+        node.next = 0;
+        self.free_node_count = self.free_node_count.saturating_sub(1);
+        self.stats.free_slab_nodes = self.free_node_count;
+        Some(node_addr)
+    }
+
+    fn push_reusable_slab_node(&mut self, node_addr: usize) {
+        let node = slab_node_mut(node_addr);
+        node.slab = Slab::empty();
+        node.next = self.free_node_head;
+        self.free_node_head = node_addr;
+        self.free_node_count += 1;
+        self.stats.free_slab_nodes = self.free_node_count;
     }
 
     fn stage_cached_free(&mut self, ptr: usize, obj_size: usize) -> Option<usize> {
@@ -478,7 +543,6 @@ impl ZoneState {
                 }
                 let node = slab_node_mut(current);
                 node.slab.active = false;
-                node.next = 0;
                 self.slab_count = self.slab_count.saturating_sub(1);
                 self.stats.active_slabs = self.slab_count;
                 self.stats.active_pages = self
@@ -486,6 +550,7 @@ impl ZoneState {
                     .active_pages
                     .saturating_sub(backing.size / PAGE_SIZE);
                 self.stats.reclaimed_slabs += 1;
+                self.push_reusable_slab_node(current);
                 return Some(backing);
             }
             prev = current;
@@ -506,22 +571,10 @@ enum SlabGrowError {
 fn allocate_slab_node(
     obj_size: usize,
     pages_per_slab: usize,
-    boot: &BootAllocator,
     phys: &Mutex<BuddyAllocator>,
     vmem: &KernelAddressSpace,
+    reusable_node: Option<usize>,
 ) -> Result<usize, SlabGrowError> {
-    let node_addr = {
-        let ptr = crate::alloc_internal_metadata(Layout::new::<SlabNode>()) as usize;
-        if ptr != 0 {
-            ptr
-        } else {
-            boot.alloc(Layout::new::<SlabNode>()) as usize
-        }
-    };
-    if node_addr == 0 {
-        return Err(SlabGrowError::Metadata);
-    }
-
     let order = pages_to_order(pages_per_slab);
     let range = vmem
         .alloc_kernel_backed_range(order, phys, crate::PagePolicy::BaseOnly)
@@ -531,6 +584,18 @@ fn allocate_slab_node(
         let _ = vmem.free_kernel_backed_range(range, phys);
         return Err(SlabGrowError::InvalidBacking);
     }
+
+    let node_addr = match reusable_node {
+        Some(node_addr) => node_addr,
+        None => {
+            let node_addr = crate::alloc_internal_metadata(Layout::new::<SlabNode>()) as usize;
+            if node_addr == 0 {
+                let _ = vmem.free_kernel_backed_range(range, phys);
+                return Err(SlabGrowError::Metadata);
+            }
+            node_addr
+        }
+    };
 
     let node = slab_node_mut(node_addr);
     node.slab = Slab::empty();
@@ -566,7 +631,6 @@ impl Zone {
     fn alloc(
         &self,
         cpu: usize,
-        boot: &BootAllocator,
         phys: &Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> *mut u8 {
@@ -615,7 +679,18 @@ impl Zone {
                     return null_mut();
                 }
 
-                match allocate_slab_node(self.size_class, self.pages_per_slab, boot, phys, vmem) {
+                let reusable_node = {
+                    let mut state = self.state.lock();
+                    state.pop_reusable_slab_node()
+                };
+
+                match allocate_slab_node(
+                    self.size_class,
+                    self.pages_per_slab,
+                    phys,
+                    vmem,
+                    reusable_node,
+                ) {
                     Ok(node_addr) => {
                         let mut state = self.state.lock();
                         state.insert_slab_node(node_addr);
@@ -625,6 +700,9 @@ impl Zone {
                     }
                     Err(err) => {
                         let mut state = self.state.lock();
+                        if let Some(node_addr) = reusable_node {
+                            state.push_reusable_slab_node(node_addr);
+                        }
                         state.note_grow_failure(err);
                         return null_mut();
                     }
@@ -766,7 +844,6 @@ impl Zone {
 pub struct SlabAllocator {
     zones: [Zone; SIZE_CLASS_COUNT],
     cpu_count: AtomicUsize,
-    metadata_boot: AtomicUsize,
     initialized: AtomicBool,
 }
 
@@ -790,14 +867,8 @@ impl SlabAllocator {
                 Zone::new(SIZE_CLASSES[13]),
             ],
             cpu_count: AtomicUsize::new(1),
-            metadata_boot: AtomicUsize::new(0),
             initialized: AtomicBool::new(false),
         }
-    }
-
-    pub fn bind_metadata_source(&self, boot: &BootAllocator) {
-        self.metadata_boot
-            .store(boot as *const _ as usize, Ordering::Release);
     }
 
     pub fn init(&self, cpu_count: usize) {
@@ -811,7 +882,19 @@ impl SlabAllocator {
     }
 
     pub fn class_index_for(layout: Layout) -> Option<usize> {
-        class_index_for_size(layout.pad_to_align().size())
+        let aligned = layout.pad_to_align();
+        let size = aligned.size();
+        let align = aligned.align();
+        if align > PAGE_SIZE {
+            return None;
+        }
+        let start = class_index_for_size(size)?;
+        for (idx, class) in SIZE_CLASSES.iter().enumerate().skip(start) {
+            if class.is_multiple_of(align) {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     pub fn zone_size_class(&self, zone_idx: usize) -> usize {
@@ -834,10 +917,7 @@ impl SlabAllocator {
             return null_mut();
         };
         let cpu = self.normalize_cpu(cpu_id);
-        let Some(boot) = self.load_metadata_source() else {
-            return null_mut();
-        };
-        self.zones[zone_idx].alloc(cpu, boot, phys, vmem)
+        self.zones[zone_idx].alloc(cpu, phys, vmem)
     }
 
     pub fn free(&self, ptr: usize, layout: Layout, cpu_id: usize) -> bool {
@@ -914,6 +994,7 @@ impl SlabAllocator {
             out.cache_refills += stats.cache_refills;
             out.cache_flushes += stats.cache_flushes;
             out.reclaimed_slabs += stats.reclaimed_slabs;
+            out.free_slab_nodes += stats.free_slab_nodes;
         }
         out
     }
@@ -921,15 +1002,6 @@ impl SlabAllocator {
     fn normalize_cpu(&self, cpu_id: usize) -> usize {
         let limit = self.cpu_count.load(Ordering::Acquire).clamp(1, MAX_CPUS);
         cpu_id.min(limit - 1)
-    }
-
-    fn load_metadata_source(&self) -> Option<&BootAllocator> {
-        let raw = self.metadata_boot.load(Ordering::Acquire);
-        if raw == 0 {
-            None
-        } else {
-            Some(unsafe { &*(raw as *const BootAllocator) })
-        }
     }
 
     fn zone_index_for_ptr(&self, ptr: usize) -> Option<usize> {
@@ -1005,6 +1077,53 @@ fn set_bit(bits: &mut [u64; BITMAP_WORDS], idx: usize, set: bool) {
     } else {
         bits[word] &= !(1u64 << bit);
     }
+}
+
+#[inline]
+fn find_clear_bit_in_range(bits: &[u64; BITMAP_WORDS], start: usize, end: usize) -> Option<usize> {
+    // 对象位图最多 512 位。按 word 查找可以一次跳过 64 个已分配槽，避免 slab 越满时
+    // cache miss 路径退化成从头逐位扫描。`end` 由 total_objects 传入，必须 mask 掉
+    // slab 末尾未使用的位，防止把 bitmap 填充位误认为真实对象槽。
+    let end = end.min(BITMAP_WORDS * 64);
+    if start >= end {
+        return None;
+    }
+
+    let mut word = start / 64;
+    while word < BITMAP_WORDS {
+        let word_start = word * 64;
+        if word_start >= end {
+            break;
+        }
+        let from = start.saturating_sub(word_start).min(64);
+        let to = (end - word_start).min(64);
+        let mask = bit_range_mask(from, to);
+        let free = !bits[word] & mask;
+        if free != 0 {
+            return Some(word_start + free.trailing_zeros() as usize);
+        }
+        word += 1;
+    }
+    None
+}
+
+#[inline]
+fn bit_range_mask(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let high = if end >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << end) - 1
+    };
+    let low = if start == 0 { 0 } else { (1u64 << start) - 1 };
+    high & !low
+}
+
+#[inline]
+fn next_hint_after(idx: usize, total: usize) -> usize {
+    if idx + 1 < total { idx + 1 } else { 0 }
 }
 
 #[inline]

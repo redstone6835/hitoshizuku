@@ -38,7 +38,7 @@ impl NetDeviceAdapter {
 }
 
 impl Device for NetDeviceAdapter {
-    type RxToken<'a> = AdapterRxToken;
+    type RxToken<'a> = AdapterRxToken<'a>;
     type TxToken<'a> = AdapterTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
@@ -50,7 +50,13 @@ impl Device for NetDeviceAdapter {
             driver: &self.driver,
             device: &self.device,
         };
-        Some((AdapterRxToken(rx_buf), tx_token))
+        Some((
+            AdapterRxToken {
+                buf: rx_buf,
+                driver: &self.driver,
+            },
+            tx_token,
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -72,8 +78,8 @@ impl Device for NetDeviceAdapter {
         // Ethernet medium 的 MTU 是完整链路帧大小；IP medium 没有二层头，
         // 直接把 driver 暴露的 IP MTU 交给 smoltcp。
         caps.max_transmission_unit = match self.driver.medium() {
-            LinkMedium::Ethernet => self.driver.mtu() + 14,
-            LinkMedium::Ip => self.driver.mtu(),
+            LinkMedium::Ethernet => self.device.mtu() + 14,
+            LinkMedium::Ip => self.device.mtu(),
         };
         caps
     }
@@ -82,14 +88,19 @@ impl Device for NetDeviceAdapter {
 // ── RxToken ──────────────────────────────────────────────────────────────────
 
 /// smoltcp 接收令牌——零拷贝包装一个已接收的 [`RxBuf`]。
-pub struct AdapterRxToken(RxBuf);
+pub struct AdapterRxToken<'a> {
+    buf: RxBuf,
+    driver: &'a Arc<dyn NetDriver>,
+}
 
-impl phy::RxToken for AdapterRxToken {
+impl<'a> phy::RxToken for AdapterRxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.0.as_slice())
+        let result = f(self.buf.as_slice());
+        self.driver.recycle_rx(self.buf);
+        result
     }
 }
 

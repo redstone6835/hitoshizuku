@@ -21,7 +21,7 @@ use core::ptr::null_mut;
 use spin::mutex::Mutex;
 
 use crate::boot::BootAllocator;
-use crate::buddy::{BuddyAllocator, PAGE_SIZE};
+use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 
 /// allocator 自身的元数据使用统计。
 #[derive(Clone, Copy, Debug, Default)]
@@ -76,6 +76,10 @@ impl MetadataAllocator {
         inner.dynamic_enabled = true;
     }
 
+    pub fn stats(&self) -> MetadataStats {
+        self.inner.lock().stats
+    }
+
     pub fn alloc(
         &self,
         layout: Layout,
@@ -97,7 +101,9 @@ impl MetadataAllocator {
             let Some(phys_to_virt) = phys_to_virt else {
                 return null_mut();
             };
-            let order = order_for_bytes(size.max(align));
+            let Some(order) = order_for_bytes(size.max(align)) else {
+                return null_mut();
+            };
             drop(inner);
 
             let paddr = {
@@ -109,19 +115,36 @@ impl MetadataAllocator {
             };
             let base = phys_to_virt(paddr);
             let span_size = (1usize << order) * PAGE_SIZE;
+            let Some(span_end) = base.checked_add(span_size) else {
+                let mut phys = phys.lock();
+                let _ = phys.free_pages(paddr, order);
+                return null_mut();
+            };
             unsafe {
                 core::ptr::write_bytes(base as *mut u8, 0, span_size);
             }
 
             let mut inner = self.inner.lock();
+            if let Some(ptr) = try_alloc_from_window(&mut inner, size, align) {
+                inner.stats.allocated_bytes += size;
+                inner.stats.dynamic_allocations += 1;
+                drop(inner);
+                let mut phys = phys.lock();
+                let _ = phys.free_pages(paddr, order);
+                return ptr as *mut u8;
+            }
+
             inner.cursor = base;
-            inner.end = base + span_size;
+            inner.end = span_end;
             inner.stats.backing_pages += 1usize << order;
             if let Some(ptr) = try_alloc_from_window(&mut inner, size, align) {
                 inner.stats.allocated_bytes += size;
                 inner.stats.dynamic_allocations += 1;
                 return ptr as *mut u8;
             }
+            drop(inner);
+            let mut phys = phys.lock();
+            let _ = phys.free_pages(paddr, order);
             return null_mut();
         }
 
@@ -164,14 +187,17 @@ fn try_alloc_from_window(inner: &mut MetadataInner, size: usize, align: usize) -
     Some(aligned)
 }
 
-fn order_for_bytes(bytes: usize) -> usize {
+fn order_for_bytes(bytes: usize) -> Option<usize> {
     let mut order = 0usize;
     let mut span = PAGE_SIZE;
     while span < bytes {
-        span <<= 1;
+        if order >= MAX_TRACKED_ORDER {
+            return None;
+        }
+        span = span.checked_shl(1)?;
         order += 1;
     }
-    order
+    Some(order)
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {

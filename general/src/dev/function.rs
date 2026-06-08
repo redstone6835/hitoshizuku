@@ -15,6 +15,10 @@ use vfs::stat::{DevId, FileMode, FileType};
 
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
+pub use crate::dev::naming::{
+    StableName as DevNodeName, StableNameAllocError as DevNodeNameAllocError,
+    StableNameAllocator as DevNodeNameAllocator,
+};
 
 /// function 的内部类别标识。
 ///
@@ -25,6 +29,7 @@ pub struct DeviceClassId(&'static str);
 impl DeviceClassId {
     pub const CHAR: Self = Self("char");
     pub const BLOCK: Self = Self("block");
+    pub const RTC: Self = Self("rtc");
 
     pub const fn new(name: &'static str) -> Self {
         Self(name)
@@ -394,6 +399,91 @@ pub fn block_device_from_function(func: &dyn DeviceFunction) -> Option<Arc<Block
         DevNodeSpec::Block { dev, .. } => Some(Arc::clone(dev)),
         DevNodeSpec::Char { .. } | DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => None,
     })
+}
+
+/// 一个已声明到 devtmpfs 的字符设备投影。
+///
+/// `node_name` 只是 VFS/POSIX 兼容层路径，不能作为底层设备身份；底层对象仍由
+/// `dev` 和所属 function 描述。sysfs/procfs 这类兼容视图需要关联 `rdev` 时，
+/// 应先按 `node_name` 查询兼容层 registry，再回到 typed device object。
+#[derive(Clone)]
+pub struct CharDevNodeProjection {
+    node_name: Box<str>,
+    dev: CharDevice,
+}
+
+impl CharDevNodeProjection {
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
+    pub fn dev(&self) -> &CharDevice {
+        &self.dev
+    }
+}
+
+/// 一个已声明到 devtmpfs 的块设备投影。
+#[derive(Clone)]
+pub struct BlockDevNodeProjection {
+    node_name: Box<str>,
+    dev: Arc<BlockDevice>,
+}
+
+impl BlockDevNodeProjection {
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
+    pub fn dev(&self) -> &Arc<BlockDevice> {
+        &self.dev
+    }
+}
+
+/// 列出当前 function registry 中活动字符设备的 `/dev` 投影。
+///
+/// 这个 helper 只暴露“function 声明了哪些 VFS 节点”这一层事实，不把 POSIX
+/// `dev_t`、主次设备号或 sysfs 目录名塞回底层设备模型。
+pub fn active_char_devnode_projections(functions: &FunctionRegistry) -> Vec<CharDevNodeProjection> {
+    let mut out = Vec::new();
+    for func in functions.list() {
+        let Some(nodes) = func.devnodes() else {
+            continue;
+        };
+        for node in nodes.nodes() {
+            if let DevNodeSpec::Char { name, dev } = node {
+                if dev.is_active() {
+                    out.push(CharDevNodeProjection {
+                        node_name: name.clone(),
+                        dev: dev.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 列出当前 function registry 中活动块设备的 `/dev` 投影。
+pub fn active_block_devnode_projections(
+    functions: &FunctionRegistry,
+) -> Vec<BlockDevNodeProjection> {
+    let mut out = Vec::new();
+    for func in functions.list() {
+        let Some(nodes) = func.devnodes() else {
+            continue;
+        };
+        for node in nodes.nodes() {
+            if let DevNodeSpec::Block { name, dev } = node {
+                if dev.is_active() {
+                    out.push(BlockDevNodeProjection {
+                        node_name: name.clone(),
+                        dev: Arc::clone(dev),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 列出当前仍处于 active 状态的字符设备节点。

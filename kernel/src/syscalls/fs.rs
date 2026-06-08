@@ -27,7 +27,7 @@ mod loongarch64_abi;
 use loongarch64_abi::{decode_dev_t, encode_dev_t};
 
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
-const COPY_CHUNK: usize = 2048;
+const COPY_CHUNK: usize = 8192;
 const PATH_MAX: usize = 4096;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -1234,32 +1234,70 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let len = ctx.args[2];
-    let mut data = vec![0u8; len];
-    copy_from_user(ctx.args[1], &mut data).map_err(|e| e.as_errno())?;
     let addr = if ctx.args[4] == 0 {
         None
     } else {
         Some(copy_sockaddr_from_user(ctx.args[4], ctx.args[5])?)
     };
-    let sent = vfs_socket::send(&vfs_ctx, &fdt, fd, &data, &[], addr.as_deref(), ctx.args[3])
-        .map_err(|err| {
-            if err == Errno::EPIPE && (ctx.args[3] & vfs_socket::MSG_NOSIGNAL) == 0 {
-                deliver_sigpipe();
-            }
-            err
-        })?;
-    Ok(sent)
+    if len <= COPY_CHUNK {
+        let mut data = [0u8; COPY_CHUNK];
+        copy_from_user(ctx.args[1], &mut data[..len]).map_err(|e| e.as_errno())?;
+        send_socket_payload(
+            &vfs_ctx,
+            &fdt,
+            fd,
+            &data[..len],
+            addr.as_deref(),
+            ctx.args[3],
+        )
+    } else {
+        let mut data = vec![0u8; len];
+        copy_from_user(ctx.args[1], &mut data).map_err(|e| e.as_errno())?;
+        send_socket_payload(&vfs_ctx, &fdt, fd, &data, addr.as_deref(), ctx.args[3])
+    }
 }
 
 pub(super) fn sys_recvfrom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fd = fd_arg(ctx.args[0])?;
     let len = ctx.args[2];
-    let mut data = vec![0u8; len];
     let want_addr = ctx.args[4] != 0 && ctx.args[5] != 0;
-    let out = vfs_socket::recv(&fdt, fd, &mut data, 0, want_addr, ctx.args[3], None)?;
+    if len <= COPY_CHUNK {
+        let mut data = [0u8; COPY_CHUNK];
+        recv_socket_payload(&fdt, fd, ctx.args[1], &mut data[..len], want_addr, ctx)
+    } else {
+        let mut data = vec![0u8; len];
+        recv_socket_payload(&fdt, fd, ctx.args[1], &mut data, want_addr, ctx)
+    }
+}
+
+fn send_socket_payload(
+    vfs_ctx: &vfs::VfsContext,
+    fdt: &vfs::fdtable::FdTable,
+    fd: Fd,
+    data: &[u8],
+    addr: Option<&[u8]>,
+    flags: usize,
+) -> Result<usize, Errno> {
+    vfs_socket::send(vfs_ctx, fdt, fd, data, &[], addr, flags).map_err(|err| {
+        if err == Errno::EPIPE && (flags & vfs_socket::MSG_NOSIGNAL) == 0 {
+            deliver_sigpipe();
+        }
+        err
+    })
+}
+
+fn recv_socket_payload(
+    fdt: &vfs::fdtable::FdTable,
+    fd: Fd,
+    user_buf: usize,
+    data: &mut [u8],
+    want_addr: bool,
+    ctx: &SyscallContext<'_>,
+) -> Result<usize, Errno> {
+    let out = vfs_socket::recv(fdt, fd, data, 0, want_addr, ctx.args[3], None)?;
     if out.len != 0 {
-        copy_to_user(ctx.args[1], &data[..out.len]).map_err(|e| e.as_errno())?;
+        copy_to_user(user_buf, &data[..out.len]).map_err(|e| e.as_errno())?;
     }
     if want_addr {
         copy_sockaddr_to_user(ctx.args[4], ctx.args[5], out.address.as_deref())?;
@@ -2068,6 +2106,9 @@ fn read_to_user(
 fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Result<(), Errno> {
     const IO_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
+    if has_unblocked_signal(&task) {
+        return Err(Errno::EINTR);
+    }
     let deadline = file.io_timeout_deadline(interest);
     if timeout_expired(deadline) {
         return Err(Errno::EAGAIN);
@@ -2104,6 +2145,16 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         }
         restore_current_task_after_wait(&task);
         return Err(Errno::EAGAIN);
+    }
+    if has_unblocked_signal(&task) {
+        if registered {
+            file.poll_remove_waiter(&task);
+        }
+        if deadline_armed {
+            sched::cancel_sleep_deadline(&task);
+        }
+        restore_current_task_after_wait(&task);
+        return Err(Errno::EINTR);
     }
 
     if registered || deadline_armed {

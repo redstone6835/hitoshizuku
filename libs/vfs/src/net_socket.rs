@@ -20,6 +20,7 @@ use crate::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
 const SOCK_RAW: u16 = 3;
+const LOOPBACK_UDP_YIELD_INTERVAL: u64 = 16;
 
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
 
@@ -176,6 +177,7 @@ pub struct NetSocketFileOps {
     handle: Mutex<Option<NetSocketHandle>>,
     family: u16,
     sock_type: u16,
+    protocol: u16,
     nonblock: AtomicBool,
     wait_queue: WaitQueue,
     local: Mutex<Option<Endpoint>>,
@@ -184,16 +186,24 @@ pub struct NetSocketFileOps {
     send_timeout_ns: AtomicU64,
     /// SO_ERROR — POSIX 要求读取后清零
     last_error: AtomicI32,
+    udp_loopback_send_count: AtomicU64,
     /// 持久化的 setsockopt 状态
     options: Mutex<SocketOptions>,
 }
 
 impl NetSocketFileOps {
-    pub fn new(handle: NetSocketHandle, family: u16, sock_type: u16, nonblock: bool) -> Self {
+    pub fn new(
+        handle: NetSocketHandle,
+        family: u16,
+        sock_type: u16,
+        protocol: u16,
+        nonblock: bool,
+    ) -> Self {
         Self {
             handle: Mutex::new(Some(handle)),
             family,
             sock_type,
+            protocol,
             nonblock: AtomicBool::new(nonblock),
             wait_queue: WaitQueue::new(),
             local: Mutex::new(None),
@@ -201,6 +211,7 @@ impl NetSocketFileOps {
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             last_error: AtomicI32::new(0),
+            udp_loopback_send_count: AtomicU64::new(0),
             options: Mutex::new(SocketOptions::default()),
         }
     }
@@ -495,7 +506,13 @@ impl NetSocketFileOps {
                     // accept/poll 路径必须依赖外层文件锁与调度顺序，网络层没有
                     // 独立 generation 校验。
                     *self.handle.lock() = Some(info.listener);
-                    let accepted = Self::new(info.accepted, self.family, self.sock_type, nonblock);
+                    let accepted = Self::new(
+                        info.accepted,
+                        self.family,
+                        self.sock_type,
+                        self.protocol,
+                        nonblock,
+                    );
                     // accept 交付的是已经 Established 的 TCP socket；端点在
                     // net 层同一把接口锁下取了快照，优先使用快照，避免后续
                     // 查询时连接状态变化导致 getpeername/getsockname 为空。
@@ -864,27 +881,42 @@ impl NetSocketFileOps {
             return Ok(handle);
         }
 
-        match handle.socket_type() {
-            SocketType::Tcp | SocketType::Udp => {}
-            SocketType::Raw | SocketType::Icmp => return Ok(handle),
-        }
-
-        if !matches!(net::stack().socket_state(handle), net::SocketState::Closed) {
-            return Ok(handle);
-        }
-
-        // socket() 创建时还没有 bind/connect 地址，只能先落到默认接口。
-        // 第一次拿到本地或远端地址后，如果它明确指向 loopback/其它接口，
-        // 就把尚未使用的 TCP/UDP socket 迁移到正确接口，避免 127.0.0.1
-        // 流量错误地走物理网卡。
         let new_handle = match handle.socket_type() {
-            SocketType::Tcp => net::stack()
-                .socket_tcp_on(target_iface)
-                .map_err(map_net_error)?,
-            SocketType::Udp => net::stack()
-                .socket_udp_on(target_iface)
-                .map_err(map_net_error)?,
-            SocketType::Raw | SocketType::Icmp => return Ok(handle),
+            SocketType::Tcp | SocketType::Udp => {
+                if !matches!(net::stack().socket_state(handle), net::SocketState::Closed) {
+                    return Ok(handle);
+                }
+                // socket() 创建时还没有 bind/connect 地址，只能先落到默认接口。
+                // 第一次拿到本地或远端地址后，如果它明确指向 loopback/其它接口，
+                // 就把尚未使用的 TCP/UDP socket 迁移到正确接口，避免本地流量
+                // 错误地走物理网卡。
+                match handle.socket_type() {
+                    SocketType::Tcp => net::stack()
+                        .socket_tcp_on(target_iface)
+                        .map_err(map_net_error)?,
+                    SocketType::Udp => net::stack()
+                        .socket_udp_on(target_iface)
+                        .map_err(map_net_error)?,
+                    SocketType::Raw | SocketType::Icmp => unreachable!(),
+                }
+            }
+            SocketType::Raw => {
+                if net::stack().raw_can_recv(handle) {
+                    return Ok(handle);
+                }
+                let ip_ver = if self.family == 10 { 6u8 } else { 4u8 };
+                net::stack()
+                    .socket_raw_on(target_iface, ip_ver, self.protocol as u8)
+                    .map_err(map_net_error)?
+            }
+            SocketType::Icmp => {
+                if net::stack().raw_can_recv(handle) {
+                    return Ok(handle);
+                }
+                net::stack()
+                    .socket_icmp_on(target_iface)
+                    .map_err(map_net_error)?
+            }
         };
         net::stack().socket_close_and_remove(handle);
         *self.handle.lock() = Some(new_handle);
@@ -918,12 +950,11 @@ impl NetSocketFileOps {
             SocketType::Tcp => loop {
                 match net::stack().tcp_send(handle, data) {
                     Ok(n) => {
-                        // TCP send 已经主动 poll 协议栈；这里再让出一次 CPU，
-                        // 让 loopback 对端及时运行并消费刚送达的数据。netperf
-                        // TCP_RR/TCP_CRR 这类短请求响应会在 write 后立刻 read，
-                        // 如果当前任务连续运行，响应端可能先睡进 recv，客户端
-                        // 还没机会处理已唤醒的可读事件。
-                        sched::schedule_once(sched::now_ns_public());
+                        // 小请求/响应负载主动让出让 loopback 对端尽快处理；
+                        // 流式大块写则避免每次 send 都调度。
+                        if n <= 512 {
+                            sched::schedule_once(sched::now_ns_public());
+                        }
                         return Ok(n);
                     }
                     Err(NetError::WouldBlock) => {
@@ -951,7 +982,12 @@ impl NetSocketFileOps {
                 // FIXME: connected UDP 由 VFS remote 缓存模拟，底层 UDP socket
                 // 没有 connect 状态，也不会过滤非 peer datagram。
                 match net::stack().udp_send_to(handle, data, remote) {
-                    Ok(n) => return Ok(n),
+                    Ok(n) => {
+                        if self.should_yield_after_loopback_udp_send(&remote) {
+                            sched::schedule_once(sched::now_ns_public());
+                        }
+                        return Ok(n);
+                    }
                     Err(NetError::WouldBlock) => {
                         if nonblocking {
                             return Err(Errno::EAGAIN);
@@ -966,45 +1002,63 @@ impl NetSocketFileOps {
                     Err(e) => return Err(map_net_error(e)),
                 }
             },
-            SocketType::Raw => loop {
-                // TODO: raw send 缺少目的地址、IP_HDRINCL、MSG_DONTROUTE 等语义。
-                match net::stack().raw_send(handle, data, remote_override) {
-                    Ok(n) => return Ok(n),
-                    Err(NetError::WouldBlock) => {
-                        if nonblocking {
-                            return Err(Errno::EAGAIN);
-                        }
-                        if self.deadline_expired(deadline) {
-                            return Err(Errno::EAGAIN);
-                        }
-                        self.wait_with_deadline_until(deadline, || {
-                            net::stack().raw_can_send(handle)
-                        })?;
+            SocketType::Raw => {
+                let mut handle = handle;
+                loop {
+                    // TODO: raw send 缺少目的地址、IP_HDRINCL、MSG_DONTROUTE 等语义。
+                    if let Some(remote) = remote_override {
+                        handle = self.rehome_for_endpoint(handle, &remote)?;
                     }
-                    Err(e) => return Err(map_net_error(e)),
-                }
-            },
-            SocketType::Icmp => loop {
-                let remote = remote_override
-                    .or_else(|| *self.remote.lock())
-                    .ok_or(Errno::EDESTADDRREQ)?;
-                match net::stack().raw_send(handle, data, Some(remote)) {
-                    Ok(n) => return Ok(n),
-                    Err(NetError::WouldBlock) => {
-                        if nonblocking {
-                            return Err(Errno::EAGAIN);
+                    match net::stack().raw_send(handle, data, remote_override) {
+                        Ok(n) => return Ok(n),
+                        Err(NetError::WouldBlock) => {
+                            if nonblocking {
+                                return Err(Errno::EAGAIN);
+                            }
+                            if self.deadline_expired(deadline) {
+                                return Err(Errno::EAGAIN);
+                            }
+                            self.wait_with_deadline_until(deadline, || {
+                                net::stack().raw_can_send(handle)
+                            })?;
                         }
-                        if self.deadline_expired(deadline) {
-                            return Err(Errno::EAGAIN);
-                        }
-                        self.wait_with_deadline_until(deadline, || {
-                            net::stack().raw_can_send(handle)
-                        })?;
+                        Err(e) => return Err(map_net_error(e)),
                     }
-                    Err(e) => return Err(map_net_error(e)),
                 }
-            },
+            }
+            SocketType::Icmp => {
+                let mut handle = handle;
+                loop {
+                    let remote = remote_override
+                        .or_else(|| *self.remote.lock())
+                        .ok_or(Errno::EDESTADDRREQ)?;
+                    handle = self.rehome_for_endpoint(handle, &remote)?;
+                    match net::stack().raw_send(handle, data, Some(remote)) {
+                        Ok(n) => return Ok(n),
+                        Err(NetError::WouldBlock) => {
+                            if nonblocking {
+                                return Err(Errno::EAGAIN);
+                            }
+                            if self.deadline_expired(deadline) {
+                                return Err(Errno::EAGAIN);
+                            }
+                            self.wait_with_deadline_until(deadline, || {
+                                net::stack().raw_can_send(handle)
+                            })?;
+                        }
+                        Err(e) => return Err(map_net_error(e)),
+                    }
+                }
+            }
         }
+    }
+
+    fn should_yield_after_loopback_udp_send(&self, remote: &Endpoint) -> bool {
+        if !endpoint_addr_is_loopback(remote) {
+            return false;
+        }
+        let count = self.udp_loopback_send_count.fetch_add(1, Ordering::Relaxed) + 1;
+        count % LOOPBACK_UDP_YIELD_INTERVAL == 0
     }
 
     fn recv_deadline(&self) -> Option<u64> {
@@ -1194,6 +1248,7 @@ pub fn create_net_socket(
         handle,
         family,
         sock_type & 0xf,
+        _protocol,
         nonblock,
     ))
 }
@@ -1227,6 +1282,13 @@ fn endpoint_addr_is_unspecified(ep: &Endpoint) -> bool {
     match ep.addr {
         net::IpAddr::V4(v4) => v4 == net::Ipv4Addr::UNSPECIFIED,
         net::IpAddr::V6(v6) => v6 == net::Ipv6Addr::UNSPECIFIED,
+    }
+}
+
+fn endpoint_addr_is_loopback(ep: &Endpoint) -> bool {
+    match ep.addr {
+        net::IpAddr::V4(v4) => v4.0[0] == 127,
+        net::IpAddr::V6(v6) => v6 == net::Ipv6Addr::LOCALHOST,
     }
 }
 

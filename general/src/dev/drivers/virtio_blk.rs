@@ -307,19 +307,20 @@ impl VirtioBlk {
         let split_queue =
             SplitVirtQueue::new(queue_size).map_err(|_| "Failed to allocate VirtIO queue")?;
 
-        // 队列 DMA 布局由公共 SplitVirtQueue 维护，MMIO 传输层只负责把物理地址写入寄存器。
+        // 队列 DMA 布局由公共 SplitVirtQueue 维护，MMIO 传输层只负责把设备
+        // 可见 DMA 地址写入寄存器，不直接假设 DMA 地址等于物理地址。
         regs.write_reg(MMIO_QUEUE_NUM, queue_size as u32);
-        let desc_phys = split_queue.desc_paddr();
-        regs.write_reg(MMIO_QUEUE_DESC_LOW, desc_phys as u32);
-        regs.write_reg(MMIO_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
+        let desc_dma = split_queue.desc_dma_addr();
+        regs.write_reg(MMIO_QUEUE_DESC_LOW, desc_dma as u32);
+        regs.write_reg(MMIO_QUEUE_DESC_HIGH, (desc_dma >> 32) as u32);
 
-        let avail_phys = split_queue.avail_paddr();
-        regs.write_reg(MMIO_QUEUE_AVAIL_LOW, avail_phys as u32);
-        regs.write_reg(MMIO_QUEUE_AVAIL_HIGH, (avail_phys >> 32) as u32);
+        let avail_dma = split_queue.avail_dma_addr();
+        regs.write_reg(MMIO_QUEUE_AVAIL_LOW, avail_dma as u32);
+        regs.write_reg(MMIO_QUEUE_AVAIL_HIGH, (avail_dma >> 32) as u32);
 
-        let used_phys = split_queue.used_paddr();
-        regs.write_reg(MMIO_QUEUE_USED_LOW, used_phys as u32);
-        regs.write_reg(MMIO_QUEUE_USED_HIGH, (used_phys >> 32) as u32);
+        let used_dma = split_queue.used_dma_addr();
+        regs.write_reg(MMIO_QUEUE_USED_LOW, used_dma as u32);
+        regs.write_reg(MMIO_QUEUE_USED_HIGH, (used_dma >> 32) as u32);
 
         regs.write_reg(MMIO_QUEUE_READY, 1);
 
@@ -603,8 +604,8 @@ impl BlockDriver for VirtioBlkIo {
             _ => None,
         };
 
-        let header_phys = meta_dma.paddr() as u64;
-        let status_phys = meta_dma.paddr() as u64 + mem::size_of::<VirtioBlkReqHeader>() as u64;
+        let header_dma = meta_dma.dma_addr() as u64;
+        let status_dma = meta_dma.dma_addr() as u64 + mem::size_of::<VirtioBlkReqHeader>() as u64;
         let head_idx = chain.head();
 
         // 构造描述符链
@@ -629,7 +630,7 @@ impl BlockDriver for VirtioBlkIo {
                     .queue
                     .write_desc(
                         d0,
-                        header_phys,
+                        header_dma,
                         mem::size_of::<VirtioBlkReqHeader>() as u32,
                         0,
                         Some(d1),
@@ -637,7 +638,7 @@ impl BlockDriver for VirtioBlkIo {
                     .and_then(|_| {
                         queue.queue.write_desc(
                             d1,
-                            data_dma.paddr() as u64,
+                            data_dma.dma_addr() as u64,
                             data_len_u32,
                             VIRTQ_DESC_F_WRITE,
                             Some(d2),
@@ -646,7 +647,7 @@ impl BlockDriver for VirtioBlkIo {
                     .and_then(|_| {
                         queue
                             .queue
-                            .write_desc(d2, status_phys, 1, VIRTQ_DESC_F_WRITE, None)
+                            .write_desc(d2, status_dma, 1, VIRTQ_DESC_F_WRITE, None)
                     })
                     .is_err()
                 {
@@ -674,7 +675,7 @@ impl BlockDriver for VirtioBlkIo {
                     .queue
                     .write_desc(
                         d0,
-                        header_phys,
+                        header_dma,
                         mem::size_of::<VirtioBlkReqHeader>() as u32,
                         0,
                         Some(d1),
@@ -682,7 +683,7 @@ impl BlockDriver for VirtioBlkIo {
                     .and_then(|_| {
                         queue.queue.write_desc(
                             d1,
-                            data_dma.paddr() as u64,
+                            data_dma.dma_addr() as u64,
                             data_len_u32,
                             0,
                             Some(d2),
@@ -691,7 +692,7 @@ impl BlockDriver for VirtioBlkIo {
                     .and_then(|_| {
                         queue
                             .queue
-                            .write_desc(d2, status_phys, 1, VIRTQ_DESC_F_WRITE, None)
+                            .write_desc(d2, status_dma, 1, VIRTQ_DESC_F_WRITE, None)
                     })
                     .is_err()
                 {
@@ -711,7 +712,7 @@ impl BlockDriver for VirtioBlkIo {
                     .queue
                     .write_desc(
                         d0,
-                        header_phys,
+                        header_dma,
                         mem::size_of::<VirtioBlkReqHeader>() as u32,
                         0,
                         Some(d1),
@@ -719,7 +720,7 @@ impl BlockDriver for VirtioBlkIo {
                     .and_then(|_| {
                         queue
                             .queue
-                            .write_desc(d1, status_phys, 1, VIRTQ_DESC_F_WRITE, None)
+                            .write_desc(d1, status_dma, 1, VIRTQ_DESC_F_WRITE, None)
                     })
                     .is_err()
                 {
@@ -815,7 +816,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
             log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
             PnpError::ProbeFailed
         })?;
-        let dev_name = alloc_virtio_blk_dev_name();
+        let dev_name = alloc_virtio_blk_dev_name(&dev.name)?;
         let block_dev = driver
             .into_block_dev(&dev_name)
             .map_err(|_| PnpError::ProbeFailed)?;

@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! bind_char("uart0", dev: CharDevice)
-//!   └─ 创建 Inode，InodeOps = DevCharOps { dev }
+//!   └─ 创建 Inode，InodeOps = DevCharOps { dev, tty }
 //!         └─ open() → 直接访问 dev              // 无查找，直接构造
 //!
 //! bind_block("disk/root", dev: Arc<BlockDevice>)
@@ -35,7 +35,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::VecDeque;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -65,7 +65,168 @@ use crate::mm::{copy_from_user, copy_to_user};
 
 static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-static PNP_DEVTMPFS_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
+static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
+static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
+    Spinlock::new(BTreeMap::new());
+static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
+static BUILTIN_STATIC_NODES_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// devtmpfs 静态节点声明。
+///
+/// 静态节点用于 random/null/zero 这类没有 PnP backing device、但又必须出现在
+/// `/dev` 的基础设备。声明只保存构造器，真正的 inode 仍通过 [`DevNodeSpec`]
+/// 进入统一绑定路径，避免 devtmpfs 为每种特殊设备增加分支。
+#[derive(Clone, Copy)]
+pub struct DevTmpfsStaticNode {
+    owner: &'static str,
+    name: &'static str,
+    build: fn() -> DevNodeSpec,
+}
+
+impl DevTmpfsStaticNode {
+    /// 构造一个静态节点声明。
+    ///
+    /// `owner` 是声明来源的稳定名字，用于让同一组件重复初始化时幂等返回，同时
+    /// 仍能发现两个不同组件抢占同一个 `/dev` 名称的真实冲突。
+    pub const fn new(owner: &'static str, name: &'static str, build: fn() -> DevNodeSpec) -> Self {
+        Self { owner, name, build }
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+}
+
+fn null_static_node() -> DevNodeSpec {
+    DevNodeSpec::Char {
+        name: "null".into(),
+        dev: CharDevice::null(),
+    }
+}
+
+fn zero_static_node() -> DevNodeSpec {
+    DevNodeSpec::Char {
+        name: "zero".into(),
+        dev: CharDevice::zero(),
+    }
+}
+
+fn bind_static_node(ops: &DevTmpfsSuperblockOps, node: DevTmpfsStaticNode) -> VfsResult<()> {
+    ops.bind_node(&(node.build)())
+}
+
+fn remove_static_dev_node_record(owner: &'static str, name: &str) -> Option<DevTmpfsStaticNode> {
+    let mut nodes = STATIC_DEV_NODES.lock();
+    let Some(index) = nodes
+        .iter()
+        .position(|existing| existing.owner == owner && existing.name == name)
+    else {
+        return None;
+    };
+    Some(nodes.remove(index))
+}
+
+fn restore_static_dev_node_record(node: DevTmpfsStaticNode) -> VfsResult<()> {
+    let mut nodes = STATIC_DEV_NODES.lock();
+    if let Some(existing) = nodes.iter().find(|existing| existing.name == node.name) {
+        if existing.owner == node.owner {
+            return Ok(());
+        }
+        return Err(VfsError::AlreadyExists);
+    }
+    nodes.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
+    nodes.push(node);
+    Ok(())
+}
+
+fn ensure_builtin_static_nodes_registered() -> VfsResult<()> {
+    if BUILTIN_STATIC_NODES_REGISTERED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    if let Err(err) = register_static_dev_node(DevTmpfsStaticNode::new(
+        "devtmpfs-core",
+        "null",
+        null_static_node,
+    )) {
+        BUILTIN_STATIC_NODES_REGISTERED.store(false, Ordering::Release);
+        return Err(err);
+    }
+    if let Err(err) = register_static_dev_node(DevTmpfsStaticNode::new(
+        "devtmpfs-core",
+        "zero",
+        zero_static_node,
+    )) {
+        let _ = unregister_static_dev_node("devtmpfs-core", "null");
+        BUILTIN_STATIC_NODES_REGISTERED.store(false, Ordering::Release);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// 注册一个非 PnP 静态 devtmpfs 节点。
+///
+/// 如果 devtmpfs 已经安装到 PnP bridge，注册会立即把节点补进现有 superblock；
+/// 否则节点会留在注册表中，首次 mount devtmpfs 时批量绑定。调用方不需要关心
+/// DTB/ACPI 等启动路径的先后顺序。
+pub fn register_static_dev_node(node: DevTmpfsStaticNode) -> VfsResult<()> {
+    split_devtmpfs_path(node.name)?;
+    {
+        let mut nodes = STATIC_DEV_NODES.lock();
+        if let Some(existing) = nodes.iter().find(|existing| existing.name == node.name) {
+            if existing.owner == node.owner {
+                return Ok(());
+            }
+            return Err(VfsError::AlreadyExists);
+        }
+        nodes.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
+        nodes.push(node);
+    }
+
+    if let Some(sb) = mounted_devtmpfs_sb() {
+        let ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        if let Err(err) = bind_static_node(ops, node) {
+            STATIC_DEV_NODES
+                .lock()
+                .retain(|existing| existing.name != node.name);
+            return Err(err);
+        }
+    }
+
+    Ok(())
+}
+
+/// 注销一个非 PnP 静态 devtmpfs 节点。
+///
+/// 这给未来可卸载的内核内建服务提供对称生命周期：注册表先移除声明，再从当前
+/// devtmpfs 单例中删除节点。不存在的节点按 `NotFound` 返回，避免调用方误以为
+/// 已完成解绑。
+pub fn unregister_static_dev_node(owner: &'static str, name: &str) -> VfsResult<()> {
+    split_devtmpfs_path(name)?;
+    let Some(node) = remove_static_dev_node_record(owner, name) else {
+        return Err(VfsError::NotFound);
+    };
+
+    if let Some(sb) = mounted_devtmpfs_sb() {
+        let ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        match ops.unbind(name) {
+            Ok(()) | Err(VfsError::NotFound) => {}
+            Err(err) => {
+                let _ = restore_static_dev_node_record(node);
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
+}
 
 const DEVTMPFS_NAME_MAX: usize = 255;
 
@@ -140,12 +301,11 @@ fn validate_symlink_target(target: &str) -> VfsResult<()> {
 /// devtmpfs superblock 中创建或删除对应 `/dev` 节点。桥接只消费 `DevNodeSpec`
 /// 携带的设备对象，不 downcast 具体 function 类型。
 pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
+    let dev_sb = publish_devtmpfs_sb(dev_sb);
     dev_sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(PnpError::NoDevtmpfs)?;
 
-    let sb_leaked: &'static Arc<Superblock> = Box::leak(Box::new(dev_sb));
-    *PNP_DEVTMPFS_SB.lock() = Some(sb_leaked);
     set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
         bind: pnp_bind_cb,
         unbind: pnp_unbind_cb,
@@ -160,12 +320,25 @@ pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
 }
 
 fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
-    PNP_DEVTMPFS_SB.lock().ok_or(PnpError::NoDevtmpfs)
+    DEVTMPFS_SINGLETON_SB.lock().ok_or(PnpError::NoDevtmpfs)
 }
 
 fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
-    let guard = PNP_DEVTMPFS_SB.lock();
+    let guard = DEVTMPFS_SINGLETON_SB.lock();
     guard.as_ref().map(|sb| Arc::clone(*sb))
+}
+
+fn publish_devtmpfs_sb(dev_sb: Arc<Superblock>) -> Arc<Superblock> {
+    let mut guard = DEVTMPFS_SINGLETON_SB.lock();
+    if let Some(existing) = guard.as_ref() {
+        return Arc::clone(*existing);
+    }
+
+    // devtmpfs 是全局设备名字空间的投影，superblock 生命周期等同内核生命周期。
+    // 这里泄露一个 Arc 作为单例锚点，后续 mount/bridge/static node 注册都只克隆它。
+    let leaked: &'static Arc<Superblock> = Box::leak(Box::new(dev_sb));
+    *guard = Some(leaked);
+    Arc::clone(leaked)
 }
 
 fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
@@ -227,6 +400,11 @@ const TCSETSW2: usize =
     IoctlCmd::from_parts(IoctlCmd::IOC_WRITE, b'T' as usize, 0x2c, LINUX_TERMIOS2_LEN).raw();
 const TCSETSF2: usize =
     IoctlCmd::from_parts(IoctlCmd::IOC_WRITE, b'T' as usize, 0x2d, LINUX_TERMIOS2_LEN).raw();
+const TCIFLUSH: usize = 0;
+const TCOFLUSH: usize = 1;
+const TCIOFLUSH: usize = 2;
+const TTY_DEFAULT_BREAK_MS: u32 = 250;
+const TTY_BREAK_UNIT_MS: u32 = 100;
 
 const BLKROGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 94, 0).raw();
 const BLKGETSIZE: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 96, 0).raw();
@@ -256,6 +434,7 @@ const NCCS_VKILL: usize = 3;
 const NCCS_VEOF: usize = 4;
 const NCCS_VTIME: usize = 5;
 const NCCS_VMIN: usize = 6;
+const NCCS_VSUSP: usize = 10;
 
 const ICRNL: u32 = 0x0100;
 const IXON: u32 = 0x0400;
@@ -375,6 +554,25 @@ impl LinuxTermios {
     fn vmin(&self) -> u8 {
         self.cc(NCCS_VMIN)
     }
+
+    fn vsusp(&self) -> u8 {
+        self.cc(NCCS_VSUSP)
+    }
+
+    fn signal_for_input(&self, ch: u8) -> Option<sched::SignalNumber> {
+        if !self.isig() || ch == 0 {
+            return None;
+        }
+        if ch == self.vintr() {
+            Some(sched::SignalNumber::SIGINT)
+        } else if ch == self.vquit() {
+            Some(sched::SignalNumber::SIGQUIT)
+        } else if ch == self.vsusp() {
+            Some(sched::SignalNumber::SIGTSTP)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -463,33 +661,71 @@ impl TtyLineState {
     }
 }
 
-struct CharDevFileOps {
-    dev: CharDevice,
-    nonblock: AtomicBool,
+/// 一个底层 TTY 设备的共享行规程状态。
+///
+/// devtmpfs 可能把同一个串口同时投影成 `/dev/console` 和 `/dev/uart0`。
+/// termios、窗口大小、前台进程组和规范模式行缓冲都属于控制终端本身，
+/// 必须在这些节点和所有 open fd 之间共享；每个 fd 只保留自己的状态标志。
+struct TtySharedState {
     termios: Spinlock<LinuxTermios>,
     winsize: Spinlock<LinuxWinSize>,
     foreground_pgrp: Spinlock<i32>,
     line_state: Spinlock<TtyLineState>,
 }
 
-impl CharDevFileOps {
-    fn new(dev: CharDevice, nonblock: bool) -> Self {
+impl TtySharedState {
+    fn new() -> Self {
         Self {
-            dev,
-            nonblock: AtomicBool::new(nonblock),
             termios: Spinlock::new(LinuxTermios::new_default()),
             winsize: Spinlock::new(LinuxWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
             line_state: Spinlock::new(TtyLineState::default()),
         }
     }
+}
+
+fn shared_tty_state(dev: &CharDevice) -> Option<Arc<TtySharedState>> {
+    if !dev.is_tty() {
+        return None;
+    }
+
+    let mut states = TTY_SHARED_STATES.lock();
+    if let Some(state) = states.get(dev.fw_name()).and_then(Weak::upgrade) {
+        return Some(state);
+    }
+
+    // 同一个底层 TTY 可能被投影成多个 `/dev` 节点，例如稳定的 console 别名
+    // 和驱动自己的串口节点。行规程状态必须按设备共享，不能按 open fd 分裂。
+    let state = Arc::new(TtySharedState::new());
+    states.insert(String::from(dev.fw_name()), Arc::downgrade(&state));
+    Some(state)
+}
+
+struct CharDevFileOps {
+    dev: CharDevice,
+    nonblock: AtomicBool,
+    tty: Option<Arc<TtySharedState>>,
+}
+
+impl CharDevFileOps {
+    fn new(dev: CharDevice, nonblock: bool, tty: Option<Arc<TtySharedState>>) -> Self {
+        Self {
+            dev,
+            nonblock: AtomicBool::new(nonblock),
+            tty,
+        }
+    }
 
     fn is_tty(&self) -> bool {
-        self.dev.is_tty()
+        self.tty.is_some() && self.dev.is_tty()
     }
 
     fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
-        let stored = *self.foreground_pgrp.lock();
+        let stored = self
+            .tty
+            .as_deref()
+            .map(|tty| *tty.foreground_pgrp.lock())
+            .unwrap_or(0);
         if stored > 0 {
             Ok(stored)
         } else {
@@ -544,8 +780,8 @@ impl CharDevFileOps {
         self.dev.write_all(&cooked).map_err(map_char_err)
     }
 
-    fn dequeue_ready(&self, buf: &mut [u8]) -> Option<usize> {
-        let mut state = self.line_state.lock();
+    fn dequeue_ready(&self, tty: &TtySharedState, buf: &mut [u8]) -> Option<usize> {
+        let mut state = tty.line_state.lock();
         if state.eof_pending {
             state.eof_pending = false;
             return Some(0);
@@ -565,17 +801,71 @@ impl CharDevFileOps {
     }
 
     fn send_fg_signal(&self, sig: sched::SignalNumber) {
-        let Ok(pgrp) = self.current_or_stored_pgrp() else {
-            return;
-        };
-        if pgrp > 0 {
-            let _ = operation::kill(-pgrp, Some(sig));
+        let stored = self
+            .tty
+            .as_deref()
+            .map(|tty| *tty.foreground_pgrp.lock())
+            .unwrap_or(0);
+        let current = operation::getpgid(0).ok().filter(|pgrp| *pgrp > 0);
+        let primary = if stored > 0 { Some(stored) } else { current };
+
+        if let Some(pgrp) = primary {
+            // 前台进程组是 TTY 的内部对象关系，不应通过 kill(-PGID) 的
+            // 用户态 pid 编码间接表达；PGID==1 会与特殊广播形式冲突。
+            let _ = operation::kill_process_group(pgrp, Some(sig));
+        }
+
+        if stored > 0 {
+            if let Some(current_pgrp) = current {
+                if current_pgrp != stored {
+                    // 当前作业控制还不完整：某些 shell 会把 TTY 前台组留在 shell 自己，
+                    // 但前台程序已经在这个读路径里消费到 VINTR/VQUIT/VSUSP。补发给当前
+                    // 读者进程组，避免 Ctrl-C 只打到 shell，真正阻塞的程序继续睡眠。
+                    let _ = operation::kill_process_group(current_pgrp, Some(sig));
+                }
+            }
         }
     }
 
-    fn read_tty_canonical(&self, buf: &mut [u8], termios: LinuxTermios) -> VfsResult<usize> {
+    fn echo_signal_char(&self, sig: sched::SignalNumber, termios: LinuxTermios) {
+        if !termios.echo() {
+            return;
+        }
+        let bytes = if sig == sched::SignalNumber::SIGINT {
+            &b"^C\n"[..]
+        } else if sig == sched::SignalNumber::SIGQUIT {
+            &b"^\\\n"[..]
+        } else if sig == sched::SignalNumber::SIGTSTP {
+            &b"^Z\n"[..]
+        } else {
+            &b"\n"[..]
+        };
+        let _ = self.write_tty_bytes(bytes, termios);
+    }
+
+    fn handle_input_signal(
+        &self,
+        tty: &TtySharedState,
+        ch: u8,
+        termios: LinuxTermios,
+    ) -> VfsResult<()> {
+        let Some(sig) = termios.signal_for_input(ch) else {
+            return Ok(());
+        };
+        self.send_fg_signal(sig);
+        tty.line_state.lock().clear();
+        self.echo_signal_char(sig, termios);
+        Err(VfsError::Interrupted)
+    }
+
+    fn read_tty_canonical(
+        &self,
+        tty: &TtySharedState,
+        buf: &mut [u8],
+        termios: LinuxTermios,
+    ) -> VfsResult<usize> {
         loop {
-            if let Some(n) = self.dequeue_ready(buf) {
+            if let Some(n) = self.dequeue_ready(tty, buf) {
                 return Ok(n);
             }
 
@@ -592,25 +882,11 @@ impl CharDevFileOps {
             if termios.ixon() && (ch == 17 || ch == 19) {
                 continue;
             }
-            if termios.isig() {
-                if ch == termios.vintr() && ch != 0 {
-                    self.send_fg_signal(sched::SignalNumber::SIGINT);
-                    let mut state = self.line_state.lock();
-                    state.line.clear();
-                    drop(state);
-                    if termios.echo() {
-                        let _ = self.write_tty_bytes(b"^C\n", termios);
-                    }
-                    continue;
-                }
-                if ch == termios.vquit() && ch != 0 {
-                    continue;
-                }
-            }
+            self.handle_input_signal(tty, ch, termios)?;
 
             let mut echo_bytes: Option<Vec<u8>> = None;
             {
-                let mut state = self.line_state.lock();
+                let mut state = tty.line_state.lock();
                 if ch == termios.verase() && ch != 0 {
                     if state.line.pop().is_some() && termios.echo() {
                         echo_bytes = Some(if termios.echoe() {
@@ -666,7 +942,12 @@ impl CharDevFileOps {
         }
     }
 
-    fn read_tty_raw(&self, buf: &mut [u8], termios: LinuxTermios) -> VfsResult<usize> {
+    fn read_tty_raw(
+        &self,
+        tty: &TtySharedState,
+        buf: &mut [u8],
+        termios: LinuxTermios,
+    ) -> VfsResult<usize> {
         let want = termios.vmin().max(1) as usize;
         let mut filled = 0usize;
         loop {
@@ -680,6 +961,9 @@ impl CharDevFileOps {
                             *byte = b'\n';
                         }
                     }
+                }
+                for idx in start..filled {
+                    self.handle_input_signal(tty, buf[idx], termios)?;
                 }
                 if termios.echo() {
                     let _ = self.write_tty_bytes(&buf[start..filled], termios);
@@ -702,18 +986,24 @@ impl FileOps for CharDevFileOps {
         if buf.is_empty() || self.nonblock.load(Ordering::Acquire) || !self.is_tty() {
             return self.dev.read(buf).map_err(map_char_err);
         }
-        let termios = *self.termios.lock();
+        let Some(tty) = self.tty.as_deref() else {
+            return self.dev.read(buf).map_err(map_char_err);
+        };
+        let termios = *tty.termios.lock();
         if termios.canonical() {
-            self.read_tty_canonical(buf, termios)
+            self.read_tty_canonical(tty, buf, termios)
         } else {
-            self.read_tty_raw(buf, termios)
+            self.read_tty_raw(tty, buf, termios)
         }
     }
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
         if !self.is_tty() || self.nonblock.load(Ordering::Acquire) {
             return self.dev.write(buf).map_err(map_char_err);
         }
-        let termios = *self.termios.lock();
+        let Some(tty) = self.tty.as_deref() else {
+            return self.dev.write(buf).map_err(map_char_err);
+        };
+        let termios = *tty.termios.lock();
         self.write_tty_bytes(buf, termios)?;
         Ok(buf.len())
     }
@@ -731,9 +1021,9 @@ impl FileOps for CharDevFileOps {
         if !self.dev.is_active() {
             return PollEvents::POLLERR.with(PollEvents::POLLHUP);
         }
-        if self.is_tty() {
+        if let Some(tty) = self.tty.as_deref() {
             let line_readable = {
-                let state = self.line_state.lock();
+                let state = tty.line_state.lock();
                 state.eof_pending || !state.ready.is_empty()
             };
             // 规范模式同样要暴露底层 FIFO 的“有字节可取”状态。阻塞 read()
@@ -751,6 +1041,19 @@ impl FileOps for CharDevFileOps {
         devtmpfs_compat_char_poll_default()
     }
 
+    fn poll_add_waiter(&self, task: &Arc<sched::Task>, interest: PollEvents) -> bool {
+        let want_read = interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI);
+        let want_write = interest.has(PollEvents::POLLOUT);
+        if !want_read && !want_write {
+            return false;
+        }
+        self.dev.poll_add_waiter(task, want_read, want_write)
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        self.dev.poll_remove_waiter(task);
+    }
+
     fn set_status_flags(&self, flags: OpenOptions) {
         self.nonblock.store(flags.nonblock, Ordering::Release);
     }
@@ -759,30 +1062,31 @@ impl FileOps for CharDevFileOps {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
         }
-        if !self.is_tty() {
+        let Some(tty) = self.tty.as_deref() else {
             return Err(Errno::ENOTTY);
-        }
+        };
 
         match cmd.raw() {
             TCGETS => {
-                let termios = *self.termios.lock();
+                let termios = *tty.termios.lock();
                 write_bytes_to_user(arg, &termios.raw)?;
                 Ok(0)
             }
             TCGETS2 => {
-                let termios = *self.termios.lock();
+                let termios = *tty.termios.lock();
                 write_bytes_to_user(arg, &termios.as_termios2_bytes())?;
                 Ok(0)
             }
             TCSETS | TCSETSW | TCSETSF => {
                 let mut raw = [0u8; LINUX_TERMIOS_LEN];
                 read_bytes_from_user(arg, &mut raw)?;
-                *self.termios.lock() = LinuxTermios { raw };
-                if matches!(cmd.raw(), TCSETSF) {
-                    self.line_state.lock().clear();
-                }
+                *tty.termios.lock() = LinuxTermios { raw };
                 if matches!(cmd.raw(), TCSETSW | TCSETSF) {
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
+                    self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
+                }
+                if matches!(cmd.raw(), TCSETSF) {
+                    tty.line_state.lock().clear();
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushRx)?;
                 }
                 Ok(0)
             }
@@ -791,25 +1095,26 @@ impl FileOps for CharDevFileOps {
                 read_bytes_from_user(arg, &mut raw)?;
                 let mut termios = [0u8; LINUX_TERMIOS_LEN];
                 termios.copy_from_slice(&raw[..LINUX_TERMIOS_LEN]);
-                *self.termios.lock() = LinuxTermios { raw: termios };
+                *tty.termios.lock() = LinuxTermios { raw: termios };
                 self.sync_termios2_hardware(&raw)?;
-                if matches!(cmd.raw(), TCSETSF2) {
-                    self.line_state.lock().clear();
-                }
                 if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
+                    self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
+                }
+                if matches!(cmd.raw(), TCSETSF2) {
+                    tty.line_state.lock().clear();
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushRx)?;
                 }
                 Ok(0)
             }
             TIOCGWINSZ => {
-                let winsize = *self.winsize.lock();
+                let winsize = *tty.winsize.lock();
                 write_bytes_to_user(arg, &winsize.to_bytes())?;
                 Ok(0)
             }
             TIOCSWINSZ => {
                 let mut raw = [0u8; LINUX_WINSIZE_LEN];
                 read_bytes_from_user(arg, &mut raw)?;
-                *self.winsize.lock() = LinuxWinSize::from_bytes(raw);
+                *tty.winsize.lock() = LinuxWinSize::from_bytes(raw);
                 Ok(0)
             }
             FIONREAD => {
@@ -831,7 +1136,7 @@ impl FileOps for CharDevFileOps {
                 if pgid <= 0 {
                     return Err(Errno::EINVAL);
                 }
-                *self.foreground_pgrp.lock() = pgid;
+                *tty.foreground_pgrp.lock() = pgid;
                 Ok(0)
             }
             TIOCGSID => {
@@ -850,16 +1155,45 @@ impl FileOps for CharDevFileOps {
                     Err(Errno::EINVAL)
                 }
             }
-            TCSBRK | TCSBRKP => {
-                self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
-                self.control_done_ignore_unsupported(CharControlRequest::SendBreak)?;
+            TCSBRK => {
+                self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
+                if arg == 0 {
+                    self.control_done_ignore_unsupported(CharControlRequest::SendBreak {
+                        duration_ms: TTY_DEFAULT_BREAK_MS,
+                    })?;
+                }
                 Ok(0)
             }
-            TCFLSH => {
-                self.line_state.lock().clear();
-                self.control_done_ignore_unsupported(CharControlRequest::FlushBoth)?;
+            TCSBRKP => {
+                self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
+                let units = u32::try_from(arg).unwrap_or(u32::MAX);
+                let duration_ms = if units == 0 {
+                    TTY_DEFAULT_BREAK_MS
+                } else {
+                    units.saturating_mul(TTY_BREAK_UNIT_MS)
+                };
+                self.control_done_ignore_unsupported(CharControlRequest::SendBreak {
+                    duration_ms,
+                })?;
                 Ok(0)
             }
+            TCFLSH => match arg {
+                TCIFLUSH => {
+                    tty.line_state.lock().clear();
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushRx)?;
+                    Ok(0)
+                }
+                TCOFLUSH => {
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
+                    Ok(0)
+                }
+                TCIOFLUSH => {
+                    tty.line_state.lock().clear();
+                    self.control_done_ignore_unsupported(CharControlRequest::FlushBoth)?;
+                    Ok(0)
+                }
+                _ => Err(Errno::EINVAL),
+            },
             TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
             _ => Err(Errno::ENOTTY),
         }
@@ -878,6 +1212,7 @@ impl FileOps for CharDevFileOps {
 /// 和已打开 fd 都会通过同一状态停止访问底层驱动。
 struct DevCharOps {
     dev: CharDevice,
+    tty: Option<Arc<TtySharedState>>,
 }
 
 impl DevCharOps {
@@ -903,6 +1238,7 @@ impl InodeOps for DevCharOps {
         Ok(Box::new(CharDevFileOps::new(
             self.dev.clone(),
             opts.nonblock,
+            self.tty.clone(),
         )))
     }
 
@@ -1746,7 +2082,7 @@ impl DevTmpfsSuperblockOps {
         ))
     }
 
-    fn new_custom_inode(&self, spec: &CustomDevNodeSpec) -> VfsResult<Arc<Inode>> {
+    fn new_custom_inode(&self, spec: &CustomDevNodeSpec, rdev: DevId) -> VfsResult<Arc<Inode>> {
         split_devtmpfs_path(spec.name())?;
         if spec.block_size() == 0 || spec.nlink() == 0 {
             return Err(VfsError::InvalidArgument);
@@ -1773,7 +2109,7 @@ impl DevTmpfsSuperblockOps {
                 ino: self.alloc_ino(),
             },
             spec.kind(),
-            spec.rdev(),
+            rdev,
             spec.block_size(),
             None,
             meta,
@@ -1957,7 +2293,8 @@ impl DevTmpfsSuperblockOps {
             blocks: 0,
         };
 
-        let ops = Arc::new(DevCharOps { dev });
+        let tty = shared_tty_state(&dev);
+        let ops = Arc::new(DevCharOps { dev, tty });
         let inode = Inode::new(
             InodeId {
                 fs_id,
@@ -1975,6 +2312,25 @@ impl DevTmpfsSuperblockOps {
         if let Err(err) = self.insert_node_at(user_name, inode) {
             super::device_numbers::unregister_node(user_name);
             return Err(err);
+        }
+        Ok(())
+    }
+
+    /// 绑定已经注册的静态节点。
+    ///
+    /// mount 时调用一次，用于把早于 devtmpfs 出现的非 PnP 节点批量投影到
+    /// 当前 superblock。运行期后注册的静态节点由 [`register_static_dev_node`]
+    /// 直接补绑。
+    fn bind_registered_static_nodes(&self) -> VfsResult<()> {
+        let mut bound: Vec<&'static str> = Vec::new();
+        for node in STATIC_DEV_NODES.lock().iter().copied() {
+            if let Err(err) = bind_static_node(self, node) {
+                for name in bound.iter().rev() {
+                    let _ = self.unbind(name);
+                }
+                return Err(err);
+            }
+            bound.push(node.name());
         }
         Ok(())
     }
@@ -2049,14 +2405,38 @@ impl DevTmpfsSuperblockOps {
     ///
     /// 自定义节点用于未来 LKM 或新设备类别直接提供自己的 `InodeOps`，devtmpfs
     /// 不需要知道该节点背后的设备类型。无法完整实现的设备语义应在对应 `InodeOps`
-    /// 或 `FileOps` 内部标记 TODO，而不是在 devtmpfs 中增加临时类型分支。
+    /// 或 `FileOps` 内部明确返回不支持，而不是在 devtmpfs 中增加临时类型分支。
     pub fn bind_custom(&self, spec: &CustomDevNodeSpec) -> VfsResult<()> {
         split_devtmpfs_path(spec.name())?;
         if self.lookup_node_at(spec.name()).is_ok() {
             return Err(VfsError::AlreadyExists);
         }
-        let inode = self.new_custom_inode(spec)?;
-        self.insert_node_at(spec.name(), inode)
+        let mut registered_rdev = false;
+        let rdev = if spec.rdev() != DevId::new(0, 0) {
+            spec.rdev()
+        } else {
+            match spec.kind() {
+                FileType::CharDevice => {
+                    registered_rdev = true;
+                    super::device_numbers::register_char(spec.name(), spec.name())
+                        .ok_or(VfsError::NoSpace)?
+                }
+                FileType::BlockDevice => {
+                    registered_rdev = true;
+                    super::device_numbers::register_block(spec.name(), spec.name())
+                        .ok_or(VfsError::NoSpace)?
+                }
+                _ => spec.rdev(),
+            }
+        };
+        let inode = self.new_custom_inode(spec, rdev)?;
+        if let Err(err) = self.insert_node_at(spec.name(), inode) {
+            if registered_rdev {
+                super::device_numbers::unregister_node(spec.name());
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 绑定一个通用 devtmpfs 节点规格。
@@ -2256,12 +2636,14 @@ impl FsDriver for DevTmpfsDriver {
             }
         });
 
-        if let Some(ops) = sb.downcast_ops::<DevTmpfsSuperblockOps>() {
-            let _ = ops.bind_char("null", CharDevice::null());
-            let _ = ops.bind_char("zero", CharDevice::zero());
-        }
+        ensure_builtin_static_nodes_registered()?;
 
-        Ok(sb)
+        let ops = sb
+            .downcast_ops::<DevTmpfsSuperblockOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        ops.bind_registered_static_nodes()?;
+
+        Ok(publish_devtmpfs_sb(sb))
     }
 
     fn kill_sb(&self, _sb: Arc<Superblock>) {}

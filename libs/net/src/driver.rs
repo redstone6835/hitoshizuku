@@ -1,7 +1,7 @@
 //! 网络设备驱动 trait 与底层缓冲区抽象。
 //!
-//! 这是 `libs/net` 与具体硬件驱动之间的契约。设计原则对齐 Linux
-//! `struct net_device_ops` 与 FreeBSD `ifnet`：
+//! 这是 `libs/net` 与具体硬件驱动之间的契约。接口只表达本协议栈需要的
+//! 设备能力，不暴露任何用户态 ABI 或具体驱动模型：
 //!
 //! - 驱动只暴露**收发硬件帧**的操作，不感知 IP/TCP/UDP 协议。
 //! - 接收端是被动的（协议栈主动 `poll_rx`），发送端是主动的
@@ -185,7 +185,7 @@ impl TxBuf {
 /// 任何驱动报告 `len > MAX_FRAME_LEN` 的接收帧会被强制截断。
 /// 这是防御深度——即使硬件或驱动 bug 报告异常长度，协议栈也不会读出
 /// buffer 边界。
-pub const MAX_FRAME_LEN: usize = 16 * 1024;
+pub const MAX_FRAME_LEN: usize = 64 * 1024;
 
 // ── 设备统计 ─────────────────────────────────────────────────────────────────
 
@@ -217,9 +217,8 @@ pub struct NetStats {
 
 /// 网络设备驱动接口。
 ///
-/// 类似 Linux `struct net_device_ops`：硬件细节封装在驱动内部，
-/// 上层（本 crate 的 [`adapter`](crate::adapter)）只通过这个 trait
-/// 与硬件交互。
+/// 硬件细节封装在驱动内部，上层（本 crate 的 [`adapter`](crate::adapter)）
+/// 只通过这个 trait 与硬件交互。
 ///
 /// **线程模型**：所有方法可在任意 CPU 上并发调用——驱动内部需要自己
 /// 用 `Mutex` / 原子操作保护硬件队列和共享状态。
@@ -243,7 +242,7 @@ pub trait NetDriver: Send + Sync {
 
     /// 批量从接收队列取出多帧。
     ///
-    /// NAPI 风格批量收包，减少高强度 I/O 下的函数调用开销和锁争用。
+    /// 批量收包，减少高强度 I/O 下的函数调用开销和锁争用。
     /// 默认实现循环调 `poll_rx`——驱动可覆盖为单次锁定下批量取多帧的
     /// 优化版本。
     ///
@@ -281,10 +280,10 @@ pub trait NetDriver: Send + Sync {
     /// 3. 在 TX 完成中断里回收描述符。
     fn commit_tx(&self, buf: TxBuf);
 
-    /// 把未消费的接收缓冲区还给驱动。
+    /// 把接收缓冲区的底层存储还给驱动。
     ///
-    /// 协议栈可能因为帧错误、未匹配等原因不消费 `RxBuf`——此时调用本方法
-    /// 让驱动有机会复用底层存储（如重新挂回 RX 环）。默认实现 drop 即可。
+    /// 协议栈同步处理完 `RxBuf` 后调用本方法，让驱动有机会复用底层存储
+    /// （如重新挂回 RX 环或 loopback freelist）。默认实现 drop 即可。
     fn recycle_rx(&self, _buf: RxBuf) {}
 
     /// 当前链路状态（同步查询，不应阻塞）。
@@ -315,7 +314,7 @@ pub trait NetDriver: Send + Sync {
         NetStats::default()
     }
 
-    /// 禁用接收中断（NAPI 风格：进入 poll 模式时调用）。
+    /// 禁用接收中断（进入主动 poll 模式时调用）。
     ///
     /// 高强度 I/O 场景下，协议栈在 poll 循环内禁用中断，批量处理
     /// RX 队列直到空，然后重新启用。避免每帧一次中断的开销。

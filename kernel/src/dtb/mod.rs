@@ -6,23 +6,20 @@
 //! 驱动对象采用静态生命周期，通过 `Box::leak` 分配，因为内核启动阶段
 //! 创建的资源将伴随系统整个生命周期，无需释放。
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use allocator::KERNEL_ALLOCATOR;
 use general::dev::block::BlockDevice;
 use general::dev::char::CharDevice;
-use general::dev::drivers;
-use general::dev::drivers::{RANDOM_DRIVER, URANDOM_DRIVER};
 use general::dev::enumerate::DEVICES;
 use general::dev::function::{active_block_devices, find_char_device_by_fw_name};
 use general::dev::pci::pci_scan_and_register;
 use general::dev::platform::{
-    DeviceMatchId, DeviceProperties, DeviceResource, PlatformDeviceInfo,
-    register_and_probe_platform_device,
+    DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, FirmwarePropertyValue,
+    PlatformDeviceInfo, PlatformProbeStatus, register_and_probe_platform_device,
 };
-use general::dev::pnp::{DevInitContext, set_dev_init_context};
+use general::dev::pnp::DevInitContext;
 use general::firmware::dtb as firmware_dtb;
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
@@ -188,70 +185,71 @@ pub fn kernel_start_init(context: &StartContext) {
     // 来决定最终 `/` 的来源。devtmpfs 会被提前建立，以便总线扫描和设备注册期间
     // 就能为后续 `/dev` 挂载准备好节点。
 
-    // 小步骤 5.1 先注册启动阶段一定会用到的文件系统驱动。
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::TmpfsDriver)))
-        .expect("[kernel-start][dtb] failed to register tmpfs driver");
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::DevTmpfsDriver)))
-        .expect("[kernel-start][dtb] failed to register devtmpfs driver");
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::ProcFsDriver)))
-        .expect("[kernel-start][dtb] failed to register procfs driver");
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::SysFsDriver)))
-        .expect("[kernel-start][dtb] failed to register sysfs driver");
-    general::vfs::register_block_filesystems();
-
-    let dev_sb = FS_REGISTRY
-        .find("devtmpfs")
-        .expect("[kernel-start][dtb] devtmpfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][dtb] failed to mount devtmpfs");
-    let dev_ops = dev_sb
-        .downcast_ops::<DevTmpfsSuperblockOps>()
-        .expect("[kernel-start][dtb] failed to downcast devtmpfs ops");
+    // 小步骤 5.1 先注册启动阶段一定会用到的文件系统驱动，并创建全局 devtmpfs
+    // superblock。DTB 后续的 platform/PCI probe 会直接把设备节点写入这份树。
+    crate::device_init::register_core_filesystems("dtb");
+    let dev_sb = crate::device_init::mount_devtmpfs("dtb");
+    let dev_ops = crate::device_init::devtmpfs_ops(&dev_sb, "dtb");
 
     // 小步骤 5.2 接着把 devtmpfs 与 PnP 层连接起来。这样 PCI 扫描过程中一旦发现
     // 可驱动设备，对应的字符设备或块设备节点就能直接写入 devtmpfs；等最终根文件
     // 系统选定之后，再把这份已经填充好的 devtmpfs 挂到 `/dev` 即可。
-    general::vfs::devtmpfs::install_pnp_bridge(Arc::clone(&dev_sb))
-        .expect("[kernel-start][dtb] failed to install PnP devtmpfs bridge");
-    printk!("[kernel-start][dtb] PnP devtmpfs callbacks installed");
-
-    set_dev_init_context(
-        DevInitContext::new(
-            context.address.device_mmio_to_virt,
-            context.address.virt_to_phys,
-        )
-        .with_realtime_clock(crate::vdso::set_realtime_ns)
-        .with_realtime_source_hooks(
-            crate::vdso::install_realtime_source,
-            crate::vdso::unregister_realtime_source,
-        ),
+    crate::device_init::activate_device_subsystem(
+        "dtb",
+        Arc::clone(&dev_sb),
+        DevInitContext::new(context.address.device_mmio_to_virt)
+            .with_realtime_clock(crate::vdso::set_realtime_ns)
+            .with_realtime_source_hooks(
+                crate::vdso::install_realtime_source,
+                crate::vdso::unregister_realtime_source,
+            ),
     );
-
-    // 安装架构无关的熵源：random 子系统需要时间戳 / 栈指针等
-    // 启动期熵，这些只能由 arch 层提供。
-    hal::random::register_arch_hooks();
-    printk!("[kernel-start][dtb] registered arch entropy source for random subsystem");
-
-    drivers::register_builtin_drivers()
-        .expect("[kernel-start][dtb] failed to register built-in PnP drivers");
-    printk!("[kernel-start][dtb] registered built-in PnP drivers");
-
-    // 把 random / urandom 字符设备绑定到 devtmpfs。
-    // 这两个节点不通过 PnP 枚举发现（既无 DTB compatible 节点，
-    // 也不是 PCI 设备），而是在启动时静态挂载：
-    //   - /dev/random   阻塞读、熵不足时 spin/yield
-    //   - /dev/urandom  永不阻塞、CSPRNG 持续可读
-    let _ = dev_ops.bind_char("random", CharDevice::new("random", &RANDOM_DRIVER));
-    let _ = dev_ops.bind_char("urandom", CharDevice::new("urandom", &URANDOM_DRIVER));
-    printk!("[kernel-start][dtb] bound /dev/random and /dev/urandom");
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;
+    // 中断控制器先注册，普通 platform 设备后注册。控制器之间仍可能存在
+    // `interrupt-parent` 级联关系，例如 PCH PIC → EIOINTC → CPUIC；因此这里对
+    // controller 节点做有限多轮重试，使父 domain 晚于子节点出现在 DTB 文本中
+    // 时也能最终完成绑定。
+    let mut pending_controllers: Vec<usize> = platform_devices
+        .iter()
+        .enumerate()
+        .filter_map(|(index, device)| device.interrupt_controller.then_some(index))
+        .collect();
+    let max_controller_passes = pending_controllers.len();
+    for _ in 0..max_controller_passes {
+        if pending_controllers.is_empty() {
+            break;
+        }
+        let before = pending_controllers.len();
+        let mut retry = Vec::new();
+        for index in pending_controllers {
+            let device = &platform_devices[index];
+            let info = platform_device_info_from_dtb(device, stdout_phys);
+            match register_platform_device_status(info, "dtb", false) {
+                PlatformRegisterStatus::Bound => platform_bound += 1,
+                PlatformRegisterStatus::Unbound => {}
+                PlatformRegisterStatus::Deferred | PlatformRegisterStatus::Failed => {
+                    retry.push(index)
+                }
+            }
+        }
+        if retry.len() == before {
+            pending_controllers = retry;
+            break;
+        }
+        pending_controllers = retry;
+    }
+    if !pending_controllers.is_empty() {
+        log::debug!(
+            "[kernel-start][dtb] {} interrupt-controller node(s) remained unbound after dependency retries",
+            pending_controllers.len()
+        );
+    }
     for device in &platform_devices {
+        if device.interrupt_controller {
+            continue;
+        }
         let info = platform_device_info_from_dtb(device, stdout_phys);
         if register_platform_device(info, "dtb") {
             platform_bound += 1;
@@ -288,6 +286,12 @@ pub fn kernel_start_init(context: &StartContext) {
             host.bus_end,
             context.address.device_mmio_to_virt,
         );
+        if pci::install_irq_routing(0, host) {
+            printk!(
+                "[kernel-start][dtb] installed PCI IRQ routing: {} map entries",
+                host.interrupt_map.len()
+            );
+        }
 
         pci::assign_bars(host.bus_start, host.bus_end);
 
@@ -554,15 +558,34 @@ fn platform_device_info_from_dtb(
         .iter()
         .map(|compatible| DeviceMatchId::DtbCompatible((*compatible).into()))
         .collect();
-    let resources = device
+    let mut resources: Vec<DeviceResource> = device
         .reg_ranges
         .iter()
-        .map(|range| DeviceResource::Mmio {
-            phys: range.phys_addr,
-            size: range.size,
+        .map(|range| DeviceResource::mmio(range.phys_addr, range.size))
+        .collect();
+    resources.extend(
+        device
+            .interrupts
+            .iter()
+            .map(|irq| DeviceResource::irq(irq.parent, irq.specifier.clone())),
+    );
+    let first_phys = device.reg_ranges.first().map(|range| range.phys_addr);
+    let fw_properties = device
+        .properties
+        .iter()
+        .map(|property| FirmwareProperty {
+            name: property.name.into(),
+            value: match &property.value {
+                firmware_dtb::DtbPropertyValue::Bool => FirmwarePropertyValue::Bool,
+                firmware_dtb::DtbPropertyValue::U32(value) => FirmwarePropertyValue::U32(*value),
+                firmware_dtb::DtbPropertyValue::StringList(values) => {
+                    FirmwarePropertyValue::StringList(
+                        values.iter().map(|value| (*value).into()).collect(),
+                    )
+                }
+            },
         })
         .collect();
-    let first_phys = device.reg_ranges.first().map(|range| range.phys_addr);
 
     PlatformDeviceInfo {
         fw_name: device.name.into(),
@@ -570,30 +593,78 @@ fn platform_device_info_from_dtb(
         resources,
         properties: DeviceProperties {
             clock_hz: device.clock_hz,
-            baud: None,
+            baud: device
+                .properties
+                .iter()
+                .find_map(|property| match &property.value {
+                    firmware_dtb::DtbPropertyValue::U32(value)
+                        if property.name == "current-speed" =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }),
+            fw_phandle: device.phandle,
+            fw_interrupt_parent: device.interrupt_parent,
+            interrupt_controller: device.interrupt_controller,
             stdout: first_phys == stdout_phys,
         },
+        fw_properties,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlatformRegisterStatus {
+    Bound,
+    Unbound,
+    Deferred,
+    Failed,
+}
+
+fn register_platform_device_status(
+    info: PlatformDeviceInfo,
+    tag: &str,
+    noisy_failure: bool,
+) -> PlatformRegisterStatus {
+    match register_and_probe_platform_device(info) {
+        Ok(reg) => match reg.status {
+            PlatformProbeStatus::Bound => PlatformRegisterStatus::Bound,
+            PlatformProbeStatus::NoDriver => {
+                log::debug!(
+                    "[kernel-start][{}] no platform driver for {}",
+                    tag,
+                    reg.device.id
+                );
+                PlatformRegisterStatus::Unbound
+            }
+            PlatformProbeStatus::Deferred => {
+                log::debug!(
+                    "[kernel-start][{}] deferred platform probe for {}",
+                    tag,
+                    reg.device.id
+                );
+                PlatformRegisterStatus::Deferred
+            }
+        },
+        Err(err) => {
+            if noisy_failure {
+                printk!(
+                    "[kernel-start][{}] failed to register/probe platform device: {:?}",
+                    tag,
+                    err
+                );
+            } else {
+                log::debug!(
+                    "[kernel-start][{}] deferred platform probe after failure: {:?}",
+                    tag,
+                    err
+                );
+            }
+            PlatformRegisterStatus::Failed
+        }
     }
 }
 
 fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
-    match register_and_probe_platform_device(info) {
-        Ok(reg) if reg.bound => true,
-        Ok(reg) => {
-            log::debug!(
-                "[kernel-start][{}] no platform driver for {}",
-                tag,
-                reg.device.id
-            );
-            false
-        }
-        Err(err) => {
-            printk!(
-                "[kernel-start][{}] failed to register/probe platform device: {:?}",
-                tag,
-                err
-            );
-            false
-        }
-    }
+    register_platform_device_status(info, tag, true) == PlatformRegisterStatus::Bound
 }
