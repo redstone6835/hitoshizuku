@@ -1033,12 +1033,23 @@ const fn pages_per_slab(size_class: usize) -> usize {
 ///
 /// 这是 slab 把“任意小对象请求”归一化成有限离散尺寸集合的关键步骤。
 fn class_index_for_size(size: usize) -> Option<usize> {
-    for (idx, class) in SIZE_CLASSES.iter().enumerate() {
-        if size <= *class {
-            return Some(idx);
-        }
+    match size {
+        0..=8 => Some(0),
+        9..=16 => Some(1),
+        17..=32 => Some(2),
+        33..=64 => Some(3),
+        65..=96 => Some(4),
+        97..=128 => Some(5),
+        129..=192 => Some(6),
+        193..=256 => Some(7),
+        257..=384 => Some(8),
+        385..=512 => Some(9),
+        513..=768 => Some(10),
+        769..=1024 => Some(11),
+        1025..=1536 => Some(12),
+        1537..=2048 => Some(13),
+        _ => None,
     }
-    None
 }
 
 #[inline]
