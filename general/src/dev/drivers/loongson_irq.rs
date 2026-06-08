@@ -21,6 +21,7 @@ use vfs::sync::Spinlock;
 use crate::dev::irq::{
     self, IrqDomain, IrqDomainHandle, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus,
 };
+use crate::dev::msi::{self, MsiController, MsiControllerHandle, MsiError, MsiMessage, MsiVector};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
@@ -31,6 +32,7 @@ const COMPAT_LOONGSON_CPUIC: &str = "loongson,cpu-interrupt-controller";
 const COMPAT_LOONGSON_EIOINTC: &str = "loongson,ls2k2000-eiointc";
 const COMPAT_LOONGSON_EIOINTC_GENERIC: &str = "loongson,eiointc-1.0";
 const COMPAT_LOONGSON_PCH_PIC: &str = "loongson,pch-pic-1.0";
+const COMPAT_LOONGSON_PCH_MSI: &str = "loongson,pch-msi-1.0";
 
 const LOONGARCH_CPU_HWI_BASE: u32 = 2;
 const LOONGARCH_CPU_HWI_COUNT: u32 = 6;
@@ -69,6 +71,9 @@ const PCH_PIC_REG_POL: usize = 0x3e0;
 const PCH_PIC_DEFAULT_ROUTE_TARGET: u8 = 1;
 const PCH_PIC_PROP_BASE_VECTOR: &str = "loongson,pic-base-vec";
 const PCH_PIC_PROP_ROUTE_TARGET: &str = "loongson,pic-route-target";
+
+const PCH_MSI_PROP_BASE_VECTOR: &str = "loongson,msi-base-vec";
+const PCH_MSI_PROP_NUM_VECS: &str = "loongson,msi-num-vecs";
 
 const IRQ_TYPE_EDGE_RISING: u32 = 1;
 const IRQ_TYPE_EDGE_FALLING: u32 = 2;
@@ -797,6 +802,162 @@ impl PnpDriver for PchPicDriver {
     }
 }
 
+struct PchMsi {
+    parent_controller: u32,
+    message_addr: u64,
+    base_vector: u32,
+    vector_count: usize,
+    allocated: Spinlock<Vec<bool>>,
+}
+
+impl PchMsi {
+    fn new(
+        parent_controller: u32,
+        message_addr: u64,
+        base_vector: u32,
+        vector_count: usize,
+        allocated: Vec<bool>,
+    ) -> Self {
+        Self {
+            parent_controller,
+            message_addr,
+            base_vector,
+            vector_count,
+            allocated: Spinlock::new(allocated),
+        }
+    }
+
+    fn alloc_slot(&self, requester: u32) -> Option<u32> {
+        if self.vector_count == 0 {
+            return None;
+        }
+        let start = requester as usize % self.vector_count;
+        let mut allocated = self.allocated.lock();
+        for offset in 0..self.vector_count {
+            let index = (start + offset) % self.vector_count;
+            if !allocated[index] {
+                allocated[index] = true;
+                return u32::try_from(index).ok();
+            }
+        }
+        None
+    }
+
+    fn free_slot(&self, hwirq: u32) {
+        let index = hwirq as usize;
+        if index >= self.vector_count {
+            return;
+        }
+        self.allocated.lock()[index] = false;
+    }
+}
+
+impl MsiController for PchMsi {
+    fn allocate_vector(&self, requester: u32) -> Option<MsiVector> {
+        let slot = self.alloc_slot(requester)?;
+        let Some(vector) = self.base_vector.checked_add(slot) else {
+            self.free_slot(slot);
+            return None;
+        };
+        let Some(line) = irq::translate_firmware_irq(Some(self.parent_controller), &[vector])
+        else {
+            self.free_slot(slot);
+            return None;
+        };
+        Some(MsiVector {
+            hwirq: slot,
+            line,
+            message: MsiMessage {
+                address: self.message_addr,
+                data: vector,
+            },
+        })
+    }
+
+    fn free_vector(&self, hwirq: u32) {
+        self.free_slot(hwirq);
+    }
+}
+
+struct PchMsiBinding {
+    controller: MsiControllerHandle,
+}
+
+pub struct PchMsiDriver;
+
+impl PchMsiDriver {
+    const fn new() -> Self {
+        Self
+    }
+
+    fn matches_platform(info: &PlatformDeviceInfo) -> bool {
+        info.properties.interrupt_controller && info.has_id(COMPAT_LOONGSON_PCH_MSI)
+    }
+}
+
+impl PnpDriver for PchMsiDriver {
+    fn name(&self) -> &'static str {
+        "platform-loongson-pch-msi"
+    }
+
+    fn bus_type(&self) -> BusType {
+        BusType::PLATFORM
+    }
+
+    fn matches(&self, id: &PnpId, info: &dyn PnpBusInfo) -> bool {
+        if !matches!(id, PnpId::Platform { .. }) {
+            return false;
+        }
+        info.as_any()
+            .downcast_ref::<PlatformDeviceInfo>()
+            .is_some_and(Self::matches_platform)
+    }
+
+    fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        let info = platform_info(dev)?;
+        let controller = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
+        let parent_controller = info
+            .properties
+            .fw_interrupt_parent
+            .ok_or(PnpError::ProbeFailed)?;
+        let (phys, _size) = info.first_mmio().ok_or(PnpError::ProbeFailed)?;
+        let base_vector = info
+            .u32_property(PCH_MSI_PROP_BASE_VECTOR)
+            .ok_or(PnpError::ProbeFailed)?;
+        let vector_count = info
+            .u32_property(PCH_MSI_PROP_NUM_VECS)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(PnpError::ProbeFailed)?;
+        if vector_count == 0 {
+            return Err(PnpError::ProbeFailed);
+        }
+        let mut allocated = Vec::new();
+        allocated
+            .try_reserve(vector_count)
+            .map_err(|_| PnpError::OutOfMemory)?;
+        allocated.resize(vector_count, false);
+
+        let msi = Arc::new(PchMsi::new(
+            parent_controller,
+            phys as u64,
+            base_vector,
+            vector_count,
+            allocated,
+        ));
+        let handle = msi::register_msi_controller(controller, msi).map_err(map_msi_error)?;
+        dev.set_driver_data(Arc::new(PchMsiBinding { controller: handle }));
+        Ok(())
+    }
+
+    fn remove(&self, dev: &Arc<PnpDevice>) {
+        if let Some(data) = dev.take_driver_data()
+            && let Ok(binding) = data.downcast::<PchMsiBinding>()
+        {
+            let _ = msi::unregister_msi_controller(binding.controller);
+        }
+    }
+}
+
 fn platform_info(dev: &Arc<PnpDevice>) -> Result<&PlatformDeviceInfo, PnpError> {
     dev.info
         .as_any()
@@ -825,6 +986,14 @@ fn map_irq_error(err: IrqError) -> PnpError {
         IrqError::OutOfMemory => PnpError::OutOfMemory,
         IrqError::AlreadyRegistered => PnpError::NameConflict,
         IrqError::NotFound => PnpError::ProbeFailed,
+    }
+}
+
+fn map_msi_error(err: MsiError) -> PnpError {
+    match err {
+        MsiError::OutOfMemory => PnpError::OutOfMemory,
+        MsiError::AlreadyRegistered => PnpError::NameConflict,
+        MsiError::NotFound | MsiError::AllocationFailed => PnpError::ProbeFailed,
     }
 }
 
@@ -864,8 +1033,21 @@ impl DriverFactory for PchPicFactory {
     }
 }
 
+struct PchMsiFactory;
+
+impl DriverFactory for PchMsiFactory {
+    fn name(&self) -> &'static str {
+        "platform-loongson-pch-msi"
+    }
+
+    fn create(&self, _ctx: &DevInitContext) -> Result<Arc<dyn PnpDriver>, PnpError> {
+        Ok(Arc::new(PchMsiDriver::new()))
+    }
+}
+
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     register_driver_factory(Arc::new(LoongsonCpuIrqFactory))?;
     register_driver_factory(Arc::new(EioIntcFactory))?;
-    register_driver_factory(Arc::new(PchPicFactory)).map(|_| ())
+    register_driver_factory(Arc::new(PchPicFactory))?;
+    register_driver_factory(Arc::new(PchMsiFactory)).map(|_| ())
 }

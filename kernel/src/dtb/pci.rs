@@ -1,15 +1,20 @@
 //! DTB 路径下的 PCIe host bridge 发现 + ECAM 配置空间访问 + BAR 资源分配。
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use general::dev::irq::{self, IrqLine};
+use general::dev::msi;
 use general::dev::pci::{
     PCI_DEVICES_PER_BUS, PCI_EXTENDED_CONFIG_SPACE_SIZE, PCI_FUNCTIONS_PER_DEVICE, PciConfigAccess,
-    PciConfigError, PciDevice, pci_scan_raw, set_pci_config_access,
+    PciConfigError, PciDevice, PciHostAddressSpace, PciHostBridgeError, PciHostBridgeInfo,
+    PciHostBridgeWindow, pci_scan_raw, register_host_bridge, set_pci_config_access,
 };
-use general::firmware::dtb::DtbPcieHostInfo;
+use general::dev::pnp::PnpDevice;
+use general::firmware::dtb::{DtbPciAddressSpace, DtbPciRangeInfo, DtbPcieHostInfo};
 use vfs::sync::Spinlock;
 
 /// ECAM 全局状态:base(虚拟地址)+ 总线范围。
@@ -38,6 +43,71 @@ struct PciIrqRouting {
 }
 
 static PCI_IRQ_ROUTING: Spinlock<Option<PciIrqRouting>> = Spinlock::new(None);
+
+struct PciMsiRoute {
+    requester_base: u32,
+    controller: u32,
+    msi_base: u32,
+    length: u32,
+}
+
+struct PciMsiRouting {
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
+    routes: Vec<PciMsiRoute>,
+}
+
+static PCI_MSI_ROUTING: Spinlock<Option<PciMsiRouting>> = Spinlock::new(None);
+
+pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<PnpDevice>>) {
+    let info = PciHostBridgeInfo {
+        name: host.name.into(),
+        firmware_path: Some(host.path.into()),
+        domain: host.domain,
+        bus_start: host.bus_start,
+        bus_end: host.bus_end,
+        ecam_phys: host.ecam_phys,
+        ecam_size: host.ecam_size,
+        dma_coherent: host.dma_coherent,
+        windows: host.ranges.iter().map(pci_host_window).collect(),
+        irq_route_count: host.interrupt_map.len(),
+        msi_route_count: host.msi_map.len(),
+    };
+    match register_host_bridge(info, pnp) {
+        Ok(handle) => log::printk!(
+            "[kernel-start][dtb] registered PCI host bridge {} handle={} windows={} irq-routes={} msi-routes={}",
+            host.path,
+            handle.id(),
+            host.ranges.len(),
+            host.interrupt_map.len(),
+            host.msi_map.len()
+        ),
+        Err(PciHostBridgeError::AlreadyRegistered) => log::debug!(
+            "[kernel-start][dtb] PCI host bridge domain {} already registered",
+            host.domain
+        ),
+        Err(err) => log::printk!(
+            "[kernel-start][dtb] failed to register PCI host bridge {}: {:?}",
+            host.path,
+            err
+        ),
+    }
+}
+
+fn pci_host_window(range: &DtbPciRangeInfo) -> PciHostBridgeWindow {
+    PciHostBridgeWindow {
+        space: match range.space {
+            DtbPciAddressSpace::Io => PciHostAddressSpace::Io,
+            DtbPciAddressSpace::Memory => PciHostAddressSpace::Memory,
+            DtbPciAddressSpace::PrefetchableMemory => PciHostAddressSpace::PrefetchableMemory,
+            DtbPciAddressSpace::Unknown(value) => PciHostAddressSpace::Unknown(value),
+        },
+        pci_start: range.child_addr,
+        cpu_start: range.parent_addr,
+        size: range.size,
+    }
+}
 
 /// ECAM 配置空间地址计算。
 ///
@@ -215,6 +285,27 @@ fn resolve_pci_irq(
         .and_then(|route| irq::translate_firmware_irq(Some(route.parent), &route.parent_specifier))
 }
 
+fn pci_requester_id(bus: u8, device: u8, function: u8) -> u32 {
+    ((bus as u32) << 8) | ((device as u32) << 3) | function as u32
+}
+
+fn resolve_pci_msi(segment: u16, bus: u8, device: u8, function: u8) -> Option<msi::MsiHandle> {
+    let routing = PCI_MSI_ROUTING.lock();
+    let routing = routing.as_ref()?;
+    if segment != routing.segment || bus < routing.bus_start || bus > routing.bus_end {
+        return None;
+    }
+    let requester = pci_requester_id(bus, device, function);
+    routing.routes.iter().find_map(|route| {
+        let offset = requester.checked_sub(route.requester_base)?;
+        if offset >= route.length {
+            return None;
+        }
+        let mapped = route.msi_base.checked_add(offset)?;
+        msi::allocate_msi(route.controller, mapped).ok()
+    })
+}
+
 pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool {
     let expected = match host.address_cells.checked_add(host.interrupt_cells) {
         Some(expected) if expected != 0 => expected,
@@ -261,6 +352,31 @@ pub(crate) fn install_irq_routing(segment: u16, host: &DtbPcieHostInfo) -> bool 
     true
 }
 
+pub(crate) fn install_msi_routing(segment: u16, host: &DtbPcieHostInfo) -> bool {
+    let mut routes = Vec::new();
+    for entry in &host.msi_map {
+        if entry.length == 0 {
+            continue;
+        }
+        routes.push(PciMsiRoute {
+            requester_base: entry.requester_base,
+            controller: entry.controller,
+            msi_base: entry.msi_base,
+            length: entry.length,
+        });
+    }
+    if routes.is_empty() {
+        return false;
+    }
+    *PCI_MSI_ROUTING.lock() = Some(PciMsiRouting {
+        segment,
+        bus_start: host.bus_start,
+        bus_end: host.bus_end,
+        routes,
+    });
+    true
+}
+
 /// 装载 ECAM 访问。`phys_base` 是物理地址,`device_mmio_to_virt` 负责转虚拟。
 /// 成功返回 `true`。重复调用会覆盖。
 pub(crate) fn install_ecam(
@@ -287,6 +403,7 @@ pub(crate) fn install_ecam(
             // 关键:BAR 物理地址要经过启动上下文提供的 MMIO 翻译,而不是 identity。
             device_mmio_to_virt: mmio_to_virt_via_stored,
             resolve_irq: Some(resolve_pci_irq),
+            allocate_msi: Some(resolve_pci_msi),
         });
     }
     true
@@ -298,12 +415,20 @@ pub(crate) fn install_ecam(
 //
 /// 扫一遍 PCI 总线并给每个 MMIO BAR 分配一段物理地址。必须在
 /// [`install_ecam`] 之后、`pci_scan_and_register` 之前调用。
-pub(crate) fn assign_bars(bus_start: u8, bus_end: u8) {
-    let Some(mmio_window) = hal::platform::default_pci_mmio_window() else {
+pub(crate) fn assign_bars(host: &DtbPcieHostInfo) {
+    let Some(mmio_window) =
+        select_host_mmio_window(host).or_else(hal::platform::default_pci_mmio_window)
+    else {
         log::printk!("[kernel-start][dtb] no fallback PCI MMIO window for this platform");
         return;
     };
-    let devices = pci_scan_raw(0, bus_start, bus_end);
+    log::printk!(
+        "[kernel-start][dtb] PCI BAR allocator window from {}: {:#x}..{:#x}",
+        host.path,
+        mmio_window.start,
+        mmio_window.end
+    );
+    let devices = pci_scan_raw(host.domain, host.bus_start, host.bus_end);
     let mut next: u64 = mmio_window.start;
     for d in devices.iter() {
         if d.bar_count() == 0 {
@@ -323,6 +448,34 @@ pub(crate) fn assign_bars(bus_start: u8, bus_end: u8) {
         assign_device_bars(&pci, &mut next, mmio_window.end);
     }
     log::printk!("[kernel-start][dtb] assigned PCI BARs up to {:#x}", next);
+}
+
+fn select_host_mmio_window(host: &DtbPcieHostInfo) -> Option<Range<u64>> {
+    let regular = host
+        .ranges
+        .iter()
+        .filter(|range| matches!(range.space, DtbPciAddressSpace::Memory))
+        .filter_map(pci_range_mmio_window)
+        .max_by_key(|range| range.end.saturating_sub(range.start));
+    if regular.is_some() {
+        return regular;
+    }
+
+    host.ranges
+        .iter()
+        .filter(|range| matches!(range.space, DtbPciAddressSpace::PrefetchableMemory))
+        .filter_map(pci_range_mmio_window)
+        .max_by_key(|range| range.end.saturating_sub(range.start))
+}
+
+fn pci_range_mmio_window(range: &DtbPciRangeInfo) -> Option<Range<u64>> {
+    match range.space {
+        DtbPciAddressSpace::Memory | DtbPciAddressSpace::PrefetchableMemory => {}
+        DtbPciAddressSpace::Io | DtbPciAddressSpace::Unknown(_) => return None,
+    }
+    let start = range.parent_addr as u64;
+    let end = start.checked_add(range.size as u64)?;
+    (end > start).then_some(start..end)
 }
 
 /// 给一个 PCI 设备的所有 BAR 分配地址。`next` 是 bump allocator 游标。

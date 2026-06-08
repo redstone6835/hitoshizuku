@@ -80,6 +80,7 @@ struct AllocationRegistryInner {
     double_free_attempts: u64,
     max_chain_len: usize,
     live_by_kind: [usize; 5],
+    initializing: bool,
     initialized: bool,
 }
 
@@ -101,6 +102,7 @@ impl AllocationRegistryInner {
             double_free_attempts: 0,
             max_chain_len: 0,
             live_by_kind: [0; 5],
+            initializing: false,
             initialized: false,
         }
     }
@@ -139,16 +141,33 @@ impl AllocationRegistry {
         let bucket_count = normalize_bucket_count(bucket_count.max(REGISTRY_SHARDS));
         let buckets_per_shard = normalize_bucket_count(bucket_count.div_ceil(REGISTRY_SHARDS));
         for shard in &self.shards {
+            loop {
+                let mut inner = shard.inner.lock();
+                if inner.initialized {
+                    break;
+                }
+                if !inner.initializing {
+                    inner.initializing = true;
+                    break;
+                }
+                drop(inner);
+                core::hint::spin_loop();
+            }
+
             if shard.inner.lock().initialized {
                 continue;
             }
 
             let layout = match Layout::array::<usize>(buckets_per_shard) {
                 Ok(layout) => layout,
-                Err(_) => return false,
+                Err(_) => {
+                    shard.inner.lock().initializing = false;
+                    return false;
+                }
             };
             let buckets = crate::alloc_internal_metadata(layout) as *mut usize;
             if buckets.is_null() {
+                shard.inner.lock().initializing = false;
                 return false;
             }
             for idx in 0..buckets_per_shard {
@@ -159,6 +178,7 @@ impl AllocationRegistry {
 
             let mut inner = shard.inner.lock();
             if inner.initialized {
+                inner.initializing = false;
                 continue;
             }
             inner.buckets = buckets;
@@ -176,6 +196,7 @@ impl AllocationRegistry {
             inner.double_free_attempts = 0;
             inner.max_chain_len = 0;
             inner.live_by_kind = [0; 5];
+            inner.initializing = false;
             inner.initialized = true;
         }
         true

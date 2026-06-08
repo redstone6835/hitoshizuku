@@ -345,12 +345,6 @@ impl FileOps for ExtRegFileOps {
                 .map_ranges(flags, size, &i_block, first_lb, lb_count)
                 .map_err(map_err)?;
 
-            // if ranges.is_empty() && offset == 0 {
-            //     log::info!("[extfs] read_at offset=0 size={} flags={:#x} ranges EMPTY first_lb={} lb_count={}", size, flags, first_lb, lb_count);
-            // } else if offset == 0 {
-            //     log::info!("[extfs] read_at offset=0 size={} ranges={} first=({},{},{:#x})", size, ranges.len(), ranges[0].0, ranges[0].1, ranges[0].2);
-            // }
-
             let mut filled_until = 0usize;
             let mut scratch = Vec::new();
             for (range_lb, range_count, phys_start) in &ranges {
@@ -588,8 +582,10 @@ fn ensure_block_any(
         if let Some(phys) = extent_wr::ensure_block_in_extent(state, i_block, lb)? {
             return Ok(phys);
         }
-        // 原地追加失败 → 降级
-        extent_wr::demote_if_extent(state, flags, i_block)?;
+        // 原地追加失败 → 保留已有数据地降级为间接块布局。
+        if !extent_wr::demote_preserve_if_extent(state, flags, i_block)? {
+            return Err(crate::state::BlockBackendError::Unsupported);
+        }
     }
     map_wr::ensure_block(state, i_block, lb)
 }

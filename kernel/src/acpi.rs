@@ -42,13 +42,11 @@ use general::firmware::{FirmwareTableMapping, SerialPortInfo};
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
-use general::vfs::dentry::{Dentry, VfsRoot};
+use general::vfs::dentry::VfsRoot;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
-use general::vfs::ensure_dir;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
 use general::vfs::mount::{Mount, MountFlags, MountNamespace};
-use general::vfs::mount_posix_shm_tmpfs;
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::{StartContext, StartFirmware};
@@ -382,25 +380,18 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let cred = Credentials::root();
 
-    let dev_inode = root_sb
-        .root_inode
-        .mkdir("dev", FileMode::new(0o755), &cred)
-        .expect("[kernel-start][acpi] failed to create /dev directory");
-    let dev_dentry = general::vfs::DCACHE.insert(Dentry::new_positive(
-        "dev",
-        Some(Arc::clone(&root_sb.root_dentry)),
-        Arc::clone(&dev_inode),
-    ));
+    let vfs_ctx = VfsContext::new(
+        Arc::clone(&root_sb.root_dentry),
+        Arc::clone(&root_mount),
+        VfsRoot::new(Arc::clone(&root_sb.root_dentry), Arc::clone(&root_mount)),
+        Arc::clone(&mount_ns),
+        Arc::new(cred.clone()),
+        FileMode::new(0),
+        VfsLimits::default_arc(),
+    );
 
     let dev_sb = crate::device_init::mount_devtmpfs("acpi");
-
-    mount_ns
-        .mount(
-            Arc::clone(&dev_dentry),
-            Arc::clone(&dev_sb),
-            MountFlags::default(),
-        )
-        .expect("[kernel-start][acpi] failed to mount devtmpfs on /dev");
+    crate::device_init::mount_devtmpfs_on_dev("acpi", &vfs_ctx, Arc::clone(&dev_sb));
 
     let dev_ops = crate::device_init::devtmpfs_ops(&dev_sb, "acpi");
 
@@ -424,6 +415,8 @@ pub fn kernel_start_init(context: &StartContext) {
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
         let info = PlatformDeviceInfo {
             fw_name: port.name.into(),
+            fw_path: None,
+            fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
             properties: DeviceProperties {
@@ -432,6 +425,10 @@ pub fn kernel_start_init(context: &StartContext) {
                 fw_phandle: None,
                 fw_interrupt_parent: None,
                 interrupt_controller: false,
+                fw_address_cells: None,
+                fw_size_cells: None,
+                fw_parent_address_cells: None,
+                fw_parent_size_cells: None,
                 stdout: stdout_phys == Some(port.phys_addr),
             },
             fw_properties: Vec::new(),
@@ -445,6 +442,8 @@ pub fn kernel_start_init(context: &StartContext) {
         ids.push(DeviceMatchId::AcpiHid(ACPI_HID_VIRTIO_MMIO.into()));
         let info = PlatformDeviceInfo {
             fw_name: device.name.into(),
+            fw_path: None,
+            fw_parent_path: None,
             ids,
             resources: device.resources.clone(),
             properties: DeviceProperties::default(),
@@ -462,20 +461,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
 
-    let vfs_ctx = VfsContext::new(
-        Arc::clone(&root_sb.root_dentry),
-        Arc::clone(&root_mount),
-        VfsRoot::new(Arc::clone(&root_sb.root_dentry), Arc::clone(&root_mount)),
-        Arc::clone(&mount_ns),
-        Arc::new(cred.clone()),
-        FileMode::new(0),
-        VfsLimits::default_arc(),
-    );
-
-    // /dev 已经由 devtmpfs 覆盖；此时在其中建立 /dev/shm 挂载点，再覆盖 tmpfs
-    // 作为 POSIX shm 的普通文件后端，避免引入特殊共享内存文件系统。
-    mount_posix_shm_tmpfs(&vfs_ctx)
-        .expect("[kernel-start][acpi] failed to mount tmpfs on /dev/shm");
+    crate::device_init::mount_standard_compat_filesystems("acpi", &vfs_ctx);
 
     // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
     // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
@@ -485,24 +471,6 @@ pub fn kernel_start_init(context: &StartContext) {
         Arc::clone(&mount_ns),
         Arc::new(cred.clone()),
     );
-
-    ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
-        .expect("[kernel-start][acpi] failed to ensure /sys directory");
-    let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
-        .expect("[kernel-start][acpi] failed to resolve /sys")
-        .dentry;
-    let sys_sb = FS_REGISTRY
-        .find("sysfs")
-        .expect("[kernel-start][acpi] sysfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][acpi] failed to mount sysfs");
-    mount_ns
-        .mount(
-            Arc::clone(&sys_dentry),
-            Arc::clone(&sys_sb),
-            MountFlags::default(),
-        )
-        .expect("[kernel-start][acpi] failed to mount sysfs on /sys");
 
     printk!(
         "[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'"

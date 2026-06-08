@@ -7,10 +7,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
 use crate::Interrupt;
 
 #[derive(Clone, Copy)]
@@ -138,9 +139,9 @@ impl IrqRegistry {
         line: IrqLine,
         handler: Arc<dyn IrqHandler>,
     ) -> Result<IrqHandle, IrqError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut handlers = self.handlers.lock();
         handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
         handlers.push(IrqRegistration { id, line, handler });
         drop(handlers);
         enable_irq_line(line);
@@ -201,7 +202,8 @@ impl Default for IrqRegistry {
 static IRQ_REGISTRY: IrqRegistry = IrqRegistry::new();
 static IRQ_LINE_OPS: Spinlock<Option<IrqLineOps>> = Spinlock::new(None);
 static IOCSR_OPS: Spinlock<Option<IocsrOps>> = Spinlock::new(None);
-static DEFAULT_IRQ_DOMAIN: Spinlock<Option<Arc<dyn IrqDomain>>> = Spinlock::new(None);
+static DEFAULT_IRQ_DOMAIN: Spinlock<Option<DefaultIrqDomainRegistration>> = Spinlock::new(None);
+static NEXT_DEFAULT_IRQ_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
 pub trait IrqDomain: Send + Sync {
     /// 将固件中断 specifier 翻译成规范化 [`IrqLine`]。
@@ -223,26 +225,36 @@ pub trait IrqDomain: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IrqDomainHandle {
     controller: u32,
+    id: u64,
 }
 
 impl IrqDomainHandle {
     pub const fn controller(self) -> u32 {
         self.controller
     }
+
+    pub const fn id(self) -> u64 {
+        self.id
+    }
 }
 
 struct IrqDomainRegistration {
     controller: u32,
+    // 同一个 controller 可以在热移除后重新注册。句柄必须带注册代次，旧句柄
+    // 不能注销后来安装的新 domain。
+    id: u64,
     domain: Arc<dyn IrqDomain>,
 }
 
 pub struct IrqDomainRegistry {
+    next_id: AtomicU64,
     domains: Spinlock<Vec<IrqDomainRegistration>>,
 }
 
 impl IrqDomainRegistry {
     pub const fn new() -> Self {
         Self {
+            next_id: AtomicU64::new(1),
             domains: Spinlock::new(Vec::new()),
         }
     }
@@ -257,15 +269,20 @@ impl IrqDomainRegistry {
             return Err(IrqError::AlreadyRegistered);
         }
         domains.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
-        domains.push(IrqDomainRegistration { controller, domain });
-        Ok(IrqDomainHandle { controller })
+        let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
+        domains.push(IrqDomainRegistration {
+            controller,
+            id,
+            domain,
+        });
+        Ok(IrqDomainHandle { controller, id })
     }
 
     pub fn unregister(&self, handle: IrqDomainHandle) -> Result<(), IrqError> {
         let mut domains = self.domains.lock();
         let Some(index) = domains
             .iter()
-            .position(|entry| entry.controller == handle.controller)
+            .position(|entry| entry.controller == handle.controller && entry.id == handle.id)
         else {
             return Err(IrqError::NotFound);
         };
@@ -300,7 +317,20 @@ impl Default for IrqDomainRegistry {
 static IRQ_DOMAINS: IrqDomainRegistry = IrqDomainRegistry::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DefaultIrqDomainHandle;
+pub struct DefaultIrqDomainHandle {
+    id: u64,
+}
+
+impl DefaultIrqDomainHandle {
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+}
+
+struct DefaultIrqDomainRegistration {
+    id: u64,
+    domain: Arc<dyn IrqDomain>,
+}
 
 pub fn register_irq_handler(
     line: IrqLine,
@@ -410,17 +440,24 @@ pub fn register_default_irq_domain(
     if default.is_some() {
         return Err(IrqError::AlreadyRegistered);
     }
-    *default = Some(domain);
-    Ok(DefaultIrqDomainHandle)
+    let id = registry_id::alloc_atomic_id(&NEXT_DEFAULT_IRQ_DOMAIN_ID)
+        .map_err(|_| IrqError::OutOfMemory)?;
+    *default = Some(DefaultIrqDomainRegistration { id, domain });
+    Ok(DefaultIrqDomainHandle { id })
 }
 
-pub fn unregister_default_irq_domain(_handle: DefaultIrqDomainHandle) -> Result<(), IrqError> {
+pub fn unregister_default_irq_domain(handle: DefaultIrqDomainHandle) -> Result<(), IrqError> {
     let mut default = DEFAULT_IRQ_DOMAIN.lock();
-    if default.take().is_some() {
-        Ok(())
-    } else {
-        Err(IrqError::NotFound)
+    let Some(registration) = default.as_ref() else {
+        return Err(IrqError::NotFound);
+    };
+    // 默认 IRQ domain 和其它 domain 一样使用注册句柄表达所有权。旧 handle
+    // 不能注销后续重新安装的 domain，否则 ACPI/DTB 启动路径的恢复逻辑会互相踩踏。
+    if registration.id != handle.id {
+        return Err(IrqError::NotFound);
     }
+    *default = None;
+    Ok(())
 }
 
 pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<IrqLine> {
@@ -429,6 +466,6 @@ pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<
         None => DEFAULT_IRQ_DOMAIN
             .lock()
             .as_ref()
-            .and_then(|domain| domain.translate(cells)),
+            .and_then(|registration| registration.domain.translate(cells)),
     }
 }

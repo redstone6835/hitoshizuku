@@ -39,7 +39,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::dev::char::{CharDevice, CharDriver, CharIoError};
 use crate::dev::function::DevNodeSpec;
-use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_node};
+use crate::dev::pnp::PnpError;
+use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -114,18 +115,6 @@ impl<T> SpinLock<T> {
             }
         }
     }
-
-    fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-        if self
-            .flag
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            Some(SpinLockGuard { lock: self })
-        } else {
-            None
-        }
-    }
 }
 
 struct SpinLockGuard<'a, T> {
@@ -194,8 +183,11 @@ impl EntropyPool {
     ///   4. 末尾再 "tap" 一遍以增加扩散。
     fn mix(&mut self, mut input: &[u8]) {
         while input.len() >= 8 {
-            let w = u64::from_le_bytes(input[..8].try_into().unwrap());
-            input = &input[8..];
+            let (word, rest) = input.split_at(core::mem::size_of::<u64>());
+            let mut bytes = [0u8; core::mem::size_of::<u64>()];
+            bytes.copy_from_slice(word);
+            let w = u64::from_le_bytes(bytes);
+            input = rest;
             self.state[0] = self.state[0].wrapping_add(w.rotate_left(13));
             self.state[0] ^= self.state[1].rotate_left(7);
             self.state[1] = self.state[1].wrapping_add(self.state[0].rotate_left(17));
@@ -266,12 +258,16 @@ impl ChaCha20 {
         const CONSTANT: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
         let mut state = [0u32; 16];
         state[0..4].copy_from_slice(&CONSTANT);
-        for i in 0..8 {
-            state[4 + i] = u32::from_le_bytes(key[i * 4..(i + 1) * 4].try_into().unwrap());
+        for (slot, chunk) in state[4..12].iter_mut().zip(key.chunks_exact(4)) {
+            let mut bytes = [0u8; core::mem::size_of::<u32>()];
+            bytes.copy_from_slice(chunk);
+            *slot = u32::from_le_bytes(bytes);
         }
         // state[12] = counter = 0
-        for i in 0..3 {
-            state[13 + i] = u32::from_le_bytes(nonce[i * 4..(i + 1) * 4].try_into().unwrap());
+        for (slot, chunk) in state[13..16].iter_mut().zip(nonce.chunks_exact(4)) {
+            let mut bytes = [0u8; core::mem::size_of::<u32>()];
+            bytes.copy_from_slice(chunk);
+            *slot = u32::from_le_bytes(bytes);
         }
         Self { state }
     }
@@ -672,6 +668,11 @@ impl CharDriver for UrandomDriver {
 /// `&'static` 单例，给 devtmpfs 绑定。
 pub static RANDOM_DRIVER: RandomDriver = RandomDriver;
 pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
+const RANDOM_STATIC_NODE_OWNER: &str = "random-driver";
+const RANDOM_STATIC_NODES: [DevTmpfsStaticNode; 2] = [
+    DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "random", random_dev_node),
+    DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "urandom", urandom_dev_node),
+];
 
 fn random_dev_node() -> DevNodeSpec {
     DevNodeSpec::Char {
@@ -692,8 +693,6 @@ fn urandom_dev_node() -> DevNodeSpec {
 // 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以
 // 满足 `drivers::register_builtin_drivers()` 调用约定，但没有设备需要
 // 通过 PnP 枚举来发现这两个节点，它们通过 devtmpfs 静态节点注册表声明。
-use crate::dev::pnp::PnpError;
-
 /// 注册 random 子系统。
 ///
 /// 内部会：
@@ -705,19 +704,7 @@ use crate::dev::pnp::PnpError;
 /// 驱动只提交 `DevNodeSpec`，实际 inode 创建仍由 devtmpfs 统一完成。
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     seed_from_startup();
-    register_static_dev_node(DevTmpfsStaticNode::new(
-        "random-driver",
-        "random",
-        random_dev_node,
-    ))
-    .map_err(|_| PnpError::DevtmpfsError)?;
-    register_static_dev_node(DevTmpfsStaticNode::new(
-        "random-driver",
-        "urandom",
-        urandom_dev_node,
-    ))
-    .map_err(|_| PnpError::DevtmpfsError)?;
-    Ok(())
+    register_static_dev_nodes(&RANDOM_STATIC_NODES).map_err(|_| PnpError::DevtmpfsError)
 }
 
 /// 启动期喂熵 + 首次 reseed。

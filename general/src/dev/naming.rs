@@ -7,7 +7,6 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
@@ -16,16 +15,36 @@ use spin::mutex::Mutex;
 /// `prefix` 由具体类别声明，`stable_key` 由 PnP identity、固件路径或总线地址提供。
 /// 同一个 key 多次分配会复用同一个短名，避免驱动解绑、依赖重试或热插重扫导致
 /// 用户可见名称随 probe 顺序漂移。
+///
+/// 分配状态按前缀全局共享，而不是按驱动实例保存。多个驱动如果都声明同一个
+/// `prefix`，会自然消费同一组编号，避免 `uart0`/`uart0` 或 `vd0`/`vd0` 这类
+/// 兼容层节点名冲突。`StableNameAllocator` 本身只是一份轻量的前缀声明。
 pub struct StableNameAllocator {
     prefix: &'static str,
-    next_index: AtomicUsize,
-    reservations: Mutex<Vec<StableNameReservation>>,
 }
 
 struct StableNameReservation {
     stable_key: String,
     name: StableName,
 }
+
+struct StableNamePrefixState {
+    prefix: &'static str,
+    next_index: usize,
+    reservations: Vec<StableNameReservation>,
+}
+
+impl StableNamePrefixState {
+    const fn new(prefix: &'static str) -> Self {
+        Self {
+            prefix,
+            next_index: 0,
+            reservations: Vec::new(),
+        }
+    }
+}
+
+static STABLE_NAME_PREFIXES: Mutex<Vec<StableNamePrefixState>> = Mutex::new(Vec::new());
 
 /// 一次稳定命名分配的结果。
 ///
@@ -59,35 +78,28 @@ pub enum StableNameAllocError {
 
 impl StableNameAllocator {
     pub const fn new(prefix: &'static str) -> Self {
-        Self {
-            prefix,
-            next_index: AtomicUsize::new(0),
-            reservations: Mutex::new(Vec::new()),
-        }
+        Self { prefix }
     }
 
     /// 分配下一个短名，例如 `uart0` 或 `vd1`。
     pub fn try_alloc(&self) -> Result<StableName, StableNameAllocError> {
-        loop {
-            let index = self.next_index.load(Ordering::Relaxed);
-            let next = index
-                .checked_add(1)
-                .ok_or(StableNameAllocError::OutOfMemory)?;
-            let name = self.try_build_name(index)?;
-            if self
-                .next_index
-                .compare_exchange(index, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok(StableName { index, name });
-            }
-        }
+        let mut prefixes = STABLE_NAME_PREFIXES.lock();
+        let state = prefix_state_mut(&mut prefixes, self.prefix)?;
+        let index = state.next_index;
+        let next = index
+            .checked_add(1)
+            .ok_or(StableNameAllocError::OutOfMemory)?;
+        let name = try_build_name(self.prefix, index)?;
+        state.next_index = next;
+        Ok(StableName { index, name })
     }
 
     /// 为稳定设备身份分配或复用短名。
     pub fn try_alloc_stable(&self, stable_key: &str) -> Result<StableName, StableNameAllocError> {
-        let mut reservations = self.reservations.lock();
-        if let Some(existing) = reservations
+        let mut prefixes = STABLE_NAME_PREFIXES.lock();
+        let state = prefix_state_mut(&mut prefixes, self.prefix)?;
+        if let Some(existing) = state
+            .reservations
             .iter()
             .find(|reservation| reservation.stable_key == stable_key)
         {
@@ -95,11 +107,12 @@ impl StableNameAllocator {
         }
 
         let stable_key = try_clone_string(stable_key)?;
-        reservations
+        state
+            .reservations
             .try_reserve(1)
             .map_err(|_| StableNameAllocError::OutOfMemory)?;
-        let (name, reserved_name) = self.try_alloc_pair()?;
-        reservations.push(StableNameReservation {
+        let (name, reserved_name) = try_alloc_pair(state, self.prefix)?;
+        state.reservations.push(StableNameReservation {
             stable_key,
             name: reserved_name,
         });
@@ -110,47 +123,57 @@ impl StableNameAllocator {
     pub const fn prefix(&self) -> &'static str {
         self.prefix
     }
+}
 
-    fn try_build_name(&self, index: usize) -> Result<String, StableNameAllocError> {
-        let len = self
-            .prefix
-            .len()
-            .checked_add(decimal_digits(index))
-            .ok_or(StableNameAllocError::OutOfMemory)?;
-        let mut name = String::new();
-        name.try_reserve(len)
-            .map_err(|_| StableNameAllocError::OutOfMemory)?;
-        name.push_str(self.prefix);
-        write!(&mut name, "{}", index).map_err(|_| StableNameAllocError::OutOfMemory)?;
-        Ok(name)
+fn prefix_state_mut<'a>(
+    prefixes: &'a mut Vec<StableNamePrefixState>,
+    prefix: &'static str,
+) -> Result<&'a mut StableNamePrefixState, StableNameAllocError> {
+    if let Some(index) = prefixes.iter().position(|state| state.prefix == prefix) {
+        return Ok(&mut prefixes[index]);
     }
 
-    fn try_alloc_pair(&self) -> Result<(StableName, StableName), StableNameAllocError> {
-        loop {
-            let index = self.next_index.load(Ordering::Relaxed);
-            let next = index
-                .checked_add(1)
-                .ok_or(StableNameAllocError::OutOfMemory)?;
-            let public_name = self.try_build_name(index)?;
-            let reserved_name = self.try_build_name(index)?;
-            if self
-                .next_index
-                .compare_exchange(index, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
-                return Ok((
-                    StableName {
-                        index,
-                        name: public_name,
-                    },
-                    StableName {
-                        index,
-                        name: reserved_name,
-                    },
-                ));
-            }
-        }
-    }
+    prefixes
+        .try_reserve(1)
+        .map_err(|_| StableNameAllocError::OutOfMemory)?;
+    prefixes.push(StableNamePrefixState::new(prefix));
+    prefixes.last_mut().ok_or(StableNameAllocError::OutOfMemory)
+}
+
+fn try_build_name(prefix: &str, index: usize) -> Result<String, StableNameAllocError> {
+    let len = prefix
+        .len()
+        .checked_add(decimal_digits(index))
+        .ok_or(StableNameAllocError::OutOfMemory)?;
+    let mut name = String::new();
+    name.try_reserve(len)
+        .map_err(|_| StableNameAllocError::OutOfMemory)?;
+    name.push_str(prefix);
+    write!(&mut name, "{}", index).map_err(|_| StableNameAllocError::OutOfMemory)?;
+    Ok(name)
+}
+
+fn try_alloc_pair(
+    state: &mut StableNamePrefixState,
+    prefix: &str,
+) -> Result<(StableName, StableName), StableNameAllocError> {
+    let index = state.next_index;
+    let next = index
+        .checked_add(1)
+        .ok_or(StableNameAllocError::OutOfMemory)?;
+    let public_name = try_build_name(prefix, index)?;
+    let reserved_name = try_build_name(prefix, index)?;
+    state.next_index = next;
+    Ok((
+        StableName {
+            index,
+            name: public_name,
+        },
+        StableName {
+            index,
+            name: reserved_name,
+        },
+    ))
 }
 
 fn decimal_digits(mut value: usize) -> usize {
