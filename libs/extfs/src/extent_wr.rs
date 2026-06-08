@@ -93,6 +93,57 @@ pub(crate) fn demote_if_extent(
     Ok(())
 }
 
+/// 保留现有数据块,把 depth=0 的 extent 根转换成 direct/indirect 映射。
+///
+/// 写路径不能使用 [`demote_if_extent`],因为它会释放 extent 树下的数据块。
+/// 当 extent 根已经无法继续追加时,这里把已有叶子映射搬到传统间接块布局,
+/// 然后调用方可以继续用 [`crate::map_wr::ensure_block`] 扩容。
+pub(crate) fn demote_preserve_if_extent(
+    state: &FsState,
+    flags: &mut u32,
+    i_block: &mut [u8],
+) -> Result<bool, BlockBackendError> {
+    if *flags & EXT4_EXTENTS_FL == 0 {
+        return Ok(true);
+    }
+    if i_block.len() < EXT_HEADER_SIZE {
+        return Ok(false);
+    }
+    let magic = u16::from_le_bytes([i_block[0], i_block[1]]);
+    if magic != EXT4_EXT_MAGIC {
+        return Ok(false);
+    }
+    let entries = u16::from_le_bytes([i_block[2], i_block[3]]) as usize;
+    let depth = u16::from_le_bytes([i_block[6], i_block[7]]);
+    if depth != 0 {
+        return Ok(false);
+    }
+
+    let old = i_block.to_vec();
+    reset_to_indirect(i_block);
+    for i in 0..entries {
+        let off = EXT_HEADER_SIZE + i * EXT_ENTRY_SIZE;
+        if off + EXT_ENTRY_SIZE > old.len() {
+            return Ok(false);
+        }
+        let ee_block = u32::from_le_bytes([old[off], old[off + 1], old[off + 2], old[off + 3]]);
+        let ee_len = u16::from_le_bytes([old[off + 4], old[off + 5]]);
+        if ee_len > 0x8000 {
+            return Ok(false);
+        }
+        let start_hi = u16::from_le_bytes([old[off + 6], old[off + 7]]) as u64;
+        let start_lo =
+            u32::from_le_bytes([old[off + 8], old[off + 9], old[off + 10], old[off + 11]])
+                as u64;
+        let start = (start_hi << 32) | start_lo;
+        for b in 0..ee_len as u32 {
+            crate::map_wr::set_existing_block(state, i_block, ee_block + b, start + b as u64)?;
+        }
+    }
+    *flags &= !EXT4_EXTENTS_FL;
+    Ok(true)
+}
+
 /// 判断 i_block 是否已经是合法的 extent 根(简单看 magic)。
 #[inline]
 #[allow(dead_code)]
