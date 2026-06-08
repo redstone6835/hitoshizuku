@@ -918,12 +918,11 @@ impl NetSocketFileOps {
             SocketType::Tcp => loop {
                 match net::stack().tcp_send(handle, data) {
                     Ok(n) => {
-                        // TCP send 已经主动 poll 协议栈；这里再让出一次 CPU，
-                        // 让 loopback 对端及时运行并消费刚送达的数据。netperf
-                        // TCP_RR/TCP_CRR 这类短请求响应会在 write 后立刻 read，
-                        // 如果当前任务连续运行，响应端可能先睡进 recv，客户端
-                        // 还没机会处理已唤醒的可读事件。
-                        sched::schedule_once(sched::now_ns_public());
+                        // 小请求/响应负载主动让出让 loopback 对端尽快处理；
+                        // 流式大块写则避免每次 send 都调度。
+                        if n <= 512 {
+                            sched::schedule_once(sched::now_ns_public());
+                        }
                         return Ok(n);
                     }
                     Err(NetError::WouldBlock) => {
