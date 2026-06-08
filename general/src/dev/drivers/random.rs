@@ -39,9 +39,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::dev::char::{CharDevice, CharDriver, CharIoError};
 use crate::dev::function::DevNodeSpec;
-use crate::vfs::devtmpfs::{
-    DevTmpfsStaticNode, register_static_dev_node, unregister_static_dev_node,
-};
+use crate::dev::pnp::PnpError;
+use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -669,6 +668,11 @@ impl CharDriver for UrandomDriver {
 /// `&'static` 单例，给 devtmpfs 绑定。
 pub static RANDOM_DRIVER: RandomDriver = RandomDriver;
 pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
+const RANDOM_STATIC_NODE_OWNER: &str = "random-driver";
+const RANDOM_STATIC_NODES: [DevTmpfsStaticNode; 2] = [
+    DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "random", random_dev_node),
+    DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "urandom", urandom_dev_node),
+];
 
 fn random_dev_node() -> DevNodeSpec {
     DevNodeSpec::Char {
@@ -689,8 +693,6 @@ fn urandom_dev_node() -> DevNodeSpec {
 // 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以
 // 满足 `drivers::register_builtin_drivers()` 调用约定，但没有设备需要
 // 通过 PnP 枚举来发现这两个节点，它们通过 devtmpfs 静态节点注册表声明。
-use crate::dev::pnp::PnpError;
-
 /// 注册 random 子系统。
 ///
 /// 内部会：
@@ -702,23 +704,7 @@ use crate::dev::pnp::PnpError;
 /// 驱动只提交 `DevNodeSpec`，实际 inode 创建仍由 devtmpfs 统一完成。
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     seed_from_startup();
-    register_static_dev_node(DevTmpfsStaticNode::new(
-        "random-driver",
-        "random",
-        random_dev_node,
-    ))
-    .map_err(|_| PnpError::DevtmpfsError)?;
-    if register_static_dev_node(DevTmpfsStaticNode::new(
-        "random-driver",
-        "urandom",
-        urandom_dev_node,
-    ))
-    .is_err()
-    {
-        let _ = unregister_static_dev_node("random-driver", "random");
-        return Err(PnpError::DevtmpfsError);
-    }
-    Ok(())
+    register_static_dev_nodes(&RANDOM_STATIC_NODES).map_err(|_| PnpError::DevtmpfsError)
 }
 
 /// 启动期喂熵 + 首次 reseed。
