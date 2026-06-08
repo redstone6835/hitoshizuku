@@ -1,16 +1,16 @@
-//! Common DMA allocation helpers.
+//! 通用 DMA 分配与同步辅助。
 
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use spin::mutex::Mutex;
 
-/// Direction of DMA ownership transfer between CPU memory and a device.
+/// CPU 与设备之间的 DMA 所有权转移方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaDirection {
-    /// CPU writes the buffer, then the device reads it.
+    /// CPU 写入缓冲区，随后设备读取。
     ToDevice,
-    /// Device writes the buffer, then the CPU reads it.
+    /// 设备写入缓冲区，随后 CPU 读取。
     FromDevice,
-    /// Both CPU and device may read or write the buffer.
+    /// CPU 和设备都可能读写缓冲区。
     Bidirectional,
 }
 
@@ -26,6 +26,11 @@ pub struct DmaSyncRegion {
 pub struct DmaOps {
     pub sync_for_device: fn(DmaSyncRegion),
     pub sync_for_cpu: fn(DmaSyncRegion),
+    /// 把内核物理地址转换成设备在描述符中应看到的 DMA 地址。
+    ///
+    /// 当前直连总线通常是 identity；一旦平台引入 IOMMU、bounce buffer 或
+    /// 设备侧地址窗口，只需要替换此 hook，驱动仍统一使用 [`DmaBuffer::dma_addr`]。
+    pub phys_to_dma: fn(DmaSyncRegion) -> usize,
 }
 
 impl DmaOps {
@@ -33,6 +38,7 @@ impl DmaOps {
         Self {
             sync_for_device: dma_coherent_sync,
             sync_for_cpu: dma_coherent_sync,
+            phys_to_dma: dma_identity_addr,
         }
     }
 }
@@ -48,16 +54,21 @@ fn dma_coherent_sync(_region: DmaSyncRegion) {
     // 通过 set_dma_ops() 安装 arch/platform 专用同步 hook。
 }
 
-/// Physically backed DMA buffer with a stable kernel virtual mapping.
+fn dma_identity_addr(region: DmaSyncRegion) -> usize {
+    region.paddr
+}
+
+/// 由物理页支撑、具有稳定内核虚拟映射和设备可见 DMA 地址的缓冲区。
 pub struct DmaBuffer {
     allocation: PhysicalAllocation,
     vaddr: usize,
+    dma_addr: usize,
     len: usize,
     direction: DmaDirection,
 }
 
 impl DmaBuffer {
-    /// Allocate a zeroed DMA buffer with at least `len` usable bytes.
+    /// 分配一个已清零的 DMA 缓冲区，至少暴露 `len` 字节可用空间。
     pub fn new(len: usize, align: usize, direction: DmaDirection) -> Result<Self, &'static str> {
         if !align.is_power_of_two() {
             return Err("DMA alignment must be a non-zero power of two");
@@ -77,61 +88,76 @@ impl DmaBuffer {
             core::ptr::write_bytes(vaddr as *mut u8, 0, allocation.size);
         }
 
+        let region = DmaSyncRegion {
+            paddr: allocation.paddr,
+            vaddr,
+            len: alloc_len,
+            direction,
+        };
+        let ops = *DMA_OPS.lock();
+        let dma_addr = (ops.phys_to_dma)(region);
+
         Ok(Self {
             allocation,
             vaddr,
+            dma_addr,
             len,
             direction,
         })
     }
 
-    /// Allocate a zeroed page-sized DMA buffer.
+    /// 分配一个已清零的页大小 DMA 缓冲区。
     pub fn page(direction: DmaDirection) -> Result<Self, &'static str> {
         Self::new(PAGE_SIZE, PAGE_SIZE, direction)
     }
 
-    /// Physical address suitable for device descriptors.
+    /// 后端物理地址，仅供内核内部诊断或平台层转换使用。
     pub const fn paddr(&self) -> usize {
         self.allocation.paddr
     }
 
-    /// Kernel virtual address of the DMA buffer.
+    /// 设备描述符中应写入的 DMA 地址。
+    pub const fn dma_addr(&self) -> usize {
+        self.dma_addr
+    }
+
+    /// DMA 缓冲区的内核虚拟地址。
     pub const fn vaddr(&self) -> usize {
         self.vaddr
     }
 
-    /// Usable byte length exposed by this buffer.
+    /// 对外暴露的可用字节长度。
     pub const fn len(&self) -> usize {
         self.len
     }
 
-    /// Returns true when the exposed usable length is zero.
+    /// 对外暴露长度是否为 0。
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    /// Configured transfer direction for this buffer.
+    /// 缓冲区配置的 DMA 传输方向。
     pub const fn direction(&self) -> DmaDirection {
         self.direction
     }
 
-    /// Immutable CPU view of the DMA buffer.
+    /// DMA 缓冲区的不可变 CPU 视图。
     pub fn as_slice(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.vaddr as *const u8, self.len) }
     }
 
-    /// Mutable CPU view of the DMA buffer.
+    /// DMA 缓冲区的可变 CPU 视图。
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.vaddr as *mut u8, self.len) }
     }
 
-    /// Prepare CPU-written contents for device access.
+    /// 将 CPU 写入的内容同步到设备可见状态。
     pub fn sync_for_device(&self) {
         let ops = *DMA_OPS.lock();
         (ops.sync_for_device)(self.sync_region());
     }
 
-    /// Prepare device-written contents for CPU access.
+    /// 将设备写入的内容同步到 CPU 可见状态。
     pub fn sync_for_cpu(&self) {
         let ops = *DMA_OPS.lock();
         (ops.sync_for_cpu)(self.sync_region());
@@ -153,30 +179,30 @@ impl Drop for DmaBuffer {
     }
 }
 
-/// Convenience wrapper for one page-sized, page-aligned DMA allocation.
+/// 单页、页对齐 DMA 分配的便捷包装。
 pub struct DmaPage {
     buffer: DmaBuffer,
 }
 
 impl DmaPage {
-    /// Allocate a zeroed DMA page.
+    /// 分配一个已清零 DMA 页。
     pub fn new(direction: DmaDirection) -> Result<Self, &'static str> {
         Ok(Self {
             buffer: DmaBuffer::page(direction)?,
         })
     }
 
-    /// Borrow the backing DMA buffer.
+    /// 借用底层 DMA 缓冲区。
     pub const fn buffer(&self) -> &DmaBuffer {
         &self.buffer
     }
 
-    /// Mutably borrow the backing DMA buffer.
+    /// 可变借用底层 DMA 缓冲区。
     pub const fn buffer_mut(&mut self) -> &mut DmaBuffer {
         &mut self.buffer
     }
 
-    /// Consume the wrapper and return the backing DMA buffer.
+    /// 消费包装并返回底层 DMA 缓冲区。
     pub fn into_buffer(self) -> DmaBuffer {
         self.buffer
     }

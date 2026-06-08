@@ -8,7 +8,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::platform::{DeviceResource, PlatformDeviceInfo};
+use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     RealtimeClockSource, register_driver_factory,
@@ -373,8 +373,9 @@ impl RtcDriver for Ls7aRtc {
         if self.alarm_irq_supported() && self.alarm_irq_available() {
             features = features.with(RtcFeatures::ALARM_IRQ);
         }
-        // TODO(rtc-ls7a): UPDATE_IRQ/PERIODIC_IRQ 需要确认 LS7A 是否提供对应硬件
-        // 事件源；当前只在 IRQ line 可解析且 handler 已注册时声明 alarm IRQ。
+        // class 层只消费已声明且可确认的事件源。当前驱动只把已接入 IRQ
+        // domain 的 alarm 事件声明为能力，避免把未接线的 update/periodic
+        // 事件暴露成可用接口。
         features
     }
 
@@ -587,13 +588,17 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         let Some((phys, size)) = info.first_mmio() else {
             return Err(PnpError::ProbeFailed);
         };
-        let irq_line = info.first_irq_line();
-        if info.has_irq_resource() && irq_line.is_none() {
-            log::debug!(
-                "[platform-ls7a-rtc] {} has firmware IRQ resource but no registered IRQ domain translator",
-                dev.id
-            );
-        }
+        let irq_line = match info.resolve_first_irq_line() {
+            Ok(line) => Some(line),
+            Err(PlatformIrqResolveError::NoResource) => None,
+            Err(PlatformIrqResolveError::Unresolved) => {
+                log::debug!(
+                    "[platform-ls7a-rtc] {} has firmware IRQ resource but no registered IRQ domain translator",
+                    dev.id
+                );
+                return Err(PnpError::ProbeDeferred);
+            }
+        };
 
         let pm_base =
             firmware_pm_mmio(info).map(|(pm_phys, _)| (self.device_mmio_to_virt)(pm_phys));
@@ -613,7 +618,8 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         })?;
 
         let rtc_driver: Arc<dyn RtcDriver> = rtc.clone();
-        let rtc_dev = Arc::new(RtcDevice::new(RtcDevice::alloc_index(), rtc_driver));
+        let rtc_node_name = RtcDevice::alloc_stable_node_name(&dev.name)?;
+        let rtc_dev = Arc::new(RtcDevice::new(rtc_node_name, rtc_driver));
         dev.register_function(Arc::new(RtcFunction::new(Arc::clone(&rtc_dev))))?;
         let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, irq_line)?;
 
@@ -658,12 +664,7 @@ fn second_mmio(info: &PlatformDeviceInfo) -> Option<(usize, usize)> {
     // 固件如果声明了额外 MMIO resource，第一段仍是 RTC TOY 窗口，第二段才作为
     // alarm enable/status 所需的 PM 窗口。没有该资源时驱动只声明无需 PM 的能力，
     // 不从 TOY 地址反推 PM 基址，避免访问固件未授权的 MMIO 区域。
-    let mut mmio = info.resources.iter().filter_map(|resource| match resource {
-        DeviceResource::Mmio { phys, size } => Some((*phys, *size)),
-        DeviceResource::Irq { .. } => None,
-    });
-    let _ = mmio.next();
-    mmio.next()
+    info.mmio_at(1)
 }
 
 struct Ls7aRtcFactory;

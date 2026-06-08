@@ -94,12 +94,57 @@ fn control_net_device(
         NetControlRequest::GetMacAddress => {
             Ok(NetControlResponse::MacAddress(dev.driver().mac_address()))
         }
-        NetControlRequest::GetMtu => Ok(NetControlResponse::Usize(dev.driver().mtu())),
+        NetControlRequest::GetMtu => Ok(NetControlResponse::Usize(dev.mtu())),
         NetControlRequest::GetTxDropped => Ok(NetControlResponse::U64(dev.tx_dropped())),
         NetControlRequest::GetStats => Ok(NetControlResponse::Stats(dev.driver().stats())),
-        NetControlRequest::SetMtu { .. }
-        | NetControlRequest::SetFlags { .. }
-        | NetControlRequest::SetMacAddress { .. } => Err(ControlError::Unsupported),
+        NetControlRequest::SetMtu { mtu } => {
+            // MTU 由 NetDevice 保存为软件上限，驱动仍只声明硬件能力。
+            dev.set_mtu(mtu).map_err(map_net_control_error)?;
+            Ok(NetControlResponse::Done)
+        }
+        NetControlRequest::SetAdminUp { up } => {
+            // 管理启停属于协议栈内的接口状态，不直接改写驱动硬件寄存器。
+            // ioctl 层只负责把兼容 flags 翻译为这个布尔语义。
+            net::stack()
+                .set_iface_admin_up(dev.id(), up)
+                .map_err(map_net_control_error)?;
+            Ok(NetControlResponse::Done)
+        }
+    }
+}
+
+fn map_net_control_error(err: net::NetError) -> ControlError {
+    match err {
+        net::NetError::InterfaceNotFound => ControlError::NoDevice,
+        net::NetError::InvalidArgument => ControlError::Invalid,
+        net::NetError::ResourceExhausted => ControlError::Busy,
+        net::NetError::LinkDown
+        | net::NetError::TimedOut
+        | net::NetError::ConnectionReset
+        | net::NetError::Unreachable
+        | net::NetError::Closed => ControlError::Io,
+        net::NetError::InterfaceExists | net::NetError::AddressInUse => ControlError::Busy,
+        net::NetError::ConnectionRefused
+        | net::NetError::WouldBlock
+        | net::NetError::BufferTooSmall => ControlError::Invalid,
+    }
+}
+
+fn map_net_errno(err: net::NetError) -> Errno {
+    match err {
+        net::NetError::InterfaceNotFound => Errno::ENODEV,
+        net::NetError::InvalidArgument => Errno::EINVAL,
+        net::NetError::ResourceExhausted => Errno::ENOMEM,
+        net::NetError::WouldBlock => Errno::EAGAIN,
+        net::NetError::AddressInUse => Errno::EADDRINUSE,
+        net::NetError::TimedOut => Errno::ETIMEDOUT,
+        net::NetError::ConnectionRefused => Errno::ECONNREFUSED,
+        net::NetError::ConnectionReset => Errno::ECONNRESET,
+        net::NetError::Closed => Errno::EPIPE,
+        net::NetError::LinkDown | net::NetError::Unreachable | net::NetError::BufferTooSmall => {
+            Errno::EINVAL
+        }
+        net::NetError::InterfaceExists => Errno::EEXIST,
     }
 }
 
@@ -125,7 +170,7 @@ const SIOCGARP: u32 = 0x8954;
 const SIOCSARP: u32 = 0x8955;
 const SIOCDARP: u32 = 0x8953;
 
-/// Linux ifreq 固定布局：ifr_name[16] + union[24]。
+/// 用户态 ifreq 兼容布局：ifr_name[16] + union[24]。
 const IFREQ_SIZE: usize = 40;
 const IFNAMSIZ: usize = 16;
 const IFCONF_LEN_OFFSET: usize = 0;
@@ -140,7 +185,7 @@ const ARPREQ_FLAGS_OFFSET: usize = 32;
 const AF_INET: u8 = 2;
 const ARPHRD_ETHER: u8 = 1;
 const ATF_COM: u32 = 0x02;
-/// 当前 net driver 没有独立 txqlen 状态，先返回 Linux 常见默认值。
+/// 当前 net driver 没有独立 txqlen 状态，先返回兼容层默认值。
 const DEFAULT_TX_QUEUE_LEN: i32 = 1000;
 
 /// 处理网络 socket 上的 ioctl。由 syscall 层调用。
@@ -155,10 +200,11 @@ pub fn net_ioctl(cmd: u32, arg: usize) -> Result<usize, Errno> {
         SIOCGIFINDEX => ioctl_gifindex(arg),
         SIOCGIFTXQLEN => ioctl_giftxqlen(arg),
         SIOCGIFBRDADDR => ioctl_gifbrdaddr(arg),
-        SIOCSIFFLAGS => Err(Errno::EPERM), // smoltcp 不支持接口 UP/DOWN 切换
+        SIOCSIFFLAGS => ioctl_sifflags(arg),
         SIOCSIFADDR => ioctl_sifaddr(arg),
         SIOCSIFNETMASK => ioctl_sifnetmask(arg),
-        SIOCSIFMTU | SIOCSIFTXQLEN => Err(Errno::EPERM),
+        SIOCSIFMTU => ioctl_sifmtu(arg),
+        SIOCSIFTXQLEN => Err(Errno::EPERM),
         SIOCADDRT => ioctl_addrt(arg),
         SIOCDELRT => ioctl_delrt(arg),
         // ARP 邻居表查询：通过 mygo-smoltcp 暴露的 neighbor_cache 获取真实数据
@@ -332,7 +378,7 @@ fn ioctl_gifindex(arg: usize) -> Result<usize, Errno> {
 }
 
 fn ioctl_giftxqlen(arg: usize) -> Result<usize, Errno> {
-    // Linux 默认 txqlen 为 1000，virtio-net 驱动无单独 txqlen 暴露。
+    // 兼容层默认 txqlen 为 1000，virtio-net 驱动无单独 txqlen 暴露。
     let name = read_ifreq_name(arg)?;
     let _iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
     let txqlen = DEFAULT_TX_QUEUE_LEN.to_ne_bytes();
@@ -362,6 +408,33 @@ fn ioctl_gifbrdaddr(arg: usize) -> Result<usize, Errno> {
 }
 
 // ── 设置类 ioctl 实现 ─────────────────────────────────────────────────────
+
+fn ioctl_sifflags(arg: usize) -> Result<usize, Errno> {
+    let name = read_ifreq_name(arg)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let mut flags = [0u8; 2];
+    copy_from_user(arg + IFREQ_DATA_OFFSET, &mut flags).map_err(|_| Errno::EFAULT)?;
+    let flags = u16::from_ne_bytes(flags) as u32;
+    net::stack()
+        .set_iface_admin_up(iface.id, flags & net::IFF_UP != 0)
+        .map_err(|_| Errno::ENODEV)?;
+    Ok(0)
+}
+
+fn ioctl_sifmtu(arg: usize) -> Result<usize, Errno> {
+    let name = read_ifreq_name(arg)?;
+    let iface = find_iface_by_name(&name).ok_or(Errno::ENODEV)?;
+    let mut raw = [0u8; 4];
+    copy_from_user(arg + IFREQ_DATA_OFFSET, &mut raw).map_err(|_| Errno::EFAULT)?;
+    let mtu = i32::from_ne_bytes(raw);
+    if mtu < 0 {
+        return Err(Errno::EINVAL);
+    }
+    net::stack()
+        .set_iface_mtu(iface.id, mtu as usize)
+        .map_err(map_net_errno)?;
+    Ok(0)
+}
 
 fn ioctl_sifaddr(arg: usize) -> Result<usize, Errno> {
     let name = read_ifreq_name(arg)?;

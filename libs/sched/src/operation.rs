@@ -91,11 +91,12 @@ fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
 
 pub fn getpgid(pid: PidT) -> Result<PidT, Errno> {
     let t = lookup_pid(pid)?;
-    t.process_group()
-        .snapshot()
-        .iter()
-        .find_map(|m| m.thread_group().leader().and_then(|l| l.pid_root()))
-        .ok_or(Errno::ESRCH)
+    let pgid = t.process_group().pgid();
+    if pgid > 0 {
+        Ok(pgid)
+    } else {
+        Err(Errno::ESRCH)
+    }
 }
 
 pub fn getsid(pid: PidT) -> Result<PidT, Errno> {
@@ -133,12 +134,10 @@ pub fn setpgid(pid: PidT, pgid: PidT) -> Result<(), Errno> {
     }
 
     // 找到名字等于 effective_pgid 的已存在 pgroup（遍历 session 里的 groups）。
-    let found = my_session.snapshot_groups().into_iter().find(|g| {
-        g.snapshot()
-            .iter()
-            .find_map(|m| m.thread_group().leader().and_then(|l| l.pid_root()))
-            .map_or(false, |pid| pid == effective_pgid)
-    });
+    let found = my_session
+        .snapshot_groups()
+        .into_iter()
+        .find(|g| g.pgid() == effective_pgid);
 
     let new_pg = match found {
         Some(g) => g,
@@ -200,6 +199,59 @@ pub fn setsid() -> Result<PidT, Errno> {
     me.set_process_group(Arc::clone(&new_pg));
 
     Ok(my_pid)
+}
+
+fn lookup_process_group(pgid: PidT) -> Result<Arc<ProcessGroup>, Errno> {
+    if pgid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let me = current_task();
+    if let Some(session) = me.process_group().session()
+        && let Some(pg) = session
+            .snapshot_groups()
+            .into_iter()
+            .find(|pg| pg.pgid() == pgid)
+    {
+        return Ok(pg);
+    }
+
+    // 进程组对象不在全局表中单独登记。这里从 pid namespace 中的存活任务反查，
+    // 避免把 TTY 的前台组投递重新编码成 kill(-PGID) 后撞上特殊 pid 语义。
+    root_pid_ns()
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .map(|task| task.process_group())
+        .find(|pg| pg.pgid() == pgid)
+        .ok_or(Errno::ESRCH)
+}
+
+fn deliver_to_process_group(pg: Arc<ProcessGroup>, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let Some(sig) = sig else { return Ok(()) };
+    let info = make_siginfo(sig);
+    for m in pg.snapshot() {
+        if check_kill_permission(&m).is_ok() {
+            m.thread_group().shared_signal().deliver(info);
+            for x in m.thread_group().snapshot() {
+                if should_wake_for_signal(&x, sig) {
+                    signal_wakeup(&x, &info);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 按真实进程组对象投递信号，供 TTY/作业控制内部路径使用。
+///
+/// 这条路径不复用 `kill(2)` 的 pid 编码，因此 PGID==1 时不会被误解释成
+/// “广播所有进程”的特殊形式。
+pub fn kill_process_group(pgid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let pg = lookup_process_group(pgid)?;
+    deliver_to_process_group(pg, sig)
 }
 
 // ── exit / exit_group ────────────────────────────────────────────────────────
@@ -727,27 +779,11 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 
     let pg = match pid {
         0 => me.process_group(),
-        p if p < -1 => {
-            let t = lookup_pid(-p)?;
-            t.process_group()
-        }
+        p if p < -1 => lookup_process_group(-p)?,
         _ => return Err(Errno::EINVAL),
     };
 
-    let Some(sig) = sig else { return Ok(()) };
-    let info = make_siginfo(sig);
-    for m in pg.snapshot() {
-        if check_kill_permission(&m).is_ok() {
-            m.thread_group().shared_signal().deliver(info);
-            for x in m.thread_group().snapshot() {
-                if should_wake_for_signal(&x, sig) {
-                    signal_wakeup(&x, &info);
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
+    deliver_to_process_group(pg, sig)
 }
 
 /// `tkill(tid, sig)`：投递到**特定线程**（per-task pending）。

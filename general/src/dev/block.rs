@@ -1,6 +1,6 @@
 //! 块设备抽象接口。
 //!
-//! - 驱动只实现纯异步 `queue_bio`（类似 Linux `blk_mq_ops::queue_rq`）。
+//! - 驱动只实现纯异步 `queue_bio`，把请求提交到自己的设备队列。
 //! - 同步是上层薄包装 `submit_bio_wait` = submit + `Completion::wait()`。
 //! - 异步通过 `submit_bio_async` 返回 `BioFuture`（`impl Future`）。
 
@@ -11,12 +11,15 @@ use core::any::Any;
 use core::future::Future;
 use core::num::NonZeroU32;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
 use spin::mutex::Mutex;
 
-use crate::dev::bio::{Bio, BioBuffer, BioError, BioOp, BioReqError, BioResult, SubmitError};
+use crate::dev::bio::{
+    Bio, BioBuffer, BioCompletionObserver, BioError, BioIoError, BioOp, BioReqError, BioResult,
+    SubmitError,
+};
 use crate::dev::completion::Completion;
 use crate::dev::control::{
     BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError, DriverControl,
@@ -26,6 +29,25 @@ use crate::dev::control::{
 pub use crate::dev::bio::{
     BioReqError as BlockRequestError, BlockRange, SubmitError as BlockSubmitError,
 };
+
+/// 块设备对象实例序列号分配器。
+///
+/// 序列号只描述本次内核生命周期内的块设备对象实例，不参与 PnP 身份匹配，也不作为
+/// 底层驱动查找键；驱动若能提供更稳定的介质序列，可在 [`BlockAttributes`] 中覆盖。
+static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_block_diskseq() -> u64 {
+    loop {
+        let current = NEXT_BLOCK_DISKSEQ.load(Ordering::Acquire).max(1);
+        let next = current.checked_add(1).unwrap_or(1);
+        if NEXT_BLOCK_DISKSEQ
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current;
+        }
+    }
+}
 
 // ───────── 几何信息与限制 ─────────
 
@@ -167,6 +189,15 @@ impl BlockAttributes {
     pub const fn diskseq(&self) -> Option<u64> {
         self.diskseq
     }
+
+    pub const fn with_diskseq(&self, diskseq: u64) -> Self {
+        Self {
+            removable: self.removable,
+            rotational: self.rotational,
+            queue_depth: self.queue_depth,
+            diskseq: Some(diskseq),
+        }
+    }
 }
 
 /// 块设备功能标志
@@ -199,7 +230,127 @@ impl core::ops::BitOrAssign for BlockFeatures {
     }
 }
 
-// ───────── 块设备驱动 trait（纯异步，类似 Linux blk-mq） ─────────
+/// 块设备 I/O 统计快照。
+///
+/// 字段使用通用块层语义：完成数按成功完成的 BIO 计数，扇区数按 512 字节兼容
+/// 扇区换算，耗时以纳秒累计。sysfs/procfs 只消费快照，不直接修改这些计数。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockIoStatsSnapshot {
+    pub read_ios: u64,
+    pub read_sectors: u64,
+    pub read_time_ns: u64,
+    pub write_ios: u64,
+    pub write_sectors: u64,
+    pub write_time_ns: u64,
+    pub discard_ios: u64,
+    pub discard_sectors: u64,
+    pub discard_time_ns: u64,
+    pub flush_ios: u64,
+    pub flush_time_ns: u64,
+    pub read_inflight: u64,
+    pub write_inflight: u64,
+}
+
+#[derive(Default)]
+struct BlockIoStats {
+    read_ios: AtomicU64,
+    read_sectors: AtomicU64,
+    read_time_ns: AtomicU64,
+    write_ios: AtomicU64,
+    write_sectors: AtomicU64,
+    write_time_ns: AtomicU64,
+    discard_ios: AtomicU64,
+    discard_sectors: AtomicU64,
+    discard_time_ns: AtomicU64,
+    flush_ios: AtomicU64,
+    flush_time_ns: AtomicU64,
+    read_inflight: AtomicU64,
+    write_inflight: AtomicU64,
+}
+
+impl BlockIoStats {
+    fn begin(&self, op: BioOp) {
+        if matches!(op, BioOp::Read) {
+            self.read_inflight.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.write_inflight.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn cancel(&self, op: BioOp) {
+        self.finish_inflight(op);
+    }
+
+    fn finish_inflight(&self, op: BioOp) {
+        let counter = if matches!(op, BioOp::Read) {
+            &self.read_inflight
+        } else {
+            &self.write_inflight
+        };
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> BlockIoStatsSnapshot {
+        BlockIoStatsSnapshot {
+            read_ios: self.read_ios.load(Ordering::Acquire),
+            read_sectors: self.read_sectors.load(Ordering::Acquire),
+            read_time_ns: self.read_time_ns.load(Ordering::Acquire),
+            write_ios: self.write_ios.load(Ordering::Acquire),
+            write_sectors: self.write_sectors.load(Ordering::Acquire),
+            write_time_ns: self.write_time_ns.load(Ordering::Acquire),
+            discard_ios: self.discard_ios.load(Ordering::Acquire),
+            discard_sectors: self.discard_sectors.load(Ordering::Acquire),
+            discard_time_ns: self.discard_time_ns.load(Ordering::Acquire),
+            flush_ios: self.flush_ios.load(Ordering::Acquire),
+            flush_time_ns: self.flush_time_ns.load(Ordering::Acquire),
+            read_inflight: self.read_inflight.load(Ordering::Acquire),
+            write_inflight: self.write_inflight.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl BioCompletionObserver for BlockIoStats {
+    fn on_complete(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        block_size: NonZeroU32,
+        submitted_ns: u64,
+        result: Result<(), BioIoError>,
+    ) {
+        self.finish_inflight(op);
+        if result.is_err() {
+            return;
+        }
+
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        let sectors =
+            (range.blocks as u64).saturating_mul((block_size.get() as u64).max(512) / 512);
+        match op {
+            BioOp::Read => {
+                self.read_ios.fetch_add(1, Ordering::AcqRel);
+                self.read_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.read_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Write => {
+                self.write_ios.fetch_add(1, Ordering::AcqRel);
+                self.write_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.write_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Discard | BioOp::WriteZeroes => {
+                self.discard_ios.fetch_add(1, Ordering::AcqRel);
+                self.discard_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.discard_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Flush => {
+                self.flush_ios.fetch_add(1, Ordering::AcqRel);
+                self.flush_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+// ───────── 块设备驱动 trait（纯异步队列模型） ─────────
 
 /// 块设备底层驱动接口。
 ///
@@ -248,6 +399,7 @@ pub struct BlockDevice {
     features: BlockFeatures,
     driver: Arc<dyn BlockDriver>,
     parent: Option<Arc<BlockDevice>>,
+    io_stats: Arc<BlockIoStats>,
     state: AtomicU8,
 }
 
@@ -268,16 +420,23 @@ impl BlockDevice {
         driver: Arc<dyn BlockDriver>,
         parent: Option<Arc<BlockDevice>>,
     ) -> Self {
+        let diskseq = init
+            .attributes
+            .diskseq()
+            .filter(|seq| *seq != 0)
+            .unwrap_or_else(allocate_block_diskseq);
+        let attributes = init.attributes.with_diskseq(diskseq);
         Self {
             name: init.name.into(),
             subsystem: init.subsystem,
             class: init.class,
             geometry: init.geometry,
             limits: init.limits,
-            attributes: init.attributes,
+            attributes,
             features: init.features,
             driver,
             parent,
+            io_stats: Arc::new(BlockIoStats::default()),
             state: AtomicU8::new(DeviceState::Active as u8),
         }
     }
@@ -306,6 +465,9 @@ impl BlockDevice {
     }
     pub fn parent(&self) -> Option<Arc<BlockDevice>> {
         self.parent.as_ref().map(Arc::clone)
+    }
+    pub fn io_stats(&self) -> BlockIoStatsSnapshot {
+        self.io_stats.snapshot()
     }
 
     pub fn state(&self) -> DeviceState {
@@ -397,7 +559,7 @@ impl BlockDevice {
 
     // ── Bio 提交 API ──────────────────────────────────────
 
-    /// 同步提交并阻塞等待（类似 Linux `submit_bio_wait`）。
+    /// 同步提交并阻塞等待。
     ///
     /// 当前实现通过主动 drain 推进硬件完成，不依赖中断。
     /// 调度器就绪时在 drain 间让出 CPU（yield）；否则纯 spin。
@@ -408,10 +570,21 @@ impl BlockDevice {
         buffer: BioBuffer,
     ) -> Result<Bio, BioError> {
         self.validate_bio(op, range, &buffer)?;
-        let (bio, completion) = Bio::new(op, range, buffer, self.geometry.logical_block_size());
-        self.driver
-            .queue_bio(bio)
-            .map_err(|(e, _)| BioError::Submit(e))?;
+        let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
+        let submitted_ns = sched::now_ns_public();
+        let (bio, completion) = Bio::new_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            Some(observer),
+        );
+        self.io_stats.begin(op);
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            self.io_stats.cancel(op);
+            return Err(BioError::Submit(err));
+        }
 
         while !completion.is_done() {
             self.driver.drain();
@@ -432,10 +605,21 @@ impl BlockDevice {
         buffer: BioBuffer,
     ) -> Result<BioFuture, BioError> {
         self.validate_bio(op, range, &buffer)?;
-        let (bio, completion) = Bio::new(op, range, buffer, self.geometry.logical_block_size());
-        self.driver
-            .queue_bio(bio)
-            .map_err(|(e, _)| BioError::Submit(e))?;
+        let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
+        let submitted_ns = sched::now_ns_public();
+        let (bio, completion) = Bio::new_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            Some(observer),
+        );
+        self.io_stats.begin(op);
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            self.io_stats.cancel(op);
+            return Err(BioError::Submit(err));
+        }
         Ok(BioFuture { completion })
     }
 

@@ -11,12 +11,11 @@
 //! devtmpfs 或 syscall 层增加设备类型特判。
 
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use errno::Errno;
 use sched::{Task, WaitQueue};
@@ -29,15 +28,17 @@ use vfs::sync::Spinlock;
 
 use crate::dev::control::DriverControl;
 use crate::dev::function::{
-    CustomDevNodeSpec, DevNodeSet, DevNodeSpec, DeviceClassId, DeviceFunction,
+    CustomDevNodeSpec, DevNodeName, DevNodeNameAllocError, DevNodeNameAllocator, DevNodeSet,
+    DevNodeSpec, DeviceClassId, DeviceFunction,
 };
 use crate::mm::{copy_from_user, copy_to_user};
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const SECS_PER_DAY: u64 = 86_400;
-const UNIX_EPOCH_WEEKDAY: u32 = 4; // 1970-01-01 was Thursday, Linux tm_wday Sunday == 0.
+const UNIX_EPOCH_WEEKDAY: u32 = 4; // 1970-01-01 为周四，tm_wday 约定周日为 0。
 const RTC_TIME_LEN: usize = 9 * core::mem::size_of::<i32>();
 const RTC_WKALRM_LEN: usize = 4 + RTC_TIME_LEN;
+static RTC_DEV_NAMES: DevNodeNameAllocator = DevNodeNameAllocator::new("rtc");
 const RTC_READ_WORD_LEN: usize = core::mem::size_of::<usize>();
 const RTC_DEFAULT_EPOCH: u32 = 1900;
 const RTC_DEFAULT_PERIODIC_RATE_HZ: u32 = 1024;
@@ -324,7 +325,7 @@ impl RtcError {
 
 /// 硬件 RTC 驱动的 typed 语义接口。
 ///
-/// 该 trait 只表达 RTC 类设备的硬件能力，不能解析 Linux ioctl number 或用户指针。
+/// 该 trait 只表达 RTC 类设备的硬件能力，不能解析 ioctl number 或用户指针。
 /// `features()` 是契约的一部分：声明某个 feature 后，对应方法必须提供真实实现；
 /// 无法由硬件或当前中断框架完成的能力应保持未声明并返回 [`RtcError::Unsupported`]。
 pub trait RtcDriver: Send + Sync {
@@ -398,7 +399,7 @@ pub struct RtcDevice {
     irq_wait: WaitQueue,
 }
 
-/// RTC class 层维护的 Linux 兼容状态。
+/// RTC class 层维护的用户态兼容状态。
 ///
 /// epoch、periodic rate、IRQ enable bit 和 pending IRQ word 都是 `/dev/rtc*`
 /// ABI 的运行期状态，不属于某一种硬件寄存器布局。把它们放在 [`RtcDevice`]
@@ -461,10 +462,11 @@ impl RtcRuntimeState {
 }
 
 impl RtcDevice {
-    pub fn new(index: usize, driver: Arc<dyn RtcDriver>) -> Self {
+    pub fn new(node_name: DevNodeName, driver: Arc<dyn RtcDriver>) -> Self {
+        let index = node_name.index();
         Self {
             index,
-            name: format!("rtc{index}").into_boxed_str(),
+            name: node_name.into_string().into_boxed_str(),
             driver,
             state: AtomicU8::new(RtcDeviceState::Active as u8),
             runtime: Spinlock::new(RtcRuntimeState::new()),
@@ -472,9 +474,12 @@ impl RtcDevice {
         }
     }
 
-    pub fn alloc_index() -> usize {
-        static NEXT_RTC_INDEX: AtomicUsize = AtomicUsize::new(0);
-        NEXT_RTC_INDEX.fetch_add(1, Ordering::Relaxed)
+    /// 为一个稳定硬件实例分配或复用 `/dev/rtc*` 节点名。
+    ///
+    /// `stable_key` 由 PnP 设备身份或固件路径提供。RTC core 统一管理兼容层命名，
+    /// 具体硬件驱动只需要传入自身实例身份，避免在驱动里散落 `rtc{n}` 拼接逻辑。
+    pub fn alloc_stable_node_name(stable_key: &str) -> Result<DevNodeName, DevNodeNameAllocError> {
+        RTC_DEV_NAMES.try_alloc_stable(stable_key)
     }
 
     pub fn index(&self) -> usize {
@@ -517,7 +522,7 @@ impl RtcDevice {
     ///
     /// 平台中断处理器在确认 alarm/update/periodic 事件后调用本方法。通用层会按
     /// 当前 enable bit 过滤事件、合并 pending word，并通过 WaitQueue 唤醒
-    /// 阻塞 read/poll。这样 IRQ 分发路径不需要知道 Linux ioctl ABI 的位布局。
+    /// 阻塞 read/poll。这样 IRQ 分发路径不需要知道 ioctl ABI 的位布局。
     pub fn record_irq(&self, data: RtcIrqData) -> Result<(), RtcError> {
         self.ensure_active()?;
         let mut runtime = self.runtime.lock();
@@ -922,7 +927,7 @@ impl FileOps for RtcFileOps {
                 Ok(0)
             }
             RTC_SET_TIME => {
-                // 当前能力模型还没有 Linux CAP_SYS_TIME，先用 SysAdmin 表达
+                // 当前能力模型还没有细分的时间设置权限，先用 SysAdmin 表达
                 // “允许修改硬件/系统全局时间源”的权限边界。
                 self.require_sys_admin()?;
                 let time = read_rtc_time(arg)?;
@@ -1064,7 +1069,7 @@ fn read_rtc_alarm_time(user: usize, base: RtcDateTime) -> Result<RtcDateTime, Er
     if sec < 0 || min < 0 || hour < 0 {
         return Err(Errno::EINVAL);
     }
-    // Linux 的旧 RTC_ALM_SET 只定义时/分/秒；部分用户态会把日期字段留空。
+    // 旧式 RTC_ALM_SET 只定义时/分/秒；部分用户态会把日期字段留空。
     // 这里按“下一次出现的 h:m:s”补齐日期，完整日期 alarm 则通过 RTC_WKALM_SET
     // 表达。若目标时刻已经不晚于当前 RTC 时间，自动滚到下一天，避免把硬件
     // alarm 编程到过去导致 read() 永远等不到事件。

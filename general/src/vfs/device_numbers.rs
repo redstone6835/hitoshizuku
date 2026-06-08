@@ -1,8 +1,8 @@
-//! POSIX `dev_t` projection for device-like VFS nodes.
+//! POSIX `dev_t` 兼容投影。
 //!
-//! This registry is intentionally part of the VFS compatibility layer.  The
-//! core device model remains keyed by PnP identity and typed device objects,
-//! not by major/minor numbers.
+//! 这个注册表只属于 VFS 兼容层：`stat(2)`、`/proc/devices`、`/sys/dev/*`
+//! 需要主次设备号，但底层设备模型仍然以 PnP identity 和 typed device object
+//! 为准，不能通过 `major/minor` 反向寻址硬件设备。
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -53,6 +53,45 @@ static POSIX_DEVICES: Spinlock<PosixDeviceRegistry> = Spinlock::new(PosixDeviceR
 // POSIX dev_t 仅是 stat/mknod/procfs 等接口的兼容投影；底层设备模型不以主次设备号寻址。
 const PRIVATE_DYNAMIC_MAJOR_START: u32 = 240;
 
+/// 兼容层保留的传统字符设备号。
+///
+/// 这些号码只按 `/dev` 投影节点名匹配，不读取底层设备的固件名或 driver 名。这样
+/// 固件节点即使叫作 `console`，也不会在未投影为 `/dev/console` 时获得控制台
+/// 设备号，避免 POSIX 兼容策略反向污染底层设备身份。
+const WELL_KNOWN_POSIX_DEVICES: &[WellKnownPosixDevice] = &[
+    WellKnownPosixDevice::char("null", 1, 3, "mem"),
+    WellKnownPosixDevice::char("zero", 1, 5, "mem"),
+    WellKnownPosixDevice::char("random", 1, 8, "mem"),
+    WellKnownPosixDevice::char("urandom", 1, 9, "mem"),
+    WellKnownPosixDevice::char("console", 5, 1, "console"),
+];
+
+#[derive(Clone, Copy)]
+struct WellKnownPosixDevice {
+    kind: PosixDeviceKind,
+    node_name: &'static str,
+    major: u32,
+    minor: u32,
+    major_name: &'static str,
+}
+
+impl WellKnownPosixDevice {
+    const fn char(
+        node_name: &'static str,
+        major: u32,
+        minor: u32,
+        major_name: &'static str,
+    ) -> Self {
+        Self {
+            kind: PosixDeviceKind::Char,
+            node_name,
+            major,
+            minor,
+            major_name,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PrivateDynamicCursor {
     major: u32,
@@ -83,7 +122,7 @@ fn register(kind: PosixDeviceKind, node_name: &str, display_name: &str) -> Optio
         return (record.kind == kind).then_some(record.rdev);
     }
 
-    let (rdev, major_name) = match well_known_rdev(kind, node_name, display_name) {
+    let (rdev, major_name) = match well_known_rdev(kind, node_name) {
         Some((rdev, major_name)) => (rdev, major_name.to_string()),
         None => allocate_private_rdev(&mut registry, kind)
             .map(|rdev| (rdev, display_name.to_string()))?,
@@ -130,30 +169,11 @@ fn advance_private_cursor(cursor: PrivateDynamicCursor) -> Option<PrivateDynamic
     }
 }
 
-fn well_known_rdev(
-    kind: PosixDeviceKind,
-    node_name: &str,
-    display_name: &str,
-) -> Option<(DevId, &'static str)> {
-    if kind != PosixDeviceKind::Char {
-        return None;
-    }
-
-    let node_leaf = node_name.rsplit('/').next().unwrap_or(node_name);
-    let name = match node_leaf {
-        "null" | "zero" | "random" | "urandom" | "console" => node_leaf,
-        _ => display_name,
-    };
-    match name {
-        // Linux/POSIX well-known 字符设备号：1 是 mem 主设备，minor 区分 null/zero/random。
-        "null" => Some((DevId::new(1, 3), "mem")),
-        "zero" => Some((DevId::new(1, 5), "mem")),
-        "random" => Some((DevId::new(1, 8), "mem")),
-        "urandom" => Some((DevId::new(1, 9), "mem")),
-        // Linux well-known 控制台设备号，供 /dev/console 和 stat(2) 兼容使用。
-        "console" => Some((DevId::new(5, 1), "console")),
-        _ => None,
-    }
+fn well_known_rdev(kind: PosixDeviceKind, node_name: &str) -> Option<(DevId, &'static str)> {
+    WELL_KNOWN_POSIX_DEVICES
+        .iter()
+        .find(|entry| entry.kind == kind && entry.node_name == node_name)
+        .map(|entry| (DevId::new(entry.major, entry.minor), entry.major_name))
 }
 
 pub fn unregister_node(node_name: &str) {

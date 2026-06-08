@@ -72,8 +72,8 @@ impl Device for NetDeviceAdapter {
         // Ethernet medium 的 MTU 是完整链路帧大小；IP medium 没有二层头，
         // 直接把 driver 暴露的 IP MTU 交给 smoltcp。
         caps.max_transmission_unit = match self.driver.medium() {
-            LinkMedium::Ethernet => self.driver.mtu() + 14,
-            LinkMedium::Ip => self.driver.mtu(),
+            LinkMedium::Ethernet => self.device.mtu() + 14,
+            LinkMedium::Ip => self.device.mtu(),
         };
         caps
     }

@@ -19,7 +19,7 @@ use smoltcp::wire::{
 };
 
 use crate::adapter::NetDeviceAdapter;
-use crate::config::{CidrAddress, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
 use crate::socket::SocketMeta;
@@ -37,10 +37,12 @@ pub(crate) struct ManagedInterface {
     pending_accepted: Vec<SocketHandle>,
     max_backlog: usize,
     inode_counter: core::sync::atomic::AtomicU64,
-    #[allow(dead_code)]
     config: IfConfig,
     #[allow(dead_code)]
     net_device: Arc<NetDevice>,
+    /// 管理态开关。链路是否真的可用仍由驱动的 link_state 决定；这里记录
+    /// 用户/管理接口希望该接口参与协议栈收发。
+    admin_up: bool,
 }
 
 impl ManagedInterface {
@@ -109,6 +111,7 @@ impl ManagedInterface {
             inode_counter: core::sync::atomic::AtomicU64::new(1),
             config,
             net_device,
+            admin_up: true,
         }
     }
 
@@ -121,6 +124,9 @@ impl ManagedInterface {
     ///
     /// 同时清理已标记为 removed 的 socket。
     pub fn poll(&mut self, timestamp: Instant) {
+        if !self.admin_up {
+            return;
+        }
         self.iface
             .poll(timestamp, &mut self.device, &mut self.sockets);
         // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的
@@ -162,14 +168,32 @@ impl ManagedInterface {
         &self.config
     }
 
+    /// 管理态是否允许接口收发。
+    pub fn is_admin_up(&self) -> bool {
+        self.admin_up
+    }
+
+    /// 设置接口管理态。关闭后协议栈不再从该接口收发帧，但底层设备对象仍保持
+    /// 注册状态，便于随后重新打开。
+    pub fn set_admin_up(&mut self, up: bool) {
+        self.admin_up = up;
+    }
+
     /// 底层 NetDevice 引用（用于查询 driver 状态：MTU、链路状态等）。
     pub fn net_device(&self) -> &Arc<NetDevice> {
         &self.net_device
     }
 
-    /// 当前驱动报告的 MTU。
+    /// 当前接口生效的 MTU。
     pub fn mtu(&self) -> usize {
-        self.net_device.driver().mtu()
+        self.net_device.mtu()
+    }
+
+    /// 设置接口运行期 MTU。
+    ///
+    /// 实际校验由 [`NetDevice`] 完成，确保不会超过驱动声明的硬件上限。
+    pub fn set_mtu(&mut self, mtu: usize) -> Result<(), crate::NetError> {
+        self.net_device.set_mtu(mtu)
     }
 
     /// 添加或替换默认 IPv4 路由。
@@ -189,6 +213,7 @@ impl ManagedInterface {
 
     /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
     pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) {
+        let prefix_len = prefix_len.min(32);
         self.iface.update_ip_addrs(|addrs| {
             addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
             let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
@@ -196,6 +221,13 @@ impl ManagedInterface {
                 prefix_len,
             )));
         });
+        self.config
+            .addresses
+            .retain(|cidr| !matches!(cidr.addr, IpAddr::V4(_)));
+        self.config
+            .addresses
+            .push(CidrAddress::new_v4(addr, prefix_len));
+        self.config.mode = IfMode::Static;
     }
 
     /// 添加 IPv4 路由（smoltcp 仅支持默认路由）。
@@ -649,7 +681,7 @@ impl ManagedInterface {
     }
 }
 
-// ── TCP 状态→Linux 数值映射 ─────────────────────────────────────────────────
+// ── TCP 状态→用户态兼容数值映射 ─────────────────────────────────────────────
 
 fn tcp_state_to_u8(state: smoltcp::socket::tcp::State) -> u8 {
     use smoltcp::socket::tcp::State;

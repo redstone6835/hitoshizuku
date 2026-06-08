@@ -8,6 +8,7 @@ extern crate hal;
 mod acpi;
 #[cfg(feature = "bench")]
 mod bench;
+mod device_init;
 mod dtb;
 mod initramfs;
 mod net_poll;
