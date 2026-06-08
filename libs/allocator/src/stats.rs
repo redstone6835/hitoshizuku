@@ -174,6 +174,12 @@ pub fn format_diagnostic(
     );
     pos += write_str(buf, pos, b"K free_segs=");
     pos += write_usize(buf, pos, layers.address_space.kernel.free_segments);
+    pos += write_str(buf, pos, b" tags=");
+    pos += write_usize(buf, pos, layers.address_space.kernel.active_tags);
+    pos += write_str(buf, pos, b"/");
+    pos += write_usize(buf, pos, layers.address_space.kernel.free_tags);
+    pos += write_str(buf, pos, b" tag_refill=");
+    pos += write_u64(buf, pos, layers.address_space.kernel.tag_refills);
     pos += write_str(buf, pos, b"K\nSlab: alloc=");
     pos += write_u64(buf, pos, layers.slab.alloc_requests);
     pos += write_str(buf, pos, b" free=");
@@ -188,6 +194,8 @@ pub fn format_diagnostic(
     pos += write_u64(buf, pos, layers.slab.cache_flushes);
     pos += write_str(buf, pos, b" reclaim=");
     pos += write_u64(buf, pos, layers.slab.reclaimed_slabs);
+    pos += write_str(buf, pos, b" free_nodes=");
+    pos += write_usize(buf, pos, layers.slab.free_slab_nodes);
     pos += write_str(buf, pos, b"\nMeta: backing=");
     pos += write_usize(
         buf,
@@ -208,8 +216,18 @@ pub fn format_diagnostic(
     pos += write_u64(buf, pos, layers.kheap.alloc_failures);
     pos += write_str(buf, pos, b"\nReg: live=");
     pos += write_usize(buf, pos, layers.registry.live_records);
+    pos += write_str(buf, pos, b" shards=");
+    pos += write_usize(buf, pos, layers.registry.shard_count);
+    pos += write_str(buf, pos, b" max_shard=");
+    pos += write_usize(buf, pos, layers.registry.max_shard_live_records);
+    pos += write_str(buf, pos, b" free=");
+    pos += write_usize(buf, pos, layers.registry.free_nodes);
     pos += write_str(buf, pos, b" max_chain=");
     pos += write_usize(buf, pos, layers.registry.max_chain_len);
+    pos += write_str(buf, pos, b" refill=");
+    pos += write_u64(buf, pos, layers.registry.node_refills);
+    pos += write_str(buf, pos, b" nodes=");
+    pos += write_usize(buf, pos, layers.registry.nodes_allocated);
     pos += write_str(buf, pos, b" dup=");
     pos += write_u64(buf, pos, layers.registry.duplicate_inserts);
     pos += write_str(buf, pos, b" double_free=");
