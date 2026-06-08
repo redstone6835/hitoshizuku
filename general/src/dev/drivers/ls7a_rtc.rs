@@ -7,8 +7,8 @@
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
+use crate::dev::irq::{self, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     RealtimeClockSource, register_driver_factory,
@@ -538,25 +538,41 @@ impl Ls7aRtcPlatformDriver {
         &self,
         rtc: &Arc<Ls7aRtc>,
         rtc_dev: &Arc<RtcDevice>,
-        line: Option<IrqLine>,
+        info: &PlatformDeviceInfo,
     ) -> Result<Option<IrqHandle>, PnpError> {
         if !rtc.alarm_irq_supported() {
             return Ok(None);
         }
-        let Some(line) = line else {
-            return Ok(None);
-        };
         let handler: Arc<dyn IrqHandler> = Arc::new(Ls7aRtcIrqHandler {
             rtc: Arc::clone(rtc),
             rtc_dev: Arc::downgrade(rtc_dev),
         });
-        match irq::register_irq_handler(line, handler) {
+        match info.register_first_irq_handler(handler) {
             Ok(handle) => {
                 rtc.set_alarm_irq_available(true);
                 Ok(Some(handle))
             }
-            Err(IrqError::OutOfMemory) => Err(PnpError::OutOfMemory),
-            Err(IrqError::AlreadyRegistered | IrqError::NotFound) => Err(PnpError::ProbeFailed),
+            Err(PlatformIrqRegistrationError::NoResource) => Ok(None),
+            Err(PlatformIrqRegistrationError::Unresolved) => {
+                log::debug!(
+                    "[platform-ls7a-rtc] {} has firmware IRQ resource but no registered IRQ domain translator",
+                    info.fw_name.as_ref()
+                );
+                Err(PnpError::ProbeDeferred)
+            }
+            Err(PlatformIrqRegistrationError::RegistrationFailed { line, err }) => {
+                log::printk!(
+                    "[platform-ls7a-rtc] failed to register alarm irq {:?}: {:?}",
+                    line,
+                    err
+                );
+                match err {
+                    irq::IrqError::OutOfMemory => Err(PnpError::OutOfMemory),
+                    irq::IrqError::AlreadyRegistered | irq::IrqError::NotFound => {
+                        Err(PnpError::ProbeFailed)
+                    }
+                }
+            }
         }
     }
 }
@@ -588,18 +604,6 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         let Some((phys, size)) = info.first_mmio() else {
             return Err(PnpError::ProbeFailed);
         };
-        let irq_line = match info.resolve_first_irq_line() {
-            Ok(line) => Some(line),
-            Err(PlatformIrqResolveError::NoResource) => None,
-            Err(PlatformIrqResolveError::Unresolved) => {
-                log::debug!(
-                    "[platform-ls7a-rtc] {} has firmware IRQ resource but no registered IRQ domain translator",
-                    dev.id
-                );
-                return Err(PnpError::ProbeDeferred);
-            }
-        };
-
         let pm_base =
             firmware_pm_mmio(info).map(|(pm_phys, _)| (self.device_mmio_to_virt)(pm_phys));
         let rtc = Arc::new(Ls7aRtc::new(
@@ -621,7 +625,7 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         let rtc_node_name = RtcDevice::alloc_stable_node_name(&dev.name)?;
         let rtc_dev = Arc::new(RtcDevice::new(rtc_node_name, rtc_driver));
         dev.register_function(Arc::new(RtcFunction::new(Arc::clone(&rtc_dev))))?;
-        let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, irq_line)?;
+        let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, info)?;
 
         self.install_realtime_clock(dev, phys, realtime_ns);
 

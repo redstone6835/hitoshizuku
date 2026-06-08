@@ -27,14 +27,17 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 
 use vfs::sync::Spinlock;
 
 use super::irq::IrqLine;
+use super::msi;
 use super::pnp::{
     BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
 };
+use super::registry_id;
 
 // ── PciInfo ──────────────────────────────────────────────────────────────
 
@@ -114,6 +117,215 @@ pub struct PciBar {
     pub size: u64,
 }
 
+// ── PCI host bridge ─────────────────────────────────────────────────────
+
+/// PCI host bridge 的地址窗口类型。
+///
+/// 这里保存的是 host bridge 对 PCI 子地址空间的公开能力，不把 DTB `ranges`
+/// cell 或其它固件编码形式泄露给 PCI 设备层。不同固件来源只需要在启动阶段把
+/// 自己的格式转换成这个枚举即可。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciHostAddressSpace {
+    Io,
+    Memory,
+    PrefetchableMemory,
+    Unknown(u32),
+}
+
+/// PCI host bridge 暴露的一段子地址空间到 CPU 物理地址的映射。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciHostBridgeWindow {
+    pub space: PciHostAddressSpace,
+    pub pci_start: u64,
+    pub cpu_start: usize,
+    pub size: usize,
+}
+
+/// PCI host bridge 的标准化描述。
+///
+/// 该结构是设备层认识 host bridge 的统一入口：ECAM 范围、bus-range、地址窗口、
+/// DMA 一致性以及固件路由规模都会被保存下来，供 sysfs/诊断/后续热插拔或 DMA
+/// 策略查询。具体的配置空间读写回调仍由 [`PciConfigAccess`] 单独安装。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciHostBridgeInfo {
+    pub name: Box<str>,
+    pub firmware_path: Option<Box<str>>,
+    pub domain: u16,
+    pub bus_start: u8,
+    pub bus_end: u8,
+    pub ecam_phys: usize,
+    pub ecam_size: usize,
+    pub dma_coherent: bool,
+    pub windows: Vec<PciHostBridgeWindow>,
+    pub irq_route_count: usize,
+    pub msi_route_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciHostBridgeHandle {
+    id: u64,
+}
+
+impl PciHostBridgeHandle {
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PciHostBridgeSnapshot {
+    pub handle: PciHostBridgeHandle,
+    pub info: PciHostBridgeInfo,
+    pub pnp: Option<Arc<PnpDevice>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciHostBridgeError {
+    Invalid,
+    AlreadyRegistered,
+    NotFound,
+    OutOfMemory,
+}
+
+struct PciHostBridgeRegistration {
+    handle: PciHostBridgeHandle,
+    info: PciHostBridgeInfo,
+    pnp: Option<Arc<PnpDevice>>,
+}
+
+struct PciHostBridgeRegistry {
+    next_id: u64,
+    bridges: Vec<PciHostBridgeRegistration>,
+}
+
+impl PciHostBridgeRegistry {
+    const fn new() -> Self {
+        Self {
+            next_id: 1,
+            bridges: Vec::new(),
+        }
+    }
+}
+
+static PCI_HOST_BRIDGES: Spinlock<PciHostBridgeRegistry> =
+    Spinlock::new(PciHostBridgeRegistry::new());
+
+/// 登记一个固件枚举出的 PCI host bridge。
+///
+/// `pnp` 是可选的固件节点对象；存在时，后续扫描到的 PCI function 会自动挂到
+/// 该节点下形成拓扑树。没有固件节点的早期平台仍可只登记 typed host 描述。
+pub fn register_host_bridge(
+    info: PciHostBridgeInfo,
+    pnp: Option<Arc<PnpDevice>>,
+) -> Result<PciHostBridgeHandle, PciHostBridgeError> {
+    if info.bus_start > info.bus_end || info.ecam_size == 0 {
+        return Err(PciHostBridgeError::Invalid);
+    }
+
+    let mut registry = PCI_HOST_BRIDGES.lock();
+    if registry.bridges.iter().any(|bridge| {
+        bridge.info.domain == info.domain
+            && pci_bus_ranges_overlap(
+                bridge.info.bus_start,
+                bridge.info.bus_end,
+                info.bus_start,
+                info.bus_end,
+            )
+    }) {
+        return Err(PciHostBridgeError::AlreadyRegistered);
+    }
+    registry
+        .bridges
+        .try_reserve(1)
+        .map_err(|_| PciHostBridgeError::OutOfMemory)?;
+    let id = registry_id::alloc_locked_id(&mut registry.next_id)
+        .map_err(|_| PciHostBridgeError::OutOfMemory)?;
+    // host bridge 句柄可能被启动期回滚或热移除路径保存；编号只增长不复用，
+    // 旧句柄就不会误注销后来重新登记的同一 domain/bus-range。
+    let handle = PciHostBridgeHandle { id };
+    registry
+        .bridges
+        .push(PciHostBridgeRegistration { handle, info, pnp });
+    Ok(handle)
+}
+
+pub fn unregister_host_bridge(handle: PciHostBridgeHandle) -> Result<(), PciHostBridgeError> {
+    let mut registry = PCI_HOST_BRIDGES.lock();
+    let Some(index) = registry
+        .bridges
+        .iter()
+        .position(|bridge| bridge.handle == handle)
+    else {
+        return Err(PciHostBridgeError::NotFound);
+    };
+    registry.bridges.swap_remove(index);
+    Ok(())
+}
+
+pub fn host_bridge_snapshot() -> Vec<PciHostBridgeSnapshot> {
+    PCI_HOST_BRIDGES
+        .lock()
+        .bridges
+        .iter()
+        .map(snapshot_host_bridge)
+        .collect()
+}
+
+/// 查询覆盖指定 segment/bus 的 PCI host bridge。
+///
+/// 调用方只需要知道 PCI function 所在的 segment/bus，即可拿到 host bridge 的
+/// ECAM、地址窗口和 DMA 属性；不需要理解 DTB `ranges`、ACPI 资源模板或其它
+/// 固件编码细节。
+pub fn host_bridge_for_bus(segment: u16, bus: u8) -> Option<PciHostBridgeSnapshot> {
+    PCI_HOST_BRIDGES
+        .lock()
+        .bridges
+        .iter()
+        .find(|bridge| pci_host_bridge_covers(bridge, segment, bus))
+        .map(snapshot_host_bridge)
+}
+
+fn host_bridge_pnp_for(segment: u16, bus: u8) -> Option<Arc<PnpDevice>> {
+    PCI_HOST_BRIDGES
+        .lock()
+        .bridges
+        .iter()
+        .find(|bridge| pci_host_bridge_covers(bridge, segment, bus))
+        .and_then(|bridge| bridge.pnp.as_ref().map(Arc::clone))
+}
+
+const fn pci_bus_ranges_overlap(a_start: u8, a_end: u8, b_start: u8, b_end: u8) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
+fn pci_host_bridge_covers(bridge: &PciHostBridgeRegistration, segment: u16, bus: u8) -> bool {
+    bridge.info.domain == segment && bus >= bridge.info.bus_start && bus <= bridge.info.bus_end
+}
+
+fn snapshot_host_bridge(bridge: &PciHostBridgeRegistration) -> PciHostBridgeSnapshot {
+    PciHostBridgeSnapshot {
+        handle: bridge.handle,
+        info: bridge.info.clone(),
+        pnp: bridge.pnp.as_ref().map(Arc::clone),
+    }
+}
+
+fn attach_to_host_bridge(dev: &Arc<PnpDevice>) {
+    let (segment, bus) = match &dev.id {
+        PnpId::Pci { segment, bus, .. } => (*segment, *bus),
+        _ => return,
+    };
+    let Some(host) = host_bridge_pnp_for(segment, bus) else {
+        return;
+    };
+    if dev.parent().is_some() || Arc::ptr_eq(&host, dev) {
+        return;
+    }
+    // 拓扑挂接失败只表示当前设备已经被其它总线关系占用或正处于生命周期转换中；
+    // PCI function 的发现与驱动 probe 不应因此被撤销。
+    let _ = host.attach_child(dev);
+}
+
 // ── PCI config space 常量 ────────────────────────────────────────────────
 
 const PCI_COMMAND_OFFSET: u16 = 0x04;
@@ -156,6 +368,12 @@ const PCI_MSI_CAPABILITY_ID: u8 = 0x05;
 const PCI_MSIX_CAPABILITY_ID: u8 = 0x11;
 const PCI_MSI_CONTROL_OFFSET: u16 = 2;
 const PCI_MSI_CONTROL_ENABLE: u16 = 0x0001;
+const PCI_MSI_CONTROL_MULTI_MESSAGE_ENABLE_MASK: u16 = 0x0070;
+const PCI_MSI_CONTROL_64BIT_CAPABLE: u16 = 0x0080;
+const PCI_MSI_MESSAGE_ADDRESS_LO_OFFSET: u16 = 0x04;
+const PCI_MSI_MESSAGE_ADDRESS_HI_OFFSET: u16 = 0x08;
+const PCI_MSI_MESSAGE_DATA_32_OFFSET: u16 = 0x08;
+const PCI_MSI_MESSAGE_DATA_64_OFFSET: u16 = 0x0c;
 /// PCI 常规配置空间每条 bus 最多有 32 个 device 编号。
 pub const PCI_DEVICES_PER_BUS: u8 = 32;
 /// 每个 PCI device 最多有 8 个 function，0 号 function 必须先探测。
@@ -176,6 +394,14 @@ pub type PciIrqResolver = fn(
     interrupt_pin: Option<u8>,
     interrupt_line: Option<u8>,
 ) -> Option<IrqLine>;
+
+/// PCI endpoint MSI 分配回调。
+///
+/// Host bridge 负责把 PCI requester id 经固件 `msi-map` 路由到具体 MSI
+/// controller。PCI 设备层只拿到已经分配好的 message/line，不理解平台 MSI
+/// doorbell 地址或 vector 池。
+pub type PciMsiAllocator =
+    fn(segment: u16, bus: u8, device: u8, function: u8) -> Option<msi::MsiHandle>;
 
 pub struct PciConfigAccess {
     pub read_u8: fn(
@@ -225,6 +451,7 @@ pub struct PciConfigAccess {
     ) -> Result<(), PciConfigError>,
     pub device_mmio_to_virt: fn(phys_addr: usize) -> usize,
     pub resolve_irq: Option<PciIrqResolver>,
+    pub allocate_msi: Option<PciMsiAllocator>,
 }
 
 static PCI_CONFIG: Spinlock<Option<PciConfigAccess>> = Spinlock::new(None);
@@ -238,6 +465,38 @@ pub enum PciConfigError {
     InvalidDevice,
     InvalidOffset,
     Uninitialized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciMsiError {
+    NotSupported,
+    NoAllocator,
+    AllocationFailed,
+    AddressUnsupported,
+    DataUnsupported,
+    Config(PciConfigError),
+}
+
+impl From<PciConfigError> for PciMsiError {
+    fn from(err: PciConfigError) -> Self {
+        Self::Config(err)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciMsiHandle {
+    cap_offset: u16,
+    allocation: msi::MsiHandle,
+}
+
+impl PciMsiHandle {
+    pub const fn line(self) -> IrqLine {
+        self.allocation.line()
+    }
+
+    pub const fn message(self) -> msi::MsiMessage {
+        self.allocation.message()
+    }
 }
 
 // ── PCI capability 遍历 ─────────────────────────────────────────────────
@@ -655,6 +914,46 @@ impl PciDevice {
         resolver(segment, bus, device, function, pin, line)
     }
 
+    pub fn try_configure_single_msi(&self) -> Result<PciMsiHandle, PciMsiError> {
+        let cap_offset = self.msi_capability().ok_or(PciMsiError::NotSupported)?;
+        let (segment, bus, device, function) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
+        let allocator = {
+            let guard = PCI_CONFIG.lock();
+            guard
+                .as_ref()
+                .and_then(|config| config.allocate_msi)
+                .ok_or(PciMsiError::NoAllocator)?
+        };
+        let allocation =
+            allocator(segment, bus, device, function).ok_or(PciMsiError::AllocationFailed)?;
+        if let Err(err) = self.program_single_msi(cap_offset, allocation.message()) {
+            let _ = msi::free_msi(allocation);
+            return Err(err);
+        }
+        Ok(PciMsiHandle {
+            cap_offset,
+            allocation,
+        })
+    }
+
+    pub fn configure_single_msi(&self) -> Option<PciMsiHandle> {
+        self.try_configure_single_msi().ok()
+    }
+
+    pub fn release_configured_msi(&self, handle: PciMsiHandle) {
+        let _ = self.try_msi_disable(handle.cap_offset);
+        let _ = msi::free_msi(handle.allocation);
+    }
+
+    pub fn try_enable_configured_msi(&self, handle: PciMsiHandle) -> Result<(), PciMsiError> {
+        let ctrl = self.try_read_config_u16(handle.cap_offset + PCI_MSI_CONTROL_OFFSET)?;
+        self.try_write_config_u16(
+            handle.cap_offset + PCI_MSI_CONTROL_OFFSET,
+            (ctrl & !PCI_MSI_CONTROL_MULTI_MESSAGE_ENABLE_MASK) | PCI_MSI_CONTROL_ENABLE,
+        )?;
+        Ok(())
+    }
+
     pub fn bar_count(&self) -> usize {
         self.info().map(PciInfo::bar_count).unwrap_or(0)
     }
@@ -707,6 +1006,47 @@ impl PciDevice {
 
     pub fn msi_disable(&self, cap_offset: u16) {
         let _ = self.try_msi_disable(cap_offset);
+    }
+
+    fn program_single_msi(
+        &self,
+        cap_offset: u16,
+        message: msi::MsiMessage,
+    ) -> Result<(), PciMsiError> {
+        if message.data > u16::MAX as u32 {
+            return Err(PciMsiError::DataUnsupported);
+        }
+        let ctrl = self.try_read_config_u16(cap_offset + PCI_MSI_CONTROL_OFFSET)?;
+        let supports_64 = ctrl & PCI_MSI_CONTROL_64BIT_CAPABLE != 0;
+        if !supports_64 && message.address > u32::MAX as u64 {
+            return Err(PciMsiError::AddressUnsupported);
+        }
+
+        // 编程 MSI message 前先关 MSI enable，避免设备在 address/data 半更新时
+        // 发出旧/新混合消息。这里只启用单 vector，multiple message enable 清零。
+        self.try_write_config_u16(
+            cap_offset + PCI_MSI_CONTROL_OFFSET,
+            ctrl & !PCI_MSI_CONTROL_ENABLE,
+        )?;
+        self.try_write_config_u32(
+            cap_offset + PCI_MSI_MESSAGE_ADDRESS_LO_OFFSET,
+            message.address as u32,
+        )?;
+        let data_offset = if supports_64 {
+            self.try_write_config_u32(
+                cap_offset + PCI_MSI_MESSAGE_ADDRESS_HI_OFFSET,
+                (message.address >> 32) as u32,
+            )?;
+            PCI_MSI_MESSAGE_DATA_64_OFFSET
+        } else {
+            PCI_MSI_MESSAGE_DATA_32_OFFSET
+        };
+        self.try_write_config_u16(cap_offset + data_offset, message.data as u16)?;
+        self.try_write_config_u16(
+            cap_offset + PCI_MSI_CONTROL_OFFSET,
+            ctrl & !(PCI_MSI_CONTROL_MULTI_MESSAGE_ENABLE_MASK | PCI_MSI_CONTROL_ENABLE),
+        )?;
+        Ok(())
     }
 
     // ── MSI-X ──
@@ -779,20 +1119,53 @@ fn pci_hardware_name(segment: u16, bus: u8, device: u8, function: u8) -> Box<str
     alloc::format!("pci-{segment:04x}:{bus:02x}:{device:02x}.{function}").into()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciProbeStatus {
+    Bound,
+    NoDriver,
+    Deferred,
+}
+
+#[derive(Clone)]
+pub struct PciRegistration {
+    pub device: Arc<PnpDevice>,
+    pub status: PciProbeStatus,
+}
+
+impl PciRegistration {
+    const fn new(device: Arc<PnpDevice>, status: PciProbeStatus) -> Self {
+        Self { device, status }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciRegisterError {
+    NotPresent,
+    Pnp(PnpError),
+}
+
+fn rollback_pci_registration(dev: &Arc<PnpDevice>, inserted: bool) {
+    if !inserted {
+        return;
+    }
+    if let Some(parent) = dev.parent() {
+        parent.detach_child(dev);
+    }
+    PNP_DEVICES.remove(&dev.id);
+}
+
 impl PciDevice {
     /// 从 config space 读取 PCI 信息，构造 PnpDevice 并注册到全局列表，
     /// 然后自动 probe 驱动。一步完成设备的完整发现-绑定流程。
     ///
     /// PnP 设备名是稳定硬件名 `pci-{seg:04x}:{bus:02x}:{dev:02x}.{func}`，
     /// 不承载 `/dev` 节点命名前缀语义。
-    // TODO(pci-pnp): 该接口仍用 `Option` 抹平了 NoDriver、Deferred 和硬失败。
-    // 后续应改成结构化 probe 结果，让扫描器能统计真实失败并保留诊断信息。
     pub fn register_and_probe(
         segment: u16,
         bus: u8,
         device: u8,
         function: u8,
-    ) -> Option<Arc<PnpDevice>> {
+    ) -> Result<PciRegistration, PciRegisterError> {
         let id = PnpId::Pci {
             segment,
             bus,
@@ -800,29 +1173,33 @@ impl PciDevice {
             function,
         };
 
-        let info = PciDevice::read_device_info(segment, bus, device, function)?;
+        let info = PciDevice::read_device_info(segment, bus, device, function)
+            .ok_or(PciRegisterError::NotPresent)?;
 
         let name = pci_hardware_name(segment, bus, device, function);
         let new_dev = PnpDevice::new(id, name, Box::new(info));
-        let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev)).ok()?;
+        let registration = PNP_DEVICES
+            .get_or_insert(Arc::clone(&new_dev))
+            .map_err(PciRegisterError::Pnp)?;
         let pnp = registration.device;
+        attach_to_host_bridge(&pnp);
 
         match pnp.state() {
-            PnpState::Bound => Some(pnp),
+            PnpState::Bound => Ok(PciRegistration::new(pnp, PciProbeStatus::Bound)),
             PnpState::Discovered => match PNP_DRIVERS.probe_device(&pnp) {
-                Ok(()) | Err(PnpError::NoDriver | PnpError::ProbeDeferred) => Some(pnp),
-                Err(_) => {
-                    if registration.inserted {
-                        PNP_DEVICES.remove(&pnp.id);
-                    }
-                    None
+                Ok(()) => Ok(PciRegistration::new(pnp, PciProbeStatus::Bound)),
+                Err(PnpError::NoDriver) => Ok(PciRegistration::new(pnp, PciProbeStatus::NoDriver)),
+                Err(PnpError::ProbeDeferred) => {
+                    Ok(PciRegistration::new(pnp, PciProbeStatus::Deferred))
+                }
+                Err(err) => {
+                    rollback_pci_registration(&pnp, registration.inserted);
+                    Err(PciRegisterError::Pnp(err))
                 }
             },
             PnpState::Probing | PnpState::Removing | PnpState::Gone => {
-                if registration.inserted {
-                    PNP_DEVICES.remove(&pnp.id);
-                }
-                None
+                rollback_pci_registration(&pnp, registration.inserted);
+                Err(PciRegisterError::Pnp(PnpError::InvalidState))
             }
         }
     }
@@ -979,12 +1356,61 @@ pub fn pci_scan_bus_range(
 pub fn pci_scan_and_register(segment: u16, start_bus: u8, end_bus: u8) -> usize {
     let mut count = 0usize;
     pci_scan_bus_range(segment, start_bus, end_bus, &mut |seg, bus, dev, func| {
-        if PciDevice::register_and_probe(seg, bus, dev, func).is_some() {
-            count += 1;
+        match PciDevice::register_and_probe(seg, bus, dev, func) {
+            Ok(_) => {
+                count += 1;
+            }
+            Err(PciRegisterError::NotPresent) => {}
+            Err(err) => {
+                log::debug!(
+                    "[pci] failed to register {seg:04x}:{bus:02x}:{dev:02x}.{func}: {:?}",
+                    err
+                );
+            }
         }
         true
     });
     count
+}
+
+/// 扫描 PCI bus 并统计注册/probe 的结构化结果。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PciScanRegisterSummary {
+    pub registered: usize,
+    pub bound: usize,
+    pub no_driver: usize,
+    pub deferred: usize,
+    pub failed: usize,
+}
+
+pub fn pci_scan_and_register_summary(
+    segment: u16,
+    start_bus: u8,
+    end_bus: u8,
+) -> PciScanRegisterSummary {
+    let mut summary = PciScanRegisterSummary::default();
+    pci_scan_bus_range(segment, start_bus, end_bus, &mut |seg, bus, dev, func| {
+        match PciDevice::register_and_probe(seg, bus, dev, func) {
+            Ok(registration) => {
+                summary.registered += 1;
+                match registration.status {
+                    PciProbeStatus::Bound => summary.bound += 1,
+                    PciProbeStatus::NoDriver => summary.no_driver += 1,
+                    PciProbeStatus::Deferred => summary.deferred += 1,
+                }
+            }
+            Err(PciRegisterError::NotPresent) => {}
+            Err(err) => {
+                summary.failed += 1;
+                log::debug!(
+                    "[pci] failed to register {seg:04x}:{bus:02x}:{dev:02x}.{func}: {:?}",
+                    err
+                );
+            }
+        }
+        true
+    });
+    summary
 }
 
 /// 扫描总线上的设备并只返回 BDF + vendor/device 的原始信息，

@@ -14,7 +14,7 @@ use sched::{Task, WaitQueue};
 use crate::dev::char::*;
 use crate::dev::function::{CharFunction, DevNodeNameAllocator};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
+use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpDevice, PnpDriver, PnpError, PnpId,
     register_driver_factory,
@@ -560,27 +560,23 @@ fn register_uart_irq(
     info: &PlatformDeviceInfo,
     uart: Arc<Uart16550>,
 ) -> Result<Option<IrqHandle>, PnpError> {
-    let line = match info.resolve_first_irq_line() {
-        Ok(line) => line,
-        Err(PlatformIrqResolveError::NoResource) => return Ok(None),
-        Err(PlatformIrqResolveError::Unresolved) => {
-            log::debug!(
-                "[platform-uart16550] {} has firmware IRQ resource but no registered IRQ domain translator",
-                info.fw_name.as_ref()
-            );
-            return Err(PnpError::ProbeDeferred);
-        }
-    };
-
     let handler: Arc<dyn IrqHandler> = Arc::new(Uart16550IrqHandler {
         uart: Arc::clone(&uart),
     });
-    match irq::register_irq_handler(line, handler) {
+    match info.register_first_irq_handler(handler) {
         Ok(handle) => {
             uart.set_rx_irq_enabled(true);
             Ok(Some(handle))
         }
-        Err(err) => {
+        Err(PlatformIrqRegistrationError::NoResource) => Ok(None),
+        Err(PlatformIrqRegistrationError::Unresolved) => {
+            log::debug!(
+                "[platform-uart16550] {} has firmware IRQ resource but no registered IRQ domain translator",
+                info.fw_name.as_ref()
+            );
+            Err(PnpError::ProbeDeferred)
+        }
+        Err(PlatformIrqRegistrationError::RegistrationFailed { line, err }) => {
             log::printk!(
                 "[platform-uart16550] failed to register irq {:?}: {:?}",
                 line,

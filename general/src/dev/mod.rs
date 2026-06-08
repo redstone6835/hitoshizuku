@@ -17,11 +17,16 @@ pub mod block_sync;
 pub mod char;
 pub mod completion;
 pub mod control;
+pub mod cpu;
 pub mod dma;
 pub mod drivers;
 pub mod enumerate;
+pub mod firmware_bus;
+pub mod flash;
 pub mod function;
+pub mod fwcfg;
 pub mod irq;
+pub mod msi;
 pub mod naming;
 pub mod net;
 pub mod pci;
@@ -29,7 +34,10 @@ pub mod platform;
 pub mod pnp;
 pub mod random_source;
 pub mod rtc;
+pub mod syscon;
 pub mod usb;
 pub mod virtio;
+
+mod registry_id;
 
 pub use control::DriverControl;
