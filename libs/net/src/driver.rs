@@ -185,7 +185,7 @@ impl TxBuf {
 /// 任何驱动报告 `len > MAX_FRAME_LEN` 的接收帧会被强制截断。
 /// 这是防御深度——即使硬件或驱动 bug 报告异常长度，协议栈也不会读出
 /// buffer 边界。
-pub const MAX_FRAME_LEN: usize = 16 * 1024;
+pub const MAX_FRAME_LEN: usize = 64 * 1024;
 
 // ── 设备统计 ─────────────────────────────────────────────────────────────────
 
@@ -280,10 +280,10 @@ pub trait NetDriver: Send + Sync {
     /// 3. 在 TX 完成中断里回收描述符。
     fn commit_tx(&self, buf: TxBuf);
 
-    /// 把未消费的接收缓冲区还给驱动。
+    /// 把接收缓冲区的底层存储还给驱动。
     ///
-    /// 协议栈可能因为帧错误、未匹配等原因不消费 `RxBuf`——此时调用本方法
-    /// 让驱动有机会复用底层存储（如重新挂回 RX 环）。默认实现 drop 即可。
+    /// 协议栈同步处理完 `RxBuf` 后调用本方法，让驱动有机会复用底层存储
+    /// （如重新挂回 RX 环或 loopback freelist）。默认实现 drop 即可。
     fn recycle_rx(&self, _buf: RxBuf) {}
 
     /// 当前链路状态（同步查询，不应阻塞）。

@@ -11,7 +11,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use smoltcp::iface::{self, SocketHandle, SocketSet};
+use smoltcp::iface::{self, PollResult, SocketHandle, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address,
@@ -123,11 +123,12 @@ impl ManagedInterface {
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
     ///
     /// 同时清理已标记为 removed 的 socket。
-    pub fn poll(&mut self, timestamp: Instant) {
+    pub fn poll(&mut self, timestamp: Instant) -> bool {
         if !self.admin_up {
-            return;
+            return false;
         }
-        self.iface
+        let state_changed = self
+            .iface
             .poll(timestamp, &mut self.device, &mut self.sockets);
         // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的
         // orphan socket。orphan 用于 fd 已释放但 FIN/ACK 仍需继续推进的
@@ -152,6 +153,7 @@ impl ManagedInterface {
         for h in to_remove {
             self.remove_socket_locked(h);
         }
+        state_changed == PollResult::SocketStateChanged
     }
 
     /// 接口名称。
