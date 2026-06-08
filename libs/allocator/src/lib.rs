@@ -22,9 +22,9 @@
 //! 为防止死锁，必须严格按照以下顺序获取锁：
 //!
 //! 1. `init_lock` — 初始化专用，正常运行期间绝不持有
-//! 2. `phys` (BuddyAllocator) — 物理内存分配器
-//! 3. `vmem` arena 锁 (direct_map, kernel, managed) — 虚拟地址空间
-//! 4. `metadata.inner` — 元数据分配器
+//! 2. `vmem` arena 锁 (direct_map, kernel, managed) — 虚拟地址空间
+//! 3. `metadata.inner` — 元数据分配器状态
+//! 4. `phys` (BuddyAllocator) — 物理内存分配器
 //! 5. `registry.inner` — 分配注册表
 //! 6. `slab.state` — Slab 分配器状态
 //! 7. `slab.cache.inner` — Per-CPU 缓存
@@ -34,7 +34,8 @@
 //!
 //! ## 关键规则
 //!
-//! - **调用回调 (map_fn, unmap_fn) 时绝不持有 `phys` 锁**
+//! - **调用回调 (map_fn, unmap_fn) 时绝不持有 allocator 内部锁**
+//! - **持有 `phys` 时不要进入 vmem；vmem 元数据扩容可能需要临时申请物理页**
 //! - **在调用可能触发分配的函数前，先释放锁**
 //! - **尽量避免同时持有多个锁**
 //! - **绝不反序获取锁**
@@ -55,7 +56,7 @@
 //! }; // 锁已释放
 //!
 //! let paddr = {
-//!     let phys = self.phys.lock();
+//!     let mut phys = self.phys.lock();
 //!     phys.alloc_pages(order)
 //! }; // 锁已释放
 //!
@@ -65,10 +66,10 @@
 //!
 //! 错误做法：
 //! ```rust
-//! let arena = self.arena.lock();
-//! let phys = self.phys.lock(); // 同时持有两把锁
+//! let phys = self.phys.lock();
+//! let arena = self.arena.lock(); // 持有 phys 时进入 vmem，可能与 metadata 扩容死锁
 //! let paddr = phys.alloc_pages(order);
-//! map_fn(vaddr, paddr, size); // 持锁时调用回调 — 有死锁风险！
+//! map_fn(vaddr, paddr, size); // 持锁时调用回调，也会放大死锁窗口
 //! ```
 
 mod boot;
@@ -348,7 +349,6 @@ impl KernelMemorySubsystem {
 
     pub fn init_slab(&self, cpu_count: usize) {
         let _guard = self.init_lock.lock();
-        self.slab.bind_metadata_source(&self.boot);
         self.slab.init(cpu_count);
     }
 
@@ -541,6 +541,7 @@ impl KernelMemorySubsystem {
             address_space: self.address_space_stats(),
             kheap: self.kheap.snapshot(),
             slab: self.slab.snapshot(),
+            metadata: self.metadata.stats(),
             registry: self.registry.stats(),
             managed: self.managed.stats(),
         }
@@ -586,6 +587,10 @@ impl KernelMemorySubsystem {
 
     pub fn registry_stats(&self) -> AllocationRegistryStats {
         self.registry.stats()
+    }
+
+    pub fn metadata_stats(&self) -> MetadataStats {
+        self.metadata.stats()
     }
 
     pub fn allocate_physical(
@@ -1182,7 +1187,10 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         self.kheap.record_realloc();
 
         if ptr.is_null() {
-            let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+                self.record_oom();
+                return null_mut();
+            };
             return unsafe { self.alloc(new_layout) };
         }
 
@@ -1191,7 +1199,10 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             return null_mut();
         }
 
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+            self.record_oom();
+            return null_mut();
+        };
         let active = self.active.load(Ordering::Acquire);
         let owner = if active {
             self.query_allocation(ptr as usize).ok()
@@ -1203,6 +1214,13 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         } else {
             None
         };
+
+        if owner.is_none() {
+            if active {
+                self.record_ownership_failure();
+            }
+            return null_mut();
+        }
 
         if active
             && owner
@@ -1231,7 +1249,7 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             match owner {
                 Some(record) if record.kind == AllocationKind::Boot => {}
                 Some(_) => unsafe { self.dealloc(ptr, layout) },
-                None => self.record_ownership_failure(),
+                None => unreachable!(),
             }
         }
 

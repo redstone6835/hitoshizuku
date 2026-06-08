@@ -62,3 +62,17 @@ fn allocate_large() {
     assert_eq!(record.kind, AllocationKind::Large);
     KERNEL_ALLOCATOR.deallocate(record.ptr).expect("deallocate");
 }
+
+/// Buddy 元数据应来自物理内存 carve-out，并在启动后拥有完整节点池。
+#[ktest]
+fn buddy_metadata_pool_initialized() {
+    let stats = KERNEL_ALLOCATOR.buddy_stats();
+    assert!(stats.total_pages > 0);
+    assert!(stats.metadata_pages > 0);
+    assert!(stats.node_capacity >= stats.total_pages);
+    assert!(stats.node_used > 0);
+
+    let metadata = KERNEL_ALLOCATOR.metadata_stats();
+    assert!(metadata.backing_pages > 0);
+    assert!(metadata.dynamic_allocations > 0);
+}

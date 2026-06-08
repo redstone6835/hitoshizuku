@@ -14,7 +14,7 @@
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::buddy::{BuddyAllocator, PAGE_SIZE};
+use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::error::{AllocationError, DeallocationError};
 use crate::request::AllocationRecord;
 use crate::request::PagePolicy;
@@ -95,14 +95,18 @@ impl KernelHeap {
         phys: &crate::Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> Result<BackedRange, AllocationError> {
-        let (order, page_policy) = effective_layout_policy(layout, page_policy);
-        let block_pages = 1usize << order;
-
         if !self.is_initialized() {
             self.alloc_failures.fetch_add(1, Ordering::Relaxed);
             return Err(AllocationError::NotInitialized);
         }
         self.alloc_requests.fetch_add(1, Ordering::Relaxed);
+
+        let Some((order, page_policy)) = effective_layout_policy(layout, page_policy) else {
+            self.alloc_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(AllocationError::InvalidLayout);
+        };
+        let block_pages = 1usize << order;
+        let block_bytes = block_pages * PAGE_SIZE;
 
         let range = match vmem.alloc_kernel_backed_range(order, phys, page_policy) {
             Ok(range) => range,
@@ -116,8 +120,7 @@ impl KernelHeap {
 
         self.active_allocs.fetch_add(1, Ordering::Relaxed);
         self.active_pages.fetch_add(block_pages, Ordering::Relaxed);
-        self.active_bytes
-            .fetch_add(block_pages * PAGE_SIZE, Ordering::Relaxed);
+        self.active_bytes.fetch_add(block_bytes, Ordering::Relaxed);
 
         Ok(range)
     }
@@ -142,13 +145,19 @@ impl KernelHeap {
             }
         };
         let order = record.order;
+        if order > MAX_TRACKED_ORDER {
+            self.invalid_frees.fetch_add(1, Ordering::Relaxed);
+            return Err(DeallocationError::InvalidPointer);
+        }
+        let block_pages = 1usize << order;
+        let block_bytes = block_pages * PAGE_SIZE;
 
         vmem.free_kernel_backed_range(
             BackedRange {
                 arena: ArenaKind::Kernel,
                 vaddr: record.ptr,
                 paddr,
-                size: (1usize << order) * PAGE_SIZE,
+                size: block_bytes,
                 order,
             },
             phys,
@@ -159,15 +168,13 @@ impl KernelHeap {
         })?;
 
         self.active_allocs.fetch_sub(1, Ordering::Relaxed);
-        self.active_pages
-            .fetch_sub(1usize << order, Ordering::Relaxed);
-        self.active_bytes
-            .fetch_sub((1usize << order) * PAGE_SIZE, Ordering::Relaxed);
+        self.active_pages.fetch_sub(block_pages, Ordering::Relaxed);
+        self.active_bytes.fetch_sub(block_bytes, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn required_order_for(layout: Layout) -> usize {
-        required_order(layout)
+        required_order(layout).unwrap_or(MAX_TRACKED_ORDER + 1)
     }
 }
 
@@ -177,17 +184,17 @@ impl Default for KernelHeap {
     }
 }
 
-fn required_order(layout: Layout) -> usize {
+fn required_order(layout: Layout) -> Option<usize> {
     let aligned = layout.pad_to_align();
     let size_pages = pages_for(aligned.size());
     let align_pages = pages_for(aligned.align().max(PAGE_SIZE));
     pages_to_order(size_pages.max(align_pages))
 }
 
-fn effective_layout_policy(layout: Layout, requested: PagePolicy) -> (usize, PagePolicy) {
+fn effective_layout_policy(layout: Layout, requested: PagePolicy) -> Option<(usize, PagePolicy)> {
     const MIN_LARGE_PAGE_ORDER: usize = 9; // 2 MiB
 
-    let mut order = required_order(layout);
+    let mut order = required_order(layout)?;
     let page_policy = match requested {
         PagePolicy::RequireLarge => {
             order = order.max(MIN_LARGE_PAGE_ORDER);
@@ -197,7 +204,10 @@ fn effective_layout_policy(layout: Layout, requested: PagePolicy) -> (usize, Pag
         PagePolicy::BaseOnly if order >= MIN_LARGE_PAGE_ORDER => PagePolicy::PreferLarge,
         PagePolicy::BaseOnly => PagePolicy::BaseOnly,
     };
-    (order, page_policy)
+    if order > MAX_TRACKED_ORDER {
+        return None;
+    }
+    Some((order, page_policy))
 }
 
 #[inline]
@@ -206,12 +216,15 @@ fn pages_for(bytes: usize) -> usize {
 }
 
 #[inline]
-fn pages_to_order(pages: usize) -> usize {
+fn pages_to_order(pages: usize) -> Option<usize> {
     let mut order = 0;
     let mut block = 1;
     while block < pages {
-        block <<= 1;
+        if order >= MAX_TRACKED_ORDER {
+            return None;
+        }
+        block = block.checked_shl(1)?;
         order += 1;
     }
-    order
+    Some(order)
 }
