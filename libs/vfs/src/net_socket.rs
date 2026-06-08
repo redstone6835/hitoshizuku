@@ -20,6 +20,7 @@ use crate::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
 const SOCK_RAW: u16 = 3;
+const LOOPBACK_UDP_YIELD_INTERVAL: u64 = 16;
 
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
 
@@ -184,6 +185,7 @@ pub struct NetSocketFileOps {
     send_timeout_ns: AtomicU64,
     /// SO_ERROR — POSIX 要求读取后清零
     last_error: AtomicI32,
+    udp_loopback_send_count: AtomicU64,
     /// 持久化的 setsockopt 状态
     options: Mutex<SocketOptions>,
 }
@@ -201,6 +203,7 @@ impl NetSocketFileOps {
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             last_error: AtomicI32::new(0),
+            udp_loopback_send_count: AtomicU64::new(0),
             options: Mutex::new(SocketOptions::default()),
         }
     }
@@ -950,7 +953,12 @@ impl NetSocketFileOps {
                 // FIXME: connected UDP 由 VFS remote 缓存模拟，底层 UDP socket
                 // 没有 connect 状态，也不会过滤非 peer datagram。
                 match net::stack().udp_send_to(handle, data, remote) {
-                    Ok(n) => return Ok(n),
+                    Ok(n) => {
+                        if self.should_yield_after_loopback_udp_send(&remote) {
+                            sched::schedule_once(sched::now_ns_public());
+                        }
+                        return Ok(n);
+                    }
                     Err(NetError::WouldBlock) => {
                         if nonblocking {
                             return Err(Errno::EAGAIN);
@@ -1004,6 +1012,14 @@ impl NetSocketFileOps {
                 }
             },
         }
+    }
+
+    fn should_yield_after_loopback_udp_send(&self, remote: &Endpoint) -> bool {
+        if !endpoint_addr_is_loopback(remote) {
+            return false;
+        }
+        let count = self.udp_loopback_send_count.fetch_add(1, Ordering::Relaxed) + 1;
+        count % LOOPBACK_UDP_YIELD_INTERVAL == 0
     }
 
     fn recv_deadline(&self) -> Option<u64> {
@@ -1226,6 +1242,13 @@ fn endpoint_addr_is_unspecified(ep: &Endpoint) -> bool {
     match ep.addr {
         net::IpAddr::V4(v4) => v4 == net::Ipv4Addr::UNSPECIFIED,
         net::IpAddr::V6(v6) => v6 == net::Ipv6Addr::UNSPECIFIED,
+    }
+}
+
+fn endpoint_addr_is_loopback(ep: &Endpoint) -> bool {
+    match ep.addr {
+        net::IpAddr::V4(v4) => v4.0[0] == 127,
+        net::IpAddr::V6(v6) => v6 == net::Ipv6Addr::LOCALHOST,
     }
 }
 
