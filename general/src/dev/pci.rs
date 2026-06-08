@@ -265,12 +265,22 @@ pub fn host_bridge_snapshot() -> Vec<PciHostBridgeSnapshot> {
         .lock()
         .bridges
         .iter()
-        .map(|bridge| PciHostBridgeSnapshot {
-            handle: bridge.handle,
-            info: bridge.info.clone(),
-            pnp: bridge.pnp.as_ref().map(Arc::clone),
-        })
+        .map(snapshot_host_bridge)
         .collect()
+}
+
+/// 查询覆盖指定 segment/bus 的 PCI host bridge。
+///
+/// 调用方只需要知道 PCI function 所在的 segment/bus，即可拿到 host bridge 的
+/// ECAM、地址窗口和 DMA 属性；不需要理解 DTB `ranges`、ACPI 资源模板或其它
+/// 固件编码细节。
+pub fn host_bridge_for_bus(segment: u16, bus: u8) -> Option<PciHostBridgeSnapshot> {
+    PCI_HOST_BRIDGES
+        .lock()
+        .bridges
+        .iter()
+        .find(|bridge| pci_host_bridge_covers(bridge, segment, bus))
+        .map(snapshot_host_bridge)
 }
 
 fn host_bridge_pnp_for(segment: u16, bus: u8) -> Option<Arc<PnpDevice>> {
@@ -278,16 +288,24 @@ fn host_bridge_pnp_for(segment: u16, bus: u8) -> Option<Arc<PnpDevice>> {
         .lock()
         .bridges
         .iter()
-        .find(|bridge| {
-            bridge.info.domain == segment
-                && bus >= bridge.info.bus_start
-                && bus <= bridge.info.bus_end
-        })
+        .find(|bridge| pci_host_bridge_covers(bridge, segment, bus))
         .and_then(|bridge| bridge.pnp.as_ref().map(Arc::clone))
 }
 
 const fn pci_bus_ranges_overlap(a_start: u8, a_end: u8, b_start: u8, b_end: u8) -> bool {
     a_start <= b_end && b_start <= a_end
+}
+
+fn pci_host_bridge_covers(bridge: &PciHostBridgeRegistration, segment: u16, bus: u8) -> bool {
+    bridge.info.domain == segment && bus >= bridge.info.bus_start && bus <= bridge.info.bus_end
+}
+
+fn snapshot_host_bridge(bridge: &PciHostBridgeRegistration) -> PciHostBridgeSnapshot {
+    PciHostBridgeSnapshot {
+        handle: bridge.handle,
+        info: bridge.info.clone(),
+        pnp: bridge.pnp.as_ref().map(Arc::clone),
+    }
 }
 
 fn attach_to_host_bridge(dev: &Arc<PnpDevice>) {
