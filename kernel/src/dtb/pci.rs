@@ -1,6 +1,7 @@
 //! DTB 路径下的 PCIe host bridge 发现 + ECAM 配置空间访问 + BAR 资源分配。
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -9,8 +10,10 @@ use general::dev::irq::{self, IrqLine};
 use general::dev::msi;
 use general::dev::pci::{
     PCI_DEVICES_PER_BUS, PCI_EXTENDED_CONFIG_SPACE_SIZE, PCI_FUNCTIONS_PER_DEVICE, PciConfigAccess,
-    PciConfigError, PciDevice, pci_scan_raw, set_pci_config_access,
+    PciConfigError, PciDevice, PciHostAddressSpace, PciHostBridgeError, PciHostBridgeInfo,
+    PciHostBridgeWindow, pci_scan_raw, register_host_bridge, set_pci_config_access,
 };
+use general::dev::pnp::PnpDevice;
 use general::firmware::dtb::{DtbPciAddressSpace, DtbPciRangeInfo, DtbPcieHostInfo};
 use vfs::sync::Spinlock;
 
@@ -56,6 +59,55 @@ struct PciMsiRouting {
 }
 
 static PCI_MSI_ROUTING: Spinlock<Option<PciMsiRouting>> = Spinlock::new(None);
+
+pub(crate) fn register_pci_host_bridge(host: &DtbPcieHostInfo, pnp: Option<Arc<PnpDevice>>) {
+    let info = PciHostBridgeInfo {
+        name: host.name.into(),
+        firmware_path: Some(host.path.into()),
+        domain: host.domain,
+        bus_start: host.bus_start,
+        bus_end: host.bus_end,
+        ecam_phys: host.ecam_phys,
+        ecam_size: host.ecam_size,
+        dma_coherent: host.dma_coherent,
+        windows: host.ranges.iter().map(pci_host_window).collect(),
+        irq_route_count: host.interrupt_map.len(),
+        msi_route_count: host.msi_map.len(),
+    };
+    match register_host_bridge(info, pnp) {
+        Ok(handle) => log::printk!(
+            "[kernel-start][dtb] registered PCI host bridge {} handle={} windows={} irq-routes={} msi-routes={}",
+            host.path,
+            handle.id(),
+            host.ranges.len(),
+            host.interrupt_map.len(),
+            host.msi_map.len()
+        ),
+        Err(PciHostBridgeError::AlreadyRegistered) => log::debug!(
+            "[kernel-start][dtb] PCI host bridge domain {} already registered",
+            host.domain
+        ),
+        Err(err) => log::printk!(
+            "[kernel-start][dtb] failed to register PCI host bridge {}: {:?}",
+            host.path,
+            err
+        ),
+    }
+}
+
+fn pci_host_window(range: &DtbPciRangeInfo) -> PciHostBridgeWindow {
+    PciHostBridgeWindow {
+        space: match range.space {
+            DtbPciAddressSpace::Io => PciHostAddressSpace::Io,
+            DtbPciAddressSpace::Memory => PciHostAddressSpace::Memory,
+            DtbPciAddressSpace::PrefetchableMemory => PciHostAddressSpace::PrefetchableMemory,
+            DtbPciAddressSpace::Unknown(value) => PciHostAddressSpace::Unknown(value),
+        },
+        pci_start: range.child_addr,
+        cpu_start: range.parent_addr,
+        size: range.size,
+    }
+}
 
 /// ECAM 配置空间地址计算。
 ///

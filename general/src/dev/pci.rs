@@ -27,6 +27,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 
 use vfs::sync::Spinlock;
@@ -113,6 +114,196 @@ pub struct PciBar {
     pub prefetchable: bool,
     pub phys_addr: u64,
     pub size: u64,
+}
+
+// ── PCI host bridge ─────────────────────────────────────────────────────
+
+/// PCI host bridge 的地址窗口类型。
+///
+/// 这里保存的是 host bridge 对 PCI 子地址空间的公开能力，不把 DTB `ranges`
+/// cell 或其它固件编码形式泄露给 PCI 设备层。不同固件来源只需要在启动阶段把
+/// 自己的格式转换成这个枚举即可。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciHostAddressSpace {
+    Io,
+    Memory,
+    PrefetchableMemory,
+    Unknown(u32),
+}
+
+/// PCI host bridge 暴露的一段子地址空间到 CPU 物理地址的映射。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciHostBridgeWindow {
+    pub space: PciHostAddressSpace,
+    pub pci_start: u64,
+    pub cpu_start: usize,
+    pub size: usize,
+}
+
+/// PCI host bridge 的标准化描述。
+///
+/// 该结构是设备层认识 host bridge 的统一入口：ECAM 范围、bus-range、地址窗口、
+/// DMA 一致性以及固件路由规模都会被保存下来，供 sysfs/诊断/后续热插拔或 DMA
+/// 策略查询。具体的配置空间读写回调仍由 [`PciConfigAccess`] 单独安装。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PciHostBridgeInfo {
+    pub name: Box<str>,
+    pub firmware_path: Option<Box<str>>,
+    pub domain: u16,
+    pub bus_start: u8,
+    pub bus_end: u8,
+    pub ecam_phys: usize,
+    pub ecam_size: usize,
+    pub dma_coherent: bool,
+    pub windows: Vec<PciHostBridgeWindow>,
+    pub irq_route_count: usize,
+    pub msi_route_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PciHostBridgeHandle {
+    id: u64,
+}
+
+impl PciHostBridgeHandle {
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PciHostBridgeSnapshot {
+    pub handle: PciHostBridgeHandle,
+    pub info: PciHostBridgeInfo,
+    pub pnp: Option<Arc<PnpDevice>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PciHostBridgeError {
+    Invalid,
+    AlreadyRegistered,
+    NotFound,
+    OutOfMemory,
+}
+
+struct PciHostBridgeRegistration {
+    handle: PciHostBridgeHandle,
+    info: PciHostBridgeInfo,
+    pnp: Option<Arc<PnpDevice>>,
+}
+
+struct PciHostBridgeRegistry {
+    next_id: u64,
+    bridges: Vec<PciHostBridgeRegistration>,
+}
+
+impl PciHostBridgeRegistry {
+    const fn new() -> Self {
+        Self {
+            next_id: 1,
+            bridges: Vec::new(),
+        }
+    }
+}
+
+static PCI_HOST_BRIDGES: Spinlock<PciHostBridgeRegistry> =
+    Spinlock::new(PciHostBridgeRegistry::new());
+
+/// 登记一个固件枚举出的 PCI host bridge。
+///
+/// `pnp` 是可选的固件节点对象；存在时，后续扫描到的 PCI function 会自动挂到
+/// 该节点下形成拓扑树。没有固件节点的早期平台仍可只登记 typed host 描述。
+pub fn register_host_bridge(
+    info: PciHostBridgeInfo,
+    pnp: Option<Arc<PnpDevice>>,
+) -> Result<PciHostBridgeHandle, PciHostBridgeError> {
+    if info.bus_start > info.bus_end || info.ecam_size == 0 {
+        return Err(PciHostBridgeError::Invalid);
+    }
+
+    let mut registry = PCI_HOST_BRIDGES.lock();
+    if registry.bridges.iter().any(|bridge| {
+        bridge.info.domain == info.domain
+            && pci_bus_ranges_overlap(
+                bridge.info.bus_start,
+                bridge.info.bus_end,
+                info.bus_start,
+                info.bus_end,
+            )
+    }) {
+        return Err(PciHostBridgeError::AlreadyRegistered);
+    }
+    registry
+        .bridges
+        .try_reserve(1)
+        .map_err(|_| PciHostBridgeError::OutOfMemory)?;
+    let handle = PciHostBridgeHandle {
+        id: registry.next_id,
+    };
+    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+    registry
+        .bridges
+        .push(PciHostBridgeRegistration { handle, info, pnp });
+    Ok(handle)
+}
+
+pub fn unregister_host_bridge(handle: PciHostBridgeHandle) -> Result<(), PciHostBridgeError> {
+    let mut registry = PCI_HOST_BRIDGES.lock();
+    let Some(index) = registry
+        .bridges
+        .iter()
+        .position(|bridge| bridge.handle == handle)
+    else {
+        return Err(PciHostBridgeError::NotFound);
+    };
+    registry.bridges.swap_remove(index);
+    Ok(())
+}
+
+pub fn host_bridge_snapshot() -> Vec<PciHostBridgeSnapshot> {
+    PCI_HOST_BRIDGES
+        .lock()
+        .bridges
+        .iter()
+        .map(|bridge| PciHostBridgeSnapshot {
+            handle: bridge.handle,
+            info: bridge.info.clone(),
+            pnp: bridge.pnp.as_ref().map(Arc::clone),
+        })
+        .collect()
+}
+
+fn host_bridge_pnp_for(segment: u16, bus: u8) -> Option<Arc<PnpDevice>> {
+    PCI_HOST_BRIDGES
+        .lock()
+        .bridges
+        .iter()
+        .find(|bridge| {
+            bridge.info.domain == segment
+                && bus >= bridge.info.bus_start
+                && bus <= bridge.info.bus_end
+        })
+        .and_then(|bridge| bridge.pnp.as_ref().map(Arc::clone))
+}
+
+const fn pci_bus_ranges_overlap(a_start: u8, a_end: u8, b_start: u8, b_end: u8) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
+fn attach_to_host_bridge(dev: &Arc<PnpDevice>) {
+    let (segment, bus) = match &dev.id {
+        PnpId::Pci { segment, bus, .. } => (*segment, *bus),
+        _ => return,
+    };
+    let Some(host) = host_bridge_pnp_for(segment, bus) else {
+        return;
+    };
+    if dev.parent().is_some() || Arc::ptr_eq(&host, dev) {
+        return;
+    }
+    // 拓扑挂接失败只表示当前设备已经被其它总线关系占用或正处于生命周期转换中；
+    // PCI function 的发现与驱动 probe 不应因此被撤销。
+    let _ = host.attach_child(dev);
 }
 
 // ── PCI config space 常量 ────────────────────────────────────────────────
@@ -935,6 +1126,7 @@ impl PciDevice {
         let new_dev = PnpDevice::new(id, name, Box::new(info));
         let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev)).ok()?;
         let pnp = registration.device;
+        attach_to_host_bridge(&pnp);
 
         match pnp.state() {
             PnpState::Bound => Some(pnp),

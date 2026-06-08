@@ -301,7 +301,7 @@ fn validate_symlink_target(target: &str) -> VfsResult<()> {
 /// devtmpfs superblock 中创建或删除对应 `/dev` 节点。桥接只消费 `DevNodeSpec`
 /// 携带的设备对象，不 downcast 具体 function 类型。
 pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
-    let dev_sb = publish_devtmpfs_sb(dev_sb);
+    let (dev_sb, first_publish) = publish_devtmpfs_sb(dev_sb);
     dev_sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(PnpError::NoDevtmpfs)?;
@@ -310,10 +310,14 @@ pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
         bind: pnp_bind_cb,
         unbind: pnp_unbind_cb,
     });
-    for func in DEVICES.functions.list() {
-        if let Some(nodes) = func.devnodes() {
-            // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 安装后补齐 POSIX 节点投影。
-            pnp_bind_cb(&nodes)?;
+    if first_publish {
+        for func in DEVICES.functions.list() {
+            if let Some(nodes) = func.devnodes() {
+                // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 首次安装后补齐
+                // POSIX 节点投影。重复安装 bridge 时不能再次 bind 同一批节点，否则
+                // 幂等初始化路径会被已有节点误判为失败。
+                pnp_bind_cb(&nodes)?;
+            }
         }
     }
     Ok(())
@@ -328,17 +332,17 @@ fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
     guard.as_ref().map(|sb| Arc::clone(*sb))
 }
 
-fn publish_devtmpfs_sb(dev_sb: Arc<Superblock>) -> Arc<Superblock> {
+fn publish_devtmpfs_sb(dev_sb: Arc<Superblock>) -> (Arc<Superblock>, bool) {
     let mut guard = DEVTMPFS_SINGLETON_SB.lock();
     if let Some(existing) = guard.as_ref() {
-        return Arc::clone(*existing);
+        return (Arc::clone(*existing), false);
     }
 
     // devtmpfs 是全局设备名字空间的投影，superblock 生命周期等同内核生命周期。
     // 这里泄露一个 Arc 作为单例锚点，后续 mount/bridge/static node 注册都只克隆它。
     let leaked: &'static Arc<Superblock> = Box::leak(Box::new(dev_sb));
     *guard = Some(leaked);
-    Arc::clone(leaked)
+    (Arc::clone(leaked), true)
 }
 
 fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
@@ -2643,7 +2647,8 @@ impl FsDriver for DevTmpfsDriver {
             .ok_or(VfsError::InvalidArgument)?;
         ops.bind_registered_static_nodes()?;
 
-        Ok(publish_devtmpfs_sb(sb))
+        let (sb, _) = publish_devtmpfs_sb(sb);
+        Ok(sb)
     }
 
     fn kill_sb(&self, _sb: Arc<Superblock>) {}

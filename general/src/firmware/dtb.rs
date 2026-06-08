@@ -599,7 +599,7 @@ impl DtbTree {
         let mut devices = Vec::new();
         for node_id in 0..self.nodes.len() {
             let entry = &self.nodes[node_id];
-            if !entry.enabled || node_id == 0 || self.node_is_pcie_host(node_id) {
+            if !entry.enabled || node_id == 0 {
                 continue;
             }
             let compatible = compatible_strings(entry.node);

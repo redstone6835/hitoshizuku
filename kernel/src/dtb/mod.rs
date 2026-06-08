@@ -328,6 +328,8 @@ pub fn kernel_start_init(context: &StartContext) {
                 host.path
             );
         }
+        let host_pnp = registered_platform_node(&registered_platform_nodes, host.path);
+        pci::register_pci_host_bridge(host, host_pnp);
         printk!(
             "[kernel-start][dtb] pcie ECAM {} domain={} phys={:#x} size={:#x} bus=[{:#x},{:#x}] ranges={} msi-map={} dma-coherent={}",
             host.path,
@@ -728,6 +730,16 @@ fn remember_registered_platform_node(
         parent_path,
         device,
     });
+}
+
+fn registered_platform_node(
+    nodes: &[RegisteredPlatformNode],
+    path: &'static str,
+) -> Option<Arc<PnpDevice>> {
+    nodes
+        .iter()
+        .find(|node| node.path == path)
+        .map(|node| Arc::clone(&node.device))
 }
 
 fn register_platform_device_status(

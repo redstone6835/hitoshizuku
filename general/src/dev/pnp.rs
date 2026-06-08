@@ -434,11 +434,22 @@ impl PnpDevice {
     // ── 父子关系 ──
 
     pub fn attach_child(self: &Arc<Self>, child: &Arc<PnpDevice>) -> Result<(), PnpError> {
+        // PnP 拓扑必须保持有向无环：设备不能把自己挂成子节点，也不能把祖先
+        // 重新挂到自己下面。否则 remove/unbind 的递归清理会形成无限递归。
+        if Arc::ptr_eq(self, child) || self.has_ancestor(child) {
+            return Err(PnpError::InvalidState);
+        }
+
         let mut inner = self.inner.lock();
         if inner.state == PnpState::Gone || inner.state == PnpState::Removing {
             return Err(PnpError::InvalidState);
         }
         let mut child_inner = child.inner.lock();
+        // 正在移除或已经 Gone 的设备不能重新进入拓扑；这类对象的 function 和
+        // driver_data 正在被清理，重新挂接会破坏热拔生命周期。
+        if child_inner.state == PnpState::Gone || child_inner.state == PnpState::Removing {
+            return Err(PnpError::InvalidState);
+        }
         if child_inner.parent.is_some() {
             drop(child_inner);
             return Err(PnpError::InvalidState);
@@ -447,6 +458,17 @@ impl PnpDevice {
         drop(child_inner);
         inner.children.push(Arc::clone(child));
         Ok(())
+    }
+
+    fn has_ancestor(&self, needle: &Arc<PnpDevice>) -> bool {
+        let mut current = self.parent();
+        while let Some(parent) = current {
+            if Arc::ptr_eq(&parent, needle) {
+                return true;
+            }
+            current = parent.parent();
+        }
+        false
     }
 
     pub fn detach_child(self: &Arc<Self>, child: &Arc<PnpDevice>) {
