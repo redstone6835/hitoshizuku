@@ -21,7 +21,7 @@ use spin::mutex::Mutex;
 
 use crate::boot::BootAllocator;
 use crate::error::RegistryError;
-use crate::request::{AllocationKind, AllocationRecord};
+use crate::request::{AllocationKind, AllocationRecord, MemoryDomain};
 
 const DEFAULT_BUCKETS: usize = 4096;
 
@@ -94,7 +94,7 @@ impl AllocationRegistry {
         self.init_with_buckets(boot, DEFAULT_BUCKETS)
     }
 
-    pub fn init_with_buckets(&self, boot: &BootAllocator, bucket_count: usize) -> bool {
+    pub fn init_with_buckets(&self, _boot: &BootAllocator, bucket_count: usize) -> bool {
         let mut inner = self.inner.lock();
         if inner.initialized {
             return true;
@@ -104,14 +104,7 @@ impl AllocationRegistry {
             Ok(layout) => layout,
             Err(_) => return false,
         };
-        let buckets = {
-            let ptr = crate::alloc_internal_metadata(layout) as *mut usize;
-            if ptr.is_null() {
-                boot.alloc(layout) as *mut usize
-            } else {
-                ptr
-            }
-        };
+        let buckets = crate::alloc_internal_metadata(layout) as *mut usize;
         if buckets.is_null() {
             return false;
         }
@@ -139,44 +132,67 @@ impl AllocationRegistry {
 
     pub fn register_result(
         &self,
-        boot: &BootAllocator,
+        _boot: &BootAllocator,
         record: AllocationRecord,
     ) -> Result<(), RegistryError> {
-        let mut inner = self.inner.lock();
-        if !inner.initialized {
-            inner.insert_failures += 1;
-            return Err(RegistryError::NotInitialized);
-        }
         if record.ptr == 0 {
+            let mut inner = self.inner.lock();
             inner.insert_failures += 1;
             return Err(RegistryError::InvalidRecord);
         }
 
-        let bucket = bucket_index(record.ptr, inner.bucket_count);
-        let head = bucket_head(&inner, bucket);
-        if head != 0 {
-            inner.collisions += 1;
-        }
-        if find_node(head, record.ptr).is_some() {
-            inner.insert_failures += 1;
-            inner.duplicate_inserts += 1;
-            return Err(RegistryError::DuplicatePointer);
-        }
+        let mut pending_node = 0usize;
+        loop {
+            let mut inner = self.inner.lock();
+            if !inner.initialized {
+                inner.insert_failures += 1;
+                if pending_node != 0 {
+                    recycle_node_locked(&mut inner, pending_node);
+                }
+                return Err(RegistryError::NotInitialized);
+            }
 
-        let Some(node_addr) = alloc_node(&mut inner, boot) else {
-            inner.insert_failures += 1;
-            return Err(RegistryError::MetadataOutOfMemory);
-        };
+            let bucket = bucket_index(record.ptr, inner.bucket_count);
+            let head = bucket_head(&inner, bucket);
+            if find_node(head, record.ptr).is_some() {
+                inner.insert_failures += 1;
+                inner.duplicate_inserts += 1;
+                if pending_node != 0 {
+                    recycle_node_locked(&mut inner, pending_node);
+                }
+                return Err(RegistryError::DuplicatePointer);
+            }
 
-        write_node(node_addr, RegistryNode { record, next: head });
-        set_bucket_head(&inner, bucket, node_addr);
-        inner.live_records += 1;
-        inner.live_by_kind[kind_index(record.kind)] += 1;
-        let chain_len = 1 + chain_len(head);
-        if chain_len > inner.max_chain_len {
-            inner.max_chain_len = chain_len;
+            let node_addr = if pending_node != 0 {
+                pending_node
+            } else if inner.free_nodes != 0 {
+                pop_free_node_locked(&mut inner)
+            } else {
+                drop(inner);
+                pending_node = match alloc_node_storage() {
+                    Some(node_addr) => node_addr,
+                    None => {
+                        let mut inner = self.inner.lock();
+                        inner.insert_failures += 1;
+                        return Err(RegistryError::MetadataOutOfMemory);
+                    }
+                };
+                continue;
+            };
+
+            write_node(node_addr, RegistryNode { record, next: head });
+            set_bucket_head(&inner, bucket, node_addr);
+            if head != 0 {
+                inner.collisions += 1;
+            }
+            inner.live_records += 1;
+            inner.live_by_kind[kind_index(record.kind)] += 1;
+            let chain_len = 1 + chain_len(head);
+            if chain_len > inner.max_chain_len {
+                inner.max_chain_len = chain_len;
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     pub fn get(&self, ptr: usize) -> Option<AllocationRecord> {
@@ -316,22 +332,29 @@ impl AllocationRegistry {
     }
 }
 
-fn alloc_node(inner: &mut AllocationRegistryInner, boot: &BootAllocator) -> Option<usize> {
-    if inner.free_nodes != 0 {
-        let node_addr = inner.free_nodes;
-        let node = read_node(node_addr);
-        inner.free_nodes = node.next;
-        return Some(node_addr);
+fn pop_free_node_locked(inner: &mut AllocationRegistryInner) -> usize {
+    let node_addr = inner.free_nodes;
+    if node_addr == 0 {
+        return 0;
     }
+    let node = read_node(node_addr);
+    inner.free_nodes = node.next;
+    node_addr
+}
 
-    let ptr = {
-        let ptr = crate::alloc_internal_metadata(Layout::new::<RegistryNode>()) as usize;
-        if ptr == 0 {
-            boot.alloc(Layout::new::<RegistryNode>()) as usize
-        } else {
-            ptr
-        }
-    };
+fn recycle_node_locked(inner: &mut AllocationRegistryInner, node_addr: usize) {
+    write_node(
+        node_addr,
+        RegistryNode {
+            record: AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, 0),
+            next: inner.free_nodes,
+        },
+    );
+    inner.free_nodes = node_addr;
+}
+
+fn alloc_node_storage() -> Option<usize> {
+    let ptr = crate::alloc_internal_metadata(Layout::new::<RegistryNode>()) as usize;
     (ptr != 0).then_some(ptr)
 }
 

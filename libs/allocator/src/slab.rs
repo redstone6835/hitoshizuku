@@ -21,7 +21,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
-use crate::boot::BootAllocator;
 use crate::buddy::{BuddyAllocator, PAGE_SIZE};
 use crate::request::AllocationRecord;
 use crate::space::{BackedRange, KernelAddressSpace};
@@ -165,7 +164,16 @@ impl Slab {
             return;
         }
 
-        let total_objects = ((page_count * PAGE_SIZE) / obj_size).min(BITMAP_WORDS * 64);
+        let Some(span_size) = page_count.checked_mul(PAGE_SIZE) else {
+            self.active = false;
+            return;
+        };
+        if page_count > u16::MAX as usize {
+            self.active = false;
+            return;
+        }
+
+        let total_objects = (span_size / obj_size).min(BITMAP_WORDS * 64);
         self.base_addr = base_addr;
         self.paddr = paddr;
         self.page_count = page_count as u16;
@@ -180,9 +188,13 @@ impl Slab {
     fn contains(&self, ptr: usize) -> bool {
         // 这里只判断地址是否落在 slab 覆盖范围内，不验证它是不是对象边界。更严格的槽位
         // 合法性检查交给 `object_index` 统一处理。
-        self.active
-            && ptr >= self.base_addr
-            && ptr < self.base_addr + self.page_count as usize * PAGE_SIZE
+        let Some(span_size) = (self.page_count as usize).checked_mul(PAGE_SIZE) else {
+            return false;
+        };
+        let Some(end) = self.base_addr.checked_add(span_size) else {
+            return false;
+        };
+        self.active && ptr >= self.base_addr && ptr < end
     }
 
     fn object_index(&self, ptr: usize, obj_size: usize) -> Option<usize> {
@@ -506,18 +518,10 @@ enum SlabGrowError {
 fn allocate_slab_node(
     obj_size: usize,
     pages_per_slab: usize,
-    boot: &BootAllocator,
     phys: &Mutex<BuddyAllocator>,
     vmem: &KernelAddressSpace,
 ) -> Result<usize, SlabGrowError> {
-    let node_addr = {
-        let ptr = crate::alloc_internal_metadata(Layout::new::<SlabNode>()) as usize;
-        if ptr != 0 {
-            ptr
-        } else {
-            boot.alloc(Layout::new::<SlabNode>()) as usize
-        }
-    };
+    let node_addr = crate::alloc_internal_metadata(Layout::new::<SlabNode>()) as usize;
     if node_addr == 0 {
         return Err(SlabGrowError::Metadata);
     }
@@ -566,7 +570,6 @@ impl Zone {
     fn alloc(
         &self,
         cpu: usize,
-        boot: &BootAllocator,
         phys: &Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> *mut u8 {
@@ -615,7 +618,7 @@ impl Zone {
                     return null_mut();
                 }
 
-                match allocate_slab_node(self.size_class, self.pages_per_slab, boot, phys, vmem) {
+                match allocate_slab_node(self.size_class, self.pages_per_slab, phys, vmem) {
                     Ok(node_addr) => {
                         let mut state = self.state.lock();
                         state.insert_slab_node(node_addr);
@@ -766,7 +769,6 @@ impl Zone {
 pub struct SlabAllocator {
     zones: [Zone; SIZE_CLASS_COUNT],
     cpu_count: AtomicUsize,
-    metadata_boot: AtomicUsize,
     initialized: AtomicBool,
 }
 
@@ -790,14 +792,8 @@ impl SlabAllocator {
                 Zone::new(SIZE_CLASSES[13]),
             ],
             cpu_count: AtomicUsize::new(1),
-            metadata_boot: AtomicUsize::new(0),
             initialized: AtomicBool::new(false),
         }
-    }
-
-    pub fn bind_metadata_source(&self, boot: &BootAllocator) {
-        self.metadata_boot
-            .store(boot as *const _ as usize, Ordering::Release);
     }
 
     pub fn init(&self, cpu_count: usize) {
@@ -834,10 +830,7 @@ impl SlabAllocator {
             return null_mut();
         };
         let cpu = self.normalize_cpu(cpu_id);
-        let Some(boot) = self.load_metadata_source() else {
-            return null_mut();
-        };
-        self.zones[zone_idx].alloc(cpu, boot, phys, vmem)
+        self.zones[zone_idx].alloc(cpu, phys, vmem)
     }
 
     pub fn free(&self, ptr: usize, layout: Layout, cpu_id: usize) -> bool {
@@ -921,15 +914,6 @@ impl SlabAllocator {
     fn normalize_cpu(&self, cpu_id: usize) -> usize {
         let limit = self.cpu_count.load(Ordering::Acquire).clamp(1, MAX_CPUS);
         cpu_id.min(limit - 1)
-    }
-
-    fn load_metadata_source(&self) -> Option<&BootAllocator> {
-        let raw = self.metadata_boot.load(Ordering::Acquire);
-        if raw == 0 {
-            None
-        } else {
-            Some(unsafe { &*(raw as *const BootAllocator) })
-        }
     }
 
     fn zone_index_for_ptr(&self, ptr: usize) -> Option<usize> {

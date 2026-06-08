@@ -256,6 +256,7 @@ const NCCS_VKILL: usize = 3;
 const NCCS_VEOF: usize = 4;
 const NCCS_VTIME: usize = 5;
 const NCCS_VMIN: usize = 6;
+const NCCS_VSUSP: usize = 10;
 
 const ICRNL: u32 = 0x0100;
 const IXON: u32 = 0x0400;
@@ -374,6 +375,25 @@ impl LinuxTermios {
 
     fn vmin(&self) -> u8 {
         self.cc(NCCS_VMIN)
+    }
+
+    fn vsusp(&self) -> u8 {
+        self.cc(NCCS_VSUSP)
+    }
+
+    fn signal_for_input(&self, ch: u8) -> Option<sched::SignalNumber> {
+        if !self.isig() || ch == 0 {
+            return None;
+        }
+        if ch == self.vintr() {
+            Some(sched::SignalNumber::SIGINT)
+        } else if ch == self.vquit() {
+            Some(sched::SignalNumber::SIGQUIT)
+        } else if ch == self.vsusp() {
+            Some(sched::SignalNumber::SIGTSTP)
+        } else {
+            None
+        }
     }
 }
 
@@ -573,6 +593,32 @@ impl CharDevFileOps {
         }
     }
 
+    fn echo_signal_char(&self, sig: sched::SignalNumber, termios: LinuxTermios) {
+        if !termios.echo() {
+            return;
+        }
+        let bytes = if sig == sched::SignalNumber::SIGINT {
+            &b"^C\n"[..]
+        } else if sig == sched::SignalNumber::SIGQUIT {
+            &b"^\\\n"[..]
+        } else if sig == sched::SignalNumber::SIGTSTP {
+            &b"^Z\n"[..]
+        } else {
+            &b"\n"[..]
+        };
+        let _ = self.write_tty_bytes(bytes, termios);
+    }
+
+    fn handle_input_signal(&self, ch: u8, termios: LinuxTermios) -> VfsResult<()> {
+        let Some(sig) = termios.signal_for_input(ch) else {
+            return Ok(());
+        };
+        self.send_fg_signal(sig);
+        self.line_state.lock().clear();
+        self.echo_signal_char(sig, termios);
+        Err(VfsError::Interrupted)
+    }
+
     fn read_tty_canonical(&self, buf: &mut [u8], termios: LinuxTermios) -> VfsResult<usize> {
         loop {
             if let Some(n) = self.dequeue_ready(buf) {
@@ -592,21 +638,7 @@ impl CharDevFileOps {
             if termios.ixon() && (ch == 17 || ch == 19) {
                 continue;
             }
-            if termios.isig() {
-                if ch == termios.vintr() && ch != 0 {
-                    self.send_fg_signal(sched::SignalNumber::SIGINT);
-                    let mut state = self.line_state.lock();
-                    state.line.clear();
-                    drop(state);
-                    if termios.echo() {
-                        let _ = self.write_tty_bytes(b"^C\n", termios);
-                    }
-                    continue;
-                }
-                if ch == termios.vquit() && ch != 0 {
-                    continue;
-                }
-            }
+            self.handle_input_signal(ch, termios)?;
 
             let mut echo_bytes: Option<Vec<u8>> = None;
             {
@@ -680,6 +712,9 @@ impl CharDevFileOps {
                             *byte = b'\n';
                         }
                     }
+                }
+                for idx in start..filled {
+                    self.handle_input_signal(buf[idx], termios)?;
                 }
                 if termios.echo() {
                     let _ = self.write_tty_bytes(&buf[start..filled], termios);
@@ -1746,7 +1781,7 @@ impl DevTmpfsSuperblockOps {
         ))
     }
 
-    fn new_custom_inode(&self, spec: &CustomDevNodeSpec) -> VfsResult<Arc<Inode>> {
+    fn new_custom_inode(&self, spec: &CustomDevNodeSpec, rdev: DevId) -> VfsResult<Arc<Inode>> {
         split_devtmpfs_path(spec.name())?;
         if spec.block_size() == 0 || spec.nlink() == 0 {
             return Err(VfsError::InvalidArgument);
@@ -1773,7 +1808,7 @@ impl DevTmpfsSuperblockOps {
                 ino: self.alloc_ino(),
             },
             spec.kind(),
-            spec.rdev(),
+            rdev,
             spec.block_size(),
             None,
             meta,
@@ -2055,8 +2090,32 @@ impl DevTmpfsSuperblockOps {
         if self.lookup_node_at(spec.name()).is_ok() {
             return Err(VfsError::AlreadyExists);
         }
-        let inode = self.new_custom_inode(spec)?;
-        self.insert_node_at(spec.name(), inode)
+        let mut registered_rdev = false;
+        let rdev = if spec.rdev() != DevId::new(0, 0) {
+            spec.rdev()
+        } else {
+            match spec.kind() {
+                FileType::CharDevice => {
+                    registered_rdev = true;
+                    super::device_numbers::register_char(spec.name(), spec.name())
+                        .ok_or(VfsError::NoSpace)?
+                }
+                FileType::BlockDevice => {
+                    registered_rdev = true;
+                    super::device_numbers::register_block(spec.name(), spec.name())
+                        .ok_or(VfsError::NoSpace)?
+                }
+                _ => spec.rdev(),
+            }
+        };
+        let inode = self.new_custom_inode(spec, rdev)?;
+        if let Err(err) = self.insert_node_at(spec.name(), inode) {
+            if registered_rdev {
+                super::device_numbers::unregister_node(spec.name());
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 绑定一个通用 devtmpfs 节点规格。

@@ -1,19 +1,18 @@
 //! vmem arena 虚拟地址空间区间管理器
 //!
-//! 参照 FreeBSD `kern/subr_vmem.c` 的设计，实现基于边界标签 (boundary tag)
-//! 的资源区间分配器。vmem 用于管理虚拟地址空间、设备 I/O 空间等线性资源。
+//! 通过边界标签 (boundary tag) 管理线性资源区间。vmem 用于管理虚拟地址空间、
+//! 设备 I/O 空间等线性资源。
 //!
 //! 核心特性:
 //! - 基于边界标签的区间管理
 //! - 支持 quantum 对齐分配
 //! - 分离的空闲链表 (power-of-2 大小桶) 加速最佳匹配查找
 //! - 即时合并 (instant coalescing) 机制
-//! - 使用 boot-backed 动态标签池消除固定上限
+//! - 使用自举感知的动态标签池消除固定上限
 
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::boot::BootAllocator;
 use crate::error::VmemError;
 
 const INVALID_TAG: usize = usize::MAX;
@@ -192,8 +191,6 @@ pub struct VmemArena {
     stats: VmemStats,
     /// 是否已初始化
     initialized: bool,
-    /// 动态标签元数据来源
-    metadata_boot: AtomicUsize,
 }
 
 impl VmemArena {
@@ -209,13 +206,7 @@ impl VmemArena {
             policy: VmemAllocPolicy::BestFit,
             stats: VmemStats::new(),
             initialized: false,
-            metadata_boot: AtomicUsize::new(0),
         }
-    }
-
-    pub fn bind_metadata_source(&mut self, boot: &BootAllocator) {
-        self.metadata_boot
-            .store(boot as *const BootAllocator as usize, Ordering::Release);
     }
 
     /// 初始化 vmem arena
@@ -267,19 +258,10 @@ impl VmemArena {
         true
     }
 
-    fn metadata_boot(&self) -> Option<&BootAllocator> {
-        let raw = self.metadata_boot.load(Ordering::Acquire);
-        if raw == 0 {
-            None
-        } else {
-            Some(unsafe { &*(raw as *const BootAllocator) })
-        }
-    }
-
     /// 从标签空闲池获取一个标签
     fn alloc_tag(&mut self) -> Option<usize> {
         // tag 本身也是元数据资源，所以这里优先复用 free tag；没有可复用的 tag 时，
-        // 才去向 metadata allocator / boot allocator 要新的标签存储。
+        // 才去向 crate 级 metadata allocator 要新的标签存储。
         if self.tag_free_head != INVALID_TAG {
             let addr = self.tag_free_head;
             self.tag_free_head = read_tag(addr).free_next;
@@ -290,15 +272,7 @@ impl VmemArena {
             return Some(addr);
         }
 
-        let addr = {
-            let ptr = crate::alloc_internal_metadata(Layout::new::<BoundaryTag>()) as usize;
-            if ptr != 0 {
-                ptr
-            } else {
-                let boot = self.metadata_boot()?;
-                boot.alloc(Layout::new::<BoundaryTag>()) as usize
-            }
-        };
+        let addr = crate::alloc_internal_metadata(Layout::new::<BoundaryTag>()) as usize;
         if addr == 0 {
             return None;
         }

@@ -9,6 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
+use crate::dev::irq::{self, IrqLine};
 use crate::dev::pnp::{BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId};
 
 const PLATFORM_ID_FNV_OFFSET: u32 = 0x811c_9dc5;
@@ -31,17 +32,50 @@ impl DeviceMatchId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceResource {
-    Mmio { phys: usize, size: usize },
-    Irq(u32),
+    Mmio {
+        phys: usize,
+        size: usize,
+    },
+    /// 固件描述的中断 specifier。
+    ///
+    /// DTB `interrupts` cells 的长度和含义由对应 interrupt controller 的
+    /// `#interrupt-cells` 决定。platform 层只保存 controller phandle 和原始
+    /// cells，不猜测第几个 cell 是中断号或触发方式；后续 IRQ domain 接入后由
+    /// 控制器驱动解释。
+    Irq {
+        controller: Option<u32>,
+        cells: Box<[u32]>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeviceProperties {
     pub clock_hz: Option<u32>,
     pub baud: Option<u32>,
+    /// 固件节点 phandle。DTB interrupt-controller driver 用它注册 IRQ domain；
+    /// 没有 phandle 的固件来源保持 `None`。
+    pub fw_phandle: Option<u32>,
+    /// 固件描述的父 interrupt-controller phandle。interrupt-controller 自身也
+    /// 可能需要它来建立级联关系，即使节点没有 `interrupts` 属性。
+    pub fw_interrupt_parent: Option<u32>,
+    /// 该 platform 节点是否声明为 interrupt-controller。
+    pub interrupt_controller: bool,
     pub stdout: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FirmwarePropertyValue {
+    Bool,
+    U32(u32),
+    StringList(Box<[Box<str>]>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareProperty {
+    pub name: Box<str>,
+    pub value: FirmwarePropertyValue,
 }
 
 #[derive(Debug)]
@@ -50,6 +84,7 @@ pub struct PlatformDeviceInfo {
     pub ids: Vec<DeviceMatchId>,
     pub resources: Vec<DeviceResource>,
     pub properties: DeviceProperties,
+    pub fw_properties: Vec<FirmwareProperty>,
 }
 
 impl PlatformDeviceInfo {
@@ -58,10 +93,69 @@ impl PlatformDeviceInfo {
     }
 
     pub fn first_mmio(&self) -> Option<(usize, usize)> {
-        self.resources.iter().find_map(|resource| match *resource {
-            DeviceResource::Mmio { phys, size } => Some((phys, size)),
-            DeviceResource::Irq(_) => None,
+        self.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Mmio { phys, size } => Some((*phys, *size)),
+            DeviceResource::Irq { .. } => None,
         })
+    }
+
+    pub fn has_irq_resource(&self) -> bool {
+        self.resources
+            .iter()
+            .any(|resource| matches!(resource, DeviceResource::Irq { .. }))
+    }
+
+    pub fn first_irq_line(&self) -> Option<IrqLine> {
+        self.resources.iter().find_map(|resource| match resource {
+            DeviceResource::Mmio { .. } => None,
+            DeviceResource::Irq { controller, cells } => {
+                irq::translate_firmware_irq(*controller, cells)
+            }
+        })
+    }
+
+    pub fn u32_property(&self, name: &str) -> Option<u32> {
+        self.fw_properties
+            .iter()
+            .find(|property| property.name.as_ref() == name)
+            .and_then(|property| match property.value {
+                FirmwarePropertyValue::U32(value) => Some(value),
+                FirmwarePropertyValue::Bool | FirmwarePropertyValue::StringList(_) => None,
+            })
+    }
+
+    pub fn bool_property(&self, name: &str) -> bool {
+        self.fw_properties.iter().any(|property| {
+            property.name.as_ref() == name && matches!(property.value, FirmwarePropertyValue::Bool)
+        })
+    }
+
+    pub fn string_list_property(&self, name: &str) -> Option<&[Box<str>]> {
+        self.fw_properties
+            .iter()
+            .find(|property| property.name.as_ref() == name)
+            .and_then(|property| match &property.value {
+                FirmwarePropertyValue::StringList(values) => Some(values.as_ref()),
+                FirmwarePropertyValue::Bool | FirmwarePropertyValue::U32(_) => None,
+            })
+    }
+
+    pub fn mmio_by_name(&self, names: &[&str]) -> Option<(usize, usize)> {
+        let reg_names = self.string_list_property("reg-names")?;
+        let mut mmio_index = 0usize;
+        for resource in &self.resources {
+            let DeviceResource::Mmio { phys, size } = resource else {
+                continue;
+            };
+            let matched = reg_names
+                .get(mmio_index)
+                .is_some_and(|reg_name| names.iter().any(|name| reg_name.as_ref() == *name));
+            if matched {
+                return Some((*phys, *size));
+            }
+            mmio_index += 1;
+        }
+        None
     }
 }
 
@@ -130,15 +224,18 @@ fn platform_instance_id(info: &PlatformDeviceInfo) -> u32 {
         }
     }
     for resource in &info.resources {
-        match *resource {
+        match resource {
             DeviceResource::Mmio { phys, size } => {
                 hash = fnv_mix_u32(hash, 4);
-                hash = fnv_mix_usize(hash, phys);
-                hash = fnv_mix_usize(hash, size);
+                hash = fnv_mix_usize(hash, *phys);
+                hash = fnv_mix_usize(hash, *size);
             }
-            DeviceResource::Irq(irq) => {
+            DeviceResource::Irq { controller, cells } => {
                 hash = fnv_mix_u32(hash, 5);
-                hash = fnv_mix_u32(hash, irq);
+                hash = fnv_mix_u32(hash, controller.unwrap_or(0));
+                for cell in cells.iter() {
+                    hash = fnv_mix_u32(hash, *cell);
+                }
             }
         }
     }
