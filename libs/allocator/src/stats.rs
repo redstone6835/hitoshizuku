@@ -14,6 +14,7 @@ use crate::buddy::{BuddyStats, PAGE_SIZE};
 use crate::gc::{GcCollectionKind, GcPhase};
 use crate::kheap::KernelHeapStats;
 use crate::managed::ManagedStats;
+use crate::metadata::MetadataStats;
 use crate::registry::AllocationRegistryStats;
 use crate::slab::SlabStats;
 use crate::space::AddressSpaceStats;
@@ -46,6 +47,7 @@ pub struct AllocatorLayerStats {
     pub address_space: AddressSpaceStats,
     pub kheap: KernelHeapStats,
     pub slab: SlabStats,
+    pub metadata: MetadataStats,
     pub registry: AllocationRegistryStats,
     pub managed: ManagedStats,
 }
@@ -58,13 +60,13 @@ pub fn build_overview(
     slab: SlabStats,
     managed: ManagedStats,
 ) -> MemoryOverview {
-    let free_physical = phys.free_pages * PAGE_SIZE;
-    let kernel_heap_used = kheap.active_bytes + slab.active_bytes;
+    let free_physical = pages_to_bytes(phys.free_pages);
+    let kernel_heap_used = kheap.active_bytes.saturating_add(slab.active_bytes);
     MemoryOverview {
-        total_physical: phys.total_pages * PAGE_SIZE,
-        allocated_physical: phys.allocated_pages * PAGE_SIZE,
+        total_physical: pages_to_bytes(phys.total_pages),
+        allocated_physical: pages_to_bytes(phys.allocated_pages),
         free_physical,
-        reserved_physical: phys.reserved_pages * PAGE_SIZE,
+        reserved_physical: pages_to_bytes(phys.reserved_pages),
         direct_map_total: address_space.direct_map.total_size,
         direct_map_allocated: address_space.direct_map.allocated_size,
         direct_map_free: address_space.direct_map.free_size,
@@ -80,6 +82,11 @@ pub fn build_overview(
         boot_free: boot.free_bytes,
         pressure_level: pressure_level(phys, address_space, managed),
     }
+}
+
+#[inline]
+fn pages_to_bytes(pages: usize) -> usize {
+    pages.saturating_mul(PAGE_SIZE)
 }
 
 pub fn pressure_level(
@@ -139,6 +146,14 @@ pub fn format_diagnostic(
     pos += write_usize(buf, pos, overview.free_physical / 1024);
     pos += write_str(buf, pos, b"K pressure=");
     pos += write_usize(buf, pos, overview.pressure_level as usize);
+    pos += write_str(buf, pos, b" meta=");
+    pos += write_usize(buf, pos, pages_to_bytes(layers.phys.metadata_pages) / 1024);
+    pos += write_str(buf, pos, b"K nodes=");
+    pos += write_usize(buf, pos, layers.phys.node_used);
+    pos += write_str(buf, pos, b"/");
+    pos += write_usize(buf, pos, layers.phys.node_capacity);
+    pos += write_str(buf, pos, b" buckets=");
+    pos += write_usize(buf, pos, layers.phys.hash_bucket_count);
     pos += write_str(buf, pos, b"\nAddr: dm=");
     pos += write_usize(buf, pos, overview.direct_map_allocated / 1024);
     pos += write_str(buf, pos, b"/");
@@ -159,6 +174,12 @@ pub fn format_diagnostic(
     );
     pos += write_str(buf, pos, b"K free_segs=");
     pos += write_usize(buf, pos, layers.address_space.kernel.free_segments);
+    pos += write_str(buf, pos, b" tags=");
+    pos += write_usize(buf, pos, layers.address_space.kernel.active_tags);
+    pos += write_str(buf, pos, b"/");
+    pos += write_usize(buf, pos, layers.address_space.kernel.free_tags);
+    pos += write_str(buf, pos, b" tag_refill=");
+    pos += write_u64(buf, pos, layers.address_space.kernel.tag_refills);
     pos += write_str(buf, pos, b"K\nSlab: alloc=");
     pos += write_u64(buf, pos, layers.slab.alloc_requests);
     pos += write_str(buf, pos, b" free=");
@@ -173,6 +194,20 @@ pub fn format_diagnostic(
     pos += write_u64(buf, pos, layers.slab.cache_flushes);
     pos += write_str(buf, pos, b" reclaim=");
     pos += write_u64(buf, pos, layers.slab.reclaimed_slabs);
+    pos += write_str(buf, pos, b" free_nodes=");
+    pos += write_usize(buf, pos, layers.slab.free_slab_nodes);
+    pos += write_str(buf, pos, b"\nMeta: backing=");
+    pos += write_usize(
+        buf,
+        pos,
+        pages_to_bytes(layers.metadata.backing_pages) / 1024,
+    );
+    pos += write_str(buf, pos, b"K used=");
+    pos += write_usize(buf, pos, layers.metadata.allocated_bytes / 1024);
+    pos += write_str(buf, pos, b"K boot=");
+    pos += write_u64(buf, pos, layers.metadata.boot_allocations);
+    pos += write_str(buf, pos, b" dyn=");
+    pos += write_u64(buf, pos, layers.metadata.dynamic_allocations);
     pos += write_str(buf, pos, b"\nKHeap: alloc=");
     pos += write_u64(buf, pos, layers.kheap.alloc_requests);
     pos += write_str(buf, pos, b" free=");
@@ -181,8 +216,18 @@ pub fn format_diagnostic(
     pos += write_u64(buf, pos, layers.kheap.alloc_failures);
     pos += write_str(buf, pos, b"\nReg: live=");
     pos += write_usize(buf, pos, layers.registry.live_records);
+    pos += write_str(buf, pos, b" shards=");
+    pos += write_usize(buf, pos, layers.registry.shard_count);
+    pos += write_str(buf, pos, b" max_shard=");
+    pos += write_usize(buf, pos, layers.registry.max_shard_live_records);
+    pos += write_str(buf, pos, b" free=");
+    pos += write_usize(buf, pos, layers.registry.free_nodes);
     pos += write_str(buf, pos, b" max_chain=");
     pos += write_usize(buf, pos, layers.registry.max_chain_len);
+    pos += write_str(buf, pos, b" refill=");
+    pos += write_u64(buf, pos, layers.registry.node_refills);
+    pos += write_str(buf, pos, b" nodes=");
+    pos += write_usize(buf, pos, layers.registry.nodes_allocated);
     pos += write_str(buf, pos, b" dup=");
     pos += write_u64(buf, pos, layers.registry.duplicate_inserts);
     pos += write_str(buf, pos, b" double_free=");

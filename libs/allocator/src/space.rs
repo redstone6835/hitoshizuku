@@ -126,7 +126,7 @@ impl KernelAddressSpace {
         phys_to_virt: fn(usize) -> usize,
         virt_to_phys: fn(usize) -> usize,
         kernel_heap_region: (usize, usize),
-        boot: &BootAllocator,
+        _boot: &BootAllocator,
     ) -> Result<(), AddressSpaceError> {
         if !phys.is_initialized() {
             return Err(AddressSpaceError::NotInitialized);
@@ -144,7 +144,6 @@ impl KernelAddressSpace {
         {
             let phase_start_ns = now_ns();
             let mut direct_map = self.direct_map.lock();
-            direct_map.bind_metadata_source(boot);
             if !direct_map.init(b"direct_map", 0, 0, PAGE_SIZE, VmemAllocPolicy::BestFit) {
                 self.initialized.store(false, Ordering::Release);
                 return Err(AddressSpaceError::MetadataOutOfMemory);
@@ -227,7 +226,6 @@ impl KernelAddressSpace {
         {
             let phase_start_ns = now_ns();
             let mut kernel = self.kernel.lock();
-            kernel.bind_metadata_source(boot);
             if kernel_heap_region.1 == 0 {
                 if !kernel.init(b"kernel_heap", 0, 0, PAGE_SIZE, VmemAllocPolicy::BestFit) {
                     self.initialized.store(false, Ordering::Release);
@@ -323,7 +321,6 @@ impl KernelAddressSpace {
         {
             let phase_start_ns = now_ns();
             let mut managed = self.managed.lock();
-            managed.bind_metadata_source(boot);
             if !managed.init(b"managed_heap", 0, 0, PAGE_SIZE, VmemAllocPolicy::BestFit) {
                 self.initialized.store(false, Ordering::Release);
                 return Err(AddressSpaceError::MetadataOutOfMemory);
