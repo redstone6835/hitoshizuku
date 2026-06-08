@@ -106,8 +106,9 @@ pub use spawn::{
 pub use task::{
     ExitCode, RobustListState, RseqRegistration, TASK_COMM_LEN, TASKEXT_EXEC_ARGS,
     TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT,
-    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook, TaskExtKey, TaskState,
-    ext_clone_hook, register_ext_clone_hook,
+    TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task, TaskExt, TaskExtCloneHook, TaskExtExitHook,
+    TaskExtKey, TaskState, ext_clone_hook, ext_exit_hook, register_ext_clone_hook,
+    register_ext_exit_hook,
 };
 pub use wait::WaitQueue;
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};

@@ -852,3 +852,23 @@ pub fn register_ext_clone_hook(hook: &'static dyn TaskExtCloneHook) {
 pub fn ext_clone_hook() -> Option<&'static dyn TaskExtCloneHook> {
     *EXT_CLONE_HOOK.lock()
 }
+
+/// 任务退出时由上层清理挂在 ext 表里的退出期资源。
+///
+/// sched 只保留 wait/reap 需要的 Task 元数据；fdtable 这类会保活外部对象的
+/// 资源不应被 Zombie 任务保活到父进程 wait 之后。
+pub trait TaskExtExitHook: Send + Sync {
+    fn cleanup_on_exit(&self, task: &Arc<Task>);
+}
+
+static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
+
+/// 注册全局 ext exit hook。kernel 启动期调用一次。
+pub fn register_ext_exit_hook(hook: &'static dyn TaskExtExitHook) {
+    *EXT_EXIT_HOOK.lock() = Some(hook);
+}
+
+/// 取已注册的 exit hook；未注册返回 `None`。
+pub fn ext_exit_hook() -> Option<&'static dyn TaskExtExitHook> {
+    *EXT_EXIT_HOOK.lock()
+}

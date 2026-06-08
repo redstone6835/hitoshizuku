@@ -26,7 +26,7 @@ use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
-use sched::task::{TaskExtCloneHook, TaskExtKey};
+use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey};
 use sched::{
     TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
@@ -135,6 +135,25 @@ impl TaskExtCloneHook for KernelExtCloneHook {
 }
 
 static HOOK: KernelExtCloneHook = KernelExtCloneHook;
+
+struct KernelExtExitHook;
+
+impl TaskExtExitHook for KernelExtExitHook {
+    fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        // FIXME: 其它 task ext 条目，在明确退出后的所有权要求后,需要这里释放资源。
+        if let Some(payload) = task.ext_remove(TASKEXT_VFS_FDTABLE) {
+            if let Ok(fdtable) = payload.downcast::<FdTable>() {
+                log::debug!(
+                    "[sched][exit-ext] pid={:?} drop fdtable open_fds={}",
+                    task.pid_root(),
+                    fdtable.len(),
+                );
+            }
+        }
+    }
+}
+
+static EXIT_HOOK: KernelExtExitHook = KernelExtExitHook;
 
 // ── VmSwitchOps ──────────────────────────────────────────────────────────────
 //
@@ -545,6 +564,7 @@ pub fn boot_init() -> Arc<Task> {
     // 2. 注入 ext clone hook，必须在 sched::init 之前——否则 init 任务后续
     //    任何 fork/clone 都会落到无 hook 的"全共享"分支。
     sched::register_ext_clone_hook(&HOOK);
+    sched::register_ext_exit_hook(&EXIT_HOOK);
 
     // 3. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
     sched::register_process_image_ops(&PROCESS_IMAGE_OPS);
