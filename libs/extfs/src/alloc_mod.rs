@@ -11,10 +11,25 @@ use crate::bgd;
 use crate::crc;
 use crate::layout::{SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET};
 use crate::state::{BlockBackendError, FsState};
-use vfs::sync::Spinlock;
+use vfs::sync::{Spinlock, SpinlockGuard};
 
 /// 互斥锁:整个 FS 串行化分配/释放路径。粒度粗但简单,不留 torn-state。
 static ALLOC_LOCK: Spinlock<()> = Spinlock::new(());
+
+fn lock_alloc() -> SpinlockGuard<'static, ()> {
+    loop {
+        if let Some(guard) = ALLOC_LOCK.try_lock() {
+            return guard;
+        }
+        // FIXME: extfs 分配临界区当前会触发块 I/O，等待方不能纯自旋；
+        // 后续应改成正式睡眠锁，或缩小临界区避免持锁 I/O。
+        if sched::is_ready() {
+            sched::schedule_once(0);
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
 
 /// 在块位图中找一个空闲 bit 并置位,返回分配到的 0-based 位号(该组内部)。
 fn alloc_bit_in_bitmap(
@@ -115,7 +130,7 @@ pub(crate) fn alloc_blocks_run(
     state: &FsState,
     want: u32,
 ) -> Result<(u64, u32), BlockBackendError> {
-    let _g = ALLOC_LOCK.lock();
+    let _g = lock_alloc();
     let sb = &state.ext_sb;
     let start_rel = state.block_alloc_hint.load(Ordering::Relaxed);
     let start_group = if sb.groups_count == 0 {
@@ -212,7 +227,7 @@ fn find_zero_run(bm: &[u8], start: u32, end: u32, want: u32) -> Option<(u32, u32
 
 /// 释放一个数据块。宽松:允许重复释放(do nothing if bitmap bit 已 0)。
 pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackendError> {
-    let _g = ALLOC_LOCK.lock();
+    let _g = lock_alloc();
     let sb = &state.ext_sb;
     if block < sb.first_data_block as u64 {
         return Err(BlockBackendError::OutOfRange);
@@ -233,7 +248,7 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
 
 /// 分配一个 inode(非目录)。`is_dir` 控制用于 `s_used_dirs` 计数。
 pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBackendError> {
-    let _g = ALLOC_LOCK.lock();
+    let _g = lock_alloc();
     let sb = &state.ext_sb;
     let start_rel = state.inode_alloc_hint.load(Ordering::Relaxed);
     let start_group = if sb.groups_count == 0 {
@@ -270,7 +285,7 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
 }
 
 pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), BlockBackendError> {
-    let _g = ALLOC_LOCK.lock();
+    let _g = lock_alloc();
     if ino == 0 {
         return Ok(());
     }

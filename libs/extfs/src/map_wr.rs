@@ -117,6 +117,78 @@ pub(crate) fn ensure_block(
     Ok(new)
 }
 
+/// 在间接块布局里写入一个既有数据块映射。
+///
+/// 补齐必要的索引块,用于从 extent
+/// 布局保留数据地降级到传统 direct/indirect 布局。
+pub(crate) fn set_existing_block(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    phys: u64,
+) -> Result<(), BlockBackendError> {
+    let p = ppb(state.ext_sb.block_size);
+    if logical < DIRECT_COUNT {
+        write_u32(i_block, logical, phys as u32);
+        return Ok(());
+    }
+
+    let bs = state.ext_sb.block_size as usize;
+    let mut buf = vec![0u8; bs];
+    let rem = logical - DIRECT_COUNT;
+    if rem < p {
+        let l1 = ensure_indirect_slot(state, i_block, 12, &mut buf)?;
+        write_u32(&mut buf, rem, phys as u32);
+        state.write_block(l1, &buf)?;
+        return Ok(());
+    }
+
+    let rem = rem - p;
+    if rem < p * p {
+        let l2 = ensure_indirect_slot(state, i_block, 13, &mut buf)?;
+        let mid_idx = rem / p;
+        let mut mid = read_u32(&buf, mid_idx);
+        if mid == 0 {
+            mid = alloc_mod::alloc_block(state)? as u32;
+            write_u32(&mut buf, mid_idx, mid);
+            state.write_block(l2, &buf)?;
+            cache_zero_block(state, mid as u64, &mut buf)?;
+        } else {
+            state.read_block(mid as u64, &mut buf)?;
+        }
+        write_u32(&mut buf, rem % p, phys as u32);
+        state.write_block(mid as u64, &buf)?;
+        return Ok(());
+    }
+
+    let rem = rem - p * p;
+    let a = p * p;
+    let l3 = ensure_indirect_slot(state, i_block, 14, &mut buf)?;
+    let top_idx = rem / a;
+    let mut top = read_u32(&buf, top_idx);
+    if top == 0 {
+        top = alloc_mod::alloc_block(state)? as u32;
+        write_u32(&mut buf, top_idx, top);
+        state.write_block(l3, &buf)?;
+        cache_zero_block(state, top as u64, &mut buf)?;
+    } else {
+        state.read_block(top as u64, &mut buf)?;
+    }
+    let mid_idx = (rem % a) / p;
+    let mut mid = read_u32(&buf, mid_idx);
+    if mid == 0 {
+        mid = alloc_mod::alloc_block(state)? as u32;
+        write_u32(&mut buf, mid_idx, mid);
+        state.write_block(top as u64, &buf)?;
+        cache_zero_block(state, mid as u64, &mut buf)?;
+    } else {
+        state.read_block(mid as u64, &mut buf)?;
+    }
+    write_u32(&mut buf, rem % p, phys as u32);
+    state.write_block(mid as u64, &buf)?;
+    Ok(())
+}
+
 /// 处理一级间接块的分配/查找。`slot` 是 i_block 中索引(12 = 一级)。
 /// 返回数据块物理号。`buf` 长度必须等于 block_size,内容会被覆盖。
 fn alloc_or_walk_l1(

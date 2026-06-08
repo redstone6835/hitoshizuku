@@ -588,6 +588,9 @@ impl BlockDevice {
 
         while !completion.is_done() {
             self.driver.drain();
+            if completion.is_done() {
+                break;
+            }
             if sched::is_ready() {
                 sched::schedule_once(0);
             } else {
