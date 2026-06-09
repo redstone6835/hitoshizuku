@@ -1069,13 +1069,14 @@ fn nice_floor_from_rlimit(task: &Arc<Task>) -> i32 {
 pub(super) fn sys_sched_getparam(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let param_user = ctx.args[1];
+    if param_user == 0 {
+        return Err(Errno::EFAULT);
+    }
     let task = sched_task_from_pid(pid, &ctx.task)?;
     let attr = sched::operation::sched_getattr_for_task(&task);
-    if param_user != 0 {
-        let mut out = [0u8; 4];
-        out[0..4].copy_from_slice(&(attr.priority as i32).to_le_bytes());
-        copy_to_user(param_user, &out).map_err(|e| e.as_errno())?;
-    }
+    let mut out = [0u8; 4];
+    out[0..4].copy_from_slice(&(attr.priority as i32).to_le_bytes());
+    copy_to_user(param_user, &out).map_err(|e| e.as_errno())?;
     Ok(0)
 }
 
@@ -1083,7 +1084,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let pid = ctx.args[0] as i32;
     let param_user = ctx.args[1];
     if param_user == 0 {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
@@ -1119,7 +1120,7 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     let policy = decode_linux_sched_policy(ctx.args[1])?;
     let param_user = ctx.args[2];
     if param_user == 0 {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
@@ -1153,7 +1154,10 @@ pub(super) fn sys_sched_getaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let cpusetsize = ctx.args[1];
     let mask_user = ctx.args[2];
     let kernel_bytes = kernel_cpuset_bytes();
-    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
+    if mask_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES {
         return Err(Errno::EINVAL);
     }
 
@@ -1171,7 +1175,10 @@ pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let cpusetsize = ctx.args[1];
     let mask_user = ctx.args[2];
     let kernel_bytes = kernel_cpuset_bytes();
-    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
+    if mask_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES {
         return Err(Errno::EINVAL);
     }
     let mut mask = Vec::new();
