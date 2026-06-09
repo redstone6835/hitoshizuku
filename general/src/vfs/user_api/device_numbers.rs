@@ -1,8 +1,8 @@
-//! POSIX `dev_t` 兼容投影。
+//! 用户 ABI `dev_t` 投影。
 //!
-//! 这个注册表只属于 VFS 兼容层：`stat(2)`、`/proc/devices`、`/sys/dev/*`
-//! 需要主次设备号，但底层设备模型仍然以 PnP identity 和 typed device object
-//! 为准，不能通过 `major/minor` 反向寻址硬件设备。
+//! 这个注册表只属于 VFS 用户接口层：`stat(2)`、`/proc/devices`、`/sys/dev/*`
+//! 需要主次设备号，但底层设备模型仍以 PnP identity 和 typed device object 为准，
+//! 不能通过 `major/minor` 反向寻址硬件设备。
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -11,21 +11,21 @@ use vfs::stat::DevId;
 use vfs::sync::Spinlock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PosixDeviceKind {
+pub enum DeviceNumberKind {
     Char,
     Block,
 }
 
 #[derive(Clone, Debug)]
-pub struct PosixDeviceRecord {
-    pub kind: PosixDeviceKind,
+pub struct DeviceNumberRecord {
+    pub kind: DeviceNumberKind,
     pub node_name: String,
     pub display_name: String,
     pub major_name: String,
     pub rdev: DevId,
 }
 
-impl PosixDeviceRecord {
+impl DeviceNumberRecord {
     fn try_clone_record(&self) -> Option<Self> {
         Some(Self {
             kind: self.kind,
@@ -38,14 +38,14 @@ impl PosixDeviceRecord {
 }
 
 #[derive(Clone, Debug)]
-pub struct PosixMajorSummary {
-    pub kind: PosixDeviceKind,
+pub struct DeviceMajorSummary {
+    pub kind: DeviceNumberKind,
     pub major: u32,
     pub display_name: String,
 }
 
-impl PosixMajorSummary {
-    fn try_new(kind: PosixDeviceKind, major: u32, display_name: &str) -> Option<Self> {
+impl DeviceMajorSummary {
+    fn try_new(kind: DeviceNumberKind, major: u32, display_name: &str) -> Option<Self> {
         Some(Self {
             kind,
             major,
@@ -54,14 +54,14 @@ impl PosixMajorSummary {
     }
 }
 
-struct PosixDeviceRegistry {
+struct DeviceNumberRegistry {
     next_char_private: Option<PrivateDynamicCursor>,
     next_block_private: Option<PrivateDynamicCursor>,
-    well_known: Vec<PosixDeviceNumberPolicy>,
-    records: Vec<PosixDeviceRecord>,
+    well_known: Vec<DeviceNumberPolicy>,
+    records: Vec<DeviceNumberRecord>,
 }
 
-impl PosixDeviceRegistry {
+impl DeviceNumberRegistry {
     const fn new() -> Self {
         Self {
             next_char_private: Some(PrivateDynamicCursor::new(PRIVATE_DYNAMIC_MAJOR_START, 0)),
@@ -72,28 +72,28 @@ impl PosixDeviceRegistry {
     }
 }
 
-static POSIX_DEVICES: Spinlock<PosixDeviceRegistry> = Spinlock::new(PosixDeviceRegistry::new());
+static DEVICE_NUMBERS: Spinlock<DeviceNumberRegistry> = Spinlock::new(DeviceNumberRegistry::new());
 
-// POSIX dev_t 仅是 stat/mknod/procfs 等接口的兼容投影；底层设备模型不以主次设备号寻址。
-// TODO(posix-compat): private dynamic major 起点仍是兼容层固定策略。后续应作为
-// device number allocator policy 的可配置字段安装，而不是写死在分配器本体中。
+// `dev_t` 仅是 stat/mknod/procfs 等接口的用户可见投影；底层设备模型不以主次设备号寻址。
+// private dynamic major 起点属于用户 ABI 策略。集中在本模块内可以避免散落到
+// devtmpfs/sysfs/procfs 或底层设备对象中。
 const PRIVATE_DYNAMIC_MAJOR_START: u32 = 240;
 
-/// 兼容层声明的传统 POSIX 设备号策略。
+/// 用户 ABI 层声明的传统设备号策略。
 ///
 /// 该策略只按 `/dev` 投影节点名匹配，不读取底层设备的固件名或 driver 名。这样
 /// 固件节点即使叫作 `console`，也不会在未投影为 `/dev/console` 时获得控制台
-/// 设备号，避免 POSIX 兼容策略反向污染底层设备身份。
+/// 设备号，避免用户 ABI 策略反向污染底层设备身份。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PosixDeviceNumberPolicy {
-    kind: PosixDeviceKind,
+pub struct DeviceNumberPolicy {
+    kind: DeviceNumberKind,
     node_name: &'static str,
     major: u32,
     minor: u32,
     major_name: &'static str,
 }
 
-impl PosixDeviceNumberPolicy {
+impl DeviceNumberPolicy {
     pub const fn char(
         node_name: &'static str,
         major: u32,
@@ -101,7 +101,7 @@ impl PosixDeviceNumberPolicy {
         major_name: &'static str,
     ) -> Self {
         Self {
-            kind: PosixDeviceKind::Char,
+            kind: DeviceNumberKind::Char,
             node_name,
             major,
             minor,
@@ -116,7 +116,7 @@ impl PosixDeviceNumberPolicy {
         major_name: &'static str,
     ) -> Self {
         Self {
-            kind: PosixDeviceKind::Block,
+            kind: DeviceNumberKind::Block,
             node_name,
             major,
             minor,
@@ -130,25 +130,25 @@ impl PosixDeviceNumberPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PosixDevicePolicyError {
+pub enum DeviceNumberPolicyError {
     Invalid,
     OutOfMemory,
     AlreadyRegistered,
     RdevConflict,
 }
 
-/// 注册一个 well-known POSIX 设备号策略。
+/// 注册一个 well-known 设备号策略。
 ///
-/// 该接口属于 VFS 兼容层初始化，不属于底层设备注册流程。重复注册完全相同的
+/// 该接口属于 VFS 用户接口层初始化，不属于底层设备注册流程。重复注册完全相同的
 /// policy 视为幂等；同一节点名或同一 `dev_t` 被不同策略抢占时返回错误。
 pub fn register_device_number_policy(
-    policy: PosixDeviceNumberPolicy,
-) -> Result<(), PosixDevicePolicyError> {
+    policy: DeviceNumberPolicy,
+) -> Result<(), DeviceNumberPolicyError> {
     if policy.node_name.is_empty() || policy.major_name.is_empty() {
-        return Err(PosixDevicePolicyError::Invalid);
+        return Err(DeviceNumberPolicyError::Invalid);
     }
 
-    let mut registry = POSIX_DEVICES.lock();
+    let mut registry = DEVICE_NUMBERS.lock();
     if let Some(existing) = registry
         .well_known
         .iter()
@@ -157,14 +157,14 @@ pub fn register_device_number_policy(
         if *existing == policy {
             return Ok(());
         }
-        return Err(PosixDevicePolicyError::AlreadyRegistered);
+        return Err(DeviceNumberPolicyError::AlreadyRegistered);
     }
     if registry
         .well_known
         .iter()
         .any(|entry| entry.kind == policy.kind && entry.rdev() == policy.rdev())
     {
-        return Err(PosixDevicePolicyError::RdevConflict);
+        return Err(DeviceNumberPolicyError::RdevConflict);
     }
     if let Some(record) = registry
         .records
@@ -172,7 +172,7 @@ pub fn register_device_number_policy(
         .find(|record| record.kind == policy.kind && record.node_name == policy.node_name)
     {
         if record.rdev != policy.rdev() || record.major_name != policy.major_name {
-            return Err(PosixDevicePolicyError::AlreadyRegistered);
+            return Err(DeviceNumberPolicyError::AlreadyRegistered);
         }
     }
     if registry.records.iter().any(|record| {
@@ -180,13 +180,13 @@ pub fn register_device_number_policy(
             && record.rdev == policy.rdev()
             && record.node_name != policy.node_name
     }) {
-        return Err(PosixDevicePolicyError::RdevConflict);
+        return Err(DeviceNumberPolicyError::RdevConflict);
     }
 
     registry
         .well_known
         .try_reserve(1)
-        .map_err(|_| PosixDevicePolicyError::OutOfMemory)?;
+        .map_err(|_| DeviceNumberPolicyError::OutOfMemory)?;
     registry.well_known.push(policy);
     Ok(())
 }
@@ -204,15 +204,15 @@ impl PrivateDynamicCursor {
 }
 
 pub fn register_char(node_name: &str, display_name: &str) -> Option<DevId> {
-    register(PosixDeviceKind::Char, node_name, display_name)
+    register(DeviceNumberKind::Char, node_name, display_name)
 }
 
 pub fn register_block(node_name: &str, display_name: &str) -> Option<DevId> {
-    register(PosixDeviceKind::Block, node_name, display_name)
+    register(DeviceNumberKind::Block, node_name, display_name)
 }
 
-fn register(kind: PosixDeviceKind, node_name: &str, display_name: &str) -> Option<DevId> {
-    let mut registry = POSIX_DEVICES.lock();
+fn register(kind: DeviceNumberKind, node_name: &str, display_name: &str) -> Option<DevId> {
+    let mut registry = DEVICE_NUMBERS.lock();
     if let Some(record) = registry
         .records
         .iter()
@@ -260,21 +260,21 @@ fn fallible_string_from(value: &str) -> Option<String> {
 }
 
 fn push_record(
-    registry: &mut PosixDeviceRegistry,
-    kind: PosixDeviceKind,
+    registry: &mut DeviceNumberRegistry,
+    kind: DeviceNumberKind,
     node_name: &str,
     display_name: &str,
     major_name: &str,
     rdev: DevId,
 ) -> Option<()> {
-    // POSIX 设备号表位于兼容层，启动期和热插拔路径都可能调用。这里不用
+    // 设备号表位于用户接口层，启动期和热插拔路径都可能调用。这里不用
     // `Vec::push`/`String::from` 的隐式分配路径，避免低内存时把普通注册失败
     // 放大成内核 panic。
     registry.records.try_reserve(1).ok()?;
     let node_name = fallible_string_from(node_name)?;
     let display_name = fallible_string_from(display_name)?;
     let major_name = fallible_string_from(major_name)?;
-    registry.records.push(PosixDeviceRecord {
+    registry.records.push(DeviceNumberRecord {
         kind,
         node_name,
         display_name,
@@ -284,18 +284,18 @@ fn push_record(
     Some(())
 }
 
-fn next_private_rdev(registry: &PosixDeviceRegistry, kind: PosixDeviceKind) -> Option<DevId> {
+fn next_private_rdev(registry: &DeviceNumberRegistry, kind: DeviceNumberKind) -> Option<DevId> {
     let cursor = match kind {
-        PosixDeviceKind::Char => registry.next_char_private,
-        PosixDeviceKind::Block => registry.next_block_private,
+        DeviceNumberKind::Char => registry.next_char_private,
+        DeviceNumberKind::Block => registry.next_block_private,
     }?;
     Some(DevId::new(cursor.major, cursor.minor))
 }
 
-fn advance_private_rdev(registry: &mut PosixDeviceRegistry, kind: PosixDeviceKind) {
+fn advance_private_rdev(registry: &mut DeviceNumberRegistry, kind: DeviceNumberKind) {
     let next_private = match kind {
-        PosixDeviceKind::Char => &mut registry.next_char_private,
-        PosixDeviceKind::Block => &mut registry.next_block_private,
+        DeviceNumberKind::Char => &mut registry.next_char_private,
+        DeviceNumberKind::Block => &mut registry.next_block_private,
     };
     if let Some(cursor) = *next_private {
         *next_private = advance_private_cursor(cursor);
@@ -313,8 +313,8 @@ fn advance_private_cursor(cursor: PrivateDynamicCursor) -> Option<PrivateDynamic
 }
 
 fn well_known_rdev(
-    registry: &PosixDeviceRegistry,
-    kind: PosixDeviceKind,
+    registry: &DeviceNumberRegistry,
+    kind: DeviceNumberKind,
     node_name: &str,
 ) -> Option<(DevId, &'static str)> {
     registry
@@ -325,42 +325,42 @@ fn well_known_rdev(
 }
 
 pub fn unregister_node(node_name: &str) {
-    POSIX_DEVICES
+    DEVICE_NUMBERS
         .lock()
         .records
         .retain(|record| record.node_name != node_name);
 }
 
-pub fn lookup_node(node_name: &str) -> Option<PosixDeviceRecord> {
-    POSIX_DEVICES
+pub fn lookup_node(node_name: &str) -> Option<DeviceNumberRecord> {
+    DEVICE_NUMBERS
         .lock()
         .records
         .iter()
         .find(|record| record.node_name == node_name)
-        .and_then(PosixDeviceRecord::try_clone_record)
+        .and_then(DeviceNumberRecord::try_clone_record)
 }
 
-pub fn lookup_rdev(kind: PosixDeviceKind, rdev: DevId) -> Option<PosixDeviceRecord> {
-    // 这是 POSIX 兼容层的快照查询，只能回答已投影的 VFS 节点；
+pub fn lookup_rdev(kind: DeviceNumberKind, rdev: DevId) -> Option<DeviceNumberRecord> {
+    // 这是用户 ABI 投影层的快照查询，只能回答已投影的 VFS 节点；
     // 不能把 rdev 当作底层设备模型的反向入口或稳定设备身份。
-    POSIX_DEVICES
+    DEVICE_NUMBERS
         .lock()
         .records
         .iter()
         .find(|record| record.kind == kind && record.rdev == rdev)
-        .and_then(PosixDeviceRecord::try_clone_record)
+        .and_then(DeviceNumberRecord::try_clone_record)
 }
 
 pub fn lookup_char(display_name: &str) -> Option<DevId> {
-    lookup(PosixDeviceKind::Char, display_name)
+    lookup(DeviceNumberKind::Char, display_name)
 }
 
 pub fn lookup_block(display_name: &str) -> Option<DevId> {
-    lookup(PosixDeviceKind::Block, display_name)
+    lookup(DeviceNumberKind::Block, display_name)
 }
 
-fn lookup(kind: PosixDeviceKind, display_name: &str) -> Option<DevId> {
-    POSIX_DEVICES
+fn lookup(kind: DeviceNumberKind, display_name: &str) -> Option<DevId> {
+    DEVICE_NUMBERS
         .lock()
         .records
         .iter()
@@ -368,33 +368,33 @@ fn lookup(kind: PosixDeviceKind, display_name: &str) -> Option<DevId> {
         .map(|record| record.rdev)
 }
 
-pub fn lookup_char_record(display_name: &str) -> Option<PosixDeviceRecord> {
-    lookup_record(PosixDeviceKind::Char, display_name)
+pub fn lookup_char_record(display_name: &str) -> Option<DeviceNumberRecord> {
+    lookup_record(DeviceNumberKind::Char, display_name)
 }
 
-pub fn lookup_block_record(display_name: &str) -> Option<PosixDeviceRecord> {
-    lookup_record(PosixDeviceKind::Block, display_name)
+pub fn lookup_block_record(display_name: &str) -> Option<DeviceNumberRecord> {
+    lookup_record(DeviceNumberKind::Block, display_name)
 }
 
-fn lookup_record(kind: PosixDeviceKind, display_name: &str) -> Option<PosixDeviceRecord> {
-    POSIX_DEVICES
+fn lookup_record(kind: DeviceNumberKind, display_name: &str) -> Option<DeviceNumberRecord> {
+    DEVICE_NUMBERS
         .lock()
         .records
         .iter()
         .find(|record| record.kind == kind && record.display_name == display_name)
-        .and_then(PosixDeviceRecord::try_clone_record)
+        .and_then(DeviceNumberRecord::try_clone_record)
 }
 
-pub fn records() -> Vec<PosixDeviceRecord> {
+pub fn records() -> Vec<DeviceNumberRecord> {
     try_records().unwrap_or_default()
 }
 
-/// 返回 POSIX 设备投影记录的 fallible 快照。
+/// 返回设备号投影记录的 fallible 快照。
 ///
 /// 诊断文件系统读取 `/sys/dev/*` 或 `/proc/devices` 时使用该接口，低内存下可以
 /// 降级为空/不完整视图，而不影响底层设备对象和 devtmpfs inode 的真实生命周期。
-pub fn try_records() -> Option<Vec<PosixDeviceRecord>> {
-    let registry = POSIX_DEVICES.lock();
+pub fn try_records() -> Option<Vec<DeviceNumberRecord>> {
+    let registry = DEVICE_NUMBERS.lock();
     let mut out = Vec::new();
     out.try_reserve(registry.records.len()).ok()?;
     for record in &registry.records {
@@ -403,23 +403,23 @@ pub fn try_records() -> Option<Vec<PosixDeviceRecord>> {
     Some(out)
 }
 
-pub fn major_summaries(kind: PosixDeviceKind) -> Vec<PosixMajorSummary> {
+pub fn major_summaries(kind: DeviceNumberKind) -> Vec<DeviceMajorSummary> {
     try_major_summaries(kind).unwrap_or_default()
 }
 
-/// 返回指定 POSIX 设备类别的 major 汇总。
+/// 返回指定设备号类别的 major 汇总。
 ///
 /// 这是 `/proc/devices` 兼容视图专用快照，不提供 `major -> device` 的底层反向
 /// 寻址能力。分配失败时返回 `None`，调用方应按空视图处理。
-pub fn try_major_summaries(kind: PosixDeviceKind) -> Option<Vec<PosixMajorSummary>> {
+pub fn try_major_summaries(kind: DeviceNumberKind) -> Option<Vec<DeviceMajorSummary>> {
     let mut summaries = Vec::new();
-    for record in POSIX_DEVICES
+    for record in DEVICE_NUMBERS
         .lock()
         .records
         .iter()
         .filter(|record| record.kind == kind)
     {
-        if summaries.iter().any(|summary: &PosixMajorSummary| {
+        if summaries.iter().any(|summary: &DeviceMajorSummary| {
             summary.kind == kind
                 && summary.major == record.rdev.major
                 && summary.display_name == record.major_name
@@ -427,7 +427,7 @@ pub fn try_major_summaries(kind: PosixDeviceKind) -> Option<Vec<PosixMajorSummar
             continue;
         }
         summaries.try_reserve(1).ok()?;
-        summaries.push(PosixMajorSummary::try_new(
+        summaries.push(DeviceMajorSummary::try_new(
             kind,
             record.rdev.major,
             &record.major_name,

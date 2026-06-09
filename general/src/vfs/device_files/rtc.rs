@@ -3,7 +3,7 @@
 //! 本模块位于 VFS/ABI 边界：把 `/dev/rtc*` 的 ioctl number、用户态
 //! `struct rtc_time` / `struct rtc_wkalrm` 布局和用户指针拷贝，翻译成
 //! [`crate::dev::rtc`] 的 typed control。底层 RTC 设备抽象只暴露时间、
-//! alarm、IRQ 等语义，不承载 POSIX/Linux ABI 细节。
+//! alarm、IRQ 等语义，不承载用户 ABI 细节。
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -22,10 +22,12 @@ use crate::dev::rtc::{
     RtcAlarm, RtcControlRequest, RtcControlResponse, RtcDateTime, RtcDevNodeEndpoint, RtcDevice,
     RtcError, RtcIrqData, RtcIrqFlags,
 };
-use crate::mm::{copy_from_user, copy_to_user};
 use crate::vfs::devtmpfs::{
     DevTmpfsCustomNodeAdapter, DevTmpfsCustomNodeAdapterRegistration,
     register_custom_devnode_adapter,
+};
+use crate::vfs::user_api::ioctl::{
+    read_bytes_from_user, write_bytes_to_user, write_u32_to_user, write_usize_to_user,
 };
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -409,13 +411,13 @@ fn linux_irq_word(data: RtcIrqData) -> usize {
 
 fn read_rtc_time(user: usize) -> Result<RtcDateTime, Errno> {
     let mut raw = [0u8; RTC_TIME_LEN];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    read_bytes_from_user(user, &mut raw)?;
     read_rtc_time_from_bytes(&raw)
 }
 
 fn read_rtc_alarm_time(user: usize, base: RtcDateTime) -> Result<RtcDateTime, Errno> {
     let mut raw = [0u8; RTC_TIME_LEN];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    read_bytes_from_user(user, &mut raw)?;
     let sec = get_i32(&raw, 0)?;
     let min = get_i32(&raw, 4)?;
     let hour = get_i32(&raw, 8)?;
@@ -483,12 +485,12 @@ fn write_rtc_time_to_bytes(raw: &mut [u8], time: RtcDateTime) -> Result<(), Errn
 fn write_rtc_time(user: usize, time: RtcDateTime) -> Result<(), Errno> {
     let mut raw = [0u8; RTC_TIME_LEN];
     write_rtc_time_to_bytes(&mut raw, time)?;
-    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+    write_bytes_to_user(user, &raw)
 }
 
 fn read_rtc_wkalrm(user: usize) -> Result<RtcAlarm, Errno> {
     let mut raw = [0u8; RTC_WKALRM_LEN];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    read_bytes_from_user(user, &mut raw)?;
     let enabled = raw[0] != 0;
     let pending = raw[1] != 0;
     let time = read_rtc_time_from_bytes(&raw[4..4 + RTC_TIME_LEN])?;
@@ -504,21 +506,21 @@ fn write_rtc_wkalrm(user: usize, alarm: RtcAlarm) -> Result<(), Errno> {
     raw[0] = u8::from(alarm.enabled);
     raw[1] = u8::from(alarm.pending);
     write_rtc_time_to_bytes(&mut raw[4..4 + RTC_TIME_LEN], alarm.time)?;
-    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+    write_bytes_to_user(user, &raw)
 }
 
 fn read_user_usize(user: usize) -> Result<usize, Errno> {
     let mut raw = [0u8; core::mem::size_of::<usize>()];
-    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    read_bytes_from_user(user, &mut raw)?;
     Ok(usize::from_le_bytes(raw))
 }
 
 fn write_user_usize(user: usize, value: usize) -> Result<(), Errno> {
-    copy_to_user(user, &value.to_le_bytes()).map_err(|e| e.as_errno())
+    write_usize_to_user(user, value)
 }
 
 fn write_user_u32(user: usize, value: u32) -> Result<(), Errno> {
-    copy_to_user(user, &value.to_le_bytes()).map_err(|e| e.as_errno())
+    write_u32_to_user(user, value)
 }
 
 fn get_i32(raw: &[u8], offset: usize) -> Result<i32, Errno> {

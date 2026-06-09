@@ -54,12 +54,15 @@ use vfs::sync::Spinlock;
 
 use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
-use crate::dev::char::{CharControlRequest, CharControlResponse, CharDevice, CharIoError};
+use crate::dev::char::{CharDevice, CharIoError};
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError};
 use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSet, DevNodeSpec};
 use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
-use crate::mm::{copy_from_user, copy_to_user};
+use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
+use crate::vfs::user_api::tty::{
+    TtyIoctlContext, TtyIoctlState, UserTermios, UserWinSize, handle_tty_ioctl,
+};
 
 // ───────── 全局实例计数器 ─────────
 
@@ -69,9 +72,8 @@ static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinl
 static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
     Spinlock::new(BTreeMap::new());
 const TTY_ASYNC_PUMP_LIMIT: usize = 256;
-// FIXME(devtmpfs): 静态节点表是为了 null/zero/random 等无 PnP backing 设备保留的
-// 兼容入口。后续应收敛到统一 function projection registry，避免驱动直接调用
-// devtmpfs 发布路径。
+// 无 PnP backing 的内核服务由 VFS device_files 层注册静态投影。devtmpfs 只维护
+// 这张声明表和事务绑定逻辑，不直接知道 null/zero/random/loop-control 等具体设备。
 static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
 static CUSTOM_DEVNODE_ADAPTERS: Spinlock<Vec<DevTmpfsCustomNodeAdapter>> =
     Spinlock::new(Vec::new());
@@ -341,67 +343,60 @@ pub fn unregister_static_dev_node(owner: &'static str, name: &str) -> VfsResult<
 
 const DEVTMPFS_NAME_MAX: usize = 255;
 
-// TODO(devtmpfs): 下面这些 mode/uid/gid/block size/poll 默认值仍是 VFS 兼容策略。
-// 后续应从 mount option、policy registry 或 function projection metadata 中取得，
-// 不能在 devtmpfs core 内长期写死。
-fn devtmpfs_compat_default_dir_mode() -> FileMode {
-    FileMode::new(0o755)
+/// devtmpfs 节点元数据策略。
+///
+/// 默认权限、属主、块大小和轮询能力属于 VFS 用户接口策略，不属于底层设备身份。
+/// 先集中在这个结构内，避免 inode 创建路径散落魔数；后续挂载参数或投影 registry
+/// 可以生成新的 policy 并替换调用点。
+#[derive(Clone, Copy)]
+struct DevTmpfsNodePolicy {
+    dir_mode: FileMode,
+    symlink_mode: FileMode,
+    device_mode: FileMode,
+    regular_mode: FileMode,
+    uid: Uid,
+    gid: Gid,
+    block_size: u32,
+    char_poll: PollEvents,
+    max_blocks_per_io: u32,
 }
 
-fn devtmpfs_compat_default_symlink_mode() -> FileMode {
-    FileMode::new(0o777)
-}
-
-fn devtmpfs_compat_default_device_mode() -> FileMode {
-    FileMode::new(0o660)
-}
-
-fn custom_devnode_default_mode(kind: CustomDevNodeKind) -> FileMode {
-    match kind {
-        CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice => {
-            devtmpfs_compat_default_device_mode()
+impl DevTmpfsNodePolicy {
+    const fn standard() -> Self {
+        Self {
+            dir_mode: FileMode::new(0o755),
+            symlink_mode: FileMode::new(0o777),
+            device_mode: FileMode::new(0o660),
+            regular_mode: FileMode::new(0o644),
+            uid: Uid::ROOT,
+            gid: Gid::ROOT,
+            block_size: 512,
+            char_poll: PollEvents::POLLIN.with(PollEvents::POLLOUT),
+            max_blocks_per_io: 1024,
         }
-        CustomDevNodeKind::RegularFile => FileMode::new(0o644),
-        CustomDevNodeKind::Directory => devtmpfs_compat_default_dir_mode(),
+    }
+
+    fn custom_mode(self, kind: CustomDevNodeKind) -> FileMode {
+        match kind {
+            CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice => self.device_mode,
+            CustomDevNodeKind::RegularFile => self.regular_mode,
+            CustomDevNodeKind::Directory => self.dir_mode,
+        }
+    }
+
+    fn custom_nlink(self, kind: CustomDevNodeKind) -> u32 {
+        match kind {
+            // 目录 inode 自身和父目录中的入口各占一个链接计数。自定义目录目前只
+            // 作为空目录投影，后续若有可枚举子项，应由对应 InodeOps 维护。
+            CustomDevNodeKind::Directory => 2,
+            CustomDevNodeKind::CharDevice
+            | CustomDevNodeKind::BlockDevice
+            | CustomDevNodeKind::RegularFile => 1,
+        }
     }
 }
 
-fn custom_devnode_default_nlink(kind: CustomDevNodeKind) -> u32 {
-    match kind {
-        // 目录 inode 自身和父目录中的入口各占一个链接计数。自定义目录目前只
-        // 作为兼容层空目录投影，后续若有可枚举子项，应由对应 InodeOps 维护。
-        // TODO(devtmpfs): 自定义目录缺少显式 child projection 接口；后续需要让
-        // custom adapter 提供目录项快照和 nlink 维护策略，而不是只能创建空目录。
-        CustomDevNodeKind::Directory => 2,
-        CustomDevNodeKind::CharDevice
-        | CustomDevNodeKind::BlockDevice
-        | CustomDevNodeKind::RegularFile => 1,
-    }
-}
-
-fn custom_devnode_default_block_size(_kind: CustomDevNodeKind) -> u32 {
-    devtmpfs_compat_block_size()
-}
-
-fn devtmpfs_compat_default_uid() -> Uid {
-    Uid::ROOT
-}
-
-fn devtmpfs_compat_default_gid() -> Gid {
-    Gid::ROOT
-}
-
-fn devtmpfs_compat_block_size() -> u32 {
-    512
-}
-
-fn devtmpfs_compat_char_poll_default() -> PollEvents {
-    PollEvents::POLLIN.with(PollEvents::POLLOUT)
-}
-
-fn devtmpfs_compat_max_blocks_per_io() -> u32 {
-    1024
-}
+const DEVTMPFS_STANDARD_POLICY: DevTmpfsNodePolicy = DevTmpfsNodePolicy::standard();
 
 fn devtmpfs_fallible_string(value: &str) -> VfsResult<String> {
     let mut out = String::new();
@@ -482,7 +477,7 @@ pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
         for func in functions {
             if let Some(nodes) = func.devnodes() {
                 // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 首次安装后补齐
-                // POSIX 节点投影。重复安装 bridge 时不能再次 bind 同一批节点，否则
+                // 用户可见节点投影。重复安装 bridge 时不能再次 bind 同一批节点，否则
                 // 幂等初始化路径会被已有节点误判为失败。
                 pnp_bind_cb(&nodes)?;
             }
@@ -586,308 +581,6 @@ fn map_control_vfs(e: ControlError) -> VfsError {
     }
 }
 
-// TODO(tty-compat): TTY ioctl 号和 termios 布局属于用户态 ABI 适配层。当前为了
-// `/dev/tty*` 可用暂时放在 devtmpfs FileOps 中，后续应拆到独立 tty/posix
-// compat 模块，devtmpfs 只负责 inode 与 typed char device 的连接。
-const TCGETS: usize = 0x5401;
-const TCSETS: usize = 0x5402;
-const TCSETSW: usize = 0x5403;
-const TCSETSF: usize = 0x5404;
-const TCSBRK: usize = 0x5409;
-const TCXONC: usize = 0x540a;
-const TCFLSH: usize = 0x540b;
-const TIOCEXCL: usize = 0x540c;
-const TIOCNXCL: usize = 0x540d;
-const TIOCSCTTY: usize = 0x540e;
-const TIOCGPGRP: usize = 0x540f;
-const TIOCSPGRP: usize = 0x5410;
-const TIOCOUTQ: usize = 0x5411;
-const TIOCGWINSZ: usize = 0x5413;
-const TIOCSWINSZ: usize = 0x5414;
-const FIONREAD: usize = 0x541b;
-const TIOCNOTTY: usize = 0x5422;
-const TIOCSETD: usize = 0x5423;
-const TIOCGETD: usize = 0x5424;
-const TCSBRKP: usize = 0x5425;
-const TIOCGSID: usize = 0x5429;
-const TCGETS2: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_READ, b'T' as usize, 0x2a, LINUX_TERMIOS2_LEN).raw();
-const TCSETS2: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_WRITE, b'T' as usize, 0x2b, LINUX_TERMIOS2_LEN).raw();
-const TCSETSW2: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_WRITE, b'T' as usize, 0x2c, LINUX_TERMIOS2_LEN).raw();
-const TCSETSF2: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_WRITE, b'T' as usize, 0x2d, LINUX_TERMIOS2_LEN).raw();
-const TCIFLUSH: usize = 0;
-const TCOFLUSH: usize = 1;
-const TCIOFLUSH: usize = 2;
-const TTY_DEFAULT_BREAK_MS: u32 = 250;
-const TTY_BREAK_UNIT_MS: u32 = 100;
-
-const BLKROGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 94, 0).raw();
-const BLKGETSIZE: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 96, 0).raw();
-const BLKFLSBUF: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 97, 0).raw();
-const BLKSSZGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 104, 0).raw();
-const BLKBSZGET: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_READ, 0x12, 112, core::mem::size_of::<usize>()).raw();
-const BLKGETSIZE64: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_READ, 0x12, 114, core::mem::size_of::<usize>()).raw();
-const BLKIOMIN: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 120, 0).raw();
-const BLKIOOPT: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 121, 0).raw();
-const BLKALIGNOFF: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 122, 0).raw();
-const BLKPBSZGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 123, 0).raw();
-const BLKDISCARDZEROES: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 124, 0).raw();
-const BLKROTATIONAL: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 126, 0).raw();
-const BLKGETDISKSEQ: usize =
-    IoctlCmd::from_parts(IoctlCmd::IOC_READ, 0x12, 128, core::mem::size_of::<u64>()).raw();
-
-const LINUX_TERMIOS_LEN: usize = 36;
-const LINUX_TERMIOS2_LEN: usize = 44;
-const LINUX_WINSIZE_LEN: usize = 8;
-const NCCS_OFFSET: usize = 17;
-const NCCS_VINTR: usize = 0;
-const NCCS_VQUIT: usize = 1;
-const NCCS_VERASE: usize = 2;
-const NCCS_VKILL: usize = 3;
-const NCCS_VEOF: usize = 4;
-const NCCS_VTIME: usize = 5;
-const NCCS_VMIN: usize = 6;
-const NCCS_VSUSP: usize = 10;
-
-const ICRNL: u32 = 0x0100;
-const IXON: u32 = 0x0400;
-const OPOST: u32 = 0x0001;
-const ONLCR: u32 = 0x0004;
-const ISIG: u32 = 0x0001;
-const ICANON: u32 = 0x0002;
-const ECHO: u32 = 0x0008;
-const ECHOE: u32 = 0x0010;
-const ECHOK: u32 = 0x0020;
-
-#[derive(Clone, Copy)]
-struct LinuxTermios {
-    raw: [u8; LINUX_TERMIOS_LEN],
-}
-
-impl LinuxTermios {
-    fn new_default() -> Self {
-        let mut raw = [0u8; LINUX_TERMIOS_LEN];
-        let _ = put_u32(&mut raw, 0, 0x0500); // ICRNL | IXON
-        let _ = put_u32(&mut raw, 4, 0x0005); // OPOST | ONLCR
-        let _ = put_u32(&mut raw, 8, 0x04bf); // B38400 | CS8 | CREAD | HUPCL
-        let _ = put_u32(&mut raw, 12, 0x803b); // ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
-        raw[17] = 3; // VINTR
-        raw[18] = 28; // VQUIT
-        raw[19] = 127; // VERASE
-        raw[20] = 21; // VKILL
-        raw[21] = 4; // VEOF
-        raw[22] = 0; // VTIME
-        raw[23] = 1; // VMIN
-        raw[25] = 17; // VSTART
-        raw[26] = 19; // VSTOP
-        raw[27] = 26; // VSUSP
-        Self { raw }
-    }
-
-    fn as_termios2_bytes(&self) -> [u8; LINUX_TERMIOS2_LEN] {
-        let mut out = [0u8; LINUX_TERMIOS2_LEN];
-        for (dst, src) in out.iter_mut().zip(self.raw.iter()) {
-            *dst = *src;
-        }
-        let _ = put_u32(&mut out, 36, 38400);
-        let _ = put_u32(&mut out, 40, 38400);
-        out
-    }
-
-    fn iflag(&self) -> u32 {
-        read_u32(&self.raw, 0).unwrap_or(0)
-    }
-
-    fn oflag(&self) -> u32 {
-        read_u32(&self.raw, 4).unwrap_or(0)
-    }
-
-    fn lflag(&self) -> u32 {
-        read_u32(&self.raw, 12).unwrap_or(0)
-    }
-
-    fn cc(&self, index: usize) -> u8 {
-        self.raw[NCCS_OFFSET + index]
-    }
-
-    fn canonical(&self) -> bool {
-        (self.lflag() & ICANON) != 0
-    }
-
-    fn echo(&self) -> bool {
-        (self.lflag() & ECHO) != 0
-    }
-
-    fn echoe(&self) -> bool {
-        (self.lflag() & ECHOE) != 0
-    }
-
-    fn echok(&self) -> bool {
-        (self.lflag() & ECHOK) != 0
-    }
-
-    fn isig(&self) -> bool {
-        (self.lflag() & ISIG) != 0
-    }
-
-    fn icrnl(&self) -> bool {
-        (self.iflag() & ICRNL) != 0
-    }
-
-    fn ixon(&self) -> bool {
-        (self.iflag() & IXON) != 0
-    }
-
-    fn opost_onlcr(&self) -> bool {
-        (self.oflag() & (OPOST | ONLCR)) == (OPOST | ONLCR)
-    }
-
-    fn vintr(&self) -> u8 {
-        self.cc(NCCS_VINTR)
-    }
-
-    fn vquit(&self) -> u8 {
-        self.cc(NCCS_VQUIT)
-    }
-
-    fn verase(&self) -> u8 {
-        self.cc(NCCS_VERASE)
-    }
-
-    fn vkill(&self) -> u8 {
-        self.cc(NCCS_VKILL)
-    }
-
-    fn veof(&self) -> u8 {
-        self.cc(NCCS_VEOF)
-    }
-
-    fn vtime(&self) -> u8 {
-        self.cc(NCCS_VTIME)
-    }
-
-    fn vmin(&self) -> u8 {
-        self.cc(NCCS_VMIN)
-    }
-
-    fn vsusp(&self) -> u8 {
-        self.cc(NCCS_VSUSP)
-    }
-
-    fn signal_for_input(&self, ch: u8) -> Option<sched::SignalNumber> {
-        if !self.isig() || ch == 0 {
-            return None;
-        }
-        if ch == self.vintr() {
-            Some(sched::SignalNumber::SIGINT)
-        } else if ch == self.vquit() {
-            Some(sched::SignalNumber::SIGQUIT)
-        } else if ch == self.vsusp() {
-            Some(sched::SignalNumber::SIGTSTP)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct LinuxWinSize {
-    rows: u16,
-    cols: u16,
-    xpixel: u16,
-    ypixel: u16,
-}
-
-impl LinuxWinSize {
-    const fn default_console() -> Self {
-        Self {
-            rows: 25,
-            cols: 80,
-            xpixel: 0,
-            ypixel: 0,
-        }
-    }
-
-    fn from_bytes(raw: [u8; LINUX_WINSIZE_LEN]) -> Self {
-        Self {
-            rows: u16::from_le_bytes([raw[0], raw[1]]),
-            cols: u16::from_le_bytes([raw[2], raw[3]]),
-            xpixel: u16::from_le_bytes([raw[4], raw[5]]),
-            ypixel: u16::from_le_bytes([raw[6], raw[7]]),
-        }
-    }
-
-    fn to_bytes(self) -> [u8; LINUX_WINSIZE_LEN] {
-        let mut out = [0u8; LINUX_WINSIZE_LEN];
-        let rows = self.rows.to_le_bytes();
-        let cols = self.cols.to_le_bytes();
-        let xpixel = self.xpixel.to_le_bytes();
-        let ypixel = self.ypixel.to_le_bytes();
-        out[0] = rows[0];
-        out[1] = rows[1];
-        out[2] = cols[0];
-        out[3] = cols[1];
-        out[4] = xpixel[0];
-        out[5] = xpixel[1];
-        out[6] = ypixel[0];
-        out[7] = ypixel[1];
-        out
-    }
-}
-
-fn read_bytes_from_user(user: usize, dst: &mut [u8]) -> Result<(), Errno> {
-    copy_from_user(user, dst).map_err(|e| e.as_errno())
-}
-
-fn write_bytes_to_user(user: usize, src: &[u8]) -> Result<(), Errno> {
-    copy_to_user(user, src).map_err(|e| e.as_errno())
-}
-
-fn read_i32_from_user(user: usize) -> Result<i32, Errno> {
-    let mut raw = [0u8; 4];
-    read_bytes_from_user(user, &mut raw)?;
-    Ok(i32::from_le_bytes(raw))
-}
-
-fn write_i32_to_user(user: usize, value: i32) -> Result<(), Errno> {
-    write_bytes_to_user(user, &value.to_le_bytes())
-}
-
-fn write_u32_to_user(user: usize, value: u32) -> Result<(), Errno> {
-    write_bytes_to_user(user, &value.to_le_bytes())
-}
-
-fn write_u64_to_user(user: usize, value: u64) -> Result<(), Errno> {
-    write_bytes_to_user(user, &value.to_le_bytes())
-}
-
-fn write_usize_to_user(user: usize, value: usize) -> Result<(), Errno> {
-    write_bytes_to_user(user, &value.to_le_bytes())
-}
-
-fn put_u32(out: &mut [u8], off: usize, value: u32) -> Option<()> {
-    // 兼容层小结构按偏移写入，统一走范围检查，避免常量调整时形成越界 panic。
-    let end = off.checked_add(core::mem::size_of::<u32>())?;
-    let dst = out.get_mut(off..end)?;
-    dst.copy_from_slice(&value.to_le_bytes());
-    Some(())
-}
-
-fn read_u32(raw: &[u8], off: usize) -> Option<u32> {
-    // 兼容层 ioctl 结构来自用户态字节流，读取时显式校验范围，避免布局变更时
-    // 固定切片转换扩大成内核 panic。
-    let end = off.checked_add(core::mem::size_of::<u32>())?;
-    let bytes = raw.get(off..end)?;
-    let mut out = [0u8; core::mem::size_of::<u32>()];
-    out.copy_from_slice(bytes);
-    Some(u32::from_le_bytes(out))
-}
-
 #[derive(Default)]
 struct TtyLineState {
     line: Vec<u8>,
@@ -910,8 +603,8 @@ impl TtyLineState {
 /// 必须在这些节点和所有 open fd 之间共享；每个 fd 只保留自己的状态标志。
 struct TtySharedState {
     dev: CharDevice,
-    termios: Spinlock<LinuxTermios>,
-    winsize: Spinlock<LinuxWinSize>,
+    termios: Spinlock<UserTermios>,
+    winsize: Spinlock<UserWinSize>,
     foreground_pgrp: Spinlock<i32>,
     line_state: Spinlock<TtyLineState>,
 }
@@ -920,11 +613,41 @@ impl TtySharedState {
     fn new(dev: CharDevice) -> Self {
         Self {
             dev,
-            termios: Spinlock::new(LinuxTermios::new_default()),
-            winsize: Spinlock::new(LinuxWinSize::default_console()),
+            termios: Spinlock::new(UserTermios::new_default()),
+            winsize: Spinlock::new(UserWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
             line_state: Spinlock::new(TtyLineState::default()),
         }
+    }
+}
+
+impl TtyIoctlState for TtySharedState {
+    fn termios(&self) -> UserTermios {
+        *self.termios.lock()
+    }
+
+    fn set_termios(&self, termios: UserTermios) {
+        *self.termios.lock() = termios;
+    }
+
+    fn winsize(&self) -> UserWinSize {
+        *self.winsize.lock()
+    }
+
+    fn set_winsize(&self, winsize: UserWinSize) {
+        *self.winsize.lock() = winsize;
+    }
+
+    fn clear_line_state(&self) {
+        self.line_state.lock().clear();
+    }
+
+    fn foreground_pgrp(&self) -> i32 {
+        *self.foreground_pgrp.lock()
+    }
+
+    fn set_foreground_pgrp(&self, pgrp: i32) {
+        *self.foreground_pgrp.lock() = pgrp;
     }
 }
 
@@ -997,34 +720,7 @@ impl CharDevFileOps {
         }
     }
 
-    fn control_done_ignore_unsupported(&self, req: CharControlRequest) -> Result<(), Errno> {
-        match self.dev.control(req) {
-            Ok(CharControlResponse::Done) | Err(ControlError::Unsupported) => Ok(()),
-            Ok(_) => Err(Errno::EINVAL),
-            Err(err) => Err(map_control_errno(err)),
-        }
-    }
-
-    fn control_u32_or_zero(&self, req: CharControlRequest) -> Result<u32, Errno> {
-        match self.dev.control(req) {
-            Ok(CharControlResponse::U32(value)) => Ok(value),
-            Ok(CharControlResponse::Done) => Err(Errno::EINVAL),
-            Err(ControlError::Unsupported) => Ok(0),
-            Err(err) => Err(map_control_errno(err)),
-        }
-    }
-
-    fn sync_termios2_hardware(&self, raw: &[u8; LINUX_TERMIOS2_LEN]) -> Result<(), Errno> {
-        let ospeed = read_u32(raw, 40).ok_or(Errno::EINVAL)?;
-        if ospeed == 0 {
-            return Ok(());
-        }
-        self.control_done_ignore_unsupported(CharControlRequest::SetSerialConfig {
-            baud: Some(ospeed),
-        })
-    }
-
-    fn write_tty_bytes(&self, buf: &[u8], termios: LinuxTermios) -> VfsResult<()> {
+    fn write_tty_bytes(&self, buf: &[u8], termios: UserTermios) -> VfsResult<()> {
         if buf.is_empty() {
             return Ok(());
         }
@@ -1104,7 +800,7 @@ impl CharDevFileOps {
         }
     }
 
-    fn echo_signal_char(&self, sig: sched::SignalNumber, termios: LinuxTermios) {
+    fn echo_signal_char(&self, sig: sched::SignalNumber, termios: UserTermios) {
         if !termios.echo() {
             return;
         }
@@ -1124,7 +820,7 @@ impl CharDevFileOps {
         &self,
         tty: &TtySharedState,
         ch: u8,
-        termios: LinuxTermios,
+        termios: UserTermios,
     ) -> VfsResult<()> {
         let Some(sig) = termios.signal_for_input(ch) else {
             return Ok(());
@@ -1139,7 +835,7 @@ impl CharDevFileOps {
         &self,
         tty: &TtySharedState,
         ch: u8,
-        termios: LinuxTermios,
+        termios: UserTermios,
     ) -> VfsResult<()> {
         // 异步输入泵没有用户态 read() 调用栈，不能完全依赖当前 termios 的
         // ISIG 状态：BusyBox shell 在启动前台命令前可能短暂把终端切到 raw
@@ -1171,7 +867,7 @@ impl CharDevFileOps {
     fn pump_tty_canonical_once(
         &self,
         tty: &TtySharedState,
-        termios: LinuxTermios,
+        termios: UserTermios,
     ) -> VfsResult<bool> {
         let mut byte = [0u8; 1];
         let n = self.dev.read(&mut byte).map_err(map_char_err)?;
@@ -1249,7 +945,7 @@ impl CharDevFileOps {
     fn process_raw_input_bytes(
         &self,
         tty: &TtySharedState,
-        termios: LinuxTermios,
+        termios: UserTermios,
         buf: &mut [u8],
         force_control_signal: bool,
     ) -> VfsResult<usize> {
@@ -1276,7 +972,7 @@ impl CharDevFileOps {
         Ok(out)
     }
 
-    fn pump_tty_raw_once(&self, tty: &TtySharedState, termios: LinuxTermios) -> VfsResult<bool> {
+    fn pump_tty_raw_once(&self, tty: &TtySharedState, termios: UserTermios) -> VfsResult<bool> {
         let mut byte = [0u8; 1];
         let n = self.dev.read(&mut byte).map_err(map_char_err)?;
         if n == 0 {
@@ -1298,7 +994,7 @@ impl CharDevFileOps {
         Ok(true)
     }
 
-    fn drain_tty_input(&self, tty: &TtySharedState, termios: LinuxTermios) {
+    fn drain_tty_input(&self, tty: &TtySharedState, termios: UserTermios) {
         for _ in 0..TTY_ASYNC_PUMP_LIMIT {
             let result = if termios.canonical() {
                 self.pump_tty_canonical_once(tty, termios)
@@ -1316,7 +1012,7 @@ impl CharDevFileOps {
         &self,
         tty: &TtySharedState,
         buf: &mut [u8],
-        termios: LinuxTermios,
+        termios: UserTermios,
     ) -> VfsResult<usize> {
         loop {
             if let Some(n) = self.dequeue_ready(tty, buf) {
@@ -1332,7 +1028,7 @@ impl CharDevFileOps {
         &self,
         tty: &TtySharedState,
         buf: &mut [u8],
-        termios: LinuxTermios,
+        termios: UserTermios,
     ) -> VfsResult<usize> {
         let want = termios.vmin().max(1) as usize;
         let mut filled = self.dequeue_pending_bytes(tty, buf);
@@ -1356,6 +1052,16 @@ impl CharDevFileOps {
                 return Err(VfsError::WouldBlock);
             }
         }
+    }
+}
+
+impl TtyIoctlContext for CharDevFileOps {
+    fn current_or_stored_pgrp(&self) -> Result<i32, Errno> {
+        self.current_or_stored_pgrp()
+    }
+
+    fn session_id(&self) -> Result<i32, Errno> {
+        operation::getsid(0)
     }
 }
 
@@ -1450,7 +1156,7 @@ impl FileOps for CharDevFileOps {
                 PollEvents::POLLOUT
             };
         }
-        devtmpfs_compat_char_poll_default()
+        DEVTMPFS_STANDARD_POLICY.char_poll
     }
 
     fn poll_add_waiter(&self, task: &Arc<sched::Task>, interest: PollEvents) -> bool {
@@ -1478,139 +1184,7 @@ impl FileOps for CharDevFileOps {
             return Err(Errno::ENOTTY);
         };
 
-        match cmd.raw() {
-            TCGETS => {
-                let termios = *tty.termios.lock();
-                write_bytes_to_user(arg, &termios.raw)?;
-                Ok(0)
-            }
-            TCGETS2 => {
-                let termios = *tty.termios.lock();
-                write_bytes_to_user(arg, &termios.as_termios2_bytes())?;
-                Ok(0)
-            }
-            TCSETS | TCSETSW | TCSETSF => {
-                let mut raw = [0u8; LINUX_TERMIOS_LEN];
-                read_bytes_from_user(arg, &mut raw)?;
-                *tty.termios.lock() = LinuxTermios { raw };
-                if matches!(cmd.raw(), TCSETSW | TCSETSF) {
-                    self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
-                }
-                if matches!(cmd.raw(), TCSETSF) {
-                    tty.line_state.lock().clear();
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushRx)?;
-                }
-                Ok(0)
-            }
-            TCSETS2 | TCSETSW2 | TCSETSF2 => {
-                let mut raw = [0u8; LINUX_TERMIOS2_LEN];
-                read_bytes_from_user(arg, &mut raw)?;
-                let mut termios = [0u8; LINUX_TERMIOS_LEN];
-                for (dst, src) in termios.iter_mut().zip(raw.iter()) {
-                    *dst = *src;
-                }
-                *tty.termios.lock() = LinuxTermios { raw: termios };
-                self.sync_termios2_hardware(&raw)?;
-                if matches!(cmd.raw(), TCSETSW2 | TCSETSF2) {
-                    self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
-                }
-                if matches!(cmd.raw(), TCSETSF2) {
-                    tty.line_state.lock().clear();
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushRx)?;
-                }
-                Ok(0)
-            }
-            TIOCGWINSZ => {
-                let winsize = *tty.winsize.lock();
-                write_bytes_to_user(arg, &winsize.to_bytes())?;
-                Ok(0)
-            }
-            TIOCSWINSZ => {
-                let mut raw = [0u8; LINUX_WINSIZE_LEN];
-                read_bytes_from_user(arg, &mut raw)?;
-                *tty.winsize.lock() = LinuxWinSize::from_bytes(raw);
-                Ok(0)
-            }
-            FIONREAD => {
-                let queued = self.control_u32_or_zero(CharControlRequest::GetInputQueueLen)?;
-                write_u32_to_user(arg, queued)?;
-                Ok(0)
-            }
-            TIOCOUTQ => {
-                let queued = self.control_u32_or_zero(CharControlRequest::GetOutputQueueLen)?;
-                write_u32_to_user(arg, queued)?;
-                Ok(0)
-            }
-            TIOCGPGRP => {
-                write_i32_to_user(arg, self.current_or_stored_pgrp()?)?;
-                Ok(0)
-            }
-            TIOCSPGRP => {
-                let pgid = read_i32_from_user(arg)?;
-                if pgid <= 0 {
-                    return Err(Errno::EINVAL);
-                }
-                *tty.foreground_pgrp.lock() = pgid;
-                Ok(0)
-            }
-            TIOCGSID => {
-                write_i32_to_user(arg, operation::getsid(0)?)?;
-                Ok(0)
-            }
-            TIOCGETD => {
-                write_i32_to_user(arg, 0)?;
-                Ok(0)
-            }
-            TIOCSETD => {
-                let discipline = read_i32_from_user(arg)?;
-                if discipline == 0 {
-                    Ok(0)
-                } else {
-                    Err(Errno::EINVAL)
-                }
-            }
-            TCSBRK => {
-                self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
-                if arg == 0 {
-                    self.control_done_ignore_unsupported(CharControlRequest::SendBreak {
-                        duration_ms: TTY_DEFAULT_BREAK_MS,
-                    })?;
-                }
-                Ok(0)
-            }
-            TCSBRKP => {
-                self.control_done_ignore_unsupported(CharControlRequest::DrainTx)?;
-                let units = u32::try_from(arg).unwrap_or(u32::MAX);
-                let duration_ms = if units == 0 {
-                    TTY_DEFAULT_BREAK_MS
-                } else {
-                    units.saturating_mul(TTY_BREAK_UNIT_MS)
-                };
-                self.control_done_ignore_unsupported(CharControlRequest::SendBreak {
-                    duration_ms,
-                })?;
-                Ok(0)
-            }
-            TCFLSH => match arg {
-                TCIFLUSH => {
-                    tty.line_state.lock().clear();
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushRx)?;
-                    Ok(0)
-                }
-                TCOFLUSH => {
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushTx)?;
-                    Ok(0)
-                }
-                TCIOFLUSH => {
-                    tty.line_state.lock().clear();
-                    self.control_done_ignore_unsupported(CharControlRequest::FlushBoth)?;
-                    Ok(0)
-                }
-                _ => Err(Errno::EINVAL),
-            },
-            TCXONC | TIOCEXCL | TIOCNXCL | TIOCSCTTY | TIOCNOTTY => Ok(0),
-            _ => Err(Errno::ENOTTY),
-        }
+        handle_tty_ioctl(tty, self, &self.dev, cmd, arg)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1750,7 +1324,7 @@ fn max_blocks_per_io(dev: &BlockDevice) -> u32 {
     dev.limits()
         .max_blocks_per_io()
         .map(|n| n.get())
-        .unwrap_or_else(devtmpfs_compat_max_blocks_per_io)
+        .unwrap_or_else(|| DEVTMPFS_STANDARD_POLICY.max_blocks_per_io)
         .max(1)
 }
 
@@ -1761,6 +1335,16 @@ fn block_io_hints(dev: &Arc<BlockDevice>) -> Result<BlockIoHints, Errno> {
     {
         BlockControlResponse::IoHints(hints) => Ok(hints),
         _ => Err(Errno::EINVAL),
+    }
+}
+
+impl BlockDeviceIoctlContext for BlockDevFileOps {
+    fn control(&self, req: BlockControlRequest) -> Result<BlockControlResponse, Errno> {
+        self.dev.control(req).map_err(map_control_errno)
+    }
+
+    fn io_hints(&self) -> Result<BlockIoHints, Errno> {
+        block_io_hints(&self.dev)
     }
 }
 
@@ -1949,129 +1533,13 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
         }
-        if let Some(result) = crate::vfs::loop_devnode::try_loop_block_ioctl(&self.dev, cmd, arg) {
+        if let Some(result) =
+            crate::vfs::device_files::loop_device::try_loop_block_ioctl(&self.dev, cmd, arg)
+        {
             return result;
         }
 
-        match cmd.raw() {
-            BLKROGET => {
-                let readonly = match self
-                    .dev
-                    .control(BlockControlRequest::GetReadOnly)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::Bool(value) => i32::from(value),
-                    _ => return Err(Errno::EINVAL),
-                };
-                write_i32_to_user(arg, readonly)?;
-                Ok(0)
-            }
-            BLKGETSIZE => {
-                let bytes = match self
-                    .dev
-                    .control(BlockControlRequest::GetCapacityBytes)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::U64(value) => value,
-                    _ => return Err(Errno::EINVAL),
-                };
-                let sectors = usize::try_from(bytes / 512).map_err(|_| Errno::EINVAL)?;
-                write_usize_to_user(arg, sectors)?;
-                Ok(0)
-            }
-            BLKGETSIZE64 => {
-                let bytes = match self
-                    .dev
-                    .control(BlockControlRequest::GetCapacityBytes)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::U64(value) => value,
-                    _ => return Err(Errno::EINVAL),
-                };
-                write_u64_to_user(arg, bytes)?;
-                Ok(0)
-            }
-            BLKSSZGET => {
-                let block_size = match self
-                    .dev
-                    .control(BlockControlRequest::GetLogicalBlockSize)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::U32(value) => value,
-                    _ => return Err(Errno::EINVAL),
-                };
-                write_u32_to_user(arg, block_size)?;
-                Ok(0)
-            }
-            BLKBSZGET => {
-                let block_size = match self
-                    .dev
-                    .control(BlockControlRequest::GetLogicalBlockSize)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::U32(value) => value,
-                    _ => return Err(Errno::EINVAL),
-                };
-                write_usize_to_user(arg, block_size as usize)?;
-                Ok(0)
-            }
-            BLKPBSZGET => {
-                let block_size = match self
-                    .dev
-                    .control(BlockControlRequest::GetPhysicalBlockSize)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::U32(value) => value,
-                    _ => return Err(Errno::EINVAL),
-                };
-                write_u32_to_user(arg, block_size)?;
-                Ok(0)
-            }
-            BLKIOMIN => {
-                let hints = block_io_hints(&self.dev)?;
-                write_u32_to_user(arg, hints.min_io_size)?;
-                Ok(0)
-            }
-            BLKIOOPT => {
-                let hints = block_io_hints(&self.dev)?;
-                write_u32_to_user(arg, hints.optimal_io_size)?;
-                Ok(0)
-            }
-            BLKALIGNOFF => {
-                let hints = block_io_hints(&self.dev)?;
-                write_i32_to_user(arg, hints.alignment_offset)?;
-                Ok(0)
-            }
-            BLKDISCARDZEROES => {
-                let hints = block_io_hints(&self.dev)?;
-                write_i32_to_user(arg, i32::from(hints.discard_zeroes))?;
-                Ok(0)
-            }
-            BLKROTATIONAL => {
-                let hints = block_io_hints(&self.dev)?;
-                write_i32_to_user(arg, i32::from(hints.rotational))?;
-                Ok(0)
-            }
-            BLKGETDISKSEQ => {
-                let diskseq = match self
-                    .dev
-                    .control(BlockControlRequest::GetDiskSeq)
-                    .map_err(map_control_errno)?
-                {
-                    BlockControlResponse::U64(value) => value,
-                    _ => return Err(Errno::EINVAL),
-                };
-                write_u64_to_user(arg, diskseq)?;
-                Ok(0)
-            }
-            BLKFLSBUF => {
-                self.dev
-                    .control(BlockControlRequest::Flush)
-                    .map_err(map_control_errno)?;
-                Ok(0)
-            }
-            _ => Err(Errno::ENOTTY),
-        }
+        handle_block_ioctl(self, cmd, arg)
     }
 
     fn release(&self) {
@@ -2425,11 +1893,11 @@ pub struct DevTmpfsSuperblockOps {
     next_ino: AtomicU64,
     /// 超级块弱引用，创建 Inode 时需要
     sb: vfs::sync::Spinlock<Option<alloc::sync::Weak<Superblock>>>,
-    /// 本 devtmpfs 实例实际创建过的 POSIX `dev_t` 投影节点。
+    /// 本 devtmpfs 实例实际创建过的 `dev_t` 投影节点。
     ///
     /// 符号链接、普通文件、目录以及未注册 `dev_t` 的节点解绑时不能无条件清理
     /// device_numbers registry，否则会误删其他兼容层入口留下的记录。
-    posix_owned_nodes: Spinlock<Vec<String>>,
+    numbered_nodes: Spinlock<Vec<String>>,
 }
 
 impl DevTmpfsSuperblockOps {
@@ -2445,8 +1913,8 @@ impl DevTmpfsSuperblockOps {
         self.sb.lock().clone()
     }
 
-    fn remember_posix_node(&self, name: &str) -> VfsResult<()> {
-        let mut nodes = self.posix_owned_nodes.lock();
+    fn remember_numbered_node(&self, name: &str) -> VfsResult<()> {
+        let mut nodes = self.numbered_nodes.lock();
         if nodes.iter().any(|existing| existing == name) {
             return Ok(());
         }
@@ -2455,8 +1923,8 @@ impl DevTmpfsSuperblockOps {
         Ok(())
     }
 
-    fn forget_posix_node(&self, name: &str) -> bool {
-        let mut nodes = self.posix_owned_nodes.lock();
+    fn forget_numbered_node(&self, name: &str) -> bool {
+        let mut nodes = self.numbered_nodes.lock();
         let Some(index) = nodes.iter().position(|existing| existing == name) else {
             return false;
         };
@@ -2464,9 +1932,9 @@ impl DevTmpfsSuperblockOps {
         true
     }
 
-    fn rollback_posix_node(&self, name: &str) {
-        if self.forget_posix_node(name) {
-            super::device_numbers::unregister_node(name);
+    fn rollback_numbered_node(&self, name: &str) {
+        if self.forget_numbered_node(name) {
+            super::user_api::device_numbers::unregister_node(name);
         }
     }
 
@@ -2526,7 +1994,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::Directory,
             DevId::new(0, 0),
-            devtmpfs_compat_block_size(),
+            DEVTMPFS_STANDARD_POLICY.block_size,
             None,
             meta,
             Arc::new(DevDirOps::new()),
@@ -2543,7 +2011,7 @@ impl DevTmpfsSuperblockOps {
         let meta = InodeMeta {
             size: target.len() as u64,
             nlink: 1,
-            mode: devtmpfs_compat_default_symlink_mode(),
+            mode: DEVTMPFS_STANDARD_POLICY.symlink_mode,
             uid,
             gid,
             atime: now,
@@ -2559,7 +2027,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::Symlink,
             DevId::new(0, 0),
-            devtmpfs_compat_block_size(),
+            DEVTMPFS_STANDARD_POLICY.block_size,
             None,
             meta,
             Arc::new(DevSymlinkOps {
@@ -2571,8 +2039,8 @@ impl DevTmpfsSuperblockOps {
 
     fn new_custom_inode(&self, spec: &CustomDevNodeSpec, rdev: DevId) -> VfsResult<Arc<Inode>> {
         split_devtmpfs_path(spec.name())?;
-        let block_size = custom_devnode_default_block_size(spec.kind());
-        let nlink = custom_devnode_default_nlink(spec.kind());
+        let block_size = DEVTMPFS_STANDARD_POLICY.block_size;
+        let nlink = DEVTMPFS_STANDARD_POLICY.custom_nlink(spec.kind());
         if block_size == 0 || nlink == 0 {
             return Err(VfsError::InvalidArgument);
         }
@@ -2585,9 +2053,9 @@ impl DevTmpfsSuperblockOps {
         let meta = InodeMeta {
             size: 0,
             nlink,
-            mode: custom_devnode_default_mode(spec.kind()),
-            uid: devtmpfs_compat_default_uid(),
-            gid: devtmpfs_compat_default_gid(),
+            mode: DEVTMPFS_STANDARD_POLICY.custom_mode(spec.kind()),
+            uid: DEVTMPFS_STANDARD_POLICY.uid,
+            gid: DEVTMPFS_STANDARD_POLICY.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -2629,9 +2097,9 @@ impl DevTmpfsSuperblockOps {
                     existing
                 } else {
                     let child = self.new_dir_inode(
-                        devtmpfs_compat_default_dir_mode(),
-                        devtmpfs_compat_default_uid(),
-                        devtmpfs_compat_default_gid(),
+                        DEVTMPFS_STANDARD_POLICY.dir_mode,
+                        DEVTMPFS_STANDARD_POLICY.uid,
+                        DEVTMPFS_STANDARD_POLICY.gid,
                     )?;
                     children.insert(devtmpfs_fallible_string(component)?, Arc::clone(&child));
                     created = true;
@@ -2768,16 +2236,16 @@ impl DevTmpfsSuperblockOps {
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
-        let rdev = super::device_numbers::register_char(user_name, dev.fw_name())
+        let rdev = super::user_api::device_numbers::register_char(user_name, dev.fw_name())
             .ok_or(VfsError::NoSpace)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: devtmpfs_compat_default_device_mode(),
-            uid: devtmpfs_compat_default_uid(),
-            gid: devtmpfs_compat_default_gid(),
+            mode: DEVTMPFS_STANDARD_POLICY.device_mode,
+            uid: DEVTMPFS_STANDARD_POLICY.uid,
+            gid: DEVTMPFS_STANDARD_POLICY.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -2793,7 +2261,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::CharDevice,
             rdev,
-            devtmpfs_compat_block_size(),
+            DEVTMPFS_STANDARD_POLICY.block_size,
             None,
             meta,
             ops,
@@ -2801,12 +2269,12 @@ impl DevTmpfsSuperblockOps {
         );
 
         if let Err(err) = self.insert_node_at(user_name, inode) {
-            super::device_numbers::unregister_node(user_name);
+            super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
-        if let Err(err) = self.remember_posix_node(user_name) {
+        if let Err(err) = self.remember_numbered_node(user_name) {
             let _ = self.remove_node_at(user_name);
-            super::device_numbers::unregister_node(user_name);
+            super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
         Ok(())
@@ -2848,16 +2316,16 @@ impl DevTmpfsSuperblockOps {
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
-        let rdev = super::device_numbers::register_block(user_name, dev.name())
+        let rdev = super::user_api::device_numbers::register_block(user_name, dev.name())
             .ok_or(VfsError::NoSpace)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: 0,
             nlink: 1,
-            mode: devtmpfs_compat_default_device_mode(),
-            uid: devtmpfs_compat_default_uid(),
-            gid: devtmpfs_compat_default_gid(),
+            mode: DEVTMPFS_STANDARD_POLICY.device_mode,
+            uid: DEVTMPFS_STANDARD_POLICY.uid,
+            gid: DEVTMPFS_STANDARD_POLICY.gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -2872,7 +2340,7 @@ impl DevTmpfsSuperblockOps {
             },
             FileType::BlockDevice,
             rdev,
-            devtmpfs_compat_block_size(),
+            DEVTMPFS_STANDARD_POLICY.block_size,
             None,
             meta,
             ops,
@@ -2880,12 +2348,12 @@ impl DevTmpfsSuperblockOps {
         );
 
         if let Err(err) = self.insert_node_at(user_name, inode) {
-            super::device_numbers::unregister_node(user_name);
+            super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
-        if let Err(err) = self.remember_posix_node(user_name) {
+        if let Err(err) = self.remember_numbered_node(user_name) {
             let _ = self.remove_node_at(user_name);
-            super::device_numbers::unregister_node(user_name);
+            super::user_api::device_numbers::unregister_node(user_name);
             return Err(err);
         }
         Ok(())
@@ -2899,15 +2367,15 @@ impl DevTmpfsSuperblockOps {
         split_devtmpfs_path(user_name)?;
         let inode = self.new_symlink_inode(
             target,
-            devtmpfs_compat_default_uid(),
-            devtmpfs_compat_default_gid(),
+            DEVTMPFS_STANDARD_POLICY.uid,
+            DEVTMPFS_STANDARD_POLICY.gid,
         )?;
         self.insert_node_at(user_name, inode)
     }
 
     /// 绑定一个自定义 devtmpfs 节点。
     ///
-    /// 自定义节点的底层 function 只提交 opaque payload；这里作为 VFS/POSIX
+    /// 自定义节点的底层 function 只提交 opaque payload；这里作为 VFS 用户接口
     /// 适配层负责解释 payload、分配兼容 `dev_t` 并创建 inode。
     pub fn bind_custom(&self, spec: &CustomDevNodeSpec) -> VfsResult<()> {
         split_devtmpfs_path(spec.name())?;
@@ -2916,16 +2384,16 @@ impl DevTmpfsSuperblockOps {
         }
 
         // custom 节点只从 dev core 接收通用类别和 opaque payload；兼容设备号
-        // 是 devtmpfs/stat/proc/sysfs 这条 POSIX 投影链路的状态，不能由底层
+        // 是 devtmpfs/stat/proc/sysfs 这条用户 ABI 投影链路的状态，不能由底层
         // function 指定或反向影响设备身份。
         let (rdev, registered_rdev) = match spec.kind() {
             CustomDevNodeKind::CharDevice => (
-                super::device_numbers::register_char(spec.name(), spec.name())
+                super::user_api::device_numbers::register_char(spec.name(), spec.name())
                     .ok_or(VfsError::NoSpace)?,
                 true,
             ),
             CustomDevNodeKind::BlockDevice => (
-                super::device_numbers::register_block(spec.name(), spec.name())
+                super::user_api::device_numbers::register_block(spec.name(), spec.name())
                     .ok_or(VfsError::NoSpace)?,
                 true,
             ),
@@ -2937,20 +2405,20 @@ impl DevTmpfsSuperblockOps {
             Ok(inode) => inode,
             Err(err) => {
                 if registered_rdev {
-                    super::device_numbers::unregister_node(spec.name());
+                    super::user_api::device_numbers::unregister_node(spec.name());
                 }
                 return Err(err);
             }
         };
         if let Err(err) = self.insert_node_at(spec.name(), inode) {
             if registered_rdev {
-                super::device_numbers::unregister_node(spec.name());
+                super::user_api::device_numbers::unregister_node(spec.name());
             }
             return Err(err);
         }
-        if registered_rdev && let Err(err) = self.remember_posix_node(spec.name()) {
+        if registered_rdev && let Err(err) = self.remember_numbered_node(spec.name()) {
             let _ = self.remove_node_at(spec.name());
-            super::device_numbers::unregister_node(spec.name());
+            super::user_api::device_numbers::unregister_node(spec.name());
             return Err(err);
         }
         Ok(())
@@ -2993,7 +2461,7 @@ impl DevTmpfsSuperblockOps {
     /// 解除设备绑定，删除 devtmpfs 中的相对路径节点。
     pub fn unbind(&self, user_name: &str) -> VfsResult<()> {
         self.remove_node_at(user_name)?;
-        self.rollback_posix_node(user_name);
+        self.rollback_numbered_node(user_name);
         Ok(())
     }
 
@@ -3040,7 +2508,7 @@ impl SuperblockOps for DevTmpfsSuperblockOps {
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
         Ok(FsStat {
             fs_type: 0x444f4445, // "devt" 魔数
-            block_size: devtmpfs_compat_block_size() as u64,
+            block_size: DEVTMPFS_STANDARD_POLICY.block_size as u64,
             total_blocks: 0,
             free_blocks: 0,
             avail_blocks: 0,
@@ -3097,7 +2565,7 @@ impl FsDriver for DevTmpfsDriver {
     }
 
     fn mount(&self, _dev: Option<&str>, _data: &str) -> VfsResult<Arc<Superblock>> {
-        // devtmpfs 是内核设备树的 POSIX 投影，不能像 tmpfs 一样每次 mount
+        // devtmpfs 是内核设备树的用户可见投影，不能像 tmpfs 一样每次 mount
         // 都创建空实例。启动期 PnP bridge 安装后，用户态再次挂载 devtmpfs
         // 应复用同一个 superblock，否则会覆盖掉已经绑定的 console/uart/vd0 等节点。
         if let Some(sb) = mounted_devtmpfs_sb() {
@@ -3114,7 +2582,7 @@ impl FsDriver for DevTmpfsDriver {
         let sb_ops = DevTmpfsSuperblockOps {
             next_ino: AtomicU64::new(2),
             sb: vfs::sync::Spinlock::new(None),
-            posix_owned_nodes: Spinlock::new(Vec::new()),
+            numbered_nodes: Spinlock::new(Vec::new()),
         };
 
         let sb = Superblock::new(move |weak_sb| {
@@ -3124,9 +2592,9 @@ impl FsDriver for DevTmpfsDriver {
             let root_meta = InodeMeta {
                 size: 0,
                 nlink: 2,
-                mode: devtmpfs_compat_default_dir_mode(),
-                uid: devtmpfs_compat_default_uid(),
-                gid: devtmpfs_compat_default_gid(),
+                mode: DEVTMPFS_STANDARD_POLICY.dir_mode,
+                uid: DEVTMPFS_STANDARD_POLICY.uid,
+                gid: DEVTMPFS_STANDARD_POLICY.gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -3137,7 +2605,7 @@ impl FsDriver for DevTmpfsDriver {
                 InodeId { fs_id, ino: 1 },
                 FileType::Directory,
                 DevId::new(0, 0),
-                devtmpfs_compat_block_size(),
+                DEVTMPFS_STANDARD_POLICY.block_size,
                 None,
                 root_meta,
                 Arc::clone(&root_ops) as Arc<dyn InodeOps + Send + Sync>,
@@ -3150,7 +2618,7 @@ impl FsDriver for DevTmpfsDriver {
                 fs_type: "devtmpfs",
                 fs_id,
                 dev_id: None,
-                block_size: devtmpfs_compat_block_size(),
+                block_size: DEVTMPFS_STANDARD_POLICY.block_size,
                 name_max: DEVTMPFS_NAME_MAX as u32,
                 root_inode,
                 root_dentry,

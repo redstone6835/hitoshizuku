@@ -33,8 +33,6 @@ pub use virtio_pci::*;
 mod random;
 pub use random::*;
 
-mod base_char;
-
 use core::num::NonZeroU32;
 
 use crate::dev::block::BlockLimits;
@@ -118,7 +116,6 @@ pub(super) fn virtio_blk_limits(block_size: u32) -> BlockLimits {
 ///
 /// 调用前必须已经通过 `set_dev_init_context()` 安装驱动初始化上下文。
 const BUILTIN_DRIVER_CATALOG: &[BuiltinDriverRegistration] = &[
-    BuiltinDriverRegistration::new("base-char", base_char::register_builtin_driver),
     BuiltinDriverRegistration::new("loopback", loopback::register_builtin_driver),
     BuiltinDriverRegistration::new("firmware-bus", firmware_bus::register_builtin_driver),
     BuiltinDriverRegistration::new("syscon", syscon::register_builtin_driver),

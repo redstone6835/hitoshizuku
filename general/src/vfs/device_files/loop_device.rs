@@ -10,7 +10,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt::Write;
-use core::mem::{MaybeUninit, size_of};
 use core::ops::ControlFlow;
 
 use errno::Errno;
@@ -31,12 +30,12 @@ use crate::dev::loopdev::{
     LoopAttachOptions, LoopBacking, LoopBackingError, LoopDeviceBundle, LoopDriver, LoopError,
     LoopFlags, LoopStatus,
 };
-use crate::mm::{copy_from_user, copy_to_user};
 use crate::vfs::devtmpfs::{
     DevTmpfsCustomNodeAdapter, DevTmpfsCustomNodeAdapterRegistration, DevTmpfsStaticNode,
     DevTmpfsStaticNodeRegistration, bind_dynamic_devnodes, register_custom_devnode_adapter,
     register_static_dev_node, unbind_dynamic_devnodes,
 };
+use crate::vfs::user_api::ioctl::{read_pod_from_user, write_pod_to_user};
 
 const LOOP_CONTROL_NODE_NAME: &str = "loop-control";
 const LOOP_DEVNODE_OWNER: &str = "loop-devnode";
@@ -596,27 +595,11 @@ fn copy_name_to_field(field: &mut [u8; LO_NAME_SIZE], name: &str) {
 }
 
 fn read_user_struct<T: Copy>(user: usize) -> Result<T, Errno> {
-    if user == 0 {
-        return Err(Errno::EFAULT);
-    }
-    let mut value = MaybeUninit::<T>::zeroed();
-    // Safety: `value` 指向内核栈上未初始化对象，按字节填满后再 assume_init；
-    // T 只用于 repr(C) ABI POD 结构，调用点限制为 Copy 类型。
-    let bytes =
-        unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
-    copy_from_user(user, bytes).map_err(|err| err.as_errno())?;
-    // Safety: 上面的 copy_from_user 已经覆盖了整个对象字节范围。
-    Ok(unsafe { value.assume_init() })
+    read_pod_from_user(user)
 }
 
 fn write_user_struct<T: Copy>(user: usize, value: &T) -> Result<(), Errno> {
-    if user == 0 {
-        return Err(Errno::EFAULT);
-    }
-    // Safety: 只把 repr(C) POD 结构按字节复制到用户空间，不暴露 Rust 引用。
-    let bytes =
-        unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
-    copy_to_user(user, bytes).map_err(|err| err.as_errno())
+    write_pod_to_user(user, value)
 }
 
 fn is_loop_ioctl(raw: usize) -> bool {

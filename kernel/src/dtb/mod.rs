@@ -422,9 +422,9 @@ pub fn kernel_start_init(context: &StartContext) {
         printk!("[kernel-start][dtb] initramfs unpacked into root");
     }
 
-    // 小步骤 5.6 最后把 devtmpfs 和标准兼容层伪文件系统挂到公共路径。
+    // 小步骤 5.6 最后把 devtmpfs 和标准用户接口伪文件系统挂到公共路径。
     crate::device_init::mount_devtmpfs_on_dev("dtb", &vfs_ctx, Arc::clone(&dev_sb));
-    crate::device_init::mount_standard_compat_filesystems("dtb", &vfs_ctx);
+    crate::device_init::mount_standard_user_api_filesystems("dtb", &vfs_ctx);
 
     printk!(
         "[kernel-start][dtb] VFS ready: '{}' mounted as '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'",

@@ -461,7 +461,7 @@ pub fn kernel_start_init(context: &StartContext) {
 
     // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
 
-    crate::device_init::mount_standard_compat_filesystems("acpi", &vfs_ctx);
+    crate::device_init::mount_standard_user_api_filesystems("acpi", &vfs_ctx);
 
     // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
     // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
