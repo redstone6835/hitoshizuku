@@ -165,6 +165,33 @@ pub(crate) fn read_all_entries(
     Ok(out)
 }
 
+/// 流式判断目录是否为空,只忽略 `.` / `..` 两个固定项。
+///
+/// `rmdir` 和 rename 覆盖空目录只需要布尔结果。直接在目录块内比较原始名称,
+/// 可以避免为整个目录构造 `Vec<DirEntryRaw>` 和 `String`。
+pub(crate) fn is_dir_empty(
+    state: &FsState,
+    i_block: &[u8],
+    flags: u32,
+    size: u64,
+) -> Result<bool, BlockBackendError> {
+    let block_size = state.ext_sb.block_size as u64;
+    let total_blocks = (size + block_size - 1) / block_size;
+    let has_ft = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
+    let ranges = mapped_ranges(state, i_block, flags, total_blocks)?;
+    let mut empty = true;
+    visit_mapped_dir_blocks(state, &ranges, |block| {
+        scan_dir_block_bytes(block, has_ft, |_, _, name_bytes| {
+            if name_bytes == b"." || name_bytes == b".." {
+                return true;
+            }
+            empty = false;
+            false
+        })
+    })?;
+    Ok(empty)
+}
+
 /// 在目录中查找一个名字。成功时提前停止扫描,避免为整目录构造 `Vec`。
 pub(crate) fn find_entry(
     state: &FsState,

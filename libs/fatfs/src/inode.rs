@@ -322,10 +322,7 @@ impl InodeOps for DirInodeOps {
         }
         // 子目录是否非空(忽略 "." 和 ".." 与已删条目)
         let sub_backing = DirBacking::ChainFromCluster(entry.first_cluster);
-        let sub_entries =
-            dir::read_all_entries(&self.state, sub_backing).map_err(backend_to_vfs)?;
-        let any = sub_entries.iter().any(|e| e.name != "." && e.name != "..");
-        if any {
+        if !dir::is_dir_empty(&self.state, sub_backing).map_err(backend_to_vfs)? {
             return Err(VfsError::DirectoryNotEmpty);
         }
         if entry.first_cluster >= 2 {

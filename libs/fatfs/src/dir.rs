@@ -386,6 +386,49 @@ pub(crate) fn read_all_entries(
     Ok(out)
 }
 
+/// 流式判断目录是否为空,只忽略 FAT 目录规定的 `.` / `..` 项。
+///
+/// `rmdir` 只需要知道是否存在第一个普通条目。这里直接扫描 SFN 槽,避免为整个
+/// 子目录构造 [`DirEntryView`] 和长文件名字符串。
+pub(crate) fn is_dir_empty(
+    state: &FsState,
+    backing: DirBacking,
+) -> Result<bool, BlockBackendError> {
+    let entries_per_sector = state.bytes_per_sector / DIR_ENTRY_SIZE as u32;
+    let mut empty = true;
+    scan_dir_sectors(state, backing, |_, sec| {
+        for idx in 0..entries_per_sector {
+            let off = idx as usize * DIR_ENTRY_SIZE;
+            let entry = &sec[off..off + DIR_ENTRY_SIZE];
+            let first = entry[OFF_NAME];
+            if first == ENTRY_END {
+                return Ok(false);
+            }
+            if first == ENTRY_FREE {
+                continue;
+            }
+            let attr = entry[OFF_ATTR];
+            if attr == ATTR_LFN || attr & ATTR_VOLUME_ID != 0 {
+                continue;
+            }
+            if is_dot_or_dotdot_sfn(entry) {
+                continue;
+            }
+            empty = false;
+            return Ok(false);
+        }
+        Ok(true)
+    })?;
+    Ok(empty)
+}
+
+#[inline]
+fn is_dot_or_dotdot_sfn(entry: &[u8]) -> bool {
+    let raw = &entry[OFF_NAME..OFF_NAME + 11];
+    (raw[0] == b'.' && raw[1..].iter().all(|&b| b == b' '))
+        || (raw[0] == b'.' && raw[1] == b'.' && raw[2..].iter().all(|&b| b == b' '))
+}
+
 /// 在目录中直接查找名称,找到后立即停止扫描。
 pub(crate) fn find_entry(
     state: &FsState,

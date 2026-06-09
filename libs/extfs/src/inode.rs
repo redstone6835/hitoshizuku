@@ -483,13 +483,10 @@ impl InodeOps for ExtInodeOps {
         {
             let traw = t_ops.raw.lock();
             let tib = copy_i_block(i_block_slice(&traw.bytes));
-            let entries =
-                crate::dir::read_all_entries(&self.state, &tib, traw.flags(), traw.size())
-                    .map_err(map_err)?;
-            for e in &entries {
-                if e.name != "." && e.name != ".." {
-                    return Err(VfsError::DirectoryNotEmpty);
-                }
+            if !crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
+                .map_err(map_err)?
+            {
+                return Err(VfsError::DirectoryNotEmpty);
             }
         }
         // 从父目录移除
@@ -675,14 +672,11 @@ impl InodeOps for ExtInodeOps {
                     .ok_or(VfsError::InvalidArgument)?;
                 let traw = eops.raw.lock();
                 let tib = copy_i_block(i_block_slice(&traw.bytes));
-                let entries =
-                    crate::dir::read_all_entries(&self.state, &tib, traw.flags(), traw.size())
-                        .map_err(map_err)?;
+                let empty = crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
+                    .map_err(map_err)?;
                 drop(traw);
-                for e in &entries {
-                    if e.name != "." && e.name != ".." {
-                        return Err(VfsError::DirectoryNotEmpty);
-                    }
+                if !empty {
+                    return Err(VfsError::DirectoryNotEmpty);
                 }
                 if !target_is_dir {
                     // 源不是目录、目标是目录:禁止
