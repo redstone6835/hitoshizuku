@@ -13,6 +13,13 @@ pub struct TcpBufferTuning {
     pub tx_bytes: usize,
 }
 
+/// TCP 监听 socket 的内部队列配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpListenTuning {
+    /// 每个接口最多缓存的已完成握手连接数量。
+    pub accept_backlog: usize,
+}
+
 /// 数据报类 socket 缓冲区配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketBufferTuning {
@@ -59,6 +66,8 @@ impl EphemeralPortRange {
 pub struct NetTuning {
     /// 默认 TCP 缓冲配置。
     pub tcp: TcpBufferTuning,
+    /// TCP 监听队列配置。
+    pub tcp_listen: TcpListenTuning,
     /// 默认 UDP 缓冲配置。
     pub udp: PacketBufferTuning,
     /// 默认 raw IP 缓冲配置。
@@ -92,6 +101,9 @@ pub const DEFAULT_PACKET_META_COUNT: usize = 32;
 /// 空转过多轮。
 pub const DEFAULT_ACTIVE_POLL_ROUNDS: usize = 16;
 
+/// 默认 TCP accept 待连接队列长度。
+pub const DEFAULT_TCP_ACCEPT_BACKLOG: usize = 128;
+
 /// 默认临时端口范围。
 pub const DEFAULT_EPHEMERAL_PORTS: EphemeralPortRange = EphemeralPortRange {
     start: 49152,
@@ -105,6 +117,9 @@ impl NetTuning {
             tcp: TcpBufferTuning {
                 rx_bytes: DEFAULT_TCP_BUFFER_BYTES,
                 tx_bytes: DEFAULT_TCP_BUFFER_BYTES,
+            },
+            tcp_listen: TcpListenTuning {
+                accept_backlog: DEFAULT_TCP_ACCEPT_BACKLOG,
             },
             udp: PacketBufferTuning {
                 rx_bytes: DEFAULT_UDP_BUFFER_BYTES,
@@ -148,10 +163,15 @@ mod tests {
 
         assert!(tuning.tcp.rx_bytes >= DEFAULT_TCP_BUFFER_BYTES);
         assert!(tuning.tcp.tx_bytes >= DEFAULT_TCP_BUFFER_BYTES);
+        assert!(tuning.tcp_listen.accept_backlog > 0);
         assert!(tuning.udp.rx_meta > 0);
         assert!(tuning.udp.tx_meta > 0);
         assert!(tuning.active_poll.max_rounds >= 2);
-        assert!(tuning.ephemeral_ports.contains(tuning.ephemeral_ports.start));
+        assert!(
+            tuning
+                .ephemeral_ports
+                .contains(tuning.ephemeral_ports.start)
+        );
         assert!(tuning.ephemeral_ports.contains(tuning.ephemeral_ports.end));
         assert_eq!(tuning.ephemeral_ports.len(), 16_384);
     }

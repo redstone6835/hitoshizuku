@@ -24,7 +24,7 @@ use crate::driver::LinkMedium;
 use crate::engine::{ProtocolSocketHandle, endpoint_from_smoltcp};
 use crate::socket::{NetSocketHandle, SocketMeta, SocketType};
 use crate::time::NetInstant;
-use crate::tuning::{PacketBufferTuning, TcpBufferTuning};
+use crate::tuning::{PacketBufferTuning, TcpBufferTuning, TcpListenTuning};
 
 // ── ManagedInterface ─────────────────────────────────────────────────────────
 
@@ -51,7 +51,11 @@ pub(crate) struct ManagedInterface {
 
 impl ManagedInterface {
     /// 根据设备和配置创建受管理接口。
-    pub fn new(net_device: Arc<NetDevice>, config: IfConfig) -> Self {
+    pub fn new(
+        net_device: Arc<NetDevice>,
+        config: IfConfig,
+        listen_tuning: TcpListenTuning,
+    ) -> Self {
         let driver = Arc::clone(net_device.driver());
         let hw_addr = match driver.medium() {
             LinkMedium::Ethernet => {
@@ -110,8 +114,8 @@ impl ManagedInterface {
             device,
             sockets: SocketSet::new(Vec::new()),
             meta: BTreeMap::new(),
-            pending_accepted: Vec::new(),
-            max_backlog: 128,
+            pending_accepted: Vec::with_capacity(listen_tuning.accept_backlog),
+            max_backlog: listen_tuning.accept_backlog,
             inode_counter: core::sync::atomic::AtomicU64::new(1),
             handle_generation: 1,
             config,
@@ -211,6 +215,11 @@ impl ManagedInterface {
             .collect();
         for h in to_remove {
             self.remove_smoltcp_socket_locked(h);
+        }
+        if changed {
+            self.refresh_pending_tcp_accepts();
+        } else if !self.pending_accepted.is_empty() {
+            self.prune_pending_tcp_accepts();
         }
         changed
     }
@@ -435,27 +444,30 @@ impl ManagedInterface {
     /// 调用 [`Self::remove_socket_locked`]。soft_remove_socket 适合"延迟
     /// 到下一次 poll"的场景（例如某条路径上需要立刻释放对端资源但又想避开
     /// 持锁移除的复杂性）。
-    pub fn soft_remove_socket(&self, handle: ProtocolSocketHandle) {
+    pub fn soft_remove_socket(&mut self, handle: ProtocolSocketHandle) {
         let handle = handle.into_smoltcp();
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_removed();
         }
+        self.remove_pending_tcp_accept(handle);
     }
 
     /// 将 socket 标记为 orphan：上层 fd 已释放，但协议栈继续负责 TCP 收尾。
-    pub fn orphan_socket(&self, handle: ProtocolSocketHandle) {
+    pub fn orphan_socket(&mut self, handle: ProtocolSocketHandle) {
         let handle = handle.into_smoltcp();
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_orphaned();
         }
+        self.remove_pending_tcp_accept(handle);
     }
 
     /// 标记 TCP 连接已被 accept 交付给 VFS。
-    pub fn mark_socket_accepted(&self, handle: ProtocolSocketHandle) {
+    pub fn mark_socket_accepted(&mut self, handle: ProtocolSocketHandle) {
         let handle = handle.into_smoltcp();
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_accepted();
         }
+        self.remove_pending_tcp_accept(handle);
     }
 
     /// 按监听端点查找一个已经由 smoltcp 原地转换为 Established、
@@ -466,14 +478,23 @@ impl ManagedInterface {
     /// 仅检查 fd 当前保存的单个 handle 容易漏掉这个已建立连接，因此这里
     /// 允许按端点扫描整个 SocketSet。
     pub fn pending_tcp_accept(
-        &self,
+        &mut self,
         preferred: ProtocolSocketHandle,
         target: IpListenEndpoint,
     ) -> Option<ProtocolSocketHandle> {
         let preferred = preferred.into_smoltcp();
-        if self.tcp_socket_is_pending_accept(preferred, target) {
+        self.prune_pending_tcp_accepts();
+        let preferred_pending = self.tcp_socket_is_pending_accept(preferred, target);
+        if preferred_pending {
+            self.enqueue_pending_tcp_accept(preferred);
+        }
+        if let Some(handle) = self.queued_pending_tcp_accept(target) {
+            return Some(ProtocolSocketHandle::from_smoltcp(handle));
+        }
+        if preferred_pending {
             return Some(ProtocolSocketHandle::from_smoltcp(preferred));
         }
+        let mut found = None;
         for (handle, socket) in self.sockets.iter() {
             if handle == preferred {
                 continue;
@@ -482,10 +503,81 @@ impl ManagedInterface {
                 continue;
             };
             if self.tcp_socket_is_pending_accept_with_socket(handle, tcp, target) {
-                return Some(ProtocolSocketHandle::from_smoltcp(handle));
+                found = Some(handle);
+                break;
             }
         }
-        None
+        if let Some(handle) = found {
+            self.enqueue_pending_tcp_accept(handle);
+            Some(ProtocolSocketHandle::from_smoltcp(handle))
+        } else {
+            None
+        }
+    }
+
+    fn refresh_pending_tcp_accepts(&mut self) {
+        self.prune_pending_tcp_accepts();
+        if self.max_backlog == 0 || self.pending_accepted.len() >= self.max_backlog {
+            return;
+        }
+        let meta = &self.meta;
+        let pending = &mut self.pending_accepted;
+        let max_backlog = self.max_backlog;
+        for (handle, socket) in self.sockets.iter() {
+            if pending.len() >= max_backlog {
+                break;
+            }
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            if tcp_socket_is_pending_accept_candidate(meta, handle, tcp, None)
+                && !pending.contains(&handle)
+            {
+                pending.push(handle);
+            }
+        }
+    }
+
+    fn prune_pending_tcp_accepts(&mut self) {
+        let meta = &self.meta;
+        let sockets = &self.sockets;
+        self.pending_accepted.retain(|handle| {
+            let mut found = None;
+            for (socket_handle, socket) in sockets.iter() {
+                if socket_handle == *handle {
+                    found = Some((socket_handle, socket));
+                    break;
+                }
+            }
+            let Some((socket_handle, socket)) = found else {
+                return false;
+            };
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                return false;
+            };
+            tcp_socket_is_pending_accept_candidate(meta, socket_handle, tcp, None)
+        });
+    }
+
+    fn queued_pending_tcp_accept(&self, target: IpListenEndpoint) -> Option<SocketHandle> {
+        self.pending_accepted
+            .iter()
+            .copied()
+            .find(|handle| self.tcp_socket_is_pending_accept(*handle, target))
+    }
+
+    fn enqueue_pending_tcp_accept(&mut self, handle: SocketHandle) {
+        if self.max_backlog == 0
+            || self.pending_accepted.len() >= self.max_backlog
+            || self.pending_accepted.contains(&handle)
+        {
+            return;
+        }
+        self.pending_accepted.push(handle);
+    }
+
+    fn remove_pending_tcp_accept(&mut self, handle: SocketHandle) {
+        self.pending_accepted.retain(|queued| *queued != handle);
     }
 
     fn tcp_socket_is_pending_accept(&self, handle: SocketHandle, target: IpListenEndpoint) -> bool {
@@ -507,14 +599,7 @@ impl ManagedInterface {
         tcp: &smoltcp::socket::tcp::Socket<'static>,
         target: IpListenEndpoint,
     ) -> bool {
-        let Some(meta) = self.meta.get(&handle) else {
-            return false;
-        };
-        if meta.is_removed() || meta.is_orphaned() || meta.is_accepted() {
-            return false;
-        }
-        tcp.state() == smoltcp::socket::tcp::State::Established
-            && listen_endpoint_matches(tcp.listen_endpoint(), target)
+        tcp_socket_is_pending_accept_candidate(&self.meta, handle, tcp, Some(target))
     }
 
     /// 同步从 `SocketSet` 中移除一个 socket（不依赖 poll 触发）。
@@ -533,6 +618,7 @@ impl ManagedInterface {
         // 下次 poll 会对一个已经在 `SocketSet` 里被替换的 handle 再调
         // `sockets.remove`，触发 "handle does not refer to a valid socket"。
         self.meta.remove(&handle);
+        self.remove_pending_tcp_accept(handle);
         self.sockets.remove(handle);
     }
 
@@ -824,6 +910,31 @@ fn listen_endpoint_matches(actual: IpListenEndpoint, target: IpListenEndpoint) -
     }
 }
 
+fn tcp_socket_is_pending_accept_candidate(
+    meta: &BTreeMap<SocketHandle, SocketMeta>,
+    handle: SocketHandle,
+    tcp: &smoltcp::socket::tcp::Socket<'static>,
+    target: Option<IpListenEndpoint>,
+) -> bool {
+    let Some(meta) = meta.get(&handle) else {
+        return false;
+    };
+    if meta.socket_type() != SocketType::Tcp
+        || meta.is_removed()
+        || meta.is_orphaned()
+        || meta.is_accepted()
+    {
+        return false;
+    }
+    let listen_endpoint = tcp.listen_endpoint();
+    if listen_endpoint.port == 0 || tcp.state() != smoltcp::socket::tcp::State::Established {
+        return false;
+    }
+    target.map_or(true, |target| {
+        listen_endpoint_matches(listen_endpoint, target)
+    })
+}
+
 // ── 类型转换 ─────────────────────────────────────────────────────────────────
 
 fn ipv4_to_smoltcp(addr: Ipv4Addr) -> Ipv4Address {
@@ -863,28 +974,48 @@ fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use alloc::vec;
     use core::any::Any;
+    use spin::Mutex;
 
     use super::*;
     use crate::driver::{Duplex, LinkState, NetDriver, RxBuf, TxBuf};
-    use crate::tuning::NetTuning;
+    use crate::tuning::{NetTuning, TcpListenTuning};
 
-    struct EmptyDriver;
+    #[derive(Default)]
+    struct TestDriver {
+        rx: Mutex<Vec<Vec<u8>>>,
+        tx: Mutex<Vec<Vec<u8>>>,
+    }
 
-    impl NetDriver for EmptyDriver {
+    impl TestDriver {
+        fn push_rx(&self, packet: Vec<u8>) {
+            self.rx.lock().push(packet);
+        }
+
+        fn last_tx(&self) -> Vec<u8> {
+            self.tx.lock().last().cloned().unwrap()
+        }
+    }
+
+    impl NetDriver for TestDriver {
         fn medium(&self) -> LinkMedium {
             LinkMedium::Ip
         }
 
         fn poll_rx(&self) -> Option<RxBuf> {
-            None
+            let packet = self.rx.lock().pop()?;
+            let len = packet.len();
+            Some(RxBuf::new(packet.into_boxed_slice(), len))
         }
 
         fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
             Some(TxBuf::new(alloc::vec![0u8; len].into_boxed_slice()))
         }
 
-        fn commit_tx(&self, _buf: TxBuf) {}
+        fn commit_tx(&self, buf: TxBuf) {
+            self.tx.lock().push(buf.as_slice().to_vec());
+        }
 
         fn link_state(&self) -> LinkState {
             LinkState::Up {
@@ -903,11 +1034,139 @@ mod tests {
     }
 
     fn test_interface() -> (InterfaceId, ManagedInterface) {
-        let driver: Arc<dyn NetDriver> = Arc::new(EmptyDriver);
+        test_interface_with_backlog(NetTuning::defaults().tcp_listen.accept_backlog)
+    }
+
+    fn test_interface_with_backlog(backlog: usize) -> (InterfaceId, ManagedInterface) {
+        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::default());
+        test_interface_with_driver(driver, backlog)
+    }
+
+    fn test_interface_with_driver(
+        driver: Arc<dyn NetDriver>,
+        backlog: usize,
+    ) -> (InterfaceId, ManagedInterface) {
         let dev = Arc::new(NetDevice::new("test-net", driver));
         let id = dev.id();
         let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, 8, None);
-        (id, ManagedInterface::new(dev, config))
+        (
+            id,
+            ManagedInterface::new(
+                dev,
+                config,
+                TcpListenTuning {
+                    accept_backlog: backlog,
+                },
+            ),
+        )
+    }
+
+    fn build_tcp_packet(
+        src: smoltcp::wire::Ipv4Address,
+        dst: smoltcp::wire::Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        seq: i32,
+        ack: Option<i32>,
+        control: smoltcp::wire::TcpControl,
+    ) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{
+            IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr, TcpSeqNumber,
+        };
+
+        let tcp = TcpRepr {
+            src_port,
+            dst_port,
+            control,
+            seq_number: TcpSeqNumber(seq),
+            ack_number: ack.map(TcpSeqNumber),
+            window_len: 4096,
+            window_scale: None,
+            max_seg_size: None,
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut bytes = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        {
+            let mut ip_packet = Ipv4Packet::new_unchecked(&mut bytes);
+            ip.emit(&mut ip_packet, &ChecksumCapabilities::default());
+            let mut tcp_packet = TcpPacket::new_unchecked(ip_packet.payload_mut());
+            tcp.emit(
+                &mut tcp_packet,
+                &IpAddress::Ipv4(src),
+                &IpAddress::Ipv4(dst),
+                &ChecksumCapabilities::default(),
+            );
+        }
+        bytes
+    }
+
+    fn parse_tcp_seq(packet: &[u8]) -> i32 {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{IpAddress, Ipv4Packet, Ipv4Repr, TcpPacket, TcpRepr};
+
+        let ip_packet = Ipv4Packet::new_checked(packet).unwrap();
+        let ip = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).unwrap();
+        let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).unwrap();
+        let tcp = TcpRepr::parse(
+            &tcp_packet,
+            &IpAddress::Ipv4(ip.src_addr),
+            &IpAddress::Ipv4(ip.dst_addr),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        tcp.seq_number.0
+    }
+
+    fn drive_inbound_handshake(
+        iface: &mut ManagedInterface,
+        driver: &TestDriver,
+        listener: ProtocolSocketHandle,
+        client_port: u16,
+        server_port: u16,
+    ) {
+        let server = smoltcp::wire::Ipv4Address::new(127, 0, 0, 1);
+        let client = smoltcp::wire::Ipv4Address::new(127, 0, 0, 2);
+        driver.push_rx(build_tcp_packet(
+            client,
+            server,
+            client_port,
+            server_port,
+            10_000,
+            None,
+            smoltcp::wire::TcpControl::Syn,
+        ));
+        assert!(iface.poll(NetInstant::ZERO));
+        assert_eq!(
+            iface.tcp_socket(listener).state(),
+            smoltcp::socket::tcp::State::SynReceived
+        );
+        let server_seq = parse_tcp_seq(&driver.last_tx());
+
+        driver.push_rx(build_tcp_packet(
+            client,
+            server,
+            client_port,
+            server_port,
+            10_001,
+            Some(server_seq.wrapping_add(1)),
+            smoltcp::wire::TcpControl::None,
+        ));
+        assert!(iface.poll(NetInstant::from_millis(1)));
+        assert_eq!(
+            iface.tcp_socket(listener).state(),
+            smoltcp::socket::tcp::State::Established
+        );
     }
 
     #[test]
@@ -948,5 +1207,118 @@ mod tests {
 
         assert!(iface.handle_is_live(tcp));
         assert!(iface.handle_is_closed(forged_udp));
+    }
+
+    #[test]
+    fn pending_accept_queue_records_established_listener_once() {
+        let driver = Arc::new(TestDriver::default());
+        let (iface_id, mut iface) = test_interface_with_driver(driver.clone(), 8);
+        let tuning = NetTuning::defaults();
+        let listener = iface.add_tcp_socket(tuning.tcp);
+        let listen_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
+        iface
+            .tcp_socket_mut(listener)
+            .listen(listen_endpoint)
+            .unwrap();
+
+        drive_inbound_handshake(&mut iface, &driver, listener, 40_000, 8080);
+        iface.refresh_pending_tcp_accepts();
+        iface.refresh_pending_tcp_accepts();
+
+        assert_eq!(iface.pending_accepted.len(), 1);
+        assert_eq!(
+            iface.pending_tcp_accept(listener, listen_endpoint),
+            Some(listener)
+        );
+        let accepted = iface
+            .make_handle(iface_id, listener, SocketType::Tcp)
+            .unwrap();
+        assert!(iface.handle_is_live(accepted));
+    }
+
+    #[test]
+    fn pending_accept_queue_prunes_accepted_and_removed_sockets() {
+        let driver = Arc::new(TestDriver::default());
+        let (_iface_id, mut iface) = test_interface_with_driver(driver.clone(), 8);
+        let tuning = NetTuning::defaults();
+        let listener = iface.add_tcp_socket(tuning.tcp);
+        let listen_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
+        iface
+            .tcp_socket_mut(listener)
+            .listen(listen_endpoint)
+            .unwrap();
+
+        drive_inbound_handshake(&mut iface, &driver, listener, 40_001, 8080);
+        assert_eq!(iface.pending_accepted.len(), 1);
+        iface.mark_socket_accepted(listener);
+        assert!(iface.pending_accepted.is_empty());
+        assert_eq!(iface.pending_tcp_accept(listener, listen_endpoint), None);
+
+        let listener = iface.add_tcp_socket(tuning.tcp);
+        iface
+            .tcp_socket_mut(listener)
+            .listen(listen_endpoint)
+            .unwrap();
+        drive_inbound_handshake(&mut iface, &driver, listener, 40_002, 8080);
+        assert_eq!(iface.pending_accepted.len(), 1);
+        iface.remove_socket_locked(listener);
+        assert!(iface.pending_accepted.is_empty());
+    }
+
+    #[test]
+    fn pending_accept_queue_respects_backlog_limit() {
+        let (_iface_id, mut iface) = test_interface_with_backlog(1);
+        let tuning = NetTuning::defaults();
+
+        let first = iface.add_tcp_socket(tuning.tcp);
+        let second = iface.add_tcp_socket(tuning.tcp);
+        let first_raw = first.into_smoltcp();
+        let second_raw = second.into_smoltcp();
+        iface.pending_accepted.push(first_raw);
+        iface.enqueue_pending_tcp_accept(second_raw);
+
+        assert_eq!(iface.pending_accepted.len(), 1);
+        assert_eq!(iface.pending_accepted[0], first_raw);
+        iface.remove_pending_tcp_accept(first_raw);
+        iface.enqueue_pending_tcp_accept(second_raw);
+        assert_eq!(iface.pending_accepted, vec![second_raw]);
+    }
+
+    #[test]
+    fn pending_accept_query_keeps_preferred_visible_when_queue_is_full() {
+        let driver = Arc::new(TestDriver::default());
+        let (_iface_id, mut iface) = test_interface_with_driver(driver.clone(), 1);
+        let tuning = NetTuning::defaults();
+        let first_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
+        let second_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8081,
+        };
+
+        let first = iface.add_tcp_socket(tuning.tcp);
+        iface.tcp_socket_mut(first).listen(first_endpoint).unwrap();
+        drive_inbound_handshake(&mut iface, &driver, first, 40_003, first_endpoint.port);
+        assert_eq!(iface.pending_accepted.len(), 1);
+
+        let second = iface.add_tcp_socket(tuning.tcp);
+        iface
+            .tcp_socket_mut(second)
+            .listen(second_endpoint)
+            .unwrap();
+        drive_inbound_handshake(&mut iface, &driver, second, 40_004, second_endpoint.port);
+        assert_eq!(iface.pending_accepted.len(), 1);
+        assert_eq!(
+            iface.pending_tcp_accept(second, second_endpoint),
+            Some(second)
+        );
     }
 }

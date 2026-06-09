@@ -111,7 +111,7 @@ impl NetStack {
     /// 此操作短暂持有写锁，会暂停所有正在进行的 poll。
     pub fn attach(&self, dev: Arc<NetDevice>, config: IfConfig) -> Result<(), NetError> {
         let id = dev.id();
-        let managed = ManagedInterface::new(dev, config.clone());
+        let managed = ManagedInterface::new(dev, config.clone(), self.tuning.tcp_listen);
         let mut table = self.interfaces.write();
         if table.contains_key(&id) {
             return Err(NetError::InterfaceExists);
@@ -1121,7 +1121,7 @@ impl NetStack {
     pub fn socket_remove(&self, handle: NetSocketHandle) {
         let table = self.interfaces.read();
         if let Some(iface_lock) = table.get(&handle.iface_id) {
-            let managed = iface_lock.lock();
+            let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
                 managed.soft_remove_socket(handle.inner);
             }
@@ -1298,7 +1298,7 @@ impl NetStack {
             let iface_lock = table
                 .get(&handle.iface_id)
                 .ok_or(NetError::InterfaceNotFound)?;
-            let managed = iface_lock.lock();
+            let mut managed = iface_lock.lock();
             if !managed.handle_is_live(handle) {
                 return Err(NetError::WouldBlock);
             }
@@ -1332,7 +1332,7 @@ impl NetStack {
         let Some(iface_lock) = table.get(&handle.iface_id) else {
             return false;
         };
-        let managed = iface_lock.lock();
+        let mut managed = iface_lock.lock();
         if !managed.handle_is_live(handle) {
             return false;
         }

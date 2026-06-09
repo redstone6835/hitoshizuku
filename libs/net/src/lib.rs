@@ -68,4 +68,6 @@ pub use stack::{
     IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, InterfaceSnapshot, NeighborEntry,
 };
 pub use time::{NetDuration, NetInstant};
-pub use tuning::{EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBufferTuning};
+pub use tuning::{
+    EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBufferTuning, TcpListenTuning,
+};
