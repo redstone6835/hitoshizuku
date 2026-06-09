@@ -10,6 +10,7 @@ use errno::Errno;
 use general::mm::{copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::{current_fdtable, current_vfs_context, namespace_path};
+use hal::abi::{decode_dev_t, encode_dev_t};
 use sched::{SigProcMaskHow, SigSet};
 use vfs::cred::{Gid, Uid};
 use vfs::error::VfsError;
@@ -20,7 +21,6 @@ use vfs::operation;
 use vfs::path::Dirfd;
 use vfs::socket as vfs_socket;
 use vfs::stat::{DevId, FileMode, FileStat, FileType, FsStat, Timespec};
-use hal::abi::{ decode_dev_t, encode_dev_t };
 
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
 const COPY_CHUNK: usize = 2048;
@@ -2150,6 +2150,7 @@ fn deliver_sigpipe() {
         code: 0,
         sender_pid: task.pid_root().unwrap_or(0),
         sender_uid: creds.uid,
+        raw: None,
     };
     task.signal.deliver(info);
     sched::signal_wakeup(&task, &info);

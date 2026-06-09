@@ -4,6 +4,7 @@ pub mod devtmpfs;
 pub mod loop_devnode;
 pub mod mount_source;
 pub mod net_ioctl;
+pub mod pidfd;
 pub mod posix_compat;
 pub mod procfs;
 pub mod rtc_devnode;

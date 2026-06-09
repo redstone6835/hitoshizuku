@@ -175,13 +175,17 @@ impl Default for SigAction {
     }
 }
 
-/// siginfo 的最小字段集。
+/// siginfo 的内核表示。
+///
+/// `raw` 用于保留 `rt_sigqueueinfo`/`rt_tgsigqueueinfo` 这类用户态排队信号的
+/// 完整 Linux ABI payload；内核自生成信号只填 typed 字段并保持 `raw = None`。
 #[derive(Debug, Clone, Copy)]
 pub struct SigInfo {
     pub sig: SignalNumber,
     pub code: i32,
     pub sender_pid: PidT,
     pub sender_uid: Uid,
+    pub raw: Option<[u8; 128]>,
 }
 
 /// 默认动作分类。
