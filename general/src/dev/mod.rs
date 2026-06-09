@@ -26,6 +26,7 @@ pub mod flash;
 pub mod function;
 pub mod fwcfg;
 pub mod irq;
+pub mod loopdev;
 pub mod msi;
 pub mod naming;
 pub mod net;

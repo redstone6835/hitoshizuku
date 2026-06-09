@@ -79,6 +79,18 @@ pub fn register_core_filesystems(tag: &str) {
             tag, err
         )
     });
+    general::vfs::loop_devnode::register_devtmpfs_adapter().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register loop devtmpfs adapter: {:?}",
+            tag, err
+        )
+    });
+    general::vfs::loop_devnode::register_control_node().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register loop-control devtmpfs node: {:?}",
+            tag, err
+        )
+    });
 }
 
 /// 创建并发布 devtmpfs 单例 superblock。

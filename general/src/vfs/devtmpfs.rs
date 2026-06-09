@@ -499,6 +499,31 @@ fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
     guard.as_ref().map(|sb| Arc::clone(*sb))
 }
 
+/// 将非 PnP 设备声明的 `/dev` 投影绑定到当前 devtmpfs 单例。
+///
+/// loop 这类虚拟设备没有固件 backing device，不能走 `PnpDevice::register_function()`；
+/// 但它仍应通过同一组 [`DevNodeSpec`] 进入 devtmpfs，避免在文件系统核心里新增
+/// 设备类型分支。调用方负责先完成底层 function registry 的事务注册。
+pub fn bind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
+    let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(VfsError::InvalidArgument)?;
+    ops.bind_nodes(nodes)
+}
+
+/// 解绑非 PnP 设备声明的 `/dev` 投影。
+///
+/// 这是 [`bind_dynamic_devnodes`] 的对称入口，供虚拟设备释放时使用；底层设备
+/// 对象和 function registry 的清理仍由调用方按自己的生命周期顺序完成。
+pub fn unbind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
+    let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(VfsError::InvalidArgument)?;
+    ops.unbind_nodes(nodes)
+}
+
 fn publish_devtmpfs_sb(dev_sb: Arc<Superblock>) -> (Arc<Superblock>, bool) {
     let mut guard = DEVTMPFS_SINGLETON_SB.lock();
     if let Some(existing) = guard.as_ref() {
@@ -546,6 +571,17 @@ fn map_control_errno(e: ControlError) -> Errno {
         ControlError::Busy => Errno::EBUSY,
         ControlError::Io => Errno::EIO,
         ControlError::Permission => Errno::EPERM,
+    }
+}
+
+fn map_control_vfs(e: ControlError) -> VfsError {
+    match e {
+        ControlError::Unsupported => VfsError::NotSupported,
+        ControlError::Invalid => VfsError::InvalidArgument,
+        ControlError::NoDevice => VfsError::NoDevice,
+        ControlError::Busy => VfsError::DeviceBusy,
+        ControlError::Io => VfsError::Io,
+        ControlError::Permission => VfsError::PermissionDenied,
     }
 }
 
@@ -1528,8 +1564,12 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
-fn block_capacity_remaining(dev: &BlockDevice, offset: u64, len: usize) -> usize {
-    let Some(capacity) = dev.geometry().capacity_bytes() else {
+fn block_capacity_remaining(dev: &Arc<BlockDevice>, offset: u64, len: usize) -> usize {
+    let capacity = match dev.control(BlockControlRequest::GetCapacityBytes) {
+        Ok(BlockControlResponse::U64(value)) => Some(value),
+        _ => dev.geometry().capacity_bytes(),
+    };
+    let Some(capacity) = capacity else {
         return len;
     };
     if offset >= capacity {
@@ -1742,6 +1782,9 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
         }
+        if let Some(result) = crate::vfs::loop_devnode::try_loop_block_ioctl(&self.dev, cmd, arg) {
+            return result;
+        }
 
         match cmd.raw() {
             BLKROGET => {
@@ -1864,7 +1907,9 @@ impl FileOps for BlockDevFileOps {
         }
     }
 
-    fn release(&self) {}
+    fn release(&self) {
+        self.dev.release_file();
+    }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -1885,6 +1930,7 @@ impl InodeOps for DevBlockOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        self.dev.open_file().map_err(map_control_vfs)?;
         Ok(Box::new(BlockDevFileOps {
             dev: Arc::clone(&self.dev),
             sync_writes: opts.sync,
