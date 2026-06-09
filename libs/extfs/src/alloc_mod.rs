@@ -22,9 +22,9 @@ fn alloc_bit_in_bitmap(
     bitmap_block: u64,
     bits_in_group: u32,
     start_hint: u32,
+    bm: &mut [u8],
 ) -> Result<Option<u32>, BlockBackendError> {
-    let mut bm = vec![0u8; state.ext_sb.block_size as usize];
-    state.read_block(bitmap_block, &mut bm)?;
+    state.read_block(bitmap_block, bm)?;
 
     let start = start_hint.min(bits_in_group);
     let nr = find_zero_bit(&bm, start, bits_in_group)
@@ -88,9 +88,9 @@ fn clear_bit_in_bitmap(
     state: &FsState,
     bitmap_block: u64,
     bit: u32,
+    bm: &mut [u8],
 ) -> Result<(), BlockBackendError> {
-    let mut bm = vec![0u8; state.ext_sb.block_size as usize];
-    state.read_block(bitmap_block, &mut bm)?;
+    state.read_block(bitmap_block, bm)?;
     let byte_idx = (bit / 8) as usize;
     let mask = 1u8 << (bit % 8) as u8;
     if bm[byte_idx] & mask == 0 {
@@ -117,6 +117,7 @@ pub(crate) fn alloc_blocks_run(
 ) -> Result<(u64, u32), BlockBackendError> {
     let _g = ALLOC_LOCK.lock();
     let sb = &state.ext_sb;
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
     let start_rel = state.block_alloc_hint.load(Ordering::Relaxed);
     let start_group = if sb.groups_count == 0 {
         0
@@ -142,7 +143,14 @@ pub(crate) fn alloc_blocks_run(
         } else {
             0
         };
-        let got = alloc_run_in_bitmap(state, bmap, bits_in_group, start_bit, want)?;
+        let got = alloc_run_in_bitmap(
+            state,
+            bmap,
+            bits_in_group,
+            start_bit,
+            want,
+            &mut bitmap_scratch,
+        )?;
         if let Some((nr, count)) = got {
             let phys =
                 sb.first_data_block as u64 + group as u64 * sb.blocks_per_group as u64 + nr as u64;
@@ -163,9 +171,9 @@ fn alloc_run_in_bitmap(
     bits_in_group: u32,
     start_hint: u32,
     want: u32,
+    bm: &mut [u8],
 ) -> Result<Option<(u32, u32)>, BlockBackendError> {
-    let mut bm = vec![0u8; state.ext_sb.block_size as usize];
-    state.read_block(bitmap_block, &mut bm)?;
+    state.read_block(bitmap_block, bm)?;
 
     let start = start_hint.min(bits_in_group);
     let result = choose_zero_run(&bm, start, bits_in_group, want);
@@ -321,6 +329,7 @@ mod tests {
 pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackendError> {
     let _g = ALLOC_LOCK.lock();
     let sb = &state.ext_sb;
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
     if block < sb.first_data_block as u64 {
         return Err(BlockBackendError::OutOfRange);
     }
@@ -328,7 +337,7 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     let group = (rel / sb.blocks_per_group as u64) as u32;
     let in_group = (rel % sb.blocks_per_group as u64) as u32;
     let gd = state.group_desc_mut(group)?;
-    clear_bit_in_bitmap(state, gd.block_bitmap, in_group)?;
+    clear_bit_in_bitmap(state, gd.block_bitmap, in_group, &mut bitmap_scratch)?;
     state.block_alloc_hint.store(
         group as u64 * sb.blocks_per_group as u64 + in_group as u64,
         Ordering::Relaxed,
@@ -342,6 +351,7 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
 pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBackendError> {
     let _g = ALLOC_LOCK.lock();
     let sb = &state.ext_sb;
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
     let start_rel = state.inode_alloc_hint.load(Ordering::Relaxed);
     let start_group = if sb.groups_count == 0 {
         0
@@ -359,7 +369,13 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
         } else {
             0
         };
-        let nr = alloc_bit_in_bitmap(state, gd.inode_bitmap, sb.inodes_per_group, start_bit)?;
+        let nr = alloc_bit_in_bitmap(
+            state,
+            gd.inode_bitmap,
+            sb.inodes_per_group,
+            start_bit,
+            &mut bitmap_scratch,
+        )?;
         if let Some(nr) = nr {
             let ino = group * sb.inodes_per_group + nr + 1;
             state
@@ -382,10 +398,11 @@ pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), 
         return Ok(());
     }
     let sb = &state.ext_sb;
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
     let group = (ino - 1) / sb.inodes_per_group;
     let in_group = (ino - 1) % sb.inodes_per_group;
     let gd = state.group_desc_mut(group)?;
-    clear_bit_in_bitmap(state, gd.inode_bitmap, in_group)?;
+    clear_bit_in_bitmap(state, gd.inode_bitmap, in_group, &mut bitmap_scratch)?;
     state
         .inode_alloc_hint
         .store(group * sb.inodes_per_group + in_group, Ordering::Relaxed);
