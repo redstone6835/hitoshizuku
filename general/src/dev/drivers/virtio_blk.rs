@@ -9,8 +9,8 @@
 //! PnP 适配层只负责匹配固件枚举的 `virtio,mmio` / `LNRO0005` 设备，并把成功
 //! 初始化的块设备封装成通用 function 注册给设备 core。
 
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use core::mem;
 use core::num::NonZeroU32;
@@ -108,7 +108,6 @@ struct VirtioBlkReqMeta {
 }
 
 struct PendingVirtioRequest {
-    head: u16,
     bio: Bio,
     meta_dma: DmaBuffer,
     data_dma: Option<DmaBuffer>,
@@ -119,13 +118,52 @@ struct PendingVirtioRequest {
 struct VirtioBlkQueue {
     /// 公共 split virtqueue 负责 DMA 布局、描述符状态和 ring 索引维护。
     queue: SplitVirtQueue,
-    /// 待处理请求队列。
-    pending: VecDeque<PendingVirtioRequest>,
+    /// 描述符 head 到在途请求的直接映射。
+    ///
+    /// bench 的 L1/L2 裸块设备测试会放大每次完成的 CPU 开销。used ring 已经返回
+    /// descriptor head，用固定表 O(1) 取回请求，避免中断/轮询热路径随队列深度线性扫描。
+    pending: Vec<Option<PendingVirtioRequest>>,
+    /// 队列协议错误后拒绝新请求；此时设备已被标记 FAILED。
+    failed: bool,
 }
 
 // Safety: VirtioBlkQueue 的裸指针指向 DMA 内存，由 Mutex 保护并发访问
 unsafe impl Send for VirtioBlkQueue {}
 unsafe impl Sync for VirtioBlkQueue {}
+
+impl VirtioBlkQueue {
+    fn new(queue: SplitVirtQueue) -> Self {
+        let mut pending = Vec::with_capacity(usize::from(queue.queue_size()));
+        pending.resize_with(usize::from(queue.queue_size()), || None);
+        Self {
+            queue,
+            pending,
+            failed: false,
+        }
+    }
+
+    fn take_pending(&mut self, head: u16) -> Option<PendingVirtioRequest> {
+        self.pending
+            .get_mut(usize::from(head))
+            .and_then(Option::take)
+    }
+
+    fn set_pending(&mut self, head: u16, pending: PendingVirtioRequest) {
+        let slot = self
+            .pending
+            .get_mut(usize::from(head))
+            .expect("virtio block pending head out of range");
+        debug_assert!(slot.is_none());
+        *slot = Some(pending);
+    }
+
+    fn mark_failed_and_take_pending(&mut self) -> Vec<Option<PendingVirtioRequest>> {
+        self.failed = true;
+        let mut failed = Vec::new();
+        mem::swap(&mut failed, &mut self.pending);
+        failed
+    }
+}
 
 struct VirtioBlkInner {
     /// MMIO 基地址
@@ -331,18 +369,15 @@ impl VirtioBlk {
             base: mmio_base,
             capacity,
             block_size,
-            queue: Mutex::new(VirtioBlkQueue {
-                queue: split_queue,
-                pending: VecDeque::new(),
-            }),
+            queue: Mutex::new(VirtioBlkQueue::new(split_queue)),
             irq_count: AtomicUsize::new(0),
         });
 
         Ok(Self { inner })
     }
 
-    fn complete_failed_requests(mut pending: VecDeque<PendingVirtioRequest>, error: BioIoError) {
-        while let Some(pending) = pending.pop_front() {
+    fn complete_failed_requests(pending: Vec<Option<PendingVirtioRequest>>, error: BioIoError) {
+        for pending in pending.into_iter().flatten() {
             pending.bio.complete(Err(error));
         }
     }
@@ -351,15 +386,12 @@ impl VirtioBlk {
         &self,
         queue: &mut VirtioBlkQueue,
         reason: &'static str,
-    ) -> VecDeque<PendingVirtioRequest> {
+    ) -> Vec<Option<PendingVirtioRequest>> {
         log::printk!("[virtio-mmio-blk] queue failed: {}", reason);
         let status = self.inner.read_reg(MMIO_STATUS);
         self.inner
             .write_reg(MMIO_STATUS, status | VIRTIO_STATUS_FAILED);
-
-        let mut failed = VecDeque::new();
-        mem::swap(&mut failed, &mut queue.pending);
-        failed
+        queue.mark_failed_and_take_pending()
     }
 
     /// 轮询并处理已完成的请求
@@ -378,12 +410,8 @@ impl VirtioBlk {
                 }
             };
             let desc_head = used.head;
-            // 查找对应的待处理请求
-            let Some(pos) = queue
-                .pending
-                .iter()
-                .position(|pending| pending.head == desc_head)
-            else {
+            // used ring 回报 descriptor head，pending 表按同一编号直接索引。
+            let Some(pending) = queue.take_pending(desc_head) else {
                 log::printk!(
                     "[virtio-mmio-blk] used head {} has no pending request",
                     desc_head
@@ -401,11 +429,7 @@ impl VirtioBlk {
                 mut bio,
                 meta_dma,
                 data_dma,
-                ..
-            } = match queue.pending.remove(pos) {
-                Some(pending) => pending,
-                None => continue,
-            };
+            } = pending;
             core::sync::atomic::fence(Ordering::Acquire);
             meta_dma.sync_for_cpu();
             let status = unsafe {
@@ -518,6 +542,9 @@ impl BlockDriver for VirtioBlkIo {
         // 进来先尝试 drain 一下硬件已完成的请求，给后面的提交腾描述符。
         self.driver.poll();
         let mut queue = self.driver.inner.queue.lock();
+        if queue.failed {
+            return Err((SubmitError::DeviceGone, bio));
+        }
 
         // 根据请求类型确定描述符数量
         let desc_count = match bio.op {
@@ -736,17 +763,23 @@ impl BlockDriver for VirtioBlkIo {
             }
         }
 
-        // 提交到设备
+        queue.set_pending(
+            head_idx,
+            PendingVirtioRequest {
+                bio,
+                meta_dma,
+                data_dma,
+            },
+        );
+
+        // 先登记 pending，再把 head 发布到 available ring，避免设备极快完成时找不到请求。
         if queue.queue.push_avail(head_idx).is_err() {
+            let pending = queue
+                .take_pending(head_idx)
+                .expect("virtio block pending disappeared before publish failure");
             let _ = queue.queue.free_chain(chain);
-            return Err((SubmitError::QueueFull, bio));
+            return Err((SubmitError::QueueFull, pending.bio));
         }
-        queue.pending.push_back(PendingVirtioRequest {
-            head: head_idx,
-            bio,
-            meta_dma,
-            data_dma,
-        });
 
         // 通知设备
         drop(queue);

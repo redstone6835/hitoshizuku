@@ -18,8 +18,8 @@
 //! remove 路径把 device status 写 0，释放队列 DMA 页，`BlockDev` 的
 //! `mark_gone` 由 PnP 框架统一处理。
 
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::mem;
 use core::num::NonZeroU32;
 use core::ptr::read_volatile;
@@ -87,11 +87,16 @@ struct VirtioBlkReqMeta {
 
 struct VirtioBlkQueue {
     queue: SplitVirtQueue,
-    pending: VecDeque<PendingVirtioPciRequest>,
+    /// descriptor head 到在途 BIO 的直接映射。
+    ///
+    /// L1/L2 块设备 bench 关注每个 I/O 的提交与完成成本。设备完成时已经返回 head，
+    /// 因此用固定槽位表 O(1) 找回请求，避免在轮询/中断路径按队列深度线性扫描。
+    pending: Vec<Option<PendingVirtioPciRequest>>,
+    /// 队列协议错误后不再接受新请求，保持与 FAILED 设备状态一致。
+    failed: bool,
 }
 
 struct PendingVirtioPciRequest {
-    head: u16,
     bio: Bio,
     meta_dma: DmaBuffer,
     data_dma: Option<DmaBuffer>,
@@ -100,6 +105,40 @@ struct PendingVirtioPciRequest {
 // Safety: DMA 指针由 Mutex 串行化;没有共享可变别名。
 unsafe impl Send for VirtioBlkQueue {}
 unsafe impl Sync for VirtioBlkQueue {}
+
+impl VirtioBlkQueue {
+    fn new(queue: SplitVirtQueue) -> Self {
+        let mut pending = Vec::with_capacity(usize::from(queue.queue_size()));
+        pending.resize_with(usize::from(queue.queue_size()), || None);
+        Self {
+            queue,
+            pending,
+            failed: false,
+        }
+    }
+
+    fn take_pending(&mut self, head: u16) -> Option<PendingVirtioPciRequest> {
+        self.pending
+            .get_mut(usize::from(head))
+            .and_then(Option::take)
+    }
+
+    fn set_pending(&mut self, head: u16, pending: PendingVirtioPciRequest) {
+        let slot = self
+            .pending
+            .get_mut(usize::from(head))
+            .expect("virtio pci block pending head out of range");
+        debug_assert!(slot.is_none());
+        *slot = Some(pending);
+    }
+
+    fn mark_failed_and_take_pending(&mut self) -> Vec<Option<PendingVirtioPciRequest>> {
+        self.failed = true;
+        let mut failed = Vec::new();
+        mem::swap(&mut failed, &mut self.pending);
+        failed
+    }
+}
 
 // ── 驱动主结构 ──────────────────────────────────────────────────────────
 
@@ -256,10 +295,7 @@ impl VirtioBlkPci {
         let read_only = driver_features & VIRTIO_BLK_F_RO != 0;
         let has_flush = driver_features & VIRTIO_BLK_F_FLUSH != 0;
 
-        let queue = VirtioBlkQueue {
-            queue: split_queue,
-            pending: VecDeque::new(),
-        };
+        let queue = VirtioBlkQueue::new(split_queue);
 
         let inner = Arc::new(VirtioBlkInner {
             transport,
@@ -275,8 +311,8 @@ impl VirtioBlkPci {
         Ok(Self { inner })
     }
 
-    fn complete_failed_requests(mut pending: VecDeque<PendingVirtioPciRequest>, error: BioIoError) {
-        while let Some(pending) = pending.pop_front() {
+    fn complete_failed_requests(pending: Vec<Option<PendingVirtioPciRequest>>, error: BioIoError) {
+        for pending in pending.into_iter().flatten() {
             pending.bio.complete(Err(error));
         }
     }
@@ -285,15 +321,12 @@ impl VirtioBlkPci {
         &self,
         queue: &mut VirtioBlkQueue,
         reason: &'static str,
-    ) -> VecDeque<PendingVirtioPciRequest> {
+    ) -> Vec<Option<PendingVirtioPciRequest>> {
         log::printk!("[virtio-pci-blk] queue failed: {}", reason);
         self.inner
             .transport
             .set_status(self.inner.transport.status() | VIRTIO_STATUS_FAILED);
-
-        let mut failed = VecDeque::new();
-        mem::swap(&mut failed, &mut queue.pending);
-        failed
+        queue.mark_failed_and_take_pending()
     }
 
     /// 轮询并处理已完成的请求。与 MMIO 版对称。
@@ -311,14 +344,7 @@ impl VirtioBlkPci {
                 }
             };
             let desc_head = used.head;
-            if let Some(pos) = queue
-                .pending
-                .iter()
-                .position(|pending| pending.head == desc_head)
-            {
-                let Some(mut pending) = queue.pending.remove(pos) else {
-                    continue;
-                };
+            if let Some(mut pending) = queue.take_pending(desc_head) {
                 core::sync::atomic::fence(Ordering::Acquire);
                 pending.meta_dma.sync_for_cpu();
                 let status = unsafe {
@@ -453,6 +479,9 @@ impl BlockDriver for VirtioBlkPciIo {
     fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)> {
         self.driver.poll();
         let mut queue = self.driver.inner.queue.lock();
+        if queue.failed {
+            return Err((SubmitError::DeviceGone, bio));
+        }
 
         let desc_count = match bio.op {
             BioOp::Read | BioOp::Write => 3,
@@ -671,18 +700,23 @@ impl BlockDriver for VirtioBlkPciIo {
             }
         }
 
-        // 提交到 available ring，交给设备消费。
-        if queue.queue.push_avail(head_idx).is_err() {
-            let _ = queue.queue.free_chain(chain);
-            return Err((SubmitError::QueueFull, bio));
-        }
+        queue.set_pending(
+            head_idx,
+            PendingVirtioPciRequest {
+                bio,
+                meta_dma,
+                data_dma,
+            },
+        );
 
-        queue.pending.push_back(PendingVirtioPciRequest {
-            head: head_idx,
-            bio,
-            meta_dma,
-            data_dma,
-        });
+        // 先登记 pending，再发布到 available ring；设备完成时按同一 head O(1) 找回 BIO。
+        if queue.queue.push_avail(head_idx).is_err() {
+            let pending = queue
+                .take_pending(head_idx)
+                .expect("virtio pci block pending disappeared before publish failure");
+            let _ = queue.queue.free_chain(chain);
+            return Err((SubmitError::QueueFull, pending.bio));
+        }
         drop(queue);
         self.notify_queue();
         Ok(())
