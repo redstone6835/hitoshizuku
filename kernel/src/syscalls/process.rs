@@ -1069,7 +1069,8 @@ fn nice_floor_from_rlimit(task: &Arc<Task>) -> i32 {
 pub(super) fn sys_sched_getparam(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let param_user = ctx.args[1];
-    let attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
     if param_user != 0 {
         let mut out = [0u8; 4];
         out[0..4].copy_from_slice(&(attr.priority as i32).to_le_bytes());
@@ -1087,7 +1088,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
-    let task = sched::operation::task_by_pid(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
     let old = task.sched.sched_attr();
     let mut attr = old;
     match attr.policy {
@@ -1111,7 +1112,8 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
 
 pub(super) fn sys_sched_getscheduler(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
-    let attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
     Ok(encode_linux_sched_policy(attr.policy))
 }
 
@@ -1133,7 +1135,7 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     {
         return Err(Errno::EINVAL);
     }
-    let task = sched::operation::task_by_pid(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
     let old = task.sched.sched_attr();
     let attr = SchedAttr {
         policy,
@@ -1158,7 +1160,8 @@ pub(super) fn sys_sched_getaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
         return Err(Errno::EINVAL);
     }
 
-    let affinity = sched::operation::sched_getaffinity(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
+    let affinity = sched::operation::sched_getaffinity_for_task(&task);
     let mut mask = Vec::new();
     mask.resize(cpusetsize, 0);
     write_cpuset_mask(&mut mask, affinity);
@@ -1177,7 +1180,7 @@ pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let mut mask = Vec::new();
     mask.resize(cpusetsize, 0);
     copy_from_user(mask_user, &mut mask).map_err(|e| e.as_errno())?;
-    let task = sched::operation::task_by_pid(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
     check_sched_target_permission(&ctx.task, &task)?;
     sched::operation::sched_setaffinity_for_task(&task, read_cpuset_mask(&mask))?;
     Ok(0)
@@ -1290,7 +1293,8 @@ pub(super) fn sys_sched_rr_get_interval(ctx: &mut SyscallContext<'_>) -> Result<
     if tp == 0 {
         return Err(Errno::EFAULT);
     }
-    let attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
     let interval_ns = if attr.slice_ns == 0 {
         sched::DEFAULT_RR_SLICE_NS
     } else {
@@ -1311,7 +1315,7 @@ pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         return Err(Errno::EINVAL);
     }
     let attr = read_linux_sched_attr(attr_user)?;
-    let task = sched::operation::task_by_pid(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
     let old = task.sched.sched_attr();
     check_sched_attr_permission(&ctx.task, &task, old, attr)?;
     sched::operation::sched_setattr_for_task(&task, attr)?;
@@ -1398,9 +1402,21 @@ pub(super) fn sys_sched_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
-    let attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, &ctx.task)?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
     write_linux_sched_attr(attr_user, size, attr)?;
     Ok(0)
+}
+
+/// 解析调度 syscall 的 `pid` 参数：0 表示当前线程，负数按 Linux 返回 EINVAL。
+fn sched_task_from_pid(pid: i32, caller: &Arc<Task>) -> Result<Arc<Task>, Errno> {
+    if pid == 0 {
+        Ok(Arc::clone(caller))
+    } else if pid > 0 {
+        sched::operation::task_by_pid(pid)
+    } else {
+        Err(Errno::EINVAL)
+    }
 }
 
 fn decode_linux_sched_policy(raw: usize) -> Result<SchedPolicy, Errno> {

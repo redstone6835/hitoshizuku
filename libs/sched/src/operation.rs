@@ -351,11 +351,21 @@ pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), E
 }
 
 pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
-    Ok(lookup_pid(pid)?.sched.sched_attr())
+    let task = lookup_pid(pid)?;
+    Ok(sched_getattr_for_task(&task))
+}
+
+pub fn sched_getattr_for_task(task: &Arc<Task>) -> SchedAttr {
+    task.sched.sched_attr()
 }
 
 pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
-    Ok(lookup_pid(pid)?.cpu_affinity() & supported_cpu_mask())
+    let task = lookup_pid(pid)?;
+    Ok(sched_getaffinity_for_task(&task))
+}
+
+pub fn sched_getaffinity_for_task(task: &Arc<Task>) -> u64 {
+    task.cpu_affinity() & supported_cpu_mask()
 }
 
 pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
