@@ -1134,10 +1134,11 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     {
         return Err(Errno::EINVAL);
     }
+    let old = sched::operation::sched_getattr(pid)?;
     let attr = SchedAttr {
         policy,
-        nice: 0,
-        slice_ns: 0,
+        nice: old.nice,
+        slice_ns: old.slice_ns,
         priority: priority as u8,
         runtime_ns: 0,
         deadline_ns: 0,
@@ -1288,7 +1289,7 @@ pub(super) fn sys_sched_rr_get_interval(ctx: &mut SyscallContext<'_>) -> Result<
     }
     let attr = sched::operation::sched_getattr(pid)?;
     let interval_ns = if attr.slice_ns == 0 {
-        100_000_000
+        sched::DEFAULT_RR_SLICE_NS
     } else {
         attr.slice_ns
     };
