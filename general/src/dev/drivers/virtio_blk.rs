@@ -118,6 +118,11 @@ struct PendingVirtioRequest {
 struct VirtioBlkQueue {
     /// 公共 split virtqueue 负责 DMA 布局、描述符状态和 ring 索引维护。
     queue: SplitVirtQueue,
+    /// 请求头/status 的小 DMA 缓冲复用池。
+    ///
+    /// L1/L2 小 I/O 会把每次 BIO 的元数据 DMA 分配成本放大。metadata 只在设备把
+    /// used ring 发布后才回收，且所有访问都在队列锁内完成，因此不会与在途请求共享。
+    meta_pool: Vec<DmaBuffer>,
     /// 描述符 head 到在途请求的直接映射。
     ///
     /// bench 的 L1/L2 裸块设备测试会放大每次完成的 CPU 开销。used ring 已经返回
@@ -135,10 +140,22 @@ impl VirtioBlkQueue {
     fn new(queue: SplitVirtQueue) -> Self {
         let mut pending = Vec::with_capacity(usize::from(queue.queue_size()));
         pending.resize_with(usize::from(queue.queue_size()), || None);
+        let meta_pool = Vec::with_capacity(usize::from(queue.queue_size()));
         Self {
             queue,
+            meta_pool,
             pending,
             failed: false,
+        }
+    }
+
+    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
+        self.meta_pool.pop()
+    }
+
+    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
+        if self.meta_pool.len() < usize::from(self.queue.queue_size()) {
+            self.meta_pool.push(meta_dma);
         }
     }
 
@@ -441,6 +458,7 @@ impl VirtioBlk {
                 VIRTIO_BLK_S_UNSUPP => Err(BioIoError::Unsupported),
                 _ => Err(BioIoError::MediaError),
             };
+            queue.recycle_meta_dma(meta_dma);
             // 读请求成功时把 DMA 区数据回拷到 Bio buffer
             if result.is_ok() && bio.op == BioOp::Read {
                 if let (BioBuffer::Owned(buf), Some(dma)) = (&mut bio.buffer, data_dma.as_ref()) {
@@ -582,18 +600,21 @@ impl BlockDriver for VirtioBlkIo {
         };
         let dma_context = queue.queue.dma_context();
 
-        // 元数据 DMA 缓冲区（请求头 + 状态字节），方向设为双向以覆盖设备写 status。
-        let meta_dma = match DmaBuffer::new_in(
-            dma_context,
-            mem::size_of::<VirtioBlkReqMeta>(),
-            mem::align_of::<VirtioBlkReqMeta>(),
-            DmaDirection::Bidirectional,
-        ) {
-            Ok(buffer) => buffer,
-            Err(_) => {
-                let _ = queue.queue.free_chain(chain);
-                return Err((SubmitError::OutOfMemory, bio));
-            }
+        // 元数据 DMA 缓冲区（请求头 + 状态字节）按队列复用，避免热路径反复分配。
+        let meta_dma = match queue.take_meta_dma() {
+            Some(buffer) => buffer,
+            None => match DmaBuffer::new_in(
+                dma_context,
+                mem::size_of::<VirtioBlkReqMeta>(),
+                mem::align_of::<VirtioBlkReqMeta>(),
+                DmaDirection::Bidirectional,
+            ) {
+                Ok(buffer) => buffer,
+                Err(_) => {
+                    let _ = queue.queue.free_chain(chain);
+                    return Err((SubmitError::OutOfMemory, bio));
+                }
+            },
         };
         let meta = VirtioBlkReqMeta {
             header: VirtioBlkReqHeader {
@@ -621,6 +642,7 @@ impl BlockDriver for VirtioBlkIo {
                     Ok(buffer) => buffer,
                     Err(_) => {
                         let _ = queue.queue.free_chain(chain);
+                        queue.recycle_meta_dma(meta_dma);
                         return Err((SubmitError::OutOfMemory, bio));
                     }
                 };
@@ -642,6 +664,7 @@ impl BlockDriver for VirtioBlkIo {
             BioOp::Read => {
                 let Some(data_dma) = data_dma.as_ref() else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -650,6 +673,7 @@ impl BlockDriver for VirtioBlkIo {
                 let (Some(d0), Some(d1), Some(d2)) = (chain.get(0), chain.get(1), chain.get(2))
                 else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -681,12 +705,14 @@ impl BlockDriver for VirtioBlkIo {
                     .is_err()
                 {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((SubmitError::QueueFull, bio));
                 }
             }
             BioOp::Write => {
                 let Some(data_dma) = data_dma.as_ref() else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -695,6 +721,7 @@ impl BlockDriver for VirtioBlkIo {
                 let (Some(d0), Some(d1), Some(d2)) = (chain.get(0), chain.get(1), chain.get(2))
                 else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -726,12 +753,14 @@ impl BlockDriver for VirtioBlkIo {
                     .is_err()
                 {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((SubmitError::QueueFull, bio));
                 }
             }
             BioOp::Flush => {
                 let (Some(d0), Some(d1)) = (chain.get(0), chain.get(1)) else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -754,11 +783,13 @@ impl BlockDriver for VirtioBlkIo {
                     .is_err()
                 {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((SubmitError::QueueFull, bio));
                 }
             }
             _ => {
                 let _ = queue.queue.free_chain(chain);
+                queue.recycle_meta_dma(meta_dma);
                 return Err((SubmitError::Unsupported, bio));
             }
         }
@@ -777,8 +808,14 @@ impl BlockDriver for VirtioBlkIo {
             let pending = queue
                 .take_pending(head_idx)
                 .expect("virtio block pending disappeared before publish failure");
+            let PendingVirtioRequest {
+                bio,
+                meta_dma,
+                data_dma: _,
+            } = pending;
             let _ = queue.queue.free_chain(chain);
-            return Err((SubmitError::QueueFull, pending.bio));
+            queue.recycle_meta_dma(meta_dma);
+            return Err((SubmitError::QueueFull, bio));
         }
 
         // 通知设备

@@ -87,6 +87,11 @@ struct VirtioBlkReqMeta {
 
 struct VirtioBlkQueue {
     queue: SplitVirtQueue,
+    /// 请求头/status 的小 DMA 缓冲复用池。
+    ///
+    /// 每个 BIO 都需要一段 header/status DMA 内存。该池只在设备发布 used ring
+    /// 之后回收对应缓冲，避免与在途请求共享，同时减少 L1/L2 小 I/O 的分配成本。
+    meta_pool: Vec<DmaBuffer>,
     /// descriptor head 到在途 BIO 的直接映射。
     ///
     /// L1/L2 块设备 bench 关注每个 I/O 的提交与完成成本。设备完成时已经返回 head，
@@ -110,10 +115,22 @@ impl VirtioBlkQueue {
     fn new(queue: SplitVirtQueue) -> Self {
         let mut pending = Vec::with_capacity(usize::from(queue.queue_size()));
         pending.resize_with(usize::from(queue.queue_size()), || None);
+        let meta_pool = Vec::with_capacity(usize::from(queue.queue_size()));
         Self {
             queue,
+            meta_pool,
             pending,
             failed: false,
+        }
+    }
+
+    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
+        self.meta_pool.pop()
+    }
+
+    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
+        if self.meta_pool.len() < usize::from(self.queue.queue_size()) {
+            self.meta_pool.push(meta_dma);
         }
     }
 
@@ -356,6 +373,7 @@ impl VirtioBlkPci {
                     VIRTIO_BLK_S_UNSUPP => Err(BioIoError::Unsupported),
                     _ => Err(BioIoError::MediaError),
                 };
+                queue.recycle_meta_dma(pending.meta_dma);
 
                 if result.is_ok() && pending.bio.op == BioOp::Read {
                     if let (BioBuffer::Owned(buf), Some(data_dma)) =
@@ -518,17 +536,20 @@ impl BlockDriver for VirtioBlkPciIo {
         };
         let dma_context = queue.queue.dma_context();
 
-        let meta_dma = match DmaBuffer::new_in(
-            dma_context,
-            mem::size_of::<VirtioBlkReqMeta>(),
-            mem::align_of::<VirtioBlkReqMeta>(),
-            DmaDirection::Bidirectional,
-        ) {
-            Ok(buffer) => buffer,
-            Err(_) => {
-                let _ = queue.queue.free_chain(chain);
-                return Err((SubmitError::OutOfMemory, bio));
-            }
+        let meta_dma = match queue.take_meta_dma() {
+            Some(buffer) => buffer,
+            None => match DmaBuffer::new_in(
+                dma_context,
+                mem::size_of::<VirtioBlkReqMeta>(),
+                mem::align_of::<VirtioBlkReqMeta>(),
+                DmaDirection::Bidirectional,
+            ) {
+                Ok(buffer) => buffer,
+                Err(_) => {
+                    let _ = queue.queue.free_chain(chain);
+                    return Err((SubmitError::OutOfMemory, bio));
+                }
+            },
         };
         let meta = VirtioBlkReqMeta {
             header: VirtioBlkReqHeader {
@@ -555,6 +576,7 @@ impl BlockDriver for VirtioBlkPciIo {
                     Ok(buffer) => buffer,
                     Err(_) => {
                         let _ = queue.queue.free_chain(chain);
+                        queue.recycle_meta_dma(meta_dma);
                         return Err((SubmitError::OutOfMemory, bio));
                     }
                 };
@@ -567,6 +589,7 @@ impl BlockDriver for VirtioBlkPciIo {
             BioOp::Flush => None,
             _ => {
                 let _ = queue.queue.free_chain(chain);
+                queue.recycle_meta_dma(meta_dma);
                 return Err((SubmitError::Unsupported, bio));
             }
         };
@@ -579,6 +602,7 @@ impl BlockDriver for VirtioBlkPciIo {
             BioOp::Read => {
                 let Some(data_dma) = data_dma.as_ref() else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -587,6 +611,7 @@ impl BlockDriver for VirtioBlkPciIo {
                 let (Some(d0), Some(d1), Some(d2)) = (chain.get(0), chain.get(1), chain.get(2))
                 else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -618,12 +643,14 @@ impl BlockDriver for VirtioBlkPciIo {
                     .is_err()
                 {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((SubmitError::QueueFull, bio));
                 }
             }
             BioOp::Write => {
                 let Some(data_dma) = data_dma.as_ref() else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -632,6 +659,7 @@ impl BlockDriver for VirtioBlkPciIo {
                 let (Some(d0), Some(d1), Some(d2)) = (chain.get(0), chain.get(1), chain.get(2))
                 else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -663,12 +691,14 @@ impl BlockDriver for VirtioBlkPciIo {
                     .is_err()
                 {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((SubmitError::QueueFull, bio));
                 }
             }
             BioOp::Flush => {
                 let (Some(d0), Some(d1)) = (chain.get(0), chain.get(1)) else {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((
                         SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
                         bio,
@@ -691,11 +721,13 @@ impl BlockDriver for VirtioBlkPciIo {
                     .is_err()
                 {
                     let _ = queue.queue.free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
                     return Err((SubmitError::QueueFull, bio));
                 }
             }
             _ => {
                 let _ = queue.queue.free_chain(chain);
+                queue.recycle_meta_dma(meta_dma);
                 return Err((SubmitError::Unsupported, bio));
             }
         }
@@ -714,8 +746,14 @@ impl BlockDriver for VirtioBlkPciIo {
             let pending = queue
                 .take_pending(head_idx)
                 .expect("virtio pci block pending disappeared before publish failure");
+            let PendingVirtioPciRequest {
+                bio,
+                meta_dma,
+                data_dma: _,
+            } = pending;
             let _ = queue.queue.free_chain(chain);
-            return Err((SubmitError::QueueFull, pending.bio));
+            queue.recycle_meta_dma(meta_dma);
+            return Err((SubmitError::QueueFull, bio));
         }
         drop(queue);
         self.notify_queue();
