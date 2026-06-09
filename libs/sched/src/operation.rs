@@ -1069,36 +1069,12 @@ pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
 }
 
 /// `setrlimit(resource, new)` 写调用者 tg 的 rlimit。
-///
-/// 校验规则照搬 Linux 6.x `kernel/sys.c::do_prlimit`：
-///   1. `new.soft ≤ new.hard`（基础不变量）
-///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时硬限制不可逆降不到
-///      "原值以下"——但硬限制是允许降到任何更小的值，包括小于当前 soft）
-///   3. `new.soft ≤ cur.hard`（软限制不能超过当前硬限制）
-///
-/// 关键点：**不检查** `new.hard < cur.soft`。POSIX 允许"硬限制降到
-/// ≥ 0 的任意值"，glibc 旧 ABI setrlimit 也支持；libctest 的
-/// `setrlim.c:21` 典型用法 `setrlimit(RLIMIT_STACK, 102400)` 会把
-/// `rlim_max = 102400`，当前 soft 可能是 8MB，老式"hard 不能降到
-/// 软以下"校验会误返 EINVAL。
 pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Errno> {
     let me = current_task();
     let tg = me.thread_group();
     let mut guard = tg.rlimits().lock();
     let cur = guard.get(resource);
-
-    // (1) 软限制必须 ≤ 硬限制。
-    if new.soft.0 > new.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
-    // (2) 无 CAP 时硬限制不可调高（只能降或保留）。
-    if new.hard.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
-    // (3) 软限制不能超当前硬限制。
-    if new.soft.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
+    validate_rlimit_update(&me, cur, new)?;
     let old = cur;
     guard.set(resource, new);
     Ok(old)
@@ -1114,8 +1090,9 @@ pub fn prlimit64(
     new: Option<RlimitPair>,
 ) -> Result<RlimitPair, Errno> {
     let me = current_task();
-    let target_tg = if pid == 0 {
-        me.thread_group()
+    let my_tg = me.thread_group();
+    let target = if pid == 0 {
+        Arc::clone(&me)
     } else if pid > 0 {
         let root = root_pid_ns();
         let Some(weak) = root.registry().lookup(pid) else {
@@ -1124,24 +1101,18 @@ pub fn prlimit64(
         let Some(task) = weak.upgrade() else {
             return Err(Errno::ESRCH);
         };
-        task.thread_group()
+        task
     } else {
         return Err(Errno::EINVAL);
     };
-    // 权限：调用方需是同 uid 或具 CAP_SYS_RESOURCE。本仓库尚未实现
-    // capability 模型，按"同进程/同 uid 直通"处理。
+    let target_tg = target.thread_group();
+    if !Arc::ptr_eq(&my_tg, &target_tg) {
+        check_prlimit_target_permission(&me, &target)?;
+    }
     if let Some(n) = new {
         let mut guard = target_tg.rlimits().lock();
         let cur = guard.get(resource);
-        if n.soft.0 > n.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
-        if n.hard.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
-        if n.soft.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
+        validate_rlimit_update(&me, cur, n)?;
         let old = cur;
         guard.set(resource, n);
         Ok(old)
@@ -1150,10 +1121,130 @@ pub fn prlimit64(
     }
 }
 
+/// 校验 rlimit 写入。
+///
+/// 规则对齐 Linux `do_prlimit`：`soft <= hard` 是基础不变量；非特权调用者
+/// 只能在当前 hard 限制内调整 soft，并且不能提高 hard；具备
+/// `CAP_SYS_RESOURCE` 时允许提高 hard/soft。这里刻意不检查 `new.hard < cur.soft`，
+/// 因为 POSIX 允许把 hard 降到低于当前 soft 的新值，只要新 soft 同步降下来。
+fn validate_rlimit_update(
+    caller: &Arc<Task>,
+    cur: RlimitPair,
+    new: RlimitPair,
+) -> Result<(), Errno> {
+    if new.soft.0 > new.hard.0 {
+        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    }
+    if caller.credentials().has_cap(Capability::SysResource) {
+        return Ok(());
+    }
+    if new.hard.0 > cur.hard.0 || new.soft.0 > cur.hard.0 {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// prlimit 读写其它进程时需要同属主，或者具备资源管理能力。
+fn check_prlimit_target_permission(caller: &Arc<Task>, target: &Arc<Task>) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysResource) {
+        return Ok(());
+    }
+    let target_creds = target.credentials();
+    if caller_creds.uid == target_creds.uid
+        && caller_creds.uid == target_creds.euid
+        && caller_creds.uid == target_creds.suid
+        && caller_creds.gid == target_creds.gid
+        && caller_creds.gid == target_creds.egid
+        && caller_creds.gid == target_creds.sgid
+    {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
 /// 返回整个 rlimit 表（用于调试/procfs）。
 pub fn rlimits_snapshot() -> Rlimits {
     let me = current_task();
     *me.thread_group().rlimits().lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::{Arc, Weak};
+
+    use super::*;
+    use crate::group::ThreadGroup;
+    use crate::ids::{CapSet, Credentials, Gid, Uid};
+    use crate::rlimit::Rlim;
+
+    fn task_with_credentials(creds: Credentials) -> Arc<Task> {
+        let session = Session::new();
+        let pg = ProcessGroup::new(&session);
+        let tg = ThreadGroup::new();
+        let task = Task::new(SchedParams::default_fair(), Weak::new(), tg, pg);
+        task.set_credentials(Arc::new(creds));
+        task
+    }
+
+    fn unprivileged_task(uid: u32, gid: u32) -> Arc<Task> {
+        task_with_credentials(Credentials::unprivileged(Uid(uid), Gid(gid)))
+    }
+
+    #[test]
+    fn rlimit_update_rejects_unprivileged_raise() {
+        let caller = unprivileged_task(1000, 1000);
+        let cur = RlimitPair::new(Rlim(100), Rlim(200));
+
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(100), Rlim(300))),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(250), Rlim(250))),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(300), Rlim(200))),
+            Err(Errno::EINVAL)
+        );
+        assert!(validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(50), Rlim(100))).is_ok());
+    }
+
+    #[test]
+    fn rlimit_update_allows_sysresource_raise() {
+        let mut creds = Credentials::unprivileged(Uid(1000), Gid(1000));
+        creds.caps = CapSet::single(Capability::SysResource);
+        let caller = task_with_credentials(creds);
+        let cur = RlimitPair::new(Rlim(0), Rlim(0));
+
+        assert!(validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(40), Rlim(40))).is_ok());
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(41), Rlim(40))),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn prlimit_target_permission_requires_ids_or_sysresource() {
+        let caller = unprivileged_task(1000, 1000);
+        let same_owner = unprivileged_task(1000, 1000);
+        assert!(check_prlimit_target_permission(&caller, &same_owner).is_ok());
+
+        let mut different_saved_uid = Credentials::unprivileged(Uid(1000), Gid(1000));
+        different_saved_uid.suid = Uid(1001);
+        let different_owner = task_with_credentials(different_saved_uid);
+        assert_eq!(
+            check_prlimit_target_permission(&caller, &different_owner),
+            Err(Errno::EPERM)
+        );
+
+        let mut resource_creds = Credentials::unprivileged(Uid(2000), Gid(2000));
+        resource_creds.caps = CapSet::single(Capability::SysResource);
+        let resource_caller = task_with_credentials(resource_creds);
+        assert!(check_prlimit_target_permission(&resource_caller, &different_owner).is_ok());
+    }
 }
 
 // ── 信号投递在内核边界的默认动作处理 ─────────────────────────────────────────
