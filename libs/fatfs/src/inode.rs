@@ -139,6 +139,7 @@ fn build_inode_for_entry(
             state: Arc::clone(state),
             first_cluster: AtomicU32::new(entry.first_cluster),
             size: AtomicU32::new(entry.size),
+            tail_cache: Spinlock::new(None),
             parent: Spinlock::new(parent),
         };
         let inode = Inode::new(
@@ -422,7 +423,15 @@ pub struct FileInodeOps {
     pub(crate) state: Arc<FsState>,
     pub(crate) first_cluster: AtomicU32,
     pub(crate) size: AtomicU32,
+    tail_cache: Spinlock<Option<TailCache>>,
     pub(crate) parent: Spinlock<ParentSlot>,
+}
+
+#[derive(Clone, Copy)]
+struct TailCache {
+    first_cluster: u32,
+    clusters: u32,
+    tail_cluster: u32,
 }
 
 impl FileInodeOps {
@@ -449,28 +458,36 @@ impl FileInodeOps {
         let mut first = self.first_cluster.load(Ordering::Acquire);
 
         if cur_clusters == 0 && need_clusters > 0 {
-            let (head, _tail) = self
+            let (head, tail) = self
                 .state
                 .alloc_cluster_run(None, need_clusters as u32)
                 .map_err(backend_to_vfs)?;
             first = head;
             self.first_cluster.store(head, Ordering::Release);
+            self.update_tail_cache(head, need_clusters as u32, tail);
         } else if cur_clusters > 0 {
-            let tail = match self
-                .state
-                .fat
-                .walk_chain(self.state.backend.as_ref(), first, cur_clusters as u32 - 1)
-                .map_err(backend_to_vfs)?
-            {
-                Some(c) => c,
-                None => return Err(VfsError::Io),
-            };
             let add = (need_clusters - cur_clusters) as u32;
             if add > 0 {
-                let _ = self
+                if first < 2 {
+                    return Err(VfsError::Io);
+                }
+                let tail = match self.cached_tail(first, cur_clusters as u32) {
+                    Some(tail) => tail,
+                    None => match self
+                        .state
+                        .fat
+                        .walk_chain(self.state.backend.as_ref(), first, cur_clusters as u32 - 1)
+                        .map_err(backend_to_vfs)?
+                    {
+                        Some(c) => c,
+                        None => return Err(VfsError::Io),
+                    },
+                };
+                let (_, new_tail) = self
                     .state
                     .alloc_cluster_run(Some(tail), add)
                     .map_err(backend_to_vfs)?;
+                self.update_tail_cache(first, need_clusters as u32, new_tail);
             }
         }
         self.size.store(new_size as u32, Ordering::Release);
@@ -495,6 +512,7 @@ impl FileInodeOps {
             }
             self.first_cluster.store(0, Ordering::Release);
             self.size.store(0, Ordering::Release);
+            self.clear_tail_cache();
             self.writeback_meta(0, 0)?;
             return Ok(());
         }
@@ -527,8 +545,31 @@ impl FileInodeOps {
                 .map_err(backend_to_vfs)?;
         }
         self.size.store(new_size as u32, Ordering::Release);
+        self.update_tail_cache(first, need_clusters as u32, cur);
         self.writeback_meta(new_size as u32, first)?;
         Ok(())
+    }
+
+    fn cached_tail(&self, first_cluster: u32, clusters: u32) -> Option<u32> {
+        let cache = self.tail_cache.lock();
+        let cache = cache.as_ref()?;
+        (cache.first_cluster == first_cluster
+            && cache.clusters == clusters
+            && cache.tail_cluster >= 2)
+            .then_some(cache.tail_cluster)
+    }
+
+    fn update_tail_cache(&self, first_cluster: u32, clusters: u32, tail_cluster: u32) {
+        // tail cache 只作为 FAT 顺序扩容的加速提示;不匹配时会回退到 walk_chain。
+        *self.tail_cache.lock() = Some(TailCache {
+            first_cluster,
+            clusters,
+            tail_cluster,
+        });
+    }
+
+    fn clear_tail_cache(&self) {
+        *self.tail_cache.lock() = None;
     }
 
     /// 当前文件大小。
