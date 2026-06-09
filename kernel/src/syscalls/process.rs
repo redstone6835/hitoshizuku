@@ -10,7 +10,7 @@ use general::syscall::SyscallContext;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::ids::{Capability, Gid, Uid};
+use sched::ids::{Capability, Credentials, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
 use sched::task::{RseqRegistration, Task, TaskState};
@@ -1044,11 +1044,7 @@ fn check_setpriority_permission(
     if caller_creds.has_cap(Capability::SysNice) {
         return Ok(());
     }
-
-    let target_creds = target.credentials();
-    if caller_creds.euid != target_creds.uid && caller_creds.euid != target_creds.euid {
-        return Err(Errno::EPERM);
-    }
+    check_sched_target_owner(&caller_creds, target)?;
 
     let current = target.sched.nice() as i32;
     if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
@@ -1181,7 +1177,9 @@ pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let mut mask = Vec::new();
     mask.resize(cpusetsize, 0);
     copy_from_user(mask_user, &mut mask).map_err(|e| e.as_errno())?;
-    sched::operation::sched_setaffinity(pid, read_cpuset_mask(&mask))?;
+    let task = sched::operation::task_by_pid(pid)?;
+    check_sched_target_permission(&ctx.task, &task)?;
+    sched::operation::sched_setaffinity_for_task(&task, read_cpuset_mask(&mask))?;
     Ok(0)
 }
 
@@ -1333,11 +1331,7 @@ fn check_sched_attr_permission(
     if caller_creds.has_cap(Capability::SysNice) {
         return Ok(());
     }
-
-    let target_creds = target.credentials();
-    if caller_creds.euid != target_creds.uid && caller_creds.euid != target_creds.euid {
-        return Err(Errno::EPERM);
-    }
+    check_sched_target_owner(&caller_creds, target)?;
 
     let requested = requested.validate()?;
     match requested.policy {
@@ -1356,6 +1350,25 @@ fn check_sched_attr_permission(
         SchedPolicy::Deadline => return Err(Errno::EPERM),
     }
     Ok(())
+}
+
+/// 校验调度类系统调用的目标权限：同属主或具备 `CAP_SYS_NICE`。
+fn check_sched_target_permission(caller: &Arc<Task>, target: &Arc<Task>) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysNice) {
+        return Ok(());
+    }
+    check_sched_target_owner(&caller_creds, target)
+}
+
+/// Linux 调度权限使用调用者 euid 匹配目标 real/effective uid。
+fn check_sched_target_owner(caller_creds: &Credentials, target: &Arc<Task>) -> Result<(), Errno> {
+    let target_creds = target.credentials();
+    if caller_creds.euid == target_creds.uid || caller_creds.euid == target_creds.euid {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
 }
 
 fn check_rtprio_limit(caller: &Arc<Task>, priority: u8) -> Result<(), Errno> {

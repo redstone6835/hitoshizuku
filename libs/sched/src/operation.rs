@@ -360,6 +360,10 @@ pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
 
 pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
     let task = lookup_pid(pid)?;
+    sched_setaffinity_for_task(&task, mask)
+}
+
+pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Errno> {
     let requested = CpuMask::from_bits_truncate(mask);
     if requested.is_empty() {
         return Err(Errno::EINVAL);
@@ -384,7 +388,7 @@ pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
         .map(|cpu| cpu.get());
 
     if let Some(target_cpu) = target {
-        if migrate_task(&task, target_cpu).is_err() {
+        if migrate_task(task, target_cpu).is_err() {
             request_balance(target_cpu);
             if current_cpu < NR_CPUS {
                 request_resched(current_cpu);
