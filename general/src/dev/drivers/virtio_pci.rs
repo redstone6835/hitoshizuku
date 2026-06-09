@@ -445,19 +445,6 @@ impl VirtioBlkPci {
                 };
                 queue.recycle_meta_dma(pending.meta_dma);
 
-                if result.is_ok() && pending.bio.op == BioOp::Read {
-                    if let (BioBuffer::Owned(buf), Some(data_dma)) =
-                        (&mut pending.bio.buffer, pending.data_dma.as_ref())
-                    {
-                        data_dma.sync_for_cpu();
-                        let take = buf.len().min(data_dma.as_slice().len());
-                        buf[..take].copy_from_slice(&data_dma.as_slice()[..take]);
-                    }
-                }
-                if let Some(data_dma) = pending.data_dma {
-                    queue.recycle_data_dma(data_dma);
-                }
-
                 if queue.queue.free_chain_from_head(desc_head).is_err() {
                     let failed =
                         self.fail_queue_locked(&mut queue, "completed descriptor chain corrupt");
@@ -467,7 +454,27 @@ impl VirtioBlkPci {
                     return;
                 }
 
+                let copy_read_data = result.is_ok() && pending.bio.op == BioOp::Read;
+                if !copy_read_data && let Some(data_dma) = pending.data_dma.take() {
+                    queue.recycle_data_dma(data_dma);
+                }
+
                 drop(queue);
+                if copy_read_data {
+                    if let (BioBuffer::Owned(buf), Some(data_dma)) =
+                        (&mut pending.bio.buffer, pending.data_dma.as_ref())
+                    {
+                        data_dma.sync_for_cpu();
+                        let take = buf.len().min(data_dma.as_slice().len());
+                        buf[..take].copy_from_slice(&data_dma.as_slice()[..take]);
+                    }
+                    if let Some(data_dma) = pending.data_dma.take() {
+                        queue = self.inner.queue.lock();
+                        queue.recycle_data_dma(data_dma);
+                        drop(queue);
+                    }
+                }
+
                 pending.bio.complete(result);
                 queue = self.inner.queue.lock();
             } else {

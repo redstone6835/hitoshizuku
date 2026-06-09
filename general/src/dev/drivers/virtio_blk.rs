@@ -515,7 +515,7 @@ impl VirtioBlk {
             let PendingVirtioRequest {
                 mut bio,
                 meta_dma,
-                data_dma,
+                mut data_dma,
             } = pending;
             core::sync::atomic::fence(Ordering::Acquire);
             meta_dma.sync_for_cpu();
@@ -529,17 +529,6 @@ impl VirtioBlk {
                 _ => Err(BioIoError::MediaError),
             };
             queue.recycle_meta_dma(meta_dma);
-            // 读请求成功时把 DMA 区数据回拷到 Bio buffer
-            if result.is_ok() && bio.op == BioOp::Read {
-                if let (BioBuffer::Owned(buf), Some(dma)) = (&mut bio.buffer, data_dma.as_ref()) {
-                    dma.sync_for_cpu();
-                    let take = buf.len().min(dma.as_slice().len());
-                    buf[..take].copy_from_slice(&dma.as_slice()[..take]);
-                }
-            }
-            if let Some(dma) = data_dma {
-                queue.recycle_data_dma(dma);
-            }
 
             if queue.queue.free_chain_from_head(desc_head).is_err() {
                 let failed =
@@ -550,9 +539,28 @@ impl VirtioBlk {
                 return;
             }
 
+            let copy_read_data = result.is_ok() && bio.op == BioOp::Read;
+            if !copy_read_data && let Some(dma) = data_dma.take() {
+                queue.recycle_data_dma(dma);
+            }
+
+            // 大块顺序读的回拷放到队列锁外,避免 L1/L5 1MiB 请求长时间阻塞提交路径。
+            drop(queue);
+            if copy_read_data {
+                if let (BioBuffer::Owned(buf), Some(dma)) = (&mut bio.buffer, data_dma.as_ref()) {
+                    dma.sync_for_cpu();
+                    let take = buf.len().min(dma.as_slice().len());
+                    buf[..take].copy_from_slice(&dma.as_slice()[..take]);
+                }
+                if let Some(dma) = data_dma.take() {
+                    queue = self.inner.queue.lock();
+                    queue.recycle_data_dma(dma);
+                    drop(queue);
+                }
+            }
+
             // 释放 queue 锁后再 complete bio——避免 completion 路径
             // （包括 Waker::wake 和 WaitQueue::wake_all）持队列锁重入。
-            drop(queue);
             bio.complete(result);
             queue = self.inner.queue.lock();
         }
