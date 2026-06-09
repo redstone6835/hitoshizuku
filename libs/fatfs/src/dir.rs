@@ -491,27 +491,36 @@ pub(crate) fn find_free_slots(
     }
 }
 
-fn write_slots(
+/// 顺序写入 LFN 切片和 SFN 条目,避免为拼接目录项再分配临时 `Vec`。
+fn write_new_entry_slots(
     state: &FsState,
     backing: DirBacking,
     start: u32,
-    entries: &[[u8; DIR_ENTRY_SIZE]],
+    lfn_entries: &[[u8; DIR_ENTRY_SIZE]],
+    sfn_entry: &[u8; DIR_ENTRY_SIZE],
 ) -> Result<(), BlockBackendError> {
     let bps = state.bytes_per_sector as usize;
+    let total = lfn_entries.len() + 1;
     let mut index = 0usize;
-    while index < entries.len() {
+    let mut sec = vec![0u8; bps];
+    while index < total {
         let slot = start
             .checked_add(index as u32)
             .ok_or(BlockBackendError::OutOfRange)?;
         let Some((lba, off)) = locate_slot(state, backing, slot)? else {
             return Err(BlockBackendError::OutOfRange);
         };
-        let fit = ((bps - off) / DIR_ENTRY_SIZE).min(entries.len() - index);
-        let mut sec = vec![0u8; bps];
+        let fit = ((bps - off) / DIR_ENTRY_SIZE).min(total - index);
         state.backend.read_sectors(lba, 1, &mut sec)?;
         for i in 0..fit {
             let dst = off + i * DIR_ENTRY_SIZE;
-            sec[dst..dst + DIR_ENTRY_SIZE].copy_from_slice(&entries[index + i]);
+            let entry_index = index + i;
+            let entry = if entry_index < lfn_entries.len() {
+                &lfn_entries[entry_index]
+            } else {
+                sfn_entry
+            };
+            sec[dst..dst + DIR_ENTRY_SIZE].copy_from_slice(entry);
         }
         state.backend.write_sectors(lba, 1, &sec)?;
         index += fit;
@@ -591,11 +600,8 @@ pub(crate) fn insert_new_entry(
     let need = (lfn_entries.len() + 1) as u32;
     let start = find_free_slots(state, backing, need)?;
     ensure_slot(state, backing, start + need - 1)?;
-    let mut entries = Vec::with_capacity(need as usize);
-    entries.extend_from_slice(lfn_entries);
-    entries.push(*sfn_entry);
     let sfn_slot = start + lfn_entries.len() as u32;
-    write_slots(state, backing, start, &entries)?;
+    write_new_entry_slots(state, backing, start, lfn_entries, sfn_entry)?;
     Ok(sfn_slot)
 }
 
@@ -611,13 +617,13 @@ pub(crate) fn remove_entry_slots(
     }
     let bps = state.bytes_per_sector as usize;
     let mut slot = slot_start;
+    let mut sec = vec![0u8; bps];
     while slot <= slot_end {
         let Some((lba, off)) = locate_slot(state, backing, slot)? else {
             break;
         };
         let remain = (slot_end - slot + 1) as usize;
         let fit = ((bps - off) / DIR_ENTRY_SIZE).min(remain);
-        let mut sec = vec![0u8; bps];
         state.backend.read_sectors(lba, 1, &mut sec)?;
         for i in 0..fit {
             sec[off + i * DIR_ENTRY_SIZE] = ENTRY_FREE;
