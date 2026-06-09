@@ -142,16 +142,17 @@ impl ManagedInterface {
     pub fn make_handle(
         &self,
         iface_id: InterfaceId,
-        inner: SocketHandle,
+        inner: ProtocolSocketHandle,
         sock_type: SocketType,
     ) -> Option<NetSocketHandle> {
-        let meta = self.meta.get(&inner)?;
+        let raw = inner.into_smoltcp();
+        let meta = self.meta.get(&raw)?;
         if meta.is_removed() || meta.is_orphaned() || meta.socket_type() != sock_type {
             return None;
         }
         Some(NetSocketHandle {
             iface_id,
-            inner: ProtocolSocketHandle::from_smoltcp(inner),
+            inner,
             generation: meta.generation(),
             sock_type,
         })
@@ -209,7 +210,7 @@ impl ManagedInterface {
             })
             .collect();
         for h in to_remove {
-            self.remove_socket_locked(h);
+            self.remove_smoltcp_socket_locked(h);
         }
         changed
     }
@@ -341,9 +342,10 @@ impl ManagedInterface {
     /// 检查同一监听端点是否已经被其它 TCP socket 占用。
     pub fn tcp_listen_endpoint_in_use(
         &self,
-        exclude: SocketHandle,
+        exclude: ProtocolSocketHandle,
         target: IpListenEndpoint,
     ) -> bool {
+        let exclude = exclude.into_smoltcp();
         for (handle, socket) in self.sockets.iter() {
             if handle == exclude {
                 continue;
@@ -374,7 +376,8 @@ impl ManagedInterface {
     /// 主动连接自动选择本地端口时必须在同一把接口锁内检查占用，避免两个
     /// 并发连接拿到相同端口。这里保守地把监听、正在连接、已建立以及关闭
     /// 尾部状态的 socket 都视为占用者。
-    pub fn tcp_local_port_in_use(&self, exclude: SocketHandle, port: u16) -> bool {
+    pub fn tcp_local_port_in_use(&self, exclude: ProtocolSocketHandle, port: u16) -> bool {
+        let exclude = exclude.into_smoltcp();
         for (handle, socket) in self.sockets.iter() {
             if handle == exclude {
                 continue;
@@ -399,7 +402,12 @@ impl ManagedInterface {
     }
 
     /// 检查 UDP 监听端点是否已被当前接口上的其它 socket 占用。
-    pub fn udp_endpoint_in_use(&self, exclude: SocketHandle, target: IpListenEndpoint) -> bool {
+    pub fn udp_endpoint_in_use(
+        &self,
+        exclude: ProtocolSocketHandle,
+        target: IpListenEndpoint,
+    ) -> bool {
+        let exclude = exclude.into_smoltcp();
         for (handle, socket) in self.sockets.iter() {
             if handle == exclude {
                 continue;
@@ -427,21 +435,24 @@ impl ManagedInterface {
     /// 调用 [`Self::remove_socket_locked`]。soft_remove_socket 适合"延迟
     /// 到下一次 poll"的场景（例如某条路径上需要立刻释放对端资源但又想避开
     /// 持锁移除的复杂性）。
-    pub fn soft_remove_socket(&self, handle: SocketHandle) {
+    pub fn soft_remove_socket(&self, handle: ProtocolSocketHandle) {
+        let handle = handle.into_smoltcp();
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_removed();
         }
     }
 
     /// 将 socket 标记为 orphan：上层 fd 已释放，但协议栈继续负责 TCP 收尾。
-    pub fn orphan_socket(&self, handle: SocketHandle) {
+    pub fn orphan_socket(&self, handle: ProtocolSocketHandle) {
+        let handle = handle.into_smoltcp();
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_orphaned();
         }
     }
 
     /// 标记 TCP 连接已被 accept 交付给 VFS。
-    pub fn mark_socket_accepted(&self, handle: SocketHandle) {
+    pub fn mark_socket_accepted(&self, handle: ProtocolSocketHandle) {
+        let handle = handle.into_smoltcp();
         if let Some(meta) = self.meta.get(&handle) {
             meta.mark_accepted();
         }
@@ -456,11 +467,12 @@ impl ManagedInterface {
     /// 允许按端点扫描整个 SocketSet。
     pub fn pending_tcp_accept(
         &self,
-        preferred: SocketHandle,
+        preferred: ProtocolSocketHandle,
         target: IpListenEndpoint,
-    ) -> Option<SocketHandle> {
+    ) -> Option<ProtocolSocketHandle> {
+        let preferred = preferred.into_smoltcp();
         if self.tcp_socket_is_pending_accept(preferred, target) {
-            return Some(preferred);
+            return Some(ProtocolSocketHandle::from_smoltcp(preferred));
         }
         for (handle, socket) in self.sockets.iter() {
             if handle == preferred {
@@ -470,7 +482,7 @@ impl ManagedInterface {
                 continue;
             };
             if self.tcp_socket_is_pending_accept_with_socket(handle, tcp, target) {
-                return Some(handle);
+                return Some(ProtocolSocketHandle::from_smoltcp(handle));
             }
         }
         None
@@ -512,7 +524,11 @@ impl ManagedInterface {
     /// 其它类型 socket 占用（smoltcp 的 `add` 不会复用 `Some(_)` 的槽位，
     /// 但 `poll` 之后 `soft_remove_socket` 标记的 socket 也只是 `None`
     /// 而真正释放——必须**自己**调本接口才安全）。
-    pub fn remove_socket_locked(&mut self, handle: SocketHandle) {
+    pub fn remove_socket_locked(&mut self, handle: ProtocolSocketHandle) {
+        self.remove_smoltcp_socket_locked(handle.into_smoltcp());
+    }
+
+    fn remove_smoltcp_socket_locked(&mut self, handle: SocketHandle) {
         // 必须先删 meta，否则 `poll` 路径的 to_remove 列表里还会保留旧条目，
         // 下次 poll 会对一个已经在 `SocketSet` 里被替换的 handle 再调
         // `sockets.remove`，触发 "handle does not refer to a valid socket"。
@@ -523,19 +539,21 @@ impl ManagedInterface {
     /// TCP connect：内部同时访问 socket 和 iface context 避免借用冲突。
     pub fn tcp_connect(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
         remote: smoltcp::wire::IpEndpoint,
         local_port: u16,
     ) -> Result<(), smoltcp::socket::tcp::ConnectError> {
         let cx = self.iface.context();
-        let socket = self.sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+        let socket = self
+            .sockets
+            .get_mut::<smoltcp::socket::tcp::Socket>(handle.into_smoltcp());
         socket.connect(cx, remote, local_port)
     }
 
     // ── Socket 管理 ──────────────────────────────────────────────────────
 
     /// 创建一个 TCP socket 并加入本接口的 SocketSet。
-    pub fn add_tcp_socket(&mut self, tuning: TcpBufferTuning) -> SocketHandle {
+    pub fn add_tcp_socket(&mut self, tuning: TcpBufferTuning) -> ProtocolSocketHandle {
         // 缓冲容量由网络栈调优配置统一提供，后续接入 per-socket option 时只需
         // 在 stack 层选择不同配置，不再修改协议适配层。
         let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tuning.rx_bytes]);
@@ -548,11 +566,11 @@ impl ManagedInterface {
         socket.set_nagle_enabled(false);
         let handle = self.sockets.add(socket);
         self.install_socket_meta(handle, SocketType::Tcp);
-        handle
+        ProtocolSocketHandle::from_smoltcp(handle)
     }
 
     /// 创建一个 UDP socket 并加入本接口的 SocketSet。
-    pub fn add_udp_socket(&mut self, tuning: PacketBufferTuning) -> SocketHandle {
+    pub fn add_udp_socket(&mut self, tuning: PacketBufferTuning) -> ProtocolSocketHandle {
         let rx_buf = smoltcp::socket::udp::PacketBuffer::new(
             alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; tuning.rx_meta],
             alloc::vec![0u8; tuning.rx_bytes],
@@ -564,42 +582,42 @@ impl ManagedInterface {
         let socket = smoltcp::socket::udp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
         self.install_socket_meta(handle, SocketType::Udp);
-        handle
+        ProtocolSocketHandle::from_smoltcp(handle)
     }
 
     /// 获取 TCP socket 的可变引用（内部操作用）。
     pub fn tcp_socket_mut(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &mut smoltcp::socket::tcp::Socket<'static> {
         // 内部 typed accessor 仍直接下转 SocketSet handle；对外入口必须先通过
         // handle_is_live 做 generation/type 校验，避免旧 handle 触发下转 panic。
-        self.sockets.get_mut(handle)
+        self.sockets.get_mut(handle.into_smoltcp())
     }
 
     /// 获取 TCP socket 的只读引用。
     pub fn tcp_socket(
         &self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &smoltcp::socket::tcp::Socket<'static> {
-        self.sockets.get(handle)
+        self.sockets.get(handle.into_smoltcp())
     }
 
     /// 获取 UDP socket 的可变引用。
     pub fn udp_socket_mut(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &mut smoltcp::socket::udp::Socket<'static> {
         // 同 tcp_socket_mut：调用方必须先完成 generation/type 校验。
-        self.sockets.get_mut(handle)
+        self.sockets.get_mut(handle.into_smoltcp())
     }
 
     /// 获取 UDP socket 的只读引用。
     pub fn udp_socket(
         &self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &smoltcp::socket::udp::Socket<'static> {
-        self.sockets.get(handle)
+        self.sockets.get(handle.into_smoltcp())
     }
 
     /// 创建一个 raw IP socket（指定 IP 版本和协议号）。
@@ -608,7 +626,7 @@ impl ManagedInterface {
         ip_version: u8,
         protocol: u8,
         tuning: PacketBufferTuning,
-    ) -> SocketHandle {
+    ) -> ProtocolSocketHandle {
         use smoltcp::socket::raw;
         use smoltcp::wire::{IpProtocol, IpVersion};
         // TODO: raw socket 仍缺少协议过滤以外的 option 支持，例如头部包含
@@ -630,11 +648,11 @@ impl ManagedInterface {
         let socket = raw::Socket::new(Some(ip_ver), Some(proto), rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
         self.install_socket_meta(handle, SocketType::Raw);
-        handle
+        ProtocolSocketHandle::from_smoltcp(handle)
     }
 
     /// 创建一个 ICMP socket。
-    pub fn add_icmp_socket(&mut self, tuning: PacketBufferTuning) -> SocketHandle {
+    pub fn add_icmp_socket(&mut self, tuning: PacketBufferTuning) -> ProtocolSocketHandle {
         use smoltcp::socket::icmp;
         // TODO: ICMP 当前是最小 echo 能力，未建模 identifier、sequence
         // 分发、错误报文队列和 IPv6 ICMP 差异。
@@ -649,39 +667,39 @@ impl ManagedInterface {
         let socket = icmp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
         self.install_socket_meta(handle, SocketType::Icmp);
-        handle
+        ProtocolSocketHandle::from_smoltcp(handle)
     }
 
     /// 获取 raw socket 的可变引用。
     pub fn raw_socket_mut(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &mut smoltcp::socket::raw::Socket<'static> {
-        self.sockets.get_mut(handle)
+        self.sockets.get_mut(handle.into_smoltcp())
     }
 
     /// 获取 raw socket 的只读引用。
     pub fn raw_socket(
         &self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &smoltcp::socket::raw::Socket<'static> {
-        self.sockets.get(handle)
+        self.sockets.get(handle.into_smoltcp())
     }
 
     /// 获取 ICMP socket 的可变引用。
     pub fn icmp_socket_mut(
         &mut self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &mut smoltcp::socket::icmp::Socket<'static> {
-        self.sockets.get_mut(handle)
+        self.sockets.get_mut(handle.into_smoltcp())
     }
 
     /// 获取 ICMP socket 的只读引用。
     pub fn icmp_socket(
         &self,
-        handle: smoltcp::iface::SocketHandle,
+        handle: ProtocolSocketHandle,
     ) -> &smoltcp::socket::icmp::Socket<'static> {
-        self.sockets.get(handle)
+        self.sockets.get(handle.into_smoltcp())
     }
 
     // ── Socket 快照遍历（供 /proc/net/ 使用）──────────────────────────
