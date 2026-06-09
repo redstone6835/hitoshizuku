@@ -694,13 +694,13 @@ pub fn balance_once(cpu_id: usize) -> bool {
         return false;
     }
 
-    let local_load = RUNQUEUES[cpu_id].nr_running();
+    let local_load = RUNQUEUES[cpu_id].migratable_load();
     let mut busiest = None;
     let mut busiest_load = local_load;
     let sources = sched_topology().balance_sources(local_cpu, online);
     for other in sources.iter() {
         let other_id = other.get();
-        let load = RUNQUEUES[other_id].nr_running();
+        let load = RUNQUEUES[other_id].migratable_load();
         if load > busiest_load + 1 {
             busiest = Some(other_id);
             busiest_load = load;

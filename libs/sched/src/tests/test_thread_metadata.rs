@@ -8,8 +8,8 @@ use alloc::sync::Weak;
 use ktest::ktest;
 
 use crate::{
-    CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedParams,
-    Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
+    CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedAttr,
+    SchedParams, Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
 };
 
 fn make_task() -> alloc::sync::Arc<Task> {
@@ -87,4 +87,21 @@ fn runqueue_pick_respects_cpu_affinity_mask() {
 
     assert!(rq.dequeue(&task0, 3));
     assert!(rq.dequeue(&task1, 3));
+}
+
+#[ktest]
+fn runqueue_migratable_load_excludes_idle_class() {
+    let fair = make_task();
+    let idle = make_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&idle), 1);
+
+    assert_eq!(rq.nr_running(), 2);
+    assert_eq!(rq.migratable_load(), 1);
+
+    assert!(rq.dequeue(&fair, 2));
+    assert!(rq.dequeue(&idle, 2));
 }

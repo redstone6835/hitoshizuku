@@ -144,6 +144,15 @@ impl Runqueue {
             + usize::from(inner.current.is_some())
     }
 
+    /// 可跨 CPU 迁移的就绪负载。
+    ///
+    /// idle 任务只属于本 CPU，deadline throttled 任务当前不可运行，current 任务
+    /// 不能被远端直接摘走；负载均衡只看能通过 [`take_migratable`] 拉走的队列。
+    pub fn migratable_load(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.fair_tree.len() + inner.rt_tree.len() + inner.deadline_tree.len()
+    }
+
     pub fn set_current(&self, task: Arc<Task>) {
         let mut inner = self.inner.lock();
         if let Some(old) = inner.current.take() {
