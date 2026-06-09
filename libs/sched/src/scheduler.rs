@@ -847,7 +847,13 @@ pub fn schedule_once(now_ns: u64) {
         (sw.on_switch)(&next);
     }
 
-    // 8. 切换。
+    // 8. 发布用户态可观察的 CPU 状态。此时 next 的地址空间已经激活，且未
+    //    进入 switch_context；回调不能影响调度决策，失败只会让用户态走保守路径。
+    if let Some(cpu_state) = crate::arch_hooks::task_cpu_state() {
+        (cpu_state.publish_current_cpu)(&next, cpu_id);
+    }
+
+    // 9. 切换。
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
     unsafe {
         (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);

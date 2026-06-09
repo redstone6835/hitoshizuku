@@ -154,6 +154,44 @@ static VM_SWITCH_OPS: VmSwitchOps = VmSwitchOps {
     on_switch: vm_on_switch,
 };
 
+// ── TaskCpuStateOps ─────────────────────────────────────────────────────────
+//
+// rseq 的 cpu_id 字段属于用户态 ABI；sched 底层只负责告诉 kernel 某个任务
+// 即将在哪个 CPU 上运行，具体用户内存写入必须留在 kernel/mm 侧完成。
+
+const RSEQ_CPU_ID_START_OFFSET: usize = 0;
+const RSEQ_CPU_ID_OFFSET: usize = 4;
+
+fn publish_task_cpu_state(task: &Arc<Task>, cpu_id: usize) {
+    let registration = task.rseq_registration();
+    if !registration.registered {
+        return;
+    }
+    let Ok(cpu) = u32::try_from(cpu_id) else {
+        return;
+    };
+    let Some(start_addr) = registration.ptr.checked_add(RSEQ_CPU_ID_START_OFFSET) else {
+        return;
+    };
+    let Some(current_addr) = registration.ptr.checked_add(RSEQ_CPU_ID_OFFSET) else {
+        return;
+    };
+    if copy_to_user(start_addr, &cpu.to_ne_bytes()).is_err()
+        || copy_to_user(current_addr, &cpu.to_ne_bytes()).is_err()
+    {
+        log::debug!(
+            "[sched][rseq] publish cpu failed pid={:?} cpu={}",
+            task.pid_root(),
+            cpu_id
+        );
+    }
+}
+
+static TASK_CPU_STATE_OPS: sched::arch_hooks::TaskCpuStateOps =
+    sched::arch_hooks::TaskCpuStateOps {
+        publish_current_cpu: publish_task_cpu_state,
+    };
+
 // ── ProcessImageOps ─────────────────────────────────────────────────────────
 //
 // sched 拥有 exec/clone/sigreturn 的状态机；真正解释用户指针、构造 trap frame、
@@ -555,10 +593,13 @@ pub fn boot_init() -> Arc<Task> {
     //    在 sched::init 之前，这样即便 init 之外的 kthread 启动也会被回调。
     sched::arch_hooks::register_vm_switch(&VM_SWITCH_OPS);
 
-    // 5. 建 init。sched::init 内部会 assert arch_hooks 已注入。
+    // 5. 注入任务 CPU 状态发布 hook：调度器切到用户任务前用它刷新 rseq。
+    sched::arch_hooks::register_task_cpu_state(&TASK_CPU_STATE_OPS);
+
+    // 6. 建 init。sched::init 内部会 assert arch_hooks 已注入。
     let init = sched::init();
 
-    // 6. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
+    // 7. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
     //    （理论上不会）就跳过——调度 / 信号路径不依赖 ext，仅 VFS syscall 受影响。
     if let Some(parts) = BOOT_VFS_PARTS.lock().take() {
         let vfs_ctx = Arc::new(VfsContext::new(
@@ -583,11 +624,11 @@ pub fn boot_init() -> Arc<Task> {
         log::info!("[sched][boot] BOOT_VFS_PARTS empty — init has no vfs ext");
     }
 
-    // 7. 为 CPU 0 启动独立 idle 内核线程。`pick_next` 返 None 时 schedule_once
+    // 8. 为 CPU 0 启动独立 idle 内核线程。`pick_next` 返 None 时 schedule_once
     //    会回落到这个 idle，main() 后续显式让渡时也按它兜底。
     sched::spawn_idle_for(0);
 
-    // 8. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
+    // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
 

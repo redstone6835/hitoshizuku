@@ -69,7 +69,7 @@ pub mod task;
 pub mod wait;
 pub mod wait_flags;
 
-pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry};
+pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry, TaskCpuStateOps};
 pub use clone_flags::{CloneArgs, CloneFlags};
 pub use cpu::{CpuId, CpuMask, SchedDomain, SchedTopology};
 pub use eevdf::{SchedEntity, SchedParams, Weight};

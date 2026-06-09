@@ -451,9 +451,6 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
 pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const RSEQ_MIN_SIZE: usize = 32;
     const RSEQ_FLAG_UNREGISTER: usize = 1;
-    const RSEQ_CPU_ID_START_OFFSET: usize = 0;
-    const RSEQ_CPU_ID_OFFSET: usize = 4;
-
     let ptr = ctx.args[0];
     let len = ctx.args[1];
     let flags = ctx.args[2];
@@ -483,10 +480,9 @@ pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
 
     // 注册成功前先确认用户区可写，并把当前 CPU 写入 rseq 的两个 CPU 字段。
-    // 当前调度器已维护 per-task current_cpu；后续多核迁移时在切换路径更新该字段。
+    // 后续迁移/切换由 kernel::sched 的 TaskCpuStateOps hook 继续刷新。
     let cpu = sched::current_cpu_id() as u32;
-    write_user_u32(ptr + RSEQ_CPU_ID_START_OFFSET, cpu)?;
-    write_user_u32(ptr + RSEQ_CPU_ID_OFFSET, cpu)?;
+    write_rseq_cpu_fields(ptr, cpu)?;
     ctx.task.set_rseq_registration(RseqRegistration {
         ptr,
         len: len as u32,
@@ -494,6 +490,18 @@ pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         registered: true,
     });
     Ok(0)
+}
+
+const RSEQ_CPU_ID_START_OFFSET: usize = 0;
+const RSEQ_CPU_ID_OFFSET: usize = 4;
+
+fn write_rseq_cpu_fields(ptr: usize, cpu: u32) -> Result<(), Errno> {
+    let start_addr = ptr
+        .checked_add(RSEQ_CPU_ID_START_OFFSET)
+        .ok_or(Errno::EFAULT)?;
+    let current_addr = ptr.checked_add(RSEQ_CPU_ID_OFFSET).ok_or(Errno::EFAULT)?;
+    write_user_u32(start_addr, cpu)?;
+    write_user_u32(current_addr, cpu)
 }
 
 pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
