@@ -798,16 +798,89 @@ impl FatTable {
         if head < 2 {
             return Ok(0);
         }
+
+        if matches!(self.kind, FatKind::Fat12) {
+            return self.free_chain_slow(backend, head);
+        }
+
+        self.chain_cache.lock().clear();
+        let bps = self.bytes_per_sector as usize;
+        let entry_bytes = self.entry_bytes();
+        let count = self.with_slots_lock(|slots| {
+            let mut count = 0u32;
+            let mut cur = head;
+
+            loop {
+                self.validate_cluster(cur)?;
+                let off = self.byte_offset(cur);
+                let sector_no = off / bps as u64;
+                let in_sector = (off % bps as u64) as usize;
+                let base_lba = self.first_fat_sector + sector_no;
+                let slot = Self::ensure_slot_present_mut(
+                    slots,
+                    backend,
+                    self.capacity,
+                    base_lba,
+                    self.bytes_per_sector,
+                )?;
+
+                let next = self.read_entry_from_slot(slot, in_sector);
+                if next == 0 {
+                    break;
+                }
+                self.write_entry_to_slot(slot, in_sector, 0);
+                count += 1;
+
+                if next < 2 || self.is_eoc(next) {
+                    break;
+                }
+                if count >= self.total_clusters {
+                    return Err(BlockBackendError::OutOfRange);
+                }
+                cur = next;
+
+                debug_assert!(in_sector + entry_bytes <= bps);
+            }
+            Ok(count)
+        })?;
+
+        if count > 0 {
+            let mut hint = self.next_free_hint.lock();
+            if head < *hint {
+                *hint = head;
+            }
+        }
+        Ok(count)
+    }
+
+    fn free_chain_slow(
+        &self,
+        backend: &dyn BlockBackend,
+        head: u32,
+    ) -> Result<u32, BlockBackendError> {
+        self.chain_cache.lock().clear();
         let mut count = 0u32;
         let mut cur = head;
         loop {
             let next = self.get(backend, cur)?;
+            if next == 0 {
+                break;
+            }
             self.set(backend, cur, 0)?;
             count += 1;
             if next < 2 || self.is_eoc(next) {
                 break;
             }
+            if count >= self.total_clusters {
+                return Err(BlockBackendError::OutOfRange);
+            }
             cur = next;
+        }
+        if count > 0 {
+            let mut hint = self.next_free_hint.lock();
+            if head < *hint {
+                *hint = head;
+            }
         }
         Ok(count)
     }

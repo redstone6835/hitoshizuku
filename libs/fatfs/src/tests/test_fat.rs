@@ -101,3 +101,36 @@ fn alloc_cluster_run_uses_fat16_entry_width() {
     assert_eq!(table.get(&*disk, 5).expect("cluster 5"), 6);
     assert!(table.is_eoc(table.get(&*disk, 6).expect("cluster 6")));
 }
+
+/// free_chain 需要按 FAT 链而不是物理连续区间释放，碎片链也要全部清零。
+#[ktest]
+fn free_chain_clears_fragmented_fat32_chain() {
+    let entries = [
+        0, 0, 3, 5, 0x0ffffff8, // 簇 4 是无关占用块，不能被释放
+        6, 0x0ffffff8,
+    ];
+    let (disk, table) = make_fat_disk(&entries, FatKind::Fat32);
+
+    let freed = table.free_chain(&*disk, 2).expect("free fragmented chain");
+
+    assert_eq!(freed, 4);
+    for cluster in [2, 3, 5, 6] {
+        assert_eq!(table.get(&*disk, cluster).expect("released cluster"), 0);
+    }
+    assert!(table.is_eoc(table.get(&*disk, 4).expect("unrelated cluster")));
+}
+
+/// FAT16 快速释放路径必须使用 2 字节表项宽度。
+#[ktest]
+fn free_chain_uses_fat16_entry_width() {
+    let entries = [0, 0, 3, 5, 0xfff8, 6, 0xfff8];
+    let (disk, table) = make_fat_disk(&entries, FatKind::Fat16);
+
+    let freed = table.free_chain(&*disk, 2).expect("free fat16 chain");
+
+    assert_eq!(freed, 4);
+    for cluster in [2, 3, 5, 6] {
+        assert_eq!(table.get(&*disk, cluster).expect("released cluster"), 0);
+    }
+    assert!(table.is_eoc(table.get(&*disk, 4).expect("unrelated cluster")));
+}
