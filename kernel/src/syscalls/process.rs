@@ -16,8 +16,6 @@ use sched::sync::Spinlock;
 use sched::task::{RseqRegistration, Task, TaskState};
 use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatus};
 
-const MAX_CPUSET_BYTES: usize = 1024;
-
 // getpriority/setpriority 的 Linux 兼容层编码。调度核心只接收 Task 和 nice，
 // 不理解 which/who 这组用户态选择语义。
 const PRIO_PROCESS: usize = 0;
@@ -1157,14 +1155,14 @@ pub(super) fn sys_sched_getaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     if mask_user == 0 {
         return Err(Errno::EFAULT);
     }
-    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES {
+    if cpusetsize < kernel_bytes {
         return Err(Errno::EINVAL);
     }
 
     let task = sched_task_from_pid(pid, &ctx.task)?;
     let affinity = sched::operation::sched_getaffinity_for_task(&task);
     let mut mask = Vec::new();
-    mask.resize(cpusetsize, 0);
+    mask.resize(kernel_bytes, 0);
     write_cpuset_mask(&mut mask, affinity);
     copy_to_user(mask_user, &mask).map_err(|e| e.as_errno())?;
     Ok(kernel_bytes)
@@ -1178,11 +1176,11 @@ pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     if mask_user == 0 {
         return Err(Errno::EFAULT);
     }
-    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES {
+    if cpusetsize < kernel_bytes {
         return Err(Errno::EINVAL);
     }
     let mut mask = Vec::new();
-    mask.resize(cpusetsize, 0);
+    mask.resize(kernel_bytes, 0);
     copy_from_user(mask_user, &mut mask).map_err(|e| e.as_errno())?;
     let task = sched_task_from_pid(pid, &ctx.task)?;
     check_sched_target_permission(&ctx.task, &task)?;
