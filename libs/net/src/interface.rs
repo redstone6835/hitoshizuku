@@ -7,7 +7,7 @@
 //! 本模块是 smoltcp 类型转换的集中点——把 `config.rs` 中的通用 IP 类型
 //! 映射为 smoltcp 的 `wire::*` 类型。支持 IPv4 + IPv6 双栈。
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -37,7 +37,12 @@ pub(crate) struct ManagedInterface {
     pub(crate) meta: BTreeMap<SocketHandle, SocketMeta>,
     /// 已完成握手的 TCP socket 队列（accept backlog）。
     pending_accepted: Vec<SocketHandle>,
+    /// 已建立连接对应的补位监听 socket。
+    accept_successors: BTreeMap<SocketHandle, SocketHandle>,
+    /// 已交给上层监听 fd 持有的补位 listener。
+    accept_published_listeners: BTreeSet<SocketHandle>,
     max_backlog: usize,
+    tcp_tuning: TcpBufferTuning,
     inode_counter: core::sync::atomic::AtomicU64,
     /// 每次分配 socket 时递增，用于给对外 handle 打生命周期标记。
     handle_generation: u64,
@@ -54,6 +59,7 @@ impl ManagedInterface {
     pub fn new(
         net_device: Arc<NetDevice>,
         config: IfConfig,
+        tcp_tuning: TcpBufferTuning,
         listen_tuning: TcpListenTuning,
     ) -> Self {
         let driver = Arc::clone(net_device.driver());
@@ -115,7 +121,10 @@ impl ManagedInterface {
             sockets: SocketSet::new(Vec::new()),
             meta: BTreeMap::new(),
             pending_accepted: Vec::with_capacity(listen_tuning.accept_backlog),
+            accept_successors: BTreeMap::new(),
+            accept_published_listeners: BTreeSet::new(),
             max_backlog: listen_tuning.accept_backlog,
+            tcp_tuning,
             inode_counter: core::sync::atomic::AtomicU64::new(1),
             handle_generation: 1,
             config,
@@ -218,6 +227,7 @@ impl ManagedInterface {
         }
         if changed {
             self.refresh_pending_tcp_accepts();
+            self.ensure_pending_accept_listeners();
         } else if !self.pending_accepted.is_empty() {
             self.prune_pending_tcp_accepts();
         }
@@ -538,6 +548,43 @@ impl ManagedInterface {
         }
     }
 
+    fn ensure_pending_accept_listeners(&mut self) {
+        if self.max_backlog == 0 || self.pending_accepted.len() >= self.max_backlog {
+            return;
+        }
+        let mut to_replace = Vec::new();
+        for accepted in self.pending_accepted.iter().copied() {
+            if self.accept_successors.contains_key(&accepted) {
+                continue;
+            }
+            let Some((_, socket)) = self.sockets.iter().find(|(h, _)| *h == accepted) else {
+                continue;
+            };
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            let endpoint = tcp.listen_endpoint();
+            if endpoint.port != 0 {
+                to_replace.push((accepted, endpoint));
+            }
+        }
+        for (accepted, endpoint) in to_replace {
+            if self.accept_successors.contains_key(&accepted) {
+                continue;
+            }
+            if self.tcp_listen_socket_exists(accepted, endpoint) {
+                continue;
+            }
+            let successor = self.add_tcp_socket(self.tcp_tuning);
+            let successor_raw = successor.into_smoltcp();
+            if self.tcp_socket_mut(successor).listen(endpoint).is_ok() {
+                self.accept_successors.insert(accepted, successor_raw);
+            } else {
+                self.remove_smoltcp_socket_locked(successor_raw);
+            }
+        }
+    }
+
     fn prune_pending_tcp_accepts(&mut self) {
         let meta = &self.meta;
         let sockets = &self.sockets;
@@ -557,6 +604,9 @@ impl ManagedInterface {
             };
             tcp_socket_is_pending_accept_candidate(meta, socket_handle, tcp, None)
         });
+        self.accept_successors.retain(|accepted, successor| {
+            self.pending_accepted.contains(accepted) && socket_handle_is_live_tcp(meta, *successor)
+        });
     }
 
     fn queued_pending_tcp_accept(&self, target: IpListenEndpoint) -> Option<SocketHandle> {
@@ -564,6 +614,24 @@ impl ManagedInterface {
             .iter()
             .copied()
             .find(|handle| self.tcp_socket_is_pending_accept(*handle, target))
+    }
+
+    fn tcp_listen_socket_exists(&self, exclude: SocketHandle, target: IpListenEndpoint) -> bool {
+        for (handle, socket) in self.sockets.iter() {
+            if handle == exclude {
+                continue;
+            }
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            if socket_handle_is_live_tcp(&self.meta, handle)
+                && tcp.state() == smoltcp::socket::tcp::State::Listen
+                && listen_endpoint_matches(tcp.listen_endpoint(), target)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn enqueue_pending_tcp_accept(&mut self, handle: SocketHandle) {
@@ -578,6 +646,56 @@ impl ManagedInterface {
 
     fn remove_pending_tcp_accept(&mut self, handle: SocketHandle) {
         self.pending_accepted.retain(|queued| *queued != handle);
+        if let Some(successor) = self.accept_successors.remove(&handle) {
+            if !self.accept_published_listeners.remove(&successor)
+                && socket_handle_is_live_tcp(&self.meta, successor)
+            {
+                self.remove_smoltcp_socket_locked(successor);
+            }
+        }
+        let stale_accepted: Vec<SocketHandle> = self
+            .accept_successors
+            .iter()
+            .filter_map(|(accepted, successor)| (*successor == handle).then_some(*accepted))
+            .collect();
+        for accepted in stale_accepted {
+            self.accept_successors.remove(&accepted);
+        }
+    }
+
+    /// 取出指定已建立连接对应的补位监听 socket。
+    pub fn take_accept_successor(
+        &mut self,
+        accepted: ProtocolSocketHandle,
+    ) -> Option<ProtocolSocketHandle> {
+        let accepted = accepted.into_smoltcp();
+        let mut successor = self.accept_successors.remove(&accepted)?;
+        let mut remaining = self.accept_successors.len() + 1;
+        while remaining != 0 {
+            if self.tcp_socket_is_live_listen(successor) {
+                self.accept_published_listeners.insert(successor);
+                return Some(ProtocolSocketHandle::from_smoltcp(successor));
+            }
+            let Some(next) = self.accept_successors.get(&successor).copied() else {
+                return None;
+            };
+            successor = next;
+            remaining -= 1;
+        }
+        None
+    }
+
+    fn tcp_socket_is_live_listen(&self, handle: SocketHandle) -> bool {
+        if !socket_handle_is_live_tcp(&self.meta, handle) {
+            return false;
+        }
+        let Some((_, socket)) = self.sockets.iter().find(|(h, _)| *h == handle) else {
+            return false;
+        };
+        let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+            return false;
+        };
+        tcp.state() == smoltcp::socket::tcp::State::Listen
     }
 
     fn tcp_socket_is_pending_accept(&self, handle: SocketHandle, target: IpListenEndpoint) -> bool {
@@ -619,6 +737,7 @@ impl ManagedInterface {
         // `sockets.remove`，触发 "handle does not refer to a valid socket"。
         self.meta.remove(&handle);
         self.remove_pending_tcp_accept(handle);
+        self.accept_published_listeners.remove(&handle);
         self.sockets.remove(handle);
     }
 
@@ -935,6 +1054,15 @@ fn tcp_socket_is_pending_accept_candidate(
     })
 }
 
+fn socket_handle_is_live_tcp(
+    meta: &BTreeMap<SocketHandle, SocketMeta>,
+    handle: SocketHandle,
+) -> bool {
+    meta.get(&handle).is_some_and(|meta| {
+        meta.socket_type() == SocketType::Tcp && !meta.is_removed() && !meta.is_orphaned()
+    })
+}
+
 // ── 类型转换 ─────────────────────────────────────────────────────────────────
 
 fn ipv4_to_smoltcp(addr: Ipv4Addr) -> Ipv4Address {
@@ -1054,6 +1182,7 @@ mod tests {
             ManagedInterface::new(
                 dev,
                 config,
+                NetTuning::defaults().tcp,
                 TcpListenTuning {
                     accept_backlog: backlog,
                 },
@@ -1256,19 +1385,73 @@ mod tests {
 
         drive_inbound_handshake(&mut iface, &driver, listener, 40_001, 8080);
         assert_eq!(iface.pending_accepted.len(), 1);
+        let successor = iface.take_accept_successor(listener).unwrap();
         iface.mark_socket_accepted(listener);
         assert!(iface.pending_accepted.is_empty());
         assert_eq!(iface.pending_tcp_accept(listener, listen_endpoint), None);
 
+        drive_inbound_handshake(&mut iface, &driver, successor, 40_002, 8080);
+        assert_eq!(iface.pending_accepted.len(), 1);
+        iface.remove_socket_locked(successor);
+        assert!(iface.pending_accepted.is_empty());
+    }
+
+    #[test]
+    fn pending_accept_poll_installs_successor_listener() {
+        let driver = Arc::new(TestDriver::default());
+        let (_iface_id, mut iface) = test_interface_with_driver(driver.clone(), 8);
+        let tuning = NetTuning::defaults();
         let listener = iface.add_tcp_socket(tuning.tcp);
+        let listen_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
         iface
             .tcp_socket_mut(listener)
             .listen(listen_endpoint)
             .unwrap();
-        drive_inbound_handshake(&mut iface, &driver, listener, 40_002, 8080);
-        assert_eq!(iface.pending_accepted.len(), 1);
-        iface.remove_socket_locked(listener);
-        assert!(iface.pending_accepted.is_empty());
+
+        drive_inbound_handshake(&mut iface, &driver, listener, 40_005, 8080);
+
+        let successor = iface.accept_successors[&listener.into_smoltcp()];
+        assert!(iface.tcp_socket_is_live_listen(successor));
+        assert_eq!(
+            iface
+                .tcp_socket(ProtocolSocketHandle::from_smoltcp(successor))
+                .listen_endpoint(),
+            listen_endpoint
+        );
+    }
+
+    #[test]
+    fn accept_successor_follows_converted_listener_chain() {
+        let driver = Arc::new(TestDriver::default());
+        let (_iface_id, mut iface) = test_interface_with_driver(driver.clone(), 8);
+        let tuning = NetTuning::defaults();
+        let first = iface.add_tcp_socket(tuning.tcp);
+        let listen_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
+        iface.tcp_socket_mut(first).listen(listen_endpoint).unwrap();
+
+        drive_inbound_handshake(&mut iface, &driver, first, 40_006, 8080);
+        let second_raw = iface.accept_successors[&first.into_smoltcp()];
+        let second = ProtocolSocketHandle::from_smoltcp(second_raw);
+        drive_inbound_handshake(&mut iface, &driver, second, 40_007, 8080);
+
+        let current_listener = iface.take_accept_successor(first).unwrap();
+        assert!(iface.tcp_socket_is_live_listen(current_listener.into_smoltcp()));
+        assert_ne!(current_listener.into_smoltcp(), second_raw);
+        assert_eq!(
+            iface.pending_tcp_accept(first, listen_endpoint),
+            Some(first)
+        );
+        iface.mark_socket_accepted(first);
+        assert_eq!(
+            iface.pending_tcp_accept(second, listen_endpoint),
+            Some(second)
+        );
     }
 
     #[test]

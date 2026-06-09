@@ -111,7 +111,8 @@ impl NetStack {
     /// 此操作短暂持有写锁，会暂停所有正在进行的 poll。
     pub fn attach(&self, dev: Arc<NetDevice>, config: IfConfig) -> Result<(), NetError> {
         let id = dev.id();
-        let managed = ManagedInterface::new(dev, config.clone(), self.tuning.tcp_listen);
+        let managed =
+            ManagedInterface::new(dev, config.clone(), self.tuning.tcp, self.tuning.tcp_listen);
         let mut table = self.interfaces.write();
         if table.contains_key(&id) {
             return Err(NetError::InterfaceExists);
@@ -1388,17 +1389,23 @@ impl NetStack {
                 .remote_endpoint()
                 .map(endpoint_from_smoltcp);
 
-            let new_listen_handle = managed.add_tcp_socket(self.tuning.tcp);
+            let new_listen_handle =
+                if let Some(successor) = managed.take_accept_successor(listen_handle.inner) {
+                    successor
+                } else {
+                    let new_listen_handle = managed.add_tcp_socket(self.tuning.tcp);
+                    managed
+                        .tcp_socket_mut(new_listen_handle)
+                        .listen(listen_endpoint)
+                        .map_err(|_| NetError::AddressInUse)?;
+                    new_listen_handle
+                };
             let new_listen = make_net_handle(
                 &managed,
                 listen_handle.iface_id,
                 new_listen_handle,
                 SocketType::Tcp,
             )?;
-            managed
-                .tcp_socket_mut(new_listen_handle)
-                .listen(listen_endpoint)
-                .map_err(|_| NetError::AddressInUse)?;
             let accepted = listen_handle;
             managed.mark_socket_accepted(listen_handle.inner);
             TcpAcceptInfo {
