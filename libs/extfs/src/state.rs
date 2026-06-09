@@ -349,6 +349,9 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
+        if count == 1 {
+            return self.read_block(start_block, out);
+        }
         // 分批读取，每批不超过 MAX_CHUNK_BLOCKS，避免超出 VirtIO 队列限制
         const MAX_CHUNK_BLOCKS: u32 = 128; // 128×4KB=512KB，VirtIO 256 descriptor 安全范围内
         let mut off = 0usize;
@@ -641,6 +644,7 @@ mod tests {
     struct CountingBackend {
         data: Spinlock<Vec<u8>>,
         sector_size: u32,
+        reads: Spinlock<Vec<(u64, u32)>>,
         writes: Spinlock<Vec<(u64, u32)>>,
     }
 
@@ -649,6 +653,7 @@ mod tests {
             Self {
                 data: Spinlock::new(vec![0; sector_count as usize * sector_size as usize]),
                 sector_size,
+                reads: Spinlock::new(Vec::new()),
                 writes: Spinlock::new(Vec::new()),
             }
         }
@@ -660,6 +665,10 @@ mod tests {
 
         fn writes(&self) -> Vec<(u64, u32)> {
             self.writes.lock().clone()
+        }
+
+        fn reads(&self) -> Vec<(u64, u32)> {
+            self.reads.lock().clone()
         }
     }
 
@@ -691,6 +700,7 @@ mod tests {
                 return Err(BlockBackendError::OutOfRange);
             }
             buf[..len].copy_from_slice(&data[start..end]);
+            self.reads.lock().push((lba, count));
             Ok(())
         }
 
@@ -791,5 +801,24 @@ mod tests {
         );
         // direct 新块由文件写路径覆盖/补零，这里只应落盘块位图，不能额外写数据零块。
         assert_eq!(backend.writes(), vec![(2, 2)]);
+    }
+
+    #[test]
+    fn read_blocks_single_block_uses_block_cache() {
+        let backend = Arc::new(CountingBackend::new(128, 512));
+        let mut data = vec![0u8; 1024];
+        data[0] = 0xaa;
+        backend.seed_block(8, 1024, &data);
+
+        let state = alloc_test_state(Arc::clone(&backend));
+        let mut first = vec![0u8; 1024];
+        let mut second = vec![0u8; 1024];
+
+        state.read_blocks(8, 1, &mut first).expect("first read");
+        state.read_blocks(8, 1, &mut second).expect("cached read");
+
+        assert_eq!(first, data);
+        assert_eq!(second, data);
+        assert_eq!(backend.reads(), vec![(16, 2)]);
     }
 }
