@@ -168,11 +168,7 @@ fn alloc_run_in_bitmap(
     state.read_block(bitmap_block, &mut bm)?;
 
     let start = start_hint.min(bits_in_group);
-    let result = find_zero_run(&bm, start, bits_in_group, want).or_else(|| {
-        (start > 0)
-            .then(|| find_zero_run(&bm, 0, start, want))
-            .flatten()
-    });
+    let result = choose_zero_run(&bm, start, bits_in_group, want);
     if let Some((nr, count)) = result {
         for i in 0..count {
             let bit = nr + i;
@@ -185,29 +181,140 @@ fn alloc_run_in_bitmap(
     Ok(None)
 }
 
-/// 在位图中找最多 `want` 个连续的 0-bit，至少找到 1 个才返回。
+fn choose_zero_run(bm: &[u8], start: u32, end: u32, want: u32) -> Option<(u32, u32)> {
+    let want = want.max(1);
+    let primary = find_zero_run(bm, start, end, want);
+    if primary.is_some_and(|(_, count)| count >= want) {
+        return primary;
+    }
+    let wrapped = (start > 0)
+        .then(|| find_zero_run(bm, 0, start, want))
+        .flatten();
+    if wrapped.is_some_and(|(_, count)| count >= want) {
+        return wrapped;
+    }
+    match (primary, wrapped) {
+        (Some(a), Some(b)) if b.1 > a.1 => Some(b),
+        (Some(a), _) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// 在位图中找一段连续 0-bit。
+///
+/// 优先返回满足 `want` 的 run；如果本扫描区间内没有足够长的连续空间，则返回
+/// 最长的短 run。bench 的新文件顺序写会直接受 extent 长度影响，不能只拿第一个
+/// 零 bit 附近的短 run，否则会把一次大写拆成多条 extent 和多轮位图更新。
 fn find_zero_run(bm: &[u8], start: u32, end: u32, want: u32) -> Option<(u32, u32)> {
-    let first = find_zero_bit(bm, start, end)?;
-    let run_start = first;
-    let mut count = 1u32;
-    let mut nr = first + 1;
-    while count < want && nr < end {
-        // 对齐后的全零 u64 可直接累加 64
-        if nr % 64 == 0 && nr + 64 <= end && count + 64 <= want {
-            let word = read_bitmap_u64(bm, (nr / 8) as usize);
-            if word == 0 {
-                count += 64;
-                nr += 64;
-                continue;
+    let want = want.max(1);
+    let mut nr = start;
+    let mut best: Option<(u32, u32)> = None;
+
+    while nr < end {
+        let Some(run_start) = find_zero_bit(bm, nr, end) else {
+            break;
+        };
+        let mut count = 1u32;
+        nr = run_start + 1;
+
+        while count < want && nr < end {
+            // 对齐后的全零 u64 可直接累加，减少大空闲区上的逐位判断。
+            if nr % 64 == 0 && nr + 64 <= end && count + 64 <= want {
+                let word = read_bitmap_u64(bm, (nr / 8) as usize);
+                if word == 0 {
+                    count += 64;
+                    nr += 64;
+                    continue;
+                }
             }
+            if !bit_is_zero(bm, nr) {
+                nr += 1;
+                break;
+            }
+            count += 1;
+            nr += 1;
         }
-        if !bit_is_zero(bm, nr) {
+
+        if count >= want {
+            return Some((run_start, want));
+        }
+        match best {
+            Some((_, best_count)) if best_count >= count => {}
+            _ => best = Some((run_start, count)),
+        }
+
+        // 如果 run 是因为达到 end 结束，后面没有更多候选。
+        if nr >= end {
             break;
         }
-        count += 1;
-        nr += 1;
+        // 如果 run 是因为达到 want 结束，上面已经返回；其余情况 nr 已跳过占用 bit。
+        while nr < end && !bit_is_zero(bm, nr) {
+            if nr % 64 == 0 && nr + 64 <= end {
+                let word = read_bitmap_u64(bm, (nr / 8) as usize);
+                if word == u64::MAX {
+                    nr += 64;
+                    continue;
+                }
+            }
+            nr += 1;
+        }
     }
-    Some((run_start, count))
+
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use std::vec;
+
+    fn mark_used(bits: &mut [u8], bit: u32) {
+        let byte_idx = (bit / 8) as usize;
+        bits[byte_idx] |= 1 << ((bit % 8) as u8);
+    }
+
+    #[test]
+    fn find_zero_run_prefers_requested_length_over_first_short_run() {
+        let mut bits = vec![0xffu8; 16];
+        // [2, 4) 是短 run，[8, 14) 能满足请求。
+        for bit in 2..4 {
+            bits[(bit / 8) as usize] &= !(1 << ((bit % 8) as u8));
+        }
+        for bit in 8..14 {
+            bits[(bit / 8) as usize] &= !(1 << ((bit % 8) as u8));
+        }
+
+        assert_eq!(find_zero_run(&bits, 0, 32, 6), Some((8, 6)));
+    }
+
+    #[test]
+    fn find_zero_run_returns_longest_short_run_when_request_cannot_fit() {
+        let mut bits = vec![0xffu8; 16];
+        for bit in 1..3 {
+            bits[(bit / 8) as usize] &= !(1 << ((bit % 8) as u8));
+        }
+        for bit in 8..12 {
+            bits[(bit / 8) as usize] &= !(1 << ((bit % 8) as u8));
+        }
+        mark_used(&mut bits, 12);
+
+        assert_eq!(find_zero_run(&bits, 0, 32, 8), Some((8, 4)));
+    }
+
+    #[test]
+    fn choose_zero_run_checks_wrapped_region_before_accepting_short_run() {
+        let mut bits = vec![0xffu8; 16];
+        for bit in 2..8 {
+            bits[(bit / 8) as usize] &= !(1 << ((bit % 8) as u8));
+        }
+        for bit in 18..20 {
+            bits[(bit / 8) as usize] &= !(1 << ((bit % 8) as u8));
+        }
+
+        assert_eq!(choose_zero_run(&bits, 16, 32, 6), Some((2, 6)));
+    }
 }
 
 /// 释放一个数据块。宽松:允许重复释放(do nothing if bitmap bit 已 0)。
