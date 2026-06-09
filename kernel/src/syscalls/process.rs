@@ -1045,7 +1045,7 @@ pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
 }
 
 fn kernel_cpuset_bytes() -> usize {
-    sched::NR_CPUS.div_ceil(8).max(1)
+    sched::CpuMask::supported_storage_bytes()
 }
 
 fn read_cpuset_mask(raw: &[u8]) -> u64 {
@@ -1060,6 +1060,75 @@ fn write_cpuset_mask(out: &mut [u8], mask: u64) {
     let raw = mask.to_le_bytes();
     let n = out.len().min(raw.len());
     out[..n].copy_from_slice(&raw[..n]);
+}
+
+const MYGO_SCHED_INFO_VERSION: u32 = 1;
+const MYGO_SCHED_INFO_HEADER_SIZE: usize = 48;
+const MYGO_SCHED_DOMAIN_ENTRY_SIZE: usize = 32;
+const MYGO_SCHED_DOMAIN_PARENT_NONE: u32 = u32::MAX;
+
+pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let user = ctx.args[0];
+    let size = ctx.args[1];
+    let flags = ctx.args[2];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let topology = sched::sched_topology();
+    let domain_count = topology.len();
+    let required = MYGO_SCHED_INFO_HEADER_SIZE
+        .checked_add(
+            domain_count
+                .checked_mul(MYGO_SCHED_DOMAIN_ENTRY_SIZE)
+                .ok_or(Errno::EOVERFLOW)?,
+        )
+        .ok_or(Errno::EOVERFLOW)?;
+    if user == 0 || size == 0 {
+        return Ok(required);
+    }
+    if size < required {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut out = Vec::new();
+    out.resize(required, 0);
+
+    // 头部：版本、结构尺寸、域数量、CPU 位图与当前调度位置。
+    write_u32(&mut out, 0, MYGO_SCHED_INFO_VERSION);
+    write_u32(&mut out, 4, MYGO_SCHED_INFO_HEADER_SIZE as u32);
+    write_u32(&mut out, 8, MYGO_SCHED_DOMAIN_ENTRY_SIZE as u32);
+    write_u32(&mut out, 12, domain_count as u32);
+    write_u64(&mut out, 16, sched::supported_cpu_mask());
+    write_u64(&mut out, 24, sched::online_cpu_mask());
+    let current_cpu = sched::current_cpu_id();
+    write_u32(&mut out, 32, current_cpu as u32);
+    write_u32(
+        &mut out,
+        36,
+        sched::current_sched_domain_id(current_cpu).unwrap_or(0) as u32,
+    );
+
+    for idx in 0..domain_count {
+        let Some(domain) = topology.domain(idx) else {
+            return Err(Errno::EINVAL);
+        };
+        let off = MYGO_SCHED_INFO_HEADER_SIZE + idx * MYGO_SCHED_DOMAIN_ENTRY_SIZE;
+        write_u32(&mut out, off, domain.id() as u32);
+        write_u32(
+            &mut out,
+            off + 4,
+            domain
+                .parent()
+                .map(|id| id as u32)
+                .unwrap_or(MYGO_SCHED_DOMAIN_PARENT_NONE),
+        );
+        write_u32(&mut out, off + 8, domain.level() as u32);
+        write_u64(&mut out, off + 16, domain.span().bits());
+    }
+
+    copy_to_user(user, &out).map_err(|e| e.as_errno())?;
+    Ok(required)
 }
 
 pub(super) fn sys_sched_get_priority_max(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2252,6 +2321,10 @@ fn write_i32(out: &mut [u8], off: usize, value: i32) {
 
 fn write_u32(out: &mut [u8], off: usize, value: u32) {
     out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(out: &mut [u8], off: usize, value: u64) {
+    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn put_u16(out: &mut [u8], off: usize, v: u16) {

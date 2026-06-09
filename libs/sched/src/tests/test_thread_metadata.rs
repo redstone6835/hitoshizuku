@@ -8,8 +8,8 @@ use alloc::sync::Weak;
 use ktest::ktest;
 
 use crate::{
-    NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedParams, Session, TASK_COMM_LEN,
-    Task, ThreadGroup, supported_cpu_mask,
+    CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedParams,
+    Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
 };
 
 fn make_task() -> alloc::sync::Arc<Task> {
@@ -67,4 +67,24 @@ fn supported_cpu_mask_matches_configured_capacity() {
     let task = make_task();
     task.set_cpu_affinity(0);
     assert_eq!(task.cpu_affinity(), 1);
+}
+
+#[ktest]
+fn runqueue_pick_respects_cpu_affinity_mask() {
+    let task0 = make_task();
+    let task1 = make_task();
+    task0.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    task1.set_cpu_affinity(CpuMask::single_raw(1).bits());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task0), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&task1), 1);
+
+    let picked = rq
+        .pick_next_on(2, CpuMask::single_raw(1).bits())
+        .expect("cpu1 should find an allowed task");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &task1));
+
+    assert!(rq.dequeue(&task0, 3));
+    assert!(rq.dequeue(&task1, 3));
 }

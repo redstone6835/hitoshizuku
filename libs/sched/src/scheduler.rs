@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch_hooks;
+use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedTopology};
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
@@ -36,7 +37,7 @@ use crate::{ExitCode, TaskState};
 
 /// 支持的最大 CPU 数。SMP 启动落地之前只有 CPU 0 真正被使用；保留更大数组
 /// 是为了让锁顺序、索引代码一次到位，AP 启动接入时无需重排数据结构。
-pub const NR_CPUS: usize = 8;
+pub const NR_CPUS: usize = MAX_CPUS;
 
 // ── 全局锚点 ──────────────────────────────────────────────────────────────────
 
@@ -93,6 +94,11 @@ static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new(
 /// 已上线 CPU 位图。CPU0 在 init 前后始终视为 online；AP 启动后通过
 /// [`register_cpu`] 打开对应 bit。
 static CPU_ONLINE: AtomicU64 = AtomicU64::new(1);
+
+/// 调度域拓扑。默认只有覆盖全部 CPU 的根域；平台发现更细粒度拓扑后可以在
+/// 启动期安装新的域层级。拓扑只用一把独立锁保护，热路径读取后立即释放，
+/// 不与 rq 锁嵌套。
+static SCHED_TOPOLOGY: Spinlock<SchedTopology> = Spinlock::new(SchedTopology::bootstrap());
 
 /// init 任务全局锚点。写入即 Release，读取必须 Acquire。
 static mut INIT_TASK: Option<Arc<Task>> = None;
@@ -290,29 +296,56 @@ pub fn is_ready() -> bool {
 }
 
 pub fn online_cpu_mask() -> u64 {
-    CPU_ONLINE.load(Ordering::Acquire) & cpu_mask_all()
+    online_cpu_set().bits()
 }
 
 pub const fn supported_cpu_mask() -> u64 {
-    cpu_mask_all()
+    CpuMask::SUPPORTED.bits()
+}
+
+fn online_cpu_set() -> CpuMask {
+    CpuMask::from_bits_truncate(CPU_ONLINE.load(Ordering::Acquire)).or_boot()
+}
+
+pub fn sched_topology() -> SchedTopology {
+    *SCHED_TOPOLOGY.lock()
+}
+
+pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errno> {
+    if !topology
+        .root_domain()
+        .span()
+        .contains_mask(CpuMask::SUPPORTED)
+    {
+        return Err(errno::Errno::EINVAL);
+    }
+    *SCHED_TOPOLOGY.lock() = topology;
+    Ok(())
+}
+
+pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
+    let cpu = CpuId::new(cpu_id)?;
+    sched_topology()
+        .domain_for_cpu(cpu)
+        .map(|domain| domain.id())
 }
 
 pub fn is_cpu_online(cpu_id: usize) -> bool {
-    cpu_id < NR_CPUS && (online_cpu_mask() & cpu_bit(cpu_id)) != 0
+    CpuId::new(cpu_id).is_some_and(|cpu| online_cpu_set().contains(cpu))
 }
 
 pub fn register_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
-    if cpu_id >= NR_CPUS {
+    let Some(cpu) = CpuId::new(cpu_id) else {
         return Err(errno::Errno::EINVAL);
-    }
-    CPU_ONLINE.fetch_or(cpu_bit(cpu_id), Ordering::AcqRel);
+    };
+    CPU_ONLINE.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
     Ok(())
 }
 
 /// AP 启动路径的调度接入口框架：把当前 CPU 正在执行的 task 登记为该 CPU 的
 /// current。当前 kernel 启动链路不调用它；AP bring-up 落地时可直接接入。
 pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Errno> {
-    if cpu_id >= NR_CPUS {
+    if CpuId::new(cpu_id).is_none() {
         return Err(errno::Errno::EINVAL);
     }
     register_cpu(cpu_id)?;
@@ -375,27 +408,19 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     }
 }
 
-/// 按亲和性和当前负载选择目标 CPU。没有匹配 online CPU 时回退到 CPU0。
+/// 按调度域、亲和性和当前负载选择目标 CPU。
 pub fn select_task_cpu(task: &Arc<Task>) -> usize {
-    let allowed = task.cpu_affinity() & online_cpu_mask();
-    let allowed = if allowed == 0 { 1 } else { allowed };
-    let current = task.current_cpu();
-    if task.state() != TaskState::New && current < NR_CPUS && (allowed & cpu_bit(current)) != 0 {
-        return current;
-    }
-    let mut best_cpu = 0usize;
-    let mut best_load = usize::MAX;
-    for cpu_id in 0..NR_CPUS {
-        if (allowed & cpu_bit(cpu_id)) == 0 {
-            continue;
-        }
-        let load = RUNQUEUES[cpu_id].nr_running();
-        if load < best_load {
-            best_cpu = cpu_id;
-            best_load = load;
-        }
-    }
-    best_cpu
+    let allowed = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    let online = online_cpu_set();
+    let current = CpuId::new(task.current_cpu());
+    let prefer_current = task.state() != TaskState::New;
+
+    sched_topology()
+        .select_cpu(allowed, online, current, prefer_current, |cpu| {
+            RUNQUEUES[cpu.get()].nr_running()
+        })
+        .unwrap_or_else(CpuId::boot)
+        .get()
 }
 
 /// 统一入队入口：设置任务 CPU 归属、入目标 runqueue、请求该 CPU 调度。
@@ -610,10 +635,14 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
 }
 
 pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
-    if target_cpu >= NR_CPUS || !is_cpu_online(target_cpu) {
+    let Some(target) = CpuId::new(target_cpu) else {
+        return Err(errno::Errno::EINVAL);
+    };
+    if !online_cpu_set().contains(target) {
         return Err(errno::Errno::EINVAL);
     }
-    if (task.cpu_affinity() & cpu_bit(target_cpu)) == 0 {
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    if !affinity.contains(target) {
         return Err(errno::Errno::EINVAL);
     }
     if task.state() == TaskState::Running {
@@ -657,26 +686,30 @@ pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Er
 
 /// 从最忙 CPU 拉一个任务到 `cpu_id`。AP 启动后可由 idle/tick 路径周期调用。
 pub fn balance_once(cpu_id: usize) -> bool {
-    if !is_cpu_online(cpu_id) {
+    let Some(local_cpu) = CpuId::new(cpu_id) else {
+        return false;
+    };
+    let online = online_cpu_set();
+    if !online.contains(local_cpu) {
         return false;
     }
+
     let local_load = RUNQUEUES[cpu_id].nr_running();
     let mut busiest = None;
     let mut busiest_load = local_load;
-    for other in 0..NR_CPUS {
-        if other == cpu_id || !is_cpu_online(other) {
-            continue;
-        }
-        let load = RUNQUEUES[other].nr_running();
+    let sources = sched_topology().balance_sources(local_cpu, online);
+    for other in sources.iter() {
+        let other_id = other.get();
+        let load = RUNQUEUES[other_id].nr_running();
         if load > busiest_load + 1 {
-            busiest = Some(other);
+            busiest = Some(other_id);
             busiest_load = load;
         }
     }
     let Some(src) = busiest else {
         return false;
     };
-    let allowed = cpu_bit(cpu_id);
+    let allowed = CpuMask::single(local_cpu).bits();
     let Some(task) = RUNQUEUES[src].take_migratable(allowed, now_ns_internal()) else {
         return false;
     };
@@ -761,7 +794,7 @@ pub fn schedule_once(now_ns: u64) {
     }
 
     // 2. 挑下一个；pick_next 会把 prev 放回 tree（若仍 runnable）。
-    let next = match RUNQUEUES[cpu_id].pick_next(now_ns) {
+    let next = match RUNQUEUES[cpu_id].pick_next_on(now_ns, CpuMask::single_raw(cpu_id).bits()) {
         Some(t) => t,
         None => {
             // 队列空：回落到本核 idle。idle 未安装则保持 prev 不切。
@@ -892,9 +925,7 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
     };
     let t = crate::spawn::kthread_create(idle_entry, cpu_id, params);
     t.sched.set_sched_attr(SchedAttr::idle());
-    if cpu_id < 64 {
-        t.set_cpu_affinity(1u64 << cpu_id);
-    }
+    t.set_cpu_affinity(CpuMask::single_raw(cpu_id).bits());
     install_idle(cpu_id, Arc::clone(&t));
     log::info!(
         "[sched][idle] cpu={} pid={:?} weight={}",
@@ -937,18 +968,6 @@ pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
         removed,
         task.state(),
     );
-}
-
-const fn cpu_mask_all() -> u64 {
-    if NR_CPUS >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << NR_CPUS) - 1
-    }
-}
-
-const fn cpu_bit(cpu_id: usize) -> u64 {
-    if cpu_id >= 64 { 0 } else { 1u64 << cpu_id }
 }
 
 fn dequeue_for_state_change(task: &Arc<Task>, now_ns: u64) -> bool {

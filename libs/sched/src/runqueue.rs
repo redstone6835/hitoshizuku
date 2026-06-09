@@ -208,6 +208,14 @@ impl Runqueue {
     }
 
     pub fn pick_next(&self, now_ns: u64) -> Option<Arc<Task>> {
+        self.pick_next_on(now_ns, u64::MAX)
+    }
+
+    /// 在指定 CPU 许可位下挑选下一个任务。
+    ///
+    /// 迁移或亲和性更新可能让某个任务暂时留在不再允许它运行的 rq 中；这里
+    /// 只跳过这类任务，不在持有本 rq 锁时跨 CPU 迁移，避免形成跨 rq 锁顺序。
+    pub fn pick_next_on(&self, now_ns: u64, cpu_mask: u64) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
 
@@ -224,7 +232,7 @@ impl Runqueue {
             }
         }
 
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr);
+        let picked = pick_queued_locked(&mut inner, fair_prev_addr, cpu_mask);
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
@@ -398,48 +406,90 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
     inner.fair_tree.insert(FairKey::of(&task), task);
 }
 
-fn pick_queued_locked(inner: &mut RqInner, fair_prev_addr: Option<usize>) -> Option<Arc<Task>> {
-    if let Some(key) = inner.deadline_tree.keys().next().copied() {
+fn pick_queued_locked(
+    inner: &mut RqInner,
+    fair_prev_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
+    if let Some(key) = inner
+        .deadline_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)
+    {
         return inner.deadline_tree.remove(&key);
     }
-    if let Some(key) = inner.rt_tree.keys().next().copied() {
+    if let Some(key) = inner
+        .rt_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)
+    {
         return inner.rt_tree.remove(&key);
     }
-    if let Some(task) = pick_fair_locked(inner, fair_prev_addr) {
+    if let Some(task) = pick_fair_locked(inner, fair_prev_addr, cpu_mask) {
         return Some(task);
     }
-    let key = inner.idle_tree.keys().next().copied()?;
+    let key = inner
+        .idle_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)?;
     inner.idle_tree.remove(&key)
 }
 
-fn pick_fair_locked(inner: &mut RqInner, skip_addr: Option<usize>) -> Option<Arc<Task>> {
+fn pick_fair_locked(
+    inner: &mut RqInner,
+    skip_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
     let key = if let Some(skip) = skip_addr {
         inner
             .fair_tree
             .iter()
-            .find(|(_, task)| task_addr(task) != skip && task.sched.vruntime() <= avg)
+            .find(|(_, task)| {
+                task_addr(task) != skip
+                    && task_allowed_on(task, cpu_mask)
+                    && task.sched.vruntime() <= avg
+            })
             .map(|(key, _)| *key)
             .or_else(|| {
                 inner
                     .fair_tree
                     .iter()
-                    .filter(|(_, task)| task_addr(task) != skip)
+                    .filter(|(_, task)| task_addr(task) != skip && task_allowed_on(task, cpu_mask))
                     .min_by_key(|(_, task)| task.sched.vruntime())
                     .map(|(key, _)| *key)
             })
-            .or_else(|| inner.fair_tree.keys().next().copied())
+            .or_else(|| {
+                inner
+                    .fair_tree
+                    .iter()
+                    .find(|(_, task)| task_allowed_on(task, cpu_mask))
+                    .map(|(key, _)| *key)
+            })
     } else {
         inner
             .fair_tree
             .iter()
-            .find(|(_, task)| task.sched.vruntime() <= avg)
+            .find(|(_, task)| task_allowed_on(task, cpu_mask) && task.sched.vruntime() <= avg)
             .map(|(key, _)| *key)
-            .or_else(|| inner.fair_tree.keys().next().copied())
+            .or_else(|| {
+                inner
+                    .fair_tree
+                    .iter()
+                    .find(|(_, task)| task_allowed_on(task, cpu_mask))
+                    .map(|(key, _)| *key)
+            })
     }?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     Some(task)
+}
+
+fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
+    (task.cpu_affinity() & cpu_mask) != 0
 }
 
 fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {

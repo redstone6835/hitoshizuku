@@ -13,6 +13,7 @@ use alloc::sync::Arc;
 use errno::Errno;
 
 use crate::clone_flags::{CloneArgs, CloneFlags};
+use crate::cpu::{CpuId, CpuMask};
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session};
 use crate::ids::{Capability, Gid, Uid};
@@ -21,9 +22,9 @@ use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
 use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::sched_class::SchedAttr;
 use crate::scheduler::{
-    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, is_cpu_online,
-    mark_task_stopped, migrate_task, request_post_syscall_handoff, request_resched, root_pid_ns,
-    runqueue_of, schedule_once, signal_wakeup, supported_cpu_mask,
+    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
+    migrate_task, online_cpu_mask, request_post_syscall_handoff, request_resched, root_pid_ns,
+    runqueue_of, sched_topology, schedule_once, signal_wakeup, supported_cpu_mask,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
@@ -331,36 +332,42 @@ pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
     Ok(lookup_pid(pid)?.cpu_affinity() & supported_cpu_mask())
 }
 
-fn affinity_cpu_bit(cpu_id: usize) -> u64 {
-    if cpu_id >= u64::BITS as usize {
-        0
-    } else {
-        1u64 << cpu_id
-    }
-}
-
 pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
     let task = lookup_pid(pid)?;
-    let supported = mask & supported_cpu_mask();
-    if supported == 0 {
+    let requested = CpuMask::from_bits_truncate(mask);
+    if requested.is_empty() {
         return Err(Errno::EINVAL);
     }
+    let online = CpuMask::from_bits_truncate(online_cpu_mask());
+    if requested.intersection(online).is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let supported = requested.bits();
     task.set_cpu_affinity(supported);
 
     let current_cpu = task.current_cpu();
-    if current_cpu < NR_CPUS && (supported & affinity_cpu_bit(current_cpu)) == 0 {
-        if let Some(target_cpu) = (0..NR_CPUS)
-            .find(|cpu_id| (supported & affinity_cpu_bit(*cpu_id)) != 0 && is_cpu_online(*cpu_id))
-        {
-            if migrate_task(&task, target_cpu).is_err() {
-                request_resched(current_cpu);
-            }
+    let current = CpuId::new(current_cpu);
+    if current.is_some_and(|cpu| requested.contains(cpu)) {
+        return Ok(());
+    }
+
+    let target = sched_topology()
+        .select_cpu(requested, online, current, false, |cpu| {
+            runqueue_of(cpu.get()).nr_running()
+        })
+        .map(|cpu| cpu.get());
+
+    if let Some(target_cpu) = target {
+        if migrate_task(&task, target_cpu).is_err() && current_cpu < NR_CPUS {
+            request_resched(current_cpu);
         }
+    } else if current_cpu < NR_CPUS {
+        request_resched(current_cpu);
     }
     Ok(())
 }
 
-/// getcpu：返回当前调度 CPU；NUMA node 暂按 UMA 返回 0。
+/// getcpu：返回当前调度 CPU；节点编号由兼容层保持 UMA 语义。
 pub fn getcpu() -> Result<(u32, u32), Errno> {
     Ok((current_cpu_id() as u32, 0))
 }

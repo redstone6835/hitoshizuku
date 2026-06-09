@@ -185,3 +185,7 @@ pub const SYS_FUTEX_WAITV: usize = 449;
 pub const SYS_FUTEX_WAKE: usize = 454;
 pub const SYS_FUTEX_WAIT: usize = 455;
 pub const SYS_FUTEX_REQUEUE: usize = 456;
+
+// MyGo 内核私有调度查询入口。该号位于当前分发表容量内，且避开已接入的
+// 通用 Linux ABI；返回格式由 kernel/syscalls/process.rs 的兼容层定义。
+pub const SYS_MYGO_SCHED_INFO: usize = 510;
