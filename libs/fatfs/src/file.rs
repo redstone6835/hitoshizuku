@@ -26,6 +26,13 @@ use crate::inode::FileInodeOps;
 use crate::state::FsState;
 use crate::sync_layer::backend_to_vfs;
 
+/// 句柄级簇链缓存的连续预取窗口。
+///
+/// bench 的 4K x1024 覆盖写每次只请求一个簇,如果只按需追一跳 FAT 链,会把
+/// FAT entry 读取和锁开销放大到每次 write_at。小批量预取连续簇可把顺序小 I/O
+/// 合并成少量 FAT 扫描,同时避免一次随机读把整条大文件链都缓存下来。
+const CHAIN_CACHE_PREFETCH_CLUSTERS: u32 = 64;
+
 // ── 目录 FileOps ─────────────────────────────────────────────────────────
 
 pub struct DirFileOps {
@@ -242,7 +249,7 @@ impl RegFileOps {
 
     fn ensure_cached_cluster(&self, first_cluster: u32, target_idx: u32) -> VfsResult<bool> {
         loop {
-            let last = {
+            let (last_idx, last) = {
                 let mut cache = self.chain_cache.lock();
                 if cache.first_cluster != first_cluster || cache.clusters.is_empty() {
                     cache.reset(first_cluster);
@@ -250,8 +257,25 @@ impl RegFileOps {
                 if cache.clusters.len() > target_idx as usize {
                     return Ok(true);
                 }
-                *cache.clusters.last().ok_or(VfsError::Io)?
+                let last_idx = cache.clusters.len().saturating_sub(1) as u32;
+                (last_idx, *cache.clusters.last().ok_or(VfsError::Io)?)
             };
+
+            let missing = target_idx
+                .saturating_add(1)
+                .saturating_sub(last_idx.saturating_add(1));
+            let max_run = missing
+                .saturating_add(CHAIN_CACHE_PREFETCH_CLUSTERS)
+                .saturating_add(1);
+            let run = self
+                .state
+                .fat
+                .contiguous_run(self.state.backend.as_ref(), last, max_run)
+                .map_err(backend_to_vfs)?;
+            if run > 1 {
+                self.extend_contiguous_cache(first_cluster, last_idx, last, run);
+                continue;
+            }
 
             let Some(next) = self
                 .state
