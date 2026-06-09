@@ -134,31 +134,7 @@ impl FatTable {
         lba: u64,
         sector_bytes: u32,
     ) -> Result<&'a mut FatSlot, BlockBackendError> {
-        if let Some(pos) = slots.iter().position(|s| s.lba == lba) {
-            if pos != 0 {
-                let slot = slots.remove(pos);
-                slots.insert(0, slot);
-            }
-            return Ok(&mut slots[0]);
-        }
-        let mut data = alloc::vec![0u8; sector_bytes as usize];
-        backend.read_sectors(lba, 1, &mut data)?;
-        if slots.len() >= capacity {
-            if let Some(ev) = slots.pop() {
-                if ev.dirty {
-                    backend.write_sectors(ev.lba, 1, &ev.data)?;
-                }
-            }
-        }
-        slots.insert(
-            0,
-            FatSlot {
-                lba,
-                data,
-                dirty: false,
-            },
-        );
-        Ok(&mut slots[0])
+        Self::ensure_slot_present_with_dirty(slots, backend, capacity, lba, sector_bytes, false)
     }
 
     fn ensure_slot_present_mut<'a>(
@@ -168,33 +144,59 @@ impl FatTable {
         lba: u64,
         sector_bytes: u32,
     ) -> Result<&'a mut FatSlot, BlockBackendError> {
+        Self::ensure_slot_present_with_dirty(slots, backend, capacity, lba, sector_bytes, true)
+    }
+
+    fn ensure_slot_present_with_dirty<'a>(
+        slots: &'a mut Vec<FatSlot>,
+        backend: &dyn BlockBackend,
+        capacity: usize,
+        lba: u64,
+        sector_bytes: u32,
+        mark_dirty: bool,
+    ) -> Result<&'a mut FatSlot, BlockBackendError> {
         if let Some(pos) = slots.iter().position(|s| s.lba == lba) {
             if pos != 0 {
                 let mut slot = slots.remove(pos);
-                slot.dirty = true;
+                slot.dirty |= mark_dirty;
                 slots.insert(0, slot);
-            } else {
+            } else if mark_dirty {
                 slots[0].dirty = true;
             }
             return Ok(&mut slots[0]);
         }
-        let mut data = alloc::vec![0u8; sector_bytes as usize];
-        backend.read_sectors(lba, 1, &mut data)?;
-        if slots.len() >= capacity {
-            if let Some(ev) = slots.pop() {
-                if ev.dirty {
-                    backend.write_sectors(ev.lba, 1, &ev.data)?;
+
+        let mut slot = if slots.len() >= capacity {
+            match slots.pop() {
+                Some(mut evicted) => {
+                    if evicted.dirty {
+                        backend.write_sectors(evicted.lba, 1, &evicted.data)?;
+                    }
+                    evicted.dirty = false;
+                    evicted
                 }
+                None => FatSlot {
+                    lba,
+                    data: alloc::vec![0u8; sector_bytes as usize],
+                    dirty: mark_dirty,
+                },
             }
-        }
-        slots.insert(
-            0,
+        } else {
             FatSlot {
                 lba,
-                data,
-                dirty: true,
-            },
-        );
+                data: alloc::vec![0u8; sector_bytes as usize],
+                dirty: mark_dirty,
+            }
+        };
+        if slot.data.len() != sector_bytes as usize {
+            slot.data.resize(sector_bytes as usize, 0);
+        }
+        // 缓存 miss 时复用被驱逐 slot 的扇区缓冲,避免 FAT 顺序扫描反复分配。
+        // 读失败时不把复用缓冲塞回旧 slot:后端可能已经部分改写缓冲内容。
+        backend.read_sectors(lba, 1, &mut slot.data)?;
+        slot.lba = lba;
+        slot.dirty = mark_dirty;
+        slots.insert(0, slot);
         Ok(&mut slots[0])
     }
 
