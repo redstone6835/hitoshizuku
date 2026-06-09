@@ -21,7 +21,7 @@ use vfs::stat::FileType;
 use vfs::superblock::Superblock;
 use vfs::sync::Spinlock;
 
-use crate::dir::{ATTR_DIRECTORY, DirEntryView};
+use crate::dir::{self, ATTR_DIRECTORY, DirBacking};
 use crate::inode::FileInodeOps;
 use crate::state::FsState;
 use crate::sync_layer::backend_to_vfs;
@@ -40,11 +40,14 @@ pub struct DirFileOps {
 }
 
 impl DirFileOps {
-    pub(crate) fn new(entries: Vec<DirEntryView>) -> Self {
-        let snapshot = entries
-            .into_iter()
-            .filter(|e| !e.is_volume())
-            .map(|e| DirEntry {
+    pub(crate) fn new(state: &FsState, backing: DirBacking) -> VfsResult<Self> {
+        let mut snapshot = Vec::new();
+        // 保持打开目录时快照的语义,但扫描时直接生成 VFS DirEntry,避免中间 Vec。
+        dir::visit_entries(state, backing, |e| {
+            if e.is_volume() {
+                return true;
+            }
+            snapshot.push(DirEntry {
                 ino: if e.first_cluster >= 2 {
                     e.first_cluster as u64
                 } else {
@@ -56,11 +59,13 @@ impl DirFileOps {
                 } else {
                     FileType::Regular
                 },
-            })
-            .collect();
-        Self {
+            });
+            true
+        })
+        .map_err(backend_to_vfs)?;
+        Ok(Self {
             snapshot: Spinlock::new(snapshot),
-        }
+        })
     }
 }
 

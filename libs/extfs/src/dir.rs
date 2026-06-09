@@ -143,26 +143,27 @@ fn visit_mapped_dir_blocks<F: FnMut(&[u8]) -> bool>(
     Ok(())
 }
 
-/// 读取一个文件所有已用数据块(根据 size + block_map 回调),并对每块调用
-/// [`scan_dir_block`]。返回所有活跃条目的集合。
-pub(crate) fn read_all_entries(
+/// 遍历目录条目,由调用方决定是否构造集合或提前停止。
+///
+/// 目录 open 只需要生成 VFS 快照,不需要先构造 `Vec<DirEntryRaw>`；该 visitor
+/// 保留原有扫描顺序,同时让调用方少一次中间集合分配。
+pub(crate) fn visit_entries<F>(
     state: &FsState,
     i_block: &[u8],
     flags: u32,
     size: u64,
-) -> Result<Vec<DirEntryRaw>, BlockBackendError> {
+    mut f: F,
+) -> Result<(), BlockBackendError>
+where
+    F: FnMut(&DirEntryRaw) -> bool,
+{
     let block_size = state.ext_sb.block_size as u64;
     let total_blocks = (size + block_size - 1) / block_size;
     let has_ft = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
-    let mut out: Vec<DirEntryRaw> = Vec::new();
     let ranges = mapped_ranges(state, i_block, flags, total_blocks)?;
     visit_mapped_dir_blocks(state, &ranges, |block| {
-        scan_dir_block(block, has_ft, |e| {
-            out.push(e.clone());
-            true
-        })
-    })?;
-    Ok(out)
+        scan_dir_block(block, has_ft, |e| f(e))
+    })
 }
 
 /// 流式判断目录是否为空,只忽略 `.` / `..` 两个固定项。

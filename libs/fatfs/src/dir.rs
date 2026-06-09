@@ -237,7 +237,7 @@ where
     Ok(next_slot)
 }
 
-fn parse_dir_entries<F>(
+pub(crate) fn visit_entries<F>(
     state: &FsState,
     backing: DirBacking,
     mut f: F,
@@ -373,19 +373,6 @@ fn decode_sfn(raw: &[u8; 11]) -> String {
     s
 }
 
-/// 完整读取目录的所有有效条目(跳过已删除与卷标)。LFN 会被自动合并。
-pub(crate) fn read_all_entries(
-    state: &FsState,
-    backing: DirBacking,
-) -> Result<Vec<DirEntryView>, BlockBackendError> {
-    let mut out = Vec::new();
-    parse_dir_entries(state, backing, |entry| {
-        out.push(entry);
-        true
-    })?;
-    Ok(out)
-}
-
 /// 流式判断目录是否为空,只忽略 FAT 目录规定的 `.` / `..` 项。
 ///
 /// `rmdir` 只需要知道是否存在第一个普通条目。这里直接扫描 SFN 槽,避免为整个
@@ -436,7 +423,7 @@ pub(crate) fn find_entry(
     name: &str,
 ) -> Result<Option<DirEntryView>, BlockBackendError> {
     let mut found = None;
-    parse_dir_entries(state, backing, |entry| {
+    visit_entries(state, backing, |entry| {
         if entry.name.eq_ignore_ascii_case(name) {
             found = Some(entry);
             false
@@ -456,7 +443,7 @@ pub(crate) fn find_entry_and_sfns(
 ) -> Result<(Option<DirEntryView>, Vec<[u8; 11]>), BlockBackendError> {
     let mut found: Option<DirEntryView> = None;
     let mut sfns: Vec<[u8; 11]> = Vec::new();
-    parse_dir_entries(state, backing, |entry| {
+    visit_entries(state, backing, |entry| {
         sfns.push(entry.short_name);
         if found.is_none() && entry.name.eq_ignore_ascii_case(name) {
             found = Some(entry);

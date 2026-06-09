@@ -402,8 +402,7 @@ impl InodeOps for DirInodeOps {
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         let _ = inode;
-        let entries = dir::read_all_entries(&self.state, self.backing).map_err(backend_to_vfs)?;
-        Ok(Box::new(DirFileOps::new(entries)))
+        Ok(Box::new(DirFileOps::new(&self.state, self.backing)?))
     }
 
     fn truncate(&self, _inode: &Inode, _new_size: u64) -> VfsResult<()> {

@@ -18,7 +18,6 @@ use vfs::stat::FileType;
 use vfs::superblock::Superblock as VfsSuperblock;
 use vfs::sync::Spinlock;
 
-use crate::dir::DirEntryRaw;
 use crate::inode::ExtInodeOps;
 use crate::inode_wr::write_raw;
 use crate::layout::{
@@ -38,41 +37,45 @@ pub struct ExtDirFileOps {
 }
 
 impl ExtDirFileOps {
-    /// 带 FsState 的构造:file_type 为 DT_UNKNOWN 时,按目标 inode 的 i_mode
-    /// 回填 kind。用于 ext2 无 INCOMPAT_FILETYPE 的卷。
-    pub(crate) fn new_with_state(entries: Vec<DirEntryRaw>, state: &FsState) -> Self {
-        let snapshot = entries
-            .into_iter()
-            .map(|e| {
-                let kind = match e.file_type {
-                    DT_REG => FileType::Regular,
-                    DT_DIR => FileType::Directory,
-                    DT_LNK => FileType::Symlink,
-                    DT_CHR => FileType::CharDevice,
-                    DT_BLK => FileType::BlockDevice,
-                    DT_FIFO => FileType::Fifo,
-                    DT_SOCK => FileType::Socket,
-                    _ => {
-                        // DT_UNKNOWN:读目标 inode 的 mode 判类型
-                        match crate::inode_wr::read_raw(state, e.ino) {
-                            Ok(ri) => {
-                                let mode = u16::from_le_bytes([ri.bytes[0], ri.bytes[1]]);
-                                crate::inode::file_type_from_mode(mode)
-                            }
-                            Err(_) => FileType::Regular,
+    /// 生成打开目录时的快照:file_type 为 DT_UNKNOWN 时按目标 inode 的 i_mode 回填。
+    pub(crate) fn new_with_state(
+        state: &FsState,
+        i_block: &[u8],
+        flags: u32,
+        size: u64,
+    ) -> VfsResult<Self> {
+        let mut snapshot = Vec::new();
+        crate::dir::visit_entries(state, i_block, flags, size, |e| {
+            let kind = match e.file_type {
+                DT_REG => FileType::Regular,
+                DT_DIR => FileType::Directory,
+                DT_LNK => FileType::Symlink,
+                DT_CHR => FileType::CharDevice,
+                DT_BLK => FileType::BlockDevice,
+                DT_FIFO => FileType::Fifo,
+                DT_SOCK => FileType::Socket,
+                _ => {
+                    // DT_UNKNOWN:读目标 inode 的 mode 判类型。
+                    match crate::inode_wr::read_raw(state, e.ino) {
+                        Ok(ri) => {
+                            let mode = u16::from_le_bytes([ri.bytes[0], ri.bytes[1]]);
+                            crate::inode::file_type_from_mode(mode)
                         }
+                        Err(_) => FileType::Regular,
                     }
-                };
-                DirEntry {
-                    ino: e.ino as u64,
-                    name: SmallStr::new(&e.name),
-                    kind,
                 }
-            })
-            .collect();
-        Self {
+            };
+            snapshot.push(DirEntry {
+                ino: e.ino as u64,
+                name: SmallStr::new(&e.name),
+                kind,
+            });
+            true
+        })
+        .map_err(map_err)?;
+        Ok(Self {
             snapshot: Spinlock::new(snapshot),
-        }
+        })
     }
 }
 

@@ -870,15 +870,12 @@ impl InodeOps for ExtInodeOps {
         let meta = self.snapshot_meta();
         let kind = file_type_from_mode(meta.mode);
         match kind {
-            FileType::Directory => {
-                let entries =
-                    crate::dir::read_all_entries(&self.state, &i_block_owned, flags, size)
-                        .map_err(map_err)?;
-                Ok(Box::new(crate::file::ExtDirFileOps::new_with_state(
-                    entries,
-                    &self.state,
-                )))
-            }
+            FileType::Directory => Ok(Box::new(crate::file::ExtDirFileOps::new_with_state(
+                &self.state,
+                &i_block_owned,
+                flags,
+                size,
+            )?)),
             FileType::Regular => {
                 let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
                 Ok(Box::new(crate::file::ExtRegFileOps::new(
