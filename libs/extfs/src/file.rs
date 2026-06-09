@@ -634,12 +634,13 @@ fn clip_ranges(ranges: &[(u32, u32, u64)], first_lb: u32, lb_count: u32) -> Vec<
         return Vec::new();
     }
     let end_lb = first_lb.saturating_add(lb_count);
-    let mut out = Vec::new();
-    for &(range_lb, range_count, phys_start) in ranges {
-        let range_end = range_lb.saturating_add(range_count);
-        if range_end <= first_lb || range_lb >= end_lb {
-            continue;
+    let start_idx = first_overlapping_range(ranges, first_lb);
+    let mut out = Vec::with_capacity(ranges.len().saturating_sub(start_idx).min(4));
+    for &(range_lb, range_count, phys_start) in &ranges[start_idx..] {
+        if range_lb >= end_lb {
+            break;
         }
+        let range_end = range_lb.saturating_add(range_count);
         let overlap_start = range_lb.max(first_lb);
         let overlap_end = range_end.min(end_lb);
         if overlap_start >= overlap_end {
@@ -652,4 +653,43 @@ fn clip_ranges(ranges: &[(u32, u32, u64)], first_lb: u32, lb_count: u32) -> Vec<
         ));
     }
     out
+}
+
+#[inline]
+fn first_overlapping_range(ranges: &[(u32, u32, u64)], first_lb: u32) -> usize {
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (range_lb, range_count, _) = ranges[mid];
+        if range_lb.saturating_add(range_count) <= first_lb {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::{clip_ranges, first_overlapping_range};
+
+    #[test]
+    fn clip_ranges_starts_inside_existing_range() {
+        let ranges = [(0, 8, 100), (16, 4, 200), (24, 2, 300)];
+
+        assert_eq!(first_overlapping_range(&ranges, 3), 0);
+        assert_eq!(clip_ranges(&ranges, 3, 4), vec![(3, 4, 103)]);
+    }
+
+    #[test]
+    fn clip_ranges_skips_before_window_and_stops_after() {
+        let ranges = [(0, 2, 100), (4, 3, 200), (8, 4, 300), (20, 1, 400)];
+
+        assert_eq!(first_overlapping_range(&ranges, 5), 1);
+        assert_eq!(clip_ranges(&ranges, 5, 5), vec![(5, 2, 201), (8, 2, 300)]);
+    }
 }
