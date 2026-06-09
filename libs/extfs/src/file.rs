@@ -406,8 +406,9 @@ impl FileOps for ExtRegFileOps {
             let old_flags = raw_guard.flags();
             let old_blocks_lo = raw_guard.blocks_lo();
             let mut flags = old_flags;
-            let mut i_block = raw_guard.i_block().to_vec();
-            let old_i_block = i_block.clone();
+            let mut i_block = [0u8; I_BLOCK_BYTES];
+            i_block.copy_from_slice(raw_guard.i_block());
+            let old_i_block = i_block;
 
             // inline_data 无损迁移:先把现有 inline 字节读出来,再清 flag,
             // 之后把旧内容作为普通数据块写回,最后执行用户写入。
@@ -420,7 +421,7 @@ impl FileOps for ExtRegFileOps {
                 for b in raw_guard.i_block_mut().iter_mut() {
                     *b = 0;
                 }
-                i_block = raw_guard.i_block().to_vec();
+                i_block.copy_from_slice(raw_guard.i_block());
                 raw_guard.set_size(0);
                 recovered
             } else {
