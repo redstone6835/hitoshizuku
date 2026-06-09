@@ -3,6 +3,7 @@ pub mod device_numbers;
 pub mod devtmpfs;
 pub mod mount_source;
 pub mod net_ioctl;
+pub mod posix_compat;
 pub mod procfs;
 pub mod rtc_devnode;
 pub mod sysfs;

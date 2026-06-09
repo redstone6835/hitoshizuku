@@ -66,6 +66,12 @@ pub fn register_core_filesystems(tag: &str) {
                 )
             });
     }
+    general::vfs::posix_compat::register_posix_device_policies().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register POSIX device number policies: {:?}",
+            tag, err
+        )
+    });
     general::vfs::register_block_filesystems();
     general::vfs::rtc_devnode::register_devtmpfs_adapter().unwrap_or_else(|err| {
         panic!(

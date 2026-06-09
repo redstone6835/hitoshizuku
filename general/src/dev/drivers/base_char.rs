@@ -9,6 +9,11 @@ use crate::dev::pnp::PnpError;
 use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 
 const OWNER: &str = "base-char-driver";
+
+// FIXME(dev-core): 基础字符设备驱动仍直接依赖 devtmpfs 静态节点注册表，
+// 这会把 VFS 兼容层路径发布混入驱动初始化。后续应提供“内建设备 function”
+// 或 projection registry，由 VFS 层统一把这些 function 投影成 `/dev/null`
+// 和 `/dev/zero`。
 const STATIC_NODES: [DevTmpfsStaticNode; 2] = [
     DevTmpfsStaticNode::new(OWNER, "null", null_dev_node),
     DevTmpfsStaticNode::new(OWNER, "zero", zero_dev_node),

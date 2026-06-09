@@ -105,8 +105,13 @@ pub enum PnpError {
     /// 设备名冲突
     NameConflict,
     /// devtmpfs 未就绪
+    /// FIXME(dev-core): 这是 VFS 投影层错误泄漏到 PnP core 的遗留接口。
+    /// 后续应由独立 projection manager 记录 `/dev` 发布失败，不能让底层设备
+    /// 生命周期直接依赖 devtmpfs 是否安装。
     NoDevtmpfs,
     /// devtmpfs 操作失败
+    /// FIXME(dev-core): 同上，devtmpfs 的具体错误需要留在 VFS/兼容层，并通过
+    /// 诊断事件或 projection 状态暴露给 sysfs/procfs。
     DevtmpfsError,
     /// 内存不足
     OutOfMemory,
@@ -743,13 +748,33 @@ impl PnpDevice {
     }
 
     /// 返回该设备已注册的 function 快照。
+    pub fn try_functions(&self) -> Option<Vec<Arc<dyn DeviceFunction>>> {
+        let inner = self.inner.lock();
+        let mut out = Vec::new();
+        // function 快照会被 procfs/sysfs 诊断路径读取；显式预留可把 OOM
+        // 表达为快照缺失，而不是在持锁 collect 时 panic。
+        out.try_reserve(inner.functions.len()).ok()?;
+        out.extend(inner.functions.iter().cloned());
+        Some(out)
+    }
+
+    /// 返回该设备已注册的 function 快照。
     pub fn functions(&self) -> Vec<Arc<dyn DeviceFunction>> {
-        self.inner.lock().functions.iter().cloned().collect()
+        self.try_functions().unwrap_or_default()
+    }
+
+    /// 返回子设备快照。
+    pub fn try_children(&self) -> Option<Vec<Arc<PnpDevice>>> {
+        let inner = self.inner.lock();
+        let mut out = Vec::new();
+        out.try_reserve(inner.children.len()).ok()?;
+        out.extend(inner.children.iter().cloned());
+        Some(out)
     }
 
     /// 返回子设备快照。
     pub fn children(&self) -> Vec<Arc<PnpDevice>> {
-        self.inner.lock().children.clone()
+        self.try_children().unwrap_or_default()
     }
 
     /// 返回最近一次 deferred probe 记录的精确依赖。
@@ -758,16 +783,25 @@ impl PnpDevice {
     }
 
     /// 返回该设备已交给 PnP core 管理的资源快照。
+    pub fn try_owned_resources(&self) -> Option<Vec<PnpOwnedResourceSnapshot>> {
+        let inner = self.inner.lock();
+        let mut out = Vec::new();
+        out.try_reserve(inner.resources.len()).ok()?;
+        out.extend(
+            inner
+                .resources
+                .iter()
+                .map(|resource| PnpOwnedResourceSnapshot {
+                    kind: resource.kind(),
+                    label: resource.label(),
+                }),
+        );
+        Some(out)
+    }
+
+    /// 返回该设备已交给 PnP core 管理的资源快照。
     pub fn owned_resources(&self) -> Vec<PnpOwnedResourceSnapshot> {
-        self.inner
-            .lock()
-            .resources
-            .iter()
-            .map(|resource| PnpOwnedResourceSnapshot {
-                kind: resource.kind(),
-                label: resource.label(),
-            })
-            .collect()
+        self.try_owned_resources().unwrap_or_default()
     }
 
     /// 返回父设备；根设备没有父设备。
@@ -1093,7 +1127,7 @@ impl PnpDriverRegistry {
         };
 
         let mut last_error = None;
-        for dev in PNP_DEVICES.list() {
+        for dev in PNP_DEVICES.try_list().ok_or(PnpError::OutOfMemory)? {
             if !dev.bound_to_driver(&driver) {
                 continue;
             }
@@ -1114,7 +1148,7 @@ impl PnpDriverRegistry {
     pub fn probe_existing_devices(&self, driver_id: DriverId) -> Result<usize, PnpError> {
         let driver = self.driver_by_id(driver_id).ok_or(PnpError::NoDriver)?;
         let mut bound = 0usize;
-        for dev in PNP_DEVICES.list() {
+        for dev in PNP_DEVICES.try_list().ok_or(PnpError::OutOfMemory)? {
             if dev.state() != PnpState::Discovered {
                 continue;
             }
@@ -1182,7 +1216,7 @@ impl PnpDriverRegistry {
         let mut total_bound = 0usize;
         loop {
             let mut round_bound = 0usize;
-            for dev in PNP_DEVICES.list() {
+            for dev in PNP_DEVICES.try_list().ok_or(PnpError::OutOfMemory)? {
                 if dev.state() != PnpState::Discovered {
                     continue;
                 }
@@ -1384,13 +1418,17 @@ impl PnpDeviceList {
     }
 
     /// 返回所有尚未 Gone 的设备快照。
+    pub fn try_list(&self) -> Option<Vec<Arc<PnpDevice>>> {
+        let list = self.devices.lock();
+        let mut out = Vec::new();
+        out.try_reserve(list.len()).ok()?;
+        out.extend(list.iter().filter(|d| d.state() != PnpState::Gone).cloned());
+        Some(out)
+    }
+
+    /// 返回所有尚未 Gone 的设备快照。
     pub fn list(&self) -> Vec<Arc<PnpDevice>> {
-        self.devices
-            .lock()
-            .iter()
-            .filter(|d| d.state() != PnpState::Gone)
-            .cloned()
-            .collect()
+        self.try_list().unwrap_or_default()
     }
 }
 
@@ -1406,6 +1444,10 @@ impl Default for PnpDeviceList {
 ///
 /// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSet`] 时，通过这里安装的
 /// 回调把节点创建委托给 devtmpfs。
+///
+/// FIXME(dev-core): 这个回调虽然避免了直接导入 VFS 类型，但仍让 PnP core 知道
+/// devtmpfs 的发布时机。应收敛为通用 function projection 事件，由 devtmpfs、
+/// sysfs、procfs 各自订阅并维护自己的兼容视图。
 #[derive(Clone, Copy)]
 pub struct PnpDevtmpfsCallbacks {
     pub bind: fn(&DevNodeSet) -> Result<(), PnpError>,
@@ -1444,6 +1486,10 @@ fn devtmpfs_unbind(nodes: &DevNodeSet) -> Result<(), PnpError> {
 
 impl PnpDevice {
     /// 事务式注册开放设备 function：DEVICES → devtmpfs → PnpDevice.attach。
+    ///
+    /// FIXME(dev-core): 事务顺序仍包含 devtmpfs bind，说明 function 生命周期和
+    /// POSIX/VFS 节点发布还没有彻底拆开。后续应先完成底层 function 注册，再由
+    /// projection 层异步/事务式补建兼容节点并记录失败原因。
     pub fn register_function(
         self: &Arc<Self>,
         func: Arc<dyn DeviceFunction>,
@@ -1490,7 +1536,7 @@ impl PnpDevice {
             inner.bound_driver = None;
             inner.driver_data = None;
             let functions = core::mem::take(&mut inner.functions);
-            let children = inner.children.clone();
+            let children = core::mem::take(&mut inner.children);
             let resources = core::mem::take(&mut inner.resources);
             if inner.state == PnpState::Probing {
                 inner.state = PnpState::Discovered;
@@ -1536,7 +1582,7 @@ impl PnpDevice {
             let bound_driver = inner.bound_driver.take().ok_or(PnpError::InvalidState)?;
             inner.state = PnpState::Removing;
             let functions = core::mem::take(&mut inner.functions);
-            let children = inner.children.clone();
+            let children = core::mem::take(&mut inner.children);
             let resources = core::mem::take(&mut inner.resources);
             (bound_driver, functions, children, resources)
         };
@@ -1613,20 +1659,25 @@ impl PnpDevice {
             inner.state = PnpState::Removing;
         }
 
-        // 阶段 2：递归移除子设备
-        let children: Vec<Arc<PnpDevice>> = self.inner.lock().children.clone();
-        for child in children.iter().rev() {
-            child.remove_device();
-        }
-
-        // 阶段 3：标记 function gone
-        let (functions, resources): (Vec<Arc<dyn DeviceFunction>>, Vec<Box<dyn PnpResource>>) = {
+        // 阶段 2/3：取出子设备与 function。进入 Removing 后它们不再属于活跃拓扑，
+        // 直接 move 出内部 Vec，避免热拔路径为了 clone 子设备列表再次分配。
+        let (children, functions, resources): (
+            Vec<Arc<PnpDevice>>,
+            Vec<Arc<dyn DeviceFunction>>,
+            Vec<Box<dyn PnpResource>>,
+        ) = {
             let mut inner = self.inner.lock();
             (
+                core::mem::take(&mut inner.children),
                 core::mem::take(&mut inner.functions),
                 core::mem::take(&mut inner.resources),
             )
         };
+
+        // 阶段 2：递归移除子设备
+        for child in children.iter().rev() {
+            child.remove_device();
+        }
 
         for func in &functions {
             func.mark_gone();

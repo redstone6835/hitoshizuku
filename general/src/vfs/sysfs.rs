@@ -29,10 +29,11 @@ use crate::dev::block::BlockDevice;
 use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
 use crate::dev::function::{
-    CustomDevNodeKind, DevNodeSpec, active_block_devnode_projections,
+    CustomDevNodeKind, DevNodeSpec, DeviceFunction, active_block_devnode_projections,
     active_char_devnode_projections,
 };
 use crate::dev::net::NET_CLASS;
+use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
 use crate::vfs::device_numbers;
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
@@ -73,6 +74,9 @@ static SYSFS_INO_REGISTRY: Spinlock<Option<SysfsInoRegistry>> = Spinlock::new(No
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
+// TODO(sysfs): 这些默认值是兼容视图策略，不能长期作为 sysfs core 的固定常量。
+// 后续应从 block/net/power 等 typed capability snapshot 中读取，缺失时再由
+// 对应兼容层 policy 给出默认值。
 const SYSFS_DEFAULT_NR_REQUESTS: u32 = 64;
 const SYSFS_BLOCK_CLASS: &str = "block";
 const SYSFS_CHAR_CLASS: &str = "char";
@@ -86,6 +90,9 @@ fn timespec_now() -> Timespec {
 
 struct SysfsInoRegistry {
     next: u64,
+    // FIXME(sysfs): 动态 inode 仍以手写路径字符串作为稳定 key。后续应改成
+    // 结构化 key（设备 identity、slot enum、projection kind），避免路径格式
+    // 变化导致 inode 稳定性和诊断视图互相耦合。
     by_key: BTreeMap<String, u64>,
 }
 
@@ -101,10 +108,25 @@ impl SysfsInoRegistry {
         if let Some(ino) = self.by_key.get(&key).copied() {
             return ino;
         }
-        let ino = self.next;
-        self.next = self.next.checked_add(1).unwrap_or(SYSFS_DYNAMIC_INO_START);
+        let ino = self.alloc_unused_ino();
         self.by_key.insert(key, ino);
         ino
+    }
+
+    fn alloc_unused_ino(&mut self) -> u64 {
+        let start = self.next;
+        loop {
+            let ino = self.next;
+            self.next = self.next.checked_add(1).unwrap_or(SYSFS_DYNAMIC_INO_START);
+            if !self.by_key.values().any(|allocated| *allocated == ino) {
+                return ino;
+            }
+            // 动态 inode 空间理论上不可能被 sysfs 用尽；这里仍显式处理完整回绕，
+            // 避免计数器重复扫描时陷入无限循环。
+            if self.next == start {
+                return SYSFS_DYNAMIC_INO_START;
+            }
+        }
     }
 }
 
@@ -207,14 +229,14 @@ struct SysPnpDeviceSnapshot {
     /// PnP core 内部登记名，保留原始固件/总线语义用于展示。
     name: String,
     bus_type: &'static str,
-    id: String,
+    id: PnpId,
     state: &'static str,
     driver: Option<&'static str>,
     parent: Option<String>,
     child_count: usize,
-    functions: Vec<String>,
-    resources: Vec<String>,
-    deferred_dependency: Option<String>,
+    functions: Vec<Arc<dyn DeviceFunction>>,
+    resources: Vec<PnpOwnedResourceSnapshot>,
+    deferred_dependency: Option<PnpDependency>,
 }
 
 #[derive(Clone)]
@@ -261,6 +283,66 @@ struct FunctionDevNodeClass {
     class_name: &'static str,
 }
 
+fn sysfs_fallible_string(value: &str) -> Option<String> {
+    let mut out = String::new();
+    out.try_reserve(value.len()).ok()?;
+    out.push_str(value);
+    Some(out)
+}
+
+fn sysfs_fallible_smallstr(value: &str) -> Option<SmallStr> {
+    let bytes = value.as_bytes();
+    if bytes.len() <= 23 {
+        let mut buf = [0u8; 23];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return Some(SmallStr::Inline {
+            len: bytes.len() as u8,
+            buf,
+        });
+    }
+    Some(SmallStr::Heap(sysfs_fallible_string(value)?))
+}
+
+fn sysfs_smallstr_lossy(value: &str) -> SmallStr {
+    sysfs_fallible_smallstr(value).unwrap_or_else(|| {
+        let mut buf = [0u8; 23];
+        buf[0] = b'?';
+        SmallStr::Inline { len: 1, buf }
+    })
+}
+
+fn push_sysfs_dir_entry(out: &mut Vec<DirEntry>, ino: u64, name: &str, kind: FileType) -> bool {
+    // sysfs 是诊断视图：目录快照分配失败时返回已收集的前缀，避免 readdir
+    // 因长设备名或瞬时低内存 panic。下一次 readdir 会重新构造快照。
+    if out.try_reserve(1).is_err() {
+        return false;
+    }
+    let Some(name) = sysfs_fallible_smallstr(name) else {
+        return false;
+    };
+    out.push(DirEntry { ino, name, kind });
+    true
+}
+
+fn push_function_devnode_class(
+    out: &mut Vec<FunctionDevNodeClass>,
+    node_name: &str,
+    class_name: &'static str,
+) {
+    // sysfs 是诊断视图，不能因为快照中某个名字分配失败而让内核崩溃。
+    // 低内存时跳过该条 class 映射，底层 function/devtmpfs 绑定仍然保持不变。
+    if out.try_reserve(1).is_err() {
+        return;
+    }
+    let Some(node_name) = sysfs_fallible_string(node_name) else {
+        return;
+    };
+    out.push(FunctionDevNodeClass {
+        node_name,
+        class_name,
+    });
+}
+
 /// sysfs 单次访问从 dev core 拷贝出的不可变快照。
 ///
 /// 目录 inode 保存稳定 key，lookup/readdir 可以在访问入口重新收集快照；属性
@@ -292,57 +374,89 @@ fn sysfs_component_name(name: &str) -> String {
     if out.is_empty() { "device".into() } else { out }
 }
 
-fn pnp_state_name(state: crate::dev::pnp::PnpState) -> &'static str {
+fn sysfs_unique_name_with_rdev<F>(base: &str, rdev: DevId, mut exists: F) -> String
+where
+    F: FnMut(&str) -> bool,
+{
+    let primary = sysfs_component_name(base);
+    if !exists(&primary) {
+        return primary;
+    }
+
+    // sysfs 目录名是兼容层投影，不是底层设备身份。同名设备出现时用已分配的
+    // POSIX rdev 做稳定消歧；这只影响用户态可见路径，不反向改变 dev core。
+    let mut suffix = 0usize;
+    loop {
+        let raw = if suffix == 0 {
+            format!("{}-{}:{}", base, rdev.major, rdev.minor)
+        } else {
+            format!("{}-{}:{}-{suffix}", base, rdev.major, rdev.minor)
+        };
+        let candidate = sysfs_component_name(&raw);
+        if !exists(&candidate) {
+            return candidate;
+        }
+        if suffix == usize::MAX {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn pnp_state_name(state: PnpState) -> &'static str {
     match state {
-        crate::dev::pnp::PnpState::Discovered => "discovered",
-        crate::dev::pnp::PnpState::Probing => "probing",
-        crate::dev::pnp::PnpState::Bound => "bound",
-        crate::dev::pnp::PnpState::Removing => "removing",
-        crate::dev::pnp::PnpState::Gone => "gone",
+        PnpState::Discovered => "discovered",
+        PnpState::Probing => "probing",
+        PnpState::Bound => "bound",
+        PnpState::Removing => "removing",
+        PnpState::Gone => "gone",
     }
 }
 
-fn pnp_resource_kind_name(kind: crate::dev::pnp::PnpResourceKind) -> &'static str {
+fn pnp_resource_kind_name(kind: PnpResourceKind) -> &'static str {
     match kind {
-        crate::dev::pnp::PnpResourceKind::Mmio => "mmio",
-        crate::dev::pnp::PnpResourceKind::Irq => "irq",
-        crate::dev::pnp::PnpResourceKind::IrqDomain => "irq-domain",
-        crate::dev::pnp::PnpResourceKind::Msi => "msi",
-        crate::dev::pnp::PnpResourceKind::MsiController => "msi-controller",
-        crate::dev::pnp::PnpResourceKind::Syscon => "syscon",
-        crate::dev::pnp::PnpResourceKind::Flash => "flash",
-        crate::dev::pnp::PnpResourceKind::FwCfg => "fwcfg",
-        crate::dev::pnp::PnpResourceKind::FirmwareBus => "firmware-bus",
-        crate::dev::pnp::PnpResourceKind::PciHostBridge => "pci-host-bridge",
-        crate::dev::pnp::PnpResourceKind::Dma => "dma",
-        crate::dev::pnp::PnpResourceKind::Function => "function",
-        crate::dev::pnp::PnpResourceKind::Other(name) => name,
+        PnpResourceKind::Mmio => "mmio",
+        PnpResourceKind::Irq => "irq",
+        PnpResourceKind::IrqDomain => "irq-domain",
+        PnpResourceKind::Msi => "msi",
+        PnpResourceKind::MsiController => "msi-controller",
+        PnpResourceKind::Syscon => "syscon",
+        PnpResourceKind::Flash => "flash",
+        PnpResourceKind::FwCfg => "fwcfg",
+        PnpResourceKind::FirmwareBus => "firmware-bus",
+        PnpResourceKind::PciHostBridge => "pci-host-bridge",
+        PnpResourceKind::Dma => "dma",
+        PnpResourceKind::Function => "function",
+        PnpResourceKind::Other(name) => name,
     }
 }
 
-fn pnp_dependency_name(dependency: crate::dev::pnp::PnpDependency) -> String {
+fn pnp_dependency_name(dependency: PnpDependency) -> String {
     match dependency {
-        crate::dev::pnp::PnpDependency::IrqController(id) => {
+        PnpDependency::IrqController(id) => {
             format!("irq-controller:{id}")
         }
-        crate::dev::pnp::PnpDependency::DefaultIrqDomain => "default-irq-domain".into(),
-        crate::dev::pnp::PnpDependency::MsiController(id) => {
+        PnpDependency::DefaultIrqDomain => "default-irq-domain".into(),
+        PnpDependency::MsiController(id) => {
             format!("msi-controller:{id}")
         }
-        crate::dev::pnp::PnpDependency::Syscon(id) => format!("syscon:{id}"),
-        crate::dev::pnp::PnpDependency::FwCfg => "fwcfg".into(),
-        crate::dev::pnp::PnpDependency::FirmwareBus => "firmware-bus".into(),
-        crate::dev::pnp::PnpDependency::PciHostBridge(domain) => {
+        PnpDependency::Syscon(id) => format!("syscon:{id}"),
+        PnpDependency::FwCfg => "fwcfg".into(),
+        PnpDependency::FirmwareBus => "firmware-bus".into(),
+        PnpDependency::PciHostBridge(domain) => {
             format!("pci-host-bridge:{domain}")
         }
-        crate::dev::pnp::PnpDependency::Dma => "dma".into(),
-        crate::dev::pnp::PnpDependency::Other(name) => name.into(),
+        PnpDependency::Dma => "dma".into(),
+        PnpDependency::Other(name) => name.into(),
     }
 }
 
 fn collect_function_devnode_classes() -> Vec<FunctionDevNodeClass> {
+    // FIXME(sysfs-dev): 这里仍直接读取 `DeviceFunction::devnodes()` 和 `DevNodeSpec`。
+    // 后续应改为读取 devtmpfs/projection registry 生成的只读快照，sysfs 不再理解
+    // 底层 function 的 `/dev` 投影声明。
     let mut out = Vec::new();
-    for func in DEVICES.functions.list() {
+    for func in DEVICES.functions.try_list().unwrap_or_default() {
         let class_name = func.class_id().as_str();
         let Some(nodes) = func.devnodes() else {
             continue;
@@ -350,10 +464,7 @@ fn collect_function_devnode_classes() -> Vec<FunctionDevNodeClass> {
         for node in nodes.nodes() {
             match node {
                 DevNodeSpec::Char { name, .. } | DevNodeSpec::Block { name, .. } => {
-                    out.push(FunctionDevNodeClass {
-                        node_name: name.to_string(),
-                        class_name,
-                    });
+                    push_function_devnode_class(&mut out, name, class_name);
                 }
                 DevNodeSpec::Custom(spec)
                     if matches!(
@@ -361,10 +472,7 @@ fn collect_function_devnode_classes() -> Vec<FunctionDevNodeClass> {
                         CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
                     ) =>
                 {
-                    out.push(FunctionDevNodeClass {
-                        node_name: spec.name().to_string(),
-                        class_name,
-                    });
+                    push_function_devnode_class(&mut out, spec.name(), class_name);
                 }
                 DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => {}
             }
@@ -415,12 +523,12 @@ fn push_class_node(
 impl SysSnapshot {
     fn collect() -> Self {
         let mut snap = SysSnapshot::default();
-        let records = device_numbers::records();
+        let records = device_numbers::try_records().unwrap_or_default();
         let devnode_classes = collect_function_devnode_classes();
 
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
-        for dev in PNP_DEVICES.list() {
+        for dev in PNP_DEVICES.try_list().unwrap_or_default() {
             let bus_type = dev.info.bus_type().as_str();
             let mut sysfs_name = sysfs_component_name(&dev.name);
             if snap
@@ -439,35 +547,25 @@ impl SysSnapshot {
                 sysfs_name = sysfs_component_name(&format!("{}-{}-{suffix}", dev.name, dev.id));
                 suffix = suffix.saturating_add(1);
             }
-            let functions = dev
-                .functions()
-                .into_iter()
-                .map(|func| format!("{}:{}", func.class_id().as_str(), func.dev_name()))
-                .collect::<Vec<_>>();
-            let resources = dev
-                .owned_resources()
-                .into_iter()
-                .map(|resource| {
-                    format!(
-                        "{}:{}",
-                        pnp_resource_kind_name(resource.kind),
-                        resource.label
-                    )
-                })
-                .collect::<Vec<_>>();
+            let functions = dev.try_functions().unwrap_or_default();
+            let resources = dev.try_owned_resources().unwrap_or_default();
             let parent = dev.parent().map(|parent| parent.name.to_string());
+            let child_count = dev
+                .try_children()
+                .map(|children| children.len())
+                .unwrap_or(0);
             snap.pnp_devices.push(SysPnpDeviceSnapshot {
                 sysfs_name,
                 name: dev.name.to_string(),
                 bus_type,
-                id: dev.id.to_string(),
+                id: dev.id.clone(),
                 state: pnp_state_name(dev.state()),
                 driver: dev.bound_driver_name(),
                 parent,
-                child_count: dev.children().len(),
+                child_count,
                 functions,
                 resources,
-                deferred_dependency: dev.deferred_dependency().map(pnp_dependency_name),
+                deferred_dependency: dev.deferred_dependency(),
             });
             if !snap.pnp_buses.contains(&bus_type) {
                 snap.pnp_buses.push(bus_type);
@@ -484,14 +582,9 @@ impl SysSnapshot {
                 continue;
             };
             let dev = Arc::clone(projection.dev());
-            let sysfs_name = dev.name().to_string();
-            if snap
-                .blocks
-                .iter()
-                .any(|block| block.sysfs_name == sysfs_name)
-            {
-                continue;
-            }
+            let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), record.rdev, |name| {
+                snap.blocks.iter().any(|block| block.sysfs_name == name)
+            });
             snap.blocks.push(BlockDevSnapshot {
                 sysfs_name,
                 rdev: record.rdev,
@@ -507,10 +600,10 @@ impl SysSnapshot {
             }) else {
                 continue;
             };
-            let sysfs_name = projection.dev().fw_name().to_string();
-            if snap.chars.iter().any(|ch| ch.sysfs_name == sysfs_name) {
-                continue;
-            }
+            let sysfs_name =
+                sysfs_unique_name_with_rdev(projection.dev().fw_name(), record.rdev, |name| {
+                    snap.chars.iter().any(|ch| ch.sysfs_name == name)
+                });
             snap.chars.push(CharDevSnapshot {
                 sysfs_name,
                 rdev: record.rdev,
@@ -543,24 +636,38 @@ impl SysSnapshot {
                 device_numbers::PosixDeviceKind::Char => {
                     let class_name =
                         class_for_devnode(&devnode_classes, &record.node_name, SYSFS_CHAR_CLASS);
-                    let has_backing_device = snap
+                    let backing_name = snap
                         .devices
                         .iter()
-                        .any(|dev| dev.class_name == class_name && dev.rdev == record.rdev);
-                    if !has_backing_device
+                        .find(|dev| dev.class_name == class_name && dev.rdev == record.rdev)
+                        .map(|dev| dev.sysfs_name.clone());
+                    let sysfs_name = backing_name.unwrap_or_else(|| {
+                        sysfs_unique_name_with_rdev(&record.display_name, record.rdev, |name| {
+                            snap.virtual_devices
+                                .iter()
+                                .any(|dev| dev.class_name == class_name && dev.sysfs_name == name)
+                                || snap.char_nodes.iter().any(|node| {
+                                    node.class_name == class_name && node.sysfs_name == name
+                                })
+                        })
+                    });
+                    if !snap
+                        .devices
+                        .iter()
+                        .any(|dev| dev.class_name == class_name && dev.rdev == record.rdev)
                         && !snap
                             .virtual_devices
                             .iter()
                             .any(|dev| dev.class_name == class_name && dev.rdev == record.rdev)
                     {
                         snap.virtual_devices.push(SysVirtualDeviceSnapshot {
-                            sysfs_name: record.display_name.clone(),
+                            sysfs_name: sysfs_name.clone(),
                             rdev: record.rdev,
                             class_name,
                         });
                     }
                     snap.char_nodes.push(CharDevNodeSnapshot {
-                        sysfs_name: record.display_name,
+                        sysfs_name,
                         devtmpfs_name: record.node_name,
                         rdev: record.rdev,
                         class_name,
@@ -569,24 +676,38 @@ impl SysSnapshot {
                 device_numbers::PosixDeviceKind::Block => {
                     let class_name =
                         class_for_devnode(&devnode_classes, &record.node_name, SYSFS_BLOCK_CLASS);
-                    let has_backing_device = snap
+                    let backing_name = snap
                         .devices
                         .iter()
-                        .any(|dev| dev.class_name == class_name && dev.rdev == record.rdev);
-                    if !has_backing_device
+                        .find(|dev| dev.class_name == class_name && dev.rdev == record.rdev)
+                        .map(|dev| dev.sysfs_name.clone());
+                    let sysfs_name = backing_name.unwrap_or_else(|| {
+                        sysfs_unique_name_with_rdev(&record.display_name, record.rdev, |name| {
+                            snap.virtual_devices
+                                .iter()
+                                .any(|dev| dev.class_name == class_name && dev.sysfs_name == name)
+                                || snap.block_nodes.iter().any(|node| {
+                                    node.class_name == class_name && node.sysfs_name == name
+                                })
+                        })
+                    });
+                    if !snap
+                        .devices
+                        .iter()
+                        .any(|dev| dev.class_name == class_name && dev.rdev == record.rdev)
                         && !snap
                             .virtual_devices
                             .iter()
                             .any(|dev| dev.class_name == class_name && dev.rdev == record.rdev)
                     {
                         snap.virtual_devices.push(SysVirtualDeviceSnapshot {
-                            sysfs_name: record.display_name.clone(),
+                            sysfs_name: sysfs_name.clone(),
                             rdev: record.rdev,
                             class_name,
                         });
                     }
                     snap.block_nodes.push(BlockDevNodeSnapshot {
-                        sysfs_name: record.display_name,
+                        sysfs_name,
                         rdev: record.rdev,
                         class_name,
                     })
@@ -961,6 +1082,8 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
     let mut s = String::new();
     match slot {
         NetDevSlot::Type => {
+            // FIXME(sysfs-net): 这里固定报告 ARPHRD_ETHER。网络设备抽象应在 typed
+            // snapshot 中提供 link-layer kind，sysfs 只负责渲染 ABI 数值。
             let _ = writeln!(s, "1"); // ARPHRD_ETHER
         }
         NetDevSlot::Address => {
@@ -978,9 +1101,13 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "0x{:x}", iface.flags);
         }
         NetDevSlot::IfIndex => {
+            // FIXME(sysfs-net): ifindex 当前由内部 InterfaceId + 1 推导，缺少独立的
+            // POSIX 网络接口编号分配器；接口删除/重建后稳定性无法由 sysfs 保证。
             let _ = writeln!(s, "{}", iface.id.raw() + 1);
         }
         NetDevSlot::TxQueueLen => {
+            // TODO(sysfs-net): tx_queue_len 应来自网络设备/队列 capability 或协议栈
+            // policy，而不是在 sysfs 兼容视图中固定为 1000。
             let _ = writeln!(s, "1000");
         }
         NetDevSlot::Carrier => {
@@ -1398,6 +1525,9 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
 }
 
 fn render_device_power_file(_snap: &SysSnapshot, _idx: usize, slot: DevicePowerSlot) -> String {
+    // TODO(sysfs-power): power/runtime 字段目前只是兼容默认值。设备 core 需要提供
+    // suspend/resume、wakeup source、runtime policy 等 typed state 后，sysfs 才能
+    // 输出真实电源管理状态。
     match slot {
         // 设备进入 sysfs 快照时已经完成 probe，通用设备模型没有 suspend/offline
         // 状态，因此 runtime_status 以 active 表达“当前可访问”。
@@ -1439,22 +1569,30 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
         PnpDeviceSlot::Functions => {
             let mut out = String::new();
             for function in &dev.functions {
-                out.push_str(function);
-                out.push('\n');
+                let _ = core::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!("{}:{}\n", function.class_id().as_str(), function.dev_name()),
+                );
             }
             out
         }
         PnpDeviceSlot::Resources => {
             let mut out = String::new();
             for resource in &dev.resources {
-                out.push_str(resource);
-                out.push('\n');
+                let _ = core::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "{}:{}\n",
+                        pnp_resource_kind_name(resource.kind),
+                        resource.label
+                    ),
+                );
             }
             out
         }
         PnpDeviceSlot::DeferredDependency => dev
             .deferred_dependency
-            .as_ref()
+            .map(pnp_dependency_name)
             .map(|dependency| format!("{dependency}\n"))
             .unwrap_or_default(),
     }
@@ -1534,6 +1672,8 @@ fn push_cpu_range(out: &mut String, start: usize, end: usize) {
 }
 
 fn format_cpu_mask_range(mask: u64) -> String {
+    // TODO(sysfs-cpu): CPU 集合当前被压成 u64 并固定扫描 0..64。后续 sched/cpu
+    // 拓扑接口应提供可迭代 CPU 集合，sysfs 不应假设最大 CPU 数。
     let mut out = String::new();
     let mut cpu = 0usize;
     while cpu < 64 {
@@ -1768,7 +1908,9 @@ fn feed_dir_entries(
     let start = core::cmp::min(pos as usize, snapshot.len());
     for (i, entry) in snapshot.iter().enumerate().skip(start) {
         if sink(entry.clone()).is_break() {
-            return Ok((i + 1) as u64);
+            // sink 返回 Break 表示当前条目未被用户缓冲区接收，下一次 getdents
+            // 必须从同一个游标重试，不能提前跳过该目录项。
+            return Ok(i as u64);
         }
     }
     Ok(snapshot.len() as u64)
@@ -2493,7 +2635,7 @@ impl SysDirInodeOps {
         let snap = &self.snap;
         let mk_dir_entry = |ino: u64, name: &str, kind: FileType| DirEntry {
             ino,
-            name: SmallStr::new(name),
+            name: sysfs_smallstr_lossy(name),
             kind,
         };
         match self.kind.clone() {
@@ -2509,18 +2651,20 @@ impl SysDirInodeOps {
                 mk_dir_entry(POWER_DIR_INO, "power", FileType::Directory),
                 mk_dir_entry(FIRMWARE_DIR_INO, "firmware", FileType::Directory),
             ],
-            SysDirKind::Block => snap
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(_, b)| {
-                    mk_dir_entry(
+            SysDirKind::Block => {
+                let mut entries = Vec::new();
+                for b in &snap.blocks {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
                         block_dev_ino(&b.sysfs_name),
                         &b.sysfs_name,
                         FileType::Directory,
-                    )
-                })
-                .collect(),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::BlockDev { name } => {
                 let Some(_) = snap
                     .blocks
@@ -2624,30 +2768,27 @@ impl SysDirInodeOps {
                 ]
             }
             SysDirKind::Devices => {
-                let mut v: Vec<DirEntry> = snap
-                    .devices
-                    .iter()
-                    .enumerate()
-                    .map(|(_, dev)| {
-                        mk_dir_entry(
-                            device_ino(dev.class_name, dev.rdev),
-                            &dev.sysfs_name,
-                            FileType::Directory,
-                        )
-                    })
-                    .collect();
-                v.push(mk_dir_entry(
-                    DEVICES_SYSTEM_INO,
-                    "system",
-                    FileType::Directory,
-                ));
-                v.push(mk_dir_entry(
-                    DEVICES_VIRTUAL_INO,
-                    "virtual",
-                    FileType::Directory,
-                ));
-                v.push(mk_dir_entry(DEVICES_PNP_INO, "pnp", FileType::Directory));
-                v
+                let mut entries = Vec::new();
+                for dev in &snap.devices {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        device_ino(dev.class_name, dev.rdev),
+                        &dev.sysfs_name,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
+                for (ino, name) in [
+                    (DEVICES_SYSTEM_INO, "system"),
+                    (DEVICES_VIRTUAL_INO, "virtual"),
+                    (DEVICES_PNP_INO, "pnp"),
+                ] {
+                    if !push_sysfs_dir_entry(&mut entries, ino, name, FileType::Directory) {
+                        return entries;
+                    }
+                }
+                entries
             }
             SysDirKind::Device { class_name, rdev } => {
                 let Some(_) = snap
@@ -2688,42 +2829,51 @@ impl SysDirInodeOps {
                 else {
                     return Vec::new();
                 };
-                DevicePowerSlot::ALL
-                    .iter()
-                    .map(|slot| {
-                        mk_dir_entry(
-                            device_power_ino(class_name, rdev, slot.to_u64()),
-                            slot.file_name(),
-                            FileType::Regular,
-                        )
-                    })
-                    .collect()
+                let mut entries = Vec::new();
+                for slot in DevicePowerSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        device_power_ino(class_name, rdev, slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
             }
-            SysDirKind::DevicesVirtual => snap
-                .virtual_classes
-                .iter()
-                .enumerate()
-                .map(|(_, class_name)| {
-                    mk_dir_entry(
+            SysDirKind::DevicesVirtual => {
+                let mut entries = Vec::new();
+                for class_name in &snap.virtual_classes {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
                         virtual_class_ino(class_name),
                         class_name,
                         FileType::Directory,
-                    )
-                })
-                .collect(),
-            SysDirKind::DevicesVirtualClass { class_name } => snap
-                .virtual_devices
-                .iter()
-                .enumerate()
-                .filter(|(_, dev)| dev.class_name == class_name)
-                .map(|(_, dev)| {
-                    mk_dir_entry(
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::DevicesVirtualClass { class_name } => {
+                let mut entries = Vec::new();
+                for dev in snap
+                    .virtual_devices
+                    .iter()
+                    .filter(|dev| dev.class_name == class_name)
+                {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
                         virtual_device_ino(dev.class_name, dev.rdev),
                         &dev.sysfs_name,
                         FileType::Directory,
-                    )
-                })
-                .collect(),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::VirtualDevice { class_name, rdev } => {
                 let Some(_) = snap
                     .virtual_devices
@@ -2763,36 +2913,47 @@ impl SysDirInodeOps {
                 else {
                     return Vec::new();
                 };
-                DevicePowerSlot::ALL
-                    .iter()
-                    .map(|slot| {
-                        mk_dir_entry(
-                            virtual_device_power_ino(class_name, rdev, slot.to_u64()),
-                            slot.file_name(),
-                            FileType::Regular,
-                        )
-                    })
-                    .collect()
+                let mut entries = Vec::new();
+                for slot in DevicePowerSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        virtual_device_power_ino(class_name, rdev, slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
             }
-            SysDirKind::DevicesPnp => snap
-                .pnp_buses
-                .iter()
-                .enumerate()
-                .map(|(_, bus)| mk_dir_entry(pnp_bus_ino(bus), bus, FileType::Directory))
-                .collect(),
-            SysDirKind::DevicesPnpBus { bus } => snap
-                .pnp_devices
-                .iter()
-                .enumerate()
-                .filter(|(_, dev)| dev.bus_type == bus)
-                .map(|(_, dev)| {
-                    mk_dir_entry(
+            SysDirKind::DevicesPnp => {
+                let mut entries = Vec::new();
+                for bus in &snap.pnp_buses {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        pnp_bus_ino(bus),
+                        bus,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::DevicesPnpBus { bus } => {
+                let mut entries = Vec::new();
+                for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
                         pnp_device_ino(dev.bus_type, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Directory,
-                    )
-                })
-                .collect(),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::PnpDevice { bus, name } => {
                 let Some(_) = snap
                     .pnp_devices
@@ -2801,45 +2962,53 @@ impl SysDirInodeOps {
                 else {
                     return Vec::new();
                 };
-                PnpDeviceSlot::ALL
-                    .iter()
-                    .map(|slot| {
-                        mk_dir_entry(
-                            pnp_device_slot_ino(bus, &name, slot.to_u64()),
-                            slot.file_name(),
-                            FileType::Regular,
-                        )
-                    })
-                    .collect()
+                let mut entries = Vec::new();
+                for slot in PnpDeviceSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        pnp_device_slot_ino(bus, &name, slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
             }
             SysDirKind::Dev => vec![
                 mk_dir_entry(DEV_BLOCK_DIR_INO, "block", FileType::Directory),
                 mk_dir_entry(DEV_CHAR_DIR_INO, "char", FileType::Directory),
             ],
-            SysDirKind::DevBlock => snap
-                .block_nodes
-                .iter()
-                .enumerate()
-                .map(|(_, b)| {
-                    mk_dir_entry(
-                        dev_block_link_ino(b.rdev),
-                        &rdev_name(b.rdev),
+            SysDirKind::DevBlock => {
+                let mut entries = Vec::new();
+                for node in &snap.block_nodes {
+                    let name = rdev_name(node.rdev);
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        dev_block_link_ino(node.rdev),
+                        &name,
                         FileType::Symlink,
-                    )
-                })
-                .collect(),
-            SysDirKind::DevChar => snap
-                .char_nodes
-                .iter()
-                .enumerate()
-                .map(|(_, c)| {
-                    mk_dir_entry(
-                        dev_char_dir_ino(c.rdev),
-                        &rdev_name(c.rdev),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::DevChar => {
+                let mut entries = Vec::new();
+                for node in &snap.char_nodes {
+                    let name = rdev_name(node.rdev);
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        dev_char_dir_ino(node.rdev),
+                        &name,
                         FileType::Directory,
-                    )
-                })
-                .collect(),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::DevCharInner { rdev } => {
                 let Some(_) = snap.char_nodes.iter().position(|node| node.rdev == rdev) else {
                     return Vec::new();
@@ -2876,60 +3045,92 @@ impl SysDirInodeOps {
             ],
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
-            SysDirKind::Class => snap
-                .classes
-                .iter()
-                .map(|class| {
-                    mk_dir_entry(class_dir_ino(class.name), class.name, FileType::Directory)
-                })
-                .collect(),
-            SysDirKind::ClassDir { class_name } => snap
-                .class_nodes
-                .iter()
-                .filter(|node| node.class_name == class_name)
-                .map(|node| {
+            SysDirKind::Class => {
+                let mut entries = Vec::new();
+                for class in &snap.classes {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        class_dir_ino(class.name),
+                        class.name,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::ClassDir { class_name } => {
+                let mut entries = Vec::new();
+                for node in snap
+                    .class_nodes
+                    .iter()
+                    .filter(|node| node.class_name == class_name)
+                {
                     let kind = match &node.kind {
                         SysClassNodeKind::Symlink { .. } => FileType::Symlink,
                         SysClassNodeKind::NetInterface { .. } => FileType::Directory,
                     };
-                    mk_dir_entry(
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
                         class_node_ino(class_name, &node.sysfs_name),
                         &node.sysfs_name,
                         kind,
-                    )
-                })
-                .collect(),
-            SysDirKind::ClassNetIface { iface_id } => {
-                let mut entries = vec![mk_dir_entry(
-                    class_net_stats_ino(iface_id),
-                    "statistics",
-                    FileType::Directory,
-                )];
-                for slot in NetDevSlot::ALL {
-                    entries.push(mk_dir_entry(
-                        class_net_iface_slot_ino(iface_id, slot.to_u64()),
-                        slot.file_name(),
-                        FileType::Regular,
-                    ));
+                    ) {
+                        return entries;
+                    }
                 }
                 entries
             }
-            SysDirKind::ClassNetStats { iface_id } => NetDevStatsSlot::ALL
-                .iter()
-                .map(|s| {
-                    mk_dir_entry(
-                        class_net_stats_slot_ino(iface_id, s.to_u64()),
-                        s.file_name(),
+            SysDirKind::ClassNetIface { iface_id } => {
+                let mut entries = Vec::new();
+                if !push_sysfs_dir_entry(
+                    &mut entries,
+                    class_net_stats_ino(iface_id),
+                    "statistics",
+                    FileType::Directory,
+                ) {
+                    return entries;
+                }
+                for slot in NetDevSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        class_net_iface_slot_ino(iface_id, slot.to_u64()),
+                        slot.file_name(),
                         FileType::Regular,
-                    )
-                })
-                .collect(),
-            SysDirKind::Bus => snap
-                .pnp_buses
-                .iter()
-                .enumerate()
-                .map(|(_, bus)| mk_dir_entry(bus_class_ino(bus), bus, FileType::Directory))
-                .collect(),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::ClassNetStats { iface_id } => {
+                let mut entries = Vec::new();
+                for slot in NetDevStatsSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        class_net_stats_slot_ino(iface_id, slot.to_u64()),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
+            SysDirKind::Bus => {
+                let mut entries = Vec::new();
+                for bus in &snap.pnp_buses {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        bus_class_ino(bus),
+                        bus,
+                        FileType::Directory,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::BusClass { bus } => {
                 let Some(_) = snap.pnp_buses.iter().position(|entry| *entry == bus) else {
                     return Vec::new();
@@ -2944,18 +3145,18 @@ impl SysDirInodeOps {
                 let Some(_) = snap.pnp_buses.iter().position(|entry| *entry == bus) else {
                     return Vec::new();
                 };
-                snap.pnp_devices
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, dev)| dev.bus_type == bus)
-                    .map(|(_, dev)| {
-                        mk_dir_entry(
-                            bus_class_device_link_ino(bus, &dev.sysfs_name),
-                            &dev.sysfs_name,
-                            FileType::Symlink,
-                        )
-                    })
-                    .collect()
+                let mut entries = Vec::new();
+                for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        bus_class_device_link_ino(bus, &dev.sysfs_name),
+                        &dev.sysfs_name,
+                        FileType::Symlink,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
             }
             SysDirKind::Module | SysDirKind::Power | SysDirKind::Firmware => Vec::new(),
             SysDirKind::DevicesSystem => vec![mk_dir_entry(
@@ -2965,25 +3166,39 @@ impl SysDirInodeOps {
             )],
             SysDirKind::DevicesSystemCpu => {
                 let mask = online_cpu_mask();
-                let mut v = vec![
-                    mk_dir_entry(DEVICES_SYSTEM_CPU_ONLINE_INO, "online", FileType::Regular),
-                    mk_dir_entry(
-                        DEVICES_SYSTEM_CPU_POSSIBLE_INO,
-                        "possible",
-                        FileType::Regular,
-                    ),
-                    mk_dir_entry(DEVICES_SYSTEM_CPU_PRESENT_INO, "present", FileType::Regular),
-                ];
-                for cpu in 0..64 {
-                    if mask & (1u64 << cpu) != 0 {
-                        v.push(mk_dir_entry(
-                            cpu_ino(cpu),
-                            &format!("cpu{}", cpu),
-                            FileType::Directory,
-                        ));
+                let mut entries = Vec::new();
+                for (ino, name) in [
+                    (DEVICES_SYSTEM_CPU_ONLINE_INO, "online"),
+                    (DEVICES_SYSTEM_CPU_POSSIBLE_INO, "possible"),
+                    (DEVICES_SYSTEM_CPU_PRESENT_INO, "present"),
+                ] {
+                    if !push_sysfs_dir_entry(&mut entries, ino, name, FileType::Regular) {
+                        return entries;
                     }
                 }
-                v
+                // TODO(sysfs-cpu): 这里和 CPU mask 渲染一样依赖 64 位固定上限；
+                // 后续应遍历 sched/cpu registry 暴露的在线 CPU 列表。
+                for cpu in 0..64 {
+                    if mask & (1u64 << cpu) != 0 {
+                        let name = {
+                            let mut out = String::new();
+                            use core::fmt::Write;
+                            if write!(&mut out, "cpu{}", cpu).is_err() {
+                                return entries;
+                            }
+                            out
+                        };
+                        if !push_sysfs_dir_entry(
+                            &mut entries,
+                            cpu_ino(cpu),
+                            &name,
+                            FileType::Directory,
+                        ) {
+                            return entries;
+                        }
+                    }
+                }
+                entries
             }
             SysDirKind::Cpu { cpu_id } => vec![
                 mk_dir_entry(
@@ -3007,16 +3222,20 @@ impl SysDirInodeOps {
                     FileType::Directory,
                 ),
             ],
-            SysDirKind::CpuTopology { cpu_id } => CpuTopologySlot::ALL
-                .iter()
-                .map(|slot| {
-                    mk_dir_entry(
+            SysDirKind::CpuTopology { cpu_id } => {
+                let mut entries = Vec::new();
+                for slot in CpuTopologySlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
                         cpu_topology_slot_ino(cpu_id, slot.to_u64()),
                         slot.file_name(),
                         FileType::Regular,
-                    )
-                })
-                .collect(),
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
         }
     }
 }

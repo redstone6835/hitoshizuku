@@ -35,7 +35,7 @@ use crate::mm::{VmSpace, page_size};
 use super::{current_vfs_context, namespace_path};
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
 use crate::dev::function::{CustomDevNodeKind, DevNodeSpec};
-use crate::dev::pnp::{PnpDependency, PnpResourceKind, PnpState};
+use crate::dev::pnp::{PnpDependency, PnpId, PnpResourceKind, PnpState};
 use crate::vfs::device_numbers::{self, PosixDeviceKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -78,6 +78,51 @@ const TASK_SLOT_MAPS: u64 = 11;
 const TASK_SLOT_FD_DIR: u64 = 12;
 const TASK_SLOT_TASK_DIR: u64 = 13;
 const TASK_SLOT_MOUNTINFO: u64 = 14;
+
+fn procfs_fallible_string(value: &str) -> VfsResult<String> {
+    let mut out = String::new();
+    out.try_reserve(value.len())
+        .map_err(|_| VfsError::NoSpace)?;
+    out.push_str(value);
+    Ok(out)
+}
+
+fn procfs_decimal_name(value: impl core::fmt::Display) -> VfsResult<String> {
+    let mut out = String::new();
+    // u64/i64 十进制文本最多 20 字节左右；预留固定上界，避免 write! 过程中
+    // 通过 String 自动扩容导致 procfs 目录快照 panic。
+    out.try_reserve(20).map_err(|_| VfsError::NoSpace)?;
+    write!(&mut out, "{value}").map_err(|_| VfsError::NoSpace)?;
+    Ok(out)
+}
+
+fn procfs_fallible_smallstr(value: &str) -> VfsResult<SmallStr> {
+    let bytes = value.as_bytes();
+    if bytes.len() <= 23 {
+        let mut buf = [0u8; 23];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return Ok(SmallStr::Inline {
+            len: bytes.len() as u8,
+            buf,
+        });
+    }
+    Ok(SmallStr::Heap(procfs_fallible_string(value)?))
+}
+
+fn push_proc_dir_entry(
+    out: &mut Vec<DirEntry>,
+    ino: u64,
+    name: &str,
+    kind: FileType,
+) -> VfsResult<()> {
+    out.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
+    out.push(DirEntry {
+        ino,
+        name: procfs_fallible_smallstr(name)?,
+        kind,
+    });
+    Ok(())
+}
 
 pub struct ProcFsDriver;
 
@@ -359,21 +404,21 @@ impl InodeOps for ProcRootOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        let mut snapshot: Vec<DirEntry> = self
-            .entries
-            .iter()
-            .map(|(name, inode)| DirEntry {
-                ino: inode.ino(),
-                name: SmallStr::new(name),
-                kind: inode.kind(),
-            })
-            .collect();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(self.entries.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (name, inode) in &self.entries {
+            push_proc_dir_entry(&mut snapshot, inode.ino(), name, inode.kind())?;
+        }
         for pid in snapshot_root_processes() {
-            snapshot.push(DirEntry {
-                ino: proc_task_dir_ino(pid, TaskDirView::Process),
-                name: SmallStr::new(&format!("{}", pid)),
-                kind: FileType::Directory,
-            });
+            let name = procfs_decimal_name(pid)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_task_dir_ino(pid, TaskDirView::Process),
+                &name,
+                FileType::Directory,
+            )?;
         }
         Ok(Box::new(ProcDirFile { snapshot }))
     }
@@ -1405,14 +1450,19 @@ impl InodeOps for ProcTaskListDirOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         let mut tids = snapshot_thread_ids(self.leader_pid)?;
         tids.sort_unstable();
-        let snapshot = tids
-            .into_iter()
-            .map(|tid| DirEntry {
-                ino: proc_task_dir_ino(tid, TaskDirView::Thread),
-                name: SmallStr::new(&format!("{}", tid)),
-                kind: FileType::Directory,
-            })
-            .collect();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(tids.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for tid in tids {
+            let name = procfs_decimal_name(tid)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_task_dir_ino(tid, TaskDirView::Thread),
+                &name,
+                FileType::Directory,
+            )?;
+        }
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
@@ -1453,14 +1503,19 @@ impl InodeOps for ProcFdDirOps {
         let fdt = task_fdtable(&task).ok_or(VfsError::NotFound)?;
         let mut fds = fdt.snapshot_fds();
         fds.sort_unstable_by_key(|(fd, _)| *fd);
-        let snapshot = fds
-            .into_iter()
-            .map(|(fd, _)| DirEntry {
-                ino: proc_fd_link_ino(self.pid, fd),
-                name: SmallStr::new(&format!("{}", fd)),
-                kind: FileType::Symlink,
-            })
-            .collect();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(fds.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (fd, _) in fds {
+            let name = procfs_decimal_name(fd)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_fd_link_ino(self.pid, fd),
+                &name,
+                FileType::Symlink,
+            )?;
+        }
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
@@ -2324,15 +2379,36 @@ fn render_stat() -> String {
 
 fn render_devices() -> String {
     // /proc/devices 只导出 POSIX 兼容投影的 major 汇总，不表示底层设备模型的寻址入口。
-    let mut out = String::from("Character devices:\n");
-    for summary in device_numbers::major_summaries(PosixDeviceKind::Char) {
-        out.push_str(&format!("  {} {}\n", summary.major, summary.display_name));
+    // major 名称来自 VFS 兼容层注册的 device number policy；procfs 只消费汇总快照，
+    // 不读取底层设备对象，也不参与设备号分配。
+    let mut out = String::new();
+    if out.try_reserve("Character devices:\n".len()).is_err() {
+        return out;
+    }
+    out.push_str("Character devices:\n");
+    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Char) {
+        write_major_summaries(&mut out, &summaries);
+    }
+    if out.try_reserve("\nBlock devices:\n".len()).is_err() {
+        return out;
     }
     out.push_str("\nBlock devices:\n");
-    for summary in device_numbers::major_summaries(PosixDeviceKind::Block) {
-        out.push_str(&format!("  {} {}\n", summary.major, summary.display_name));
+    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Block) {
+        write_major_summaries(&mut out, &summaries);
     }
     out
+}
+
+fn write_major_summaries(out: &mut String, summaries: &[device_numbers::PosixMajorSummary]) {
+    for summary in summaries {
+        // 设备诊断文本不能因为临时格式化缓冲分配失败而影响设备注册表本身。
+        // 预留本行空间后再写入，避免为每一行创建额外 String。
+        let line_reserve = summary.display_name.len().saturating_add(16);
+        if out.try_reserve(line_reserve).is_err() {
+            return;
+        }
+        let _ = writeln!(out, "  {} {}", summary.major, summary.display_name);
+    }
 }
 
 fn proc_custom_devnode_kind_name(kind: CustomDevNodeKind) -> &'static str {
@@ -2344,17 +2420,37 @@ fn proc_custom_devnode_kind_name(kind: CustomDevNodeKind) -> &'static str {
     }
 }
 
-fn proc_devnode_name(node: &DevNodeSpec) -> String {
+fn proc_devnode_render_len(node: &DevNodeSpec) -> usize {
     match node {
-        DevNodeSpec::Char { name, .. } => format!("char:{}", name),
-        DevNodeSpec::Block { name, .. } => format!("block:{}", name),
-        DevNodeSpec::Symlink { name, target } => format!("symlink:{}->{}", name, target),
+        DevNodeSpec::Char { name, .. } => "char:".len() + name.len(),
+        DevNodeSpec::Block { name, .. } => "block:".len() + name.len(),
+        DevNodeSpec::Symlink { name, target } => {
+            "symlink:".len() + name.len() + "->".len() + target.len()
+        }
         DevNodeSpec::Custom(spec) => {
-            format!(
+            proc_custom_devnode_kind_name(spec.kind()).len() + 1 + spec.name().len()
+        }
+    }
+}
+
+fn write_proc_devnode_name(out: &mut String, node: &DevNodeSpec) {
+    match node {
+        DevNodeSpec::Char { name, .. } => {
+            let _ = write!(out, "char:{name}");
+        }
+        DevNodeSpec::Block { name, .. } => {
+            let _ = write!(out, "block:{name}");
+        }
+        DevNodeSpec::Symlink { name, target } => {
+            let _ = write!(out, "symlink:{name}->{target}");
+        }
+        DevNodeSpec::Custom(spec) => {
+            let _ = write!(
+                out,
                 "{}:{}",
                 proc_custom_devnode_kind_name(spec.kind()),
                 spec.name()
-            )
+            );
         }
     }
 }
@@ -2363,27 +2459,50 @@ fn render_device_functions() -> String {
     // `/proc/device-functions` 是 dev core function registry 的调试快照。
     // 它只展示 class/name 与 devtmpfs 投影声明，不能作为设备打开或寻址入口；
     // 用户态访问路径仍由 `/dev`、`/sys` 和对应 syscall 兼容层决定。
-    let mut out = String::from("class\tname\tdevnodes\n");
-    for func in DEVICES.functions.list() {
-        let devnodes = func
-            .devnodes()
+    // FIXME(procfs-dev): 这个诊断视图仍直接理解 `DevNodeSpec`，说明 dev core 的
+    // `/dev` 投影声明泄漏到了 procfs。后续应改为读取 projection 层生成的
+    // 只读快照，procfs 不再格式化底层 function 的 devtmpfs 节点细节。
+    let mut out = String::new();
+    if out.try_reserve("class\tname\tdevnodes\n".len()).is_err() {
+        return out;
+    }
+    out.push_str("class\tname\tdevnodes\n");
+    for func in DEVICES.functions.try_list().unwrap_or_default() {
+        let nodes = func.devnodes();
+        let devnode_len = nodes
+            .as_ref()
             .map(|nodes| {
-                nodes
+                let names_len = nodes
                     .nodes()
                     .iter()
-                    .map(proc_devnode_name)
-                    .collect::<Vec<_>>()
-                    .join(",")
+                    .map(proc_devnode_render_len)
+                    .sum::<usize>();
+                names_len.saturating_add(nodes.nodes().len().saturating_sub(1))
             })
-            .filter(|nodes| !nodes.is_empty())
-            .unwrap_or_else(|| "-".into());
-        let _ = writeln!(
-            out,
-            "{}\t{}\t{}",
-            func.class_id().as_str(),
-            func.dev_name(),
-            devnodes
-        );
+            .filter(|len| *len > 0)
+            .unwrap_or(1);
+        let line_reserve = func
+            .class_id()
+            .as_str()
+            .len()
+            .saturating_add(func.dev_name().len())
+            .saturating_add(devnode_len)
+            .saturating_add(3);
+        if out.try_reserve(line_reserve).is_err() {
+            return out;
+        }
+        let _ = write!(out, "{}\t{}\t", func.class_id().as_str(), func.dev_name(),);
+        if let Some(nodes) = nodes.filter(|nodes| !nodes.nodes().is_empty()) {
+            for (idx, node) in nodes.nodes().iter().enumerate() {
+                if idx != 0 {
+                    out.push(',');
+                }
+                write_proc_devnode_name(&mut out, node);
+            }
+        } else {
+            out.push('-');
+        }
+        out.push('\n');
     }
     out
 }
@@ -2416,60 +2535,140 @@ fn proc_pnp_resource_kind_name(kind: PnpResourceKind) -> &'static str {
     }
 }
 
-fn proc_pnp_dependency_name(dependency: PnpDependency) -> String {
+fn proc_pnp_dependency_render_len(dependency: PnpDependency) -> usize {
     match dependency {
-        PnpDependency::IrqController(id) => format!("irq-controller:{id}"),
-        PnpDependency::DefaultIrqDomain => "default-irq-domain".into(),
-        PnpDependency::MsiController(id) => format!("msi-controller:{id}"),
-        PnpDependency::Syscon(id) => format!("syscon:{id}"),
-        PnpDependency::FwCfg => "fwcfg".into(),
-        PnpDependency::FirmwareBus => "firmware-bus".into(),
-        PnpDependency::PciHostBridge(domain) => format!("pci-host-bridge:{domain}"),
-        PnpDependency::Dma => "dma".into(),
-        PnpDependency::Other(name) => name.into(),
+        PnpDependency::IrqController(_) => "irq-controller:".len() + 10,
+        PnpDependency::DefaultIrqDomain => "default-irq-domain".len(),
+        PnpDependency::MsiController(_) => "msi-controller:".len() + 10,
+        PnpDependency::Syscon(_) => "syscon:".len() + 10,
+        PnpDependency::FwCfg => "fwcfg".len(),
+        PnpDependency::FirmwareBus => "firmware-bus".len(),
+        PnpDependency::PciHostBridge(_) => "pci-host-bridge:".len() + 5,
+        PnpDependency::Dma => "dma".len(),
+        PnpDependency::Other(name) => name.len(),
+    }
+}
+
+fn proc_pnp_id_render_len(id: &PnpId) -> usize {
+    match id {
+        PnpId::Pci { .. } => "pci:0000:00:00.".len() + 3,
+        PnpId::Usb { interface, .. } => {
+            let base = "usb:".len() + 3 + 1 + 3;
+            if interface.is_some() {
+                base + 1 + 3
+            } else {
+                base
+            }
+        }
+        PnpId::Platform { name, identity } => {
+            if let Some(path) = identity.firmware_path() {
+                "platform:".len() + name.len() + 1 + path.len()
+            } else {
+                // 无固件路径时 Display 只输出 match/resource 计数；这里按最大十进制
+                // 位数预留，避免诊断输出为了设备 id 再次扩容。
+                "platform:".len() + name.len() + "[ids=,resources=]".len() + 20
+            }
+        }
+    }
+}
+
+fn write_proc_pnp_dependency(out: &mut String, dependency: PnpDependency) {
+    match dependency {
+        PnpDependency::IrqController(id) => {
+            let _ = write!(out, "irq-controller:{id}");
+        }
+        PnpDependency::DefaultIrqDomain => out.push_str("default-irq-domain"),
+        PnpDependency::MsiController(id) => {
+            let _ = write!(out, "msi-controller:{id}");
+        }
+        PnpDependency::Syscon(id) => {
+            let _ = write!(out, "syscon:{id}");
+        }
+        PnpDependency::FwCfg => out.push_str("fwcfg"),
+        PnpDependency::FirmwareBus => out.push_str("firmware-bus"),
+        PnpDependency::PciHostBridge(domain) => {
+            let _ = write!(out, "pci-host-bridge:{domain}");
+        }
+        PnpDependency::Dma => out.push_str("dma"),
+        PnpDependency::Other(name) => out.push_str(name),
     }
 }
 
 fn render_pnp() -> String {
     // `/proc/pnp` 是面向诊断的 dev core 快照；设备寻址和层级关系以 sysfs 为准。
-    let mut out =
-        String::from("bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n");
-    for dev in PNP_DEVICES.list() {
-        let functions = dev
-            .functions()
-            .into_iter()
-            .map(|func| format!("{}:{}", func.class_id().as_str(), func.dev_name()))
-            .collect::<Vec<_>>()
-            .join(",");
-        let resources = dev
-            .owned_resources()
-            .into_iter()
-            .map(|resource| {
-                format!(
-                    "{}:{}",
-                    proc_pnp_resource_kind_name(resource.kind),
-                    resource.label
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let deferred = dev
-            .deferred_dependency()
-            .map(proc_pnp_dependency_name)
-            .unwrap_or_default();
+    // TODO(procfs-dev): 字段 schema 和 resource/dependency 文本仍由 procfs 手写。
+    // 后续应由 dev core 暴露稳定的诊断 snapshot/formatter，procfs 只负责输出，
+    // 避免每新增资源类型都同步修改多个虚拟文件系统。
+    let header = "bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n";
+    let mut out = String::new();
+    if out.try_reserve(header.len()).is_err() {
+        return out;
+    }
+    out.push_str(header);
+    for dev in PNP_DEVICES.try_list().unwrap_or_default() {
+        let functions = dev.try_functions().unwrap_or_default();
+        let resources = dev.try_owned_resources().unwrap_or_default();
+        let deferred = dev.deferred_dependency();
         let driver = dev.bound_driver_name().unwrap_or("-");
-        let _ = writeln!(
+        // 诊断输出按设备逐行预留，避免构造 function/resource 的中间字符串列表。
+        let functions_len = functions
+            .iter()
+            .map(|func| func.class_id().as_str().len() + 1 + func.dev_name().len())
+            .sum::<usize>()
+            .saturating_add(functions.len().saturating_sub(1));
+        let resources_len = resources
+            .iter()
+            .map(|resource| {
+                proc_pnp_resource_kind_name(resource.kind).len() + 1 + resource.label.len()
+            })
+            .sum::<usize>()
+            .saturating_add(resources.len().saturating_sub(1));
+        let deferred_len = deferred.map(proc_pnp_dependency_render_len).unwrap_or(0);
+        let line_reserve = dev
+            .name
+            .len()
+            .saturating_add(proc_pnp_id_render_len(&dev.id))
+            .saturating_add(dev.info.bus_type().as_str().len())
+            .saturating_add(driver.len())
+            .saturating_add(functions_len)
+            .saturating_add(resources_len)
+            .saturating_add(deferred_len)
+            .saturating_add(128);
+        if out.try_reserve(line_reserve).is_err() {
+            return out;
+        }
+        let _ = write!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t",
             dev.info.bus_type().as_str(),
             dev.id,
             dev.name,
             proc_pnp_state_name(dev.state()),
             driver,
-            functions,
-            resources,
-            deferred,
         );
+        for (idx, func) in functions.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{}:{}", func.class_id().as_str(), func.dev_name());
+        }
+        out.push('\t');
+        for (idx, resource) in resources.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{}:{}",
+                proc_pnp_resource_kind_name(resource.kind),
+                resource.label
+            );
+        }
+        out.push('\t');
+        if let Some(dependency) = deferred {
+            write_proc_pnp_dependency(&mut out, dependency);
+        }
+        out.push('\n');
     }
     out
 }

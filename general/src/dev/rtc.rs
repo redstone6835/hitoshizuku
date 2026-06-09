@@ -714,10 +714,11 @@ impl DeviceFunction for RtcFunction {
         let mut nodes = Vec::new();
         let payload: Arc<dyn Any + Send + Sync> =
             Arc::new(RtcDevNodeEndpoint::new(Arc::clone(&self.dev)));
-        nodes.push(DevNodeSpec::custom(
-            CustomDevNodeSpec::new(self.dev.name(), CustomDevNodeKind::CharDevice, payload)
-                .with_mode(0o660),
-        ));
+        nodes.push(DevNodeSpec::custom(CustomDevNodeSpec::new(
+            self.dev.name(),
+            CustomDevNodeKind::CharDevice,
+            payload,
+        )));
         if self.dev.index() == 0 {
             nodes.push(DevNodeSpec::Symlink {
                 name: "rtc".into(),
