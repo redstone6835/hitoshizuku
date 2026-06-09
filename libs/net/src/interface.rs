@@ -21,7 +21,7 @@ use crate::adapter::NetDeviceAdapter;
 use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
-use crate::engine::ProtocolSocketHandle;
+use crate::engine::{ProtocolSocketHandle, endpoint_from_smoltcp};
 use crate::socket::{NetSocketHandle, SocketMeta, SocketType};
 use crate::time::NetInstant;
 use crate::tuning::{PacketBufferTuning, TcpBufferTuning};
@@ -705,12 +705,8 @@ impl ManagedInterface {
                 if matches!(tcp_socket.state(), State::Listen) {
                     continue;
                 }
-                let local = tcp_socket
-                    .local_endpoint()
-                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
-                let remote = tcp_socket
-                    .remote_endpoint()
-                    .map(|ep| crate::stack::endpoint_from_smoltcp(ep));
+                let local = tcp_socket.local_endpoint().map(endpoint_from_smoltcp);
+                let remote = tcp_socket.remote_endpoint().map(endpoint_from_smoltcp);
                 if let (Some(local), Some(remote)) = (local, remote) {
                     out.push(super::socket::TcpConnSnapshot {
                         local,
