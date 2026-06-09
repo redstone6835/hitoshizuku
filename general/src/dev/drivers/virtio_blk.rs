@@ -712,14 +712,14 @@ impl BlockDriver for VirtioBlkIo {
         meta_dma.sync_for_device();
 
         // 数据 DMA 缓冲区（仅 Read/Write 需要）
-        let data_dma = match bio.op {
+        let mut data_dma = match bio.op {
             BioOp::Read | BioOp::Write => {
                 let direction = if bio.op == BioOp::Read {
                     DmaDirection::FromDevice
                 } else {
                     DmaDirection::ToDevice
                 };
-                let mut dma = match queue.take_data_dma(data_len, direction) {
+                let dma = match queue.take_data_dma(data_len, direction) {
                     Some(buffer) => buffer,
                     None => match DmaBuffer::new_in(dma_context, data_len, 1, direction) {
                         Ok(buffer) => buffer,
@@ -730,14 +730,25 @@ impl BlockDriver for VirtioBlkIo {
                         }
                     },
                 };
-                if bio.op == BioOp::Write {
-                    dma.as_mut_slice()[..data_len].copy_from_slice(bio.buffer.as_slice());
-                }
-                dma.sync_for_device();
                 Some(dma)
             }
             _ => None,
         };
+
+        if let Some(dma) = data_dma.as_mut() {
+            // 大块顺序写会在这里拷贝 1MiB 级数据；放到队列锁外，避免阻塞完成路径。
+            drop(queue);
+            if bio.op == BioOp::Write {
+                dma.as_mut_slice()[..data_len].copy_from_slice(bio.buffer.as_slice());
+            }
+            dma.sync_for_device();
+            queue = self.driver.inner.queue.lock();
+            if queue.failed {
+                let _ = queue.queue.free_chain(chain);
+                queue.recycle_request_dma(meta_dma, data_dma);
+                return Err((SubmitError::DeviceGone, bio));
+            }
+        }
 
         let header_dma = meta_dma.dma_addr() as u64;
         let status_dma = meta_dma.dma_addr() as u64 + mem::size_of::<VirtioBlkReqHeader>() as u64;
