@@ -52,6 +52,14 @@ pub enum SocketState {
 /// 后续所有操作检查此标志直接返回 `Closed`。实际从 `SocketSet` 中移除
 /// 推迟到下一轮 `poll`，避免并发操作 use-after-free。
 pub(crate) struct SocketMeta {
+    /// 当前占用该 SocketSet 槽位的 generation。
+    ///
+    /// smoltcp 的 `SocketHandle` 只是槽位下标，槽位释放后会被后续 socket
+    /// 复用。generation 用来区分“同一个下标上的不同生命周期”，防止旧
+    /// handle 误操作新 socket。
+    generation: u64,
+    /// 当前槽位内 socket 的协议类型。
+    sock_type: SocketType,
     /// socket 是否已被标记为移除。
     pub removed: AtomicBool,
     /// fd 已释放但 TCP 四次挥手还需要继续由协议栈推进。
@@ -67,12 +75,26 @@ pub(crate) struct SocketMeta {
 }
 
 impl SocketMeta {
-    pub fn new() -> Self {
+    pub fn new(generation: u64, sock_type: SocketType) -> Self {
         Self {
+            generation,
+            sock_type,
             removed: AtomicBool::new(false),
             orphaned: AtomicBool::new(false),
             accepted: AtomicBool::new(false),
         }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn socket_type(&self) -> SocketType {
+        self.sock_type
+    }
+
+    pub fn matches_handle(&self, generation: u64, sock_type: SocketType) -> bool {
+        self.generation == generation && self.sock_type == sock_type
     }
 
     pub fn is_removed(&self) -> bool {
@@ -110,6 +132,7 @@ impl SocketMeta {
 pub struct NetSocketHandle {
     pub(crate) iface_id: InterfaceId,
     pub(crate) inner: smoltcp::iface::SocketHandle,
+    pub(crate) generation: u64,
     pub(crate) sock_type: SocketType,
 }
 

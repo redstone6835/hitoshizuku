@@ -22,7 +22,7 @@ use crate::adapter::NetDeviceAdapter;
 use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
-use crate::socket::SocketMeta;
+use crate::socket::{NetSocketHandle, SocketMeta, SocketType};
 use crate::tuning::{PacketBufferTuning, TcpBufferTuning};
 
 // ── ManagedInterface ─────────────────────────────────────────────────────────
@@ -38,6 +38,8 @@ pub(crate) struct ManagedInterface {
     pending_accepted: Vec<SocketHandle>,
     max_backlog: usize,
     inode_counter: core::sync::atomic::AtomicU64,
+    /// 每次分配 socket 时递增，用于给对外 handle 打生命周期标记。
+    handle_generation: u64,
     config: IfConfig,
     #[allow(dead_code)]
     net_device: Arc<NetDevice>,
@@ -110,6 +112,7 @@ impl ManagedInterface {
             pending_accepted: Vec::new(),
             max_backlog: 128,
             inode_counter: core::sync::atomic::AtomicU64::new(1),
+            handle_generation: 1,
             config,
             net_device,
             admin_up: true,
@@ -119,6 +122,52 @@ impl ManagedInterface {
     fn next_inode(&self) -> u64 {
         self.inode_counter
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        let generation = self.handle_generation;
+        self.handle_generation = self.handle_generation.wrapping_add(1).max(1);
+        generation
+    }
+
+    fn install_socket_meta(&mut self, handle: SocketHandle, sock_type: SocketType) -> u64 {
+        let generation = self.next_generation();
+        self.meta
+            .insert(handle, SocketMeta::new(generation, sock_type));
+        generation
+    }
+
+    /// 构造对外暴露的 socket handle。
+    pub fn make_handle(
+        &self,
+        iface_id: InterfaceId,
+        inner: SocketHandle,
+        sock_type: SocketType,
+    ) -> Option<NetSocketHandle> {
+        let meta = self.meta.get(&inner)?;
+        if meta.is_removed() || meta.is_orphaned() || meta.socket_type() != sock_type {
+            return None;
+        }
+        Some(NetSocketHandle {
+            iface_id,
+            inner,
+            generation: meta.generation(),
+            sock_type,
+        })
+    }
+
+    /// 检查外部 handle 是否仍指向当前生命周期的 socket。
+    pub fn handle_is_live(&self, handle: NetSocketHandle) -> bool {
+        self.meta.get(&handle.inner).is_some_and(|meta| {
+            meta.matches_handle(handle.generation, handle.sock_type)
+                && !meta.is_removed()
+                && !meta.is_orphaned()
+        })
+    }
+
+    /// 检查外部 handle 是否存在但已被标记为移除或 orphan。
+    pub fn handle_is_closed(&self, handle: NetSocketHandle) -> bool {
+        !self.handle_is_live(handle)
     }
 
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
@@ -282,18 +331,6 @@ impl ManagedInterface {
             });
         }
         out
-    }
-
-    /// 检查 socket 是否已被 soft-close 标记为移除。
-    pub fn is_socket_removed(&self, handle: SocketHandle) -> bool {
-        self.meta
-            .get(&handle)
-            .map_or(true, |m| m.is_removed() || m.is_orphaned())
-    }
-
-    /// 检查 socket handle 当前是否仍存在于元数据表中。
-    pub fn has_socket(&self, handle: SocketHandle) -> bool {
-        self.meta.contains_key(&handle)
     }
 
     /// 检查同一监听端点是否已经被其它 TCP socket 占用。
@@ -505,7 +542,7 @@ impl ManagedInterface {
         // setsockopt 再精细控制。
         socket.set_nagle_enabled(false);
         let handle = self.sockets.add(socket);
-        self.meta.insert(handle, SocketMeta::new());
+        self.install_socket_meta(handle, SocketType::Tcp);
         handle
     }
 
@@ -521,18 +558,8 @@ impl ManagedInterface {
         );
         let socket = smoltcp::socket::udp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
-        self.meta.insert(handle, SocketMeta::new());
+        self.install_socket_meta(handle, SocketType::Udp);
         handle
-    }
-
-    /// 从 SocketSet 移除一个 socket。
-    ///
-    /// 旧实现只删 SocketSet 不删 meta，会导致下一次 `poll` 看到 `meta`
-    /// 里残留的 `is_removed=true` 条目然后去 `sockets.remove` 一个已经被
-    /// 释放的槽位，触发 smoltcp 的 "handle does not refer to a valid
-    /// socket" panic。统一走 `remove_socket_locked`。
-    pub fn remove_socket(&mut self, handle: smoltcp::iface::SocketHandle) {
-        self.remove_socket_locked(handle);
     }
 
     /// 获取 TCP socket 的可变引用（内部操作用）。
@@ -540,8 +567,8 @@ impl ManagedInterface {
         &mut self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::tcp::Socket<'static> {
-        // FIXME: typed accessor 直接下转 SocketSet handle，依赖外层先检查
-        // meta 和 socket 类型；旧 handle 误用仍可能触发 smoltcp panic。
+        // 内部 typed accessor 仍直接下转 SocketSet handle；对外入口必须先通过
+        // handle_is_live 做 generation/type 校验，避免旧 handle 触发下转 panic。
         self.sockets.get_mut(handle)
     }
 
@@ -558,7 +585,7 @@ impl ManagedInterface {
         &mut self,
         handle: smoltcp::iface::SocketHandle,
     ) -> &mut smoltcp::socket::udp::Socket<'static> {
-        // FIXME: 同 tcp_socket_mut，缺少 generation/type guard。
+        // 同 tcp_socket_mut：调用方必须先完成 generation/type 校验。
         self.sockets.get_mut(handle)
     }
 
@@ -597,7 +624,7 @@ impl ManagedInterface {
         );
         let socket = raw::Socket::new(Some(ip_ver), Some(proto), rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
-        self.meta.insert(handle, SocketMeta::new());
+        self.install_socket_meta(handle, SocketType::Raw);
         handle
     }
 
@@ -616,7 +643,7 @@ impl ManagedInterface {
         );
         let socket = icmp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
-        self.meta.insert(handle, SocketMeta::new());
+        self.install_socket_meta(handle, SocketType::Icmp);
         handle
     }
 
@@ -812,4 +839,95 @@ fn generate_seed(id: InterfaceId) -> u64 {
 
 fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
     u32::from_be_bytes(mask.0).leading_ones() as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::any::Any;
+
+    use super::*;
+    use crate::driver::{Duplex, LinkState, NetDriver, RxBuf, TxBuf};
+    use crate::tuning::NetTuning;
+
+    struct EmptyDriver;
+
+    impl NetDriver for EmptyDriver {
+        fn medium(&self) -> LinkMedium {
+            LinkMedium::Ip
+        }
+
+        fn poll_rx(&self) -> Option<RxBuf> {
+            None
+        }
+
+        fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
+            Some(TxBuf::new(alloc::vec![0u8; len].into_boxed_slice()))
+        }
+
+        fn commit_tx(&self, _buf: TxBuf) {}
+
+        fn link_state(&self) -> LinkState {
+            LinkState::Up {
+                speed_mbps: None,
+                duplex: Duplex::Full,
+            }
+        }
+
+        fn mac_address(&self) -> [u8; 6] {
+            [0; 6]
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn test_interface() -> (InterfaceId, ManagedInterface) {
+        let driver: Arc<dyn NetDriver> = Arc::new(EmptyDriver);
+        let dev = Arc::new(NetDevice::new("test-net", driver));
+        let id = dev.id();
+        let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, 8, None);
+        (id, ManagedInterface::new(dev, config))
+    }
+
+    #[test]
+    fn stale_socket_handle_is_rejected_after_slot_reuse() {
+        let (iface_id, mut iface) = test_interface();
+        let tuning = NetTuning::defaults();
+
+        let first_inner = iface.add_udp_socket(tuning.udp);
+        let first = iface
+            .make_handle(iface_id, first_inner, SocketType::Udp)
+            .unwrap();
+        iface.remove_socket_locked(first_inner);
+
+        let second_inner = iface.add_udp_socket(tuning.udp);
+        let second = iface
+            .make_handle(iface_id, second_inner, SocketType::Udp)
+            .unwrap();
+
+        // smoltcp 会复用空槽位；generation 必须让旧 handle 失效，防止旧 fd
+        // 误关或误读新 socket。
+        assert_eq!(first.inner, second.inner);
+        assert_ne!(first.generation, second.generation);
+        assert!(iface.handle_is_closed(first));
+        assert!(iface.handle_is_live(second));
+    }
+
+    #[test]
+    fn wrong_socket_type_handle_is_rejected_before_downcast() {
+        let (iface_id, mut iface) = test_interface();
+        let tuning = NetTuning::defaults();
+
+        let inner = iface.add_tcp_socket(tuning.tcp);
+        let tcp = iface.make_handle(iface_id, inner, SocketType::Tcp).unwrap();
+        let forged_udp = NetSocketHandle {
+            sock_type: SocketType::Udp,
+            ..tcp
+        };
+
+        assert!(iface.handle_is_live(tcp));
+        assert!(iface.handle_is_closed(forged_udp));
+    }
 }
