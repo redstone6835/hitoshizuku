@@ -367,7 +367,7 @@ impl NetStack {
                 SocketType::Raw => {
                     // TODO: raw IP 发送目前忽略 remote，缺少 per-packet 目的地址、
                     // 路由元信息和 raw socket 头部包含语义。
-                    let socket = managed.raw_socket_mut(handle.inner);
+                    let socket = managed.raw_socket_mut(handle.inner.into_smoltcp());
                     let tx_buf = socket.send(data.len()).map_err(|_| NetError::WouldBlock)?;
                     tx_buf.copy_from_slice(data);
                     data.len()
@@ -376,7 +376,7 @@ impl NetStack {
                     let remote = remote.ok_or(NetError::InvalidArgument)?;
                     // TODO: ICMP 仅把 remote addr 传给 smoltcp，尚未支持 identifier
                     // 绑定、IPv6 ICMP 细分语义和 socket 级过滤。
-                    let socket = managed.icmp_socket_mut(handle.inner);
+                    let socket = managed.icmp_socket_mut(handle.inner.into_smoltcp());
                     socket
                         .send_slice(data, endpoint_to_smoltcp(&remote).addr)
                         .map_err(|err| match err {
@@ -405,7 +405,7 @@ impl NetStack {
         }
         match handle.sock_type {
             SocketType::Raw => {
-                let socket = managed.raw_socket_mut(handle.inner);
+                let socket = managed.raw_socket_mut(handle.inner.into_smoltcp());
                 let data = socket.recv().map_err(|_| NetError::WouldBlock)?;
                 // FIXME: raw::Socket::recv() 的来源/接口元信息在这里被丢弃，
                 // VFS recvfrom 无法返回 peer 地址。
@@ -414,7 +414,7 @@ impl NetStack {
                 Ok(n)
             }
             SocketType::Icmp => {
-                let socket = managed.icmp_socket_mut(handle.inner);
+                let socket = managed.icmp_socket_mut(handle.inner.into_smoltcp());
                 let (data, _) = socket.recv().map_err(|_| NetError::WouldBlock)?;
                 // FIXME: ICMP recv 丢弃 endpoint，导致 recvfrom 只能返回 None。
                 let n = data.len().min(buf.len());
@@ -435,8 +435,8 @@ impl NetStack {
             return false;
         }
         match handle.sock_type {
-            SocketType::Raw => managed.raw_socket(handle.inner).can_recv(),
-            SocketType::Icmp => managed.icmp_socket(handle.inner).can_recv(),
+            SocketType::Raw => managed.raw_socket(handle.inner.into_smoltcp()).can_recv(),
+            SocketType::Icmp => managed.icmp_socket(handle.inner.into_smoltcp()).can_recv(),
             _ => false,
         }
     }
@@ -451,8 +451,8 @@ impl NetStack {
             return false;
         }
         match handle.sock_type {
-            SocketType::Raw => managed.raw_socket(handle.inner).can_send(),
-            SocketType::Icmp => managed.icmp_socket(handle.inner).can_send(),
+            SocketType::Raw => managed.raw_socket(handle.inner.into_smoltcp()).can_send(),
+            SocketType::Icmp => managed.icmp_socket(handle.inner.into_smoltcp()).can_send(),
             _ => false,
         }
     }
@@ -479,10 +479,13 @@ impl NetStack {
                 return Err(NetError::Closed);
             }
             let remote_ep = endpoint_to_smoltcp(&remote);
-            let local_port =
-                select_tcp_ephemeral_port(&managed, handle.inner, self.tuning.ephemeral_ports)?;
+            let local_port = select_tcp_ephemeral_port(
+                &managed,
+                handle.inner.into_smoltcp(),
+                self.tuning.ephemeral_ports,
+            )?;
             managed
-                .tcp_connect(handle.inner, remote_ep, local_port)
+                .tcp_connect(handle.inner.into_smoltcp(), remote_ep, local_port)
                 .map_err(|_| NetError::ConnectionRefused)?;
         }
         self.poll_now();
@@ -508,10 +511,10 @@ impl NetStack {
         }
         if local.port != 0 {
             let local_ep = endpoint_to_smoltcp_listen(&local);
-            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+            if managed.tcp_listen_endpoint_in_use(handle.inner.into_smoltcp(), local_ep) {
                 return Err(NetError::AddressInUse);
             }
-            let socket = managed.tcp_socket_mut(handle.inner);
+            let socket = managed.tcp_socket_mut(handle.inner.into_smoltcp());
             socket
                 .listen(local_ep)
                 .map_err(|_| NetError::AddressInUse)?;
@@ -524,10 +527,10 @@ impl NetStack {
         for candidate in EphemeralPortCursor::new(self.tuning.ephemeral_ports) {
             local.port = candidate;
             let local_ep = endpoint_to_smoltcp_listen(&local);
-            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+            if managed.tcp_listen_endpoint_in_use(handle.inner.into_smoltcp(), local_ep) {
                 continue;
             }
-            let socket = managed.tcp_socket_mut(handle.inner);
+            let socket = managed.tcp_socket_mut(handle.inner.into_smoltcp());
             if socket.listen(local_ep).is_ok() {
                 return Ok(local);
             }
@@ -551,7 +554,7 @@ impl NetStack {
             if managed.handle_is_closed(handle) {
                 return Err(NetError::Closed);
             }
-            let socket = managed.tcp_socket_mut(handle.inner);
+            let socket = managed.tcp_socket_mut(handle.inner.into_smoltcp());
             if !socket.may_send() {
                 return Err(NetError::Closed);
             }
@@ -586,7 +589,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
-        let socket = managed.tcp_socket_mut(handle.inner);
+        let socket = managed.tcp_socket_mut(handle.inner.into_smoltcp());
         match socket.recv_slice(buf) {
             Ok(0) if buf.is_empty() => Ok(0),
             Ok(0) if socket.may_recv() => Err(NetError::WouldBlock),
@@ -615,7 +618,7 @@ impl NetStack {
             if let Some(iface_lock) = table.get(&handle.iface_id) {
                 let mut managed = iface_lock.lock();
                 if managed.handle_is_live(handle) {
-                    managed.tcp_socket_mut(handle.inner).close();
+                    managed.tcp_socket_mut(handle.inner.into_smoltcp()).close();
                 }
             }
         }
@@ -634,7 +637,7 @@ impl NetStack {
             let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
                 managed
-                    .tcp_socket_mut(handle.inner)
+                    .tcp_socket_mut(handle.inner.into_smoltcp())
                     .set_nagle_enabled(!nodelay);
             }
         }
@@ -655,7 +658,7 @@ impl NetStack {
             };
             if managed.handle_is_live(handle) {
                 managed
-                    .tcp_socket_mut(handle.inner)
+                    .tcp_socket_mut(handle.inner.into_smoltcp())
                     .set_keep_alive(interval);
             }
         }
@@ -675,7 +678,9 @@ impl NetStack {
                 Some(NetDuration::from_secs(secs).into_smoltcp())
             };
             if managed.handle_is_live(handle) {
-                managed.tcp_socket_mut(handle.inner).set_timeout(timeout);
+                managed
+                    .tcp_socket_mut(handle.inner.into_smoltcp())
+                    .set_timeout(timeout);
             }
         }
     }
@@ -689,7 +694,9 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
-                managed.tcp_socket_mut(handle.inner).set_hop_limit(ttl);
+                managed
+                    .tcp_socket_mut(handle.inner.into_smoltcp())
+                    .set_hop_limit(ttl);
             }
         }
     }
@@ -707,7 +714,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return 0;
         }
-        managed.tcp_socket(handle.inner).recv_queue()
+        managed.tcp_socket(handle.inner.into_smoltcp()).recv_queue()
     }
 
     /// 查询 TCP 发送缓冲区已排队字节数。
@@ -723,7 +730,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return 0;
         }
-        managed.tcp_socket(handle.inner).send_queue()
+        managed.tcp_socket(handle.inner.into_smoltcp()).send_queue()
     }
 
     /// TCP peek（窥视，不消费数据）。
@@ -740,7 +747,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
-        let socket = managed.tcp_socket_mut(handle.inner);
+        let socket = managed.tcp_socket_mut(handle.inner.into_smoltcp());
         match socket.peek_slice(buf) {
             Ok(0) if buf.is_empty() => Ok(0),
             Ok(0) if socket.may_recv() => Err(NetError::WouldBlock),
@@ -760,7 +767,9 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return None;
         }
-        let ep = managed.tcp_socket(handle.inner).local_endpoint()?;
+        let ep = managed
+            .tcp_socket(handle.inner.into_smoltcp())
+            .local_endpoint()?;
         Some(endpoint_from_smoltcp(ep))
     }
 
@@ -775,7 +784,9 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return None;
         }
-        let ep = managed.tcp_socket(handle.inner).remote_endpoint()?;
+        let ep = managed
+            .tcp_socket(handle.inner.into_smoltcp())
+            .remote_endpoint()?;
         Some(endpoint_from_smoltcp(ep))
     }
 
@@ -788,7 +799,9 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
-                managed.udp_socket_mut(handle.inner).set_hop_limit(ttl);
+                managed
+                    .udp_socket_mut(handle.inner.into_smoltcp())
+                    .set_hop_limit(ttl);
             }
         }
     }
@@ -810,7 +823,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
-        let socket = managed.udp_socket_mut(handle.inner);
+        let socket = managed.udp_socket_mut(handle.inner.into_smoltcp());
         let (n, meta) = socket.peek_slice(buf).map_err(|_| NetError::WouldBlock)?;
         Ok((n, endpoint_from_smoltcp(meta.endpoint)))
     }
@@ -976,10 +989,10 @@ impl NetStack {
         }
         if local.port != 0 {
             let local_ep = endpoint_to_smoltcp_listen(&local);
-            if managed.udp_endpoint_in_use(handle.inner, local_ep) {
+            if managed.udp_endpoint_in_use(handle.inner.into_smoltcp(), local_ep) {
                 return Err(NetError::AddressInUse);
             }
-            let socket = managed.udp_socket_mut(handle.inner);
+            let socket = managed.udp_socket_mut(handle.inner.into_smoltcp());
             socket.bind(local_ep).map_err(|_| NetError::AddressInUse)?;
             return Ok(local);
         }
@@ -989,10 +1002,10 @@ impl NetStack {
         for candidate in EphemeralPortCursor::new(self.tuning.ephemeral_ports) {
             local.port = candidate;
             let local_ep = endpoint_to_smoltcp_listen(&local);
-            if managed.udp_endpoint_in_use(handle.inner, local_ep) {
+            if managed.udp_endpoint_in_use(handle.inner.into_smoltcp(), local_ep) {
                 continue;
             }
-            let socket = managed.udp_socket_mut(handle.inner);
+            let socket = managed.udp_socket_mut(handle.inner.into_smoltcp());
             if socket.bind(local_ep).is_ok() {
                 return Ok(local);
             }
@@ -1021,17 +1034,22 @@ impl NetStack {
             if managed.handle_is_closed(handle) {
                 return Err(NetError::Closed);
             }
-            if managed.udp_socket(handle.inner).endpoint().port == 0 {
+            if managed
+                .udp_socket(handle.inner.into_smoltcp())
+                .endpoint()
+                .port
+                == 0
+            {
                 let local_ep = select_udp_ephemeral_endpoint(
                     &managed,
-                    handle.inner,
+                    handle.inner.into_smoltcp(),
                     self.tuning.ephemeral_ports,
                 )?;
-                let socket = managed.udp_socket_mut(handle.inner);
+                let socket = managed.udp_socket_mut(handle.inner.into_smoltcp());
                 socket.bind(local_ep).map_err(|_| NetError::AddressInUse)?;
             }
             let remote_ep = endpoint_to_smoltcp(&remote);
-            let socket = managed.udp_socket_mut(handle.inner);
+            let socket = managed.udp_socket_mut(handle.inner.into_smoltcp());
             socket
                 .send_slice(data, remote_ep)
                 .map_err(|_| NetError::WouldBlock)?;
@@ -1057,7 +1075,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
-        let socket = managed.udp_socket_mut(handle.inner);
+        let socket = managed.udp_socket_mut(handle.inner.into_smoltcp());
         let (len, meta) = socket.recv_slice(buf).map_err(|_| NetError::WouldBlock)?;
         let remote = endpoint_from_smoltcp(meta.endpoint);
         Ok((len, remote))
@@ -1074,7 +1092,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return None;
         }
-        let ep = managed.udp_socket(handle.inner).endpoint();
+        let ep = managed.udp_socket(handle.inner.into_smoltcp()).endpoint();
         if ep.port == 0 {
             return None;
         }
@@ -1098,7 +1116,7 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
-                managed.udp_socket_mut(handle.inner).close();
+                managed.udp_socket_mut(handle.inner.into_smoltcp()).close();
             }
         }
     }
@@ -1119,7 +1137,7 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
-                managed.soft_remove_socket(handle.inner);
+                managed.soft_remove_socket(handle.inner.into_smoltcp());
             }
         }
     }
@@ -1146,7 +1164,7 @@ impl NetStack {
                 if let Some(iface_lock) = table.get(&handle.iface_id) {
                     let mut managed = iface_lock.lock();
                     if managed.handle_is_live(handle) {
-                        managed.tcp_socket_mut(handle.inner).close();
+                        managed.tcp_socket_mut(handle.inner.into_smoltcp()).close();
                     }
                 }
             }
@@ -1155,7 +1173,7 @@ impl NetStack {
                 if let Some(iface_lock) = table.get(&handle.iface_id) {
                     let mut managed = iface_lock.lock();
                     if managed.handle_is_live(handle) {
-                        managed.udp_socket_mut(handle.inner).close();
+                        managed.udp_socket_mut(handle.inner.into_smoltcp()).close();
                     }
                 }
             }
@@ -1174,7 +1192,7 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
-                managed.remove_socket_locked(handle.inner);
+                managed.remove_socket_locked(handle.inner.into_smoltcp());
             }
         }
     }
@@ -1197,8 +1215,8 @@ impl NetStack {
             if let Some(iface_lock) = table.get(&handle.iface_id) {
                 let mut managed = iface_lock.lock();
                 if managed.handle_is_live(handle) {
-                    managed.tcp_socket_mut(handle.inner).close();
-                    managed.orphan_socket(handle.inner);
+                    managed.tcp_socket_mut(handle.inner.into_smoltcp()).close();
+                    managed.orphan_socket(handle.inner.into_smoltcp());
                 }
             }
         }
@@ -1221,12 +1239,12 @@ impl NetStack {
         }
         match handle.sock_type {
             SocketType::Tcp => {
-                let socket = managed.tcp_socket(handle.inner);
+                let socket = managed.tcp_socket(handle.inner.into_smoltcp());
                 socket.can_recv() || tcp_state_is_read_eof(socket.state())
             }
-            SocketType::Udp => managed.udp_socket(handle.inner).can_recv(),
-            SocketType::Raw => managed.raw_socket(handle.inner).can_recv(),
-            SocketType::Icmp => managed.icmp_socket(handle.inner).can_recv(),
+            SocketType::Udp => managed.udp_socket(handle.inner.into_smoltcp()).can_recv(),
+            SocketType::Raw => managed.raw_socket(handle.inner.into_smoltcp()).can_recv(),
+            SocketType::Icmp => managed.icmp_socket(handle.inner.into_smoltcp()).can_recv(),
         }
     }
 
@@ -1243,10 +1261,10 @@ impl NetStack {
             return false;
         }
         match handle.sock_type {
-            SocketType::Tcp => managed.tcp_socket(handle.inner).can_send(),
-            SocketType::Udp => managed.udp_socket(handle.inner).can_send(),
-            SocketType::Raw => managed.raw_socket(handle.inner).can_send(),
-            SocketType::Icmp => managed.icmp_socket(handle.inner).can_send(),
+            SocketType::Tcp => managed.tcp_socket(handle.inner.into_smoltcp()).can_send(),
+            SocketType::Udp => managed.udp_socket(handle.inner.into_smoltcp()).can_send(),
+            SocketType::Raw => managed.raw_socket(handle.inner.into_smoltcp()).can_send(),
+            SocketType::Icmp => managed.icmp_socket(handle.inner.into_smoltcp()).can_send(),
         }
     }
 
@@ -1301,10 +1319,12 @@ impl NetStack {
             let target = if let Some(local) = local_hint {
                 endpoint_to_smoltcp_listen(&local)
             } else {
-                managed.tcp_socket(handle.inner).listen_endpoint()
+                managed
+                    .tcp_socket(handle.inner.into_smoltcp())
+                    .listen_endpoint()
             };
             managed
-                .pending_tcp_accept(handle.inner, target)
+                .pending_tcp_accept(handle.inner.into_smoltcp(), target)
                 .and_then(|inner| managed.make_handle(handle.iface_id, inner, SocketType::Tcp))
         };
         if let Some(pending) = pending {
@@ -1335,9 +1355,13 @@ impl NetStack {
         let target = if let Some(local) = local_hint {
             endpoint_to_smoltcp_listen(&local)
         } else {
-            managed.tcp_socket(handle.inner).listen_endpoint()
+            managed
+                .tcp_socket(handle.inner.into_smoltcp())
+                .listen_endpoint()
         };
-        managed.pending_tcp_accept(handle.inner, target).is_some()
+        managed
+            .pending_tcp_accept(handle.inner.into_smoltcp(), target)
+            .is_some()
     }
 
     /// 接受一条已经被 smoltcp 装到 listen socket 上的连接：
@@ -1363,24 +1387,28 @@ impl NetStack {
             if managed.handle_is_closed(listen_handle) {
                 return Err(NetError::WouldBlock);
             }
-            if managed.tcp_socket(listen_handle.inner).state()
+            if managed
+                .tcp_socket(listen_handle.inner.into_smoltcp())
+                .state()
                 != smoltcp::socket::tcp::State::Established
             {
                 return Err(NetError::WouldBlock);
             }
 
-            let listen_endpoint = managed.tcp_socket(listen_handle.inner).listen_endpoint();
-            if managed.pending_tcp_accept(listen_handle.inner, listen_endpoint)
-                != Some(listen_handle.inner)
+            let listen_endpoint = managed
+                .tcp_socket(listen_handle.inner.into_smoltcp())
+                .listen_endpoint();
+            if managed.pending_tcp_accept(listen_handle.inner.into_smoltcp(), listen_endpoint)
+                != Some(listen_handle.inner.into_smoltcp())
             {
                 return Err(NetError::WouldBlock);
             }
             let local = managed
-                .tcp_socket(listen_handle.inner)
+                .tcp_socket(listen_handle.inner.into_smoltcp())
                 .local_endpoint()
                 .map(endpoint_from_smoltcp);
             let remote = managed
-                .tcp_socket(listen_handle.inner)
+                .tcp_socket(listen_handle.inner.into_smoltcp())
                 .remote_endpoint()
                 .map(endpoint_from_smoltcp);
 
@@ -1396,7 +1424,7 @@ impl NetStack {
                 .listen(listen_endpoint)
                 .map_err(|_| NetError::AddressInUse)?;
             let accepted = listen_handle;
-            managed.mark_socket_accepted(listen_handle.inner);
+            managed.mark_socket_accepted(listen_handle.inner.into_smoltcp());
             TcpAcceptInfo {
                 accepted,
                 listener: new_listen,
@@ -1460,11 +1488,11 @@ impl NetStack {
         }
         match handle.sock_type {
             SocketType::Tcp => {
-                let socket = managed.tcp_socket(handle.inner);
+                let socket = managed.tcp_socket(handle.inner.into_smoltcp());
                 tcp_state_to_socket_state(socket.state())
             }
             SocketType::Udp => {
-                let socket = managed.udp_socket(handle.inner);
+                let socket = managed.udp_socket(handle.inner.into_smoltcp());
                 if socket.is_open() {
                     SocketState::Established
                 } else {
@@ -1474,8 +1502,8 @@ impl NetStack {
             SocketType::Raw => {
                 // TODO: raw socket 没有连接态，这里用 can_recv/can_send 推导
                 // Established 只是为了兼容上层等待逻辑。
-                if managed.raw_socket(handle.inner).can_recv()
-                    || managed.raw_socket(handle.inner).can_send()
+                if managed.raw_socket(handle.inner.into_smoltcp()).can_recv()
+                    || managed.raw_socket(handle.inner.into_smoltcp()).can_send()
                 {
                     SocketState::Established
                 } else {
@@ -1485,8 +1513,8 @@ impl NetStack {
             SocketType::Icmp => {
                 // TODO: ICMP socket 也没有严格连接态，这里返回 Established
                 // 只是近似 readiness，不代表 peer/identifier 已绑定。
-                if managed.icmp_socket(handle.inner).can_recv()
-                    || managed.icmp_socket(handle.inner).can_send()
+                if managed.icmp_socket(handle.inner.into_smoltcp()).can_recv()
+                    || managed.icmp_socket(handle.inner.into_smoltcp()).can_send()
                 {
                     SocketState::Established
                 } else {

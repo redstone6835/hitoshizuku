@@ -21,6 +21,7 @@ use crate::adapter::NetDeviceAdapter;
 use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
+use crate::engine::ProtocolSocketHandle;
 use crate::socket::{NetSocketHandle, SocketMeta, SocketType};
 use crate::time::NetInstant;
 use crate::tuning::{PacketBufferTuning, TcpBufferTuning};
@@ -150,7 +151,7 @@ impl ManagedInterface {
         }
         Some(NetSocketHandle {
             iface_id,
-            inner,
+            inner: ProtocolSocketHandle::from_smoltcp(inner),
             generation: meta.generation(),
             sock_type,
         })
@@ -158,11 +159,13 @@ impl ManagedInterface {
 
     /// 检查外部 handle 是否仍指向当前生命周期的 socket。
     pub fn handle_is_live(&self, handle: NetSocketHandle) -> bool {
-        self.meta.get(&handle.inner).is_some_and(|meta| {
-            meta.matches_handle(handle.generation, handle.sock_type)
-                && !meta.is_removed()
-                && !meta.is_orphaned()
-        })
+        self.meta
+            .get(&handle.inner.into_smoltcp())
+            .is_some_and(|meta| {
+                meta.matches_handle(handle.generation, handle.sock_type)
+                    && !meta.is_removed()
+                    && !meta.is_orphaned()
+            })
     }
 
     /// 检查外部 handle 是否存在但已被标记为移除或 orphan。
@@ -911,7 +914,7 @@ mod tests {
 
         // smoltcp 会复用空槽位；generation 必须让旧 handle 失效，防止旧 fd
         // 误关或误读新 socket。
-        assert_eq!(first.inner, second.inner);
+        assert_eq!(first.inner.into_smoltcp(), second.inner.into_smoltcp());
         assert_ne!(first.generation, second.generation);
         assert!(iface.handle_is_closed(first));
         assert!(iface.handle_is_live(second));

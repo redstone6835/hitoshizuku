@@ -13,6 +13,7 @@
 //! - [`stack`]：全局网络协议栈管理器
 //!   （[`NetStack`](stack::NetStack)），负责接口生命周期和 poll 调度。
 //! - [`time`]：网络层自有单调时间类型，隔离具体协议引擎的时间表示。
+//! - `engine`：crate 内部协议引擎适配类型，不作为公共 API 暴露。
 //! - [`error`]：统一错误类型。
 //!
 //! # 架构分层
@@ -47,6 +48,7 @@ pub mod config;
 pub mod device;
 pub mod dhcp;
 pub mod driver;
+mod engine;
 pub mod error;
 pub mod interface;
 pub mod route;

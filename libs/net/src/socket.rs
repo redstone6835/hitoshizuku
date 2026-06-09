@@ -5,12 +5,13 @@
 //! （connect/send/recv/close 等）。
 //!
 //! 设计上 handle 是轻量值类型（Copy），可以自由传递和存储。实际的 socket
-//! 状态和缓冲区由 smoltcp 的 `SocketSet` 内部管理——本 crate 只暴露
-//! 操作接口，不暴露 smoltcp 内部类型。
+//! 状态和缓冲区由协议引擎内部管理——本 crate 只暴露操作接口，不暴露
+//! 具体协议栈内部类型。
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::device::InterfaceId;
+use crate::engine::ProtocolSocketHandle;
 
 // ── Socket 类型 ──────────────────────────────────────────────────────────────
 
@@ -54,9 +55,9 @@ pub enum SocketState {
 pub(crate) struct SocketMeta {
     /// 当前占用该 SocketSet 槽位的 generation。
     ///
-    /// smoltcp 的 `SocketHandle` 只是槽位下标，槽位释放后会被后续 socket
-    /// 复用。generation 用来区分“同一个下标上的不同生命周期”，防止旧
-    /// handle 误操作新 socket。
+    /// 协议引擎的 socket handle 可能只是槽位下标，槽位释放后会被后续
+    /// socket 复用。generation 用来区分“同一个下标上的不同生命周期”，
+    /// 防止旧 handle 误操作新 socket。
     generation: u64,
     /// 当前槽位内 socket 的协议类型。
     sock_type: SocketType,
@@ -131,7 +132,7 @@ impl SocketMeta {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NetSocketHandle {
     pub(crate) iface_id: InterfaceId,
-    pub(crate) inner: smoltcp::iface::SocketHandle,
+    pub(crate) inner: ProtocolSocketHandle,
     pub(crate) generation: u64,
     pub(crate) sock_type: SocketType,
 }
