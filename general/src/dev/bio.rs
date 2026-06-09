@@ -48,8 +48,9 @@ impl BioOp {
 
 /// Bio 的数据缓冲区。
 ///
-/// `Owned` 持有堆分配的连续缓冲区，物理地址由驱动通过 `virt_to_phys`
-/// 注入函数计算。`None` 用于 Flush / Discard / WriteZeroes 这类无数据操作。
+/// `Owned` 持有普通内核缓冲区；需要设备直接访问时，驱动应复制或映射到自己的
+/// DMA 缓冲区，再把设备可见地址写入描述符。`None` 用于 Flush / Discard /
+/// WriteZeroes 这类无数据操作。
 #[derive(Debug)]
 pub enum BioBuffer {
     Owned(Box<[u8]>),
@@ -139,6 +140,22 @@ impl From<BioIoError> for BioError {
 
 pub type BioResult = Result<Bio, BioError>;
 
+/// BIO 完成观察者。
+///
+/// 观察者只接收通用块 I/O 元数据，用于块设备通用层维护统计、inflight 等状态。
+/// 具体驱动仍然只负责执行请求并调用 [`Bio::complete`]，不需要知道 sysfs 或
+/// 兼容层如何展示这些信息。
+pub trait BioCompletionObserver: Send + Sync {
+    fn on_complete(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        block_size: NonZeroU32,
+        submitted_ns: u64,
+        result: Result<(), BioIoError>,
+    );
+}
+
 /// 块 I/O 请求。
 ///
 /// 提交后所有权进入驱动；驱动完成时调用 [`Bio::complete`] 把请求归还给
@@ -149,6 +166,8 @@ pub struct Bio {
     pub buffer: BioBuffer,
     pub block_size: NonZeroU32,
     pub fua: bool,
+    submitted_ns: u64,
+    observer: Option<Arc<dyn BioCompletionObserver>>,
     completion: Arc<Completion<BioResult>>,
 }
 
@@ -160,6 +179,18 @@ impl Bio {
         buffer: BioBuffer,
         block_size: NonZeroU32,
     ) -> (Self, Arc<Completion<BioResult>>) {
+        Self::new_with_observer(op, range, buffer, block_size, 0, None)
+    }
+
+    /// 创建带完成观察者的新 Bio。
+    pub fn new_with_observer(
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+        block_size: NonZeroU32,
+        submitted_ns: u64,
+        observer: Option<Arc<dyn BioCompletionObserver>>,
+    ) -> (Self, Arc<Completion<BioResult>>) {
         let completion = Completion::new();
         let bio = Self {
             op,
@@ -167,6 +198,8 @@ impl Bio {
             buffer,
             block_size,
             fua: false,
+            submitted_ns,
+            observer,
             completion: Arc::clone(&completion),
         };
         (bio, completion)
@@ -183,6 +216,15 @@ impl Bio {
     /// `Ok(())` 表示成功——Bio 自身（包含数据缓冲区）通过 Completion 归还。
     /// `Err(e)` 表示失败——Bio 被消费，等待者收到 `Err(e)`。
     pub fn complete(self, result: Result<(), BioIoError>) {
+        if let Some(observer) = self.observer.as_ref() {
+            observer.on_complete(
+                self.op,
+                self.range,
+                self.block_size,
+                self.submitted_ns,
+                result,
+            );
+        }
         let completion = Arc::clone(&self.completion);
         let value = match result {
             Ok(()) => Ok(self),

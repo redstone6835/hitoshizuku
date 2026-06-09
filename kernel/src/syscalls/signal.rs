@@ -145,7 +145,11 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
         if sec == 0 && nsec == 0 {
             None
         } else {
-            Some((sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64))
+            Some(
+                (sec as u64)
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(nsec as u64),
+            )
         }
     };
 
@@ -214,6 +218,9 @@ fn write_sigaction(user: usize, action: SigAction) -> Result<(), Errno> {
 }
 
 fn write_siginfo(user: usize, info: &sched::SigInfo) -> Result<(), Errno> {
+    if let Some(raw) = info.raw {
+        return copy_to_user(user, &raw).map_err(|e| e.as_errno());
+    }
     let mut raw = [0u8; 128];
     put_i32(&mut raw, 0, info.sig.raw() as i32);
     put_i32(&mut raw, 8, info.code);

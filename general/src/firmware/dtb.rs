@@ -35,36 +35,122 @@ pub struct DtbMmioRangeInfo {
     pub size: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbInterruptInfo {
+    pub parent: Option<u32>,
+    pub specifier: Box<[u32]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DtbPropertyValue {
+    Bool,
+    U32(u32),
+    U32List(Box<[u32]>),
+    StringList(Vec<&'static str>),
+    Bytes(Box<[u8]>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbDeviceProperty {
+    pub name: &'static str,
+    pub value: DtbPropertyValue,
+}
+
 #[derive(Debug)]
 pub struct DtbPlatformDeviceInfo {
     pub name: &'static str,
     pub path: &'static str,
+    pub parent_path: Option<&'static str>,
+    pub phandle: Option<u32>,
+    pub interrupt_parent: Option<u32>,
+    pub address_cells: usize,
+    pub size_cells: usize,
+    pub parent_address_cells: usize,
+    pub parent_size_cells: usize,
     pub compatible: Vec<&'static str>,
     pub reg_ranges: Vec<DtbMmioRangeInfo>,
+    pub interrupts: Vec<DtbInterruptInfo>,
+    pub interrupt_controller: bool,
     pub clock_hz: Option<u32>,
+    pub properties: Vec<DtbDeviceProperty>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DtbPcieHostInfo {
     pub name: &'static str,
     pub path: &'static str,
     pub ecam_phys: usize,
     pub ecam_size: usize,
+    pub domain: u16,
     pub bus_start: u8,
     pub bus_end: u8,
+    pub dma_coherent: bool,
+    pub address_cells: usize,
+    pub interrupt_cells: usize,
+    pub ranges: Vec<DtbPciRangeInfo>,
+    pub interrupt_map_mask: Option<Box<[u32]>>,
+    pub interrupt_map: Vec<DtbPciInterruptMapEntry>,
+    pub msi_map: Vec<DtbPciMsiMapEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbPciRangeInfo {
+    pub space: DtbPciAddressSpace,
+    pub child_addr: u64,
+    pub parent_addr: usize,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DtbPciAddressSpace {
+    Io,
+    Memory,
+    PrefetchableMemory,
+    Unknown(u32),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbPciMsiMapEntry {
+    pub requester_base: u32,
+    pub controller: u32,
+    pub msi_base: u32,
+    pub length: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbPciInterruptMapEntry {
+    pub child_address: Box<[u32]>,
+    pub child_interrupt: Box<[u32]>,
+    pub parent: u32,
+    pub parent_address: Box<[u32]>,
+    pub parent_specifier: Box<[u32]>,
 }
 
 #[derive(Debug)]
 pub struct DtbFirmwareInfo {
+    pub root_compatible: Vec<&'static str>,
     pub cpu_count: usize,
+    pub cpus: Vec<DtbCpuInfo>,
     pub memory_segments: Vec<MemorySegment>,
     pub reserved_segments: Vec<MemorySegment>,
     pub external_initramfs_range: Option<(usize, usize)>,
+    pub rng_seed: Option<Box<[u8]>>,
     pub stdout_serial: Option<SerialPortInfo>,
     pub power_controls: PowerControlInfo,
     pub serial_ports: Vec<SerialPortInfo>,
     pub platform_devices: Vec<DtbPlatformDeviceInfo>,
     pub pcie_hosts: Vec<DtbPcieHostInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DtbCpuInfo {
+    pub logical_id: u32,
+    pub reg: u64,
+    pub phandle: Option<u32>,
+    pub compatible: Vec<&'static str>,
+    pub socket_id: Option<u32>,
+    pub core_id: Option<u32>,
+    pub thread_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +199,14 @@ struct DtbPhandle {
     node_id: NodeId,
 }
 
+#[derive(Clone, Copy)]
+struct DtbCpuMapEntry {
+    cpu: u32,
+    socket_id: Option<u32>,
+    core_id: Option<u32>,
+    thread_id: Option<u32>,
+}
+
 struct DtbTree {
     nodes: Vec<DtbNodeInfo>,
     aliases: Vec<DtbAlias>,
@@ -122,10 +216,13 @@ struct DtbTree {
 pub fn parse(dtb: Dtb<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
     let tree = DtbTree::new(dtb)?;
 
+    let root_compatible = tree.root_compatible();
     let cpu_count = tree.cpu_count();
+    let cpus = tree.cpus();
     let stdout_serial = tree.stdout_serial();
     let power_controls = tree.power_controls();
     let external_initramfs_range = tree.external_initramfs_range();
+    let rng_seed = tree.rng_seed();
 
     let raw_memory_segments =
         normalize_segments(tree.memory_segments()).ok_or(DtbFirmwareError::NoUsableMemory)?;
@@ -134,10 +231,13 @@ pub fn parse(dtb: Dtb<'static>) -> Result<DtbFirmwareInfo, DtbFirmwareError> {
         .ok_or(DtbFirmwareError::NoUsableMemory)?;
 
     Ok(DtbFirmwareInfo {
+        root_compatible,
         cpu_count,
+        cpus,
         memory_segments,
         reserved_segments,
         external_initramfs_range,
+        rng_seed,
         stdout_serial,
         power_controls,
         serial_ports: tree.serial_ports(),
@@ -252,12 +352,81 @@ impl DtbTree {
         }
     }
 
+    fn root_compatible(&self) -> Vec<&'static str> {
+        compatible_strings(self.nodes[0].node)
+    }
+
     fn cpu_count(&self) -> usize {
         self.nodes
             .iter()
             .filter(|entry| entry.enabled && entry.node.base_name_bytes() == b"cpu")
             .count()
             .max(1)
+    }
+
+    fn cpus(&self) -> Vec<DtbCpuInfo> {
+        let topology = self.cpu_map_entries();
+        let mut cpus = Vec::new();
+        for node_id in 0..self.nodes.len() {
+            let entry = &self.nodes[node_id];
+            if !entry.enabled || !self.node_is_cpu(node_id) {
+                continue;
+            }
+            let phandle = self.phandle_for_node(node_id);
+            let topology = phandle
+                .and_then(|phandle| topology.iter().find(|entry| entry.cpu == phandle).copied());
+            let logical_id = u32::try_from(cpus.len()).unwrap_or(u32::MAX);
+            cpus.push(DtbCpuInfo {
+                logical_id,
+                reg: self.read_cpu_reg(node_id).unwrap_or(u64::from(logical_id)),
+                phandle,
+                compatible: compatible_strings(entry.node),
+                socket_id: topology.and_then(|entry| entry.socket_id),
+                core_id: topology.and_then(|entry| entry.core_id),
+                thread_id: topology.and_then(|entry| entry.thread_id),
+            });
+        }
+        cpus
+    }
+
+    fn cpu_map_entries(&self) -> Vec<DtbCpuMapEntry> {
+        let Some(root_id) = self
+            .nodes
+            .iter()
+            .position(|entry| entry.enabled && entry.node.base_name_bytes() == b"cpu-map")
+        else {
+            return Vec::new();
+        };
+
+        let mut entries = Vec::new();
+        let mut stack = Vec::new();
+        stack.push((root_id, None, None, None));
+        while let Some((node_id, socket_id, core_id, thread_id)) = stack.pop() {
+            let node = self.nodes[node_id].node;
+            let name = node.name().unwrap_or("");
+            let socket_id = indexed_name_suffix(name, "socket").or(socket_id);
+            let core_id = indexed_name_suffix(name, "core").or(core_id);
+            let thread_id = indexed_name_suffix(name, "thread").or(thread_id);
+
+            if let Some(cpu) = node
+                .find_property("cpu")
+                .and_then(|prop| read_be_u32_prop(prop.value()))
+            {
+                entries.push(DtbCpuMapEntry {
+                    cpu,
+                    socket_id,
+                    core_id,
+                    thread_id,
+                });
+            }
+
+            for child in self.nodes[node_id].children.iter().rev() {
+                if self.nodes[*child].enabled {
+                    stack.push((*child, socket_id, core_id, thread_id));
+                }
+            }
+        }
+        entries
     }
 
     fn stdout_serial(&self) -> Option<SerialPortInfo> {
@@ -275,7 +444,9 @@ impl DtbTree {
         Some(SerialPortInfo {
             name: self.node_name_or_path(node_id),
             phys_addr: range.start,
+            reg_size: Some(range.size),
             clock_hz: read_clock_hz(entry.node),
+            baud: read_current_speed(entry.node),
         })
     }
 
@@ -333,6 +504,15 @@ impl DtbTree {
         let start = read_usize_scalar(chosen.node.find_property("linux,initrd-start")?.value())?;
         let end = read_usize_scalar(chosen.node.find_property("linux,initrd-end")?.value())?;
         (end > start).then_some((start, end))
+    }
+
+    fn rng_seed(&self) -> Option<Box<[u8]>> {
+        let chosen = self
+            .nodes
+            .iter()
+            .find(|entry| entry.node.base_name_bytes() == b"chosen")?;
+        let seed = chosen.node.find_property("rng-seed")?.value();
+        (!seed.is_empty()).then(|| seed.to_vec().into_boxed_slice())
     }
 
     fn memory_segments(&self) -> Vec<MemorySegment> {
@@ -407,7 +587,9 @@ impl DtbTree {
             ports.push(SerialPortInfo {
                 name: self.node_name_or_path(node_id),
                 phys_addr: range.start,
+                reg_size: Some(range.size),
                 clock_hz: read_clock_hz(self.nodes[node_id].node),
+                baud: read_current_speed(self.nodes[node_id].node),
             });
         }
         ports
@@ -417,15 +599,23 @@ impl DtbTree {
         let mut devices = Vec::new();
         for node_id in 0..self.nodes.len() {
             let entry = &self.nodes[node_id];
-            if !entry.enabled || node_id == 0 || self.node_is_pcie_host(node_id) {
+            if !entry.enabled || node_id == 0 {
                 continue;
             }
             let compatible = compatible_strings(entry.node);
             if compatible.is_empty() {
                 continue;
             };
-            let Ok(ranges) = self.reg_ranges(node_id) else {
-                continue;
+            let interrupt_controller = self.node_is_interrupt_controller(node_id);
+            let ranges = match self.reg_ranges(node_id) {
+                Ok(ranges) => ranges,
+                // 有 compatible 的无寄存器节点仍是固件描述的一部分，例如
+                // simple-bus、syscon-poweroff/reboot 这类功能节点。它们不提供
+                // MMIO resource，但应进入 platform PnP，让总线/电源/诊断接口
+                // 能看到完整固件拓扑。
+                Err(DtbAddressError::MissingReg) => Vec::new(),
+                Err(DtbAddressError::InvalidReg) if interrupt_controller => Vec::new(),
+                Err(_) => continue,
             };
             let reg_ranges = ranges
                 .into_iter()
@@ -437,9 +627,19 @@ impl DtbTree {
             devices.push(DtbPlatformDeviceInfo {
                 name: self.node_name_or_path(node_id),
                 path: entry.path,
+                parent_path: entry.parent.map(|parent| self.nodes[parent].path),
+                phandle: self.phandle_for_node(node_id),
+                interrupt_parent: self.interrupt_parent_phandle(node_id),
+                address_cells: entry.child_addr_cells,
+                size_cells: entry.child_size_cells,
+                parent_address_cells: entry.reg_addr_cells,
+                parent_size_cells: entry.reg_size_cells,
                 compatible,
                 reg_ranges,
+                interrupts: self.interrupts(node_id),
+                interrupt_controller,
                 clock_hz: read_clock_hz(entry.node),
+                properties: scalar_properties(entry.node),
             });
         }
         devices
@@ -456,20 +656,353 @@ impl DtbTree {
                 continue;
             };
             let (bus_start, bus_end) = read_bus_range(entry.node).unwrap_or((0, 0xff));
+            let domain = read_pci_domain(entry.node).unwrap_or(0);
+            let address_cells = entry.child_addr_cells;
+            let interrupt_cells = read_cells_count(entry.node, "#interrupt-cells").unwrap_or(1);
+            let ranges = self.pci_ranges(node_id);
+            let interrupt_map_mask =
+                self.pci_interrupt_map_mask(node_id, address_cells, interrupt_cells);
+            let interrupt_map = self.pci_interrupt_map(node_id, address_cells, interrupt_cells);
+            let msi_map = self.pci_msi_map(node_id);
             hosts.push(DtbPcieHostInfo {
                 name: self.node_name_or_path(node_id),
                 path: entry.path,
                 ecam_phys: range.start,
                 ecam_size: range.size,
+                domain,
                 bus_start,
                 bus_end,
+                dma_coherent: entry.node.find_property("dma-coherent").is_some(),
+                address_cells,
+                interrupt_cells,
+                ranges,
+                interrupt_map_mask,
+                interrupt_map,
+                msi_map,
             });
         }
         hosts
     }
 
+    fn pci_ranges(&self, node_id: NodeId) -> Vec<DtbPciRangeInfo> {
+        let entry = &self.nodes[node_id];
+        let Some(value) = entry.node.find_property("ranges").map(|prop| prop.value()) else {
+            return Vec::new();
+        };
+        let range_cells = entry
+            .child_addr_cells
+            .checked_add(entry.reg_addr_cells)
+            .and_then(|cells| cells.checked_add(entry.reg_size_cells));
+        let Some(range_cells) = range_cells else {
+            return Vec::new();
+        };
+        let Some(range_bytes) = range_cells.checked_mul(4) else {
+            return Vec::new();
+        };
+        if entry.child_addr_cells < 3
+            || entry.reg_addr_cells == 0
+            || entry.reg_size_cells == 0
+            || range_bytes == 0
+            || !value.len().is_multiple_of(range_bytes)
+        {
+            return Vec::new();
+        }
+
+        let mut ranges = Vec::new();
+        for chunk in value.chunks_exact(range_bytes) {
+            let child_bytes = entry.child_addr_cells * 4;
+            let parent_bytes = entry.reg_addr_cells * 4;
+            let parent_start = child_bytes;
+            let size_start = child_bytes + parent_bytes;
+            let Some(child_cells) =
+                read_fixed_u32_cells(&chunk[..child_bytes], entry.child_addr_cells)
+            else {
+                continue;
+            };
+            let Some(space) = pci_address_space(child_cells[0]) else {
+                continue;
+            };
+            let Some(child_addr) = pci_child_range_address(&child_cells) else {
+                continue;
+            };
+            let Ok(parent_raw) =
+                read_cells_u128(&chunk[parent_start..size_start], entry.reg_addr_cells)
+            else {
+                continue;
+            };
+            let Ok(size_raw) = read_cells_u128(&chunk[size_start..], entry.reg_size_cells) else {
+                continue;
+            };
+            let Ok(parent_addr) = u128_to_usize(parent_raw) else {
+                continue;
+            };
+            let Ok(size) = u128_to_usize(size_raw) else {
+                continue;
+            };
+            if size == 0 || parent_addr.checked_add(size).is_none() {
+                continue;
+            }
+            ranges.push(DtbPciRangeInfo {
+                space,
+                child_addr,
+                parent_addr,
+                size,
+            });
+        }
+        ranges
+    }
+
+    fn pci_msi_map(&self, node_id: NodeId) -> Vec<DtbPciMsiMapEntry> {
+        let Some(value) = self.nodes[node_id]
+            .node
+            .find_property("msi-map")
+            .map(|prop| prop.value())
+        else {
+            return Vec::new();
+        };
+        let Some(cells) = read_u32_cells(value) else {
+            return Vec::new();
+        };
+        if !cells.len().is_multiple_of(4) {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        for chunk in cells.chunks_exact(4) {
+            let [requester_base, controller, msi_base, length] = chunk else {
+                continue;
+            };
+            if *length == 0 || self.lookup_phandle(*controller).is_none() {
+                continue;
+            }
+            entries.push(DtbPciMsiMapEntry {
+                requester_base: *requester_base,
+                controller: *controller,
+                msi_base: *msi_base,
+                length: *length,
+            });
+        }
+        entries
+    }
+
+    fn pci_interrupt_map_mask(
+        &self,
+        node_id: NodeId,
+        address_cells: usize,
+        interrupt_cells: usize,
+    ) -> Option<Box<[u32]>> {
+        let expected = address_cells.checked_add(interrupt_cells)?;
+        let value = self.nodes[node_id]
+            .node
+            .find_property("interrupt-map-mask")?
+            .value();
+        let cells = read_u32_cells(value)?;
+        (cells.len() == expected).then_some(cells)
+    }
+
+    fn pci_interrupt_map(
+        &self,
+        node_id: NodeId,
+        address_cells: usize,
+        interrupt_cells: usize,
+    ) -> Vec<DtbPciInterruptMapEntry> {
+        let Some(value) = self.nodes[node_id]
+            .node
+            .find_property("interrupt-map")
+            .map(|prop| prop.value())
+        else {
+            return Vec::new();
+        };
+        let Some(child_address_bytes) = address_cells.checked_mul(4) else {
+            return Vec::new();
+        };
+        let Some(child_interrupt_bytes) = interrupt_cells.checked_mul(4) else {
+            return Vec::new();
+        };
+        if address_cells == 0 || interrupt_cells == 0 {
+            return Vec::new();
+        }
+
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        while offset < value.len() {
+            let Some(child_address_raw) =
+                value.get(offset..offset.saturating_add(child_address_bytes))
+            else {
+                break;
+            };
+            let Some(child_address) = read_fixed_u32_cells(child_address_raw, address_cells) else {
+                break;
+            };
+            offset += child_address_bytes;
+
+            let Some(child_interrupt_raw) =
+                value.get(offset..offset.saturating_add(child_interrupt_bytes))
+            else {
+                break;
+            };
+            let Some(child_interrupt) = read_fixed_u32_cells(child_interrupt_raw, interrupt_cells)
+            else {
+                break;
+            };
+            offset += child_interrupt_bytes;
+
+            let Some(parent) = value
+                .get(offset..offset.saturating_add(4))
+                .and_then(read_be_u32_prop)
+            else {
+                break;
+            };
+            offset += 4;
+
+            let Some(parent_id) = self.lookup_phandle(parent) else {
+                break;
+            };
+            let parent_node = self.nodes[parent_id].node;
+            let parent_address_cells = read_cells_count(parent_node, "#address-cells").unwrap_or(0);
+            let parent_interrupt_cells =
+                read_cells_count(parent_node, "#interrupt-cells").unwrap_or(1);
+            let Some(parent_address_bytes) = parent_address_cells.checked_mul(4) else {
+                break;
+            };
+            let Some(parent_interrupt_bytes) = parent_interrupt_cells.checked_mul(4) else {
+                break;
+            };
+
+            let Some(parent_address_raw) =
+                value.get(offset..offset.saturating_add(parent_address_bytes))
+            else {
+                break;
+            };
+            let Some(parent_address) =
+                read_fixed_u32_cells(parent_address_raw, parent_address_cells)
+            else {
+                break;
+            };
+            offset += parent_address_bytes;
+
+            let Some(parent_specifier_raw) =
+                value.get(offset..offset.saturating_add(parent_interrupt_bytes))
+            else {
+                break;
+            };
+            let Some(parent_specifier) =
+                read_fixed_u32_cells(parent_specifier_raw, parent_interrupt_cells)
+            else {
+                break;
+            };
+            offset += parent_interrupt_bytes;
+
+            entries.push(DtbPciInterruptMapEntry {
+                child_address,
+                child_interrupt,
+                parent,
+                parent_address,
+                parent_specifier,
+            });
+        }
+        entries
+    }
+
     fn first_reg_range(&self, node_id: NodeId) -> Option<AddressRange> {
         self.reg_ranges(node_id).ok()?.into_iter().next()
+    }
+
+    fn interrupts(&self, node_id: NodeId) -> Vec<DtbInterruptInfo> {
+        let extended = self.interrupts_extended(node_id);
+        if !extended.is_empty() {
+            return extended;
+        }
+        self.interrupts_inherited(node_id)
+    }
+
+    fn interrupts_extended(&self, node_id: NodeId) -> Vec<DtbInterruptInfo> {
+        let Some(value) = self.nodes[node_id]
+            .node
+            .find_property("interrupts-extended")
+            .map(|prop| prop.value())
+        else {
+            return Vec::new();
+        };
+
+        let mut interrupts = Vec::new();
+        let mut offset = 0usize;
+        while offset < value.len() {
+            let Some(parent) = value
+                .get(offset..offset.saturating_add(4))
+                .and_then(read_be_u32_prop)
+            else {
+                break;
+            };
+            offset += 4;
+            let Some(parent_id) = self.lookup_phandle(parent) else {
+                break;
+            };
+            let cell_count =
+                read_cells_count(self.nodes[parent_id].node, "#interrupt-cells").unwrap_or(1);
+            let Some(byte_count) = cell_count.checked_mul(4) else {
+                break;
+            };
+            if byte_count == 0 {
+                break;
+            }
+            let Some(specifier_bytes) = value.get(offset..offset.saturating_add(byte_count)) else {
+                break;
+            };
+            let Some(specifier) = read_u32_cells(specifier_bytes) else {
+                break;
+            };
+            interrupts.push(DtbInterruptInfo {
+                parent: Some(parent),
+                specifier,
+            });
+            offset += byte_count;
+        }
+        interrupts
+    }
+
+    fn interrupts_inherited(&self, node_id: NodeId) -> Vec<DtbInterruptInfo> {
+        let Some(value) = self.nodes[node_id]
+            .node
+            .find_property("interrupts")
+            .map(|prop| prop.value())
+        else {
+            return Vec::new();
+        };
+        let parent = self.interrupt_parent_phandle(node_id);
+        let cell_count = parent
+            .and_then(|phandle| self.lookup_phandle(phandle))
+            .and_then(|parent_id| read_cells_count(self.nodes[parent_id].node, "#interrupt-cells"))
+            .unwrap_or(1);
+        let Some(byte_count) = cell_count.checked_mul(4) else {
+            return Vec::new();
+        };
+        if byte_count == 0 || !value.len().is_multiple_of(byte_count) {
+            return Vec::new();
+        }
+
+        let mut interrupts = Vec::new();
+        for chunk in value.chunks_exact(byte_count) {
+            let Some(specifier) = read_u32_cells(chunk) else {
+                continue;
+            };
+            interrupts.push(DtbInterruptInfo { parent, specifier });
+        }
+        interrupts
+    }
+
+    fn interrupt_parent_phandle(&self, node_id: NodeId) -> Option<u32> {
+        let mut current = Some(node_id);
+        while let Some(id) = current {
+            if let Some(value) = self.nodes[id]
+                .node
+                .find_property("interrupt-parent")
+                .and_then(|prop| read_be_u32_prop(prop.value()))
+            {
+                return Some(value);
+            }
+            current = self.nodes[id].parent;
+        }
+        None
     }
 
     fn reg_ranges(&self, node_id: NodeId) -> Result<Vec<AddressRange>, DtbAddressError> {
@@ -615,6 +1148,11 @@ impl DtbTree {
             || property_first_string_eq(node, "device_type", "memory")
     }
 
+    fn node_is_cpu(&self, node_id: NodeId) -> bool {
+        let node = self.nodes[node_id].node;
+        node.base_name_bytes() == b"cpu" || property_first_string_eq(node, "device_type", "cpu")
+    }
+
     fn node_is_serial(&self, node_id: NodeId) -> bool {
         let node = self.nodes[node_id].node;
         node.base_name_bytes() == b"serial"
@@ -625,6 +1163,13 @@ impl DtbTree {
     fn node_is_pcie_host(&self, node_id: NodeId) -> bool {
         let node = self.nodes[node_id].node;
         compatible_contains(node, COMPAT_PCI_ECAM) || compatible_contains(node, COMPAT_PCIE_ECAM)
+    }
+
+    fn node_is_interrupt_controller(&self, node_id: NodeId) -> bool {
+        self.nodes[node_id]
+            .node
+            .find_property("interrupt-controller")
+            .is_some()
     }
 
     fn node_name_or_path(&self, node_id: NodeId) -> &'static str {
@@ -660,6 +1205,24 @@ impl DtbTree {
             .iter()
             .find(|entry| entry.value == value)
             .map(|entry| entry.node_id)
+    }
+
+    fn phandle_for_node(&self, node_id: NodeId) -> Option<u32> {
+        self.phandles
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .map(|entry| entry.value)
+    }
+
+    fn read_cpu_reg(&self, node_id: NodeId) -> Option<u64> {
+        let entry = &self.nodes[node_id];
+        let value = entry.node.find_property("reg")?.value();
+        let byte_count = entry.reg_addr_cells.checked_mul(4)?;
+        if entry.reg_addr_cells == 0 || value.len() < byte_count {
+            return None;
+        }
+        let raw = read_cells_u128(&value[..byte_count], entry.reg_addr_cells).ok()?;
+        u64::try_from(raw).ok()
     }
 }
 
@@ -762,6 +1325,100 @@ fn read_clock_hz(node: DtbNode<'static>) -> Option<u32> {
     read_be_u32_prop(node.find_property("clock-frequency")?.value())
 }
 
+fn read_current_speed(node: DtbNode<'static>) -> Option<u32> {
+    read_be_u32_prop(node.find_property("current-speed")?.value())
+}
+
+fn scalar_properties(node: DtbNode<'static>) -> Vec<DtbDeviceProperty> {
+    let mut properties = Vec::new();
+    for property in node.properties() {
+        let Some(name) = property.name() else {
+            continue;
+        };
+        let value = property.value();
+        let value = if value.is_empty() {
+            DtbPropertyValue::Bool
+        } else if string_property_name(name) {
+            let values = string_list(value);
+            if values.is_empty() {
+                DtbPropertyValue::Bytes(value.to_vec().into_boxed_slice())
+            } else {
+                DtbPropertyValue::StringList(values)
+            }
+        } else if value.len() == 4 {
+            let Some(value) = read_be_u32_prop(value) else {
+                continue;
+            };
+            DtbPropertyValue::U32(value)
+        } else if value.len().is_multiple_of(4) {
+            let Some(values) = read_u32_cells(value) else {
+                continue;
+            };
+            DtbPropertyValue::U32List(values)
+        } else {
+            DtbPropertyValue::Bytes(value.to_vec().into_boxed_slice())
+        };
+        properties.push(DtbDeviceProperty { name, value });
+    }
+    properties
+}
+
+fn string_property_name(name: &str) -> bool {
+    matches!(
+        name,
+        "compatible" | "device_type" | "model" | "reg-names" | "status"
+    )
+}
+
+fn read_pci_domain(node: DtbNode<'static>) -> Option<u16> {
+    let value = read_be_u32_prop(node.find_property("linux,pci-domain")?.value())?;
+    u16::try_from(value).ok()
+}
+
+fn pci_address_space(phys_hi: u32) -> Option<DtbPciAddressSpace> {
+    const PCI_RANGE_SPACE_MASK: u32 = 0x0300_0000;
+    const PCI_RANGE_IO: u32 = 0x0100_0000;
+    const PCI_RANGE_MEM32: u32 = 0x0200_0000;
+    const PCI_RANGE_MEM64: u32 = 0x0300_0000;
+    const PCI_RANGE_PREFETCHABLE: u32 = 0x4000_0000;
+
+    match phys_hi & PCI_RANGE_SPACE_MASK {
+        PCI_RANGE_IO => Some(DtbPciAddressSpace::Io),
+        PCI_RANGE_MEM32 | PCI_RANGE_MEM64 => {
+            if phys_hi & PCI_RANGE_PREFETCHABLE != 0 {
+                Some(DtbPciAddressSpace::PrefetchableMemory)
+            } else {
+                Some(DtbPciAddressSpace::Memory)
+            }
+        }
+        0 => None,
+        other => Some(DtbPciAddressSpace::Unknown(other)),
+    }
+}
+
+fn pci_child_range_address(cells: &[u32]) -> Option<u64> {
+    if cells.len() < 3 {
+        return None;
+    }
+    Some(((cells[1] as u64) << 32) | cells[2] as u64)
+}
+
+fn string_list(value: &'static [u8]) -> Vec<&'static str> {
+    value
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| str::from_utf8(entry).ok())
+        .collect()
+}
+
+fn indexed_name_suffix(name: &str, prefix: &str) -> Option<u32> {
+    let suffix = name.strip_prefix(prefix)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
 fn read_bus_range(node: DtbNode<'static>) -> Option<(u8, u8)> {
     let value = node.find_property("bus-range")?.value();
     let start = read_be_u32_prop(value.get(..4)?)?;
@@ -781,6 +1438,28 @@ fn read_cells_count(node: DtbNode<'static>, name: &str) -> Option<usize> {
 
 fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
+}
+
+fn read_u32_cells(value: &[u8]) -> Option<Box<[u32]>> {
+    if value.is_empty() || !value.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut cells = Vec::new();
+    for chunk in value.chunks_exact(4) {
+        cells.push(read_be_u32_prop(chunk)?);
+    }
+    Some(cells.into_boxed_slice())
+}
+
+fn read_fixed_u32_cells(value: &[u8], cells: usize) -> Option<Box<[u32]>> {
+    let expected = cells.checked_mul(4)?;
+    if value.len() != expected {
+        return None;
+    }
+    if cells == 0 {
+        return Some(Vec::new().into_boxed_slice());
+    }
+    read_u32_cells(value)
 }
 
 fn read_usize_scalar(value: &[u8]) -> Option<usize> {

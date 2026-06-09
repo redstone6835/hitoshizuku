@@ -51,11 +51,11 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
-use sched::arch_hooks::{ArchContextOps, ArchTimeOps, ArchTrapOps, KernelEntry};
+use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
 
 use super::specific::kernel_timestamp_ns;
 use super::task::LoongArch64TaskOps;
-use super::trap::LoongArch64MessageInterruptOps;
+use super::trap::{LoongArch64InterruptOps, LoongArch64MessageInterruptOps};
 
 pub(crate) const KCTX_SIZE: usize = 128;
 pub(crate) const KCTX_ALIGN: usize = 16;
@@ -205,6 +205,21 @@ static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
 };
 
+static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
+    idle_relax: loongarch64_idle_relax,
+};
+
+fn loongarch64_idle_relax() {
+    unsafe {
+        // idle 任务运行在内核态，普通 trap/系统调用返回路径不会替它恢复
+        // PRMD.PIE。进入 idle 等待窗口前必须临时打开 CRMD.IE，否则 timer
+        // interrupt 不能唤醒 timed sleepers，阻塞 read/select 会永久睡眠。
+        LoongArch64InterruptOps::enable_interrupts();
+        core::arch::asm!("idle 0", options(nomem, nostack, preserves_flags));
+        LoongArch64InterruptOps::disable_interrupts();
+    }
+}
+
 /// 把 [`LoongArch64TaskOps::set_kernel_trap_stack`] 拉成裸 `unsafe fn` 指针，
 /// 对接 [`ArchTrapOps`] 的契约。
 ///
@@ -228,6 +243,7 @@ pub fn register() {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
+        sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
         // UserPgdOps / UserAccessOps / FaultDecodeOps
         super::mm::register();
         // SyscallFrameOps

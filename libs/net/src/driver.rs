@@ -1,7 +1,7 @@
 //! 网络设备驱动 trait 与底层缓冲区抽象。
 //!
-//! 这是 `libs/net` 与具体硬件驱动之间的契约。设计原则对齐 Linux
-//! `struct net_device_ops` 与 FreeBSD `ifnet`：
+//! 这是 `libs/net` 与具体硬件驱动之间的契约。接口只表达本协议栈需要的
+//! 设备能力，不暴露任何用户态 ABI 或具体驱动模型：
 //!
 //! - 驱动只暴露**收发硬件帧**的操作，不感知 IP/TCP/UDP 协议。
 //! - 接收端是被动的（协议栈主动 `poll_rx`），发送端是主动的
@@ -43,6 +43,15 @@ pub enum LinkState {
     },
 }
 
+/// 设备向协议栈暴露的二层介质类型。
+///
+/// 普通网卡使用 Ethernet，loopback 这类没有二层头和 ARP 的虚拟接口使用 Ip。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkMedium {
+    Ethernet,
+    Ip,
+}
+
 // ── 缓冲区抽象 ───────────────────────────────────────────────────────────────
 
 /// 接收缓冲区。
@@ -76,7 +85,10 @@ impl RxBuf {
         );
         // 防御性截断：保护协议栈不被异常大帧攻击
         let safe_len = len.min(MAX_FRAME_LEN);
-        Self { data, len: safe_len }
+        Self {
+            data,
+            len: safe_len,
+        }
     }
 
     /// 帧数据切片（只读）。
@@ -205,9 +217,8 @@ pub struct NetStats {
 
 /// 网络设备驱动接口。
 ///
-/// 类似 Linux `struct net_device_ops`：硬件细节封装在驱动内部，
-/// 上层（本 crate 的 [`adapter`](crate::adapter)）只通过这个 trait
-/// 与硬件交互。
+/// 硬件细节封装在驱动内部，上层（本 crate 的 [`adapter`](crate::adapter)）
+/// 只通过这个 trait 与硬件交互。
 ///
 /// **线程模型**：所有方法可在任意 CPU 上并发调用——驱动内部需要自己
 /// 用 `Mutex` / 原子操作保护硬件队列和共享状态。
@@ -216,6 +227,11 @@ pub struct NetStats {
 /// 资源不可用时返回 `None`。硬件级故障（DMA 错误、寄存器异常）应当
 /// 在驱动内部记录并通过 [`link_state`](Self::link_state) 切换为 `Down`。
 pub trait NetDriver: Send + Sync {
+    /// 当前驱动承载的链路介质。默认是普通以太网设备。
+    fn medium(&self) -> LinkMedium {
+        LinkMedium::Ethernet
+    }
+
     /// 尝试从接收队列取出一帧。
     ///
     /// 返回 `Some(buf)` 表示成功取出一帧，协议栈应当解析并消费。
@@ -226,7 +242,7 @@ pub trait NetDriver: Send + Sync {
 
     /// 批量从接收队列取出多帧。
     ///
-    /// NAPI 风格批量收包，减少高强度 I/O 下的函数调用开销和锁争用。
+    /// 批量收包，减少高强度 I/O 下的函数调用开销和锁争用。
     /// 默认实现循环调 `poll_rx`——驱动可覆盖为单次锁定下批量取多帧的
     /// 优化版本。
     ///
@@ -298,7 +314,7 @@ pub trait NetDriver: Send + Sync {
         NetStats::default()
     }
 
-    /// 禁用接收中断（NAPI 风格：进入 poll 模式时调用）。
+    /// 禁用接收中断（进入主动 poll 模式时调用）。
     ///
     /// 高强度 I/O 场景下，协议栈在 poll 循环内禁用中断，批量处理
     /// RX 队列直到空，然后重新启用。避免每帧一次中断的开销。

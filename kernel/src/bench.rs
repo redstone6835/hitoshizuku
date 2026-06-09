@@ -15,36 +15,59 @@
 //!   L7  – 顺序写文件（新建文件，无缓存）
 //!   L8  – 元数据操作（readdir、创建/删除文件）
 
+#[cfg(feature = "bench")]
 use alloc::boxed::Box;
+#[cfg(feature = "bench")]
 use alloc::sync::Arc;
+#[cfg(feature = "bench")]
 use alloc::vec;
+#[cfg(feature = "bench")]
 use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+#[cfg(feature = "bench")]
 use core::any::Any;
+#[cfg(feature = "bench")]
 use core::num::NonZeroU32;
+#[cfg(feature = "bench")]
 use core::ops::ControlFlow;
 
+use allocator::{
+    KERNEL_ALLOCATOR, MAX_SMALL_SIZE, MemoryDomain, MemoryRequest, PAGE_SIZE, PhysicalAllocRequest,
+    ReclaimPolicy, Zeroing,
+};
+#[cfg(feature = "bench")]
 use vfs::cred::Credentials;
+#[cfg(feature = "bench")]
 use vfs::file::{DirEntry, OpenOptions};
+#[cfg(feature = "bench")]
 use vfs::superblock::{FsDriver, Superblock};
+#[cfg(feature = "bench")]
 use vfs::sync::Spinlock;
 
+#[cfg(feature = "bench")]
 use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
+#[cfg(feature = "bench")]
 use general::dev::block::{
-    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
-    BlockGeometry, BlockLimits,
+    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry,
+    BlockLimits,
 };
+#[cfg(feature = "bench")]
 use general::dev::block_sync::SyncBlockBackend;
 
 // ── 嵌入的磁盘镜像 ──────────────────────────────────────────────────────
 
+#[cfg(feature = "bench")]
 static FAT_IMG: &[u8] = include_bytes!("../../build/fat32.img");
+#[cfg(feature = "bench")]
 static EXT_IMG: &[u8] = include_bytes!("../../build/ext4.img");
 
 // ── 测试入口 ────────────────────────────────────────────────────────────
 
+#[cfg(feature = "bench")]
 pub fn run() {
     log::info!("[bench] ================= LAYERED PERF TEST =================");
 
+    run_allocator_bench();
     run_memcpy_baseline();
     run_memcpy_cold();
     run_software_overhead_only();
@@ -97,10 +120,400 @@ pub fn run() {
     log::info!("[bench] ================= TEST COMPLETE ====================");
 }
 
+pub fn run_allocator_only() {
+    log::info!("[bench] ================= ALLOCATOR PERF TEST =================");
+    run_allocator_bench();
+    log::info!("[bench] ================= TEST COMPLETE ======================");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // 基础辅助
 // ═══════════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════════
+// Allocator: 分配器路径基准
+// ═══════════════════════════════════════════════════════════════════════
+
+// TODO(alloc-stabilization): 当前只完成 allocator-bench 框架和开销来源日志。
+// 恢复实现时需要在 loongarch64/QEMU 下采集真实结果，并把优化前后 ns/op 对比固化到
+// 提交说明或独立报告中，避免只凭 host check 推断内核态性能。
+const ALLOC_BENCH_BATCH: usize = 128;
+
+fn run_allocator_bench() {
+    log::info!("[bench][alloc] ---------------- allocator cost model ----------------");
+    log::info!(
+        "[bench][alloc] small_limit={} page_size={} batch={}",
+        MAX_SMALL_SIZE,
+        PAGE_SIZE,
+        ALLOC_BENCH_BATCH
+    );
+
+    let slab8 = run_allocator_alloc_free_case("slab-8", 8, 8, 256, Zeroing::Uninitialized);
+    let slab64 = run_allocator_alloc_free_case("slab-64", 64, 8, 256, Zeroing::Uninitialized);
+    let slab80_align64 =
+        run_allocator_alloc_free_case("slab-80-align64", 80, 64, 192, Zeroing::Uninitialized);
+    let slab1024 = run_allocator_alloc_free_case("slab-1024", 1024, 8, 128, Zeroing::Uninitialized);
+    let zero1024 = run_allocator_alloc_free_case("slab-1024-zeroed", 1024, 8, 128, Zeroing::Zeroed);
+    if zero1024 >= slab1024 {
+        log::info!(
+            "[bench][alloc][cost] zeroing adds about {} ns/op at 1024B; source=memset on hot slab object",
+            zero1024 - slab1024
+        );
+    }
+
+    let large4k =
+        run_allocator_alloc_free_case("kheap-4k", 4096, PAGE_SIZE, 64, Zeroing::Uninitialized);
+    let large8k =
+        run_allocator_alloc_free_case("kheap-8k", 8192, PAGE_SIZE, 48, Zeroing::Uninitialized);
+    let large64k = run_allocator_alloc_free_case(
+        "kheap-64k",
+        64 * 1024,
+        PAGE_SIZE,
+        16,
+        Zeroing::Uninitialized,
+    );
+
+    run_allocator_registry_lookup();
+    run_allocator_in_place_query();
+    run_allocator_realloc_same_class();
+    run_allocator_realloc_grow();
+    run_allocator_diagnostic();
+    run_allocator_physical();
+
+    log::info!(
+        "[bench][alloc][cost] slab hot path ~= request routing + per-cpu cache + registry insert/remove: 8B={}ns 64B={}ns 80B/64align={}ns 1024B={}ns",
+        slab8,
+        slab64,
+        slab80_align64,
+        slab1024
+    );
+    log::info!(
+        "[bench][alloc][cost] kheap path ~= vmem reserve/tag split + buddy page + map/unmap + registry: 4K={}ns 8K={}ns 64K={}ns",
+        large4k,
+        large8k,
+        large64k
+    );
+}
+
+fn allocator_request(size: usize, align: usize, zeroing: Zeroing) -> MemoryRequest {
+    MemoryRequest::new(MemoryDomain::Kernel, size, align)
+        .with_zeroing(zeroing)
+        .with_reclaim(ReclaimPolicy::NoReclaim)
+}
+
+fn run_allocator_alloc_free_case(
+    tag: &str,
+    size: usize,
+    align: usize,
+    iters: usize,
+    zeroing: Zeroing,
+) -> u64 {
+    let mut records = [None; ALLOC_BENCH_BATCH];
+    let request = allocator_request(size, align, zeroing);
+    let mut completed = 0usize;
+    let t0 = hal::time::monotonic_ns();
+
+    for _ in 0..iters {
+        let mut allocated = 0usize;
+        for slot in &mut records {
+            match KERNEL_ALLOCATOR.allocate(request) {
+                Ok(record) => {
+                    core::hint::black_box(record.ptr);
+                    *slot = Some(record);
+                    allocated += 1;
+                }
+                Err(err) => {
+                    log::error!(
+                        "[bench][alloc][{}] allocate failed after {} objects: {:?}",
+                        tag,
+                        completed,
+                        err
+                    );
+                    break;
+                }
+            }
+        }
+        for slot in records.iter_mut().take(allocated).rev() {
+            if let Some(record) = slot.take() {
+                if let Err(err) = KERNEL_ALLOCATOR.deallocate(record.ptr) {
+                    log::error!(
+                        "[bench][alloc][{}] deallocate failed ptr={:#x}: {:?}",
+                        tag,
+                        record.ptr,
+                        err
+                    );
+                    return 0;
+                }
+                completed += 1;
+            }
+        }
+        if allocated != ALLOC_BENCH_BATCH {
+            break;
+        }
+    }
+
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let avg = dt / completed.max(1) as u64;
+    log::info!(
+        "[bench][alloc][{}] {} x alloc+free size={} align={} zero={:?}: total {} ns (avg {} ns/op)",
+        tag,
+        completed,
+        size,
+        align,
+        zeroing,
+        dt,
+        avg
+    );
+    avg
+}
+
+fn run_allocator_registry_lookup() {
+    let request = allocator_request(64, 8, Zeroing::Uninitialized);
+    let record = match KERNEL_ALLOCATOR.allocate(request) {
+        Ok(record) => record,
+        Err(err) => {
+            log::error!("[bench][alloc][registry] setup alloc failed: {:?}", err);
+            return;
+        }
+    };
+
+    let iters = 16 * 1024usize;
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        let found = KERNEL_ALLOCATOR.query_tracked_allocation(record.ptr).ok();
+        core::hint::black_box(found);
+    }
+    let hit_dt = hal::time::monotonic_ns().saturating_sub(t0);
+
+    let miss_ptr = usize::MAX - PAGE_SIZE + 1;
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        let found = KERNEL_ALLOCATOR.query_tracked_allocation(miss_ptr).ok();
+        core::hint::black_box(found);
+    }
+    let miss_dt = hal::time::monotonic_ns().saturating_sub(t0);
+
+    let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+    log::info!(
+        "[bench][alloc][registry] lookup hit avg {} ns/op, miss avg {} ns/op; source=bucket lock + chain scan",
+        hit_dt / iters as u64,
+        miss_dt / iters as u64
+    );
+}
+
+fn run_allocator_in_place_query() {
+    let request = allocator_request(64, 8, Zeroing::Uninitialized);
+    let record = match KERNEL_ALLOCATOR.allocate(request) {
+        Ok(record) => record,
+        Err(err) => {
+            log::error!(
+                "[bench][alloc][in-place-query] setup alloc failed: {:?}",
+                err
+            );
+            return;
+        }
+    };
+
+    let same_class =
+        MemoryRequest::new(MemoryDomain::Kernel, 63, 8).with_reclaim(ReclaimPolicy::NoReclaim);
+    let moving =
+        MemoryRequest::new(MemoryDomain::Kernel, 4096, 8).with_reclaim(ReclaimPolicy::NoReclaim);
+    let iters = 16 * 1024usize;
+
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        let can = KERNEL_ALLOCATOR
+            .can_reallocate_in_place(record.ptr, same_class)
+            .ok();
+        core::hint::black_box(can);
+    }
+    let same_dt = hal::time::monotonic_ns().saturating_sub(t0);
+
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        let can = KERNEL_ALLOCATOR
+            .can_reallocate_in_place(record.ptr, moving)
+            .ok();
+        core::hint::black_box(can);
+    }
+    let moving_dt = hal::time::monotonic_ns().saturating_sub(t0);
+
+    let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+    log::info!(
+        "[bench][alloc][in-place-query] same-class avg {} ns/op, moving-needed avg {} ns/op; source=registry lookup + slab class/kheap order predicate",
+        same_dt / iters as u64,
+        moving_dt / iters as u64
+    );
+}
+
+fn run_allocator_realloc_same_class() {
+    let old_layout = Layout::from_size_align(64, 8).expect("valid realloc old layout");
+    let new_layout = Layout::from_size_align(63, 8).expect("valid realloc new layout");
+    let mut ptrs = [core::ptr::null_mut(); ALLOC_BENCH_BATCH];
+    let mut completed = 0usize;
+    let iters = 256usize;
+    let mut total_dt = 0u64;
+
+    for _ in 0..iters {
+        let mut allocated = 0usize;
+        for ptr in &mut ptrs {
+            let p = unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, old_layout) };
+            if p.is_null() {
+                break;
+            }
+            *ptr = p;
+            allocated += 1;
+        }
+        let t0 = hal::time::monotonic_ns();
+        for ptr in ptrs.iter_mut().take(allocated) {
+            let new_ptr = unsafe { GlobalAlloc::realloc(&KERNEL_ALLOCATOR, *ptr, old_layout, 63) };
+            if new_ptr.is_null() {
+                log::error!("[bench][alloc][realloc-same] realloc returned null");
+                break;
+            }
+            core::hint::black_box(new_ptr);
+            *ptr = new_ptr;
+            completed += 1;
+        }
+        total_dt = total_dt.saturating_add(hal::time::monotonic_ns().saturating_sub(t0));
+        for ptr in ptrs.iter_mut().take(allocated) {
+            if !(*ptr).is_null() {
+                unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, *ptr, new_layout) };
+                *ptr = core::ptr::null_mut();
+            }
+        }
+        if allocated != ALLOC_BENCH_BATCH {
+            break;
+        }
+    }
+
+    log::info!(
+        "[bench][alloc][realloc-same] {} x 64B->63B avg {} ns/op; source=single registry shard update + in-place size update",
+        completed,
+        total_dt / completed.max(1) as u64
+    );
+}
+
+fn run_allocator_realloc_grow() {
+    let old_layout = Layout::from_size_align(64, 8).expect("valid realloc old layout");
+    let new_layout = Layout::from_size_align(4096, 8).expect("valid realloc new layout");
+    let mut ptrs = [core::ptr::null_mut(); ALLOC_BENCH_BATCH];
+    let mut completed = 0usize;
+    let iters = 64usize;
+    let mut total_dt = 0u64;
+
+    for _ in 0..iters {
+        let mut allocated = 0usize;
+        for ptr in &mut ptrs {
+            let p = unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, old_layout) };
+            if p.is_null() {
+                break;
+            }
+            *ptr = p;
+            allocated += 1;
+        }
+        let t0 = hal::time::monotonic_ns();
+        for ptr in ptrs.iter_mut().take(allocated) {
+            let new_ptr =
+                unsafe { GlobalAlloc::realloc(&KERNEL_ALLOCATOR, *ptr, old_layout, 4096) };
+            if new_ptr.is_null() {
+                log::error!("[bench][alloc][realloc-grow] realloc returned null");
+                break;
+            }
+            core::hint::black_box(new_ptr);
+            *ptr = new_ptr;
+            completed += 1;
+        }
+        total_dt = total_dt.saturating_add(hal::time::monotonic_ns().saturating_sub(t0));
+        for ptr in ptrs.iter_mut().take(allocated) {
+            if !(*ptr).is_null() {
+                unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, *ptr, new_layout) };
+                *ptr = core::ptr::null_mut();
+            }
+        }
+        if allocated != ALLOC_BENCH_BATCH {
+            break;
+        }
+    }
+
+    log::info!(
+        "[bench][alloc][realloc-grow] {} x 64B->4K avg {} ns/op; source=new kheap alloc + copy + old slab free",
+        completed,
+        total_dt / completed.max(1) as u64
+    );
+}
+
+fn run_allocator_diagnostic() {
+    let mut buf = [0u8; 2048];
+    let iters = 512usize;
+    let t0 = hal::time::monotonic_ns();
+    let mut total_len = 0usize;
+    for _ in 0..iters {
+        let len = KERNEL_ALLOCATOR.format_diagnostic(&mut buf);
+        total_len = total_len.saturating_add(len);
+        core::hint::black_box(len);
+    }
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + no_alloc formatting",
+        iters,
+        dt / iters as u64,
+        total_len / iters
+    );
+}
+
+fn run_allocator_physical() {
+    let mut pages = [None; ALLOC_BENCH_BATCH];
+    let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
+    let iters = 64usize;
+    let mut completed = 0usize;
+    let t0 = hal::time::monotonic_ns();
+
+    for _ in 0..iters {
+        let mut allocated = 0usize;
+        for slot in &mut pages {
+            match KERNEL_ALLOCATOR.allocate_physical(request) {
+                Ok(page) => {
+                    core::hint::black_box(page.paddr);
+                    *slot = Some(page);
+                    allocated += 1;
+                }
+                Err(err) => {
+                    log::error!(
+                        "[bench][alloc][physical] allocate failed after {} pages: {:?}",
+                        completed,
+                        err
+                    );
+                    break;
+                }
+            }
+        }
+        for slot in pages.iter_mut().take(allocated).rev() {
+            if let Some(page) = slot.take() {
+                if !KERNEL_ALLOCATOR.free_physical(page) {
+                    log::error!(
+                        "[bench][alloc][physical] free failed paddr={:#x}",
+                        page.paddr
+                    );
+                    return;
+                }
+                completed += 1;
+            }
+        }
+        if allocated != ALLOC_BENCH_BATCH {
+            break;
+        }
+    }
+
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][alloc][physical] {} x page alloc+free avg {} ns/op; source=buddy lock + split/coalesce",
+        completed,
+        dt / completed.max(1) as u64
+    );
+}
+
+#[cfg(feature = "bench")]
 fn make_ram_device(name: &str, image: &'static [u8]) -> Arc<BlockDevice> {
     const LBS: u32 = 512;
     let block_count = (image.len() as u64) / LBS as u64;
@@ -120,6 +533,7 @@ fn make_ram_device(name: &str, image: &'static [u8]) -> Arc<BlockDevice> {
             class: BlockClass::Whole,
             geometry: geom,
             limits: BlockLimits::unrestricted(),
+            attributes: Default::default(),
             features: BlockFeatures::FLUSH,
         },
         io,
@@ -127,8 +541,15 @@ fn make_ram_device(name: &str, image: &'static [u8]) -> Arc<BlockDevice> {
     ))
 }
 
+#[cfg(feature = "bench")]
 fn mount_fat(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
-    let backend = Arc::new(SyncBlockBackend::new(Arc::clone(&dev)));
+    let backend = match SyncBlockBackend::new(Arc::clone(&dev)) {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            log::error!("[bench][{}] backend unavailable: {:?}", tag, e);
+            return None;
+        }
+    };
     let driver = Box::leak(Box::new(fatfs::FatFsDriver::new()));
     driver.bind_backend(backend);
     match driver.mount(None, "") {
@@ -143,8 +564,15 @@ fn mount_fat(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
     }
 }
 
+#[cfg(feature = "bench")]
 fn mount_ext(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
-    let backend = Arc::new(SyncBlockBackend::new(Arc::clone(&dev)));
+    let backend = match SyncBlockBackend::new(Arc::clone(&dev)) {
+        Ok(backend) => Arc::new(backend),
+        Err(e) => {
+            log::error!("[bench][{}] backend unavailable: {:?}", tag, e);
+            return None;
+        }
+    };
     let driver = Box::leak(Box::new(extfs::ExtFsDriver::new()));
     driver.bind_backend(backend);
     match driver.mount(None, "") {
@@ -163,6 +591,7 @@ fn mount_ext(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
 // L0: 纯内存拷贝
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_memcpy_baseline() {
     let size = 4 * 1024 * 1024usize;
     let src: Vec<u8> = vec![0xAA; size];
@@ -181,6 +610,7 @@ fn run_memcpy_baseline() {
 
 /// L0-cold: 从 64 MiB 冷数据源拷贝 4 MiB，强制 cache miss。
 /// 如果结果 ≈ L1，说明瓶颈是内存访问而非软件。
+#[cfg(feature = "bench")]
 fn run_memcpy_cold() {
     let cold_size = 64 * 1024 * 1024usize;
     let cold_src: Vec<u8> = vec![0xBB; cold_size];
@@ -201,6 +631,7 @@ fn run_memcpy_cold() {
 
 /// 测量纯软件开销：读 1 个扇区（512B），数据拷贝可忽略，
 /// 剩下的全是 lock/unlock + validation + vtable + atomic ops。
+#[cfg(feature = "bench")]
 fn run_software_overhead_only() {
     let image: &[u8] = &[0u8; 4096];
     let dev = {
@@ -222,13 +653,20 @@ fn run_software_overhead_only() {
                 class: BlockClass::Whole,
                 geometry: geom,
                 limits: BlockLimits::unrestricted(),
+                attributes: Default::default(),
                 features: BlockFeatures::FLUSH,
             },
             io,
             None,
         ))
     };
-    let backend = SyncBlockBackend::new(Arc::clone(&dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(&dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][SW-overhead] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let mut buf = [0u8; 512];
     let count = 1000u64;
     let t0 = hal::time::monotonic_ns();
@@ -248,8 +686,15 @@ fn run_software_overhead_only() {
 // L1: 裸块设备顺序读写
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_block_seq_read(dev: &Arc<BlockDevice>) {
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][L1-blk] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
@@ -279,6 +724,7 @@ fn run_block_seq_read(dev: &Arc<BlockDevice>) {
 /// 精确对比测试：同一设备、同一数据、相同 cache 状态下，
 /// 对比「直接 memcpy」vs「通过 SyncBlockBackend 完整路径」。
 /// 先 warmup 把数据拉入 cache，再分别测量两条路径。
+#[cfg(feature = "bench")]
 fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
@@ -289,7 +735,13 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     let blocks_per_chunk = (chunk / lbs) as u32;
     let iters = total_bytes / chunk;
 
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][PROOF] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let mut buf = vec![0u8; chunk];
 
     // ── Warmup: 通过完整路径读一遍，把 backing store 拉入 cache ──
@@ -353,8 +805,15 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     );
 }
 
+#[cfg(feature = "bench")]
 fn run_block_seq_write(dev: &Arc<BlockDevice>) {
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][L1-blk] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
@@ -385,8 +844,15 @@ fn run_block_seq_write(dev: &Arc<BlockDevice>) {
 // L2: 裸块设备随机读取
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_block_rand_read(dev: &Arc<BlockDevice>) {
-    let backend = SyncBlockBackend::new(Arc::clone(dev));
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][L2-blk] backend unavailable: {:?}", e);
+            return;
+        }
+    };
     let lbs = dev.geometry().logical_block_size().get() as usize;
     let block = 4096usize;
     let count = 100u64;
@@ -394,7 +860,13 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
         return;
     }
     let blocks_per_op = (block / lbs) as u32;
-    let max_lba = dev.geometry().block_count().unwrap_or(0) - blocks_per_op as u64;
+    let Some(max_lba) = dev
+        .geometry()
+        .block_count()
+        .and_then(|total| total.checked_sub(blocks_per_op as u64))
+    else {
+        return;
+    };
     if max_lba == 0 {
         return;
     }
@@ -420,6 +892,7 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
 // FAT 写路径细化插桩
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_fat_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
@@ -582,6 +1055,7 @@ fn run_fat_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
 // EXT4 写路径细化插桩
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
@@ -709,6 +1183,7 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
 // L5: 顺序读文件
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_fs_seq_read(tag: &str, sb: &Arc<Superblock>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
@@ -741,6 +1216,7 @@ fn run_fs_seq_read(tag: &str, sb: &Arc<Superblock>) {
 // L6: 随机读文件
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_fs_rand_read(tag: &str, sb: &Arc<Superblock>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
@@ -776,6 +1252,7 @@ fn run_fs_rand_read(tag: &str, sb: &Arc<Superblock>) {
 // L5/L7: 顺序写+读（同一文件，控制变量）
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_fs_seq_write_read(tag: &str, sb: &Arc<Superblock>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
@@ -863,6 +1340,7 @@ fn run_fs_seq_write_read(tag: &str, sb: &Arc<Superblock>) {
 // L8: 元数据操作
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn run_fs_meta(tag: &str, sb: &Arc<Superblock>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
@@ -922,6 +1400,7 @@ fn run_fs_meta(tag: &str, sb: &Arc<Superblock>) {
 // 辅助：找最大普通文件
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 fn find_largest_file(
     root: &Arc<vfs::inode::Inode>,
     _tag: &str,
@@ -962,10 +1441,12 @@ fn find_largest_file(
 // RAM 块驱动（带 read_sectors_sync 快速路径）
 // ═══════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "bench")]
 struct RamBlockIo {
     data: Spinlock<Vec<u8>>,
 }
 
+#[cfg(feature = "bench")]
 impl RamBlockIo {
     fn new(data: Vec<u8>) -> Self {
         Self {
@@ -974,6 +1455,7 @@ impl RamBlockIo {
     }
 }
 
+#[cfg(feature = "bench")]
 impl BlockDriver for RamBlockIo {
     fn queue_bio(&self, mut bio: Bio) -> Result<(), (SubmitError, Bio)> {
         const LBS: usize = 512;

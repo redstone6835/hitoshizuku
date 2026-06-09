@@ -44,21 +44,22 @@ extern crate alloc;
 pub mod adapter;
 pub mod config;
 pub mod device;
+pub mod dhcp;
 pub mod driver;
 pub mod error;
 pub mod interface;
 pub mod socket;
 pub mod stack;
 
-pub use config::{
-    CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr,
-};
+pub use config::{CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 pub use device::{InterfaceId, NetDevice};
-pub use driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
+pub use driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 pub use error::NetError;
-pub use socket::{NetSocketHandle, SocketState, SocketType};
+pub use socket::{NetSocketHandle, SocketState, SocketType, TcpConnSnapshot, UdpSockSnapshot};
 pub use stack::stack;
-pub use stack::{IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, InterfaceSnapshot, NeighborEntry};
+pub use stack::{
+    IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, InterfaceSnapshot, NeighborEntry,
+};
 // 把 smoltcp 的时间类型 re-export 出来，外部（kernel 侧的 net_poll 钩子）
 // 不用直接依赖 smoltcp。
 pub use smoltcp::time::Instant;

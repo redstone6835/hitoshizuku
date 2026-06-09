@@ -10,7 +10,9 @@ use errno::Errno;
 use general::mm::{copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::{current_fdtable, current_vfs_context, namespace_path};
+use hal::abi::{decode_dev_t, encode_dev_t};
 use sched::{SigProcMaskHow, SigSet};
+use vfs::cred::{Gid, Uid};
 use vfs::error::VfsError;
 use vfs::fdtable::{Fd, FdFlags};
 use vfs::file::{AccessMode, IoctlCmd, OpenOptions, PollEvents, SeekFrom};
@@ -21,7 +23,7 @@ use vfs::socket as vfs_socket;
 use vfs::stat::{DevId, FileMode, FileStat, FileType, FsStat, Timespec};
 
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
-const COPY_CHUNK: usize = 256;
+const COPY_CHUNK: usize = 2048;
 const PATH_MAX: usize = 4096;
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: usize = 0x100;
@@ -59,6 +61,7 @@ const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const FD_CLOEXEC: usize = 1;
+const FIONBIO: usize = 0x5421;
 
 const STATX_TYPE: u32 = 0x0001;
 const STATX_MODE: u32 = 0x0002;
@@ -108,7 +111,7 @@ pub(super) fn sys_pread64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let fd = fd_arg(ctx.args[0])?;
     let buf = ctx.args[1];
     let len = ctx.args[2];
-    let offset = ctx.args[3] as u64;
+    let offset = nonnegative_i64_arg(ctx.args[3])?;
     let file = file_for_fd(fd)?;
     read_to_user(&file, buf, len, Some(offset))
 }
@@ -117,7 +120,7 @@ pub(super) fn sys_pwrite64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let fd = fd_arg(ctx.args[0])?;
     let buf = ctx.args[1];
     let len = ctx.args[2];
-    let offset = ctx.args[3] as u64;
+    let offset = nonnegative_i64_arg(ctx.args[3])?;
     let file = file_for_fd(fd)?;
     write_from_user_at(&file, buf, len, Some(offset))
 }
@@ -385,6 +388,7 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 (arg & O_APPEND) != 0,
                 (arg & O_NONBLOCK) != 0,
                 (arg & O_SYNC) != 0,
+                (arg & O_DIRECT) != 0,
             );
             Ok(0)
         }
@@ -395,9 +399,11 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_ioctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let file = file_for_fd(fd_arg(ctx.args[0])?)?;
     let cmd = IoctlCmd::new(ctx.args[1] & u32::MAX as usize);
-    let raw_cmd = cmd.raw() as u32;
-    if general::dev::net::is_net_ioctl(raw_cmd) {
-        return general::dev::net::net_ioctl(raw_cmd, ctx.args[2]);
+    if cmd.raw() == FIONBIO {
+        let enabled = read_user_i32(ctx.args[2])? != 0;
+        let flags = file.flags();
+        file.set_status_flags(flags.append, enabled, flags.sync, flags.direct);
+        return Ok(0);
     }
     file.ioctl(cmd, ctx.args[2])
 }
@@ -437,7 +443,11 @@ pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fds_bytes: &[u8] = unsafe {
         core::slice::from_raw_parts(fds.as_ptr() as *const u8, core::mem::size_of::<[i32; 2]>())
     };
-    copy_to_user(fds_user, fds_bytes).map_err(|e| e.as_errno())?;
+    if let Err(err) = copy_to_user(fds_user, fds_bytes) {
+        let _ = fdt.close_fd(write_fd);
+        let _ = fdt.close_fd(read_fd);
+        return Err(err.as_errno());
+    }
 
     Ok(0)
 }
@@ -530,12 +540,18 @@ pub(super) fn sys_mknodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         _ => return Err(Errno::EINVAL),
     };
     let file_mode = FileMode::new((mode & 0o7777) as u16);
-    let dev_id = DevId::new(
-        ((dev >> 8) & 0xfff) as u32,
-        (dev & 0xff | ((dev >> 12) & !0xff)) as u32,
-    );
+    let dev_id = decode_dev_t(dev);
     operation::mknodat(&vfs_ctx, &dirfd, &path, kind, file_mode, dev_id)
         .map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_fchmod(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let mode = FileMode::new((ctx.args[1] & 0o7777) as u16);
+    operation::fchmod(&vfs_ctx, &fdt, fd, mode).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -550,15 +566,27 @@ pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 }
 
 pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    use vfs::cred::{Gid, Uid};
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_cstr_from_user(ctx.args[1], PATH_MAX).map_err(|e| e.as_errno())?;
-    let uid_raw = ctx.args[2] as u32;
-    let gid_raw = ctx.args[3] as u32;
+    let (uid, gid) = decode_optional_owner(ctx.args[2] as u32, ctx.args[3] as u32);
     let flags = ctx.args[4];
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
+    operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_fchown(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let fd = fd_arg(ctx.args[0])?;
+    let (uid, gid) = decode_optional_owner(ctx.args[1] as u32, ctx.args[2] as u32);
+    operation::fchown(&vfs_ctx, &fdt, fd, uid, gid).map_err(|e| e.to_errno())?;
+    Ok(0)
+}
+
+fn decode_optional_owner(uid_raw: u32, gid_raw: u32) -> (Option<Uid>, Option<Gid>) {
     let uid = if uid_raw == u32::MAX {
         None
     } else {
@@ -569,8 +597,7 @@ pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     } else {
         Some(Gid(gid_raw))
     };
-    operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
-    Ok(0)
+    (uid, gid)
 }
 
 pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -613,7 +640,7 @@ pub(super) fn sys_truncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let _fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let path = copy_cstr_from_user(ctx.args[0], PATH_MAX).map_err(|e| e.as_errno())?;
-    let size = ctx.args[1] as u64;
+    let size = nonnegative_i64_arg(ctx.args[1])?;
     let dirfd = Dirfd::Cwd;
     operation::truncate(&vfs_ctx, &dirfd, &path, size).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -621,12 +648,12 @@ pub(super) fn sys_truncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
 pub(super) fn sys_ftruncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
-    let size = ctx.args[1] as u64;
+    let size = nonnegative_i64_arg(ctx.args[1])?;
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
-    file.inode().set_size(size);
+    file.truncate(size).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -651,7 +678,11 @@ pub(super) fn sys_getdents64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let file = file_for_fd(fd)?;
 
     let mut buf_pos = 0usize;
+    let mut copy_error = None;
     file.readdir(&mut |entry| {
+        if copy_error.is_some() {
+            return ControlFlow::Break(());
+        }
         if buf_pos >= count {
             return ControlFlow::Break(());
         }
@@ -671,13 +702,20 @@ pub(super) fn sys_getdents64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         raw[18] = file_type_to_d_type(entry.kind);
         raw[19..19 + name_len].copy_from_slice(&name_bytes[..name_len]);
         raw[19 + name_len] = 0;
-        if copy_to_user(dirent + buf_pos, &raw).is_err() {
+        if let Err(err) = copy_to_user(dirent + buf_pos, &raw) {
+            copy_error = Some(err.as_errno());
             return ControlFlow::Break(());
         }
         buf_pos += reclen;
         ControlFlow::Continue(())
     })
     .map_err(|e| e.to_errno())?;
+
+    if let Some(err) = copy_error
+        && buf_pos == 0
+    {
+        return Err(err);
+    }
 
     Ok(buf_pos)
 }
@@ -1022,18 +1060,17 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
 
 pub(super) fn sys_fallocate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
-    let _mode = ctx.args[1];
-    let offset = ctx.args[2] as u64;
-    let len = ctx.args[3] as u64;
+    let mode = ctx.args[1];
+    let offset = nonnegative_i64_arg(ctx.args[2])?;
+    let len = nonnegative_i64_arg(ctx.args[3])?;
+    if mode != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let file = file_for_fd(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
-    let size = file.stat().map_err(|e| e.to_errno())?.size as u64;
-    let end = offset.saturating_add(len);
-    if end > size {
-        file.inode().set_size(end);
-    }
+    file.fallocate(offset, len).map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -1426,7 +1463,7 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut pollfds = vec![0u8; total_bytes];
     copy_from_user(fds_user, &mut pollfds).map_err(|e| e.as_errno())?;
 
-    let timeout_ms = read_timespec_ms(timeout_user);
+    let timeout_ms = read_timespec_ms(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
 
     let deadline = timeout_deadline(timeout_ms);
@@ -1496,7 +1533,7 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let mut read_out = vec![0u8; set_len];
     let mut write_out = vec![0u8; set_len];
     let mut except_out = vec![0u8; set_len];
-    let timeout_ms = read_timespec_ms(timeout_user);
+    let timeout_ms = read_timespec_ms(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
     let deadline = timeout_deadline(timeout_ms);
 
@@ -1572,7 +1609,7 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
-        Some(sched::now_ns_public() + (timeout_ms as u64) * 1_000_000)
+        Some(sched::now_ns_public().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
     } else {
         None
     }
@@ -1582,10 +1619,17 @@ fn timeout_expired(deadline: Option<u64>) -> bool {
     deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
 }
 
+fn restore_current_task_after_wait(task: &Arc<sched::Task>) {
+    if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
+        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
+    }
+}
+
 fn wait_on_poll_sources(
     sources: &[(Arc<vfs::file::File>, PollEvents)],
     deadline: Option<u64>,
 ) -> Result<(), Errno> {
+    const POLL_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
@@ -1601,8 +1645,16 @@ fn wait_on_poll_sources(
     for (file, interest) in sources {
         registered_waiter |= file.poll_add_waiter(&task, *interest);
     }
+    // 当前网络 waiter 仍是全局粗粒度唤醒，存在丢失精确事件的窗口。
+    // poll/select 不能因此永久睡眠；即使没有收到 waiter 唤醒，也按短
+    // 周期重新检查 fd readiness，直到原始 timeout 到期。
+    let recheck_deadline = {
+        let now = sched::now_ns_public();
+        let quantum = now.saturating_add(POLL_RECHECK_NS);
+        Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
+    };
     let deadline_armed =
-        deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
+        recheck_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
 
     if sources
         .iter()
@@ -1614,7 +1666,7 @@ fn wait_on_poll_sources(
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
     if timeout_expired(deadline) {
@@ -1624,22 +1676,23 @@ fn wait_on_poll_sources(
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
 
     if !registered_waiter && !deadline_armed {
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return sched::operation::sched_yield();
     }
 
-    sched::schedule_once(0);
+    sched::schedule_once(sched::now_ns_public());
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
     if deadline_armed {
         sched::cancel_sleep_deadline(&task);
     }
+    restore_current_task_after_wait(&task);
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
     }
@@ -1742,6 +1795,14 @@ fn fd_arg(raw: usize) -> Result<Fd, Errno> {
         return Err(Errno::EBADF);
     }
     Ok(Fd::from_raw(fd as u32))
+}
+
+fn nonnegative_i64_arg(raw: usize) -> Result<u64, Errno> {
+    let value = raw as isize as i64;
+    if value < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value as u64)
 }
 
 fn dirfd_arg(raw: usize, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
@@ -1869,6 +1930,9 @@ fn open_options_to_linux_flags(opts: &OpenOptions) -> usize {
     if opts.sync {
         raw |= O_SYNC;
     }
+    if opts.direct {
+        raw |= O_DIRECT;
+    }
     raw
 }
 
@@ -1890,7 +1954,8 @@ fn decode_open_options(raw: usize) -> Result<OpenOptions, Errno> {
         noatime: (raw & O_NOATIME) != 0,
         path_only: (raw & O_PATH) != 0,
         nonblock: (raw & O_NONBLOCK) != 0,
-        sync: false,
+        sync: (raw & O_SYNC) != 0,
+        direct: (raw & O_DIRECT) != 0,
         cloexec: (raw & O_CLOEXEC) != 0,
     })
 }
@@ -1912,7 +1977,13 @@ fn write_from_user_at(
     let mut tmp = [0u8; COPY_CHUNK];
     while remaining > 0 {
         let chunk = remaining.min(tmp.len());
-        copy_from_user(user_ptr, &mut tmp[..chunk]).map_err(|e| e.as_errno())?;
+        if let Err(e) = copy_from_user(user_ptr, &mut tmp[..chunk]) {
+            return if written > 0 {
+                Ok(written)
+            } else {
+                Err(e.as_errno())
+            };
+        }
         let n = match if offset.is_some() {
             file.write_at(&tmp[..chunk], pos)
         } else {
@@ -1972,7 +2043,13 @@ fn read_to_user(
         if n == 0 {
             break;
         }
-        copy_to_user(user_ptr, &tmp[..n]).map_err(|e| e.as_errno())?;
+        if let Err(e) = copy_to_user(user_ptr, &tmp[..n]) {
+            return if read > 0 {
+                Ok(read)
+            } else {
+                Err(e.as_errno())
+            };
+        }
         read += n;
         user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
         pos = pos.saturating_add(n as u64);
@@ -1985,7 +2062,11 @@ fn read_to_user(
 }
 
 fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Result<(), Errno> {
+    const IO_RECHECK_NS: u64 = 10_000_000;
     let task = sched::current_task();
+    if has_unblocked_signal(&task) {
+        return Err(Errno::EINTR);
+    }
     let deadline = file.io_timeout_deadline(interest);
     if timeout_expired(deadline) {
         return Err(Errno::EAGAIN);
@@ -1994,8 +2075,15 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
     let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
 
     let registered = file.poll_add_waiter(&task, interest);
-    let deadline_armed =
-        deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
+    // 不是所有文件都有专用唤醒源，例如 UART/TTY 当前是轮询设备。没有
+    // waiter 时也必须定期重检 readiness，否则阻塞 read/write 可能永久睡眠；
+    // 直接忙等又会饿死 QEMU/设备后端的输入投递。
+    let recheck_deadline = {
+        let now = sched::now_ns_public();
+        let quantum = now.saturating_add(IO_RECHECK_NS);
+        deadline.map_or(quantum, |dl| dl.min(quantum))
+    };
+    let deadline_armed = sched::register_sleep_deadline(&task, recheck_deadline);
     if !file.poll(interest).is_empty() {
         if registered {
             file.poll_remove_waiter(&task);
@@ -2003,7 +2091,7 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
     if timeout_expired(deadline) {
@@ -2013,20 +2101,31 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Err(Errno::EAGAIN);
     }
-
-    if registered || deadline_armed {
-        sched::schedule_once(0);
+    if has_unblocked_signal(&task) {
         if registered {
             file.poll_remove_waiter(&task);
         }
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
+        restore_current_task_after_wait(&task);
+        return Err(Errno::EINTR);
+    }
+
+    if registered || deadline_armed {
+        sched::schedule_once(sched::now_ns_public());
+        if registered {
+            file.poll_remove_waiter(&task);
+        }
+        if deadline_armed {
+            sched::cancel_sleep_deadline(&task);
+        }
+        restore_current_task_after_wait(&task);
     } else {
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         sched::operation::sched_yield()?;
     }
 
@@ -2040,10 +2139,7 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
 }
 
 fn has_unblocked_signal(task: &Arc<sched::Task>) -> bool {
-    let blocked = task.signal.blocked_snapshot().raw();
-    let pending =
-        task.signal.pending_snapshot().raw() | task.shared_signal().pending_snapshot().raw();
-    (pending & !blocked) != 0
+    sched::operation::has_interrupting_signal(task)
 }
 
 fn deliver_sigpipe() {
@@ -2054,6 +2150,7 @@ fn deliver_sigpipe() {
         code: 0,
         sender_pid: task.pid_root().unwrap_or(0),
         sender_uid: creds.uid,
+        raw: None,
     };
     task.signal.deliver(info);
     sched::signal_wakeup(&task, &info);
@@ -2068,6 +2165,12 @@ fn read_iovec(iov: usize, index: usize) -> Result<(usize, usize), Errno> {
     let base = usize::from_le_bytes(raw[0..8].try_into().unwrap());
     let len = usize::from_le_bytes(raw[8..16].try_into().unwrap());
     Ok((base, len))
+}
+
+fn read_user_i32(user: usize) -> Result<i32, Errno> {
+    let mut raw = [0u8; 4];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok(i32::from_ne_bytes(raw))
 }
 
 struct UserMsghdr {
@@ -2294,13 +2397,13 @@ fn getsockname_common(ctx: &mut SyscallContext<'_>, peer: bool) -> Result<usize,
 
 fn write_linux_stat(user: usize, st: &FileStat) -> Result<(), Errno> {
     let mut out = [0u8; 128];
-    put_u64(&mut out, 0, encode_dev(st.dev));
+    put_u64(&mut out, 0, encode_dev_t(st.dev));
     put_u64(&mut out, 8, st.ino);
     put_u32(&mut out, 16, st.mode);
     put_u32(&mut out, 20, st.nlink);
     put_u32(&mut out, 24, st.uid);
     put_u32(&mut out, 28, st.gid);
-    put_u64(&mut out, 32, encode_dev(st.rdev));
+    put_u64(&mut out, 32, encode_dev_t(st.rdev));
     put_i64(&mut out, 48, st.size);
     put_u32(&mut out, 56, st.blksize);
     put_u64(&mut out, 64, st.blocks);
@@ -2315,6 +2418,8 @@ fn write_linux_stat(user: usize, st: &FileStat) -> Result<(), Errno> {
 
 fn write_linux_statx(user: usize, st: &FileStat) -> Result<(), Errno> {
     let mut out = [0u8; 256];
+    let rdev = statx_dev_components(st.rdev);
+    let dev = statx_dev_components(st.dev);
     put_u32(&mut out, 0, STATX_BASIC_STATS);
     put_u32(&mut out, 4, st.blksize);
     put_u64(&mut out, 8, 0);
@@ -2329,22 +2434,20 @@ fn write_linux_statx(user: usize, st: &FileStat) -> Result<(), Errno> {
     put_statx_timestamp(&mut out, 64, st.atime);
     put_statx_timestamp(&mut out, 96, st.ctime);
     put_statx_timestamp(&mut out, 112, st.mtime);
-    put_u32(&mut out, 128, st.rdev.major);
-    put_u32(&mut out, 132, st.rdev.minor);
-    put_u32(&mut out, 136, st.dev.major);
-    put_u32(&mut out, 140, st.dev.minor);
+    put_u32(&mut out, 128, rdev.major);
+    put_u32(&mut out, 132, rdev.minor);
+    put_u32(&mut out, 136, dev.major);
+    put_u32(&mut out, 140, dev.minor);
     copy_to_user(user, &out).map_err(|e| e.as_errno())
+}
+
+fn statx_dev_components(dev: DevId) -> DevId {
+    decode_dev_t(encode_dev_t(dev))
 }
 
 fn put_statx_timestamp(out: &mut [u8], off: usize, ts: Timespec) {
     put_i64(out, off, ts.secs);
     put_u32(out, off + 8, ts.nsecs);
-}
-
-fn encode_dev(dev: DevId) -> u64 {
-    let major = dev.major as u64;
-    let minor = dev.minor as u64;
-    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
 fn put_u16(out: &mut [u8], off: usize, v: u16) {
@@ -2397,20 +2500,18 @@ fn write_linux_statfs(user: usize, st: &FsStat) -> Result<(), Errno> {
     copy_to_user(user, &out).map_err(|e| e.as_errno())
 }
 
-fn read_timespec_ms(user: usize) -> i64 {
+fn read_timespec_ms(user: usize) -> Result<i64, Errno> {
     if user == 0 {
-        return -1;
+        return Ok(-1);
     }
     let mut raw = [0u8; 16];
-    if copy_from_user(user, &mut raw).is_err() {
-        return -1;
-    }
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
     let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
     let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
     if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
-        return -1;
+        return Err(Errno::EINVAL);
     }
-    sec.saturating_mul(1000).saturating_add(nsec / 1_000_000)
+    Ok(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000))
 }
 
 fn read_socket_timeout_deadline(user: usize) -> Result<Option<u64>, Errno> {

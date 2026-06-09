@@ -13,6 +13,7 @@ socket = { path = "../socket" }
 smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "alloc",
     "medium-ethernet",
+    "medium-ip",
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",

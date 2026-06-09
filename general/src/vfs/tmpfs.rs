@@ -166,6 +166,96 @@ enum TmpfsInodeData {
     Special,
 }
 
+fn resize_file_data(file_data: &mut Vec<u8>, new_len: usize) -> VfsResult<()> {
+    if new_len > file_data.len() {
+        file_data
+            .try_reserve_exact(new_len - file_data.len())
+            .map_err(|_| VfsError::OutOfMemory)?;
+    }
+    file_data.resize(new_len, 0);
+    Ok(())
+}
+
+fn tmpfs_blocks_for_len(len: u64) -> u64 {
+    // stat.st_blocks 的单位固定为 512 字节，不等同于 tmpfs 的页大小。
+    len.saturating_add(511) / 512
+}
+
+fn ensure_empty_tmpfs_dir(inode: &Inode) -> VfsResult<()> {
+    if inode.kind() != FileType::Directory {
+        return Err(VfsError::NotADirectory);
+    }
+    let ops = inode
+        .downcast_ops::<TmpfsInodeOps>()
+        .ok_or(VfsError::InvalidArgument)?;
+    let data = ops.data.lock();
+    let entries = match &*data {
+        TmpfsInodeData::Directory(entries) => entries,
+        _ => return Err(VfsError::NotADirectory),
+    };
+    if entries.is_empty() {
+        Ok(())
+    } else {
+        Err(VfsError::DirectoryNotEmpty)
+    }
+}
+
+fn validate_rename_replacement(old_inode: &Inode, replaced: &Inode) -> VfsResult<()> {
+    match (old_inode.kind(), replaced.kind()) {
+        (FileType::Directory, FileType::Directory) => ensure_empty_tmpfs_dir(replaced),
+        (FileType::Directory, _) => Err(VfsError::NotADirectory),
+        (_, FileType::Directory) => Err(VfsError::IsADirectory),
+        _ => Ok(()),
+    }
+}
+
+fn retire_replaced_entry(replaced: &Inode, parent: &Inode) {
+    if replaced.kind() == FileType::Directory {
+        replaced.set_nlink(0);
+        parent.dec_nlink();
+    } else {
+        replaced.dec_nlink();
+    }
+    replaced.touch_ctime();
+}
+
+fn rename_entry(
+    old_entries: &mut BTreeMap<String, u64>,
+    new_entries: &mut BTreeMap<String, u64>,
+    sb: &Superblock,
+    old_name: &str,
+    old_inode: &Inode,
+    new_dir: &Inode,
+    new_name: &str,
+) -> VfsResult<bool> {
+    let old_ino = *old_entries.get(old_name).ok_or(VfsError::NotFound)?;
+    if old_ino != old_inode.ino() {
+        return Err(VfsError::NotFound);
+    }
+
+    let replaced = if let Some(existing_ino) = new_entries.get(new_name).copied() {
+        if existing_ino == old_ino {
+            old_entries.remove(old_name);
+            old_inode.dec_nlink();
+            old_inode.touch_ctime();
+            return Ok(false);
+        }
+        let inode = sb.find_inode(existing_ino).ok_or(VfsError::NotFound)?;
+        validate_rename_replacement(old_inode, &inode)?;
+        Some(inode)
+    } else {
+        None
+    };
+
+    old_entries.remove(old_name);
+    new_entries.insert(new_name.to_string(), old_ino);
+
+    if let Some(replaced) = replaced {
+        retire_replaced_entry(&replaced, new_dir);
+    }
+    Ok(true)
+}
+
 struct TmpfsInodeOps {
     data: Spinlock<TmpfsInodeData>,
 }
@@ -424,7 +514,7 @@ impl InodeOps for TmpfsInodeOps {
             atime: now,
             mtime: now,
             ctime: now,
-            blocks: 0,
+            blocks: tmpfs_blocks_for_len(target.len() as u64),
         };
 
         let new_inode = Inode::new(
@@ -444,6 +534,8 @@ impl InodeOps for TmpfsInodeOps {
         );
 
         entries.insert(name.to_string(), ino);
+        dir.touch_mtime();
+        dir.touch_ctime();
         drop(data);
 
         Ok(sb.insert_inode(new_inode))
@@ -539,7 +631,121 @@ impl InodeOps for TmpfsInodeOps {
         entries.insert(name.to_string(), target.ino());
         target.inc_nlink();
         target.touch_ctime();
+        dir.touch_mtime();
+        dir.touch_ctime();
 
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        dir: &Inode,
+        old_name: &str,
+        old_inode: &Inode,
+        new_dir: &Inode,
+        new_name: &str,
+    ) -> VfsResult<()> {
+        if dir.kind() != FileType::Directory || new_dir.kind() != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+
+        let sb = dir.superblock().ok_or(VfsError::InvalidArgument)?;
+        if new_dir.fs_id() != dir.fs_id() {
+            return Err(VfsError::CrossDevice);
+        }
+        let new_ops = new_dir
+            .downcast_ops::<TmpfsInodeOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+
+        if dir.ino() == new_dir.ino() {
+            let mut data = self.data.lock();
+            let entries = match &mut *data {
+                TmpfsInodeData::Directory(entries) => entries,
+                _ => return Err(VfsError::NotADirectory),
+            };
+            let old_ino = *entries.get(old_name).ok_or(VfsError::NotFound)?;
+            if old_ino != old_inode.ino() {
+                return Err(VfsError::NotFound);
+            }
+
+            let replaced = if let Some(existing_ino) = entries.get(new_name).copied() {
+                if existing_ino == old_ino {
+                    entries.remove(old_name);
+                    old_inode.dec_nlink();
+                    old_inode.touch_ctime();
+                    dir.touch_mtime();
+                    dir.touch_ctime();
+                    return Ok(());
+                }
+                let inode = sb.find_inode(existing_ino).ok_or(VfsError::NotFound)?;
+                validate_rename_replacement(old_inode, &inode)?;
+                Some(inode)
+            } else {
+                None
+            };
+
+            entries.remove(old_name);
+            entries.insert(new_name.to_string(), old_ino);
+            if let Some(replaced) = replaced {
+                retire_replaced_entry(&replaced, dir);
+            }
+        } else if dir.ino() < new_dir.ino() {
+            let mut old_data = self.data.lock();
+            let mut new_data = new_ops.data.lock();
+            let old_entries = match &mut *old_data {
+                TmpfsInodeData::Directory(entries) => entries,
+                _ => return Err(VfsError::NotADirectory),
+            };
+            let new_entries = match &mut *new_data {
+                TmpfsInodeData::Directory(entries) => entries,
+                _ => return Err(VfsError::NotADirectory),
+            };
+            let inserted = rename_entry(
+                old_entries,
+                new_entries,
+                &sb,
+                old_name,
+                old_inode,
+                new_dir,
+                new_name,
+            )?;
+            if inserted && old_inode.kind() == FileType::Directory {
+                dir.dec_nlink();
+                new_dir.inc_nlink();
+            }
+        } else {
+            let mut new_data = new_ops.data.lock();
+            let mut old_data = self.data.lock();
+            let old_entries = match &mut *old_data {
+                TmpfsInodeData::Directory(entries) => entries,
+                _ => return Err(VfsError::NotADirectory),
+            };
+            let new_entries = match &mut *new_data {
+                TmpfsInodeData::Directory(entries) => entries,
+                _ => return Err(VfsError::NotADirectory),
+            };
+            let inserted = rename_entry(
+                old_entries,
+                new_entries,
+                &sb,
+                old_name,
+                old_inode,
+                new_dir,
+                new_name,
+            )?;
+            if inserted && old_inode.kind() == FileType::Directory {
+                dir.dec_nlink();
+                new_dir.inc_nlink();
+            }
+        }
+
+        old_inode.touch_ctime();
+        dir.touch_mtime();
+        dir.touch_ctime();
+        if dir.ino() != new_dir.ino() {
+            new_dir.touch_mtime();
+            new_dir.touch_ctime();
+        }
         Ok(())
     }
 
@@ -553,6 +759,28 @@ impl InodeOps for TmpfsInodeOps {
             TmpfsInodeData::Symlink(target) => Ok(target.clone()),
             _ => Err(VfsError::InvalidArgument),
         }
+    }
+
+    fn chmod(&self, inode: &Inode, mode: FileMode) -> VfsResult<()> {
+        inode.set_mode(mode);
+        Ok(())
+    }
+
+    fn chown(&self, inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> VfsResult<()> {
+        if uid.is_some() || gid.is_some() {
+            inode.set_owner(uid, gid);
+        }
+        Ok(())
+    }
+
+    fn utimes(
+        &self,
+        inode: &Inode,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+    ) -> VfsResult<()> {
+        inode.set_times(atime, mtime);
+        Ok(())
     }
 
     fn truncate(&self, inode: &Inode, new_size: u64) -> VfsResult<()> {
@@ -569,8 +797,8 @@ impl InodeOps for TmpfsInodeOps {
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        file_data.resize(new_size as usize, 0);
-        inode.set_size(new_size);
+        resize_file_data(file_data, new_size as usize)?;
+        inode.set_size_and_blocks(new_size, tmpfs_blocks_for_len(new_size));
         inode.touch_mtime();
         inode.touch_ctime();
 
@@ -639,7 +867,10 @@ impl FileOps for TmpfsFileOps {
         }
 
         let start = (offset as usize).min(file_data.len());
-        let end = (start + buf.len()).min(file_data.len());
+        let end = start
+            .checked_add(buf.len())
+            .unwrap_or(usize::MAX)
+            .min(file_data.len());
         let n = end - start;
 
         buf[..n].copy_from_slice(&file_data[start..end]);
@@ -669,13 +900,14 @@ impl FileOps for TmpfsFileOps {
         let end = start.checked_add(buf.len()).ok_or(VfsError::FileTooLarge)?;
 
         if end > file_data.len() {
-            file_data.resize(end, 0);
+            resize_file_data(file_data, end)?;
         }
 
         file_data[start..end].copy_from_slice(buf);
         if let Some(inode) = self.inode() {
             if inode.size() != file_data.len() as u64 {
-                inode.set_size(file_data.len() as u64);
+                let size = file_data.len() as u64;
+                inode.set_size_and_blocks(size, tmpfs_blocks_for_len(size));
             }
             if !buf.is_empty() {
                 inode.touch_mtime();
@@ -683,6 +915,32 @@ impl FileOps for TmpfsFileOps {
             }
         }
         Ok(buf.len())
+    }
+
+    fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+
+        let ops = unsafe { &*self.inode_ops };
+        let mut data = ops.data.lock();
+        let file_data = match &mut *data {
+            TmpfsInodeData::File(data) => data,
+            _ => return Err(VfsError::InvalidArgument),
+        };
+
+        let end = end as usize;
+        if end > file_data.len() {
+            resize_file_data(file_data, end)?;
+            if let Some(inode) = self.inode() {
+                let size = end as u64;
+                inode.set_size_and_blocks(size, tmpfs_blocks_for_len(size));
+                inode.touch_mtime();
+                inode.touch_ctime();
+            }
+        }
+        Ok(())
     }
 
     fn readdir(
@@ -696,13 +954,15 @@ impl FileOps for TmpfsFileOps {
             TmpfsInodeData::Directory(entries) => entries,
             _ => return Err(VfsError::NotADirectory),
         };
+        let sb = self.sb.upgrade().ok_or(VfsError::InvalidArgument)?;
 
         let mut current_pos = pos;
         for (name, ino) in entries.iter().skip(pos as usize) {
+            let kind = sb.find_inode(*ino).ok_or(VfsError::NotFound)?.kind();
             let entry = DirEntry {
                 ino: *ino,
                 name: SmallStr::from(name.as_str()),
-                kind: FileType::Regular, // tmpfs 不在 DirEntry 中存储类型
+                kind,
             };
 
             if sink(entry).is_break() {

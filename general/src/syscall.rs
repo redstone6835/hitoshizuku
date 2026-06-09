@@ -185,6 +185,7 @@ pub fn dispatch(tf: TrapFramePtr) {
         ) {
             sched::schedule_once(0);
         }
+        sched::run_post_syscall_handoff(sched::now_ns_public());
     }
     log::debug!("[syscall] nr={} args={:?} -> {}", nr, args, ret);
 }

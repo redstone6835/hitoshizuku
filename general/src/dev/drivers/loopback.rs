@@ -9,11 +9,17 @@ use core::any::Any;
 
 use spin::Mutex;
 
-use net::driver::{Duplex, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 use net::config::{IfConfig, Ipv4Addr};
 use net::device::NetDevice;
+use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 
-use crate::dev::pnp::PnpError;
+use crate::dev::pnp::{PnpError, PnpResourceKind};
+
+const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
+/// loopback 接口使用的本地最大传输单元。
+const LOOPBACK_MTU: usize = 65_536;
+/// 保留传统 loopback 网段：lo 固定为 127.0.0.1/8。
+const LOOPBACK_IPV4_PREFIX: u8 = 8;
 
 struct LoopbackDriver {
     queue: Mutex<VecDeque<Box<[u8]>>>,
@@ -30,6 +36,12 @@ impl LoopbackDriver {
 }
 
 impl NetDriver for LoopbackDriver {
+    fn medium(&self) -> LinkMedium {
+        // loopback 没有 Ethernet 二层头，也不需要 ARP/邻居解析；
+        // 直接以 IP packet 形式交给 smoltcp，127.0.0.1 才能在本机闭环。
+        LinkMedium::Ip
+    }
+
     fn poll_rx(&self) -> Option<RxBuf> {
         let mut q = self.queue.lock();
         let frame = q.pop_front()?;
@@ -55,9 +67,12 @@ impl NetDriver for LoopbackDriver {
             stats.tx_packets += 1;
             stats.tx_bytes += len as u64;
         }
-        // FIXME: loopback 队列没有容量上限或 backpressure，持续发送会让
-        // 内存无界增长。
-        self.queue.lock().push_back(data);
+        let mut queue = self.queue.lock();
+        if queue.len() >= MAX_LOOPBACK_QUEUE_FRAMES {
+            self.stats.lock().tx_dropped += 1;
+            return;
+        }
+        queue.push_back(data);
     }
 
     fn link_state(&self) -> LinkState {
@@ -72,7 +87,7 @@ impl NetDriver for LoopbackDriver {
     }
 
     fn mtu(&self) -> usize {
-        65536
+        LOOPBACK_MTU
     }
 
     fn stats(&self) -> NetStats {
@@ -87,10 +102,11 @@ impl NetDriver for LoopbackDriver {
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     let driver: Arc<dyn NetDriver> = Arc::new(LoopbackDriver::new());
     let dev = Arc::new(NetDevice::new("lo", driver));
-    let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, 8, None);
+    // lo 固定使用保留的 127.0.0.1/8 本地回环网段；这里不扩展完整路由策略。
+    let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, LOOPBACK_IPV4_PREFIX, None);
     net::stack()
         .attach(dev, config)
-        .map_err(|_| PnpError::ProbeFailed)?;
+        .map_err(|_| PnpError::registration_failed(PnpResourceKind::Function, "loopback attach"))?;
     log::printk!("[loopback] attached lo 127.0.0.1/8");
     Ok(())
 }

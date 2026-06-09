@@ -33,7 +33,10 @@ use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
 use super::{current_vfs_context, namespace_path};
-use crate::dev::function::{active_block_devices, active_char_devices};
+use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
+use crate::dev::function::{CustomDevNodeKind, DevNodeSpec};
+use crate::dev::pnp::{PnpDependency, PnpId, PnpResourceKind, PnpState};
+use crate::vfs::device_numbers::{self, PosixDeviceKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
@@ -55,6 +58,8 @@ const SYS_KERNEL_INO: u64 = 14;
 const SYS_HOTPLUG_INO: u64 = 15;
 const NET_DIR_INO: u64 = 16;
 const NET_DEV_INO: u64 = 17;
+const PNP_INO: u64 = 18;
+const DEVICE_FUNCTIONS_INO: u64 = 19;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -73,6 +78,51 @@ const TASK_SLOT_MAPS: u64 = 11;
 const TASK_SLOT_FD_DIR: u64 = 12;
 const TASK_SLOT_TASK_DIR: u64 = 13;
 const TASK_SLOT_MOUNTINFO: u64 = 14;
+
+fn procfs_fallible_string(value: &str) -> VfsResult<String> {
+    let mut out = String::new();
+    out.try_reserve(value.len())
+        .map_err(|_| VfsError::NoSpace)?;
+    out.push_str(value);
+    Ok(out)
+}
+
+fn procfs_decimal_name(value: impl core::fmt::Display) -> VfsResult<String> {
+    let mut out = String::new();
+    // u64/i64 十进制文本最多 20 字节左右；预留固定上界，避免 write! 过程中
+    // 通过 String 自动扩容导致 procfs 目录快照 panic。
+    out.try_reserve(20).map_err(|_| VfsError::NoSpace)?;
+    write!(&mut out, "{value}").map_err(|_| VfsError::NoSpace)?;
+    Ok(out)
+}
+
+fn procfs_fallible_smallstr(value: &str) -> VfsResult<SmallStr> {
+    let bytes = value.as_bytes();
+    if bytes.len() <= 23 {
+        let mut buf = [0u8; 23];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return Ok(SmallStr::Inline {
+            len: bytes.len() as u8,
+            buf,
+        });
+    }
+    Ok(SmallStr::Heap(procfs_fallible_string(value)?))
+}
+
+fn push_proc_dir_entry(
+    out: &mut Vec<DirEntry>,
+    ino: u64,
+    name: &str,
+    kind: FileType,
+) -> VfsResult<()> {
+    out.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
+    out.push(DirEntry {
+        ino,
+        name: procfs_fallible_smallstr(name)?,
+        kind,
+    });
+    Ok(())
+}
 
 pub struct ProcFsDriver;
 
@@ -154,6 +204,8 @@ enum RootFileKind {
     Uptime,
     Stat,
     Devices,
+    Pnp,
+    DeviceFunctions,
 }
 
 #[derive(Clone, Copy)]
@@ -282,18 +334,29 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("uptime", mk_root_file(UPTIME_INO, RootFileKind::Uptime)),
         ("stat", mk_root_file(STAT_INO, RootFileKind::Stat)),
         ("devices", mk_root_file(DEVICES_INO, RootFileKind::Devices)),
+        ("pnp", mk_root_file(PNP_INO, RootFileKind::Pnp)),
+        (
+            "device-functions",
+            mk_root_file(DEVICE_FUNCTIONS_INO, RootFileKind::DeviceFunctions),
+        ),
         ("self", self_inode),
         ("thread-self", thread_self_inode),
         ("sys", sys_inode),
-        ("net", mk_inode(
-            fs_id,
-            weak_sb,
-            NET_DIR_INO,
-            FileType::Directory,
-            0o555,
-            2,
-            Arc::new(ProcNetDirOps { fs_id, weak_sb: weak_sb.clone() }),
-        )),
+        (
+            "net",
+            mk_inode(
+                fs_id,
+                weak_sb,
+                NET_DIR_INO,
+                FileType::Directory,
+                0o555,
+                2,
+                Arc::new(ProcNetDirOps {
+                    fs_id,
+                    weak_sb: weak_sb.clone(),
+                }),
+            ),
+        ),
     ];
     Inode::new(
         InodeId {
@@ -341,21 +404,21 @@ impl InodeOps for ProcRootOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        let mut snapshot: Vec<DirEntry> = self
-            .entries
-            .iter()
-            .map(|(name, inode)| DirEntry {
-                ino: inode.ino(),
-                name: SmallStr::new(name),
-                kind: inode.kind(),
-            })
-            .collect();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(self.entries.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (name, inode) in &self.entries {
+            push_proc_dir_entry(&mut snapshot, inode.ino(), name, inode.kind())?;
+        }
         for pid in snapshot_root_processes() {
-            snapshot.push(DirEntry {
-                ino: proc_task_dir_ino(pid, TaskDirView::Process),
-                name: SmallStr::new(&format!("{}", pid)),
-                kind: FileType::Directory,
-            });
+            let name = procfs_decimal_name(pid)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_task_dir_ino(pid, TaskDirView::Process),
+                &name,
+                FileType::Directory,
+            )?;
         }
         Ok(Box::new(ProcDirFile { snapshot }))
     }
@@ -426,8 +489,8 @@ struct ProcNetDirOps {
 
 impl InodeOps for ProcNetDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
-        match name {
-            "dev" => Ok(mk_inode(
+        if name == "dev" {
+            return Ok(mk_inode(
                 self.fs_id,
                 &self.weak_sb,
                 NET_DEV_INO,
@@ -435,116 +498,147 @@ impl InodeOps for ProcNetDirOps {
                 0o444,
                 1,
                 Arc::new(ProcNetDevOps),
-            )),
-            "tcp" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 1,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("tcp")),
-            )),
-            "udp" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 2,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("udp")),
-            )),
-            "route" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 3,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("route")),
-            )),
-            "unix" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 4,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("unix")),
-            )),
-            _ => Err(VfsError::NotFound),
+            ));
         }
+
+        let Some(kind) = ProcNetSnapshotKind::from_name(name) else {
+            return Err(VfsError::NotFound);
+        };
+        Ok(mk_inode(
+            self.fs_id,
+            &self.weak_sb,
+            kind.ino(),
+            FileType::Regular,
+            0o444,
+            1,
+            Arc::new(ProcNetSnapshotOps { kind }),
+        ))
     }
 
     fn open(
-        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        Ok(Box::new(ProcDirFile {
-            snapshot: vec![
-                DirEntry {
-                    ino: NET_DEV_INO,
-                    name: SmallStr::new("dev"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 1,
-                    name: SmallStr::new("tcp"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 2,
-                    name: SmallStr::new("udp"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 3,
-                    name: SmallStr::new("route"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 4,
-                    name: SmallStr::new("unix"),
-                    kind: FileType::Regular,
-                },
-            ],
-        }))
+        let mut snapshot = vec![DirEntry {
+            ino: NET_DEV_INO,
+            name: SmallStr::new("dev"),
+            kind: FileType::Regular,
+        }];
+        for kind in ProcNetSnapshotKind::ALL {
+            snapshot.push(DirEntry {
+                ino: kind.ino(),
+                name: SmallStr::new(kind.name()),
+                kind: FileType::Regular,
+            });
+        }
+        Ok(Box::new(ProcDirFile { snapshot }))
     }
 
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
-struct ProcNetStubOps(&'static str);
+/// `/proc/net` 中由内核快照动态渲染的兼容文件。
+///
+/// 文件名和 inode 偏移集中在这里维护，避免 lookup 与 readdir 各自重复维护一份
+/// 列表。渲染逻辑只读取 `net`/`socket` 层公开快照，不把 procfs 的文本 ABI
+/// 反向泄入底层设备抽象。
+#[derive(Clone, Copy)]
+enum ProcNetSnapshotKind {
+    Tcp,
+    Udp,
+    Route,
+    Unix,
+    Arp,
+    Sockstat,
+}
 
-impl InodeOps for ProcNetStubOps {
+impl ProcNetSnapshotKind {
+    const ALL: [Self; 6] = [
+        Self::Tcp,
+        Self::Udp,
+        Self::Route,
+        Self::Unix,
+        Self::Arp,
+        Self::Sockstat,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Route => "route",
+            Self::Unix => "unix",
+            Self::Arp => "arp",
+            Self::Sockstat => "sockstat",
+        }
+    }
+
+    const fn ino(self) -> u64 {
+        NET_DEV_INO
+            + match self {
+                Self::Tcp => 1,
+                Self::Udp => 2,
+                Self::Route => 3,
+                Self::Unix => 4,
+                Self::Arp => 5,
+                Self::Sockstat => 6,
+            }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.name() == name)
+    }
+
+    fn render(self) -> String {
+        match self {
+            Self::Tcp => render_proc_net_tcp(),
+            Self::Udp => render_proc_net_udp(),
+            Self::Route => render_proc_net_route(),
+            Self::Unix => render_proc_net_unix(),
+            Self::Arp => render_proc_net_arp(),
+            Self::Sockstat => render_proc_net_sockstat(),
+        }
+    }
+}
+
+struct ProcNetSnapshotOps {
+    kind: ProcNetSnapshotKind,
+}
+
+impl InodeOps for ProcNetSnapshotOps {
     fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
         Err(VfsError::NotADirectory)
     }
     fn open(
-        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        // TODO: 实现 /proc/net/{tcp,udp,route,unix} 的真实内容
-        Ok(Box::new(ProcNetStubFile(self.0)))
+        Ok(Box::new(ProcNetSnapshotFile { kind: self.kind }))
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
-struct ProcNetStubFile(&'static str);
+struct ProcNetSnapshotFile {
+    kind: ProcNetSnapshotKind,
+}
 
-impl FileOps for ProcNetStubFile {
+impl FileOps for ProcNetSnapshotFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let content = match self.0 {
-            "tcp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
-            "udp" => "  sl  local_address rem_address   st tx_queue rx_queue\n".into(),
-            "route" => render_proc_net_route(),
-            "unix" => "Num       RefCount Protocol Flags    Type St Inode Path\n".into(),
-            _ => String::new(),
-        };
+        let content = self.kind.render();
         let offset = offset as usize;
         if offset >= content.len() {
             return Ok(0);
@@ -556,33 +650,46 @@ impl FileOps for ProcNetStubFile {
     fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
         Err(VfsError::PermissionDenied)
     }
-    fn readdir(
-        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn render_proc_net_route() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT");
+    let _ = writeln!(
+        out,
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT"
+    );
     let ifaces = net::stack().snapshot_interfaces();
     for iface in &ifaces {
         // 每个配置的 CIDR 地址生成一条 connected route
         for cidr in &iface.addresses {
             if let net::config::IpAddr::V4(v4) = cidr.addr {
                 let prefix = cidr.prefix_len.min(32);
-                let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+                let mask: u32 = if prefix == 0 {
+                    0
+                } else {
+                    !0u32 << (32 - prefix)
+                };
                 let dst = u32::from_be_bytes(v4.0) & mask;
                 let _ = writeln!(
                     out,
                     "{}\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0",
-                    iface.name, dst.to_be(), mask.to_be()
+                    iface.name,
+                    dst.to_be(),
+                    mask.to_be()
                 );
             }
         }
@@ -596,11 +703,221 @@ fn render_proc_net_route() -> String {
                 let _ = writeln!(
                     out,
                     "{}\t00000000\t{:08X}\t0003\t0\t0\t0\t00000000\t0\t0\t0",
-                    iface.name, gw_ip.to_be()
+                    iface.name,
+                    gw_ip.to_be()
                 );
             }
         }
     }
+    out
+}
+
+fn render_proc_net_tcp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    let connections = net::stack().snapshot_tcp_connections();
+    let mut slot: u64 = 0;
+    for (_iface_id, conns) in &connections {
+        for c in conns {
+            let local_hex = endpoint_to_hex(&c.local);
+            let remote_hex = endpoint_to_hex(&c.remote);
+            let _ = writeln!(
+                out,
+                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
+                slot,
+                local_hex,
+                remote_hex,
+                c.state,
+                c.tx_queue,
+                c.rx_queue,
+                0u8,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                c.inode,
+            );
+            slot += 1;
+        }
+    }
+    out
+}
+
+fn render_proc_net_udp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+    );
+    let sockets = net::stack().snapshot_udp_sockets();
+    let mut slot: u64 = 0;
+    for (_iface_id, socks) in &sockets {
+        for s in socks {
+            let local_hex = endpoint_to_hex(&s.local);
+            let remote_hex = match &s.remote {
+                Some(ep) => endpoint_to_hex(ep),
+                None => "00000000:0000".into(),
+            };
+            let _ = writeln!(
+                out,
+                "{:>4}: {:>17} {:>17} {:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:>5} {:>8} {:>8}",
+                slot,
+                local_hex,
+                remote_hex,
+                7u8, // ESTABLISHED
+                0usize,
+                0usize,
+                0u8,
+                0u32,
+                0u32,
+                0u32,
+                0u32,
+                s.inode,
+            );
+            slot += 1;
+        }
+    }
+    out
+}
+
+fn endpoint_to_hex(ep: &net::Endpoint) -> alloc::string::String {
+    use alloc::fmt::Write;
+    let mut s = alloc::string::String::new();
+    match ep.addr {
+        net::IpAddr::V4(v4) => {
+            let ip = u32::from_be_bytes(v4.0);
+            let _ = write!(s, "{:08X}:{:04X}", ip, ep.port);
+        }
+        net::IpAddr::V6(_v6) => {
+            let _ = write!(s, "00000000000000000000000000000000:{:04X}", ep.port);
+        }
+    }
+    s
+}
+
+fn render_proc_net_unix() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Num       RefCount Protocol Flags    Type St Inode Path"
+    );
+    let sockets = socket::snapshot_sockets();
+    for s in &sockets {
+        let (typ, state) = unix_socket_info(s);
+        let path = match s.local_address() {
+            socket::UnixAddress::Path { display, .. } => {
+                core::str::from_utf8(&display).unwrap_or("").to_string()
+            }
+            socket::UnixAddress::Abstract(name) => {
+                let mut s = String::with_capacity(name.len() + 1);
+                s.push('@');
+                if let Ok(text) = core::str::from_utf8(&name) {
+                    s.push_str(text);
+                }
+                s
+            }
+            _ => String::new(),
+        };
+        let _ = writeln!(
+            out,
+            "{:016X}: {:08X} {:08X} {:08X} {:04X} {:02X} {:>8} {}",
+            s.id(),
+            2u32, // RefCount (至少 1: fd 引用 + snapshot 临时引用)
+            0u32, // Protocol
+            0u32, // Flags
+            typ,
+            state,
+            s.id(),
+            path,
+        );
+    }
+    out
+}
+
+fn unix_socket_info(s: &socket::Socket) -> (u16, u8) {
+    let typ = match s.socket_type() {
+        socket::SocketType::Stream => 1u16,
+        socket::SocketType::Datagram => 2u16,
+        socket::SocketType::Sequenced => 5u16,
+        _ => 0u16,
+    };
+    // 近似状态：通过 socket 是否可读写判断
+    let readiness = s.readiness();
+    let state = if readiness.bits() == 0 { 1u8 } else { 3u8 }; // SS_UNCONNECTED or SS_CONNECTED
+    (typ, state)
+}
+
+fn render_proc_net_arp() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "IP address       HW type     Flags       HW address            Mask     Device"
+    );
+    let neighbors = net::stack().all_neighbors();
+    for (iface_id, entries) in &neighbors {
+        let iface_name = net::stack()
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|i| i.id == *iface_id)
+            .map(|i| i.name)
+            .unwrap_or_else(|| alloc::string::String::from("?"));
+        for entry in entries {
+            let ip_str = match entry.ip_addr {
+                net::IpAddr::V4(v4) => {
+                    let mut s = alloc::string::String::new();
+                    let _ = write!(s, "{}.{}.{}.{}", v4.0[0], v4.0[1], v4.0[2], v4.0[3]);
+                    s
+                }
+                net::IpAddr::V6(_) => alloc::string::String::from("::1"),
+            };
+            let _ = writeln!(
+                out,
+                "{:<16} 0x1         0x2         {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}     *        {}",
+                ip_str,
+                entry.hw_addr[0],
+                entry.hw_addr[1],
+                entry.hw_addr[2],
+                entry.hw_addr[3],
+                entry.hw_addr[4],
+                entry.hw_addr[5],
+                iface_name,
+            );
+        }
+    }
+    out
+}
+
+fn render_proc_net_sockstat() -> String {
+    use alloc::fmt::Write;
+    let mut out = String::new();
+    let tcp_total: usize = net::stack()
+        .snapshot_tcp_connections()
+        .iter()
+        .map(|(_, v)| v.len())
+        .sum();
+    let udp_total: usize = net::stack()
+        .snapshot_udp_sockets()
+        .iter()
+        .map(|(_, v)| v.len())
+        .sum();
+    let unix_total = socket::snapshot_sockets().len();
+    let total = tcp_total + udp_total + unix_total;
+    let _ = writeln!(out, "sockets: used {}", total);
+    let _ = writeln!(
+        out,
+        "TCP: inuse {} orphan 0 tw 0 alloc {} mem 0",
+        tcp_total, tcp_total
+    );
+    let _ = writeln!(out, "UDP: inuse {} mem 0", udp_total);
+    let _ = writeln!(out, "RAW: inuse 0");
+    let _ = writeln!(out, "FRAG: inuse 0 memory 0");
     out
 }
 
@@ -611,14 +928,19 @@ impl InodeOps for ProcNetDevOps {
         Err(VfsError::NotADirectory)
     }
     fn open(
-        &self, _: &Inode, _: &OpenOptions, _: &Credentials,
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcNetDevFile))
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
     }
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 struct ProcNetDevFile;
@@ -637,22 +959,32 @@ impl FileOps for ProcNetDevFile {
     fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
         Err(VfsError::PermissionDenied)
     }
-    fn readdir(
-        &self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
+    fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
         Err(VfsError::NotADirectory)
     }
-    fn sync(&self) -> VfsResult<()> { Ok(()) }
-    fn poll(&self, _: PollEvents) -> PollEvents { PollEvents(0) }
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+    fn poll(&self, _: PollEvents) -> PollEvents {
+        PollEvents(0)
+    }
     fn release(&self) {}
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 fn render_proc_net_dev() -> String {
     use alloc::fmt::Write;
     let mut out = String::new();
-    let _ = writeln!(out, "Inter-|   Receive                                                |  Transmit");
-    let _ = writeln!(out, " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed");
+    let _ = writeln!(
+        out,
+        "Inter-|   Receive                                                |  Transmit"
+    );
+    let _ = writeln!(
+        out,
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed"
+    );
     let ifaces = net::stack().snapshot_interfaces();
     for iface in &ifaces {
         let s = &iface.stats;
@@ -660,8 +992,22 @@ fn render_proc_net_dev() -> String {
             out,
             "{:>6}:{:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>10} {:>9} {:>8} {:>7} {:>4} {:>4} {:>4} {:>5} {:>7} {:>10}",
             iface.name,
-            s.rx_bytes, s.rx_packets, s.rx_errors, s.rx_dropped, 0, 0, 0, 0,
-            s.tx_bytes, s.tx_packets, s.tx_errors, s.tx_dropped, 0, 0, 0, 0
+            s.rx_bytes,
+            s.rx_packets,
+            s.rx_errors,
+            s.rx_dropped,
+            0,
+            0,
+            0,
+            0,
+            s.tx_bytes,
+            s.tx_packets,
+            s.tx_errors,
+            s.tx_dropped,
+            0,
+            0,
+            0,
+            0
         );
     }
     out
@@ -1104,14 +1450,19 @@ impl InodeOps for ProcTaskListDirOps {
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         let mut tids = snapshot_thread_ids(self.leader_pid)?;
         tids.sort_unstable();
-        let snapshot = tids
-            .into_iter()
-            .map(|tid| DirEntry {
-                ino: proc_task_dir_ino(tid, TaskDirView::Thread),
-                name: SmallStr::new(&format!("{}", tid)),
-                kind: FileType::Directory,
-            })
-            .collect();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(tids.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for tid in tids {
+            let name = procfs_decimal_name(tid)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_task_dir_ino(tid, TaskDirView::Thread),
+                &name,
+                FileType::Directory,
+            )?;
+        }
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
@@ -1152,14 +1503,19 @@ impl InodeOps for ProcFdDirOps {
         let fdt = task_fdtable(&task).ok_or(VfsError::NotFound)?;
         let mut fds = fdt.snapshot_fds();
         fds.sort_unstable_by_key(|(fd, _)| *fd);
-        let snapshot = fds
-            .into_iter()
-            .map(|(fd, _)| DirEntry {
-                ino: proc_fd_link_ino(self.pid, fd),
-                name: SmallStr::new(&format!("{}", fd)),
-                kind: FileType::Symlink,
-            })
-            .collect();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(fds.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (fd, _) in fds {
+            let name = procfs_decimal_name(fd)?;
+            push_proc_dir_entry(
+                &mut snapshot,
+                proc_fd_link_ino(self.pid, fd),
+                &name,
+                FileType::Symlink,
+            )?;
+        }
         Ok(Box::new(ProcDirFile { snapshot }))
     }
 
@@ -1374,6 +1730,8 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::Uptime => render_uptime().into_bytes(),
             RootFileKind::Stat => render_stat().into_bytes(),
             RootFileKind::Devices => render_devices().into_bytes(),
+            RootFileKind::Pnp => render_pnp().into_bytes(),
+            RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
         }),
         ProcFileKind::Task { pid, kind } => {
             let task = lookup_task(pid).ok_or(VfsError::NotFound)?;
@@ -1540,12 +1898,6 @@ fn task_cwd_path(task: &Arc<Task>) -> VfsResult<String> {
     Ok(cwd)
 }
 
-fn basename(path: &str) -> &str {
-    path.rsplit('/')
-        .find(|part| !part.is_empty())
-        .unwrap_or(path)
-}
-
 fn fd_target_path(task: &Arc<Task>, file: &Arc<File>) -> String {
     if let Some(ctx) = task_vfs_context(task) {
         if let Some(path) = namespace_path(&ctx, file.dentry(), file.mount()) {
@@ -1704,8 +2056,9 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let num_threads = task_thread_count(task);
     let (vsize, rss_bytes) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
-    // TODO: 填充真实的 tty_nr, minflt, cminflt, majflt, cmajflt, utime, stime,
-    //       cutime, cstime, priority, nice, starttime, signal, blocked, sigignore, sigcatch 等字段
+    // 这里按当前 Task 模型已经可观测的字段生成 Linux 兼容 stat。fault 计数、
+    // 累积 CPU 时间、信号掩码等尚未进入 sched/mm 的公共快照接口，因此兼容字段
+    // 保持 0，避免在 procfs 层伪造无法证明的数据。
     format!(
         "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid, comm, state, ppid, pgrp, session, num_threads, vsize, rss_pages,
@@ -1737,15 +2090,9 @@ fn render_task_environ(task: &Arc<Task>) -> Vec<u8> {
 }
 
 fn render_task_comm(task: &Arc<Task>) -> String {
-    if let Some(args) = task_exec_args(task)
-        && let Some(argv0) = args.first()
-        && !argv0.is_empty()
-    {
-        return format!("{}\n", basename(argv0));
-    }
-    let name = task_exec_path(task)
-        .map(|path| basename(&path).to_string())
-        .unwrap_or_else(|_| String::from("unknown"));
+    let comm = task.comm();
+    let len = comm.iter().position(|b| *b == 0).unwrap_or(comm.len());
+    let name = core::str::from_utf8(&comm[..len]).unwrap_or("unknown");
     format!("{}\n", name)
 }
 
@@ -1845,41 +2192,83 @@ fn render_version() -> String {
     format!("MyGo kernel version 0.1.0 (loongarch64)\n")
 }
 
-// TODO: 从硬件读取真实 CPU 特征标志、BogoMIPS、cache 信息等
+fn cpuinfo_model_from_compatible(compatible: &str) -> &str {
+    compatible
+        .split_once(',')
+        .map(|(_, model)| model)
+        .unwrap_or(compatible)
+}
+
+fn cpuinfo_vendor_from_compatible(compatible: &str) -> &str {
+    compatible
+        .split_once(',')
+        .map(|(vendor, _)| vendor)
+        .unwrap_or("unknown")
+}
+
+fn cpuinfo_family_from_compatible(compatible: &str) -> &str {
+    let vendor = cpuinfo_vendor_from_compatible(compatible);
+    if vendor.eq_ignore_ascii_case("loongarch") {
+        "LoongArch"
+    } else {
+        vendor
+    }
+}
+
+fn render_cpuinfo_entry(out: &mut String, cpu_id: usize, compatible: Option<&str>) {
+    let vendor = compatible
+        .map(cpuinfo_vendor_from_compatible)
+        .unwrap_or("unknown");
+    let family = compatible
+        .map(cpuinfo_family_from_compatible)
+        .unwrap_or("unknown");
+    let model = compatible
+        .map(cpuinfo_model_from_compatible)
+        .unwrap_or("unknown");
+    let isa = compatible
+        .and_then(|text| text.split_once(',').map(|(isa, _)| isa))
+        .unwrap_or("unknown");
+
+    // BogoMIPS 需要架构层提供定标后的循环/延迟校准值。当前公共 CPU 拓扑只包含
+    // 固件身份，因此该兼容字段明确报告 0.00，而不是伪造固定性能数字。
+    let _ = write!(
+        out,
+        "processor\t: {cpu_id}\n\
+         vendor_id\t: {vendor}\n\
+         cpu family\t: {family}\n\
+         model name\t: {model}\n\
+         CPU architecture\t: {isa}\n\
+         isa\t\t: {isa}\n\
+         fpu\t\t: unknown\n\
+         BogoMIPS\t: 0.00\n\n"
+    );
+}
+
 fn render_cpuinfo() -> String {
     let mut out = String::new();
     let mut online_mask = sched::online_cpu_mask();
     if online_mask == 0 {
         online_mask = 1;
     }
+    let topology = crate::dev::cpu::snapshot_topology();
     for cpu_id in 0..sched::NR_CPUS {
         if (online_mask & (1u64 << cpu_id)) == 0 || !sched::is_cpu_online(cpu_id) {
             continue;
         }
-        let _ = write!(
-            out,
-            "processor\t: {cpu_id}\n\
-             vendor_id\t: MyGo\n\
-             cpu family\t: LoongArch\n\
-             model name\t: LoongArch64 Virtual CPU\n\
-             CPU architecture\t: loongarch64\n\
-             isa\t\t: loongarch64\n\
-             fpu\t\t: yes\n\
-             BogoMIPS\t: 100.00\n\n"
-        );
+        let compatible = topology
+            .iter()
+            .find(|entry| entry.logical_id as usize == cpu_id)
+            .and_then(|entry| entry.compatible.first())
+            .map(|text| text.as_ref());
+        render_cpuinfo_entry(&mut out, cpu_id, compatible);
     }
     if out.is_empty() {
-        let _ = write!(
-            out,
-            "processor\t: 0\n\
-             vendor_id\t: MyGo\n\
-             cpu family\t: LoongArch\n\
-             model name\t: LoongArch64 Virtual CPU\n\
-             CPU architecture\t: loongarch64\n\
-             isa\t\t: loongarch64\n\
-             fpu\t\t: yes\n\
-             BogoMIPS\t: 100.00\n\n"
-        );
+        let compatible = topology
+            .iter()
+            .find(|entry| entry.logical_id == 0)
+            .and_then(|entry| entry.compatible.first())
+            .map(|text| text.as_ref());
+        render_cpuinfo_entry(&mut out, 0, compatible);
     }
     out
 }
@@ -1887,6 +2276,16 @@ fn render_cpuinfo() -> String {
 fn render_meminfo() -> String {
     let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
     let kb = |bytes: usize| -> usize { bytes / 1024 };
+    // 下列兼容字段需要独立的块缓存、页缓存、swap、内核栈和页表统计源。当前内核
+    // 尚未把这些子系统聚合到公共 memory snapshot，procfs 只报告 allocator 能
+    // 证明的项目，其余兼容字段保持 0。
+    let buffers_kb = 0usize;
+    let cached_kb = 0usize;
+    let swap_cached_kb = 0usize;
+    let kernel_stack_kb = 0usize;
+    let page_tables_kb = 0usize;
+    let swap_total_kb = 0usize;
+    let swap_free_kb = 0usize;
     format!(
         "MemTotal:       {:>8} kB\n\
          MemFree:        {:>8} kB\n\
@@ -1912,17 +2311,17 @@ fn render_meminfo() -> String {
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(overview.free_physical),
-        0usize,                        // TODO: 实现 Buffers（块设备缓冲区统计）
-        0usize,                        // TODO: 实现 Cached（页缓存统计）
-        0usize,                        // TODO: 实现 SwapCached
+        buffers_kb,
+        cached_kb,
+        swap_cached_kb,
         kb(overview.kernel_heap_used), // Slab: 暂用 kernel heap 近似
-        0usize,                        // TODO: 实现 KernelStack（内核栈统计）
-        0usize,                        // TODO: 实现 PageTables（页表统计）
+        kernel_stack_kb,
+        page_tables_kb,
         kb(overview.kernel_vmem_total),
         kb(overview.kernel_vmem_allocated),
         kb(overview.kernel_vmem_free),
-        0usize, // TODO: 实现 SwapTotal
-        0usize, // TODO: 实现 SwapFree
+        swap_total_kb,
+        swap_free_kb,
         kb(overview.direct_map_total),
         kb(overview.direct_map_allocated),
         kb(overview.direct_map_free),
@@ -1936,7 +2335,8 @@ fn render_meminfo() -> String {
 fn render_uptime() -> String {
     let ns = sched::now_ns_public();
     let secs = ns / 1_000_000_000;
-    // TODO: 第二个字段是 idle 时间，需要从调度器读取累计 idle 累积值
+    // 第二个字段是累计 idle 时间。调度器尚未导出 per-CPU idle accounting，
+    // 因此只报告可证明的系统运行时间，idle 兼容字段保持 0。
     format!(
         "{}.{:02} {}.{:02}\n",
         secs,
@@ -1968,8 +2368,8 @@ fn render_stat() -> String {
             }
         }
     }
-    // TODO: 实现 cpu jiffies 统计（user/nice/system/idle/iowait/irq/softirq/steal/guest/guest_nice）
-    //       以及 intr、ctxt、btime；当前所有字段为 0
+    // 当前 sched 公共接口还没有导出 CPU jiffies、上下文切换、启动时间和中断计数。
+    // 这里保留字段形状并只填入可观测的进程数量，避免让兼容层反向依赖内部实现。
     format!(
         "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n\
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
@@ -1978,14 +2378,297 @@ fn render_stat() -> String {
 }
 
 fn render_devices() -> String {
-    // TODO: 当前所有 char/block 设备硬编码 major=254，需要从设备注册表中读取真实主设备号
-    let mut out = String::from("Character devices:\n");
-    for dev in active_char_devices(&crate::dev::enumerate::DEVICES.functions) {
-        out.push_str(&format!("  254 {}\n", dev.fw_name()));
+    // /proc/devices 只导出 POSIX 兼容投影的 major 汇总，不表示底层设备模型的寻址入口。
+    // major 名称来自 VFS 兼容层注册的 device number policy；procfs 只消费汇总快照，
+    // 不读取底层设备对象，也不参与设备号分配。
+    let mut out = String::new();
+    if out.try_reserve("Character devices:\n".len()).is_err() {
+        return out;
+    }
+    out.push_str("Character devices:\n");
+    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Char) {
+        write_major_summaries(&mut out, &summaries);
+    }
+    if out.try_reserve("\nBlock devices:\n".len()).is_err() {
+        return out;
     }
     out.push_str("\nBlock devices:\n");
-    for dev in active_block_devices(&crate::dev::enumerate::DEVICES.functions) {
-        out.push_str(&format!("  254 {}\n", dev.name()));
+    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Block) {
+        write_major_summaries(&mut out, &summaries);
+    }
+    out
+}
+
+fn write_major_summaries(out: &mut String, summaries: &[device_numbers::PosixMajorSummary]) {
+    for summary in summaries {
+        // 设备诊断文本不能因为临时格式化缓冲分配失败而影响设备注册表本身。
+        // 预留本行空间后再写入，避免为每一行创建额外 String。
+        let line_reserve = summary.display_name.len().saturating_add(16);
+        if out.try_reserve(line_reserve).is_err() {
+            return;
+        }
+        let _ = writeln!(out, "  {} {}", summary.major, summary.display_name);
+    }
+}
+
+fn proc_custom_devnode_kind_name(kind: CustomDevNodeKind) -> &'static str {
+    match kind {
+        CustomDevNodeKind::CharDevice => "custom-char",
+        CustomDevNodeKind::BlockDevice => "custom-block",
+        CustomDevNodeKind::RegularFile => "custom-file",
+        CustomDevNodeKind::Directory => "custom-dir",
+    }
+}
+
+fn proc_devnode_render_len(node: &DevNodeSpec) -> usize {
+    match node {
+        DevNodeSpec::Char { name, .. } => "char:".len() + name.len(),
+        DevNodeSpec::Block { name, .. } => "block:".len() + name.len(),
+        DevNodeSpec::Symlink { name, target } => {
+            "symlink:".len() + name.len() + "->".len() + target.len()
+        }
+        DevNodeSpec::Custom(spec) => {
+            proc_custom_devnode_kind_name(spec.kind()).len() + 1 + spec.name().len()
+        }
+    }
+}
+
+fn write_proc_devnode_name(out: &mut String, node: &DevNodeSpec) {
+    match node {
+        DevNodeSpec::Char { name, .. } => {
+            let _ = write!(out, "char:{name}");
+        }
+        DevNodeSpec::Block { name, .. } => {
+            let _ = write!(out, "block:{name}");
+        }
+        DevNodeSpec::Symlink { name, target } => {
+            let _ = write!(out, "symlink:{name}->{target}");
+        }
+        DevNodeSpec::Custom(spec) => {
+            let _ = write!(
+                out,
+                "{}:{}",
+                proc_custom_devnode_kind_name(spec.kind()),
+                spec.name()
+            );
+        }
+    }
+}
+
+fn render_device_functions() -> String {
+    // `/proc/device-functions` 是 dev core function registry 的调试快照。
+    // 它只展示 class/name 与 devtmpfs 投影声明，不能作为设备打开或寻址入口；
+    // 用户态访问路径仍由 `/dev`、`/sys` 和对应 syscall 兼容层决定。
+    // FIXME(procfs-dev): 这个诊断视图仍直接理解 `DevNodeSpec`，说明 dev core 的
+    // `/dev` 投影声明泄漏到了 procfs。后续应改为读取 projection 层生成的
+    // 只读快照，procfs 不再格式化底层 function 的 devtmpfs 节点细节。
+    let mut out = String::new();
+    if out.try_reserve("class\tname\tdevnodes\n".len()).is_err() {
+        return out;
+    }
+    out.push_str("class\tname\tdevnodes\n");
+    for func in DEVICES.functions.try_list().unwrap_or_default() {
+        let nodes = func.devnodes();
+        let devnode_len = nodes
+            .as_ref()
+            .map(|nodes| {
+                let names_len = nodes
+                    .nodes()
+                    .iter()
+                    .map(proc_devnode_render_len)
+                    .sum::<usize>();
+                names_len.saturating_add(nodes.nodes().len().saturating_sub(1))
+            })
+            .filter(|len| *len > 0)
+            .unwrap_or(1);
+        let line_reserve = func
+            .class_id()
+            .as_str()
+            .len()
+            .saturating_add(func.dev_name().len())
+            .saturating_add(devnode_len)
+            .saturating_add(3);
+        if out.try_reserve(line_reserve).is_err() {
+            return out;
+        }
+        let _ = write!(out, "{}\t{}\t", func.class_id().as_str(), func.dev_name(),);
+        if let Some(nodes) = nodes.filter(|nodes| !nodes.nodes().is_empty()) {
+            for (idx, node) in nodes.nodes().iter().enumerate() {
+                if idx != 0 {
+                    out.push(',');
+                }
+                write_proc_devnode_name(&mut out, node);
+            }
+        } else {
+            out.push('-');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn proc_pnp_state_name(state: PnpState) -> &'static str {
+    match state {
+        PnpState::Discovered => "discovered",
+        PnpState::Probing => "probing",
+        PnpState::Bound => "bound",
+        PnpState::Removing => "removing",
+        PnpState::Gone => "gone",
+    }
+}
+
+fn proc_pnp_resource_kind_name(kind: PnpResourceKind) -> &'static str {
+    match kind {
+        PnpResourceKind::Mmio => "mmio",
+        PnpResourceKind::Irq => "irq",
+        PnpResourceKind::IrqDomain => "irq-domain",
+        PnpResourceKind::Msi => "msi",
+        PnpResourceKind::MsiController => "msi-controller",
+        PnpResourceKind::Syscon => "syscon",
+        PnpResourceKind::Flash => "flash",
+        PnpResourceKind::FwCfg => "fwcfg",
+        PnpResourceKind::FirmwareBus => "firmware-bus",
+        PnpResourceKind::PciHostBridge => "pci-host-bridge",
+        PnpResourceKind::Dma => "dma",
+        PnpResourceKind::Function => "function",
+        PnpResourceKind::Other(name) => name,
+    }
+}
+
+fn proc_pnp_dependency_render_len(dependency: PnpDependency) -> usize {
+    match dependency {
+        PnpDependency::IrqController(_) => "irq-controller:".len() + 10,
+        PnpDependency::DefaultIrqDomain => "default-irq-domain".len(),
+        PnpDependency::MsiController(_) => "msi-controller:".len() + 10,
+        PnpDependency::Syscon(_) => "syscon:".len() + 10,
+        PnpDependency::FwCfg => "fwcfg".len(),
+        PnpDependency::FirmwareBus => "firmware-bus".len(),
+        PnpDependency::PciHostBridge(_) => "pci-host-bridge:".len() + 5,
+        PnpDependency::Dma => "dma".len(),
+        PnpDependency::Other(name) => name.len(),
+    }
+}
+
+fn proc_pnp_id_render_len(id: &PnpId) -> usize {
+    match id {
+        PnpId::Pci { .. } => "pci:0000:00:00.".len() + 3,
+        PnpId::Usb { interface, .. } => {
+            let base = "usb:".len() + 3 + 1 + 3;
+            if interface.is_some() {
+                base + 1 + 3
+            } else {
+                base
+            }
+        }
+        PnpId::Platform { name, identity } => {
+            if let Some(path) = identity.firmware_path() {
+                "platform:".len() + name.len() + 1 + path.len()
+            } else {
+                // 无固件路径时 Display 只输出 match/resource 计数；这里按最大十进制
+                // 位数预留，避免诊断输出为了设备 id 再次扩容。
+                "platform:".len() + name.len() + "[ids=,resources=]".len() + 20
+            }
+        }
+    }
+}
+
+fn write_proc_pnp_dependency(out: &mut String, dependency: PnpDependency) {
+    match dependency {
+        PnpDependency::IrqController(id) => {
+            let _ = write!(out, "irq-controller:{id}");
+        }
+        PnpDependency::DefaultIrqDomain => out.push_str("default-irq-domain"),
+        PnpDependency::MsiController(id) => {
+            let _ = write!(out, "msi-controller:{id}");
+        }
+        PnpDependency::Syscon(id) => {
+            let _ = write!(out, "syscon:{id}");
+        }
+        PnpDependency::FwCfg => out.push_str("fwcfg"),
+        PnpDependency::FirmwareBus => out.push_str("firmware-bus"),
+        PnpDependency::PciHostBridge(domain) => {
+            let _ = write!(out, "pci-host-bridge:{domain}");
+        }
+        PnpDependency::Dma => out.push_str("dma"),
+        PnpDependency::Other(name) => out.push_str(name),
+    }
+}
+
+fn render_pnp() -> String {
+    // `/proc/pnp` 是面向诊断的 dev core 快照；设备寻址和层级关系以 sysfs 为准。
+    // TODO(procfs-dev): 字段 schema 和 resource/dependency 文本仍由 procfs 手写。
+    // 后续应由 dev core 暴露稳定的诊断 snapshot/formatter，procfs 只负责输出，
+    // 避免每新增资源类型都同步修改多个虚拟文件系统。
+    let header = "bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n";
+    let mut out = String::new();
+    if out.try_reserve(header.len()).is_err() {
+        return out;
+    }
+    out.push_str(header);
+    for dev in PNP_DEVICES.try_list().unwrap_or_default() {
+        let functions = dev.try_functions().unwrap_or_default();
+        let resources = dev.try_owned_resources().unwrap_or_default();
+        let deferred = dev.deferred_dependency();
+        let driver = dev.bound_driver_name().unwrap_or("-");
+        // 诊断输出按设备逐行预留，避免构造 function/resource 的中间字符串列表。
+        let functions_len = functions
+            .iter()
+            .map(|func| func.class_id().as_str().len() + 1 + func.dev_name().len())
+            .sum::<usize>()
+            .saturating_add(functions.len().saturating_sub(1));
+        let resources_len = resources
+            .iter()
+            .map(|resource| {
+                proc_pnp_resource_kind_name(resource.kind).len() + 1 + resource.label.len()
+            })
+            .sum::<usize>()
+            .saturating_add(resources.len().saturating_sub(1));
+        let deferred_len = deferred.map(proc_pnp_dependency_render_len).unwrap_or(0);
+        let line_reserve = dev
+            .name
+            .len()
+            .saturating_add(proc_pnp_id_render_len(&dev.id))
+            .saturating_add(dev.info.bus_type().as_str().len())
+            .saturating_add(driver.len())
+            .saturating_add(functions_len)
+            .saturating_add(resources_len)
+            .saturating_add(deferred_len)
+            .saturating_add(128);
+        if out.try_reserve(line_reserve).is_err() {
+            return out;
+        }
+        let _ = write!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t",
+            dev.info.bus_type().as_str(),
+            dev.id,
+            dev.name,
+            proc_pnp_state_name(dev.state()),
+            driver,
+        );
+        for (idx, func) in functions.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{}:{}", func.class_id().as_str(), func.dev_name());
+        }
+        out.push('\t');
+        for (idx, resource) in resources.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{}:{}",
+                proc_pnp_resource_kind_name(resource.kind),
+                resource.label
+            );
+        }
+        out.push('\t');
+        if let Some(dependency) = deferred {
+            write_proc_pnp_dependency(&mut out, dependency);
+        }
+        out.push('\n');
     }
     out
 }

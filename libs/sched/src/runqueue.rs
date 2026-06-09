@@ -70,10 +70,28 @@ impl DeadlineKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DeadlineThrottleKey {
+    replenish_ns: u64,
+    seq: u64,
+    addr: usize,
+}
+
+impl DeadlineThrottleKey {
+    fn of(task: &Arc<Task>, seq: u64) -> Self {
+        Self {
+            replenish_ns: task.sched.deadline_replenish_ns(),
+            seq,
+            addr: task_addr(task),
+        }
+    }
+}
+
 struct RqInner {
     fair_tree: BTreeMap<FairKey, Arc<Task>>,
     rt_tree: BTreeMap<RtKey, Arc<Task>>,
     deadline_tree: BTreeMap<DeadlineKey, Arc<Task>>,
+    deadline_throttled: BTreeMap<DeadlineThrottleKey, Arc<Task>>,
     idle_tree: BTreeMap<RtKey, Arc<Task>>,
     total_weight: u128,
     weighted_vruntime_sum: u128,
@@ -95,6 +113,7 @@ impl Runqueue {
                 fair_tree: BTreeMap::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
+                deadline_throttled: BTreeMap::new(),
                 idle_tree: BTreeMap::new(),
                 total_weight: 0,
                 weighted_vruntime_sum: 0,
@@ -120,6 +139,7 @@ impl Runqueue {
         inner.fair_tree.len()
             + inner.rt_tree.len()
             + inner.deadline_tree.len()
+            + inner.deadline_throttled.len()
             + inner.idle_tree.len()
             + usize::from(inner.current.is_some())
     }
@@ -138,7 +158,7 @@ impl Runqueue {
         if task.sched.on_rq() {
             return;
         }
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
         enqueue_queued_locked(&mut inner, task, now_ns);
@@ -146,32 +166,50 @@ impl Runqueue {
 
     pub fn dequeue(&self, task: &Arc<Task>, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
         dequeue_locked(&mut inner, task)
+    }
+
+    pub fn dequeue_queued(&self, task: &Arc<Task>, now_ns: u64) -> bool {
+        let mut inner = self.inner.lock();
+        let _ = update_curr_locked(&mut inner, now_ns);
+        remove_queued_any_locked(&mut inner, task).is_some()
+    }
+
+    pub fn is_current(&self, task: &Arc<Task>) -> bool {
+        self.inner
+            .lock()
+            .current
+            .as_ref()
+            .is_some_and(|curr| Arc::ptr_eq(curr, task))
     }
 
     pub fn tick(&self, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let replenished = update_curr_locked(&mut inner, now_ns);
         let Some(curr) = inner.current.as_ref() else {
-            return false;
+            return replenished;
         };
-        match curr.sched.policy() {
-            SchedPolicy::Deadline => {
-                curr.sched.deadline_budget_ns() == 0 || now_ns > curr.sched.absolute_deadline_ns()
+        replenished
+            || match curr.sched.policy() {
+                SchedPolicy::Deadline => {
+                    curr.sched.deadline_budget_ns() == 0
+                        || now_ns > curr.sched.absolute_deadline_ns()
+                }
+                SchedPolicy::RtRoundRobin => {
+                    curr.sched.rr_remaining_ns() == 0
+                        && has_rt_peer_locked(&inner, curr.sched.rt_priority())
+                }
+                SchedPolicy::RtFifo => false,
+                SchedPolicy::Fair | SchedPolicy::Idle => {
+                    curr.sched.vruntime() >= curr.sched.deadline()
+                }
             }
-            SchedPolicy::RtRoundRobin => {
-                curr.sched.rr_remaining_ns() == 0
-                    && has_rt_peer_locked(&inner, curr.sched.rt_priority())
-            }
-            SchedPolicy::RtFifo => false,
-            SchedPolicy::Fair | SchedPolicy::Idle => curr.sched.vruntime() >= curr.sched.deadline(),
-        }
     }
 
     pub fn pick_next(&self, now_ns: u64) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
 
         let mut fair_prev_addr = None;
         if let Some(prev) = inner.current.take() {
@@ -196,7 +234,7 @@ impl Runqueue {
 
     pub fn take_migratable(&self, allowed_cpu_mask: u64, now_ns: u64) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
 
         if let Some(task) = take_fair_migratable_locked(&mut inner, allowed_cpu_mask) {
             return Some(task);
@@ -247,7 +285,7 @@ impl Runqueue {
         F: FnOnce(&Arc<Task>),
     {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
         let mut update = Some(update);
 
         if let Some(curr) = inner.current.as_ref() {
@@ -296,11 +334,23 @@ impl Default for Runqueue {
 fn enqueue_queued_locked(inner: &mut RqInner, task: Arc<Task>, now_ns: u64) {
     match task.sched.policy() {
         SchedPolicy::Deadline => {
+            let replenish_at = task.sched.deadline_replenish_ns();
             if task.sched.absolute_deadline_ns() == 0
-                || task.sched.deadline_budget_ns() == 0
-                || now_ns >= task.sched.absolute_deadline_ns()
+                || (replenish_at != 0 && now_ns >= replenish_at)
             {
                 task.sched.replenish_deadline(now_ns);
+            }
+            if task.sched.deadline_budget_ns() == 0 {
+                let replenish_at = task.sched.deadline_replenish_ns();
+                if replenish_at == 0 || now_ns >= replenish_at {
+                    task.sched.replenish_deadline(now_ns);
+                } else {
+                    let seq = next_seq(inner);
+                    inner
+                        .deadline_throttled
+                        .insert(DeadlineThrottleKey::of(&task, seq), task);
+                    return;
+                }
             }
             let seq = next_seq(inner);
             inner
@@ -410,7 +460,12 @@ fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
         }
         SchedPolicy::RtFifo => {}
         SchedPolicy::Deadline => {
-            if task.sched.absolute_deadline_ns() == 0 || task.sched.deadline_budget_ns() == 0 {
+            let replenish_at = task.sched.deadline_replenish_ns();
+            if task.sched.absolute_deadline_ns() == 0
+                || (replenish_at != 0 && now_ns >= replenish_at)
+                || (task.sched.deadline_budget_ns() == 0
+                    && (replenish_at == 0 || now_ns >= replenish_at))
+            {
                 task.sched.replenish_deadline(now_ns);
             }
         }
@@ -424,7 +479,10 @@ fn prepare_sleeping_locked(inner: &mut RqInner, task: &Arc<Task>, _now_ns: u64) 
     } else if task.sched.policy() == SchedPolicy::RtRoundRobin && task.sched.rr_remaining_ns() == 0
     {
         task.sched.reset_rr_slice();
-    } else if task.sched.policy() == SchedPolicy::Deadline && task.sched.absolute_deadline_ns() == 0
+    } else if task.sched.policy() == SchedPolicy::Deadline
+        && (task.sched.absolute_deadline_ns() == 0
+            || (task.sched.deadline_replenish_ns() != 0
+                && inner.last_update_ns >= task.sched.deadline_replenish_ns()))
     {
         task.sched.replenish_deadline(inner.last_update_ns);
     }
@@ -453,6 +511,9 @@ fn remove_queued_any_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc
         return Some(task);
     }
     if let Some(task) = remove_deadline_locked(inner, task) {
+        return Some(task);
+    }
+    if let Some(task) = remove_deadline_throttled_locked(inner, task) {
         return Some(task);
     }
     remove_idle_locked(inner, task)
@@ -489,6 +550,17 @@ fn remove_deadline_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<T
         .find(|(_, value)| Arc::ptr_eq(value, task))
         .map(|(key, _)| *key)?;
     let task = inner.deadline_tree.remove(&key)?;
+    task.sched.set_on_rq(false);
+    Some(task)
+}
+
+fn remove_deadline_throttled_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> {
+    let key = inner
+        .deadline_throttled
+        .iter()
+        .find(|(_, value)| Arc::ptr_eq(value, task))
+        .map(|(key, _)| *key)?;
+    let task = inner.deadline_throttled.remove(&key)?;
     task.sched.set_on_rq(false);
     Some(task)
 }
@@ -544,25 +616,52 @@ fn take_deadline_migratable_locked(
     Some(task)
 }
 
-fn update_curr_locked(inner: &mut RqInner, now_ns: u64) {
-    if now_ns <= inner.last_update_ns {
-        return;
-    }
-    let delta = now_ns - inner.last_update_ns;
-    inner.last_update_ns = now_ns;
-    let Some(curr) = inner.current.as_ref().map(Arc::clone) else {
-        return;
-    };
-    match curr.sched.policy() {
-        SchedPolicy::Fair | SchedPolicy::Idle => update_fair_curr_locked(inner, &curr, delta),
-        SchedPolicy::RtRoundRobin => {
-            let _ = curr.sched.charge_rr_runtime(delta);
+fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
+    if now_ns > inner.last_update_ns {
+        let delta = now_ns - inner.last_update_ns;
+        inner.last_update_ns = now_ns;
+        if let Some(curr) = inner.current.as_ref().map(Arc::clone) {
+            match curr.sched.policy() {
+                SchedPolicy::Fair | SchedPolicy::Idle => {
+                    update_fair_curr_locked(inner, &curr, delta)
+                }
+                SchedPolicy::RtRoundRobin => {
+                    let _ = curr.sched.charge_rr_runtime(delta);
+                }
+                SchedPolicy::Deadline => {
+                    let _ = curr.sched.charge_deadline_runtime(delta);
+                }
+                SchedPolicy::RtFifo => {}
+            }
         }
-        SchedPolicy::Deadline => {
-            let _ = curr.sched.charge_deadline_runtime(delta);
-        }
-        SchedPolicy::RtFifo => {}
     }
+    requeue_ready_deadline_locked(inner, now_ns)
+}
+
+fn requeue_ready_deadline_locked(inner: &mut RqInner, now_ns: u64) -> bool {
+    let mut moved = false;
+    loop {
+        let Some(key) = inner.deadline_throttled.keys().next().copied() else {
+            break;
+        };
+        if key.replenish_ns > now_ns {
+            break;
+        }
+        let Some(task) = inner.deadline_throttled.remove(&key) else {
+            break;
+        };
+        if task.state() != TaskState::Runnable {
+            task.sched.set_on_rq(false);
+            continue;
+        }
+        task.sched.replenish_deadline(now_ns);
+        let seq = next_seq(inner);
+        inner
+            .deadline_tree
+            .insert(DeadlineKey::of(&task, seq), task);
+        moved = true;
+    }
+    moved
 }
 
 fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64) {

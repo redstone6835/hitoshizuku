@@ -16,8 +16,8 @@
 //! - **不可降硬限制到软限制以下**：Linux 行为；非特权进程只能 `soft ≤ hard`
 //!   之内调，调硬限制需要特权。
 //! - **`RLIM_INFINITY` 的算术**：`x.saturating_add(RLIM_INFINITY)` 仍是
-//!   infinity，遵循"无限制 + 任何 = 无限制"。`x.saturating_sub(RLIM_INFINITY)`
-//!   返回 0（"无限制减去 x 仍为无限制"我们取 0，与 Linux 实际行为一致）。
+//!   infinity，遵循"无限制 + 任何 = 无限制"。`saturating_sub` 是"剩余额度"
+//!   辅助：任一操作数为 infinity 时返回 0，有限值之间走原生饱和减法。
 //! - **Resource 的可枚举性**：`From<u32>` / `as_u32` 双向；越界返回 None。
 //!   syscall 入口处先校验，未知资源返回 `EINVAL`。
 
@@ -81,12 +81,11 @@ impl Rlim {
         self.0.checked_add(rhs.0).map(Self)
     }
 
-    /// `infinity - x = 0`（Linux: `RLIM_INFINITY - x = RLIM_INFINITY`，本实
-    /// 现折中成 0，理由：结果用于"剩余 quota"，infinity 表示无剩余）。
+    /// "剩余额度"减法：任一操作数为 infinity 时返回 0；有限值走饱和减法。
     #[inline]
     pub fn saturating_sub(self, rhs: Self) -> Self {
-        if self.is_infinity() {
-            return Self::INFINITY;
+        if self.is_infinity() || rhs.is_infinity() {
+            return Self(0);
         }
         Self(self.0.saturating_sub(rhs.0))
     }

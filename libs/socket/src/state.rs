@@ -5,6 +5,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -294,6 +295,42 @@ impl Socket {
             }
         };
         self.finish_result(result)
+    }
+
+    pub fn validate_connect_ready(&self) -> Result<(), SocketError> {
+        if *self.inner.closed.lock() {
+            return Err(SocketError::PeerClosed);
+        }
+        match &self.inner.kind_impl {
+            SocketKind::Stream(stream) => {
+                let state = stream.state.lock();
+                match &*state {
+                    StreamState::Init => Ok(()),
+                    StreamState::Connected(_) => Err(SocketError::AlreadyConnected),
+                    StreamState::Listening(_) | StreamState::Closed => {
+                        Err(SocketError::StateMismatch)
+                    }
+                }
+            }
+            SocketKind::Datagram(dgram) => {
+                let state = dgram.state.lock();
+                if state.write_shutdown {
+                    Err(SocketError::PeerClosed)
+                } else {
+                    Ok(())
+                }
+            }
+            SocketKind::Sequenced(seq) => {
+                let state = seq.state.lock();
+                match &*state {
+                    SequencedState::Init => Ok(()),
+                    SequencedState::Connected(_) => Err(SocketError::AlreadyConnected),
+                    SequencedState::Listening(_) | SequencedState::Closed => {
+                        Err(SocketError::StateMismatch)
+                    }
+                }
+            }
+        }
     }
 
     pub fn shutdown(&self, how: SocketShutdown) -> Result<(), SocketError> {
@@ -907,61 +944,43 @@ fn socket_inflight_reaches_socket(start_id: u64, needle_id: u64) -> bool {
         }
     }
 
-    fn handle_reaches_socket(
-        handle: &SharedHandle,
-        needle_id: u64,
-        visited: &mut Vec<u64>,
-    ) -> bool {
+    fn push_handle(handle: &SharedHandle, needle_id: u64, stack: &mut Vec<u64>) -> bool {
         let Some(HandleIdentity::Socket(id)) = handle.identity() else {
             return false;
         };
         if id == needle_id {
             return true;
         }
-        if visited.contains(&id) {
-            return false;
-        }
-        let Some(inner) = lookup_socket(id) else {
-            return false;
-        };
-        socket_reaches_socket(&inner, needle_id, visited)
+        stack.push(id);
+        false
     }
 
-    fn scan_handles(handles: &[SharedHandle], needle_id: u64, visited: &mut Vec<u64>) -> bool {
-        handles
-            .iter()
-            .any(|handle| handle_reaches_socket(handle, needle_id, visited))
-    }
-
-    fn stream_queue_handles(queue: &StreamQueue) -> Vec<SharedHandle> {
+    fn push_stream_queue(queue: &StreamQueue, needle_id: u64, stack: &mut Vec<u64>) -> bool {
         let state = queue.state.lock();
-        let mut handles = Vec::new();
         for chunk in &state.chunks {
-            handles.extend(chunk.handles.iter().cloned());
+            for handle in &chunk.handles {
+                if push_handle(handle, needle_id, stack) {
+                    return true;
+                }
+            }
         }
-        handles
+        false
     }
 
-    fn packet_queue_handles(queue: &PacketQueue) -> Vec<SharedHandle> {
+    fn push_packet_queue(queue: &PacketQueue, needle_id: u64, stack: &mut Vec<u64>) -> bool {
         let state = queue.state.lock();
-        let mut handles = Vec::new();
         for packet in &state.packets {
-            handles.extend(packet.handles.iter().cloned());
+            for handle in &packet.handles {
+                if push_handle(handle, needle_id, stack) {
+                    return true;
+                }
+            }
         }
-        handles
+        false
     }
 
-    fn socket_reaches_socket(
-        inner: &Arc<SocketInner>,
-        needle_id: u64,
-        visited: &mut Vec<u64>,
-    ) -> bool {
-        if visited.contains(&inner.id) {
-            return false;
-        }
-        visited.push(inner.id);
-
-        let handles = match &inner.kind_impl {
+    fn push_socket_edges(inner: &Arc<SocketInner>, needle_id: u64, stack: &mut Vec<u64>) -> bool {
+        match &inner.kind_impl {
             SocketKind::Stream(stream) => {
                 let state = stream.state.lock();
                 match &*state {
@@ -969,30 +988,31 @@ fn socket_inflight_reaches_socket(start_id: u64, needle_id: u64) -> bool {
                         let rx = Arc::clone(&conn.rx);
                         let tx = Arc::clone(&conn.tx);
                         drop(state);
-                        let mut handles = stream_queue_handles(&rx);
-                        handles.extend(stream_queue_handles(&tx));
-                        handles
+                        push_stream_queue(&rx, needle_id, stack)
+                            || push_stream_queue(&tx, needle_id, stack)
                     }
                     StreamState::Listening(listener) => {
-                        let pending: Vec<Socket> = listener.pending.iter().cloned().collect();
-                        drop(state);
-                        for socket in pending {
-                            if socket_reaches_socket(&socket.inner, needle_id, visited) {
+                        for socket in &listener.pending {
+                            if socket.inner.id == needle_id {
                                 return true;
                             }
+                            stack.push(socket.inner.id);
                         }
-                        Vec::new()
+                        false
                     }
-                    StreamState::Init | StreamState::Closed => Vec::new(),
+                    StreamState::Init | StreamState::Closed => false,
                 }
             }
             SocketKind::Datagram(dgram) => {
                 let state = dgram.state.lock();
-                let mut handles = Vec::new();
                 for packet in &state.queue {
-                    handles.extend(packet.handles.iter().cloned());
+                    for handle in &packet.handles {
+                        if push_handle(handle, needle_id, stack) {
+                            return true;
+                        }
+                    }
                 }
-                handles
+                false
             }
             SocketKind::Sequenced(seq) => {
                 let state = seq.state.lock();
@@ -1001,31 +1021,42 @@ fn socket_inflight_reaches_socket(start_id: u64, needle_id: u64) -> bool {
                         let rx = Arc::clone(&conn.rx);
                         let tx = Arc::clone(&conn.tx);
                         drop(state);
-                        let mut handles = packet_queue_handles(&rx);
-                        handles.extend(packet_queue_handles(&tx));
-                        handles
+                        push_packet_queue(&rx, needle_id, stack)
+                            || push_packet_queue(&tx, needle_id, stack)
                     }
                     SequencedState::Listening(listener) => {
-                        let pending: Vec<Socket> = listener.pending.iter().cloned().collect();
-                        drop(state);
-                        for socket in pending {
-                            if socket_reaches_socket(&socket.inner, needle_id, visited) {
+                        for socket in &listener.pending {
+                            if socket.inner.id == needle_id {
                                 return true;
                             }
+                            stack.push(socket.inner.id);
                         }
-                        Vec::new()
+                        false
                     }
-                    SequencedState::Init | SequencedState::Closed => Vec::new(),
+                    SequencedState::Init | SequencedState::Closed => false,
                 }
             }
-        };
-        scan_handles(&handles, needle_id, visited)
+        }
     }
 
-    let Some(start) = lookup_socket(start_id) else {
-        return false;
-    };
-    socket_reaches_socket(&start, needle_id, &mut Vec::new())
+    let mut visited = Vec::new();
+    let mut stack = vec![start_id];
+    while let Some(id) = stack.pop() {
+        if id == needle_id {
+            return true;
+        }
+        if visited.contains(&id) {
+            continue;
+        }
+        visited.push(id);
+        let Some(inner) = lookup_socket(id) else {
+            continue;
+        };
+        if push_socket_edges(&inner, needle_id, &mut stack) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn default_socket_options(kind: SocketType) -> SocketOptions {

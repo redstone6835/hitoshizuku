@@ -19,5 +19,6 @@ log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
 sched = { path = "../libs/sched" }
+socket = { path = "../libs/socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 vfs = { path = "../libs/vfs" }

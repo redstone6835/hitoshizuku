@@ -44,7 +44,12 @@ impl<T> Completion<T> {
         if let Some(w) = self.waker.lock().take() {
             w.wake();
         }
-        self.wait_queue.wake_all();
+        // Completion<T> 当前是单消费者原语；T 不要求 Clone，不能把同一结果发给多个 waiter。
+        self.wait_queue.wake_one_with(|task| {
+            if sched::is_ready() && task.state() == sched::TaskState::Runnable {
+                sched::enqueue_task(Arc::clone(task), sched::now_ns_public());
+            }
+        });
     }
 
     /// 同步阻塞等待结果。调度器就绪时用 WaitQueue 让出 CPU；否则 spin。
@@ -59,12 +64,21 @@ impl<T> Completion<T> {
     /// 供 Future::poll 使用。
     pub fn poll(&self, cx: &mut Context<'_>) -> Poll<T> {
         if self.done.load(Ordering::Acquire) {
-            return Poll::Ready(self.result.lock().take().unwrap());
+            return self
+                .result
+                .lock()
+                .take()
+                .map(Poll::Ready)
+                .unwrap_or(Poll::Pending);
         }
         *self.waker.lock() = Some(cx.waker().clone());
         // 二次检查：避免注册和完成之间的竞争
         if self.done.load(Ordering::Acquire) {
-            Poll::Ready(self.result.lock().take().unwrap())
+            self.result
+                .lock()
+                .take()
+                .map(Poll::Ready)
+                .unwrap_or(Poll::Pending)
         } else {
             Poll::Pending
         }
@@ -74,7 +88,9 @@ impl<T> Completion<T> {
         let task = sched::current_task();
         loop {
             if self.done.load(Ordering::Acquire) {
-                return self.result.lock().take().unwrap();
+                if let Some(result) = self.result.lock().take() {
+                    return result;
+                }
             }
             let _ = task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping);
             let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
@@ -82,7 +98,9 @@ impl<T> Completion<T> {
             if self.done.load(Ordering::Acquire) {
                 self.wait_queue.remove(&task);
                 let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
-                return self.result.lock().take().unwrap();
+                if let Some(result) = self.result.lock().take() {
+                    return result;
+                }
             }
             sched::schedule_once(0);
             self.wait_queue.remove(&task);
@@ -92,7 +110,9 @@ impl<T> Completion<T> {
     fn wait_spinning(&self) -> T {
         loop {
             if self.done.load(Ordering::Acquire) {
-                return self.result.lock().take().unwrap();
+                if let Some(result) = self.result.lock().take() {
+                    return result;
+                }
             }
             core::hint::spin_loop();
         }

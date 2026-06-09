@@ -426,6 +426,21 @@ impl MountNamespace {
         }
         .unwrap_or_else(|| Arc::clone(&self.root.lock()));
 
+        self.mount_at(mountpoint, parent_mount, superblock, flags)
+    }
+
+    /// 在已经解析好的挂载点上执行挂载操作。
+    ///
+    /// 调用方必须传入挂载点所在的父 [`Mount`]。这用于 `mount(2)` 路径的最终
+    /// 分量：最终分量不能自动穿越已有挂载，否则新挂载会错误地落到被挂载文件系统
+    /// 的根 dentry 上，而不是被覆盖的挂载点 dentry 上。
+    pub fn mount_at(
+        &self,
+        mountpoint: Arc<Dentry>,
+        parent_mount: Arc<Mount>,
+        superblock: Arc<Superblock>,
+        flags: MountFlags,
+    ) -> VfsResult<Arc<Mount>> {
         let mount_root = Arc::clone(&superblock.root_dentry);
         let new_mount = Mount::new(
             superblock,
