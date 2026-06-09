@@ -67,6 +67,12 @@ pub fn register_core_filesystems(tag: &str) {
             });
     }
     general::vfs::register_block_filesystems();
+    general::vfs::rtc_devnode::register_devtmpfs_adapter().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register RTC devtmpfs adapter: {:?}",
+            tag, err
+        )
+    });
 }
 
 /// 创建并发布 devtmpfs 单例 superblock。

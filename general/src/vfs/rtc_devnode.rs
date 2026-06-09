@@ -17,11 +17,16 @@ use vfs::error::{VfsError, VfsResult};
 use vfs::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 use vfs::inode::{Inode, InodeOps};
 
+use crate::dev::function::CustomDevNodeSpec;
 use crate::dev::rtc::{
     RtcAlarm, RtcControlRequest, RtcControlResponse, RtcDateTime, RtcDevNodeEndpoint, RtcDevice,
     RtcError, RtcIrqData, RtcIrqFlags,
 };
 use crate::mm::{copy_from_user, copy_to_user};
+use crate::vfs::devtmpfs::{
+    DevTmpfsCustomNodeAdapter, DevTmpfsCustomNodeAdapterRegistration,
+    register_custom_devnode_adapter,
+};
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const SECS_PER_DAY: u64 = 86_400;
@@ -69,10 +74,35 @@ const RTC_VL_READ: usize = IoctlCmd::from_parts(
 .raw();
 const RTC_VL_CLR: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, b'p' as usize, 0x14, 0).raw();
 
+const RTC_DEVNODE_ADAPTER_OWNER: &str = "rtc-devnode";
+const RTC_DEVNODE_ADAPTER_NAME: &str = "rtc";
+
+/// 注册 RTC custom devnode 适配器。
+///
+/// 启动期 VFS 兼容层调用本函数，把 [`RtcDevNodeEndpoint`] 的解释能力挂到
+/// devtmpfs adapter registry。devtmpfs 核心因此不需要直接依赖 RTC 类型。
+pub fn register_devtmpfs_adapter() -> VfsResult<DevTmpfsCustomNodeAdapterRegistration> {
+    register_custom_devnode_adapter(DevTmpfsCustomNodeAdapter::new(
+        RTC_DEVNODE_ADAPTER_OWNER,
+        RTC_DEVNODE_ADAPTER_NAME,
+        build_rtc_inode_ops,
+    ))
+}
+
+fn build_rtc_inode_ops(
+    spec: &CustomDevNodeSpec,
+) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+    let payload = spec.payload();
+    let Some(endpoint) = payload.as_ref().downcast_ref::<RtcDevNodeEndpoint>() else {
+        return Ok(None);
+    };
+    Ok(Some(inode_ops(endpoint)))
+}
+
 /// 根据 dev core 提供的 typed endpoint 构造 RTC inode 操作对象。
 ///
-/// 这里是 opaque payload 的唯一解释点；新增 RTC 硬件驱动不会影响 devtmpfs
-/// 的分发逻辑，只要继续发布 [`RtcDevNodeEndpoint`] 即可。
+/// 这里是 RTC opaque payload 的唯一解释点；新增 RTC 硬件驱动不会影响
+/// devtmpfs 的分发逻辑，只要继续发布 [`RtcDevNodeEndpoint`] 即可。
 pub fn inode_ops(endpoint: &RtcDevNodeEndpoint) -> Arc<dyn InodeOps + Send + Sync> {
     Arc::new(RtcInodeOps {
         dev: endpoint.dev(),

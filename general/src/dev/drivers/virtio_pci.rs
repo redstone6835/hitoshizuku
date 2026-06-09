@@ -36,7 +36,7 @@ use crate::dev::block::{
 use crate::dev::dma::{DmaBuffer, DmaDirection};
 use crate::dev::function::BlockFunction;
 use crate::dev::irq::{self, IrqError, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::pci::{PciBar, PciDevice, PciInfo, PciMsiPnpResource};
+use crate::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     PnpResourceKind, register_driver_factory,
@@ -885,10 +885,4 @@ impl DriverFactory for VirtioPciBlkFactory {
 /// 注册 VirtIO-PCI block 内建驱动 factory。
 pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
     register_driver_factory(Arc::new(VirtioPciBlkFactory)).map(|_| ())
-}
-
-// 避免 BAR 解析时 PciBar 字段被优化掉；保留显式静默引用。
-#[allow(dead_code)]
-fn _keep_prefetchable(bar: &PciBar) -> bool {
-    bar.prefetchable
 }

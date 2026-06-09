@@ -33,6 +33,9 @@ use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
 use super::{current_vfs_context, namespace_path};
+use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
+use crate::dev::function::{CustomDevNodeKind, DevNodeSpec};
+use crate::dev::pnp::{PnpDependency, PnpResourceKind, PnpState};
 use crate::vfs::device_numbers::{self, PosixDeviceKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -55,6 +58,8 @@ const SYS_KERNEL_INO: u64 = 14;
 const SYS_HOTPLUG_INO: u64 = 15;
 const NET_DIR_INO: u64 = 16;
 const NET_DEV_INO: u64 = 17;
+const PNP_INO: u64 = 18;
+const DEVICE_FUNCTIONS_INO: u64 = 19;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -154,6 +159,8 @@ enum RootFileKind {
     Uptime,
     Stat,
     Devices,
+    Pnp,
+    DeviceFunctions,
 }
 
 #[derive(Clone, Copy)]
@@ -282,6 +289,11 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
         ("uptime", mk_root_file(UPTIME_INO, RootFileKind::Uptime)),
         ("stat", mk_root_file(STAT_INO, RootFileKind::Stat)),
         ("devices", mk_root_file(DEVICES_INO, RootFileKind::Devices)),
+        ("pnp", mk_root_file(PNP_INO, RootFileKind::Pnp)),
+        (
+            "device-functions",
+            mk_root_file(DEVICE_FUNCTIONS_INO, RootFileKind::DeviceFunctions),
+        ),
         ("self", self_inode),
         ("thread-self", thread_self_inode),
         ("sys", sys_inode),
@@ -432,8 +444,8 @@ struct ProcNetDirOps {
 
 impl InodeOps for ProcNetDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
-        match name {
-            "dev" => Ok(mk_inode(
+        if name == "dev" {
+            return Ok(mk_inode(
                 self.fs_id,
                 &self.weak_sb,
                 NET_DEV_INO,
@@ -441,63 +453,21 @@ impl InodeOps for ProcNetDirOps {
                 0o444,
                 1,
                 Arc::new(ProcNetDevOps),
-            )),
-            "tcp" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 1,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("tcp")),
-            )),
-            "udp" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 2,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("udp")),
-            )),
-            "route" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 3,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("route")),
-            )),
-            "unix" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 4,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("unix")),
-            )),
-            "arp" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 5,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("arp")),
-            )),
-            "sockstat" => Ok(mk_inode(
-                self.fs_id,
-                &self.weak_sb,
-                NET_DEV_INO + 6,
-                FileType::Regular,
-                0o444,
-                1,
-                Arc::new(ProcNetStubOps("sockstat")),
-            )),
-            _ => Err(VfsError::NotFound),
+            ));
         }
+
+        let Some(kind) = ProcNetSnapshotKind::from_name(name) else {
+            return Err(VfsError::NotFound);
+        };
+        Ok(mk_inode(
+            self.fs_id,
+            &self.weak_sb,
+            kind.ino(),
+            FileType::Regular,
+            0o444,
+            1,
+            Arc::new(ProcNetSnapshotOps { kind }),
+        ))
     }
 
     fn open(
@@ -506,45 +476,19 @@ impl InodeOps for ProcNetDirOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        Ok(Box::new(ProcDirFile {
-            snapshot: vec![
-                DirEntry {
-                    ino: NET_DEV_INO,
-                    name: SmallStr::new("dev"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 1,
-                    name: SmallStr::new("tcp"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 2,
-                    name: SmallStr::new("udp"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 3,
-                    name: SmallStr::new("route"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 4,
-                    name: SmallStr::new("unix"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 5,
-                    name: SmallStr::new("arp"),
-                    kind: FileType::Regular,
-                },
-                DirEntry {
-                    ino: NET_DEV_INO + 6,
-                    name: SmallStr::new("sockstat"),
-                    kind: FileType::Regular,
-                },
-            ],
-        }))
+        let mut snapshot = vec![DirEntry {
+            ino: NET_DEV_INO,
+            name: SmallStr::new("dev"),
+            kind: FileType::Regular,
+        }];
+        for kind in ProcNetSnapshotKind::ALL {
+            snapshot.push(DirEntry {
+                ino: kind.ino(),
+                name: SmallStr::new(kind.name()),
+                kind: FileType::Regular,
+            });
+        }
+        Ok(Box::new(ProcDirFile { snapshot }))
     }
 
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
@@ -555,9 +499,75 @@ impl InodeOps for ProcNetDirOps {
     }
 }
 
-struct ProcNetStubOps(&'static str);
+/// `/proc/net` 中由内核快照动态渲染的兼容文件。
+///
+/// 文件名和 inode 偏移集中在这里维护，避免 lookup 与 readdir 各自重复维护一份
+/// 列表。渲染逻辑只读取 `net`/`socket` 层公开快照，不把 procfs 的文本 ABI
+/// 反向泄入底层设备抽象。
+#[derive(Clone, Copy)]
+enum ProcNetSnapshotKind {
+    Tcp,
+    Udp,
+    Route,
+    Unix,
+    Arp,
+    Sockstat,
+}
 
-impl InodeOps for ProcNetStubOps {
+impl ProcNetSnapshotKind {
+    const ALL: [Self; 6] = [
+        Self::Tcp,
+        Self::Udp,
+        Self::Route,
+        Self::Unix,
+        Self::Arp,
+        Self::Sockstat,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Route => "route",
+            Self::Unix => "unix",
+            Self::Arp => "arp",
+            Self::Sockstat => "sockstat",
+        }
+    }
+
+    const fn ino(self) -> u64 {
+        NET_DEV_INO
+            + match self {
+                Self::Tcp => 1,
+                Self::Udp => 2,
+                Self::Route => 3,
+                Self::Unix => 4,
+                Self::Arp => 5,
+                Self::Sockstat => 6,
+            }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.name() == name)
+    }
+
+    fn render(self) -> String {
+        match self {
+            Self::Tcp => render_proc_net_tcp(),
+            Self::Udp => render_proc_net_udp(),
+            Self::Route => render_proc_net_route(),
+            Self::Unix => render_proc_net_unix(),
+            Self::Arp => render_proc_net_arp(),
+            Self::Sockstat => render_proc_net_sockstat(),
+        }
+    }
+}
+
+struct ProcNetSnapshotOps {
+    kind: ProcNetSnapshotKind,
+}
+
+impl InodeOps for ProcNetSnapshotOps {
     fn lookup(&self, _: &Inode, _: &str) -> VfsResult<Arc<Inode>> {
         Err(VfsError::NotADirectory)
     }
@@ -567,8 +577,7 @@ impl InodeOps for ProcNetStubOps {
         _: &OpenOptions,
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        // TODO: 实现 /proc/net/{tcp,udp,route,unix} 的真实内容
-        Ok(Box::new(ProcNetStubFile(self.0)))
+        Ok(Box::new(ProcNetSnapshotFile { kind: self.kind }))
     }
     fn readlink(&self, _: &Inode) -> VfsResult<String> {
         Err(VfsError::InvalidArgument)
@@ -578,19 +587,13 @@ impl InodeOps for ProcNetStubOps {
     }
 }
 
-struct ProcNetStubFile(&'static str);
+struct ProcNetSnapshotFile {
+    kind: ProcNetSnapshotKind,
+}
 
-impl FileOps for ProcNetStubFile {
+impl FileOps for ProcNetSnapshotFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let content = match self.0 {
-            "tcp" => render_proc_net_tcp(),
-            "udp" => render_proc_net_udp(),
-            "route" => render_proc_net_route(),
-            "unix" => render_proc_net_unix(),
-            "arp" => render_proc_net_arp(),
-            "sockstat" => render_proc_net_sockstat(),
-            _ => String::new(),
-        };
+        let content = self.kind.render();
         let offset = offset as usize;
         if offset >= content.len() {
             return Ok(0);
@@ -1672,6 +1675,8 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::Uptime => render_uptime().into_bytes(),
             RootFileKind::Stat => render_stat().into_bytes(),
             RootFileKind::Devices => render_devices().into_bytes(),
+            RootFileKind::Pnp => render_pnp().into_bytes(),
+            RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
         }),
         ProcFileKind::Task { pid, kind } => {
             let task = lookup_task(pid).ok_or(VfsError::NotFound)?;
@@ -1996,8 +2001,9 @@ fn render_task_stat(task: &Arc<Task>) -> String {
     let num_threads = task_thread_count(task);
     let (vsize, rss_bytes) = task_memory_usage(task);
     let rss_pages = rss_bytes / page_size() as u64;
-    // TODO: 填充真实的 tty_nr, minflt, cminflt, majflt, cmajflt, utime, stime,
-    //       cutime, cstime, priority, nice, starttime, signal, blocked, sigignore, sigcatch 等字段
+    // 这里按当前 Task 模型已经可观测的字段生成 Linux 兼容 stat。fault 计数、
+    // 累积 CPU 时间、信号掩码等尚未进入 sched/mm 的公共快照接口，因此兼容字段
+    // 保持 0，避免在 procfs 层伪造无法证明的数据。
     format!(
         "{} ({}) {} {} {} {} 0 0 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 {} {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid, comm, state, ppid, pgrp, session, num_threads, vsize, rss_pages,
@@ -2131,41 +2137,83 @@ fn render_version() -> String {
     format!("MyGo kernel version 0.1.0 (loongarch64)\n")
 }
 
-// TODO: 从硬件读取真实 CPU 特征标志、BogoMIPS、cache 信息等
+fn cpuinfo_model_from_compatible(compatible: &str) -> &str {
+    compatible
+        .split_once(',')
+        .map(|(_, model)| model)
+        .unwrap_or(compatible)
+}
+
+fn cpuinfo_vendor_from_compatible(compatible: &str) -> &str {
+    compatible
+        .split_once(',')
+        .map(|(vendor, _)| vendor)
+        .unwrap_or("unknown")
+}
+
+fn cpuinfo_family_from_compatible(compatible: &str) -> &str {
+    let vendor = cpuinfo_vendor_from_compatible(compatible);
+    if vendor.eq_ignore_ascii_case("loongarch") {
+        "LoongArch"
+    } else {
+        vendor
+    }
+}
+
+fn render_cpuinfo_entry(out: &mut String, cpu_id: usize, compatible: Option<&str>) {
+    let vendor = compatible
+        .map(cpuinfo_vendor_from_compatible)
+        .unwrap_or("unknown");
+    let family = compatible
+        .map(cpuinfo_family_from_compatible)
+        .unwrap_or("unknown");
+    let model = compatible
+        .map(cpuinfo_model_from_compatible)
+        .unwrap_or("unknown");
+    let isa = compatible
+        .and_then(|text| text.split_once(',').map(|(isa, _)| isa))
+        .unwrap_or("unknown");
+
+    // BogoMIPS 需要架构层提供定标后的循环/延迟校准值。当前公共 CPU 拓扑只包含
+    // 固件身份，因此该兼容字段明确报告 0.00，而不是伪造固定性能数字。
+    let _ = write!(
+        out,
+        "processor\t: {cpu_id}\n\
+         vendor_id\t: {vendor}\n\
+         cpu family\t: {family}\n\
+         model name\t: {model}\n\
+         CPU architecture\t: {isa}\n\
+         isa\t\t: {isa}\n\
+         fpu\t\t: unknown\n\
+         BogoMIPS\t: 0.00\n\n"
+    );
+}
+
 fn render_cpuinfo() -> String {
     let mut out = String::new();
     let mut online_mask = sched::online_cpu_mask();
     if online_mask == 0 {
         online_mask = 1;
     }
+    let topology = crate::dev::cpu::snapshot_topology();
     for cpu_id in 0..sched::NR_CPUS {
         if (online_mask & (1u64 << cpu_id)) == 0 || !sched::is_cpu_online(cpu_id) {
             continue;
         }
-        let _ = write!(
-            out,
-            "processor\t: {cpu_id}\n\
-             vendor_id\t: MyGo\n\
-             cpu family\t: LoongArch\n\
-             model name\t: LoongArch64 Virtual CPU\n\
-             CPU architecture\t: loongarch64\n\
-             isa\t\t: loongarch64\n\
-             fpu\t\t: yes\n\
-             BogoMIPS\t: 100.00\n\n"
-        );
+        let compatible = topology
+            .iter()
+            .find(|entry| entry.logical_id as usize == cpu_id)
+            .and_then(|entry| entry.compatible.first())
+            .map(|text| text.as_ref());
+        render_cpuinfo_entry(&mut out, cpu_id, compatible);
     }
     if out.is_empty() {
-        let _ = write!(
-            out,
-            "processor\t: 0\n\
-             vendor_id\t: MyGo\n\
-             cpu family\t: LoongArch\n\
-             model name\t: LoongArch64 Virtual CPU\n\
-             CPU architecture\t: loongarch64\n\
-             isa\t\t: loongarch64\n\
-             fpu\t\t: yes\n\
-             BogoMIPS\t: 100.00\n\n"
-        );
+        let compatible = topology
+            .iter()
+            .find(|entry| entry.logical_id == 0)
+            .and_then(|entry| entry.compatible.first())
+            .map(|text| text.as_ref());
+        render_cpuinfo_entry(&mut out, 0, compatible);
     }
     out
 }
@@ -2173,6 +2221,16 @@ fn render_cpuinfo() -> String {
 fn render_meminfo() -> String {
     let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
     let kb = |bytes: usize| -> usize { bytes / 1024 };
+    // 下列兼容字段需要独立的块缓存、页缓存、swap、内核栈和页表统计源。当前内核
+    // 尚未把这些子系统聚合到公共 memory snapshot，procfs 只报告 allocator 能
+    // 证明的项目，其余兼容字段保持 0。
+    let buffers_kb = 0usize;
+    let cached_kb = 0usize;
+    let swap_cached_kb = 0usize;
+    let kernel_stack_kb = 0usize;
+    let page_tables_kb = 0usize;
+    let swap_total_kb = 0usize;
+    let swap_free_kb = 0usize;
     format!(
         "MemTotal:       {:>8} kB\n\
          MemFree:        {:>8} kB\n\
@@ -2198,17 +2256,17 @@ fn render_meminfo() -> String {
         kb(overview.total_physical),
         kb(overview.free_physical),
         kb(overview.free_physical),
-        0usize,                        // TODO: 实现 Buffers（块设备缓冲区统计）
-        0usize,                        // TODO: 实现 Cached（页缓存统计）
-        0usize,                        // TODO: 实现 SwapCached
+        buffers_kb,
+        cached_kb,
+        swap_cached_kb,
         kb(overview.kernel_heap_used), // Slab: 暂用 kernel heap 近似
-        0usize,                        // TODO: 实现 KernelStack（内核栈统计）
-        0usize,                        // TODO: 实现 PageTables（页表统计）
+        kernel_stack_kb,
+        page_tables_kb,
         kb(overview.kernel_vmem_total),
         kb(overview.kernel_vmem_allocated),
         kb(overview.kernel_vmem_free),
-        0usize, // TODO: 实现 SwapTotal
-        0usize, // TODO: 实现 SwapFree
+        swap_total_kb,
+        swap_free_kb,
         kb(overview.direct_map_total),
         kb(overview.direct_map_allocated),
         kb(overview.direct_map_free),
@@ -2222,7 +2280,8 @@ fn render_meminfo() -> String {
 fn render_uptime() -> String {
     let ns = sched::now_ns_public();
     let secs = ns / 1_000_000_000;
-    // TODO: 第二个字段是 idle 时间，需要从调度器读取累计 idle 累积值
+    // 第二个字段是累计 idle 时间。调度器尚未导出 per-CPU idle accounting，
+    // 因此只报告可证明的系统运行时间，idle 兼容字段保持 0。
     format!(
         "{}.{:02} {}.{:02}\n",
         secs,
@@ -2254,8 +2313,8 @@ fn render_stat() -> String {
             }
         }
     }
-    // TODO: 实现 cpu jiffies 统计（user/nice/system/idle/iowait/irq/softirq/steal/guest/guest_nice）
-    //       以及 intr、ctxt、btime；当前所有字段为 0
+    // 当前 sched 公共接口还没有导出 CPU jiffies、上下文切换、启动时间和中断计数。
+    // 这里保留字段形状并只填入可观测的进程数量，避免让兼容层反向依赖内部实现。
     format!(
         "cpu  0 0 0 0 0 0 0 0 0 0\ncpu0 0 0 0 0 0 0 0 0 0 0\n\
          intr 0\nctxt 0\nbtime 0\nprocesses {}\nprocs_running {}\nprocs_blocked {}\n",
@@ -2272,6 +2331,145 @@ fn render_devices() -> String {
     out.push_str("\nBlock devices:\n");
     for summary in device_numbers::major_summaries(PosixDeviceKind::Block) {
         out.push_str(&format!("  {} {}\n", summary.major, summary.display_name));
+    }
+    out
+}
+
+fn proc_custom_devnode_kind_name(kind: CustomDevNodeKind) -> &'static str {
+    match kind {
+        CustomDevNodeKind::CharDevice => "custom-char",
+        CustomDevNodeKind::BlockDevice => "custom-block",
+        CustomDevNodeKind::RegularFile => "custom-file",
+        CustomDevNodeKind::Directory => "custom-dir",
+    }
+}
+
+fn proc_devnode_name(node: &DevNodeSpec) -> String {
+    match node {
+        DevNodeSpec::Char { name, .. } => format!("char:{}", name),
+        DevNodeSpec::Block { name, .. } => format!("block:{}", name),
+        DevNodeSpec::Symlink { name, target } => format!("symlink:{}->{}", name, target),
+        DevNodeSpec::Custom(spec) => {
+            format!(
+                "{}:{}",
+                proc_custom_devnode_kind_name(spec.kind()),
+                spec.name()
+            )
+        }
+    }
+}
+
+fn render_device_functions() -> String {
+    // `/proc/device-functions` 是 dev core function registry 的调试快照。
+    // 它只展示 class/name 与 devtmpfs 投影声明，不能作为设备打开或寻址入口；
+    // 用户态访问路径仍由 `/dev`、`/sys` 和对应 syscall 兼容层决定。
+    let mut out = String::from("class\tname\tdevnodes\n");
+    for func in DEVICES.functions.list() {
+        let devnodes = func
+            .devnodes()
+            .map(|nodes| {
+                nodes
+                    .nodes()
+                    .iter()
+                    .map(proc_devnode_name)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|nodes| !nodes.is_empty())
+            .unwrap_or_else(|| "-".into());
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}",
+            func.class_id().as_str(),
+            func.dev_name(),
+            devnodes
+        );
+    }
+    out
+}
+
+fn proc_pnp_state_name(state: PnpState) -> &'static str {
+    match state {
+        PnpState::Discovered => "discovered",
+        PnpState::Probing => "probing",
+        PnpState::Bound => "bound",
+        PnpState::Removing => "removing",
+        PnpState::Gone => "gone",
+    }
+}
+
+fn proc_pnp_resource_kind_name(kind: PnpResourceKind) -> &'static str {
+    match kind {
+        PnpResourceKind::Mmio => "mmio",
+        PnpResourceKind::Irq => "irq",
+        PnpResourceKind::IrqDomain => "irq-domain",
+        PnpResourceKind::Msi => "msi",
+        PnpResourceKind::MsiController => "msi-controller",
+        PnpResourceKind::Syscon => "syscon",
+        PnpResourceKind::Flash => "flash",
+        PnpResourceKind::FwCfg => "fwcfg",
+        PnpResourceKind::FirmwareBus => "firmware-bus",
+        PnpResourceKind::PciHostBridge => "pci-host-bridge",
+        PnpResourceKind::Dma => "dma",
+        PnpResourceKind::Function => "function",
+        PnpResourceKind::Other(name) => name,
+    }
+}
+
+fn proc_pnp_dependency_name(dependency: PnpDependency) -> String {
+    match dependency {
+        PnpDependency::IrqController(id) => format!("irq-controller:{id}"),
+        PnpDependency::DefaultIrqDomain => "default-irq-domain".into(),
+        PnpDependency::MsiController(id) => format!("msi-controller:{id}"),
+        PnpDependency::Syscon(id) => format!("syscon:{id}"),
+        PnpDependency::FwCfg => "fwcfg".into(),
+        PnpDependency::FirmwareBus => "firmware-bus".into(),
+        PnpDependency::PciHostBridge(domain) => format!("pci-host-bridge:{domain}"),
+        PnpDependency::Dma => "dma".into(),
+        PnpDependency::Other(name) => name.into(),
+    }
+}
+
+fn render_pnp() -> String {
+    // `/proc/pnp` 是面向诊断的 dev core 快照；设备寻址和层级关系以 sysfs 为准。
+    let mut out =
+        String::from("bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n");
+    for dev in PNP_DEVICES.list() {
+        let functions = dev
+            .functions()
+            .into_iter()
+            .map(|func| format!("{}:{}", func.class_id().as_str(), func.dev_name()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let resources = dev
+            .owned_resources()
+            .into_iter()
+            .map(|resource| {
+                format!(
+                    "{}:{}",
+                    proc_pnp_resource_kind_name(resource.kind),
+                    resource.label
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let deferred = dev
+            .deferred_dependency()
+            .map(proc_pnp_dependency_name)
+            .unwrap_or_default();
+        let driver = dev.bound_driver_name().unwrap_or("-");
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            dev.info.bus_type().as_str(),
+            dev.id,
+            dev.name,
+            proc_pnp_state_name(dev.state()),
+            driver,
+            functions,
+            resources,
+            deferred,
+        );
     }
     out
 }

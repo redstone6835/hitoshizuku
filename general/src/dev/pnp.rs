@@ -557,6 +557,16 @@ pub trait PnpResource: Send {
     fn release(self: Box<Self>) -> Result<(), PnpResourceReleaseError>;
 }
 
+/// PnP 设备当前拥有资源的只读快照。
+///
+/// sysfs/procfs 等诊断视图只能观察资源类别和稳定标签，不能拿到底层 handle；
+/// handle 的释放所有权仍然完全留在 PnP core 内部，避免兼容层破坏 remove 事务。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PnpOwnedResourceSnapshot {
+    pub kind: PnpResourceKind,
+    pub label: &'static str,
+}
+
 /// PnP resource 自动释放失败。
 ///
 /// release 失败不会阻止 remove 流程继续；它只进入日志，提示存在重复释放、
@@ -745,6 +755,19 @@ impl PnpDevice {
     /// 返回最近一次 deferred probe 记录的精确依赖。
     pub fn deferred_dependency(&self) -> Option<PnpDependency> {
         self.inner.lock().deferred_dependency
+    }
+
+    /// 返回该设备已交给 PnP core 管理的资源快照。
+    pub fn owned_resources(&self) -> Vec<PnpOwnedResourceSnapshot> {
+        self.inner
+            .lock()
+            .resources
+            .iter()
+            .map(|resource| PnpOwnedResourceSnapshot {
+                kind: resource.kind(),
+                label: resource.label(),
+            })
+            .collect()
     }
 
     /// 返回父设备；根设备没有父设备。

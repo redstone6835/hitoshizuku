@@ -45,7 +45,6 @@ const VIRTIO_NET_F_STATUS: u64 = 1 << 16;
 // ── VirtIO-Net device config offsets ───────────────────────────────────
 
 const NET_CFG_MAC: usize = 0x00;
-#[allow(dead_code)]
 const NET_CFG_STATUS: usize = 0x06;
 
 // ── Virtqueue 常量 ─────────────────────────────────────────────────────

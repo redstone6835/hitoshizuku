@@ -59,7 +59,6 @@ use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHint
 use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSet, DevNodeSpec};
 use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
-use crate::dev::rtc::RtcDevNodeEndpoint;
 use crate::mm::{copy_from_user, copy_to_user};
 
 // ───────── 全局实例计数器 ─────────
@@ -70,6 +69,104 @@ static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinl
 static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
     Spinlock::new(BTreeMap::new());
 static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
+static CUSTOM_DEVNODE_ADAPTERS: Spinlock<Vec<DevTmpfsCustomNodeAdapter>> =
+    Spinlock::new(Vec::new());
+
+/// 自定义 devtmpfs 节点适配器构造函数。
+///
+/// 返回 `Ok(None)` 表示当前适配器不认识该 payload；返回 `Ok(Some(_))` 表示
+/// 已成功把 typed endpoint 转换成 VFS inode 操作对象；返回 `Err(_)` 表示
+/// payload 类型匹配但元数据或运行状态不合法。
+pub type DevTmpfsCustomNodeBuild =
+    fn(&CustomDevNodeSpec) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>>;
+
+/// 自定义节点适配器声明。
+///
+/// devtmpfs 本体不应该知道 RTC、GPU、专用控制设备等具体类型。每个 VFS 兼容
+/// 适配器通过本结构注册一个 typed payload 解释器，devtmpfs 只负责按注册顺序
+/// 分发，避免每新增一种设备都修改核心文件系统代码。
+#[derive(Clone, Copy)]
+pub struct DevTmpfsCustomNodeAdapter {
+    owner: &'static str,
+    name: &'static str,
+    build: DevTmpfsCustomNodeBuild,
+}
+
+/// 自定义 devtmpfs 节点适配器注册结果。
+///
+/// `inserted=false` 表示同一 owner/name 已经登记过，本次只是幂等确认。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DevTmpfsCustomNodeAdapterRegistration {
+    inserted: bool,
+}
+
+impl DevTmpfsCustomNodeAdapterRegistration {
+    pub const fn inserted(self) -> bool {
+        self.inserted
+    }
+}
+
+impl DevTmpfsCustomNodeAdapter {
+    pub const fn new(
+        owner: &'static str,
+        name: &'static str,
+        build: DevTmpfsCustomNodeBuild,
+    ) -> Self {
+        Self { owner, name, build }
+    }
+
+    pub const fn owner(self) -> &'static str {
+        self.owner
+    }
+
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    fn build(self, spec: &CustomDevNodeSpec) -> VfsResult<Option<Arc<dyn InodeOps + Send + Sync>>> {
+        (self.build)(spec)
+    }
+}
+
+/// 注册一个自定义 devtmpfs 节点适配器。
+///
+/// 同一 owner/name 重复注册视为幂等，便于 DTB/ACPI 或测试路径重复执行启动期
+/// 初始化；不同 owner 复用同一 adapter name 会被拒绝，避免两个适配器抢占同一
+/// payload 命名空间。
+pub fn register_custom_devnode_adapter(
+    adapter: DevTmpfsCustomNodeAdapter,
+) -> VfsResult<DevTmpfsCustomNodeAdapterRegistration> {
+    if adapter.owner().is_empty() || adapter.name().is_empty() {
+        return Err(VfsError::InvalidArgument);
+    }
+    let mut adapters = CUSTOM_DEVNODE_ADAPTERS.lock();
+    if let Some(existing) = adapters.iter().find(|entry| entry.name() == adapter.name()) {
+        if existing.owner() == adapter.owner() {
+            return Ok(DevTmpfsCustomNodeAdapterRegistration { inserted: false });
+        }
+        return Err(VfsError::AlreadyExists);
+    }
+    adapters.try_reserve(1).map_err(|_| VfsError::OutOfMemory)?;
+    adapters.push(adapter);
+    Ok(DevTmpfsCustomNodeAdapterRegistration { inserted: true })
+}
+
+/// 注销一个自定义 devtmpfs 节点适配器。
+///
+/// 该操作只移除后续 custom 节点解析能力，不会主动删除已经创建的 inode；驱动
+/// 或 PnP remove 仍应通过节点解绑路径处理已存在的 `/dev` 投影。
+pub fn unregister_custom_devnode_adapter(owner: &'static str, name: &str) -> VfsResult<()> {
+    let mut adapters = CUSTOM_DEVNODE_ADAPTERS.lock();
+    let Some(index) = adapters
+        .iter()
+        .position(|entry| entry.owner() == owner && entry.name() == name)
+    else {
+        return Err(VfsError::NotFound);
+    };
+    adapters.remove(index);
+    Ok(())
+}
+
 /// devtmpfs 静态节点声明。
 ///
 /// 静态节点用于没有 PnP backing device、但又必须出现在 `/dev` 的基础设备。
@@ -1765,12 +1862,15 @@ fn custom_devnode_file_type(kind: CustomDevNodeKind) -> FileType {
 }
 
 fn custom_devnode_ops(spec: &CustomDevNodeSpec) -> VfsResult<Arc<dyn InodeOps + Send + Sync>> {
-    // dev core 只保存 opaque payload；这里是 VFS 兼容层解释 payload 的唯一入口。
-    // 新的自定义节点类型需要先定义 typed endpoint，再在本函数中接入适配器，
-    // 避免把 InodeOps/FileOps 直接塞回底层设备模型。
-    let payload = spec.payload();
-    if let Some(endpoint) = payload.as_ref().downcast_ref::<RtcDevNodeEndpoint>() {
-        return Ok(crate::vfs::rtc_devnode::inode_ops(endpoint));
+    // dev core 只保存 opaque payload；这里按注册的 VFS 适配器顺序解释 payload。
+    // devtmpfs 不直接 downcast 到具体设备 endpoint，从而保持核心文件系统对
+    // 后续设备类别开放。先复制适配器快照再调用构造函数，避免 VFS 适配器内部再
+    // 注册节点或访问 devtmpfs 时和全局 adapter 表形成锁顺序依赖。
+    let adapters = CUSTOM_DEVNODE_ADAPTERS.lock().clone();
+    for adapter in adapters {
+        if let Some(ops) = adapter.build(spec)? {
+            return Ok(ops);
+        }
     }
     Err(VfsError::InvalidArgument)
 }
@@ -2035,6 +2135,11 @@ pub struct DevTmpfsSuperblockOps {
     next_ino: AtomicU64,
     /// 超级块弱引用，创建 Inode 时需要
     sb: vfs::sync::Spinlock<Option<alloc::sync::Weak<Superblock>>>,
+    /// 本 devtmpfs 实例实际创建过的 POSIX `dev_t` 投影节点。
+    ///
+    /// 符号链接、普通文件、目录以及未注册 `dev_t` 的节点解绑时不能无条件清理
+    /// device_numbers registry，否则会误删其他兼容层入口留下的记录。
+    posix_owned_nodes: Spinlock<Vec<String>>,
 }
 
 impl DevTmpfsSuperblockOps {
@@ -2048,6 +2153,31 @@ impl DevTmpfsSuperblockOps {
 
     fn sb_weak(&self) -> Option<alloc::sync::Weak<Superblock>> {
         self.sb.lock().clone()
+    }
+
+    fn remember_posix_node(&self, name: &str) -> VfsResult<()> {
+        let mut nodes = self.posix_owned_nodes.lock();
+        if nodes.iter().any(|existing| existing == name) {
+            return Ok(());
+        }
+        nodes.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
+        nodes.push(String::from(name));
+        Ok(())
+    }
+
+    fn forget_posix_node(&self, name: &str) -> bool {
+        let mut nodes = self.posix_owned_nodes.lock();
+        let Some(index) = nodes.iter().position(|existing| existing == name) else {
+            return false;
+        };
+        nodes.remove(index);
+        true
+    }
+
+    fn rollback_posix_node(&self, name: &str) {
+        if self.forget_posix_node(name) {
+            super::device_numbers::unregister_node(name);
+        }
     }
 
     fn root_inode(&self) -> VfsResult<Arc<Inode>> {
@@ -2382,6 +2512,11 @@ impl DevTmpfsSuperblockOps {
             super::device_numbers::unregister_node(user_name);
             return Err(err);
         }
+        if let Err(err) = self.remember_posix_node(user_name) {
+            let _ = self.remove_node_at(user_name);
+            super::device_numbers::unregister_node(user_name);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -2392,7 +2527,10 @@ impl DevTmpfsSuperblockOps {
     /// 直接补绑。
     fn bind_registered_static_nodes(&self) -> VfsResult<()> {
         let mut bound: Vec<&'static str> = Vec::new();
-        for node in STATIC_DEV_NODES.lock().iter().copied() {
+        // 复制静态节点声明后再执行绑定，保证节点构造路径不会在持有全局静态
+        // 注册表锁时回调到 VFS 或 dev core。
+        let nodes = STATIC_DEV_NODES.lock().clone();
+        for node in nodes {
             if let Err(err) = bind_static_node(self, node) {
                 for name in bound.iter().rev() {
                     let _ = self.unbind(name);
@@ -2453,6 +2591,11 @@ impl DevTmpfsSuperblockOps {
             super::device_numbers::unregister_node(user_name);
             return Err(err);
         }
+        if let Err(err) = self.remember_posix_node(user_name) {
+            let _ = self.remove_node_at(user_name);
+            super::device_numbers::unregister_node(user_name);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -2481,7 +2624,22 @@ impl DevTmpfsSuperblockOps {
         }
         let mut registered_rdev = false;
         let rdev = if let Some(rdev) = spec.rdev() {
-            DevId::new(rdev.major, rdev.minor)
+            let rdev = DevId::new(rdev.major, rdev.minor);
+            match spec.kind() {
+                CustomDevNodeKind::CharDevice => {
+                    registered_rdev = true;
+                    super::device_numbers::register_char_with_rdev(spec.name(), spec.name(), rdev)
+                        .ok_or(VfsError::NoSpace)?
+                }
+                CustomDevNodeKind::BlockDevice => {
+                    registered_rdev = true;
+                    super::device_numbers::register_block_with_rdev(spec.name(), spec.name(), rdev)
+                        .ok_or(VfsError::NoSpace)?
+                }
+                CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => {
+                    return Err(VfsError::InvalidArgument);
+                }
+            }
         } else {
             match spec.kind() {
                 CustomDevNodeKind::CharDevice => {
@@ -2497,11 +2655,24 @@ impl DevTmpfsSuperblockOps {
                 CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => DevId::new(0, 0),
             }
         };
-        let inode = self.new_custom_inode(spec, rdev)?;
+        let inode = match self.new_custom_inode(spec, rdev) {
+            Ok(inode) => inode,
+            Err(err) => {
+                if registered_rdev {
+                    super::device_numbers::unregister_node(spec.name());
+                }
+                return Err(err);
+            }
+        };
         if let Err(err) = self.insert_node_at(spec.name(), inode) {
             if registered_rdev {
                 super::device_numbers::unregister_node(spec.name());
             }
+            return Err(err);
+        }
+        if registered_rdev && let Err(err) = self.remember_posix_node(spec.name()) {
+            let _ = self.remove_node_at(spec.name());
+            super::device_numbers::unregister_node(spec.name());
             return Err(err);
         }
         Ok(())
@@ -2538,7 +2709,7 @@ impl DevTmpfsSuperblockOps {
     /// 解除设备绑定，删除 devtmpfs 中的相对路径节点。
     pub fn unbind(&self, user_name: &str) -> VfsResult<()> {
         self.remove_node_at(user_name)?;
-        super::device_numbers::unregister_node(user_name);
+        self.rollback_posix_node(user_name);
         Ok(())
     }
 
@@ -2659,6 +2830,7 @@ impl FsDriver for DevTmpfsDriver {
         let sb_ops = DevTmpfsSuperblockOps {
             next_ino: AtomicU64::new(2),
             sb: vfs::sync::Spinlock::new(None),
+            posix_owned_nodes: Spinlock::new(Vec::new()),
         };
 
         let sb = Superblock::new(move |weak_sb| {

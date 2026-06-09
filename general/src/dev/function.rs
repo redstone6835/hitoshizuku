@@ -434,11 +434,16 @@ pub fn block_device_from_function(func: &dyn DeviceFunction) -> Option<Arc<Block
 /// 应先按 `node_name` 查询兼容层 registry，再回到 typed device object。
 #[derive(Clone)]
 pub struct CharDevNodeProjection {
+    class_id: DeviceClassId,
     node_name: Box<str>,
     dev: CharDevice,
 }
 
 impl CharDevNodeProjection {
+    pub fn class_id(&self) -> DeviceClassId {
+        self.class_id
+    }
+
     pub fn node_name(&self) -> &str {
         &self.node_name
     }
@@ -451,11 +456,16 @@ impl CharDevNodeProjection {
 /// 一个已声明到 devtmpfs 的块设备投影。
 #[derive(Clone)]
 pub struct BlockDevNodeProjection {
+    class_id: DeviceClassId,
     node_name: Box<str>,
     dev: Arc<BlockDevice>,
 }
 
 impl BlockDevNodeProjection {
+    pub fn class_id(&self) -> DeviceClassId {
+        self.class_id
+    }
+
     pub fn node_name(&self) -> &str {
         &self.node_name
     }
@@ -472,6 +482,7 @@ impl BlockDevNodeProjection {
 pub fn active_char_devnode_projections(functions: &FunctionRegistry) -> Vec<CharDevNodeProjection> {
     let mut out = Vec::new();
     for func in functions.list() {
+        let class_id = func.class_id();
         let Some(nodes) = func.devnodes() else {
             continue;
         };
@@ -479,6 +490,7 @@ pub fn active_char_devnode_projections(functions: &FunctionRegistry) -> Vec<Char
             if let DevNodeSpec::Char { name, dev } = node {
                 if dev.is_active() {
                     out.push(CharDevNodeProjection {
+                        class_id,
                         node_name: name.clone(),
                         dev: dev.clone(),
                     });
@@ -495,6 +507,7 @@ pub fn active_block_devnode_projections(
 ) -> Vec<BlockDevNodeProjection> {
     let mut out = Vec::new();
     for func in functions.list() {
+        let class_id = func.class_id();
         let Some(nodes) = func.devnodes() else {
             continue;
         };
@@ -502,6 +515,7 @@ pub fn active_block_devnode_projections(
             if let DevNodeSpec::Block { name, dev } = node {
                 if dev.is_active() {
                     out.push(BlockDevNodeProjection {
+                        class_id,
                         node_name: name.clone(),
                         dev: Arc::clone(dev),
                     });
