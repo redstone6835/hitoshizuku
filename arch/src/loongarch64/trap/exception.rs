@@ -134,13 +134,20 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
             // 路径在 RX 队列空时本身极快（一次 mutex + 几次状态查询）。
             super::super::vdso::run_net_poll_hook(now_ns);
+            // TTY 输入泵：即使前台任务没有调用 read()，也要及时处理
+            // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
+            super::super::vdso::run_tty_poll_hook(now_ns);
             sched::preempt_if_needed(now_ns);
             return arg4;
         }
+        let now_ns = super::super::specific::kernel_timestamp_ns();
         let _ = general::dev::irq::dispatch_interrupt(intr);
+        // 串口输入在 UART 外部中断到来时最可靠：此时硬件 FIFO 已经可读，
+        // 需要马上拉进 TTY 行规程，避免没有 reader 的前台任务错过 Ctrl-C。
+        super::super::vdso::run_tty_poll_hook(now_ns);
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。
-        sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+        sched::preempt_if_needed(now_ns);
         arg4
     } else if ecode == ECODE_SYS {
         // syscall 通过注入的 SyscallFrameOps 读 a7/a0-a5、写返回值、推 PC。

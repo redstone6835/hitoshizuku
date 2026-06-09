@@ -68,6 +68,7 @@ static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
 static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
     Spinlock::new(BTreeMap::new());
+const TTY_ASYNC_PUMP_LIMIT: usize = 256;
 // FIXME(devtmpfs): 静态节点表是为了 null/zero/random 等无 PnP backing 设备保留的
 // 兼容入口。后续应收敛到统一 function projection registry，避免驱动直接调用
 // devtmpfs 发布路径。
@@ -908,6 +909,7 @@ impl TtyLineState {
 /// termios、窗口大小、前台进程组和规范模式行缓冲都属于控制终端本身，
 /// 必须在这些节点和所有 open fd 之间共享；每个 fd 只保留自己的状态标志。
 struct TtySharedState {
+    dev: CharDevice,
     termios: Spinlock<LinuxTermios>,
     winsize: Spinlock<LinuxWinSize>,
     foreground_pgrp: Spinlock<i32>,
@@ -915,8 +917,9 @@ struct TtySharedState {
 }
 
 impl TtySharedState {
-    fn new() -> Self {
+    fn new(dev: CharDevice) -> Self {
         Self {
+            dev,
             termios: Spinlock::new(LinuxTermios::new_default()),
             winsize: Spinlock::new(LinuxWinSize::default_console()),
             foreground_pgrp: Spinlock::new(0),
@@ -937,7 +940,7 @@ fn shared_tty_state(dev: &CharDevice) -> Option<Arc<TtySharedState>> {
 
     // 同一个底层 TTY 可能被投影成多个 `/dev` 节点，例如稳定的 console 别名
     // 和驱动自己的串口节点。行规程状态必须按设备共享，不能按 open fd 分裂。
-    let state = Arc::new(TtySharedState::new());
+    let state = Arc::new(TtySharedState::new(dev.clone()));
     // 共享状态缓存只是优化；如果名称键分配失败，当前 open fd 仍可持有独立
     // 状态继续工作，不能因为缓存失败阻断字符设备打开路径。
     if let Ok(key) = devtmpfs_fallible_string(dev.fw_name()) {
@@ -975,6 +978,22 @@ impl CharDevFileOps {
             Ok(stored)
         } else {
             operation::getpgid(0)
+        }
+    }
+
+    fn remember_reader_pgrp(&self, tty: &TtySharedState) {
+        let Ok(pgrp) = operation::getpgid(0) else {
+            return;
+        };
+        if pgrp <= 0 {
+            return;
+        }
+        let mut foreground = tty.foreground_pgrp.lock();
+        if *foreground <= 0 {
+            // 某些 shell 在当前作业控制尚不完整时不会显式 TIOCSPGRP。
+            // 记录最近的 tty reader 进程组，供 timer 输入泵在没有 reader
+            // 调用栈时仍能把 Ctrl-C 发给合理的前台组。
+            *foreground = pgrp;
         }
     }
 
@@ -1045,6 +1064,19 @@ impl CharDevFileOps {
         Some(n)
     }
 
+    fn dequeue_pending_bytes(&self, tty: &TtySharedState, buf: &mut [u8]) -> usize {
+        let mut state = tty.line_state.lock();
+        let mut n = 0usize;
+        while n < buf.len() {
+            let Some(byte) = state.ready.pop_front() else {
+                break;
+            };
+            buf[n] = byte;
+            n += 1;
+        }
+        n
+    }
+
     fn send_fg_signal(&self, sig: sched::SignalNumber) {
         let stored = self
             .tty
@@ -1103,6 +1135,183 @@ impl CharDevFileOps {
         Err(VfsError::Interrupted)
     }
 
+    fn handle_async_input_signal(
+        &self,
+        tty: &TtySharedState,
+        ch: u8,
+        termios: LinuxTermios,
+    ) -> VfsResult<()> {
+        // 异步输入泵没有用户态 read() 调用栈，不能完全依赖当前 termios 的
+        // ISIG 状态：BusyBox shell 在启动前台命令前可能短暂把终端切到 raw
+        // 模式。此时 Ctrl-C 如果按普通字节排队，就会等到前台命令结束后才
+        // 被 shell 读到。这里仅对 VINTR/VQUIT/VSUSP 做兜底信号化，普通字节
+        // 仍进入行规程 pending 队列，避免破坏 raw 模式数据流。
+        let sig = termios.signal_for_input(ch).or_else(|| {
+            if ch == 0 {
+                None
+            } else if ch == termios.vintr() {
+                Some(sched::SignalNumber::SIGINT)
+            } else if ch == termios.vquit() {
+                Some(sched::SignalNumber::SIGQUIT)
+            } else if ch == termios.vsusp() {
+                Some(sched::SignalNumber::SIGTSTP)
+            } else {
+                None
+            }
+        });
+        let Some(sig) = sig else {
+            return Ok(());
+        };
+        self.send_fg_signal(sig);
+        tty.line_state.lock().clear();
+        self.echo_signal_char(sig, termios);
+        Err(VfsError::Interrupted)
+    }
+
+    fn pump_tty_canonical_once(
+        &self,
+        tty: &TtySharedState,
+        termios: LinuxTermios,
+    ) -> VfsResult<bool> {
+        let mut byte = [0u8; 1];
+        let n = self.dev.read(&mut byte).map_err(map_char_err)?;
+        if n == 0 {
+            return Ok(false);
+        }
+
+        let mut ch = byte[0];
+        if termios.icrnl() && ch == b'\r' {
+            ch = b'\n';
+        }
+        if termios.ixon() && (ch == 17 || ch == 19) {
+            return Ok(true);
+        }
+        self.handle_input_signal(tty, ch, termios)?;
+
+        let mut echo_bytes: Option<Vec<u8>> = None;
+        {
+            let mut state = tty.line_state.lock();
+            if ch == termios.verase() && ch != 0 {
+                if state.line.pop().is_some() && termios.echo() {
+                    echo_bytes = Some(if termios.echoe() {
+                        Vec::from(&b"\x08 \x08"[..])
+                    } else {
+                        Vec::from(&[ch][..])
+                    });
+                }
+            } else if ch == termios.vkill() && ch != 0 {
+                let erased = state.line.len();
+                state.line.clear();
+                if erased != 0 && termios.echo() {
+                    let mut out = Vec::new();
+                    if termios.echoe() {
+                        out.reserve(erased * 3);
+                        for _ in 0..erased {
+                            out.extend_from_slice(b"\x08 \x08");
+                        }
+                    }
+                    if termios.echok() {
+                        out.push(b'\n');
+                    }
+                    if !out.is_empty() {
+                        echo_bytes = Some(out);
+                    }
+                }
+            } else if ch == termios.veof() && ch != 0 {
+                if state.line.is_empty() {
+                    state.eof_pending = true;
+                } else {
+                    while let Some(byte) = state.line.first().copied() {
+                        state.ready.push_back(byte);
+                        state.line.remove(0);
+                    }
+                }
+            } else {
+                state.line.push(ch);
+                if termios.echo() {
+                    echo_bytes = Some(Vec::from(&[ch][..]));
+                }
+                if ch == b'\n' {
+                    while let Some(byte) = state.line.first().copied() {
+                        state.ready.push_back(byte);
+                        state.line.remove(0);
+                    }
+                }
+            }
+        }
+
+        if let Some(bytes) = echo_bytes.as_deref() {
+            let _ = self.write_tty_bytes(bytes, termios);
+        }
+        Ok(true)
+    }
+
+    fn process_raw_input_bytes(
+        &self,
+        tty: &TtySharedState,
+        termios: LinuxTermios,
+        buf: &mut [u8],
+        force_control_signal: bool,
+    ) -> VfsResult<usize> {
+        let mut out = 0usize;
+        for idx in 0..buf.len() {
+            let mut ch = buf[idx];
+            if termios.icrnl() && ch == b'\r' {
+                ch = b'\n';
+            }
+            if termios.ixon() && (ch == 17 || ch == 19) {
+                continue;
+            }
+            if force_control_signal {
+                self.handle_async_input_signal(tty, ch, termios)?;
+            } else {
+                self.handle_input_signal(tty, ch, termios)?;
+            }
+            buf[out] = ch;
+            out += 1;
+        }
+        if out != 0 && termios.echo() {
+            let _ = self.write_tty_bytes(&buf[..out], termios);
+        }
+        Ok(out)
+    }
+
+    fn pump_tty_raw_once(&self, tty: &TtySharedState, termios: LinuxTermios) -> VfsResult<bool> {
+        let mut byte = [0u8; 1];
+        let n = self.dev.read(&mut byte).map_err(map_char_err)?;
+        if n == 0 {
+            return Ok(false);
+        }
+
+        let produced = self.process_raw_input_bytes(tty, termios, &mut byte, true)?;
+        if produced == 0 {
+            return Ok(true);
+        }
+        let mut state = tty.line_state.lock();
+        state
+            .ready
+            .try_reserve(produced)
+            .map_err(|_| VfsError::NoSpace)?;
+        for &byte in &byte[..produced] {
+            state.ready.push_back(byte);
+        }
+        Ok(true)
+    }
+
+    fn drain_tty_input(&self, tty: &TtySharedState, termios: LinuxTermios) {
+        for _ in 0..TTY_ASYNC_PUMP_LIMIT {
+            let result = if termios.canonical() {
+                self.pump_tty_canonical_once(tty, termios)
+            } else {
+                self.pump_tty_raw_once(tty, termios)
+            };
+            match result {
+                Ok(true) | Err(VfsError::Interrupted) => {}
+                Ok(false) | Err(_) => break,
+            }
+        }
+    }
+
     fn read_tty_canonical(
         &self,
         tty: &TtySharedState,
@@ -1113,76 +1322,8 @@ impl CharDevFileOps {
             if let Some(n) = self.dequeue_ready(tty, buf) {
                 return Ok(n);
             }
-
-            let mut byte = [0u8; 1];
-            let n = self.dev.read(&mut byte).map_err(map_char_err)?;
-            if n == 0 {
+            if !self.pump_tty_canonical_once(tty, termios)? {
                 return Err(VfsError::WouldBlock);
-            }
-
-            let mut ch = byte[0];
-            if termios.icrnl() && ch == b'\r' {
-                ch = b'\n';
-            }
-            if termios.ixon() && (ch == 17 || ch == 19) {
-                continue;
-            }
-            self.handle_input_signal(tty, ch, termios)?;
-
-            let mut echo_bytes: Option<Vec<u8>> = None;
-            {
-                let mut state = tty.line_state.lock();
-                if ch == termios.verase() && ch != 0 {
-                    if state.line.pop().is_some() && termios.echo() {
-                        echo_bytes = Some(if termios.echoe() {
-                            Vec::from(&b"\x08 \x08"[..])
-                        } else {
-                            Vec::from(&[ch][..])
-                        });
-                    }
-                } else if ch == termios.vkill() && ch != 0 {
-                    let erased = state.line.len();
-                    state.line.clear();
-                    if erased != 0 && termios.echo() {
-                        let mut out = Vec::new();
-                        if termios.echoe() {
-                            out.reserve(erased * 3);
-                            for _ in 0..erased {
-                                out.extend_from_slice(b"\x08 \x08");
-                            }
-                        }
-                        if termios.echok() {
-                            out.push(b'\n');
-                        }
-                        if !out.is_empty() {
-                            echo_bytes = Some(out);
-                        }
-                    }
-                } else if ch == termios.veof() && ch != 0 {
-                    if state.line.is_empty() {
-                        state.eof_pending = true;
-                    } else {
-                        while let Some(byte) = state.line.first().copied() {
-                            state.ready.push_back(byte);
-                            state.line.remove(0);
-                        }
-                    }
-                } else {
-                    state.line.push(ch);
-                    if termios.echo() {
-                        echo_bytes = Some(Vec::from(&[ch][..]));
-                    }
-                    if ch == b'\n' {
-                        while let Some(byte) = state.line.first().copied() {
-                            state.ready.push_back(byte);
-                            state.line.remove(0);
-                        }
-                    }
-                }
-            }
-
-            if let Some(bytes) = echo_bytes.as_deref() {
-                let _ = self.write_tty_bytes(bytes, termios);
             }
         }
     }
@@ -1194,25 +1335,17 @@ impl CharDevFileOps {
         termios: LinuxTermios,
     ) -> VfsResult<usize> {
         let want = termios.vmin().max(1) as usize;
-        let mut filled = 0usize;
+        let mut filled = self.dequeue_pending_bytes(tty, buf);
+        if filled >= want || filled == buf.len() {
+            return Ok(filled);
+        }
         loop {
-            let n = self.dev.read(&mut buf[filled..]).map_err(map_char_err)?;
+            let start = filled;
+            let n = self.dev.read(&mut buf[start..]).map_err(map_char_err)?;
             if n != 0 {
-                let start = filled;
-                filled += n;
-                if termios.icrnl() {
-                    for byte in &mut buf[start..filled] {
-                        if *byte == b'\r' {
-                            *byte = b'\n';
-                        }
-                    }
-                }
-                for idx in start..filled {
-                    self.handle_input_signal(tty, buf[idx], termios)?;
-                }
-                if termios.echo() {
-                    let _ = self.write_tty_bytes(&buf[start..filled], termios);
-                }
+                let produced =
+                    self.process_raw_input_bytes(tty, termios, &mut buf[start..start + n], false)?;
+                filled += produced;
                 if filled >= want || filled == buf.len() {
                     return Ok(filled);
                 }
@@ -1226,14 +1359,48 @@ impl CharDevFileOps {
     }
 }
 
+/// 从已打开的 TTY 中主动拉取输入，供 timer tick 路径调用。
+///
+/// 串口中断只能说明底层 FIFO 有字节，不能替代终端行规程。若前台程序
+/// 没有调用 `read()`（例如 `sleep`），Ctrl-C/Ctrl-\ /Ctrl-Z 仍必须被
+/// 终端识别并投递给前台进程组；因此这里在 tick 上做一次有界 drain。
+/// 非规范模式下普通字节会进入 TTY pending 队列，由之后的 read() 取走；
+/// 控制字符则立即处理，避免 raw-mode shell 启动前台程序后 Ctrl-C 滞留。
+pub fn poll_tty_input() {
+    let mut active = Vec::new();
+    {
+        let mut states = TTY_SHARED_STATES.lock();
+        states.retain(|_, weak| {
+            let Some(tty) = weak.upgrade() else {
+                return false;
+            };
+            active.push(tty);
+            true
+        });
+    }
+
+    for tty in active {
+        if !tty.dev.is_active() {
+            continue;
+        }
+        let termios = *tty.termios.lock();
+        let ops = CharDevFileOps::new(tty.dev.clone(), false, Some(Arc::clone(&tty)));
+        ops.drain_tty_input(&tty, termios);
+    }
+}
+
 impl FileOps for CharDevFileOps {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        if buf.is_empty() || self.nonblock.load(Ordering::Acquire) || !self.is_tty() {
+        if buf.is_empty() || !self.is_tty() {
             return self.dev.read(buf).map_err(map_char_err);
         }
         let Some(tty) = self.tty.as_deref() else {
             return self.dev.read(buf).map_err(map_char_err);
         };
+        // O_NONBLOCK 只影响没有完整输入时是否等待，不能绕过 TTY 行规程。
+        // Ctrl-C/Ctrl-D 等控制字符必须先经过 ISIG/ICANON 处理，再由 syscall
+        // 层把 WouldBlock 按文件状态转换成 EAGAIN 或阻塞等待。
+        self.remember_reader_pgrp(tty);
         let termios = *tty.termios.lock();
         if termios.canonical() {
             self.read_tty_canonical(tty, buf, termios)

@@ -701,27 +701,13 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Ok(0);
     }
     let deadline = sched::now_ns_public().saturating_add(ns_total as u64);
-    loop {
-        if sched::now_ns_public() >= deadline {
-            return Ok(0);
+    match sleep_until_deadline(&ctx.task, deadline, || Ok(sched::now_ns_public())) {
+        Ok(()) => Ok(0),
+        Err(Errno::EINTR) => {
+            write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()));
+            Err(Errno::EINTR)
         }
-        sched::operation::sched_yield()?;
-        let pending = sched::operation::sigpending()?;
-        if pending.raw() != 0 {
-            if rem_user != 0 {
-                let now = sched::now_ns_public();
-                let remaining_ns = deadline.saturating_sub(now) as i64;
-                let rem_sec = remaining_ns / 1_000_000_000;
-                let rem_nsec = remaining_ns % 1_000_000_000;
-                let rem_buf = rem_sec
-                    .to_le_bytes()
-                    .into_iter()
-                    .chain(rem_nsec.to_le_bytes())
-                    .collect::<Vec<_>>();
-                let _ = copy_to_user(rem_user, &rem_buf);
-            }
-            return Err(Errno::EINTR);
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -790,33 +776,84 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if !absolute && sec == 0 && nsec == 0 {
         return Ok(0);
     }
-    loop {
-        let now = if absolute {
-            crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)?
+    let now_fn = || {
+        if absolute {
+            crate::vdso::clock_time_ns(clock_id as usize).ok_or(Errno::EINVAL)
         } else {
-            sched::now_ns_public()
-        };
-        if now >= deadline {
-            return Ok(0);
+            Ok(sched::now_ns_public())
         }
-        sched::operation::sched_yield()?;
-        let pending = sched::operation::sigpending()?;
-        if pending.raw() != 0 {
-            if !absolute && rem_user != 0 {
-                let now = sched::now_ns_public();
-                let remaining_ns = deadline.saturating_sub(now) as i64;
-                let rem_sec = remaining_ns / 1_000_000_000;
-                let rem_nsec = remaining_ns % 1_000_000_000;
-                let rem_buf = rem_sec
-                    .to_le_bytes()
-                    .into_iter()
-                    .chain(rem_nsec.to_le_bytes())
-                    .collect::<Vec<_>>();
-                let _ = copy_to_user(rem_user, &rem_buf);
+    };
+    match sleep_until_deadline(&ctx.task, deadline, now_fn) {
+        Ok(()) => Ok(0),
+        Err(Errno::EINTR) => {
+            if !absolute {
+                write_remaining_timespec(rem_user, deadline.saturating_sub(sched::now_ns_public()));
             }
+            Err(Errno::EINTR)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn sleep_until_deadline(
+    task: &Arc<Task>,
+    deadline: u64,
+    mut now_fn: impl FnMut() -> Result<u64, Errno>,
+) -> Result<(), Errno> {
+    loop {
+        if now_fn()? >= deadline {
+            return Ok(());
+        }
+        if sched::operation::has_interrupting_signal(task) {
             return Err(Errno::EINTR);
         }
+
+        if !task.cas_state(TaskState::Running, TaskState::Sleeping)
+            && !task.cas_state(TaskState::Runnable, TaskState::Sleeping)
+            && task.state() != TaskState::Sleeping
+        {
+            sched::operation::sched_yield()?;
+            continue;
+        }
+
+        let now = now_fn()?;
+        if now >= deadline {
+            restore_current_task_after_sleep(task);
+            return Ok(());
+        }
+        if sched::operation::has_interrupting_signal(task) {
+            restore_current_task_after_sleep(task);
+            return Err(Errno::EINTR);
+        }
+
+        let sleep_deadline = sched::now_ns_public().saturating_add(deadline.saturating_sub(now));
+        if !sched::register_sleep_deadline(task, sleep_deadline) {
+            restore_current_task_after_sleep(task);
+            return Ok(());
+        }
+        sched::schedule_once(sched::now_ns_public());
+        sched::cancel_sleep_deadline(task);
+        restore_current_task_after_sleep(task);
     }
+}
+
+fn restore_current_task_after_sleep(task: &Arc<Task>) {
+    if !task.cas_state(TaskState::Sleeping, TaskState::Running) {
+        let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
+    }
+}
+
+fn write_remaining_timespec(rem_user: usize, remaining_ns: u64) {
+    if rem_user == 0 {
+        return;
+    }
+    let remaining_ns = remaining_ns.min(i64::MAX as u64) as i64;
+    let rem_sec = remaining_ns / 1_000_000_000;
+    let rem_nsec = remaining_ns % 1_000_000_000;
+    let mut rem_buf = [0u8; 16];
+    rem_buf[0..8].copy_from_slice(&rem_sec.to_le_bytes());
+    rem_buf[8..16].copy_from_slice(&rem_nsec.to_le_bytes());
+    let _ = copy_to_user(rem_user, &rem_buf);
 }
 
 pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
