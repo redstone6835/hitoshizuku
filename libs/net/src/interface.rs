@@ -23,6 +23,7 @@ use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ip
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
 use crate::socket::SocketMeta;
+use crate::tuning::{PacketBufferTuning, TcpBufferTuning};
 
 // ── ManagedInterface ─────────────────────────────────────────────────────────
 
@@ -123,12 +124,15 @@ impl ManagedInterface {
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
     ///
     /// 同时清理已标记为 removed 的 socket。
-    pub fn poll(&mut self, timestamp: Instant) {
+    pub fn poll(&mut self, timestamp: Instant) -> bool {
         if !self.admin_up {
-            return;
+            return false;
         }
-        self.iface
-            .poll(timestamp, &mut self.device, &mut self.sockets);
+        let changed = matches!(
+            self.iface
+                .poll(timestamp, &mut self.device, &mut self.sockets),
+            iface::PollResult::SocketStateChanged
+        );
         // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的
         // orphan socket。orphan 用于 fd 已释放但 FIN/ACK 仍需继续推进的
         // 场景，不能像普通 remove 一样在 close 后立刻摘掉。
@@ -152,6 +156,7 @@ impl ManagedInterface {
         for h in to_remove {
             self.remove_socket_locked(h);
         }
+        changed
     }
 
     /// 接口名称。
@@ -322,6 +327,58 @@ impl ManagedInterface {
         false
     }
 
+    /// 检查 TCP 本地端口是否已被当前接口上的其它 socket 占用。
+    ///
+    /// 主动连接自动选择本地端口时必须在同一把接口锁内检查占用，避免两个
+    /// 并发连接拿到相同端口。这里保守地把监听、正在连接、已建立以及关闭
+    /// 尾部状态的 socket 都视为占用者。
+    pub fn tcp_local_port_in_use(&self, exclude: SocketHandle, port: u16) -> bool {
+        for (handle, socket) in self.sockets.iter() {
+            if handle == exclude {
+                continue;
+            }
+            let Some(meta) = self.meta.get(&handle) else {
+                continue;
+            };
+            if meta.is_removed() || meta.is_orphaned() {
+                continue;
+            }
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            if tcp.listen_endpoint().port == port {
+                return true;
+            }
+            if tcp.local_endpoint().is_some_and(|ep| ep.port == port) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 检查 UDP 监听端点是否已被当前接口上的其它 socket 占用。
+    pub fn udp_endpoint_in_use(&self, exclude: SocketHandle, target: IpListenEndpoint) -> bool {
+        for (handle, socket) in self.sockets.iter() {
+            if handle == exclude {
+                continue;
+            }
+            let Some(meta) = self.meta.get(&handle) else {
+                continue;
+            };
+            if meta.is_removed() || meta.is_orphaned() {
+                continue;
+            }
+            let smoltcp::socket::Socket::Udp(udp) = socket else {
+                continue;
+            };
+            let endpoint = udp.endpoint();
+            if endpoint.port != 0 && listen_endpoint_matches(endpoint, target) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Soft-close：标记 socket 为已移除（延迟到下一轮 poll 时真正释放）。
     ///
     /// **本接口仅供内部 soft-close 协议使用**——上层关闭文件 fd 时应直接
@@ -436,11 +493,11 @@ impl ManagedInterface {
     // ── Socket 管理 ──────────────────────────────────────────────────────
 
     /// 创建一个 TCP socket 并加入本接口的 SocketSet。
-    pub fn add_tcp_socket(&mut self, rx_buf_size: usize, tx_buf_size: usize) -> SocketHandle {
-        // TODO: 缓冲区大小由调用方固定传入，缺少 SO_SNDBUF/SO_RCVBUF
-        // 动态调整和内存压力下的 backpressure 策略。
-        let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; rx_buf_size]);
-        let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tx_buf_size]);
+    pub fn add_tcp_socket(&mut self, tuning: TcpBufferTuning) -> SocketHandle {
+        // 缓冲容量由网络栈调优配置统一提供，后续接入 per-socket option 时只需
+        // 在 stack 层选择不同配置，不再修改协议适配层。
+        let rx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tuning.rx_bytes]);
+        let tx_buf = smoltcp::socket::tcp::SocketBuffer::new(alloc::vec![0u8; tuning.tx_bytes]);
         let mut socket = smoltcp::socket::tcp::Socket::new(rx_buf, tx_buf);
         // 当前 syscall 层会分块搬运用户缓冲；在 loopback 大 MTU 下这些块
         // 往往小于 MSS，若默认启用 Nagle，iperf/netperf 这类连续写会很快
@@ -453,22 +510,14 @@ impl ManagedInterface {
     }
 
     /// 创建一个 UDP socket 并加入本接口的 SocketSet。
-    pub fn add_udp_socket(
-        &mut self,
-        rx_buf_size: usize,
-        tx_buf_size: usize,
-        rx_meta_count: usize,
-        tx_meta_count: usize,
-    ) -> SocketHandle {
-        // TODO: UDP packet metadata 数量固定，队列满时只能 WouldBlock；
-        // 还没有按 socket option 或负载自动调节。
+    pub fn add_udp_socket(&mut self, tuning: PacketBufferTuning) -> SocketHandle {
         let rx_buf = smoltcp::socket::udp::PacketBuffer::new(
-            alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; rx_meta_count],
-            alloc::vec![0u8; rx_buf_size],
+            alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; tuning.rx_meta],
+            alloc::vec![0u8; tuning.rx_bytes],
         );
         let tx_buf = smoltcp::socket::udp::PacketBuffer::new(
-            alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; tx_meta_count],
-            alloc::vec![0u8; tx_buf_size],
+            alloc::vec![smoltcp::socket::udp::PacketMetadata::EMPTY; tuning.tx_meta],
+            alloc::vec![0u8; tuning.tx_bytes],
         );
         let socket = smoltcp::socket::udp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
@@ -522,11 +571,16 @@ impl ManagedInterface {
     }
 
     /// 创建一个 raw IP socket（指定 IP 版本和协议号）。
-    pub fn add_raw_socket(&mut self, ip_version: u8, protocol: u8) -> SocketHandle {
+    pub fn add_raw_socket(
+        &mut self,
+        ip_version: u8,
+        protocol: u8,
+        tuning: PacketBufferTuning,
+    ) -> SocketHandle {
         use smoltcp::socket::raw;
         use smoltcp::wire::{IpProtocol, IpVersion};
-        // TODO: raw buffer/meta 容量写死，且缺少协议过滤以外的 socket option
-        // 支持，例如 IP_HDRINCL、TTL/TOS 和接收控制消息。
+        // TODO: raw socket 仍缺少协议过滤以外的 option 支持，例如头部包含
+        // 语义、TTL/TOS 和接收控制消息；容量本身已由调优配置统一管理。
         let ip_ver = if ip_version == 6 {
             IpVersion::Ipv6
         } else {
@@ -534,12 +588,12 @@ impl ManagedInterface {
         };
         let proto = IpProtocol::from(protocol);
         let rx_buf = raw::PacketBuffer::new(
-            alloc::vec![raw::PacketMetadata::EMPTY; 8],
-            alloc::vec![0u8; 8192],
+            alloc::vec![raw::PacketMetadata::EMPTY; tuning.rx_meta],
+            alloc::vec![0u8; tuning.rx_bytes],
         );
         let tx_buf = raw::PacketBuffer::new(
-            alloc::vec![raw::PacketMetadata::EMPTY; 8],
-            alloc::vec![0u8; 8192],
+            alloc::vec![raw::PacketMetadata::EMPTY; tuning.tx_meta],
+            alloc::vec![0u8; tuning.tx_bytes],
         );
         let socket = raw::Socket::new(Some(ip_ver), Some(proto), rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
@@ -548,17 +602,17 @@ impl ManagedInterface {
     }
 
     /// 创建一个 ICMP socket。
-    pub fn add_icmp_socket(&mut self) -> SocketHandle {
+    pub fn add_icmp_socket(&mut self, tuning: PacketBufferTuning) -> SocketHandle {
         use smoltcp::socket::icmp;
         // TODO: ICMP 当前是最小 echo 能力，未建模 identifier、sequence
         // 分发、错误报文队列和 IPv6 ICMP 差异。
         let rx_buf = icmp::PacketBuffer::new(
-            alloc::vec![icmp::PacketMetadata::EMPTY; 8],
-            alloc::vec![0u8; 8192],
+            alloc::vec![icmp::PacketMetadata::EMPTY; tuning.rx_meta],
+            alloc::vec![0u8; tuning.rx_bytes],
         );
         let tx_buf = icmp::PacketBuffer::new(
-            alloc::vec![icmp::PacketMetadata::EMPTY; 8],
-            alloc::vec![0u8; 8192],
+            alloc::vec![icmp::PacketMetadata::EMPTY; tuning.tx_meta],
+            alloc::vec![0u8; tuning.tx_bytes],
         );
         let socket = icmp::Socket::new(rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
