@@ -23,8 +23,8 @@ use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::sched_class::SchedAttr;
 use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
-    migrate_task, online_cpu_mask, request_post_syscall_handoff, request_resched, root_pid_ns,
-    runqueue_of, sched_topology, schedule_once, signal_wakeup, supported_cpu_mask,
+    migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
+    root_pid_ns, runqueue_of, sched_topology, schedule_once, signal_wakeup, supported_cpu_mask,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
@@ -358,8 +358,11 @@ pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
         .map(|cpu| cpu.get());
 
     if let Some(target_cpu) = target {
-        if migrate_task(&task, target_cpu).is_err() && current_cpu < NR_CPUS {
-            request_resched(current_cpu);
+        if migrate_task(&task, target_cpu).is_err() {
+            request_balance(target_cpu);
+            if current_cpu < NR_CPUS {
+                request_resched(current_cpu);
+            }
         }
     } else if current_cpu < NR_CPUS {
         request_resched(current_cpu);

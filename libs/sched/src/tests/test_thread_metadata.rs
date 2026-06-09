@@ -105,3 +105,23 @@ fn runqueue_migratable_load_excludes_idle_class() {
     assert!(rq.dequeue(&fair, 2));
     assert!(rq.dequeue(&idle, 2));
 }
+
+#[ktest]
+fn runqueue_migratable_load_filters_cpu_affinity() {
+    let cpu0 = make_task();
+    let cpu1 = make_task();
+    cpu0.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    cpu1.set_cpu_affinity(CpuMask::single_raw(1).bits());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&cpu0), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&cpu1), 1);
+
+    assert_eq!(rq.migratable_load(), 2);
+    assert_eq!(rq.migratable_load_for(CpuMask::single_raw(0).bits()), 1);
+    assert_eq!(rq.migratable_load_for(CpuMask::single_raw(1).bits()), 1);
+    assert_eq!(rq.migratable_load_for(CpuMask::single_raw(2).bits()), 0);
+
+    assert!(rq.dequeue(&cpu0, 2));
+    assert!(rq.dequeue(&cpu1, 2));
+}

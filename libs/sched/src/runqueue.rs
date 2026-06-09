@@ -153,6 +153,29 @@ impl Runqueue {
         inner.fair_tree.len() + inner.rt_tree.len() + inner.deadline_tree.len()
     }
 
+    /// 对指定 CPU 许可位可迁移的就绪负载。
+    ///
+    /// 亲和性收窄后，任务可能短暂留在旧 CPU 的 rq 中；负载均衡只应选择
+    /// 确实能被目标 CPU 拉走的源队列。
+    pub fn migratable_load_for(&self, allowed_cpu_mask: u64) -> usize {
+        let inner = self.inner.lock();
+        inner
+            .fair_tree
+            .values()
+            .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+            .count()
+            + inner
+                .rt_tree
+                .values()
+                .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+                .count()
+            + inner
+                .deadline_tree
+                .values()
+                .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+                .count()
+    }
+
     pub fn set_current(&self, task: Arc<Task>) {
         let mut inner = self.inner.lock();
         if let Some(old) = inner.current.take() {

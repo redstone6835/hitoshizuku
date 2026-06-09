@@ -3,6 +3,7 @@
 use ktest::ktest;
 
 use crate::cpu::{CpuId, CpuMask, ROOT_SCHED_DOMAIN_ID, SchedDomain, SchedTopology};
+use crate::scheduler::select_balance_source;
 use crate::{NR_CPUS, supported_cpu_mask};
 
 #[ktest]
@@ -100,4 +101,21 @@ fn sched_topology_falls_back_to_root_when_local_domain_unusable() {
         })
         .expect("selected remote cpu");
     assert_eq!(chosen.get(), 3);
+}
+
+#[ktest]
+fn balance_source_allows_single_remote_task_when_local_is_idle() {
+    let topology = SchedTopology::bootstrap();
+    let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
+
+    let source = select_balance_source(topology, CpuId::new(1).unwrap(), online, 0, |cpu| {
+        if cpu.get() == 0 { 1 } else { 0 }
+    })
+    .expect("idle cpu should pull the only remote task");
+    assert_eq!(source.get(), 0);
+
+    let no_pull = select_balance_source(topology, CpuId::new(1).unwrap(), online, 1, |cpu| {
+        if cpu.get() == 0 { 2 } else { 1 }
+    });
+    assert!(no_pull.is_none());
 }

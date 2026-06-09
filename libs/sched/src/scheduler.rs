@@ -56,6 +56,10 @@ static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
 /// 路径 / 主动 yield 入口读到 true 即调一次 [`schedule_once`]。
 static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
 
+/// 每核负载拉取请求。其它 CPU 不能直接摘走某个 CPU 的 current，因此只能
+/// 通过这个标志让目标 CPU 在调度边界按调度域主动拉取可迁移任务。
+static NEED_BALANCE: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+
 /// 每核 syscall 收尾后的启动交接轮数。
 ///
 /// clone/fork 成功时只登记这个计数；真正调度发生在 syscall 分发器已经写好
@@ -376,6 +380,14 @@ pub fn request_resched(cpu_id: usize) {
     }
 }
 
+pub fn request_balance(cpu_id: usize) {
+    if cpu_id >= NR_CPUS {
+        return;
+    }
+    NEED_BALANCE[cpu_id].store(true, Ordering::Release);
+    request_resched(cpu_id);
+}
+
 pub fn request_post_syscall_handoff() {
     let cpu_id = cpu();
     let cell = &POST_SYSCALL_HANDOFF[cpu_id];
@@ -694,22 +706,14 @@ pub fn balance_once(cpu_id: usize) -> bool {
         return false;
     }
 
-    let local_load = RUNQUEUES[cpu_id].migratable_load();
-    let mut busiest = None;
-    let mut busiest_load = local_load;
-    let sources = sched_topology().balance_sources(local_cpu, online);
-    for other in sources.iter() {
-        let other_id = other.get();
-        let load = RUNQUEUES[other_id].migratable_load();
-        if load > busiest_load + 1 {
-            busiest = Some(other_id);
-            busiest_load = load;
-        }
-    }
-    let Some(src) = busiest else {
+    let allowed = CpuMask::single(local_cpu).bits();
+    let local_load = RUNQUEUES[cpu_id].migratable_load_for(allowed);
+    let Some(src) = select_balance_source(sched_topology(), local_cpu, online, local_load, |cpu| {
+        RUNQUEUES[cpu.get()].migratable_load_for(allowed)
+    })
+    .map(|cpu| cpu.get()) else {
         return false;
     };
-    let allowed = CpuMask::single(local_cpu).bits();
     let Some(task) = RUNQUEUES[src].take_migratable(allowed, now_ns_internal()) else {
         return false;
     };
@@ -717,6 +721,66 @@ pub fn balance_once(cpu_id: usize) -> bool {
     RUNQUEUES[cpu_id].enqueue(task, now_ns_internal());
     request_resched(cpu_id);
     true
+}
+
+pub(crate) fn select_balance_source<F>(
+    topology: SchedTopology,
+    local_cpu: CpuId,
+    online: CpuMask,
+    local_load: usize,
+    mut load_of: F,
+) -> Option<CpuId>
+where
+    F: FnMut(CpuId) -> usize,
+{
+    let mut busiest = None;
+    let mut busiest_load = local_load;
+    let sources = topology.balance_sources(local_cpu, online);
+    for other in sources.iter() {
+        let load = load_of(other);
+        if load == 0 {
+            continue;
+        }
+        let should_pull = if local_load == 0 {
+            busiest.is_none() || load > busiest_load
+        } else {
+            load > local_load.saturating_add(1) && load > busiest_load
+        };
+        if should_pull {
+            busiest = Some(other);
+            busiest_load = load;
+        }
+    }
+    busiest
+}
+
+fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usize) {
+    let Some(source) = CpuId::new(source_cpu) else {
+        return;
+    };
+    if !task.sched.on_rq() || task.state() != TaskState::Runnable {
+        return;
+    }
+
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    if affinity.contains(source) {
+        return;
+    }
+
+    let online = online_cpu_set();
+    let allowed = affinity.intersection(online).without(source);
+    if allowed.is_empty() {
+        return;
+    }
+
+    let target = sched_topology().select_cpu(allowed, online, Some(source), false, |cpu| {
+        RUNQUEUES[cpu.get()].nr_running()
+    });
+    if let Some(cpu) = target {
+        if migrate_task(task, cpu.get()).is_err() {
+            request_balance(cpu.get());
+        }
+    }
 }
 
 // ── 信号唤醒 ─────────────────────────────────────────────────────────────────
@@ -793,7 +857,8 @@ pub fn schedule_once(now_ns: u64) {
         let _ = crate::operation::deliver_pending_signals();
     }
 
-    // 2. 挑下一个；pick_next 会把 prev 放回 tree（若仍 runnable）。
+    // 2. 挑下一个；pick_next 会把 prev 放回 tree（若仍 runnable）。若 prev 的
+    //    亲和性已经排除本 CPU，此时它已稳定停在旧 rq，可通知目标 CPU 拉取。
     let next = match RUNQUEUES[cpu_id].pick_next_on(now_ns, CpuMask::single_raw(cpu_id).bits()) {
         Some(t) => t,
         None => {
@@ -810,6 +875,7 @@ pub fn schedule_once(now_ns: u64) {
             idle
         }
     };
+    migrate_local_ineligible_or_request_balance(&prev, cpu_id);
 
     // 3. 自己被选回：继续跑即可。
     if Arc::ptr_eq(&prev, &next) {
@@ -886,6 +952,9 @@ pub fn preempt_if_needed(now_ns: u64) {
     }
     let cpu_id = cpu();
     if NEED_RESCHED[cpu_id].swap(false, Ordering::AcqRel) {
+        if NEED_BALANCE[cpu_id].swap(false, Ordering::AcqRel) {
+            let _ = balance_once(cpu_id);
+        }
         schedule_once(now_ns);
     }
 }
@@ -896,6 +965,7 @@ pub fn preempt_if_needed(now_ns: u64) {
 /// "硬件 wfi"等节能指令留到后续接 arch 钩子。
 unsafe extern "C" fn idle_entry(_cpu_arg: usize) -> ! {
     loop {
+        let _ = NEED_BALANCE[cpu()].swap(false, Ordering::AcqRel);
         let _ = balance_once(cpu());
         // 队列空时 schedule_once 也会走"idle == prev"的快路径直接返回；
         // 一旦有 runnable 任务进来，下一次 schedule_once 会把 idle 切走。
