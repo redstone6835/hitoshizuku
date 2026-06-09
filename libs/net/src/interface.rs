@@ -284,7 +284,10 @@ impl ManagedInterface {
         self.config.mode = IfMode::Static;
     }
 
-    /// 添加 IPv4 路由（smoltcp 仅支持默认路由）。
+    /// 添加 IPv4 路由到当前协议引擎。
+    ///
+    /// 内核网络层的完整选路由 [`crate::route`] 维护；这里仅把当前底层协议引擎
+    /// 能理解的默认网关同步进去。
     pub fn add_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
         let prefix_len = mask_to_prefix_len(mask);
         if prefix_len == 0 {
@@ -293,11 +296,7 @@ impl ManagedInterface {
                 .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
                 .ok();
         } else {
-            // smoltcp 不支持非默认路由，降级为默认网关
-            self.iface
-                .routes_mut()
-                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
-                .ok();
+            // 当前协议引擎没有非默认路由接口，保留内核路由表中的真实条目。
             let _ = (dest, prefix_len);
         }
     }

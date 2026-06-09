@@ -48,6 +48,7 @@ pub mod dhcp;
 pub mod driver;
 pub mod error;
 pub mod interface;
+pub mod route;
 pub mod socket;
 pub mod stack;
 pub mod tuning;
@@ -56,6 +57,7 @@ pub use config::{CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4A
 pub use device::{InterfaceId, NetDevice};
 pub use driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 pub use error::NetError;
+pub use route::{NextHop, RouteEntry, RouteLookup, RouteSource, RouteTable};
 pub use socket::{NetSocketHandle, SocketState, SocketType, TcpConnSnapshot, UdpSockSnapshot};
 pub use stack::stack;
 pub use stack::{

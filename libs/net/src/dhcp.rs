@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 use smoltcp::time::Instant;
 
-use crate::config::{Gateway, IfConfig, Ipv4Addr};
+use crate::config::{IfConfig, Ipv4Addr};
 
 const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 

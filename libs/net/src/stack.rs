@@ -32,6 +32,7 @@ use crate::config::{CidrAddress, Endpoint, Gateway, IfConfig, IpAddr, Ipv4Addr, 
 use crate::device::{InterfaceId, NetDevice};
 use crate::error::NetError;
 use crate::interface::ManagedInterface;
+use crate::route::{RouteEntry, RouteTable};
 use crate::socket::{NetSocketHandle, SocketState, SocketType};
 use crate::tuning::{EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBufferTuning};
 
@@ -65,6 +66,8 @@ pub struct NetStack {
     tuning: NetTuning,
     /// 接口注册表。读锁路径包含所有 I/O 操作，写锁仅 attach/detach 时持有。
     interfaces: RwLock<BTreeMap<InterfaceId, Arc<Mutex<ManagedInterface>>>>,
+    /// 协议无关路由表。接口配置和管理路由更新时同步维护。
+    routes: RwLock<RouteTable>,
     /// 全局 socket 事件通知队列。
     ///
     /// 所有阻塞在 recv/send/accept/connect 的 `NetSocketFileOps` 在
@@ -88,6 +91,7 @@ impl NetStack {
         Self {
             tuning: NetTuning::defaults(),
             interfaces: RwLock::new(BTreeMap::new()),
+            routes: RwLock::new(RouteTable::new()),
             notify_waiters: sched::WaitQueue::new(),
         }
     }
@@ -103,12 +107,16 @@ impl NetStack {
     /// 此操作短暂持有写锁，会暂停所有正在进行的 poll。
     pub fn attach(&self, dev: Arc<NetDevice>, config: IfConfig) -> Result<(), NetError> {
         let id = dev.id();
-        let managed = ManagedInterface::new(dev, config);
+        let managed = ManagedInterface::new(dev, config.clone());
         let mut table = self.interfaces.write();
         if table.contains_key(&id) {
             return Err(NetError::InterfaceExists);
         }
         table.insert(id, Arc::new(Mutex::new(managed)));
+        drop(table);
+        let mut routes = self.routes.write();
+        routes.replace_connected(id, &config.addresses);
+        routes.replace_gateway(id, config.gateway);
         Ok(())
     }
 
@@ -123,10 +131,14 @@ impl NetStack {
     /// **之前**调用，使正在进行的 RX/TX 立即看到设备失效。
     pub fn detach(&self, id: InterfaceId) -> Result<(), NetError> {
         let mut table = self.interfaces.write();
-        table
+        let removed = table
             .remove(&id)
             .map(|_| ())
-            .ok_or(NetError::InterfaceNotFound)
+            .ok_or(NetError::InterfaceNotFound);
+        if removed.is_ok() {
+            self.routes.write().remove_iface(id);
+        }
+        removed
     }
 
     /// 驱动所有活跃接口进行一轮收发。
@@ -815,6 +827,11 @@ impl NetStack {
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         managed.add_default_route_v4(gateway);
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .replace_gateway_v4(iface_id, Some(gateway));
         Ok(())
     }
 
@@ -824,6 +841,9 @@ impl NetStack {
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         managed.remove_default_route_v4();
+        drop(managed);
+        drop(table);
+        self.routes.write().replace_gateway_v4(iface_id, None);
         Ok(())
     }
 
@@ -840,6 +860,10 @@ impl NetStack {
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         managed.set_ipv4_addr(addr, prefix);
+        let addresses = managed.config().addresses.clone();
+        drop(managed);
+        drop(table);
+        self.routes.write().replace_connected(id, &addresses);
         Ok(())
     }
 
@@ -877,6 +901,14 @@ impl NetStack {
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         managed.add_route_v4(dest, mask, gw);
+        drop(managed);
+        drop(table);
+        self.routes.write().upsert(RouteEntry::static_v4(
+            dest,
+            mask_to_prefix_len(mask),
+            gw,
+            id,
+        ));
         Ok(())
     }
 
@@ -891,6 +923,11 @@ impl NetStack {
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         managed.remove_route_v4(dest, mask);
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .remove_static(id, CidrAddress::new_v4(dest, mask_to_prefix_len(mask)));
         Ok(())
     }
 
@@ -1461,34 +1498,20 @@ impl NetStack {
 
     // ── 内部辅助 ─────────────────────────────────────────────────────────
 
-    /// 按目标地址做最长前缀匹配选择出口接口（跳过 loopback）。
+    /// 按目标地址做最长前缀匹配选择出口接口。
     pub fn resolve_iface_for_remote(&self, remote: &crate::IpAddr) -> Option<InterfaceId> {
         if is_loopback_ip(remote) {
             return self.loopback_iface_id();
         }
+        let route = self.routes.read().lookup(remote)?;
         let table = self.interfaces.read();
-        let mut best: Option<(InterfaceId, u8)> = None;
-        for (&id, iface_lock) in table.iter() {
-            let managed = iface_lock.lock();
-            if managed.name() == "lo" {
-                continue;
-            }
-            for cidr in &managed.config().addresses {
-                if ip_matches_cidr(remote, cidr) {
-                    if best.map_or(true, |(_, p)| cidr.prefix_len > p) {
-                        best = Some((id, cidr.prefix_len));
-                    }
-                }
-            }
+        let iface = table.get(&route.iface)?;
+        let managed = iface.lock();
+        if managed.is_admin_up() {
+            Some(route.iface)
+        } else {
+            None
         }
-        if let Some((id, _)) = best {
-            return Some(id);
-        }
-        // 回退：第一个非 lo 接口
-        table
-            .iter()
-            .find(|&(_, lock)| lock.lock().name() != "lo")
-            .map(|(&id, _)| id)
     }
 
     /// 按单个地址选择接口。未指定地址保留现有默认选择；loopback 地址强制走 lo。
@@ -1694,21 +1717,6 @@ fn tcp_state_is_read_eof(state: smoltcp::socket::tcp::State) -> bool {
     matches!(state, S::CloseWait | S::Closing | S::LastAck | S::TimeWait)
 }
 
-fn ip_matches_cidr(addr: &crate::IpAddr, cidr: &crate::config::CidrAddress) -> bool {
-    match (addr, &cidr.addr) {
-        (crate::IpAddr::V4(a), crate::IpAddr::V4(c)) => {
-            if cidr.prefix_len == 0 {
-                return true;
-            }
-            let mask = !0u32 << (32 - cidr.prefix_len);
-            let a_int = u32::from_be_bytes(a.0);
-            let c_int = u32::from_be_bytes(c.0);
-            (a_int & mask) == (c_int & mask)
-        }
-        _ => false,
-    }
-}
-
 fn is_loopback_ip(addr: &crate::IpAddr) -> bool {
     match addr {
         crate::IpAddr::V4(v4) => v4.0[0] == 127,
@@ -1721,6 +1729,10 @@ fn is_unspecified_ip(addr: &crate::IpAddr) -> bool {
         crate::IpAddr::V4(v4) => *v4 == crate::Ipv4Addr::UNSPECIFIED,
         crate::IpAddr::V6(v6) => *v6 == crate::Ipv6Addr::UNSPECIFIED,
     }
+}
+
+fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
+    u32::from_be_bytes(mask.0).leading_ones() as u8
 }
 
 fn select_tcp_ephemeral_port(
