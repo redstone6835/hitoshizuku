@@ -207,12 +207,15 @@ unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<()
 }
 
 unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAccessError> {
-    if start_user.checked_add(max).map_or(true, |end| end > USER_SPACE_TOP) {
+    // 起始地址必须在用户空间内
+    if start_user >= USER_SPACE_TOP {
         return Err(UserAccessError::Fault);
     }
+    // clamp max 到地址空间边界，避免 start + max 溢出或越界判定为非法
+    let effective_max = max.min(USER_SPACE_TOP - start_user);
     let mut i = 0usize;
     unsafe { set_sum() };
-    while i < max {
+    while i < effective_max {
         let b: u8;
         let faulted: usize;
         unsafe {
@@ -239,7 +242,7 @@ unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAcces
         i += 1;
     }
     unsafe { clear_sum() };
-    Ok(max)
+    Ok(effective_max)
 }
 
 pub(super) static USER_ACCESS_OPS: UserAccessOps = UserAccessOps {

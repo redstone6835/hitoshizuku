@@ -9,7 +9,7 @@ pub fn monotonic_ns() -> u64 {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL timer is not implemented")
+        arch::kernel_timestamp_ns()
     }
 }
 
@@ -22,7 +22,7 @@ pub fn stable_counter_raw() -> u64 {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL timer is not implemented")
+        arch::stable_counter_raw()
     }
 }
 
@@ -35,7 +35,7 @@ pub fn stable_counter_hz() -> u64 {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL timer is not implemented")
+        arch::stable_counter_hz()
     }
 }
 
@@ -48,7 +48,6 @@ pub fn stable_counter_to_ns(cnt: u64) -> u64 {
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = cnt;
-        todo!("riscv64 HAL timer is not implemented")
+        arch::stable_counter_to_ns(cnt)
     }
 }

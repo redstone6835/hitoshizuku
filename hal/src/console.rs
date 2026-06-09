@@ -11,6 +11,6 @@ pub fn early_write_bytes(bytes: &[u8]) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 early write is not implemented")
+        arch::early_console::e_write_bytes(bytes);
     }
 }

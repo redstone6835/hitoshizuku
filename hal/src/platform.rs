@@ -11,7 +11,7 @@ pub fn arch_name() -> &'static str {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL platform metadata is not implemented")
+        "riscv64"
     }
 }
 
@@ -24,7 +24,7 @@ pub fn elf_arch() -> elf::Arch {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL ELF metadata is not implemented")
+        elf::Arch::Riscv64
     }
 }
 
@@ -37,6 +37,6 @@ pub fn default_pci_mmio_window() -> Option<Range<u64>> {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL PCI MMIO window is not implemented")
+        Some(0x4000_0000..0x8000_0000)
     }
 }

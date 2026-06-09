@@ -11,7 +11,9 @@ pub fn default_stack_top() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL user stack layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .default_stack_top
     }
 }
 
@@ -26,7 +28,9 @@ pub fn default_stack_size() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL user stack layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .default_stack_size
     }
 }
 
@@ -41,7 +45,9 @@ pub fn main_pie_base() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL user PIE layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .main_pie_base
     }
 }
 
@@ -56,7 +62,9 @@ pub fn interp_base() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL interpreter layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .interp_base
     }
 }
 
@@ -71,7 +79,9 @@ pub fn vdso_base() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL vDSO layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .vdso_base
     }
 }
 
@@ -84,7 +94,7 @@ pub fn vdso_data_page_offset() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL vDSO layout is not implemented")
+        arch::riscv64::vdso::VDSO_DATA_PAGE_OFFSET
     }
 }
 
@@ -97,7 +107,7 @@ pub fn vdso_text_page_len() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL vDSO layout is not implemented")
+        arch::riscv64::vdso::VDSO_TEXT_PAGE_SIZE
     }
 }
 
@@ -110,7 +120,7 @@ pub fn vdso_total_size() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL vDSO layout is not implemented")
+        arch::riscv64::vdso::VDSO_TOTAL_SIZE
     }
 }
 
@@ -123,7 +133,7 @@ pub fn vdso_image() -> alloc::vec::Vec<u8> {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL vDSO is not implemented")
+        arch::riscv64::vdso::vdso_image()
     }
 }
 
@@ -136,7 +146,7 @@ pub fn sigreturn_entry_va() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL vDSO sigreturn is not implemented")
+        vdso_base() + arch::riscv64::vdso::sigreturn_entry_offset()
     }
 }
 
@@ -149,8 +159,7 @@ pub fn register_vdso_tick_hook(hook: fn(u64)) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = hook;
-        todo!("riscv64 HAL vDSO timer hook is not implemented")
+        arch::riscv64::vdso::register_timer_tick_hook(hook);
     }
 }
 
@@ -167,8 +176,7 @@ pub fn register_net_poll_hook(hook: fn(u64)) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = hook;
-        todo!("riscv64 HAL net poll hook is not implemented")
+        arch::riscv64::vdso::register_net_poll_hook(hook);
     }
 }
 
@@ -219,6 +227,20 @@ pub fn patch_interpreter_image(interp: &str, bytes: &mut [u8]) {
     }
 }
 
+/// 启用 SUM（Supervisor User Memory access），允许 S-mode 直接访问 U 标记的页面。
+///
+/// RISC-V 专用；LoongArch 上为空操作。
+pub unsafe fn enable_sum() {
+    #[cfg(target_arch = "loongarch64")]
+    {
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        arch::riscv64::set_sum();
+    }
+}
+
 /// 构造当前架构的用户 trap frame，并切入用户态执行。
 ///
 /// # Safety
@@ -239,8 +261,7 @@ pub unsafe fn enter_user_mode(
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = (entry_pc, user_sp, arg0, kernel_stack_top);
-        todo!("riscv64 HAL user mode entry is not implemented")
+        unsafe { riscv64_enter_user_mode(entry_pc, user_sp, arg0, kernel_stack_top) }
     }
 }
 
@@ -262,6 +283,24 @@ unsafe fn loongarch64_enter_user_mode(
     // Safety: `frame` remains alive until `resume_to_trap_frame` switches to user mode
     // and never returns to this stack frame.
     unsafe { <arch::LoongArch64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
+}
+
+#[cfg(target_arch = "riscv64")]
+unsafe fn riscv64_enter_user_mode(
+    entry_pc: usize,
+    user_sp: usize,
+    arg0: usize,
+    kernel_stack_top: usize,
+) -> ! {
+    use general::{TaskOps, TrapFramePtr};
+
+    <arch::Riscv64TaskOps as TaskOps>::set_kernel_trap_stack(kernel_stack_top);
+
+    let mut frame = arch::TrapFrame::default();
+    let frame_ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
+    <arch::Riscv64TaskOps as TaskOps>::init_user_trap_frame(frame_ptr, entry_pc, user_sp, arg0);
+
+    unsafe { <arch::Riscv64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
 }
 
 #[cfg(target_arch = "loongarch64")]
