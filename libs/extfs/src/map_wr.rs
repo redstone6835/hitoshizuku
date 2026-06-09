@@ -10,6 +10,24 @@ use crate::state::{BlockBackendError, FsState};
 
 const DIRECT_COUNT: u32 = 12;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockAllocState {
+    Existing(u64),
+    NewlyAllocated(u64),
+}
+
+impl BlockAllocState {
+    pub(crate) const fn phys(self) -> u64 {
+        match self {
+            Self::Existing(phys) | Self::NewlyAllocated(phys) => phys,
+        }
+    }
+
+    pub(crate) const fn is_new(self) -> bool {
+        matches!(self, Self::NewlyAllocated(_))
+    }
+}
+
 #[inline]
 fn ppb(block_size: u32) -> u32 {
     block_size / 4
@@ -32,16 +50,31 @@ pub(crate) fn ensure_block(
     i_block: &mut [u8],
     logical: u32,
 ) -> Result<u64, BlockBackendError> {
+    ensure_block_for_write(state, i_block, logical, true).map(BlockAllocState::phys)
+}
+
+/// 给写路径查找或分配逻辑块，并返回该数据块是否刚分配。
+///
+/// `zero_new_data` 只控制新数据块是否立即写零；调用方若会整块覆盖或会自行填零，
+/// 可以跳过这次写盘，避免 bench 写路径里的重复 I/O。间接块本身仍始终清零。
+pub(crate) fn ensure_block_for_write(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    zero_new_data: bool,
+) -> Result<BlockAllocState, BlockBackendError> {
     let p = ppb(state.ext_sb.block_size);
     if logical < DIRECT_COUNT {
         let cur = read_u32(i_block, logical);
         if cur != 0 {
-            return Ok(cur as u64);
+            return Ok(BlockAllocState::Existing(cur as u64));
         }
         let new = alloc_mod::alloc_block(state)?;
-        zero_block(state, new)?;
+        if zero_new_data {
+            zero_block(state, new)?;
+        }
         write_u32(i_block, logical, new as u32);
-        return Ok(new);
+        return Ok(BlockAllocState::NewlyAllocated(new));
     }
 
     let bs = state.ext_sb.block_size as usize;
@@ -49,7 +82,7 @@ pub(crate) fn ensure_block(
     let mut buf = vec![0u8; bs];
     let rem = logical - DIRECT_COUNT;
     if rem < p {
-        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, &mut buf)?;
+        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, &mut buf, zero_new_data)?;
         return Ok(new_data);
     }
 
@@ -72,13 +105,15 @@ pub(crate) fn ensure_block(
         let inner = rem % p;
         let cur = read_u32(&buf, inner);
         if cur != 0 {
-            return Ok(cur as u64);
+            return Ok(BlockAllocState::Existing(cur as u64));
         }
         let new = alloc_mod::alloc_block(state)?;
-        zero_block(state, new)?;
+        if zero_new_data {
+            zero_block(state, new)?;
+        }
         write_u32(&mut buf, inner, new as u32);
         state.write_block(mid as u64, &buf)?;
-        return Ok(new);
+        return Ok(BlockAllocState::NewlyAllocated(new));
     }
 
     // 三级间接
@@ -108,13 +143,15 @@ pub(crate) fn ensure_block(
     let inner = rem % p;
     let cur = read_u32(&buf, inner);
     if cur != 0 {
-        return Ok(cur as u64);
+        return Ok(BlockAllocState::Existing(cur as u64));
     }
     let new = alloc_mod::alloc_block(state)?;
-    zero_block(state, new)?;
+    if zero_new_data {
+        zero_block(state, new)?;
+    }
     write_u32(&mut buf, inner, new as u32);
     state.write_block(mid as u64, &buf)?;
-    Ok(new)
+    Ok(BlockAllocState::NewlyAllocated(new))
 }
 
 /// 处理一级间接块的分配/查找。`slot` 是 i_block 中索引(12 = 一级)。
@@ -125,17 +162,20 @@ fn alloc_or_walk_l1(
     slot: u32,
     inner: u32,
     buf: &mut [u8],
-) -> Result<u64, BlockBackendError> {
+    zero_new_data: bool,
+) -> Result<BlockAllocState, BlockBackendError> {
     let l1 = ensure_indirect_slot(state, i_block, slot, buf)?;
     let cur = read_u32(buf, inner);
     if cur != 0 {
-        return Ok(cur as u64);
+        return Ok(BlockAllocState::Existing(cur as u64));
     }
     let new = alloc_mod::alloc_block(state)?;
-    zero_block(state, new)?;
+    if zero_new_data {
+        zero_block(state, new)?;
+    }
     write_u32(buf, inner, new as u32);
     state.write_block(l1, buf)?;
-    Ok(new)
+    Ok(BlockAllocState::NewlyAllocated(new))
 }
 
 /// 确保 i_block[slot] 指向一个存在的间接块。`buf` 出参为该间接块的内容。

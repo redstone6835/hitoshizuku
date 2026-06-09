@@ -24,6 +24,7 @@ use crate::inode_wr::write_raw;
 use crate::layout::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EXT4_INLINE_DATA_FL,
 };
+use crate::map_wr::BlockAllocState;
 use crate::state::{FsState, map_err};
 use crate::{extent_wr, map_wr};
 
@@ -438,10 +439,11 @@ impl FileOps for ExtRegFileOps {
                         let lb = (written as u64 / block_size) as u32;
                         let in_block = (written as u64 % block_size) as usize;
                         let want = ((block_size - in_block as u64) as usize).min(total - written);
-                        let phys = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
+                        let block = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
                             .map_err(map_err)?;
+                        let phys = block.phys();
                         let mut blk = vec![0u8; block_size as usize];
-                        if in_block != 0 || want < block_size as usize {
+                        if !block.is_new() && (in_block != 0 || want < block_size as usize) {
                             self.state.read_block(phys, &mut blk).map_err(map_err)?;
                         }
                         blk[in_block..in_block + want]
@@ -491,8 +493,9 @@ impl FileOps for ExtRegFileOps {
                     let lb = lb as u32;
                     let in_block = (file_off % block_size) as usize;
                     let want = ((block_size - in_block as u64) as usize).min(buf.len() - written);
-                    let phys = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
+                    let block = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
                         .map_err(map_err)?;
+                    let phys = block.phys();
                     if let Some(prev_lb) = cur_lb {
                         if prev_lb != lb {
                             self.state
@@ -501,7 +504,9 @@ impl FileOps for ExtRegFileOps {
                         }
                     }
                     if cur_lb != Some(lb) {
-                        if in_block != 0 || want < block_size as usize {
+                        if block.is_new() {
+                            cur_blk_buf.fill(0);
+                        } else if in_block != 0 || want < block_size as usize {
                             self.state
                                 .read_block(phys, &mut cur_blk_buf)
                                 .map_err(map_err)?;
@@ -575,23 +580,24 @@ pub(crate) fn symlink_target(
 
 /// 统一入口:根据 flags 选择 extent 原地追加或 indirect 分配。
 ///
-/// - 若文件使用 extent 且根节点能容纳下新叶子,原地追加并返回新分配物理块;
+/// - 若文件使用 extent 且根节点能容纳下新叶子,原地追加并返回物理块状态;
 /// - 若 extent 根已满或为索引节点,fallback 到 `demote_if_extent` + indirect;
-/// - 若文件本就是 indirect,直接走 `map_wr::ensure_block`。
+/// - 若文件本就是 indirect,直接走间接块写路径。
 fn ensure_block_any(
     state: &FsState,
     flags: &mut u32,
     i_block: &mut [u8],
     lb: u32,
-) -> Result<u64, crate::state::BlockBackendError> {
+) -> Result<BlockAllocState, crate::state::BlockBackendError> {
     if *flags & crate::layout::EXT4_EXTENTS_FL != 0 {
-        if let Some(phys) = extent_wr::ensure_block_in_extent(state, i_block, lb)? {
-            return Ok(phys);
+        if let Some(block) = extent_wr::ensure_block_in_extent_for_write(state, i_block, lb)? {
+            return Ok(block);
         }
         // 原地追加失败 → 降级
         extent_wr::demote_if_extent(state, flags, i_block)?;
     }
-    map_wr::ensure_block(state, i_block, lb)
+    // 文件写路径会自行处理新块未覆盖区域，避免整块覆盖时先写零再写数据。
+    map_wr::ensure_block_for_write(state, i_block, lb, false)
 }
 
 #[inline]
