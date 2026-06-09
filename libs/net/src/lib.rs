@@ -8,10 +8,11 @@
 //!   代表一个已注册的网络接口在内核中的身份。
 //! - [`config`]：接口配置类型（IP 地址、网关、DHCP 等）。
 //! - [`adapter`]：将 [`NetDriver`](driver::NetDriver) 适配为当前协议引擎的
-//!   设备接口——本 crate 与具体协议引擎之间的耦合点。
+//!   设备接口。
 //! - [`interface`]：单个受管理接口的内部状态。
 //! - [`stack`]：全局网络协议栈管理器
 //!   （[`NetStack`](stack::NetStack)），负责接口生命周期和 poll 调度。
+//! - [`time`]：网络层自有单调时间类型，隔离具体协议引擎的时间表示。
 //! - [`error`]：统一错误类型。
 //!
 //! # 架构分层
@@ -22,7 +23,7 @@
 //! ├──────────────────────────────────┤
 //! │  stack.rs (NetStack)             │  ← 协议栈调度
 //! ├──────────────────────────────────┤
-//! │  adapter.rs (protocol phy)       │  ← 协议引擎耦合
+//! │  interface/adapter/time          │  ← 协议引擎适配边界
 //! ├──────────────────────────────────┤
 //! │  driver.rs (NetDriver trait)     │  ← 设备抽象
 //! ├──────────────────────────────────┤
@@ -34,7 +35,7 @@
 //!
 //! - 新增网络驱动：实现 `NetDriver` trait，零 core 改动。
 //! - 新增协议：在 `stack.rs` 暴露协议无关 handle 方法。
-//! - 替换协议栈：重写 `adapter.rs` + 协议引擎实现，`driver.rs` 不动。
+//! - 替换协议栈：重写协议引擎适配层，`driver.rs` 和公共时间/配置类型不动。
 //! - IPv6：启用 `smoltcp/proto-ipv6`，`config.rs` 加地址变体。
 
 #![no_std]
@@ -51,6 +52,7 @@ pub mod interface;
 pub mod route;
 pub mod socket;
 pub mod stack;
+pub mod time;
 pub mod tuning;
 
 pub use config::{CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
@@ -63,7 +65,5 @@ pub use stack::stack;
 pub use stack::{
     IFF_BROADCAST, IFF_MULTICAST, IFF_RUNNING, IFF_UP, InterfaceSnapshot, NeighborEntry,
 };
+pub use time::{NetDuration, NetInstant};
 pub use tuning::{EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBufferTuning};
-// 把 smoltcp 的时间类型 re-export 出来，外部（kernel 侧的 net_poll 钩子）
-// 不用直接依赖 smoltcp。
-pub use smoltcp::time::Instant;

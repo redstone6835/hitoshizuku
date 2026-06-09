@@ -12,7 +12,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use smoltcp::iface::{self, SocketHandle, SocketSet};
-use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address,
     Ipv6Cidr,
@@ -23,6 +22,7 @@ use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ip
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
 use crate::socket::{NetSocketHandle, SocketMeta, SocketType};
+use crate::time::NetInstant;
 use crate::tuning::{PacketBufferTuning, TcpBufferTuning};
 
 // ── ManagedInterface ─────────────────────────────────────────────────────────
@@ -63,7 +63,7 @@ impl ManagedInterface {
         iface_config.random_seed = generate_seed(net_device.id());
 
         let mut device = NetDeviceAdapter::new(driver, Arc::clone(&net_device));
-        let now = Instant::from_millis(0);
+        let now = NetInstant::ZERO.into_smoltcp();
         let mut iface = iface::Interface::new(iface_config, &mut device, now);
 
         // 配置 IP 地址（支持 IPv4 + IPv6 混合）
@@ -173,13 +173,16 @@ impl ManagedInterface {
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
     ///
     /// 同时清理已标记为 removed 的 socket。
-    pub fn poll(&mut self, timestamp: Instant) -> bool {
+    pub fn poll(&mut self, timestamp: NetInstant) -> bool {
         if !self.admin_up {
             return false;
         }
         let changed = matches!(
-            self.iface
-                .poll(timestamp, &mut self.device, &mut self.sockets),
+            self.iface.poll(
+                timestamp.into_smoltcp(),
+                &mut self.device,
+                &mut self.sockets
+            ),
             iface::PollResult::SocketStateChanged
         );
         // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的

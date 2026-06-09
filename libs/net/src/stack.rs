@@ -24,7 +24,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address};
 use spin::{Mutex, RwLock};
 
@@ -34,6 +33,7 @@ use crate::error::NetError;
 use crate::interface::ManagedInterface;
 use crate::route::{RouteEntry, RouteTable};
 use crate::socket::{NetSocketHandle, SocketState, SocketType};
+use crate::time::{NetDuration, NetInstant};
 use crate::tuning::{EphemeralPortRange, NetTuning, PacketBufferTuning, TcpBufferTuning};
 
 // ── 全局单例 ─────────────────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ impl NetStack {
     /// 收尾会唤醒 [`Self::enqueue_socket_waiter`] 里所有挂着的任务
     /// （即所有阻塞在 recv/send/accept/connect 的用户进程），让它们重
     /// 新检查 socket 状态。
-    pub fn poll(&self, timestamp: Instant) {
+    pub fn poll(&self, timestamp: NetInstant) {
         let table = self.interfaces.read();
         for iface_lock in table.values() {
             if let Some(mut managed) = iface_lock.try_lock() {
@@ -168,7 +168,7 @@ impl NetStack {
     /// 以毫秒时间戳驱动所有活跃接口——供 kernel timer tick 使用，
     /// 无需直接依赖 smoltcp。
     pub fn poll_ms(&self, millis: i64) {
-        self.poll(Instant::from_millis(millis));
+        self.poll(NetInstant::from_millis(millis));
     }
 
     /// 立即驱动一次协议栈。
@@ -184,7 +184,7 @@ impl NetStack {
         while rounds < self.tuning.active_poll.max_rounds {
             let mut changed = false;
             for iface_lock in table.values() {
-                changed |= iface_lock.lock().poll(Instant::from_millis(millis));
+                changed |= iface_lock.lock().poll(NetInstant::from_millis(millis));
             }
             rounds += 1;
 
@@ -202,7 +202,7 @@ impl NetStack {
     ///
     /// 比 `poll()` 更轻量——只锁定单个接口，其他接口完全不受影响。
     /// 推荐网卡 IRQ handler 调用此方法而非全局 `poll`。
-    pub fn poll_interface(&self, id: InterfaceId, timestamp: Instant) {
+    pub fn poll_interface(&self, id: InterfaceId, timestamp: NetInstant) {
         let table = self.interfaces.read();
         if let Some(iface_lock) = table.get(&id) {
             iface_lock.lock().poll(timestamp);
@@ -218,7 +218,7 @@ impl NetStack {
     /// 设备驱动层不应该直接暴露或依赖 smoltcp 的时间类型；中断处理路径只需
     /// 传入调度器/时钟层提供的单调毫秒值，由协议栈内部完成类型转换。
     pub fn poll_interface_ms(&self, id: InterfaceId, millis: i64) {
-        self.poll_interface(id, Instant::from_millis(millis));
+        self.poll_interface(id, NetInstant::from_millis(millis));
     }
 
     /// 把当前任务挂到全局 socket 事件通知队列。
@@ -651,7 +651,7 @@ impl NetStack {
             let interval = if secs == 0 {
                 None
             } else {
-                Some(smoltcp::time::Duration::from_secs(secs))
+                Some(NetDuration::from_secs(secs).into_smoltcp())
             };
             if managed.handle_is_live(handle) {
                 managed
@@ -672,7 +672,7 @@ impl NetStack {
             let timeout = if secs == 0 {
                 None
             } else {
-                Some(smoltcp::time::Duration::from_secs(secs))
+                Some(NetDuration::from_secs(secs).into_smoltcp())
             };
             if managed.handle_is_live(handle) {
                 managed.tcp_socket_mut(handle.inner).set_timeout(timeout);

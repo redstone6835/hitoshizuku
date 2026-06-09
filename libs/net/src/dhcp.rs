@@ -10,10 +10,9 @@
 //! BOUND → (RELEASE) → INIT
 //! ```
 
-use alloc::vec::Vec;
-use smoltcp::time::Instant;
-
 use crate::config::{IfConfig, Ipv4Addr};
+use crate::time::{NetDuration, NetInstant};
+use alloc::vec::Vec;
 
 const MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 
@@ -40,7 +39,7 @@ pub enum DhcpState {
     Selecting,
     Requesting,
     Bound {
-        lease_expires: Instant,
+        lease_expires: NetInstant,
         server_id: Ipv4Addr,
     },
 }
@@ -102,7 +101,7 @@ impl DhcpClient {
     }
 
     /// 解析 DHCP 响应，返回获得的网络配置（仅当收到 ACK 时）。
-    pub fn parse_response(&mut self, data: &[u8], now: Instant) -> Option<IfConfig> {
+    pub fn parse_response(&mut self, data: &[u8], now: NetInstant) -> Option<IfConfig> {
         if data.len() < 240 || data[0] != OP_REPLY {
             return None;
         }
@@ -191,9 +190,7 @@ impl DhcpClient {
             DHCPACK => {
                 let lease_secs = lease_time.unwrap_or(86400) as u64;
                 self.state = DhcpState::Bound {
-                    lease_expires: Instant::from_millis(
-                        now.total_millis() + (lease_secs * 1000) as i64,
-                    ),
+                    lease_expires: now + NetDuration::from_secs(lease_secs),
                     server_id: server_id?,
                 };
                 let prefix = subnet
