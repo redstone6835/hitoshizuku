@@ -4,6 +4,7 @@
 //! 上完成,由调用方负责把它写回 inode。
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::alloc_mod;
 use crate::state::{BlockBackendError, FsState};
@@ -63,6 +64,21 @@ pub(crate) fn ensure_block_for_write(
     logical: u32,
     zero_new_data: bool,
 ) -> Result<BlockAllocState, BlockBackendError> {
+    let mut scratch = Vec::new();
+    ensure_block_for_write_with_scratch(state, i_block, logical, zero_new_data, &mut scratch)
+}
+
+/// 与 [`ensure_block_for_write`] 相同,但由调用方复用间接块 scratch。
+///
+/// 文件顺序写降级到 indirect 布局时会逐块调用这里；把 block-size 缓冲提升到
+/// 调用层,可以避免每个逻辑块都重新分配一块临时内存。
+pub(crate) fn ensure_block_for_write_with_scratch(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    zero_new_data: bool,
+    scratch: &mut Vec<u8>,
+) -> Result<BlockAllocState, BlockBackendError> {
     let p = ppb(state.ext_sb.block_size);
     if logical < DIRECT_COUNT {
         let cur = read_u32(i_block, logical);
@@ -78,32 +94,35 @@ pub(crate) fn ensure_block_for_write(
     }
 
     let bs = state.ext_sb.block_size as usize;
+    if scratch.len() != bs {
+        scratch.resize(bs, 0);
+    }
     // 各级间接块共用同一个 scratch buffer,避免重复堆分配。
-    let mut buf = vec![0u8; bs];
+    let buf = scratch.as_mut_slice();
     let rem = logical - DIRECT_COUNT;
     if rem < p {
-        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, &mut buf, zero_new_data)?;
+        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, buf, zero_new_data)?;
         return Ok(new_data);
     }
 
     let rem = rem - p;
     if rem < p * p {
         // 二级间接:先确保 L2 索引块存在,把它读到 buf
-        let l2 = ensure_indirect_slot(state, i_block, 13, &mut buf)?;
+        let l2 = ensure_indirect_slot(state, i_block, 13, buf)?;
         let mid_idx = rem / p;
-        let mut mid = read_u32(&buf, mid_idx);
+        let mut mid = read_u32(buf, mid_idx);
         if mid == 0 {
             mid = alloc_mod::alloc_block(state)? as u32;
             // 新 mid 块逻辑上为零,直接写零到磁盘后续不再 read_block
-            write_u32(&mut buf, mid_idx, mid);
-            state.write_block(l2, &buf)?;
+            write_u32(buf, mid_idx, mid);
+            state.write_block(l2, buf)?;
             // mid 块需要置零 (因为我们随后会读它),走 cache insert
-            cache_zero_block(state, mid as u64, &mut buf)?;
+            cache_zero_block(state, mid as u64, buf)?;
         } else {
-            state.read_block(mid as u64, &mut buf)?;
+            state.read_block(mid as u64, buf)?;
         }
         let inner = rem % p;
-        let cur = read_u32(&buf, inner);
+        let cur = read_u32(buf, inner);
         if cur != 0 {
             return Ok(BlockAllocState::Existing(cur as u64));
         }
@@ -111,37 +130,37 @@ pub(crate) fn ensure_block_for_write(
         if zero_new_data {
             zero_block(state, new)?;
         }
-        write_u32(&mut buf, inner, new as u32);
-        state.write_block(mid as u64, &buf)?;
+        write_u32(buf, inner, new as u32);
+        state.write_block(mid as u64, buf)?;
         return Ok(BlockAllocState::NewlyAllocated(new));
     }
 
     // 三级间接
     let rem = rem - p * p;
     let a = p * p;
-    let l3 = ensure_indirect_slot(state, i_block, 14, &mut buf)?;
+    let l3 = ensure_indirect_slot(state, i_block, 14, buf)?;
     let top_idx = rem / a;
-    let mut top = read_u32(&buf, top_idx);
+    let mut top = read_u32(buf, top_idx);
     if top == 0 {
         top = alloc_mod::alloc_block(state)? as u32;
-        write_u32(&mut buf, top_idx, top);
-        state.write_block(l3, &buf)?;
-        cache_zero_block(state, top as u64, &mut buf)?;
+        write_u32(buf, top_idx, top);
+        state.write_block(l3, buf)?;
+        cache_zero_block(state, top as u64, buf)?;
     } else {
-        state.read_block(top as u64, &mut buf)?;
+        state.read_block(top as u64, buf)?;
     }
     let mid_idx = (rem % a) / p;
-    let mut mid = read_u32(&buf, mid_idx);
+    let mut mid = read_u32(buf, mid_idx);
     if mid == 0 {
         mid = alloc_mod::alloc_block(state)? as u32;
-        write_u32(&mut buf, mid_idx, mid);
-        state.write_block(top as u64, &buf)?;
-        cache_zero_block(state, mid as u64, &mut buf)?;
+        write_u32(buf, mid_idx, mid);
+        state.write_block(top as u64, buf)?;
+        cache_zero_block(state, mid as u64, buf)?;
     } else {
-        state.read_block(mid as u64, &mut buf)?;
+        state.read_block(mid as u64, buf)?;
     }
     let inner = rem % p;
-    let cur = read_u32(&buf, inner);
+    let cur = read_u32(buf, inner);
     if cur != 0 {
         return Ok(BlockAllocState::Existing(cur as u64));
     }
@@ -149,8 +168,8 @@ pub(crate) fn ensure_block_for_write(
     if zero_new_data {
         zero_block(state, new)?;
     }
-    write_u32(&mut buf, inner, new as u32);
-    state.write_block(mid as u64, &buf)?;
+    write_u32(buf, inner, new as u32);
+    state.write_block(mid as u64, buf)?;
     Ok(BlockAllocState::NewlyAllocated(new))
 }
 

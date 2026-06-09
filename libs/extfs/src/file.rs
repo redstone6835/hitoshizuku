@@ -430,6 +430,7 @@ impl FileOps for ExtRegFileOps {
             // 不强行 demote — 如果是 extent 文件且能原地 append 就留着;
             // 真正无法容纳时再退化成间接布局。
             let block_size = self.state.ext_sb.block_size as u64;
+            let mut map_scratch = Vec::new();
 
             // 把旧 inline 内容(如果有)写回为数据块
             if let Some(old) = inline_recovered {
@@ -440,8 +441,14 @@ impl FileOps for ExtRegFileOps {
                         let lb = (written as u64 / block_size) as u32;
                         let in_block = (written as u64 % block_size) as usize;
                         let want = ((block_size - in_block as u64) as usize).min(total - written);
-                        let block = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
-                            .map_err(map_err)?;
+                        let block = ensure_block_any(
+                            &self.state,
+                            &mut flags,
+                            &mut i_block,
+                            lb,
+                            &mut map_scratch,
+                        )
+                        .map_err(map_err)?;
                         let phys = block.phys();
                         let mut blk = vec![0u8; block_size as usize];
                         if !block.is_new() && (in_block != 0 || want < block_size as usize) {
@@ -494,8 +501,14 @@ impl FileOps for ExtRegFileOps {
                     let lb = lb as u32;
                     let in_block = (file_off % block_size) as usize;
                     let want = ((block_size - in_block as u64) as usize).min(buf.len() - written);
-                    let block = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
-                        .map_err(map_err)?;
+                    let block = ensure_block_any(
+                        &self.state,
+                        &mut flags,
+                        &mut i_block,
+                        lb,
+                        &mut map_scratch,
+                    )
+                    .map_err(map_err)?;
                     let phys = block.phys();
                     if let Some(prev_lb) = cur_lb {
                         if prev_lb != lb {
@@ -589,6 +602,7 @@ fn ensure_block_any(
     flags: &mut u32,
     i_block: &mut [u8],
     lb: u32,
+    scratch: &mut Vec<u8>,
 ) -> Result<BlockAllocState, crate::state::BlockBackendError> {
     if *flags & crate::layout::EXT4_EXTENTS_FL != 0 {
         if let Some(block) = extent_wr::ensure_block_in_extent_for_write(state, i_block, lb)? {
@@ -598,7 +612,7 @@ fn ensure_block_any(
         extent_wr::demote_if_extent(state, flags, i_block)?;
     }
     // 文件写路径会自行处理新块未覆盖区域，避免整块覆盖时先写零再写数据。
-    map_wr::ensure_block_for_write(state, i_block, lb, false)
+    map_wr::ensure_block_for_write_with_scratch(state, i_block, lb, false, scratch)
 }
 
 #[inline]
