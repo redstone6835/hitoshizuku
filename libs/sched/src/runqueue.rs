@@ -315,6 +315,11 @@ impl Runqueue {
         self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params));
     }
 
+    /// 在 rq 锁内只更新 nice/weight，保持策略与时间片不变。
+    pub fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice));
+    }
+
     /// 在 rq 锁内更新完整调度属性，并按旧 class / 权重完成出队记账。
     pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) {
         self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr));

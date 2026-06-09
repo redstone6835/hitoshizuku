@@ -90,6 +90,14 @@ fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
         .ok_or(Errno::ESRCH)
 }
 
+/// 按根 PID namespace 查询任务句柄。
+///
+/// 调度核心只暴露稳定的任务选择入口；`pid == 0` 的 Linux 特殊语义仍由
+/// syscall 兼容层决定是否传入。
+pub fn task_by_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
+    lookup_pid(pid)
+}
+
 pub fn getpgid(pid: PidT) -> Result<PidT, Errno> {
     let t = lookup_pid(pid)?;
     let pgid = t.process_group().pgid();
@@ -312,7 +320,16 @@ pub fn nice(inc: i32) -> Result<i32, Errno> {
 /// 为 pid 对应任务设置 sched params。
 pub fn sched_setparam(pid: PidT, params: SchedParams) -> Result<(), Errno> {
     let t = lookup_pid(pid)?;
-    runqueue_of(t.current_cpu()).update_params(&t, params, crate::scheduler::now_ns_public());
+    sched_setparam_for_task(&t, params)
+}
+
+pub fn sched_setparam_for_task(task: &Arc<Task>, params: SchedParams) -> Result<(), Errno> {
+    runqueue_of(task.current_cpu()).update_params(task, params, crate::scheduler::now_ns_public());
+    Ok(())
+}
+
+pub fn sched_setnice_for_task(task: &Arc<Task>, nice: i8) -> Result<(), Errno> {
+    runqueue_of(task.current_cpu()).update_nice(task, nice, crate::scheduler::now_ns_public());
     Ok(())
 }
 
@@ -320,7 +337,16 @@ pub fn sched_setparam(pid: PidT, params: SchedParams) -> Result<(), Errno> {
 pub fn sched_setattr(pid: PidT, attr: SchedAttr) -> Result<(), Errno> {
     let attr = attr.validate()?;
     let t = lookup_pid(pid)?;
-    runqueue_of(t.current_cpu()).update_sched_attr(&t, attr, crate::scheduler::now_ns_public());
+    sched_setattr_for_task(&t, attr)
+}
+
+pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
+    let attr = attr.validate()?;
+    runqueue_of(task.current_cpu()).update_sched_attr(
+        task,
+        attr,
+        crate::scheduler::now_ns_public(),
+    );
     Ok(())
 }
 

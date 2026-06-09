@@ -18,6 +18,14 @@ use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatu
 
 const MAX_CPUSET_BYTES: usize = 1024;
 
+// getpriority/setpriority 的 Linux 兼容层编码。调度核心只接收 Task 和 nice，
+// 不理解 which/who 这组用户态选择语义。
+const PRIO_PROCESS: usize = 0;
+const PRIO_PGRP: usize = 1;
+const PRIO_USER: usize = 2;
+const MIN_NICE: i32 = -20;
+const MAX_NICE: i32 = 19;
+
 const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
 const LINUX_REBOOT_MAGIC2: u32 = 672_274_793;
 const LINUX_REBOOT_MAGIC2A: u32 = 85_072_278;
@@ -934,13 +942,132 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 }
 
 pub(super) fn sys_getpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _which = ctx.args[0];
-    let _who = ctx.args[1];
-    Ok(20)
+    let targets = priority_targets(ctx.args[0], ctx.args[1], &ctx.task)?;
+    let best = targets
+        .iter()
+        .map(|task| task.sched.nice() as i32)
+        .min()
+        .ok_or(Errno::ESRCH)?;
+    Ok(linux_priority_from_nice(best))
 }
 
-pub(super) fn sys_setpriority(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_setpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let targets = priority_targets(ctx.args[0], ctx.args[1], &ctx.task)?;
+    let nice = (ctx.args[2] as isize as i32).clamp(MIN_NICE, MAX_NICE);
+    for task in &targets {
+        check_setpriority_permission(&ctx.task, task, nice)?;
+    }
+    for task in targets {
+        sched::operation::sched_setnice_for_task(&task, nice as i8)?;
+    }
     Ok(0)
+}
+
+fn linux_priority_from_nice(nice: i32) -> usize {
+    (20 - nice.clamp(MIN_NICE, MAX_NICE)) as usize
+}
+
+/// 按 Linux `which/who` 选择目标任务集合。
+///
+/// `who == 0` 的含义依赖 `which`，所以只在兼容层展开；返回集合为空时按
+/// syscall 语义报 `ESRCH`。
+fn priority_targets(which: usize, who: usize, caller: &Arc<Task>) -> Result<Vec<Arc<Task>>, Errno> {
+    let tasks = match which {
+        PRIO_PROCESS => {
+            let pid = if who == 0 {
+                caller.pid_root().ok_or(Errno::ESRCH)?
+            } else {
+                who as i32
+            };
+            alloc::vec![sched::operation::task_by_pid(pid)?]
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                caller.process_group().pgid()
+            } else {
+                who as i32
+            };
+            if pgid <= 0 {
+                return Err(Errno::ESRCH);
+            }
+            tasks_by_process_group(pgid)
+        }
+        PRIO_USER => {
+            let uid = if who == 0 {
+                caller.credentials().uid
+            } else {
+                Uid(who as u32)
+            };
+            tasks_by_real_uid(uid)
+        }
+        _ => return Err(Errno::EINVAL),
+    };
+    if tasks.is_empty() {
+        Err(Errno::ESRCH)
+    } else {
+        Ok(tasks)
+    }
+}
+
+/// 遍历根 PID namespace，收集指定进程组中的任务。
+fn tasks_by_process_group(pgid: i32) -> Vec<Arc<Task>> {
+    sched::root_pid_ns()
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .filter(|task| task.process_group().pgid() == pgid)
+        .collect()
+}
+
+/// 遍历根 PID namespace，收集真实 UID 匹配的任务。
+fn tasks_by_real_uid(uid: Uid) -> Vec<Arc<Task>> {
+    sched::root_pid_ns()
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .filter(|task| task.credentials().uid == uid)
+        .collect()
+}
+
+/// 校验 setpriority 的目标权限与优先级提升权限。
+///
+/// 普通调用者只能修改同属主任务；降低 nice（提高优先级）时，还必须满足
+/// `CAP_SYS_NICE` 或当前线程组的 `RLIMIT_NICE` 下限。
+fn check_setpriority_permission(
+    caller: &Arc<Task>,
+    target: &Arc<Task>,
+    requested_nice: i32,
+) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysNice) {
+        return Ok(());
+    }
+
+    let target_creds = target.credentials();
+    if caller_creds.euid != target_creds.uid && caller_creds.euid != target_creds.euid {
+        return Err(Errno::EPERM);
+    }
+
+    let current = target.sched.nice() as i32;
+    if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
+/// 把 `RLIMIT_NICE` 的 soft limit 转成允许设置的最低 nice 值。
+fn nice_floor_from_rlimit(task: &Arc<Task>) -> i32 {
+    let limit = task
+        .thread_group()
+        .rlimits()
+        .lock()
+        .get(sched::Resource::Nice)
+        .soft
+        .raw()
+        .min(40) as i32;
+    (20 - limit).clamp(MIN_NICE, MAX_NICE)
 }
 
 pub(super) fn sys_sched_getparam(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1089,9 +1216,9 @@ pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize,
         .checked_add(
             domain_count
                 .checked_mul(MYGO_SCHED_DOMAIN_ENTRY_SIZE)
-                .ok_or(Errno::EOVERFLOW)?,
+                .ok_or(Errno::EINVAL)?,
         )
-        .ok_or(Errno::EOVERFLOW)?;
+        .ok_or(Errno::EINVAL)?;
     if user == 0 || size == 0 {
         return Ok(required);
     }

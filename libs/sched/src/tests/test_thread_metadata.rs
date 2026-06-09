@@ -9,7 +9,7 @@ use ktest::ktest;
 
 use crate::{
     CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedAttr,
-    SchedParams, Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
+    SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
 };
 
 fn make_task() -> alloc::sync::Arc<Task> {
@@ -124,4 +124,23 @@ fn runqueue_migratable_load_filters_cpu_affinity() {
 
     assert!(rq.dequeue(&cpu0, 2));
     assert!(rq.dequeue(&cpu1, 2));
+}
+
+#[ktest]
+fn runqueue_update_nice_keeps_policy_and_slice() {
+    let task = make_task();
+    task.sched
+        .set_sched_attr(SchedAttr::rt_round_robin(20, 50_000_000));
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task), 1);
+    rq.update_nice(&task, 10, 2);
+
+    let attr = task.sched.sched_attr();
+    assert_eq!(attr.policy, SchedPolicy::RtRoundRobin);
+    assert_eq!(attr.priority, 20);
+    assert_eq!(attr.slice_ns, 50_000_000);
+    assert_eq!(attr.nice, 10);
+
+    assert!(rq.dequeue(&task, 3));
 }
