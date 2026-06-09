@@ -50,39 +50,15 @@ pub enum CustomDevNodeKind {
     Directory,
 }
 
-/// devtmpfs 自定义节点使用的兼容层设备号。
-///
-/// `None` 表示由 VFS/POSIX 兼容层按节点名分配临时 `dev_t`。这里保留为纯整数，
-/// 避免底层设备模型依赖 POSIX `DevId` 类型。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CustomDevNodeId {
-    pub major: u32,
-    pub minor: u32,
-}
-
-impl CustomDevNodeId {
-    pub const fn new(major: u32, minor: u32) -> Self {
-        Self { major, minor }
-    }
-}
-
 /// 自定义 devtmpfs 节点规格。
 ///
-/// 新设备类型如果需要在 `/dev` 暴露特殊节点，只在这里声明通用节点元数据和一个
-/// opaque payload。payload 的 ABI/VFS 解释由 devtmpfs 适配层负责，dev core 不
-/// 依赖 `InodeOps`、`FileMode`、`Uid/Gid` 或 POSIX 设备号类型。
+/// 新设备类型如果需要在 `/dev` 暴露特殊节点，只在这里声明节点名称、通用类别
+/// 和 opaque payload。payload 的 ABI/VFS 解释由 devtmpfs 适配层负责，dev core
+/// 不依赖 `InodeOps`、`FileMode`、`Uid/Gid`、兼容设备号或 inode 元数据类型。
 #[derive(Clone)]
 pub struct CustomDevNodeSpec {
     name: Box<str>,
     kind: CustomDevNodeKind,
-    rdev: Option<CustomDevNodeId>,
-    block_size: u32,
-    mode: u16,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    blocks: u64,
-    nlink: u32,
     payload: Arc<dyn Any + Send + Sync>,
 }
 
@@ -91,48 +67,8 @@ impl CustomDevNodeSpec {
         Self {
             name: name.into(),
             kind,
-            rdev: None,
-            block_size: 512,
-            mode: 0o660,
-            uid: 0,
-            gid: 0,
-            size: 0,
-            blocks: 0,
-            nlink: 1,
             payload,
         }
-    }
-
-    pub fn with_rdev(mut self, rdev: CustomDevNodeId) -> Self {
-        self.rdev = Some(rdev);
-        self
-    }
-
-    pub fn with_block_size(mut self, block_size: u32) -> Self {
-        self.block_size = block_size;
-        self
-    }
-
-    pub fn with_mode(mut self, mode: u16) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    pub fn with_owner(mut self, uid: u32, gid: u32) -> Self {
-        self.uid = uid;
-        self.gid = gid;
-        self
-    }
-
-    pub fn with_size(mut self, size: u64, blocks: u64) -> Self {
-        self.size = size;
-        self.blocks = blocks;
-        self
-    }
-
-    pub fn with_nlink(mut self, nlink: u32) -> Self {
-        self.nlink = nlink;
-        self
     }
 
     pub fn name(&self) -> &str {
@@ -141,38 +77,6 @@ impl CustomDevNodeSpec {
 
     pub fn kind(&self) -> CustomDevNodeKind {
         self.kind
-    }
-
-    pub fn rdev(&self) -> Option<CustomDevNodeId> {
-        self.rdev
-    }
-
-    pub fn block_size(&self) -> u32 {
-        self.block_size
-    }
-
-    pub fn mode(&self) -> u16 {
-        self.mode
-    }
-
-    pub fn uid(&self) -> u32 {
-        self.uid
-    }
-
-    pub fn gid(&self) -> u32 {
-        self.gid
-    }
-
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-
-    pub fn blocks(&self) -> u64 {
-        self.blocks
-    }
-
-    pub fn nlink(&self) -> u32 {
-        self.nlink
     }
 
     pub fn payload(&self) -> Arc<dyn Any + Send + Sync> {
@@ -191,6 +95,10 @@ impl CustomDevNodeSpec {
 /// 新设备类别如果没有 `/dev` 节点（网络等）应通过 `devnode() → None` 表达；
 /// 如果确实需要 `/dev` 投影，优先使用 [`DevNodeSpec::Custom`] 携带 opaque
 /// payload，由 VFS 兼容层解释 inode/file 语义。
+///
+/// FIXME(dev-core): `DevNodeSpec` 仍然位于底层 function 抽象中，说明 dev core
+/// 还直接暴露了 `/dev` 投影声明。后续应把这组类型迁到独立的 VFS/兼容层
+/// projector registry，让 `DeviceFunction` 只描述 typed capability 和生命周期。
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum DevNodeSpec {
@@ -481,7 +389,7 @@ impl BlockDevNodeProjection {
 /// `dev_t`、主次设备号或 sysfs 目录名塞回底层设备模型。
 pub fn active_char_devnode_projections(functions: &FunctionRegistry) -> Vec<CharDevNodeProjection> {
     let mut out = Vec::new();
-    for func in functions.list() {
+    for func in functions.try_list().unwrap_or_default() {
         let class_id = func.class_id();
         let Some(nodes) = func.devnodes() else {
             continue;
@@ -489,6 +397,9 @@ pub fn active_char_devnode_projections(functions: &FunctionRegistry) -> Vec<Char
         for node in nodes.nodes() {
             if let DevNodeSpec::Char { name, dev } = node {
                 if dev.is_active() {
+                    if out.try_reserve(1).is_err() {
+                        return out;
+                    }
                     out.push(CharDevNodeProjection {
                         class_id,
                         node_name: name.clone(),
@@ -506,7 +417,7 @@ pub fn active_block_devnode_projections(
     functions: &FunctionRegistry,
 ) -> Vec<BlockDevNodeProjection> {
     let mut out = Vec::new();
-    for func in functions.list() {
+    for func in functions.try_list().unwrap_or_default() {
         let class_id = func.class_id();
         let Some(nodes) = func.devnodes() else {
             continue;
@@ -514,6 +425,9 @@ pub fn active_block_devnode_projections(
         for node in nodes.nodes() {
             if let DevNodeSpec::Block { name, dev } = node {
                 if dev.is_active() {
+                    if out.try_reserve(1).is_err() {
+                        return out;
+                    }
                     out.push(BlockDevNodeProjection {
                         class_id,
                         node_name: name.clone(),
@@ -531,22 +445,38 @@ pub fn active_block_devnode_projections(
 /// 这是 VFS/procfs/sysfs 兼容层使用的查询 helper。调用方不需要知道 function
 /// 的具体 Rust 类型，只需要消费返回的 `CharDevice`。
 pub fn active_char_devices(functions: &FunctionRegistry) -> Vec<CharDevice> {
-    functions
-        .list()
-        .into_iter()
-        .filter_map(|func| char_device_from_function(func.as_ref()))
-        .filter(CharDevice::is_active)
-        .collect()
+    let mut out = Vec::new();
+    for func in functions.try_list().unwrap_or_default() {
+        let Some(dev) = char_device_from_function(func.as_ref()) else {
+            continue;
+        };
+        if !dev.is_active() {
+            continue;
+        }
+        if out.try_reserve(1).is_err() {
+            return out;
+        }
+        out.push(dev);
+    }
+    out
 }
 
 /// 列出当前仍处于 active 状态的块设备节点。
 pub fn active_block_devices(functions: &FunctionRegistry) -> Vec<Arc<BlockDevice>> {
-    functions
-        .list()
-        .into_iter()
-        .filter_map(|func| block_device_from_function(func.as_ref()))
-        .filter(|dev| dev.is_active())
-        .collect()
+    let mut out = Vec::new();
+    for func in functions.try_list().unwrap_or_default() {
+        let Some(dev) = block_device_from_function(func.as_ref()) else {
+            continue;
+        };
+        if !dev.is_active() {
+            continue;
+        }
+        if out.try_reserve(1).is_err() {
+            return out;
+        }
+        out.push(dev);
+    }
+    out
 }
 
 /// 按固件名查找字符设备。
@@ -568,7 +498,8 @@ pub fn lookup_block_device_by_node(
     dev_name: &str,
 ) -> Option<Arc<BlockDevice>> {
     functions
-        .list()
+        .try_list()
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|func| {
             func.devnodes()?.nodes().iter().find_map(|node| match node {
@@ -690,18 +621,38 @@ impl FunctionRegistry {
     }
 
     /// 返回所有 function 的快照。
+    pub fn try_list(&self) -> Option<Vec<Arc<dyn DeviceFunction>>> {
+        let list = self.functions.lock();
+        let mut out = Vec::new();
+        // devtmpfs/sysfs/procfs 会频繁读取 function 快照。先按当前长度预留，
+        // 让低内存失败变成可诊断的空快照或上层错误，而不是隐式分配 panic。
+        out.try_reserve(list.len()).ok()?;
+        out.extend(list.iter().cloned());
+        Some(out)
+    }
+
+    /// 返回所有 function 的快照。
     pub fn list(&self) -> Vec<Arc<dyn DeviceFunction>> {
-        self.functions.lock().iter().cloned().collect()
+        self.try_list().unwrap_or_default()
+    }
+
+    /// 返回指定类别 function 的快照。
+    pub fn try_list_by_class(
+        &self,
+        class_id: DeviceClassId,
+    ) -> Option<Vec<Arc<dyn DeviceFunction>>> {
+        let list = self.functions.lock();
+        let mut out = Vec::new();
+        for func in list.iter().filter(|func| func.class_id() == class_id) {
+            out.try_reserve(1).ok()?;
+            out.push(Arc::clone(func));
+        }
+        Some(out)
     }
 
     /// 返回指定类别 function 的快照。
     pub fn list_by_class(&self, class_id: DeviceClassId) -> Vec<Arc<dyn DeviceFunction>> {
-        self.functions
-            .lock()
-            .iter()
-            .filter(|func| func.class_id() == class_id)
-            .cloned()
-            .collect()
+        self.try_list_by_class(class_id).unwrap_or_default()
     }
 }
 

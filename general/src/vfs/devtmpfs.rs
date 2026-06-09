@@ -68,6 +68,9 @@ static DEVTMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static DEVTMPFS_SINGLETON_SB: Spinlock<Option<&'static Arc<Superblock>>> = Spinlock::new(None);
 static TTY_SHARED_STATES: Spinlock<BTreeMap<String, Weak<TtySharedState>>> =
     Spinlock::new(BTreeMap::new());
+// FIXME(devtmpfs): 静态节点表是为了 null/zero/random 等无 PnP backing 设备保留的
+// 兼容入口。后续应收敛到统一 function projection registry，避免驱动直接调用
+// devtmpfs 发布路径。
 static STATIC_DEV_NODES: Spinlock<Vec<DevTmpfsStaticNode>> = Spinlock::new(Vec::new());
 static CUSTOM_DEVNODE_ADAPTERS: Spinlock<Vec<DevTmpfsCustomNodeAdapter>> =
     Spinlock::new(Vec::new());
@@ -337,6 +340,9 @@ pub fn unregister_static_dev_node(owner: &'static str, name: &str) -> VfsResult<
 
 const DEVTMPFS_NAME_MAX: usize = 255;
 
+// TODO(devtmpfs): 下面这些 mode/uid/gid/block size/poll 默认值仍是 VFS 兼容策略。
+// 后续应从 mount option、policy registry 或 function projection metadata 中取得，
+// 不能在 devtmpfs core 内长期写死。
 fn devtmpfs_compat_default_dir_mode() -> FileMode {
     FileMode::new(0o755)
 }
@@ -347,6 +353,33 @@ fn devtmpfs_compat_default_symlink_mode() -> FileMode {
 
 fn devtmpfs_compat_default_device_mode() -> FileMode {
     FileMode::new(0o660)
+}
+
+fn custom_devnode_default_mode(kind: CustomDevNodeKind) -> FileMode {
+    match kind {
+        CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice => {
+            devtmpfs_compat_default_device_mode()
+        }
+        CustomDevNodeKind::RegularFile => FileMode::new(0o644),
+        CustomDevNodeKind::Directory => devtmpfs_compat_default_dir_mode(),
+    }
+}
+
+fn custom_devnode_default_nlink(kind: CustomDevNodeKind) -> u32 {
+    match kind {
+        // 目录 inode 自身和父目录中的入口各占一个链接计数。自定义目录目前只
+        // 作为兼容层空目录投影，后续若有可枚举子项，应由对应 InodeOps 维护。
+        // TODO(devtmpfs): 自定义目录缺少显式 child projection 接口；后续需要让
+        // custom adapter 提供目录项快照和 nlink 维护策略，而不是只能创建空目录。
+        CustomDevNodeKind::Directory => 2,
+        CustomDevNodeKind::CharDevice
+        | CustomDevNodeKind::BlockDevice
+        | CustomDevNodeKind::RegularFile => 1,
+    }
+}
+
+fn custom_devnode_default_block_size(_kind: CustomDevNodeKind) -> u32 {
+    devtmpfs_compat_block_size()
 }
 
 fn devtmpfs_compat_default_uid() -> Uid {
@@ -369,6 +402,27 @@ fn devtmpfs_compat_max_blocks_per_io() -> u32 {
     1024
 }
 
+fn devtmpfs_fallible_string(value: &str) -> VfsResult<String> {
+    let mut out = String::new();
+    out.try_reserve(value.len())
+        .map_err(|_| VfsError::NoSpace)?;
+    out.push_str(value);
+    Ok(out)
+}
+
+fn devtmpfs_fallible_smallstr(value: &str) -> VfsResult<SmallStr> {
+    let bytes = value.as_bytes();
+    if bytes.len() <= 23 {
+        let mut buf = [0u8; 23];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return Ok(SmallStr::Inline {
+            len: bytes.len() as u8,
+            buf,
+        });
+    }
+    Ok(SmallStr::Heap(devtmpfs_fallible_string(value)?))
+}
+
 fn validate_devtmpfs_component(name: &str) -> VfsResult<()> {
     if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
         return Err(VfsError::InvalidArgument);
@@ -387,6 +441,7 @@ fn split_devtmpfs_path(path: &str) -> VfsResult<Vec<&str>> {
     let mut components = Vec::new();
     for component in path.split('/') {
         validate_devtmpfs_component(component)?;
+        components.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
         components.push(component);
     }
     if components.is_empty() {
@@ -407,6 +462,10 @@ fn validate_symlink_target(target: &str) -> VfsResult<()> {
 /// 安装后，PnpDevice 注册带 [`DevNodeSpec`] 的 function 时，会自动在这个
 /// devtmpfs superblock 中创建或删除对应 `/dev` 节点。桥接只消费 `DevNodeSpec`
 /// 携带的设备对象，不 downcast 具体 function 类型。
+///
+/// FIXME(devtmpfs): 这里仍与 PnP core 共享专用回调，后续应改成订阅通用
+/// function/projection 事件；devtmpfs 只维护自己的名字空间，不参与底层设备注册
+/// 事务。
 pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
     let (dev_sb, first_publish) = publish_devtmpfs_sb(dev_sb);
     dev_sb
@@ -418,7 +477,8 @@ pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
         unbind: pnp_unbind_cb,
     });
     if first_publish {
-        for func in DEVICES.functions.list() {
+        let functions = DEVICES.functions.try_list().ok_or(PnpError::OutOfMemory)?;
+        for func in functions {
             if let Some(nodes) = func.devnodes() {
                 // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 首次安装后补齐
                 // POSIX 节点投影。重复安装 bridge 时不能再次 bind 同一批节点，否则
@@ -437,6 +497,31 @@ fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
 fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
     let guard = DEVTMPFS_SINGLETON_SB.lock();
     guard.as_ref().map(|sb| Arc::clone(*sb))
+}
+
+/// 将非 PnP 设备声明的 `/dev` 投影绑定到当前 devtmpfs 单例。
+///
+/// loop 这类虚拟设备没有固件 backing device，不能走 `PnpDevice::register_function()`；
+/// 但它仍应通过同一组 [`DevNodeSpec`] 进入 devtmpfs，避免在文件系统核心里新增
+/// 设备类型分支。调用方负责先完成底层 function registry 的事务注册。
+pub fn bind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
+    let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(VfsError::InvalidArgument)?;
+    ops.bind_nodes(nodes)
+}
+
+/// 解绑非 PnP 设备声明的 `/dev` 投影。
+///
+/// 这是 [`bind_dynamic_devnodes`] 的对称入口，供虚拟设备释放时使用；底层设备
+/// 对象和 function registry 的清理仍由调用方按自己的生命周期顺序完成。
+pub fn unbind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
+    let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
+    let ops = sb
+        .downcast_ops::<DevTmpfsSuperblockOps>()
+        .ok_or(VfsError::InvalidArgument)?;
+    ops.unbind_nodes(nodes)
 }
 
 fn publish_devtmpfs_sb(dev_sb: Arc<Superblock>) -> (Arc<Superblock>, bool) {
@@ -489,6 +574,20 @@ fn map_control_errno(e: ControlError) -> Errno {
     }
 }
 
+fn map_control_vfs(e: ControlError) -> VfsError {
+    match e {
+        ControlError::Unsupported => VfsError::NotSupported,
+        ControlError::Invalid => VfsError::InvalidArgument,
+        ControlError::NoDevice => VfsError::NoDevice,
+        ControlError::Busy => VfsError::DeviceBusy,
+        ControlError::Io => VfsError::Io,
+        ControlError::Permission => VfsError::PermissionDenied,
+    }
+}
+
+// TODO(tty-compat): TTY ioctl 号和 termios 布局属于用户态 ABI 适配层。当前为了
+// `/dev/tty*` 可用暂时放在 devtmpfs FileOps 中，后续应拆到独立 tty/posix
+// compat 模块，devtmpfs 只负责 inode 与 typed char device 的连接。
 const TCGETS: usize = 0x5401;
 const TCSETS: usize = 0x5402;
 const TCSETSW: usize = 0x5403;
@@ -839,7 +938,11 @@ fn shared_tty_state(dev: &CharDevice) -> Option<Arc<TtySharedState>> {
     // 同一个底层 TTY 可能被投影成多个 `/dev` 节点，例如稳定的 console 别名
     // 和驱动自己的串口节点。行规程状态必须按设备共享，不能按 open fd 分裂。
     let state = Arc::new(TtySharedState::new());
-    states.insert(String::from(dev.fw_name()), Arc::downgrade(&state));
+    // 共享状态缓存只是优化；如果名称键分配失败，当前 open fd 仍可持有独立
+    // 状态继续工作，不能因为缓存失败阻断字符设备打开路径。
+    if let Ok(key) = devtmpfs_fallible_string(dev.fw_name()) {
+        states.insert(key, Arc::downgrade(&state));
+    }
     Some(state)
 }
 
@@ -1461,8 +1564,12 @@ fn block_range_for_io(dev: &BlockDevice, offset: u64, len: usize) -> VfsResult<O
     }))
 }
 
-fn block_capacity_remaining(dev: &BlockDevice, offset: u64, len: usize) -> usize {
-    let Some(capacity) = dev.geometry().capacity_bytes() else {
+fn block_capacity_remaining(dev: &Arc<BlockDevice>, offset: u64, len: usize) -> usize {
+    let capacity = match dev.control(BlockControlRequest::GetCapacityBytes) {
+        Ok(BlockControlResponse::U64(value)) => Some(value),
+        _ => dev.geometry().capacity_bytes(),
+    };
+    let Some(capacity) = capacity else {
         return len;
     };
     if offset >= capacity {
@@ -1675,6 +1782,9 @@ impl FileOps for BlockDevFileOps {
         if !self.dev.is_active() {
             return Err(Errno::ENODEV);
         }
+        if let Some(result) = crate::vfs::loop_devnode::try_loop_block_ioctl(&self.dev, cmd, arg) {
+            return result;
+        }
 
         match cmd.raw() {
             BLKROGET => {
@@ -1797,7 +1907,9 @@ impl FileOps for BlockDevFileOps {
         }
     }
 
-    fn release(&self) {}
+    fn release(&self) {
+        self.dev.release_file();
+    }
 
     fn as_any(&self) -> &dyn core::any::Any {
         self
@@ -1818,6 +1930,7 @@ impl InodeOps for DevBlockOps {
         if !self.dev.is_active() {
             return Err(VfsError::NoDevice);
         }
+        self.dev.open_file().map_err(map_control_vfs)?;
         Ok(Box::new(BlockDevFileOps {
             dev: Arc::clone(&self.dev),
             sync_writes: opts.sync,
@@ -1919,12 +2032,21 @@ impl DevDirOps {
     }
 
     /// 返回当前子节点的快照：`(user_name, Arc<Inode>)` 列表。
+    pub fn try_children_snapshot(&self) -> VfsResult<alloc::vec::Vec<(String, Arc<Inode>)>> {
+        let children = self.children.lock();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(children.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (name, inode) in children.iter() {
+            snapshot.push((devtmpfs_fallible_string(name)?, Arc::clone(inode)));
+        }
+        Ok(snapshot)
+    }
+
+    /// 返回当前子节点的快照：`(user_name, Arc<Inode>)` 列表。
     pub fn children_snapshot(&self) -> alloc::vec::Vec<(String, Arc<Inode>)> {
-        self.children
-            .lock()
-            .iter()
-            .map(|(name, inode)| (name.clone(), Arc::clone(inode)))
-            .collect()
+        self.try_children_snapshot().unwrap_or_default()
     }
 }
 
@@ -1959,7 +2081,7 @@ impl InodeOps for DevDirOps {
         if children.contains_key(name) {
             return Err(VfsError::AlreadyExists);
         }
-        children.insert(String::from(name), Arc::clone(&inode));
+        children.insert(devtmpfs_fallible_string(name)?, Arc::clone(&inode));
         drop(children);
 
         dir.inc_nlink();
@@ -1991,7 +2113,7 @@ impl InodeOps for DevDirOps {
         if children.contains_key(name) {
             return Err(VfsError::AlreadyExists);
         }
-        children.insert(String::from(name), Arc::clone(&inode));
+        children.insert(devtmpfs_fallible_string(name)?, Arc::clone(&inode));
         drop(children);
 
         dir.touch_mtime();
@@ -2062,18 +2184,19 @@ impl InodeOps for DevDirOps {
         _opts: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
-        Ok(Box::new(DevRootFile {
-            snapshot: self
-                .children
-                .lock()
-                .iter()
-                .map(|(name, inode)| DirEntry {
-                    ino: inode.ino(),
-                    name: SmallStr::new(name),
-                    kind: inode.kind(),
-                })
-                .collect(),
-        }))
+        let children = self.children.lock();
+        let mut snapshot = Vec::new();
+        snapshot
+            .try_reserve(children.len())
+            .map_err(|_| VfsError::NoSpace)?;
+        for (name, inode) in children.iter() {
+            snapshot.push(DirEntry {
+                ino: inode.ino(),
+                name: devtmpfs_fallible_smallstr(name)?,
+                kind: inode.kind(),
+            });
+        }
+        Ok(Box::new(DevRootFile { snapshot }))
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -2161,7 +2284,7 @@ impl DevTmpfsSuperblockOps {
             return Ok(());
         }
         nodes.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
-        nodes.push(String::from(name));
+        nodes.push(devtmpfs_fallible_string(name)?);
         Ok(())
     }
 
@@ -2281,7 +2404,9 @@ impl DevTmpfsSuperblockOps {
 
     fn new_custom_inode(&self, spec: &CustomDevNodeSpec, rdev: DevId) -> VfsResult<Arc<Inode>> {
         split_devtmpfs_path(spec.name())?;
-        if spec.block_size() == 0 || spec.nlink() == 0 {
+        let block_size = custom_devnode_default_block_size(spec.kind());
+        let nlink = custom_devnode_default_nlink(spec.kind());
+        if block_size == 0 || nlink == 0 {
             return Err(VfsError::InvalidArgument);
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
@@ -2291,15 +2416,15 @@ impl DevTmpfsSuperblockOps {
 
         let now = Timespec::now();
         let meta = InodeMeta {
-            size: spec.size(),
-            nlink: spec.nlink(),
-            mode: FileMode::new(spec.mode()),
-            uid: Uid(spec.uid()),
-            gid: Gid(spec.gid()),
+            size: 0,
+            nlink,
+            mode: custom_devnode_default_mode(spec.kind()),
+            uid: devtmpfs_compat_default_uid(),
+            gid: devtmpfs_compat_default_gid(),
             atime: now,
             mtime: now,
             ctime: now,
-            blocks: spec.blocks(),
+            blocks: 0,
         };
 
         Ok(Inode::new(
@@ -2309,7 +2434,7 @@ impl DevTmpfsSuperblockOps {
             },
             kind,
             rdev,
-            spec.block_size(),
+            block_size,
             None,
             meta,
             ops,
@@ -2341,7 +2466,7 @@ impl DevTmpfsSuperblockOps {
                         devtmpfs_compat_default_uid(),
                         devtmpfs_compat_default_gid(),
                     )?;
-                    children.insert(String::from(*component), Arc::clone(&child));
+                    children.insert(devtmpfs_fallible_string(component)?, Arc::clone(&child));
                     created = true;
                     child
                 }
@@ -2397,7 +2522,7 @@ impl DevTmpfsSuperblockOps {
         if children.contains_key(name) {
             return Err(VfsError::AlreadyExists);
         }
-        children.insert(String::from(name), inode);
+        children.insert(devtmpfs_fallible_string(name)?, inode);
         drop(children);
 
         parent.touch_mtime();
@@ -2418,7 +2543,7 @@ impl DevTmpfsSuperblockOps {
             .ok_or(VfsError::NotADirectory)?;
 
         let mut children = parent_ops.children.lock();
-        let inode = children.remove(name).ok_or(VfsError::NotFound)?;
+        let (owned_name, inode) = children.remove_entry(name).ok_or(VfsError::NotFound)?;
         drop(children);
 
         if inode.kind() == FileType::Directory {
@@ -2427,7 +2552,7 @@ impl DevTmpfsSuperblockOps {
                 .ok_or(VfsError::InvalidArgument)?;
             if !dir_ops.children.lock().is_empty() {
                 let mut children = parent_ops.children.lock();
-                children.insert(String::from(name), Arc::clone(&inode));
+                children.insert(owned_name, Arc::clone(&inode));
                 return Err(VfsError::DirectoryNotEmpty);
             }
             parent.dec_nlink();
@@ -2622,37 +2747,23 @@ impl DevTmpfsSuperblockOps {
         if self.lookup_node_at(spec.name()).is_ok() {
             return Err(VfsError::AlreadyExists);
         }
-        let mut registered_rdev = false;
-        let rdev = if let Some(rdev) = spec.rdev() {
-            let rdev = DevId::new(rdev.major, rdev.minor);
-            match spec.kind() {
-                CustomDevNodeKind::CharDevice => {
-                    registered_rdev = true;
-                    super::device_numbers::register_char_with_rdev(spec.name(), spec.name(), rdev)
-                        .ok_or(VfsError::NoSpace)?
-                }
-                CustomDevNodeKind::BlockDevice => {
-                    registered_rdev = true;
-                    super::device_numbers::register_block_with_rdev(spec.name(), spec.name(), rdev)
-                        .ok_or(VfsError::NoSpace)?
-                }
-                CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => {
-                    return Err(VfsError::InvalidArgument);
-                }
-            }
-        } else {
-            match spec.kind() {
-                CustomDevNodeKind::CharDevice => {
-                    registered_rdev = true;
-                    super::device_numbers::register_char(spec.name(), spec.name())
-                        .ok_or(VfsError::NoSpace)?
-                }
-                CustomDevNodeKind::BlockDevice => {
-                    registered_rdev = true;
-                    super::device_numbers::register_block(spec.name(), spec.name())
-                        .ok_or(VfsError::NoSpace)?
-                }
-                CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => DevId::new(0, 0),
+
+        // custom 节点只从 dev core 接收通用类别和 opaque payload；兼容设备号
+        // 是 devtmpfs/stat/proc/sysfs 这条 POSIX 投影链路的状态，不能由底层
+        // function 指定或反向影响设备身份。
+        let (rdev, registered_rdev) = match spec.kind() {
+            CustomDevNodeKind::CharDevice => (
+                super::device_numbers::register_char(spec.name(), spec.name())
+                    .ok_or(VfsError::NoSpace)?,
+                true,
+            ),
+            CustomDevNodeKind::BlockDevice => (
+                super::device_numbers::register_block(spec.name(), spec.name())
+                    .ok_or(VfsError::NoSpace)?,
+                true,
+            ),
+            CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => {
+                (DevId::new(0, 0), false)
             }
         };
         let inode = match self.new_custom_inode(spec, rdev) {
@@ -2695,6 +2806,12 @@ impl DevTmpfsSuperblockOps {
     pub fn bind_nodes(&self, nodes: &DevNodeSet) -> VfsResult<()> {
         let mut bound: Vec<&str> = Vec::new();
         for node in nodes.nodes() {
+            if bound.try_reserve(1).is_err() {
+                for name in bound.iter().rev() {
+                    let _ = self.unbind(name);
+                }
+                return Err(VfsError::NoSpace);
+            }
             if let Err(err) = self.bind_node(node) {
                 for name in bound.iter().rev() {
                     let _ = self.unbind(name);

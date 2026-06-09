@@ -11,10 +11,12 @@ use alloc::vec::Vec;
 
 use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::BlockDevice;
+use crate::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
 
 /// 把 [`BlockDevice`] 适配为文件系统同步 BlockBackend。
 pub struct FsBlockAdapter {
     dev: Arc<BlockDevice>,
+    sector_size: u32,
     sector_count: u64,
 }
 
@@ -43,17 +45,23 @@ impl From<BioError> for SyncIoError {
 
 impl FsBlockAdapter {
     pub fn new(dev: Arc<BlockDevice>) -> Result<Self, SyncIoError> {
-        let sector_count = dev
-            .geometry()
-            .block_count()
-            .ok_or(SyncIoError::UnknownCapacity)?;
+        let sector_size = block_sector_size(&dev)?;
+        let capacity_bytes = block_capacity_bytes(&dev)?;
+        let sector_count = capacity_bytes / sector_size as u64;
+        if sector_count == 0 {
+            return Err(SyncIoError::UnknownCapacity);
+        }
         // 文件系统 BlockBackend trait 只能返回 u64 容量，没有“不知道”的表达；
         // 构造期显式失败，避免把未知容量硬投影成 0 扇区空盘。
-        Ok(Self { dev, sector_count })
+        Ok(Self {
+            dev,
+            sector_size,
+            sector_count,
+        })
     }
 
     pub fn sector_size_bytes(&self) -> u32 {
-        self.dev.geometry().logical_block_size().get()
+        self.sector_size
     }
 
     pub fn sector_count_total(&self) -> u64 {
@@ -89,6 +97,37 @@ impl FsBlockAdapter {
             .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
             .map_err(SyncIoError::from)?;
         Ok(())
+    }
+}
+
+fn block_sector_size(dev: &Arc<BlockDevice>) -> Result<u32, SyncIoError> {
+    match dev
+        .control(BlockControlRequest::GetLogicalBlockSize)
+        .map_err(map_control_sync_error)?
+    {
+        BlockControlResponse::U32(size) if size != 0 && size.is_power_of_two() => Ok(size),
+        _ => Err(SyncIoError::UnknownCapacity),
+    }
+}
+
+fn block_capacity_bytes(dev: &Arc<BlockDevice>) -> Result<u64, SyncIoError> {
+    match dev
+        .control(BlockControlRequest::GetCapacityBytes)
+        .map_err(map_control_sync_error)?
+    {
+        BlockControlResponse::U64(bytes) => Ok(bytes),
+        _ => Err(SyncIoError::UnknownCapacity),
+    }
+}
+
+fn map_control_sync_error(err: ControlError) -> SyncIoError {
+    match err {
+        ControlError::Unsupported | ControlError::Invalid | ControlError::NoDevice => {
+            SyncIoError::UnknownCapacity
+        }
+        ControlError::Busy => SyncIoError::InvalidRange,
+        ControlError::Io => SyncIoError::Io(crate::dev::bio::BioIoError::MediaError),
+        ControlError::Permission => SyncIoError::Submit(crate::dev::bio::SubmitError::ReadOnly),
     }
 }
 

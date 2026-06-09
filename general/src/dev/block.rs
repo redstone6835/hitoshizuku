@@ -366,6 +366,32 @@ pub trait BlockDriver: Send + Sync {
     /// 不持有任何外部锁时被调用。
     fn drain(&self) {}
 
+    /// 一个 VFS 块设备文件被打开时调用。
+    ///
+    /// 这是设备对象层的生命周期通知，不携带 fd、路径或权限位等 POSIX 信息。
+    /// 默认 no-op；需要按打开引用管理资源的虚拟设备可以覆盖。
+    fn open_file(&self) -> Result<(), ControlError> {
+        Ok(())
+    }
+
+    /// 一个 VFS 块设备文件的最后引用释放时调用。
+    ///
+    /// 与 [`open_file`](Self::open_file) 成对使用。默认 no-op，硬件块设备通常
+    /// 不需要感知普通文件描述符生命周期。
+    fn release_file(&self) {}
+
+    /// 处理需要由具体驱动覆盖的块设备 typed control。
+    ///
+    /// 大多数硬件块设备的容量、只读状态和 I/O hint 都可以由 [`BlockDevice`]
+    /// 的静态描述直接回答；loop 这类虚拟设备的 backing file 会在运行期变化，
+    /// 因此允许驱动在这里覆盖特定请求。返回 `None` 表示继续使用块层默认实现。
+    fn control(
+        &self,
+        _req: BlockControlRequest,
+    ) -> Option<Result<BlockControlResponse, ControlError>> {
+        None
+    }
+
     /// 用于向下转型，获取具体驱动类型。
     fn as_any(&self) -> &dyn Any;
 }
@@ -487,6 +513,21 @@ impl BlockDevice {
         self.driver.drain();
     }
 
+    /// 通知底层驱动该块设备节点被打开。
+    ///
+    /// VFS 兼容层只在成功创建文件对象前调用一次；失败时打开操作返回给上层。
+    pub fn open_file(&self) -> Result<(), ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+        self.driver.open_file()
+    }
+
+    /// 通知底层驱动该块设备文件对象已释放。
+    pub fn release_file(&self) {
+        self.driver.release_file();
+    }
+
     /// 执行块设备类 typed control。
     pub fn control(
         self: &Arc<Self>,
@@ -494,6 +535,10 @@ impl BlockDevice {
     ) -> Result<BlockControlResponse, ControlError> {
         if !self.is_active() {
             return Err(ControlError::NoDevice);
+        }
+
+        if let Some(response) = self.driver.control(req) {
+            return response;
         }
 
         match req {

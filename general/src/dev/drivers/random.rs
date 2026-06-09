@@ -669,6 +669,10 @@ impl CharDriver for UrandomDriver {
 pub static RANDOM_DRIVER: RandomDriver = RandomDriver;
 pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
 const RANDOM_STATIC_NODE_OWNER: &str = "random-driver";
+
+// FIXME(dev-core): random 驱动仍通过 devtmpfs 静态节点表直接发布 `/dev` 路径。
+// 后续应把 random/urandom 表达为无 PnP backing 的 typed function，路径、设备号
+// 和 inode 适配全部由 VFS/兼容层 projector 处理。
 const RANDOM_STATIC_NODES: [DevTmpfsStaticNode; 2] = [
     DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "random", random_dev_node),
     DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "urandom", urandom_dev_node),
