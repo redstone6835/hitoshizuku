@@ -375,6 +375,7 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
+    me.clear_rseq_registration();
     me.shared_signal().reset_caught_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);

@@ -72,6 +72,21 @@ impl FileOps for PidfdFileOps {
         }
     }
 
+    fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
+        if !interest.has(PollEvents::POLLIN) {
+            return false;
+        }
+        if matches!(self.task.state(), TaskState::Zombie | TaskState::Dead) {
+            return false;
+        }
+        self.task.exit_waiters.enqueue(task);
+        true
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<Task>) {
+        self.task.exit_waiters.remove(task);
+    }
+
     fn is_seekable(&self) -> bool {
         false
     }

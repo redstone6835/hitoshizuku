@@ -1482,11 +1482,18 @@ const FUTEX_WAKE: u32 = 1;
 const FUTEX_REQUEUE: u32 = 3;
 const FUTEX_CMP_REQUEUE: u32 = 4;
 const FUTEX_WAKE_OP: u32 = 5;
+const FUTEX_LOCK_PI: u32 = 6;
+const FUTEX_UNLOCK_PI: u32 = 7;
+const FUTEX_TRYLOCK_PI: u32 = 8;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
+const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+const FUTEX_CMP_REQUEUE_PI: u32 = 12;
+const FUTEX_LOCK_PI2: u32 = 13;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 const ROBUST_LIST_HEAD_SIZE: usize = 24;
@@ -1690,6 +1697,77 @@ fn sign_extend_12(value: u32) -> i32 {
     ((value << 20) as i32) >> 20
 }
 
+fn futex_lock_pi(
+    task: &Arc<Task>,
+    uaddr: usize,
+    private: bool,
+    try_only: bool,
+    deadline_ns: Option<u64>,
+) -> Result<usize, Errno> {
+    let tid = task.pid_root().unwrap_or(0) as u32;
+    if tid == 0 {
+        return Err(Errno::ESRCH);
+    }
+    let key = futex_key(task, uaddr, private)?;
+    loop {
+        let expected = {
+            let _guard = FUTEX_USER_OP_LOCK.lock();
+            let cur = read_user_u32(uaddr)?;
+            let owner = cur & FUTEX_TID_MASK;
+            if owner == 0 {
+                let new = (cur & FUTEX_OWNER_DIED) | tid;
+                write_user_u32(uaddr, new)?;
+                return Ok(0);
+            }
+            if owner == tid {
+                return Err(Errno::EDEADLK);
+            }
+            if try_only {
+                return Err(Errno::EAGAIN);
+            }
+            let waiting = cur | FUTEX_WAITERS;
+            if waiting != cur {
+                write_user_u32(uaddr, waiting)?;
+            }
+            waiting
+        };
+        match futex_wait(
+            task,
+            key,
+            uaddr,
+            expected,
+            FUTEX_BITSET_MATCH_ANY,
+            deadline_ns,
+        ) {
+            Ok(_) | Err(Errno::EAGAIN) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn futex_unlock_pi(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<usize, Errno> {
+    let tid = task.pid_root().unwrap_or(0) as u32;
+    if tid == 0 {
+        return Err(Errno::ESRCH);
+    }
+    let key = futex_key(task, uaddr, private)?;
+    let had_waiters = {
+        let _guard = FUTEX_USER_OP_LOCK.lock();
+        let cur = read_user_u32(uaddr)?;
+        if (cur & FUTEX_TID_MASK) != tid {
+            return Err(Errno::EPERM);
+        }
+        let had_waiters = (cur & FUTEX_WAITERS) != 0;
+        write_user_u32(uaddr, 0)?;
+        had_waiters
+    };
+    Ok(if had_waiters {
+        futex_wake_key(key, 1, FUTEX_BITSET_MATCH_ANY)
+    } else {
+        0
+    })
+}
+
 fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
     let mut woken = 0usize;
     if let Ok(key) = futex_key(task, uaddr, true) {
@@ -1792,9 +1870,16 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 val3,
             )
         }
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => futex_lock_pi(&ctx.task, uaddr, private, false, None),
+        FUTEX_TRYLOCK_PI => futex_lock_pi(&ctx.task, uaddr, private, true, None),
+        FUTEX_UNLOCK_PI => futex_unlock_pi(&ctx.task, uaddr, private),
+        FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI => {
+            // TODO(threading): requeue_pi 需要把普通等待者原子迁移到 PI owner
+            // 队列，并在迁移期间维护 owner 继承关系；不能退化成普通 requeue。
+            Err(Errno::EOPNOTSUPP)
+        }
         _ => {
-            // TODO(threading): PI futexes and requeue_pi need
-            // priority inheritance state attached to scheduler wait queues.
+            // TODO(threading): 其它 futex 操作需要扩展独立的等待队列状态。
             Err(Errno::EOPNOTSUPP)
         }
     }
