@@ -140,6 +140,7 @@ pub fn mount_devtmpfs_on_dev(tag: &str, ctx: &VfsContext, dev_sb: Arc<Superblock
 /// `/dev/shm` 和 `/sys` 不是底层设备身份的一部分，但它们依赖启动期设备文件系统
 /// 先就绪。集中到这里可以让 DTB/ACPI 等固件入口共享同一套顺序和幂等规则。
 pub fn mount_standard_compat_filesystems(tag: &str, ctx: &VfsContext) {
+    general::vfs::net_ioctl::install_net_ioctl_compat();
     mount_posix_shm_tmpfs(ctx).unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to mount tmpfs on /dev/shm: {:?}",

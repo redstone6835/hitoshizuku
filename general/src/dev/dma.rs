@@ -22,6 +22,148 @@ pub struct DmaSyncRegion {
     pub direction: DmaDirection,
 }
 
+/// 设备可见 DMA 地址窗口。
+///
+/// `cpu_start..cpu_start+size` 是内核物理地址范围，`dma_start` 是同一窗口在设备
+/// 描述符中应看到的起始地址。没有 IOMMU 或偏移窗口的平台通常使用 identity。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaWindow {
+    pub cpu_start: usize,
+    pub dma_start: usize,
+    pub size: usize,
+}
+
+impl DmaWindow {
+    pub const fn identity(start: usize, size: usize) -> Self {
+        Self {
+            cpu_start: start,
+            dma_start: start,
+            size,
+        }
+    }
+
+    pub fn translate(self, paddr: usize, len: usize) -> Option<usize> {
+        let end = paddr.checked_add(len)?;
+        let window_end = self.cpu_start.checked_add(self.size)?;
+        if paddr < self.cpu_start || end > window_end {
+            return None;
+        }
+        self.dma_start.checked_add(paddr - self.cpu_start)
+    }
+}
+
+/// DMA bounce buffer 策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaBouncePolicy {
+    /// 地址无法被设备直接访问时返回错误。
+    Disabled,
+    /// 允许 DMA 层后续引入 bounce buffer。
+    Allowed,
+}
+
+/// 单个设备的 DMA 能力约束。
+///
+/// 该结构描述设备自身能力：地址位宽、单段大小、scatter-gather 能力和是否 cache
+/// coherent。它不从全局平台 hook 推断，后续 PCI/platform 总线应按设备/桥属性填充。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaConstraints {
+    pub address_mask: usize,
+    pub max_segment_size: usize,
+    pub max_segments: usize,
+    pub coherent: bool,
+    pub supports_scatter_gather: bool,
+    pub bounce: DmaBouncePolicy,
+}
+
+impl DmaConstraints {
+    pub const fn coherent_identity() -> Self {
+        Self {
+            address_mask: usize::MAX,
+            max_segment_size: usize::MAX,
+            max_segments: 1,
+            coherent: true,
+            supports_scatter_gather: false,
+            bounce: DmaBouncePolicy::Disabled,
+        }
+    }
+
+    pub fn accepts_dma_addr(self, dma_addr: usize, len: usize) -> bool {
+        let Some(end) = dma_addr.checked_add(len.saturating_sub(1)) else {
+            return false;
+        };
+        end <= self.address_mask && len <= self.max_segment_size
+    }
+}
+
+/// 设备 DMA 地址映射与 cache 同步接口。
+///
+/// mapper 是 per-device 上下文的一部分；全局 `DMA_OPS` 只作为默认 mapper 的
+/// 兼容入口存在，不能再作为设备能力模型本身。
+pub trait DmaMapper: Send + Sync {
+    fn sync_for_device(&self, region: DmaSyncRegion);
+    fn sync_for_cpu(&self, region: DmaSyncRegion);
+    fn phys_to_dma(&self, region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize>;
+}
+
+struct LegacyGlobalDmaMapper;
+
+impl DmaMapper for LegacyGlobalDmaMapper {
+    fn sync_for_device(&self, region: DmaSyncRegion) {
+        let ops = *DMA_OPS.lock();
+        (ops.sync_for_device)(region);
+    }
+
+    fn sync_for_cpu(&self, region: DmaSyncRegion) {
+        let ops = *DMA_OPS.lock();
+        (ops.sync_for_cpu)(region);
+    }
+
+    fn phys_to_dma(&self, region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize> {
+        let ops = *DMA_OPS.lock();
+        let dma_addr = (ops.phys_to_dma)(region);
+        constraints
+            .accepts_dma_addr(dma_addr, region.len)
+            .then_some(dma_addr)
+    }
+}
+
+static LEGACY_GLOBAL_DMA_MAPPER: LegacyGlobalDmaMapper = LegacyGlobalDmaMapper;
+
+/// 单个设备使用的 DMA 上下文。
+#[derive(Clone, Copy)]
+pub struct DmaContext {
+    constraints: DmaConstraints,
+    mapper: &'static dyn DmaMapper,
+}
+
+impl DmaContext {
+    pub const fn new(constraints: DmaConstraints, mapper: &'static dyn DmaMapper) -> Self {
+        Self {
+            constraints,
+            mapper,
+        }
+    }
+
+    /// 使用默认平台 mapper 和指定设备约束构造 DMA 上下文。
+    ///
+    /// 这是总线层给设备生成 per-device DMA 能力的常用入口。全局 mapper 只负责
+    /// 执行平台地址转换/cache 同步，地址位宽、coherent 等能力来自设备或桥。
+    pub const fn with_constraints(constraints: DmaConstraints) -> Self {
+        Self::new(constraints, &LEGACY_GLOBAL_DMA_MAPPER)
+    }
+
+    pub const fn default_coherent() -> Self {
+        Self::new(
+            DmaConstraints::coherent_identity(),
+            &LEGACY_GLOBAL_DMA_MAPPER,
+        )
+    }
+
+    pub const fn constraints(self) -> DmaConstraints {
+        self.constraints
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct DmaOps {
     pub sync_for_device: fn(DmaSyncRegion),
@@ -61,6 +203,7 @@ fn dma_identity_addr(region: DmaSyncRegion) -> usize {
 /// 由物理页支撑、具有稳定内核虚拟映射和设备可见 DMA 地址的缓冲区。
 pub struct DmaBuffer {
     allocation: PhysicalAllocation,
+    context: DmaContext,
     vaddr: usize,
     dma_addr: usize,
     len: usize,
@@ -70,6 +213,16 @@ pub struct DmaBuffer {
 impl DmaBuffer {
     /// 分配一个已清零的 DMA 缓冲区，至少暴露 `len` 字节可用空间。
     pub fn new(len: usize, align: usize, direction: DmaDirection) -> Result<Self, &'static str> {
+        Self::new_in(DmaContext::default_coherent(), len, align, direction)
+    }
+
+    /// 使用指定设备 DMA 上下文分配缓冲区。
+    pub fn new_in(
+        context: DmaContext,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Result<Self, &'static str> {
         if !align.is_power_of_two() {
             return Err("DMA alignment must be a non-zero power of two");
         }
@@ -94,11 +247,14 @@ impl DmaBuffer {
             len: alloc_len,
             direction,
         };
-        let ops = *DMA_OPS.lock();
-        let dma_addr = (ops.phys_to_dma)(region);
+        let Some(dma_addr) = context.mapper.phys_to_dma(region, context.constraints()) else {
+            let _ = KERNEL_ALLOCATOR.free_physical(allocation);
+            return Err("DMA buffer is outside device DMA constraints");
+        };
 
         Ok(Self {
             allocation,
+            context,
             vaddr,
             dma_addr,
             len,
@@ -109,6 +265,11 @@ impl DmaBuffer {
     /// 分配一个已清零的页大小 DMA 缓冲区。
     pub fn page(direction: DmaDirection) -> Result<Self, &'static str> {
         Self::new(PAGE_SIZE, PAGE_SIZE, direction)
+    }
+
+    /// 使用指定设备 DMA 上下文分配一个已清零的页大小 DMA 缓冲区。
+    pub fn page_in(context: DmaContext, direction: DmaDirection) -> Result<Self, &'static str> {
+        Self::new_in(context, PAGE_SIZE, PAGE_SIZE, direction)
     }
 
     /// 后端物理地址，仅供内核内部诊断或平台层转换使用。
@@ -153,14 +314,12 @@ impl DmaBuffer {
 
     /// 将 CPU 写入的内容同步到设备可见状态。
     pub fn sync_for_device(&self) {
-        let ops = *DMA_OPS.lock();
-        (ops.sync_for_device)(self.sync_region());
+        self.context.mapper.sync_for_device(self.sync_region());
     }
 
     /// 将设备写入的内容同步到 CPU 可见状态。
     pub fn sync_for_cpu(&self) {
-        let ops = *DMA_OPS.lock();
-        (ops.sync_for_cpu)(self.sync_region());
+        self.context.mapper.sync_for_cpu(self.sync_region());
     }
 
     fn sync_region(&self) -> DmaSyncRegion {

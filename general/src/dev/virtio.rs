@@ -9,7 +9,7 @@ use core::mem;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
-use crate::dev::dma::{DmaBuffer, DmaDirection};
+use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
 use crate::dev::pci::{PciBarType, PciDevice};
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 1;
@@ -545,6 +545,7 @@ enum DescState {
 
 pub struct SplitVirtQueue {
     queue_size: u16,
+    dma_context: DmaContext,
     desc: DmaBuffer,
     avail: DmaBuffer,
     used: DmaBuffer,
@@ -557,6 +558,14 @@ pub type VirtQueue = SplitVirtQueue;
 
 impl SplitVirtQueue {
     pub fn new(queue_size: u16) -> Result<Self, VirtQueueError> {
+        Self::new_in(DmaContext::default_coherent(), queue_size)
+    }
+
+    /// 使用指定设备 DMA 上下文创建 split virtqueue。
+    ///
+    /// virtqueue 的三段 ring 必须和后续请求 buffer 使用同一个设备 DMA 视图，
+    /// 否则 IOMMU/地址窗口平台上描述符地址和数据地址可能属于不同地址空间。
+    pub fn new_in(dma_context: DmaContext, queue_size: u16) -> Result<Self, VirtQueueError> {
         // VirtIO split queue 的环大小必须统一在这里校验：
         // 非 0 且为 2 的幂，后续取模和 wrap-around 逻辑依赖该约束。
         let qsz = validate_queue_size(queue_size)?;
@@ -564,15 +573,16 @@ impl SplitVirtQueue {
         let avail_len = avail_ring_bytes(qsz)?;
         let used_len = used_ring_bytes(qsz)?;
 
-        let desc = DmaBuffer::new(desc_len, DESC_ALIGN, DmaDirection::ToDevice)
+        let desc = DmaBuffer::new_in(dma_context, desc_len, DESC_ALIGN, DmaDirection::ToDevice)
             .map_err(VirtQueueError::DmaAllocationFailed)?;
-        let avail = DmaBuffer::new(avail_len, AVAIL_ALIGN, DmaDirection::ToDevice)
+        let avail = DmaBuffer::new_in(dma_context, avail_len, AVAIL_ALIGN, DmaDirection::ToDevice)
             .map_err(VirtQueueError::DmaAllocationFailed)?;
-        let used = DmaBuffer::new(used_len, USED_ALIGN, DmaDirection::FromDevice)
+        let used = DmaBuffer::new_in(dma_context, used_len, USED_ALIGN, DmaDirection::FromDevice)
             .map_err(VirtQueueError::DmaAllocationFailed)?;
 
         let mut queue = Self {
             queue_size,
+            dma_context,
             desc,
             avail,
             used,
@@ -582,6 +592,10 @@ impl SplitVirtQueue {
         };
         queue.clear()?;
         Ok(queue)
+    }
+
+    pub const fn dma_context(&self) -> DmaContext {
+        self.dma_context
     }
 
     pub const fn queue_size(&self) -> u16 {

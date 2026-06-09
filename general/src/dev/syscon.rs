@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
+use crate::dev::pnp::{self, PnpDependency, PnpHandleResource, PnpResourceKind};
+
 use super::registry_id;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +131,8 @@ pub fn register(dev: Arc<dyn SysconDevice>) -> Result<SysconHandle, SysconError>
     // 同一个 phandle 被注销后可以再次登记，但旧 SysconHandle 不能继续拥有新对象。
     let handle = SysconHandle { phandle, id };
     registry.devices.push(SysconRegistration { handle, dev });
+    drop(registry);
+    pnp::notify_dependency_ready(PnpDependency::Syscon(phandle));
     Ok(handle)
 }
 
@@ -143,6 +147,23 @@ pub fn unregister(handle: SysconHandle) -> Result<(), SysconError> {
     };
     registry.devices.swap_remove(index);
     Ok(())
+}
+
+fn release_syscon_resource(handle: SysconHandle) -> bool {
+    unregister(handle).is_ok()
+}
+
+/// 将 syscon handle 包装成 PnP-owned resource。
+///
+/// 驱动 probe 成功登记 syscon 后应立即交给 PnP 设备拥有，remove/rollback 时由
+/// core 统一注销，避免驱动私有状态和 registry 生命周期分离。
+pub fn pnp_resource(handle: SysconHandle, label: &'static str) -> PnpHandleResource<SysconHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::Syscon,
+        label,
+        handle,
+        release_syscon_resource,
+    )
 }
 
 pub fn get(phandle: u32) -> Option<Arc<dyn SysconDevice>> {

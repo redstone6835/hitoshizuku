@@ -25,12 +25,12 @@ use crate::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures,
     BlockGeometry,
 };
-use crate::dev::dma::{DmaBuffer, DmaDirection};
+use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
 use crate::dev::function::BlockFunction;
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    PnpResourceKind, register_driver_factory,
 };
 use crate::dev::virtio::{SplitVirtQueue, VIRTQ_DESC_F_WRITE, choose_split_queue_size};
 
@@ -225,7 +225,7 @@ impl VirtioBlk {
     ///
     /// # 返回
     /// 成功时返回驱动实例，失败时返回错误信息
-    pub fn new(mmio_base: usize) -> Result<Self, &'static str> {
+    pub fn new(mmio_base: usize, dma_context: DmaContext) -> Result<Self, &'static str> {
         let regs = VirtioMmioRegs { base: mmio_base };
 
         // 1. 验证 Magic 和 Version
@@ -304,8 +304,8 @@ impl VirtioBlk {
             regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
             return Err("VirtIO queue size is too small");
         }
-        let split_queue =
-            SplitVirtQueue::new(queue_size).map_err(|_| "Failed to allocate VirtIO queue")?;
+        let split_queue = SplitVirtQueue::new_in(dma_context, queue_size)
+            .map_err(|_| "Failed to allocate VirtIO queue")?;
 
         // 队列 DMA 布局由公共 SplitVirtQueue 维护，MMIO 传输层只负责把设备
         // 可见 DMA 地址写入寄存器，不直接假设 DMA 地址等于物理地址。
@@ -553,9 +553,11 @@ impl BlockDriver for VirtioBlkIo {
             Ok(chain) => chain,
             Err(_) => return Err((SubmitError::QueueFull, bio)),
         };
+        let dma_context = queue.queue.dma_context();
 
         // 元数据 DMA 缓冲区（请求头 + 状态字节），方向设为双向以覆盖设备写 status。
-        let meta_dma = match DmaBuffer::new(
+        let meta_dma = match DmaBuffer::new_in(
+            dma_context,
             mem::size_of::<VirtioBlkReqMeta>(),
             mem::align_of::<VirtioBlkReqMeta>(),
             DmaDirection::Bidirectional,
@@ -588,7 +590,7 @@ impl BlockDriver for VirtioBlkIo {
                 } else {
                     DmaDirection::ToDevice
                 };
-                let mut dma = match DmaBuffer::new(data_len, 1, direction) {
+                let mut dma = match DmaBuffer::new_in(dma_context, data_len, 1, direction) {
                     Ok(buffer) => buffer,
                     Err(_) => {
                         let _ = queue.queue.free_chain(chain);
@@ -809,17 +811,20 @@ impl PnpDriver for VirtioMmioBlkDriver {
             .downcast_ref::<PlatformDeviceInfo>()
             .ok_or(PnpError::InvalidState)?;
         let Some((phys, _size)) = info.first_mmio() else {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::missing(
+                PnpResourceKind::Mmio,
+                "virtio-mmio reg missing",
+            ));
         };
         let virt_base = (self.device_mmio_to_virt)(phys);
-        let driver = VirtioBlk::new(virt_base).map_err(|msg| {
+        let driver = VirtioBlk::new(virt_base, info.dma_context()).map_err(|msg| {
             log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
-            PnpError::ProbeFailed
+            PnpError::hardware_failure("virtio-mmio block init failed")
         })?;
         let dev_name = alloc_virtio_blk_dev_name(&dev.name)?;
-        let block_dev = driver
-            .into_block_dev(&dev_name)
-            .map_err(|_| PnpError::ProbeFailed)?;
+        let block_dev = driver.into_block_dev(&dev_name).map_err(|_| {
+            PnpError::registration_failed(PnpResourceKind::Function, "block function")
+        })?;
         dev.register_function(Arc::new(BlockFunction::with_devnode(
             &dev.name, &dev_name, block_dev,
         )))?;

@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
+use crate::dev::pnp::{PnpHandleResource, PnpResourceKind};
+
 use super::registry_id;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +101,20 @@ pub fn unregister(handle: FlashHandle) -> Result<(), FlashError> {
     };
     registry.devices.swap_remove(index);
     Ok(())
+}
+
+fn release_flash_resource(handle: FlashHandle) -> bool {
+    unregister(handle).is_ok()
+}
+
+/// 将 flash handle 包装成 PnP-owned resource。
+pub fn pnp_resource(handle: FlashHandle, label: &'static str) -> PnpHandleResource<FlashHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::Flash,
+        label,
+        handle,
+        release_flash_resource,
+    )
 }
 
 pub fn snapshot() -> Vec<Arc<dyn FlashDevice>> {

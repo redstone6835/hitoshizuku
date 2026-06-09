@@ -32,10 +32,13 @@ use core::fmt;
 
 use vfs::sync::Spinlock;
 
+use super::dma::{DmaBouncePolicy, DmaConstraints, DmaContext};
 use super::irq::IrqLine;
 use super::msi;
 use super::pnp::{
-    BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
+    self as pnp_core, BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDependency, PnpDevice,
+    PnpError, PnpHandleResource, PnpId, PnpResource, PnpResourceKind, PnpResourceReleaseError,
+    PnpState,
 };
 use super::registry_id;
 
@@ -222,6 +225,7 @@ pub fn register_host_bridge(
         return Err(PciHostBridgeError::Invalid);
     }
 
+    let domain = info.domain;
     let mut registry = PCI_HOST_BRIDGES.lock();
     if registry.bridges.iter().any(|bridge| {
         bridge.info.domain == info.domain
@@ -246,6 +250,8 @@ pub fn register_host_bridge(
     registry
         .bridges
         .push(PciHostBridgeRegistration { handle, info, pnp });
+    drop(registry);
+    pnp_core::notify_dependency_ready(PnpDependency::PciHostBridge(domain));
     Ok(handle)
 }
 
@@ -260,6 +266,23 @@ pub fn unregister_host_bridge(handle: PciHostBridgeHandle) -> Result<(), PciHost
     };
     registry.bridges.swap_remove(index);
     Ok(())
+}
+
+fn release_host_bridge_resource(handle: PciHostBridgeHandle) -> bool {
+    unregister_host_bridge(handle).is_ok()
+}
+
+/// 将 PCI host bridge 登记 handle 包装成 PnP-owned resource。
+pub fn host_bridge_pnp_resource(
+    handle: PciHostBridgeHandle,
+    label: &'static str,
+) -> PnpHandleResource<PciHostBridgeHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::PciHostBridge,
+        label,
+        handle,
+        release_host_bridge_resource,
+    )
 }
 
 pub fn host_bridge_snapshot() -> Vec<PciHostBridgeSnapshot> {
@@ -499,6 +522,37 @@ impl PciMsiHandle {
     }
 }
 
+/// PCI MSI 配置资源。
+///
+/// 释放 MSI vector 前必须先清设备配置空间中的 MSI enable 位；因此它不能只保存
+/// 底层 MSI handle，而要同时持有对应的 PCI function 访问对象。
+pub struct PciMsiPnpResource {
+    pci: PciDevice,
+    handle: PciMsiHandle,
+    label: &'static str,
+}
+
+impl PciMsiPnpResource {
+    pub const fn new(pci: PciDevice, handle: PciMsiHandle, label: &'static str) -> Self {
+        Self { pci, handle, label }
+    }
+}
+
+impl PnpResource for PciMsiPnpResource {
+    fn kind(&self) -> PnpResourceKind {
+        PnpResourceKind::Msi
+    }
+
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    fn release(self: Box<Self>) -> Result<(), PnpResourceReleaseError> {
+        self.pci.release_configured_msi(self.handle);
+        Ok(())
+    }
+}
+
 // ── PCI capability 遍历 ─────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -549,6 +603,7 @@ fn capability_visited_bit(offset: u16) -> Option<u64> {
 
 // ── PciDevice ────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct PciDevice {
     pnp: Arc<PnpDevice>,
 }
@@ -585,6 +640,28 @@ impl PciDevice {
 
     pub fn info(&self) -> Option<&PciInfo> {
         self.pnp.info.as_any().downcast_ref::<PciInfo>()
+    }
+
+    /// 返回该 PCI function 的 DMA 上下文。
+    ///
+    /// DMA 能力来自设备所在 host bridge，而不是全局静态假设。当前固件只提供
+    /// coherent 属性时，地址窗口仍采用 identity 兼容策略；后续接入 `dma-ranges`
+    /// 或 IOMMU 后只需要在这里构造更精确的 constraints/mapper。
+    pub fn dma_context(&self) -> DmaContext {
+        let Some((segment, bus, _, _)) = self.bdf() else {
+            return DmaContext::default_coherent();
+        };
+        let Some(host) = host_bridge_for_bus(segment, bus) else {
+            return DmaContext::default_coherent();
+        };
+        DmaContext::with_constraints(DmaConstraints {
+            address_mask: usize::MAX,
+            max_segment_size: usize::MAX,
+            max_segments: 1,
+            coherent: host.info.dma_coherent,
+            supports_scatter_gather: false,
+            bounce: DmaBouncePolicy::Disabled,
+        })
     }
 
     fn bdf(&self) -> Option<(u16, u8, u8, u8)> {
@@ -1189,7 +1266,7 @@ impl PciDevice {
             PnpState::Discovered => match PNP_DRIVERS.probe_device(&pnp) {
                 Ok(()) => Ok(PciRegistration::new(pnp, PciProbeStatus::Bound)),
                 Err(PnpError::NoDriver) => Ok(PciRegistration::new(pnp, PciProbeStatus::NoDriver)),
-                Err(PnpError::ProbeDeferred) => {
+                Err(err) if err.is_deferred() => {
                     Ok(PciRegistration::new(pnp, PciProbeStatus::Deferred))
                 }
                 Err(err) => {

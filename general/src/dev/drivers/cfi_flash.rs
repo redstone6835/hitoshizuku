@@ -9,9 +9,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::read_volatile;
 
-use crate::dev::flash::{
-    self, FlashCapabilities, FlashDevice, FlashError, FlashHandle, FlashWindow,
-};
+use crate::dev::flash::{self, FlashCapabilities, FlashDevice, FlashError, FlashWindow};
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
@@ -104,10 +102,6 @@ impl FlashDevice for CfiFlash {
     }
 }
 
-struct CfiFlashBinding {
-    handle: FlashHandle,
-}
-
 pub struct CfiFlashPlatformDriver {
     device_mmio_to_virt: fn(usize) -> usize,
 }
@@ -147,7 +141,10 @@ impl PnpDriver for CfiFlashPlatformDriver {
         let mut windows = Vec::new();
         for (phys, size) in info.mmio_resources() {
             if size == 0 {
-                return Err(PnpError::ProbeFailed);
+                return Err(PnpError::malformed(
+                    crate::dev::pnp::PnpResourceKind::Mmio,
+                    "cfi flash mmio window has zero size",
+                ));
             }
             windows.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
             windows.push(MappedFlashWindow {
@@ -157,7 +154,10 @@ impl PnpDriver for CfiFlashPlatformDriver {
             });
         }
         if windows.is_empty() {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::missing(
+                crate::dev::pnp::PnpResourceKind::Mmio,
+                "cfi flash has no mmio window",
+            ));
         }
 
         let flash = Arc::new(CfiFlash {
@@ -166,7 +166,10 @@ impl PnpDriver for CfiFlashPlatformDriver {
             windows,
         });
         let handle = flash::register(flash.clone()).map_err(map_flash_error)?;
-        dev.set_driver_data(Arc::new(CfiFlashBinding { handle }));
+        if let Err(err) = dev.own_resource(flash::pnp_resource(handle, "platform-cfi-flash")) {
+            let _ = flash::unregister(handle);
+            return Err(err);
+        }
         log::printk!(
             "[cfi-flash] registered {} windows={} bank-width={} total={:#x}",
             flash.name(),
@@ -177,13 +180,7 @@ impl PnpDriver for CfiFlashPlatformDriver {
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<CfiFlashBinding>()
-        {
-            let _ = flash::unregister(binding.handle);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 fn platform_info(dev: &Arc<PnpDevice>) -> Result<&PlatformDeviceInfo, PnpError> {
@@ -197,14 +194,20 @@ fn flash_bank_width(info: &PlatformDeviceInfo) -> Result<usize, PnpError> {
     let width = info.u32_property(PROP_BANK_WIDTH).unwrap_or(1) as usize;
     match width {
         1 | 2 | 4 | 8 => Ok(width),
-        _ => Err(PnpError::ProbeFailed),
+        _ => Err(PnpError::malformed(
+            crate::dev::pnp::PnpResourceKind::Flash,
+            "invalid cfi flash bank-width",
+        )),
     }
 }
 
 fn map_flash_error(err: FlashError) -> PnpError {
     match err {
         FlashError::Invalid | FlashError::OutOfRange | FlashError::Unsupported => {
-            PnpError::ProbeFailed
+            PnpError::malformed(
+                crate::dev::pnp::PnpResourceKind::Flash,
+                "invalid flash registry request",
+            )
         }
         FlashError::NotFound => PnpError::InvalidState,
         FlashError::OutOfMemory => PnpError::OutOfMemory,

@@ -16,8 +16,8 @@ use crate::dev::function::{CharFunction, DevNodeNameAllocator};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    BusType, DevInitContext, DriverFactory, PnpDependency, PnpDevice, PnpDriver, PnpError, PnpId,
+    PnpResourceKind, register_driver_factory,
 };
 
 // ─────────────────────── UART 寄存器偏移与标志 ───────────────────────────
@@ -545,15 +545,25 @@ impl IrqHandler for Uart16550IrqHandler {
 
 struct Uart16550Binding {
     uart: Arc<Uart16550>,
-    irq_handle: Option<IrqHandle>,
 }
 
 fn map_irq_error(err: IrqError) -> PnpError {
     match err {
         IrqError::OutOfMemory => PnpError::OutOfMemory,
-        IrqError::AlreadyRegistered => PnpError::NameConflict,
-        IrqError::NotFound => PnpError::ProbeFailed,
+        IrqError::AlreadyRegistered => {
+            PnpError::registration_failed(PnpResourceKind::Irq, "uart irq already registered")
+        }
+        IrqError::NotFound => {
+            PnpError::registration_failed(PnpResourceKind::Irq, "uart irq line not found")
+        }
     }
+}
+
+fn first_irq_dependency(info: &PlatformDeviceInfo) -> PnpDependency {
+    info.irq_resources()
+        .find_map(|irq| irq.controller())
+        .map(PnpDependency::IrqController)
+        .unwrap_or(PnpDependency::DefaultIrqDomain)
 }
 
 fn register_uart_irq(
@@ -574,7 +584,7 @@ fn register_uart_irq(
                 "[platform-uart16550] {} has firmware IRQ resource but no registered IRQ domain translator",
                 info.fw_name.as_ref()
             );
-            Err(PnpError::ProbeDeferred)
+            Err(PnpError::dependency(first_irq_dependency(info)))
         }
         Err(PlatformIrqRegistrationError::RegistrationFailed { line, err }) => {
             log::printk!(
@@ -718,7 +728,7 @@ impl PnpDriver for Uart16550PlatformDriver {
             .downcast_ref::<PlatformDeviceInfo>()
             .ok_or(PnpError::InvalidState)?;
         let Some((phys, _size)) = info.first_mmio() else {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::missing(PnpResourceKind::Mmio, "uart reg missing"));
         };
         let virt_base = (self.device_mmio_to_virt)(phys);
         let uart = if let Some(clock_hz) = info.properties.clock_hz {
@@ -737,18 +747,24 @@ impl PnpDriver for Uart16550PlatformDriver {
             .into_string();
         let ch = CharDevice::new(info.fw_name.clone(), Arc::clone(&uart));
         let irq_handle = register_uart_irq(info, Arc::clone(&uart))?;
+        if let Some(handle) = irq_handle
+            && let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
+                handle,
+                "platform-uart16550-rx",
+            ))
+        {
+            uart.set_rx_irq_enabled(false);
+            let _ = irq::unregister_irq_handler(handle);
+            return Err(err);
+        }
         if let Err(err) = dev.register_function(Arc::new(CharFunction::with_devnode(
             &dev.name, &dev_name, ch,
         ))) {
             uart.set_rx_irq_enabled(false);
-            if let Some(handle) = irq_handle {
-                let _ = irq::unregister_irq_handler(handle);
-            }
             return Err(err);
         }
         dev.set_driver_data(Arc::new(Uart16550Binding {
             uart: Arc::clone(&uart),
-            irq_handle,
         }));
         log::printk!(
             "[platform-uart16550] bound {} phys={:#x} -> /dev/{}",
@@ -764,9 +780,6 @@ impl PnpDriver for Uart16550PlatformDriver {
             && let Ok(binding) = data.downcast::<Uart16550Binding>()
         {
             binding.uart.set_rx_irq_enabled(false);
-            if let Some(handle) = binding.irq_handle {
-                let _ = irq::unregister_irq_handler(handle);
-            }
         }
         log::printk!("[platform-uart16550] removed {}", dev.id);
     }

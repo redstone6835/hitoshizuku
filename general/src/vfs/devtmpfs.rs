@@ -57,8 +57,9 @@ use crate::dev::block::{BlockDevice, BlockFeatures};
 use crate::dev::char::{CharControlRequest, CharControlResponse, CharDevice, CharIoError};
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError};
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{CustomDevNodeSpec, DevNodeSet, DevNodeSpec};
+use crate::dev::function::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSet, DevNodeSpec};
 use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
+use crate::dev::rtc::RtcDevNodeEndpoint;
 use crate::mm::{copy_from_user, copy_to_user};
 
 // ───────── 全局实例计数器 ─────────
@@ -381,7 +382,14 @@ fn map_char_err(e: CharIoError) -> VfsError {
 }
 
 fn map_control_errno(e: ControlError) -> Errno {
-    e.to_errno()
+    match e {
+        ControlError::Unsupported => Errno::ENOTTY,
+        ControlError::Invalid => Errno::EINVAL,
+        ControlError::NoDevice => Errno::ENODEV,
+        ControlError::Busy => Errno::EBUSY,
+        ControlError::Io => Errno::EIO,
+        ControlError::Permission => Errno::EPERM,
+    }
 }
 
 const TCGETS: usize = 0x5401;
@@ -1747,6 +1755,26 @@ struct DevSymlinkOps {
     target: String,
 }
 
+fn custom_devnode_file_type(kind: CustomDevNodeKind) -> FileType {
+    match kind {
+        CustomDevNodeKind::CharDevice => FileType::CharDevice,
+        CustomDevNodeKind::BlockDevice => FileType::BlockDevice,
+        CustomDevNodeKind::RegularFile => FileType::Regular,
+        CustomDevNodeKind::Directory => FileType::Directory,
+    }
+}
+
+fn custom_devnode_ops(spec: &CustomDevNodeSpec) -> VfsResult<Arc<dyn InodeOps + Send + Sync>> {
+    // dev core 只保存 opaque payload；这里是 VFS 兼容层解释 payload 的唯一入口。
+    // 新的自定义节点类型需要先定义 typed endpoint，再在本函数中接入适配器，
+    // 避免把 InodeOps/FileOps 直接塞回底层设备模型。
+    let payload = spec.payload();
+    if let Some(endpoint) = payload.as_ref().downcast_ref::<RtcDevNodeEndpoint>() {
+        return Ok(crate::vfs::rtc_devnode::inode_ops(endpoint));
+    }
+    Err(VfsError::InvalidArgument)
+}
+
 impl InodeOps for DevSymlinkOps {
     fn lookup(&self, _inode: &Inode, _name: &str) -> VfsResult<Arc<Inode>> {
         Err(VfsError::NotADirectory)
@@ -2128,14 +2156,16 @@ impl DevTmpfsSuperblockOps {
         }
         let fs_id = self.fs_id().ok_or(VfsError::InvalidArgument)?;
         let sb_weak = self.sb_weak().ok_or(VfsError::InvalidArgument)?;
+        let kind = custom_devnode_file_type(spec.kind());
+        let ops = custom_devnode_ops(spec)?;
 
         let now = Timespec::now();
         let meta = InodeMeta {
             size: spec.size(),
             nlink: spec.nlink(),
-            mode: spec.mode(),
-            uid: spec.uid(),
-            gid: spec.gid(),
+            mode: FileMode::new(spec.mode()),
+            uid: Uid(spec.uid()),
+            gid: Gid(spec.gid()),
             atime: now,
             mtime: now,
             ctime: now,
@@ -2147,12 +2177,12 @@ impl DevTmpfsSuperblockOps {
                 fs_id,
                 ino: self.alloc_ino(),
             },
-            spec.kind(),
+            kind,
             rdev,
             spec.block_size(),
             None,
             meta,
-            spec.ops(),
+            ops,
             sb_weak,
         ))
     }
@@ -2442,30 +2472,29 @@ impl DevTmpfsSuperblockOps {
 
     /// 绑定一个自定义 devtmpfs 节点。
     ///
-    /// 自定义节点用于未来 LKM 或新设备类别直接提供自己的 `InodeOps`，devtmpfs
-    /// 不需要知道该节点背后的设备类型。无法完整实现的设备语义应在对应 `InodeOps`
-    /// 或 `FileOps` 内部明确返回不支持，而不是在 devtmpfs 中增加临时类型分支。
+    /// 自定义节点的底层 function 只提交 opaque payload；这里作为 VFS/POSIX
+    /// 适配层负责解释 payload、分配兼容 `dev_t` 并创建 inode。
     pub fn bind_custom(&self, spec: &CustomDevNodeSpec) -> VfsResult<()> {
         split_devtmpfs_path(spec.name())?;
         if self.lookup_node_at(spec.name()).is_ok() {
             return Err(VfsError::AlreadyExists);
         }
         let mut registered_rdev = false;
-        let rdev = if spec.rdev() != DevId::new(0, 0) {
-            spec.rdev()
+        let rdev = if let Some(rdev) = spec.rdev() {
+            DevId::new(rdev.major, rdev.minor)
         } else {
             match spec.kind() {
-                FileType::CharDevice => {
+                CustomDevNodeKind::CharDevice => {
                     registered_rdev = true;
                     super::device_numbers::register_char(spec.name(), spec.name())
                         .ok_or(VfsError::NoSpace)?
                 }
-                FileType::BlockDevice => {
+                CustomDevNodeKind::BlockDevice => {
                     registered_rdev = true;
                     super::device_numbers::register_block(spec.name(), spec.name())
                         .ok_or(VfsError::NoSpace)?
                 }
-                _ => spec.rdev(),
+                CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => DevId::new(0, 0),
             }
         };
         let inode = self.new_custom_inode(spec, rdev)?;

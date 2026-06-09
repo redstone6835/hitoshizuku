@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::dev::firmware_bus::{
-    self, FirmwareBus, FirmwareBusDescriptor, FirmwareBusError, FirmwareBusHandle, FirmwareBusRange,
+    self, FirmwareBus, FirmwareBusDescriptor, FirmwareBusError, FirmwareBusRange,
 };
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
@@ -29,10 +29,6 @@ impl FirmwareBus for DtbFirmwareBus {
     fn descriptor(&self) -> &FirmwareBusDescriptor {
         &self.descriptor
     }
-}
-
-struct FirmwareBusBinding {
-    handle: FirmwareBusHandle,
 }
 
 pub struct FirmwareBusPlatformDriver;
@@ -71,7 +67,12 @@ impl PnpDriver for FirmwareBusPlatformDriver {
         let descriptor = firmware_bus_descriptor(info)?;
         let bus = Arc::new(DtbFirmwareBus { descriptor });
         let handle = firmware_bus::register(bus.clone()).map_err(map_firmware_bus_error)?;
-        dev.set_driver_data(Arc::new(FirmwareBusBinding { handle }));
+        if let Err(err) =
+            dev.own_resource(firmware_bus::pnp_resource(handle, "platform-firmware-bus"))
+        {
+            let _ = firmware_bus::unregister(handle);
+            return Err(err);
+        }
         log::printk!(
             "[firmware-bus] registered {} ranges={} dma-coherent={}",
             bus.descriptor().name.as_ref(),
@@ -81,13 +82,7 @@ impl PnpDriver for FirmwareBusPlatformDriver {
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<FirmwareBusBinding>()
-        {
-            let _ = firmware_bus::unregister(binding.handle);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 fn map_firmware_bus_error(err: FirmwareBusError) -> PnpError {
@@ -105,15 +100,21 @@ fn platform_info(dev: &Arc<PnpDevice>) -> Result<&PlatformDeviceInfo, PnpError> 
 }
 
 fn firmware_bus_descriptor(info: &PlatformDeviceInfo) -> Result<FirmwareBusDescriptor, PnpError> {
-    let child_address_cells = info
-        .properties
-        .fw_address_cells
-        .ok_or(PnpError::ProbeFailed)?;
-    let child_size_cells = info.properties.fw_size_cells.ok_or(PnpError::ProbeFailed)?;
+    let child_address_cells = info.properties.fw_address_cells.ok_or(PnpError::missing(
+        crate::dev::pnp::PnpResourceKind::FirmwareBus,
+        "child #address-cells missing",
+    ))?;
+    let child_size_cells = info.properties.fw_size_cells.ok_or(PnpError::missing(
+        crate::dev::pnp::PnpResourceKind::FirmwareBus,
+        "child #size-cells missing",
+    ))?;
     let parent_address_cells = info
         .properties
         .fw_parent_address_cells
-        .ok_or(PnpError::ProbeFailed)?;
+        .ok_or(PnpError::missing(
+            crate::dev::pnp::PnpResourceKind::FirmwareBus,
+            "parent #address-cells missing",
+        ))?;
     let ranges = parse_ranges(
         info.u32_list_property(PROP_RANGES).unwrap_or(&[]),
         child_address_cells as usize,
@@ -143,9 +144,15 @@ fn parse_ranges(
     let entry_cells = child_address_cells
         .checked_add(parent_address_cells)
         .and_then(|value| value.checked_add(size_cells))
-        .ok_or(PnpError::ProbeFailed)?;
+        .ok_or(PnpError::malformed(
+            crate::dev::pnp::PnpResourceKind::FirmwareBus,
+            "ranges entry width overflows",
+        ))?;
     if entry_cells == 0 || !cells.len().is_multiple_of(entry_cells) {
-        return Err(PnpError::ProbeFailed);
+        return Err(PnpError::malformed(
+            crate::dev::pnp::PnpResourceKind::FirmwareBus,
+            "ranges length is not aligned to entry width",
+        ));
     }
 
     let mut ranges = Vec::new();
@@ -156,12 +163,24 @@ fn parse_ranges(
         let child_end = child_address_cells;
         let parent_end = child_end + parent_address_cells;
         let child_start = read_cells(&chunk[..child_end])?;
-        let parent_start = usize::try_from(read_cells(&chunk[child_end..parent_end])?)
-            .map_err(|_| PnpError::ProbeFailed)?;
-        let size = usize::try_from(read_cells(&chunk[parent_end..])?)
-            .map_err(|_| PnpError::ProbeFailed)?;
+        let parent_start =
+            usize::try_from(read_cells(&chunk[child_end..parent_end])?).map_err(|_| {
+                PnpError::malformed(
+                    crate::dev::pnp::PnpResourceKind::FirmwareBus,
+                    "parent range address does not fit usize",
+                )
+            })?;
+        let size = usize::try_from(read_cells(&chunk[parent_end..])?).map_err(|_| {
+            PnpError::malformed(
+                crate::dev::pnp::PnpResourceKind::FirmwareBus,
+                "range size does not fit usize",
+            )
+        })?;
         if size == 0 || parent_start.checked_add(size).is_none() {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::malformed(
+                crate::dev::pnp::PnpResourceKind::FirmwareBus,
+                "invalid ranges tuple",
+            ));
         }
         ranges.push(FirmwareBusRange {
             child_start,
@@ -174,7 +193,10 @@ fn parse_ranges(
 
 fn read_cells(cells: &[u32]) -> Result<u128, PnpError> {
     if cells.len() > 4 {
-        return Err(PnpError::ProbeFailed);
+        return Err(PnpError::malformed(
+            crate::dev::pnp::PnpResourceKind::FirmwareBus,
+            "cell value is wider than u128",
+        ));
     }
     let mut value = 0u128;
     for cell in cells {

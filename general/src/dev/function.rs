@@ -7,11 +7,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 
 use spin::mutex::Mutex;
-use vfs::cred::{Gid, Uid};
-use vfs::inode::InodeOps;
-use vfs::stat::{DevId, FileMode, FileType};
 
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
@@ -40,45 +38,73 @@ impl DeviceClassId {
     }
 }
 
+/// devtmpfs 自定义节点的通用文件类别。
+///
+/// 该类型是 dev core 到 VFS 兼容层的中立描述，不暴露 `vfs::stat::FileType`。
+/// 具体 inode 类型转换只允许在 devtmpfs 适配层完成。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomDevNodeKind {
+    CharDevice,
+    BlockDevice,
+    RegularFile,
+    Directory,
+}
+
+/// devtmpfs 自定义节点使用的兼容层设备号。
+///
+/// `None` 表示由 VFS/POSIX 兼容层按节点名分配临时 `dev_t`。这里保留为纯整数，
+/// 避免底层设备模型依赖 POSIX `DevId` 类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CustomDevNodeId {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl CustomDevNodeId {
+    pub const fn new(major: u32, minor: u32) -> Self {
+        Self { major, minor }
+    }
+}
+
 /// 自定义 devtmpfs 节点规格。
 ///
-/// 新设备类型如果需要在 `/dev` 暴露特殊节点，不应修改 devtmpfs 的核心 match
-/// 逻辑，而应构造一个携带自身 [`InodeOps`] 的自定义节点。devtmpfs 只负责路径、
-/// inode 号、元数据和目录树管理，具体 open/ioctl/read/write 语义由该 ops 决定。
+/// 新设备类型如果需要在 `/dev` 暴露特殊节点，只在这里声明通用节点元数据和一个
+/// opaque payload。payload 的 ABI/VFS 解释由 devtmpfs 适配层负责，dev core 不
+/// 依赖 `InodeOps`、`FileMode`、`Uid/Gid` 或 POSIX 设备号类型。
 #[derive(Clone)]
 pub struct CustomDevNodeSpec {
     name: Box<str>,
-    kind: FileType,
-    rdev: DevId,
+    kind: CustomDevNodeKind,
+    rdev: Option<CustomDevNodeId>,
     block_size: u32,
-    mode: FileMode,
-    uid: Uid,
-    gid: Gid,
+    mode: u16,
+    uid: u32,
+    gid: u32,
     size: u64,
     blocks: u64,
     nlink: u32,
-    ops: Arc<dyn InodeOps + Send + Sync>,
+    payload: Arc<dyn Any + Send + Sync>,
 }
 
 impl CustomDevNodeSpec {
-    pub fn new(name: &str, kind: FileType, ops: Arc<dyn InodeOps + Send + Sync>) -> Self {
+    pub fn new(name: &str, kind: CustomDevNodeKind, payload: Arc<dyn Any + Send + Sync>) -> Self {
         Self {
             name: name.into(),
             kind,
-            rdev: DevId::new(0, 0),
+            rdev: None,
             block_size: 512,
-            mode: FileMode::new(0o660),
-            uid: Uid::ROOT,
-            gid: Gid::ROOT,
+            mode: 0o660,
+            uid: 0,
+            gid: 0,
             size: 0,
             blocks: 0,
             nlink: 1,
-            ops,
+            payload,
         }
     }
 
-    pub fn with_rdev(mut self, rdev: DevId) -> Self {
-        self.rdev = rdev;
+    pub fn with_rdev(mut self, rdev: CustomDevNodeId) -> Self {
+        self.rdev = Some(rdev);
         self
     }
 
@@ -87,12 +113,12 @@ impl CustomDevNodeSpec {
         self
     }
 
-    pub fn with_mode(mut self, mode: FileMode) -> Self {
+    pub fn with_mode(mut self, mode: u16) -> Self {
         self.mode = mode;
         self
     }
 
-    pub fn with_owner(mut self, uid: Uid, gid: Gid) -> Self {
+    pub fn with_owner(mut self, uid: u32, gid: u32) -> Self {
         self.uid = uid;
         self.gid = gid;
         self
@@ -113,11 +139,11 @@ impl CustomDevNodeSpec {
         &self.name
     }
 
-    pub fn kind(&self) -> FileType {
+    pub fn kind(&self) -> CustomDevNodeKind {
         self.kind
     }
 
-    pub fn rdev(&self) -> DevId {
+    pub fn rdev(&self) -> Option<CustomDevNodeId> {
         self.rdev
     }
 
@@ -125,15 +151,15 @@ impl CustomDevNodeSpec {
         self.block_size
     }
 
-    pub fn mode(&self) -> FileMode {
+    pub fn mode(&self) -> u16 {
         self.mode
     }
 
-    pub fn uid(&self) -> Uid {
+    pub fn uid(&self) -> u32 {
         self.uid
     }
 
-    pub fn gid(&self) -> Gid {
+    pub fn gid(&self) -> u32 {
         self.gid
     }
 
@@ -149,8 +175,8 @@ impl CustomDevNodeSpec {
         self.nlink
     }
 
-    pub fn ops(&self) -> Arc<dyn InodeOps + Send + Sync> {
-        Arc::clone(&self.ops)
+    pub fn payload(&self) -> Arc<dyn Any + Send + Sync> {
+        Arc::clone(&self.payload)
     }
 }
 
@@ -163,8 +189,8 @@ impl CustomDevNodeSpec {
 ///
 /// 标记为 `#[non_exhaustive]` 以便未来扩展新 VFS 节点类型时保持 API 兼容；
 /// 新设备类别如果没有 `/dev` 节点（网络等）应通过 `devnode() → None` 表达；
-/// 如果确实需要 `/dev` 投影，优先使用 [`DevNodeSpec::Custom`] 携带自己的
-/// [`InodeOps`]，而不是继续向 devtmpfs core 增加设备类型分支。
+/// 如果确实需要 `/dev` 投影，优先使用 [`DevNodeSpec::Custom`] 携带 opaque
+/// payload，由 VFS 兼容层解释 inode/file 语义。
 #[non_exhaustive]
 #[derive(Clone)]
 pub enum DevNodeSpec {

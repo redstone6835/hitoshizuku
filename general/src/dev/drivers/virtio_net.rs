@@ -14,14 +14,14 @@ use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use spin::Mutex;
 
-use crate::dev::dma::{DmaBuffer, DmaDirection};
-use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
+use crate::dev::irq::{self, IrqError, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::naming::StableNameAllocator;
 use crate::dev::net::NetFunction;
-use crate::dev::pci::{PciDevice, PciInfo, PciMsiHandle};
+use crate::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    PnpResourceKind, register_driver_factory,
 };
 use crate::dev::virtio::{
     VIRTIO_F_VERSION_1, VIRTIO_PCI_FUNCTION_NETWORK, VIRTIO_PCI_RESET_SPIN_LIMIT,
@@ -113,6 +113,7 @@ struct VirtioNetHdr {
 // ── 队列状态 ───────────────────────────────────────────────────────────
 
 struct VirtioNetQueue {
+    dma_context: DmaContext,
     desc_dma: DmaBuffer,
     avail_dma: DmaBuffer,
     used_dma: DmaBuffer,
@@ -202,6 +203,7 @@ fn rd_u16(addr: usize) -> u16 {
 
 fn setup_queue(
     transport: &VirtioPciTransport,
+    dma_context: DmaContext,
     queue_idx: u16,
 ) -> Result<VirtioNetQueue, &'static str> {
     transport.select_queue(queue_idx);
@@ -216,9 +218,9 @@ fn setup_queue(
     }
     transport.set_selected_queue_size(qsz);
 
-    let desc_dma = DmaBuffer::page(DmaDirection::ToDevice)?;
-    let avail_dma = DmaBuffer::page(DmaDirection::ToDevice)?;
-    let used_dma = DmaBuffer::page(DmaDirection::FromDevice)?;
+    let desc_dma = DmaBuffer::page_in(dma_context, DmaDirection::ToDevice)?;
+    let avail_dma = DmaBuffer::page_in(dma_context, DmaDirection::ToDevice)?;
+    let used_dma = DmaBuffer::page_in(dma_context, DmaDirection::FromDevice)?;
     let desc_table = desc_dma.vaddr() as *mut VirtqDesc;
     let avail_ring = avail_dma.vaddr() as *mut VirtqAvail;
     let used_ring = used_dma.vaddr() as *mut VirtqUsed;
@@ -237,6 +239,7 @@ fn setup_queue(
     transport.enable_selected_queue();
 
     Ok(VirtioNetQueue {
+        dma_context,
         desc_dma,
         avail_dma,
         used_dma,
@@ -302,14 +305,15 @@ impl VirtioNetPci {
             }
         }
 
-        // 建立 RX/TX 两个 virtqueue。
-        let rx_queue = setup_queue(&transport, RX_QUEUE)?;
-        let tx_queue = setup_queue(&transport, TX_QUEUE)?;
+        // 建立 RX/TX 两个 virtqueue。队列和后续数据缓冲区共享同一设备 DMA 上下文。
+        let dma_context = pci.dma_context();
+        let rx_queue = setup_queue(&transport, dma_context, RX_QUEUE)?;
+        let tx_queue = setup_queue(&transport, dma_context, TX_QUEUE)?;
 
         // 预分配 RX DMA 缓冲区，并把设备可写描述符填入 RX 队列。
         let mut rx_buffers = Vec::with_capacity(rx_queue.queue_size as usize);
         for i in 0..rx_queue.queue_size {
-            let buf = DmaBuffer::page(DmaDirection::FromDevice)?;
+            let buf = DmaBuffer::page_in(rx_queue.dma_context, DmaDirection::FromDevice)?;
             let buf_dma = buf.dma_addr() as u64;
             buf.sync_for_device();
             rx_buffers.push(buf);
@@ -447,7 +451,7 @@ impl net::NetDriver for VirtioNetPci {
         // 分配 DMA buffer 并写入 virtio_net_hdr + frame
         let frame_data = buf.as_slice();
         let total_len = VIRTIO_NET_HDR_SIZE + frame_data.len();
-        let tx_buf = match DmaBuffer::page(DmaDirection::ToDevice) {
+        let tx_buf = match DmaBuffer::page_in(inner.tx_queue.dma_context, DmaDirection::ToDevice) {
             Ok(a) => a,
             Err(_) => {
                 inner.tx_free_descs.push_front(desc_idx);
@@ -623,8 +627,7 @@ struct VirtioNetPciBinding {
 
 #[derive(Clone, Copy)]
 struct VirtioNetPciIrqRegistration {
-    irq_handle: IrqHandle,
-    msi_handle: Option<PciMsiHandle>,
+    using_msi: bool,
 }
 
 impl VirtioNetPciDriver {
@@ -658,10 +661,11 @@ fn map_irq_error(err: IrqError) -> &'static str {
 }
 
 fn register_virtio_net_irq(
+    dev: &Arc<PnpDevice>,
     pci: &PciDevice,
     driver: Arc<VirtioNetPci>,
     iface_id: net::InterfaceId,
-) -> Option<VirtioNetPciIrqRegistration> {
+) -> Result<Option<VirtioNetPciIrqRegistration>, PnpError> {
     let handler: Arc<dyn IrqHandler> = Arc::new(VirtioNetPciIrqHandler { driver, iface_id });
 
     if let Ok(msi_handle) = pci.try_configure_single_msi() {
@@ -670,10 +674,23 @@ fn register_virtio_net_irq(
             Ok(irq_handle) => {
                 if pci.try_enable_configured_msi(msi_handle).is_ok() {
                     pci.disable_interrupts();
-                    return Some(VirtioNetPciIrqRegistration {
+                    if let Err(err) = dev.own_resource(PciMsiPnpResource::new(
+                        pci.clone(),
+                        msi_handle,
+                        "virtio-net-msi",
+                    )) {
+                        let _ = irq::unregister_irq_handler(irq_handle);
+                        pci.release_configured_msi(msi_handle);
+                        return Err(err);
+                    }
+                    if let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
                         irq_handle,
-                        msi_handle: Some(msi_handle),
-                    });
+                        "virtio-net-msi-irq",
+                    )) {
+                        let _ = irq::unregister_irq_handler(irq_handle);
+                        return Err(err);
+                    }
+                    return Ok(Some(VirtioNetPciIrqRegistration { using_msi: true }));
                 }
                 let _ = irq::unregister_irq_handler(irq_handle);
                 pci.release_configured_msi(msi_handle);
@@ -691,15 +708,19 @@ fn register_virtio_net_irq(
 
     let Some(line) = pci.routed_irq_line() else {
         pci.disable_interrupts();
-        return None;
+        return Ok(None);
     };
     match irq::register_irq_handler(line, handler) {
         Ok(handle) => {
             pci.enable_interrupts();
-            Some(VirtioNetPciIrqRegistration {
-                irq_handle: handle,
-                msi_handle: None,
-            })
+            if let Err(err) =
+                dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-net-intx"))
+            {
+                let _ = irq::unregister_irq_handler(handle);
+                pci.disable_interrupts();
+                return Err(err);
+            }
+            Ok(Some(VirtioNetPciIrqRegistration { using_msi: false }))
         }
         Err(err) => {
             log::printk!(
@@ -708,16 +729,13 @@ fn register_virtio_net_irq(
                 map_irq_error(err)
             );
             pci.disable_interrupts();
-            None
+            Ok(None)
         }
     }
 }
 
 fn unregister_virtio_net_irq(pci: &PciDevice, registration: VirtioNetPciIrqRegistration) {
-    let _ = irq::unregister_irq_handler(registration.irq_handle);
-    if let Some(msi_handle) = registration.msi_handle {
-        pci.release_configured_msi(msi_handle);
-    } else {
+    if !registration.using_msi {
         pci.disable_interrupts();
     }
 }
@@ -744,7 +762,7 @@ impl PnpDriver for VirtioNetPciDriver {
 
         let driver = VirtioNetPci::probe(&pci).map_err(|msg| {
             log::printk!("[virtio-net] probe failed: {}", msg);
-            PnpError::ProbeFailed
+            PnpError::hardware_failure("virtio-net init failed")
         })?;
 
         let name = NET_IFACE_NAMES.try_alloc_stable(&dev.name)?.into_string();
@@ -754,8 +772,8 @@ impl PnpDriver for VirtioNetPciDriver {
         let config = net::IfConfig::auto();
         net::stack()
             .attach(Arc::clone(&net_dev), config)
-            .map_err(|_| PnpError::ProbeFailed)?;
-        let irq = register_virtio_net_irq(&pci, Arc::clone(&driver), net_dev.id());
+            .map_err(|_| PnpError::registration_failed(PnpResourceKind::Function, "net attach"))?;
+        let irq = register_virtio_net_irq(dev, &pci, Arc::clone(&driver), net_dev.id())?;
         if let Err(err) =
             dev.register_function(Arc::new(NetFunction::new(&name, Arc::clone(&net_dev))))
         {
@@ -792,8 +810,6 @@ impl PnpDriver for VirtioNetPciDriver {
                 if let Some(registration) = binding.irq {
                     if let Some(pci) = PciDevice::from_pnp(dev) {
                         unregister_virtio_net_irq(&pci, registration);
-                    } else {
-                        let _ = irq::unregister_irq_handler(registration.irq_handle);
                     }
                 }
                 binding.net_dev.mark_gone();

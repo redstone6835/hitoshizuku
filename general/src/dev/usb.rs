@@ -408,7 +408,7 @@ fn probe_registered_usb_pnp(
                 Arc::clone(pnp),
                 UsbProbeStatus::NoDriver,
             )),
-            Err(PnpError::ProbeDeferred) => Ok(UsbRegistration::new(
+            Err(err) if err.is_deferred() => Ok(UsbRegistration::new(
                 Arc::clone(pnp),
                 UsbProbeStatus::Deferred,
             )),

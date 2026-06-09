@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
+use crate::dev::pnp::{self, PnpDependency, PnpHandleResource, PnpResourceKind};
+
 use super::registry_id;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +85,8 @@ pub fn register(bus: Arc<dyn FirmwareBus>) -> Result<FirmwareBusHandle, Firmware
     // 固件总线节点只在设备管理层内部表达拓扑；handle ID 用于区分每一次登记生命周期。
     let handle = FirmwareBusHandle { id };
     registry.buses.push(FirmwareBusRegistration { handle, bus });
+    drop(registry);
+    pnp::notify_dependency_ready(PnpDependency::FirmwareBus);
     Ok(handle)
 }
 
@@ -97,6 +101,23 @@ pub fn unregister(handle: FirmwareBusHandle) -> Result<(), FirmwareBusError> {
     };
     registry.buses.swap_remove(index);
     Ok(())
+}
+
+fn release_firmware_bus_resource(handle: FirmwareBusHandle) -> bool {
+    unregister(handle).is_ok()
+}
+
+/// 将固件总线登记 handle 包装成 PnP-owned resource。
+pub fn pnp_resource(
+    handle: FirmwareBusHandle,
+    label: &'static str,
+) -> PnpHandleResource<FirmwareBusHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::FirmwareBus,
+        label,
+        handle,
+        release_firmware_bus_resource,
+    )
 }
 
 pub fn snapshot() -> Vec<Arc<dyn FirmwareBus>> {

@@ -6,15 +6,12 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::any::Any;
 use core::future::Future;
 use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll};
-
-use spin::mutex::Mutex;
 
 use crate::dev::bio::{
     Bio, BioBuffer, BioCompletionObserver, BioError, BioIoError, BioOp, BioReqError, BioResult,
@@ -757,92 +754,5 @@ impl Future for BioFuture {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.completion.poll(cx)
-    }
-}
-
-// ───────── 注册表错误 ─────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockRegistryError {
-    NameExists,
-    DeviceGone,
-    OutOfMemory,
-}
-
-// ───────── 块设备动态注册表 ─────────
-
-pub struct BlockDeviceList {
-    devices: Mutex<Vec<Arc<BlockDevice>>>,
-}
-
-impl BlockDeviceList {
-    pub const fn new() -> Self {
-        Self {
-            devices: Mutex::new(Vec::new()),
-        }
-    }
-
-    pub fn push(&self, dev: &Arc<BlockDevice>) -> Result<Arc<BlockDevice>, BlockRegistryError> {
-        if !dev.is_active() {
-            return Err(BlockRegistryError::DeviceGone);
-        }
-        let mut list = self.devices.lock();
-        list.retain(|existing| existing.is_active());
-        if !dev.is_active() {
-            return Err(BlockRegistryError::DeviceGone);
-        }
-        if list.iter().any(|d| d.name() == dev.name()) {
-            return Err(BlockRegistryError::NameExists);
-        }
-        // 设备注册路径不能把 host Vec 扩容失败伪装成驱动成功。
-        list.try_reserve(1)
-            .map_err(|_| BlockRegistryError::OutOfMemory)?;
-        list.push(Arc::clone(dev));
-        Ok(Arc::clone(dev))
-    }
-
-    pub fn lookup(&self, name: &str) -> Option<Arc<BlockDevice>> {
-        let list = self.devices.lock();
-        list.iter()
-            .find(|d| d.name() == name && d.is_active())
-            .cloned()
-    }
-
-    pub fn remove(&self, name: &str) -> bool {
-        let mut list = self.devices.lock();
-        if let Some(pos) = list.iter().position(|d| d.name() == name) {
-            list[pos].mark_gone();
-            list.swap_remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn list(&self) -> Vec<Arc<BlockDevice>> {
-        self.devices
-            .lock()
-            .iter()
-            .filter(|dev| dev.is_active())
-            .cloned()
-            .collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.devices
-            .lock()
-            .iter()
-            .filter(|dev| dev.is_active())
-            .count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl Default for BlockDeviceList {
-    fn default() -> Self {
-        Self::new()
     }
 }

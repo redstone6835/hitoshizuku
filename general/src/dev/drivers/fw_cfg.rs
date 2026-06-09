@@ -9,7 +9,7 @@ use core::ptr::{read_volatile, write_volatile};
 
 use vfs::sync::Spinlock;
 
-use crate::dev::fwcfg::{self, FwCfgDevice, FwCfgError, FwCfgHandle};
+use crate::dev::fwcfg::{self, FwCfgDevice, FwCfgError};
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
@@ -74,10 +74,6 @@ impl FwCfgDevice for QemuFwCfgMmio {
     }
 }
 
-struct QemuFwCfgBinding {
-    handle: FwCfgHandle,
-}
-
 pub struct QemuFwCfgMmioDriver {
     device_mmio_to_virt: fn(usize) -> usize,
 }
@@ -114,9 +110,15 @@ impl PnpDriver for QemuFwCfgMmioDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let (phys, size) = info.first_mmio().ok_or(PnpError::ProbeFailed)?;
+        let (phys, size) = info.first_mmio().ok_or(PnpError::missing(
+            crate::dev::pnp::PnpResourceKind::Mmio,
+            "fw_cfg mmio window missing",
+        ))?;
         if size < FW_CFG_MMIO_MIN_SIZE {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::malformed(
+                crate::dev::pnp::PnpResourceKind::Mmio,
+                "fw_cfg mmio window too small",
+            ));
         }
         let fwcfg = Arc::new(QemuFwCfgMmio::new(phys, (self.device_mmio_to_virt)(phys)));
         let mut signature = [0u8; 4];
@@ -124,11 +126,17 @@ impl PnpDriver for QemuFwCfgMmioDriver {
             .read_item(FW_CFG_SIGNATURE_SELECTOR, &mut signature)
             .map_err(map_fwcfg_error)?;
         if &signature != FW_CFG_SIGNATURE {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::malformed(
+                crate::dev::pnp::PnpResourceKind::FwCfg,
+                "fw_cfg signature mismatch",
+            ));
         }
         let revision = fwcfg.read_revision().unwrap_or(0);
         let handle = fwcfg::install(fwcfg.clone()).map_err(map_fwcfg_error)?;
-        dev.set_driver_data(Arc::new(QemuFwCfgBinding { handle }));
+        if let Err(err) = dev.own_resource(fwcfg::pnp_resource(handle, "platform-fw-cfg")) {
+            let _ = fwcfg::uninstall(handle);
+            return Err(err);
+        }
         log::printk!(
             "[fw_cfg] installed qemu fw_cfg mmio phys={:#x} revision={:#x}",
             fwcfg.phys,
@@ -137,13 +145,7 @@ impl PnpDriver for QemuFwCfgMmioDriver {
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<QemuFwCfgBinding>()
-        {
-            let _ = fwcfg::uninstall(binding.handle);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 fn platform_info(dev: &Arc<PnpDevice>) -> Result<&PlatformDeviceInfo, PnpError> {
@@ -157,7 +159,10 @@ fn map_fwcfg_error(err: FwCfgError) -> PnpError {
     match err {
         FwCfgError::AlreadyInstalled => PnpError::NameConflict,
         FwCfgError::Invalid | FwCfgError::Io | FwCfgError::NotInstalled | FwCfgError::NotFound => {
-            PnpError::ProbeFailed
+            PnpError::registration_failed(
+                crate::dev::pnp::PnpResourceKind::FwCfg,
+                "fw_cfg install failed",
+            )
         }
         FwCfgError::OutOfMemory => PnpError::OutOfMemory,
     }
