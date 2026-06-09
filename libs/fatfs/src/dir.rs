@@ -122,22 +122,6 @@ pub(crate) fn locate_slot(
     }
 }
 
-/// 读一个目录槽(32 字节)到 `out`。返回 `false` 表示槽号超出后端容量。
-pub(crate) fn read_slot(
-    state: &FsState,
-    backing: DirBacking,
-    slot: u32,
-    out: &mut [u8; DIR_ENTRY_SIZE],
-) -> Result<bool, BlockBackendError> {
-    let Some((lba, off)) = locate_slot(state, backing, slot)? else {
-        return Ok(false);
-    };
-    let mut sec = vec![0u8; state.bytes_per_sector as usize];
-    state.backend.read_sectors(lba, 1, &mut sec)?;
-    out.copy_from_slice(&sec[off..off + DIR_ENTRY_SIZE]);
-    Ok(true)
-}
-
 /// 写一个目录槽。槽必须已存在(预先用 [`ensure_slot`] 扩容)。
 pub(crate) fn write_slot(
     state: &FsState,
@@ -656,10 +640,12 @@ pub(crate) fn update_sfn_metadata(
     first_cluster: u32,
     size: u32,
 ) -> Result<(), BlockBackendError> {
-    let mut buf = [0u8; DIR_ENTRY_SIZE];
-    if !read_slot(state, backing, sfn_slot, &mut buf)? {
+    let Some((lba, off)) = locate_slot(state, backing, sfn_slot)? else {
         return Err(BlockBackendError::OutOfRange);
-    }
+    };
+    let mut sec = vec![0u8; state.bytes_per_sector as usize];
+    state.backend.read_sectors(lba, 1, &mut sec)?;
+    let buf = &mut sec[off..off + DIR_ENTRY_SIZE];
     let hi = (first_cluster >> 16) as u16;
     let lo = first_cluster as u16;
     buf[OFF_CLUSTER_HI..OFF_CLUSTER_HI + 2].copy_from_slice(&hi.to_le_bytes());
@@ -669,7 +655,7 @@ pub(crate) fn update_sfn_metadata(
     buf[OFF_MTIME..OFF_MTIME + 2].copy_from_slice(&t.to_le_bytes());
     buf[OFF_MDATE..OFF_MDATE + 2].copy_from_slice(&d.to_le_bytes());
     buf[OFF_ADATE..OFF_ADATE + 2].copy_from_slice(&d.to_le_bytes());
-    write_slot(state, backing, sfn_slot, &buf)
+    state.backend.write_sectors(lba, 1, &sec)
 }
 
 /// 构造一个 SFN 条目的 32 字节:给定 11 字节 SFN、属性、first_cluster、size。
