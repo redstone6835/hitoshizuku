@@ -1091,7 +1091,9 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
-    let mut attr = sched::operation::sched_getattr(pid)?;
+    let task = sched::operation::task_by_pid(pid)?;
+    let old = task.sched.sched_attr();
+    let mut attr = old;
     match attr.policy {
         SchedPolicy::Fair | SchedPolicy::Idle => {
             if priority != 0 {
@@ -1106,7 +1108,8 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
         }
         SchedPolicy::Deadline => return Err(Errno::EINVAL),
     }
-    sched::operation::sched_setattr(pid, attr)?;
+    check_sched_attr_permission(&ctx.task, &task, old, attr)?;
+    sched::operation::sched_setattr_for_task(&task, attr)?;
     Ok(0)
 }
 
@@ -1134,7 +1137,8 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     {
         return Err(Errno::EINVAL);
     }
-    let old = sched::operation::sched_getattr(pid)?;
+    let task = sched::operation::task_by_pid(pid)?;
+    let old = task.sched.sched_attr();
     let attr = SchedAttr {
         policy,
         nice: old.nice,
@@ -1144,7 +1148,8 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
         deadline_ns: 0,
         period_ns: 0,
     };
-    sched::operation::sched_setattr(pid, attr)?;
+    check_sched_attr_permission(&ctx.task, &task, old, attr)?;
+    sched::operation::sched_setattr_for_task(&task, attr)?;
     Ok(0)
 }
 
@@ -1308,8 +1313,65 @@ pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         return Err(Errno::EINVAL);
     }
     let attr = read_linux_sched_attr(attr_user)?;
-    sched::operation::sched_setattr(pid, attr)?;
+    let task = sched::operation::task_by_pid(pid)?;
+    let old = task.sched.sched_attr();
+    check_sched_attr_permission(&ctx.task, &task, old, attr)?;
+    sched::operation::sched_setattr_for_task(&task, attr)?;
     Ok(0)
+}
+
+/// 校验调度属性修改权限。
+///
+/// syscall 层负责用户态权限和资源限制；sched 核心只接收已经授权的内部属性。
+fn check_sched_attr_permission(
+    caller: &Arc<Task>,
+    target: &Arc<Task>,
+    old: SchedAttr,
+    requested: SchedAttr,
+) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysNice) {
+        return Ok(());
+    }
+
+    let target_creds = target.credentials();
+    if caller_creds.euid != target_creds.uid && caller_creds.euid != target_creds.euid {
+        return Err(Errno::EPERM);
+    }
+
+    let requested = requested.validate()?;
+    match requested.policy {
+        SchedPolicy::Fair => {
+            if requested.nice < old.nice && (requested.nice as i32) < nice_floor_from_rlimit(caller)
+            {
+                return Err(Errno::EACCES);
+            }
+        }
+        SchedPolicy::Idle => {}
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
+            if old.policy != requested.policy || requested.priority > old.priority {
+                check_rtprio_limit(caller, requested.priority)?;
+            }
+        }
+        SchedPolicy::Deadline => return Err(Errno::EPERM),
+    }
+    Ok(())
+}
+
+fn check_rtprio_limit(caller: &Arc<Task>, priority: u8) -> Result<(), Errno> {
+    let limit = caller
+        .thread_group()
+        .rlimits()
+        .lock()
+        .get(sched::Resource::RtPrio)
+        .soft
+        .raw()
+        .min(sched::RT_PRIO_MAX as u64) as u8;
+    if priority <= limit {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
 }
 
 pub(super) fn sys_sched_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
