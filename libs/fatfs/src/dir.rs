@@ -13,7 +13,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::bpb::FatKind;
-use crate::lfn::{decode_lfn_entry, encode_lfn_entry, lfn_checksum, str_to_ucs2, ucs2_to_string};
+use crate::lfn::{
+    decode_lfn_entry_fixed, encode_lfn_entry, lfn_checksum, str_to_ucs2, ucs2_to_string,
+};
 use crate::state::{BlockBackendError, FsState};
 
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
@@ -297,12 +299,8 @@ where
                 }
                 let out_idx = (order as usize).saturating_sub(1) * 13;
                 if out_idx + 13 <= lfn_units.len() {
-                    let mut local: Vec<u16> = Vec::with_capacity(13);
-                    let _ = decode_lfn_entry(entry, &mut local);
                     let mut chars13 = [0u16; 13];
-                    for (i, c) in local.into_iter().take(13).enumerate() {
-                        chars13[i] = c;
-                    }
+                    let _ = decode_lfn_entry_fixed(entry, &mut chars13);
                     lfn_units[out_idx..out_idx + 13].copy_from_slice(&chars13);
                 }
                 continue;
