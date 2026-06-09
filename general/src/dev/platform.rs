@@ -9,13 +9,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 
+use crate::dev::dma::{DmaBouncePolicy, DmaConstraints, DmaContext};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine};
 use crate::dev::pnp::{
-    BusType, PNP_DEVICES, PNP_DRIVERS, PnpBusInfo, PnpDevice, PnpError, PnpId, PnpState,
+    BusType, PNP_DEVICES, PNP_DRIVERS, PlatformIdentity, PlatformIdentityIrqAttributes,
+    PlatformIdentityIrqPolarity, PlatformIdentityIrqSharing, PlatformIdentityIrqTrigger,
+    PlatformIdentityMatchId, PlatformIdentityResource, PnpBusInfo, PnpDevice, PnpError, PnpId,
+    PnpState,
 };
-
-const PLATFORM_ID_FNV_OFFSET: u32 = 0x811c_9dc5;
-const PLATFORM_ID_FNV_PRIME: u32 = 0x0100_0193;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceMatchId {
@@ -280,6 +281,21 @@ impl PlatformDeviceInfo {
         self.resolve_first_irq_line().ok()
     }
 
+    /// 返回该 platform 设备的 DMA 上下文。
+    ///
+    /// platform 设备没有统一可枚举配置空间，DMA coherent 等能力来自固件属性。
+    /// 未声明时不假设设备 cache coherent；地址转换仍走平台 mapper 的默认入口。
+    pub fn dma_context(&self) -> DmaContext {
+        DmaContext::with_constraints(DmaConstraints {
+            address_mask: usize::MAX,
+            max_segment_size: usize::MAX,
+            max_segments: 1,
+            coherent: self.bool_property("dma-coherent"),
+            supports_scatter_gather: false,
+            bounce: DmaBouncePolicy::Disabled,
+        })
+    }
+
     pub fn resolve_irq_line_at(&self, index: usize) -> Result<IrqLine, PlatformIrqResolveError> {
         let irq = self
             .irq_at(index)
@@ -312,11 +328,13 @@ impl PlatformDeviceInfo {
         index: usize,
         handler: Arc<dyn IrqHandler>,
     ) -> Result<IrqHandle, PlatformIrqRegistrationError> {
-        let line = self
-            .resolve_irq_line_at(index)
-            .map_err(map_irq_resolve_error)?;
-        irq::register_irq_handler(line, handler)
-            .map_err(|err| PlatformIrqRegistrationError::RegistrationFailed { line, err })
+        let irq_resource = self
+            .irq_at(index)
+            .ok_or(PlatformIrqRegistrationError::NoResource)?;
+        let line = irq_resource
+            .resolve_line()
+            .ok_or(PlatformIrqRegistrationError::Unresolved)?;
+        register_firmware_irq_handler(irq_resource, line, handler)
     }
 
     /// 使用第一个可翻译的固件 IRQ 资源注册 handler。
@@ -334,8 +352,7 @@ impl PlatformDeviceInfo {
             let Some(line) = irq_resource.resolve_line() else {
                 continue;
             };
-            return irq::register_irq_handler(line, handler)
-                .map_err(|err| PlatformIrqRegistrationError::RegistrationFailed { line, err });
+            return register_firmware_irq_handler(irq_resource, line, handler);
         }
         Err(if saw_irq {
             PlatformIrqRegistrationError::Unresolved
@@ -421,10 +438,43 @@ impl PlatformDeviceInfo {
     }
 }
 
-fn map_irq_resolve_error(err: PlatformIrqResolveError) -> PlatformIrqRegistrationError {
-    match err {
-        PlatformIrqResolveError::NoResource => PlatformIrqRegistrationError::NoResource,
-        PlatformIrqResolveError::Unresolved => PlatformIrqRegistrationError::Unresolved,
+fn register_firmware_irq_handler(
+    irq_resource: FirmwareIrqResource<'_>,
+    line: IrqLine,
+    handler: Arc<dyn IrqHandler>,
+) -> Result<IrqHandle, PlatformIrqRegistrationError> {
+    // 固件 IRQ descriptor 中的触发/极性/共享信息必须进入 IRQ core；驱动只负责
+    // 声明 handler，不应重复解析 controller-specific cells。
+    let attributes = irq_resource.attributes();
+    let mut request = irq::IrqRequest::shared(line, "platform-firmware-irq", handler);
+    request.sharing = attributes
+        .sharing
+        .map(map_irq_sharing)
+        .unwrap_or(irq::IrqSharing::Shared);
+    request.trigger = attributes.trigger.map(map_irq_trigger);
+    request.polarity = attributes.polarity.map(map_irq_polarity);
+    irq::register_irq_request(request)
+        .map_err(|err| PlatformIrqRegistrationError::RegistrationFailed { line, err })
+}
+
+fn map_irq_trigger(trigger: IrqTrigger) -> irq::IrqTrigger {
+    match trigger {
+        IrqTrigger::Edge => irq::IrqTrigger::Edge,
+        IrqTrigger::Level => irq::IrqTrigger::Level,
+    }
+}
+
+fn map_irq_polarity(polarity: IrqPolarity) -> irq::IrqPolarity {
+    match polarity {
+        IrqPolarity::ActiveHigh => irq::IrqPolarity::High,
+        IrqPolarity::ActiveLow => irq::IrqPolarity::Low,
+    }
+}
+
+fn map_irq_sharing(sharing: IrqSharing) -> irq::IrqSharing {
+    match sharing {
+        IrqSharing::Exclusive => irq::IrqSharing::Exclusive,
+        IrqSharing::Shared => irq::IrqSharing::Shared,
     }
 }
 
@@ -464,10 +514,10 @@ pub fn register_and_probe_platform_device(
     info: PlatformDeviceInfo,
 ) -> Result<PlatformRegistration, PnpError> {
     let name = info.fw_name.clone();
-    let index = platform_instance_id(&info);
+    let identity = platform_identity(&info);
     let id = PnpId::Platform {
         name: name.clone(),
-        index,
+        identity,
     };
     let new_dev = PnpDevice::new(id, name, Box::new(info));
     let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev))?;
@@ -499,7 +549,7 @@ pub fn register_and_probe_platform_device(
             device: dev,
             status: PlatformProbeStatus::NoDriver,
         }),
-        Err(PnpError::ProbeDeferred) => Ok(PlatformRegistration {
+        Err(err) if err.is_deferred() => Ok(PlatformRegistration {
             device: dev,
             status: PlatformProbeStatus::Deferred,
         }),
@@ -512,95 +562,63 @@ pub fn register_and_probe_platform_device(
     }
 }
 
-fn platform_instance_id(info: &PlatformDeviceInfo) -> u32 {
-    // Platform 设备没有 PCI BDF 这类天然地址，这里用固件名、match id 和资源 tuple
-    // 生成稳定 instance。它只用于 PnP identity，不参与 `/dev`/POSIX 设备号投影。
-    let mut hash = PLATFORM_ID_FNV_OFFSET;
-    hash = fnv_mix_bytes(hash, info.fw_name.as_bytes());
-    if let Some(path) = info.fw_path.as_ref() {
-        hash = fnv_mix_u32(hash, 0);
-        hash = fnv_mix_bytes(hash, path.as_bytes());
-    }
-    for id in &info.ids {
-        match id {
+fn platform_identity(info: &PlatformDeviceInfo) -> PlatformIdentity {
+    // platform 设备身份保留完整固件路径和资源 tuple，避免 32 位 hash 碰撞导致
+    // 两个不同固件节点被 PnP core 误判为同一设备。
+    let match_ids: Vec<PlatformIdentityMatchId> = info
+        .ids
+        .iter()
+        .map(|id| match id {
             DeviceMatchId::DtbCompatible(value) => {
-                hash = fnv_mix_u32(hash, 1);
-                hash = fnv_mix_bytes(hash, value.as_bytes());
+                PlatformIdentityMatchId::DtbCompatible(value.clone())
             }
-            DeviceMatchId::AcpiHid(value) => {
-                hash = fnv_mix_u32(hash, 2);
-                hash = fnv_mix_bytes(hash, value.as_bytes());
-            }
-            DeviceMatchId::AcpiCid(value) => {
-                hash = fnv_mix_u32(hash, 3);
-                hash = fnv_mix_bytes(hash, value.as_bytes());
-            }
-        }
-    }
-    for resource in &info.resources {
-        match resource {
-            DeviceResource::Mmio { phys, size } => {
-                hash = fnv_mix_u32(hash, 4);
-                hash = fnv_mix_usize(hash, *phys);
-                hash = fnv_mix_usize(hash, *size);
-            }
+            DeviceMatchId::AcpiHid(value) => PlatformIdentityMatchId::AcpiHid(value.clone()),
+            DeviceMatchId::AcpiCid(value) => PlatformIdentityMatchId::AcpiCid(value.clone()),
+        })
+        .collect();
+    let resources: Vec<PlatformIdentityResource> = info
+        .resources
+        .iter()
+        .map(|resource| match resource {
+            DeviceResource::Mmio { phys, size } => PlatformIdentityResource::Mmio {
+                phys: *phys,
+                size: *size,
+            },
             DeviceResource::Irq {
                 controller,
                 cells,
                 attributes,
-            } => {
-                hash = fnv_mix_u32(hash, 5);
-                hash = fnv_mix_u32(hash, controller.unwrap_or(0));
-                for cell in cells.iter() {
-                    hash = fnv_mix_u32(hash, *cell);
-                }
-                hash = fnv_mix_irq_attributes(hash, *attributes);
-            }
-        }
+            } => PlatformIdentityResource::Irq {
+                controller: *controller,
+                cells: cells.clone(),
+                attributes: platform_identity_irq_attributes(*attributes),
+            },
+        })
+        .collect();
+    PlatformIdentity::new(
+        info.fw_path.clone(),
+        info.fw_parent_path.clone(),
+        match_ids.into_boxed_slice(),
+        resources.into_boxed_slice(),
+    )
+}
+
+fn platform_identity_irq_attributes(
+    attributes: IrqResourceAttributes,
+) -> PlatformIdentityIrqAttributes {
+    PlatformIdentityIrqAttributes {
+        trigger: attributes.trigger.map(|trigger| match trigger {
+            IrqTrigger::Edge => PlatformIdentityIrqTrigger::Edge,
+            IrqTrigger::Level => PlatformIdentityIrqTrigger::Level,
+        }),
+        polarity: attributes.polarity.map(|polarity| match polarity {
+            IrqPolarity::ActiveHigh => PlatformIdentityIrqPolarity::ActiveHigh,
+            IrqPolarity::ActiveLow => PlatformIdentityIrqPolarity::ActiveLow,
+        }),
+        sharing: attributes.sharing.map(|sharing| match sharing {
+            IrqSharing::Exclusive => PlatformIdentityIrqSharing::Exclusive,
+            IrqSharing::Shared => PlatformIdentityIrqSharing::Shared,
+        }),
+        wake_capable: attributes.wake_capable,
     }
-    hash
-}
-
-fn fnv_mix_irq_attributes(mut hash: u32, attributes: IrqResourceAttributes) -> u32 {
-    hash = fnv_mix_u32(
-        hash,
-        match attributes.trigger {
-            None => 0,
-            Some(IrqTrigger::Edge) => 1,
-            Some(IrqTrigger::Level) => 2,
-        },
-    );
-    hash = fnv_mix_u32(
-        hash,
-        match attributes.polarity {
-            None => 0,
-            Some(IrqPolarity::ActiveHigh) => 1,
-            Some(IrqPolarity::ActiveLow) => 2,
-        },
-    );
-    hash = fnv_mix_u32(
-        hash,
-        match attributes.sharing {
-            None => 0,
-            Some(IrqSharing::Exclusive) => 1,
-            Some(IrqSharing::Shared) => 2,
-        },
-    );
-    fnv_mix_u32(hash, if attributes.wake_capable { 1 } else { 0 })
-}
-
-fn fnv_mix_bytes(mut hash: u32, bytes: &[u8]) -> u32 {
-    for byte in bytes {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(PLATFORM_ID_FNV_PRIME);
-    }
-    hash
-}
-
-fn fnv_mix_u32(hash: u32, value: u32) -> u32 {
-    fnv_mix_bytes(hash, &value.to_le_bytes())
-}
-
-fn fnv_mix_usize(hash: u32, value: usize) -> u32 {
-    fnv_mix_bytes(hash, &value.to_le_bytes())
 }

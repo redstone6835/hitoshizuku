@@ -48,6 +48,44 @@ use crate::dev::registry_id;
 
 // ── PnP 错误类型 ─────────────────────────────────────────────────────────
 
+/// PnP core 认识的资源类别。
+///
+/// 这里描述的是设备管理层资源，不是 POSIX 设备号或 `/dev` 节点。驱动 probe
+/// 失败时应尽量带上具体类别，便于 deferred probe 和启动日志定位真实缺口。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PnpResourceKind {
+    Mmio,
+    Irq,
+    IrqDomain,
+    Msi,
+    MsiController,
+    Syscon,
+    Flash,
+    FwCfg,
+    FirmwareBus,
+    PciHostBridge,
+    Dma,
+    Function,
+    Other(&'static str),
+}
+
+/// deferred probe 的精确依赖键。
+///
+/// 设备返回该依赖后，PnP core 会记录“缺的是哪个资源”，对应资源登记成功时
+/// 可以只重试受影响设备，而不是无条件扫描所有 Discovered 设备。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PnpDependency {
+    IrqController(u32),
+    DefaultIrqDomain,
+    MsiController(u32),
+    Syscon(u32),
+    FwCfg,
+    FirmwareBus,
+    PciHostBridge(u16),
+    Dma,
+    Other(&'static str),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PnpError {
     /// 设备状态不允许当前操作
@@ -72,6 +110,64 @@ pub enum PnpError {
     DevtmpfsError,
     /// 内存不足
     OutOfMemory,
+    /// 固件或总线没有提供驱动必需的资源。
+    MissingResource {
+        kind: PnpResourceKind,
+        detail: &'static str,
+    },
+    /// 固件资源存在，但格式或取值不满足该资源的解析规则。
+    MalformedResource {
+        kind: PnpResourceKind,
+        detail: &'static str,
+    },
+    /// probe 依赖的其它资源尚未登记，设备应等待该依赖就绪后精准重试。
+    DependencyNotReady(PnpDependency),
+    /// 资源登记失败，但不属于单纯内存不足或命名冲突。
+    RegistrationFailed {
+        kind: PnpResourceKind,
+        detail: &'static str,
+    },
+    /// 设备或平台明确不支持驱动请求的能力。
+    Unsupported { feature: &'static str },
+    /// 硬件访问失败或返回了不可恢复的异常状态。
+    HardwareFailure { detail: &'static str },
+}
+
+impl PnpError {
+    pub const fn missing(kind: PnpResourceKind, detail: &'static str) -> Self {
+        Self::MissingResource { kind, detail }
+    }
+
+    pub const fn malformed(kind: PnpResourceKind, detail: &'static str) -> Self {
+        Self::MalformedResource { kind, detail }
+    }
+
+    pub const fn dependency(dependency: PnpDependency) -> Self {
+        Self::DependencyNotReady(dependency)
+    }
+
+    pub const fn registration_failed(kind: PnpResourceKind, detail: &'static str) -> Self {
+        Self::RegistrationFailed { kind, detail }
+    }
+
+    pub const fn unsupported(feature: &'static str) -> Self {
+        Self::Unsupported { feature }
+    }
+
+    pub const fn hardware_failure(detail: &'static str) -> Self {
+        Self::HardwareFailure { detail }
+    }
+
+    pub const fn is_deferred(self) -> bool {
+        matches!(self, Self::ProbeDeferred | Self::DependencyNotReady(_))
+    }
+
+    pub const fn deferred_dependency(self) -> Option<PnpDependency> {
+        match self {
+            Self::DependencyNotReady(dependency) => Some(dependency),
+            _ => None,
+        }
+    }
 }
 
 impl From<FunctionRegistryError> for PnpError {
@@ -113,7 +209,107 @@ pub enum PnpId {
         interface: Option<u8>,
     },
     /// 固件枚举的 platform 设备。
-    Platform { name: Box<str>, index: u32 },
+    Platform {
+        name: Box<str>,
+        identity: PlatformIdentity,
+    },
+}
+
+/// platform 设备的完整固件身份。
+///
+/// platform 设备不像 PCI 那样天然拥有 BDF。这里保留固件路径、match id 和资源
+/// tuple 本身，而不是把它们压成整数 hash；这样 PnP 去重不会受 hash 碰撞影响，
+/// 诊断信息也能追溯到原始固件节点。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PlatformIdentity {
+    firmware_path: Option<Box<str>>,
+    parent_path: Option<Box<str>>,
+    match_ids: Box<[PlatformIdentityMatchId]>,
+    resources: Box<[PlatformIdentityResource]>,
+}
+
+impl PlatformIdentity {
+    pub fn new(
+        firmware_path: Option<Box<str>>,
+        parent_path: Option<Box<str>>,
+        match_ids: Box<[PlatformIdentityMatchId]>,
+        resources: Box<[PlatformIdentityResource]>,
+    ) -> Self {
+        Self {
+            firmware_path,
+            parent_path,
+            match_ids,
+            resources,
+        }
+    }
+
+    pub fn firmware_path(&self) -> Option<&str> {
+        self.firmware_path.as_deref()
+    }
+
+    pub fn parent_path(&self) -> Option<&str> {
+        self.parent_path.as_deref()
+    }
+
+    pub fn match_ids(&self) -> &[PlatformIdentityMatchId] {
+        &self.match_ids
+    }
+
+    pub fn resources(&self) -> &[PlatformIdentityResource] {
+        &self.resources
+    }
+}
+
+/// platform 设备参与身份判等的固件匹配 id。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformIdentityMatchId {
+    DtbCompatible(Box<str>),
+    AcpiHid(Box<str>),
+    AcpiCid(Box<str>),
+}
+
+/// platform IRQ 资源参与身份判等的触发方式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformIdentityIrqTrigger {
+    Edge,
+    Level,
+}
+
+/// platform IRQ 资源参与身份判等的极性。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformIdentityIrqPolarity {
+    ActiveHigh,
+    ActiveLow,
+}
+
+/// platform IRQ 资源参与身份判等的共享策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformIdentityIrqSharing {
+    Exclusive,
+    Shared,
+}
+
+/// platform IRQ 资源参与身份判等的通用属性。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PlatformIdentityIrqAttributes {
+    pub trigger: Option<PlatformIdentityIrqTrigger>,
+    pub polarity: Option<PlatformIdentityIrqPolarity>,
+    pub sharing: Option<PlatformIdentityIrqSharing>,
+    pub wake_capable: bool,
+}
+
+/// platform 设备参与身份判等的固件资源。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PlatformIdentityResource {
+    Mmio {
+        phys: usize,
+        size: usize,
+    },
+    Irq {
+        controller: Option<u32>,
+        cells: Box<[u32]>,
+        attributes: PlatformIdentityIrqAttributes,
+    },
 }
 
 impl Hash for PnpId {
@@ -140,9 +336,9 @@ impl Hash for PnpId {
                 address.hash(state);
                 interface.hash(state);
             }
-            PnpId::Platform { name, index } => {
+            PnpId::Platform { name, identity } => {
                 name.as_ref().hash(state);
-                index.hash(state);
+                identity.hash(state);
             }
         }
     }
@@ -182,7 +378,19 @@ impl fmt::Display for PnpId {
                     write!(f, "usb:{}-{}", bus_id, address)
                 }
             }
-            PnpId::Platform { name, index } => write!(f, "platform:{}[{}]", name, index),
+            PnpId::Platform { name, identity } => {
+                if let Some(path) = identity.firmware_path() {
+                    write!(f, "platform:{}@{}", name, path)
+                } else {
+                    write!(
+                        f,
+                        "platform:{}[ids={},resources={}]",
+                        name,
+                        identity.match_ids().len(),
+                        identity.resources().len()
+                    )
+                }
+            }
         }
     }
 }
@@ -333,6 +541,127 @@ impl PnpState {
     }
 }
 
+// ── PnP-owned resource ──────────────────────────────────────────────────
+
+/// PnP 设备拥有的可回收资源。
+///
+/// 驱动在 probe 期间通过 [`PnpDevice::own_resource`] 把 IRQ/MSI/syscon 等
+/// registry handle 交给 PnP core。core 在 probe 回滚、驱动解绑和热拔时按
+/// LIFO 顺序释放，避免每个驱动重复手写清理路径。
+pub trait PnpResource: Send {
+    /// 资源类别，用于日志和错误定位。
+    fn kind(&self) -> PnpResourceKind;
+    /// 资源诊断标签，必须是稳定静态字符串，不能依赖用户态 ABI 名称。
+    fn label(&self) -> &'static str;
+    /// 释放资源。实现必须允许底层资源已被提前释放并安全返回错误。
+    fn release(self: Box<Self>) -> Result<(), PnpResourceReleaseError>;
+}
+
+/// PnP 设备当前拥有资源的只读快照。
+///
+/// sysfs/procfs 等诊断视图只能观察资源类别和稳定标签，不能拿到底层 handle；
+/// handle 的释放所有权仍然完全留在 PnP core 内部，避免兼容层破坏 remove 事务。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PnpOwnedResourceSnapshot {
+    pub kind: PnpResourceKind,
+    pub label: &'static str,
+}
+
+/// PnP resource 自动释放失败。
+///
+/// release 失败不会阻止 remove 流程继续；它只进入日志，提示存在重复释放、
+/// handle 代次不匹配或底层 registry 状态异常。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PnpResourceReleaseError {
+    pub kind: PnpResourceKind,
+    pub label: &'static str,
+    pub detail: &'static str,
+}
+
+impl PnpResourceReleaseError {
+    pub const fn new(kind: PnpResourceKind, label: &'static str, detail: &'static str) -> Self {
+        Self {
+            kind,
+            label,
+            detail,
+        }
+    }
+}
+
+/// 小型 handle resource 包装器。
+///
+/// 大多数设备资源都是“注册函数返回 handle、注销函数消费 handle”的形态。这个
+/// 包装器让驱动不需要为每一种 handle 写新的资源类型。
+pub struct PnpHandleResource<H>
+where
+    H: Copy + Send + 'static,
+{
+    kind: PnpResourceKind,
+    label: &'static str,
+    handle: H,
+    release: fn(H) -> bool,
+}
+
+impl<H> PnpHandleResource<H>
+where
+    H: Copy + Send + 'static,
+{
+    pub const fn new(
+        kind: PnpResourceKind,
+        label: &'static str,
+        handle: H,
+        release: fn(H) -> bool,
+    ) -> Self {
+        Self {
+            kind,
+            label,
+            handle,
+            release,
+        }
+    }
+}
+
+impl<H> PnpResource for PnpHandleResource<H>
+where
+    H: Copy + Send + 'static,
+{
+    fn kind(&self) -> PnpResourceKind {
+        self.kind
+    }
+
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    fn release(self: Box<Self>) -> Result<(), PnpResourceReleaseError> {
+        if (self.release)(self.handle) {
+            Ok(())
+        } else {
+            Err(PnpResourceReleaseError::new(
+                self.kind,
+                self.label,
+                "resource release callback reported failure",
+            ))
+        }
+    }
+}
+
+fn release_pnp_resources(mut resources: Vec<Box<dyn PnpResource>>, owner: &PnpId) {
+    while let Some(resource) = resources.pop() {
+        let kind = resource.kind();
+        let label = resource.label();
+        if let Err(err) = resource.release() {
+            log::error!(
+                "[pnp] failed to release {:?} resource {} for {}: {}",
+                kind,
+                label,
+                owner,
+                err.detail
+            );
+        }
+    }
+}
+
 // ── PnpDevice ────────────────────────────────────────────────────────────
 
 struct PnpDeviceInner {
@@ -340,8 +669,10 @@ struct PnpDeviceInner {
     parent: Option<Weak<PnpDevice>>,
     children: Vec<Arc<PnpDevice>>,
     functions: Vec<Arc<dyn DeviceFunction>>,
+    resources: Vec<Box<dyn PnpResource>>,
     bound_driver: Option<Arc<dyn PnpDriver>>,
     driver_data: Option<Arc<dyn Any + Send + Sync>>,
+    deferred_dependency: Option<PnpDependency>,
 }
 
 /// PnP 设备对象。
@@ -367,6 +698,8 @@ impl Debug for PnpDevice {
             .field("parent", &inner.parent)
             .field("children_count", &inner.children.len())
             .field("functions_count", &inner.functions.len())
+            .field("resources_count", &inner.resources.len())
+            .field("deferred_dependency", &inner.deferred_dependency)
             .field("driver", &inner.bound_driver.as_ref().map(|d| d.name()))
             .finish()
     }
@@ -383,8 +716,10 @@ impl PnpDevice {
                 parent: None,
                 children: Vec::new(),
                 functions: Vec::new(),
+                resources: Vec::new(),
                 bound_driver: None,
                 driver_data: None,
+                deferred_dependency: None,
             }),
             removal_lock: AtomicBool::new(false),
         })
@@ -415,6 +750,24 @@ impl PnpDevice {
     /// 返回子设备快照。
     pub fn children(&self) -> Vec<Arc<PnpDevice>> {
         self.inner.lock().children.clone()
+    }
+
+    /// 返回最近一次 deferred probe 记录的精确依赖。
+    pub fn deferred_dependency(&self) -> Option<PnpDependency> {
+        self.inner.lock().deferred_dependency
+    }
+
+    /// 返回该设备已交给 PnP core 管理的资源快照。
+    pub fn owned_resources(&self) -> Vec<PnpOwnedResourceSnapshot> {
+        self.inner
+            .lock()
+            .resources
+            .iter()
+            .map(|resource| PnpOwnedResourceSnapshot {
+                kind: resource.kind(),
+                label: resource.label(),
+            })
+            .collect()
     }
 
     /// 返回父设备；根设备没有父设备。
@@ -517,6 +870,30 @@ impl PnpDevice {
             .map_err(|_| PnpError::OutOfMemory)?;
         inner.functions.push(func);
         Ok(())
+    }
+
+    /// 将一个资源交给当前 PnP 设备拥有。
+    ///
+    /// 允许在 probe 期间登记，也允许已绑定驱动后登记运行期资源。core 会在 probe
+    /// 回滚、驱动解绑和热拔时按登记反序释放，驱动不应再手写同一个 handle 的注销。
+    pub fn own_resource<R>(&self, resource: R) -> Result<(), PnpError>
+    where
+        R: PnpResource + 'static,
+    {
+        let mut inner = self.inner.lock();
+        if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
+            return Err(PnpError::InvalidState);
+        }
+        inner
+            .resources
+            .try_reserve(1)
+            .map_err(|_| PnpError::OutOfMemory)?;
+        inner.resources.push(Box::new(resource));
+        Ok(())
+    }
+
+    fn set_deferred_dependency(&self, dependency: Option<PnpDependency>) {
+        self.inner.lock().deferred_dependency = dependency;
     }
 
     fn transition(self: &Arc<Self>, from: PnpState, to: PnpState) -> Result<(), PnpError> {
@@ -749,7 +1126,8 @@ impl PnpDriverRegistry {
             }
             match self.bind_driver_to_device(&dev, Arc::clone(&driver)) {
                 Ok(()) => bound += 1,
-                Err(PnpError::InvalidState | PnpError::ProbeDeferred) => {}
+                Err(PnpError::InvalidState) => {}
+                Err(err) if err.is_deferred() => {}
                 Err(err) => return Err(err),
             }
         }
@@ -778,9 +1156,21 @@ impl PnpDriverRegistry {
     /// 重试所有仍处于 Discovered 状态的设备。
     ///
     /// 典型场景是 interrupt-controller、桥设备或其它基础设施刚刚 probe 成功，
-    /// 之前返回 [`PnpError::ProbeDeferred`] 的普通设备现在可能已经具备依赖。
+    /// 之前返回 deferred error 的普通设备现在可能已经具备依赖。
     /// 本函数用一个轻量 reentry guard 防止 probe 链条中重复递归进入。
     pub fn retry_deferred_devices(&self) -> Result<usize, PnpError> {
+        self.retry_deferred_matching(|_| true)
+    }
+
+    /// 只重试等待指定依赖的 deferred 设备。
+    pub fn retry_deferred_dependency(&self, dependency: PnpDependency) -> Result<usize, PnpError> {
+        self.retry_deferred_matching(|dev| dev.deferred_dependency() == Some(dependency))
+    }
+
+    fn retry_deferred_matching(
+        &self,
+        mut accepts: impl FnMut(&Arc<PnpDevice>) -> bool,
+    ) -> Result<usize, PnpError> {
         if self
             .retrying_deferred
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -796,9 +1186,13 @@ impl PnpDriverRegistry {
                 if dev.state() != PnpState::Discovered {
                     continue;
                 }
+                if !accepts(&dev) {
+                    continue;
+                }
                 match self.probe_device_once(&dev) {
                     Ok(()) => round_bound += 1,
-                    Err(PnpError::NoDriver | PnpError::ProbeDeferred | PnpError::InvalidState) => {}
+                    Err(PnpError::NoDriver | PnpError::InvalidState) => {}
+                    Err(err) if err.is_deferred() => {}
                     Err(err) => {
                         self.retrying_deferred.store(false, Ordering::Release);
                         return Err(err);
@@ -830,10 +1224,13 @@ impl PnpDriverRegistry {
                 }
                 inner.bound_driver = Some(driver);
                 inner.state = PnpState::Bound;
+                inner.deferred_dependency = None;
                 Ok(())
             }
             Err(err) => {
+                let deferred_dependency = err.deferred_dependency();
                 dev.rollback_probe_side_effects();
+                dev.set_deferred_dependency(deferred_dependency);
                 Err(err)
             }
         }
@@ -908,6 +1305,15 @@ pub fn unregister_driver(handle: DriverHandle) -> Result<(), PnpError> {
 /// 让指定驱动认领当前尚未绑定的既有设备。
 pub fn probe_existing_devices(driver_id: DriverId) -> Result<usize, PnpError> {
     PNP_DRIVERS.probe_existing_devices(driver_id)
+}
+
+/// 通知一个 deferred 依赖已经就绪。
+///
+/// 资源 registry 在成功登记 controller、syscon、fwcfg 等依赖后调用该函数。
+/// PnP core 会只重试记录了同一依赖的设备；旧式没有精确依赖的 deferred 设备仍由
+/// [`PnpDriverRegistry::retry_deferred_devices`] 兜底处理。
+pub fn notify_dependency_ready(dependency: PnpDependency) {
+    let _ = PNP_DRIVERS.retry_deferred_dependency(dependency);
 }
 
 // ── PnpDeviceList ────────────────────────────────────────────────────────
@@ -1079,16 +1485,17 @@ impl PnpDevice {
     }
 
     fn rollback_probe_side_effects(self: &Arc<Self>) {
-        let (functions, children) = {
+        let (functions, children, resources) = {
             let mut inner = self.inner.lock();
             inner.bound_driver = None;
             inner.driver_data = None;
             let functions = core::mem::take(&mut inner.functions);
             let children = inner.children.clone();
+            let resources = core::mem::take(&mut inner.resources);
             if inner.state == PnpState::Probing {
                 inner.state = PnpState::Discovered;
             }
-            (functions, children)
+            (functions, children, resources)
         };
 
         for child in children.iter().rev() {
@@ -1099,6 +1506,8 @@ impl PnpDevice {
             func.mark_gone();
             self.unregister_function_external(func);
         }
+
+        release_pnp_resources(resources, &self.id);
     }
 
     fn unbind_driver_if_matches(
@@ -1113,7 +1522,7 @@ impl PnpDevice {
             return Err(PnpError::InvalidState);
         }
 
-        let (bound_driver, functions, children) = {
+        let (bound_driver, functions, children, resources) = {
             let mut inner = self.inner.lock();
             let matches_driver = inner
                 .bound_driver
@@ -1128,7 +1537,8 @@ impl PnpDevice {
             inner.state = PnpState::Removing;
             let functions = core::mem::take(&mut inner.functions);
             let children = inner.children.clone();
-            (bound_driver, functions, children)
+            let resources = core::mem::take(&mut inner.resources);
+            (bound_driver, functions, children, resources)
         };
 
         // 子设备通常由当前驱动在 probe 期间枚举出来。驱动解绑时按叶子优先移除
@@ -1147,6 +1557,8 @@ impl PnpDevice {
         bound_driver.remove(self);
         let _ = self.inner.lock().driver_data.take();
 
+        release_pnp_resources(resources, &self.id);
+
         for func in &functions {
             self.unregister_function_external(func);
         }
@@ -1154,6 +1566,7 @@ impl PnpDevice {
         {
             let mut inner = self.inner.lock();
             inner.children.clear();
+            inner.deferred_dependency = None;
             if inner.state != PnpState::Removing {
                 self.removal_lock.store(false, Ordering::Release);
                 return Err(PnpError::InvalidState);
@@ -1207,9 +1620,12 @@ impl PnpDevice {
         }
 
         // 阶段 3：标记 function gone
-        let functions: Vec<Arc<dyn DeviceFunction>> = {
+        let (functions, resources): (Vec<Arc<dyn DeviceFunction>>, Vec<Box<dyn PnpResource>>) = {
             let mut inner = self.inner.lock();
-            core::mem::take(&mut inner.functions)
+            (
+                core::mem::take(&mut inner.functions),
+                core::mem::take(&mut inner.resources),
+            )
         };
 
         for func in &functions {
@@ -1228,6 +1644,8 @@ impl PnpDevice {
         }
         let _ = self.inner.lock().driver_data.take();
 
+        release_pnp_resources(resources, &self.id);
+
         // 阶段 6：解绑 devtmpfs 和 DEVICES
         for func in &functions {
             self.unregister_function_external(func);
@@ -1237,6 +1655,7 @@ impl PnpDevice {
         {
             let mut inner = self.inner.lock();
             inner.children.clear();
+            inner.deferred_dependency = None;
             inner.state = PnpState::Gone;
         }
         PNP_DEVICES.remove(&self.id);

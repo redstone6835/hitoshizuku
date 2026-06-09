@@ -20,11 +20,7 @@ use vfs::operation;
 use vfs::path::Dirfd;
 use vfs::socket as vfs_socket;
 use vfs::stat::{DevId, FileMode, FileStat, FileType, FsStat, Timespec};
-
-#[allow(dead_code)]
-#[path = "../../../arch/src/loongarch64/abi.rs"]
-mod loongarch64_abi;
-use loongarch64_abi::{decode_dev_t, encode_dev_t};
+use hal::abi::{ decode_dev_t, encode_dev_t };
 
 /// 单次最多从用户态拷到内核临时缓冲的字节数。
 const COPY_CHUNK: usize = 8192;

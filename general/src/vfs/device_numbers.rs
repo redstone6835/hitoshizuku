@@ -112,6 +112,19 @@ pub fn register_block(node_name: &str, display_name: &str) -> Option<DevId> {
     register(PosixDeviceKind::Block, node_name, display_name)
 }
 
+/// 注册调用方显式指定的字符设备号。
+///
+/// 这仍然只属于 VFS/POSIX 投影：底层设备对象不通过 `rdev` 寻址。显式设备号
+/// 主要给 custom devnode 适配层表达已有 ABI 号码，不能覆盖已登记的其他节点。
+pub fn register_char_with_rdev(node_name: &str, display_name: &str, rdev: DevId) -> Option<DevId> {
+    register_with_rdev(PosixDeviceKind::Char, node_name, display_name, rdev)
+}
+
+/// 注册调用方显式指定的块设备号。
+pub fn register_block_with_rdev(node_name: &str, display_name: &str, rdev: DevId) -> Option<DevId> {
+    register_with_rdev(PosixDeviceKind::Block, node_name, display_name, rdev)
+}
+
 fn register(kind: PosixDeviceKind, node_name: &str, display_name: &str) -> Option<DevId> {
     let mut registry = POSIX_DEVICES.lock();
     if let Some(record) = registry
@@ -141,6 +154,37 @@ fn register(kind: PosixDeviceKind, node_name: &str, display_name: &str) -> Optio
         node_name: node_name.to_string(),
         display_name: display_name.to_string(),
         major_name,
+        rdev,
+    });
+    Some(rdev)
+}
+
+fn register_with_rdev(
+    kind: PosixDeviceKind,
+    node_name: &str,
+    display_name: &str,
+    rdev: DevId,
+) -> Option<DevId> {
+    let mut registry = POSIX_DEVICES.lock();
+    if let Some(record) = registry
+        .records
+        .iter()
+        .find(|record| record.node_name == node_name)
+    {
+        return (record.kind == kind && record.rdev == rdev).then_some(record.rdev);
+    }
+    if registry
+        .records
+        .iter()
+        .any(|record| record.kind == kind && record.rdev == rdev)
+    {
+        return None;
+    }
+    registry.records.push(PosixDeviceRecord {
+        kind,
+        node_name: node_name.to_string(),
+        display_name: display_name.to_string(),
+        major_name: display_name.to_string(),
         rdev,
     });
     Some(rdev)

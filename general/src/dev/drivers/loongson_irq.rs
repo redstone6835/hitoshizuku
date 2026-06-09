@@ -18,14 +18,12 @@ use alloc::vec::Vec;
 
 use vfs::sync::Spinlock;
 
-use crate::dev::irq::{
-    self, IrqDomain, IrqDomainHandle, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus,
-};
-use crate::dev::msi::{self, MsiController, MsiControllerHandle, MsiError, MsiMessage, MsiVector};
+use crate::dev::irq::{self, IrqDomain, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::msi::{self, MsiController, MsiError, MsiMessage, MsiVector};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqResolveError};
 use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDependency, PnpDevice, PnpDriver,
+    PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
 
 const COMPAT_LOONGSON_CPUIC: &str = "loongson,cpu-interrupt-controller";
@@ -96,10 +94,6 @@ impl IrqDomain for LoongsonCpuIrqDomain {
     }
 }
 
-struct LoongsonCpuIrqBinding {
-    domain: IrqDomainHandle,
-}
-
 pub struct LoongsonCpuIrqDriver;
 
 impl LoongsonCpuIrqDriver {
@@ -132,20 +126,23 @@ impl PnpDriver for LoongsonCpuIrqDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let controller = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
+        let controller = info.properties.fw_phandle.ok_or(PnpError::missing(
+            PnpResourceKind::IrqDomain,
+            "cpuic phandle missing",
+        ))?;
         let handle = irq::register_irq_domain(controller, Arc::new(LoongsonCpuIrqDomain))
             .map_err(map_irq_error)?;
-        dev.set_driver_data(Arc::new(LoongsonCpuIrqBinding { domain: handle }));
+        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
+            handle,
+            "loongson-cpuic-domain",
+        )) {
+            let _ = irq::unregister_irq_domain(handle);
+            return Err(err);
+        }
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<LoongsonCpuIrqBinding>()
-        {
-            let _ = irq::unregister_irq_domain(binding.domain);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 #[derive(Clone, Copy)]
@@ -328,11 +325,6 @@ fn repeat_byte(value: u8) -> u32 {
     out
 }
 
-struct EioIntcBinding {
-    domain: IrqDomainHandle,
-    parent_irq: IrqHandle,
-}
-
 pub struct EioIntcDriver;
 
 impl EioIntcDriver {
@@ -367,42 +359,61 @@ impl PnpDriver for EioIntcDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let controller = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
+        let controller = info.properties.fw_phandle.ok_or(PnpError::missing(
+            PnpResourceKind::IrqDomain,
+            "eiointc phandle missing",
+        ))?;
         let parent_line = match info.resolve_first_irq_line() {
             Ok(line) => line,
-            Err(PlatformIrqResolveError::Unresolved) => return Err(PnpError::ProbeDeferred),
-            Err(PlatformIrqResolveError::NoResource) => return Err(PnpError::ProbeFailed),
+            Err(PlatformIrqResolveError::Unresolved) => {
+                return Err(PnpError::dependency(first_irq_dependency(info)));
+            }
+            Err(PlatformIrqResolveError::NoResource) => {
+                return Err(PnpError::missing(
+                    PnpResourceKind::Irq,
+                    "eiointc parent irq",
+                ));
+            }
         };
         let IrqLine::Hardware(parent_hwi) = parent_line else {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::malformed(
+                PnpResourceKind::Irq,
+                "eiointc parent is not cpu hardware irq",
+            ));
         };
-        let route =
-            EioIntcRouteConfig::from_platform(parent_hwi, info).ok_or(PnpError::ProbeFailed)?;
+        let route = EioIntcRouteConfig::from_platform(parent_hwi, info).ok_or(
+            PnpError::malformed(PnpResourceKind::IrqDomain, "invalid eiointc route"),
+        )?;
         let intc = Arc::new(EioIntc::new(controller, route));
         intc.initialize()?;
         let domain = irq::register_irq_domain(controller, intc.clone()).map_err(map_irq_error)?;
+        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
+            domain,
+            "loongson-eiointc-domain",
+        )) {
+            let _ = irq::unregister_irq_domain(domain);
+            return Err(err);
+        }
         let handler: Arc<dyn IrqHandler> = Arc::new(EioIntcIrqHandler {
             intc: Arc::clone(&intc),
         });
         let parent_irq = match irq::register_irq_handler(parent_line, handler) {
             Ok(handle) => handle,
             Err(err) => {
-                let _ = irq::unregister_irq_domain(domain);
                 return Err(map_irq_error(err));
             }
         };
-        dev.set_driver_data(Arc::new(EioIntcBinding { domain, parent_irq }));
+        if let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
+            parent_irq,
+            "loongson-eiointc-parent",
+        )) {
+            let _ = irq::unregister_irq_handler(parent_irq);
+            return Err(err);
+        }
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<EioIntcBinding>()
-        {
-            let _ = irq::unregister_irq_handler(binding.parent_irq);
-            let _ = irq::unregister_irq_domain(binding.domain);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 #[derive(Clone, Copy)]
@@ -719,7 +730,6 @@ impl IrqHandler for PchPicCascadeHandler {
 }
 
 struct PchPicBinding {
-    domain: IrqDomainHandle,
     pic: Arc<PchPic>,
 }
 
@@ -759,16 +769,28 @@ impl PnpDriver for PchPicDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let controller = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
+        let controller = info.properties.fw_phandle.ok_or(PnpError::missing(
+            PnpResourceKind::IrqDomain,
+            "pch-pic phandle missing",
+        ))?;
         let parent_controller = info
             .properties
             .fw_interrupt_parent
-            .ok_or(PnpError::ProbeFailed)?;
+            .ok_or(PnpError::missing(
+                PnpResourceKind::IrqDomain,
+                "pch-pic interrupt-parent missing",
+            ))?;
         let Some((phys, _size)) = info.first_mmio() else {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::missing(
+                PnpResourceKind::Mmio,
+                "pch-pic reg missing",
+            ));
         };
         let base_vector = info.u32_property(PCH_PIC_PROP_BASE_VECTOR).unwrap_or(0);
-        let route_target = PchPicRouteTarget::from_platform(info).ok_or(PnpError::ProbeFailed)?;
+        let route_target = PchPicRouteTarget::from_platform(info).ok_or(PnpError::malformed(
+            PnpResourceKind::IrqDomain,
+            "invalid pch-pic route target",
+        ))?;
         let pic = Arc::new(PchPic::new(
             controller,
             parent_controller,
@@ -784,7 +806,14 @@ impl PnpDriver for PchPicDriver {
             }),
         )
         .map_err(map_irq_error)?;
-        dev.set_driver_data(Arc::new(PchPicBinding { domain, pic }));
+        if let Err(err) = dev.own_resource(irq::irq_domain_pnp_resource(
+            domain,
+            "loongson-pch-pic-domain",
+        )) {
+            let _ = irq::unregister_irq_domain(domain);
+            return Err(err);
+        }
+        dev.set_driver_data(Arc::new(PchPicBinding { pic }));
         Ok(())
     }
 
@@ -797,7 +826,6 @@ impl PnpDriver for PchPicDriver {
             // 注销过程中继续向上游控制器冒泡。
             binding.pic.reset();
             binding.pic.unregister_parent_handlers();
-            let _ = irq::unregister_irq_domain(binding.domain);
         }
     }
 }
@@ -879,10 +907,6 @@ impl MsiController for PchMsi {
     }
 }
 
-struct PchMsiBinding {
-    controller: MsiControllerHandle,
-}
-
 pub struct PchMsiDriver;
 
 impl PchMsiDriver {
@@ -915,21 +939,39 @@ impl PnpDriver for PchMsiDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let controller = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
+        let controller = info.properties.fw_phandle.ok_or(PnpError::missing(
+            PnpResourceKind::MsiController,
+            "pch-msi phandle missing",
+        ))?;
         let parent_controller = info
             .properties
             .fw_interrupt_parent
-            .ok_or(PnpError::ProbeFailed)?;
-        let (phys, _size) = info.first_mmio().ok_or(PnpError::ProbeFailed)?;
+            .ok_or(PnpError::missing(
+                PnpResourceKind::IrqDomain,
+                "pch-msi interrupt-parent missing",
+            ))?;
+        let (phys, _size) = info.first_mmio().ok_or(PnpError::missing(
+            PnpResourceKind::Mmio,
+            "pch-msi reg missing",
+        ))?;
         let base_vector = info
             .u32_property(PCH_MSI_PROP_BASE_VECTOR)
-            .ok_or(PnpError::ProbeFailed)?;
+            .ok_or(PnpError::missing(
+                PnpResourceKind::Msi,
+                "msi-base-vec missing",
+            ))?;
         let vector_count = info
             .u32_property(PCH_MSI_PROP_NUM_VECS)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or(PnpError::ProbeFailed)?;
+            .ok_or(PnpError::missing(
+                PnpResourceKind::Msi,
+                "msi-num-vecs missing",
+            ))?;
         if vector_count == 0 {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::malformed(
+                PnpResourceKind::Msi,
+                "zero MSI vectors",
+            ));
         }
         let mut allocated = Vec::new();
         allocated
@@ -945,17 +987,17 @@ impl PnpDriver for PchMsiDriver {
             allocated,
         ));
         let handle = msi::register_msi_controller(controller, msi).map_err(map_msi_error)?;
-        dev.set_driver_data(Arc::new(PchMsiBinding { controller: handle }));
+        if let Err(err) = dev.own_resource(msi::controller_pnp_resource(
+            handle,
+            "loongson-pch-msi-controller",
+        )) {
+            let _ = msi::unregister_msi_controller(handle);
+            return Err(err);
+        }
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<PchMsiBinding>()
-        {
-            let _ = msi::unregister_msi_controller(binding.controller);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 fn platform_info(dev: &Arc<PnpDevice>) -> Result<&PlatformDeviceInfo, PnpError> {
@@ -965,35 +1007,54 @@ fn platform_info(dev: &Arc<PnpDevice>) -> Result<&PlatformDeviceInfo, PnpError> 
         .ok_or(PnpError::InvalidState)
 }
 
+fn first_irq_dependency(info: &PlatformDeviceInfo) -> PnpDependency {
+    info.irq_resources()
+        .find_map(|irq| irq.controller())
+        .map(PnpDependency::IrqController)
+        .unwrap_or(PnpDependency::DefaultIrqDomain)
+}
+
 fn iocsr_read64(offset: usize) -> Result<u64, PnpError> {
-    irq::iocsr_read64(offset).ok_or(PnpError::ProbeFailed)
+    irq::iocsr_read64(offset).ok_or(PnpError::hardware_failure("iocsr read64 failed"))
 }
 
 fn iocsr_write32(offset: usize, value: u32) -> Result<(), PnpError> {
     irq::iocsr_write32(offset, value)
         .then_some(())
-        .ok_or(PnpError::ProbeFailed)
+        .ok_or(PnpError::hardware_failure("iocsr write32 failed"))
 }
 
 fn iocsr_write64(offset: usize, value: u64) -> Result<(), PnpError> {
     irq::iocsr_write64(offset, value)
         .then_some(())
-        .ok_or(PnpError::ProbeFailed)
+        .ok_or(PnpError::hardware_failure("iocsr write64 failed"))
 }
 
 fn map_irq_error(err: IrqError) -> PnpError {
     match err {
         IrqError::OutOfMemory => PnpError::OutOfMemory,
-        IrqError::AlreadyRegistered => PnpError::NameConflict,
-        IrqError::NotFound => PnpError::ProbeFailed,
+        IrqError::AlreadyRegistered => {
+            PnpError::registration_failed(PnpResourceKind::Irq, "irq already registered")
+        }
+        IrqError::NotFound => {
+            PnpError::registration_failed(PnpResourceKind::Irq, "irq line not found")
+        }
     }
 }
 
 fn map_msi_error(err: MsiError) -> PnpError {
     match err {
         MsiError::OutOfMemory => PnpError::OutOfMemory,
-        MsiError::AlreadyRegistered => PnpError::NameConflict,
-        MsiError::NotFound | MsiError::AllocationFailed => PnpError::ProbeFailed,
+        MsiError::AlreadyRegistered => PnpError::registration_failed(
+            PnpResourceKind::MsiController,
+            "msi controller already registered",
+        ),
+        MsiError::NotFound => {
+            PnpError::registration_failed(PnpResourceKind::MsiController, "msi controller missing")
+        }
+        MsiError::AllocationFailed => {
+            PnpError::registration_failed(PnpResourceKind::Msi, "msi allocation failed")
+        }
     }
 }
 

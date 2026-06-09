@@ -35,11 +35,11 @@ use crate::dev::block::{
 };
 use crate::dev::dma::{DmaBuffer, DmaDirection};
 use crate::dev::function::BlockFunction;
-use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::pci::{PciBar, PciDevice, PciInfo, PciMsiHandle};
+use crate::dev::irq::{self, IrqError, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    PnpResourceKind, register_driver_factory,
 };
 use crate::dev::virtio::{
     SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTIO_PCI_FUNCTION_BLOCK, VIRTIO_PCI_RESET_SPIN_LIMIT,
@@ -232,8 +232,9 @@ impl VirtioBlkPci {
         }
         transport.set_selected_queue_size(qsz);
 
-        let split_queue =
-            SplitVirtQueue::new(qsz).map_err(|_| "virtio-pci: queue allocation failed")?;
+        let dma_context = pci.dma_context();
+        let split_queue = SplitVirtQueue::new_in(dma_context, qsz)
+            .map_err(|_| "virtio-pci: queue allocation failed")?;
 
         // 写入设备可见的 queue_desc/driver/device DMA 地址。
         transport.set_selected_queue_addresses(
@@ -486,8 +487,10 @@ impl BlockDriver for VirtioBlkPciIo {
             Ok(chain) => chain,
             Err(_) => return Err((SubmitError::QueueFull, bio)),
         };
+        let dma_context = queue.queue.dma_context();
 
-        let meta_dma = match DmaBuffer::new(
+        let meta_dma = match DmaBuffer::new_in(
+            dma_context,
             mem::size_of::<VirtioBlkReqMeta>(),
             mem::align_of::<VirtioBlkReqMeta>(),
             DmaDirection::Bidirectional,
@@ -519,7 +522,7 @@ impl BlockDriver for VirtioBlkPciIo {
                 } else {
                     DmaDirection::ToDevice
                 };
-                let mut dma = match DmaBuffer::new(data_len, 1, direction) {
+                let mut dma = match DmaBuffer::new_in(dma_context, data_len, 1, direction) {
                     Ok(buffer) => buffer,
                     Err(_) => {
                         let _ = queue.queue.free_chain(chain);
@@ -707,8 +710,7 @@ struct VirtioPciBlkBinding {
 
 #[derive(Clone, Copy)]
 struct VirtioPciIrqRegistration {
-    irq_handle: IrqHandle,
-    msi_handle: Option<PciMsiHandle>,
+    using_msi: bool,
 }
 
 impl VirtioPciBlkDriver {
@@ -727,9 +729,10 @@ fn map_irq_error(err: IrqError) -> &'static str {
 }
 
 fn register_virtio_pci_irq(
+    dev: &Arc<PnpDevice>,
     pci: &PciDevice,
     driver: Arc<VirtioBlkPci>,
-) -> Option<VirtioPciIrqRegistration> {
+) -> Result<Option<VirtioPciIrqRegistration>, PnpError> {
     let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkPciIrqHandler { driver });
 
     if let Ok(msi_handle) = pci.try_configure_single_msi() {
@@ -739,10 +742,23 @@ fn register_virtio_pci_irq(
                 if pci.try_enable_configured_msi(msi_handle).is_ok() {
                     // MSI 已启用；同时屏蔽 INTx，避免同一设备双路上报。
                     pci.disable_interrupts();
-                    return Some(VirtioPciIrqRegistration {
+                    if let Err(err) = dev.own_resource(PciMsiPnpResource::new(
+                        pci.clone(),
+                        msi_handle,
+                        "virtio-pci-blk-msi",
+                    )) {
+                        let _ = irq::unregister_irq_handler(irq_handle);
+                        pci.release_configured_msi(msi_handle);
+                        return Err(err);
+                    }
+                    if let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
                         irq_handle,
-                        msi_handle: Some(msi_handle),
-                    });
+                        "virtio-pci-blk-msi-irq",
+                    )) {
+                        let _ = irq::unregister_irq_handler(irq_handle);
+                        return Err(err);
+                    }
+                    return Ok(Some(VirtioPciIrqRegistration { using_msi: true }));
                 }
                 let _ = irq::unregister_irq_handler(irq_handle);
                 pci.release_configured_msi(msi_handle);
@@ -760,15 +776,19 @@ fn register_virtio_pci_irq(
 
     let Some(line) = pci.routed_irq_line() else {
         pci.disable_interrupts();
-        return None;
+        return Ok(None);
     };
     match irq::register_irq_handler(line, handler) {
         Ok(handle) => {
             pci.enable_interrupts();
-            Some(VirtioPciIrqRegistration {
-                irq_handle: handle,
-                msi_handle: None,
-            })
+            if let Err(err) =
+                dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-pci-blk-intx"))
+            {
+                let _ = irq::unregister_irq_handler(handle);
+                pci.disable_interrupts();
+                return Err(err);
+            }
+            Ok(Some(VirtioPciIrqRegistration { using_msi: false }))
         }
         Err(err) => {
             log::printk!(
@@ -777,16 +797,13 @@ fn register_virtio_pci_irq(
                 map_irq_error(err)
             );
             pci.disable_interrupts();
-            None
+            Ok(None)
         }
     }
 }
 
 fn unregister_virtio_pci_irq(pci: &PciDevice, registration: VirtioPciIrqRegistration) {
-    let _ = irq::unregister_irq_handler(registration.irq_handle);
-    if let Some(msi_handle) = registration.msi_handle {
-        pci.release_configured_msi(msi_handle);
-    } else {
+    if !registration.using_msi {
         pci.disable_interrupts();
     }
 }
@@ -815,14 +832,14 @@ impl PnpDriver for VirtioPciBlkDriver {
 
         let driver = VirtioBlkPci::probe(&pci).map_err(|msg| {
             log::printk!("[virtio-pci] probe failed: {}", msg);
-            PnpError::ProbeFailed
+            PnpError::hardware_failure("virtio-pci block init failed")
         })?;
 
         let dev_name = alloc_virtio_blk_dev_name(&dev.name)?;
-        let (block_dev, driver) = driver
-            .into_block_dev(&dev_name)
-            .map_err(|_| PnpError::ProbeFailed)?;
-        let irq = register_virtio_pci_irq(&pci, Arc::clone(&driver));
+        let (block_dev, driver) = driver.into_block_dev(&dev_name).map_err(|_| {
+            PnpError::registration_failed(PnpResourceKind::Function, "block function")
+        })?;
+        let irq = register_virtio_pci_irq(dev, &pci, Arc::clone(&driver))?;
 
         let func = Arc::new(BlockFunction::with_devnode(&dev.name, &dev_name, block_dev));
         if let Err(err) = dev.register_function(func) {
@@ -843,8 +860,6 @@ impl PnpDriver for VirtioPciBlkDriver {
             if let Some(registration) = binding.irq {
                 if let Some(pci) = PciDevice::from_pnp(dev) {
                     unregister_virtio_pci_irq(&pci, registration);
-                } else {
-                    let _ = irq::unregister_irq_handler(registration.irq_handle);
                 }
             }
         }
@@ -870,10 +885,4 @@ impl DriverFactory for VirtioPciBlkFactory {
 /// 注册 VirtIO-PCI block 内建驱动 factory。
 pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
     register_driver_factory(Arc::new(VirtioPciBlkFactory)).map(|_| ())
-}
-
-// 避免 BAR 解析时 PciBar 字段被优化掉；保留显式静默引用。
-#[allow(dead_code)]
-fn _keep_prefetchable(bar: &PciBar) -> bool {
-    bar.prefetchable
 }

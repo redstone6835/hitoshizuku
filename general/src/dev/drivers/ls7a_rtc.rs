@@ -10,8 +10,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::dev::irq::{self, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    RealtimeClockSource, register_driver_factory,
+    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDependency, PnpDevice, PnpDriver,
+    PnpError, PnpId, PnpResourceKind, RealtimeClockSource, register_driver_factory,
 };
 use crate::dev::rtc::{
     RtcAlarm, RtcDateTime, RtcDevice, RtcDriver, RtcError, RtcFeatures, RtcFunction, RtcIrqData,
@@ -425,7 +425,6 @@ impl IrqHandler for Ls7aRtcIrqHandler {
 struct Ls7aRtcBinding {
     rtc: Arc<Ls7aRtc>,
     rtc_dev: Arc<RtcDevice>,
-    irq_handle: Option<IrqHandle>,
 }
 
 pub struct Ls7aRtcPlatformDriver {
@@ -434,6 +433,13 @@ pub struct Ls7aRtcPlatformDriver {
     install_realtime_source: Option<fn(RealtimeClockSource) -> bool>,
     unregister_realtime_source: Option<fn(usize)>,
     realtime_owner: AtomicUsize,
+}
+
+fn first_irq_dependency(info: &PlatformDeviceInfo) -> PnpDependency {
+    info.irq_resources()
+        .find_map(|irq| irq.controller())
+        .map(PnpDependency::IrqController)
+        .unwrap_or(PnpDependency::DefaultIrqDomain)
 }
 
 impl Ls7aRtcPlatformDriver {
@@ -558,7 +564,7 @@ impl Ls7aRtcPlatformDriver {
                     "[platform-ls7a-rtc] {} has firmware IRQ resource but no registered IRQ domain translator",
                     info.fw_name.as_ref()
                 );
-                Err(PnpError::ProbeDeferred)
+                Err(PnpError::dependency(first_irq_dependency(info)))
             }
             Err(PlatformIrqRegistrationError::RegistrationFailed { line, err }) => {
                 log::printk!(
@@ -568,9 +574,14 @@ impl Ls7aRtcPlatformDriver {
                 );
                 match err {
                     irq::IrqError::OutOfMemory => Err(PnpError::OutOfMemory),
-                    irq::IrqError::AlreadyRegistered | irq::IrqError::NotFound => {
-                        Err(PnpError::ProbeFailed)
-                    }
+                    irq::IrqError::AlreadyRegistered => Err(PnpError::registration_failed(
+                        PnpResourceKind::Irq,
+                        "rtc alarm irq already registered",
+                    )),
+                    irq::IrqError::NotFound => Err(PnpError::registration_failed(
+                        PnpResourceKind::Irq,
+                        "rtc alarm irq line not found",
+                    )),
                 }
             }
         }
@@ -602,7 +613,7 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
             .downcast_ref::<PlatformDeviceInfo>()
             .ok_or(PnpError::InvalidState)?;
         let Some((phys, size)) = info.first_mmio() else {
-            return Err(PnpError::ProbeFailed);
+            return Err(PnpError::missing(PnpResourceKind::Mmio, "rtc reg missing"));
         };
         let pm_base =
             firmware_pm_mmio(info).map(|(pm_phys, _)| (self.device_mmio_to_virt)(pm_phys));
@@ -618,7 +629,7 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
                 phys,
                 err
             );
-            PnpError::ProbeFailed
+            PnpError::hardware_failure("rtc initial time read failed")
         })?;
 
         let rtc_driver: Arc<dyn RtcDriver> = rtc.clone();
@@ -626,14 +637,20 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         let rtc_dev = Arc::new(RtcDevice::new(rtc_node_name, rtc_driver));
         dev.register_function(Arc::new(RtcFunction::new(Arc::clone(&rtc_dev))))?;
         let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, info)?;
+        if let Some(handle) = irq_handle
+            && let Err(err) = dev.own_resource(irq::irq_handler_pnp_resource(
+                handle,
+                "platform-ls7a-rtc-alarm",
+            ))
+        {
+            rtc.set_alarm_irq_available(false);
+            let _ = irq::unregister_irq_handler(handle);
+            return Err(err);
+        }
 
         self.install_realtime_clock(dev, phys, realtime_ns);
 
-        dev.set_driver_data(Arc::new(Ls7aRtcBinding {
-            rtc,
-            rtc_dev,
-            irq_handle,
-        }));
+        dev.set_driver_data(Arc::new(Ls7aRtcBinding { rtc, rtc_dev }));
         Ok(())
     }
 
@@ -648,9 +665,6 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         {
             binding.rtc.set_alarm_irq_available(false);
             let _ = binding.rtc.set_alarm_enabled(false);
-            if let Some(handle) = binding.irq_handle {
-                let _ = irq::unregister_irq_handler(handle);
-            }
             binding.rtc_dev.mark_gone();
         }
         log::printk!("[platform-ls7a-rtc] removed {}", dev.id);

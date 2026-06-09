@@ -5,8 +5,6 @@
 
 use alloc::boxed::Box;
 
-use errno::Errno;
-
 /// 类型安全的设备控制接口（字符设备与块设备共用）。
 ///
 /// 每种驱动自行定义 `Request`、`Response`、`Error` 关联类型，不使用中心化
@@ -32,19 +30,6 @@ pub enum ControlError {
     Busy,
     Io,
     Permission,
-}
-
-impl ControlError {
-    pub const fn to_errno(self) -> Errno {
-        match self {
-            Self::Unsupported => Errno::ENOTTY,
-            Self::Invalid => Errno::EINVAL,
-            Self::NoDevice => Errno::ENODEV,
-            Self::Busy => Errno::EBUSY,
-            Self::Io => Errno::EIO,
-            Self::Permission => Errno::EPERM,
-        }
-    }
 }
 
 /// 字符设备类的通用控制请求。

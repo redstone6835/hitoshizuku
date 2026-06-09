@@ -10,9 +10,9 @@ use core::ptr::{read_volatile, write_volatile};
 use crate::dev::platform::{FirmwarePropertyValue, PlatformDeviceInfo};
 use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    register_driver_factory,
+    PnpResourceKind, register_driver_factory,
 };
-use crate::dev::syscon::{self, SysconAccessWidth, SysconDevice, SysconError, SysconHandle};
+use crate::dev::syscon::{self, SysconAccessWidth, SysconDevice, SysconError};
 use crate::firmware::power::{
     PowerAccessWidth, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
@@ -131,10 +131,6 @@ impl SysconDevice for MmioSyscon {
     }
 }
 
-struct SysconBinding {
-    handle: SysconHandle,
-}
-
 pub struct SysconPlatformDriver {
     device_mmio_to_virt: fn(usize) -> usize,
 }
@@ -170,11 +166,20 @@ impl PnpDriver for SysconPlatformDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let phandle = info.properties.fw_phandle.ok_or(PnpError::ProbeFailed)?;
-        let (phys, size) = info.first_mmio().ok_or(PnpError::ProbeFailed)?;
-        let width = syscon_width(info).ok_or(PnpError::ProbeFailed)?;
+        let phandle = info.properties.fw_phandle.ok_or(PnpError::missing(
+            PnpResourceKind::Syscon,
+            "missing phandle",
+        ))?;
+        let (phys, size) = info.first_mmio().ok_or(PnpError::missing(
+            PnpResourceKind::Mmio,
+            "missing syscon reg",
+        ))?;
+        let width = syscon_width(info).ok_or(PnpError::malformed(
+            PnpResourceKind::Syscon,
+            "unsupported reg-io-width",
+        ))?;
         let reg_shift = u8::try_from(info.u32_property(PROP_REG_SHIFT).unwrap_or(0))
-            .map_err(|_| PnpError::ProbeFailed)?;
+            .map_err(|_| PnpError::malformed(PnpResourceKind::Syscon, "reg-shift too large"))?;
         let syscon = Arc::new(MmioSyscon::new(
             phandle,
             phys,
@@ -184,7 +189,10 @@ impl PnpDriver for SysconPlatformDriver {
             width,
         ));
         let handle = syscon::register(syscon).map_err(map_syscon_error)?;
-        dev.set_driver_data(Arc::new(SysconBinding { handle }));
+        if let Err(err) = dev.own_resource(syscon::pnp_resource(handle, "platform-syscon")) {
+            let _ = syscon::unregister(handle);
+            return Err(err);
+        }
         log::printk!(
             "[syscon] registered {} phandle={:#x} phys={:#x} size={:#x} width={} shift={}",
             dev.name.as_ref(),
@@ -197,13 +205,7 @@ impl PnpDriver for SysconPlatformDriver {
         Ok(())
     }
 
-    fn remove(&self, dev: &Arc<PnpDevice>) {
-        if let Some(data) = dev.take_driver_data()
-            && let Ok(binding) = data.downcast::<SysconBinding>()
-        {
-            let _ = syscon::unregister(binding.handle);
-        }
-    }
+    fn remove(&self, _dev: &Arc<PnpDevice>) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,18 +264,29 @@ impl PnpDriver for SysconPowerDriver {
 
     fn probe(&self, dev: &Arc<PnpDevice>) -> Result<(), PnpError> {
         let info = platform_info(dev)?;
-        let action = Self::action(info).ok_or(PnpError::ProbeFailed)?;
+        let action = Self::action(info).ok_or(PnpError::unsupported("syscon power action"))?;
         let regmap = info
             .u32_property(PROP_REGMAP)
-            .ok_or(PnpError::ProbeFailed)?;
-        let syscon = syscon::get(regmap).ok_or(PnpError::ProbeDeferred)?;
-        let offset = usize_property(info, PROP_OFFSET).ok_or(PnpError::ProbeFailed)?;
-        let value = u64_property(info, PROP_VALUE).ok_or(PnpError::ProbeFailed)?;
+            .ok_or(PnpError::missing(PnpResourceKind::Syscon, "missing regmap"))?;
+        let syscon = syscon::get(regmap).ok_or(PnpError::dependency(
+            crate::dev::pnp::PnpDependency::Syscon(regmap),
+        ))?;
+        let offset = usize_property(info, PROP_OFFSET).ok_or(PnpError::missing(
+            PnpResourceKind::Syscon,
+            "missing power offset",
+        ))?;
+        let value = u64_property(info, PROP_VALUE).ok_or(PnpError::missing(
+            PnpResourceKind::Syscon,
+            "missing power value",
+        ))?;
         let width = syscon.default_width();
         let phys = syscon
             .phys_addr_for(offset, width)
-            .ok_or(PnpError::ProbeFailed)?;
-        let access_width = power_width(width).ok_or(PnpError::ProbeFailed)?;
+            .ok_or(PnpError::malformed(
+                PnpResourceKind::Syscon,
+                "offset out of range",
+            ))?;
+        let access_width = power_width(width).ok_or(PnpError::unsupported("syscon power width"))?;
         let method = PowerControlMethod::RegisterWrite {
             register: PowerRegister {
                 space: PowerRegisterSpace::SystemMemory,
@@ -369,9 +382,14 @@ fn u64_property(info: &PlatformDeviceInfo, name: &str) -> Option<u64> {
 fn map_syscon_error(err: SysconError) -> PnpError {
     match err {
         SysconError::AlreadyRegistered => PnpError::NameConflict,
-        SysconError::Invalid | SysconError::OutOfRange => PnpError::ProbeFailed,
+        SysconError::Invalid | SysconError::OutOfRange => PnpError::malformed(
+            crate::dev::pnp::PnpResourceKind::Syscon,
+            "invalid syscon resource",
+        ),
         SysconError::OutOfMemory => PnpError::OutOfMemory,
-        SysconError::NotFound => PnpError::ProbeDeferred,
+        SysconError::NotFound => {
+            PnpError::dependency(crate::dev::pnp::PnpDependency::Other("syscon-registry"))
+        }
     }
 }
 

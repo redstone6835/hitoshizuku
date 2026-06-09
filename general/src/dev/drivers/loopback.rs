@@ -13,7 +13,7 @@ use net::config::{IfConfig, Ipv4Addr};
 use net::device::NetDevice;
 use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
 
-use crate::dev::pnp::PnpError;
+use crate::dev::pnp::{PnpError, PnpResourceKind};
 
 const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
 const MAX_LOOPBACK_FREE_FRAMES: usize = 1024;
@@ -121,7 +121,7 @@ pub fn register_builtin_driver() -> Result<(), PnpError> {
     let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, LOOPBACK_IPV4_PREFIX, None);
     net::stack()
         .attach(dev, config)
-        .map_err(|_| PnpError::ProbeFailed)?;
+        .map_err(|_| PnpError::registration_failed(PnpResourceKind::Function, "loopback attach"))?;
     log::printk!("[loopback] attached lo 127.0.0.1/8");
     Ok(())
 }

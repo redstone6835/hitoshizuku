@@ -8,6 +8,8 @@ use core::sync::atomic::AtomicU64;
 
 use vfs::sync::Spinlock;
 
+use crate::dev::pnp::{self, PnpDependency, PnpHandleResource, PnpResourceKind};
+
 use super::registry_id;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,8 @@ pub fn install(dev: Arc<dyn FwCfgDevice>) -> Result<FwCfgHandle, FwCfgError> {
     let id = registry_id::alloc_atomic_id(&NEXT_FW_CFG_ID).map_err(|_| FwCfgError::OutOfMemory)?;
     // fw_cfg 当前是单实例资源，但 handle 仍表示一次安装生命周期，不能在卸载后复用。
     *current = Some(FwCfgRegistration { id, dev });
+    drop(current);
+    pnp::notify_dependency_ready(PnpDependency::FwCfg);
     Ok(FwCfgHandle { id })
 }
 
@@ -68,6 +72,20 @@ pub fn uninstall(handle: FwCfgHandle) -> Result<(), FwCfgError> {
     }
     *current = None;
     Ok(())
+}
+
+fn release_fwcfg_resource(handle: FwCfgHandle) -> bool {
+    uninstall(handle).is_ok()
+}
+
+/// 将 fw_cfg 安装 handle 包装成 PnP-owned resource。
+pub fn pnp_resource(handle: FwCfgHandle, label: &'static str) -> PnpHandleResource<FwCfgHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::FwCfg,
+        label,
+        handle,
+        release_fwcfg_resource,
+    )
 }
 
 pub fn read_item(selector: u16, out: &mut [u8]) -> Result<(), FwCfgError> {

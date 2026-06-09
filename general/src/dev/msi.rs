@@ -13,6 +13,7 @@ use vfs::sync::Spinlock;
 
 use super::registry_id;
 use crate::dev::irq::IrqLine;
+use crate::dev::pnp::{self, PnpDependency, PnpHandleResource, PnpResourceKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsiMessage {
@@ -65,6 +66,7 @@ impl MsiControllerHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MsiHandle {
     controller: u32,
+    controller_id: u64,
     hwirq: u32,
     line: IrqLine,
     message: MsiMessage,
@@ -73,6 +75,10 @@ pub struct MsiHandle {
 impl MsiHandle {
     pub const fn controller(self) -> u32 {
         self.controller
+    }
+
+    pub const fn controller_id(self) -> u64 {
+        self.controller_id
     }
 
     pub const fn hwirq(self) -> u32 {
@@ -119,7 +125,10 @@ pub fn register_msi_controller(
         id,
         driver,
     });
-    Ok(MsiControllerHandle { controller, id })
+    let handle = MsiControllerHandle { controller, id };
+    drop(controllers);
+    pnp::notify_dependency_ready(PnpDependency::MsiController(controller));
+    Ok(handle)
 }
 
 pub fn unregister_msi_controller(handle: MsiControllerHandle) -> Result<(), MsiError> {
@@ -135,12 +144,12 @@ pub fn unregister_msi_controller(handle: MsiControllerHandle) -> Result<(), MsiE
 }
 
 pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiError> {
-    let driver = {
+    let (controller_id, driver) = {
         let controllers = MSI_CONTROLLERS.lock();
         controllers
             .iter()
             .find(|entry| entry.controller == controller)
-            .map(|entry| Arc::clone(&entry.driver))
+            .map(|entry| (entry.id, Arc::clone(&entry.driver)))
     }
     .ok_or(MsiError::NotFound)?;
 
@@ -149,6 +158,7 @@ pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiErr
         .ok_or(MsiError::AllocationFailed)?;
     Ok(MsiHandle {
         controller,
+        controller_id,
         hwirq: vector.hwirq,
         line: vector.line,
         message: vector.message,
@@ -160,10 +170,41 @@ pub fn free_msi(handle: MsiHandle) -> Result<(), MsiError> {
         let controllers = MSI_CONTROLLERS.lock();
         controllers
             .iter()
-            .find(|entry| entry.controller == handle.controller)
+            .find(|entry| entry.controller == handle.controller && entry.id == handle.controller_id)
             .map(|entry| Arc::clone(&entry.driver))
     }
     .ok_or(MsiError::NotFound)?;
     driver.free_vector(handle.hwirq);
     Ok(())
+}
+
+fn release_msi_controller_resource(handle: MsiControllerHandle) -> bool {
+    unregister_msi_controller(handle).is_ok()
+}
+
+fn release_msi_vector_resource(handle: MsiHandle) -> bool {
+    free_msi(handle).is_ok()
+}
+
+/// 将 MSI controller 注册 handle 包装成 PnP-owned resource。
+pub fn controller_pnp_resource(
+    handle: MsiControllerHandle,
+    label: &'static str,
+) -> PnpHandleResource<MsiControllerHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::MsiController,
+        label,
+        handle,
+        release_msi_controller_resource,
+    )
+}
+
+/// 将单个 MSI vector 分配 handle 包装成 PnP-owned resource。
+pub fn vector_pnp_resource(handle: MsiHandle, label: &'static str) -> PnpHandleResource<MsiHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::Msi,
+        label,
+        handle,
+        release_msi_vector_resource,
+    )
 }
