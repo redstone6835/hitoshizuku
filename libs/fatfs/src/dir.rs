@@ -124,23 +124,6 @@ pub(crate) fn locate_slot(
     }
 }
 
-/// 写一个目录槽。槽必须已存在(预先用 [`ensure_slot`] 扩容)。
-pub(crate) fn write_slot(
-    state: &FsState,
-    backing: DirBacking,
-    slot: u32,
-    data: &[u8; DIR_ENTRY_SIZE],
-) -> Result<(), BlockBackendError> {
-    let Some((lba, off)) = locate_slot(state, backing, slot)? else {
-        return Err(BlockBackendError::OutOfRange);
-    };
-    let mut sec = vec![0u8; state.bytes_per_sector as usize];
-    state.backend.read_sectors(lba, 1, &mut sec)?;
-    sec[off..off + DIR_ENTRY_SIZE].copy_from_slice(data);
-    state.backend.write_sectors(lba, 1, &sec)?;
-    Ok(())
-}
-
 /// 确保槽 `slot` 可以容纳:对于簇链型目录,必要时从 FAT 申请新簇并清零;
 /// 对于固定范围(FAT12/16 根目录)无法扩容,会返回 `OutOfRange`。
 pub(crate) fn ensure_slot(

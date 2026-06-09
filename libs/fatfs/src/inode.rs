@@ -229,16 +229,6 @@ impl InodeOps for DirInodeOps {
         let new_c = self.state.alloc_cluster(None).map_err(backend_to_vfs)?;
 
         let res = (|| -> VfsResult<_> {
-            let zero = alloc::vec![0u8; self.state.cluster_size as usize];
-            self.state
-                .backend
-                .write_sectors(
-                    self.state.cluster_to_lba(new_c).map_err(backend_to_vfs)?,
-                    self.state.sectors_per_cluster,
-                    &zero,
-                )
-                .map_err(backend_to_vfs)?;
-
             let dot_sfn = {
                 let mut s = [b' '; 11];
                 s[0] = b'.';
@@ -256,9 +246,19 @@ impl InodeOps for DirInodeOps {
             };
             let dot_entry = dir::build_sfn_entry(dot_sfn, ATTR_DIRECTORY, new_c, 0);
             let dotdot_entry = dir::build_sfn_entry(dotdot_sfn, ATTR_DIRECTORY, parent_first, 0);
-            let new_backing = DirBacking::ChainFromCluster(new_c);
-            dir::write_slot(&self.state, new_backing, 0, &dot_entry).map_err(backend_to_vfs)?;
-            dir::write_slot(&self.state, new_backing, 1, &dotdot_entry).map_err(backend_to_vfs)?;
+            let mut cluster_buf = alloc::vec![0u8; self.state.cluster_size as usize];
+            // 新分配目录簇本应全零；直接在零缓冲中放入 `.`/`..`,避免两次读改写。
+            cluster_buf[..dir::DIR_ENTRY_SIZE].copy_from_slice(&dot_entry);
+            cluster_buf[dir::DIR_ENTRY_SIZE..dir::DIR_ENTRY_SIZE * 2]
+                .copy_from_slice(&dotdot_entry);
+            self.state
+                .backend
+                .write_sectors(
+                    self.state.cluster_to_lba(new_c).map_err(backend_to_vfs)?,
+                    self.state.sectors_per_cluster,
+                    &cluster_buf,
+                )
+                .map_err(backend_to_vfs)?;
 
             let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
             let entry = dir::build_sfn_entry(sfn, ATTR_DIRECTORY, new_c, 0);
