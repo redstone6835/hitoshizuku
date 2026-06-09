@@ -1098,10 +1098,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
             }
         }
         SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
-            if !(1..=99).contains(&priority) {
-                return Err(Errno::EINVAL);
-            }
-            attr.priority = priority as u8;
+            attr.priority = linux_rt_priority_from_param(priority)?;
         }
         SchedPolicy::Deadline => return Err(Errno::EINVAL),
     }
@@ -1130,18 +1127,18 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     if matches!(policy, SchedPolicy::Fair | SchedPolicy::Idle) && priority != 0 {
         return Err(Errno::EINVAL);
     }
-    if matches!(policy, SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin)
-        && !(1..=99).contains(&priority)
-    {
-        return Err(Errno::EINVAL);
-    }
+    let rt_priority = if matches!(policy, SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin) {
+        linux_rt_priority_from_param(priority)?
+    } else {
+        0
+    };
     let task = sched_task_from_pid(pid, &ctx.task)?;
     let old = task.sched.sched_attr();
     let attr = SchedAttr {
         policy,
         nice: old.nice,
         slice_ns: old.slice_ns,
-        priority: priority as u8,
+        priority: rt_priority,
         runtime_ns: 0,
         deadline_ns: 0,
         period_ns: 0,
@@ -1275,14 +1272,14 @@ pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize,
 
 pub(super) fn sys_sched_get_priority_max(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     match decode_linux_sched_policy(ctx.args[0])? {
-        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(99),
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(sched::RT_PRIO_MAX as usize),
         _ => Ok(0),
     }
 }
 
 pub(super) fn sys_sched_get_priority_min(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     match decode_linux_sched_policy(ctx.args[0])? {
-        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(1),
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(sched::RT_PRIO_MIN as usize),
         _ => Ok(0),
     }
 }
@@ -1414,6 +1411,15 @@ fn sched_task_from_pid(pid: i32, caller: &Arc<Task>) -> Result<Arc<Task>, Errno>
         Ok(Arc::clone(caller))
     } else if pid > 0 {
         sched::operation::task_by_pid(pid)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+/// Linux `sched_param.sched_priority` 转内部 RT 优先级。
+fn linux_rt_priority_from_param(priority: i32) -> Result<u8, Errno> {
+    if (sched::RT_PRIO_MIN as i32..=sched::RT_PRIO_MAX as i32).contains(&priority) {
+        Ok(priority as u8)
     } else {
         Err(Errno::EINVAL)
     }
