@@ -184,9 +184,11 @@ impl RouteTable {
                 && existing.destination == entry.destination
         }) {
             *existing = entry;
+            self.sort_entries();
             return;
         }
         self.entries.push(entry);
+        self.sort_entries();
     }
 
     /// 删除静态路由。
@@ -203,14 +205,18 @@ impl RouteTable {
     pub fn lookup(&self, remote: &IpAddr) -> Option<RouteLookup> {
         self.entries
             .iter()
-            .filter(|entry| cidr_contains(&entry.destination, remote))
-            .max_by(|a, b| route_rank(a).cmp(&route_rank(b)))
+            .find(|entry| cidr_contains(&entry.destination, remote))
             .map(|entry| RouteLookup {
                 iface: entry.iface,
                 next_hop: entry.next_hop,
                 prefix_len: entry.destination.prefix_len,
                 source: entry.source,
             })
+    }
+
+    fn sort_entries(&mut self) {
+        self.entries
+            .sort_by(|a, b| route_rank(b).cmp(&route_rank(a)));
     }
 }
 
@@ -308,6 +314,43 @@ mod tests {
             .unwrap();
         assert_eq!(route.iface, iface(2));
         assert_eq!(route.prefix_len, 16);
+    }
+
+    #[test]
+    fn entries_are_kept_in_lookup_priority_order() {
+        let mut table = RouteTable::new();
+        table.upsert(RouteEntry {
+            destination: CidrAddress::new_v4(Ipv4Addr::UNSPECIFIED, 0),
+            iface: iface(1),
+            next_hop: NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            source: RouteSource::Gateway,
+            metric: 100,
+        });
+        table.upsert(RouteEntry::static_v4(
+            Ipv4Addr::new(10, 1, 0, 0),
+            16,
+            Ipv4Addr::new(10, 1, 0, 1),
+            iface(2),
+        ));
+        table.upsert(RouteEntry::connected(
+            CidrAddress::new_v4(Ipv4Addr::new(10, 1, 2, 0), 24),
+            iface(3),
+        ));
+
+        assert_eq!(table.entries()[0].iface, iface(3));
+        assert_eq!(table.entries()[1].iface, iface(2));
+        assert_eq!(table.entries()[2].iface, iface(1));
+
+        table.upsert(RouteEntry::static_v4(
+            Ipv4Addr::new(10, 1, 0, 0),
+            16,
+            Ipv4Addr::new(10, 1, 0, 254),
+            iface(2),
+        ));
+        assert_eq!(
+            table.entries()[1].next_hop,
+            NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 254)))
+        );
     }
 
     #[test]
