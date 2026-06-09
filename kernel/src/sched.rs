@@ -523,6 +523,11 @@ fn process_setup_signal_frame(
 }
 
 fn write_siginfo(out: &mut [u8], info: SigInfo) {
+    if let Some(raw) = info.raw {
+        let n = out.len().min(raw.len());
+        out[..n].copy_from_slice(&raw[..n]);
+        return;
+    }
     write_i32(out, 0, info.sig.raw() as i32);
     write_i32(out, 4, 0);
     write_i32(out, 8, info.code);

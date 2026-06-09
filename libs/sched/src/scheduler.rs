@@ -596,6 +596,7 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
         code: 128,
         sender_pid: 0,
         sender_uid: Uid::ROOT,
+        raw: None,
     };
     tg.shared_signal().deliver(info);
     for task in tg.snapshot() {

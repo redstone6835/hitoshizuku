@@ -5,13 +5,15 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use errno::Errno;
 use general::firmware::power;
-use general::mm::{VmSpace, copy_from_user, copy_to_user};
+use general::mm::{VmFutexKey, VmSpace, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
+use general::vfs::pidfd;
+use general::vfs::{self, fdtable::Fd};
 use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{Capability, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
-use sched::task::{Task, TaskState};
+use sched::task::{RseqRegistration, Task, TaskState};
 use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatus};
 
 const MAX_CPUSET_BYTES: usize = 1024;
@@ -87,9 +89,14 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 
 pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let regs = hal::user::decode_clone_register_args(ctx.args);
+    let flags = CloneFlags::from_raw(regs.flags);
     let args = CloneArgs {
-        flags: CloneFlags::from_raw(regs.flags),
-        pidfd: 0,
+        flags,
+        pidfd: if flags.has(CloneFlags::CLONE_PIDFD) {
+            regs.parent_tid
+        } else {
+            0
+        },
         stack: regs.stack,
         stack_size: 0,
         parent_tid: regs.parent_tid,
@@ -98,10 +105,16 @@ pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         exit_signal: regs.flags & 0xff,
         set_tid: 0,
         set_tid_size: 0,
+        requested_pid: 0,
         cgroup: 0,
     };
-    let pid = sched::operation::clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
-    Ok(pid as usize)
+    if flags.has(CloneFlags::CLONE_PIDFD) && flags.has(CloneFlags::CLONE_PARENT_SETTID) {
+        return Err(Errno::EINVAL);
+    }
+    let outcome =
+        sched::operation::clone_with_context_outcome(args, UserContextRef::new(ctx.tf.as_usize()))?;
+    install_clone_pidfd(args, Arc::clone(&outcome.child))?;
+    Ok(outcome.pid as usize)
 }
 
 pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -124,7 +137,7 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         let start = idx * 8;
         u64::from_le_bytes(raw[start..start + 8].try_into().unwrap())
     };
-    let args = CloneArgs {
+    let mut args = CloneArgs {
         flags: CloneFlags::from_raw(read_u64(0)),
         pidfd: read_u64(1) as usize,
         child_tid: read_u64(2) as usize,
@@ -135,15 +148,68 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         tls: read_u64(7) as usize,
         set_tid: read_u64(8) as usize,
         set_tid_size: read_u64(9) as usize,
+        requested_pid: 0,
         cgroup: read_u64(10) as usize,
     };
-    if args.pidfd != 0 || args.set_tid != 0 || args.set_tid_size != 0 || args.cgroup != 0 {
-        // TODO(threading): clone3 pidfd/set_tid/cgroup need pidfd file
-        // objects, namespace-aware TID allocation and cgroup membership state.
+    prepare_clone3_set_tid(&mut args, &ctx.task)?;
+    if args.cgroup != 0 {
+        // TODO(threading): cgroup 需要成员状态与迁移事务；当前阶段不把 fd 当作占位接受。
         return Err(Errno::EOPNOTSUPP);
     }
-    let pid = sched::operation::clone_with_context(args, UserContextRef::new(ctx.tf.as_usize()))?;
-    Ok(pid as usize)
+    let outcome =
+        sched::operation::clone_with_context_outcome(args, UserContextRef::new(ctx.tf.as_usize()))?;
+    install_clone_pidfd(args, Arc::clone(&outcome.child))?;
+    Ok(outcome.pid as usize)
+}
+
+fn install_clone_pidfd(args: CloneArgs, child: Arc<Task>) -> Result<(), Errno> {
+    if !args.flags.has(CloneFlags::CLONE_PIDFD) {
+        return Ok(());
+    }
+    let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
+    let cred = vfs::current_vfs_context()
+        .map(|ctx| Arc::clone(&ctx.cred))
+        .ok_or(Errno::ENOSYS)?;
+    let fd = pidfd::create(&fdt, cred, child)?;
+    if let Err(err) = copy_to_user(args.pidfd, &(fd.as_raw() as i32).to_le_bytes()) {
+        let _ = fdt.close_fd(fd);
+        return Err(err.as_errno());
+    }
+    Ok(())
+}
+
+fn prepare_clone3_set_tid(args: &mut CloneArgs, task: &Arc<Task>) -> Result<(), Errno> {
+    if args.set_tid == 0 && args.set_tid_size == 0 {
+        return Ok(());
+    }
+    if args.set_tid == 0 || args.set_tid_size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if args.set_tid_size != 1 {
+        // 多层 namespace 的 set_tid 数组需要完整 PID namespace 栈；当前 PID
+        // 模型只有 root namespace 指定分配，因此只接受单元素数组。
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let creds = task.credentials();
+    if !creds.euid.is_root()
+        && !creds.has_cap(Capability::SysAdmin)
+        && !creds.has_cap(Capability::CheckpointRestore)
+    {
+        return Err(Errno::EPERM);
+    }
+    let mut raw = [0u8; 4];
+    copy_from_user(args.set_tid, &mut raw).map_err(|e| e.as_errno())?;
+    let requested = i32::from_le_bytes(raw);
+    if requested <= 0 || requested >= sched::pid::DEFAULT_PID_MAX {
+        return Err(Errno::EINVAL);
+    }
+    if sched::root_pid_ns().registry().lookup(requested).is_some() {
+        return Err(Errno::EEXIST);
+    }
+    args.requested_pid = requested;
+    args.set_tid = 0;
+    args.set_tid_size = 0;
+    Ok(())
 }
 
 pub(super) fn sys_execve(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -252,7 +318,12 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 WaitId::Pgid(id)
             }
         }
-        P_PIDFD => WaitId::Pidfd(id),
+        P_PIDFD => {
+            let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
+            let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
+            let task = pidfd::task_from_file(&file).ok_or(Errno::EINVAL)?;
+            WaitId::Pidfd(task)
+        }
         _ => return Err(Errno::EINVAL),
     };
     let result = sched::operation::waitid(target, options)?;
@@ -306,10 +377,28 @@ pub(super) fn sys_rt_tgsigqueueinfo(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let tgid = ctx.args[0] as i32;
     let tid = ctx.args[1] as i32;
     let sig = signal_arg(ctx.args[2])?;
-    let _uinfo = ctx.args[3];
-    // TODO(threading): preserve user-provided siginfo payload instead of
-    // degrading this ABI to tgkill-style delivery.
-    sched::operation::tgkill(tgid, tid, sig)?;
+    let uinfo = ctx.args[3];
+    let Some(sig) = sig else {
+        sched::operation::tgkill(tgid, tid, None)?;
+        return Ok(0);
+    };
+    if uinfo == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 128];
+    copy_from_user(uinfo, &mut raw).map_err(|e| e.as_errno())?;
+    let signo = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+    if signo != sig.raw() as i32 {
+        return Err(Errno::EINVAL);
+    }
+    let info = sched::SigInfo {
+        sig,
+        code: i32::from_le_bytes(raw[8..12].try_into().unwrap()),
+        sender_pid: i32::from_le_bytes(raw[12..16].try_into().unwrap()),
+        sender_uid: Uid(u32::from_le_bytes(raw[16..20].try_into().unwrap())),
+        raw: Some(raw),
+    };
+    sched::operation::tgqueueinfo(tgid, tid, info)?;
     Ok(0)
 }
 
@@ -359,22 +448,86 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
     Ok(0)
 }
 
-pub(super) fn sys_rseq(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    // TODO(threading): rseq cannot be safely advertised until context switch,
-    // signal delivery, preemption and future cross-CPU migration paths all abort
-    // active user critical sections. Returning ENOSYS makes libc disable rseq.
-    Err(Errno::ENOSYS)
+pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const RSEQ_MIN_SIZE: usize = 32;
+    const RSEQ_FLAG_UNREGISTER: usize = 1;
+    const RSEQ_CPU_ID_START_OFFSET: usize = 0;
+    const RSEQ_CPU_ID_OFFSET: usize = 4;
+
+    let ptr = ctx.args[0];
+    let len = ctx.args[1];
+    let flags = ctx.args[2];
+    let signature = ctx.args[3] as u32;
+
+    if (flags & !RSEQ_FLAG_UNREGISTER) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if ptr == 0 || len < RSEQ_MIN_SIZE || len > u32::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+
+    let current = ctx.task.rseq_registration();
+    if (flags & RSEQ_FLAG_UNREGISTER) != 0 {
+        if !current.registered {
+            return Err(Errno::EINVAL);
+        }
+        if current.ptr != ptr || current.len as usize != len || current.signature != signature {
+            return Err(Errno::EINVAL);
+        }
+        ctx.task.clear_rseq_registration();
+        return Ok(0);
+    }
+
+    if current.registered {
+        return Err(Errno::EBUSY);
+    }
+
+    // 注册成功前先确认用户区可写，并把当前 CPU 写入 rseq 的两个 CPU 字段。
+    // 当前调度器已维护 per-task current_cpu；后续多核迁移时在切换路径更新该字段。
+    let cpu = sched::current_cpu_id() as u32;
+    write_user_u32(ptr + RSEQ_CPU_ID_START_OFFSET, cpu)?;
+    write_user_u32(ptr + RSEQ_CPU_ID_OFFSET, cpu)?;
+    ctx.task.set_rseq_registration(RseqRegistration {
+        ptr,
+        len: len as u32,
+        signature,
+        registered: true,
+    });
+    Ok(0)
 }
 
 pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const MEMBARRIER_CMD_QUERY: usize = 0;
-    match ctx.args[0] {
-        MEMBARRIER_CMD_QUERY => Ok(0),
-        _ => {
-            // TODO(threading): expedited/global membarrier needs cross-CPU
-            // rendezvous/IPI support after AP startup lands.
-            Err(Errno::EOPNOTSUPP)
+    const MEMBARRIER_CMD_GLOBAL: usize = 1 << 0;
+    const MEMBARRIER_CMD_GLOBAL_EXPEDITED: usize = 1 << 1;
+    const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
+    const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
+    const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
+    const SUPPORTED: usize = MEMBARRIER_CMD_GLOBAL
+        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+
+    let cmd = ctx.args[0];
+    let flags = ctx.args[1];
+    if cmd != MEMBARRIER_CMD_QUERY && flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    match cmd {
+        MEMBARRIER_CMD_QUERY => Ok(SUPPORTED),
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
+            Ok(0)
         }
+        MEMBARRIER_CMD_GLOBAL
+        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+        | MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
+            // 当前内核只启动单 CPU；完整 SMP IPI rendezvous 接入前，SeqCst fence
+            // 已足以满足本 CPU 上的 membarrier 可见性语义。
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
     }
 }
 
@@ -1108,6 +1261,7 @@ pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         new.uid = uid;
         new.euid = uid;
         new.suid = uid;
+        new.fsuid = uid;
         ctx.task.set_credentials(Arc::new(new));
         Ok(0)
     } else {
@@ -1123,6 +1277,7 @@ pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         new.gid = gid;
         new.egid = gid;
         new.sgid = gid;
+        new.fsgid = gid;
         ctx.task.set_credentials(Arc::new(new));
         Ok(0)
     } else {
@@ -1149,7 +1304,9 @@ pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         {
             return Err(Errno::EPERM);
         }
-        new.euid = Uid(euid);
+        let new_euid = Uid(euid);
+        new.euid = new_euid;
+        new.fsuid = new_euid;
     }
     ctx.task.set_credentials(Arc::new(new));
     Ok(0)
@@ -1174,7 +1331,9 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         {
             return Err(Errno::EPERM);
         }
-        new.egid = Gid(egid);
+        let new_egid = Gid(egid);
+        new.egid = new_egid;
+        new.fsgid = new_egid;
     }
     ctx.task.set_credentials(Arc::new(new));
     Ok(0)
@@ -1201,7 +1360,9 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.uid = Uid(ruid);
     }
     if euid != u32::MAX {
-        new.euid = Uid(euid);
+        let new_euid = Uid(euid);
+        new.euid = new_euid;
+        new.fsuid = new_euid;
     }
     if suid != u32::MAX {
         new.suid = Uid(suid);
@@ -1231,7 +1392,9 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         new.gid = Gid(rgid);
     }
     if egid != u32::MAX {
-        new.egid = Gid(egid);
+        let new_egid = Gid(egid);
+        new.egid = new_egid;
+        new.fsgid = new_egid;
     }
     if sgid != u32::MAX {
         new.sgid = Gid(sgid);
@@ -1240,16 +1403,38 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(0)
 }
 
-/// FIXME: setfsuid/setfsgid 目前为安全空操作，始终返回当前 uid/gid，
-/// 不修改任何凭据字段。POSIX 要求 fsuid/fsgid 是独立于 uid/gid 的字段，
-/// 用于文件系统权限检查；正确实现需在 Credentials 中新增 fsuid/fsgid
-/// 字段并修改 VFS 权限检查逻辑。
 pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(ctx.task.credentials().uid.0 as usize)
+    let uid = Uid(ctx.args[0] as u32);
+    let creds = ctx.task.credentials();
+    let old = creds.fsuid;
+    if creds.has_cap(Capability::Setuid)
+        || uid == creds.uid
+        || uid == creds.euid
+        || uid == creds.suid
+        || uid == creds.fsuid
+    {
+        let mut new = (*creds).clone();
+        new.fsuid = uid;
+        ctx.task.set_credentials(Arc::new(new));
+    }
+    Ok(old.0 as usize)
 }
 
 pub(super) fn sys_setfsgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(ctx.task.credentials().gid.0 as usize)
+    let gid = Gid(ctx.args[0] as u32);
+    let creds = ctx.task.credentials();
+    let old = creds.fsgid;
+    if creds.has_cap(Capability::Setgid)
+        || gid == creds.gid
+        || gid == creds.egid
+        || gid == creds.sgid
+        || gid == creds.fsgid
+    {
+        let mut new = (*creds).clone();
+        new.fsgid = gid;
+        ctx.task.set_credentials(Arc::new(new));
+    }
+    Ok(old.0 as usize)
 }
 
 pub(super) fn sys_getgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1296,22 +1481,25 @@ const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
 const FUTEX_REQUEUE: u32 = 3;
 const FUTEX_CMP_REQUEUE: u32 = 4;
+const FUTEX_WAKE_OP: u32 = 5;
+const FUTEX_LOCK_PI: u32 = 6;
+const FUTEX_UNLOCK_PI: u32 = 7;
+const FUTEX_TRYLOCK_PI: u32 = 8;
 const FUTEX_WAIT_BITSET: u32 = 9;
 const FUTEX_WAKE_BITSET: u32 = 10;
+const FUTEX_WAIT_REQUEUE_PI: u32 = 11;
+const FUTEX_CMP_REQUEUE_PI: u32 = 12;
+const FUTEX_LOCK_PI2: u32 = 13;
 const FUTEX_PRIVATE_FLAG: u32 = 128;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
+const FUTEX_WAITERS: u32 = 0x8000_0000;
 const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
 const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 const ROBUST_LIST_HEAD_SIZE: usize = 24;
 const ROBUST_LIST_LIMIT: usize = 2048;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct FutexKey {
-    owner: usize,
-    uaddr: usize,
-    shared: bool,
-}
+type FutexKey = VmFutexKey;
 
 struct FutexWaiter {
     task: Arc<sched::Task>,
@@ -1323,34 +1511,21 @@ struct FutexBucket {
 }
 
 static FUTEX_TABLE: Spinlock<BTreeMap<FutexKey, FutexBucket>> = Spinlock::new(BTreeMap::new());
+static FUTEX_USER_OP_LOCK: Spinlock<()> = Spinlock::new(());
 
 fn futex_cmd(futex_op: u32) -> u32 {
     futex_op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME)
 }
 
-fn task_vm_identity(task: &Arc<Task>) -> Option<usize> {
-    let payload = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
-    let vm = payload.downcast::<VmSpace>().ok()?;
-    Some(Arc::as_ptr(&vm) as usize)
+fn task_vm_space_for_futex(task: &Arc<Task>) -> Result<Arc<VmSpace>, Errno> {
+    let payload = task
+        .ext_lookup(sched::TASKEXT_VM_SPACE)
+        .ok_or(Errno::EFAULT)?;
+    payload.downcast::<VmSpace>().map_err(|_| Errno::EFAULT)
 }
 
-fn futex_key(task: &Arc<Task>, uaddr: usize, private: bool) -> FutexKey {
-    if private {
-        FutexKey {
-            owner: task_vm_identity(task).unwrap_or_else(|| Arc::as_ptr(task) as usize),
-            uaddr,
-            shared: false,
-        }
-    } else {
-        // TODO(threading): shared futex keys should be based on the mapped file
-        // object or physical page, not the numeric user VA. This placeholder
-        // keeps the ABI visible while private pthread futexes use precise keys.
-        FutexKey {
-            owner: 0,
-            uaddr,
-            shared: true,
-        }
-    }
+fn futex_key(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<FutexKey, Errno> {
+    task_vm_space_for_futex(task)?.futex_key_for(uaddr, private)
 }
 
 fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
@@ -1451,8 +1626,157 @@ fn futex_requeue_key(
     wake_futex_waiters(wake) + requeue
 }
 
+fn futex_wake_op(
+    task: &Arc<Task>,
+    uaddr: usize,
+    uaddr2: usize,
+    private: bool,
+    wake_count: usize,
+    wake_count2: usize,
+    encoded: u32,
+) -> Result<usize, Errno> {
+    let key1 = futex_key(task, uaddr, private)?;
+    let key2 = futex_key(task, uaddr2, private)?;
+    let old = {
+        let _guard = FUTEX_USER_OP_LOCK.lock();
+        let old = read_user_u32(uaddr2)?;
+        let new = futex_apply_wake_op(old, encoded)?;
+        write_user_u32(uaddr2, new)?;
+        old
+    };
+    let mut woken = futex_wake_key(key1, wake_count, FUTEX_BITSET_MATCH_ANY);
+    if futex_wake_op_cmp(old, encoded)? {
+        woken += futex_wake_key(key2, wake_count2, FUTEX_BITSET_MATCH_ANY);
+    }
+    Ok(woken)
+}
+
+fn futex_apply_wake_op(old: u32, encoded: u32) -> Result<u32, Errno> {
+    const FUTEX_OP_SET: u32 = 0;
+    const FUTEX_OP_ADD: u32 = 1;
+    const FUTEX_OP_OR: u32 = 2;
+    const FUTEX_OP_ANDN: u32 = 3;
+    const FUTEX_OP_XOR: u32 = 4;
+    const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+
+    let mut op = (encoded >> 28) & 0xf;
+    let mut arg = (encoded >> 12) & 0xfff;
+    if (op & FUTEX_OP_OPARG_SHIFT) != 0 {
+        op &= !FUTEX_OP_OPARG_SHIFT;
+        if arg >= 32 {
+            return Err(Errno::EINVAL);
+        }
+        arg = 1u32 << arg;
+    }
+    match op {
+        FUTEX_OP_SET => Ok(arg),
+        FUTEX_OP_ADD => Ok(old.wrapping_add(arg)),
+        FUTEX_OP_OR => Ok(old | arg),
+        FUTEX_OP_ANDN => Ok(old & !arg),
+        FUTEX_OP_XOR => Ok(old ^ arg),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn futex_wake_op_cmp(old: u32, encoded: u32) -> Result<bool, Errno> {
+    let cmp = (encoded >> 24) & 0xf;
+    let rhs = sign_extend_12(encoded & 0xfff);
+    let lhs = old as i32;
+    match cmp {
+        0 => Ok(lhs == rhs),
+        1 => Ok(lhs != rhs),
+        2 => Ok(lhs < rhs),
+        3 => Ok(lhs <= rhs),
+        4 => Ok(lhs > rhs),
+        5 => Ok(lhs >= rhs),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn sign_extend_12(value: u32) -> i32 {
+    ((value << 20) as i32) >> 20
+}
+
+fn futex_lock_pi(
+    task: &Arc<Task>,
+    uaddr: usize,
+    private: bool,
+    try_only: bool,
+    deadline_ns: Option<u64>,
+) -> Result<usize, Errno> {
+    let tid = task.pid_root().unwrap_or(0) as u32;
+    if tid == 0 {
+        return Err(Errno::ESRCH);
+    }
+    let key = futex_key(task, uaddr, private)?;
+    loop {
+        let expected = {
+            let _guard = FUTEX_USER_OP_LOCK.lock();
+            let cur = read_user_u32(uaddr)?;
+            let owner = cur & FUTEX_TID_MASK;
+            if owner == 0 {
+                let new = (cur & FUTEX_OWNER_DIED) | tid;
+                write_user_u32(uaddr, new)?;
+                return Ok(0);
+            }
+            if owner == tid {
+                return Err(Errno::EDEADLK);
+            }
+            if try_only {
+                return Err(Errno::EAGAIN);
+            }
+            let waiting = cur | FUTEX_WAITERS;
+            if waiting != cur {
+                write_user_u32(uaddr, waiting)?;
+            }
+            waiting
+        };
+        match futex_wait(
+            task,
+            key,
+            uaddr,
+            expected,
+            FUTEX_BITSET_MATCH_ANY,
+            deadline_ns,
+        ) {
+            Ok(_) | Err(Errno::EAGAIN) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn futex_unlock_pi(task: &Arc<Task>, uaddr: usize, private: bool) -> Result<usize, Errno> {
+    let tid = task.pid_root().unwrap_or(0) as u32;
+    if tid == 0 {
+        return Err(Errno::ESRCH);
+    }
+    let key = futex_key(task, uaddr, private)?;
+    let had_waiters = {
+        let _guard = FUTEX_USER_OP_LOCK.lock();
+        let cur = read_user_u32(uaddr)?;
+        if (cur & FUTEX_TID_MASK) != tid {
+            return Err(Errno::EPERM);
+        }
+        let had_waiters = (cur & FUTEX_WAITERS) != 0;
+        write_user_u32(uaddr, 0)?;
+        had_waiters
+    };
+    Ok(if had_waiters {
+        futex_wake_key(key, 1, FUTEX_BITSET_MATCH_ANY)
+    } else {
+        0
+    })
+}
+
 fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
-    futex_wake_key(futex_key(task, uaddr, true), count, FUTEX_BITSET_MATCH_ANY)
+    let mut woken = 0usize;
+    if let Ok(key) = futex_key(task, uaddr, true) {
+        woken += futex_wake_key(key, count, FUTEX_BITSET_MATCH_ANY);
+    }
+    if let Ok(key) = futex_key(task, uaddr, false) {
+        woken += futex_wake_key(key, count.saturating_sub(woken), FUTEX_BITSET_MATCH_ANY);
+    }
+    woken
 }
 
 fn clear_child_tid_and_wake(task: &Arc<Task>) {
@@ -1483,7 +1807,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     match cmd {
         FUTEX_WAIT => futex_wait(
             &ctx.task,
-            futex_key(&ctx.task, uaddr, private),
+            futex_key(&ctx.task, uaddr, private)?,
             uaddr,
             val,
             FUTEX_BITSET_MATCH_ANY,
@@ -1495,7 +1819,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             futex_wait(
                 &ctx.task,
-                futex_key(&ctx.task, uaddr, private),
+                futex_key(&ctx.task, uaddr, private)?,
                 uaddr,
                 val,
                 val3,
@@ -1503,7 +1827,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             )
         }
         FUTEX_WAKE => Ok(futex_wake_key(
-            futex_key(&ctx.task, uaddr, private),
+            futex_key(&ctx.task, uaddr, private)?,
             val as usize,
             FUTEX_BITSET_MATCH_ANY,
         )),
@@ -1512,7 +1836,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EINVAL);
             }
             Ok(futex_wake_key(
-                futex_key(&ctx.task, uaddr, private),
+                futex_key(&ctx.task, uaddr, private)?,
                 val as usize,
                 val3,
             ))
@@ -1525,16 +1849,37 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EAGAIN);
             }
             Ok(futex_requeue_key(
-                futex_key(&ctx.task, uaddr, private),
-                futex_key(&ctx.task, uaddr2, private),
+                futex_key(&ctx.task, uaddr, private)?,
+                futex_key(&ctx.task, uaddr2, private)?,
                 val as usize,
                 timeout,
                 FUTEX_BITSET_MATCH_ANY,
             ))
         }
+        FUTEX_WAKE_OP => {
+            if uaddr2 == 0 || uaddr2 % 4 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            futex_wake_op(
+                &ctx.task,
+                uaddr,
+                uaddr2,
+                private,
+                val as usize,
+                timeout,
+                val3,
+            )
+        }
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => futex_lock_pi(&ctx.task, uaddr, private, false, None),
+        FUTEX_TRYLOCK_PI => futex_lock_pi(&ctx.task, uaddr, private, true, None),
+        FUTEX_UNLOCK_PI => futex_unlock_pi(&ctx.task, uaddr, private),
+        FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI => {
+            // TODO(threading): requeue_pi 需要把普通等待者原子迁移到 PI owner
+            // 队列，并在迁移期间维护 owner 继承关系；不能退化成普通 requeue。
+            Err(Errno::EOPNOTSUPP)
+        }
         _ => {
-            // TODO(threading): PI futexes, FUTEX_WAKE_OP and requeue_pi need
-            // priority inheritance state attached to scheduler wait queues.
+            // TODO(threading): 其它 futex 操作需要扩展独立的等待队列状态。
             Err(Errno::EOPNOTSUPP)
         }
     }
@@ -1704,18 +2049,28 @@ fn exit_robust_list(task: &Arc<Task>) {
     let pending = read_user_usize(robust.head + 16).unwrap_or(0);
     let mut next = read_user_usize(robust.head).unwrap_or(0);
     let mut walked = 0usize;
+    let mut visited = Vec::new();
     while next != 0 && next != robust.head && walked < ROBUST_LIST_LIMIT {
+        if visited.contains(&next) {
+            log::warning!(
+                "[syscall][robust] pid={:?} robust list cycle at {:#x}",
+                task.pid_root(),
+                next,
+            );
+            break;
+        }
+        visited.push(next);
         handle_robust_node(task, next, futex_offset, tid);
         next = read_user_usize(next).unwrap_or(0);
         walked += 1;
     }
     if walked == ROBUST_LIST_LIMIT {
         log::warning!(
-            "[syscall][robust] pid={:?} robust list walk hit limit; TODO fault-safe cycle detection",
+            "[syscall][robust] pid={:?} robust list walk hit limit",
             task.pid_root(),
         );
     }
-    if pending != 0 {
+    if pending != 0 && !visited.contains(&pending) {
         handle_robust_node(task, pending, futex_offset, tid);
     }
     task.set_robust_list(0, 0);

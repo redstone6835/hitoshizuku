@@ -214,14 +214,34 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     }
 
     // 9. 分配 pid（根 ns 一次；多 ns 留待后续）。
-    let Some(pid) = root_ns.registry().allocate(&child) else {
-        log::warning!(
-            "[sched][clone] pid allocation failed parent_pid={:?} flags={:#x}",
-            real_parent.pid_root(),
-            flags.raw(),
-        );
-        abort_new_task(&child);
-        return child;
+    let pid = if args.requested_pid > 0 {
+        match root_ns
+            .registry()
+            .allocate_specific(&child, args.requested_pid)
+        {
+            Ok(pid) => pid,
+            Err(err) => {
+                log::warning!(
+                    "[sched][clone] requested pid allocation failed parent_pid={:?} requested_pid={} err={:?}",
+                    real_parent.pid_root(),
+                    args.requested_pid,
+                    err,
+                );
+                abort_new_task(&child);
+                return child;
+            }
+        }
+    } else {
+        let Some(pid) = root_ns.registry().allocate(&child) else {
+            log::warning!(
+                "[sched][clone] pid allocation failed parent_pid={:?} flags={:#x}",
+                real_parent.pid_root(),
+                flags.raw(),
+            );
+            abort_new_task(&child);
+            return child;
+        };
+        pid
     };
     child.register_pid(Arc::clone(&root_ns), pid);
     if !flags.has(CloneFlags::CLONE_THREAD) {
@@ -279,6 +299,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                             code: 1, // CLD_EXITED
                             sender_pid: c.pid_root().unwrap_or(0),
                             sender_uid: crate::ids::Uid::ROOT,
+                            raw: None,
                         };
                         init.thread_group().shared_signal().deliver(info);
                         crate::scheduler::signal_wakeup(&init, &info);
@@ -319,6 +340,7 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                     code: 1, // CLD_EXITED
                     sender_pid: task.pid_root().unwrap_or(0),
                     sender_uid: crate::ids::Uid::ROOT,
+                    raw: None,
                 };
                 // 共享投递（thread-group level）：parent 任意线程能收到。
                 parent.thread_group().shared_signal().deliver(info);

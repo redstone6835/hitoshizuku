@@ -375,6 +375,7 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let me = current_task();
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
+    me.clear_rseq_registration();
     me.shared_signal().reset_handlers_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);
@@ -421,6 +422,20 @@ pub fn clone(args: CloneArgs) -> Result<PidT, Errno> {
 }
 
 pub fn clone_with_context(args: CloneArgs, user_ctx: UserContextRef) -> Result<PidT, Errno> {
+    Ok(clone_with_context_outcome(args, user_ctx)?.pid)
+}
+
+/// clone 的完整返回值。syscall 兼容层需要 child 句柄创建 pidfd；调度器核心
+/// 仍然只暴露任务对象，不直接理解 fdtable 或用户态 ABI。
+pub struct CloneOutcome {
+    pub pid: PidT,
+    pub child: Arc<Task>,
+}
+
+pub fn clone_with_context_outcome(
+    args: CloneArgs,
+    user_ctx: UserContextRef,
+) -> Result<CloneOutcome, Errno> {
     validate_clone_args(args)?;
     let parent = current_task();
     let params = SchedParams::default_fair();
@@ -462,7 +477,7 @@ pub fn clone_with_context(args: CloneArgs, user_ctx: UserContextRef) -> Result<P
         request_post_syscall_handoff();
     }
 
-    Ok(pid)
+    Ok(CloneOutcome { pid, child })
 }
 
 fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
@@ -492,28 +507,35 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWPID
         | CloneFlags::CLONE_NEWNET
         | CloneFlags::CLONE_IO;
-    const UNSUPPORTED: u64 = CloneFlags::CLONE_PIDFD
-        | CloneFlags::CLONE_PTRACE
+    const UNSUPPORTED: u64 = CloneFlags::CLONE_PTRACE
         | CloneFlags::CLONE_NEWNS
         | CloneFlags::CLONE_NEWCGROUP
         | CloneFlags::CLONE_NEWUTS
         | CloneFlags::CLONE_NEWIPC
         | CloneFlags::CLONE_NEWUSER
         | CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWNET
-        | CloneFlags::CLONE_IO;
-    if (flags.raw() & !KNOWN) != 0
-        || (flags.raw() & UNSUPPORTED) != 0
-        || args.pidfd != 0
-        || args.set_tid != 0
-        || args.set_tid_size != 0
-        || args.cgroup != 0
-    {
-        // TODO(threading): pidfd, namespace/cgroup flags and CLONE_IO need
-        // backing kernel objects before clone can expose them safely.
+        | CloneFlags::CLONE_NEWNET;
+    if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
+        return Err(Errno::EINVAL);
+    }
+    if (flags.raw() & !KNOWN) != 0 || (flags.raw() & UNSUPPORTED) != 0 || args.cgroup != 0 {
+        // TODO(threading): namespace/cgroup flags need namespace and cgroup objects before
+        // clone can expose them safely.
         return Err(Errno::EOPNOTSUPP);
     }
+    if args.set_tid != 0 || args.set_tid_size != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if args.pidfd != 0 && !flags.has(CloneFlags::CLONE_PIDFD) {
+        return Err(Errno::EINVAL);
+    }
+    if flags.has(CloneFlags::CLONE_PIDFD) && args.pidfd == 0 {
+        return Err(Errno::EINVAL);
+    }
     if args.exit_signal > 64 {
+        return Err(Errno::EINVAL);
+    }
+    if flags.has(CloneFlags::CLONE_THREAD) && args.exit_signal_raw() != 0 {
         return Err(Errno::EINVAL);
     }
     if args.stack == 0 && args.stack_size != 0 {
@@ -532,18 +554,18 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
 
 // ── wait4 / waitid ───────────────────────────────────────────────────────────
 
-fn matches_waitid(child: &Arc<Task>, target: WaitId, parent: &Arc<Task>) -> bool {
+fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> bool {
     match target {
         WaitId::All => true,
-        WaitId::Pid(pid) => child.pid_root() == Some(pid),
+        WaitId::Pid(pid) => child.pid_root() == Some(*pid),
         WaitId::Pgid(pgid) => child
             .process_group()
             .snapshot()
             .iter()
             .find_map(|m| m.thread_group().leader().and_then(|l| l.pid_root()))
-            .map_or(false, |p| p == pgid),
+            .map_or(false, |p| p == *pgid),
         WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &parent.process_group()),
-        WaitId::Pidfd(_) => false, // pidfd 对象层尚未接入，syscall 层返回不匹配。
+        WaitId::Pidfd(task) => Arc::ptr_eq(child, task),
     }
 }
 
@@ -558,7 +580,7 @@ fn wait_child_observable(
     let mut any_match = false;
     for child in children
         .iter()
-        .filter(|c| matches_waitid(c, target, parent))
+        .filter(|c| matches_waitid(c, &target, parent))
     {
         any_match = true;
         if wait_exited && child.state() == TaskState::Zombie {
@@ -611,7 +633,7 @@ fn wait_common(
     loop {
         // 1. 先看是否有退出事件匹配。
         //    waitid 必须由调用方显式传 WEXITED/WSTOPPED/WCONTINUED。
-        let pred = |c: &Arc<Task>| matches_waitid(c, target, &me);
+        let pred = |c: &Arc<Task>| matches_waitid(c, &target, &me);
         if wait_exited {
             if nowait {
                 if let Some(child) = me
@@ -638,7 +660,7 @@ fn wait_common(
         // 2. stopped / continued 是父侧可消费的状态变化事件，不会 reap child。
         let children = me.snapshot_children();
         if wait_stopped {
-            for child in children.iter().filter(|c| matches_waitid(c, target, &me)) {
+            for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
                 if let Some(status) = child.wait_stopped_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
@@ -648,7 +670,7 @@ fn wait_common(
             }
         }
         if wait_continued {
-            for child in children.iter().filter(|c| matches_waitid(c, target, &me)) {
+            for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
                 if let Some(status) = child.wait_continued_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
@@ -659,7 +681,7 @@ fn wait_common(
         }
 
         // 3. 是否还有匹配的子？没有任何匹配子 → ECHILD。
-        let any_match = children.iter().any(|c| matches_waitid(c, target, &me));
+        let any_match = children.iter().any(|c| matches_waitid(c, &target, &me));
         if !any_match {
             return Err(Errno::ECHILD);
         }
@@ -674,7 +696,13 @@ fn wait_common(
 
         // 5. 阻塞：按 wait_event 协议挂到 me.exit_waiters，让出 CPU，被唤醒后重试。
         me.exit_waiters.wait_event(&me, || {
-            wait_child_observable(&me, target, wait_exited, wait_stopped, wait_continued)
+            wait_child_observable(
+                &me,
+                target.clone(),
+                wait_exited,
+                wait_stopped,
+                wait_continued,
+            )
         });
         // 唤醒后重新轮询。
     }
@@ -705,6 +733,7 @@ fn make_siginfo(sig: SignalNumber) -> SigInfo {
         code: 0,
         sender_pid: me.pid_root().unwrap_or(0),
         sender_uid: me.credentials().uid,
+        raw: None,
     }
 }
 
@@ -811,6 +840,23 @@ pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Er
     check_kill_permission(&target)?;
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo(sig);
+    target.signal.deliver(info);
+    signal_wakeup(&target, &info);
+    Ok(())
+}
+
+/// `rt_tgsigqueueinfo` 的调度层入口：调用方已经保留完整用户态 siginfo。
+pub fn tgqueueinfo(tgid: PidT, tid: PidT, info: SigInfo) -> Result<(), Errno> {
+    let target = lookup_pid(tid)?;
+    let actual_tgid = target
+        .thread_group()
+        .leader()
+        .and_then(|l| l.pid_root())
+        .unwrap_or(0);
+    if actual_tgid != tgid {
+        return Err(Errno::ESRCH);
+    }
+    check_kill_permission(&target)?;
     target.signal.deliver(info);
     signal_wakeup(&target, &info);
     Ok(())
@@ -1116,6 +1162,7 @@ pub fn deliver_pending_signals_with_context(user_ctx: UserContextRef) -> Option<
                         code: 0,
                         sender_pid: 0,
                         sender_uid: crate::ids::Uid::ROOT,
+                        raw: None,
                     });
                     None
                 }
@@ -1410,6 +1457,7 @@ pub mod smoketest {
             exit_signal: 0,
             set_tid: 0,
             set_tid_size: 0,
+            requested_pid: 0,
             cgroup: 0,
         };
         let shared_child = clone_task(&init, shared_args, SchedParams::default_fair());

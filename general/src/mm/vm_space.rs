@@ -60,6 +60,33 @@ struct SharedAnonPageKey {
     offset: u64,
 }
 
+/// futex 等用户态同步原语使用的稳定地址 key。
+///
+/// 私有 futex 绑定到当前地址空间；共享 futex 绑定到底层 shared backing，
+/// 这样同一文件页或同一 shared-anon 页在不同进程中的不同 VA 也能互相唤醒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VmFutexKey {
+    Private {
+        vm: usize,
+        page: usize,
+        offset: u16,
+    },
+    SharedFile {
+        file_key: usize,
+        offset: u64,
+        word_offset: u16,
+    },
+    SharedAnon {
+        id: usize,
+        offset: u64,
+        word_offset: u16,
+    },
+    Direct {
+        paddr: usize,
+        word_offset: u16,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageAccess {
     ReadOnly,
@@ -364,6 +391,62 @@ impl VmSpace {
             }
         }
         None
+    }
+
+    /// 根据用户地址生成 futex key。
+    ///
+    /// `private` 对应 `FUTEX_PRIVATE_FLAG`。未带 private flag 时，也只有真正
+    /// `MAP_SHARED`/direct shared backing 才生成跨地址空间 key；普通 private
+    /// VMA 仍按本地址空间隔离，避免不同进程相同 VA 错误互唤醒。
+    pub fn futex_key_for(&self, uaddr: usize, private: bool) -> Result<VmFutexKey, Errno> {
+        if uaddr % 4 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let page = page_base(uaddr);
+        let word_offset = u16::try_from(uaddr - page).map_err(|_| Errno::EINVAL)?;
+        if private {
+            return Ok(VmFutexKey::Private {
+                vm: self as *const Self as usize,
+                page,
+                offset: word_offset,
+            });
+        }
+
+        let set = self.vmas.lock();
+        let area = set.find(uaddr).ok_or(Errno::EFAULT)?;
+        if !area.flags.has(VmFlags::SHARED) && !matches!(area.backing, VmBacking::Direct(_)) {
+            return Ok(VmFutexKey::Private {
+                vm: self as *const Self as usize,
+                page,
+                offset: word_offset,
+            });
+        }
+        let page_delta = page.checked_sub(area.range.start).ok_or(Errno::EFAULT)?;
+        match &area.backing {
+            VmBacking::File { file, offset } => Ok(VmFutexKey::SharedFile {
+                file_key: file.cache_key(),
+                offset: offset
+                    .checked_add(u64::try_from(page_delta).map_err(|_| Errno::EINVAL)?)
+                    .ok_or(Errno::EINVAL)?,
+                word_offset,
+            }),
+            VmBacking::SharedAnon { id, offset } => Ok(VmFutexKey::SharedAnon {
+                id: *id,
+                offset: offset
+                    .checked_add(u64::try_from(page_delta).map_err(|_| Errno::EINVAL)?)
+                    .ok_or(Errno::EINVAL)?,
+                word_offset,
+            }),
+            VmBacking::Direct(base) => Ok(VmFutexKey::Direct {
+                paddr: base.checked_add(page_delta).ok_or(Errno::EINVAL)?,
+                word_offset,
+            }),
+            VmBacking::Anon => Ok(VmFutexKey::Private {
+                vm: self as *const Self as usize,
+                page,
+                offset: word_offset,
+            }),
+        }
     }
 
     /// 注册一段匿名 VMA。不立即分配物理页。

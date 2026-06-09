@@ -200,9 +200,11 @@ fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
         uid: VfsUid(src.uid.0),
         euid: VfsUid(src.euid.0),
         suid: VfsUid(src.suid.0),
+        fsuid: VfsUid(src.fsuid.0),
         gid: VfsGid(src.gid.0),
         egid: VfsGid(src.egid.0),
         sgid: VfsGid(src.sgid.0),
+        fsgid: VfsGid(src.fsgid.0),
         groups: src
             .groups
             .iter()

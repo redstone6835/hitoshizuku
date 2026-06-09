@@ -182,12 +182,16 @@ pub struct Credentials {
     pub euid: Uid,
     /// 保存的 set-user-ID（saved UID）：供 `seteuid` 临时放弃再恢复特权使用。
     pub suid: Uid,
+    /// 文件系统 UID：VFS DAC 和所有者判断使用它，而不是 effective UID。
+    pub fsuid: Uid,
     /// 真实组 ID。
     pub gid: Gid,
     /// 有效组 ID：用于文件所属组的权限检查。
     pub egid: Gid,
     /// 保存的 set-group-ID。
     pub sgid: Gid,
+    /// 文件系统 GID：VFS DAC 的 group 档位判断使用它，而不是 effective GID。
+    pub fsgid: Gid,
     /// 附加组列表（supplementary groups）。
     pub groups: Vec<Gid>,
     /// 进程当前的有效能力位集。
@@ -215,9 +219,11 @@ impl Credentials {
             uid,
             euid: uid,
             suid: uid,
+            fsuid: uid,
             gid,
             egid: gid,
             sgid: gid,
+            fsgid: gid,
             groups: Vec::new(),
             caps: CapSet::EMPTY,
         }
@@ -240,9 +246,11 @@ impl Credentials {
             uid: Uid(0),
             euid: Uid(0),
             suid: Uid(0),
+            fsuid: Uid(0),
             gid: Gid(0),
             egid: Gid(0),
             sgid: Gid(0),
+            fsgid: Gid(0),
             groups: Vec::new(),
             caps: CapSet::FULL,
         }
@@ -298,10 +306,10 @@ impl Credentials {
             PermissionKind::Exec { .. } => (FileMode::IXUSR, FileMode::IXGRP, FileMode::IXOTH),
         };
 
-        if self.euid == file_uid {
+        if self.fsuid == file_uid {
             return mode.has(owner_bit);
         }
-        if self.egid == file_gid || self.groups.contains(&file_gid) {
+        if self.fsgid == file_gid || self.groups.contains(&file_gid) {
             return mode.has(group_bit);
         }
         mode.has(other_bit)
@@ -337,8 +345,8 @@ impl Credentials {
 
     /// 判断凭据是否为文件所有者（用于 `chown`/`chmod` 等元数据修改操作）。
     ///
-    /// 规则：`euid == file_uid` 或持有 `Capability::FOwner`。
+    /// 规则：`fsuid == file_uid` 或持有 `Capability::FOwner`。
     pub fn is_owner(&self, file_uid: Uid) -> bool {
-        self.euid == file_uid || self.has_cap(Capability::FOwner)
+        self.fsuid == file_uid || self.has_cap(Capability::FOwner)
     }
 }

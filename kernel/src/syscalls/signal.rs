@@ -218,6 +218,9 @@ fn write_sigaction(user: usize, action: SigAction) -> Result<(), Errno> {
 }
 
 fn write_siginfo(user: usize, info: &sched::SigInfo) -> Result<(), Errno> {
+    if let Some(raw) = info.raw {
+        return copy_to_user(user, &raw).map_err(|e| e.as_errno());
+    }
     let mut raw = [0u8; 128];
     put_i32(&mut raw, 0, info.sig.raw() as i32);
     put_i32(&mut raw, 8, info.code);

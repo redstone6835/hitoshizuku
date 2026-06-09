@@ -70,9 +70,11 @@ pub enum Capability {
     Setgid = 6,
     Setuid = 7,
     Setpcap = 8,
+    SysAdmin = 21,
     SysBoot = 22,
     SysNice = 23,
     SysResource = 24,
+    CheckpointRestore = 40,
 }
 
 /// 进程凭据快照。写时复制——每次 setuid/setgid/capset 替换整个 `Arc<Credentials>`。
@@ -81,9 +83,13 @@ pub struct Credentials {
     pub uid: Uid,
     pub euid: Uid,
     pub suid: Uid,
+    /// 文件系统权限检查使用的 UID。它只影响 VFS DAC，不参与信号权限。
+    pub fsuid: Uid,
     pub gid: Gid,
     pub egid: Gid,
     pub sgid: Gid,
+    /// 文件系统权限检查使用的 GID。它只影响 VFS DAC，不参与信号权限。
+    pub fsgid: Gid,
     pub groups: Vec<Gid>,
     pub caps: CapSet,
 }
@@ -95,9 +101,11 @@ impl Credentials {
             uid: Uid::ROOT,
             euid: Uid::ROOT,
             suid: Uid::ROOT,
+            fsuid: Uid::ROOT,
             gid: Gid::ROOT,
             egid: Gid::ROOT,
             sgid: Gid::ROOT,
+            fsgid: Gid::ROOT,
             groups: Vec::new(),
             caps: CapSet::FULL,
         }
@@ -109,9 +117,11 @@ impl Credentials {
             uid,
             euid: uid,
             suid: uid,
+            fsuid: uid,
             gid,
             egid: gid,
             sgid: gid,
+            fsgid: gid,
             groups: Vec::new(),
             caps: CapSet::EMPTY,
         }
