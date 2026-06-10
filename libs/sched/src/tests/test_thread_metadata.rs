@@ -67,6 +67,8 @@ fn supported_cpu_mask_matches_configured_capacity() {
     let task = make_task();
     task.set_cpu_affinity(0);
     assert_eq!(task.cpu_affinity(), 1);
+    task.set_cpu_affinity(u64::MAX);
+    assert_eq!(task.cpu_affinity(), supported_cpu_mask());
 }
 
 #[ktest]
