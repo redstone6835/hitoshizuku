@@ -7,6 +7,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -186,15 +187,27 @@ impl InodeOps for DirInodeOps {
         if name.is_empty() || name == "." || name == ".." {
             return Err(VfsError::InvalidArgument);
         }
-        let (existing, used) =
-            dir::find_entry_and_sfns(&self.state, self.backing, name).map_err(backend_to_vfs)?;
+        let mut dir_scratch = Vec::new();
+        let (existing, used) = dir::find_entry_and_sfns_with_scratch(
+            &self.state,
+            self.backing,
+            name,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         if existing.is_some() {
             return Err(VfsError::AlreadyExists);
         }
         let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
         let entry = dir::build_sfn_entry(sfn, ATTR_ARCHIVE, 0, 0);
-        let sfn_slot = dir::insert_new_entry(&self.state, self.backing, &lfn_entries, &entry)
-            .map_err(backend_to_vfs)?;
+        let sfn_slot = dir::insert_new_entry_with_scratch(
+            &self.state,
+            self.backing,
+            &lfn_entries,
+            &entry,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
 
         let view = DirEntryView {
             name: name.into(),
@@ -222,8 +235,14 @@ impl InodeOps for DirInodeOps {
         if name.is_empty() || name == "." || name == ".." {
             return Err(VfsError::InvalidArgument);
         }
-        let (existing, used) =
-            dir::find_entry_and_sfns(&self.state, self.backing, name).map_err(backend_to_vfs)?;
+        let mut dir_scratch = Vec::new();
+        let (existing, used) = dir::find_entry_and_sfns_with_scratch(
+            &self.state,
+            self.backing,
+            name,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         if existing.is_some() {
             return Err(VfsError::AlreadyExists);
         }
@@ -247,24 +266,31 @@ impl InodeOps for DirInodeOps {
             };
             let dot_entry = dir::build_sfn_entry(dot_sfn, ATTR_DIRECTORY, new_c, 0);
             let dotdot_entry = dir::build_sfn_entry(dotdot_sfn, ATTR_DIRECTORY, parent_first, 0);
-            let mut cluster_buf = alloc::vec![0u8; self.state.cluster_size as usize];
             // 新分配目录簇本应全零；直接在零缓冲中放入 `.`/`..`,避免两次读改写。
-            cluster_buf[..dir::DIR_ENTRY_SIZE].copy_from_slice(&dot_entry);
-            cluster_buf[dir::DIR_ENTRY_SIZE..dir::DIR_ENTRY_SIZE * 2]
+            dir_scratch.resize(self.state.cluster_size as usize, 0);
+            dir_scratch.fill(0);
+            dir_scratch[..dir::DIR_ENTRY_SIZE].copy_from_slice(&dot_entry);
+            dir_scratch[dir::DIR_ENTRY_SIZE..dir::DIR_ENTRY_SIZE * 2]
                 .copy_from_slice(&dotdot_entry);
             self.state
                 .backend
                 .write_sectors(
                     self.state.cluster_to_lba(new_c).map_err(backend_to_vfs)?,
                     self.state.sectors_per_cluster,
-                    &cluster_buf,
+                    &dir_scratch,
                 )
                 .map_err(backend_to_vfs)?;
 
             let (sfn, lfn_entries) = dir::build_entries_for_name(name, &used);
             let entry = dir::build_sfn_entry(sfn, ATTR_DIRECTORY, new_c, 0);
-            let sfn_slot = dir::insert_new_entry(&self.state, self.backing, &lfn_entries, &entry)
-                .map_err(backend_to_vfs)?;
+            let sfn_slot = dir::insert_new_entry_with_scratch(
+                &self.state,
+                self.backing,
+                &lfn_entries,
+                &entry,
+                &mut dir_scratch,
+            )
+            .map_err(backend_to_vfs)?;
 
             let view = DirEntryView {
                 name: name.into(),
@@ -292,7 +318,11 @@ impl InodeOps for DirInodeOps {
         if self.state.is_read_only() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        let Some(entry) = self.find_entry(name)? else {
+        let mut dir_scratch = Vec::new();
+        let Some(entry) =
+            dir::find_entry_with_scratch(&self.state, self.backing, name, &mut dir_scratch)
+                .map_err(backend_to_vfs)?
+        else {
             return Err(VfsError::NotFound);
         };
         if entry.is_dir() {
@@ -304,8 +334,14 @@ impl InodeOps for DirInodeOps {
                 .free_chain(entry.first_cluster)
                 .map_err(backend_to_vfs)?;
         }
-        dir::remove_entry_slots(&self.state, self.backing, entry.slot_start, entry.slot_sfn)
-            .map_err(backend_to_vfs)?;
+        dir::remove_entry_slots_with_scratch(
+            &self.state,
+            self.backing,
+            entry.slot_start,
+            entry.slot_sfn,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         let _ = child;
         Ok(())
     }
@@ -314,7 +350,11 @@ impl InodeOps for DirInodeOps {
         if self.state.is_read_only() {
             return Err(VfsError::ReadOnlyFilesystem);
         }
-        let Some(entry) = self.find_entry(name)? else {
+        let mut dir_scratch = Vec::new();
+        let Some(entry) =
+            dir::find_entry_with_scratch(&self.state, self.backing, name, &mut dir_scratch)
+                .map_err(backend_to_vfs)?
+        else {
             return Err(VfsError::NotFound);
         };
         if !entry.is_dir() {
@@ -322,7 +362,9 @@ impl InodeOps for DirInodeOps {
         }
         // 子目录是否非空(忽略 "." 和 ".." 与已删条目)
         let sub_backing = DirBacking::ChainFromCluster(entry.first_cluster);
-        if !dir::is_dir_empty(&self.state, sub_backing).map_err(backend_to_vfs)? {
+        if !dir::is_dir_empty_with_scratch(&self.state, sub_backing, &mut dir_scratch)
+            .map_err(backend_to_vfs)?
+        {
             return Err(VfsError::DirectoryNotEmpty);
         }
         if entry.first_cluster >= 2 {
@@ -330,8 +372,14 @@ impl InodeOps for DirInodeOps {
                 .free_chain(entry.first_cluster)
                 .map_err(backend_to_vfs)?;
         }
-        dir::remove_entry_slots(&self.state, self.backing, entry.slot_start, entry.slot_sfn)
-            .map_err(backend_to_vfs)?;
+        dir::remove_entry_slots_with_scratch(
+            &self.state,
+            self.backing,
+            entry.slot_start,
+            entry.slot_sfn,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         let _ = child;
         Ok(())
     }
@@ -350,7 +398,11 @@ impl InodeOps for DirInodeOps {
         if new_name.is_empty() || new_name == "." || new_name == ".." {
             return Err(VfsError::InvalidArgument);
         }
-        let Some(entry) = self.find_entry(old_name)? else {
+        let mut dir_scratch = Vec::new();
+        let Some(entry) =
+            dir::find_entry_with_scratch(&self.state, self.backing, old_name, &mut dir_scratch)
+                .map_err(backend_to_vfs)?
+        else {
             return Err(VfsError::NotFound);
         };
         // 目标目录的 InodeOps 必须也是同一个 FsState 上的 DirInodeOps
@@ -362,9 +414,13 @@ impl InodeOps for DirInodeOps {
         }
         // 如果新名字已存在则覆盖(unlink 之);本实现拒绝覆盖目录。
         // 单次扫描同时检测冲突 + 收集 SFN
-        let (existing, mut used) =
-            dir::find_entry_and_sfns(&self.state, new_dir_ops.backing, new_name)
-                .map_err(backend_to_vfs)?;
+        let (existing, mut used) = dir::find_entry_and_sfns_with_scratch(
+            &self.state,
+            new_dir_ops.backing,
+            new_name,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         if let Some(existing) = existing {
             if existing.is_dir() {
                 return Err(VfsError::IsADirectory);
@@ -374,11 +430,12 @@ impl InodeOps for DirInodeOps {
                     .free_chain(existing.first_cluster)
                     .map_err(backend_to_vfs)?;
             }
-            dir::remove_entry_slots(
+            dir::remove_entry_slots_with_scratch(
                 &self.state,
                 new_dir_ops.backing,
                 existing.slot_start,
                 existing.slot_sfn,
+                &mut dir_scratch,
             )
             .map_err(backend_to_vfs)?;
             used.retain(|s| *s != existing.short_name);
@@ -387,11 +444,23 @@ impl InodeOps for DirInodeOps {
         let (sfn, lfn_entries) = dir::build_entries_for_name(new_name, &used);
         let attr = entry.attr;
         let new_entry = dir::build_sfn_entry(sfn, attr, entry.first_cluster, entry.size);
-        dir::insert_new_entry(&self.state, new_dir_ops.backing, &lfn_entries, &new_entry)
-            .map_err(backend_to_vfs)?;
+        dir::insert_new_entry_with_scratch(
+            &self.state,
+            new_dir_ops.backing,
+            &lfn_entries,
+            &new_entry,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         // 删旧条目
-        dir::remove_entry_slots(&self.state, self.backing, entry.slot_start, entry.slot_sfn)
-            .map_err(backend_to_vfs)?;
+        dir::remove_entry_slots_with_scratch(
+            &self.state,
+            self.backing,
+            entry.slot_start,
+            entry.slot_sfn,
+            &mut dir_scratch,
+        )
+        .map_err(backend_to_vfs)?;
         Ok(())
     }
 
@@ -433,12 +502,14 @@ struct TailCache {
 impl FileInodeOps {
     fn writeback_meta(&self, new_size: u32, new_first: u32) -> VfsResult<()> {
         let parent = *self.parent.lock();
-        dir::update_sfn_metadata(
+        let mut dir_scratch = Vec::new();
+        dir::update_sfn_metadata_with_scratch(
             &self.state,
             parent.backing,
             parent.sfn_slot,
             new_first,
             new_size,
+            &mut dir_scratch,
         )
         .map_err(backend_to_vfs)
     }
