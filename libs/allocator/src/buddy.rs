@@ -19,7 +19,9 @@ use core::alloc::Layout;
 use core::ptr::null_mut;
 
 use crate::boot::BootAllocator;
-use crate::request::{MemoryPlacement, PagePolicy, PhysicalAllocRequest, PhysicalAllocation};
+use crate::request::{
+    AllocationRequestError, MemoryPlacement, PhysicalAllocRequest, PhysicalAllocation,
+};
 
 #[inline]
 fn now_ns() -> u64 {
@@ -166,6 +168,7 @@ pub enum BuddyAllocError {
     BlockOutOfRange,
     BlockNotFree,
     Fragmented,
+    MetadataOutOfMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1792,32 +1795,19 @@ fn pages_to_order_floor(pages: usize) -> usize {
 }
 
 fn required_order_for_request(request: &PhysicalAllocRequest) -> Result<usize, BuddyAllocError> {
-    const MIN_LARGE_PAGE_ORDER: usize = 9;
-    let min_pages = pages_for(request.size.max(1)).max(pages_for(request.align.max(PAGE_SIZE)));
-    let mut order = pages_to_order(min_pages);
-    if matches!(request.page_policy, PagePolicy::RequireLarge) {
-        order = order.max(MIN_LARGE_PAGE_ORDER);
-    }
-    if order > MAX_TRACKED_ORDER {
-        return Err(BuddyAllocError::InvalidOrder);
-    }
-    Ok(order)
+    request
+        .required_order()
+        .map_err(buddy_alloc_error_from_request)
 }
 
-#[inline]
-fn pages_for(bytes: usize) -> usize {
-    bytes.max(1).div_ceil(PAGE_SIZE).max(1)
-}
-
-#[inline]
-fn pages_to_order(pages: usize) -> usize {
-    let mut order = 0usize;
-    let mut block = 1usize;
-    while block < pages {
-        block <<= 1;
-        order += 1;
+fn buddy_alloc_error_from_request(err: AllocationRequestError) -> BuddyAllocError {
+    match err {
+        AllocationRequestError::InvalidSize
+        | AllocationRequestError::InvalidAlignment
+        | AllocationRequestError::SizeOverflow
+        | AllocationRequestError::UnsupportedOrder => BuddyAllocError::InvalidOrder,
+        AllocationRequestError::InvalidPlacement => BuddyAllocError::InvalidAddress,
     }
-    order
 }
 
 #[inline]

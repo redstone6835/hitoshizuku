@@ -14,6 +14,8 @@
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use spin::mutex::Mutex;
+
 use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::error::{AllocationError, DeallocationError};
 use crate::request::AllocationRecord;
@@ -31,6 +33,99 @@ pub struct KernelHeapStats {
     pub alloc_failures: u64,
     pub address_reservation_failures: u64,
     pub invalid_frees: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_inserts: u64,
+    pub cache_full_releases: u64,
+    pub cache_pressure_flushes: u64,
+    pub cache_pressure_releases: u64,
+    pub cache_release_failures: u64,
+    pub cached_ranges: usize,
+    pub cached_pages: usize,
+    pub cached_bytes: usize,
+}
+
+const KHEAP_CACHE_MAX_ORDER: usize = 1;
+const KHEAP_CACHE_ORDER_COUNT: usize = KHEAP_CACHE_MAX_ORDER + 1;
+const KHEAP_CACHE_CAPACITY_PER_ORDER: usize = 128;
+const KHEAP_CACHEABLE_BACKEND_COOKIE: usize = 1;
+
+#[derive(Clone, Copy)]
+struct CachedOrderRanges {
+    ranges: [Option<BackedRange>; KHEAP_CACHE_CAPACITY_PER_ORDER],
+    len: usize,
+}
+
+impl CachedOrderRanges {
+    const fn new() -> Self {
+        Self {
+            ranges: [None; KHEAP_CACHE_CAPACITY_PER_ORDER],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, range: BackedRange) -> bool {
+        if self.len == self.ranges.len() {
+            return false;
+        }
+        self.ranges[self.len] = Some(range);
+        self.len += 1;
+        true
+    }
+
+    fn pop(&mut self) -> Option<BackedRange> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        let range = self.ranges[self.len];
+        self.ranges[self.len] = None;
+        range
+    }
+}
+
+struct KernelHeapRangeCache {
+    orders: [CachedOrderRanges; KHEAP_CACHE_ORDER_COUNT],
+}
+
+impl KernelHeapRangeCache {
+    const fn new() -> Self {
+        Self {
+            orders: [CachedOrderRanges::new(); KHEAP_CACHE_ORDER_COUNT],
+        }
+    }
+
+    fn push(&mut self, range: BackedRange) -> bool {
+        let Some(idx) = cache_order_index(range.order) else {
+            return false;
+        };
+        self.orders[idx].push(range)
+    }
+
+    fn pop(&mut self, order: usize) -> Option<BackedRange> {
+        let idx = cache_order_index(order)?;
+        self.orders[idx].pop()
+    }
+
+    fn pop_any(&mut self) -> Option<BackedRange> {
+        for idx in (0..self.orders.len()).rev() {
+            if let Some(range) = self.orders[idx].pop() {
+                return Some(range);
+            }
+        }
+        None
+    }
+
+    fn snapshot(&self) -> (usize, usize, usize) {
+        let mut ranges = 0usize;
+        let mut pages = 0usize;
+        for order in 0..=KHEAP_CACHE_MAX_ORDER {
+            let len = self.orders[order].len;
+            ranges = ranges.saturating_add(len);
+            pages = pages.saturating_add(len.saturating_mul(1usize << order));
+        }
+        (ranges, pages, pages.saturating_mul(PAGE_SIZE))
+    }
 }
 
 pub struct KernelHeap {
@@ -44,6 +139,14 @@ pub struct KernelHeap {
     alloc_failures: AtomicU64,
     address_reservation_failures: AtomicU64,
     invalid_frees: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    cache_inserts: AtomicU64,
+    cache_full_releases: AtomicU64,
+    cache_pressure_flushes: AtomicU64,
+    cache_pressure_releases: AtomicU64,
+    cache_release_failures: AtomicU64,
+    cache: Mutex<KernelHeapRangeCache>,
 }
 
 impl KernelHeap {
@@ -59,6 +162,14 @@ impl KernelHeap {
             alloc_failures: AtomicU64::new(0),
             address_reservation_failures: AtomicU64::new(0),
             invalid_frees: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            cache_inserts: AtomicU64::new(0),
+            cache_full_releases: AtomicU64::new(0),
+            cache_pressure_flushes: AtomicU64::new(0),
+            cache_pressure_releases: AtomicU64::new(0),
+            cache_release_failures: AtomicU64::new(0),
+            cache: Mutex::new(KernelHeapRangeCache::new()),
         }
     }
 
@@ -71,6 +182,7 @@ impl KernelHeap {
     }
 
     pub fn snapshot(&self) -> KernelHeapStats {
+        let (cached_ranges, cached_pages, cached_bytes) = self.cache.lock().snapshot();
         KernelHeapStats {
             alloc_requests: self.alloc_requests.load(Ordering::Acquire),
             free_requests: self.free_requests.load(Ordering::Acquire),
@@ -81,6 +193,16 @@ impl KernelHeap {
             alloc_failures: self.alloc_failures.load(Ordering::Acquire),
             address_reservation_failures: self.address_reservation_failures.load(Ordering::Acquire),
             invalid_frees: self.invalid_frees.load(Ordering::Acquire),
+            cache_hits: self.cache_hits.load(Ordering::Acquire),
+            cache_misses: self.cache_misses.load(Ordering::Acquire),
+            cache_inserts: self.cache_inserts.load(Ordering::Acquire),
+            cache_full_releases: self.cache_full_releases.load(Ordering::Acquire),
+            cache_pressure_flushes: self.cache_pressure_flushes.load(Ordering::Acquire),
+            cache_pressure_releases: self.cache_pressure_releases.load(Ordering::Acquire),
+            cache_release_failures: self.cache_release_failures.load(Ordering::Acquire),
+            cached_ranges,
+            cached_pages,
+            cached_bytes,
         }
     }
 
@@ -108,13 +230,38 @@ impl KernelHeap {
         let block_pages = 1usize << order;
         let block_bytes = block_pages * PAGE_SIZE;
 
-        let range = match vmem.alloc_kernel_backed_range(order, phys, page_policy) {
+        if is_cacheable_policy(order, page_policy) {
+            if let Some(range) = self.pop_cached_range(order) {
+                self.active_allocs.fetch_add(1, Ordering::Relaxed);
+                self.active_pages.fetch_add(block_pages, Ordering::Relaxed);
+                self.active_bytes.fetch_add(block_bytes, Ordering::Relaxed);
+                return Ok(range);
+            }
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let range = match self.alloc_range_uncached(order, page_policy, phys, vmem) {
             Ok(range) => range,
             Err(err) => {
-                self.alloc_failures.fetch_add(1, Ordering::Relaxed);
-                self.address_reservation_failures
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(AllocationError::AddressSpace(err));
+                let released = self.flush_cache_to_backend(phys, vmem);
+                if released == 0 {
+                    self.alloc_failures.fetch_add(1, Ordering::Relaxed);
+                    self.address_reservation_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(AllocationError::AddressSpace(err));
+                }
+                self.cache_pressure_flushes.fetch_add(1, Ordering::Relaxed);
+                self.cache_pressure_releases
+                    .fetch_add(released as u64, Ordering::Relaxed);
+                match self.alloc_range_uncached(order, page_policy, phys, vmem) {
+                    Ok(range) => range,
+                    Err(err) => {
+                        self.alloc_failures.fetch_add(1, Ordering::Relaxed);
+                        self.address_reservation_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(AllocationError::AddressSpace(err));
+                    }
+                }
             }
         };
 
@@ -130,6 +277,25 @@ impl KernelHeap {
         record: AllocationRecord,
         phys: &crate::Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
+    ) -> Result<(), DeallocationError> {
+        self.free_record_inner(record, phys, vmem, true)
+    }
+
+    pub(crate) fn free_record_uncached(
+        &self,
+        record: AllocationRecord,
+        phys: &crate::Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> Result<(), DeallocationError> {
+        self.free_record_inner(record, phys, vmem, false)
+    }
+
+    fn free_record_inner(
+        &self,
+        record: AllocationRecord,
+        phys: &crate::Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+        allow_cache: bool,
     ) -> Result<(), DeallocationError> {
         self.free_requests.fetch_add(1, Ordering::Relaxed);
         if !self.is_initialized() {
@@ -152,20 +318,20 @@ impl KernelHeap {
         let block_pages = 1usize << order;
         let block_bytes = block_pages * PAGE_SIZE;
 
-        vmem.free_kernel_backed_range(
-            BackedRange {
-                arena: ArenaKind::Kernel,
-                vaddr: record.ptr,
-                paddr,
-                size: block_bytes,
-                order,
-            },
-            phys,
-        )
-        .map_err(|err| {
-            self.invalid_frees.fetch_add(1, Ordering::Relaxed);
-            DeallocationError::AddressSpace(err)
-        })?;
+        let range = BackedRange {
+            arena: ArenaKind::Kernel,
+            vaddr: record.ptr,
+            paddr,
+            size: block_bytes,
+            order,
+        };
+
+        if !allow_cache || !self.try_cache_freed_range(record, range) {
+            vmem.free_kernel_backed_range(range, phys).map_err(|err| {
+                self.invalid_frees.fetch_add(1, Ordering::Relaxed);
+                DeallocationError::AddressSpace(err)
+            })?;
+        }
 
         self.active_allocs.fetch_sub(1, Ordering::Relaxed);
         self.active_pages.fetch_sub(block_pages, Ordering::Relaxed);
@@ -175,6 +341,69 @@ impl KernelHeap {
 
     pub fn required_order_for(layout: Layout) -> usize {
         required_order(layout).unwrap_or(MAX_TRACKED_ORDER + 1)
+    }
+
+    pub(crate) fn backend_cookie_for(range: BackedRange, page_policy: PagePolicy) -> usize {
+        if is_cacheable_policy(range.order, page_policy) {
+            KHEAP_CACHEABLE_BACKEND_COOKIE
+        } else {
+            0
+        }
+    }
+
+    fn alloc_range_uncached(
+        &self,
+        order: usize,
+        page_policy: PagePolicy,
+        phys: &crate::Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> Result<BackedRange, crate::AddressSpaceError> {
+        vmem.alloc_kernel_backed_range(order, phys, page_policy)
+    }
+
+    fn pop_cached_range(&self, order: usize) -> Option<BackedRange> {
+        let range = self.cache.lock().pop(order);
+        if range.is_some() {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        range
+    }
+
+    fn try_cache_freed_range(&self, record: AllocationRecord, range: BackedRange) -> bool {
+        if record.backend_cookie != KHEAP_CACHEABLE_BACKEND_COOKIE || !is_cacheable_range(range) {
+            return false;
+        }
+
+        if self.cache.lock().push(range) {
+            self.cache_inserts.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            self.cache_full_releases.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    fn flush_cache_to_backend(
+        &self,
+        phys: &crate::Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> usize {
+        let mut released = 0usize;
+        loop {
+            let range = self.cache.lock().pop_any();
+            let Some(range) = range else {
+                break;
+            };
+            if let Err(err) = vmem.free_kernel_backed_range(range, phys) {
+                self.cache_release_failures.fetch_add(1, Ordering::Relaxed);
+                panic!(
+                    "[alloc][invariant] kheap cache release failed: vaddr={:#x} paddr={:#x} order={} err={:?}",
+                    range.vaddr, range.paddr, range.order, err
+                );
+            }
+            released += 1;
+        }
+        released
     }
 }
 
@@ -208,6 +437,28 @@ fn effective_layout_policy(layout: Layout, requested: PagePolicy) -> Option<(usi
         return None;
     }
     Some((order, page_policy))
+}
+
+#[inline]
+fn cache_order_index(order: usize) -> Option<usize> {
+    if order <= KHEAP_CACHE_MAX_ORDER {
+        Some(order)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn is_cacheable_policy(order: usize, page_policy: PagePolicy) -> bool {
+    cache_order_index(order).is_some() && matches!(page_policy, PagePolicy::BaseOnly)
+}
+
+#[inline]
+fn is_cacheable_range(range: BackedRange) -> bool {
+    if range.arena != ArenaKind::Kernel || cache_order_index(range.order).is_none() {
+        return false;
+    }
+    range.size == (1usize << range.order) * PAGE_SIZE
 }
 
 #[inline]
