@@ -48,11 +48,16 @@ const O_APPEND: usize = 0o00002000;
 const O_NONBLOCK: usize = 0o00004000;
 const O_DIRECTORY: usize = 0o00200000;
 const O_NOFOLLOW: usize = 0o00400000;
+const O_NOCTTY: usize = 0o00000400;
+const O_DSYNC: usize = 0o00010000;
 const O_DIRECT: usize = 0o00040000;
 const O_NOATIME: usize = 0o01000000;
 const O_CLOEXEC: usize = 0o02000000;
 const O_PATH: usize = 0o10000000;
 const O_SYNC: usize = 0o4010000;
+
+const OPEN_HOW_SIZE: usize = 24;
+const OPEN_HOW_MAX_SIZE: usize = 4096;
 
 const F_DUPFD: usize = 0;
 const F_GETFD: usize = 1;
@@ -133,21 +138,7 @@ pub(super) fn sys_writev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    let mut total = 0usize;
-    for i in 0..iovcnt {
-        let (base, len) = read_iovec(iov, i)?;
-        match write_from_user(&file, base, len) {
-            Ok(n) => {
-                total = total.checked_add(n).ok_or(Errno::EINVAL)?;
-                if n < len {
-                    break;
-                }
-            }
-            Err(_) if total > 0 => return Ok(total),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(total)
+    write_iovecs(&file, iov, iovcnt, None)
 }
 
 pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -158,21 +149,7 @@ pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
-    let mut total = 0usize;
-    for i in 0..iovcnt {
-        let (base, len) = read_iovec(iov, i)?;
-        match read_to_user(&file, base, len, None) {
-            Ok(n) => {
-                total = total.checked_add(n).ok_or(Errno::EINVAL)?;
-                if n < len {
-                    break;
-                }
-            }
-            Err(_) if total > 0 => return Ok(total),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(total)
+    read_iovecs(&file, iov, iovcnt, None)
 }
 
 pub(super) fn sys_close(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -478,13 +455,28 @@ pub(super) fn sys_unlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 }
 
 pub(super) fn sys_renameat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    renameat_common(
+        ctx.args[0],
+        ctx.args[1],
+        ctx.args[2],
+        ctx.args[3],
+        ctx.args[4],
+    )
+}
+
+fn renameat_common(
+    old_dirfd_raw: usize,
+    old_path_user: usize,
+    new_dirfd_raw: usize,
+    new_path_user: usize,
+    flags: usize,
+) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let old_dirfd = dirfd_arg(ctx.args[0], &fdt)?;
-    let old_path = copy_cstr_from_user(ctx.args[1], PATH_MAX).map_err(|e| e.as_errno())?;
-    let new_dirfd = dirfd_arg(ctx.args[2], &fdt)?;
-    let new_path = copy_cstr_from_user(ctx.args[3], PATH_MAX).map_err(|e| e.as_errno())?;
-    let flags = ctx.args[4];
+    let old_dirfd = dirfd_arg(old_dirfd_raw, &fdt)?;
+    let old_path = copy_cstr_from_user(old_path_user, PATH_MAX).map_err(|e| e.as_errno())?;
+    let new_dirfd = dirfd_arg(new_dirfd_raw, &fdt)?;
+    let new_path = copy_cstr_from_user(new_path_user, PATH_MAX).map_err(|e| e.as_errno())?;
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
@@ -1679,8 +1671,8 @@ pub(super) fn sys_ioprio_get(_ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_renameat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_renameat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    renameat_common(ctx.args[0], ctx.args[1], ctx.args[2], ctx.args[3], 0)
 }
 
 pub(super) fn sys_nfsservctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1695,12 +1687,28 @@ pub(super) fn sys_quotactl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_preadv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_preadv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let iov = ctx.args[1];
+    let iovcnt = ctx.args[2];
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let offset = nonnegative_i64_arg(ctx.args[3])?;
+    let file = file_for_fd(fd)?;
+    read_iovecs(&file, iov, iovcnt, Some(offset))
 }
 
-pub(super) fn sys_pwritev(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_pwritev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let iov = ctx.args[1];
+    let iovcnt = ctx.args[2];
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let offset = nonnegative_i64_arg(ctx.args[3])?;
+    let file = file_for_fd(fd)?;
+    write_iovecs(&file, iov, iovcnt, Some(offset))
 }
 
 pub(super) fn sys_vmsplice(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1743,12 +1751,18 @@ pub(super) fn sys_memfd_create(_ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_preadv2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_preadv2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    if ctx.args[4] != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    sys_preadv(ctx)
 }
 
-pub(super) fn sys_pwritev2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    if ctx.args[4] != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    sys_pwritev(ctx)
 }
 
 pub(super) fn sys_timerfd_gettime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1759,20 +1773,20 @@ pub(super) fn sys_timerfd_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usi
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_utimensat_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_utimensat_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_utimensat(ctx)
 }
 
-pub(super) fn sys_pselect6_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_pselect6_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_pselect6(ctx)
 }
 
-pub(super) fn sys_ppoll_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_ppoll_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_ppoll(ctx)
 }
 
-pub(super) fn sys_recvmmsg_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_recvmmsg_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_recvmmsg(ctx)
 }
 
 pub(super) fn sys_io_uring_setup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1811,16 +1825,48 @@ pub(super) fn sys_fspick(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_openat2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_openat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_cstr_from_user(ctx.args[1], PATH_MAX).map_err(|e| e.as_errno())?;
+    let how = read_open_how(ctx.args[2], ctx.args[3])?;
+    if how.resolve != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let raw_flags = usize::try_from(how.flags).map_err(|_| Errno::EINVAL)?;
+    validate_openat2_flags(raw_flags)?;
+    let flags = decode_open_options(raw_flags)?;
+    if how.mode != 0 && (raw_flags & O_CREAT) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (how.mode & !0o7777) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mode = FileMode::new((how.mode & 0o7777) as u16);
+    let fd =
+        operation::openat(&vfs_ctx, &fdt, &dirfd, &path, flags, mode).map_err(|e| e.to_errno())?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_pidfd_getfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_epoll_pwait2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let epfd = fd_arg(ctx.args[0])?;
+    let events_user = ctx.args[1];
+    let maxevents = ctx.args[2];
+    let timeout_ms = read_timespec_ms_ceil(ctx.args[3])?;
+    let sigmask = read_direct_sigmask(ctx.args[4], ctx.args[5])?;
+    if maxevents == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let _mask_guard = TemporarySigmask::install(sigmask);
+    let ready = vfs::epoll::wait(&fdt, epfd, maxevents, timeout_ms)?;
+    write_epoll_events(events_user, &ready)?;
+    Ok(ready.len())
 }
 
 pub(super) fn sys_mount_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1831,8 +1877,25 @@ pub(super) fn sys_quotactl_fd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_fchmodat2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_fchmodat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_cstr_from_user(ctx.args[1], PATH_MAX).map_err(|e| e.as_errno())?;
+    let mode = FileMode::new((ctx.args[2] & 0o7777) as u16);
+    let flags = ctx.args[3];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    operation::fchmodat(
+        &vfs_ctx,
+        &dirfd,
+        &path,
+        mode,
+        (flags & AT_SYMLINK_NOFOLLOW) != 0,
+    )
+    .map_err(|e| e.to_errno())?;
+    Ok(0)
 }
 
 pub(super) fn sys_statmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2218,10 +2281,67 @@ fn decode_open_options(raw: usize) -> Result<OpenOptions, Errno> {
         noatime: (raw & O_NOATIME) != 0,
         path_only: (raw & O_PATH) != 0,
         nonblock: (raw & O_NONBLOCK) != 0,
-        sync: (raw & O_SYNC) != 0,
+        sync: (raw & (O_SYNC | O_DSYNC)) != 0,
         direct: (raw & O_DIRECT) != 0,
         cloexec: (raw & O_CLOEXEC) != 0,
     })
+}
+
+#[derive(Clone, Copy)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn read_open_how(user: usize, size: usize) -> Result<OpenHow, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if size < OPEN_HOW_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    if size > OPEN_HOW_MAX_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    let mut raw = [0u8; OPEN_HOW_SIZE];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    if size > OPEN_HOW_SIZE {
+        let extra_len = size - OPEN_HOW_SIZE;
+        let mut extra = vec![0u8; extra_len];
+        let extra_user = user.checked_add(OPEN_HOW_SIZE).ok_or(Errno::EFAULT)?;
+        copy_from_user(extra_user, &mut extra).map_err(|e| e.as_errno())?;
+        if extra.iter().any(|b| *b != 0) {
+            return Err(Errno::E2BIG);
+        }
+    }
+    Ok(OpenHow {
+        flags: u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+        mode: u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+        resolve: u64::from_le_bytes(raw[16..24].try_into().unwrap()),
+    })
+}
+
+fn validate_openat2_flags(raw: usize) -> Result<(), Errno> {
+    const SUPPORTED_OPEN_FLAGS: usize = O_ACCMODE
+        | O_CREAT
+        | O_EXCL
+        | O_NOCTTY
+        | O_TRUNC
+        | O_APPEND
+        | O_NONBLOCK
+        | O_DSYNC
+        | O_DIRECT
+        | O_DIRECTORY
+        | O_NOFOLLOW
+        | O_NOATIME
+        | O_CLOEXEC
+        | O_PATH
+        | O_SYNC;
+    if (raw & !SUPPORTED_OPEN_FLAGS) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 fn write_from_user(file: &vfs::file::File, user: usize, len: usize) -> Result<usize, Errno> {
@@ -2323,6 +2443,60 @@ fn read_to_user(
         }
     }
     Ok(read)
+}
+
+fn write_iovecs(
+    file: &vfs::file::File,
+    iov: usize,
+    iovcnt: usize,
+    mut offset: Option<u64>,
+) -> Result<usize, Errno> {
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let (base, len) = read_iovec(iov, i)?;
+        let current_offset = offset;
+        match write_from_user_at(file, base, len, current_offset) {
+            Ok(n) => {
+                total = total.checked_add(n).ok_or(Errno::EINVAL)?;
+                if let Some(pos) = offset.as_mut() {
+                    *pos = pos.saturating_add(n as u64);
+                }
+                if n < len {
+                    break;
+                }
+            }
+            Err(_) if total > 0 => return Ok(total),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
+fn read_iovecs(
+    file: &vfs::file::File,
+    iov: usize,
+    iovcnt: usize,
+    mut offset: Option<u64>,
+) -> Result<usize, Errno> {
+    let mut total = 0usize;
+    for i in 0..iovcnt {
+        let (base, len) = read_iovec(iov, i)?;
+        let current_offset = offset;
+        match read_to_user(file, base, len, current_offset) {
+            Ok(n) => {
+                total = total.checked_add(n).ok_or(Errno::EINVAL)?;
+                if let Some(pos) = offset.as_mut() {
+                    *pos = pos.saturating_add(n as u64);
+                }
+                if n < len {
+                    break;
+                }
+            }
+            Err(_) if total > 0 => return Ok(total),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
 }
 
 fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Result<(), Errno> {
@@ -2776,6 +2950,24 @@ fn read_timespec_ms(user: usize) -> Result<i64, Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(sec.saturating_mul(1000).saturating_add(nsec / 1_000_000))
+}
+
+fn read_timespec_ms_ceil(user: usize) -> Result<i64, Errno> {
+    if user == 0 {
+        return Ok(-1);
+    }
+    let mut raw = [0u8; 16];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let sec = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let nsec = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+    if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+        return Err(Errno::EINVAL);
+    }
+    let mut ms = sec.saturating_mul(1000);
+    if nsec != 0 {
+        ms = ms.saturating_add(((nsec as u64).saturating_add(999_999) / 1_000_000) as i64);
+    }
+    Ok(ms)
 }
 
 fn read_socket_timeout_deadline(user: usize) -> Result<Option<u64>, Errno> {

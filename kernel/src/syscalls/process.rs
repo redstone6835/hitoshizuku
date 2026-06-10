@@ -1990,12 +1990,20 @@ pub(super) fn sys_ptrace(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_getresuid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_getresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let creds = ctx.task.credentials();
+    copy_to_user(ctx.args[0], &creds.uid.0.to_le_bytes()).map_err(|e| e.as_errno())?;
+    copy_to_user(ctx.args[1], &creds.euid.0.to_le_bytes()).map_err(|e| e.as_errno())?;
+    copy_to_user(ctx.args[2], &creds.suid.0.to_le_bytes()).map_err(|e| e.as_errno())?;
+    Ok(0)
 }
 
-pub(super) fn sys_getresgid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_getresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let creds = ctx.task.credentials();
+    copy_to_user(ctx.args[0], &creds.gid.0.to_le_bytes()).map_err(|e| e.as_errno())?;
+    copy_to_user(ctx.args[1], &creds.egid.0.to_le_bytes()).map_err(|e| e.as_errno())?;
+    copy_to_user(ctx.args[2], &creds.sgid.0.to_le_bytes()).map_err(|e| e.as_errno())?;
+    Ok(0)
 }
 
 pub(super) fn sys_sethostname(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2006,8 +2014,10 @@ pub(super) fn sys_setdomainname(_ctx: &mut SyscallContext<'_>) -> Result<usize, 
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_umask(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vfs_ctx = vfs::current_vfs_context().ok_or(Errno::EBADF)?;
+    let old = vfs_ctx.set_umask(vfs::FileMode::new((ctx.args[0] & 0o777) as u16));
+    Ok(old.bits() as usize)
 }
 
 pub(super) fn sys_settimeofday(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2054,8 +2064,8 @@ pub(super) fn sys_kexec_file_load(_ctx: &mut SyscallContext<'_>) -> Result<usize
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_clock_gettime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_gettime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_clock_gettime(ctx)
 }
 
 pub(super) fn sys_clock_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2066,12 +2076,12 @@ pub(super) fn sys_clock_adjtime64(_ctx: &mut SyscallContext<'_>) -> Result<usize
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_clock_getres_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_getres_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_clock_getres(ctx)
 }
 
-pub(super) fn sys_clock_nanosleep_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_nanosleep_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_clock_nanosleep(ctx)
 }
 
 pub(super) fn sys_timer_gettime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2082,8 +2092,22 @@ pub(super) fn sys_timer_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_pidfd_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    let flags = ctx.args[1];
+    if pid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let task = lookup_task_for_thread_syscall(pid, &ctx.task)?;
+    let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
+    let cred = vfs::current_vfs_context()
+        .map(|ctx| Arc::clone(&ctx.cred))
+        .ok_or(Errno::ENOSYS)?;
+    let fd = pidfd::create(&fdt, cred, task)?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_landlock_create_ruleset(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

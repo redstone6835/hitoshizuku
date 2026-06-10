@@ -1,10 +1,14 @@
 //! 信号相关 syscall：rt_sigaction / rt_sigprocmask。
 
+use alloc::sync::Arc;
+
 use errno::Errno;
 use general::mm::{copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
+use general::vfs::{self, fdtable::Fd, pidfd};
+use sched::ids::Uid;
 use sched::process_ops::UserContextRef;
-use sched::task::TaskState;
+use sched::task::{Task, TaskState};
 use sched::{SigAction, SigActionFlags, SigHandler, SigProcMaskHow, SigSet, SignalNumber};
 
 const SIGSET_SIZE: usize = 8;
@@ -183,16 +187,94 @@ pub(super) fn sys_restart_syscall(_ctx: &mut SyscallContext<'_>) -> Result<usize
     Err(Errno::EINTR)
 }
 
-pub(super) fn sys_rt_sigqueueinfo(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_rt_sigqueueinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    if pid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let Some(sig) = signal_number(ctx.args[1])? else {
+        sched::operation::tgkill(pid, pid, None)?;
+        return Ok(0);
+    };
+    let info = read_queued_siginfo(ctx.args[2], sig)?;
+    sched::operation::tgqueueinfo(pid, pid, info)?;
+    Ok(0)
 }
 
-pub(super) fn sys_rt_sigtimedwait_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_rt_sigtimedwait_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_rt_sigtimedwait(ctx)
 }
 
-pub(super) fn sys_pidfd_send_signal(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_pidfd_send_signal(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let sig = signal_number(ctx.args[1])?;
+    let uinfo = ctx.args[2];
+    let flags = ctx.args[3];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+    let task = pidfd::task_from_file(&file).ok_or(Errno::EINVAL)?;
+    let (tgid, tid) = task_tgid_tid(&task)?;
+    let Some(sig) = sig else {
+        sched::operation::tgkill(tgid, tid, None)?;
+        return Ok(0);
+    };
+    if uinfo == 0 {
+        sched::operation::tgkill(tgid, tid, Some(sig))?;
+    } else {
+        let info = read_queued_siginfo(uinfo, sig)?;
+        sched::operation::tgqueueinfo(tgid, tid, info)?;
+    }
+    Ok(0)
+}
+
+fn signal_number(raw: usize) -> Result<Option<SignalNumber>, Errno> {
+    if raw == 0 {
+        Ok(None)
+    } else {
+        SignalNumber::from_raw(raw as i32)
+            .map(Some)
+            .ok_or(Errno::EINVAL)
+    }
+}
+
+fn read_queued_siginfo(user: usize, sig: SignalNumber) -> Result<sched::SigInfo, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 128];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let signo = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+    if signo != sig.raw() as i32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(sched::SigInfo {
+        sig,
+        code: i32::from_le_bytes(raw[8..12].try_into().unwrap()),
+        sender_pid: i32::from_le_bytes(raw[12..16].try_into().unwrap()),
+        sender_uid: Uid(u32::from_le_bytes(raw[16..20].try_into().unwrap())),
+        raw: Some(raw),
+    })
+}
+
+fn task_tgid_tid(task: &Arc<Task>) -> Result<(i32, i32), Errno> {
+    let tid = task.pid_root().ok_or(Errno::ESRCH)?;
+    let tgid = task
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_root())
+        .unwrap_or(tid);
+    Ok((tgid, tid))
+}
+
+fn fd_arg(raw: usize) -> Result<Fd, Errno> {
+    let fd = raw as isize;
+    if fd < 0 {
+        return Err(Errno::EBADF);
+    }
+    Ok(Fd::from_raw(fd as u32))
 }
 
 fn read_sigaction(user: usize) -> Result<SigAction, Errno> {
