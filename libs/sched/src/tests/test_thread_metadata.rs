@@ -154,6 +154,26 @@ fn runqueue_take_migratable_respects_cpu_affinity() {
 }
 
 #[ktest]
+fn runqueue_take_migratable_preserves_fair_lag() {
+    let early = make_task();
+    let late = make_task();
+    early.sched.store_vruntime(100);
+    late.sched.store_vruntime(300);
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&early), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&late), 1);
+
+    let pulled = rq
+        .take_migratable(CpuMask::single_raw(0).bits(), 2)
+        .expect("fair task should be migratable");
+    assert!(alloc::sync::Arc::ptr_eq(&pulled, &late));
+    assert_eq!(pulled.sched.lag(), -200);
+
+    assert!(rq.dequeue(&early, 3));
+}
+
+#[ktest]
 fn runqueue_update_nice_keeps_policy_and_slice() {
     let task = make_task();
     task.sched

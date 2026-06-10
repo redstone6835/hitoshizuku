@@ -679,6 +679,7 @@ fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Op
         .map(|(key, _)| *key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
+    store_fair_lag_locked(inner, &task);
     task.sched.set_on_rq(false);
     Some(task)
 }
