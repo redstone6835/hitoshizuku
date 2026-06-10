@@ -21,7 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
-use crate::buddy::{BuddyAllocator, PAGE_SIZE};
+use crate::buddy::{BuddyAllocator, MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::request::AllocationRecord;
 use crate::space::{BackedRange, KernelAddressSpace};
 
@@ -54,6 +54,8 @@ pub struct SlabStats {
     pub invalid_frees: u64,
     pub cache_refills: u64,
     pub cache_flushes: u64,
+    pub fast_free_hits: u64,
+    pub fast_free_fallbacks: u64,
     pub reclaimed_slabs: u64,
     pub free_slab_nodes: usize,
 }
@@ -122,6 +124,25 @@ impl PerCpuCache {
         Self {
             inner: Mutex::new(PerCpuCacheState::new()),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlabAllocation {
+    pub ptr: usize,
+    pub slab_node: usize,
+}
+
+impl SlabAllocation {
+    const fn null() -> Self {
+        Self {
+            ptr: 0,
+            slab_node: INVALID_SLAB_NODE,
+        }
+    }
+
+    pub const fn is_null(self) -> bool {
+        self.ptr == 0
     }
 }
 
@@ -362,6 +383,8 @@ impl ZoneState {
                 invalid_frees: 0,
                 cache_refills: 0,
                 cache_flushes: 0,
+                fast_free_hits: 0,
+                fast_free_fallbacks: 0,
                 reclaimed_slabs: 0,
                 free_slab_nodes: 0,
             },
@@ -378,13 +401,16 @@ impl ZoneState {
         self.stats.active_bytes = self.stats.active_bytes.saturating_sub(obj_size);
     }
 
-    fn try_allocate_user_object(&mut self, obj_size: usize) -> Option<usize> {
+    fn try_allocate_user_object(&mut self, obj_size: usize) -> Option<SlabAllocation> {
         let mut node_addr = self.slab_head;
         while node_addr != 0 {
             let node = slab_node_mut(node_addr);
             if let Some(ptr) = node.slab.allocate(obj_size, false) {
                 self.on_alloc(obj_size);
-                return Some(ptr);
+                return Some(SlabAllocation {
+                    ptr,
+                    slab_node: node_addr,
+                });
             }
             node_addr = node.next;
         }
@@ -456,6 +482,15 @@ impl ZoneState {
     fn stage_cached_free(&mut self, ptr: usize, obj_size: usize) -> Option<usize> {
         // ZoneState 级别的 staged free 负责在本 zone 的所有 slab 中定位归属对象，并把
         // “用户已释放”的事实同步到统计信息上；位图状态细节仍由具体 slab 执行。
+        self.stage_cached_free_scanning(ptr, obj_size, true)
+    }
+
+    fn stage_cached_free_scanning(
+        &mut self,
+        ptr: usize,
+        obj_size: usize,
+        count_invalid: bool,
+    ) -> Option<usize> {
         let mut node_addr = self.slab_head;
         while node_addr != 0 {
             let node = slab_node_mut(node_addr);
@@ -465,7 +500,33 @@ impl ZoneState {
             }
             node_addr = node.next;
         }
-        self.stats.invalid_frees += 1;
+        if count_invalid {
+            self.stats.invalid_frees += 1;
+        }
+        None
+    }
+
+    fn stage_cached_free_at_node(
+        &mut self,
+        ptr: usize,
+        obj_size: usize,
+        node_addr: usize,
+    ) -> Option<usize> {
+        // registry record 已经记住所属 slab node 时，释放路径可以直接回到目标 slab。
+        // 这个 cookie 与 per-CPU cache entry 中的 slab node 属于同一类内部不变量：它只能
+        // 由 allocator 自己写入 registry，外部 crate 无法伪造。SlabNode 元数据只复用不
+        // 释放，因此过期 cookie 最多命中一个已复用节点；对象边界和状态校验失败后会回退
+        // 到慢速扫描路径，不会把错误对象直接释放。
+        if node_addr == INVALID_SLAB_NODE {
+            return None;
+        }
+        if slab_node_mut(node_addr)
+            .slab
+            .stage_cached_free(ptr, obj_size)
+        {
+            self.on_free(obj_size);
+            return Some(node_addr);
+        }
         None
     }
 
@@ -509,7 +570,9 @@ impl ZoneState {
         self.stats.grow_failures += 1;
         if matches!(
             reason,
-            SlabGrowError::BackedRange | SlabGrowError::InvalidBacking
+            SlabGrowError::BackedRange
+                | SlabGrowError::UnsupportedOrder
+                | SlabGrowError::InvalidBacking
         ) {
             self.stats.address_reservation_failures += 1;
         }
@@ -564,6 +627,7 @@ impl ZoneState {
 enum SlabGrowError {
     Metadata,
     BackedRange,
+    UnsupportedOrder,
     InvalidBacking,
     Inactive,
 }
@@ -575,11 +639,11 @@ fn allocate_slab_node(
     vmem: &KernelAddressSpace,
     reusable_node: Option<usize>,
 ) -> Result<usize, SlabGrowError> {
-    let order = pages_to_order(pages_per_slab);
+    let order = pages_to_order(pages_per_slab).ok_or(SlabGrowError::UnsupportedOrder)?;
     let range = vmem
         .alloc_kernel_backed_range(order, phys, crate::PagePolicy::BaseOnly)
         .map_err(|_| SlabGrowError::BackedRange)?;
-    let block_pages = 1usize << order;
+    let block_pages = pages_for_order(order).ok_or(SlabGrowError::UnsupportedOrder)?;
     if range.paddr & (PAGE_SIZE - 1) != 0 {
         let _ = vmem.free_kernel_backed_range(range, phys);
         return Err(SlabGrowError::InvalidBacking);
@@ -633,7 +697,7 @@ impl Zone {
         cpu: usize,
         phys: &Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
-    ) -> *mut u8 {
+    ) -> SlabAllocation {
         // Zone 的热路径是三段式：
         // 1. 先看 per-CPU cache；
         // 2. miss 后再看全局 slab 状态；
@@ -654,7 +718,10 @@ impl Zone {
         if let Some(entry) = cache_entry {
             if state.commit_cache_alloc(entry, self.size_class) {
                 state.stats.cache_hits += 1;
-                return entry.ptr as *mut u8;
+                return SlabAllocation {
+                    ptr: entry.ptr,
+                    slab_node: entry.slab_node,
+                };
             }
             state.stats.invalid_frees += 1;
             panic!(
@@ -664,9 +731,9 @@ impl Zone {
         }
 
         state.stats.cache_misses += 1;
-        let ptr = if let Some(ptr) = state.try_allocate_user_object(self.size_class) {
+        let allocation = if let Some(allocation) = state.try_allocate_user_object(self.size_class) {
             drop(state);
-            ptr
+            allocation
         } else {
             drop(state);
             let mut grow_attempts = 0;
@@ -676,7 +743,7 @@ impl Zone {
                     state.stats.grow_failures += 1;
                     drop(state);
                     self.reclaim_empty_slabs(Some((phys, vmem)));
-                    return null_mut();
+                    return SlabAllocation::null();
                 }
 
                 let reusable_node = {
@@ -694,8 +761,8 @@ impl Zone {
                     Ok(node_addr) => {
                         let mut state = self.state.lock();
                         state.insert_slab_node(node_addr);
-                        if let Some(ptr) = state.try_allocate_user_object(self.size_class) {
-                            break ptr;
+                        if let Some(allocation) = state.try_allocate_user_object(self.size_class) {
+                            break allocation;
                         }
                     }
                     Err(err) => {
@@ -704,7 +771,7 @@ impl Zone {
                             state.push_reusable_slab_node(node_addr);
                         }
                         state.note_grow_failure(err);
-                        return null_mut();
+                        return SlabAllocation::null();
                     }
                 }
                 grow_attempts += 1;
@@ -744,7 +811,7 @@ impl Zone {
             }
         }
 
-        ptr as *mut u8
+        allocation
     }
 
     fn free(
@@ -782,6 +849,73 @@ impl Zone {
             let mut state = self.state.lock();
             state.stats.free_requests += 1;
             state.stage_cached_free(ptr, self.size_class)
+        };
+
+        let Some(slab_node) = staged else {
+            self.reclaim_empty_slabs(backing);
+            return false;
+        };
+
+        let entry = CacheEntry { ptr, slab_node };
+        let pushed = {
+            let mut cache_guard = cache.inner.lock();
+            cache_guard.push(entry)
+        };
+        if !pushed {
+            let mut state = self.state.lock();
+            state.flush_cached_entries(&[entry], self.size_class);
+        }
+        self.reclaim_empty_slabs(backing);
+        true
+    }
+
+    fn free_with_hint(
+        &self,
+        ptr: usize,
+        cpu: usize,
+        slab_node_hint: usize,
+        backing: Option<(&Mutex<BuddyAllocator>, &KernelAddressSpace)>,
+    ) -> bool {
+        if slab_node_hint == INVALID_SLAB_NODE {
+            return self.free(ptr, cpu, backing);
+        }
+
+        let cache = &self.caches[cpu];
+        let mut drained = [CacheEntry::empty(); CACHE_CAPACITY / 2];
+        let drained_count = {
+            let mut cache_guard = cache.inner.lock();
+            if cache_guard.count < CACHE_CAPACITY {
+                0
+            } else {
+                let mut drained_count = 0usize;
+                for slot in drained.iter_mut() {
+                    let Some(entry) = cache_guard.pop() else {
+                        break;
+                    };
+                    *slot = entry;
+                    drained_count += 1;
+                }
+                drained_count
+            }
+        };
+        if drained_count > 0 {
+            let mut state = self.state.lock();
+            state.flush_cached_entries(&drained[..drained_count], self.size_class);
+        }
+
+        let staged = {
+            let mut state = self.state.lock();
+            state.stats.free_requests += 1;
+            match state.stage_cached_free_at_node(ptr, self.size_class, slab_node_hint) {
+                Some(node) => {
+                    state.stats.fast_free_hits += 1;
+                    Some(node)
+                }
+                None => {
+                    state.stats.fast_free_fallbacks += 1;
+                    state.stage_cached_free_scanning(ptr, self.size_class, true)
+                }
+            }
         };
 
         let Some(slab_node) = staged else {
@@ -917,6 +1051,22 @@ impl SlabAllocator {
             return null_mut();
         };
         let cpu = self.normalize_cpu(cpu_id);
+        self.zones[zone_idx].alloc(cpu, phys, vmem).ptr as *mut u8
+    }
+
+    pub(crate) fn alloc_class(
+        &self,
+        zone_idx: usize,
+        cpu_id: usize,
+        phys: &Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> SlabAllocation {
+        // 上层路由已经根据 Layout 做过 size-class 与对齐判定时，直接进入目标 zone，
+        // 避免在 GlobalAlloc 热路径里重复计算一次 class_index_for(layout)。
+        if !self.is_initialized() || zone_idx >= self.zones.len() {
+            return SlabAllocation::null();
+        }
+        let cpu = self.normalize_cpu(cpu_id);
         self.zones[zone_idx].alloc(cpu, phys, vmem)
     }
 
@@ -968,7 +1118,7 @@ impl SlabAllocator {
             return false;
         };
         let cpu = self.normalize_cpu(cpu_id);
-        self.zones[zone_idx].free(record.ptr, cpu, backing)
+        self.zones[zone_idx].free_with_hint(record.ptr, cpu, record.backend_cookie, backing)
     }
 
     pub fn usable_size_for_ptr(&self, ptr: usize) -> Option<usize> {
@@ -993,6 +1143,8 @@ impl SlabAllocator {
             out.invalid_frees += stats.invalid_frees;
             out.cache_refills += stats.cache_refills;
             out.cache_flushes += stats.cache_flushes;
+            out.fast_free_hits += stats.fast_free_hits;
+            out.fast_free_fallbacks += stats.fast_free_fallbacks;
             out.reclaimed_slabs += stats.reclaimed_slabs;
             out.free_slab_nodes += stats.free_slab_nodes;
         }
@@ -1138,14 +1290,30 @@ fn next_hint_after(idx: usize, total: usize) -> usize {
 }
 
 #[inline]
-fn pages_to_order(pages: usize) -> usize {
+fn pages_to_order(pages: usize) -> Option<usize> {
     // slab 想申请任意页数，但 buddy 只接受 order。这里做的就是把需求向上折算成最小
-    // 覆盖该页数的 2^order 块，作为下层物理页和虚拟区间申请的共同粒度。
+    // 覆盖该页数的 2^order 块，作为下层物理页和虚拟区间申请的共同粒度。这里必须
+    // 使用有界左移：size class 目前是常量，但未来扩展 slab class 时不能让极端页数
+    // 在 grow 冷路径中溢出或无限循环。
+    if pages == 0 {
+        return None;
+    }
     let mut order = 0;
     let mut block = 1;
     while block < pages {
-        block <<= 1;
+        if order >= MAX_TRACKED_ORDER {
+            return None;
+        }
+        block = block.checked_shl(1)?;
         order += 1;
     }
-    order
+    Some(order)
+}
+
+#[inline]
+fn pages_for_order(order: usize) -> Option<usize> {
+    if order > MAX_TRACKED_ORDER {
+        return None;
+    }
+    1usize.checked_shl(order as u32)
 }

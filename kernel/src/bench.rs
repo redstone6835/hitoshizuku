@@ -135,18 +135,23 @@ pub fn run_allocator_only() {
 // ═══════════════════════════════════════════════════════════════════════
 
 // TODO(alloc-stabilization): 当前只完成 allocator-bench 框架和开销来源日志。
-// 恢复实现时需要在 loongarch64/QEMU 下采集真实结果，并把优化前后 ns/op 对比固化到
-// 提交说明或独立报告中，避免只凭 host check 推断内核态性能。
+// 恢复实现时需要在 QEMU 下采集真实结果，并把优化前后 ns/op 对比固化到提交说
+// 明或独立报告中，避免只凭 host check 推断内核态性能。
 const ALLOC_BENCH_BATCH: usize = 128;
 
 fn run_allocator_bench() {
     log::info!("[bench][alloc] ---------------- allocator cost model ----------------");
+    let audit_start = KERNEL_ALLOCATOR.audit();
     log::info!(
-        "[bench][alloc] small_limit={} page_size={} batch={}",
+        "[bench][alloc] small_limit={} page_size={} batch={} audit_ok={} audit_flags={} live={}",
         MAX_SMALL_SIZE,
         PAGE_SIZE,
-        ALLOC_BENCH_BATCH
+        ALLOC_BENCH_BATCH,
+        audit_start.is_consistent(),
+        audit_start.flags.bits(),
+        audit_start.registry_live_records
     );
+    log_allocator_hotspot("start");
 
     let slab8 = run_allocator_alloc_free_case("slab-8", 8, 8, 256, Zeroing::Uninitialized);
     let slab64 = run_allocator_alloc_free_case("slab-64", 64, 8, 256, Zeroing::Uninitialized);
@@ -177,11 +182,48 @@ fn run_allocator_bench() {
     run_allocator_in_place_query();
     run_allocator_realloc_same_class();
     run_allocator_realloc_grow();
+    run_allocator_audit();
     run_allocator_diagnostic();
     run_allocator_physical();
 
+    let audit_end = KERNEL_ALLOCATOR.audit();
+    if audit_end.is_consistent() {
+        log::info!(
+            "[bench][alloc][audit] final ok live={} boot={} physrec={} slab={}/{} kheap={}/{} managed={}/{}",
+            audit_end.registry_live_records,
+            audit_end.registry_boot_records,
+            audit_end.registry_physical_records,
+            audit_end.slab_active_objects,
+            audit_end.slab_live_records,
+            audit_end.kheap_active_allocs,
+            audit_end.kheap_live_records,
+            audit_end.managed_active_objects,
+            audit_end.managed_live_records
+        );
+    } else {
+        log::error!(
+            "[bench][alloc][audit] final inconsistent flags={} reg_struct={} live={} kinds={} boot={} physrec={} nodes={}/{} scan={}/{} slab={}/{} kheap={}/{} managed={}/{}",
+            audit_end.flags.bits(),
+            audit_end.registry_structure.flags.bits(),
+            audit_end.registry_live_records,
+            audit_end.registry_kind_records,
+            audit_end.registry_boot_records,
+            audit_end.registry_physical_records,
+            audit_end.registry_nodes_accounted,
+            audit_end.registry_node_capacity,
+            audit_end.registry_structure.scanned_live_records,
+            audit_end.registry_structure.scanned_free_nodes,
+            audit_end.slab_active_objects,
+            audit_end.slab_live_records,
+            audit_end.kheap_active_allocs,
+            audit_end.kheap_live_records,
+            audit_end.managed_active_objects,
+            audit_end.managed_live_records
+        );
+    }
+
     log::info!(
-        "[bench][alloc][cost] slab hot path ~= request routing + per-cpu cache + registry insert/remove: 8B={}ns 64B={}ns 80B/64align={}ns 1024B={}ns",
+        "[bench][alloc][cost] slab hot path ~= class routing + per-cpu cache + registry insert/remove + slab-node direct free: 8B={}ns 64B={}ns 80B/64align={}ns 1024B={}ns",
         slab8,
         slab64,
         slab80_align64,
@@ -192,6 +234,60 @@ fn run_allocator_bench() {
         large4k,
         large8k,
         large64k
+    );
+    log_allocator_hotspot("end");
+}
+
+fn log_allocator_hotspot(stage: &str) {
+    let hot = KERNEL_ALLOCATOR.hotspot_summary();
+    log::info!(
+        "[bench][alloc][hotspot][{}] slab_hit={}/1000 slab_miss={}/1000 refill={}/1000 flush={}/1000 fast_free={}/1000 fallback={} reg_chain={} reg_shard={} reg_load={}/1000 reg_nonempty={} reg_nonempty_load={}/1000 reg_underflow={} kheap_fail={}/1000 kheap_realloc={}/1000 kheap_cache={}/1000 cached_pages={} pressure_rel={} vmem_largest={}pct vmem_free_segs={} managed_frag={}/1000 pressure={}",
+        stage,
+        hot.slab_cache_hit_per_mille,
+        hot.slab_cache_miss_per_mille,
+        hot.slab_refill_per_mille,
+        hot.slab_flush_per_mille,
+        hot.slab_fast_free_per_mille,
+        hot.slab_fast_free_fallbacks,
+        hot.registry_max_chain_len,
+        hot.registry_max_shard_live_records,
+        hot.registry_live_per_bucket_per_mille,
+        hot.registry_nonempty_buckets,
+        hot.registry_nonempty_load_per_mille,
+        hot.registry_underflows,
+        hot.kheap_failure_per_mille,
+        hot.kheap_realloc_per_mille,
+        hot.kheap_cache_hit_per_mille,
+        hot.kheap_cached_pages,
+        hot.kheap_cache_pressure_releases,
+        hot.kernel_vmem_largest_free_percent,
+        hot.kernel_vmem_free_segments,
+        hot.managed_fragmentation_per_mille,
+        hot.pressure_level
+    );
+}
+
+fn run_allocator_audit() {
+    let iters = 4096usize;
+    let t0 = hal::time::monotonic_ns();
+    let mut audit_flags = 0u32;
+    let mut registry_flags = 0u32;
+    let mut live = 0usize;
+    for _ in 0..iters {
+        let audit = KERNEL_ALLOCATOR.audit();
+        audit_flags |= audit.flags.bits();
+        registry_flags |= audit.registry_structure.flags.bits();
+        live = live.saturating_add(audit.registry_live_records);
+        core::hint::black_box(audit);
+    }
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][alloc][audit] {} snapshots avg {} ns/op audit_flags={} registry_flags={} avg_live={}; source=layer stats snapshot + full registry shard scan + typed invariant checks",
+        iters,
+        dt / iters as u64,
+        audit_flags,
+        registry_flags,
+        live / iters
     );
 }
 
@@ -437,7 +533,7 @@ fn run_allocator_realloc_grow() {
     }
 
     log::info!(
-        "[bench][alloc][realloc-grow] {} x 64B->4K avg {} ns/op; source=new kheap alloc + copy + old slab free",
+        "[bench][alloc][realloc-grow] {} x 64B->4K avg {} ns/op; source=new kheap alloc + copy + registry-cookie old slab release",
         completed,
         total_dt / completed.max(1) as u64
     );
@@ -455,7 +551,7 @@ fn run_allocator_diagnostic() {
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + no_alloc formatting",
+        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + registry audit scan + no_alloc formatting",
         iters,
         dt / iters as u64,
         total_len / iters
@@ -490,10 +586,11 @@ fn run_allocator_physical() {
         }
         for slot in pages.iter_mut().take(allocated).rev() {
             if let Some(page) = slot.take() {
-                if !KERNEL_ALLOCATOR.free_physical(page) {
+                if let Err(err) = KERNEL_ALLOCATOR.try_free_physical(page) {
                     log::error!(
-                        "[bench][alloc][physical] free failed paddr={:#x}",
-                        page.paddr
+                        "[bench][alloc][physical] free failed paddr={:#x}: {:?}",
+                        page.paddr,
+                        err
                     );
                     return;
                 }
@@ -507,7 +604,7 @@ fn run_allocator_physical() {
 
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][alloc][physical] {} x page alloc+free avg {} ns/op; source=buddy lock + split/coalesce",
+        "[bench][alloc][physical] {} x page alloc+free avg {} ns/op; source=buddy lock + split/coalesce + registry tracking",
         completed,
         dt / completed.max(1) as u64
     );
