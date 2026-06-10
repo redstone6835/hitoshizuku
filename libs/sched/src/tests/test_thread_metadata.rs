@@ -127,6 +127,31 @@ fn runqueue_migratable_load_filters_cpu_affinity() {
 }
 
 #[ktest]
+fn runqueue_take_migratable_respects_cpu_affinity() {
+    let cpu0 = make_task();
+    let cpu1 = make_task();
+    cpu0.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    cpu1.set_cpu_affinity(CpuMask::single_raw(1).bits());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&cpu0), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&cpu1), 1);
+
+    let pulled = rq
+        .take_migratable(CpuMask::single_raw(1).bits(), 2)
+        .expect("cpu1 should pull an affinity-compatible task");
+    assert!(alloc::sync::Arc::ptr_eq(&pulled, &cpu1));
+    assert!(!pulled.sched.on_rq());
+    assert_eq!(rq.migratable_load(), 1);
+    assert!(
+        rq.take_migratable(CpuMask::single_raw(2).bits(), 3)
+            .is_none()
+    );
+
+    assert!(rq.dequeue(&cpu0, 4));
+}
+
+#[ktest]
 fn runqueue_update_nice_keeps_policy_and_slice() {
     let task = make_task();
     task.sched
