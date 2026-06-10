@@ -306,14 +306,13 @@ pub fn nice(inc: i32) -> Result<i32, Errno> {
     } else if new_nice > 19 {
         new_nice = 19;
     }
-    runqueue_of(me.current_cpu()).update_params(
+    sched_setparam_for_task(
         &me,
         SchedParams {
             nice: new_nice as i8,
             slice_ns: 0,
         },
-        crate::scheduler::now_ns_public(),
-    );
+    )?;
     Ok(new_nice)
 }
 
@@ -324,13 +323,15 @@ pub fn sched_setparam(pid: PidT, params: SchedParams) -> Result<(), Errno> {
 }
 
 pub fn sched_setparam_for_task(task: &Arc<Task>, params: SchedParams) -> Result<(), Errno> {
-    runqueue_of(task.current_cpu()).update_params(task, params, crate::scheduler::now_ns_public());
-    Ok(())
+    update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_params(task, params, now_ns)
+    })
 }
 
 pub fn sched_setnice_for_task(task: &Arc<Task>, nice: i8) -> Result<(), Errno> {
-    runqueue_of(task.current_cpu()).update_nice(task, nice, crate::scheduler::now_ns_public());
-    Ok(())
+    update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_nice(task, nice, now_ns)
+    })
 }
 
 /// 设置完整调度属性。权限检查由 syscall 层负责；本函数只校验参数和更新 rq。
@@ -342,12 +343,37 @@ pub fn sched_setattr(pid: PidT, attr: SchedAttr) -> Result<(), Errno> {
 
 pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
     let attr = attr.validate()?;
-    runqueue_of(task.current_cpu()).update_sched_attr(
-        task,
-        attr,
-        crate::scheduler::now_ns_public(),
-    );
-    Ok(())
+    update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_sched_attr(task, attr, now_ns)
+    })
+}
+
+fn update_task_sched_entity(
+    task: &Arc<Task>,
+    mut update: impl FnMut(usize, &Arc<Task>, u64) -> bool,
+) -> Result<(), Errno> {
+    let now_ns = crate::scheduler::now_ns_public();
+    let owner = task.current_cpu();
+    if owner < NR_CPUS && update(owner, task, now_ns) {
+        return Ok(());
+    }
+
+    for cpu_id in 0..NR_CPUS {
+        if cpu_id == owner {
+            continue;
+        }
+        if update(cpu_id, task, now_ns) {
+            return Ok(());
+        }
+    }
+
+    if task.sched.on_rq() {
+        Err(Errno::EBUSY)
+    } else if update(task.current_cpu().min(NR_CPUS - 1), task, now_ns) {
+        Ok(())
+    } else {
+        Err(Errno::EBUSY)
+    }
 }
 
 pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {

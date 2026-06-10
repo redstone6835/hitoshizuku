@@ -311,21 +311,21 @@ impl Runqueue {
     }
 
     /// 在 rq 锁内更新 nice / slice，并按旧属性先完成出队记账。
-    pub fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params));
+    pub fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params))
     }
 
     /// 在 rq 锁内只更新 nice/weight，保持策略与时间片不变。
-    pub fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice));
+    pub fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice))
     }
 
     /// 在 rq 锁内更新完整调度属性，并按旧 class / 权重完成出队记账。
-    pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr));
+    pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr))
     }
 
-    fn update_sched_entity<F>(&self, task: &Arc<Task>, now_ns: u64, update: F)
+    fn update_sched_entity<F>(&self, task: &Arc<Task>, now_ns: u64, update: F) -> bool
     where
         F: FnOnce(&Arc<Task>),
     {
@@ -339,7 +339,7 @@ impl Runqueue {
                 apply(task);
                 let now = inner.last_update_ns;
                 prepare_running_locked(&mut inner, task, now);
-                return;
+                return true;
             }
         }
 
@@ -350,13 +350,20 @@ impl Runqueue {
             owned.set_state(TaskState::Runnable);
             let now = inner.last_update_ns;
             enqueue_queued_locked(&mut inner, owned, now);
-            return;
+            return true;
+        }
+
+        // 任务声称仍在某个 rq 上，但不属于当前 rq。调用方应重新按 CPU 归属
+        // 定位或扫描其它 rq，避免在迁移窗口里只更新实体而留下旧索引。
+        if task.sched.on_rq() {
+            return false;
         }
 
         let apply = update.take().expect("[sched] update closure consumed");
         apply(task);
         let now = inner.last_update_ns;
         prepare_sleeping_locked(&mut inner, task, now);
+        true
     }
 
     pub fn snapshot_runnable(&self) -> Vec<Arc<Task>> {

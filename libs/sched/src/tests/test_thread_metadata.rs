@@ -169,3 +169,15 @@ fn runqueue_update_nice_keeps_policy_and_slice() {
 
     assert!(rq.dequeue(&task, 3));
 }
+
+#[ktest]
+fn runqueue_update_wrong_queue_does_not_mutate_entity() {
+    let task = make_task();
+    task.sched.set_on_rq(true);
+    task.set_current_cpu(1);
+
+    let rq = Runqueue::new();
+    assert!(!rq.update_nice(&task, -10, 1));
+    assert_eq!(task.sched.nice(), 0);
+    assert!(task.sched.on_rq());
+}
