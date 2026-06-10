@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use crate::arch_hooks::KernelEntry;
 use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::eevdf::SchedParams;
+use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::group::ThreadGroup;
 use crate::scheduler::{
     current_task, enqueue_task, init_task, mark_task_exited, now_ns_public, root_pid_ns,
@@ -172,6 +173,24 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     );
     // 5. 凭据：所有 fork/clone 都拷贝父的当前凭据（写时复制）。
     child.set_credentials(parent.credentials());
+    if flags.has(CloneFlags::CLONE_VM) && !flags.has(CloneFlags::CLONE_VFORK) {
+        child.clear_sigaltstack();
+    } else {
+        child.set_sigaltstack(parent.sigaltstack());
+    }
+    if parent.sched_reset_on_fork() && !flags.has(CloneFlags::CLONE_THREAD) {
+        // 父任务通过 SCHED_RESET_ON_FORK 要求子进程不能继承 RT/deadline
+        // 或负 nice 权重；子任务自身不继续携带该继承标志。
+        let parent_attr = parent.sched.sched_attr();
+        let child_attr = match parent_attr.policy {
+            SchedPolicy::Fair | SchedPolicy::Idle => SchedAttr::fair(parent_attr.nice.max(0), 0),
+            SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin | SchedPolicy::Deadline => {
+                SchedAttr::fair(0, 0)
+            }
+        };
+        child.sched.set_sched_attr(child_attr);
+        child.set_sched_reset_on_fork(false);
+    }
 
     // 6. 退出信号：CLONE_THREAD 不发；否则取 flags 低 8 位（0 → SIGCHLD）。
     let Some(raw_exit_sig) = args.exit_signal_checked() else {
@@ -365,6 +384,8 @@ where
     let code = zombie
         .exit_code()
         .expect("[sched][reap] zombie without exit code");
+    let usage = zombie.usage_snapshot(now_ns_public());
+    parent.add_child_usage(usage);
 
     // 归还 pid 槽。
     for (ns, pid) in zombie.pid_namespaces_snapshot() {

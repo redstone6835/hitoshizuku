@@ -13,7 +13,7 @@ use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::ids::{Capability, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
-use sched::task::{RseqRegistration, Task, TaskState};
+use sched::task::{Task, TaskState};
 use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatus};
 
 const MAX_CPUSET_BYTES: usize = 1024;
@@ -32,6 +32,11 @@ const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_fedc;
 const LINUX_REBOOT_CMD_RESTART2: u32 = 0xa1b2_c3d4;
 const LINUX_REBOOT_CMD_SW_SUSPEND: u32 = 0xd000_fce2;
 const LINUX_REBOOT_CMD_KEXEC: u32 = 0x4558_4543;
+const UTS_FIELD_LEN: usize = 65;
+const UTS_NAME_MAX: usize = UTS_FIELD_LEN - 1;
+
+static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
+static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 
 pub(super) fn sys_getpid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(sched::operation::getpid() as usize)
@@ -285,8 +290,7 @@ pub(super) fn sys_wait4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         copy_to_user(status_user, &result.status.raw().to_le_bytes()).map_err(|e| e.as_errno())?;
     }
     if rusage_user != 0 {
-        let zero_rusage = [0u8; 144];
-        copy_to_user(rusage_user, &zero_rusage).map_err(|e| e.as_errno())?;
+        write_rusage(rusage_user, result.usage)?;
     }
     Ok(result.pid as usize)
 }
@@ -340,8 +344,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
     }
     if rusage != 0 {
-        let zero_rusage = [0u8; 144];
-        copy_to_user(rusage, &zero_rusage).map_err(|e| e.as_errno())?;
+        write_rusage(rusage, result.usage)?;
     }
     Ok(0)
 }
@@ -442,6 +445,7 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
         return Err(Errno::EFAULT);
     }
     let task = lookup_task_for_thread_syscall(pid, &ctx.task)?;
+    require_task_access(&ctx.task, &task)?;
     let robust = task.robust_list();
     copy_to_user(head_user, &robust.head.to_ne_bytes()).map_err(|e| e.as_errno())?;
     copy_to_user(len_user, &robust.len.to_ne_bytes()).map_err(|e| e.as_errno())?;
@@ -449,51 +453,11 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
 }
 
 pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    const RSEQ_MIN_SIZE: usize = 32;
-    const RSEQ_FLAG_UNREGISTER: usize = 1;
-    const RSEQ_CPU_ID_START_OFFSET: usize = 0;
-    const RSEQ_CPU_ID_OFFSET: usize = 4;
-
-    let ptr = ctx.args[0];
-    let len = ctx.args[1];
-    let flags = ctx.args[2];
-    let signature = ctx.args[3] as u32;
-
-    if (flags & !RSEQ_FLAG_UNREGISTER) != 0 {
-        return Err(Errno::EINVAL);
-    }
-    if ptr == 0 || len < RSEQ_MIN_SIZE || len > u32::MAX as usize {
-        return Err(Errno::EINVAL);
-    }
-
-    let current = ctx.task.rseq_registration();
-    if (flags & RSEQ_FLAG_UNREGISTER) != 0 {
-        if !current.registered {
-            return Err(Errno::EINVAL);
-        }
-        if current.ptr != ptr || current.len as usize != len || current.signature != signature {
-            return Err(Errno::EINVAL);
-        }
-        ctx.task.clear_rseq_registration();
-        return Ok(0);
-    }
-
-    if current.registered {
-        return Err(Errno::EBUSY);
-    }
-
-    // 注册成功前先确认用户区可写，并把当前 CPU 写入 rseq 的两个 CPU 字段。
-    // 当前调度器已维护 per-task current_cpu；后续多核迁移时在切换路径更新该字段。
-    let cpu = sched::current_cpu_id() as u32;
-    write_user_u32(ptr + RSEQ_CPU_ID_START_OFFSET, cpu)?;
-    write_user_u32(ptr + RSEQ_CPU_ID_OFFSET, cpu)?;
-    ctx.task.set_rseq_registration(RseqRegistration {
-        ptr,
-        len: len as u32,
-        signature,
-        registered: true,
-    });
-    Ok(0)
+    let _ = ctx;
+    // TODO(threading): rseq 不能只登记 CPU id。完整语义必须在信号、抢占、
+    // CPU 迁移和用户态 critical section abort 路径同时接入；在此之前返回
+    // ENOSYS 让 libc 安全禁用 rseq，避免暴露不完整快路径。
+    Err(Errno::ENOSYS)
 }
 
 pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -503,11 +467,18 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: usize = 1 << 2;
     const MEMBARRIER_CMD_PRIVATE_EXPEDITED: usize = 1 << 3;
     const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: usize = 1 << 4;
-    const SUPPORTED: usize = MEMBARRIER_CMD_GLOBAL
-        | MEMBARRIER_CMD_GLOBAL_EXPEDITED
-        | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
-        | MEMBARRIER_CMD_PRIVATE_EXPEDITED
-        | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED;
+    let single_cpu = sched::online_cpu_mask().count_ones() <= 1;
+    let supported = if single_cpu {
+        MEMBARRIER_CMD_GLOBAL
+            | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+            | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+            | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+    } else {
+        // TODO(smp): 多核 membarrier 需要 IPI rendezvous，确保目标 CPU 在
+        // 返回前经过调度点或显式内存屏障；单 CPU fence 不能扩展成 SMP 语义。
+        0
+    };
 
     let cmd = ctx.args[0];
     let flags = ctx.args[1];
@@ -515,13 +486,20 @@ pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         return Err(Errno::EINVAL);
     }
     match cmd {
-        MEMBARRIER_CMD_QUERY => Ok(SUPPORTED),
+        MEMBARRIER_CMD_QUERY => Ok(supported),
         MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED => {
-            Ok(0)
+            if (supported & cmd) != 0 {
+                Ok(0)
+            } else {
+                Err(Errno::EOPNOTSUPP)
+            }
         }
         MEMBARRIER_CMD_GLOBAL
         | MEMBARRIER_CMD_GLOBAL_EXPEDITED
         | MEMBARRIER_CMD_PRIVATE_EXPEDITED => {
+            if (supported & cmd) == 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
             // 当前内核只启动单 CPU；完整 SMP IPI rendezvous 接入前，SeqCst fence
             // 已足以满足本 CPU 上的 membarrier 可见性语义。
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -661,11 +639,11 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut out = [0u8; 65 * 6];
     write_uts_field(&mut out, 0, b"MyGo");
-    write_uts_field(&mut out, 1, b"mygo");
+    write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"mygo");
     write_uts_field(&mut out, 2, b"0.1.0");
     write_uts_field(&mut out, 3, b"MyGo kernel");
     write_uts_field(&mut out, 4, hal::platform::arch_name().as_bytes());
-    write_uts_field(&mut out, 5, b"localdomain");
+    write_uts_dynamic_field(&mut out, 5, &UTS_DOMAINNAME, b"localdomain");
     copy_to_user(ctx.args[0], &out).map_err(|e| e.as_errno())?;
     Ok(0)
 }
@@ -871,21 +849,72 @@ pub(super) fn sys_clock_getres(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 
 pub(super) fn sys_times(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let buf = ctx.args[0];
+    let self_usage = ctx.task.usage_snapshot(sched::now_ns_public());
+    let child_usage = ctx.task.child_usage_snapshot();
+    let ticks = ns_to_clock_ticks(sched::now_ns_public());
     if buf != 0 {
-        let zero = [0u8; 32];
-        copy_to_user(buf, &zero).map_err(|e| e.as_errno())?;
+        let mut raw = [0u8; 32];
+        put_i64(&mut raw, 0, ns_to_clock_ticks(self_usage.user_ns));
+        put_i64(&mut raw, 8, ns_to_clock_ticks(self_usage.system_ns));
+        put_i64(&mut raw, 16, ns_to_clock_ticks(child_usage.user_ns));
+        put_i64(&mut raw, 24, ns_to_clock_ticks(child_usage.system_ns));
+        copy_to_user(buf, &raw).map_err(|e| e.as_errno())?;
     }
-    Ok(0)
+    Ok(ticks as usize)
 }
 
 pub(super) fn sys_getrusage(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _who = ctx.args[0];
+    const RUSAGE_SELF: i32 = 0;
+    const RUSAGE_CHILDREN: i32 = -1;
+    const RUSAGE_THREAD: i32 = 1;
+
+    let who = ctx.args[0] as i32;
     let usage = ctx.args[1];
-    if usage != 0 {
-        let zero = [0u8; 144];
-        copy_to_user(usage, &zero).map_err(|e| e.as_errno())?;
+    if usage == 0 {
+        return Err(Errno::EFAULT);
     }
+    let snapshot = match who {
+        RUSAGE_SELF | RUSAGE_THREAD => ctx.task.usage_snapshot(sched::now_ns_public()),
+        RUSAGE_CHILDREN => ctx.task.child_usage_snapshot(),
+        _ => return Err(Errno::EINVAL),
+    };
+    write_rusage(usage, snapshot)?;
     Ok(0)
+}
+
+const USER_HZ: u64 = 100;
+
+fn ns_to_clock_ticks(ns: u64) -> i64 {
+    (ns / (1_000_000_000 / USER_HZ)).min(i64::MAX as u64) as i64
+}
+
+fn write_rusage(user: usize, usage: sched::TaskUsage) -> Result<(), Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 144];
+    write_timeval_pair(&mut raw, 0, usage.user_ns);
+    write_timeval_pair(&mut raw, 16, usage.system_ns);
+    put_i64(&mut raw, 64, usage.minflt.min(i64::MAX as u64) as i64);
+    put_i64(&mut raw, 72, usage.majflt.min(i64::MAX as u64) as i64);
+    put_i64(
+        &mut raw,
+        128,
+        usage.voluntary_ctxt_switches.min(i64::MAX as u64) as i64,
+    );
+    put_i64(
+        &mut raw,
+        136,
+        usage.involuntary_ctxt_switches.min(i64::MAX as u64) as i64,
+    );
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+}
+
+fn write_timeval_pair(out: &mut [u8], off: usize, ns: u64) {
+    let sec = (ns / 1_000_000_000).min(i64::MAX as u64) as i64;
+    let usec = ((ns % 1_000_000_000) / 1_000) as i64;
+    put_i64(out, off, sec);
+    put_i64(out, off + 8, usec);
 }
 
 pub(super) fn sys_sysinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -926,13 +955,123 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 }
 
 pub(super) fn sys_getpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _which = ctx.args[0];
-    let _who = ctx.args[1];
-    Ok(20)
+    let targets = priority_targets(ctx.args[0], ctx.args[1], &ctx.task)?;
+    let best_nice = targets
+        .iter()
+        .map(|task| task.sched.nice())
+        .min()
+        .ok_or(Errno::ESRCH)?;
+    Ok((20i32 - best_nice as i32) as usize)
 }
 
-pub(super) fn sys_setpriority(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_setpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let targets = priority_targets(ctx.args[0], ctx.args[1], &ctx.task)?;
+    if targets.is_empty() {
+        return Err(Errno::ESRCH);
+    }
+    let nice = (ctx.args[2] as i32).clamp(-20, 19) as i8;
+    for target in targets.iter() {
+        require_priority_access(&ctx.task, target, nice)?;
+    }
+    for target in targets {
+        sched::operation::set_task_nice(&target, nice);
+    }
     Ok(0)
+}
+
+const PRIO_PROCESS: usize = 0;
+const PRIO_PGRP: usize = 1;
+const PRIO_USER: usize = 2;
+
+fn priority_targets(
+    which: usize,
+    who: usize,
+    current: &Arc<Task>,
+) -> Result<Vec<Arc<Task>>, Errno> {
+    let tasks = sched::operation::all_tasks_snapshot();
+    let mut out = Vec::new();
+    match which {
+        PRIO_PROCESS => {
+            let pid = if who == 0 {
+                current.pid_root().unwrap_or(0)
+            } else {
+                who as i32
+            };
+            out.extend(tasks.into_iter().filter(|task| task.pid_root() == Some(pid)));
+        }
+        PRIO_PGRP => {
+            let pgid = if who == 0 {
+                current.process_group().pgid()
+            } else {
+                who as i32
+            };
+            out.extend(
+                tasks
+                    .into_iter()
+                    .filter(|task| task.process_group().pgid() == pgid),
+            );
+        }
+        PRIO_USER => {
+            let uid = if who == 0 {
+                current.credentials().uid
+            } else {
+                Uid(who as u32)
+            };
+            out.extend(
+                tasks
+                    .into_iter()
+                    .filter(|task| task.credentials().uid == uid),
+            );
+        }
+        _ => return Err(Errno::EINVAL),
+    }
+    if out.is_empty() {
+        Err(Errno::ESRCH)
+    } else {
+        Ok(out)
+    }
+}
+
+fn require_priority_access(
+    current: &Arc<Task>,
+    target: &Arc<Task>,
+    new_nice: i8,
+) -> Result<(), Errno> {
+    let current_creds = current.credentials();
+    if current_creds.has_cap(Capability::SysNice) {
+        return Ok(());
+    }
+    let target_creds = target.credentials();
+    let same_user = current_creds.euid == target_creds.uid
+        || current_creds.euid == target_creds.euid
+        || current_creds.uid == target_creds.uid
+        || current_creds.uid == target_creds.euid;
+    if !same_user {
+        return Err(Errno::EPERM);
+    }
+    if new_nice < target.sched.nice() {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
+fn require_sched_change_access(
+    ctx: &SyscallContext<'_>,
+    pid: i32,
+    new_attr: SchedAttr,
+) -> Result<(), Errno> {
+    let target = lookup_task_for_thread_syscall(pid, &ctx.task)?;
+    require_priority_access(&ctx.task, &target, new_attr.nice)?;
+    let old = target.sched.sched_attr();
+    let needs_sys_nice = matches!(
+        new_attr.policy,
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin | SchedPolicy::Deadline
+    ) || new_attr.priority > old.priority
+        || new_attr.nice < old.nice;
+    if needs_sys_nice && !ctx.task.credentials().has_cap(Capability::SysNice) {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
 }
 
 pub(super) fn sys_sched_getparam(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -971,6 +1110,7 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
         }
         SchedPolicy::Deadline => return Err(Errno::EINVAL),
     }
+    require_sched_change_access(ctx, pid, attr)?;
     sched::operation::sched_setattr(pid, attr)?;
     Ok(0)
 }
@@ -978,12 +1118,18 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
 pub(super) fn sys_sched_getscheduler(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let attr = sched::operation::sched_getattr(pid)?;
-    Ok(encode_linux_sched_policy(attr.policy))
+    let mut raw = encode_linux_sched_policy(attr.policy);
+    if sched::operation::sched_reset_on_fork(pid)? {
+        raw |= SCHED_RESET_ON_FORK;
+    }
+    Ok(raw)
 }
 
 pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
-    let policy = decode_linux_sched_policy(ctx.args[1])?;
+    let raw_policy = ctx.args[1];
+    let reset_on_fork = (raw_policy & SCHED_RESET_ON_FORK) != 0;
+    let policy = decode_linux_sched_policy(raw_policy)?;
     let param_user = ctx.args[2];
     if param_user == 0 {
         return Err(Errno::EINVAL);
@@ -1008,7 +1154,9 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
         deadline_ns: 0,
         period_ns: 0,
     };
+    require_sched_change_access(ctx, pid, attr)?;
     sched::operation::sched_setattr(pid, attr)?;
+    sched::operation::set_sched_reset_on_fork(pid, reset_on_fork)?;
     Ok(0)
 }
 
@@ -1102,8 +1250,10 @@ pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
-    let attr = read_linux_sched_attr(attr_user)?;
+    let (attr, reset_on_fork) = read_linux_sched_attr(attr_user)?;
+    require_sched_change_access(ctx, pid, attr)?;
     sched::operation::sched_setattr(pid, attr)?;
+    sched::operation::set_sched_reset_on_fork(pid, reset_on_fork)?;
     Ok(0)
 }
 
@@ -1119,12 +1269,15 @@ pub(super) fn sys_sched_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         return Err(Errno::EINVAL);
     }
     let attr = sched::operation::sched_getattr(pid)?;
-    write_linux_sched_attr(attr_user, size, attr)?;
+    let reset_on_fork = sched::operation::sched_reset_on_fork(pid)?;
+    write_linux_sched_attr(attr_user, size, attr, reset_on_fork)?;
     Ok(0)
 }
 
+const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
+const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+
 fn decode_linux_sched_policy(raw: usize) -> Result<SchedPolicy, Errno> {
-    const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
     match raw & !SCHED_RESET_ON_FORK {
         0 => Ok(SchedPolicy::Fair),
         1 => Ok(SchedPolicy::RtFifo),
@@ -1180,7 +1333,7 @@ fn validate_user_tail_zero(user: usize, offset: usize, len: usize) -> Result<(),
     Ok(())
 }
 
-fn read_linux_sched_attr(user: usize) -> Result<SchedAttr, Errno> {
+fn read_linux_sched_attr(user: usize) -> Result<(SchedAttr, bool), Errno> {
     let mut raw = [0u8; LINUX_SCHED_ATTR_SIZE];
     copy_from_user(user, &mut raw[..4]).map_err(|e| e.as_errno())?;
     let size = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
@@ -1201,30 +1354,43 @@ fn read_linux_sched_attr(user: usize) -> Result<SchedAttr, Errno> {
     let policy =
         decode_linux_sched_policy(u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize)?;
     let flags = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-    if flags != 0 {
-        // TODO(threading): sched_attr flags such as RESET_ON_FORK need per-task
-        // inheritance state. Reject them explicitly until that state exists.
+    if (flags & !SCHED_FLAG_RESET_ON_FORK) != 0 {
+        // TODO(threading): 其它 sched_attr flags 需要调度器提供对应的继承或
+        // admission-control 状态，不能在 ABI 层静默吞掉。
         return Err(Errno::EOPNOTSUPP);
     }
-    Ok(SchedAttr {
-        policy,
-        nice: i32::from_le_bytes(raw[16..20].try_into().unwrap()) as i8,
-        slice_ns: 0,
-        priority: u32::from_le_bytes(raw[20..24].try_into().unwrap()) as u8,
-        runtime_ns: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
-        deadline_ns: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
-        period_ns: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
-    })
+    Ok((
+        SchedAttr {
+            policy,
+            nice: i32::from_le_bytes(raw[16..20].try_into().unwrap()) as i8,
+            slice_ns: 0,
+            priority: u32::from_le_bytes(raw[20..24].try_into().unwrap()) as u8,
+            runtime_ns: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+            deadline_ns: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
+            period_ns: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
+        },
+        (flags & SCHED_FLAG_RESET_ON_FORK) != 0,
+    ))
 }
 
-fn write_linux_sched_attr(user: usize, size: usize, attr: SchedAttr) -> Result<(), Errno> {
+fn write_linux_sched_attr(
+    user: usize,
+    size: usize,
+    attr: SchedAttr,
+    reset_on_fork: bool,
+) -> Result<(), Errno> {
     if size < LINUX_SCHED_ATTR_BASE_SIZE {
         return Err(Errno::EINVAL);
     }
     let mut raw = [0u8; LINUX_SCHED_ATTR_SIZE];
     raw[0..4].copy_from_slice(&(LINUX_SCHED_ATTR_SIZE as u32).to_le_bytes());
     raw[4..8].copy_from_slice(&(encode_linux_sched_policy(attr.policy) as u32).to_le_bytes());
-    raw[8..16].copy_from_slice(&0u64.to_le_bytes());
+    let flags = if reset_on_fork {
+        SCHED_FLAG_RESET_ON_FORK
+    } else {
+        0
+    };
+    raw[8..16].copy_from_slice(&flags.to_le_bytes());
     raw[16..20].copy_from_slice(&(attr.nice as i32).to_le_bytes());
     raw[20..24].copy_from_slice(&(attr.priority as u32).to_le_bytes());
     raw[24..32].copy_from_slice(&attr.runtime_ns.to_le_bytes());
@@ -1541,6 +1707,7 @@ type FutexKey = VmFutexKey;
 struct FutexWaiter {
     task: Arc<sched::Task>,
     bitset: u32,
+    waitv_index: Option<usize>,
 }
 
 struct FutexBucket {
@@ -1922,22 +2089,129 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
 }
 
-pub(super) fn sys_futex_waitv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    // TODO(threading): futex_waitv needs vector validation and shared futex key
-    // support. Keep the syscall registered so userspace probing is explicit.
-    Err(Errno::EOPNOTSUPP)
+pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const FUTEX_WAITV_MAX: usize = 128;
+    const FUTEX_WAITV_ENTRY_SIZE: usize = 24;
+
+    let waiters = ctx.args[0];
+    let nr = ctx.args[1];
+    let flags = ctx.args[2];
+    let timeout = ctx.args[3];
+    let clockid = ctx.args[4];
+    if waiters == 0 || nr == 0 || nr > FUTEX_WAITV_MAX || flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let deadline = futex2_abs_deadline(timeout, clockid)?;
+    let mut entries = Vec::new();
+    for index in 0..nr {
+        let entry = read_futex_waitv_entry(waiters + index * FUTEX_WAITV_ENTRY_SIZE, index)?;
+        if read_user_u32(entry.uaddr)? != entry.expected {
+            return Err(Errno::EAGAIN);
+        }
+        entries.push(entry);
+    }
+    if let Some(deadline) = deadline
+        && sched::now_ns_public() >= deadline
+    {
+        return Err(Errno::ETIMEDOUT);
+    }
+    {
+        let mut table = FUTEX_TABLE.lock();
+        for entry in entries.iter() {
+            table
+                .entry(entry.key)
+                .or_insert(FutexBucket {
+                    waiters: Vec::new(),
+                })
+                .waiters
+                .push(FutexWaiter {
+                    task: Arc::clone(&ctx.task),
+                    bitset: FUTEX_BITSET_MATCH_ANY,
+                    waitv_index: Some(entry.index),
+                });
+        }
+    }
+
+    loop {
+        if sched::operation::sigpending()?.raw() != 0 {
+            futex_waitv_remove_all(&entries, &ctx.task);
+            restore_current_task_after_sleep(&ctx.task);
+            if deadline.is_some() {
+                sched::cancel_sleep_deadline(&ctx.task);
+            }
+            return Err(Errno::EINTR);
+        }
+        if let Some(index) = futex_waitv_woken_index(&entries, &ctx.task) {
+            futex_waitv_remove_all(&entries, &ctx.task);
+            restore_current_task_after_sleep(&ctx.task);
+            if deadline.is_some() {
+                sched::cancel_sleep_deadline(&ctx.task);
+            }
+            return Ok(index);
+        }
+        if let Some(deadline) = deadline {
+            if sched::now_ns_public() >= deadline {
+                futex_waitv_remove_all(&entries, &ctx.task);
+                restore_current_task_after_sleep(&ctx.task);
+                sched::cancel_sleep_deadline(&ctx.task);
+                return Err(Errno::ETIMEDOUT);
+            }
+            if !sched::register_sleep_deadline(&ctx.task, deadline) {
+                futex_waitv_remove_all(&entries, &ctx.task);
+                restore_current_task_after_sleep(&ctx.task);
+                return Err(Errno::ETIMEDOUT);
+            }
+        }
+        let _ = ctx.task.cas_state(TaskState::Running, TaskState::Sleeping);
+        sched::operation::sched_yield()?;
+        if deadline.is_some() {
+            sched::cancel_sleep_deadline(&ctx.task);
+        }
+        restore_current_task_after_sleep(&ctx.task);
+    }
 }
 
-pub(super) fn sys_futex_wake(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    // TODO(threading): new futex2 wake ABI has a different argument layout from
-    // futex(2); implement it after the shared-key backend exists.
-    Err(Errno::EOPNOTSUPP)
+pub(super) fn sys_futex_wake(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let uaddr = ctx.args[0];
+    let mask = ctx.args[1] as u32;
+    let nr = ctx.args[2] as isize;
+    let flags = ctx.args[3] as u32;
+    if uaddr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if uaddr % 4 != 0 || mask == 0 || nr < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let private = futex2_private(flags)?;
+    Ok(futex_wake_key(
+        futex_key(&ctx.task, uaddr, private)?,
+        nr as usize,
+        mask,
+    ))
 }
 
-pub(super) fn sys_futex_wait(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    // TODO(threading): new futex2 wait ABI is intentionally not aliased to old
-    // futex because flags and timeout layout differ.
-    Err(Errno::EOPNOTSUPP)
+pub(super) fn sys_futex_wait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let uaddr = ctx.args[0];
+    let val = ctx.args[1] as u32;
+    let mask = ctx.args[2] as u32;
+    let flags = ctx.args[3] as u32;
+    let timeout = ctx.args[4];
+    let clockid = ctx.args[5];
+    if uaddr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if uaddr % 4 != 0 || mask == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let private = futex2_private(flags)?;
+    futex_wait(
+        &ctx.task,
+        futex_key(&ctx.task, uaddr, private)?,
+        uaddr,
+        val,
+        mask,
+        futex2_abs_deadline(timeout, clockid)?,
+    )
 }
 
 pub(super) fn sys_futex_requeue(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1982,8 +2256,8 @@ pub(super) fn sys_timer_delete(_ctx: &mut SyscallContext<'_>) -> Result<usize, E
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_clock_settime(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    clock_settime_common(ctx)
 }
 
 pub(super) fn sys_ptrace(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2006,12 +2280,12 @@ pub(super) fn sys_getresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     Ok(0)
 }
 
-pub(super) fn sys_sethostname(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_sethostname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    set_uts_field(ctx, &UTS_HOSTNAME)
 }
 
-pub(super) fn sys_setdomainname(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_setdomainname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    set_uts_field(ctx, &UTS_DOMAINNAME)
 }
 
 pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2020,8 +2294,16 @@ pub(super) fn sys_umask(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Ok(old.bits() as usize)
 }
 
-pub(super) fn sys_settimeofday(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_settimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let tv = ctx.args[0];
+    if tv == 0 {
+        return Ok(0);
+    }
+    require_cap(&ctx.task, Capability::SysTime)?;
+    let mut raw = [0u8; TIMEVAL_SIZE];
+    copy_from_user(tv, &mut raw).map_err(|e| e.as_errno())?;
+    crate::vdso::set_realtime_ns(timeval_to_ns(&raw)?);
+    Ok(0)
 }
 
 pub(super) fn sys_adjtimex(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2040,8 +2322,55 @@ pub(super) fn sys_setns(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_kcmp(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_kcmp(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const KCMP_FILE: usize = 0;
+    const KCMP_VM: usize = 1;
+    const KCMP_FILES: usize = 2;
+    const KCMP_FS: usize = 3;
+    const KCMP_SIGHAND: usize = 4;
+
+    let pid1 = ctx.args[0] as i32;
+    let pid2 = ctx.args[1] as i32;
+    let ty = ctx.args[2];
+    let idx1 = ctx.args[3];
+    let idx2 = ctx.args[4];
+    let task1 = lookup_task_for_thread_syscall(pid1, &ctx.task)?;
+    let task2 = lookup_task_for_thread_syscall(pid2, &ctx.task)?;
+    require_task_access(&ctx.task, &task1)?;
+    require_task_access(&ctx.task, &task2)?;
+
+    match ty {
+        KCMP_FILE => {
+            let fd1 = kcmp_fd_arg(idx1)?;
+            let fd2 = kcmp_fd_arg(idx2)?;
+            let fdt1 = task_fdtable(&task1).ok_or(Errno::EBADF)?;
+            let fdt2 = task_fdtable(&task2).ok_or(Errno::EBADF)?;
+            let file1 = fdt1.get_file(fd1).ok_or(Errno::EBADF)?;
+            let file2 = fdt2.get_file(fd2).ok_or(Errno::EBADF)?;
+            Ok(kcmp_arc(&file1, &file2))
+        }
+        KCMP_VM => {
+            let vm1 = task_vm_space(&task1).ok_or(Errno::EINVAL)?;
+            let vm2 = task_vm_space(&task2).ok_or(Errno::EINVAL)?;
+            Ok(kcmp_arc(&vm1, &vm2))
+        }
+        KCMP_FILES => {
+            let fdt1 = task_fdtable(&task1).ok_or(Errno::EINVAL)?;
+            let fdt2 = task_fdtable(&task2).ok_or(Errno::EINVAL)?;
+            Ok(kcmp_arc(&fdt1, &fdt2))
+        }
+        KCMP_FS => {
+            let fs1 = task_vfs_context(&task1).ok_or(Errno::EINVAL)?;
+            let fs2 = task_vfs_context(&task2).ok_or(Errno::EINVAL)?;
+            Ok(kcmp_arc(&fs1, &fs2))
+        }
+        KCMP_SIGHAND => {
+            let sig1 = task1.shared_signal();
+            let sig2 = task2.shared_signal();
+            Ok(kcmp_arc(&sig1, &sig2))
+        }
+        _ => Err(Errno::EOPNOTSUPP),
+    }
 }
 
 pub(super) fn sys_finit_module(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2068,8 +2397,8 @@ pub(super) fn sys_clock_gettime64(ctx: &mut SyscallContext<'_>) -> Result<usize,
     sys_clock_gettime(ctx)
 }
 
-pub(super) fn sys_clock_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_clock_settime64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    clock_settime_common(ctx)
 }
 
 pub(super) fn sys_clock_adjtime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2102,6 +2431,7 @@ pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         return Err(Errno::EINVAL);
     }
     let task = lookup_task_for_thread_syscall(pid, &ctx.task)?;
+    require_task_access(&ctx.task, &task)?;
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
         .map(|ctx| Arc::clone(&ctx.cred))
@@ -2166,6 +2496,7 @@ fn futex_wait(
             .push(FutexWaiter {
                 task: me.clone(),
                 bitset,
+                waitv_index: None,
             });
     }
 
@@ -2208,6 +2539,112 @@ fn futex_wait(
             return Ok(0);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct FutexWaitvEntry {
+    index: usize,
+    uaddr: usize,
+    expected: u32,
+    key: FutexKey,
+}
+
+const FUTEX2_SIZE_U32: u32 = 0x02;
+const FUTEX2_SIZE_MASK: u32 = 0x03;
+const FUTEX2_SUPPORTED_FLAGS: u32 = FUTEX2_SIZE_U32 | FUTEX_PRIVATE_FLAG;
+
+fn futex2_private(flags: u32) -> Result<bool, Errno> {
+    if (flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32
+        || (flags & !FUTEX2_SUPPORTED_FLAGS) != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    Ok((flags & FUTEX_PRIVATE_FLAG) != 0)
+}
+
+fn read_futex_waitv_entry(user: usize, index: usize) -> Result<FutexWaitvEntry, Errno> {
+    let mut raw = [0u8; 24];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let val = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let uaddr = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as usize;
+    let flags = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+    let reserved = u32::from_le_bytes(raw[20..24].try_into().unwrap());
+    if reserved != 0 || val > u32::MAX as u64 {
+        return Err(Errno::EINVAL);
+    }
+    if uaddr == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if uaddr % 4 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let private = futex2_private(flags)?;
+    let task = sched::current_task();
+    Ok(FutexWaitvEntry {
+        index,
+        uaddr,
+        expected: val as u32,
+        key: futex_key(&task, uaddr, private)?,
+    })
+}
+
+fn futex_waitv_contains(
+    bucket: &FutexBucket,
+    task: &Arc<Task>,
+    waitv_index: usize,
+) -> bool {
+    bucket
+        .waiters
+        .iter()
+        .any(|waiter| Arc::ptr_eq(&waiter.task, task) && waiter.waitv_index == Some(waitv_index))
+}
+
+fn futex_waitv_woken_index(entries: &[FutexWaitvEntry], task: &Arc<Task>) -> Option<usize> {
+    let table = FUTEX_TABLE.lock();
+    for entry in entries {
+        let still_waiting = table
+            .get(&entry.key)
+            .map(|bucket| futex_waitv_contains(bucket, task, entry.index))
+            .unwrap_or(false);
+        if !still_waiting {
+            return Some(entry.index);
+        }
+    }
+    None
+}
+
+fn futex_waitv_remove_all(entries: &[FutexWaitvEntry], task: &Arc<Task>) {
+    let mut table = FUTEX_TABLE.lock();
+    for entry in entries {
+        let remove_bucket = if let Some(bucket) = table.get_mut(&entry.key) {
+            bucket.waiters.retain(|waiter| {
+                !(Arc::ptr_eq(&waiter.task, task) && waiter.waitv_index == Some(entry.index))
+            });
+            bucket.waiters.is_empty()
+        } else {
+            false
+        };
+        if remove_bucket {
+            table.remove(&entry.key);
+        }
+    }
+}
+
+fn futex2_abs_deadline(timeout_user: usize, clockid: usize) -> Result<Option<u64>, Errno> {
+    if timeout_user == 0 {
+        return Ok(None);
+    }
+    if clockid != crate::vdso::CLOCK_MONOTONIC && clockid != crate::vdso::CLOCK_REALTIME {
+        return Err(Errno::EINVAL);
+    }
+    let abs_ns = read_timespec_ns(timeout_user)?;
+    let sched_now = sched::now_ns_public();
+    let clock_now = crate::vdso::clock_time_ns(clockid).unwrap_or(sched_now);
+    Ok(Some(if abs_ns <= clock_now {
+        sched_now
+    } else {
+        sched_now.saturating_add(abs_ns - clock_now)
+    }))
 }
 
 fn futex_wait_deadline(futex_op: u32, cmd: u32, timeout_user: usize) -> Result<Option<u64>, Errno> {
@@ -2264,6 +2701,62 @@ fn lookup_task_for_thread_syscall(pid: i32, current: &Arc<Task>) -> Result<Arc<T
         .lookup(pid)
         .and_then(|weak| weak.upgrade())
         .ok_or(Errno::ESRCH)
+}
+
+fn require_task_access(current: &Arc<Task>, target: &Arc<Task>) -> Result<(), Errno> {
+    if Arc::ptr_eq(current, target) {
+        return Ok(());
+    }
+    let current_creds = current.credentials();
+    if current_creds.has_cap(Capability::SysAdmin) {
+        return Ok(());
+    }
+    let target_creds = target.credentials();
+    if current_creds.euid == target_creds.uid
+        || current_creds.euid == target_creds.euid
+        || current_creds.uid == target_creds.uid
+        || current_creds.uid == target_creds.euid
+    {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+fn task_fdtable(task: &Arc<Task>) -> Option<Arc<vfs::FdTable>> {
+    task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)?
+        .downcast::<vfs::FdTable>()
+        .ok()
+}
+
+fn task_vfs_context(task: &Arc<Task>) -> Option<Arc<vfs::VfsContext>> {
+    task.ext_lookup(sched::TASKEXT_VFS_CONTEXT)?
+        .downcast::<vfs::VfsContext>()
+        .ok()
+}
+
+fn task_vm_space(task: &Arc<Task>) -> Option<Arc<VmSpace>> {
+    task.ext_lookup(sched::TASKEXT_VM_SPACE)?
+        .downcast::<VmSpace>()
+        .ok()
+}
+
+fn kcmp_arc<T>(left: &Arc<T>, right: &Arc<T>) -> usize {
+    if Arc::ptr_eq(left, right) {
+        return 0;
+    }
+    if (Arc::as_ptr(left) as usize) < (Arc::as_ptr(right) as usize) {
+        1
+    } else {
+        2
+    }
+}
+
+fn kcmp_fd_arg(raw: usize) -> Result<Fd, Errno> {
+    if raw > u32::MAX as usize {
+        return Err(Errno::EBADF);
+    }
+    Ok(Fd::from_raw(raw as u32))
 }
 
 fn exit_robust_list(task: &Arc<Task>) {
@@ -2390,10 +2883,65 @@ fn write_timeval_ns(out: &mut [u8], ns: u64) {
     out[8..16].copy_from_slice(&usec.to_le_bytes());
 }
 
+fn require_cap(task: &Arc<Task>, cap: Capability) -> Result<(), Errno> {
+    if task.credentials().has_cap(cap) {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+fn clock_settime_common(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let clock_id = ctx.args[0];
+    let tp = ctx.args[1];
+    if clock_id != crate::vdso::CLOCK_REALTIME {
+        return Err(Errno::EINVAL);
+    }
+    if tp == 0 {
+        return Err(Errno::EFAULT);
+    }
+    require_cap(&ctx.task, Capability::SysTime)?;
+    crate::vdso::set_realtime_ns(read_timespec_ns(tp)?);
+    Ok(0)
+}
+
+fn set_uts_field(
+    ctx: &mut SyscallContext<'_>,
+    field: &Spinlock<[u8; UTS_FIELD_LEN]>,
+) -> Result<usize, Errno> {
+    let user = ctx.args[0];
+    let len = ctx.args[1];
+    if len > UTS_NAME_MAX {
+        return Err(Errno::EINVAL);
+    }
+    require_cap(&ctx.task, Capability::SysAdmin)?;
+    let mut value = [0u8; UTS_FIELD_LEN];
+    if len != 0 {
+        copy_from_user(user, &mut value[..len]).map_err(|e| e.as_errno())?;
+    }
+    value[UTS_NAME_MAX] = 1;
+    *field.lock() = value;
+    Ok(0)
+}
+
 fn write_uts_field(out: &mut [u8], index: usize, value: &[u8]) {
     let start = index * 65;
     let n = value.len().min(64);
     out[start..start + n].copy_from_slice(&value[..n]);
+}
+
+fn write_uts_dynamic_field(
+    out: &mut [u8],
+    index: usize,
+    field: &Spinlock<[u8; UTS_FIELD_LEN]>,
+    default: &[u8],
+) {
+    let guard = field.lock();
+    if guard[UTS_NAME_MAX] == 0 {
+        write_uts_field(out, index, default);
+    } else {
+        write_uts_field(out, index, &guard[..]);
+    }
 }
 
 fn signal_arg(raw: usize) -> Result<Option<SignalNumber>, Errno> {

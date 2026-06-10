@@ -452,7 +452,24 @@ fn process_setup_signal_frame(
     let total = SIGFRAME_TRAP_OFF
         .checked_add(trap_len)
         .ok_or(Errno::EINVAL)?;
-    let new_sp = saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf;
+    let new_sp = if action.flags.has(SigActionFlags::SA_ONSTACK) {
+        let altstack = task.sigaltstack();
+        if !altstack.disabled && !altstack.contains(saved.sp()) {
+            let top = altstack
+                .sp
+                .checked_add(altstack.size)
+                .ok_or(Errno::EINVAL)?;
+            let sp = top.checked_sub(total).ok_or(Errno::ENOMEM)? & !0xf;
+            if sp < altstack.sp {
+                return Err(Errno::ENOMEM);
+            }
+            sp
+        } else {
+            saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
+        }
+    } else {
+        saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
+    };
 
     let mut frame_bytes = Vec::new();
     frame_bytes.resize(total, 0);

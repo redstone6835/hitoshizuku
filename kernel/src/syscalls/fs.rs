@@ -9,9 +9,9 @@ use core::ops::ControlFlow;
 use errno::Errno;
 use general::mm::{copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
-use general::vfs::{current_fdtable, current_vfs_context, namespace_path};
+use general::vfs::{current_fdtable, current_vfs_context, namespace_path, pidfd};
 use hal::abi::{decode_dev_t, encode_dev_t};
-use sched::{SigProcMaskHow, SigSet};
+use sched::{Capability, SigProcMaskHow, SigSet};
 use vfs::cred::{Gid, Uid};
 use vfs::error::VfsError;
 use vfs::fdtable::{Fd, FdFlags};
@@ -1097,8 +1097,26 @@ pub(super) fn sys_close_range(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     Ok(0)
 }
 
-pub(super) fn sys_eventfd2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_eventfd2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const EFD_SEMAPHORE: usize = 1;
+    const EFD_SUPPORTED: usize = EFD_SEMAPHORE | O_CLOEXEC | O_NONBLOCK;
+
+    let initval = ctx.args[0] as u32 as u64;
+    let flags = ctx.args[1];
+    if (flags & !EFD_SUPPORTED) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
+    let fd = vfs::eventfd::create(
+        &fdt,
+        Arc::clone(&vfs_ctx.cred),
+        initval,
+        (flags & EFD_SEMAPHORE) != 0,
+        (flags & O_NONBLOCK) != 0,
+        (flags & O_CLOEXEC) != 0,
+    )?;
+    Ok(fd.as_raw() as usize)
 }
 
 pub(super) fn sys_timerfd_create(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1663,12 +1681,43 @@ pub(super) fn sys_inotify_rm_watch(_ctx: &mut SyscallContext<'_>) -> Result<usiz
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_ioprio_set(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_ioprio_set(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let which = ctx.args[0];
+    let who = ctx.args[1] as i32;
+    let ioprio = validate_ioprio(ctx.args[2])?;
+    if ioprio_class(ioprio) == IOPRIO_CLASS_RT
+        && !ctx.task.credentials().has_cap(Capability::SysAdmin)
+    {
+        return Err(Errno::EPERM);
+    }
+    let targets = ioprio_targets(which, who, &ctx.task)?;
+    if targets.is_empty() {
+        return Err(Errno::ESRCH);
+    }
+    for task in targets {
+        if !task_may_access(&ctx.task, &task) {
+            return Err(Errno::EPERM);
+        }
+        task.set_ioprio(ioprio);
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_ioprio_get(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_ioprio_get(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let which = ctx.args[0];
+    let who = ctx.args[1] as i32;
+    let targets = ioprio_targets(which, who, &ctx.task)?;
+    if targets.is_empty() {
+        return Err(Errno::ESRCH);
+    }
+    let mut best = u16::MAX;
+    for task in targets {
+        if !task_may_access(&ctx.task, &task) {
+            return Err(Errno::EPERM);
+        }
+        best = best.min(task.ioprio());
+    }
+    Ok(best as usize)
 }
 
 pub(super) fn sys_renameat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1723,8 +1772,25 @@ pub(super) fn sys_tee(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_sync_file_range2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_sync_file_range2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const SYNC_FILE_RANGE_WAIT_BEFORE: usize = 1;
+    const SYNC_FILE_RANGE_WRITE: usize = 2;
+    const SYNC_FILE_RANGE_WAIT_AFTER: usize = 4;
+    const SYNC_FILE_RANGE_SUPPORTED: usize =
+        SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER;
+
+    let fd = fd_arg(ctx.args[0])?;
+    let flags = ctx.args[1];
+    let _offset = nonnegative_i64_arg(ctx.args[2])?;
+    let _nbytes = nonnegative_i64_arg(ctx.args[3])?;
+    if (flags & !SYNC_FILE_RANGE_SUPPORTED) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = file_for_fd(fd)?;
+    if flags != 0 {
+        file.sync().map_err(|e| e.to_errno())?;
+    }
+    Ok(0)
 }
 
 pub(super) fn sys_acct(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1849,8 +1915,25 @@ pub(super) fn sys_openat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     Ok(fd.as_raw() as usize)
 }
 
-pub(super) fn sys_pidfd_getfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pidfd = fd_arg(ctx.args[0])?;
+    let targetfd = fd_arg(ctx.args[1])?;
+    let flags = ctx.args[2];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let pid_file = fdt.get_file(pidfd).ok_or(Errno::EBADF)?;
+    let target = pidfd::task_from_file(&pid_file).ok_or(Errno::EINVAL)?;
+    if !task_may_access(&ctx.task, &target) {
+        return Err(Errno::EPERM);
+    }
+    let target_fdt = task_fdtable(&target).ok_or(Errno::EBADF)?;
+    let file = target_fdt.get_file(targetfd).ok_or(Errno::EBADF)?;
+    let new_fd = fdt
+        .alloc_fd(file, FdFlags::CLOEXEC)
+        .map_err(|err| err.to_errno())?;
+    Ok(new_fd.as_raw() as usize)
 }
 
 pub(super) fn sys_epoll_pwait2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2122,6 +2205,108 @@ fn fd_arg(raw: usize) -> Result<Fd, Errno> {
         return Err(Errno::EBADF);
     }
     Ok(Fd::from_raw(fd as u32))
+}
+
+const IOPRIO_WHO_PROCESS: usize = 1;
+const IOPRIO_WHO_PGRP: usize = 2;
+const IOPRIO_WHO_USER: usize = 3;
+const IOPRIO_CLASS_SHIFT: u16 = 13;
+const IOPRIO_CLASS_RT: u16 = 1;
+
+fn validate_ioprio(raw: usize) -> Result<u16, Errno> {
+    if raw > u16::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+    let value = raw as u16;
+    let class = ioprio_class(value);
+    if class > 3 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(value)
+}
+
+fn ioprio_class(value: u16) -> u16 {
+    value >> IOPRIO_CLASS_SHIFT
+}
+
+fn ioprio_targets(
+    which: usize,
+    who: i32,
+    current: &Arc<sched::Task>,
+) -> Result<Vec<Arc<sched::Task>>, Errno> {
+    match which {
+        IOPRIO_WHO_PROCESS => {
+            let task = if who == 0 {
+                Arc::clone(current)
+            } else {
+                lookup_task_by_pid(who)?
+            };
+            Ok(vec![task])
+        }
+        IOPRIO_WHO_PGRP => {
+            let pgid = if who == 0 {
+                current.process_group().pgid()
+            } else {
+                who
+            };
+            Ok(sched::root_pid_ns()
+                .registry()
+                .snapshot()
+                .into_iter()
+                .filter_map(|(_, weak)| weak.upgrade())
+                .filter(|task| task.process_group().pgid() == pgid)
+                .collect())
+        }
+        IOPRIO_WHO_USER => {
+            let uid = if who == 0 {
+                current.credentials().uid.0
+            } else if who < 0 {
+                return Err(Errno::EINVAL);
+            } else {
+                who as u32
+            };
+            Ok(sched::root_pid_ns()
+                .registry()
+                .snapshot()
+                .into_iter()
+                .filter_map(|(_, weak)| weak.upgrade())
+                .filter(|task| task.credentials().uid.0 == uid)
+                .collect())
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn lookup_task_by_pid(pid: i32) -> Result<Arc<sched::Task>, Errno> {
+    if pid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    sched::root_pid_ns()
+        .registry()
+        .lookup(pid)
+        .and_then(|weak| weak.upgrade())
+        .ok_or(Errno::ESRCH)
+}
+
+fn task_may_access(current: &Arc<sched::Task>, target: &Arc<sched::Task>) -> bool {
+    if Arc::ptr_eq(current, target) {
+        return true;
+    }
+    let current_creds = current.credentials();
+    if current_creds.has_cap(Capability::SysAdmin) {
+        return true;
+    }
+    let target_creds = target.credentials();
+    current_creds.euid == target_creds.uid
+        || current_creds.euid == target_creds.euid
+        || current_creds.uid == target_creds.uid
+        || current_creds.uid == target_creds.euid
+}
+
+fn task_fdtable(task: &Arc<sched::Task>) -> Option<Arc<vfs::fdtable::FdTable>> {
+    task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)?
+        .downcast::<vfs::fdtable::FdTable>()
+        .ok()
 }
 
 fn nonnegative_i64_arg(raw: usize) -> Result<u64, Errno> {

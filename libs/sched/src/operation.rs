@@ -9,6 +9,7 @@
 //! 调用者句柄。返回值统一 `Result<T, errno::Errno>`。
 //!
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use errno::Errno;
 
@@ -30,7 +31,7 @@ use crate::signal::{
     default_action,
 };
 use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching};
-use crate::task::Task;
+use crate::task::{Task, TaskUsage};
 use crate::wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 use crate::{ExitCode, TaskState};
 
@@ -283,6 +284,7 @@ pub fn exit_group(code: i32) -> ! {
 // ── 调度器相关 ────────────────────────────────────────────────────────────────
 
 pub fn sched_yield() -> Result<(), Errno> {
+    current_task().record_voluntary_context_switch();
     schedule_once(0);
     Ok(())
 }
@@ -325,6 +327,42 @@ pub fn sched_setattr(pid: PidT, attr: SchedAttr) -> Result<(), Errno> {
 
 pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
     Ok(lookup_pid(pid)?.sched.sched_attr())
+}
+
+pub fn set_sched_reset_on_fork(pid: PidT, enabled: bool) -> Result<(), Errno> {
+    lookup_pid(pid)?.set_sched_reset_on_fork(enabled);
+    Ok(())
+}
+
+pub fn sched_reset_on_fork(pid: PidT) -> Result<bool, Errno> {
+    Ok(lookup_pid(pid)?.sched_reset_on_fork())
+}
+
+pub fn set_task_nice(task: &Arc<Task>, nice: i8) {
+    let mut attr = task.sched.sched_attr();
+    attr.nice = nice.clamp(crate::eevdf::NICE_MIN, crate::eevdf::NICE_MAX);
+    runqueue_of(task.current_cpu()).update_sched_attr(
+        task,
+        attr,
+        crate::scheduler::now_ns_public(),
+    );
+}
+
+pub fn task_usage(pid: PidT) -> Result<TaskUsage, Errno> {
+    Ok(lookup_pid(pid)?.usage_snapshot(crate::scheduler::now_ns_public()))
+}
+
+pub fn children_usage(pid: PidT) -> Result<TaskUsage, Errno> {
+    Ok(lookup_pid(pid)?.child_usage_snapshot())
+}
+
+pub fn all_tasks_snapshot() -> Vec<Arc<Task>> {
+    root_pid_ns()
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .collect()
 }
 
 pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
@@ -376,6 +414,7 @@ pub fn execve_with_context(request: ExecRequest, user_ctx: UserContextRef) -> Re
     let ops = process_image_ops().ok_or(Errno::ENOSYS)?;
     (ops.execve)(&me, request, user_ctx)?;
     me.clear_rseq_registration();
+    me.clear_sigaltstack();
     me.shared_signal().reset_caught_for_exec();
     if me.is_vforking() {
         me.set_vforking(false);
@@ -514,7 +553,8 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
         | CloneFlags::CLONE_NEWIPC
         | CloneFlags::CLONE_NEWUSER
         | CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWNET;
+        | CloneFlags::CLONE_NEWNET
+        | CloneFlags::CLONE_IO;
     if flags.has(CloneFlags::CLONE_NEWNS) && flags.has(CloneFlags::CLONE_FS) {
         return Err(Errno::EINVAL);
     }
@@ -647,12 +687,14 @@ fn wait_common(
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status: child_exit_status(&child, code),
+                        usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
                     });
                 }
             } else if let Some((child, code)) = reap_matching(&me, pred) {
                 return Ok(WaitResult {
                     pid: child.pid_root().unwrap_or(0),
                     status: child_exit_status(&child, code),
+                    usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
                 });
             }
         }
@@ -665,6 +707,7 @@ fn wait_common(
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status,
+                        usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
                     });
                 }
             }
@@ -675,6 +718,7 @@ fn wait_common(
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
                         status,
+                        usage: child.usage_snapshot(crate::scheduler::now_ns_public()),
                     });
                 }
             }
@@ -691,6 +735,7 @@ fn wait_common(
             return Ok(WaitResult {
                 pid: 0,
                 status: WaitStatus(0),
+                usage: TaskUsage::default(),
             });
         }
 
@@ -859,6 +904,23 @@ pub fn tgqueueinfo(tgid: PidT, tid: PidT, info: SigInfo) -> Result<(), Errno> {
     check_kill_permission(&target)?;
     target.signal.deliver(info);
     signal_wakeup(&target, &info);
+    Ok(())
+}
+
+/// `rt_sigqueueinfo` / pidfd process-directed queued signal entry.
+pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
+    if pid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let target = lookup_pid(pid)?;
+    check_kill_permission(&target)?;
+    target.thread_group().shared_signal().deliver(info);
+    for member in target.thread_group().snapshot() {
+        if should_wake_for_signal(&member, info.sig) {
+            signal_wakeup(&member, &info);
+            break;
+        }
+    }
     Ok(())
 }
 

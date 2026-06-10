@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 
 use errno::Errno;
-use general::mm::VmSpace;
+use general::mm::{VmSpace, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::current_fdtable;
 use mm::VmFlags;
@@ -18,6 +18,17 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
+
+const MS_ASYNC: usize = 1;
+const MS_INVALIDATE: usize = 2;
+const MS_SYNC: usize = 4;
+const MS_SUPPORTED: usize = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+
+const MCL_CURRENT: usize = 1;
+const MCL_FUTURE: usize = 2;
+const MCL_ONFAULT: usize = 4;
+const MCL_SUPPORTED: usize = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+const MLOCK_ONFAULT: usize = 1;
 
 pub(super) fn sys_brk(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let Some(vm) = task_vm(ctx) else {
@@ -156,28 +167,76 @@ pub(super) fn sys_swapoff(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_msync(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_msync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let addr = ctx.args[0];
+    let len = ctx.args[1];
+    let flags = ctx.args[2];
+    if (flags & !MS_SUPPORTED) != 0 || (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let range = page_aligned_range(addr, len)?;
+    if (flags & MS_ASYNC) == 0 {
+        vm.sync_range(range)?;
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_mlock(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_mlock(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    if let Some(range) = rounded_page_range(ctx.args[0], ctx.args[1])? {
+        vm.mlock_range(range)?;
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_munlock(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_munlock(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    if let Some(range) = rounded_page_range(ctx.args[0], ctx.args[1])? {
+        vm.munlock_range(range)?;
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_mlockall(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_mlockall(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let flags = ctx.args[0];
+    if flags == 0 || (flags & !MCL_SUPPORTED) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MCL_ONFAULT) != 0 && (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MCL_CURRENT) != 0 {
+        vm.mlock_all_current();
+    }
+    if (flags & MCL_FUTURE) != 0 {
+        vm.set_mlock_future(true);
+    }
+    Ok(0)
 }
 
-pub(super) fn sys_munlockall(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_munlockall(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    vm.munlock_all();
+    Ok(0)
 }
 
-pub(super) fn sys_mincore(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_mincore(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let addr = ctx.args[0];
+    let len = ctx.args[1];
+    let vec_user = ctx.args[2];
+    if vec_user == 0 || len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let range = page_aligned_range(addr, len)?;
+    let bitmap = vm.resident_bitmap(range)?;
+    copy_to_user(vec_user, &bitmap).map_err(|e| e.as_errno())?;
+    Ok(0)
 }
 
 pub(super) fn sys_remap_file_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -216,8 +275,12 @@ pub(super) fn sys_userfaultfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_mlock2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_mlock2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let flags = ctx.args[2];
+    if (flags & !MLOCK_ONFAULT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    sys_mlock(ctx)
 }
 
 pub(super) fn sys_pkey_mprotect(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -304,4 +367,34 @@ fn prot_to_vm_flags(prot: usize) -> VmFlags {
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
     Some(value.checked_add(align - 1)? & !(align - 1))
+}
+
+fn page_aligned_range(addr: usize, len: usize) -> Result<core::ops::Range<usize>, Errno> {
+    let page_size = hal::memory::page_size();
+    if addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    if len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    Ok(addr..end)
+}
+
+fn rounded_page_range(
+    addr: usize,
+    len: usize,
+) -> Result<Option<core::ops::Range<usize>>, Errno> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let page_size = hal::memory::page_size();
+    let start = addr & !(page_size - 1);
+    let raw_end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let end = align_up(raw_end, page_size).ok_or(Errno::EINVAL)?;
+    if start >= end {
+        return Ok(None);
+    }
+    Ok(Some(start..end))
 }

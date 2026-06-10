@@ -287,6 +287,23 @@ impl VmaSet {
         out
     }
 
+    /// 修改 `range` 内全部 VMA 的非几何属性。跨边界时自动 split，backing 不变。
+    pub fn update_flags_range(
+        &mut self,
+        range: &Range<usize>,
+        update: impl Fn(VmFlags) -> VmFlags,
+    ) -> Vec<(Range<usize>, VmFlags)> {
+        let cut_pieces = self.unmap_range(range);
+        let mut out = Vec::with_capacity(cut_pieces.len());
+        for mut p in cut_pieces {
+            p.flags = update(p.flags);
+            out.push((p.range.clone(), p.flags));
+            let _ = self.insert(p);
+        }
+        self.merge_neighbors();
+        out
+    }
+
     /// 合并相邻且 flags/backing 兼容的 VMA（Anon、SharedAnon/File 偏移衔接、
     /// Direct 物理地址衔接）。
     /// 典型调用点：insert 之后的紧邻合并；批量 unmap 之后的收尾。

@@ -220,6 +220,7 @@ pub struct VmSpace {
     brk_start: usize,
     brk_current: AtomicUsize,
     mmap_next: AtomicUsize,
+    mlock_future: AtomicBool,
     /// 诊断辅助：记录当前已建立页表映射的用户页数。
     mapped_pages: AtomicUsize,
 }
@@ -241,6 +242,7 @@ impl VmSpace {
             brk_start: layout.user_heap_base,
             brk_current: AtomicUsize::new(layout.user_heap_base),
             mmap_next: AtomicUsize::new(layout.user_mmap_base),
+            mlock_future: AtomicBool::new(false),
             mapped_pages: AtomicUsize::new(0),
         }
     }
@@ -251,6 +253,14 @@ impl VmSpace {
 
     pub fn mapped_pages(&self) -> usize {
         self.mapped_pages.load(Ordering::Acquire)
+    }
+
+    fn with_future_mlock(&self, flags: VmFlags) -> VmFlags {
+        if self.mlock_future.load(Ordering::Acquire) {
+            flags.with(VmFlags::LOCKED)
+        } else {
+            flags
+        }
     }
 
     pub fn current_brk(&self) -> usize {
@@ -452,6 +462,7 @@ impl VmSpace {
     /// 注册一段匿名 VMA。不立即分配物理页。
     pub fn map_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
                 id: NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed),
@@ -477,6 +488,7 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        let flags = self.with_future_mlock(flags);
         let mapped_file = Arc::clone(&file);
         let area = VmArea {
             range,
@@ -491,6 +503,7 @@ impl VmSpace {
     /// MAP_FIXED 原子操作：在同一把 VMA 锁内先 unmap 再 insert，消除竞态窗口。
     pub fn map_fixed_anon(&self, range: Range<usize>, flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        let flags = self.with_future_mlock(flags);
         let backing = if flags.has(VmFlags::SHARED) {
             VmBacking::SharedAnon {
                 id: NEXT_SHARED_ANON_ID.fetch_add(1, Ordering::Relaxed),
@@ -530,6 +543,7 @@ impl VmSpace {
         flags: VmFlags,
     ) -> Result<(), Errno> {
         self.validate_range(&range)?;
+        let flags = self.with_future_mlock(flags);
         let mapped_file = Arc::clone(&file);
         let area = VmArea {
             range: range.clone(),
@@ -567,7 +581,7 @@ impl VmSpace {
         if paddr % page_size != 0 {
             return Err(Errno::EINVAL);
         }
-        let area_flags = flags.with(VmFlags::USER);
+        let area_flags = self.with_future_mlock(flags).with(VmFlags::USER);
         let area = VmArea {
             range: range.clone(),
             flags: area_flags,
@@ -626,6 +640,90 @@ impl VmSpace {
         Ok(())
     }
 
+    pub fn resident_bitmap(&self, range: Range<usize>) -> Result<Vec<u8>, Errno> {
+        self.validate_range(&range)?;
+        let page_size = page_size();
+        let page_count = (range.end - range.start) / page_size;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let pages = self.pages.lock();
+        let mut out = Vec::with_capacity(page_count);
+        let mut va = range.start;
+        while va < range.end {
+            out.push(if pages.contains_key(&va) { 1 } else { 0 });
+            va += page_size;
+        }
+        Ok(out)
+    }
+
+    pub fn sync_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        {
+            let set = self.vmas.lock();
+            if !set.contains_range(&range) {
+                return Err(Errno::ENOMEM);
+            }
+        }
+        let pages: Vec<Arc<ResidentPage>> = {
+            let pages = self.pages.lock();
+            pages
+                .range(range)
+                .map(|(_va, mapping)| Arc::clone(&mapping.page))
+                .collect()
+        };
+        for page in pages {
+            page.flush_to_backing()?;
+        }
+        Ok(())
+    }
+
+    pub fn mlock_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.update_locked_range(range, true)
+    }
+
+    pub fn munlock_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.update_locked_range(range, false)
+    }
+
+    pub fn mlock_all_current(&self) {
+        let mut set = self.vmas.lock();
+        let ranges: Vec<Range<usize>> = set.iter().map(|area| area.range.clone()).collect();
+        for range in ranges {
+            set.update_flags_range(&range, |flags| flags.with(VmFlags::LOCKED));
+        }
+    }
+
+    pub fn set_mlock_future(&self, enabled: bool) {
+        self.mlock_future.store(enabled, Ordering::Release);
+    }
+
+    pub fn munlock_all(&self) {
+        self.mlock_future.store(false, Ordering::Release);
+        let mut set = self.vmas.lock();
+        let ranges: Vec<Range<usize>> = set.iter().map(|area| area.range.clone()).collect();
+        for range in ranges {
+            set.update_flags_range(&range, |flags| flags.without(VmFlags::LOCKED));
+        }
+    }
+
+    fn update_locked_range(&self, range: Range<usize>, locked: bool) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let mut set = self.vmas.lock();
+        if !set.contains_range(&range) {
+            return Err(Errno::ENOMEM);
+        }
+        if locked {
+            set.update_flags_range(&range, |flags| flags.with(VmFlags::LOCKED));
+        } else {
+            set.update_flags_range(&range, |flags| flags.without(VmFlags::LOCKED));
+        }
+        Ok(())
+    }
+
     /// fork：克隆 VMA 元数据，已驻留的页按 private-COW / shared 语义重建页表。
     pub fn fork(&self) -> Self {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
@@ -679,6 +777,7 @@ impl VmSpace {
             brk_start: self.brk_start,
             brk_current: AtomicUsize::new(self.current_brk()),
             mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
+            mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
             mapped_pages: AtomicUsize::new(mapped_pages),
         }
     }

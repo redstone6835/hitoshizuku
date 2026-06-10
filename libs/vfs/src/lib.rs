@@ -9,11 +9,13 @@ extern crate alloc;
 
 pub use alloc::sync::Arc;
 
+pub mod anon;
 pub mod addr;
 pub mod cred;
 pub mod dentry;
 pub mod epoll;
 pub mod error;
+pub mod eventfd;
 pub mod fdtable;
 pub mod file;
 pub mod inode;
@@ -39,6 +41,7 @@ use stat::{FileMode, FileType};
 /// 为沿用旧的 `crate::vfs::...` 路径提供兼容别名。
 mod vfs {
     pub use crate::Arc;
+    pub use crate::anon;
     pub use crate::cred;
     pub use crate::dentry;
     pub use crate::error;
