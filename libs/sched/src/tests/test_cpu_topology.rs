@@ -2,7 +2,7 @@
 
 use ktest::ktest;
 
-use crate::cpu::{CpuId, CpuMask, ROOT_SCHED_DOMAIN_ID, SchedDomain, SchedTopology};
+use crate::cpu::{CpuId, CpuMask, MAX_CPUS, ROOT_SCHED_DOMAIN_ID, SchedDomain, SchedTopology};
 use crate::scheduler::select_balance_source;
 use crate::{NR_CPUS, supported_cpu_mask};
 
@@ -11,6 +11,10 @@ fn cpu_mask_truncates_to_supported_capacity() {
     let all = CpuMask::from_bits_truncate(u64::MAX);
     assert_eq!(all.bits(), supported_cpu_mask());
     assert_eq!(all.count(), NR_CPUS.min(u64::BITS as usize));
+    assert_eq!(
+        CpuMask::supported_storage_bytes(),
+        MAX_CPUS.min(u64::BITS as usize).div_ceil(8).max(1)
+    );
 
     let out_of_range = CpuMask::single_raw(NR_CPUS + 1);
     assert!(out_of_range.is_empty());

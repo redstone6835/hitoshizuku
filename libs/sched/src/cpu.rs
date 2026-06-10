@@ -152,7 +152,12 @@ impl CpuMask {
     }
 
     pub const fn supported_storage_bytes() -> usize {
-        let bytes = MAX_CPUS.div_ceil(BITS_PER_BYTE);
+        let supported = if MAX_CPUS > u64::BITS as usize {
+            u64::BITS as usize
+        } else {
+            MAX_CPUS
+        };
+        let bytes = supported.div_ceil(BITS_PER_BYTE);
         if bytes == 0 { 1 } else { bytes }
     }
 }
