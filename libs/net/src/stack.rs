@@ -1012,11 +1012,12 @@ impl NetStack {
         data: &[u8],
         remote: Endpoint,
     ) -> Result<usize, NetError> {
-        // FIXME: UDP 发送沿用 socket 创建时的接口，缺少按 remote 路由选路
-        // 和 connected UDP 的协议栈状态校验。
+        // FIXME: connected UDP 的协议栈状态尚未单独建模；当前 sendto 只按
+        // 每包 remote 做出站接口一致性校验。
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
+        self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
         {
             let table = self.interfaces.read();
             let iface_lock = table
@@ -1525,6 +1526,21 @@ impl NetStack {
         }
     }
 
+    fn ensure_socket_route_matches(
+        &self,
+        socket_iface: InterfaceId,
+        remote: &crate::IpAddr,
+    ) -> Result<(), NetError> {
+        let routed_iface = self
+            .resolve_iface_for_remote(remote)
+            .ok_or(NetError::Unreachable)?;
+        if routed_iface == socket_iface {
+            Ok(())
+        } else {
+            Err(NetError::Unreachable)
+        }
+    }
+
     /// 按单个地址选择接口。未指定地址保留现有默认选择；loopback 地址强制走 lo。
     pub fn resolve_iface_for_addr(&self, addr: &crate::IpAddr) -> Option<InterfaceId> {
         if is_unspecified_ip(addr) {
@@ -1752,9 +1768,53 @@ impl Iterator for EphemeralPortCursor {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::any::Any;
 
     use super::*;
+    use crate::driver::{Duplex, LinkMedium, LinkState, NetDriver, RxBuf, TxBuf};
+
+    struct TestDriver;
+
+    impl NetDriver for TestDriver {
+        fn medium(&self) -> LinkMedium {
+            LinkMedium::Ip
+        }
+
+        fn poll_rx(&self) -> Option<RxBuf> {
+            None
+        }
+
+        fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
+            Some(TxBuf::new(alloc::vec![0u8; len].into_boxed_slice()))
+        }
+
+        fn commit_tx(&self, _buf: TxBuf) {}
+
+        fn link_state(&self) -> LinkState {
+            LinkState::Up {
+                speed_mbps: None,
+                duplex: Duplex::Full,
+            }
+        }
+
+        fn mac_address(&self) -> [u8; 6] {
+            [0; 6]
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn attach_test_iface(stack: &NetStack, name: &str, config: IfConfig) -> InterfaceId {
+        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver);
+        let dev = Arc::new(NetDevice::new(name, driver));
+        let id = dev.id();
+        stack.attach(dev, config).unwrap();
+        id
+    }
 
     #[test]
     fn ephemeral_cursor_scans_each_port_once() {
@@ -1772,5 +1832,114 @@ mod tests {
         assert_eq!(ports.len(), range.len() as usize);
         assert_eq!(ports[0], range.start);
         assert_eq!(*ports.last().unwrap(), range.end);
+    }
+
+    #[test]
+    fn udp_send_route_check_accepts_socket_on_routed_interface() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-route-ok",
+            IfConfig::static_v4(Ipv4Addr::new(10, 1, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(
+                handle.iface_id,
+                &IpAddr::V4(Ipv4Addr::new(10, 1, 0, 77)),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn udp_send_route_check_rejects_socket_on_wrong_interface() {
+        let stack = NetStack::new();
+        let first = attach_test_iface(
+            &stack,
+            "eth-route-a",
+            IfConfig::static_v4(Ipv4Addr::new(10, 2, 0, 2), 24, None),
+        );
+        attach_test_iface(
+            &stack,
+            "eth-route-b",
+            IfConfig::static_v4(Ipv4Addr::new(10, 3, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(first).unwrap();
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(
+                handle.iface_id,
+                &IpAddr::V4(Ipv4Addr::new(10, 3, 0, 77)),
+            ),
+            Err(NetError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn udp_send_to_rejects_wrong_route_before_auto_bind() {
+        let stack = NetStack::new();
+        let first = attach_test_iface(
+            &stack,
+            "eth-send-a",
+            IfConfig::static_v4(Ipv4Addr::new(10, 5, 0, 2), 24, None),
+        );
+        attach_test_iface(
+            &stack,
+            "eth-send-b",
+            IfConfig::static_v4(Ipv4Addr::new(10, 6, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(first).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 6, 0, 77)),
+            port: 53,
+        };
+
+        assert_eq!(
+            stack.udp_send_to(handle, b"route-check", remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
+    fn udp_send_route_check_rejects_remote_without_route() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-route-none",
+            IfConfig::static_v4(Ipv4Addr::new(10, 4, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(
+                handle.iface_id,
+                &IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77)),
+            ),
+            Err(NetError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn udp_send_to_rejects_missing_route_before_auto_bind() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-send-none",
+            IfConfig::static_v4(Ipv4Addr::new(10, 7, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77)),
+            port: 53,
+        };
+
+        assert_eq!(
+            stack.udp_send_to(handle, b"route-check", remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(stack.udp_local_endpoint(handle), None);
     }
 }
