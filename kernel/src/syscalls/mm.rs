@@ -148,6 +148,114 @@ pub(super) fn sys_mremap(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     Err(Errno::ENOSYS)
 }
 
+pub(super) fn sys_swapon(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_swapoff(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_msync(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mlock(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_munlock(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mlockall(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_munlockall(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mincore(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_remap_file_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mbind(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_get_mempolicy(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_set_mempolicy(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_migrate_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_move_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_process_vm_readv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_process_vm_writev(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_userfaultfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mlock2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pkey_mprotect(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pkey_alloc(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pkey_free(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_process_madvise(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_memfd_secret(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_set_mempolicy_home_node(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_cachestat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_map_shadow_stack(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mseal(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
     let payload = ctx.task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()

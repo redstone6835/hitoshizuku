@@ -1607,6 +1607,270 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     }
 }
 
+pub(super) fn sys_setxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_lsetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fsetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_getxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_lgetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fgetxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_listxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_llistxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_flistxattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_removexattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_lremovexattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fremovexattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_lookup_dcookie(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_inotify_init1(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_inotify_add_watch(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_inotify_rm_watch(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_ioprio_set(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_ioprio_get(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_renameat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_nfsservctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_vhangup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_quotactl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_preadv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pwritev(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_vmsplice(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_splice(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_tee(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_sync_file_range2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_acct(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fanotify_init(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fanotify_mark(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_name_to_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_open_by_handle_at(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_memfd_create(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_preadv2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pwritev2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_timerfd_gettime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_timerfd_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_utimensat_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pselect6_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_ppoll_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_recvmmsg_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_uring_setup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_uring_enter(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_uring_register(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_open_tree(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_move_mount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fsopen(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fsconfig(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fsmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fspick(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_openat2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pidfd_getfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_epoll_pwait2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mount_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_quotactl_fd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_fchmodat2(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_statmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_listmount(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_setxattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_getxattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_listxattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_removexattrat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_open_tree_attr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_file_getattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_file_setattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
         Some(sched::now_ns_public().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))

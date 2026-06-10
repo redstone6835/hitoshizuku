@@ -183,6 +183,18 @@ pub(super) fn sys_restart_syscall(_ctx: &mut SyscallContext<'_>) -> Result<usize
     Err(Errno::EINTR)
 }
 
+pub(super) fn sys_rt_sigqueueinfo(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_rt_sigtimedwait_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pidfd_send_signal(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
 fn read_sigaction(user: usize) -> Result<SigAction, Errno> {
     let mut raw = [0u8; 32];
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
