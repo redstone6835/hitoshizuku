@@ -172,6 +172,23 @@ pub fn register_net_poll_hook(hook: fn(u64)) {
     }
 }
 
+/// 注册 timer tick 时的 TTY 输入泵回调。
+///
+/// 终端控制字符需要在没有用户 read 调用时也能触发信号；该 hook 供 kernel
+/// 把 VFS 兼容层的 TTY 行规程接入架构 timer 路径。
+pub fn register_tty_poll_hook(hook: fn(u64)) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::register_tty_poll_hook(hook);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        let _ = hook;
+        todo!("riscv64 HAL tty poll hook is not implemented")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CloneRegisterArgs {
     pub flags: u64,

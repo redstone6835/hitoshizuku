@@ -12,7 +12,7 @@ use vfs::path::{self, Dirfd, LookupFlags};
 
 use crate::dev::block::BlockDevice;
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::lookup_block_device_by_node;
+use crate::vfs::device_files::projection::lookup_block_device_by_node;
 
 use super::current_vfs_context;
 use super::devtmpfs::block_device_from_inode;

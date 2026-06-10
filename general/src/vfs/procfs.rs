@@ -33,10 +33,10 @@ use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
 use super::{current_vfs_context, namespace_path};
-use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::{CustomDevNodeKind, DevNodeSpec};
+use crate::dev::enumerate::PNP_DEVICES;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpResourceKind, PnpState};
-use crate::vfs::device_numbers::{self, PosixDeviceKind};
+use crate::vfs::device_files::projection::render_function_projection_diagnostics;
+use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
@@ -2378,7 +2378,7 @@ fn render_stat() -> String {
 }
 
 fn render_devices() -> String {
-    // /proc/devices 只导出 POSIX 兼容投影的 major 汇总，不表示底层设备模型的寻址入口。
+    // /proc/devices 只导出用户 ABI 设备号投影的 major 汇总，不表示底层设备模型的寻址入口。
     // major 名称来自 VFS 兼容层注册的 device number policy；procfs 只消费汇总快照，
     // 不读取底层设备对象，也不参与设备号分配。
     let mut out = String::new();
@@ -2386,20 +2386,20 @@ fn render_devices() -> String {
         return out;
     }
     out.push_str("Character devices:\n");
-    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Char) {
+    if let Some(summaries) = device_numbers::try_major_summaries(DeviceNumberKind::Char) {
         write_major_summaries(&mut out, &summaries);
     }
     if out.try_reserve("\nBlock devices:\n".len()).is_err() {
         return out;
     }
     out.push_str("\nBlock devices:\n");
-    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Block) {
+    if let Some(summaries) = device_numbers::try_major_summaries(DeviceNumberKind::Block) {
         write_major_summaries(&mut out, &summaries);
     }
     out
 }
 
-fn write_major_summaries(out: &mut String, summaries: &[device_numbers::PosixMajorSummary]) {
+fn write_major_summaries(out: &mut String, summaries: &[device_numbers::DeviceMajorSummary]) {
     for summary in summaries {
         // 设备诊断文本不能因为临时格式化缓冲分配失败而影响设备注册表本身。
         // 预留本行空间后再写入，避免为每一行创建额外 String。
@@ -2411,100 +2411,8 @@ fn write_major_summaries(out: &mut String, summaries: &[device_numbers::PosixMaj
     }
 }
 
-fn proc_custom_devnode_kind_name(kind: CustomDevNodeKind) -> &'static str {
-    match kind {
-        CustomDevNodeKind::CharDevice => "custom-char",
-        CustomDevNodeKind::BlockDevice => "custom-block",
-        CustomDevNodeKind::RegularFile => "custom-file",
-        CustomDevNodeKind::Directory => "custom-dir",
-    }
-}
-
-fn proc_devnode_render_len(node: &DevNodeSpec) -> usize {
-    match node {
-        DevNodeSpec::Char { name, .. } => "char:".len() + name.len(),
-        DevNodeSpec::Block { name, .. } => "block:".len() + name.len(),
-        DevNodeSpec::Symlink { name, target } => {
-            "symlink:".len() + name.len() + "->".len() + target.len()
-        }
-        DevNodeSpec::Custom(spec) => {
-            proc_custom_devnode_kind_name(spec.kind()).len() + 1 + spec.name().len()
-        }
-    }
-}
-
-fn write_proc_devnode_name(out: &mut String, node: &DevNodeSpec) {
-    match node {
-        DevNodeSpec::Char { name, .. } => {
-            let _ = write!(out, "char:{name}");
-        }
-        DevNodeSpec::Block { name, .. } => {
-            let _ = write!(out, "block:{name}");
-        }
-        DevNodeSpec::Symlink { name, target } => {
-            let _ = write!(out, "symlink:{name}->{target}");
-        }
-        DevNodeSpec::Custom(spec) => {
-            let _ = write!(
-                out,
-                "{}:{}",
-                proc_custom_devnode_kind_name(spec.kind()),
-                spec.name()
-            );
-        }
-    }
-}
-
 fn render_device_functions() -> String {
-    // `/proc/device-functions` 是 dev core function registry 的调试快照。
-    // 它只展示 class/name 与 devtmpfs 投影声明，不能作为设备打开或寻址入口；
-    // 用户态访问路径仍由 `/dev`、`/sys` 和对应 syscall 兼容层决定。
-    // FIXME(procfs-dev): 这个诊断视图仍直接理解 `DevNodeSpec`，说明 dev core 的
-    // `/dev` 投影声明泄漏到了 procfs。后续应改为读取 projection 层生成的
-    // 只读快照，procfs 不再格式化底层 function 的 devtmpfs 节点细节。
-    let mut out = String::new();
-    if out.try_reserve("class\tname\tdevnodes\n".len()).is_err() {
-        return out;
-    }
-    out.push_str("class\tname\tdevnodes\n");
-    for func in DEVICES.functions.try_list().unwrap_or_default() {
-        let nodes = func.devnodes();
-        let devnode_len = nodes
-            .as_ref()
-            .map(|nodes| {
-                let names_len = nodes
-                    .nodes()
-                    .iter()
-                    .map(proc_devnode_render_len)
-                    .sum::<usize>();
-                names_len.saturating_add(nodes.nodes().len().saturating_sub(1))
-            })
-            .filter(|len| *len > 0)
-            .unwrap_or(1);
-        let line_reserve = func
-            .class_id()
-            .as_str()
-            .len()
-            .saturating_add(func.dev_name().len())
-            .saturating_add(devnode_len)
-            .saturating_add(3);
-        if out.try_reserve(line_reserve).is_err() {
-            return out;
-        }
-        let _ = write!(out, "{}\t{}\t", func.class_id().as_str(), func.dev_name(),);
-        if let Some(nodes) = nodes.filter(|nodes| !nodes.nodes().is_empty()) {
-            for (idx, node) in nodes.nodes().iter().enumerate() {
-                if idx != 0 {
-                    out.push(',');
-                }
-                write_proc_devnode_name(&mut out, node);
-            }
-        } else {
-            out.push('-');
-        }
-        out.push('\n');
-    }
-    out
+    render_function_projection_diagnostics()
 }
 
 fn proc_pnp_state_name(state: PnpState) -> &'static str {
@@ -2594,35 +2502,69 @@ fn write_proc_pnp_dependency(out: &mut String, dependency: PnpDependency) {
     }
 }
 
+struct ProcPnpSchema;
+
+impl ProcPnpSchema {
+    const HEADER: &'static str =
+        "bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n";
+
+    fn function_list_len(functions: &[Arc<dyn crate::dev::function::DeviceFunction>]) -> usize {
+        functions
+            .iter()
+            .map(|func| func.class_id().as_str().len() + 1 + func.dev_name().len())
+            .sum::<usize>()
+            .saturating_add(functions.len().saturating_sub(1))
+    }
+
+    fn resource_list_len(resources: &[crate::dev::pnp::PnpOwnedResourceSnapshot]) -> usize {
+        resources
+            .iter()
+            .map(|resource| {
+                proc_pnp_resource_kind_name(resource.kind).len() + 1 + resource.label.len()
+            })
+            .sum::<usize>()
+            .saturating_add(resources.len().saturating_sub(1))
+    }
+
+    fn write_functions(out: &mut String, functions: &[Arc<dyn crate::dev::function::DeviceFunction>]) {
+        for (idx, func) in functions.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{}:{}", func.class_id().as_str(), func.dev_name());
+        }
+    }
+
+    fn write_resources(out: &mut String, resources: &[crate::dev::pnp::PnpOwnedResourceSnapshot]) {
+        for (idx, resource) in resources.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{}:{}",
+                proc_pnp_resource_kind_name(resource.kind),
+                resource.label
+            );
+        }
+    }
+}
+
 fn render_pnp() -> String {
     // `/proc/pnp` 是面向诊断的 dev core 快照；设备寻址和层级关系以 sysfs 为准。
-    // TODO(procfs-dev): 字段 schema 和 resource/dependency 文本仍由 procfs 手写。
-    // 后续应由 dev core 暴露稳定的诊断 snapshot/formatter，procfs 只负责输出，
-    // 避免每新增资源类型都同步修改多个虚拟文件系统。
-    let header = "bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n";
     let mut out = String::new();
-    if out.try_reserve(header.len()).is_err() {
+    if out.try_reserve(ProcPnpSchema::HEADER.len()).is_err() {
         return out;
     }
-    out.push_str(header);
+    out.push_str(ProcPnpSchema::HEADER);
     for dev in PNP_DEVICES.try_list().unwrap_or_default() {
         let functions = dev.try_functions().unwrap_or_default();
         let resources = dev.try_owned_resources().unwrap_or_default();
         let deferred = dev.deferred_dependency();
         let driver = dev.bound_driver_name().unwrap_or("-");
         // 诊断输出按设备逐行预留，避免构造 function/resource 的中间字符串列表。
-        let functions_len = functions
-            .iter()
-            .map(|func| func.class_id().as_str().len() + 1 + func.dev_name().len())
-            .sum::<usize>()
-            .saturating_add(functions.len().saturating_sub(1));
-        let resources_len = resources
-            .iter()
-            .map(|resource| {
-                proc_pnp_resource_kind_name(resource.kind).len() + 1 + resource.label.len()
-            })
-            .sum::<usize>()
-            .saturating_add(resources.len().saturating_sub(1));
+        let functions_len = ProcPnpSchema::function_list_len(&functions);
+        let resources_len = ProcPnpSchema::resource_list_len(&resources);
         let deferred_len = deferred.map(proc_pnp_dependency_render_len).unwrap_or(0);
         let line_reserve = dev
             .name
@@ -2646,24 +2588,9 @@ fn render_pnp() -> String {
             proc_pnp_state_name(dev.state()),
             driver,
         );
-        for (idx, func) in functions.iter().enumerate() {
-            if idx != 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{}:{}", func.class_id().as_str(), func.dev_name());
-        }
+        ProcPnpSchema::write_functions(&mut out, &functions);
         out.push('\t');
-        for (idx, resource) in resources.iter().enumerate() {
-            if idx != 0 {
-                out.push(',');
-            }
-            let _ = write!(
-                out,
-                "{}:{}",
-                proc_pnp_resource_kind_name(resource.kind),
-                resource.label
-            );
-        }
+        ProcPnpSchema::write_resources(&mut out, &resources);
         out.push('\t');
         if let Some(dependency) = deferred {
             write_proc_pnp_dependency(&mut out, dependency);

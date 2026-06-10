@@ -14,7 +14,7 @@ use general::vfs::mount::{Mount, MountFlags};
 use general::vfs::path::{self, Dirfd, LookupFlags};
 use general::vfs::stat::FileMode;
 use general::vfs::superblock::Superblock;
-use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_posix_shm_tmpfs};
+use general::vfs::{FS_REGISTRY, VfsContext, ensure_dir, mount_standard_shm_tmpfs};
 use log::printk;
 
 const SYSFS_DIR_PATH: &str = "/sys";
@@ -66,28 +66,43 @@ pub fn register_core_filesystems(tag: &str) {
                 )
             });
     }
-    general::vfs::posix_compat::register_posix_device_policies().unwrap_or_else(|err| {
-        panic!(
-            "[kernel-start][{}] failed to register POSIX device number policies: {:?}",
-            tag, err
-        )
-    });
+    general::vfs::user_api::standard_devices::register_standard_device_policies().unwrap_or_else(
+        |err| {
+            panic!(
+                "[kernel-start][{}] failed to register standard device number policies: {:?}",
+                tag, err
+            )
+        },
+    );
     general::vfs::register_block_filesystems();
-    general::vfs::rtc_devnode::register_devtmpfs_adapter().unwrap_or_else(|err| {
+    general::vfs::device_files::projection::register_builtin_device_file_projectors()
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to register device file projectors: {:?}",
+                tag, err
+            )
+        });
+    general::vfs::device_files::rtc::register_devtmpfs_adapter().unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to register RTC devtmpfs adapter: {:?}",
             tag, err
         )
     });
-    general::vfs::loop_devnode::register_devtmpfs_adapter().unwrap_or_else(|err| {
+    general::vfs::device_files::loop_device::register_devtmpfs_adapter().unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to register loop devtmpfs adapter: {:?}",
             tag, err
         )
     });
-    general::vfs::loop_devnode::register_control_node().unwrap_or_else(|err| {
+    general::vfs::device_files::loop_device::register_control_node().unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to register loop-control devtmpfs node: {:?}",
+            tag, err
+        )
+    });
+    general::vfs::device_files::base::register_static_nodes().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register base devtmpfs nodes: {:?}",
             tag, err
         )
     });
@@ -163,9 +178,9 @@ pub fn mount_devtmpfs_on_dev(tag: &str, ctx: &VfsContext, dev_sb: Arc<Superblock
 ///
 /// `/dev/shm` 和 `/sys` 不是底层设备身份的一部分，但它们依赖启动期设备文件系统
 /// 先就绪。集中到这里可以让 DTB/ACPI 等固件入口共享同一套顺序和幂等规则。
-pub fn mount_standard_compat_filesystems(tag: &str, ctx: &VfsContext) {
-    general::vfs::net_ioctl::install_net_ioctl_compat();
-    mount_posix_shm_tmpfs(ctx).unwrap_or_else(|err| {
+pub fn mount_standard_user_api_filesystems(tag: &str, ctx: &VfsContext) {
+    general::vfs::user_api::net_socket::install_net_socket_ioctl_adapter();
+    mount_standard_shm_tmpfs(ctx).unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to mount tmpfs on /dev/shm: {:?}",
             tag, err
@@ -215,18 +230,21 @@ fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
         })
 }
 
-/// 安装 PnP bridge、设备初始化上下文和内建驱动。
+/// 安装 function 投影订阅、设备初始化上下文和内建驱动。
 ///
-/// `ctx` 只携带底层设备驱动需要的内核能力；POSIX `/dev` 命名、设备号等兼容层
+/// `ctx` 只携带底层设备驱动需要的内核能力；`/dev` 命名、设备号等用户接口层
 /// 信息不进入这个上下文，仍由 devtmpfs/VFS 投影层处理。
 pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevInitContext) {
-    general::vfs::devtmpfs::install_pnp_bridge(Arc::clone(&dev_sb)).unwrap_or_else(|err| {
+    general::vfs::devtmpfs::install_function_projection(Arc::clone(&dev_sb)).unwrap_or_else(|err| {
         panic!(
-            "[kernel-start][{}] failed to install PnP devtmpfs bridge: {:?}",
+            "[kernel-start][{}] failed to install devtmpfs function projection: {:?}",
             tag, err
         )
     });
-    printk!("[kernel-start][{}] PnP devtmpfs callbacks installed", tag);
+    printk!(
+        "[kernel-start][{}] devtmpfs function projection installed",
+        tag
+    );
 
     set_dev_init_context(ctx);
 

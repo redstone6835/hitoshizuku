@@ -118,12 +118,11 @@ pub enum IrqSharing {
 
 /// IRQ bottom-half 回调。
 ///
-/// 当前 registry 在 top-half 返回 `Handled` 后同步调用该回调；后续接入独立
-/// worker/threaded IRQ 时，可以保持 request 结构不变，仅替换调度策略。
-///
-/// TODO(irq): 这里还不是完整的 threaded/bottom-half 模型；回调仍在 IRQ 分发
-/// 路径同步执行，也没有独立的 ack/mask 生命周期事件。后续应接入可调度的
-/// deferred handler 队列，并让控制器驱动显式声明 ack/mask/unmask 顺序。
+/// 当前 registry 会先在锁外运行 top-half；当 top-half 返回 `Handled` 后，再同步
+/// 调用该回调，用于把较重的设备侧收尾逻辑从 fast handler 里拆出来。控制器线的
+/// mask/ack/unmask 生命周期由对应 [`IrqDomain`] 的 `set_line_enabled`、
+/// `configure_line` 以及控制器驱动的 demux/ack 过程表达；如果后续接入可调度的
+/// threaded IRQ，仍可复用当前 request 结构，仅替换 bottom-half 调度策略。
 pub trait IrqBottomHalf: Send + Sync {
     fn run_bottom_half(&self, line: IrqLine);
 }

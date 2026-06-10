@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 static TIMER_TICK_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NET_POLL_HOOK: AtomicUsize = AtomicUsize::new(0);
+static TTY_POLL_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 const TEXT_OFF: usize = 0x200;
 const DYNSYM_OFF: usize = 0x0B0;
@@ -391,6 +392,22 @@ pub fn register_net_poll_hook(hook: fn(u64)) {
 /// 如果没注册 hook，本函数是 no-op。
 pub fn run_net_poll_hook(now_ns: u64) {
     let raw = NET_POLL_HOOK.load(Ordering::Acquire);
+    if raw != 0 {
+        let hook: fn(u64) = unsafe { transmute(raw) };
+        hook(now_ns);
+    }
+}
+
+/// 注册 TTY 输入泵回调。
+///
+/// 该回调与 vDSO / net poll hook 平级，由 timer tick 驱动，用于在没有
+/// 用户进程正在 read 终端时仍能处理 Ctrl-C 等控制字符。
+pub fn register_tty_poll_hook(hook: fn(u64)) {
+    TTY_POLL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+pub fn run_tty_poll_hook(now_ns: u64) {
+    let raw = TTY_POLL_HOOK.load(Ordering::Acquire);
     if raw != 0 {
         let hook: fn(u64) = unsafe { transmute(raw) };
         hook(now_ns);
