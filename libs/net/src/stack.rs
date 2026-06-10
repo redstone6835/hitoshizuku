@@ -62,6 +62,13 @@ pub struct TcpAcceptInfo {
     pub remote: Option<Endpoint>,
 }
 
+/// Raw/ICMP 接收结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawRecvInfo {
+    pub len: usize,
+    pub remote: Option<Endpoint>,
+}
+
 // ── NetStack ─────────────────────────────────────────────────────────────────
 
 /// 全局网络协议栈。
@@ -399,7 +406,11 @@ impl NetStack {
         Ok(sent)
     }
 
-    pub fn raw_recv(&self, handle: NetSocketHandle, buf: &mut [u8]) -> Result<usize, NetError> {
+    pub fn raw_recv_from(
+        &self,
+        handle: NetSocketHandle,
+        buf: &mut [u8],
+    ) -> Result<RawRecvInfo, NetError> {
         let table = self.interfaces.read();
         let iface_lock = table
             .get(&handle.iface_id)
@@ -412,22 +423,31 @@ impl NetStack {
             SocketType::Raw => {
                 let socket = managed.raw_socket_mut(handle.inner);
                 let data = socket.recv().map_err(|_| NetError::WouldBlock)?;
-                // FIXME: raw::Socket::recv() 的来源/接口元信息在这里被丢弃，
-                // VFS recvfrom 无法返回 peer 地址。
+                // raw::Socket 当前不携带来源元信息；调用方需要 None 区分
+                // “协议栈没有给出”与“远端确实是未指定地址”。
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
-                Ok(n)
+                Ok(RawRecvInfo {
+                    len: n,
+                    remote: None,
+                })
             }
             SocketType::Icmp => {
                 let socket = managed.icmp_socket_mut(handle.inner);
-                let (data, _) = socket.recv().map_err(|_| NetError::WouldBlock)?;
-                // FIXME: ICMP recv 丢弃 endpoint，导致 recvfrom 只能返回 None。
+                let (data, remote) = socket.recv().map_err(|_| NetError::WouldBlock)?;
                 let n = data.len().min(buf.len());
                 buf[..n].copy_from_slice(&data[..n]);
-                Ok(n)
+                Ok(RawRecvInfo {
+                    len: n,
+                    remote: Some(endpoint_from_ip_address(remote)),
+                })
             }
             _ => Err(NetError::InvalidArgument),
         }
+    }
+
+    pub fn raw_recv(&self, handle: NetSocketHandle, buf: &mut [u8]) -> Result<usize, NetError> {
+        self.raw_recv_from(handle, buf).map(|info| info.len)
     }
 
     pub fn raw_can_recv(&self, handle: NetSocketHandle) -> bool {
@@ -1695,6 +1715,14 @@ fn is_unspecified_ip(addr: &crate::IpAddr) -> bool {
     }
 }
 
+fn endpoint_from_ip_address(addr: IpAddress) -> Endpoint {
+    let addr = match addr {
+        IpAddress::Ipv4(v4) => IpAddr::V4(Ipv4Addr(v4.octets())),
+        IpAddress::Ipv6(v6) => IpAddr::V6(Ipv6Addr(v6.octets())),
+    };
+    Endpoint { addr, port: 0 }
+}
+
 fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
     u32::from_be_bytes(mask.0).leading_ones() as u8
 }
@@ -1772,11 +1800,21 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::any::Any;
+    use spin::Mutex;
 
     use super::*;
     use crate::driver::{Duplex, LinkMedium, LinkState, NetDriver, RxBuf, TxBuf};
 
-    struct TestDriver;
+    #[derive(Default)]
+    struct TestDriver {
+        rx: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl TestDriver {
+        fn push_rx(&self, packet: Vec<u8>) {
+            self.rx.lock().push(packet);
+        }
+    }
 
     impl NetDriver for TestDriver {
         fn medium(&self) -> LinkMedium {
@@ -1784,7 +1822,9 @@ mod tests {
         }
 
         fn poll_rx(&self) -> Option<RxBuf> {
-            None
+            let packet = self.rx.lock().pop()?;
+            let len = packet.len();
+            Some(RxBuf::new(packet.into_boxed_slice(), len))
         }
 
         fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
@@ -1810,11 +1850,51 @@ mod tests {
     }
 
     fn attach_test_iface(stack: &NetStack, name: &str, config: IfConfig) -> InterfaceId {
-        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver);
-        let dev = Arc::new(NetDevice::new(name, driver));
+        attach_test_iface_with_driver(stack, name, config).0
+    }
+
+    fn attach_test_iface_with_driver(
+        stack: &NetStack,
+        name: &str,
+        config: IfConfig,
+    ) -> (InterfaceId, Arc<TestDriver>) {
+        let driver = Arc::new(TestDriver::default());
+        let dev = Arc::new(NetDevice::new(name, driver.clone()));
         let id = dev.id();
         stack.attach(dev, config).unwrap();
-        id
+        (id, driver)
+    }
+
+    fn build_icmpv4_echo_reply(
+        src: smoltcp::wire::Ipv4Address,
+        dst: smoltcp::wire::Ipv4Address,
+        ident: u16,
+        seq_no: u16,
+        payload: &'static [u8],
+    ) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr};
+
+        let icmp = Icmpv4Repr::EchoReply {
+            ident,
+            seq_no,
+            data: payload,
+        };
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Icmp,
+            payload_len: icmp.buffer_len(),
+            hop_limit: 64,
+        };
+        let mut bytes = alloc::vec![0u8; ip.buffer_len() + icmp.buffer_len()];
+        {
+            let mut ip_packet = Ipv4Packet::new_unchecked(&mut bytes);
+            ip.emit(&mut ip_packet, &ChecksumCapabilities::default());
+            let mut icmp_packet = Icmpv4Packet::new_unchecked(ip_packet.payload_mut());
+            icmp.emit(&mut icmp_packet, &ChecksumCapabilities::default());
+        }
+        bytes
     }
 
     #[test]
@@ -1989,5 +2069,71 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert_eq!(stack.socket_state(handle), SocketState::Closed);
+    }
+
+    #[test]
+    fn raw_recv_from_preserves_icmp_remote_address() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-recv",
+            IfConfig::static_v4(Ipv4Addr::new(10, 11, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let src = smoltcp::wire::Ipv4Address::new(10, 11, 0, 77);
+        let dst = smoltcp::wire::Ipv4Address::new(10, 11, 0, 2);
+
+        {
+            let table = stack.interfaces.read();
+            let iface_lock = table.get(&iface).unwrap();
+            let mut managed = iface_lock.lock();
+            managed
+                .icmp_socket_mut(handle.inner)
+                .bind(smoltcp::socket::icmp::Endpoint::Ident(0x1234))
+                .unwrap();
+        }
+        driver.push_rx(build_icmpv4_echo_reply(src, dst, 0x1234, 0x5678, b"pong"));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 16];
+        let info = stack.raw_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(info.len, 12);
+        assert_eq!(&buf[8..info.len], b"pong");
+        assert_eq!(
+            info.remote,
+            Some(Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 11, 0, 77)),
+                port: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn raw_recv_keeps_length_only_compatibility() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-compat",
+            IfConfig::static_v4(Ipv4Addr::new(10, 12, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let src = smoltcp::wire::Ipv4Address::new(10, 12, 0, 77);
+        let dst = smoltcp::wire::Ipv4Address::new(10, 12, 0, 2);
+
+        {
+            let table = stack.interfaces.read();
+            let iface_lock = table.get(&iface).unwrap();
+            let mut managed = iface_lock.lock();
+            managed
+                .icmp_socket_mut(handle.inner)
+                .bind(smoltcp::socket::icmp::Endpoint::Ident(0x1234))
+                .unwrap();
+        }
+        driver.push_rx(build_icmpv4_echo_reply(src, dst, 0x1234, 0x5678, b"old"));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 16];
+        assert_eq!(stack.raw_recv(handle, &mut buf), Ok(11));
+        assert_eq!(&buf[8..11], b"old");
     }
 }
