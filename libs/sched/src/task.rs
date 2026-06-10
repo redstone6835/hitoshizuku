@@ -31,6 +31,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize
 use crate::arch_hooks;
 use crate::arch_hooks::KernelEntry;
 use crate::clone_flags::CloneFlags;
+use crate::cpu::CpuMask;
 use crate::eevdf::{SchedEntity, SchedParams};
 use crate::group::{ProcessGroup, ThreadGroup};
 use crate::ids::Credentials;
@@ -752,7 +753,8 @@ impl Task {
     }
 
     pub fn set_cpu_affinity(&self, mask: u64) {
-        self.cpu_affinity.store(mask.max(1), Ordering::Release);
+        self.cpu_affinity
+            .store(CpuMask::from_bits_or_boot(mask).bits(), Ordering::Release);
     }
 
     pub fn current_cpu(&self) -> usize {

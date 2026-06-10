@@ -144,6 +144,38 @@ impl Runqueue {
             + usize::from(inner.current.is_some())
     }
 
+    /// 可跨 CPU 迁移的就绪负载。
+    ///
+    /// idle 任务只属于本 CPU，deadline throttled 任务当前不可运行，current 任务
+    /// 不能被远端直接摘走；负载均衡只看能通过 [`take_migratable`] 拉走的队列。
+    pub fn migratable_load(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.fair_tree.len() + inner.rt_tree.len() + inner.deadline_tree.len()
+    }
+
+    /// 对指定 CPU 许可位可迁移的就绪负载。
+    ///
+    /// 亲和性收窄后，任务可能短暂留在旧 CPU 的 rq 中；负载均衡只应选择
+    /// 确实能被目标 CPU 拉走的源队列。
+    pub fn migratable_load_for(&self, allowed_cpu_mask: u64) -> usize {
+        let inner = self.inner.lock();
+        inner
+            .fair_tree
+            .values()
+            .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+            .count()
+            + inner
+                .rt_tree
+                .values()
+                .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+                .count()
+            + inner
+                .deadline_tree
+                .values()
+                .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+                .count()
+    }
+
     pub fn set_current(&self, task: Arc<Task>) {
         let mut inner = self.inner.lock();
         if let Some(old) = inner.current.take() {
@@ -208,6 +240,14 @@ impl Runqueue {
     }
 
     pub fn pick_next(&self, now_ns: u64) -> Option<Arc<Task>> {
+        self.pick_next_on(now_ns, u64::MAX)
+    }
+
+    /// 在指定 CPU 许可位下挑选下一个任务。
+    ///
+    /// 迁移或亲和性更新可能让某个任务暂时留在不再允许它运行的 rq 中；这里
+    /// 只跳过这类任务，不在持有本 rq 锁时跨 CPU 迁移，避免形成跨 rq 锁顺序。
+    pub fn pick_next_on(&self, now_ns: u64, cpu_mask: u64) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
         let _ = update_curr_locked(&mut inner, now_ns);
 
@@ -224,7 +264,7 @@ impl Runqueue {
             }
         }
 
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr);
+        let picked = pick_queued_locked(&mut inner, fair_prev_addr, cpu_mask);
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
@@ -271,16 +311,21 @@ impl Runqueue {
     }
 
     /// 在 rq 锁内更新 nice / slice，并按旧属性先完成出队记账。
-    pub fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params));
+    pub fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params))
+    }
+
+    /// 在 rq 锁内只更新 nice/weight，保持策略与时间片不变。
+    pub fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice))
     }
 
     /// 在 rq 锁内更新完整调度属性，并按旧 class / 权重完成出队记账。
-    pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr));
+    pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr))
     }
 
-    fn update_sched_entity<F>(&self, task: &Arc<Task>, now_ns: u64, update: F)
+    fn update_sched_entity<F>(&self, task: &Arc<Task>, now_ns: u64, update: F) -> bool
     where
         F: FnOnce(&Arc<Task>),
     {
@@ -294,7 +339,7 @@ impl Runqueue {
                 apply(task);
                 let now = inner.last_update_ns;
                 prepare_running_locked(&mut inner, task, now);
-                return;
+                return true;
             }
         }
 
@@ -305,13 +350,20 @@ impl Runqueue {
             owned.set_state(TaskState::Runnable);
             let now = inner.last_update_ns;
             enqueue_queued_locked(&mut inner, owned, now);
-            return;
+            return true;
+        }
+
+        // 任务声称仍在某个 rq 上，但不属于当前 rq。调用方应重新按 CPU 归属
+        // 定位或扫描其它 rq，避免在迁移窗口里只更新实体而留下旧索引。
+        if task.sched.on_rq() {
+            return false;
         }
 
         let apply = update.take().expect("[sched] update closure consumed");
         apply(task);
         let now = inner.last_update_ns;
         prepare_sleeping_locked(&mut inner, task, now);
+        true
     }
 
     pub fn snapshot_runnable(&self) -> Vec<Arc<Task>> {
@@ -398,48 +450,90 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
     inner.fair_tree.insert(FairKey::of(&task), task);
 }
 
-fn pick_queued_locked(inner: &mut RqInner, fair_prev_addr: Option<usize>) -> Option<Arc<Task>> {
-    if let Some(key) = inner.deadline_tree.keys().next().copied() {
+fn pick_queued_locked(
+    inner: &mut RqInner,
+    fair_prev_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
+    if let Some(key) = inner
+        .deadline_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)
+    {
         return inner.deadline_tree.remove(&key);
     }
-    if let Some(key) = inner.rt_tree.keys().next().copied() {
+    if let Some(key) = inner
+        .rt_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)
+    {
         return inner.rt_tree.remove(&key);
     }
-    if let Some(task) = pick_fair_locked(inner, fair_prev_addr) {
+    if let Some(task) = pick_fair_locked(inner, fair_prev_addr, cpu_mask) {
         return Some(task);
     }
-    let key = inner.idle_tree.keys().next().copied()?;
+    let key = inner
+        .idle_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)?;
     inner.idle_tree.remove(&key)
 }
 
-fn pick_fair_locked(inner: &mut RqInner, skip_addr: Option<usize>) -> Option<Arc<Task>> {
+fn pick_fair_locked(
+    inner: &mut RqInner,
+    skip_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
     let key = if let Some(skip) = skip_addr {
         inner
             .fair_tree
             .iter()
-            .find(|(_, task)| task_addr(task) != skip && task.sched.vruntime() <= avg)
+            .find(|(_, task)| {
+                task_addr(task) != skip
+                    && task_allowed_on(task, cpu_mask)
+                    && task.sched.vruntime() <= avg
+            })
             .map(|(key, _)| *key)
             .or_else(|| {
                 inner
                     .fair_tree
                     .iter()
-                    .filter(|(_, task)| task_addr(task) != skip)
+                    .filter(|(_, task)| task_addr(task) != skip && task_allowed_on(task, cpu_mask))
                     .min_by_key(|(_, task)| task.sched.vruntime())
                     .map(|(key, _)| *key)
             })
-            .or_else(|| inner.fair_tree.keys().next().copied())
+            .or_else(|| {
+                inner
+                    .fair_tree
+                    .iter()
+                    .find(|(_, task)| task_allowed_on(task, cpu_mask))
+                    .map(|(key, _)| *key)
+            })
     } else {
         inner
             .fair_tree
             .iter()
-            .find(|(_, task)| task.sched.vruntime() <= avg)
+            .find(|(_, task)| task_allowed_on(task, cpu_mask) && task.sched.vruntime() <= avg)
             .map(|(key, _)| *key)
-            .or_else(|| inner.fair_tree.keys().next().copied())
+            .or_else(|| {
+                inner
+                    .fair_tree
+                    .iter()
+                    .find(|(_, task)| task_allowed_on(task, cpu_mask))
+                    .map(|(key, _)| *key)
+            })
     }?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     Some(task)
+}
+
+fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
+    (task.cpu_affinity() & cpu_mask) != 0
 }
 
 fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
@@ -585,6 +679,7 @@ fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Op
         .map(|(key, _)| *key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
+    store_fair_lag_locked(inner, &task);
     task.sched.set_on_rq(false);
     Some(task)
 }
