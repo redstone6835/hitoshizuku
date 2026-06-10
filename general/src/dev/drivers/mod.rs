@@ -36,7 +36,9 @@ pub use random::*;
 use core::num::NonZeroU32;
 
 use crate::dev::block::BlockLimits;
-use crate::dev::function::{DevNodeNameAllocError, DevNodeNameAllocator};
+use crate::dev::function::{
+    FunctionProjectionNameAllocError, FunctionProjectionNameAllocator,
+};
 use crate::dev::pnp::PnpError;
 
 /// 一个编译进内核的内建设备驱动注册项。
@@ -85,18 +87,19 @@ impl BuiltinDriverRegisterError {
     }
 }
 
-/// VirtIO block 的 POSIX `/dev/vd*` 投影名由所有传输层共享分配。
+/// VirtIO block 的用户可见 `vd*` 投影名由所有传输层共享分配。
 ///
 /// 这只是用户可见节点名，不参与底层设备身份；底层身份仍来自 PnP id。
-static VIRTIO_BLK_DEV_NAMES: DevNodeNameAllocator = DevNodeNameAllocator::new("vd");
+static VIRTIO_BLK_PROJECTION_NAMES: FunctionProjectionNameAllocator =
+    FunctionProjectionNameAllocator::new("vd");
 /// VirtIO block request 的 sector 字段固定以 512 字节为单位；这是协议常量，
 /// 不是底层块设备逻辑块大小。
 pub(super) const VIRTIO_BLK_SECTOR_SIZE: u32 = 512;
 
 pub(super) fn alloc_virtio_blk_dev_name(
     stable_key: &str,
-) -> Result<alloc::string::String, DevNodeNameAllocError> {
-    VIRTIO_BLK_DEV_NAMES
+) -> Result<alloc::string::String, FunctionProjectionNameAllocError> {
+    VIRTIO_BLK_PROJECTION_NAMES
         .try_alloc_stable(stable_key)
         .map(|name| name.into_string())
 }

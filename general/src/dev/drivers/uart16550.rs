@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use sched::{Task, WaitQueue};
 
 use crate::dev::char::*;
-use crate::dev::function::{CharFunction, DevNodeNameAllocator};
+use crate::dev::function::{CharFunction, FunctionProjectionNameAllocator};
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
 use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
@@ -681,7 +681,7 @@ impl DriverControl for Uart16550 {
 /// 实例，并注册字符设备 function。
 pub struct Uart16550PlatformDriver {
     device_mmio_to_virt: fn(usize) -> usize,
-    devnode_names: DevNodeNameAllocator,
+    projection_names: FunctionProjectionNameAllocator,
 }
 
 impl Uart16550PlatformDriver {
@@ -691,7 +691,7 @@ impl Uart16550PlatformDriver {
             device_mmio_to_virt,
             // 串口的用户可见节点名由兼容层分配器生成，驱动只声明“这是一个
             // 串口 function”，不把该名字作为硬件身份参与 PnP 匹配。
-            devnode_names: DevNodeNameAllocator::new("uart"),
+            projection_names: FunctionProjectionNameAllocator::new("uart"),
         }
     }
 
@@ -742,7 +742,7 @@ impl PnpDriver for Uart16550PlatformDriver {
         };
 
         let dev_name = self
-            .devnode_names
+            .projection_names
             .try_alloc_stable(&dev.name)?
             .into_string();
         let ch = CharDevice::new(info.fw_name.clone(), Arc::clone(&uart));
@@ -757,7 +757,7 @@ impl PnpDriver for Uart16550PlatformDriver {
             let _ = irq::unregister_irq_handler(handle);
             return Err(err);
         }
-        if let Err(err) = dev.register_function(Arc::new(CharFunction::with_devnode(
+        if let Err(err) = dev.register_function(Arc::new(CharFunction::with_projection_name(
             &dev.name, &dev_name, ch,
         ))) {
             uart.set_rx_irq_enabled(false);

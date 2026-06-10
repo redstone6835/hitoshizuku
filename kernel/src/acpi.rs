@@ -28,7 +28,6 @@ use acpi::{AcpiTable, AmlHandler, Handle, Handler, PhysicalMapping};
 use allocator::KERNEL_ALLOCATOR;
 use general::dev::char::CharDevice;
 use general::dev::enumerate::DEVICES;
-use general::dev::function::find_char_device_by_fw_name;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, IrqPolarity, IrqResourceAttributes,
     IrqSharing, IrqTrigger, PlatformDeviceInfo, PlatformProbeStatus,
@@ -38,6 +37,7 @@ use general::dev::pnp::DevInitContext;
 use general::firmware::power::{
     PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
+use general::vfs::device_files::projection::find_char_device_by_fw_name;
 use general::firmware::{FirmwareTableMapping, SerialPortInfo};
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;

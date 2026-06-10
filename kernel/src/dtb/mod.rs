@@ -13,7 +13,6 @@ use allocator::KERNEL_ALLOCATOR;
 use general::dev::block::BlockDevice;
 use general::dev::char::CharDevice;
 use general::dev::enumerate::DEVICES;
-use general::dev::function::{active_block_devices, find_char_device_by_fw_name};
 use general::dev::pci::pci_scan_and_register_summary;
 use general::dev::platform::{
     DeviceMatchId, DeviceProperties, DeviceResource, FirmwareProperty, FirmwarePropertyValue,
@@ -26,6 +25,7 @@ use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
+use general::vfs::device_files::projection::{active_block_devices, find_char_device_by_fw_name};
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;

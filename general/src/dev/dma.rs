@@ -131,9 +131,9 @@ static LEGACY_GLOBAL_DMA_MAPPER: LegacyGlobalDmaMapper = LegacyGlobalDmaMapper;
 
 /// 单个设备使用的 DMA 上下文。
 ///
-/// TODO(dma): 当前已经有 per-device constraints，但默认 mapper 仍落到全局
-/// `DMA_OPS`。后续总线层应为每个设备安装明确的 DMA window/IOMMU/bounce
-/// mapper，并实现 scatter-gather 与 bounce buffer，而不是长期依赖全局默认值。
+/// 这是 DMA 子系统的设备级边界：驱动只持有本设备的约束与 mapper，不直接读取
+/// 平台全局状态。直连、cache coherent 的平台可以使用默认 mapper；带地址窗口或
+/// 隔离域的总线应在枚举设备时构造专属 mapper 并传入 [`DmaContext::new`]。
 #[derive(Clone, Copy)]
 pub struct DmaContext {
     constraints: DmaConstraints,
@@ -191,8 +191,11 @@ impl DmaOps {
 
 static DMA_OPS: Mutex<DmaOps> = Mutex::new(DmaOps::coherent());
 
-// FIXME(dma): 这是启动期兼容 hook，只能作为“没有总线/IOMMU 上下文时”的默认
-// mapper。设备抽象完善后，驱动不应通过全局状态推导自己的 DMA 能力。
+/// 安装平台默认 DMA mapper。
+///
+/// 这个入口只定义“未提供设备专属 mapper 时”的平台默认行为。设备的地址位宽、
+/// 段大小、coherency 等能力仍由 [`DmaContext`] 内的 per-device constraints
+/// 表达，驱动不通过这里反推设备能力。
 pub fn set_dma_ops(ops: DmaOps) {
     *DMA_OPS.lock() = ops;
 }

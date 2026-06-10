@@ -6,7 +6,7 @@
 
 use crate::dev::char::CharDevice;
 use crate::dev::drivers::{RANDOM_DRIVER, URANDOM_DRIVER};
-use crate::dev::function::DevNodeSpec;
+use crate::vfs::device_files::spec::{DevNodeSpec, fallible_box_str};
 use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 use vfs::error::VfsResult;
 
@@ -19,32 +19,32 @@ const BASE_STATIC_NODES: [DevTmpfsStaticNode; 4] = [
     DevTmpfsStaticNode::new(BASE_DEVICE_FILE_OWNER, "urandom", urandom_dev_node),
 ];
 
-fn null_dev_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "null".into(),
+fn null_dev_node() -> VfsResult<DevNodeSpec> {
+    Ok(DevNodeSpec::Char {
+        name: fallible_box_str("null")?,
         dev: CharDevice::null(),
-    }
+    })
 }
 
-fn zero_dev_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "zero".into(),
+fn zero_dev_node() -> VfsResult<DevNodeSpec> {
+    Ok(DevNodeSpec::Char {
+        name: fallible_box_str("zero")?,
         dev: CharDevice::zero(),
-    }
+    })
 }
 
-fn random_dev_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "random".into(),
+fn random_dev_node() -> VfsResult<DevNodeSpec> {
+    Ok(DevNodeSpec::Char {
+        name: fallible_box_str("random")?,
         dev: CharDevice::new("random", &RANDOM_DRIVER),
-    }
+    })
 }
 
-fn urandom_dev_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "urandom".into(),
+fn urandom_dev_node() -> VfsResult<DevNodeSpec> {
+    Ok(DevNodeSpec::Char {
+        name: fallible_box_str("urandom")?,
         dev: CharDevice::new("urandom", &URANDOM_DRIVER),
-    }
+    })
 }
 
 /// 注册基础字符设备的 `/dev` 投影。

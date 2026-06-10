@@ -22,18 +22,16 @@ use vfs::sync::Spinlock;
 
 use crate::dev::block::BlockDevice;
 use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{
-    BlockFunction, CustomDevNodeKind, CustomDevNodeSpec, DevNodeSpec, DeviceFunction,
-    FunctionRegistryError,
-};
+use crate::dev::function::{BlockFunction, DeviceFunction, FunctionRegistryError};
 use crate::dev::loopdev::{
     LoopAttachOptions, LoopBacking, LoopBackingError, LoopDeviceBundle, LoopDriver, LoopError,
     LoopFlags, LoopStatus,
 };
+use crate::vfs::device_files::spec::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSpec};
+use crate::vfs::device_files::projection::devnodes_for_function;
 use crate::vfs::devtmpfs::{
     DevTmpfsCustomNodeAdapter, DevTmpfsCustomNodeAdapterRegistration, DevTmpfsStaticNode,
-    DevTmpfsStaticNodeRegistration, bind_dynamic_devnodes, register_custom_devnode_adapter,
-    register_static_dev_node, unbind_dynamic_devnodes,
+    DevTmpfsStaticNodeRegistration, register_custom_devnode_adapter, register_static_dev_node,
 };
 use crate::vfs::user_api::ioctl::{read_pod_from_user, write_pod_to_user};
 
@@ -153,7 +151,7 @@ struct LoopEntry {
 impl LoopEntry {
     fn new(index: u32) -> Result<Arc<Self>, Errno> {
         let bundle = LoopDeviceBundle::new(index).map_err(map_loop_errno)?;
-        let function: Arc<dyn DeviceFunction> = Arc::new(BlockFunction::with_devnode(
+        let function: Arc<dyn DeviceFunction> = Arc::new(BlockFunction::with_projection_name(
             bundle.name(),
             bundle.name(),
             bundle.block(),
@@ -204,13 +202,13 @@ pub fn register_control_node() -> VfsResult<DevTmpfsStaticNodeRegistration> {
     ))
 }
 
-fn build_loop_control_node() -> DevNodeSpec {
+fn build_loop_control_node() -> VfsResult<DevNodeSpec> {
     let payload: Arc<dyn Any + Send + Sync> = Arc::new(LoopControlEndpoint);
-    DevNodeSpec::custom(CustomDevNodeSpec::new(
+    Ok(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
         LOOP_CONTROL_NODE_NAME,
         CustomDevNodeKind::CharDevice,
         payload,
-    ))
+    )?))
 }
 
 fn build_loop_control_inode_ops(
@@ -455,27 +453,19 @@ fn remove_loop(index: u32) -> Result<(), Errno> {
 }
 
 fn publish_entry(entry: &Arc<LoopEntry>) -> Result<(), Errno> {
+    match devnodes_for_function(entry.function.as_ref()) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => return Err(Errno::EINVAL),
+    }
     DEVICES
         .register_function(Arc::clone(&entry.function))
         .map_err(map_function_registry_errno)?;
-    let Some(nodes) = entry.function.devnodes() else {
-        DEVICES.unregister_function(&entry.function);
-        return Err(Errno::EINVAL);
-    };
-    if let Err(err) = bind_dynamic_devnodes(&nodes) {
-        DEVICES.unregister_function(&entry.function);
-        entry.function.mark_gone();
-        return Err(err.to_errno());
-    }
     Ok(())
 }
 
 fn unpublish_entry(entry: &Arc<LoopEntry>) {
     entry.function.mark_gone();
     entry.function.drain_io();
-    if let Some(nodes) = entry.function.devnodes() {
-        let _ = unbind_dynamic_devnodes(&nodes);
-    }
     DEVICES.unregister_function(&entry.function);
 }
 
@@ -646,6 +636,7 @@ fn map_loop_errno(err: LoopError) -> Errno {
 fn map_function_registry_errno(err: FunctionRegistryError) -> Errno {
     match err {
         FunctionRegistryError::NameExists => Errno::EEXIST,
+        FunctionRegistryError::NotFound => Errno::ENODEV,
         FunctionRegistryError::OutOfMemory => Errno::ENOMEM,
     }
 }

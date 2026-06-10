@@ -56,9 +56,18 @@ use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
 use crate::dev::block::{BlockDevice, BlockFeatures};
 use crate::dev::char::{CharDevice, CharIoError};
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError};
-use crate::dev::enumerate::DEVICES;
-use crate::dev::function::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSet, DevNodeSpec};
-use crate::dev::pnp::{PnpDevtmpfsCallbacks, PnpError, set_devtmpfs_callbacks};
+use crate::dev::enumerate::{
+    DEVICES, DeviceFunctionEvent, DeviceFunctionEventKind, subscribe_function_events,
+};
+use crate::dev::function::DeviceFunction;
+use crate::vfs::device_files::projection::{
+    devnodes_for_function, forget_published_devnodes, mark_projection_bound,
+    mark_projection_failed, mark_projection_pending, mark_projection_unbound,
+    published_devnodes_for_function, remember_published_devnodes,
+};
+use crate::vfs::device_files::spec::{
+    CustomDevNodeKind, CustomDevNodeSpec, DevNodeSet, DevNodeSpec,
+};
 use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
 use crate::vfs::user_api::tty::{
     TtyIoctlContext, TtyIoctlState, UserTermios, UserWinSize, handle_tty_ioctl,
@@ -182,7 +191,7 @@ pub fn unregister_custom_devnode_adapter(owner: &'static str, name: &str) -> Vfs
 pub struct DevTmpfsStaticNode {
     owner: &'static str,
     name: &'static str,
-    build: fn() -> DevNodeSpec,
+    build: fn() -> VfsResult<DevNodeSpec>,
 }
 
 impl DevTmpfsStaticNode {
@@ -190,7 +199,11 @@ impl DevTmpfsStaticNode {
     ///
     /// `owner` 是声明来源的稳定名字，用于让同一组件重复初始化时幂等返回，同时
     /// 仍能发现两个不同组件抢占同一个 `/dev` 名称的真实冲突。
-    pub const fn new(owner: &'static str, name: &'static str, build: fn() -> DevNodeSpec) -> Self {
+    pub const fn new(
+        owner: &'static str,
+        name: &'static str,
+        build: fn() -> VfsResult<DevNodeSpec>,
+    ) -> Self {
         Self { owner, name, build }
     }
 
@@ -219,7 +232,8 @@ impl DevTmpfsStaticNodeRegistration {
 }
 
 fn bind_static_node(ops: &DevTmpfsSuperblockOps, node: DevTmpfsStaticNode) -> VfsResult<()> {
-    ops.bind_node(&(node.build)())
+    let spec = (node.build)()?;
+    ops.bind_node(&spec)
 }
 
 fn remove_static_dev_node_record(owner: &'static str, name: &str) -> Option<DevTmpfsStaticNode> {
@@ -274,7 +288,7 @@ pub fn register_static_dev_node(
         if let Err(err) = bind_static_node(ops, node) {
             STATIC_DEV_NODES
                 .lock()
-                .retain(|existing| existing.name != node.name);
+                .retain(|existing| existing.owner != node.owner || existing.name != node.name);
             return Err(err);
         }
     }
@@ -453,41 +467,44 @@ fn validate_symlink_target(target: &str) -> VfsResult<()> {
     Ok(())
 }
 
-/// 安装 PnP 到 devtmpfs 的桥接。
+/// 安装 function registry 到 devtmpfs 的投影订阅。
 ///
-/// 安装后，PnpDevice 注册带 [`DevNodeSpec`] 的 function 时，会自动在这个
-/// devtmpfs superblock 中创建或删除对应 `/dev` 节点。桥接只消费 `DevNodeSpec`
-/// 携带的设备对象，不 downcast 具体 function 类型。
-///
-/// FIXME(devtmpfs): 这里仍与 PnP core 共享专用回调，后续应改成订阅通用
-/// function/projection 事件；devtmpfs 只维护自己的名字空间，不参与底层设备注册
-/// 事务。
-pub fn install_pnp_bridge(dev_sb: Arc<Superblock>) -> Result<(), PnpError> {
-    let (dev_sb, first_publish) = publish_devtmpfs_sb(dev_sb);
+/// 安装后，任何带 [`DevNodeSpec`] 的 function 注册/注销都会触发 devtmpfs 在当前
+/// superblock 中创建或删除对应 `/dev` 节点。该路径只是用户态名字空间投影：
+/// function 的所有权、probe/remove 事务仍由 dev core/PnP core 管理，投影失败只会
+/// 记录日志，不会回滚底层设备注册。
+pub fn install_function_projection(dev_sb: Arc<Superblock>) -> VfsResult<()> {
+    let (dev_sb, _) = publish_devtmpfs_sb(dev_sb);
     dev_sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
-        .ok_or(PnpError::NoDevtmpfs)?;
+        .ok_or(VfsError::InvalidArgument)?;
 
-    set_devtmpfs_callbacks(PnpDevtmpfsCallbacks {
-        bind: pnp_bind_cb,
-        unbind: pnp_unbind_cb,
-    });
-    if first_publish {
-        let functions = DEVICES.functions.try_list().ok_or(PnpError::OutOfMemory)?;
+    let subscription = subscribe_function_events(
+        "devtmpfs",
+        "function-devnodes",
+        devtmpfs_function_event,
+    )
+        .map_err(|_| VfsError::NoSpace)?;
+    if subscription.inserted() {
+        let functions = DEVICES.functions.try_list().ok_or(VfsError::NoSpace)?;
         for func in functions {
-            if let Some(nodes) = func.devnodes() {
-                // 允许 PnP core 在 devtmpfs 之前完成底层注册；bridge 首次安装后补齐
-                // 用户可见节点投影。重复安装 bridge 时不能再次 bind 同一批节点，否则
-                // 幂等初始化路径会被已有节点误判为失败。
-                pnp_bind_cb(&nodes)?;
+            match devnodes_for_function(func.as_ref()) {
+                Ok(Some(nodes)) => {
+                    // 允许 function 在 devtmpfs 之前完成底层注册；投影首次安装后补齐
+                    // 用户可见节点投影。单个节点失败只影响该 function 的用户态入口，
+                    // 不能阻止 devtmpfs 本身挂载或反向破坏底层设备生命周期。
+                    handle_projected_devnodes(
+                        func.as_ref(),
+                        DeviceFunctionEventKind::Registered,
+                        &nodes,
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => mark_projection_failed(func.as_ref(), err),
             }
         }
     }
     Ok(())
-}
-
-fn pnp_devtmpfs_sb() -> Result<&'static Arc<Superblock>, PnpError> {
-    DEVTMPFS_SINGLETON_SB.lock().ok_or(PnpError::NoDevtmpfs)
 }
 
 fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
@@ -495,12 +512,11 @@ fn mounted_devtmpfs_sb() -> Option<Arc<Superblock>> {
     guard.as_ref().map(|sb| Arc::clone(*sb))
 }
 
-/// 将非 PnP 设备声明的 `/dev` 投影绑定到当前 devtmpfs 单例。
+/// 将 function 声明的 `/dev` 投影绑定到当前 devtmpfs 单例。
 ///
-/// loop 这类虚拟设备没有固件 backing device，不能走 `PnpDevice::register_function()`；
-/// 但它仍应通过同一组 [`DevNodeSpec`] 进入 devtmpfs，避免在文件系统核心里新增
-/// 设备类型分支。调用方负责先完成底层 function registry 的事务注册。
-pub fn bind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
+/// 该函数只服务于 devtmpfs 自己的投影事件处理；调用方必须已经完成底层
+/// function registry 的注册事务，devtmpfs 不反向拥有设备对象。
+fn bind_projected_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
     let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
     let ops = sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
@@ -508,11 +524,20 @@ pub fn bind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
     ops.bind_nodes(nodes)
 }
 
-/// 解绑非 PnP 设备声明的 `/dev` 投影。
-///
-/// 这是 [`bind_dynamic_devnodes`] 的对称入口，供虚拟设备释放时使用；底层设备
-/// 对象和 function registry 的清理仍由调用方按自己的生命周期顺序完成。
-pub fn unbind_dynamic_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
+fn bind_and_remember_projected_devnodes(
+    func: &dyn DeviceFunction,
+    nodes: &DevNodeSet,
+) -> VfsResult<()> {
+    bind_projected_devnodes(nodes)?;
+    if let Err(err) = remember_bound_projection_nodes(func, nodes) {
+        let _ = unbind_projected_devnodes(nodes);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// 解绑 function 声明的 `/dev` 投影。
+fn unbind_projected_devnodes(nodes: &DevNodeSet) -> VfsResult<()> {
     let sb = mounted_devtmpfs_sb().ok_or(VfsError::NoDevice)?;
     let ops = sb
         .downcast_ops::<DevTmpfsSuperblockOps>()
@@ -533,20 +558,84 @@ fn publish_devtmpfs_sb(dev_sb: Arc<Superblock>) -> (Arc<Superblock>, bool) {
     (Arc::clone(leaked), true)
 }
 
-fn pnp_bind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
-    let sb = pnp_devtmpfs_sb()?;
-    let ops = sb
-        .downcast_ops::<DevTmpfsSuperblockOps>()
-        .ok_or(PnpError::NoDevtmpfs)?;
-    ops.bind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
+fn devtmpfs_function_event(event: &DeviceFunctionEvent) {
+    match event.kind() {
+        DeviceFunctionEventKind::Registered => {
+            match devnodes_for_function(event.function().as_ref()) {
+                Ok(Some(nodes)) => {
+                    handle_projected_devnodes(event.function().as_ref(), event.kind(), &nodes)
+                }
+                Ok(None) => {}
+                Err(err) => mark_projection_failed(event.function().as_ref(), err),
+            }
+        }
+        DeviceFunctionEventKind::Unregistered => {
+            let Some(nodes) = bound_projection_nodes(event.function().as_ref()) else {
+                mark_projection_unbound(event.function().as_ref());
+                return;
+            };
+            handle_projected_devnodes(event.function().as_ref(), event.kind(), &nodes);
+        }
+    }
 }
 
-fn pnp_unbind_cb(nodes: &DevNodeSet) -> Result<(), PnpError> {
-    let sb = pnp_devtmpfs_sb()?;
-    let ops = sb
-        .downcast_ops::<DevTmpfsSuperblockOps>()
-        .ok_or(PnpError::NoDevtmpfs)?;
-    ops.unbind_nodes(nodes).map_err(|_| PnpError::DevtmpfsError)
+fn bound_projection_nodes(func: &dyn DeviceFunction) -> Option<DevNodeSet> {
+    published_devnodes_for_function(func)
+}
+
+fn forget_bound_projection_nodes(func: &dyn DeviceFunction) {
+    let _ = forget_published_devnodes(func);
+}
+
+fn handle_projected_devnodes(
+    func: &dyn DeviceFunction,
+    kind: DeviceFunctionEventKind,
+    nodes: &DevNodeSet,
+) {
+    match kind {
+        DeviceFunctionEventKind::Registered => mark_projection_pending(func),
+        DeviceFunctionEventKind::Unregistered => {}
+    }
+    let result = match kind {
+        DeviceFunctionEventKind::Registered => bind_and_remember_projected_devnodes(func, nodes),
+        DeviceFunctionEventKind::Unregistered => unbind_projected_devnodes(nodes),
+    };
+    log_projection_result(func, kind, result);
+}
+
+fn log_projection_result(
+    func: &dyn DeviceFunction,
+    kind: DeviceFunctionEventKind,
+    result: VfsResult<()>,
+) {
+    if result.is_ok() {
+        match kind {
+            DeviceFunctionEventKind::Registered => mark_projection_bound(func),
+            DeviceFunctionEventKind::Unregistered => {
+                forget_bound_projection_nodes(func);
+                mark_projection_unbound(func)
+            }
+        }
+        return;
+    }
+
+    if let Err(err) = result {
+        match kind {
+            DeviceFunctionEventKind::Registered => mark_projection_failed(func, err),
+            DeviceFunctionEventKind::Unregistered if err == VfsError::NotFound => {
+                forget_bound_projection_nodes(func);
+                mark_projection_unbound(func)
+            }
+            DeviceFunctionEventKind::Unregistered => mark_projection_failed(func, err),
+        }
+        // 投影层失败不能破坏 dev core 生命周期。这里保留启动/热拔诊断，后续 sysfs
+        // 可读取更结构化的 projection 状态。
+        log::debug!("[devtmpfs] function projection {:?} failed: {:?}", kind, err);
+    }
+}
+
+fn remember_bound_projection_nodes(func: &dyn DeviceFunction, nodes: &DevNodeSet) -> VfsResult<()> {
+    remember_published_devnodes(func, nodes)
 }
 
 // ───────── 字符设备 FileOps（内联适配器） ─────────
@@ -1898,6 +1987,11 @@ pub struct DevTmpfsSuperblockOps {
     /// 符号链接、普通文件、目录以及未注册 `dev_t` 的节点解绑时不能无条件清理
     /// device_numbers registry，否则会误删其他兼容层入口留下的记录。
     numbered_nodes: Spinlock<Vec<String>>,
+    /// 由 devtmpfs 自动补出来的中间目录路径。
+    ///
+    /// 只有这类目录会在节点解绑后自动收缩；用户显式 `mkdir` 的目录不进入此表，
+    /// 避免文件系统帮用户删除自己创建的空目录。
+    implicit_dirs: Spinlock<Vec<String>>,
 }
 
 impl DevTmpfsSuperblockOps {
@@ -1935,6 +2029,147 @@ impl DevTmpfsSuperblockOps {
     fn rollback_numbered_node(&self, name: &str) {
         if self.forget_numbered_node(name) {
             super::user_api::device_numbers::unregister_node(name);
+        }
+    }
+
+    fn remember_implicit_dir(&self, path: &str) -> VfsResult<()> {
+        let mut dirs = self.implicit_dirs.lock();
+        if dirs.iter().any(|existing| existing == path) {
+            return Ok(());
+        }
+        dirs.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
+        dirs.push(devtmpfs_fallible_string(path)?);
+        Ok(())
+    }
+
+    fn is_implicit_dir(&self, path: &str) -> bool {
+        self.implicit_dirs
+            .lock()
+            .iter()
+            .any(|existing| existing == path)
+    }
+
+    fn forget_implicit_dir(&self, path: &str) -> bool {
+        let mut dirs = self.implicit_dirs.lock();
+        let Some(index) = dirs.iter().position(|existing| existing == path) else {
+            return false;
+        };
+        dirs.remove(index);
+        true
+    }
+
+    fn rollback_implicit_dirs(&self, paths: &[String]) {
+        for path in paths.iter().rev() {
+            let _ = self.remove_implicit_dir_path(path);
+        }
+    }
+
+    fn join_components(components: &[&str]) -> VfsResult<String> {
+        let mut path = String::new();
+        for component in components {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.try_reserve(component.len())
+                .map_err(|_| VfsError::NoSpace)?;
+            path.push_str(component);
+        }
+        Ok(path)
+    }
+
+    fn lookup_dir_at_components(&self, components: &[&str]) -> VfsResult<Arc<Inode>> {
+        let mut dir_inode = self.root_inode()?;
+        for component in components {
+            let dir_ops = dir_inode
+                .downcast_ops::<DevDirOps>()
+                .ok_or(VfsError::NotADirectory)?;
+            let next = dir_ops
+                .children
+                .lock()
+                .get(*component)
+                .cloned()
+                .ok_or(VfsError::NotFound)?;
+            if next.kind() != FileType::Directory {
+                return Err(VfsError::NotADirectory);
+            }
+            dir_inode = next;
+        }
+        Ok(dir_inode)
+    }
+
+    fn remove_implicit_dir_path(&self, path: &str) -> VfsResult<bool> {
+        if !self.is_implicit_dir(path) {
+            return Ok(false);
+        }
+
+        let components = split_devtmpfs_path(path)?;
+        let name = components
+            .last()
+            .copied()
+            .ok_or(VfsError::InvalidArgument)?;
+        let parent = if components.len() == 1 {
+            self.root_inode()?
+        } else {
+            self.lookup_dir_at_components(&components[..components.len() - 1])?
+        };
+        let parent_ops = parent
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::NotADirectory)?;
+        let child = {
+            let children = parent_ops.children.lock();
+            children.get(name).cloned()
+        };
+        let Some(child) = child else {
+            return Ok(false);
+        };
+        if child.kind() != FileType::Directory {
+            return Ok(false);
+        }
+        let child_ops = child
+            .downcast_ops::<DevDirOps>()
+            .ok_or(VfsError::InvalidArgument)?;
+        if !child_ops.children.lock().is_empty() {
+            return Ok(false);
+        }
+
+        let removed = {
+            let mut children = parent_ops.children.lock();
+            children.remove(name)
+        };
+        let Some(removed) = removed else {
+            return Ok(false);
+        };
+        if removed.ino() != child.ino() || removed.fs_id() != child.fs_id() {
+            let mut children = parent_ops.children.lock();
+            children.insert(devtmpfs_fallible_string(name)?, removed);
+            return Ok(false);
+        }
+
+        parent.dec_nlink();
+        parent.touch_mtime();
+        parent.touch_ctime();
+        removed.set_nlink(0);
+        removed.touch_ctime();
+        if let Some(sb) = removed.superblock() {
+            sb.remove_inode(removed.ino());
+        }
+        self.invalidate_path_dcache(path);
+        let _ = self.forget_implicit_dir(path);
+        Ok(true)
+    }
+
+    fn prune_implicit_dir_chain(&self, components: &[&str]) {
+        if components.is_empty() {
+            return;
+        }
+        for len in (1..=components.len()).rev() {
+            let Ok(path) = Self::join_components(&components[..len]) else {
+                return;
+            };
+            match self.remove_implicit_dir_path(&path) {
+                Ok(true) => continue,
+                Ok(false) | Err(_) => return,
+            }
         }
     }
 
@@ -2031,7 +2266,7 @@ impl DevTmpfsSuperblockOps {
             None,
             meta,
             Arc::new(DevSymlinkOps {
-                target: String::from(target),
+                target: devtmpfs_fallible_string(target)?,
             }),
             sb_weak,
         ))
@@ -2080,10 +2315,15 @@ impl DevTmpfsSuperblockOps {
     fn ensure_parent_dir(&self, components: &[&str]) -> VfsResult<Arc<Inode>> {
         let mut dir_inode = self.root_inode()?;
         let mut current_path = String::new();
+        let mut created_paths: Vec<String> = Vec::new();
 
         for component in &components[..components.len().saturating_sub(1)] {
             if !current_path.is_empty() {
                 current_path.push('/');
+            }
+            if let Err(_) = current_path.try_reserve(component.len()) {
+                self.rollback_implicit_dirs(&created_paths);
+                return Err(VfsError::NoSpace);
             }
             current_path.push_str(component);
 
@@ -2101,13 +2341,34 @@ impl DevTmpfsSuperblockOps {
                         DEVTMPFS_STANDARD_POLICY.uid,
                         DEVTMPFS_STANDARD_POLICY.gid,
                     )?;
-                    children.insert(devtmpfs_fallible_string(component)?, Arc::clone(&child));
+                    let path = match devtmpfs_fallible_string(&current_path) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            self.rollback_implicit_dirs(&created_paths);
+                            return Err(err);
+                        }
+                    };
+                    if let Err(err) = self.remember_implicit_dir(&path) {
+                        self.rollback_implicit_dirs(&created_paths);
+                        return Err(err);
+                    }
+                    let key = match devtmpfs_fallible_string(component) {
+                        Ok(key) => key,
+                        Err(err) => {
+                            let _ = self.forget_implicit_dir(&path);
+                            self.rollback_implicit_dirs(&created_paths);
+                            return Err(err);
+                        }
+                    };
+                    children.insert(key, Arc::clone(&child));
                     created = true;
+                    created_paths.push(path);
                     child
                 }
             };
 
             if next.kind() != FileType::Directory {
+                self.rollback_implicit_dirs(&created_paths);
                 return Err(VfsError::NotADirectory);
             }
             if created {
@@ -2148,13 +2409,17 @@ impl DevTmpfsSuperblockOps {
             .last()
             .copied()
             .ok_or(VfsError::InvalidArgument)?;
-        let parent = self.ensure_parent_dir(&components)?;
+        let parent = match self.ensure_parent_dir(&components) {
+            Ok(parent) => parent,
+            Err(err) => return Err(err),
+        };
         let parent_ops = parent
             .downcast_ops::<DevDirOps>()
             .ok_or(VfsError::NotADirectory)?;
 
         let mut children = parent_ops.children.lock();
         if children.contains_key(name) {
+            self.prune_implicit_dir_chain(&components[..components.len().saturating_sub(1)]);
             return Err(VfsError::AlreadyExists);
         }
         children.insert(devtmpfs_fallible_string(name)?, inode);
@@ -2201,6 +2466,7 @@ impl DevTmpfsSuperblockOps {
             sb.remove_inode(inode.ino());
         }
         self.invalidate_path_dcache(path);
+        self.prune_implicit_dir_chain(&components[..components.len().saturating_sub(1)]);
         Ok(inode)
     }
 
@@ -2583,6 +2849,7 @@ impl FsDriver for DevTmpfsDriver {
             next_ino: AtomicU64::new(2),
             sb: vfs::sync::Spinlock::new(None),
             numbered_nodes: Spinlock::new(Vec::new()),
+            implicit_dirs: Spinlock::new(Vec::new()),
         };
 
         let sb = Superblock::new(move |weak_sb| {

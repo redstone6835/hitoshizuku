@@ -42,7 +42,7 @@ use vfs::sync::Spinlock;
 
 use crate::dev::enumerate::DEVICES;
 use crate::dev::function::{
-    DevNodeNameAllocError, DevNodeSet, DeviceFunction, FunctionRegistryError,
+    DeviceFunction, FunctionProjectionNameAllocError, FunctionRegistryError,
 };
 use crate::dev::registry_id;
 
@@ -104,15 +104,6 @@ pub enum PnpError {
     FunctionExists,
     /// 设备名冲突
     NameConflict,
-    /// devtmpfs 未就绪
-    /// FIXME(dev-core): 这是 VFS 投影层错误泄漏到 PnP core 的遗留接口。
-    /// 后续应由独立 projection manager 记录 `/dev` 发布失败，不能让底层设备
-    /// 生命周期直接依赖 devtmpfs 是否安装。
-    NoDevtmpfs,
-    /// devtmpfs 操作失败
-    /// FIXME(dev-core): 同上，devtmpfs 的具体错误需要留在 VFS/兼容层，并通过
-    /// 诊断事件或 projection 状态暴露给 sysfs/procfs。
-    DevtmpfsError,
     /// 内存不足
     OutOfMemory,
     /// 固件或总线没有提供驱动必需的资源。
@@ -179,15 +170,18 @@ impl From<FunctionRegistryError> for PnpError {
     fn from(e: FunctionRegistryError) -> Self {
         match e {
             FunctionRegistryError::NameExists => PnpError::NameConflict,
+            FunctionRegistryError::NotFound => {
+                PnpError::registration_failed(PnpResourceKind::Function, "function not registered")
+            }
             FunctionRegistryError::OutOfMemory => PnpError::OutOfMemory,
         }
     }
 }
 
-impl From<DevNodeNameAllocError> for PnpError {
-    fn from(e: DevNodeNameAllocError) -> Self {
+impl From<FunctionProjectionNameAllocError> for PnpError {
+    fn from(e: FunctionProjectionNameAllocError) -> Self {
         match e {
-            DevNodeNameAllocError::OutOfMemory => PnpError::OutOfMemory,
+            FunctionProjectionNameAllocError::OutOfMemory => PnpError::OutOfMemory,
         }
     }
 }
@@ -1438,58 +1432,14 @@ impl Default for PnpDeviceList {
     }
 }
 
-// ── devtmpfs 回调 ────────────────────────────────────────────────────────
-
-/// PnP 与 devtmpfs 之间的最小桥接回调。
-///
-/// PnP core 不直接依赖 VFS；当 function 带有 [`DevNodeSet`] 时，通过这里安装的
-/// 回调把节点创建委托给 devtmpfs。
-///
-/// FIXME(dev-core): 这个回调虽然避免了直接导入 VFS 类型，但仍让 PnP core 知道
-/// devtmpfs 的发布时机。应收敛为通用 function projection 事件，由 devtmpfs、
-/// sysfs、procfs 各自订阅并维护自己的兼容视图。
-#[derive(Clone, Copy)]
-pub struct PnpDevtmpfsCallbacks {
-    pub bind: fn(&DevNodeSet) -> Result<(), PnpError>,
-    pub unbind: fn(&DevNodeSet) -> Result<(), PnpError>,
-}
-
-static DEVTMPFS_CB: Spinlock<Option<PnpDevtmpfsCallbacks>> = Spinlock::new(None);
-
-/// 安装 devtmpfs 桥接回调。
-pub fn set_devtmpfs_callbacks(cb: PnpDevtmpfsCallbacks) {
-    *DEVTMPFS_CB.lock() = Some(cb);
-}
-
-fn devtmpfs_bind_function(func: &Arc<dyn DeviceFunction>) -> Result<(), PnpError> {
-    let Some(nodes) = func.devnodes() else {
-        return Ok(());
-    };
-    let cb = DEVTMPFS_CB
-        .lock()
-        .as_ref()
-        .copied()
-        .ok_or(PnpError::NoDevtmpfs)?;
-    (cb.bind)(&nodes)
-}
-
-fn devtmpfs_unbind(nodes: &DevNodeSet) -> Result<(), PnpError> {
-    let cb = DEVTMPFS_CB
-        .lock()
-        .as_ref()
-        .copied()
-        .ok_or(PnpError::NoDevtmpfs)?;
-    (cb.unbind)(nodes)
-}
-
 // ── 功能注册 helpers ────────────────────────────────────────────────────
 
 impl PnpDevice {
-    /// 事务式注册开放设备 function：DEVICES → devtmpfs → PnpDevice.attach。
+    /// 事务式注册开放设备 function。
     ///
-    /// FIXME(dev-core): 事务顺序仍包含 devtmpfs bind，说明 function 生命周期和
-    /// POSIX/VFS 节点发布还没有彻底拆开。后续应先完成底层 function 注册，再由
-    /// projection 层异步/事务式补建兼容节点并记录失败原因。
+    /// 这里的事务边界只覆盖 PnP 设备与全局 function registry。`/dev`、`/sys`
+    /// 等用户态视图通过 function 生命周期事件自行投影，不能反向决定底层设备
+    /// 是否 probe 成功。
     pub fn register_function(
         self: &Arc<Self>,
         func: Arc<dyn DeviceFunction>,
@@ -1500,17 +1450,6 @@ impl PnpDevice {
             self.detach_function(&func);
             func.mark_gone();
             return Err(e.into());
-        }
-
-        if let Err(e) = devtmpfs_bind_function(&func) {
-            if e != PnpError::NoDevtmpfs {
-                DEVICES.unregister_function(&func);
-                self.detach_function(&func);
-                func.mark_gone();
-                return Err(e);
-            }
-            // devtmpfs 是 POSIX/VFS 投影层；桥接未安装时不能反向阻止底层设备注册。
-            // 启动路径通常会先安装 bridge，热插拔/特殊初始化路径可在之后补建节点。
         }
 
         Ok(())
@@ -1524,9 +1463,6 @@ impl PnpDevice {
     }
 
     fn unregister_function_external(&self, func: &Arc<dyn DeviceFunction>) {
-        if let Some(nodes) = func.devnodes() {
-            let _ = devtmpfs_unbind(&nodes);
-        }
         DEVICES.unregister_function(func);
     }
 

@@ -28,12 +28,13 @@ use vfs::sync::Spinlock;
 use crate::dev::block::BlockDevice;
 use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::{
-    DeviceFunction, active_block_devnode_projections, active_char_devnode_projections,
-};
+use crate::dev::function::DeviceFunction;
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
-use crate::vfs::device_files::projection::collect_function_projection_snapshots;
+use crate::vfs::device_files::projection::{
+    PublishedDevNodeClass, append_function_projection_diagnostics, published_block_devnodes,
+    published_char_devnodes, published_devnode_classes,
+};
 use crate::vfs::user_api::device_numbers;
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
@@ -60,6 +61,7 @@ const KERNEL_OSTYPE_INO: u64 = 20;
 const KERNEL_OSRELEASE_INO: u64 = 21;
 const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
+const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -432,11 +434,6 @@ enum SysClassNodeKind {
     NetInterface { iface_id: u32 },
 }
 
-struct FunctionDevNodeClass {
-    node_name: String,
-    class_name: &'static str,
-}
-
 fn sysfs_fallible_string(value: &str) -> Option<String> {
     let mut out = String::new();
     out.try_reserve(value.len()).ok()?;
@@ -476,25 +473,6 @@ fn push_sysfs_dir_entry(out: &mut Vec<DirEntry>, ino: u64, name: &str, kind: Fil
     };
     out.push(DirEntry { ino, name, kind });
     true
-}
-
-fn push_function_devnode_class(
-    out: &mut Vec<FunctionDevNodeClass>,
-    node_name: &str,
-    class_name: &'static str,
-) {
-    // sysfs 是诊断视图，不能因为快照中某个名字分配失败而让内核崩溃。
-    // 低内存时跳过该条 class 映射，底层 function/devtmpfs 绑定仍然保持不变。
-    if out.try_reserve(1).is_err() {
-        return;
-    }
-    let Some(node_name) = sysfs_fallible_string(node_name) else {
-        return;
-    };
-    out.push(FunctionDevNodeClass {
-        node_name,
-        class_name,
-    });
 }
 
 /// sysfs 单次访问从 dev core 拷贝出的不可变快照。
@@ -605,27 +583,15 @@ fn pnp_dependency_name(dependency: PnpDependency) -> String {
     }
 }
 
-fn collect_function_devnode_classes() -> Vec<FunctionDevNodeClass> {
-    let mut out = Vec::new();
-    for func in collect_function_projection_snapshots() {
-        for node in func.nodes() {
-            if node.kind().has_device_class() {
-                push_function_devnode_class(&mut out, node.node_name(), node.class_name());
-            }
-        }
-    }
-    out
-}
-
 fn class_for_devnode(
-    devnode_classes: &[FunctionDevNodeClass],
+    devnode_classes: &[PublishedDevNodeClass],
     node_name: &str,
     fallback: &'static str,
 ) -> &'static str {
     devnode_classes
         .iter()
-        .find(|entry| entry.node_name == node_name)
-        .map(|entry| entry.class_name)
+        .find(|entry| entry.node_name() == node_name)
+        .map(|entry| entry.class_name())
         .unwrap_or(fallback)
 }
 
@@ -660,7 +626,7 @@ impl SysSnapshot {
     fn collect() -> Self {
         let mut snap = SysSnapshot::default();
         let records = device_numbers::try_records().unwrap_or_default();
-        let devnode_classes = collect_function_devnode_classes();
+        let devnode_classes = published_devnode_classes();
 
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
@@ -708,41 +674,30 @@ impl SysSnapshot {
             }
         }
 
-        // `/sys/block` 和 `/sys/devices` 展示 typed device object；`rdev` 只从
-        // devtmpfs 已注册的设备号投影补充而来，不能反过来当底层设备身份。
-        for projection in active_block_devnode_projections(&DEVICES.functions) {
-            let Some(record) = records.iter().find(|record| {
-                record.kind == device_numbers::DeviceNumberKind::Block
-                    && record.node_name == projection.node_name()
-            }) else {
-                continue;
-            };
+        // `/sys/block` 和 `/sys/devices` 展示 typed device object；`rdev` 来自
+        // projection 层已经确认发布的 devtmpfs+device_numbers 联合快照，sysfs
+        // 不再重复解释 `/dev` 节点和设备号表的关联规则。
+        for projection in published_block_devnodes(&DEVICES.functions) {
             let dev = Arc::clone(projection.dev());
-            let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), record.rdev, |name| {
+            let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), projection.rdev(), |name| {
                 snap.blocks.iter().any(|block| block.sysfs_name == name)
             });
             snap.blocks.push(BlockDevSnapshot {
                 sysfs_name,
-                rdev: record.rdev,
+                rdev: projection.rdev(),
                 dev,
                 class_name: projection.class_id().as_str(),
             });
         }
 
-        for projection in active_char_devnode_projections(&DEVICES.functions) {
-            let Some(record) = records.iter().find(|record| {
-                record.kind == device_numbers::DeviceNumberKind::Char
-                    && record.node_name == projection.node_name()
-            }) else {
-                continue;
-            };
+        for projection in published_char_devnodes(&DEVICES.functions) {
             let sysfs_name =
-                sysfs_unique_name_with_rdev(projection.dev().fw_name(), record.rdev, |name| {
+                sysfs_unique_name_with_rdev(projection.dev().fw_name(), projection.rdev(), |name| {
                     snap.chars.iter().any(|ch| ch.sysfs_name == name)
                 });
             snap.chars.push(CharDevSnapshot {
                 sysfs_name,
-                rdev: record.rdev,
+                rdev: projection.rdev(),
                 class_name: projection.class_id().as_str(),
             });
         }
@@ -1531,6 +1486,7 @@ enum SysRegFile {
     Osrelease,
     Version,
     Cmdline,
+    DeviceFunctions,
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
@@ -1941,6 +1897,11 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::Osrelease => env!("CARGO_PKG_VERSION").to_string() + "\n",
         SysRegFile::Version => format!("mygo {} (mygo-build)\n", env!("CARGO_PKG_VERSION")),
         SysRegFile::Cmdline => render_kernel_cmdline(),
+        SysRegFile::DeviceFunctions => {
+            let mut out = String::new();
+            append_function_projection_diagnostics(&mut out);
+            out
+        }
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::stack()
                 .snapshot_interfaces()
@@ -2604,6 +2565,11 @@ impl SysDirInodeOps {
                 "osrelease" => mk_reg(KERNEL_OSRELEASE_INO, SysRegFile::Osrelease),
                 "version" => mk_reg(KERNEL_VERSION_INO, SysRegFile::Version),
                 "cmdline" => mk_reg(KERNEL_CMDLINE_INO, SysRegFile::Cmdline),
+                // 该文件是 devtmpfs/sysfs/procfs 共享的 function 投影诊断入口。
+                // 它只展示 VFS 用户态命名空间发布状态，不参与底层设备生命周期。
+                "device_functions" => {
+                    mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
+                }
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::Fs => match name {
@@ -3180,6 +3146,11 @@ impl SysDirInodeOps {
                 mk_dir_entry(KERNEL_OSRELEASE_INO, "osrelease", FileType::Regular),
                 mk_dir_entry(KERNEL_VERSION_INO, "version", FileType::Regular),
                 mk_dir_entry(KERNEL_CMDLINE_INO, "cmdline", FileType::Regular),
+                mk_dir_entry(
+                    KERNEL_DEVICE_FUNCTIONS_INO,
+                    "device_functions",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),

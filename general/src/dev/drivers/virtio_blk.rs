@@ -825,7 +825,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
         let block_dev = driver.into_block_dev(&dev_name).map_err(|_| {
             PnpError::registration_failed(PnpResourceKind::Function, "block function")
         })?;
-        dev.register_function(Arc::new(BlockFunction::with_devnode(
+        dev.register_function(Arc::new(BlockFunction::with_projection_name(
             &dev.name, &dev_name, block_dev,
         )))?;
         log::printk!(

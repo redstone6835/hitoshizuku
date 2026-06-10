@@ -8,3 +8,4 @@ pub mod base;
 pub mod loop_device;
 pub mod projection;
 pub mod rtc;
+pub mod spec;

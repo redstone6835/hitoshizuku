@@ -75,6 +75,13 @@ pub fn register_core_filesystems(tag: &str) {
         },
     );
     general::vfs::register_block_filesystems();
+    general::vfs::device_files::projection::register_builtin_device_file_projectors()
+        .unwrap_or_else(|err| {
+            panic!(
+                "[kernel-start][{}] failed to register device file projectors: {:?}",
+                tag, err
+            )
+        });
     general::vfs::device_files::rtc::register_devtmpfs_adapter().unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to register RTC devtmpfs adapter: {:?}",
@@ -223,18 +230,21 @@ fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
         })
 }
 
-/// 安装 PnP bridge、设备初始化上下文和内建驱动。
+/// 安装 function 投影订阅、设备初始化上下文和内建驱动。
 ///
 /// `ctx` 只携带底层设备驱动需要的内核能力；`/dev` 命名、设备号等用户接口层
 /// 信息不进入这个上下文，仍由 devtmpfs/VFS 投影层处理。
 pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevInitContext) {
-    general::vfs::devtmpfs::install_pnp_bridge(Arc::clone(&dev_sb)).unwrap_or_else(|err| {
+    general::vfs::devtmpfs::install_function_projection(Arc::clone(&dev_sb)).unwrap_or_else(|err| {
         panic!(
-            "[kernel-start][{}] failed to install PnP devtmpfs bridge: {:?}",
+            "[kernel-start][{}] failed to install devtmpfs function projection: {:?}",
             tag, err
         )
     });
-    printk!("[kernel-start][{}] PnP devtmpfs callbacks installed", tag);
+    printk!(
+        "[kernel-start][{}] devtmpfs function projection installed",
+        tag
+    );
 
     set_dev_init_context(ctx);
 

@@ -841,7 +841,7 @@ impl PnpDriver for VirtioPciBlkDriver {
         })?;
         let irq = register_virtio_pci_irq(dev, &pci, Arc::clone(&driver))?;
 
-        let func = Arc::new(BlockFunction::with_devnode(&dev.name, &dev_name, block_dev));
+        let func = Arc::new(BlockFunction::with_projection_name(&dev.name, &dev_name, block_dev));
         if let Err(err) = dev.register_function(func) {
             if let Some(registration) = irq {
                 unregister_virtio_pci_irq(&pci, registration);

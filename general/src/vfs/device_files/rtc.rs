@@ -17,11 +17,11 @@ use vfs::error::{VfsError, VfsResult};
 use vfs::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 use vfs::inode::{Inode, InodeOps};
 
-use crate::dev::function::CustomDevNodeSpec;
 use crate::dev::rtc::{
-    RtcAlarm, RtcControlRequest, RtcControlResponse, RtcDateTime, RtcDevNodeEndpoint, RtcDevice,
-    RtcError, RtcIrqData, RtcIrqFlags,
+    RtcAlarm, RtcControlRequest, RtcControlResponse, RtcDateTime, RtcDevice, RtcError,
+    RtcIrqData, RtcIrqFlags,
 };
+use crate::vfs::device_files::spec::CustomDevNodeSpec;
 use crate::vfs::devtmpfs::{
     DevTmpfsCustomNodeAdapter, DevTmpfsCustomNodeAdapterRegistration,
     register_custom_devnode_adapter,
@@ -78,6 +78,26 @@ const RTC_VL_CLR: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, b'p' as usize
 
 const RTC_DEVNODE_ADAPTER_OWNER: &str = "rtc-devnode";
 const RTC_DEVNODE_ADAPTER_NAME: &str = "rtc";
+
+/// RTC 在 devtmpfs 自定义节点中的 typed endpoint。
+///
+/// 这里不保存 VFS inode/file 操作，也不保存 ioctl number。VFS 投影层只用它把
+/// `RtcFunction` 中的 typed 设备传给 devtmpfs custom adapter，避免底层 RTC
+/// 设备抽象直接依赖用户 ABI 或 inode 类型。
+#[derive(Clone)]
+pub struct RtcDevNodeEndpoint {
+    dev: Arc<RtcDevice>,
+}
+
+impl RtcDevNodeEndpoint {
+    pub fn new(dev: Arc<RtcDevice>) -> Self {
+        Self { dev }
+    }
+
+    pub fn dev(&self) -> Arc<RtcDevice> {
+        Arc::clone(&self.dev)
+    }
+}
 
 /// 注册 RTC custom devnode 适配器。
 ///
