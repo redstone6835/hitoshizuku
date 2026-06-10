@@ -469,11 +469,12 @@ impl NetStack {
     /// 调用后 socket 进入 `Connecting` 状态，需要 poll 驱动握手完成。
     /// 上层用 `socket_state()` 轮询直到 `Established` 或超时。
     pub fn tcp_connect(&self, handle: NetSocketHandle, remote: Endpoint) -> Result<(), NetError> {
-        // FIXME: connect 仍未在旧 handle 上重选接口；调用方应尽量用
-        // `socket_tcp_for_remote` 创建 socket，把选路策略前置到创建阶段。
+        // 旧 handle 不在这里跨接口迁移；调用方应尽量用
+        // `socket_tcp_for_remote` 创建 socket。这里先保证不会从错误接口发 SYN。
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
+        self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
         {
             let table = self.interfaces.read();
             let iface_lock = table
@@ -1904,6 +1905,32 @@ mod tests {
     }
 
     #[test]
+    fn tcp_connect_rejects_wrong_route_before_syn() {
+        let stack = NetStack::new();
+        let first = attach_test_iface(
+            &stack,
+            "eth-tcp-a",
+            IfConfig::static_v4(Ipv4Addr::new(10, 8, 0, 2), 24, None),
+        );
+        attach_test_iface(
+            &stack,
+            "eth-tcp-b",
+            IfConfig::static_v4(Ipv4Addr::new(10, 9, 0, 2), 24, None),
+        );
+        let handle = stack.socket_tcp_on(first).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 9, 0, 77)),
+            port: 80,
+        };
+
+        assert_eq!(
+            stack.tcp_connect(handle, remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(stack.socket_state(handle), SocketState::Closed);
+    }
+
+    #[test]
     fn udp_send_route_check_rejects_remote_without_route() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -1941,5 +1968,26 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
+    fn tcp_connect_rejects_missing_route_before_syn() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-tcp-none",
+            IfConfig::static_v4(Ipv4Addr::new(10, 10, 0, 2), 24, None),
+        );
+        let handle = stack.socket_tcp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 88)),
+            port: 80,
+        };
+
+        assert_eq!(
+            stack.tcp_connect(handle, remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(stack.socket_state(handle), SocketState::Closed);
     }
 }
