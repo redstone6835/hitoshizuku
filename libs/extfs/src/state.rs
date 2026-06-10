@@ -7,6 +7,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -190,7 +191,8 @@ pub(crate) struct FsState {
     pub(crate) sb_free_inodes: core::sync::atomic::AtomicU32,
     pub(crate) block_alloc_hint: core::sync::atomic::AtomicU64,
     pub(crate) inode_alloc_hint: core::sync::atomic::AtomicU32,
-    pub(crate) alloc_meta_dirty: AtomicBool,
+    pub(crate) alloc_group_dirty: Spinlock<alloc::vec::Vec<u8>>,
+    pub(crate) alloc_sb_dirty: AtomicBool,
     /// 只读挂载标志(由驱动 flags 或 remount 控制)。
     pub(crate) read_only: core::sync::atomic::AtomicBool,
 }
@@ -229,8 +231,7 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.free_blocks = apply_delta(c.free_blocks, delta);
         }
-        let _ = group;
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.mark_group_dirty(group)?;
         Ok(())
     }
     pub(crate) fn adjust_group_free_inodes(
@@ -245,8 +246,7 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.free_inodes = apply_delta(c.free_inodes, delta);
         }
-        let _ = group;
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.mark_group_dirty(group)?;
         Ok(())
     }
     pub(crate) fn adjust_group_used_dirs(
@@ -261,8 +261,16 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.used_dirs = apply_delta(c.used_dirs, delta);
         }
-        let _ = group;
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.mark_group_dirty(group)?;
+        Ok(())
+    }
+
+    fn mark_group_dirty(&self, group: u32) -> Result<(), BlockBackendError> {
+        let mut dirty = self.alloc_group_dirty.lock();
+        let slot = dirty
+            .get_mut(group as usize)
+            .ok_or(BlockBackendError::OutOfRange)?;
+        *slot = 1;
         Ok(())
     }
 
@@ -277,7 +285,7 @@ impl FsState {
         };
         self.sb_free_blocks
             .store(next, core::sync::atomic::Ordering::Release);
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.alloc_sb_dirty.store(true, Ordering::Release);
         Ok(())
     }
     pub(crate) fn adjust_sb_free_inodes(&self, delta: i32) -> Result<(), BlockBackendError> {
@@ -287,7 +295,7 @@ impl FsState {
         let next = apply_delta(prev, delta);
         self.sb_free_inodes
             .store(next, core::sync::atomic::Ordering::Release);
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.alloc_sb_dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -399,13 +407,41 @@ impl FsState {
     }
 
     pub(crate) fn flush_alloc_metadata(&self) -> Result<(), BlockBackendError> {
-        if !self.alloc_meta_dirty.swap(false, Ordering::AcqRel) {
-            return Ok(());
+        let dirty_groups = {
+            let mut dirty = self.alloc_group_dirty.lock();
+            let mut groups = Vec::new();
+            for (group, is_dirty) in dirty.iter_mut().enumerate() {
+                if *is_dirty != 0 {
+                    *is_dirty = 0;
+                    groups.push(group as u32);
+                }
+            }
+            groups
+        };
+        let sb_dirty = self.alloc_sb_dirty.swap(false, Ordering::AcqRel);
+
+        for (idx, &group) in dirty_groups.iter().enumerate() {
+            if let Err(err) = crate::alloc_mod::flush_group_desc(self, group) {
+                let mut dirty = self.alloc_group_dirty.lock();
+                for &pending_group in &dirty_groups[idx..] {
+                    if let Some(slot) = dirty.get_mut(pending_group as usize) {
+                        *slot = 1;
+                    }
+                }
+                if sb_dirty {
+                    self.alloc_sb_dirty.store(true, Ordering::Release);
+                }
+                return Err(err);
+            }
         }
-        for group in 0..self.ext_sb.groups_count {
-            crate::alloc_mod::flush_group_desc(self, group)?;
+
+        if sb_dirty {
+            if let Err(err) = crate::alloc_mod::write_superblock(self) {
+                self.alloc_sb_dirty.store(true, Ordering::Release);
+                return Err(err);
+            }
         }
-        crate::alloc_mod::write_superblock(self)
+        Ok(())
     }
 
     #[inline]
@@ -543,6 +579,7 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
             used_dirs: g.used_dirs_count,
         })
         .collect::<alloc::vec::Vec<_>>();
+    let group_count = group_desc.len();
     let free_blocks = ext_sb.free_blocks_count;
     let free_inodes = ext_sb.free_inodes_count;
     let block_size = ext_sb.block_size;
@@ -557,7 +594,8 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         sb_free_inodes: core::sync::atomic::AtomicU32::new(free_inodes),
         block_alloc_hint: core::sync::atomic::AtomicU64::new(0),
         inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
-        alloc_meta_dirty: AtomicBool::new(false),
+        alloc_group_dirty: Spinlock::new(vec![0u8; group_count]),
+        alloc_sb_dirty: AtomicBool::new(false),
         read_only: core::sync::atomic::AtomicBool::new(false),
     });
 
@@ -775,7 +813,8 @@ mod tests {
             sb_free_inodes: core::sync::atomic::AtomicU32::new(16),
             block_alloc_hint: AtomicU64::new(0),
             inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
-            alloc_meta_dirty: AtomicBool::new(false),
+            alloc_group_dirty: Spinlock::new(vec![0; 1]),
+            alloc_sb_dirty: AtomicBool::new(false),
             read_only: AtomicBool::new(false),
         }
     }
@@ -820,5 +859,17 @@ mod tests {
         assert_eq!(first, data);
         assert_eq!(second, data);
         assert_eq!(backend.reads(), vec![(16, 2)]);
+    }
+
+    #[test]
+    fn flush_alloc_metadata_writes_only_dirty_group() {
+        let backend = Arc::new(CountingBackend::new(256, 512));
+        let state = alloc_test_state(Arc::clone(&backend));
+        state.adjust_group_free_blocks(0, -1).expect("mark dirty");
+        backend.writes.lock().clear();
+
+        state.flush_alloc_metadata().expect("flush metadata");
+
+        assert_eq!(backend.writes(), vec![(2, 2)]);
     }
 }
