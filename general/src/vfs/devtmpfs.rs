@@ -479,12 +479,9 @@ pub fn install_function_projection(dev_sb: Arc<Superblock>) -> VfsResult<()> {
         .downcast_ops::<DevTmpfsSuperblockOps>()
         .ok_or(VfsError::InvalidArgument)?;
 
-    let subscription = subscribe_function_events(
-        "devtmpfs",
-        "function-devnodes",
-        devtmpfs_function_event,
-    )
-        .map_err(|_| VfsError::NoSpace)?;
+    let subscription =
+        subscribe_function_events("devtmpfs", "function-devnodes", devtmpfs_function_event)
+            .map_err(|_| VfsError::NoSpace)?;
     if subscription.inserted() {
         let functions = DEVICES.functions.try_list().ok_or(VfsError::NoSpace)?;
         for func in functions {
@@ -630,7 +627,11 @@ fn log_projection_result(
         }
         // 投影层失败不能破坏 dev core 生命周期。这里保留启动/热拔诊断，后续 sysfs
         // 可读取更结构化的 projection 状态。
-        log::debug!("[devtmpfs] function projection {:?} failed: {:?}", kind, err);
+        log::debug!(
+            "[devtmpfs] function projection {:?} failed: {:?}",
+            kind,
+            err
+        );
     }
 }
 

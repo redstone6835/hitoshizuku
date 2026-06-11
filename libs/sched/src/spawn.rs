@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use crate::arch_hooks::KernelEntry;
 use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::eevdf::SchedParams;
-use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::group::ThreadGroup;
+use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     current_task, enqueue_task, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
     root_pid_ns, schedule_once,

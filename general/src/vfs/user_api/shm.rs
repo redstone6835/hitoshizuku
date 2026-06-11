@@ -77,4 +77,3 @@ pub fn mount_standard_shm_tmpfs(ctx: &VfsContext) -> error::VfsResult<Arc<Mount>
     )?;
     Ok(shm_mount)
 }
-

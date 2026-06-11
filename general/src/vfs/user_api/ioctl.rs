@@ -33,9 +33,8 @@ pub fn write_bytes_to_user(user: usize, src: &[u8]) -> Result<(), Errno> {
 pub fn read_pod_from_user<T: Copy>(user: usize) -> Result<T, Errno> {
     let mut value = MaybeUninit::<T>::zeroed();
     // Safety: 按字节填满栈上对象后再 assume_init；调用点限制为固定布局 POD。
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>())
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
     read_bytes_from_user(user, bytes)?;
     // Safety: 上面的 read_bytes_from_user 已经覆盖整个对象字节范围。
     Ok(unsafe { value.assume_init() })
@@ -44,9 +43,8 @@ pub fn read_pod_from_user<T: Copy>(user: usize) -> Result<T, Errno> {
 /// 向用户空间写入一个 POD ABI 结构。
 pub fn write_pod_to_user<T: Copy>(user: usize, value: &T) -> Result<(), Errno> {
     // Safety: 只把固定布局 POD 结构按字节复制到用户空间，不暴露 Rust 引用。
-    let bytes = unsafe {
-        core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>())
-    };
+    let bytes =
+        unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) };
     write_bytes_to_user(user, bytes)
 }
 

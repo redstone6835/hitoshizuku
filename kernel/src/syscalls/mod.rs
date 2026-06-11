@@ -406,8 +406,5 @@ pub fn register_all() {
     register_syscall(nr::SYS_PIDFD_SEND_SIGNAL, signal::sys_pidfd_send_signal);
 
     let registered = general::syscall::registered_count();
-    log::info!(
-        "[syscalls] registered {} entries",
-        registered
-    );
+    log::info!("[syscalls] registered {} entries", registered);
 }

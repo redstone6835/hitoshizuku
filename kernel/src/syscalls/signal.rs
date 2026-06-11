@@ -191,16 +191,16 @@ pub(super) fn sys_sigaltstack(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let current_sp = UserTrapFrame::from_context(ctx.tf.as_usize()).sp();
 
     if old_user != 0 {
-        write_stack_t(old_user, ctx.task.sigaltstack(), current_sp)?;
+        write_stack_t(old_user, ctx.task().sigaltstack(), current_sp)?;
     }
     if new_user == 0 {
         return Ok(0);
     }
-    if ctx.task.sigaltstack().contains(current_sp) {
+    if ctx.task().sigaltstack().contains(current_sp) {
         return Err(Errno::EPERM);
     }
     let new_stack = read_stack_t(new_user)?;
-    ctx.task.set_sigaltstack(new_stack);
+    ctx.task().set_sigaltstack(new_stack);
     Ok(0)
 }
 

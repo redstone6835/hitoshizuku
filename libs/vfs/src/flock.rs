@@ -66,7 +66,8 @@ impl LockState {
 
     fn compatible(&self, owner: usize, wanted: LockKind) -> bool {
         self.owners.iter().all(|entry| {
-            entry.ptr == owner || matches!((entry.kind, wanted), (LockKind::Shared, LockKind::Shared))
+            entry.ptr == owner
+                || matches!((entry.kind, wanted), (LockKind::Shared, LockKind::Shared))
         })
     }
 

@@ -27,7 +27,8 @@ use crate::dev::function::{
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const SECS_PER_DAY: u64 = 86_400;
 const UNIX_EPOCH_WEEKDAY: u32 = 4; // 1970-01-01 为周四，tm_wday 约定周日为 0。
-static RTC_PROJECTION_NAMES: FunctionProjectionNameAllocator = FunctionProjectionNameAllocator::new("rtc");
+static RTC_PROJECTION_NAMES: FunctionProjectionNameAllocator =
+    FunctionProjectionNameAllocator::new("rtc");
 const RTC_DEFAULT_EPOCH: u32 = 1900;
 const RTC_DEFAULT_PERIODIC_RATE_HZ: u32 = 1024;
 const RTC_MIN_PERIODIC_RATE_HZ: u32 = 2;

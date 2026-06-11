@@ -1200,7 +1200,11 @@ impl VmSpace {
             self.unmap_page(old_va)?;
             let new_va = new_start + (old_va - old_start);
             let area = set.find(new_va).ok_or(Errno::ENOMEM)?;
-            self.map_page(new_va, mapping.page.paddr(), pte_flags_for(area.flags, mapping.access))?;
+            self.map_page(
+                new_va,
+                mapping.page.paddr(),
+                pte_flags_for(area.flags, mapping.access),
+            )?;
             pages.insert(new_va, mapping);
         }
         self.mapped_pages.store(pages.len(), Ordering::Release);

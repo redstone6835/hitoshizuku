@@ -576,8 +576,10 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
-        self.exited_usage_ns
-            .store(self.elapsed_usage_ns(crate::scheduler::now_ns_public()), Ordering::Release);
+        self.exited_usage_ns.store(
+            self.elapsed_usage_ns(crate::scheduler::now_ns_public()),
+            Ordering::Release,
+        );
         if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
             self.exit_reason
                 .store(EXIT_REASON_EXITED, Ordering::Release);
@@ -1001,8 +1003,7 @@ impl Task {
     }
 
     pub fn set_sched_reset_on_fork(&self, enabled: bool) {
-        self.sched_reset_on_fork
-            .store(enabled, Ordering::Release);
+        self.sched_reset_on_fork.store(enabled, Ordering::Release);
     }
 
     // ── CPU 亲和性 ───────────────────────────────────────────────────────

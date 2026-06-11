@@ -85,7 +85,8 @@ struct DeviceFileProjectionStateRecord {
     errno: Option<i32>,
 }
 
-static PROJECTION_STATES: Spinlock<Vec<DeviceFileProjectionStateRecord>> = Spinlock::new(Vec::new());
+static PROJECTION_STATES: Spinlock<Vec<DeviceFileProjectionStateRecord>> =
+    Spinlock::new(Vec::new());
 
 #[derive(Clone)]
 struct PublishedDevNodeRecord {
@@ -289,9 +290,9 @@ pub fn forget_published_devnodes(func: &dyn DeviceFunction) -> Option<DevNodeSet
     let class_name = func.class_id().as_str();
     let function_name = func.dev_name();
     let mut published = PUBLISHED_DEVNODES.lock();
-    let index = published
-        .iter()
-        .position(|record| record.class_name == class_name && record.function_name == function_name)?;
+    let index = published.iter().position(|record| {
+        record.class_name == class_name && record.function_name == function_name
+    })?;
     Some(published.remove(index).nodes)
 }
 
@@ -842,7 +843,10 @@ impl DeviceFileProjectionKind {
 
     /// 该节点是否能在 `/sys/class/<class>` 中作为设备文件 class 成员展示。
     pub const fn has_device_class(self) -> bool {
-        matches!(self, Self::Char | Self::Block | Self::CustomChar | Self::CustomBlock)
+        matches!(
+            self,
+            Self::Char | Self::Block | Self::CustomChar | Self::CustomBlock
+        )
     }
 }
 
@@ -1058,9 +1062,9 @@ fn projection_list_len(nodes: &[DeviceFileProjectionEntry]) -> Option<usize> {
     if nodes.is_empty() {
         return None;
     }
-    let names_len = nodes
-        .iter()
-        .fold(0usize, |acc, node| acc.saturating_add(node.diagnostic_len()));
+    let names_len = nodes.iter().fold(0usize, |acc, node| {
+        acc.saturating_add(node.diagnostic_len())
+    });
     Some(names_len.saturating_add(nodes.len().saturating_sub(1)))
 }
 
@@ -1090,9 +1094,11 @@ fn projection_entry(
     let (node_name, target, kind) = match node {
         DevNodeSpec::Char { name, .. } => (name.as_ref(), None, DeviceFileProjectionKind::Char),
         DevNodeSpec::Block { name, .. } => (name.as_ref(), None, DeviceFileProjectionKind::Block),
-        DevNodeSpec::Symlink { name, target } => {
-            (name.as_ref(), Some(target.as_ref()), DeviceFileProjectionKind::Symlink)
-        }
+        DevNodeSpec::Symlink { name, target } => (
+            name.as_ref(),
+            Some(target.as_ref()),
+            DeviceFileProjectionKind::Symlink,
+        ),
         DevNodeSpec::Custom(spec) => (spec.name(), None, custom_kind(spec.kind())),
     };
     Some(DeviceFileProjectionEntry {

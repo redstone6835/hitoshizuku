@@ -421,10 +421,7 @@ fn page_aligned_range(addr: usize, len: usize) -> Result<core::ops::Range<usize>
     Ok(addr..end)
 }
 
-fn rounded_page_range(
-    addr: usize,
-    len: usize,
-) -> Result<Option<core::ops::Range<usize>>, Errno> {
+fn rounded_page_range(addr: usize, len: usize) -> Result<Option<core::ops::Range<usize>>, Errno> {
     if len == 0 {
         return Ok(None);
     }

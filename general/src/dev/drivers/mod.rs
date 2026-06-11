@@ -36,9 +36,7 @@ pub use random::*;
 use core::num::NonZeroU32;
 
 use crate::dev::block::BlockLimits;
-use crate::dev::function::{
-    FunctionProjectionNameAllocError, FunctionProjectionNameAllocator,
-};
+use crate::dev::function::{FunctionProjectionNameAllocError, FunctionProjectionNameAllocator};
 use crate::dev::pnp::PnpError;
 
 /// 一个编译进内核的内建设备驱动注册项。
