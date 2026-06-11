@@ -189,6 +189,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                     let me = sched::current_task();
                     let pid = me.pid_root().unwrap_or(0);
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
+                    drop(me);
                     sched::schedule_once(super::super::specific::kernel_timestamp_ns());
                 }
                 arg4

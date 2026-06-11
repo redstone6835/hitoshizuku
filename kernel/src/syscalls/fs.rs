@@ -1686,10 +1686,13 @@ fn wait_on_poll_sources(
 
     if !registered_waiter && !deadline_armed {
         restore_current_task_after_wait(&task);
+        drop(task);
         return sched::operation::sched_yield();
     }
 
+    drop(task);
     sched::schedule_once(sched::now_ns_public());
+    let task = sched::current_task();
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
@@ -1831,7 +1834,7 @@ fn synthetic_readlink_target(
     path: &str,
 ) -> Result<Option<String>, Errno> {
     match path {
-        "/proc/self/exe" | "/proc/thread-self/exe" => crate::sched::task_exec_path(&ctx.task)
+        "/proc/self/exe" | "/proc/thread-self/exe" => crate::sched::task_exec_path(ctx.task())
             .map(Some)
             .ok_or(Errno::ENOENT),
         "/proc/self/root" | "/proc/thread-self/root" => Ok(Some(String::from("/"))),
@@ -1890,7 +1893,7 @@ fn faccessat_common(ctx: &mut SyscallContext<'_>, has_flags: bool) -> Result<usi
 }
 
 fn access_mode_allowed(ctx: &SyscallContext<'_>, st: &FileStat, mode: usize, flags: usize) -> bool {
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     let uid = if (flags & AT_EACCESS) != 0 {
         creds.euid.0
     } else {
@@ -2106,8 +2109,10 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         return Err(Errno::EAGAIN);
     }
 
-    if registered || deadline_armed {
+    let task = if registered || deadline_armed {
+        drop(task);
         sched::schedule_once(sched::now_ns_public());
+        let task = sched::current_task();
         if registered {
             file.poll_remove_waiter(&task);
         }
@@ -2115,10 +2120,13 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
             sched::cancel_sleep_deadline(&task);
         }
         restore_current_task_after_wait(&task);
+        task
     } else {
         restore_current_task_after_wait(&task);
+        drop(task);
         sched::operation::sched_yield()?;
-    }
+        sched::current_task()
+    };
 
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);

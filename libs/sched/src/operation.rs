@@ -208,6 +208,7 @@ pub fn setsid() -> Result<PidT, Errno> {
 pub fn exit(code: i32) -> ! {
     let me = current_task();
     exit_task(&me, ExitCode(code));
+    drop(me);
     schedule_once(0);
     panic!("[sched] exit: schedule_once returned unexpectedly");
 }
@@ -225,6 +226,9 @@ pub fn exit_group(code: i32) -> ! {
             exit_task(m, ExitCode(code));
         }
     }
+    drop(members);
+    drop(tg);
+    drop(me);
     exit(code);
 }
 
@@ -400,9 +404,32 @@ pub fn clone_with_context(args: CloneArgs, user_ctx: UserContextRef) -> Result<P
     }
 
     if args.flags.has(CloneFlags::CLONE_VFORK) {
-        child
-            .vfork_done
-            .wait_event(&parent, || !child.is_vforking());
+        let child_wait = Arc::downgrade(&child);
+        drop(child);
+        drop(parent);
+        loop {
+            let Some(wait_child) = child_wait.upgrade() else {
+                break;
+            };
+            if !wait_child.is_vforking() {
+                break;
+            }
+            let parent = current_task();
+            wait_child
+                .vfork_done
+                .prepare_to_wait(&parent, TaskState::Sleeping);
+            if !wait_child.is_vforking() {
+                wait_child.vfork_done.finish_wait(&parent);
+                break;
+            }
+            drop(wait_child);
+            drop(parent);
+            schedule_once(crate::scheduler::now_ns_public());
+            let parent = current_task();
+            if let Some(wait_child) = child_wait.upgrade() {
+                wait_child.vfork_done.finish_wait(&parent);
+            }
+        }
     } else {
         // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
         // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
@@ -550,7 +577,7 @@ fn wait_common(
     options: WaitOptions,
     implicit_exited: bool,
 ) -> Result<WaitResult, Errno> {
-    let me = current_task();
+    let mut me = current_task();
     let wait_exited = implicit_exited || options.has(WaitOptions::WEXITED);
     let wait_stopped = options.has(WaitOptions::WSTOPPED);
     let wait_continued = options.has(WaitOptions::WCONTINUED);
@@ -621,9 +648,15 @@ fn wait_common(
         }
 
         // 5. 阻塞：按 wait_event 协议挂到 me.exit_waiters，让出 CPU，被唤醒后重试。
-        me.exit_waiters.wait_event(&me, || {
-            wait_child_observable(&me, target, wait_exited, wait_stopped, wait_continued)
-        });
+        me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
+        if wait_child_observable(&me, target, wait_exited, wait_stopped, wait_continued) {
+            me.exit_waiters.finish_wait(&me);
+            continue;
+        }
+        drop(me);
+        schedule_once(crate::scheduler::now_ns_public());
+        me = current_task();
+        me.exit_waiters.finish_wait(&me);
         // 唤醒后重新轮询。
     }
 }
@@ -879,7 +912,7 @@ fn finish_current_signal_wait(me: &Arc<Task>) {
 /// 本函数只等待、不消费；调用方随后用 [`sigtimedwait_poll`] 取走 siginfo。
 pub fn sigtimedwait_wait(these: SigSet, timeout_ns: Option<u64>) -> bool {
     use crate::scheduler::{cancel_sleep_deadline, now_ns_public, register_sleep_deadline};
-    let me = current_task();
+    let mut me = current_task();
     let deadline = timeout_ns.map(|ns| now_ns_public().saturating_add(ns));
     me.signal.begin_sigtimedwait(these);
     loop {
@@ -926,7 +959,9 @@ pub fn sigtimedwait_wait(these: SigSet, timeout_ns: Option<u64>) -> bool {
             }
         }
 
+        drop(me);
         schedule_once(now_ns_public());
+        me = current_task();
         if deadline.is_some() {
             cancel_sleep_deadline(&me);
         }

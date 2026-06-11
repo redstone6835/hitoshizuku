@@ -1,7 +1,7 @@
 //! 进程与 libc 初始化相关 syscall。
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use errno::Errno;
 use general::firmware::power;
@@ -61,27 +61,31 @@ pub(super) fn sys_getegid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 
 pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
-    log::debug!(
-        "[syscall][exit] pid={:?} code={}",
-        ctx.task.pid_root(),
-        code
-    );
-    exit_robust_list(&ctx.task);
-    clear_child_tid_and_wake(&ctx.task);
+    let task = Arc::clone(ctx.task());
+    log::debug!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
+    futex_remove_task_waiters(&task);
+    exit_robust_list(&task);
+    clear_child_tid_and_wake(&task);
+    ctx.release_task_ref();
+    drop(task);
     sched::operation::exit(code);
 }
 
 pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
+    let task = Arc::clone(ctx.task());
     log::debug!(
         "[syscall][exit_group] pid={:?} code={}",
-        ctx.task.pid_root(),
+        task.pid_root(),
         code
     );
-    for task in ctx.task.thread_group().snapshot() {
-        exit_robust_list(&task);
-        clear_child_tid_and_wake(&task);
+    for member in task.thread_group().snapshot() {
+        futex_remove_task_waiters(&member);
+        exit_robust_list(&member);
+        clear_child_tid_and_wake(&member);
     }
+    ctx.release_task_ref();
+    drop(task);
     sched::operation::exit_group(code);
 }
 
@@ -170,7 +174,7 @@ pub(super) fn sys_reboot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
 
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if !creds.has_cap(Capability::SysBoot) {
         return Err(Errno::EPERM);
     }
@@ -263,7 +267,7 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             write_i32(&mut raw, 4, 0);
             write_i32(&mut raw, 8, waitid_code(result.status));
             write_i32(&mut raw, 16, result.pid);
-            write_u32(&mut raw, 20, ctx.task.credentials().uid.0);
+            write_u32(&mut raw, 20, ctx.task().credentials().uid.0);
             write_i32(&mut raw, 24, waitid_status(result.status));
         }
         copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
@@ -331,7 +335,7 @@ pub(super) fn sys_setsid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
 }
 
 pub(super) fn sys_set_tid_address(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    ctx.task.set_clear_child_tid(ctx.args[0]);
+    ctx.task().set_clear_child_tid(ctx.args[0]);
     Ok(sched::operation::gettid() as usize)
 }
 
@@ -341,7 +345,7 @@ pub(super) fn sys_set_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if len != ROBUST_LIST_HEAD_SIZE {
         return Err(Errno::EINVAL);
     }
-    ctx.task.set_robust_list(head, len);
+    ctx.task().set_robust_list(head, len);
     Ok(0)
 }
 
@@ -352,7 +356,7 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
     if head_user == 0 || len_user == 0 {
         return Err(Errno::EFAULT);
     }
-    let task = lookup_task_for_thread_syscall(pid, &ctx.task)?;
+    let task = lookup_task_for_thread_syscall(pid, ctx.task())?;
     let robust = task.robust_list();
     copy_to_user(head_user, &robust.head.to_ne_bytes()).map_err(|e| e.as_errno())?;
     copy_to_user(len_user, &robust.len.to_ne_bytes()).map_err(|e| e.as_errno())?;
@@ -581,7 +585,7 @@ pub(super) fn sys_getitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if which != ITIMER_REAL {
         return Err(Errno::EINVAL);
     }
-    let spec = sched::get_realtime_itimer(&ctx.task);
+    let spec = sched::get_realtime_itimer(ctx.task());
     write_itimerval(curr_value, spec)?;
     Ok(0)
 }
@@ -599,7 +603,7 @@ pub(super) fn sys_setitimer(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     } else {
         read_itimerval(new_value)?
     };
-    let old_spec = sched::set_realtime_itimer(&ctx.task, new_spec.value_ns, new_spec.interval_ns);
+    let old_spec = sched::set_realtime_itimer(ctx.task(), new_spec.value_ns, new_spec.interval_ns);
     if old_value != 0 {
         write_itimerval(old_value, old_spec)?;
     }
@@ -1060,13 +1064,13 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let mut raw = [0u8; sched::TASK_COMM_LEN];
             copy_from_user(name_user, &mut raw).map_err(|e| e.as_errno())?;
-            ctx.task.set_comm(&raw);
+            ctx.task().set_comm(&raw);
             Ok(0)
         }
         PR_GET_NAME => {
             let buf = ctx.args[1];
             if buf != 0 {
-                copy_to_user(buf, &ctx.task.comm()).map_err(|e| e.as_errno())?;
+                copy_to_user(buf, &ctx.task().comm()).map_err(|e| e.as_errno())?;
             }
             Ok(0)
         }
@@ -1102,13 +1106,13 @@ pub(super) fn sys_capset(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let uid = Uid(ctx.args[0] as u32);
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if creds.euid == Uid::ROOT || creds.uid == uid || creds.euid == uid || creds.suid == uid {
         let mut new = (*creds).clone();
         new.uid = uid;
         new.euid = uid;
         new.suid = uid;
-        ctx.task.set_credentials(Arc::new(new));
+        ctx.task().set_credentials(Arc::new(new));
         Ok(0)
     } else {
         Err(Errno::EPERM)
@@ -1117,13 +1121,13 @@ pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
 pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let gid = Gid(ctx.args[0] as u32);
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if creds.euid == Uid::ROOT || creds.gid == gid || creds.egid == gid || creds.sgid == gid {
         let mut new = (*creds).clone();
         new.gid = gid;
         new.egid = gid;
         new.sgid = gid;
-        ctx.task.set_credentials(Arc::new(new));
+        ctx.task().set_credentials(Arc::new(new));
         Ok(0)
     } else {
         Err(Errno::EPERM)
@@ -1133,7 +1137,7 @@ pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let ruid = ctx.args[0] as u32;
     let euid = ctx.args[1] as u32;
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     let mut new = (*creds).clone();
     if ruid != u32::MAX {
         if creds.euid != Uid::ROOT && ruid != creds.uid.0 && ruid != creds.euid.0 {
@@ -1151,14 +1155,14 @@ pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         }
         new.euid = Uid(euid);
     }
-    ctx.task.set_credentials(Arc::new(new));
+    ctx.task().set_credentials(Arc::new(new));
     Ok(0)
 }
 
 pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let rgid = ctx.args[0] as u32;
     let egid = ctx.args[1] as u32;
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     let mut new = (*creds).clone();
     if rgid != u32::MAX {
         if creds.euid != Uid::ROOT && rgid != creds.gid.0 && rgid != creds.egid.0 {
@@ -1176,7 +1180,7 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         }
         new.egid = Gid(egid);
     }
-    ctx.task.set_credentials(Arc::new(new));
+    ctx.task().set_credentials(Arc::new(new));
     Ok(0)
 }
 
@@ -1184,7 +1188,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let ruid = ctx.args[0] as u32;
     let euid = ctx.args[1] as u32;
     let suid = ctx.args[2] as u32;
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if creds.euid != Uid::ROOT {
         if ruid != u32::MAX && ruid != creds.uid.0 && ruid != creds.euid.0 && ruid != creds.suid.0 {
             return Err(Errno::EPERM);
@@ -1206,7 +1210,7 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if suid != u32::MAX {
         new.suid = Uid(suid);
     }
-    ctx.task.set_credentials(Arc::new(new));
+    ctx.task().set_credentials(Arc::new(new));
     Ok(0)
 }
 
@@ -1214,7 +1218,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let rgid = ctx.args[0] as u32;
     let egid = ctx.args[1] as u32;
     let sgid = ctx.args[2] as u32;
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if creds.euid != Uid::ROOT {
         if rgid != u32::MAX && rgid != creds.gid.0 && rgid != creds.egid.0 && rgid != creds.sgid.0 {
             return Err(Errno::EPERM);
@@ -1236,7 +1240,7 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if sgid != u32::MAX {
         new.sgid = Gid(sgid);
     }
-    ctx.task.set_credentials(Arc::new(new));
+    ctx.task().set_credentials(Arc::new(new));
     Ok(0)
 }
 
@@ -1245,17 +1249,17 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 /// 用于文件系统权限检查；正确实现需在 Credentials 中新增 fsuid/fsgid
 /// 字段并修改 VFS 权限检查逻辑。
 pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(ctx.task.credentials().uid.0 as usize)
+    Ok(ctx.task().credentials().uid.0 as usize)
 }
 
 pub(super) fn sys_setfsgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(ctx.task.credentials().gid.0 as usize)
+    Ok(ctx.task().credentials().gid.0 as usize)
 }
 
 pub(super) fn sys_getgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let size = ctx.args[0];
     let list = ctx.args[1];
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if size == 0 {
         return Ok(creds.groups.len());
     }
@@ -1272,7 +1276,7 @@ pub(super) fn sys_getgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let size = ctx.args[0];
     let list = ctx.args[1];
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     if creds.euid != Uid::ROOT {
         return Err(Errno::EPERM);
     }
@@ -1288,7 +1292,7 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     }
     let mut new = (*creds).clone();
     new.groups = groups;
-    ctx.task.set_credentials(Arc::new(new));
+    ctx.task().set_credentials(Arc::new(new));
     Ok(0)
 }
 
@@ -1314,7 +1318,7 @@ struct FutexKey {
 }
 
 struct FutexWaiter {
-    task: Arc<sched::Task>,
+    task: Weak<sched::Task>,
     bitset: u32,
 }
 
@@ -1363,7 +1367,10 @@ fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
         let mut idx = 0;
         while idx < bucket.waiters.len() && waiters.len() < count {
             if (bucket.waiters[idx].bitset & bitset) != 0 {
-                waiters.push(bucket.waiters.remove(idx).task);
+                let waiter = bucket.waiters.remove(idx);
+                if let Some(task) = waiter.task.upgrade() {
+                    waiters.push(task);
+                }
             } else {
                 idx += 1;
             }
@@ -1397,9 +1404,33 @@ fn futex_remove_waiter(key: FutexKey, task: &Arc<Task>) -> bool {
         return false;
     };
     let before = bucket.waiters.len();
-    bucket.waiters.retain(|w| !Arc::ptr_eq(&w.task, task));
+    bucket.waiters.retain(|w| match w.task.upgrade() {
+        Some(waiter) => !Arc::ptr_eq(&waiter, task),
+        None => false,
+    });
     let removed = before != bucket.waiters.len();
     if bucket.waiters.is_empty() {
+        table.remove(&key);
+    }
+    removed
+}
+
+fn futex_remove_task_waiters(task: &Arc<Task>) -> usize {
+    let mut table = FUTEX_TABLE.lock();
+    let mut empty_keys = Vec::new();
+    let mut removed = 0usize;
+    for (key, bucket) in table.iter_mut() {
+        let before = bucket.waiters.len();
+        bucket.waiters.retain(|waiter| match waiter.task.upgrade() {
+            Some(waiter_task) => !Arc::ptr_eq(&waiter_task, task),
+            None => false,
+        });
+        removed = removed.saturating_add(before.saturating_sub(bucket.waiters.len()));
+        if bucket.waiters.is_empty() {
+            empty_keys.push(*key);
+        }
+    }
+    for key in empty_keys {
         table.remove(&key);
     }
     removed
@@ -1427,9 +1458,13 @@ fn futex_requeue_key(
                 }
                 let waiter = bucket.waiters.remove(idx);
                 if wake.len() < wake_count {
-                    wake.push(waiter.task);
+                    if let Some(task) = waiter.task.upgrade() {
+                        wake.push(task);
+                    }
                 } else if requeue.len() < requeue_count {
-                    requeue.push(waiter);
+                    if waiter.task.strong_count() != 0 {
+                        requeue.push(waiter);
+                    }
                 }
             }
             if bucket.waiters.is_empty() {
@@ -1482,8 +1517,8 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 
     match cmd {
         FUTEX_WAIT => futex_wait(
-            &ctx.task,
-            futex_key(&ctx.task, uaddr, private),
+            ctx.task(),
+            futex_key(ctx.task(), uaddr, private),
             uaddr,
             val,
             FUTEX_BITSET_MATCH_ANY,
@@ -1494,8 +1529,8 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EINVAL);
             }
             futex_wait(
-                &ctx.task,
-                futex_key(&ctx.task, uaddr, private),
+                ctx.task(),
+                futex_key(ctx.task(), uaddr, private),
                 uaddr,
                 val,
                 val3,
@@ -1503,7 +1538,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             )
         }
         FUTEX_WAKE => Ok(futex_wake_key(
-            futex_key(&ctx.task, uaddr, private),
+            futex_key(ctx.task(), uaddr, private),
             val as usize,
             FUTEX_BITSET_MATCH_ANY,
         )),
@@ -1512,7 +1547,7 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EINVAL);
             }
             Ok(futex_wake_key(
-                futex_key(&ctx.task, uaddr, private),
+                futex_key(ctx.task(), uaddr, private),
                 val as usize,
                 val3,
             ))
@@ -1525,8 +1560,8 @@ pub(super) fn sys_futex(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 return Err(Errno::EAGAIN);
             }
             Ok(futex_requeue_key(
-                futex_key(&ctx.task, uaddr, private),
-                futex_key(&ctx.task, uaddr2, private),
+                futex_key(ctx.task(), uaddr, private),
+                futex_key(ctx.task(), uaddr2, private),
                 val as usize,
                 timeout,
                 FUTEX_BITSET_MATCH_ANY,
@@ -1590,7 +1625,7 @@ fn futex_wait(
             })
             .waiters
             .push(FutexWaiter {
-                task: me.clone(),
+                task: Arc::downgrade(&me),
                 bitset,
             });
     }
@@ -1625,7 +1660,14 @@ fn futex_wait(
         let table = FUTEX_TABLE.lock();
         let still_waiting = table
             .get(&key)
-            .map(|bucket| bucket.waiters.iter().any(|w| Arc::ptr_eq(&w.task, &me)))
+            .map(|bucket| {
+                bucket.waiters.iter().any(|w| {
+                    w.task
+                        .upgrade()
+                        .as_ref()
+                        .is_some_and(|waiter| Arc::ptr_eq(waiter, &me))
+                })
+            })
             .unwrap_or(false);
         if !still_waiting {
             if deadline_ns.is_some() {

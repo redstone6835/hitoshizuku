@@ -495,10 +495,22 @@ impl RandomCore {
         }
 
         if sched::is_ready() {
-            let task = sched::current_task();
-            self.entropy_wait
-                .wait_event(&task, || self.estimated_entropy_bits() >= bits);
-            return;
+            loop {
+                if self.estimated_entropy_bits() >= bits {
+                    return;
+                }
+                let task = sched::current_task();
+                self.entropy_wait
+                    .prepare_to_wait(&task, sched::TaskState::Sleeping);
+                if self.estimated_entropy_bits() >= bits {
+                    self.entropy_wait.finish_wait(&task);
+                    return;
+                }
+                drop(task);
+                sched::schedule_once(sched::now_ns_public());
+                let task = sched::current_task();
+                self.entropy_wait.finish_wait(&task);
+            }
         }
 
         // 调度器启动前没有 current task 可挂队列，只能保留极早期兼容兜底；

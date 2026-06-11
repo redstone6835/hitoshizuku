@@ -141,8 +141,8 @@ pub use request::{
     PhysicalAllocation, ReclaimPolicy, Zeroing,
 };
 pub use slab::{
-    MAX_CPUS, MAX_SMALL_SIZE, SlabAllocator as ZoneAllocator, SlabAudit, SlabAuditFlags,
-    SlabReclaimStats, SlabStats,
+    MAX_CPUS, MAX_SMALL_SIZE, SLAB_SIZE_CLASS_COUNT, SlabAllocator as ZoneAllocator, SlabAudit,
+    SlabAuditFlags, SlabClassStat, SlabReclaimStats, SlabStats,
 };
 pub use space::{AddressSpaceStats, ArenaKind, BackedRange, KernelAddressSpace};
 pub use stats::{
@@ -736,6 +736,14 @@ impl KernelMemorySubsystem {
     /// O(1) 统计是否仍然一致。
     pub fn slab_audit(&self) -> SlabAudit {
         self.slab.audit()
+    }
+
+    /// 返回每个 slab size class 的轻量计数器快照。
+    ///
+    /// 该接口只读取各 zone 的 O(1) 统计，不扫描对象内容，用于定位小对象泄漏集中在哪个
+    /// 尺寸层级。
+    pub fn slab_class_stats(&self) -> [SlabClassStat; SLAB_SIZE_CLASS_COUNT] {
+        self.slab.class_stats()
     }
 
     /// 返回 kheap 大对象缓存 ring 和活跃页账本的一致性审计结果。

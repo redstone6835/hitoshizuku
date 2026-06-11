@@ -21,7 +21,7 @@ pub(super) fn sys_rt_sigaction(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
         return Err(Errno::EINVAL);
     }
 
-    let old = ctx.task.shared_signal().get_action(sig);
+    let old = ctx.task().shared_signal().get_action(sig);
     if old_user != 0 {
         write_sigaction(old_user, old)?;
     }
@@ -41,7 +41,7 @@ pub(super) fn sys_rt_sigprocmask(ctx: &mut SyscallContext<'_>) -> Result<usize, 
         return Err(Errno::EINVAL);
     }
 
-    let old = ctx.task.signal.blocked_snapshot();
+    let old = ctx.task().signal.blocked_snapshot();
     if old_user != 0 {
         copy_to_user(old_user, &old.raw().to_le_bytes()).map_err(|e| e.as_errno())?;
     }
@@ -88,18 +88,21 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let mut raw = [0u8; 8];
     copy_from_user(set_user, &mut raw).map_err(|e| e.as_errno())?;
     let mask = SigSet::from_raw(u64::from_le_bytes(raw));
-    ctx.task.signal.save_blocked(mask);
+    ctx.task().signal.save_blocked(mask);
     loop {
         let pending = sched::operation::sigpending()?;
         if pending.raw() != 0 {
             break;
         }
-        if !ctx.task.cas_state(TaskState::Running, TaskState::Sleeping) {
+        if !ctx
+            .task()
+            .cas_state(TaskState::Running, TaskState::Sleeping)
+        {
             continue;
         }
         sched::operation::sched_yield()?;
     }
-    ctx.task.signal.restore_blocked();
+    ctx.task().signal.restore_blocked();
     Err(Errno::EINTR)
 }
 
