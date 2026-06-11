@@ -358,6 +358,8 @@ impl NetStack {
         ip_version: u8,
         protocol: u8,
     ) -> Result<NetSocketHandle, NetError> {
+        let ip_version = raw_ip_version_from_u8(ip_version)?;
+        let protocol = IpProtocol::from(protocol);
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
@@ -1888,6 +1890,14 @@ fn parse_raw_packet_meta(data: &[u8]) -> Result<RawPacketMeta, NetError> {
     }
 }
 
+fn raw_ip_version_from_u8(version: u8) -> Result<IpVersion, NetError> {
+    match version {
+        4 => Ok(IpVersion::Ipv4),
+        6 => Ok(IpVersion::Ipv6),
+        _ => Err(NetError::InvalidArgument),
+    }
+}
+
 fn ensure_udp_bound_locked(
     managed: &mut ManagedInterface,
     handle: ProtocolSocketHandle,
@@ -2163,6 +2173,30 @@ mod tests {
         {
             let mut packet = Ipv4Packet::new_unchecked(&mut bytes);
             ip.emit(&mut packet, &ChecksumCapabilities::default());
+            packet.payload_mut().copy_from_slice(payload);
+        }
+        bytes
+    }
+
+    fn build_raw_ipv6_packet(
+        src: smoltcp::wire::Ipv6Address,
+        dst: smoltcp::wire::Ipv6Address,
+        protocol: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use smoltcp::wire::{IpProtocol, Ipv6Packet, Ipv6Repr};
+
+        let ip = Ipv6Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::from(protocol),
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = alloc::vec![0u8; ip.buffer_len() + payload.len()];
+        {
+            let mut packet = Ipv6Packet::new_unchecked(&mut bytes);
+            ip.emit(&mut packet);
             packet.payload_mut().copy_from_slice(payload);
         }
         bytes
@@ -2511,6 +2545,26 @@ mod tests {
     }
 
     #[test]
+    fn socket_raw_rejects_invalid_ip_version() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-raw-version-invalid",
+            IfConfig::static_v4(Ipv4Addr::new(10, 34, 0, 2), 24, None),
+        );
+
+        assert_eq!(
+            stack.socket_raw_on(iface, 5, 253),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.socket_raw_on(iface, 0, 253),
+            Err(NetError::InvalidArgument)
+        );
+        assert!(stack.socket_raw_on(iface, 6, 253).is_ok());
+    }
+
+    #[test]
     fn raw_send_accepts_packet_destination_without_remote() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -2554,6 +2608,33 @@ mod tests {
         assert_eq!(
             stack.raw_send(handle, &packet, None),
             Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn raw_send_rejects_packet_ip_version_that_does_not_match_socket() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-raw-header-version",
+            IfConfig::static_v6(
+                Ipv6Addr::new([0x2001, 0x0db8, 0x0034, 0, 0, 0, 0, 2]),
+                64,
+                None,
+            ),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let packet = build_raw_ipv6_packet(
+            smoltcp::wire::Ipv6Address::new(0x2001, 0x0db8, 0x0034, 0, 0, 0, 0, 2),
+            smoltcp::wire::Ipv6Address::new(0x2001, 0x0db8, 0x0034, 0, 0, 0, 0, 77),
+            253,
+            b"raw-ipv6",
+        );
+
+        assert_eq!(
+            stack.raw_send(handle, &packet, None),
+            Err(NetError::InvalidArgument)
         );
         assert!(stack.raw_can_send(handle));
     }

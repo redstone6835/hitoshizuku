@@ -850,20 +850,13 @@ impl ManagedInterface {
     /// 创建一个 raw IP socket（指定 IP 版本和协议号）。
     pub fn add_raw_socket(
         &mut self,
-        ip_version: u8,
-        protocol: u8,
+        ip_version: smoltcp::wire::IpVersion,
+        protocol: smoltcp::wire::IpProtocol,
         tuning: PacketBufferTuning,
     ) -> ProtocolSocketHandle {
         use smoltcp::socket::raw;
-        use smoltcp::wire::{IpProtocol, IpVersion};
-        // TODO: raw socket 仍缺少协议过滤以外的 option 支持，例如头部包含
-        // 语义、TTL/TOS 和接收控制消息；容量本身已由调优配置统一管理。
-        let ip_ver = if ip_version == 6 {
-            IpVersion::Ipv6
-        } else {
-            IpVersion::Ipv4
-        };
-        let proto = IpProtocol::from(protocol);
+        // TODO: raw socket 仍缺少协议过滤以外的 option 支持，例如 TTL/TOS
+        // 和接收控制消息；容量本身已由调优配置统一管理。
         let rx_buf = raw::PacketBuffer::new(
             alloc::vec![raw::PacketMetadata::EMPTY; tuning.rx_meta],
             alloc::vec![0u8; tuning.rx_bytes],
@@ -872,7 +865,7 @@ impl ManagedInterface {
             alloc::vec![raw::PacketMetadata::EMPTY; tuning.tx_meta],
             alloc::vec![0u8; tuning.tx_bytes],
         );
-        let socket = raw::Socket::new(Some(ip_ver), Some(proto), rx_buf, tx_buf);
+        let socket = raw::Socket::new(Some(ip_version), Some(protocol), rx_buf, tx_buf);
         let handle = self.sockets.add(socket);
         self.install_socket_meta(handle, SocketType::Raw);
         ProtocolSocketHandle::from_smoltcp(handle)
