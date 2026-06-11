@@ -26,7 +26,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use crate::arch_hooks;
 use crate::arch_hooks::KernelEntry;
@@ -60,6 +62,67 @@ pub struct RseqRegistration {
     pub len: u32,
     pub signature: u32,
     pub registered: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigAltStack {
+    pub sp: usize,
+    pub size: usize,
+    pub disabled: bool,
+}
+
+impl SigAltStack {
+    pub const fn disabled() -> Self {
+        Self {
+            sp: 0,
+            size: 0,
+            disabled: true,
+        }
+    }
+
+    pub fn contains(self, sp: usize) -> bool {
+        !self.disabled
+            && self
+                .sp
+                .checked_add(self.size)
+                .is_some_and(|end| sp >= self.sp && sp < end)
+    }
+}
+
+impl Default for SigAltStack {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+/// 任务资源使用快照。
+///
+/// 当前调度器尚未区分用户态/内核态执行时间，因此先把任务生命周期内的可运行
+/// 时间计入 `user_ns`，`system_ns` 保持 0。接口按结构化字段提供给 syscall
+/// 兼容层，后续接入更细的 trap/syscall 记账时无需改动 wait/getrusage ABI。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskUsage {
+    pub user_ns: u64,
+    pub system_ns: u64,
+    pub minflt: u64,
+    pub majflt: u64,
+    pub voluntary_ctxt_switches: u64,
+    pub involuntary_ctxt_switches: u64,
+}
+
+impl TaskUsage {
+    pub fn add_assign(&mut self, rhs: Self) {
+        self.user_ns = self.user_ns.saturating_add(rhs.user_ns);
+        self.system_ns = self.system_ns.saturating_add(rhs.system_ns);
+        self.minflt = self.minflt.saturating_add(rhs.minflt);
+        self.majflt = self.majflt.saturating_add(rhs.majflt);
+        self.voluntary_ctxt_switches = self
+            .voluntary_ctxt_switches
+            .saturating_add(rhs.voluntary_ctxt_switches);
+        self.involuntary_ctxt_switches = self
+            .involuntary_ctxt_switches
+            .saturating_add(rhs.involuntary_ctxt_switches);
+    }
 }
 
 /// 任务状态机。
@@ -268,12 +331,26 @@ pub struct Task {
     robust_list: Spinlock<RobustListState>,
     /// `rseq` 注册状态。完整 restartable sequence 语义后续由 arch/trap 接入。
     rseq: Spinlock<RseqRegistration>,
+    /// `sigaltstack(2)` 的 per-thread alternate signal stack。
+    sigaltstack: Spinlock<SigAltStack>,
     /// `PR_SET_NAME` / `PR_GET_NAME` 暴露的 per-thread comm。
     comm: Spinlock<[u8; TASK_COMM_LEN]>,
+    /// 任务创建时间，用于在精细 CPU 记账落地前提供稳定的 rusage 近似值。
+    start_time_ns: AtomicU64,
+    /// 任务退出时冻结的自身 usage。非 Zombie 任务按当前时间动态计算。
+    exited_usage_ns: AtomicU64,
+    /// 已被本任务 reap 的子任务 usage 累计。
+    child_usage: Spinlock<TaskUsage>,
+    voluntary_ctxt_switches: AtomicU64,
+    involuntary_ctxt_switches: AtomicU64,
+    /// SCHED_RESET_ON_FORK 标志。fork/clone 子进程继承时由 spawn 路径消费。
+    sched_reset_on_fork: AtomicBool,
     /// CPU 亲和性位图。预留单 word，单 CPU 原型暂不强制。
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
     current_cpu: AtomicUsize,
+    /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
+    ioprio: AtomicU32,
     /// 子系统侧表：VFS context / fdtable 等通过 [`TaskExtKey`] 挂载。
     /// 详见模块级 [`TaskExtCloneHook`]。
     ext: Spinlock<Vec<TaskExt>>,
@@ -322,9 +399,17 @@ impl Task {
             clear_child_tid: AtomicUsize::new(0),
             robust_list: Spinlock::new(RobustListState::default()),
             rseq: Spinlock::new(RseqRegistration::default()),
+            sigaltstack: Spinlock::new(SigAltStack::default()),
             comm: Spinlock::new(DEFAULT_COMM),
+            start_time_ns: AtomicU64::new(crate::scheduler::now_ns_public()),
+            exited_usage_ns: AtomicU64::new(0),
+            child_usage: Spinlock::new(TaskUsage::default()),
+            voluntary_ctxt_switches: AtomicU64::new(0),
+            involuntary_ctxt_switches: AtomicU64::new(0),
+            sched_reset_on_fork: AtomicBool::new(false),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
+            ioprio: AtomicU32::new(0),
             ext: Spinlock::new(Vec::new()),
         })
     }
@@ -400,6 +485,8 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
+        self.exited_usage_ns
+            .store(self.elapsed_usage_ns(crate::scheduler::now_ns_public()), Ordering::Release);
         if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
             self.exit_reason
                 .store(EXIT_REASON_EXITED, Ordering::Release);
@@ -731,6 +818,18 @@ impl Task {
         *self.rseq.lock() = RseqRegistration::default();
     }
 
+    pub fn sigaltstack(&self) -> SigAltStack {
+        *self.sigaltstack.lock()
+    }
+
+    pub fn set_sigaltstack(&self, stack: SigAltStack) {
+        *self.sigaltstack.lock() = stack;
+    }
+
+    pub fn clear_sigaltstack(&self) {
+        *self.sigaltstack.lock() = SigAltStack::disabled();
+    }
+
     pub fn comm(&self) -> [u8; TASK_COMM_LEN] {
         *self.comm.lock()
     }
@@ -744,6 +843,51 @@ impl Task {
             .min(TASK_COMM_LEN - 1);
         comm[..n].copy_from_slice(&name[..n]);
         *self.comm.lock() = comm;
+    }
+
+    fn elapsed_usage_ns(&self, now_ns: u64) -> u64 {
+        let frozen = self.exited_usage_ns.load(Ordering::Acquire);
+        if frozen != 0 {
+            return frozen;
+        }
+        now_ns.saturating_sub(self.start_time_ns.load(Ordering::Acquire))
+    }
+
+    pub fn usage_snapshot(&self, now_ns: u64) -> TaskUsage {
+        TaskUsage {
+            user_ns: self.elapsed_usage_ns(now_ns),
+            system_ns: 0,
+            minflt: 0,
+            majflt: 0,
+            voluntary_ctxt_switches: self.voluntary_ctxt_switches.load(Ordering::Acquire),
+            involuntary_ctxt_switches: self.involuntary_ctxt_switches.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn child_usage_snapshot(&self) -> TaskUsage {
+        *self.child_usage.lock()
+    }
+
+    pub fn add_child_usage(&self, usage: TaskUsage) {
+        self.child_usage.lock().add_assign(usage);
+    }
+
+    pub fn record_voluntary_context_switch(&self) {
+        self.voluntary_ctxt_switches.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn record_involuntary_context_switch(&self) {
+        self.involuntary_ctxt_switches
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn sched_reset_on_fork(&self) -> bool {
+        self.sched_reset_on_fork.load(Ordering::Acquire)
+    }
+
+    pub fn set_sched_reset_on_fork(&self, enabled: bool) {
+        self.sched_reset_on_fork
+            .store(enabled, Ordering::Release);
     }
 
     // ── CPU 亲和性 ───────────────────────────────────────────────────────
@@ -763,6 +907,14 @@ impl Task {
 
     pub(crate) fn set_current_cpu(&self, cpu_id: usize) {
         self.current_cpu.store(cpu_id, Ordering::Release);
+    }
+
+    pub fn ioprio(&self) -> u16 {
+        self.ioprio.load(Ordering::Acquire) as u16
+    }
+
+    pub fn set_ioprio(&self, value: u16) {
+        self.ioprio.store(value as u32, Ordering::Release);
     }
 
     // ── 子系统侧表（VFS / FdTable 等） ───────────────────────────────────

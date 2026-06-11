@@ -44,7 +44,7 @@ fn main() -> ! {
     general::mm::smoketest::run();
     */
 
-    #[cfg(feature = "kernel-tests")]
+    #[cfg(any(feature = "kernel-tests", feature = "allocator-tests"))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);
         let report = ktest::runner::run_all();

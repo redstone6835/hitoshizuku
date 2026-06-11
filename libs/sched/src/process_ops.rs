@@ -4,6 +4,7 @@
 //! 地址空间或 trap-frame 布局。上层内核注册这些 ops 后，`sched::operation`
 //! 即可完成语义调度；未注册时返回 `ENOSYS`，不会留下半初始化任务。
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -35,10 +36,19 @@ impl UserContextRef {
     }
 }
 
-/// execve 的用户 ABI 参数。指针值由上层 ops 按当前地址空间解释。
-#[derive(Debug, Clone, Copy)]
+/// execve 的路径来源。
+#[derive(Debug, Clone)]
+pub enum ExecPath {
+    /// 用户 ABI 传入的 C 字符串指针，由 kernel ops 在当前地址空间解释。
+    User(usize),
+    /// syscall 层已经解析好的内核字符串，典型用于 `execveat` 的 dirfd 相对路径。
+    Kernel(String),
+}
+
+/// execve 的 ABI 参数。argv/envp 仍是用户指针，路径可以来自用户指针或内核字符串。
+#[derive(Debug, Clone)]
 pub struct ExecRequest {
-    pub path_user: usize,
+    pub path: ExecPath,
     pub argv_user: usize,
     pub envp_user: usize,
 }
@@ -46,7 +56,15 @@ pub struct ExecRequest {
 impl ExecRequest {
     pub const fn new(path_user: usize, argv_user: usize, envp_user: usize) -> Self {
         Self {
-            path_user,
+            path: ExecPath::User(path_user),
+            argv_user,
+            envp_user,
+        }
+    }
+
+    pub fn from_kernel_path(path: String, argv_user: usize, envp_user: usize) -> Self {
+        Self {
+            path: ExecPath::Kernel(path),
             argv_user,
             envp_user,
         }

@@ -116,6 +116,76 @@ pub struct ManagedStats {
     pub gc_control: Option<gc::GcControlSnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManagedAudit {
+    pub flags: ManagedAuditFlags,
+    pub scanned_active_objects: u64,
+    pub scanned_active_bytes: usize,
+    pub scanned_young_objects: u64,
+    pub scanned_old_objects: u64,
+    pub scanned_object_slots: usize,
+    pub scanned_active_handle_slots: usize,
+    pub scanned_strong_handle_slots: usize,
+    pub scanned_weak_handle_slots: usize,
+    pub scanned_pinned_handle_slots: usize,
+    pub scanned_root_entries: usize,
+    pub scanned_automatic_root_entries: usize,
+    pub scanned_strong_reference_slots: usize,
+    pub scanned_weak_reference_slots: usize,
+    pub scanned_stale_weak_reference_slots: usize,
+    pub scanned_pending_finalizers: usize,
+    pub scanned_dirty_cards: usize,
+    pub scanned_remembered_objects: usize,
+    pub scanned_dynamic_exact_roots: usize,
+}
+
+impl ManagedAudit {
+    pub const fn is_consistent(self) -> bool {
+        self.flags.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ManagedAuditFlags(u32);
+
+impl ManagedAuditFlags {
+    pub const HEAP_RANGE_INVALID: Self = Self(1 << 0);
+    pub const OBJECT_TABLE_INVALID: Self = Self(1 << 1);
+    pub const OBJECT_RANGE_INVALID: Self = Self(1 << 2);
+    pub const OBJECT_HEADER_MISMATCH: Self = Self(1 << 3);
+    pub const OBJECT_ACCOUNTING_MISMATCH: Self = Self(1 << 4);
+    pub const HANDLE_TABLE_INVALID: Self = Self(1 << 5);
+    pub const HANDLE_TARGET_INVALID: Self = Self(1 << 6);
+    pub const HANDLE_ACCOUNTING_MISMATCH: Self = Self(1 << 7);
+    pub const ROOT_TABLE_INVALID: Self = Self(1 << 8);
+    pub const ROOT_TARGET_INVALID: Self = Self(1 << 9);
+    pub const ROOT_ACCOUNTING_MISMATCH: Self = Self(1 << 10);
+    pub const FINALIZER_QUEUE_INVALID: Self = Self(1 << 11);
+    pub const CARD_ACCOUNTING_MISMATCH: Self = Self(1 << 12);
+    pub const EXACT_ROOT_REGISTRY_INVALID: Self = Self(1 << 13);
+    pub const REFERENCE_GRAPH_MISMATCH: Self = Self(1 << 14);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+
+    fn insert(&mut self, flag: Self) {
+        self.0 |= flag.0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ManagedAllocator 主结构体
 // ---------------------------------------------------------------------------
@@ -433,6 +503,7 @@ impl ManagedAllocator {
                 reserve_size,
                 object_size,
                 object_align,
+                trace_descriptor as *const _ as usize,
             ) {
                 let mut gc = self.gc.lock();
                 if let Some(idx) = gc.find_object_by_object_addr(object_addr) {
@@ -737,7 +808,7 @@ impl ManagedAllocator {
         target_header.generation = source_header.generation;
         target_header.flags = flags;
         target_header.finalizer_id = source_header.finalizer_id;
-        target_header.set_trace_descriptor(source_header.trace_descriptor());
+        target_header.set_trace_descriptor(target_entry.trace_descriptor());
         target_header.set_forwarding(0);
         unsafe {
             *(header_addr as *mut GcObjectHeader) = target_header;
@@ -823,7 +894,7 @@ impl ManagedAllocator {
                 }
             };
             let mut flags =
-                ManagedAllocFlags::new().with_trace_descriptor(header.trace_descriptor());
+                ManagedAllocFlags::new().with_trace_descriptor(source_entry.trace_descriptor());
             if header.flags & GC_FLAG_HAS_FINALIZER != 0 {
                 flags = flags.with_finalizer(header.finalizer_id);
             }
@@ -1456,6 +1527,327 @@ impl ManagedAllocator {
         }
     }
 
+    pub fn audit(&self) -> ManagedAudit {
+        let enabled = self.is_enabled();
+        let heap_start = self.heap_start.load(Ordering::Acquire);
+        let heap_size = self.heap_size.load(Ordering::Acquire);
+        let Some(heap_end) = heap_start.checked_add(heap_size) else {
+            let mut audit = ManagedAudit::default();
+            audit.flags.insert(ManagedAuditFlags::HEAP_RANGE_INVALID);
+            return audit;
+        };
+        let active_objects = self.active_objects.load(Ordering::Acquire);
+        let active_bytes = self.active_bytes.load(Ordering::Acquire);
+        let safepoint_requested = self.gc_safepoint_requested.load(Ordering::Acquire);
+
+        let gc = self.gc.lock();
+        let gc_stats = gc.stats();
+        let mut audit = ManagedAudit::default();
+
+        if enabled {
+            if !gc.initialized
+                || heap_size == 0
+                || gc.heap_start != heap_start
+                || gc.heap_end != heap_end
+                || gc.card_table_base != heap_start
+                || !managed_range_is_valid(heap_start, heap_end)
+                || !managed_subrange_is_valid(
+                    heap_start,
+                    heap_end,
+                    gc.young_gen_start,
+                    gc.young_gen_end,
+                )
+                || !managed_subrange_is_valid(heap_start, heap_end, gc.eden_start, gc.eden_end)
+                || !managed_subrange_is_valid(
+                    heap_start,
+                    heap_end,
+                    gc.survivor_from_start,
+                    gc.survivor_from_end,
+                )
+                || !managed_subrange_is_valid(
+                    heap_start,
+                    heap_end,
+                    gc.survivor_to_start,
+                    gc.survivor_to_end,
+                )
+            {
+                audit.flags.insert(ManagedAuditFlags::HEAP_RANGE_INVALID);
+            }
+        } else if gc.initialized
+            || active_objects != 0
+            || active_bytes != 0
+            || gc.live_object_count != 0
+        {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::OBJECT_ACCOUNTING_MISMATCH);
+        }
+
+        if gc.object_count > gc.objects.len() || gc.live_object_count > gc.object_count {
+            audit.flags.insert(ManagedAuditFlags::OBJECT_TABLE_INVALID);
+        }
+        let object_limit = gc.object_count.min(gc.objects.len());
+        audit.scanned_object_slots = object_limit;
+
+        for idx in 0..object_limit {
+            let entry = gc.objects[idx];
+            if !entry.active {
+                continue;
+            }
+            audit.scanned_active_objects = audit.scanned_active_objects.saturating_add(1);
+            audit.scanned_active_bytes =
+                audit.scanned_active_bytes.saturating_add(entry.object_size);
+
+            let object_range_ok =
+                audit_managed_object_range(heap_start, heap_end, entry, &mut audit);
+            if object_range_ok {
+                let header = unsafe { *(entry.header_addr as *const GcObjectHeader) };
+                audit_managed_object_header(entry, header, &mut audit);
+                audit_managed_object_references(&gc, entry, header, &mut audit);
+                if header.flags & GC_FLAG_OLD_GEN != 0 {
+                    audit.scanned_old_objects = audit.scanned_old_objects.saturating_add(1);
+                } else {
+                    audit.scanned_young_objects = audit.scanned_young_objects.saturating_add(1);
+                }
+                if header.flags & GC_FLAG_REMEMBERED != 0 {
+                    audit.scanned_remembered_objects =
+                        audit.scanned_remembered_objects.saturating_add(1);
+                }
+                if header.flags & GC_FLAG_FORWARDED != 0 {
+                    let target = header.forwarding_ptr;
+                    if target == 0 || gc.find_object_by_object_addr(target).is_none() {
+                        audit
+                            .flags
+                            .insert(ManagedAuditFlags::OBJECT_HEADER_MISMATCH);
+                    }
+                }
+            }
+
+            for prev_idx in 0..idx {
+                let prev = gc.objects[prev_idx];
+                if prev.active
+                    && managed_ranges_overlap(
+                        entry.object_addr,
+                        entry.object_size,
+                        prev.object_addr,
+                        prev.object_size,
+                    )
+                {
+                    audit.flags.insert(ManagedAuditFlags::OBJECT_RANGE_INVALID);
+                    break;
+                }
+            }
+        }
+
+        if audit.scanned_active_objects != active_objects
+            || audit.scanned_active_objects != gc.live_object_count as u64
+            || audit.scanned_active_objects != gc_stats.object_table_entries as u64
+            || audit.scanned_active_bytes != active_bytes
+            || audit.scanned_young_objects != gc_stats.young_gen_objects
+            || audit.scanned_old_objects != gc_stats.old_gen_objects
+        {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::OBJECT_ACCOUNTING_MISMATCH);
+        }
+
+        if gc.handle_slot_count > gc.handle_slots.len() {
+            audit.flags.insert(ManagedAuditFlags::HANDLE_TABLE_INVALID);
+        }
+        let handle_limit = gc.handle_slot_count.min(gc.handle_slots.len());
+        for idx in 0..handle_limit {
+            let slot = gc.handle_slots[idx];
+            if !slot.active {
+                if slot.strong_refs != 0
+                    || slot.weak_refs != 0
+                    || slot.root_refs != 0
+                    || slot.pin_refs != 0
+                {
+                    audit
+                        .flags
+                        .insert(ManagedAuditFlags::HANDLE_ACCOUNTING_MISMATCH);
+                }
+                continue;
+            }
+
+            audit.scanned_active_handle_slots += 1;
+            if slot.strong_refs > 0 && slot.object_addr != 0 {
+                audit.scanned_strong_handle_slots += 1;
+            }
+            if slot.weak_refs > 0 {
+                audit.scanned_weak_handle_slots += 1;
+            }
+            if slot.pin_refs > 0 && slot.object_addr != 0 {
+                audit.scanned_pinned_handle_slots += 1;
+            }
+
+            if slot.object_addr == 0 {
+                if slot.strong_refs != 0 || slot.root_refs != 0 || slot.pin_refs != 0 {
+                    audit.flags.insert(ManagedAuditFlags::HANDLE_TARGET_INVALID);
+                }
+            } else if gc.find_object_by_object_addr(slot.object_addr).is_none() {
+                audit.flags.insert(ManagedAuditFlags::HANDLE_TARGET_INVALID);
+            } else if slot.pin_refs > 0 {
+                let object_idx = gc
+                    .find_object_by_object_addr(slot.object_addr)
+                    .expect("object was checked above");
+                let header =
+                    unsafe { *(gc.objects[object_idx].header_addr as *const GcObjectHeader) };
+                if header.flags & GC_FLAG_PINNED == 0 {
+                    audit
+                        .flags
+                        .insert(ManagedAuditFlags::HANDLE_ACCOUNTING_MISMATCH);
+                }
+            }
+
+            if slot.strong_refs == 0
+                && slot.weak_refs == 0
+                && slot.root_refs == 0
+                && slot.pin_refs == 0
+            {
+                audit
+                    .flags
+                    .insert(ManagedAuditFlags::HANDLE_ACCOUNTING_MISMATCH);
+            }
+        }
+
+        if audit.scanned_strong_handle_slots != gc_stats.strong_handle_slots
+            || audit.scanned_weak_handle_slots != gc_stats.weak_handle_slots
+            || audit.scanned_pinned_handle_slots != gc_stats.pinned_handle_slots
+        {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::HANDLE_ACCOUNTING_MISMATCH);
+        }
+
+        if gc.root_count > gc.roots.len() {
+            audit.flags.insert(ManagedAuditFlags::ROOT_TABLE_INVALID);
+        }
+        let root_limit = gc.root_count.min(gc.roots.len());
+        for idx in 0..root_limit {
+            let root = gc.roots[idx];
+            if !root.active {
+                continue;
+            }
+            audit.scanned_root_entries += 1;
+            if root.automatic {
+                audit.scanned_automatic_root_entries += 1;
+            }
+
+            if root.handle_slot != u16::MAX {
+                let slot_idx = root.handle_slot as usize;
+                if slot_idx >= handle_limit
+                    || !gc.handle_slots[slot_idx].active
+                    || gc.handle_slots[slot_idx].generation != root.handle_generation
+                    || gc.handle_slots[slot_idx].object_addr == 0
+                {
+                    audit.flags.insert(ManagedAuditFlags::ROOT_TARGET_INVALID);
+                }
+            } else if root.ptr == 0 || gc.find_object_containing(root.ptr).is_none() {
+                audit.flags.insert(ManagedAuditFlags::ROOT_TARGET_INVALID);
+            }
+        }
+
+        for slot_idx in 0..handle_limit {
+            let slot = gc.handle_slots[slot_idx];
+            let mut scanned_root_refs = 0u32;
+            for root_idx in 0..root_limit {
+                let root = gc.roots[root_idx];
+                if root.active
+                    && root.handle_slot as usize == slot_idx
+                    && root.handle_generation == slot.generation
+                {
+                    scanned_root_refs = scanned_root_refs.saturating_add(1);
+                }
+            }
+            if slot.root_refs != scanned_root_refs {
+                audit
+                    .flags
+                    .insert(ManagedAuditFlags::ROOT_ACCOUNTING_MISMATCH);
+            }
+        }
+
+        if audit.scanned_automatic_root_entries != gc_stats.automatic_root_entries {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::ROOT_ACCOUNTING_MISMATCH);
+        }
+
+        if gc.finalizer_count > gc.finalizers.len()
+            || gc.pending_finalizer_count > gc.pending_finalizers.len()
+        {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::FINALIZER_QUEUE_INVALID);
+        }
+        for idx in 0..gc.finalizer_count.min(gc.finalizers.len()) {
+            let entry = gc.finalizers[idx];
+            if entry.active && entry.callback.is_none() {
+                audit
+                    .flags
+                    .insert(ManagedAuditFlags::FINALIZER_QUEUE_INVALID);
+            }
+        }
+        let pending_limit = gc.pending_finalizer_count.min(gc.pending_finalizers.len());
+        audit.scanned_pending_finalizers = pending_limit;
+        for idx in 0..pending_limit {
+            let pending = gc.pending_finalizers[idx];
+            if pending.callback.is_none()
+                || pending.obj_addr == 0
+                || pending.obj_size == 0
+                || gc.find_object_by_object_addr(pending.obj_addr).is_none()
+            {
+                audit
+                    .flags
+                    .insert(ManagedAuditFlags::FINALIZER_QUEUE_INVALID);
+            }
+        }
+        if audit.scanned_pending_finalizers != gc_stats.pending_finalizers {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::FINALIZER_QUEUE_INVALID);
+        }
+
+        audit.scanned_dirty_cards = gc.card_table.iter().filter(|&&card| card != 0).count();
+        if audit.scanned_dirty_cards != gc_stats.dirty_cards
+            || audit.scanned_remembered_objects != gc_stats.remembered_objects
+        {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::CARD_ACCOUNTING_MISMATCH);
+        }
+
+        let root_registry = self.exact_root_registry.lock();
+        for idx in 0..root_registry.slots.len() {
+            let entry = root_registry.slots[idx];
+            if !entry.active {
+                continue;
+            }
+            audit.scanned_dynamic_exact_roots += 1;
+            if entry.slot_addr == 0 {
+                audit
+                    .flags
+                    .insert(ManagedAuditFlags::EXACT_ROOT_REGISTRY_INVALID);
+                continue;
+            }
+            for prev_idx in 0..idx {
+                let prev = root_registry.slots[prev_idx];
+                if prev.active && prev.slot_addr == entry.slot_addr {
+                    audit
+                        .flags
+                        .insert(ManagedAuditFlags::EXACT_ROOT_REGISTRY_INVALID);
+                    break;
+                }
+            }
+        }
+
+        if safepoint_requested && !gc.control_snapshot(safepoint_requested).safepoint_requested {
+            audit.flags.insert(ManagedAuditFlags::HEAP_RANGE_INVALID);
+        }
+
+        audit
+    }
+
     pub fn set_mode(&self, mode: GcMode) {
         if !self.is_enabled() {
             return;
@@ -1599,8 +1991,13 @@ impl ManagedAllocator {
         let Some(allocation) = self.read_allocation(owner_ptr) else {
             return Err(ManagedHandleError::InvalidHandle);
         };
-        let header = unsafe { *(allocation.header_addr as *const GcObjectHeader) };
-        let descriptor = header.trace_descriptor();
+        let descriptor = {
+            let gc = self.gc.lock();
+            let Some(idx) = gc.find_object_by_object_addr(owner_ptr) else {
+                return Err(ManagedHandleError::InvalidHandle);
+            };
+            gc.objects[idx].trace_descriptor()
+        };
         let valid = match slot_kind {
             ManagedSlotKind::Strong => {
                 descriptor.allows_ref_offset(allocation.object_size, field_offset)
@@ -1883,6 +2280,170 @@ fn encode_reserve_size(header: &mut GcObjectHeader, reserve_size: usize) {
 
 fn decode_reserve_size(header: GcObjectHeader) -> u32 {
     header.reserve_size_lo as u32 | ((header.reserve_size_hi as u32) << 16)
+}
+
+fn managed_range_is_valid(start: usize, end: usize) -> bool {
+    start < end
+}
+
+fn managed_subrange_is_valid(heap_start: usize, heap_end: usize, start: usize, end: usize) -> bool {
+    start <= end && start >= heap_start && end <= heap_end
+}
+
+fn managed_sized_range_is_valid(
+    heap_start: usize,
+    heap_end: usize,
+    start: usize,
+    size: usize,
+) -> bool {
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    size != 0 && start >= heap_start && end <= heap_end
+}
+
+fn audit_managed_object_range(
+    heap_start: usize,
+    heap_end: usize,
+    entry: crate::gc::GcObjectEntry,
+    audit: &mut ManagedAudit,
+) -> bool {
+    let Some(header_end) = entry.header_addr.checked_add(GcObjectHeader::HEADER_SIZE) else {
+        audit.flags.insert(ManagedAuditFlags::OBJECT_RANGE_INVALID);
+        return false;
+    };
+    let Some(raw_end) = entry.raw_base.checked_add(entry.reserve_size) else {
+        audit.flags.insert(ManagedAuditFlags::OBJECT_RANGE_INVALID);
+        return false;
+    };
+    let Some(object_end) = entry.object_addr.checked_add(entry.object_size) else {
+        audit.flags.insert(ManagedAuditFlags::OBJECT_RANGE_INVALID);
+        return false;
+    };
+    let range_ok = entry.object_size != 0
+        && entry.object_align != 0
+        && entry.object_align.is_power_of_two()
+        && entry.raw_base <= entry.header_addr
+        && header_end == entry.object_addr
+        && object_end <= raw_end
+        && entry.reserve_size >= GcObjectHeader::HEADER_SIZE.saturating_add(entry.object_size)
+        && managed_sized_range_is_valid(heap_start, heap_end, entry.raw_base, entry.reserve_size)
+        && managed_sized_range_is_valid(
+            heap_start,
+            heap_end,
+            entry.header_addr,
+            GcObjectHeader::HEADER_SIZE,
+        )
+        && managed_sized_range_is_valid(heap_start, heap_end, entry.object_addr, entry.object_size)
+        && entry.object_addr.is_multiple_of(entry.object_align);
+    if !range_ok {
+        audit.flags.insert(ManagedAuditFlags::OBJECT_RANGE_INVALID);
+    }
+    range_ok
+}
+
+fn audit_managed_object_header(
+    entry: crate::gc::GcObjectEntry,
+    header: GcObjectHeader,
+    audit: &mut ManagedAudit,
+) {
+    let prefix = entry.header_addr.saturating_sub(entry.raw_base);
+    let decoded_reserve_size = decode_reserve_size(header) as usize;
+    let color_is_valid = header.color <= gc::GcColor::Black as u8;
+    let forwarding_is_valid =
+        header.flags & GC_FLAG_FORWARDED == 0 || header.forwarding_ptr != entry.object_addr;
+
+    if header.size as usize != entry.object_size
+        || header.prefix_bytes as usize != prefix
+        || decoded_reserve_size != entry.reserve_size
+        || header.trace_descriptor_ptr != entry.trace_descriptor_ptr
+        || !color_is_valid
+        || !forwarding_is_valid
+    {
+        audit
+            .flags
+            .insert(ManagedAuditFlags::OBJECT_HEADER_MISMATCH);
+    }
+}
+
+fn audit_managed_object_references(
+    gc: &GarbageCollector,
+    entry: crate::gc::GcObjectEntry,
+    header: GcObjectHeader,
+    audit: &mut ManagedAudit,
+) {
+    // 字段边扫描使用对象注册时保存的 descriptor 指针。对象头中的指针仍会被校验，
+    // 但不会作为 audit 冷路径的唯一数据源，避免单个坏对象头把结构扫描变成坏指针解引用。
+    let descriptor = entry.trace_descriptor();
+    if !descriptor.matches_layout(entry.object_size, entry.object_align) {
+        audit
+            .flags
+            .insert(ManagedAuditFlags::OBJECT_HEADER_MISMATCH);
+        return;
+    }
+
+    let object_is_old = header.flags & GC_FLAG_OLD_GEN != 0;
+    let mut has_young_strong_ref = false;
+
+    for &offset in descriptor.reference_offsets {
+        if !descriptor.allows_ref_offset(entry.object_size, offset) {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::OBJECT_HEADER_MISMATCH);
+            continue;
+        }
+        audit.scanned_strong_reference_slots += 1;
+        let slot_addr = entry.object_addr.saturating_add(offset);
+        let raw_ref = unsafe { *(slot_addr as *const usize) };
+        if raw_ref == 0 {
+            continue;
+        }
+        let resolved = gc.resolve_forwarding_addr(raw_ref);
+        if gc.find_object_containing(resolved).is_none() {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::REFERENCE_GRAPH_MISMATCH);
+            continue;
+        }
+        if object_is_old && gc.is_in_young_gen(resolved) {
+            has_young_strong_ref = true;
+        }
+    }
+
+    if has_young_strong_ref && header.flags & GC_FLAG_REMEMBERED == 0 {
+        audit
+            .flags
+            .insert(ManagedAuditFlags::REFERENCE_GRAPH_MISMATCH);
+    }
+
+    for &offset in descriptor.weak_reference_offsets {
+        if !descriptor.allows_weak_ref_offset(entry.object_size, offset) {
+            audit
+                .flags
+                .insert(ManagedAuditFlags::OBJECT_HEADER_MISMATCH);
+            continue;
+        }
+        audit.scanned_weak_reference_slots += 1;
+        let slot_addr = entry.object_addr.saturating_add(offset);
+        let raw_ref = unsafe { *(slot_addr as *const usize) };
+        if raw_ref == 0 {
+            continue;
+        }
+        let resolved = gc.resolve_forwarding_addr(raw_ref);
+        if gc.find_object_containing(resolved).is_none() {
+            audit.scanned_stale_weak_reference_slots += 1;
+        }
+    }
+}
+
+fn managed_ranges_overlap(a_start: usize, a_size: usize, b_start: usize, b_size: usize) -> bool {
+    let Some(a_end) = a_start.checked_add(a_size) else {
+        return true;
+    };
+    let Some(b_end) = b_start.checked_add(b_size) else {
+        return true;
+    };
+    a_start < b_end && b_start < a_end
 }
 
 #[inline]

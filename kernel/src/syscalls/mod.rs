@@ -97,9 +97,75 @@ pub fn register_all() {
     register_syscall(nr::SYS_CLOSE, fs::sys_close);
     register_syscall(nr::SYS_LSEEK, fs::sys_lseek);
     register_syscall(nr::SYS_READLINKAT, fs::sys_readlinkat);
-    register_syscall(nr::SYS_NEWFSTATAT, fs::sys_newfstatat);
+    register_syscall(nr::SYS_FSTATAT, fs::sys_newfstatat);
     register_syscall(nr::SYS_FSTAT, fs::sys_fstat);
     register_syscall(nr::SYS_STATX, fs::sys_statx);
+    register_syscall(nr::SYS_SETXATTR, fs::sys_setxattr);
+    register_syscall(nr::SYS_LSETXATTR, fs::sys_lsetxattr);
+    register_syscall(nr::SYS_FSETXATTR, fs::sys_fsetxattr);
+    register_syscall(nr::SYS_GETXATTR, fs::sys_getxattr);
+    register_syscall(nr::SYS_LGETXATTR, fs::sys_lgetxattr);
+    register_syscall(nr::SYS_FGETXATTR, fs::sys_fgetxattr);
+    register_syscall(nr::SYS_LISTXATTR, fs::sys_listxattr);
+    register_syscall(nr::SYS_LLISTXATTR, fs::sys_llistxattr);
+    register_syscall(nr::SYS_FLISTXATTR, fs::sys_flistxattr);
+    register_syscall(nr::SYS_REMOVEXATTR, fs::sys_removexattr);
+    register_syscall(nr::SYS_LREMOVEXATTR, fs::sys_lremovexattr);
+    register_syscall(nr::SYS_FREMOVEXATTR, fs::sys_fremovexattr);
+    register_syscall(nr::SYS_LOOKUP_DCOOKIE, fs::sys_lookup_dcookie);
+    register_syscall(nr::SYS_INOTIFY_INIT1, fs::sys_inotify_init1);
+    register_syscall(nr::SYS_INOTIFY_ADD_WATCH, fs::sys_inotify_add_watch);
+    register_syscall(nr::SYS_INOTIFY_RM_WATCH, fs::sys_inotify_rm_watch);
+    register_syscall(nr::SYS_IOPRIO_SET, fs::sys_ioprio_set);
+    register_syscall(nr::SYS_IOPRIO_GET, fs::sys_ioprio_get);
+    register_syscall(nr::SYS_RENAMEAT, fs::sys_renameat);
+    register_syscall(nr::SYS_NFSSERVCTL, fs::sys_nfsservctl);
+    register_syscall(nr::SYS_VHANGUP, fs::sys_vhangup);
+    register_syscall(nr::SYS_QUOTACTL, fs::sys_quotactl);
+    register_syscall(nr::SYS_PREADV, fs::sys_preadv);
+    register_syscall(nr::SYS_PWRITEV, fs::sys_pwritev);
+    register_syscall(nr::SYS_VMSPLICE, fs::sys_vmsplice);
+    register_syscall(nr::SYS_SPLICE, fs::sys_splice);
+    register_syscall(nr::SYS_TEE, fs::sys_tee);
+    register_syscall(nr::SYS_SYNC_FILE_RANGE2, fs::sys_sync_file_range2);
+    register_syscall(nr::SYS_ACCT, fs::sys_acct);
+    register_syscall(nr::SYS_FANOTIFY_INIT, fs::sys_fanotify_init);
+    register_syscall(nr::SYS_FANOTIFY_MARK, fs::sys_fanotify_mark);
+    register_syscall(nr::SYS_NAME_TO_HANDLE_AT, fs::sys_name_to_handle_at);
+    register_syscall(nr::SYS_OPEN_BY_HANDLE_AT, fs::sys_open_by_handle_at);
+    register_syscall(nr::SYS_MEMFD_CREATE, fs::sys_memfd_create);
+    register_syscall(nr::SYS_PREADV2, fs::sys_preadv2);
+    register_syscall(nr::SYS_PWRITEV2, fs::sys_pwritev2);
+    register_syscall(nr::SYS_TIMERFD_GETTIME64, fs::sys_timerfd_gettime64);
+    register_syscall(nr::SYS_TIMERFD_SETTIME64, fs::sys_timerfd_settime64);
+    register_syscall(nr::SYS_UTIMENSAT_TIME64, fs::sys_utimensat_time64);
+    register_syscall(nr::SYS_PSELECT6_TIME64, fs::sys_pselect6_time64);
+    register_syscall(nr::SYS_PPOLL_TIME64, fs::sys_ppoll_time64);
+    register_syscall(nr::SYS_RECVMMSG_TIME64, fs::sys_recvmmsg_time64);
+    register_syscall(nr::SYS_IO_URING_SETUP, fs::sys_io_uring_setup);
+    register_syscall(nr::SYS_IO_URING_ENTER, fs::sys_io_uring_enter);
+    register_syscall(nr::SYS_IO_URING_REGISTER, fs::sys_io_uring_register);
+    register_syscall(nr::SYS_OPEN_TREE, fs::sys_open_tree);
+    register_syscall(nr::SYS_MOVE_MOUNT, fs::sys_move_mount);
+    register_syscall(nr::SYS_FSOPEN, fs::sys_fsopen);
+    register_syscall(nr::SYS_FSCONFIG, fs::sys_fsconfig);
+    register_syscall(nr::SYS_FSMOUNT, fs::sys_fsmount);
+    register_syscall(nr::SYS_FSPICK, fs::sys_fspick);
+    register_syscall(nr::SYS_OPENAT2, fs::sys_openat2);
+    register_syscall(nr::SYS_PIDFD_GETFD, fs::sys_pidfd_getfd);
+    register_syscall(nr::SYS_EPOLL_PWAIT2, fs::sys_epoll_pwait2);
+    register_syscall(nr::SYS_MOUNT_SETATTR, fs::sys_mount_setattr);
+    register_syscall(nr::SYS_QUOTACTL_FD, fs::sys_quotactl_fd);
+    register_syscall(nr::SYS_FCHMODAT2, fs::sys_fchmodat2);
+    register_syscall(nr::SYS_STATMOUNT, fs::sys_statmount);
+    register_syscall(nr::SYS_LISTMOUNT, fs::sys_listmount);
+    register_syscall(nr::SYS_SETXATTRAT, fs::sys_setxattrat);
+    register_syscall(nr::SYS_GETXATTRAT, fs::sys_getxattrat);
+    register_syscall(nr::SYS_LISTXATTRAT, fs::sys_listxattrat);
+    register_syscall(nr::SYS_REMOVEXATTRAT, fs::sys_removexattrat);
+    register_syscall(nr::SYS_OPEN_TREE_ATTR, fs::sys_open_tree_attr);
+    register_syscall(nr::SYS_FILE_GETATTR, fs::sys_file_getattr);
+    register_syscall(nr::SYS_FILE_SETATTR, fs::sys_file_setattr);
 
     // 进程
     register_syscall(nr::SYS_EXIT, process::sys_exit);
@@ -195,6 +261,60 @@ pub fn register_all() {
     register_syscall(nr::SYS_FUTEX_WAKE, process::sys_futex_wake);
     register_syscall(nr::SYS_FUTEX_WAIT, process::sys_futex_wait);
     register_syscall(nr::SYS_FUTEX_REQUEUE, process::sys_futex_requeue);
+    register_syscall(nr::SYS_UNSHARE, process::sys_unshare);
+    register_syscall(nr::SYS_KEXEC_LOAD, process::sys_kexec_load);
+    register_syscall(nr::SYS_INIT_MODULE, process::sys_init_module);
+    register_syscall(nr::SYS_DELETE_MODULE, process::sys_delete_module);
+    register_syscall(nr::SYS_TIMER_CREATE, process::sys_timer_create);
+    register_syscall(nr::SYS_TIMER_GETTIME, process::sys_timer_gettime);
+    register_syscall(nr::SYS_TIMER_GETOVERRUN, process::sys_timer_getoverrun);
+    register_syscall(nr::SYS_TIMER_SETTIME, process::sys_timer_settime);
+    register_syscall(nr::SYS_TIMER_DELETE, process::sys_timer_delete);
+    register_syscall(nr::SYS_CLOCK_SETTIME, process::sys_clock_settime);
+    register_syscall(nr::SYS_PTRACE, process::sys_ptrace);
+    register_syscall(nr::SYS_GETRESUID, process::sys_getresuid);
+    register_syscall(nr::SYS_GETRESGID, process::sys_getresgid);
+    register_syscall(nr::SYS_SETHOSTNAME, process::sys_sethostname);
+    register_syscall(nr::SYS_SETDOMAINNAME, process::sys_setdomainname);
+    register_syscall(nr::SYS_UMASK, process::sys_umask);
+    register_syscall(nr::SYS_SETTIMEOFDAY, process::sys_settimeofday);
+    register_syscall(nr::SYS_ADJTIMEX, process::sys_adjtimex);
+    register_syscall(nr::SYS_PERF_EVENT_OPEN, process::sys_perf_event_open);
+    register_syscall(nr::SYS_CLOCK_ADJTIME, process::sys_clock_adjtime);
+    register_syscall(nr::SYS_SETNS, process::sys_setns);
+    register_syscall(nr::SYS_KCMP, process::sys_kcmp);
+    register_syscall(nr::SYS_FINIT_MODULE, process::sys_finit_module);
+    register_syscall(nr::SYS_SECCOMP, process::sys_seccomp);
+    register_syscall(nr::SYS_BPF, process::sys_bpf);
+    register_syscall(nr::SYS_EXECVEAT, process::sys_execveat);
+    register_syscall(nr::SYS_KEXEC_FILE_LOAD, process::sys_kexec_file_load);
+    register_syscall(nr::SYS_CLOCK_GETTIME64, process::sys_clock_gettime64);
+    register_syscall(nr::SYS_CLOCK_SETTIME64, process::sys_clock_settime64);
+    register_syscall(nr::SYS_CLOCK_ADJTIME64, process::sys_clock_adjtime64);
+    register_syscall(
+        nr::SYS_CLOCK_GETRES_TIME64,
+        process::sys_clock_getres_time64,
+    );
+    register_syscall(
+        nr::SYS_CLOCK_NANOSLEEP_TIME64,
+        process::sys_clock_nanosleep_time64,
+    );
+    register_syscall(nr::SYS_TIMER_GETTIME64, process::sys_timer_gettime64);
+    register_syscall(nr::SYS_TIMER_SETTIME64, process::sys_timer_settime64);
+    register_syscall(nr::SYS_PIDFD_OPEN, process::sys_pidfd_open);
+    register_syscall(
+        nr::SYS_LANDLOCK_CREATE_RULESET,
+        process::sys_landlock_create_ruleset,
+    );
+    register_syscall(nr::SYS_LANDLOCK_ADD_RULE, process::sys_landlock_add_rule);
+    register_syscall(
+        nr::SYS_LANDLOCK_RESTRICT_SELF,
+        process::sys_landlock_restrict_self,
+    );
+    register_syscall(nr::SYS_PROCESS_MRELEASE, process::sys_process_mrelease);
+    register_syscall(nr::SYS_LSM_GET_SELF_ATTR, process::sys_lsm_get_self_attr);
+    register_syscall(nr::SYS_LSM_SET_SELF_ATTR, process::sys_lsm_set_self_attr);
+    register_syscall(nr::SYS_LSM_LIST_MODULES, process::sys_lsm_list_modules);
 
     // 内存
     register_syscall(nr::SYS_BRK, mm::sys_brk);
@@ -203,12 +323,72 @@ pub fn register_all() {
     register_syscall(nr::SYS_MPROTECT, mm::sys_mprotect);
     register_syscall(nr::SYS_MADVISE, mm::sys_madvise);
     register_syscall(nr::SYS_MREMAP, mm::sys_mremap);
+    register_syscall(nr::SYS_SWAPON, mm::sys_swapon);
+    register_syscall(nr::SYS_SWAPOFF, mm::sys_swapoff);
+    register_syscall(nr::SYS_MSYNC, mm::sys_msync);
+    register_syscall(nr::SYS_MLOCK, mm::sys_mlock);
+    register_syscall(nr::SYS_MUNLOCK, mm::sys_munlock);
+    register_syscall(nr::SYS_MLOCKALL, mm::sys_mlockall);
+    register_syscall(nr::SYS_MUNLOCKALL, mm::sys_munlockall);
+    register_syscall(nr::SYS_MINCORE, mm::sys_mincore);
+    register_syscall(nr::SYS_REMAP_FILE_PAGES, mm::sys_remap_file_pages);
+    register_syscall(nr::SYS_MBIND, mm::sys_mbind);
+    register_syscall(nr::SYS_GET_MEMPOLICY, mm::sys_get_mempolicy);
+    register_syscall(nr::SYS_SET_MEMPOLICY, mm::sys_set_mempolicy);
+    register_syscall(nr::SYS_MIGRATE_PAGES, mm::sys_migrate_pages);
+    register_syscall(nr::SYS_MOVE_PAGES, mm::sys_move_pages);
+    register_syscall(nr::SYS_PROCESS_VM_READV, mm::sys_process_vm_readv);
+    register_syscall(nr::SYS_PROCESS_VM_WRITEV, mm::sys_process_vm_writev);
+    register_syscall(nr::SYS_USERFAULTFD, mm::sys_userfaultfd);
+    register_syscall(nr::SYS_MLOCK2, mm::sys_mlock2);
+    register_syscall(nr::SYS_PKEY_MPROTECT, mm::sys_pkey_mprotect);
+    register_syscall(nr::SYS_PKEY_ALLOC, mm::sys_pkey_alloc);
+    register_syscall(nr::SYS_PKEY_FREE, mm::sys_pkey_free);
+    register_syscall(nr::SYS_PROCESS_MADVISE, mm::sys_process_madvise);
+    register_syscall(nr::SYS_MEMFD_SECRET, mm::sys_memfd_secret);
+    register_syscall(
+        nr::SYS_SET_MEMPOLICY_HOME_NODE,
+        mm::sys_set_mempolicy_home_node,
+    );
+    register_syscall(nr::SYS_CACHESTAT, mm::sys_cachestat);
+    register_syscall(nr::SYS_MAP_SHADOW_STACK, mm::sys_map_shadow_stack);
+    register_syscall(nr::SYS_MSEAL, mm::sys_mseal);
 
     // SysV IPC
     register_syscall(nr::SYS_SHMGET, ipc::sys_shmget);
     register_syscall(nr::SYS_SHMCTL, ipc::sys_shmctl);
     register_syscall(nr::SYS_SHMAT, ipc::sys_shmat);
     register_syscall(nr::SYS_SHMDT, ipc::sys_shmdt);
+    register_syscall(nr::SYS_IO_SETUP, ipc::sys_io_setup);
+    register_syscall(nr::SYS_IO_DESTROY, ipc::sys_io_destroy);
+    register_syscall(nr::SYS_IO_SUBMIT, ipc::sys_io_submit);
+    register_syscall(nr::SYS_IO_CANCEL, ipc::sys_io_cancel);
+    register_syscall(nr::SYS_IO_GETEVENTS, ipc::sys_io_getevents);
+    register_syscall(nr::SYS_MQ_OPEN, ipc::sys_mq_open);
+    register_syscall(nr::SYS_MQ_UNLINK, ipc::sys_mq_unlink);
+    register_syscall(nr::SYS_MQ_TIMEDSEND, ipc::sys_mq_timedsend);
+    register_syscall(nr::SYS_MQ_TIMEDRECEIVE, ipc::sys_mq_timedreceive);
+    register_syscall(nr::SYS_MQ_NOTIFY, ipc::sys_mq_notify);
+    register_syscall(nr::SYS_MQ_GETSETATTR, ipc::sys_mq_getsetattr);
+    register_syscall(nr::SYS_MSGGET, ipc::sys_msgget);
+    register_syscall(nr::SYS_MSGCTL, ipc::sys_msgctl);
+    register_syscall(nr::SYS_MSGRCV, ipc::sys_msgrcv);
+    register_syscall(nr::SYS_MSGSND, ipc::sys_msgsnd);
+    register_syscall(nr::SYS_SEMGET, ipc::sys_semget);
+    register_syscall(nr::SYS_SEMCTL, ipc::sys_semctl);
+    register_syscall(nr::SYS_SEMTIMEDOP, ipc::sys_semtimedop);
+    register_syscall(nr::SYS_SEMOP, ipc::sys_semop);
+    register_syscall(nr::SYS_ADD_KEY, ipc::sys_add_key);
+    register_syscall(nr::SYS_REQUEST_KEY, ipc::sys_request_key);
+    register_syscall(nr::SYS_KEYCTL, ipc::sys_keyctl);
+    register_syscall(nr::SYS_IO_PGETEVENTS, ipc::sys_io_pgetevents);
+    register_syscall(nr::SYS_IO_PGETEVENTS_TIME64, ipc::sys_io_pgetevents_time64);
+    register_syscall(nr::SYS_MQ_TIMEDSEND_TIME64, ipc::sys_mq_timedsend_time64);
+    register_syscall(
+        nr::SYS_MQ_TIMEDRECEIVE_TIME64,
+        ipc::sys_mq_timedreceive_time64,
+    );
+    register_syscall(nr::SYS_SEMTIMEDOP_TIME64, ipc::sys_semtimedop_time64);
 
     // 信号
     register_syscall(nr::SYS_RT_SIGACTION, signal::sys_rt_sigaction);
@@ -219,9 +399,16 @@ pub fn register_all() {
     register_syscall(nr::SYS_RT_SIGTIMEDWAIT, signal::sys_rt_sigtimedwait);
     register_syscall(nr::SYS_SIGALTSTACK, signal::sys_sigaltstack);
     register_syscall(nr::SYS_RESTART_SYSCALL, signal::sys_restart_syscall);
+    register_syscall(nr::SYS_RT_SIGQUEUEINFO, signal::sys_rt_sigqueueinfo);
+    register_syscall(
+        nr::SYS_RT_SIGTIMEDWAIT_TIME64,
+        signal::sys_rt_sigtimedwait_time64,
+    );
+    register_syscall(nr::SYS_PIDFD_SEND_SIGNAL, signal::sys_pidfd_send_signal);
 
+    let registered = general::syscall::registered_count();
     log::info!(
         "[syscalls] registered {} entries",
-        general::syscall::registered_count()
+        registered
     );
 }

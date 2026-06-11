@@ -6,16 +6,47 @@ extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 
+use crate::boot::BootAllocator;
+use crate::buddy::{DEFERRED_ORDER0_COALESCE_TARGET, DEFERRED_ORDER0_MIN_FREE_PERCENT};
 use crate::error::DeallocationError;
+use crate::gc::GcObjectHeader;
+use crate::registry::AllocationRegistry;
 use crate::request::{
-    AllocationKind, MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest,
-    Zeroing,
+    AllocationKind, AllocationRecord, MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy,
+    PhysicalAllocRequest, Zeroing,
 };
 use crate::{
-    AllocationError, AllocationRegistryAuditFlags, AllocatorAuditFlags, KERNEL_ALLOCATOR,
-    ManagedAllocFlags, PAGE_SIZE, PhysicalAllocation, PhysicalFreeError,
+    ALLOCATOR_API_VERSION, AllocationError, AllocationRegistryAuditFlags, AllocatorAuditFlags,
+    AllocatorAuditScope, AllocatorCapabilityFlags, AllocatorReclaimRequest, BuddyAuditFlags, GcRef,
+    GcRefSlot, GcWeakRef, GcWeakRefSlot, KERNEL_ALLOCATOR, KernelHeapAuditFlags, ManagedAllocFlags,
+    ManagedAuditFlags, PAGE_SIZE, PhysicalAllocation, PhysicalFreeError, SlabAuditFlags,
+    TraceDescriptor,
 };
 use ktest::ktest;
+
+#[allow(dead_code)]
+#[repr(C)]
+struct ManagedAuditLeaf {
+    word: usize,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+struct ManagedAuditNode {
+    strong: GcRef<ManagedAuditLeaf>,
+    weak: GcWeakRef<ManagedAuditLeaf>,
+}
+
+const MANAGED_AUDIT_STRONG_OFFSET: usize = 0;
+const MANAGED_AUDIT_WEAK_OFFSET: usize = core::mem::size_of::<GcRef<ManagedAuditLeaf>>();
+static MANAGED_AUDIT_STRONG_OFFSETS: [usize; 1] = [MANAGED_AUDIT_STRONG_OFFSET];
+static MANAGED_AUDIT_WEAK_OFFSETS: [usize; 1] = [MANAGED_AUDIT_WEAK_OFFSET];
+static MANAGED_AUDIT_NODE_DESCRIPTOR: TraceDescriptor = TraceDescriptor::exact_layout(
+    core::mem::size_of::<ManagedAuditNode>(),
+    core::mem::align_of::<ManagedAuditNode>(),
+    &MANAGED_AUDIT_STRONG_OFFSETS,
+)
+.with_weak_references(&MANAGED_AUDIT_WEAK_OFFSETS);
 
 /// 分配 8 字节小对象，验证指针非空且走 slab 路径。
 #[ktest]
@@ -125,18 +156,30 @@ fn kheap_reuses_cached_base_ranges_without_registry_leak() {
         ))
         .expect("allocate cacheable kheap range");
     assert_eq!(first.kind, AllocationKind::Large);
+    let after_alloc = KERNEL_ALLOCATOR.layer_stats().kheap;
     KERNEL_ALLOCATOR
         .deallocate(first.ptr)
         .expect("cache first kheap range");
 
     let after_free = KERNEL_ALLOCATOR.layer_stats().kheap;
     assert!(after_free.cache_inserts >= kheap_before.cache_inserts + 1);
-    assert!(after_free.cached_pages >= kheap_before.cached_pages + 1);
+    if after_alloc.cache_hits > kheap_before.cache_hits {
+        // 前序测试可能已经预热了 kheap cache。此时本轮分配先消耗一个缓存页，
+        // 释放后只需要回到测试前缓存水位，而不是继续增加 cached_pages。
+        assert!(after_free.cached_pages >= kheap_before.cached_pages);
+    } else {
+        assert!(after_free.cached_pages >= kheap_before.cached_pages + 1);
+    }
 
     let cached = KERNEL_ALLOCATOR.audit();
     assert!(cached.is_consistent());
     assert_eq!(cached.registry_live_records, before.registry_live_records);
     assert_eq!(cached.kheap_active_allocs, before.kheap_active_allocs);
+    let kheap_audit = KERNEL_ALLOCATOR.kheap_audit();
+    assert!(kheap_audit.is_consistent());
+    assert_eq!(kheap_audit.flags, KernelHeapAuditFlags::empty());
+    assert_eq!(kheap_audit.scanned_cached_pages, after_free.cached_pages);
+    assert_eq!(kheap_audit.scanned_cached_ranges, after_free.cached_ranges);
 
     let second = KERNEL_ALLOCATOR
         .allocate(MemoryRequest::new(
@@ -152,6 +195,102 @@ fn kheap_reuses_cached_base_ranges_without_registry_leak() {
     KERNEL_ALLOCATOR
         .deallocate(second.ptr)
         .expect("deallocate reused kheap range");
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.kheap_active_allocs, before.kheap_active_allocs);
+}
+
+/// kheap cache 满桶时应保留最新释放的 range，而不是把最热对象直接释放回后端。
+#[ktest]
+fn kheap_full_cache_keeps_latest_freed_range_hot() {
+    const COUNT: usize = 160;
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let kheap_before = KERNEL_ALLOCATOR.layer_stats().kheap;
+    let mut records = [None; COUNT];
+
+    for slot in &mut records {
+        let record = KERNEL_ALLOCATOR
+            .allocate(MemoryRequest::new(
+                MemoryDomain::Kernel,
+                PAGE_SIZE,
+                PAGE_SIZE,
+            ))
+            .expect("allocate kheap cache fill object");
+        assert_eq!(record.kind, AllocationKind::Large);
+        *slot = Some(record);
+    }
+
+    let sentinel = records[COUNT - 1].take().expect("sentinel record exists");
+    for slot in records.iter_mut().take(COUNT - 1) {
+        let record = slot.take().expect("record exists");
+        KERNEL_ALLOCATOR
+            .deallocate(record.ptr)
+            .expect("deallocate cache fill object");
+    }
+
+    KERNEL_ALLOCATOR
+        .deallocate(sentinel.ptr)
+        .expect("deallocate sentinel into full cache");
+    let after_full_free = KERNEL_ALLOCATOR.layer_stats().kheap;
+    assert!(after_full_free.cache_full_releases > kheap_before.cache_full_releases);
+
+    let reused = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(
+            MemoryDomain::Kernel,
+            PAGE_SIZE,
+            PAGE_SIZE,
+        ))
+        .expect("allocate from full kheap cache");
+    assert_eq!(reused.ptr, sentinel.ptr);
+    assert!(KERNEL_ALLOCATOR.layer_stats().kheap.cache_hits > after_full_free.cache_hits);
+
+    KERNEL_ALLOCATOR
+        .deallocate(reused.ptr)
+        .expect("deallocate reused sentinel");
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.kheap_active_allocs, before.kheap_active_allocs);
+}
+
+/// 外部维护 API 应能主动释放 kheap 缓存页，并保持 registry 账本不变。
+#[ktest]
+fn allocator_reclaim_releases_kheap_cached_ranges() {
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+
+    let record = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(
+            MemoryDomain::Kernel,
+            PAGE_SIZE,
+            PAGE_SIZE,
+        ))
+        .expect("allocate cacheable kheap object");
+    assert_eq!(record.kind, AllocationKind::Large);
+    KERNEL_ALLOCATOR
+        .deallocate(record.ptr)
+        .expect("cache kheap object");
+
+    let cached = KERNEL_ALLOCATOR.layer_stats().kheap;
+    assert!(cached.cached_ranges > 0);
+
+    let reclaim = KERNEL_ALLOCATOR
+        .reclaim(
+            AllocatorReclaimRequest::caches()
+                .without_slab_cache_flush()
+                .without_slab_empty_reclaim()
+                .without_physical_deferred_reclaim(),
+        )
+        .expect("reclaim kheap cache");
+    assert!(reclaim.kheap.released_ranges > 0);
+    assert!(reclaim.kheap.released_pages > 0);
+    assert!(reclaim.reclaimed_bytes() >= PAGE_SIZE);
+
+    let kheap_after = KERNEL_ALLOCATOR.layer_stats().kheap;
+    assert_eq!(kheap_after.cached_ranges, 0);
 
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
@@ -256,6 +395,9 @@ fn slab_record_carries_private_backend_cookie() {
     assert_eq!(queried, record);
     let debug = alloc::format!("{:?}", queried);
     assert!(!debug.contains("backend_cookie"));
+    // `format!` 会经全局 allocator 创建临时 String；审计前必须释放它，
+    // 否则本测试自身会让 registry live 计数比基线多一个对象。
+    drop(debug);
 
     KERNEL_ALLOCATOR
         .deallocate(record.ptr)
@@ -271,6 +413,86 @@ fn slab_record_carries_private_backend_cookie() {
     assert!(after.is_consistent());
     assert_eq!(after.registry_live_records, before.registry_live_records);
     assert_eq!(after.slab_live_records, before.slab_live_records);
+}
+
+/// slab cache 满桶时必须先 flush 旧 cached 对象，再把当前释放对象放回 cache。
+#[ktest]
+fn slab_cache_overflow_free_keeps_accounting_consistent() {
+    const COUNT: usize = 96;
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let slab_before = KERNEL_ALLOCATOR.layer_stats().slab;
+    let mut records = [None; COUNT];
+
+    for slot in &mut records {
+        let record = KERNEL_ALLOCATOR
+            .allocate(MemoryRequest::new(MemoryDomain::Kernel, 64, 8))
+            .expect("allocate cache overflow object");
+        assert_eq!(record.kind, AllocationKind::Small);
+        *slot = Some(record);
+    }
+
+    let during = KERNEL_ALLOCATOR.audit();
+    assert!(during.is_consistent());
+    assert_eq!(
+        during.registry_live_records,
+        before.registry_live_records + COUNT
+    );
+    assert_eq!(during.slab_live_records, before.slab_live_records + COUNT);
+
+    for slot in records.iter_mut().rev() {
+        let record = slot.take().expect("record exists");
+        KERNEL_ALLOCATOR
+            .deallocate(record.ptr)
+            .expect("deallocate cache overflow object");
+    }
+
+    let slab_after = KERNEL_ALLOCATOR.layer_stats().slab;
+    assert!(slab_after.cache_flushes > slab_before.cache_flushes);
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.slab_live_records, before.slab_live_records);
+    assert_eq!(after.slab_active_objects, before.slab_active_objects);
+}
+
+/// 外部维护 API 应能冲刷 slab per-CPU cache，而不是只能等 cache 满桶时被动 flush。
+#[ktest]
+fn allocator_reclaim_flushes_slab_cpu_caches() {
+    const COUNT: usize = 16;
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let mut records = [None; COUNT];
+
+    for slot in &mut records {
+        let record = KERNEL_ALLOCATOR
+            .allocate(MemoryRequest::new(MemoryDomain::Kernel, 64, 8))
+            .expect("allocate slab cache object");
+        assert_eq!(record.kind, AllocationKind::Small);
+        *slot = Some(record);
+    }
+    for slot in &mut records {
+        let record = slot.take().expect("record exists");
+        KERNEL_ALLOCATOR
+            .deallocate(record.ptr)
+            .expect("stage slab object into cache");
+    }
+
+    let reclaim = KERNEL_ALLOCATOR
+        .reclaim(
+            AllocatorReclaimRequest::caches()
+                .with_kheap_cached_ranges(0)
+                .without_slab_empty_reclaim()
+                .without_physical_deferred_reclaim(),
+        )
+        .expect("flush slab cpu caches");
+    assert!(reclaim.slab.flushed_cached_objects > 0);
+    assert_eq!(reclaim.kheap.released_ranges, 0);
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.slab_active_objects, before.slab_active_objects);
 }
 
 /// reallocate 同尺寸等级时应原地更新账本，不移动对象。
@@ -300,6 +522,50 @@ fn reallocate_small_in_place() {
     KERNEL_ALLOCATOR
         .deallocate(resized.ptr)
         .expect("deallocate resized");
+}
+
+/// typed reallocate 原地扩容时仍必须遵守 Zeroed 请求，清零新增逻辑区间。
+#[ktest]
+fn reallocate_small_in_place_zeroed_growth_clears_new_bytes() {
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+
+    let record = KERNEL_ALLOCATOR
+        .allocate(MemoryRequest::new(MemoryDomain::Kernel, 48, 8))
+        .expect("allocate object with slab headroom");
+    let grown_size = record.usable_size;
+    assert!(grown_size > record.size);
+    unsafe {
+        core::ptr::write_bytes(record.ptr as *mut u8, 0x5A, record.size);
+        // allocator 内部测试可以污染 backend 已保留但尚未暴露给调用者的可用区间，
+        // 用来证明原地扩容时的 Zeroed 语义确实覆盖新增逻辑字节。
+        core::ptr::write_bytes(
+            (record.ptr + record.size) as *mut u8,
+            0xA5,
+            grown_size - record.size,
+        );
+    }
+
+    let resized = KERNEL_ALLOCATOR
+        .reallocate(
+            record.ptr,
+            MemoryRequest::new(MemoryDomain::Kernel, grown_size, 8).with_zeroing(Zeroing::Zeroed),
+        )
+        .expect("reallocate in place with zeroed growth");
+    assert_eq!(resized.ptr, record.ptr);
+    assert_eq!(resized.size, grown_size);
+
+    let bytes = unsafe { core::slice::from_raw_parts(resized.ptr as *const u8, grown_size) };
+    assert!(bytes[..record.size].iter().all(|&byte| byte == 0x5A));
+    assert!(bytes[record.size..grown_size].iter().all(|&byte| byte == 0));
+
+    KERNEL_ALLOCATOR
+        .deallocate(resized.ptr)
+        .expect("deallocate zero-grown object");
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.slab_live_records, before.slab_live_records);
 }
 
 /// GlobalAlloc::realloc 的同 size-class 快路径应只更新账本，不移动对象。
@@ -510,11 +776,9 @@ fn registry_tracks_many_live_small_objects() {
     let stats = KERNEL_ALLOCATOR.registry_stats();
     assert!(stats.shard_count > 1);
     assert!(stats.live_small >= COUNT);
+    assert_eq!(stats.chain_corruptions, 0);
     assert!(stats.max_shard_live_records > 0);
     assert!(stats.max_shard_live_records <= stats.live_records);
-    assert!(stats.nonempty_buckets > 0);
-    assert!(stats.nonempty_buckets <= stats.live_records);
-    assert!(stats.max_shard_nonempty_buckets <= stats.nonempty_buckets);
     assert!(stats.nodes_allocated >= stats.live_records);
     assert!(stats.node_refills > 0);
 
@@ -522,7 +786,6 @@ fn registry_tracks_many_live_small_objects() {
     assert_eq!(audit.flags, AllocationRegistryAuditFlags::empty());
     assert_eq!(audit.scanned_live_records, stats.live_records);
     assert_eq!(audit.scanned_live_small, stats.live_small);
-    assert_eq!(audit.scanned_nonempty_buckets, stats.nonempty_buckets);
     assert_eq!(audit.scanned_max_chain_len, stats.max_chain_len);
 
     let snapshot = KERNEL_ALLOCATOR.registry_snapshot();
@@ -533,10 +796,6 @@ fn registry_tracks_many_live_small_objects() {
     );
     assert_eq!(snapshot.audit.scanned_live_small, snapshot.stats.live_small);
     assert_eq!(snapshot.audit.scanned_free_nodes, snapshot.stats.free_nodes);
-    assert_eq!(
-        snapshot.audit.scanned_nonempty_buckets,
-        snapshot.stats.nonempty_buckets
-    );
 
     for slot in records.iter_mut().rev() {
         let record = slot.take().expect("record exists");
@@ -548,13 +807,12 @@ fn registry_tracks_many_live_small_objects() {
     let stats = KERNEL_ALLOCATOR.registry_stats();
     assert!(stats.free_nodes > 0);
     assert!(stats.nodes_allocated >= stats.free_nodes);
-    assert!(stats.nonempty_buckets <= stats.live_records);
 
     let audit = KERNEL_ALLOCATOR.registry_audit();
     assert_eq!(audit.flags, AllocationRegistryAuditFlags::empty());
     assert_eq!(audit.scanned_live_records, stats.live_records);
     assert_eq!(audit.scanned_free_nodes, stats.free_nodes);
-    assert_eq!(audit.scanned_nonempty_buckets, stats.nonempty_buckets);
+    assert_eq!(audit.scanned_max_chain_len, stats.max_chain_len);
 
     let snapshot = KERNEL_ALLOCATOR.registry_snapshot();
     assert_eq!(snapshot.audit.flags, AllocationRegistryAuditFlags::empty());
@@ -564,9 +822,69 @@ fn registry_tracks_many_live_small_objects() {
     );
     assert_eq!(snapshot.audit.scanned_free_nodes, snapshot.stats.free_nodes);
     assert_eq!(
-        snapshot.audit.scanned_nonempty_buckets,
-        snapshot.stats.nonempty_buckets
+        snapshot.audit.scanned_max_chain_len,
+        snapshot.stats.max_chain_len
     );
+}
+
+/// registry 删除热点链表节点后，O(1) 统计中的最大链长必须随当前结构回落。
+#[ktest]
+fn registry_max_chain_len_shrinks_after_collision_removal() {
+    const COUNT: usize = 8;
+    let registry = AllocationRegistry::new();
+    let boot = BootAllocator::new();
+    assert!(registry.init_with_buckets(&boot, 1));
+
+    let stats = registry.stats();
+    assert_eq!(stats.bucket_count, stats.shard_count);
+    let shard_mask = stats.shard_count - 1;
+    let mut ptrs = [0usize; COUNT];
+    let mut filled = 0usize;
+    let mut candidate = 0x1000usize;
+    while filled < COUNT {
+        if registry_test_shard(candidate, shard_mask) == 0 {
+            ptrs[filled] = candidate;
+            filled += 1;
+        }
+        candidate = candidate.saturating_add(8);
+        assert!(candidate < 0x10_0000);
+    }
+
+    for &ptr in &ptrs {
+        let record = AllocationRecord::new(AllocationKind::Small, MemoryDomain::Kernel, ptr)
+            .with_sizes(32, 32, 8);
+        registry
+            .register_result(&boot, record)
+            .expect("register colliding record");
+    }
+
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.audit.flags, AllocationRegistryAuditFlags::empty());
+    assert_eq!(snapshot.stats.live_records, COUNT);
+    assert_eq!(snapshot.stats.max_chain_len, COUNT);
+    assert_eq!(snapshot.audit.scanned_max_chain_len, COUNT);
+
+    for (idx, &ptr) in ptrs.iter().enumerate() {
+        registry
+            .remove_result(ptr)
+            .expect("remove colliding record");
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.audit.flags, AllocationRegistryAuditFlags::empty());
+        assert_eq!(snapshot.stats.live_records, COUNT - idx - 1);
+        assert_eq!(
+            snapshot.stats.max_chain_len,
+            snapshot.audit.scanned_max_chain_len
+        );
+    }
+
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.stats.live_records, 0);
+    assert_eq!(snapshot.stats.max_chain_len, 0);
+    assert_eq!(snapshot.audit.scanned_max_chain_len, 0);
+}
+
+fn registry_test_shard(ptr: usize, shard_mask: usize) -> usize {
+    ((ptr >> 3) ^ (ptr >> 11) ^ (ptr >> 19) ^ (ptr >> 27)) & shard_mask
 }
 
 /// 审计接口应能把 registry 和后端计数稳定对齐。
@@ -575,9 +893,30 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     let before = KERNEL_ALLOCATOR.audit();
     assert!(before.is_consistent());
     assert_eq!(before.flags, AllocatorAuditFlags::empty());
+    assert!(before.registry_structure_scanned);
     assert_eq!(
         before.registry_structure.flags,
         AllocationRegistryAuditFlags::empty()
+    );
+    assert!(before.phys_structure_scanned);
+    assert_eq!(before.phys_structure.flags, BuddyAuditFlags::empty());
+    assert_eq!(
+        before.phys_structure.scanned_total_pages,
+        KERNEL_ALLOCATOR.buddy_stats().total_pages
+    );
+    assert!(before.slab_structure_scanned);
+    assert_eq!(before.slab_structure.flags, SlabAuditFlags::empty());
+    assert!(before.kheap_structure_scanned);
+    assert_eq!(before.kheap_structure.flags, KernelHeapAuditFlags::empty());
+    assert!(before.managed_structure_scanned);
+    assert_eq!(before.managed_structure.flags, ManagedAuditFlags::empty());
+    assert_eq!(
+        before.slab_structure.scanned_active_objects,
+        before.slab_active_objects
+    );
+    assert_eq!(
+        before.slab_structure.scanned_active_bytes,
+        before.slab_active_bytes
     );
 
     let small = KERNEL_ALLOCATOR
@@ -589,6 +928,11 @@ fn allocator_audit_reports_consistent_layer_accounting() {
 
     let during = KERNEL_ALLOCATOR.audit();
     assert!(during.is_consistent());
+    assert!(during.registry_structure_scanned);
+    assert!(during.phys_structure_scanned);
+    assert!(during.slab_structure_scanned);
+    assert!(during.kheap_structure_scanned);
+    assert!(during.managed_structure_scanned);
     assert_eq!(
         during.registry_structure.scanned_live_records,
         during.registry_live_records
@@ -605,6 +949,14 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     assert_eq!(during.slab_live_records, before.slab_live_records + 1);
     assert_eq!(during.kheap_active_allocs, before.kheap_active_allocs + 1);
     assert_eq!(during.kheap_live_records, before.kheap_live_records + 1);
+    assert_eq!(
+        during.kheap_structure.scanned_active_allocs,
+        during.kheap_active_allocs
+    );
+    assert_eq!(
+        during.kheap_structure.scanned_active_pages * PAGE_SIZE,
+        during.kheap_active_bytes
+    );
     assert_eq!(during.registry_boot_records, before.registry_boot_records);
     assert_eq!(
         during.registry_physical_records,
@@ -622,7 +974,39 @@ fn allocator_audit_reports_consistent_layer_accounting() {
         during.registry_node_capacity
     );
     assert!(during.slab_active_bytes <= during.slab_backing_bytes);
+    assert_eq!(
+        during.slab_structure.scanned_active_objects,
+        during.slab_active_objects
+    );
+    assert_eq!(
+        during.slab_structure.scanned_active_bytes,
+        during.slab_active_bytes
+    );
+    assert_eq!(
+        during.slab_structure.scanned_active_pages * PAGE_SIZE,
+        during.slab_backing_bytes
+    );
+    assert_eq!(during.phys_structure.flags, BuddyAuditFlags::empty());
+    assert_eq!(
+        during
+            .phys_structure
+            .scanned_allocated_pages
+            .saturating_add(during.phys_structure.scanned_free_pages)
+            .saturating_add(during.phys_structure.scanned_reserved_pages),
+        during.phys_structure.scanned_total_pages
+    );
+    assert_eq!(during.slab_structure.flags, SlabAuditFlags::empty());
+    assert_eq!(during.kheap_structure.flags, KernelHeapAuditFlags::empty());
+    assert_eq!(during.managed_structure.flags, ManagedAuditFlags::empty());
     assert_eq!(during.kheap_active_bytes, during.kheap_page_bytes);
+    assert_eq!(
+        during.managed_structure.scanned_active_objects,
+        during.managed_active_objects
+    );
+    assert_eq!(
+        during.managed_structure.scanned_active_bytes,
+        KERNEL_ALLOCATOR.managed_stats().active_bytes
+    );
 
     KERNEL_ALLOCATOR
         .deallocate(small.ptr)
@@ -633,6 +1017,11 @@ fn allocator_audit_reports_consistent_layer_accounting() {
 
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
+    assert!(after.registry_structure_scanned);
+    assert!(after.phys_structure_scanned);
+    assert!(after.slab_structure_scanned);
+    assert!(after.kheap_structure_scanned);
+    assert!(after.managed_structure_scanned);
     assert_eq!(after.registry_live_records, before.registry_live_records);
     assert_eq!(after.slab_active_objects, before.slab_active_objects);
     assert_eq!(after.slab_live_records, before.slab_live_records);
@@ -642,6 +1031,55 @@ fn allocator_audit_reports_consistent_layer_accounting() {
     assert_eq!(
         after.registry_physical_records,
         before.registry_physical_records
+    );
+}
+
+/// counters-only 审计只检查 O(1) 分层账本，不扫描 registry 链表。
+#[ktest]
+fn allocator_counter_audit_skips_registry_scan() {
+    let full = KERNEL_ALLOCATOR.audit();
+    assert!(full.is_consistent());
+    assert!(full.registry_structure_scanned);
+    assert!(full.phys_structure_scanned);
+    assert!(full.slab_structure_scanned);
+    assert!(full.kheap_structure_scanned);
+    assert!(full.managed_structure_scanned);
+
+    let counters = KERNEL_ALLOCATOR.audit_counters();
+    assert!(counters.is_consistent());
+    assert_eq!(counters.flags, AllocatorAuditFlags::empty());
+    assert!(!counters.registry_structure_scanned);
+    assert_eq!(counters.registry_structure.flags.bits(), 0);
+    assert_eq!(counters.registry_structure.scanned_live_records, 0);
+    assert!(!counters.phys_structure_scanned);
+    assert_eq!(counters.phys_structure.flags.bits(), 0);
+    assert_eq!(counters.phys_structure.scanned_total_pages, 0);
+    assert!(!counters.slab_structure_scanned);
+    assert_eq!(counters.slab_structure.flags.bits(), 0);
+    assert_eq!(counters.slab_structure.scanned_active_objects, 0);
+    assert!(!counters.kheap_structure_scanned);
+    assert_eq!(counters.kheap_structure.flags.bits(), 0);
+    assert_eq!(counters.kheap_structure.scanned_cached_ranges, 0);
+    assert!(!counters.managed_structure_scanned);
+    assert_eq!(counters.managed_structure.flags.bits(), 0);
+    assert_eq!(counters.managed_structure.scanned_active_objects, 0);
+    assert_eq!(counters.registry_live_records, full.registry_live_records);
+    assert_eq!(
+        counters.registry_nodes_accounted,
+        counters.registry_node_capacity
+    );
+
+    let scoped = KERNEL_ALLOCATOR.audit_with_scope(AllocatorAuditScope::CountersOnly);
+    assert_eq!(scoped, counters);
+    let scoped_full = KERNEL_ALLOCATOR.audit_with_scope(AllocatorAuditScope::FullRegistry);
+    assert!(scoped_full.registry_structure_scanned);
+    assert!(scoped_full.phys_structure_scanned);
+    assert!(scoped_full.slab_structure_scanned);
+    assert!(scoped_full.kheap_structure_scanned);
+    assert!(scoped_full.managed_structure_scanned);
+    assert_eq!(
+        scoped_full.registry_live_records,
+        full.registry_live_records
     );
 }
 
@@ -656,10 +1094,55 @@ fn allocator_diagnostic_reports_audit_snapshot() {
     assert!(len > 0);
     let text = core::str::from_utf8(&buf[..len]).expect("diagnostic is ascii");
     assert!(text.contains("Audit: ok=1"));
+    assert!(text.contains("mode=full"));
     assert!(text.contains("reg_struct=0"));
+    assert!(text.contains("phys_struct=0"));
+    assert!(text.contains("slab_struct=0"));
+    assert!(text.contains("kheap_struct=0"));
+    assert!(text.contains("managed_struct=0"));
+    assert!(text.contains("managed_refs=0/0/0"));
     assert!(text.contains("Hot: slab_hit="));
+    assert!(text.contains("phys_split="));
+    assert!(text.contains("phys_defer="));
+    assert!(text.contains("phys_reclaim="));
+    assert!(text.contains("phys_corrupt=0"));
+    assert!(text.contains("reg_corrupt=0"));
     assert!(text.contains("boot="));
     assert!(text.contains("physrec="));
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.registry_node_capacity, before.registry_node_capacity);
+}
+
+/// 轻量诊断应避免 registry 全量扫描，并在文本中明确标记采样范围。
+#[ktest]
+fn allocator_counter_diagnostic_reports_skipped_scan() {
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+
+    let mut buf = [0u8; 2048];
+    let len = KERNEL_ALLOCATOR.format_diagnostic_counters(&mut buf);
+    assert!(len > 0);
+    let text = core::str::from_utf8(&buf[..len]).expect("diagnostic is ascii");
+    assert!(text.contains("Audit: ok=1"));
+    assert!(text.contains("mode=counters"));
+    assert!(text.contains("reg_struct=skip"));
+    assert!(text.contains("phys_struct=skip"));
+    assert!(text.contains("slab_struct=skip"));
+    assert!(text.contains("kheap_struct=skip"));
+    assert!(text.contains("managed_struct=skip"));
+    assert!(text.contains("managed_refs=skip"));
+    assert!(text.contains("scan=skip"));
+    assert!(text.contains("Hot: slab_hit="));
+    assert!(text.contains("phys_meta="));
+
+    let scoped_len =
+        KERNEL_ALLOCATOR.format_diagnostic_with_scope(&mut buf, AllocatorAuditScope::CountersOnly);
+    assert!(scoped_len > 0);
+    let scoped = core::str::from_utf8(&buf[..scoped_len]).expect("diagnostic is ascii");
+    assert!(scoped.contains("mode=counters"));
 
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
@@ -674,15 +1157,73 @@ fn allocator_hotspot_summary_is_no_alloc_snapshot() {
     assert!(before.is_consistent());
 
     let hot = KERNEL_ALLOCATOR.hotspot_summary();
+    let registry = KERNEL_ALLOCATOR.registry_stats();
+    let expected_registry_load = if registry.bucket_count == 0 {
+        0
+    } else {
+        ((registry.live_records as u128 * 1000) / registry.bucket_count as u128)
+            .min(u32::MAX as u128) as u32
+    };
+    assert!(hot.phys_alloc_failure_per_mille <= 1000);
+    assert!(hot.phys_defer_per_free_mille <= 1000);
+    assert!(hot.phys_metadata_load_per_mille <= 1000);
+    assert_eq!(hot.phys_chain_corruptions, 0);
     assert!(hot.slab_cache_hit_per_mille <= 1000);
     assert!(hot.slab_cache_miss_per_mille <= 1000);
-    assert!(hot.registry_live_per_bucket_per_mille <= 1000);
-    assert!(hot.registry_nonempty_load_per_mille <= 1000);
-    assert!(hot.registry_max_shard_nonempty_buckets <= hot.registry_nonempty_buckets);
+    assert_eq!(
+        hot.registry_live_per_bucket_per_mille,
+        expected_registry_load
+    );
+    assert_eq!(hot.registry_chain_corruptions, 0);
     assert!(hot.kheap_failure_per_mille <= 1000);
     assert!(hot.kheap_realloc_per_mille <= 1000);
     assert!(hot.kernel_vmem_largest_free_percent <= 100);
     assert!(hot.managed_fragmentation_per_mille <= 1000);
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.registry_node_capacity, before.registry_node_capacity);
+}
+
+/// capability 快照给外部模块提供稳定的 allocator 能力发现入口。
+#[ktest]
+fn allocator_capabilities_report_stable_external_api() {
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+
+    let caps = KERNEL_ALLOCATOR.capabilities();
+    assert_eq!(caps.api_version, ALLOCATOR_API_VERSION);
+    assert_eq!(caps.page_size, PAGE_SIZE);
+    assert_eq!(caps.max_small_size, crate::MAX_SMALL_SIZE);
+    assert_eq!(caps.max_cpus, crate::MAX_CPUS);
+    assert!(caps.supports(AllocatorCapabilityFlags::TYPED_MEMORY_REQUEST));
+    assert!(caps.supports(AllocatorCapabilityFlags::TRACKED_PHYSICAL_API));
+    assert!(caps.supports(AllocatorCapabilityFlags::REGISTRY_SNAPSHOT));
+    assert!(caps.supports(AllocatorCapabilityFlags::COUNTERS_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::FULL_STRUCTURE_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::BUDDY_STRUCTURE_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::SLAB_STRUCTURE_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::KHEAP_STRUCTURE_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::MANAGED_STRUCTURE_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::MANAGED_REFERENCE_AUDIT));
+    assert!(caps.supports(AllocatorCapabilityFlags::CACHE_RECLAIM));
+    assert!(caps.supports(AllocatorCapabilityFlags::HOTSPOT_SUMMARY));
+    assert!(caps.supports(AllocatorCapabilityFlags::MANAGED_GC));
+    assert!(caps.supports(AllocatorCapabilityFlags::RELOCATION_OBSERVER));
+    assert!(caps.supports(AllocatorCapabilityFlags::EXACT_ROOT_PROVIDER));
+    assert!(caps.supports(AllocatorCapabilityFlags::GC_CRITICAL_SECTION_HOOKS));
+    assert_eq!(
+        caps.managed_enabled,
+        KERNEL_ALLOCATOR.managed_stats().enabled
+    );
+
+    let counter = KERNEL_ALLOCATOR.audit_counters();
+    assert!(counter.is_consistent());
+    assert!(!counter.registry_structure_scanned);
+    let full = KERNEL_ALLOCATOR.audit();
+    assert!(full.is_consistent());
+    assert!(full.managed_structure_scanned);
 
     let after = KERNEL_ALLOCATOR.audit();
     assert!(after.is_consistent());
@@ -721,6 +1262,17 @@ fn managed_deallocate_failure_keeps_registry_record() {
         blocked.managed_live_records,
         before.managed_live_records + 1
     );
+    let managed_audit = KERNEL_ALLOCATOR.managed_audit();
+    assert!(managed_audit.is_consistent());
+    assert_eq!(managed_audit.flags, ManagedAuditFlags::empty());
+    assert_eq!(
+        managed_audit.scanned_active_objects,
+        blocked.managed_active_objects
+    );
+    assert_eq!(
+        managed_audit.scanned_active_bytes,
+        KERNEL_ALLOCATOR.managed_stats().active_bytes
+    );
 
     KERNEL_ALLOCATOR.managed_allocator().release_handle(handle);
     KERNEL_ALLOCATOR
@@ -731,6 +1283,231 @@ fn managed_deallocate_failure_keeps_registry_record() {
     assert!(after.is_consistent());
     assert_eq!(after.managed_active_objects, before.managed_active_objects);
     assert_eq!(after.managed_live_records, before.managed_live_records);
+}
+
+/// managed audit 应扫描精确 trace descriptor 中声明的强/弱引用字段。
+#[ktest]
+fn managed_audit_scans_typed_reference_slots() {
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let before_managed = KERNEL_ALLOCATOR.managed_audit();
+    assert!(before_managed.is_consistent());
+
+    let node = KERNEL_ALLOCATOR
+        .allocate_managed_handle(
+            Layout::new::<ManagedAuditNode>(),
+            ManagedAllocFlags::new().with_trace_descriptor(&MANAGED_AUDIT_NODE_DESCRIPTOR),
+        )
+        .expect("allocate managed reference node");
+    let strong_target = KERNEL_ALLOCATOR
+        .allocate_managed_handle(
+            Layout::new::<ManagedAuditLeaf>(),
+            ManagedAllocFlags::default(),
+        )
+        .expect("allocate managed strong target");
+    let weak_target = KERNEL_ALLOCATOR
+        .allocate_managed_handle(
+            Layout::new::<ManagedAuditLeaf>(),
+            ManagedAllocFlags::default(),
+        )
+        .expect("allocate managed weak target");
+
+    let node_ptr = KERNEL_ALLOCATOR
+        .managed_allocator()
+        .resolve_handle(&node)
+        .expect("resolve managed node");
+    let strong_ptr = KERNEL_ALLOCATOR
+        .managed_allocator()
+        .resolve_handle(&strong_target)
+        .expect("resolve managed strong target");
+    let weak_ptr = KERNEL_ALLOCATOR
+        .managed_allocator()
+        .resolve_handle(&weak_target)
+        .expect("resolve managed weak target");
+
+    KERNEL_ALLOCATOR
+        .managed_allocator()
+        .store_ref(
+            &node,
+            GcRefSlot::<ManagedAuditLeaf>::new(MANAGED_AUDIT_STRONG_OFFSET),
+            GcRef::from_raw(strong_ptr),
+        )
+        .expect("store managed strong reference");
+    KERNEL_ALLOCATOR
+        .managed_allocator()
+        .store_weak_ref(
+            &node,
+            GcWeakRefSlot::<ManagedAuditLeaf>::new(MANAGED_AUDIT_WEAK_OFFSET),
+            GcWeakRef::from_raw(weak_ptr),
+        )
+        .expect("store managed weak reference");
+
+    let audit = KERNEL_ALLOCATOR.managed_audit();
+    assert!(audit.is_consistent());
+    assert_eq!(audit.flags, ManagedAuditFlags::empty());
+    assert_eq!(
+        audit.scanned_strong_reference_slots,
+        before_managed.scanned_strong_reference_slots + 1
+    );
+    assert_eq!(
+        audit.scanned_weak_reference_slots,
+        before_managed.scanned_weak_reference_slots + 1
+    );
+    assert_eq!(
+        audit.scanned_stale_weak_reference_slots,
+        before_managed.scanned_stale_weak_reference_slots
+    );
+
+    let header_addr = node_ptr - GcObjectHeader::HEADER_SIZE;
+    let saved_header = unsafe { *(header_addr as *const GcObjectHeader) };
+    let mut corrupted_header = saved_header;
+    corrupted_header.trace_descriptor_ptr = 0;
+    unsafe {
+        *(header_addr as *mut GcObjectHeader) = corrupted_header;
+    }
+    let drift = KERNEL_ALLOCATOR.managed_audit();
+    assert!(
+        drift
+            .flags
+            .contains(ManagedAuditFlags::OBJECT_HEADER_MISMATCH)
+    );
+    assert_eq!(
+        drift.scanned_strong_reference_slots,
+        before_managed.scanned_strong_reference_slots + 1
+    );
+    unsafe {
+        *(header_addr as *mut GcObjectHeader) = saved_header;
+    }
+    let restored = KERNEL_ALLOCATOR.managed_audit();
+    assert!(restored.is_consistent());
+
+    KERNEL_ALLOCATOR.managed_allocator().release_handle(node);
+    KERNEL_ALLOCATOR
+        .deallocate(node_ptr)
+        .expect("deallocate managed reference node");
+    KERNEL_ALLOCATOR
+        .managed_allocator()
+        .release_handle(strong_target);
+    KERNEL_ALLOCATOR
+        .deallocate(strong_ptr)
+        .expect("deallocate managed strong target");
+    KERNEL_ALLOCATOR
+        .managed_allocator()
+        .release_handle(weak_target);
+    KERNEL_ALLOCATOR
+        .deallocate(weak_ptr)
+        .expect("deallocate managed weak target");
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(after.managed_active_objects, before.managed_active_objects);
+    assert_eq!(after.managed_live_records, before.managed_live_records);
+}
+
+/// order-0 物理页短周期释放应优先进入受限延迟合并水位，减少下一轮分配的 split 抖动。
+#[ktest]
+fn physical_page_churn_uses_deferred_order0_coalesce() {
+    const COUNT: usize = 32;
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let buddy_before = KERNEL_ALLOCATOR.buddy_stats();
+    let can_defer = buddy_before.total_pages != 0
+        && (buddy_before.free_pages.saturating_mul(100)) / buddy_before.total_pages
+            >= DEFERRED_ORDER0_MIN_FREE_PERCENT
+        && buddy_before.free_count_per_order[0] < DEFERRED_ORDER0_COALESCE_TARGET;
+    let mut pages = [None; COUNT];
+
+    for slot in &mut pages {
+        let page = KERNEL_ALLOCATOR
+            .allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
+            .expect("allocate churn physical page");
+        *slot = Some(page);
+    }
+    for slot in pages.iter_mut().rev() {
+        let page = slot.take().expect("physical page exists");
+        KERNEL_ALLOCATOR
+            .try_free_physical(page)
+            .expect("free churn physical page");
+    }
+
+    let buddy_after = KERNEL_ALLOCATOR.buddy_stats();
+    assert!(buddy_after.free_requests >= buddy_before.free_requests + COUNT as u64);
+    assert!(buddy_after.deferred_coalesce_count >= buddy_before.deferred_coalesce_count);
+    if can_defer {
+        assert!(buddy_after.deferred_coalesce_count > buddy_before.deferred_coalesce_count);
+    }
+
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(
+        after.registry_physical_records,
+        before.registry_physical_records
+    );
+}
+
+/// ExactPhys 高阶分配应能先回收 deferred order-0 页，避免热页缓存造成假性碎片。
+#[ktest]
+fn exact_physical_alloc_reclaims_deferred_order0_pages() {
+    const COUNT: usize = 16;
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let mut pages = [None; COUNT];
+
+    for slot in &mut pages {
+        let page = KERNEL_ALLOCATOR
+            .allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE))
+            .expect("allocate exact-reclaim source page");
+        *slot = Some(page);
+    }
+
+    let mut exact_base = None;
+    for left in 0..COUNT {
+        for right in (left + 1)..COUNT {
+            let a = pages[left].expect("left page exists").paddr;
+            let b = pages[right].expect("right page exists").paddr;
+            let base = a.min(b);
+            let next = a.max(b);
+            if base.is_multiple_of(PAGE_SIZE * 2) && next == base + PAGE_SIZE {
+                exact_base = Some(base);
+                break;
+            }
+        }
+        if exact_base.is_some() {
+            break;
+        }
+    }
+    let exact_base = exact_base.expect("allocated pages should contain an order-1 buddy pair");
+
+    for slot in pages.iter_mut().rev() {
+        let page = slot.take().expect("source page exists");
+        KERNEL_ALLOCATOR
+            .try_free_physical(page)
+            .expect("free exact-reclaim source page");
+    }
+    let before_reclaim = KERNEL_ALLOCATOR.buddy_stats();
+
+    let allocation = KERNEL_ALLOCATOR
+        .allocate_physical(
+            PhysicalAllocRequest::new(PAGE_SIZE * 2, PAGE_SIZE * 2)
+                .with_placement(MemoryPlacement::ExactPhys(exact_base)),
+        )
+        .expect("allocate exact order-1 block from deferred pages");
+    assert_eq!(allocation.paddr, exact_base);
+    let after_reclaim = KERNEL_ALLOCATOR.buddy_stats();
+    assert!(after_reclaim.deferred_reclaim_count > before_reclaim.deferred_reclaim_count);
+
+    KERNEL_ALLOCATOR
+        .try_free_physical(allocation)
+        .expect("free exact-reclaimed block");
+    let after = KERNEL_ALLOCATOR.audit();
+    assert!(after.is_consistent());
+    assert_eq!(after.registry_live_records, before.registry_live_records);
+    assert_eq!(
+        after.registry_physical_records,
+        before.registry_physical_records
+    );
 }
 
 /// 公开物理页 API 也必须进入 registry，这样 DMA/页表等外部调用者不会绕过账本审计。
@@ -923,6 +1700,43 @@ fn buddy_metadata_pool_initialized() {
     assert!(stats.metadata_pages > 0);
     assert!(stats.node_capacity >= stats.total_pages);
     assert!(stats.node_used > 0);
+    assert!(stats.nonempty_hash_bucket_count <= stats.hash_bucket_count);
+    assert!(stats.nonempty_hash_bucket_count <= stats.node_used);
+    assert_eq!(stats.chain_corruptions, 0);
+    assert_eq!(
+        stats
+            .free_pages
+            .saturating_add(stats.allocated_pages)
+            .saturating_add(stats.reserved_pages),
+        stats.total_pages
+    );
+
+    let audit = KERNEL_ALLOCATOR.audit();
+    assert!(
+        !audit
+            .flags
+            .contains(AllocatorAuditFlags::PHYS_PAGE_ACCOUNTING_MISMATCH)
+    );
+    assert!(audit.phys_structure_scanned);
+    assert_eq!(audit.phys_structure.flags, BuddyAuditFlags::empty());
+
+    let buddy_audit = KERNEL_ALLOCATOR.buddy_audit();
+    assert!(buddy_audit.is_consistent());
+    assert_eq!(buddy_audit.flags, BuddyAuditFlags::empty());
+    assert_eq!(buddy_audit.scanned_total_pages, stats.total_pages);
+    assert_eq!(buddy_audit.scanned_free_pages, stats.free_pages);
+    assert_eq!(buddy_audit.scanned_allocated_pages, stats.allocated_pages);
+    assert_eq!(buddy_audit.scanned_reserved_pages, stats.reserved_pages);
+    assert_eq!(
+        buddy_audit
+            .scanned_hash_nodes
+            .saturating_add(buddy_audit.scanned_recycled_nodes),
+        stats.node_used
+    );
+    assert_eq!(
+        buddy_audit.scanned_nonempty_hash_buckets,
+        stats.nonempty_hash_bucket_count
+    );
 
     let metadata = KERNEL_ALLOCATOR.metadata_stats();
     assert!(metadata.backing_pages > 0);

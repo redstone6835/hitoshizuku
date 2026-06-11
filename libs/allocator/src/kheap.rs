@@ -39,10 +39,65 @@ pub struct KernelHeapStats {
     pub cache_full_releases: u64,
     pub cache_pressure_flushes: u64,
     pub cache_pressure_releases: u64,
+    pub cache_maintenance_flushes: u64,
+    pub cache_maintenance_releases: u64,
     pub cache_release_failures: u64,
     pub cached_ranges: usize,
     pub cached_pages: usize,
     pub cached_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelHeapReclaimStats {
+    pub released_ranges: usize,
+    pub released_pages: usize,
+    pub released_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelHeapAudit {
+    pub flags: KernelHeapAuditFlags,
+    pub scanned_cached_ranges: usize,
+    pub scanned_cached_pages: usize,
+    pub scanned_cached_bytes: usize,
+    pub scanned_active_allocs: u64,
+    pub scanned_active_pages: usize,
+    pub scanned_active_bytes: usize,
+}
+
+impl KernelHeapAudit {
+    pub const fn is_consistent(self) -> bool {
+        self.flags.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelHeapAuditFlags(u32);
+
+impl KernelHeapAuditFlags {
+    pub const CACHE_RING_INVALID: Self = Self(1 << 0);
+    pub const CACHE_RANGE_INVALID: Self = Self(1 << 1);
+    pub const ACTIVE_ACCOUNTING_MISMATCH: Self = Self(1 << 2);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+
+    fn insert(&mut self, flag: Self) {
+        self.0 |= flag.0;
+    }
 }
 
 const KHEAP_CACHE_MAX_ORDER: usize = 1;
@@ -53,6 +108,7 @@ const KHEAP_CACHEABLE_BACKEND_COOKIE: usize = 1;
 #[derive(Clone, Copy)]
 struct CachedOrderRanges {
     ranges: [Option<BackedRange>; KHEAP_CACHE_CAPACITY_PER_ORDER],
+    head: usize,
     len: usize,
 }
 
@@ -60,6 +116,7 @@ impl CachedOrderRanges {
     const fn new() -> Self {
         Self {
             ranges: [None; KHEAP_CACHE_CAPACITY_PER_ORDER],
+            head: 0,
             len: 0,
         }
     }
@@ -68,7 +125,8 @@ impl CachedOrderRanges {
         if self.len == self.ranges.len() {
             return false;
         }
-        self.ranges[self.len] = Some(range);
+        let tail = self.tail_index();
+        self.ranges[tail] = Some(range);
         self.len += 1;
         true
     }
@@ -77,15 +135,90 @@ impl CachedOrderRanges {
         if self.len == 0 {
             return None;
         }
+        let tail = self.newest_index();
+        let range = self.ranges[tail].take();
         self.len -= 1;
-        let range = self.ranges[self.len];
-        self.ranges[self.len] = None;
+        if self.len == 0 {
+            self.head = 0;
+        }
         range
+    }
+
+    fn push_or_evict_oldest(&mut self, range: BackedRange) -> Option<BackedRange> {
+        if self.push(range) {
+            return None;
+        }
+
+        // cache 满时保留最新释放的 range。大对象路径最常见的模式是短时间内释放后再分配
+        // 同阶对象；环形队列淘汰最旧元素并把当前 range 放到最新位置，避免满桶时搬移
+        // 128 个槽位。
+        let evicted = self.ranges[self.head].replace(range);
+        self.head = self.next_index(self.head);
+        evicted
+    }
+
+    fn tail_index(&self) -> usize {
+        (self.head + self.len) % self.ranges.len()
+    }
+
+    fn newest_index(&self) -> usize {
+        (self.head + self.len - 1) % self.ranges.len()
+    }
+
+    fn next_index(&self, index: usize) -> usize {
+        let next = index + 1;
+        if next == self.ranges.len() { 0 } else { next }
+    }
+
+    fn audit(&self, order: usize, audit: &mut KernelHeapAudit) {
+        // kheap cache 是环形队列：active 窗口必须全部为合法 range，窗口外必须为空。
+        // 这能发现 len/head 损坏、坏槽位残留，以及错误 order 的 range 被放入缓存。
+        if self.len > self.ranges.len()
+            || self.head >= self.ranges.len()
+            || (self.len == 0 && self.head != 0)
+        {
+            audit.flags.insert(KernelHeapAuditFlags::CACHE_RING_INVALID);
+        }
+
+        let len = self.len.min(self.ranges.len());
+        for slot in 0..self.ranges.len() {
+            let offset = if slot >= self.head {
+                slot - self.head
+            } else {
+                self.ranges.len() - self.head + slot
+            };
+            let active_slot = offset < len;
+            match (active_slot, self.ranges[slot]) {
+                (true, Some(range)) => {
+                    if !is_expected_cached_range(range, order) {
+                        audit
+                            .flags
+                            .insert(KernelHeapAuditFlags::CACHE_RANGE_INVALID);
+                        continue;
+                    }
+                    let pages = 1usize << range.order;
+                    audit.scanned_cached_ranges += 1;
+                    audit.scanned_cached_pages = audit.scanned_cached_pages.saturating_add(pages);
+                    audit.scanned_cached_bytes =
+                        audit.scanned_cached_bytes.saturating_add(range.size);
+                }
+                (true, None) | (false, Some(_)) => {
+                    audit.flags.insert(KernelHeapAuditFlags::CACHE_RING_INVALID);
+                }
+                (false, None) => {}
+            }
+        }
     }
 }
 
 struct KernelHeapRangeCache {
     orders: [CachedOrderRanges; KHEAP_CACHE_ORDER_COUNT],
+}
+
+enum CacheFreeOutcome {
+    Cached,
+    ReleaseCurrent(BackedRange),
+    ReleaseEvicted(BackedRange),
 }
 
 impl KernelHeapRangeCache {
@@ -95,11 +228,9 @@ impl KernelHeapRangeCache {
         }
     }
 
-    fn push(&mut self, range: BackedRange) -> bool {
-        let Some(idx) = cache_order_index(range.order) else {
-            return false;
-        };
-        self.orders[idx].push(range)
+    fn push_or_evict_oldest(&mut self, range: BackedRange) -> Option<BackedRange> {
+        let idx = cache_order_index(range.order)?;
+        self.orders[idx].push_or_evict_oldest(range)
     }
 
     fn pop(&mut self, order: usize) -> Option<BackedRange> {
@@ -126,6 +257,14 @@ impl KernelHeapRangeCache {
         }
         (ranges, pages, pages.saturating_mul(PAGE_SIZE))
     }
+
+    fn audit(&self) -> KernelHeapAudit {
+        let mut audit = KernelHeapAudit::default();
+        for order in 0..=KHEAP_CACHE_MAX_ORDER {
+            self.orders[order].audit(order, &mut audit);
+        }
+        audit
+    }
 }
 
 pub struct KernelHeap {
@@ -145,6 +284,8 @@ pub struct KernelHeap {
     cache_full_releases: AtomicU64,
     cache_pressure_flushes: AtomicU64,
     cache_pressure_releases: AtomicU64,
+    cache_maintenance_flushes: AtomicU64,
+    cache_maintenance_releases: AtomicU64,
     cache_release_failures: AtomicU64,
     cache: Mutex<KernelHeapRangeCache>,
 }
@@ -168,6 +309,8 @@ impl KernelHeap {
             cache_full_releases: AtomicU64::new(0),
             cache_pressure_flushes: AtomicU64::new(0),
             cache_pressure_releases: AtomicU64::new(0),
+            cache_maintenance_flushes: AtomicU64::new(0),
+            cache_maintenance_releases: AtomicU64::new(0),
             cache_release_failures: AtomicU64::new(0),
             cache: Mutex::new(KernelHeapRangeCache::new()),
         }
@@ -199,11 +342,31 @@ impl KernelHeap {
             cache_full_releases: self.cache_full_releases.load(Ordering::Acquire),
             cache_pressure_flushes: self.cache_pressure_flushes.load(Ordering::Acquire),
             cache_pressure_releases: self.cache_pressure_releases.load(Ordering::Acquire),
+            cache_maintenance_flushes: self.cache_maintenance_flushes.load(Ordering::Acquire),
+            cache_maintenance_releases: self.cache_maintenance_releases.load(Ordering::Acquire),
             cache_release_failures: self.cache_release_failures.load(Ordering::Acquire),
             cached_ranges,
             cached_pages,
             cached_bytes,
         }
+    }
+
+    pub fn audit(&self) -> KernelHeapAudit {
+        let mut audit = self.cache.lock().audit();
+        audit.scanned_active_allocs = self.active_allocs.load(Ordering::Acquire);
+        audit.scanned_active_pages = self.active_pages.load(Ordering::Acquire);
+        audit.scanned_active_bytes = self.active_bytes.load(Ordering::Acquire);
+
+        if audit.scanned_active_bytes != audit.scanned_active_pages.saturating_mul(PAGE_SIZE)
+            || (audit.scanned_active_allocs == 0
+                && (audit.scanned_active_pages != 0 || audit.scanned_active_bytes != 0))
+        {
+            audit
+                .flags
+                .insert(KernelHeapAuditFlags::ACTIVE_ACCOUNTING_MISMATCH);
+        }
+
+        audit
     }
 
     pub fn record_realloc(&self) {
@@ -326,11 +489,28 @@ impl KernelHeap {
             order,
         };
 
-        if !allow_cache || !self.try_cache_freed_range(record, range) {
-            vmem.free_kernel_backed_range(range, phys).map_err(|err| {
-                self.invalid_frees.fetch_add(1, Ordering::Relaxed);
-                DeallocationError::AddressSpace(err)
-            })?;
+        let cache_outcome = if allow_cache {
+            self.cache_freed_range(record, range)
+        } else {
+            CacheFreeOutcome::ReleaseCurrent(range)
+        };
+        match cache_outcome {
+            CacheFreeOutcome::Cached => {}
+            CacheFreeOutcome::ReleaseCurrent(range) => {
+                vmem.free_kernel_backed_range(range, phys).map_err(|err| {
+                    self.invalid_frees.fetch_add(1, Ordering::Relaxed);
+                    DeallocationError::AddressSpace(err)
+                })?;
+            }
+            CacheFreeOutcome::ReleaseEvicted(range) => {
+                if let Err(err) = vmem.free_kernel_backed_range(range, phys) {
+                    self.cache_release_failures.fetch_add(1, Ordering::Relaxed);
+                    panic!(
+                        "[alloc][invariant] kheap cache eviction release failed: vaddr={:#x} paddr={:#x} order={} err={:?}",
+                        range.vaddr, range.paddr, range.order, err
+                    );
+                }
+            }
         }
 
         self.active_allocs.fetch_sub(1, Ordering::Relaxed);
@@ -351,6 +531,22 @@ impl KernelHeap {
         }
     }
 
+    pub fn reclaim_cached_ranges(
+        &self,
+        max_ranges: usize,
+        phys: &crate::Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> KernelHeapReclaimStats {
+        let stats = self.release_cached_ranges(max_ranges, phys, vmem);
+        if stats.released_ranges != 0 {
+            self.cache_maintenance_flushes
+                .fetch_add(1, Ordering::Relaxed);
+            self.cache_maintenance_releases
+                .fetch_add(stats.released_ranges as u64, Ordering::Relaxed);
+        }
+        stats
+    }
+
     fn alloc_range_uncached(
         &self,
         order: usize,
@@ -369,17 +565,19 @@ impl KernelHeap {
         range
     }
 
-    fn try_cache_freed_range(&self, record: AllocationRecord, range: BackedRange) -> bool {
+    fn cache_freed_range(&self, record: AllocationRecord, range: BackedRange) -> CacheFreeOutcome {
         if record.backend_cookie != KHEAP_CACHEABLE_BACKEND_COOKIE || !is_cacheable_range(range) {
-            return false;
+            return CacheFreeOutcome::ReleaseCurrent(range);
         }
 
-        if self.cache.lock().push(range) {
-            self.cache_inserts.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            self.cache_full_releases.fetch_add(1, Ordering::Relaxed);
-            false
+        let evicted = self.cache.lock().push_or_evict_oldest(range);
+        self.cache_inserts.fetch_add(1, Ordering::Relaxed);
+        match evicted {
+            Some(evicted) => {
+                self.cache_full_releases.fetch_add(1, Ordering::Relaxed);
+                CacheFreeOutcome::ReleaseEvicted(evicted)
+            }
+            None => CacheFreeOutcome::Cached,
         }
     }
 
@@ -388,8 +586,18 @@ impl KernelHeap {
         phys: &crate::Mutex<BuddyAllocator>,
         vmem: &KernelAddressSpace,
     ) -> usize {
-        let mut released = 0usize;
-        loop {
+        self.release_cached_ranges(usize::MAX, phys, vmem)
+            .released_ranges
+    }
+
+    fn release_cached_ranges(
+        &self,
+        max_ranges: usize,
+        phys: &crate::Mutex<BuddyAllocator>,
+        vmem: &KernelAddressSpace,
+    ) -> KernelHeapReclaimStats {
+        let mut out = KernelHeapReclaimStats::default();
+        while out.released_ranges < max_ranges {
             let range = self.cache.lock().pop_any();
             let Some(range) = range else {
                 break;
@@ -401,9 +609,11 @@ impl KernelHeap {
                     range.vaddr, range.paddr, range.order, err
                 );
             }
-            released += 1;
+            out.released_ranges += 1;
+            out.released_pages = out.released_pages.saturating_add(1usize << range.order);
+            out.released_bytes = out.released_bytes.saturating_add(range.size);
         }
-        released
+        out
     }
 }
 
@@ -459,6 +669,14 @@ fn is_cacheable_range(range: BackedRange) -> bool {
         return false;
     }
     range.size == (1usize << range.order) * PAGE_SIZE
+}
+
+#[inline]
+fn is_expected_cached_range(range: BackedRange, order: usize) -> bool {
+    is_cacheable_range(range)
+        && range.order == order
+        && range.vaddr.is_multiple_of(PAGE_SIZE)
+        && range.paddr.is_multiple_of(PAGE_SIZE)
 }
 
 #[inline]

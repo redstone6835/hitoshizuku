@@ -136,6 +136,7 @@ pub enum SigProcMaskHow {
 pub struct SigActionFlags(pub u32);
 
 impl SigActionFlags {
+    pub const SA_ONSTACK: u32 = 0x08000000;
     pub const SA_NODEFER: u32 = 0x40000000;
     pub const SA_RESETHAND: u32 = 0x80000000;
     pub const SA_RESTART: u32 = 0x10000000;

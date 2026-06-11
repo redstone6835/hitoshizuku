@@ -18,9 +18,9 @@
 //! 起来以后仍然能稳定工作。
 //!
 //! TODO(alloc-stabilization): 本轮收口后仍需继续完成以下事项：
-//! 1. 在 `loongarch64-unknown-none` 目标和 QEMU 中跑完 allocator-bench，补齐真实
-//!    ns/op 数据和瓶颈归因；
-//! 2. 对 buddy/kheap/managed GC 做与 registry/slab/vmem 同等级别的热点审计；
+//! 1. 把 `loongarch64-unknown-none` QEMU allocator-bench 的关键 ns/op 数据纳入持续
+//!    回归，避免后续优化只看单次日志；
+//! 2. 为 managed GC 增加 stop-the-world 引用图验证，补齐对象字段级一致性检查；
 //! 3. 引入多核压力测试，验证 registry shard、slab per-CPU cache 和回收路径无竞态；
 //! 4. 评估 NUMA/per-CPU page cache、自定义 arena/policy 注册等扩展 API 是否需要进入
 //!    对外稳定接口。
@@ -108,7 +108,10 @@ use metadata::MetadataAllocator;
 use registry::AllocationRegistry;
 use slab::SlabAllocator;
 
-pub use buddy::{BuddyAllocator as PhysicalAllocator, BuddyStats, MemorySegment, PAGE_SIZE};
+pub use buddy::{
+    BuddyAllocator as PhysicalAllocator, BuddyAudit, BuddyAuditFlags, BuddyReclaimStats,
+    BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
+};
 pub use error::{
     AddressSpaceError, AllocationError, DeallocationError, InitError, ManagedHandleError,
     OwnershipError, PhysicalFreeError, RegistryError, VmemError,
@@ -119,10 +122,13 @@ pub use gc::{
     GcWeakRefSlot, RootType, TRACE_FLAG_HAS_FINALIZER, TRACE_FLAG_HAS_WEAK_REFS,
     TRACE_FLAG_PINNED_LAYOUT, TraceDescriptor,
 };
-pub use kheap::{KernelHeap as LargeObjectAllocator, KernelHeapStats};
+pub use kheap::{
+    KernelHeap as LargeObjectAllocator, KernelHeapAudit, KernelHeapAuditFlags,
+    KernelHeapReclaimStats, KernelHeapStats,
+};
 pub use managed::{
     DEFAULT_MANAGED_HEAP_ORDER, ExactRootProviderFn, LARGE_MANAGED_HEAP_ORDER, ManagedAllocator,
-    ManagedFailurePolicy, ManagedHeapConfig, ManagedStats,
+    ManagedAudit, ManagedAuditFlags, ManagedFailurePolicy, ManagedHeapConfig, ManagedStats,
 };
 pub use metadata::MetadataStats;
 pub use registry::{
@@ -134,9 +140,16 @@ pub use request::{
     MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest,
     PhysicalAllocation, ReclaimPolicy, Zeroing,
 };
-pub use slab::{MAX_CPUS, MAX_SMALL_SIZE, SlabAllocator as ZoneAllocator, SlabStats};
+pub use slab::{
+    MAX_CPUS, MAX_SMALL_SIZE, SlabAllocator as ZoneAllocator, SlabAudit, SlabAuditFlags,
+    SlabReclaimStats, SlabStats,
+};
 pub use space::{AddressSpaceStats, ArenaKind, BackedRange, KernelAddressSpace};
-pub use stats::{AllocatorAudit, AllocatorAuditFlags, AllocatorHotspotSummary};
+pub use stats::{
+    ALLOCATOR_API_VERSION, AllocatorAudit, AllocatorAuditFlags, AllocatorAuditScope,
+    AllocatorCapabilities, AllocatorCapabilityFlags, AllocatorHotspotSummary,
+    AllocatorReclaimRequest, AllocatorReclaimStats,
+};
 pub use vmem::{VmemAllocPolicy, VmemStats, VmemValidationStats};
 
 pub type PhysicalMemoryManager = BuddyAllocator;
@@ -204,7 +217,10 @@ pub type KernelAllocator = KernelMemorySubsystem;
 unsafe impl Sync for KernelMemorySubsystem {}
 
 enum TrackedReallocProbe {
-    Updated,
+    Updated {
+        old_size: usize,
+        record: AllocationRecord,
+    },
     NeedsMove(AllocationRecord),
     Untracked,
 }
@@ -519,6 +535,24 @@ impl KernelMemorySubsystem {
         self.active.load(Ordering::Acquire)
     }
 
+    /// 返回 allocator 对外稳定能力快照。
+    ///
+    /// 该接口不扫描内部结构、不分配内存，适合 LKM/外部子系统在初始化时判断当前内核是否
+    /// 支持 typed physical API、结构审计、cache reclaim、managed GC 等能力。功能新增时
+    /// 应增加 capability bit；破坏性 ABI 变化才递增 [`ALLOCATOR_API_VERSION`]。
+    pub fn capabilities(&self) -> AllocatorCapabilities {
+        AllocatorCapabilities {
+            api_version: ALLOCATOR_API_VERSION,
+            flags: AllocatorCapabilityFlags::stable_kernel(),
+            max_small_size: MAX_SMALL_SIZE,
+            max_cpus: MAX_CPUS,
+            page_size: PAGE_SIZE,
+            default_managed_heap_order: DEFAULT_MANAGED_HEAP_ORDER,
+            large_managed_heap_order: LARGE_MANAGED_HEAP_ORDER,
+            managed_enabled: self.managed.is_enabled(),
+        }
+    }
+
     pub fn stats(&self) -> AllocStats {
         let boot = self.boot.snapshot();
         let address_space = self.vmem.snapshot();
@@ -554,15 +588,23 @@ impl KernelMemorySubsystem {
     }
 
     pub fn layer_stats(&self) -> stats::AllocatorLayerStats {
-        self.layer_stats_with_registry(self.registry.stats())
+        self.layer_stats_with_physical_registry(self.buddy_stats(), self.registry.stats())
     }
 
     fn layer_stats_with_registry(
         &self,
         registry: AllocationRegistryStats,
     ) -> stats::AllocatorLayerStats {
+        self.layer_stats_with_physical_registry(self.buddy_stats(), registry)
+    }
+
+    fn layer_stats_with_physical_registry(
+        &self,
+        phys: BuddyStats,
+        registry: AllocationRegistryStats,
+    ) -> stats::AllocatorLayerStats {
         stats::AllocatorLayerStats {
-            phys: self.buddy_stats(),
+            phys,
             address_space: self.address_space_stats(),
             kheap: self.kheap.snapshot(),
             slab: self.slab.snapshot(),
@@ -587,10 +629,58 @@ impl KernelMemorySubsystem {
     }
 
     pub fn format_diagnostic(&self, buf: &mut [u8]) -> usize {
-        let registry_snapshot = self.registry.snapshot();
-        let layers = self.layer_stats_with_registry(registry_snapshot.stats);
-        let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
-        stats::format_diagnostic(buf, &overview, &layers, &registry_snapshot.audit)
+        self.format_diagnostic_with_scope(buf, AllocatorAuditScope::FullRegistry)
+    }
+
+    /// 使用指定自检范围格式化 allocator 诊断文本。
+    ///
+    /// `FullRegistry` 保留旧接口语义，会扫描 registry 链表并输出 `reg_struct/scan/chain`；
+    /// `CountersOnly` 只读取各层 O(1) 计数器，适合高频日志、监控和未来外部扩展的低扰动
+    /// 快照。诊断文本里的 `mode=` 字段会明确标明本次采样范围。
+    pub fn format_diagnostic_with_scope(
+        &self,
+        buf: &mut [u8],
+        scope: AllocatorAuditScope,
+    ) -> usize {
+        match scope {
+            AllocatorAuditScope::FullRegistry => {
+                let registry_snapshot = self.registry.snapshot();
+                let phys_snapshot = self.phys.lock().snapshot();
+                let layers = self.layer_stats_with_physical_registry(
+                    phys_snapshot.stats,
+                    registry_snapshot.stats,
+                );
+                let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
+                let slab_audit = self.slab.audit();
+                let kheap_audit = self.kheap.audit();
+                let managed_audit = self.managed.audit();
+                stats::format_diagnostic(
+                    buf,
+                    &overview,
+                    &layers,
+                    &registry_snapshot.audit,
+                    &phys_snapshot.audit,
+                    &slab_audit,
+                    &kheap_audit,
+                    &managed_audit,
+                )
+            }
+            AllocatorAuditScope::CountersOnly => {
+                let layers = self.layer_stats_with_registry(self.registry.stats());
+                let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
+                stats::format_diagnostic_counters(buf, &overview, &layers)
+            }
+        }
+    }
+
+    /// 格式化只基于计数器的轻量诊断文本，不扫描 registry 链表。
+    pub fn format_diagnostic_counters(&self, buf: &mut [u8]) -> usize {
+        self.format_diagnostic_with_scope(buf, AllocatorAuditScope::CountersOnly)
+    }
+
+    /// 显式格式化带 registry 结构扫描的完整诊断文本。
+    pub fn format_diagnostic_full(&self, buf: &mut [u8]) -> usize {
+        self.format_diagnostic_with_scope(buf, AllocatorAuditScope::FullRegistry)
     }
 
     /// 返回 allocator 分层账本的一致性审计快照。
@@ -599,9 +689,106 @@ impl KernelMemorySubsystem {
     /// 故障日志确认 registry 与 slab/kheap/managed 等后端的计数是否仍然一致。并发运行时
     /// 可能观察到短暂中间态，严格断言应在没有其它 CPU 同时 alloc/free 的自检阶段执行。
     pub fn audit(&self) -> AllocatorAudit {
-        let registry_snapshot = self.registry.snapshot();
-        let layers = self.layer_stats_with_registry(registry_snapshot.stats);
-        stats::build_audit(&layers, registry_snapshot.audit)
+        self.audit_with_scope(AllocatorAuditScope::FullRegistry)
+    }
+
+    /// 按采样范围返回 allocator 审计快照。
+    ///
+    /// `CountersOnly` 可以证明各层 O(1) 账本之间是否一致，但不会扫描 registry 结构；返回值
+    /// 中的 `registry_structure_scanned=false` 用来防止调用方把轻量结果误当成完整结构审计。
+    pub fn audit_with_scope(&self, scope: AllocatorAuditScope) -> AllocatorAudit {
+        match scope {
+            AllocatorAuditScope::FullRegistry => {
+                let registry_snapshot = self.registry.snapshot();
+                let phys_snapshot = self.phys.lock().snapshot();
+                let layers = self.layer_stats_with_physical_registry(
+                    phys_snapshot.stats,
+                    registry_snapshot.stats,
+                );
+                let slab_audit = self.slab.audit();
+                let kheap_audit = self.kheap.audit();
+                let managed_audit = self.managed.audit();
+                stats::build_audit_with_structures(
+                    &layers,
+                    registry_snapshot.audit,
+                    phys_snapshot.audit,
+                    slab_audit,
+                    kheap_audit,
+                    managed_audit,
+                )
+            }
+            AllocatorAuditScope::CountersOnly => {
+                let layers = self.layer_stats_with_registry(self.registry.stats());
+                stats::build_counter_audit(&layers)
+            }
+        }
+    }
+
+    /// 返回不扫描 registry 链表的轻量审计快照。
+    pub fn audit_counters(&self) -> AllocatorAudit {
+        self.audit_with_scope(AllocatorAuditScope::CountersOnly)
+    }
+
+    /// 返回 slab 内部链表和位图的一致性审计结果。
+    ///
+    /// 该接口只在每个 size class 内做有界扫描，不会修复状态。它比普通 `SlabStats`
+    /// 更适合在 allocator 自检和 panic 前诊断里确认 slab node 链、alloc/cache 位图与
+    /// O(1) 统计是否仍然一致。
+    pub fn slab_audit(&self) -> SlabAudit {
+        self.slab.audit()
+    }
+
+    /// 返回 kheap 大对象缓存 ring 和活跃页账本的一致性审计结果。
+    ///
+    /// kheap 的活跃对象所有权由 registry 证明；这里重点扫描缓存 ring，确认 cached range
+    /// 没有错阶、坏槽位或统计漂移。
+    pub fn kheap_audit(&self) -> KernelHeapAudit {
+        self.kheap.audit()
+    }
+
+    /// 返回 managed/GC 对象表、句柄表、根表和卡表的一致性审计结果。
+    ///
+    /// 该接口只做保守结构扫描，不递归追踪对象字段引用图；完整图校验需要未来在
+    /// stop-the-world 安全点内加入 fault-safe 字段读取。
+    pub fn managed_audit(&self) -> ManagedAudit {
+        self.managed.audit()
+    }
+
+    pub fn reclaim(
+        &self,
+        request: AllocatorReclaimRequest,
+    ) -> Result<AllocatorReclaimStats, AllocationError> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(AllocationError::NotInitialized);
+        }
+
+        let kheap = if request.kheap_cached_ranges == 0 {
+            KernelHeapReclaimStats::default()
+        } else {
+            self.kheap
+                .reclaim_cached_ranges(request.kheap_cached_ranges, &self.phys, &self.vmem)
+        };
+        let slab = if request.flush_slab_cpu_caches || request.reclaim_slab_empty {
+            self.slab.reclaim(
+                request.flush_slab_cpu_caches,
+                request.reclaim_slab_empty,
+                &self.phys,
+                &self.vmem,
+            )
+        } else {
+            SlabReclaimStats::default()
+        };
+        let phys = if request.reclaim_physical_deferred {
+            self.phys.lock().reclaim_deferred()
+        } else {
+            BuddyReclaimStats::default()
+        };
+
+        Ok(AllocatorReclaimStats { kheap, slab, phys })
+    }
+
+    pub fn reclaim_caches(&self) -> Result<AllocatorReclaimStats, AllocationError> {
+        self.reclaim(AllocatorReclaimRequest::caches())
     }
 
     pub fn address_space(&self) -> &KernelAddressSpace {
@@ -622,6 +809,14 @@ impl KernelMemorySubsystem {
 
     pub fn buddy_stats(&self) -> BuddyStats {
         self.phys.lock().stats()
+    }
+
+    /// 扫描 buddy hash/free-list/node freelist 并返回物理页结构审计结果。
+    ///
+    /// 这是冷路径接口，用于 allocator 自检、benchmark 和 panic 前日志。热路径只应读取
+    /// [`KernelMemorySubsystem::buddy_stats`]，避免把全量物理页结构扫描放进 alloc/free。
+    pub fn buddy_audit(&self) -> BuddyAudit {
+        self.phys.lock().audit()
     }
 
     pub fn address_space_stats(&self) -> AddressSpaceStats {
@@ -655,6 +850,10 @@ impl KernelMemorySubsystem {
 
     pub fn metadata_stats(&self) -> MetadataStats {
         self.metadata.stats()
+    }
+
+    pub fn managed_stats(&self) -> ManagedStats {
+        self.managed.stats()
     }
 
     pub fn allocate_physical(
@@ -1053,30 +1252,27 @@ impl KernelMemorySubsystem {
         }
 
         let new_layout = request.layout()?;
-        let mut old_record = self
-            .query_tracked_allocation(ptr)
-            .map_err(|_| AllocationError::InvalidLayout)?;
+        let old_record = match self.probe_tracked_realloc(ptr, new_layout, request.size) {
+            Ok(TrackedReallocProbe::Updated { old_size, record }) => {
+                if matches!(request.zeroing, Zeroing::Zeroed) && request.size > old_size {
+                    let start = ptr
+                        .checked_add(old_size)
+                        .ok_or(AllocationError::InvalidLayout)?;
+                    let len = request.size - old_size;
+                    unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
+                }
+                return Ok(record);
+            }
+            Ok(TrackedReallocProbe::NeedsMove(record)) => record,
+            Ok(TrackedReallocProbe::Untracked) | Err(_) => {
+                return Err(AllocationError::InvalidLayout);
+            }
+        };
         if !matches!(
             old_record.kind,
             AllocationKind::Small | AllocationKind::Large
         ) {
             return Err(AllocationError::InvalidLayout);
-        }
-
-        if self.can_reuse_allocation(old_record, new_layout) {
-            if matches!(request.zeroing, Zeroing::Zeroed) && request.size > old_record.size {
-                let start = ptr
-                    .checked_add(old_record.size)
-                    .ok_or(AllocationError::InvalidLayout)?;
-                let len = request.size - old_record.size;
-                unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
-            }
-            old_record.size = request.size.max(1);
-            old_record.align = new_layout.align();
-            self.registry
-                .update_existing_result(ptr, old_record)
-                .map_err(allocation_error_from_registry)?;
-            return Ok(old_record);
         }
 
         let new_record = self.allocate(request)?;
@@ -1487,9 +1683,11 @@ impl KernelMemorySubsystem {
         // 原地复用 + 更新逻辑大小”合并到 registry 的单次 shard 加锁中，避免同一
         // 指针连续两次哈希、加锁和链表扫描；无法原地复用时直接把旧记录带回，
         // 后续搬迁复制也不需要再查一次账本。
+        let mut old_size = 0usize;
         match self
             .registry
             .update_existing_maybe_result(ptr, |mut record| {
+                old_size = record.size;
                 if !self.can_reuse_allocation(record, new_layout) {
                     return None;
                 }
@@ -1497,7 +1695,7 @@ impl KernelMemorySubsystem {
                 record.align = new_layout.align();
                 Some(record)
             }) {
-            Ok((_, true)) => Ok(TrackedReallocProbe::Updated),
+            Ok((record, true)) => Ok(TrackedReallocProbe::Updated { old_size, record }),
             Ok((record, false)) => Ok(TrackedReallocProbe::NeedsMove(record)),
             Err(RegistryError::UnknownPointer) => Ok(TrackedReallocProbe::Untracked),
             Err(err) => Err(err),
@@ -1750,7 +1948,7 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         let active = self.active.load(Ordering::Acquire);
         let owner = if active {
             match self.probe_tracked_realloc(ptr as usize, new_layout, new_size) {
-                Ok(TrackedReallocProbe::Updated) => return ptr,
+                Ok(TrackedReallocProbe::Updated { .. }) => return ptr,
                 Ok(TrackedReallocProbe::NeedsMove(record)) => Some(record),
                 Ok(TrackedReallocProbe::Untracked) if self.boot.contains(ptr as usize) => Some(
                     AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr as usize)

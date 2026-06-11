@@ -881,6 +881,7 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    prev.record_involuntary_context_switch();
 
     // 4. 更新 CURRENT_TASKS。
     *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));

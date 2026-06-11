@@ -23,7 +23,7 @@ use general::vfs::{
 use hal::user_context::UserTrapFrame;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
+use sched::process_ops::{ExecPath, ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
 use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey};
@@ -344,7 +344,12 @@ fn process_execve(
     }
 
     let old_vm = task_vm_space(task);
-    let path = copy_cstr_from_user(request.path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?;
+    let path = match request.path {
+        ExecPath::User(path_user) => {
+            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?
+        }
+        ExecPath::Kernel(path) => path,
+    };
     let mut used = path.len().checked_add(1).ok_or(Errno::EINVAL)?;
     let argv = collect_user_string_array(request.argv_user, &mut used)?;
     let envp = collect_user_string_array(request.envp_user, &mut used)?;
@@ -512,7 +517,24 @@ fn process_setup_signal_frame(
     let total = SIGFRAME_TRAP_OFF
         .checked_add(trap_len)
         .ok_or(Errno::EINVAL)?;
-    let new_sp = saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf;
+    let new_sp = if action.flags.has(SigActionFlags::SA_ONSTACK) {
+        let altstack = task.sigaltstack();
+        if !altstack.disabled && !altstack.contains(saved.sp()) {
+            let top = altstack
+                .sp
+                .checked_add(altstack.size)
+                .ok_or(Errno::EINVAL)?;
+            let sp = top.checked_sub(total).ok_or(Errno::ENOMEM)? & !0xf;
+            if sp < altstack.sp {
+                return Err(Errno::ENOMEM);
+            }
+            sp
+        } else {
+            saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
+        }
+    } else {
+        saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
+    };
 
     let mut frame_bytes = Vec::new();
     frame_bytes.resize(total, 0);

@@ -102,8 +102,24 @@ pub fn openat(
     flags: OpenOptions,
     mode: FileMode,
 ) -> VfsResult<Fd> {
+    openat_with_lookup_flags(ctx, fdt, dirfd, path, flags, mode, LookupFlags::default())
+}
+
+/// `openat` 的扩展入口，供 `openat2` 传入额外路径解析约束。
+///
+/// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
+/// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+pub fn openat_with_lookup_flags(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    dirfd: &Dirfd,
+    path: &str,
+    flags: OpenOptions,
+    mode: FileMode,
+    extra_lookup_flags: LookupFlags,
+) -> VfsResult<Fd> {
     let lookup_flags = {
-        let mut f = LookupFlags::default();
+        let mut f = extra_lookup_flags;
         if flags.nofollow {
             f = f.with(LookupFlags::NO_FOLLOW);
         }
