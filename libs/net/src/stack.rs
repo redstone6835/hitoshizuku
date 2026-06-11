@@ -360,6 +360,53 @@ impl NetStack {
 
     // ── Raw / ICMP 操作 ─────────────────────────────────────────────────
 
+    /// 将 ICMP socket 绑定到 echo identifier。
+    ///
+    /// 绑定后只接收 identifier 匹配的 echo request/reply。identifier 本身是
+    /// ICMP 协议字段，不在这里模拟 POSIX 端口语义。
+    pub fn icmp_bind_identifier(
+        &self,
+        handle: NetSocketHandle,
+        identifier: u16,
+    ) -> Result<(), NetError> {
+        if handle.sock_type != SocketType::Icmp {
+            return Err(NetError::InvalidArgument);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        managed
+            .icmp_socket_mut(handle.inner)
+            .bind(smoltcp::socket::icmp::Endpoint::Ident(identifier))
+            .map_err(map_icmp_bind_error)
+    }
+
+    /// 将 ICMP socket 绑定到 UDP 本地端点，用于接收该 UDP 端点关联的 ICMP 错误。
+    pub fn icmp_bind_udp(&self, handle: NetSocketHandle, local: Endpoint) -> Result<(), NetError> {
+        if handle.sock_type != SocketType::Icmp {
+            return Err(NetError::InvalidArgument);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        managed
+            .icmp_socket_mut(handle.inner)
+            .bind(smoltcp::socket::icmp::Endpoint::Udp(
+                endpoint_to_smoltcp_listen(&local),
+            ))
+            .map_err(map_icmp_bind_error)
+    }
+
     pub fn raw_send(
         &self,
         handle: NetSocketHandle,
@@ -1726,6 +1773,13 @@ fn endpoint_from_ip_address(addr: IpAddress) -> Endpoint {
     Endpoint { addr, port: 0 }
 }
 
+fn map_icmp_bind_error(err: smoltcp::socket::icmp::BindError) -> NetError {
+    match err {
+        smoltcp::socket::icmp::BindError::InvalidState => NetError::AddressInUse,
+        smoltcp::socket::icmp::BindError::Unaddressable => NetError::InvalidArgument,
+    }
+}
+
 fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
     u32::from_be_bytes(mask.0).leading_ones() as u8
 }
@@ -2169,6 +2223,111 @@ mod tests {
     }
 
     #[test]
+    fn icmp_bind_identifier_rejects_wrong_socket_type() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-bind-wrong",
+            IfConfig::static_v4(Ipv4Addr::new(10, 19, 0, 2), 24, None),
+        );
+        let udp = stack.socket_udp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.icmp_bind_identifier(udp, 0x1234),
+            Err(NetError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn icmp_bind_identifier_rejects_second_bind() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-bind-twice",
+            IfConfig::static_v4(Ipv4Addr::new(10, 20, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+
+        assert_eq!(stack.icmp_bind_identifier(handle, 0x1234), Ok(()));
+        assert_eq!(
+            stack.icmp_bind_identifier(handle, 0x4321),
+            Err(NetError::AddressInUse)
+        );
+    }
+
+    #[test]
+    fn icmp_bind_udp_rejects_zero_port() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-bind-udp-zero",
+            IfConfig::static_v4(Ipv4Addr::new(10, 21, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.icmp_bind_udp(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 0,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn icmp_bind_udp_accepts_udp_error_endpoint() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-bind-udp",
+            IfConfig::static_v4(Ipv4Addr::new(10, 22, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.icmp_bind_udp(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 33434,
+                },
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn icmp_bind_identifier_filters_echo_replies() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-filter",
+            IfConfig::static_v4(Ipv4Addr::new(10, 23, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let src = smoltcp::wire::Ipv4Address::new(10, 23, 0, 77);
+        let dst = smoltcp::wire::Ipv4Address::new(10, 23, 0, 2);
+
+        assert_eq!(stack.icmp_bind_identifier(handle, 0x1234), Ok(()));
+        driver.push_rx(build_icmpv4_echo_reply(src, dst, 0x4321, 0x5678, b"bad"));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 16];
+        assert!(!stack.raw_can_recv(handle));
+        assert_eq!(stack.raw_recv(handle, &mut buf), Err(NetError::WouldBlock));
+
+        driver.push_rx(build_icmpv4_echo_reply(src, dst, 0x1234, 0x5678, b"good"));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let info = stack.raw_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(info.len, 12);
+        assert_eq!(&buf[8..info.len], b"good");
+    }
+
+    #[test]
     fn raw_recv_from_preserves_icmp_remote_address() {
         let stack = NetStack::new();
         let (iface, driver) = attach_test_iface_with_driver(
@@ -2180,15 +2339,7 @@ mod tests {
         let src = smoltcp::wire::Ipv4Address::new(10, 11, 0, 77);
         let dst = smoltcp::wire::Ipv4Address::new(10, 11, 0, 2);
 
-        {
-            let table = stack.interfaces.read();
-            let iface_lock = table.get(&iface).unwrap();
-            let mut managed = iface_lock.lock();
-            managed
-                .icmp_socket_mut(handle.inner)
-                .bind(smoltcp::socket::icmp::Endpoint::Ident(0x1234))
-                .unwrap();
-        }
+        assert_eq!(stack.icmp_bind_identifier(handle, 0x1234), Ok(()));
         driver.push_rx(build_icmpv4_echo_reply(src, dst, 0x1234, 0x5678, b"pong"));
         stack.poll_interface(iface, NetInstant::ZERO);
 
@@ -2217,15 +2368,7 @@ mod tests {
         let src = smoltcp::wire::Ipv4Address::new(10, 12, 0, 77);
         let dst = smoltcp::wire::Ipv4Address::new(10, 12, 0, 2);
 
-        {
-            let table = stack.interfaces.read();
-            let iface_lock = table.get(&iface).unwrap();
-            let mut managed = iface_lock.lock();
-            managed
-                .icmp_socket_mut(handle.inner)
-                .bind(smoltcp::socket::icmp::Endpoint::Ident(0x1234))
-                .unwrap();
-        }
+        assert_eq!(stack.icmp_bind_identifier(handle, 0x1234), Ok(()));
         driver.push_rx(build_icmpv4_echo_reply(src, dst, 0x1234, 0x5678, b"old"));
         stack.poll_interface(iface, NetInstant::ZERO);
 
