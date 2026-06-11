@@ -24,7 +24,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use smoltcp::wire::{IpAddress, IpListenEndpoint};
+use smoltcp::wire::{IpAddress, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
 use spin::{Mutex, RwLock};
 
 use crate::config::{CidrAddress, Endpoint, Gateway, IfConfig, IpAddr, Ipv4Addr, Ipv6Addr};
@@ -67,6 +67,28 @@ pub struct TcpAcceptInfo {
 pub struct RawRecvInfo {
     pub len: usize,
     pub remote: Option<Endpoint>,
+}
+
+/// Raw IP 出站包头摘要。
+///
+/// Raw socket 发送路径要求调用方提供完整 IP 包；网络层从包头提取路由和
+/// 过滤所需的字段，避免 remote 参数与包头目的地址分叉。
+#[derive(Debug, Clone, Copy)]
+struct RawPacketMeta {
+    version: IpVersion,
+    protocol: IpProtocol,
+    destination: IpAddr,
+}
+
+impl RawPacketMeta {
+    fn matches_socket(
+        &self,
+        socket_version: Option<IpVersion>,
+        socket_protocol: Option<IpProtocol>,
+    ) -> bool {
+        socket_version.is_none_or(|version| version == self.version)
+            && socket_protocol.is_none_or(|protocol| protocol == self.protocol)
+    }
 }
 
 // ── NetStack ─────────────────────────────────────────────────────────────────
@@ -413,9 +435,25 @@ impl NetStack {
         data: &[u8],
         remote: Option<Endpoint>,
     ) -> Result<usize, NetError> {
-        if let Some(remote) = remote {
-            self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
-        }
+        let raw_meta = match handle.sock_type {
+            SocketType::Raw => {
+                let meta = parse_raw_packet_meta(data)?;
+                if is_unspecified_ip(&meta.destination) {
+                    return Err(NetError::InvalidArgument);
+                }
+                if remote.is_some_and(|remote| remote.addr != meta.destination) {
+                    return Err(NetError::InvalidArgument);
+                }
+                self.ensure_socket_route_matches(handle.iface_id, &meta.destination)?;
+                Some(meta)
+            }
+            SocketType::Icmp => {
+                let remote = remote.ok_or(NetError::InvalidArgument)?;
+                self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
+                None
+            }
+            _ => return Err(NetError::InvalidArgument),
+        };
         let sent = {
             let table = self.interfaces.read();
             let iface_lock = table
@@ -427,17 +465,19 @@ impl NetStack {
             }
             match handle.sock_type {
                 SocketType::Raw => {
-                    // TODO: raw IP 发送目前忽略 remote，缺少 per-packet 目的地址、
-                    // 路由元信息和 raw socket 头部包含语义。
+                    let raw_meta = raw_meta.ok_or(NetError::InvalidArgument)?;
                     let socket = managed.raw_socket_mut(handle.inner);
+                    if !raw_meta.matches_socket(socket.ip_version(), socket.ip_protocol()) {
+                        return Err(NetError::InvalidArgument);
+                    }
                     let tx_buf = socket.send(data.len()).map_err(|_| NetError::WouldBlock)?;
                     tx_buf.copy_from_slice(data);
                     data.len()
                 }
                 SocketType::Icmp => {
                     let remote = remote.ok_or(NetError::InvalidArgument)?;
-                    // TODO: ICMP 仅把 remote addr 传给 smoltcp，尚未支持 identifier
-                    // 绑定、IPv6 ICMP 细分语义和 socket 级过滤。
+                    // ICMP payload 由调用方按已绑定 endpoint 构造；网络层只负责
+                    // 目的地址、发送缓冲和协议栈驱动。
                     let socket = managed.icmp_socket_mut(handle.inner);
                     socket
                         .send_slice(data, endpoint_to_smoltcp(&remote).addr)
@@ -1773,6 +1813,36 @@ fn endpoint_from_ip_address(addr: IpAddress) -> Endpoint {
     Endpoint { addr, port: 0 }
 }
 
+fn parse_raw_packet_meta(data: &[u8]) -> Result<RawPacketMeta, NetError> {
+    if data.is_empty() {
+        return Err(NetError::InvalidArgument);
+    }
+    match IpVersion::of_packet(data).map_err(|_| NetError::InvalidArgument)? {
+        IpVersion::Ipv4 => {
+            let packet = Ipv4Packet::new_checked(data).map_err(|_| NetError::InvalidArgument)?;
+            if packet.total_len() as usize != data.len() {
+                return Err(NetError::InvalidArgument);
+            }
+            Ok(RawPacketMeta {
+                version: IpVersion::Ipv4,
+                protocol: packet.next_header(),
+                destination: IpAddr::V4(Ipv4Addr(packet.dst_addr().octets())),
+            })
+        }
+        IpVersion::Ipv6 => {
+            let packet = Ipv6Packet::new_checked(data).map_err(|_| NetError::InvalidArgument)?;
+            if packet.total_len() != data.len() {
+                return Err(NetError::InvalidArgument);
+            }
+            Ok(RawPacketMeta {
+                version: IpVersion::Ipv6,
+                protocol: packet.next_header(),
+                destination: IpAddr::V6(Ipv6Addr(packet.dst_addr().octets())),
+            })
+        }
+    }
+}
+
 fn map_icmp_bind_error(err: smoltcp::socket::icmp::BindError) -> NetError {
     match err {
         smoltcp::socket::icmp::BindError::InvalidState => NetError::AddressInUse,
@@ -1954,6 +2024,31 @@ mod tests {
         bytes
     }
 
+    fn build_raw_ipv4_packet(
+        src: smoltcp::wire::Ipv4Address,
+        dst: smoltcp::wire::Ipv4Address,
+        protocol: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv4Repr};
+
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::from(protocol),
+            payload_len: payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = alloc::vec![0u8; ip.buffer_len() + payload.len()];
+        {
+            let mut packet = Ipv4Packet::new_unchecked(&mut bytes);
+            ip.emit(&mut packet, &ChecksumCapabilities::default());
+            packet.payload_mut().copy_from_slice(payload);
+        }
+        bytes
+    }
+
     #[test]
     fn ephemeral_cursor_scans_each_port_once() {
         let range = EphemeralPortRange {
@@ -2085,10 +2180,114 @@ mod tests {
             addr: IpAddr::V4(Ipv4Addr::new(10, 14, 0, 77)),
             port: 0,
         };
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 13, 0, 2),
+            smoltcp::wire::Ipv4Address::new(10, 14, 0, 77),
+            253,
+            b"raw-route",
+        );
 
         assert_eq!(
-            stack.raw_send(handle, b"raw-route", Some(remote)),
+            stack.raw_send(handle, &packet, Some(remote)),
             Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn raw_send_accepts_packet_destination_without_remote() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-raw-header-ok",
+            IfConfig::static_v4(Ipv4Addr::new(10, 24, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 24, 0, 2),
+            smoltcp::wire::Ipv4Address::new(10, 24, 0, 77),
+            253,
+            b"raw-payload",
+        );
+
+        assert_eq!(stack.raw_send(handle, &packet, None), Ok(packet.len()));
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn raw_send_without_remote_uses_packet_destination_route() {
+        let stack = NetStack::new();
+        let first = attach_test_iface(
+            &stack,
+            "eth-raw-header-a",
+            IfConfig::static_v4(Ipv4Addr::new(10, 25, 0, 2), 24, None),
+        );
+        attach_test_iface(
+            &stack,
+            "eth-raw-header-b",
+            IfConfig::static_v4(Ipv4Addr::new(10, 26, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(first, 4, 253).unwrap();
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 25, 0, 2),
+            smoltcp::wire::Ipv4Address::new(10, 26, 0, 77),
+            253,
+            b"raw-route",
+        );
+
+        assert_eq!(
+            stack.raw_send(handle, &packet, None),
+            Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn raw_send_rejects_remote_that_differs_from_packet_destination() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-raw-header-remote",
+            IfConfig::static_v4(Ipv4Addr::new(10, 27, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 27, 0, 2),
+            smoltcp::wire::Ipv4Address::new(10, 27, 0, 77),
+            253,
+            b"raw-route",
+        );
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 27, 0, 88)),
+            port: 0,
+        };
+
+        assert_eq!(
+            stack.raw_send(handle, &packet, Some(remote)),
+            Err(NetError::InvalidArgument)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn raw_send_rejects_packet_protocol_that_does_not_match_socket() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-raw-header-proto",
+            IfConfig::static_v4(Ipv4Addr::new(10, 28, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 28, 0, 2),
+            smoltcp::wire::Ipv4Address::new(10, 28, 0, 77),
+            254,
+            b"raw-route",
+        );
+
+        assert_eq!(
+            stack.raw_send(handle, &packet, None),
+            Err(NetError::InvalidArgument)
         );
         assert!(stack.raw_can_send(handle));
     }
@@ -2193,9 +2392,15 @@ mod tests {
             addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
             port: 0,
         };
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 17, 0, 2),
+            smoltcp::wire::Ipv4Address::new(192, 0, 2, 99),
+            253,
+            b"raw-route",
+        );
 
         assert_eq!(
-            stack.raw_send(handle, b"raw-route", Some(remote)),
+            stack.raw_send(handle, &packet, Some(remote)),
             Err(NetError::Unreachable)
         );
         assert!(stack.raw_can_send(handle));

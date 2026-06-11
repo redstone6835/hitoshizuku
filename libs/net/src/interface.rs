@@ -859,8 +859,8 @@ impl ManagedInterface {
     /// 创建一个 ICMP socket。
     pub fn add_icmp_socket(&mut self, tuning: PacketBufferTuning) -> ProtocolSocketHandle {
         use smoltcp::socket::icmp;
-        // TODO: ICMP 当前是最小 echo 能力，未建模 identifier、sequence
-        // 分发、错误报文队列和 IPv6 ICMP 差异。
+        // TODO: ICMP identifier 已由 NetStack 绑定接口暴露；仍缺少 sequence
+        // 分发策略、错误报文队列和 IPv6 ICMP 细分语义。
         let rx_buf = icmp::PacketBuffer::new(
             alloc::vec![icmp::PacketMetadata::EMPTY; tuning.rx_meta],
             alloc::vec![0u8; tuning.rx_bytes],
