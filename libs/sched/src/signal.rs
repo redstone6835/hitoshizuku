@@ -448,6 +448,10 @@ impl SharedSignal {
     pub fn pending_snapshot(&self) -> SigSet {
         SigSet(self.shared_pending_bits.load(Ordering::Acquire))
     }
+
+    pub fn pending_len_hint(&self) -> usize {
+        self.shared_pending_infos.lock().len()
+    }
 }
 
 impl Default for SharedSignal {

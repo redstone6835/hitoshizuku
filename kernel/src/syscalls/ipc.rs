@@ -40,7 +40,7 @@ pub(super) fn sys_shmget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let key = ShmKey(ctx.args[0] as i32);
     let size = ctx.args[1] as u64;
     let flags = ctx.args[2] as u32;
-    let cred = vfs_cred_from_sched(&ctx.task.credentials());
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
 
     let manager = shm_manager();
     let id = manager.shmget(key, size, flags, &cred)?;
@@ -67,7 +67,7 @@ pub(super) fn sys_shmat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
     }
 
-    let cred = vfs_cred_from_sched(&ctx.task.credentials());
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
     let manager = shm_manager();
     let object = manager.attach(shmid, flags, &cred)?;
     let size = usize::try_from(object.len()).map_err(|_| Errno::EINVAL)?;
@@ -116,7 +116,7 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let raw_cmd = ctx.args[1] as u32;
     let cmd = raw_cmd & !IPC_64;
     let buf = ctx.args[2];
-    let cred = vfs_cred_from_sched(&ctx.task.credentials());
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
     let manager = shm_manager();
 
     match cmd {
@@ -266,12 +266,12 @@ fn shm_manager() -> Arc<ShmManager> {
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
-    let payload = ctx.task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    let payload = ctx.task().ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
 
 fn task_pid(ctx: &SyscallContext<'_>) -> i32 {
-    ctx.task.pid_root().unwrap_or(0)
+    ctx.task().pid_root().unwrap_or(0)
 }
 
 fn shmat_vm_flags(flags: u32) -> VmFlags {

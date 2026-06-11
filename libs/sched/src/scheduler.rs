@@ -55,6 +55,28 @@ static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
 /// 路径 / 主动 yield 入口读到 true 即调一次 [`schedule_once`]。
 static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
 
+/// 已经最终切走的任务。
+///
+/// Zombie / Dead 任务不会再恢复到自己的内核栈。如果把 `Arc<Task>` 作为普通局部
+/// 留在 `schedule_once` 的旧栈上，它的析构永远不会运行，进而保活 VmSpace/FdTable
+/// 等资源。最终切换前把它移动到这里，后续任意调度边界在当前活任务栈上 drop。
+static RETIRED_TASKS: [Spinlock<Vec<Arc<Task>>>; NR_CPUS] =
+    [const { Spinlock::new(Vec::new()) }; NR_CPUS];
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SchedulerDiag {
+    pub current_slots: usize,
+    pub current_zombie_or_dead: usize,
+    pub rq_current_slots: usize,
+    pub rq_current_zombie_or_dead: usize,
+    pub rq_queued_slots: usize,
+    pub rq_queued_zombie_or_dead: usize,
+    pub retired_tasks: usize,
+    pub pid_count: usize,
+    pub init_children: usize,
+    pub init_zombies: usize,
+}
+
 /// 每核 syscall 收尾后的启动交接轮数。
 ///
 /// clone/fork 成功时只登记这个计数；真正调度发生在 syscall 分发器已经写好
@@ -276,6 +298,59 @@ pub fn current_task_on(cpu_id: usize) -> Option<Arc<Task>> {
     CURRENT_TASKS[cpu_id].lock().clone()
 }
 
+pub fn scheduler_diag() -> SchedulerDiag {
+    let mut diag = SchedulerDiag::default();
+    for slot in &CURRENT_TASKS {
+        if let Some(task) = slot.lock().as_ref() {
+            diag.current_slots += 1;
+            if matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
+                diag.current_zombie_or_dead += 1;
+            }
+        }
+    }
+    for rq in &RUNQUEUES {
+        if let Some(task) = rq.current() {
+            diag.rq_current_slots += 1;
+            if matches!(task.state(), TaskState::Zombie | TaskState::Dead) {
+                diag.rq_current_zombie_or_dead += 1;
+            }
+        }
+        let queued = rq.snapshot_runnable();
+        diag.rq_queued_slots += queued.len();
+        diag.rq_queued_zombie_or_dead += queued
+            .iter()
+            .filter(|task| matches!(task.state(), TaskState::Zombie | TaskState::Dead))
+            .count();
+    }
+    for retired in &RETIRED_TASKS {
+        diag.retired_tasks += retired.lock().len();
+    }
+    if INIT_READY.load(Ordering::Acquire) {
+        diag.pid_count = pid_count();
+        let init = init_task();
+        let children = init.snapshot_children();
+        diag.init_children = children.len();
+        diag.init_zombies = children
+            .iter()
+            .filter(|child| child.state() == TaskState::Zombie)
+            .count();
+    }
+    diag
+}
+
+pub(crate) fn is_current_on_any_cpu(task: &Arc<Task>) -> bool {
+    for current in &CURRENT_TASKS {
+        if current
+            .lock()
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, task))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// 指定 CPU 上的 idle 任务句柄。
 pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
     if cpu_id >= NR_CPUS {
@@ -359,6 +434,25 @@ pub fn request_post_syscall_handoff() {
         }
     }
     request_resched(cpu_id);
+}
+
+fn cleanup_retired_tasks(cpu_id: usize) {
+    let retired = {
+        let mut slot = RETIRED_TASKS[cpu_id].lock();
+        if slot.is_empty() {
+            return;
+        }
+        core::mem::take(&mut *slot)
+    };
+    for task in retired.iter() {
+        task.cleanup_exit_extensions();
+        task.retire_execution();
+    }
+    drop(retired);
+}
+
+fn retire_final_task(cpu_id: usize, task: Arc<Task>) {
+    RETIRED_TASKS[cpu_id].lock().push(task);
 }
 
 pub fn run_post_syscall_handoff(now_ns: u64) {
@@ -748,6 +842,7 @@ pub(crate) fn continue_task(task: &Arc<Task>) -> bool {
 /// 主动 yield 之类无法测时间的路径）。返回时调用方已经重新获得 CPU。
 pub fn schedule_once(now_ns: u64) {
     let cpu_id = cpu();
+    cleanup_retired_tasks(cpu_id);
 
     // 1. 取 prev（不持 CURRENT_TASKS 锁跨切换）。
     let Some(prev) = CURRENT_TASKS[cpu_id].lock().clone() else {
@@ -783,9 +878,9 @@ pub fn schedule_once(now_ns: u64) {
         return;
     }
     prev.record_involuntary_context_switch();
+    let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
 
     // 4. 更新 CURRENT_TASKS。
-    *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));
     next.set_current_cpu(cpu_id);
 
     // 5. 取 ctx。
@@ -818,7 +913,15 @@ pub fn schedule_once(now_ns: u64) {
     // 8. 切换。
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
     unsafe {
-        (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
+        if final_prev {
+            *CURRENT_TASKS[cpu_id].lock() = Some(next);
+            retire_final_task(cpu_id, prev);
+            (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
+            core::hint::unreachable_unchecked();
+        } else {
+            *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));
+            (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
+        }
     }
     // 被切回后正常返回。
 }

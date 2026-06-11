@@ -17,11 +17,31 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::file::File;
 use crate::vfs::limits::VfsLimits;
 use crate::vfs::sync::Spinlock;
+
+static FDTABLE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static FDTABLE_CREATED: AtomicUsize = AtomicUsize::new(0);
+static FDTABLE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FdTableDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn fdtable_diag() -> FdTableDiag {
+    FdTableDiag {
+        live: FDTABLE_LIVE.load(Ordering::Acquire),
+        created: FDTABLE_CREATED.load(Ordering::Acquire),
+        dropped: FDTABLE_DROPPED.load(Ordering::Acquire),
+    }
+}
 
 /// 每进程默认最大打开文件数的默认值（软限制）。
 ///
@@ -269,6 +289,8 @@ pub struct FdTable {
 impl FdTable {
     /// 构造一个空的描述符表，从 `limits` 中读取初始软硬限制。
     pub fn new(limits: &VfsLimits) -> Self {
+        FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Spinlock::new(FdTableInner::new(
                 core::cmp::min(limits.nofile_default, limits.nofile_max),
@@ -279,6 +301,8 @@ impl FdTable {
 
     /// 构造一个使用 [`RLIMIT_NOFILE_DEFAULT`] 默认值的描述符表（便于测试）。
     pub fn new_default() -> Self {
+        FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Spinlock::new(FdTableInner::new(RLIMIT_NOFILE_DEFAULT, RLIMIT_NOFILE_MAX)),
         }
@@ -666,6 +690,8 @@ impl FdTable {
                 })
             })
             .collect();
+        FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
         FdTable {
             inner: Spinlock::new(FdTableInner {
                 entries: new_entries,
@@ -676,5 +702,12 @@ impl FdTable {
                 close_observers: inner.close_observers.clone(),
             }),
         }
+    }
+}
+
+impl Drop for FdTable {
+    fn drop(&mut self) {
+        FDTABLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }

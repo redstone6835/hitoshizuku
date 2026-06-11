@@ -26,7 +26,7 @@ use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecPath, ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
-use sched::task::{TaskExtCloneHook, TaskExtKey};
+use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey};
 use sched::{
     TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
@@ -135,6 +135,19 @@ impl TaskExtCloneHook for KernelExtCloneHook {
 }
 
 static HOOK: KernelExtCloneHook = KernelExtCloneHook;
+
+struct KernelExtExitHook;
+
+impl TaskExtExitHook for KernelExtExitHook {
+    fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
+        let _ = task.ext_remove(TASKEXT_VM_SPACE);
+        let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
+        let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
+    }
+}
+
+static EXIT_HOOK: KernelExtExitHook = KernelExtExitHook;
 
 // ── VmSwitchOps ──────────────────────────────────────────────────────────────
 //
@@ -260,19 +273,22 @@ fn activate_task_vm(task: &Arc<Task>) {
 }
 
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
-    let me = sched::current_task();
-    activate_task_vm(&me);
-    let kstack_top = me
-        .kernel_stack_top()
-        .expect("[sched][clone] user child missing kernel stack");
-    hal::user_context::set_kernel_trap_stack(kstack_top);
+    let frame = {
+        let me = sched::current_task();
+        activate_task_vm(&me);
+        let kstack_top = me
+            .kernel_stack_top()
+            .expect("[sched][clone] user child missing kernel stack");
+        hal::user_context::set_kernel_trap_stack(kstack_top);
 
-    let payload = me
-        .ext_remove(TASKEXT_USER_TRAP_FRAME)
-        .expect("[sched][clone] user child missing saved trap frame");
-    let frame = payload
-        .downcast::<UserTrapFrame>()
-        .expect("[sched][clone] saved trap frame type mismatch");
+        let payload = me
+            .ext_remove(TASKEXT_USER_TRAP_FRAME)
+            .expect("[sched][clone] user child missing saved trap frame");
+        let frame = payload
+            .downcast::<UserTrapFrame>()
+            .expect("[sched][clone] saved trap frame type mismatch");
+        *frame
+    };
 
     unsafe { frame.resume() }
 }
@@ -570,17 +586,20 @@ pub fn boot_init() -> Arc<Task> {
     //    任何 fork/clone 都会落到无 hook 的"全共享"分支。
     sched::register_ext_clone_hook(&HOOK);
 
-    // 3. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
+    // 3. 注入 ext exit hook，让 wait/reap 能在 kernel 上下文释放 VM/FDT 等大对象。
+    sched::register_ext_exit_hook(&EXIT_HOOK);
+
+    // 4. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
     sched::register_process_image_ops(&PROCESS_IMAGE_OPS);
 
-    // 4. 注入 VmSwitchOps：schedule_once 切换前据此激活用户页表。注册点必须
+    // 5. 注入 VmSwitchOps：schedule_once 切换前据此激活用户页表。注册点必须
     //    在 sched::init 之前，这样即便 init 之外的 kthread 启动也会被回调。
     sched::arch_hooks::register_vm_switch(&VM_SWITCH_OPS);
 
-    // 5. 建 init。sched::init 内部会 assert arch_hooks 已注入。
+    // 6. 建 init。sched::init 内部会 assert arch_hooks 已注入。
     let init = sched::init();
 
-    // 6. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
+    // 7. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过
     //    （理论上不会）就跳过——调度 / 信号路径不依赖 ext，仅 VFS syscall 受影响。
     if let Some(parts) = BOOT_VFS_PARTS.lock().take() {
         let vfs_ctx = Arc::new(VfsContext::new(
@@ -605,11 +624,11 @@ pub fn boot_init() -> Arc<Task> {
         log::info!("[sched][boot] BOOT_VFS_PARTS empty — init has no vfs ext");
     }
 
-    // 7. 为 CPU 0 启动独立 idle 内核线程。`pick_next` 返 None 时 schedule_once
+    // 8. 为 CPU 0 启动独立 idle 内核线程。`pick_next` 返 None 时 schedule_once
     //    会回落到这个 idle，main() 后续显式让渡时也按它兜底。
     sched::spawn_idle_for(0);
 
-    // 8. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
+    // 9. 注册全套 syscall 实现（kernel::syscalls::register_all 把 fs/process/
     //    mm/signal 四类实现写进 general::syscall 的全局表）。
     crate::syscalls::register_all();
 

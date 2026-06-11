@@ -23,7 +23,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use errno::Errno;
 use sched::Task;
@@ -35,6 +35,25 @@ use crate::vfs::error::VfsResult;
 use crate::vfs::inode::Inode;
 use crate::vfs::stat::FileStat;
 use crate::vfs::sync::Spinlock;
+
+static FILE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static FILE_CREATED: AtomicUsize = AtomicUsize::new(0);
+static FILE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn file_diag() -> FileDiag {
+    FileDiag {
+        live: FILE_LIVE.load(Ordering::Acquire),
+        created: FILE_CREATED.load(Ordering::Acquire),
+        dropped: FILE_DROPPED.load(Ordering::Acquire),
+    }
+}
 
 // ── 打开选项（Open Options） ──────────────────────────────────────────────────
 
@@ -352,6 +371,8 @@ impl File {
         dentry: Arc<crate::vfs::dentry::Dentry>,
         mount: Arc<crate::vfs::mount::Mount>,
     ) -> Self {
+        FILE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FILE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             inode,
             flags,
@@ -649,6 +670,8 @@ impl Drop for File {
         // `flock(2)` 的锁属于打开文件描述；最后一个 Arc<File> 消失时自动释放，
         // 避免进程异常退出后留下无法唤醒的 advisory lock。
         crate::vfs::flock::unlock_file_ref(self);
+        FILE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        FILE_LIVE.fetch_sub(1, Ordering::Relaxed);
         self.ops.release();
         // 自动递减挂载引用计数，保证 is_busy() 正确反映活跃 fd 数量。
         self.mount.dec_open();

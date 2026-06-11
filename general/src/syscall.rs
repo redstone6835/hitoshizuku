@@ -75,12 +75,20 @@ pub struct SyscallContext<'a> {
     pub nr: usize,
     pub args: [usize; 6],
     pub tf: TrapFramePtr,
-    pub task: Arc<sched::Task>,
+    task: Option<Arc<sched::Task>>,
     frame_finalized: bool,
     _phantom: core::marker::PhantomData<&'a ()>,
 }
 
 impl SyscallContext<'_> {
+    pub fn task(&self) -> &Arc<sched::Task> {
+        self.task.as_ref().expect("[syscall] task already released")
+    }
+
+    pub fn release_task_ref(&mut self) {
+        self.task.take();
+    }
+
     /// 标记当前 syscall 已经完整重写 trap frame。dispatch 不再写 syscall
     /// 返回值、不推进 PC，也不在本次返回前投递 signal frame。
     pub fn finalize_frame(&mut self) {
@@ -148,7 +156,7 @@ pub fn dispatch(tf: TrapFramePtr) {
         nr,
         args,
         tf,
-        task,
+        task: Some(task),
         frame_finalized: false,
         _phantom: core::marker::PhantomData,
     };
@@ -176,14 +184,18 @@ pub fn dispatch(tf: TrapFramePtr) {
         let _ = sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(
             tf.as_usize(),
         ));
-        if matches!(
-            ctx.task.state(),
-            sched::TaskState::Stopped
-                | sched::TaskState::Continued
-                | sched::TaskState::Zombie
-                | sched::TaskState::Dead
-        ) {
-            sched::schedule_once(0);
+        match ctx.task().state() {
+            sched::TaskState::Zombie | sched::TaskState::Dead => {
+                // 当前任务已经终止，下面的调度切换不会回到这段内核栈。
+                // 先释放 syscall context 持有的 Arc，避免把 dead task 永久钉在旧栈上。
+                ctx.release_task_ref();
+                sched::schedule_once(0);
+                panic!("[syscall] terminal task scheduled back unexpectedly");
+            }
+            sched::TaskState::Stopped | sched::TaskState::Continued => {
+                sched::schedule_once(0);
+            }
+            _ => {}
         }
         sched::run_post_syscall_handoff(sched::now_ns_public());
     }

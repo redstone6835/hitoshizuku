@@ -13,8 +13,8 @@ use crate::eevdf::SchedParams;
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::group::ThreadGroup;
 use crate::scheduler::{
-    current_task, enqueue_task, init_task, mark_task_exited, now_ns_public, root_pid_ns,
-    schedule_once,
+    current_task, enqueue_task, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
+    root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -329,6 +329,9 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
     }
 
     mark_task_exited(task, code);
+    if !is_current_on_any_cpu(task) {
+        task.cleanup_exit_extensions();
+    }
 
     // 唤醒 vfork 父。
     if task.is_vforking() {
@@ -396,6 +399,10 @@ where
     zombie.thread_group().remove_member(&zombie);
     zombie.process_group().remove_member(&zombie);
 
+    // 进程已经不再运行；在父进程 wait 上下文释放 VM/FDT/VFS 等重量级资源。
+    // wait 状态和 procfs 需要的轻量字段仍保留在 Task 本体中。
+    zombie.cleanup_exit_extensions();
+
     debug_assert_eq!(zombie.state(), TaskState::Dead);
     log::debug!(
         "[sched][reap] parent_pid={:?} child_pid={:?} code={}",
@@ -453,6 +460,7 @@ pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc
 pub fn kthread_finish(code: ExitCode) -> ! {
     let me = current_task();
     exit_task(&me, code);
+    drop(me);
     schedule_once(0);
     panic!("[sched] kthread_finish: schedule_once returned unexpectedly");
 }

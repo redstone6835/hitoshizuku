@@ -117,13 +117,46 @@ pub fn run() {
         run_fs_meta("ext", sb);
     }
 
+    drop(fat_sb);
+    drop(ext_sb);
+    drop(raw_dev);
+    drop(fat_dev);
+    drop(ext_dev);
+    reclaim_allocator_caches_after_bench("full");
+
     log::info!("[bench] ================= TEST COMPLETE ====================");
 }
 
 pub fn run_allocator_only() {
     log::info!("[bench] ================= ALLOCATOR PERF TEST =================");
     run_allocator_bench();
+    reclaim_allocator_caches_after_bench("allocator-only");
     log::info!("[bench] ================= TEST COMPLETE ======================");
+}
+
+fn reclaim_allocator_caches_after_bench(tag: &str) {
+    let before = KERNEL_ALLOCATOR.layer_stats();
+    match KERNEL_ALLOCATOR.reclaim_caches() {
+        Ok(reclaim) => {
+            let after = KERNEL_ALLOCATOR.layer_stats();
+            log::info!(
+                "[bench][{}][reclaim-final] bytes={} kheap_ranges={} kheap_pages={} slab_flush={} slab_slabs={} cached_kb {}->{} slab_pages {}->{}",
+                tag,
+                reclaim.reclaimed_bytes(),
+                reclaim.kheap.released_ranges,
+                reclaim.kheap.released_pages,
+                reclaim.slab.flushed_cached_objects,
+                reclaim.slab.reclaimed_slabs,
+                before.kheap.cached_bytes / 1024,
+                after.kheap.cached_bytes / 1024,
+                before.slab.active_pages,
+                after.slab.active_pages,
+            );
+        }
+        Err(err) => {
+            log::warning!("[bench][{}][reclaim-final] failed: {:?}", tag, err);
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════

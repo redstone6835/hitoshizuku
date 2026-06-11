@@ -1219,8 +1219,8 @@ pub(super) fn sys_close_range(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let fdt = if (flags & CLOSE_RANGE_UNSHARE) != 0 {
         // Linux 语义要求先解除 CLONE_FILES 共享，再在新 fdtable 上执行 close/cloexec。
         let new_fdt = Arc::new(fdt.fork());
-        let _ = ctx.task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
-        ctx.task
+        let _ = ctx.task().ext_remove(sched::TASKEXT_VFS_FDTABLE);
+        ctx.task()
             .ext_install(sched::TASKEXT_VFS_FDTABLE, new_fdt.clone());
         new_fdt
     } else {
@@ -1866,16 +1866,16 @@ pub(super) fn sys_ioprio_set(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let who = ctx.args[1] as i32;
     let ioprio = validate_ioprio(ctx.args[2])?;
     if ioprio_class(ioprio) == IOPRIO_CLASS_RT
-        && !ctx.task.credentials().has_cap(Capability::SysAdmin)
+        && !ctx.task().credentials().has_cap(Capability::SysAdmin)
     {
         return Err(Errno::EPERM);
     }
-    let targets = ioprio_targets(which, who, &ctx.task)?;
+    let targets = ioprio_targets(which, who, ctx.task())?;
     if targets.is_empty() {
         return Err(Errno::ESRCH);
     }
     for task in targets {
-        if !task_may_access(&ctx.task, &task) {
+        if !task_may_access(ctx.task(), &task) {
             return Err(Errno::EPERM);
         }
         task.set_ioprio(ioprio);
@@ -1886,13 +1886,13 @@ pub(super) fn sys_ioprio_set(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
 pub(super) fn sys_ioprio_get(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let which = ctx.args[0];
     let who = ctx.args[1] as i32;
-    let targets = ioprio_targets(which, who, &ctx.task)?;
+    let targets = ioprio_targets(which, who, ctx.task())?;
     if targets.is_empty() {
         return Err(Errno::ESRCH);
     }
     let mut best = u16::MAX;
     for task in targets {
-        if !task_may_access(&ctx.task, &task) {
+        if !task_may_access(ctx.task(), &task) {
             return Err(Errno::EPERM);
         }
         best = best.min(task.ioprio());
@@ -2213,7 +2213,7 @@ pub(super) fn sys_pidfd_getfd(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let pid_file = fdt.get_file(pidfd).ok_or(Errno::EBADF)?;
     let target = pidfd::task_from_file(&pid_file).ok_or(Errno::EINVAL)?;
-    if !task_may_access(&ctx.task, &target) {
+    if !task_may_access(ctx.task(), &target) {
         return Err(Errno::EPERM);
     }
     let target_fdt = task_fdtable(&target).ok_or(Errno::EBADF)?;
@@ -2396,10 +2396,13 @@ fn wait_on_poll_sources(
 
     if !registered_waiter && !deadline_armed {
         restore_current_task_after_wait(&task);
+        drop(task);
         return sched::operation::sched_yield();
     }
 
+    drop(task);
     sched::schedule_once(sched::now_ns_public());
+    let task = sched::current_task();
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
@@ -2655,7 +2658,7 @@ fn synthetic_readlink_target(
     path: &str,
 ) -> Result<Option<String>, Errno> {
     match path {
-        "/proc/self/exe" | "/proc/thread-self/exe" => crate::sched::task_exec_path(&ctx.task)
+        "/proc/self/exe" | "/proc/thread-self/exe" => crate::sched::task_exec_path(ctx.task())
             .map(Some)
             .ok_or(Errno::ENOENT),
         "/proc/self/root" | "/proc/thread-self/root" => Ok(Some(String::from("/"))),
@@ -2714,7 +2717,7 @@ fn faccessat_common(ctx: &mut SyscallContext<'_>, has_flags: bool) -> Result<usi
 }
 
 fn access_mode_allowed(ctx: &SyscallContext<'_>, st: &FileStat, mode: usize, flags: usize) -> bool {
-    let creds = ctx.task.credentials();
+    let creds = ctx.task().credentials();
     let uid = if (flags & AT_EACCESS) != 0 {
         creds.euid.0
     } else {
@@ -3146,8 +3149,10 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
         return Err(Errno::EINTR);
     }
 
-    if registered || deadline_armed {
+    let task = if registered || deadline_armed {
+        drop(task);
         sched::schedule_once(sched::now_ns_public());
+        let task = sched::current_task();
         if registered {
             file.poll_remove_waiter(&task);
         }
@@ -3155,10 +3160,13 @@ fn wait_for_file_readiness(file: &vfs::file::File, interest: PollEvents) -> Resu
             sched::cancel_sleep_deadline(&task);
         }
         restore_current_task_after_wait(&task);
+        task
     } else {
         restore_current_task_after_wait(&task);
+        drop(task);
         sched::operation::sched_yield()?;
-    }
+        sched::current_task()
+    };
 
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);

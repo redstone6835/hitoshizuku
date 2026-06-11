@@ -61,6 +61,24 @@ static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentP
 static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, Weak<ResidentPage>>> =
     spin::Mutex::new(BTreeMap::new());
 static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
+static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
+static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VmSpaceDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn vm_space_diag() -> VmSpaceDiag {
+    VmSpaceDiag {
+        live: VM_SPACE_LIVE.load(Ordering::Acquire),
+        created: VM_SPACE_CREATED.load(Ordering::Acquire),
+        dropped: VM_SPACE_DROPPED.load(Ordering::Acquire),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SharedFilePageKey {
@@ -258,6 +276,8 @@ impl VmSpace {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let layout = vm_layout();
         let pgd = (ops.new_pgd_for_user)();
+        VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
+        VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             vmas: spin::Mutex::new(VmaSet::new()),
             pages: spin::Mutex::new(BTreeMap::new()),
@@ -905,6 +925,8 @@ impl VmSpace {
         Self::notify_files_mapped(cloned_file_backings);
 
         let mapped_pages = child_pages.len();
+        VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
+        VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             vmas: spin::Mutex::new(cloned_set),
             pages: spin::Mutex::new(child_pages),
@@ -1252,6 +1274,8 @@ impl VmSpace {
 
 impl Drop for VmSpace {
     fn drop(&mut self) {
+        VM_SPACE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        VM_SPACE_LIVE.fetch_sub(1, Ordering::Relaxed);
         let files = {
             let vmas = self.vmas.lock();
             Self::collect_file_backings(vmas.iter())
