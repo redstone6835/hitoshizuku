@@ -291,6 +291,15 @@ pub enum BuddyFreeError {
     CorruptTail,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuddyReleaseReservedError {
+    NotInitialized,
+    Unaligned,
+    InvalidAddress,
+    OverlapsTrackedBlock,
+    MetadataOutOfMemory,
+}
+
 #[derive(Clone, Copy)]
 struct BuddySegment {
     range: MemorySegment,
@@ -577,6 +586,50 @@ impl BuddyAllocator {
 
     pub fn release_bootmem(&mut self) {
         // 兼容壳：稀疏实现已经在 `init()` 内完成全部播种。
+    }
+
+    /// 将初始化时保留的整页物理区间重新移交给 buddy free list。
+    ///
+    /// reserved 页没有 allocation node，不能走 [`free_pages()`]。该接口只服务启动期
+    /// 生命周期收口，例如 boot allocator 结束后把未使用尾部回灌给正式物理页分配器。
+    pub fn release_reserved_range(
+        &mut self,
+        start: usize,
+        size: usize,
+    ) -> Result<usize, BuddyReleaseReservedError> {
+        if !self.initialized {
+            return Err(BuddyReleaseReservedError::NotInitialized);
+        }
+        if size == 0 {
+            return Ok(0);
+        }
+        if start % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
+            return Err(BuddyReleaseReservedError::Unaligned);
+        }
+        let Some(end) = start.checked_add(size) else {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        };
+        let Some((seg_idx, start_page)) = self.page_location(start) else {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        };
+        let Some((end_seg_idx, end_last_page)) = self.page_location(end - PAGE_SIZE) else {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        };
+        if seg_idx != end_seg_idx {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        }
+
+        let range_end_page = end_last_page + 1;
+        if self.any_tracked_block_overlaps(start, end) {
+            return Err(BuddyReleaseReservedError::OverlapsTrackedBlock);
+        }
+
+        self.seed_free_range(seg_idx, start_page, range_end_page)
+            .map_err(|_| BuddyReleaseReservedError::MetadataOutOfMemory)?;
+
+        let released_pages = size / PAGE_SIZE;
+        self.stats.reserved_pages = self.stats.reserved_pages.saturating_sub(released_pages);
+        Ok(released_pages)
     }
 
     pub fn alloc_pages(&mut self, order: usize) -> Option<usize> {
@@ -1929,6 +1982,38 @@ impl BuddyAllocator {
             }
         }
         None
+    }
+
+    fn any_tracked_block_overlaps(&self, start: usize, end: usize) -> bool {
+        let mut nonempty_seen = 0usize;
+        for bucket in 0..self.hash_bucket_count {
+            let mut node_addr = self.bucket_head(bucket);
+            if node_addr == 0 {
+                continue;
+            }
+            nonempty_seen += 1;
+
+            let mut visited = 0usize;
+            while node_addr != 0 {
+                if visited >= self.node_used {
+                    return true;
+                }
+                visited += 1;
+
+                let node = node_ref(node_addr);
+                let size = (1usize << (node.order as usize)).saturating_mul(PAGE_SIZE);
+                let node_end = node.start.saturating_add(size);
+                if node.start < end && start < node_end {
+                    return true;
+                }
+                node_addr = node.hash_next;
+            }
+
+            if nonempty_seen >= self.nonempty_hash_bucket_count {
+                break;
+            }
+        }
+        false
     }
 }
 

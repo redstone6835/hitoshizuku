@@ -527,6 +527,39 @@ impl KernelMemorySubsystem {
         if !self.registry.init(&self.boot) {
             return Err(InitError::MetadataOutOfMemory);
         }
+        if let Some(range) = self.boot.seal_and_take_free_tail(PAGE_SIZE) {
+            if let Some(virt_to_phys) = self.load_virt_to_phys() {
+                let paddr = virt_to_phys(range.start);
+                match self.phys.lock().release_reserved_range(paddr, range.size) {
+                    Ok(pages) => {
+                        log::info!(
+                            "[alloc][boot] released boot tail vaddr={:#x}..{:#x} paddr={:#x} pages={} bytes={}",
+                            range.start,
+                            range.end(),
+                            paddr,
+                            pages,
+                            pages * PAGE_SIZE
+                        );
+                    }
+                    Err(err) => {
+                        log::warning!(
+                            "[alloc][boot] failed to release boot tail vaddr={:#x}..{:#x} paddr={:#x} size={} err={:?}",
+                            range.start,
+                            range.end(),
+                            paddr,
+                            range.size,
+                            err
+                        );
+                    }
+                }
+            } else {
+                log::warning!(
+                    "[alloc][boot] failed to release boot tail vaddr={:#x}..{:#x}: missing virt_to_phys",
+                    range.start,
+                    range.end()
+                );
+            }
+        }
         self.active.store(true, Ordering::Release);
         Ok(())
     }
