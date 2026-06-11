@@ -1431,18 +1431,35 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
 
 fn alloc_zeroed_user_page() -> Option<usize> {
     let order = user_page_order()?;
-    let paddr = allocator::KERNEL_ALLOCATOR.buddy_alloc_pages(order)?;
+    let size = page_size();
+    // 用户物理页必须进入 allocator registry；否则 fork/munmap/drop 路径无法被
+    // allocator 审计发现泄漏或重复释放。
+    let allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_physical(allocator::PhysicalAllocRequest::new(
+            size,
+            allocator::PAGE_SIZE,
+        ))
+        .ok()?;
     let Some(virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
-        free_user_page(paddr);
+        let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
         return None;
     };
-    unsafe { core::ptr::write_bytes(virt(paddr) as *mut u8, 0, page_size()) };
-    Some(paddr)
+    if allocation.order != order || allocation.size != size {
+        let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
+        return None;
+    }
+    unsafe { core::ptr::write_bytes(virt(allocation.paddr) as *mut u8, 0, size) };
+    Some(allocation.paddr)
 }
 
 fn free_user_page(paddr: usize) {
-    let order = user_page_order().expect("[mm] invalid user page layout");
-    let _ = allocator::KERNEL_ALLOCATOR.buddy_free_pages(paddr, order);
+    if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_physical_addr(paddr) {
+        log::error!(
+            "[mm] failed to free tracked user page paddr={:#x}: {:?}",
+            paddr,
+            err
+        );
+    }
 }
 
 fn user_page_order() -> Option<usize> {
