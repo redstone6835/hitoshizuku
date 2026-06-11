@@ -366,6 +366,9 @@ impl NetStack {
         data: &[u8],
         remote: Option<Endpoint>,
     ) -> Result<usize, NetError> {
+        if let Some(remote) = remote {
+            self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
+        }
         let sent = {
             let table = self.interfaces.read();
             let iface_lock = table
@@ -2011,6 +2014,58 @@ mod tests {
     }
 
     #[test]
+    fn raw_send_rejects_wrong_route_before_enqueue() {
+        let stack = NetStack::new();
+        let first = attach_test_iface(
+            &stack,
+            "eth-raw-a",
+            IfConfig::static_v4(Ipv4Addr::new(10, 13, 0, 2), 24, None),
+        );
+        attach_test_iface(
+            &stack,
+            "eth-raw-b",
+            IfConfig::static_v4(Ipv4Addr::new(10, 14, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(first, 4, 253).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 14, 0, 77)),
+            port: 0,
+        };
+
+        assert_eq!(
+            stack.raw_send(handle, b"raw-route", Some(remote)),
+            Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn icmp_send_rejects_wrong_route_before_enqueue() {
+        let stack = NetStack::new();
+        let first = attach_test_iface(
+            &stack,
+            "eth-icmp-a",
+            IfConfig::static_v4(Ipv4Addr::new(10, 15, 0, 2), 24, None),
+        );
+        attach_test_iface(
+            &stack,
+            "eth-icmp-b",
+            IfConfig::static_v4(Ipv4Addr::new(10, 16, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(first).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 16, 0, 77)),
+            port: 0,
+        };
+
+        assert_eq!(
+            stack.raw_send(handle, b"icmp-route", Some(remote)),
+            Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
     fn udp_send_route_check_rejects_remote_without_route() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -2069,6 +2124,48 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert_eq!(stack.socket_state(handle), SocketState::Closed);
+    }
+
+    #[test]
+    fn raw_send_rejects_missing_route_before_enqueue() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-raw-none",
+            IfConfig::static_v4(Ipv4Addr::new(10, 17, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
+            port: 0,
+        };
+
+        assert_eq!(
+            stack.raw_send(handle, b"raw-route", Some(remote)),
+            Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn icmp_send_rejects_missing_route_before_enqueue() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-none",
+            IfConfig::static_v4(Ipv4Addr::new(10, 18, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99)),
+            port: 0,
+        };
+
+        assert_eq!(
+            stack.raw_send(handle, b"icmp-route", Some(remote)),
+            Err(NetError::Unreachable)
+        );
+        assert!(stack.raw_can_send(handle));
     }
 
     #[test]
