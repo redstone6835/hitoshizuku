@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::vfs::cred::Credentials;
 use crate::vfs::dentry::Dentry;
@@ -22,6 +23,7 @@ struct AnonFs {
 }
 
 static ANON_FS: Spinlock<Option<AnonFs>> = Spinlock::new(None);
+static NEXT_ANON_INO: AtomicU64 = AtomicU64::new(2);
 
 fn get_or_init_anon_fs() -> (Arc<Mount>, Arc<Inode>, Arc<Dentry>) {
     let mut guard = ANON_FS.lock();
@@ -153,6 +155,58 @@ pub fn new_file(
     file
 }
 
+/// 创建带有私有 inode 的匿名文件。
+///
+/// 纯事件对象可以共享 anonfs 根 inode；需要稳定 inode 身份、文件大小或私有 inode
+/// 操作的对象（例如 memfd）则通过这里分配独立 inode。这样对象身份属于 VFS 语义，
+/// 不需要泄漏到 syscall 兼容层里手工维护。
+pub fn new_private_file(
+    cred: Arc<Credentials>,
+    flags: OpenOptions,
+    kind: FileType,
+    mode: FileMode,
+    size: u64,
+    inode_ops: Arc<dyn InodeOps + Send + Sync>,
+    file_ops: Box<dyn FileOps + Send + Sync>,
+) -> Arc<File> {
+    let (mount, _root_inode, root_dentry) = get_or_init_anon_fs();
+    let ino = NEXT_ANON_INO.fetch_add(1, Ordering::Relaxed);
+    let inode = Inode::new(
+        InodeId {
+            fs_id: mount.superblock.fs_id,
+            ino,
+        },
+        kind,
+        DevId::new(0, 0),
+        mount.superblock.block_size,
+        mount.superblock.dev_id,
+        InodeMeta {
+            size,
+            nlink: 1,
+            mode,
+            uid: cred.uid,
+            gid: cred.gid,
+            atime: Timespec::ZERO,
+            mtime: Timespec::ZERO,
+            ctime: Timespec::ZERO,
+            blocks: size.div_ceil(512),
+        },
+        inode_ops,
+        Arc::downgrade(&mount.superblock),
+    );
+    let dentry = Dentry::new_positive("anon", Some(root_dentry), Arc::clone(&inode));
+    let file = Arc::new(File::new(
+        inode,
+        flags,
+        cred,
+        file_ops,
+        dentry,
+        Arc::clone(&mount),
+    ));
+    mount.inc_open();
+    file
+}
+
 pub fn create_fd(
     fdt: &FdTable,
     cred: Arc<Credentials>,
@@ -161,5 +215,21 @@ pub fn create_fd(
     ops: Box<dyn FileOps + Send + Sync>,
 ) -> VfsResult<Fd> {
     let file = new_file(cred, file_flags, ops);
+    fdt.alloc_fd(file, fd_flags)
+}
+
+/// 创建带有私有 inode 的匿名 fd。
+pub fn create_private_fd(
+    fdt: &FdTable,
+    cred: Arc<Credentials>,
+    file_flags: OpenOptions,
+    fd_flags: FdFlags,
+    kind: FileType,
+    mode: FileMode,
+    size: u64,
+    inode_ops: Arc<dyn InodeOps + Send + Sync>,
+    file_ops: Box<dyn FileOps + Send + Sync>,
+) -> VfsResult<Fd> {
+    let file = new_private_file(cred, file_flags, kind, mode, size, inode_ops, file_ops);
     fdt.alloc_fd(file, fd_flags)
 }

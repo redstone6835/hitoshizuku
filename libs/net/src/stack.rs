@@ -1243,33 +1243,40 @@ impl NetStack {
         // 先短持锁查找 pending 连接——检查完立即释放，再走
         // accept_in_place 路径（后者会自己重新加锁）。**绝不能**持锁跨调
         // accept_in_place，否则会触发 `Mutex` 的递归 deadlock。
-        let pending = {
+        let accept_state = {
             let table = self.interfaces.read();
             let iface_lock = table
                 .get(&handle.iface_id)
                 .ok_or(NetError::InterfaceNotFound)?;
             let managed = iface_lock.lock();
-            let target = if let Some(local) = local_hint {
-                endpoint_to_smoltcp_listen(&local)
-            } else if managed.has_socket(handle.inner) && !managed.is_socket_removed(handle.inner) {
-                managed.tcp_socket(handle.inner).listen_endpoint()
-            } else {
-                return Err(NetError::WouldBlock);
-            };
-            managed
+            if !managed.has_socket(handle.inner) || managed.is_socket_removed(handle.inner) {
+                return Err(NetError::Closed);
+            }
+            let socket = managed.tcp_socket(handle.inner);
+            let target = local_hint
+                .as_ref()
+                .map(endpoint_to_smoltcp_listen)
+                .unwrap_or_else(|| socket.listen_endpoint());
+            let pending = managed
                 .pending_tcp_accept(handle.inner, target)
                 .map(|inner| NetSocketHandle {
                     iface_id: handle.iface_id,
                     inner,
                     sock_type: SocketType::Tcp,
-                })
+                });
+            (pending, socket.state())
         };
+        let (pending, state) = accept_state;
         if let Some(pending) = pending {
             // smoltcp 把被命中的 listen socket 原地转成已连接；accept 时把
             // 这条连接交给用户，再另起一个 listener 顶替同一端点。
             return self.accept_in_place_connection(pending);
         }
-        Err(NetError::WouldBlock)
+        if state == smoltcp::socket::tcp::State::Listen {
+            Err(NetError::WouldBlock)
+        } else {
+            Err(NetError::InvalidArgument)
+        }
     }
 
     /// 检查指定监听 fd 是否已有待 accept 的 TCP 连接。

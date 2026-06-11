@@ -30,6 +30,10 @@ const MCL_ONFAULT: usize = 4;
 const MCL_SUPPORTED: usize = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
 const MLOCK_ONFAULT: usize = 1;
 
+const MREMAP_MAYMOVE: usize = 1;
+const MREMAP_FIXED: usize = 2;
+const MREMAP_DONTUNMAP: usize = 4;
+
 pub(super) fn sys_brk(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let Some(vm) = task_vm(ctx) else {
         return Err(Errno::ENOMEM);
@@ -155,8 +159,43 @@ pub(super) fn sys_madvise(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(0)
 }
 
-pub(super) fn sys_mremap(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_mremap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let old_addr = ctx.args[0];
+    let old_size = ctx.args[1];
+    let new_size = ctx.args[2];
+    let flags = ctx.args[3];
+    let new_addr = ctx.args[4];
+    let page_size = hal::memory::page_size();
+    if old_addr % page_size != 0 || old_size == 0 || new_size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MREMAP_DONTUNMAP) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if (flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MREMAP_FIXED) != 0 && new_addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let old_len = align_up(old_size, page_size).ok_or(Errno::EINVAL)?;
+    let new_len = align_up(new_size, page_size).ok_or(Errno::EINVAL)?;
+    let old_end = old_addr.checked_add(old_len).ok_or(Errno::EINVAL)?;
+    let fixed = if (flags & MREMAP_FIXED) != 0 {
+        Some(new_addr)
+    } else {
+        None
+    };
+    vm.mremap(
+        old_addr..old_end,
+        new_len,
+        (flags & MREMAP_MAYMOVE) != 0,
+        fixed,
+    )
 }
 
 pub(super) fn sys_swapon(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

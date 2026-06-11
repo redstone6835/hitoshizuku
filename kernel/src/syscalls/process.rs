@@ -5,12 +5,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use errno::Errno;
 use general::firmware::power;
-use general::mm::{VmFutexKey, VmSpace, copy_from_user, copy_to_user};
+use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::ids::{Capability, Gid, Uid};
+use sched::ids::{CapSet, Capability, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
 use sched::task::{Task, TaskState};
@@ -34,6 +34,7 @@ const LINUX_REBOOT_CMD_SW_SUSPEND: u32 = 0xd000_fce2;
 const LINUX_REBOOT_CMD_KEXEC: u32 = 0x4558_4543;
 const UTS_FIELD_LEN: usize = 65;
 const UTS_NAME_MAX: usize = UTS_FIELD_LEN - 1;
+const EXEC_PATH_MAX: usize = 4096;
 
 static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
@@ -75,6 +76,7 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     );
     exit_robust_list(&ctx.task);
     clear_child_tid_and_wake(&ctx.task);
+    release_exit_files(&ctx.task);
     sched::operation::exit(code);
 }
 
@@ -88,8 +90,16 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     for task in ctx.task.thread_group().snapshot() {
         exit_robust_list(&task);
         clear_child_tid_and_wake(&task);
+        release_exit_files(&task);
     }
     sched::operation::exit_group(code);
+}
+
+fn release_exit_files(task: &Arc<Task>) {
+    // A zombie must not keep pipe/socket/file endpoints alive until its parent
+    // reaps it.  Shell pipelines rely on writer fd release at process exit to
+    // deliver EOF to readers such as wc or command substitution.
+    let _ = task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
 }
 
 pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -175,7 +185,7 @@ fn install_clone_pidfd(args: CloneArgs, child: Arc<Task>) -> Result<(), Errno> {
     let cred = vfs::current_vfs_context()
         .map(|ctx| Arc::clone(&ctx.cred))
         .ok_or(Errno::ENOSYS)?;
-    let fd = pidfd::create(&fdt, cred, child)?;
+    let fd = pidfd::create(&fdt, cred, child, false)?;
     if let Err(err) = copy_to_user(args.pidfd, &(fd.as_raw() as i32).to_le_bytes()) {
         let _ = fdt.close_fd(fd);
         return Err(err.as_errno());
@@ -325,7 +335,30 @@ pub(super) fn sys_waitid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         P_PIDFD => {
             let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
             let file = fdt.get_file(Fd::from_raw(id as u32)).ok_or(Errno::EBADF)?;
+            let nonblock_pidfd = file.flags().nonblock;
             let task = pidfd::task_from_file(&file).ok_or(Errno::EINVAL)?;
+            if nonblock_pidfd && !options.has(WaitOptions::WNOHANG) {
+                let probe_options = WaitOptions::from_raw(options.raw() | WaitOptions::WNOHANG);
+                let probe =
+                    sched::operation::waitid(WaitId::Pidfd(Arc::clone(&task)), probe_options)?;
+                if probe.pid == 0 {
+                    return Err(Errno::EAGAIN);
+                }
+                if infop != 0 {
+                    let mut raw = [0u8; 128];
+                    write_i32(&mut raw, 0, SignalNumber::SIGCHLD.raw() as i32);
+                    write_i32(&mut raw, 4, 0);
+                    write_i32(&mut raw, 8, waitid_code(probe.status));
+                    write_i32(&mut raw, 16, probe.pid);
+                    write_u32(&mut raw, 20, ctx.task.credentials().uid.0);
+                    write_i32(&mut raw, 24, waitid_status(probe.status));
+                    copy_to_user(infop, &raw).map_err(|e| e.as_errno())?;
+                }
+                if rusage != 0 {
+                    write_rusage(rusage, probe.usage)?;
+                }
+                return Ok(0);
+            }
             WaitId::Pidfd(task)
         }
         _ => return Err(Errno::EINVAL),
@@ -997,7 +1030,11 @@ fn priority_targets(
             } else {
                 who as i32
             };
-            out.extend(tasks.into_iter().filter(|task| task.pid_root() == Some(pid)));
+            out.extend(
+                tasks
+                    .into_iter()
+                    .filter(|task| task.pid_root() == Some(pid)),
+            );
         }
         PRIO_PGRP => {
             let pgid = if who == 0 {
@@ -1433,27 +1470,97 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_capget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let hdrp = ctx.args[0];
     let datap = ctx.args[1];
-    if hdrp != 0 {
-        let mut hdr = [0u8; 16];
-        copy_from_user(hdrp, &mut hdr).map_err(|e| e.as_errno())?;
-        hdr[0..4].copy_from_slice(&0x20080522u32.to_le_bytes());
-        hdr[4..8].copy_from_slice(&0u32.to_le_bytes());
-        copy_to_user(hdrp, &hdr).map_err(|e| e.as_errno())?;
+    let (version, pid) = read_cap_header(hdrp)?;
+    let words = cap_version_words(version)?;
+    if pid != 0 && Some(pid) != ctx.task.pid_root() {
+        return Err(Errno::ESRCH);
     }
     if datap != 0 {
-        let data = [0u64; 2];
-        let bytes = unsafe {
-            core::slice::from_raw_parts(data.as_ptr() as *const u8, core::mem::size_of_val(&data))
-        };
-        copy_to_user(datap, bytes).map_err(|e| e.as_errno())?;
+        write_cap_data(datap, words, ctx.task.credentials().caps)?;
     }
     Ok(0)
 }
 
 pub(super) fn sys_capset(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _hdrp = ctx.args[0];
-    let _datap = ctx.args[1];
+    let hdrp = ctx.args[0];
+    let datap = ctx.args[1];
+    if datap == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let (version, pid) = read_cap_header(hdrp)?;
+    let words = cap_version_words(version)?;
+    if pid != 0 && Some(pid) != ctx.task.pid_root() {
+        return Err(Errno::EPERM);
+    }
+    let requested = read_cap_data(datap, words)?;
+    let current = ctx.task.credentials();
+    let added = requested.raw() & !current.caps.raw();
+    if added != 0 && !current.has_cap(Capability::Setpcap) {
+        return Err(Errno::EPERM);
+    }
+    let mut new = (*current).clone();
+    new.caps = requested;
+    ctx.task.set_credentials(Arc::new(new));
     Ok(0)
+}
+
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+fn read_cap_header(user: usize) -> Result<(u32, i32), Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 8];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let version = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+    let pid = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+    if cap_version_words(version).is_err() {
+        raw[0..4].copy_from_slice(&LINUX_CAPABILITY_VERSION_3.to_le_bytes());
+        raw[4..8].copy_from_slice(&0i32.to_le_bytes());
+        let _ = copy_to_user(user, &raw);
+        return Err(Errno::EINVAL);
+    }
+    Ok((version, pid))
+}
+
+fn cap_version_words(version: u32) -> Result<usize, Errno> {
+    match version {
+        LINUX_CAPABILITY_VERSION_1 => Ok(1),
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => Ok(2),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn write_cap_data(user: usize, words: usize, caps: CapSet) -> Result<(), Errno> {
+    let mut raw = [0u8; 24];
+    for i in 0..words {
+        let shift = i * 32;
+        let value = ((caps.raw() >> shift) & u32::MAX as u64) as u32;
+        let off = i * 12;
+        raw[off..off + 4].copy_from_slice(&value.to_le_bytes());
+        raw[off + 4..off + 8].copy_from_slice(&value.to_le_bytes());
+        raw[off + 8..off + 12].copy_from_slice(&0u32.to_le_bytes());
+    }
+    copy_to_user(user, &raw[..words * 12]).map_err(|e| e.as_errno())
+}
+
+fn read_cap_data(user: usize, words: usize) -> Result<CapSet, Errno> {
+    let mut raw = [0u8; 24];
+    copy_from_user(user, &mut raw[..words * 12]).map_err(|e| e.as_errno())?;
+    let mut effective = 0u64;
+    let mut permitted = 0u64;
+    for i in 0..words {
+        let off = i * 12;
+        let eff = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap()) as u64;
+        let prm = u32::from_le_bytes(raw[off + 4..off + 8].try_into().unwrap()) as u64;
+        effective |= eff << (i * 32);
+        permitted |= prm << (i * 32);
+    }
+    // 当前调度层只维护一个 capability 位集。用 effective ∩ permitted 作为生效集，
+    // 既保留 Linux “permitted 是上限”的安全语义，也避免引入半套未使用的状态。
+    Ok(CapSet::from_raw(effective & permitted))
 }
 
 pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2214,10 +2321,31 @@ pub(super) fn sys_futex_wait(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     )
 }
 
-pub(super) fn sys_futex_requeue(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    // TODO(threading): futex2 requeue should share the same future keyed wait
-    // queue backend as futex_waitv/futex_wake.
-    Err(Errno::EOPNOTSUPP)
+pub(super) fn sys_futex_requeue(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const FUTEX_WAITV_ENTRY_SIZE: usize = 24;
+
+    let waiters = ctx.args[0];
+    let flags = ctx.args[1];
+    let nr_wake = ctx.args[2] as isize;
+    let nr_requeue = ctx.args[3] as isize;
+    if waiters == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if flags != 0 || nr_wake < 0 || nr_requeue < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let src = read_futex_waitv_entry(waiters, 0)?;
+    let dst = read_futex_waitv_entry(waiters + FUTEX_WAITV_ENTRY_SIZE, 1)?;
+    if read_user_u32(src.uaddr)? != src.expected {
+        return Err(Errno::EAGAIN);
+    }
+    Ok(futex_requeue_key(
+        src.key,
+        dst.key,
+        nr_wake as usize,
+        nr_requeue as usize,
+        FUTEX_BITSET_MATCH_ANY,
+    ))
 }
 
 pub(super) fn sys_unshare(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2385,8 +2513,66 @@ pub(super) fn sys_bpf(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
-pub(super) fn sys_execveat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_execveat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const AT_FDCWD: i32 = -100;
+    const AT_SYMLINK_NOFOLLOW: usize = 0x100;
+    const AT_EMPTY_PATH: usize = 0x1000;
+
+    let dirfd_raw = ctx.args[0];
+    let path_user = ctx.args[1];
+    let argv_user = ctx.args[2];
+    let envp_user = ctx.args[3];
+    let flags = ctx.args[4];
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let vfs_ctx = vfs::current_vfs_context().ok_or(Errno::EBADF)?;
+    let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let path = copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?;
+
+    let exec_path = if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        if dirfd_raw as i32 == AT_FDCWD {
+            vfs::namespace_path(&vfs_ctx, &vfs_ctx.cwd(), &vfs_ctx.cwd_mount())
+                .ok_or(Errno::ENOENT)?
+        } else {
+            let fd = Fd::from_raw(dirfd_raw as u32);
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            vfs::namespace_path(&vfs_ctx, file.dentry(), file.mount()).ok_or(Errno::ENOENT)?
+        }
+    } else {
+        let dirfd = if dirfd_raw as i32 == AT_FDCWD {
+            vfs::path::Dirfd::Cwd
+        } else {
+            let file = fdt
+                .get_file(Fd::from_raw(dirfd_raw as u32))
+                .ok_or(Errno::EBADF)?;
+            vfs::path::Dirfd::Fd(file)
+        };
+        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            vfs::path::LookupFlags::NO_FOLLOW
+        } else {
+            vfs::path::LookupFlags::default()
+        };
+        let result =
+            vfs::path::lookup(&vfs_ctx, &dirfd, &path, lookup_flags).map_err(|e| e.to_errno())?;
+        if (flags & AT_SYMLINK_NOFOLLOW) != 0
+            && result
+                .dentry
+                .inode()
+                .is_some_and(|inode| inode.kind() == vfs::stat::FileType::Symlink)
+        {
+            return Err(Errno::ELOOP);
+        }
+        vfs::namespace_path(&vfs_ctx, &result.dentry, &result.mount).ok_or(Errno::ENOENT)?
+    };
+
+    let request = ExecRequest::from_kernel_path(exec_path, argv_user, envp_user);
+    sched::operation::execve_with_context(request, UserContextRef::new(ctx.tf.as_usize()))?;
+    ctx.finalize_frame();
+    Ok(0)
 }
 
 pub(super) fn sys_kexec_file_load(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -2424,10 +2610,11 @@ pub(super) fn sys_timer_settime64(_ctx: &mut SyscallContext<'_>) -> Result<usize
 pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let flags = ctx.args[1];
+    const PIDFD_NONBLOCK: usize = 0o00004000;
     if pid <= 0 {
         return Err(Errno::EINVAL);
     }
-    if flags != 0 {
+    if (flags & !PIDFD_NONBLOCK) != 0 {
         return Err(Errno::EINVAL);
     }
     let task = lookup_task_for_thread_syscall(pid, &ctx.task)?;
@@ -2436,7 +2623,7 @@ pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     let cred = vfs::current_vfs_context()
         .map(|ctx| Arc::clone(&ctx.cred))
         .ok_or(Errno::ENOSYS)?;
-    let fd = pidfd::create(&fdt, cred, task)?;
+    let fd = pidfd::create(&fdt, cred, task, (flags & PIDFD_NONBLOCK) != 0)?;
     Ok(fd.as_raw() as usize)
 }
 
@@ -2554,9 +2741,7 @@ const FUTEX2_SIZE_MASK: u32 = 0x03;
 const FUTEX2_SUPPORTED_FLAGS: u32 = FUTEX2_SIZE_U32 | FUTEX_PRIVATE_FLAG;
 
 fn futex2_private(flags: u32) -> Result<bool, Errno> {
-    if (flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32
-        || (flags & !FUTEX2_SUPPORTED_FLAGS) != 0
-    {
+    if (flags & FUTEX2_SIZE_MASK) != FUTEX2_SIZE_U32 || (flags & !FUTEX2_SUPPORTED_FLAGS) != 0 {
         return Err(Errno::EINVAL);
     }
     Ok((flags & FUTEX_PRIVATE_FLAG) != 0)
@@ -2588,11 +2773,7 @@ fn read_futex_waitv_entry(user: usize, index: usize) -> Result<FutexWaitvEntry, 
     })
 }
 
-fn futex_waitv_contains(
-    bucket: &FutexBucket,
-    task: &Arc<Task>,
-    waitv_index: usize,
-) -> bool {
+fn futex_waitv_contains(bucket: &FutexBucket, task: &Arc<Task>, waitv_index: usize) -> bool {
     bucket
         .waiters
         .iter()

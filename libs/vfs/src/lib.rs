@@ -9,8 +9,8 @@ extern crate alloc;
 
 pub use alloc::sync::Arc;
 
-pub mod anon;
 pub mod addr;
+pub mod anon;
 pub mod cred;
 pub mod dentry;
 pub mod epoll;
@@ -18,18 +18,22 @@ pub mod error;
 pub mod eventfd;
 pub mod fdtable;
 pub mod file;
+pub mod flock;
 pub mod inode;
 pub mod limits;
+pub mod memfd;
 pub mod mount;
 pub mod net_socket;
 pub mod netlink_socket;
 pub mod operation;
 pub mod path;
 pub mod pipe;
+pub mod signalfd;
 pub mod socket;
 pub mod stat;
 pub mod superblock;
 pub mod sync;
+pub mod timerfd;
 
 use cred::Credentials;
 use dentry::{Dentry, DentryCache, VfsRoot};
@@ -48,6 +52,7 @@ mod vfs {
     pub use crate::error::VfsResult;
     pub use crate::fdtable;
     pub use crate::file;
+    pub use crate::flock;
     pub use crate::inode;
     pub use crate::limits;
     pub use crate::mount;

@@ -646,6 +646,9 @@ impl Drop for File {
     /// 这保证了无论通过何种路径（正常 `close`、进程退出、`execve` 的 CLOEXEC）
     /// 关闭描述符，驱动的清理逻辑都会被调用且只调用一次（Arc 的唯一性保证）。
     fn drop(&mut self) {
+        // `flock(2)` 的锁属于打开文件描述；最后一个 Arc<File> 消失时自动释放，
+        // 避免进程异常退出后留下无法唤醒的 advisory lock。
+        crate::vfs::flock::unlock_file_ref(self);
         self.ops.release();
         // 自动递减挂载引用计数，保证 is_busy() 正确反映活跃 fd 数量。
         self.mount.dec_open();

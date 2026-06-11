@@ -23,7 +23,7 @@ use general::vfs::{
 use hal::user_context::UserTrapFrame;
 use sched::arch_hooks::VmSwitchOps;
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::process_ops::{ExecRequest, ProcessImageOps, UserContextRef};
+use sched::process_ops::{ExecPath, ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
 use sched::task::{TaskExtCloneHook, TaskExtKey};
@@ -287,7 +287,12 @@ fn process_execve(
     }
 
     let old_vm = task_vm_space(task);
-    let path = copy_cstr_from_user(request.path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?;
+    let path = match request.path {
+        ExecPath::User(path_user) => {
+            copy_cstr_from_user(path_user, EXEC_PATH_MAX).map_err(|e| e.as_errno())?
+        }
+        ExecPath::Kernel(path) => path,
+    };
     let mut used = path.len().checked_add(1).ok_or(Errno::EINVAL)?;
     let argv = collect_user_string_array(request.argv_user, &mut used)?;
     let envp = collect_user_string_array(request.envp_user, &mut used)?;

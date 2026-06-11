@@ -33,6 +33,29 @@ fn page_base(addr: usize) -> usize {
     addr & !(page_size - 1)
 }
 
+fn ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+fn covered_len(areas: &[VmArea], range: &Range<usize>) -> usize {
+    let mut cursor = range.start;
+    let mut total = 0usize;
+    for area in areas {
+        if area.range.start > cursor {
+            break;
+        }
+        let end = area.range.end.min(range.end);
+        if end > cursor {
+            total += end - cursor;
+            cursor = end;
+        }
+        if cursor >= range.end {
+            break;
+        }
+    }
+    total
+}
+
 static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentPage>>> =
     spin::Mutex::new(BTreeMap::new());
 static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, Weak<ResidentPage>>> =
@@ -616,6 +639,118 @@ impl VmSpace {
         Ok(())
     }
 
+    /// 调整一段既有映射的大小或位置。
+    ///
+    /// 这是 `mremap(2)` 的核心实现：VMA 元数据迁移与页表迁移在这里保持一致。
+    /// 不支持 `DONTUNMAP` 的双映射语义，因为那需要额外的 resident page 所有权
+    /// 标记；普通 shrink / in-place grow / move / fixed move 都在此闭环。
+    pub fn mremap(
+        &self,
+        old_range: Range<usize>,
+        new_len: usize,
+        may_move: bool,
+        fixed_addr: Option<usize>,
+    ) -> Result<usize, Errno> {
+        self.validate_range(&old_range)?;
+        let page_size = page_size();
+        if new_len == 0 || new_len % page_size != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let old_len = old_range.end - old_range.start;
+        if new_len <= old_len {
+            if new_len < old_len {
+                self.unmap(old_range.start + new_len..old_range.end)?;
+            }
+            return Ok(old_range.start);
+        }
+
+        let in_place_end = old_range.start.checked_add(new_len).ok_or(Errno::EINVAL)?;
+        let in_place_tail = old_range.end..in_place_end;
+        if fixed_addr == Some(old_range.start) {
+            return if self.extend_mapping_in_place(&old_range, &in_place_tail)? {
+                Ok(old_range.start)
+            } else {
+                Err(Errno::ENOMEM)
+            };
+        }
+        if fixed_addr.is_none() && self.extend_mapping_in_place(&old_range, &in_place_tail)? {
+            return Ok(old_range.start);
+        }
+        if !may_move && fixed_addr.is_none() {
+            return Err(Errno::ENOMEM);
+        }
+
+        let new_start = if let Some(addr) = fixed_addr {
+            addr
+        } else {
+            self.alloc_mmap_range(new_len)?.start
+        };
+        let new_end = new_start.checked_add(new_len).ok_or(Errno::EINVAL)?;
+        let new_range = new_start..new_end;
+        self.validate_range(&new_range)?;
+        if ranges_overlap(&old_range, &new_range) && new_range.start != old_range.start {
+            return Err(Errno::EINVAL);
+        }
+
+        let (removed_target, mapped_tail) = {
+            let mut vmas = self.vmas.lock();
+            if !vmas.contains_range(&old_range) {
+                return Err(Errno::ENOMEM);
+            }
+            let removed_target = if fixed_addr.is_some() {
+                vmas.unmap_range(&new_range)
+            } else {
+                if !vmas.is_range_free(&new_range) {
+                    return Err(Errno::EEXIST);
+                }
+                Vec::new()
+            };
+            let old_pieces = vmas.unmap_range(&old_range);
+            let old_covered = covered_len(&old_pieces, &old_range);
+            if old_covered != old_len {
+                return Err(Errno::ENOMEM);
+            }
+
+            let mut cursor = new_range.start;
+            let mut last_inserted = None;
+            for mut area in old_pieces {
+                let len = area.range.end - area.range.start;
+                area.range = cursor..cursor + len;
+                cursor += len;
+                last_inserted = Some(area.clone());
+                vmas.insert(area)?;
+            }
+
+            let mapped_tail = if cursor < new_range.end {
+                let last = last_inserted.ok_or(Errno::ENOMEM)?;
+                let last_len = last.range.end - last.range.start;
+                let backing = last.backing.checked_shift(last_len).ok_or(Errno::EINVAL)?;
+                let tail = VmArea {
+                    range: cursor..new_range.end,
+                    flags: last.flags,
+                    backing,
+                };
+                let files = Self::collect_file_backings(core::iter::once(&tail));
+                vmas.insert(tail)?;
+                files
+            } else {
+                Vec::new()
+            };
+            (removed_target, mapped_tail)
+        };
+        Self::notify_file_unmapped(&removed_target);
+        Self::notify_files_mapped(mapped_tail);
+
+        let removed_pages = self.remove_page_mappings(new_range.clone());
+        for (va, _mapping) in &removed_pages {
+            self.unmap_page(*va)?;
+        }
+        drop(removed_pages);
+        self.move_page_mappings(old_range.start, new_range.start, old_len)?;
+        self.mmap_next.store(new_range.end, Ordering::Release);
+        Ok(new_range.start)
+    }
+
     /// 修改权限。要求整个 range 已被 VMA 连续覆盖。
     pub fn mprotect(&self, range: Range<usize>, new_flags: VmFlags) -> Result<(), Errno> {
         self.validate_range(&range)?;
@@ -1027,6 +1162,62 @@ impl VmSpace {
         }
         self.mapped_pages.store(pages.len(), Ordering::Release);
         removed
+    }
+
+    fn move_page_mappings(
+        &self,
+        old_start: usize,
+        new_start: usize,
+        len: usize,
+    ) -> Result<(), Errno> {
+        let old_range = old_start..old_start + len;
+        let moved = self.remove_page_mappings(old_range);
+        let set = self.vmas.lock();
+        let mut pages = self.pages.lock();
+        for (old_va, mapping) in moved {
+            self.unmap_page(old_va)?;
+            let new_va = new_start + (old_va - old_start);
+            let area = set.find(new_va).ok_or(Errno::ENOMEM)?;
+            self.map_page(new_va, mapping.page.paddr(), pte_flags_for(area.flags, mapping.access))?;
+            pages.insert(new_va, mapping);
+        }
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        Ok(())
+    }
+
+    fn extend_mapping_in_place(
+        &self,
+        old_range: &Range<usize>,
+        tail_range: &Range<usize>,
+    ) -> Result<bool, Errno> {
+        if tail_range.start >= tail_range.end {
+            return Ok(true);
+        }
+        let mapped_tail = {
+            let mut vmas = self.vmas.lock();
+            if !vmas.contains_range(old_range) {
+                return Err(Errno::ENOMEM);
+            }
+            if !vmas.is_range_free(tail_range) {
+                return Ok(false);
+            }
+            let last = vmas
+                .find(old_range.end - page_size())
+                .cloned()
+                .ok_or(Errno::ENOMEM)?;
+            let shift = last.range.end - last.range.start;
+            let backing = last.backing.checked_shift(shift).ok_or(Errno::EINVAL)?;
+            let tail = VmArea {
+                range: tail_range.clone(),
+                flags: last.flags,
+                backing,
+            };
+            let files = Self::collect_file_backings(core::iter::once(&tail));
+            vmas.insert(tail)?;
+            files
+        };
+        Self::notify_files_mapped(mapped_tail);
+        Ok(true)
     }
 
     /// 收集 VMA 上的 file backing，生命周期 hook 统一在锁外调用。
