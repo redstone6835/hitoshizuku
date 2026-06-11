@@ -167,7 +167,7 @@ impl MemoryRequest {
             align,
             page_policy: PagePolicy::BaseOnly,
             placement: MemoryPlacement::Any,
-            reclaim: ReclaimPolicy::TryManagedGc,
+            reclaim: ReclaimPolicy::TryAllocatorReclaim,
             zeroing: Zeroing::Uninitialized,
             managed: ManagedAllocFlags::new(),
         }

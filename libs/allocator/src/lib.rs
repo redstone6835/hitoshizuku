@@ -1029,13 +1029,30 @@ impl KernelMemorySubsystem {
         }
 
         let mut allocation = self.allocate_active_once(request);
-        if allocation.is_err()
-            && !matches!(request.reclaim, ReclaimPolicy::NoReclaim)
-            && self.managed.is_enabled()
-        {
-            let pressure = self.pressure_level();
-            self.managed.collect_on_pressure(pressure);
-            allocation = self.allocate_active_once(request);
+        if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
+            match request.reclaim {
+                ReclaimPolicy::NoReclaim => {}
+                ReclaimPolicy::TryManagedGc => {
+                    if self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                        allocation = self.allocate_active_once(request);
+                    }
+                }
+                ReclaimPolicy::TryAllocatorReclaim => {
+                    let reclaimed = self.reclaim_allocator_caches_for_retry();
+                    if reclaimed.reclaimed_bytes() != 0 && self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                    }
+                    allocation = self.allocate_active_once(request);
+                    if allocation.is_err() && self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                        allocation = self.allocate_active_once(request);
+                    }
+                }
+            }
         }
         match allocation {
             Ok(record) => Ok(record),
@@ -1306,7 +1323,9 @@ impl KernelMemorySubsystem {
     }
 
     fn alloc_active(&self, layout: Layout, zeroing: Zeroing) -> *mut u8 {
-        let request = MemoryRequest::for_kernel_layout(layout).with_zeroing(zeroing);
+        let request = MemoryRequest::for_kernel_layout(layout)
+            .with_zeroing(zeroing)
+            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim);
         match self.allocate(request) {
             Ok(record) => record.ptr as *mut u8,
             Err(_) => null_mut(),
@@ -1371,7 +1390,7 @@ impl KernelMemorySubsystem {
                         let allocation =
                             self.slab.alloc_class(zone_idx, cpu, &self.phys, &self.vmem);
                         if allocation.is_null() {
-                            return alloc_large();
+                            return Err(AllocationError::OutOfMemory);
                         }
                         if matches!(request.zeroing, Zeroing::Zeroed) {
                             unsafe {
@@ -1539,6 +1558,15 @@ impl KernelMemorySubsystem {
     fn allocate_internal_metadata(&self, layout: Layout) -> *mut u8 {
         self.metadata
             .alloc(layout, &self.phys, self.load_phys_to_virt())
+    }
+
+    fn reclaim_allocator_caches_for_retry(&self) -> AllocatorReclaimStats {
+        // 分配失败后的重试路径必须先归还 allocator 自己持有的可回收内存：
+        // kheap range cache、slab per-CPU cache/空 slab、buddy order-0 延迟合并页。
+        // 这不是周期性整理，而是 OOM 前的最后防线，避免大规模短生命周期任务结束后
+        // 大量页仍停在内部缓存里，后续请求却继续向 buddy 要新页。
+        self.reclaim(AllocatorReclaimRequest::caches())
+            .unwrap_or_default()
     }
 
     pub fn load_phys_to_virt(&self) -> Option<PhysToVirtFn> {
