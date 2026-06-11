@@ -10,14 +10,187 @@
 //! 这个模块负责把分散的统计数据组织成较高层的视图，使内核日志和自检代码能够用
 //! 一套统一格式描述当前内存状态。
 use crate::boot::BootStats;
-use crate::buddy::{BuddyStats, PAGE_SIZE};
+use crate::buddy::{BuddyAudit, BuddyReclaimStats, BuddyStats, PAGE_SIZE};
 use crate::gc::{GcCollectionKind, GcPhase};
-use crate::kheap::KernelHeapStats;
-use crate::managed::ManagedStats;
+use crate::kheap::{KernelHeapAudit, KernelHeapReclaimStats, KernelHeapStats};
+use crate::managed::{ManagedAudit, ManagedStats};
 use crate::metadata::MetadataStats;
 use crate::registry::{AllocationRegistryAudit, AllocationRegistryStats};
-use crate::slab::SlabStats;
+use crate::slab::{SlabAudit, SlabReclaimStats, SlabStats};
 use crate::space::AddressSpaceStats;
+
+pub const ALLOCATOR_API_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorCapabilities {
+    pub api_version: u32,
+    pub flags: AllocatorCapabilityFlags,
+    pub max_small_size: usize,
+    pub max_cpus: usize,
+    pub page_size: usize,
+    pub default_managed_heap_order: usize,
+    pub large_managed_heap_order: usize,
+    pub managed_enabled: bool,
+}
+
+impl AllocatorCapabilities {
+    pub const fn supports(self, flag: AllocatorCapabilityFlags) -> bool {
+        self.flags.contains(flag)
+    }
+}
+
+/// allocator 对外能力集合。
+///
+/// 这个位图面向未来 LKM/外部子系统：调用方可以先读取 capability，再决定是否使用
+/// typed physical API、完整结构审计、cache reclaim 或 managed GC 接口，避免靠内核版本号
+/// 和日志字符串做脆弱判断。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorCapabilityFlags(u64);
+
+impl AllocatorCapabilityFlags {
+    pub const TYPED_MEMORY_REQUEST: Self = Self(1 << 0);
+    pub const TRACKED_PHYSICAL_API: Self = Self(1 << 1);
+    pub const REGISTRY_SNAPSHOT: Self = Self(1 << 2);
+    pub const COUNTERS_AUDIT: Self = Self(1 << 3);
+    pub const FULL_STRUCTURE_AUDIT: Self = Self(1 << 4);
+    pub const SLAB_STRUCTURE_AUDIT: Self = Self(1 << 5);
+    pub const KHEAP_STRUCTURE_AUDIT: Self = Self(1 << 6);
+    pub const BUDDY_STRUCTURE_AUDIT: Self = Self(1 << 7);
+    pub const MANAGED_STRUCTURE_AUDIT: Self = Self(1 << 8);
+    pub const MANAGED_REFERENCE_AUDIT: Self = Self(1 << 9);
+    pub const CACHE_RECLAIM: Self = Self(1 << 10);
+    pub const HOTSPOT_SUMMARY: Self = Self(1 << 11);
+    pub const MANAGED_GC: Self = Self(1 << 12);
+    pub const RELOCATION_OBSERVER: Self = Self(1 << 13);
+    pub const EXACT_ROOT_PROVIDER: Self = Self(1 << 14);
+    pub const GC_CRITICAL_SECTION_HOOKS: Self = Self(1 << 15);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn stable_kernel() -> Self {
+        Self(
+            Self::TYPED_MEMORY_REQUEST.0
+                | Self::TRACKED_PHYSICAL_API.0
+                | Self::REGISTRY_SNAPSHOT.0
+                | Self::COUNTERS_AUDIT.0
+                | Self::FULL_STRUCTURE_AUDIT.0
+                | Self::SLAB_STRUCTURE_AUDIT.0
+                | Self::KHEAP_STRUCTURE_AUDIT.0
+                | Self::BUDDY_STRUCTURE_AUDIT.0
+                | Self::MANAGED_STRUCTURE_AUDIT.0
+                | Self::MANAGED_REFERENCE_AUDIT.0
+                | Self::CACHE_RECLAIM.0
+                | Self::HOTSPOT_SUMMARY.0
+                | Self::MANAGED_GC.0
+                | Self::RELOCATION_OBSERVER.0
+                | Self::EXACT_ROOT_PROVIDER.0
+                | Self::GC_CRITICAL_SECTION_HOOKS.0,
+        )
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
+
+/// allocator 自检/诊断的采样范围。
+///
+/// `CountersOnly` 只读取各层 O(1) 计数器，适合热诊断、周期性监控和未来外部扩展的低扰动
+/// 采样；`FullRegistry` 会额外扫描 registry bucket/freelist，用于测试、panic 前日志和人工
+/// 排查。调用方必须显式选择，避免把全量链表扫描误放进高频路径。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AllocatorAuditScope {
+    CountersOnly,
+    #[default]
+    FullRegistry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AllocatorReclaimRequest {
+    pub kheap_cached_ranges: usize,
+    pub flush_slab_cpu_caches: bool,
+    pub reclaim_slab_empty: bool,
+    pub reclaim_physical_deferred: bool,
+}
+
+impl AllocatorReclaimRequest {
+    pub const fn caches() -> Self {
+        Self {
+            kheap_cached_ranges: usize::MAX,
+            flush_slab_cpu_caches: true,
+            reclaim_slab_empty: true,
+            reclaim_physical_deferred: true,
+        }
+    }
+
+    pub const fn counters_only() -> Self {
+        Self {
+            kheap_cached_ranges: 0,
+            flush_slab_cpu_caches: false,
+            reclaim_slab_empty: false,
+            reclaim_physical_deferred: false,
+        }
+    }
+
+    pub const fn with_kheap_cached_ranges(mut self, max_ranges: usize) -> Self {
+        self.kheap_cached_ranges = max_ranges;
+        self
+    }
+
+    pub const fn without_slab_cache_flush(mut self) -> Self {
+        self.flush_slab_cpu_caches = false;
+        self
+    }
+
+    pub const fn without_slab_empty_reclaim(mut self) -> Self {
+        self.reclaim_slab_empty = false;
+        self
+    }
+
+    pub const fn without_physical_deferred_reclaim(mut self) -> Self {
+        self.reclaim_physical_deferred = false;
+        self
+    }
+}
+
+impl Default for AllocatorReclaimRequest {
+    fn default() -> Self {
+        Self::caches()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllocatorReclaimStats {
+    pub kheap: KernelHeapReclaimStats,
+    pub slab: SlabReclaimStats,
+    pub phys: BuddyReclaimStats,
+}
+
+impl AllocatorReclaimStats {
+    pub const fn is_empty(self) -> bool {
+        self.kheap.released_ranges == 0
+            && self.slab.flushed_cached_objects == 0
+            && self.slab.reclaimed_slabs == 0
+            && self.phys.deferred_reclaim_passes == 0
+            && self.phys.merged_blocks == 0
+    }
+
+    pub const fn reclaimed_bytes(self) -> usize {
+        self.kheap
+            .released_bytes
+            .saturating_add(self.slab.reclaimed_bytes)
+    }
+}
 
 /// allocator 分层账本审计结果。
 ///
@@ -29,6 +202,15 @@ use crate::space::AddressSpaceStats;
 pub struct AllocatorAudit {
     pub flags: AllocatorAuditFlags,
     pub registry_structure: AllocationRegistryAudit,
+    pub registry_structure_scanned: bool,
+    pub phys_structure: BuddyAudit,
+    pub phys_structure_scanned: bool,
+    pub slab_structure: SlabAudit,
+    pub slab_structure_scanned: bool,
+    pub kheap_structure: KernelHeapAudit,
+    pub kheap_structure_scanned: bool,
+    pub managed_structure: ManagedAudit,
+    pub managed_structure_scanned: bool,
     pub registry_live_records: usize,
     pub registry_kind_records: usize,
     pub registry_boot_records: usize,
@@ -49,7 +231,12 @@ pub struct AllocatorAudit {
 
 impl AllocatorAudit {
     pub const fn is_consistent(self) -> bool {
-        self.flags.is_empty() && self.registry_structure.is_consistent()
+        self.flags.is_empty()
+            && (!self.registry_structure_scanned || self.registry_structure.is_consistent())
+            && (!self.phys_structure_scanned || self.phys_structure.is_consistent())
+            && (!self.slab_structure_scanned || self.slab_structure.is_consistent())
+            && (!self.kheap_structure_scanned || self.kheap_structure.is_consistent())
+            && (!self.managed_structure_scanned || self.managed_structure.is_consistent())
     }
 }
 
@@ -72,6 +259,11 @@ impl AllocatorAuditFlags {
     pub const KHEAP_PAGE_ACCOUNTING_MISMATCH: Self = Self(1 << 5);
     pub const MANAGED_RECORD_MISMATCH: Self = Self(1 << 6);
     pub const REGISTRY_STRUCTURE_MISMATCH: Self = Self(1 << 7);
+    pub const PHYS_STRUCTURE_MISMATCH: Self = Self(1 << 8);
+    pub const PHYS_PAGE_ACCOUNTING_MISMATCH: Self = Self(1 << 9);
+    pub const SLAB_STRUCTURE_MISMATCH: Self = Self(1 << 10);
+    pub const KHEAP_STRUCTURE_MISMATCH: Self = Self(1 << 11);
+    pub const MANAGED_STRUCTURE_MISMATCH: Self = Self(1 << 12);
 
     pub const fn empty() -> Self {
         Self(0)
@@ -135,6 +327,13 @@ pub struct AllocatorLayerStats {
 /// 优先看 bucket/shard 参数，vmem 最大空闲段过小时则说明大对象路径受碎片化影响。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AllocatorHotspotSummary {
+    pub phys_alloc_failure_per_mille: u16,
+    pub phys_split_per_alloc_mille: u32,
+    pub phys_coalesce_per_free_mille: u32,
+    pub phys_defer_per_free_mille: u32,
+    pub phys_reclaim_per_alloc_mille: u32,
+    pub phys_metadata_load_per_mille: u16,
+    pub phys_chain_corruptions: u64,
     pub slab_cache_hit_per_mille: u16,
     pub slab_cache_miss_per_mille: u16,
     pub slab_refill_per_mille: u16,
@@ -143,11 +342,9 @@ pub struct AllocatorHotspotSummary {
     pub slab_fast_free_fallbacks: u64,
     pub registry_max_chain_len: usize,
     pub registry_max_shard_live_records: usize,
-    pub registry_live_per_bucket_per_mille: u16,
-    pub registry_nonempty_buckets: usize,
-    pub registry_nonempty_load_per_mille: u16,
-    pub registry_max_shard_nonempty_buckets: usize,
+    pub registry_live_per_bucket_per_mille: u32,
     pub registry_underflows: u64,
+    pub registry_chain_corruptions: u64,
     pub kheap_failure_per_mille: u16,
     pub kheap_realloc_per_mille: u16,
     pub kheap_cache_hit_per_mille: u16,
@@ -163,6 +360,39 @@ pub fn build_audit(
     layers: &AllocatorLayerStats,
     registry_structure: AllocationRegistryAudit,
 ) -> AllocatorAudit {
+    build_audit_inner(layers, Some(registry_structure), None, None, None, None)
+}
+
+pub fn build_audit_with_structures(
+    layers: &AllocatorLayerStats,
+    registry_structure: AllocationRegistryAudit,
+    phys_structure: BuddyAudit,
+    slab_structure: SlabAudit,
+    kheap_structure: KernelHeapAudit,
+    managed_structure: ManagedAudit,
+) -> AllocatorAudit {
+    build_audit_inner(
+        layers,
+        Some(registry_structure),
+        Some(phys_structure),
+        Some(slab_structure),
+        Some(kheap_structure),
+        Some(managed_structure),
+    )
+}
+
+pub fn build_counter_audit(layers: &AllocatorLayerStats) -> AllocatorAudit {
+    build_audit_inner(layers, None, None, None, None, None)
+}
+
+fn build_audit_inner(
+    layers: &AllocatorLayerStats,
+    registry_structure: Option<AllocationRegistryAudit>,
+    phys_structure: Option<BuddyAudit>,
+    slab_structure: Option<SlabAudit>,
+    kheap_structure: Option<KernelHeapAudit>,
+    managed_structure: Option<ManagedAudit>,
+) -> AllocatorAudit {
     let registry_kind_records = layers
         .registry
         .live_boot
@@ -176,6 +406,11 @@ pub fn build_audit(
         .saturating_add(layers.registry.free_nodes);
     let slab_backing_bytes = pages_to_bytes(layers.slab.active_pages);
     let kheap_page_bytes = pages_to_bytes(layers.kheap.active_pages);
+    let phys_pages_accounted = layers
+        .phys
+        .free_pages
+        .saturating_add(layers.phys.allocated_pages)
+        .saturating_add(layers.phys.reserved_pages);
 
     let mut flags = AllocatorAuditFlags::empty();
     if registry_kind_records != layers.registry.live_records {
@@ -184,18 +419,46 @@ pub fn build_audit(
     if registry_nodes_accounted != layers.registry.nodes_allocated {
         flags.insert(AllocatorAuditFlags::REGISTRY_NODE_ACCOUNTING_MISMATCH);
     }
-    if !registry_structure.is_consistent()
-        || registry_structure.scanned_live_records != layers.registry.live_records
-        || registry_structure.scanned_free_nodes != layers.registry.free_nodes
-        || registry_structure.scanned_live_boot != layers.registry.live_boot
-        || registry_structure.scanned_live_small != layers.registry.live_small
-        || registry_structure.scanned_live_large != layers.registry.live_large
-        || registry_structure.scanned_live_managed != layers.registry.live_managed
-        || registry_structure.scanned_live_physical != layers.registry.live_physical
-        || registry_structure.scanned_nonempty_buckets != layers.registry.nonempty_buckets
-        || registry_structure.scanned_max_chain_len > layers.registry.max_chain_len
-    {
+    if layers.registry.chain_corruptions != 0 {
         flags.insert(AllocatorAuditFlags::REGISTRY_STRUCTURE_MISMATCH);
+    }
+    if layers.phys.chain_corruptions != 0 {
+        flags.insert(AllocatorAuditFlags::PHYS_STRUCTURE_MISMATCH);
+    }
+    if phys_pages_accounted != layers.phys.total_pages {
+        flags.insert(AllocatorAuditFlags::PHYS_PAGE_ACCOUNTING_MISMATCH);
+    }
+    if layers.phys.node_used > layers.phys.node_capacity {
+        flags.insert(AllocatorAuditFlags::PHYS_STRUCTURE_MISMATCH);
+    }
+    if let Some(phys_structure) = phys_structure {
+        if !phys_structure.is_consistent()
+            || phys_structure.scanned_total_pages != layers.phys.total_pages
+            || phys_structure.scanned_allocated_pages != layers.phys.allocated_pages
+            || phys_structure.scanned_free_pages != layers.phys.free_pages
+            || phys_structure.scanned_reserved_pages != layers.phys.reserved_pages
+            || phys_structure
+                .scanned_hash_nodes
+                .saturating_add(phys_structure.scanned_recycled_nodes)
+                != layers.phys.node_used
+            || phys_structure.scanned_free_count_per_order != layers.phys.free_count_per_order
+        {
+            flags.insert(AllocatorAuditFlags::PHYS_STRUCTURE_MISMATCH);
+        }
+    }
+    if let Some(registry_structure) = registry_structure {
+        if !registry_structure.is_consistent()
+            || registry_structure.scanned_live_records != layers.registry.live_records
+            || registry_structure.scanned_free_nodes != layers.registry.free_nodes
+            || registry_structure.scanned_live_boot != layers.registry.live_boot
+            || registry_structure.scanned_live_small != layers.registry.live_small
+            || registry_structure.scanned_live_large != layers.registry.live_large
+            || registry_structure.scanned_live_managed != layers.registry.live_managed
+            || registry_structure.scanned_live_physical != layers.registry.live_physical
+            || registry_structure.scanned_max_chain_len > layers.registry.max_chain_len
+        {
+            flags.insert(AllocatorAuditFlags::REGISTRY_STRUCTURE_MISMATCH);
+        }
     }
     if layers.slab.active_objects != layers.registry.live_small as u64 {
         flags.insert(AllocatorAuditFlags::SLAB_RECORD_MISMATCH);
@@ -203,19 +466,73 @@ pub fn build_audit(
     if layers.slab.active_bytes > slab_backing_bytes {
         flags.insert(AllocatorAuditFlags::SLAB_BACKING_OVERCOMMIT);
     }
+    if let Some(slab_structure) = slab_structure {
+        if !slab_structure.is_consistent()
+            || slab_structure.scanned_slabs != layers.slab.active_slabs
+            || slab_structure.scanned_active_objects != layers.slab.active_objects
+            || slab_structure.scanned_active_pages != layers.slab.active_pages
+            || slab_structure.scanned_active_bytes != layers.slab.active_bytes
+            || slab_structure.scanned_free_nodes != layers.slab.free_slab_nodes
+        {
+            flags.insert(AllocatorAuditFlags::SLAB_STRUCTURE_MISMATCH);
+        }
+    }
     if layers.kheap.active_allocs != layers.registry.live_large as u64 {
         flags.insert(AllocatorAuditFlags::KHEAP_RECORD_MISMATCH);
     }
     if layers.kheap.active_bytes != kheap_page_bytes {
         flags.insert(AllocatorAuditFlags::KHEAP_PAGE_ACCOUNTING_MISMATCH);
     }
+    if let Some(kheap_structure) = kheap_structure {
+        if !kheap_structure.is_consistent()
+            || kheap_structure.scanned_active_allocs != layers.kheap.active_allocs
+            || kheap_structure.scanned_active_pages != layers.kheap.active_pages
+            || kheap_structure.scanned_active_bytes != layers.kheap.active_bytes
+            || kheap_structure.scanned_cached_ranges != layers.kheap.cached_ranges
+            || kheap_structure.scanned_cached_pages != layers.kheap.cached_pages
+            || kheap_structure.scanned_cached_bytes != layers.kheap.cached_bytes
+        {
+            flags.insert(AllocatorAuditFlags::KHEAP_STRUCTURE_MISMATCH);
+        }
+    }
     if layers.managed.active_objects != layers.registry.live_managed as u64 {
         flags.insert(AllocatorAuditFlags::MANAGED_RECORD_MISMATCH);
+    }
+    if let Some(managed_structure) = managed_structure {
+        if !managed_structure.is_consistent()
+            || managed_structure.scanned_active_objects != layers.managed.active_objects
+            || managed_structure.scanned_active_objects
+                != layers.managed.gc.object_table_entries as u64
+            || managed_structure.scanned_active_bytes != layers.managed.active_bytes
+            || managed_structure.scanned_young_objects != layers.managed.gc.young_gen_objects
+            || managed_structure.scanned_old_objects != layers.managed.gc.old_gen_objects
+            || managed_structure.scanned_strong_handle_slots
+                != layers.managed.gc.strong_handle_slots
+            || managed_structure.scanned_weak_handle_slots != layers.managed.gc.weak_handle_slots
+            || managed_structure.scanned_pinned_handle_slots
+                != layers.managed.gc.pinned_handle_slots
+            || managed_structure.scanned_automatic_root_entries
+                != layers.managed.gc.automatic_root_entries
+            || managed_structure.scanned_pending_finalizers != layers.managed.gc.pending_finalizers
+            || managed_structure.scanned_dirty_cards != layers.managed.gc.dirty_cards
+            || managed_structure.scanned_remembered_objects != layers.managed.gc.remembered_objects
+        {
+            flags.insert(AllocatorAuditFlags::MANAGED_STRUCTURE_MISMATCH);
+        }
     }
 
     AllocatorAudit {
         flags,
-        registry_structure,
+        registry_structure: registry_structure.unwrap_or_default(),
+        registry_structure_scanned: registry_structure.is_some(),
+        phys_structure: phys_structure.unwrap_or_default(),
+        phys_structure_scanned: phys_structure.is_some(),
+        slab_structure: slab_structure.unwrap_or_default(),
+        slab_structure_scanned: slab_structure.is_some(),
+        kheap_structure: kheap_structure.unwrap_or_default(),
+        kheap_structure_scanned: kheap_structure.is_some(),
+        managed_structure: managed_structure.unwrap_or_default(),
+        managed_structure_scanned: managed_structure.is_some(),
         registry_live_records: layers.registry.live_records,
         registry_kind_records,
         registry_boot_records: layers.registry.live_boot,
@@ -236,6 +553,12 @@ pub fn build_audit(
 }
 
 pub fn build_hotspot_summary(layers: &AllocatorLayerStats) -> AllocatorHotspotSummary {
+    let phys_alloc_requests = layers.phys.alloc_requests;
+    let phys_free_requests = layers.phys.free_requests;
+    let phys_metadata_load = per_mille(
+        layers.phys.node_used as u64,
+        layers.phys.node_capacity as u64,
+    );
     let slab_total = layers
         .slab
         .cache_hits
@@ -243,16 +566,8 @@ pub fn build_hotspot_summary(layers: &AllocatorLayerStats) -> AllocatorHotspotSu
     let registry_live_per_bucket = if layers.registry.bucket_count == 0 {
         0
     } else {
-        per_mille(
+        per_mille_unbounded(
             layers.registry.live_records as u64,
-            layers.registry.bucket_count as u64,
-        )
-    };
-    let registry_nonempty_load = if layers.registry.bucket_count == 0 {
-        0
-    } else {
-        per_mille(
-            layers.registry.nonempty_buckets as u64,
             layers.registry.bucket_count as u64,
         )
     };
@@ -274,6 +589,25 @@ pub fn build_hotspot_summary(layers: &AllocatorLayerStats) -> AllocatorHotspotSu
     };
 
     AllocatorHotspotSummary {
+        phys_alloc_failure_per_mille: per_mille(layers.phys.alloc_failures, phys_alloc_requests),
+        phys_split_per_alloc_mille: per_mille_unbounded(
+            layers.phys.split_count,
+            phys_alloc_requests,
+        ),
+        phys_coalesce_per_free_mille: per_mille_unbounded(
+            layers.phys.coalesce_count,
+            phys_free_requests,
+        ),
+        phys_defer_per_free_mille: per_mille_unbounded(
+            layers.phys.deferred_coalesce_count,
+            phys_free_requests,
+        ),
+        phys_reclaim_per_alloc_mille: per_mille_unbounded(
+            layers.phys.deferred_reclaim_count,
+            phys_alloc_requests,
+        ),
+        phys_metadata_load_per_mille: phys_metadata_load,
+        phys_chain_corruptions: layers.phys.chain_corruptions,
         slab_cache_hit_per_mille: per_mille(layers.slab.cache_hits, slab_total),
         slab_cache_miss_per_mille: per_mille(layers.slab.cache_misses, slab_total),
         slab_refill_per_mille: per_mille(layers.slab.cache_refills, slab_total),
@@ -283,10 +617,8 @@ pub fn build_hotspot_summary(layers: &AllocatorLayerStats) -> AllocatorHotspotSu
         registry_max_chain_len: layers.registry.max_chain_len,
         registry_max_shard_live_records: layers.registry.max_shard_live_records,
         registry_live_per_bucket_per_mille: registry_live_per_bucket,
-        registry_nonempty_buckets: layers.registry.nonempty_buckets,
-        registry_nonempty_load_per_mille: registry_nonempty_load,
-        registry_max_shard_nonempty_buckets: layers.registry.max_shard_nonempty_buckets,
         registry_underflows: layers.registry.accounting_underflows,
+        registry_chain_corruptions: layers.registry.chain_corruptions,
         kheap_failure_per_mille: per_mille(layers.kheap.alloc_failures, kheap_requests),
         kheap_realloc_per_mille: per_mille(layers.kheap.realloc_requests, kheap_activity),
         kheap_cache_hit_per_mille: per_mille(layers.kheap.cache_hits, kheap_cache_lookups),
@@ -402,11 +734,53 @@ fn per_mille(part: u64, total: u64) -> u16 {
     ((part as u128 * 1000) / total as u128).min(1000) as u16
 }
 
+#[inline]
+fn per_mille_unbounded(part: u64, total: u64) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    ((part as u128 * 1000) / total as u128).min(u32::MAX as u128) as u32
+}
+
 pub fn format_diagnostic(
     buf: &mut [u8],
     overview: &MemoryOverview,
     layers: &AllocatorLayerStats,
     registry_structure: &AllocationRegistryAudit,
+    phys_structure: &BuddyAudit,
+    slab_structure: &SlabAudit,
+    kheap_structure: &KernelHeapAudit,
+    managed_structure: &ManagedAudit,
+) -> usize {
+    format_diagnostic_inner(
+        buf,
+        overview,
+        layers,
+        Some(*registry_structure),
+        Some(*phys_structure),
+        Some(*slab_structure),
+        Some(*kheap_structure),
+        Some(*managed_structure),
+    )
+}
+
+pub fn format_diagnostic_counters(
+    buf: &mut [u8],
+    overview: &MemoryOverview,
+    layers: &AllocatorLayerStats,
+) -> usize {
+    format_diagnostic_inner(buf, overview, layers, None, None, None, None, None)
+}
+
+fn format_diagnostic_inner(
+    buf: &mut [u8],
+    overview: &MemoryOverview,
+    layers: &AllocatorLayerStats,
+    registry_structure: Option<AllocationRegistryAudit>,
+    phys_structure: Option<BuddyAudit>,
+    slab_structure: Option<SlabAudit>,
+    kheap_structure: Option<KernelHeapAudit>,
+    managed_structure: Option<ManagedAudit>,
 ) -> usize {
     let mut pos = 0usize;
     pos += write_str(buf, pos, b"Phys: total=");
@@ -423,6 +797,8 @@ pub fn format_diagnostic(
     pos += write_usize(buf, pos, layers.phys.node_capacity);
     pos += write_str(buf, pos, b" buckets=");
     pos += write_usize(buf, pos, layers.phys.hash_bucket_count);
+    pos += write_str(buf, pos, b" corrupt=");
+    pos += write_u64(buf, pos, layers.phys.chain_corruptions);
     pos += write_str(buf, pos, b"\nAddr: dm=");
     pos += write_usize(buf, pos, overview.direct_map_allocated / 1024);
     pos += write_str(buf, pos, b"/");
@@ -497,6 +873,10 @@ pub fn format_diagnostic(
     pos += write_usize(buf, pos, layers.kheap.cached_pages);
     pos += write_str(buf, pos, b" pressure_rel=");
     pos += write_u64(buf, pos, layers.kheap.cache_pressure_releases);
+    pos += write_str(buf, pos, b" maint_flush=");
+    pos += write_u64(buf, pos, layers.kheap.cache_maintenance_flushes);
+    pos += write_str(buf, pos, b" maint_rel=");
+    pos += write_u64(buf, pos, layers.kheap.cache_maintenance_releases);
     pos += write_str(buf, pos, b"\nReg: live=");
     pos += write_usize(buf, pos, layers.registry.live_records);
     pos += write_str(buf, pos, b" shards=");
@@ -507,10 +887,6 @@ pub fn format_diagnostic(
     pos += write_usize(buf, pos, layers.registry.free_nodes);
     pos += write_str(buf, pos, b" max_chain=");
     pos += write_usize(buf, pos, layers.registry.max_chain_len);
-    pos += write_str(buf, pos, b" nonempty=");
-    pos += write_usize(buf, pos, layers.registry.nonempty_buckets);
-    pos += write_str(buf, pos, b" max_nonempty=");
-    pos += write_usize(buf, pos, layers.registry.max_shard_nonempty_buckets);
     pos += write_str(buf, pos, b" refill=");
     pos += write_u64(buf, pos, layers.registry.node_refills);
     pos += write_str(buf, pos, b" nodes=");
@@ -521,6 +897,8 @@ pub fn format_diagnostic(
     pos += write_u64(buf, pos, layers.registry.double_free_attempts);
     pos += write_str(buf, pos, b" underflow=");
     pos += write_u64(buf, pos, layers.registry.accounting_underflows);
+    pos += write_str(buf, pos, b" corrupt=");
+    pos += write_u64(buf, pos, layers.registry.chain_corruptions);
     let hotspot = build_hotspot_summary(layers);
     pos += write_str(buf, pos, b"\nHot: slab_hit=");
     pos += write_usize(buf, pos, hotspot.slab_cache_hit_per_mille as usize);
@@ -530,6 +908,20 @@ pub fn format_diagnostic(
     pos += write_usize(buf, pos, hotspot.slab_fast_free_per_mille as usize);
     pos += write_str(buf, pos, b" slab_fallback=");
     pos += write_u64(buf, pos, hotspot.slab_fast_free_fallbacks);
+    pos += write_str(buf, pos, b" phys_fail=");
+    pos += write_usize(buf, pos, hotspot.phys_alloc_failure_per_mille as usize);
+    pos += write_str(buf, pos, b" phys_split=");
+    pos += write_usize(buf, pos, hotspot.phys_split_per_alloc_mille as usize);
+    pos += write_str(buf, pos, b" phys_merge=");
+    pos += write_usize(buf, pos, hotspot.phys_coalesce_per_free_mille as usize);
+    pos += write_str(buf, pos, b" phys_defer=");
+    pos += write_usize(buf, pos, hotspot.phys_defer_per_free_mille as usize);
+    pos += write_str(buf, pos, b" phys_reclaim=");
+    pos += write_usize(buf, pos, hotspot.phys_reclaim_per_alloc_mille as usize);
+    pos += write_str(buf, pos, b" phys_meta=");
+    pos += write_usize(buf, pos, hotspot.phys_metadata_load_per_mille as usize);
+    pos += write_str(buf, pos, b" phys_corrupt=");
+    pos += write_u64(buf, pos, hotspot.phys_chain_corruptions);
     pos += write_str(buf, pos, b" reg_chain=");
     pos += write_usize(buf, pos, hotspot.registry_max_chain_len);
     pos += write_str(buf, pos, b" reg_load=");
@@ -538,10 +930,8 @@ pub fn format_diagnostic(
         pos,
         hotspot.registry_live_per_bucket_per_mille as usize,
     );
-    pos += write_str(buf, pos, b" reg_nonempty=");
-    pos += write_usize(buf, pos, hotspot.registry_nonempty_buckets);
-    pos += write_str(buf, pos, b" reg_nonempty_load=");
-    pos += write_usize(buf, pos, hotspot.registry_nonempty_load_per_mille as usize);
+    pos += write_str(buf, pos, b" reg_corrupt=");
+    pos += write_u64(buf, pos, hotspot.registry_chain_corruptions);
     pos += write_str(buf, pos, b" kheap_fail=");
     pos += write_usize(buf, pos, hotspot.kheap_failure_per_mille as usize);
     pos += write_str(buf, pos, b" kheap_cache=");
@@ -550,9 +940,42 @@ pub fn format_diagnostic(
     pos += write_usize(buf, pos, hotspot.kheap_cached_pages);
     pos += write_str(buf, pos, b" vmem_largest=");
     pos += write_usize(buf, pos, hotspot.kernel_vmem_largest_free_percent as usize);
-    let audit = build_audit(layers, *registry_structure);
+    let audit = match (
+        registry_structure,
+        phys_structure,
+        slab_structure,
+        kheap_structure,
+        managed_structure,
+    ) {
+        (
+            Some(registry_structure),
+            Some(phys_structure),
+            Some(slab_structure),
+            Some(kheap_structure),
+            Some(managed_structure),
+        ) => build_audit_with_structures(
+            layers,
+            registry_structure,
+            phys_structure,
+            slab_structure,
+            kheap_structure,
+            managed_structure,
+        ),
+        (Some(registry_structure), _, _, _, _) => build_audit(layers, registry_structure),
+        _ => build_counter_audit(layers),
+    };
     pos += write_str(buf, pos, b"\nAudit: ok=");
     pos += write_usize(buf, pos, audit.is_consistent() as usize);
+    pos += write_str(buf, pos, b" mode=");
+    pos += write_str(
+        buf,
+        pos,
+        if audit.registry_structure_scanned {
+            b"full"
+        } else {
+            b"counters"
+        },
+    );
     pos += write_str(buf, pos, b" flags=");
     pos += write_usize(buf, pos, audit.flags.bits() as usize);
     pos += write_str(buf, pos, b" live=");
@@ -568,13 +991,105 @@ pub fn format_diagnostic(
     pos += write_str(buf, pos, b"/");
     pos += write_usize(buf, pos, audit.registry_node_capacity);
     pos += write_str(buf, pos, b" reg_struct=");
-    pos += write_usize(buf, pos, audit.registry_structure.flags.bits() as usize);
+    if audit.registry_structure_scanned {
+        pos += write_usize(buf, pos, audit.registry_structure.flags.bits() as usize);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
     pos += write_str(buf, pos, b" scan=");
-    pos += write_usize(buf, pos, audit.registry_structure.scanned_live_records);
-    pos += write_str(buf, pos, b"/");
-    pos += write_usize(buf, pos, audit.registry_structure.scanned_free_nodes);
+    if audit.registry_structure_scanned {
+        pos += write_usize(buf, pos, audit.registry_structure.scanned_live_records);
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(buf, pos, audit.registry_structure.scanned_free_nodes);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
     pos += write_str(buf, pos, b" chain=");
-    pos += write_usize(buf, pos, audit.registry_structure.scanned_max_chain_len);
+    if audit.registry_structure_scanned {
+        pos += write_usize(buf, pos, audit.registry_structure.scanned_max_chain_len);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" phys_struct=");
+    if audit.phys_structure_scanned {
+        pos += write_usize(buf, pos, audit.phys_structure.flags.bits() as usize);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" phys_scan=");
+    if audit.phys_structure_scanned {
+        pos += write_usize(buf, pos, audit.phys_structure.scanned_allocated_pages);
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(buf, pos, audit.phys_structure.scanned_free_pages);
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(buf, pos, audit.phys_structure.scanned_reserved_pages);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" slab_struct=");
+    if audit.slab_structure_scanned {
+        pos += write_usize(buf, pos, audit.slab_structure.flags.bits() as usize);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" slab_scan=");
+    if audit.slab_structure_scanned {
+        pos += write_u64(buf, pos, audit.slab_structure.scanned_active_objects);
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(buf, pos, audit.slab_structure.scanned_slabs);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" kheap_struct=");
+    if audit.kheap_structure_scanned {
+        pos += write_usize(buf, pos, audit.kheap_structure.flags.bits() as usize);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" kheap_cache_scan=");
+    if audit.kheap_structure_scanned {
+        pos += write_usize(buf, pos, audit.kheap_structure.scanned_cached_ranges);
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(buf, pos, audit.kheap_structure.scanned_cached_pages);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" managed_struct=");
+    if audit.managed_structure_scanned {
+        pos += write_usize(buf, pos, audit.managed_structure.flags.bits() as usize);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" managed_scan=");
+    if audit.managed_structure_scanned {
+        pos += write_u64(buf, pos, audit.managed_structure.scanned_active_objects);
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(buf, pos, audit.managed_structure.scanned_active_bytes);
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
+    pos += write_str(buf, pos, b" managed_refs=");
+    if audit.managed_structure_scanned {
+        pos += write_usize(
+            buf,
+            pos,
+            audit.managed_structure.scanned_strong_reference_slots,
+        );
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(
+            buf,
+            pos,
+            audit.managed_structure.scanned_weak_reference_slots,
+        );
+        pos += write_str(buf, pos, b"/");
+        pos += write_usize(
+            buf,
+            pos,
+            audit.managed_structure.scanned_stale_weak_reference_slots,
+        );
+    } else {
+        pos += write_str(buf, pos, b"skip");
+    }
     pos += write_str(buf, pos, b" slab=");
     pos += write_u64(buf, pos, audit.slab_active_objects);
     pos += write_str(buf, pos, b"/");

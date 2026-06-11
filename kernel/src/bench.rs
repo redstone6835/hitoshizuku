@@ -32,8 +32,8 @@ use core::num::NonZeroU32;
 use core::ops::ControlFlow;
 
 use allocator::{
-    KERNEL_ALLOCATOR, MAX_SMALL_SIZE, MemoryDomain, MemoryRequest, PAGE_SIZE, PhysicalAllocRequest,
-    ReclaimPolicy, Zeroing,
+    AllocatorAuditScope, AllocatorReclaimRequest, KERNEL_ALLOCATOR, MAX_SMALL_SIZE, MemoryDomain,
+    MemoryPlacement, MemoryRequest, PAGE_SIZE, PhysicalAllocRequest, ReclaimPolicy, Zeroing,
 };
 #[cfg(feature = "bench")]
 use vfs::cred::Credentials;
@@ -134,10 +134,11 @@ pub fn run_allocator_only() {
 // Allocator: 分配器路径基准
 // ═══════════════════════════════════════════════════════════════════════
 
-// TODO(alloc-stabilization): 当前只完成 allocator-bench 框架和开销来源日志。
-// 恢复实现时需要在 QEMU 下采集真实结果，并把优化前后 ns/op 对比固化到提交说
-// 明或独立报告中，避免只凭 host check 推断内核态性能。
+// TODO(alloc-stabilization): allocator-bench 已能在 QEMU 下给出单次 ns/op、p50/p95
+// 小样本和主要计数器来源。后续应把优化前后 ns/op 对比固化到提交说明或独立报告中，
+// 并补多 CPU、cache warm/cold 等可重复采样场景，避免只凭 host check 推断内核态性能。
 const ALLOC_BENCH_BATCH: usize = 128;
+const ALLOC_BENCH_SAMPLES: usize = 7;
 
 fn run_allocator_bench() {
     log::info!("[bench][alloc] ---------------- allocator cost model ----------------");
@@ -155,6 +156,7 @@ fn run_allocator_bench() {
 
     let slab8 = run_allocator_alloc_free_case("slab-8", 8, 8, 256, Zeroing::Uninitialized);
     let slab64 = run_allocator_alloc_free_case("slab-64", 64, 8, 256, Zeroing::Uninitialized);
+    run_allocator_sampled_alloc_free_case("slab-64", 64, 8, 16, Zeroing::Uninitialized);
     let slab80_align64 =
         run_allocator_alloc_free_case("slab-80-align64", 80, 64, 192, Zeroing::Uninitialized);
     let slab1024 = run_allocator_alloc_free_case("slab-1024", 1024, 8, 128, Zeroing::Uninitialized);
@@ -165,9 +167,11 @@ fn run_allocator_bench() {
             zero1024 - slab1024
         );
     }
+    run_allocator_split_alloc_free_case("slab-64-split", 64, 8, 256, Zeroing::Uninitialized);
 
     let large4k =
         run_allocator_alloc_free_case("kheap-4k", 4096, PAGE_SIZE, 64, Zeroing::Uninitialized);
+    run_allocator_sampled_alloc_free_case("kheap-4k", 4096, PAGE_SIZE, 8, Zeroing::Uninitialized);
     let large8k =
         run_allocator_alloc_free_case("kheap-8k", 8192, PAGE_SIZE, 48, Zeroing::Uninitialized);
     let large64k = run_allocator_alloc_free_case(
@@ -177,14 +181,28 @@ fn run_allocator_bench() {
         16,
         Zeroing::Uninitialized,
     );
+    run_allocator_split_alloc_free_case(
+        "kheap-4k-split",
+        4096,
+        PAGE_SIZE,
+        64,
+        Zeroing::Uninitialized,
+    );
+    run_allocator_kheap_full_cache_reuse();
+    run_allocator_reclaim_api();
 
     run_allocator_registry_lookup();
+    run_allocator_sampled_registry_lookup();
     run_allocator_in_place_query();
     run_allocator_realloc_same_class();
+    run_allocator_typed_realloc_same_class();
     run_allocator_realloc_grow();
+    run_allocator_counter_audit();
     run_allocator_audit();
+    run_allocator_counter_diagnostic();
     run_allocator_diagnostic();
     run_allocator_physical();
+    run_allocator_physical_exact_reclaim();
 
     let audit_end = KERNEL_ALLOCATOR.audit();
     if audit_end.is_consistent() {
@@ -202,9 +220,13 @@ fn run_allocator_bench() {
         );
     } else {
         log::error!(
-            "[bench][alloc][audit] final inconsistent flags={} reg_struct={} live={} kinds={} boot={} physrec={} nodes={}/{} scan={}/{} slab={}/{} kheap={}/{} managed={}/{}",
+            "[bench][alloc][audit] final inconsistent flags={} reg_struct={} phys_struct={} slab_struct={} kheap_struct={} managed_struct={} live={} kinds={} boot={} physrec={} nodes={}/{} scan={}/{} slab={}/{} kheap={}/{} managed={}/{}",
             audit_end.flags.bits(),
             audit_end.registry_structure.flags.bits(),
+            audit_end.phys_structure.flags.bits(),
+            audit_end.slab_structure.flags.bits(),
+            audit_end.kheap_structure.flags.bits(),
+            audit_end.managed_structure.flags.bits(),
             audit_end.registry_live_records,
             audit_end.registry_kind_records,
             audit_end.registry_boot_records,
@@ -241,8 +263,15 @@ fn run_allocator_bench() {
 fn log_allocator_hotspot(stage: &str) {
     let hot = KERNEL_ALLOCATOR.hotspot_summary();
     log::info!(
-        "[bench][alloc][hotspot][{}] slab_hit={}/1000 slab_miss={}/1000 refill={}/1000 flush={}/1000 fast_free={}/1000 fallback={} reg_chain={} reg_shard={} reg_load={}/1000 reg_nonempty={} reg_nonempty_load={}/1000 reg_underflow={} kheap_fail={}/1000 kheap_realloc={}/1000 kheap_cache={}/1000 cached_pages={} pressure_rel={} vmem_largest={}pct vmem_free_segs={} managed_frag={}/1000 pressure={}",
+        "[bench][alloc][hotspot][{}] phys_fail={}/1000 phys_split={}/1000alloc phys_merge={}/1000free phys_defer={}/1000free phys_reclaim={}/1000alloc phys_meta={}/1000 phys_corrupt={} slab_hit={}/1000 slab_miss={}/1000 refill={}/1000 flush={}/1000 fast_free={}/1000 fallback={} reg_chain={} reg_shard={} reg_load={}/1000 reg_underflow={} reg_corrupt={} kheap_fail={}/1000 kheap_realloc={}/1000 kheap_cache={}/1000 cached_pages={} pressure_rel={} vmem_largest={}pct vmem_free_segs={} managed_frag={}/1000 pressure={}",
         stage,
+        hot.phys_alloc_failure_per_mille,
+        hot.phys_split_per_alloc_mille,
+        hot.phys_coalesce_per_free_mille,
+        hot.phys_defer_per_free_mille,
+        hot.phys_reclaim_per_alloc_mille,
+        hot.phys_metadata_load_per_mille,
+        hot.phys_chain_corruptions,
         hot.slab_cache_hit_per_mille,
         hot.slab_cache_miss_per_mille,
         hot.slab_refill_per_mille,
@@ -252,9 +281,8 @@ fn log_allocator_hotspot(stage: &str) {
         hot.registry_max_chain_len,
         hot.registry_max_shard_live_records,
         hot.registry_live_per_bucket_per_mille,
-        hot.registry_nonempty_buckets,
-        hot.registry_nonempty_load_per_mille,
         hot.registry_underflows,
+        hot.registry_chain_corruptions,
         hot.kheap_failure_per_mille,
         hot.kheap_realloc_per_mille,
         hot.kheap_cache_hit_per_mille,
@@ -267,26 +295,69 @@ fn log_allocator_hotspot(stage: &str) {
     );
 }
 
+fn bench_per_mille(part: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    ((part as u128 * 1000) / total as u128).min(u64::MAX as u128) as u64
+}
+
 fn run_allocator_audit() {
     let iters = 4096usize;
     let t0 = hal::time::monotonic_ns();
     let mut audit_flags = 0u32;
     let mut registry_flags = 0u32;
+    let mut phys_flags = 0u32;
+    let mut slab_flags = 0u32;
+    let mut kheap_flags = 0u32;
+    let mut managed_flags = 0u32;
     let mut live = 0usize;
     for _ in 0..iters {
         let audit = KERNEL_ALLOCATOR.audit();
         audit_flags |= audit.flags.bits();
         registry_flags |= audit.registry_structure.flags.bits();
+        phys_flags |= audit.phys_structure.flags.bits();
+        slab_flags |= audit.slab_structure.flags.bits();
+        kheap_flags |= audit.kheap_structure.flags.bits();
+        managed_flags |= audit.managed_structure.flags.bits();
         live = live.saturating_add(audit.registry_live_records);
         core::hint::black_box(audit);
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][alloc][audit] {} snapshots avg {} ns/op audit_flags={} registry_flags={} avg_live={}; source=layer stats snapshot + full registry shard scan + typed invariant checks",
+        "[bench][alloc][audit] {} snapshots avg {} ns/op audit_flags={} registry_flags={} phys_flags={} slab_flags={} kheap_flags={} managed_flags={} avg_live={}; source=layer stats snapshot + full registry/buddy/slab/kheap/managed structure scan + typed invariant checks",
         iters,
         dt / iters as u64,
         audit_flags,
         registry_flags,
+        phys_flags,
+        slab_flags,
+        kheap_flags,
+        managed_flags,
+        live / iters
+    );
+}
+
+fn run_allocator_counter_audit() {
+    let iters = 4096usize;
+    let t0 = hal::time::monotonic_ns();
+    let mut audit_flags = 0u32;
+    let mut scanned = 0usize;
+    let mut live = 0usize;
+    for _ in 0..iters {
+        let audit = KERNEL_ALLOCATOR.audit_counters();
+        audit_flags |= audit.flags.bits();
+        scanned += audit.registry_structure_scanned as usize;
+        live = live.saturating_add(audit.registry_live_records);
+        core::hint::black_box(audit);
+    }
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][alloc][audit-counters] {} snapshots avg {} ns/op audit_flags={} scanned={} avg_live={}; source=layer stats snapshot + O(1) registry counters, no bucket scan",
+        iters,
+        dt / iters as u64,
+        audit_flags,
+        scanned,
         live / iters
     );
 }
@@ -297,6 +368,13 @@ fn allocator_request(size: usize, align: usize, zeroing: Zeroing) -> MemoryReque
         .with_reclaim(ReclaimPolicy::NoReclaim)
 }
 
+#[derive(Clone, Copy)]
+struct AllocFreeMeasurement {
+    completed: usize,
+    total_ns: u64,
+    avg_ns: u64,
+}
+
 fn run_allocator_alloc_free_case(
     tag: &str,
     size: usize,
@@ -304,6 +382,30 @@ fn run_allocator_alloc_free_case(
     iters: usize,
     zeroing: Zeroing,
 ) -> u64 {
+    let Some(measurement) = measure_allocator_alloc_free_case(tag, size, align, iters, zeroing)
+    else {
+        return 0;
+    };
+    log::info!(
+        "[bench][alloc][{}] {} x alloc+free size={} align={} zero={:?}: total {} ns (avg {} ns/op)",
+        tag,
+        measurement.completed,
+        size,
+        align,
+        zeroing,
+        measurement.total_ns,
+        measurement.avg_ns
+    );
+    measurement.avg_ns
+}
+
+fn measure_allocator_alloc_free_case(
+    tag: &str,
+    size: usize,
+    align: usize,
+    iters: usize,
+    zeroing: Zeroing,
+) -> Option<AllocFreeMeasurement> {
     let mut records = [None; ALLOC_BENCH_BATCH];
     let request = allocator_request(size, align, zeroing);
     let mut completed = 0usize;
@@ -338,7 +440,7 @@ fn run_allocator_alloc_free_case(
                         record.ptr,
                         err
                     );
-                    return 0;
+                    return None;
                 }
                 completed += 1;
             }
@@ -349,18 +451,285 @@ fn run_allocator_alloc_free_case(
     }
 
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
-    let avg = dt / completed.max(1) as u64;
+    Some(AllocFreeMeasurement {
+        completed,
+        total_ns: dt,
+        avg_ns: dt / completed.max(1) as u64,
+    })
+}
+
+fn run_allocator_sampled_alloc_free_case(
+    tag: &str,
+    size: usize,
+    align: usize,
+    iters: usize,
+    zeroing: Zeroing,
+) {
+    let mut samples = [0u64; ALLOC_BENCH_SAMPLES];
+    let mut collected = 0usize;
+    for slot in &mut samples {
+        let Some(measurement) = measure_allocator_alloc_free_case(tag, size, align, iters, zeroing)
+        else {
+            break;
+        };
+        *slot = measurement.avg_ns;
+        collected += 1;
+    }
+    if collected == 0 {
+        return;
+    }
+    let samples = &mut samples[..collected];
+    samples.sort_unstable();
+    let p50 = samples[percentile_index(collected, 50)];
+    let p95 = samples[percentile_index(collected, 95)];
     log::info!(
-        "[bench][alloc][{}] {} x alloc+free size={} align={} zero={:?}: total {} ns (avg {} ns/op)",
+        "[bench][alloc][sample][{}] samples={} each={} objects size={} align={} zero={:?}: min={} p50={} p95={} max={} ns/op; source=repeated short alloc+free windows",
+        tag,
+        collected,
+        iters * ALLOC_BENCH_BATCH,
+        size,
+        align,
+        zeroing,
+        samples[0],
+        p50,
+        p95,
+        samples[collected - 1]
+    );
+}
+
+fn percentile_index(count: usize, percentile: usize) -> usize {
+    count
+        .saturating_mul(percentile)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(count.saturating_sub(1))
+}
+
+fn run_allocator_split_alloc_free_case(
+    tag: &str,
+    size: usize,
+    align: usize,
+    iters: usize,
+    zeroing: Zeroing,
+) {
+    let mut records = [None; ALLOC_BENCH_BATCH];
+    let request = allocator_request(size, align, zeroing);
+    let mut completed = 0usize;
+    let mut alloc_dt = 0u64;
+    let mut free_dt = 0u64;
+
+    for _ in 0..iters {
+        let mut allocated = 0usize;
+        let t0 = hal::time::monotonic_ns();
+        for slot in &mut records {
+            match KERNEL_ALLOCATOR.allocate(request) {
+                Ok(record) => {
+                    core::hint::black_box(record.ptr);
+                    *slot = Some(record);
+                    allocated += 1;
+                }
+                Err(err) => {
+                    log::error!(
+                        "[bench][alloc][split][{}] allocate failed after {} objects: {:?}",
+                        tag,
+                        completed,
+                        err
+                    );
+                    break;
+                }
+            }
+        }
+        alloc_dt = alloc_dt.saturating_add(hal::time::monotonic_ns().saturating_sub(t0));
+
+        let t0 = hal::time::monotonic_ns();
+        for slot in records.iter_mut().take(allocated).rev() {
+            if let Some(record) = slot.take() {
+                if let Err(err) = KERNEL_ALLOCATOR.deallocate(record.ptr) {
+                    log::error!(
+                        "[bench][alloc][split][{}] deallocate failed ptr={:#x}: {:?}",
+                        tag,
+                        record.ptr,
+                        err
+                    );
+                    return;
+                }
+                completed += 1;
+            }
+        }
+        free_dt = free_dt.saturating_add(hal::time::monotonic_ns().saturating_sub(t0));
+        if allocated != ALLOC_BENCH_BATCH {
+            break;
+        }
+    }
+
+    let ops = completed.max(1) as u64;
+    log::info!(
+        "[bench][alloc][split][{}] {} objects size={} align={} zero={:?}: alloc {} ns/op free {} ns/op; source=route+backend+registry-insert vs registry-remove+backend-release",
         tag,
         completed,
         size,
         align,
         zeroing,
-        dt,
-        avg
+        alloc_dt / ops,
+        free_dt / ops
     );
-    avg
+}
+
+fn run_allocator_kheap_full_cache_reuse() {
+    const COUNT: usize = 160;
+    let mut records = [None; COUNT];
+    let request = allocator_request(PAGE_SIZE, PAGE_SIZE, Zeroing::Uninitialized);
+
+    for slot in &mut records {
+        match KERNEL_ALLOCATOR.allocate(request) {
+            Ok(record) => {
+                *slot = Some(record);
+            }
+            Err(err) => {
+                log::error!(
+                    "[bench][alloc][kheap-cache-full] allocate failed during fill: {:?}",
+                    err
+                );
+                for slot in &mut records {
+                    if let Some(record) = slot.take() {
+                        let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    let sentinel = records[COUNT - 1].take().expect("sentinel exists");
+    for slot in records.iter_mut().take(COUNT - 1) {
+        if let Some(record) = slot.take() {
+            if let Err(err) = KERNEL_ALLOCATOR.deallocate(record.ptr) {
+                log::error!(
+                    "[bench][alloc][kheap-cache-full] deallocate fill ptr={:#x} failed: {:?}",
+                    record.ptr,
+                    err
+                );
+                let _ = KERNEL_ALLOCATOR.deallocate(sentinel.ptr);
+                return;
+            }
+        }
+    }
+
+    let before = KERNEL_ALLOCATOR.layer_stats().kheap;
+    let t0 = hal::time::monotonic_ns();
+    if let Err(err) = KERNEL_ALLOCATOR.deallocate(sentinel.ptr) {
+        log::error!(
+            "[bench][alloc][kheap-cache-full] deallocate sentinel ptr={:#x} failed: {:?}",
+            sentinel.ptr,
+            err
+        );
+        return;
+    }
+    let free_dt = hal::time::monotonic_ns().saturating_sub(t0);
+
+    let t0 = hal::time::monotonic_ns();
+    let reused = match KERNEL_ALLOCATOR.allocate(request) {
+        Ok(record) => record,
+        Err(err) => {
+            log::error!(
+                "[bench][alloc][kheap-cache-full] allocate reused sentinel failed: {:?}",
+                err
+            );
+            return;
+        }
+    };
+    let alloc_dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = KERNEL_ALLOCATOR.layer_stats().kheap;
+    let hot_reuse = (reused.ptr == sentinel.ptr) as usize;
+    log::info!(
+        "[bench][alloc][kheap-cache-full] sentinel hot={} free {} ns alloc {} ns full_release_delta={} cache_hit_delta={}; source=full-cache ring replace-oldest + LIFO reuse",
+        hot_reuse,
+        free_dt,
+        alloc_dt,
+        after
+            .cache_full_releases
+            .saturating_sub(before.cache_full_releases),
+        after.cache_hits.saturating_sub(before.cache_hits)
+    );
+    let _ = KERNEL_ALLOCATOR.deallocate(reused.ptr);
+}
+
+fn run_allocator_reclaim_api() {
+    const KHEAP_COUNT: usize = 8;
+    const SLAB_COUNT: usize = 16;
+    let mut kheap_records = [None; KHEAP_COUNT];
+    let mut slab_records = [None; SLAB_COUNT];
+
+    for slot in &mut kheap_records {
+        match KERNEL_ALLOCATOR.allocate(allocator_request(
+            PAGE_SIZE,
+            PAGE_SIZE,
+            Zeroing::Uninitialized,
+        )) {
+            Ok(record) => *slot = Some(record),
+            Err(err) => {
+                log::error!(
+                    "[bench][alloc][reclaim] kheap setup alloc failed: {:?}",
+                    err
+                );
+                return;
+            }
+        }
+    }
+    for slot in &mut slab_records {
+        match KERNEL_ALLOCATOR.allocate(allocator_request(64, 8, Zeroing::Uninitialized)) {
+            Ok(record) => *slot = Some(record),
+            Err(err) => {
+                log::error!("[bench][alloc][reclaim] slab setup alloc failed: {:?}", err);
+                for slot in &mut kheap_records {
+                    if let Some(record) = slot.take() {
+                        let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    for slot in &mut kheap_records {
+        if let Some(record) = slot.take() {
+            let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+        }
+    }
+    for slot in &mut slab_records {
+        if let Some(record) = slot.take() {
+            let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+        }
+    }
+
+    let before = KERNEL_ALLOCATOR.layer_stats();
+    let t0 = hal::time::monotonic_ns();
+    let reclaim = match KERNEL_ALLOCATOR
+        .reclaim(AllocatorReclaimRequest::caches().without_physical_deferred_reclaim())
+    {
+        Ok(reclaim) => reclaim,
+        Err(err) => {
+            log::error!("[bench][alloc][reclaim] api failed: {:?}", err);
+            return;
+        }
+    };
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = KERNEL_ALLOCATOR.layer_stats();
+    log::info!(
+        "[bench][alloc][reclaim] one-shot {} ns kheap_ranges={} kheap_pages={} slab_flush={} slab_slabs={} bytes={} cached_pages {}->{} slab_flush_delta={}; source=public pressure/cache maintenance API",
+        dt,
+        reclaim.kheap.released_ranges,
+        reclaim.kheap.released_pages,
+        reclaim.slab.flushed_cached_objects,
+        reclaim.slab.reclaimed_slabs,
+        reclaim.reclaimed_bytes(),
+        before.kheap.cached_pages,
+        after.kheap.cached_pages,
+        after
+            .slab
+            .cache_flushes
+            .saturating_sub(before.slab.cache_flushes)
+    );
 }
 
 fn run_allocator_registry_lookup() {
@@ -394,6 +763,59 @@ fn run_allocator_registry_lookup() {
         "[bench][alloc][registry] lookup hit avg {} ns/op, miss avg {} ns/op; source=bucket lock + chain scan",
         hit_dt / iters as u64,
         miss_dt / iters as u64
+    );
+}
+
+fn run_allocator_sampled_registry_lookup() {
+    let request = allocator_request(64, 8, Zeroing::Uninitialized);
+    let record = match KERNEL_ALLOCATOR.allocate(request) {
+        Ok(record) => record,
+        Err(err) => {
+            log::error!(
+                "[bench][alloc][registry-sample] setup alloc failed: {:?}",
+                err
+            );
+            return;
+        }
+    };
+
+    let iters = 4096usize;
+    let miss_ptr = usize::MAX - PAGE_SIZE + 1;
+    let mut hit_samples = [0u64; ALLOC_BENCH_SAMPLES];
+    let mut miss_samples = [0u64; ALLOC_BENCH_SAMPLES];
+    for idx in 0..ALLOC_BENCH_SAMPLES {
+        let t0 = hal::time::monotonic_ns();
+        for _ in 0..iters {
+            let found = KERNEL_ALLOCATOR.query_tracked_allocation(record.ptr).ok();
+            core::hint::black_box(found);
+        }
+        hit_samples[idx] = hal::time::monotonic_ns().saturating_sub(t0) / iters as u64;
+
+        let t0 = hal::time::monotonic_ns();
+        for _ in 0..iters {
+            let found = KERNEL_ALLOCATOR.query_tracked_allocation(miss_ptr).ok();
+            core::hint::black_box(found);
+        }
+        miss_samples[idx] = hal::time::monotonic_ns().saturating_sub(t0) / iters as u64;
+    }
+
+    let _ = KERNEL_ALLOCATOR.deallocate(record.ptr);
+    hit_samples.sort_unstable();
+    miss_samples.sort_unstable();
+    let p50_idx = percentile_index(ALLOC_BENCH_SAMPLES, 50);
+    let p95_idx = percentile_index(ALLOC_BENCH_SAMPLES, 95);
+    log::info!(
+        "[bench][alloc][sample][registry] samples={} each={} lookups: hit min={} p50={} p95={} max={} miss min={} p50={} p95={} max={} ns/op; source=repeated bucket lock + chain scan windows",
+        ALLOC_BENCH_SAMPLES,
+        iters,
+        hit_samples[0],
+        hit_samples[p50_idx],
+        hit_samples[p95_idx],
+        hit_samples[ALLOC_BENCH_SAMPLES - 1],
+        miss_samples[0],
+        miss_samples[p50_idx],
+        miss_samples[p95_idx],
+        miss_samples[ALLOC_BENCH_SAMPLES - 1]
     );
 }
 
@@ -490,6 +912,80 @@ fn run_allocator_realloc_same_class() {
     );
 }
 
+fn run_allocator_typed_realloc_same_class() {
+    let old_request = allocator_request(64, 8, Zeroing::Uninitialized);
+    let new_request = allocator_request(63, 8, Zeroing::Uninitialized);
+    let mut records = [None; ALLOC_BENCH_BATCH];
+    let mut completed = 0usize;
+    let iters = 256usize;
+    let mut total_dt = 0u64;
+
+    for _ in 0..iters {
+        let mut allocated = 0usize;
+        for slot in &mut records {
+            match KERNEL_ALLOCATOR.allocate(old_request) {
+                Ok(record) => {
+                    *slot = Some(record);
+                    allocated += 1;
+                }
+                Err(err) => {
+                    log::error!(
+                        "[bench][alloc][typed-realloc-same] allocate failed after {} objects: {:?}",
+                        completed,
+                        err
+                    );
+                    break;
+                }
+            }
+        }
+
+        let t0 = hal::time::monotonic_ns();
+        for slot in records.iter_mut().take(allocated) {
+            let Some(record) = *slot else {
+                continue;
+            };
+            match KERNEL_ALLOCATOR.reallocate(record.ptr, new_request) {
+                Ok(resized) => {
+                    core::hint::black_box(resized.ptr);
+                    *slot = Some(resized);
+                    completed += 1;
+                }
+                Err(err) => {
+                    log::error!(
+                        "[bench][alloc][typed-realloc-same] reallocate ptr={:#x} failed: {:?}",
+                        record.ptr,
+                        err
+                    );
+                    break;
+                }
+            }
+        }
+        total_dt = total_dt.saturating_add(hal::time::monotonic_ns().saturating_sub(t0));
+
+        for slot in records.iter_mut().take(allocated) {
+            if let Some(record) = slot.take() {
+                if let Err(err) = KERNEL_ALLOCATOR.deallocate(record.ptr) {
+                    log::error!(
+                        "[bench][alloc][typed-realloc-same] deallocate ptr={:#x} failed: {:?}",
+                        record.ptr,
+                        err
+                    );
+                    return;
+                }
+            }
+        }
+        if allocated != ALLOC_BENCH_BATCH {
+            break;
+        }
+    }
+
+    log::info!(
+        "[bench][alloc][typed-realloc-same] {} x 64B->63B avg {} ns/op; source=typed MemoryRequest validation + single registry shard update",
+        completed,
+        total_dt / completed.max(1) as u64
+    );
+}
+
 fn run_allocator_realloc_grow() {
     let old_layout = Layout::from_size_align(64, 8).expect("valid realloc old layout");
     let new_layout = Layout::from_size_align(4096, 8).expect("valid realloc new layout");
@@ -551,7 +1047,27 @@ fn run_allocator_diagnostic() {
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     log::info!(
-        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + registry audit scan + no_alloc formatting",
+        "[bench][alloc][diagnostic] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + full registry/buddy/slab/kheap/managed audit scan + no_alloc formatting",
+        iters,
+        dt / iters as u64,
+        total_len / iters
+    );
+}
+
+fn run_allocator_counter_diagnostic() {
+    let mut buf = [0u8; 2048];
+    let iters = 512usize;
+    let t0 = hal::time::monotonic_ns();
+    let mut total_len = 0usize;
+    for _ in 0..iters {
+        let len = KERNEL_ALLOCATOR
+            .format_diagnostic_with_scope(&mut buf, AllocatorAuditScope::CountersOnly);
+        total_len = total_len.saturating_add(len);
+        core::hint::black_box(len);
+    }
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][alloc][diagnostic-counters] {} snapshots avg {} ns/op avg_len={}; source=stats snapshot + O(1) registry counters + no_alloc formatting",
         iters,
         dt / iters as u64,
         total_len / iters
@@ -563,6 +1079,7 @@ fn run_allocator_physical() {
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);
     let iters = 64usize;
     let mut completed = 0usize;
+    let before = KERNEL_ALLOCATOR.buddy_stats();
     let t0 = hal::time::monotonic_ns();
 
     for _ in 0..iters {
@@ -603,11 +1120,118 @@ fn run_allocator_physical() {
     }
 
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = KERNEL_ALLOCATOR.buddy_stats();
+    let alloc_delta = after.alloc_requests.saturating_sub(before.alloc_requests);
+    let free_delta = after.free_requests.saturating_sub(before.free_requests);
+    let split_delta = after.split_count.saturating_sub(before.split_count);
+    let coalesce_delta = after.coalesce_count.saturating_sub(before.coalesce_count);
+    let defer_delta = after
+        .deferred_coalesce_count
+        .saturating_sub(before.deferred_coalesce_count);
+    let reclaim_delta = after
+        .deferred_reclaim_count
+        .saturating_sub(before.deferred_reclaim_count);
+    let failure_delta = after.alloc_failures.saturating_sub(before.alloc_failures);
     log::info!(
-        "[bench][alloc][physical] {} x page alloc+free avg {} ns/op; source=buddy lock + split/coalesce + registry tracking",
+        "[bench][alloc][physical] {} x page alloc+free avg {} ns/op split={} merge={} defer={} reclaim={} fail={} split_per_alloc={}/1000 merge_per_free={}/1000 defer_per_free={}/1000 reclaim_per_alloc={}/1000; source=buddy lock + split/coalesce/defer + registry tracking",
         completed,
-        dt / completed.max(1) as u64
+        dt / completed.max(1) as u64,
+        split_delta,
+        coalesce_delta,
+        defer_delta,
+        reclaim_delta,
+        failure_delta,
+        bench_per_mille(split_delta, alloc_delta),
+        bench_per_mille(coalesce_delta, free_delta),
+        bench_per_mille(defer_delta, free_delta),
+        bench_per_mille(reclaim_delta, alloc_delta)
     );
+}
+
+fn run_allocator_physical_exact_reclaim() {
+    const COUNT: usize = 16;
+    let mut pages = [None; COUNT];
+    for slot in &mut pages {
+        match KERNEL_ALLOCATOR.allocate_physical(PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE)) {
+            Ok(page) => *slot = Some(page),
+            Err(err) => {
+                log::error!(
+                    "[bench][alloc][physical-exact-reclaim] source page allocate failed: {:?}",
+                    err
+                );
+                return;
+            }
+        }
+    }
+
+    let mut exact_base = None;
+    for left in 0..COUNT {
+        for right in (left + 1)..COUNT {
+            let a = pages[left].expect("left page exists").paddr;
+            let b = pages[right].expect("right page exists").paddr;
+            let base = a.min(b);
+            let next = a.max(b);
+            if base.is_multiple_of(PAGE_SIZE * 2) && next == base + PAGE_SIZE {
+                exact_base = Some(base);
+                break;
+            }
+        }
+        if exact_base.is_some() {
+            break;
+        }
+    }
+    let Some(exact_base) = exact_base else {
+        log::error!("[bench][alloc][physical-exact-reclaim] no order-1 buddy pair found");
+        for slot in &mut pages {
+            if let Some(page) = slot.take() {
+                let _ = KERNEL_ALLOCATOR.try_free_physical(page);
+            }
+        }
+        return;
+    };
+
+    for slot in pages.iter_mut().rev() {
+        if let Some(page) = slot.take() {
+            if let Err(err) = KERNEL_ALLOCATOR.try_free_physical(page) {
+                log::error!(
+                    "[bench][alloc][physical-exact-reclaim] source free paddr={:#x} failed: {:?}",
+                    page.paddr,
+                    err
+                );
+                return;
+            }
+        }
+    }
+
+    let before = KERNEL_ALLOCATOR.buddy_stats();
+    let request = PhysicalAllocRequest::new(PAGE_SIZE * 2, PAGE_SIZE * 2)
+        .with_placement(MemoryPlacement::ExactPhys(exact_base));
+    let t0 = hal::time::monotonic_ns();
+    let allocation = match KERNEL_ALLOCATOR.allocate_physical(request) {
+        Ok(allocation) => allocation,
+        Err(err) => {
+            log::error!(
+                "[bench][alloc][physical-exact-reclaim] exact order-1 allocate failed base={:#x}: {:?}",
+                exact_base,
+                err
+            );
+            return;
+        }
+    };
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = KERNEL_ALLOCATOR.buddy_stats();
+    log::info!(
+        "[bench][alloc][physical-exact-reclaim] exact order-1 base={:#x} alloc {} ns reclaim_delta={} merge_delta={} split_delta={}; source=deferred order0 reclaim before ExactPhys",
+        exact_base,
+        dt,
+        after
+            .deferred_reclaim_count
+            .saturating_sub(before.deferred_reclaim_count),
+        after.coalesce_count.saturating_sub(before.coalesce_count),
+        after.split_count.saturating_sub(before.split_count)
+    );
+
+    let _ = KERNEL_ALLOCATOR.try_free_physical(allocation);
 }
 
 #[cfg(feature = "bench")]
