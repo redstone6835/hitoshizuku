@@ -18,7 +18,7 @@ use smoltcp::wire::{
 };
 
 use crate::adapter::NetDeviceAdapter;
-use crate::config::{CidrAddress, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::config::{CidrAddress, Endpoint, Gateway, IfConfig, IfMode, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::device::{InterfaceId, NetDevice};
 use crate::driver::LinkMedium;
 use crate::engine::{ProtocolSocketHandle, endpoint_from_smoltcp};
@@ -41,6 +41,11 @@ pub(crate) struct ManagedInterface {
     accept_successors: BTreeMap<SocketHandle, SocketHandle>,
     /// 已交给上层监听 fd 持有的补位 listener。
     accept_published_listeners: BTreeSet<SocketHandle>,
+    /// UDP socket 的可选 peer 关联。
+    ///
+    /// smoltcp UDP socket 只按本地监听端点分发，不保存远端 peer。网络层在
+    /// 这里记录协议无关的 peer 状态，send/recv 路径据此过滤数据报。
+    udp_peers: BTreeMap<SocketHandle, Endpoint>,
     max_backlog: usize,
     tcp_tuning: TcpBufferTuning,
     inode_counter: core::sync::atomic::AtomicU64,
@@ -123,6 +128,7 @@ impl ManagedInterface {
             pending_accepted: Vec::with_capacity(listen_tuning.accept_backlog),
             accept_successors: BTreeMap::new(),
             accept_published_listeners: BTreeSet::new(),
+            udp_peers: BTreeMap::new(),
             max_backlog: listen_tuning.accept_backlog,
             tcp_tuning,
             inode_counter: core::sync::atomic::AtomicU64::new(1),
@@ -448,6 +454,21 @@ impl ManagedInterface {
         false
     }
 
+    /// 设置 UDP socket 的远端 peer。
+    pub fn set_udp_peer(&mut self, handle: ProtocolSocketHandle, peer: Endpoint) {
+        self.udp_peers.insert(handle.into_smoltcp(), peer);
+    }
+
+    /// 清除 UDP socket 的远端 peer。
+    pub fn clear_udp_peer(&mut self, handle: ProtocolSocketHandle) {
+        self.udp_peers.remove(&handle.into_smoltcp());
+    }
+
+    /// 查询 UDP socket 的远端 peer。
+    pub fn udp_peer(&self, handle: ProtocolSocketHandle) -> Option<Endpoint> {
+        self.udp_peers.get(&handle.into_smoltcp()).copied()
+    }
+
     /// Soft-close：标记 socket 为已移除（延迟到下一轮 poll 时真正释放）。
     ///
     /// **本接口仅供内部 soft-close 协议使用**——上层关闭文件 fd 时应直接
@@ -736,6 +757,7 @@ impl ManagedInterface {
         // 下次 poll 会对一个已经在 `SocketSet` 里被替换的 handle 再调
         // `sockets.remove`，触发 "handle does not refer to a valid socket"。
         self.meta.remove(&handle);
+        self.udp_peers.remove(&handle);
         self.remove_pending_tcp_accept(handle);
         self.accept_published_listeners.remove(&handle);
         self.sockets.remove(handle);
@@ -976,7 +998,7 @@ impl ManagedInterface {
                     };
                     out.push(super::socket::UdpSockSnapshot {
                         local,
-                        remote: None,
+                        remote: self.udp_peers.get(&handle).copied(),
                         inode: self.next_inode(),
                     });
                 }

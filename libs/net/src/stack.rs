@@ -926,9 +926,9 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
+        let peer = managed.udp_peer(handle.inner);
         let socket = managed.udp_socket_mut(handle.inner);
-        let (n, meta) = socket.peek_slice(buf).map_err(|_| NetError::WouldBlock)?;
-        Ok((n, endpoint_from_smoltcp(meta.endpoint)))
+        udp_recv_filtered(socket, peer, buf, true)
     }
 
     // ── 路由管理 ─────────────────────────────────────────────────────────
@@ -1123,8 +1123,6 @@ impl NetStack {
         data: &[u8],
         remote: Endpoint,
     ) -> Result<usize, NetError> {
-        // FIXME: connected UDP 的协议栈状态尚未单独建模；当前 sendto 只按
-        // 每包 remote 做出站接口一致性校验。
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
@@ -1138,15 +1136,13 @@ impl NetStack {
             if managed.handle_is_closed(handle) {
                 return Err(NetError::Closed);
             }
-            if managed.udp_socket(handle.inner).endpoint().port == 0 {
-                let local_ep = select_udp_ephemeral_endpoint(
-                    &managed,
-                    handle.inner,
-                    self.tuning.ephemeral_ports,
-                )?;
-                let socket = managed.udp_socket_mut(handle.inner);
-                socket.bind(local_ep).map_err(|_| NetError::AddressInUse)?;
+            if managed
+                .udp_peer(handle.inner)
+                .is_some_and(|peer| peer != remote)
+            {
+                return Err(NetError::InvalidArgument);
             }
+            ensure_udp_bound_locked(&mut managed, handle.inner, self.tuning.ephemeral_ports)?;
             let remote_ep = endpoint_to_smoltcp(&remote);
             let socket = managed.udp_socket_mut(handle.inner);
             socket
@@ -1155,6 +1151,53 @@ impl NetStack {
         }
         self.poll_now();
         Ok(data.len())
+    }
+
+    /// UDP connect。记录默认远端 peer，并在需要时自动绑定本地端口。
+    pub fn udp_connect(
+        &self,
+        handle: NetSocketHandle,
+        remote: Endpoint,
+    ) -> Result<Endpoint, NetError> {
+        if handle.sock_type != SocketType::Udp {
+            return Err(NetError::InvalidArgument);
+        }
+        if remote.port == 0 || is_unspecified_ip(&remote.addr) {
+            return Err(NetError::InvalidArgument);
+        }
+        self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        ensure_udp_bound_locked(&mut managed, handle.inner, self.tuning.ephemeral_ports)?;
+        managed.set_udp_peer(handle.inner, remote);
+        udp_listen_endpoint_to_endpoint(
+            managed.udp_socket(handle.inner).endpoint(),
+            Some(&remote.addr),
+        )
+        .ok_or(NetError::Closed)
+    }
+
+    /// UDP disconnect。清除默认远端 peer，保留已有本地绑定。
+    pub fn udp_disconnect(&self, handle: NetSocketHandle) -> Result<(), NetError> {
+        if handle.sock_type != SocketType::Udp {
+            return Err(NetError::InvalidArgument);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        managed.clear_udp_peer(handle.inner);
+        Ok(())
     }
 
     /// UDP recvfrom（非阻塞）。
@@ -1174,10 +1217,9 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
+        let peer = managed.udp_peer(handle.inner);
         let socket = managed.udp_socket_mut(handle.inner);
-        let (len, meta) = socket.recv_slice(buf).map_err(|_| NetError::WouldBlock)?;
-        let remote = endpoint_from_smoltcp(meta.endpoint);
-        Ok((len, remote))
+        udp_recv_filtered(socket, peer, buf, false)
     }
 
     /// 查询 UDP socket 的本地端点（getsockname 真实值）。
@@ -1191,19 +1233,21 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return None;
         }
-        let ep = managed.udp_socket(handle.inner).endpoint();
-        if ep.port == 0 {
+        udp_listen_endpoint_to_endpoint(managed.udp_socket(handle.inner).endpoint(), None)
+    }
+
+    /// 查询 UDP socket 的远端 peer。
+    pub fn udp_remote_endpoint(&self, handle: NetSocketHandle) -> Option<Endpoint> {
+        if handle.sock_type != SocketType::Udp {
             return None;
         }
-        let addr = match ep.addr {
-            Some(IpAddress::Ipv4(v4)) => IpAddr::V4(Ipv4Addr(v4.octets())),
-            Some(IpAddress::Ipv6(v6)) => IpAddr::V6(Ipv6Addr(v6.octets())),
-            None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        };
-        Some(Endpoint {
-            addr,
-            port: ep.port,
-        })
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&handle.iface_id)?;
+        let managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return None;
+        }
+        managed.udp_peer(handle.inner)
     }
 
     /// UDP close。解绑并释放 socket。
@@ -1215,6 +1259,7 @@ impl NetStack {
         if let Some(iface_lock) = table.get(&handle.iface_id) {
             let mut managed = iface_lock.lock();
             if managed.handle_is_live(handle) {
+                managed.clear_udp_peer(handle.inner);
                 managed.udp_socket_mut(handle.inner).close();
             }
         }
@@ -1843,6 +1888,80 @@ fn parse_raw_packet_meta(data: &[u8]) -> Result<RawPacketMeta, NetError> {
     }
 }
 
+fn ensure_udp_bound_locked(
+    managed: &mut ManagedInterface,
+    handle: ProtocolSocketHandle,
+    range: EphemeralPortRange,
+) -> Result<(), NetError> {
+    if managed.udp_socket(handle).endpoint().port != 0 {
+        return Ok(());
+    }
+    let local_ep = select_udp_ephemeral_endpoint(managed, handle, range)?;
+    managed
+        .udp_socket_mut(handle)
+        .bind(local_ep)
+        .map_err(|_| NetError::AddressInUse)
+}
+
+fn udp_recv_filtered(
+    socket: &mut smoltcp::socket::udp::Socket<'static>,
+    peer: Option<Endpoint>,
+    buf: &mut [u8],
+    peek: bool,
+) -> Result<(usize, Endpoint), NetError> {
+    loop {
+        if peek {
+            let drop_current = {
+                let (data, meta) = socket.peek().map_err(|_| NetError::WouldBlock)?;
+                let remote = endpoint_from_smoltcp(meta.endpoint);
+                if udp_peer_matches(peer, remote) {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    return Ok((n, remote));
+                }
+                true
+            };
+            if drop_current {
+                let _ = socket.recv().map_err(|_| NetError::WouldBlock)?;
+            }
+            continue;
+        }
+
+        let (data, meta) = socket.recv().map_err(|_| NetError::WouldBlock)?;
+        let remote = endpoint_from_smoltcp(meta.endpoint);
+        if udp_peer_matches(peer, remote) {
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            return Ok((n, remote));
+        }
+    }
+}
+
+fn udp_peer_matches(peer: Option<Endpoint>, remote: Endpoint) -> bool {
+    peer.is_none_or(|expected| expected == remote)
+}
+
+fn udp_listen_endpoint_to_endpoint(
+    ep: IpListenEndpoint,
+    family_hint: Option<&IpAddr>,
+) -> Option<Endpoint> {
+    if ep.port == 0 {
+        return None;
+    }
+    let addr = match ep.addr {
+        Some(IpAddress::Ipv4(v4)) => IpAddr::V4(Ipv4Addr(v4.octets())),
+        Some(IpAddress::Ipv6(v6)) => IpAddr::V6(Ipv6Addr(v6.octets())),
+        None => match family_hint {
+            Some(IpAddr::V6(_)) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        },
+    };
+    Some(Endpoint {
+        addr,
+        port: ep.port,
+    })
+}
+
 fn map_icmp_bind_error(err: smoltcp::socket::icmp::BindError) -> NetError {
     match err {
         smoltcp::socket::icmp::BindError::InvalidState => NetError::AddressInUse,
@@ -2049,6 +2168,41 @@ mod tests {
         bytes
     }
 
+    fn build_udpv4_packet(
+        src: smoltcp::wire::Ipv4Address,
+        dst: smoltcp::wire::Ipv4Address,
+        src_port: u16,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr};
+
+        let udp = UdpRepr { src_port, dst_port };
+        let ip = Ipv4Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: IpProtocol::Udp,
+            payload_len: udp.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let mut bytes = alloc::vec![0u8; ip.buffer_len() + ip.payload_len];
+        {
+            let mut ip_packet = Ipv4Packet::new_unchecked(&mut bytes);
+            ip.emit(&mut ip_packet, &ChecksumCapabilities::default());
+            let mut udp_packet = UdpPacket::new_unchecked(ip_packet.payload_mut());
+            udp.emit(
+                &mut udp_packet,
+                &IpAddress::Ipv4(src),
+                &IpAddress::Ipv4(dst),
+                payload.len(),
+                |buf| buf.copy_from_slice(payload),
+                &ChecksumCapabilities::default(),
+            );
+        }
+        bytes
+    }
+
     #[test]
     fn ephemeral_cursor_scans_each_port_once() {
         let range = EphemeralPortRange {
@@ -2134,6 +2288,168 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
+    fn udp_connect_auto_binds_and_records_peer() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-udp-connect",
+            IfConfig::static_v4(Ipv4Addr::new(10, 29, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 29, 0, 77)),
+            port: 9000,
+        };
+
+        assert_eq!(stack.udp_local_endpoint(handle), None);
+        let local = stack.udp_connect(handle, remote).unwrap();
+        assert_ne!(local.port, 0);
+        assert_eq!(local.addr, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(stack.udp_local_endpoint(handle), Some(local));
+        assert_eq!(stack.udp_remote_endpoint(handle), Some(remote));
+    }
+
+    #[test]
+    fn udp_send_to_rejects_non_peer_after_connect() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-udp-peer-send",
+            IfConfig::static_v4(Ipv4Addr::new(10, 30, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let peer = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 30, 0, 77)),
+            port: 9000,
+        };
+        let other = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 30, 0, 88)),
+            port: 9000,
+        };
+
+        assert!(stack.udp_connect(handle, peer).is_ok());
+        assert_eq!(
+            stack.udp_send_to(handle, b"wrong-peer", other),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(stack.udp_send_to(handle, b"right-peer", peer), Ok(10));
+    }
+
+    #[test]
+    fn udp_disconnect_allows_sending_to_new_remote() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-udp-disconnect",
+            IfConfig::static_v4(Ipv4Addr::new(10, 31, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let peer = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 31, 0, 77)),
+            port: 9000,
+        };
+        let other = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 31, 0, 88)),
+            port: 9001,
+        };
+
+        assert!(stack.udp_connect(handle, peer).is_ok());
+        assert_eq!(stack.udp_disconnect(handle), Ok(()));
+        assert_eq!(stack.udp_remote_endpoint(handle), None);
+        assert_eq!(stack.udp_send_to(handle, b"new-peer", other), Ok(8));
+    }
+
+    #[test]
+    fn udp_recv_from_filters_non_peer_after_connect() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-peer-recv",
+            IfConfig::static_v4(Ipv4Addr::new(10, 32, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7777,
+        };
+        let peer = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 32, 0, 77)),
+            port: 9000,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+        assert!(stack.udp_connect(handle, peer).is_ok());
+
+        let dst = smoltcp::wire::Ipv4Address::new(10, 32, 0, 2);
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 32, 0, 88),
+            dst,
+            9000,
+            7777,
+            b"wrong",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 32, 0, 77),
+            dst,
+            9000,
+            7777,
+            b"right",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 16];
+        let (len, remote) = stack.udp_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(len, 5);
+        assert_eq!(&buf[..len], b"right");
+        assert_eq!(remote, peer);
+        assert_eq!(
+            stack.udp_recv_from(handle, &mut buf),
+            Err(NetError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn udp_peek_from_filters_peer_without_consuming_match() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-peer-peek",
+            IfConfig::static_v4(Ipv4Addr::new(10, 33, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7778,
+        };
+        let peer = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 33, 0, 77)),
+            port: 9000,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+        assert!(stack.udp_connect(handle, peer).is_ok());
+
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 33, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 33, 0, 2),
+            9000,
+            7778,
+            b"peek",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 16];
+        let (len, remote) = stack.udp_peek_from(handle, &mut buf).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(&buf[..len], b"peek");
+        assert_eq!(remote, peer);
+
+        let (len, remote) = stack.udp_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(len, 4);
+        assert_eq!(&buf[..len], b"peek");
+        assert_eq!(remote, peer);
     }
 
     #[test]
