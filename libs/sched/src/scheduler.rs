@@ -867,6 +867,10 @@ pub fn schedule_once(now_ns: u64) {
             if Arc::ptr_eq(&idle, &prev) {
                 return;
             }
+            assert!(
+                idle.arch_context().is_some(),
+                "[sched] idle task lost arch context"
+            );
             idle.set_state(TaskState::Running);
             idle.sched.set_on_rq(false);
             idle
@@ -995,6 +999,7 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
         slice_ns: 0,
     };
     let t = crate::spawn::kthread_create(idle_entry, cpu_id, params);
+    t.mark_idle_task();
     t.sched.set_sched_attr(SchedAttr::idle());
     if cpu_id < 64 {
         t.set_cpu_affinity(1u64 << cpu_id);

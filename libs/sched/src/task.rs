@@ -250,6 +250,28 @@ impl TaskState {
     }
 }
 
+/// 任务来源类型。
+///
+/// 用户态任务参与 POSIX 信号、进程组和 wait 语义；内核线程/idle 只属于调度器
+/// 内部，不应被用户态 signal/exit_group/wait 路径影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TaskKind {
+    User = 0,
+    KernelThread = 1,
+    Idle = 2,
+}
+
+impl TaskKind {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::KernelThread,
+            2 => Self::Idle,
+            _ => Self::User,
+        }
+    }
+}
+
 /// 退出码，承载正常 exit(code) 的原始数值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
@@ -381,6 +403,9 @@ struct Relations {
 /// arch ctx、ext 侧表）各自独立小锁。
 pub struct Task {
     pub sched: SchedEntity,
+    /// 用户任务和内核任务的生命周期域不同。该字段用于把内核线程从 POSIX
+    /// signal/exit_group/wait 模型中隔离出去。
+    kind: AtomicU8,
     state: AtomicU8,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
@@ -460,6 +485,7 @@ impl Task {
         TASK_LIVE.fetch_add(1, Ordering::Relaxed);
         let task = Arc::new(Self {
             sched: SchedEntity::new(params),
+            kind: AtomicU8::new(TaskKind::User as u8),
             state: AtomicU8::new(TaskState::New as u8),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
@@ -507,6 +533,31 @@ impl Task {
 
     pub fn state(&self) -> TaskState {
         TaskState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn kind(&self) -> TaskKind {
+        TaskKind::from_u8(self.kind.load(Ordering::Acquire))
+    }
+
+    pub fn is_user_task(&self) -> bool {
+        self.kind() == TaskKind::User
+    }
+
+    pub fn is_kernel_task(&self) -> bool {
+        !self.is_user_task()
+    }
+
+    pub fn is_idle_task(&self) -> bool {
+        self.kind() == TaskKind::Idle
+    }
+
+    pub(crate) fn mark_kernel_thread(&self) {
+        self.kind
+            .store(TaskKind::KernelThread as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_idle_task(&self) {
+        self.kind.store(TaskKind::Idle as u8, Ordering::Release);
     }
 
     /// 直接覆盖状态。仅供调度器内部在已经建立同步关系（持有 rq 锁或 CAS 成功）后使用。

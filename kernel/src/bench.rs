@@ -72,56 +72,56 @@ pub fn run() {
     run_memcpy_cold();
     run_software_overhead_only();
 
-    let raw_dev = make_ram_device("ramd-raw", EXT_IMG);
-    run_block_seq_read(&raw_dev);
-    run_block_seq_write(&raw_dev);
-    run_block_seq_read_instrumented(&raw_dev);
-    run_block_rand_read(&raw_dev);
+    {
+        let raw_dev = make_ram_device("ramd-raw", EXT_IMG);
+        run_block_seq_read(&raw_dev);
+        run_block_seq_write(&raw_dev);
+        run_block_seq_read_instrumented(&raw_dev);
+        run_block_rand_read(&raw_dev);
 
-    let fat_dev = make_ram_device("ramd-fat", FAT_IMG);
-    let ext_dev = make_ram_device("ramd-ext", EXT_IMG);
-    let fat_sb = mount_fat("fat", fat_dev);
-    let ext_sb = mount_ext("ext", ext_dev);
+        let fat_dev = make_ram_device("ramd-fat", FAT_IMG);
+        let ext_dev = make_ram_device("ramd-ext", EXT_IMG);
+        let fat_sb = mount_fat("fat", fat_dev);
+        let ext_sb = mount_ext("ext", ext_dev);
 
-    // ─── L5/L7: 文件系统顺序写+读（先写后读，同一文件） ─────
-    if let Some(ref sb) = fat_sb {
-        run_fs_seq_write_read("fat", sb);
-    }
-    if let Some(ref sb) = ext_sb {
-        run_fs_seq_write_read("ext", sb);
-    }
+        // ─── L5/L7: 文件系统顺序写+读（先写后读，同一文件） ─────
+        if let Some(ref sb) = fat_sb {
+            run_fs_seq_write_read("fat", sb);
+        }
+        if let Some(ref sb) = ext_sb {
+            run_fs_seq_write_read("ext", sb);
+        }
 
-    // ─── FAT 写路径细化插桩 ─────────────────────────────────
-    if let Some(ref sb) = fat_sb {
-        run_fat_write_breakdown("fat", sb);
-    }
+        // ─── FAT 写路径细化插桩 ─────────────────────────────────
+        if let Some(ref sb) = fat_sb {
+            run_fat_write_breakdown("fat", sb);
+        }
 
-    // ─── EXT4 写路径细化插桩 ────────────────────────────────
-    if let Some(ref sb) = ext_sb {
-        run_ext_write_breakdown("ext", sb);
-    }
+        // ─── EXT4 写路径细化插桩 ────────────────────────────────
+        if let Some(ref sb) = ext_sb {
+            run_ext_write_breakdown("ext", sb);
+        }
 
-    // ─── L6: 随机读文件 ─────────────────────────────────────
-    if let Some(ref sb) = fat_sb {
-        run_fs_rand_read("fat", sb);
-    }
-    if let Some(ref sb) = ext_sb {
-        run_fs_rand_read("ext", sb);
-    }
+        // ─── L6: 随机读文件 ─────────────────────────────────────
+        if let Some(ref sb) = fat_sb {
+            run_fs_rand_read("fat", sb);
+        }
+        if let Some(ref sb) = ext_sb {
+            run_fs_rand_read("ext", sb);
+        }
 
-    // ─── L8: 元数据操作 ─────────────────────────────────────
-    if let Some(ref sb) = fat_sb {
-        run_fs_meta("fat", sb);
-    }
-    if let Some(ref sb) = ext_sb {
-        run_fs_meta("ext", sb);
-    }
+        // ─── L8: 元数据操作 ─────────────────────────────────────
+        if let Some(ref sb) = fat_sb {
+            run_fs_meta("fat", sb);
+        }
+        if let Some(ref sb) = ext_sb {
+            run_fs_meta("ext", sb);
+        }
 
-    drop(fat_sb);
-    drop(ext_sb);
-    drop(raw_dev);
-    drop(fat_dev);
-    drop(ext_dev);
+        release_bench_superblock("fat", fat_sb);
+        release_bench_superblock("ext", ext_sb);
+        drop(raw_dev);
+    }
     reclaim_allocator_caches_after_bench("full");
 
     log::info!("[bench] ================= TEST COMPLETE ====================");
@@ -156,6 +156,22 @@ fn reclaim_allocator_caches_after_bench(tag: &str) {
         Err(err) => {
             log::warning!("[bench][{}][reclaim-final] failed: {:?}", tag, err);
         }
+    }
+}
+
+#[cfg(feature = "bench")]
+fn release_bench_superblock(tag: &str, sb: Option<Arc<Superblock>>) {
+    if let Some(sb) = sb {
+        if let Err(err) = sb.sync() {
+            log::warning!(
+                "[bench][{}] final sync failed before release: {:?}",
+                tag,
+                err
+            );
+        }
+        vfs::DCACHE.invalidate_subtree(&sb.root_dentry);
+        sb.gc_inode_cache();
+        drop(sb);
     }
 }
 
@@ -1304,7 +1320,7 @@ fn mount_fat(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
             return None;
         }
     };
-    let driver = Box::leak(Box::new(fatfs::FatFsDriver::new()));
+    let driver = fatfs::FatFsDriver::new();
     driver.bind_backend(backend);
     match driver.mount(None, "") {
         Ok(sb) => {
@@ -1327,7 +1343,7 @@ fn mount_ext(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
             return None;
         }
     };
-    let driver = Box::leak(Box::new(extfs::ExtFsDriver::new()));
+    let driver = extfs::ExtFsDriver::new();
     driver.bind_backend(backend);
     match driver.mount(None, "") {
         Ok(sb) => {

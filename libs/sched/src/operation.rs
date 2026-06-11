@@ -224,6 +224,7 @@ fn lookup_process_group(pgid: PidT) -> Result<Arc<ProcessGroup>, Errno> {
         .snapshot()
         .into_iter()
         .filter_map(|(_, weak)| weak.upgrade())
+        .filter(|task| task.is_user_task())
         .map(|task| task.process_group())
         .find(|pg| pg.pgid() == pgid)
         .ok_or(Errno::ESRCH)
@@ -233,6 +234,9 @@ fn deliver_to_process_group(pg: Arc<ProcessGroup>, sig: Option<SignalNumber>) ->
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo(sig);
     for m in pg.snapshot() {
+        if m.is_kernel_task() {
+            continue;
+        }
         if check_kill_permission(&m).is_ok() {
             m.thread_group().shared_signal().deliver(info);
             for x in m.thread_group().snapshot() {
@@ -273,6 +277,9 @@ pub fn exit_group(code: i32) -> ! {
     let members = tg.snapshot();
     for m in members.iter() {
         if Arc::ptr_eq(m, &me) {
+            continue;
+        }
+        if m.is_kernel_task() {
             continue;
         }
         if m.state() != TaskState::Zombie && m.state() != TaskState::Dead {
@@ -621,6 +628,9 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
 // ── wait4 / waitid ───────────────────────────────────────────────────────────
 
 fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> bool {
+    if child.is_kernel_task() {
+        return false;
+    }
     match target {
         WaitId::All => true,
         WaitId::Pid(pid) => child.pid_root() == Some(*pid),
@@ -788,6 +798,9 @@ fn wait_common(
 // ── kill / tkill / tgkill ────────────────────────────────────────────────────
 
 fn check_kill_permission(target: &Arc<Task>) -> Result<(), Errno> {
+    if target.is_kernel_task() {
+        return Err(Errno::ESRCH);
+    }
     let me = current_task();
     let me_creds = me.credentials();
     if me_creds.has_cap(Capability::Kill) {
@@ -815,7 +828,8 @@ fn make_siginfo(sig: SignalNumber) -> SigInfo {
 }
 
 fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
-    !task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig)
+    task.is_user_task()
+        && (!task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig))
 }
 
 /// `kill(pid, sig)`：按 POSIX pid 语义投递信号。
@@ -827,6 +841,9 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let me = current_task();
     if pid > 0 {
         let target = lookup_pid(pid)?;
+        if target.is_kernel_task() {
+            return Err(Errno::ESRCH);
+        }
         check_kill_permission(&target)?;
         let Some(sig) = sig else { return Ok(()) };
         let info = make_siginfo(sig);
@@ -856,6 +873,9 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
                 continue;
             }
             let Some(t) = weak.upgrade() else { continue };
+            if t.is_kernel_task() {
+                continue;
+            }
             // 同 tg 直接跳过（覆盖 init 整个线程组）。
             if Arc::ptr_eq(&t.thread_group(), &my_tg) {
                 continue;
@@ -895,6 +915,9 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 /// `tkill(tid, sig)`：投递到**特定线程**（per-task pending）。
 pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let target = lookup_pid(tid)?;
+    if target.is_kernel_task() {
+        return Err(Errno::ESRCH);
+    }
     check_kill_permission(&target)?;
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo(sig);
@@ -906,6 +929,9 @@ pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
 /// `tgkill(tgid, tid, sig)`：tid 的 thread_group 必须等于 tgid。
 pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let target = lookup_pid(tid)?;
+    if target.is_kernel_task() {
+        return Err(Errno::ESRCH);
+    }
     let actual_tgid = target
         .thread_group()
         .leader()
@@ -925,6 +951,9 @@ pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Er
 /// `rt_tgsigqueueinfo` 的调度层入口：调用方已经保留完整用户态 siginfo。
 pub fn tgqueueinfo(tgid: PidT, tid: PidT, info: SigInfo) -> Result<(), Errno> {
     let target = lookup_pid(tid)?;
+    if target.is_kernel_task() {
+        return Err(Errno::ESRCH);
+    }
     let actual_tgid = target
         .thread_group()
         .leader()
@@ -945,6 +974,9 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
         return Err(Errno::EINVAL);
     }
     let target = lookup_pid(pid)?;
+    if target.is_kernel_task() {
+        return Err(Errno::ESRCH);
+    }
     check_kill_permission(&target)?;
     target.thread_group().shared_signal().deliver(info);
     for member in target.thread_group().snapshot() {
@@ -1229,6 +1261,9 @@ pub fn deliver_pending_signals() -> Option<SigInfo> {
 
 pub fn deliver_pending_signals_with_context(user_ctx: UserContextRef) -> Option<SigInfo> {
     let me = current_task();
+    if me.is_kernel_task() {
+        return None;
+    }
     let info = me.signal.dequeue_one().or_else(|| {
         me.shared_signal()
             .dequeue_one(me.signal.blocked_snapshot().raw())

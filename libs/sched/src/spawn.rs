@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::arch_hooks::KernelEntry;
 use crate::clone_flags::{CloneArgs, CloneFlags};
 use crate::eevdf::SchedParams;
-use crate::group::ThreadGroup;
+use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
     current_task, enqueue_task, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
@@ -301,6 +301,14 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
 ///
 /// 不切换 CPU；调用方决定何时调 [`schedule_once`]。
 pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
+    if task.is_idle_task() {
+        log::error!(
+            "[sched][exit] refusing to exit idle task pid={:?}",
+            task.pid_root(),
+        );
+        return;
+    }
+
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
     //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。
     let children = task.snapshot_children();
@@ -383,7 +391,7 @@ pub fn reap_matching<F>(parent: &Arc<Task>, mut pred: F) -> Option<(Arc<Task>, E
 where
     F: FnMut(&Arc<Task>) -> bool,
 {
-    let zombie = parent.reap_matching(|t| pred(t))?;
+    let zombie = parent.reap_matching(|t| t.is_user_task() && pred(t))?;
     let code = zombie
         .exit_code()
         .expect("[sched][reap] zombie without exit code");
@@ -402,6 +410,7 @@ where
     // 进程已经不再运行；在父进程 wait 上下文释放 VM/FDT/VFS 等重量级资源。
     // wait 状态和 procfs 需要的轻量字段仍保留在 Task 本体中。
     zombie.cleanup_exit_extensions();
+    zombie.retire_execution();
 
     debug_assert_eq!(zombie.state(), TaskState::Dead);
     log::debug!(
@@ -418,7 +427,7 @@ pub fn list_zombie_children(parent: &Arc<Task>) -> Vec<Arc<Task>> {
     parent
         .snapshot_children()
         .into_iter()
-        .filter(|c| c.state() == TaskState::Zombie)
+        .filter(|c| c.is_user_task() && c.state() == TaskState::Zombie)
         .collect()
 }
 
@@ -427,11 +436,33 @@ pub fn list_zombie_children(parent: &Arc<Task>) -> Vec<Arc<Task>> {
 /// 从 init 派生一个内核线程。线程入口签名：
 /// `unsafe extern "C" fn(arg: usize) -> !`，内部以 [`kthread_finish`] 退出。
 pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc<Task> {
-    let init = init_task();
-    let child = spawn_child(&init, SpawnKind::Thread, params);
-    if child.state() == TaskState::Dead {
+    let root_ns = root_pid_ns();
+    let session = Session::new();
+    let pgroup = ProcessGroup::new(&session);
+    session.register_group(&pgroup);
+    let tgroup = ThreadGroup::new();
+
+    // 内核线程必须和 PID 1 的用户态进程彻底分离：不作为 init 的普通子线程，
+    // 不共享 init 的 SharedSignal，也不进入 init 的进程组。否则 Ctrl-C /
+    // exit_group / wait 这类 POSIX 路径会误伤 idle 和其它内核线程。
+    let child = Task::new(params, alloc::sync::Weak::new(), Arc::clone(&tgroup), Arc::clone(&pgroup));
+    child.mark_kernel_thread();
+    child.set_exit_signal(0);
+
+    let Some(pid) = root_ns.registry().allocate(&child) else {
+        log::warning!("[sched][kthread] pid allocation failed");
+        child.set_state(TaskState::Dead);
         return child;
-    }
+    };
+    child.register_pid(Arc::clone(&root_ns), pid);
+    tgroup.set_leader(&child);
+    tgroup.set_tgid(pid);
+    tgroup.add_member(&child);
+    pgroup.set_pgid(pid);
+    pgroup.add_member(&child);
+    session.set_leader(&child);
+    session.set_sid(pid);
+
     child.into_kernel_thread(entry, arg);
     child
 }
