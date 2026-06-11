@@ -309,6 +309,8 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
         return;
     }
 
+    task.cleanup_before_exit();
+
     // 1) 先把自己的子任务托管给 init，让它们在父死后仍有 reaper。
     //    init 任务本身退出（正常情况下不会发生）时跳过，避免自引用成环。
     let children = task.snapshot_children();
@@ -445,7 +447,12 @@ pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Ar
     // 内核线程必须和 PID 1 的用户态进程彻底分离：不作为 init 的普通子线程，
     // 不共享 init 的 SharedSignal，也不进入 init 的进程组。否则 Ctrl-C /
     // exit_group / wait 这类 POSIX 路径会误伤 idle 和其它内核线程。
-    let child = Task::new(params, alloc::sync::Weak::new(), Arc::clone(&tgroup), Arc::clone(&pgroup));
+    let child = Task::new(
+        params,
+        alloc::sync::Weak::new(),
+        Arc::clone(&tgroup),
+        Arc::clone(&pgroup),
+    );
     child.mark_kernel_thread();
     child.set_exit_signal(0);
 

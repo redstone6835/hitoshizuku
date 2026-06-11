@@ -71,9 +71,6 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
     let task = Arc::clone(ctx.task());
     log::debug!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
-    futex_remove_task_waiters(&task);
-    exit_robust_list(&task);
-    clear_child_tid_and_wake(&task);
     release_exit_files(&task);
     ctx.release_task_ref();
     drop(task);
@@ -89,9 +86,6 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         code
     );
     for member in task.thread_group().snapshot() {
-        futex_remove_task_waiters(&member);
-        exit_robust_list(&member);
-        clear_child_tid_and_wake(&member);
         release_exit_files(&member);
     }
     ctx.release_task_ref();
@@ -2130,7 +2124,7 @@ fn clear_child_tid_and_wake(task: &Arc<Task>) {
     if tid_addr == 0 {
         return;
     }
-    let zero = 0usize;
+    let zero = 0u32;
     let _ = copy_to_user(tid_addr, &zero.to_ne_bytes());
     task.set_clear_child_tid(0);
     let _ = futex_wake_addr(task, tid_addr, 1);
@@ -2973,6 +2967,48 @@ fn task_vm_space(task: &Arc<Task>) -> Option<Arc<VmSpace>> {
     task.ext_lookup(sched::TASKEXT_VM_SPACE)?
         .downcast::<VmSpace>()
         .ok()
+}
+
+pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
+    if task.is_kernel_task() {
+        return;
+    }
+    let _ = sched::cancel_sleep_deadline(task);
+    let current = sched::current_task();
+    if Arc::ptr_eq(&current, task) {
+        cleanup_task_before_exit_in_active_vm(task);
+        return;
+    }
+    let target_vm = task_vm_space(task);
+    let current_vm = task_vm_space(&current);
+    let switch_vm = match (&target_vm, &current_vm) {
+        (Some(target), Some(current)) => !Arc::ptr_eq(target, current),
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if switch_vm {
+        let saved = current.ext_remove(sched::TASKEXT_VM_SPACE);
+        if let Some(vm) = target_vm.as_ref() {
+            current.ext_install(sched::TASKEXT_VM_SPACE, vm.clone());
+            vm.activate();
+        }
+        cleanup_task_before_exit_in_active_vm(task);
+        current.ext_remove(sched::TASKEXT_VM_SPACE);
+        if let Some(saved) = saved {
+            current.ext_install(sched::TASKEXT_VM_SPACE, saved);
+        }
+        if let Some(vm) = current_vm.as_ref() {
+            vm.activate();
+        }
+    } else {
+        cleanup_task_before_exit_in_active_vm(task);
+    }
+}
+
+fn cleanup_task_before_exit_in_active_vm(task: &Arc<Task>) {
+    let _ = futex_remove_task_waiters(task);
+    exit_robust_list(task);
+    clear_child_tid_and_wake(task);
 }
 
 fn kcmp_arc<T>(left: &Arc<T>, right: &Arc<T>) -> usize {

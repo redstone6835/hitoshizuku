@@ -465,6 +465,9 @@ pub struct Task {
     /// 退出清理是否已经运行。exit、最终切换和 wait/reap 都可能观察到同一个任务，
     /// 必须只让上层 ext hook 执行一次。
     ext_exit_cleaned: AtomicBool,
+    /// 进入退出态前的用户态线程 ABI 清理是否已经运行。该阶段仍可访问用户地址空间，
+    /// 用于 clear-child-tid、robust futex 等必须在释放 VM 前完成的动作。
+    pre_exit_cleaned: AtomicBool,
 }
 
 impl Task {
@@ -526,6 +529,7 @@ impl Task {
             ioprio: AtomicU32::new(0),
             ext: Spinlock::new(Vec::new()),
             ext_exit_cleaned: AtomicBool::new(false),
+            pre_exit_cleaned: AtomicBool::new(false),
         });
         TASK_TRACKER.lock().push(Arc::downgrade(&task));
         task
@@ -861,6 +865,20 @@ impl Task {
         }
     }
 
+    /// 在任务进入 Zombie/Dead 前运行一次上层用户态退出清理。
+    ///
+    /// 与 [`cleanup_exit_extensions`] 不同，这个 hook 必须在 VmSpace/FdTable 等
+    /// 上层扩展仍挂在 task 上时执行；robust futex 和 CLONE_CHILD_CLEARTID 都依赖
+    /// 这个时序。
+    pub(crate) fn cleanup_before_exit(self: &Arc<Self>) {
+        if self.pre_exit_cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(hook) = pre_exit_hook() {
+            hook.cleanup_before_exit(self);
+        }
+    }
+
     /// 确保当前任务拥有一段内核 trap 栈，并返回栈顶。
     ///
     /// boot init 任务是通过 [`Task::adopt_current_context`] 接管当前上下文的，
@@ -1177,8 +1195,14 @@ pub trait TaskExtExitHook: Send + Sync {
     fn cleanup_on_exit(&self, task: &Arc<Task>);
 }
 
+/// task 进入退出态前由上层执行用户态 ABI 清理。
+pub trait TaskPreExitHook: Send + Sync {
+    fn cleanup_before_exit(&self, task: &Arc<Task>);
+}
+
 static EXT_CLONE_HOOK: Spinlock<Option<&'static dyn TaskExtCloneHook>> = Spinlock::new(None);
 static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
+static PRE_EXIT_HOOK: Spinlock<Option<&'static dyn TaskPreExitHook>> = Spinlock::new(None);
 
 /// 注册全局 ext clone hook。kernel 启动期调用一次。
 pub fn register_ext_clone_hook(hook: &'static dyn TaskExtCloneHook) {
@@ -1198,4 +1222,14 @@ pub fn register_ext_exit_hook(hook: &'static dyn TaskExtExitHook) {
 /// 取已注册的 exit hook；未注册返回 `None`。
 pub fn ext_exit_hook() -> Option<&'static dyn TaskExtExitHook> {
     *EXT_EXIT_HOOK.lock()
+}
+
+/// 注册全局 pre-exit hook。kernel 启动期调用一次。
+pub fn register_pre_exit_hook(hook: &'static dyn TaskPreExitHook) {
+    *PRE_EXIT_HOOK.lock() = Some(hook);
+}
+
+/// 取已注册的 pre-exit hook；未注册返回 `None`。
+pub fn pre_exit_hook() -> Option<&'static dyn TaskPreExitHook> {
+    *PRE_EXIT_HOOK.lock()
 }
