@@ -71,6 +71,22 @@ impl RouteEntry {
             metric: 10,
         }
     }
+
+    /// 构造静态 IPv6 路由。
+    pub fn static_v6(
+        destination: Ipv6Addr,
+        prefix_len: u8,
+        gateway: Ipv6Addr,
+        iface: InterfaceId,
+    ) -> Self {
+        Self {
+            destination: CidrAddress::new_v6(destination, prefix_len),
+            iface,
+            next_hop: NextHop::Gateway(IpAddr::V6(gateway)),
+            source: RouteSource::Static,
+            metric: 10,
+        }
+    }
 }
 
 /// 路由查询结果。
@@ -395,6 +411,24 @@ mod tests {
                 .iface,
             iface(7)
         );
+    }
+
+    #[test]
+    fn static_ipv6_route_is_normalized_and_removable() {
+        let mut table = RouteTable::new();
+        let route_iface = iface(8);
+        let dest = Ipv6Addr::new([0x2001, 0x0db8, 0x1234, 0xabcd, 0, 0, 0, 1]);
+        let gateway = Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1]);
+        let remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x1234, 0xffff, 0, 0, 0, 99]));
+
+        table.upsert(RouteEntry::static_v6(dest, 48, gateway, route_iface));
+        let route = table.lookup(&remote).unwrap();
+        assert_eq!(route.iface, route_iface);
+        assert_eq!(route.prefix_len, 48);
+        assert_eq!(route.next_hop, NextHop::Gateway(IpAddr::V6(gateway)));
+
+        table.remove_static(route_iface, CidrAddress::new_v6(dest, 48));
+        assert_eq!(table.lookup(&remote), None);
     }
 
     #[test]

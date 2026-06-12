@@ -140,14 +140,21 @@ impl NetStack {
     /// 此操作短暂持有写锁，会暂停所有正在进行的 poll。
     pub fn attach(&self, dev: Arc<NetDevice>, config: IfConfig) -> Result<(), NetError> {
         let id = dev.id();
-        let managed =
-            ManagedInterface::new(dev, config.clone(), self.tuning.tcp, self.tuning.tcp_listen);
-        let mut table = self.interfaces.write();
-        if table.contains_key(&id) {
-            return Err(NetError::InterfaceExists);
+        {
+            let table = self.interfaces.read();
+            if table.contains_key(&id) {
+                return Err(NetError::InterfaceExists);
+            }
         }
-        table.insert(id, Arc::new(Mutex::new(managed)));
-        drop(table);
+        let managed =
+            ManagedInterface::new(dev, config.clone(), self.tuning.tcp, self.tuning.tcp_listen)?;
+        {
+            let mut table = self.interfaces.write();
+            if table.contains_key(&id) {
+                return Err(NetError::InterfaceExists);
+            }
+            table.insert(id, Arc::new(Mutex::new(managed)));
+        }
         let mut routes = self.routes.write();
         routes.replace_connected(id, &config.addresses);
         routes.replace_gateway(id, config.gateway);
@@ -1028,7 +1035,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_default_route_v4(gateway);
+        managed.add_default_route_v4(gateway)?;
         drop(managed);
         drop(table);
         self.routes
@@ -1058,7 +1065,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_default_route_v6(gateway);
+        managed.add_default_route_v6(gateway)?;
         drop(managed);
         drop(table);
         self.routes
@@ -1091,7 +1098,25 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.set_ipv4_addr(addr, prefix);
+        managed.set_ipv4_addr(addr, prefix)?;
+        let addresses = managed.config().addresses.clone();
+        drop(managed);
+        drop(table);
+        self.routes.write().replace_connected(id, &addresses);
+        Ok(())
+    }
+
+    /// 设置指定接口的 IPv6 地址。
+    pub fn set_iface_ipv6_addr(
+        &self,
+        id: InterfaceId,
+        addr: crate::Ipv6Addr,
+        prefix: u8,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_ipv6_addr(addr, prefix)?;
         let addresses = managed.config().addresses.clone();
         drop(managed);
         drop(table);
@@ -1108,7 +1133,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.apply_config(config);
+        managed.apply_config(config)?;
         let addresses = managed.config().addresses.clone();
         let gateway = managed.config().gateway;
         drop(managed);
@@ -1149,18 +1174,19 @@ impl NetStack {
         mask: crate::Ipv4Addr,
         gw: crate::Ipv4Addr,
     ) -> Result<(), NetError> {
+        let prefix_len = prefix_len_from_mask(mask)?;
+        if prefix_len == 0 {
+            return self.add_default_route_v4(id, gw);
+        }
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_route_v4(dest, mask, gw);
+        managed.add_route_v4(dest, mask, gw)?;
         drop(managed);
         drop(table);
-        self.routes.write().upsert(RouteEntry::static_v4(
-            dest,
-            mask_to_prefix_len(mask),
-            gw,
-            id,
-        ));
+        self.routes
+            .write()
+            .upsert(RouteEntry::static_v4(dest, prefix_len, gw, id));
         Ok(())
     }
 
@@ -1171,15 +1197,66 @@ impl NetStack {
         dest: crate::Ipv4Addr,
         mask: crate::Ipv4Addr,
     ) -> Result<(), NetError> {
+        let prefix_len = prefix_len_from_mask(mask)?;
+        if prefix_len == 0 {
+            return self.remove_default_route_v4(id);
+        }
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.remove_route_v4(dest, mask);
+        managed.remove_route_v4(dest, mask)?;
         drop(managed);
         drop(table);
         self.routes
             .write()
-            .remove_static(id, CidrAddress::new_v4(dest, mask_to_prefix_len(mask)));
+            .remove_static(id, CidrAddress::new_v4(dest, prefix_len));
+        Ok(())
+    }
+
+    /// 在指定接口上添加 IPv6 路由。
+    pub fn add_route_v6(
+        &self,
+        id: InterfaceId,
+        dest: crate::Ipv6Addr,
+        prefix_len: u8,
+        gw: crate::Ipv6Addr,
+    ) -> Result<(), NetError> {
+        let prefix_len = prefix_len.min(128);
+        if prefix_len == 0 {
+            return self.add_default_route_v6(id, gw);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.add_route_v6(dest, prefix_len, gw)?;
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .upsert(RouteEntry::static_v6(dest, prefix_len, gw, id));
+        Ok(())
+    }
+
+    /// 在指定接口上删除 IPv6 路由。
+    pub fn remove_route_v6(
+        &self,
+        id: InterfaceId,
+        dest: crate::Ipv6Addr,
+        prefix_len: u8,
+    ) -> Result<(), NetError> {
+        let prefix_len = prefix_len.min(128);
+        if prefix_len == 0 {
+            return self.remove_default_route_v6(id);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.remove_route_v6(dest, prefix_len);
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .remove_static(id, CidrAddress::new_v6(dest, prefix_len));
         Ok(())
     }
 
@@ -2222,8 +2299,19 @@ fn map_icmp_bind_error(err: smoltcp::socket::icmp::BindError) -> NetError {
     }
 }
 
-fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
-    u32::from_be_bytes(mask.0).leading_ones() as u8
+fn prefix_len_from_mask(mask: Ipv4Addr) -> Result<u8, NetError> {
+    let bits = u32::from_be_bytes(mask.0);
+    let prefix_len = bits.leading_ones() as u8;
+    let expected = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    if bits == expected {
+        Ok(prefix_len)
+    } else {
+        Err(NetError::InvalidArgument)
+    }
 }
 
 fn select_tcp_ephemeral_port(
@@ -3394,6 +3482,110 @@ mod tests {
     }
 
     #[test]
+    fn attach_rejects_invalid_interface_address() {
+        let stack = NetStack::new();
+        let driver = Arc::new(TestDriver::default());
+        let dev = Arc::new(NetDevice::new("eth-invalid-addr", driver));
+        assert_eq!(
+            stack.attach(
+                dev,
+                IfConfig::static_v4(Ipv4Addr::new(224, 0, 0, 1), 24, None)
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert!(stack.snapshot_interfaces().is_empty());
+        assert_eq!(
+            stack.ensure_socket_route_matches(
+                InterfaceId(0),
+                &IpAddr::V4(Ipv4Addr::new(224, 0, 0, 2)),
+            ),
+            Err(NetError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn set_iface_ipv6_addr_preserves_ipv4_and_replaces_v6_route() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-set-v6",
+            IfConfig::static_v4(Ipv4Addr::new(10, 45, 0, 2), 24, None),
+        );
+        let first_v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0045, 0, 0, 0, 0, 2]);
+        let second_v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0046, 0, 0, 0, 0, 2]);
+        let v4_remote = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 99));
+        let first_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0045, 0, 0, 0, 0, 99]));
+        let second_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0046, 0, 0, 0, 0, 99]));
+
+        stack.set_iface_ipv6_addr(iface, first_v6, 64).unwrap();
+        let configured = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(
+            configured.addresses,
+            alloc::vec![
+                CidrAddress::new_v4(Ipv4Addr::new(10, 45, 0, 2), 24),
+                CidrAddress::new_v6(first_v6, 64),
+            ]
+        );
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &first_remote),
+            Ok(())
+        );
+
+        stack.set_iface_ipv6_addr(iface, second_v6, 64).unwrap();
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &first_remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &second_remote),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn set_iface_ipv6_addr_does_not_update_routes_on_address_capacity_error() {
+        let stack = NetStack::new();
+        let mut addresses = Vec::new();
+        for i in 0..smoltcp::config::IFACE_MAX_ADDR_COUNT {
+            addresses.push(CidrAddress::new_v4(Ipv4Addr::new(10, 47, i as u8, 2), 24));
+        }
+        let iface = attach_test_iface(
+            &stack,
+            "eth-set-v6-full",
+            IfConfig {
+                addresses: addresses.clone(),
+                gateway: None,
+                mode: crate::IfMode::Static,
+            },
+        );
+        let v4_remote = IpAddr::V4(Ipv4Addr::new(10, 47, 0, 99));
+        let v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0047, 0, 0, 0, 0, 2]);
+        let v6_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0047, 0, 0, 0, 0, 99]));
+
+        assert_eq!(
+            stack.set_iface_ipv6_addr(iface, v6, 64),
+            Err(NetError::ResourceExhausted)
+        );
+        let snapshot = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(snapshot.addresses, addresses);
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &v6_remote),
+            Err(NetError::Unreachable)
+        );
+    }
+
+    #[test]
     fn ipv6_default_route_updates_route_table_without_dropping_ipv4() {
         let stack = NetStack::new();
         let config = IfConfig {
@@ -3413,20 +3605,147 @@ mod tests {
             stack.ensure_socket_route_matches(iface, &v6_remote),
             Err(NetError::Unreachable)
         );
-
-        stack
-            .add_default_route_v6(
-                iface,
-                Ipv6Addr::new([0x2001, 0x0db8, 0x0044, 0, 0, 0, 0, 1]),
-            )
+        let initial = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
             .unwrap();
+        assert_eq!(
+            initial.gateway,
+            Some(Gateway::V4(Ipv4Addr::new(10, 44, 0, 1)))
+        );
+
+        let v6_gateway = Ipv6Addr::new([0x2001, 0x0db8, 0x0044, 0, 0, 0, 0, 1]);
+        stack.add_default_route_v6(iface, v6_gateway).unwrap();
         assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
         assert_eq!(stack.ensure_socket_route_matches(iface, &v6_remote), Ok(()));
+        let dual_stack = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(
+            dual_stack.gateway,
+            Some(Gateway::DualStack {
+                v4: Ipv4Addr::new(10, 44, 0, 1),
+                v6: v6_gateway,
+            })
+        );
 
         stack.remove_default_route_v6(iface).unwrap();
         assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
         assert_eq!(
             stack.ensure_socket_route_matches(iface, &v6_remote),
+            Err(NetError::Unreachable)
+        );
+        let v4_only = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(
+            v4_only.gateway,
+            Some(Gateway::V4(Ipv4Addr::new(10, 44, 0, 1)))
+        );
+    }
+
+    #[test]
+    fn zero_prefix_static_route_uses_default_gateway_state() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-zero-default",
+            IfConfig::static_v4(Ipv4Addr::new(10, 46, 0, 2), 24, None),
+        );
+        let gateway = Ipv4Addr::new(10, 46, 0, 1);
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 46));
+
+        stack
+            .add_route(iface, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, gateway)
+            .unwrap();
+
+        let snapshot = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(snapshot.gateway, Some(Gateway::V4(gateway)));
+        let lookup = stack.routes.read().lookup(&remote).unwrap();
+        assert_eq!(lookup.source, crate::route::RouteSource::Gateway);
+        assert_eq!(stack.ensure_socket_route_matches(iface, &remote), Ok(()));
+
+        stack
+            .remove_route(iface, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED)
+            .unwrap();
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
+            Err(NetError::Unreachable)
+        );
+        let snapshot = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(snapshot.gateway, None);
+    }
+
+    #[test]
+    fn ipv4_static_route_rejects_non_contiguous_netmask() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-v4-mask",
+            IfConfig::static_v4(Ipv4Addr::new(10, 48, 0, 2), 24, None),
+        );
+        let invalid_mask = Ipv4Addr::new(255, 0, 255, 0);
+        let remote = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+
+        assert_eq!(
+            stack.add_route(
+                iface,
+                Ipv4Addr::new(198, 51, 100, 0),
+                invalid_mask,
+                Ipv4Addr::new(10, 48, 0, 1),
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.remove_route(iface, Ipv4Addr::new(198, 51, 0, 0), invalid_mask),
+            Err(NetError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn ipv6_static_route_selects_interface_and_can_be_removed() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-v6-static",
+            IfConfig::static_v6(
+                Ipv6Addr::new([0x2001, 0x0db8, 0x0055, 0, 0, 0, 0, 2]),
+                64,
+                None,
+            ),
+        );
+        let dest = Ipv6Addr::new([0x2001, 0x0db8, 0x9955, 0, 0, 0, 0, 0]);
+        let remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x9955, 0x1234, 0, 0, 0, 77]));
+        let gateway = Ipv6Addr::new([0x2001, 0x0db8, 0x0055, 0, 0, 0, 0, 1]);
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
+            Err(NetError::Unreachable)
+        );
+
+        stack.add_route_v6(iface, dest, 48, gateway).unwrap();
+        assert_eq!(stack.ensure_socket_route_matches(iface, &remote), Ok(()));
+
+        stack.remove_route_v6(iface, dest, 48).unwrap();
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
             Err(NetError::Unreachable)
         );
     }
