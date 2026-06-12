@@ -422,7 +422,7 @@ impl ManagedInterface {
         mask: Ipv4Addr,
         gateway: Ipv4Addr,
     ) -> Result<(), crate::NetError> {
-        let prefix_len = mask_to_prefix_len(mask);
+        let prefix_len = prefix_len_from_mask(mask)?;
         if prefix_len == 0 {
             self.add_default_route_v4(gateway)
         } else {
@@ -438,8 +438,12 @@ impl ManagedInterface {
     }
 
     /// 删除 IPv4 路由。
-    pub fn remove_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) {
-        let prefix_len = mask_to_prefix_len(mask);
+    pub fn remove_route_v4(
+        &mut self,
+        dest: Ipv4Addr,
+        mask: Ipv4Addr,
+    ) -> Result<(), crate::NetError> {
+        let prefix_len = prefix_len_from_mask(mask)?;
         if prefix_len == 0 {
             self.remove_default_route_v4();
         } else {
@@ -451,6 +455,7 @@ impl ManagedInterface {
                 )),
             );
         }
+        Ok(())
     }
 
     /// 添加 IPv6 静态网关路由到当前协议引擎。
@@ -1475,8 +1480,19 @@ fn generate_seed(id: InterfaceId) -> u64 {
     raw.wrapping_mul(6364136223846793005).wrapping_add(1)
 }
 
-fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
-    u32::from_be_bytes(mask.0).leading_ones() as u8
+fn prefix_len_from_mask(mask: Ipv4Addr) -> Result<u8, crate::NetError> {
+    let bits = u32::from_be_bytes(mask.0);
+    let prefix_len = bits.leading_ones() as u8;
+    let expected = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    if bits == expected {
+        Ok(prefix_len)
+    } else {
+        Err(crate::NetError::InvalidArgument)
+    }
 }
 
 fn network_v4_addr(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
@@ -1626,10 +1642,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(find_smoltcp_route(&mut iface, v4_cidr), Some(v4_gateway));
-        iface.remove_route_v4(
-            Ipv4Addr::new(198, 51, 100, 0),
-            Ipv4Addr::new(255, 255, 255, 0),
-        );
+        iface
+            .remove_route_v4(
+                Ipv4Addr::new(198, 51, 100, 0),
+                Ipv4Addr::new(255, 255, 255, 0),
+            )
+            .unwrap();
         assert_eq!(find_smoltcp_route(&mut iface, v4_cidr), None);
 
         assert_eq!(find_smoltcp_route(&mut iface, v6_cidr), None);
@@ -1643,6 +1661,27 @@ mod tests {
         assert_eq!(find_smoltcp_route(&mut iface, v6_cidr), Some(v6_gateway));
         iface.remove_route_v6(Ipv6Addr::new([0x2001, 0x0db8, 0x8866, 0, 0, 0, 0, 0]), 48);
         assert_eq!(find_smoltcp_route(&mut iface, v6_cidr), None);
+    }
+
+    #[test]
+    fn ipv4_route_rejects_non_contiguous_netmask() {
+        let (_id, mut iface) = test_interface();
+        let cidr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(198, 51, 0, 0), 16));
+        let invalid_mask = Ipv4Addr::new(255, 0, 255, 0);
+
+        assert_eq!(
+            iface.add_route_v4(
+                Ipv4Addr::new(198, 51, 100, 1),
+                invalid_mask,
+                Ipv4Addr::new(10, 0, 0, 1),
+            ),
+            Err(crate::NetError::InvalidArgument)
+        );
+        assert_eq!(find_smoltcp_route(&mut iface, cidr), None);
+        assert_eq!(
+            iface.remove_route_v4(Ipv4Addr::new(198, 51, 0, 0), invalid_mask),
+            Err(crate::NetError::InvalidArgument)
+        );
     }
 
     fn find_smoltcp_route(iface: &mut ManagedInterface, cidr: IpCidr) -> Option<IpAddress> {

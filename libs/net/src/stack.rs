@@ -1174,7 +1174,8 @@ impl NetStack {
         mask: crate::Ipv4Addr,
         gw: crate::Ipv4Addr,
     ) -> Result<(), NetError> {
-        if mask_to_prefix_len(mask) == 0 {
+        let prefix_len = prefix_len_from_mask(mask)?;
+        if prefix_len == 0 {
             return self.add_default_route_v4(id, gw);
         }
         let table = self.interfaces.read();
@@ -1183,12 +1184,9 @@ impl NetStack {
         managed.add_route_v4(dest, mask, gw)?;
         drop(managed);
         drop(table);
-        self.routes.write().upsert(RouteEntry::static_v4(
-            dest,
-            mask_to_prefix_len(mask),
-            gw,
-            id,
-        ));
+        self.routes
+            .write()
+            .upsert(RouteEntry::static_v4(dest, prefix_len, gw, id));
         Ok(())
     }
 
@@ -1199,18 +1197,19 @@ impl NetStack {
         dest: crate::Ipv4Addr,
         mask: crate::Ipv4Addr,
     ) -> Result<(), NetError> {
-        if mask_to_prefix_len(mask) == 0 {
+        let prefix_len = prefix_len_from_mask(mask)?;
+        if prefix_len == 0 {
             return self.remove_default_route_v4(id);
         }
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.remove_route_v4(dest, mask);
+        managed.remove_route_v4(dest, mask)?;
         drop(managed);
         drop(table);
         self.routes
             .write()
-            .remove_static(id, CidrAddress::new_v4(dest, mask_to_prefix_len(mask)));
+            .remove_static(id, CidrAddress::new_v4(dest, prefix_len));
         Ok(())
     }
 
@@ -2292,8 +2291,19 @@ fn map_icmp_bind_error(err: smoltcp::socket::icmp::BindError) -> NetError {
     }
 }
 
-fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
-    u32::from_be_bytes(mask.0).leading_ones() as u8
+fn prefix_len_from_mask(mask: Ipv4Addr) -> Result<u8, NetError> {
+    let bits = u32::from_be_bytes(mask.0);
+    let prefix_len = bits.leading_ones() as u8;
+    let expected = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    if bits == expected {
+        Ok(prefix_len)
+    } else {
+        Err(NetError::InvalidArgument)
+    }
 }
 
 fn select_tcp_ephemeral_port(
@@ -3669,6 +3679,36 @@ mod tests {
             .find(|snapshot| snapshot.id == iface)
             .unwrap();
         assert_eq!(snapshot.gateway, None);
+    }
+
+    #[test]
+    fn ipv4_static_route_rejects_non_contiguous_netmask() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-v4-mask",
+            IfConfig::static_v4(Ipv4Addr::new(10, 48, 0, 2), 24, None),
+        );
+        let invalid_mask = Ipv4Addr::new(255, 0, 255, 0);
+        let remote = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+
+        assert_eq!(
+            stack.add_route(
+                iface,
+                Ipv4Addr::new(198, 51, 100, 0),
+                invalid_mask,
+                Ipv4Addr::new(10, 48, 0, 1),
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.remove_route(iface, Ipv4Addr::new(198, 51, 0, 0), invalid_mask),
+            Err(NetError::InvalidArgument)
+        );
     }
 
     #[test]
