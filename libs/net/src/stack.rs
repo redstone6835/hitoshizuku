@@ -651,6 +651,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
+        ensure_local_addr_available(&managed, &local.addr)?;
         if local.port != 0 {
             let local_ep = endpoint_to_smoltcp_listen(&local);
             if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
@@ -1163,6 +1164,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
+        ensure_local_addr_available(&managed, &local.addr)?;
         if local.port != 0 {
             let local_ep = endpoint_to_smoltcp_listen(&local);
             if managed.udp_endpoint_in_use(handle.inner, local_ep) {
@@ -1964,6 +1966,19 @@ fn validate_transport_remote(remote: &Endpoint) -> Result<(), NetError> {
     Ok(())
 }
 
+fn ensure_local_addr_available(managed: &ManagedInterface, addr: &IpAddr) -> Result<(), NetError> {
+    if is_unspecified_ip(addr)
+        || managed
+            .config()
+            .addresses
+            .iter()
+            .any(|assigned| assigned.addr == *addr)
+    {
+        return Ok(());
+    }
+    Err(NetError::InvalidArgument)
+}
+
 fn endpoint_from_ip_address(addr: IpAddress) -> Endpoint {
     let addr = match addr {
         IpAddress::Ipv4(v4) => IpAddr::V4(Ipv4Addr(v4.octets())),
@@ -2510,6 +2525,39 @@ mod tests {
     }
 
     #[test]
+    fn udp_bind_rejects_nonlocal_address() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-udp-bind-local",
+            IfConfig::static_v4(Ipv4Addr::new(10, 7, 1, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.udp_bind(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 7, 2, 2)),
+                    port: 7777,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.udp_bind(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 7, 2, 2)),
+                    port: 0,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
     fn udp_connect_auto_binds_and_records_peer() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -2842,6 +2890,39 @@ mod tests {
                 Endpoint {
                     addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     port: 80,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(stack.socket_state(handle), SocketState::Closed);
+    }
+
+    #[test]
+    fn tcp_listen_rejects_nonlocal_address() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-tcp-listen-local",
+            IfConfig::static_v4(Ipv4Addr::new(10, 11, 1, 2), 24, None),
+        );
+        let handle = stack.socket_tcp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.tcp_listen(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 11, 2, 2)),
+                    port: 8080,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.tcp_listen(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 11, 2, 2)),
+                    port: 0,
                 },
             ),
             Err(NetError::InvalidArgument)
