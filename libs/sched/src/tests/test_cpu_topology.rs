@@ -38,6 +38,59 @@ fn sched_topology_rejects_invalid_domains() {
 
     let bad_level = SchedDomain::new(1, CpuMask::single_raw(0), 0, Some(0)).expect("bad level");
     assert!(SchedTopology::from_domains(&[SchedDomain::root(), bad_level]).is_err());
+
+    let left = SchedDomain::new(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+    )
+    .expect("left sibling");
+    let right = SchedDomain::new(
+        2,
+        CpuMask::single_raw(1).union(CpuMask::single_raw(2)),
+        1,
+        Some(0),
+    )
+    .expect("right sibling");
+    assert!(SchedTopology::from_domains(&[SchedDomain::root(), left, right]).is_err());
+}
+
+#[ktest]
+fn sched_topology_allows_nested_overlapping_domains() {
+    let cluster = SchedDomain::new(
+        1,
+        CpuMask::single_raw(0)
+            .union(CpuMask::single_raw(1))
+            .union(CpuMask::single_raw(2)),
+        1,
+        Some(0),
+    )
+    .expect("cluster domain");
+    let core_pair = SchedDomain::new(
+        2,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        2,
+        Some(1),
+    )
+    .expect("nested domain");
+
+    let topology =
+        SchedTopology::from_domains(&[SchedDomain::root(), cluster, core_pair]).expect("topology");
+    assert_eq!(
+        topology
+            .domain_for_cpu(CpuId::new(0).unwrap())
+            .unwrap()
+            .id(),
+        2
+    );
+    assert_eq!(
+        topology
+            .domain_for_cpu(CpuId::new(2).unwrap())
+            .unwrap()
+            .id(),
+        1
+    );
 }
 
 #[ktest]

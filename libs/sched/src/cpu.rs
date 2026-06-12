@@ -326,6 +326,21 @@ impl SchedTopology {
             }
         }
 
+        // 非根域可以嵌套，但不能形成“相交却互不隶属”的兄弟关系。否则同一
+        // CPU 的最小域归属会依赖输入顺序，后续放置和均衡都无法得到稳定语义。
+        for left in 1..out.len {
+            for right in left + 1..out.len {
+                let left_domain = out.domains[left];
+                let right_domain = out.domains[right];
+                if !left_domain.span.intersects(right_domain.span) {
+                    continue;
+                }
+                if !out.domain_is_ancestor(left, right) && !out.domain_is_ancestor(right, left) {
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
+
         for cpu in CpuMask::SUPPORTED.iter() {
             out.cpu_domain[cpu.get()] = out.best_domain_for_cpu(cpu);
         }
@@ -447,6 +462,22 @@ impl SchedTopology {
             }
         }
         best
+    }
+
+    fn domain_is_ancestor(self, ancestor: usize, child: usize) -> bool {
+        let mut seen = 0usize;
+        let mut cursor = self.domains[child].parent;
+        while let Some(parent) = cursor {
+            if parent == ancestor {
+                return true;
+            }
+            if parent >= self.len || seen >= self.len {
+                return false;
+            }
+            seen += 1;
+            cursor = self.domains[parent].parent;
+        }
+        false
     }
 }
 
