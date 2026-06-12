@@ -436,13 +436,17 @@ impl SchedTopology {
         }
     }
 
-    /// 返回可从中拉取任务的同域 CPU 集，不包含本 CPU。
+    /// 返回最近可拉取任务的调度域 CPU 集，不包含本 CPU。
     pub fn balance_sources(self, cpu: CpuId, online: CpuMask) -> CpuMask {
-        let span = self
-            .domain_for_cpu(cpu)
-            .map(|domain| domain.span)
-            .unwrap_or_else(|| self.root_domain().span);
-        span.intersection(online).without(cpu)
+        let mut domain_id = self.cpu_domain[cpu.get()];
+        loop {
+            let domain = self.domain(domain_id).unwrap_or_else(|| self.root_domain());
+            let sources = domain.span.intersection(online).without(cpu);
+            if !sources.is_empty() || domain.id == ROOT_SCHED_DOMAIN_ID {
+                return sources;
+            }
+            domain_id = domain.parent.unwrap_or(ROOT_SCHED_DOMAIN_ID);
+        }
     }
 
     fn best_domain_for_cpu(self, cpu: CpuId) -> usize {

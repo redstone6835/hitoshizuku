@@ -135,6 +135,37 @@ fn sched_topology_selects_inside_local_domain_first() {
 }
 
 #[ktest]
+fn sched_topology_balance_sources_fall_back_to_parent_domain() {
+    let root = SchedDomain::root();
+    let cluster = SchedDomain::new(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+    )
+    .expect("cluster domain");
+    let leaf = SchedDomain::new(2, CpuMask::single_raw(0), 2, Some(1)).expect("leaf domain");
+    let remote = SchedDomain::new(3, CpuMask::single_raw(2), 1, Some(0)).expect("remote domain");
+    let topology = SchedTopology::from_domains(&[root, cluster, leaf, remote]).expect("topology");
+    let online = CpuMask::single_raw(0)
+        .union(CpuMask::single_raw(1))
+        .union(CpuMask::single_raw(2));
+
+    let sources = topology.balance_sources(CpuId::new(0).unwrap(), online);
+
+    assert!(sources.contains_raw(1));
+    assert!(!sources.contains_raw(0));
+    assert!(!sources.contains_raw(2));
+
+    let root_sources = topology.balance_sources(
+        CpuId::new(0).unwrap(),
+        CpuMask::single_raw(0).union(CpuMask::single_raw(2)),
+    );
+    assert!(root_sources.contains_raw(2));
+    assert!(!root_sources.contains_raw(1));
+}
+
+#[ktest]
 fn sched_topology_falls_back_to_root_when_local_domain_unusable() {
     let root = SchedDomain::root();
     let local = SchedDomain::new(
