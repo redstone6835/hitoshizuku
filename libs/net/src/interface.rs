@@ -372,6 +372,7 @@ impl ManagedInterface {
     /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
     pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) -> Result<(), crate::NetError> {
         let prefix_len = prefix_len.min(32);
+        validate_ip_addr(IpAddr::V4(addr))?;
         ensure_replacement_addr_capacity(&self.iface, true)?;
         self.iface.update_ip_addrs(|addrs| {
             addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
@@ -394,6 +395,7 @@ impl ManagedInterface {
     /// 替换接口上的所有 IPv6 地址为指定 CIDR 块。
     pub fn set_ipv6_addr(&mut self, addr: Ipv6Addr, prefix_len: u8) -> Result<(), crate::NetError> {
         let prefix_len = prefix_len.min(128);
+        validate_ip_addr(IpAddr::V6(addr))?;
         ensure_replacement_addr_capacity(&self.iface, false)?;
         self.iface.update_ip_addrs(|addrs| {
             addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv6(_)));
@@ -1260,6 +1262,7 @@ fn install_ip_addrs(
     iface: &mut iface::Interface,
     addresses: &[CidrAddress],
 ) -> Result<(), crate::NetError> {
+    validate_ip_addrs(addresses)?;
     ensure_ip_addr_capacity(addresses.len())?;
     iface.update_ip_addrs(|addrs| {
         addrs.clear();
@@ -1268,6 +1271,25 @@ fn install_ip_addrs(
         }
     });
     Ok(())
+}
+
+fn validate_ip_addrs(addresses: &[CidrAddress]) -> Result<(), crate::NetError> {
+    for cidr in addresses {
+        validate_ip_addr(cidr.addr)?;
+    }
+    Ok(())
+}
+
+fn validate_ip_addr(addr: IpAddr) -> Result<(), crate::NetError> {
+    let addr = match addr {
+        IpAddr::V4(v4) => IpAddress::Ipv4(ipv4_to_smoltcp(v4)),
+        IpAddr::V6(v6) => IpAddress::Ipv6(ipv6_to_smoltcp(v6)),
+    };
+    if addr.is_unicast() || addr.is_unspecified() {
+        Ok(())
+    } else {
+        Err(crate::NetError::InvalidArgument)
+    }
 }
 
 fn ensure_ip_addr_capacity(count: usize) -> Result<(), crate::NetError> {
@@ -1725,6 +1747,39 @@ mod tests {
         assert_eq!(iface.config().addresses, original.addresses);
         assert_eq!(iface.config().gateway, original.gateway);
         assert_eq!(iface.config().mode, original.mode);
+    }
+
+    #[test]
+    fn interface_rejects_non_unicast_addresses_without_panicking() {
+        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::default());
+        let dev = Arc::new(NetDevice::new("test-invalid-attach", driver));
+        let tuning = NetTuning::defaults();
+        assert!(matches!(
+            ManagedInterface::new(
+                dev,
+                IfConfig::static_v4(Ipv4Addr::BROADCAST, 24, None),
+                tuning.tcp,
+                tuning.tcp_listen,
+            ),
+            Err(crate::NetError::InvalidArgument)
+        ));
+
+        let (_id, mut iface) = test_interface();
+        let original = iface.config().clone();
+        assert_eq!(
+            iface.apply_config(IfConfig::static_v4(Ipv4Addr::new(224, 0, 0, 1), 24, None)),
+            Err(crate::NetError::InvalidArgument)
+        );
+        assert_eq!(iface.config().addresses, original.addresses);
+        assert_eq!(
+            iface.set_ipv4_addr(Ipv4Addr::BROADCAST, 24),
+            Err(crate::NetError::InvalidArgument)
+        );
+        assert_eq!(
+            iface.set_ipv6_addr(Ipv6Addr::new([0xff00, 0, 0, 0, 0, 0, 0, 1]), 64),
+            Err(crate::NetError::InvalidArgument)
+        );
+        assert_eq!(iface.config().addresses, original.addresses);
     }
 
     fn build_tcp_packet(

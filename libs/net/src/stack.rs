@@ -3464,6 +3464,28 @@ mod tests {
     }
 
     #[test]
+    fn attach_rejects_invalid_interface_address() {
+        let stack = NetStack::new();
+        let driver = Arc::new(TestDriver::default());
+        let dev = Arc::new(NetDevice::new("eth-invalid-addr", driver));
+        assert_eq!(
+            stack.attach(
+                dev,
+                IfConfig::static_v4(Ipv4Addr::new(224, 0, 0, 1), 24, None)
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert!(stack.snapshot_interfaces().is_empty());
+        assert_eq!(
+            stack.ensure_socket_route_matches(
+                InterfaceId(0),
+                &IpAddr::V4(Ipv4Addr::new(224, 0, 0, 2)),
+            ),
+            Err(NetError::Unreachable)
+        );
+    }
+
+    #[test]
     fn set_iface_ipv6_addr_preserves_ipv4_and_replaces_v6_route() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
