@@ -105,7 +105,7 @@ impl ManagedInterface {
         let now = NetInstant::ZERO.into_smoltcp();
         let mut iface = iface::Interface::new(iface_config, &mut device, now);
 
-        install_ip_addrs(&mut iface, &config.addresses);
+        install_ip_addrs(&mut iface, &config.addresses)?;
         install_gateway(&mut iface, config.gateway)?;
 
         let mut sockets = SocketSet::new(Vec::new());
@@ -259,7 +259,7 @@ impl ManagedInterface {
     /// [`crate::stack::NetStack`] 在外层同步维护。
     pub fn apply_config(&mut self, config: IfConfig) -> Result<(), crate::NetError> {
         ensure_gateway_capacity(&mut self.iface, config.gateway)?;
-        install_ip_addrs(&mut self.iface, &config.addresses);
+        install_ip_addrs(&mut self.iface, &config.addresses)?;
         install_gateway(&mut self.iface, config.gateway)?;
         self.sync_auto_config_socket(config.mode);
         self.config = config;
@@ -370,8 +370,9 @@ impl ManagedInterface {
     // ── 运行时配置（供 ioctl / netlink 写操作使用）─────────────────────
 
     /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
-    pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) {
+    pub fn set_ipv4_addr(&mut self, addr: Ipv4Addr, prefix_len: u8) -> Result<(), crate::NetError> {
         let prefix_len = prefix_len.min(32);
+        ensure_replacement_addr_capacity(&self.iface, true)?;
         self.iface.update_ip_addrs(|addrs| {
             addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv4(_)));
             let _ = addrs.push(smoltcp::wire::IpCidr::Ipv4(smoltcp::wire::Ipv4Cidr::new(
@@ -387,11 +388,13 @@ impl ManagedInterface {
             .push(CidrAddress::new_v4(addr, prefix_len));
         self.config.mode = IfMode::Static;
         self.sync_auto_config_socket(self.config.mode);
+        Ok(())
     }
 
     /// 替换接口上的所有 IPv6 地址为指定 CIDR 块。
-    pub fn set_ipv6_addr(&mut self, addr: Ipv6Addr, prefix_len: u8) {
+    pub fn set_ipv6_addr(&mut self, addr: Ipv6Addr, prefix_len: u8) -> Result<(), crate::NetError> {
         let prefix_len = prefix_len.min(128);
+        ensure_replacement_addr_capacity(&self.iface, false)?;
         self.iface.update_ip_addrs(|addrs| {
             addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv6(_)));
             let _ = addrs.push(smoltcp::wire::IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(
@@ -407,6 +410,7 @@ impl ManagedInterface {
             .push(CidrAddress::new_v6(addr, prefix_len));
         self.config.mode = IfMode::Static;
         self.sync_auto_config_socket(self.config.mode);
+        Ok(())
     }
 
     /// 添加 IPv4 静态网关路由到当前协议引擎。
@@ -1252,13 +1256,41 @@ fn cidr_to_smoltcp(cidr: &CidrAddress) -> IpCidr {
     }
 }
 
-fn install_ip_addrs(iface: &mut iface::Interface, addresses: &[CidrAddress]) {
+fn install_ip_addrs(
+    iface: &mut iface::Interface,
+    addresses: &[CidrAddress],
+) -> Result<(), crate::NetError> {
+    ensure_ip_addr_capacity(addresses.len())?;
     iface.update_ip_addrs(|addrs| {
         addrs.clear();
         for cidr in addresses {
             let _ = addrs.push(cidr_to_smoltcp(cidr));
         }
     });
+    Ok(())
+}
+
+fn ensure_ip_addr_capacity(count: usize) -> Result<(), crate::NetError> {
+    if count > smoltcp::config::IFACE_MAX_ADDR_COUNT {
+        Err(crate::NetError::ResourceExhausted)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_replacement_addr_capacity(
+    iface: &iface::Interface,
+    replace_v4: bool,
+) -> Result<(), crate::NetError> {
+    let retained = iface
+        .ip_addrs()
+        .iter()
+        .filter(|cidr| match (replace_v4, cidr) {
+            (true, IpCidr::Ipv4(_)) | (false, IpCidr::Ipv6(_)) => false,
+            _ => true,
+        })
+        .count();
+    ensure_ip_addr_capacity(retained + 1)
 }
 
 fn install_gateway(
@@ -1672,6 +1704,29 @@ mod tests {
         assert_eq!(iface.config().mode, original.mode);
     }
 
+    #[test]
+    fn apply_config_does_not_partially_update_on_address_capacity_error() {
+        let (_id, mut iface) = test_interface();
+        let original = iface.config().clone();
+        let mut addresses = Vec::new();
+        for i in 0..=smoltcp::config::IFACE_MAX_ADDR_COUNT {
+            addresses.push(CidrAddress::new_v4(Ipv4Addr::new(10, 80, i as u8, 2), 24));
+        }
+        let replacement = IfConfig {
+            addresses,
+            gateway: Some(Gateway::V4(Ipv4Addr::new(10, 80, 0, 1))),
+            mode: IfMode::Static,
+        };
+
+        assert_eq!(
+            iface.apply_config(replacement),
+            Err(crate::NetError::ResourceExhausted)
+        );
+        assert_eq!(iface.config().addresses, original.addresses);
+        assert_eq!(iface.config().gateway, original.gateway);
+        assert_eq!(iface.config().mode, original.mode);
+    }
+
     fn build_tcp_packet(
         src: smoltcp::wire::Ipv4Address,
         dst: smoltcp::wire::Ipv4Address,
@@ -1845,7 +1900,9 @@ mod tests {
         assert_eq!(dhcpv4_socket_count(&iface), 1);
         assert!(!iface.meta.contains_key(&renewed));
 
-        iface.set_ipv4_addr(Ipv4Addr::new(192, 0, 2, 10), 24);
+        iface
+            .set_ipv4_addr(Ipv4Addr::new(192, 0, 2, 10), 24)
+            .unwrap();
         assert_eq!(iface.dhcpv4_socket, None);
         assert_eq!(dhcpv4_socket_count(&iface), 0);
     }
@@ -1861,7 +1918,9 @@ mod tests {
         assert!(iface.dhcpv4_socket.is_some());
         assert_eq!(dhcpv4_socket_count(&iface), 1);
 
-        iface.set_ipv6_addr(Ipv6Addr::new([0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 2]), 64);
+        iface
+            .set_ipv6_addr(Ipv6Addr::new([0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 2]), 64)
+            .unwrap();
         assert_eq!(iface.dhcpv4_socket, None);
         assert_eq!(dhcpv4_socket_count(&iface), 0);
         assert_eq!(

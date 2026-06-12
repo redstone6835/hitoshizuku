@@ -1098,7 +1098,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.set_ipv4_addr(addr, prefix);
+        managed.set_ipv4_addr(addr, prefix)?;
         let addresses = managed.config().addresses.clone();
         drop(managed);
         drop(table);
@@ -1116,7 +1116,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.set_ipv6_addr(addr, prefix);
+        managed.set_ipv6_addr(addr, prefix)?;
         let addresses = managed.config().addresses.clone();
         drop(managed);
         drop(table);
@@ -3505,6 +3505,43 @@ mod tests {
         assert_eq!(
             stack.ensure_socket_route_matches(iface, &second_remote),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn set_iface_ipv6_addr_does_not_update_routes_on_address_capacity_error() {
+        let stack = NetStack::new();
+        let mut addresses = Vec::new();
+        for i in 0..smoltcp::config::IFACE_MAX_ADDR_COUNT {
+            addresses.push(CidrAddress::new_v4(Ipv4Addr::new(10, 47, i as u8, 2), 24));
+        }
+        let iface = attach_test_iface(
+            &stack,
+            "eth-set-v6-full",
+            IfConfig {
+                addresses: addresses.clone(),
+                gateway: None,
+                mode: crate::IfMode::Static,
+            },
+        );
+        let v4_remote = IpAddr::V4(Ipv4Addr::new(10, 47, 0, 99));
+        let v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0047, 0, 0, 0, 0, 2]);
+        let v6_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0047, 0, 0, 0, 0, 99]));
+
+        assert_eq!(
+            stack.set_iface_ipv6_addr(iface, v6, 64),
+            Err(NetError::ResourceExhausted)
+        );
+        let snapshot = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(snapshot.addresses, addresses);
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &v6_remote),
+            Err(NetError::Unreachable)
         );
     }
 
