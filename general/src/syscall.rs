@@ -21,7 +21,7 @@
 //! 走 ctx.tf 直接改），也能 `ctx.task.ext_lookup` 拿 fdtable / vmspace。
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use errno::Errno;
 
@@ -106,8 +106,7 @@ pub type SyscallFn = fn(&mut SyscallContext<'_>) -> Result<usize, Errno>;
 /// 表大小：覆盖 Linux asm-generic 全部 syscall 号（最大约 450）。
 pub const SYSCALL_TABLE_LEN: usize = 512;
 
-static SYSCALL_TABLE: spin::Mutex<[Option<SyscallFn>; SYSCALL_TABLE_LEN]> =
-    spin::Mutex::new([None; SYSCALL_TABLE_LEN]);
+static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] = [const { AtomicUsize::new(0) }; SYSCALL_TABLE_LEN];
 
 /// 在启动期注册一个 syscall 号 → fn 的映射。重复注册会 panic（防止表条目被
 /// 静默覆盖）。
@@ -118,18 +117,21 @@ pub fn register_syscall(nr: usize, f: SyscallFn) {
         nr,
         SYSCALL_TABLE_LEN - 1
     );
-    let mut table = SYSCALL_TABLE.lock();
-    assert!(
-        table[nr].is_none(),
-        "[syscall] nr {} already registered",
-        nr
+    let old = SYSCALL_TABLE[nr].compare_exchange(
+        0,
+        f as usize,
+        Ordering::AcqRel,
+        Ordering::Acquire,
     );
-    table[nr] = Some(f);
+    assert!(old.is_ok(), "[syscall] nr {} already registered", nr);
 }
 
 /// 启动期已注册的 syscall 数量；smoketest / debug 用。
 pub fn registered_count() -> usize {
-    SYSCALL_TABLE.lock().iter().filter(|e| e.is_some()).count()
+    SYSCALL_TABLE
+        .iter()
+        .filter(|e| e.load(Ordering::Acquire) != 0)
+        .count()
 }
 
 // ── 3. 主分发 ────────────────────────────────────────────────────────────────
@@ -161,10 +163,16 @@ pub fn dispatch(tf: TrapFramePtr) {
         _phantom: core::marker::PhantomData,
     };
 
-    //   提前从锁中取出条目，释放锁后再执行 syscall，
-    //   避免整个 syscall 执行期间持有全局表锁。
+    // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
+    // simple syscall 每次都争用全局自旋锁。
     let entry = if nr < SYSCALL_TABLE_LEN {
-        SYSCALL_TABLE.lock()[nr]
+        let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
+        if ptr == 0 {
+            None
+        } else {
+            // Safety: register_syscall 只写入 SyscallFn 函数指针，且条目一旦设置不再修改。
+            Some(unsafe { core::mem::transmute::<usize, SyscallFn>(ptr) })
+        }
     } else {
         None
     };

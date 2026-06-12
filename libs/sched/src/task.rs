@@ -462,6 +462,11 @@ pub struct Task {
     ioprio: AtomicU32,
     /// 子系统侧表：VFS context / fdtable 等通过 [`TaskExtKey`] 挂载。
     /// 详见模块级 [`TaskExtCloneHook`]。
+    ///
+    /// lmbench 的 read/write/stat/mmap 热路径会极高频查询 fdtable/vfs/vm。
+    /// 这些固定 key 走独立槽位，避免每次 syscall 都锁 Vec 并线性查找；
+    /// 其它低频扩展仍保留在 ext 表中，兼容原有 hook 机制。
+    hot_ext: HotTaskExt,
     ext: Spinlock<Vec<TaskExt>>,
     /// 退出清理是否已经运行。exit、最终切换和 wait/reap 都可能观察到同一个任务，
     /// 必须只让上层 ext hook 执行一次。
@@ -528,6 +533,7 @@ impl Task {
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
             ioprio: AtomicU32::new(0),
+            hot_ext: HotTaskExt::new(),
             ext: Spinlock::new(Vec::new()),
             ext_exit_cleaned: AtomicBool::new(false),
             pre_exit_cleaned: AtomicBool::new(false),
@@ -1107,6 +1113,9 @@ impl Task {
 
     /// 安装一个子系统状态。同 key 重复装入视作配置错误（debug_assert）。
     pub fn ext_install(&self, key: TaskExtKey, payload: Arc<dyn Any + Send + Sync>) {
+        if self.hot_ext.install(key, &payload) {
+            return;
+        }
         let mut ext = self.ext.lock();
         debug_assert!(
             !ext.iter().any(|e| e.key == key),
@@ -1118,6 +1127,9 @@ impl Task {
 
     /// 查询某个子系统状态；不存在返回 `None`。
     pub fn ext_lookup(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
+        if let Some(payload) = self.hot_ext.lookup(key) {
+            return Some(payload);
+        }
         self.ext
             .lock()
             .iter()
@@ -1127,6 +1139,9 @@ impl Task {
 
     /// 移除并返回某个子系统状态。
     pub fn ext_remove(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
+        if let Some(payload) = self.hot_ext.remove(key) {
+            return Some(payload);
+        }
         let mut ext = self.ext.lock();
         let pos = ext.iter().position(|e| e.key == key)?;
         Some(ext.swap_remove(pos).payload)
@@ -1134,11 +1149,14 @@ impl Task {
 
     /// 列出当前所有子系统挂载，便于 fork 时遍历。
     pub fn ext_snapshot(&self) -> Vec<(TaskExtKey, Arc<dyn Any + Send + Sync>)> {
-        self.ext
-            .lock()
-            .iter()
-            .map(|e| (e.key, Arc::clone(&e.payload)))
-            .collect()
+        let mut out = self.hot_ext.snapshot();
+        out.extend(
+            self.ext
+                .lock()
+                .iter()
+                .map(|e| (e.key, Arc::clone(&e.payload))),
+        );
+        out
     }
 }
 
@@ -1168,6 +1186,68 @@ pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
 /// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
 pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
+
+struct HotTaskExt {
+    vfs_context: Spinlock<Option<Arc<dyn Any + Send + Sync>>>,
+    fdtable: Spinlock<Option<Arc<dyn Any + Send + Sync>>>,
+    vm_space: Spinlock<Option<Arc<dyn Any + Send + Sync>>>,
+    user_trap_frame: Spinlock<Option<Arc<dyn Any + Send + Sync>>>,
+}
+
+impl HotTaskExt {
+    const fn new() -> Self {
+        Self {
+            vfs_context: Spinlock::new(None),
+            fdtable: Spinlock::new(None),
+            vm_space: Spinlock::new(None),
+            user_trap_frame: Spinlock::new(None),
+        }
+    }
+
+    fn slot(&self, key: TaskExtKey) -> Option<&Spinlock<Option<Arc<dyn Any + Send + Sync>>>> {
+        match key {
+            TASKEXT_VFS_CONTEXT => Some(&self.vfs_context),
+            TASKEXT_VFS_FDTABLE => Some(&self.fdtable),
+            TASKEXT_VM_SPACE => Some(&self.vm_space),
+            TASKEXT_USER_TRAP_FRAME => Some(&self.user_trap_frame),
+            _ => None,
+        }
+    }
+
+    fn install(&self, key: TaskExtKey, payload: &Arc<dyn Any + Send + Sync>) -> bool {
+        let Some(slot) = self.slot(key) else {
+            return false;
+        };
+        let mut guard = slot.lock();
+        debug_assert!(guard.is_none(), "[sched][ext] key 0x{:x} already installed", key);
+        *guard = Some(Arc::clone(payload));
+        true
+    }
+
+    fn lookup(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.slot(key)
+            .and_then(|slot| slot.lock().as_ref().map(Arc::clone))
+    }
+
+    fn remove(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.slot(key).and_then(|slot| slot.lock().take())
+    }
+
+    fn snapshot(&self) -> Vec<(TaskExtKey, Arc<dyn Any + Send + Sync>)> {
+        let mut out = Vec::new();
+        for (key, slot) in [
+            (TASKEXT_VFS_CONTEXT, &self.vfs_context),
+            (TASKEXT_VFS_FDTABLE, &self.fdtable),
+            (TASKEXT_VM_SPACE, &self.vm_space),
+            (TASKEXT_USER_TRAP_FRAME, &self.user_trap_frame),
+        ] {
+            if let Some(payload) = slot.lock().as_ref() {
+                out.push((key, Arc::clone(payload)));
+            }
+        }
+        out
+    }
+}
 
 /// 单条子系统挂载。
 pub struct TaskExt {

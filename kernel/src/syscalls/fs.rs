@@ -1714,8 +1714,26 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::EINVAL);
     }
     let total_bytes = nfds.checked_mul(POLLFD_SIZE).ok_or(Errno::EINVAL)?;
-    let mut pollfds = vec![0u8; total_bytes];
-    copy_from_user(fds_user, &mut pollfds).map_err(|e| e.as_errno())?;
+    let mut pollfds_stack = [0u8; POLLFD_SIZE * 64];
+    let mut pollfds_heap;
+    let pollfds = if total_bytes <= pollfds_stack.len() {
+        &mut pollfds_stack[..total_bytes]
+    } else {
+        pollfds_heap = vec![0u8; total_bytes];
+        pollfds_heap.as_mut_slice()
+    };
+    copy_from_user(fds_user, pollfds).map_err(|e| e.as_errno())?;
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let mut lookup_index = Vec::with_capacity(nfds.min(64));
+    let mut lookup_fds = Vec::with_capacity(nfds.min(64));
+    for i in 0..nfds {
+        let off = i * POLLFD_SIZE;
+        let fd_raw = i32::from_le_bytes(pollfds[off..off + 4].try_into().unwrap());
+        if fd_raw >= 0 {
+            lookup_index.push(i);
+            lookup_fds.push(Fd::from_raw(fd_raw as u32));
+        }
+    }
 
     let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
@@ -1723,7 +1741,10 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let deadline = timeout_deadline(timeout_ms);
     loop {
         let mut count = 0usize;
-        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> = Vec::new();
+        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> =
+            Vec::with_capacity(lookup_fds.len());
+        let files = fdt.get_files_dense(&lookup_fds);
+        let mut lookup_cursor = 0usize;
 
         for i in 0..nfds {
             let off = i * POLLFD_SIZE;
@@ -1734,7 +1755,8 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 continue;
             }
 
-            if let Ok(file) = file_for_fd(Fd::from_raw(fd_raw as u32)) {
+            debug_assert_eq!(lookup_index[lookup_cursor], i);
+            if let Some(file) = files[lookup_cursor].as_ref().map(Arc::clone) {
                 let interest = PollEvents(events);
                 let ready = file.poll(interest);
                 if ready.0 != 0 {
@@ -1750,16 +1772,17 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
                 pollfds[off + 6..off + 8].copy_from_slice(&PollEvents::POLLNVAL.0.to_le_bytes());
                 count += 1;
             }
+            lookup_cursor += 1;
         }
 
         if count != 0 {
-            copy_to_user(fds_user, &pollfds).map_err(|e| e.as_errno())?;
+            copy_to_user(fds_user, pollfds).map_err(|e| e.as_errno())?;
             return Ok(count);
         }
 
         if timeout_expired(deadline) || timeout_ms == 0 {
             // 确保 revents 已写回到用户空间
-            copy_to_user(fds_user, &pollfds).map_err(|e| e.as_errno())?;
+            copy_to_user(fds_user, pollfds).map_err(|e| e.as_errno())?;
             return Ok(0);
         }
 
@@ -1784,19 +1807,37 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let read_in = copy_fdset_from_user(readfds_user, set_len)?;
     let write_in = copy_fdset_from_user(writefds_user, set_len)?;
     let except_in = copy_fdset_from_user(exceptfds_user, set_len)?;
-    let mut read_out = vec![0u8; set_len];
-    let mut write_out = vec![0u8; set_len];
-    let mut except_out = vec![0u8; set_len];
+    let mut read_out_storage = [0u8; MAX_SELECT_FDS / 8];
+    let mut write_out_storage = [0u8; MAX_SELECT_FDS / 8];
+    let mut except_out_storage = [0u8; MAX_SELECT_FDS / 8];
+    let read_out = &mut read_out_storage[..set_len];
+    let write_out = &mut write_out_storage[..set_len];
+    let except_out = &mut except_out_storage[..set_len];
+    let fdt = current_fdtable().ok_or(Errno::EBADF)?;
+    let mut lookup_index = Vec::with_capacity(nfds.min(64));
+    let mut lookup_fds = Vec::with_capacity(nfds.min(64));
+    for fd_num in 0..nfds {
+        if fdset_test(&read_in, fd_num)
+            || fdset_test(&write_in, fd_num)
+            || fdset_test(&except_in, fd_num)
+        {
+            lookup_index.push(fd_num);
+            lookup_fds.push(Fd::from_raw(fd_num as u32));
+        }
+    }
     let timeout_ms = read_timespec_ms_ceil(timeout_user)?;
     let _mask_guard = TemporarySigmask::install(sigmask);
     let deadline = timeout_deadline(timeout_ms);
 
     loop {
-        clear_fdset(&mut read_out);
-        clear_fdset(&mut write_out);
-        clear_fdset(&mut except_out);
+        clear_fdset(read_out);
+        clear_fdset(write_out);
+        clear_fdset(except_out);
         let mut count = 0usize;
-        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> = Vec::new();
+        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> =
+            Vec::with_capacity(lookup_fds.len());
+        let files = fdt.get_files_dense(&lookup_fds);
+        let mut lookup_cursor = 0usize;
 
         for fd_num in 0..nfds {
             let want_read = fdset_test(&read_in, fd_num);
@@ -1805,7 +1846,12 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
             if !want_read && !want_write && !want_except {
                 continue;
             }
-            let file = file_for_fd(Fd::from_raw(fd_num as u32))?;
+            debug_assert_eq!(lookup_index[lookup_cursor], fd_num);
+            let file = files[lookup_cursor]
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or(Errno::EBADF)?;
+            lookup_cursor += 1;
             let mut interest = PollEvents::default();
             if want_read {
                 interest = interest.with(PollEvents::POLLIN);
@@ -1825,15 +1871,15 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
                         .with(PollEvents::POLLERR),
                 )
             {
-                fdset_set(&mut read_out, fd_num);
+                fdset_set(read_out, fd_num);
                 fd_ready = true;
             }
             if want_write && ready.has(PollEvents::POLLOUT.with(PollEvents::POLLERR)) {
-                fdset_set(&mut write_out, fd_num);
+                fdset_set(write_out, fd_num);
                 fd_ready = true;
             }
             if want_except && ready.has(PollEvents::POLLPRI.with(PollEvents::POLLERR)) {
-                fdset_set(&mut except_out, fd_num);
+                fdset_set(except_out, fd_num);
                 fd_ready = true;
             }
             if fd_ready {
@@ -1844,16 +1890,16 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         }
 
         if count != 0 {
-            copy_fdset_to_user(readfds_user, &read_out)?;
-            copy_fdset_to_user(writefds_user, &write_out)?;
-            copy_fdset_to_user(exceptfds_user, &except_out)?;
+            copy_fdset_to_user(readfds_user, read_out)?;
+            copy_fdset_to_user(writefds_user, write_out)?;
+            copy_fdset_to_user(exceptfds_user, except_out)?;
             return Ok(count);
         }
 
         if timeout_expired(deadline) || timeout_ms == 0 {
-            copy_fdset_to_user(readfds_user, &read_out)?;
-            copy_fdset_to_user(writefds_user, &write_out)?;
-            copy_fdset_to_user(exceptfds_user, &except_out)?;
+            copy_fdset_to_user(readfds_user, read_out)?;
+            copy_fdset_to_user(writefds_user, write_out)?;
+            copy_fdset_to_user(exceptfds_user, except_out)?;
             return Ok(0);
         }
 
