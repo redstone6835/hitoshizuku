@@ -1009,6 +1009,26 @@ impl NetStack {
         Ok(())
     }
 
+    /// 一次性替换指定接口的完整网络配置。
+    ///
+    /// 该入口用于 DHCP/SLAAC 或管理面拿到完整配置后的提交阶段。它同时更新
+    /// 协议引擎中的地址/默认网关、接口配置快照和全局路由表，避免上层分别
+    /// 调用地址与路由接口时观察到不一致的中间状态。
+    pub fn apply_iface_config(&self, id: InterfaceId, config: IfConfig) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.apply_config(config);
+        let addresses = managed.config().addresses.clone();
+        let gateway = managed.config().gateway;
+        drop(managed);
+        drop(table);
+        let mut routes = self.routes.write();
+        routes.replace_connected(id, &addresses);
+        routes.replace_gateway(id, gateway);
+        Ok(())
+    }
+
     /// 设置指定接口的管理态 UP/DOWN。
     ///
     /// 这只表达“协议栈是否应使用该接口”，不销毁底层设备，也不参与驱动
@@ -2907,6 +2927,75 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
+    fn apply_iface_config_replaces_addresses_gateway_and_routes() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(&stack, "eth-apply-config", IfConfig::auto());
+        let initial = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert!(initial.addresses.is_empty());
+        assert_eq!(initial.gateway, None);
+
+        let mut dhcp_config = IfConfig::static_v4(
+            Ipv4Addr::new(10, 42, 0, 22),
+            24,
+            Some(Ipv4Addr::new(10, 42, 0, 1)),
+        );
+        dhcp_config.mode = crate::IfMode::Auto;
+        stack
+            .apply_iface_config(iface, dhcp_config.clone())
+            .unwrap();
+
+        let configured = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(configured.addresses, dhcp_config.addresses);
+        assert_eq!(configured.gateway, dhcp_config.gateway);
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(10, 42, 0, 99)),),
+            Ok(())
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),),
+            Ok(())
+        );
+
+        let v6_config = IfConfig::static_v6(
+            Ipv6Addr::new([0x2001, 0x0db8, 0x0042, 0, 0, 0, 0, 2]),
+            64,
+            None,
+        );
+        stack.apply_iface_config(iface, v6_config.clone()).unwrap();
+
+        let replaced = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(replaced.addresses, v6_config.addresses);
+        assert_eq!(replaced.gateway, None);
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(10, 42, 0, 99)),),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(
+                iface,
+                &IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0042, 0, 0, 0, 0, 99])),
+            ),
+            Ok(())
+        );
     }
 
     #[test]

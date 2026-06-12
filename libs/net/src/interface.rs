@@ -82,43 +82,8 @@ impl ManagedInterface {
         let now = NetInstant::ZERO.into_smoltcp();
         let mut iface = iface::Interface::new(iface_config, &mut device, now);
 
-        // 配置 IP 地址（支持 IPv4 + IPv6 混合）
-        // TODO: IfMode::Auto 当前不会触发 DHCP/SLAAC，这里只会把已有
-        // config.addresses 静态写入 smoltcp。
-        let cidrs: Vec<IpCidr> = config.addresses.iter().map(cidr_to_smoltcp).collect();
-        iface.update_ip_addrs(|addrs| {
-            for cidr in cidrs {
-                let _ = addrs.push(cidr);
-            }
-        });
-
-        // 配置默认网关
-        if let Some(ref gw) = config.gateway {
-            match gw {
-                Gateway::V4(v4) => {
-                    iface
-                        .routes_mut()
-                        .add_default_ipv4_route(ipv4_to_smoltcp(*v4))
-                        .ok();
-                }
-                Gateway::V6(v6) => {
-                    iface
-                        .routes_mut()
-                        .add_default_ipv6_route(ipv6_to_smoltcp(*v6))
-                        .ok();
-                }
-                Gateway::DualStack { v4, v6 } => {
-                    iface
-                        .routes_mut()
-                        .add_default_ipv4_route(ipv4_to_smoltcp(*v4))
-                        .ok();
-                    iface
-                        .routes_mut()
-                        .add_default_ipv6_route(ipv6_to_smoltcp(*v6))
-                        .ok();
-                }
-            }
-        }
+        install_ip_addrs(&mut iface, &config.addresses);
+        install_gateway(&mut iface, config.gateway);
 
         Self {
             iface,
@@ -252,6 +217,17 @@ impl ManagedInterface {
 
     pub fn config(&self) -> &IfConfig {
         &self.config
+    }
+
+    /// 原子替换接口的运行期网络配置。
+    ///
+    /// DHCP/SLAAC 或管理接口拿到完整配置后应走这里一次性替换地址和默认网关，
+    /// 避免地址、协议引擎路由和 `config` 快照出现中间态分叉。全局路由表由
+    /// [`crate::stack::NetStack`] 在外层同步维护。
+    pub fn apply_config(&mut self, config: IfConfig) {
+        install_ip_addrs(&mut self.iface, &config.addresses);
+        install_gateway(&mut self.iface, config.gateway);
+        self.config = config;
     }
 
     /// 管理态是否允许接口收发。
@@ -1102,6 +1078,45 @@ fn cidr_to_smoltcp(cidr: &CidrAddress) -> IpCidr {
     match cidr.addr {
         IpAddr::V4(v4) => IpCidr::Ipv4(Ipv4Cidr::new(ipv4_to_smoltcp(v4), cidr.prefix_len)),
         IpAddr::V6(v6) => IpCidr::Ipv6(Ipv6Cidr::new(ipv6_to_smoltcp(v6), cidr.prefix_len)),
+    }
+}
+
+fn install_ip_addrs(iface: &mut iface::Interface, addresses: &[CidrAddress]) {
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        for cidr in addresses {
+            let _ = addrs.push(cidr_to_smoltcp(cidr));
+        }
+    });
+}
+
+fn install_gateway(iface: &mut iface::Interface, gateway: Option<Gateway>) {
+    iface.routes_mut().remove_default_ipv4_route();
+    iface.routes_mut().remove_default_ipv6_route();
+    match gateway {
+        Some(Gateway::V4(v4)) => {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(v4))
+                .ok();
+        }
+        Some(Gateway::V6(v6)) => {
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(ipv6_to_smoltcp(v6))
+                .ok();
+        }
+        Some(Gateway::DualStack { v4, v6 }) => {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(ipv4_to_smoltcp(v4))
+                .ok();
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(ipv6_to_smoltcp(v6))
+                .ok();
+        }
+        None => {}
     }
 }
 
