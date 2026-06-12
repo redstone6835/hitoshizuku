@@ -1049,6 +1049,36 @@ impl NetStack {
         Ok(())
     }
 
+    /// 添加默认 IPv6 路由（gateway）到指定接口。
+    pub fn add_default_route_v6(
+        &self,
+        iface_id: InterfaceId,
+        gateway: crate::Ipv6Addr,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.add_default_route_v6(gateway);
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .replace_gateway_v6(iface_id, Some(gateway));
+        Ok(())
+    }
+
+    /// 移除指定接口上的默认 IPv6 路由。
+    pub fn remove_default_route_v6(&self, iface_id: InterfaceId) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.remove_default_route_v6();
+        drop(managed);
+        drop(table);
+        self.routes.write().replace_gateway_v6(iface_id, None);
+        Ok(())
+    }
+
     // ── 运行时配置（供 ioctl / netlink 写操作使用）──────────────────────
 
     /// 设置指定接口的 IPv4 地址。
@@ -3352,6 +3382,44 @@ mod tests {
                 &IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0042, 0, 0, 0, 0, 99])),
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn ipv6_default_route_updates_route_table_without_dropping_ipv4() {
+        let stack = NetStack::new();
+        let config = IfConfig {
+            addresses: alloc::vec![
+                CidrAddress::new_v4(Ipv4Addr::new(10, 44, 0, 2), 24),
+                CidrAddress::new_v6(Ipv6Addr::new([0x2001, 0x0db8, 0x0044, 0, 0, 0, 0, 2]), 64,),
+            ],
+            gateway: Some(Gateway::V4(Ipv4Addr::new(10, 44, 0, 1))),
+            mode: crate::IfMode::Static,
+        };
+        let iface = attach_test_iface(&stack, "eth-v6-default", config);
+        let v4_remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44));
+        let v6_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x9900, 0, 0, 0, 0, 44]));
+
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &v6_remote),
+            Err(NetError::Unreachable)
+        );
+
+        stack
+            .add_default_route_v6(
+                iface,
+                Ipv6Addr::new([0x2001, 0x0db8, 0x0044, 0, 0, 0, 0, 1]),
+            )
+            .unwrap();
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v6_remote), Ok(()));
+
+        stack.remove_default_route_v6(iface).unwrap();
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &v6_remote),
+            Err(NetError::Unreachable)
         );
     }
 

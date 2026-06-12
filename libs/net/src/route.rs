@@ -172,6 +172,24 @@ impl RouteTable {
         }
     }
 
+    /// 替换指定接口的 IPv6 默认网关，不影响同接口 IPv4 默认网关。
+    pub fn replace_gateway_v6(&mut self, iface: InterfaceId, gateway: Option<Ipv6Addr>) {
+        self.entries.retain(|entry| {
+            !(entry.iface == iface
+                && entry.source == RouteSource::Gateway
+                && matches!(entry.destination.addr, IpAddr::V6(_)))
+        });
+        if let Some(gateway) = gateway {
+            self.upsert(RouteEntry {
+                destination: CidrAddress::new_v6(Ipv6Addr::UNSPECIFIED, 0),
+                iface,
+                next_hop: NextHop::Gateway(IpAddr::V6(gateway)),
+                source: RouteSource::Gateway,
+                metric: 100,
+            });
+        }
+    }
+
     /// 添加或替换静态路由。
     pub fn upsert(&mut self, entry: RouteEntry) {
         let entry = RouteEntry {
@@ -396,7 +414,42 @@ mod tests {
             .unwrap();
         let v6 = table.lookup(&IpAddr::V6(Ipv6Addr::LOCALHOST)).unwrap();
 
-        assert_eq!(v4.next_hop, NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254))));
-        assert_eq!(v6.next_hop, NextHop::Gateway(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(
+            v4.next_hop,
+            NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)))
+        );
+        assert_eq!(
+            v6.next_hop,
+            NextHop::Gateway(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn ipv6_gateway_replace_preserves_ipv4_default_route() {
+        let mut table = RouteTable::new();
+        table.replace_gateway(
+            iface(4),
+            Some(Gateway::DualStack {
+                v4: Ipv4Addr::new(10, 0, 0, 1),
+                v6: Ipv6Addr::LOCALHOST,
+            }),
+        );
+        let replacement = Ipv6Addr::new([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1]);
+        table.replace_gateway_v6(iface(4), Some(replacement));
+
+        let v4 = table
+            .lookup(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+            .unwrap();
+        let v6 = table
+            .lookup(&IpAddr::V6(Ipv6Addr::new([
+                0x2001, 0x0db8, 0x1234, 0, 0, 0, 0, 1,
+            ])))
+            .unwrap();
+
+        assert_eq!(
+            v4.next_hop,
+            NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        assert_eq!(v6.next_hop, NextHop::Gateway(IpAddr::V6(replacement)));
     }
 }

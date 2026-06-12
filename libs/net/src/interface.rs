@@ -342,6 +342,19 @@ impl ManagedInterface {
         self.iface.routes_mut().remove_default_ipv4_route();
     }
 
+    /// 添加或替换默认 IPv6 路由。
+    pub fn add_default_route_v6(&mut self, gateway: Ipv6Addr) {
+        self.iface
+            .routes_mut()
+            .add_default_ipv6_route(ipv6_to_smoltcp(gateway))
+            .ok();
+    }
+
+    /// 移除默认 IPv6 路由。
+    pub fn remove_default_route_v6(&mut self) {
+        self.iface.routes_mut().remove_default_ipv6_route();
+    }
+
     // ── 运行时配置（供 ioctl / netlink 写操作使用）─────────────────────
 
     /// 替换接口上的所有 IPv4 地址为指定 CIDR 块。
