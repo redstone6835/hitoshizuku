@@ -817,15 +817,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return 0;
         }
-        let table = self.interfaces.read();
-        let Some(iface_lock) = table.get(&handle.iface_id) else {
-            return 0;
-        };
-        let managed = iface_lock.lock();
-        if managed.handle_is_closed(handle) {
-            return 0;
-        }
-        managed.tcp_socket(handle.inner).recv_queue()
+        self.socket_recv_queue(handle)
     }
 
     /// 查询 TCP 发送缓冲区已排队字节数。
@@ -833,6 +825,15 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return 0;
         }
+        self.socket_send_queue(handle)
+    }
+
+    /// 查询 socket 接收队列中已缓存的字节数。
+    ///
+    /// 这是协议无关的底层队列视图：TCP 表示连续字节流可读字节数，
+    /// UDP/Raw/ICMP 表示所有已排队数据报 payload 字节总量。上层若需要
+    /// POSIX 兼容的“下一条数据报长度”，应在兼容层基于协议类型再做转换。
+    pub fn socket_recv_queue(&self, handle: NetSocketHandle) -> usize {
         let table = self.interfaces.read();
         let Some(iface_lock) = table.get(&handle.iface_id) else {
             return 0;
@@ -841,7 +842,30 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return 0;
         }
-        managed.tcp_socket(handle.inner).send_queue()
+        match handle.sock_type {
+            SocketType::Tcp => managed.tcp_socket(handle.inner).recv_queue(),
+            SocketType::Udp => managed.udp_socket(handle.inner).recv_queue(),
+            SocketType::Raw => managed.raw_socket(handle.inner).recv_queue(),
+            SocketType::Icmp => managed.icmp_socket(handle.inner).recv_queue(),
+        }
+    }
+
+    /// 查询 socket 发送队列中已缓存、等待协议栈发送的字节数。
+    pub fn socket_send_queue(&self, handle: NetSocketHandle) -> usize {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return 0;
+        };
+        let managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return 0;
+        }
+        match handle.sock_type {
+            SocketType::Tcp => managed.tcp_socket(handle.inner).send_queue(),
+            SocketType::Udp => managed.udp_socket(handle.inner).send_queue(),
+            SocketType::Raw => managed.raw_socket(handle.inner).send_queue(),
+            SocketType::Icmp => managed.icmp_socket(handle.inner).send_queue(),
+        }
     }
 
     /// TCP peek（窥视，不消费数据）。
@@ -2585,6 +2609,38 @@ mod tests {
     }
 
     #[test]
+    fn socket_recv_queue_reports_udp_payload_bytes() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-queue",
+            IfConfig::static_v4(Ipv4Addr::new(10, 39, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7781,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+        assert_eq!(stack.socket_recv_queue(handle), 0);
+
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 39, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 39, 0, 2),
+            9000,
+            7781,
+            b"queued",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        assert_eq!(stack.socket_recv_queue(handle), 6);
+        let mut buf = [0u8; 16];
+        let (len, _) = stack.udp_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(len, 6);
+        assert_eq!(stack.socket_recv_queue(handle), 0);
+    }
+
+    #[test]
     fn tcp_connect_rejects_wrong_route_before_syn() {
         let stack = NetStack::new();
         let first = attach_test_iface(
@@ -3119,6 +3175,57 @@ mod tests {
             stack.raw_recv(handle, &mut large),
             Err(NetError::WouldBlock)
         );
+    }
+
+    #[test]
+    fn socket_recv_queue_reports_raw_and_icmp_datagram_bytes() {
+        let stack = NetStack::new();
+        let (raw_iface, raw_driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-raw-queue",
+            IfConfig::static_v4(Ipv4Addr::new(10, 40, 0, 2), 24, None),
+        );
+        let raw_handle = stack.socket_raw_on(raw_iface, 4, 253).unwrap();
+        let raw_packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 40, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 40, 0, 2),
+            253,
+            b"raw-queued",
+        );
+        let raw_len = raw_packet.len();
+
+        raw_driver.push_rx(raw_packet);
+        stack.poll_interface(raw_iface, NetInstant::ZERO);
+
+        assert_eq!(stack.socket_recv_queue(raw_handle), raw_len);
+        let mut raw_buf = [0u8; 64];
+        assert_eq!(stack.raw_recv(raw_handle, &mut raw_buf), Ok(raw_len));
+        assert_eq!(stack.socket_recv_queue(raw_handle), 0);
+
+        let (icmp_iface, icmp_driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-queue",
+            IfConfig::static_v4(Ipv4Addr::new(10, 41, 0, 2), 24, None),
+        );
+        let icmp_handle = stack.socket_icmp_on(icmp_iface).unwrap();
+        let src = smoltcp::wire::Ipv4Address::new(10, 41, 0, 77);
+        let dst = smoltcp::wire::Ipv4Address::new(10, 41, 0, 2);
+
+        assert_eq!(stack.icmp_bind_identifier(icmp_handle, 0x1234), Ok(()));
+        icmp_driver.push_rx(build_icmpv4_echo_reply(
+            src,
+            dst,
+            0x1234,
+            0x5678,
+            b"icmp-queued",
+        ));
+        stack.poll_interface(icmp_iface, NetInstant::ZERO);
+
+        let icmp_len = 8 + b"icmp-queued".len();
+        assert_eq!(stack.socket_recv_queue(icmp_handle), icmp_len);
+        let mut icmp_buf = [0u8; 64];
+        assert_eq!(stack.raw_recv(icmp_handle, &mut icmp_buf), Ok(icmp_len));
+        assert_eq!(stack.socket_recv_queue(icmp_handle), 0);
     }
 
     #[test]
