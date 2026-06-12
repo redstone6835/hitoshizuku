@@ -612,6 +612,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return Err(NetError::InvalidArgument);
         }
+        validate_transport_remote(&remote)?;
         self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
         {
             let table = self.interfaces.read();
@@ -1198,6 +1199,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
+        validate_transport_remote(&remote)?;
         self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
         {
             let table = self.interfaces.read();
@@ -1234,9 +1236,7 @@ impl NetStack {
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
-        if remote.port == 0 || is_unspecified_ip(&remote.addr) {
-            return Err(NetError::InvalidArgument);
-        }
+        validate_transport_remote(&remote)?;
         self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
         let table = self.interfaces.read();
         let iface_lock = table
@@ -1957,6 +1957,13 @@ fn is_unspecified_ip(addr: &crate::IpAddr) -> bool {
     }
 }
 
+fn validate_transport_remote(remote: &Endpoint) -> Result<(), NetError> {
+    if remote.port == 0 || is_unspecified_ip(&remote.addr) {
+        return Err(NetError::InvalidArgument);
+    }
+    Ok(())
+}
+
 fn endpoint_from_ip_address(addr: IpAddress) -> Endpoint {
     let addr = match addr {
         IpAddress::Ipv4(v4) => IpAddr::V4(Ipv4Addr(v4.octets())),
@@ -2468,6 +2475,41 @@ mod tests {
     }
 
     #[test]
+    fn udp_send_to_rejects_invalid_remote_before_auto_bind() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-send-invalid",
+            IfConfig::static_v4(Ipv4Addr::new(10, 7, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.udp_send_to(
+                handle,
+                b"bad-port",
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 7, 0, 77)),
+                    port: 0,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.udp_send_to(
+                handle,
+                b"bad-addr",
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 53,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
     fn udp_connect_auto_binds_and_records_peer() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -2770,6 +2812,39 @@ mod tests {
         assert_eq!(
             stack.tcp_connect(handle, remote),
             Err(NetError::Unreachable)
+        );
+        assert_eq!(stack.socket_state(handle), SocketState::Closed);
+    }
+
+    #[test]
+    fn tcp_connect_rejects_invalid_remote_before_syn() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-tcp-invalid",
+            IfConfig::static_v4(Ipv4Addr::new(10, 11, 0, 2), 24, None),
+        );
+        let handle = stack.socket_tcp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.tcp_connect(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 11, 0, 77)),
+                    port: 0,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.tcp_connect(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 80,
+                },
+            ),
+            Err(NetError::InvalidArgument)
         );
         assert_eq!(stack.socket_state(handle), SocketState::Closed);
     }
