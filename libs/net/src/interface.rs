@@ -333,6 +333,37 @@ impl ManagedInterface {
         self.net_device.set_mtu(mtu)
     }
 
+    /// 加入指定 IP 组播组。
+    pub fn join_multicast_group(&mut self, addr: IpAddr) -> Result<(), crate::NetError> {
+        let addr = ip_to_smoltcp(addr);
+        if !addr.is_multicast() {
+            return Err(crate::NetError::InvalidArgument);
+        }
+        self.iface
+            .join_multicast_group(addr)
+            .map_err(map_multicast_error)
+    }
+
+    /// 离开指定 IP 组播组。
+    pub fn leave_multicast_group(&mut self, addr: IpAddr) -> Result<(), crate::NetError> {
+        let addr = ip_to_smoltcp(addr);
+        if !addr.is_multicast() {
+            return Err(crate::NetError::InvalidArgument);
+        }
+        self.iface
+            .leave_multicast_group(addr)
+            .map_err(map_multicast_error)
+    }
+
+    /// 查询当前接口是否接收指定 IP 组播组。
+    pub fn has_multicast_group(&self, addr: IpAddr) -> Result<bool, crate::NetError> {
+        let addr = ip_to_smoltcp(addr);
+        if !addr.is_multicast() {
+            return Err(crate::NetError::InvalidArgument);
+        }
+        Ok(self.iface.has_multicast_group(addr))
+    }
+
     /// 添加或替换默认 IPv4 路由。
     pub fn add_default_route_v4(&mut self, gateway: Ipv4Addr) -> Result<(), crate::NetError> {
         self.iface
@@ -1286,10 +1317,7 @@ fn validate_ip_addrs(addresses: &[CidrAddress]) -> Result<(), crate::NetError> {
 }
 
 fn validate_ip_addr(addr: IpAddr) -> Result<(), crate::NetError> {
-    let addr = match addr {
-        IpAddr::V4(v4) => IpAddress::Ipv4(ipv4_to_smoltcp(v4)),
-        IpAddr::V6(v6) => IpAddress::Ipv6(ipv6_to_smoltcp(v6)),
-    };
+    let addr = ip_to_smoltcp(addr);
     if addr.is_unicast() || addr.is_unspecified() {
         Ok(())
     } else {
@@ -1478,6 +1506,20 @@ fn if_config_from_dhcpv4(config: &dhcpv4::Config<'_>) -> IfConfig {
 fn generate_seed(id: InterfaceId) -> u64 {
     let raw = id.raw() as u64;
     raw.wrapping_mul(6364136223846793005).wrapping_add(1)
+}
+
+fn ip_to_smoltcp(addr: IpAddr) -> IpAddress {
+    match addr {
+        IpAddr::V4(v4) => IpAddress::Ipv4(ipv4_to_smoltcp(v4)),
+        IpAddr::V6(v6) => IpAddress::Ipv6(ipv6_to_smoltcp(v6)),
+    }
+}
+
+fn map_multicast_error(err: iface::MulticastError) -> crate::NetError {
+    match err {
+        iface::MulticastError::GroupTableFull => crate::NetError::ResourceExhausted,
+        iface::MulticastError::Unaddressable => crate::NetError::InvalidArgument,
+    }
 }
 
 fn prefix_len_from_mask(mask: Ipv4Addr) -> Result<u8, crate::NetError> {
@@ -1735,6 +1777,61 @@ mod tests {
 
         iface.remove_default_route_v6();
         assert_eq!(iface.config().gateway, None);
+    }
+
+    #[test]
+    fn multicast_group_join_leave_tracks_membership() {
+        let (_id, mut iface) = test_interface();
+        let v4_group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+        let v6_group = IpAddr::V6(Ipv6Addr::new([0xff02, 0, 0, 0, 0, 0, 0, 0x00fb]));
+
+        assert_eq!(iface.has_multicast_group(v4_group), Ok(false));
+        iface.join_multicast_group(v4_group).unwrap();
+        assert_eq!(iface.has_multicast_group(v4_group), Ok(true));
+        iface.leave_multicast_group(v4_group).unwrap();
+        assert_eq!(iface.has_multicast_group(v4_group), Ok(false));
+
+        assert_eq!(iface.has_multicast_group(v6_group), Ok(false));
+        iface.join_multicast_group(v6_group).unwrap();
+        assert_eq!(iface.has_multicast_group(v6_group), Ok(true));
+        iface.leave_multicast_group(v6_group).unwrap();
+        assert_eq!(iface.has_multicast_group(v6_group), Ok(false));
+    }
+
+    #[test]
+    fn multicast_group_rejects_non_multicast_addresses() {
+        let (_id, mut iface) = test_interface();
+        let v4_unicast = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let v6_unicast = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1]));
+
+        assert_eq!(
+            iface.join_multicast_group(v4_unicast),
+            Err(crate::NetError::InvalidArgument)
+        );
+        assert_eq!(
+            iface.leave_multicast_group(v6_unicast),
+            Err(crate::NetError::InvalidArgument)
+        );
+        assert_eq!(
+            iface.has_multicast_group(v4_unicast),
+            Err(crate::NetError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn multicast_group_reports_table_full() {
+        let (_id, mut iface) = test_interface();
+
+        for i in 1..=smoltcp::config::IFACE_MAX_MULTICAST_GROUP_COUNT {
+            iface
+                .join_multicast_group(IpAddr::V4(Ipv4Addr::new(239, 0, 0, i as u8)))
+                .unwrap();
+        }
+
+        assert_eq!(
+            iface.join_multicast_group(IpAddr::V4(Ipv4Addr::new(239, 0, 1, 1))),
+            Err(crate::NetError::ResourceExhausted)
+        );
     }
 
     #[test]

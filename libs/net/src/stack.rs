@@ -622,6 +622,9 @@ impl NetStack {
             return Err(NetError::InvalidArgument);
         }
         validate_transport_remote(&remote)?;
+        if is_interface_scoped_destination_ip(&remote.addr) {
+            return Err(NetError::InvalidArgument);
+        }
         self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
         {
             let table = self.interfaces.read();
@@ -1237,6 +1240,39 @@ impl NetStack {
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
         managed.set_mtu(mtu)
+    }
+
+    /// 在指定接口上加入 IP 组播组。
+    pub fn join_multicast_group(&self, id: InterfaceId, addr: IpAddr) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        {
+            let mut managed = iface_lock.lock();
+            managed.join_multicast_group(addr)?;
+        }
+        drop(table);
+        self.poll_now();
+        Ok(())
+    }
+
+    /// 在指定接口上离开 IP 组播组。
+    pub fn leave_multicast_group(&self, id: InterfaceId, addr: IpAddr) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        {
+            let mut managed = iface_lock.lock();
+            managed.leave_multicast_group(addr)?;
+        }
+        drop(table);
+        self.poll_now();
+        Ok(())
+    }
+
+    /// 查询指定接口是否接收某个 IP 组播组。
+    pub fn has_multicast_group(&self, id: InterfaceId, addr: IpAddr) -> Result<bool, NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        iface_lock.lock().has_multicast_group(addr)
     }
 
     /// 在指定接口上添加 IPv4 路由。
@@ -2000,6 +2036,9 @@ impl NetStack {
         if is_loopback_ip(remote) {
             return self.loopback_iface_id();
         }
+        if is_interface_scoped_destination_ip(remote) {
+            return self.first_admin_up_iface_id_for(remote);
+        }
         let route = self.routes.read().lookup(remote)?;
         let table = self.interfaces.read();
         let iface = table.get(&route.iface)?;
@@ -2016,6 +2055,13 @@ impl NetStack {
         socket_iface: InterfaceId,
         remote: &crate::IpAddr,
     ) -> Result<(), NetError> {
+        if is_interface_scoped_destination_ip(remote) {
+            return if self.iface_can_send_addr(socket_iface, remote) {
+                Ok(())
+            } else {
+                Err(NetError::Unreachable)
+            };
+        }
         let routed_iface = self
             .resolve_iface_for_remote(remote)
             .ok_or(NetError::Unreachable)?;
@@ -2032,6 +2078,45 @@ impl NetStack {
             return self.default_iface_id().ok();
         }
         self.resolve_iface_for_remote(addr)
+    }
+
+    fn first_admin_up_iface_id_for(&self, remote: &crate::IpAddr) -> Option<InterfaceId> {
+        let table = self.interfaces.read();
+        table
+            .iter()
+            .find_map(|(&id, iface_lock)| self.iface_lock_can_send_addr(id, iface_lock, remote))
+    }
+
+    fn iface_can_send_addr(&self, iface_id: InterfaceId, remote: &crate::IpAddr) -> bool {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&iface_id) else {
+            return false;
+        };
+        self.iface_lock_can_send_addr(iface_id, iface_lock, remote)
+            .is_some()
+    }
+
+    fn iface_lock_can_send_addr(
+        &self,
+        iface_id: InterfaceId,
+        iface_lock: &Arc<Mutex<ManagedInterface>>,
+        remote: &crate::IpAddr,
+    ) -> Option<InterfaceId> {
+        let managed = iface_lock.lock();
+        if !managed.is_admin_up() {
+            return None;
+        }
+        let has_family_addr = managed.config().addresses.iter().any(|addr| {
+            matches!(
+                (&addr.addr, remote),
+                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+            )
+        });
+        if has_family_addr {
+            Some(iface_id)
+        } else {
+            None
+        }
     }
 
     // ── Socket 快照查询（供 /proc/net/ 使用）──────────────────────────────
@@ -2177,6 +2262,21 @@ fn is_unspecified_ip(addr: &crate::IpAddr) -> bool {
         crate::IpAddr::V4(v4) => *v4 == crate::Ipv4Addr::UNSPECIFIED,
         crate::IpAddr::V6(v6) => *v6 == crate::Ipv6Addr::UNSPECIFIED,
     }
+}
+
+fn is_multicast_ip(addr: &crate::IpAddr) -> bool {
+    match addr {
+        crate::IpAddr::V4(v4) => (224..=239).contains(&v4.0[0]),
+        crate::IpAddr::V6(v6) => v6.0[0] == 0xff,
+    }
+}
+
+fn is_limited_broadcast_ip(addr: &crate::IpAddr) -> bool {
+    matches!(addr, crate::IpAddr::V4(v4) if *v4 == crate::Ipv4Addr::BROADCAST)
+}
+
+fn is_interface_scoped_destination_ip(addr: &crate::IpAddr) -> bool {
+    is_multicast_ip(addr) || is_limited_broadcast_ip(addr)
 }
 
 fn validate_transport_remote(remote: &Endpoint) -> Result<(), NetError> {
@@ -2820,6 +2920,193 @@ mod tests {
             Err(NetError::InvalidArgument)
         );
         assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
+    fn multicast_group_api_joins_leaves_ipv4_and_ipv6_groups() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-mcast",
+            IfConfig {
+                addresses: alloc::vec![
+                    CidrAddress::new_v4(Ipv4Addr::new(10, 50, 0, 2), 24),
+                    CidrAddress::new_v6(Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 2]), 64,),
+                ],
+                gateway: None,
+                mode: crate::IfMode::Static,
+            },
+        );
+        let v4_group = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
+        let v6_group = IpAddr::V6(Ipv6Addr::new([0xff02, 0, 0, 0, 0, 0, 0, 0x00fb]));
+
+        assert_eq!(stack.has_multicast_group(iface, v4_group), Ok(false));
+        assert_eq!(stack.join_multicast_group(iface, v4_group), Ok(()));
+        assert_eq!(stack.has_multicast_group(iface, v4_group), Ok(true));
+        assert_eq!(stack.leave_multicast_group(iface, v4_group), Ok(()));
+        assert_eq!(stack.has_multicast_group(iface, v4_group), Ok(false));
+
+        assert_eq!(stack.has_multicast_group(iface, v6_group), Ok(false));
+        assert_eq!(stack.join_multicast_group(iface, v6_group), Ok(()));
+        assert_eq!(stack.has_multicast_group(iface, v6_group), Ok(true));
+        assert_eq!(stack.leave_multicast_group(iface, v6_group), Ok(()));
+        assert_eq!(stack.has_multicast_group(iface, v6_group), Ok(false));
+    }
+
+    #[test]
+    fn multicast_group_api_rejects_invalid_inputs() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-mcast-invalid",
+            IfConfig::static_v4(Ipv4Addr::new(10, 51, 0, 2), 24, None),
+        );
+        let unicast = IpAddr::V4(Ipv4Addr::new(10, 51, 0, 77));
+        let group = IpAddr::V4(Ipv4Addr::new(239, 51, 0, 1));
+
+        assert_eq!(
+            stack.join_multicast_group(iface, unicast),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.has_multicast_group(iface, unicast),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.join_multicast_group(InterfaceId(0), group),
+            Err(NetError::InterfaceNotFound)
+        );
+    }
+
+    #[test]
+    fn interface_scoped_route_selection_uses_matching_address_family() {
+        let stack = NetStack::new();
+        let v4_iface = attach_test_iface(
+            &stack,
+            "eth-mcast-v4-route",
+            IfConfig::static_v4(Ipv4Addr::new(10, 52, 0, 2), 24, None),
+        );
+        let v6_iface = attach_test_iface(
+            &stack,
+            "eth-mcast-v6-route",
+            IfConfig::static_v6(Ipv6Addr::new([0xfe80, 0, 0, 0, 0, 0, 0, 0x52]), 64, None),
+        );
+        let v4_group = IpAddr::V4(Ipv4Addr::new(239, 52, 0, 1));
+        let v6_group = IpAddr::V6(Ipv6Addr::new([0xff02, 0, 0, 0, 0, 0, 0, 0x0052]));
+        let limited_broadcast = IpAddr::V4(Ipv4Addr::BROADCAST);
+
+        assert_eq!(stack.resolve_iface_for_remote(&v4_group), Some(v4_iface));
+        assert_eq!(
+            stack.resolve_iface_for_remote(&limited_broadcast),
+            Some(v4_iface)
+        );
+        assert_eq!(stack.resolve_iface_for_remote(&v6_group), Some(v6_iface));
+        assert_eq!(
+            stack.ensure_socket_route_matches(v4_iface, &v4_group),
+            Ok(())
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(v4_iface, &limited_broadcast),
+            Ok(())
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(v4_iface, &v6_group),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(v6_iface, &v6_group),
+            Ok(())
+        );
+
+        stack.set_iface_admin_up(v6_iface, false).unwrap();
+        assert_eq!(stack.resolve_iface_for_remote(&v6_group), None);
+    }
+
+    #[test]
+    fn udp_send_to_allows_ipv4_multicast_without_gateway() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-mcast-send",
+            IfConfig::static_v4(Ipv4Addr::new(10, 53, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+            port: 5353,
+        };
+
+        assert_eq!(stack.udp_send_to(handle, b"mdns", remote), Ok(4));
+
+        let frame = driver.last_tx().unwrap();
+        let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+        assert_eq!(ip_packet.dst_addr().octets(), [224, 0, 0, 251]);
+        assert_eq!(ip_packet.next_header(), smoltcp::wire::IpProtocol::Udp);
+    }
+
+    #[test]
+    fn udp_send_to_allows_limited_broadcast_without_gateway() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-bcast-send",
+            IfConfig::static_v4(Ipv4Addr::new(10, 53, 1, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::BROADCAST),
+            port: 9,
+        };
+
+        assert_eq!(stack.udp_send_to(handle, b"wake", remote), Ok(4));
+
+        let frame = driver.last_tx().unwrap();
+        let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+        assert_eq!(ip_packet.dst_addr().octets(), [255, 255, 255, 255]);
+        assert_eq!(ip_packet.next_header(), smoltcp::wire::IpProtocol::Udp);
+    }
+
+    #[test]
+    fn multicast_join_enables_udp_receive_for_group() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-mcast-recv",
+            IfConfig::static_v4(Ipv4Addr::new(10, 56, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 5353,
+        };
+        let src = smoltcp::wire::Ipv4Address::new(10, 56, 0, 77);
+        let dst = smoltcp::wire::Ipv4Address::new(224, 0, 0, 251);
+
+        stack.udp_bind(handle, local).unwrap();
+        driver.push_rx(build_udpv4_packet(src, dst, 42000, 5353, b"before-join"));
+        stack.poll_interface(iface, NetInstant::ZERO);
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            stack.udp_recv_from(handle, &mut buf),
+            Err(NetError::WouldBlock)
+        );
+
+        assert_eq!(
+            stack.join_multicast_group(iface, IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251))),
+            Ok(())
+        );
+        driver.push_rx(build_udpv4_packet(src, dst, 42000, 5353, b"after-join"));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let (len, remote) = stack.udp_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(&buf[..len], b"after-join");
+        assert_eq!(
+            remote,
+            Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 56, 0, 77)),
+                port: 42000,
+            }
+        );
     }
 
     #[test]
@@ -3924,6 +4211,37 @@ mod tests {
     }
 
     #[test]
+    fn tcp_connect_rejects_multicast_remote_before_syn() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-tcp-mcast",
+            IfConfig::static_v4(Ipv4Addr::new(10, 54, 0, 2), 24, None),
+        );
+        let handle = stack.socket_tcp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(239, 54, 0, 1)),
+            port: 80,
+        };
+
+        assert_eq!(
+            stack.tcp_connect(handle, remote),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(stack.socket_state(handle), SocketState::Closed);
+
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::BROADCAST),
+            port: 80,
+        };
+        assert_eq!(
+            stack.tcp_connect(handle, remote),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(stack.socket_state(handle), SocketState::Closed);
+    }
+
+    #[test]
     fn raw_send_rejects_missing_route_before_enqueue() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -3948,6 +4266,48 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn raw_and_icmp_send_allow_ipv4_multicast_without_gateway() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-raw-icmp-mcast",
+            IfConfig::static_v4(Ipv4Addr::new(10, 55, 0, 2), 24, None),
+        );
+        let raw = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let raw_packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 55, 0, 2),
+            smoltcp::wire::Ipv4Address::new(239, 55, 0, 1),
+            253,
+            b"raw-mcast",
+        );
+
+        assert_eq!(stack.raw_send(raw, &raw_packet, None), Ok(raw_packet.len()));
+        let frame = driver.last_tx().unwrap();
+        let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+        assert_eq!(ip_packet.dst_addr().octets(), [239, 55, 0, 1]);
+        assert_eq!(
+            ip_packet.next_header(),
+            smoltcp::wire::IpProtocol::Unknown(253)
+        );
+
+        let icmp = stack.socket_icmp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(224, 0, 0, 252)),
+            port: 0,
+        };
+        let payload = build_icmpv4_echo_request_payload(0x1234, 0x5678, b"icmp-mcast");
+        assert_eq!(
+            stack.raw_send(icmp, &payload, Some(remote)),
+            Ok(payload.len())
+        );
+
+        let frame = driver.last_tx().unwrap();
+        let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+        assert_eq!(ip_packet.dst_addr().octets(), [224, 0, 0, 252]);
+        assert_eq!(ip_packet.next_header(), smoltcp::wire::IpProtocol::Icmp);
     }
 
     #[test]
