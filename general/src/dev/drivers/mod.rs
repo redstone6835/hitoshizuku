@@ -21,6 +21,8 @@ mod fw_cfg;
 
 mod cfi_flash;
 
+mod virtio_block_common;
+
 mod virtio_blk;
 pub use virtio_blk::*;
 
@@ -33,9 +35,6 @@ pub use virtio_pci::*;
 mod random;
 pub use random::*;
 
-use core::num::NonZeroU32;
-
-use crate::dev::block::BlockLimits;
 use crate::dev::function::{FunctionProjectionNameAllocError, FunctionProjectionNameAllocator};
 use crate::dev::pnp::PnpError;
 
@@ -100,17 +99,6 @@ pub(super) fn alloc_virtio_blk_dev_name(
     VIRTIO_BLK_PROJECTION_NAMES
         .try_alloc_stable(stable_key)
         .map(|name| name.into_string())
-}
-
-pub(super) fn virtio_blk_limits(block_size: u32) -> BlockLimits {
-    if block_size == 0 {
-        return BlockLimits::unrestricted();
-    }
-    let max_blocks = NonZeroU32::new(u32::MAX / block_size);
-    match BlockLimits::new(max_blocks, max_blocks, NonZeroU32::new(1)) {
-        Some(limits) => limits,
-        None => BlockLimits::unrestricted(),
-    }
 }
 
 /// 注册当前内核镜像内建的所有 PnP 驱动。
