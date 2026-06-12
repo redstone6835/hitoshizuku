@@ -1709,6 +1709,8 @@ pub(super) fn sys_personality(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
 pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     const PR_SET_NAME: usize = 15;
     const PR_GET_NAME: usize = 16;
+    const PR_CAPBSET_READ: usize = 23;
+    const PR_CAPBSET_DROP: usize = 24;
     match ctx.args[0] {
         PR_SET_NAME => {
             let name_user = ctx.args[1];
@@ -1727,6 +1729,28 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             Ok(0)
         }
+        PR_CAPBSET_READ => {
+            let cap = ctx.args[1] as u32;
+            if !linux_cap_valid(cap) {
+                return Err(Errno::EINVAL);
+            }
+            let creds = ctx.task().credentials();
+            Ok(((creds.cap_bset.raw() >> cap) & 1) as usize)
+        }
+        PR_CAPBSET_DROP => {
+            let cap = ctx.args[1] as u32;
+            if !linux_cap_valid(cap) {
+                return Err(Errno::EINVAL);
+            }
+            let current = ctx.task().credentials();
+            if !current.has_cap(Capability::Setpcap) {
+                return Err(Errno::EPERM);
+            }
+            let mut new = (*current).clone();
+            new.cap_bset = CapSet::from_raw(new.cap_bset.raw() & !(1u64 << cap));
+            ctx.task().set_credentials(Arc::new(new));
+            Ok(0)
+        }
         _ => Ok(0),
     }
 }
@@ -1740,7 +1764,8 @@ pub(super) fn sys_capget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         return Err(Errno::ESRCH);
     }
     if datap != 0 {
-        write_cap_data(datap, words, ctx.task().credentials().caps)?;
+        let creds = ctx.task().credentials();
+        write_cap_data(datap, words, &creds)?;
     }
     Ok(0)
 }
@@ -1758,12 +1783,11 @@ pub(super) fn sys_capset(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let requested = read_cap_data(datap, words)?;
     let current = ctx.task().credentials();
-    let added = requested.raw() & !current.caps.raw();
-    if added != 0 && !current.has_cap(Capability::Setpcap) {
-        return Err(Errno::EPERM);
-    }
+    validate_capset(requested, &current)?;
     let mut new = (*current).clone();
-    new.caps = requested;
+    new.caps = requested.effective;
+    new.cap_permitted = requested.permitted;
+    new.cap_inheritable = requested.inheritable;
     ctx.task().set_credentials(Arc::new(new));
     Ok(0)
 }
@@ -1771,6 +1795,23 @@ pub(super) fn sys_capset(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const LINUX_CAP_LAST_CAP: u32 = 40;
+const LINUX_CAP_VALID_MASK: u64 = (1u64 << (LINUX_CAP_LAST_CAP + 1)) - 1;
+
+#[derive(Clone, Copy)]
+struct LinuxCapData {
+    effective: CapSet,
+    permitted: CapSet,
+    inheritable: CapSet,
+}
+
+fn linux_cap_valid(cap: u32) -> bool {
+    cap <= LINUX_CAP_LAST_CAP
+}
+
+fn valid_linux_caps() -> CapSet {
+    CapSet::from_raw(LINUX_CAP_VALID_MASK)
+}
 
 fn read_cap_header(user: usize) -> Result<(u32, i32), Errno> {
     if user == 0 {
@@ -1797,34 +1838,75 @@ fn cap_version_words(version: u32) -> Result<usize, Errno> {
     }
 }
 
-fn write_cap_data(user: usize, words: usize, caps: CapSet) -> Result<(), Errno> {
+fn write_cap_data(user: usize, words: usize, creds: &Credentials) -> Result<(), Errno> {
     let mut raw = [0u8; 24];
+    let valid = LINUX_CAP_VALID_MASK;
+    let caps = [
+        creds.caps.raw() & valid,
+        creds.cap_permitted.raw() & valid,
+        creds.cap_inheritable.raw() & valid,
+    ];
     for i in 0..words {
         let shift = i * 32;
-        let value = ((caps.raw() >> shift) & u32::MAX as u64) as u32;
         let off = i * 12;
-        raw[off..off + 4].copy_from_slice(&value.to_le_bytes());
-        raw[off + 4..off + 8].copy_from_slice(&value.to_le_bytes());
-        raw[off + 8..off + 12].copy_from_slice(&0u32.to_le_bytes());
+        for (j, value) in caps.iter().enumerate() {
+            let word = ((value >> shift) & u32::MAX as u64) as u32;
+            raw[off + j * 4..off + j * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
     }
     copy_to_user(user, &raw[..words * 12]).map_err(|e| e.as_errno())
 }
 
-fn read_cap_data(user: usize, words: usize) -> Result<CapSet, Errno> {
+fn read_cap_data(user: usize, words: usize) -> Result<LinuxCapData, Errno> {
     let mut raw = [0u8; 24];
     copy_from_user(user, &mut raw[..words * 12]).map_err(|e| e.as_errno())?;
     let mut effective = 0u64;
     let mut permitted = 0u64;
+    let mut inheritable = 0u64;
     for i in 0..words {
         let off = i * 12;
         let eff = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap()) as u64;
         let prm = u32::from_le_bytes(raw[off + 4..off + 8].try_into().unwrap()) as u64;
+        let inh = u32::from_le_bytes(raw[off + 8..off + 12].try_into().unwrap()) as u64;
         effective |= eff << (i * 32);
         permitted |= prm << (i * 32);
+        inheritable |= inh << (i * 32);
     }
-    // 当前调度层只维护一个 capability 位集。用 effective ∩ permitted 作为生效集，
-    // 既保留 Linux “permitted 是上限”的安全语义，也避免引入半套未使用的状态。
-    Ok(CapSet::from_raw(effective & permitted))
+    Ok(LinuxCapData {
+        effective: CapSet::from_raw(effective),
+        permitted: CapSet::from_raw(permitted),
+        inheritable: CapSet::from_raw(inheritable),
+    })
+}
+
+fn validate_capset(requested: LinuxCapData, current: &Credentials) -> Result<(), Errno> {
+    let valid = valid_linux_caps();
+    let requested_all =
+        requested.effective.raw() | requested.permitted.raw() | requested.inheritable.raw();
+    if (requested_all & !valid.raw()) != 0 {
+        return Err(Errno::EPERM);
+    }
+
+    if !requested.permitted.contains_all(requested.effective) {
+        return Err(Errno::EPERM);
+    }
+
+    let old_permitted = current.cap_permitted.mask(valid);
+    if !old_permitted.contains_all(requested.permitted) {
+        return Err(Errno::EPERM);
+    }
+
+    let old_inheritable = current.cap_inheritable.mask(valid);
+    let inheritable_from = if current.has_cap(Capability::Setpcap) {
+        old_inheritable.raw() | current.cap_bset.mask(valid).raw()
+    } else {
+        old_inheritable.raw() | old_permitted.raw()
+    };
+    if (requested.inheritable.raw() & !inheritable_from) != 0 {
+        return Err(Errno::EPERM);
+    }
+
+    Ok(())
 }
 
 pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

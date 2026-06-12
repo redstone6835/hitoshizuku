@@ -150,6 +150,7 @@ struct PageMapping {
 
 enum ResidentPageKind {
     Anon,
+    SharedAnon,
     PrivateFile,
     SharedFile {
         file: Arc<dyn FileLike>,
@@ -169,6 +170,14 @@ impl ResidentPage {
         Arc::new(Self {
             paddr,
             kind: ResidentPageKind::Anon,
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    fn new_shared_anon(paddr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            paddr,
+            kind: ResidentPageKind::SharedAnon,
             dirty: AtomicBool::new(false),
         })
     }
@@ -203,6 +212,18 @@ impl ResidentPage {
 
     fn is_direct(&self) -> bool {
         matches!(self.kind, ResidentPageKind::Direct)
+    }
+
+    fn is_shared_anon(&self) -> bool {
+        matches!(self.kind, ResidentPageKind::SharedAnon)
+    }
+
+    fn is_sysv_shm(&self) -> bool {
+        matches!(&self.kind, ResidentPageKind::SharedFile { file, .. } if file.is_sysv_shm())
+    }
+
+    fn is_direct_shared_writable(&self) -> bool {
+        self.is_direct() || self.is_shared_anon() || self.is_sysv_shm()
     }
 
     fn mark_dirty(&self) {
@@ -1108,6 +1129,12 @@ impl VmSpace {
             Err(err) => return fault_from_errno(err),
         };
         let mut access = access_for_new_page(flags, &page);
+        if page.is_sysv_shm() && flags.has(VmFlags::WRITE) {
+            // SysV shm is a shared memory object, not a regular file mapping.
+            // Keep it writable across fork, but conservatively flush it back if
+            // the last resident page disappears before another attach faults it.
+            page.mark_dirty();
+        }
         if is_write_fault(kind) && matches!(access, PageAccess::SharedTracked) {
             page.mark_dirty();
             access = PageAccess::Writable;
@@ -1324,7 +1351,7 @@ impl Drop for VmSpace {
 }
 
 fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
-    if page.is_direct() {
+    if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
         } else {
@@ -1341,7 +1368,7 @@ fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
 }
 
 fn access_for_existing_page(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
-    if page.is_direct() {
+    if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
         } else {
@@ -1360,7 +1387,7 @@ fn access_for_existing_page(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAcc
 }
 
 fn access_after_fork(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
-    if page.is_direct() {
+    if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
         } else {
@@ -1414,7 +1441,7 @@ fn shared_anon_page(id: usize, offset: u64) -> Result<Arc<ResidentPage>, Errno> 
         }
     }
     let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
-    let page = ResidentPage::new_anon(paddr);
+    let page = ResidentPage::new_shared_anon(paddr);
     SHARED_ANON_PAGES.lock().insert(key, Arc::downgrade(&page));
     Ok(page)
 }

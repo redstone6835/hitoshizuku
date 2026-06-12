@@ -658,6 +658,9 @@ pub fn accept(
 ) -> Result<(Fd, Option<Vec<u8>>), Errno> {
     let file = file_from_fd(fdt, fd)?;
     let (nonblock, cloexec) = parse_accept_flags(flags)?;
+    if file.flags().path_only {
+        return Err(Errno::EBADF);
+    }
     let fd_flags = if cloexec {
         FdFlags::CLOEXEC
     } else {

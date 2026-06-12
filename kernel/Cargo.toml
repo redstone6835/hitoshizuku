@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 bench = []
+block-bench = []
 allocator-bench = []
 embedded-initramfs = []
 allocator-tests = [

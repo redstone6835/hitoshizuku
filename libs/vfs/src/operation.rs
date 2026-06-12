@@ -601,10 +601,16 @@ fn chown_inode(
 
     inode.ops.chown(inode, uid, gid)?;
 
-    // POSIX：chown 后必须清除 SUID/SGID，防止权限提升（除非 CAP_FSETID）
-    if (uid.is_some() || gid.is_some()) && !ctx.cred.has_cap(cred::Capability::FSetId) {
+    // Linux regular-file semantics: chown clears SUID, and clears SGID only
+    // when the group execute bit is set. A non-executable SGID regular file
+    // uses the bit for mandatory locking and must keep it.
+    if (uid.is_some() || gid.is_some()) && inode.kind() == stat::FileType::Regular {
         let current_mode = inode.meta_snapshot().mode;
-        let new_mode = current_mode.without(FileMode::SUID_SGID);
+        let mut drop_bits = FileMode::ISUID;
+        if current_mode.has(FileMode::IXGRP) {
+            drop_bits = drop_bits.with(FileMode::ISGID);
+        }
+        let new_mode = current_mode.without(drop_bits);
         if new_mode != current_mode {
             inode.ops.chmod(inode, new_mode)?;
         }

@@ -15,43 +15,54 @@
 //!   L7  – 顺序写文件（新建文件，无缓存）
 //!   L8  – 元数据操作（readdir、创建/删除文件）
 
-#[cfg(feature = "bench")]
+#[cfg(feature = "block-bench")]
 use alloc::boxed::Box;
-#[cfg(feature = "bench")]
+#[cfg(feature = "block-bench")]
+use alloc::string::String;
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use alloc::sync::Arc;
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use alloc::vec;
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 #[cfg(feature = "bench")]
 use core::any::Any;
 #[cfg(feature = "bench")]
 use core::num::NonZeroU32;
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use core::ops::ControlFlow;
 
 use allocator::{
     AllocatorAuditScope, AllocatorReclaimRequest, KERNEL_ALLOCATOR, MAX_SMALL_SIZE, MemoryDomain,
     MemoryPlacement, MemoryRequest, PAGE_SIZE, PhysicalAllocRequest, ReclaimPolicy, Zeroing,
 };
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use vfs::cred::Credentials;
+#[cfg(feature = "block-bench")]
+use vfs::file::DirEntry;
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+use vfs::file::OpenOptions;
 #[cfg(feature = "bench")]
-use vfs::file::{DirEntry, OpenOptions};
-#[cfg(feature = "bench")]
-use vfs::superblock::{FsDriver, Superblock};
+use vfs::superblock::FsDriver;
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+use vfs::superblock::Superblock;
 #[cfg(feature = "bench")]
 use vfs::sync::Spinlock;
 
 #[cfg(feature = "bench")]
 use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
+#[cfg(feature = "block-bench")]
+use general::dev::enumerate::DEVICES;
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+use general::dev::block::BlockDevice;
 #[cfg(feature = "bench")]
 use general::dev::block::{
-    BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry,
-    BlockLimits,
+    BlockClass, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry, BlockLimits,
 };
-#[cfg(feature = "bench")]
+#[cfg(feature = "block-bench")]
+use general::vfs::device_files::projection::active_block_devices;
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::block_sync::SyncBlockBackend;
 
 // ── 嵌入的磁盘镜像 ──────────────────────────────────────────────────────
@@ -74,15 +85,15 @@ pub fn run() {
 
     {
         let raw_dev = make_ram_device("ramd-raw", EXT_IMG);
-        run_block_seq_read(&raw_dev);
-        run_block_seq_write(&raw_dev);
-        run_block_seq_read_instrumented(&raw_dev);
-        run_block_rand_read(&raw_dev);
+        run_block_seq_read("ram-raw", &raw_dev);
+        run_block_seq_write("ram-raw", &raw_dev);
+        run_block_seq_read_instrumented("ram-raw", &raw_dev);
+        run_block_rand_read("ram-raw", &raw_dev);
 
         let fat_dev = make_ram_device("ramd-fat", FAT_IMG);
         let ext_dev = make_ram_device("ramd-ext", EXT_IMG);
-        let fat_sb = mount_fat("fat", fat_dev);
-        let ext_sb = mount_ext("ext", ext_dev);
+        let fat_sb = mount_fat("fat", Arc::clone(&fat_dev));
+        let ext_sb = mount_ext("ext", Arc::clone(&ext_dev));
 
         // ─── L5/L7: 文件系统顺序写+读（先写后读，同一文件） ─────
         if let Some(ref sb) = fat_sb {
@@ -104,10 +115,10 @@ pub fn run() {
 
         // ─── L6: 随机读文件 ─────────────────────────────────────
         if let Some(ref sb) = fat_sb {
-            run_fs_rand_read("fat", sb);
+            run_fs_rand_read("fat", sb, &fat_dev);
         }
         if let Some(ref sb) = ext_sb {
-            run_fs_rand_read("ext", sb);
+            run_fs_rand_read("ext", sb, &ext_dev);
         }
 
         // ─── L8: 元数据操作 ─────────────────────────────────────
@@ -124,6 +135,84 @@ pub fn run() {
     }
     reclaim_allocator_caches_after_bench("full");
 
+    log::info!("[bench] ================= TEST COMPLETE ====================");
+}
+
+#[cfg(feature = "block-bench")]
+pub fn run_block_device() {
+    log::info!("[bench] ============ BLOCK DEVICE PERF TEST ============");
+
+    run_memcpy_baseline();
+    run_memcpy_cold();
+
+    let devices = active_block_devices(&DEVICES.functions);
+    if devices.is_empty() {
+        log::error!("[bench][block] no active block devices found");
+        reclaim_allocator_caches_after_bench("block-device");
+        log::info!("[bench] ================= TEST COMPLETE ====================");
+        return;
+    }
+
+    let mut tested_fat = false;
+    let mut tested_ext = false;
+
+    for dev in devices {
+        let dev_name = String::from(dev.name());
+        log::info!(
+            "[bench][block] candidate={} logical={} physical={} blocks={:?}",
+            dev_name,
+            dev.geometry().logical_block_size().get(),
+            dev.geometry().physical_block_size().get(),
+            dev.geometry().block_count()
+        );
+
+        let raw_tag = alloc::format!("block-{}", dev_name);
+        match general::vfs::mount_block_device_auto(Arc::clone(&dev), "") {
+            Ok((sb, source)) => {
+                log::info!(
+                    "[bench][block] mounted candidate={} fs={} source={}",
+                    dev_name,
+                    sb.fs_type,
+                    source
+                );
+                match sb.fs_type {
+                    "fatfs" if !tested_fat => {
+                        run_block_device_fs_read_suite("fat-block", &dev, &sb);
+                        tested_fat = true;
+                        release_bench_superblock_no_sync("fat-block", Some(sb));
+                    }
+                    "extfs" | "ext2" | "ext3" | "ext4" if !tested_ext => {
+                        run_block_device_fs_read_suite("ext-block", &dev, &sb);
+                        tested_ext = true;
+                        release_bench_superblock_no_sync("ext-block", Some(sb));
+                    }
+                    _ => release_bench_superblock_no_sync(&raw_tag, Some(sb)),
+                }
+            }
+            Err(err) => {
+                log::warning!(
+                    "[bench][block] candidate={} auto mount skipped: {:?}",
+                    dev_name,
+                    err
+                );
+            }
+        }
+
+        run_block_small_read(&raw_tag, &dev);
+        run_block_seq_read(&raw_tag, &dev);
+        run_block_seq_read_repeat(&raw_tag, &dev);
+        run_block_rand_read(&raw_tag, &dev);
+    }
+
+    if !tested_fat {
+        log::warning!("[bench][fat-block] no FAT block device found");
+    }
+
+    if !tested_ext {
+        log::warning!("[bench][ext-block] no EXT block device found");
+    }
+
+    reclaim_allocator_caches_after_bench("block-device");
     log::info!("[bench] ================= TEST COMPLETE ====================");
 }
 
@@ -172,6 +261,16 @@ fn release_bench_superblock(tag: &str, sb: Option<Arc<Superblock>>) {
         vfs::DCACHE.invalidate_subtree(&sb.root_dentry);
         sb.gc_inode_cache();
         drop(sb);
+    }
+}
+
+#[cfg(feature = "block-bench")]
+fn release_bench_superblock_no_sync(tag: &str, sb: Option<Arc<Superblock>>) {
+    if let Some(sb) = sb {
+        vfs::DCACHE.invalidate_subtree(&sb.root_dentry);
+        sb.gc_inode_cache();
+        drop(sb);
+        log::debug!("[bench][{}] released read-only bench superblock", tag);
     }
 }
 
@@ -1361,7 +1460,7 @@ fn mount_ext(tag: &str, dev: Arc<BlockDevice>) -> Option<Arc<Superblock>> {
 // L0: 纯内存拷贝
 // ═══════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 fn run_memcpy_baseline() {
     let size = 4 * 1024 * 1024usize;
     let src: Vec<u8> = vec![0xAA; size];
@@ -1380,7 +1479,7 @@ fn run_memcpy_baseline() {
 
 /// L0-cold: 从 64 MiB 冷数据源拷贝 4 MiB，强制 cache miss。
 /// 如果结果 ≈ L1，说明瓶颈是内存访问而非软件。
-#[cfg(feature = "bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 fn run_memcpy_cold() {
     let cold_size = 64 * 1024 * 1024usize;
     let cold_src: Vec<u8> = vec![0xBB; cold_size];
@@ -1456,12 +1555,51 @@ fn run_software_overhead_only() {
 // L1: 裸块设备顺序读写
 // ═══════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "bench")]
-fn run_block_seq_read(dev: &Arc<BlockDevice>) {
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+fn block_device_has_bytes(dev: &BlockDevice, bytes: usize) -> bool {
+    dev.geometry()
+        .capacity_bytes()
+        .is_some_and(|capacity| capacity >= bytes as u64)
+}
+
+#[cfg(feature = "block-bench")]
+fn run_block_small_read(tag: &str, dev: &Arc<BlockDevice>) {
     let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
         Ok(backend) => backend,
         Err(e) => {
-            log::error!("[bench][L1-blk] backend unavailable: {:?}", e);
+            log::error!("[bench][{}][SW-block] backend unavailable: {:?}", tag, e);
+            return;
+        }
+    };
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+    let mut buf = vec![0u8; lbs];
+    let count = 1000u64;
+    let t0 = hal::time::monotonic_ns();
+    let mut errors = 0u64;
+    for _ in 0..count {
+        if backend.read(0, 1, &mut buf).is_err() {
+            errors += 1;
+        }
+        core::hint::black_box(&buf);
+    }
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][{}][SW-block] {}x read {}B from block device: total {} ns avg {} ns/op err={}",
+        tag,
+        count,
+        lbs,
+        dt,
+        dt / count,
+        errors
+    );
+}
+
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+fn run_block_seq_read(tag: &str, dev: &Arc<BlockDevice>) {
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][{}][L1-blk] backend unavailable: {:?}", tag, e);
             return;
         }
     };
@@ -1471,6 +1609,14 @@ fn run_block_seq_read(dev: &Arc<BlockDevice>) {
     if chunk % lbs != 0 {
         return;
     }
+    if !block_device_has_bytes(dev, total_bytes) {
+        log::error!(
+            "[bench][{}][L1-blk] device too small for {} bytes seq read",
+            tag,
+            total_bytes
+        );
+        return;
+    }
     let blocks_per_chunk = (chunk / lbs) as u32;
     let iters = total_bytes / chunk;
     let mut buf = vec![0u8; chunk];
@@ -1478,16 +1624,69 @@ fn run_block_seq_read(dev: &Arc<BlockDevice>) {
     for i in 0..iters {
         let lba = (i as u64) * blocks_per_chunk as u64;
         if backend.read(lba, blocks_per_chunk, &mut buf).is_err() {
-            log::error!("[bench][L1-blk] seq read error");
+            log::error!("[bench][{}][L1-blk] seq read error", tag);
             return;
         }
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     let mibps = (total_bytes as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
-        "[bench][L1-blk] seq read 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
+        "[bench][{}][L1-blk] seq read 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
+        tag,
         dt,
         mibps
+    );
+}
+
+#[cfg(feature = "block-bench")]
+fn run_block_seq_read_repeat(tag: &str, dev: &Arc<BlockDevice>) {
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][{}][L1-repeat] backend unavailable: {:?}", tag, e);
+            return;
+        }
+    };
+    let chunk = 1024 * 1024usize;
+    let total_bytes = 4 * 1024 * 1024usize;
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+    if chunk % lbs != 0 || !block_device_has_bytes(dev, total_bytes) {
+        return;
+    }
+    let blocks_per_chunk = (chunk / lbs) as u32;
+    let iters = total_bytes / chunk;
+    let mut buf = vec![0u8; chunk];
+
+    for i in 0..iters {
+        let lba = (i as u64) * blocks_per_chunk as u64;
+        let _ = backend.read(lba, blocks_per_chunk, &mut buf);
+    }
+    core::hint::black_box(&buf);
+
+    let before = dev.io_stats();
+    let t0 = hal::time::monotonic_ns();
+    for i in 0..iters {
+        let lba = (i as u64) * blocks_per_chunk as u64;
+        if backend.read(lba, blocks_per_chunk, &mut buf).is_err() {
+            log::error!("[bench][{}][L1-repeat] seq read error", tag);
+            return;
+        }
+    }
+    core::hint::black_box(&buf);
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = dev.io_stats();
+    let read_ios = after.read_ios.saturating_sub(before.read_ios);
+    let read_sectors = after.read_sectors.saturating_sub(before.read_sectors);
+    let read_time_ns = after.read_time_ns.saturating_sub(before.read_time_ns);
+    let mibps = (total_bytes as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
+    log::info!(
+        "[bench][{}][L1-repeat] seq read 4 MiB repeat: {} ns ({} MiB/s) backend_ios={} backend_read={} KiB backend_avg={} ns",
+        tag,
+        dt,
+        mibps,
+        read_ios,
+        read_sectors / 2,
+        read_time_ns / read_ios.max(1)
     );
 }
 
@@ -1495,7 +1694,7 @@ fn run_block_seq_read(dev: &Arc<BlockDevice>) {
 /// 对比「直接 memcpy」vs「通过 SyncBlockBackend 完整路径」。
 /// 先 warmup 把数据拉入 cache，再分别测量两条路径。
 #[cfg(feature = "bench")]
-fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
+fn run_block_seq_read_instrumented(tag: &str, dev: &Arc<BlockDevice>) {
     let chunk = 1024 * 1024usize;
     let total_bytes = 4 * 1024 * 1024usize;
     let lbs = dev.geometry().logical_block_size().get() as usize;
@@ -1508,7 +1707,7 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
         Ok(backend) => backend,
         Err(e) => {
-            log::error!("[bench][PROOF] backend unavailable: {:?}", e);
+            log::error!("[bench][{}][PROOF] backend unavailable: {:?}", tag, e);
             return;
         }
     };
@@ -1530,14 +1729,14 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     core::hint::black_box(&buf);
     let dt_full = hal::time::monotonic_ns().saturating_sub(t0);
 
-    // ── 测量 B: 直接路径（旧 read_sectors_sync 快路径已移除，与 backend 同等） ──
+    // ── 测量 B: 重复完整路径。旧 read_sectors_sync 快路径已移除，这里不是直连驱动路径。 ──
     let t0 = hal::time::monotonic_ns();
     for i in 0..iters {
         let lba = (i as u64) * blocks_per_chunk as u64;
         let _ = backend.read(lba, blocks_per_chunk, &mut buf);
     }
     core::hint::black_box(&buf);
-    let dt_direct = hal::time::monotonic_ns().saturating_sub(t0);
+    let dt_repeat = hal::time::monotonic_ns().saturating_sub(t0);
 
     // ── 测量 C: 纯 memcpy（同一 backing store，手动 lock） ──
     let io_ref = dev.downcast_driver::<RamBlockIo>().unwrap();
@@ -1551,36 +1750,40 @@ fn run_block_seq_read_instrumented(dev: &Arc<BlockDevice>) {
     }
     let dt_raw = hal::time::monotonic_ns().saturating_sub(t0);
 
-    let overhead = dt_full.saturating_sub(dt_direct);
-    log::info!("[bench][PROOF] same device, cache hot, 4 MiB x3:");
+    let backend_over_raw = dt_full.saturating_sub(dt_raw);
+    log::info!("[bench][{}][PROOF] same device, cache hot, 4 MiB x3:", tag);
     log::info!(
-        "[bench][PROOF]   full path (SyncBlockBackend): {} ns ({} MiB/s)",
+        "[bench][{}][PROOF]   SyncBlockBackend pass#1: {} ns ({} MiB/s)",
+        tag,
         dt_full,
         (total_bytes as u64) * 1_000_000_000 / dt_full.max(1) / (1024 * 1024)
     );
     log::info!(
-        "[bench][PROOF]   direct BlockIo::read_sectors_sync: {} ns ({} MiB/s)",
-        dt_direct,
-        (total_bytes as u64) * 1_000_000_000 / dt_direct.max(1) / (1024 * 1024)
+        "[bench][{}][PROOF]   SyncBlockBackend pass#2: {} ns ({} MiB/s)",
+        tag,
+        dt_repeat,
+        (total_bytes as u64) * 1_000_000_000 / dt_repeat.max(1) / (1024 * 1024)
     );
     log::info!(
-        "[bench][PROOF]   raw lock+memcpy: {} ns ({} MiB/s)",
+        "[bench][{}][PROOF]   raw lock+memcpy: {} ns ({} MiB/s)",
+        tag,
         dt_raw,
         (total_bytes as u64) * 1_000_000_000 / dt_raw.max(1) / (1024 * 1024)
     );
     log::info!(
-        "[bench][PROOF]   software overhead (full - direct): {} ns ({} ns/op)",
-        overhead,
-        overhead / iters as u64
+        "[bench][{}][PROOF]   backend wrapper over raw memcpy: {} ns ({} ns/op); no direct read_sectors_sync path measured",
+        tag,
+        backend_over_raw,
+        backend_over_raw / iters as u64
     );
 }
 
 #[cfg(feature = "bench")]
-fn run_block_seq_write(dev: &Arc<BlockDevice>) {
+fn run_block_seq_write(tag: &str, dev: &Arc<BlockDevice>) {
     let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
         Ok(backend) => backend,
         Err(e) => {
-            log::error!("[bench][L1-blk] backend unavailable: {:?}", e);
+            log::error!("[bench][{}][L1-blk] backend unavailable: {:?}", tag, e);
             return;
         }
     };
@@ -1597,14 +1800,15 @@ fn run_block_seq_write(dev: &Arc<BlockDevice>) {
     for i in 0..iters {
         let lba = (i as u64) * blocks_per_chunk as u64;
         if backend.write(lba, blocks_per_chunk, &buf).is_err() {
-            log::error!("[bench][L1-blk] seq write error");
+            log::error!("[bench][{}][L1-blk] seq write error", tag);
             return;
         }
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     let mibps = (total_bytes as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
     log::info!(
-        "[bench][L1-blk] seq write 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
+        "[bench][{}][L1-blk] seq write 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
+        tag,
         dt,
         mibps
     );
@@ -1614,12 +1818,12 @@ fn run_block_seq_write(dev: &Arc<BlockDevice>) {
 // L2: 裸块设备随机读取
 // ═══════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "bench")]
-fn run_block_rand_read(dev: &Arc<BlockDevice>) {
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+fn run_block_rand_read(tag: &str, dev: &Arc<BlockDevice>) {
     let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
         Ok(backend) => backend,
         Err(e) => {
-            log::error!("[bench][L2-blk] backend unavailable: {:?}", e);
+            log::error!("[bench][{}][L2-blk] backend unavailable: {:?}", tag, e);
             return;
         }
     };
@@ -1630,6 +1834,7 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
         return;
     }
     let blocks_per_op = (block / lbs) as u32;
+    let stride = blocks_per_op as u64;
     let Some(max_lba) = dev
         .geometry()
         .block_count()
@@ -1645,13 +1850,14 @@ fn run_block_rand_read(dev: &Arc<BlockDevice>) {
     let t0 = hal::time::monotonic_ns();
     for _ in 0..count {
         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
-        let lba = (rng as u64) % (max_lba / 8 + 1) * 8;
+        let lba = (rng as u64) % (max_lba / stride + 1) * stride;
         let _ = backend.read(lba, blocks_per_op, &mut buf);
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
     let avg_ns = dt / count;
     log::info!(
-        "[bench][L2-blk] rand read {} x 4 KiB: total {} ns (avg {} ns/op)  <-- 裸块随机延迟",
+        "[bench][{}][L2-blk] rand read {} x 4 KiB: total {} ns (avg {} ns/op)  <-- 裸块随机延迟",
+        tag,
         count,
         dt,
         avg_ns
@@ -1950,72 +2156,346 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// L5: 顺序读文件
-// ═══════════════════════════════════════════════════════════════════════
-
-#[cfg(feature = "bench")]
-fn run_fs_seq_read(tag: &str, sb: &Arc<Superblock>) {
-    let root = &sb.root_inode;
-    let cred = Credentials::root();
-    let (file, size) = match find_largest_file(root, tag, &cred) {
-        Some(v) => v,
-        None => return,
-    };
-    let want = core::cmp::min(size, 4 * 1024 * 1024) as usize;
-    if want == 0 {
-        return;
-    }
-    let mut buf = vec![0u8; want];
-    let t0 = hal::time::monotonic_ns();
-    if file.read_at(&mut buf, 0).is_err() {
-        log::error!("[bench][{}][L5-seq] read error", tag);
-        return;
-    }
-    let dt = hal::time::monotonic_ns().saturating_sub(t0);
-    let mibps = (want as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
-    log::info!(
-        "[bench][{}][L5-seq] seq read {} bytes in {} ns ({} MiB/s)",
-        tag,
-        want,
-        dt,
-        mibps
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // L6: 随机读文件
 // ═══════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "bench")]
-fn run_fs_rand_read(tag: &str, sb: &Arc<Superblock>) {
+#[cfg(feature = "block-bench")]
+fn run_block_device_fs_read_suite(tag: &str, dev: &Arc<BlockDevice>, sb: &Arc<Superblock>) {
+    log::info!(
+        "[bench][{}] read-only fs bench fs={} block_size={}",
+        tag,
+        sb.fs_type,
+        sb.block_size
+    );
+    run_fs_meta_readonly(tag, sb);
+    run_fs_seq_read_existing(tag, sb, dev);
+    run_fs_rand_read_existing(tag, sb, dev);
+}
+
+#[cfg(feature = "block-bench")]
+fn run_fs_seq_read_existing(tag: &str, sb: &Arc<Superblock>, dev: &Arc<BlockDevice>) {
     let root = &sb.root_inode;
     let cred = Credentials::root();
-    let (file, size) = match find_largest_file(root, tag, &cred) {
-        Some(v) => v,
-        None => return,
+    let Some((name, _inode, file, size)) = find_largest_regular_file(root, &cred) else {
+        log::warning!("[bench][{}][L5-read] no regular file in root directory", tag);
+        return;
     };
-    let block = 4096usize;
-    let count = 100u64;
-    if size < block as u64 {
+    let want = core::cmp::min(size, 4 * 1024 * 1024) as usize;
+    if want == 0 {
+        log::warning!("[bench][{}][L5-read] selected file {} is empty", tag, name);
         return;
     }
-    let mut buf = vec![0u8; block];
-    let mut rng = 0xbeefdeadu32;
+
+    let mut buf = vec![0u8; want];
+    let before = dev.io_stats();
     let t0 = hal::time::monotonic_ns();
-    for _ in 0..count {
+    let n = match file.read_at(&mut buf, 0) {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("[bench][{}][L5-read] {} read failed: {:?}", tag, name, e);
+            return;
+        }
+    };
+    core::hint::black_box(&buf[..n.min(want)]);
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = dev.io_stats();
+    let read_ios = after.read_ios.saturating_sub(before.read_ios);
+    let read_sectors = after.read_sectors.saturating_sub(before.read_sectors);
+    let read_time_ns = after.read_time_ns.saturating_sub(before.read_time_ns);
+    let mibps = (n as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
+    log::info!(
+        "[bench][{}][L5-read] existing file {} size={} read={} bytes: {} ns ({} MiB/s) backend_ios={} backend_read={} KiB backend_avg={} ns",
+        tag,
+        name,
+        size,
+        n,
+        dt,
+        mibps,
+        read_ios,
+        read_sectors / 2,
+        read_time_ns / read_ios.max(1)
+    );
+}
+
+#[cfg(feature = "block-bench")]
+fn run_fs_rand_read_existing(tag: &str, sb: &Arc<Superblock>, dev: &Arc<BlockDevice>) {
+    let root = &sb.root_inode;
+    let cred = Credentials::root();
+    let Some((name, _inode, file, size)) = find_largest_regular_file(root, &cred) else {
+        log::warning!("[bench][{}][L6-rand] no regular file in root directory", tag);
+        return;
+    };
+    let block = 4096usize;
+    if size < block as u64 {
+        log::warning!(
+            "[bench][{}][L6-rand] selected file {} too small: {} bytes",
+            tag,
+            name,
+            size
+        );
+        return;
+    }
+
+    let count = 100usize;
+    let size_usize = core::cmp::min(size, usize::MAX as u64) as usize;
+    let max_off = size_usize.saturating_sub(block);
+    let mut offsets = vec![0usize; count];
+    let mut rng = 0xbeefdeadu32 ^ (tag.as_bytes().first().copied().unwrap_or(0) as u32);
+    for off in &mut offsets {
         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
-        let max_off = (size as usize).saturating_sub(block);
-        let off = (rng as usize) % (max_off / block + 1) * block;
-        let _ = file.read_at(&mut buf, off as u64);
+        *off = (rng as usize) % (max_off / block + 1) * block;
+    }
+
+    log::info!(
+        "[bench][{}][L6-rand] existing file {} size={} bytes",
+        tag,
+        name,
+        size
+    );
+    run_fs_rand_read_pass(tag, "existing", &*file, dev, &offsets, block);
+    run_fs_rand_read_pass(tag, "existing-repeat", &*file, dev, &offsets, block);
+}
+
+#[cfg(feature = "bench")]
+fn run_fs_rand_read(tag: &str, sb: &Arc<Superblock>, dev: &Arc<BlockDevice>) {
+    let root = &sb.root_inode;
+    let cred = Credentials::root();
+    let fname = ".__bench_randio__";
+    let total = 4 * 1024 * 1024usize;
+    let block = 4096usize;
+    let count = 100usize;
+
+    if let Ok(child) = root.lookup(fname) {
+        let _ = root.unlink(fname, &*child);
+    }
+
+    let inode = match root.create(fname, vfs::stat::FileMode::new(0o644), &cred) {
+        Ok(inode) => inode,
+        Err(e) => {
+            log::error!("[bench][{}][L6-rand] create failed: {:?}", tag, e);
+            return;
+        }
+    };
+
+    let opts_w = OpenOptions {
+        access: vfs::file::AccessMode::WriteOnly,
+        ..OpenOptions::default()
+    };
+    let file_w = match inode.open_ops(&opts_w, &cred) {
+        Ok(file) => file,
+        Err(e) => {
+            log::error!("[bench][{}][L6-rand] open(W) failed: {:?}", tag, e);
+            let _ = root.unlink(fname, &*inode);
+            return;
+        }
+    };
+
+    let mut wbuf = vec![0u8; total];
+    for (idx, byte) in wbuf.iter_mut().enumerate() {
+        *byte = ((idx as u32).wrapping_mul(131).wrapping_add(17) >> 3) as u8;
+    }
+
+    match file_w.write_at(&wbuf, 0) {
+        Ok(n) if n == total => {}
+        Ok(n) => {
+            log::error!(
+                "[bench][{}][L6-rand] setup short write: {} of {} bytes",
+                tag,
+                n,
+                total
+            );
+            drop(file_w);
+            let _ = root.unlink(fname, &*inode);
+            return;
+        }
+        Err(e) => {
+            log::error!("[bench][{}][L6-rand] setup write failed: {:?}", tag, e);
+            drop(file_w);
+            let _ = root.unlink(fname, &*inode);
+            return;
+        }
+    }
+    if let Err(e) = file_w.sync() {
+        log::error!("[bench][{}][L6-rand] sync failed: {:?}", tag, e);
+        drop(file_w);
+        let _ = root.unlink(fname, &*inode);
+        return;
+    }
+    drop(file_w);
+
+    let file = match inode.open_ops(&OpenOptions::default(), &cred) {
+        Ok(file) => file,
+        Err(e) => {
+            log::error!("[bench][{}][L6-rand] open(R) failed: {:?}", tag, e);
+            let _ = root.unlink(fname, &*inode);
+            return;
+        }
+    };
+
+    let mut offsets = vec![0usize; count];
+    let mut rng = 0xbeefdeadu32 ^ (tag.as_bytes().first().copied().unwrap_or(0) as u32);
+    let max_off = total.saturating_sub(block);
+    for off in &mut offsets {
+        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+        *off = (rng as usize) % (max_off / block + 1) * block;
+    }
+
+    run_fs_rand_read_pass(tag, "cold-ish", &*file, dev, &offsets, block);
+    run_fs_rand_read_pass(tag, "repeat", &*file, dev, &offsets, block);
+    drop(file);
+
+    if let Ok(child) = root.lookup(fname) {
+        let _ = root.unlink(fname, &*child);
+    }
+}
+
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+fn run_fs_rand_read_pass(
+    tag: &str,
+    pass: &str,
+    file: &(dyn vfs::file::FileOps + Send + Sync),
+    dev: &Arc<BlockDevice>,
+    offsets: &[usize],
+    block: usize,
+) {
+    let mut buf = vec![0u8; block];
+    let before = dev.io_stats();
+    let mut full = 0usize;
+    let mut short = 0usize;
+    let mut errors = 0usize;
+    let mut checksum = 0u64;
+
+    let t0 = hal::time::monotonic_ns();
+    for &off in offsets {
+        match file.read_at(&mut buf, off as u64) {
+            Ok(n) if n == block => {
+                full += 1;
+                checksum = checksum
+                    .wrapping_add(buf[0] as u64)
+                    .wrapping_add((buf[block / 2] as u64) << 8)
+                    .wrapping_add((buf[block - 1] as u64) << 16)
+                    .wrapping_add(off as u64);
+                core::hint::black_box(&buf);
+            }
+            Ok(n) => {
+                short += 1;
+                checksum = checksum.wrapping_add(n as u64).wrapping_add(off as u64);
+                core::hint::black_box(&buf[..n.min(block)]);
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
     }
     let dt = hal::time::monotonic_ns().saturating_sub(t0);
-    let avg_ns = dt / count;
+    let after = dev.io_stats();
+    let read_ios = after.read_ios.saturating_sub(before.read_ios);
+    let read_sectors = after.read_sectors.saturating_sub(before.read_sectors);
+    let read_time_ns = after.read_time_ns.saturating_sub(before.read_time_ns);
+    let avg_ns = dt / offsets.len().max(1) as u64;
+    let backend_avg_ns = read_time_ns / read_ios.max(1);
+    let backend_kib = read_sectors / 2;
+
     log::info!(
-        "[bench][{}][L6-rand] rand read {} x 4 KiB: avg {} ns/op",
+        "[bench][{}][L6-rand][{}] rand read {} x 4 KiB: total {} ns avg {} ns/op full={} short={} err={} backend_read_ios={} backend_read={} KiB backend_avg={} ns checksum={:#x}",
+        tag,
+        pass,
+        offsets.len(),
+        dt,
+        avg_ns,
+        full,
+        short,
+        errors,
+        read_ios,
+        backend_kib,
+        backend_avg_ns,
+        checksum
+    );
+}
+
+#[cfg(feature = "block-bench")]
+fn run_fs_meta_readonly(tag: &str, sb: &Arc<Superblock>) {
+    let root = &sb.root_inode;
+    let cred = Credentials::root();
+    let t0 = hal::time::monotonic_ns();
+    let dir = match root.open_ops(&OpenOptions::default(), &cred) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("[bench][{}][L8-meta-ro] open root failed: {:?}", tag, e);
+            return;
+        }
+    };
+    let mut count = 0u32;
+    let _ = dir.readdir(0, &mut |_| {
+        count += 1;
+        ControlFlow::Continue(())
+    });
+    drop(dir);
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][{}][L8-meta-ro] readdir {} entries in {} ns",
         tag,
         count,
-        avg_ns
+        dt
     );
+}
+
+#[cfg(feature = "block-bench")]
+fn find_largest_regular_file(
+    root: &Arc<vfs::inode::Inode>,
+    cred: &Credentials,
+) -> Option<(
+    String,
+    Arc<vfs::inode::Inode>,
+    Box<dyn vfs::file::FileOps + Send + Sync>,
+    u64,
+)> {
+    let dir = root.open_ops(&OpenOptions::default(), cred).ok()?;
+    let mut entries: Vec<DirEntry> = Vec::new();
+    let _ = dir.readdir(0, &mut |entry| {
+        entries.push(entry);
+        ControlFlow::Continue(())
+    });
+
+    let mut best_allocated: Option<(String, u64)> = None;
+    let mut best_any: Option<(String, u64)> = None;
+    for entry in &entries {
+        if !matches!(entry.kind, vfs::stat::FileType::Regular) {
+            continue;
+        }
+        let Ok(name) = core::str::from_utf8(entry.name.as_bytes()) else {
+            continue;
+        };
+        if name == "." || name == ".." || name.is_empty() {
+            continue;
+        }
+        let Ok(child) = root.lookup(name) else {
+            continue;
+        };
+        let size = child.size();
+        if size == 0 {
+            continue;
+        }
+        if best_any
+            .as_ref()
+            .is_none_or(|(_, best_size)| size > *best_size)
+        {
+            best_any = Some((String::from(name), size));
+        }
+        let allocated_blocks = child.stat().map(|stat| stat.blocks).unwrap_or(0);
+        if allocated_blocks != 0
+            && best_allocated
+                .as_ref()
+                .is_none_or(|(_, best_size)| size > *best_size)
+        {
+            best_allocated = Some((String::from(name), size));
+        }
+    }
+
+    let (name, size) = best_allocated.or(best_any)?;
+    let inode = root.lookup(&name).ok()?;
+    let file = inode.open_ops(&OpenOptions::default(), cred).ok()?;
+    Some((name, inode, file, size))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2164,47 +2644,6 @@ fn run_fs_meta(tag: &str, sb: &Arc<Superblock>) {
             delete_total / 10
         );
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// 辅助：找最大普通文件
-// ═══════════════════════════════════════════════════════════════════════
-
-#[cfg(feature = "bench")]
-fn find_largest_file(
-    root: &Arc<vfs::inode::Inode>,
-    _tag: &str,
-    cred: &Credentials,
-) -> Option<(Box<dyn vfs::file::FileOps + Send + Sync>, u64)> {
-    let opts = OpenOptions::default();
-    let dir = root.open_ops(&opts, cred).ok()?;
-    let mut entries: Vec<DirEntry> = Vec::new();
-    let _ = dir.readdir(0, &mut |e| {
-        entries.push(e);
-        ControlFlow::Continue(())
-    });
-    let mut largest: u64 = 0;
-    let mut target_name: Option<alloc::string::String> = None;
-    for e in &entries {
-        if matches!(e.kind, vfs::stat::FileType::Regular) {
-            if let Ok(name) = core::str::from_utf8(e.name.as_bytes()) {
-                if name == "." || name == ".." || name.is_empty() {
-                    continue;
-                }
-                if let Ok(child) = root.lookup(name) {
-                    let sz = child.size();
-                    if sz > largest {
-                        largest = sz;
-                        target_name = Some(name.into());
-                    }
-                }
-            }
-        }
-    }
-    let name = target_name?;
-    let inode = root.lookup(&name).ok()?;
-    let file = inode.open_ops(&opts, cred).ok()?;
-    Some((file, largest))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
