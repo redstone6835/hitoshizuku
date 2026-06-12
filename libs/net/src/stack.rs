@@ -449,6 +449,7 @@ impl NetStack {
         if managed.handle_is_closed(handle) {
             return Err(NetError::Closed);
         }
+        ensure_local_addr_available(&managed, &local.addr)?;
         managed
             .icmp_socket_mut(handle.inner)
             .bind(smoltcp::socket::icmp::Endpoint::Udp(
@@ -477,6 +478,7 @@ impl NetStack {
             }
             SocketType::Icmp => {
                 let remote = remote.ok_or(NetError::InvalidArgument)?;
+                validate_specified_remote_addr(&remote.addr)?;
                 self.ensure_socket_route_matches(handle.iface_id, &remote.addr)?;
                 None
             }
@@ -1960,7 +1962,15 @@ fn is_unspecified_ip(addr: &crate::IpAddr) -> bool {
 }
 
 fn validate_transport_remote(remote: &Endpoint) -> Result<(), NetError> {
-    if remote.port == 0 || is_unspecified_ip(&remote.addr) {
+    validate_specified_remote_addr(&remote.addr)?;
+    if remote.port == 0 {
+        return Err(NetError::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn validate_specified_remote_addr(addr: &IpAddr) -> Result<(), NetError> {
+    if is_unspecified_ip(addr) {
         return Err(NetError::InvalidArgument);
     }
     Ok(())
@@ -3358,6 +3368,30 @@ mod tests {
     }
 
     #[test]
+    fn icmp_send_rejects_unspecified_remote_before_route() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-unspecified",
+            IfConfig::static_v4(Ipv4Addr::new(10, 18, 1, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.raw_send(
+                handle,
+                b"icmp-route",
+                Some(Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 0,
+                }),
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
     fn icmp_bind_identifier_rejects_wrong_socket_type() {
         let stack = NetStack::new();
         let iface = attach_test_iface(
@@ -3409,6 +3443,38 @@ mod tests {
                 },
             ),
             Err(NetError::InvalidArgument)
+        );
+    }
+
+    #[test]
+    fn icmp_bind_udp_rejects_nonlocal_address() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-icmp-bind-udp-local",
+            IfConfig::static_v4(Ipv4Addr::new(10, 21, 1, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+
+        assert_eq!(
+            stack.icmp_bind_udp(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(10, 21, 2, 2)),
+                    port: 33434,
+                },
+            ),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.icmp_bind_udp(
+                handle,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    port: 33434,
+                },
+            ),
+            Ok(())
         );
     }
 
