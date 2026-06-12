@@ -51,18 +51,11 @@ struct DtbBuffer(UnsafeCell<[u8; DTB_BUF_SIZE]>);
 unsafe impl Sync for DtbBuffer {}
 static DTB_BUFFER: DtbBuffer = DtbBuffer(UnsafeCell::new([0u8; DTB_BUF_SIZE]));
 
-/// DTB 零拷贝虚拟地址（direct map 覆盖时使用）。
-static DTB_DIRECT_PTR: AtomicUsize = AtomicUsize::new(0);
-
 /// 启动 hart ID，由 loader 设置后供 allocator 的 cpu_id 回调使用。
 static HART_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// 返回内核 DTB 视图。优先走零拷贝（direct map），fallback 读 buffer。
+/// 返回内核 DTB 视图（始终从内核缓冲区读取）。
 fn kernel_dtb() -> Option<Dtb<'static>> {
-    let direct = DTB_DIRECT_PTR.load(Ordering::Acquire);
-    if direct != 0 {
-        return unsafe { Dtb::from_ptr(direct) };
-    }
     let len = DTB_VALID_LEN.load(Ordering::Acquire);
     if len == 0 {
         return None;
@@ -71,31 +64,27 @@ fn kernel_dtb() -> Option<Dtb<'static>> {
     Dtb::from_bytes(slice)
 }
 
-/// 获取 DTB 访问。
+/// 将固件提供的 DTB 拷贝到内核静态缓冲区。
 ///
-/// RAM 区域（>= 0x8000_0000）的 DTB 通过 direct map 零拷贝访问；
-/// 低地址 MMIO 区域（< 0x4000_0000，identity map 覆盖）的 DTB 拷贝到内核 buffer。
-/// 0x4000_0000..0x8000_0000 范围不在任何映射内，会触发 panic。
+/// 所有地址范围统一走拷贝路径，不保留零拷贝引用——DTB 原址在 buddy
+/// allocator 接管后会被覆盖，零拷贝会导致 `&str`/`&[u8]` 引用失效。
 fn store_kernel_dtb(dtb_paddr: usize) -> Result<Dtb<'static>, &'static str> {
     if dtb_paddr == 0 {
         return Err("missing DTB address");
     }
 
-    // RAM 区域：direct map 覆盖，零拷贝
-    if dtb_paddr >= 0x8000_0000 {
-        let vaddr = phys_to_virt(dtb_paddr);
-        let dtb = unsafe { Dtb::from_ptr(vaddr) }.ok_or("invalid DTB magic")?;
-        DTB_DIRECT_PTR.store(vaddr, Ordering::Release);
-        return Ok(dtb);
-    }
-
-    // 0x4000_0000..0x8000_0000：既不在 RAM 也不在 identity map 范围
-    if dtb_paddr >= 0x4000_0000 {
+    // 0x4000_0000..0x8000_0000：不在任何映射内
+    if dtb_paddr >= 0x4000_0000 && dtb_paddr < 0x8000_0000 {
         return Err("DTB at unsupported address (not in identity map or RAM)");
     }
 
-    // MMIO 区域（< 0x4000_0000）：通过 identity mapping 拷贝到 buffer
-    let fw_dtb = unsafe { Dtb::from_ptr(dtb_paddr) }.ok_or("invalid DTB magic")?;
+    let vaddr = if dtb_paddr >= 0x8000_0000 {
+        phys_to_virt(dtb_paddr)
+    } else {
+        dtb_paddr // MMIO 区域走 identity mapping
+    };
+
+    let fw_dtb = unsafe { Dtb::from_ptr(vaddr) }.ok_or("invalid DTB magic")?;
     let bytes = fw_dtb.as_bytes();
     if bytes.len() > DTB_BUF_SIZE {
         return Err("DTB too large for kernel buffer");
