@@ -76,7 +76,8 @@ impl Riscv64Paging {
     }
 
     const fn leaf_flags(r: bool, w: bool, x: bool, u: bool, g: bool) -> usize {
-        let mut f = PTE_V | PTE_A | PTE_D;
+        let mut f = PTE_V | PTE_A;
+        if w { f |= PTE_D; }
         if r { f |= PTE_R; }
         if w { f |= PTE_W; }
         if x { f |= PTE_X; }
