@@ -389,6 +389,35 @@ impl VmSpace {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
     }
 
+    /// 检查一段用户地址是否被可读用户 VMA 连续覆盖。
+    ///
+    /// 这个接口不触发缺页，也不承诺页表页已经常驻；它只用于 syscall 在访问用户
+    /// 指针前做快速结构性校验，避免退出清理这类不可失败路径卡在明显损坏的链表上。
+    pub fn is_user_range_readable(&self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        let range = addr..end;
+        let set = self.vmas.lock();
+        let mut cursor = range.start;
+        for area in set.iter_overlap(&range) {
+            if area.range.start > cursor {
+                return false;
+            }
+            if !area.flags.contains_all(VmFlags::USER | VmFlags::READ) {
+                return false;
+            }
+            cursor = cursor.max(area.range.end.min(range.end));
+            if cursor >= range.end {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 按 `shmdt` 的入口地址查找一整段 SysV shm 映射。
     ///
     /// SysV shm 通过普通 file-backed VMA 接入 VM，因此这里不引入新的 backing

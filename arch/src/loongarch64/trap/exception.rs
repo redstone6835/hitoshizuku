@@ -38,6 +38,33 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+/// 在从用户态 trap 返回前投递异步信号。
+///
+/// syscall 返回路径已经在 `general::syscall::dispatch` 中带 trap-frame context
+/// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。这样忙循环的用户线程
+/// 即使不再进入 syscall，也能在下一次时钟中断返回前进入用户信号 handler。
+fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready() {
+        return;
+    }
+
+    let _ =
+        sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(tf_ptr));
+
+    match sched::current_task().state() {
+        sched::TaskState::Zombie | sched::TaskState::Dead => {
+            // 默认 Term/Core 信号会在投递阶段直接 exit_task；当前任务已不应再
+            // 回到用户态，必须立刻切走，不能依赖 NEED_RESCHED 是否已经置位。
+            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            panic!("[trap][signal] terminal task scheduled back unexpectedly");
+        }
+        sched::TaskState::Stopped | sched::TaskState::Continued => {
+            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+        }
+        _ => {}
+    }
+}
+
 /// 解码中断：从 IS 字段选出最高优先级中断类型。
 fn decode_interrupt(is: usize) -> Interrupt {
     // LoongArch 把待处理中断线压在 ESTAT.IS 位域里，但 Rust 侧更关心语义化后的
@@ -137,6 +164,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             // TTY 输入泵：即使前台任务没有调用 read()，也要及时处理
             // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
             super::super::vdso::run_tty_poll_hook(now_ns);
+            deliver_user_signals_before_return(arg4, from_user);
             sched::preempt_if_needed(now_ns);
             return arg4;
         }
@@ -147,6 +175,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         super::super::vdso::run_tty_poll_hook(now_ns);
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。
+        deliver_user_signals_before_return(arg4, from_user);
         sched::preempt_if_needed(now_ns);
         arg4
     } else if ecode == ECODE_SYS {
@@ -187,7 +216,10 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         use general::mm::{FaultOutcome, KernelFaultReason};
         let tf_ptr = general::TrapFramePtr::new(arg4);
         match general::mm::dispatch_page_fault(tf_ptr) {
-            FaultOutcome::Fixed => arg4,
+            FaultOutcome::Fixed => {
+                deliver_user_signals_before_return(arg4, from_user);
+                arg4
+            }
             FaultOutcome::Segv => {
                 // 投 SIGSEGV 给当前线程；下一次调度边界 deliver_pending_signals
                 // 拿到默认 Term 动作即触发 exit_task。本轮 hello 跑通不应触发；

@@ -2114,7 +2114,7 @@ fn futex_wake_addr(task: &Arc<Task>, uaddr: usize, count: usize) -> usize {
         woken += futex_wake_key(key, count, FUTEX_BITSET_MATCH_ANY);
     }
     if let Ok(key) = futex_key(task, uaddr, false) {
-        woken += futex_wake_key(key, count.saturating_sub(woken), FUTEX_BITSET_MATCH_ANY);
+        woken += futex_wake_key(key, count, FUTEX_BITSET_MATCH_ANY);
     }
     woken
 }
@@ -2269,7 +2269,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     }
 
     loop {
-        if sched::operation::sigpending()?.raw() != 0 {
+        if sched::operation::has_interrupting_signal(ctx.task()) {
             futex_waitv_remove_all(&entries, ctx.task());
             restore_current_task_after_sleep(ctx.task());
             if deadline.is_some() {
@@ -2717,19 +2717,18 @@ fn futex_wait(
                 waitv_index: None,
             });
     }
-
     loop {
         if let Some(deadline) = deadline_ns {
             if sched::now_ns_public() >= deadline {
                 futex_remove_waiter(key, &me);
-                let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+                restore_current_task_after_sleep(task);
                 sched::cancel_sleep_deadline(task);
                 return Err(Errno::ETIMEDOUT);
             }
         }
-        if sched::operation::sigpending()?.raw() != 0 {
+        if sched::operation::has_interrupting_signal(task) {
             futex_remove_waiter(key, &me);
-            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            restore_current_task_after_sleep(task);
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
@@ -2737,7 +2736,7 @@ fn futex_wait(
         }
         if read_user_u32(uaddr).map_or(true, |cur| cur != expected) {
             futex_remove_waiter(key, &me);
-            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            restore_current_task_after_sleep(task);
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
@@ -2761,6 +2760,7 @@ fn futex_wait(
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
+            restore_current_task_after_sleep(task);
             return Ok(0);
         }
     }
@@ -3034,15 +3034,30 @@ fn exit_robust_list(task: &Arc<Task>) {
     if robust.head == 0 || robust.len != ROBUST_LIST_HEAD_SIZE {
         return;
     }
+    if !robust_node_aligned(robust.head)
+        || !task_user_range_readable(task, robust.head, ROBUST_LIST_HEAD_SIZE)
+    {
+        task.set_robust_list(0, 0);
+        return;
+    }
     let tid = task.pid_root().unwrap_or(0) as u32;
-    let Ok(futex_offset) = read_user_isize(robust.head + 8) else {
+    let Ok(futex_offset) = read_robust_isize(task, robust.head + 8) else {
+        task.set_robust_list(0, 0);
         return;
     };
-    let pending = read_user_usize(robust.head + 16).unwrap_or(0);
-    let mut next = read_user_usize(robust.head).unwrap_or(0);
+    let pending = read_robust_usize(task, robust.head + 16).unwrap_or(0);
+    let mut next = read_robust_usize(task, robust.head).unwrap_or(0);
     let mut walked = 0usize;
     let mut visited = Vec::new();
     while next != 0 && next != robust.head && walked < ROBUST_LIST_LIMIT {
+        if !robust_node_aligned(next) {
+            log::debug!(
+                "[syscall][robust] pid={:?} ignored unaligned robust node {:#x}",
+                task.pid_root(),
+                next,
+            );
+            break;
+        }
         if visited.contains(&next) {
             log::warning!(
                 "[syscall][robust] pid={:?} robust list cycle at {:#x}",
@@ -3052,8 +3067,16 @@ fn exit_robust_list(task: &Arc<Task>) {
             break;
         }
         visited.push(next);
+        let Ok(next_link) = read_robust_usize(task, next) else {
+            log::debug!(
+                "[syscall][robust] pid={:?} stopped at unreadable robust node {:#x}",
+                task.pid_root(),
+                next,
+            );
+            break;
+        };
         handle_robust_node(task, next, futex_offset, tid);
-        next = read_user_usize(next).unwrap_or(0);
+        next = next_link;
         walked += 1;
     }
     if walked == ROBUST_LIST_LIMIT {
@@ -3062,7 +3085,11 @@ fn exit_robust_list(task: &Arc<Task>) {
             task.pid_root(),
         );
     }
-    if pending != 0 && !visited.contains(&pending) {
+    if pending != 0
+        && pending != robust.head
+        && robust_node_aligned(pending)
+        && !visited.contains(&pending)
+    {
         handle_robust_node(task, pending, futex_offset, tid);
     }
     task.set_robust_list(0, 0);
@@ -3075,7 +3102,7 @@ fn handle_robust_node(task: &Arc<Task>, node: usize, futex_offset: isize, tid: u
     if uaddr % 4 != 0 {
         return;
     }
-    let Ok(cur) = read_user_u32(uaddr) else {
+    let Ok(cur) = read_robust_u32(task, uaddr) else {
         return;
     };
     if (cur & FUTEX_TID_MASK) != tid {
@@ -3090,6 +3117,35 @@ fn handle_robust_node(task: &Arc<Task>, node: usize, futex_offset: isize, tid: u
 fn robust_futex_addr(node: usize, futex_offset: isize) -> Option<usize> {
     let addr = (node as isize).checked_add(futex_offset)?;
     if addr < 0 { None } else { Some(addr as usize) }
+}
+
+fn robust_node_aligned(node: usize) -> bool {
+    node % core::mem::align_of::<usize>() == 0
+}
+
+fn task_user_range_readable(task: &Arc<Task>, user: usize, len: usize) -> bool {
+    task_vm_space(task).is_some_and(|vm| vm.is_user_range_readable(user, len))
+}
+
+fn read_robust_usize(task: &Arc<Task>, user: usize) -> Result<usize, Errno> {
+    if !task_user_range_readable(task, user, core::mem::size_of::<usize>()) {
+        return Err(Errno::EFAULT);
+    }
+    read_user_usize(user)
+}
+
+fn read_robust_isize(task: &Arc<Task>, user: usize) -> Result<isize, Errno> {
+    if !task_user_range_readable(task, user, core::mem::size_of::<isize>()) {
+        return Err(Errno::EFAULT);
+    }
+    read_user_isize(user)
+}
+
+fn read_robust_u32(task: &Arc<Task>, user: usize) -> Result<u32, Errno> {
+    if !task_user_range_readable(task, user, core::mem::size_of::<u32>()) {
+        return Err(Errno::EFAULT);
+    }
+    read_user_u32(user)
 }
 
 fn read_user_usize(user: usize) -> Result<usize, Errno> {
