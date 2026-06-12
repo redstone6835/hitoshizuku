@@ -71,7 +71,7 @@ pub mod wait_flags;
 
 pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry, TaskCpuStateOps};
 pub use clone_flags::{CloneArgs, CloneFlags};
-pub use cpu::{CpuId, CpuMask, SchedDomain, SchedTopology};
+pub use cpu::{CpuId, CpuMask, SchedDomain, SchedPlacement, SchedTopology};
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
@@ -96,7 +96,9 @@ pub use scheduler::{
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
-pub use scheduler::{current_sched_domain_id, install_sched_topology, sched_topology};
+pub use scheduler::{
+    current_sched_domain_id, install_sched_topology, sched_topology, task_sched_placement,
+};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
     SigSet, SignalNumber, SignalState,

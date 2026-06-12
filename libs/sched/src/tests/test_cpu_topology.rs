@@ -108,6 +108,47 @@ fn sched_topology_falls_back_to_root_when_local_domain_unusable() {
 }
 
 #[ktest]
+fn sched_topology_describes_task_placement_snapshot() {
+    let root = SchedDomain::root();
+    let local = SchedDomain::new(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+    )
+    .expect("local domain");
+    let remote = SchedDomain::new(
+        2,
+        CpuMask::single_raw(2).union(CpuMask::single_raw(3)),
+        1,
+        Some(0),
+    )
+    .expect("remote domain");
+    let topology = SchedTopology::from_domains(&[root, local, remote]).expect("topology");
+    let affinity = CpuMask::single_raw(1).union(CpuMask::single_raw(2));
+    let online = CpuMask::single_raw(0)
+        .union(CpuMask::single_raw(1))
+        .union(CpuMask::single_raw(2));
+
+    let placement = topology.describe_placement(affinity, online, CpuId::new(0), false, |cpu| {
+        match cpu.get() {
+            1 => 1,
+            2 => 0,
+            _ => 9,
+        }
+    });
+
+    assert_eq!(placement.current_cpu, CpuId::new(0));
+    assert_eq!(placement.current_domain, Some(1));
+    assert_eq!(placement.affinity.bits(), affinity.bits());
+    assert_eq!(
+        placement.effective.bits(),
+        affinity.intersection(online).bits()
+    );
+    assert_eq!(placement.preferred_cpu, CpuId::new(1));
+}
+
+#[ktest]
 fn balance_source_allows_single_remote_task_when_local_is_idle() {
     let topology = SchedTopology::bootstrap();
     let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));

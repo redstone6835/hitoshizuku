@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch_hooks;
-use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedTopology};
+use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
@@ -409,6 +409,21 @@ pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
         .map(|domain| domain.id())
 }
 
+/// 查询某个任务在当前拓扑下的调度放置状态。
+///
+/// 返回值只是快照：函数不会迁移任务，也不承诺下一次入队一定选中同一 CPU。
+/// 调用方可用它向用户态或诊断路径解释“为什么这个任务能在哪些 CPU 上运行”。
+pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    let online = online_cpu_set();
+    let current = CpuId::new(task.current_cpu());
+    let prefer_current = task.state() != TaskState::New;
+
+    sched_topology().describe_placement(affinity, online, current, prefer_current, |cpu| {
+        RUNQUEUES[cpu.get()].nr_running()
+    })
+}
+
 pub fn is_cpu_online(cpu_id: usize) -> bool {
     CpuId::new(cpu_id).is_some_and(|cpu| online_cpu_set().contains(cpu))
 }
@@ -506,6 +521,18 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     }
     let cpu_id = cpu();
     let rounds = POST_SYSCALL_HANDOFF[cpu_id].swap(0, Ordering::AcqRel);
+    if rounds == 0 {
+        return;
+    }
+
+    // request_post_syscall_handoff() 会把普通 resched 位作为 trap 返回调度的兜底。
+    // 这里消费了专用交接请求后，如果继续保留 resched 位，新任务第一次 syscall
+    // 返回时会立刻再次进入调度器，而父任务还停在 clone 的 syscall 收尾路径上。
+    // 因此先清掉兜底位；下面有界交接循环会完成预期的调度工作。
+    let _ = NEED_RESCHED[cpu_id].swap(false, Ordering::AcqRel);
+    if NEED_BALANCE[cpu_id].swap(false, Ordering::AcqRel) {
+        let _ = balance_once(cpu_id);
+    }
     for _ in 0..rounds {
         if RUNQUEUES[cpu_id].nr_running() <= 1 {
             break;
@@ -516,15 +543,8 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
 
 /// 按调度域、亲和性和当前负载选择目标 CPU。
 pub fn select_task_cpu(task: &Arc<Task>) -> usize {
-    let allowed = CpuMask::from_bits_or_boot(task.cpu_affinity());
-    let online = online_cpu_set();
-    let current = CpuId::new(task.current_cpu());
-    let prefer_current = task.state() != TaskState::New;
-
-    sched_topology()
-        .select_cpu(allowed, online, current, prefer_current, |cpu| {
-            RUNQUEUES[cpu.get()].nr_running()
-        })
+    task_sched_placement(task)
+        .preferred_cpu
         .unwrap_or_else(CpuId::boot)
         .get()
 }

@@ -1313,20 +1313,29 @@ fn write_cpuset_mask(out: &mut [u8], mask: u64) {
     out[..n].copy_from_slice(&raw[..n]);
 }
 
-const MYGO_SCHED_INFO_VERSION: u32 = 1;
-const MYGO_SCHED_INFO_HEADER_SIZE: usize = 48;
+const MYGO_SCHED_INFO_VERSION: u32 = 2;
+const MYGO_SCHED_INFO_HEADER_SIZE: usize = 80;
 const MYGO_SCHED_DOMAIN_ENTRY_SIZE: usize = 32;
 const MYGO_SCHED_DOMAIN_PARENT_NONE: u32 = u32::MAX;
+const MYGO_SCHED_INFO_F_TARGET_PID: usize = 1 << 0;
+const MYGO_SCHED_INFO_INVALID_U32: u32 = u32::MAX;
 
 pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let user = ctx.args[0];
     let size = ctx.args[1];
     let flags = ctx.args[2];
-    if flags != 0 {
+    if flags & !MYGO_SCHED_INFO_F_TARGET_PID != 0 {
         return Err(Errno::EINVAL);
     }
+    let target = if flags & MYGO_SCHED_INFO_F_TARGET_PID != 0 {
+        sched_task_from_pid(ctx.args[3] as i32, ctx.task())?
+    } else {
+        Arc::clone(ctx.task())
+    };
+    check_sched_target_permission(ctx.task(), &target)?;
 
     let topology = sched::sched_topology();
+    let placement = sched::task_sched_placement(&target);
     let domain_count = topology.len();
     let required = MYGO_SCHED_INFO_HEADER_SIZE
         .checked_add(
@@ -1345,7 +1354,8 @@ pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let mut out = Vec::new();
     out.resize(required, 0);
 
-    // 头部：版本、结构尺寸、域数量、CPU 位图与当前调度位置。
+    // 头部只定义 MyGo 私有调度查询格式；具体偏移不进入 sched 核心，避免
+    // 底层调度模型被用户态 ABI 绑死。
     write_u32(&mut out, 0, MYGO_SCHED_INFO_VERSION);
     write_u32(&mut out, 4, MYGO_SCHED_INFO_HEADER_SIZE as u32);
     write_u32(&mut out, 8, MYGO_SCHED_DOMAIN_ENTRY_SIZE as u32);
@@ -1359,6 +1369,33 @@ pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize,
         36,
         sched::current_sched_domain_id(current_cpu).unwrap_or(0) as u32,
     );
+    write_u64(&mut out, 40, placement.affinity.bits());
+    write_u64(&mut out, 48, placement.effective.bits());
+    write_u32(
+        &mut out,
+        56,
+        placement
+            .current_cpu
+            .map(|cpu| cpu.get() as u32)
+            .unwrap_or(MYGO_SCHED_INFO_INVALID_U32),
+    );
+    write_u32(
+        &mut out,
+        60,
+        placement
+            .current_domain
+            .map(|id| id as u32)
+            .unwrap_or(MYGO_SCHED_INFO_INVALID_U32),
+    );
+    write_u32(
+        &mut out,
+        64,
+        placement
+            .preferred_cpu
+            .map(|cpu| cpu.get() as u32)
+            .unwrap_or(MYGO_SCHED_INFO_INVALID_U32),
+    );
+    write_u32(&mut out, 68, target.pid_root().unwrap_or(0) as u32);
 
     for idx in 0..domain_count {
         let Some(domain) = topology.domain(idx) else {

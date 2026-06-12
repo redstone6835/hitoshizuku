@@ -242,6 +242,20 @@ impl SchedDomain {
     }
 }
 
+/// 某个任务在当前拓扑下的调度放置快照。
+///
+/// 这个结构只描述调度核心的通用事实，不包含任何用户态 ABI 编码。`affinity`
+/// 是任务声明的 CPU 许可集，`effective` 是再与在线 CPU 集相交后的实际可运行集；
+/// `preferred_cpu` 是按当前负载、调度域和是否优先保持原 CPU 计算出的候选 CPU。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedPlacement {
+    pub current_cpu: Option<CpuId>,
+    pub current_domain: Option<usize>,
+    pub preferred_cpu: Option<CpuId>,
+    pub affinity: CpuMask,
+    pub effective: CpuMask,
+}
+
 /// 固定容量调度拓扑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedTopology {
@@ -374,6 +388,37 @@ impl SchedTopology {
         }
 
         choose_least_loaded(eligible, &mut load_of)
+    }
+
+    /// 计算任务在当前拓扑下的放置快照。
+    ///
+    /// 该函数不修改 runqueue，也不持有任何外部锁；调用方把实时负载通过
+    /// `load_of` 闭包注入。这样 syscall 查询、调试输出和实际入队选择可以共享
+    /// 同一套拓扑规则，避免各处重复硬编码 CPU 选择策略。
+    pub fn describe_placement<F>(
+        self,
+        affinity: CpuMask,
+        online: CpuMask,
+        current: Option<CpuId>,
+        prefer_current: bool,
+        load_of: F,
+    ) -> SchedPlacement
+    where
+        F: FnMut(CpuId) -> usize,
+    {
+        let affinity = affinity.or_boot();
+        let effective = affinity.intersection(online);
+        let current_domain = current
+            .and_then(|cpu| self.domain_for_cpu(cpu))
+            .map(|domain| domain.id());
+        let preferred_cpu = self.select_cpu(affinity, online, current, prefer_current, load_of);
+        SchedPlacement {
+            current_cpu: current,
+            current_domain,
+            preferred_cpu,
+            affinity,
+            effective,
+        }
     }
 
     /// 返回可从中拉取任务的同域 CPU 集，不包含本 CPU。
