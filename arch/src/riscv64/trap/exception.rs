@@ -99,7 +99,8 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
             sched::preempt_if_needed(now_ns);
             return tf_ptr;
         }
-        // 非 timer 中断：只做抢占检查，不推进 vDSO 时钟（时钟源只由 timer tick 驱动）
+        // 非 timer 中断：SupervisorExternal (PLIC), IPI 等
+        let _ = general::dev::irq::dispatch_interrupt(intr);
         sched::preempt_if_needed(kernel_timestamp_ns());
         tf_ptr
     } else if code == EXC_ECALL_U || code == EXC_ECALL_S {
