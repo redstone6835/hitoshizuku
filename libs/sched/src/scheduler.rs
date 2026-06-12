@@ -1003,8 +1003,13 @@ pub fn schedule_once(now_ns: u64) {
     prev.record_involuntary_context_switch();
     let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
 
-    // 4. 更新 CURRENT_TASKS。
+    // 4. 发布下一任务为本 CPU current。
+    //
+    // 后续 vm_switch 会激活 next 的页表，task_cpu_state 可能通过 copy_to_user
+    // 刷新 rseq。内核态 uaccess 的缺页处理依赖 current_task()->VmSpace，所以
+    // 必须先发布 current，再触碰 next 的用户地址空间。
     next.set_current_cpu(cpu_id);
+    *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));
 
     // 5. 取 ctx。
     let prev_ctx = prev
@@ -1043,12 +1048,11 @@ pub fn schedule_once(now_ns: u64) {
     // Safety: 两侧 ctx 都已初始化；调用前所有锁已释放；调用期间不触发重入。
     unsafe {
         if final_prev {
-            *CURRENT_TASKS[cpu_id].lock() = Some(next);
+            drop(next);
             retire_final_task(cpu_id, prev);
             (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
             core::hint::unreachable_unchecked();
         } else {
-            *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));
             (crate::arch_hooks::ops_or_panic().switch_context)(prev_ctx, next_ctx);
         }
     }
