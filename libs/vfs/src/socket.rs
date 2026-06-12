@@ -32,7 +32,7 @@ use crate::vfs::superblock::{InodeCache, Superblock, SuperblockOps};
 use crate::vfs::sync::Spinlock;
 // 仅在 setsockopt dispatch 路径上需要按 handle.sock_type 严格分派；引入
 // SocketType 枚举以避免继续依赖裸的 SOCK_* 常量做比较（容易遗漏 RAW/ICMP）。
-use net::SocketType as NetSocketType;
+use net::{InterfaceId, SocketType as NetSocketType};
 
 pub const AF_UNIX: u16 = 1;
 
@@ -1104,6 +1104,7 @@ const IPV6_RECVPKTINFO: i32 = 49;
 const IPV6_RECVHOPLIMIT: i32 = 51;
 const IPV6_TCLASS: i32 = 67;
 const IPV6_ADD_MEMBERSHIP: i32 = 20;
+const IPV6_DROP_MEMBERSHIP: i32 = 21;
 const IPV6_RECVERR: i32 = 25;
 const IPV6_MULTICAST_HOPS: i32 = 18;
 const IPV6_MULTICAST_IF: i32 = 17;
@@ -1139,6 +1140,76 @@ fn parse_timeval_ns(value: &[u8]) -> u64 {
     .max(0) as u64;
     secs.saturating_mul(1_000_000_000)
         .saturating_add(usecs.saturating_mul(1_000))
+}
+
+fn parse_ipv4_multicast_membership(
+    value: &[u8],
+    fallback_iface: InterfaceId,
+) -> Result<(InterfaceId, net::IpAddr), Errno> {
+    if value.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let group = net::Ipv4Addr([value[0], value[1], value[2], value[3]]);
+    let iface_addr = net::Ipv4Addr([value[4], value[5], value[6], value[7]]);
+    let ifindex = if value.len() >= 12 {
+        let raw = i32::from_ne_bytes([value[8], value[9], value[10], value[11]]);
+        interface_id_from_user_ifindex(raw)?
+    } else {
+        None
+    };
+    let iface = if let Some(iface) = ifindex {
+        iface
+    } else if iface_addr != net::Ipv4Addr::UNSPECIFIED {
+        net::stack()
+            .resolve_iface_for_addr(&net::IpAddr::V4(iface_addr))
+            .ok_or(Errno::ENODEV)?
+    } else {
+        fallback_iface
+    };
+    Ok((iface, net::IpAddr::V4(group)))
+}
+
+fn parse_ipv6_multicast_membership(
+    value: &[u8],
+    fallback_iface: InterfaceId,
+) -> Result<(InterfaceId, net::IpAddr), Errno> {
+    if value.len() < 20 {
+        return Err(Errno::EINVAL);
+    }
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&value[..16]);
+    let ifindex = u32::from_ne_bytes([value[16], value[17], value[18], value[19]]);
+    let iface = if ifindex == 0 {
+        fallback_iface
+    } else {
+        InterfaceId(ifindex.checked_sub(1).ok_or(Errno::EINVAL)?)
+    };
+    Ok((iface, net::IpAddr::V6(net::Ipv6Addr(octets))))
+}
+
+fn interface_id_from_user_ifindex(ifindex: i32) -> Result<Option<InterfaceId>, Errno> {
+    if ifindex < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((ifindex > 0).then(|| InterfaceId(ifindex as u32 - 1)))
+}
+
+fn map_inet_net_error(err: net::NetError) -> Errno {
+    match err {
+        net::NetError::InterfaceNotFound => Errno::ENODEV,
+        net::NetError::InvalidArgument => Errno::EINVAL,
+        net::NetError::ResourceExhausted => Errno::ENOMEM,
+        net::NetError::WouldBlock => Errno::EAGAIN,
+        net::NetError::AddressInUse => Errno::EADDRINUSE,
+        net::NetError::TimedOut => Errno::ETIMEDOUT,
+        net::NetError::ConnectionRefused => Errno::ECONNREFUSED,
+        net::NetError::ConnectionReset => Errno::ECONNRESET,
+        net::NetError::Closed => Errno::EPIPE,
+        net::NetError::InterfaceExists => Errno::EEXIST,
+        net::NetError::LinkDown | net::NetError::Unreachable | net::NetError::BufferTooSmall => {
+            Errno::EINVAL
+        }
+    }
 }
 
 fn timeval_from_ns(ns: u64) -> [u8; 16] {
@@ -1451,7 +1522,17 @@ fn inet_setsockopt(
                 opts.mcast_loop = parse_int_opt(value)? != 0;
                 Ok(())
             }
-            IP_MULTICAST_IF | IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => Ok(()),
+            IP_MULTICAST_IF => Ok(()),
+            IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
+                let handle = handle.ok_or(Errno::ENODEV)?;
+                let (iface, group) = parse_ipv4_multicast_membership(value, handle.interface_id())?;
+                let result = if optname == IP_ADD_MEMBERSHIP {
+                    net::stack().join_multicast_group(iface, group)
+                } else {
+                    net::stack().leave_multicast_group(iface, group)
+                };
+                result.map_err(map_inet_net_error)
+            }
             IP_PKTINFO => {
                 opts.pktinfo = parse_int_opt(value)? != 0;
                 Ok(())
@@ -1521,9 +1602,17 @@ fn inet_setsockopt(
                 opts.tclass = parse_int_opt(value)?;
                 Ok(())
             }
-            IPV6_ADD_MEMBERSHIP | IPV6_MULTICAST_HOPS | IPV6_MULTICAST_IF | IPV6_MULTICAST_LOOP => {
-                Ok(())
+            IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => {
+                let handle = handle.ok_or(Errno::ENODEV)?;
+                let (iface, group) = parse_ipv6_multicast_membership(value, handle.interface_id())?;
+                let result = if optname == IPV6_ADD_MEMBERSHIP {
+                    net::stack().join_multicast_group(iface, group)
+                } else {
+                    net::stack().leave_multicast_group(iface, group)
+                };
+                result.map_err(map_inet_net_error)
             }
+            IPV6_MULTICAST_HOPS | IPV6_MULTICAST_IF | IPV6_MULTICAST_LOOP => Ok(()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
