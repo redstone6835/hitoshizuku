@@ -1099,6 +1099,24 @@ impl NetStack {
         Ok(())
     }
 
+    /// 设置指定接口的 IPv6 地址。
+    pub fn set_iface_ipv6_addr(
+        &self,
+        id: InterfaceId,
+        addr: crate::Ipv6Addr,
+        prefix: u8,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.set_ipv6_addr(addr, prefix);
+        let addresses = managed.config().addresses.clone();
+        drop(managed);
+        drop(table);
+        self.routes.write().replace_connected(id, &addresses);
+        Ok(())
+    }
+
     /// 一次性替换指定接口的完整网络配置。
     ///
     /// 该入口用于 DHCP/SLAAC 或管理面拿到完整配置后的提交阶段。它同时更新
@@ -3422,6 +3440,51 @@ mod tests {
                 iface,
                 &IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0042, 0, 0, 0, 0, 99])),
             ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn set_iface_ipv6_addr_preserves_ipv4_and_replaces_v6_route() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-set-v6",
+            IfConfig::static_v4(Ipv4Addr::new(10, 45, 0, 2), 24, None),
+        );
+        let first_v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0045, 0, 0, 0, 0, 2]);
+        let second_v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0046, 0, 0, 0, 0, 2]);
+        let v4_remote = IpAddr::V4(Ipv4Addr::new(10, 45, 0, 99));
+        let first_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0045, 0, 0, 0, 0, 99]));
+        let second_remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0046, 0, 0, 0, 0, 99]));
+
+        stack.set_iface_ipv6_addr(iface, first_v6, 64).unwrap();
+        let configured = stack
+            .snapshot_interfaces()
+            .into_iter()
+            .find(|snapshot| snapshot.id == iface)
+            .unwrap();
+        assert_eq!(
+            configured.addresses,
+            alloc::vec![
+                CidrAddress::new_v4(Ipv4Addr::new(10, 45, 0, 2), 24),
+                CidrAddress::new_v6(first_v6, 64),
+            ]
+        );
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &first_remote),
+            Ok(())
+        );
+
+        stack.set_iface_ipv6_addr(iface, second_v6, 64).unwrap();
+        assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &first_remote),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &second_remote),
             Ok(())
         );
     }

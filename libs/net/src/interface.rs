@@ -377,6 +377,26 @@ impl ManagedInterface {
         self.sync_auto_config_socket(self.config.mode);
     }
 
+    /// 替换接口上的所有 IPv6 地址为指定 CIDR 块。
+    pub fn set_ipv6_addr(&mut self, addr: Ipv6Addr, prefix_len: u8) {
+        let prefix_len = prefix_len.min(128);
+        self.iface.update_ip_addrs(|addrs| {
+            addrs.retain(|c| !matches!(c, smoltcp::wire::IpCidr::Ipv6(_)));
+            let _ = addrs.push(smoltcp::wire::IpCidr::Ipv6(smoltcp::wire::Ipv6Cidr::new(
+                ipv6_to_smoltcp(addr),
+                prefix_len,
+            )));
+        });
+        self.config
+            .addresses
+            .retain(|cidr| !matches!(cidr.addr, IpAddr::V6(_)));
+        self.config
+            .addresses
+            .push(CidrAddress::new_v6(addr, prefix_len));
+        self.config.mode = IfMode::Static;
+        self.sync_auto_config_socket(self.config.mode);
+    }
+
     /// 添加 IPv4 路由到当前协议引擎。
     ///
     /// 内核网络层的完整选路由 [`crate::route`] 维护；这里仅把当前底层协议引擎
@@ -1538,6 +1558,28 @@ mod tests {
         iface.set_ipv4_addr(Ipv4Addr::new(192, 0, 2, 10), 24);
         assert_eq!(iface.dhcpv4_socket, None);
         assert_eq!(dhcpv4_socket_count(&iface), 0);
+    }
+
+    #[test]
+    fn set_ipv6_addr_disables_auto_config_socket() {
+        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::ethernet());
+        let dev = Arc::new(NetDevice::new("test-eth-v6-static", driver));
+        let tuning = NetTuning::defaults();
+        let mut iface = ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen);
+
+        assert!(iface.dhcpv4_socket.is_some());
+        assert_eq!(dhcpv4_socket_count(&iface), 1);
+
+        iface.set_ipv6_addr(Ipv6Addr::new([0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 2]), 64);
+        assert_eq!(iface.dhcpv4_socket, None);
+        assert_eq!(dhcpv4_socket_count(&iface), 0);
+        assert_eq!(
+            iface.config().addresses,
+            alloc::vec![CidrAddress::new_v6(
+                Ipv6Addr::new([0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 2]),
+                64,
+            )]
+        );
     }
 
     #[test]
