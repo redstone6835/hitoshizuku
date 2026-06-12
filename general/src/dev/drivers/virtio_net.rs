@@ -431,7 +431,8 @@ impl net::NetDriver for VirtioNetPci {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        self.reclaim_tx(&mut inner);
         if inner.tx_free_descs.is_empty() {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -442,8 +443,10 @@ impl net::NetDriver for VirtioNetPci {
 
     fn commit_tx(&self, buf: net::TxBuf) {
         let mut inner = self.inner.lock();
+        self.reclaim_tx(&mut inner);
         let transport = inner.transport;
         let Some(desc_idx) = inner.tx_free_descs.pop_front() else {
+            self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
 
