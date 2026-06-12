@@ -249,7 +249,7 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
         return Err(VfsError::AlreadyExists);
     }
 
-    let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
+    let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
     let parent_mount = parent_result.mount;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;
@@ -273,7 +273,7 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 
 /// `unlinkat(AT_REMOVEDIR)` — 删除空目录。
 pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
-    let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
+    let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
     let parent_mount = parent_result.mount;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;

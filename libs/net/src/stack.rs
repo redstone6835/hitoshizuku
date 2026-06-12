@@ -1631,14 +1631,17 @@ impl NetStack {
             if !managed.handle_is_live(handle) {
                 return Err(NetError::WouldBlock);
             }
+            let socket = managed.tcp_socket(handle.inner);
+            let state = socket.state();
             let target = if let Some(local) = local_hint {
                 endpoint_to_smoltcp_listen(&local)
             } else {
-                managed.tcp_socket(handle.inner).listen_endpoint()
+                socket.listen_endpoint()
             };
-            managed
+            let pending = managed
                 .pending_tcp_accept(handle.inner, target)
-                .and_then(|inner| managed.make_handle(handle.iface_id, inner, SocketType::Tcp))
+                .and_then(|inner| managed.make_handle(handle.iface_id, inner, SocketType::Tcp));
+            (pending, state)
         };
         let (pending, state) = accept_state;
         if let Some(pending) = pending {

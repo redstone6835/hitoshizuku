@@ -369,9 +369,41 @@ pub fn lookup_parent<'p>(
     dirfd: &Dirfd,
     path: &'p str,
 ) -> VfsResult<(LookupResult, &'p str)> {
-    if path.is_empty() || path.contains('\0') || path.ends_with('/') {
+    lookup_parent_inner(ctx, dirfd, path, false)
+}
+
+/// 与 [`lookup_parent`] 相同，但允许路径带尾随斜杠。
+///
+/// 仅目录类操作应使用此入口。POSIX 路径语义中尾随斜杠表示最终对象必须是目录；
+/// 对 `mkdir("foo/")` 和 `rmdir("foo/")`，最终对象本身就是目录，所以需要把尾随
+/// 斜杠规约掉后再提取父目录和叶子名。普通文件创建、硬链接和符号链接仍应使用
+/// [`lookup_parent`]，避免错误接受 `file/` 形式的目标。
+pub fn lookup_parent_dir_leaf<'p>(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &'p str,
+) -> VfsResult<(LookupResult, &'p str)> {
+    lookup_parent_inner(ctx, dirfd, path, true)
+}
+
+fn lookup_parent_inner<'p>(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &'p str,
+    allow_trailing_slash: bool,
+) -> VfsResult<(LookupResult, &'p str)> {
+    if path.is_empty() || path.contains('\0') {
         return Err(VfsError::InvalidArgument);
     }
+    if !allow_trailing_slash && path.ends_with('/') {
+        return Err(VfsError::InvalidArgument);
+    }
+
+    let path = if allow_trailing_slash {
+        trim_trailing_slashes_preserving_root(path)
+    } else {
+        path
+    };
 
     let components: alloc::vec::Vec<&str> = PathComponents::new(path).collect();
     if components.is_empty() {
@@ -393,7 +425,7 @@ pub fn lookup_parent<'p>(
     } else {
         // 构造父目录路径（去掉最后一个分量）
         let parent_path = {
-            // path.ends_with('/') 已在入口拒绝，这里保留 trim 是为了兼容重复斜杠场景。
+            // 这里保留 trim 是为了兼容重复斜杠场景。
             let trimmed = path.trim_end_matches('/');
             // 找最后一个 '/' 的位置
             match trimmed.rfind('/') {
@@ -408,6 +440,15 @@ pub fn lookup_parent<'p>(
     ensure_directory(&result.dentry)?;
     check_name_max(&result.dentry, last_name)?;
     Ok((result, last_name))
+}
+
+fn trim_trailing_slashes_preserving_root(path: &str) -> &str {
+    let mut end = path.len();
+    let bytes = path.as_bytes();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    &path[..end]
 }
 
 /// 解析单个路径分量 `name`（`.`、`..` 或普通名称），在 `parent` 目录下查找。

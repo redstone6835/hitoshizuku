@@ -165,7 +165,11 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
             super::super::vdso::run_tty_poll_hook(now_ns);
             deliver_user_signals_before_return(arg4, from_user);
-            sched::preempt_if_needed(now_ns);
+            // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
+            // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
+            if from_user {
+                sched::preempt_if_needed(now_ns);
+            }
             return arg4;
         }
         let now_ns = super::super::specific::kernel_timestamp_ns();
@@ -176,7 +180,10 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。
         deliver_user_signals_before_return(arg4, from_user);
-        sched::preempt_if_needed(now_ns);
+        // 与 timer 分支一致，只在返回用户态前处理抢占请求。
+        if from_user {
+            sched::preempt_if_needed(now_ns);
+        }
         arg4
     } else if ecode == ECODE_SYS {
         // syscall 通过注入的 SyscallFrameOps 读 a7/a0-a5、写返回值、推 PC。
