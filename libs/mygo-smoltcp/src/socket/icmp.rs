@@ -393,6 +393,21 @@ impl<'a> Socket<'a> {
         Ok((packet_buf, endpoint))
     }
 
+    /// 查看下一条已接收 ICMP 报文，不从接收队列移除。
+    ///
+    /// 该接口服务内核 poll/ioctl 这类只需要观察下一条报文长度或来源的路径；
+    /// 真正消费仍应走 [`recv`](#method.recv) / [`recv_slice`](#method.recv_slice)。
+    pub fn peek(&mut self) -> Result<(&[u8], IpAddress), RecvError> {
+        let (endpoint, packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
+
+        net_trace!(
+            "icmp:{}: peek {} buffered octets",
+            endpoint,
+            packet_buf.len()
+        );
+        Ok((packet_buf, *endpoint))
+    }
+
     /// Dequeue a packet received from a remote endpoint, copy the payload into the given slice,
     /// and return the amount of octets copied as well as the `IpAddress`
     ///

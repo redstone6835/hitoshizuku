@@ -112,7 +112,10 @@ pub enum Gateway {
 pub enum IfMode {
     /// 静态 IP。
     Static,
-    /// DHCP/SLAAC 自动获取（未来扩展）。
+    /// DHCP/SLAAC 自动获取。
+    ///
+    /// 当前 Ethernet 接口会由内部 DHCPv4 socket 填充 IPv4 配置；IPv6
+    /// SLAAC 状态机后续接入时复用同一模式。
     Auto,
 }
 
@@ -148,8 +151,8 @@ impl IfConfig {
 
     /// 自动配置（DHCP + SLAAC）。
     pub fn auto() -> Self {
-        // FIXME: 这里只声明 Auto 模式并返回空地址/空网关，当前没有 DHCP
-        // 或 SLAAC 状态机负责后续填充配置。
+        // Auto 初始态没有租约；接口 poll 中的自动配置状态机会在获得租约后
+        // 原子提交地址和默认网关。
         Self {
             addresses: Vec::new(),
             gateway: None,
