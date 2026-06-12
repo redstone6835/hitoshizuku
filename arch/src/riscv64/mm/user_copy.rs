@@ -2,12 +2,15 @@
 //!
 //! 利用 RISC-V 的 `SSTATUS.SUM`（Supervisor User Memory access）位：
 //! 置 SUM=1 后 S-mode 可直接访问 U 标记的页面，配合 `__ex_table` 实现
-//! 高性能批量拷贝。fault 时由 fault_decode 改写 sepc 到 fixup label。
+//! 逐字节安全拷贝。每条 load/store 指令单独挂一条 `__ex_table`，
+//! fault 时 fixup 到本字节的错误返回路径。
 //!
-//! ## 性能
+//! ## 设计
 //!
-//! 拷贝采用对齐优化策略：头部逐字节对齐到 8 字节边界 → 中间 8 字节 ld/sd
-//! 批量搬运 → 尾部逐字节收尾。相比逐字节方案，批量段吞吐提升约 4-8x。
+//! 采用逐字节拷贝 + 单条指令 `__ex_table` 保护的模式。每个 asm 块只包含
+//! 一条 `lbu`/`sb` 指令和一个 fixup label，`faulted` 标志在 Rust 侧初始化，
+//! 避免在 asm 块内使用 `li {ok}, 0` 这类指令。
+//! 字节间的回写走 `write_volatile`（内核 buf 永远安全）。
 
 use mm::UserAccessError;
 use general::mm::UserAccessOps;
@@ -20,7 +23,6 @@ const SSTATUS_SUM: usize = 1 << 18;
 
 // ── SUM 操作 ──────────────────────────────────────────────────────────────────
 
-/// 置 SSTATUS.SUM=1，允许 S-mode 直接访问 U=1 的用户页面。
 #[inline(always)]
 pub unsafe fn set_sum() {
     unsafe {
@@ -34,7 +36,6 @@ pub unsafe fn set_sum() {
     }
 }
 
-/// 清 SSTATUS.SUM=0，恢复 S-mode 对 U 页面的访问保护。
 #[inline(always)]
 pub(super) unsafe fn clear_sum() {
     unsafe {
@@ -48,186 +49,119 @@ pub(super) unsafe fn clear_sum() {
     }
 }
 
-// ── 批量拷贝（SUM 保护下） ────────────────────────────────────────────────────
-//
-// 使用 inline asm 实现 memcpy-like 循环，整个循环体挂一条 ex_table。
-// fault 时跳到 fixup label 返回错误。
+// ── 用户拷贝 ──────────────────────────────────────────────────────────────────
 
-/// SUM 保护下从用户空间批量拷贝到内核。
-/// 头部逐字节对齐到 8 字节 → 中间 8 字节批量 ld/sd → 尾部逐字节。
-/// 每段各挂 ex_table，fault 时返回 Err。
+/// 从用户空间逐字节拷贝到内核缓冲区。
 #[inline(never)]
-unsafe fn sum_copy_from_user(dst: *mut u8, src: usize, len: usize) -> Result<(), UserAccessError> {
-    let faulted: usize;
-    unsafe {
-        core::arch::asm!(
-            "li {ok}, 0",
-            "beqz {len}, 99f",
-
-            // ── 头部：逐字节对齐 src 到 8 字节边界 ──
-            "10: andi {tmp}, {src}, 7",
-            "beqz {tmp}, 20f",
-            "11: lbu {tmp}, 0({src})",
-            "sb {tmp}, 0({dst})",
-            "addi {src}, {src}, 1",
-            "addi {dst}, {dst}, 1",
-            "addi {len}, {len}, -1",
-            "beqz {len}, 99f",
-            "andi {tmp}, {src}, 7",
-            "bnez {tmp}, 11b",
-
-            // ── 中间：8 字节批量拷贝 ──
-            "20: li {tmp}, 8",
-            "bltu {len}, {tmp}, 30f",
-            "21: ld {tmp}, 0({src})",
-            "sd {tmp}, 0({dst})",
-            "addi {src}, {src}, 8",
-            "addi {dst}, {dst}, 8",
-            "addi {len}, {len}, -8",
-            "li {tmp}, 8",
-            "bgeu {len}, {tmp}, 21b",
-
-            // ── 尾部：逐字节收尾 ──
-            "30: beqz {len}, 99f",
-            "31: lbu {tmp}, 0({src})",
-            "sb {tmp}, 0({dst})",
-            "addi {src}, {src}, 1",
-            "addi {dst}, {dst}, 1",
-            "addi {len}, {len}, -1",
-            "bnez {len}, 31b",
-            "j 99f",
-
-            // ── fault fixup ──
-            "90: li {ok}, 1",
-            "99:",
-
-            ".pushsection __ex_table,\"a\"",
-            ".balign 8",
-            ".8byte 11b, 90b",
-            ".8byte 21b, 90b",
-            ".8byte 31b, 90b",
-            ".popsection",
-
-            src = inout(reg) src => _,
-            dst = inout(reg) dst => _,
-            len = inout(reg) len => _,
-            tmp = lateout(reg) _,
-            ok = lateout(reg) faulted,
-            options(nostack)
-        );
+unsafe fn sum_copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<(), UserAccessError> {
+    let mut i = 0usize;
+    unsafe { set_sum() };
+    while i < len {
+        let ptr = (src_user + i) as *const u8;
+        let b: u8;
+        let mut faulted: usize = 0;
+        unsafe {
+            core::arch::asm!(
+                "2: lbu {val}, 0({ptr})",
+                "j 3f",
+                "4: li {ok}, 1",
+                "3:",
+                ".pushsection __ex_table,\"a\"",
+                ".balign 8",
+                ".8byte 2b, 4b",
+                ".popsection",
+                ptr = in(reg) ptr,
+                val = out(reg) b,
+                ok = inlateout(reg) faulted,
+                options(nostack, readonly)
+            );
+        }
+        if faulted != 0 {
+            unsafe { clear_sum() };
+            return Err(UserAccessError::Fault);
+        }
+        unsafe { core::ptr::write_volatile(dst.add(i), b) };
+        i += 1;
     }
-    if faulted == 0 { Ok(()) } else { Err(UserAccessError::Fault) }
+    unsafe { clear_sum() };
+    Ok(())
 }
 
-/// SUM 保护下从内核批量拷贝到用户空间。
-/// 头部逐字节对齐 dst 到 8 字节 → 中间 8 字节批量 → 尾部逐字节。
+/// 从内核缓冲区逐字节拷贝到用户空间。
 #[inline(never)]
-unsafe fn sum_copy_to_user(dst: usize, src: *const u8, len: usize) -> Result<(), UserAccessError> {
-    let faulted: usize;
-    unsafe {
-        core::arch::asm!(
-            "li {ok}, 0",
-            "beqz {len}, 99f",
-
-            // ── 头部：逐字节对齐 dst 到 8 字节边界 ──
-            "10: andi {tmp}, {dst}, 7",
-            "beqz {tmp}, 20f",
-            "11: lbu {tmp}, 0({src})",
-            "sb {tmp}, 0({dst})",
-            "addi {src}, {src}, 1",
-            "addi {dst}, {dst}, 1",
-            "addi {len}, {len}, -1",
-            "beqz {len}, 99f",
-            "andi {tmp}, {dst}, 7",
-            "bnez {tmp}, 11b",
-
-            // ── 中间：8 字节批量拷贝 ──
-            "20: li {tmp}, 8",
-            "bltu {len}, {tmp}, 30f",
-            "21: ld {tmp}, 0({src})",
-            "sd {tmp}, 0({dst})",
-            "addi {src}, {src}, 8",
-            "addi {dst}, {dst}, 8",
-            "addi {len}, {len}, -8",
-            "li {tmp}, 8",
-            "bgeu {len}, {tmp}, 21b",
-
-            // ── 尾部：逐字节收尾 ──
-            "30: beqz {len}, 99f",
-            "31: lbu {tmp}, 0({src})",
-            "sb {tmp}, 0({dst})",
-            "addi {src}, {src}, 1",
-            "addi {dst}, {dst}, 1",
-            "addi {len}, {len}, -1",
-            "bnez {len}, 31b",
-            "j 99f",
-
-            // ── fault fixup ──
-            "90: li {ok}, 1",
-            "99:",
-
-            ".pushsection __ex_table,\"a\"",
-            ".balign 8",
-            ".8byte 11b, 90b",
-            ".8byte 21b, 90b",
-            ".8byte 31b, 90b",
-            ".popsection",
-
-            src = inout(reg) src => _,
-            dst = inout(reg) dst => _,
-            len = inout(reg) len => _,
-            tmp = lateout(reg) _,
-            ok = lateout(reg) faulted,
-            options(nostack)
-        );
+unsafe fn sum_copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<(), UserAccessError> {
+    let mut i = 0usize;
+    unsafe { set_sum() };
+    while i < len {
+        let b = unsafe { core::ptr::read_volatile(src.add(i)) };
+        let ptr = (dst_user + i) as *mut u8;
+        let mut faulted: usize = 0;
+        unsafe {
+            core::arch::asm!(
+                "2: sb {val}, 0({ptr})",
+                "j 3f",
+                "4: li {ok}, 1",
+                "3:",
+                ".pushsection __ex_table,\"a\"",
+                ".balign 8",
+                ".8byte 2b, 4b",
+                ".popsection",
+                ptr = in(reg) ptr,
+                val = in(reg) b,
+                ok = inlateout(reg) faulted,
+                options(nostack)
+            );
+        }
+        if faulted != 0 {
+            unsafe { clear_sum() };
+            return Err(UserAccessError::Fault);
+        }
+        i += 1;
     }
-    if faulted == 0 { Ok(()) } else { Err(UserAccessError::Fault) }
+    unsafe { clear_sum() };
+    Ok(())
 }
 
-// ── 公开接口 ──────────────────────────────────────────────────────────────────
+// ── 对外接口 ──────────────────────────────────────────────────────────────────
 
 unsafe fn copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<(), UserAccessError> {
     if src_user.checked_add(len).map_or(true, |end| end > USER_SPACE_TOP) {
         return Err(UserAccessError::Fault);
     }
-    unsafe { set_sum() };
-    let r = unsafe { sum_copy_from_user(dst, src_user, len) };
-    unsafe { clear_sum() };
-    r
+    unsafe { sum_copy_from_user(dst, src_user, len) }
 }
 
 unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<(), UserAccessError> {
     if dst_user.checked_add(len).map_or(true, |end| end > USER_SPACE_TOP) {
         return Err(UserAccessError::Fault);
     }
-    unsafe { set_sum() };
-    let r = unsafe { sum_copy_to_user(dst_user, src, len) };
-    unsafe { clear_sum() };
-    r
+    unsafe { sum_copy_to_user(dst_user, src, len) }
 }
 
 unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAccessError> {
-    // 起始地址必须在用户空间内
     if start_user >= USER_SPACE_TOP {
         return Err(UserAccessError::Fault);
     }
-    // clamp max 到地址空间边界，避免 start + max 溢出或越界判定为非法
     let effective_max = max.min(USER_SPACE_TOP - start_user);
     let mut i = 0usize;
     unsafe { set_sum() };
     while i < effective_max {
+        let ptr = (start_user + i) as *const u8;
         let b: u8;
-        let faulted: usize;
+        let mut faulted: usize = 0;
         unsafe {
             core::arch::asm!(
-                "li {ok}, 0",
-                "2: lbu {val}, 0({addr})",
-                "j 5f", "3: li {ok}, 1", "5:",
-                ".pushsection __ex_table,\"a\"", ".balign 8",
-                ".8byte 2b, 3b", ".popsection",
-                addr = in(reg) start_user + i,
-                val = lateout(reg) b,
-                ok = lateout(reg) faulted,
+                "2: lbu {val}, 0({ptr})",
+                "j 3f",
+                "4: li {ok}, 1",
+                "3:",
+                ".pushsection __ex_table,\"a\"",
+                ".balign 8",
+                ".8byte 2b, 4b",
+                ".popsection",
+                ptr = in(reg) ptr,
+                val = out(reg) b,
+                ok = inlateout(reg) faulted,
                 options(nostack, readonly)
             );
         }
