@@ -403,6 +403,20 @@ impl FdTable {
         self.inner.lock().get(fd.0).map(|e| Arc::clone(&e.file))
     }
 
+    /// 批量获取一组 fd 对应的文件。
+    ///
+    /// select/poll 这类接口会在一次 syscall 中检查大量 fd。逐个调用
+    /// `get_file()` 会反复获取 fdtable 锁；这里在同一把锁内完成所有 clone，
+    /// 保持语义不变但显著减少热路径锁开销。
+    pub fn get_files_dense(&self, fds: &[Fd]) -> Vec<Option<Arc<File>>> {
+        let inner = self.inner.lock();
+        let mut out = Vec::with_capacity(fds.len());
+        for fd in fds {
+            out.push(inner.get(fd.0).map(|e| Arc::clone(&e.file)));
+        }
+        out
+    }
+
     /// 复制描述符（`dup`）。
     pub fn dup_fd(&self, old_fd: Fd) -> VfsResult<Fd> {
         self.dup_fd_from(old_fd, 0, FdFlags::default())
