@@ -14,6 +14,7 @@ use alloc::vec::Vec;
 use errno::Errno;
 
 use crate::clone_flags::{CloneArgs, CloneFlags};
+use crate::cpu::{CpuId, CpuMask};
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session};
 use crate::ids::{Capability, Gid, Uid};
@@ -22,9 +23,9 @@ use crate::process_ops::{ExecRequest, UserContextRef, process_image_ops};
 use crate::rlimit::{Resource, RlimitError, RlimitPair, Rlimits};
 use crate::sched_class::SchedAttr;
 use crate::scheduler::{
-    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, is_cpu_online,
-    mark_task_stopped, migrate_task, request_post_syscall_handoff, request_resched, root_pid_ns,
-    runqueue_of, schedule_once, signal_wakeup, supported_cpu_mask,
+    NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
+    migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
+    root_pid_ns, runqueue_of, sched_topology, schedule_once, signal_wakeup, supported_cpu_mask,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
@@ -88,6 +89,14 @@ fn lookup_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
         .lookup(pid)
         .and_then(|w| w.upgrade())
         .ok_or(Errno::ESRCH)
+}
+
+/// 按根 PID namespace 查询任务句柄。
+///
+/// 调度核心只暴露稳定的任务选择入口；`pid == 0` 的 Linux 特殊语义仍由
+/// syscall 兼容层决定是否传入。
+pub fn task_by_pid(pid: PidT) -> Result<Arc<Task>, Errno> {
+    lookup_pid(pid)
 }
 
 pub fn getpgid(pid: PidT) -> Result<PidT, Errno> {
@@ -310,34 +319,83 @@ pub fn nice(inc: i32) -> Result<i32, Errno> {
     } else if new_nice > 19 {
         new_nice = 19;
     }
-    runqueue_of(me.current_cpu()).update_params(
+    sched_setparam_for_task(
         &me,
         SchedParams {
             nice: new_nice as i8,
             slice_ns: 0,
         },
-        crate::scheduler::now_ns_public(),
-    );
+    )?;
     Ok(new_nice)
 }
 
 /// 为 pid 对应任务设置 sched params。
 pub fn sched_setparam(pid: PidT, params: SchedParams) -> Result<(), Errno> {
     let t = lookup_pid(pid)?;
-    runqueue_of(t.current_cpu()).update_params(&t, params, crate::scheduler::now_ns_public());
-    Ok(())
+    sched_setparam_for_task(&t, params)
+}
+
+pub fn sched_setparam_for_task(task: &Arc<Task>, params: SchedParams) -> Result<(), Errno> {
+    update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_params(task, params, now_ns)
+    })
+}
+
+pub fn sched_setnice_for_task(task: &Arc<Task>, nice: i8) -> Result<(), Errno> {
+    update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_nice(task, nice, now_ns)
+    })
 }
 
 /// 设置完整调度属性。权限检查由 syscall 层负责；本函数只校验参数和更新 rq。
 pub fn sched_setattr(pid: PidT, attr: SchedAttr) -> Result<(), Errno> {
     let attr = attr.validate()?;
     let t = lookup_pid(pid)?;
-    runqueue_of(t.current_cpu()).update_sched_attr(&t, attr, crate::scheduler::now_ns_public());
-    Ok(())
+    sched_setattr_for_task(&t, attr)
+}
+
+pub fn sched_setattr_for_task(task: &Arc<Task>, attr: SchedAttr) -> Result<(), Errno> {
+    let attr = attr.validate()?;
+    update_task_sched_entity(task, |cpu_id, task, now_ns| {
+        runqueue_of(cpu_id).update_sched_attr(task, attr, now_ns)
+    })
+}
+
+fn update_task_sched_entity(
+    task: &Arc<Task>,
+    mut update: impl FnMut(usize, &Arc<Task>, u64) -> bool,
+) -> Result<(), Errno> {
+    let now_ns = crate::scheduler::now_ns_public();
+    let owner = task.current_cpu();
+    if owner < NR_CPUS && update(owner, task, now_ns) {
+        return Ok(());
+    }
+
+    for cpu_id in 0..NR_CPUS {
+        if cpu_id == owner {
+            continue;
+        }
+        if update(cpu_id, task, now_ns) {
+            return Ok(());
+        }
+    }
+
+    if task.sched.on_rq() {
+        Err(Errno::EBUSY)
+    } else if update(task.current_cpu().min(NR_CPUS - 1), task, now_ns) {
+        Ok(())
+    } else {
+        Err(Errno::EBUSY)
+    }
 }
 
 pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
-    Ok(lookup_pid(pid)?.sched.sched_attr())
+    let task = lookup_pid(pid)?;
+    Ok(sched_getattr_for_task(&task))
+}
+
+pub fn sched_getattr_for_task(task: &Arc<Task>) -> SchedAttr {
+    task.sched.sched_attr()
 }
 
 pub fn set_sched_reset_on_fork(pid: PidT, enabled: bool) -> Result<(), Errno> {
@@ -377,39 +435,57 @@ pub fn all_tasks_snapshot() -> Vec<Arc<Task>> {
 }
 
 pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
-    Ok(lookup_pid(pid)?.cpu_affinity() & supported_cpu_mask())
+    let task = lookup_pid(pid)?;
+    Ok(sched_getaffinity_for_task(&task))
 }
 
-fn affinity_cpu_bit(cpu_id: usize) -> u64 {
-    if cpu_id >= u64::BITS as usize {
-        0
-    } else {
-        1u64 << cpu_id
-    }
+pub fn sched_getaffinity_for_task(task: &Arc<Task>) -> u64 {
+    task.cpu_affinity() & supported_cpu_mask()
 }
 
 pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
     let task = lookup_pid(pid)?;
-    let supported = mask & supported_cpu_mask();
-    if supported == 0 {
+    sched_setaffinity_for_task(&task, mask)
+}
+
+pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Errno> {
+    let requested = CpuMask::from_bits_truncate(mask);
+    if requested.is_empty() {
         return Err(Errno::EINVAL);
     }
+    let online = CpuMask::from_bits_truncate(online_cpu_mask());
+    if requested.intersection(online).is_empty() {
+        return Err(Errno::EINVAL);
+    }
+    let supported = requested.bits();
     task.set_cpu_affinity(supported);
 
     let current_cpu = task.current_cpu();
-    if current_cpu < NR_CPUS && (supported & affinity_cpu_bit(current_cpu)) == 0 {
-        if let Some(target_cpu) = (0..NR_CPUS)
-            .find(|cpu_id| (supported & affinity_cpu_bit(*cpu_id)) != 0 && is_cpu_online(*cpu_id))
-        {
-            if migrate_task(&task, target_cpu).is_err() {
+    let current = CpuId::new(current_cpu);
+    if current.is_some_and(|cpu| requested.contains(cpu)) {
+        return Ok(());
+    }
+
+    let target = sched_topology()
+        .select_cpu(requested, online, current, false, |cpu| {
+            runqueue_of(cpu.get()).nr_running()
+        })
+        .map(|cpu| cpu.get());
+
+    if let Some(target_cpu) = target {
+        if migrate_task(task, target_cpu).is_err() {
+            request_balance(target_cpu);
+            if current_cpu < NR_CPUS {
                 request_resched(current_cpu);
             }
         }
+    } else if current_cpu < NR_CPUS {
+        request_resched(current_cpu);
     }
     Ok(())
 }
 
-/// getcpu：返回当前调度 CPU；NUMA node 暂按 UMA 返回 0。
+/// getcpu：返回当前调度 CPU；节点编号由兼容层保持 UMA 语义。
 pub fn getcpu() -> Result<(u32, u32), Errno> {
     Ok((current_cpu_id() as u32, 0))
 }
@@ -1161,36 +1237,12 @@ pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
 }
 
 /// `setrlimit(resource, new)` 写调用者 tg 的 rlimit。
-///
-/// 校验规则照搬 Linux 6.x `kernel/sys.c::do_prlimit`：
-///   1. `new.soft ≤ new.hard`（基础不变量）
-///   2. `new.hard ≤ cur.hard`（无 CAP_SYS_RESOURCE 时硬限制不可逆降不到
-///      "原值以下"——但硬限制是允许降到任何更小的值，包括小于当前 soft）
-///   3. `new.soft ≤ cur.hard`（软限制不能超过当前硬限制）
-///
-/// 关键点：**不检查** `new.hard < cur.soft`。POSIX 允许"硬限制降到
-/// ≥ 0 的任意值"，glibc 旧 ABI setrlimit 也支持；libctest 的
-/// `setrlim.c:21` 典型用法 `setrlimit(RLIMIT_STACK, 102400)` 会把
-/// `rlim_max = 102400`，当前 soft 可能是 8MB，老式"hard 不能降到
-/// 软以下"校验会误返 EINVAL。
 pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Errno> {
     let me = current_task();
     let tg = me.thread_group();
     let mut guard = tg.rlimits().lock();
     let cur = guard.get(resource);
-
-    // (1) 软限制必须 ≤ 硬限制。
-    if new.soft.0 > new.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
-    // (2) 无 CAP 时硬限制不可调高（只能降或保留）。
-    if new.hard.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
-    // (3) 软限制不能超当前硬限制。
-    if new.soft.0 > cur.hard.0 {
-        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-    }
+    validate_rlimit_update(&me, cur, new)?;
     let old = cur;
     guard.set(resource, new);
     Ok(old)
@@ -1206,8 +1258,9 @@ pub fn prlimit64(
     new: Option<RlimitPair>,
 ) -> Result<RlimitPair, Errno> {
     let me = current_task();
-    let target_tg = if pid == 0 {
-        me.thread_group()
+    let my_tg = me.thread_group();
+    let target = if pid == 0 {
+        Arc::clone(&me)
     } else if pid > 0 {
         let root = root_pid_ns();
         let Some(weak) = root.registry().lookup(pid) else {
@@ -1216,24 +1269,18 @@ pub fn prlimit64(
         let Some(task) = weak.upgrade() else {
             return Err(Errno::ESRCH);
         };
-        task.thread_group()
+        task
     } else {
         return Err(Errno::EINVAL);
     };
-    // 权限：调用方需是同 uid 或具 CAP_SYS_RESOURCE。本仓库尚未实现
-    // capability 模型，按"同进程/同 uid 直通"处理。
+    let target_tg = target.thread_group();
+    if !Arc::ptr_eq(&my_tg, &target_tg) {
+        check_prlimit_target_permission(&me, &target)?;
+    }
     if let Some(n) = new {
         let mut guard = target_tg.rlimits().lock();
         let cur = guard.get(resource);
-        if n.soft.0 > n.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
-        if n.hard.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
-        if n.soft.0 > cur.hard.0 {
-            return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
-        }
+        validate_rlimit_update(&me, cur, n)?;
         let old = cur;
         guard.set(resource, n);
         Ok(old)
@@ -1242,10 +1289,130 @@ pub fn prlimit64(
     }
 }
 
+/// 校验 rlimit 写入。
+///
+/// 规则对齐 Linux `do_prlimit`：`soft <= hard` 是基础不变量；非特权调用者
+/// 只能在当前 hard 限制内调整 soft，并且不能提高 hard；具备
+/// `CAP_SYS_RESOURCE` 时允许提高 hard/soft。这里刻意不检查 `new.hard < cur.soft`，
+/// 因为 POSIX 允许把 hard 降到低于当前 soft 的新值，只要新 soft 同步降下来。
+fn validate_rlimit_update(
+    caller: &Arc<Task>,
+    cur: RlimitPair,
+    new: RlimitPair,
+) -> Result<(), Errno> {
+    if new.soft.0 > new.hard.0 {
+        return Err(rlimit_err_to_errno(RlimitError::ExceedsHard));
+    }
+    if caller.credentials().has_cap(Capability::SysResource) {
+        return Ok(());
+    }
+    if new.hard.0 > cur.hard.0 || new.soft.0 > cur.hard.0 {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// prlimit 读写其它进程时需要同属主，或者具备资源管理能力。
+fn check_prlimit_target_permission(caller: &Arc<Task>, target: &Arc<Task>) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysResource) {
+        return Ok(());
+    }
+    let target_creds = target.credentials();
+    if caller_creds.uid == target_creds.uid
+        && caller_creds.uid == target_creds.euid
+        && caller_creds.uid == target_creds.suid
+        && caller_creds.gid == target_creds.gid
+        && caller_creds.gid == target_creds.egid
+        && caller_creds.gid == target_creds.sgid
+    {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
 /// 返回整个 rlimit 表（用于调试/procfs）。
 pub fn rlimits_snapshot() -> Rlimits {
     let me = current_task();
     *me.thread_group().rlimits().lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::{Arc, Weak};
+
+    use super::*;
+    use crate::group::ThreadGroup;
+    use crate::ids::{CapSet, Credentials, Gid, Uid};
+    use crate::rlimit::Rlim;
+
+    fn task_with_credentials(creds: Credentials) -> Arc<Task> {
+        let session = Session::new();
+        let pg = ProcessGroup::new(&session);
+        let tg = ThreadGroup::new();
+        let task = Task::new(SchedParams::default_fair(), Weak::new(), tg, pg);
+        task.set_credentials(Arc::new(creds));
+        task
+    }
+
+    fn unprivileged_task(uid: u32, gid: u32) -> Arc<Task> {
+        task_with_credentials(Credentials::unprivileged(Uid(uid), Gid(gid)))
+    }
+
+    #[test]
+    fn rlimit_update_rejects_unprivileged_raise() {
+        let caller = unprivileged_task(1000, 1000);
+        let cur = RlimitPair::new(Rlim(100), Rlim(200));
+
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(100), Rlim(300))),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(250), Rlim(250))),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(300), Rlim(200))),
+            Err(Errno::EINVAL)
+        );
+        assert!(validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(50), Rlim(100))).is_ok());
+    }
+
+    #[test]
+    fn rlimit_update_allows_sysresource_raise() {
+        let mut creds = Credentials::unprivileged(Uid(1000), Gid(1000));
+        creds.caps = CapSet::single(Capability::SysResource);
+        let caller = task_with_credentials(creds);
+        let cur = RlimitPair::new(Rlim(0), Rlim(0));
+
+        assert!(validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(40), Rlim(40))).is_ok());
+        assert_eq!(
+            validate_rlimit_update(&caller, cur, RlimitPair::new(Rlim(41), Rlim(40))),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn prlimit_target_permission_requires_ids_or_sysresource() {
+        let caller = unprivileged_task(1000, 1000);
+        let same_owner = unprivileged_task(1000, 1000);
+        assert!(check_prlimit_target_permission(&caller, &same_owner).is_ok());
+
+        let mut different_saved_uid = Credentials::unprivileged(Uid(1000), Gid(1000));
+        different_saved_uid.suid = Uid(1001);
+        let different_owner = task_with_credentials(different_saved_uid);
+        assert_eq!(
+            check_prlimit_target_permission(&caller, &different_owner),
+            Err(Errno::EPERM)
+        );
+
+        let mut resource_creds = Credentials::unprivileged(Uid(2000), Gid(2000));
+        resource_creds.caps = CapSet::single(Capability::SysResource);
+        let resource_caller = task_with_credentials(resource_creds);
+        assert!(check_prlimit_target_permission(&resource_caller, &different_owner).is_ok());
+    }
 }
 
 // ── 信号投递在内核边界的默认动作处理 ─────────────────────────────────────────

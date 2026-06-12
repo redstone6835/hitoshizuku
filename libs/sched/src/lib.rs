@@ -51,6 +51,7 @@ extern crate alloc;
 
 pub mod arch_hooks;
 pub mod clone_flags;
+pub mod cpu;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
@@ -68,8 +69,9 @@ pub mod task;
 pub mod wait;
 pub mod wait_flags;
 
-pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry};
+pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry, TaskCpuStateOps};
 pub use clone_flags::{CloneArgs, CloneFlags};
+pub use cpu::{CpuId, CpuMask, SchedDomain, SchedTopology};
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
@@ -88,12 +90,13 @@ pub use scheduler::{
     NR_CPUS, balance_once, current_cpu_id, current_task, current_task_on, enqueue_task, idle_task,
     init, init_task, install_idle, is_cpu_online, is_ready, migrate_task, needs_resched,
     now_ns_public, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
-    register_sleep_deadline, request_post_syscall_handoff, request_resched, root_pid_ns,
-    run_post_syscall_handoff, runqueue, runqueue_of, schedule_once, scheduler_diag,
+    register_sleep_deadline, request_balance, request_post_syscall_handoff, request_resched,
+    root_pid_ns, run_post_syscall_handoff, runqueue, runqueue_of, schedule_once, scheduler_diag,
     set_realtime_itimer, signal_wakeup, spawn_idle_for, supported_cpu_mask,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
+pub use scheduler::{current_sched_domain_id, install_sched_topology, sched_topology};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
     SigSet, SignalNumber, SignalState,

@@ -10,13 +10,19 @@ use general::syscall::SyscallContext;
 use general::vfs::pidfd;
 use general::vfs::{self, fdtable::Fd};
 use sched::clone_flags::{CloneArgs, CloneFlags};
-use sched::ids::{CapSet, Capability, Gid, Uid};
+use sched::ids::{CapSet, Capability, Credentials, Gid, Uid};
 use sched::process_ops::{ExecRequest, UserContextRef};
 use sched::sync::Spinlock;
-use sched::task::{Task, TaskState};
+use sched::task::{RseqRegistration, Task, TaskState};
 use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatus};
 
-const MAX_CPUSET_BYTES: usize = 1024;
+// getpriority/setpriority 的 Linux 兼容层编码。调度核心只接收 Task 和 nice，
+// 不理解 which/who 这组用户态选择语义。
+const PRIO_PROCESS: usize = 0;
+const PRIO_PGRP: usize = 1;
+const PRIO_USER: usize = 2;
+const MIN_NICE: i32 = -20;
+const MAX_NICE: i32 = 19;
 
 const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
 const LINUX_REBOOT_MAGIC2: u32 = 672_274_793;
@@ -484,11 +490,59 @@ pub(super) fn sys_get_robust_list(ctx: &mut SyscallContext<'_>) -> Result<usize,
 }
 
 pub(super) fn sys_rseq(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let _ = ctx;
-    // TODO(threading): rseq 不能只登记 CPU id。完整语义必须在信号、抢占、
-    // CPU 迁移和用户态 critical section abort 路径同时接入；在此之前返回
-    // ENOSYS 让 libc 安全禁用 rseq，避免暴露不完整快路径。
-    Err(Errno::ENOSYS)
+    const RSEQ_MIN_SIZE: usize = 32;
+    const RSEQ_FLAG_UNREGISTER: usize = 1;
+    let ptr = ctx.args[0];
+    let len = ctx.args[1];
+    let flags = ctx.args[2];
+    let signature = ctx.args[3] as u32;
+
+    if (flags & !RSEQ_FLAG_UNREGISTER) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if ptr == 0 || len < RSEQ_MIN_SIZE || len > u32::MAX as usize {
+        return Err(Errno::EINVAL);
+    }
+
+    let current = ctx.task().rseq_registration();
+    if (flags & RSEQ_FLAG_UNREGISTER) != 0 {
+        if !current.registered {
+            return Err(Errno::EINVAL);
+        }
+        if current.ptr != ptr || current.len as usize != len || current.signature != signature {
+            return Err(Errno::EINVAL);
+        }
+        ctx.task().clear_rseq_registration();
+        return Ok(0);
+    }
+
+    if current.registered {
+        return Err(Errno::EBUSY);
+    }
+
+    // 注册成功前先确认用户区可写，并把当前 CPU 写入 rseq 的两个 CPU 字段。
+    // 后续迁移/切换由 kernel::sched 的 TaskCpuStateOps hook 继续刷新。
+    let cpu = sched::current_cpu_id() as u32;
+    write_rseq_cpu_fields(ptr, cpu)?;
+    ctx.task().set_rseq_registration(RseqRegistration {
+        ptr,
+        len: len as u32,
+        signature,
+        registered: true,
+    });
+    Ok(0)
+}
+
+const RSEQ_CPU_ID_START_OFFSET: usize = 0;
+const RSEQ_CPU_ID_OFFSET: usize = 4;
+
+fn write_rseq_cpu_fields(ptr: usize, cpu: u32) -> Result<(), Errno> {
+    let start_addr = ptr
+        .checked_add(RSEQ_CPU_ID_START_OFFSET)
+        .ok_or(Errno::EFAULT)?;
+    let current_addr = ptr.checked_add(RSEQ_CPU_ID_OFFSET).ok_or(Errno::EFAULT)?;
+    write_user_u32(start_addr, cpu)?;
+    write_user_u32(current_addr, cpu)
 }
 
 pub(super) fn sys_membarrier(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -987,137 +1041,140 @@ pub(super) fn sys_gettimeofday(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 
 pub(super) fn sys_getpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let targets = priority_targets(ctx.args[0], ctx.args[1], ctx.task())?;
-    let best_nice = targets
+    let best = targets
         .iter()
-        .map(|task| task.sched.nice())
+        .map(|task| task.sched.nice() as i32)
         .min()
         .ok_or(Errno::ESRCH)?;
-    Ok((20i32 - best_nice as i32) as usize)
+    Ok(linux_priority_from_nice(best))
 }
 
 pub(super) fn sys_setpriority(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let targets = priority_targets(ctx.args[0], ctx.args[1], ctx.task())?;
-    if targets.is_empty() {
-        return Err(Errno::ESRCH);
+    let nice = (ctx.args[2] as isize as i32).clamp(MIN_NICE, MAX_NICE);
+    for task in &targets {
+        check_setpriority_permission(ctx.task(), task, nice)?;
     }
-    let nice = (ctx.args[2] as i32).clamp(-20, 19) as i8;
-    for target in targets.iter() {
-        require_priority_access(ctx.task(), target, nice)?;
-    }
-    for target in targets {
-        sched::operation::set_task_nice(&target, nice);
+    for task in targets {
+        sched::operation::sched_setnice_for_task(&task, nice as i8)?;
     }
     Ok(0)
 }
 
-const PRIO_PROCESS: usize = 0;
-const PRIO_PGRP: usize = 1;
-const PRIO_USER: usize = 2;
+fn linux_priority_from_nice(nice: i32) -> usize {
+    (20 - nice.clamp(MIN_NICE, MAX_NICE)) as usize
+}
 
-fn priority_targets(
-    which: usize,
-    who: usize,
-    current: &Arc<Task>,
-) -> Result<Vec<Arc<Task>>, Errno> {
-    let tasks = sched::operation::all_tasks_snapshot();
-    let mut out = Vec::new();
-    match which {
+/// 按 Linux `which/who` 选择目标任务集合。
+///
+/// `who == 0` 的含义依赖 `which`，所以只在兼容层展开；返回集合为空时按
+/// syscall 语义报 `ESRCH`。
+fn priority_targets(which: usize, who: usize, caller: &Arc<Task>) -> Result<Vec<Arc<Task>>, Errno> {
+    let tasks = match which {
         PRIO_PROCESS => {
             let pid = if who == 0 {
-                current.pid_root().unwrap_or(0)
+                caller.pid_root().ok_or(Errno::ESRCH)?
             } else {
                 who as i32
             };
-            out.extend(
-                tasks
-                    .into_iter()
-                    .filter(|task| task.pid_root() == Some(pid)),
-            );
+            alloc::vec![sched::operation::task_by_pid(pid)?]
         }
         PRIO_PGRP => {
             let pgid = if who == 0 {
-                current.process_group().pgid()
+                caller.process_group().pgid()
             } else {
                 who as i32
             };
-            out.extend(
-                tasks
-                    .into_iter()
-                    .filter(|task| task.process_group().pgid() == pgid),
-            );
+            if pgid <= 0 {
+                return Err(Errno::ESRCH);
+            }
+            tasks_by_process_group(pgid)
         }
         PRIO_USER => {
             let uid = if who == 0 {
-                current.credentials().uid
+                caller.credentials().uid
             } else {
                 Uid(who as u32)
             };
-            out.extend(
-                tasks
-                    .into_iter()
-                    .filter(|task| task.credentials().uid == uid),
-            );
+            tasks_by_real_uid(uid)
         }
         _ => return Err(Errno::EINVAL),
-    }
-    if out.is_empty() {
+    };
+    if tasks.is_empty() {
         Err(Errno::ESRCH)
     } else {
-        Ok(out)
+        Ok(tasks)
     }
 }
 
-fn require_priority_access(
-    current: &Arc<Task>,
+/// 遍历根 PID namespace，收集指定进程组中的任务。
+fn tasks_by_process_group(pgid: i32) -> Vec<Arc<Task>> {
+    sched::root_pid_ns()
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .filter(|task| task.process_group().pgid() == pgid)
+        .collect()
+}
+
+/// 遍历根 PID namespace，收集真实 UID 匹配的任务。
+fn tasks_by_real_uid(uid: Uid) -> Vec<Arc<Task>> {
+    sched::root_pid_ns()
+        .registry()
+        .snapshot()
+        .into_iter()
+        .filter_map(|(_, weak)| weak.upgrade())
+        .filter(|task| task.credentials().uid == uid)
+        .collect()
+}
+
+/// 校验 setpriority 的目标权限与优先级提升权限。
+///
+/// 普通调用者只能修改同属主任务；降低 nice（提高优先级）时，还必须满足
+/// `CAP_SYS_NICE` 或当前线程组的 `RLIMIT_NICE` 下限。
+fn check_setpriority_permission(
+    caller: &Arc<Task>,
     target: &Arc<Task>,
-    new_nice: i8,
+    requested_nice: i32,
 ) -> Result<(), Errno> {
-    let current_creds = current.credentials();
-    if current_creds.has_cap(Capability::SysNice) {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysNice) {
         return Ok(());
     }
-    let target_creds = target.credentials();
-    let same_user = current_creds.euid == target_creds.uid
-        || current_creds.euid == target_creds.euid
-        || current_creds.uid == target_creds.uid
-        || current_creds.uid == target_creds.euid;
-    if !same_user {
-        return Err(Errno::EPERM);
-    }
-    if new_nice < target.sched.nice() {
+    check_sched_target_owner(&caller_creds, target)?;
+
+    let current = target.sched.nice() as i32;
+    if requested_nice < current && requested_nice < nice_floor_from_rlimit(caller) {
         return Err(Errno::EACCES);
     }
     Ok(())
 }
 
-fn require_sched_change_access(
-    ctx: &SyscallContext<'_>,
-    pid: i32,
-    new_attr: SchedAttr,
-) -> Result<(), Errno> {
-    let target = lookup_task_for_thread_syscall(pid, ctx.task())?;
-    require_priority_access(ctx.task(), &target, new_attr.nice)?;
-    let old = target.sched.sched_attr();
-    let needs_sys_nice = matches!(
-        new_attr.policy,
-        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin | SchedPolicy::Deadline
-    ) || new_attr.priority > old.priority
-        || new_attr.nice < old.nice;
-    if needs_sys_nice && !ctx.task().credentials().has_cap(Capability::SysNice) {
-        return Err(Errno::EPERM);
-    }
-    Ok(())
+/// 把 `RLIMIT_NICE` 的 soft limit 转成允许设置的最低 nice 值。
+fn nice_floor_from_rlimit(task: &Arc<Task>) -> i32 {
+    let limit = task
+        .thread_group()
+        .rlimits()
+        .lock()
+        .get(sched::Resource::Nice)
+        .soft
+        .raw()
+        .min(40) as i32;
+    (20 - limit).clamp(MIN_NICE, MAX_NICE)
 }
 
 pub(super) fn sys_sched_getparam(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
     let param_user = ctx.args[1];
-    let attr = sched::operation::sched_getattr(pid)?;
-    if param_user != 0 {
-        let mut out = [0u8; 4];
-        out[0..4].copy_from_slice(&(attr.priority as i32).to_le_bytes());
-        copy_to_user(param_user, &out).map_err(|e| e.as_errno())?;
+    if param_user == 0 {
+        return Err(Errno::EFAULT);
     }
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
+    let mut out = [0u8; 4];
+    out[0..4].copy_from_slice(&(attr.priority as i32).to_le_bytes());
+    copy_to_user(param_user, &out).map_err(|e| e.as_errno())?;
     Ok(0)
 }
 
@@ -1125,12 +1182,14 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let pid = ctx.args[0] as i32;
     let param_user = ctx.args[1];
     if param_user == 0 {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
     let priority = i32::from_le_bytes(raw);
-    let mut attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let old = task.sched.sched_attr();
+    let mut attr = old;
     match attr.policy {
         SchedPolicy::Fair | SchedPolicy::Idle => {
             if priority != 0 {
@@ -1138,23 +1197,21 @@ pub(super) fn sys_sched_setparam(ctx: &mut SyscallContext<'_>) -> Result<usize, 
             }
         }
         SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
-            if !(1..=99).contains(&priority) {
-                return Err(Errno::EINVAL);
-            }
-            attr.priority = priority as u8;
+            attr.priority = linux_rt_priority_from_param(priority)?;
         }
         SchedPolicy::Deadline => return Err(Errno::EINVAL),
     }
-    require_sched_change_access(ctx, pid, attr)?;
-    sched::operation::sched_setattr(pid, attr)?;
+    check_sched_attr_permission(ctx.task(), &task, old, attr)?;
+    sched::operation::sched_setattr_for_task(&task, attr)?;
     Ok(0)
 }
 
 pub(super) fn sys_sched_getscheduler(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pid = ctx.args[0] as i32;
-    let attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
     let mut raw = encode_linux_sched_policy(attr.policy);
-    if sched::operation::sched_reset_on_fork(pid)? {
+    if task.sched_reset_on_fork() {
         raw |= SCHED_RESET_ON_FORK;
     }
     Ok(raw)
@@ -1167,7 +1224,7 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     let policy = decode_linux_sched_policy(raw_policy)?;
     let param_user = ctx.args[2];
     if param_user == 0 {
-        return Err(Errno::EINVAL);
+        return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 4];
     copy_from_user(param_user, &mut raw).map_err(|e| e.as_errno())?;
@@ -1175,23 +1232,25 @@ pub(super) fn sys_sched_setscheduler(ctx: &mut SyscallContext<'_>) -> Result<usi
     if matches!(policy, SchedPolicy::Fair | SchedPolicy::Idle) && priority != 0 {
         return Err(Errno::EINVAL);
     }
-    if matches!(policy, SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin)
-        && !(1..=99).contains(&priority)
-    {
-        return Err(Errno::EINVAL);
-    }
+    let rt_priority = if matches!(policy, SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin) {
+        linux_rt_priority_from_param(priority)?
+    } else {
+        0
+    };
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let old = task.sched.sched_attr();
     let attr = SchedAttr {
         policy,
-        nice: 0,
-        slice_ns: 0,
-        priority: priority as u8,
+        nice: old.nice,
+        slice_ns: old.slice_ns,
+        priority: rt_priority,
         runtime_ns: 0,
         deadline_ns: 0,
         period_ns: 0,
     };
-    require_sched_change_access(ctx, pid, attr)?;
-    sched::operation::sched_setattr(pid, attr)?;
-    sched::operation::set_sched_reset_on_fork(pid, reset_on_fork)?;
+    check_sched_attr_permission(ctx.task(), &task, old, attr)?;
+    sched::operation::sched_setattr_for_task(&task, attr)?;
+    task.set_sched_reset_on_fork(reset_on_fork);
     Ok(0)
 }
 
@@ -1200,13 +1259,17 @@ pub(super) fn sys_sched_getaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let cpusetsize = ctx.args[1];
     let mask_user = ctx.args[2];
     let kernel_bytes = kernel_cpuset_bytes();
-    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
+    if mask_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if cpusetsize < kernel_bytes {
         return Err(Errno::EINVAL);
     }
 
-    let affinity = sched::operation::sched_getaffinity(pid)?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let affinity = sched::operation::sched_getaffinity_for_task(&task);
     let mut mask = Vec::new();
-    mask.resize(cpusetsize, 0);
+    mask.resize(kernel_bytes, 0);
     write_cpuset_mask(&mut mask, affinity);
     copy_to_user(mask_user, &mask).map_err(|e| e.as_errno())?;
     Ok(kernel_bytes)
@@ -1217,18 +1280,23 @@ pub(super) fn sys_sched_setaffinity(ctx: &mut SyscallContext<'_>) -> Result<usiz
     let cpusetsize = ctx.args[1];
     let mask_user = ctx.args[2];
     let kernel_bytes = kernel_cpuset_bytes();
-    if cpusetsize < kernel_bytes || cpusetsize > MAX_CPUSET_BYTES || mask_user == 0 {
+    if mask_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    if cpusetsize < kernel_bytes {
         return Err(Errno::EINVAL);
     }
     let mut mask = Vec::new();
-    mask.resize(cpusetsize, 0);
+    mask.resize(kernel_bytes, 0);
     copy_from_user(mask_user, &mut mask).map_err(|e| e.as_errno())?;
-    sched::operation::sched_setaffinity(pid, read_cpuset_mask(&mask))?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    check_sched_target_permission(ctx.task(), &task)?;
+    sched::operation::sched_setaffinity_for_task(&task, read_cpuset_mask(&mask))?;
     Ok(0)
 }
 
 fn kernel_cpuset_bytes() -> usize {
-    sched::NR_CPUS.div_ceil(8).max(1)
+    sched::CpuMask::supported_storage_bytes()
 }
 
 fn read_cpuset_mask(raw: &[u8]) -> u64 {
@@ -1245,16 +1313,85 @@ fn write_cpuset_mask(out: &mut [u8], mask: u64) {
     out[..n].copy_from_slice(&raw[..n]);
 }
 
+const MYGO_SCHED_INFO_VERSION: u32 = 1;
+const MYGO_SCHED_INFO_HEADER_SIZE: usize = 48;
+const MYGO_SCHED_DOMAIN_ENTRY_SIZE: usize = 32;
+const MYGO_SCHED_DOMAIN_PARENT_NONE: u32 = u32::MAX;
+
+pub(super) fn sys_mygo_sched_info(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let user = ctx.args[0];
+    let size = ctx.args[1];
+    let flags = ctx.args[2];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+
+    let topology = sched::sched_topology();
+    let domain_count = topology.len();
+    let required = MYGO_SCHED_INFO_HEADER_SIZE
+        .checked_add(
+            domain_count
+                .checked_mul(MYGO_SCHED_DOMAIN_ENTRY_SIZE)
+                .ok_or(Errno::EINVAL)?,
+        )
+        .ok_or(Errno::EINVAL)?;
+    if user == 0 || size == 0 {
+        return Ok(required);
+    }
+    if size < required {
+        return Err(Errno::EINVAL);
+    }
+
+    let mut out = Vec::new();
+    out.resize(required, 0);
+
+    // 头部：版本、结构尺寸、域数量、CPU 位图与当前调度位置。
+    write_u32(&mut out, 0, MYGO_SCHED_INFO_VERSION);
+    write_u32(&mut out, 4, MYGO_SCHED_INFO_HEADER_SIZE as u32);
+    write_u32(&mut out, 8, MYGO_SCHED_DOMAIN_ENTRY_SIZE as u32);
+    write_u32(&mut out, 12, domain_count as u32);
+    write_u64(&mut out, 16, sched::supported_cpu_mask());
+    write_u64(&mut out, 24, sched::online_cpu_mask());
+    let current_cpu = sched::current_cpu_id();
+    write_u32(&mut out, 32, current_cpu as u32);
+    write_u32(
+        &mut out,
+        36,
+        sched::current_sched_domain_id(current_cpu).unwrap_or(0) as u32,
+    );
+
+    for idx in 0..domain_count {
+        let Some(domain) = topology.domain(idx) else {
+            return Err(Errno::EINVAL);
+        };
+        let off = MYGO_SCHED_INFO_HEADER_SIZE + idx * MYGO_SCHED_DOMAIN_ENTRY_SIZE;
+        write_u32(&mut out, off, domain.id() as u32);
+        write_u32(
+            &mut out,
+            off + 4,
+            domain
+                .parent()
+                .map(|id| id as u32)
+                .unwrap_or(MYGO_SCHED_DOMAIN_PARENT_NONE),
+        );
+        write_u32(&mut out, off + 8, domain.level() as u32);
+        write_u64(&mut out, off + 16, domain.span().bits());
+    }
+
+    copy_to_user(user, &out).map_err(|e| e.as_errno())?;
+    Ok(required)
+}
+
 pub(super) fn sys_sched_get_priority_max(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     match decode_linux_sched_policy(ctx.args[0])? {
-        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(99),
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(sched::RT_PRIO_MAX as usize),
         _ => Ok(0),
     }
 }
 
 pub(super) fn sys_sched_get_priority_min(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     match decode_linux_sched_policy(ctx.args[0])? {
-        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(1),
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => Ok(sched::RT_PRIO_MIN as usize),
         _ => Ok(0),
     }
 }
@@ -1265,9 +1402,10 @@ pub(super) fn sys_sched_rr_get_interval(ctx: &mut SyscallContext<'_>) -> Result<
     if tp == 0 {
         return Err(Errno::EFAULT);
     }
-    let attr = sched::operation::sched_getattr(pid)?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
     let interval_ns = if attr.slice_ns == 0 {
-        100_000_000
+        sched::DEFAULT_RR_SLICE_NS
     } else {
         attr.slice_ns
     };
@@ -1286,10 +1424,81 @@ pub(super) fn sys_sched_setattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
         return Err(Errno::EINVAL);
     }
     let (attr, reset_on_fork) = read_linux_sched_attr(attr_user)?;
-    require_sched_change_access(ctx, pid, attr)?;
-    sched::operation::sched_setattr(pid, attr)?;
-    sched::operation::set_sched_reset_on_fork(pid, reset_on_fork)?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let old = task.sched.sched_attr();
+    check_sched_attr_permission(ctx.task(), &task, old, attr)?;
+    sched::operation::sched_setattr_for_task(&task, attr)?;
+    task.set_sched_reset_on_fork(reset_on_fork);
     Ok(0)
+}
+
+/// 校验调度属性修改权限。
+///
+/// syscall 层负责用户态权限和资源限制；sched 核心只接收已经授权的内部属性。
+fn check_sched_attr_permission(
+    caller: &Arc<Task>,
+    target: &Arc<Task>,
+    old: SchedAttr,
+    requested: SchedAttr,
+) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysNice) {
+        return Ok(());
+    }
+    check_sched_target_owner(&caller_creds, target)?;
+
+    let requested = requested.validate()?;
+    match requested.policy {
+        SchedPolicy::Fair => {
+            if requested.nice < old.nice && (requested.nice as i32) < nice_floor_from_rlimit(caller)
+            {
+                return Err(Errno::EACCES);
+            }
+        }
+        SchedPolicy::Idle => {}
+        SchedPolicy::RtFifo | SchedPolicy::RtRoundRobin => {
+            if old.policy != requested.policy || requested.priority > old.priority {
+                check_rtprio_limit(caller, requested.priority)?;
+            }
+        }
+        SchedPolicy::Deadline => return Err(Errno::EPERM),
+    }
+    Ok(())
+}
+
+/// 校验调度类系统调用的目标权限：同属主或具备 `CAP_SYS_NICE`。
+fn check_sched_target_permission(caller: &Arc<Task>, target: &Arc<Task>) -> Result<(), Errno> {
+    let caller_creds = caller.credentials();
+    if caller_creds.has_cap(Capability::SysNice) {
+        return Ok(());
+    }
+    check_sched_target_owner(&caller_creds, target)
+}
+
+/// Linux 调度权限使用调用者 euid 匹配目标 real/effective uid。
+fn check_sched_target_owner(caller_creds: &Credentials, target: &Arc<Task>) -> Result<(), Errno> {
+    let target_creds = target.credentials();
+    if caller_creds.euid == target_creds.uid || caller_creds.euid == target_creds.euid {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+fn check_rtprio_limit(caller: &Arc<Task>, priority: u8) -> Result<(), Errno> {
+    let limit = caller
+        .thread_group()
+        .rlimits()
+        .lock()
+        .get(sched::Resource::RtPrio)
+        .soft
+        .raw()
+        .min(sched::RT_PRIO_MAX as u64) as u8;
+    if priority <= limit {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
 }
 
 pub(super) fn sys_sched_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -1303,14 +1512,34 @@ pub(super) fn sys_sched_getattr(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
-    let attr = sched::operation::sched_getattr(pid)?;
-    let reset_on_fork = sched::operation::sched_reset_on_fork(pid)?;
-    write_linux_sched_attr(attr_user, size, attr, reset_on_fork)?;
+    let task = sched_task_from_pid(pid, ctx.task())?;
+    let attr = sched::operation::sched_getattr_for_task(&task);
+    write_linux_sched_attr(attr_user, size, attr, task.sched_reset_on_fork())?;
     Ok(0)
 }
 
 const SCHED_RESET_ON_FORK: usize = 0x4000_0000;
 const SCHED_FLAG_RESET_ON_FORK: u64 = 0x01;
+
+/// 解析调度 syscall 的 `pid` 参数：0 表示当前线程，负数按 Linux 返回 EINVAL。
+fn sched_task_from_pid(pid: i32, caller: &Arc<Task>) -> Result<Arc<Task>, Errno> {
+    if pid == 0 {
+        Ok(Arc::clone(caller))
+    } else if pid > 0 {
+        sched::operation::task_by_pid(pid)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+/// Linux `sched_param.sched_priority` 转内部 RT 优先级。
+fn linux_rt_priority_from_param(priority: i32) -> Result<u8, Errno> {
+    if (sched::RT_PRIO_MIN as i32..=sched::RT_PRIO_MAX as i32).contains(&priority) {
+        Ok(priority as u8)
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
 
 fn decode_linux_sched_policy(raw: usize) -> Result<SchedPolicy, Errno> {
     match raw & !SCHED_RESET_ON_FORK {
@@ -3318,6 +3547,10 @@ fn write_i32(out: &mut [u8], off: usize, value: i32) {
 
 fn write_u32(out: &mut [u8], off: usize, value: u32) {
     out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(out: &mut [u8], off: usize, value: u64) {
+    out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
 fn put_u16(out: &mut [u8], off: usize, v: u16) {

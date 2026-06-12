@@ -349,3 +349,7 @@ pub const SYS_REMOVEXATTRAT: usize = 466;
 pub const SYS_OPEN_TREE_ATTR: usize = 467;
 pub const SYS_FILE_GETATTR: usize = 468;
 pub const SYS_FILE_SETATTR: usize = 469;
+
+// MyGo 内核私有调度查询入口。该号位于当前分发表容量内，且避开已接入的
+// 通用 Linux ABI；返回格式由 kernel/syscalls/process.rs 的兼容层定义。
+pub const SYS_MYGO_SCHED_INFO: usize = 510;
