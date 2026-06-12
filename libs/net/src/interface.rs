@@ -14,8 +14,8 @@ use alloc::vec::Vec;
 use smoltcp::iface::{self, SocketHandle, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address,
-    Ipv6Cidr,
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr,
+    Ipv6Address, Ipv6Cidr,
 };
 
 use crate::adapter::NetDeviceAdapter;
@@ -397,20 +397,29 @@ impl ManagedInterface {
         self.sync_auto_config_socket(self.config.mode);
     }
 
-    /// 添加 IPv4 路由到当前协议引擎。
-    ///
-    /// 内核网络层的完整选路由 [`crate::route`] 维护；这里仅把当前底层协议引擎
-    /// 能理解的默认网关同步进去。
-    pub fn add_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr, gateway: Ipv4Addr) {
+    /// 添加 IPv4 静态网关路由到当前协议引擎。
+    pub fn add_route_v4(
+        &mut self,
+        dest: Ipv4Addr,
+        mask: Ipv4Addr,
+        gateway: Ipv4Addr,
+    ) -> Result<(), crate::NetError> {
         let prefix_len = mask_to_prefix_len(mask);
         if prefix_len == 0 {
             self.iface
                 .routes_mut()
                 .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
-                .ok();
+                .map(|_| ())
+                .map_err(|_| crate::NetError::ResourceExhausted)
         } else {
-            // 当前协议引擎没有非默认路由接口，保留内核路由表中的真实条目。
-            let _ = (dest, prefix_len);
+            upsert_smoltcp_route(
+                self.iface.routes_mut(),
+                IpCidr::Ipv4(Ipv4Cidr::new(
+                    ipv4_to_smoltcp(network_v4_addr(dest, prefix_len)),
+                    prefix_len,
+                )),
+                IpAddress::Ipv4(ipv4_to_smoltcp(gateway)),
+            )
         }
     }
 
@@ -419,23 +428,40 @@ impl ManagedInterface {
         let prefix_len = mask_to_prefix_len(mask);
         if prefix_len == 0 {
             self.iface.routes_mut().remove_default_ipv4_route();
+        } else {
+            remove_smoltcp_route(
+                self.iface.routes_mut(),
+                IpCidr::Ipv4(Ipv4Cidr::new(
+                    ipv4_to_smoltcp(network_v4_addr(dest, prefix_len)),
+                    prefix_len,
+                )),
+            );
         }
-        let _ = (dest, prefix_len);
     }
 
-    /// 添加 IPv6 路由到当前协议引擎。
-    ///
-    /// 当前底层协议引擎只接收默认网关；完整的 IPv6 前缀路由由内核 RouteTable
-    /// 保存并参与 socket 出口接口选择。
-    pub fn add_route_v6(&mut self, dest: Ipv6Addr, prefix_len: u8, gateway: Ipv6Addr) {
+    /// 添加 IPv6 静态网关路由到当前协议引擎。
+    pub fn add_route_v6(
+        &mut self,
+        dest: Ipv6Addr,
+        prefix_len: u8,
+        gateway: Ipv6Addr,
+    ) -> Result<(), crate::NetError> {
         let prefix_len = prefix_len.min(128);
         if prefix_len == 0 {
             self.iface
                 .routes_mut()
                 .add_default_ipv6_route(ipv6_to_smoltcp(gateway))
-                .ok();
+                .map(|_| ())
+                .map_err(|_| crate::NetError::ResourceExhausted)
         } else {
-            let _ = (dest, prefix_len);
+            upsert_smoltcp_route(
+                self.iface.routes_mut(),
+                IpCidr::Ipv6(Ipv6Cidr::new(
+                    ipv6_to_smoltcp(network_v6_addr(dest, prefix_len)),
+                    prefix_len,
+                )),
+                IpAddress::Ipv6(ipv6_to_smoltcp(gateway)),
+            )
         }
     }
 
@@ -444,8 +470,15 @@ impl ManagedInterface {
         let prefix_len = prefix_len.min(128);
         if prefix_len == 0 {
             self.iface.routes_mut().remove_default_ipv6_route();
+        } else {
+            remove_smoltcp_route(
+                self.iface.routes_mut(),
+                IpCidr::Ipv6(Ipv6Cidr::new(
+                    ipv6_to_smoltcp(network_v6_addr(dest, prefix_len)),
+                    prefix_len,
+                )),
+            );
         }
-        let _ = (dest, prefix_len);
     }
 
     /// 返回邻居缓存中所有条目（ARP/NDP 表查询）。
@@ -1254,6 +1287,48 @@ fn install_gateway(iface: &mut iface::Interface, gateway: Option<Gateway>) {
     }
 }
 
+fn upsert_smoltcp_route(
+    routes: &mut iface::Routes,
+    cidr: IpCidr,
+    gateway: IpAddress,
+) -> Result<(), crate::NetError> {
+    let mut full = false;
+    routes.update(|storage| {
+        let exists = storage.iter().any(|route| route.cidr == cidr);
+        if !exists && storage.len() == storage.capacity() {
+            full = true;
+            return;
+        }
+        while let Some(index) = storage.iter().position(|route| route.cidr == cidr) {
+            storage.remove(index);
+        }
+        if storage
+            .push(iface::Route {
+                cidr,
+                via_router: gateway,
+                preferred_until: None,
+                expires_at: None,
+            })
+            .is_err()
+        {
+            full = true;
+        }
+    });
+    if full {
+        Err(crate::NetError::ResourceExhausted)
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_smoltcp_route(routes: &mut iface::Routes, cidr: IpCidr) {
+    routes.update(|storage| {
+        while let Some(index) = storage.iter().position(|route| route.cidr == cidr) {
+            storage.remove(index);
+        }
+    });
+}
+
 fn should_run_dhcpv4(mode: IfMode, medium: LinkMedium) -> bool {
     mode == IfMode::Auto && medium == LinkMedium::Ethernet
 }
@@ -1275,6 +1350,24 @@ fn generate_seed(id: InterfaceId) -> u64 {
 
 fn mask_to_prefix_len(mask: Ipv4Addr) -> u8 {
     u32::from_be_bytes(mask.0).leading_ones() as u8
+}
+
+fn network_v4_addr(addr: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    Ipv4Addr((u32::from_be_bytes(addr.0) & mask).to_be_bytes())
+}
+
+fn network_v6_addr(addr: Ipv6Addr, prefix_len: u8) -> Ipv6Addr {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix_len)
+    };
+    Ipv6Addr((u128::from_be_bytes(addr.0) & mask).to_be_bytes())
 }
 
 #[cfg(test)]
@@ -1383,6 +1476,56 @@ mod tests {
                 },
             ),
         )
+    }
+
+    #[test]
+    fn static_gateway_routes_are_synced_to_protocol_engine() {
+        let (_id, mut iface) = test_interface();
+        let v4_cidr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(198, 51, 100, 0), 24));
+        let v4_gateway = IpAddress::Ipv4(Ipv4Address::new(10, 0, 0, 1));
+        let v6_cidr = IpCidr::Ipv6(Ipv6Cidr::new(
+            Ipv6Address::new(0x2001, 0x0db8, 0x8866, 0, 0, 0, 0, 0),
+            48,
+        ));
+        let v6_gateway = IpAddress::Ipv6(Ipv6Address::new(0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1));
+
+        assert_eq!(find_smoltcp_route(&mut iface, v4_cidr), None);
+        iface
+            .add_route_v4(
+                Ipv4Addr::new(198, 51, 100, 1),
+                Ipv4Addr::new(255, 255, 255, 0),
+                Ipv4Addr::new(10, 0, 0, 1),
+            )
+            .unwrap();
+        assert_eq!(find_smoltcp_route(&mut iface, v4_cidr), Some(v4_gateway));
+        iface.remove_route_v4(
+            Ipv4Addr::new(198, 51, 100, 0),
+            Ipv4Addr::new(255, 255, 255, 0),
+        );
+        assert_eq!(find_smoltcp_route(&mut iface, v4_cidr), None);
+
+        assert_eq!(find_smoltcp_route(&mut iface, v6_cidr), None);
+        iface
+            .add_route_v6(
+                Ipv6Addr::new([0x2001, 0x0db8, 0x8866, 0xabcd, 0, 0, 0, 1]),
+                48,
+                Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1]),
+            )
+            .unwrap();
+        assert_eq!(find_smoltcp_route(&mut iface, v6_cidr), Some(v6_gateway));
+        iface.remove_route_v6(Ipv6Addr::new([0x2001, 0x0db8, 0x8866, 0, 0, 0, 0, 0]), 48);
+        assert_eq!(find_smoltcp_route(&mut iface, v6_cidr), None);
+    }
+
+    fn find_smoltcp_route(iface: &mut ManagedInterface, cidr: IpCidr) -> Option<IpAddress> {
+        let mut found = None;
+        iface.iface.routes_mut().update(|routes| {
+            found = routes
+                .iter()
+                .find(|route| route.cidr == cidr)
+                .map(|route| route.via_router);
+        });
+        found
     }
 
     fn build_tcp_packet(

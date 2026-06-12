@@ -1170,7 +1170,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_route_v4(dest, mask, gw);
+        managed.add_route_v4(dest, mask, gw)?;
         drop(managed);
         drop(table);
         self.routes.write().upsert(RouteEntry::static_v4(
@@ -1213,7 +1213,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_route_v6(dest, prefix_len, gw);
+        managed.add_route_v6(dest, prefix_len, gw)?;
         drop(managed);
         drop(table);
         self.routes
