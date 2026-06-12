@@ -25,7 +25,8 @@ use crate::sched_class::SchedAttr;
 use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
     migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
-    root_pid_ns, runqueue_of, sched_topology, schedule_once, signal_wakeup, supported_cpu_mask,
+    root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
+    supported_cpu_mask,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
@@ -462,15 +463,11 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
 
     let current_cpu = task.current_cpu();
     let current = CpuId::new(current_cpu);
-    if current.is_some_and(|cpu| requested.contains(cpu)) {
+    if current.is_some_and(|cpu| requested.contains(cpu) && online.contains(cpu)) {
         return Ok(());
     }
 
-    let target = sched_topology()
-        .select_cpu(requested, online, current, false, |cpu| {
-            runqueue_of(cpu.get()).nr_running()
-        })
-        .map(|cpu| cpu.get());
+    let target = select_cpu_for_mask(requested, current, false).map(|cpu| cpu.get());
 
     if let Some(target_cpu) = target {
         if migrate_task(task, target_cpu).is_err() {

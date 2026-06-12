@@ -39,6 +39,33 @@ use crate::{ExitCode, TaskState};
 /// 是为了让锁顺序、索引代码一次到位，AP 启动接入时无需重排数据结构。
 pub const NR_CPUS: usize = MAX_CPUS;
 
+/// 一次调度决策内使用的 runqueue 负载快照。
+///
+/// 采样时按 CPU 逐个短暂持有 rq 锁，后续选择过程只读本地数组，避免在拓扑
+/// 遍历时反复进入不同 rq 锁。快照只保证单次决策内部自洽，不表示全局静态状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunqueueLoadSnapshot {
+    loads: [usize; NR_CPUS],
+}
+
+impl RunqueueLoadSnapshot {
+    pub(crate) fn collect<F>(cpus: CpuMask, mut load_of: F) -> Self
+    where
+        F: FnMut(CpuId) -> usize,
+    {
+        let sampled = cpus.intersection(CpuMask::SUPPORTED);
+        let mut loads = [0; NR_CPUS];
+        for cpu in sampled.iter() {
+            loads[cpu.get()] = load_of(cpu);
+        }
+        Self { loads }
+    }
+
+    pub(crate) fn load_of(self, cpu: CpuId) -> usize {
+        self.loads[cpu.get()]
+    }
+}
+
 // ── 全局锚点 ──────────────────────────────────────────────────────────────────
 
 /// 每核运行队列。
@@ -418,9 +445,28 @@ pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
     let online = online_cpu_set();
     let current = CpuId::new(task.current_cpu());
     let prefer_current = task.state() != TaskState::New;
+    let load_snapshot = collect_rq_load_snapshot(affinity.intersection(online));
 
     sched_topology().describe_placement(affinity, online, current, prefer_current, |cpu| {
-        RUNQUEUES[cpu.get()].nr_running()
+        load_snapshot.load_of(cpu)
+    })
+}
+
+fn collect_rq_load_snapshot(cpus: CpuMask) -> RunqueueLoadSnapshot {
+    RunqueueLoadSnapshot::collect(cpus, |cpu| RUNQUEUES[cpu.get()].nr_running())
+}
+
+/// 按当前拓扑、在线 CPU 和一次性 rq 负载快照选择目标 CPU。
+pub(crate) fn select_cpu_for_mask(
+    allowed: CpuMask,
+    current: Option<CpuId>,
+    prefer_current: bool,
+) -> Option<CpuId> {
+    let online = online_cpu_set();
+    let eligible = allowed.intersection(online);
+    let load_snapshot = collect_rq_load_snapshot(eligible);
+    sched_topology().select_cpu(allowed, online, current, prefer_current, |cpu| {
+        load_snapshot.load_of(cpu)
     })
 }
 
@@ -820,10 +866,17 @@ pub fn balance_once(cpu_id: usize) -> bool {
         return false;
     }
 
+    let topology = sched_topology();
     let allowed = CpuMask::single(local_cpu).bits();
-    let local_load = RUNQUEUES[cpu_id].migratable_load_for(allowed);
-    let Some(src) = select_balance_source(sched_topology(), local_cpu, online, local_load, |cpu| {
+    let sample_cpus = topology
+        .balance_sources(local_cpu, online)
+        .union(CpuMask::single(local_cpu));
+    let load_snapshot = RunqueueLoadSnapshot::collect(sample_cpus, |cpu| {
         RUNQUEUES[cpu.get()].migratable_load_for(allowed)
+    });
+    let local_load = load_snapshot.load_of(local_cpu);
+    let Some(src) = select_balance_source(topology, local_cpu, online, local_load, |cpu| {
+        load_snapshot.load_of(cpu)
     })
     .map(|cpu| cpu.get()) else {
         return false;
@@ -887,9 +940,7 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
         return;
     }
 
-    let target = sched_topology().select_cpu(allowed, online, Some(source), false, |cpu| {
-        RUNQUEUES[cpu.get()].nr_running()
-    });
+    let target = select_cpu_for_mask(allowed, Some(source), false);
     if let Some(cpu) = target {
         if migrate_task(task, cpu.get()).is_err() {
             request_balance(cpu.get());

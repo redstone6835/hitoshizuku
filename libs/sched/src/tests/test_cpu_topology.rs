@@ -1,9 +1,11 @@
 //! CPU 位图与调度域拓扑测试。
 
+use core::cell::Cell;
+
 use ktest::ktest;
 
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, ROOT_SCHED_DOMAIN_ID, SchedDomain, SchedTopology};
-use crate::scheduler::select_balance_source;
+use crate::scheduler::{RunqueueLoadSnapshot, select_balance_source};
 use crate::{NR_CPUS, supported_cpu_mask};
 
 #[ktest]
@@ -199,6 +201,24 @@ fn sched_topology_describes_task_placement_snapshot() {
         affinity.intersection(online).bits()
     );
     assert_eq!(placement.preferred_cpu, CpuId::new(1));
+}
+
+#[ktest]
+fn runqueue_load_snapshot_samples_each_cpu_once() {
+    let mask = CpuMask::single_raw(0)
+        .union(CpuMask::single_raw(2))
+        .union(CpuMask::single_raw(NR_CPUS + 1));
+    let calls = Cell::new(0usize);
+
+    let snapshot = RunqueueLoadSnapshot::collect(mask, |cpu| {
+        calls.set(calls.get() + 1);
+        cpu.get() + 7
+    });
+
+    assert_eq!(calls.get(), mask.intersection(CpuMask::SUPPORTED).count());
+    assert_eq!(snapshot.load_of(CpuId::new(0).unwrap()), 7);
+    assert_eq!(snapshot.load_of(CpuId::new(2).unwrap()), 9);
+    assert_eq!(snapshot.load_of(CpuId::new(1).unwrap()), 0);
 }
 
 #[ktest]
