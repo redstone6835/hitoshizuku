@@ -514,11 +514,11 @@ impl NetStack {
         match handle.sock_type {
             SocketType::Raw => {
                 let socket = managed.raw_socket_mut(handle.inner);
-                let data = socket.recv().map_err(|_| NetError::WouldBlock)?;
                 // raw::Socket 当前不携带来源元信息；调用方需要 None 区分
-                // “协议栈没有给出”与“远端确实是未指定地址”。
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
+                // “协议栈没有给出”与“远端确实是未指定地址”。recv_slice 在
+                // 缓冲区不足时会丢弃当前包并返回 Truncated，统一映射为
+                // NetError::BufferTooSmall，避免底层 API 静默截断数据报。
+                let n = socket.recv_slice(buf).map_err(map_raw_recv_error)?;
                 Ok(RawRecvInfo {
                     len: n,
                     remote: None,
@@ -526,9 +526,9 @@ impl NetStack {
             }
             SocketType::Icmp => {
                 let socket = managed.icmp_socket_mut(handle.inner);
-                let (data, remote) = socket.recv().map_err(|_| NetError::WouldBlock)?;
-                let n = data.len().min(buf.len());
-                buf[..n].copy_from_slice(&data[..n]);
+                // ICMP 与 raw 一样按完整数据报交付；缓冲区不足时返回明确错误，
+                // 不把半包伪装成完整控制报文。
+                let (n, remote) = socket.recv_slice(buf).map_err(map_icmp_recv_error)?;
                 Ok(RawRecvInfo {
                     len: n,
                     remote: Some(endpoint_from_ip_address(remote)),
@@ -1925,9 +1925,11 @@ fn udp_recv_filtered(
                 let (data, meta) = socket.peek().map_err(|_| NetError::WouldBlock)?;
                 let remote = endpoint_from_smoltcp(meta.endpoint);
                 if udp_peer_matches(peer, remote) {
-                    let n = data.len().min(buf.len());
-                    buf[..n].copy_from_slice(&data[..n]);
-                    return Ok((n, remote));
+                    if buf.len() < data.len() {
+                        return Err(NetError::BufferTooSmall);
+                    }
+                    buf[..data.len()].copy_from_slice(data);
+                    return Ok((data.len(), remote));
                 }
                 true
             };
@@ -1940,15 +1942,32 @@ fn udp_recv_filtered(
         let (data, meta) = socket.recv().map_err(|_| NetError::WouldBlock)?;
         let remote = endpoint_from_smoltcp(meta.endpoint);
         if udp_peer_matches(peer, remote) {
-            let n = data.len().min(buf.len());
-            buf[..n].copy_from_slice(&data[..n]);
-            return Ok((n, remote));
+            // 普通 recv 已经把数据报出队，缓冲区不足时与 smoltcp::recv_slice 保持一致。
+            if buf.len() < data.len() {
+                return Err(NetError::BufferTooSmall);
+            }
+            buf[..data.len()].copy_from_slice(data);
+            return Ok((data.len(), remote));
         }
     }
 }
 
 fn udp_peer_matches(peer: Option<Endpoint>, remote: Endpoint) -> bool {
     peer.is_none_or(|expected| expected == remote)
+}
+
+fn map_raw_recv_error(err: smoltcp::socket::raw::RecvError) -> NetError {
+    match err {
+        smoltcp::socket::raw::RecvError::Exhausted => NetError::WouldBlock,
+        smoltcp::socket::raw::RecvError::Truncated => NetError::BufferTooSmall,
+    }
+}
+
+fn map_icmp_recv_error(err: smoltcp::socket::icmp::RecvError) -> NetError {
+    match err {
+        smoltcp::socket::icmp::RecvError::Exhausted => NetError::WouldBlock,
+        smoltcp::socket::icmp::RecvError::Truncated => NetError::BufferTooSmall,
+    }
 }
 
 fn udp_listen_endpoint_to_endpoint(
@@ -2487,6 +2506,85 @@ mod tests {
     }
 
     #[test]
+    fn udp_recv_from_rejects_small_buffer_and_drops_datagram() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-small-recv",
+            IfConfig::static_v4(Ipv4Addr::new(10, 35, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7779,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 35, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 35, 0, 2),
+            9000,
+            7779,
+            b"too-large",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut small = [0u8; 4];
+        assert_eq!(
+            stack.udp_recv_from(handle, &mut small),
+            Err(NetError::BufferTooSmall)
+        );
+        let mut large = [0u8; 16];
+        assert_eq!(
+            stack.udp_recv_from(handle, &mut large),
+            Err(NetError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn udp_peek_from_rejects_small_buffer_without_consuming_datagram() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-small-peek",
+            IfConfig::static_v4(Ipv4Addr::new(10, 36, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7780,
+        };
+        let peer = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 36, 0, 77)),
+            port: 9000,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+        assert!(stack.udp_connect(handle, peer).is_ok());
+
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 36, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 36, 0, 2),
+            9000,
+            7780,
+            b"too-large",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut small = [0u8; 4];
+        assert_eq!(
+            stack.udp_peek_from(handle, &mut small),
+            Err(NetError::BufferTooSmall)
+        );
+        assert_eq!(small, [0u8; 4]);
+
+        let mut large = [0u8; 16];
+        let (len, remote) = stack.udp_recv_from(handle, &mut large).unwrap();
+        assert_eq!(len, 9);
+        assert_eq!(&large[..len], b"too-large");
+        assert_eq!(remote, peer);
+    }
+
+    #[test]
     fn tcp_connect_rejects_wrong_route_before_syn() {
         let stack = NetStack::new();
         let first = attach_test_iface(
@@ -2955,6 +3053,71 @@ mod tests {
                 addr: IpAddr::V4(Ipv4Addr::new(10, 11, 0, 77)),
                 port: 0,
             })
+        );
+    }
+
+    #[test]
+    fn raw_recv_rejects_small_buffer_and_drops_datagram() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-raw-small-recv",
+            IfConfig::static_v4(Ipv4Addr::new(10, 37, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 37, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 37, 0, 2),
+            253,
+            b"raw-too-large",
+        );
+
+        driver.push_rx(packet);
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut small = [0u8; 8];
+        assert_eq!(
+            stack.raw_recv(handle, &mut small),
+            Err(NetError::BufferTooSmall)
+        );
+        let mut large = [0u8; 64];
+        assert_eq!(
+            stack.raw_recv(handle, &mut large),
+            Err(NetError::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn icmp_recv_rejects_small_buffer_and_drops_datagram() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-small-recv",
+            IfConfig::static_v4(Ipv4Addr::new(10, 38, 0, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let src = smoltcp::wire::Ipv4Address::new(10, 38, 0, 77);
+        let dst = smoltcp::wire::Ipv4Address::new(10, 38, 0, 2);
+
+        assert_eq!(stack.icmp_bind_identifier(handle, 0x1234), Ok(()));
+        driver.push_rx(build_icmpv4_echo_reply(
+            src,
+            dst,
+            0x1234,
+            0x5678,
+            b"icmp-too-large",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut small = [0u8; 4];
+        assert_eq!(
+            stack.raw_recv(handle, &mut small),
+            Err(NetError::BufferTooSmall)
+        );
+        let mut large = [0u8; 64];
+        assert_eq!(
+            stack.raw_recv(handle, &mut large),
+            Err(NetError::WouldBlock)
         );
     }
 
