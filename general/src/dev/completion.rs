@@ -85,13 +85,13 @@ impl<T> Completion<T> {
     }
 
     fn wait_blocking(&self) -> T {
-        let task = sched::current_task();
         loop {
             if self.done.load(Ordering::Acquire) {
                 if let Some(result) = self.result.lock().take() {
                     return result;
                 }
             }
+            let task = sched::current_task();
             let _ = task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping);
             let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
             self.wait_queue.enqueue(&task);
@@ -102,7 +102,9 @@ impl<T> Completion<T> {
                     return result;
                 }
             }
+            drop(task);
             sched::schedule_once(0);
+            let task = sched::current_task();
             self.wait_queue.remove(&task);
         }
     }

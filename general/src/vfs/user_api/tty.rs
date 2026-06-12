@@ -458,7 +458,10 @@ fn sync_termios2_hardware(dev: &CharDevice, raw: &[u8; LINUX_TERMIOS2_LEN]) -> R
     if ospeed == 0 {
         return Ok(());
     }
-    control_done_ignore_unsupported(dev, CharControlRequest::SetSerialConfig { baud: Some(ospeed) })
+    control_done_ignore_unsupported(
+        dev,
+        CharControlRequest::SetSerialConfig { baud: Some(ospeed) },
+    )
 }
 
 fn control_done_ignore_unsupported(dev: &CharDevice, req: CharControlRequest) -> Result<(), Errno> {

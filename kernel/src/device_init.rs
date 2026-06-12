@@ -94,9 +94,23 @@ pub fn register_core_filesystems(tag: &str) {
             tag, err
         )
     });
+    general::vfs::device_files::cpu_dma_latency::register_devtmpfs_adapter().unwrap_or_else(
+        |err| {
+            panic!(
+                "[kernel-start][{}] failed to register cpu_dma_latency devtmpfs adapter: {:?}",
+                tag, err
+            )
+        },
+    );
     general::vfs::device_files::loop_device::register_control_node().unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to register loop-control devtmpfs node: {:?}",
+            tag, err
+        )
+    });
+    general::vfs::device_files::cpu_dma_latency::register_static_node().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register cpu_dma_latency devtmpfs node: {:?}",
             tag, err
         )
     });
@@ -235,12 +249,14 @@ fn mount_sysfs_on_sys(tag: &str, ctx: &VfsContext) -> Arc<Mount> {
 /// `ctx` 只携带底层设备驱动需要的内核能力；`/dev` 命名、设备号等用户接口层
 /// 信息不进入这个上下文，仍由 devtmpfs/VFS 投影层处理。
 pub fn activate_device_subsystem(tag: &str, dev_sb: Arc<Superblock>, ctx: DevInitContext) {
-    general::vfs::devtmpfs::install_function_projection(Arc::clone(&dev_sb)).unwrap_or_else(|err| {
-        panic!(
-            "[kernel-start][{}] failed to install devtmpfs function projection: {:?}",
-            tag, err
-        )
-    });
+    general::vfs::devtmpfs::install_function_projection(Arc::clone(&dev_sb)).unwrap_or_else(
+        |err| {
+            panic!(
+                "[kernel-start][{}] failed to install devtmpfs function projection: {:?}",
+                tag, err
+            )
+        },
+    );
     printk!(
         "[kernel-start][{}] devtmpfs function projection installed",
         tag

@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::alloc_mod;
 use crate::layout::{EXT4_EXT_MAGIC, EXT4_EXTENTS_FL};
+use crate::map_wr::BlockAllocState;
 use crate::state::{BlockBackendError, FsState};
 
 const EXT_HEADER_SIZE: usize = 12;
@@ -266,6 +267,18 @@ pub(crate) fn ensure_block_in_extent(
     i_block: &mut [u8],
     lb: u32,
 ) -> Result<Option<u64>, BlockBackendError> {
+    ensure_block_in_extent_for_write(state, i_block, lb).map(|res| res.map(BlockAllocState::phys))
+}
+
+/// 在 extent 根叶子中查找或分配一个逻辑块，并返回该数据块是否刚分配。
+///
+/// 新 extent 数据块不在这里清零；写路径会根据部分写/整块覆盖决定是否需要填零，
+/// 这样可以避免新建文件顺序写时的重复写盘。
+pub(crate) fn ensure_block_in_extent_for_write(
+    state: &crate::state::FsState,
+    i_block: &mut [u8],
+    lb: u32,
+) -> Result<Option<BlockAllocState>, BlockBackendError> {
     if i_block.len() < EXT_HEADER_SIZE {
         return Ok(None);
     }
@@ -310,13 +323,15 @@ pub(crate) fn ensure_block_in_extent(
                 i_block[off + 11],
             ]) as u64;
             let start = (start_hi << 32) | start_lo;
-            return Ok(Some(start + (lb - ee_block) as u64));
+            return Ok(Some(BlockAllocState::Existing(
+                start + (lb - ee_block) as u64,
+            )));
         }
     }
     // 没覆盖到:需要新开一条叶子。先分配一个物理块,再尝试 append。
     let new_phys = crate::alloc_mod::alloc_block(state)?;
     if try_append_leaf(i_block, lb, new_phys, 1) {
-        Ok(Some(new_phys))
+        Ok(Some(BlockAllocState::NewlyAllocated(new_phys)))
     } else {
         // 失败 —— 把块释放再回退,调用方会走 demote
         crate::alloc_mod::free_block(state, new_phys)?;
@@ -342,20 +357,9 @@ pub(crate) fn ensure_extent_run(
         return Ok(None);
     }
 
-    // 先检查 start_lb 是否已有映射（覆盖写场景）
-    if let Some(phys) = lookup_extent_phys(i_block, start_lb) {
-        // 已映射，找连续 run 长度
-        let mut run = 1u32;
-        while run < count {
-            if let Some(p) = lookup_extent_phys(i_block, start_lb + run) {
-                if p != phys + run as u64 {
-                    break;
-                }
-                run += 1;
-            } else {
-                break;
-            }
-        }
+    // bench 的覆盖写会反复命中同一条 extent。直接从叶子条目计算 run，避免
+    // 对每个逻辑块都重新扫描 extent 表。
+    if let Some((phys, run)) = lookup_extent_run(i_block, start_lb, count) {
         return Ok(Some((phys, run)));
     }
 
@@ -380,8 +384,14 @@ pub(crate) fn ensure_extent_run(
     }
 }
 
-/// 在 extent 叶子中查找 lb 对应的物理块号。
-fn lookup_extent_phys(i_block: &[u8], lb: u32) -> Option<u64> {
+/// 在叶子 extent 中查找从 `lb` 开始的连续映射。
+///
+/// 返回的 run 长度不会超过 `max_count`，且只来自同一条 extent；extent 条目本身已
+/// 表达物理块连续性，无需逐个逻辑块重复查找。
+fn lookup_extent_run(i_block: &[u8], lb: u32, max_count: u32) -> Option<(u64, u32)> {
+    if max_count == 0 || i_block.len() < EXT_HEADER_SIZE {
+        return None;
+    }
     let entries = u16::from_le_bytes([i_block[2], i_block[3]]);
     for i in 0..entries as usize {
         let off = EXT_HEADER_SIZE + i * EXT_ENTRY_SIZE;
@@ -411,8 +421,26 @@ fn lookup_extent_phys(i_block: &[u8], lb: u32) -> Option<u64> {
                 i_block[off + 10],
                 i_block[off + 11],
             ]) as u64;
-            return Some(((start_hi << 32) | start_lo) + (lb - ee_block) as u64);
+            let in_extent = lb - ee_block;
+            let run = (real_len as u32 - in_extent).min(max_count);
+            return Some((((start_hi << 32) | start_lo) + in_extent as u64, run));
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{init_empty_root, lookup_extent_run, try_append_leaf};
+
+    #[test]
+    fn lookup_extent_run_clips_inside_single_extent() {
+        let mut root = [0u8; 60];
+        init_empty_root(&mut root);
+        assert!(try_append_leaf(&mut root, 8, 1000, 16));
+
+        assert_eq!(lookup_extent_run(&root, 12, 32), Some((1004, 12)));
+        assert_eq!(lookup_extent_run(&root, 20, 2), Some((1012, 2)));
+        assert_eq!(lookup_extent_run(&root, 24, 1), None);
+    }
 }

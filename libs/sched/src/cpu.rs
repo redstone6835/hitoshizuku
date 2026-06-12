@@ -242,6 +242,20 @@ impl SchedDomain {
     }
 }
 
+/// 某个任务在当前拓扑下的调度放置快照。
+///
+/// 这个结构只描述调度核心的通用事实，不包含任何用户态 ABI 编码。`affinity`
+/// 是任务声明的 CPU 许可集，`effective` 是再与在线 CPU 集相交后的实际可运行集；
+/// `preferred_cpu` 是按当前负载、调度域和是否优先保持原 CPU 计算出的候选 CPU。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedPlacement {
+    pub current_cpu: Option<CpuId>,
+    pub current_domain: Option<usize>,
+    pub preferred_cpu: Option<CpuId>,
+    pub affinity: CpuMask,
+    pub effective: CpuMask,
+}
+
 /// 固定容量调度拓扑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedTopology {
@@ -312,6 +326,21 @@ impl SchedTopology {
             }
         }
 
+        // 非根域可以嵌套，但不能形成“相交却互不隶属”的兄弟关系。否则同一
+        // CPU 的最小域归属会依赖输入顺序，后续放置和均衡都无法得到稳定语义。
+        for left in 1..out.len {
+            for right in left + 1..out.len {
+                let left_domain = out.domains[left];
+                let right_domain = out.domains[right];
+                if !left_domain.span.intersects(right_domain.span) {
+                    continue;
+                }
+                if !out.domain_is_ancestor(left, right) && !out.domain_is_ancestor(right, left) {
+                    return Err(Errno::EINVAL);
+                }
+            }
+        }
+
         for cpu in CpuMask::SUPPORTED.iter() {
             out.cpu_domain[cpu.get()] = out.best_domain_for_cpu(cpu);
         }
@@ -376,13 +405,48 @@ impl SchedTopology {
         choose_least_loaded(eligible, &mut load_of)
     }
 
-    /// 返回可从中拉取任务的同域 CPU 集，不包含本 CPU。
+    /// 计算任务在当前拓扑下的放置快照。
+    ///
+    /// 该函数不修改 runqueue，也不持有任何外部锁；调用方把实时负载通过
+    /// `load_of` 闭包注入。这样 syscall 查询、调试输出和实际入队选择可以共享
+    /// 同一套拓扑规则，避免各处重复硬编码 CPU 选择策略。
+    pub fn describe_placement<F>(
+        self,
+        affinity: CpuMask,
+        online: CpuMask,
+        current: Option<CpuId>,
+        prefer_current: bool,
+        load_of: F,
+    ) -> SchedPlacement
+    where
+        F: FnMut(CpuId) -> usize,
+    {
+        let affinity = affinity.or_boot();
+        let effective = affinity.intersection(online);
+        let current_domain = current
+            .and_then(|cpu| self.domain_for_cpu(cpu))
+            .map(|domain| domain.id());
+        let preferred_cpu = self.select_cpu(affinity, online, current, prefer_current, load_of);
+        SchedPlacement {
+            current_cpu: current,
+            current_domain,
+            preferred_cpu,
+            affinity,
+            effective,
+        }
+    }
+
+    /// 返回最近可拉取任务的调度域 CPU 集，不包含本 CPU。
     pub fn balance_sources(self, cpu: CpuId, online: CpuMask) -> CpuMask {
-        let span = self
-            .domain_for_cpu(cpu)
-            .map(|domain| domain.span)
-            .unwrap_or_else(|| self.root_domain().span);
-        span.intersection(online).without(cpu)
+        let mut domain_id = self.cpu_domain[cpu.get()];
+        loop {
+            let domain = self.domain(domain_id).unwrap_or_else(|| self.root_domain());
+            let sources = domain.span.intersection(online).without(cpu);
+            if !sources.is_empty() || domain.id == ROOT_SCHED_DOMAIN_ID {
+                return sources;
+            }
+            domain_id = domain.parent.unwrap_or(ROOT_SCHED_DOMAIN_ID);
+        }
     }
 
     fn best_domain_for_cpu(self, cpu: CpuId) -> usize {
@@ -402,6 +466,22 @@ impl SchedTopology {
             }
         }
         best
+    }
+
+    fn domain_is_ancestor(self, ancestor: usize, child: usize) -> bool {
+        let mut seen = 0usize;
+        let mut cursor = self.domains[child].parent;
+        while let Some(parent) = cursor {
+            if parent == ancestor {
+                return true;
+            }
+            if parent >= self.len || seen >= self.len {
+                return false;
+            }
+            seen += 1;
+            cursor = self.domains[parent].parent;
+        }
+        false
     }
 }
 

@@ -37,12 +37,12 @@ use general::dev::pnp::DevInitContext;
 use general::firmware::power::{
     PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
-use general::vfs::device_files::projection::find_char_device_by_fw_name;
 use general::firmware::{FirmwareTableMapping, SerialPortInfo};
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
 use general::vfs::dentry::VfsRoot;
+use general::vfs::device_files::projection::find_char_device_by_fw_name;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;

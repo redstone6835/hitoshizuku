@@ -5,6 +5,7 @@
 //! 翻译为底层 typed device/control 接口。
 
 pub mod base;
+pub mod cpu_dma_latency;
 pub mod loop_device;
 pub mod projection;
 pub mod rtc;

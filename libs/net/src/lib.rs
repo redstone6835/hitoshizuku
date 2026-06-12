@@ -46,7 +46,6 @@ extern crate alloc;
 pub mod adapter;
 pub mod config;
 pub mod device;
-pub mod dhcp;
 pub mod driver;
 mod engine;
 pub mod error;

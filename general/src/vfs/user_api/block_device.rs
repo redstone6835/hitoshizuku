@@ -9,9 +9,7 @@ use vfs::file::IoctlCmd;
 
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints};
 
-use super::ioctl::{
-    write_i32_to_user, write_u32_to_user, write_u64_to_user, write_usize_to_user,
-};
+use super::ioctl::{write_i32_to_user, write_u32_to_user, write_u64_to_user, write_usize_to_user};
 
 const BLKROGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 94, 0).raw();
 const BLKGETSIZE: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 96, 0).raw();
@@ -55,8 +53,8 @@ pub fn handle_block_ioctl<C: BlockDeviceIoctlContext>(
         }
         BLKGETSIZE => {
             let bytes = capacity_bytes(ctx)?;
-            let sectors = usize::try_from(bytes / BLKGETSIZE_SECTOR_BYTES)
-                .map_err(|_| Errno::EINVAL)?;
+            let sectors =
+                usize::try_from(bytes / BLKGETSIZE_SECTOR_BYTES).map_err(|_| Errno::EINVAL)?;
             write_usize_to_user(arg, sectors)?;
             Ok(0)
         }

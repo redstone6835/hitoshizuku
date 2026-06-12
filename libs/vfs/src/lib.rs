@@ -35,6 +35,7 @@ pub mod superblock;
 pub mod sync;
 pub mod timerfd;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
 use cred::Credentials;
 use dentry::{Dentry, DentryCache, VfsRoot};
 use error::{VfsError, VfsResult};
@@ -70,6 +71,25 @@ pub static DCACHE: DentryCache = DentryCache::new();
 /// 内核全局文件系统驱动注册表。
 pub static FS_REGISTRY: superblock::FsRegistry = superblock::FsRegistry::new();
 
+static VFS_CONTEXT_LIVE: AtomicUsize = AtomicUsize::new(0);
+static VFS_CONTEXT_CREATED: AtomicUsize = AtomicUsize::new(0);
+static VFS_CONTEXT_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VfsContextDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn vfs_context_diag() -> VfsContextDiag {
+    VfsContextDiag {
+        live: VFS_CONTEXT_LIVE.load(Ordering::Acquire),
+        created: VFS_CONTEXT_CREATED.load(Ordering::Acquire),
+        dropped: VFS_CONTEXT_DROPPED.load(Ordering::Acquire),
+    }
+}
+
 struct CwdState {
     cwd: Arc<Dentry>,
     cwd_mount: Arc<mount::Mount>,
@@ -95,6 +115,8 @@ impl VfsContext {
         umask: FileMode,
         limits: Arc<VfsLimits>,
     ) -> Self {
+        VFS_CONTEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        VFS_CONTEXT_LIVE.fetch_add(1, Ordering::Relaxed);
         cwd_mount.inc_open();
         Self {
             cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
@@ -163,6 +185,8 @@ impl VfsContext {
         let cwd = Arc::clone(&cwd_st.cwd);
         let cwd_mount = Arc::clone(&cwd_st.cwd_mount);
         cwd_mount.inc_open();
+        VFS_CONTEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        VFS_CONTEXT_LIVE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
             root: VfsRoot::new(self.root.root(), self.root.mount()),
@@ -184,6 +208,8 @@ impl VfsContext {
         let new_root_mount = new_ns
             .find_mount_for_root(&self.root.mount().mount_root)
             .unwrap_or_else(|| Arc::clone(&new_ns.root.lock()));
+        VFS_CONTEXT_CREATED.fetch_add(1, Ordering::Relaxed);
+        VFS_CONTEXT_LIVE.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             cwd_state: sync::Spinlock::new(CwdState {
                 cwd: Arc::clone(&cwd_st.cwd),
@@ -200,6 +226,8 @@ impl VfsContext {
 
 impl Drop for VfsContext {
     fn drop(&mut self) {
+        VFS_CONTEXT_DROPPED.fetch_add(1, Ordering::Relaxed);
+        VFS_CONTEXT_LIVE.fetch_sub(1, Ordering::Relaxed);
         self.cwd_state.lock().cwd_mount.dec_open();
     }
 }

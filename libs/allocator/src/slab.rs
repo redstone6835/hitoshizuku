@@ -32,6 +32,7 @@ const SIZE_CLASSES: [usize; 14] = [
     8, 16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
 ];
 const SIZE_CLASS_COUNT: usize = SIZE_CLASSES.len();
+pub const SLAB_SIZE_CLASS_COUNT: usize = SIZE_CLASS_COUNT;
 const CACHE_CAPACITY: usize = 32;
 const REFILL_BATCH: usize = 8;
 const BITMAP_WORDS: usize = 8;
@@ -57,6 +58,19 @@ pub struct SlabStats {
     pub fast_free_hits: u64,
     pub fast_free_fallbacks: u64,
     pub reclaimed_slabs: u64,
+    pub free_slab_nodes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SlabClassStat {
+    pub size_class: usize,
+    pub active_objects: u64,
+    pub active_bytes: usize,
+    pub active_slabs: usize,
+    pub active_pages: usize,
+    pub empty_slabs: usize,
+    pub empty_pages: usize,
+    pub reclaimable_empty_pages: usize,
     pub free_slab_nodes: usize,
 }
 
@@ -1139,6 +1153,34 @@ impl Zone {
         self.state.lock().stats
     }
 
+    fn class_stat(&self) -> SlabClassStat {
+        let state = self.state.lock();
+        let mut empty_slabs = 0usize;
+        let mut empty_pages = 0usize;
+        let mut node_addr = state.slab_head;
+        while node_addr != 0 {
+            let node = slab_node(node_addr);
+            if node.slab.is_empty() {
+                empty_slabs = empty_slabs.saturating_add(1);
+                empty_pages = empty_pages.saturating_add(node.backing.size / PAGE_SIZE);
+            }
+            node_addr = node.next;
+        }
+        SlabClassStat {
+            size_class: self.size_class,
+            active_objects: state.stats.active_objects,
+            active_bytes: state.stats.active_bytes,
+            active_slabs: state.stats.active_slabs,
+            active_pages: state.stats.active_pages,
+            empty_slabs,
+            empty_pages,
+            reclaimable_empty_pages: empty_slabs
+                .saturating_sub(MAX_EMPTY_SLABS_PER_ZONE)
+                .saturating_mul(self.pages_per_slab),
+            free_slab_nodes: state.stats.free_slab_nodes,
+        }
+    }
+
     fn contains(&self, ptr: usize) -> bool {
         let state = self.state.lock();
         let mut node_addr = state.slab_head;
@@ -1331,6 +1373,10 @@ impl SlabAllocator {
             out.free_slab_nodes += stats.free_slab_nodes;
         }
         out
+    }
+
+    pub fn class_stats(&self) -> [SlabClassStat; SIZE_CLASS_COUNT] {
+        core::array::from_fn(|idx| self.zones[idx].class_stat())
     }
 
     pub fn reclaim(

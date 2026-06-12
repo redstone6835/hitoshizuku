@@ -57,6 +57,7 @@ impl DeviceMajorSummary {
 struct DeviceNumberRegistry {
     next_char_private: Option<PrivateDynamicCursor>,
     next_block_private: Option<PrivateDynamicCursor>,
+    next_misc_minor: Option<u32>,
     well_known: Vec<DeviceNumberPolicy>,
     records: Vec<DeviceNumberRecord>,
 }
@@ -66,6 +67,7 @@ impl DeviceNumberRegistry {
         Self {
             next_char_private: Some(PrivateDynamicCursor::new(PRIVATE_DYNAMIC_MAJOR_START, 0)),
             next_block_private: Some(PrivateDynamicCursor::new(PRIVATE_DYNAMIC_MAJOR_START, 0)),
+            next_misc_minor: Some(0),
             well_known: Vec::new(),
             records: Vec::new(),
         }
@@ -78,6 +80,8 @@ static DEVICE_NUMBERS: Spinlock<DeviceNumberRegistry> = Spinlock::new(DeviceNumb
 // private dynamic major 起点属于用户 ABI 策略。集中在本模块内可以避免散落到
 // devtmpfs/sysfs/procfs 或底层设备对象中。
 const PRIVATE_DYNAMIC_MAJOR_START: u32 = 240;
+const MISC_MAJOR: u32 = 10;
+const MISC_MAJOR_NAME: &str = "misc";
 
 /// 用户 ABI 层声明的传统设备号策略。
 ///
@@ -207,6 +211,37 @@ pub fn register_char(node_name: &str, display_name: &str) -> Option<DevId> {
     register(DeviceNumberKind::Char, node_name, display_name)
 }
 
+/// Register a Linux misc character device with a dynamically allocated minor.
+///
+/// Misc devices share character major 10. The minor number is an ABI-facing
+/// projection detail and is not used for reverse lookup into the device model.
+pub fn register_misc_char(node_name: &str, display_name: &str) -> Option<DevId> {
+    let mut registry = DEVICE_NUMBERS.lock();
+    if let Some(record) = registry
+        .records
+        .iter()
+        .find(|record| record.node_name == node_name)
+    {
+        return (record.kind == DeviceNumberKind::Char
+            && record.rdev.major == MISC_MAJOR
+            && record.major_name == MISC_MAJOR_NAME)
+            .then_some(record.rdev);
+    }
+
+    let minor = next_misc_minor(&registry)?;
+    let rdev = DevId::new(MISC_MAJOR, minor);
+    push_record(
+        &mut registry,
+        DeviceNumberKind::Char,
+        node_name,
+        display_name,
+        MISC_MAJOR_NAME,
+        rdev,
+    )?;
+    registry.next_misc_minor = minor.checked_add(1);
+    Some(rdev)
+}
+
 pub fn register_block(node_name: &str, display_name: &str) -> Option<DevId> {
     register(DeviceNumberKind::Block, node_name, display_name)
 }
@@ -309,6 +344,20 @@ fn advance_private_cursor(cursor: PrivateDynamicCursor) -> Option<PrivateDynamic
             .major
             .checked_add(1)
             .map(|major| PrivateDynamicCursor::new(major, 0)),
+    }
+}
+
+fn next_misc_minor(registry: &DeviceNumberRegistry) -> Option<u32> {
+    let mut minor = registry.next_misc_minor?;
+    loop {
+        if registry.records.iter().all(|record| {
+            record.kind != DeviceNumberKind::Char
+                || record.rdev.major != MISC_MAJOR
+                || record.rdev.minor != minor
+        }) {
+            return Some(minor);
+        }
+        minor = minor.checked_add(1)?;
     }
 }
 

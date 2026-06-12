@@ -141,8 +141,8 @@ pub use request::{
     PhysicalAllocation, ReclaimPolicy, Zeroing,
 };
 pub use slab::{
-    MAX_CPUS, MAX_SMALL_SIZE, SlabAllocator as ZoneAllocator, SlabAudit, SlabAuditFlags,
-    SlabReclaimStats, SlabStats,
+    MAX_CPUS, MAX_SMALL_SIZE, SLAB_SIZE_CLASS_COUNT, SlabAllocator as ZoneAllocator, SlabAudit,
+    SlabAuditFlags, SlabClassStat, SlabReclaimStats, SlabStats,
 };
 pub use space::{AddressSpaceStats, ArenaKind, BackedRange, KernelAddressSpace};
 pub use stats::{
@@ -527,6 +527,39 @@ impl KernelMemorySubsystem {
         if !self.registry.init(&self.boot) {
             return Err(InitError::MetadataOutOfMemory);
         }
+        if let Some(range) = self.boot.seal_and_take_free_tail(PAGE_SIZE) {
+            if let Some(virt_to_phys) = self.load_virt_to_phys() {
+                let paddr = virt_to_phys(range.start);
+                match self.phys.lock().release_reserved_range(paddr, range.size) {
+                    Ok(pages) => {
+                        log::info!(
+                            "[alloc][boot] released boot tail vaddr={:#x}..{:#x} paddr={:#x} pages={} bytes={}",
+                            range.start,
+                            range.end(),
+                            paddr,
+                            pages,
+                            pages * PAGE_SIZE
+                        );
+                    }
+                    Err(err) => {
+                        log::warning!(
+                            "[alloc][boot] failed to release boot tail vaddr={:#x}..{:#x} paddr={:#x} size={} err={:?}",
+                            range.start,
+                            range.end(),
+                            paddr,
+                            range.size,
+                            err
+                        );
+                    }
+                }
+            } else {
+                log::warning!(
+                    "[alloc][boot] failed to release boot tail vaddr={:#x}..{:#x}: missing virt_to_phys",
+                    range.start,
+                    range.end()
+                );
+            }
+        }
         self.active.store(true, Ordering::Release);
         Ok(())
     }
@@ -736,6 +769,14 @@ impl KernelMemorySubsystem {
     /// O(1) 统计是否仍然一致。
     pub fn slab_audit(&self) -> SlabAudit {
         self.slab.audit()
+    }
+
+    /// 返回每个 slab size class 的轻量计数器快照。
+    ///
+    /// 该接口只读取各 zone 的 O(1) 统计，不扫描对象内容，用于定位小对象泄漏集中在哪个
+    /// 尺寸层级。
+    pub fn slab_class_stats(&self) -> [SlabClassStat; SLAB_SIZE_CLASS_COUNT] {
+        self.slab.class_stats()
     }
 
     /// 返回 kheap 大对象缓存 ring 和活跃页账本的一致性审计结果。
@@ -1029,13 +1070,30 @@ impl KernelMemorySubsystem {
         }
 
         let mut allocation = self.allocate_active_once(request);
-        if allocation.is_err()
-            && !matches!(request.reclaim, ReclaimPolicy::NoReclaim)
-            && self.managed.is_enabled()
-        {
-            let pressure = self.pressure_level();
-            self.managed.collect_on_pressure(pressure);
-            allocation = self.allocate_active_once(request);
+        if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
+            match request.reclaim {
+                ReclaimPolicy::NoReclaim => {}
+                ReclaimPolicy::TryManagedGc => {
+                    if self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                        allocation = self.allocate_active_once(request);
+                    }
+                }
+                ReclaimPolicy::TryAllocatorReclaim => {
+                    let reclaimed = self.reclaim_allocator_caches_for_retry();
+                    if reclaimed.reclaimed_bytes() != 0 && self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                    }
+                    allocation = self.allocate_active_once(request);
+                    if allocation.is_err() && self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                        allocation = self.allocate_active_once(request);
+                    }
+                }
+            }
         }
         match allocation {
             Ok(record) => Ok(record),
@@ -1306,7 +1364,9 @@ impl KernelMemorySubsystem {
     }
 
     fn alloc_active(&self, layout: Layout, zeroing: Zeroing) -> *mut u8 {
-        let request = MemoryRequest::for_kernel_layout(layout).with_zeroing(zeroing);
+        let request = MemoryRequest::for_kernel_layout(layout)
+            .with_zeroing(zeroing)
+            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim);
         match self.allocate(request) {
             Ok(record) => record.ptr as *mut u8,
             Err(_) => null_mut(),
@@ -1371,7 +1431,7 @@ impl KernelMemorySubsystem {
                         let allocation =
                             self.slab.alloc_class(zone_idx, cpu, &self.phys, &self.vmem);
                         if allocation.is_null() {
-                            return alloc_large();
+                            return Err(AllocationError::OutOfMemory);
                         }
                         if matches!(request.zeroing, Zeroing::Zeroed) {
                             unsafe {
@@ -1539,6 +1599,15 @@ impl KernelMemorySubsystem {
     fn allocate_internal_metadata(&self, layout: Layout) -> *mut u8 {
         self.metadata
             .alloc(layout, &self.phys, self.load_phys_to_virt())
+    }
+
+    fn reclaim_allocator_caches_for_retry(&self) -> AllocatorReclaimStats {
+        // 分配失败后的重试路径必须先归还 allocator 自己持有的可回收内存：
+        // kheap range cache、slab per-CPU cache/空 slab、buddy order-0 延迟合并页。
+        // 这不是周期性整理，而是 OOM 前的最后防线，避免大规模短生命周期任务结束后
+        // 大量页仍停在内部缓存里，后续请求却继续向 buddy 要新页。
+        self.reclaim(AllocatorReclaimRequest::caches())
+            .unwrap_or_default()
     }
 
     pub fn load_phys_to_virt(&self) -> Option<PhysToVirtFn> {

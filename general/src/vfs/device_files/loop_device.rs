@@ -27,8 +27,8 @@ use crate::dev::loopdev::{
     LoopAttachOptions, LoopBacking, LoopBackingError, LoopDeviceBundle, LoopDriver, LoopError,
     LoopFlags, LoopStatus,
 };
-use crate::vfs::device_files::spec::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSpec};
 use crate::vfs::device_files::projection::devnodes_for_function;
+use crate::vfs::device_files::spec::{CustomDevNodeKind, CustomDevNodeSpec, DevNodeSpec};
 use crate::vfs::devtmpfs::{
     DevTmpfsCustomNodeAdapter, DevTmpfsCustomNodeAdapterRegistration, DevTmpfsStaticNode,
     DevTmpfsStaticNodeRegistration, register_custom_devnode_adapter, register_static_dev_node,

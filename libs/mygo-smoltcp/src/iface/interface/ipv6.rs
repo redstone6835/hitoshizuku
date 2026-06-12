@@ -187,11 +187,13 @@ impl InterfaceInner {
     pub(super) fn process_ipv6<'frame>(
         &mut self,
         sockets: &mut SocketSet,
-        meta: PacketMeta,
+        mut meta: PacketMeta,
         source_hardware_addr: HardwareAddress,
         ipv6_packet: &Ipv6Packet<&'frame [u8]>,
     ) -> Option<Packet<'frame>> {
         let ipv6_repr = check!(Ipv6Repr::parse(ipv6_packet));
+        meta.hop_limit = Some(ipv6_repr.hop_limit);
+        meta.traffic_class = Some(ipv6_packet.traffic_class());
 
         if !ipv6_repr.src_addr.x_is_unicast() {
             // Discard packets with non-unicast source addresses.

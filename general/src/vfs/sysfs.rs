@@ -211,10 +211,7 @@ impl SysfsKey {
     }
 
     fn virtual_device(class_name: &str, rdev: DevId) -> Self {
-        Self::raw(format!(
-            "devices/virtual/{class_name}/{}",
-            Self::rdev(rdev)
-        ))
+        Self::raw(format!("devices/virtual/{class_name}/{}", Self::rdev(rdev)))
     }
 
     fn virtual_device_slot(class_name: &str, rdev: DevId, slot: u64) -> Self {
@@ -288,9 +285,7 @@ impl SysfsKey {
     }
 
     fn net_stats_slot(iface_id: u32, slot: u64) -> Self {
-        Self::raw(format!(
-            "class/net/iface/{iface_id}/statistics/slot/{slot}"
-        ))
+        Self::raw(format!("class/net/iface/{iface_id}/statistics/slot/{slot}"))
     }
 }
 
@@ -691,10 +686,11 @@ impl SysSnapshot {
         }
 
         for projection in published_char_devnodes(&DEVICES.functions) {
-            let sysfs_name =
-                sysfs_unique_name_with_rdev(projection.dev().fw_name(), projection.rdev(), |name| {
-                    snap.chars.iter().any(|ch| ch.sysfs_name == name)
-                });
+            let sysfs_name = sysfs_unique_name_with_rdev(
+                projection.dev().fw_name(),
+                projection.rdev(),
+                |name| snap.chars.iter().any(|ch| ch.sysfs_name == name),
+            );
             snap.chars.push(CharDevSnapshot {
                 sysfs_name,
                 rdev: projection.rdev(),
@@ -1600,7 +1596,9 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
 fn render_device_power_file(_snap: &SysSnapshot, _idx: usize, slot: DevicePowerSlot) -> String {
     match slot {
         // 通用设备模型暂未暴露 runtime PM typed state 时，统一从用户视图策略渲染。
-        DevicePowerSlot::RuntimeStatus => format!("{}\n", SYSFS_USER_VIEW_POLICY.power_runtime_status),
+        DevicePowerSlot::RuntimeStatus => {
+            format!("{}\n", SYSFS_USER_VIEW_POLICY.power_runtime_status)
+        }
         DevicePowerSlot::Control => format!("{}\n", SYSFS_USER_VIEW_POLICY.power_control),
         DevicePowerSlot::Wakeup => format!("{}\n", SYSFS_USER_VIEW_POLICY.power_wakeup),
     }
@@ -3294,12 +3292,8 @@ impl SysDirInodeOps {
                         }
                         out
                     };
-                    if !push_sysfs_dir_entry(
-                        &mut entries,
-                        cpu_ino(cpu),
-                        &name,
-                        FileType::Directory,
-                    ) {
+                    if !push_sysfs_dir_entry(&mut entries, cpu_ino(cpu), &name, FileType::Directory)
+                    {
                         return entries;
                     }
                 }

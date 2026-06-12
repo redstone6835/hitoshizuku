@@ -26,7 +26,7 @@ use sched::clone_flags::{CloneArgs, CloneFlags};
 use sched::process_ops::{ExecPath, ExecRequest, ProcessImageOps, UserContextRef};
 use sched::signal::{SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet};
 use sched::sync::Spinlock;
-use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey};
+use sched::task::{TaskExtCloneHook, TaskExtExitHook, TaskExtKey, TaskPreExitHook};
 use sched::{
     TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE, TASKEXT_VM_SPACE, Task,
 };
@@ -140,20 +140,24 @@ struct KernelExtExitHook;
 
 impl TaskExtExitHook for KernelExtExitHook {
     fn cleanup_on_exit(&self, task: &Arc<Task>) {
-        // FIXME: 其它 task ext 条目，在明确退出后的所有权要求后,需要这里释放资源。
-        if let Some(payload) = task.ext_remove(TASKEXT_VFS_FDTABLE) {
-            if let Ok(fdtable) = payload.downcast::<FdTable>() {
-                log::debug!(
-                    "[sched][exit-ext] pid={:?} drop fdtable open_fds={}",
-                    task.pid_root(),
-                    fdtable.len(),
-                );
-            }
-        }
+        let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
+        let _ = task.ext_remove(TASKEXT_VM_SPACE);
+        let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
+        let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);
     }
 }
 
 static EXIT_HOOK: KernelExtExitHook = KernelExtExitHook;
+
+struct KernelPreExitHook;
+
+impl TaskPreExitHook for KernelPreExitHook {
+    fn cleanup_before_exit(&self, task: &Arc<Task>) {
+        crate::syscalls::cleanup_task_before_exit(task);
+    }
+}
+
+static PRE_EXIT_HOOK: KernelPreExitHook = KernelPreExitHook;
 
 // ── VmSwitchOps ──────────────────────────────────────────────────────────────
 //
@@ -273,7 +277,7 @@ fn read_user_usize(user: usize) -> Result<usize, Errno> {
     Ok(usize::from_ne_bytes(raw))
 }
 
-fn write_user_usize(user: usize, value: usize) -> Result<(), Errno> {
+fn write_user_pid_t(user: usize, value: sched::pid::PidT) -> Result<(), Errno> {
     copy_to_user(user, &value.to_ne_bytes()).map_err(|e| e.as_errno())
 }
 
@@ -317,19 +321,22 @@ fn activate_task_vm(task: &Arc<Task>) {
 }
 
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
-    let me = sched::current_task();
-    activate_task_vm(&me);
-    let kstack_top = me
-        .kernel_stack_top()
-        .expect("[sched][clone] user child missing kernel stack");
-    hal::user_context::set_kernel_trap_stack(kstack_top);
+    let frame = {
+        let me = sched::current_task();
+        activate_task_vm(&me);
+        let kstack_top = me
+            .kernel_stack_top()
+            .expect("[sched][clone] user child missing kernel stack");
+        hal::user_context::set_kernel_trap_stack(kstack_top);
 
-    let payload = me
-        .ext_remove(TASKEXT_USER_TRAP_FRAME)
-        .expect("[sched][clone] user child missing saved trap frame");
-    let frame = payload
-        .downcast::<UserTrapFrame>()
-        .expect("[sched][clone] saved trap frame type mismatch");
+        let payload = me
+            .ext_remove(TASKEXT_USER_TRAP_FRAME)
+            .expect("[sched][clone] user child missing saved trap frame");
+        let frame = payload
+            .downcast::<UserTrapFrame>()
+            .expect("[sched][clone] saved trap frame type mismatch");
+        *frame
+    };
 
     unsafe { frame.resume() }
 }
@@ -414,9 +421,9 @@ fn process_clone_user_context(
         frame.set_tls(args.tls);
     }
 
-    let child_tid = child.pid_root().ok_or(Errno::EAGAIN)? as usize;
+    let child_tid = child.pid_root().ok_or(Errno::EAGAIN)?;
     if args.flags.has(CloneFlags::CLONE_PARENT_SETTID) && args.parent_tid != 0 {
-        write_user_usize(args.parent_tid, child_tid)?;
+        write_user_pid_t(args.parent_tid, child_tid)?;
     }
     if args.flags.has(CloneFlags::CLONE_CHILD_SETTID) && args.child_tid != 0 {
         // 切换到子进程页表写 child_tid；缺页处理依赖 current_task_vm_space()，
@@ -435,7 +442,7 @@ fn process_clone_user_context(
         } else {
             None
         };
-        let result = write_user_usize(args.child_tid, child_tid);
+        let result = write_user_pid_t(args.child_tid, child_tid);
         if !args.flags.has(CloneFlags::CLONE_VM) {
             parent.ext_remove(TASKEXT_VM_SPACE);
             if let Some(old) = saved_vm {
@@ -629,19 +636,24 @@ pub fn boot_init() -> Arc<Task> {
     // 2. 注入 ext clone hook，必须在 sched::init 之前——否则 init 任务后续
     //    任何 fork/clone 都会落到无 hook 的"全共享"分支。
     sched::register_ext_clone_hook(&HOOK);
+
+    // 3. 注入 ext exit hook，让 wait/reap 能在 kernel 上下文释放 VM/FDT 等大对象。
     sched::register_ext_exit_hook(&EXIT_HOOK);
 
-    // 3. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
+    // 4. 注入 pre-exit hook。robust futex / clear-child-tid 必须在释放 VM 前完成。
+    sched::register_pre_exit_hook(&PRE_EXIT_HOOK);
+
+    // 5. 注入用户进程镜像 ops。sched 只依赖这张表，不直接依赖 ELF/MM/trap。
     sched::register_process_image_ops(&PROCESS_IMAGE_OPS);
 
-    // 4. 注入 VmSwitchOps：schedule_once 切换前据此激活用户页表。注册点必须
+    // 6. 注入 VmSwitchOps：schedule_once 切换前据此激活用户页表。注册点必须
     //    在 sched::init 之前，这样即便 init 之外的 kthread 启动也会被回调。
     sched::arch_hooks::register_vm_switch(&VM_SWITCH_OPS);
 
-    // 5. 注入任务 CPU 状态发布 hook：调度器切到用户任务前用它刷新 rseq。
+    // 7. 注入任务 CPU 状态发布 hook：调度器切到用户任务前用它刷新 rseq。
     sched::arch_hooks::register_task_cpu_state(&TASK_CPU_STATE_OPS);
 
-    // 6. 建 init。sched::init 内部会 assert arch_hooks 已注入。
+    // 8. 建 init。sched::init 内部会 assert arch_hooks 已注入。
     let init = sched::init();
 
     // 7. 把启动期 stash 的 VFS 部件挂到 init 任务上。acpi / dtb 路径若没走过

@@ -495,6 +495,91 @@ fn allocator_reclaim_flushes_slab_cpu_caches() {
     assert_eq!(after.slab_active_objects, before.slab_active_objects);
 }
 
+/// 大规模 small object churn 不能在释放后继续单调吃页，更不能退化成 kheap 整页分配。
+#[ktest]
+fn allocator_reclaim_after_slab_churn_stops_page_growth() {
+    const COUNT: usize = 384;
+
+    KERNEL_ALLOCATOR
+        .reclaim(AllocatorReclaimRequest::caches())
+        .expect("quiesce allocator caches before churn");
+    let before = KERNEL_ALLOCATOR.audit();
+    assert!(before.is_consistent());
+    let baseline = KERNEL_ALLOCATOR.layer_stats();
+
+    run_small_churn_batch::<COUNT>();
+    let first_reclaim = KERNEL_ALLOCATOR
+        .reclaim(AllocatorReclaimRequest::caches())
+        .expect("reclaim after first slab churn");
+    assert!(first_reclaim.slab.flushed_cached_objects > 0);
+    assert!(first_reclaim.slab.reclaimed_slabs > 0);
+
+    let after_first = KERNEL_ALLOCATOR.audit();
+    assert!(after_first.is_consistent());
+    assert_eq!(
+        after_first.registry_live_records,
+        before.registry_live_records
+    );
+    assert_eq!(after_first.slab_live_records, before.slab_live_records);
+    assert_eq!(after_first.slab_active_objects, before.slab_active_objects);
+    let first_layers = KERNEL_ALLOCATOR.layer_stats();
+    assert_eq!(
+        first_layers.kheap.alloc_requests,
+        baseline.kheap.alloc_requests
+    );
+    assert_eq!(
+        first_layers.kheap.active_allocs,
+        baseline.kheap.active_allocs
+    );
+
+    run_small_churn_batch::<COUNT>();
+    let second_reclaim = KERNEL_ALLOCATOR
+        .reclaim(AllocatorReclaimRequest::caches())
+        .expect("reclaim after second slab churn");
+    assert!(second_reclaim.slab.flushed_cached_objects > 0);
+
+    let after_second = KERNEL_ALLOCATOR.audit();
+    assert!(after_second.is_consistent());
+    assert_eq!(
+        after_second.registry_live_records,
+        before.registry_live_records
+    );
+    assert_eq!(after_second.slab_live_records, before.slab_live_records);
+    assert_eq!(after_second.slab_active_objects, before.slab_active_objects);
+    let second_layers = KERNEL_ALLOCATOR.layer_stats();
+    assert_eq!(
+        second_layers.kheap.alloc_requests,
+        baseline.kheap.alloc_requests
+    );
+    assert_eq!(
+        second_layers.kheap.active_allocs,
+        baseline.kheap.active_allocs
+    );
+    assert!(
+        second_layers.slab.active_pages <= first_layers.slab.active_pages,
+        "slab pages kept growing after full reclaim: first={} second={}",
+        first_layers.slab.active_pages,
+        second_layers.slab.active_pages
+    );
+}
+
+fn run_small_churn_batch<const COUNT: usize>() {
+    let mut records = [None; COUNT];
+    for slot in &mut records {
+        let record = KERNEL_ALLOCATOR
+            .allocate(MemoryRequest::new(MemoryDomain::Kernel, 64, 8))
+            .expect("allocate slab churn object");
+        assert_eq!(record.kind, AllocationKind::Small);
+        *slot = Some(record);
+    }
+    for slot in records.iter_mut().rev() {
+        let record = slot.take().expect("record exists");
+        KERNEL_ALLOCATOR
+            .deallocate(record.ptr)
+            .expect("deallocate slab churn object");
+    }
+}
+
 /// reallocate 同尺寸等级时应原地更新账本，不移动对象。
 #[ktest]
 fn reallocate_small_in_place() {

@@ -700,17 +700,17 @@ impl Interface {
                 }),
                 #[cfg(feature = "socket-icmp")]
                 Socket::Icmp(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, response| match response {
+                    socket.dispatch(&mut self.inner, |inner, meta, response| match response {
                         #[cfg(feature = "proto-ipv4")]
                         (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
                             inner,
-                            PacketMeta::default(),
+                            meta,
                             Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr)),
                         ),
                         #[cfg(feature = "proto-ipv6")]
                         (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
                             inner,
-                            PacketMeta::default(),
+                            meta,
                             Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr)),
                         ),
                         #[allow(unreachable_patterns)]
@@ -724,13 +724,11 @@ impl Interface {
                     })
                 }
                 #[cfg(feature = "socket-tcp")]
-                Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond(
-                        inner,
-                        PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Tcp(tcp)),
-                    )
-                }),
+                Socket::Tcp(socket) => {
+                    socket.dispatch(&mut self.inner, |inner, meta, (ip, tcp)| {
+                        respond(inner, meta, Packet::new(ip, IpPayload::Tcp(tcp)))
+                    })
+                }
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
                     socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
@@ -1205,6 +1203,7 @@ impl InterfaceInner {
         // Emit function for the IP header and payload.
         let emit_ip = |repr: &IpRepr, tx_buffer: &mut [u8]| {
             repr.emit(&mut *tx_buffer, &self.caps.checksum);
+            apply_packet_meta(repr, meta, tx_buffer, &self.caps.checksum);
 
             let payload = &mut tx_buffer[repr.header_len()..];
             packet.emit_payload(repr, payload, &caps)
@@ -1246,6 +1245,7 @@ impl InterfaceInner {
 
                         // Save the IP header for other fragments.
                         frag.ipv4.repr = *repr;
+                        frag.ipv4.traffic_class = meta.traffic_class;
 
                         // Save how much bytes we will send now.
                         frag.sent_bytes = first_frag_ip_len;
@@ -1326,6 +1326,32 @@ impl InterfaceInner {
                         Ok(())
                     })
                 }
+            }
+        }
+    }
+}
+
+fn apply_packet_meta(
+    ip_repr: &IpRepr,
+    meta: PacketMeta,
+    tx_buffer: &mut [u8],
+    checksum_caps: &ChecksumCapabilities,
+) {
+    if let Some(traffic_class) = meta.traffic_class {
+        match ip_repr {
+            #[cfg(feature = "proto-ipv4")]
+            IpRepr::Ipv4(_) => {
+                let mut packet = Ipv4Packet::new_unchecked(tx_buffer);
+                packet.set_dscp(traffic_class >> 2);
+                packet.set_ecn(traffic_class & 0x03);
+                if checksum_caps.ipv4.tx() {
+                    packet.fill_checksum();
+                }
+            }
+            #[cfg(feature = "proto-ipv6")]
+            IpRepr::Ipv6(_) => {
+                let mut packet = Ipv6Packet::new_unchecked(tx_buffer);
+                packet.set_traffic_class(traffic_class);
             }
         }
     }

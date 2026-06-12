@@ -9,11 +9,12 @@
 //! - [`insert_entry`] / [`remove_entry`] / [`update_entry`] 支持目录修改。
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::bpb::FatKind;
-use crate::lfn::{decode_lfn_entry, encode_lfn_entry, lfn_checksum, str_to_ucs2, ucs2_to_string};
+use crate::lfn::{
+    decode_lfn_entry_fixed, encode_lfn_entry, lfn_checksum, str_to_ucs2, ucs2_to_string,
+};
 use crate::state::{BlockBackendError, FsState};
 
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
@@ -122,91 +123,33 @@ pub(crate) fn locate_slot(
     }
 }
 
-/// 读一个目录槽(32 字节)到 `out`。返回 `false` 表示槽号超出后端容量。
-pub(crate) fn read_slot(
-    state: &FsState,
-    backing: DirBacking,
-    slot: u32,
-    out: &mut [u8; DIR_ENTRY_SIZE],
-) -> Result<bool, BlockBackendError> {
-    let Some((lba, off)) = locate_slot(state, backing, slot)? else {
-        return Ok(false);
-    };
-    let mut sec = vec![0u8; state.bytes_per_sector as usize];
-    state.backend.read_sectors(lba, 1, &mut sec)?;
-    out.copy_from_slice(&sec[off..off + DIR_ENTRY_SIZE]);
-    Ok(true)
-}
-
-/// 写一个目录槽。槽必须已存在(预先用 [`ensure_slot`] 扩容)。
-pub(crate) fn write_slot(
-    state: &FsState,
-    backing: DirBacking,
-    slot: u32,
-    data: &[u8; DIR_ENTRY_SIZE],
-) -> Result<(), BlockBackendError> {
-    let Some((lba, off)) = locate_slot(state, backing, slot)? else {
-        return Err(BlockBackendError::OutOfRange);
-    };
-    let mut sec = vec![0u8; state.bytes_per_sector as usize];
-    state.backend.read_sectors(lba, 1, &mut sec)?;
-    sec[off..off + DIR_ENTRY_SIZE].copy_from_slice(data);
-    state.backend.write_sectors(lba, 1, &sec)?;
-    Ok(())
-}
-
-/// 确保槽 `slot` 可以容纳:对于簇链型目录,必要时从 FAT 申请新簇并清零;
-/// 对于固定范围(FAT12/16 根目录)无法扩容,会返回 `OutOfRange`。
-pub(crate) fn ensure_slot(
-    state: &FsState,
-    backing: DirBacking,
-    slot: u32,
-) -> Result<(), BlockBackendError> {
-    let bps = state.bytes_per_sector;
-    let entries_per_sector = bps / DIR_ENTRY_SIZE as u32;
-    let sector_no = slot / entries_per_sector;
-    match backing {
-        DirBacking::FixedRange { sector_count, .. } => {
-            if sector_no >= sector_count {
-                Err(BlockBackendError::OutOfRange)
-            } else {
-                Ok(())
-            }
-        }
-        DirBacking::ChainFromCluster(first_cluster) => {
-            let sectors_per_cluster = state.sectors_per_cluster;
-            let cluster_idx = sector_no / sectors_per_cluster;
-            let max_steps = cluster_idx.min(state.total_clusters);
-            let mut cur = first_cluster;
-            for _ in 0..max_steps {
-                match state.fat.next_cluster(state.backend.as_ref(), cur)? {
-                    Some(next) => cur = next,
-                    None => {
-                        let new_c = state.alloc_cluster(Some(cur))?;
-                        zero_cluster(state, new_c)?;
-                        cur = new_c;
-                    }
-                }
-            }
-            if max_steps < cluster_idx {
-                return Err(BlockBackendError::OutOfRange);
-            }
-            Ok(())
-        }
+fn resize_scratch(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if scratch.len() != len {
+        scratch.resize(len, 0);
     }
+    scratch.as_mut_slice()
 }
 
-fn zero_cluster(state: &FsState, cluster: u32) -> Result<(), BlockBackendError> {
+fn zero_cluster_with_scratch(
+    state: &FsState,
+    cluster: u32,
+    scratch: &mut Vec<u8>,
+) -> Result<(), BlockBackendError> {
     let lba = state.cluster_to_lba(cluster)?;
-    let zero = vec![0u8; (state.bytes_per_sector * state.sectors_per_cluster) as usize];
+    let zero = resize_scratch(
+        scratch,
+        (state.bytes_per_sector * state.sectors_per_cluster) as usize,
+    );
+    zero.fill(0);
     state
         .backend
-        .write_sectors(lba, state.sectors_per_cluster, &zero)
+        .write_sectors(lba, state.sectors_per_cluster, zero)
 }
 
-fn scan_dir_sectors<F>(
+fn scan_dir_sectors_with_scratch<F>(
     state: &FsState,
     backing: DirBacking,
+    scratch: &mut Vec<u8>,
     mut f: F,
 ) -> Result<u32, BlockBackendError>
 where
@@ -220,14 +163,14 @@ where
             start_lba,
             sector_count,
         } => {
-            let mut sec = vec![0u8; bps];
+            let sec = resize_scratch(scratch, bps);
             for sec_idx in 0..sector_count {
                 state
                     .backend
-                    .read_sectors(start_lba + sec_idx as u64, 1, &mut sec)?;
+                    .read_sectors(start_lba + sec_idx as u64, 1, sec)?;
                 let slot_base = sec_idx * entries_per_sector;
                 next_slot = slot_base + entries_per_sector;
-                if !f(slot_base, &sec)? {
+                if !f(slot_base, sec)? {
                     break;
                 }
             }
@@ -239,12 +182,12 @@ where
             let mut cluster = first_cluster;
             let mut cluster_index = 0u32;
             let cluster_bytes = (state.bytes_per_sector * state.sectors_per_cluster) as usize;
-            let mut cluster_buf = vec![0u8; cluster_bytes];
+            let cluster_buf = resize_scratch(scratch, cluster_bytes);
             loop {
                 let lba = state.cluster_to_lba(cluster)?;
                 state
                     .backend
-                    .read_sectors(lba, state.sectors_per_cluster, &mut cluster_buf)?;
+                    .read_sectors(lba, state.sectors_per_cluster, cluster_buf)?;
                 let cluster_slot_base =
                     cluster_index * state.sectors_per_cluster * entries_per_sector;
                 for sec_idx in 0..state.sectors_per_cluster {
@@ -268,9 +211,22 @@ where
     Ok(next_slot)
 }
 
-fn parse_dir_entries<F>(
+pub(crate) fn visit_entries<F>(
     state: &FsState,
     backing: DirBacking,
+    mut f: F,
+) -> Result<(), BlockBackendError>
+where
+    F: FnMut(DirEntryView) -> bool,
+{
+    let mut scratch = Vec::new();
+    visit_entries_with_scratch(state, backing, &mut scratch, |entry| f(entry))
+}
+
+pub(crate) fn visit_entries_with_scratch<F>(
+    state: &FsState,
+    backing: DirBacking,
+    scratch: &mut Vec<u8>,
     mut f: F,
 ) -> Result<(), BlockBackendError>
 where
@@ -281,7 +237,7 @@ where
     let mut lfn_checksum_val: u8 = 0;
     let mut lfn_start_slot: Option<u32> = None;
 
-    scan_dir_sectors(state, backing, |slot_base, sec| {
+    scan_dir_sectors_with_scratch(state, backing, scratch, |slot_base, sec| {
         for idx in 0..entries_per_sector {
             let slot = slot_base + idx;
             let off = idx as usize * DIR_ENTRY_SIZE;
@@ -313,12 +269,8 @@ where
                 }
                 let out_idx = (order as usize).saturating_sub(1) * 13;
                 if out_idx + 13 <= lfn_units.len() {
-                    let mut local: Vec<u16> = Vec::with_capacity(13);
-                    let _ = decode_lfn_entry(entry, &mut local);
                     let mut chars13 = [0u16; 13];
-                    for (i, c) in local.into_iter().take(13).enumerate() {
-                        chars13[i] = c;
-                    }
+                    let _ = decode_lfn_entry_fixed(entry, &mut chars13);
                     lfn_units[out_idx..out_idx + 13].copy_from_slice(&chars13);
                 }
                 continue;
@@ -408,17 +360,48 @@ fn decode_sfn(raw: &[u8; 11]) -> String {
     s
 }
 
-/// 完整读取目录的所有有效条目(跳过已删除与卷标)。LFN 会被自动合并。
-pub(crate) fn read_all_entries(
+/// 流式判断目录是否为空,只忽略 FAT 目录规定的 `.` / `..` 项。
+///
+/// `rmdir` 只需要知道是否存在第一个普通条目。这里直接扫描 SFN 槽,避免为整个
+/// 子目录构造 [`DirEntryView`] 和长文件名字符串。
+pub(crate) fn is_dir_empty_with_scratch(
     state: &FsState,
     backing: DirBacking,
-) -> Result<Vec<DirEntryView>, BlockBackendError> {
-    let mut out = Vec::new();
-    parse_dir_entries(state, backing, |entry| {
-        out.push(entry);
-        true
+    scratch: &mut Vec<u8>,
+) -> Result<bool, BlockBackendError> {
+    let entries_per_sector = state.bytes_per_sector / DIR_ENTRY_SIZE as u32;
+    let mut empty = true;
+    scan_dir_sectors_with_scratch(state, backing, scratch, |_, sec| {
+        for idx in 0..entries_per_sector {
+            let off = idx as usize * DIR_ENTRY_SIZE;
+            let entry = &sec[off..off + DIR_ENTRY_SIZE];
+            let first = entry[OFF_NAME];
+            if first == ENTRY_END {
+                return Ok(false);
+            }
+            if first == ENTRY_FREE {
+                continue;
+            }
+            let attr = entry[OFF_ATTR];
+            if attr == ATTR_LFN || attr & ATTR_VOLUME_ID != 0 {
+                continue;
+            }
+            if is_dot_or_dotdot_sfn(entry) {
+                continue;
+            }
+            empty = false;
+            return Ok(false);
+        }
+        Ok(true)
     })?;
-    Ok(out)
+    Ok(empty)
+}
+
+#[inline]
+fn is_dot_or_dotdot_sfn(entry: &[u8]) -> bool {
+    let raw = &entry[OFF_NAME..OFF_NAME + 11];
+    (raw[0] == b'.' && raw[1..].iter().all(|&b| b == b' '))
+        || (raw[0] == b'.' && raw[1] == b'.' && raw[2..].iter().all(|&b| b == b' '))
 }
 
 /// 在目录中直接查找名称,找到后立即停止扫描。
@@ -427,8 +410,18 @@ pub(crate) fn find_entry(
     backing: DirBacking,
     name: &str,
 ) -> Result<Option<DirEntryView>, BlockBackendError> {
+    let mut scratch = Vec::new();
+    find_entry_with_scratch(state, backing, name, &mut scratch)
+}
+
+pub(crate) fn find_entry_with_scratch(
+    state: &FsState,
+    backing: DirBacking,
+    name: &str,
+    scratch: &mut Vec<u8>,
+) -> Result<Option<DirEntryView>, BlockBackendError> {
     let mut found = None;
-    parse_dir_entries(state, backing, |entry| {
+    visit_entries_with_scratch(state, backing, scratch, |entry| {
         if entry.name.eq_ignore_ascii_case(name) {
             found = Some(entry);
             false
@@ -441,14 +434,15 @@ pub(crate) fn find_entry(
 
 /// 单次遍历同时完成:按名称查找 + 收集所有已用 SFN。
 /// 用于 create/mkdir/rename 路径,合并冲突检查与 SFN 冲突避让两次全扫描。
-pub(crate) fn find_entry_and_sfns(
+pub(crate) fn find_entry_and_sfns_with_scratch(
     state: &FsState,
     backing: DirBacking,
     name: &str,
+    scratch: &mut Vec<u8>,
 ) -> Result<(Option<DirEntryView>, Vec<[u8; 11]>), BlockBackendError> {
     let mut found: Option<DirEntryView> = None;
     let mut sfns: Vec<[u8; 11]> = Vec::new();
-    parse_dir_entries(state, backing, |entry| {
+    visit_entries_with_scratch(state, backing, scratch, |entry| {
         sfns.push(entry.short_name);
         if found.is_none() && entry.name.eq_ignore_ascii_case(name) {
             found = Some(entry);
@@ -458,80 +452,39 @@ pub(crate) fn find_entry_and_sfns(
     Ok((found, sfns))
 }
 
-/// 在目录中查找连续 `need` 个空闲(或 0x00 终止)槽,从 0 号槽开始扫描。
-/// 若 backing 是簇链且没找到,会返回 `Ok(end_slot)` 标记需要扩容的起点。
-pub(crate) fn find_free_slots(
-    state: &FsState,
-    backing: DirBacking,
-    need: u32,
-) -> Result<u32, BlockBackendError> {
-    if need == 0 {
-        return Err(BlockBackendError::OutOfRange);
-    }
-    let mut run_start: u32 = 0;
-    let mut run_len: u32 = 0;
-    let mut found = None;
-    let mut end_slot: u32 = 0;
-    let entries_per_sector = state.bytes_per_sector / DIR_ENTRY_SIZE as u32;
-
-    scan_dir_sectors(state, backing, |slot_base, sec| {
-        for idx in 0..entries_per_sector {
-            let slot = slot_base + idx;
-            let off = idx as usize * DIR_ENTRY_SIZE;
-            let first = sec[off + OFF_NAME];
-            end_slot = slot.saturating_add(1);
-            if first == ENTRY_END {
-                found = Some(if run_len > 0 { run_start } else { slot });
-                return Ok(false);
-            }
-            if first == ENTRY_FREE {
-                if run_len == 0 {
-                    run_start = slot;
-                }
-                run_len += 1;
-                if run_len >= need {
-                    found = Some(run_start);
-                    return Ok(false);
-                }
-            } else {
-                run_len = 0;
-            }
-        }
-        Ok(true)
-    })?;
-
-    if let Some(slot) = found {
-        Ok(slot)
-    } else if matches!(backing, DirBacking::FixedRange { .. }) {
-        Err(BlockBackendError::OutOfRange)
-    } else {
-        Ok(end_slot)
-    }
-}
-
-fn write_slots(
+/// 顺序写入 LFN 切片和 SFN 条目,避免为拼接目录项再分配临时 `Vec`。
+fn write_new_entry_slots_with_scratch(
     state: &FsState,
     backing: DirBacking,
     start: u32,
-    entries: &[[u8; DIR_ENTRY_SIZE]],
+    lfn_entries: &[[u8; DIR_ENTRY_SIZE]],
+    sfn_entry: &[u8; DIR_ENTRY_SIZE],
+    scratch: &mut Vec<u8>,
 ) -> Result<(), BlockBackendError> {
     let bps = state.bytes_per_sector as usize;
+    let total = lfn_entries.len() + 1;
     let mut index = 0usize;
-    while index < entries.len() {
+    let sec = resize_scratch(scratch, bps);
+    while index < total {
         let slot = start
             .checked_add(index as u32)
             .ok_or(BlockBackendError::OutOfRange)?;
         let Some((lba, off)) = locate_slot(state, backing, slot)? else {
             return Err(BlockBackendError::OutOfRange);
         };
-        let fit = ((bps - off) / DIR_ENTRY_SIZE).min(entries.len() - index);
-        let mut sec = vec![0u8; bps];
-        state.backend.read_sectors(lba, 1, &mut sec)?;
+        let fit = ((bps - off) / DIR_ENTRY_SIZE).min(total - index);
+        state.backend.read_sectors(lba, 1, sec)?;
         for i in 0..fit {
             let dst = off + i * DIR_ENTRY_SIZE;
-            sec[dst..dst + DIR_ENTRY_SIZE].copy_from_slice(&entries[index + i]);
+            let entry_index = index + i;
+            let entry = if entry_index < lfn_entries.len() {
+                &lfn_entries[entry_index]
+            } else {
+                sfn_entry
+            };
+            sec[dst..dst + DIR_ENTRY_SIZE].copy_from_slice(entry);
         }
-        state.backend.write_sectors(lba, 1, &sec)?;
+        state.backend.write_sectors(lba, 1, sec)?;
         index += fit;
     }
     Ok(())
@@ -598,49 +551,138 @@ pub(crate) fn build_entries_for_name(
     (sfn, entries)
 }
 
-/// 新建一条目录项:在 `backing` 里找(或扩容)足够的连续槽,顺序写入
-/// 全部 LFN 条目 + SFN 条目。返回 SFN 所在的槽号。
-pub(crate) fn insert_new_entry(
+/// 新建一条目录项并复用调用方的目录扫描/写入缓冲。
+/// 返回 SFN 所在的槽号。
+pub(crate) fn insert_new_entry_with_scratch(
     state: &FsState,
     backing: DirBacking,
     lfn_entries: &[[u8; DIR_ENTRY_SIZE]],
     sfn_entry: &[u8; DIR_ENTRY_SIZE],
+    scratch: &mut Vec<u8>,
 ) -> Result<u32, BlockBackendError> {
     let need = (lfn_entries.len() + 1) as u32;
-    let start = find_free_slots(state, backing, need)?;
-    ensure_slot(state, backing, start + need - 1)?;
-    let mut entries = Vec::with_capacity(need as usize);
-    entries.extend_from_slice(lfn_entries);
-    entries.push(*sfn_entry);
+    let start = find_free_slots_with_scratch(state, backing, need, scratch)?;
+    ensure_slot_with_scratch(state, backing, start + need - 1, scratch)?;
     let sfn_slot = start + lfn_entries.len() as u32;
-    write_slots(state, backing, start, &entries)?;
+    write_new_entry_slots_with_scratch(state, backing, start, lfn_entries, sfn_entry, scratch)?;
     Ok(sfn_slot)
 }
 
-/// 把 `[slot_start, slot_end]`(闭区间)的条目都打上 `0xE5`。
-pub(crate) fn remove_entry_slots(
+fn find_free_slots_with_scratch(
+    state: &FsState,
+    backing: DirBacking,
+    need: u32,
+    scratch: &mut Vec<u8>,
+) -> Result<u32, BlockBackendError> {
+    if need == 0 {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    let mut run_start: u32 = 0;
+    let mut run_len: u32 = 0;
+    let mut found = None;
+    let mut end_slot: u32 = 0;
+    let entries_per_sector = state.bytes_per_sector / DIR_ENTRY_SIZE as u32;
+
+    scan_dir_sectors_with_scratch(state, backing, scratch, |slot_base, sec| {
+        for idx in 0..entries_per_sector {
+            let slot = slot_base + idx;
+            let off = idx as usize * DIR_ENTRY_SIZE;
+            let first = sec[off + OFF_NAME];
+            end_slot = slot.saturating_add(1);
+            if first == ENTRY_END {
+                found = Some(if run_len > 0 { run_start } else { slot });
+                return Ok(false);
+            }
+            if first == ENTRY_FREE {
+                if run_len == 0 {
+                    run_start = slot;
+                }
+                run_len += 1;
+                if run_len >= need {
+                    found = Some(run_start);
+                    return Ok(false);
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        Ok(true)
+    })?;
+
+    if let Some(slot) = found {
+        Ok(slot)
+    } else if matches!(backing, DirBacking::FixedRange { .. }) {
+        Err(BlockBackendError::OutOfRange)
+    } else {
+        Ok(end_slot)
+    }
+}
+
+fn ensure_slot_with_scratch(
+    state: &FsState,
+    backing: DirBacking,
+    slot: u32,
+    scratch: &mut Vec<u8>,
+) -> Result<(), BlockBackendError> {
+    let bps = state.bytes_per_sector;
+    let entries_per_sector = bps / DIR_ENTRY_SIZE as u32;
+    let sector_no = slot / entries_per_sector;
+    match backing {
+        DirBacking::FixedRange { sector_count, .. } => {
+            if sector_no >= sector_count {
+                Err(BlockBackendError::OutOfRange)
+            } else {
+                Ok(())
+            }
+        }
+        DirBacking::ChainFromCluster(first_cluster) => {
+            let sectors_per_cluster = state.sectors_per_cluster;
+            let cluster_idx = sector_no / sectors_per_cluster;
+            let max_steps = cluster_idx.min(state.total_clusters);
+            let mut cur = first_cluster;
+            for _ in 0..max_steps {
+                match state.fat.next_cluster(state.backend.as_ref(), cur)? {
+                    Some(next) => cur = next,
+                    None => {
+                        let new_c = state.alloc_cluster(Some(cur))?;
+                        zero_cluster_with_scratch(state, new_c, scratch)?;
+                        cur = new_c;
+                    }
+                }
+            }
+            if max_steps < cluster_idx {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 把 `[slot_start, slot_end]` 标记为空闲,并复用调用方扇区缓冲。
+pub(crate) fn remove_entry_slots_with_scratch(
     state: &FsState,
     backing: DirBacking,
     slot_start: u32,
     slot_end: u32,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), BlockBackendError> {
     if slot_end < slot_start {
         return Ok(());
     }
     let bps = state.bytes_per_sector as usize;
     let mut slot = slot_start;
+    let sec = resize_scratch(scratch, bps);
     while slot <= slot_end {
         let Some((lba, off)) = locate_slot(state, backing, slot)? else {
             break;
         };
         let remain = (slot_end - slot + 1) as usize;
         let fit = ((bps - off) / DIR_ENTRY_SIZE).min(remain);
-        let mut sec = vec![0u8; bps];
-        state.backend.read_sectors(lba, 1, &mut sec)?;
+        state.backend.read_sectors(lba, 1, sec)?;
         for i in 0..fit {
             sec[off + i * DIR_ENTRY_SIZE] = ENTRY_FREE;
         }
-        state.backend.write_sectors(lba, 1, &sec)?;
+        state.backend.write_sectors(lba, 1, sec)?;
         slot = slot
             .checked_add(fit as u32)
             .ok_or(BlockBackendError::OutOfRange)?;
@@ -648,18 +690,21 @@ pub(crate) fn remove_entry_slots(
     Ok(())
 }
 
-/// 原地更新 SFN 条目的 size / first_cluster / 时间字段。
-pub(crate) fn update_sfn_metadata(
+/// 原地更新 SFN 元数据,并复用调用方扇区缓冲。
+pub(crate) fn update_sfn_metadata_with_scratch(
     state: &FsState,
     backing: DirBacking,
     sfn_slot: u32,
     first_cluster: u32,
     size: u32,
+    scratch: &mut Vec<u8>,
 ) -> Result<(), BlockBackendError> {
-    let mut buf = [0u8; DIR_ENTRY_SIZE];
-    if !read_slot(state, backing, sfn_slot, &mut buf)? {
+    let Some((lba, off)) = locate_slot(state, backing, sfn_slot)? else {
         return Err(BlockBackendError::OutOfRange);
-    }
+    };
+    let sec = resize_scratch(scratch, state.bytes_per_sector as usize);
+    state.backend.read_sectors(lba, 1, sec)?;
+    let buf = &mut sec[off..off + DIR_ENTRY_SIZE];
     let hi = (first_cluster >> 16) as u16;
     let lo = first_cluster as u16;
     buf[OFF_CLUSTER_HI..OFF_CLUSTER_HI + 2].copy_from_slice(&hi.to_le_bytes());
@@ -669,7 +714,7 @@ pub(crate) fn update_sfn_metadata(
     buf[OFF_MTIME..OFF_MTIME + 2].copy_from_slice(&t.to_le_bytes());
     buf[OFF_MDATE..OFF_MDATE + 2].copy_from_slice(&d.to_le_bytes());
     buf[OFF_ADATE..OFF_ADATE + 2].copy_from_slice(&d.to_le_bytes());
-    write_slot(state, backing, sfn_slot, &buf)
+    state.backend.write_sectors(lba, 1, sec)
 }
 
 /// 构造一个 SFN 条目的 32 字节:给定 11 字节 SFN、属性、first_cluster、size。

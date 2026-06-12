@@ -26,8 +26,130 @@ pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
 pub const F_SEAL_ALL: u32 =
     F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
 
-struct MemfdInner {
+const MEMFD_PAGE_SIZE: usize = 4096;
+const MEMFD_PAGE_SIZE_U64: u64 = MEMFD_PAGE_SIZE as u64;
+
+struct MemfdPage {
+    index: u64,
     data: Vec<u8>,
+}
+
+struct MemfdFileData {
+    size: u64,
+    pages: Vec<MemfdPage>,
+}
+
+impl MemfdFileData {
+    const fn new() -> Self {
+        Self {
+            size: 0,
+            pages: Vec::new(),
+        }
+    }
+
+    fn blocks(&self) -> u64 {
+        (self.pages.len() as u64 * MEMFD_PAGE_SIZE_U64).div_ceil(512)
+    }
+
+    fn truncate(&mut self, new_size: u64) {
+        if new_size < self.size {
+            let keep_pages = new_size.div_ceil(MEMFD_PAGE_SIZE_U64);
+            self.pages.retain(|page| page.index < keep_pages);
+            if new_size % MEMFD_PAGE_SIZE_U64 != 0 {
+                let tail_index = new_size / MEMFD_PAGE_SIZE_U64;
+                let tail_offset = (new_size % MEMFD_PAGE_SIZE_U64) as usize;
+                if let Some(pos) = self.page_pos(tail_index).ok() {
+                    self.pages[pos].data[tail_offset..].fill(0);
+                }
+            }
+        }
+        self.size = new_size;
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> usize {
+        if offset >= self.size || buf.is_empty() {
+            return 0;
+        }
+        let end = offset.saturating_add(buf.len() as u64).min(self.size);
+        let n = (end - offset) as usize;
+        let out = &mut buf[..n];
+        out.fill(0);
+
+        let first_page = offset / MEMFD_PAGE_SIZE_U64;
+        let last_page = (end - 1) / MEMFD_PAGE_SIZE_U64;
+        for page_index in first_page..=last_page {
+            let Ok(pos) = self.page_pos(page_index) else {
+                continue;
+            };
+            let page_start = page_index * MEMFD_PAGE_SIZE_U64;
+            let copy_start = offset.max(page_start);
+            let copy_end = end.min(page_start + MEMFD_PAGE_SIZE_U64);
+            let src_start = (copy_start - page_start) as usize;
+            let dst_start = (copy_start - offset) as usize;
+            let len = (copy_end - copy_start) as usize;
+            out[dst_start..dst_start + len]
+                .copy_from_slice(&self.pages[pos].data[src_start..src_start + len]);
+        }
+        n
+    }
+
+    fn write_at(&mut self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+
+        let mut written = 0usize;
+        while written < buf.len() {
+            let file_off = offset + written as u64;
+            let page_index = file_off / MEMFD_PAGE_SIZE_U64;
+            let page_offset = (file_off % MEMFD_PAGE_SIZE_U64) as usize;
+            let chunk = (MEMFD_PAGE_SIZE - page_offset).min(buf.len() - written);
+            let page = match self.get_or_create_page(page_index) {
+                Ok(page) => page,
+                Err(_) if written != 0 => {
+                    self.size = self.size.max(offset + written as u64);
+                    return Ok(written);
+                }
+                Err(err) => return Err(err),
+            };
+            page[page_offset..page_offset + chunk].copy_from_slice(&buf[written..written + chunk]);
+            written += chunk;
+        }
+
+        self.size = self.size.max(end);
+        Ok(written)
+    }
+
+    fn page_pos(&self, index: u64) -> Result<usize, usize> {
+        self.pages.binary_search_by_key(&index, |page| page.index)
+    }
+
+    fn get_or_create_page(&mut self, index: u64) -> VfsResult<&mut [u8]> {
+        match self.page_pos(index) {
+            Ok(pos) => Ok(self.pages[pos].data.as_mut_slice()),
+            Err(pos) => {
+                self.pages
+                    .try_reserve(1)
+                    .map_err(|_| VfsError::OutOfMemory)?;
+                let mut data = Vec::new();
+                data.try_reserve_exact(MEMFD_PAGE_SIZE)
+                    .map_err(|_| VfsError::OutOfMemory)?;
+                data.resize(MEMFD_PAGE_SIZE, 0);
+                self.pages.insert(pos, MemfdPage { index, data });
+                Ok(self.pages[pos].data.as_mut_slice())
+            }
+        }
+    }
+}
+
+struct MemfdInner {
+    file: MemfdFileData,
     seals: u32,
     inode: Option<Weak<Inode>>,
 }
@@ -43,7 +165,7 @@ impl MemfdState {
         let seals = if allow_sealing { 0 } else { F_SEAL_SEAL };
         Self {
             inner: Spinlock::new(MemfdInner {
-                data: Vec::new(),
+                file: MemfdFileData::new(),
                 seals,
                 inode: None,
             }),
@@ -58,8 +180,7 @@ impl MemfdState {
 
     fn update_inode_size(inner: &MemfdInner) {
         if let Some(inode) = inner.inode.as_ref().and_then(Weak::upgrade) {
-            let size = inner.data.len() as u64;
-            inode.set_size_and_blocks(size, size.div_ceil(512));
+            inode.set_size_and_blocks(inner.file.size, inner.file.blocks());
         }
     }
 
@@ -80,16 +201,18 @@ impl MemfdState {
     }
 
     fn truncate(&self, size: u64) -> VfsResult<()> {
-        let size = usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?;
+        if size > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
         let mut inner = self.inner.lock();
-        let old_len = inner.data.len();
-        if size < old_len && (inner.seals & F_SEAL_SHRINK) != 0 {
+        let old_size = inner.file.size;
+        if size < old_size && (inner.seals & F_SEAL_SHRINK) != 0 {
             return Err(VfsError::OperationNotPermitted);
         }
-        if size > old_len && (inner.seals & F_SEAL_GROW) != 0 {
+        if size > old_size && (inner.seals & F_SEAL_GROW) != 0 {
             return Err(VfsError::OperationNotPermitted);
         }
-        inner.data.resize(size, 0);
+        inner.file.truncate(size);
         Self::update_inode_size(&inner);
         drop(inner);
         self.waiters.wake_all();
@@ -140,14 +263,8 @@ impl MemfdFileOps {
 
 impl FileOps for MemfdFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        let offset = usize::try_from(offset).map_err(|_| VfsError::InvalidArgument)?;
         let inner = self.state.inner.lock();
-        if offset >= inner.data.len() {
-            return Ok(0);
-        }
-        let n = buf.len().min(inner.data.len() - offset);
-        buf[..n].copy_from_slice(&inner.data[offset..offset + n]);
-        Ok(n)
+        Ok(inner.file.read_at(buf, offset))
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
@@ -156,24 +273,26 @@ impl FileOps for MemfdFileOps {
             return Err(VfsError::OperationNotPermitted);
         }
         let offset = if offset == u64::MAX {
-            inner.data.len()
+            inner.file.size
         } else {
-            usize::try_from(offset).map_err(|_| VfsError::FileTooLarge)?
+            if offset > usize::MAX as u64 {
+                return Err(VfsError::FileTooLarge);
+            }
+            offset
         };
         let end = offset
-            .checked_add(buf.len())
+            .checked_add(buf.len() as u64)
             .ok_or(VfsError::FileTooLarge)?;
-        if end > inner.data.len() && (inner.seals & F_SEAL_GROW) != 0 {
+        if end > inner.file.size && (inner.seals & F_SEAL_GROW) != 0 {
             return Err(VfsError::OperationNotPermitted);
         }
-        if end > inner.data.len() {
-            inner.data.resize(end, 0);
-        }
-        inner.data[offset..end].copy_from_slice(buf);
+        let written = inner.file.write_at(buf, offset)?;
         Self::state_update_inode_size(&inner);
         drop(inner);
-        self.state.waiters.wake_all();
-        Ok(buf.len())
+        if written != 0 {
+            self.state.waiters.wake_all();
+        }
+        Ok(written)
     }
 
     fn readdir(
@@ -207,6 +326,8 @@ impl FileOps for MemfdFileOps {
 
     fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        // memfd/tmpfs backing is sparse: reserve logical size here and allocate
+        // real pages lazily when data is written or a shared mmap page is dirtied.
         self.state.truncate(end)
     }
 

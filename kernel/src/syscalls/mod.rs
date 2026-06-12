@@ -14,7 +14,13 @@ mod process;
 mod signal;
 mod syslog;
 
+use alloc::sync::Arc;
 use general::syscall::register_syscall;
+use sched::Task;
+
+pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
+    process::cleanup_task_before_exit(task);
+}
 
 pub fn register_all() {
     // 文件 I/O
@@ -407,8 +413,5 @@ pub fn register_all() {
     register_syscall(nr::SYS_PIDFD_SEND_SIGNAL, signal::sys_pidfd_send_signal);
 
     let registered = general::syscall::registered_count();
-    log::info!(
-        "[syscalls] registered {} entries",
-        registered
-    );
+    log::info!("[syscalls] registered {} entries", registered);
 }

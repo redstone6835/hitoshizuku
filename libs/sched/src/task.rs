@@ -43,6 +43,90 @@ use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
 use crate::wait_flags::WaitStatus;
 
+static TASK_LIVE: AtomicUsize = AtomicUsize::new(0);
+static TASK_CREATED: AtomicUsize = AtomicUsize::new(0);
+static TASK_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static TASK_TRACKER: Spinlock<Vec<Weak<Task>>> = Spinlock::new(Vec::new());
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TaskDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+    pub tracked_alive: usize,
+    pub zombie: usize,
+    pub dead: usize,
+    pub pidless: usize,
+    pub child_links: usize,
+    pub dead_child_links: usize,
+    pub max_external_refs: usize,
+    pub dead_external_refs: usize,
+    pub shared_pending_infos: usize,
+    pub max_shared_pending_infos: usize,
+    pub dead_ref_sample_pid: PidT,
+    pub dead_ref_sample_parent_pid: PidT,
+    pub dead_ref_sample_refs: usize,
+    pub dead_ref_sample_on_rq: bool,
+    pub dead_ref_sample_has_ctx: bool,
+    pub dead_ref_sample_has_kstack: bool,
+    pub dead_ref_sample_exts: usize,
+    pub dead_ref_sample_comm: [u8; TASK_COMM_LEN],
+}
+
+pub fn task_diag() -> TaskDiag {
+    let mut diag = TaskDiag {
+        live: TASK_LIVE.load(Ordering::Acquire),
+        created: TASK_CREATED.load(Ordering::Acquire),
+        dropped: TASK_DROPPED.load(Ordering::Acquire),
+        ..TaskDiag::default()
+    };
+    let mut tracker = TASK_TRACKER.lock();
+    tracker.retain(|weak| weak.strong_count() != 0);
+    for weak in tracker.iter() {
+        let Some(task) = weak.upgrade() else {
+            continue;
+        };
+        diag.tracked_alive += 1;
+        let external_refs = Arc::strong_count(&task).saturating_sub(1);
+        diag.max_external_refs = diag.max_external_refs.max(external_refs);
+        if task.pid_root().is_none() {
+            diag.pidless += 1;
+        }
+        let rel = task.rel.lock();
+        diag.child_links = diag.child_links.saturating_add(rel.children.len());
+        diag.dead_child_links = diag.dead_child_links.saturating_add(
+            rel.children
+                .iter()
+                .filter(|child| matches!(child.state(), TaskState::Zombie | TaskState::Dead))
+                .count(),
+        );
+        drop(rel);
+        let shared_pending = task.shared_signal().pending_len_hint();
+        diag.shared_pending_infos = diag.shared_pending_infos.saturating_add(shared_pending);
+        diag.max_shared_pending_infos = diag.max_shared_pending_infos.max(shared_pending);
+        match task.state() {
+            TaskState::Zombie => diag.zombie += 1,
+            TaskState::Dead => {
+                diag.dead += 1;
+                diag.dead_external_refs = diag.dead_external_refs.saturating_add(external_refs);
+                if external_refs > diag.dead_ref_sample_refs {
+                    diag.dead_ref_sample_pid = task.pid_root().unwrap_or(0);
+                    diag.dead_ref_sample_parent_pid =
+                        task.parent().and_then(|p| p.pid_root()).unwrap_or(0);
+                    diag.dead_ref_sample_refs = external_refs;
+                    diag.dead_ref_sample_on_rq = task.sched.on_rq();
+                    diag.dead_ref_sample_has_ctx = task.ctx.lock().is_some();
+                    diag.dead_ref_sample_has_kstack = task.kstack.lock().is_some();
+                    diag.dead_ref_sample_exts = task.ext.lock().len();
+                    diag.dead_ref_sample_comm = *task.comm.lock();
+                }
+            }
+            _ => {}
+        }
+    }
+    diag
+}
+
 /// Linux 线程名长度，包含结尾 NUL。
 pub const TASK_COMM_LEN: usize = 16;
 const DEFAULT_COMM: [u8; TASK_COMM_LEN] =
@@ -163,6 +247,28 @@ impl TaskState {
             6 => Self::Continued,
             7 => Self::Zombie,
             _ => Self::Dead,
+        }
+    }
+}
+
+/// 任务来源类型。
+///
+/// 用户态任务参与 POSIX 信号、进程组和 wait 语义；内核线程/idle 只属于调度器
+/// 内部，不应被用户态 signal/exit_group/wait 路径影响。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TaskKind {
+    User = 0,
+    KernelThread = 1,
+    Idle = 2,
+}
+
+impl TaskKind {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::KernelThread,
+            2 => Self::Idle,
+            _ => Self::User,
         }
     }
 }
@@ -298,6 +404,9 @@ struct Relations {
 /// arch ctx、ext 侧表）各自独立小锁。
 pub struct Task {
     pub sched: SchedEntity,
+    /// 用户任务和内核任务的生命周期域不同。该字段用于把内核线程从 POSIX
+    /// signal/exit_group/wait 模型中隔离出去。
+    kind: AtomicU8,
     state: AtomicU8,
     exit_code: AtomicI32,
     has_exit_code: AtomicU8,
@@ -354,6 +463,12 @@ pub struct Task {
     /// 子系统侧表：VFS context / fdtable 等通过 [`TaskExtKey`] 挂载。
     /// 详见模块级 [`TaskExtCloneHook`]。
     ext: Spinlock<Vec<TaskExt>>,
+    /// 退出清理是否已经运行。exit、最终切换和 wait/reap 都可能观察到同一个任务，
+    /// 必须只让上层 ext hook 执行一次。
+    ext_exit_cleaned: AtomicBool,
+    /// 进入退出态前的用户态线程 ABI 清理是否已经运行。该阶段仍可访问用户地址空间，
+    /// 用于 clear-child-tid、robust futex 等必须在释放 VM 前完成的动作。
+    pre_exit_cleaned: AtomicBool,
 }
 
 impl Task {
@@ -370,8 +485,11 @@ impl Task {
         process_group: Arc<ProcessGroup>,
     ) -> Arc<Self> {
         let shared = Arc::clone(thread_group.shared_signal());
-        Arc::new(Self {
+        TASK_CREATED.fetch_add(1, Ordering::Relaxed);
+        TASK_LIVE.fetch_add(1, Ordering::Relaxed);
+        let task = Arc::new(Self {
             sched: SchedEntity::new(params),
+            kind: AtomicU8::new(TaskKind::User as u8),
             state: AtomicU8::new(TaskState::New as u8),
             exit_code: AtomicI32::new(0),
             has_exit_code: AtomicU8::new(0),
@@ -411,11 +529,40 @@ impl Task {
             current_cpu: AtomicUsize::new(0),
             ioprio: AtomicU32::new(0),
             ext: Spinlock::new(Vec::new()),
-        })
+            ext_exit_cleaned: AtomicBool::new(false),
+            pre_exit_cleaned: AtomicBool::new(false),
+        });
+        TASK_TRACKER.lock().push(Arc::downgrade(&task));
+        task
     }
 
     pub fn state(&self) -> TaskState {
         TaskState::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn kind(&self) -> TaskKind {
+        TaskKind::from_u8(self.kind.load(Ordering::Acquire))
+    }
+
+    pub fn is_user_task(&self) -> bool {
+        self.kind() == TaskKind::User
+    }
+
+    pub fn is_kernel_task(&self) -> bool {
+        !self.is_user_task()
+    }
+
+    pub fn is_idle_task(&self) -> bool {
+        self.kind() == TaskKind::Idle
+    }
+
+    pub(crate) fn mark_kernel_thread(&self) {
+        self.kind
+            .store(TaskKind::KernelThread as u8, Ordering::Release);
+    }
+
+    pub(crate) fn mark_idle_task(&self) {
+        self.kind.store(TaskKind::Idle as u8, Ordering::Release);
     }
 
     /// 直接覆盖状态。仅供调度器内部在已经建立同步关系（持有 rq 锁或 CAS 成功）后使用。
@@ -485,8 +632,10 @@ impl Task {
     /// 调用方负责把任务从 runqueue 移除并向父投递 SIGCHLD。
     pub fn mark_exited(&self, code: ExitCode) {
         self.exit_code.store(code.0, Ordering::Release);
-        self.exited_usage_ns
-            .store(self.elapsed_usage_ns(crate::scheduler::now_ns_public()), Ordering::Release);
+        self.exited_usage_ns.store(
+            self.elapsed_usage_ns(crate::scheduler::now_ns_public()),
+            Ordering::Release,
+        );
         if self.exit_reason.load(Ordering::Acquire) == EXIT_REASON_NONE {
             self.exit_reason
                 .store(EXIT_REASON_EXITED, Ordering::Release);
@@ -693,6 +842,44 @@ impl Task {
         self.kstack.lock().as_ref().map(|s| s.top())
     }
 
+    /// 释放已经不会再运行的任务执行上下文。
+    ///
+    /// 只能在任务最终切离 CPU 后调用。Zombie 仍需保留 wait/proc 可见的轻量状态，
+    /// 但内核栈和 arch context 已不再需要，继续挂在 Task 上会让父进程 wait 前
+    /// 每个 zombie 至少保留一段内核栈。
+    pub(crate) fn retire_execution(&self) {
+        *self.ctx.lock() = None;
+        *self.kstack.lock() = None;
+    }
+
+    /// 释放退出任务不再需要的上层扩展状态。
+    ///
+    /// 这个动作必须幂等：当前任务最终切离 CPU、父进程 wait/reap、以及非当前任务被
+    /// exit_group 杀掉时都可能来到这里。wait 可见的 pid/exit status/comm 等轻量状态
+    /// 保留在 Task 本体中，VM/FDT/VFS 等重量级状态交给 kernel 注册的 hook 移除。
+    pub(crate) fn cleanup_exit_extensions(self: &Arc<Self>) {
+        if self.ext_exit_cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(hook) = ext_exit_hook() {
+            hook.cleanup_on_exit(self);
+        }
+    }
+
+    /// 在任务进入 Zombie/Dead 前运行一次上层用户态退出清理。
+    ///
+    /// 与 [`cleanup_exit_extensions`] 不同，这个 hook 必须在 VmSpace/FdTable 等
+    /// 上层扩展仍挂在 task 上时执行；robust futex 和 CLONE_CHILD_CLEARTID 都依赖
+    /// 这个时序。
+    pub(crate) fn cleanup_before_exit(self: &Arc<Self>) {
+        if self.pre_exit_cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(hook) = pre_exit_hook() {
+            hook.cleanup_before_exit(self);
+        }
+    }
+
     /// 确保当前任务拥有一段内核 trap 栈，并返回栈顶。
     ///
     /// boot init 任务是通过 [`Task::adopt_current_context`] 接管当前上下文的，
@@ -886,8 +1073,7 @@ impl Task {
     }
 
     pub fn set_sched_reset_on_fork(&self, enabled: bool) {
-        self.sched_reset_on_fork
-            .store(enabled, Ordering::Release);
+        self.sched_reset_on_fork.store(enabled, Ordering::Release);
     }
 
     // ── CPU 亲和性 ───────────────────────────────────────────────────────
@@ -956,6 +1142,13 @@ impl Task {
     }
 }
 
+impl Drop for Task {
+    fn drop(&mut self) {
+        TASK_DROPPED.fetch_add(1, Ordering::Relaxed);
+        TASK_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 // ── TaskExt 侧表 ────────────────────────────────────────────────────────────
 
 /// 子系统标识：每个上层子系统申请一个唯一 key 来挂状态。
@@ -995,7 +1188,23 @@ pub trait TaskExtCloneHook: Send + Sync {
     ) -> Arc<dyn Any + Send + Sync>;
 }
 
+/// task 进入退出态时由上层释放跨子系统的大对象。
+///
+/// sched crate 不认识 VmSpace / FdTable / VfsContext 的具体类型，只负责在
+/// `exit_task` 的安全边界调用此 hook。hook 不应释放内核栈和 arch context：
+/// 当前任务可能正运行在这段栈上，最终释放由调度切换后的 Arc drop 完成。
+pub trait TaskExtExitHook: Send + Sync {
+    fn cleanup_on_exit(&self, task: &Arc<Task>);
+}
+
+/// task 进入退出态前由上层执行用户态 ABI 清理。
+pub trait TaskPreExitHook: Send + Sync {
+    fn cleanup_before_exit(&self, task: &Arc<Task>);
+}
+
 static EXT_CLONE_HOOK: Spinlock<Option<&'static dyn TaskExtCloneHook>> = Spinlock::new(None);
+static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
+static PRE_EXIT_HOOK: Spinlock<Option<&'static dyn TaskPreExitHook>> = Spinlock::new(None);
 
 /// 注册全局 ext clone hook。kernel 启动期调用一次。
 pub fn register_ext_clone_hook(hook: &'static dyn TaskExtCloneHook) {
@@ -1007,16 +1216,6 @@ pub fn ext_clone_hook() -> Option<&'static dyn TaskExtCloneHook> {
     *EXT_CLONE_HOOK.lock()
 }
 
-/// 任务退出时由上层清理挂在 ext 表里的退出期资源。
-///
-/// sched 只保留 wait/reap 需要的 Task 元数据；fdtable 这类会保活外部对象的
-/// 资源不应被 Zombie 任务保活到父进程 wait 之后。
-pub trait TaskExtExitHook: Send + Sync {
-    fn cleanup_on_exit(&self, task: &Arc<Task>);
-}
-
-static EXT_EXIT_HOOK: Spinlock<Option<&'static dyn TaskExtExitHook>> = Spinlock::new(None);
-
 /// 注册全局 ext exit hook。kernel 启动期调用一次。
 pub fn register_ext_exit_hook(hook: &'static dyn TaskExtExitHook) {
     *EXT_EXIT_HOOK.lock() = Some(hook);
@@ -1025,4 +1224,14 @@ pub fn register_ext_exit_hook(hook: &'static dyn TaskExtExitHook) {
 /// 取已注册的 exit hook；未注册返回 `None`。
 pub fn ext_exit_hook() -> Option<&'static dyn TaskExtExitHook> {
     *EXT_EXIT_HOOK.lock()
+}
+
+/// 注册全局 pre-exit hook。kernel 启动期调用一次。
+pub fn register_pre_exit_hook(hook: &'static dyn TaskPreExitHook) {
+    *PRE_EXIT_HOOK.lock() = Some(hook);
+}
+
+/// 取已注册的 pre-exit hook；未注册返回 `None`。
+pub fn pre_exit_hook() -> Option<&'static dyn TaskPreExitHook> {
+    *PRE_EXIT_HOOK.lock()
 }

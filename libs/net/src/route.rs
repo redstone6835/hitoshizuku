@@ -71,6 +71,22 @@ impl RouteEntry {
             metric: 10,
         }
     }
+
+    /// 构造静态 IPv6 路由。
+    pub fn static_v6(
+        destination: Ipv6Addr,
+        prefix_len: u8,
+        gateway: Ipv6Addr,
+        iface: InterfaceId,
+    ) -> Self {
+        Self {
+            destination: CidrAddress::new_v6(destination, prefix_len),
+            iface,
+            next_hop: NextHop::Gateway(IpAddr::V6(gateway)),
+            source: RouteSource::Static,
+            metric: 10,
+        }
+    }
 }
 
 /// 路由查询结果。
@@ -166,6 +182,24 @@ impl RouteTable {
                 destination: CidrAddress::new_v4(Ipv4Addr::UNSPECIFIED, 0),
                 iface,
                 next_hop: NextHop::Gateway(IpAddr::V4(gateway)),
+                source: RouteSource::Gateway,
+                metric: 100,
+            });
+        }
+    }
+
+    /// 替换指定接口的 IPv6 默认网关，不影响同接口 IPv4 默认网关。
+    pub fn replace_gateway_v6(&mut self, iface: InterfaceId, gateway: Option<Ipv6Addr>) {
+        self.entries.retain(|entry| {
+            !(entry.iface == iface
+                && entry.source == RouteSource::Gateway
+                && matches!(entry.destination.addr, IpAddr::V6(_)))
+        });
+        if let Some(gateway) = gateway {
+            self.upsert(RouteEntry {
+                destination: CidrAddress::new_v6(Ipv6Addr::UNSPECIFIED, 0),
+                iface,
+                next_hop: NextHop::Gateway(IpAddr::V6(gateway)),
                 source: RouteSource::Gateway,
                 metric: 100,
             });
@@ -380,6 +414,24 @@ mod tests {
     }
 
     #[test]
+    fn static_ipv6_route_is_normalized_and_removable() {
+        let mut table = RouteTable::new();
+        let route_iface = iface(8);
+        let dest = Ipv6Addr::new([0x2001, 0x0db8, 0x1234, 0xabcd, 0, 0, 0, 1]);
+        let gateway = Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1]);
+        let remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x1234, 0xffff, 0, 0, 0, 99]));
+
+        table.upsert(RouteEntry::static_v6(dest, 48, gateway, route_iface));
+        let route = table.lookup(&remote).unwrap();
+        assert_eq!(route.iface, route_iface);
+        assert_eq!(route.prefix_len, 48);
+        assert_eq!(route.next_hop, NextHop::Gateway(IpAddr::V6(gateway)));
+
+        table.remove_static(route_iface, CidrAddress::new_v6(dest, 48));
+        assert_eq!(table.lookup(&remote), None);
+    }
+
+    #[test]
     fn ipv4_gateway_replace_preserves_ipv6_default_route() {
         let mut table = RouteTable::new();
         table.replace_gateway(
@@ -396,7 +448,42 @@ mod tests {
             .unwrap();
         let v6 = table.lookup(&IpAddr::V6(Ipv6Addr::LOCALHOST)).unwrap();
 
-        assert_eq!(v4.next_hop, NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254))));
-        assert_eq!(v6.next_hop, NextHop::Gateway(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(
+            v4.next_hop,
+            NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 254)))
+        );
+        assert_eq!(
+            v6.next_hop,
+            NextHop::Gateway(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn ipv6_gateway_replace_preserves_ipv4_default_route() {
+        let mut table = RouteTable::new();
+        table.replace_gateway(
+            iface(4),
+            Some(Gateway::DualStack {
+                v4: Ipv4Addr::new(10, 0, 0, 1),
+                v6: Ipv6Addr::LOCALHOST,
+            }),
+        );
+        let replacement = Ipv6Addr::new([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1]);
+        table.replace_gateway_v6(iface(4), Some(replacement));
+
+        let v4 = table
+            .lookup(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
+            .unwrap();
+        let v6 = table
+            .lookup(&IpAddr::V6(Ipv6Addr::new([
+                0x2001, 0x0db8, 0x1234, 0, 0, 0, 0, 1,
+            ])))
+            .unwrap();
+
+        assert_eq!(
+            v4.next_hop,
+            NextHop::Gateway(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+        assert_eq!(v6.next_hop, NextHop::Gateway(IpAddr::V6(replacement)));
     }
 }

@@ -61,6 +61,24 @@ static SHARED_FILE_PAGES: spin::Mutex<BTreeMap<SharedFilePageKey, Weak<ResidentP
 static SHARED_ANON_PAGES: spin::Mutex<BTreeMap<SharedAnonPageKey, Weak<ResidentPage>>> =
     spin::Mutex::new(BTreeMap::new());
 static NEXT_SHARED_ANON_ID: AtomicUsize = AtomicUsize::new(1);
+static VM_SPACE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static VM_SPACE_CREATED: AtomicUsize = AtomicUsize::new(0);
+static VM_SPACE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VmSpaceDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn vm_space_diag() -> VmSpaceDiag {
+    VmSpaceDiag {
+        live: VM_SPACE_LIVE.load(Ordering::Acquire),
+        created: VM_SPACE_CREATED.load(Ordering::Acquire),
+        dropped: VM_SPACE_DROPPED.load(Ordering::Acquire),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SharedFilePageKey {
@@ -132,6 +150,7 @@ struct PageMapping {
 
 enum ResidentPageKind {
     Anon,
+    SharedAnon,
     PrivateFile,
     SharedFile {
         file: Arc<dyn FileLike>,
@@ -151,6 +170,14 @@ impl ResidentPage {
         Arc::new(Self {
             paddr,
             kind: ResidentPageKind::Anon,
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    fn new_shared_anon(paddr: usize) -> Arc<Self> {
+        Arc::new(Self {
+            paddr,
+            kind: ResidentPageKind::SharedAnon,
             dirty: AtomicBool::new(false),
         })
     }
@@ -185,6 +212,18 @@ impl ResidentPage {
 
     fn is_direct(&self) -> bool {
         matches!(self.kind, ResidentPageKind::Direct)
+    }
+
+    fn is_shared_anon(&self) -> bool {
+        matches!(self.kind, ResidentPageKind::SharedAnon)
+    }
+
+    fn is_sysv_shm(&self) -> bool {
+        matches!(&self.kind, ResidentPageKind::SharedFile { file, .. } if file.is_sysv_shm())
+    }
+
+    fn is_direct_shared_writable(&self) -> bool {
+        self.is_direct() || self.is_shared_anon() || self.is_sysv_shm()
     }
 
     fn mark_dirty(&self) {
@@ -258,6 +297,8 @@ impl VmSpace {
         let ops = user_pgd_ops().expect("[mm] user_pgd_ops not registered");
         let layout = vm_layout();
         let pgd = (ops.new_pgd_for_user)();
+        VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
+        VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             vmas: spin::Mutex::new(VmaSet::new()),
             pages: spin::Mutex::new(BTreeMap::new()),
@@ -367,6 +408,35 @@ impl VmSpace {
 
     pub fn is_range_free(&self, range: Range<usize>) -> bool {
         self.validate_range(&range).is_ok() && self.vmas.lock().is_range_free(&range)
+    }
+
+    /// 检查一段用户地址是否被可读用户 VMA 连续覆盖。
+    ///
+    /// 这个接口不触发缺页，也不承诺页表页已经常驻；它只用于 syscall 在访问用户
+    /// 指针前做快速结构性校验，避免退出清理这类不可失败路径卡在明显损坏的链表上。
+    pub fn is_user_range_readable(&self, addr: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        let range = addr..end;
+        let set = self.vmas.lock();
+        let mut cursor = range.start;
+        for area in set.iter_overlap(&range) {
+            if area.range.start > cursor {
+                return false;
+            }
+            if !area.flags.contains_all(VmFlags::USER | VmFlags::READ) {
+                return false;
+            }
+            cursor = cursor.max(area.range.end.min(range.end));
+            if cursor >= range.end {
+                return true;
+            }
+        }
+        false
     }
 
     /// 按 `shmdt` 的入口地址查找一整段 SysV shm 映射。
@@ -905,6 +975,8 @@ impl VmSpace {
         Self::notify_files_mapped(cloned_file_backings);
 
         let mapped_pages = child_pages.len();
+        VM_SPACE_CREATED.fetch_add(1, Ordering::Relaxed);
+        VM_SPACE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             vmas: spin::Mutex::new(cloned_set),
             pages: spin::Mutex::new(child_pages),
@@ -1057,6 +1129,12 @@ impl VmSpace {
             Err(err) => return fault_from_errno(err),
         };
         let mut access = access_for_new_page(flags, &page);
+        if page.is_sysv_shm() && flags.has(VmFlags::WRITE) {
+            // SysV shm is a shared memory object, not a regular file mapping.
+            // Keep it writable across fork, but conservatively flush it back if
+            // the last resident page disappears before another attach faults it.
+            page.mark_dirty();
+        }
         if is_write_fault(kind) && matches!(access, PageAccess::SharedTracked) {
             page.mark_dirty();
             access = PageAccess::Writable;
@@ -1178,7 +1256,11 @@ impl VmSpace {
             self.unmap_page(old_va)?;
             let new_va = new_start + (old_va - old_start);
             let area = set.find(new_va).ok_or(Errno::ENOMEM)?;
-            self.map_page(new_va, mapping.page.paddr(), pte_flags_for(area.flags, mapping.access))?;
+            self.map_page(
+                new_va,
+                mapping.page.paddr(),
+                pte_flags_for(area.flags, mapping.access),
+            )?;
             pages.insert(new_va, mapping);
         }
         self.mapped_pages.store(pages.len(), Ordering::Release);
@@ -1252,6 +1334,8 @@ impl VmSpace {
 
 impl Drop for VmSpace {
     fn drop(&mut self) {
+        VM_SPACE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        VM_SPACE_LIVE.fetch_sub(1, Ordering::Relaxed);
         let files = {
             let vmas = self.vmas.lock();
             Self::collect_file_backings(vmas.iter())
@@ -1267,7 +1351,7 @@ impl Drop for VmSpace {
 }
 
 fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
-    if page.is_direct() {
+    if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
         } else {
@@ -1284,7 +1368,7 @@ fn access_for_new_page(flags: VmFlags, page: &ResidentPage) -> PageAccess {
 }
 
 fn access_for_existing_page(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
-    if page.is_direct() {
+    if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
         } else {
@@ -1303,7 +1387,7 @@ fn access_for_existing_page(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAcc
 }
 
 fn access_after_fork(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
-    if page.is_direct() {
+    if page.is_direct_shared_writable() {
         return if flags.has(VmFlags::WRITE) {
             PageAccess::Writable
         } else {
@@ -1357,7 +1441,7 @@ fn shared_anon_page(id: usize, offset: u64) -> Result<Arc<ResidentPage>, Errno> 
         }
     }
     let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
-    let page = ResidentPage::new_anon(paddr);
+    let page = ResidentPage::new_shared_anon(paddr);
     SHARED_ANON_PAGES.lock().insert(key, Arc::downgrade(&page));
     Ok(page)
 }

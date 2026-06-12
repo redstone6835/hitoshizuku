@@ -27,6 +27,8 @@ use crate::layout::*;
 use crate::state::{BlockBackendError, FsState, map_err};
 use crate::{alloc_mod, dir_wr, extent_wr, map_wr};
 
+const I_BLOCK_BYTES: usize = 60;
+
 /// on-disk inode 摘要(由 [`load_inode`] 返回)。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -89,7 +91,15 @@ pub(crate) fn load_inode(
 
 #[inline]
 pub(crate) fn i_block_slice(raw: &[u8]) -> &[u8] {
-    &raw[0x28..0x28 + 60]
+    &raw[0x28..0x28 + I_BLOCK_BYTES]
+}
+
+/// 复制 inode 的 `i_block[0..60]` 到栈上固定数组,避免元数据热路径反复分配小 `Vec`。
+#[inline]
+fn copy_i_block(i_block: &[u8]) -> [u8; I_BLOCK_BYTES] {
+    let mut out = [0u8; I_BLOCK_BYTES];
+    out.copy_from_slice(i_block);
+    out
 }
 
 /// 当 `EXT4_INLINE_DATA_FL` 启用时,尝试读出内联数据。
@@ -179,9 +189,9 @@ impl ExtInodeOps {
         parse_inode_meta(&g.bytes)
     }
 
-    fn snapshot_i_block(&self) -> Vec<u8> {
+    fn snapshot_i_block(&self) -> [u8; I_BLOCK_BYTES] {
         let g = self.raw.lock();
-        i_block_slice(&g.bytes).to_vec()
+        copy_i_block(i_block_slice(&g.bytes))
     }
 
     #[allow(dead_code)]
@@ -189,9 +199,9 @@ impl ExtInodeOps {
         self.raw.lock().flags()
     }
 
-    fn snapshot_all(&self) -> (u32, u64, Vec<u8>) {
+    fn snapshot_all(&self) -> (u32, u64, [u8; I_BLOCK_BYTES]) {
         let g = self.raw.lock();
-        (g.flags(), g.size(), i_block_slice(&g.bytes).to_vec())
+        (g.flags(), g.size(), copy_i_block(i_block_slice(&g.bytes)))
     }
 
     fn check_writable(&self) -> VfsResult<()> {
@@ -324,7 +334,7 @@ impl InodeOps for ExtInodeOps {
 
         // 在父目录插 entry
         let mut parent = self.raw.lock();
-        let mut i_block = parent.i_block().to_vec();
+        let mut i_block = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
@@ -384,7 +394,7 @@ impl InodeOps for ExtInodeOps {
 
         // 父目录:插 entry + nlink++
         let mut parent = self.raw.lock();
-        let mut pi_block = parent.i_block().to_vec();
+        let mut pi_block = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
@@ -418,7 +428,7 @@ impl InodeOps for ExtInodeOps {
         }
         // 1) 从父目录移除 entry
         let mut parent = self.raw.lock();
-        let pi_block = parent.i_block().to_vec();
+        let pi_block = copy_i_block(parent.i_block());
         let pflags = parent.flags();
         let ok = dir_wr::remove_entry(&self.state, &pi_block, pflags, parent.size(), name)
             .map_err(map_err)?;
@@ -439,7 +449,7 @@ impl InodeOps for ExtInodeOps {
         let nl = traw.nlink().saturating_sub(1);
         traw.set_nlink(nl);
         if nl == 0 {
-            let mut ib = traw.i_block().to_vec();
+            let mut ib = copy_i_block(traw.i_block());
             let mut flags = traw.flags();
             extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
             map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
@@ -472,19 +482,16 @@ impl InodeOps for ExtInodeOps {
             .ok_or(VfsError::InvalidArgument)?;
         {
             let traw = t_ops.raw.lock();
-            let tib = i_block_slice(&traw.bytes).to_vec();
-            let entries =
-                crate::dir::read_all_entries(&self.state, &tib, traw.flags(), traw.size())
-                    .map_err(map_err)?;
-            for e in &entries {
-                if e.name != "." && e.name != ".." {
-                    return Err(VfsError::DirectoryNotEmpty);
-                }
+            let tib = copy_i_block(i_block_slice(&traw.bytes));
+            if !crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
+                .map_err(map_err)?
+            {
+                return Err(VfsError::DirectoryNotEmpty);
             }
         }
         // 从父目录移除
         let mut parent = self.raw.lock();
-        let pib = parent.i_block().to_vec();
+        let pib = copy_i_block(parent.i_block());
         let pflags = parent.flags();
         dir_wr::remove_entry(&self.state, &pib, pflags, parent.size(), name).map_err(map_err)?;
         parent.i_block_mut().copy_from_slice(&pib);
@@ -497,7 +504,7 @@ impl InodeOps for ExtInodeOps {
 
         // 释放目标目录的所有数据块 + inode
         let mut traw = t_ops.raw.lock();
-        let mut ib = traw.i_block().to_vec();
+        let mut ib = copy_i_block(traw.i_block());
         let mut flags = traw.flags();
         extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
         map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
@@ -556,7 +563,7 @@ impl InodeOps for ExtInodeOps {
 
         // 父目录插 entry
         let mut parent = self.raw.lock();
-        let mut pib = parent.i_block().to_vec();
+        let mut pib = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
@@ -613,7 +620,7 @@ impl InodeOps for ExtInodeOps {
             FileType::Directory => unreachable!(),
         };
         let mut parent = self.raw.lock();
-        let mut pib = parent.i_block().to_vec();
+        let mut pib = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
@@ -664,15 +671,12 @@ impl InodeOps for ExtInodeOps {
                     .downcast_ops::<ExtInodeOps>()
                     .ok_or(VfsError::InvalidArgument)?;
                 let traw = eops.raw.lock();
-                let tib = i_block_slice(&traw.bytes).to_vec();
-                let entries =
-                    crate::dir::read_all_entries(&self.state, &tib, traw.flags(), traw.size())
-                        .map_err(map_err)?;
+                let tib = copy_i_block(i_block_slice(&traw.bytes));
+                let empty = crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
+                    .map_err(map_err)?;
                 drop(traw);
-                for e in &entries {
-                    if e.name != "." && e.name != ".." {
-                        return Err(VfsError::DirectoryNotEmpty);
-                    }
+                if !empty {
+                    return Err(VfsError::DirectoryNotEmpty);
                 }
                 if !target_is_dir {
                     // 源不是目录、目标是目录:禁止
@@ -699,7 +703,7 @@ impl InodeOps for ExtInodeOps {
         };
         if cross_dir {
             let mut ndir = new_dir_ops.raw.lock();
-            let mut ib = ndir.i_block().to_vec();
+            let mut ib = copy_i_block(ndir.i_block());
             let mut flags = ndir.flags();
             let new_size = dir_wr::insert_entry(
                 &self.state,
@@ -725,7 +729,7 @@ impl InodeOps for ExtInodeOps {
         // 从源目录移除 old_name 条目;跨目录时顺手减 nlink
         {
             let mut parent = self.raw.lock();
-            let mut ib = parent.i_block().to_vec();
+            let mut ib = copy_i_block(parent.i_block());
             let mut flags = parent.flags();
             dir_wr::remove_entry(&self.state, &ib, flags, parent.size(), old_name)
                 .map_err(map_err)?;
@@ -760,7 +764,7 @@ impl InodeOps for ExtInodeOps {
                 .ok_or(VfsError::InvalidArgument)?;
             let tib = {
                 let g = tops.raw.lock();
-                (i_block_slice(&g.bytes).to_vec(), g.flags())
+                (copy_i_block(i_block_slice(&g.bytes)), g.flags())
             };
             dir_wr::update_dotdot(&self.state, &tib.0, tib.1, new_dir_ops.ino).map_err(map_err)?;
         }
@@ -780,7 +784,7 @@ impl InodeOps for ExtInodeOps {
         }
         let block_size = self.state.ext_sb.block_size as u64;
         if new_size < cur_size {
-            let mut ib = raw.i_block().to_vec();
+            let mut ib = copy_i_block(raw.i_block());
             let mut flags = raw.flags();
             // extent 文件先降级成间接布局再做精确释放
             extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
@@ -866,15 +870,12 @@ impl InodeOps for ExtInodeOps {
         let meta = self.snapshot_meta();
         let kind = file_type_from_mode(meta.mode);
         match kind {
-            FileType::Directory => {
-                let entries =
-                    crate::dir::read_all_entries(&self.state, &i_block_owned, flags, size)
-                        .map_err(map_err)?;
-                Ok(Box::new(crate::file::ExtDirFileOps::new_with_state(
-                    entries,
-                    &self.state,
-                )))
-            }
+            FileType::Directory => Ok(Box::new(crate::file::ExtDirFileOps::new_with_state(
+                &self.state,
+                &i_block_owned,
+                flags,
+                size,
+            )?)),
             FileType::Regular => {
                 let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
                 Ok(Box::new(crate::file::ExtRegFileOps::new(

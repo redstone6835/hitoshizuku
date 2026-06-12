@@ -13,8 +13,7 @@ use spin::mutex::Mutex;
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
 pub use crate::dev::naming::{
-    StableName as FunctionProjectionName,
-    StableNameAllocError as FunctionProjectionNameAllocError,
+    StableName as FunctionProjectionName, StableNameAllocError as FunctionProjectionNameAllocError,
     StableNameAllocator as FunctionProjectionNameAllocator,
 };
 

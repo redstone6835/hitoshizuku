@@ -18,8 +18,8 @@ use vfs::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 use vfs::inode::{Inode, InodeOps};
 
 use crate::dev::rtc::{
-    RtcAlarm, RtcControlRequest, RtcControlResponse, RtcDateTime, RtcDevice, RtcError,
-    RtcIrqData, RtcIrqFlags,
+    RtcAlarm, RtcControlRequest, RtcControlResponse, RtcDateTime, RtcDevice, RtcError, RtcIrqData,
+    RtcIrqFlags,
 };
 use crate::vfs::device_files::spec::CustomDevNodeSpec;
 use crate::vfs::devtmpfs::{

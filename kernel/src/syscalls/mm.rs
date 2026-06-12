@@ -359,7 +359,7 @@ pub(super) fn sys_mseal(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
-    let payload = ctx.task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    let payload = ctx.task().ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
 
@@ -421,10 +421,7 @@ fn page_aligned_range(addr: usize, len: usize) -> Result<core::ops::Range<usize>
     Ok(addr..end)
 }
 
-fn rounded_page_range(
-    addr: usize,
-    len: usize,
-) -> Result<Option<core::ops::Range<usize>>, Errno> {
+fn rounded_page_range(addr: usize, len: usize) -> Result<Option<core::ops::Range<usize>>, Errno> {
     if len == 0 {
         return Ok(None);
     }

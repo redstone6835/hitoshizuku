@@ -295,6 +295,8 @@ pub(crate) struct Ipv4Fragmenter {
     /// The destination hardware address.
     #[cfg(feature = "medium-ethernet")]
     pub dst_hardware_addr: EthernetAddress,
+    /// 所有分片继承的出站 traffic class。
+    pub traffic_class: Option<u8>,
     /// The offset of the next fragment.
     pub frag_offset: u16,
     /// The identifier of the stream.
@@ -337,6 +339,7 @@ impl Fragmenter {
                 },
                 #[cfg(feature = "medium-ethernet")]
                 dst_hardware_addr: EthernetAddress::default(),
+                traffic_class: None,
                 frag_offset: 0,
                 ident: 0,
             },
@@ -383,6 +386,7 @@ impl Fragmenter {
             {
                 self.ipv4.dst_hardware_addr = EthernetAddress::default();
             }
+            self.ipv4.traffic_class = None;
         }
 
         #[cfg(feature = "proto-sixlowpan-fragmentation")]

@@ -40,6 +40,11 @@ pub struct BootAllocator {
     pos: AtomicUsize,
     /// 是否已经完成初始化。
     initialized: AtomicBool,
+    /// 是否已经结束启动期分配。
+    ///
+    /// 正式 allocator 接管后，boot allocator 的未用尾部会被归还给 buddy。此后继续
+    /// 从 boot 区域分配会破坏 buddy 所有权，因此 sealed 状态下 `alloc()` 必须失败。
+    sealed: AtomicBool,
 }
 
 impl BootAllocator {
@@ -52,6 +57,7 @@ impl BootAllocator {
             end: AtomicUsize::new(0),
             pos: AtomicUsize::new(0),
             initialized: AtomicBool::new(false),
+            sealed: AtomicBool::new(false),
         }
     }
 
@@ -64,6 +70,7 @@ impl BootAllocator {
         self.start.store(start, Ordering::Release);
         self.pos.store(start, Ordering::Release);
         self.end.store(end, Ordering::Release);
+        self.sealed.store(false, Ordering::Release);
         self.initialized.store(true, Ordering::Release);
     }
 
@@ -77,7 +84,7 @@ impl BootAllocator {
     /// 使用无锁 CAS 循环推进游标，保证在单核或尚未建立正式锁机制的多核早期阶段也能
     /// 安全使用。如果剩余空间不足，返回空指针。
     pub fn alloc(&self, layout: Layout) -> *mut u8 {
-        if !self.is_initialized() {
+        if !self.is_initialized() || self.sealed.load(Ordering::Acquire) {
             return null_mut();
         }
 
@@ -101,6 +108,38 @@ impl BootAllocator {
                 Err(_) => continue,
             }
         }
+    }
+
+    /// 结束启动期分配，并取出可归还给正式物理页分配器的整页尾部。
+    ///
+    /// 返回的区间仍是 boot allocator 原本记录的地址空间（当前平台为直接映射虚拟地址），
+    /// 调用方负责在交给 buddy 前转换成物理地址。只归还 `pos` 之后的完整页；包含已用
+    /// 字节的部分页会保留为 boot used，避免释放仍可能存放早期元数据的页。
+    pub fn seal_and_take_free_tail(&self, page_size: usize) -> Option<BootReclaimRange> {
+        if !self.is_initialized() || page_size == 0 || !page_size.is_power_of_two() {
+            self.sealed.store(true, Ordering::Release);
+            return None;
+        }
+
+        self.sealed.store(true, Ordering::Release);
+
+        let start = self.start.load(Ordering::Acquire);
+        let end = self.end.load(Ordering::Acquire);
+        let pos = self.pos.load(Ordering::Acquire).clamp(start, end);
+        let reclaim_start = align_up(pos, page_size).min(end);
+        let reclaim_end = align_down(end, page_size);
+
+        // 收缩统计窗口，使 /proc/meminfo 不再把已移交的尾部显示为 BootFree。
+        self.pos.store(reclaim_start, Ordering::Release);
+        self.end.store(reclaim_start, Ordering::Release);
+
+        if reclaim_start >= reclaim_end {
+            return None;
+        }
+        Some(BootReclaimRange {
+            start: reclaim_start,
+            size: reclaim_end - reclaim_start,
+        })
     }
 
     /// 检查给定地址是否落在启动期内存区间内。
@@ -134,10 +173,28 @@ impl BootAllocator {
     }
 }
 
+/// Boot allocator 已移交给正式物理页分配器的地址区间。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BootReclaimRange {
+    pub start: usize,
+    pub size: usize,
+}
+
+impl BootReclaimRange {
+    pub const fn end(self) -> usize {
+        self.start.saturating_add(self.size)
+    }
+}
+
 /// 将给定值向上对齐到指定对齐边界。
 ///
 /// `align` 必须是 2 的幂，调用者负责保证这一点。
 #[inline]
 fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
+}
+
+#[inline]
+fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
 }
