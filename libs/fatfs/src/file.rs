@@ -9,7 +9,6 @@
 //! `offset == u64::MAX` 区分;调用方持锁,与读路径不混叠。
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::ops::ControlFlow;
@@ -22,10 +21,17 @@ use vfs::stat::FileType;
 use vfs::superblock::Superblock;
 use vfs::sync::Spinlock;
 
-use crate::dir::{ATTR_DIRECTORY, DirEntryView};
+use crate::dir::{self, ATTR_DIRECTORY, DirBacking};
 use crate::inode::FileInodeOps;
 use crate::state::FsState;
 use crate::sync_layer::backend_to_vfs;
+
+/// 句柄级簇链缓存的连续预取窗口。
+///
+/// bench 的 4K x1024 覆盖写每次只请求一个簇,如果只按需追一跳 FAT 链,会把
+/// FAT entry 读取和锁开销放大到每次 write_at。小批量预取连续簇可把顺序小 I/O
+/// 合并成少量 FAT 扫描,同时避免一次随机读把整条大文件链都缓存下来。
+const CHAIN_CACHE_PREFETCH_CLUSTERS: u32 = 64;
 
 // ── 目录 FileOps ─────────────────────────────────────────────────────────
 
@@ -34,11 +40,14 @@ pub struct DirFileOps {
 }
 
 impl DirFileOps {
-    pub(crate) fn new(entries: Vec<DirEntryView>) -> Self {
-        let snapshot = entries
-            .into_iter()
-            .filter(|e| !e.is_volume())
-            .map(|e| DirEntry {
+    pub(crate) fn new(state: &FsState, backing: DirBacking) -> VfsResult<Self> {
+        let mut snapshot = Vec::new();
+        // 保持打开目录时快照的语义,但扫描时直接生成 VFS DirEntry,避免中间 Vec。
+        dir::visit_entries(state, backing, |e| {
+            if e.is_volume() {
+                return true;
+            }
+            snapshot.push(DirEntry {
                 ino: if e.first_cluster >= 2 {
                     e.first_cluster as u64
                 } else {
@@ -50,11 +59,13 @@ impl DirFileOps {
                 } else {
                     FileType::Regular
                 },
-            })
-            .collect();
-        Self {
+            });
+            true
+        })
+        .map_err(backend_to_vfs)?;
+        Ok(Self {
             snapshot: Spinlock::new(snapshot),
-        }
+        })
     }
 }
 
@@ -101,8 +112,48 @@ pub struct RegFileOps {
     sb: Arc<Superblock>,
     ino: u64,
     chain_cache: Spinlock<ChainCache>,
+    scratch: IoScratch,
     /// 串行化 append 与扩容(避免两条 O_APPEND 同时读到旧 EOF 再写同位置)。
     io_mu: Spinlock<()>,
+}
+
+/// 文件句柄内的临时 I/O 缓冲区。
+///
+/// 非扇区对齐的读写需要先读出边界扇区再局部修改。这里把临时缓冲区以
+/// `Option<Vec<u8>>` 的形式缓存起来:取出缓冲区后立即释放锁,磁盘 I/O 在锁外
+/// 完成,归还时再短暂加锁。因此并发读写最多退化为一次临时分配,不会共享同一
+/// 个可变缓冲区,也不会在自旋锁临界区里等待块设备。
+struct IoScratch {
+    slot: Spinlock<Option<Vec<u8>>>,
+}
+
+impl IoScratch {
+    const fn new() -> Self {
+        Self {
+            slot: Spinlock::new(None),
+        }
+    }
+
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut buf = self.slot.lock().take().unwrap_or_default();
+        if buf.len() != len {
+            buf.resize(len, 0);
+        }
+        buf
+    }
+
+    fn take_zeroed(&self, len: usize) -> Vec<u8> {
+        let mut buf = self.take(len);
+        buf.fill(0);
+        buf
+    }
+
+    fn recycle(&self, buf: Vec<u8>) {
+        let mut slot = self.slot.lock();
+        if slot.is_none() {
+            *slot = Some(buf);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -128,6 +179,7 @@ impl RegFileOps {
             sb,
             ino,
             chain_cache: Spinlock::new(ChainCache::default()),
+            scratch: IoScratch::new(),
             io_mu: Spinlock::new(()),
         }
     }
@@ -202,7 +254,7 @@ impl RegFileOps {
 
     fn ensure_cached_cluster(&self, first_cluster: u32, target_idx: u32) -> VfsResult<bool> {
         loop {
-            let last = {
+            let (last_idx, last) = {
                 let mut cache = self.chain_cache.lock();
                 if cache.first_cluster != first_cluster || cache.clusters.is_empty() {
                     cache.reset(first_cluster);
@@ -210,8 +262,25 @@ impl RegFileOps {
                 if cache.clusters.len() > target_idx as usize {
                     return Ok(true);
                 }
-                *cache.clusters.last().ok_or(VfsError::Io)?
+                let last_idx = cache.clusters.len().saturating_sub(1) as u32;
+                (last_idx, *cache.clusters.last().ok_or(VfsError::Io)?)
             };
+
+            let missing = target_idx
+                .saturating_add(1)
+                .saturating_sub(last_idx.saturating_add(1));
+            let max_run = missing
+                .saturating_add(CHAIN_CACHE_PREFETCH_CLUSTERS)
+                .saturating_add(1);
+            let run = self
+                .state
+                .fat
+                .contiguous_run(self.state.backend.as_ref(), last, max_run)
+                .map_err(backend_to_vfs)?;
+            if run > 1 {
+                self.extend_contiguous_cache(first_cluster, last_idx, last, run);
+                continue;
+            }
 
             let Some(next) = self
                 .state
@@ -232,57 +301,110 @@ impl RegFileOps {
 
     fn read_run(&self, cluster: u32, in_cluster: u64, out: &mut [u8]) -> VfsResult<()> {
         let bps = self.state.bytes_per_sector as u64;
+        let bps_usize = self.state.bytes_per_sector as usize;
         let start_lba = self.state.cluster_to_lba(cluster).map_err(backend_to_vfs)?;
-        let len = out.len() as u64;
-        let aligned = in_cluster.is_multiple_of(bps) && len.is_multiple_of(bps);
-        let start_sector = in_cluster / bps;
-        if aligned {
+        let mut done = 0usize;
+        let mut disk_off = in_cluster;
+
+        // 头部非对齐扇区只能读-拷贝需要的窗口,后续对齐部分直接读入用户缓冲。
+        if !disk_off.is_multiple_of(bps) {
+            let sector_off = (disk_off % bps) as usize;
+            let take = (bps_usize - sector_off).min(out.len());
+            let mut sector = self.scratch.take(bps_usize);
             self.state
                 .backend
-                .read_sectors(start_lba + start_sector, (len / bps) as u32, out)
+                .read_sectors(start_lba + disk_off / bps, 1, &mut sector)
                 .map_err(backend_to_vfs)?;
-            return Ok(());
+            out[..take].copy_from_slice(&sector[sector_off..sector_off + take]);
+            self.scratch.recycle(sector);
+            done += take;
+            disk_off += take as u64;
         }
 
-        let end_sector = (in_cluster + len).div_ceil(bps);
-        let sector_count = (end_sector - start_sector) as u32;
-        let mut chunk = vec![0u8; (sector_count as u64 * bps) as usize];
-        self.state
-            .backend
-            .read_sectors(start_lba + start_sector, sector_count, &mut chunk)
-            .map_err(backend_to_vfs)?;
-        let chunk_off = (in_cluster - start_sector * bps) as usize;
-        out.copy_from_slice(&chunk[chunk_off..chunk_off + out.len()]);
+        let aligned_len = ((out.len() - done) / bps_usize) * bps_usize;
+        if aligned_len != 0 {
+            self.state
+                .backend
+                .read_sectors(
+                    start_lba + disk_off / bps,
+                    (aligned_len / bps_usize) as u32,
+                    &mut out[done..done + aligned_len],
+                )
+                .map_err(backend_to_vfs)?;
+            done += aligned_len;
+            disk_off += aligned_len as u64;
+        }
+
+        if done < out.len() {
+            let take = out.len() - done;
+            let mut sector = self.scratch.take(bps_usize);
+            self.state
+                .backend
+                .read_sectors(start_lba + disk_off / bps, 1, &mut sector)
+                .map_err(backend_to_vfs)?;
+            out[done..].copy_from_slice(&sector[..take]);
+            self.scratch.recycle(sector);
+        }
         Ok(())
     }
 
     fn write_run(&self, cluster: u32, in_cluster: u64, data: &[u8]) -> VfsResult<()> {
         let bps = self.state.bytes_per_sector as u64;
+        let bps_usize = self.state.bytes_per_sector as usize;
         let start_lba = self.state.cluster_to_lba(cluster).map_err(backend_to_vfs)?;
-        let len = data.len() as u64;
-        let aligned = in_cluster.is_multiple_of(bps) && len.is_multiple_of(bps);
-        let start_sector = in_cluster / bps;
-        if aligned {
+        let mut done = 0usize;
+        let mut disk_off = in_cluster;
+
+        // 只对头尾非对齐扇区做读-改-写,中间完整扇区直接提交给后端。
+        if !disk_off.is_multiple_of(bps) {
+            let sector_off = (disk_off % bps) as usize;
+            let take = (bps_usize - sector_off).min(data.len());
+            let lba = start_lba + disk_off / bps;
+            let mut sector = self.scratch.take(bps_usize);
             self.state
                 .backend
-                .write_sectors(start_lba + start_sector, (len / bps) as u32, data)
+                .read_sectors(lba, 1, &mut sector)
                 .map_err(backend_to_vfs)?;
-            return Ok(());
+            sector[sector_off..sector_off + take].copy_from_slice(&data[..take]);
+            self.state
+                .backend
+                .write_sectors(lba, 1, &sector)
+                .map_err(backend_to_vfs)?;
+            self.scratch.recycle(sector);
+            done += take;
+            disk_off += take as u64;
         }
 
-        let end_sector = (in_cluster + len).div_ceil(bps);
-        let sector_count = (end_sector - start_sector) as u32;
-        let mut chunk = vec![0u8; (sector_count as u64 * bps) as usize];
-        self.state
-            .backend
-            .read_sectors(start_lba + start_sector, sector_count, &mut chunk)
-            .map_err(backend_to_vfs)?;
-        let chunk_off = (in_cluster - start_sector * bps) as usize;
-        chunk[chunk_off..chunk_off + data.len()].copy_from_slice(data);
-        self.state
-            .backend
-            .write_sectors(start_lba + start_sector, sector_count, &chunk)
-            .map_err(backend_to_vfs)
+        let aligned_len = ((data.len() - done) / bps_usize) * bps_usize;
+        if aligned_len != 0 {
+            self.state
+                .backend
+                .write_sectors(
+                    start_lba + disk_off / bps,
+                    (aligned_len / bps_usize) as u32,
+                    &data[done..done + aligned_len],
+                )
+                .map_err(backend_to_vfs)?;
+            done += aligned_len;
+            disk_off += aligned_len as u64;
+        }
+
+        if done < data.len() {
+            let take = data.len() - done;
+            let lba = start_lba + disk_off / bps;
+            let mut sector = self.scratch.take(bps_usize);
+            self.state
+                .backend
+                .read_sectors(lba, 1, &mut sector)
+                .map_err(backend_to_vfs)?;
+            sector[..take].copy_from_slice(&data[done..]);
+            self.state
+                .backend
+                .write_sectors(lba, 1, &sector)
+                .map_err(backend_to_vfs)?;
+            self.scratch.recycle(sector);
+        }
+        Ok(())
     }
 }
 
@@ -406,7 +528,6 @@ impl RegFileOps {
             return Ok(());
         }
         let cluster_size = self.state.cluster_size as u64;
-        let bps = self.state.bytes_per_sector as u64;
         let mut pos = lo;
         while pos < hi {
             let cluster_idx = (pos / cluster_size) as u32;
@@ -419,29 +540,86 @@ impl RegFileOps {
             };
             let cluster_lba = self.state.cluster_to_lba(cluster).map_err(backend_to_vfs)?;
             let want = ((run_clusters as u64 * cluster_size) - in_cluster).min(hi - pos);
-            let start_sector = in_cluster / bps;
-            let end_sector = (in_cluster + want).div_ceil(bps);
-            let sector_count = (end_sector - start_sector) as u32;
-            let chunk_bytes = (sector_count as u64 * bps) as usize;
-            let head_u = !in_cluster.is_multiple_of(bps);
-            let tail_u = !(in_cluster + want).is_multiple_of(bps);
-            let mut chunk = vec![0u8; chunk_bytes];
-            if head_u || tail_u {
-                self.state
-                    .backend
-                    .read_sectors(cluster_lba + start_sector, sector_count, &mut chunk)
-                    .map_err(backend_to_vfs)?;
-            }
-            let chunk_off = (in_cluster - start_sector * bps) as usize;
-            for b in &mut chunk[chunk_off..chunk_off + want as usize] {
-                *b = 0;
-            }
-            self.state
-                .backend
-                .write_sectors(cluster_lba + start_sector, sector_count, &chunk)
-                .map_err(backend_to_vfs)?;
+            self.zero_run(cluster_lba, in_cluster, want)?;
             pos += want;
         }
+        Ok(())
+    }
+
+    fn zero_run(&self, start_lba: u64, in_cluster: u64, len: u64) -> VfsResult<()> {
+        let bps = self.state.bytes_per_sector as u64;
+        let bps_usize = self.state.bytes_per_sector as usize;
+        let mut done = 0u64;
+        let mut disk_off = in_cluster;
+
+        if !disk_off.is_multiple_of(bps) {
+            let sector_off = (disk_off % bps) as usize;
+            let take = ((bps_usize - sector_off) as u64).min(len);
+            let lba = start_lba + disk_off / bps;
+            let mut sector = self.scratch.take(bps_usize);
+            self.state
+                .backend
+                .read_sectors(lba, 1, &mut sector)
+                .map_err(backend_to_vfs)?;
+            sector[sector_off..sector_off + take as usize].fill(0);
+            self.state
+                .backend
+                .write_sectors(lba, 1, &sector)
+                .map_err(backend_to_vfs)?;
+            self.scratch.recycle(sector);
+            done += take;
+            disk_off += take;
+        }
+
+        let aligned_bytes = ((len - done) / bps) * bps;
+        if aligned_bytes != 0 {
+            self.write_zeroed_sectors(start_lba + disk_off / bps, aligned_bytes / bps)?;
+            done += aligned_bytes;
+            disk_off += aligned_bytes;
+        }
+
+        if done < len {
+            let take = (len - done) as usize;
+            let lba = start_lba + disk_off / bps;
+            let mut sector = self.scratch.take(bps_usize);
+            self.state
+                .backend
+                .read_sectors(lba, 1, &mut sector)
+                .map_err(backend_to_vfs)?;
+            sector[..take].fill(0);
+            self.state
+                .backend
+                .write_sectors(lba, 1, &sector)
+                .map_err(backend_to_vfs)?;
+            self.scratch.recycle(sector);
+        }
+        Ok(())
+    }
+
+    fn write_zeroed_sectors(&self, mut lba: u64, mut sectors: u64) -> VfsResult<()> {
+        if sectors == 0 {
+            return Ok(());
+        }
+        let bps = self.state.bytes_per_sector as usize;
+        let sectors_per_chunk = self.state.sectors_per_cluster.max(1) as u64;
+        let mut zero = self
+            .scratch
+            .take_zeroed((sectors.min(sectors_per_chunk) as usize) * bps);
+        while sectors != 0 {
+            let take = sectors.min(sectors_per_chunk) as u32;
+            let bytes = take as usize * bps;
+            if zero.len() != bytes {
+                zero.resize(bytes, 0);
+            }
+            zero.fill(0);
+            self.state
+                .backend
+                .write_sectors(lba, take, &zero[..bytes])
+                .map_err(backend_to_vfs)?;
+            lba += u64::from(take);
+            sectors -= u64::from(take);
+        }
+        self.scratch.recycle(zero);
         Ok(())
     }
 }

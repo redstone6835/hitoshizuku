@@ -135,7 +135,13 @@ struct VirtioNetInner {
     tx_queue: VirtioNetQueue,
     rx_buffers: Vec<DmaBuffer>,
     tx_free_descs: VecDeque<u16>,
-    pending_tx: VecDeque<(u16, DmaBuffer)>,
+    /// TX 描述符号到在途 DMA 缓冲区的直接映射。
+    ///
+    /// VirtIO used ring 回报的是描述符 head id。用队列大小固定的 `Option` 表保存
+    /// 在途缓冲区后,完成路径可以 O(1) 取回 DMA 所有权,避免在中断/轮询热路径里
+    /// 对 pending 队列做线性扫描。该表只在 `inner` 锁内读写,描述符释放与 DMA
+    /// 缓冲区 drop 的顺序仍由同一个临界区串行化。
+    pending_tx: Vec<Option<DmaBuffer>>,
 }
 
 unsafe impl Send for VirtioNetInner {}
@@ -344,6 +350,8 @@ impl VirtioNetPci {
         for i in (0..tx_queue.queue_size).rev() {
             tx_free_descs.push_back(i);
         }
+        let mut pending_tx = Vec::with_capacity(tx_queue.queue_size as usize);
+        pending_tx.resize_with(tx_queue.queue_size as usize, || None);
 
         // 完成设备初始化握手。
         transport.add_status(VIRTIO_STATUS_DRIVER_OK);
@@ -367,7 +375,7 @@ impl VirtioNetPci {
                 tx_queue,
                 rx_buffers,
                 tx_free_descs,
-                pending_tx: VecDeque::new(),
+                pending_tx,
             }),
             mac,
             has_status,
@@ -502,8 +510,10 @@ impl net::NetDriver for VirtioNetPci {
         let notify_addr = tq.notify_addr;
 
         // 延迟回收：先登记 pending，再通知设备，避免设备快速完成时 used ring
-        // 先于 pending_tx 可见。
-        inner.pending_tx.push_back((desc_idx, tx_buf));
+        // 先于 pending_tx 可见。描述符来自空闲池,这里的槽位按协议应为空。
+        let pending_slot = &mut inner.pending_tx[desc_idx as usize];
+        debug_assert!(pending_slot.is_none());
+        *pending_slot = Some(tx_buf);
         self.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
         self.stats
             .tx_bytes
@@ -583,9 +593,9 @@ impl VirtioNetPci {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            // 在 pending_tx 中找到并释放对应的 DMA buffer
-            if let Some(pos) = inner.pending_tx.iter().position(|(d, _)| *d == desc_idx) {
-                let _ = inner.pending_tx.remove(pos);
+            // used ring 给出的 head id 直接索引 pending 表；take 后 DMA buffer drop,
+            // 再把描述符归还空闲池,避免同一描述符被重复提交时保留旧缓冲区。
+            if inner.pending_tx[desc_idx as usize].take().is_some() {
                 inner.tx_free_descs.push_back(desc_idx);
             } else {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);

@@ -11,31 +11,27 @@ use crate::layout::EXT4_EXTENTS_FL;
 use crate::state::{BlockBackendError, FsState};
 use crate::{extent_wr, map_wr};
 
-/// 给定 `name` + 文件类型,返回一个整条 dir_entry_2 的字节序(已 4-byte 对齐 rec_len)。
-///
-/// `has_filetype` 控制字段布局:
-/// - true (默认,INCOMPAT_FILETYPE 开启):byte 6=name_len(u8), byte 7=file_type;
-/// - false (ext2 经典):byte 6..7 合并为小端 u16 name_len,byte 7 不用作 file_type。
-pub(crate) fn make_entry(
-    ino: u32,
+#[inline]
+fn write_entry(
+    dst: &mut [u8],
+    rec_len: u16,
+    new_ino: u32,
     file_type: u8,
     name: &str,
     has_filetype: bool,
-) -> alloc::vec::Vec<u8> {
+) {
     let name_bytes = name.as_bytes();
-    let rec_len = ((8 + name_bytes.len() + 3) & !3) as u16;
-    let mut v = alloc::vec![0u8; rec_len as usize];
-    v[0..4].copy_from_slice(&ino.to_le_bytes());
-    v[4..6].copy_from_slice(&rec_len.to_le_bytes());
+    dst.fill(0);
+    dst[0..4].copy_from_slice(&new_ino.to_le_bytes());
+    dst[4..6].copy_from_slice(&rec_len.to_le_bytes());
     if has_filetype {
-        v[6] = name_bytes.len() as u8;
-        v[7] = file_type;
+        dst[6] = name_bytes.len() as u8;
+        dst[7] = file_type;
     } else {
         let nl = name_bytes.len() as u16;
-        v[6..8].copy_from_slice(&nl.to_le_bytes());
+        dst[6..8].copy_from_slice(&nl.to_le_bytes());
     }
-    v[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
-    v
+    dst[8..8 + name_bytes.len()].copy_from_slice(name_bytes);
 }
 
 #[inline]
@@ -44,12 +40,19 @@ fn needed(name_len: usize) -> u16 {
 }
 
 /// 扫一个目录块,尝试在里面就地插入一条新 entry。成功返回 `true`,
-/// 失败(没 slack)返回 `false`。`new_entry` 是已按 4 字节对齐的 dir_entry_2 字节。
-fn try_insert_in_block(block: &mut [u8], new_entry: &[u8], has_filetype: bool) -> bool {
-    let need = new_entry.len() as u16;
+/// 失败(没 slack)返回 `false`。
+fn try_insert_in_block(
+    block: &mut [u8],
+    new_ino: u32,
+    file_type: u8,
+    name: &str,
+    has_filetype: bool,
+) -> bool {
+    let need = needed(name.len());
     let mut off = 0usize;
     while off + 8 <= block.len() {
-        let ino = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        let entry_ino =
+            u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
         let rec_len = u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize;
         if rec_len < 8 || off + rec_len > block.len() {
             return false;
@@ -59,28 +62,41 @@ fn try_insert_in_block(block: &mut [u8], new_entry: &[u8], has_filetype: bool) -
         } else {
             u16::from_le_bytes([block[off + 6], block[off + 7]]) as usize
         };
-        let real = if ino == 0 { 0u16 } else { needed(name_len) };
+        let real = if entry_ino == 0 {
+            0u16
+        } else {
+            needed(name_len)
+        };
+        if real as usize > rec_len {
+            return false;
+        }
         let slack = rec_len as u16 - real;
         if slack >= need {
             // 在当前条目后插入
             // 1) 把当前条目的 rec_len 缩到 real(或如果 ino==0,则完全替换)
-            if ino == 0 {
-                // 整条替换
-                let mut new = alloc::vec![0u8; rec_len];
-                new[..new_entry.len()].copy_from_slice(new_entry);
-                // 新 entry 继承原 rec_len,填满 slack
-                let new_rec = rec_len as u16;
-                new[4..6].copy_from_slice(&new_rec.to_le_bytes());
-                block[off..off + rec_len].copy_from_slice(&new);
+            if entry_ino == 0 {
+                // 空洞整条替换,rec_len 继承原 slot,避免额外分配临时 Vec。
+                write_entry(
+                    &mut block[off..off + rec_len],
+                    rec_len as u16,
+                    new_ino,
+                    file_type,
+                    name,
+                    has_filetype,
+                );
                 return true;
             } else {
                 block[off + 4..off + 6].copy_from_slice(&real.to_le_bytes());
-                // 2) 在当前条目后写新条目,rec_len 扩大到吃掉 slack
-                let mut new = alloc::vec![0u8; slack as usize];
-                new[..new_entry.len()].copy_from_slice(new_entry);
-                new[4..6].copy_from_slice(&slack.to_le_bytes());
+                // 2) 在当前条目后写新条目,rec_len 扩大到吃掉 slack。
                 let start = off + real as usize;
-                block[start..start + slack as usize].copy_from_slice(&new);
+                write_entry(
+                    &mut block[start..start + slack as usize],
+                    slack,
+                    new_ino,
+                    file_type,
+                    name,
+                    has_filetype,
+                );
                 return true;
             }
         }
@@ -105,7 +121,6 @@ pub(crate) fn insert_entry(
     let bs = state.ext_sb.block_size as usize;
     let total_blocks = (size + bs as u64 - 1) / bs as u64;
     let has_filetype = state.ext_sb.feature_incompat & crate::layout::INCOMPAT_FILETYPE != 0;
-    let entry = make_entry(ino, file_type, name, has_filetype);
 
     let mut buf = vec![0u8; bs];
     for lb in 0..total_blocks {
@@ -113,7 +128,7 @@ pub(crate) fn insert_entry(
         match phys {
             Some(p) => {
                 state.read_block(p, &mut buf)?;
-                if try_insert_in_block(&mut buf, &entry, has_filetype) {
+                if try_insert_in_block(&mut buf, ino, file_type, name, has_filetype) {
                     state.write_block(p, &buf)?;
                     return Ok(size);
                 }
@@ -133,10 +148,14 @@ pub(crate) fn insert_entry(
     let mut blk = vec![0u8; bs];
     // 新块里先放一条占满整个块的 entry
     let rec_len = bs as u16;
-    let mut full_entry = alloc::vec::Vec::from(entry);
-    full_entry.resize(rec_len as usize, 0);
-    full_entry[4..6].copy_from_slice(&rec_len.to_le_bytes());
-    blk[..rec_len as usize].copy_from_slice(&full_entry);
+    write_entry(
+        &mut blk[..rec_len as usize],
+        rec_len,
+        ino,
+        file_type,
+        name,
+        has_filetype,
+    );
     state.write_block(new_phys, &blk)?;
     Ok(size + bs as u64)
 }
