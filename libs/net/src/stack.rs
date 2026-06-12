@@ -858,7 +858,7 @@ impl NetStack {
     ///
     /// 这是协议无关的底层队列视图：TCP 表示连续字节流可读字节数，
     /// UDP/Raw/ICMP 表示所有已排队数据报 payload 字节总量。上层若需要
-    /// POSIX 兼容的“下一条数据报长度”，应在兼容层基于协议类型再做转换。
+    /// POSIX 兼容的“下一次接收长度”，应调用 [`socket_recv_next_len`](Self::socket_recv_next_len)。
     pub fn socket_recv_queue(&self, handle: NetSocketHandle) -> usize {
         let table = self.interfaces.read();
         let Some(iface_lock) = table.get(&handle.iface_id) else {
@@ -1443,13 +1443,12 @@ impl NetStack {
 
     /// 查询 socket 是否有数据可读。
     pub fn socket_can_recv(&self, handle: NetSocketHandle) -> bool {
-        // TODO: readiness 当前仍缺少精确 socket 事件订阅、UDP datagram 长度、
-        // raw/icmp 元信息等 POSIX poll 语义；TCP EOF 先在这里补齐。
+        // TODO: readiness 当前仍缺少精确 socket 事件订阅；TCP EOF 先在这里补齐。
         let table = self.interfaces.read();
         let Some(iface_lock) = table.get(&handle.iface_id) else {
             return false;
         };
-        let managed = iface_lock.lock();
+        let mut managed = iface_lock.lock();
         if managed.handle_is_closed(handle) {
             return false;
         }
@@ -1458,9 +1457,45 @@ impl NetStack {
                 let socket = managed.tcp_socket(handle.inner);
                 socket.can_recv() || tcp_state_is_read_eof(socket.state())
             }
-            SocketType::Udp => managed.udp_socket(handle.inner).can_recv(),
+            SocketType::Udp => {
+                let peer = managed.udp_peer(handle.inner);
+                udp_next_recv_len_filtered(managed.udp_socket_mut(handle.inner), peer).is_some()
+            }
             SocketType::Raw => managed.raw_socket(handle.inner).can_recv(),
             SocketType::Icmp => managed.icmp_socket(handle.inner).can_recv(),
+        }
+    }
+
+    /// 查询下一次接收能返回的字节数。
+    ///
+    /// TCP 是字节流，返回当前可读队列总字节数；数据报 socket 返回下一条可被
+    /// 当前 socket 接收的数据报长度。UDP 已连接 socket 会丢弃队首非 peer
+    /// 数据报，这与实际 recv 路径保持一致。
+    pub fn socket_recv_next_len(&self, handle: NetSocketHandle) -> usize {
+        let table = self.interfaces.read();
+        let Some(iface_lock) = table.get(&handle.iface_id) else {
+            return 0;
+        };
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return 0;
+        }
+        match handle.sock_type {
+            SocketType::Tcp => managed.tcp_socket(handle.inner).recv_queue(),
+            SocketType::Udp => {
+                let peer = managed.udp_peer(handle.inner);
+                udp_next_recv_len_filtered(managed.udp_socket_mut(handle.inner), peer).unwrap_or(0)
+            }
+            SocketType::Raw => managed
+                .raw_socket_mut(handle.inner)
+                .peek()
+                .map(|packet| packet.len())
+                .unwrap_or(0),
+            SocketType::Icmp => managed
+                .icmp_socket_mut(handle.inner)
+                .peek()
+                .map(|(packet, _)| packet.len())
+                .unwrap_or(0),
         }
     }
 
@@ -2022,6 +2057,25 @@ fn udp_recv_filtered(
     }
 }
 
+fn udp_next_recv_len_filtered(
+    socket: &mut smoltcp::socket::udp::Socket<'static>,
+    peer: Option<Endpoint>,
+) -> Option<usize> {
+    loop {
+        let drop_current = {
+            let (data, meta) = socket.peek().ok()?;
+            let remote = endpoint_from_smoltcp(meta.endpoint);
+            if udp_peer_matches(peer, remote) {
+                return Some(data.len());
+            }
+            true
+        };
+        if drop_current {
+            let _ = socket.recv().ok()?;
+        }
+    }
+}
+
 fn udp_peer_matches(peer: Option<Endpoint>, remote: Endpoint) -> bool {
     peer.is_none_or(|expected| expected == remote)
 }
@@ -2523,6 +2577,11 @@ mod tests {
         ));
         stack.poll_interface(iface, NetInstant::ZERO);
 
+        assert_eq!(stack.socket_recv_queue(handle), 10);
+        assert_eq!(stack.socket_recv_next_len(handle), 5);
+        assert_eq!(stack.socket_recv_queue(handle), 5);
+        assert!(stack.socket_can_recv(handle));
+
         let mut buf = [0u8; 16];
         let (len, remote) = stack.udp_recv_from(handle, &mut buf).unwrap();
         assert_eq!(len, 5);
@@ -2669,6 +2728,7 @@ mod tests {
         };
         assert_eq!(stack.udp_bind(handle, local), Ok(local));
         assert_eq!(stack.socket_recv_queue(handle), 0);
+        assert_eq!(stack.socket_recv_next_len(handle), 0);
 
         driver.push_rx(build_udpv4_packet(
             smoltcp::wire::Ipv4Address::new(10, 39, 0, 77),
@@ -2680,10 +2740,12 @@ mod tests {
         stack.poll_interface(iface, NetInstant::ZERO);
 
         assert_eq!(stack.socket_recv_queue(handle), 6);
+        assert_eq!(stack.socket_recv_next_len(handle), 6);
         let mut buf = [0u8; 16];
         let (len, _) = stack.udp_recv_from(handle, &mut buf).unwrap();
         assert_eq!(len, 6);
         assert_eq!(stack.socket_recv_queue(handle), 0);
+        assert_eq!(stack.socket_recv_next_len(handle), 0);
     }
 
     #[test]
@@ -3359,9 +3421,12 @@ mod tests {
         stack.poll_interface(raw_iface, NetInstant::ZERO);
 
         assert_eq!(stack.socket_recv_queue(raw_handle), raw_len);
+        assert_eq!(stack.socket_recv_next_len(raw_handle), raw_len);
+        assert_eq!(stack.socket_recv_next_len(raw_handle), raw_len);
         let mut raw_buf = [0u8; 64];
         assert_eq!(stack.raw_recv(raw_handle, &mut raw_buf), Ok(raw_len));
         assert_eq!(stack.socket_recv_queue(raw_handle), 0);
+        assert_eq!(stack.socket_recv_next_len(raw_handle), 0);
 
         let (icmp_iface, icmp_driver) = attach_test_iface_with_driver(
             &stack,
@@ -3384,9 +3449,12 @@ mod tests {
 
         let icmp_len = 8 + b"icmp-queued".len();
         assert_eq!(stack.socket_recv_queue(icmp_handle), icmp_len);
+        assert_eq!(stack.socket_recv_next_len(icmp_handle), icmp_len);
+        assert_eq!(stack.socket_recv_next_len(icmp_handle), icmp_len);
         let mut icmp_buf = [0u8; 64];
         assert_eq!(stack.raw_recv(icmp_handle, &mut icmp_buf), Ok(icmp_len));
         assert_eq!(stack.socket_recv_queue(icmp_handle), 0);
+        assert_eq!(stack.socket_recv_next_len(icmp_handle), 0);
     }
 
     #[test]
