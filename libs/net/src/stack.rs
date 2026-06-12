@@ -34,7 +34,7 @@ use crate::engine::{
     tcp_state_is_read_eof, tcp_state_to_socket_state,
 };
 use crate::error::NetError;
-use crate::interface::ManagedInterface;
+use crate::interface::{InterfacePollResult, ManagedInterface};
 use crate::route::{RouteEntry, RouteTable};
 use crate::socket::{NetSocketHandle, SocketState, SocketType};
 use crate::time::{NetDuration, NetInstant};
@@ -187,9 +187,11 @@ impl NetStack {
     /// 新检查 socket 状态。
     pub fn poll(&self, timestamp: NetInstant) {
         let table = self.interfaces.read();
-        for iface_lock in table.values() {
+        for (&id, iface_lock) in table.iter() {
             if let Some(mut managed) = iface_lock.try_lock() {
-                managed.poll(timestamp);
+                let result = managed.poll(timestamp);
+                drop(managed);
+                self.apply_poll_result(id, result);
             }
         }
         drop(table);
@@ -217,8 +219,10 @@ impl NetStack {
         let mut rounds = 0usize;
         while rounds < self.tuning.active_poll.max_rounds {
             let mut changed = false;
-            for iface_lock in table.values() {
-                changed |= iface_lock.lock().poll(NetInstant::from_millis(millis));
+            for (&id, iface_lock) in table.iter() {
+                let result = iface_lock.lock().poll(NetInstant::from_millis(millis));
+                changed |= result.socket_changed;
+                self.apply_poll_result(id, result);
             }
             rounds += 1;
 
@@ -239,7 +243,8 @@ impl NetStack {
     pub fn poll_interface(&self, id: InterfaceId, timestamp: NetInstant) {
         let table = self.interfaces.read();
         if let Some(iface_lock) = table.get(&id) {
-            iface_lock.lock().poll(timestamp);
+            let result = iface_lock.lock().poll(timestamp);
+            self.apply_poll_result(id, result);
         }
         drop(table);
         // FIXME: 中断快速路径也走全局唤醒，多个接口/多个 socket 时会把
@@ -253,6 +258,14 @@ impl NetStack {
     /// 传入调度器/时钟层提供的单调毫秒值，由协议栈内部完成类型转换。
     pub fn poll_interface_ms(&self, id: InterfaceId, millis: i64) {
         self.poll_interface(id, NetInstant::from_millis(millis));
+    }
+
+    fn apply_poll_result(&self, id: InterfaceId, result: InterfacePollResult) {
+        if let Some(config) = result.config_changed {
+            let mut routes = self.routes.write();
+            routes.replace_connected(id, &config.addresses);
+            routes.replace_gateway(id, config.gateway);
+        }
     }
 
     /// 把当前任务挂到全局 socket 事件通知队列。
@@ -2995,6 +3008,52 @@ mod tests {
                 &IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x0042, 0, 0, 0, 0, 99])),
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn poll_result_config_change_replaces_routes() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(&stack, "eth-poll-config", IfConfig::auto());
+        let mut dhcp_config = IfConfig::static_v4(
+            Ipv4Addr::new(10, 43, 0, 22),
+            24,
+            Some(Ipv4Addr::new(10, 43, 0, 1)),
+        );
+        dhcp_config.mode = crate::IfMode::Auto;
+
+        stack.apply_poll_result(
+            iface,
+            InterfacePollResult {
+                socket_changed: true,
+                config_changed: Some(dhcp_config),
+            },
+        );
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(10, 43, 0, 99)),),
+            Ok(())
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),),
+            Ok(())
+        );
+
+        stack.apply_poll_result(
+            iface,
+            InterfacePollResult {
+                socket_changed: true,
+                config_changed: Some(IfConfig::auto()),
+            },
+        );
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(10, 43, 0, 99)),),
+            Err(NetError::Unreachable)
+        );
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),),
+            Err(NetError::Unreachable)
         );
     }
 

@@ -20,6 +20,7 @@ smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "socket-udp",
     "socket-icmp",
     "socket-raw",
+    "socket-dhcpv4",
 ] }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }
 # 用于全局 socket 事件唤醒队列（WakeQueue）。

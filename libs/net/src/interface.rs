@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use smoltcp::iface::{self, SocketHandle, SocketSet};
+use smoltcp::socket::dhcpv4;
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv4Cidr, Ipv6Address,
     Ipv6Cidr,
@@ -33,6 +34,10 @@ pub(crate) struct ManagedInterface {
     iface: iface::Interface,
     device: NetDeviceAdapter,
     sockets: SocketSet<'static>,
+    /// Auto 模式使用的内部 DHCPv4 socket，不向 VFS/用户态暴露。
+    dhcpv4_socket: Option<SocketHandle>,
+    /// 记录 DHCPv4 socket 是否曾经提交过租约；用于忽略初始空状态事件。
+    dhcpv4_configured: bool,
     /// 每个 socket 的元数据（soft-close 标志）。
     pub(crate) meta: BTreeMap<SocketHandle, SocketMeta>,
     /// 已完成握手的 TCP socket 队列（accept backlog）。
@@ -59,6 +64,23 @@ pub(crate) struct ManagedInterface {
     admin_up: bool,
 }
 
+/// 单次接口 poll 的结果。
+pub(crate) struct InterfacePollResult {
+    /// 公开 socket 状态可能已变化，需要上层重新检查 readiness。
+    pub(crate) socket_changed: bool,
+    /// 接口自动配置发生变化，需要 NetStack 同步全局路由表。
+    pub(crate) config_changed: Option<IfConfig>,
+}
+
+impl InterfacePollResult {
+    fn unchanged() -> Self {
+        Self {
+            socket_changed: false,
+            config_changed: None,
+        }
+    }
+}
+
 impl ManagedInterface {
     /// 根据设备和配置创建受管理接口。
     pub fn new(
@@ -68,7 +90,8 @@ impl ManagedInterface {
         listen_tuning: TcpListenTuning,
     ) -> Self {
         let driver = Arc::clone(net_device.driver());
-        let hw_addr = match driver.medium() {
+        let medium = driver.medium();
+        let hw_addr = match medium {
             LinkMedium::Ethernet => {
                 HardwareAddress::Ethernet(EthernetAddress(driver.mac_address()))
             }
@@ -85,10 +108,16 @@ impl ManagedInterface {
         install_ip_addrs(&mut iface, &config.addresses);
         install_gateway(&mut iface, config.gateway);
 
+        let mut sockets = SocketSet::new(Vec::new());
+        let dhcpv4_socket =
+            should_run_dhcpv4(config.mode, medium).then(|| sockets.add(dhcpv4::Socket::new()));
+
         Self {
             iface,
             device,
-            sockets: SocketSet::new(Vec::new()),
+            sockets,
+            dhcpv4_socket,
+            dhcpv4_configured: false,
             meta: BTreeMap::new(),
             pending_accepted: Vec::with_capacity(listen_tuning.accept_backlog),
             accept_successors: BTreeMap::new(),
@@ -161,11 +190,11 @@ impl ManagedInterface {
     /// 执行一轮协议栈 poll（处理 RX/TX + TCP 状态机推进）。
     ///
     /// 同时清理已标记为 removed 的 socket。
-    pub fn poll(&mut self, timestamp: NetInstant) -> bool {
+    pub fn poll(&mut self, timestamp: NetInstant) -> InterfacePollResult {
         if !self.admin_up {
-            return false;
+            return InterfacePollResult::unchanged();
         }
-        let changed = matches!(
+        let socket_changed = matches!(
             self.iface.poll(
                 timestamp.into_smoltcp(),
                 &mut self.device,
@@ -173,6 +202,7 @@ impl ManagedInterface {
             ),
             iface::PollResult::SocketStateChanged
         );
+        let config_changed = self.poll_dhcpv4_config();
         // 延迟清理：移除标记为 removed 的 socket，或已完成 TCP 收尾的
         // orphan socket。orphan 用于 fd 已释放但 FIN/ACK 仍需继续推进的
         // 场景，不能像普通 remove 一样在 close 后立刻摘掉。
@@ -196,13 +226,16 @@ impl ManagedInterface {
         for h in to_remove {
             self.remove_smoltcp_socket_locked(h);
         }
-        if changed {
+        if socket_changed {
             self.refresh_pending_tcp_accepts();
             self.ensure_pending_accept_listeners();
         } else if !self.pending_accepted.is_empty() {
             self.prune_pending_tcp_accepts();
         }
-        changed
+        InterfacePollResult {
+            socket_changed: socket_changed || config_changed.is_some(),
+            config_changed,
+        }
     }
 
     /// 接口名称。
@@ -227,7 +260,45 @@ impl ManagedInterface {
     pub fn apply_config(&mut self, config: IfConfig) {
         install_ip_addrs(&mut self.iface, &config.addresses);
         install_gateway(&mut self.iface, config.gateway);
+        self.sync_auto_config_socket(config.mode);
         self.config = config;
+    }
+
+    fn poll_dhcpv4_config(&mut self) -> Option<IfConfig> {
+        let handle = self.dhcpv4_socket?;
+        let event = self.sockets.get_mut::<dhcpv4::Socket>(handle).poll()?;
+        let config = match event {
+            dhcpv4::Event::Configured(config) => {
+                self.dhcpv4_configured = true;
+                if_config_from_dhcpv4(&config)
+            }
+            dhcpv4::Event::Deconfigured => {
+                if !self.dhcpv4_configured {
+                    return None;
+                }
+                self.dhcpv4_configured = false;
+                IfConfig::auto()
+            }
+        };
+        self.apply_config(config.clone());
+        Some(config)
+    }
+
+    fn sync_auto_config_socket(&mut self, mode: IfMode) {
+        let should_run = should_run_dhcpv4(mode, self.net_device.driver().medium());
+        match (should_run, self.dhcpv4_socket) {
+            (true, None) => {
+                let handle = self.sockets.add(dhcpv4::Socket::new());
+                self.dhcpv4_socket = Some(handle);
+                self.dhcpv4_configured = false;
+            }
+            (false, Some(handle)) => {
+                self.dhcpv4_socket = None;
+                self.dhcpv4_configured = false;
+                self.remove_smoltcp_socket_locked(handle);
+            }
+            _ => {}
+        }
     }
 
     /// 管理态是否允许接口收发。
@@ -290,6 +361,7 @@ impl ManagedInterface {
             .addresses
             .push(CidrAddress::new_v4(addr, prefix_len));
         self.config.mode = IfMode::Static;
+        self.sync_auto_config_socket(self.config.mode);
     }
 
     /// 添加 IPv4 路由到当前协议引擎。
@@ -732,6 +804,10 @@ impl ManagedInterface {
         // 必须先删 meta，否则 `poll` 路径的 to_remove 列表里还会保留旧条目，
         // 下次 poll 会对一个已经在 `SocketSet` 里被替换的 handle 再调
         // `sockets.remove`，触发 "handle does not refer to a valid socket"。
+        if self.dhcpv4_socket == Some(handle) {
+            self.dhcpv4_socket = None;
+            self.dhcpv4_configured = false;
+        }
         self.meta.remove(&handle);
         self.udp_peers.remove(&handle);
         self.remove_pending_tcp_accept(handle);
@@ -1120,6 +1196,20 @@ fn install_gateway(iface: &mut iface::Interface, gateway: Option<Gateway>) {
     }
 }
 
+fn should_run_dhcpv4(mode: IfMode, medium: LinkMedium) -> bool {
+    mode == IfMode::Auto && medium == LinkMedium::Ethernet
+}
+
+fn if_config_from_dhcpv4(config: &dhcpv4::Config<'_>) -> IfConfig {
+    let mut out = IfConfig::static_v4(
+        Ipv4Addr(config.address.address().octets()),
+        config.address.prefix_len(),
+        config.router.map(|router| Ipv4Addr(router.octets())),
+    );
+    out.mode = IfMode::Auto;
+    out
+}
+
 fn generate_seed(id: InterfaceId) -> u64 {
     let raw = id.raw() as u64;
     raw.wrapping_mul(6364136223846793005).wrapping_add(1)
@@ -1140,13 +1230,30 @@ mod tests {
     use crate::driver::{Duplex, LinkState, NetDriver, RxBuf, TxBuf};
     use crate::tuning::{NetTuning, TcpListenTuning};
 
-    #[derive(Default)]
     struct TestDriver {
+        medium: LinkMedium,
         rx: Mutex<Vec<Vec<u8>>>,
         tx: Mutex<Vec<Vec<u8>>>,
     }
 
+    impl Default for TestDriver {
+        fn default() -> Self {
+            Self {
+                medium: LinkMedium::Ip,
+                rx: Mutex::new(Vec::new()),
+                tx: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
     impl TestDriver {
+        fn ethernet() -> Self {
+            Self {
+                medium: LinkMedium::Ethernet,
+                ..Self::default()
+            }
+        }
+
         fn push_rx(&self, packet: Vec<u8>) {
             self.rx.lock().push(packet);
         }
@@ -1158,7 +1265,7 @@ mod tests {
 
     impl NetDriver for TestDriver {
         fn medium(&self) -> LinkMedium {
-            LinkMedium::Ip
+            self.medium
         }
 
         fn poll_rx(&self) -> Option<RxBuf> {
@@ -1287,6 +1394,14 @@ mod tests {
         tcp.seq_number.0
     }
 
+    fn dhcpv4_socket_count(iface: &ManagedInterface) -> usize {
+        iface
+            .sockets
+            .iter()
+            .filter(|(_, socket)| matches!(socket, smoltcp::socket::Socket::Dhcpv4(_)))
+            .count()
+    }
+
     fn drive_inbound_handshake(
         iface: &mut ManagedInterface,
         driver: &TestDriver,
@@ -1305,7 +1420,7 @@ mod tests {
             None,
             smoltcp::wire::TcpControl::Syn,
         ));
-        assert!(iface.poll(NetInstant::ZERO));
+        assert!(iface.poll(NetInstant::ZERO).socket_changed);
         assert_eq!(
             iface.tcp_socket(listener).state(),
             smoltcp::socket::tcp::State::SynReceived
@@ -1321,7 +1436,7 @@ mod tests {
             Some(server_seq.wrapping_add(1)),
             smoltcp::wire::TcpControl::None,
         ));
-        assert!(iface.poll(NetInstant::from_millis(1)));
+        assert!(iface.poll(NetInstant::from_millis(1)).socket_changed);
         assert_eq!(
             iface.tcp_socket(listener).state(),
             smoltcp::socket::tcp::State::Established
@@ -1350,6 +1465,80 @@ mod tests {
         assert_ne!(first.generation, second.generation);
         assert!(iface.handle_is_closed(first));
         assert!(iface.handle_is_live(second));
+    }
+
+    #[test]
+    fn auto_ethernet_interface_tracks_internal_dhcp_socket_lifecycle() {
+        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::ethernet());
+        let dev = Arc::new(NetDevice::new("test-eth-auto", driver));
+        let tuning = NetTuning::defaults();
+        let mut iface = ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen);
+
+        let initial = iface.dhcpv4_socket.unwrap();
+        assert_eq!(dhcpv4_socket_count(&iface), 1);
+        assert!(!iface.meta.contains_key(&initial));
+
+        iface.apply_config(IfConfig::static_v4(
+            Ipv4Addr::new(10, 0, 0, 2),
+            24,
+            Some(Ipv4Addr::new(10, 0, 0, 1)),
+        ));
+        assert_eq!(iface.dhcpv4_socket, None);
+        assert_eq!(dhcpv4_socket_count(&iface), 0);
+
+        let mut auto_config = IfConfig::static_v4(
+            Ipv4Addr::new(10, 0, 1, 2),
+            24,
+            Some(Ipv4Addr::new(10, 0, 1, 1)),
+        );
+        auto_config.mode = IfMode::Auto;
+        iface.apply_config(auto_config);
+        let renewed = iface.dhcpv4_socket.unwrap();
+        assert_eq!(dhcpv4_socket_count(&iface), 1);
+        assert!(!iface.meta.contains_key(&renewed));
+
+        iface.set_ipv4_addr(Ipv4Addr::new(192, 0, 2, 10), 24);
+        assert_eq!(iface.dhcpv4_socket, None);
+        assert_eq!(dhcpv4_socket_count(&iface), 0);
+    }
+
+    #[test]
+    fn auto_ip_medium_does_not_create_dhcp_socket() {
+        let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::default());
+        let dev = Arc::new(NetDevice::new("test-ip-auto", driver));
+        let tuning = NetTuning::defaults();
+        let iface = ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen);
+
+        assert_eq!(iface.dhcpv4_socket, None);
+        assert_eq!(dhcpv4_socket_count(&iface), 0);
+    }
+
+    #[test]
+    fn dhcpv4_config_maps_to_auto_if_config() {
+        let lease = dhcpv4::Config {
+            server: dhcpv4::ServerInfo {
+                address: smoltcp::wire::Ipv4Address::new(10, 0, 2, 1),
+                identifier: smoltcp::wire::Ipv4Address::new(10, 0, 2, 1),
+            },
+            address: smoltcp::wire::Ipv4Cidr::new(
+                smoltcp::wire::Ipv4Address::new(10, 0, 2, 15),
+                24,
+            ),
+            router: Some(smoltcp::wire::Ipv4Address::new(10, 0, 2, 254)),
+            dns_servers: Default::default(),
+            packet: None,
+        };
+
+        let config = if_config_from_dhcpv4(&lease);
+        assert_eq!(config.mode, IfMode::Auto);
+        assert_eq!(
+            config.addresses,
+            vec![CidrAddress::new_v4(Ipv4Addr::new(10, 0, 2, 15), 24)]
+        );
+        assert_eq!(
+            config.gateway,
+            Some(Gateway::V4(Ipv4Addr::new(10, 0, 2, 254)))
+        );
     }
 
     #[test]
