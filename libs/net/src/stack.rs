@@ -1028,7 +1028,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_default_route_v4(gateway);
+        managed.add_default_route_v4(gateway)?;
         drop(managed);
         drop(table);
         self.routes
@@ -1058,7 +1058,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&iface_id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.add_default_route_v6(gateway);
+        managed.add_default_route_v6(gateway)?;
         drop(managed);
         drop(table);
         self.routes

@@ -330,11 +330,12 @@ impl ManagedInterface {
     }
 
     /// 添加或替换默认 IPv4 路由。
-    pub fn add_default_route_v4(&mut self, gateway: Ipv4Addr) {
+    pub fn add_default_route_v4(&mut self, gateway: Ipv4Addr) -> Result<(), crate::NetError> {
         self.iface
             .routes_mut()
             .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
-            .ok();
+            .map(|_| ())
+            .map_err(|_| crate::NetError::ResourceExhausted)
     }
 
     /// 移除默认 IPv4 路由。
@@ -343,11 +344,12 @@ impl ManagedInterface {
     }
 
     /// 添加或替换默认 IPv6 路由。
-    pub fn add_default_route_v6(&mut self, gateway: Ipv6Addr) {
+    pub fn add_default_route_v6(&mut self, gateway: Ipv6Addr) -> Result<(), crate::NetError> {
         self.iface
             .routes_mut()
             .add_default_ipv6_route(ipv6_to_smoltcp(gateway))
-            .ok();
+            .map(|_| ())
+            .map_err(|_| crate::NetError::ResourceExhausted)
     }
 
     /// 移除默认 IPv6 路由。
@@ -1526,6 +1528,29 @@ mod tests {
                 .map(|route| route.via_router);
         });
         found
+    }
+
+    #[test]
+    fn default_route_add_reports_protocol_route_table_full() {
+        let (_id, mut iface) = test_interface();
+        for i in 0..smoltcp::config::IFACE_MAX_ROUTE_COUNT {
+            iface
+                .add_route_v4(
+                    Ipv4Addr::new(172, 16, i as u8, 0),
+                    Ipv4Addr::new(255, 255, 255, 0),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            iface.add_default_route_v4(Ipv4Addr::new(10, 0, 0, 254)),
+            Err(crate::NetError::ResourceExhausted)
+        );
+        assert_eq!(
+            iface.add_default_route_v6(Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1])),
+            Err(crate::NetError::ResourceExhausted)
+        );
     }
 
     fn build_tcp_packet(
