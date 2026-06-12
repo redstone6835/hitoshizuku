@@ -88,7 +88,7 @@ impl ManagedInterface {
         config: IfConfig,
         tcp_tuning: TcpBufferTuning,
         listen_tuning: TcpListenTuning,
-    ) -> Self {
+    ) -> Result<Self, crate::NetError> {
         let driver = Arc::clone(net_device.driver());
         let medium = driver.medium();
         let hw_addr = match medium {
@@ -106,13 +106,13 @@ impl ManagedInterface {
         let mut iface = iface::Interface::new(iface_config, &mut device, now);
 
         install_ip_addrs(&mut iface, &config.addresses);
-        install_gateway(&mut iface, config.gateway);
+        install_gateway(&mut iface, config.gateway)?;
 
         let mut sockets = SocketSet::new(Vec::new());
         let dhcpv4_socket =
             should_run_dhcpv4(config.mode, medium).then(|| sockets.add(dhcpv4::Socket::new()));
 
-        Self {
+        Ok(Self {
             iface,
             device,
             sockets,
@@ -130,7 +130,7 @@ impl ManagedInterface {
             config,
             net_device,
             admin_up: true,
-        }
+        })
     }
 
     fn next_inode(&self) -> u64 {
@@ -257,31 +257,35 @@ impl ManagedInterface {
     /// DHCP/SLAAC 或管理接口拿到完整配置后应走这里一次性替换地址和默认网关，
     /// 避免地址、协议引擎路由和 `config` 快照出现中间态分叉。全局路由表由
     /// [`crate::stack::NetStack`] 在外层同步维护。
-    pub fn apply_config(&mut self, config: IfConfig) {
+    pub fn apply_config(&mut self, config: IfConfig) -> Result<(), crate::NetError> {
+        ensure_gateway_capacity(&mut self.iface, config.gateway)?;
         install_ip_addrs(&mut self.iface, &config.addresses);
-        install_gateway(&mut self.iface, config.gateway);
+        install_gateway(&mut self.iface, config.gateway)?;
         self.sync_auto_config_socket(config.mode);
         self.config = config;
+        Ok(())
     }
 
     fn poll_dhcpv4_config(&mut self) -> Option<IfConfig> {
         let handle = self.dhcpv4_socket?;
         let event = self.sockets.get_mut::<dhcpv4::Socket>(handle).poll()?;
-        let config = match event {
+        match event {
             dhcpv4::Event::Configured(config) => {
+                let config = if_config_from_dhcpv4(&config);
+                self.apply_config(config.clone()).ok()?;
                 self.dhcpv4_configured = true;
-                if_config_from_dhcpv4(&config)
+                Some(config)
             }
             dhcpv4::Event::Deconfigured => {
                 if !self.dhcpv4_configured {
                     return None;
                 }
+                let config = IfConfig::auto();
+                self.apply_config(config.clone()).ok()?;
                 self.dhcpv4_configured = false;
-                IfConfig::auto()
+                Some(config)
             }
-        };
-        self.apply_config(config.clone());
-        Some(config)
+        }
     }
 
     fn sync_auto_config_socket(&mut self, mode: IfMode) {
@@ -1259,7 +1263,11 @@ fn install_ip_addrs(iface: &mut iface::Interface, addresses: &[CidrAddress]) {
     });
 }
 
-fn install_gateway(iface: &mut iface::Interface, gateway: Option<Gateway>) {
+fn install_gateway(
+    iface: &mut iface::Interface,
+    gateway: Option<Gateway>,
+) -> Result<(), crate::NetError> {
+    ensure_gateway_capacity(iface, gateway)?;
     iface.routes_mut().remove_default_ipv4_route();
     iface.routes_mut().remove_default_ipv6_route();
     match gateway {
@@ -1267,25 +1275,64 @@ fn install_gateway(iface: &mut iface::Interface, gateway: Option<Gateway>) {
             iface
                 .routes_mut()
                 .add_default_ipv4_route(ipv4_to_smoltcp(v4))
-                .ok();
+                .map(|_| ())
+                .map_err(|_| crate::NetError::ResourceExhausted)?;
         }
         Some(Gateway::V6(v6)) => {
             iface
                 .routes_mut()
                 .add_default_ipv6_route(ipv6_to_smoltcp(v6))
-                .ok();
+                .map(|_| ())
+                .map_err(|_| crate::NetError::ResourceExhausted)?;
         }
         Some(Gateway::DualStack { v4, v6 }) => {
             iface
                 .routes_mut()
                 .add_default_ipv4_route(ipv4_to_smoltcp(v4))
-                .ok();
+                .map(|_| ())
+                .map_err(|_| crate::NetError::ResourceExhausted)?;
             iface
                 .routes_mut()
                 .add_default_ipv6_route(ipv6_to_smoltcp(v6))
-                .ok();
+                .map(|_| ())
+                .map_err(|_| crate::NetError::ResourceExhausted)?;
         }
         None => {}
+    }
+    Ok(())
+}
+
+fn ensure_gateway_capacity(
+    iface: &mut iface::Interface,
+    gateway: Option<Gateway>,
+) -> Result<(), crate::NetError> {
+    let mut full = false;
+    iface.routes_mut().update(|routes| {
+        let retained = routes
+            .iter()
+            .filter(|route| !is_default_route_cidr(route.cidr))
+            .count();
+        full = retained + gateway_default_route_count(gateway) > routes.capacity();
+    });
+    if full {
+        Err(crate::NetError::ResourceExhausted)
+    } else {
+        Ok(())
+    }
+}
+
+fn gateway_default_route_count(gateway: Option<Gateway>) -> usize {
+    match gateway {
+        Some(Gateway::DualStack { .. }) => 2,
+        Some(Gateway::V4(_)) | Some(Gateway::V6(_)) => 1,
+        None => 0,
+    }
+}
+
+fn is_default_route_cidr(cidr: IpCidr) -> bool {
+    match cidr {
+        IpCidr::Ipv4(cidr) => cidr.prefix_len() == 0,
+        IpCidr::Ipv6(cidr) => cidr.prefix_len() == 0,
     }
 }
 
@@ -1476,7 +1523,8 @@ mod tests {
                 TcpListenTuning {
                     accept_backlog: backlog,
                 },
-            ),
+            )
+            .unwrap(),
         )
     }
 
@@ -1551,6 +1599,34 @@ mod tests {
             iface.add_default_route_v6(Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1])),
             Err(crate::NetError::ResourceExhausted)
         );
+    }
+
+    #[test]
+    fn apply_config_does_not_partially_update_on_gateway_capacity_error() {
+        let (_id, mut iface) = test_interface();
+        let original = iface.config().clone();
+        for i in 0..smoltcp::config::IFACE_MAX_ROUTE_COUNT {
+            iface
+                .add_route_v4(
+                    Ipv4Addr::new(10, 64, i as u8, 0),
+                    Ipv4Addr::new(255, 255, 255, 0),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                )
+                .unwrap();
+        }
+
+        let replacement = IfConfig::static_v4(
+            Ipv4Addr::new(192, 0, 2, 44),
+            24,
+            Some(Ipv4Addr::new(192, 0, 2, 1)),
+        );
+        assert_eq!(
+            iface.apply_config(replacement),
+            Err(crate::NetError::ResourceExhausted)
+        );
+        assert_eq!(iface.config().addresses, original.addresses);
+        assert_eq!(iface.config().gateway, original.gateway);
+        assert_eq!(iface.config().mode, original.mode);
     }
 
     fn build_tcp_packet(
@@ -1698,17 +1774,20 @@ mod tests {
         let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::ethernet());
         let dev = Arc::new(NetDevice::new("test-eth-auto", driver));
         let tuning = NetTuning::defaults();
-        let mut iface = ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen);
+        let mut iface =
+            ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen).unwrap();
 
         let initial = iface.dhcpv4_socket.unwrap();
         assert_eq!(dhcpv4_socket_count(&iface), 1);
         assert!(!iface.meta.contains_key(&initial));
 
-        iface.apply_config(IfConfig::static_v4(
-            Ipv4Addr::new(10, 0, 0, 2),
-            24,
-            Some(Ipv4Addr::new(10, 0, 0, 1)),
-        ));
+        iface
+            .apply_config(IfConfig::static_v4(
+                Ipv4Addr::new(10, 0, 0, 2),
+                24,
+                Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ))
+            .unwrap();
         assert_eq!(iface.dhcpv4_socket, None);
         assert_eq!(dhcpv4_socket_count(&iface), 0);
 
@@ -1718,7 +1797,7 @@ mod tests {
             Some(Ipv4Addr::new(10, 0, 1, 1)),
         );
         auto_config.mode = IfMode::Auto;
-        iface.apply_config(auto_config);
+        iface.apply_config(auto_config).unwrap();
         let renewed = iface.dhcpv4_socket.unwrap();
         assert_eq!(dhcpv4_socket_count(&iface), 1);
         assert!(!iface.meta.contains_key(&renewed));
@@ -1733,7 +1812,8 @@ mod tests {
         let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::ethernet());
         let dev = Arc::new(NetDevice::new("test-eth-v6-static", driver));
         let tuning = NetTuning::defaults();
-        let mut iface = ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen);
+        let mut iface =
+            ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen).unwrap();
 
         assert!(iface.dhcpv4_socket.is_some());
         assert_eq!(dhcpv4_socket_count(&iface), 1);
@@ -1755,7 +1835,8 @@ mod tests {
         let driver: Arc<dyn NetDriver> = Arc::new(TestDriver::default());
         let dev = Arc::new(NetDevice::new("test-ip-auto", driver));
         let tuning = NetTuning::defaults();
-        let iface = ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen);
+        let iface =
+            ManagedInterface::new(dev, IfConfig::auto(), tuning.tcp, tuning.tcp_listen).unwrap();
 
         assert_eq!(iface.dhcpv4_socket, None);
         assert_eq!(dhcpv4_socket_count(&iface), 0);

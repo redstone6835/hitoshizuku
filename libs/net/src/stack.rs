@@ -140,14 +140,21 @@ impl NetStack {
     /// 此操作短暂持有写锁，会暂停所有正在进行的 poll。
     pub fn attach(&self, dev: Arc<NetDevice>, config: IfConfig) -> Result<(), NetError> {
         let id = dev.id();
-        let managed =
-            ManagedInterface::new(dev, config.clone(), self.tuning.tcp, self.tuning.tcp_listen);
-        let mut table = self.interfaces.write();
-        if table.contains_key(&id) {
-            return Err(NetError::InterfaceExists);
+        {
+            let table = self.interfaces.read();
+            if table.contains_key(&id) {
+                return Err(NetError::InterfaceExists);
+            }
         }
-        table.insert(id, Arc::new(Mutex::new(managed)));
-        drop(table);
+        let managed =
+            ManagedInterface::new(dev, config.clone(), self.tuning.tcp, self.tuning.tcp_listen)?;
+        {
+            let mut table = self.interfaces.write();
+            if table.contains_key(&id) {
+                return Err(NetError::InterfaceExists);
+            }
+            table.insert(id, Arc::new(Mutex::new(managed)));
+        }
         let mut routes = self.routes.write();
         routes.replace_connected(id, &config.addresses);
         routes.replace_gateway(id, config.gateway);
@@ -1126,7 +1133,7 @@ impl NetStack {
         let table = self.interfaces.read();
         let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
         let mut managed = iface_lock.lock();
-        managed.apply_config(config);
+        managed.apply_config(config)?;
         let addresses = managed.config().addresses.clone();
         let gateway = managed.config().gateway;
         drop(managed);
