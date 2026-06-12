@@ -32,6 +32,7 @@ pub mod naming;
 pub mod net;
 pub mod pci;
 pub mod platform;
+pub mod pm_qos;
 pub mod pnp;
 pub mod random_source;
 pub mod rtc;

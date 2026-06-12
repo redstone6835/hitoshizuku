@@ -27,6 +27,17 @@ pub enum CustomDevNodeKind {
     Directory,
 }
 
+/// 自定义 devtmpfs 节点的设备号分配策略。
+///
+/// 默认策略保持现有行为：字符/块 custom 节点使用项目私有动态设备号。Linux
+/// misc 设备通过显式策略进入 major 10 的动态 minor 池，避免 devtmpfs 核心按
+/// 节点名特判。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomDevNodeNumbering {
+    Default,
+    MiscChar,
+}
+
 /// 自定义 devtmpfs 节点规格。
 ///
 /// 新设备类型如果需要在 `/dev` 暴露特殊节点，只在这里声明节点名称、通用类别
@@ -37,6 +48,7 @@ pub struct CustomDevNodeSpec {
     name: Box<str>,
     kind: CustomDevNodeKind,
     payload: Arc<dyn Any + Send + Sync>,
+    numbering: CustomDevNodeNumbering,
 }
 
 impl CustomDevNodeSpec {
@@ -45,10 +57,20 @@ impl CustomDevNodeSpec {
         kind: CustomDevNodeKind,
         payload: Arc<dyn Any + Send + Sync>,
     ) -> VfsResult<Self> {
+        Self::try_new_with_numbering(name, kind, payload, CustomDevNodeNumbering::Default)
+    }
+
+    pub fn try_new_with_numbering(
+        name: &str,
+        kind: CustomDevNodeKind,
+        payload: Arc<dyn Any + Send + Sync>,
+        numbering: CustomDevNodeNumbering,
+    ) -> VfsResult<Self> {
         Ok(Self {
             name: fallible_box_str(name)?,
             kind,
             payload,
+            numbering,
         })
     }
 
@@ -62,6 +84,10 @@ impl CustomDevNodeSpec {
 
     pub fn payload(&self) -> Arc<dyn Any + Send + Sync> {
         Arc::clone(&self.payload)
+    }
+
+    pub fn numbering(&self) -> CustomDevNodeNumbering {
+        self.numbering
     }
 }
 

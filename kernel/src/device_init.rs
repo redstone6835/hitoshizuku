@@ -94,9 +94,23 @@ pub fn register_core_filesystems(tag: &str) {
             tag, err
         )
     });
+    general::vfs::device_files::cpu_dma_latency::register_devtmpfs_adapter().unwrap_or_else(
+        |err| {
+            panic!(
+                "[kernel-start][{}] failed to register cpu_dma_latency devtmpfs adapter: {:?}",
+                tag, err
+            )
+        },
+    );
     general::vfs::device_files::loop_device::register_control_node().unwrap_or_else(|err| {
         panic!(
             "[kernel-start][{}] failed to register loop-control devtmpfs node: {:?}",
+            tag, err
+        )
+    });
+    general::vfs::device_files::cpu_dma_latency::register_static_node().unwrap_or_else(|err| {
+        panic!(
+            "[kernel-start][{}] failed to register cpu_dma_latency devtmpfs node: {:?}",
             tag, err
         )
     });

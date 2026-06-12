@@ -66,7 +66,7 @@ use crate::vfs::device_files::projection::{
     published_devnodes_for_function, remember_published_devnodes,
 };
 use crate::vfs::device_files::spec::{
-    CustomDevNodeKind, CustomDevNodeSpec, DevNodeSet, DevNodeSpec,
+    CustomDevNodeKind, CustomDevNodeNumbering, CustomDevNodeSpec, DevNodeSet, DevNodeSpec,
 };
 use crate::vfs::user_api::block_device::{BlockDeviceIoctlContext, handle_block_ioctl};
 use crate::vfs::user_api::tty::{
@@ -2655,16 +2655,34 @@ impl DevTmpfsSuperblockOps {
         // function 指定或反向影响设备身份。
         let (rdev, registered_rdev) = match spec.kind() {
             CustomDevNodeKind::CharDevice => (
-                super::user_api::device_numbers::register_char(spec.name(), spec.name())
-                    .ok_or(VfsError::NoSpace)?,
+                match spec.numbering() {
+                    CustomDevNodeNumbering::Default => {
+                        super::user_api::device_numbers::register_char(spec.name(), spec.name())
+                    }
+                    CustomDevNodeNumbering::MiscChar => {
+                        super::user_api::device_numbers::register_misc_char(
+                            spec.name(),
+                            spec.name(),
+                        )
+                    }
+                }
+                .ok_or(VfsError::NoSpace)?,
                 true,
             ),
-            CustomDevNodeKind::BlockDevice => (
-                super::user_api::device_numbers::register_block(spec.name(), spec.name())
-                    .ok_or(VfsError::NoSpace)?,
-                true,
-            ),
+            CustomDevNodeKind::BlockDevice => {
+                if spec.numbering() != CustomDevNodeNumbering::Default {
+                    return Err(VfsError::InvalidArgument);
+                }
+                (
+                    super::user_api::device_numbers::register_block(spec.name(), spec.name())
+                        .ok_or(VfsError::NoSpace)?,
+                    true,
+                )
+            }
             CustomDevNodeKind::RegularFile | CustomDevNodeKind::Directory => {
+                if spec.numbering() != CustomDevNodeNumbering::Default {
+                    return Err(VfsError::InvalidArgument);
+                }
                 (DevId::new(0, 0), false)
             }
         };
