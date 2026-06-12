@@ -645,8 +645,7 @@ impl IrqHandler for VirtioNetPciIrqHandler {
         if !self.driver.handle_interrupt() {
             return IrqStatus::Unhandled;
         }
-        let millis = (sched::now_ns_public() / 1_000_000) as i64;
-        net::stack().poll_interface_ms(self.iface_id, millis);
+        net::stack().poll_interface_ns(self.iface_id, sched::now_ns_public());
         IrqStatus::Handled
     }
 }

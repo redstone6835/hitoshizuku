@@ -43,7 +43,7 @@ static LAST_POLL_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 ///
 /// 签名必须满足 `fn(u64)`——见
 /// [`arch::loongarch64::vdso::register_net_poll_hook`]。`now_ns` 是当前
-/// 物理时间戳（与 vDSO 那边一致），smoltcp 用 `Instant::from_millis` 接收。
+/// 物理时间戳（与 vDSO 那边一致），网络层会转换成协议引擎时间。
 pub fn tick_net_poll(now_ns: u64) {
     if LAST_POLL_NS.swap(now_ns, Ordering::AcqRel) == now_ns {
         return;
@@ -54,10 +54,8 @@ pub fn tick_net_poll(now_ns: u64) {
     if now_ns == 0 {
         return;
     }
-    // smoltcp 的 Instant::from_millis 取毫秒，向下取整即可。
-    // TODO: 这里把 ns 向下取整到 ms，短超时和连续 tick 下的协议栈时间
-    // 精度会丢失。
-    net::stack().poll_ms((now_ns / 1_000_000) as i64);
+    // 直接传纳秒时间戳，避免进入协议栈前先丢失毫秒以下精度。
+    net::stack().poll_ns(now_ns);
     // 网络 poll 可能让对端任务变为 runnable（例如 TCP_CRR 的短连接
     // accept/recv/send 交替）。即使没有显式 socket waiter，也请求一次
     // 当前 CPU 重调度，避免对端等到其它定时任务触发后才运行。

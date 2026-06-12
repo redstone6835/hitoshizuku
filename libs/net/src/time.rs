@@ -9,8 +9,8 @@ use core::ops;
 /// 单调时间点。
 ///
 /// 单位为微秒，零点由调用方定义（通常是系统启动时间）。允许负值，便于
-/// 与协议引擎历史行为兼容；公共调用通常通过 [`Self::from_millis`] 传入
-/// 调度器提供的毫秒时间戳。
+/// 与协议引擎历史行为兼容；公共调用通常通过 [`Self::from_nanos`] 传入
+/// 调度器提供的纳秒时间戳。
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NetInstant {
     micros: i64,
@@ -22,6 +22,13 @@ impl NetInstant {
     /// 从微秒构造时间点。
     pub const fn from_micros(micros: i64) -> Self {
         Self { micros }
+    }
+
+    /// 从纳秒构造时间点。内部按微秒保存，只丢弃亚微秒精度。
+    pub fn from_nanos(nanos: u64) -> Self {
+        Self {
+            micros: (nanos / 1_000).min(i64::MAX as u64) as i64,
+        }
     }
 
     /// 从毫秒构造时间点。乘法饱和，避免异常输入造成回绕。
@@ -187,6 +194,15 @@ mod tests {
 
         let duration = NetDuration::from_secs(7);
         assert_eq!(NetDuration::from_smoltcp(duration.into_smoltcp()), duration);
+    }
+
+    #[test]
+    fn net_instant_from_nanos_preserves_microsecond_resolution() {
+        let instant = NetInstant::from_nanos(1_234_567);
+
+        assert_eq!(instant.total_micros(), 1_234);
+        assert_eq!(instant.total_millis(), 1);
+        assert_eq!(NetInstant::from_smoltcp(instant.into_smoltcp()), instant);
     }
 
     #[test]

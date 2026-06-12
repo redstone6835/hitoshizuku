@@ -207,6 +207,14 @@ impl NetStack {
         self.poll(NetInstant::from_millis(millis));
     }
 
+    /// 以纳秒时间戳驱动所有活跃接口。
+    ///
+    /// 内核调度器原生提供纳秒时间；这里统一转换到网络层自有时间类型，避免
+    /// timer/IRQ 路径在进入协议栈前先损失毫秒以下精度。
+    pub fn poll_ns(&self, nanos: u64) {
+        self.poll(NetInstant::from_nanos(nanos));
+    }
+
     /// 立即驱动一次协议栈。
     ///
     /// 这用于 socket 操作刚刚排入出站数据之后主动推进 smoltcp 状态机。
@@ -214,13 +222,13 @@ impl NetStack {
     /// timer tick，阻塞 connect/accept/read 路径容易出现不必要的长等待。
     pub fn poll_now(&self) {
         let now_ns = sched::now_ns_public();
-        let millis = (now_ns / 1_000_000) as i64;
+        let timestamp = NetInstant::from_nanos(now_ns);
         let table = self.interfaces.read();
         let mut rounds = 0usize;
         while rounds < self.tuning.active_poll.max_rounds {
             let mut changed = false;
             for (&id, iface_lock) in table.iter() {
-                let result = iface_lock.lock().poll(NetInstant::from_millis(millis));
+                let result = iface_lock.lock().poll(timestamp);
                 changed |= result.socket_changed;
                 self.apply_poll_result(id, result);
             }
@@ -258,6 +266,11 @@ impl NetStack {
     /// 传入调度器/时钟层提供的单调毫秒值，由协议栈内部完成类型转换。
     pub fn poll_interface_ms(&self, id: InterfaceId, millis: i64) {
         self.poll_interface(id, NetInstant::from_millis(millis));
+    }
+
+    /// 以纳秒时间戳 poll 指定接口。
+    pub fn poll_interface_ns(&self, id: InterfaceId, nanos: u64) {
+        self.poll_interface(id, NetInstant::from_nanos(nanos));
     }
 
     fn apply_poll_result(&self, id: InterfaceId, result: InterfacePollResult) {
