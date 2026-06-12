@@ -164,10 +164,15 @@ pub use self::tuntap_interface::TunTapInterface;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
-    /// 出站 IP traffic class 值。
+    /// IP hop limit / IPv4 TTL 元信息。
     ///
-    /// IPv4 发包时写入 DSCP/ECN 字节，IPv6 发包时写入 traffic class 字段。
-    /// `None` 表示沿用协议默认值。
+    /// 入站路径记录收到的 TTL/hop limit；出站路径暂不消费该字段，仍由各
+    /// socket 的 hop_limit 配置生成 IP 头。
+    pub hop_limit: Option<u8>,
+    /// IP traffic class 元信息。
+    ///
+    /// 入站路径记录 IPv4 DSCP/ECN 或 IPv6 traffic class；出站路径写入
+    /// IPv4 DSCP/ECN 字节或 IPv6 traffic class 字段。`None` 表示沿用协议默认值。
     pub traffic_class: Option<u8>,
 }
 

@@ -16,7 +16,9 @@ use socket::{
     UnixAddress,
 };
 
-use crate::net_socket::{InetRecvOptions, InetRecvResult, InetSendOptions, NetSocketFileOps};
+use crate::net_socket::{
+    InetRecvOptions, InetRecvResult, InetSendOptions, NetSocketFileOps, SocketOptions,
+};
 use crate::operation;
 use crate::vfs::VfsContext;
 use crate::vfs::cred::Credentials;
@@ -1107,7 +1109,9 @@ const IP_DROP_MEMBERSHIP: i32 = 36;
 const IPV6_V6ONLY: i32 = 26;
 const IPV6_UNICAST_HOPS: i32 = 16;
 const IPV6_RECVPKTINFO: i32 = 49;
+const IPV6_PKTINFO: i32 = 50;
 const IPV6_RECVHOPLIMIT: i32 = 51;
+const IPV6_HOPLIMIT: i32 = 52;
 const IPV6_TCLASS: i32 = 67;
 const IPV6_ADD_MEMBERSHIP: i32 = 20;
 const IPV6_DROP_MEMBERSHIP: i32 = 21;
@@ -1491,33 +1495,47 @@ fn inet_setsockopt(
         },
         SOL_IP => match optname {
             IP_TTL => {
-                opts.ttl = parse_int_opt(value)? as u8;
+                let ttl = parse_int_opt(value)?;
+                if !(1..=255).contains(&ttl) {
+                    return Err(Errno::EINVAL);
+                }
+                opts.ttl = ttl as u8;
                 if let Some(h) = handle {
                     // 必须严格按 handle.sock_type 分派：
                     // - TCP   -> tcp_set_hop_limit
                     // - UDP   -> udp_set_hop_limit
+                    // - ICMP  -> icmp_set_hop_limit
                     // - RAW   -> smoltcp 的 raw socket 没有 hop_limit API，仅记录到 opts
-                    // - ICMP  -> 同 raw
                     // 之前的实现把后两类也错走到 udp_set_hop_limit，调用
                     // udp_socket_mut(handle.inner) 时下转失败触发
                     // "handle refers to a socket of a wrong type" panic。
                     match h.socket_type() {
-                        NetSocketType::Tcp => {
-                            net::stack().tcp_set_hop_limit(h, Some(opts.ttl));
+                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
+                            net::stack()
+                                .socket_set_hop_limit(h, Some(opts.ttl))
+                                .map_err(map_inet_net_error)?
                         }
-                        NetSocketType::Udp => {
-                            net::stack().udp_set_hop_limit(h, Some(opts.ttl));
-                        }
-                        NetSocketType::Raw | NetSocketType::Icmp => {
-                            // TODO: smoltcp 没有 raw/icmp hop limit 概念；opts.ttl 已经在
-                            // 上层 opts 里保存，可供未来 raw send 时取用。
-                        }
+                        NetSocketType::Raw => {}
                     }
                 }
                 Ok(())
             }
             IP_TOS => {
-                opts.tos = parse_int_opt(value)? as u8;
+                let tos = parse_int_opt(value)?;
+                if !(0..=255).contains(&tos) {
+                    return Err(Errno::EINVAL);
+                }
+                opts.tos = tos as u8;
+                if let Some(h) = handle {
+                    match h.socket_type() {
+                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
+                            net::stack()
+                                .socket_set_traffic_class(h, Some(opts.tos))
+                                .map_err(map_inet_net_error)?
+                        }
+                        NetSocketType::Raw => {}
+                    }
+                }
                 Ok(())
             }
             IP_MULTICAST_TTL => {
@@ -1578,15 +1596,12 @@ fn inet_setsockopt(
                 if let Some(h) = handle {
                     // 严格按 handle.sock_type 分派，原因同上 IP_TTL。
                     match h.socket_type() {
-                        NetSocketType::Tcp => {
-                            net::stack().tcp_set_hop_limit(h, Some(opts.hops_v6));
+                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
+                            net::stack()
+                                .socket_set_hop_limit(h, Some(opts.hops_v6))
+                                .map_err(map_inet_net_error)?
                         }
-                        NetSocketType::Udp => {
-                            net::stack().udp_set_hop_limit(h, Some(opts.hops_v6));
-                        }
-                        NetSocketType::Raw | NetSocketType::Icmp => {
-                            // TODO: smoltcp 没有 raw/icmp hop limit 概念；opts.hops_v6 已保存。
-                        }
+                        NetSocketType::Raw => {}
                     }
                 }
                 Ok(())
@@ -1605,7 +1620,22 @@ fn inet_setsockopt(
                 Ok(())
             }
             IPV6_TCLASS => {
-                opts.tclass = parse_int_opt(value)?;
+                let tclass = parse_int_opt(value)?;
+                if !(-1..=255).contains(&tclass) {
+                    return Err(Errno::EINVAL);
+                }
+                opts.tclass = tclass;
+                if let Some(h) = handle {
+                    let traffic_class = if tclass < 0 { None } else { Some(tclass as u8) };
+                    match h.socket_type() {
+                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
+                            net::stack()
+                                .socket_set_traffic_class(h, traffic_class)
+                                .map_err(map_inet_net_error)?
+                        }
+                        NetSocketType::Raw => {}
+                    }
+                }
                 Ok(())
             }
             IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => {
@@ -2086,25 +2116,103 @@ fn encode_inet_pktinfo(result: &InetRecvResult) -> Option<Vec<u8>> {
     Some(encode_cmsg(SOL_IP, IP_PKTINFO, &payload))
 }
 
+fn encode_inet_ttl(result: &InetRecvResult) -> Option<Vec<u8>> {
+    let local = result.local?;
+    if !matches!(local.addr, net::IpAddr::V4(_)) {
+        return None;
+    }
+    let ttl = result.hop_limit? as i32;
+    Some(encode_cmsg(SOL_IP, IP_TTL, &ttl.to_ne_bytes()))
+}
+
+fn encode_inet_tos(result: &InetRecvResult) -> Option<Vec<u8>> {
+    let local = result.local?;
+    if !matches!(local.addr, net::IpAddr::V4(_)) {
+        return None;
+    }
+    let tos = result.traffic_class?;
+    Some(encode_cmsg(SOL_IP, IP_TOS, &[tos]))
+}
+
+fn encode_inet6_pktinfo(result: &InetRecvResult) -> Option<Vec<u8>> {
+    let local = result.local?;
+    let net::IpAddr::V6(addr) = local.addr else {
+        return None;
+    };
+    let ifindex = result
+        .interface_id
+        .map(|id| id.raw().saturating_add(1) as u32)
+        .unwrap_or(0);
+    let mut payload = [0u8; 20];
+    payload[0..16].copy_from_slice(&addr.0);
+    payload[16..20].copy_from_slice(&ifindex.to_ne_bytes());
+    Some(encode_cmsg(SOL_IPV6, IPV6_PKTINFO, &payload))
+}
+
+fn encode_inet6_hoplimit(result: &InetRecvResult) -> Option<Vec<u8>> {
+    let local = result.local?;
+    if !matches!(local.addr, net::IpAddr::V6(_)) {
+        return None;
+    }
+    let hoplimit = result.hop_limit? as i32;
+    Some(encode_cmsg(
+        SOL_IPV6,
+        IPV6_HOPLIMIT,
+        &hoplimit.to_ne_bytes(),
+    ))
+}
+
+fn append_receive_cmsg(out: &mut Vec<u8>, control_len: usize, cmsg: Vec<u8>) -> bool {
+    if out.len() + cmsg.len() <= control_len {
+        out.extend_from_slice(&cmsg);
+        false
+    } else {
+        true
+    }
+}
+
 fn encode_inet_receive_control(
     net_ops: &NetSocketFileOps,
     result: &InetRecvResult,
     control_len: usize,
 ) -> (Vec<u8>, bool) {
-    let opts = net_ops.options().lock();
-    if !opts.pktinfo {
-        return (Vec::new(), false);
-    }
-    drop(opts);
+    let opts = net_ops.options().lock().clone();
+    encode_inet_receive_control_with_options(&opts, result, control_len)
+}
 
-    let Some(pktinfo) = encode_inet_pktinfo(result) else {
-        return (Vec::new(), false);
-    };
-    if pktinfo.len() <= control_len {
-        (pktinfo, false)
-    } else {
-        (Vec::new(), true)
+fn encode_inet_receive_control_with_options(
+    opts: &SocketOptions,
+    result: &InetRecvResult,
+    control_len: usize,
+) -> (Vec<u8>, bool) {
+    let mut out = Vec::new();
+    let mut truncated = false;
+    if opts.pktinfo {
+        if let Some(cmsg) = encode_inet_pktinfo(result) {
+            truncated |= append_receive_cmsg(&mut out, control_len, cmsg);
+        }
     }
+    if !truncated && opts.recvttl {
+        if let Some(cmsg) = encode_inet_ttl(result) {
+            truncated |= append_receive_cmsg(&mut out, control_len, cmsg);
+        }
+    }
+    if !truncated && opts.recvtos {
+        if let Some(cmsg) = encode_inet_tos(result) {
+            truncated |= append_receive_cmsg(&mut out, control_len, cmsg);
+        }
+    }
+    if !truncated && opts.recv_pktinfo_v6 {
+        if let Some(cmsg) = encode_inet6_pktinfo(result) {
+            truncated |= append_receive_cmsg(&mut out, control_len, cmsg);
+        }
+    }
+    if !truncated && opts.recv_hoplimit_v6 {
+        if let Some(cmsg) = encode_inet6_hoplimit(result) {
+            truncated |= append_receive_cmsg(&mut out, control_len, cmsg);
+        }
+    }
+    (out, truncated)
 }
 
 fn rights_capacity_remaining(remaining: usize) -> usize {
@@ -2159,4 +2267,143 @@ fn encode_receive_control(
 
 const fn align_cmsg(value: usize) -> usize {
     (value + (CMSG_ALIGN - 1)) & !(CMSG_ALIGN - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_cmsgs(control: &[u8]) -> Vec<(i32, i32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset + CMSG_HEADER_LEN <= control.len() {
+            let len =
+                usize::from_ne_bytes(control[offset..offset + 8].try_into().expect("cmsg len"));
+            if len < CMSG_HEADER_LEN || offset + len > control.len() {
+                break;
+            }
+            let level = i32::from_ne_bytes(
+                control[offset + 8..offset + 12]
+                    .try_into()
+                    .expect("cmsg level"),
+            );
+            let kind = i32::from_ne_bytes(
+                control[offset + 12..offset + 16]
+                    .try_into()
+                    .expect("cmsg kind"),
+            );
+            out.push((
+                level,
+                kind,
+                control[offset + CMSG_HEADER_LEN..offset + len].to_vec(),
+            ));
+            offset = align_cmsg(offset + len);
+        }
+        out
+    }
+
+    #[test]
+    fn inet_receive_control_encodes_ipv4_pktinfo_ttl_tos() {
+        let mut opts = SocketOptions::default();
+        opts.pktinfo = true;
+        opts.recvttl = true;
+        opts.recvtos = true;
+        let result = InetRecvResult {
+            len: 4,
+            remote: None,
+            local: Some(net::Endpoint {
+                addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 1, 2, 3)),
+                port: 7783,
+            }),
+            interface_id: Some(InterfaceId(4)),
+            hop_limit: Some(37),
+            traffic_class: Some(0xbb),
+            msg_flags: 0,
+        };
+
+        let (control, truncated) = encode_inet_receive_control_with_options(&opts, &result, 128);
+        assert!(!truncated);
+        let cmsgs = parse_cmsgs(&control);
+        assert_eq!(cmsgs.len(), 3);
+
+        assert_eq!(cmsgs[0].0, SOL_IP);
+        assert_eq!(cmsgs[0].1, IP_PKTINFO);
+        assert_eq!(cmsgs[0].2.len(), 12);
+        assert_eq!(i32::from_ne_bytes(cmsgs[0].2[0..4].try_into().unwrap()), 5);
+        assert_eq!(&cmsgs[0].2[4..8], &[10, 1, 2, 3]);
+        assert_eq!(&cmsgs[0].2[8..12], &[10, 1, 2, 3]);
+
+        assert_eq!(cmsgs[1].0, SOL_IP);
+        assert_eq!(cmsgs[1].1, IP_TTL);
+        assert_eq!(i32::from_ne_bytes(cmsgs[1].2[0..4].try_into().unwrap()), 37);
+
+        assert_eq!(cmsgs[2].0, SOL_IP);
+        assert_eq!(cmsgs[2].1, IP_TOS);
+        assert_eq!(cmsgs[2].2, vec![0xbb]);
+    }
+
+    #[test]
+    fn inet_receive_control_encodes_ipv6_pktinfo_hoplimit() {
+        let mut opts = SocketOptions::default();
+        opts.recv_pktinfo_v6 = true;
+        opts.recv_hoplimit_v6 = true;
+        let addr = net::Ipv6Addr::new([0x2001, 0xdb8, 0, 0, 0, 0, 0, 7]);
+        let result = InetRecvResult {
+            len: 4,
+            remote: None,
+            local: Some(net::Endpoint {
+                addr: net::IpAddr::V6(addr),
+                port: 7783,
+            }),
+            interface_id: Some(InterfaceId(8)),
+            hop_limit: Some(63),
+            traffic_class: Some(0),
+            msg_flags: 0,
+        };
+
+        let (control, truncated) = encode_inet_receive_control_with_options(&opts, &result, 128);
+        assert!(!truncated);
+        let cmsgs = parse_cmsgs(&control);
+        assert_eq!(cmsgs.len(), 2);
+
+        assert_eq!(cmsgs[0].0, SOL_IPV6);
+        assert_eq!(cmsgs[0].1, IPV6_PKTINFO);
+        assert_eq!(cmsgs[0].2.len(), 20);
+        assert_eq!(&cmsgs[0].2[0..16], &addr.0);
+        assert_eq!(
+            u32::from_ne_bytes(cmsgs[0].2[16..20].try_into().unwrap()),
+            9
+        );
+
+        assert_eq!(cmsgs[1].0, SOL_IPV6);
+        assert_eq!(cmsgs[1].1, IPV6_HOPLIMIT);
+        assert_eq!(i32::from_ne_bytes(cmsgs[1].2[0..4].try_into().unwrap()), 63);
+    }
+
+    #[test]
+    fn inet_receive_control_sets_truncation_after_last_fitting_cmsg() {
+        let mut opts = SocketOptions::default();
+        opts.pktinfo = true;
+        opts.recvttl = true;
+        let result = InetRecvResult {
+            len: 4,
+            remote: None,
+            local: Some(net::Endpoint {
+                addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 1, 2, 3)),
+                port: 7783,
+            }),
+            interface_id: Some(InterfaceId(4)),
+            hop_limit: Some(37),
+            traffic_class: Some(0),
+            msg_flags: 0,
+        };
+
+        let pktinfo_len = align_cmsg(CMSG_HEADER_LEN + 12);
+        let (control, truncated) =
+            encode_inet_receive_control_with_options(&opts, &result, pktinfo_len);
+        assert!(truncated);
+        let cmsgs = parse_cmsgs(&control);
+        assert_eq!(cmsgs.len(), 1);
+        assert_eq!(cmsgs[0].1, IP_PKTINFO);
+    }
 }

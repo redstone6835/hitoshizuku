@@ -68,6 +68,8 @@ pub struct UdpRecvInfo {
     pub len: usize,
     pub remote: Endpoint,
     pub local: Option<Endpoint>,
+    pub hop_limit: Option<u8>,
+    pub traffic_class: Option<u8>,
 }
 
 /// Raw/ICMP 接收结果。
@@ -2418,6 +2420,8 @@ fn udp_recv_filtered(
                         len: data.len(),
                         remote,
                         local: udp_local_from_metadata(meta, local_port),
+                        hop_limit: meta.meta.hop_limit,
+                        traffic_class: meta.meta.traffic_class,
                     });
                 }
                 true
@@ -2440,6 +2444,8 @@ fn udp_recv_filtered(
                 len: data.len(),
                 remote,
                 local: udp_local_from_metadata(&meta, local_port),
+                hop_limit: meta.meta.hop_limit,
+                traffic_class: meta.meta.traffic_class,
             });
         }
     }
@@ -3481,6 +3487,46 @@ mod tests {
         assert_eq!(info.remote, expected_remote);
         assert_eq!(info.local, expected_local);
         assert_eq!(&buf[..info.len], b"pktinfo");
+    }
+
+    #[test]
+    fn udp_recv_info_preserves_ip_header_metadata() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-recv-ip-meta",
+            IfConfig::static_v4(Ipv4Addr::new(10, 58, 1, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7783,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+
+        let mut packet = build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 58, 1, 77),
+            smoltcp::wire::Ipv4Address::new(10, 58, 1, 2),
+            9002,
+            7783,
+            b"meta",
+        );
+        {
+            let mut ip_packet = smoltcp::wire::Ipv4Packet::new_unchecked(packet.as_mut_slice());
+            ip_packet.set_hop_limit(37);
+            ip_packet.set_dscp(0x2e);
+            ip_packet.set_ecn(0x03);
+            ip_packet.fill_checksum();
+        }
+        driver.push_rx(packet);
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 16];
+        let info = stack.udp_recv_info(handle, &mut buf).unwrap();
+        assert_eq!(info.len, 4);
+        assert_eq!(info.hop_limit, Some(37));
+        assert_eq!(info.traffic_class, Some(0xbb));
+        assert_eq!(&buf[..info.len], b"meta");
     }
 
     #[test]

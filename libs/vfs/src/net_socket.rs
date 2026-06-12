@@ -65,6 +65,8 @@ pub struct InetRecvResult {
     pub remote: Option<Endpoint>,
     pub local: Option<Endpoint>,
     pub interface_id: Option<net::InterfaceId>,
+    pub hop_limit: Option<u8>,
+    pub traffic_class: Option<u8>,
     pub msg_flags: usize,
 }
 
@@ -643,6 +645,8 @@ impl NetSocketFileOps {
                                     remote: *self.remote.lock(),
                                     local: None,
                                     interface_id: None,
+                                    hop_limit: None,
+                                    traffic_class: None,
                                     msg_flags: 0,
                                 });
                             }
@@ -675,6 +679,8 @@ impl NetSocketFileOps {
                                     remote: *self.remote.lock(),
                                     local: None,
                                     interface_id: None,
+                                    hop_limit: None,
+                                    traffic_class: None,
                                     msg_flags: 0,
                                 });
                             }
@@ -686,6 +692,8 @@ impl NetSocketFileOps {
                                         remote: *self.remote.lock(),
                                         local: None,
                                         interface_id: None,
+                                        hop_limit: None,
+                                        traffic_class: None,
                                         msg_flags: 0,
                                     });
                                 }
@@ -698,6 +706,8 @@ impl NetSocketFileOps {
                                             remote: *self.remote.lock(),
                                             local: None,
                                             interface_id: None,
+                                            hop_limit: None,
+                                            traffic_class: None,
                                             msg_flags: 0,
                                         })
                                     } else {
@@ -712,6 +722,8 @@ impl NetSocketFileOps {
                                             remote: *self.remote.lock(),
                                             local: None,
                                             interface_id: None,
+                                            hop_limit: None,
+                                            traffic_class: None,
                                             msg_flags: 0,
                                         })
                                     } else {
@@ -735,6 +747,8 @@ impl NetSocketFileOps {
                     remote: *self.remote.lock(),
                     local: None,
                     interface_id: None,
+                    hop_limit: None,
+                    traffic_class: None,
                     msg_flags: 0,
                 })
             }
@@ -753,6 +767,8 @@ impl NetSocketFileOps {
                                     remote: Some(info.remote),
                                     local: info.local,
                                     interface_id: Some(handle.interface_id()),
+                                    hop_limit: info.hop_limit,
+                                    traffic_class: info.traffic_class,
                                     msg_flags: datagram_msg_flags(info.len, buf.len(), opts.trunc),
                                 });
                             }
@@ -784,6 +800,8 @@ impl NetSocketFileOps {
                                 remote: Some(info.remote),
                                 local: info.local,
                                 interface_id: Some(handle.interface_id()),
+                                hop_limit: info.hop_limit,
+                                traffic_class: info.traffic_class,
                                 msg_flags: datagram_msg_flags(info.len, buf.len(), opts.trunc),
                             });
                         }
@@ -810,6 +828,8 @@ impl NetSocketFileOps {
                     remote,
                     local: None,
                     interface_id: None,
+                    hop_limit: None,
+                    traffic_class: None,
                     msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
                 })
             }
