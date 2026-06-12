@@ -63,6 +63,8 @@ pub struct InetRecvOptions {
 pub struct InetRecvResult {
     pub len: usize,
     pub remote: Option<Endpoint>,
+    pub local: Option<Endpoint>,
+    pub interface_id: Option<net::InterfaceId>,
     pub msg_flags: usize,
 }
 
@@ -639,6 +641,8 @@ impl NetSocketFileOps {
                                 return Ok(InetRecvResult {
                                     len: n,
                                     remote: *self.remote.lock(),
+                                    local: None,
+                                    interface_id: None,
                                     msg_flags: 0,
                                 });
                             }
@@ -669,6 +673,8 @@ impl NetSocketFileOps {
                                 return Ok(InetRecvResult {
                                     len: total,
                                     remote: *self.remote.lock(),
+                                    local: None,
+                                    interface_id: None,
                                     msg_flags: 0,
                                 });
                             }
@@ -678,6 +684,8 @@ impl NetSocketFileOps {
                                     return Ok(InetRecvResult {
                                         len: total,
                                         remote: *self.remote.lock(),
+                                        local: None,
+                                        interface_id: None,
                                         msg_flags: 0,
                                     });
                                 }
@@ -688,6 +696,8 @@ impl NetSocketFileOps {
                                         Ok(InetRecvResult {
                                             len: total,
                                             remote: *self.remote.lock(),
+                                            local: None,
+                                            interface_id: None,
                                             msg_flags: 0,
                                         })
                                     } else {
@@ -700,6 +710,8 @@ impl NetSocketFileOps {
                                         Ok(InetRecvResult {
                                             len: total,
                                             remote: *self.remote.lock(),
+                                            local: None,
+                                            interface_id: None,
                                             msg_flags: 0,
                                         })
                                     } else {
@@ -721,6 +733,8 @@ impl NetSocketFileOps {
                 Ok(InetRecvResult {
                     len: n,
                     remote: *self.remote.lock(),
+                    local: None,
+                    interface_id: None,
                     msg_flags: 0,
                 })
             }
@@ -728,16 +742,18 @@ impl NetSocketFileOps {
                 if opts.peek {
                     loop {
                         let peer = *self.remote.lock();
-                        match net::stack().udp_peek_from(handle, buf) {
-                            Ok((n, remote)) => {
-                                if !udp_peer_matches(peer, remote) {
+                        match net::stack().udp_peek_info(handle, buf) {
+                            Ok(info) => {
+                                if !udp_peer_matches(peer, info.remote) {
                                     let _ = net::stack().udp_recv_from(handle, buf);
                                     continue;
                                 }
                                 return Ok(InetRecvResult {
-                                    len: n,
-                                    remote: Some(remote),
-                                    msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
+                                    len: info.len,
+                                    remote: Some(info.remote),
+                                    local: info.local,
+                                    interface_id: Some(handle.interface_id()),
+                                    msg_flags: datagram_msg_flags(info.len, buf.len(), opts.trunc),
                                 });
                             }
                             Err(NetError::WouldBlock) => {
@@ -758,15 +774,17 @@ impl NetSocketFileOps {
                 }
                 loop {
                     let peer = *self.remote.lock();
-                    match net::stack().udp_recv_from(handle, buf) {
-                        Ok((n, remote)) => {
-                            if !udp_peer_matches(peer, remote) {
+                    match net::stack().udp_recv_info(handle, buf) {
+                        Ok(info) => {
+                            if !udp_peer_matches(peer, info.remote) {
                                 continue;
                             }
                             return Ok(InetRecvResult {
-                                len: n,
-                                remote: Some(remote),
-                                msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
+                                len: info.len,
+                                remote: Some(info.remote),
+                                local: info.local,
+                                interface_id: Some(handle.interface_id()),
+                                msg_flags: datagram_msg_flags(info.len, buf.len(), opts.trunc),
                             });
                         }
                         Err(NetError::WouldBlock) => {
@@ -790,6 +808,8 @@ impl NetSocketFileOps {
                 Ok(InetRecvResult {
                     len: n,
                     remote,
+                    local: None,
+                    interface_id: None,
                     msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
                 })
             }

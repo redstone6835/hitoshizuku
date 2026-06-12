@@ -62,6 +62,14 @@ pub struct TcpAcceptInfo {
     pub remote: Option<Endpoint>,
 }
 
+/// UDP 接收结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpRecvInfo {
+    pub len: usize,
+    pub remote: Endpoint,
+    pub local: Option<Endpoint>,
+}
+
 /// Raw/ICMP 接收结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawRecvInfo {
@@ -1085,6 +1093,16 @@ impl NetStack {
         handle: NetSocketHandle,
         buf: &mut [u8],
     ) -> Result<(usize, Endpoint), NetError> {
+        self.udp_peek_info(handle, buf)
+            .map(|info| (info.len, info.remote))
+    }
+
+    /// UDP peek（窥视一个数据报，不消费），同时返回本地目的地址元信息。
+    pub fn udp_peek_info(
+        &self,
+        handle: NetSocketHandle,
+        buf: &mut [u8],
+    ) -> Result<UdpRecvInfo, NetError> {
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
@@ -1529,6 +1547,16 @@ impl NetStack {
         handle: NetSocketHandle,
         buf: &mut [u8],
     ) -> Result<(usize, Endpoint), NetError> {
+        self.udp_recv_info(handle, buf)
+            .map(|info| (info.len, info.remote))
+    }
+
+    /// UDP recvfrom（非阻塞），同时返回本地目的地址元信息。
+    pub fn udp_recv_info(
+        &self,
+        handle: NetSocketHandle,
+        buf: &mut [u8],
+    ) -> Result<UdpRecvInfo, NetError> {
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
         }
@@ -2374,7 +2402,8 @@ fn udp_recv_filtered(
     peer: Option<Endpoint>,
     buf: &mut [u8],
     peek: bool,
-) -> Result<(usize, Endpoint), NetError> {
+) -> Result<UdpRecvInfo, NetError> {
+    let local_port = socket.endpoint().port;
     loop {
         if peek {
             let drop_current = {
@@ -2385,7 +2414,11 @@ fn udp_recv_filtered(
                         return Err(NetError::BufferTooSmall);
                     }
                     buf[..data.len()].copy_from_slice(data);
-                    return Ok((data.len(), remote));
+                    return Ok(UdpRecvInfo {
+                        len: data.len(),
+                        remote,
+                        local: udp_local_from_metadata(meta, local_port),
+                    });
                 }
                 true
             };
@@ -2403,9 +2436,22 @@ fn udp_recv_filtered(
                 return Err(NetError::BufferTooSmall);
             }
             buf[..data.len()].copy_from_slice(data);
-            return Ok((data.len(), remote));
+            return Ok(UdpRecvInfo {
+                len: data.len(),
+                remote,
+                local: udp_local_from_metadata(&meta, local_port),
+            });
         }
     }
+}
+
+fn udp_local_from_metadata(
+    meta: &smoltcp::socket::udp::UdpMetadata,
+    port: u16,
+) -> Option<Endpoint> {
+    let mut endpoint = endpoint_from_ip_address(meta.local_address?);
+    endpoint.port = port;
+    Some(endpoint)
 }
 
 fn udp_next_recv_len_filtered(
@@ -3389,6 +3435,52 @@ mod tests {
         assert_eq!(len, 6);
         assert_eq!(stack.socket_recv_queue(handle), 0);
         assert_eq!(stack.socket_recv_next_len(handle), 0);
+    }
+
+    #[test]
+    fn udp_recv_info_preserves_local_destination() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-udp-recv-info",
+            IfConfig::static_v4(Ipv4Addr::new(10, 58, 0, 2), 24, None),
+        );
+        let handle = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 7782,
+        };
+        assert_eq!(stack.udp_bind(handle, local), Ok(local));
+
+        driver.push_rx(build_udpv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 58, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 58, 0, 2),
+            9001,
+            7782,
+            b"pktinfo",
+        ));
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let expected_remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 58, 0, 77)),
+            port: 9001,
+        };
+        let expected_local = Some(Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 58, 0, 2)),
+            port: 7782,
+        });
+        let mut buf = [0u8; 16];
+        let peek = stack.udp_peek_info(handle, &mut buf).unwrap();
+        assert_eq!(peek.len, 7);
+        assert_eq!(peek.remote, expected_remote);
+        assert_eq!(peek.local, expected_local);
+        assert_eq!(&buf[..peek.len], b"pktinfo");
+
+        let info = stack.udp_recv_info(handle, &mut buf).unwrap();
+        assert_eq!(info.len, 7);
+        assert_eq!(info.remote, expected_remote);
+        assert_eq!(info.local, expected_local);
+        assert_eq!(&buf[..info.len], b"pktinfo");
     }
 
     #[test]

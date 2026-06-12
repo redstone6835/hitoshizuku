@@ -16,7 +16,7 @@ use socket::{
     UnixAddress,
 };
 
-use crate::net_socket::{InetRecvOptions, InetSendOptions, NetSocketFileOps};
+use crate::net_socket::{InetRecvOptions, InetRecvResult, InetSendOptions, NetSocketFileOps};
 use crate::operation;
 use crate::vfs::VfsContext;
 use crate::vfs::cred::Credentials;
@@ -885,11 +885,17 @@ pub fn recv(
         } else {
             None
         };
+        let (control, control_truncated) =
+            encode_inet_receive_control(net_ops, &result, control_len);
+        let mut msg_flags = result.msg_flags;
+        if control_truncated {
+            msg_flags |= MSG_CTRUNC;
+        }
         return Ok(RecvOutput {
             len: result.len,
             address,
-            control: Vec::new(),
-            msg_flags: result.msg_flags,
+            control,
+            msg_flags,
         });
     }
 
@@ -2050,6 +2056,55 @@ fn encode_credentials(identity: PeerIdentity) -> Vec<u8> {
     out[20..24].copy_from_slice(&identity.user.to_ne_bytes());
     out[24..28].copy_from_slice(&identity.group.to_ne_bytes());
     out
+}
+
+fn encode_cmsg(level: i32, kind: i32, payload: &[u8]) -> Vec<u8> {
+    let cmsg_len = CMSG_HEADER_LEN + payload.len();
+    let total = align_cmsg(cmsg_len);
+    let mut out = vec![0u8; total];
+    out[0..8].copy_from_slice(&cmsg_len.to_ne_bytes());
+    out[8..12].copy_from_slice(&level.to_ne_bytes());
+    out[12..16].copy_from_slice(&kind.to_ne_bytes());
+    out[CMSG_HEADER_LEN..CMSG_HEADER_LEN + payload.len()].copy_from_slice(payload);
+    out
+}
+
+fn encode_inet_pktinfo(result: &InetRecvResult) -> Option<Vec<u8>> {
+    let local = result.local?;
+    let net::IpAddr::V4(addr) = local.addr else {
+        return None;
+    };
+    let ifindex = result
+        .interface_id
+        .map(|id| id.raw().saturating_add(1) as i32)
+        .unwrap_or(0);
+    let mut payload = [0u8; 12];
+    payload[0..4].copy_from_slice(&ifindex.to_ne_bytes());
+    // Linux in_pktinfo: ipi_spec_dst 与 ipi_addr 都填入本报文目的地址。
+    payload[4..8].copy_from_slice(&addr.0);
+    payload[8..12].copy_from_slice(&addr.0);
+    Some(encode_cmsg(SOL_IP, IP_PKTINFO, &payload))
+}
+
+fn encode_inet_receive_control(
+    net_ops: &NetSocketFileOps,
+    result: &InetRecvResult,
+    control_len: usize,
+) -> (Vec<u8>, bool) {
+    let opts = net_ops.options().lock();
+    if !opts.pktinfo {
+        return (Vec::new(), false);
+    }
+    drop(opts);
+
+    let Some(pktinfo) = encode_inet_pktinfo(result) else {
+        return (Vec::new(), false);
+    };
+    if pktinfo.len() <= control_len {
+        (pktinfo, false)
+    } else {
+        (Vec::new(), true)
+    }
 }
 
 fn rights_capacity_remaining(remaining: usize) -> usize {
