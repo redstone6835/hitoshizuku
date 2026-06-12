@@ -833,13 +833,41 @@ impl NetStack {
         if handle.sock_type != SocketType::Tcp {
             return;
         }
-        let table = self.interfaces.read();
-        if let Some(iface_lock) = table.get(&handle.iface_id) {
-            let mut managed = iface_lock.lock();
-            if managed.handle_is_live(handle) {
-                managed.tcp_socket_mut(handle.inner).set_hop_limit(ttl);
-            }
+        let _ = self.socket_set_hop_limit(handle, ttl);
+    }
+
+    /// 设置由协议栈生成 IP 头的 socket 出站 hop limit。
+    ///
+    /// Raw socket 发送路径由调用方提供完整 IP 包头，不能在这里重写 TTL/hop limit。
+    pub fn socket_set_hop_limit(
+        &self,
+        handle: NetSocketHandle,
+        hop_limit: Option<u8>,
+    ) -> Result<(), NetError> {
+        if matches!(hop_limit, Some(0)) {
+            return Err(NetError::InvalidArgument);
         }
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        match handle.sock_type {
+            SocketType::Tcp => managed
+                .tcp_socket_mut(handle.inner)
+                .set_hop_limit(hop_limit),
+            SocketType::Udp => managed
+                .udp_socket_mut(handle.inner)
+                .set_hop_limit(hop_limit),
+            SocketType::Icmp => managed
+                .icmp_socket_mut(handle.inner)
+                .set_hop_limit(hop_limit),
+            SocketType::Raw => return Err(NetError::InvalidArgument),
+        }
+        Ok(())
     }
 
     /// 查询 TCP 接收缓冲区可读字节数（FIONREAD）。
@@ -956,13 +984,15 @@ impl NetStack {
         if handle.sock_type != SocketType::Udp {
             return;
         }
-        let table = self.interfaces.read();
-        if let Some(iface_lock) = table.get(&handle.iface_id) {
-            let mut managed = iface_lock.lock();
-            if managed.handle_is_live(handle) {
-                managed.udp_socket_mut(handle.inner).set_hop_limit(ttl);
-            }
+        let _ = self.socket_set_hop_limit(handle, ttl);
+    }
+
+    /// 设置 ICMP 出站 hop limit。
+    pub fn icmp_set_hop_limit(&self, handle: NetSocketHandle, ttl: Option<u8>) {
+        if handle.sock_type != SocketType::Icmp {
+            return;
         }
+        let _ = self.socket_set_hop_limit(handle, ttl);
     }
 
     /// UDP peek（窥视一个数据报，不消费）。
@@ -2239,11 +2269,16 @@ mod tests {
     #[derive(Default)]
     struct TestDriver {
         rx: Mutex<Vec<Vec<u8>>>,
+        tx: Mutex<Vec<Vec<u8>>>,
     }
 
     impl TestDriver {
         fn push_rx(&self, packet: Vec<u8>) {
             self.rx.lock().push(packet);
+        }
+
+        fn last_tx(&self) -> Option<Vec<u8>> {
+            self.tx.lock().last().cloned()
         }
     }
 
@@ -2262,7 +2297,9 @@ mod tests {
             Some(TxBuf::new(alloc::vec![0u8; len].into_boxed_slice()))
         }
 
-        fn commit_tx(&self, _buf: TxBuf) {}
+        fn commit_tx(&self, buf: TxBuf) {
+            self.tx.lock().push(buf.as_slice().to_vec());
+        }
 
         fn link_state(&self) -> LinkState {
             LinkState::Up {
@@ -2325,6 +2362,25 @@ mod tests {
             let mut icmp_packet = Icmpv4Packet::new_unchecked(ip_packet.payload_mut());
             icmp.emit(&mut icmp_packet, &ChecksumCapabilities::default());
         }
+        bytes
+    }
+
+    fn build_icmpv4_echo_request_payload(
+        ident: u16,
+        seq_no: u16,
+        payload: &'static [u8],
+    ) -> Vec<u8> {
+        use smoltcp::phy::ChecksumCapabilities;
+        use smoltcp::wire::{Icmpv4Packet, Icmpv4Repr};
+
+        let icmp = Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data: payload,
+        };
+        let mut bytes = alloc::vec![0u8; icmp.buffer_len()];
+        let mut packet = Icmpv4Packet::new_unchecked(&mut bytes);
+        icmp.emit(&mut packet, &ChecksumCapabilities::default());
         bytes
     }
 
@@ -3118,6 +3174,27 @@ mod tests {
     }
 
     #[test]
+    fn socket_set_hop_limit_rejects_invalid_inputs() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-hop-invalid",
+            IfConfig::static_v4(Ipv4Addr::new(10, 28, 1, 2), 24, None),
+        );
+        let udp = stack.socket_udp_on(iface).unwrap();
+        let raw = stack.socket_raw_on(iface, 4, 253).unwrap();
+
+        assert_eq!(
+            stack.socket_set_hop_limit(udp, Some(0)),
+            Err(NetError::InvalidArgument)
+        );
+        assert_eq!(
+            stack.socket_set_hop_limit(raw, Some(42)),
+            Err(NetError::InvalidArgument)
+        );
+    }
+
+    #[test]
     fn icmp_send_rejects_wrong_route_before_enqueue() {
         let stack = NetStack::new();
         let first = attach_test_iface(
@@ -3141,6 +3218,32 @@ mod tests {
             Err(NetError::Unreachable)
         );
         assert!(stack.raw_can_send(handle));
+    }
+
+    #[test]
+    fn icmp_set_hop_limit_updates_outgoing_ip_header() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-hop",
+            IfConfig::static_v4(Ipv4Addr::new(10, 15, 1, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 15, 1, 77)),
+            port: 0,
+        };
+        let payload = build_icmpv4_echo_request_payload(0x1234, 0x5678, b"hop");
+
+        stack.icmp_set_hop_limit(handle, Some(42));
+        assert_eq!(
+            stack.raw_send(handle, &payload, Some(remote)),
+            Ok(payload.len())
+        );
+
+        let frame = driver.last_tx().unwrap();
+        let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+        assert_eq!(ip_packet.hop_limit(), 42);
     }
 
     #[test]
