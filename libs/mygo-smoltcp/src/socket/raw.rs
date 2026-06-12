@@ -8,7 +8,7 @@ use crate::socket::PollAt;
 use crate::socket::WakerRegistration;
 
 use crate::storage::Empty;
-use crate::wire::{IpProtocol, IpRepr, IpVersion};
+use crate::wire::{IpAddress, IpProtocol, IpRepr, IpVersion};
 #[cfg(feature = "proto-ipv4")]
 use crate::wire::{Ipv4Packet, Ipv4Repr};
 #[cfg(feature = "proto-ipv6")]
@@ -72,11 +72,21 @@ impl core::fmt::Display for RecvError {
 #[cfg(feature = "std")]
 impl std::error::Error for RecvError {}
 
-/// A UDP packet metadata.
-pub type PacketMetadata = crate::storage::PacketMetadata<()>;
+/// Metadata for a sent or received raw IP packet.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct RawMetadata {
+    /// 收到的 IP 包来源地址；发送队列中的包由完整 IP 头决定，通常为 None。
+    pub remote_address: Option<IpAddress>,
+    /// 收到的 IP 包目的地址；发送队列中的包由完整 IP 头决定，通常为 None。
+    pub local_address: Option<IpAddress>,
+}
 
-/// A UDP packet ring buffer.
-pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, ()>;
+/// A raw IP packet metadata.
+pub type PacketMetadata = crate::storage::PacketMetadata<RawMetadata>;
+
+/// A raw IP packet ring buffer.
+pub type PacketBuffer<'a> = crate::storage::PacketBuffer<'a, RawMetadata>;
 
 /// A raw IP socket.
 ///
@@ -212,7 +222,7 @@ impl<'a> Socket<'a> {
     pub fn send(&mut self, size: usize) -> Result<&mut [u8], SendError> {
         let packet_buf = self
             .tx_buffer
-            .enqueue(size, ())
+            .enqueue(size, RawMetadata::default())
             .map_err(|_| SendError::BufferFull)?;
 
         net_trace!(
@@ -234,7 +244,7 @@ impl<'a> Socket<'a> {
     {
         let size = self
             .tx_buffer
-            .enqueue_with_infallible(max_size, (), f)
+            .enqueue_with_infallible(max_size, RawMetadata::default(), f)
             .map_err(|_| SendError::BufferFull)?;
 
         net_trace!(
@@ -262,7 +272,12 @@ impl<'a> Socket<'a> {
     /// **Note:** The IP header is parsed and re-serialized, and may not match
     /// the header actually received bit for bit.
     pub fn recv(&mut self) -> Result<&[u8], RecvError> {
-        let ((), packet_buf) = self.rx_buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
+        self.recv_with_meta().map(|(_, packet_buf)| packet_buf)
+    }
+
+    /// Dequeue a packet and return its metadata together with the payload.
+    pub fn recv_with_meta(&mut self) -> Result<(RawMetadata, &[u8]), RecvError> {
+        let (metadata, packet_buf) = self.rx_buffer.dequeue().map_err(|_| RecvError::Exhausted)?;
 
         net_trace!(
             "raw:{:?}:{:?}: receive {} buffered octets",
@@ -270,7 +285,7 @@ impl<'a> Socket<'a> {
             self.ip_protocol,
             packet_buf.len()
         );
-        Ok(packet_buf)
+        Ok((metadata, packet_buf))
     }
 
     /// Dequeue a packet, and copy the payload into the given slice.
@@ -280,14 +295,22 @@ impl<'a> Socket<'a> {
     ///
     /// See also [recv](#method.recv).
     pub fn recv_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
-        let buffer = self.recv()?;
+        self.recv_slice_with_meta(data).map(|(len, _)| len)
+    }
+
+    /// Dequeue a packet, copy it into the given slice, and return its metadata.
+    pub fn recv_slice_with_meta(
+        &mut self,
+        data: &mut [u8],
+    ) -> Result<(usize, RawMetadata), RecvError> {
+        let (metadata, buffer) = self.recv_with_meta()?;
         if data.len() < buffer.len() {
             return Err(RecvError::Truncated);
         }
 
         let length = min(data.len(), buffer.len());
         data[..length].copy_from_slice(&buffer[..length]);
-        Ok(length)
+        Ok((length, metadata))
     }
 
     /// Peek at a packet in the receive buffer and return a pointer to the
@@ -296,7 +319,12 @@ impl<'a> Socket<'a> {
     ///
     /// It returns `Err(Error::Exhausted)` if the receive buffer is empty.
     pub fn peek(&mut self) -> Result<&[u8], RecvError> {
-        let ((), packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
+        self.peek_with_meta().map(|(_, packet_buf)| packet_buf)
+    }
+
+    /// Peek at a packet and return its metadata together with the payload.
+    pub fn peek_with_meta(&mut self) -> Result<(&RawMetadata, &[u8]), RecvError> {
+        let (metadata, packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
 
         net_trace!(
             "raw:{:?}:{:?}: receive {} buffered octets",
@@ -305,7 +333,7 @@ impl<'a> Socket<'a> {
             packet_buf.len()
         );
 
-        Ok(packet_buf)
+        Ok((metadata, packet_buf))
     }
 
     /// Peek at a packet in the receive buffer, copy the payload into the given slice,
@@ -317,14 +345,22 @@ impl<'a> Socket<'a> {
     ///
     /// See also [peek](#method.peek).
     pub fn peek_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
-        let buffer = self.peek()?;
+        self.peek_slice_with_meta(data).map(|(len, _)| len)
+    }
+
+    /// Peek at a packet, copy it into the given slice, and return its metadata.
+    pub fn peek_slice_with_meta(
+        &mut self,
+        data: &mut [u8],
+    ) -> Result<(usize, RawMetadata), RecvError> {
+        let (metadata, buffer) = self.peek_with_meta()?;
         if data.len() < buffer.len() {
             return Err(RecvError::Truncated);
         }
 
         let length = min(data.len(), buffer.len());
         data[..length].copy_from_slice(&buffer[..length]);
-        Ok(length)
+        Ok((length, *metadata))
     }
 
     /// Return the amount of octets queued in the transmit buffer.
@@ -368,7 +404,12 @@ impl<'a> Socket<'a> {
             total_len
         );
 
-        match self.rx_buffer.enqueue(total_len, ()) {
+        let metadata = RawMetadata {
+            remote_address: Some(ip_repr.src_addr()),
+            local_address: Some(ip_repr.dst_addr()),
+        };
+
+        match self.rx_buffer.enqueue(total_len, metadata) {
             Ok(buf) => {
                 ip_repr.emit(&mut buf[..header_len], &cx.checksum_caps());
                 buf[header_len..].copy_from_slice(payload);
@@ -391,7 +432,7 @@ impl<'a> Socket<'a> {
         let ip_protocol = self.ip_protocol;
         let ip_version = self.ip_version;
         let _checksum_caps = &cx.checksum_caps();
-        let res = self.tx_buffer.dequeue_with(|&mut (), buffer| {
+        let res = self.tx_buffer.dequeue_with(|_, buffer| {
             match IpVersion::of_packet(buffer) {
                 #[cfg(feature = "proto-ipv4")]
                 Ok(IpVersion::Ipv4) => {
@@ -649,6 +690,28 @@ mod test {
 
                     assert!(socket.accepts(&$hdr));
                     socket.process(&mut cx, &$hdr, &buffer);
+                }
+
+                #[rstest]
+                #[case::ip(Medium::Ip)]
+                #[cfg(feature = "medium-ip")]
+                #[case::ethernet(Medium::Ethernet)]
+                #[cfg(feature = "medium-ethernet")]
+                #[case::ieee802154(Medium::Ieee802154)]
+                #[cfg(feature = "medium-ieee802154")]
+                fn test_recv_metadata(#[case] medium: Medium) {
+                    let (mut iface, _, _) = setup(medium);
+                    let mut cx = iface.context();
+                    let mut socket = $socket(buffer(1), buffer(0));
+
+                    assert!(socket.accepts(&$hdr));
+                    socket.process(&mut cx, &$hdr, &$payload);
+
+                    let mut slice = [0; 64];
+                    let (len, meta) = socket.recv_slice_with_meta(&mut slice[..]).unwrap();
+                    assert_eq!(len, $packet.len());
+                    assert_eq!(meta.remote_address, Some($hdr.src_addr()));
+                    assert_eq!(meta.local_address, Some($hdr.dst_addr()));
                 }
 
                 #[rstest]

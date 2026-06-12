@@ -549,14 +549,15 @@ impl NetStack {
         match handle.sock_type {
             SocketType::Raw => {
                 let socket = managed.raw_socket_mut(handle.inner);
-                // raw::Socket 当前不携带来源元信息；调用方需要 None 区分
-                // “协议栈没有给出”与“远端确实是未指定地址”。recv_slice 在
+                // raw 包按完整 IP 报文交付，来源地址从协议栈接收元信息中取出。
                 // 缓冲区不足时会丢弃当前包并返回 Truncated，统一映射为
                 // NetError::BufferTooSmall，避免底层 API 静默截断数据报。
-                let n = socket.recv_slice(buf).map_err(map_raw_recv_error)?;
+                let (n, meta) = socket
+                    .recv_slice_with_meta(buf)
+                    .map_err(map_raw_recv_error)?;
                 Ok(RawRecvInfo {
                     len: n,
-                    remote: None,
+                    remote: meta.remote_address.map(endpoint_from_ip_address),
                 })
             }
             SocketType::Icmp => {
@@ -4516,6 +4517,38 @@ mod tests {
             info.remote,
             Some(Endpoint {
                 addr: IpAddr::V4(Ipv4Addr::new(10, 11, 0, 77)),
+                port: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn raw_recv_from_preserves_raw_remote_address() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-raw-recv-remote",
+            IfConfig::static_v4(Ipv4Addr::new(10, 57, 0, 2), 24, None),
+        );
+        let handle = stack.socket_raw_on(iface, 4, 253).unwrap();
+        let packet = build_raw_ipv4_packet(
+            smoltcp::wire::Ipv4Address::new(10, 57, 0, 77),
+            smoltcp::wire::Ipv4Address::new(10, 57, 0, 2),
+            253,
+            b"raw-remote",
+        );
+        let packet_len = packet.len();
+
+        driver.push_rx(packet);
+        stack.poll_interface(iface, NetInstant::ZERO);
+
+        let mut buf = [0u8; 64];
+        let info = stack.raw_recv_from(handle, &mut buf).unwrap();
+        assert_eq!(info.len, packet_len);
+        assert_eq!(
+            info.remote,
+            Some(Endpoint {
+                addr: IpAddr::V4(Ipv4Addr::new(10, 57, 0, 77)),
                 port: 0,
             })
         );
