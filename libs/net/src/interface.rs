@@ -339,12 +339,15 @@ impl ManagedInterface {
             .routes_mut()
             .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
             .map(|_| ())
-            .map_err(|_| crate::NetError::ResourceExhausted)
+            .map_err(|_| crate::NetError::ResourceExhausted)?;
+        self.config.gateway = gateway_with_v4(self.config.gateway, Some(gateway));
+        Ok(())
     }
 
     /// 移除默认 IPv4 路由。
     pub fn remove_default_route_v4(&mut self) {
         self.iface.routes_mut().remove_default_ipv4_route();
+        self.config.gateway = gateway_with_v4(self.config.gateway, None);
     }
 
     /// 添加或替换默认 IPv6 路由。
@@ -353,12 +356,15 @@ impl ManagedInterface {
             .routes_mut()
             .add_default_ipv6_route(ipv6_to_smoltcp(gateway))
             .map(|_| ())
-            .map_err(|_| crate::NetError::ResourceExhausted)
+            .map_err(|_| crate::NetError::ResourceExhausted)?;
+        self.config.gateway = gateway_with_v6(self.config.gateway, Some(gateway));
+        Ok(())
     }
 
     /// 移除默认 IPv6 路由。
     pub fn remove_default_route_v6(&mut self) {
         self.iface.routes_mut().remove_default_ipv6_route();
+        self.config.gateway = gateway_with_v6(self.config.gateway, None);
     }
 
     // ── 运行时配置（供 ioctl / netlink 写操作使用）─────────────────────
@@ -412,11 +418,7 @@ impl ManagedInterface {
     ) -> Result<(), crate::NetError> {
         let prefix_len = mask_to_prefix_len(mask);
         if prefix_len == 0 {
-            self.iface
-                .routes_mut()
-                .add_default_ipv4_route(ipv4_to_smoltcp(gateway))
-                .map(|_| ())
-                .map_err(|_| crate::NetError::ResourceExhausted)
+            self.add_default_route_v4(gateway)
         } else {
             upsert_smoltcp_route(
                 self.iface.routes_mut(),
@@ -433,7 +435,7 @@ impl ManagedInterface {
     pub fn remove_route_v4(&mut self, dest: Ipv4Addr, mask: Ipv4Addr) {
         let prefix_len = mask_to_prefix_len(mask);
         if prefix_len == 0 {
-            self.iface.routes_mut().remove_default_ipv4_route();
+            self.remove_default_route_v4();
         } else {
             remove_smoltcp_route(
                 self.iface.routes_mut(),
@@ -454,11 +456,7 @@ impl ManagedInterface {
     ) -> Result<(), crate::NetError> {
         let prefix_len = prefix_len.min(128);
         if prefix_len == 0 {
-            self.iface
-                .routes_mut()
-                .add_default_ipv6_route(ipv6_to_smoltcp(gateway))
-                .map(|_| ())
-                .map_err(|_| crate::NetError::ResourceExhausted)
+            self.add_default_route_v6(gateway)
         } else {
             upsert_smoltcp_route(
                 self.iface.routes_mut(),
@@ -475,7 +473,7 @@ impl ManagedInterface {
     pub fn remove_route_v6(&mut self, dest: Ipv6Addr, prefix_len: u8) {
         let prefix_len = prefix_len.min(128);
         if prefix_len == 0 {
-            self.iface.routes_mut().remove_default_ipv6_route();
+            self.remove_default_route_v6();
         } else {
             remove_smoltcp_route(
                 self.iface.routes_mut(),
@@ -1329,6 +1327,32 @@ fn gateway_default_route_count(gateway: Option<Gateway>) -> usize {
     }
 }
 
+fn gateway_with_v4(current: Option<Gateway>, v4: Option<Ipv4Addr>) -> Option<Gateway> {
+    let v6 = match current {
+        Some(Gateway::V6(v6)) | Some(Gateway::DualStack { v6, .. }) => Some(v6),
+        Some(Gateway::V4(_)) | None => None,
+    };
+    match (v4, v6) {
+        (Some(v4), Some(v6)) => Some(Gateway::DualStack { v4, v6 }),
+        (Some(v4), None) => Some(Gateway::V4(v4)),
+        (None, Some(v6)) => Some(Gateway::V6(v6)),
+        (None, None) => None,
+    }
+}
+
+fn gateway_with_v6(current: Option<Gateway>, v6: Option<Ipv6Addr>) -> Option<Gateway> {
+    let v4 = match current {
+        Some(Gateway::V4(v4)) | Some(Gateway::DualStack { v4, .. }) => Some(v4),
+        Some(Gateway::V6(_)) | None => None,
+    };
+    match (v4, v6) {
+        (Some(v4), Some(v6)) => Some(Gateway::DualStack { v4, v6 }),
+        (Some(v4), None) => Some(Gateway::V4(v4)),
+        (None, Some(v6)) => Some(Gateway::V6(v6)),
+        (None, None) => None,
+    }
+}
+
 fn is_default_route_cidr(cidr: IpCidr) -> bool {
     match cidr {
         IpCidr::Ipv4(cidr) => cidr.prefix_len() == 0,
@@ -1599,6 +1623,25 @@ mod tests {
             iface.add_default_route_v6(Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1])),
             Err(crate::NetError::ResourceExhausted)
         );
+    }
+
+    #[test]
+    fn default_route_updates_config_gateway_snapshot() {
+        let (_id, mut iface) = test_interface();
+        let v4 = Ipv4Addr::new(10, 0, 0, 254);
+        let v6 = Ipv6Addr::new([0x2001, 0x0db8, 0x0001, 0, 0, 0, 0, 1]);
+
+        iface.add_default_route_v4(v4).unwrap();
+        assert_eq!(iface.config().gateway, Some(Gateway::V4(v4)));
+
+        iface.add_default_route_v6(v6).unwrap();
+        assert_eq!(iface.config().gateway, Some(Gateway::DualStack { v4, v6 }));
+
+        iface.remove_default_route_v4();
+        assert_eq!(iface.config().gateway, Some(Gateway::V6(v6)));
+
+        iface.remove_default_route_v6();
+        assert_eq!(iface.config().gateway, None);
     }
 
     #[test]
