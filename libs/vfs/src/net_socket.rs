@@ -422,20 +422,9 @@ impl FileOps for NetSocketFileOps {
         match cmd.raw() {
             FIONREAD => {
                 let handle = self.get_handle()?;
-                let n = match handle.socket_type() {
-                    SocketType::Tcp => net::stack().tcp_recv_queue(handle),
-                    // TODO: UDP 应返回下一个 datagram 的长度或队列中可读字节数，
-                    // 当前固定 0 会误导 ioctl(FIONREAD) 调用者。
-                    SocketType::Udp => 0,
-                    SocketType::Raw | SocketType::Icmp => {
-                        // TODO: raw/icmp 这里只返回是否可读，未暴露实际 packet 长度。
-                        if net::stack().raw_can_recv(handle) {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                };
+                // Linux 的 FIONREAD/SIOCINQ 对数据报 socket 返回下一次 recv
+                // 能取到的数据报长度；这里复用 net 层已过滤 UDP peer 的视图。
+                let n = net::stack().socket_recv_next_len(handle);
                 Ok(n)
             }
             SIOCATMARK => {
@@ -797,10 +786,10 @@ impl NetSocketFileOps {
                 }
             }
             SocketType::Raw | SocketType::Icmp => {
-                let n = self.do_recv_with(buf, opts.nonblocking, opts.deadline_ns)?;
+                let (n, remote) = self.do_raw_recv_from(buf, opts.nonblocking, opts.deadline_ns)?;
                 Ok(InetRecvResult {
                     len: n,
-                    remote: None,
+                    remote,
                     msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
                 })
             }
@@ -1169,23 +1158,48 @@ impl NetSocketFileOps {
                     Err(e) => return Err(map_net_error(e)),
                 }
             },
-            SocketType::Raw | SocketType::Icmp => loop {
-                match net::stack().raw_recv(handle, buf) {
-                    Ok(n) => return Ok(n),
-                    Err(NetError::WouldBlock) => {
-                        if nonblocking {
-                            return Err(Errno::EAGAIN);
-                        }
-                        if self.deadline_expired(deadline) {
-                            return Err(Errno::EAGAIN);
-                        }
-                        self.wait_with_deadline_until(deadline, || {
-                            net::stack().raw_can_recv(handle)
-                        })?;
+            SocketType::Raw | SocketType::Icmp => self
+                .do_raw_recv_from_with_handle(handle, buf, nonblocking, deadline)
+                .map(|(len, _)| len),
+        }
+    }
+
+    fn do_raw_recv_from(
+        &self,
+        buf: &mut [u8],
+        nonblocking: bool,
+        call_deadline: Option<u64>,
+    ) -> Result<(usize, Option<Endpoint>), Errno> {
+        if self.options.lock().read_shutdown {
+            return Ok((0, None)); // EOF — 读方向已关闭
+        }
+        let handle = self.get_handle()?;
+        let deadline = self.recv_wait_deadline(call_deadline);
+        let nonblocking = nonblocking || self.is_nonblock();
+        self.do_raw_recv_from_with_handle(handle, buf, nonblocking, deadline)
+    }
+
+    fn do_raw_recv_from_with_handle(
+        &self,
+        handle: NetSocketHandle,
+        buf: &mut [u8],
+        nonblocking: bool,
+        deadline: Option<u64>,
+    ) -> Result<(usize, Option<Endpoint>), Errno> {
+        loop {
+            match net::stack().raw_recv_from(handle, buf) {
+                Ok(info) => return Ok((info.len, info.remote)),
+                Err(NetError::WouldBlock) => {
+                    if nonblocking {
+                        return Err(Errno::EAGAIN);
                     }
-                    Err(e) => return Err(map_net_error(e)),
+                    if self.deadline_expired(deadline) {
+                        return Err(Errno::EAGAIN);
+                    }
+                    self.wait_with_deadline_until(deadline, || net::stack().raw_can_recv(handle))?;
                 }
-            },
+                Err(e) => return Err(map_net_error(e)),
+            }
         }
     }
 

@@ -421,7 +421,7 @@ fn socket_creation_validates_domain_type_protocol_and_flags() {
     let fx = fixture();
 
     assert_eq!(
-        vsock::socket(&fx.ctx, &fx.fdt, 2, vsock::SOCK_STREAM, 0),
+        vsock::socket(&fx.ctx, &fx.fdt, 9999, vsock::SOCK_STREAM, 0),
         Err(Errno::EAFNOSUPPORT)
     );
     assert_eq!(
