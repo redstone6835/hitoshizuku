@@ -843,6 +843,14 @@ impl NetStack {
         let _ = self.socket_set_hop_limit(handle, ttl);
     }
 
+    /// 设置 TCP 出站 traffic class。
+    pub fn tcp_set_traffic_class(&self, handle: NetSocketHandle, traffic_class: Option<u8>) {
+        if handle.sock_type != SocketType::Tcp {
+            return;
+        }
+        let _ = self.socket_set_traffic_class(handle, traffic_class);
+    }
+
     /// 设置由协议栈生成 IP 头的 socket 出站 hop limit。
     ///
     /// Raw socket 发送路径由调用方提供完整 IP 包头，不能在这里重写 TTL/hop limit。
@@ -875,6 +883,55 @@ impl NetStack {
             SocketType::Raw => return Err(NetError::InvalidArgument),
         }
         Ok(())
+    }
+
+    /// 设置由协议栈生成 IP 头的 socket 出站 traffic class。
+    ///
+    /// Raw socket 发送路径由调用方提供完整 IP 包头，不能在这里重写该字段。
+    pub fn socket_set_traffic_class(
+        &self,
+        handle: NetSocketHandle,
+        traffic_class: Option<u8>,
+    ) -> Result<(), NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        match handle.sock_type {
+            SocketType::Tcp => managed
+                .tcp_socket_mut(handle.inner)
+                .set_traffic_class(traffic_class),
+            SocketType::Udp => managed
+                .udp_socket_mut(handle.inner)
+                .set_traffic_class(traffic_class),
+            SocketType::Icmp => managed
+                .icmp_socket_mut(handle.inner)
+                .set_traffic_class(traffic_class),
+            SocketType::Raw => return Err(NetError::InvalidArgument),
+        }
+        Ok(())
+    }
+
+    /// 查询由协议栈生成 IP 头的 socket 出站 traffic class。
+    pub fn socket_traffic_class(&self, handle: NetSocketHandle) -> Result<Option<u8>, NetError> {
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        match handle.sock_type {
+            SocketType::Tcp => Ok(managed.tcp_socket(handle.inner).traffic_class()),
+            SocketType::Udp => Ok(managed.udp_socket(handle.inner).traffic_class()),
+            SocketType::Icmp => Ok(managed.icmp_socket(handle.inner).traffic_class()),
+            SocketType::Raw => Err(NetError::InvalidArgument),
+        }
     }
 
     /// 查询 TCP 接收缓冲区可读字节数（FIONREAD）。
@@ -994,12 +1051,28 @@ impl NetStack {
         let _ = self.socket_set_hop_limit(handle, ttl);
     }
 
+    /// 设置 UDP 出站 traffic class。
+    pub fn udp_set_traffic_class(&self, handle: NetSocketHandle, traffic_class: Option<u8>) {
+        if handle.sock_type != SocketType::Udp {
+            return;
+        }
+        let _ = self.socket_set_traffic_class(handle, traffic_class);
+    }
+
     /// 设置 ICMP 出站 hop limit。
     pub fn icmp_set_hop_limit(&self, handle: NetSocketHandle, ttl: Option<u8>) {
         if handle.sock_type != SocketType::Icmp {
             return;
         }
         let _ = self.socket_set_hop_limit(handle, ttl);
+    }
+
+    /// 设置 ICMP 出站 traffic class。
+    pub fn icmp_set_traffic_class(&self, handle: NetSocketHandle, traffic_class: Option<u8>) {
+        if handle.sock_type != SocketType::Icmp {
+            return;
+        }
+        let _ = self.socket_set_traffic_class(handle, traffic_class);
     }
 
     /// UDP peek（窥视一个数据报，不消费）。
@@ -3318,6 +3391,10 @@ mod tests {
             stack.socket_set_hop_limit(raw, Some(42)),
             Err(NetError::InvalidArgument)
         );
+        assert_eq!(
+            stack.socket_set_traffic_class(raw, Some(0xb9)),
+            Err(NetError::InvalidArgument)
+        );
     }
 
     #[test]
@@ -3370,6 +3447,35 @@ mod tests {
         let frame = driver.last_tx().unwrap();
         let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
         assert_eq!(ip_packet.hop_limit(), 42);
+    }
+
+    #[test]
+    fn icmp_set_traffic_class_updates_outgoing_ip_header() {
+        let stack = NetStack::new();
+        let (iface, driver) = attach_test_iface_with_driver(
+            &stack,
+            "eth-icmp-class",
+            IfConfig::static_v4(Ipv4Addr::new(10, 15, 2, 2), 24, None),
+        );
+        let handle = stack.socket_icmp_on(iface).unwrap();
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 15, 2, 77)),
+            port: 0,
+        };
+        let payload = build_icmpv4_echo_request_payload(0x1234, 0x5678, b"class");
+        let traffic_class = 0xb9;
+
+        stack.icmp_set_traffic_class(handle, Some(traffic_class));
+        assert_eq!(stack.socket_traffic_class(handle), Ok(Some(traffic_class)));
+        assert_eq!(
+            stack.raw_send(handle, &payload, Some(remote)),
+            Ok(payload.len())
+        );
+
+        let frame = driver.last_tx().unwrap();
+        let ip_packet = smoltcp::wire::Ipv4Packet::new_checked(frame.as_slice()).unwrap();
+        assert_eq!((ip_packet.dscp() << 2) | ip_packet.ecn(), traffic_class);
+        assert!(ip_packet.verify_checksum());
     }
 
     #[test]

@@ -123,6 +123,8 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// 出站 IP traffic class 值。
+    traffic_class: Option<u8>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -137,6 +139,7 @@ impl<'a> Socket<'a> {
             rx_buffer,
             tx_buffer,
             hop_limit: None,
+            traffic_class: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -210,6 +213,18 @@ impl<'a> Socket<'a> {
         }
 
         self.hop_limit = hop_limit
+    }
+
+    /// 返回出站 IP traffic class 值。
+    ///
+    /// IPv4 发包时写入 DSCP/ECN 字节，IPv6 发包时写入 traffic class 字段。
+    pub fn traffic_class(&self) -> Option<u8> {
+        self.traffic_class
+    }
+
+    /// 设置出站 IP traffic class 值。
+    pub fn set_traffic_class(&mut self, traffic_class: Option<u8>) {
+        self.traffic_class = traffic_class
     }
 
     /// Bind the socket to the given endpoint.
@@ -541,8 +556,11 @@ impl<'a> Socket<'a> {
     {
         let endpoint = self.endpoint;
         let hop_limit = self.hop_limit.unwrap_or(64);
+        let traffic_class = self.traffic_class;
 
         let res = self.tx_buffer.dequeue_with(|packet_meta, payload_buf| {
+            let mut meta = packet_meta.meta;
+            meta.traffic_class = traffic_class;
             let src_addr = if let Some(s) = packet_meta.local_address {
                 s
             } else {
@@ -581,7 +599,7 @@ impl<'a> Socket<'a> {
                 hop_limit,
             );
 
-            emit(cx, packet_meta.meta, (ip_repr, repr, payload_buf))
+            emit(cx, meta, (ip_repr, repr, payload_buf))
         });
         match res {
             Err(Empty) => Ok(()),

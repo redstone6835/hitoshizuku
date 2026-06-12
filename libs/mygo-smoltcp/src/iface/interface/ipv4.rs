@@ -459,6 +459,10 @@ impl InterfaceInner {
             packet.set_more_frags(more_frags);
             packet.set_dont_frag(false);
             packet.set_frag_offset(frag.ipv4.frag_offset);
+            if let Some(traffic_class) = frag.ipv4.traffic_class {
+                packet.set_dscp(traffic_class >> 2);
+                packet.set_ecn(traffic_class & 0x03);
+            }
 
             if caps.checksum.ipv4.tx() {
                 packet.fill_checksum();

@@ -481,6 +481,48 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>> Packet<T> {
         raw[idx..idx + value.len()].copy_from_slice(value);
     }
 
+    fn set_traffic_flow(
+        &mut self,
+        ecn: Option<u8>,
+        dscp: Option<u8>,
+        flow_label: Option<u16>,
+        mut idx: usize,
+    ) -> usize {
+        match (ecn, dscp, flow_label) {
+            (Some(ecn), Some(dscp), Some(flow_label)) => {
+                self.set_tf_field(0b00);
+                self.set_field(
+                    idx,
+                    &[
+                        (ecn & 0xc0) | (dscp & 0x3f),
+                        0,
+                        (flow_label >> 8) as u8,
+                        flow_label as u8,
+                    ],
+                );
+                idx += 4;
+            }
+            (Some(ecn), None, Some(flow_label)) => {
+                self.set_tf_field(0b01);
+                self.set_field(
+                    idx,
+                    &[(ecn & 0xc0), (flow_label >> 8) as u8, flow_label as u8],
+                );
+                idx += 3;
+            }
+            (Some(ecn), Some(dscp), None) => {
+                self.set_tf_field(0b10);
+                self.set_field(idx, &[(ecn & 0xc0) | (dscp & 0x3f)]);
+                idx += 1;
+            }
+            (None, None, None) => {
+                self.set_tf_field(0b11);
+            }
+            _ => unreachable!(),
+        }
+        idx
+    }
+
     /// Set the Next Header.
     ///
     /// **NOTE**: `idx` is the offset at which the Next Header needs to be written to.
@@ -854,8 +896,7 @@ impl Repr {
 
         packet.set_dispatch_field();
 
-        // FIXME(thvdveld): we don't set anything from the traffic flow.
-        packet.set_tf_field(0b11);
+        let idx = packet.set_traffic_flow(self.ecn, self.dscp, self.flow_label, idx);
 
         let idx = packet.set_next_header(self.next_header, idx);
         let idx = packet.set_hop_limit(self.hop_limit, idx);

@@ -164,6 +164,11 @@ pub use self::tuntap_interface::TunTapInterface;
 pub struct PacketMeta {
     #[cfg(feature = "packetmeta-id")]
     pub id: u32,
+    /// 出站 IP traffic class 值。
+    ///
+    /// IPv4 发包时写入 DSCP/ECN 字节，IPv6 发包时写入 traffic class 字段。
+    /// `None` 表示沿用协议默认值。
+    pub traffic_class: Option<u8>,
 }
 
 /// A description of checksum behavior for a particular protocol.
