@@ -403,6 +403,31 @@ impl ManagedInterface {
         let _ = (dest, prefix_len);
     }
 
+    /// 添加 IPv6 路由到当前协议引擎。
+    ///
+    /// 当前底层协议引擎只接收默认网关；完整的 IPv6 前缀路由由内核 RouteTable
+    /// 保存并参与 socket 出口接口选择。
+    pub fn add_route_v6(&mut self, dest: Ipv6Addr, prefix_len: u8, gateway: Ipv6Addr) {
+        let prefix_len = prefix_len.min(128);
+        if prefix_len == 0 {
+            self.iface
+                .routes_mut()
+                .add_default_ipv6_route(ipv6_to_smoltcp(gateway))
+                .ok();
+        } else {
+            let _ = (dest, prefix_len);
+        }
+    }
+
+    /// 删除 IPv6 路由。
+    pub fn remove_route_v6(&mut self, dest: Ipv6Addr, prefix_len: u8) {
+        let prefix_len = prefix_len.min(128);
+        if prefix_len == 0 {
+            self.iface.routes_mut().remove_default_ipv6_route();
+        }
+        let _ = (dest, prefix_len);
+    }
+
     /// 返回邻居缓存中所有条目（ARP/NDP 表查询）。
     pub fn neighbor_entries(&self) -> Vec<crate::stack::NeighborEntry> {
         use smoltcp::wire::{HardwareAddress, IpAddress};

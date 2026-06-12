@@ -1183,6 +1183,47 @@ impl NetStack {
         Ok(())
     }
 
+    /// 在指定接口上添加 IPv6 路由。
+    pub fn add_route_v6(
+        &self,
+        id: InterfaceId,
+        dest: crate::Ipv6Addr,
+        prefix_len: u8,
+        gw: crate::Ipv6Addr,
+    ) -> Result<(), NetError> {
+        let prefix_len = prefix_len.min(128);
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.add_route_v6(dest, prefix_len, gw);
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .upsert(RouteEntry::static_v6(dest, prefix_len, gw, id));
+        Ok(())
+    }
+
+    /// 在指定接口上删除 IPv6 路由。
+    pub fn remove_route_v6(
+        &self,
+        id: InterfaceId,
+        dest: crate::Ipv6Addr,
+        prefix_len: u8,
+    ) -> Result<(), NetError> {
+        let prefix_len = prefix_len.min(128);
+        let table = self.interfaces.read();
+        let iface_lock = table.get(&id).ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        managed.remove_route_v6(dest, prefix_len);
+        drop(managed);
+        drop(table);
+        self.routes
+            .write()
+            .remove_static(id, CidrAddress::new_v6(dest, prefix_len));
+        Ok(())
+    }
+
     // ── 邻居表查询 ───────────────────────────────────────────────────────
 
     /// 查询指定接口的 ARP/NDP 邻居表。
@@ -3419,6 +3460,37 @@ mod tests {
         assert_eq!(stack.ensure_socket_route_matches(iface, &v4_remote), Ok(()));
         assert_eq!(
             stack.ensure_socket_route_matches(iface, &v6_remote),
+            Err(NetError::Unreachable)
+        );
+    }
+
+    #[test]
+    fn ipv6_static_route_selects_interface_and_can_be_removed() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-v6-static",
+            IfConfig::static_v6(
+                Ipv6Addr::new([0x2001, 0x0db8, 0x0055, 0, 0, 0, 0, 2]),
+                64,
+                None,
+            ),
+        );
+        let dest = Ipv6Addr::new([0x2001, 0x0db8, 0x9955, 0, 0, 0, 0, 0]);
+        let remote = IpAddr::V6(Ipv6Addr::new([0x2001, 0x0db8, 0x9955, 0x1234, 0, 0, 0, 77]));
+        let gateway = Ipv6Addr::new([0x2001, 0x0db8, 0x0055, 0, 0, 0, 0, 1]);
+
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
+            Err(NetError::Unreachable)
+        );
+
+        stack.add_route_v6(iface, dest, 48, gateway).unwrap();
+        assert_eq!(stack.ensure_socket_route_matches(iface, &remote), Ok(()));
+
+        stack.remove_route_v6(iface, dest, 48).unwrap();
+        assert_eq!(
+            stack.ensure_socket_route_matches(iface, &remote),
             Err(NetError::Unreachable)
         );
     }
