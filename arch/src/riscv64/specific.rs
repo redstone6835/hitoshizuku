@@ -81,7 +81,9 @@ pub fn current_hart() -> &'static HartLocal {
 
 #[inline]
 pub fn current_cpu_id() -> usize {
-    current_hart().hart_id
+    // TODO(SMP): 调度器 CURRENT_TASKS[0] 硬编槽位 0，
+    let _ = current_hart(); // 确保 tp 已初始化
+    0
 }
 
 // ── ISA 扩展能力检测 ──────────────────────────────────────────────────────────

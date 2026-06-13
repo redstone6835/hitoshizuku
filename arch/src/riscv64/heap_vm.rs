@@ -15,6 +15,7 @@
 //! PGD[511] (0xFFFF_FF80_0000_0000 .. 0xFFFF_FFFF_FFFF_FFFF)
 //!   PUD[0..1]: kernel heap（按需映射 4K / 2M 页）
 //!   PUD[2]:    kernel code direct map（512×2MiB = 1GiB，PA 0x8000_0000 起）
+//!   PUD[3]:    kernel direct map 扩展（1GiB leaf，PA 0xC000_0000 起，boot 阶段建立）
 //!
 //! PGD[510] (0xFFFF_FF00_0000_0000 .. 0xFFFF_FF80_0000_0000)
 //!   PUD[0]:    MMIO 直接映射（1GiB leaf，PA 0x0..0x4000_0000）
@@ -162,12 +163,12 @@ pub fn init_kernel_page_table() {
     let mmio_pud_paddr = mmio_pud_alloc.paddr;
     let mmio_pud = phys_to_virt(mmio_pud_paddr) as *mut usize;
     unsafe { core::ptr::write_bytes(mmio_pud, 0, PAGE_SIZE / core::mem::size_of::<usize>()) };
-    // PUD[0]：1GiB leaf 映射 PA 0x0..0x40000000（覆盖全部 MMIO）
-    // TODO: 粒度过粗——应从 DTB 解析实际 MMIO 区域后按需映射，避免写入未定义地址触发总线错误。
-    let mmio_leaf = Riscv64Paging::make_leaf_pte(
-        0, true, true, false, false, true,
-    );
-    unsafe { core::ptr::write_volatile(mmio_pud.add(0), mmio_leaf.bits()) };
+    // PUD[0]：1GiB leaf 映射 PA 0x0..0x40000000（覆盖 QEMU virt 设备 MMIO）
+    let leaf0 = Riscv64Paging::make_leaf_pte(0, true, true, false, false, true);
+    unsafe { core::ptr::write_volatile(mmio_pud.add(0), leaf0.bits()) };
+    // PUD[1]：1GiB leaf 映射 PA 0x40000000..0x80000000（覆盖 PCI 32-bit BAR 窗口）
+    let leaf1 = Riscv64Paging::make_leaf_pte(0x40000000, true, true, false, false, true);
+    unsafe { core::ptr::write_volatile(mmio_pud.add(1), leaf1.bits()) };
     // 写入 PGD[510]
     let mmio_pgd_pte = Riscv64Paging::make_table_pte(mmio_pud_paddr);
     let pgd_ptr = phys_to_virt(root_paddr) as *mut usize;

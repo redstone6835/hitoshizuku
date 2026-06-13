@@ -320,6 +320,8 @@ fn process_execve(
     // exec 时将 caught 信号重置为 SIG_DFL
     task.thread_group().shared_signal().reset_caught_for_exec();
 
+    let kstack_top = task.ensure_kernel_stack();
+    hal::user_context::set_kernel_trap_stack(kstack_top);
     let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.apply_to_context(user_ctx.as_usize());
     Ok(())

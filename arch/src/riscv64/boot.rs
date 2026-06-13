@@ -20,7 +20,9 @@
 //! ```text
 //!   PGD[0]   → PUD_identity    PUD_identity[0] = 1G leaf → 0x0 (MMIO, RW)
 //!   PGD[511] → PUD_kernel      PUD_identity[2] = 1G leaf → 0x8000_0000 (RWXAD)
+//!                              PUD_identity[3] = 1G leaf → 0xC000_0000 (RWXAD)
 //!                              PUD_kernel[2]   = 1G leaf → 0x8000_0000 (RWXAD)
+//!                              PUD_kernel[3]   = 1G leaf → 0xC000_0000 (RWXAD)
 //! ```
 
 use core::arch::naked_asm;
@@ -132,10 +134,20 @@ pub unsafe extern "C" fn _start() {
         "addi t2, t2, 0xCF",
         "sd t2, 16(t1)",
 
+        // PUD_identity[3] = 1G → PA 0xC000_0000 (identity, 覆盖 DTB)
+        "lui t2, 0x30000",
+        "addi t2, t2, 0xCF",
+        "sd t2, 24(t1)",
+
         // PUD_kernel[2] = 1G → PA 0x8000_0000 (高半区)
         "lui t2, 0x20000",
         "addi t2, t2, 0xCF",
         "sd t2, 16(t3)",
+
+        // PUD_kernel[3] = 1G → PA 0xC000_0000 (高半区, 覆盖 DTB)
+        "lui t2, 0x30000",
+        "addi t2, t2, 0xCF",
+        "sd t2, 24(t3)",
 
         // ── 激活 Sv48 ──
         "srli t2, t0, 12",           // PPN

@@ -37,6 +37,7 @@ use crate::dev::virtio::{SplitVirtQueue, VIRTQ_DESC_F_WRITE, choose_split_queue_
 // ───────── VirtIO MMIO 寄存器布局 ─────────
 
 const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x74726976; // "virt"
+const VIRTIO_MMIO_VERSION_LEGACY: u32 = 0x1; // Legacy (pre-1.0)
 const VIRTIO_MMIO_VERSION: u32 = 0x2; // VirtIO 1.0
 const VIRTIO_MMIO_DEVICE_ID_BLOCK: u32 = 2;
 
@@ -232,7 +233,10 @@ impl VirtioBlk {
         if regs.read_reg(MMIO_MAGIC) != VIRTIO_MMIO_MAGIC_VALUE {
             return Err("Invalid VirtIO magic value");
         }
-        if regs.read_reg(MMIO_VERSION) != VIRTIO_MMIO_VERSION {
+        let ver = regs.read_reg(MMIO_VERSION);
+        let is_legacy = ver == VIRTIO_MMIO_VERSION_LEGACY;
+        if !is_legacy && ver != VIRTIO_MMIO_VERSION {
+            log::printk!("[virtio-mmio-blk] unsupported version {:#x} (base={:#x})", ver, mmio_base);
             return Err("Unsupported VirtIO version");
         }
         if regs.read_reg(MMIO_DEVICE_ID) != VIRTIO_MMIO_DEVICE_ID_BLOCK {
@@ -250,11 +254,13 @@ impl VirtioBlk {
         let device_features = regs.read_device_features();
         let mut driver_features = 0u64;
 
-        if device_features & VIRTIO_F_VERSION_1 == 0 {
-            regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
-            return Err("VirtIO 1.0 VERSION_1 feature is missing");
+        if !is_legacy {
+            if device_features & VIRTIO_F_VERSION_1 == 0 {
+                regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
+                return Err("VirtIO 1.0 VERSION_1 feature is missing");
+            }
+            driver_features |= VIRTIO_F_VERSION_1;
         }
-        driver_features |= VIRTIO_F_VERSION_1;
 
         // 选择我们支持的特性
         if device_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
