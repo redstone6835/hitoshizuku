@@ -45,9 +45,7 @@ pub(crate) fn free_tree(state: &FsState, root: &[u8]) -> Result<(), BlockBackend
                 u32::from_le_bytes([root[off + 8], root[off + 9], root[off + 10], root[off + 11]])
                     as u64;
             let start = (start_hi << 32) | start_lo;
-            for b in 0..real_len as u64 {
-                alloc_mod::free_block(state, start + b)?;
-            }
+            alloc_mod::free_blocks_run(state, start, real_len as u32)?;
         }
     } else {
         for i in 0..entries as usize {

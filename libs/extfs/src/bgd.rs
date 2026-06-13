@@ -194,8 +194,18 @@ pub(crate) fn write_desc(
     // bitmap checksum。若只改位图和计数字段,宿主 debugfs/e2fsck 会报
     // "bitmap checksum does not match bitmap"。
     if sb.metadata_csum {
-        let block_bitmap_csum = bitmap_checksum(backend, sb, desc.block_bitmap)?;
-        let inode_bitmap_csum = bitmap_checksum(backend, sb, desc.inode_bitmap)?;
+        let block_bitmap_csum = bitmap_checksum(
+            backend,
+            sb,
+            desc.block_bitmap,
+            (sb.blocks_per_group / 8) as usize,
+        )?;
+        let inode_bitmap_csum = bitmap_checksum(
+            backend,
+            sb,
+            desc.inode_bitmap,
+            (sb.inodes_per_group / 8) as usize,
+        )?;
         raw[0x18..0x1a].copy_from_slice(&(block_bitmap_csum as u16).to_le_bytes());
         raw[0x1a..0x1c].copy_from_slice(&(inode_bitmap_csum as u16).to_le_bytes());
         if desc_size == 64 {
@@ -223,8 +233,13 @@ fn bitmap_checksum(
     backend: &dyn BlockBackend,
     sb: &Superblock,
     bitmap_block: u64,
+    checksum_len: usize,
 ) -> Result<u32, BlockBackendError> {
     let mut bitmap = vec![0u8; sb.block_size as usize];
     read_blocks(backend, sb, bitmap_block, 1, &mut bitmap)?;
-    Ok(crc::update(sb.csum_seed, &bitmap))
+    // ext4 metadata_csum 的 bitmap checksum 只覆盖有效 bitmap 字节：
+    // inode 是 inodes_per_group / 8，block 是 clusters_per_group / 8。
+    // 不能对整块做 CRC；flex_bg/小 inode 组会在尾部留下非 bitmap 填充字节。
+    let len = checksum_len.min(bitmap.len());
+    Ok(crc::update(sb.csum_seed, &bitmap[..len]))
 }
