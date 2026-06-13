@@ -273,8 +273,6 @@ impl VirtioMmioTransport for LegacyMmioTransport {
     }
 
     fn configure_queue_addresses(&self, desc_dma: u64, _avail_dma: u64, _used_dma: u64) {
-        // Legacy: 写 GuestPageSize + QueueAlign + QueuePFN。
-        // GuestPageSize 默认可能是 0，必须显式设为 4096。
         let pfn = (desc_dma >> 12) as u32;
         unsafe {
             self.write_reg(0x028, 4096);        // GuestPageSize

@@ -287,8 +287,23 @@ fn map_range_with_policy(
                 phys_to_virt,
                 alloc_page_table_page,
             );
-            if result.is_err() && page_policy == PagePolicy::RequireLarge {
-                return result;
+            if result.is_err() {
+                if page_policy == PagePolicy::RequireLarge {
+                    return result;
+                }
+                // PreferLarge 失败：降级到 BaseOnly
+                walk_and_map::<Riscv64Paging>(
+                    root_vaddr,
+                    current_vaddr,
+                    current_paddr,
+                    find_smallest_leaf_level(),
+                    true, true, true, false, true,
+                    phys_to_virt,
+                    alloc_page_table_page,
+                )?;
+                current_vaddr += PAGE_SIZE;
+                current_paddr += PAGE_SIZE;
+                continue;
             }
             current_vaddr += page_size;
             current_paddr += page_size;
