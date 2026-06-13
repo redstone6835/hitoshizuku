@@ -231,6 +231,10 @@ const SIGFRAME_UCONTEXT_HEAD_SIZE: usize = 64;
 const SIGFRAME_SIGINFO_OFF: usize = SIGFRAME_HEADER_SIZE;
 const SIGFRAME_UCONTEXT_OFF: usize = SIGFRAME_SIGINFO_OFF + SIGFRAME_SIGINFO_SIZE;
 const SIGFRAME_TRAP_OFF: usize = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_HEAD_SIZE;
+// 当前 LoongArch64 用户陷阱帧约 552 字节。信号路径不用堆分配，但也不能在
+// 64KiB 内核栈上放 16KiB 大对象；2KiB 给后续寄存器扩展留出余量。
+const SIGFRAME_TRAP_BUF_SIZE: usize = 2048;
+const SIGFRAME_STACK_BUF_SIZE: usize = SIGFRAME_TRAP_OFF + SIGFRAME_TRAP_BUF_SIZE;
 
 fn task_vm_space(task: &Arc<Task>) -> Option<Arc<VmSpace>> {
     task.ext_lookup(TASKEXT_VM_SPACE)?
@@ -387,7 +391,9 @@ fn process_execve(
     }
 
     // exec 时将 caught 信号重置为 SIG_DFL
-    task.thread_group().shared_signal().reset_handlers_for_exec();
+    task.thread_group()
+        .shared_signal()
+        .reset_handlers_for_exec();
 
     let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.apply_to_context(user_ctx.as_usize());
@@ -489,11 +495,16 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
         return Err(Errno::EINVAL);
     }
 
-    let mut bytes = Vec::new();
-    bytes.resize(trap_len, 0);
-    copy_from_user(sp.checked_add(trap_off).ok_or(Errno::EINVAL)?, &mut bytes)
+    // 信号返回是 lmbench lat_sig 的热路径；陷阱帧大小固定，避免每次
+    // rt_sigreturn 都走堆分配。
+    let mut trap_storage = [0u8; SIGFRAME_TRAP_BUF_SIZE];
+    if trap_len > trap_storage.len() {
+        return Err(Errno::EINVAL);
+    }
+    let trap_bytes = &mut trap_storage[..trap_len];
+    copy_from_user(sp.checked_add(trap_off).ok_or(Errno::EINVAL)?, trap_bytes)
         .map_err(|e| e.as_errno())?;
-    let restored = UserTrapFrame::read_bytes(&bytes).ok_or(Errno::EINVAL)?;
+    let restored = UserTrapFrame::read_bytes(trap_bytes).ok_or(Errno::EINVAL)?;
     task.signal
         .block(SigSet::from_raw(old_mask), SigProcMaskHow::SetMask);
     restored.apply_to_context(user_ctx.as_usize());
@@ -543,24 +554,29 @@ fn process_setup_signal_frame(
         saved.sp().checked_sub(total).ok_or(Errno::EINVAL)? & !0xf
     };
 
-    let mut frame_bytes = Vec::new();
-    frame_bytes.resize(total, 0);
-    write_u64(&mut frame_bytes, 0, SIGFRAME_MAGIC);
-    write_u64(&mut frame_bytes, 8, total as u64);
-    write_u64(&mut frame_bytes, 16, old_mask.raw());
-    write_u64(&mut frame_bytes, 24, SIGFRAME_TRAP_OFF as u64);
-    write_u64(&mut frame_bytes, 32, trap_len as u64);
-    write_u64(&mut frame_bytes, 40, SIGFRAME_SIGINFO_OFF as u64);
-    write_u64(&mut frame_bytes, 48, SIGFRAME_UCONTEXT_OFF as u64);
-    write_u64(&mut frame_bytes, 56, info.sig.raw() as u64);
+    // 信号投递同样在 lat_sig 中高频触发；sigframe 大小由固定头部和陷阱帧
+    // 构成，使用小型栈缓冲避免 allocator 锁竞争，同时控制内核栈占用。
+    let mut frame_storage = [0u8; SIGFRAME_STACK_BUF_SIZE];
+    if total > frame_storage.len() {
+        return Err(Errno::EINVAL);
+    }
+    let frame_bytes = &mut frame_storage[..total];
+    write_u64(frame_bytes, 0, SIGFRAME_MAGIC);
+    write_u64(frame_bytes, 8, total as u64);
+    write_u64(frame_bytes, 16, old_mask.raw());
+    write_u64(frame_bytes, 24, SIGFRAME_TRAP_OFF as u64);
+    write_u64(frame_bytes, 32, trap_len as u64);
+    write_u64(frame_bytes, 40, SIGFRAME_SIGINFO_OFF as u64);
+    write_u64(frame_bytes, 48, SIGFRAME_UCONTEXT_OFF as u64);
+    write_u64(frame_bytes, 56, info.sig.raw() as u64);
 
     write_siginfo(
         &mut frame_bytes[SIGFRAME_SIGINFO_OFF..][..SIGFRAME_SIGINFO_SIZE],
         info,
     );
-    write_u64(&mut frame_bytes, SIGFRAME_UCONTEXT_OFF, 0); // uc_flags
-    write_u64(&mut frame_bytes, SIGFRAME_UCONTEXT_OFF + 8, 0); // uc_link
-    write_u64(&mut frame_bytes, SIGFRAME_UCONTEXT_OFF + 40, old_mask.raw()); // uc_sigmask
+    write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF, 0); // uc_flags
+    write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF + 8, 0); // uc_link
+    write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF + 40, old_mask.raw()); // uc_sigmask
     if !saved.write_bytes(&mut frame_bytes[SIGFRAME_TRAP_OFF..]) {
         return Err(Errno::EINVAL);
     }

@@ -831,16 +831,22 @@ impl VmSpace {
         set.protect_range(&range, new_flags.with(VmFlags::USER));
 
         let mut pages = self.pages.lock();
-        let keys: Vec<usize> = pages.range(range.clone()).map(|(k, _)| *k).collect();
-        for va in keys {
+        // mprotect 会被动态链接器和 lmbench mmap/munmap 小测频繁调用。
+        // range 已按页对齐，直接逐页探测现有映射，避免先收集 key 到 Vec。
+        let page_size = page_size();
+        let mut va = range.start;
+        while va < range.end {
             let Some(area) = set.find(va) else {
+                va += page_size;
                 continue;
             };
             let Some(mapping) = pages.get_mut(&va) else {
+                va += page_size;
                 continue;
             };
             mapping.access = access_for_existing_page(area.flags, &mapping.page);
             self.protect_page(va, pte_flags_for(area.flags, mapping.access))?;
+            va += page_size;
         }
         Ok(())
     }

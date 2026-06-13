@@ -488,44 +488,44 @@ fn pick_fair_locked(
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
-    let key = if let Some(skip) = skip_addr {
-        inner
-            .fair_tree
-            .iter()
-            .find(|(_, task)| {
-                task_addr(task) != skip
-                    && task_allowed_on(task, cpu_mask)
-                    && task.sched.vruntime() <= avg
-            })
-            .map(|(key, _)| *key)
-            .or_else(|| {
-                inner
-                    .fair_tree
-                    .iter()
-                    .filter(|(_, task)| task_addr(task) != skip && task_allowed_on(task, cpu_mask))
-                    .min_by_key(|(_, task)| task.sched.vruntime())
-                    .map(|(key, _)| *key)
-            })
-            .or_else(|| {
-                inner
-                    .fair_tree
-                    .iter()
-                    .find(|(_, task)| task_allowed_on(task, cpu_mask))
-                    .map(|(key, _)| *key)
-            })
+    let mut first_allowed = None;
+    let mut first_eligible = None;
+    let mut min_non_skip: Option<(FairKey, u64)> = None;
+
+    // 调度器持 rq 锁选择下一个 fair 任务。原实现为了保留“优先不选刚让出
+    // CPU 的任务，再退化到最小 vruntime，最后才允许选回它”的语义会多次
+    // 扫描 BTreeMap；这里一次遍历同时收集候选，减少 lmbench syscall/context
+    // switch 热路径里的锁内扫描成本。
+    for (key, task) in inner.fair_tree.iter() {
+        if !task_allowed_on(task, cpu_mask) {
+            continue;
+        }
+
+        first_allowed.get_or_insert(*key);
+
+        let is_skip = skip_addr.is_some_and(|skip| task_addr(task) == skip);
+        if !is_skip {
+            let vruntime = task.sched.vruntime();
+            if vruntime <= avg {
+                first_eligible.get_or_insert(*key);
+            }
+            if min_non_skip
+                .as_ref()
+                .is_none_or(|(_, current_min)| vruntime < *current_min)
+            {
+                min_non_skip = Some((*key, vruntime));
+            }
+        } else if skip_addr.is_none() && first_eligible.is_none() && task.sched.vruntime() <= avg {
+            first_eligible = Some(*key);
+        }
+    }
+
+    let key = if skip_addr.is_some() {
+        first_eligible
+            .or_else(|| min_non_skip.map(|(key, _)| key))
+            .or(first_allowed)
     } else {
-        inner
-            .fair_tree
-            .iter()
-            .find(|(_, task)| task_allowed_on(task, cpu_mask) && task.sched.vruntime() <= avg)
-            .map(|(key, _)| *key)
-            .or_else(|| {
-                inner
-                    .fair_tree
-                    .iter()
-                    .find(|(_, task)| task_allowed_on(task, cpu_mask))
-                    .map(|(key, _)| *key)
-            })
+        first_eligible.or(first_allowed)
     }?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
