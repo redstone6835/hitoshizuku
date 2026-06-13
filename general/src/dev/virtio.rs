@@ -988,7 +988,7 @@ impl SplitVirtQueue {
         }
     }
 
-    fn used_idx(&self) -> u16 {
+    pub fn used_idx(&self) -> u16 {
         unsafe { read_volatile(self.used_idx_ptr().cast_const()) }
     }
 
