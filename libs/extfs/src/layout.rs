@@ -44,6 +44,7 @@ pub(crate) const COMPAT_EXT_ATTR: u32 = 0x0008;
 pub(crate) const COMPAT_RESIZE_INODE: u32 = 0x0010;
 pub(crate) const COMPAT_DIR_INDEX: u32 = 0x0020;
 pub(crate) const COMPAT_SPARSE_SUPER2: u32 = 0x0200;
+pub(crate) const COMPAT_ORPHAN_FILE: u32 = 0x1000;
 
 /// feature_incompat (s_feature_incompat) —— 未知位必须拒绝挂载
 pub(crate) const INCOMPAT_COMPRESSION: u32 = 0x0001;
@@ -77,6 +78,7 @@ pub(crate) const RO_COMPAT_BIGALLOC: u32 = 0x0200;
 pub(crate) const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 pub(crate) const RO_COMPAT_PROJECT: u32 = 0x2000;
 pub(crate) const RO_COMPAT_VERITY: u32 = 0x8000;
+pub(crate) const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x10000;
 
 /// Inode flags (i_flags)
 pub(crate) const EXT4_EXTENTS_FL: u32 = 0x00080000;

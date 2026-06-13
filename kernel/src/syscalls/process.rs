@@ -694,17 +694,30 @@ pub(super) fn sys_getrandom(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let buf_user = ctx.args[0];
     let size = ctx.args[1];
     let flags = ctx.args[2];
-    const GRND_NONBLOCK: usize = 1;
-    const GRND_RANDOM: usize = 2;
-    if (flags & !(GRND_NONBLOCK | GRND_RANDOM)) != 0 {
+    const GRND_NONBLOCK: usize = 0x0001;
+    const GRND_RANDOM: usize = 0x0002;
+    const GRND_INSECURE: usize = 0x0004;
+    const RANDOM_COPY_CHUNK: usize = 256;
+
+    // 用户态标志只在 syscall 兼容层解释，底层随机源只提供字节填充能力。
+    let known_flags = GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE;
+    if (flags & !known_flags) != 0
+        || (flags & (GRND_RANDOM | GRND_INSECURE)) == (GRND_RANDOM | GRND_INSECURE)
+    {
         return Err(Errno::EINVAL);
     }
-    if size > 256 {
-        return Err(Errno::EINVAL);
+
+    let mut done = 0usize;
+    let mut chunk = [0u8; RANDOM_COPY_CHUNK];
+    while done < size {
+        let n = (size - done).min(chunk.len());
+        // 256 字节只作为内核栈上临时缓冲大小，不限制用户态请求长度。
+        prng_fill(&mut chunk[..n]);
+        let dst = buf_user.checked_add(done).ok_or(Errno::EFAULT)?;
+        copy_to_user(dst, &chunk[..n]).map_err(|e| e.as_errno())?;
+        done += n;
     }
-    let mut data = alloc::vec![0u8; size];
-    prng_fill(&mut data);
-    copy_to_user(buf_user, &data).map_err(|e| e.as_errno())?;
+
     Ok(size)
 }
 
@@ -750,7 +763,8 @@ pub(super) fn sys_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let req_user = ctx.args[0];
     let rem_user = ctx.args[1];
     if req_user == 0 {
-        return Err(Errno::EINVAL);
+        // 空指针是用户内存访问失败；只有读取到的 timespec 内容非法才返回 EINVAL。
+        return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 16];
     copy_from_user(req_user, &mut raw).map_err(|e| e.as_errno())?;
@@ -819,7 +833,8 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
         return Err(Errno::EINVAL);
     }
     if req_user == 0 {
-        return Err(Errno::EINVAL);
+        // 空指针是用户内存访问失败；只有读取到的 timespec 内容非法才返回 EINVAL。
+        return Err(Errno::EFAULT);
     }
     let mut raw = [0u8; 16];
     copy_from_user(req_user, &mut raw).map_err(|e| e.as_errno())?;

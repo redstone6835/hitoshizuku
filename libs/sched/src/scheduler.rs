@@ -579,11 +579,14 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     if NEED_BALANCE[cpu_id].swap(false, Ordering::AcqRel) {
         let _ = balance_once(cpu_id);
     }
+    // syscall 返回后的父子任务交接是 clone/vfork 热路径；时间戳只需采样一次，
+    // 避免有界循环里重复读取时钟。
+    let handoff_now = now_ns_internal().max(now_ns);
     for _ in 0..rounds {
         if RUNQUEUES[cpu_id].nr_running() <= 1 {
             break;
         }
-        schedule_once(now_ns_internal().max(now_ns));
+        schedule_once(handoff_now);
     }
 }
 

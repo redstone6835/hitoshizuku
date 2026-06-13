@@ -206,8 +206,13 @@ pub fn decode_clone_register_args(args: [usize; 6]) -> CloneRegisterArgs {
             flags: args[0] as u64,
             stack: args[1],
             parent_tid: args[2],
-            child_tid: args[3],
-            tls: args[4],
+            // LoongArch64 传统 clone syscall 使用 asm-generic 新架构顺序：
+            // flags, stack, parent_tidptr, tls, child_tidptr。pthread_create()
+            // 会同时传 CLONE_SETTLS 与 CLONE_CHILD_CLEARTID，若把 tls 和
+            // child_tidptr 反解，会导致新线程 TLS 错乱，glibc 线程创建路径
+            // 可能在后续调度属性设置阶段以 EINVAL 失败。
+            tls: args[3],
+            child_tid: args[4],
         }
     }
 

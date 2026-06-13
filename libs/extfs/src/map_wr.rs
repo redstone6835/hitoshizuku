@@ -313,6 +313,92 @@ fn resize_block_scratch(buf: &mut Vec<u8>, bs: usize) {
     }
 }
 
+/// 统计传统 direct/indirect 布局实际占用的文件系统块数。
+///
+/// ext4 的 `i_blocks` 记录的是已分配 512B sector 数,不是 `i_size` 四舍五入。
+/// 因此 1 字节文件只要分配了一个 4KiB 数据块,也必须记 8 个 sector。
+pub(crate) fn count_all_blocks(state: &FsState, i_block: &[u8]) -> Result<u64, BlockBackendError> {
+    let bs = state.ext_sb.block_size as usize;
+    let p = ppb(state.ext_sb.block_size);
+    let mut total = 0u64;
+    let mut l1_blk = Vec::new();
+    let mut l2_blk = Vec::new();
+    let mut l3_blk = Vec::new();
+    let mut top_blk = Vec::new();
+    let mut mid_blk = Vec::new();
+
+    for i in 0..DIRECT_COUNT {
+        if read_u32(i_block, i) != 0 {
+            total += 1;
+        }
+    }
+
+    let l1 = read_u32(i_block, 12);
+    if l1 != 0 {
+        total += 1; // 一级间接块本身
+        resize_block_scratch(&mut l1_blk, bs);
+        state.read_block(l1 as u64, &mut l1_blk)?;
+        for i in 0..p {
+            if read_u32(&l1_blk, i) != 0 {
+                total += 1;
+            }
+        }
+    }
+
+    let l2 = read_u32(i_block, 13);
+    if l2 != 0 {
+        total += 1; // 二级间接块本身
+        resize_block_scratch(&mut l2_blk, bs);
+        resize_block_scratch(&mut mid_blk, bs);
+        state.read_block(l2 as u64, &mut l2_blk)?;
+        for i in 0..p {
+            let mid = read_u32(&l2_blk, i);
+            if mid == 0 {
+                continue;
+            }
+            total += 1; // 中间一级间接块
+            state.read_block(mid as u64, &mut mid_blk)?;
+            for j in 0..p {
+                if read_u32(&mid_blk, j) != 0 {
+                    total += 1;
+                }
+            }
+        }
+    }
+
+    let l3 = read_u32(i_block, 14);
+    if l3 != 0 {
+        total += 1; // 三级间接块本身
+        resize_block_scratch(&mut l3_blk, bs);
+        resize_block_scratch(&mut top_blk, bs);
+        resize_block_scratch(&mut mid_blk, bs);
+        state.read_block(l3 as u64, &mut l3_blk)?;
+        for i in 0..p {
+            let top = read_u32(&l3_blk, i);
+            if top == 0 {
+                continue;
+            }
+            total += 1; // 二级索引块
+            state.read_block(top as u64, &mut top_blk)?;
+            for j in 0..p {
+                let mid = read_u32(&top_blk, j);
+                if mid == 0 {
+                    continue;
+                }
+                total += 1; // 一级索引块
+                state.read_block(mid as u64, &mut mid_blk)?;
+                for k in 0..p {
+                    if read_u32(&mid_blk, k) != 0 {
+                        total += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
+}
+
 /// 释放逻辑块号 ≥ `from_lb` 的所有间接指针对应的物理块。用于 partial truncate。
 /// 处理完成后,间接块本身若变空(没有任何指向非零的项)也被释放。
 pub(crate) fn free_blocks_from(

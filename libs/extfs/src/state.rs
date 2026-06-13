@@ -568,6 +568,34 @@ impl SuperblockOps for ExtFsSuperblockOps {
     }
 }
 
+fn discard_orphan_file(state: &Arc<FsState>) -> Result<(), BlockBackendError> {
+    let ino = state.ext_sb.orphan_file_inum;
+    if ino == 0 || ino > state.ext_sb.inodes_count {
+        return Ok(());
+    }
+
+    let mut raw = crate::inode_wr::read_raw(state, ino)?;
+    let mut i_block = [0u8; 60];
+    i_block.copy_from_slice(raw.i_block());
+
+    // 当前内核没有 ext4 orphan_file 维护逻辑。若直接只清 superblock feature,
+    // 原 orphan file inode 会变成宿主 fsck 眼中的 unattached inode；因此挂载时
+    // 主动丢弃它占用的数据块和 inode 位图，再把 superblock 指针清零。
+    if raw.flags() & crate::layout::EXT4_EXTENTS_FL != 0 {
+        crate::extent_wr::free_tree(state, &i_block)?;
+    } else {
+        crate::map_wr::free_all_blocks(state, &mut i_block)?;
+    }
+
+    raw.bytes.fill(0);
+    // extfs 库层无法直接访问内核 realtime；写合法 epoch 秒即可避免
+    // e2fsck 把过小 dtime 误判为损坏 orphan 链。
+    raw.set_dtime(1_700_000_000);
+    crate::inode_wr::write_raw(state, &raw)?;
+    crate::alloc_mod::free_inode(state, ino, false)?;
+    Ok(())
+}
+
 fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
     let ext_sb = sb::load(backend.as_ref()).map_err(map_err)?;
     let group_desc = bgd::load_all(backend.as_ref(), &ext_sb).map_err(map_err)?;
@@ -598,6 +626,11 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         alloc_sb_dirty: AtomicBool::new(false),
         read_only: core::sync::atomic::AtomicBool::new(false),
     });
+
+    // 当前驱动不维护 ext4 orphan_file。可写挂载后立即规范化 superblock，
+    // 同时清理旧镜像可能残留的 feature 位、s_last_orphan 和 s_orphan_file_inum。
+    discard_orphan_file(&state).map_err(map_err)?;
+    crate::alloc_mod::write_superblock(&state).map_err(map_err)?;
 
     // 加载根 inode(2 号)
     let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(map_err)?;
@@ -785,6 +818,7 @@ mod tests {
             csum_seed: 0,
             free_blocks_count: free_blocks,
             free_inodes_count: 16,
+            orphan_file_inum: 0,
             groups_count: 1,
         };
         let group_desc = vec![GroupDesc {
@@ -838,8 +872,11 @@ mod tests {
             u32::from_le_bytes([i_block[0], i_block[1], i_block[2], i_block[3]]),
             4
         );
-        // direct 新块由文件写路径覆盖/补零，这里只应落盘块位图，不能额外写数据零块。
-        assert_eq!(backend.writes(), vec![(2, 2)]);
+        // direct 新块由文件写路径覆盖/补零；alloc 路径只允许写分配元数据，
+        // 不能提前写物理数据块 4，否则小块覆盖写会被大量无意义清零拖慢。
+        let writes = backend.writes();
+        assert!(writes.contains(&(2, 2)));
+        assert!(!writes.contains(&(8, 2)));
     }
 
     #[test]

@@ -9,7 +9,9 @@ use core::sync::atomic::Ordering;
 
 use crate::bgd;
 use crate::crc;
-use crate::layout::{SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET};
+use crate::layout::{
+    COMPAT_ORPHAN_FILE, RO_COMPAT_ORPHAN_PRESENT, SUPERBLOCK_CHECKSUM_OFFSET, SUPERBLOCK_OFFSET,
+};
 use crate::state::{BlockBackendError, FsState};
 use vfs::sync::{Spinlock, SpinlockGuard};
 
@@ -104,17 +106,17 @@ fn clear_bit_in_bitmap(
     bitmap_block: u64,
     bit: u32,
     bm: &mut [u8],
-) -> Result<(), BlockBackendError> {
+) -> Result<bool, BlockBackendError> {
     state.read_block(bitmap_block, bm)?;
     let byte_idx = (bit / 8) as usize;
     let mask = 1u8 << (bit % 8) as u8;
     if bm[byte_idx] & mask == 0 {
         // 已经是空闲,不算错误(容忍重复 free)
-        return Ok(());
+        return Ok(false);
     }
     bm[byte_idx] &= !mask;
     state.write_block(bitmap_block, &bm)?;
-    Ok(())
+    Ok(true)
 }
 
 /// 分配一个数据块。按组顺序扫描 `s_free_blocks`;找到则更新 gd/sb 回写。
@@ -173,6 +175,7 @@ pub(crate) fn alloc_blocks_run(
             state.block_alloc_hint.store(next_rel, Ordering::Relaxed);
             state.adjust_group_free_blocks(group, -(count as i32))?;
             state.adjust_sb_free_blocks(-(count as i64))?;
+            state.flush_alloc_metadata()?;
             return Ok((phys, count));
         }
     }
@@ -352,13 +355,94 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     let group = (rel / sb.blocks_per_group as u64) as u32;
     let in_group = (rel % sb.blocks_per_group as u64) as u32;
     let gd = state.group_desc_mut(group)?;
-    clear_bit_in_bitmap(state, gd.block_bitmap, in_group, &mut bitmap_scratch)?;
+    if !clear_bit_in_bitmap(state, gd.block_bitmap, in_group, &mut bitmap_scratch)? {
+        return Ok(());
+    }
     state.block_alloc_hint.store(
         group as u64 * sb.blocks_per_group as u64 + in_group as u64,
         Ordering::Relaxed,
     );
     state.adjust_group_free_blocks(group, 1)?;
     state.adjust_sb_free_blocks(1)?;
+    state.flush_alloc_metadata()?;
+    Ok(())
+}
+
+/// 批量释放一段连续数据块，并把同一批次的 group/superblock 元数据合并刷新。
+///
+/// iozone 这类测试会频繁删除刚写完的大文件；extent 中通常是一段连续物理块。
+/// 若逐块调用 `free_block()`，每个 4KiB 数据块都会触发一次 bitmap checksum、
+/// group descriptor 和 superblock 写回，收尾阶段会被放大成近似卡死。
+pub(crate) fn free_blocks_run(
+    state: &FsState,
+    start_block: u64,
+    count: u32,
+) -> Result<(), BlockBackendError> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let _g = lock_alloc();
+    let sb = &state.ext_sb;
+    if start_block < sb.first_data_block as u64 {
+        return Err(BlockBackendError::OutOfRange);
+    }
+
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
+    let first_rel = start_block - sb.first_data_block as u64;
+    let mut rel = first_rel;
+    let mut remaining = count;
+    let mut total_cleared = 0u32;
+
+    while remaining > 0 {
+        let group = (rel / sb.blocks_per_group as u64) as u32;
+        if group >= sb.groups_count {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let in_group = (rel % sb.blocks_per_group as u64) as u32;
+        let bits_in_group = if group == sb.groups_count - 1 {
+            let used_before = group as u64 * sb.blocks_per_group as u64;
+            let remain = sb.blocks_count.saturating_sub(used_before);
+            remain.min(sb.blocks_per_group as u64) as u32
+        } else {
+            sb.blocks_per_group
+        };
+        if in_group >= bits_in_group {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let run = remaining.min(bits_in_group - in_group);
+        let gd = state.group_desc_mut(group)?;
+        state.read_block(gd.block_bitmap, &mut bitmap_scratch)?;
+
+        let mut cleared = 0u32;
+        for bit in in_group..in_group + run {
+            let byte_idx = (bit / 8) as usize;
+            let mask = 1u8 << ((bit % 8) as u8);
+            if bitmap_scratch[byte_idx] & mask != 0 {
+                bitmap_scratch[byte_idx] &= !mask;
+                cleared += 1;
+            }
+        }
+
+        if cleared != 0 {
+            state.write_block(gd.block_bitmap, &bitmap_scratch)?;
+            state.adjust_group_free_blocks(group, cleared as i32)?;
+            total_cleared += cleared;
+        }
+
+        rel += run as u64;
+        remaining -= run;
+    }
+
+    if total_cleared != 0 {
+        state
+            .block_alloc_hint
+            .store(first_rel, Ordering::Relaxed);
+        state.adjust_sb_free_blocks(total_cleared as i64)?;
+        state.flush_alloc_metadata()?;
+    }
     Ok(())
 }
 
@@ -401,6 +485,7 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
                 state.adjust_group_used_dirs(group, 1)?;
             }
             state.adjust_sb_free_inodes(-1)?;
+            state.flush_alloc_metadata()?;
             return Ok(ino);
         }
     }
@@ -417,7 +502,9 @@ pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), 
     let group = (ino - 1) / sb.inodes_per_group;
     let in_group = (ino - 1) % sb.inodes_per_group;
     let gd = state.group_desc_mut(group)?;
-    clear_bit_in_bitmap(state, gd.inode_bitmap, in_group, &mut bitmap_scratch)?;
+    if !clear_bit_in_bitmap(state, gd.inode_bitmap, in_group, &mut bitmap_scratch)? {
+        return Ok(());
+    }
     state
         .inode_alloc_hint
         .store(group * sb.inodes_per_group + in_group, Ordering::Relaxed);
@@ -426,6 +513,7 @@ pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), 
         state.adjust_group_used_dirs(group, -1)?;
     }
     state.adjust_sb_free_inodes(1)?;
+    state.flush_alloc_metadata()?;
     Ok(())
 }
 
@@ -446,6 +534,17 @@ pub(crate) fn write_superblock(state: &FsState) -> Result<(), BlockBackendError>
     let free_inodes = state.ext_sb_free_inodes();
     sb_slice[12..16].copy_from_slice(&(free_blocks as u32).to_le_bytes());
     sb_slice[16..20].copy_from_slice(&free_inodes.to_le_bytes());
+    // 当前写路径不维护 ext4 orphan_file。进入可写挂载后清掉该特性位,
+    // 否则 e2fsck 会按 orphan file 扫描已释放 inode 并报告 corrupted orphan list。
+    let compat = u32::from_le_bytes([sb_slice[92], sb_slice[93], sb_slice[94], sb_slice[95]])
+        & !COMPAT_ORPHAN_FILE;
+    sb_slice[92..96].copy_from_slice(&compat.to_le_bytes());
+    let ro_compat =
+        u32::from_le_bytes([sb_slice[100], sb_slice[101], sb_slice[102], sb_slice[103]])
+            & !RO_COMPAT_ORPHAN_PRESENT;
+    sb_slice[100..104].copy_from_slice(&ro_compat.to_le_bytes());
+    sb_slice[0xe8..0xec].copy_from_slice(&0u32.to_le_bytes());
+    sb_slice[0x280..0x284].copy_from_slice(&0u32.to_le_bytes());
     if state.ext_sb.feature_incompat & crate::layout::INCOMPAT_64BIT != 0 {
         let hi = (free_blocks >> 32) as u32;
         sb_slice[0x154..0x158].copy_from_slice(&hi.to_le_bytes());

@@ -11,8 +11,8 @@
 //!   会永远无法 drop；
 //! - 已死任务的 upgrade 会自动失败，遍历时顺手清掉即可，不需要显式 "unregister"。
 
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 
 use crate::sync::Spinlock;
 use crate::task::{Task, TaskState};
@@ -24,13 +24,13 @@ pub type WakeFn = fn(&Arc<Task>);
 
 /// 等待队列。
 pub struct WaitQueue {
-    waiters: Spinlock<Vec<Weak<Task>>>,
+    waiters: Spinlock<VecDeque<Weak<Task>>>,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
         Self {
-            waiters: Spinlock::new(Vec::new()),
+            waiters: Spinlock::new(VecDeque::new()),
         }
     }
 
@@ -47,7 +47,7 @@ impl WaitQueue {
         }) {
             return;
         }
-        waiters.push(Arc::downgrade(task));
+        waiters.push_back(Arc::downgrade(task));
     }
 
     /// 准备进入等待：先把当前任务标成睡眠态，再挂入等待队列。
@@ -93,17 +93,16 @@ impl WaitQueue {
         });
     }
 
-    /// 唤醒一个等待者。清理 upgrade 失败的条目后，取出首个有效 Weak。
+    /// 唤醒一个等待者。用 VecDeque 从队头取元素，避免 Vec::remove(0)
+    /// 在 pipe/select 等高频等待路径上反复搬移整段数组。
     /// 返回被唤醒任务的 `Arc`，便于上层决定是否直接转入 runqueue。
     pub fn wake_one(&self, wake: WakeFn) -> Option<Arc<Task>> {
         let picked = {
             let mut w = self.waiters.lock();
             loop {
-                let front = w.first().cloned();
-                match front {
+                match w.pop_front() {
                     None => break None,
                     Some(weak) => {
-                        w.remove(0);
                         if let Some(task) = weak.upgrade() {
                             break Some(task);
                         }
@@ -124,9 +123,14 @@ impl WaitQueue {
         self.wake_all_with(default_wake);
     }
 
+    /// 使用默认调度器入口唤醒一个等待者。
+    pub fn wake_one_default(&self) -> Option<Arc<Task>> {
+        self.wake_one(default_wake)
+    }
+
     /// 带回调的全量唤醒。
     pub fn wake_all_with(&self, wake: impl Fn(&Arc<Task>)) {
-        let drained: Vec<Weak<Task>> = {
+        let drained: VecDeque<Weak<Task>> = {
             let mut w = self.waiters.lock();
             core::mem::take(&mut *w)
         };
@@ -143,11 +147,13 @@ impl WaitQueue {
         if n == 0 {
             return 0;
         }
-        let mut taken: Vec<Weak<Task>> = Vec::new();
+        let mut taken: VecDeque<Weak<Task>> = VecDeque::new();
         {
             let mut w = self.waiters.lock();
             while taken.len() < n && !w.is_empty() {
-                taken.push(w.remove(0));
+                if let Some(weak) = w.pop_front() {
+                    taken.push_back(weak);
+                }
             }
         }
         let mut woken = 0usize;
@@ -166,11 +172,9 @@ impl WaitQueue {
         let picked = {
             let mut w = self.waiters.lock();
             loop {
-                let front = w.first().cloned();
-                match front {
+                match w.pop_front() {
                     None => break None,
                     Some(weak) => {
-                        w.remove(0);
                         if let Some(task) = weak.upgrade() {
                             break Some(task);
                         }

@@ -94,8 +94,9 @@ impl FileOps for DirFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举不会等待外部事件；readiness 表示可立即尝试 I/O。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn Any {
@@ -512,8 +513,9 @@ impl FileOps for RegFileOps {
     fn sync(&self) -> VfsResult<()> {
         self.state.sync_all().map_err(backend_to_vfs)
     }
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 普通文件不会阻塞等待设备事件；读写 readiness 应立即满足。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn Any {

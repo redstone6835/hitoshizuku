@@ -809,6 +809,22 @@ impl MountNamespace {
         out
     }
 
+    /// 同步当前 mount namespace 中所有 superblock。
+    ///
+    /// `sync(2)` 是全局刷盘语义。当前内核没有全局 superblock registry,
+    /// 但每个进程至少能看到自己的挂载命名空间;遍历这里的 mount 列表可以覆盖
+    /// 测试盘 ext4、根 tmpfs、proc/sys/dev 等当前可见文件系统。
+    pub fn sync_all(&self) -> VfsResult<()> {
+        let mounts = {
+            let data = self.data.lock();
+            data.mounts.clone()
+        };
+        for mount in mounts {
+            mount.superblock.sync()?;
+        }
+        Ok(())
+    }
+
     /// 将当前所有挂载信息格式化为 Linux `/proc/*/mountinfo` 风格。
     pub fn dump_mountinfo(
         &self,

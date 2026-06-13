@@ -831,16 +831,22 @@ impl VmSpace {
         set.protect_range(&range, new_flags.with(VmFlags::USER));
 
         let mut pages = self.pages.lock();
-        let keys: Vec<usize> = pages.range(range.clone()).map(|(k, _)| *k).collect();
-        for va in keys {
+        // mprotect 会被动态链接器和 lmbench mmap/munmap 小测频繁调用。
+        // range 已按页对齐，直接逐页探测现有映射，避免先收集 key 到 Vec。
+        let page_size = page_size();
+        let mut va = range.start;
+        while va < range.end {
             let Some(area) = set.find(va) else {
+                va += page_size;
                 continue;
             };
             let Some(mapping) = pages.get_mut(&va) else {
+                va += page_size;
                 continue;
             };
             mapping.access = access_for_existing_page(area.flags, &mapping.page);
             self.protect_page(va, pte_flags_for(area.flags, mapping.access))?;
+            va += page_size;
         }
         Ok(())
     }
@@ -863,6 +869,26 @@ impl VmSpace {
             va += page_size;
         }
         Ok(out)
+    }
+
+    /// 校验一段用户 VMA 是否连续存在，不触发缺页也不改变页表状态。
+    pub fn contains_user_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let set = self.vmas.lock();
+        if !set.contains_range(&range) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
+    pub fn discard_resident_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.contains_user_range(range.clone())?;
+        let removed = self.remove_page_mappings(range);
+        for (va, _mapping) in &removed {
+            self.unmap_page(*va)?;
+        }
+        Ok(())
     }
 
     pub fn sync_range(&self, range: Range<usize>) -> Result<(), Errno> {

@@ -161,6 +161,8 @@ impl PollEvents {
     pub const POLLNVAL: Self = Self(0x0020);
     /// 对端关闭写半边（Linux POLLRDHUP / EPOLLRDHUP）。
     pub const POLLRDHUP: Self = Self(0x2000);
+    /// 非状态型文件的默认就绪集合：读写操作都不会因为等待外部事件而休眠。
+    pub const READ_WRITE_READY: Self = Self::POLLIN.with(Self::POLLOUT);
 
     /// 将两个事件掩码合并。
     pub const fn with(self, other: Self) -> Self {
