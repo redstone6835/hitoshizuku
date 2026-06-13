@@ -155,7 +155,43 @@ pub(super) fn sys_mprotect(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(0)
 }
 
-pub(super) fn sys_madvise(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_madvise(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const MADV_NORMAL: usize = 0;
+    const MADV_RANDOM: usize = 1;
+    const MADV_SEQUENTIAL: usize = 2;
+    const MADV_WILLNEED: usize = 3;
+    const MADV_DONTNEED: usize = 4;
+
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let addr = ctx.args[0];
+    let len = ctx.args[1];
+    let advice = ctx.args[2];
+    if !matches!(
+        advice,
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED
+    ) {
+        return Err(Errno::EINVAL);
+    }
+
+    let page_size = hal::memory::page_size();
+    if addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let range = addr..end;
+    match advice {
+        MADV_DONTNEED => vm.discard_resident_range(range)?,
+        // 这些 advice 只影响后续访问策略；当前 VM 没有策略状态，完成可见校验即可。
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED => {
+            vm.contains_user_range(range)?
+        }
+        _ => unreachable!(),
+    }
     Ok(0)
 }
 
@@ -269,10 +305,20 @@ pub(super) fn sys_mincore(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     let addr = ctx.args[0];
     let len = ctx.args[1];
     let vec_user = ctx.args[2];
-    if vec_user == 0 || len == 0 {
+    let page_size = hal::memory::page_size();
+    if addr % page_size != 0 {
         return Err(Errno::EINVAL);
     }
-    let range = page_aligned_range(addr, len)?;
+    if len == 0 {
+        return Ok(0);
+    }
+    if vec_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let range = addr..end;
     let bitmap = vm.resident_bitmap(range)?;
     copy_to_user(vec_user, &bitmap).map_err(|e| e.as_errno())?;
     Ok(0)

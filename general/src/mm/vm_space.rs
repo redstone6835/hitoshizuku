@@ -871,6 +871,26 @@ impl VmSpace {
         Ok(out)
     }
 
+    /// 校验一段用户 VMA 是否连续存在，不触发缺页也不改变页表状态。
+    pub fn contains_user_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.validate_range(&range)?;
+        let set = self.vmas.lock();
+        if !set.contains_range(&range) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// 丢弃指定范围内已经常驻的页，保留 VMA 语义供后续缺页按 backing 重建。
+    pub fn discard_resident_range(&self, range: Range<usize>) -> Result<(), Errno> {
+        self.contains_user_range(range.clone())?;
+        let removed = self.remove_page_mappings(range);
+        for (va, _mapping) in &removed {
+            self.unmap_page(*va)?;
+        }
+        Ok(())
+    }
+
     pub fn sync_range(&self, range: Range<usize>) -> Result<(), Errno> {
         self.validate_range(&range)?;
         {

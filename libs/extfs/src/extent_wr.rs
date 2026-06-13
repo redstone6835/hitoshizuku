@@ -70,6 +70,56 @@ pub(crate) fn free_tree(state: &FsState, root: &[u8]) -> Result<(), BlockBackend
     Ok(())
 }
 
+/// 统计 extent tree 实际占用的文件系统块数,包含数据块和外部 extent 索引块。
+///
+/// inode 内嵌的 extent root 不占磁盘块,所以 depth=0 时只累加叶子 extent 的
+/// 数据块数;depth>0 时每个 child extent block 先计 1,再递归统计其子树。
+pub(crate) fn count_tree_blocks(state: &FsState, root: &[u8]) -> Result<u64, BlockBackendError> {
+    if root.len() < EXT_HEADER_SIZE {
+        return Ok(0);
+    }
+    let magic = u16::from_le_bytes([root[0], root[1]]);
+    if magic != EXT4_EXT_MAGIC {
+        return Ok(0);
+    }
+    let entries = u16::from_le_bytes([root[2], root[3]]) as usize;
+    let depth = u16::from_le_bytes([root[6], root[7]]);
+    let mut total = 0u64;
+    if depth == 0 {
+        for i in 0..entries {
+            let off = EXT_HEADER_SIZE + i * EXT_ENTRY_SIZE;
+            if off + EXT_ENTRY_SIZE > root.len() {
+                break;
+            }
+            let ee_len = u16::from_le_bytes([root[off + 4], root[off + 5]]);
+            let real_len = if ee_len > 0x8000 {
+                ee_len - 0x8000
+            } else {
+                ee_len
+            };
+            total += real_len as u64;
+        }
+    } else {
+        let bs = state.ext_sb.block_size as usize;
+        let mut blk = vec![0u8; bs];
+        for i in 0..entries {
+            let off = EXT_HEADER_SIZE + i * EXT_ENTRY_SIZE;
+            if off + EXT_ENTRY_SIZE > root.len() {
+                break;
+            }
+            let leaf_lo =
+                u32::from_le_bytes([root[off + 4], root[off + 5], root[off + 6], root[off + 7]])
+                    as u64;
+            let leaf_hi = u16::from_le_bytes([root[off + 8], root[off + 9]]) as u64;
+            let child = (leaf_hi << 32) | leaf_lo;
+            total += 1;
+            state.read_block(child, &mut blk)?;
+            total += count_tree_blocks(state, &blk)?;
+        }
+    }
+    Ok(total)
+}
+
 /// 把一个原来用 extent 的文件 i_block 重置为"空的间接块布局"。
 /// 调用方负责清 `EXT4_EXTENTS_FL`。
 pub(crate) fn reset_to_indirect(i_block: &mut [u8]) {
@@ -134,8 +184,7 @@ pub(crate) fn demote_preserve_if_extent(
         }
         let start_hi = u16::from_le_bytes([old[off + 6], old[off + 7]]) as u64;
         let start_lo =
-            u32::from_le_bytes([old[off + 8], old[off + 9], old[off + 10], old[off + 11]])
-                as u64;
+            u32::from_le_bytes([old[off + 8], old[off + 9], old[off + 10], old[off + 11]]) as u64;
         let start = (start_hi << 32) | start_lo;
         for b in 0..ee_len as u32 {
             crate::map_wr::set_existing_block(state, i_block, ee_block + b, start + b as u64)?;

@@ -656,8 +656,9 @@ impl FileOps for ProcNetSnapshotFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 快照型伪文件每次读都会重新生成内容，不需要等待异步事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -965,8 +966,9 @@ impl FileOps for ProcNetDevFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 快照型伪文件每次读都会重新生成内容，不需要等待异步事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1616,8 +1618,9 @@ impl FileOps for ProcDirFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举基于打开时快照，可立即尝试读取目录项。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1701,8 +1704,9 @@ impl FileOps for ProcRegularFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 只读或少量可写的伪文件不会等待外部 I/O 事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {

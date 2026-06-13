@@ -1962,8 +1962,9 @@ impl FileOps for DevRootFile {
         Ok(())
     }
 
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 根目录是设备表快照，目录项读取不会等待设备事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
 
     fn release(&self) {}

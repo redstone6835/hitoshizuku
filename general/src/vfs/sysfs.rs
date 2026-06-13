@@ -2030,8 +2030,9 @@ impl FileOps for SysDirFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举基于内存快照，可立即尝试读取目录项。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)
@@ -2064,8 +2065,9 @@ impl FileOps for SysRegFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 属性内容由内核内存即时渲染，不依赖外部事件到达。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)

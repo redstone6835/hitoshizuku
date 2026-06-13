@@ -18,8 +18,7 @@ use vfs::stat::FileType;
 use vfs::superblock::Superblock as VfsSuperblock;
 use vfs::sync::Spinlock;
 
-use crate::inode::ExtInodeOps;
-use crate::inode_wr::write_raw;
+use crate::inode_wr::{RawInode, write_raw};
 use crate::layout::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EXT4_INLINE_DATA_FL,
 };
@@ -104,8 +103,9 @@ impl FileOps for ExtDirFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举不会等待外部事件；readiness 表示可立即尝试 I/O。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn Any {
@@ -119,6 +119,11 @@ pub struct ExtRegFileOps {
     state: Arc<FsState>,
     sb: Arc<VfsSuperblock>,
     ino: u32,
+    /// 打开文件直接持有 inode raw 状态，保证 unlink 后仍可继续 I/O。
+    ///
+    /// VFS 在 nlink=0 后会把 inode 从 superblock cache 移除；如果这里每次
+    /// I/O 都靠 ino 反查 cache，unlink-but-open 文件会立刻变成 ENOENT。
+    raw: Arc<Spinlock<RawInode>>,
     map_cache: Spinlock<BlockMapCache>,
     /// 串行化 append / 扩容。
     io_mu: Spinlock<()>,
@@ -157,33 +162,29 @@ impl BlockMapCache {
 }
 
 impl ExtRegFileOps {
-    pub(crate) fn new(state: Arc<FsState>, sb: Arc<VfsSuperblock>, ino: u32) -> Self {
+    pub(crate) fn new(
+        state: Arc<FsState>,
+        sb: Arc<VfsSuperblock>,
+        ino: u32,
+        raw: Arc<Spinlock<RawInode>>,
+    ) -> Self {
         Self {
             state,
             sb,
             ino,
+            raw,
             map_cache: Spinlock::new(BlockMapCache::default()),
             io_mu: Spinlock::new(()),
         }
     }
 
-    pub(crate) fn new_empty(state: Arc<FsState>, sb: Arc<VfsSuperblock>, ino: u32) -> Self {
-        Self::new(state, sb, ino)
-    }
-
-    /// 找回 Inode 与 ExtInodeOps(每次 I/O 都现取,状态是最新的)。
-    fn with_ops<R>(
-        &self,
-        f: impl FnOnce(&vfs::inode::Inode, &ExtInodeOps) -> VfsResult<R>,
-    ) -> VfsResult<R> {
-        let inode = self
-            .sb
-            .find_inode(self.ino as u64)
-            .ok_or(VfsError::NotFound)?;
-        let ops = inode
-            .downcast_ops::<ExtInodeOps>()
-            .ok_or(VfsError::InvalidArgument)?;
-        f(&inode, ops)
+    pub(crate) fn new_empty(
+        state: Arc<FsState>,
+        sb: Arc<VfsSuperblock>,
+        ino: u32,
+        raw: Arc<Spinlock<RawInode>>,
+    ) -> Self {
+        Self::new(state, sb, ino, raw)
     }
 
     fn map_ranges(
@@ -313,75 +314,73 @@ impl ExtRegFileOps {
 
 impl FileOps for ExtRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        self.with_ops(|_inode, ops| {
-            let (flags, size, i_block) = {
-                let g = ops.raw.lock();
-                let mut i_block = [0u8; I_BLOCK_BYTES];
-                i_block.copy_from_slice(crate::inode::i_block_slice(&g.bytes));
-                (g.flags(), g.size(), i_block)
-            };
-            if offset >= size || buf.is_empty() {
-                return Ok(0);
+        let (flags, size, i_block) = {
+            let g = self.raw.lock();
+            let mut i_block = [0u8; I_BLOCK_BYTES];
+            i_block.copy_from_slice(crate::inode::i_block_slice(&g.bytes));
+            (g.flags(), g.size(), i_block)
+        };
+        if offset >= size || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = (size - offset).min(buf.len() as u64) as usize;
+
+        // inline_data 路径
+        if flags & EXT4_INLINE_DATA_FL != 0 {
+            let raw_bytes = self.raw.lock().bytes.clone();
+            if let Some(inline) =
+                crate::inode::try_inline_data(&self.state, &raw_bytes, size, flags)
+            {
+                let start = offset as usize;
+                let end = (start + remaining).min(inline.len());
+                let take = end.saturating_sub(start);
+                buf[..take].copy_from_slice(&inline[start..end]);
+                return Ok(take);
             }
-            let remaining = (size - offset).min(buf.len() as u64) as usize;
+        }
 
-            // inline_data 路径
-            if flags & EXT4_INLINE_DATA_FL != 0 {
-                let raw_bytes = ops.raw.lock().bytes.clone();
-                if let Some(inline) =
-                    crate::inode::try_inline_data(&self.state, &raw_bytes, size, flags)
-                {
-                    let start = offset as usize;
-                    let end = (start + remaining).min(inline.len());
-                    let take = end.saturating_sub(start);
-                    buf[..take].copy_from_slice(&inline[start..end]);
-                    return Ok(take);
-                }
+        let block_size = self.state.ext_sb.block_size as u64;
+
+        let first_lb = (offset / block_size) as u32;
+        let last_lb = ((offset + remaining as u64 - 1) / block_size) as u32;
+        let lb_count = last_lb - first_lb + 1;
+
+        let ranges = self
+            .map_ranges(flags, size, &i_block, first_lb, lb_count)
+            .map_err(map_err)?;
+
+        let mut filled_until = 0usize;
+        let mut scratch = Vec::new();
+        for (range_lb, range_count, phys_start) in &ranges {
+            let range_byte_start = *range_lb as u64 * block_size;
+            let range_byte_end = range_byte_start + *range_count as u64 * block_size;
+            let read_start = offset.max(range_byte_start);
+            let read_end = (offset + remaining as u64).min(range_byte_end);
+            if read_start >= read_end {
+                continue;
+            }
+            let overlap_bytes = (read_end - read_start) as usize;
+            let buf_pos = (read_start - offset) as usize;
+
+            if filled_until < buf_pos {
+                zero_bytes(&mut buf[filled_until..buf_pos]);
             }
 
-            let block_size = self.state.ext_sb.block_size as u64;
-
-            let first_lb = (offset / block_size) as u32;
-            let last_lb = ((offset + remaining as u64 - 1) / block_size) as u32;
-            let lb_count = last_lb - first_lb + 1;
-
-            let ranges = self
-                .map_ranges(flags, size, &i_block, first_lb, lb_count)
-                .map_err(map_err)?;
-
-            let mut filled_until = 0usize;
-            let mut scratch = Vec::new();
-            for (range_lb, range_count, phys_start) in &ranges {
-                let range_byte_start = *range_lb as u64 * block_size;
-                let range_byte_end = range_byte_start + *range_count as u64 * block_size;
-                let read_start = offset.max(range_byte_start);
-                let read_end = (offset + remaining as u64).min(range_byte_end);
-                if read_start >= read_end {
-                    continue;
-                }
-                let overlap_bytes = (read_end - read_start) as usize;
-                let buf_pos = (read_start - offset) as usize;
-
-                if filled_until < buf_pos {
-                    zero_bytes(&mut buf[filled_until..buf_pos]);
-                }
-
-                self.read_mapped_bytes(
-                    &mut scratch,
-                    range_byte_start,
-                    *phys_start,
-                    read_start,
-                    read_end,
-                    offset,
-                    buf,
-                )?;
-                filled_until = filled_until.max(buf_pos + overlap_bytes);
-            }
-            if filled_until < remaining {
-                zero_bytes(&mut buf[filled_until..remaining]);
-            }
-            Ok(remaining)
-        })
+            self.read_mapped_bytes(
+                &mut scratch,
+                range_byte_start,
+                *phys_start,
+                read_start,
+                read_end,
+                offset,
+                buf,
+            )?;
+            filled_until = filled_until.max(buf_pos + overlap_bytes);
+        }
+        if filled_until < remaining {
+            zero_bytes(&mut buf[filled_until..remaining]);
+        }
+        Ok(remaining)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
@@ -392,8 +391,8 @@ impl FileOps for ExtRegFileOps {
             return Ok(0);
         }
         let _io = self.io_mu.lock();
-        self.with_ops(|inode, ops| {
-            let mut raw_guard = ops.raw.lock();
+        {
+            let mut raw_guard = self.raw.lock();
             let old_size = raw_guard.size();
             let start = if offset == u64::MAX { old_size } else { offset };
             let end = start
@@ -539,24 +538,30 @@ impl FileOps for ExtRegFileOps {
             }
 
             let new_size = raw_guard.size().max(end);
-            let blocks512 = (new_size + 511) / 512;
-            let new_blocks_lo = blocks512 as u32;
-            let metadata_changed = new_size != old_size
-                || new_blocks_lo != old_blocks_lo
-                || flags != old_flags
-                || i_block != old_i_block;
+            let mapping_changed = flags != old_flags || i_block != old_i_block;
+            let size_changed = new_size != old_size;
+            let new_blocks_lo = if mapping_changed || size_changed {
+                crate::inode::blocks_lo_from_mapping(&self.state, flags, &i_block)
+                    .map_err(map_err)?
+            } else {
+                old_blocks_lo
+            };
+            let metadata_changed =
+                size_changed || new_blocks_lo != old_blocks_lo || mapping_changed;
             if metadata_changed {
                 raw_guard.i_block_mut().copy_from_slice(&i_block);
                 raw_guard.set_flags(flags);
                 raw_guard.set_size(new_size);
                 raw_guard.set_blocks_lo(new_blocks_lo);
                 write_raw(&self.state, &raw_guard).map_err(map_err)?;
-                inode.set_size(new_size);
+                if let Some(inode) = self.sb.find_inode(self.ino as u64) {
+                    inode.set_size(new_size);
+                }
                 self.invalidate_map_cache();
             }
 
             Ok(written)
-        })
+        }
     }
 
     fn readdir(
@@ -569,8 +574,9 @@ impl FileOps for ExtRegFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 普通文件不会阻塞等待设备事件；读写 readiness 应立即满足。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn Any {

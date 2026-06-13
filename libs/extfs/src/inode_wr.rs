@@ -49,6 +49,9 @@ impl RawInode {
     pub fn set_nlink(&mut self, v: u16) {
         self.bytes[26..28].copy_from_slice(&v.to_le_bytes());
     }
+    pub fn set_dtime(&mut self, v: u32) {
+        self.bytes[20..24].copy_from_slice(&v.to_le_bytes());
+    }
     #[allow(dead_code)]
     pub fn uid(&self) -> u32 {
         let lo = u16::from_le_bytes([self.bytes[2], self.bytes[3]]) as u32;

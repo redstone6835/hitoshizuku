@@ -368,9 +368,7 @@ fn process_execve(
     let loaded = match crate::user::load_user_image_from_path(task, &path, &argv, &envp) {
         Ok(loaded) => loaded,
         Err(err) => {
-            if err == Errno::ENOEXEC {
-                // shell 执行无 shebang 的脚本时会先尝试 execve，收到
-                // ENOEXEC 后回退为解释执行；这是用户态正常探测路径。
+            if matches!(err, Errno::ENOEXEC | Errno::ENOENT) {
                 log::debug!("[exec] load failed: path={:?} err={:?}", path, err);
             } else {
                 log::info!("[exec] load failed: path={:?} err={:?}", path, err);

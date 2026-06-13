@@ -228,15 +228,16 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
                 arg4
             }
             FaultOutcome::Segv => {
-                // 投 SIGSEGV 给当前线程；下一次调度边界 deliver_pending_signals
-                // 拿到默认 Term 动作即触发 exit_task。本轮 hello 跑通不应触发；
-                // 兜底替代旧的 halt 行为。
+                // 同步 page fault 必须在返回用户态前立刻投递 SIGSEGV。若只把信号
+                // 入队再返回，lmbench lat_sig prot 这类“handler 返回后重试同一条
+                // fault 指令”的测试会在同一 PC 上反复 fault，永远等不到 syscall/
+                // timer 边界来安装用户 signal frame。
                 if sched::is_ready() {
                     let me = sched::current_task();
                     let pid = me.pid_root().unwrap_or(0);
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
                     drop(me);
-                    sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+                    deliver_user_signals_before_return(arg4, from_user);
                 }
                 arg4
             }

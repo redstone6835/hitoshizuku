@@ -47,7 +47,7 @@ fn scan_dir_block_bytes<F: FnMut(u32, u8, &[u8]) -> bool>(
             break;
         }
         // checksum tail 只在 INCOMPAT_FILETYPE 时才会出现(两字段布局才合法)
-        if has_filetype && block[off + 6] == DIR_TAIL_MARKER {
+        if has_filetype && block[off + 6] == 0 && block[off + 7] == DIR_TAIL_MARKER {
             off += rec_len;
             continue;
         }

@@ -664,9 +664,10 @@ fn validate_clone_args(args: CloneArgs) -> Result<(), Errno> {
     if args.set_tid != 0 || args.set_tid_size != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    if args.pidfd != 0 && !flags.has(CloneFlags::CLONE_PIDFD) {
-        return Err(Errno::EINVAL);
-    }
+    // clone3 的 pidfd 字段只有在 CLONE_PIDFD 置位时才有意义。glibc 的
+    // pthread_create() 会复用 clone_args 缓冲，把该字段填成 TID 地址但不置
+    // CLONE_PIDFD；Linux 对这种无效字段是忽略而不是返回 EINVAL，否则用户态
+    // 不会 fallback 到传统 clone，线程创建会直接失败。
     if flags.has(CloneFlags::CLONE_PIDFD) && args.pidfd == 0 {
         return Err(Errno::EINVAL);
     }

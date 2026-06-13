@@ -120,11 +120,6 @@ impl FileOps for PipeReadEnd {
             return Ok(0);
         }
 
-        // FIXME: 当前基于 write_pos 的启发式会误判流水线写入场景会产生错误
-        if inner.write_pos > 0 {
-            inner.writer_count = 0;
-            return Ok(0);
-        }
         Err(VfsError::WouldBlock)
     }
 
@@ -151,8 +146,7 @@ impl FileOps for PipeReadEnd {
         if avail > 0 {
             ready = ready.with(PollEvents::POLLIN);
         }
-        // FIXME: 此处的 write_pos>0 启发式与 read_at 中的自旋死锁检测一致，
-        if inner.writer_count == 0 || (avail == 0 && inner.write_pos > 0) {
+        if inner.writer_count == 0 {
             ready = ready.with(PollEvents::POLLHUP);
         }
         ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))

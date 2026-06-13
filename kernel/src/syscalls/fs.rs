@@ -985,6 +985,11 @@ pub(super) fn sys_umount2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
 }
 
 pub(super) fn sys_sync(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    if let Some(vfs_ctx) = current_vfs_context() {
+        // iozone/lmbench 会依赖 sync(2) 作为阶段边界。这里至少同步当前
+        // mount namespace 中可见的 superblock,确保 ext4 位图和块组描述符刷盘。
+        vfs_ctx.mount_ns.sync_all().map_err(|e| e.to_errno())?;
+    }
     Ok(0)
 }
 
@@ -2033,7 +2038,7 @@ pub(super) fn sys_preadv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     if iovcnt > 1024 {
         return Err(Errno::EINVAL);
     }
-    let offset = nonnegative_i64_arg(ctx.args[3])?;
+    let offset = nonnegative_split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
     read_iovecs(&file, iov, iovcnt, Some(offset))
 }
@@ -2045,7 +2050,7 @@ pub(super) fn sys_pwritev(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
     if iovcnt > 1024 {
         return Err(Errno::EINVAL);
     }
-    let offset = nonnegative_i64_arg(ctx.args[3])?;
+    let offset = nonnegative_split_offset_arg(ctx.args[3], ctx.args[4])?;
     let file = file_for_fd(fd)?;
     write_iovecs(&file, iov, iovcnt, Some(offset))
 }
@@ -2179,15 +2184,23 @@ pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 }
 
 pub(super) fn sys_preadv2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let flags = ctx.args[4];
+    let flags = ctx.args[5];
     if (flags & !RWF_SUPPORTED) != 0 || (flags & RWF_APPEND) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
-    sys_preadv(ctx)
+    let fd = fd_arg(ctx.args[0])?;
+    let iov = ctx.args[1];
+    let iovcnt = ctx.args[2];
+    if iovcnt > 1024 {
+        return Err(Errno::EINVAL);
+    }
+    let offset = split_offset_arg(ctx.args[3], ctx.args[4])?;
+    let file = file_for_fd(fd)?;
+    read_iovecs(&file, iov, iovcnt, offset)
 }
 
 pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    let flags = ctx.args[4];
+    let flags = ctx.args[5];
     if (flags & !RWF_SUPPORTED) != 0 || ((flags & RWF_APPEND) != 0 && (flags & RWF_NOAPPEND) != 0) {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -2198,12 +2211,12 @@ pub(super) fn sys_pwritev2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         return Err(Errno::EINVAL);
     }
     let offset = if (flags & RWF_APPEND) != 0 {
-        u64::MAX
+        Some(u64::MAX)
     } else {
-        nonnegative_i64_arg(ctx.args[3])?
+        split_offset_arg(ctx.args[3], ctx.args[4])?
     };
     let file = file_for_fd(fd)?;
-    let written = write_iovecs(&file, iov, iovcnt, Some(offset))?;
+    let written = write_iovecs(&file, iov, iovcnt, offset)?;
     if (flags & (RWF_DSYNC | RWF_SYNC)) != 0 {
         file.sync().map_err(|e| e.to_errno())?;
     }
@@ -2746,6 +2759,25 @@ fn nonnegative_i64_arg(raw: usize) -> Result<u64, Errno> {
     Ok(value as u64)
 }
 
+fn split_offset_arg(pos_l: usize, pos_h: usize) -> Result<Option<u64>, Errno> {
+    // Linux raw preadv/pwritev ABI 把 64-bit offset 拆成 pos_l/pos_h 两个寄存器。
+    // libc/rustix 在 64-bit 架构上也按这个 raw ABI 传参；只取低 32 位可兼容
+    // pos_l 传完整 64-bit 值或只传低 32-bit 值的两种封装。
+    let raw = ((pos_h as u64 & 0xffff_ffff) << 32) | (pos_l as u64 & 0xffff_ffff);
+    let signed = raw as i64;
+    if signed == -1 {
+        return Ok(None);
+    }
+    if signed < 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Some(signed as u64))
+}
+
+fn nonnegative_split_offset_arg(pos_l: usize, pos_h: usize) -> Result<u64, Errno> {
+    split_offset_arg(pos_l, pos_h)?.ok_or(Errno::EINVAL)
+}
+
 fn dirfd_arg(raw: usize, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
     let fd = raw as isize as i32;
     if fd == AT_FDCWD {
@@ -3000,6 +3032,16 @@ fn write_from_user_at(
             }
             Err(e) => return Err(e.to_errno()),
         };
+        if n == 0 {
+            // 非空 write 返回 0 表示底层没有取得任何进展。Linux write(2)
+            // 对常规文件通常应返回错误；这里优先返回已写入字节数，避免 libc/测试
+            // 在同一缓冲区上无限重试导致 iozone/lmbench 卡死。
+            return if written > 0 {
+                Ok(written)
+            } else {
+                Err(Errno::EIO)
+            };
+        }
         written += n;
         if n < chunk {
             break;
