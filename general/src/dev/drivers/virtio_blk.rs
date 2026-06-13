@@ -9,12 +9,12 @@
 //! PnP 适配层只负责匹配固件枚举的 `virtio,mmio` / `LNRO0005` 设备，并把成功
 //! 初始化的块设备封装成通用 function 注册给设备 core。
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::any::Any;
 use core::mem;
 use core::num::NonZeroU32;
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
@@ -33,49 +33,17 @@ use crate::dev::pnp::{
     PnpResourceKind, register_driver_factory,
 };
 use crate::dev::virtio::{SplitVirtQueue, VIRTQ_DESC_F_WRITE, choose_split_queue_size};
-
-// ───────── VirtIO MMIO 寄存器布局 ─────────
-
-const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x74726976; // "virt"
-const VIRTIO_MMIO_VERSION_LEGACY: u32 = 0x1; // Legacy (pre-1.0)
-const VIRTIO_MMIO_VERSION: u32 = 0x2; // VirtIO 1.0
-const VIRTIO_MMIO_DEVICE_ID_BLOCK: u32 = 2;
-
-// MMIO 寄存器偏移
-const MMIO_MAGIC: usize = 0x000;
-const MMIO_VERSION: usize = 0x004;
-const MMIO_DEVICE_ID: usize = 0x008;
-const MMIO_DEVICE_FEATURES: usize = 0x010;
-const MMIO_DEVICE_FEATURES_SEL: usize = 0x014;
-const MMIO_DRIVER_FEATURES: usize = 0x020;
-const MMIO_DRIVER_FEATURES_SEL: usize = 0x024;
-const MMIO_QUEUE_SEL: usize = 0x030;
-const MMIO_QUEUE_NUM_MAX: usize = 0x034;
-const MMIO_QUEUE_NUM: usize = 0x038;
-const MMIO_QUEUE_READY: usize = 0x044;
-const MMIO_QUEUE_NOTIFY: usize = 0x050;
-const MMIO_INTERRUPT_STATUS: usize = 0x060;
-const MMIO_INTERRUPT_ACK: usize = 0x064;
-const MMIO_STATUS: usize = 0x070;
-const MMIO_QUEUE_DESC_LOW: usize = 0x080;
-const MMIO_QUEUE_DESC_HIGH: usize = 0x084;
-const MMIO_QUEUE_AVAIL_LOW: usize = 0x090;
-const MMIO_QUEUE_AVAIL_HIGH: usize = 0x094;
-const MMIO_QUEUE_USED_LOW: usize = 0x0a0;
-const MMIO_QUEUE_USED_HIGH: usize = 0x0a4;
-
-// VirtIO 设备状态位
-const VIRTIO_STATUS_ACKNOWLEDGE: u32 = 1;
-const VIRTIO_STATUS_DRIVER: u32 = 2;
-const VIRTIO_STATUS_FEATURES_OK: u32 = 8;
-const VIRTIO_STATUS_DRIVER_OK: u32 = 4;
-const VIRTIO_STATUS_FAILED: u32 = 128;
+use crate::dev::virtio_mmio::{
+    self, VirtioMmioTransport,
+    VIRTIO_F_VERSION_1,
+    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FEATURES_OK, VIRTIO_STATUS_FAILED,
+};
 
 // VirtIO Block 特性位
 const VIRTIO_BLK_F_RO: u64 = 1 << 5;
 const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
-const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
 // VirtIO Block 设备配置空间偏移（相对于 0x100）
 const BLK_CFG_CAPACITY: usize = 0x100;
@@ -129,8 +97,7 @@ unsafe impl Send for VirtioBlkQueue {}
 unsafe impl Sync for VirtioBlkQueue {}
 
 struct VirtioBlkInner {
-    /// MMIO 基地址
-    base: usize,
+    transport: Box<dyn VirtioMmioTransport>,
     /// 设备容量（扇区数）
     capacity: u64,
     /// 逻辑块大小
@@ -147,72 +114,7 @@ pub struct VirtioBlk {
 
 impl Drop for VirtioBlk {
     fn drop(&mut self) {
-        self.inner.write_reg(MMIO_STATUS, 0);
-    }
-}
-
-struct VirtioMmioRegs {
-    base: usize,
-}
-
-// ───────── MMIO 寄存器访问辅助函数 ─────────
-
-impl VirtioMmioRegs {
-    #[inline]
-    fn read_reg(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.base + offset) as *const u32) }
-    }
-
-    #[inline]
-    fn write_reg(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
-    }
-
-    #[inline]
-    fn read_reg64(&self, offset: usize) -> u64 {
-        let low = self.read_reg(offset) as u64;
-        let high = self.read_reg(offset + 4) as u64;
-        (high << 32) | low
-    }
-
-    fn read_device_features(&self) -> u64 {
-        self.write_reg(MMIO_DEVICE_FEATURES_SEL, 0);
-        let low = self.read_reg(MMIO_DEVICE_FEATURES) as u64;
-        self.write_reg(MMIO_DEVICE_FEATURES_SEL, 1);
-        let high = self.read_reg(MMIO_DEVICE_FEATURES) as u64;
-        (high << 32) | low
-    }
-
-    fn write_driver_features(&self, features: u64) {
-        self.write_reg(MMIO_DRIVER_FEATURES_SEL, 0);
-        self.write_reg(MMIO_DRIVER_FEATURES, features as u32);
-        self.write_reg(MMIO_DRIVER_FEATURES_SEL, 1);
-        self.write_reg(MMIO_DRIVER_FEATURES, (features >> 32) as u32);
-    }
-
-    fn set_status(&self, status: u32) {
-        let current = self.read_reg(MMIO_STATUS);
-        self.write_reg(MMIO_STATUS, current | status);
-    }
-}
-
-impl VirtioBlkInner {
-    #[inline]
-    fn read_reg(&self, offset: usize) -> u32 {
-        unsafe { read_volatile((self.base + offset) as *const u32) }
-    }
-
-    #[inline]
-    fn write_reg(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
-    }
-
-    fn read_device_features(&self) -> u64 {
-        self.write_reg(MMIO_DEVICE_FEATURES_SEL, 0);
-        let low = self.read_reg(MMIO_DEVICE_FEATURES) as u64;
-        self.write_reg(MMIO_DEVICE_FEATURES_SEL, 1);
-        let high = self.read_reg(MMIO_DEVICE_FEATURES) as u64;
-        (high << 32) | low
+        self.inner.transport.write_status(0);
     }
 }
 
@@ -226,43 +128,34 @@ impl VirtioBlk {
     ///
     /// # 返回
     /// 成功时返回驱动实例，失败时返回错误信息
-    pub fn new(mmio_base: usize, dma_context: DmaContext) -> Result<Self, &'static str> {
-        let regs = VirtioMmioRegs { base: mmio_base };
+    pub fn new(transport: Box<dyn VirtioMmioTransport>, dma_context: DmaContext) -> Result<Self, &'static str> {
+        let is_legacy = transport.is_legacy();
 
-        // 1. 验证 Magic 和 Version
-        if regs.read_reg(MMIO_MAGIC) != VIRTIO_MMIO_MAGIC_VALUE {
-            return Err("Invalid VirtIO magic value");
-        }
-        let ver = regs.read_reg(MMIO_VERSION);
-        let is_legacy = ver == VIRTIO_MMIO_VERSION_LEGACY;
-        if !is_legacy && ver != VIRTIO_MMIO_VERSION {
-            log::printk!("[virtio-mmio-blk] unsupported version {:#x} (base={:#x})", ver, mmio_base);
-            return Err("Unsupported VirtIO version");
-        }
-        if regs.read_reg(MMIO_DEVICE_ID) != VIRTIO_MMIO_DEVICE_ID_BLOCK {
+        // 1. 验证 Device ID
+        let device_id = unsafe { transport.read_reg(0x008) };
+        if device_id != 2 {
             return Err("Not a VirtIO block device");
         }
 
         // 2. 重置设备
-        regs.write_reg(MMIO_STATUS, 0);
+        transport.write_status(0);
 
         // 3. 设置 ACKNOWLEDGE 和 DRIVER 状态位
-        regs.set_status(VIRTIO_STATUS_ACKNOWLEDGE);
-        regs.set_status(VIRTIO_STATUS_DRIVER);
+        transport.add_status(VIRTIO_STATUS_ACKNOWLEDGE);
+        transport.add_status(VIRTIO_STATUS_DRIVER);
 
         // 4. 协商特性
-        let device_features = regs.read_device_features();
+        let device_features = transport.read_device_features();
         let mut driver_features = 0u64;
 
         if !is_legacy {
             if device_features & VIRTIO_F_VERSION_1 == 0 {
-                regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
+                transport.write_status(VIRTIO_STATUS_FAILED);
                 return Err("VirtIO 1.0 VERSION_1 feature is missing");
             }
             driver_features |= VIRTIO_F_VERSION_1;
         }
 
-        // 选择我们支持的特性
         if device_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
             driver_features |= VIRTIO_BLK_F_BLK_SIZE;
         }
@@ -273,19 +166,19 @@ impl VirtioBlk {
             driver_features |= VIRTIO_BLK_F_RO;
         }
 
-        regs.write_driver_features(driver_features);
-        regs.set_status(VIRTIO_STATUS_FEATURES_OK);
+        transport.write_driver_features(driver_features);
+        transport.add_status(VIRTIO_STATUS_FEATURES_OK);
 
-        // 验证特性协商是否成功
-        if regs.read_reg(MMIO_STATUS) & VIRTIO_STATUS_FEATURES_OK == 0 {
-            regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
+        let status = transport.read_status();
+        if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+            transport.write_status(VIRTIO_STATUS_FAILED);
             return Err("Feature negotiation failed");
         }
 
         // 5. 读取设备配置
-        let capacity = regs.read_reg64(BLK_CFG_CAPACITY);
+        let capacity = unsafe { transport.read_reg64(BLK_CFG_CAPACITY) };
         let block_size = if driver_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
-            regs.read_reg(BLK_CFG_BLK_SIZE)
+            unsafe { transport.read_reg(BLK_CFG_BLK_SIZE) }
         } else {
             VIRTIO_BLK_SECTOR_SIZE
         };
@@ -293,48 +186,44 @@ impl VirtioBlk {
             || !block_size.is_power_of_two()
             || !block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)
         {
-            regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
+            transport.write_status(VIRTIO_STATUS_FAILED);
             return Err("Invalid VirtIO block size");
         }
 
         // 6. 设置队列
-        regs.write_reg(MMIO_QUEUE_SEL, 0);
-        let max_queue_size = regs.read_reg(MMIO_QUEUE_NUM_MAX) as u16;
+        transport.select_queue(0);
+        let max_queue_size = transport.read_queue_max_size() as u16;
         if max_queue_size == 0 {
-            regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
+            transport.write_status(VIRTIO_STATUS_FAILED);
             return Err("Queue size is zero");
         }
         let queue_size = choose_split_queue_size(max_queue_size, None)
             .map_err(|_| "Invalid VirtIO queue size")?;
         if queue_size < VIRTIO_BLK_MIN_QUEUE_SIZE {
-            regs.write_reg(MMIO_STATUS, VIRTIO_STATUS_FAILED);
+            transport.write_status(VIRTIO_STATUS_FAILED);
             return Err("VirtIO queue size is too small");
         }
-        let split_queue = SplitVirtQueue::new_in(dma_context, queue_size)
-            .map_err(|_| "Failed to allocate VirtIO queue")?;
+        let split_queue = if is_legacy {
+            SplitVirtQueue::new_legacy(queue_size)
+                .map_err(|_| "Failed to allocate VirtIO queue")?
+        } else {
+            SplitVirtQueue::new_in(dma_context, queue_size)
+                .map_err(|_| "Failed to allocate VirtIO queue")?
+        };
 
-        // 队列 DMA 布局由公共 SplitVirtQueue 维护，MMIO 传输层只负责把设备
-        // 可见 DMA 地址写入寄存器，不直接假设 DMA 地址等于物理地址。
-        regs.write_reg(MMIO_QUEUE_NUM, queue_size as u32);
-        let desc_dma = split_queue.desc_dma_addr();
-        regs.write_reg(MMIO_QUEUE_DESC_LOW, desc_dma as u32);
-        regs.write_reg(MMIO_QUEUE_DESC_HIGH, (desc_dma >> 32) as u32);
-
-        let avail_dma = split_queue.avail_dma_addr();
-        regs.write_reg(MMIO_QUEUE_AVAIL_LOW, avail_dma as u32);
-        regs.write_reg(MMIO_QUEUE_AVAIL_HIGH, (avail_dma >> 32) as u32);
-
-        let used_dma = split_queue.used_dma_addr();
-        regs.write_reg(MMIO_QUEUE_USED_LOW, used_dma as u32);
-        regs.write_reg(MMIO_QUEUE_USED_HIGH, (used_dma >> 32) as u32);
-
-        regs.write_reg(MMIO_QUEUE_READY, 1);
+        transport.write_queue_size(queue_size as u32);
+        transport.configure_queue_addresses(
+            split_queue.desc_dma_addr() as u64,
+            split_queue.avail_dma_addr() as u64,
+            split_queue.used_dma_addr() as u64,
+        );
+        transport.enable_queue();
 
         // 7. 设置 DRIVER_OK
-        regs.set_status(VIRTIO_STATUS_DRIVER_OK);
+        transport.add_status(VIRTIO_STATUS_DRIVER_OK);
 
         let inner = Arc::new(VirtioBlkInner {
-            base: mmio_base,
+            transport,
             capacity,
             block_size,
             queue: Mutex::new(VirtioBlkQueue {
@@ -359,9 +248,8 @@ impl VirtioBlk {
         reason: &'static str,
     ) -> VecDeque<PendingVirtioRequest> {
         log::printk!("[virtio-mmio-blk] queue failed: {}", reason);
-        let status = self.inner.read_reg(MMIO_STATUS);
-        self.inner
-            .write_reg(MMIO_STATUS, status | VIRTIO_STATUS_FAILED);
+        let status = self.inner.transport.read_status();
+        self.inner.transport.write_status(status | VIRTIO_STATUS_FAILED);
 
         let mut failed = VecDeque::new();
         mem::swap(&mut failed, &mut queue.pending);
@@ -452,8 +340,8 @@ impl VirtioBlk {
     /// 处理中断（由中断处理程序调用）
     pub fn handle_interrupt(&self) {
         // 确认中断
-        let status = self.inner.read_reg(MMIO_INTERRUPT_STATUS);
-        self.inner.write_reg(MMIO_INTERRUPT_ACK, status);
+        let status = self.inner.transport.read_interrupt_status();
+        self.inner.transport.acknowledge_interrupt(status);
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
 
         // 轮询完成的请求
@@ -482,10 +370,10 @@ impl VirtioBlk {
         let attributes = BlockAttributes::new(false, false, NonZeroU32::new(queue_depth), None);
 
         let mut features = BlockFeatures(0);
-        if self.inner.read_device_features() & VIRTIO_BLK_F_FLUSH != 0 {
+        if self.inner.transport.read_device_features() & VIRTIO_BLK_F_FLUSH != 0 {
             features |= BlockFeatures::FLUSH;
         }
-        if self.inner.read_device_features() & VIRTIO_BLK_F_RO != 0 {
+        if self.inner.transport.read_device_features() & VIRTIO_BLK_F_RO != 0 {
             features |= BlockFeatures::READ_ONLY;
         }
 
@@ -756,7 +644,7 @@ impl BlockDriver for VirtioBlkIo {
 
         // 通知设备
         drop(queue);
-        self.driver.inner.write_reg(MMIO_QUEUE_NOTIFY, 0);
+        self.driver.inner.transport.notify_queue(0);
         Ok(())
     }
 
@@ -823,7 +711,11 @@ impl PnpDriver for VirtioMmioBlkDriver {
             ));
         };
         let virt_base = (self.device_mmio_to_virt)(phys);
-        let driver = VirtioBlk::new(virt_base, info.dma_context()).map_err(|msg| {
+        let transport = virtio_mmio::detect(virt_base).map_err(|msg| {
+            log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
+            PnpError::HardwareFailure { detail: "virtio-mmio block init failed" }
+        })?;
+        let driver = VirtioBlk::new(transport, info.dma_context()).map_err(|msg| {
             log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
             PnpError::hardware_failure("virtio-mmio block init failed")
         })?;

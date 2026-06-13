@@ -19,6 +19,7 @@ pub mod completion;
 pub mod control;
 pub mod cpu;
 pub mod dma;
+pub mod virtio_mmio;
 pub mod drivers;
 pub mod enumerate;
 pub mod firmware_bus;
