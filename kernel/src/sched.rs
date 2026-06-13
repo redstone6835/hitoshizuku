@@ -392,6 +392,10 @@ fn process_clone_user_context(
     }
 
     let _ = child.ext_remove(TASKEXT_USER_TRAP_FRAME);
+    // 清零 kstack_top：clone 帧从父进程拷贝了父的栈顶值，
+    // 若保留会在 resume 时错误覆盖 sscratch 为父进程的栈，
+    // 导致子进程中断处理写入父栈，损坏父进程数据。
+    frame.set_kernel_stack_top(0);
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     child.into_kernel_thread(user_clone_entry, 0);
     Ok(())
