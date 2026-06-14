@@ -44,6 +44,10 @@ pub(crate) struct Superblock {
     pub free_blocks_count: u64,
     pub free_inodes_count: u32,
 
+    /// ext4 orphan_file inode 号。当前写路径不维护 orphan_file,
+    /// 可写挂载时会把它占用的资源释放并清掉 superblock 指针。
+    pub orphan_file_inum: u32,
+
     /// 总块组数。
     pub groups_count: u32,
 }
@@ -211,6 +215,7 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
     };
     let free_blocks_count = ((free_blocks_hi as u64) << 32) | free_blocks_lo as u64;
     let free_inodes_count = le32(sb, 16);
+    let orphan_file_inum = le32(sb, 0x280);
 
     Ok(Superblock {
         kind,
@@ -233,6 +238,7 @@ fn parse(sb: &[u8]) -> Result<Superblock, BlockBackendError> {
         csum_seed,
         free_blocks_count,
         free_inodes_count,
+        orphan_file_inum,
         groups_count,
     })
 }

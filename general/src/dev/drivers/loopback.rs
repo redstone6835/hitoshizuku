@@ -16,13 +16,15 @@ use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxB
 use crate::dev::pnp::{PnpError, PnpResourceKind};
 
 const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
-/// loopback 接口使用的本地最大传输单元。
+const MAX_LOOPBACK_FREE_FRAMES: usize = 1024;
+/// Linux 兼容的 loopback MTU。
 const LOOPBACK_MTU: usize = 65_536;
 /// 保留传统 loopback 网段：lo 固定为 127.0.0.1/8。
 const LOOPBACK_IPV4_PREFIX: u8 = 8;
 
 struct LoopbackDriver {
-    queue: Mutex<VecDeque<Box<[u8]>>>,
+    queue: Mutex<VecDeque<(Box<[u8]>, usize)>>,
+    free: Mutex<VecDeque<Box<[u8]>>>,
     stats: Mutex<NetStats>,
 }
 
@@ -30,6 +32,7 @@ impl LoopbackDriver {
     fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
+            free: Mutex::new(VecDeque::new()),
             stats: Mutex::new(NetStats::default()),
         }
     }
@@ -44,15 +47,19 @@ impl NetDriver for LoopbackDriver {
 
     fn poll_rx(&self) -> Option<RxBuf> {
         let mut q = self.queue.lock();
-        let frame = q.pop_front()?;
-        let len = frame.len();
+        let (frame, len) = q.pop_front()?;
         self.stats.lock().rx_packets += 1;
         self.stats.lock().rx_bytes += len as u64;
         Some(RxBuf::new(frame, len))
     }
 
     fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
-        let buf = alloc::vec![0u8; len].into_boxed_slice();
+        let mut free = self.free.lock();
+        let buf = free
+            .iter()
+            .position(|buf| buf.len() >= len)
+            .and_then(|pos| free.remove(pos))
+            .unwrap_or_else(|| alloc::vec![0u8; len].into_boxed_slice());
         Some(TxBuf::new(buf))
     }
 
@@ -72,7 +79,15 @@ impl NetDriver for LoopbackDriver {
             self.stats.lock().tx_dropped += 1;
             return;
         }
-        queue.push_back(data);
+        queue.push_back((data, len));
+    }
+
+    fn recycle_rx(&self, buf: RxBuf) {
+        let storage = buf.into_storage();
+        let mut free = self.free.lock();
+        if free.len() < MAX_LOOPBACK_FREE_FRAMES {
+            free.push_back(storage);
+        }
     }
 
     fn link_state(&self) -> LinkState {

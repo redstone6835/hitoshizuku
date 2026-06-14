@@ -29,6 +29,8 @@ impl VmFlags {
     pub const GROWS_DOWN: u32 = 1 << 10;
     /// 匿名映射：无 file backing。对应 Linux `MAP_ANONYMOUS`。
     pub const ANON: u32 = 1 << 11;
+    /// 已被 mlock/munlockall 状态标记为常驻。当前无换出回收时仅作为策略位。
+    pub const LOCKED: u32 = 1 << 12;
 
     /// 从裸位构造。不做语义校验；校验留给 VmSpace 层。
     pub const fn from_bits(bits: u32) -> Self {

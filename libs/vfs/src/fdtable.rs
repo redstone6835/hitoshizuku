@@ -17,11 +17,31 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::vfs::error::{VfsError, VfsResult};
 use crate::vfs::file::File;
 use crate::vfs::limits::VfsLimits;
 use crate::vfs::sync::Spinlock;
+
+static FDTABLE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static FDTABLE_CREATED: AtomicUsize = AtomicUsize::new(0);
+static FDTABLE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FdTableDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn fdtable_diag() -> FdTableDiag {
+    FdTableDiag {
+        live: FDTABLE_LIVE.load(Ordering::Acquire),
+        created: FDTABLE_CREATED.load(Ordering::Acquire),
+        dropped: FDTABLE_DROPPED.load(Ordering::Acquire),
+    }
+}
 
 /// 每进程默认最大打开文件数的默认值（软限制）。
 ///
@@ -269,6 +289,8 @@ pub struct FdTable {
 impl FdTable {
     /// 构造一个空的描述符表，从 `limits` 中读取初始软硬限制。
     pub fn new(limits: &VfsLimits) -> Self {
+        FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Spinlock::new(FdTableInner::new(
                 core::cmp::min(limits.nofile_default, limits.nofile_max),
@@ -279,6 +301,8 @@ impl FdTable {
 
     /// 构造一个使用 [`RLIMIT_NOFILE_DEFAULT`] 默认值的描述符表（便于测试）。
     pub fn new_default() -> Self {
+        FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             inner: Spinlock::new(FdTableInner::new(RLIMIT_NOFILE_DEFAULT, RLIMIT_NOFILE_MAX)),
         }
@@ -377,6 +401,20 @@ impl FdTable {
     /// 获取 fd 对应的 `File` 共享引用（O(1) 数组索引）。
     pub fn get_file(&self, fd: Fd) -> Option<Arc<File>> {
         self.inner.lock().get(fd.0).map(|e| Arc::clone(&e.file))
+    }
+
+    /// 批量获取一组 fd 对应的文件。
+    ///
+    /// select/poll 这类接口会在一次 syscall 中检查大量 fd。逐个调用
+    /// `get_file()` 会反复获取 fdtable 锁；这里在同一把锁内完成所有 clone，
+    /// 保持语义不变但显著减少热路径锁开销。
+    pub fn get_files_dense(&self, fds: &[Fd]) -> Vec<Option<Arc<File>>> {
+        let inner = self.inner.lock();
+        let mut out = Vec::with_capacity(fds.len());
+        for fd in fds {
+            out.push(inner.get(fd.0).map(|e| Arc::clone(&e.file)));
+        }
+        out
     }
 
     /// 复制描述符（`dup`）。
@@ -666,6 +704,8 @@ impl FdTable {
                 })
             })
             .collect();
+        FDTABLE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_add(1, Ordering::Relaxed);
         FdTable {
             inner: Spinlock::new(FdTableInner {
                 entries: new_entries,
@@ -676,5 +716,12 @@ impl FdTable {
                 close_observers: inner.close_observers.clone(),
             }),
         }
+    }
+}
+
+impl Drop for FdTable {
+    fn drop(&mut self) {
+        FDTABLE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        FDTABLE_LIVE.fetch_sub(1, Ordering::Relaxed);
     }
 }

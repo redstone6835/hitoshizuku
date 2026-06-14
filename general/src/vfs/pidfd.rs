@@ -219,11 +219,19 @@ fn get_or_init_pidfd_fs() -> (Arc<Mount>, Arc<Inode>, Arc<Dentry>) {
     )
 }
 
-pub fn create(fdt: &FdTable, cred: Arc<Credentials>, task: Arc<Task>) -> Result<Fd, Errno> {
+pub fn create(
+    fdt: &FdTable,
+    cred: Arc<Credentials>,
+    task: Arc<Task>,
+    nonblock: bool,
+) -> Result<Fd, Errno> {
     let (mount, inode, dentry) = get_or_init_pidfd_fs();
     let file = Arc::new(File::new(
         inode,
-        OpenOptions::default(),
+        OpenOptions {
+            nonblock,
+            ..OpenOptions::default()
+        },
         cred,
         Box::new(PidfdFileOps::new(task)),
         dentry,

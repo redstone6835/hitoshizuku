@@ -3,6 +3,7 @@
 //! 本模块持有"可变 inode"的完整 128+ 字节表示,负责 inode 表块的
 //! 读-改-写 + 重算 checksum。
 
+use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -47,6 +48,9 @@ impl RawInode {
     }
     pub fn set_nlink(&mut self, v: u16) {
         self.bytes[26..28].copy_from_slice(&v.to_le_bytes());
+    }
+    pub fn set_dtime(&mut self, v: u32) {
+        self.bytes[20..24].copy_from_slice(&v.to_le_bytes());
     }
     #[allow(dead_code)]
     pub fn uid(&self) -> u32 {
@@ -138,8 +142,9 @@ pub(crate) fn write_raw(state: &FsState, inode: &RawInode) -> Result<(), BlockBa
     let inode_size = state.ext_sb.inode_size as usize;
     let block_size = state.ext_sb.block_size as usize;
 
-    let mut bytes = inode.bytes.clone();
-    if state.ext_sb.metadata_csum && inode_size >= 256 {
+    // 无 metadata checksum 时直接写回原始 inode 字节,避免 L8 元数据热路径每次 clone。
+    let bytes: Cow<'_, [u8]> = if state.ext_sb.metadata_csum && inode_size >= 256 {
+        let mut bytes = inode.bytes.clone();
         // 清零 csum lo/hi 再重算
         bytes[0x7c] = 0;
         bytes[0x7d] = 0;
@@ -157,7 +162,10 @@ pub(crate) fn write_raw(state: &FsState, inode: &RawInode) -> Result<(), BlockBa
         if i_extra_isize >= 4 {
             bytes[0x82..0x84].copy_from_slice(&((sum >> 16) as u16).to_le_bytes());
         }
-    }
+        Cow::Owned(bytes)
+    } else {
+        Cow::Borrowed(inode.bytes.as_slice())
+    };
 
     // 写回一个或两个 inode table 块
     let mut blk = vec![0u8; block_size];

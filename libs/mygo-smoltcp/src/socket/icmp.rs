@@ -122,6 +122,8 @@ pub struct Socket<'a> {
     endpoint: Endpoint,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// 出站 IP traffic class 值。
+    traffic_class: Option<u8>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -136,6 +138,7 @@ impl<'a> Socket<'a> {
             tx_buffer,
             endpoint: Default::default(),
             hop_limit: None,
+            traffic_class: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -203,6 +206,18 @@ impl<'a> Socket<'a> {
         }
 
         self.hop_limit = hop_limit
+    }
+
+    /// 返回出站 IP traffic class 值。
+    ///
+    /// IPv4 发包时写入 DSCP/ECN 字节，IPv6 发包时写入 traffic class 字段。
+    pub fn traffic_class(&self) -> Option<u8> {
+        self.traffic_class
+    }
+
+    /// 设置出站 IP traffic class 值。
+    pub fn set_traffic_class(&mut self, traffic_class: Option<u8>) {
+        self.traffic_class = traffic_class
     }
 
     /// Bind the socket to the given endpoint.
@@ -393,6 +408,21 @@ impl<'a> Socket<'a> {
         Ok((packet_buf, endpoint))
     }
 
+    /// 查看下一条已接收 ICMP 报文，不从接收队列移除。
+    ///
+    /// 该接口服务内核 poll/ioctl 这类只需要观察下一条报文长度或来源的路径；
+    /// 真正消费仍应走 [`recv`](#method.recv) / [`recv_slice`](#method.recv_slice)。
+    pub fn peek(&mut self) -> Result<(&[u8], IpAddress), RecvError> {
+        let (endpoint, packet_buf) = self.rx_buffer.peek().map_err(|_| RecvError::Exhausted)?;
+
+        net_trace!(
+            "icmp:{}: peek {} buffered octets",
+            endpoint,
+            packet_buf.len()
+        );
+        Ok((packet_buf, *endpoint))
+    }
+
     /// Dequeue a packet received from a remote endpoint, copy the payload into the given slice,
     /// and return the amount of octets copied as well as the `IpAddress`
     ///
@@ -560,10 +590,13 @@ impl<'a> Socket<'a> {
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut Context, (IpRepr, IcmpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut Context, crate::phy::PacketMeta, (IpRepr, IcmpRepr)) -> Result<(), E>,
     {
         let hop_limit = self.hop_limit.unwrap_or(64);
+        let traffic_class = self.traffic_class;
         let res = self.tx_buffer.dequeue_with(|remote_endpoint, packet_buf| {
+            let mut meta = crate::phy::PacketMeta::default();
+            meta.traffic_class = traffic_class;
             net_trace!(
                 "icmp:{}: sending {} octets",
                 remote_endpoint,
@@ -600,7 +633,7 @@ impl<'a> Socket<'a> {
                         payload_len: repr.buffer_len(),
                         hop_limit,
                     });
-                    emit(cx, (ip_repr, IcmpRepr::Ipv4(repr)))
+                    emit(cx, meta, (ip_repr, IcmpRepr::Ipv4(repr)))
                 }
                 #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(dst_addr) => {
@@ -629,7 +662,7 @@ impl<'a> Socket<'a> {
                         payload_len: repr.buffer_len(),
                         hop_limit,
                     });
-                    emit(cx, (ip_repr, IcmpRepr::Ipv6(repr)))
+                    emit(cx, meta, (ip_repr, IcmpRepr::Ipv6(repr)))
                 }
             }
         });
@@ -737,7 +770,10 @@ mod test_ipv4 {
         let mut socket = socket(buffer(0), buffer(1));
         let checksum = ChecksumCapabilities::default();
 
-        assert_eq!(socket.dispatch(cx, |_, _| unreachable!()), Ok::<_, ()>(()));
+        assert_eq!(
+            socket.dispatch(cx, |_, _, _| unreachable!()),
+            Ok::<_, ()>(())
+        );
 
         // This buffer is too long
         assert_eq!(
@@ -761,7 +797,7 @@ mod test_ipv4 {
         assert!(!socket.can_send());
 
         assert_eq!(
-            socket.dispatch(cx, |_, (ip_repr, icmp_repr)| {
+            socket.dispatch(cx, |_, _, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV4_REPR);
                 assert_eq!(icmp_repr, ECHOV4_REPR.into());
                 Err(())
@@ -772,7 +808,7 @@ mod test_ipv4 {
         assert!(!socket.can_send());
 
         assert_eq!(
-            socket.dispatch(cx, |_, (ip_repr, icmp_repr)| {
+            socket.dispatch(cx, |_, _, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV4_REPR);
                 assert_eq!(icmp_repr, ECHOV4_REPR.into());
                 Ok::<_, ()>(())
@@ -804,7 +840,7 @@ mod test_ipv4 {
             Ok(())
         );
         assert_eq!(
-            s.dispatch(cx, |_, (ip_repr, _)| {
+            s.dispatch(cx, |_, _, (ip_repr, _)| {
                 assert_eq!(
                     ip_repr,
                     IpRepr::Ipv4(Ipv4Repr {
@@ -998,7 +1034,10 @@ mod test_ipv6 {
         let mut socket = socket(buffer(0), buffer(1));
         let checksum = ChecksumCapabilities::default();
 
-        assert_eq!(socket.dispatch(cx, |_, _| unreachable!()), Ok::<_, ()>(()));
+        assert_eq!(
+            socket.dispatch(cx, |_, _, _| unreachable!()),
+            Ok::<_, ()>(())
+        );
 
         // This buffer is too long
         assert_eq!(
@@ -1022,7 +1061,7 @@ mod test_ipv6 {
         assert!(!socket.can_send());
 
         assert_eq!(
-            socket.dispatch(cx, |_, (ip_repr, icmp_repr)| {
+            socket.dispatch(cx, |_, _, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV6_REPR.into());
                 assert_eq!(icmp_repr, ECHOV6_REPR.into());
                 Err(())
@@ -1033,7 +1072,7 @@ mod test_ipv6 {
         assert!(!socket.can_send());
 
         assert_eq!(
-            socket.dispatch(cx, |_, (ip_repr, icmp_repr)| {
+            socket.dispatch(cx, |_, _, (ip_repr, icmp_repr)| {
                 assert_eq!(ip_repr, LOCAL_IPV6_REPR.into());
                 assert_eq!(icmp_repr, ECHOV6_REPR.into());
                 Ok::<_, ()>(())
@@ -1065,7 +1104,7 @@ mod test_ipv6 {
             Ok(())
         );
         assert_eq!(
-            s.dispatch(cx, |_, (ip_repr, _)| {
+            s.dispatch(cx, |_, _, (ip_repr, _)| {
                 assert_eq!(
                     ip_repr,
                     IpRepr::Ipv6(Ipv6Repr {

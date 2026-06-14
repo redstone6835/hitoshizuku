@@ -7,15 +7,14 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::any::Any;
 
 use spin::mutex::Mutex;
 
 use crate::dev::block::BlockDevice;
 use crate::dev::char::CharDevice;
 pub use crate::dev::naming::{
-    StableName as DevNodeName, StableNameAllocError as DevNodeNameAllocError,
-    StableNameAllocator as DevNodeNameAllocator,
+    StableName as FunctionProjectionName, StableNameAllocError as FunctionProjectionNameAllocError,
+    StableNameAllocator as FunctionProjectionNameAllocator,
 };
 
 /// function 的内部类别标识。
@@ -38,176 +37,46 @@ impl DeviceClassId {
     }
 }
 
-/// devtmpfs 自定义节点的通用文件类别。
-///
-/// 该类型是 dev core 到 VFS 兼容层的中立描述，不暴露 `vfs::stat::FileType`。
-/// 具体 inode 类型转换只允许在 devtmpfs 适配层完成。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CustomDevNodeKind {
-    CharDevice,
-    BlockDevice,
-    RegularFile,
-    Directory,
-}
-
-/// 自定义 devtmpfs 节点规格。
-///
-/// 新设备类型如果需要在 `/dev` 暴露特殊节点，只在这里声明节点名称、通用类别
-/// 和 opaque payload。payload 的 ABI/VFS 解释由 devtmpfs 适配层负责，dev core
-/// 不依赖 `InodeOps`、`FileMode`、`Uid/Gid`、兼容设备号或 inode 元数据类型。
-#[derive(Clone)]
-pub struct CustomDevNodeSpec {
-    name: Box<str>,
-    kind: CustomDevNodeKind,
-    payload: Arc<dyn Any + Send + Sync>,
-}
-
-impl CustomDevNodeSpec {
-    pub fn new(name: &str, kind: CustomDevNodeKind, payload: Arc<dyn Any + Send + Sync>) -> Self {
-        Self {
-            name: name.into(),
-            kind,
-            payload,
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn kind(&self) -> CustomDevNodeKind {
-        self.kind
-    }
-
-    pub fn payload(&self) -> Arc<dyn Any + Send + Sync> {
-        Arc::clone(&self.payload)
-    }
-}
-
-/// devtmpfs 需要创建的兼容层设备节点。
-///
-/// 枚举变体直接携带 VFS 打开节点时需要的对象，因此 devtmpfs 不需要再把
-/// `DeviceFunction` downcast 回 `CharFunction` 或 `BlockFunction`。
-/// 这里描述的是 POSIX/VFS 命名空间里的投影，不是底层硬件 identity；底层身份
-/// 仍由 PnP id、function `class_id + dev_name` 和具体 typed device object 表达。
-///
-/// 标记为 `#[non_exhaustive]` 以便未来扩展新 VFS 节点类型时保持 API 兼容；
-/// 新设备类别如果没有 `/dev` 节点（网络等）应通过 `devnode() → None` 表达；
-/// 如果确实需要 `/dev` 投影，优先使用 [`DevNodeSpec::Custom`] 携带 opaque
-/// payload，由 VFS 兼容层解释 inode/file 语义。
-///
-/// FIXME(dev-core): `DevNodeSpec` 仍然位于底层 function 抽象中，说明 dev core
-/// 还直接暴露了 `/dev` 投影声明。后续应把这组类型迁到独立的 VFS/兼容层
-/// projector registry，让 `DeviceFunction` 只描述 typed capability 和生命周期。
-#[non_exhaustive]
-#[derive(Clone)]
-pub enum DevNodeSpec {
-    Char {
-        name: Box<str>,
-        dev: CharDevice,
-    },
-    Block {
-        name: Box<str>,
-        dev: Arc<BlockDevice>,
-    },
-    Symlink {
-        name: Box<str>,
-        target: Box<str>,
-    },
-    Custom(CustomDevNodeSpec),
-}
-
-impl DevNodeSpec {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Char { name, .. } | Self::Block { name, .. } | Self::Symlink { name, .. } => name,
-            Self::Custom(spec) => spec.name(),
-        }
-    }
-
-    pub fn custom(spec: CustomDevNodeSpec) -> Self {
-        Self::Custom(spec)
-    }
-}
-
-/// 一个 function 在 devtmpfs 中需要投影出的节点集合。
-///
-/// 旧接口里 `function 名称 == /dev 节点名 == 解绑键`，这会把设备身份和 VFS
-/// 名字空间耦合在一起。节点集合把这三件事拆开：function 仍由 `class_id +
-/// dev_name` 唯一标识，devtmpfs 只消费这里声明的路径投影。
-#[derive(Clone)]
-pub struct DevNodeSet {
-    nodes: Vec<DevNodeSpec>,
-}
-
-impl DevNodeSet {
-    pub fn single(node: DevNodeSpec) -> Self {
-        let mut nodes = Vec::new();
-        nodes.push(node);
-        Self { nodes }
-    }
-
-    pub fn new(nodes: Vec<DevNodeSpec>) -> Option<Self> {
-        if nodes.is_empty() {
-            None
-        } else {
-            Some(Self { nodes })
-        }
-    }
-
-    pub fn nodes(&self) -> &[DevNodeSpec] {
-        &self.nodes
-    }
-}
-
 pub trait DeviceFunction: Send + Sync {
     /// function 类别，同一类别下 `dev_name` 必须唯一。
     fn class_id(&self) -> DeviceClassId;
-    /// function registry key 的名称；`/dev` 节点由 [`DevNodeSpec`]/[`DevNodeSet`] 决定。
+    /// function registry key 的名称。
+    ///
+    /// 该名字只用于 dev core 的对象身份。用户可见文件节点由 VFS 投影层按
+    /// function 类型和注册的 projector 生成，不能反向作为底层设备身份。
     fn dev_name(&self) -> &str;
     /// 标记 function 已不可用，使旧句柄尽快停止访问底层设备。
     fn mark_gone(&self);
     /// 等待正在进行的 I/O 排空；没有异步 I/O 的 function 可以使用默认空实现。
     fn drain_io(&self) {}
-    /// 返回该 function 需要暴露到 devtmpfs 的节点规格。
-    fn devnode(&self) -> Option<DevNodeSpec> {
-        None
-    }
-    /// 返回该 function 需要暴露到 devtmpfs 的节点集合。
-    ///
-    /// 默认把旧的单节点接口提升为集合，已有驱动无需立即迁移；需要多个路径、别名
-    /// 或符号链接的驱动可以只覆盖此方法。
-    fn devnodes(&self) -> Option<DevNodeSet> {
-        self.devnode().map(DevNodeSet::single)
-    }
     /// 向下转型支持。新设备类型通过此方法提供类型恢复路径。
     fn as_any(&self) -> &dyn core::any::Any;
 }
 
 /// 字符设备 function。
 ///
-/// 它把 [`CharDevice`] 包装成通用 [`DeviceFunction`]，供 PnP core 和 devtmpfs
-/// 统一处理。
+/// 它把 [`CharDevice`] 包装成通用 [`DeviceFunction`]，供 PnP core 注册和查询。
+/// 是否以及如何投影到 `/dev` 由 VFS device_files 层决定。
 pub struct CharFunction {
     dev_name: Box<str>,
-    devnode_name: Box<str>,
+    projection_name: Box<str>,
     dev: CharDevice,
 }
 
 impl CharFunction {
     /// 创建一个字符设备 function。
     pub fn new(dev_name: &str, dev: CharDevice) -> Self {
-        Self::with_devnode(dev_name, dev_name, dev)
+        Self::with_projection_name(dev_name, dev_name, dev)
     }
 
-    /// 创建一个字符设备 function，并显式指定 `/dev` 投影名。
+    /// 创建一个字符设备 function，并显式指定用户可见投影名。
     ///
-    /// `dev_name` 是设备 registry key，`devnode_name` 是 POSIX/VFS 兼容层路径名；
-    /// 两者允许相同，但底层设备抽象不再强制绑定二者。
-    pub fn with_devnode(dev_name: &str, devnode_name: &str, dev: CharDevice) -> Self {
+    /// `projection_name` 只是提供给 VFS 投影层的稳定名字种子；它不参与 PnP
+    /// 匹配、资源所有权或驱动身份判定。
+    pub fn with_projection_name(dev_name: &str, projection_name: &str, dev: CharDevice) -> Self {
         Self {
             dev_name: dev_name.into(),
-            devnode_name: devnode_name.into(),
+            projection_name: projection_name.into(),
             dev,
         }
     }
@@ -215,6 +84,11 @@ impl CharFunction {
     /// 返回内部字符设备句柄。
     pub fn dev(&self) -> CharDevice {
         self.dev.clone()
+    }
+
+    /// 返回 VFS 投影层使用的稳定用户可见名字。
+    pub fn projection_name(&self) -> &str {
+        &self.projection_name
     }
 }
 
@@ -231,13 +105,6 @@ impl DeviceFunction for CharFunction {
         self.dev.mark_gone();
     }
 
-    fn devnode(&self) -> Option<DevNodeSpec> {
-        Some(DevNodeSpec::Char {
-            name: self.devnode_name.clone(),
-            dev: self.dev(),
-        })
-    }
-
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
@@ -246,24 +113,28 @@ impl DeviceFunction for CharFunction {
 /// 块设备 function。
 pub struct BlockFunction {
     dev_name: Box<str>,
-    devnode_name: Box<str>,
+    projection_name: Box<str>,
     dev: Arc<BlockDevice>,
 }
 
 impl BlockFunction {
     /// 创建一个块设备 function。
     pub fn new(dev_name: &str, dev: Arc<BlockDevice>) -> Self {
-        Self::with_devnode(dev_name, dev_name, dev)
+        Self::with_projection_name(dev_name, dev_name, dev)
     }
 
-    /// 创建一个块设备 function，并显式指定 `/dev` 投影名。
+    /// 创建一个块设备 function，并显式指定用户可见投影名。
     ///
-    /// `dev_name` 是 PnP/function registry key，`devnode_name` 只用于 devtmpfs
-    /// 暴露 POSIX 块设备节点，避免把底层设备身份和 `/dev` 命名策略混在一起。
-    pub fn with_devnode(dev_name: &str, devnode_name: &str, dev: Arc<BlockDevice>) -> Self {
+    /// `projection_name` 由 VFS 投影层解释为用户可见设备文件名；底层 block
+    /// 设备仍以 `dev_name`、PnP identity 和 typed object 表达身份。
+    pub fn with_projection_name(
+        dev_name: &str,
+        projection_name: &str,
+        dev: Arc<BlockDevice>,
+    ) -> Self {
         Self {
             dev_name: dev_name.into(),
-            devnode_name: devnode_name.into(),
+            projection_name: projection_name.into(),
             dev,
         }
     }
@@ -271,6 +142,11 @@ impl BlockFunction {
     /// 返回内部块设备对象。
     pub fn dev(&self) -> Arc<BlockDevice> {
         Arc::clone(&self.dev)
+    }
+
+    /// 返回 VFS 投影层使用的稳定用户可见名字。
+    pub fn projection_name(&self) -> &str {
+        &self.projection_name
     }
 }
 
@@ -289,13 +165,6 @@ impl DeviceFunction for BlockFunction {
 
     fn drain_io(&self) {
         self.dev.drain();
-    }
-
-    fn devnode(&self) -> Option<DevNodeSpec> {
-        Some(DevNodeSpec::Block {
-            name: self.devnode_name.clone(),
-            dev: self.dev(),
-        })
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -321,209 +190,20 @@ pub fn function_as<T: 'static>(func: &dyn DeviceFunction) -> Option<&T> {
     func.as_any().downcast_ref::<T>()
 }
 
-pub fn char_device_from_function(func: &dyn DeviceFunction) -> Option<CharDevice> {
-    func.devnodes()?.nodes().iter().find_map(|node| match node {
-        DevNodeSpec::Char { dev, .. } => Some(dev.clone()),
-        DevNodeSpec::Block { .. } | DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => None,
-    })
-}
-
-pub fn block_device_from_function(func: &dyn DeviceFunction) -> Option<Arc<BlockDevice>> {
-    func.devnodes()?.nodes().iter().find_map(|node| match node {
-        DevNodeSpec::Block { dev, .. } => Some(Arc::clone(dev)),
-        DevNodeSpec::Char { .. } | DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => None,
-    })
-}
-
-/// 一个已声明到 devtmpfs 的字符设备投影。
-///
-/// `node_name` 只是 VFS/POSIX 兼容层路径，不能作为底层设备身份；底层对象仍由
-/// `dev` 和所属 function 描述。sysfs/procfs 这类兼容视图需要关联 `rdev` 时，
-/// 应先按 `node_name` 查询兼容层 registry，再回到 typed device object。
-#[derive(Clone)]
-pub struct CharDevNodeProjection {
-    class_id: DeviceClassId,
-    node_name: Box<str>,
-    dev: CharDevice,
-}
-
-impl CharDevNodeProjection {
-    pub fn class_id(&self) -> DeviceClassId {
-        self.class_id
-    }
-
-    pub fn node_name(&self) -> &str {
-        &self.node_name
-    }
-
-    pub fn dev(&self) -> &CharDevice {
-        &self.dev
-    }
-}
-
-/// 一个已声明到 devtmpfs 的块设备投影。
-#[derive(Clone)]
-pub struct BlockDevNodeProjection {
-    class_id: DeviceClassId,
-    node_name: Box<str>,
-    dev: Arc<BlockDevice>,
-}
-
-impl BlockDevNodeProjection {
-    pub fn class_id(&self) -> DeviceClassId {
-        self.class_id
-    }
-
-    pub fn node_name(&self) -> &str {
-        &self.node_name
-    }
-
-    pub fn dev(&self) -> &Arc<BlockDevice> {
-        &self.dev
-    }
-}
-
-/// 列出当前 function registry 中活动字符设备的 `/dev` 投影。
-///
-/// 这个 helper 只暴露“function 声明了哪些 VFS 节点”这一层事实，不把 POSIX
-/// `dev_t`、主次设备号或 sysfs 目录名塞回底层设备模型。
-pub fn active_char_devnode_projections(functions: &FunctionRegistry) -> Vec<CharDevNodeProjection> {
-    let mut out = Vec::new();
-    for func in functions.try_list().unwrap_or_default() {
-        let class_id = func.class_id();
-        let Some(nodes) = func.devnodes() else {
-            continue;
-        };
-        for node in nodes.nodes() {
-            if let DevNodeSpec::Char { name, dev } = node {
-                if dev.is_active() {
-                    if out.try_reserve(1).is_err() {
-                        return out;
-                    }
-                    out.push(CharDevNodeProjection {
-                        class_id,
-                        node_name: name.clone(),
-                        dev: dev.clone(),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 列出当前 function registry 中活动块设备的 `/dev` 投影。
-pub fn active_block_devnode_projections(
-    functions: &FunctionRegistry,
-) -> Vec<BlockDevNodeProjection> {
-    let mut out = Vec::new();
-    for func in functions.try_list().unwrap_or_default() {
-        let class_id = func.class_id();
-        let Some(nodes) = func.devnodes() else {
-            continue;
-        };
-        for node in nodes.nodes() {
-            if let DevNodeSpec::Block { name, dev } = node {
-                if dev.is_active() {
-                    if out.try_reserve(1).is_err() {
-                        return out;
-                    }
-                    out.push(BlockDevNodeProjection {
-                        class_id,
-                        node_name: name.clone(),
-                        dev: Arc::clone(dev),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-/// 列出当前仍处于 active 状态的字符设备节点。
-///
-/// 这是 VFS/procfs/sysfs 兼容层使用的查询 helper。调用方不需要知道 function
-/// 的具体 Rust 类型，只需要消费返回的 `CharDevice`。
-pub fn active_char_devices(functions: &FunctionRegistry) -> Vec<CharDevice> {
-    let mut out = Vec::new();
-    for func in functions.try_list().unwrap_or_default() {
-        let Some(dev) = char_device_from_function(func.as_ref()) else {
-            continue;
-        };
-        if !dev.is_active() {
-            continue;
-        }
-        if out.try_reserve(1).is_err() {
-            return out;
-        }
-        out.push(dev);
-    }
-    out
-}
-
-/// 列出当前仍处于 active 状态的块设备节点。
-pub fn active_block_devices(functions: &FunctionRegistry) -> Vec<Arc<BlockDevice>> {
-    let mut out = Vec::new();
-    for func in functions.try_list().unwrap_or_default() {
-        let Some(dev) = block_device_from_function(func.as_ref()) else {
-            continue;
-        };
-        if !dev.is_active() {
-            continue;
-        }
-        if out.try_reserve(1).is_err() {
-            return out;
-        }
-        out.push(dev);
-    }
-    out
-}
-
-/// 按固件名查找字符设备。
-///
-/// 控制台选择路径使用固件名（例如 DTB stdout-path 指向的串口节点名），而不是
-/// `/dev` 下的节点名，因此这里扫描所有字符 function 的 `fw_name()`。
-pub fn find_char_device_by_fw_name(
-    functions: &FunctionRegistry,
-    fw_name: &str,
-) -> Option<CharDevice> {
-    active_char_devices(functions)
-        .into_iter()
-        .find(|dev| dev.fw_name() == fw_name)
-}
-
-/// 按 `/dev` 节点名查找块设备。
-pub fn lookup_block_device_by_node(
-    functions: &FunctionRegistry,
-    dev_name: &str,
-) -> Option<Arc<BlockDevice>> {
-    functions
-        .try_list()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|func| {
-            func.devnodes()?.nodes().iter().find_map(|node| match node {
-                DevNodeSpec::Block { name, dev } if name.as_ref() == dev_name => {
-                    Some(Arc::clone(dev))
-                }
-                _ => None,
-            })
-        })
-        .find(|dev| dev.is_active())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionRegistryError {
     /// 同类别同名 function 已存在。
     NameExists,
+    /// 要移除或查询的 registry 记录不存在。
+    NotFound,
     /// 扩容或分配失败。
     OutOfMemory,
 }
 
 /// 全局开放设备 function 注册表。
 ///
-/// 注册表只保存 `Arc<dyn DeviceFunction>`，不持有具体字符/块类型。兼容层如
-/// procfs/sysfs/devtmpfs 通过 helper 函数读取 `DevNodeSpec`。
+/// 注册表只保存 `Arc<dyn DeviceFunction>`，不持有具体字符/块类型。VFS 投影层
+/// 通过 function 生命周期事件读取 typed function 并生成用户可见设备文件声明。
 pub struct FunctionRegistry {
     functions: Mutex<Vec<Arc<dyn DeviceFunction>>>,
 }

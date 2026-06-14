@@ -146,20 +146,20 @@ fn ensure_data_page() -> Result<usize, Errno> {
 }
 
 fn alloc_zeroed_page() -> Result<(usize, usize), Errno> {
-    let paddr = allocator::KERNEL_ALLOCATOR
-        .buddy_alloc_pages(0)
-        .ok_or(Errno::ENOMEM)?;
+    let allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_physical(allocator::PhysicalAllocRequest::new(
+            allocator::PAGE_SIZE,
+            allocator::PAGE_SIZE,
+        ))
+        .map_err(|_| Errno::ENOMEM)?;
     let Some(phys_to_virt) = allocator::KERNEL_ALLOCATOR.load_phys_to_virt() else {
-        free_page(paddr);
+        let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(allocation);
         return Err(Errno::ENOMEM);
     };
+    let paddr = allocation.paddr;
     let kva = phys_to_virt(paddr);
     unsafe { core::ptr::write_bytes(kva as *mut u8, 0, hal::user::vdso_data_page_offset()) };
     Ok((paddr, kva))
-}
-
-fn free_page(paddr: usize) {
-    let _ = allocator::KERNEL_ALLOCATOR.buddy_free_pages(paddr, 0);
 }
 
 fn data_ptr() -> Option<&'static mut VdsoData> {

@@ -477,6 +477,8 @@ pub struct Socket<'a> {
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// 出站 IP traffic class 值。
+    traffic_class: Option<u8>,
     /// Address passed to listen(). Listen address is set when listen() is called and
     /// used every time the socket is reset back to the LISTEN state.
     listen_endpoint: IpListenEndpoint,
@@ -580,6 +582,7 @@ impl<'a> Socket<'a> {
             timeout: None,
             keep_alive: None,
             hop_limit: None,
+            traffic_class: None,
             listen_endpoint: IpListenEndpoint::default(),
             bound_endpoint: IpListenEndpoint::default(),
             tuple: None,
@@ -845,6 +848,18 @@ impl<'a> Socket<'a> {
         }
 
         self.hop_limit = hop_limit
+    }
+
+    /// 返回出站 IP traffic class 值。
+    ///
+    /// IPv4 发包时写入 DSCP/ECN 字节，IPv6 发包时写入 traffic class 字段。
+    pub fn traffic_class(&self) -> Option<u8> {
+        self.traffic_class
+    }
+
+    /// 设置出站 IP traffic class 值。
+    pub fn set_traffic_class(&mut self, traffic_class: Option<u8>) {
+        self.traffic_class = traffic_class
     }
 
     /// Return the listen endpoint
@@ -2337,7 +2352,7 @@ impl<'a> Socket<'a> {
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut Context, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut Context, (IpRepr, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut Context, crate::phy::PacketMeta, (IpRepr, TcpRepr)) -> Result<(), E>,
     {
         if self.tuple.is_none() {
             return Ok(());
@@ -2587,7 +2602,9 @@ impl<'a> Socket<'a> {
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
         ip_repr.set_payload_len(repr.buffer_len());
-        emit(cx, (ip_repr, repr))?;
+        let mut meta = crate::phy::PacketMeta::default();
+        meta.traffic_class = self.traffic_class;
+        emit(cx, meta, (ip_repr, repr))?;
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -2879,7 +2896,7 @@ mod test {
         let mut sent = 0;
         let result = socket
             .socket
-            .dispatch(&mut socket.cx, |_, (ip_repr, tcp_repr)| {
+            .dispatch(&mut socket.cx, |_, _, (ip_repr, tcp_repr)| {
                 assert_eq!(ip_repr.next_header(), IpProtocol::Tcp);
                 assert_eq!(ip_repr.src_addr(), LOCAL_ADDR.into());
                 assert_eq!(ip_repr.dst_addr(), REMOTE_ADDR.into());
@@ -2900,7 +2917,7 @@ mod test {
         socket.cx.set_now(timestamp);
 
         let mut fail = false;
-        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _| {
+        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.cx, |_, _, _| {
             fail = true;
             Ok(())
         });
@@ -7745,7 +7762,7 @@ mod test {
 
         s.set_hop_limit(Some(0x2a));
         assert_eq!(
-            s.socket.dispatch(&mut s.cx, |_, (ip_repr, _)| {
+            s.socket.dispatch(&mut s.cx, |_, _, (ip_repr, _)| {
                 assert_eq!(ip_repr.hop_limit(), 0x2a);
                 Ok::<_, ()>(())
             }),

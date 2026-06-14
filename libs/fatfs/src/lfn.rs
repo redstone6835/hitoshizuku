@@ -43,12 +43,13 @@ pub(crate) fn encode_lfn_entry(order: u8, chars: &[u16; 13], checksum: u8, out: 
     }
 }
 
-/// 从一条 LFN 条目中抽取 13 个 UCS-2 码点,按顺序追加到 `sink`。
-/// 遇到 `0x0000` 或 `0xFFFF` 终止符时停止(并告知调用方)。
+/// 从一条 LFN 条目中抽取最多 13 个 UCS-2 码点到固定缓冲。
 ///
-/// 返回 `true` 表示遇到了结束标记,调用方应停止继续向后拼接。
-pub(crate) fn decode_lfn_entry(entry: &[u8], sink: &mut Vec<u16>) -> bool {
+/// 返回 `(写入数量,是否遇到结束标记)`。目录扫描热路径用固定数组承接,
+/// 避免每个 LFN 槽都分配一个临时 `Vec`。
+pub(crate) fn decode_lfn_entry_fixed(entry: &[u8], out: &mut [u16; 13]) -> (usize, bool) {
     let mut terminated = false;
+    let mut len = 0;
     let ranges: [(usize, usize); 3] = [(1, 11), (14, 26), (28, 32)];
     for (start, end) in ranges {
         let mut i = start;
@@ -59,10 +60,13 @@ pub(crate) fn decode_lfn_entry(entry: &[u8], sink: &mut Vec<u16>) -> bool {
                 terminated = true;
                 continue;
             }
-            sink.push(u);
+            if len < out.len() {
+                out[len] = u;
+                len += 1;
+            }
         }
     }
-    terminated
+    (len, terminated)
 }
 
 /// 将一组 UCS-2 码点拼为 `String`(非法代理对用 U+FFFD 替换)。

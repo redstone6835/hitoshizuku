@@ -250,11 +250,21 @@ impl Session {
     }
 
     pub fn register_group(&self, pg: &Arc<ProcessGroup>) {
-        self.groups.lock().push(Arc::downgrade(pg));
+        let mut groups = self.groups.lock();
+        groups.retain(|w| w.upgrade().is_some());
+        if groups.iter().any(|w| {
+            w.upgrade()
+                .as_ref()
+                .is_some_and(|queued| Arc::ptr_eq(queued, pg))
+        }) {
+            return;
+        }
+        groups.push(Arc::downgrade(pg));
     }
 
     pub fn snapshot_groups(&self) -> Vec<Arc<ProcessGroup>> {
-        let groups = self.groups.lock();
+        let mut groups = self.groups.lock();
+        groups.retain(|w| w.upgrade().is_some());
         groups.iter().filter_map(|w| w.upgrade()).collect()
     }
 

@@ -6,7 +6,7 @@ extern crate allocator;
 extern crate hal;
 
 mod acpi;
-#[cfg(any(feature = "bench", feature = "allocator-bench"))]
+#[cfg(any(feature = "bench", feature = "block-bench", feature = "allocator-bench"))]
 mod bench;
 mod device_init;
 mod dtb;
@@ -17,6 +17,7 @@ mod sched;
 mod start;
 mod stdio;
 mod syscalls;
+mod tty_poll;
 mod user;
 mod vdso;
 
@@ -30,6 +31,10 @@ fn main() -> ! {
 
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则
+    // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要
+    // 调度器 init/idle 完成后才能派生内核线程。
+    tty_poll::register();
     /*
     #[cfg(debug_assertions)]
     sched::smoketest();
@@ -39,7 +44,7 @@ fn main() -> ! {
     general::mm::smoketest::run();
     */
 
-    #[cfg(feature = "kernel-tests")]
+    #[cfg(any(feature = "kernel-tests", feature = "allocator-tests"))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);
         let report = ktest::runner::run_all();
@@ -47,12 +52,17 @@ fn main() -> ! {
     }
 
     // ── 文件系统挂载 + 性能测试 ────────────────────────────────────────
-    #[cfg(all(feature = "allocator-bench", not(feature = "bench")))]
+    #[cfg(all(
+        feature = "allocator-bench",
+        not(any(feature = "bench", feature = "block-bench"))
+    ))]
     bench::run_allocator_only();
     #[cfg(feature = "bench")]
     bench::run();
+    #[cfg(feature = "block-bench")]
+    bench::run_block_device();
 
-    // log::set_log_level(log::LogLevel::Debug);
+    log::set_log_level(log::LogLevel::Info);
     sched::start_init_process(&init)
 }
 

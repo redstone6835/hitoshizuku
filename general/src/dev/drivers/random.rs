@@ -37,10 +37,8 @@ use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use crate::dev::char::{CharDevice, CharDriver, CharIoError};
-use crate::dev::function::DevNodeSpec;
+use crate::dev::char::{CharDriver, CharIoError};
 use crate::dev::pnp::PnpError;
-use crate::vfs::devtmpfs::{DevTmpfsStaticNode, register_static_dev_nodes};
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -492,10 +490,22 @@ impl RandomCore {
         }
 
         if sched::is_ready() {
-            let task = sched::current_task();
-            self.entropy_wait
-                .wait_event(&task, || self.estimated_entropy_bits() >= bits);
-            return;
+            loop {
+                if self.estimated_entropy_bits() >= bits {
+                    return;
+                }
+                let task = sched::current_task();
+                self.entropy_wait
+                    .prepare_to_wait(&task, sched::TaskState::Sleeping);
+                if self.estimated_entropy_bits() >= bits {
+                    self.entropy_wait.finish_wait(&task);
+                    return;
+                }
+                drop(task);
+                sched::schedule_once(sched::now_ns_public());
+                let task = sched::current_task();
+                self.entropy_wait.finish_wait(&task);
+            }
         }
 
         // 调度器启动前没有 current task 可挂队列，只能保留极早期兼容兜底；
@@ -668,47 +678,21 @@ impl CharDriver for UrandomDriver {
 /// `&'static` 单例，给 devtmpfs 绑定。
 pub static RANDOM_DRIVER: RandomDriver = RandomDriver;
 pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
-const RANDOM_STATIC_NODE_OWNER: &str = "random-driver";
-
-// FIXME(dev-core): random 驱动仍通过 devtmpfs 静态节点表直接发布 `/dev` 路径。
-// 后续应把 random/urandom 表达为无 PnP backing 的 typed function，路径、设备号
-// 和 inode 适配全部由 VFS/兼容层 projector 处理。
-const RANDOM_STATIC_NODES: [DevTmpfsStaticNode; 2] = [
-    DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "random", random_dev_node),
-    DevTmpfsStaticNode::new(RANDOM_STATIC_NODE_OWNER, "urandom", urandom_dev_node),
-];
-
-fn random_dev_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "random".into(),
-        dev: CharDevice::new("random", &RANDOM_DRIVER),
-    }
-}
-
-fn urandom_dev_node() -> DevNodeSpec {
-    DevNodeSpec::Char {
-        name: "urandom".into(),
-        dev: CharDevice::new("urandom", &URANDOM_DRIVER),
-    }
-}
 
 // ──────────────────────── 工厂入口（兼容 drivers/mod.rs 形态） ─────────────
 
-// 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以
-// 满足 `drivers::register_builtin_drivers()` 调用约定，但没有设备需要
-// 通过 PnP 枚举来发现这两个节点，它们通过 devtmpfs 静态节点注册表声明。
+// 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以满足
+// `drivers::register_builtin_drivers()` 调用约定。`/dev/random` 和
+// `/dev/urandom` 的路径发布由 VFS device_files 层负责，不能回流到驱动层。
 /// 注册 random 子系统。
 ///
 /// 内部会：
 ///   1. 喂一次启动期样本（时间戳 + 栈地址 + self 地址），并按熵源显式
 ///      credit reseed 一次。
 ///   2. 标记 `first_seed_done`，供诊断。
-///
-/// `/dev/random` 和 `/dev/urandom` 通过 devtmpfs 静态节点注册表声明；
-/// 驱动只提交 `DevNodeSpec`，实际 inode 创建仍由 devtmpfs 统一完成。
 pub fn register_builtin_driver() -> Result<(), PnpError> {
     seed_from_startup();
-    register_static_dev_nodes(&RANDOM_STATIC_NODES).map_err(|_| PnpError::DevtmpfsError)
+    Ok(())
 }
 
 /// 启动期喂熵 + 首次 reseed。

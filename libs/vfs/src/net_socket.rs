@@ -20,6 +20,7 @@ use crate::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
 const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
 const SOCK_RAW: u16 = 3;
+const LOOPBACK_UDP_YIELD_INTERVAL: u64 = 16;
 
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
 
@@ -63,6 +64,10 @@ pub struct InetRecvOptions {
 pub struct InetRecvResult {
     pub len: usize,
     pub remote: Option<Endpoint>,
+    pub local: Option<Endpoint>,
+    pub interface_id: Option<net::InterfaceId>,
+    pub hop_limit: Option<u8>,
+    pub traffic_class: Option<u8>,
     pub msg_flags: usize,
 }
 
@@ -185,6 +190,7 @@ pub struct NetSocketFileOps {
     send_timeout_ns: AtomicU64,
     /// SO_ERROR — POSIX 要求读取后清零
     last_error: AtomicI32,
+    udp_loopback_send_count: AtomicU64,
     /// 持久化的 setsockopt 状态
     options: Mutex<SocketOptions>,
 }
@@ -209,6 +215,7 @@ impl NetSocketFileOps {
             recv_timeout_ns: AtomicU64::new(0),
             send_timeout_ns: AtomicU64::new(0),
             last_error: AtomicI32::new(0),
+            udp_loopback_send_count: AtomicU64::new(0),
             options: Mutex::new(SocketOptions::default()),
         }
     }
@@ -422,20 +429,9 @@ impl FileOps for NetSocketFileOps {
         match cmd.raw() {
             FIONREAD => {
                 let handle = self.get_handle()?;
-                let n = match handle.socket_type() {
-                    SocketType::Tcp => net::stack().tcp_recv_queue(handle),
-                    // TODO: UDP 应返回下一个 datagram 的长度或队列中可读字节数，
-                    // 当前固定 0 会误导 ioctl(FIONREAD) 调用者。
-                    SocketType::Udp => 0,
-                    SocketType::Raw | SocketType::Icmp => {
-                        // TODO: raw/icmp 这里只返回是否可读，未暴露实际 packet 长度。
-                        if net::stack().raw_can_recv(handle) {
-                            1
-                        } else {
-                            0
-                        }
-                    }
-                };
+                // Linux 的 FIONREAD/SIOCINQ 对数据报 socket 返回下一次 recv
+                // 能取到的数据报长度；这里复用 net 层已过滤 UDP peer 的视图。
+                let n = net::stack().socket_recv_next_len(handle);
                 Ok(n)
             }
             SIOCATMARK => {
@@ -650,6 +646,10 @@ impl NetSocketFileOps {
                                 return Ok(InetRecvResult {
                                     len: n,
                                     remote: *self.remote.lock(),
+                                    local: None,
+                                    interface_id: None,
+                                    hop_limit: None,
+                                    traffic_class: None,
                                     msg_flags: 0,
                                 });
                             }
@@ -680,6 +680,10 @@ impl NetSocketFileOps {
                                 return Ok(InetRecvResult {
                                     len: total,
                                     remote: *self.remote.lock(),
+                                    local: None,
+                                    interface_id: None,
+                                    hop_limit: None,
+                                    traffic_class: None,
                                     msg_flags: 0,
                                 });
                             }
@@ -689,6 +693,10 @@ impl NetSocketFileOps {
                                     return Ok(InetRecvResult {
                                         len: total,
                                         remote: *self.remote.lock(),
+                                        local: None,
+                                        interface_id: None,
+                                        hop_limit: None,
+                                        traffic_class: None,
                                         msg_flags: 0,
                                     });
                                 }
@@ -699,6 +707,10 @@ impl NetSocketFileOps {
                                         Ok(InetRecvResult {
                                             len: total,
                                             remote: *self.remote.lock(),
+                                            local: None,
+                                            interface_id: None,
+                                            hop_limit: None,
+                                            traffic_class: None,
                                             msg_flags: 0,
                                         })
                                     } else {
@@ -711,6 +723,10 @@ impl NetSocketFileOps {
                                         Ok(InetRecvResult {
                                             len: total,
                                             remote: *self.remote.lock(),
+                                            local: None,
+                                            interface_id: None,
+                                            hop_limit: None,
+                                            traffic_class: None,
                                             msg_flags: 0,
                                         })
                                     } else {
@@ -732,6 +748,10 @@ impl NetSocketFileOps {
                 Ok(InetRecvResult {
                     len: n,
                     remote: *self.remote.lock(),
+                    local: None,
+                    interface_id: None,
+                    hop_limit: None,
+                    traffic_class: None,
                     msg_flags: 0,
                 })
             }
@@ -739,16 +759,20 @@ impl NetSocketFileOps {
                 if opts.peek {
                     loop {
                         let peer = *self.remote.lock();
-                        match net::stack().udp_peek_from(handle, buf) {
-                            Ok((n, remote)) => {
-                                if !udp_peer_matches(peer, remote) {
+                        match net::stack().udp_peek_info(handle, buf) {
+                            Ok(info) => {
+                                if !udp_peer_matches(peer, info.remote) {
                                     let _ = net::stack().udp_recv_from(handle, buf);
                                     continue;
                                 }
                                 return Ok(InetRecvResult {
-                                    len: n,
-                                    remote: Some(remote),
-                                    msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
+                                    len: info.len,
+                                    remote: Some(info.remote),
+                                    local: info.local,
+                                    interface_id: Some(handle.interface_id()),
+                                    hop_limit: info.hop_limit,
+                                    traffic_class: info.traffic_class,
+                                    msg_flags: datagram_msg_flags(info.len, buf.len(), opts.trunc),
                                 });
                             }
                             Err(NetError::WouldBlock) => {
@@ -769,15 +793,19 @@ impl NetSocketFileOps {
                 }
                 loop {
                     let peer = *self.remote.lock();
-                    match net::stack().udp_recv_from(handle, buf) {
-                        Ok((n, remote)) => {
-                            if !udp_peer_matches(peer, remote) {
+                    match net::stack().udp_recv_info(handle, buf) {
+                        Ok(info) => {
+                            if !udp_peer_matches(peer, info.remote) {
                                 continue;
                             }
                             return Ok(InetRecvResult {
-                                len: n,
-                                remote: Some(remote),
-                                msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
+                                len: info.len,
+                                remote: Some(info.remote),
+                                local: info.local,
+                                interface_id: Some(handle.interface_id()),
+                                hop_limit: info.hop_limit,
+                                traffic_class: info.traffic_class,
+                                msg_flags: datagram_msg_flags(info.len, buf.len(), opts.trunc),
                             });
                         }
                         Err(NetError::WouldBlock) => {
@@ -797,10 +825,14 @@ impl NetSocketFileOps {
                 }
             }
             SocketType::Raw | SocketType::Icmp => {
-                let n = self.do_recv_with(buf, opts.nonblocking, opts.deadline_ns)?;
+                let (n, remote) = self.do_raw_recv_from(buf, opts.nonblocking, opts.deadline_ns)?;
                 Ok(InetRecvResult {
                     len: n,
-                    remote: None,
+                    remote,
+                    local: None,
+                    interface_id: None,
+                    hop_limit: None,
+                    traffic_class: None,
                     msg_flags: datagram_msg_flags(n, buf.len(), opts.trunc),
                 })
             }
@@ -947,12 +979,11 @@ impl NetSocketFileOps {
             SocketType::Tcp => loop {
                 match net::stack().tcp_send(handle, data) {
                     Ok(n) => {
-                        // TCP send 已经主动 poll 协议栈；这里再让出一次 CPU，
-                        // 让 loopback 对端及时运行并消费刚送达的数据。netperf
-                        // TCP_RR/TCP_CRR 这类短请求响应会在 write 后立刻 read，
-                        // 如果当前任务连续运行，响应端可能先睡进 recv，客户端
-                        // 还没机会处理已唤醒的可读事件。
-                        sched::schedule_once(sched::now_ns_public());
+                        // 小请求/响应负载主动让出让 loopback 对端尽快处理；
+                        // 流式大块写则避免每次 send 都调度。
+                        if n <= 512 {
+                            sched::schedule_once(sched::now_ns_public());
+                        }
                         return Ok(n);
                     }
                     Err(NetError::WouldBlock) => {
@@ -980,7 +1011,12 @@ impl NetSocketFileOps {
                 // FIXME: connected UDP 由 VFS remote 缓存模拟，底层 UDP socket
                 // 没有 connect 状态，也不会过滤非 peer datagram。
                 match net::stack().udp_send_to(handle, data, remote) {
-                    Ok(n) => return Ok(n),
+                    Ok(n) => {
+                        if self.should_yield_after_loopback_udp_send(&remote) {
+                            sched::schedule_once(sched::now_ns_public());
+                        }
+                        return Ok(n);
+                    }
                     Err(NetError::WouldBlock) => {
                         if nonblocking {
                             return Err(Errno::EAGAIN);
@@ -1044,6 +1080,14 @@ impl NetSocketFileOps {
                 }
             }
         }
+    }
+
+    fn should_yield_after_loopback_udp_send(&self, remote: &Endpoint) -> bool {
+        if !endpoint_addr_is_loopback(remote) {
+            return false;
+        }
+        let count = self.udp_loopback_send_count.fetch_add(1, Ordering::Relaxed) + 1;
+        count % LOOPBACK_UDP_YIELD_INTERVAL == 0
     }
 
     fn recv_deadline(&self) -> Option<u64> {
@@ -1169,23 +1213,48 @@ impl NetSocketFileOps {
                     Err(e) => return Err(map_net_error(e)),
                 }
             },
-            SocketType::Raw | SocketType::Icmp => loop {
-                match net::stack().raw_recv(handle, buf) {
-                    Ok(n) => return Ok(n),
-                    Err(NetError::WouldBlock) => {
-                        if nonblocking {
-                            return Err(Errno::EAGAIN);
-                        }
-                        if self.deadline_expired(deadline) {
-                            return Err(Errno::EAGAIN);
-                        }
-                        self.wait_with_deadline_until(deadline, || {
-                            net::stack().raw_can_recv(handle)
-                        })?;
+            SocketType::Raw | SocketType::Icmp => self
+                .do_raw_recv_from_with_handle(handle, buf, nonblocking, deadline)
+                .map(|(len, _)| len),
+        }
+    }
+
+    fn do_raw_recv_from(
+        &self,
+        buf: &mut [u8],
+        nonblocking: bool,
+        call_deadline: Option<u64>,
+    ) -> Result<(usize, Option<Endpoint>), Errno> {
+        if self.options.lock().read_shutdown {
+            return Ok((0, None)); // EOF — 读方向已关闭
+        }
+        let handle = self.get_handle()?;
+        let deadline = self.recv_wait_deadline(call_deadline);
+        let nonblocking = nonblocking || self.is_nonblock();
+        self.do_raw_recv_from_with_handle(handle, buf, nonblocking, deadline)
+    }
+
+    fn do_raw_recv_from_with_handle(
+        &self,
+        handle: NetSocketHandle,
+        buf: &mut [u8],
+        nonblocking: bool,
+        deadline: Option<u64>,
+    ) -> Result<(usize, Option<Endpoint>), Errno> {
+        loop {
+            match net::stack().raw_recv_from(handle, buf) {
+                Ok(info) => return Ok((info.len, info.remote)),
+                Err(NetError::WouldBlock) => {
+                    if nonblocking {
+                        return Err(Errno::EAGAIN);
                     }
-                    Err(e) => return Err(map_net_error(e)),
+                    if self.deadline_expired(deadline) {
+                        return Err(Errno::EAGAIN);
+                    }
+                    self.wait_with_deadline_until(deadline, || net::stack().raw_can_recv(handle))?;
                 }
-            },
+                Err(e) => return Err(map_net_error(e)),
+            }
         }
     }
 
@@ -1267,6 +1336,13 @@ fn endpoint_addr_is_unspecified(ep: &Endpoint) -> bool {
     match ep.addr {
         net::IpAddr::V4(v4) => v4 == net::Ipv4Addr::UNSPECIFIED,
         net::IpAddr::V6(v6) => v6 == net::Ipv6Addr::UNSPECIFIED,
+    }
+}
+
+fn endpoint_addr_is_loopback(ep: &Endpoint) -> bool {
+    match ep.addr {
+        net::IpAddr::V4(v4) => v4.0[0] == 127,
+        net::IpAddr::V6(v6) => v6 == net::Ipv6Addr::LOCALHOST,
     }
 }
 

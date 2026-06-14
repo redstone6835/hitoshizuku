@@ -309,8 +309,9 @@ impl InterfaceInner {
 
         // First we calculate the size we are going to need. If the size is bigger than the MTU,
         // then we use fragmentation.
+        let traffic_class = meta.traffic_class;
         let (total_size, compressed_size, uncompressed_size) =
-            Self::compressed_packet_size(&packet, &ieee_repr);
+            Self::compressed_packet_size(&packet, &ieee_repr, traffic_class);
 
         let ieee_len = ieee_repr.buffer_len();
 
@@ -343,6 +344,7 @@ impl InterfaceInner {
                     &self.checksum_caps(),
                     packet,
                     &ieee_repr,
+                    traffic_class,
                     &mut pkt.buffer[..],
                 );
 
@@ -417,7 +419,13 @@ impl InterfaceInner {
                 ieee_repr.emit(&mut ieee_packet);
                 tx_buf = &mut tx_buf[ieee_len..];
 
-                Self::ipv6_to_sixlowpan(&self.checksum_caps(), packet, &ieee_repr, tx_buf);
+                Self::ipv6_to_sixlowpan(
+                    &self.checksum_caps(),
+                    packet,
+                    &ieee_repr,
+                    traffic_class,
+                    tx_buf,
+                );
             });
         }
     }
@@ -426,6 +434,7 @@ impl InterfaceInner {
         checksum_caps: &ChecksumCapabilities,
         mut packet: PacketV6,
         ieee_repr: &Ieee802154Repr,
+        traffic_class: Option<u8>,
         mut buffer: &mut [u8],
     ) {
         let last_header = packet.payload.as_sixlowpan_next_header();
@@ -445,6 +454,7 @@ impl InterfaceInner {
             next_header
         };
 
+        let (ecn, dscp) = sixlowpan_traffic_class_fields(traffic_class);
         let iphc_repr = SixlowpanIphcRepr {
             src_addr: packet.header.src_addr,
             ll_src_addr: ieee_repr.src_addr,
@@ -452,8 +462,8 @@ impl InterfaceInner {
             ll_dst_addr: ieee_repr.dst_addr,
             next_header,
             hop_limit: packet.header.hop_limit,
-            ecn: None,
-            dscp: None,
+            ecn,
+            dscp,
             flow_label: None,
         };
 
@@ -562,6 +572,7 @@ impl InterfaceInner {
     fn compressed_packet_size(
         packet: &PacketV6,
         ieee_repr: &Ieee802154Repr,
+        traffic_class: Option<u8>,
     ) -> (usize, usize, usize) {
         let last_header = packet.payload.as_sixlowpan_next_header();
         let next_header = last_header;
@@ -580,6 +591,7 @@ impl InterfaceInner {
             next_header
         };
 
+        let (ecn, dscp) = sixlowpan_traffic_class_fields(traffic_class);
         let iphc = SixlowpanIphcRepr {
             src_addr: packet.header.src_addr,
             ll_src_addr: ieee_repr.src_addr,
@@ -587,8 +599,8 @@ impl InterfaceInner {
             ll_dst_addr: ieee_repr.dst_addr,
             next_header,
             hop_limit: packet.header.hop_limit,
-            ecn: None,
-            dscp: None,
+            ecn,
+            dscp,
             flow_label: None,
         };
 
@@ -690,6 +702,12 @@ impl InterfaceInner {
             },
         );
     }
+}
+
+fn sixlowpan_traffic_class_fields(traffic_class: Option<u8>) -> (Option<u8>, Option<u8>) {
+    traffic_class
+        .map(|value| (Some((value & 0x03) << 6), Some(value >> 2)))
+        .unwrap_or((None, None))
 }
 
 /// Convert a 6LoWPAN next header to an IPv6 next header.

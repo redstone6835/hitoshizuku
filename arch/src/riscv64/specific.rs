@@ -29,7 +29,6 @@ pub struct HartLocal {
     /// 中断栈栈顶（高地址端）。trap entry from_kernel 路径切换到此栈。
     pub irq_stack_top: usize,
 }
-
 /// 中断栈大小：8 KiB（足够处理嵌套中断 + Rust handler 栈帧）。
 pub const IRQ_STACK_SIZE: usize = 8192;
 
@@ -70,7 +69,6 @@ pub(crate) unsafe fn boot_hart_local_ptr() -> *mut HartLocal {
     // Safety: 调用方保证在单核 boot 阶段调用（pre_boot_init），此时无并发访问 HART_LOCALS。
     unsafe { core::ptr::addr_of_mut!(HART_LOCALS) as *mut HartLocal }
 }
-
 #[inline]
 pub fn current_hart() -> &'static HartLocal {
     let ptr: *const HartLocal;
@@ -130,5 +128,3 @@ pub unsafe fn zero_memory_fast(vaddr: usize, len: usize) {
         }
     }
 }
-
-

@@ -17,7 +17,7 @@ use core::fmt;
 
 use crate::pid::PidT;
 use crate::signal::SignalNumber;
-use crate::task::Task;
+use crate::task::{Task, TaskUsage};
 
 /// `wait4` / `waitid` 的标志位。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -171,4 +171,5 @@ impl WaitStatus {
 pub struct WaitResult {
     pub pid: PidT,
     pub status: WaitStatus,
+    pub usage: TaskUsage,
 }

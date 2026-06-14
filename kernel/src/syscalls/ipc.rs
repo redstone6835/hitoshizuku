@@ -40,7 +40,7 @@ pub(super) fn sys_shmget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let key = ShmKey(ctx.args[0] as i32);
     let size = ctx.args[1] as u64;
     let flags = ctx.args[2] as u32;
-    let cred = vfs_cred_from_sched(&ctx.task.credentials());
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
 
     let manager = shm_manager();
     let id = manager.shmget(key, size, flags, &cred)?;
@@ -67,7 +67,7 @@ pub(super) fn sys_shmat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         }
     }
 
-    let cred = vfs_cred_from_sched(&ctx.task.credentials());
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
     let manager = shm_manager();
     let object = manager.attach(shmid, flags, &cred)?;
     let size = usize::try_from(object.len()).map_err(|_| Errno::EINVAL)?;
@@ -116,7 +116,7 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let raw_cmd = ctx.args[1] as u32;
     let cmd = raw_cmd & !IPC_64;
     let buf = ctx.args[2];
-    let cred = vfs_cred_from_sched(&ctx.task.credentials());
+    let cred = vfs_cred_from_sched(&ctx.task().credentials());
     let manager = shm_manager();
 
     match cmd {
@@ -147,6 +147,114 @@ pub(super) fn sys_shmctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
 }
 
+pub(super) fn sys_io_setup(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_destroy(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_submit(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_cancel(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_getevents(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_open(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_unlink(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_timedsend(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_timedreceive(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_notify(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_getsetattr(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_msgget(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_msgctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_msgrcv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_msgsnd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_semget(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_semctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_semtimedop(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_semop(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_add_key(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_request_key(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_keyctl(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_pgetevents(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_io_pgetevents_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_timedsend_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mq_timedreceive_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_semtimedop_time64(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
 fn shm_manager() -> Arc<ShmManager> {
     let mut slot = SYSV_SHM_MANAGER.lock();
     if let Some(manager) = slot.as_ref() {
@@ -158,12 +266,12 @@ fn shm_manager() -> Arc<ShmManager> {
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
-    let payload = ctx.task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    let payload = ctx.task().ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
 
 fn task_pid(ctx: &SyscallContext<'_>) -> i32 {
-    ctx.task.pid_root().unwrap_or(0)
+    ctx.task().pid_root().unwrap_or(0)
 }
 
 fn shmat_vm_flags(flags: u32) -> VmFlags {

@@ -111,18 +111,15 @@ impl FileOps for PipeReadEnd {
         if avail > 0 {
             let n = self.pipe.read_data(&mut inner, buf);
             drop(inner);
-            self.pipe.write_wait.wake_all();
+            // 正常读出数据只释放了部分缓冲空间，唤醒一个写者即可；
+            // 端点关闭等状态变化仍在 release() 中广播给全部等待者。
+            self.pipe.write_wait.wake_one_default();
             return Ok(n);
         }
         if inner.writer_count == 0 {
             return Ok(0);
         }
 
-        // FIXME: 当前基于 write_pos 的启发式会误判流水线写入场景会产生错误
-        if inner.write_pos > 0 {
-            inner.writer_count = 0;
-            return Ok(0);
-        }
         Err(VfsError::WouldBlock)
     }
 
@@ -149,10 +146,7 @@ impl FileOps for PipeReadEnd {
         if avail > 0 {
             ready = ready.with(PollEvents::POLLIN);
         }
-        // FIXME: 此处的 write_pos>0 启发式与 read_at 中的自旋死锁检测一致，
-        if inner.writer_count == 0
-            || (avail == 0 && inner.write_pos > 0)
-        {
+        if inner.writer_count == 0 {
             ready = ready.with(PollEvents::POLLHUP);
         }
         ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
@@ -219,7 +213,9 @@ impl FileOps for PipeWriteEnd {
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
             drop(inner);
-            self.pipe.read_wait.wake_all();
+            // 写入后只需要一个读者消费新数据，避免 lmbench pipe 场景
+            // 中把所有等待任务同时推回 runqueue 造成惊群。
+            self.pipe.read_wait.wake_one_default();
             return Ok(n);
         }
         Err(VfsError::WouldBlock)

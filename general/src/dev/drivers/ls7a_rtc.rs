@@ -633,8 +633,8 @@ impl PnpDriver for Ls7aRtcPlatformDriver {
         })?;
 
         let rtc_driver: Arc<dyn RtcDriver> = rtc.clone();
-        let rtc_node_name = RtcDevice::alloc_stable_node_name(&dev.name)?;
-        let rtc_dev = Arc::new(RtcDevice::new(rtc_node_name, rtc_driver));
+        let rtc_projection_name = RtcDevice::alloc_stable_projection_name(&dev.name)?;
+        let rtc_dev = Arc::new(RtcDevice::new(rtc_projection_name, rtc_driver));
         dev.register_function(Arc::new(RtcFunction::new(Arc::clone(&rtc_dev))))?;
         let irq_handle = self.register_alarm_irq_handler(&rtc, &rtc_dev, info)?;
         if let Some(handle) = irq_handle

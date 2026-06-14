@@ -28,13 +28,14 @@ use vfs::sync::Spinlock;
 use crate::dev::block::BlockDevice;
 use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::{
-    CustomDevNodeKind, DevNodeSpec, DeviceFunction, active_block_devnode_projections,
-    active_char_devnode_projections,
-};
+use crate::dev::function::DeviceFunction;
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
-use crate::vfs::device_numbers;
+use crate::vfs::device_files::projection::{
+    PublishedDevNodeClass, append_function_projection_diagnostics, published_block_devnodes,
+    published_char_devnodes, published_devnode_classes,
+};
+use crate::vfs::user_api::device_numbers;
 
 // ─── 静态 ino 编号 ──────────────────────────────────────────
 const ROOT_INO: u64 = 1;
@@ -60,6 +61,7 @@ const KERNEL_OSTYPE_INO: u64 = 20;
 const KERNEL_OSRELEASE_INO: u64 = 21;
 const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
+const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -74,13 +76,44 @@ static SYSFS_INO_REGISTRY: Spinlock<Option<SysfsInoRegistry>> = Spinlock::new(No
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
-// TODO(sysfs): 这些默认值是兼容视图策略，不能长期作为 sysfs core 的固定常量。
-// 后续应从 block/net/power 等 typed capability snapshot 中读取，缺失时再由
-// 对应兼容层 policy 给出默认值。
-const SYSFS_DEFAULT_NR_REQUESTS: u32 = 64;
 const SYSFS_BLOCK_CLASS: &str = "block";
 const SYSFS_CHAR_CLASS: &str = "char";
 const SYSFS_NET_CLASS: &str = NET_CLASS.as_str();
+
+/// sysfs 用户视图默认策略。
+///
+/// sysfs 优先渲染 typed device snapshot；当底层设备暂未暴露队列深度、链路类型
+/// 或电源管理状态时，统一从这里取用户 ABI 默认值，避免魔数散落在各个属性文件。
+#[derive(Clone, Copy)]
+struct SysfsUserViewPolicy {
+    block_nr_requests: u32,
+    net_link_type_ether: u32,
+    net_tx_queue_len: u32,
+    power_runtime_status: &'static str,
+    power_control: &'static str,
+    power_wakeup: &'static str,
+}
+
+impl SysfsUserViewPolicy {
+    const fn standard() -> Self {
+        Self {
+            block_nr_requests: 64,
+            net_link_type_ether: 1,
+            net_tx_queue_len: 1000,
+            power_runtime_status: "active",
+            power_control: "on",
+            power_wakeup: "disabled",
+        }
+    }
+
+    fn net_ifindex(self, iface_id: u32) -> u32 {
+        // 当前网络栈 snapshot 尚未携带独立 ifindex。把编号策略集中在用户视图
+        // policy 内，后续接入 stable interface index 时无需改属性渲染路径。
+        iface_id.saturating_add(1)
+    }
+}
+
+const SYSFS_USER_VIEW_POLICY: SysfsUserViewPolicy = SysfsUserViewPolicy::standard();
 
 // ─── 渲染辅助 ──────────────────────────────────────────────
 
@@ -90,9 +123,6 @@ fn timespec_now() -> Timespec {
 
 struct SysfsInoRegistry {
     next: u64,
-    // FIXME(sysfs): 动态 inode 仍以手写路径字符串作为稳定 key。后续应改成
-    // 结构化 key（设备 identity、slot enum、projection kind），避免路径格式
-    // 变化导致 inode 稳定性和诊断视图互相耦合。
     by_key: BTreeMap<String, u64>,
 }
 
@@ -130,19 +160,140 @@ impl SysfsInoRegistry {
     }
 }
 
-/// 为动态 sysfs 对象分配稳定 inode。
+/// 动态 sysfs inode 的稳定 key。
 ///
-/// key 使用 sysfs 逻辑路径而不是哈希值；这样 inode 编号只承担 VFS 标识职责，
-/// 不会反过来成为设备身份，也不会因为枚举顺序变化而漂移。
-fn sysfs_dynamic_ino(key: String) -> u64 {
+/// key 集中由专用 helper 生成；inode 编号只承担 VFS 标识职责，不反向成为设备
+/// 身份，也不依赖枚举顺序。后续如需改成 enum/typed key，只需要替换本结构的
+/// 构造器，不必修改目录渲染逻辑。
+struct SysfsKey(String);
+
+impl SysfsKey {
+    fn raw(value: String) -> Self {
+        Self(value)
+    }
+
+    fn rdev(rdev: DevId) -> String {
+        format!("{}:{}", rdev.major, rdev.minor)
+    }
+
+    fn block_device(name: &str) -> Self {
+        Self::raw(format!("block/{name}"))
+    }
+
+    fn block_device_slot(name: &str, slot: u64) -> Self {
+        Self::raw(format!("block/{name}/slot/{slot}"))
+    }
+
+    fn block_queue_slot(name: &str, slot: u64) -> Self {
+        Self::raw(format!("block/{name}/queue/{slot}"))
+    }
+
+    fn device(class_name: &str, rdev: DevId) -> Self {
+        Self::raw(format!("devices/{class_name}/{}", Self::rdev(rdev)))
+    }
+
+    fn device_slot(class_name: &str, rdev: DevId, slot: u64) -> Self {
+        Self::raw(format!(
+            "devices/{class_name}/{}/slot/{slot}",
+            Self::rdev(rdev)
+        ))
+    }
+
+    fn device_power_slot(class_name: &str, rdev: DevId, slot: u64) -> Self {
+        Self::raw(format!(
+            "devices/{class_name}/{}/power/{slot}",
+            Self::rdev(rdev)
+        ))
+    }
+
+    fn virtual_class(class_name: &str) -> Self {
+        Self::raw(format!("devices/virtual/{class_name}"))
+    }
+
+    fn virtual_device(class_name: &str, rdev: DevId) -> Self {
+        Self::raw(format!("devices/virtual/{class_name}/{}", Self::rdev(rdev)))
+    }
+
+    fn virtual_device_slot(class_name: &str, rdev: DevId, slot: u64) -> Self {
+        Self::raw(format!(
+            "devices/virtual/{class_name}/{}/slot/{slot}",
+            Self::rdev(rdev)
+        ))
+    }
+
+    fn virtual_device_power_slot(class_name: &str, rdev: DevId, slot: u64) -> Self {
+        Self::raw(format!(
+            "devices/virtual/{class_name}/{}/power/{slot}",
+            Self::rdev(rdev)
+        ))
+    }
+
+    fn pnp_bus(bus: &str) -> Self {
+        Self::raw(format!("devices/pnp/{bus}"))
+    }
+
+    fn pnp_device(bus: &str, name: &str) -> Self {
+        Self::raw(format!("devices/pnp/{bus}/{name}"))
+    }
+
+    fn pnp_device_slot(bus: &str, name: &str, slot: u64) -> Self {
+        Self::raw(format!("devices/pnp/{bus}/{name}/slot/{slot}"))
+    }
+
+    fn bus_class(bus: &str) -> Self {
+        Self::raw(format!("bus/{bus}"))
+    }
+
+    fn bus_class_devices(bus: &str) -> Self {
+        Self::raw(format!("bus/{bus}/devices"))
+    }
+
+    fn bus_class_device_link(bus: &str, name: &str) -> Self {
+        Self::raw(format!("bus/{bus}/devices/{name}"))
+    }
+
+    fn class_dir(class_name: &str) -> Self {
+        Self::raw(format!("class/{class_name}"))
+    }
+
+    fn class_node(class_name: &str, name: &str) -> Self {
+        Self::raw(format!("class/{class_name}/{name}"))
+    }
+
+    fn dev_block_link(rdev: DevId) -> Self {
+        Self::raw(format!("dev/block/{}", Self::rdev(rdev)))
+    }
+
+    fn dev_char_dir(rdev: DevId) -> Self {
+        Self::raw(format!("dev/char/{}", Self::rdev(rdev)))
+    }
+
+    fn dev_char_inner(rdev: DevId, slot: u64) -> Self {
+        Self::raw(format!("dev/char/{}/slot/{slot}", Self::rdev(rdev)))
+    }
+
+    fn net_iface(iface_id: u32) -> Self {
+        Self::raw(format!("class/net/iface/{iface_id}"))
+    }
+
+    fn net_iface_slot(iface_id: u32, slot: u64) -> Self {
+        Self::raw(format!("class/net/iface/{iface_id}/slot/{slot}"))
+    }
+
+    fn net_stats(iface_id: u32) -> Self {
+        Self::raw(format!("class/net/iface/{iface_id}/statistics"))
+    }
+
+    fn net_stats_slot(iface_id: u32, slot: u64) -> Self {
+        Self::raw(format!("class/net/iface/{iface_id}/statistics/slot/{slot}"))
+    }
+}
+
+fn sysfs_dynamic_ino(key: SysfsKey) -> u64 {
     let mut registry = SYSFS_INO_REGISTRY.lock();
     registry
         .get_or_insert_with(SysfsInoRegistry::new)
-        .get_or_alloc(key)
-}
-
-fn sysfs_rdev_key(rdev: DevId) -> String {
-    format!("{}:{}", rdev.major, rdev.minor)
+        .get_or_alloc(key.0)
 }
 
 fn inode_meta(mode: u16, nlink: u32, now: Timespec) -> InodeMeta {
@@ -278,11 +429,6 @@ enum SysClassNodeKind {
     NetInterface { iface_id: u32 },
 }
 
-struct FunctionDevNodeClass {
-    node_name: String,
-    class_name: &'static str,
-}
-
 fn sysfs_fallible_string(value: &str) -> Option<String> {
     let mut out = String::new();
     out.try_reserve(value.len()).ok()?;
@@ -322,25 +468,6 @@ fn push_sysfs_dir_entry(out: &mut Vec<DirEntry>, ino: u64, name: &str, kind: Fil
     };
     out.push(DirEntry { ino, name, kind });
     true
-}
-
-fn push_function_devnode_class(
-    out: &mut Vec<FunctionDevNodeClass>,
-    node_name: &str,
-    class_name: &'static str,
-) {
-    // sysfs 是诊断视图，不能因为快照中某个名字分配失败而让内核崩溃。
-    // 低内存时跳过该条 class 映射，底层 function/devtmpfs 绑定仍然保持不变。
-    if out.try_reserve(1).is_err() {
-        return;
-    }
-    let Some(node_name) = sysfs_fallible_string(node_name) else {
-        return;
-    };
-    out.push(FunctionDevNodeClass {
-        node_name,
-        class_name,
-    });
 }
 
 /// sysfs 单次访问从 dev core 拷贝出的不可变快照。
@@ -384,7 +511,7 @@ where
     }
 
     // sysfs 目录名是兼容层投影，不是底层设备身份。同名设备出现时用已分配的
-    // POSIX rdev 做稳定消歧；这只影响用户态可见路径，不反向改变 dev core。
+    // rdev 做稳定消歧；这只影响用户态可见路径，不反向改变 dev core。
     let mut suffix = 0usize;
     loop {
         let raw = if suffix == 0 {
@@ -451,45 +578,15 @@ fn pnp_dependency_name(dependency: PnpDependency) -> String {
     }
 }
 
-fn collect_function_devnode_classes() -> Vec<FunctionDevNodeClass> {
-    // FIXME(sysfs-dev): 这里仍直接读取 `DeviceFunction::devnodes()` 和 `DevNodeSpec`。
-    // 后续应改为读取 devtmpfs/projection registry 生成的只读快照，sysfs 不再理解
-    // 底层 function 的 `/dev` 投影声明。
-    let mut out = Vec::new();
-    for func in DEVICES.functions.try_list().unwrap_or_default() {
-        let class_name = func.class_id().as_str();
-        let Some(nodes) = func.devnodes() else {
-            continue;
-        };
-        for node in nodes.nodes() {
-            match node {
-                DevNodeSpec::Char { name, .. } | DevNodeSpec::Block { name, .. } => {
-                    push_function_devnode_class(&mut out, name, class_name);
-                }
-                DevNodeSpec::Custom(spec)
-                    if matches!(
-                        spec.kind(),
-                        CustomDevNodeKind::CharDevice | CustomDevNodeKind::BlockDevice
-                    ) =>
-                {
-                    push_function_devnode_class(&mut out, spec.name(), class_name);
-                }
-                DevNodeSpec::Symlink { .. } | DevNodeSpec::Custom(_) => {}
-            }
-        }
-    }
-    out
-}
-
 fn class_for_devnode(
-    devnode_classes: &[FunctionDevNodeClass],
+    devnode_classes: &[PublishedDevNodeClass],
     node_name: &str,
     fallback: &'static str,
 ) -> &'static str {
     devnode_classes
         .iter()
-        .find(|entry| entry.node_name == node_name)
-        .map(|entry| entry.class_name)
+        .find(|entry| entry.node_name() == node_name)
+        .map(|entry| entry.class_name())
         .unwrap_or(fallback)
 }
 
@@ -524,7 +621,7 @@ impl SysSnapshot {
     fn collect() -> Self {
         let mut snap = SysSnapshot::default();
         let records = device_numbers::try_records().unwrap_or_default();
-        let devnode_classes = collect_function_devnode_classes();
+        let devnode_classes = published_devnode_classes();
 
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
@@ -572,41 +669,31 @@ impl SysSnapshot {
             }
         }
 
-        // `/sys/block` 和 `/sys/devices` 展示 typed device object；`rdev` 只从
-        // devtmpfs 已注册的 POSIX 投影补充而来，不能反过来当底层设备身份。
-        for projection in active_block_devnode_projections(&DEVICES.functions) {
-            let Some(record) = records.iter().find(|record| {
-                record.kind == device_numbers::PosixDeviceKind::Block
-                    && record.node_name == projection.node_name()
-            }) else {
-                continue;
-            };
+        // `/sys/block` 和 `/sys/devices` 展示 typed device object；`rdev` 来自
+        // projection 层已经确认发布的 devtmpfs+device_numbers 联合快照，sysfs
+        // 不再重复解释 `/dev` 节点和设备号表的关联规则。
+        for projection in published_block_devnodes(&DEVICES.functions) {
             let dev = Arc::clone(projection.dev());
-            let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), record.rdev, |name| {
+            let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), projection.rdev(), |name| {
                 snap.blocks.iter().any(|block| block.sysfs_name == name)
             });
             snap.blocks.push(BlockDevSnapshot {
                 sysfs_name,
-                rdev: record.rdev,
+                rdev: projection.rdev(),
                 dev,
                 class_name: projection.class_id().as_str(),
             });
         }
 
-        for projection in active_char_devnode_projections(&DEVICES.functions) {
-            let Some(record) = records.iter().find(|record| {
-                record.kind == device_numbers::PosixDeviceKind::Char
-                    && record.node_name == projection.node_name()
-            }) else {
-                continue;
-            };
-            let sysfs_name =
-                sysfs_unique_name_with_rdev(projection.dev().fw_name(), record.rdev, |name| {
-                    snap.chars.iter().any(|ch| ch.sysfs_name == name)
-                });
+        for projection in published_char_devnodes(&DEVICES.functions) {
+            let sysfs_name = sysfs_unique_name_with_rdev(
+                projection.dev().fw_name(),
+                projection.rdev(),
+                |name| snap.chars.iter().any(|ch| ch.sysfs_name == name),
+            );
             snap.chars.push(CharDevSnapshot {
                 sysfs_name,
-                rdev: record.rdev,
+                rdev: projection.rdev(),
                 class_name: projection.class_id().as_str(),
             });
         }
@@ -629,11 +716,11 @@ impl SysSnapshot {
                 _kind: SysDeviceKind::Block,
             }));
 
-        // `/sys/dev/{char,block}` 是 POSIX `dev_t` 的兼容视图，来源只能是
+        // `/sys/dev/{char,block}` 是 `dev_t` 的用户 ABI 视图，来源只能是
         // device_numbers registry；这里不向底层设备模型反向写入任何信息。
         for record in records {
             match record.kind {
-                device_numbers::PosixDeviceKind::Char => {
+                device_numbers::DeviceNumberKind::Char => {
                     let class_name =
                         class_for_devnode(&devnode_classes, &record.node_name, SYSFS_CHAR_CLASS);
                     let backing_name = snap
@@ -673,7 +760,7 @@ impl SysSnapshot {
                         class_name,
                     })
                 }
-                device_numbers::PosixDeviceKind::Block => {
+                device_numbers::DeviceNumberKind::Block => {
                     let class_name =
                         class_for_devnode(&devnode_classes, &record.node_name, SYSFS_BLOCK_CLASS);
                     let backing_name = snap
@@ -721,7 +808,7 @@ impl SysSnapshot {
         }
 
         // `/sys/class` 是 dev core function class 与 VFS 兼容投影的汇合点。
-        // 节点名和设备号来自 POSIX registry；class 语义优先来自 function
+        // 节点名和设备号来自用户 ABI registry；class 语义优先来自 function
         // registry。这样 RTC 等 custom devnode 能自然进入 `rtc` class，而不
         // 被压回底层并不关心的 `char` 类别。
         let char_node_count = snap.char_nodes.len();
@@ -767,82 +854,67 @@ impl SysSnapshot {
 // ─── 动态 inode 辅助 ─────────────────────────────────────────
 
 fn block_dev_ino(name: &str) -> u64 {
-    sysfs_dynamic_ino(format!("block/{name}"))
+    sysfs_dynamic_ino(SysfsKey::block_device(name))
 }
 fn block_dev_slot_ino(name: &str, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!("block/{name}/slot/{slot}"))
+    sysfs_dynamic_ino(SysfsKey::block_device_slot(name, slot))
 }
 fn block_queue_slot_ino(name: &str, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!("block/{name}/queue/{slot}"))
+    sysfs_dynamic_ino(SysfsKey::block_queue_slot(name, slot))
 }
 fn device_ino(class_name: &str, rdev: DevId) -> u64 {
-    sysfs_dynamic_ino(format!("devices/{class_name}/{}", sysfs_rdev_key(rdev)))
+    sysfs_dynamic_ino(SysfsKey::device(class_name, rdev))
 }
 fn device_slot_ino(class_name: &str, rdev: DevId, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!(
-        "devices/{class_name}/{}/slot/{slot}",
-        sysfs_rdev_key(rdev)
-    ))
+    sysfs_dynamic_ino(SysfsKey::device_slot(class_name, rdev, slot))
 }
 fn device_power_ino(class_name: &str, rdev: DevId, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!(
-        "devices/{class_name}/{}/power/{slot}",
-        sysfs_rdev_key(rdev)
-    ))
+    sysfs_dynamic_ino(SysfsKey::device_power_slot(class_name, rdev, slot))
 }
 fn virtual_class_ino(class_name: &str) -> u64 {
-    sysfs_dynamic_ino(format!("devices/virtual/{class_name}"))
+    sysfs_dynamic_ino(SysfsKey::virtual_class(class_name))
 }
 fn virtual_device_ino(class_name: &str, rdev: DevId) -> u64 {
-    sysfs_dynamic_ino(format!(
-        "devices/virtual/{class_name}/{}",
-        sysfs_rdev_key(rdev)
-    ))
+    sysfs_dynamic_ino(SysfsKey::virtual_device(class_name, rdev))
 }
 fn virtual_device_slot_ino(class_name: &str, rdev: DevId, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!(
-        "devices/virtual/{class_name}/{}/slot/{slot}",
-        sysfs_rdev_key(rdev)
-    ))
+    sysfs_dynamic_ino(SysfsKey::virtual_device_slot(class_name, rdev, slot))
 }
 fn virtual_device_power_ino(class_name: &str, rdev: DevId, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!(
-        "devices/virtual/{class_name}/{}/power/{slot}",
-        sysfs_rdev_key(rdev)
-    ))
+    sysfs_dynamic_ino(SysfsKey::virtual_device_power_slot(class_name, rdev, slot))
 }
 fn pnp_bus_ino(bus: &str) -> u64 {
-    sysfs_dynamic_ino(format!("devices/pnp/{bus}"))
+    sysfs_dynamic_ino(SysfsKey::pnp_bus(bus))
 }
 fn pnp_device_ino(bus: &str, name: &str) -> u64 {
-    sysfs_dynamic_ino(format!("devices/pnp/{bus}/{name}"))
+    sysfs_dynamic_ino(SysfsKey::pnp_device(bus, name))
 }
 fn pnp_device_slot_ino(bus: &str, name: &str, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!("devices/pnp/{bus}/{name}/slot/{slot}"))
+    sysfs_dynamic_ino(SysfsKey::pnp_device_slot(bus, name, slot))
 }
 fn bus_class_ino(bus: &str) -> u64 {
-    sysfs_dynamic_ino(format!("bus/{bus}"))
+    sysfs_dynamic_ino(SysfsKey::bus_class(bus))
 }
 fn bus_class_devices_ino(bus: &str) -> u64 {
-    sysfs_dynamic_ino(format!("bus/{bus}/devices"))
+    sysfs_dynamic_ino(SysfsKey::bus_class_devices(bus))
 }
 fn bus_class_device_link_ino(bus: &str, name: &str) -> u64 {
-    sysfs_dynamic_ino(format!("bus/{bus}/devices/{name}"))
+    sysfs_dynamic_ino(SysfsKey::bus_class_device_link(bus, name))
 }
 fn class_dir_ino(class_name: &str) -> u64 {
-    sysfs_dynamic_ino(format!("class/{class_name}"))
+    sysfs_dynamic_ino(SysfsKey::class_dir(class_name))
 }
 fn class_node_ino(class_name: &str, name: &str) -> u64 {
-    sysfs_dynamic_ino(format!("class/{class_name}/{name}"))
+    sysfs_dynamic_ino(SysfsKey::class_node(class_name, name))
 }
 fn dev_block_link_ino(rdev: DevId) -> u64 {
-    sysfs_dynamic_ino(format!("dev/block/{}", sysfs_rdev_key(rdev)))
+    sysfs_dynamic_ino(SysfsKey::dev_block_link(rdev))
 }
 fn dev_char_dir_ino(rdev: DevId) -> u64 {
-    sysfs_dynamic_ino(format!("dev/char/{}", sysfs_rdev_key(rdev)))
+    sysfs_dynamic_ino(SysfsKey::dev_char_dir(rdev))
 }
 fn dev_char_inner_ino(rdev: DevId, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!("dev/char/{}/slot/{slot}", sysfs_rdev_key(rdev)))
+    sysfs_dynamic_ino(SysfsKey::dev_char_inner(rdev, slot))
 }
 fn cpu_ino(cpu_id: usize) -> u64 {
     CPU_BASE + (cpu_id as u64) * CPU_SLOTS
@@ -1062,19 +1134,19 @@ fn netdev_stats_slot_by_name(name: &str) -> Option<NetDevStatsSlot> {
 }
 
 fn class_net_iface_ino(iface_id: u32) -> u64 {
-    sysfs_dynamic_ino(format!("class/net/iface/{iface_id}"))
+    sysfs_dynamic_ino(SysfsKey::net_iface(iface_id))
 }
 
 fn class_net_iface_slot_ino(iface_id: u32, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!("class/net/iface/{iface_id}/slot/{slot}"))
+    sysfs_dynamic_ino(SysfsKey::net_iface_slot(iface_id, slot))
 }
 
 fn class_net_stats_ino(iface_id: u32) -> u64 {
-    sysfs_dynamic_ino(format!("class/net/iface/{iface_id}/statistics"))
+    sysfs_dynamic_ino(SysfsKey::net_stats(iface_id))
 }
 
 fn class_net_stats_slot_ino(iface_id: u32, slot: u64) -> u64 {
-    sysfs_dynamic_ino(format!("class/net/iface/{iface_id}/statistics/slot/{slot}"))
+    sysfs_dynamic_ino(SysfsKey::net_stats_slot(iface_id, slot))
 }
 
 fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -> String {
@@ -1082,9 +1154,9 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
     let mut s = String::new();
     match slot {
         NetDevSlot::Type => {
-            // FIXME(sysfs-net): 这里固定报告 ARPHRD_ETHER。网络设备抽象应在 typed
-            // snapshot 中提供 link-layer kind，sysfs 只负责渲染 ABI 数值。
-            let _ = writeln!(s, "1"); // ARPHRD_ETHER
+            // 当前网络设备 snapshot 尚未携带链路层类型；用户视图策略给出以太网
+            // 默认值，后续 typed capability 可覆盖该字段。
+            let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_link_type_ether);
         }
         NetDevSlot::Address => {
             let mac = iface.mac;
@@ -1101,14 +1173,10 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "0x{:x}", iface.flags);
         }
         NetDevSlot::IfIndex => {
-            // FIXME(sysfs-net): ifindex 当前由内部 InterfaceId + 1 推导，缺少独立的
-            // POSIX 网络接口编号分配器；接口删除/重建后稳定性无法由 sysfs 保证。
-            let _ = writeln!(s, "{}", iface.id.raw() + 1);
+            let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_ifindex(iface.id.raw()));
         }
         NetDevSlot::TxQueueLen => {
-            // TODO(sysfs-net): tx_queue_len 应来自网络设备/队列 capability 或协议栈
-            // policy，而不是在 sysfs 兼容视图中固定为 1000。
-            let _ = writeln!(s, "1000");
+            let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_tx_queue_len);
         }
         NetDevSlot::Carrier => {
             let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 {
@@ -1414,6 +1482,7 @@ enum SysRegFile {
     Osrelease,
     Version,
     Cmdline,
+    DeviceFunctions,
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
@@ -1496,12 +1565,12 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
             }
         }
         BlockQueueSlot::NrRequests => {
-            // 没有真实队列深度的设备使用兼容默认值；VirtIO 等驱动会填实际协商值。
+            // 没有真实队列深度的设备使用 sysfs 用户视图默认值；VirtIO 等驱动会填实际协商值。
             let depth = dev
                 .attributes()
                 .queue_depth()
                 .map(|n| n.get())
-                .unwrap_or(SYSFS_DEFAULT_NR_REQUESTS);
+                .unwrap_or(SYSFS_USER_VIEW_POLICY.block_nr_requests);
             format!("{}\n", depth)
         }
         BlockQueueSlot::HwSectorSize => format!("{}\n", geom.logical_block_size().get()),
@@ -1525,18 +1594,13 @@ fn render_device_file(snap: &SysSnapshot, idx: usize, slot: DeviceSlot) -> Strin
 }
 
 fn render_device_power_file(_snap: &SysSnapshot, _idx: usize, slot: DevicePowerSlot) -> String {
-    // TODO(sysfs-power): power/runtime 字段目前只是兼容默认值。设备 core 需要提供
-    // suspend/resume、wakeup source、runtime policy 等 typed state 后，sysfs 才能
-    // 输出真实电源管理状态。
     match slot {
-        // 设备进入 sysfs 快照时已经完成 probe，通用设备模型没有 suspend/offline
-        // 状态，因此 runtime_status 以 active 表达“当前可访问”。
-        DevicePowerSlot::RuntimeStatus => "active\n".into(),
-        // 没有 runtime PM policy 时，兼容视图固定为 on，避免用户态误判该设备
-        // 支持自动挂起。
-        DevicePowerSlot::Control => "on\n".into(),
-        // 当前设备抽象没有声明 wakeup source 的接口，兼容视图统一为 disabled。
-        DevicePowerSlot::Wakeup => "disabled\n".into(),
+        // 通用设备模型暂未暴露 runtime PM typed state 时，统一从用户视图策略渲染。
+        DevicePowerSlot::RuntimeStatus => {
+            format!("{}\n", SYSFS_USER_VIEW_POLICY.power_runtime_status)
+        }
+        DevicePowerSlot::Control => format!("{}\n", SYSFS_USER_VIEW_POLICY.power_control),
+        DevicePowerSlot::Wakeup => format!("{}\n", SYSFS_USER_VIEW_POLICY.power_wakeup),
     }
 }
 
@@ -1672,24 +1736,52 @@ fn push_cpu_range(out: &mut String, start: usize, end: usize) {
 }
 
 fn format_cpu_mask_range(mask: u64) -> String {
-    // TODO(sysfs-cpu): CPU 集合当前被压成 u64 并固定扫描 0..64。后续 sched/cpu
-    // 拓扑接口应提供可迭代 CPU 集合，sysfs 不应假设最大 CPU 数。
     let mut out = String::new();
-    let mut cpu = 0usize;
-    while cpu < 64 {
-        if mask & (1u64 << cpu) == 0 {
-            cpu += 1;
-            continue;
+    let mut iter = CpuMaskIter::new(mask);
+    while let Some(start) = iter.next() {
+        let mut end = start;
+        while let Some(next) = iter.peek() {
+            if next != end.saturating_add(1) {
+                break;
+            }
+            end = iter.next().unwrap_or(end);
         }
-        let start = cpu;
-        while cpu + 1 < 64 && (mask & (1u64 << (cpu + 1))) != 0 {
-            cpu += 1;
-        }
-        push_cpu_range(&mut out, start, cpu);
-        cpu += 1;
+        push_cpu_range(&mut out, start, end);
     }
     out.push('\n');
     out
+}
+
+struct CpuMaskIter {
+    mask: u64,
+    next: usize,
+}
+
+impl CpuMaskIter {
+    const fn new(mask: u64) -> Self {
+        Self { mask, next: 0 }
+    }
+
+    fn peek(&self) -> Option<usize> {
+        let mut cpu = self.next;
+        while cpu < u64::BITS as usize {
+            if self.mask & (1u64 << cpu) != 0 {
+                return Some(cpu);
+            }
+            cpu += 1;
+        }
+        None
+    }
+}
+
+impl Iterator for CpuMaskIter {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cpu = self.peek()?;
+        self.next = cpu.saturating_add(1);
+        Some(cpu)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1803,6 +1895,11 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
         SysRegFile::Osrelease => env!("CARGO_PKG_VERSION").to_string() + "\n",
         SysRegFile::Version => format!("mygo {} (mygo-build)\n", env!("CARGO_PKG_VERSION")),
         SysRegFile::Cmdline => render_kernel_cmdline(),
+        SysRegFile::DeviceFunctions => {
+            let mut out = String::new();
+            append_function_projection_diagnostics(&mut out);
+            out
+        }
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::stack()
                 .snapshot_interfaces()
@@ -1933,8 +2030,9 @@ impl FileOps for SysDirFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举基于内存快照，可立即尝试读取目录项。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)
@@ -1967,8 +2065,9 @@ impl FileOps for SysRegFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 属性内容由内核内存即时渲染，不依赖外部事件到达。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn ioctl(&self, _: IoctlCmd, _: usize) -> Result<usize, Errno> {
         Err(errno::Errno::ENOTTY)
@@ -2466,6 +2565,11 @@ impl SysDirInodeOps {
                 "osrelease" => mk_reg(KERNEL_OSRELEASE_INO, SysRegFile::Osrelease),
                 "version" => mk_reg(KERNEL_VERSION_INO, SysRegFile::Version),
                 "cmdline" => mk_reg(KERNEL_CMDLINE_INO, SysRegFile::Cmdline),
+                // 该文件是 devtmpfs/sysfs/procfs 共享的 function 投影诊断入口。
+                // 它只展示 VFS 用户态命名空间发布状态，不参与底层设备生命周期。
+                "device_functions" => {
+                    mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
+                }
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::Fs => match name {
@@ -3042,6 +3146,11 @@ impl SysDirInodeOps {
                 mk_dir_entry(KERNEL_OSRELEASE_INO, "osrelease", FileType::Regular),
                 mk_dir_entry(KERNEL_VERSION_INO, "version", FileType::Regular),
                 mk_dir_entry(KERNEL_CMDLINE_INO, "cmdline", FileType::Regular),
+                mk_dir_entry(
+                    KERNEL_DEVICE_FUNCTIONS_INO,
+                    "device_functions",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
@@ -3176,26 +3285,18 @@ impl SysDirInodeOps {
                         return entries;
                     }
                 }
-                // TODO(sysfs-cpu): 这里和 CPU mask 渲染一样依赖 64 位固定上限；
-                // 后续应遍历 sched/cpu registry 暴露的在线 CPU 列表。
-                for cpu in 0..64 {
-                    if mask & (1u64 << cpu) != 0 {
-                        let name = {
-                            let mut out = String::new();
-                            use core::fmt::Write;
-                            if write!(&mut out, "cpu{}", cpu).is_err() {
-                                return entries;
-                            }
-                            out
-                        };
-                        if !push_sysfs_dir_entry(
-                            &mut entries,
-                            cpu_ino(cpu),
-                            &name,
-                            FileType::Directory,
-                        ) {
+                for cpu in CpuMaskIter::new(mask) {
+                    let name = {
+                        let mut out = String::new();
+                        use core::fmt::Write;
+                        if write!(&mut out, "cpu{}", cpu).is_err() {
                             return entries;
                         }
+                        out
+                    };
+                    if !push_sysfs_dir_entry(&mut entries, cpu_ino(cpu), &name, FileType::Directory)
+                    {
+                        return entries;
                     }
                 }
                 entries

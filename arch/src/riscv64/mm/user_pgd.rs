@@ -66,7 +66,7 @@ impl UserPgdInner {
         let cur_root_ppn = cur_satp & 0xFFF_FFFF_FFFF;
         let cur_root_phys = cur_root_ppn << 12;
         let cur_root_virt = phys_to_virt(cur_root_phys);
-        
+
         // 只复制高半区（内核空间）entries 到用户页表
         // 低半区（用户空间，entries 0~255）保持全零，由 ELF loader 按需映射
         let entries = Riscv64Paging::ENTRIES_PER_TABLE;

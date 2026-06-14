@@ -2,7 +2,7 @@
 //!
 //! 本模块位于 VFS/ABI 边界，负责把用户态 `SIOC*`、`ifreq`、`arpreq`
 //! 布局和用户指针拷贝翻译为 `net` crate 的 typed 接口。底层 `dev::net`
-//! 只暴露网络设备 function 和 typed control，不承载这些 POSIX ABI 细节。
+//! 只暴露网络设备 function 和 typed control，不承载这些用户 ABI 细节。
 
 use errno::Errno;
 use net::config::IpAddr;
@@ -47,8 +47,8 @@ const ATF_COM: u32 = 0x02;
 /// 当前 net driver 没有独立 txqlen 状态，兼容层返回传统默认值。
 const DEFAULT_TX_QUEUE_LEN: i32 = 1000;
 
-/// 安装网络 socket ioctl 兼容处理器。
-pub fn install_net_ioctl_compat() {
+/// 安装网络 socket ioctl 适配器。
+pub fn install_net_socket_ioctl_adapter() {
     ::vfs::net_socket::install_net_ioctl_handler(net_ioctl);
 }
 

@@ -4,15 +4,14 @@
 //!
 //! 1. [`RtcDriver`] 描述硬件驱动能力，只表达平台无关的 RTC 语义；
 //! 2. [`RtcDevice`] 为驱动实例提供生命周期、typed control 和运行期状态；
-//! 3. [`RtcFunction`] 把 RTC 设备投影成 devtmpfs 自定义节点，payload 只携带
-//!    [`RtcDevNodeEndpoint`]，具体 inode/file/ioctl 语义由 VFS 兼容层解释。
+//! 3. [`RtcFunction`] 把 RTC 设备暴露为通用 function；具体 `/dev/rtc*` 节点、
+//!    ioctl 和 inode/file 语义由 VFS device_files 层生成。
 //!
 //! 这样 LS7A、CMOS 或其它未来 RTC 驱动只需要实现 [`RtcDriver`]，不需要在
 //! devtmpfs 或 syscall 层增加硬件类型特判。
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -21,14 +20,15 @@ use vfs::sync::Spinlock;
 
 use crate::dev::control::DriverControl;
 use crate::dev::function::{
-    CustomDevNodeKind, CustomDevNodeSpec, DevNodeName, DevNodeNameAllocError, DevNodeNameAllocator,
-    DevNodeSet, DevNodeSpec, DeviceClassId, DeviceFunction,
+    DeviceClassId, DeviceFunction, FunctionProjectionName, FunctionProjectionNameAllocError,
+    FunctionProjectionNameAllocator,
 };
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const SECS_PER_DAY: u64 = 86_400;
 const UNIX_EPOCH_WEEKDAY: u32 = 4; // 1970-01-01 为周四，tm_wday 约定周日为 0。
-static RTC_DEV_NAMES: DevNodeNameAllocator = DevNodeNameAllocator::new("rtc");
+static RTC_PROJECTION_NAMES: FunctionProjectionNameAllocator =
+    FunctionProjectionNameAllocator::new("rtc");
 const RTC_DEFAULT_EPOCH: u32 = 1900;
 const RTC_DEFAULT_PERIODIC_RATE_HZ: u32 = 1024;
 const RTC_MIN_PERIODIC_RATE_HZ: u32 = 2;
@@ -381,11 +381,11 @@ impl RtcRuntimeState {
 }
 
 impl RtcDevice {
-    pub fn new(node_name: DevNodeName, driver: Arc<dyn RtcDriver>) -> Self {
-        let index = node_name.index();
+    pub fn new(projection_name: FunctionProjectionName, driver: Arc<dyn RtcDriver>) -> Self {
+        let index = projection_name.index();
         Self {
             index,
-            name: node_name.into_string().into_boxed_str(),
+            name: projection_name.into_string().into_boxed_str(),
             driver,
             state: AtomicU8::new(RtcDeviceState::Active as u8),
             runtime: Spinlock::new(RtcRuntimeState::new()),
@@ -393,12 +393,14 @@ impl RtcDevice {
         }
     }
 
-    /// 为一个稳定硬件实例分配或复用 `/dev/rtc*` 节点名。
+    /// 为一个稳定硬件实例分配或复用 RTC 用户可见投影名。
     ///
-    /// `stable_key` 由 PnP 设备身份或固件路径提供。RTC core 统一管理兼容层命名，
+    /// `stable_key` 由 PnP 设备身份或固件路径提供。RTC core 统一管理投影命名，
     /// 具体硬件驱动只需要传入自身实例身份，避免在驱动里散落 `rtc{n}` 拼接逻辑。
-    pub fn alloc_stable_node_name(stable_key: &str) -> Result<DevNodeName, DevNodeNameAllocError> {
-        RTC_DEV_NAMES.try_alloc_stable(stable_key)
+    pub fn alloc_stable_projection_name(
+        stable_key: &str,
+    ) -> Result<FunctionProjectionName, FunctionProjectionNameAllocError> {
+        RTC_PROJECTION_NAMES.try_alloc_stable(stable_key)
     }
 
     pub fn index(&self) -> usize {
@@ -663,26 +665,6 @@ pub enum RtcControlResponse {
     U32(u32),
 }
 
-/// RTC 在 devtmpfs 自定义节点中的 typed endpoint。
-///
-/// 这里不保存 VFS inode/file 操作，也不保存 ioctl number。dev core 只声明
-/// “这个节点关联到哪个 RTC 设备”；VFS 兼容层拿到 endpoint 后再构造具体
-/// `/dev/rtc*` 行为，避免底层设备抽象反向依赖 POSIX ABI。
-#[derive(Clone)]
-pub struct RtcDevNodeEndpoint {
-    dev: Arc<RtcDevice>,
-}
-
-impl RtcDevNodeEndpoint {
-    pub fn new(dev: Arc<RtcDevice>) -> Self {
-        Self { dev }
-    }
-
-    pub fn dev(&self) -> Arc<RtcDevice> {
-        Arc::clone(&self.dev)
-    }
-}
-
 pub struct RtcFunction {
     dev: Arc<RtcDevice>,
 }
@@ -708,24 +690,6 @@ impl DeviceFunction for RtcFunction {
 
     fn mark_gone(&self) {
         self.dev.mark_gone();
-    }
-
-    fn devnodes(&self) -> Option<DevNodeSet> {
-        let mut nodes = Vec::new();
-        let payload: Arc<dyn Any + Send + Sync> =
-            Arc::new(RtcDevNodeEndpoint::new(Arc::clone(&self.dev)));
-        nodes.push(DevNodeSpec::custom(CustomDevNodeSpec::new(
-            self.dev.name(),
-            CustomDevNodeKind::CharDevice,
-            payload,
-        )));
-        if self.dev.index() == 0 {
-            nodes.push(DevNodeSpec::Symlink {
-                name: "rtc".into(),
-                target: self.dev.name().into(),
-            });
-        }
-        DevNodeSet::new(nodes)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -1,16 +1,27 @@
 //! 信号相关 syscall：rt_sigaction / rt_sigprocmask。
 
+use alloc::sync::Arc;
+
 use errno::Errno;
 use general::mm::{copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
+use general::vfs::{self, fdtable::Fd, pidfd};
+use hal::user_context::UserTrapFrame;
+use sched::ids::Uid;
 use sched::process_ops::UserContextRef;
-use sched::task::TaskState;
-use sched::{SigAction, SigActionFlags, SigHandler, SigProcMaskHow, SigSet, SignalNumber};
+use sched::task::{Task, TaskState};
+use sched::{
+    SigAction, SigActionFlags, SigAltStack, SigHandler, SigProcMaskHow, SigSet, SignalNumber,
+};
 
 const SIGSET_SIZE: usize = 8;
 const SIG_BLOCK: usize = 0;
 const SIG_UNBLOCK: usize = 1;
 const SIG_SETMASK: usize = 2;
+const STACK_T_SIZE: usize = 24;
+const SS_ONSTACK: u32 = 1;
+const SS_DISABLE: u32 = 2;
+const MINSIGSTKSZ: usize = 2048;
 
 pub(super) fn sys_rt_sigaction(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let sig = SignalNumber::from_raw(ctx.args[0] as i32).ok_or(Errno::EINVAL)?;
@@ -21,7 +32,7 @@ pub(super) fn sys_rt_sigaction(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
         return Err(Errno::EINVAL);
     }
 
-    let old = ctx.task.shared_signal().get_action(sig);
+    let old = ctx.task().shared_signal().get_action(sig);
     if old_user != 0 {
         write_sigaction(old_user, old)?;
     }
@@ -41,7 +52,7 @@ pub(super) fn sys_rt_sigprocmask(ctx: &mut SyscallContext<'_>) -> Result<usize, 
         return Err(Errno::EINVAL);
     }
 
-    let old = ctx.task.signal.blocked_snapshot();
+    let old = ctx.task().signal.blocked_snapshot();
     if old_user != 0 {
         copy_to_user(old_user, &old.raw().to_le_bytes()).map_err(|e| e.as_errno())?;
     }
@@ -88,18 +99,21 @@ pub(super) fn sys_rt_sigsuspend(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     let mut raw = [0u8; 8];
     copy_from_user(set_user, &mut raw).map_err(|e| e.as_errno())?;
     let mask = SigSet::from_raw(u64::from_le_bytes(raw));
-    ctx.task.signal.save_blocked(mask);
+    ctx.task().signal.save_blocked(mask);
     loop {
         let pending = sched::operation::sigpending()?;
         if pending.raw() != 0 {
             break;
         }
-        if !ctx.task.cas_state(TaskState::Running, TaskState::Sleeping) {
+        if !ctx
+            .task()
+            .cas_state(TaskState::Running, TaskState::Sleeping)
+        {
             continue;
         }
         sched::operation::sched_yield()?;
     }
-    ctx.task.signal.restore_blocked();
+    ctx.task().signal.restore_blocked();
     Err(Errno::EINTR)
 }
 
@@ -141,16 +155,12 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
         if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
             return Err(Errno::EINVAL);
         }
-        // {0,0} → 永久等待；其它 → ns 总数。
-        if sec == 0 && nsec == 0 {
-            None
-        } else {
-            Some(
-                (sec as u64)
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(nsec as u64),
-            )
-        }
+        // NULL timeout 才表示永久等待；非 NULL 的 {0,0} 是立即轮询。
+        Some(
+            (sec as u64)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(nsec as u64),
+        )
     };
 
     // 3. 先非阻塞轮询；命中则直接返回。
@@ -175,12 +185,117 @@ pub(super) fn sys_rt_sigtimedwait(ctx: &mut SyscallContext<'_>) -> Result<usize,
     Ok(info.sig.as_usize())
 }
 
-pub(super) fn sys_sigaltstack(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_sigaltstack(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let new_user = ctx.args[0];
+    let old_user = ctx.args[1];
+    let current_sp = UserTrapFrame::from_context(ctx.tf.as_usize()).sp();
+
+    if old_user != 0 {
+        write_stack_t(old_user, ctx.task().sigaltstack(), current_sp)?;
+    }
+    if new_user == 0 {
+        return Ok(0);
+    }
+    if ctx.task().sigaltstack().contains(current_sp) {
+        return Err(Errno::EPERM);
+    }
+    let new_stack = read_stack_t(new_user)?;
+    ctx.task().set_sigaltstack(new_stack);
+    Ok(0)
 }
 
 pub(super) fn sys_restart_syscall(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::EINTR)
+}
+
+pub(super) fn sys_rt_sigqueueinfo(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let pid = ctx.args[0] as i32;
+    if pid <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let Some(sig) = signal_number(ctx.args[1])? else {
+        sched::operation::kill(pid, None)?;
+        return Ok(0);
+    };
+    let info = read_queued_siginfo(ctx.args[2], sig)?;
+    sched::operation::queueinfo(pid, info)?;
+    Ok(0)
+}
+
+pub(super) fn sys_rt_sigtimedwait_time64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    sys_rt_sigtimedwait(ctx)
+}
+
+pub(super) fn sys_pidfd_send_signal(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let fd = fd_arg(ctx.args[0])?;
+    let sig = signal_number(ctx.args[1])?;
+    let uinfo = ctx.args[2];
+    let flags = ctx.args[3];
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let fdt = vfs::current_fdtable().ok_or(Errno::EBADF)?;
+    let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+    let task = pidfd::task_from_file(&file).ok_or(Errno::EINVAL)?;
+    let (tgid, _tid) = task_tgid_tid(&task)?;
+    let Some(sig) = sig else {
+        sched::operation::kill(tgid, None)?;
+        return Ok(0);
+    };
+    if uinfo == 0 {
+        sched::operation::kill(tgid, Some(sig))?;
+    } else {
+        let info = read_queued_siginfo(uinfo, sig)?;
+        sched::operation::queueinfo(tgid, info)?;
+    }
+    Ok(0)
+}
+
+fn signal_number(raw: usize) -> Result<Option<SignalNumber>, Errno> {
+    if raw == 0 {
+        Ok(None)
+    } else {
+        SignalNumber::from_raw(raw as i32)
+            .map(Some)
+            .ok_or(Errno::EINVAL)
+    }
+}
+
+fn read_queued_siginfo(user: usize, sig: SignalNumber) -> Result<sched::SigInfo, Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 128];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let signo = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+    if signo != sig.raw() as i32 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(sched::SigInfo {
+        sig,
+        code: i32::from_le_bytes(raw[8..12].try_into().unwrap()),
+        sender_pid: i32::from_le_bytes(raw[12..16].try_into().unwrap()),
+        sender_uid: Uid(u32::from_le_bytes(raw[16..20].try_into().unwrap())),
+        raw: Some(raw),
+    })
+}
+
+fn task_tgid_tid(task: &Arc<Task>) -> Result<(i32, i32), Errno> {
+    let tid = task.pid_root().ok_or(Errno::ESRCH)?;
+    let tgid = task
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_root())
+        .unwrap_or(tid);
+    Ok((tgid, tid))
+}
+
+fn fd_arg(raw: usize) -> Result<Fd, Errno> {
+    let fd = raw as isize;
+    if fd < 0 {
+        return Err(Errno::EBADF);
+    }
+    Ok(Fd::from_raw(fd as u32))
 }
 
 fn read_sigaction(user: usize) -> Result<SigAction, Errno> {
@@ -226,6 +341,44 @@ fn write_siginfo(user: usize, info: &sched::SigInfo) -> Result<(), Errno> {
     put_i32(&mut raw, 8, info.code);
     put_i32(&mut raw, 12, info.sender_pid);
     put_u32(&mut raw, 16, info.sender_uid.0);
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+}
+
+fn read_stack_t(user: usize) -> Result<SigAltStack, Errno> {
+    let mut raw = [0u8; STACK_T_SIZE];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    let sp = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
+    let flags = u32::from_le_bytes(raw[8..12].try_into().unwrap());
+    let size = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
+    if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 || (flags & SS_ONSTACK) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & SS_DISABLE) != 0 {
+        return Ok(SigAltStack::disabled());
+    }
+    if size < MINSIGSTKSZ {
+        return Err(Errno::ENOMEM);
+    }
+    sp.checked_add(size).ok_or(Errno::EINVAL)?;
+    Ok(SigAltStack {
+        sp,
+        size,
+        disabled: false,
+    })
+}
+
+fn write_stack_t(user: usize, stack: SigAltStack, current_sp: usize) -> Result<(), Errno> {
+    let mut raw = [0u8; STACK_T_SIZE];
+    raw[0..8].copy_from_slice(&(stack.sp as u64).to_le_bytes());
+    let flags = if stack.disabled {
+        SS_DISABLE
+    } else if stack.contains(current_sp) {
+        SS_ONSTACK
+    } else {
+        0
+    };
+    raw[8..12].copy_from_slice(&flags.to_le_bytes());
+    raw[16..24].copy_from_slice(&(stack.size as u64).to_le_bytes());
     copy_to_user(user, &raw).map_err(|e| e.as_errno())
 }
 

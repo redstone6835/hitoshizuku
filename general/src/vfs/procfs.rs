@@ -33,10 +33,10 @@ use crate::mm::vm_space::dump_vmas;
 use crate::mm::{VmSpace, page_size};
 
 use super::{current_vfs_context, namespace_path};
-use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::{CustomDevNodeKind, DevNodeSpec};
+use crate::dev::enumerate::PNP_DEVICES;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpResourceKind, PnpState};
-use crate::vfs::device_numbers::{self, PosixDeviceKind};
+use crate::vfs::device_files::projection::render_function_projection_diagnostics;
+use crate::vfs::user_api::device_numbers::{self, DeviceNumberKind};
 
 static PROCFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_PATH: Spinlock<String> = Spinlock::new(String::new());
@@ -656,8 +656,9 @@ impl FileOps for ProcNetSnapshotFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 快照型伪文件每次读都会重新生成内容，不需要等待异步事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -965,8 +966,9 @@ impl FileOps for ProcNetDevFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 快照型伪文件每次读都会重新生成内容，不需要等待异步事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1616,8 +1618,9 @@ impl FileOps for ProcDirFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举基于打开时快照，可立即尝试读取目录项。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -1672,6 +1675,9 @@ struct ProcRegularFile {
 
 impl FileOps for ProcRegularFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        if let ProcFileKind::Root(RootFileKind::MemInfo) = self.kind {
+            return read_meminfo_at(buf, offset);
+        }
         let content = render_proc_file(self.kind)?;
         slice_bytes(buf, offset, &content)
     }
@@ -1698,8 +1704,9 @@ impl FileOps for ProcRegularFile {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 只读或少量可写的伪文件不会等待外部 I/O 事件。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn core::any::Any {
@@ -2273,20 +2280,48 @@ fn render_cpuinfo() -> String {
     out
 }
 
-fn render_meminfo() -> String {
+fn read_meminfo_at(buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+    let mut content = [0u8; 8192];
+    let len = render_meminfo_into(&mut content);
+    slice_bytes(buf, offset, &content[..len])
+}
+
+fn render_meminfo_into(buf: &mut [u8]) -> usize {
     let overview = allocator::KERNEL_ALLOCATOR.detailed_stats();
+    let layers = allocator::KERNEL_ALLOCATOR.layer_stats();
+    let sched_diag = sched::scheduler_diag();
+    let task_diag = sched::task_diag();
+    let vm_diag = crate::mm::vm_space::vm_space_diag();
+    let file_diag = vfs::file::file_diag();
+    let fdtable_diag = vfs::fdtable::fdtable_diag();
+    let vfs_context_diag = vfs::vfs_context_diag();
+    let slab_classes = allocator::KERNEL_ALLOCATOR.slab_class_stats();
+    let dead_comm_len = task_diag
+        .dead_ref_sample_comm
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(task_diag.dead_ref_sample_comm.len());
+    let dead_comm =
+        core::str::from_utf8(&task_diag.dead_ref_sample_comm[..dead_comm_len]).unwrap_or("?");
     let kb = |bytes: usize| -> usize { bytes / 1024 };
-    // 下列兼容字段需要独立的块缓存、页缓存、swap、内核栈和页表统计源。当前内核
-    // 尚未把这些子系统聚合到公共 memory snapshot，procfs 只报告 allocator 能
-    // 证明的项目，其余兼容字段保持 0。
-    let buffers_kb = 0usize;
-    let cached_kb = 0usize;
-    let swap_cached_kb = 0usize;
-    let kernel_stack_kb = 0usize;
-    let page_tables_kb = 0usize;
+    let slab_empty_pages = slab_classes
+        .iter()
+        .fold(0usize, |sum, class| sum.saturating_add(class.empty_pages));
+    let slab_reclaimable_pages = slab_classes.iter().fold(0usize, |sum, class| {
+        sum.saturating_add(class.reclaimable_empty_pages)
+    });
+    let slab_reclaimable_bytes = slab_reclaimable_pages.saturating_mul(page_size());
+    let allocator_reclaimable = layers
+        .kheap
+        .cached_bytes
+        .saturating_add(slab_reclaimable_bytes);
+    let mem_available = overview.free_physical.saturating_add(allocator_reclaimable);
+    let slab_bytes = layers.slab.active_pages.saturating_mul(page_size());
     let swap_total_kb = 0usize;
     let swap_free_kb = 0usize;
-    format!(
+    let mut out = FixedBuf::new(buf);
+    let _ = write!(
+        out,
         "MemTotal:       {:>8} kB\n\
          MemFree:        {:>8} kB\n\
          MemAvailable:   {:>8} kB\n\
@@ -2307,16 +2342,77 @@ fn render_meminfo() -> String {
          MemReserved:    {:>8} kB\n\
          KernelHeap:     {:>8} kB\n\
          BootUsed:       {:>8} kB\n\
-         BootFree:       {:>8} kB\n",
+         BootFree:       {:>8} kB\n\
+         AllocRegLive:   {:>8}\n\
+         AllocRegNodes:  {:>8}\n\
+         AllocRegFree:   {:>8}\n\
+         AllocSmallLive: {:>8}\n\
+         AllocLargeLive: {:>8}\n\
+         AllocPhysLive:  {:>8}\n\
+         SlabObjects:    {:>8}\n\
+         SlabActive:     {:>8} kB\n\
+         SlabPages:      {:>8}\n\
+         SlabFreeNodes:  {:>8}\n\
+         KHeapObjects:   {:>8}\n\
+         KHeapActive:    {:>8} kB\n\
+         KHeapCached:    {:>8} kB\n\
+         AllocReclaimable:{:>7} kB\n\
+         SlabEmpty:      {:>8} kB\n\
+         SlabReclaimable:{:>7} kB\n\
+         MetaBacking:    {:>8} kB\n\
+         SchedPidCount:  {:>8}\n\
+         SchedCurSlots:  {:>8}\n\
+         SchedCurDead:   {:>8}\n\
+         SchedRqCur:     {:>8}\n\
+         SchedRqCurDead: {:>8}\n\
+         SchedRqQueued:  {:>8}\n\
+         SchedRqQDead:   {:>8}\n\
+         SchedRetired:   {:>8}\n\
+         InitChildren:   {:>8}\n\
+         InitZombies:    {:>8}\n\
+         TaskLive:       {:>8}\n\
+         TaskCreated:    {:>8}\n\
+         TaskDropped:    {:>8}\n\
+         TaskTracked:    {:>8}\n\
+         TaskZombie:     {:>8}\n\
+         TaskDead:       {:>8}\n\
+         TaskPidless:    {:>8}\n\
+         TaskChildLinks: {:>8}\n\
+         TaskDeadChild:  {:>8}\n\
+         TaskMaxRefs:    {:>8}\n\
+         TaskDeadRefs:   {:>8}\n\
+         TaskDeadPid:    {:>8}\n\
+         TaskDeadPPid:   {:>8}\n\
+         TaskDeadRefMax: {:>8}\n\
+         TaskDeadOnRq:   {:>8}\n\
+         TaskDeadCtx:    {:>8}\n\
+         TaskDeadKStack: {:>8}\n\
+         TaskDeadExts:   {:>8}\n\
+         TaskDeadComm:   {}\n\
+         TaskSigPending: {:>8}\n\
+         TaskMaxSigPend: {:>8}\n\
+         DcacheEntries:  {:>8}\n\
+         FileLive:       {:>8}\n\
+         FileCreated:    {:>8}\n\
+         FileDropped:    {:>8}\n\
+         FdTableLive:    {:>8}\n\
+         FdTableCreated: {:>8}\n\
+         FdTableDropped: {:>8}\n\
+         VfsCtxLive:     {:>8}\n\
+         VfsCtxCreated:  {:>8}\n\
+         VfsCtxDropped:  {:>8}\n\
+         VmSpaceLive:    {:>8}\n\
+         VmSpaceCreated: {:>8}\n\
+         VmSpaceDropped: {:>8}\n",
         kb(overview.total_physical),
         kb(overview.free_physical),
-        kb(overview.free_physical),
-        buffers_kb,
-        cached_kb,
-        swap_cached_kb,
-        kb(overview.kernel_heap_used), // Slab: 暂用 kernel heap 近似
-        kernel_stack_kb,
-        page_tables_kb,
+        kb(mem_available),
+        0usize, // TODO: 实现 Buffers（块设备缓冲区统计）
+        0usize, // TODO: 实现 Cached（页缓存统计）
+        0usize, // TODO: 实现 SwapCached
+        kb(slab_bytes),
+        0usize, // TODO: 实现 KernelStack（内核栈统计）
+        0usize, // TODO: 实现 PageTables（页表统计）
         kb(overview.kernel_vmem_total),
         kb(overview.kernel_vmem_allocated),
         kb(overview.kernel_vmem_free),
@@ -2329,7 +2425,121 @@ fn render_meminfo() -> String {
         kb(overview.kernel_heap_used),
         kb(overview.boot_used),
         kb(overview.boot_free),
-    )
+        layers.registry.live_records,
+        layers.registry.nodes_allocated,
+        layers.registry.free_nodes,
+        layers.registry.live_small,
+        layers.registry.live_large,
+        layers.registry.live_physical,
+        layers.slab.active_objects,
+        kb(layers.slab.active_bytes),
+        layers.slab.active_pages,
+        layers.slab.free_slab_nodes,
+        layers.kheap.active_allocs,
+        kb(layers.kheap.active_bytes),
+        kb(layers.kheap.cached_bytes),
+        kb(allocator_reclaimable),
+        kb(slab_empty_pages.saturating_mul(page_size())),
+        kb(slab_reclaimable_bytes),
+        kb(layers.metadata.backing_pages.saturating_mul(page_size())),
+        sched_diag.pid_count,
+        sched_diag.current_slots,
+        sched_diag.current_zombie_or_dead,
+        sched_diag.rq_current_slots,
+        sched_diag.rq_current_zombie_or_dead,
+        sched_diag.rq_queued_slots,
+        sched_diag.rq_queued_zombie_or_dead,
+        sched_diag.retired_tasks,
+        sched_diag.init_children,
+        sched_diag.init_zombies,
+        task_diag.live,
+        task_diag.created,
+        task_diag.dropped,
+        task_diag.tracked_alive,
+        task_diag.zombie,
+        task_diag.dead,
+        task_diag.pidless,
+        task_diag.child_links,
+        task_diag.dead_child_links,
+        task_diag.max_external_refs,
+        task_diag.dead_external_refs,
+        task_diag.dead_ref_sample_pid,
+        task_diag.dead_ref_sample_parent_pid,
+        task_diag.dead_ref_sample_refs,
+        usize::from(task_diag.dead_ref_sample_on_rq),
+        usize::from(task_diag.dead_ref_sample_has_ctx),
+        usize::from(task_diag.dead_ref_sample_has_kstack),
+        task_diag.dead_ref_sample_exts,
+        dead_comm,
+        task_diag.shared_pending_infos,
+        task_diag.max_shared_pending_infos,
+        vfs::DCACHE.len(),
+        file_diag.live,
+        file_diag.created,
+        file_diag.dropped,
+        fdtable_diag.live,
+        fdtable_diag.created,
+        fdtable_diag.dropped,
+        vfs_context_diag.live,
+        vfs_context_diag.created,
+        vfs_context_diag.dropped,
+        vm_diag.live,
+        vm_diag.created,
+        vm_diag.dropped,
+    );
+    for class in slab_classes {
+        let _ = write!(
+            out,
+            "Slab{}:         {:>8} objs {:>8} kB {:>8} pages\n",
+            class.size_class,
+            class.active_objects,
+            kb(class.active_bytes),
+            class.active_pages,
+        );
+        let _ = write!(
+            out,
+            "Slab{}Empty:    {:>8} slabs {:>8} kB {:>8} reclaim_kB\n",
+            class.size_class,
+            class.empty_slabs,
+            kb(class.empty_pages.saturating_mul(page_size())),
+            kb(class.reclaimable_empty_pages.saturating_mul(page_size())),
+        );
+    }
+    out.len()
+}
+
+fn render_meminfo() -> String {
+    let mut buf = [0u8; 8192];
+    let len = render_meminfo_into(&mut buf);
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+struct FixedBuf<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> FixedBuf<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl core::fmt::Write for FixedBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let remaining = self.buf.len().saturating_sub(self.len);
+        let bytes = s.as_bytes();
+        let copy_len = remaining.min(bytes.len());
+        if copy_len != 0 {
+            self.buf[self.len..self.len + copy_len].copy_from_slice(&bytes[..copy_len]);
+            self.len += copy_len;
+        }
+        Ok(())
+    }
 }
 
 fn render_uptime() -> String {
@@ -2378,7 +2588,7 @@ fn render_stat() -> String {
 }
 
 fn render_devices() -> String {
-    // /proc/devices 只导出 POSIX 兼容投影的 major 汇总，不表示底层设备模型的寻址入口。
+    // /proc/devices 只导出用户 ABI 设备号投影的 major 汇总，不表示底层设备模型的寻址入口。
     // major 名称来自 VFS 兼容层注册的 device number policy；procfs 只消费汇总快照，
     // 不读取底层设备对象，也不参与设备号分配。
     let mut out = String::new();
@@ -2386,20 +2596,20 @@ fn render_devices() -> String {
         return out;
     }
     out.push_str("Character devices:\n");
-    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Char) {
+    if let Some(summaries) = device_numbers::try_major_summaries(DeviceNumberKind::Char) {
         write_major_summaries(&mut out, &summaries);
     }
     if out.try_reserve("\nBlock devices:\n".len()).is_err() {
         return out;
     }
     out.push_str("\nBlock devices:\n");
-    if let Some(summaries) = device_numbers::try_major_summaries(PosixDeviceKind::Block) {
+    if let Some(summaries) = device_numbers::try_major_summaries(DeviceNumberKind::Block) {
         write_major_summaries(&mut out, &summaries);
     }
     out
 }
 
-fn write_major_summaries(out: &mut String, summaries: &[device_numbers::PosixMajorSummary]) {
+fn write_major_summaries(out: &mut String, summaries: &[device_numbers::DeviceMajorSummary]) {
     for summary in summaries {
         // 设备诊断文本不能因为临时格式化缓冲分配失败而影响设备注册表本身。
         // 预留本行空间后再写入，避免为每一行创建额外 String。
@@ -2411,100 +2621,8 @@ fn write_major_summaries(out: &mut String, summaries: &[device_numbers::PosixMaj
     }
 }
 
-fn proc_custom_devnode_kind_name(kind: CustomDevNodeKind) -> &'static str {
-    match kind {
-        CustomDevNodeKind::CharDevice => "custom-char",
-        CustomDevNodeKind::BlockDevice => "custom-block",
-        CustomDevNodeKind::RegularFile => "custom-file",
-        CustomDevNodeKind::Directory => "custom-dir",
-    }
-}
-
-fn proc_devnode_render_len(node: &DevNodeSpec) -> usize {
-    match node {
-        DevNodeSpec::Char { name, .. } => "char:".len() + name.len(),
-        DevNodeSpec::Block { name, .. } => "block:".len() + name.len(),
-        DevNodeSpec::Symlink { name, target } => {
-            "symlink:".len() + name.len() + "->".len() + target.len()
-        }
-        DevNodeSpec::Custom(spec) => {
-            proc_custom_devnode_kind_name(spec.kind()).len() + 1 + spec.name().len()
-        }
-    }
-}
-
-fn write_proc_devnode_name(out: &mut String, node: &DevNodeSpec) {
-    match node {
-        DevNodeSpec::Char { name, .. } => {
-            let _ = write!(out, "char:{name}");
-        }
-        DevNodeSpec::Block { name, .. } => {
-            let _ = write!(out, "block:{name}");
-        }
-        DevNodeSpec::Symlink { name, target } => {
-            let _ = write!(out, "symlink:{name}->{target}");
-        }
-        DevNodeSpec::Custom(spec) => {
-            let _ = write!(
-                out,
-                "{}:{}",
-                proc_custom_devnode_kind_name(spec.kind()),
-                spec.name()
-            );
-        }
-    }
-}
-
 fn render_device_functions() -> String {
-    // `/proc/device-functions` 是 dev core function registry 的调试快照。
-    // 它只展示 class/name 与 devtmpfs 投影声明，不能作为设备打开或寻址入口；
-    // 用户态访问路径仍由 `/dev`、`/sys` 和对应 syscall 兼容层决定。
-    // FIXME(procfs-dev): 这个诊断视图仍直接理解 `DevNodeSpec`，说明 dev core 的
-    // `/dev` 投影声明泄漏到了 procfs。后续应改为读取 projection 层生成的
-    // 只读快照，procfs 不再格式化底层 function 的 devtmpfs 节点细节。
-    let mut out = String::new();
-    if out.try_reserve("class\tname\tdevnodes\n".len()).is_err() {
-        return out;
-    }
-    out.push_str("class\tname\tdevnodes\n");
-    for func in DEVICES.functions.try_list().unwrap_or_default() {
-        let nodes = func.devnodes();
-        let devnode_len = nodes
-            .as_ref()
-            .map(|nodes| {
-                let names_len = nodes
-                    .nodes()
-                    .iter()
-                    .map(proc_devnode_render_len)
-                    .sum::<usize>();
-                names_len.saturating_add(nodes.nodes().len().saturating_sub(1))
-            })
-            .filter(|len| *len > 0)
-            .unwrap_or(1);
-        let line_reserve = func
-            .class_id()
-            .as_str()
-            .len()
-            .saturating_add(func.dev_name().len())
-            .saturating_add(devnode_len)
-            .saturating_add(3);
-        if out.try_reserve(line_reserve).is_err() {
-            return out;
-        }
-        let _ = write!(out, "{}\t{}\t", func.class_id().as_str(), func.dev_name(),);
-        if let Some(nodes) = nodes.filter(|nodes| !nodes.nodes().is_empty()) {
-            for (idx, node) in nodes.nodes().iter().enumerate() {
-                if idx != 0 {
-                    out.push(',');
-                }
-                write_proc_devnode_name(&mut out, node);
-            }
-        } else {
-            out.push('-');
-        }
-        out.push('\n');
-    }
-    out
+    render_function_projection_diagnostics()
 }
 
 fn proc_pnp_state_name(state: PnpState) -> &'static str {
@@ -2594,35 +2712,72 @@ fn write_proc_pnp_dependency(out: &mut String, dependency: PnpDependency) {
     }
 }
 
+struct ProcPnpSchema;
+
+impl ProcPnpSchema {
+    const HEADER: &'static str =
+        "bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n";
+
+    fn function_list_len(functions: &[Arc<dyn crate::dev::function::DeviceFunction>]) -> usize {
+        functions
+            .iter()
+            .map(|func| func.class_id().as_str().len() + 1 + func.dev_name().len())
+            .sum::<usize>()
+            .saturating_add(functions.len().saturating_sub(1))
+    }
+
+    fn resource_list_len(resources: &[crate::dev::pnp::PnpOwnedResourceSnapshot]) -> usize {
+        resources
+            .iter()
+            .map(|resource| {
+                proc_pnp_resource_kind_name(resource.kind).len() + 1 + resource.label.len()
+            })
+            .sum::<usize>()
+            .saturating_add(resources.len().saturating_sub(1))
+    }
+
+    fn write_functions(
+        out: &mut String,
+        functions: &[Arc<dyn crate::dev::function::DeviceFunction>],
+    ) {
+        for (idx, func) in functions.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{}:{}", func.class_id().as_str(), func.dev_name());
+        }
+    }
+
+    fn write_resources(out: &mut String, resources: &[crate::dev::pnp::PnpOwnedResourceSnapshot]) {
+        for (idx, resource) in resources.iter().enumerate() {
+            if idx != 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{}:{}",
+                proc_pnp_resource_kind_name(resource.kind),
+                resource.label
+            );
+        }
+    }
+}
+
 fn render_pnp() -> String {
     // `/proc/pnp` 是面向诊断的 dev core 快照；设备寻址和层级关系以 sysfs 为准。
-    // TODO(procfs-dev): 字段 schema 和 resource/dependency 文本仍由 procfs 手写。
-    // 后续应由 dev core 暴露稳定的诊断 snapshot/formatter，procfs 只负责输出，
-    // 避免每新增资源类型都同步修改多个虚拟文件系统。
-    let header = "bus\tid\tname\tstate\tdriver\tfunctions\tresources\tdeferred_dependency\n";
     let mut out = String::new();
-    if out.try_reserve(header.len()).is_err() {
+    if out.try_reserve(ProcPnpSchema::HEADER.len()).is_err() {
         return out;
     }
-    out.push_str(header);
+    out.push_str(ProcPnpSchema::HEADER);
     for dev in PNP_DEVICES.try_list().unwrap_or_default() {
         let functions = dev.try_functions().unwrap_or_default();
         let resources = dev.try_owned_resources().unwrap_or_default();
         let deferred = dev.deferred_dependency();
         let driver = dev.bound_driver_name().unwrap_or("-");
         // 诊断输出按设备逐行预留，避免构造 function/resource 的中间字符串列表。
-        let functions_len = functions
-            .iter()
-            .map(|func| func.class_id().as_str().len() + 1 + func.dev_name().len())
-            .sum::<usize>()
-            .saturating_add(functions.len().saturating_sub(1));
-        let resources_len = resources
-            .iter()
-            .map(|resource| {
-                proc_pnp_resource_kind_name(resource.kind).len() + 1 + resource.label.len()
-            })
-            .sum::<usize>()
-            .saturating_add(resources.len().saturating_sub(1));
+        let functions_len = ProcPnpSchema::function_list_len(&functions);
+        let resources_len = ProcPnpSchema::resource_list_len(&resources);
         let deferred_len = deferred.map(proc_pnp_dependency_render_len).unwrap_or(0);
         let line_reserve = dev
             .name
@@ -2646,24 +2801,9 @@ fn render_pnp() -> String {
             proc_pnp_state_name(dev.state()),
             driver,
         );
-        for (idx, func) in functions.iter().enumerate() {
-            if idx != 0 {
-                out.push(',');
-            }
-            let _ = write!(out, "{}:{}", func.class_id().as_str(), func.dev_name());
-        }
+        ProcPnpSchema::write_functions(&mut out, &functions);
         out.push('\t');
-        for (idx, resource) in resources.iter().enumerate() {
-            if idx != 0 {
-                out.push(',');
-            }
-            let _ = write!(
-                out,
-                "{}:{}",
-                proc_pnp_resource_kind_name(resource.kind),
-                resource.label
-            );
-        }
+        ProcPnpSchema::write_resources(&mut out, &resources);
         out.push('\t');
         if let Some(dependency) = deferred {
             write_proc_pnp_dependency(&mut out, dependency);
