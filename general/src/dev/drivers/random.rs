@@ -38,6 +38,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::dev::char::{CharDriver, CharIoError};
+use crate::dev::pnp::PnpError;
 use sched::WaitQueue;
 
 // ──────────────────────── 时间戳 / 启动期熵源 ──────────────────────────────
@@ -55,8 +56,7 @@ const POOL_BYTES: usize = POOL_WORDS * core::mem::size_of::<u64>();
 /// 熵池满载时按 8 bit/byte 计入，约 1024 bit 熵。
 const POOL_BITS: u64 = (POOL_BYTES as u64) * 8;
 
-/// ChaCha20 输出 64 字节，reseed 间隔 Linux 5.x 默认 1 MiB，我们采用
-/// `64 * (1 << 14) = 1 MiB`。
+/// ChaCha20 输出 64 字节；每输出 1 MiB 后重新派生一次密钥流状态。
 const CHACHA20_BLOCK: usize = 64;
 const RESEED_BYTES: u64 = 1u64 << 20;
 
@@ -113,18 +113,6 @@ impl<T> SpinLock<T> {
             }
         }
     }
-
-    fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-        if self
-            .flag
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            Some(SpinLockGuard { lock: self })
-        } else {
-            None
-        }
-    }
 }
 
 struct SpinLockGuard<'a, T> {
@@ -159,12 +147,12 @@ fn sched_yield_best_effort() {
 
 // ──────────────────────── 输入熵池 ────────────────────────────────────────
 
-/// 16 × u64 状态的熵池，模仿 Linux `input_pool` 的简化版。
+/// 16 × u64 状态的熵池。
 ///
 /// 状态本身是公开的 `s`，但只有 `mix_*` 知道怎么把外部字节喂进去；
 /// 直接访问 `state` 是私有 API。
 struct EntropyPool {
-    /// 池内 16 个 64-bit 字。Linux `pool` 数组按小端 `u64` 访问。
+    /// 池内 16 个 64-bit 字，按小端 `u64` 混入外部字节。
     state: [u64; POOL_WORDS],
     /// 估计可用熵 bit 数，初始 0。
     estimated_entropy_bits: u64,
@@ -186,15 +174,18 @@ impl EntropyPool {
 
     /// 把 `n` 字节按 8 字节小端展开后与池状态做 7-位移位混合。
     ///
-    /// 这一步的设计完全照搬 Linux `mix_pool_bytes` 的简化：
+    /// 混合步骤：
     ///   1. 每 8 字节折叠成 `u64`；
     ///   2. 在状态字之间做 (rotate-left, add, xor) 三角链；
     ///   3. 剩余 < 8 字节折叠到 state[0]；
     ///   4. 末尾再 "tap" 一遍以增加扩散。
     fn mix(&mut self, mut input: &[u8]) {
         while input.len() >= 8 {
-            let w = u64::from_le_bytes(input[..8].try_into().unwrap());
-            input = &input[8..];
+            let (word, rest) = input.split_at(core::mem::size_of::<u64>());
+            let mut bytes = [0u8; core::mem::size_of::<u64>()];
+            bytes.copy_from_slice(word);
+            let w = u64::from_le_bytes(bytes);
+            input = rest;
             self.state[0] = self.state[0].wrapping_add(w.rotate_left(13));
             self.state[0] ^= self.state[1].rotate_left(7);
             self.state[1] = self.state[1].wrapping_add(self.state[0].rotate_left(17));
@@ -265,12 +256,16 @@ impl ChaCha20 {
         const CONSTANT: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
         let mut state = [0u32; 16];
         state[0..4].copy_from_slice(&CONSTANT);
-        for i in 0..8 {
-            state[4 + i] = u32::from_le_bytes(key[i * 4..(i + 1) * 4].try_into().unwrap());
+        for (slot, chunk) in state[4..12].iter_mut().zip(key.chunks_exact(4)) {
+            let mut bytes = [0u8; core::mem::size_of::<u32>()];
+            bytes.copy_from_slice(chunk);
+            *slot = u32::from_le_bytes(bytes);
         }
         // state[12] = counter = 0
-        for i in 0..3 {
-            state[13 + i] = u32::from_le_bytes(nonce[i * 4..(i + 1) * 4].try_into().unwrap());
+        for (slot, chunk) in state[13..16].iter_mut().zip(nonce.chunks_exact(4)) {
+            let mut bytes = [0u8; core::mem::size_of::<u32>()];
+            bytes.copy_from_slice(chunk);
+            *slot = u32::from_le_bytes(bytes);
         }
         Self { state }
     }
@@ -495,10 +490,22 @@ impl RandomCore {
         }
 
         if sched::is_ready() {
-            let task = sched::current_task();
-            self.entropy_wait
-                .wait_event(&task, || self.estimated_entropy_bits() >= bits);
-            return;
+            loop {
+                if self.estimated_entropy_bits() >= bits {
+                    return;
+                }
+                let task = sched::current_task();
+                self.entropy_wait
+                    .prepare_to_wait(&task, sched::TaskState::Sleeping);
+                if self.estimated_entropy_bits() >= bits {
+                    self.entropy_wait.finish_wait(&task);
+                    return;
+                }
+                drop(task);
+                sched::schedule_once(sched::now_ns_public());
+                let task = sched::current_task();
+                self.entropy_wait.finish_wait(&task);
+            }
         }
 
         // 调度器启动前没有 current task 可挂队列，只能保留极早期兼容兜底；
@@ -674,12 +681,10 @@ pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
 
 // ──────────────────────── 工厂入口（兼容 drivers/mod.rs 形态） ─────────────
 
-// 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以
-// 满足 `drivers::register_builtin_drivers()` 调用约定，但没有设备需要
-// 通过 PnP 枚举来发现这两个节点，它们是在 devtmpfs mount 时静态绑定的。
-use crate::dev::pnp::PnpError;
-
-/// 注册 random 子系统。在 devtmpfs mount 之前调用。
+// 字符设备驱动不需要 PnP factory；这里提供 `register_builtin_driver` 以满足
+// `drivers::register_builtin_drivers()` 调用约定。`/dev/random` 和
+// `/dev/urandom` 的路径发布由 VFS device_files 层负责，不能回流到驱动层。
+/// 注册 random 子系统。
 ///
 /// 内部会：
 ///   1. 喂一次启动期样本（时间戳 + 栈地址 + self 地址），并按熵源显式
@@ -720,7 +725,7 @@ fn seed_from_startup() {
         }
     } else {
         // 没有 arch 熵源：跳过硬件项，只靠用户态 write + reseed。
-        // Linux 在 start_kernel 早期 `crng_init = 0` 的状态也是这样。
+        // 这保持“无可信熵时不解除阻塞随机读”的内部不变量。
     }
 
     // 启动 hint 可以 mix，但默认不 credit。只有 EntropySource 通过

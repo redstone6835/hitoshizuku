@@ -28,4 +28,4 @@ pub use ops::{
     user_pgd_ops, user_vm_layout,
 };
 pub use user_access::{copy_cstr_from_user, copy_from_user, copy_to_user};
-pub use vm_space::{VmSpace, page_size};
+pub use vm_space::{VmFutexKey, VmSpace, page_size};

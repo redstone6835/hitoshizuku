@@ -275,6 +275,41 @@ pub fn vm_switch() -> Option<&'static VmSwitchOps> {
     }
 }
 
+// ── TaskCpuStateOps ─────────────────────────────────────────────────────────
+//
+// 调度核心在切到某个任务前已经知道它即将运行在哪个 CPU；用户态可观察的
+// per-task CPU 状态（例如 rseq 的 cpu_id 字段）需要由 kernel 层按当前地址空间
+// 更新。sched 不理解用户指针和地址空间，只在无锁边界触发这个回调。
+
+/// 任务即将运行在指定 CPU 时的外部状态发布契约。
+#[repr(C)]
+pub struct TaskCpuStateOps {
+    pub publish_current_cpu: fn(task: &Arc<crate::task::Task>, cpu_id: usize),
+}
+
+unsafe impl Sync for TaskCpuStateOps {}
+unsafe impl Send for TaskCpuStateOps {}
+
+static TASK_CPU_STATE_OPS: AtomicPtr<TaskCpuStateOps> = AtomicPtr::new(core::ptr::null_mut());
+
+pub fn register_task_cpu_state(ops: &'static TaskCpuStateOps) {
+    register_once(
+        &TASK_CPU_STATE_OPS,
+        ops as *const _ as *mut _,
+        "TaskCpuStateOps",
+    );
+}
+
+pub fn task_cpu_state() -> Option<&'static TaskCpuStateOps> {
+    let ptr = TASK_CPU_STATE_OPS.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // Safety: register_task_cpu_state 仅接受 'static；Acquire/Release 配对。
+        Some(unsafe { &*(ptr as *const TaskCpuStateOps) })
+    }
+}
+
 // ── ArchIdleOps ──────────────────────────────────────────────────────────────
 
 /// 架构相关的 idle 等待契约。

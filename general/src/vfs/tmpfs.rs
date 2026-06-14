@@ -160,20 +160,141 @@ impl SuperblockOps for TmpfsSuperblockOps {
 // ── Inode 数据 ────────────────────────────────────────────────────────────────
 
 enum TmpfsInodeData {
-    File(Vec<u8>),
+    File(TmpfsFileData),
     Directory(BTreeMap<String, u64>),
     Symlink(String),
     Special,
 }
 
-fn resize_file_data(file_data: &mut Vec<u8>, new_len: usize) -> VfsResult<()> {
-    if new_len > file_data.len() {
-        file_data
-            .try_reserve_exact(new_len - file_data.len())
-            .map_err(|_| VfsError::OutOfMemory)?;
+const TMPFS_PAGE_SIZE: usize = 4096;
+const TMPFS_PAGE_SIZE_U64: u64 = TMPFS_PAGE_SIZE as u64;
+
+struct TmpfsPage {
+    index: u64,
+    data: Vec<u8>,
+}
+
+struct TmpfsFileData {
+    size: u64,
+    pages: Vec<TmpfsPage>,
+}
+
+impl TmpfsFileData {
+    const fn new() -> Self {
+        Self {
+            size: 0,
+            pages: Vec::new(),
+        }
     }
-    file_data.resize(new_len, 0);
-    Ok(())
+
+    fn blocks(&self) -> u64 {
+        (self.pages.len() as u64 * TMPFS_PAGE_SIZE_U64).div_ceil(512)
+    }
+
+    fn truncate(&mut self, new_size: u64) {
+        if new_size < self.size {
+            let keep_pages = new_size.div_ceil(TMPFS_PAGE_SIZE_U64);
+            self.pages.retain(|page| page.index < keep_pages);
+            if new_size % TMPFS_PAGE_SIZE_U64 != 0 {
+                let tail_index = new_size / TMPFS_PAGE_SIZE_U64;
+                let tail_offset = (new_size % TMPFS_PAGE_SIZE_U64) as usize;
+                if let Some(pos) = self.page_pos(tail_index).ok() {
+                    self.pages[pos].data[tail_offset..].fill(0);
+                }
+            }
+        }
+        self.size = new_size;
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> usize {
+        if offset >= self.size || buf.is_empty() {
+            return 0;
+        }
+        let end = offset.saturating_add(buf.len() as u64).min(self.size);
+        let n = (end - offset) as usize;
+        let out = &mut buf[..n];
+        out.fill(0);
+
+        let first_page = offset / TMPFS_PAGE_SIZE_U64;
+        let last_page = (end - 1) / TMPFS_PAGE_SIZE_U64;
+        for page_index in first_page..=last_page {
+            let Ok(pos) = self.page_pos(page_index) else {
+                continue;
+            };
+            let page_start = page_index * TMPFS_PAGE_SIZE_U64;
+            let copy_start = offset.max(page_start);
+            let copy_end = end.min(page_start + TMPFS_PAGE_SIZE_U64);
+            let src_start = (copy_start - page_start) as usize;
+            let dst_start = (copy_start - offset) as usize;
+            let len = (copy_end - copy_start) as usize;
+            out[dst_start..dst_start + len]
+                .copy_from_slice(&self.pages[pos].data[src_start..src_start + len]);
+        }
+        n
+    }
+
+    fn write_at(&mut self, buf: &[u8], offset: u64) -> VfsResult<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+
+        let mut written = 0usize;
+        while written < buf.len() {
+            let file_off = offset + written as u64;
+            let page_index = file_off / TMPFS_PAGE_SIZE_U64;
+            let page_offset = (file_off % TMPFS_PAGE_SIZE_U64) as usize;
+            let chunk = (TMPFS_PAGE_SIZE - page_offset).min(buf.len() - written);
+            let page = match self.get_or_create_page(page_index) {
+                Ok(page) => page,
+                Err(_) if written != 0 => {
+                    self.size = self.size.max(offset + written as u64);
+                    return Ok(written);
+                }
+                Err(err) => return Err(err),
+            };
+            page[page_offset..page_offset + chunk].copy_from_slice(&buf[written..written + chunk]);
+            written += chunk;
+        }
+
+        self.size = self.size.max(end);
+        Ok(written)
+    }
+
+    fn reserve(&mut self, offset: u64, len: u64) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+        self.size = self.size.max(end);
+        Ok(())
+    }
+
+    fn page_pos(&self, index: u64) -> Result<usize, usize> {
+        self.pages.binary_search_by_key(&index, |page| page.index)
+    }
+
+    fn get_or_create_page(&mut self, index: u64) -> VfsResult<&mut [u8]> {
+        match self.page_pos(index) {
+            Ok(pos) => Ok(self.pages[pos].data.as_mut_slice()),
+            Err(pos) => {
+                self.pages
+                    .try_reserve(1)
+                    .map_err(|_| VfsError::OutOfMemory)?;
+                let mut data = Vec::new();
+                data.try_reserve_exact(TMPFS_PAGE_SIZE)
+                    .map_err(|_| VfsError::OutOfMemory)?;
+                data.resize(TMPFS_PAGE_SIZE, 0);
+                self.pages.insert(pos, TmpfsPage { index, data });
+                Ok(self.pages[pos].data.as_mut_slice())
+            }
+        }
+    }
 }
 
 fn tmpfs_blocks_for_len(len: u64) -> u64 {
@@ -332,7 +453,7 @@ impl InodeOps for TmpfsInodeOps {
             sb.dev_id,
             meta,
             Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::File(Vec::new())),
+                data: Spinlock::new(TmpfsInodeData::File(TmpfsFileData::new())),
             }),
             sb.self_weak.clone(),
         );
@@ -797,8 +918,8 @@ impl InodeOps for TmpfsInodeOps {
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        resize_file_data(file_data, new_size as usize)?;
-        inode.set_size_and_blocks(new_size, tmpfs_blocks_for_len(new_size));
+        file_data.truncate(new_size);
+        inode.set_size_and_blocks(new_size, file_data.blocks());
         inode.touch_mtime();
         inode.touch_ctime();
 
@@ -862,18 +983,7 @@ impl FileOps for TmpfsFileOps {
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        if offset > usize::MAX as u64 {
-            return Ok(0);
-        }
-
-        let start = (offset as usize).min(file_data.len());
-        let end = start
-            .checked_add(buf.len())
-            .unwrap_or(usize::MAX)
-            .min(file_data.len());
-        let n = end - start;
-
-        buf[..n].copy_from_slice(&file_data[start..end]);
+        let n = file_data.read_at(buf, offset);
         if n != 0
             && let Some(inode) = self.inode()
         {
@@ -891,30 +1001,22 @@ impl FileOps for TmpfsFileOps {
         };
 
         let start = if offset == u64::MAX {
-            file_data.len()
+            file_data.size
         } else if offset > usize::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         } else {
-            offset as usize
+            offset
         };
-        let end = start.checked_add(buf.len()).ok_or(VfsError::FileTooLarge)?;
 
-        if end > file_data.len() {
-            resize_file_data(file_data, end)?;
-        }
-
-        file_data[start..end].copy_from_slice(buf);
+        let n = file_data.write_at(buf, start)?;
         if let Some(inode) = self.inode() {
-            if inode.size() != file_data.len() as u64 {
-                let size = file_data.len() as u64;
-                inode.set_size_and_blocks(size, tmpfs_blocks_for_len(size));
-            }
-            if !buf.is_empty() {
+            inode.set_size_and_blocks(file_data.size, file_data.blocks());
+            if n != 0 {
                 inode.touch_mtime();
                 inode.touch_ctime();
             }
         }
-        Ok(buf.len())
+        Ok(n)
     }
 
     fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
@@ -930,12 +1032,11 @@ impl FileOps for TmpfsFileOps {
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        let end = end as usize;
-        if end > file_data.len() {
-            resize_file_data(file_data, end)?;
+        if end > file_data.size {
+            file_data.reserve(offset, len)?;
             if let Some(inode) = self.inode() {
-                let size = end as u64;
-                inode.set_size_and_blocks(size, tmpfs_blocks_for_len(size));
+                let size = file_data.size;
+                inode.set_size_and_blocks(size, file_data.blocks());
                 inode.touch_mtime();
                 inode.touch_ctime();
             }

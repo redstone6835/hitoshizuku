@@ -1,7 +1,8 @@
 //! POSIX 信号集与信号号码测试。
 //!
 //! 验证 SigSet 的位操作（has/with/without/union/intersection）与
-//! SignalNumber 的合法性检查和位转换。位 0 保留，信号 N 使用 bit N。
+//! SignalNumber 的合法性检查和位转换。信号 N 使用 bit(N - 1)，与用户态
+//! sigset 编码保持一致。
 
 extern crate std;
 
@@ -77,11 +78,11 @@ fn signal_number_from_raw_invalid() {
     assert!(SignalNumber::from_raw(-1).is_none());
 }
 
-/// 信号 N 的位掩码为 1 << N（位 0 保留不用）。
+/// 信号 N 的位掩码为 1 << (N - 1)。
 #[ktest]
 fn signal_number_bit() {
-    assert_eq!(SignalNumber::SIGKILL.bit(), 1 << 9);
-    assert_eq!(SignalNumber::SIGHUP.bit(), 1 << 1);
+    assert_eq!(SignalNumber::SIGKILL.bit(), 1 << 8);
+    assert_eq!(SignalNumber::SIGHUP.bit(), 1);
 }
 
 /// as_usize 返回信号编号的数值。

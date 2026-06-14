@@ -45,6 +45,12 @@ impl CapSet {
     pub const fn without(self, cap: Capability) -> Self {
         Self(self.0 & !(1u64 << (cap as u32)))
     }
+    pub const fn mask(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+    pub const fn contains_all(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -70,9 +76,12 @@ pub enum Capability {
     Setgid = 6,
     Setuid = 7,
     Setpcap = 8,
+    SysAdmin = 21,
     SysBoot = 22,
     SysNice = 23,
     SysResource = 24,
+    SysTime = 25,
+    CheckpointRestore = 40,
 }
 
 /// 进程凭据快照。写时复制——每次 setuid/setgid/capset 替换整个 `Arc<Credentials>`。
@@ -81,11 +90,22 @@ pub struct Credentials {
     pub uid: Uid,
     pub euid: Uid,
     pub suid: Uid,
+    /// 文件系统权限检查使用的 UID。它只影响 VFS DAC，不参与信号权限。
+    pub fsuid: Uid,
     pub gid: Gid,
     pub egid: Gid,
     pub sgid: Gid,
+    /// 文件系统权限检查使用的 GID。它只影响 VFS DAC，不参与信号权限。
+    pub fsgid: Gid,
     pub groups: Vec<Gid>,
+    /// Effective capability set used by kernel permission checks.
     pub caps: CapSet,
+    /// Linux permitted capability set exposed through capget/capset.
+    pub cap_permitted: CapSet,
+    /// Linux inheritable capability set exposed through capget/capset.
+    pub cap_inheritable: CapSet,
+    /// Linux capability bounding set, modified by PR_CAPBSET_DROP.
+    pub cap_bset: CapSet,
 }
 
 impl Credentials {
@@ -95,11 +115,16 @@ impl Credentials {
             uid: Uid::ROOT,
             euid: Uid::ROOT,
             suid: Uid::ROOT,
+            fsuid: Uid::ROOT,
             gid: Gid::ROOT,
             egid: Gid::ROOT,
             sgid: Gid::ROOT,
+            fsgid: Gid::ROOT,
             groups: Vec::new(),
             caps: CapSet::FULL,
+            cap_permitted: CapSet::FULL,
+            cap_inheritable: CapSet::EMPTY,
+            cap_bset: CapSet::FULL,
         }
     }
 
@@ -109,11 +134,16 @@ impl Credentials {
             uid,
             euid: uid,
             suid: uid,
+            fsuid: uid,
             gid,
             egid: gid,
             sgid: gid,
+            fsgid: gid,
             groups: Vec::new(),
             caps: CapSet::EMPTY,
+            cap_permitted: CapSet::EMPTY,
+            cap_inheritable: CapSet::EMPTY,
+            cap_bset: CapSet::EMPTY,
         }
     }
 

@@ -14,6 +14,6 @@ pub fn register_arch_hooks() {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("not implemented");
+        arch::register_entropy_source();
     }
 }

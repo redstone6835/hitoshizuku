@@ -1,6 +1,8 @@
-//! smoltcp `phy::Device` 适配层。
+//! 协议引擎 `phy::Device` 适配层。
 //!
-//! 本模块是 `libs/net` 与 smoltcp 之间**唯一的耦合点**。
+//! 本模块只负责把内核网络驱动抽象接到当前协议引擎的设备接口。IP/socket
+//! 语义和时间转换分别收敛在 `interface.rs`、`stack.rs` 和 `time.rs`，避免
+//! 驱动层直接感知具体协议栈实现。
 //!
 //! # 性能与安全的平衡
 //!
@@ -38,7 +40,7 @@ impl NetDeviceAdapter {
 }
 
 impl Device for NetDeviceAdapter {
-    type RxToken<'a> = AdapterRxToken;
+    type RxToken<'a> = AdapterRxToken<'a>;
     type TxToken<'a> = AdapterTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
@@ -50,7 +52,13 @@ impl Device for NetDeviceAdapter {
             driver: &self.driver,
             device: &self.device,
         };
-        Some((AdapterRxToken(rx_buf), tx_token))
+        Some((
+            AdapterRxToken {
+                buf: rx_buf,
+                driver: &self.driver,
+            },
+            tx_token,
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -72,8 +80,8 @@ impl Device for NetDeviceAdapter {
         // Ethernet medium 的 MTU 是完整链路帧大小；IP medium 没有二层头，
         // 直接把 driver 暴露的 IP MTU 交给 smoltcp。
         caps.max_transmission_unit = match self.driver.medium() {
-            LinkMedium::Ethernet => self.driver.mtu() + 14,
-            LinkMedium::Ip => self.driver.mtu(),
+            LinkMedium::Ethernet => self.device.mtu() + 14,
+            LinkMedium::Ip => self.device.mtu(),
         };
         caps
     }
@@ -82,14 +90,19 @@ impl Device for NetDeviceAdapter {
 // ── RxToken ──────────────────────────────────────────────────────────────────
 
 /// smoltcp 接收令牌——零拷贝包装一个已接收的 [`RxBuf`]。
-pub struct AdapterRxToken(RxBuf);
+pub struct AdapterRxToken<'a> {
+    buf: RxBuf,
+    driver: &'a Arc<dyn NetDriver>,
+}
 
-impl phy::RxToken for AdapterRxToken {
+impl<'a> phy::RxToken for AdapterRxToken<'a> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.0.as_slice())
+        let result = f(self.buf.as_slice());
+        self.driver.recycle_rx(self.buf);
+        result
     }
 }
 
@@ -108,10 +121,11 @@ impl<'a> phy::TxToken for AdapterTxToken<'a> {
     {
         // 热路径：smoltcp 已保证 len ≤ MTU；设备状态已在 transmit() 入口验证
         let Some(mut tx_buf) = self.driver.alloc_tx(len) else {
-            // TX 队列满或驱动 teardown——记录丢帧统计后返回零长 buffer
+            // TX 队列满或驱动 teardown——记录丢帧统计后写入丢弃缓冲，
+            // 避免协议 emit 按请求长度写包头时撞上零长 slice。
             self.device.inc_tx_dropped();
-            let mut discard = [0u8; 0];
-            return f(&mut discard);
+            let mut discard = alloc::vec![0u8; len];
+            return f(discard.as_mut_slice());
         };
         // 防御性 assert：驱动 bug 触发越界写时确定性 panic 而非 UB
         assert!(
@@ -124,5 +138,75 @@ impl<'a> phy::TxToken for AdapterTxToken<'a> {
         tx_buf.set_len(len);
         self.driver.commit_tx(tx_buf);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use core::any::Any;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use smoltcp::phy::TxToken;
+
+    use super::*;
+    use crate::driver::{Duplex, LinkState, TxBuf};
+
+    struct FailingTxDriver {
+        commits: AtomicUsize,
+    }
+
+    impl NetDriver for FailingTxDriver {
+        fn poll_rx(&self) -> Option<RxBuf> {
+            None
+        }
+
+        fn alloc_tx(&self, _len: usize) -> Option<TxBuf> {
+            None
+        }
+
+        fn commit_tx(&self, _buf: TxBuf) {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn link_state(&self) -> LinkState {
+            LinkState::Up {
+                speed_mbps: None,
+                duplex: Duplex::Full,
+            }
+        }
+
+        fn mac_address(&self) -> [u8; 6] {
+            [0; 6]
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn tx_alloc_failure_uses_sized_discard_buffer() {
+        let concrete = Arc::new(FailingTxDriver {
+            commits: AtomicUsize::new(0),
+        });
+        let driver: Arc<dyn NetDriver> = concrete.clone();
+        let device = Arc::new(NetDevice::new("tx-fail", Arc::clone(&driver)));
+        let token = AdapterTxToken {
+            driver: &driver,
+            device: &device,
+        };
+
+        let written = token.consume(64, |buf| {
+            assert_eq!(buf.len(), 64);
+            for byte in buf.iter_mut() {
+                *byte = 0xa5;
+            }
+            buf.len()
+        });
+
+        assert_eq!(written, 64);
+        assert_eq!(device.tx_dropped(), 1);
+        assert_eq!(concrete.commits.load(Ordering::Relaxed), 0);
     }
 }

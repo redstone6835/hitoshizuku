@@ -12,8 +12,9 @@
 //! 这样一来，路由逻辑可以根据统一请求模型做决策，而释放、重分配和统计代码也能
 //! 依赖统一记录格式，不需要再回头猜测原始上下文。
 use core::alloc::Layout;
+use core::fmt;
 
-use crate::buddy::PAGE_SIZE;
+use crate::buddy::{MAX_TRACKED_ORDER, PAGE_SIZE};
 use crate::gc::TraceDescriptor;
 
 /// 内存请求所属的逻辑域。
@@ -90,6 +91,21 @@ pub enum Zeroing {
     Zeroed,
 }
 
+/// 分配请求在进入后端前的规范化错误。
+///
+/// 这里刻意放在 request 层，而不是让 slab/kheap/buddy 各自解释非法参数：外部扩展
+/// 只要拿到一个请求对象，就可以先调用 `validate()` / `layout()` / `required_order()`
+/// 做同一套边界检查，避免不同后端对 size=0、非 2 次幂对齐或超大 order 给出互相
+/// 矛盾的行为。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationRequestError {
+    InvalidSize,
+    InvalidAlignment,
+    SizeOverflow,
+    UnsupportedOrder,
+    InvalidPlacement,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManagedAllocFlags {
     pub pinned: bool,
@@ -151,7 +167,7 @@ impl MemoryRequest {
             align,
             page_policy: PagePolicy::BaseOnly,
             placement: MemoryPlacement::Any,
-            reclaim: ReclaimPolicy::TryManagedGc,
+            reclaim: ReclaimPolicy::TryAllocatorReclaim,
             zeroing: Zeroing::Uninitialized,
             managed: ManagedAllocFlags::new(),
         }
@@ -199,6 +215,27 @@ impl MemoryRequest {
         self.managed = managed;
         self
     }
+
+    /// 校验通用内存请求的基础 layout 约束。
+    ///
+    /// typed allocator API 不再把 `size=0` 或 `align=0` 静默改写成 1。这样做可以把调用方
+    /// bug 挡在入口处，也避免 registry 中出现“实际分配 1 字节、记录大小 0 字节”的对象。
+    pub fn validate(self) -> Result<Self, AllocationRequestError> {
+        self.layout()?;
+        Ok(self)
+    }
+
+    /// 将请求转换成 Rust `Layout`，同时保留 allocator 自己的错误语义。
+    pub fn layout(self) -> Result<Layout, AllocationRequestError> {
+        if self.size == 0 {
+            return Err(AllocationRequestError::InvalidSize);
+        }
+        if self.align == 0 || !self.align.is_power_of_two() {
+            return Err(AllocationRequestError::InvalidAlignment);
+        }
+        Layout::from_size_align(self.size, self.align)
+            .map_err(|_| AllocationRequestError::SizeOverflow)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +265,51 @@ impl PhysicalAllocRequest {
         self.placement = placement;
         self
     }
+
+    /// 校验物理页请求，并返回原请求方便链式使用。
+    pub fn validate(self) -> Result<Self, AllocationRequestError> {
+        self.required_order()?;
+        Ok(self)
+    }
+
+    /// 计算满足 size、align、page policy 和 exact placement 的 buddy order。
+    ///
+    /// 这是物理页 API 的标准入口。它带上了上界检查，避免极大 size 让 order 推导时左移
+    /// 溢出或陷入循环；buddy 后端和外部扩展都应复用这里的结果语义。
+    pub fn required_order(self) -> Result<usize, AllocationRequestError> {
+        const MIN_LARGE_PAGE_ORDER: usize = 9;
+
+        if self.size == 0 {
+            return Err(AllocationRequestError::InvalidSize);
+        }
+        if self.align == 0 || !self.align.is_power_of_two() {
+            return Err(AllocationRequestError::InvalidAlignment);
+        }
+
+        let size_pages = pages_for_checked(self.size)?;
+        let align_pages = pages_for_checked(self.align.max(PAGE_SIZE))?;
+        let min_pages = size_pages.max(align_pages);
+        let mut order = pages_to_order_bounded(min_pages)?;
+        if matches!(self.page_policy, PagePolicy::RequireLarge) {
+            order = order.max(MIN_LARGE_PAGE_ORDER);
+        }
+        if order > MAX_TRACKED_ORDER {
+            return Err(AllocationRequestError::UnsupportedOrder);
+        }
+
+        if let MemoryPlacement::ExactPhys(addr) = self.placement {
+            let block_size = block_size_for_order(order)?;
+            if addr & (block_size - 1) != 0 {
+                return Err(AllocationRequestError::InvalidPlacement);
+            }
+        }
+        Ok(order)
+    }
+
+    /// 返回该物理页请求最终会保留的字节数。
+    pub fn reserved_size(self) -> Result<usize, AllocationRequestError> {
+        block_size_for_order(self.required_order()?)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +320,7 @@ pub struct PhysicalAllocation {
     pub page_size: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AllocationRecord {
     pub kind: AllocationKind,
     pub domain: MemoryDomain,
@@ -250,6 +332,13 @@ pub struct AllocationRecord {
     pub align: usize,
     pub order: usize,
     pub page_size: usize,
+    /// 后端私有定位 cookie。
+    ///
+    /// 这个字段不属于外部所有权语义，只给 allocator 内部热路径使用。例如 slab 会在
+    /// registry record 里保存所属 `SlabNode` 地址，释放时即可直接回到对应 slab，而不必
+    /// 再按 size class 扫描整条 slab 链。外部扩展应通过公开字段理解对象属性，不能依赖
+    /// 该值的格式或稳定性。
+    pub(crate) backend_cookie: usize,
 }
 
 impl AllocationRecord {
@@ -265,6 +354,7 @@ impl AllocationRecord {
             align: 1,
             order: 0,
             page_size: PAGE_SIZE,
+            backend_cookie: 0,
         }
     }
 
@@ -286,4 +376,68 @@ impl AllocationRecord {
         self.align = align;
         self
     }
+
+    pub(crate) const fn with_backend_cookie(mut self, backend_cookie: usize) -> Self {
+        self.backend_cookie = backend_cookie;
+        self
+    }
+}
+
+impl fmt::Debug for AllocationRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // backend_cookie 可能保存 slab 元数据地址。它只参与 allocator 内部快速定位和一致性
+        // 比较，不应在普通日志或外部 Debug 输出中泄露。
+        f.debug_struct("AllocationRecord")
+            .field("kind", &self.kind)
+            .field("domain", &self.domain)
+            .field("arena", &self.arena)
+            .field("ptr", &self.ptr)
+            .field("paddr", &self.paddr)
+            .field("size", &self.size)
+            .field("usable_size", &self.usable_size)
+            .field("align", &self.align)
+            .field("order", &self.order)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
+}
+
+#[inline]
+fn pages_for_checked(bytes: usize) -> Result<usize, AllocationRequestError> {
+    if bytes == 0 {
+        return Err(AllocationRequestError::InvalidSize);
+    }
+    Ok(bytes.div_ceil(PAGE_SIZE).max(1))
+}
+
+#[inline]
+fn pages_to_order_bounded(pages: usize) -> Result<usize, AllocationRequestError> {
+    let max_pages = 1usize
+        .checked_shl(MAX_TRACKED_ORDER as u32)
+        .ok_or(AllocationRequestError::UnsupportedOrder)?;
+    if pages > max_pages {
+        return Err(AllocationRequestError::UnsupportedOrder);
+    }
+
+    let mut order = 0usize;
+    let mut block = 1usize;
+    while block < pages {
+        if order >= MAX_TRACKED_ORDER {
+            return Err(AllocationRequestError::UnsupportedOrder);
+        }
+        block <<= 1;
+        order += 1;
+    }
+    Ok(order)
+}
+
+#[inline]
+fn block_size_for_order(order: usize) -> Result<usize, AllocationRequestError> {
+    if order > MAX_TRACKED_ORDER {
+        return Err(AllocationRequestError::UnsupportedOrder);
+    }
+    (1usize
+        .checked_shl(order as u32)
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE)))
+    .ok_or(AllocationRequestError::SizeOverflow)
 }

@@ -127,12 +127,26 @@ fn register_block_fs_name(
     name: &'static str,
     driver: &'static dyn BlockFsDriver,
     auto_detect: bool,
-) -> VfsResult<usize> {
+) -> VfsResult<()> {
+    if let Some(existing) = FS_REGISTRY.find(name) {
+        // 块文件系统的主名和别名都可能在多条启动路径中重复注册。已有条目如果
+        // 指向同一个底层 driver，说明这是幂等重入；如果同名被其它 FsDriver
+        // 占用，则必须报告冲突，不能静默覆盖 mount 语义。
+        let Some(adapter) = existing.as_any().downcast_ref::<BlockFsAdapter>() else {
+            return Err(VfsError::AlreadyExists);
+        };
+        if adapter.driver.name() == driver.name() {
+            return Ok(());
+        }
+        return Err(VfsError::AlreadyExists);
+    }
+
     FS_REGISTRY.register(Box::leak(Box::new(BlockFsAdapter::new(
         name,
         driver,
         auto_detect,
-    ))))
+    ))))?;
+    Ok(())
 }
 
 pub fn mount_block_source_auto(

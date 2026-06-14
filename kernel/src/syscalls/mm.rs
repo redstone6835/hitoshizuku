@@ -3,7 +3,7 @@
 use alloc::sync::Arc;
 
 use errno::Errno;
-use general::mm::VmSpace;
+use general::mm::{VmSpace, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::current_fdtable;
 use mm::VmFlags;
@@ -18,6 +18,21 @@ const MAP_PRIVATE: usize = 0x02;
 const MAP_FIXED: usize = 0x10;
 const MAP_ANONYMOUS: usize = 0x20;
 const MAP_FIXED_NOREPLACE: usize = 0x100000;
+
+const MS_ASYNC: usize = 1;
+const MS_INVALIDATE: usize = 2;
+const MS_SYNC: usize = 4;
+const MS_SUPPORTED: usize = MS_ASYNC | MS_INVALIDATE | MS_SYNC;
+
+const MCL_CURRENT: usize = 1;
+const MCL_FUTURE: usize = 2;
+const MCL_ONFAULT: usize = 4;
+const MCL_SUPPORTED: usize = MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT;
+const MLOCK_ONFAULT: usize = 1;
+
+const MREMAP_MAYMOVE: usize = 1;
+const MREMAP_FIXED: usize = 2;
+const MREMAP_DONTUNMAP: usize = 4;
 
 pub(super) fn sys_brk(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let Some(vm) = task_vm(ctx) else {
@@ -140,16 +155,257 @@ pub(super) fn sys_mprotect(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     Ok(0)
 }
 
-pub(super) fn sys_madvise(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_madvise(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const MADV_NORMAL: usize = 0;
+    const MADV_RANDOM: usize = 1;
+    const MADV_SEQUENTIAL: usize = 2;
+    const MADV_WILLNEED: usize = 3;
+    const MADV_DONTNEED: usize = 4;
+
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let addr = ctx.args[0];
+    let len = ctx.args[1];
+    let advice = ctx.args[2];
+    if !matches!(
+        advice,
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED | MADV_DONTNEED
+    ) {
+        return Err(Errno::EINVAL);
+    }
+
+    let page_size = hal::memory::page_size();
+    if addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let range = addr..end;
+    match advice {
+        MADV_DONTNEED => vm.discard_resident_range(range)?,
+        // 这些 advice 只影响后续访问策略；当前 VM 没有策略状态，完成可见校验即可。
+        MADV_NORMAL | MADV_RANDOM | MADV_SEQUENTIAL | MADV_WILLNEED => {
+            vm.contains_user_range(range)?
+        }
+        _ => unreachable!(),
+    }
     Ok(0)
 }
 
-pub(super) fn sys_mremap(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+pub(super) fn sys_mremap(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let old_addr = ctx.args[0];
+    let old_size = ctx.args[1];
+    let new_size = ctx.args[2];
+    let flags = ctx.args[3];
+    let new_addr = ctx.args[4];
+    let page_size = hal::memory::page_size();
+    if old_addr % page_size != 0 || old_size == 0 || new_size == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MREMAP_DONTUNMAP) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if (flags & MREMAP_FIXED) != 0 && (flags & MREMAP_MAYMOVE) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MREMAP_FIXED) != 0 && new_addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let old_len = align_up(old_size, page_size).ok_or(Errno::EINVAL)?;
+    let new_len = align_up(new_size, page_size).ok_or(Errno::EINVAL)?;
+    let old_end = old_addr.checked_add(old_len).ok_or(Errno::EINVAL)?;
+    let fixed = if (flags & MREMAP_FIXED) != 0 {
+        Some(new_addr)
+    } else {
+        None
+    };
+    vm.mremap(
+        old_addr..old_end,
+        new_len,
+        (flags & MREMAP_MAYMOVE) != 0,
+        fixed,
+    )
+}
+
+pub(super) fn sys_swapon(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_swapoff(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_msync(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let addr = ctx.args[0];
+    let len = ctx.args[1];
+    let flags = ctx.args[2];
+    if (flags & !MS_SUPPORTED) != 0 || (flags & MS_ASYNC) != 0 && (flags & MS_SYNC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let range = page_aligned_range(addr, len)?;
+    if (flags & MS_ASYNC) == 0 {
+        vm.sync_range(range)?;
+    }
+    Ok(0)
+}
+
+pub(super) fn sys_mlock(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    if let Some(range) = rounded_page_range(ctx.args[0], ctx.args[1])? {
+        vm.mlock_range(range)?;
+    }
+    Ok(0)
+}
+
+pub(super) fn sys_munlock(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    if let Some(range) = rounded_page_range(ctx.args[0], ctx.args[1])? {
+        vm.munlock_range(range)?;
+    }
+    Ok(0)
+}
+
+pub(super) fn sys_mlockall(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let flags = ctx.args[0];
+    if flags == 0 || (flags & !MCL_SUPPORTED) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MCL_ONFAULT) != 0 && (flags & (MCL_CURRENT | MCL_FUTURE)) == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if (flags & MCL_CURRENT) != 0 {
+        vm.mlock_all_current();
+    }
+    if (flags & MCL_FUTURE) != 0 {
+        vm.set_mlock_future(true);
+    }
+    Ok(0)
+}
+
+pub(super) fn sys_munlockall(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    vm.munlock_all();
+    Ok(0)
+}
+
+pub(super) fn sys_mincore(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let vm = task_vm(ctx).ok_or(Errno::ENOMEM)?;
+    let addr = ctx.args[0];
+    let len = ctx.args[1];
+    let vec_user = ctx.args[2];
+    let page_size = hal::memory::page_size();
+    if addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    if vec_user == 0 {
+        return Err(Errno::EFAULT);
+    }
+
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let range = addr..end;
+    let bitmap = vm.resident_bitmap(range)?;
+    copy_to_user(vec_user, &bitmap).map_err(|e| e.as_errno())?;
+    Ok(0)
+}
+
+pub(super) fn sys_remap_file_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mbind(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_get_mempolicy(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_set_mempolicy(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_migrate_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_move_pages(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_process_vm_readv(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_process_vm_writev(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_userfaultfd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mlock2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let flags = ctx.args[2];
+    if (flags & !MLOCK_ONFAULT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    sys_mlock(ctx)
+}
+
+pub(super) fn sys_pkey_mprotect(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pkey_alloc(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_pkey_free(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_process_madvise(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_memfd_secret(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_set_mempolicy_home_node(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_cachestat(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_map_shadow_stack(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Err(Errno::ENOSYS)
+}
+
+pub(super) fn sys_mseal(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     Err(Errno::ENOSYS)
 }
 
 fn task_vm(ctx: &SyscallContext<'_>) -> Option<Arc<VmSpace>> {
-    let payload = ctx.task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    let payload = ctx.task().ext_lookup(sched::TASKEXT_VM_SPACE)?;
     payload.downcast::<VmSpace>().ok()
 }
 
@@ -196,4 +452,31 @@ fn prot_to_vm_flags(prot: usize) -> VmFlags {
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
     Some(value.checked_add(align - 1)? & !(align - 1))
+}
+
+fn page_aligned_range(addr: usize, len: usize) -> Result<core::ops::Range<usize>, Errno> {
+    let page_size = hal::memory::page_size();
+    if addr % page_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let len = align_up(len, page_size).ok_or(Errno::EINVAL)?;
+    if len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    Ok(addr..end)
+}
+
+fn rounded_page_range(addr: usize, len: usize) -> Result<Option<core::ops::Range<usize>>, Errno> {
+    if len == 0 {
+        return Ok(None);
+    }
+    let page_size = hal::memory::page_size();
+    let start = addr & !(page_size - 1);
+    let raw_end = addr.checked_add(len).ok_or(Errno::EINVAL)?;
+    let end = align_up(raw_end, page_size).ok_or(Errno::EINVAL)?;
+    if start >= end {
+        return Ok(None);
+    }
+    Ok(Some(start..end))
 }

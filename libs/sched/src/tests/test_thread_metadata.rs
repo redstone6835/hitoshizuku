@@ -8,8 +8,8 @@ use alloc::sync::Weak;
 use ktest::ktest;
 
 use crate::{
-    NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedParams, Session, TASK_COMM_LEN,
-    Task, ThreadGroup, supported_cpu_mask,
+    CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedAttr,
+    SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
 };
 
 fn make_task() -> alloc::sync::Arc<Task> {
@@ -67,4 +67,139 @@ fn supported_cpu_mask_matches_configured_capacity() {
     let task = make_task();
     task.set_cpu_affinity(0);
     assert_eq!(task.cpu_affinity(), 1);
+    task.set_cpu_affinity(u64::MAX);
+    assert_eq!(task.cpu_affinity(), supported_cpu_mask());
+}
+
+#[ktest]
+fn runqueue_pick_respects_cpu_affinity_mask() {
+    let task0 = make_task();
+    let task1 = make_task();
+    task0.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    task1.set_cpu_affinity(CpuMask::single_raw(1).bits());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task0), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&task1), 1);
+
+    let picked = rq
+        .pick_next_on(2, CpuMask::single_raw(1).bits())
+        .expect("cpu1 should find an allowed task");
+    assert!(alloc::sync::Arc::ptr_eq(&picked, &task1));
+
+    assert!(rq.dequeue(&task0, 3));
+    assert!(rq.dequeue(&task1, 3));
+}
+
+#[ktest]
+fn runqueue_migratable_load_excludes_idle_class() {
+    let fair = make_task();
+    let idle = make_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&idle), 1);
+
+    assert_eq!(rq.nr_running(), 2);
+    assert_eq!(rq.migratable_load(), 1);
+
+    assert!(rq.dequeue(&fair, 2));
+    assert!(rq.dequeue(&idle, 2));
+}
+
+#[ktest]
+fn runqueue_migratable_load_filters_cpu_affinity() {
+    let cpu0 = make_task();
+    let cpu1 = make_task();
+    cpu0.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    cpu1.set_cpu_affinity(CpuMask::single_raw(1).bits());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&cpu0), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&cpu1), 1);
+
+    assert_eq!(rq.migratable_load(), 2);
+    assert_eq!(rq.migratable_load_for(CpuMask::single_raw(0).bits()), 1);
+    assert_eq!(rq.migratable_load_for(CpuMask::single_raw(1).bits()), 1);
+    assert_eq!(rq.migratable_load_for(CpuMask::single_raw(2).bits()), 0);
+
+    assert!(rq.dequeue(&cpu0, 2));
+    assert!(rq.dequeue(&cpu1, 2));
+}
+
+#[ktest]
+fn runqueue_take_migratable_respects_cpu_affinity() {
+    let cpu0 = make_task();
+    let cpu1 = make_task();
+    cpu0.set_cpu_affinity(CpuMask::single_raw(0).bits());
+    cpu1.set_cpu_affinity(CpuMask::single_raw(1).bits());
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&cpu0), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&cpu1), 1);
+
+    let pulled = rq
+        .take_migratable(CpuMask::single_raw(1).bits(), 2)
+        .expect("cpu1 should pull an affinity-compatible task");
+    assert!(alloc::sync::Arc::ptr_eq(&pulled, &cpu1));
+    assert!(!pulled.sched.on_rq());
+    assert_eq!(rq.migratable_load(), 1);
+    assert!(
+        rq.take_migratable(CpuMask::single_raw(2).bits(), 3)
+            .is_none()
+    );
+
+    assert!(rq.dequeue(&cpu0, 4));
+}
+
+#[ktest]
+fn runqueue_take_migratable_preserves_fair_lag() {
+    let early = make_task();
+    let late = make_task();
+    early.sched.store_vruntime(100);
+    late.sched.store_vruntime(300);
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&early), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&late), 1);
+
+    let pulled = rq
+        .take_migratable(CpuMask::single_raw(0).bits(), 2)
+        .expect("fair task should be migratable");
+    assert!(alloc::sync::Arc::ptr_eq(&pulled, &late));
+    assert_eq!(pulled.sched.lag(), -200);
+
+    assert!(rq.dequeue(&early, 3));
+}
+
+#[ktest]
+fn runqueue_update_nice_keeps_policy_and_slice() {
+    let task = make_task();
+    task.sched
+        .set_sched_attr(SchedAttr::rt_round_robin(20, 50_000_000));
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&task), 1);
+    rq.update_nice(&task, 10, 2);
+
+    let attr = task.sched.sched_attr();
+    assert_eq!(attr.policy, SchedPolicy::RtRoundRobin);
+    assert_eq!(attr.priority, 20);
+    assert_eq!(attr.slice_ns, 50_000_000);
+    assert_eq!(attr.nice, 10);
+
+    assert!(rq.dequeue(&task, 3));
+}
+
+#[ktest]
+fn runqueue_update_wrong_queue_does_not_mutate_entity() {
+    let task = make_task();
+    task.sched.set_on_rq(true);
+    task.set_current_cpu(1);
+
+    let rq = Runqueue::new();
+    assert!(!rq.update_nice(&task, -10, 1));
+    assert_eq!(task.sched.nice(), 0);
+    assert!(task.sched.on_rq());
 }

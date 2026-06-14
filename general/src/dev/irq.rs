@@ -7,11 +7,13 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 
 use vfs::sync::Spinlock;
 
+use super::registry_id;
 use crate::Interrupt;
+use crate::dev::pnp::{self, PnpDependency, PnpHandleResource, PnpResourceKind};
 
 #[derive(Clone, Copy)]
 pub struct IrqLineOps {
@@ -91,6 +93,87 @@ pub trait IrqHandler: Send + Sync {
     fn handle_irq(&self, line: IrqLine) -> IrqStatus;
 }
 
+/// IRQ 触发模式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqTrigger {
+    Edge,
+    Level,
+}
+
+/// IRQ 有效电平/边沿极性。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqPolarity {
+    High,
+    Low,
+}
+
+/// IRQ handler 共享策略。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqSharing {
+    /// 该 line 只能有一个 handler。
+    Exclusive,
+    /// 该 line 可以挂多个 handler，dispatch 时逐个调用。
+    Shared,
+}
+
+/// IRQ bottom-half 回调。
+///
+/// 当前 registry 会先在锁外运行 top-half；当 top-half 返回 `Handled` 后，再同步
+/// 调用该回调，用于把较重的设备侧收尾逻辑从 fast handler 里拆出来。控制器线的
+/// mask/ack/unmask 生命周期由对应 [`IrqDomain`] 的 `set_line_enabled`、
+/// `configure_line` 以及控制器驱动的 demux/ack 过程表达；如果后续接入可调度的
+/// threaded IRQ，仍可复用当前 request 结构，仅替换 bottom-half 调度策略。
+pub trait IrqBottomHalf: Send + Sync {
+    fn run_bottom_half(&self, line: IrqLine);
+}
+
+/// IRQ 注册请求。
+///
+/// 这是设备驱动面向 IRQ core 的完整声明：要消费哪条 line、是否允许共享、
+/// 固件解析出的触发/极性，以及资源所有者的诊断标签。旧入口会构造 shared
+/// request，保持既有多 handler 行为。
+pub struct IrqRequest {
+    pub line: IrqLine,
+    pub handler: Arc<dyn IrqHandler>,
+    pub owner: &'static str,
+    pub sharing: IrqSharing,
+    pub trigger: Option<IrqTrigger>,
+    pub polarity: Option<IrqPolarity>,
+    pub bottom_half: Option<Arc<dyn IrqBottomHalf>>,
+}
+
+impl IrqRequest {
+    pub fn shared(line: IrqLine, owner: &'static str, handler: Arc<dyn IrqHandler>) -> Self {
+        Self {
+            line,
+            handler,
+            owner,
+            sharing: IrqSharing::Shared,
+            trigger: None,
+            polarity: None,
+            bottom_half: None,
+        }
+    }
+
+    pub fn exclusive(line: IrqLine, owner: &'static str, handler: Arc<dyn IrqHandler>) -> Self {
+        Self {
+            sharing: IrqSharing::Exclusive,
+            ..Self::shared(line, owner, handler)
+        }
+    }
+
+    pub const fn with_trigger(mut self, trigger: IrqTrigger, polarity: IrqPolarity) -> Self {
+        self.trigger = Some(trigger);
+        self.polarity = Some(polarity);
+        self
+    }
+
+    pub fn with_bottom_half(mut self, bottom_half: Arc<dyn IrqBottomHalf>) -> Self {
+        self.bottom_half = Some(bottom_half);
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IrqError {
     OutOfMemory,
@@ -117,7 +200,12 @@ impl IrqHandle {
 struct IrqRegistration {
     id: u64,
     line: IrqLine,
+    _owner: &'static str,
+    sharing: IrqSharing,
+    _trigger: Option<IrqTrigger>,
+    _polarity: Option<IrqPolarity>,
     handler: Arc<dyn IrqHandler>,
+    bottom_half: Option<Arc<dyn IrqBottomHalf>>,
 }
 
 pub struct IrqRegistry {
@@ -133,18 +221,42 @@ impl IrqRegistry {
         }
     }
 
+    pub fn register_request(&self, request: IrqRequest) -> Result<IrqHandle, IrqError> {
+        if !configure_irq_line(request.line, request.trigger, request.polarity) {
+            return Err(IrqError::NotFound);
+        }
+        let mut handlers = self.handlers.lock();
+        if handlers.iter().any(|entry| {
+            entry.line == request.line
+                && (entry.sharing == IrqSharing::Exclusive
+                    || request.sharing == IrqSharing::Exclusive)
+        }) {
+            return Err(IrqError::AlreadyRegistered);
+        }
+        handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
+        let line = request.line;
+        handlers.push(IrqRegistration {
+            id,
+            line,
+            _owner: request.owner,
+            sharing: request.sharing,
+            _trigger: request.trigger,
+            _polarity: request.polarity,
+            handler: request.handler,
+            bottom_half: request.bottom_half,
+        });
+        drop(handlers);
+        enable_irq_line(line);
+        Ok(IrqHandle { id, line })
+    }
+
     pub fn register(
         &self,
         line: IrqLine,
         handler: Arc<dyn IrqHandler>,
     ) -> Result<IrqHandle, IrqError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut handlers = self.handlers.lock();
-        handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
-        handlers.push(IrqRegistration { id, line, handler });
-        drop(handlers);
-        enable_irq_line(line);
-        Ok(IrqHandle { id, line })
+        self.register_request(IrqRequest::shared(line, "legacy-irq-handler", handler))
     }
 
     pub fn unregister(&self, handle: IrqHandle) -> Result<(), IrqError> {
@@ -175,9 +287,15 @@ impl IrqRegistry {
                     .iter()
                     .filter(|entry| entry.line == line && entry.id > last_id)
                     .min_by_key(|entry| entry.id)
-                    .map(|entry| (entry.id, Arc::clone(&entry.handler)))
+                    .map(|entry| {
+                        (
+                            entry.id,
+                            Arc::clone(&entry.handler),
+                            entry.bottom_half.as_ref().map(Arc::clone),
+                        )
+                    })
             };
-            let Some((id, handler)) = next else {
+            let Some((id, handler, bottom_half)) = next else {
                 break;
             };
 
@@ -185,7 +303,13 @@ impl IrqRegistry {
             // 分发子线。handler 调用必须发生在 registry 锁外，否则 PCH/EIOINTC
             // 这类树形 IRQ 拓扑会递归拿同一把 Spinlock 并死锁。
             last_id = id;
-            handled |= handler.handle_irq(line).is_handled();
+            let status = handler.handle_irq(line);
+            if status.is_handled() {
+                handled = true;
+                if let Some(bottom_half) = bottom_half {
+                    bottom_half.run_bottom_half(line);
+                }
+            }
         }
 
         handled
@@ -201,6 +325,8 @@ impl Default for IrqRegistry {
 static IRQ_REGISTRY: IrqRegistry = IrqRegistry::new();
 static IRQ_LINE_OPS: Spinlock<Option<IrqLineOps>> = Spinlock::new(None);
 static IOCSR_OPS: Spinlock<Option<IocsrOps>> = Spinlock::new(None);
+static DEFAULT_IRQ_DOMAIN: Spinlock<Option<DefaultIrqDomainRegistration>> = Spinlock::new(None);
+static NEXT_DEFAULT_IRQ_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
 pub trait IrqDomain: Send + Sync {
     /// 将固件中断 specifier 翻译成规范化 [`IrqLine`]。
@@ -217,31 +343,54 @@ pub trait IrqDomain: Send + Sync {
     fn set_line_enabled(&self, _hwirq: u32, _enabled: bool) -> bool {
         false
     }
+
+    /// 配置 domain 内部硬件线的触发/极性。
+    ///
+    /// 固件已提供该信息时，IRQ registry 在 handler 注册前调用。默认返回 `true`
+    /// 表示该 domain 接受默认配置；需要真实落寄存器的 controller 应覆盖它。
+    fn configure_line(
+        &self,
+        _hwirq: u32,
+        _trigger: Option<IrqTrigger>,
+        _polarity: Option<IrqPolarity>,
+    ) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IrqDomainHandle {
     controller: u32,
+    id: u64,
 }
 
 impl IrqDomainHandle {
     pub const fn controller(self) -> u32 {
         self.controller
     }
+
+    pub const fn id(self) -> u64 {
+        self.id
+    }
 }
 
 struct IrqDomainRegistration {
     controller: u32,
+    // 同一个 controller 可以在热移除后重新注册。句柄必须带注册代次，旧句柄
+    // 不能注销后来安装的新 domain。
+    id: u64,
     domain: Arc<dyn IrqDomain>,
 }
 
 pub struct IrqDomainRegistry {
+    next_id: AtomicU64,
     domains: Spinlock<Vec<IrqDomainRegistration>>,
 }
 
 impl IrqDomainRegistry {
     pub const fn new() -> Self {
         Self {
+            next_id: AtomicU64::new(1),
             domains: Spinlock::new(Vec::new()),
         }
     }
@@ -256,15 +405,23 @@ impl IrqDomainRegistry {
             return Err(IrqError::AlreadyRegistered);
         }
         domains.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
-        domains.push(IrqDomainRegistration { controller, domain });
-        Ok(IrqDomainHandle { controller })
+        let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
+        domains.push(IrqDomainRegistration {
+            controller,
+            id,
+            domain,
+        });
+        let handle = IrqDomainHandle { controller, id };
+        drop(domains);
+        pnp::notify_dependency_ready(PnpDependency::IrqController(controller));
+        Ok(handle)
     }
 
     pub fn unregister(&self, handle: IrqDomainHandle) -> Result<(), IrqError> {
         let mut domains = self.domains.lock();
         let Some(index) = domains
             .iter()
-            .position(|entry| entry.controller == handle.controller)
+            .position(|entry| entry.controller == handle.controller && entry.id == handle.id)
         else {
             return Err(IrqError::NotFound);
         };
@@ -288,6 +445,17 @@ impl IrqDomainRegistry {
         self.domain(controller)
             .is_some_and(|domain| domain.set_line_enabled(hwirq, enabled))
     }
+
+    pub fn configure_line(
+        &self,
+        controller: u32,
+        hwirq: u32,
+        trigger: Option<IrqTrigger>,
+        polarity: Option<IrqPolarity>,
+    ) -> bool {
+        self.domain(controller)
+            .is_some_and(|domain| domain.configure_line(hwirq, trigger, polarity))
+    }
 }
 
 impl Default for IrqDomainRegistry {
@@ -298,6 +466,22 @@ impl Default for IrqDomainRegistry {
 
 static IRQ_DOMAINS: IrqDomainRegistry = IrqDomainRegistry::new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DefaultIrqDomainHandle {
+    id: u64,
+}
+
+impl DefaultIrqDomainHandle {
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+}
+
+struct DefaultIrqDomainRegistration {
+    id: u64,
+    domain: Arc<dyn IrqDomain>,
+}
+
 pub fn register_irq_handler(
     line: IrqLine,
     handler: Arc<dyn IrqHandler>,
@@ -305,8 +489,29 @@ pub fn register_irq_handler(
     IRQ_REGISTRY.register(line, handler)
 }
 
+pub fn register_irq_request(request: IrqRequest) -> Result<IrqHandle, IrqError> {
+    IRQ_REGISTRY.register_request(request)
+}
+
 pub fn unregister_irq_handler(handle: IrqHandle) -> Result<(), IrqError> {
     IRQ_REGISTRY.unregister(handle)
+}
+
+fn release_irq_handler_resource(handle: IrqHandle) -> bool {
+    unregister_irq_handler(handle).is_ok()
+}
+
+/// 将 IRQ handler 注册 handle 包装成 PnP-owned resource。
+pub fn irq_handler_pnp_resource(
+    handle: IrqHandle,
+    label: &'static str,
+) -> PnpHandleResource<IrqHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::Irq,
+        label,
+        handle,
+        release_irq_handler_resource,
+    )
 }
 
 pub fn install_irq_line_ops(ops: IrqLineOps) {
@@ -323,6 +528,20 @@ fn enable_irq_line(line: IrqLine) {
 
 fn disable_irq_line(line: IrqLine) {
     let _ = set_irq_line_enabled(line, false);
+}
+
+fn configure_irq_line(
+    line: IrqLine,
+    trigger: Option<IrqTrigger>,
+    polarity: Option<IrqPolarity>,
+) -> bool {
+    if trigger.is_none() && polarity.is_none() {
+        return true;
+    }
+    if let IrqLine::Controller { controller, hwirq } = line {
+        return IRQ_DOMAINS.configure_line(controller, hwirq, trigger, polarity);
+    }
+    true
 }
 
 pub fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
@@ -393,6 +612,81 @@ pub fn unregister_irq_domain(handle: IrqDomainHandle) -> Result<(), IrqError> {
     IRQ_DOMAINS.unregister(handle)
 }
 
+fn release_irq_domain_resource(handle: IrqDomainHandle) -> bool {
+    unregister_irq_domain(handle).is_ok()
+}
+
+/// 将 IRQ domain 注册 handle 包装成 PnP-owned resource。
+pub fn irq_domain_pnp_resource(
+    handle: IrqDomainHandle,
+    label: &'static str,
+) -> PnpHandleResource<IrqDomainHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::IrqDomain,
+        label,
+        handle,
+        release_irq_domain_resource,
+    )
+}
+
+/// 安装当前固件模型的默认 IRQ domain。
+///
+/// DTB 设备通常通过 phandle 指向具体 interrupt-controller；ACPI 这类固件模型
+/// 可能直接给出全局中断号，此时 `DeviceResource::Irq { controller: None, .. }`
+/// 会交给这里注册的默认 domain 翻译。该接口只表达资源解释策略，不把任何平台
+/// 的中断号布局硬编码进设备 core。
+pub fn register_default_irq_domain(
+    domain: Arc<dyn IrqDomain>,
+) -> Result<DefaultIrqDomainHandle, IrqError> {
+    let mut default = DEFAULT_IRQ_DOMAIN.lock();
+    if default.is_some() {
+        return Err(IrqError::AlreadyRegistered);
+    }
+    let id = registry_id::alloc_atomic_id(&NEXT_DEFAULT_IRQ_DOMAIN_ID)
+        .map_err(|_| IrqError::OutOfMemory)?;
+    *default = Some(DefaultIrqDomainRegistration { id, domain });
+    drop(default);
+    pnp::notify_dependency_ready(PnpDependency::DefaultIrqDomain);
+    Ok(DefaultIrqDomainHandle { id })
+}
+
+pub fn unregister_default_irq_domain(handle: DefaultIrqDomainHandle) -> Result<(), IrqError> {
+    let mut default = DEFAULT_IRQ_DOMAIN.lock();
+    let Some(registration) = default.as_ref() else {
+        return Err(IrqError::NotFound);
+    };
+    // 默认 IRQ domain 和其它 domain 一样使用注册句柄表达所有权。旧 handle
+    // 不能注销后续重新安装的 domain，否则 ACPI/DTB 启动路径的恢复逻辑会互相踩踏。
+    if registration.id != handle.id {
+        return Err(IrqError::NotFound);
+    }
+    *default = None;
+    Ok(())
+}
+
+fn release_default_irq_domain_resource(handle: DefaultIrqDomainHandle) -> bool {
+    unregister_default_irq_domain(handle).is_ok()
+}
+
+/// 将默认 IRQ domain 注册 handle 包装成 PnP-owned resource。
+pub fn default_irq_domain_pnp_resource(
+    handle: DefaultIrqDomainHandle,
+    label: &'static str,
+) -> PnpHandleResource<DefaultIrqDomainHandle> {
+    PnpHandleResource::new(
+        PnpResourceKind::IrqDomain,
+        label,
+        handle,
+        release_default_irq_domain_resource,
+    )
+}
+
 pub fn translate_firmware_irq(controller: Option<u32>, cells: &[u32]) -> Option<IrqLine> {
-    IRQ_DOMAINS.translate(controller?, cells)
+    match controller {
+        Some(controller) => IRQ_DOMAINS.translate(controller, cells),
+        None => DEFAULT_IRQ_DOMAIN
+            .lock()
+            .as_ref()
+            .and_then(|registration| registration.domain.translate(cells)),
+    }
 }

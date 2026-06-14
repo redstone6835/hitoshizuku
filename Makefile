@@ -1,6 +1,6 @@
 .PHONY: all clean cargo-setup kernel-la kernel-rv
 
-all: cargo-setup kernel-la
+all: cargo-setup kernel-la kernel-rv
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
@@ -18,4 +18,4 @@ kernel-rv:
 
 clean:
 	cargo clean
-	rm -f kernel-la kernel-rv build/initramfs.cpio
+	rm -f kernel-la kernel-rv build/initramfs.cpio build/initramfs-la.cpio build/initramfs-rv.cpio

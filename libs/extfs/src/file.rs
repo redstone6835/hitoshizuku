@@ -18,12 +18,11 @@ use vfs::stat::FileType;
 use vfs::superblock::Superblock as VfsSuperblock;
 use vfs::sync::Spinlock;
 
-use crate::dir::DirEntryRaw;
-use crate::inode::ExtInodeOps;
-use crate::inode_wr::write_raw;
+use crate::inode_wr::{RawInode, write_raw};
 use crate::layout::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EXT4_INLINE_DATA_FL,
 };
+use crate::map_wr::BlockAllocState;
 use crate::state::{FsState, map_err};
 use crate::{extent_wr, map_wr};
 
@@ -37,41 +36,45 @@ pub struct ExtDirFileOps {
 }
 
 impl ExtDirFileOps {
-    /// 带 FsState 的构造:file_type 为 DT_UNKNOWN 时,按目标 inode 的 i_mode
-    /// 回填 kind。用于 ext2 无 INCOMPAT_FILETYPE 的卷。
-    pub(crate) fn new_with_state(entries: Vec<DirEntryRaw>, state: &FsState) -> Self {
-        let snapshot = entries
-            .into_iter()
-            .map(|e| {
-                let kind = match e.file_type {
-                    DT_REG => FileType::Regular,
-                    DT_DIR => FileType::Directory,
-                    DT_LNK => FileType::Symlink,
-                    DT_CHR => FileType::CharDevice,
-                    DT_BLK => FileType::BlockDevice,
-                    DT_FIFO => FileType::Fifo,
-                    DT_SOCK => FileType::Socket,
-                    _ => {
-                        // DT_UNKNOWN:读目标 inode 的 mode 判类型
-                        match crate::inode_wr::read_raw(state, e.ino) {
-                            Ok(ri) => {
-                                let mode = u16::from_le_bytes([ri.bytes[0], ri.bytes[1]]);
-                                crate::inode::file_type_from_mode(mode)
-                            }
-                            Err(_) => FileType::Regular,
+    /// 生成打开目录时的快照:file_type 为 DT_UNKNOWN 时按目标 inode 的 i_mode 回填。
+    pub(crate) fn new_with_state(
+        state: &FsState,
+        i_block: &[u8],
+        flags: u32,
+        size: u64,
+    ) -> VfsResult<Self> {
+        let mut snapshot = Vec::new();
+        crate::dir::visit_entries(state, i_block, flags, size, |e| {
+            let kind = match e.file_type {
+                DT_REG => FileType::Regular,
+                DT_DIR => FileType::Directory,
+                DT_LNK => FileType::Symlink,
+                DT_CHR => FileType::CharDevice,
+                DT_BLK => FileType::BlockDevice,
+                DT_FIFO => FileType::Fifo,
+                DT_SOCK => FileType::Socket,
+                _ => {
+                    // DT_UNKNOWN:读目标 inode 的 mode 判类型。
+                    match crate::inode_wr::read_raw(state, e.ino) {
+                        Ok(ri) => {
+                            let mode = u16::from_le_bytes([ri.bytes[0], ri.bytes[1]]);
+                            crate::inode::file_type_from_mode(mode)
                         }
+                        Err(_) => FileType::Regular,
                     }
-                };
-                DirEntry {
-                    ino: e.ino as u64,
-                    name: SmallStr::new(&e.name),
-                    kind,
                 }
-            })
-            .collect();
-        Self {
+            };
+            snapshot.push(DirEntry {
+                ino: e.ino as u64,
+                name: SmallStr::new(&e.name),
+                kind,
+            });
+            true
+        })
+        .map_err(map_err)?;
+        Ok(Self {
             snapshot: Spinlock::new(snapshot),
-        }
+        })
     }
 }
 
@@ -100,8 +103,9 @@ impl FileOps for ExtDirFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 目录枚举不会等待外部事件；readiness 表示可立即尝试 I/O。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn Any {
@@ -115,6 +119,11 @@ pub struct ExtRegFileOps {
     state: Arc<FsState>,
     sb: Arc<VfsSuperblock>,
     ino: u32,
+    /// 打开文件直接持有 inode raw 状态，保证 unlink 后仍可继续 I/O。
+    ///
+    /// VFS 在 nlink=0 后会把 inode 从 superblock cache 移除；如果这里每次
+    /// I/O 都靠 ino 反查 cache，unlink-but-open 文件会立刻变成 ENOENT。
+    raw: Arc<Spinlock<RawInode>>,
     map_cache: Spinlock<BlockMapCache>,
     /// 串行化 append / 扩容。
     io_mu: Spinlock<()>,
@@ -153,33 +162,29 @@ impl BlockMapCache {
 }
 
 impl ExtRegFileOps {
-    pub(crate) fn new(state: Arc<FsState>, sb: Arc<VfsSuperblock>, ino: u32) -> Self {
+    pub(crate) fn new(
+        state: Arc<FsState>,
+        sb: Arc<VfsSuperblock>,
+        ino: u32,
+        raw: Arc<Spinlock<RawInode>>,
+    ) -> Self {
         Self {
             state,
             sb,
             ino,
+            raw,
             map_cache: Spinlock::new(BlockMapCache::default()),
             io_mu: Spinlock::new(()),
         }
     }
 
-    pub(crate) fn new_empty(state: Arc<FsState>, sb: Arc<VfsSuperblock>, ino: u32) -> Self {
-        Self::new(state, sb, ino)
-    }
-
-    /// 找回 Inode 与 ExtInodeOps(每次 I/O 都现取,状态是最新的)。
-    fn with_ops<R>(
-        &self,
-        f: impl FnOnce(&vfs::inode::Inode, &ExtInodeOps) -> VfsResult<R>,
-    ) -> VfsResult<R> {
-        let inode = self
-            .sb
-            .find_inode(self.ino as u64)
-            .ok_or(VfsError::NotFound)?;
-        let ops = inode
-            .downcast_ops::<ExtInodeOps>()
-            .ok_or(VfsError::InvalidArgument)?;
-        f(&inode, ops)
+    pub(crate) fn new_empty(
+        state: Arc<FsState>,
+        sb: Arc<VfsSuperblock>,
+        ino: u32,
+        raw: Arc<Spinlock<RawInode>>,
+    ) -> Self {
+        Self::new(state, sb, ino, raw)
     }
 
     fn map_ranges(
@@ -309,81 +314,73 @@ impl ExtRegFileOps {
 
 impl FileOps for ExtRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        self.with_ops(|_inode, ops| {
-            let (flags, size, i_block) = {
-                let g = ops.raw.lock();
-                let mut i_block = [0u8; I_BLOCK_BYTES];
-                i_block.copy_from_slice(crate::inode::i_block_slice(&g.bytes));
-                (g.flags(), g.size(), i_block)
-            };
-            if offset >= size || buf.is_empty() {
-                return Ok(0);
+        let (flags, size, i_block) = {
+            let g = self.raw.lock();
+            let mut i_block = [0u8; I_BLOCK_BYTES];
+            i_block.copy_from_slice(crate::inode::i_block_slice(&g.bytes));
+            (g.flags(), g.size(), i_block)
+        };
+        if offset >= size || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = (size - offset).min(buf.len() as u64) as usize;
+
+        // inline_data 路径
+        if flags & EXT4_INLINE_DATA_FL != 0 {
+            let raw_bytes = self.raw.lock().bytes.clone();
+            if let Some(inline) =
+                crate::inode::try_inline_data(&self.state, &raw_bytes, size, flags)
+            {
+                let start = offset as usize;
+                let end = (start + remaining).min(inline.len());
+                let take = end.saturating_sub(start);
+                buf[..take].copy_from_slice(&inline[start..end]);
+                return Ok(take);
             }
-            let remaining = (size - offset).min(buf.len() as u64) as usize;
+        }
 
-            // inline_data 路径
-            if flags & EXT4_INLINE_DATA_FL != 0 {
-                let raw_bytes = ops.raw.lock().bytes.clone();
-                if let Some(inline) =
-                    crate::inode::try_inline_data(&self.state, &raw_bytes, size, flags)
-                {
-                    let start = offset as usize;
-                    let end = (start + remaining).min(inline.len());
-                    let take = end.saturating_sub(start);
-                    buf[..take].copy_from_slice(&inline[start..end]);
-                    return Ok(take);
-                }
+        let block_size = self.state.ext_sb.block_size as u64;
+
+        let first_lb = (offset / block_size) as u32;
+        let last_lb = ((offset + remaining as u64 - 1) / block_size) as u32;
+        let lb_count = last_lb - first_lb + 1;
+
+        let ranges = self
+            .map_ranges(flags, size, &i_block, first_lb, lb_count)
+            .map_err(map_err)?;
+
+        let mut filled_until = 0usize;
+        let mut scratch = Vec::new();
+        for (range_lb, range_count, phys_start) in &ranges {
+            let range_byte_start = *range_lb as u64 * block_size;
+            let range_byte_end = range_byte_start + *range_count as u64 * block_size;
+            let read_start = offset.max(range_byte_start);
+            let read_end = (offset + remaining as u64).min(range_byte_end);
+            if read_start >= read_end {
+                continue;
+            }
+            let overlap_bytes = (read_end - read_start) as usize;
+            let buf_pos = (read_start - offset) as usize;
+
+            if filled_until < buf_pos {
+                zero_bytes(&mut buf[filled_until..buf_pos]);
             }
 
-            let block_size = self.state.ext_sb.block_size as u64;
-
-            let first_lb = (offset / block_size) as u32;
-            let last_lb = ((offset + remaining as u64 - 1) / block_size) as u32;
-            let lb_count = last_lb - first_lb + 1;
-
-            let ranges = self
-                .map_ranges(flags, size, &i_block, first_lb, lb_count)
-                .map_err(map_err)?;
-
-            // if ranges.is_empty() && offset == 0 {
-            //     log::info!("[extfs] read_at offset=0 size={} flags={:#x} ranges EMPTY first_lb={} lb_count={}", size, flags, first_lb, lb_count);
-            // } else if offset == 0 {
-            //     log::info!("[extfs] read_at offset=0 size={} ranges={} first=({},{},{:#x})", size, ranges.len(), ranges[0].0, ranges[0].1, ranges[0].2);
-            // }
-
-            let mut filled_until = 0usize;
-            let mut scratch = Vec::new();
-            for (range_lb, range_count, phys_start) in &ranges {
-                let range_byte_start = *range_lb as u64 * block_size;
-                let range_byte_end = range_byte_start + *range_count as u64 * block_size;
-                let read_start = offset.max(range_byte_start);
-                let read_end = (offset + remaining as u64).min(range_byte_end);
-                if read_start >= read_end {
-                    continue;
-                }
-                let overlap_bytes = (read_end - read_start) as usize;
-                let buf_pos = (read_start - offset) as usize;
-
-                if filled_until < buf_pos {
-                    zero_bytes(&mut buf[filled_until..buf_pos]);
-                }
-
-                self.read_mapped_bytes(
-                    &mut scratch,
-                    range_byte_start,
-                    *phys_start,
-                    read_start,
-                    read_end,
-                    offset,
-                    buf,
-                )?;
-                filled_until = filled_until.max(buf_pos + overlap_bytes);
-            }
-            if filled_until < remaining {
-                zero_bytes(&mut buf[filled_until..remaining]);
-            }
-            Ok(remaining)
-        })
+            self.read_mapped_bytes(
+                &mut scratch,
+                range_byte_start,
+                *phys_start,
+                read_start,
+                read_end,
+                offset,
+                buf,
+            )?;
+            filled_until = filled_until.max(buf_pos + overlap_bytes);
+        }
+        if filled_until < remaining {
+            zero_bytes(&mut buf[filled_until..remaining]);
+        }
+        Ok(remaining)
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
@@ -394,8 +391,8 @@ impl FileOps for ExtRegFileOps {
             return Ok(0);
         }
         let _io = self.io_mu.lock();
-        self.with_ops(|inode, ops| {
-            let mut raw_guard = ops.raw.lock();
+        {
+            let mut raw_guard = self.raw.lock();
             let old_size = raw_guard.size();
             let start = if offset == u64::MAX { old_size } else { offset };
             let end = start
@@ -405,8 +402,9 @@ impl FileOps for ExtRegFileOps {
             let old_flags = raw_guard.flags();
             let old_blocks_lo = raw_guard.blocks_lo();
             let mut flags = old_flags;
-            let mut i_block = raw_guard.i_block().to_vec();
-            let old_i_block = i_block.clone();
+            let mut i_block = [0u8; I_BLOCK_BYTES];
+            i_block.copy_from_slice(raw_guard.i_block());
+            let old_i_block = i_block;
 
             // inline_data 无损迁移:先把现有 inline 字节读出来,再清 flag,
             // 之后把旧内容作为普通数据块写回,最后执行用户写入。
@@ -419,7 +417,7 @@ impl FileOps for ExtRegFileOps {
                 for b in raw_guard.i_block_mut().iter_mut() {
                     *b = 0;
                 }
-                i_block = raw_guard.i_block().to_vec();
+                i_block.copy_from_slice(raw_guard.i_block());
                 raw_guard.set_size(0);
                 recovered
             } else {
@@ -428,6 +426,7 @@ impl FileOps for ExtRegFileOps {
             // 不强行 demote — 如果是 extent 文件且能原地 append 就留着;
             // 真正无法容纳时再退化成间接布局。
             let block_size = self.state.ext_sb.block_size as u64;
+            let mut map_scratch = Vec::new();
 
             // 把旧 inline 内容(如果有)写回为数据块
             if let Some(old) = inline_recovered {
@@ -438,10 +437,17 @@ impl FileOps for ExtRegFileOps {
                         let lb = (written as u64 / block_size) as u32;
                         let in_block = (written as u64 % block_size) as usize;
                         let want = ((block_size - in_block as u64) as usize).min(total - written);
-                        let phys = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
-                            .map_err(map_err)?;
+                        let block = ensure_block_any(
+                            &self.state,
+                            &mut flags,
+                            &mut i_block,
+                            lb,
+                            &mut map_scratch,
+                        )
+                        .map_err(map_err)?;
+                        let phys = block.phys();
                         let mut blk = vec![0u8; block_size as usize];
-                        if in_block != 0 || want < block_size as usize {
+                        if !block.is_new() && (in_block != 0 || want < block_size as usize) {
                             self.state.read_block(phys, &mut blk).map_err(map_err)?;
                         }
                         blk[in_block..in_block + want]
@@ -491,8 +497,15 @@ impl FileOps for ExtRegFileOps {
                     let lb = lb as u32;
                     let in_block = (file_off % block_size) as usize;
                     let want = ((block_size - in_block as u64) as usize).min(buf.len() - written);
-                    let phys = ensure_block_any(&self.state, &mut flags, &mut i_block, lb)
-                        .map_err(map_err)?;
+                    let block = ensure_block_any(
+                        &self.state,
+                        &mut flags,
+                        &mut i_block,
+                        lb,
+                        &mut map_scratch,
+                    )
+                    .map_err(map_err)?;
+                    let phys = block.phys();
                     if let Some(prev_lb) = cur_lb {
                         if prev_lb != lb {
                             self.state
@@ -501,7 +514,9 @@ impl FileOps for ExtRegFileOps {
                         }
                     }
                     if cur_lb != Some(lb) {
-                        if in_block != 0 || want < block_size as usize {
+                        if block.is_new() {
+                            cur_blk_buf.fill(0);
+                        } else if in_block != 0 || want < block_size as usize {
                             self.state
                                 .read_block(phys, &mut cur_blk_buf)
                                 .map_err(map_err)?;
@@ -523,24 +538,30 @@ impl FileOps for ExtRegFileOps {
             }
 
             let new_size = raw_guard.size().max(end);
-            let blocks512 = (new_size + 511) / 512;
-            let new_blocks_lo = blocks512 as u32;
-            let metadata_changed = new_size != old_size
-                || new_blocks_lo != old_blocks_lo
-                || flags != old_flags
-                || i_block != old_i_block;
+            let mapping_changed = flags != old_flags || i_block != old_i_block;
+            let size_changed = new_size != old_size;
+            let new_blocks_lo = if mapping_changed || size_changed {
+                crate::inode::blocks_lo_from_mapping(&self.state, flags, &i_block)
+                    .map_err(map_err)?
+            } else {
+                old_blocks_lo
+            };
+            let metadata_changed =
+                size_changed || new_blocks_lo != old_blocks_lo || mapping_changed;
             if metadata_changed {
                 raw_guard.i_block_mut().copy_from_slice(&i_block);
                 raw_guard.set_flags(flags);
                 raw_guard.set_size(new_size);
                 raw_guard.set_blocks_lo(new_blocks_lo);
                 write_raw(&self.state, &raw_guard).map_err(map_err)?;
-                inode.set_size(new_size);
+                if let Some(inode) = self.sb.find_inode(self.ino as u64) {
+                    inode.set_size(new_size);
+                }
                 self.invalidate_map_cache();
             }
 
             Ok(written)
-        })
+        }
     }
 
     fn readdir(
@@ -553,8 +574,9 @@ impl FileOps for ExtRegFileOps {
     fn sync(&self) -> VfsResult<()> {
         Ok(())
     }
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents(0)
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        // 普通文件不会阻塞等待设备事件；读写 readiness 应立即满足。
+        PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {}
     fn as_any(&self) -> &dyn Any {
@@ -575,23 +597,27 @@ pub(crate) fn symlink_target(
 
 /// 统一入口:根据 flags 选择 extent 原地追加或 indirect 分配。
 ///
-/// - 若文件使用 extent 且根节点能容纳下新叶子,原地追加并返回新分配物理块;
+/// - 若文件使用 extent 且根节点能容纳下新叶子,原地追加并返回物理块状态;
 /// - 若 extent 根已满或为索引节点,fallback 到 `demote_if_extent` + indirect;
-/// - 若文件本就是 indirect,直接走 `map_wr::ensure_block`。
+/// - 若文件本就是 indirect,直接走间接块写路径。
 fn ensure_block_any(
     state: &FsState,
     flags: &mut u32,
     i_block: &mut [u8],
     lb: u32,
-) -> Result<u64, crate::state::BlockBackendError> {
+    scratch: &mut Vec<u8>,
+) -> Result<BlockAllocState, crate::state::BlockBackendError> {
     if *flags & crate::layout::EXT4_EXTENTS_FL != 0 {
-        if let Some(phys) = extent_wr::ensure_block_in_extent(state, i_block, lb)? {
-            return Ok(phys);
+        if let Some(block) = extent_wr::ensure_block_in_extent_for_write(state, i_block, lb)? {
+            return Ok(block);
         }
-        // 原地追加失败 → 降级
-        extent_wr::demote_if_extent(state, flags, i_block)?;
+        // 原地追加失败 → 保留已有数据地降级为间接块布局。
+        if !extent_wr::demote_preserve_if_extent(state, flags, i_block)? {
+            return Err(crate::state::BlockBackendError::Unsupported);
+        }
     }
-    map_wr::ensure_block(state, i_block, lb)
+    // 文件写路径会自行处理新块未覆盖区域，避免整块覆盖时先写零再写数据。
+    map_wr::ensure_block_for_write_with_scratch(state, i_block, lb, false, scratch)
 }
 
 #[inline]
@@ -628,12 +654,13 @@ fn clip_ranges(ranges: &[(u32, u32, u64)], first_lb: u32, lb_count: u32) -> Vec<
         return Vec::new();
     }
     let end_lb = first_lb.saturating_add(lb_count);
-    let mut out = Vec::new();
-    for &(range_lb, range_count, phys_start) in ranges {
-        let range_end = range_lb.saturating_add(range_count);
-        if range_end <= first_lb || range_lb >= end_lb {
-            continue;
+    let start_idx = first_overlapping_range(ranges, first_lb);
+    let mut out = Vec::with_capacity(ranges.len().saturating_sub(start_idx).min(4));
+    for &(range_lb, range_count, phys_start) in &ranges[start_idx..] {
+        if range_lb >= end_lb {
+            break;
         }
+        let range_end = range_lb.saturating_add(range_count);
         let overlap_start = range_lb.max(first_lb);
         let overlap_end = range_end.min(end_lb);
         if overlap_start >= overlap_end {
@@ -646,4 +673,43 @@ fn clip_ranges(ranges: &[(u32, u32, u64)], first_lb: u32, lb_count: u32) -> Vec<
         ));
     }
     out
+}
+
+#[inline]
+fn first_overlapping_range(ranges: &[(u32, u32, u64)], first_lb: u32) -> usize {
+    let mut lo = 0usize;
+    let mut hi = ranges.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (range_lb, range_count, _) = ranges[mid];
+        if range_lb.saturating_add(range_count) <= first_lb {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::{clip_ranges, first_overlapping_range};
+
+    #[test]
+    fn clip_ranges_starts_inside_existing_range() {
+        let ranges = [(0, 8, 100), (16, 4, 200), (24, 2, 300)];
+
+        assert_eq!(first_overlapping_range(&ranges, 3), 0);
+        assert_eq!(clip_ranges(&ranges, 3, 4), vec![(3, 4, 103)]);
+    }
+
+    #[test]
+    fn clip_ranges_skips_before_window_and_stops_after() {
+        let ranges = [(0, 2, 100), (4, 3, 200), (8, 4, 300), (20, 1, 400)];
+
+        assert_eq!(first_overlapping_range(&ranges, 5), 1);
+        assert_eq!(clip_ranges(&ranges, 5, 5), vec![(5, 2, 201), (8, 2, 300)]);
+    }
 }

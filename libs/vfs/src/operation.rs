@@ -102,8 +102,24 @@ pub fn openat(
     flags: OpenOptions,
     mode: FileMode,
 ) -> VfsResult<Fd> {
+    openat_with_lookup_flags(ctx, fdt, dirfd, path, flags, mode, LookupFlags::default())
+}
+
+/// `openat` 的扩展入口，供 `openat2` 传入额外路径解析约束。
+///
+/// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
+/// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+pub fn openat_with_lookup_flags(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    dirfd: &Dirfd,
+    path: &str,
+    flags: OpenOptions,
+    mode: FileMode,
+    extra_lookup_flags: LookupFlags,
+) -> VfsResult<Fd> {
     let lookup_flags = {
-        let mut f = LookupFlags::default();
+        let mut f = extra_lookup_flags;
         if flags.nofollow {
             f = f.with(LookupFlags::NO_FOLLOW);
         }
@@ -233,7 +249,7 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
         return Err(VfsError::AlreadyExists);
     }
 
-    let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
+    let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
     let parent_mount = parent_result.mount;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;
@@ -257,7 +273,7 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 
 /// `unlinkat(AT_REMOVEDIR)` — 删除空目录。
 pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
-    let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
+    let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
     let parent_mount = parent_result.mount;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;
@@ -585,10 +601,16 @@ fn chown_inode(
 
     inode.ops.chown(inode, uid, gid)?;
 
-    // POSIX：chown 后必须清除 SUID/SGID，防止权限提升（除非 CAP_FSETID）
-    if (uid.is_some() || gid.is_some()) && !ctx.cred.has_cap(cred::Capability::FSetId) {
+    // Linux regular-file semantics: chown clears SUID, and clears SGID only
+    // when the group execute bit is set. A non-executable SGID regular file
+    // uses the bit for mandatory locking and must keep it.
+    if (uid.is_some() || gid.is_some()) && inode.kind() == stat::FileType::Regular {
         let current_mode = inode.meta_snapshot().mode;
-        let new_mode = current_mode.without(FileMode::SUID_SGID);
+        let mut drop_bits = FileMode::ISUID;
+        if current_mode.has(FileMode::IXGRP) {
+            drop_bits = drop_bits.with(FileMode::ISGID);
+        }
+        let new_mode = current_mode.without(drop_bits);
         if new_mode != current_mode {
             inode.ops.chmod(inode, new_mode)?;
         }

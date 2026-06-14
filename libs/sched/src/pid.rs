@@ -21,6 +21,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+use errno::Errno;
+
 use crate::sync::Spinlock;
 use crate::task::Task;
 
@@ -125,6 +127,53 @@ impl PidRegistry {
         None
     }
 
+    /// 为 `task` 占用调用者指定的 pid。该入口服务 clone3 `set_tid_size=1`；
+    /// 多 namespace set_tid 需要在更高层先建立完整 namespace 栈后再扩展。
+    pub fn allocate_specific(&self, task: &Arc<Task>, pid: PidT) -> Result<PidT, Errno> {
+        if pid <= PID_INVALID {
+            return Err(Errno::EINVAL);
+        }
+        let idx = pid as u32;
+        let mut inner = self.inner.lock();
+        if idx >= inner.pid_max {
+            return Err(Errno::EINVAL);
+        }
+
+        if (idx as usize) < inner.slots.len() {
+            if inner.slots[idx as usize].occupied {
+                return Err(Errno::EEXIST);
+            }
+            remove_from_free_list(&mut inner, idx);
+            let slot = &mut inner.slots[idx as usize];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.task = Arc::downgrade(task);
+            slot.next_free = None;
+            slot.occupied = true;
+            inner.next_hint = idx.saturating_add(1).max(1);
+            return Ok(pid);
+        }
+
+        while inner.slots.len() < idx as usize {
+            let free_idx = inner.slots.len() as u32;
+            let old_head = inner.free_head;
+            inner.slots.push(Slot {
+                task: Weak::new(),
+                generation: 0,
+                next_free: old_head,
+                occupied: false,
+            });
+            inner.free_head = Some(free_idx);
+        }
+        inner.slots.push(Slot {
+            task: Arc::downgrade(task),
+            generation: 1,
+            next_free: None,
+            occupied: true,
+        });
+        inner.next_hint = idx.saturating_add(1).max(1);
+        Ok(pid)
+    }
+
     /// 根据 pid 查找任务的弱引用。`pid <= 0` 或越界都返回 `None`。
     pub fn lookup(&self, pid: PidT) -> Option<Weak<Task>> {
         if pid <= PID_INVALID {
@@ -185,6 +234,25 @@ impl PidRegistry {
             out.push((idx as PidT, slot.task.clone()));
         }
         out
+    }
+}
+
+fn remove_from_free_list(inner: &mut RegistryInner, idx: u32) {
+    let mut current = inner.free_head;
+    let mut prev = None;
+    while let Some(cur) = current {
+        if cur == idx {
+            let next = inner.slots[cur as usize].next_free;
+            if let Some(prev_idx) = prev {
+                inner.slots[prev_idx as usize].next_free = next;
+            } else {
+                inner.free_head = next;
+            }
+            inner.slots[cur as usize].next_free = None;
+            return;
+        }
+        prev = current;
+        current = inner.slots[cur as usize].next_free;
     }
 }
 

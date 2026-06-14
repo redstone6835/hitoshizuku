@@ -5,7 +5,13 @@ edition = "2024"
 
 [features]
 bench = []
+block-bench = []
+allocator-bench = []
 embedded-initramfs = []
+allocator-tests = [
+    "ktest/kernel",
+    "allocator/ktest-kernel",
+]
 kernel-tests = [
     "ktest/kernel",
     "errno/ktest-kernel",

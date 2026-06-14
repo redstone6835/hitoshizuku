@@ -17,6 +17,14 @@
 //! 锁顺序和职责边界。文件头下面的 lock ordering 说明，就是为了保证这些层在组合
 //! 起来以后仍然能稳定工作。
 //!
+//! TODO(alloc-stabilization): 本轮收口后仍需继续完成以下事项：
+//! 1. 把 `loongarch64-unknown-none` QEMU allocator-bench 的关键 ns/op 数据纳入持续
+//!    回归，避免后续优化只看单次日志；
+//! 2. 为 managed GC 增加 stop-the-world 引用图验证，补齐对象字段级一致性检查；
+//! 3. 引入多核压力测试，验证 registry shard、slab per-CPU cache 和回收路径无竞态；
+//! 4. 评估 NUMA/per-CPU page cache、自定义 arena/policy 注册等扩展 API 是否需要进入
+//!    对外稳定接口。
+//!
 //! # 锁顺序 (Lock Ordering)
 //!
 //! 为防止死锁，必须严格按照以下顺序获取锁：
@@ -25,7 +33,7 @@
 //! 2. `vmem` arena 锁 (direct_map, kernel, managed) — 虚拟地址空间
 //! 3. `metadata.inner` — 元数据分配器状态
 //! 4. `phys` (BuddyAllocator) — 物理内存分配器
-//! 5. `registry.inner` — 分配注册表
+//! 5. `registry.shard.inner` — 分片分配注册表
 //! 6. `slab.state` — Slab 分配器状态
 //! 7. `slab.cache.inner` — Per-CPU 缓存
 //! 8. `kheap.inner` — 大对象分配器
@@ -100,10 +108,13 @@ use metadata::MetadataAllocator;
 use registry::AllocationRegistry;
 use slab::SlabAllocator;
 
-pub use buddy::{BuddyAllocator as PhysicalAllocator, BuddyStats, MemorySegment, PAGE_SIZE};
+pub use buddy::{
+    BuddyAllocator as PhysicalAllocator, BuddyAudit, BuddyAuditFlags, BuddyReclaimStats,
+    BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
+};
 pub use error::{
     AddressSpaceError, AllocationError, DeallocationError, InitError, ManagedHandleError,
-    OwnershipError, RegistryError, VmemError,
+    OwnershipError, PhysicalFreeError, RegistryError, VmemError,
 };
 pub use gc::{
     FinalizerFn, GcCell, GcCollectionKind, GcControlSnapshot, GcHandle, GcMode, GcObjectHeader,
@@ -111,20 +122,34 @@ pub use gc::{
     GcWeakRefSlot, RootType, TRACE_FLAG_HAS_FINALIZER, TRACE_FLAG_HAS_WEAK_REFS,
     TRACE_FLAG_PINNED_LAYOUT, TraceDescriptor,
 };
-pub use kheap::{KernelHeap as LargeObjectAllocator, KernelHeapStats};
+pub use kheap::{
+    KernelHeap as LargeObjectAllocator, KernelHeapAudit, KernelHeapAuditFlags,
+    KernelHeapReclaimStats, KernelHeapStats,
+};
 pub use managed::{
     DEFAULT_MANAGED_HEAP_ORDER, ExactRootProviderFn, LARGE_MANAGED_HEAP_ORDER, ManagedAllocator,
-    ManagedFailurePolicy, ManagedHeapConfig, ManagedStats,
+    ManagedAudit, ManagedAuditFlags, ManagedFailurePolicy, ManagedHeapConfig, ManagedStats,
 };
 pub use metadata::MetadataStats;
-pub use registry::AllocationRegistryStats;
-pub use request::{
-    AllocationArena, AllocationKind, AllocationRecord, ManagedAllocFlags, MemoryDomain,
-    MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest, PhysicalAllocation,
-    ReclaimPolicy, Zeroing,
+pub use registry::{
+    AllocationRegistryAudit, AllocationRegistryAuditFlags, AllocationRegistrySnapshot,
+    AllocationRegistryStats,
 };
-pub use slab::{MAX_CPUS, MAX_SMALL_SIZE, SlabAllocator as ZoneAllocator, SlabStats};
+pub use request::{
+    AllocationArena, AllocationKind, AllocationRecord, AllocationRequestError, ManagedAllocFlags,
+    MemoryDomain, MemoryPlacement, MemoryRequest, PagePolicy, PhysicalAllocRequest,
+    PhysicalAllocation, ReclaimPolicy, Zeroing,
+};
+pub use slab::{
+    MAX_CPUS, MAX_SMALL_SIZE, SLAB_SIZE_CLASS_COUNT, SlabAllocator as ZoneAllocator, SlabAudit,
+    SlabAuditFlags, SlabClassStat, SlabReclaimStats, SlabStats,
+};
 pub use space::{AddressSpaceStats, ArenaKind, BackedRange, KernelAddressSpace};
+pub use stats::{
+    ALLOCATOR_API_VERSION, AllocatorAudit, AllocatorAuditFlags, AllocatorAuditScope,
+    AllocatorCapabilities, AllocatorCapabilityFlags, AllocatorHotspotSummary,
+    AllocatorReclaimRequest, AllocatorReclaimStats,
+};
 pub use vmem::{VmemAllocPolicy, VmemStats, VmemValidationStats};
 
 pub type PhysicalMemoryManager = BuddyAllocator;
@@ -190,6 +215,15 @@ pub struct KernelMemorySubsystem {
 pub type KernelAllocator = KernelMemorySubsystem;
 
 unsafe impl Sync for KernelMemorySubsystem {}
+
+enum TrackedReallocProbe {
+    Updated {
+        old_size: usize,
+        record: AllocationRecord,
+    },
+    NeedsMove(AllocationRecord),
+    Untracked,
+}
 
 impl KernelMemorySubsystem {
     pub const fn new() -> Self {
@@ -493,12 +527,63 @@ impl KernelMemorySubsystem {
         if !self.registry.init(&self.boot) {
             return Err(InitError::MetadataOutOfMemory);
         }
+        if let Some(range) = self.boot.seal_and_take_free_tail(PAGE_SIZE) {
+            if let Some(virt_to_phys) = self.load_virt_to_phys() {
+                let paddr = virt_to_phys(range.start);
+                match self.phys.lock().release_reserved_range(paddr, range.size) {
+                    Ok(pages) => {
+                        log::info!(
+                            "[alloc][boot] released boot tail vaddr={:#x}..{:#x} paddr={:#x} pages={} bytes={}",
+                            range.start,
+                            range.end(),
+                            paddr,
+                            pages,
+                            pages * PAGE_SIZE
+                        );
+                    }
+                    Err(err) => {
+                        log::warning!(
+                            "[alloc][boot] failed to release boot tail vaddr={:#x}..{:#x} paddr={:#x} size={} err={:?}",
+                            range.start,
+                            range.end(),
+                            paddr,
+                            range.size,
+                            err
+                        );
+                    }
+                }
+            } else {
+                log::warning!(
+                    "[alloc][boot] failed to release boot tail vaddr={:#x}..{:#x}: missing virt_to_phys",
+                    range.start,
+                    range.end()
+                );
+            }
+        }
         self.active.store(true, Ordering::Release);
         Ok(())
     }
 
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
+    }
+
+    /// 返回 allocator 对外稳定能力快照。
+    ///
+    /// 该接口不扫描内部结构、不分配内存，适合 LKM/外部子系统在初始化时判断当前内核是否
+    /// 支持 typed physical API、结构审计、cache reclaim、managed GC 等能力。功能新增时
+    /// 应增加 capability bit；破坏性 ABI 变化才递增 [`ALLOCATOR_API_VERSION`]。
+    pub fn capabilities(&self) -> AllocatorCapabilities {
+        AllocatorCapabilities {
+            api_version: ALLOCATOR_API_VERSION,
+            flags: AllocatorCapabilityFlags::stable_kernel(),
+            max_small_size: MAX_SMALL_SIZE,
+            max_cpus: MAX_CPUS,
+            page_size: PAGE_SIZE,
+            default_managed_heap_order: DEFAULT_MANAGED_HEAP_ORDER,
+            large_managed_heap_order: LARGE_MANAGED_HEAP_ORDER,
+            managed_enabled: self.managed.is_enabled(),
+        }
     }
 
     pub fn stats(&self) -> AllocStats {
@@ -536,13 +621,28 @@ impl KernelMemorySubsystem {
     }
 
     pub fn layer_stats(&self) -> stats::AllocatorLayerStats {
+        self.layer_stats_with_physical_registry(self.buddy_stats(), self.registry.stats())
+    }
+
+    fn layer_stats_with_registry(
+        &self,
+        registry: AllocationRegistryStats,
+    ) -> stats::AllocatorLayerStats {
+        self.layer_stats_with_physical_registry(self.buddy_stats(), registry)
+    }
+
+    fn layer_stats_with_physical_registry(
+        &self,
+        phys: BuddyStats,
+        registry: AllocationRegistryStats,
+    ) -> stats::AllocatorLayerStats {
         stats::AllocatorLayerStats {
-            phys: self.buddy_stats(),
+            phys,
             address_space: self.address_space_stats(),
             kheap: self.kheap.snapshot(),
             slab: self.slab.snapshot(),
             metadata: self.metadata.stats(),
-            registry: self.registry.stats(),
+            registry,
             managed: self.managed.stats(),
         }
     }
@@ -551,10 +651,185 @@ impl KernelMemorySubsystem {
         self.detailed_stats().pressure_level
     }
 
+    /// 返回 allocator 当前热点摘要。
+    ///
+    /// 这个接口复用各层现有计数器，不做对象扫描，也不生成文本。bench、调试命令和未来
+    /// LKM 风格扩展可以通过它稳定读取 cache 命中率、registry 链长、vmem 碎片等成本来源，
+    /// 不需要解析 `format_diagnostic()` 的输出。
+    pub fn hotspot_summary(&self) -> AllocatorHotspotSummary {
+        let layers = self.layer_stats_with_registry(self.registry.stats());
+        stats::build_hotspot_summary(&layers)
+    }
+
     pub fn format_diagnostic(&self, buf: &mut [u8]) -> usize {
-        let overview = self.detailed_stats();
-        let layers = self.layer_stats();
-        stats::format_diagnostic(buf, &overview, &layers)
+        self.format_diagnostic_with_scope(buf, AllocatorAuditScope::FullRegistry)
+    }
+
+    /// 使用指定自检范围格式化 allocator 诊断文本。
+    ///
+    /// `FullRegistry` 保留旧接口语义，会扫描 registry 链表并输出 `reg_struct/scan/chain`；
+    /// `CountersOnly` 只读取各层 O(1) 计数器，适合高频日志、监控和未来外部扩展的低扰动
+    /// 快照。诊断文本里的 `mode=` 字段会明确标明本次采样范围。
+    pub fn format_diagnostic_with_scope(
+        &self,
+        buf: &mut [u8],
+        scope: AllocatorAuditScope,
+    ) -> usize {
+        match scope {
+            AllocatorAuditScope::FullRegistry => {
+                let registry_snapshot = self.registry.snapshot();
+                let phys_snapshot = self.phys.lock().snapshot();
+                let layers = self.layer_stats_with_physical_registry(
+                    phys_snapshot.stats,
+                    registry_snapshot.stats,
+                );
+                let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
+                let slab_audit = self.slab.audit();
+                let kheap_audit = self.kheap.audit();
+                let managed_audit = self.managed.audit();
+                stats::format_diagnostic(
+                    buf,
+                    &overview,
+                    &layers,
+                    &registry_snapshot.audit,
+                    &phys_snapshot.audit,
+                    &slab_audit,
+                    &kheap_audit,
+                    &managed_audit,
+                )
+            }
+            AllocatorAuditScope::CountersOnly => {
+                let layers = self.layer_stats_with_registry(self.registry.stats());
+                let overview = stats::build_overview_from_layers(self.boot.snapshot(), &layers);
+                stats::format_diagnostic_counters(buf, &overview, &layers)
+            }
+        }
+    }
+
+    /// 格式化只基于计数器的轻量诊断文本，不扫描 registry 链表。
+    pub fn format_diagnostic_counters(&self, buf: &mut [u8]) -> usize {
+        self.format_diagnostic_with_scope(buf, AllocatorAuditScope::CountersOnly)
+    }
+
+    /// 显式格式化带 registry 结构扫描的完整诊断文本。
+    pub fn format_diagnostic_full(&self, buf: &mut [u8]) -> usize {
+        self.format_diagnostic_with_scope(buf, AllocatorAuditScope::FullRegistry)
+    }
+
+    /// 返回 allocator 分层账本的一致性审计快照。
+    ///
+    /// 这个接口只读取统计信息，不扫描对象内容，也不会修复状态；它用于测试、benchmark 和
+    /// 故障日志确认 registry 与 slab/kheap/managed 等后端的计数是否仍然一致。并发运行时
+    /// 可能观察到短暂中间态，严格断言应在没有其它 CPU 同时 alloc/free 的自检阶段执行。
+    pub fn audit(&self) -> AllocatorAudit {
+        self.audit_with_scope(AllocatorAuditScope::FullRegistry)
+    }
+
+    /// 按采样范围返回 allocator 审计快照。
+    ///
+    /// `CountersOnly` 可以证明各层 O(1) 账本之间是否一致，但不会扫描 registry 结构；返回值
+    /// 中的 `registry_structure_scanned=false` 用来防止调用方把轻量结果误当成完整结构审计。
+    pub fn audit_with_scope(&self, scope: AllocatorAuditScope) -> AllocatorAudit {
+        match scope {
+            AllocatorAuditScope::FullRegistry => {
+                let registry_snapshot = self.registry.snapshot();
+                let phys_snapshot = self.phys.lock().snapshot();
+                let layers = self.layer_stats_with_physical_registry(
+                    phys_snapshot.stats,
+                    registry_snapshot.stats,
+                );
+                let slab_audit = self.slab.audit();
+                let kheap_audit = self.kheap.audit();
+                let managed_audit = self.managed.audit();
+                stats::build_audit_with_structures(
+                    &layers,
+                    registry_snapshot.audit,
+                    phys_snapshot.audit,
+                    slab_audit,
+                    kheap_audit,
+                    managed_audit,
+                )
+            }
+            AllocatorAuditScope::CountersOnly => {
+                let layers = self.layer_stats_with_registry(self.registry.stats());
+                stats::build_counter_audit(&layers)
+            }
+        }
+    }
+
+    /// 返回不扫描 registry 链表的轻量审计快照。
+    pub fn audit_counters(&self) -> AllocatorAudit {
+        self.audit_with_scope(AllocatorAuditScope::CountersOnly)
+    }
+
+    /// 返回 slab 内部链表和位图的一致性审计结果。
+    ///
+    /// 该接口只在每个 size class 内做有界扫描，不会修复状态。它比普通 `SlabStats`
+    /// 更适合在 allocator 自检和 panic 前诊断里确认 slab node 链、alloc/cache 位图与
+    /// O(1) 统计是否仍然一致。
+    pub fn slab_audit(&self) -> SlabAudit {
+        self.slab.audit()
+    }
+
+    /// 返回每个 slab size class 的轻量计数器快照。
+    ///
+    /// 该接口只读取各 zone 的 O(1) 统计，不扫描对象内容，用于定位小对象泄漏集中在哪个
+    /// 尺寸层级。
+    pub fn slab_class_stats(&self) -> [SlabClassStat; SLAB_SIZE_CLASS_COUNT] {
+        self.slab.class_stats()
+    }
+
+    /// 返回 kheap 大对象缓存 ring 和活跃页账本的一致性审计结果。
+    ///
+    /// kheap 的活跃对象所有权由 registry 证明；这里重点扫描缓存 ring，确认 cached range
+    /// 没有错阶、坏槽位或统计漂移。
+    pub fn kheap_audit(&self) -> KernelHeapAudit {
+        self.kheap.audit()
+    }
+
+    /// 返回 managed/GC 对象表、句柄表、根表和卡表的一致性审计结果。
+    ///
+    /// 该接口只做保守结构扫描，不递归追踪对象字段引用图；完整图校验需要未来在
+    /// stop-the-world 安全点内加入 fault-safe 字段读取。
+    pub fn managed_audit(&self) -> ManagedAudit {
+        self.managed.audit()
+    }
+
+    pub fn reclaim(
+        &self,
+        request: AllocatorReclaimRequest,
+    ) -> Result<AllocatorReclaimStats, AllocationError> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(AllocationError::NotInitialized);
+        }
+
+        let kheap = if request.kheap_cached_ranges == 0 {
+            KernelHeapReclaimStats::default()
+        } else {
+            self.kheap
+                .reclaim_cached_ranges(request.kheap_cached_ranges, &self.phys, &self.vmem)
+        };
+        let slab = if request.flush_slab_cpu_caches || request.reclaim_slab_empty {
+            self.slab.reclaim(
+                request.flush_slab_cpu_caches,
+                request.reclaim_slab_empty,
+                &self.phys,
+                &self.vmem,
+            )
+        } else {
+            SlabReclaimStats::default()
+        };
+        let phys = if request.reclaim_physical_deferred {
+            self.phys.lock().reclaim_deferred()
+        } else {
+            BuddyReclaimStats::default()
+        };
+
+        Ok(AllocatorReclaimStats { kheap, slab, phys })
+    }
+
+    pub fn reclaim_caches(&self) -> Result<AllocatorReclaimStats, AllocationError> {
+        self.reclaim(AllocatorReclaimRequest::caches())
     }
 
     pub fn address_space(&self) -> &KernelAddressSpace {
@@ -577,6 +852,14 @@ impl KernelMemorySubsystem {
         self.phys.lock().stats()
     }
 
+    /// 扫描 buddy hash/free-list/node freelist 并返回物理页结构审计结果。
+    ///
+    /// 这是冷路径接口，用于 allocator 自检、benchmark 和 panic 前日志。热路径只应读取
+    /// [`KernelMemorySubsystem::buddy_stats`]，避免把全量物理页结构扫描放进 alloc/free。
+    pub fn buddy_audit(&self) -> BuddyAudit {
+        self.phys.lock().audit()
+    }
+
     pub fn address_space_stats(&self) -> AddressSpaceStats {
         self.vmem.snapshot()
     }
@@ -589,38 +872,197 @@ impl KernelMemorySubsystem {
         self.registry.stats()
     }
 
+    /// 扫描 registry 内部链表并返回结构审计结果。
+    ///
+    /// 这是冷路径自检接口，会遍历所有 shard 的 bucket 链和 freelist；热路径只应使用
+    /// [`KernelMemorySubsystem::registry_stats`] 读取 O(1) 计数器，避免把完整扫描放进
+    /// alloc/free 的临界路径。
+    pub fn registry_audit(&self) -> AllocationRegistryAudit {
+        self.registry.audit()
+    }
+
+    /// 在同一次 shard 加锁窗口中同时取得 registry 计数器和结构审计结果。
+    ///
+    /// 诊断和 benchmark 同时需要两类数据时应优先使用该接口，避免先 `stats()` 再
+    /// `audit()` 造成重复锁 shard，也让两份数据来自更接近的采样窗口。
+    pub fn registry_snapshot(&self) -> AllocationRegistrySnapshot {
+        self.registry.snapshot()
+    }
+
     pub fn metadata_stats(&self) -> MetadataStats {
         self.metadata.stats()
+    }
+
+    pub fn managed_stats(&self) -> ManagedStats {
+        self.managed.stats()
     }
 
     pub fn allocate_physical(
         &self,
         request: PhysicalAllocRequest,
     ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
-        let mut phys = self.phys.lock();
-        let result = phys.alloc_pages_with(&request);
-        match result {
-            Ok(allocation) => Ok(allocation),
-            Err(err) => Err(err),
+        request.validate().map_err(buddy_alloc_error_from_request)?;
+        let allocation = self.allocate_physical_raw(request)?;
+        if !self.active.load(Ordering::Acquire) {
+            return Ok(allocation);
+        }
+
+        let record = physical_record_from_allocation(request, allocation);
+        match self.registry.register_result(&self.boot, record) {
+            Ok(()) => Ok(allocation),
+            Err(err) => {
+                let _ = self.free_physical_raw(allocation);
+                Err(match err {
+                    RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
+                    RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
+                    RegistryError::UnknownPointer => buddy::BuddyAllocError::InvalidAddress,
+                    RegistryError::DuplicatePointer => buddy::BuddyAllocError::BlockNotFree,
+                    RegistryError::MetadataOutOfMemory => {
+                        buddy::BuddyAllocError::MetadataOutOfMemory
+                    }
+                })
+            }
         }
     }
 
     pub fn free_physical(&self, allocation: PhysicalAllocation) -> bool {
-        let mut phys = self.phys.lock();
-        phys.free_allocation(allocation).is_ok()
+        self.try_free_physical(allocation).is_ok()
     }
 
+    /// 按物理地址查询已经进入 registry 的显式物理页句柄。
+    ///
+    /// 这个接口面向只保存 `paddr` 的外部子系统。它把 registry 中的真实
+    /// size/order/page_size 恢复成 [`PhysicalAllocation`]，避免调用方为了日志、校验或
+    /// 延迟释放而手工拼装句柄。
+    pub fn query_physical_allocation(
+        &self,
+        paddr: usize,
+    ) -> Result<PhysicalAllocation, PhysicalFreeError> {
+        let record = self
+            .query_tracked_allocation(paddr)
+            .map_err(|_| PhysicalFreeError::UnknownPointer)?;
+        if record.kind != AllocationKind::Physical {
+            return Err(PhysicalFreeError::InvalidRecordKind {
+                actual: record.kind,
+            });
+        }
+        Ok(physical_allocation_from_record(record))
+    }
+
+    /// 按物理地址释放一个已经进入 registry 的显式物理页。
+    ///
+    /// 外部 MM/页表代码经常只保存 `paddr`，如果让它们手工重建
+    /// [`PhysicalAllocation`]，很容易把 size/order/page_size 填错。这个接口直接移除
+    /// registry 中的 `Physical` 记录并释放对应 buddy 块，只做一次 shard 查找；若后端释放
+    /// 失败会恢复原记录，保持和 [`KernelMemorySubsystem::try_free_physical`] 相同的回滚语义。
+    pub fn try_free_physical_addr(&self, paddr: usize) -> Result<(), PhysicalFreeError> {
+        if !self.active.load(Ordering::Acquire) {
+            // 按地址释放依赖 registry 恢复 order/size/page_size。allocator 尚未 active 时
+            // 没有逐对象物理页记录，不能把裸 paddr 猜成单页释放；早期路径必须保留完整
+            // [`PhysicalAllocation`] 并调用 `try_free_physical()`。
+            return Err(PhysicalFreeError::Registry(RegistryError::NotInitialized));
+        }
+
+        let record = match self.registry.remove_result(paddr) {
+            Ok(record) => record,
+            Err(RegistryError::UnknownPointer) => return Err(PhysicalFreeError::UnknownPointer),
+            Err(err) => return Err(PhysicalFreeError::Registry(err)),
+        };
+        if record.kind != AllocationKind::Physical {
+            let _ = self.registry.register_result(&self.boot, record);
+            return Err(PhysicalFreeError::InvalidRecordKind {
+                actual: record.kind,
+            });
+        }
+
+        let allocation = physical_allocation_from_record(record);
+        if allocation.paddr != paddr {
+            let _ = self.registry.register_result(&self.boot, record);
+            return Err(PhysicalFreeError::AddressMismatch {
+                expected: allocation.paddr,
+                actual: paddr,
+            });
+        }
+
+        match self.try_free_physical_raw(allocation) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = self.registry.register_result(&self.boot, record);
+                Err(PhysicalFreeError::Buddy(err))
+            }
+        }
+    }
+
+    /// 释放由 [`KernelMemorySubsystem::allocate_physical`] 返回的显式物理页。
+    ///
+    /// 与旧的布尔接口相比，这个接口会保留失败原因：active 后先校验 registry 中的
+    /// `Physical` 记录，确认地址、order 和保留大小都与调用方传入的句柄一致，然后才
+    /// 进入 buddy 释放。任何校验失败都会把刚移除的 registry 记录恢复回去，避免一次
+    /// 错误释放尝试破坏后续所有权判断。
+    pub fn try_free_physical(
+        &self,
+        allocation: PhysicalAllocation,
+    ) -> Result<(), PhysicalFreeError> {
+        if !self.active.load(Ordering::Acquire) {
+            return self
+                .try_free_physical_raw(allocation)
+                .map_err(PhysicalFreeError::Buddy);
+        }
+
+        let record = match self.registry.remove_result(allocation.paddr) {
+            Ok(record) => record,
+            Err(RegistryError::UnknownPointer) => return Err(PhysicalFreeError::UnknownPointer),
+            Err(err) => return Err(PhysicalFreeError::Registry(err)),
+        };
+
+        if let Err(err) = validate_physical_free_record(record, allocation) {
+            // 调用方传入的句柄和 registry 中活跃记录不一致，说明这不是一次合法的
+            // 所有权释放。物理页仍由原记录持有，必须先恢复账本再返回类型化错误。
+            let _ = self.registry.register_result(&self.boot, record);
+            return Err(err);
+        }
+
+        match self.try_free_physical_raw(allocation) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // buddy 拒绝释放时，物理页实际仍由调用方持有；必须恢复 registry
+                // 账本，否则下一次释放会变成未知指针，审计也会漏掉该页。
+                let _ = self.registry.register_result(&self.boot, record);
+                Err(PhysicalFreeError::Buddy(err))
+            }
+        }
+    }
+
+    /// 直接从 buddy 分配裸物理页，不写入 allocator registry。
+    ///
+    /// 这个接口只保留给极早期 bring-up 或 allocator 内部兼容路径。正常驱动、DMA、
+    /// 用户页和未来 LKM 风格扩展都应使用 [`KernelMemorySubsystem::allocate_physical`]
+    /// / [`KernelMemorySubsystem::try_free_physical`]，否则审计无法发现泄漏、重复释放或
+    /// 句柄参数不匹配。
+    #[deprecated(
+        since = "0.1.0",
+        note = "use allocate_physical/try_free_physical so physical pages are tracked in allocator registry"
+    )]
     pub fn buddy_alloc_pages(&self, order: usize) -> Option<usize> {
         let mut phys = self.phys.lock();
         phys.alloc_pages(order)
     }
 
+    /// 释放由 [`KernelMemorySubsystem::buddy_alloc_pages`] 返回的裸物理页。
+    ///
+    /// 与 [`KernelMemorySubsystem::try_free_physical`] 不同，这里不会检查 registry 记录，
+    /// 也不会产生结构化错误。除非调用方明确处在 allocator 自举阶段，否则不应使用它。
+    #[deprecated(
+        since = "0.1.0",
+        note = "use try_free_physical so ownership is validated against allocator registry"
+    )]
     pub fn buddy_free_pages(&self, addr: usize, order: usize) -> bool {
         let mut phys = self.phys.lock();
         phys.free_pages(addr, order).is_ok()
     }
 
     pub fn allocate(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
+        request.validate()?;
         let active = self.active.load(Ordering::Acquire);
 
         if !active {
@@ -628,13 +1070,30 @@ impl KernelMemorySubsystem {
         }
 
         let mut allocation = self.allocate_active_once(request);
-        if allocation.is_err()
-            && !matches!(request.reclaim, ReclaimPolicy::NoReclaim)
-            && self.managed.is_enabled()
-        {
-            let pressure = self.pressure_level();
-            self.managed.collect_on_pressure(pressure);
-            allocation = self.allocate_active_once(request);
+        if allocation.is_err() && !matches!(request.reclaim, ReclaimPolicy::NoReclaim) {
+            match request.reclaim {
+                ReclaimPolicy::NoReclaim => {}
+                ReclaimPolicy::TryManagedGc => {
+                    if self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                        allocation = self.allocate_active_once(request);
+                    }
+                }
+                ReclaimPolicy::TryAllocatorReclaim => {
+                    let reclaimed = self.reclaim_allocator_caches_for_retry();
+                    if reclaimed.reclaimed_bytes() != 0 && self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                    }
+                    allocation = self.allocate_active_once(request);
+                    if allocation.is_err() && self.managed.is_enabled() {
+                        let pressure = self.pressure_level();
+                        self.managed.collect_on_pressure(pressure);
+                        allocation = self.allocate_active_once(request);
+                    }
+                }
+            }
         }
         match allocation {
             Ok(record) => Ok(record),
@@ -682,8 +1141,79 @@ impl KernelMemorySubsystem {
         Err(OwnershipError::UnknownPointer)
     }
 
+    /// 查询逐对象注册表中的分配记录。
+    ///
+    /// 与 [`KernelMemorySubsystem::query_allocation`] 不同，这个 API 不把 boot bump
+    /// 区间作为 fallback。外部子系统需要判断“这个裸指针是否仍是一个可操作的对象”
+    /// 时应使用这里，因为 active 后 boot 分配没有逐对象边界，不能安全地从区间包含关系
+    /// 推导出对象所有权。
+    pub fn query_tracked_allocation(&self, ptr: usize) -> Result<AllocationRecord, OwnershipError> {
+        self.registry.get(ptr).ok_or(OwnershipError::UnknownPointer)
+    }
+
+    /// 判断裸指针是否属于当前 allocator 逐对象跟踪的活跃分配。
+    ///
+    /// 这是给外部子系统做防御性检查的窄 API。需要释放或调整大小时仍应调用
+    /// [`KernelMemorySubsystem::deallocate`] / [`KernelMemorySubsystem::reallocate`]，
+    /// 不能因为这里返回 `true` 就绕过 allocator 的账本更新。
+    ///
+    /// active 之后 boot 区域没有逐对象元数据，不能把“地址落在 boot bump 区间内”
+    /// 等价成“这是一个仍可操作的分配起始指针”；因此这里只信任注册表。
+    pub fn owns_allocation(&self, ptr: usize) -> bool {
+        ptr != 0 && self.query_tracked_allocation(ptr).is_ok()
+    }
+
     pub fn allocation_kind(&self, ptr: usize) -> Result<AllocationKind, OwnershipError> {
-        self.query_allocation(ptr).map(|record| record.kind)
+        self.query_tracked_allocation(ptr).map(|record| record.kind)
+    }
+
+    /// 返回调用方请求的逻辑大小。
+    ///
+    /// 该值不一定等于底层可用空间；slab 对象通常会向上取整到 size class。
+    pub fn allocation_size(&self, ptr: usize) -> Result<usize, OwnershipError> {
+        self.query_tracked_allocation(ptr).map(|record| record.size)
+    }
+
+    /// 返回 allocator 为该分配实际保留的可用大小。
+    ///
+    /// 调用方只能在自己持有对象所有权时使用这个值做容量优化，不能把它当作越界访问
+    /// 的授权；对象语义上的有效长度仍由上层数据结构维护。
+    pub fn allocation_usable_size(&self, ptr: usize) -> Result<usize, OwnershipError> {
+        self.query_tracked_allocation(ptr)
+            .map(|record| record.usable_size.max(record.size))
+    }
+
+    /// 返回分配记录中的对齐要求。
+    pub fn allocation_alignment(&self, ptr: usize) -> Result<usize, OwnershipError> {
+        self.query_tracked_allocation(ptr)
+            .map(|record| record.align)
+    }
+
+    /// 判断指定分配能否在不移动指针的前提下调整到新请求。
+    ///
+    /// 这个 API 只做账本和 size-class/order 判断，不会修改 allocator 状态。需要稳定
+    /// 指针的外部子系统可以先调用它：返回 `Ok(true)` 时 [`reallocate`] 会走原地更新，
+    /// 返回 `Ok(false)` 时则表示需要新分配、复制和释放旧对象。
+    pub fn can_reallocate_in_place(
+        &self,
+        ptr: usize,
+        request: MemoryRequest,
+    ) -> Result<bool, AllocationError> {
+        if ptr == 0
+            || !self.active.load(Ordering::Acquire)
+            || !matches!(request.domain, MemoryDomain::Kernel)
+        {
+            return Err(AllocationError::InvalidLayout);
+        }
+
+        let new_layout = request.layout()?;
+        let record = self
+            .query_tracked_allocation(ptr)
+            .map_err(|_| AllocationError::InvalidLayout)?;
+        if !matches!(record.kind, AllocationKind::Small | AllocationKind::Large) {
+            return Err(AllocationError::InvalidLayout);
+        }
+        Ok(self.can_reuse_allocation(record, new_layout))
     }
 
     pub fn deallocate(&self, ptr: usize) -> Result<(), DeallocationError> {
@@ -727,37 +1257,98 @@ impl KernelMemorySubsystem {
                 Ok(())
             }
             AllocationKind::Managed => {
-                if let Err(err) = self.managed.free(ptr, &self.vmem) {
-                    // 允许 ObjectStillReferenced 错误传播（例如由上层处理）
-                    Err(err)
-                } else {
-                    Ok(())
+                match self.managed.free(ptr, &self.vmem) {
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        // managed 对象可能因为仍有强句柄或根引用而拒绝释放。此时对象实际
+                        // 仍然存活，registry 账本必须回滚，否则后续句柄释放后会变成悬空对象。
+                        if let Err(rollback_err) = self.registry.register_result(&self.boot, record)
+                        {
+                            panic!(
+                                "[alloc][invariant] managed deallocate rollback failed: ptr={:#x} err={:?} rollback={:?}",
+                                ptr, err, rollback_err
+                            );
+                        }
+                        Err(err)
+                    }
                 }
             }
             AllocationKind::Physical => {
-                let allocation = PhysicalAllocation {
-                    paddr: record.paddr.unwrap_or(record.ptr),
-                    size: record.usable_size.max(record.size),
-                    order: record.order,
-                    page_size: record.page_size,
-                };
-                if self.free_physical(allocation) {
-                    Ok(())
-                } else {
-                    panic!(
-                        "[alloc][invariant] registry owned physical allocation but buddy rejected free: ptr={:#x} paddr={:#x} order={}",
-                        ptr, allocation.paddr, allocation.order
-                    )
+                let allocation = physical_allocation_from_record(record);
+                match self.try_free_physical_raw(allocation) {
+                    Ok(()) => Ok(()),
+                    Err(err) => panic!(
+                        "[alloc][invariant] registry owned physical allocation but buddy rejected free: ptr={:#x} paddr={:#x} order={} err={:?}",
+                        ptr, allocation.paddr, allocation.order, err
+                    ),
                 }
             }
         }
+    }
+
+    /// 调整一个普通内核分配的大小，并返回更新后的分配记录。
+    ///
+    /// 这是给内核其它子系统使用的安全 resize API。它只支持 `Kernel` 域中由
+    /// slab/kheap 管理的对象；受管对象迁移必须走 GC 句柄语义，物理页也应使用
+    /// `allocate_physical/free_physical` 明确表达所有权。
+    ///
+    /// 和 `GlobalAlloc::realloc` 不同，这里不要求调用方提供旧 `Layout`，复制长度
+    /// 直接来自 allocator 注册表中的真实记录，避免外部 API 误传旧尺寸导致越界复制。
+    pub fn reallocate(
+        &self,
+        ptr: usize,
+        request: MemoryRequest,
+    ) -> Result<AllocationRecord, AllocationError> {
+        self.total_reallocs.fetch_add(1, Ordering::Relaxed);
+        self.kheap.record_realloc();
+
+        if ptr == 0 {
+            return self.allocate(request);
+        }
+        if !self.active.load(Ordering::Acquire) || !matches!(request.domain, MemoryDomain::Kernel) {
+            return Err(AllocationError::InvalidLayout);
+        }
+
+        let new_layout = request.layout()?;
+        let old_record = match self.probe_tracked_realloc(ptr, new_layout, request.size) {
+            Ok(TrackedReallocProbe::Updated { old_size, record }) => {
+                if matches!(request.zeroing, Zeroing::Zeroed) && request.size > old_size {
+                    let start = ptr
+                        .checked_add(old_size)
+                        .ok_or(AllocationError::InvalidLayout)?;
+                    let len = request.size - old_size;
+                    unsafe { core::ptr::write_bytes(start as *mut u8, 0, len) };
+                }
+                return Ok(record);
+            }
+            Ok(TrackedReallocProbe::NeedsMove(record)) => record,
+            Ok(TrackedReallocProbe::Untracked) | Err(_) => {
+                return Err(AllocationError::InvalidLayout);
+            }
+        };
+        if !matches!(
+            old_record.kind,
+            AllocationKind::Small | AllocationKind::Large
+        ) {
+            return Err(AllocationError::InvalidLayout);
+        }
+
+        let new_record = self.allocate(request)?;
+        let copy_len = old_record.size.min(new_record.size);
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr as *const u8, new_record.ptr as *mut u8, copy_len);
+        }
+        self.retire_moved_kernel_allocation(ptr, old_record, || {
+            let _ = self.deallocate(new_record.ptr);
+        });
+        Ok(new_record)
     }
 
     fn allocate_boot(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
         if !matches!(request.domain, MemoryDomain::Kernel) {
             return Err(AllocationError::NotInitialized);
         }
-        let layout = layout_from_request(request)?;
+        let layout = request.layout()?;
         let ptr = self.boot.alloc(layout) as usize;
         if ptr == 0 {
             return Err(AllocationError::OutOfMemory);
@@ -773,7 +1364,9 @@ impl KernelMemorySubsystem {
     }
 
     fn alloc_active(&self, layout: Layout, zeroing: Zeroing) -> *mut u8 {
-        let request = MemoryRequest::for_kernel_layout(layout).with_zeroing(zeroing);
+        let request = MemoryRequest::for_kernel_layout(layout)
+            .with_zeroing(zeroing)
+            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim);
         match self.allocate(request) {
             Ok(record) => record.ptr as *mut u8,
             Err(_) => null_mut(),
@@ -787,7 +1380,7 @@ impl KernelMemorySubsystem {
         match request.domain {
             MemoryDomain::Kernel => {
                 let cpu = self.current_cpu_id();
-                let layout = layout_from_request(request)?;
+                let layout = request.layout()?;
                 let force_large = matches!(request.page_policy, PagePolicy::RequireLarge);
                 let alloc_large = || -> Result<AllocationRecord, AllocationError> {
                     let range = match self.kheap.alloc_range(
@@ -817,41 +1410,42 @@ impl KernelMemorySubsystem {
                         range.paddr,
                         range.order,
                         (1usize << range.order) * PAGE_SIZE,
-                    );
+                    )
+                    .with_backend_cookie(KernelHeap::backend_cookie_for(
+                        range,
+                        request.page_policy,
+                    ));
                     self.register_allocation(record, || {
-                        let _ = self.kheap.free_record(record, &self.phys, &self.vmem);
+                        let _ = self
+                            .kheap
+                            .free_record_uncached(record, &self.phys, &self.vmem);
                     })?;
                     Ok(record)
                 };
                 if is_small_request(request) && !force_large {
                     // 先尝试 slab，但前提是它能满足对齐要求
-                    let zone_idx_opt = {
-                        let layout = layout_from_request(request)?;
-                        SlabAllocator::class_index_for(layout)
-                    };
+                    let zone_idx_opt = SlabAllocator::class_index_for(layout);
 
                     if let Some(zone_idx) = zone_idx_opt {
                         let usable_size = self.slab.zone_size_class(zone_idx);
-                        let ptr = self.slab.alloc(layout, cpu, &self.phys, &self.vmem);
-                        if ptr.is_null() {
-                            return alloc_large();
+                        let allocation =
+                            self.slab.alloc_class(zone_idx, cpu, &self.phys, &self.vmem);
+                        if allocation.is_null() {
+                            return Err(AllocationError::OutOfMemory);
                         }
                         if matches!(request.zeroing, Zeroing::Zeroed) {
                             unsafe {
-                                core::ptr::write_bytes(ptr, 0, request.size);
+                                core::ptr::write_bytes(allocation.ptr as *mut u8, 0, request.size);
                             }
                         }
                         let record = AllocationRecord::new(
                             AllocationKind::Small,
                             MemoryDomain::Kernel,
-                            ptr as usize,
+                            allocation.ptr,
                         )
                         .with_arena(AllocationArena::Kernel)
-                        .with_sizes(
-                            request.size,
-                            usable_size,
-                            request.align,
-                        );
+                        .with_sizes(request.size, usable_size, request.align)
+                        .with_backend_cookie(allocation.slab_node);
                         self.register_allocation(record, || {
                             self.slab.free_record_reclaiming(
                                 record,
@@ -877,7 +1471,7 @@ impl KernelMemorySubsystem {
                         _ => AllocationError::NotInitialized,
                     });
                 }
-                let layout = layout_from_request(request)?;
+                let layout = request.layout()?;
                 let record =
                     match self
                         .managed
@@ -905,26 +1499,39 @@ impl KernelMemorySubsystem {
                 Ok(record)
             }
             MemoryDomain::Physical => {
+                let physical_request = PhysicalAllocRequest::new(request.size, request.align)
+                    .with_page_policy(request.page_policy)
+                    .with_placement(request.placement);
                 let allocation = self
-                    .allocate_physical(
-                        PhysicalAllocRequest::new(request.size, request.align)
-                            .with_page_policy(request.page_policy)
-                            .with_placement(request.placement),
-                    )
+                    .allocate_physical_raw(physical_request)
                     .map_err(AllocationError::from)?;
-                let record = AllocationRecord::new(
-                    AllocationKind::Physical,
-                    MemoryDomain::Physical,
-                    allocation.paddr,
-                )
-                .with_physical(allocation.paddr, allocation.order, allocation.page_size)
-                .with_sizes(request.size, allocation.size, request.align);
+                let record = physical_record_from_allocation(physical_request, allocation);
                 self.register_allocation(record, || {
-                    let _ = self.free_physical(allocation);
+                    let _ = self.free_physical_raw(allocation);
                 })?;
                 Ok(record)
             }
         }
+    }
+
+    fn allocate_physical_raw(
+        &self,
+        request: PhysicalAllocRequest,
+    ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
+        let mut phys = self.phys.lock();
+        phys.alloc_pages_with(&request)
+    }
+
+    fn free_physical_raw(&self, allocation: PhysicalAllocation) -> bool {
+        self.try_free_physical_raw(allocation).is_ok()
+    }
+
+    fn try_free_physical_raw(
+        &self,
+        allocation: PhysicalAllocation,
+    ) -> Result<(), buddy::BuddyFreeError> {
+        let mut phys = self.phys.lock();
+        phys.free_allocation(allocation)
     }
 
     fn current_cpu_id(&self) -> usize {
@@ -994,6 +1601,15 @@ impl KernelMemorySubsystem {
             .alloc(layout, &self.phys, self.load_phys_to_virt())
     }
 
+    fn reclaim_allocator_caches_for_retry(&self) -> AllocatorReclaimStats {
+        // 分配失败后的重试路径必须先归还 allocator 自己持有的可回收内存：
+        // kheap range cache、slab per-CPU cache/空 slab、buddy order-0 延迟合并页。
+        // 这不是周期性整理，而是 OOM 前的最后防线，避免大规模短生命周期任务结束后
+        // 大量页仍停在内部缓存里，后续请求却继续向 buddy 要新页。
+        self.reclaim(AllocatorReclaimRequest::caches())
+            .unwrap_or_default()
+    }
+
     pub fn load_phys_to_virt(&self) -> Option<PhysToVirtFn> {
         let raw = self.phys_to_virt.load(Ordering::Acquire);
         if raw == 0 {
@@ -1049,6 +1665,9 @@ impl KernelMemorySubsystem {
     }
 
     fn can_reuse_allocation(&self, record: AllocationRecord, new_layout: Layout) -> bool {
+        if !ptr_satisfies_align(record.ptr, new_layout.align()) {
+            return false;
+        }
         match record.kind {
             AllocationKind::Small => {
                 is_small(new_layout)
@@ -1063,12 +1682,110 @@ impl KernelMemorySubsystem {
         }
     }
 
+    fn release_moved_kernel_record(&self, record: AllocationRecord) {
+        // `reallocate` 迁移路径已经把旧对象从 registry 移除。这里直接释放对应后端，避免
+        // 再进入通用 `deallocate` 做一次查账和分派；如果后端拒绝释放，说明 registry 与
+        // 后端状态已经不一致，必须作为 allocator invariant 暴露。
+        match record.kind {
+            AllocationKind::Small => {
+                if !self.slab.free_record_reclaiming(
+                    record,
+                    self.current_cpu_id(),
+                    Some((&self.phys, &self.vmem)),
+                ) {
+                    panic!(
+                        "[alloc][invariant] moved small allocation release failed: ptr={:#x} size={} usable={}",
+                        record.ptr, record.size, record.usable_size
+                    );
+                }
+            }
+            AllocationKind::Large => {
+                if let Err(err) = self.kheap.free_record(record, &self.phys, &self.vmem) {
+                    panic!(
+                        "[alloc][invariant] moved large allocation release failed: ptr={:#x} paddr={:?} order={} err={:?}",
+                        record.ptr, record.paddr, record.order, err
+                    );
+                }
+            }
+            _ => panic!(
+                "[alloc][invariant] reallocate tried to release non-kernel movable record: {:?}",
+                record
+            ),
+        }
+    }
+
+    fn retire_moved_kernel_allocation<F>(
+        &self,
+        ptr: usize,
+        expected: AllocationRecord,
+        cleanup_new: F,
+    ) where
+        F: FnOnce(),
+    {
+        let removed = match self.registry.remove_result(ptr) {
+            Ok(record) => record,
+            Err(err) => {
+                cleanup_new();
+                panic!(
+                    "[alloc][invariant] reallocate lost old registry record: ptr={:#x} err={:?}",
+                    ptr, err
+                );
+            }
+        };
+        if removed != expected {
+            cleanup_new();
+            panic!(
+                "[alloc][invariant] reallocate removed unexpected record: ptr={:#x} expected={:?} removed={:?}",
+                ptr, expected, removed
+            );
+        }
+        self.release_moved_kernel_record(removed);
+    }
+
+    fn probe_tracked_realloc(
+        &self,
+        ptr: usize,
+        new_layout: Layout,
+        new_size: usize,
+    ) -> Result<TrackedReallocProbe, RegistryError> {
+        // GlobalAlloc::realloc 是最热的 resize 入口之一。这里把“查记录 + 判断能否
+        // 原地复用 + 更新逻辑大小”合并到 registry 的单次 shard 加锁中，避免同一
+        // 指针连续两次哈希、加锁和链表扫描；无法原地复用时直接把旧记录带回，
+        // 后续搬迁复制也不需要再查一次账本。
+        let mut old_size = 0usize;
+        match self
+            .registry
+            .update_existing_maybe_result(ptr, |mut record| {
+                old_size = record.size;
+                if !self.can_reuse_allocation(record, new_layout) {
+                    return None;
+                }
+                record.size = new_size;
+                record.align = new_layout.align();
+                Some(record)
+            }) {
+            Ok((record, true)) => Ok(TrackedReallocProbe::Updated { old_size, record }),
+            Ok((record, false)) => Ok(TrackedReallocProbe::NeedsMove(record)),
+            Err(RegistryError::UnknownPointer) => Ok(TrackedReallocProbe::Untracked),
+            Err(err) => Err(err),
+        }
+    }
+
     fn record_oom(&self) {
         self.oom_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_ownership_failure(&self) {
         self.ownership_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_global_dealloc_stats(&self, layout: Layout) {
+        // `total_*` 统计的是 Rust `GlobalAlloc` 前端看到的请求，而不是所有 typed
+        // allocator API。`realloc` 搬迁路径绕过通用 `dealloc` 释放旧对象时，也必须
+        // 维持同一口径，benchmark 才能稳定拆分 alloc/free/realloc 成本。
+        self.total_deallocs.fetch_add(1, Ordering::Relaxed);
+        self.total_bytes_freed
+            .fetch_add(layout.size() as u64, Ordering::Relaxed);
     }
 
     fn register_allocation<F>(
@@ -1102,11 +1819,13 @@ impl KernelMemorySubsystem {
                 }
                 // 无法清除则回滚
                 rollback();
-                Err(AllocationError::OutOfMemory)
+                Err(allocation_error_from_registry(
+                    RegistryError::DuplicatePointer,
+                ))
             }
-            Err(_) => {
+            Err(err) => {
                 rollback();
-                Err(AllocationError::OutOfMemory)
+                Err(allocation_error_from_registry(err))
             }
         }
     }
@@ -1129,9 +1848,101 @@ fn is_small_request(request: MemoryRequest) -> bool {
     request.size <= MAX_SMALL_SIZE && request.align <= PAGE_SIZE
 }
 
-fn layout_from_request(request: MemoryRequest) -> Result<Layout, AllocationError> {
-    Layout::from_size_align(request.size.max(1), request.align.max(1))
-        .map_err(|_| AllocationError::InvalidLayout)
+fn physical_record_from_allocation(
+    request: PhysicalAllocRequest,
+    allocation: PhysicalAllocation,
+) -> AllocationRecord {
+    AllocationRecord::new(
+        AllocationKind::Physical,
+        MemoryDomain::Physical,
+        allocation.paddr,
+    )
+    .with_physical(allocation.paddr, allocation.order, allocation.page_size)
+    .with_sizes(request.size, allocation.size, request.align)
+}
+
+fn physical_allocation_from_record(record: AllocationRecord) -> PhysicalAllocation {
+    PhysicalAllocation {
+        paddr: record.paddr.unwrap_or(record.ptr),
+        size: record.usable_size.max(record.size),
+        order: record.order,
+        page_size: record.page_size,
+    }
+}
+
+fn validate_physical_free_record(
+    record: AllocationRecord,
+    allocation: PhysicalAllocation,
+) -> Result<(), PhysicalFreeError> {
+    if record.kind != AllocationKind::Physical {
+        return Err(PhysicalFreeError::InvalidRecordKind {
+            actual: record.kind,
+        });
+    }
+
+    let expected_paddr = record.paddr.unwrap_or(record.ptr);
+    if expected_paddr != allocation.paddr {
+        return Err(PhysicalFreeError::AddressMismatch {
+            expected: expected_paddr,
+            actual: allocation.paddr,
+        });
+    }
+    if record.order != allocation.order {
+        return Err(PhysicalFreeError::OrderMismatch {
+            expected: record.order,
+            actual: allocation.order,
+        });
+    }
+
+    if record.page_size != allocation.page_size {
+        return Err(PhysicalFreeError::PageSizeMismatch {
+            expected: record.page_size,
+            actual: allocation.page_size,
+        });
+    }
+
+    let expected_size = record.usable_size.max(record.size);
+    if expected_size != allocation.size {
+        return Err(PhysicalFreeError::SizeMismatch {
+            expected: expected_size,
+            actual: allocation.size,
+        });
+    }
+    Ok(())
+}
+
+fn allocation_error_from_registry(err: RegistryError) -> AllocationError {
+    match err {
+        RegistryError::NotInitialized => AllocationError::NotInitialized,
+        RegistryError::MetadataOutOfMemory => AllocationError::OutOfMemory,
+        RegistryError::InvalidRecord
+        | RegistryError::DuplicatePointer
+        | RegistryError::UnknownPointer => AllocationError::InvalidLayout,
+    }
+}
+
+fn buddy_alloc_error_from_request(err: AllocationRequestError) -> buddy::BuddyAllocError {
+    match err {
+        AllocationRequestError::InvalidSize
+        | AllocationRequestError::InvalidAlignment
+        | AllocationRequestError::SizeOverflow
+        | AllocationRequestError::UnsupportedOrder => buddy::BuddyAllocError::InvalidOrder,
+        AllocationRequestError::InvalidPlacement => buddy::BuddyAllocError::InvalidAddress,
+    }
+}
+
+fn ptr_satisfies_align(ptr: usize, align: usize) -> bool {
+    align != 0 && align.is_power_of_two() && (ptr & (align - 1)) == 0
+}
+
+fn realloc_copy_source_size(record: AllocationRecord, fallback_layout_size: usize) -> usize {
+    // boot 分配没有逐对象账本，active 后只能合成 size=0 的记录；realloc 仍需按
+    // 调用方传入的旧 Layout 保留内容，其它路径则以 registry 真实大小为准。
+    if matches!(record.kind, AllocationKind::Boot) && record.size == 0 {
+        fallback_layout_size
+    } else {
+        record.size
+    }
 }
 
 fn managed_gc_reclaim(ptr: usize, size: usize) {
@@ -1205,7 +2016,19 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         };
         let active = self.active.load(Ordering::Acquire);
         let owner = if active {
-            self.query_allocation(ptr as usize).ok()
+            match self.probe_tracked_realloc(ptr as usize, new_layout, new_size) {
+                Ok(TrackedReallocProbe::Updated { .. }) => return ptr,
+                Ok(TrackedReallocProbe::NeedsMove(record)) => Some(record),
+                Ok(TrackedReallocProbe::Untracked) if self.boot.contains(ptr as usize) => Some(
+                    AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr as usize)
+                        .with_sizes(layout.size(), layout.size(), layout.align()),
+                ),
+                Ok(TrackedReallocProbe::Untracked) => None,
+                Err(_) => {
+                    self.record_ownership_failure();
+                    return null_mut();
+                }
+            }
         } else if self.boot.contains(ptr as usize) {
             Some(
                 AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr as usize)
@@ -1215,26 +2038,20 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             None
         };
 
-        if owner.is_none() {
+        let Some(owner) = owner else {
             if active {
                 self.record_ownership_failure();
             }
             return null_mut();
-        }
-
+        };
         if active
-            && owner
-                .map(|record| self.can_reuse_allocation(record, new_layout))
-                .unwrap_or(false)
+            && !matches!(
+                owner.kind,
+                AllocationKind::Boot | AllocationKind::Small | AllocationKind::Large
+            )
         {
-            if let Some(mut record) = owner {
-                record.size = new_size;
-                record.align = new_layout.align();
-                if !self.registry.update_existing(ptr as usize, record) {
-                    self.record_ownership_failure();
-                }
-            }
-            return ptr;
+            self.record_ownership_failure();
+            return null_mut();
         }
 
         let new_ptr = unsafe { self.alloc(new_layout) };
@@ -1242,14 +2059,24 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             return null_mut();
         }
 
-        let copy_len = layout.size().min(new_size);
+        let old_size = realloc_copy_source_size(owner, layout.size());
+        let copy_len = old_size.min(new_size);
         unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy_len) };
 
         if active {
-            match owner {
-                Some(record) if record.kind == AllocationKind::Boot => {}
-                Some(_) => unsafe { self.dealloc(ptr, layout) },
-                None => unreachable!(),
+            match owner.kind {
+                AllocationKind::Boot => {}
+                AllocationKind::Small | AllocationKind::Large => {
+                    self.retire_moved_kernel_allocation(ptr as usize, owner, || unsafe {
+                        self.dealloc(new_ptr, new_layout)
+                    });
+                    self.record_global_dealloc_stats(layout);
+                }
+                AllocationKind::Managed | AllocationKind::Physical => {
+                    self.record_ownership_failure();
+                    unsafe { self.dealloc(new_ptr, new_layout) };
+                    return null_mut();
+                }
             }
         }
 
