@@ -594,6 +594,52 @@ impl SplitVirtQueue {
         Ok(queue)
     }
 
+    /// 创建一个兼容 VirtIO legacy (MMIO v1) 的 split virtqueue。
+    ///
+    /// Legacy 传输要求 descriptor table、available ring、used ring 放在
+    /// 一段物理连续的内存中，通过 QueuePFN 寄存器一次性告知设备。
+    /// 布局：desc_table | avail_ring | used_ring（按各自对齐要求）。
+    pub fn new_legacy(queue_size: u16) -> Result<Self, VirtQueueError> {
+        let qsz = validate_queue_size(queue_size)?;
+        let desc_len = desc_table_bytes(qsz)?;
+        let avail_len = avail_ring_bytes(qsz)?;
+        let used_len = used_ring_bytes(qsz)?;
+
+        let page_align = DESC_ALIGN.max(AVAIL_ALIGN).max(USED_ALIGN).max(4096);
+        // Legacy 要求 Used Ring 页对齐：在 avail 和 used 之间可能有填充
+        let used_off = (desc_len + avail_len).next_multiple_of(4096);
+        let total = used_off + used_len;
+        let dma_ctx = DmaContext::default_coherent();
+        let buf = DmaBuffer::new_in(dma_ctx, total, page_align, DmaDirection::Bidirectional)
+            .map_err(VirtQueueError::DmaAllocationFailed)?;
+
+        let base_dma = buf.dma_addr();
+        let base_vaddr = buf.vaddr();
+        let master_alloc = buf.take_allocation();
+
+        // desc 持有主分配（drop 时释放整段）；avail/used 是零分配视图
+        let desc = DmaBuffer::from_allocation(
+            master_alloc, base_dma, base_vaddr, desc_len, DmaDirection::ToDevice,
+        );
+        // Legacy 规范要求 Used Ring 页对齐
+        let used_off = (desc_len + avail_len).next_multiple_of(4096);
+        let avail = DmaBuffer::sub_view(base_dma + desc_len, base_vaddr + desc_len, avail_len);
+        let used = DmaBuffer::sub_view(base_dma + used_off, base_vaddr + used_off, used_len);
+
+        let mut queue = Self {
+            queue_size,
+            dma_context: dma_ctx,
+            desc,
+            avail,
+            used,
+            last_used_idx: 0,
+            free_desc: Vec::new(),
+            desc_state: Vec::new(),
+        };
+        queue.clear()?;
+        Ok(queue)
+    }
+
     pub const fn dma_context(&self) -> DmaContext {
         self.dma_context
     }
@@ -942,7 +988,7 @@ impl SplitVirtQueue {
         }
     }
 
-    fn used_idx(&self) -> u16 {
+    pub fn used_idx(&self) -> u16 {
         unsafe { read_volatile(self.used_idx_ptr().cast_const()) }
     }
 

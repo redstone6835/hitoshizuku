@@ -339,6 +339,42 @@ impl DmaBuffer {
             direction: self.direction(),
         }
     }
+
+}
+
+impl DmaBuffer {
+    /// 创建一个不拥有底层内存的"视图" DmaBuffer。
+    /// drop 时 free_physical 是空操作（size=0）。
+    pub fn sub_view(dma_addr: usize, vaddr: usize, len: usize) -> Self {
+        Self {
+            allocation: PhysicalAllocation { paddr: 0, size: 0, order: 0, page_size: 0 },
+            context: DmaContext::default_coherent(),
+            vaddr,
+            dma_addr,
+            len,
+            direction: DmaDirection::Bidirectional,
+        }
+    }
+
+    /// 从已有的 PhysicalAllocation 构造 DmaBuffer（继承其生命周期）。
+    /// 用于 legacy virtqueue：主分配由 desc ring 持有，avail/used 用 sub_view。
+    pub fn from_allocation(alloc: PhysicalAllocation, dma_addr: usize, vaddr: usize, len: usize, direction: DmaDirection) -> Self {
+        Self {
+            allocation: alloc,
+            context: DmaContext::default_coherent(),
+            vaddr,
+            dma_addr,
+            len,
+            direction,
+        }
+    }
+
+    /// 消费 DmaBuffer，返回内部 PhysicalAllocation 供手动管理。
+    pub fn take_allocation(self) -> PhysicalAllocation {
+        let alloc = self.allocation;
+        core::mem::forget(self);
+        alloc
+    }
 }
 
 impl Drop for DmaBuffer {

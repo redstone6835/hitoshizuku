@@ -9,6 +9,6 @@ pub fn register_arch_hooks() {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL sched hooks are not implemented")
+        arch::register_sched_ctx();
     }
 }

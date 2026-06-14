@@ -15,6 +15,8 @@ mod syscon;
 
 mod loongson_irq;
 
+mod plic;
+
 mod ls7a_rtc;
 
 mod fw_cfg;
@@ -109,6 +111,7 @@ const BUILTIN_DRIVER_CATALOG: &[BuiltinDriverRegistration] = &[
     BuiltinDriverRegistration::new("firmware-bus", firmware_bus::register_builtin_driver),
     BuiltinDriverRegistration::new("syscon", syscon::register_builtin_driver),
     BuiltinDriverRegistration::new("loongson-irq", loongson_irq::register_builtin_driver),
+    BuiltinDriverRegistration::new("riscv-plic", plic::register_builtin_driver),
     BuiltinDriverRegistration::new("ls7a-rtc", ls7a_rtc::register_builtin_driver),
     BuiltinDriverRegistration::new("fw-cfg", fw_cfg::register_builtin_driver),
     BuiltinDriverRegistration::new("cfi-flash", cfi_flash::register_builtin_driver),
