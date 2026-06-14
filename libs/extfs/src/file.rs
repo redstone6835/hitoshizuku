@@ -17,6 +17,7 @@ use vfs::file::{DirEntry, FileOps, PollEvents};
 use vfs::stat::FileType;
 use vfs::superblock::Superblock as VfsSuperblock;
 use vfs::sync::Spinlock;
+use sched::mutex::Mutex;
 
 use crate::inode_wr::{RawInode, write_raw};
 use crate::layout::{
@@ -126,7 +127,7 @@ pub struct ExtRegFileOps {
     raw: Arc<Spinlock<RawInode>>,
     map_cache: Spinlock<BlockMapCache>,
     /// 串行化 append / 扩容。
-    io_mu: Spinlock<()>,
+    io_mu: Mutex<()>,
 }
 
 struct BlockMapCache {
@@ -174,7 +175,7 @@ impl ExtRegFileOps {
             ino,
             raw,
             map_cache: Spinlock::new(BlockMapCache::default()),
-            io_mu: Spinlock::new(()),
+            io_mu: Mutex::new(()),
         }
     }
 
