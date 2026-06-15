@@ -702,7 +702,10 @@ impl BlockDevice {
                 break;
             }
             if sched::is_ready() {
-                sched::schedule_once(0);
+                // 同步块 I/O 等待是 iozone 写路径的热区。用真实时间片让
+                // 持锁/持请求的任务获得公平运行机会，避免零记账 yield
+                // 在高并发小 I/O 下让完成路径长期拿不到 CPU。
+                sched::schedule_once(sched::now_ns_public());
             } else {
                 core::hint::spin_loop();
             }

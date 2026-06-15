@@ -3,6 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
@@ -2184,6 +2185,23 @@ struct FutexWaiter {
     task: Weak<sched::Task>,
     bitset: u32,
     waitv_index: Option<usize>,
+    state: Arc<FutexWaitState>,
+}
+
+struct FutexWaitState {
+    /// waiter 是否已经把当前 task 提交为 Sleeping。
+    sleeping: AtomicBool,
+    /// wake 先于真正 schedule 发生时，用这个标记把事件传回 waiter 自身。
+    woken: AtomicBool,
+}
+
+impl FutexWaitState {
+    fn new() -> Self {
+        Self {
+            sleeping: AtomicBool::new(false),
+            woken: AtomicBool::new(false),
+        }
+    }
 }
 
 struct FutexBucket {
@@ -2220,7 +2238,7 @@ fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
             if (bucket.waiters[idx].bitset & bitset) != 0 {
                 let waiter = bucket.waiters.remove(idx);
                 if let Some(task) = waiter.task.upgrade() {
-                    waiters.push(task);
+                    waiters.push((task, waiter.state));
                 }
             } else {
                 idx += 1;
@@ -2234,15 +2252,19 @@ fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
     wake_futex_waiters(waiters)
 }
 
-fn wake_futex_waiters(waiters: Vec<Arc<sched::Task>>) -> usize {
+fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> usize {
     let mut woken = 0usize;
-    for waiter in waiters {
-        if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+    for (waiter, state) in waiters {
+        state.woken.store(true, Ordering::Release);
+        if state.sleeping.load(Ordering::Acquire)
+            && waiter.cas_state(TaskState::Sleeping, TaskState::Runnable)
+        {
             sched::enqueue_task(waiter, sched::now_ns_public());
             woken += 1;
-        } else if waiter.cas_state(TaskState::Running, TaskState::Runnable) {
-            woken += 1;
-        } else if waiter.state() == TaskState::Runnable {
+        } else if matches!(waiter.state(), TaskState::Running | TaskState::Runnable) {
+            // waiter 可能刚把自己发布到 futex 表、但还没有真正睡眠。
+            // 这种情况下 wake 已经通过“从表中删除 waiter”传递了事件；
+            // 不要把仍在运行的当前任务强行塞回 runqueue，避免重复入队。
             woken += 1;
         }
     }
@@ -2310,7 +2332,7 @@ fn futex_requeue_key(
                 let waiter = bucket.waiters.remove(idx);
                 if wake.len() < wake_count {
                     if let Some(task) = waiter.task.upgrade() {
-                        wake.push(task);
+                        wake.push((task, waiter.state));
                     }
                 } else if requeue.len() < requeue_count {
                     if waiter.task.strong_count() != 0 {
@@ -2635,6 +2657,7 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
                     task: Arc::downgrade(ctx.task()),
                     bitset: FUTEX_BITSET_MATCH_ANY,
                     waitv_index: Some(entry.index),
+                    state: Arc::clone(&entry.wait_state),
                 });
         }
     }
@@ -2648,13 +2671,21 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
             }
             return Err(Errno::EINTR);
         }
-        if let Some(index) = futex_waitv_woken_index(&entries, ctx.task()) {
+        if let Some(index) = futex_waitv_woken_index(&entries) {
             futex_waitv_remove_all(&entries, ctx.task());
             restore_current_task_after_sleep(ctx.task());
             if deadline.is_some() {
                 sched::cancel_sleep_deadline(ctx.task());
             }
             return Ok(index);
+        }
+        if futex_waitv_value_mismatch(&entries)? {
+            futex_waitv_remove_all(&entries, ctx.task());
+            restore_current_task_after_sleep(ctx.task());
+            if deadline.is_some() {
+                sched::cancel_sleep_deadline(ctx.task());
+            }
+            return Err(Errno::EAGAIN);
         }
         if let Some(deadline) = deadline {
             if sched::now_ns_public() >= deadline {
@@ -2672,7 +2703,27 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         let _ = ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping);
+        for entry in &entries {
+            entry.wait_state.sleeping.store(true, Ordering::Release);
+        }
+        // 与 FUTEX_WAIT 一样，wake 可能正好发生在“检查 woken_index”和
+        // “真正让出 CPU”之间。这里在进入调度器前再查一次，避免事件已到达
+        // 但当前任务仍睡下去。
+        if let Some(index) = futex_waitv_woken_index(&entries) {
+            for entry in &entries {
+                entry.wait_state.sleeping.store(false, Ordering::Release);
+            }
+            futex_waitv_remove_all(&entries, ctx.task());
+            restore_current_task_after_sleep(ctx.task());
+            if deadline.is_some() {
+                sched::cancel_sleep_deadline(ctx.task());
+            }
+            return Ok(index);
+        }
         sched::operation::sched_yield()?;
+        for entry in &entries {
+            entry.wait_state.sleeping.store(false, Ordering::Release);
+        }
         if deadline.is_some() {
             sched::cancel_sleep_deadline(ctx.task());
         }
@@ -3066,6 +3117,7 @@ fn futex_wait(
     deadline_ns: Option<u64>,
 ) -> Result<usize, Errno> {
     let me = Arc::clone(task);
+    let wait_state = Arc::new(FutexWaitState::new());
     if read_user_u32(uaddr)? != expected {
         return Err(Errno::EAGAIN);
     }
@@ -3086,6 +3138,7 @@ fn futex_wait(
                 task: Arc::downgrade(&me),
                 bitset,
                 waitv_index: None,
+                state: Arc::clone(&wait_state),
             });
     }
     loop {
@@ -3113,21 +3166,29 @@ fn futex_wait(
             }
             return Err(Errno::EAGAIN);
         }
+        if wait_state.woken.load(Ordering::Acquire) {
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            restore_current_task_after_sleep(task);
+            return Ok(0);
+        }
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
+        wait_state.sleeping.store(true, Ordering::Release);
+        // 关闭 futex lost-wakeup 窗口：
+        // wake 可能发生在用户值二次检查之后、真正 schedule 之前。wake 会先置
+        // woken；若 waiter 尚未提交睡眠，wake 不会入队，等待者必须在这里自行返回。
+        if wait_state.woken.load(Ordering::Acquire) {
+            wait_state.sleeping.store(false, Ordering::Release);
+            if deadline_ns.is_some() {
+                sched::cancel_sleep_deadline(task);
+            }
+            restore_current_task_after_sleep(task);
+            return Ok(0);
+        }
         sched::operation::sched_yield()?;
-        let table = FUTEX_TABLE.lock();
-        let still_waiting = table
-            .get(&key)
-            .map(|bucket| {
-                bucket.waiters.iter().any(|w| {
-                    w.task
-                        .upgrade()
-                        .as_ref()
-                        .is_some_and(|waiter| Arc::ptr_eq(waiter, &me))
-                })
-            })
-            .unwrap_or(false);
-        if !still_waiting {
+        wait_state.sleeping.store(false, Ordering::Release);
+        if wait_state.woken.load(Ordering::Acquire) {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
@@ -3137,12 +3198,13 @@ fn futex_wait(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FutexWaitvEntry {
     index: usize,
     uaddr: usize,
     expected: u32,
     key: FutexKey,
+    wait_state: Arc<FutexWaitState>,
 }
 
 const FUTEX2_SIZE_U32: u32 = 0x02;
@@ -3179,32 +3241,26 @@ fn read_futex_waitv_entry(user: usize, index: usize) -> Result<FutexWaitvEntry, 
         uaddr,
         expected: val as u32,
         key: futex_key(&task, uaddr, private)?,
+        wait_state: Arc::new(FutexWaitState::new()),
     })
 }
 
-fn futex_waitv_contains(bucket: &FutexBucket, task: &Arc<Task>, waitv_index: usize) -> bool {
-    bucket.waiters.iter().any(|waiter| {
-        waiter
-            .task
-            .upgrade()
-            .as_ref()
-            .is_some_and(|waiter_task| Arc::ptr_eq(waiter_task, task))
-            && waiter.waitv_index == Some(waitv_index)
-    })
-}
-
-fn futex_waitv_woken_index(entries: &[FutexWaitvEntry], task: &Arc<Task>) -> Option<usize> {
-    let table = FUTEX_TABLE.lock();
+fn futex_waitv_woken_index(entries: &[FutexWaitvEntry]) -> Option<usize> {
     for entry in entries {
-        let still_waiting = table
-            .get(&entry.key)
-            .map(|bucket| futex_waitv_contains(bucket, task, entry.index))
-            .unwrap_or(false);
-        if !still_waiting {
+        if entry.wait_state.woken.load(Ordering::Acquire) {
             return Some(entry.index);
         }
     }
     None
+}
+
+fn futex_waitv_value_mismatch(entries: &[FutexWaitvEntry]) -> Result<bool, Errno> {
+    for entry in entries {
+        if read_user_u32(entry.uaddr)? != entry.expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn futex_waitv_remove_all(entries: &[FutexWaitvEntry], task: &Arc<Task>) {

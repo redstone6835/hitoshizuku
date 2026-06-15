@@ -616,8 +616,7 @@ pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
 }
 
 fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
-    if task.arch_context().is_none()
-        || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+    if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
     {
         // 只有拥有执行体的活任务才能进入 rq。退出清理和 wait/reap 会释放
         // arch context；若这些任务被等待队列或信号路径误唤醒，必须在统一

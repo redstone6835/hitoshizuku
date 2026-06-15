@@ -575,8 +575,7 @@ fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
 }
 
 fn task_can_enter_runqueue(task: &Arc<Task>) -> bool {
-    task.arch_context().is_some()
-        && !matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+    task.arch_context().is_some() && !matches!(task.state(), TaskState::Zombie | TaskState::Dead)
 }
 
 fn task_can_run_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
