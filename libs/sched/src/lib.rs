@@ -64,6 +64,7 @@ pub mod sched_class;
 pub mod scheduler;
 pub mod signal;
 pub mod spawn;
+pub mod mutex;
 pub mod sync;
 pub mod task;
 pub mod wait;

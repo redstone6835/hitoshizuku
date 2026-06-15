@@ -3113,8 +3113,11 @@ fn futex_wait(
             }
             return Err(Errno::EAGAIN);
         }
-        let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
-        sched::operation::sched_yield()?;
+        if task.cas_state(TaskState::Running, TaskState::Sleeping) {
+            sched::operation::sched_yield()?;
+        } else {
+            continue;
+        }
         let table = FUTEX_TABLE.lock();
         let still_waiting = table
             .get(&key)
