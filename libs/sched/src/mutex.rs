@@ -9,7 +9,6 @@
 //! - 同一任务重复 `lock()` 会死锁自身。
 //! - 临界区内可以执行阻塞 I/O。
 
-use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
@@ -77,7 +76,6 @@ impl<T> Mutex<T> {
             self.waiters
                 .prepare_to_wait(&current, TaskState::Sleeping);
 
-            // 重新检查，防止 wakeup 发生在 prepare_to_wait 和 schedule 之间
             if self
                 .locked
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)

@@ -2256,19 +2256,27 @@ fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> 
     let mut woken = 0usize;
     for (waiter, state) in waiters {
         state.woken.store(true, Ordering::Release);
-        if state.sleeping.load(Ordering::Acquire)
-            && waiter.cas_state(TaskState::Sleeping, TaskState::Runnable)
-        {
+        if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
             sched::enqueue_task(waiter, sched::now_ns_public());
             woken += 1;
-        } else if matches!(waiter.state(), TaskState::Running | TaskState::Runnable) {
-            // waiter 可能刚把自己发布到 futex 表、但还没有真正睡眠。
-            // 这种情况下 wake 已经通过“从表中删除 waiter”传递了事件；
-            // 不要把仍在运行的当前任务强行塞回 runqueue，避免重复入队。
+        } else if waiter.cas_state(TaskState::Running, TaskState::Runnable) {
+            woken += 1;
+        } else if waiter.state() == TaskState::Runnable {
             woken += 1;
         }
     }
     woken
+}
+
+fn futex_table_contains(key: FutexKey, task: &Arc<Task>) -> bool {
+    FUTEX_TABLE
+        .lock()
+        .get(&key)
+        .map_or(false, |b| {
+            b.waiters
+                .iter()
+                .any(|w| w.task.upgrade().as_ref().is_some_and(|t| Arc::ptr_eq(t, task)))
+        })
 }
 
 fn futex_remove_waiter(key: FutexKey, task: &Arc<Task>) -> bool {
@@ -3188,7 +3196,9 @@ fn futex_wait(
         }
         sched::operation::sched_yield()?;
         wait_state.sleeping.store(false, Ordering::Release);
-        if wait_state.woken.load(Ordering::Acquire) {
+        if wait_state.woken.load(Ordering::Acquire)
+            || !futex_table_contains(key, &me)
+        {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
