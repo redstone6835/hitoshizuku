@@ -227,10 +227,13 @@ const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 const SIGFRAME_MAGIC: u64 = 0x4d59474f_53494746; // "MYGOSIGF"
 const SIGFRAME_HEADER_SIZE: usize = 64;
 const SIGFRAME_SIGINFO_SIZE: usize = 128;
-const SIGFRAME_UCONTEXT_HEAD_SIZE: usize = 64;
+const SIGFRAME_UCONTEXT_SIGMASK_OFF: usize = 40;
+const SIGFRAME_UCONTEXT_MCONTEXT_OFF: usize = 176;
+const SIGFRAME_MCONTEXT_SIZE: usize = 272;
+const SIGFRAME_UCONTEXT_SIZE: usize = SIGFRAME_UCONTEXT_MCONTEXT_OFF + SIGFRAME_MCONTEXT_SIZE;
 const SIGFRAME_SIGINFO_OFF: usize = SIGFRAME_HEADER_SIZE;
 const SIGFRAME_UCONTEXT_OFF: usize = SIGFRAME_SIGINFO_OFF + SIGFRAME_SIGINFO_SIZE;
-const SIGFRAME_TRAP_OFF: usize = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_HEAD_SIZE;
+const SIGFRAME_TRAP_OFF: usize = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_SIZE;
 // 当前 LoongArch64 用户陷阱帧约 552 字节。信号路径不用堆分配，但也不能在
 // 64KiB 内核栈上放 16KiB 大对象；2KiB 给后续寄存器扩展留出余量。
 const SIGFRAME_TRAP_BUF_SIZE: usize = 2048;
@@ -484,14 +487,33 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     let old_mask = read_u64(&header, 16);
     let trap_off = read_u64(&header, 24) as usize;
     let trap_len = read_u64(&header, 32) as usize;
+    let ucontext_off = read_u64(&header, 48) as usize;
+    let abi_pc = read_u64(&header, 56) as usize;
     let trap_end = trap_off.checked_add(trap_len).ok_or(Errno::EINVAL)?;
+    let ucontext_mcontext = ucontext_off
+        .checked_add(SIGFRAME_UCONTEXT_MCONTEXT_OFF)
+        .ok_or(Errno::EINVAL)?;
+    let ucontext_mcontext_end = ucontext_mcontext
+        .checked_add(SIGFRAME_MCONTEXT_SIZE)
+        .ok_or(Errno::EINVAL)?;
     if trap_off < SIGFRAME_HEADER_SIZE
         || trap_len != UserTrapFrame::encoded_len()
         || trap_end > total
+        || ucontext_off < SIGFRAME_HEADER_SIZE
+        || ucontext_mcontext_end > total
         || total > 16 * 1024
     {
         return Err(Errno::EINVAL);
     }
+
+    let mut mask_raw = [0u8; 8];
+    let mask_addr = sp
+        .checked_add(ucontext_off)
+        .and_then(|base| base.checked_add(SIGFRAME_UCONTEXT_SIGMASK_OFF))
+        .ok_or(Errno::EINVAL)?;
+    let restore_mask = copy_from_user(mask_addr, &mut mask_raw)
+        .map(|_| u64::from_le_bytes(mask_raw))
+        .unwrap_or(old_mask);
 
     // 信号返回是 lmbench lat_sig 的热路径；陷阱帧大小固定，避免每次
     // rt_sigreturn 都走堆分配。
@@ -502,9 +524,21 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     let trap_bytes = &mut trap_storage[..trap_len];
     copy_from_user(sp.checked_add(trap_off).ok_or(Errno::EINVAL)?, trap_bytes)
         .map_err(|e| e.as_errno())?;
-    let restored = UserTrapFrame::read_bytes(trap_bytes).ok_or(Errno::EINVAL)?;
+    let mut restored = UserTrapFrame::read_bytes(trap_bytes).ok_or(Errno::EINVAL)?;
+    let mut mcontext_storage = [0u8; SIGFRAME_MCONTEXT_SIZE];
+    copy_from_user(
+        sp.checked_add(ucontext_mcontext).ok_or(Errno::EINVAL)?,
+        &mut mcontext_storage,
+    )
+    .map_err(|e| e.as_errno())?;
+    let mcontext_pc = read_u64(&mcontext_storage, 0) as usize;
+    if mcontext_pc != abi_pc {
+        if !restored.apply_linux_mcontext(&mcontext_storage) {
+            return Err(Errno::EINVAL);
+        }
+    }
     task.signal
-        .block(SigSet::from_raw(old_mask), SigProcMaskHow::SetMask);
+        .block(SigSet::from_raw(restore_mask), SigProcMaskHow::SetMask);
     restored.apply_to_context(user_ctx.as_usize());
     Ok(())
 }
@@ -566,7 +600,7 @@ fn process_setup_signal_frame(
     write_u64(frame_bytes, 32, trap_len as u64);
     write_u64(frame_bytes, 40, SIGFRAME_SIGINFO_OFF as u64);
     write_u64(frame_bytes, 48, SIGFRAME_UCONTEXT_OFF as u64);
-    write_u64(frame_bytes, 56, info.sig.raw() as u64);
+    write_u64(frame_bytes, 56, 0);
 
     write_siginfo(
         &mut frame_bytes[SIGFRAME_SIGINFO_OFF..][..SIGFRAME_SIGINFO_SIZE],
@@ -574,7 +608,32 @@ fn process_setup_signal_frame(
     );
     write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF, 0); // uc_flags
     write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF + 8, 0); // uc_link
-    write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF + 40, old_mask.raw()); // uc_sigmask
+    write_u64(
+        frame_bytes,
+        SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_SIGMASK_OFF,
+        old_mask.raw(),
+    );
+    let mcontext_start = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_MCONTEXT_OFF;
+    if !saved.write_linux_mcontext(&mut frame_bytes[mcontext_start..][..SIGFRAME_MCONTEXT_SIZE]) {
+        return Err(Errno::EINVAL);
+    }
+    let mut abi_pc = saved.pc();
+    if info.sig.raw() >= 32
+        && (saved.ret() as isize) == -(Errno::EINTR.as_i32() as isize)
+        && saved.pc() >= 4
+    {
+        // musl 的取消信号 handler 用 ucontext PC 判断线程是否正处于
+        // __syscall_cp 的可取消区间。syscall dispatcher 已经把真实返回 PC
+        // 推到 syscall 之后；ABI ucontext 需要暴露 syscall 指令位置，而
+        // 内核私有 trap 副本仍保留真实返回位置供 rt_sigreturn 使用。
+        write_u64(
+            frame_bytes,
+            mcontext_start,
+            saved.pc().wrapping_sub(4) as u64,
+        );
+        abi_pc = saved.pc().wrapping_sub(4);
+    }
+    write_u64(frame_bytes, 56, abi_pc as u64);
     if !saved.write_bytes(&mut frame_bytes[SIGFRAME_TRAP_OFF..]) {
         return Err(Errno::EINVAL);
     }

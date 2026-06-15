@@ -885,11 +885,21 @@ fn check_kill_permission(target: &Arc<Task>) -> Result<(), Errno> {
 }
 
 fn make_siginfo(sig: SignalNumber) -> SigInfo {
+    make_siginfo_with_code(sig, 0)
+}
+
+fn make_siginfo_with_code(sig: SignalNumber, code: i32) -> SigInfo {
     let me = current_task();
+    let sender_pid = me
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_root())
+        .or_else(|| me.pid_root())
+        .unwrap_or(0);
     SigInfo {
         sig,
-        code: 0,
-        sender_pid: me.pid_root().unwrap_or(0),
+        code,
+        sender_pid,
         sender_uid: me.credentials().uid,
         raw: None,
     }
@@ -988,7 +998,7 @@ pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     }
     check_kill_permission(&target)?;
     let Some(sig) = sig else { return Ok(()) };
-    let info = make_siginfo(sig);
+    let info = make_siginfo_with_code(sig, -6);
     target.signal.deliver(info);
     signal_wakeup(&target, &info);
     Ok(())
@@ -1010,7 +1020,7 @@ pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Er
     }
     check_kill_permission(&target)?;
     let Some(sig) = sig else { return Ok(()) };
-    let info = make_siginfo(sig);
+    let info = make_siginfo_with_code(sig, -6);
     target.signal.deliver(info);
     signal_wakeup(&target, &info);
     Ok(())

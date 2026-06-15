@@ -299,12 +299,11 @@ fn fd_arg(raw: usize) -> Result<Fd, Errno> {
 }
 
 fn read_sigaction(user: usize) -> Result<SigAction, Errno> {
-    let mut raw = [0u8; 32];
+    let mut raw = [0u8; 24];
     copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
     let handler = u64::from_le_bytes(raw[0..8].try_into().unwrap()) as usize;
     let flags = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as u32;
-    let restorer = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
-    let mask = u64::from_le_bytes(raw[24..32].try_into().unwrap());
+    let mask = u64::from_le_bytes(raw[16..24].try_into().unwrap());
     let handler = match handler {
         0 => SigHandler::Default,
         1 => SigHandler::Ignore,
@@ -314,12 +313,12 @@ fn read_sigaction(user: usize) -> Result<SigAction, Errno> {
         handler,
         mask: SigSet::from_raw(mask),
         flags: SigActionFlags(flags),
-        restorer,
+        restorer: 0,
     })
 }
 
 fn write_sigaction(user: usize, action: SigAction) -> Result<(), Errno> {
-    let mut raw = [0u8; 32];
+    let mut raw = [0u8; 24];
     let handler = match action.handler {
         SigHandler::Default => 0usize,
         SigHandler::Ignore => 1usize,
@@ -327,8 +326,7 @@ fn write_sigaction(user: usize, action: SigAction) -> Result<(), Errno> {
     };
     raw[0..8].copy_from_slice(&(handler as u64).to_le_bytes());
     raw[8..16].copy_from_slice(&(action.flags.raw() as u64).to_le_bytes());
-    raw[16..24].copy_from_slice(&(action.restorer as u64).to_le_bytes());
-    raw[24..32].copy_from_slice(&action.mask.raw().to_le_bytes());
+    raw[16..24].copy_from_slice(&action.mask.raw().to_le_bytes());
     copy_to_user(user, &raw).map_err(|e| e.as_errno())
 }
 

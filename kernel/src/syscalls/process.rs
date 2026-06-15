@@ -3,7 +3,7 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 use errno::Errno;
 use general::firmware::power;
 use general::mm::{VmFutexKey, VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
@@ -2189,24 +2189,47 @@ struct FutexWaiter {
 }
 
 struct FutexWaitState {
-    /// waiter 是否已经把当前 task 提交为 Sleeping。
-    sleeping: AtomicBool,
-    /// wake 先于真正 schedule 发生时，用这个标记把事件传回 waiter 自身。
-    woken: AtomicBool,
+    /// futex 等待状态机：
+    /// - ARMED：waiter 已进入 futex 表，但还没有真正睡下；
+    /// - SLEEPING：waiter 已把 task 状态切到 Sleeping，可以由 wake 入队；
+    /// - WOKEN：wake 事件已经到达，waiter 自己或调度器会负责收尾。
+    state: core::sync::atomic::AtomicU8,
 }
 
 impl FutexWaitState {
     fn new() -> Self {
         Self {
-            sleeping: AtomicBool::new(false),
-            woken: AtomicBool::new(false),
+            state: core::sync::atomic::AtomicU8::new(FUTEX_WAIT_ARMED),
         }
+    }
+
+    fn is_woken(&self) -> bool {
+        self.state.load(Ordering::Acquire) == FUTEX_WAIT_WOKEN
+    }
+
+    fn mark_sleeping(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FUTEX_WAIT_ARMED,
+                FUTEX_WAIT_SLEEPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn mark_woken(&self) -> u8 {
+        self.state.swap(FUTEX_WAIT_WOKEN, Ordering::AcqRel)
     }
 }
 
 struct FutexBucket {
     waiters: Vec<FutexWaiter>,
 }
+
+const FUTEX_WAIT_ARMED: u8 = 0;
+const FUTEX_WAIT_SLEEPING: u8 = 1;
+const FUTEX_WAIT_WOKEN: u8 = 2;
 
 static FUTEX_TABLE: Spinlock<BTreeMap<FutexKey, FutexBucket>> = Spinlock::new(BTreeMap::new());
 static FUTEX_USER_OP_LOCK: Spinlock<()> = Spinlock::new(());
@@ -2255,17 +2278,23 @@ fn futex_wake_key(key: FutexKey, count: usize, bitset: u32) -> usize {
 fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> usize {
     let mut woken = 0usize;
     for (waiter, state) in waiters {
-        state.woken.store(true, Ordering::Release);
-        if state.sleeping.load(Ordering::Acquire)
-            && waiter.cas_state(TaskState::Sleeping, TaskState::Runnable)
-        {
-            sched::enqueue_task(waiter, sched::now_ns_public());
-            woken += 1;
-        } else if matches!(waiter.state(), TaskState::Running | TaskState::Runnable) {
-            // waiter 可能刚把自己发布到 futex 表、但还没有真正睡眠。
-            // 这种情况下 wake 已经通过“从表中删除 waiter”传递了事件；
-            // 不要把仍在运行的当前任务强行塞回 runqueue，避免重复入队。
-            woken += 1;
+        match state.mark_woken() {
+            FUTEX_WAIT_SLEEPING => {
+                if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
+                    sched::enqueue_task(waiter, sched::now_ns_public());
+                }
+                woken += 1;
+            }
+            FUTEX_WAIT_ARMED => {
+                // waiter 已经登记到 futex 表，但尚未切出 CPU。只标记 WOKEN，
+                // 由 waiter 在 schedule 前的复查中直接返回，不能把 current
+                // 当作已睡眠任务入队。
+                woken += 1;
+            }
+            FUTEX_WAIT_WOKEN => {
+                woken += 1;
+            }
+            _ => {}
         }
     }
     woken
@@ -2703,16 +2732,17 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         let _ = ctx
             .task()
             .cas_state(TaskState::Running, TaskState::Sleeping);
+        let mut already_woken = None;
         for entry in &entries {
-            entry.wait_state.sleeping.store(true, Ordering::Release);
+            if !entry.wait_state.mark_sleeping() && entry.wait_state.is_woken() {
+                already_woken = Some(entry.index);
+                break;
+            }
         }
         // 与 FUTEX_WAIT 一样，wake 可能正好发生在“检查 woken_index”和
         // “真正让出 CPU”之间。这里在进入调度器前再查一次，避免事件已到达
         // 但当前任务仍睡下去。
-        if let Some(index) = futex_waitv_woken_index(&entries) {
-            for entry in &entries {
-                entry.wait_state.sleeping.store(false, Ordering::Release);
-            }
+        if let Some(index) = already_woken.or_else(|| futex_waitv_woken_index(&entries)) {
             futex_waitv_remove_all(&entries, ctx.task());
             restore_current_task_after_sleep(ctx.task());
             if deadline.is_some() {
@@ -2721,9 +2751,6 @@ pub(super) fn sys_futex_waitv(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
             return Ok(index);
         }
         sched::operation::sched_yield()?;
-        for entry in &entries {
-            entry.wait_state.sleeping.store(false, Ordering::Release);
-        }
         if deadline.is_some() {
             sched::cancel_sleep_deadline(ctx.task());
         }
@@ -3166,7 +3193,7 @@ fn futex_wait(
             }
             return Err(Errno::EAGAIN);
         }
-        if wait_state.woken.load(Ordering::Acquire) {
+        if wait_state.is_woken() {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
@@ -3174,12 +3201,21 @@ fn futex_wait(
             return Ok(0);
         }
         let _ = task.cas_state(TaskState::Running, TaskState::Sleeping);
-        wait_state.sleeping.store(true, Ordering::Release);
+        if !wait_state.mark_sleeping() {
+            if wait_state.is_woken() {
+                if deadline_ns.is_some() {
+                    sched::cancel_sleep_deadline(task);
+                }
+                restore_current_task_after_sleep(task);
+                return Ok(0);
+            }
+            restore_current_task_after_sleep(task);
+            continue;
+        }
         // 关闭 futex lost-wakeup 窗口：
         // wake 可能发生在用户值二次检查之后、真正 schedule 之前。wake 会先置
         // woken；若 waiter 尚未提交睡眠，wake 不会入队，等待者必须在这里自行返回。
-        if wait_state.woken.load(Ordering::Acquire) {
-            wait_state.sleeping.store(false, Ordering::Release);
+        if wait_state.is_woken() {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
@@ -3187,8 +3223,7 @@ fn futex_wait(
             return Ok(0);
         }
         sched::operation::sched_yield()?;
-        wait_state.sleeping.store(false, Ordering::Release);
-        if wait_state.woken.load(Ordering::Acquire) {
+        if wait_state.is_woken() {
             if deadline_ns.is_some() {
                 sched::cancel_sleep_deadline(task);
             }
@@ -3247,7 +3282,7 @@ fn read_futex_waitv_entry(user: usize, index: usize) -> Result<FutexWaitvEntry, 
 
 fn futex_waitv_woken_index(entries: &[FutexWaitvEntry]) -> Option<usize> {
     for entry in entries {
-        if entry.wait_state.woken.load(Ordering::Acquire) {
+        if entry.wait_state.is_woken() {
             return Some(entry.index);
         }
     }
