@@ -280,7 +280,7 @@ impl VirtioBlkPci {
             device_features,
             transport.status()
         );
-        let driver_features = match negotiate_supported_features(device_features) {
+        let driver_features = match negotiate_supported_features(device_features, true) {
             Ok(features) => features,
             Err(msg) => {
                 transport.set_status(VIRTIO_STATUS_FAILED);

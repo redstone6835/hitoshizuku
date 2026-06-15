@@ -626,6 +626,11 @@ impl SplitVirtQueue {
     /// 一段物理连续的内存中，通过 QueuePFN 寄存器一次性告知设备。
     /// 布局：desc_table | avail_ring | used_ring（按各自对齐要求）。
     pub fn new_legacy(queue_size: u16) -> Result<Self, VirtQueueError> {
+        Self::new_legacy_in(DmaContext::default_coherent(), queue_size)
+    }
+
+    /// 使用指定设备 DMA 上下文创建 legacy split virtqueue。
+    pub fn new_legacy_in(dma_context: DmaContext, queue_size: u16) -> Result<Self, VirtQueueError> {
         let qsz = validate_queue_size(queue_size)?;
         let desc_len = desc_table_bytes(qsz)?;
         let avail_len = avail_ring_bytes(qsz)?;
@@ -635,16 +640,17 @@ impl SplitVirtQueue {
         // Legacy 要求 Used Ring 页对齐：在 avail 和 used 之间可能有填充
         let used_off = (desc_len + avail_len).next_multiple_of(4096);
         let total = used_off + used_len;
-        let dma_ctx = DmaContext::default_coherent();
-        let buf = DmaBuffer::new_in(dma_ctx, total, page_align, DmaDirection::Bidirectional)
+        let buf = DmaBuffer::new_in(dma_context, total, page_align, DmaDirection::Bidirectional)
             .map_err(VirtQueueError::DmaAllocationFailed)?;
 
         let base_dma = buf.dma_addr();
+        let base_paddr = buf.paddr();
         let base_vaddr = buf.vaddr();
         let master_alloc = buf.take_allocation();
 
         // desc 持有主分配（drop 时释放整段）；avail/used 是零分配视图
-        let desc = DmaBuffer::from_allocation(
+        let desc = DmaBuffer::from_allocation_in(
+            dma_context,
             master_alloc,
             base_dma,
             base_vaddr,
@@ -653,12 +659,24 @@ impl SplitVirtQueue {
         );
         // Legacy 规范要求 Used Ring 页对齐
         let used_off = (desc_len + avail_len).next_multiple_of(4096);
-        let avail = DmaBuffer::sub_view(base_dma + desc_len, base_vaddr + desc_len, avail_len);
-        let used = DmaBuffer::sub_view(base_dma + used_off, base_vaddr + used_off, used_len);
+        let avail = DmaBuffer::sub_view_in(
+            dma_context,
+            base_dma + desc_len,
+            base_vaddr + desc_len,
+            base_paddr + desc_len,
+            avail_len,
+        );
+        let used = DmaBuffer::sub_view_in(
+            dma_context,
+            base_dma + used_off,
+            base_vaddr + used_off,
+            base_paddr + used_off,
+            used_len,
+        );
 
         let mut queue = Self {
             queue_size,
-            dma_context: dma_ctx,
+            dma_context,
             desc,
             avail,
             used,

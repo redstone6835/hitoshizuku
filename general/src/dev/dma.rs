@@ -213,6 +213,7 @@ fn dma_identity_addr(region: DmaSyncRegion) -> usize {
 pub struct DmaBuffer {
     allocation: PhysicalAllocation,
     context: DmaContext,
+    paddr: usize,
     vaddr: usize,
     dma_addr: usize,
     len: usize,
@@ -262,6 +263,7 @@ impl DmaBuffer {
         };
 
         Ok(Self {
+            paddr: allocation.paddr,
             allocation,
             context,
             vaddr,
@@ -283,7 +285,7 @@ impl DmaBuffer {
 
     /// 后端物理地址，仅供内核内部诊断或平台层转换使用。
     pub const fn paddr(&self) -> usize {
-        self.allocation.paddr
+        self.paddr
     }
 
     /// 设备描述符中应写入的 DMA 地址。
@@ -345,6 +347,23 @@ impl DmaBuffer {
     /// 创建一个不拥有底层内存的"视图" DmaBuffer。
     /// drop 时 free_physical 是空操作（size=0）。
     pub fn sub_view(dma_addr: usize, vaddr: usize, len: usize) -> Self {
+        Self::sub_view_in(
+            DmaContext::default_coherent(),
+            dma_addr,
+            vaddr,
+            dma_addr,
+            len,
+        )
+    }
+
+    /// 创建一个继承指定 DMA 上下文的非拥有视图。
+    pub fn sub_view_in(
+        context: DmaContext,
+        dma_addr: usize,
+        vaddr: usize,
+        paddr: usize,
+        len: usize,
+    ) -> Self {
         Self {
             allocation: PhysicalAllocation {
                 paddr: 0,
@@ -352,7 +371,8 @@ impl DmaBuffer {
                 order: 0,
                 page_size: 0,
             },
-            context: DmaContext::default_coherent(),
+            context,
+            paddr,
             vaddr,
             dma_addr,
             len,
@@ -369,9 +389,29 @@ impl DmaBuffer {
         len: usize,
         direction: DmaDirection,
     ) -> Self {
+        Self::from_allocation_in(
+            DmaContext::default_coherent(),
+            alloc,
+            dma_addr,
+            vaddr,
+            len,
+            direction,
+        )
+    }
+
+    /// 从已有的 PhysicalAllocation 构造继承指定 DMA 上下文的 DmaBuffer。
+    pub fn from_allocation_in(
+        context: DmaContext,
+        alloc: PhysicalAllocation,
+        dma_addr: usize,
+        vaddr: usize,
+        len: usize,
+        direction: DmaDirection,
+    ) -> Self {
         Self {
+            paddr: alloc.paddr,
             allocation: alloc,
-            context: DmaContext::default_coherent(),
+            context,
             vaddr,
             dma_addr,
             len,

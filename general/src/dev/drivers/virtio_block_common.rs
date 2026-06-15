@@ -148,11 +148,19 @@ impl VirtioBlkNegotiatedFeatures {
 }
 
 /// 从设备 feature 中选择驱动支持的集合。
-pub(super) fn negotiate_supported_features(device_features: u64) -> Result<u64, &'static str> {
-    if device_features & VIRTIO_F_VERSION_1 == 0 {
+pub(super) fn negotiate_supported_features(
+    device_features: u64,
+    require_version_1: bool,
+) -> Result<u64, &'static str> {
+    if require_version_1 && device_features & VIRTIO_F_VERSION_1 == 0 {
         return Err("virtio-blk: VERSION_1 feature is missing");
     }
-    Ok(device_features & SUPPORTED_FEATURES)
+    let supported = if require_version_1 {
+        SUPPORTED_FEATURES
+    } else {
+        SUPPORTED_FEATURES & !VIRTIO_F_VERSION_1
+    };
+    Ok(device_features & supported)
 }
 
 /// virtio-blk 设备 config 空间读取接口。
