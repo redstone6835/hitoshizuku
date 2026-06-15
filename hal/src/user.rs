@@ -192,8 +192,7 @@ pub fn register_tty_poll_hook(hook: fn(u64)) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = hook;
-        todo!("riscv64 HAL tty poll hook is not implemented")
+        arch::riscv64::vdso::register_tty_poll_hook(hook);
     }
 }
 

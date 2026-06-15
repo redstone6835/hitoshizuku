@@ -26,6 +26,30 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+/// 在从用户态 trap 返回前投递异步信号。
+///
+/// syscall 返回路径已经在 `general::syscall::dispatch` 中带 trap-frame context
+/// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。
+fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready() {
+        return;
+    }
+
+    let _ =
+        sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(tf_ptr));
+
+    match sched::current_task().state() {
+        sched::TaskState::Zombie | sched::TaskState::Dead => {
+            sched::schedule_once(kernel_timestamp_ns());
+            panic!("[trap][signal] terminal task scheduled back unexpectedly");
+        }
+        sched::TaskState::Stopped | sched::TaskState::Continued => {
+            sched::schedule_once(kernel_timestamp_ns());
+        }
+        _ => {}
+    }
+}
+
 /// 解码中断：从 SCAUSE 寄存器提取中断类型。
 fn decode_interrupt(cause: usize) -> Interrupt {
     // RISC-V 把待处理中断类型压在 SCAUSE 的高比特位。与 LoongArch 不同，RISC-V
@@ -96,12 +120,21 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
             sched::on_timer_tick(now_ns);
             super::super::vdso::run_timer_tick_hook(now_ns);
             super::super::vdso::run_net_poll_hook(now_ns);
-            sched::preempt_if_needed(now_ns);
+            super::super::vdso::run_tty_poll_hook(now_ns);
+            deliver_user_signals_before_return(tf_ptr, from_user);
+            if from_user {
+                sched::preempt_if_needed(now_ns);
+            }
             return tf_ptr;
         }
         // 非 timer 中断：SupervisorExternal (PLIC), IPI 等
+        let now_ns = kernel_timestamp_ns();
         let _ = general::dev::irq::dispatch_interrupt(intr);
-        sched::preempt_if_needed(kernel_timestamp_ns());
+        super::super::vdso::run_tty_poll_hook(now_ns);
+        deliver_user_signals_before_return(tf_ptr, from_user);
+        if from_user {
+            sched::preempt_if_needed(now_ns);
+        }
         tf_ptr
     } else if code == EXC_ECALL_U || code == EXC_ECALL_S {
         general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
@@ -119,10 +152,13 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         //   Segv                       → 本轮先 log 并投 SIGSEGV；
         //   Kernel(NotInitialized)     → 启动早期缺页，按旧路径 halt；
         //   Kernel(UncaughtKernelAccess) → 真内核 bug，halt。
-        use general::mm::{FaultOutcome, KernelFaultReason};
+        use general::mm::FaultOutcome;
         let tf_ptr_gen = general::TrapFramePtr::new(tf_ptr);
         match general::mm::dispatch_page_fault(tf_ptr_gen) {
-            FaultOutcome::Fixed => tf_ptr,
+            FaultOutcome::Fixed => {
+                deliver_user_signals_before_return(tf_ptr, from_user);
+                tf_ptr
+            }
             FaultOutcome::Segv => {
                 log::info!(
                     "[trap][mm] user SIGSEGV sepc={:#x} tval={:#x} code={:#x}",
@@ -137,7 +173,8 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                     let me = sched::current_task();
                     let pid = me.pid_root().unwrap_or(0);
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
-                    sched::schedule_once(kernel_timestamp_ns());
+                    drop(me);
+                    deliver_user_signals_before_return(tf_ptr, from_user);
                 }
                 tf_ptr
             }

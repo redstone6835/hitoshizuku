@@ -145,7 +145,7 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
-            todo!("riscv64 HAL user trap-frame ret is not implemented")
+            self.inner.a0
         }
     }
 
@@ -288,8 +288,52 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
-            let _ = out;
-            todo!("riscv64 HAL linux mcontext encode is not implemented")
+            const PC_OFF: usize = 0;
+            const REGS_OFF: usize = 8;
+            const MCONTEXT_LEN: usize = REGS_OFF + 32 * 8;
+            if out.len() < MCONTEXT_LEN {
+                return false;
+            }
+            out[..MCONTEXT_LEN].fill(0);
+            write_u64(out, PC_OFF, self.inner.sepc as u64);
+            let regs = [
+                0usize,
+                self.inner.ra,
+                self.inner.sp,
+                self.inner.gp,
+                self.inner.tp,
+                self.inner.t0,
+                self.inner.t1,
+                self.inner.t2,
+                self.inner.s0,
+                self.inner.s1,
+                self.inner.a0,
+                self.inner.a1,
+                self.inner.a2,
+                self.inner.a3,
+                self.inner.a4,
+                self.inner.a5,
+                self.inner.a6,
+                self.inner.a7,
+                self.inner.s2,
+                self.inner.s3,
+                self.inner.s4,
+                self.inner.s5,
+                self.inner.s6,
+                self.inner.s7,
+                self.inner.s8,
+                self.inner.s9,
+                self.inner.s10,
+                self.inner.s11,
+                self.inner.t3,
+                self.inner.t4,
+                self.inner.t5,
+                self.inner.t6,
+            ];
+            for (idx, reg) in regs.iter().enumerate() {
+                write_u64(out, REGS_OFF + idx * 8, *reg as u64);
+            }
+            true
         }
     }
 
@@ -340,8 +384,46 @@ impl UserTrapFrame {
 
         #[cfg(target_arch = "riscv64")]
         {
-            let _ = input;
-            todo!("riscv64 HAL linux mcontext decode is not implemented")
+            const PC_OFF: usize = 0;
+            const REGS_OFF: usize = 8;
+            const MCONTEXT_LEN: usize = REGS_OFF + 32 * 8;
+            if input.len() < MCONTEXT_LEN {
+                return false;
+            }
+            let reg = |idx: usize| -> usize { read_u64(input, REGS_OFF + idx * 8) as usize };
+            self.inner.sepc = read_u64(input, PC_OFF) as usize;
+            self.inner.ra = reg(1);
+            self.inner.sp = reg(2);
+            self.inner.gp = reg(3);
+            self.inner.tp = reg(4);
+            self.inner.t0 = reg(5);
+            self.inner.t1 = reg(6);
+            self.inner.t2 = reg(7);
+            self.inner.s0 = reg(8);
+            self.inner.s1 = reg(9);
+            self.inner.a0 = reg(10);
+            self.inner.a1 = reg(11);
+            self.inner.a2 = reg(12);
+            self.inner.a3 = reg(13);
+            self.inner.a4 = reg(14);
+            self.inner.a5 = reg(15);
+            self.inner.a6 = reg(16);
+            self.inner.a7 = reg(17);
+            self.inner.s2 = reg(18);
+            self.inner.s3 = reg(19);
+            self.inner.s4 = reg(20);
+            self.inner.s5 = reg(21);
+            self.inner.s6 = reg(22);
+            self.inner.s7 = reg(23);
+            self.inner.s8 = reg(24);
+            self.inner.s9 = reg(25);
+            self.inner.s10 = reg(26);
+            self.inner.s11 = reg(27);
+            self.inner.t3 = reg(28);
+            self.inner.t4 = reg(29);
+            self.inner.t5 = reg(30);
+            self.inner.t6 = reg(31);
+            true
         }
     }
 
@@ -387,12 +469,10 @@ impl UserTrapFrame {
     }
 }
 
-#[cfg(target_arch = "loongarch64")]
 fn write_u64(out: &mut [u8], off: usize, value: u64) {
     out[off..off + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-#[cfg(target_arch = "loongarch64")]
 fn read_u64(input: &[u8], off: usize) -> u64 {
     let mut raw = [0u8; 8];
     raw.copy_from_slice(&input[off..off + 8]);
