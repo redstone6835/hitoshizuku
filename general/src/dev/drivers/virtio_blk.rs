@@ -471,14 +471,14 @@ impl VirtioBlk {
                     "[virtio-mmio-blk] used head {} has no pending request",
                     desc_head
                 );
-                if queue.queue.free_chain_from_head(desc_head).is_err() {
-                    let failed =
-                        self.fail_queue_locked(&mut queue, "unknown used head cannot be freed");
-                    drop(queue);
-                    Self::complete_failed_requests(failed, BioIoError::Unavailable);
-                    return;
-                }
-                continue;
+                // used ring 返回了当前队列内的 descriptor head，但驱动没有对应的
+                // BIO 记录。继续运行可能释放到其它请求的描述符链，因此直接把队列
+                // 标记为失败，让上层重新发现设备状态，而不是尝试局部恢复。
+                let failed =
+                    self.fail_queue_locked(&mut queue, "used head without pending request");
+                drop(queue);
+                Self::complete_failed_requests(failed, BioIoError::Unavailable);
+                return;
             };
             let PendingVirtioRequest {
                 mut bio,
@@ -568,11 +568,15 @@ impl VirtioBlk {
             .ok_or("Invalid geometry")?;
 
         let queue_guard = self.inner.queue.lock();
-        let limits = block_limits(block_size, queue_guard.queue.dma_context())?;
+        let limits = block_limits(
+            block_size,
+            queue_guard.queue.dma_context(),
+            self.inner.capabilities,
+        )?;
         let queue_depth = u32::from(queue_guard.queue.queue_size());
         drop(queue_guard);
         let attributes = BlockAttributes::new(false, false, NonZeroU32::new(queue_depth), None);
-        let features = self.inner.capabilities.block_features();
+        let features = self.inner.capabilities.block_features(block_size);
 
         let io = Arc::new(VirtioBlkIo {
             driver: Arc::new(self),
@@ -617,6 +621,7 @@ impl BlockDriver for VirtioBlkIo {
             bio.op,
             bio.range.lba,
             bio.range.blocks,
+            bio.fua,
             self.driver.inner.block_size,
             self.driver.inner.capabilities,
         ) {

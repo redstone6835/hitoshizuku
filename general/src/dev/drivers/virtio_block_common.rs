@@ -8,7 +8,7 @@ use core::mem;
 use core::num::NonZeroU32;
 
 use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
-use crate::dev::block::{BlockFeatures, BlockLimits};
+use crate::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
 use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
 use crate::dev::virtio::{
     DescriptorChain, SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
@@ -237,6 +237,34 @@ impl VirtioBlkRangeOpLimits {
     pub fn sector_aligned(self, sector: u64) -> bool {
         sector.is_multiple_of(u64::from(self.sector_alignment.get()))
     }
+
+    pub fn block_range_limits(self, logical_block_size: u32) -> Option<BlockRangeLimits> {
+        let sector_scale = logical_block_size.checked_div(VIRTIO_BLK_SECTOR_SIZE)?;
+        if sector_scale == 0 || !logical_block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE) {
+            return None;
+        }
+        let max_blocks = NonZeroU32::new(self.max_sectors / sector_scale)?;
+        let alignment_blocks =
+            logical_lba_alignment_blocks(self.sector_alignment.get(), sector_scale);
+        Some(BlockRangeLimits::new(
+            Some(max_blocks),
+            NonZeroU32::new(alignment_blocks),
+        ))
+    }
+}
+
+fn logical_lba_alignment_blocks(sector_alignment: u32, sector_scale: u32) -> u32 {
+    let gcd = gcd_u32(sector_alignment.max(1), sector_scale.max(1));
+    (sector_alignment.max(1) / gcd).max(1)
+}
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let next = a % b;
+        a = b;
+        b = next;
+    }
+    a.max(1)
 }
 
 /// virtio-blk 完成协商并校验后的块设备能力。
@@ -263,7 +291,7 @@ impl VirtioBlkCapabilities {
         }
     }
 
-    pub fn block_features(self) -> BlockFeatures {
+    pub fn block_features(self, logical_block_size: u32) -> BlockFeatures {
         let mut features = BlockFeatures(0);
         if self.features.read_only() {
             features |= BlockFeatures::READ_ONLY;
@@ -271,10 +299,18 @@ impl VirtioBlkCapabilities {
         if self.features.has_flush() {
             features |= BlockFeatures::FLUSH;
         }
-        if self.discard.is_some() {
+        if self
+            .discard
+            .and_then(|limits| limits.block_range_limits(logical_block_size))
+            .is_some()
+        {
             features |= BlockFeatures::DISCARD;
         }
-        if self.write_zeroes.is_some() {
+        if self
+            .write_zeroes
+            .and_then(|limits| limits.block_range_limits(logical_block_size))
+            .is_some()
+        {
             features |= BlockFeatures::WRITE_ZEROES;
         }
         features
@@ -362,6 +398,7 @@ pub(super) fn read_device_config<R: VirtioBlkConfigReader>(
 pub(super) fn block_limits(
     block_size: u32,
     dma_context: DmaContext,
+    capabilities: VirtioBlkCapabilities,
 ) -> Result<BlockLimits, &'static str> {
     if block_size == 0 {
         return Err("virtio-blk: block size is zero");
@@ -374,7 +411,20 @@ pub(super) fn block_limits(
     }
     let max_blocks =
         NonZeroU32::new((max_bytes / block_size as usize).min(u32::MAX as usize) as u32);
-    match BlockLimits::new(max_blocks, max_blocks, NonZeroU32::new(1)) {
+    let limits = BlockLimits::new(max_blocks, max_blocks, NonZeroU32::new(1)).map(|limits| {
+        limits
+            .with_discard_limits(
+                capabilities
+                    .discard
+                    .and_then(|limits| limits.block_range_limits(block_size)),
+            )
+            .with_write_zeroes_limits(
+                capabilities
+                    .write_zeroes
+                    .and_then(|limits| limits.block_range_limits(block_size)),
+            )
+    });
+    match limits {
         Some(limits) => Ok(limits),
         None => Err("virtio-blk: invalid block limits"),
     }
@@ -440,9 +490,16 @@ impl VirtioBlkRequestPlan {
         op: BioOp,
         lba: u64,
         blocks: u32,
+        fua: bool,
         logical_block_size: u32,
         capabilities: VirtioBlkCapabilities,
     ) -> Result<Self, SubmitError> {
+        if fua {
+            // virtio-blk 的现代协议用独立 FLUSH 命令表达持久化屏障，没有本驱动可
+            // 协商的 per-request FUA 位。直接拒绝可以避免把上层的写入持久性要求
+            // 静默降级成普通写。
+            return Err(SubmitError::Unsupported);
+        }
         if logical_block_size < VIRTIO_BLK_SECTOR_SIZE
             || !logical_block_size.is_power_of_two()
             || !logical_block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)

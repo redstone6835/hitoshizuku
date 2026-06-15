@@ -820,7 +820,8 @@ impl SplitVirtQueue {
         unsafe {
             write_volatile(ring_ptr, head);
         }
-        self.desc.sync_for_device();
+        // descriptor table 在 write_descs/write_desc 时已经同步给设备。发布阶段只需
+        // 同步 avail ring，并用 release fence 保证设备看到 head 前已能看到描述符内容。
         self.avail.sync_for_device();
         fence(Ordering::Release);
         self.set_avail_idx(avail_idx.wrapping_add(1));

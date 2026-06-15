@@ -51,15 +51,17 @@ use vfs::superblock::Superblock;
 use vfs::sync::Spinlock;
 
 #[cfg(feature = "bench")]
-use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
+use general::dev::bio::{Bio, BioIoError, SubmitError};
 #[cfg(any(feature = "bench", feature = "block-bench"))]
-use general::dev::block::BlockDevice;
+use general::dev::bio::{BioBuffer, BioOp, BlockRange};
 #[cfg(feature = "bench")]
-use general::dev::block::{
-    BlockClass, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry, BlockLimits,
-};
+use general::dev::block::{BlockClass, BlockDeviceInit, BlockDriver, BlockGeometry, BlockLimits};
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+use general::dev::block::{BlockDevice, BlockFeatures};
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::block_sync::SyncBlockBackend;
+#[cfg(feature = "block-bench")]
+use general::dev::control::{BlockControlRequest, BlockControlResponse};
 #[cfg(feature = "block-bench")]
 use general::dev::enumerate::DEVICES;
 #[cfg(feature = "block-bench")]
@@ -167,8 +169,10 @@ pub fn run_block_device() {
         );
 
         let raw_tag = alloc::format!("block-{}", dev_name);
+        let mut auto_mounted = false;
         match general::vfs::mount_block_device_auto(Arc::clone(&dev), "") {
             Ok((sb, source)) => {
+                auto_mounted = true;
                 log::info!(
                     "[bench][block] mounted candidate={} fs={} source={}",
                     dev_name,
@@ -199,6 +203,10 @@ pub fn run_block_device() {
         }
 
         run_block_small_read(&raw_tag, &dev);
+        run_block_rw_flush_validation(&raw_tag, &dev);
+        if !auto_mounted {
+            run_block_range_ops_validation(&raw_tag, &dev);
+        }
         run_block_seq_read(&raw_tag, &dev);
         run_block_seq_read_repeat(&raw_tag, &dev);
         run_block_rand_read(&raw_tag, &dev);
@@ -1592,6 +1600,371 @@ fn run_block_small_read(tag: &str, dev: &Arc<BlockDevice>) {
         dt / count,
         errors
     );
+}
+
+#[cfg(feature = "block-bench")]
+fn run_block_rw_flush_validation(tag: &str, dev: &Arc<BlockDevice>) {
+    let read_only = match dev.control(BlockControlRequest::GetReadOnly) {
+        Ok(BlockControlResponse::Bool(read_only)) => read_only,
+        Ok(other) => {
+            log::error!(
+                "[bench][{}][RW-flush] unexpected read-only response: {:?}",
+                tag,
+                other
+            );
+            return;
+        }
+        Err(err) => {
+            log::error!(
+                "[bench][{}][RW-flush] failed to query read-only state: {:?}",
+                tag,
+                err
+            );
+            return;
+        }
+    };
+    if read_only {
+        log::warning!("[bench][{}][RW-flush] skipped read-only block device", tag);
+        return;
+    }
+
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][{}][RW-flush] backend unavailable: {:?}", tag, e);
+            return;
+        }
+    };
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+    if !block_device_has_bytes(dev, lbs) {
+        log::error!(
+            "[bench][{}][RW-flush] device too small for one logical block",
+            tag
+        );
+        return;
+    }
+
+    let mut before = vec![0u8; lbs];
+    let mut after = vec![0u8; lbs];
+    if let Err(err) = backend.read(0, 1, &mut before) {
+        log::error!("[bench][{}][RW-flush] initial read failed: {:?}", tag, err);
+        return;
+    }
+
+    // 用原始内容原样写回同一块，既覆盖 virtio write 路径，又不改变镜像语义。
+    if let Err(err) = backend.write(0, 1, &before) {
+        log::error!("[bench][{}][RW-flush] write-back failed: {:?}", tag, err);
+        return;
+    }
+
+    match dev.control(BlockControlRequest::Flush) {
+        Ok(BlockControlResponse::Done) => {}
+        Ok(other) => {
+            log::error!(
+                "[bench][{}][RW-flush] unexpected flush response: {:?}",
+                tag,
+                other
+            );
+            return;
+        }
+        Err(err) => {
+            log::error!("[bench][{}][RW-flush] flush failed: {:?}", tag, err);
+            return;
+        }
+    }
+
+    if let Err(err) = backend.read(0, 1, &mut after) {
+        log::error!("[bench][{}][RW-flush] readback failed: {:?}", tag, err);
+        return;
+    }
+    if before != after {
+        log::error!(
+            "[bench][{}][RW-flush] readback mismatch after write-back",
+            tag
+        );
+        return;
+    }
+    log::info!(
+        "[bench][{}][RW-flush] read/write/flush/readback ok bytes={}",
+        tag,
+        lbs
+    );
+}
+
+#[cfg(feature = "block-bench")]
+fn run_block_range_ops_validation(tag: &str, dev: &Arc<BlockDevice>) {
+    let features = dev.features();
+    if !features.contains(BlockFeatures::DISCARD) && !features.contains(BlockFeatures::WRITE_ZEROES)
+    {
+        log::warning!(
+            "[bench][{}][range-op] skipped: discard/write-zeroes unsupported",
+            tag
+        );
+        return;
+    }
+
+    match dev.control(BlockControlRequest::GetReadOnly) {
+        Ok(BlockControlResponse::Bool(true)) => {
+            log::warning!("[bench][{}][range-op] skipped read-only block device", tag);
+            return;
+        }
+        Ok(BlockControlResponse::Bool(false)) => {}
+        Ok(other) => {
+            log::error!(
+                "[bench][{}][range-op] unexpected read-only response: {:?}",
+                tag,
+                other
+            );
+            return;
+        }
+        Err(err) => {
+            log::error!(
+                "[bench][{}][range-op] failed to query read-only state: {:?}",
+                tag,
+                err
+            );
+            return;
+        }
+    }
+
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("[bench][{}][range-op] backend unavailable: {:?}", tag, e);
+            return;
+        }
+    };
+    let Some(lba) = select_blank_range_test_lba(tag, dev, &backend, features) else {
+        return;
+    };
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+    let mut original = vec![0u8; lbs];
+    if let Err(err) = backend.read(lba, 1, &mut original) {
+        log::error!(
+            "[bench][{}][range-op] failed to read test block lba={}: {:?}",
+            tag,
+            lba,
+            err
+        );
+        return;
+    }
+    let pattern = range_validation_pattern(lbs);
+
+    if features.contains(BlockFeatures::WRITE_ZEROES) {
+        if let Err(err) = backend.write(lba, 1, &pattern) {
+            log::error!(
+                "[bench][{}][range-op] prepare write-zeroes pattern failed lba={}: {:?}",
+                tag,
+                lba,
+                err
+            );
+            return;
+        }
+        if let Err(err) = submit_range_op(dev, BioOp::WriteZeroes, lba) {
+            restore_range_probe_block(tag, dev, &backend, lba, &original);
+            log::error!(
+                "[bench][{}][range-op] write-zeroes failed lba={}: {:?}",
+                tag,
+                lba,
+                err
+            );
+            return;
+        }
+        let mut after = vec![0u8; lbs];
+        if let Err(err) = backend.read(lba, 1, &mut after) {
+            restore_range_probe_block(tag, dev, &backend, lba, &original);
+            log::error!(
+                "[bench][{}][range-op] write-zeroes readback failed lba={}: {:?}",
+                tag,
+                lba,
+                err
+            );
+            return;
+        }
+        if !after.iter().all(|byte| *byte == 0) {
+            restore_range_probe_block(tag, dev, &backend, lba, &original);
+            log::error!(
+                "[bench][{}][range-op] write-zeroes readback is not zero lba={}",
+                tag,
+                lba
+            );
+            return;
+        }
+        log::info!(
+            "[bench][{}][range-op] write-zeroes ok lba={} bytes={}",
+            tag,
+            lba,
+            lbs
+        );
+    }
+
+    if features.contains(BlockFeatures::DISCARD) {
+        if let Err(err) = backend.write(lba, 1, &pattern) {
+            restore_range_probe_block(tag, dev, &backend, lba, &original);
+            log::error!(
+                "[bench][{}][range-op] prepare discard pattern failed lba={}: {:?}",
+                tag,
+                lba,
+                err
+            );
+            return;
+        }
+        if let Err(err) = submit_range_op(dev, BioOp::Discard, lba) {
+            restore_range_probe_block(tag, dev, &backend, lba, &original);
+            log::error!(
+                "[bench][{}][range-op] discard failed lba={}: {:?}",
+                tag,
+                lba,
+                err
+            );
+            return;
+        }
+        restore_range_probe_block(tag, dev, &backend, lba, &original);
+        log::info!("[bench][{}][range-op] discard ok lba={}", tag, lba);
+    } else {
+        restore_range_probe_block(tag, dev, &backend, lba, &original);
+    }
+}
+
+#[cfg(feature = "block-bench")]
+fn select_blank_range_test_lba(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    backend: &SyncBlockBackend,
+    features: BlockFeatures,
+) -> Option<u64> {
+    let total = dev.geometry().block_count()?;
+    if total == 0 {
+        return None;
+    }
+    let alignment = range_validation_alignment_blocks(tag, dev, features)?;
+    let last_lba = total.saturating_sub(1);
+    let candidate_lba = last_lba - (last_lba % alignment);
+    let first_zero = read_probe_block_is_zero(backend, 0).ok()?;
+    let candidate_zero = read_probe_block_is_zero(backend, candidate_lba).ok()?;
+    if !first_zero || !candidate_zero {
+        log::warning!(
+            "[bench][{}][range-op] skipped: unmounted device is not blank enough first_zero={} candidate_lba={} candidate_zero={}",
+            tag,
+            first_zero,
+            candidate_lba,
+            candidate_zero
+        );
+        return None;
+    }
+    Some(candidate_lba)
+}
+
+#[cfg(feature = "block-bench")]
+fn range_validation_alignment_blocks(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    features: BlockFeatures,
+) -> Option<u64> {
+    let mut alignment = 1u64;
+    if features.contains(BlockFeatures::WRITE_ZEROES) {
+        alignment = merge_range_alignment(tag, dev, alignment, BioOp::WriteZeroes)?;
+    }
+    if features.contains(BlockFeatures::DISCARD) {
+        alignment = merge_range_alignment(tag, dev, alignment, BioOp::Discard)?;
+    }
+    Some(alignment.max(1))
+}
+
+#[cfg(feature = "block-bench")]
+fn merge_range_alignment(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    current: u64,
+    op: BioOp,
+) -> Option<u64> {
+    let Some(limits) = dev.limits().range_limits_for(op) else {
+        log::warning!(
+            "[bench][{}][range-op] skipped: {:?} feature lacks range limits",
+            tag,
+            op
+        );
+        return None;
+    };
+    if let Some(max_blocks) = limits.max_blocks_per_io() {
+        if max_blocks.get() == 0 {
+            return None;
+        }
+    }
+    let next = limits
+        .alignment_blocks()
+        .map(|alignment| u64::from(alignment.get()))
+        .unwrap_or(1);
+    lcm_u64(current.max(1), next.max(1))
+}
+
+#[cfg(feature = "block-bench")]
+fn lcm_u64(a: u64, b: u64) -> Option<u64> {
+    a.checked_div(gcd_u64(a, b))?.checked_mul(b)
+}
+
+#[cfg(feature = "block-bench")]
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let next = a % b;
+        a = b;
+        b = next;
+    }
+    a.max(1)
+}
+
+#[cfg(feature = "block-bench")]
+fn read_probe_block_is_zero(backend: &SyncBlockBackend, lba: u64) -> Result<bool, ()> {
+    let len = backend.sector_size_bytes() as usize;
+    let mut buf = vec![0u8; len];
+    backend.read(lba, 1, &mut buf).map_err(|_| ())?;
+    Ok(buf.iter().all(|byte| *byte == 0))
+}
+
+#[cfg(feature = "block-bench")]
+fn range_validation_pattern(len: usize) -> Vec<u8> {
+    let mut data = vec![0u8; len];
+    for (idx, byte) in data.iter_mut().enumerate() {
+        *byte = 0x5au8 ^ (idx as u8).wrapping_mul(17);
+    }
+    data
+}
+
+#[cfg(feature = "block-bench")]
+fn submit_range_op(
+    dev: &Arc<BlockDevice>,
+    op: BioOp,
+    lba: u64,
+) -> Result<(), general::dev::bio::BioError> {
+    dev.submit_bio_wait(op, BlockRange { lba, blocks: 1 }, BioBuffer::None)
+        .map(|_| ())
+}
+
+#[cfg(feature = "block-bench")]
+fn restore_range_probe_block(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    backend: &SyncBlockBackend,
+    lba: u64,
+    original: &[u8],
+) {
+    if let Err(err) = backend.write(lba, 1, original) {
+        log::error!(
+            "[bench][{}][range-op] failed to restore probe block lba={}: {:?}",
+            tag,
+            lba,
+            err
+        );
+        return;
+    }
+    if let Err(err) = dev.control(BlockControlRequest::Flush) {
+        log::error!(
+            "[bench][{}][range-op] failed to flush restored probe block lba={}: {:?}",
+            tag,
+            lba,
+            err
+        );
+    }
 }
 
 #[cfg(any(feature = "bench", feature = "block-bench"))]

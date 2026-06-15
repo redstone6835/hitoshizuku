@@ -7,9 +7,13 @@
 use errno::Errno;
 use vfs::file::IoctlCmd;
 
+use crate::dev::bio::{BioOp, BlockRange};
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, BlockIoHints};
 
-use super::ioctl::{write_i32_to_user, write_u32_to_user, write_u64_to_user, write_usize_to_user};
+use super::ioctl::{
+    read_bytes_from_user, write_i32_to_user, write_u32_to_user, write_u64_to_user,
+    write_usize_to_user,
+};
 
 const BLKROGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 94, 0).raw();
 const BLKGETSIZE: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 96, 0).raw();
@@ -17,6 +21,7 @@ const BLKFLSBUF: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 97, 0).r
 const BLKSSZGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 104, 0).raw();
 const BLKBSZGET: usize =
     IoctlCmd::from_parts(IoctlCmd::IOC_READ, 0x12, 112, core::mem::size_of::<usize>()).raw();
+const BLKDISCARD: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 119, 0).raw();
 const BLKGETSIZE64: usize =
     IoctlCmd::from_parts(IoctlCmd::IOC_READ, 0x12, 114, core::mem::size_of::<usize>()).raw();
 const BLKIOMIN: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 120, 0).raw();
@@ -25,6 +30,7 @@ const BLKALIGNOFF: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 122, 0
 const BLKPBSZGET: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 123, 0).raw();
 const BLKDISCARDZEROES: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 124, 0).raw();
 const BLKROTATIONAL: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 126, 0).raw();
+const BLKZEROOUT: usize = IoctlCmd::from_parts(IoctlCmd::IOC_NONE, 0x12, 127, 0).raw();
 const BLKGETDISKSEQ: usize =
     IoctlCmd::from_parts(IoctlCmd::IOC_READ, 0x12, 128, core::mem::size_of::<u64>()).raw();
 
@@ -34,6 +40,7 @@ const BLKGETSIZE_SECTOR_BYTES: u64 = 512;
 pub trait BlockDeviceIoctlContext {
     fn control(&self, req: BlockControlRequest) -> Result<BlockControlResponse, Errno>;
     fn io_hints(&self) -> Result<BlockIoHints, Errno>;
+    fn submit_range(&self, op: BioOp, range: BlockRange) -> Result<(), Errno>;
 }
 
 /// 执行通用块设备 ioctl。
@@ -98,6 +105,18 @@ pub fn handle_block_ioctl<C: BlockDeviceIoctlContext>(
             write_i32_to_user(arg, i32::from(hints.discard_zeroes))?;
             Ok(0)
         }
+        BLKDISCARD => {
+            if let Some(range) = read_user_block_range(ctx, arg)? {
+                ctx.submit_range(BioOp::Discard, range)?;
+            }
+            Ok(0)
+        }
+        BLKZEROOUT => {
+            if let Some(range) = read_user_block_range(ctx, arg)? {
+                ctx.submit_range(BioOp::WriteZeroes, range)?;
+            }
+            Ok(0)
+        }
         BLKROTATIONAL => {
             let hints = ctx.io_hints()?;
             write_i32_to_user(arg, i32::from(hints.rotational))?;
@@ -131,4 +150,37 @@ fn logical_block_size<C: BlockDeviceIoctlContext>(ctx: &C) -> Result<u32, Errno>
         BlockControlResponse::U32(value) => Ok(value),
         _ => Err(Errno::EINVAL),
     }
+}
+
+fn read_user_block_range<C: BlockDeviceIoctlContext>(
+    ctx: &C,
+    arg: usize,
+) -> Result<Option<BlockRange>, Errno> {
+    let mut raw = [0u8; core::mem::size_of::<u64>() * 2];
+    read_bytes_from_user(arg, &mut raw)?;
+    let start = read_le_u64(&raw[..core::mem::size_of::<u64>()]);
+    let len = read_le_u64(&raw[core::mem::size_of::<u64>()..]);
+    if len == 0 {
+        return Ok(None);
+    }
+
+    let block_size = u64::from(logical_block_size(ctx)?);
+    if block_size == 0 || !start.is_multiple_of(block_size) || !len.is_multiple_of(block_size) {
+        return Err(Errno::EINVAL);
+    }
+    let end = start.checked_add(len).ok_or(Errno::EINVAL)?;
+    if end > capacity_bytes(ctx)? {
+        return Err(Errno::EINVAL);
+    }
+    let blocks = u32::try_from(len / block_size).map_err(|_| Errno::EINVAL)?;
+    Ok(Some(BlockRange {
+        lba: start / block_size,
+        blocks,
+    }))
+}
+
+fn read_le_u64(bytes: &[u8]) -> u64 {
+    let mut out = [0u8; core::mem::size_of::<u64>()];
+    out.copy_from_slice(bytes);
+    u64::from_le_bytes(out)
 }
