@@ -211,6 +211,9 @@ fn load_user_image_from_path_inner(
         (ops.activate)(vm.pgd());
     }
 
+    // RISC-V: 设置 SUM 位允许 S-mode 访问 U=1 的用户页面
+    unsafe { hal::user::enable_sum() };
+
     let entry_pc = interp_loaded
         .as_ref()
         .map(|interp| interp.entry)

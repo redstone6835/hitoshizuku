@@ -55,6 +55,7 @@ pub mod cpu;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
+pub mod mutex;
 pub mod operation;
 pub mod pid;
 pub mod process_ops;

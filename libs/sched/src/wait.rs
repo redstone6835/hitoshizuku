@@ -60,8 +60,10 @@ impl WaitQueue {
             state,
             TaskState::Sleeping | TaskState::Uninterruptible
         ));
-        task.set_state(state);
+        // 先入队再切状态：若先切 Sleeping 再入队，waker 可能在入队前
+        // 检查队列（空），唤醒丢失。
         self.enqueue(task);
+        task.set_state(state);
     }
 
     /// 结束等待：从队列移除，并把仍处于睡眠态的任务恢复为可运行态。
@@ -99,16 +101,26 @@ impl WaitQueue {
     pub fn wake_one(&self, wake: WakeFn) -> Option<Arc<Task>> {
         let picked = {
             let mut w = self.waiters.lock();
+            let initial_len = w.len();
+            let mut pushed_back = 0usize;
             loop {
-                match w.pop_front() {
+                let weak = match w.pop_front() {
                     None => break None,
-                    Some(weak) => {
-                        if let Some(task) = weak.upgrade() {
-                            break Some(task);
-                        }
-                        // upgrade 失败：任务已死，继续找下一个。
+                    Some(wk) => wk,
+                };
+                let Some(task) = weak.upgrade() else {
+                    continue;
+                };
+                let st = task.state();
+                if st != TaskState::Sleeping && st != TaskState::Uninterruptible {
+                    if pushed_back < initial_len {
+                        w.push_back(weak);
+                        pushed_back += 1;
+                        continue;
                     }
+                    break None;
                 }
+                break Some(task);
             }
         };
         if let Some(ref task) = picked {

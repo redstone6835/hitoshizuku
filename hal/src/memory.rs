@@ -9,7 +9,7 @@ pub fn page_size() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL memory layout is not implemented")
+        general::mm::page_size()
     }
 }
 
@@ -21,6 +21,6 @@ pub fn virt_to_phys(virt: usize) -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL virt_to_phys is not implemented")
+        arch::virt_to_phys(virt)
     }
 }

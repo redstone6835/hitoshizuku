@@ -39,6 +39,7 @@ pub mod rtc;
 pub mod syscon;
 pub mod usb;
 pub mod virtio;
+pub mod virtio_mmio;
 
 mod registry_id;
 

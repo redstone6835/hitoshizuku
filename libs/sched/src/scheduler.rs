@@ -1087,14 +1087,9 @@ pub fn schedule_once(now_ns: u64) {
         .arch_context()
         .expect("[sched] next task has no arch context");
 
-    // 6. 切换前先把"内核 trap 入口栈"指向 next 的内核栈顶。这一步必须在
-    //    switch_context 调用之前完成——否则 switch_context 期间若发生中断，
-    //    硬件会把现场写到 prev 的栈上，破坏 prev 的待恢复状态。idle 与
-    //    kthread 必有栈；init 用 adopt_current_context 没分配栈，跳过。
+    // 6. 切换前先把"内核 trap 入口栈"指向 next 的内核栈顶。
     if let Some(top) = next.kernel_stack_top() {
         if let Some(trap) = arch_hooks::trap() {
-            // Safety: top 来自 next.kstack 的栈顶（高地址），仍由 next 持有；
-            //         arch 实现保证只写硬件寄存器、不解引用栈内容。
             unsafe { (trap.set_kernel_trap_stack)(top) };
         }
     }

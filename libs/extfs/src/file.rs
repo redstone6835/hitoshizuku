@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::ops::ControlFlow;
 
+use sched::mutex::Mutex;
 use vfs::dentry::SmallStr;
 use vfs::error::{VfsError, VfsResult};
 use vfs::file::{DirEntry, FileOps, PollEvents};
@@ -126,7 +127,7 @@ pub struct ExtRegFileOps {
     raw: Arc<Spinlock<RawInode>>,
     map_cache: Spinlock<BlockMapCache>,
     /// 串行化 append / 扩容。
-    io_mu: Spinlock<()>,
+    io_mu: Mutex<()>,
 }
 
 struct BlockMapCache {
@@ -174,7 +175,7 @@ impl ExtRegFileOps {
             ino,
             raw,
             map_cache: Spinlock::new(BlockMapCache::default()),
-            io_mu: Spinlock::new(()),
+            io_mu: Mutex::new(()),
         }
     }
 

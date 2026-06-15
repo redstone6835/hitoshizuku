@@ -1,0 +1,235 @@
+//! RISC-V64 异常/中断分发处理。
+//!
+//! 本模块实现异常入口的 Rust 端逻辑，由汇编入口
+//! `__riscv_exception_entry` 保存完整 TrapFrame 后调用。
+//!
+//! 参数约定（与汇编端一致）：
+//! - `tf_ptr`  : TrapFrame 指针（内核栈上，已由汇编填好）
+//! - `_user_sp`: 用户栈指针（当前未使用）
+//!
+//! 返回值：
+//! - 非零 → 汇编端恢复该 TrapFrame 指针并执行 `sret`；
+//! - 零   → 汇编端进入死循环宕机。
+
+use crate::trap::Riscv64MessageInterruptOps;
+use crate::*;
+use general::{Exception, Interrupt};
+
+/// 将 `TrapFrame` 指针转换为可变引用。
+///
+/// # Safety
+/// `ptr` 必须是汇编入口写入的有效、对齐且完整的 TrapFrame 指针。
+#[inline]
+unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
+    // 安全性：调用方保证 ptr 来自 arch 入口写入的 TrapFrame 指针，生命周期
+    //         在 trap 返回前一直有效。
+    unsafe { &mut *(ptr as *mut TrapFrame) }
+}
+
+/// 解码中断：从 SCAUSE 寄存器提取中断类型。
+fn decode_interrupt(cause: usize) -> Interrupt {
+    // RISC-V 把待处理中断类型压在 SCAUSE 的高比特位。与 LoongArch 不同，RISC-V
+    // 的中断类型通过单独的 exception code 区分。这里做的就是把硬件编码翻译成上层
+    // 更容易消费的枚举。
+    let code = cause & !SCAUSE_INTERRUPT;
+    match code {
+        IRQ_S_SOFT => Interrupt::Ipi,
+        IRQ_S_TIMER => Interrupt::Timer,
+        IRQ_S_EXT => Interrupt::Hardware(0),
+        _ => Interrupt::Other(code),
+    }
+}
+
+/// 解码异常代码为 Exception 类型。
+fn decode_exception(code: usize) -> Exception {
+    match code {
+        EXC_INST_PAGE_FAULT => Exception::InstructionPageFault,
+        EXC_LOAD_PAGE_FAULT => Exception::LoadPageFault,
+        EXC_STORE_PAGE_FAULT => Exception::StorePageFault,
+        EXC_ILLEGAL_INST => Exception::IllegalInstruction,
+        EXC_BREAKPOINT => Exception::Breakpoint,
+        EXC_INST_MISALIGNED => Exception::AddressError,
+        EXC_LOAD_ACCESS => Exception::AddressError,
+        EXC_STORE_ACCESS => Exception::AddressError,
+        EXC_INST_ACCESS => Exception::AddressError,
+        _ => Exception::Other(code),
+    }
+}
+
+/// RISC-V64 统一异常入口（Rust 端）。
+///
+/// # Safety
+/// 本函数由汇编入口调用，必须遵循参数约定传递有效的 TrapFrame 指针。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize) -> usize {
+    // 汇编入口已经完成最危险的硬件现场保存；Rust 端从这里开始处理"解释现场并决定命运"。
+    // 返回非零表示异常可恢复，汇编端将按该 TrapFrame 恢复寄存器并执行 `sret`；
+    // 返回零表示当前策略认定无法恢复，汇编端进入停机路径。
+    let tf = unsafe { trap_frame_mut(tf_ptr) };
+    let cause = tf.cause;
+    let is_interrupt = (cause & SCAUSE_INTERRUPT) != 0;
+    let code = cause & !SCAUSE_INTERRUPT;
+
+    let from_user = (tf.status & SSTATUS_SPP) == 0;
+
+    // 从用户态进入异常时开中断，允许设备中断在 handler 执行期间被响应。
+    // 这样可以避免在长时间运行的系统调用中错过重要的设备事件。
+    if from_user {
+        set_csr!(sstatus, SSTATUS_SIE);
+    }
+
+    if is_interrupt {
+        // 对中断而言，最关键的信息是 SCAUSE 位域。与同步异常不同，中断通常不需要 tval，
+        // 且多数情况下 PC 只用于诊断，不决定恢复逻辑。
+        let intr = decode_interrupt(cause);
+        log::debug!(
+            "[trap][interrupt] {:?} sepc={:#x} cpu={}",
+            intr,
+            tf.sepc,
+            Riscv64MessageInterruptOps::current_cpu_id()
+        );
+        // 清除定时器中断标志
+        if code == IRQ_S_TIMER {
+            // RISC-V 的定时器中断需要软件显式清除，否则在 `sret` 后会立即再次陷入，
+            // 形成"看似无法返回"的中断风暴。
+            let now_ns = kernel_timestamp_ns();
+            sched::on_timer_tick(now_ns);
+            super::super::vdso::run_timer_tick_hook(now_ns);
+            super::super::vdso::run_net_poll_hook(now_ns);
+            sched::preempt_if_needed(now_ns);
+            return tf_ptr;
+        }
+        // 非 timer 中断：SupervisorExternal (PLIC), IPI 等
+        let _ = general::dev::irq::dispatch_interrupt(intr);
+        sched::preempt_if_needed(kernel_timestamp_ns());
+        tf_ptr
+    } else if code == EXC_ECALL_U || code == EXC_ECALL_S {
+        general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
+        // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
+        tf_ptr
+    } else if code == EXC_INST_PAGE_FAULT
+        || code == EXC_LOAD_PAGE_FAULT
+        || code == EXC_STORE_PAGE_FAULT
+        || code == EXC_LOAD_ACCESS
+        || code == EXC_STORE_ACCESS
+    {
+        // 缺页族 → 统一走 general::mm::dispatch_page_fault。
+        // 分派结果：
+        //   Fixed                      → 重试指令，返回 tf_ptr；
+        //   Segv                       → 本轮先 log 并投 SIGSEGV；
+        //   Kernel(NotInitialized)     → 启动早期缺页，按旧路径 halt；
+        //   Kernel(UncaughtKernelAccess) → 真内核 bug，halt。
+        use general::mm::{FaultOutcome, KernelFaultReason};
+        let tf_ptr_gen = general::TrapFramePtr::new(tf_ptr);
+        match general::mm::dispatch_page_fault(tf_ptr_gen) {
+            FaultOutcome::Fixed => tf_ptr,
+            FaultOutcome::Segv => {
+                log::info!(
+                    "[trap][mm] user SIGSEGV sepc={:#x} tval={:#x} code={:#x}",
+                    tf.sepc,
+                    tf.tval,
+                    code
+                );
+                // 投 SIGSEGV 给当前线程；下一次调度边界 deliver_pending_signals
+                // 拿到默认 Term 动作即触发 exit_task。本轮 hello 跑通不应触发；
+                // 兜底替代旧的 halt 行为。
+                if sched::is_ready() {
+                    let me = sched::current_task();
+                    let pid = me.pid_root().unwrap_or(0);
+                    let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
+                    sched::schedule_once(kernel_timestamp_ns());
+                }
+                tf_ptr
+            }
+            FaultOutcome::Kernel(reason) => {
+                log::error!(
+                    "[trap][mm] FATAL kernel fault ({:?}) sepc={:#x} tval={:#x} code={:#x} — halting",
+                    reason,
+                    tf.sepc,
+                    tf.tval,
+                    code
+                );
+                0
+            }
+        }
+    } else if code == EXC_BREAKPOINT {
+        // ebreak 指令可能是 4 字节标准格式或 2 字节压缩格式（c.ebreak）。
+        // 通过读取指令低 2 位判断宽度：低 2 位为 0x3 表示 4 字节指令。
+        let insn_lo = unsafe { core::ptr::read(tf.sepc as *const u16) };
+        let step = if insn_lo & 0x3 == 0x3 { 4usize } else { 2usize };
+        tf.sepc = tf.sepc.wrapping_add(step);
+        tf_ptr
+    } else {
+        log::error!(
+            "[trap][exception] UNHANDLED exception code={:#x} sepc={:#x} stval={:#x} from_user={}",
+            code,
+            tf.sepc,
+            tf.tval,
+            from_user
+        );
+        0
+    }
+}
+
+// ── syscall 快速路径 ─────────────────────────────────────────────────────────
+
+/// syscall 快速路径 handler。与 `riscv64_handle_exception` 相同签名，
+/// 但只处理 ecall（入口未保存 FPU）。
+///
+/// 由汇编快速路径在确认 scause=8 后直接调用。
+/// 信号投递需要完整的 FPU 状态，因此在 dispatch 前惰性保存 FPU。
+#[unsafe(no_mangle)]
+pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
+    let tf = unsafe { trap_frame_mut(tf_ptr) };
+
+    // 惰性保存 FPU：仅在 sstatus.FS != Off 时执行。
+    // 这保证 signal delivery 构建 sigframe 时能从 tf.f[] 正确读取用户态浮点状态。
+    if (tf.status & SSTATUS_FS_MASK) != 0 {
+        unsafe { save_fpu_to_frame(tf) };
+    }
+
+    // syscall 处理期间开中断，允许 UART 等设备中断被响应
+    set_csr!(sstatus, SSTATUS_SIE);
+    general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
+    // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
+    tf_ptr
+}
+
+/// 将当前 CPU 的 FPU 寄存器保存到 trap frame。
+///
+/// # Safety
+///
+/// 必须在 FPU 可访问时调用（sstatus.FS != Off）。
+#[inline]
+unsafe fn save_fpu_to_frame(tf: &mut TrapFrame) {
+    let base = tf.f.as_mut_ptr() as usize;
+    let fcsr: usize;
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d",
+            "frcsr {fcsr}",
+            "fsd f0,  0*8({base})",  "fsd f1,  1*8({base})",
+            "fsd f2,  2*8({base})",  "fsd f3,  3*8({base})",
+            "fsd f4,  4*8({base})",  "fsd f5,  5*8({base})",
+            "fsd f6,  6*8({base})",  "fsd f7,  7*8({base})",
+            "fsd f8,  8*8({base})",  "fsd f9,  9*8({base})",
+            "fsd f10, 10*8({base})", "fsd f11, 11*8({base})",
+            "fsd f12, 12*8({base})", "fsd f13, 13*8({base})",
+            "fsd f14, 14*8({base})", "fsd f15, 15*8({base})",
+            "fsd f16, 16*8({base})", "fsd f17, 17*8({base})",
+            "fsd f18, 18*8({base})", "fsd f19, 19*8({base})",
+            "fsd f20, 20*8({base})", "fsd f21, 21*8({base})",
+            "fsd f22, 22*8({base})", "fsd f23, 23*8({base})",
+            "fsd f24, 24*8({base})", "fsd f25, 25*8({base})",
+            "fsd f26, 26*8({base})", "fsd f27, 27*8({base})",
+            "fsd f28, 28*8({base})", "fsd f29, 29*8({base})",
+            "fsd f30, 30*8({base})", "fsd f31, 31*8({base})",
+            ".option pop",
+            base = in(reg) base,
+            fcsr = out(reg) fcsr,
+            options(nostack)
+        );
+    }
+    tf.fcsr = fcsr as u32;
+}

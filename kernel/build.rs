@@ -169,15 +169,20 @@ fn build_lua(root: &Path, arch: Arch) {
 // ── initramfs ───────────────────────────────────────────────────────────────────
 
 fn pack_initramfs(root: &Path, arch: Arch) {
+    let cpio_arch = match arch {
+        Arch::La => "initramfs-la.cpio",
+        Arch::Rv => "initramfs-rv.cpio",
+    };
     let out_cpio = root.join("build/initramfs.cpio");
+    let save = root.join("build").join(cpio_arch);
     let src = root.join(arch.rootfs_dir());
 
-    // cpio 比 rootfs 目录新则跳过
-    if out_cpio.exists() {
-        if let Ok(cpio_time) = std::fs::metadata(&out_cpio).and_then(|m| m.modified()) {
-            let mut newer_than_cpio = false;
-            check_modified(&src, cpio_time, &mut newer_than_cpio);
-            if !newer_than_cpio {
+    if save.exists() {
+        if let Ok(save_time) = std::fs::metadata(&save).and_then(|m| m.modified()) {
+            let mut newer = false;
+            check_modified(&src, save_time, &mut newer);
+            if !newer {
+                let _ = std::fs::copy(&save, &out_cpio);
                 return;
             }
         }
@@ -189,6 +194,8 @@ fn pack_initramfs(root: &Path, arch: Arch) {
         src.display(),
         out_cpio.display()
     )));
+
+    let _ = std::fs::copy(&out_cpio, &save);
 }
 
 fn check_modified(dir: &Path, ref_time: std::time::SystemTime, result: &mut bool) {

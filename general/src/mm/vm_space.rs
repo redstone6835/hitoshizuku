@@ -391,8 +391,8 @@ impl VmSpace {
             .clamp(layout.user_mmap_base, layout.user_mmap_limit);
         let set = self.vmas.lock();
         let candidates = [
-            (cursor, layout.user_mmap_limit),
             (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
         ];
         for (start, end) in candidates {
             if start >= end {
