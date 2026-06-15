@@ -140,8 +140,13 @@ impl VirtioBlkQueue {
         }
     }
 
-    fn take_data_dma(&mut self, len: usize, direction: DmaDirection) -> Option<DmaBuffer> {
-        self.data_pool.take(len, direction)
+    fn take_data_dma(
+        &mut self,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBuffer> {
+        self.data_pool.take(len, align, direction)
     }
 
     fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {
@@ -197,8 +202,13 @@ impl VirtioBlkDmaQueue for VirtioBlkQueue {
         Self::recycle_meta_dma(self, meta_dma);
     }
 
-    fn take_data_dma(&mut self, len: usize, direction: DmaDirection) -> Option<DmaBuffer> {
-        Self::take_data_dma(self, len, direction)
+    fn take_data_dma(
+        &mut self,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBuffer> {
+        Self::take_data_dma(self, len, align, direction)
     }
 
     fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {

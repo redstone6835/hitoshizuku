@@ -1185,6 +1185,12 @@ impl VmSpace {
         kind: FaultKind,
         mapping: &mut PageMapping,
     ) -> FaultOutcome {
+        if matches!(kind, FaultKind::Privilege) {
+            return match self.protect_page(page_va, pte_flags_for(flags, mapping.access)) {
+                Ok(()) => FaultOutcome::Fixed,
+                Err(err) => fault_from_errno(err),
+            };
+        }
         if !is_write_fault(kind) {
             return FaultOutcome::Fixed;
         }
@@ -1240,7 +1246,13 @@ impl VmSpace {
 
     fn protect_page(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        unsafe { (ops.protect)(self.pgd, vaddr, page_size(), flags.with(VmFlags::USER)) };
+        let page_size = page_size();
+        unsafe {
+            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
+            // mprotect 会在 pthread 创建路径把预留栈从 PROT_NONE 改为 RW。
+            // 权限位修改后必须刷掉旧 TLB，否则用户态可能继续命中旧的不可访问权限。
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
+        }
         Ok(())
     }
 
@@ -1532,6 +1544,7 @@ fn permits(flags: VmFlags, kind: FaultKind) -> bool {
         FaultKind::Load | FaultKind::PermRead => flags.has(VmFlags::READ),
         FaultKind::Store | FaultKind::PermWrite => flags.has(VmFlags::WRITE),
         FaultKind::Exec | FaultKind::PermExec => flags.has(VmFlags::EXEC),
+        FaultKind::Privilege => flags.permissions().bits() != 0,
     }
 }
 

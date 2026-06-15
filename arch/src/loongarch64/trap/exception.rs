@@ -212,7 +212,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         arg4
     } else if matches!(
         ecode,
-        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX
+        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX | ECODE_PPI
     ) {
         // 缺页族 → 统一走 general::mm::dispatch_page_fault。
         // 分派结果：

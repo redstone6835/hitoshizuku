@@ -5,7 +5,7 @@
 //!
 //! ## 当前实现
 //!
-//! - `fault_kind`：按 ESTAT.ECODE 分类（PIL/PIS/PIF/PME/PNR/PNX）。**目前从
+//! - `fault_kind`：按 ESTAT.ECODE 分类（PIL/PIS/PIF/PME/PNR/PNX/PPI）。**目前从
 //!   CSR 直接读 ESTAT**——TrapFrame 里没缓存它。改从 trap frame 读需要修改
 //!   asm 入口；现阶段 CSR 直读足够（handler 还没 enable 中断）。
 //! - `fault_addr`：读 CSR_BADV。
@@ -20,7 +20,7 @@ use general::mm::{FaultDecodeOps, FaultKind};
 
 use crate::loongarch64::specific::{
     CSR_BADV, CSR_ESTAT, CSR_PRMD_PPLV_MASK, ECODE_PIF, ECODE_PIL, ECODE_PIS, ECODE_PME, ECODE_PNR,
-    ECODE_PNX, TrapFrame,
+    ECODE_PNX, ECODE_PPI, TrapFrame,
 };
 
 const ESTAT_ECODE_SHIFT: usize = 16;
@@ -89,6 +89,7 @@ fn fault_kind(_tf: TrapFramePtr) -> FaultKind {
         ECODE_PME => FaultKind::PermWrite,
         ECODE_PNR => FaultKind::PermRead,
         ECODE_PNX => FaultKind::PermExec,
+        ECODE_PPI => FaultKind::Privilege,
         // 非缺页族 → 归 Load，由 VmSpace::handle_fault 据地址走 Segv 分支。
         _ => FaultKind::Load,
     }

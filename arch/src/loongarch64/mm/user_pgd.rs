@@ -229,7 +229,6 @@ unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
         }
         va += LoongArch64Paging::PAGE_SIZE;
     }
-    unsafe { invalidate_range(handle, vaddr, len) };
 }
 
 unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range<usize>) {

@@ -476,6 +476,11 @@ pub(super) struct VirtioBlkRequestPlan {
     pub sector: u64,
     pub descriptor_count: usize,
     pub data_len: usize,
+    /// 数据 descriptor 对应 DMA 缓冲的 CPU 访问对齐。
+    ///
+    /// 普通 BIO 数据按字节拷贝，1 字节对齐即可；range descriptor 由 CPU 以
+    /// 协议结构体写入，必须满足结构体对齐，避免把 allocator 当前行为当作契约。
+    pub data_align: usize,
     pub data_direction: Option<DmaDirection>,
     pub data_device_writable: bool,
     pub data_payload: VirtioBlkDataPayload,
@@ -528,6 +533,7 @@ impl VirtioBlkRequestPlan {
                 sector,
                 descriptor_count: 3,
                 data_len: checked_bio_payload_len(blocks, logical_block_size)?,
+                data_align: 1,
                 data_direction: Some(DmaDirection::FromDevice),
                 data_device_writable: true,
                 data_payload: VirtioBlkDataPayload::BioBuffer,
@@ -537,6 +543,7 @@ impl VirtioBlkRequestPlan {
                 sector,
                 descriptor_count: 3,
                 data_len: checked_bio_payload_len(blocks, logical_block_size)?,
+                data_align: 1,
                 data_direction: Some(DmaDirection::ToDevice),
                 data_device_writable: false,
                 data_payload: VirtioBlkDataPayload::BioBuffer,
@@ -550,6 +557,7 @@ impl VirtioBlkRequestPlan {
                     sector,
                     descriptor_count: 2,
                     data_len: 0,
+                    data_align: 1,
                     data_direction: None,
                     data_device_writable: false,
                     data_payload: VirtioBlkDataPayload::None,
@@ -570,6 +578,7 @@ impl VirtioBlkRequestPlan {
                     sector: 0,
                     descriptor_count: 3,
                     data_len: mem::size_of::<VirtioBlkRangeSegment>(),
+                    data_align: mem::align_of::<VirtioBlkRangeSegment>(),
                     data_direction: Some(DmaDirection::ToDevice),
                     data_device_writable: false,
                     data_payload: VirtioBlkDataPayload::RangeSegment(VirtioBlkRangeSegment::new(
@@ -599,6 +608,7 @@ impl VirtioBlkRequestPlan {
                     sector: 0,
                     descriptor_count: 3,
                     data_len: mem::size_of::<VirtioBlkRangeSegment>(),
+                    data_align: mem::align_of::<VirtioBlkRangeSegment>(),
                     data_direction: Some(DmaDirection::ToDevice),
                     data_device_writable: false,
                     data_payload: VirtioBlkDataPayload::RangeSegment(VirtioBlkRangeSegment::new(
@@ -709,7 +719,12 @@ pub(super) trait VirtioBlkDmaQueue {
     fn split_queue(&mut self) -> &mut SplitVirtQueue;
     fn take_meta_dma(&mut self) -> Option<DmaBuffer>;
     fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer);
-    fn take_data_dma(&mut self, len: usize, direction: DmaDirection) -> Option<DmaBuffer>;
+    fn take_data_dma(
+        &mut self,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBuffer>;
     fn recycle_data_dma(&mut self, data_dma: DmaBuffer);
 
     fn recycle_request_dma(&mut self, meta_dma: DmaBuffer, data_dma: Option<DmaBuffer>) {
@@ -773,9 +788,10 @@ pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
                 return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
             }
         };
-        match queue.take_data_dma(plan.data_len, direction) {
+        match queue.take_data_dma(plan.data_len, plan.data_align, direction) {
             Some(buffer) => Some(buffer),
-            None => match DmaBuffer::new_in(dma_context, plan.data_len, 1, direction) {
+            None => match DmaBuffer::new_in(dma_context, plan.data_len, plan.data_align, direction)
+            {
                 Ok(buffer) => Some(buffer),
                 Err(_) => {
                     let _ = queue.split_queue().free_chain(chain);
@@ -928,15 +944,22 @@ impl DmaBufferPool {
         }
     }
 
-    pub fn take(&mut self, len: usize, direction: DmaDirection) -> Option<DmaBuffer> {
+    pub fn take(&mut self, len: usize, align: usize, direction: DmaDirection) -> Option<DmaBuffer> {
+        let align = align.max(1);
         let pos = self
             .buffers
             .iter()
             .enumerate()
-            .filter(|(_, buffer)| buffer.direction() == direction && buffer.len() >= len)
+            .filter(|(_, buffer)| {
+                buffer.direction() == direction
+                    && buffer.len() >= len
+                    && buffer.vaddr().is_multiple_of(align)
+            })
             .min_by_key(|(_, buffer)| buffer.len())
             .map(|(pos, _)| pos)?;
-        let buffer = self.buffers.remove(pos);
+        // 缓冲池没有稳定顺序语义；best-fit 位置已经选定后，用 swap_remove
+        // 避免 Vec::remove 在热路径移动后续元素。
+        let buffer = self.buffers.swap_remove(pos);
         self.cached_bytes = self.cached_bytes.saturating_sub(buffer.len());
         Some(buffer)
     }
