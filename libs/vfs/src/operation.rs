@@ -831,17 +831,38 @@ pub fn utimensat(
         LookupFlags::default()
     };
     let result = path::lookup(ctx, dirfd, path, flags)?;
-    result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
-    {
-        let meta = inode.meta_snapshot();
-        // 文件所有者或有写权限的进程可以设置时间戳；任意进程设置为当前时间
-        // 此处实现：所有者或有写权限
-        if !ctx.cred.is_owner(meta.uid) && !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
-            return Err(VfsError::PermissionDenied);
-        }
+    utimens_inode(ctx, &result.mount, &inode, atime, mtime)
+}
+
+/// `futimens(2)` — 通过已打开 fd 设置文件时间戳。
+pub fn futimens(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    fd: Fd,
+    atime: Option<stat::Timespec>,
+    mtime: Option<stat::Timespec>,
+) -> VfsResult<()> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    if file.flags().path_only {
+        return Err(VfsError::BadFileDescriptor);
     }
-    inode.ops.utimes(&inode, atime, mtime)
+    utimens_inode(ctx, file.mount(), file.inode(), atime, mtime)
+}
+
+fn utimens_inode(
+    ctx: &VfsContext,
+    mount: &Arc<mount::Mount>,
+    inode: &Arc<Inode>,
+    atime: Option<stat::Timespec>,
+    mtime: Option<stat::Timespec>,
+) -> VfsResult<()> {
+    mount.check_writable()?;
+    let meta = inode.meta_snapshot();
+    if !ctx.cred.is_owner(meta.uid) && !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
+        return Err(VfsError::PermissionDenied);
+    }
+    inode.ops.utimes(inode, atime, mtime)
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────

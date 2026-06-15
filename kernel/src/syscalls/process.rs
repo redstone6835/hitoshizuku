@@ -633,6 +633,12 @@ pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     };
 
     let old = sched::operation::prlimit64(pid, resource, new_pair)?;
+    if resource == sched::Resource::Nofile
+        && let Some(new) = new_pair
+    {
+        let target = sched_task_from_pid(pid, ctx.task())?;
+        sync_fdtable_nofile_limit(&target, new)?;
+    }
 
     if old_user != 0 {
         let mut raw = [0u8; 16];
@@ -688,6 +694,9 @@ pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let max = u64::from_le_bytes(raw[8..16].try_into().unwrap());
     let new = sched::RlimitPair::new(sched::Rlim::from_raw(cur), sched::Rlim::from_raw(max));
     let _old = sched::operation::set_rlimit(resource, new)?;
+    if resource == sched::Resource::Nofile {
+        sync_fdtable_nofile_limit(ctx.task(), new)?;
+    }
     Ok(0)
 }
 
@@ -3417,6 +3426,13 @@ fn task_fdtable(task: &Arc<Task>) -> Option<Arc<vfs::FdTable>> {
     task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)?
         .downcast::<vfs::FdTable>()
         .ok()
+}
+
+fn sync_fdtable_nofile_limit(task: &Arc<Task>, limit: sched::RlimitPair) -> Result<(), Errno> {
+    let raw = limit.soft.raw();
+    let soft = u32::try_from(raw).map_err(|_| Errno::EINVAL)?;
+    let fdt = task_fdtable(task).ok_or(Errno::EBADF)?;
+    fdt.set_limit(soft).map_err(|e| e.to_errno())
 }
 
 fn task_vfs_context(task: &Arc<Task>) -> Option<Arc<vfs::VfsContext>> {

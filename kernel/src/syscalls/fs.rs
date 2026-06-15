@@ -648,37 +648,70 @@ fn decode_optional_owner(uid_raw: u32, gid_raw: u32) -> (Option<Uid>, Option<Gid
 pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
-    let path = copy_path_from_user(ctx.args[1])?;
+    let path_user = ctx.args[1];
     let times_user = ctx.args[2];
     let flags = ctx.args[3];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (atime, mtime) = decode_utimens_times(times_user)?;
+
+    if path_user == 0 {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let fd = fd_arg(ctx.args[0])?;
+        operation::futimens(&vfs_ctx, &fdt, fd, atime, mtime).map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(path_user)?;
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
-
-    let (atime, mtime) = if times_user == 0 {
-        (None, None)
-    } else {
-        let mut raw = [0u8; 32];
-        copy_from_user(times_user, &mut raw).map_err(|e| e.as_errno())?;
-        let read_ts = |off: usize| -> Option<Timespec> {
-            let sec = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
-            let nsec = i64::from_le_bytes(raw[off + 8..off + 16].try_into().unwrap());
-            if sec == 0x3fffffff && nsec == 0x3fffffff {
-                None
-            } else if sec == 0x3ffffffe && nsec == 0x3ffffffe {
-                Some(Timespec::ZERO)
-            } else {
-                Some(Timespec {
-                    secs: sec,
-                    nsecs: nsec as u32,
-                })
-            }
-        };
-        (read_ts(0), read_ts(16))
-    };
-
     operation::utimensat(&vfs_ctx, &dirfd, &path, atime, mtime, no_follow)
         .map_err(|e| e.to_errno())?;
     Ok(0)
+}
+
+fn decode_utimens_times(times_user: usize) -> Result<(Option<Timespec>, Option<Timespec>), Errno> {
+    if times_user == 0 {
+        let now = realtime_timespec();
+        return Ok((Some(now), Some(now)));
+    }
+
+    const UTIME_NOW_NSEC: i64 = 0x3fff_ffff;
+    const UTIME_OMIT_NSEC: i64 = 0x3fff_fffe;
+    const NSEC_PER_SEC: i64 = 1_000_000_000;
+
+    let mut raw = [0u8; 32];
+    copy_from_user(times_user, &mut raw).map_err(|e| e.as_errno())?;
+    let now = realtime_timespec();
+    let read_ts = |off: usize| -> Result<Option<Timespec>, Errno> {
+        let sec = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(raw[off + 8..off + 16].try_into().unwrap());
+        if nsec == UTIME_NOW_NSEC {
+            return Ok(Some(now));
+        }
+        if nsec == UTIME_OMIT_NSEC {
+            return Ok(None);
+        }
+        if !(0..NSEC_PER_SEC).contains(&nsec) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(Some(Timespec {
+            secs: sec,
+            nsecs: nsec as u32,
+        }))
+    };
+    Ok((read_ts(0)?, read_ts(16)?))
+}
+
+fn realtime_timespec() -> Timespec {
+    let ns = crate::vdso::realtime_ns();
+    Timespec {
+        secs: (ns / 1_000_000_000) as i64,
+        nsecs: (ns % 1_000_000_000) as u32,
+    }
 }
 
 pub(super) fn sys_truncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

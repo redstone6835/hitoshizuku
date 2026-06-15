@@ -463,8 +463,8 @@ impl NetSocketFileOps {
                 Ok(())
             }
             SocketType::Tcp => {
-                // FIXME: TCP bind 暂不下沉到协议栈，listen/connect 时才应用。
-                *self.local.lock() = Some(ep);
+                let bound = net::stack().tcp_bind(handle, ep).map_err(map_net_error)?;
+                *self.local.lock() = Some(bound);
                 Ok(())
             }
             SocketType::Raw | SocketType::Icmp => {

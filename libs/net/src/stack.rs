@@ -647,14 +647,62 @@ impl NetStack {
                 return Err(NetError::Closed);
             }
             let remote_ep = endpoint_to_smoltcp(&remote);
-            let local_port =
-                select_tcp_ephemeral_port(&managed, handle.inner, self.tuning.ephemeral_ports)?;
+            let local_port = if let Some(bound) = managed.tcp_bound_endpoint(handle.inner) {
+                bound.port
+            } else {
+                select_tcp_ephemeral_port(&managed, handle.inner, self.tuning.ephemeral_ports)?
+            };
             managed
                 .tcp_connect(handle.inner, remote_ep, local_port)
                 .map_err(|_| NetError::ConnectionRefused)?;
         }
         self.poll_now();
         Ok(())
+    }
+
+    /// TCP bind（保留本地端点，不进入 listen/connect 状态）。
+    pub fn tcp_bind(
+        &self,
+        handle: NetSocketHandle,
+        mut local: Endpoint,
+    ) -> Result<Endpoint, NetError> {
+        if handle.sock_type != SocketType::Tcp {
+            return Err(NetError::InvalidArgument);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        if managed.tcp_bound_endpoint(handle.inner).is_some() {
+            return Err(NetError::InvalidArgument);
+        }
+        if managed.tcp_socket(handle.inner).state() != smoltcp::socket::tcp::State::Closed {
+            return Err(NetError::InvalidArgument);
+        }
+        ensure_local_addr_available(&managed, &local.addr)?;
+        if local.port != 0 {
+            let local_ep = endpoint_to_smoltcp_listen(&local);
+            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+                return Err(NetError::AddressInUse);
+            }
+            managed.set_tcp_bound_endpoint(handle.inner, local_ep);
+            return Ok(local);
+        }
+
+        for candidate in EphemeralPortCursor::new(self.tuning.ephemeral_ports) {
+            local.port = candidate;
+            let local_ep = endpoint_to_smoltcp_listen(&local);
+            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+                continue;
+            }
+            managed.set_tcp_bound_endpoint(handle.inner, local_ep);
+            return Ok(local);
+        }
+        Err(NetError::AddressInUse)
     }
 
     /// TCP listen（开始监听）。

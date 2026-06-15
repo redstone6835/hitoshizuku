@@ -138,7 +138,7 @@ impl SuperblockOps for TmpfsSuperblockOps {
             free_blocks: u64::MAX,
             avail_blocks: u64::MAX,
             total_inodes: self.total_inodes.load(Ordering::Relaxed),
-            free_inodes: u64::MAX,
+            free_inodes: 0,
             fs_id: sb.fs_id.raw(),
             name_max: sb.name_max,
         })
@@ -939,12 +939,15 @@ impl InodeOps for TmpfsInodeOps {
             }
         }
         let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
+        let opened_inode = sb
+            .find_inode(inode.ino())
+            .ok_or(VfsError::InvalidArgument)?;
         Ok(Box::new(TmpfsFileOps {
             inode_ops: inode
                 .downcast_ops::<TmpfsInodeOps>()
                 .ok_or(VfsError::InvalidArgument)? as *const TmpfsInodeOps,
+            inode: opened_inode,
             sb: Arc::downgrade(&sb),
-            ino: inode.ino(),
         }))
     }
 
@@ -961,18 +964,12 @@ impl InodeOps for TmpfsInodeOps {
 
 struct TmpfsFileOps {
     inode_ops: *const TmpfsInodeOps,
+    inode: Arc<Inode>,
     sb: Weak<Superblock>,
-    ino: u64,
 }
 
 unsafe impl Send for TmpfsFileOps {}
 unsafe impl Sync for TmpfsFileOps {}
-
-impl TmpfsFileOps {
-    fn inode(&self) -> Option<Arc<Inode>> {
-        self.sb.upgrade().and_then(|sb| sb.find_inode(self.ino))
-    }
-}
 
 impl FileOps for TmpfsFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
@@ -984,10 +981,8 @@ impl FileOps for TmpfsFileOps {
         };
 
         let n = file_data.read_at(buf, offset);
-        if n != 0
-            && let Some(inode) = self.inode()
-        {
-            inode.touch_atime();
+        if n != 0 {
+            self.inode.touch_atime();
         }
         Ok(n)
     }
@@ -1009,12 +1004,11 @@ impl FileOps for TmpfsFileOps {
         };
 
         let n = file_data.write_at(buf, start)?;
-        if let Some(inode) = self.inode() {
-            inode.set_size_and_blocks(file_data.size, file_data.blocks());
-            if n != 0 {
-                inode.touch_mtime();
-                inode.touch_ctime();
-            }
+        self.inode
+            .set_size_and_blocks(file_data.size, file_data.blocks());
+        if n != 0 {
+            self.inode.touch_mtime();
+            self.inode.touch_ctime();
         }
         Ok(n)
     }
@@ -1034,12 +1028,10 @@ impl FileOps for TmpfsFileOps {
 
         if end > file_data.size {
             file_data.reserve(offset, len)?;
-            if let Some(inode) = self.inode() {
-                let size = file_data.size;
-                inode.set_size_and_blocks(size, file_data.blocks());
-                inode.touch_mtime();
-                inode.touch_ctime();
-            }
+            let size = file_data.size;
+            self.inode.set_size_and_blocks(size, file_data.blocks());
+            self.inode.touch_mtime();
+            self.inode.touch_ctime();
         }
         Ok(())
     }

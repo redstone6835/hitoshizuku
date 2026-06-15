@@ -40,6 +40,8 @@ pub(crate) struct ManagedInterface {
     dhcpv4_configured: bool,
     /// 每个 socket 的元数据（soft-close 标志）。
     pub(crate) meta: BTreeMap<SocketHandle, SocketMeta>,
+    /// TCP bind 尚未进入 listen/connect 时的本地端点保留。
+    tcp_bound: BTreeMap<SocketHandle, IpListenEndpoint>,
     /// 已完成握手的 TCP socket 队列（accept backlog）。
     pending_accepted: Vec<SocketHandle>,
     /// 已建立连接对应的补位监听 socket。
@@ -119,6 +121,7 @@ impl ManagedInterface {
             dhcpv4_socket,
             dhcpv4_configured: false,
             meta: BTreeMap::new(),
+            tcp_bound: BTreeMap::new(),
             pending_accepted: Vec::with_capacity(listen_tuning.accept_backlog),
             accept_successors: BTreeMap::new(),
             accept_published_listeners: BTreeSet::new(),
@@ -555,6 +558,9 @@ impl ManagedInterface {
         exclude: ProtocolSocketHandle,
         target: IpListenEndpoint,
     ) -> bool {
+        if self.tcp_bound_endpoint_in_use(exclude, target) {
+            return true;
+        }
         let exclude = exclude.into_smoltcp();
         for (handle, socket) in self.sockets.iter() {
             if handle == exclude {
@@ -581,12 +587,54 @@ impl ManagedInterface {
         false
     }
 
+    /// 检查 TCP bind 保留端点是否被其它 socket 占用。
+    pub fn tcp_bound_endpoint_in_use(
+        &self,
+        exclude: ProtocolSocketHandle,
+        target: IpListenEndpoint,
+    ) -> bool {
+        let exclude = exclude.into_smoltcp();
+        for (handle, endpoint) in &self.tcp_bound {
+            if *handle == exclude {
+                continue;
+            }
+            let Some(meta) = self.meta.get(handle) else {
+                continue;
+            };
+            if meta.is_removed() || meta.is_orphaned() {
+                continue;
+            }
+            if listen_endpoint_matches(*endpoint, target) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 读取 TCP bind 保留端点。
+    pub fn tcp_bound_endpoint(&self, handle: ProtocolSocketHandle) -> Option<IpListenEndpoint> {
+        self.tcp_bound.get(&handle.into_smoltcp()).copied()
+    }
+
+    /// 记录 TCP bind 保留端点。
+    pub fn set_tcp_bound_endpoint(
+        &mut self,
+        handle: ProtocolSocketHandle,
+        endpoint: IpListenEndpoint,
+    ) {
+        self.tcp_bound.insert(handle.into_smoltcp(), endpoint);
+    }
+
     /// 检查 TCP 本地端口是否已被当前接口上的其它 socket 占用。
     ///
     /// 主动连接自动选择本地端口时必须在同一把接口锁内检查占用，避免两个
     /// 并发连接拿到相同端口。这里保守地把监听、正在连接、已建立以及关闭
     /// 尾部状态的 socket 都视为占用者。
     pub fn tcp_local_port_in_use(&self, exclude: ProtocolSocketHandle, port: u16) -> bool {
+        let target = IpListenEndpoint { addr: None, port };
+        if self.tcp_bound_endpoint_in_use(exclude, target) {
+            return true;
+        }
         let exclude = exclude.into_smoltcp();
         for (handle, socket) in self.sockets.iter() {
             if handle == exclude {
@@ -965,6 +1013,7 @@ impl ManagedInterface {
             self.dhcpv4_configured = false;
         }
         self.meta.remove(&handle);
+        self.tcp_bound.remove(&handle);
         self.udp_peers.remove(&handle);
         self.remove_pending_tcp_accept(handle);
         self.accept_published_listeners.remove(&handle);
