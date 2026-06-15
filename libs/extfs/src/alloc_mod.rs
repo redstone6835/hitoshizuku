@@ -23,10 +23,11 @@ fn lock_alloc() -> SpinlockGuard<'static, ()> {
         if let Some(guard) = ALLOC_LOCK.try_lock() {
             return guard;
         }
-        // FIXME: extfs 分配临界区当前会触发块 I/O，等待方不能纯自旋；
-        // 后续应改成正式睡眠锁，或缩小临界区避免持锁 I/O。
+        // extfs 分配临界区当前会触发块 I/O，等待方不能纯自旋，否则单核
+        // 下持锁任务拿不到 CPU。这里必须用真实时间戳推进 fair 调度；
+        // `schedule_once(0)` 不记账，在 iozone 多进程写入时会放大成饥饿。
         if sched::is_ready() {
-            sched::schedule_once(0);
+            sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
         }
@@ -437,9 +438,7 @@ pub(crate) fn free_blocks_run(
     }
 
     if total_cleared != 0 {
-        state
-            .block_alloc_hint
-            .store(first_rel, Ordering::Relaxed);
+        state.block_alloc_hint.store(first_rel, Ordering::Relaxed);
         state.adjust_sb_free_blocks(total_cleared as i64)?;
         state.flush_alloc_metadata()?;
     }

@@ -97,15 +97,16 @@ impl<T> Completion<T> {
             self.wait_queue.enqueue(&task);
             if self.done.load(Ordering::Acquire) {
                 self.wait_queue.remove(&task);
-                let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
                 if let Some(result) = self.result.lock().take() {
+                    restore_current_after_wait(&task);
                     return result;
                 }
             }
             drop(task);
-            sched::schedule_once(0);
+            sched::schedule_once(sched::now_ns_public());
             let task = sched::current_task();
             self.wait_queue.remove(&task);
+            restore_current_after_wait(&task);
         }
     }
 
@@ -118,5 +119,11 @@ impl<T> Completion<T> {
             }
             core::hint::spin_loop();
         }
+    }
+}
+
+fn restore_current_after_wait(task: &Arc<sched::Task>) {
+    if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
+        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
     }
 }

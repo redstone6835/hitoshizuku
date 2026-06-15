@@ -1360,6 +1360,26 @@ fn map_bio_err(err: BioError) -> VfsError {
     }
 }
 
+fn map_bio_errno(err: BioError) -> Errno {
+    match err {
+        BioError::Submit(s) => match s {
+            crate::dev::bio::SubmitError::Unsupported => Errno::ENOTTY,
+            crate::dev::bio::SubmitError::ReadOnly => Errno::EROFS,
+            crate::dev::bio::SubmitError::QueueFull => Errno::EAGAIN,
+            crate::dev::bio::SubmitError::DeviceGone => Errno::ENODEV,
+            crate::dev::bio::SubmitError::OutOfMemory => Errno::ENOMEM,
+            crate::dev::bio::SubmitError::InvalidRequest(_) => Errno::EINVAL,
+        },
+        BioError::Io(i) => match i {
+            crate::dev::bio::BioIoError::MediaError => Errno::EIO,
+            crate::dev::bio::BioIoError::Unavailable => Errno::ENODEV,
+            crate::dev::bio::BioIoError::Timeout => Errno::ETIMEDOUT,
+            crate::dev::bio::BioIoError::ReadOnly => Errno::EROFS,
+            crate::dev::bio::BioIoError::Unsupported => Errno::ENOTTY,
+        },
+    }
+}
+
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
     let mut data = Vec::new();
     data.try_reserve(len).map_err(|_| VfsError::OutOfMemory)?;
@@ -1435,6 +1455,15 @@ impl BlockDeviceIoctlContext for BlockDevFileOps {
 
     fn io_hints(&self) -> Result<BlockIoHints, Errno> {
         block_io_hints(&self.dev)
+    }
+
+    fn submit_range(&self, op: BioOp, range: BlockRange) -> Result<(), Errno> {
+        // ioctl 层已经把用户 ABI 的字节区间转换为块范围；这里仅提交 typed BIO，
+        // 不解析 ioctl number，也不接触用户指针。
+        self.dev
+            .submit_bio_wait(op, range, BioBuffer::None)
+            .map(|_| ())
+            .map_err(map_bio_errno)
     }
 }
 

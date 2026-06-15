@@ -1219,7 +1219,11 @@ impl HotTaskExt {
             return false;
         };
         let mut guard = slot.lock();
-        debug_assert!(guard.is_none(), "[sched][ext] key 0x{:x} already installed", key);
+        debug_assert!(
+            guard.is_none(),
+            "[sched][ext] key 0x{:x} already installed",
+            key
+        );
         *guard = Some(Arc::clone(payload));
         true
     }

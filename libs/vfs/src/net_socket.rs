@@ -455,7 +455,10 @@ impl NetSocketFileOps {
         let handle = self.rehome_for_endpoint(self.get_handle()?, &ep)?;
         match handle.socket_type() {
             SocketType::Udp => {
-                let bound = net::stack().udp_bind(handle, ep).map_err(map_net_error)?;
+                let allow_reuse = self.udp_bind_reuse_enabled();
+                let bound = net::stack()
+                    .udp_bind_with_reuse(handle, ep, allow_reuse)
+                    .map_err(map_net_error)?;
                 *self.local.lock() = Some(bound);
                 Ok(())
             }
@@ -545,11 +548,9 @@ impl NetSocketFileOps {
         {
             handle = self.rehome_for_endpoint(handle, &ep)?;
         }
-        // FIXME: remote 是 VFS 层缓存；UDP/RAW/ICMP connect 不会同步到底层
-        // socket，getpeername 可能返回一个协议栈并未验证过的地址。
-        *self.remote.lock() = Some(ep);
         match handle.socket_type() {
             SocketType::Tcp => {
+                *self.remote.lock() = Some(ep);
                 net::stack()
                     .tcp_connect(handle, ep)
                     .map_err(map_net_error)?;
@@ -577,7 +578,18 @@ impl NetSocketFileOps {
                 // 非阻塞 connect：不等待握手完成，返回 EINPROGRESS
                 Err(Errno::EINPROGRESS)
             }
-            SocketType::Udp | SocketType::Raw | SocketType::Icmp => Ok(()),
+            SocketType::Udp => {
+                let local = net::stack()
+                    .udp_connect(handle, ep)
+                    .map_err(map_net_error)?;
+                *self.local.lock() = Some(local);
+                *self.remote.lock() = Some(ep);
+                Ok(())
+            }
+            SocketType::Raw | SocketType::Icmp => {
+                *self.remote.lock() = Some(ep);
+                Ok(())
+            }
         }
     }
 
@@ -1149,10 +1161,19 @@ impl NetSocketFileOps {
                 }
             });
         let bound = net::stack()
-            .udp_bind(handle, Endpoint { addr, port: 0 })
+            .udp_bind_with_reuse(
+                handle,
+                Endpoint { addr, port: 0 },
+                self.udp_bind_reuse_enabled(),
+            )
             .map_err(map_net_error)?;
         *self.local.lock() = Some(bound);
         Ok(handle)
+    }
+
+    fn udp_bind_reuse_enabled(&self) -> bool {
+        let options = self.options.lock();
+        options.reuseaddr || options.reuseport
     }
 
     fn do_recv_with(

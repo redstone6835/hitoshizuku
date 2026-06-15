@@ -61,7 +61,7 @@ pub(crate) fn wait_while(
             if deadline_armed {
                 cancel_sleep_deadline(&task);
             }
-            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            restore_current_after_wait(&task);
             return Ok(());
         }
         if deadline_expired(deadline) {
@@ -69,7 +69,7 @@ pub(crate) fn wait_while(
             if deadline_armed {
                 cancel_sleep_deadline(&task);
             }
-            let _ = task.cas_state(TaskState::Sleeping, TaskState::Runnable);
+            restore_current_after_wait(&task);
             return Err(SocketError::TemporaryUnavailable);
         }
         schedule_once(now_ns_public());
@@ -77,11 +77,18 @@ pub(crate) fn wait_while(
         if deadline_armed {
             cancel_sleep_deadline(&task);
         }
+        restore_current_after_wait(&task);
         if has_pending_signal(&task) {
             return Err(SocketError::Interrupted);
         }
         if deadline_expired(deadline) {
             return Err(SocketError::TemporaryUnavailable);
         }
+    }
+}
+
+fn restore_current_after_wait(task: &Arc<Task>) {
+    if !task.cas_state(TaskState::Sleeping, TaskState::Running) {
+        let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
     }
 }

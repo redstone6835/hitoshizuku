@@ -98,6 +98,39 @@ pub struct BlockLimits {
     max_blocks_per_io: Option<NonZeroU32>,
     optimal_blocks_per_io: Option<NonZeroU32>,
     buffer_alignment: Option<NonZeroU32>,
+    discard: Option<BlockRangeLimits>,
+    write_zeroes: Option<BlockRangeLimits>,
+}
+
+/// 范围类块命令的限制。
+///
+/// Discard / WriteZeroes 等命令不携带用户数据缓冲，它们的设备限制通常来自介质
+/// 擦除粒度或协议 range descriptor，而不是普通数据 DMA 段大小。用独立结构表达
+/// 可以避免把读写 I/O 的 DMA 限制误套到范围命令上。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockRangeLimits {
+    max_blocks_per_io: Option<NonZeroU32>,
+    alignment_blocks: Option<NonZeroU32>,
+}
+
+impl BlockRangeLimits {
+    pub const fn new(
+        max_blocks_per_io: Option<NonZeroU32>,
+        alignment_blocks: Option<NonZeroU32>,
+    ) -> Self {
+        Self {
+            max_blocks_per_io,
+            alignment_blocks,
+        }
+    }
+
+    pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
+        self.max_blocks_per_io
+    }
+
+    pub const fn alignment_blocks(&self) -> Option<NonZeroU32> {
+        self.alignment_blocks
+    }
 }
 
 impl BlockLimits {
@@ -120,6 +153,8 @@ impl BlockLimits {
             max_blocks_per_io,
             optimal_blocks_per_io,
             buffer_alignment,
+            discard: None,
+            write_zeroes: None,
         })
     }
 
@@ -128,7 +163,19 @@ impl BlockLimits {
             max_blocks_per_io: None,
             optimal_blocks_per_io: None,
             buffer_alignment: None,
+            discard: None,
+            write_zeroes: None,
         }
+    }
+
+    pub const fn with_discard_limits(mut self, limits: Option<BlockRangeLimits>) -> Self {
+        self.discard = limits;
+        self
+    }
+
+    pub const fn with_write_zeroes_limits(mut self, limits: Option<BlockRangeLimits>) -> Self {
+        self.write_zeroes = limits;
+        self
     }
 
     pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
@@ -141,6 +188,22 @@ impl BlockLimits {
 
     pub const fn buffer_alignment(&self) -> Option<NonZeroU32> {
         self.buffer_alignment
+    }
+
+    pub const fn discard_limits(&self) -> Option<BlockRangeLimits> {
+        self.discard
+    }
+
+    pub const fn write_zeroes_limits(&self) -> Option<BlockRangeLimits> {
+        self.write_zeroes
+    }
+
+    pub const fn range_limits_for(&self, op: BioOp) -> Option<BlockRangeLimits> {
+        match op {
+            BioOp::Discard => self.discard,
+            BioOp::WriteZeroes => self.write_zeroes,
+            _ => None,
+        }
     }
 }
 
@@ -207,6 +270,11 @@ impl BlockFeatures {
     pub const DISCARD: Self = Self(1 << 2);
     pub const WRITE_ZEROES: Self = Self(1 << 3);
     pub const FUA: Self = Self(1 << 4);
+    /// Discard 后读取同一区间能够稳定返回零。
+    ///
+    /// 这和 WRITE_ZEROES 是两个能力：WRITE_ZEROES 表示设备支持显式写零命令，
+    /// DISCARD_ZEROES 表示丢弃后的介质可观测内容为零。没有明确保证时不能声明。
+    pub const DISCARD_ZEROES: Self = Self(1 << 5);
 
     #[inline]
     pub fn contains(self, other: Self) -> bool {
@@ -567,7 +635,7 @@ impl BlockDevice {
                     min_io_size: logical,
                     optimal_io_size: optimal,
                     alignment_offset: self.limits.buffer_alignment().map(|_| 0).unwrap_or(0),
-                    discard_zeroes: self.features.contains(BlockFeatures::WRITE_ZEROES),
+                    discard_zeroes: self.features.contains(BlockFeatures::DISCARD_ZEROES),
                     rotational: self.attributes.rotational(),
                 }))
             }
@@ -634,7 +702,10 @@ impl BlockDevice {
                 break;
             }
             if sched::is_ready() {
-                sched::schedule_once(0);
+                // 同步块 I/O 等待是 iozone 写路径的热区。用真实时间片让
+                // 持锁/持请求的任务获得公平运行机会，避免零记账 yield
+                // 在高并发小 I/O 下让完成路径长期拿不到 CPU。
+                sched::schedule_once(sched::now_ns_public());
             } else {
                 core::hint::spin_loop();
             }
@@ -718,12 +789,35 @@ impl BlockDevice {
                 BioReqError::EmptyRange,
             )));
         }
-        if let Some(max) = self.limits.max_blocks_per_io() {
-            if range.blocks > max.get() {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(
-                    BioReqError::TooLarge,
-                )));
+        match op {
+            BioOp::Discard | BioOp::WriteZeroes => {
+                if let Some(limits) = self.limits.range_limits_for(op) {
+                    if let Some(max) = limits.max_blocks_per_io() {
+                        if range.blocks > max.get() {
+                            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                                BioReqError::TooLarge,
+                            )));
+                        }
+                    }
+                    if let Some(alignment) = limits.alignment_blocks() {
+                        if !range.lba.is_multiple_of(u64::from(alignment.get())) {
+                            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                                BioReqError::Misaligned,
+                            )));
+                        }
+                    }
+                }
             }
+            BioOp::Read | BioOp::Write => {
+                if let Some(max) = self.limits.max_blocks_per_io() {
+                    if range.blocks > max.get() {
+                        return Err(BioError::Submit(SubmitError::InvalidRequest(
+                            BioReqError::TooLarge,
+                        )));
+                    }
+                }
+            }
+            BioOp::Flush => {}
         }
         if let Some(count) = self.geometry.block_count() {
             let end = range

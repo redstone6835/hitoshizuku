@@ -106,7 +106,8 @@ pub type SyscallFn = fn(&mut SyscallContext<'_>) -> Result<usize, Errno>;
 /// 表大小：覆盖 Linux asm-generic 全部 syscall 号（最大约 450）。
 pub const SYSCALL_TABLE_LEN: usize = 512;
 
-static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] = [const { AtomicUsize::new(0) }; SYSCALL_TABLE_LEN];
+static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] =
+    [const { AtomicUsize::new(0) }; SYSCALL_TABLE_LEN];
 
 /// 在启动期注册一个 syscall 号 → fn 的映射。重复注册会 panic（防止表条目被
 /// 静默覆盖）。
@@ -117,12 +118,8 @@ pub fn register_syscall(nr: usize, f: SyscallFn) {
         nr,
         SYSCALL_TABLE_LEN - 1
     );
-    let old = SYSCALL_TABLE[nr].compare_exchange(
-        0,
-        f as usize,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    let old =
+        SYSCALL_TABLE[nr].compare_exchange(0, f as usize, Ordering::AcqRel, Ordering::Acquire);
     assert!(old.is_ok(), "[syscall] nr {} already registered", nr);
 }
 

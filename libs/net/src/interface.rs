@@ -617,6 +617,16 @@ impl ManagedInterface {
         exclude: ProtocolSocketHandle,
         target: IpListenEndpoint,
     ) -> bool {
+        self.udp_endpoint_conflicts(exclude, target, false)
+    }
+
+    /// 检查 UDP 监听端点是否冲突，并按 SO_REUSEADDR/SO_REUSEPORT 语义放行。
+    pub fn udp_endpoint_conflicts(
+        &self,
+        exclude: ProtocolSocketHandle,
+        target: IpListenEndpoint,
+        allow_reuse: bool,
+    ) -> bool {
         let exclude = exclude.into_smoltcp();
         for (handle, socket) in self.sockets.iter() {
             if handle == exclude {
@@ -633,10 +643,19 @@ impl ManagedInterface {
             };
             let endpoint = udp.endpoint();
             if endpoint.port != 0 && listen_endpoint_matches(endpoint, target) {
-                return true;
+                if !allow_reuse || !meta.reuse_bind() {
+                    return true;
+                }
             }
         }
         false
+    }
+
+    /// 记录当前 UDP socket 是否以复用模式完成 bind。
+    pub fn set_udp_reuse_bind(&mut self, handle: ProtocolSocketHandle, enabled: bool) {
+        if let Some(meta) = self.meta.get(&handle.into_smoltcp()) {
+            meta.set_reuse_bind(enabled);
+        }
     }
 
     /// 设置 UDP socket 的远端 peer。

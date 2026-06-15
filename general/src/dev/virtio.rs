@@ -454,6 +454,32 @@ impl VirtqDesc {
     }
 }
 
+/// 一次描述符表更新。
+///
+/// 调用方先按协议准备好描述符链，再把若干更新一次性交给队列。队列会先校验所有
+/// descriptor 仍处于 InUse 状态，最后只做一次描述符表同步，避免非 coherent DMA
+/// 平台在提交热路径中对每段 descriptor 反复同步。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtqDescUpdate {
+    pub index: u16,
+    pub addr: u64,
+    pub len: u32,
+    pub flags: u16,
+    pub next: Option<u16>,
+}
+
+impl VirtqDescUpdate {
+    pub const fn new(index: u16, addr: u64, len: u32, flags: u16, next: Option<u16>) -> Self {
+        Self {
+            index,
+            addr,
+            len,
+            flags,
+            next,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VirtqAvailHeader {
@@ -781,19 +807,45 @@ impl SplitVirtQueue {
         flags: u16,
         next: Option<u16>,
     ) -> Result<(), VirtQueueError> {
-        self.check_descriptor_in_use(index)?;
+        let update = VirtqDescUpdate::new(index, addr, len, flags, next);
+        self.write_descs(core::slice::from_ref(&update))
+    }
 
-        let mut desc_flags = flags & !VIRTQ_DESC_F_NEXT;
-        let next_idx = match next {
-            Some(next_idx) => {
-                self.check_descriptor_in_use(next_idx)?;
-                desc_flags |= VIRTQ_DESC_F_NEXT;
-                next_idx
+    /// 批量写入一组 split virtqueue descriptor。
+    ///
+    /// 这是块设备等热路径的推荐入口：先完整校验，再连续写入，最后只同步一次
+    /// descriptor table。单个 descriptor 写入仍通过 [`Self::write_desc`] 复用这里。
+    pub fn write_descs(&mut self, updates: &[VirtqDescUpdate]) -> Result<(), VirtQueueError> {
+        if updates.is_empty() {
+            return Err(VirtQueueError::DescriptorCountZero);
+        }
+        for (pos, update) in updates.iter().enumerate() {
+            self.check_descriptor_in_use(update.index)?;
+            for prev in &updates[..pos] {
+                if prev.index == update.index {
+                    return Err(VirtQueueError::DuplicateDescriptor);
+                }
             }
-            None => 0,
-        };
+            if let Some(next_idx) = update.next {
+                self.check_descriptor_in_use(next_idx)?;
+            }
+        }
 
-        self.write_desc_raw(index, VirtqDesc::new(addr, len, desc_flags, next_idx))?;
+        for update in updates.iter().copied() {
+            let mut desc_flags = update.flags & !VIRTQ_DESC_F_NEXT;
+            let next_idx = match update.next {
+                Some(next_idx) => {
+                    desc_flags |= VIRTQ_DESC_F_NEXT;
+                    next_idx
+                }
+                None => 0,
+            };
+            self.write_desc_raw(
+                update.index,
+                VirtqDesc::new(update.addr, update.len, desc_flags, next_idx),
+            )?;
+        }
+
         self.desc.sync_for_device();
         Ok(())
     }
@@ -814,7 +866,8 @@ impl SplitVirtQueue {
         unsafe {
             write_volatile(ring_ptr, head);
         }
-        self.desc.sync_for_device();
+        // descriptor table 在 write_descs/write_desc 时已经同步给设备。发布阶段只需
+        // 同步 avail ring，并用 release fence 保证设备看到 head 前已能看到描述符内容。
         self.avail.sync_for_device();
         fence(Ordering::Release);
         self.set_avail_idx(avail_idx.wrapping_add(1));

@@ -616,6 +616,20 @@ pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
 }
 
 fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
+    if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+    {
+        // 只有拥有执行体的活任务才能进入 rq。退出清理和 wait/reap 会释放
+        // arch context；若这些任务被等待队列或信号路径误唤醒，必须在统一
+        // 入队口截断，避免后续切换到已经回收的上下文。
+        task.sched.set_on_rq(false);
+        log::warning!(
+            "[sched] reject enqueue without runnable context pid={:?} state={:?} has_ctx={}",
+            task.pid_root(),
+            task.state(),
+            task.arch_context().is_some(),
+        );
+        return task.current_cpu().min(NR_CPUS - 1);
+    }
     if task.sched.on_rq() {
         return task.current_cpu().min(NR_CPUS - 1);
     }

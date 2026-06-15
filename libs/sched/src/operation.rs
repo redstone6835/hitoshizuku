@@ -194,6 +194,8 @@ pub fn setsid() -> Result<PidT, Errno> {
     let new_session = Session::new();
     let new_pg = ProcessGroup::new(&new_session);
     new_session.register_group(&new_pg);
+    new_pg.set_pgid(my_pid);
+    new_session.set_sid(my_pid);
     new_session.set_leader(&me);
 
     // 迁移当前线程。

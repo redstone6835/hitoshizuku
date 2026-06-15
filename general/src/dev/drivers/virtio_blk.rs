@@ -3,36 +3,32 @@
 //! 实现 VirtIO 1.0 规范中的 MMIO 传输层块设备，支持：
 //! - MMIO 传输层
 //! - 异步 I/O 完成回调
-//! - 读、写、flush 操作
-//! - 多队列支持（当前实现单队列）
+//! - 读、写、flush、discard、write-zeroes 请求规划
+//! - typed I/O queue 身份，后续多队列策略可以在不改提交协议的情况下接入
 //!
 //! PnP 适配层只负责匹配固件枚举的 `virtio,mmio` / `LNRO0005` 设备，并把成功
 //! 初始化的块设备封装成通用 function 注册给设备 core。
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::mem;
 use core::num::NonZeroU32;
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
 use super::virtio_block_common::{
-    CONFIG_BLK_SIZE_OFFSET, CONFIG_CAPACITY_OFFSET, CONFIG_DISCARD_SECTOR_ALIGNMENT_OFFSET,
-    CONFIG_MAX_DISCARD_SECTORS_OFFSET, CONFIG_MAX_DISCARD_SEG_OFFSET,
-    CONFIG_MAX_WRITE_ZEROES_SECTORS_OFFSET, CONFIG_MAX_WRITE_ZEROES_SEG_OFFSET,
-    CONFIG_WRITE_ZEROES_MAY_UNMAP_OFFSET, DmaBufferPool, DmaBufferPoolProfile,
-    FEATURE_BLK_SIZE as VIRTIO_BLK_F_BLK_SIZE, FEATURE_DISCARD as VIRTIO_BLK_F_DISCARD,
-    FEATURE_FLUSH as VIRTIO_BLK_F_FLUSH, FEATURE_RO as VIRTIO_BLK_F_RO,
-    FEATURE_WRITE_ZEROES as VIRTIO_BLK_F_WRITE_ZEROES, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE,
-    VirtioBlkCapabilities, VirtioBlkDataPayload, VirtioBlkNegotiatedFeatures,
-    VirtioBlkRangeOpLimits, VirtioBlkReqMeta, VirtioBlkRequestPlan, block_limits,
-    req_status_offset, status_to_result, write_request_descriptors,
+    DmaBufferPool, DmaBufferPoolProfile, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE,
+    VirtioBlkAllocatedRequest, VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkDmaQueue,
+    VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
+    free_allocated_request, negotiate_supported_features, read_device_config, status_to_result,
+    validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
+    write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
-use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
+use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
@@ -43,14 +39,41 @@ use crate::dev::pnp::{
     BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
     PnpResourceKind, register_driver_factory,
 };
-use crate::dev::virtio::{SplitVirtQueue, choose_split_queue_size};
-use crate::dev::virtio_mmio::{
-    self, VIRTIO_F_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
-    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK,
-    VirtioMmioTransport,
+use crate::dev::virtio::{
+    SplitVirtQueue, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK,
+    VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK, choose_split_queue_size,
 };
 
-// VirtIO Block 设备配置空间偏移（相对于 0x100）
+// ───────── VirtIO MMIO 寄存器布局 ─────────
+
+const VIRTIO_MMIO_MAGIC_VALUE: u32 = 0x74726976; // "virt"
+const VIRTIO_MMIO_VERSION: u32 = 0x2; // VirtIO 1.0
+const VIRTIO_MMIO_DEVICE_ID_BLOCK: u32 = 2;
+
+// MMIO 寄存器偏移
+const MMIO_MAGIC: usize = 0x000;
+const MMIO_VERSION: usize = 0x004;
+const MMIO_DEVICE_ID: usize = 0x008;
+const MMIO_DEVICE_FEATURES: usize = 0x010;
+const MMIO_DEVICE_FEATURES_SEL: usize = 0x014;
+const MMIO_DRIVER_FEATURES: usize = 0x020;
+const MMIO_DRIVER_FEATURES_SEL: usize = 0x024;
+const MMIO_QUEUE_SEL: usize = 0x030;
+const MMIO_QUEUE_NUM_MAX: usize = 0x034;
+const MMIO_QUEUE_NUM: usize = 0x038;
+const MMIO_QUEUE_READY: usize = 0x044;
+const MMIO_QUEUE_NOTIFY: usize = 0x050;
+const MMIO_INTERRUPT_STATUS: usize = 0x060;
+const MMIO_INTERRUPT_ACK: usize = 0x064;
+const MMIO_STATUS: usize = 0x070;
+const MMIO_QUEUE_DESC_LOW: usize = 0x080;
+const MMIO_QUEUE_DESC_HIGH: usize = 0x084;
+const MMIO_QUEUE_AVAIL_LOW: usize = 0x090;
+const MMIO_QUEUE_AVAIL_HIGH: usize = 0x094;
+const MMIO_QUEUE_USED_LOW: usize = 0x0a0;
+const MMIO_QUEUE_USED_HIGH: usize = 0x0a4;
+
+// MMIO 传输层中设备类型 config 的起始偏移；字段语义由 virtio-blk 公共层解析。
 const BLK_CFG_BASE: usize = 0x100;
 
 // ───────── VirtIO 数据结构 ─────────
@@ -59,6 +82,8 @@ struct PendingVirtioRequest {
     bio: Bio,
     meta_dma: DmaBuffer,
     data_dma: Option<DmaBuffer>,
+    /// 设备完成时至少应写回的字节数，用于发现 used ring 短写。
+    expected_device_write_len: u32,
 }
 
 // ───────── 驱动内部状态 ─────────
@@ -159,14 +184,39 @@ impl VirtioBlkQueue {
     }
 }
 
+impl VirtioBlkDmaQueue for VirtioBlkQueue {
+    fn split_queue(&mut self) -> &mut SplitVirtQueue {
+        &mut self.queue
+    }
+
+    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
+        Self::take_meta_dma(self)
+    }
+
+    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
+        Self::recycle_meta_dma(self, meta_dma);
+    }
+
+    fn take_data_dma(&mut self, len: usize, direction: DmaDirection) -> Option<DmaBuffer> {
+        Self::take_data_dma(self, len, direction)
+    }
+
+    fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {
+        Self::recycle_data_dma(self, data_dma);
+    }
+}
+
 struct VirtioBlkInner {
-    transport: Box<dyn VirtioMmioTransport>,
+    /// MMIO 基地址
+    base: usize,
     /// 设备容量（扇区数）
     capacity: u64,
     /// 逻辑块大小
     block_size: u32,
     /// 已完成协商的块设备能力。
     capabilities: VirtioBlkCapabilities,
+    /// 当前用于通用块 I/O 的 virtqueue 编号。
+    queue_id: VirtioBlkQueueId,
     /// 队列
     queue: Mutex<VirtioBlkQueue>,
     /// 中断计数（用于轮询模式）
@@ -179,28 +229,99 @@ pub struct VirtioBlk {
 
 impl Drop for VirtioBlk {
     fn drop(&mut self) {
-        self.inner.transport.write_status(0);
+        self.inner.write_reg(MMIO_STATUS, 0);
+    }
+}
+
+struct VirtioMmioRegs {
+    base: usize,
+}
+
+// ───────── MMIO 寄存器访问辅助函数 ─────────
+
+impl VirtioMmioRegs {
+    #[inline]
+    fn read_reg(&self, offset: usize) -> u32 {
+        unsafe { read_volatile((self.base + offset) as *const u32) }
+    }
+
+    #[inline]
+    fn write_reg(&self, offset: usize, value: u32) {
+        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
+    }
+
+    #[inline]
+    fn read_reg64(&self, offset: usize) -> u64 {
+        let low = self.read_reg(offset) as u64;
+        let high = self.read_reg(offset + 4) as u64;
+        (high << 32) | low
+    }
+
+    #[inline]
+    fn read_config_u8(&self, offset: usize) -> u8 {
+        unsafe { read_volatile((self.base + BLK_CFG_BASE + offset) as *const u8) }
+    }
+
+    #[inline]
+    fn read_config_u32(&self, offset: usize) -> u32 {
+        self.read_reg(BLK_CFG_BASE + offset)
+    }
+
+    #[inline]
+    fn read_config_u64(&self, offset: usize) -> u64 {
+        self.read_reg64(BLK_CFG_BASE + offset)
+    }
+
+    fn read_device_features(&self) -> u64 {
+        self.write_reg(MMIO_DEVICE_FEATURES_SEL, 0);
+        let low = self.read_reg(MMIO_DEVICE_FEATURES) as u64;
+        self.write_reg(MMIO_DEVICE_FEATURES_SEL, 1);
+        let high = self.read_reg(MMIO_DEVICE_FEATURES) as u64;
+        (high << 32) | low
+    }
+
+    fn write_driver_features(&self, features: u64) {
+        self.write_reg(MMIO_DRIVER_FEATURES_SEL, 0);
+        self.write_reg(MMIO_DRIVER_FEATURES, features as u32);
+        self.write_reg(MMIO_DRIVER_FEATURES_SEL, 1);
+        self.write_reg(MMIO_DRIVER_FEATURES, (features >> 32) as u32);
+    }
+
+    fn set_status(&self, status: u8) {
+        let current = self.read_reg(MMIO_STATUS);
+        self.write_reg(MMIO_STATUS, current | u32::from(status));
+    }
+}
+
+impl VirtioBlkConfigReader for VirtioMmioRegs {
+    fn read_u8(&self, offset: usize) -> Option<u8> {
+        Some(self.read_config_u8(offset))
+    }
+
+    fn read_u32(&self, offset: usize) -> Option<u32> {
+        Some(self.read_config_u32(offset))
+    }
+
+    fn read_u64(&self, offset: usize) -> Option<u64> {
+        Some(self.read_config_u64(offset))
+    }
+}
+
+impl VirtioBlkInner {
+    #[inline]
+    fn read_reg(&self, offset: usize) -> u32 {
+        unsafe { read_volatile((self.base + offset) as *const u32) }
+    }
+
+    #[inline]
+    fn write_reg(&self, offset: usize, value: u32) {
+        unsafe { write_volatile((self.base + offset) as *mut u32, value) }
     }
 }
 
 // ───────── 驱动初始化 ─────────
 
 impl VirtioBlk {
-    #[inline]
-    fn read_config_u8(transport: &dyn VirtioMmioTransport, offset: usize) -> u8 {
-        unsafe { core::ptr::read_volatile((transport.base() + BLK_CFG_BASE + offset) as *const u8) }
-    }
-
-    #[inline]
-    fn read_config_u32(transport: &dyn VirtioMmioTransport, offset: usize) -> u32 {
-        unsafe { transport.read_reg(BLK_CFG_BASE + offset) }
-    }
-
-    #[inline]
-    fn read_config_u64(transport: &dyn VirtioMmioTransport, offset: usize) -> u64 {
-        unsafe { transport.read_reg64(BLK_CFG_BASE + offset) }
-    }
-
     /// 创建并初始化 VirtIO Block 设备驱动
     ///
     /// # 参数
@@ -208,141 +329,101 @@ impl VirtioBlk {
     ///
     /// # 返回
     /// 成功时返回驱动实例，失败时返回错误信息
-    pub fn new(
-        transport: Box<dyn VirtioMmioTransport>,
-        dma_context: DmaContext,
-    ) -> Result<Self, &'static str> {
-        let is_legacy = transport.is_legacy();
+    pub fn new(mmio_base: usize, dma_context: DmaContext) -> Result<Self, &'static str> {
+        let regs = VirtioMmioRegs { base: mmio_base };
 
-        // 1. 验证 Device ID
-        let device_id = unsafe { transport.read_reg(0x008) };
-        if device_id != 2 {
+        // 1. 验证 Magic 和 Version
+        if regs.read_reg(MMIO_MAGIC) != VIRTIO_MMIO_MAGIC_VALUE {
+            return Err("Invalid VirtIO magic value");
+        }
+        if regs.read_reg(MMIO_VERSION) != VIRTIO_MMIO_VERSION {
+            return Err("Unsupported VirtIO version");
+        }
+        if regs.read_reg(MMIO_DEVICE_ID) != VIRTIO_MMIO_DEVICE_ID_BLOCK {
             return Err("Not a VirtIO block device");
         }
 
         // 2. 重置设备
-        transport.write_status(0);
+        regs.write_reg(MMIO_STATUS, 0);
 
         // 3. 设置 ACKNOWLEDGE 和 DRIVER 状态位
-        transport.add_status(VIRTIO_STATUS_ACKNOWLEDGE);
-        transport.add_status(VIRTIO_STATUS_DRIVER);
+        regs.set_status(VIRTIO_STATUS_ACKNOWLEDGE);
+        regs.set_status(VIRTIO_STATUS_DRIVER);
 
         // 4. 协商特性
-        let device_features = transport.read_device_features();
-        let mut driver_features = 0u64;
-
-        if !is_legacy {
-            if device_features & VIRTIO_F_VERSION_1 == 0 {
-                transport.write_status(VIRTIO_STATUS_FAILED);
-                return Err("VirtIO 1.0 VERSION_1 feature is missing");
+        let device_features = regs.read_device_features();
+        let driver_features = match negotiate_supported_features(device_features) {
+            Ok(features) => features,
+            Err(msg) => {
+                regs.write_reg(MMIO_STATUS, u32::from(VIRTIO_STATUS_FAILED));
+                return Err(msg);
             }
-            driver_features |= VIRTIO_F_VERSION_1;
-        }
+        };
 
-        if device_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
-            driver_features |= VIRTIO_BLK_F_BLK_SIZE;
-        }
-        if device_features & VIRTIO_BLK_F_FLUSH != 0 {
-            driver_features |= VIRTIO_BLK_F_FLUSH;
-        }
-        if device_features & VIRTIO_BLK_F_RO != 0 {
-            driver_features |= VIRTIO_BLK_F_RO;
-        }
-        if device_features & VIRTIO_BLK_F_DISCARD != 0 {
-            driver_features |= VIRTIO_BLK_F_DISCARD;
-        }
-        if device_features & VIRTIO_BLK_F_WRITE_ZEROES != 0 {
-            driver_features |= VIRTIO_BLK_F_WRITE_ZEROES;
-        }
+        regs.write_driver_features(driver_features);
+        regs.set_status(VIRTIO_STATUS_FEATURES_OK);
 
-        transport.write_driver_features(driver_features);
-        transport.add_status(VIRTIO_STATUS_FEATURES_OK);
-
-        let status = transport.read_status();
-        if status & VIRTIO_STATUS_FEATURES_OK == 0 {
-            transport.write_status(VIRTIO_STATUS_FAILED);
+        // 验证特性协商是否成功
+        if regs.read_reg(MMIO_STATUS) & u32::from(VIRTIO_STATUS_FEATURES_OK) == 0 {
+            regs.write_reg(MMIO_STATUS, u32::from(VIRTIO_STATUS_FAILED));
             return Err("Feature negotiation failed");
         }
 
-        // 5. 读取设备配置
-        let capacity = Self::read_config_u64(transport.as_ref(), CONFIG_CAPACITY_OFFSET);
-        let block_size = if driver_features & VIRTIO_BLK_F_BLK_SIZE != 0 {
-            Self::read_config_u32(transport.as_ref(), CONFIG_BLK_SIZE_OFFSET)
-        } else {
-            VIRTIO_BLK_SECTOR_SIZE
+        // 5. 读取并解释设备类型 config。字段语义由 virtio-blk 公共层统一维护。
+        let config = match read_device_config(&regs, driver_features) {
+            Ok(config) => config,
+            Err(err) => {
+                regs.write_reg(MMIO_STATUS, u32::from(VIRTIO_STATUS_FAILED));
+                return Err(err.message());
+            }
         };
-        if block_size < VIRTIO_BLK_SECTOR_SIZE
-            || !block_size.is_power_of_two()
-            || !block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)
-        {
-            transport.write_status(VIRTIO_STATUS_FAILED);
-            return Err("Invalid VirtIO block size");
-        }
-        let negotiated_features = VirtioBlkNegotiatedFeatures::new(driver_features);
-        let discard_limits = if driver_features & VIRTIO_BLK_F_DISCARD != 0 {
-            let _alignment =
-                Self::read_config_u32(transport.as_ref(), CONFIG_DISCARD_SECTOR_ALIGNMENT_OFFSET);
-            VirtioBlkRangeOpLimits::new(
-                Self::read_config_u32(transport.as_ref(), CONFIG_MAX_DISCARD_SECTORS_OFFSET),
-                Self::read_config_u32(transport.as_ref(), CONFIG_MAX_DISCARD_SEG_OFFSET),
-            )
-        } else {
-            None
-        };
-        let write_zeroes_limits = if driver_features & VIRTIO_BLK_F_WRITE_ZEROES != 0 {
-            VirtioBlkRangeOpLimits::new(
-                Self::read_config_u32(transport.as_ref(), CONFIG_MAX_WRITE_ZEROES_SECTORS_OFFSET),
-                Self::read_config_u32(transport.as_ref(), CONFIG_MAX_WRITE_ZEROES_SEG_OFFSET),
-            )
-        } else {
-            None
-        };
-        let write_zeroes_may_unmap = driver_features & VIRTIO_BLK_F_WRITE_ZEROES != 0
-            && Self::read_config_u8(transport.as_ref(), CONFIG_WRITE_ZEROES_MAY_UNMAP_OFFSET) != 0;
-        let capabilities = VirtioBlkCapabilities::new(
-            negotiated_features,
-            discard_limits,
-            write_zeroes_limits,
-            write_zeroes_may_unmap,
-        );
+        let capacity = config.capacity_sectors;
+        let block_size = config.logical_block_size;
+        let capabilities = config.capabilities;
 
         // 6. 设置队列
-        transport.select_queue(0);
-        let max_queue_size = transport.read_queue_max_size() as u16;
+        let queue_id = VirtioBlkQueueId::DEFAULT_IO;
+        regs.write_reg(MMIO_QUEUE_SEL, u32::from(queue_id.raw()));
+        let max_queue_size = regs.read_reg(MMIO_QUEUE_NUM_MAX) as u16;
         if max_queue_size == 0 {
-            transport.write_status(VIRTIO_STATUS_FAILED);
+            regs.write_reg(MMIO_STATUS, u32::from(VIRTIO_STATUS_FAILED));
             return Err("Queue size is zero");
         }
         let queue_size = choose_split_queue_size(max_queue_size, None)
             .map_err(|_| "Invalid VirtIO queue size")?;
         if queue_size < VIRTIO_BLK_MIN_QUEUE_SIZE {
-            transport.write_status(VIRTIO_STATUS_FAILED);
+            regs.write_reg(MMIO_STATUS, u32::from(VIRTIO_STATUS_FAILED));
             return Err("VirtIO queue size is too small");
         }
-        let split_queue = if is_legacy {
-            SplitVirtQueue::new_legacy(queue_size)
-                .map_err(|_| "Failed to allocate VirtIO queue")?
-        } else {
-            SplitVirtQueue::new_in(dma_context, queue_size)
-                .map_err(|_| "Failed to allocate VirtIO queue")?
-        };
+        let split_queue = SplitVirtQueue::new_in(dma_context, queue_size)
+            .map_err(|_| "Failed to allocate VirtIO queue")?;
 
-        transport.write_queue_size(queue_size as u32);
-        transport.configure_queue_addresses(
-            split_queue.desc_dma_addr() as u64,
-            split_queue.avail_dma_addr() as u64,
-            split_queue.used_dma_addr() as u64,
-        );
-        transport.enable_queue();
+        // 队列 DMA 布局由公共 SplitVirtQueue 维护，MMIO 传输层只负责把设备
+        // 可见 DMA 地址写入寄存器，不直接假设 DMA 地址等于物理地址。
+        regs.write_reg(MMIO_QUEUE_NUM, queue_size as u32);
+        let desc_dma = split_queue.desc_dma_addr();
+        regs.write_reg(MMIO_QUEUE_DESC_LOW, desc_dma as u32);
+        regs.write_reg(MMIO_QUEUE_DESC_HIGH, (desc_dma >> 32) as u32);
+
+        let avail_dma = split_queue.avail_dma_addr();
+        regs.write_reg(MMIO_QUEUE_AVAIL_LOW, avail_dma as u32);
+        regs.write_reg(MMIO_QUEUE_AVAIL_HIGH, (avail_dma >> 32) as u32);
+
+        let used_dma = split_queue.used_dma_addr();
+        regs.write_reg(MMIO_QUEUE_USED_LOW, used_dma as u32);
+        regs.write_reg(MMIO_QUEUE_USED_HIGH, (used_dma >> 32) as u32);
+
+        regs.write_reg(MMIO_QUEUE_READY, 1);
 
         // 7. 设置 DRIVER_OK
-        transport.add_status(VIRTIO_STATUS_DRIVER_OK);
+        regs.set_status(VIRTIO_STATUS_DRIVER_OK);
 
         let inner = Arc::new(VirtioBlkInner {
-            transport,
+            base: mmio_base,
             capacity,
             block_size,
             capabilities,
+            queue_id,
             queue: Mutex::new(VirtioBlkQueue::new(split_queue)),
             irq_count: AtomicUsize::new(0),
         });
@@ -362,8 +443,9 @@ impl VirtioBlk {
         reason: &'static str,
     ) -> Vec<Option<PendingVirtioRequest>> {
         log::printk!("[virtio-mmio-blk] queue failed: {}", reason);
-        let status = self.inner.transport.read_status();
-        self.inner.transport.write_status(status | VIRTIO_STATUS_FAILED);
+        let status = self.inner.read_reg(MMIO_STATUS);
+        self.inner
+            .write_reg(MMIO_STATUS, status | u32::from(VIRTIO_STATUS_FAILED));
         queue.mark_failed_and_take_pending()
     }
 
@@ -389,19 +471,20 @@ impl VirtioBlk {
                     "[virtio-mmio-blk] used head {} has no pending request",
                     desc_head
                 );
-                if queue.queue.free_chain_from_head(desc_head).is_err() {
-                    let failed =
-                        self.fail_queue_locked(&mut queue, "unknown used head cannot be freed");
-                    drop(queue);
-                    Self::complete_failed_requests(failed, BioIoError::Unavailable);
-                    return;
-                }
-                continue;
+                // used ring 返回了当前队列内的 descriptor head，但驱动没有对应的
+                // BIO 记录。继续运行可能释放到其它请求的描述符链，因此直接把队列
+                // 标记为失败，让上层重新发现设备状态，而不是尝试局部恢复。
+                let failed =
+                    self.fail_queue_locked(&mut queue, "used head without pending request");
+                drop(queue);
+                Self::complete_failed_requests(failed, BioIoError::Unavailable);
+                return;
             };
             let PendingVirtioRequest {
                 mut bio,
                 meta_dma,
                 mut data_dma,
+                expected_device_write_len,
             } = pending;
             core::sync::atomic::fence(Ordering::Acquire);
             meta_dma.sync_for_cpu();
@@ -409,7 +492,10 @@ impl VirtioBlk {
                 let meta = &*(meta_dma.vaddr() as *const VirtioBlkReqMeta);
                 meta.status
             };
-            let result = status_to_result(status);
+            let mut result = status_to_result(status);
+            if result.is_ok() {
+                result = validate_used_write_len(expected_device_write_len, used.len);
+            }
             queue.recycle_meta_dma(meta_dma);
 
             if queue.queue.free_chain_from_head(desc_head).is_err() {
@@ -430,9 +516,14 @@ impl VirtioBlk {
             drop(queue);
             if copy_read_data {
                 if let (BioBuffer::Owned(buf), Some(dma)) = (&mut bio.buffer, data_dma.as_ref()) {
-                    dma.sync_for_cpu();
-                    let take = buf.len().min(dma.as_slice().len());
-                    buf[..take].copy_from_slice(&dma.as_slice()[..take]);
+                    if dma.as_slice().len() < buf.len() {
+                        result = Err(BioIoError::Unavailable);
+                    } else {
+                        dma.sync_for_cpu();
+                        buf.copy_from_slice(&dma.as_slice()[..buf.len()]);
+                    }
+                } else {
+                    result = Err(BioIoError::Unavailable);
                 }
                 if let Some(dma) = data_dma.take() {
                     queue = self.inner.queue.lock();
@@ -451,8 +542,8 @@ impl VirtioBlk {
     /// 处理中断（由中断处理程序调用）
     pub fn handle_interrupt(&self) {
         // 确认中断
-        let status = self.inner.transport.read_interrupt_status();
-        self.inner.transport.acknowledge_interrupt(status);
+        let status = self.inner.read_reg(MMIO_INTERRUPT_STATUS);
+        self.inner.write_reg(MMIO_INTERRUPT_ACK, status);
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
 
         // 轮询完成的请求
@@ -477,11 +568,15 @@ impl VirtioBlk {
             .ok_or("Invalid geometry")?;
 
         let queue_guard = self.inner.queue.lock();
-        let limits = block_limits(block_size, queue_guard.queue.dma_context())?;
+        let limits = block_limits(
+            block_size,
+            queue_guard.queue.dma_context(),
+            self.inner.capabilities,
+        )?;
         let queue_depth = u32::from(queue_guard.queue.queue_size());
         drop(queue_guard);
         let attributes = BlockAttributes::new(false, false, NonZeroU32::new(queue_depth), None);
-        let features = self.inner.capabilities.block_features();
+        let features = self.inner.capabilities.block_features(block_size);
 
         let io = Arc::new(VirtioBlkIo {
             driver: Arc::new(self),
@@ -526,136 +621,67 @@ impl BlockDriver for VirtioBlkIo {
             bio.op,
             bio.range.lba,
             bio.range.blocks,
+            bio.fua,
             self.driver.inner.block_size,
             self.driver.inner.capabilities,
         ) {
             Ok(plan) => plan,
             Err(err) => return Err((err, bio)),
         };
-        let plan_data_len = plan.data_len;
-        if plan.expects_bio_buffer() && bio.buffer.len() != plan_data_len {
-            return Err((
-                SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
-                bio,
-            ));
+        if let Err(err) = validate_bio_buffer_for_plan(plan, &bio) {
+            return Err((err, bio));
         }
-        if queue.queue.free_descriptor_count() < plan.descriptor_count {
-            return Err((SubmitError::QueueFull, bio));
-        }
-        let data_len_u32 = match u32::try_from(plan_data_len) {
-            Ok(len) => len,
-            Err(_) => return Err((SubmitError::InvalidRequest(BioReqError::TooLarge), bio)),
+        let mut request = match allocate_request(&mut *queue, plan) {
+            Ok(request) => request,
+            Err(err) => return Err((err, bio)),
         };
 
-        let chain = match queue.queue.alloc_chain(plan.descriptor_count) {
-            Ok(chain) => chain,
-            Err(_) => return Err((SubmitError::QueueFull, bio)),
-        };
-        let dma_context = queue.queue.dma_context();
-
-        // 元数据 DMA 缓冲区（请求头 + 状态字节）按队列复用，避免热路径反复分配。
-        let meta_dma = match queue.take_meta_dma() {
-            Some(buffer) => buffer,
-            None => match DmaBuffer::new_in(
-                dma_context,
-                mem::size_of::<VirtioBlkReqMeta>(),
-                mem::align_of::<VirtioBlkReqMeta>(),
-                DmaDirection::Bidirectional,
-            ) {
-                Ok(buffer) => buffer,
-                Err(_) => {
-                    let _ = queue.queue.free_chain(chain);
-                    return Err((SubmitError::OutOfMemory, bio));
-                }
-            },
-        };
-        let meta = plan.meta();
-        unsafe {
-            core::ptr::write(meta_dma.vaddr() as *mut VirtioBlkReqMeta, meta);
-        }
-        meta_dma.sync_for_device();
-
-        // 数据 DMA 缓冲区（仅 Read/Write 需要）
-        let mut data_dma = if plan.has_data_descriptor() {
-            match plan.data_direction {
-                Some(direction) => {
-                    let dma = match queue.take_data_dma(plan_data_len, direction) {
-                        Some(buffer) => buffer,
-                        None => match DmaBuffer::new_in(dma_context, plan_data_len, 1, direction) {
-                            Ok(buffer) => buffer,
-                            Err(_) => {
-                                let _ = queue.queue.free_chain(chain);
-                                queue.recycle_meta_dma(meta_dma);
-                                return Err((SubmitError::OutOfMemory, bio));
-                            }
-                        },
-                    };
-                    Some(dma)
-                }
-                None => {
-                    let _ = queue.queue.free_chain(chain);
-                    queue.recycle_meta_dma(meta_dma);
-                    return Err((
-                        SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch),
-                        bio,
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
-        if let Some(dma) = data_dma.as_mut() {
-            // 大块顺序写会在这里拷贝 1MiB 级数据；放到队列锁外，避免阻塞完成路径。
+        if request.data_dma.is_some() {
+            // 大块顺序写和 range payload 初始化放到队列锁外，避免阻塞完成路径。
             drop(queue);
-            match plan.data_payload {
-                VirtioBlkDataPayload::BioBuffer if bio.op == BioOp::Write => {
-                    dma.as_mut_slice()[..plan_data_len].copy_from_slice(bio.buffer.as_slice());
-                }
-                VirtioBlkDataPayload::RangeSegment(segment) => unsafe {
-                    core::ptr::write(dma.vaddr() as *mut _, segment);
-                },
-                _ => {}
+            if let Err(err) = write_data_payload(plan, &bio, &mut request.data_dma) {
+                queue = self.driver.inner.queue.lock();
+                free_allocated_request(&mut *queue, request);
+                return Err((err, bio));
             }
-            dma.sync_for_device();
             queue = self.driver.inner.queue.lock();
             if queue.failed {
-                let _ = queue.queue.free_chain(chain);
-                queue.recycle_request_dma(meta_dma, data_dma);
+                free_allocated_request(&mut *queue, request);
                 return Err((SubmitError::DeviceGone, bio));
             }
         }
 
-        let header_dma = meta_dma.dma_addr() as u64;
-        let status_dma = meta_dma.dma_addr() as u64 + req_status_offset();
-        let head_idx = chain.head();
-
         // 描述符链形状由 virtio-blk 公共层统一维护，MMIO 传输层只负责发布 head。
-        let data_dma_addr = data_dma.as_ref().map(|dma| dma.dma_addr() as u64);
-        if let Err(err) = write_request_descriptors(
-            &mut queue.queue,
-            &chain,
-            plan,
-            header_dma,
-            data_dma_addr,
-            data_len_u32,
-            status_dma,
-        ) {
-            let _ = queue.queue.free_chain(chain);
-            queue.recycle_request_dma(meta_dma, data_dma);
+        if let Err(err) = write_allocated_request_descriptors(&mut *queue, &request, plan) {
+            free_allocated_request(&mut *queue, request);
             return Err((err, bio));
         }
+        let expected_device_write_len = match plan.expected_device_write_len() {
+            Ok(len) => len,
+            Err(err) => {
+                free_allocated_request(&mut *queue, request);
+                return Err((err, bio));
+            }
+        };
 
+        let VirtioBlkAllocatedRequest {
+            chain,
+            head: head_idx,
+            meta_dma,
+            data_dma,
+        } = request;
         let pending = PendingVirtioRequest {
             bio,
             meta_dma,
             data_dma,
+            expected_device_write_len,
         };
         if let Err(pending) = queue.set_pending(head_idx, pending) {
             let PendingVirtioRequest {
                 bio,
                 meta_dma,
                 data_dma,
+                ..
             } = pending;
             let _ = queue.queue.free_chain(chain);
             queue.recycle_request_dma(meta_dma, data_dma);
@@ -679,6 +705,7 @@ impl BlockDriver for VirtioBlkIo {
                 bio,
                 meta_dma,
                 data_dma,
+                ..
             } = pending;
             let _ = queue.queue.free_chain(chain);
             queue.recycle_meta_dma(meta_dma);
@@ -690,7 +717,10 @@ impl BlockDriver for VirtioBlkIo {
 
         // 通知设备
         drop(queue);
-        self.driver.inner.transport.notify_queue(0);
+        self.driver.inner.write_reg(
+            MMIO_QUEUE_NOTIFY,
+            u32::from(self.driver.inner.queue_id.raw()),
+        );
         Ok(())
     }
 
@@ -757,11 +787,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
             ));
         };
         let virt_base = (self.device_mmio_to_virt)(phys);
-        let transport = virtio_mmio::detect(virt_base).map_err(|msg| {
-            log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
-            PnpError::HardwareFailure { detail: "virtio-mmio block init failed" }
-        })?;
-        let driver = VirtioBlk::new(transport, info.dma_context()).map_err(|msg| {
+        let driver = VirtioBlk::new(virt_base, info.dma_context()).map_err(|msg| {
             log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);
             PnpError::hardware_failure("virtio-mmio block init failed")
         })?;

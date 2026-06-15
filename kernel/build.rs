@@ -68,7 +68,9 @@ fn build_busybox(root: &Path, arch: Arch) {
     if !config.exists() {
         run_cmd(
             Command::new("make")
-                .arg("-C").arg(&src).arg(&cross)
+                .arg("-C")
+                .arg(&src)
+                .arg(&cross)
                 .arg("defconfig"),
         );
     }
@@ -78,20 +80,27 @@ fn build_busybox(root: &Path, arch: Arch) {
         "sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' {} && \
          sed -i 's/.*CONFIG_PIE.*/CONFIG_PIE=y/' {} && \
          sed -i 's/^CONFIG_TC=.*/# CONFIG_TC is not set/' {}",
-        config.display(), config.display(), config.display()
+        config.display(),
+        config.display(),
+        config.display()
     )));
 
     // 非交互式 oldconfig
     run_cmd(Command::new("sh").arg("-c").arg(&format!(
         "yes '' | make -C {} {} oldconfig",
-        src.display(), cross
+        src.display(),
+        cross
     )));
 
     // 编译
-    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     run_cmd(
         Command::new("make")
-            .arg("-C").arg(&src).arg(&cross)
+            .arg("-C")
+            .arg(&src)
+            .arg(&cross)
             .arg(format!("-j{jobs}")),
     );
 
@@ -100,7 +109,9 @@ fn build_busybox(root: &Path, arch: Arch) {
     let _ = std::fs::create_dir_all(&dest);
     run_cmd(
         Command::new("make")
-            .arg("-C").arg(&src).arg(&cross)
+            .arg("-C")
+            .arg(&src)
+            .arg(&cross)
             .arg(format!("CONFIG_PREFIX={}", dest.display()))
             .arg("install"),
     );
@@ -125,10 +136,13 @@ fn build_lua(root: &Path, arch: Arch) {
     let src = root.join("third/lua");
     let cc = format!("CC={}gcc", arch.cross_prefix());
 
-    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let jobs = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     run_cmd(
         Command::new("make")
-            .arg("-C").arg(&src)
+            .arg("-C")
+            .arg(&src)
             .arg("all")
             .arg(&cc)
             .arg("MYCFLAGS=-std=c99 -static -fPIE -DLUA_USE_POSIX")
@@ -145,7 +159,11 @@ fn build_lua(root: &Path, arch: Arch) {
         .arg(&dest_bin)
         .status();
 
-    let _ = Command::new("make").arg("-C").arg(&src).arg("clean").status();
+    let _ = Command::new("make")
+        .arg("-C")
+        .arg(&src)
+        .arg("clean")
+        .status();
 }
 
 // ── initramfs ───────────────────────────────────────────────────────────────────
@@ -182,7 +200,9 @@ fn pack_initramfs(root: &Path, arch: Arch) {
 }
 
 fn check_modified(dir: &Path, ref_time: std::time::SystemTime, result: &mut bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if *result {
             return;

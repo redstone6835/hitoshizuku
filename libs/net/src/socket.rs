@@ -73,6 +73,9 @@ pub(crate) struct SocketMeta {
     /// VFS accept 路径。smoltcp 没有独立 accept 队列，必须用这个标记避免
     /// 按监听端点扫描时把同一条已接受连接重复返回。
     pub accepted: AtomicBool,
+    /// bind 时是否允许同端口复用。UDP 的 SO_REUSEADDR/SO_REUSEPORT 需要
+    /// 已绑定和新绑定 socket 都声明复用，才能共享同一个本地端口。
+    pub reuse_bind: AtomicBool,
 }
 
 impl SocketMeta {
@@ -83,6 +86,7 @@ impl SocketMeta {
             removed: AtomicBool::new(false),
             orphaned: AtomicBool::new(false),
             accepted: AtomicBool::new(false),
+            reuse_bind: AtomicBool::new(false),
         }
     }
 
@@ -120,6 +124,14 @@ impl SocketMeta {
 
     pub fn mark_accepted(&self) {
         self.accepted.store(true, Ordering::Release);
+    }
+
+    pub fn reuse_bind(&self) -> bool {
+        self.reuse_bind.load(Ordering::Acquire)
+    }
+
+    pub fn set_reuse_bind(&self, enabled: bool) {
+        self.reuse_bind.store(enabled, Ordering::Release);
     }
 }
 

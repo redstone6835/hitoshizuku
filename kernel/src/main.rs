@@ -6,7 +6,11 @@ extern crate allocator;
 extern crate hal;
 
 mod acpi;
-#[cfg(any(feature = "bench", feature = "block-bench", feature = "allocator-bench"))]
+#[cfg(any(
+    feature = "bench",
+    feature = "block-bench",
+    feature = "allocator-bench"
+))]
 mod bench;
 mod device_init;
 mod dtb;
