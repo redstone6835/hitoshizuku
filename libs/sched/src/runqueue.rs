@@ -187,6 +187,15 @@ impl Runqueue {
 
     pub fn enqueue(&self, task: Arc<Task>, now_ns: u64) {
         let mut inner = self.inner.lock();
+        if !task_can_enter_runqueue(&task) {
+            task.sched.set_on_rq(false);
+            log::warning!(
+                "[sched] reject non-executable task enqueue pid={:?} state={:?}",
+                task.pid_root(),
+                task.state(),
+            );
+            return;
+        }
         if task.sched.on_rq() {
             return;
         }
@@ -253,13 +262,25 @@ impl Runqueue {
 
         let mut fair_prev_addr = None;
         if let Some(prev) = inner.current.take() {
-            if prev.state() == TaskState::Running || prev.state() == TaskState::Runnable {
+            if task_can_enter_runqueue(&prev)
+                && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
+            {
                 prev.set_state(TaskState::Runnable);
                 if prev.sched.policy() == SchedPolicy::Fair {
                     fair_prev_addr = Some(task_addr(&prev));
                 }
                 enqueue_queued_locked(&mut inner, prev, now_ns);
             } else {
+                if prev.arch_context().is_none()
+                    && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
+                {
+                    log::warning!(
+                        "[sched] drop current without arch context pid={:?} state={:?}",
+                        prev.pid_root(),
+                        prev.state(),
+                    );
+                    prev.set_state(TaskState::Dead);
+                }
                 prev.sched.set_on_rq(false);
             }
         }
@@ -452,6 +473,23 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
 
 fn pick_queued_locked(
     inner: &mut RqInner,
+    mut fair_prev_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
+    loop {
+        let task = pick_queued_candidate_locked(inner, fair_prev_addr, cpu_mask)?;
+        if task_can_run_on(&task, cpu_mask) {
+            return Some(task);
+        }
+        discard_non_runnable_pick(&task);
+        if fair_prev_addr.is_some_and(|addr| addr == task_addr(&task)) {
+            fair_prev_addr = None;
+        }
+    }
+}
+
+fn pick_queued_candidate_locked(
+    inner: &mut RqInner,
     fair_prev_addr: Option<usize>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
@@ -534,6 +572,33 @@ fn pick_fair_locked(
 
 fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
     (task.cpu_affinity() & cpu_mask) != 0
+}
+
+fn task_can_enter_runqueue(task: &Arc<Task>) -> bool {
+    task.arch_context().is_some()
+        && !matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+}
+
+fn task_can_run_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
+    task_allowed_on(task, cpu_mask)
+        && task.state() == TaskState::Runnable
+        && task.arch_context().is_some()
+}
+
+fn discard_non_runnable_pick(task: &Arc<Task>) {
+    let state = task.state();
+    task.sched.set_on_rq(false);
+    if task.arch_context().is_none() && !matches!(state, TaskState::Zombie | TaskState::Dead) {
+        // 已释放执行体的任务绝不能重新进入调度。这里把异常残留终结掉，
+        // 避免调度器在同一个坏任务上反复自旋或切到无效上下文。
+        task.set_state(TaskState::Dead);
+    }
+    log::warning!(
+        "[sched] discard non-runnable queued task pid={:?} state={:?} has_ctx={}",
+        task.pid_root(),
+        state,
+        task.arch_context().is_some(),
+    );
 }
 
 fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {

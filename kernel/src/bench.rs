@@ -52,18 +52,18 @@ use vfs::sync::Spinlock;
 
 #[cfg(feature = "bench")]
 use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
-#[cfg(feature = "block-bench")]
-use general::dev::enumerate::DEVICES;
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::block::BlockDevice;
 #[cfg(feature = "bench")]
 use general::dev::block::{
     BlockClass, BlockDeviceInit, BlockDriver, BlockFeatures, BlockGeometry, BlockLimits,
 };
-#[cfg(feature = "block-bench")]
-use general::vfs::device_files::projection::active_block_devices;
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::block_sync::SyncBlockBackend;
+#[cfg(feature = "block-bench")]
+use general::dev::enumerate::DEVICES;
+#[cfg(feature = "block-bench")]
+use general::vfs::device_files::projection::active_block_devices;
 
 // ── 嵌入的磁盘镜像 ──────────────────────────────────────────────────────
 
@@ -2177,7 +2177,10 @@ fn run_fs_seq_read_existing(tag: &str, sb: &Arc<Superblock>, dev: &Arc<BlockDevi
     let root = &sb.root_inode;
     let cred = Credentials::root();
     let Some((name, _inode, file, size)) = find_largest_regular_file(root, &cred) else {
-        log::warning!("[bench][{}][L5-read] no regular file in root directory", tag);
+        log::warning!(
+            "[bench][{}][L5-read] no regular file in root directory",
+            tag
+        );
         return;
     };
     let want = core::cmp::min(size, 4 * 1024 * 1024) as usize;
@@ -2222,7 +2225,10 @@ fn run_fs_rand_read_existing(tag: &str, sb: &Arc<Superblock>, dev: &Arc<BlockDev
     let root = &sb.root_inode;
     let cred = Credentials::root();
     let Some((name, _inode, file, size)) = find_largest_regular_file(root, &cred) else {
-        log::warning!("[bench][{}][L6-rand] no regular file in root directory", tag);
+        log::warning!(
+            "[bench][{}][L6-rand] no regular file in root directory",
+            tag
+        );
         return;
     };
     let block = 4096usize;

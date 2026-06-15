@@ -7,10 +7,12 @@
 use core::mem;
 use core::num::NonZeroU32;
 
-use crate::dev::bio::{BioIoError, BioOp, BioReqError, SubmitError};
+use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
 use crate::dev::block::{BlockFeatures, BlockLimits};
 use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
-use crate::dev::virtio::{DescriptorChain, SplitVirtQueue, VIRTQ_DESC_F_WRITE};
+use crate::dev::virtio::{
+    DescriptorChain, SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
+};
 
 use super::VIRTIO_BLK_SECTOR_SIZE;
 
@@ -18,6 +20,21 @@ use super::VIRTIO_BLK_SECTOR_SIZE;
 pub(super) const MIN_QUEUE_SIZE: u16 = 4;
 /// 设备 status 初始填充值。任何非 OK/UNSUPP 的最终值都按设备错误处理。
 pub(super) const STATUS_PENDING: u8 = 0xff;
+
+/// virtio-blk 队列编号。
+///
+/// 单队列设备使用默认 I/O 队列；后续接入多队列时，传输层只需要替换队列选择
+/// 策略，提交路径仍通过这个类型传递队列身份，避免把裸 `u16` 编号散落在驱动里。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct VirtioBlkQueueId(u16);
+
+impl VirtioBlkQueueId {
+    pub const DEFAULT_IO: Self = Self(0);
+
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
+}
 
 const REQ_TYPE_IN: u32 = 0;
 const REQ_TYPE_OUT: u32 = 1;
@@ -28,22 +45,44 @@ const REQ_TYPE_WRITE_ZEROES: u32 = 13;
 const STATUS_OK: u8 = 0;
 const STATUS_UNSUPP: u8 = 2;
 
+/// write-zeroes range segment 的 UNMAP 标志；只有设备声明允许时才置位。
+const WRITE_ZEROES_FLAG_UNMAP: u32 = 1;
+
 /// virtio-blk 设备能力位。
-pub(super) const FEATURE_RO: u64 = 1 << 5;
-pub(super) const FEATURE_BLK_SIZE: u64 = 1 << 6;
-pub(super) const FEATURE_FLUSH: u64 = 1 << 9;
-pub(super) const FEATURE_DISCARD: u64 = 1 << 13;
-pub(super) const FEATURE_WRITE_ZEROES: u64 = 1 << 14;
+const FEATURE_RO: u64 = 1 << 5;
+const FEATURE_BLK_SIZE: u64 = 1 << 6;
+const FEATURE_FLUSH: u64 = 1 << 9;
+const FEATURE_DISCARD: u64 = 1 << 13;
+const FEATURE_WRITE_ZEROES: u64 = 1 << 14;
+
+/// 本驱动完整支持并愿意协商的 virtio-blk feature 集合。
+///
+/// 传输层只读取设备 feature 并写回协商结果；具体哪些 feature 属于块协议能力，
+/// 统一在这里维护，避免 MMIO/PCI 路径出现不同的能力选择策略。
+const SUPPORTED_FEATURES: u64 = VIRTIO_F_VERSION_1
+    | FEATURE_RO
+    | FEATURE_BLK_SIZE
+    | FEATURE_FLUSH
+    | FEATURE_DISCARD
+    | FEATURE_WRITE_ZEROES;
 
 /// virtio-blk 配置空间字段偏移，均相对于设备类型 config 起始地址。
-pub(super) const CONFIG_CAPACITY_OFFSET: usize = 0x00;
-pub(super) const CONFIG_BLK_SIZE_OFFSET: usize = 0x14;
-pub(super) const CONFIG_MAX_DISCARD_SECTORS_OFFSET: usize = 0x28;
-pub(super) const CONFIG_MAX_DISCARD_SEG_OFFSET: usize = 0x2c;
-pub(super) const CONFIG_DISCARD_SECTOR_ALIGNMENT_OFFSET: usize = 0x30;
-pub(super) const CONFIG_MAX_WRITE_ZEROES_SECTORS_OFFSET: usize = 0x34;
-pub(super) const CONFIG_MAX_WRITE_ZEROES_SEG_OFFSET: usize = 0x38;
-pub(super) const CONFIG_WRITE_ZEROES_MAY_UNMAP_OFFSET: usize = 0x3c;
+const CONFIG_CAPACITY_OFFSET: usize = 0x00;
+const CONFIG_BLK_SIZE_OFFSET: usize = 0x14;
+const CONFIG_MAX_DISCARD_SECTORS_OFFSET: usize = 0x28;
+const CONFIG_MAX_DISCARD_SEG_OFFSET: usize = 0x2c;
+const CONFIG_DISCARD_SECTOR_ALIGNMENT_OFFSET: usize = 0x30;
+const CONFIG_MAX_WRITE_ZEROES_SECTORS_OFFSET: usize = 0x34;
+const CONFIG_MAX_WRITE_ZEROES_SEG_OFFSET: usize = 0x38;
+const CONFIG_WRITE_ZEROES_MAY_UNMAP_OFFSET: usize = 0x3c;
+
+/// 默认 DMA 缓冲池最多缓存的 buffer 数。
+///
+/// 这是驱动策略参数，不是协议常量；集中命名后，后续可以按设备队列深度或
+/// 平台 DMA 约束替换 profile，而不会把策略数字散落到提交路径。
+const DEFAULT_DMA_POOL_TARGET_BUFFERS: usize = 4;
+/// 默认 DMA 缓冲池最多缓存的总字节数。
+const DEFAULT_DMA_POOL_TARGET_BYTES: usize = 2 * 1024 * 1024;
 
 /// DMA 缓冲复用池的策略参数。
 ///
@@ -64,7 +103,10 @@ impl DmaBufferPoolProfile {
     }
 
     pub const fn virtio_block_default() -> Self {
-        Self::new(4, 2 * 1024 * 1024)
+        Self::new(
+            DEFAULT_DMA_POOL_TARGET_BUFFERS,
+            DEFAULT_DMA_POOL_TARGET_BYTES,
+        )
     }
 
     fn max_buffers(self, queue_size: u16) -> usize {
@@ -105,26 +147,95 @@ impl VirtioBlkNegotiatedFeatures {
     }
 }
 
+/// 从设备 feature 中选择驱动支持的集合。
+pub(super) fn negotiate_supported_features(device_features: u64) -> Result<u64, &'static str> {
+    if device_features & VIRTIO_F_VERSION_1 == 0 {
+        return Err("virtio-blk: VERSION_1 feature is missing");
+    }
+    Ok(device_features & SUPPORTED_FEATURES)
+}
+
+/// virtio-blk 设备 config 空间读取接口。
+///
+/// MMIO 与 PCI 的边界检查方式不同：MMIO config 空间由设备寄存器窗口固定给出，
+/// PCI device_cfg 则必须按 capability 长度逐项校验。公共层只依赖这个 typed
+/// 读取接口，集中解释块设备 config 字段的语义。
+pub(super) trait VirtioBlkConfigReader {
+    fn read_u8(&self, offset: usize) -> Option<u8>;
+    fn read_u32(&self, offset: usize) -> Option<u32>;
+
+    fn read_u64(&self, offset: usize) -> Option<u64> {
+        let lo = self.read_u32(offset)? as u64;
+        let hi = self.read_u32(offset.checked_add(mem::size_of::<u32>())?)? as u64;
+        Some((hi << 32) | lo)
+    }
+}
+
+/// 已解析并校验过的 virtio-blk config。
+pub(super) struct VirtioBlkDeviceConfig {
+    pub capacity_sectors: u64,
+    pub logical_block_size: u32,
+    pub capabilities: VirtioBlkCapabilities,
+}
+
+/// config 解析失败原因。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VirtioBlkConfigError {
+    MissingCapacity,
+    MissingBlockSize,
+    MissingDiscardLimits,
+    MissingWriteZeroesLimits,
+    MissingWriteZeroesUnmap,
+    InvalidBlockSize,
+}
+
+impl VirtioBlkConfigError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::MissingCapacity => "virtio-blk: device_cfg capacity is missing",
+            Self::MissingBlockSize => "virtio-blk: device_cfg block size is missing",
+            Self::MissingDiscardLimits => "virtio-blk: device_cfg discard limits are missing",
+            Self::MissingWriteZeroesLimits => {
+                "virtio-blk: device_cfg write-zeroes limits are missing"
+            }
+            Self::MissingWriteZeroesUnmap => {
+                "virtio-blk: device_cfg write-zeroes unmap flag is missing"
+            }
+            Self::InvalidBlockSize => "virtio-blk: invalid logical block size",
+        }
+    }
+}
+
 /// 单段 discard/write-zeroes 类命令的设备限制。
 #[derive(Clone, Copy, Debug)]
 pub(super) struct VirtioBlkRangeOpLimits {
     pub max_sectors: u32,
     pub max_segments: u32,
+    pub sector_alignment: NonZeroU32,
 }
 
 impl VirtioBlkRangeOpLimits {
-    pub const fn new(max_sectors: u32, max_segments: u32) -> Option<Self> {
+    pub const fn new(
+        max_sectors: u32,
+        max_segments: u32,
+        sector_alignment: NonZeroU32,
+    ) -> Option<Self> {
         if max_sectors == 0 || max_segments == 0 {
             return None;
         }
         Some(Self {
             max_sectors,
             max_segments,
+            sector_alignment,
         })
     }
 
-    pub const fn supports_single_segment(self, sectors: u32) -> bool {
+    pub const fn supports_single_segment_count(self, sectors: u32) -> bool {
         self.max_segments >= 1 && sectors <= self.max_sectors
+    }
+
+    pub fn sector_aligned(self, sector: u64) -> bool {
+        sector.is_multiple_of(u64::from(self.sector_alignment.get()))
     }
 }
 
@@ -168,6 +279,80 @@ impl VirtioBlkCapabilities {
         }
         features
     }
+}
+
+/// 解析并校验 virtio-blk device config。
+pub(super) fn read_device_config<R: VirtioBlkConfigReader>(
+    reader: &R,
+    driver_features: u64,
+) -> Result<VirtioBlkDeviceConfig, VirtioBlkConfigError> {
+    let capacity_sectors = reader
+        .read_u64(CONFIG_CAPACITY_OFFSET)
+        .ok_or(VirtioBlkConfigError::MissingCapacity)?;
+    let negotiated_features = VirtioBlkNegotiatedFeatures::new(driver_features);
+    let logical_block_size = if negotiated_features.contains(FEATURE_BLK_SIZE) {
+        reader
+            .read_u32(CONFIG_BLK_SIZE_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingBlockSize)?
+    } else {
+        VIRTIO_BLK_SECTOR_SIZE
+    };
+    if logical_block_size < VIRTIO_BLK_SECTOR_SIZE
+        || !logical_block_size.is_power_of_two()
+        || !logical_block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)
+    {
+        return Err(VirtioBlkConfigError::InvalidBlockSize);
+    }
+
+    let discard = if negotiated_features.contains(FEATURE_DISCARD) {
+        let max_sectors = reader
+            .read_u32(CONFIG_MAX_DISCARD_SECTORS_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingDiscardLimits)?;
+        let max_segments = reader
+            .read_u32(CONFIG_MAX_DISCARD_SEG_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingDiscardLimits)?;
+        let raw_alignment = reader
+            .read_u32(CONFIG_DISCARD_SECTOR_ALIGNMENT_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingDiscardLimits)?;
+        let alignment = NonZeroU32::new(raw_alignment).unwrap_or(NonZeroU32::MIN);
+        VirtioBlkRangeOpLimits::new(max_sectors, max_segments, alignment)
+    } else {
+        None
+    };
+
+    let write_zeroes = if negotiated_features.contains(FEATURE_WRITE_ZEROES) {
+        let max_sectors = reader
+            .read_u32(CONFIG_MAX_WRITE_ZEROES_SECTORS_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingWriteZeroesLimits)?;
+        let max_segments = reader
+            .read_u32(CONFIG_MAX_WRITE_ZEROES_SEG_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingWriteZeroesLimits)?;
+        // virtio-blk 没有单独的 write-zeroes alignment 字段；协议扇区对齐即可。
+        VirtioBlkRangeOpLimits::new(max_sectors, max_segments, NonZeroU32::MIN)
+    } else {
+        None
+    };
+
+    let write_zeroes_may_unmap = if negotiated_features.contains(FEATURE_WRITE_ZEROES) {
+        reader
+            .read_u8(CONFIG_WRITE_ZEROES_MAY_UNMAP_OFFSET)
+            .ok_or(VirtioBlkConfigError::MissingWriteZeroesUnmap)?
+            != 0
+    } else {
+        false
+    };
+    let capabilities = VirtioBlkCapabilities::new(
+        negotiated_features,
+        discard,
+        write_zeroes,
+        write_zeroes_may_unmap,
+    );
+
+    Ok(VirtioBlkDeviceConfig {
+        capacity_sectors,
+        logical_block_size,
+        capabilities,
+    })
 }
 
 /// 根据设备 DMA 能力和 virtio 描述符格式构造块层 I/O 限制。
@@ -258,6 +443,12 @@ impl VirtioBlkRequestPlan {
         logical_block_size: u32,
         capabilities: VirtioBlkCapabilities,
     ) -> Result<Self, SubmitError> {
+        if logical_block_size < VIRTIO_BLK_SECTOR_SIZE
+            || !logical_block_size.is_power_of_two()
+            || !logical_block_size.is_multiple_of(VIRTIO_BLK_SECTOR_SIZE)
+        {
+            return Err(SubmitError::InvalidRequest(BioReqError::Misaligned));
+        }
         if capabilities.features.read_only() && op.is_write() {
             return Err(SubmitError::ReadOnly);
         }
@@ -311,7 +502,10 @@ impl VirtioBlkRequestPlan {
                 let num_sectors = u32::try_from(num_sectors)
                     .map_err(|_| SubmitError::InvalidRequest(BioReqError::TooLarge))?;
                 let limits = capabilities.discard.ok_or(SubmitError::Unsupported)?;
-                if !limits.supports_single_segment(num_sectors) {
+                if !limits.sector_aligned(sector) {
+                    return Err(SubmitError::InvalidRequest(BioReqError::Misaligned));
+                }
+                if !limits.supports_single_segment_count(num_sectors) {
                     return Err(SubmitError::InvalidRequest(BioReqError::TooLarge));
                 }
                 Ok(Self {
@@ -332,10 +526,17 @@ impl VirtioBlkRequestPlan {
                 let num_sectors = u32::try_from(num_sectors)
                     .map_err(|_| SubmitError::InvalidRequest(BioReqError::TooLarge))?;
                 let limits = capabilities.write_zeroes.ok_or(SubmitError::Unsupported)?;
-                if !limits.supports_single_segment(num_sectors) {
+                if !limits.sector_aligned(sector) {
+                    return Err(SubmitError::InvalidRequest(BioReqError::Misaligned));
+                }
+                if !limits.supports_single_segment_count(num_sectors) {
                     return Err(SubmitError::InvalidRequest(BioReqError::TooLarge));
                 }
-                let flags = u32::from(capabilities.write_zeroes_may_unmap);
+                let flags = if capabilities.write_zeroes_may_unmap {
+                    WRITE_ZEROES_FLAG_UNMAP
+                } else {
+                    0
+                };
                 Ok(Self {
                     req_type: REQ_TYPE_WRITE_ZEROES,
                     sector: 0,
@@ -372,6 +573,23 @@ impl VirtioBlkRequestPlan {
     pub const fn expects_bio_buffer(&self) -> bool {
         matches!(self.data_payload, VirtioBlkDataPayload::BioBuffer)
     }
+
+    /// 设备在 used ring 中至少应声明写回的字节数。
+    ///
+    /// virtio-blk 每个请求都有一个 status 字节由设备写回；读请求还会把数据
+    /// descriptor 一并写回。完成路径用这个值识别短写，避免状态字节为 OK 但
+    /// 数据缓冲未完整写入时误报成功。
+    pub fn expected_device_write_len(&self) -> Result<u32, SubmitError> {
+        let data_len = if self.data_device_writable {
+            self.data_len
+        } else {
+            0
+        };
+        data_len
+            .checked_add(mem::size_of::<u8>())
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or(SubmitError::InvalidRequest(BioReqError::TooLarge))
+    }
 }
 
 fn checked_bio_payload_len(blocks: u32, logical_block_size: u32) -> Result<usize, SubmitError> {
@@ -394,6 +612,187 @@ pub(super) fn status_to_result(status: u8) -> Result<(), BioIoError> {
         STATUS_UNSUPP => Err(BioIoError::Unsupported),
         _ => Err(BioIoError::MediaError),
     }
+}
+
+/// 校验 used ring 中设备声明的写回长度。
+///
+/// 这里接受比预期更大的长度：部分设备会按内部合并后的 in descriptor 长度回报。
+/// 但长度小于 status/data 的最小写回需求时，请求不能被视为成功。
+pub(super) fn validate_used_write_len(expected: u32, actual: u32) -> Result<(), BioIoError> {
+    if actual < expected {
+        Err(BioIoError::Unavailable)
+    } else {
+        Ok(())
+    }
+}
+
+/// 校验 BIO 自带缓冲区是否符合请求规划。
+///
+/// 读写请求必须携带精确长度的数据缓冲；flush/discard/write-zeroes 的协议 payload
+/// 由驱动自己构造，调用方不能额外塞入数据缓冲，否则容易隐藏上层参数错误。
+pub(super) fn validate_bio_buffer_for_plan(
+    plan: VirtioBlkRequestPlan,
+    bio: &Bio,
+) -> Result<(), SubmitError> {
+    if plan.expects_bio_buffer() {
+        if bio.buffer.len() != plan.data_len {
+            return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
+        }
+    } else if !matches!(&bio.buffer, BioBuffer::None) {
+        return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
+    }
+    Ok(())
+}
+
+/// virtio-blk 提交路径需要的队列能力。
+///
+/// MMIO 与 PCI 队列结构各自保存 pending 表和失败状态，但 DMA 缓冲池、split
+/// queue 访问方式一致。用这个小接口把“协议层如何准备一次请求”从传输层拆出。
+pub(super) trait VirtioBlkDmaQueue {
+    fn split_queue(&mut self) -> &mut SplitVirtQueue;
+    fn take_meta_dma(&mut self) -> Option<DmaBuffer>;
+    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer);
+    fn take_data_dma(&mut self, len: usize, direction: DmaDirection) -> Option<DmaBuffer>;
+    fn recycle_data_dma(&mut self, data_dma: DmaBuffer);
+
+    fn recycle_request_dma(&mut self, meta_dma: DmaBuffer, data_dma: Option<DmaBuffer>) {
+        self.recycle_meta_dma(meta_dma);
+        if let Some(data_dma) = data_dma {
+            self.recycle_data_dma(data_dma);
+        }
+    }
+}
+
+/// 已分配但尚未发布到 available ring 的请求资源。
+pub(super) struct VirtioBlkAllocatedRequest {
+    pub chain: DescriptorChain,
+    pub head: u16,
+    pub meta_dma: DmaBuffer,
+    pub data_dma: Option<DmaBuffer>,
+}
+
+/// 为一次请求分配描述符链和 DMA 缓冲，并写入请求头。
+pub(super) fn allocate_request<Q: VirtioBlkDmaQueue>(
+    queue: &mut Q,
+    plan: VirtioBlkRequestPlan,
+) -> Result<VirtioBlkAllocatedRequest, SubmitError> {
+    if queue.split_queue().free_descriptor_count() < plan.descriptor_count {
+        return Err(SubmitError::QueueFull);
+    }
+    let chain = queue
+        .split_queue()
+        .alloc_chain(plan.descriptor_count)
+        .map_err(|_| SubmitError::QueueFull)?;
+    let head = chain.head();
+    let dma_context = queue.split_queue().dma_context();
+
+    let meta_dma = match queue.take_meta_dma() {
+        Some(buffer) => buffer,
+        None => match DmaBuffer::new_in(
+            dma_context,
+            mem::size_of::<VirtioBlkReqMeta>(),
+            mem::align_of::<VirtioBlkReqMeta>(),
+            DmaDirection::Bidirectional,
+        ) {
+            Ok(buffer) => buffer,
+            Err(_) => {
+                let _ = queue.split_queue().free_chain(chain);
+                return Err(SubmitError::OutOfMemory);
+            }
+        },
+    };
+    let meta = plan.meta();
+    unsafe {
+        core::ptr::write(meta_dma.vaddr() as *mut VirtioBlkReqMeta, meta);
+    }
+    meta_dma.sync_for_device();
+
+    let data_dma = if plan.has_data_descriptor() {
+        let direction = match plan.data_direction {
+            Some(direction) => direction,
+            None => {
+                let _ = queue.split_queue().free_chain(chain);
+                queue.recycle_meta_dma(meta_dma);
+                return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
+            }
+        };
+        match queue.take_data_dma(plan.data_len, direction) {
+            Some(buffer) => Some(buffer),
+            None => match DmaBuffer::new_in(dma_context, plan.data_len, 1, direction) {
+                Ok(buffer) => Some(buffer),
+                Err(_) => {
+                    let _ = queue.split_queue().free_chain(chain);
+                    queue.recycle_meta_dma(meta_dma);
+                    return Err(SubmitError::OutOfMemory);
+                }
+            },
+        }
+    } else {
+        None
+    };
+
+    Ok(VirtioBlkAllocatedRequest {
+        chain,
+        head,
+        meta_dma,
+        data_dma,
+    })
+}
+
+/// 释放尚未发布给设备的请求资源。
+pub(super) fn free_allocated_request<Q: VirtioBlkDmaQueue>(
+    queue: &mut Q,
+    request: VirtioBlkAllocatedRequest,
+) {
+    let _ = queue.split_queue().free_chain(request.chain);
+    queue.recycle_request_dma(request.meta_dma, request.data_dma);
+}
+
+/// 在提交锁外写入数据 DMA payload。
+///
+/// Read 请求的数据缓冲由设备填充，不在这里写；Write、Discard、WriteZeroes 的
+/// payload 由 CPU 先写入 DMA 缓冲，再统一同步给设备。
+pub(super) fn write_data_payload(
+    plan: VirtioBlkRequestPlan,
+    bio: &Bio,
+    data_dma: &mut Option<DmaBuffer>,
+) -> Result<(), SubmitError> {
+    let Some(dma) = data_dma.as_mut() else {
+        return Ok(());
+    };
+    match plan.data_payload {
+        VirtioBlkDataPayload::BioBuffer if plan.data_direction == Some(DmaDirection::ToDevice) => {
+            if bio.buffer.len() != plan.data_len {
+                return Err(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch));
+            }
+            dma.as_mut_slice()[..plan.data_len].copy_from_slice(bio.buffer.as_slice());
+        }
+        VirtioBlkDataPayload::RangeSegment(segment) => unsafe {
+            core::ptr::write(dma.vaddr() as *mut VirtioBlkRangeSegment, segment);
+        },
+        _ => {}
+    }
+    dma.sync_for_device();
+    Ok(())
+}
+
+/// 写入描述符链，但不发布 available ring。
+pub(super) fn write_allocated_request_descriptors<Q: VirtioBlkDmaQueue>(
+    queue: &mut Q,
+    request: &VirtioBlkAllocatedRequest,
+    plan: VirtioBlkRequestPlan,
+) -> Result<(), SubmitError> {
+    let data_len = u32::try_from(plan.data_len)
+        .map_err(|_| SubmitError::InvalidRequest(BioReqError::TooLarge))?;
+    write_request_descriptors(
+        queue.split_queue(),
+        &request.chain,
+        plan,
+        request.meta_dma.dma_addr() as u64,
+        request.data_dma.as_ref().map(|dma| dma.dma_addr() as u64),
+        data_len,
+        request.meta_dma.dma_addr() as u64 + req_status_offset(),
+    )
 }
 
 /// 按 virtio-blk 协议写入一次请求的 split virtqueue 描述符链。
@@ -428,18 +827,24 @@ pub(super) fn write_request_descriptors(
         } else {
             0
         };
+        let updates = [
+            VirtqDescUpdate::new(d0, header_dma, req_header_size(), 0, Some(d1)),
+            VirtqDescUpdate::new(d1, data_dma, data_len, data_flags, Some(d2)),
+            VirtqDescUpdate::new(d2, status_dma, 1, VIRTQ_DESC_F_WRITE, None),
+        ];
         queue
-            .write_desc(d0, header_dma, req_header_size(), 0, Some(d1))
-            .and_then(|_| queue.write_desc(d1, data_dma, data_len, data_flags, Some(d2)))
-            .and_then(|_| queue.write_desc(d2, status_dma, 1, VIRTQ_DESC_F_WRITE, None))
+            .write_descs(&updates)
             .map_err(|_| SubmitError::QueueFull)
     } else {
         let d1 = chain
             .get(1)
             .ok_or(SubmitError::InvalidRequest(BioReqError::BufferSizeMismatch))?;
+        let updates = [
+            VirtqDescUpdate::new(d0, header_dma, req_header_size(), 0, Some(d1)),
+            VirtqDescUpdate::new(d1, status_dma, 1, VIRTQ_DESC_F_WRITE, None),
+        ];
         queue
-            .write_desc(d0, header_dma, req_header_size(), 0, Some(d1))
-            .and_then(|_| queue.write_desc(d1, status_dma, 1, VIRTQ_DESC_F_WRITE, None))
+            .write_descs(&updates)
             .map_err(|_| SubmitError::QueueFull)
     }
 }

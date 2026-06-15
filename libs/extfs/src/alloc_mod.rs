@@ -437,9 +437,7 @@ pub(crate) fn free_blocks_run(
     }
 
     if total_cleared != 0 {
-        state
-            .block_alloc_hint
-            .store(first_rel, Ordering::Relaxed);
+        state.block_alloc_hint.store(first_rel, Ordering::Relaxed);
         state.adjust_sb_free_blocks(total_cleared as i64)?;
         state.flush_alloc_metadata()?;
     }
