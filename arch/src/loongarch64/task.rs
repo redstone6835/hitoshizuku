@@ -26,9 +26,9 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = sp;
     }
 
-    fn set_trap_frame_gp(trap_frame_ptr: TrapFramePtr, gp: usize) {
-        let tf = unsafe { &mut *(trap_frame_ptr.as_usize() as *mut TrapFrame) };
-        tf.tp = gp;
+    fn set_trap_frame_gp(_trap_frame_ptr: TrapFramePtr, _gp: usize) {
+        // LoongArch64 psABI does not expose a dedicated GP register in the
+        // saved trap frame. Do not alias this architecture-neutral hook to TP.
     }
 
     fn set_trap_frame_tp(trap_frame_ptr: TrapFramePtr, tp: usize) {

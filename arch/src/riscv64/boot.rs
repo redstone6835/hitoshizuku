@@ -222,7 +222,10 @@ unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
     // 初始化 boot hart（index 0）的 per-hart 数据
     unsafe {
         let hl = crate::riscv64::specific::boot_hart_local_ptr();
+        let kernel_gp: usize;
+        core::arch::asm!("mv {}, gp", out(reg) kernel_gp, options(nomem, nostack));
         (*hl).hart_id = hartid;
+        (*hl).kernel_gp = kernel_gp;
         // 中断栈栈顶 = IRQ_STACKS[0] 末尾（栈向低地址增长）
         (*hl).irq_stack_top = core::ptr::addr_of!(IRQ_STACKS) as usize + IRQ_STACK_SIZE;
         core::sync::atomic::compiler_fence(Ordering::Release);

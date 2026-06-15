@@ -179,12 +179,30 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 tf_ptr
             }
             FaultOutcome::Kernel(reason) => {
+                let (pid, kind, state, comm) = if sched::is_ready() {
+                    let task = sched::current_task();
+                    (task.pid_root(), task.kind(), task.state(), task.comm())
+                } else {
+                    (
+                        None,
+                        sched::TaskKind::KernelThread,
+                        sched::TaskState::Running,
+                        [0u8; sched::TASK_COMM_LEN],
+                    )
+                };
                 log::error!(
-                    "[trap][mm] FATAL kernel fault ({:?}) sepc={:#x} tval={:#x} code={:#x} — halting",
+                    "[trap][mm] FATAL kernel fault ({:?}) sepc={:#x} ra={:#x} sp={:#x} tval={:#x} status={:#x} code={:#x} pid={:?} kind={:?} state={:?} comm={:?} — halting",
                     reason,
                     tf.sepc,
+                    tf.ra,
+                    tf.sp,
                     tf.tval,
-                    code
+                    tf.status,
+                    code,
+                    pid,
+                    kind,
+                    state,
+                    comm
                 );
                 0
             }

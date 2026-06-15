@@ -26,6 +26,7 @@ pub struct HartLocal {
     pub hart_id: usize,
     pub kernel_stack_top: usize,
     pub preempt_count: usize,
+    pub kernel_gp: usize,
     /// 中断栈栈顶（高地址端）。trap entry from_kernel 路径切换到此栈。
     pub irq_stack_top: usize,
 }
@@ -33,7 +34,8 @@ pub struct HartLocal {
 pub const IRQ_STACK_SIZE: usize = 8192;
 
 /// HartLocal.irq_stack_top 在结构体中的字节偏移。
-pub const HART_LOCAL_IRQ_STACK_TOP_OFF: usize = 24; // 3 * size_of::<usize>()
+pub const HART_LOCAL_KERNEL_GP_OFF: usize = 24; // 3 * size_of::<usize>()
+pub const HART_LOCAL_IRQ_STACK_TOP_OFF: usize = 32; // 4 * size_of::<usize>()
 
 /// 全部 hart 的中断栈（静态分配，按 hart index 索引）。
 #[repr(C, align(16))]
@@ -54,6 +56,7 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
         hart_id: 0,
         kernel_stack_top: 0,
         preempt_count: 0,
+        kernel_gp: 0,
         irq_stack_top: 0,
     };
     [EMPTY; MAX_HARTS]
@@ -67,7 +70,7 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
 #[inline]
 pub(crate) unsafe fn boot_hart_local_ptr() -> *mut HartLocal {
     // Safety: 调用方保证在单核 boot 阶段调用（pre_boot_init），此时无并发访问 HART_LOCALS。
-    unsafe { core::ptr::addr_of_mut!(HART_LOCALS) as *mut HartLocal }
+    core::ptr::addr_of_mut!(HART_LOCALS) as *mut HartLocal
 }
 #[inline]
 pub fn current_hart() -> &'static HartLocal {
