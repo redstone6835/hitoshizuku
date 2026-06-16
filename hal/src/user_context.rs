@@ -149,6 +149,11 @@ impl UserTrapFrame {
         }
     }
 
+    pub fn signal_interrupted_syscall_pc(&self) -> Option<usize> {
+        let ptr = TrapFramePtr::new(&self.inner as *const arch::TrapFrame as usize);
+        <arch::CurrentTaskOps as TaskOps>::signal_interrupted_syscall_pc(ptr)
+    }
+
     pub fn set_args(&mut self, arg0: usize, arg1: usize, arg2: usize) {
         #[cfg(target_arch = "loongarch64")]
         {

@@ -137,6 +137,19 @@ impl Riscv64Paging {
     pub unsafe fn activate_with_asid(root: PhysPageTableRoot, asid: usize) {
         let satp =
             SATP_MODE_SV48 | ((asid & ASID_MASK) << PPN_BITS) | (Self::make_ppn(root.as_usize()));
+        let current: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrr {current}, satp",
+                current = out(reg) current,
+                options(nostack, preserves_flags)
+            );
+        }
+        if current == satp {
+            // 同一进程内的 pthread 切换会反复进入 VmSpace::activate。
+            // root/asid 未变化时不需要重写 satp，也不能白白做全局 sfence.vma。
+            return;
+        }
         unsafe {
             core::arch::asm!(
                 "csrw satp, {val}",

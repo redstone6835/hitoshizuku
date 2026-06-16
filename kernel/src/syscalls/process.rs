@@ -77,6 +77,7 @@ pub(super) fn sys_getegid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
     let task = Arc::clone(ctx.task());
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
     release_exit_files(&task);
     ctx.release_task_ref();
@@ -87,6 +88,7 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let code = ctx.args[0] as i32;
     let task = Arc::clone(ctx.task());
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[syscall][exit_group] pid={:?} code={}",
         task.pid_root(),
@@ -110,6 +112,15 @@ fn release_exit_files(task: &Arc<Task>) {
 pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let regs = hal::user::decode_clone_register_args(ctx.args);
     let flags = CloneFlags::from_raw(regs.flags);
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::debug!(
+        "[syscall][clone] flags={:#x} stack={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
+        regs.flags,
+        regs.stack,
+        regs.parent_tid,
+        regs.child_tid,
+        regs.tls,
+    );
     let args = CloneArgs {
         flags,
         pidfd: if flags.has(CloneFlags::CLONE_PIDFD) {
@@ -171,6 +182,16 @@ pub(super) fn sys_clone3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         requested_pid: 0,
         cgroup: read_u64(10) as usize,
     };
+    #[cfg(feature = "trace-task-lifecycle")]
+    log::debug!(
+        "[syscall][clone3] flags={:#x} stack={:#x} stack_size={:#x} parent_tid={:#x} child_tid={:#x} tls={:#x}",
+        args.flags.raw(),
+        args.stack,
+        args.stack_size,
+        args.parent_tid,
+        args.child_tid,
+        args.tls,
+    );
     prepare_clone3_set_tid(&mut args, ctx.task())?;
     if args.cgroup != 0 {
         // TODO(threading): cgroup 需要成员状态与迁移事务；当前阶段不把 fd 当作占位接受。
@@ -2290,7 +2311,9 @@ fn wake_futex_waiters(waiters: Vec<(Arc<sched::Task>, Arc<FutexWaitState>)>) -> 
         match state.mark_woken() {
             FUTEX_WAIT_SLEEPING => {
                 if waiter.cas_state(TaskState::Sleeping, TaskState::Runnable) {
-                    sched::enqueue_task(waiter, sched::now_ns_public());
+                    // futex 唤醒属于短等待热路径，优先让被唤醒者尽快继续执行，
+                    // 避免 join / condvar / mutex 反复多等一个时间片。
+                    sched::enqueue_task_preferred(waiter, sched::now_ns_public());
                 }
                 woken += 1;
             }
@@ -3434,14 +3457,15 @@ fn sync_thread_group_fdtable_nofile_limit(
 ) -> Result<(), Errno> {
     let raw = limit.soft.raw();
     let soft = u32::try_from(raw).map_err(|_| Errno::EINVAL)?;
+    let hard = u32::try_from(limit.hard.raw()).map_err(|_| Errno::EINVAL)?;
     let mut synced = false;
     if let Some(fdt) = task_fdtable(task) {
-        fdt.set_limit(soft).map_err(|e| e.to_errno())?;
+        fdt.set_limits(soft, hard).map_err(|e| e.to_errno())?;
         synced = true;
     }
     for member in task.thread_group().snapshot() {
         if let Some(fdt) = task_fdtable(&member) {
-            fdt.set_limit(soft).map_err(|e| e.to_errno())?;
+            fdt.set_limits(soft, hard).map_err(|e| e.to_errno())?;
             synced = true;
         }
     }

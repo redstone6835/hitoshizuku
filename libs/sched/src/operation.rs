@@ -609,11 +609,16 @@ pub fn clone_with_context_outcome(
                 wait_child.vfork_done.finish_wait(&parent);
             }
         }
-    } else {
+    } else if !args.flags.has(CloneFlags::CLONE_THREAD) {
         // 不在 clone syscall 尚未返回时直接重入调度：父进程的 trap frame
         // 仍由 syscall 出口负责写返回值和推进 PC。这里只登记一次收尾后的
         // 启动交接，由 syscall dispatcher 在安全边界切给新子进程。
         request_post_syscall_handoff();
+    } else {
+        // pthread 创建后，父线程通常会立即 join/futex 等待，或继续批量创建
+        // 其它线程。强制在每次 clone 返回后切给子线程会把 create 串行化，
+        // 使 libcbench 的 pthread 创建项异常变慢；让父线程自然运行到阻塞点，
+        // 再由 futex/preferred 入队把子线程调度起来即可。
     }
 
     Ok(CloneOutcome { pid, child })

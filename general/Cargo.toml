@@ -8,6 +8,9 @@ test = false
 doctest = false
 bench = false
 
+[features]
+trace-syscall = []
+
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false }
 allocator = { path = "../libs/allocator" }

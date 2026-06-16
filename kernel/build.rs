@@ -7,18 +7,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    let target = std::env::var("TARGET").expect("TARGET not set by cargo");
+    let target = std::env::var("TARGET").expect("Cargo 未设置 TARGET 环境变量");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
 
     let initramfs_root = env_path("INITRAMFS_ROOT", &root).unwrap_or_else(|| {
-        root.join(default_rootfs_dir(&target).unwrap_or_else(|| {
-            panic!("INITRAMFS_ROOT is required for unsupported TARGET: {target}")
-        }))
+        root.join(
+            default_rootfs_dir(&target)
+                .unwrap_or_else(|| panic!("不支持的目标 {target}，必须显式设置 INITRAMFS_ROOT")),
+        )
     });
     let initramfs_cpio = env_path("INITRAMFS_CPIO", &root).unwrap_or_else(|| {
-        root.join(default_initramfs_cpio(&target).unwrap_or_else(|| {
-            panic!("INITRAMFS_CPIO is required for unsupported TARGET: {target}")
-        }))
+        root.join(
+            default_initramfs_cpio(&target)
+                .unwrap_or_else(|| panic!("不支持的目标 {target}，必须显式设置 INITRAMFS_CPIO")),
+        )
     });
 
     pack_initramfs(&initramfs_root, &initramfs_cpio);
@@ -64,13 +66,13 @@ fn default_initramfs_cpio(target: &str) -> Option<&'static str> {
 
 fn pack_initramfs(src: &Path, out_cpio: &Path) {
     if !src.is_dir() {
-        panic!("initramfs root does not exist or is not a directory: {src:?}");
+        panic!("initramfs 根目录不存在或不是目录：{src:?}");
     }
     let parent = out_cpio
         .parent()
-        .unwrap_or_else(|| panic!("initramfs output has no parent: {out_cpio:?}"));
+        .unwrap_or_else(|| panic!("initramfs 输出路径没有父目录：{out_cpio:?}"));
     std::fs::create_dir_all(parent)
-        .unwrap_or_else(|err| panic!("failed to create initramfs output dir {parent:?}: {err}"));
+        .unwrap_or_else(|err| panic!("创建 initramfs 输出目录 {parent:?} 失败：{err}"));
 
     run_cmd(Command::new("sh").arg("-c").arg(&format!(
         "cd {} && find . -print0 | cpio --quiet -o -0 -H newc > {}",
@@ -87,6 +89,6 @@ fn shell_quote(path: &Path) -> String {
 fn run_cmd(cmd: &mut Command) {
     let status = cmd
         .status()
-        .unwrap_or_else(|e| panic!("failed to spawn {cmd:?}: {e}"));
-    assert!(status.success(), "{cmd:?} exited with {status:?}");
+        .unwrap_or_else(|e| panic!("启动命令 {cmd:?} 失败：{e}"));
+    assert!(status.success(), "命令 {cmd:?} 退出状态异常：{status:?}");
 }

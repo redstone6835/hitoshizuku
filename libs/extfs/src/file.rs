@@ -556,7 +556,7 @@ impl FileOps for ExtRegFileOps {
                 raw_guard.set_blocks_lo(new_blocks_lo);
                 write_raw(&self.state, &raw_guard).map_err(map_err)?;
                 if let Some(inode) = self.sb.find_inode(self.ino as u64) {
-                    inode.set_size(new_size);
+                    inode.set_size_and_blocks(new_size, new_blocks_lo as u64);
                 }
                 self.invalidate_map_cache();
             }

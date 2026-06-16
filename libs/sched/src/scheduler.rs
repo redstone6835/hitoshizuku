@@ -116,9 +116,10 @@ static NEED_BALANCE: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; 
 /// 的机会，同时避免在 clone syscall 内部切换导致父 trap frame 尚未收尾。
 static POST_SYSCALL_HANDOFF: [AtomicU8; NR_CPUS] = [const { AtomicU8::new(0) }; NR_CPUS];
 
-/// 单次 clone 后最多让渡的轮数。每轮仍由 runqueue 正常挑选任务；这不是忙等，
-/// 而是在安全边界多给刚唤醒/刚创建的任务几个调度机会。
-const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 16;
+/// 单次 clone 后让渡的轮数。这里只需要一次安全边界交接：
+/// 再多轮只会放大 fork/daemon 一类短任务的 syscall 收尾开销；pthread
+/// 创建不走这里，线程会自然运行到 futex 等阻塞点再交给被唤醒者。
+const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 1;
 
 struct TimedSleeper {
     deadline_ns: u64,
@@ -605,6 +606,17 @@ pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
     cpu_id
 }
 
+/// futex 唤醒热路径入口：入队后让下一次本地调度优先尝试运行该任务。
+///
+/// 这不是长期优先级，也不会绕过调度 class。runqueue 在真正 pick 时仍会
+/// 复查任务状态、CPU 亲和性和 class；提示只消费一次，用于避免 pthread
+/// join / condvar / mutex 这类短等待路径退化到等待下一个 tick。
+pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
+    let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true);
+    request_resched(cpu_id);
+    cpu_id
+}
+
 /// 只把任务放回 runqueue，不主动抢占当前任务。
 ///
 /// vfork child 在 exec 完成时需要唤醒父进程，但 child 自己也刚拿到新的用户态
@@ -616,6 +628,10 @@ pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
 }
 
 fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
+    enqueue_task_locked_with_preference(task, now_ns, false)
+}
+
+fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: bool) -> usize {
     if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
     {
         // 只有拥有执行体的活任务才能进入 rq。退出清理和 wait/reap 会释放
@@ -635,7 +651,11 @@ fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
     }
     let cpu_id = select_task_cpu(&task);
     task.set_current_cpu(cpu_id);
-    RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
+    if preferred {
+        RUNQUEUES[cpu_id].enqueue_preferred(Arc::clone(&task), now_ns);
+    } else {
+        RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
+    }
     cpu_id
 }
 
@@ -1231,8 +1251,12 @@ pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
 pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
     // 任务可能登记在任一 CPU 的 rq 上；远端 current 不能被本 CPU 直接摘掉，
     // 只能请求对方在调度边界观察到新状态后自行切走。
+    #[cfg(feature = "trace-task-lifecycle")]
     let removed = dequeue_for_state_change(task, 0);
+    #[cfg(not(feature = "trace-task-lifecycle"))]
+    let _ = dequeue_for_state_change(task, 0);
     task.mark_exited(code);
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][exit] pid={:?} code={} on_rq={} state={:?}",
         task.pid_root(),

@@ -38,6 +38,9 @@ pub(crate) struct InodeMetaDisk {
     pub gid: u32,
     pub size: u64,
     pub nlink: u16,
+    pub atime: Timespec,
+    pub mtime: Timespec,
+    pub ctime: Timespec,
     pub flags: u32,
     pub blocks_512: u64,
     pub file_acl_hi: u32,
@@ -60,6 +63,9 @@ fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
     let mode = u16::from_le_bytes([raw[0], raw[1]]);
     let uid_lo = u16::from_le_bytes([raw[2], raw[3]]) as u32;
     let size_lo = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let atime_sec = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as i64;
+    let ctime_sec = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as i64;
+    let mtime_sec = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as i64;
     let gid_lo = u16::from_le_bytes([raw[24], raw[25]]) as u32;
     let nlink = u16::from_le_bytes([raw[26], raw[27]]);
     let blocks_lo = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
@@ -74,6 +80,18 @@ fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
         gid: (gid_hi << 16) | gid_lo,
         size: ((size_hi as u64) << 32) | size_lo as u64,
         nlink,
+        atime: Timespec {
+            secs: atime_sec,
+            nsecs: 0,
+        },
+        mtime: Timespec {
+            secs: mtime_sec,
+            nsecs: 0,
+        },
+        ctime: Timespec {
+            secs: ctime_sec,
+            nsecs: 0,
+        },
         flags,
         blocks_512: blocks_lo as u64,
         file_acl_hi,
@@ -237,9 +255,9 @@ fn build_inode_for(
         mode,
         uid: Uid(meta.uid),
         gid: Gid(meta.gid),
-        atime: Timespec::ZERO,
-        mtime: Timespec::ZERO,
-        ctime: Timespec::ZERO,
+        atime: meta.atime,
+        mtime: meta.mtime,
+        ctime: meta.ctime,
         blocks: meta.blocks_512,
     };
     let block_size = state.ext_sb.block_size;
@@ -294,11 +312,18 @@ fn create_disk_inode(
 }
 
 fn sync_vfs_meta(inode: &Inode, raw: &RawInode) {
-    inode.set_size(raw.size());
-    inode.set_nlink(raw.nlink() as u32);
-    // mode 改动不经 VFS 镜像(vfs::Inode 没暴露公开 setter),
-    // 下次 stat 读不到新 mode 直到 Inode 被重新创建 —— 只读 FS 不关心,
-    // R/W 场景里 chmod 的常见路径是 open + 用新 handle 再 stat。
+    let meta = parse_inode_meta(&raw.bytes);
+    inode.refresh_meta_from_fs(InodeMeta {
+        size: meta.size,
+        nlink: meta.nlink as u32,
+        mode: FileMode::new((meta.mode & 0o7777) as u16),
+        uid: Uid(meta.uid),
+        gid: Gid(meta.gid),
+        atime: meta.atime,
+        mtime: meta.mtime,
+        ctime: meta.ctime,
+        blocks: meta.blocks_512,
+    });
 }
 
 pub(crate) fn blocks_lo_from_mapping(
@@ -901,6 +926,25 @@ impl InodeOps for ExtInodeOps {
         }
         // new_size > cur_size:不分配新块,读路径返回零;下次 write 触及再补。
         raw.set_size(new_size);
+        write_raw(&self.state, &raw).map_err(map_err)?;
+        sync_vfs_meta(inode, &raw);
+        Ok(())
+    }
+
+    fn utimes(
+        &self,
+        inode: &Inode,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+    ) -> VfsResult<()> {
+        self.check_writable()?;
+        let mut raw = self.raw.lock();
+        if let Some(ts) = atime {
+            raw.set_atime_sec(ts.secs);
+        }
+        if let Some(ts) = mtime {
+            raw.set_mtime_sec(ts.secs);
+        }
         write_raw(&self.state, &raw).map_err(map_err)?;
         sync_vfs_meta(inode, &raw);
         Ok(())

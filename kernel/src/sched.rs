@@ -399,7 +399,6 @@ fn process_execve(
         .reset_handlers_for_exec();
 
     let kstack_top = task.ensure_kernel_stack();
-    #[cfg(target_arch = "loongarch64")]
     hal::user_context::set_kernel_trap_stack(kstack_top);
     let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.set_kernel_stack_top(kstack_top);
@@ -624,20 +623,15 @@ fn process_setup_signal_frame(
         return Err(Errno::EINVAL);
     }
     let mut abi_pc = saved.pc();
-    if info.sig.raw() >= 32
-        && (saved.ret() as isize) == -(Errno::EINTR.as_i32() as isize)
-        && saved.pc() >= 4
-    {
+    if info.sig.raw() >= 32 && (saved.ret() as isize) == -(Errno::EINTR.as_i32() as isize) {
         // musl 的取消信号 handler 用 ucontext PC 判断线程是否正处于
         // __syscall_cp 的可取消区间。syscall dispatcher 已经把真实返回 PC
         // 推到 syscall 之后；ABI ucontext 需要暴露 syscall 指令位置，而
         // 内核私有 trap 副本仍保留真实返回位置供 rt_sigreturn 使用。
-        write_u64(
-            frame_bytes,
-            mcontext_start,
-            saved.pc().wrapping_sub(4) as u64,
-        );
-        abi_pc = saved.pc().wrapping_sub(4);
+        if let Some(syscall_pc) = saved.signal_interrupted_syscall_pc() {
+            write_u64(frame_bytes, mcontext_start, syscall_pc as u64);
+            abi_pc = syscall_pc;
+        }
     }
     write_u64(frame_bytes, 56, abi_pc as u64);
     if !saved.write_bytes(&mut frame_bytes[SIGFRAME_TRAP_OFF..]) {
@@ -821,7 +815,6 @@ fn enter_loaded_user_image(
 
     let kstack_top = task.ensure_kernel_stack();
     loaded.vm.activate();
-    #[cfg(target_arch = "loongarch64")]
     hal::user_context::set_kernel_trap_stack(kstack_top);
     let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     frame.set_kernel_stack_top(kstack_top);

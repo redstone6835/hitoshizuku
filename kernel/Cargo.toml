@@ -8,6 +8,7 @@ bench = []
 block-bench = []
 allocator-bench = []
 embedded-initramfs = []
+trace-task-lifecycle = ["sched/trace-task-lifecycle"]
 allocator-tests = [
     "ktest/kernel",
     "allocator/ktest-kernel",

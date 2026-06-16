@@ -551,7 +551,7 @@ impl SuperblockOps for ExtFsSuperblockOps {
             free_blocks: 0,
             avail_blocks: 0,
             total_inodes: s.inodes_count as u64,
-            free_inodes: 0,
+            free_inodes: s.free_inodes_count as u64,
             fs_id: sb.fs_id.raw(),
             name_max: 255,
         })

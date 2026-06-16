@@ -43,6 +43,12 @@ impl RawInode {
         self.bytes[4..8].copy_from_slice(&(v as u32).to_le_bytes());
         self.bytes[108..112].copy_from_slice(&((v >> 32) as u32).to_le_bytes());
     }
+    pub fn set_atime_sec(&mut self, v: i64) {
+        self.bytes[8..12].copy_from_slice(&(v as u32).to_le_bytes());
+    }
+    pub fn set_mtime_sec(&mut self, v: i64) {
+        self.bytes[16..20].copy_from_slice(&(v as u32).to_le_bytes());
+    }
     pub fn nlink(&self) -> u16 {
         u16::from_le_bytes([self.bytes[26], self.bytes[27]])
     }

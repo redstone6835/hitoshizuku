@@ -27,7 +27,8 @@ if [ -x /sbin/mdev ]; then
 fi
 
 # 测试黑名单
-BLACKLIST="iozone iperf ltp unixbench"
+# basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
+BLACKLIST="ltp unixbench"
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do

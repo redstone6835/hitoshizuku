@@ -96,6 +96,11 @@ impl TaskOps for LoongArch64TaskOps {
         tf.a2 = arg2;
     }
 
+    fn signal_interrupted_syscall_pc(trap_frame_ptr: TrapFramePtr) -> Option<usize> {
+        let tf = unsafe { &*(trap_frame_ptr.as_usize() as *const TrapFrame) };
+        tf.pc.checked_sub(4)
+    }
+
     fn init_user_entry() -> unsafe extern "C" fn() -> ! {
         __loongarch64_user_entry
     }

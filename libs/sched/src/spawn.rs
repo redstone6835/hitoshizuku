@@ -85,6 +85,7 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
         pgroup.set_pgid(pid);
     }
 
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][spawn] kind={:?} pid={} parent_pid={:?}",
         kind,
@@ -283,6 +284,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         }
     }
 
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][clone] pid={} parent_pid={:?} flags={:#x} exit_sig={}",
         pid,
@@ -419,6 +421,7 @@ where
     zombie.retire_execution();
 
     debug_assert_eq!(zombie.state(), TaskState::Dead);
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][reap] parent_pid={:?} child_pid={:?} code={}",
         parent.pid_root(),
@@ -490,6 +493,7 @@ pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc
         );
         return child;
     }
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][kthread] spawned pid={:?} entry={:#x}",
         child.pid_root(),

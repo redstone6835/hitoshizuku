@@ -597,16 +597,23 @@ impl FdTable {
         self.len() == 0
     }
 
-    /// 调整每进程打开文件数软限制。
+    /// 调整每进程打开文件数软/硬限制。
     ///
-    /// 已经打开的 fd 不会因为软限制下调而被关闭；新分配的 fd 只需满足
-    /// `fd < limit` 即可。
-    pub fn set_limit(&self, new_limit: u32) -> VfsResult<()> {
+    /// 已经打开的 fd 不会因为限制下调而被关闭；后续分配和 `dup` 必须同时满足
+    /// `fd < soft` 与 `fd < hard`。位图按需截断，避免软限制已降到 42 时仍从
+    /// 旧 hard_limit 4096 范围内找出高位 fd。
+    pub fn set_limits(&self, new_soft: u32, new_hard: u32) -> VfsResult<()> {
         let mut inner = self.inner.lock();
-        if new_limit > inner.hard_limit {
+        if new_soft > new_hard {
             return Err(VfsError::OperationNotPermitted);
         }
-        inner.limit = new_limit;
+        inner.limit = new_soft;
+        inner.hard_limit = new_hard;
+        let words = bitmap_words(new_hard);
+        inner.bitmap.resize(words, 0);
+        for word_idx in 0..inner.bitmap.len() {
+            inner.bitmap[word_idx] &= inner.valid_bits_mask(word_idx);
+        }
         Ok(())
     }
 

@@ -204,5 +204,8 @@ pub fn dispatch(tf: TrapFramePtr) {
         }
         sched::run_post_syscall_handoff(sched::now_ns_public());
     }
+    // syscall 是 libcbench/lmbench 的最热路径，默认不能格式化并写入每次调用。
+    // 需要单步追踪时临时打开下面的编译期开关即可。
+    #[cfg(feature = "trace-syscall")]
     log::debug!("[syscall] nr={} args={:?} -> {}", nr, args, ret);
 }

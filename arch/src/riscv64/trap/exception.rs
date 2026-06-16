@@ -203,6 +203,9 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 0
             }
         }
+    } else if code == EXC_ILLEGAL_INST && from_user && enable_user_fpu_if_needed(tf) {
+        // 用户首次触碰浮点状态时按需打开 FS，保持 sepc 不变让原指令重试。
+        tf_ptr
     } else if code == EXC_BREAKPOINT {
         // ebreak 指令可能是 4 字节标准格式或 2 字节压缩格式（c.ebreak）。
         // 通过读取指令低 2 位判断宽度：低 2 位为 0x3 表示 4 字节指令。
@@ -228,14 +231,15 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// 但只处理 ecall（入口未保存 FPU）。
 ///
 /// 由汇编快速路径在确认 scause=8 后直接调用。
-/// 信号投递需要完整的 FPU 状态，因此在 dispatch 前惰性保存 FPU。
+/// 只有 FS=Dirty 时才保存 FPU；FS=Off 表示该线程尚未使用浮点寄存器，不能在
+/// pthread/futex 这类 syscall 热路径上无条件搬运 32 个浮点寄存器。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
     let tf = unsafe { trap_frame_mut(tf_ptr) };
 
-    // 惰性保存 FPU：仅在 sstatus.FS != Off 时执行。
+    // 惰性保存 FPU：仅在 sstatus.FS=Dirty 时执行。
     // 这保证 signal delivery 构建 sigframe 时能从 tf.f[] 正确读取用户态浮点状态。
-    if (tf.status & SSTATUS_FS_MASK) != 0 {
+    if (tf.status & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY {
         unsafe { save_fpu_to_frame(tf) };
     }
 
@@ -243,6 +247,40 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
     // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
     sched::preempt_if_needed(kernel_timestamp_ns());
     tf_ptr
+}
+
+fn enable_user_fpu_if_needed(tf: &mut TrapFrame) -> bool {
+    if (tf.status & SSTATUS_FS_MASK) != 0 || !looks_like_fpu_instruction(tf.sepc) {
+        return false;
+    }
+    tf.status = (tf.status & !SSTATUS_FS_MASK) | SSTATUS_FS_INITIAL;
+    true
+}
+
+fn looks_like_fpu_instruction(pc: usize) -> bool {
+    let mut lo = [0u8; 2];
+    if general::mm::copy_from_user(pc, &mut lo).is_err() {
+        return false;
+    }
+    let half = u16::from_le_bytes(lo);
+    if half & 0x3 != 0x3 {
+        return matches!(
+            half & 0xe003,
+            0x2000 | 0x6000 | 0xa000 | 0xe000 | 0x2002 | 0x6002 | 0xa002 | 0xe002
+        );
+    }
+
+    let mut raw = [0u8; 4];
+    raw[..2].copy_from_slice(&lo);
+    if general::mm::copy_from_user(pc.wrapping_add(2), &mut raw[2..]).is_err() {
+        return false;
+    }
+    let insn = u32::from_le_bytes(raw);
+    let opcode = insn & 0x7f;
+    matches!(
+        opcode,
+        0x07 | 0x27 | 0x43 | 0x47 | 0x4b | 0x4f | 0x53 | 0x73
+    ) && (opcode != 0x73 || matches!((insn >> 20) & 0xfff, 0x001..=0x003))
 }
 
 /// 将当前 CPU 的 FPU 寄存器保存到 trap frame。

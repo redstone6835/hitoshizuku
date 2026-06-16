@@ -31,6 +31,7 @@ pub const SSTATUS_SPIE: usize = 1 << 5; // [5]     trap 前 SIE 备份
 pub const SSTATUS_SPP: usize = 1 << 8; // [8]     trap 前特权级 (0=U,1=S)
 pub const SSTATUS_VS_MASK: usize = 3 << 9; // [10:9]  向量状态
 pub const SSTATUS_FS_MASK: usize = 0b11 << 13; // [14:13] 浮点状态（2-bit 提取掩码）
+pub const SSTATUS_FS_INITIAL: usize = 0b01 << 13; // [14:13] FS = Initial；首次允许用户执行浮点指令
 pub const SSTATUS_FS_DIRTY: usize = 0b11 << 13; // [14:13] FS = Dirty；数值恰等于 MASK（0b11 是最大编码值）
 pub const SSTATUS_SUM: usize = 1 << 18; // [18]    S-mode 访问 U 页
 pub const SSTATUS_MXR: usize = 1 << 19; // [19]    execute-only 页可读

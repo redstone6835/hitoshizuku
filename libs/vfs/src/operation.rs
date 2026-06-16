@@ -859,6 +859,9 @@ fn utimens_inode(
 ) -> VfsResult<()> {
     mount.check_writable()?;
     let meta = inode.meta_snapshot();
+    if atime.is_none() && mtime.is_none() {
+        return Ok(());
+    }
     if !ctx.cred.is_owner(meta.uid) && !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
         return Err(VfsError::PermissionDenied);
     }
