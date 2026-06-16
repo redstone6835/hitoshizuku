@@ -27,7 +27,7 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=INITRAMFS_ROOT");
     println!("cargo:rerun-if-env-changed=INITRAMFS_CPIO");
-    println!("cargo:rerun-if-changed={}", initramfs_root.display());
+    emit_initramfs_rerun_inputs(&initramfs_root);
     println!(
         "cargo:rustc-env=MYGO_INITRAMFS_CPIO={}",
         initramfs_cpio.display()
@@ -79,6 +79,29 @@ fn pack_initramfs(src: &Path, out_cpio: &Path) {
         shell_quote(src),
         shell_quote(out_cpio)
     )));
+}
+
+fn emit_initramfs_rerun_inputs(root: &Path) {
+    // Cargo 对目录的 rerun-if-changed 不是递归语义。initramfs 里 rcS、
+    // busybox applet 链接等任一文件变更都必须触发重新打包，否则内嵌
+    // cpio 会继续使用旧内容，启动行为和源码工作区不一致。
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        println!("cargo:rerun-if-changed={}", path.display());
+        if !path.is_dir() {
+            continue;
+        }
+        let mut entries = std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("读取 initramfs 目录 {path:?} 失败：{err}"))
+            .map(|entry| {
+                entry.unwrap_or_else(|err| panic!("读取 initramfs 目录项 {path:?} 失败：{err}"))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries.into_iter().rev() {
+            stack.push(entry.path());
+        }
+    }
 }
 
 fn shell_quote(path: &Path) -> String {

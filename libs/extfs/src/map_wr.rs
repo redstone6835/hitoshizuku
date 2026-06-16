@@ -413,13 +413,14 @@ pub(crate) fn free_blocks_from(
     let mut l3_blk = Vec::new();
     let mut top_blk = Vec::new();
     let mut mid_blk = Vec::new();
+    let mut freed_blocks = Vec::new();
 
     // 直接块
     let direct_count = DIRECT_COUNT;
     for i in from_lb..direct_count {
         let b = read_u32(i_block, i);
         if b != 0 {
-            crate::alloc_mod::free_block(state, b as u64)?;
+            freed_blocks.push(b as u64);
             write_u32(i_block, i, 0);
         }
     }
@@ -433,13 +434,13 @@ pub(crate) fn free_blocks_from(
             for i in rel..p {
                 let b = read_u32(&l1_blk, i);
                 if b != 0 {
-                    crate::alloc_mod::free_block(state, b as u64)?;
+                    freed_blocks.push(b as u64);
                     write_u32(&mut l1_blk, i, 0);
                 }
             }
             if rel == 0 {
                 // 整块都空了,连间接块自身也释放
-                crate::alloc_mod::free_block(state, l1 as u64)?;
+                freed_blocks.push(l1 as u64);
                 write_u32(i_block, 12, 0);
             } else {
                 state.write_block(l1 as u64, &l1_blk)?;
@@ -454,10 +455,10 @@ pub(crate) fn free_blocks_from(
             for i in 0..p {
                 let b = read_u32(&l1_blk, i);
                 if b != 0 {
-                    crate::alloc_mod::free_block(state, b as u64)?;
+                    freed_blocks.push(b as u64);
                 }
             }
-            crate::alloc_mod::free_block(state, l1 as u64)?;
+            freed_blocks.push(l1 as u64);
             write_u32(i_block, 12, 0);
         }
     }
@@ -483,19 +484,19 @@ pub(crate) fn free_blocks_from(
                 for j in start_in_mid..p {
                     let b = read_u32(&mid_blk, j);
                     if b != 0 {
-                        crate::alloc_mod::free_block(state, b as u64)?;
+                        freed_blocks.push(b as u64);
                         write_u32(&mut mid_blk, j, 0);
                     }
                 }
                 if start_in_mid == 0 {
-                    crate::alloc_mod::free_block(state, mid as u64)?;
+                    freed_blocks.push(mid as u64);
                     write_u32(&mut l2_blk, i, 0);
                 } else {
                     state.write_block(mid as u64, &mid_blk)?;
                 }
             }
             if mid_idx_start == 0 && inner_start == 0 {
-                crate::alloc_mod::free_block(state, l2 as u64)?;
+                freed_blocks.push(l2 as u64);
                 write_u32(i_block, 13, 0);
             } else {
                 state.write_block(l2 as u64, &l2_blk)?;
@@ -517,12 +518,12 @@ pub(crate) fn free_blocks_from(
                 for j in 0..p {
                     let b = read_u32(&mid_blk, j);
                     if b != 0 {
-                        crate::alloc_mod::free_block(state, b as u64)?;
+                        freed_blocks.push(b as u64);
                     }
                 }
-                crate::alloc_mod::free_block(state, mid as u64)?;
+                freed_blocks.push(mid as u64);
             }
-            crate::alloc_mod::free_block(state, l2 as u64)?;
+            freed_blocks.push(l2 as u64);
             write_u32(i_block, 13, 0);
         }
     }
@@ -567,26 +568,26 @@ pub(crate) fn free_blocks_from(
                     for k in inner_start_here..p {
                         let b = read_u32(&mid_blk, k);
                         if b != 0 {
-                            crate::alloc_mod::free_block(state, b as u64)?;
+                            freed_blocks.push(b as u64);
                             write_u32(&mut mid_blk, k, 0);
                         }
                     }
                     if inner_start_here == 0 {
-                        crate::alloc_mod::free_block(state, mid as u64)?;
+                        freed_blocks.push(mid as u64);
                         write_u32(&mut top_blk, mi, 0);
                     } else {
                         state.write_block(mid as u64, &mid_blk)?;
                     }
                 }
                 if mid_start_here == 0 && inner_start_here_base == 0 {
-                    crate::alloc_mod::free_block(state, top as u64)?;
+                    freed_blocks.push(top as u64);
                     write_u32(&mut l3_blk, ti, 0);
                 } else {
                     state.write_block(top as u64, &top_blk)?;
                 }
             }
             if top_idx_start == 0 && mid_idx_start == 0 && inner_start == 0 {
-                crate::alloc_mod::free_block(state, l3 as u64)?;
+                freed_blocks.push(l3 as u64);
                 write_u32(i_block, 14, 0);
             } else {
                 state.write_block(l3 as u64, &l3_blk)?;
@@ -615,17 +616,18 @@ pub(crate) fn free_blocks_from(
                     for k in 0..p {
                         let b = read_u32(&mid_blk, k);
                         if b != 0 {
-                            crate::alloc_mod::free_block(state, b as u64)?;
+                            freed_blocks.push(b as u64);
                         }
                     }
-                    crate::alloc_mod::free_block(state, mid as u64)?;
+                    freed_blocks.push(mid as u64);
                 }
-                crate::alloc_mod::free_block(state, top as u64)?;
+                freed_blocks.push(top as u64);
             }
-            crate::alloc_mod::free_block(state, l3 as u64)?;
+            freed_blocks.push(l3 as u64);
             write_u32(i_block, 14, 0);
         }
     }
+    crate::alloc_mod::free_blocks_sparse(state, &freed_blocks)?;
     Ok(())
 }
 
@@ -641,12 +643,13 @@ pub(crate) fn free_all_blocks(
     let mut l3_blk = Vec::new();
     let mut top_blk = Vec::new();
     let mut mid_blk = Vec::new();
+    let mut freed_blocks = Vec::new();
 
     // 直接块
     for i in 0..DIRECT_COUNT {
         let b = read_u32(i_block, i);
         if b != 0 {
-            alloc_mod::free_block(state, b as u64)?;
+            freed_blocks.push(b as u64);
             write_u32(i_block, i, 0);
         }
     }
@@ -658,10 +661,10 @@ pub(crate) fn free_all_blocks(
         for i in 0..p {
             let b = read_u32(&l1_blk, i);
             if b != 0 {
-                alloc_mod::free_block(state, b as u64)?;
+                freed_blocks.push(b as u64);
             }
         }
-        alloc_mod::free_block(state, l1 as u64)?;
+        freed_blocks.push(l1 as u64);
         write_u32(i_block, 12, 0);
     }
     // 二级
@@ -679,12 +682,12 @@ pub(crate) fn free_all_blocks(
             for j in 0..p {
                 let b = read_u32(&mid_blk, j);
                 if b != 0 {
-                    alloc_mod::free_block(state, b as u64)?;
+                    freed_blocks.push(b as u64);
                 }
             }
-            alloc_mod::free_block(state, mid as u64)?;
+            freed_blocks.push(mid as u64);
         }
-        alloc_mod::free_block(state, l2 as u64)?;
+        freed_blocks.push(l2 as u64);
         write_u32(i_block, 13, 0);
     }
     // 三级
@@ -709,15 +712,16 @@ pub(crate) fn free_all_blocks(
                 for k in 0..p {
                     let b = read_u32(&mid_blk, k);
                     if b != 0 {
-                        alloc_mod::free_block(state, b as u64)?;
+                        freed_blocks.push(b as u64);
                     }
                 }
-                alloc_mod::free_block(state, mid as u64)?;
+                freed_blocks.push(mid as u64);
             }
-            alloc_mod::free_block(state, top as u64)?;
+            freed_blocks.push(top as u64);
         }
-        alloc_mod::free_block(state, l3 as u64)?;
+        freed_blocks.push(l3 as u64);
         write_u32(i_block, 14, 0);
     }
+    alloc_mod::free_blocks_sparse(state, &freed_blocks)?;
     Ok(())
 }

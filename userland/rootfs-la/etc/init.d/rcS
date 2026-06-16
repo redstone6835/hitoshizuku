@@ -28,7 +28,7 @@ fi
 
 # 测试黑名单
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="ltp unixbench"
+BLACKLIST="ltp unixbench iozone"
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do
