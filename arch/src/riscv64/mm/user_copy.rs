@@ -49,6 +49,29 @@ pub(super) unsafe fn clear_sum() {
     }
 }
 
+#[inline(always)]
+unsafe fn enable_sum_and_save() -> usize {
+    let old: usize;
+    unsafe {
+        core::arch::asm!(
+            "csrrs {old}, sstatus, {sum}",
+            old = out(reg) old,
+            sum = in(reg) SSTATUS_SUM,
+            options(nostack, preserves_flags)
+        );
+    }
+    old
+}
+
+#[inline(always)]
+unsafe fn restore_sum(old_sstatus: usize) {
+    if old_sstatus & SSTATUS_SUM != 0 {
+        unsafe { set_sum() };
+    } else {
+        unsafe { clear_sum() };
+    }
+}
+
 // ── 用户拷贝 ──────────────────────────────────────────────────────────────────
 
 /// 从用户空间逐字节拷贝到内核缓冲区。
@@ -59,7 +82,7 @@ unsafe fn sum_copy_from_user(
     len: usize,
 ) -> Result<(), UserAccessError> {
     let mut i = 0usize;
-    unsafe { set_sum() };
+    let old_sstatus = unsafe { enable_sum_and_save() };
     while i < len {
         let ptr = (src_user + i) as *const u8;
         let b: u8;
@@ -81,13 +104,13 @@ unsafe fn sum_copy_from_user(
             );
         }
         if faulted != 0 {
-            unsafe { clear_sum() };
+            unsafe { restore_sum(old_sstatus) };
             return Err(UserAccessError::Fault);
         }
         unsafe { core::ptr::write_volatile(dst.add(i), b) };
         i += 1;
     }
-    unsafe { clear_sum() };
+    unsafe { restore_sum(old_sstatus) };
     Ok(())
 }
 
@@ -99,7 +122,7 @@ unsafe fn sum_copy_to_user(
     len: usize,
 ) -> Result<(), UserAccessError> {
     let mut i = 0usize;
-    unsafe { set_sum() };
+    let old_sstatus = unsafe { enable_sum_and_save() };
     while i < len {
         let b = unsafe { core::ptr::read_volatile(src.add(i)) };
         let ptr = (dst_user + i) as *mut u8;
@@ -121,12 +144,12 @@ unsafe fn sum_copy_to_user(
             );
         }
         if faulted != 0 {
-            unsafe { clear_sum() };
+            unsafe { restore_sum(old_sstatus) };
             return Err(UserAccessError::Fault);
         }
         i += 1;
     }
-    unsafe { clear_sum() };
+    unsafe { restore_sum(old_sstatus) };
     Ok(())
 }
 
@@ -158,7 +181,7 @@ unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAcces
     }
     let effective_max = max.min(USER_SPACE_TOP - start_user);
     let mut i = 0usize;
-    unsafe { set_sum() };
+    let old_sstatus = unsafe { enable_sum_and_save() };
     while i < effective_max {
         let ptr = (start_user + i) as *const u8;
         let b: u8;
@@ -180,17 +203,17 @@ unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAcces
             );
         }
         if faulted != 0 {
-            unsafe { clear_sum() };
+            unsafe { restore_sum(old_sstatus) };
             return Err(UserAccessError::Fault);
         }
         if b == 0 {
-            unsafe { clear_sum() };
+            unsafe { restore_sum(old_sstatus) };
             return Ok(i);
         }
         i += 1;
     }
-    unsafe { clear_sum() };
-    Ok(effective_max)
+    unsafe { restore_sum(old_sstatus) };
+    Err(UserAccessError::TooLong)
 }
 
 pub(super) static USER_ACCESS_OPS: UserAccessOps = UserAccessOps {

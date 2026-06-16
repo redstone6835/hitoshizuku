@@ -39,9 +39,12 @@ pub unsafe fn install_exception_entry() {
 pub unsafe extern "C" fn __riscv_exception_entry() {
     naked_asm!(
         "csrrw t6, {sscratch}, t6",
-        "bnez t6, 2f",
+        "csrr t5, {sstatus}",
+        "andi t5, t5, {spp}",
+        "beqz t5, 2f",
 
-        // from_kernel: t6=0(原sscratch), 原始t6在sscratch中
+        // from_kernel: sscratch 可能已经预置为用户态 trap 栈顶；
+        // 来源必须以硬件 SPP 为准，不能只看 sscratch 是否为 0。
         "3:",
         "addi t6, sp, -{frame_size}",
         "sd sp, {sp_off}(t6)",
@@ -218,6 +221,7 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         sscratch = const CSR_SSCRATCH,
         sepc = const CSR_SEPC,
         sstatus = const CSR_SSTATUS,
+        spp = const SSTATUS_SPP,
         scause = const CSR_SCAUSE,
         stval = const CSR_STVAL,
         satp = const CSR_SATP,

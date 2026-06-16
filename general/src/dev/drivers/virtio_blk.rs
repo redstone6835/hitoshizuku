@@ -753,6 +753,9 @@ impl PnpDriver for VirtioMmioBlkDriver {
                 "virtio-mmio reg missing",
             ));
         };
+        if !self.matches_block_device(info) {
+            return Err(PnpError::NoDriver);
+        }
         let virt_base = (self.device_mmio_to_virt)(phys);
         let driver = VirtioBlk::new(virt_base, info.dma_context()).map_err(|msg| {
             log::printk!("[platform-virtio-mmio-blk] probe failed: {}", msg);

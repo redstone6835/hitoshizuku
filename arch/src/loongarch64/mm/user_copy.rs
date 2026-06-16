@@ -11,6 +11,15 @@ use mm::UserAccessError;
 
 use general::mm::UserAccessOps;
 
+/// 当前 LoongArch64 用户虚拟地址上界（不含）。
+const USER_SPACE_TOP: usize = 0x0000_8000_0000_0000;
+
+#[inline]
+fn user_range_within(addr: usize, len: usize) -> bool {
+    addr.checked_add(len)
+        .is_some_and(|end| end <= USER_SPACE_TOP)
+}
+
 #[inline(always)]
 unsafe fn load_user_u8(src_user: usize) -> Result<u8, UserAccessError> {
     let value: usize;
@@ -252,6 +261,10 @@ unsafe fn store_user_u64(dst_user: usize, value: u64) -> Result<(), UserAccessEr
 /// # Safety
 /// `dst` 必须指向 `len` 字节可写内核内存；`src_user` 可以是任意用户值。
 unsafe fn copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<(), UserAccessError> {
+    if !user_range_within(src_user, len) {
+        return Err(UserAccessError::Fault);
+    }
+
     let mut copied = 0usize;
 
     // 热路径按机器字批量搬运；只有用户地址满足对应对齐时使用宽 load，
@@ -292,6 +305,10 @@ unsafe fn copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<()
 /// # Safety
 /// 对偶 of [`copy_from_user`]；`src` 必须指向 `len` 字节可读内核内存。
 unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<(), UserAccessError> {
+    if !user_range_within(dst_user, len) {
+        return Err(UserAccessError::Fault);
+    }
+
     let mut copied = 0usize;
 
     // 与 copy_from_user 对称：用户地址对齐后走宽 store，内核源地址允许非对齐读取。
@@ -331,6 +348,10 @@ unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<()
 /// # Safety
 /// `start_user` 可以是任意用户值；扫到 NUL 或 max 为止。
 unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAccessError> {
+    if start_user >= USER_SPACE_TOP {
+        return Err(UserAccessError::Fault);
+    }
+    let max = max.min(USER_SPACE_TOP - start_user);
     let mut i = 0usize;
     while i < max {
         let user_addr = start_user.checked_add(i).ok_or(UserAccessError::Fault)?;

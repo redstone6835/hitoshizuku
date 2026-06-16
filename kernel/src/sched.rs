@@ -331,10 +331,6 @@ unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
     let frame = {
         let me = sched::current_task();
         activate_task_vm(&me);
-        let kstack_top = me
-            .kernel_stack_top()
-            .expect("[sched][clone] user child missing kernel stack");
-        hal::user_context::set_kernel_trap_stack(kstack_top);
 
         let payload = me
             .ext_remove(TASKEXT_USER_TRAP_FRAME)
@@ -342,7 +338,13 @@ unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
         let frame = payload
             .downcast::<UserTrapFrame>()
             .expect("[sched][clone] saved trap frame type mismatch");
-        *frame
+        let mut frame = *frame;
+        let kstack_top = me
+            .kernel_stack_top()
+            .expect("[sched][clone] user child missing kernel stack");
+        frame.set_current_address_space();
+        frame.set_kernel_stack_top(kstack_top);
+        frame
     };
 
     unsafe { frame.resume() }
@@ -397,8 +399,10 @@ fn process_execve(
         .reset_handlers_for_exec();
 
     let kstack_top = task.ensure_kernel_stack();
+    #[cfg(target_arch = "loongarch64")]
     hal::user_context::set_kernel_trap_stack(kstack_top);
-    let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    frame.set_kernel_stack_top(kstack_top);
     frame.apply_to_context(user_ctx.as_usize());
     Ok(())
 }
@@ -468,10 +472,6 @@ fn process_clone_user_context(
     }
 
     let _ = child.ext_remove(TASKEXT_USER_TRAP_FRAME);
-    // 清零 kstack_top：clone 帧从父进程拷贝了父的栈顶值，
-    // 若保留会在 resume 时错误覆盖 sscratch 为父进程的栈，
-    // 导致子进程中断处理写入父栈，损坏父进程数据。
-    frame.set_kernel_stack_top(0);
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     child.into_kernel_thread(user_clone_entry, 0);
     Ok(())
@@ -821,8 +821,10 @@ fn enter_loaded_user_image(
 
     let kstack_top = task.ensure_kernel_stack();
     loaded.vm.activate();
-    let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    #[cfg(target_arch = "loongarch64")]
     hal::user_context::set_kernel_trap_stack(kstack_top);
+    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    frame.set_kernel_stack_top(kstack_top);
     unsafe { frame.resume() }
 }
 

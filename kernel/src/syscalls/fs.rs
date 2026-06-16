@@ -3740,16 +3740,19 @@ fn file_type_to_d_type(kind: FileType) -> u8 {
 
 fn write_linux_statfs(user: usize, st: &FsStat) -> Result<(), Errno> {
     let mut out = [0u8; 120];
+    let total_inodes = st.total_inodes;
+    let free_inodes = st.free_inodes.min(total_inodes);
     put_i64(&mut out, 0, st.fs_type as i64);
     put_i64(&mut out, 8, st.block_size as i64);
     put_u64(&mut out, 16, st.total_blocks);
     put_u64(&mut out, 24, st.free_blocks);
     put_u64(&mut out, 32, st.avail_blocks);
-    put_u64(&mut out, 40, st.total_inodes);
-    put_u64(&mut out, 48, st.free_inodes);
+    put_u64(&mut out, 40, total_inodes);
+    put_u64(&mut out, 48, free_inodes);
     put_u64(&mut out, 56, st.fs_id);
     put_i64(&mut out, 64, st.name_max as i64);
     put_i64(&mut out, 72, st.block_size as i64);
+    put_i64(&mut out, 80, 0);
     copy_to_user(user, &out).map_err(|e| e.as_errno())
 }
 

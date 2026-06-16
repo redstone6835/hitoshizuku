@@ -1263,6 +1263,7 @@ impl VmSpace {
             (ops.unmap)(self.pgd, vaddr, page_size);
             (ops.invalidate_range)(self.pgd, vaddr, page_size);
             (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
         }
         Ok(())
     }

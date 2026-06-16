@@ -311,11 +311,10 @@ unsafe fn riscv64_enter_user_mode(
 ) -> ! {
     use general::{TaskOps, TrapFramePtr};
 
-    <arch::Riscv64TaskOps as TaskOps>::set_kernel_trap_stack(kernel_stack_top);
-
     let mut frame = arch::TrapFrame::default();
     let frame_ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
     <arch::Riscv64TaskOps as TaskOps>::init_user_trap_frame(frame_ptr, entry_pc, user_sp, arg0);
+    frame.kstack_top = kernel_stack_top;
 
     unsafe { <arch::Riscv64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
 }

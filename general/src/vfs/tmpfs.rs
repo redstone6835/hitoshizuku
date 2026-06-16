@@ -26,6 +26,9 @@ use vfs::sync::Spinlock;
 /// 全局 tmpfs 实例计数器，用于生成唯一的 fs_id。
 static TMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+const TMPFS_VIRTUAL_BLOCKS: u64 = 256 * 1024;
+const TMPFS_VIRTUAL_INODES: u64 = 1_000_000;
+
 // ── Tmpfs 驱动 ────────────────────────────────────────────────────────────────
 
 /// Tmpfs 文件系统驱动。
@@ -131,14 +134,17 @@ impl SuperblockOps for TmpfsSuperblockOps {
     }
 
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
+        let used_inodes = self.total_inodes.load(Ordering::Relaxed);
+        let total_inodes = TMPFS_VIRTUAL_INODES.max(used_inodes);
+        let free_inodes = total_inodes.saturating_sub(used_inodes);
         Ok(FsStat {
             fs_type: 0x01021994,
             block_size: sb.block_size as u64,
-            total_blocks: u64::MAX,
-            free_blocks: u64::MAX,
-            avail_blocks: u64::MAX,
-            total_inodes: self.total_inodes.load(Ordering::Relaxed),
-            free_inodes: 0,
+            total_blocks: TMPFS_VIRTUAL_BLOCKS,
+            free_blocks: TMPFS_VIRTUAL_BLOCKS,
+            avail_blocks: TMPFS_VIRTUAL_BLOCKS,
+            total_inodes,
+            free_inodes,
             fs_id: sb.fs_id.raw(),
             name_max: sb.name_max,
         })

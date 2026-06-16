@@ -30,7 +30,7 @@
 
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use general::{MapError, PagingArch, VirtAddr, find_leaf, unmap_range_entries, walk_and_map};
+use general::{MapError, PagingArch, find_leaf, unmap_range_entries, walk_and_map};
 
 use crate::riscv64::paging::Riscv64Paging;
 use crate::riscv64::specific::phys_to_virt;

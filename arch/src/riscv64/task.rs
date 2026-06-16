@@ -209,10 +209,12 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "andi t1, t0, {spp}",
         "bnez t1, 1f",
 
-        // return-to-user：统一页表方案下 satp 未变，无需切换
-        // 仅设置 sscratch（trap entry 依赖 sscratch 区分 from_user/from_kernel）
+        // return-to-user：切到 TrapFrame 记录的用户页表，并在最后写 sscratch。
+        "ld t2, {satp_off}(s11)",
+        "csrw {satp}, t2",
+        "sfence.vma",
         "ld t0, {kstack_top_off}(s11)",
-        "beqz t0, 2f",              // kstack_top=0 → 保持当前 sscratch（由调用方预设）
+        "beqz t0, 2f",
         "csrw {sscratch}, t0",
         "j 2f",
 
@@ -323,9 +325,11 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         sepc = const CSR_SEPC,
         sstatus = const CSR_SSTATUS,
         sscratch = const CSR_SSCRATCH,
+        satp = const crate::riscv64::specific::CSR_SATP,
         fcsr = const CSR_FCSR,
         spp = const SSTATUS_SPP,
         fs_mask = const SSTATUS_FS_MASK,
+        satp_off = const crate::riscv64::specific::SATP_OFFSET,
     );
 }
 

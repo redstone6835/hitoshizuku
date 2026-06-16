@@ -637,7 +637,7 @@ pub(super) fn sys_prlimit64(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         && let Some(new) = new_pair
     {
         let target = sched_task_from_pid(pid, ctx.task())?;
-        sync_fdtable_nofile_limit(&target, new)?;
+        sync_thread_group_fdtable_nofile_limit(&target, new)?;
     }
 
     if old_user != 0 {
@@ -695,7 +695,7 @@ pub(super) fn sys_setrlimit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let new = sched::RlimitPair::new(sched::Rlim::from_raw(cur), sched::Rlim::from_raw(max));
     let _old = sched::operation::set_rlimit(resource, new)?;
     if resource == sched::Resource::Nofile {
-        sync_fdtable_nofile_limit(ctx.task(), new)?;
+        sync_thread_group_fdtable_nofile_limit(ctx.task(), new)?;
     }
     Ok(0)
 }
@@ -3428,11 +3428,24 @@ fn task_fdtable(task: &Arc<Task>) -> Option<Arc<vfs::FdTable>> {
         .ok()
 }
 
-fn sync_fdtable_nofile_limit(task: &Arc<Task>, limit: sched::RlimitPair) -> Result<(), Errno> {
+fn sync_thread_group_fdtable_nofile_limit(
+    task: &Arc<Task>,
+    limit: sched::RlimitPair,
+) -> Result<(), Errno> {
     let raw = limit.soft.raw();
     let soft = u32::try_from(raw).map_err(|_| Errno::EINVAL)?;
-    let fdt = task_fdtable(task).ok_or(Errno::EBADF)?;
-    fdt.set_limit(soft).map_err(|e| e.to_errno())
+    let mut synced = false;
+    if let Some(fdt) = task_fdtable(task) {
+        fdt.set_limit(soft).map_err(|e| e.to_errno())?;
+        synced = true;
+    }
+    for member in task.thread_group().snapshot() {
+        if let Some(fdt) = task_fdtable(&member) {
+            fdt.set_limit(soft).map_err(|e| e.to_errno())?;
+            synced = true;
+        }
+    }
+    if synced { Ok(()) } else { Err(Errno::EBADF) }
 }
 
 fn task_vfs_context(task: &Arc<Task>) -> Option<Arc<vfs::VfsContext>> {

@@ -21,6 +21,7 @@ const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
 const SOCK_RAW: u16 = 3;
 const LOOPBACK_UDP_YIELD_INTERVAL: u64 = 16;
+const TCP_CONNECT_TIMEOUT_NS: u64 = 3_000_000_000;
 
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
 
@@ -555,6 +556,7 @@ impl NetSocketFileOps {
                     .tcp_connect(handle, ep)
                     .map_err(map_net_error)?;
                 if !(self.is_nonblock() || nonblocking) {
+                    let deadline = sched::now_ns_public().saturating_add(TCP_CONNECT_TIMEOUT_NS);
                     loop {
                         let state = net::stack().socket_state(handle);
                         match state {
@@ -564,14 +566,13 @@ impl NetSocketFileOps {
                                 return Ok(());
                             }
                             net::SocketState::Closed => return Err(Errno::ECONNREFUSED),
-                            // FIXME: 阻塞 connect 没有独立超时或错误队列检查，
-                            // 依赖全局 poll 唤醒后再次读取粗粒度 SocketState。
-                            _ => self.yield_wait_until(|| {
-                                matches!(
-                                    net::stack().socket_state(handle),
-                                    net::SocketState::Established | net::SocketState::Closed
-                                )
-                            })?,
+                            _ => {
+                                if sched::now_ns_public() >= deadline {
+                                    return Err(Errno::ETIMEDOUT);
+                                }
+                                net::stack().poll_now();
+                                sched::schedule_once(sched::now_ns_public());
+                            }
                         }
                     }
                 }
@@ -1340,6 +1341,7 @@ fn map_net_error(e: NetError) -> Errno {
         NetError::Closed => Errno::EPIPE,
         NetError::AddressInUse => Errno::EADDRINUSE,
         NetError::TimedOut => Errno::ETIMEDOUT,
+        NetError::Unreachable => Errno::Other(113),
         NetError::InvalidArgument => Errno::EINVAL,
         _ => Errno::EINVAL,
     }

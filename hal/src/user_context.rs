@@ -189,6 +189,24 @@ impl UserTrapFrame {
         }
     }
 
+    pub fn set_current_address_space(&mut self) {
+        #[cfg(target_arch = "loongarch64")]
+        {}
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            let satp: usize;
+            unsafe {
+                core::arch::asm!(
+                    "csrr {satp}, satp",
+                    satp = out(reg) satp,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+            self.inner.satp = satp;
+        }
+    }
+
     pub fn advance_pc(&mut self) {
         #[cfg(target_arch = "loongarch64")]
         {

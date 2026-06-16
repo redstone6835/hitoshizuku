@@ -11,10 +11,11 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use general::TaskOps;
-use sched::arch_hooks::{ArchContextOps, ArchTimeOps, ArchTrapOps, KernelEntry};
+use sched::arch_hooks::{ArchContextOps, ArchIdleOps, ArchTimeOps, ArchTrapOps, KernelEntry};
 
 use crate::riscv64::specific::{current_cpu_id, kernel_timestamp_ns};
 use crate::riscv64::task::Riscv64TaskOps;
+use crate::riscv64::trap::Riscv64InterruptOps;
 
 pub(crate) const KCTX_SIZE: usize = 112; // 14 × u64
 pub(crate) const KCTX_ALIGN: usize = 16;
@@ -129,6 +130,24 @@ static ARCH_TRAP_OPS: ArchTrapOps = ArchTrapOps {
     set_kernel_trap_stack: set_kernel_trap_stack_raw,
 };
 
+static ARCH_IDLE_OPS: ArchIdleOps = ArchIdleOps {
+    idle_relax: riscv64_idle_relax,
+};
+
+fn riscv64_idle_relax() {
+    unsafe {
+        // idle 线程进入等待窗口前必须临时开本地中断，否则 timer/event 只能
+        // 置 pending，无法真正打断 idle 并唤醒睡眠任务。
+        Riscv64InterruptOps::enable_interrupts();
+        if sched::needs_resched(current_cpu_id()) {
+            Riscv64InterruptOps::disable_interrupts();
+            return;
+        }
+        core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        Riscv64InterruptOps::disable_interrupts();
+    }
+}
+
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
 pub fn register() {
@@ -139,6 +158,7 @@ pub fn register() {
         sched::arch_hooks::register(&ARCH_CONTEXT_OPS);
         sched::arch_hooks::register_time(&ARCH_TIME_OPS);
         sched::arch_hooks::register_trap(&ARCH_TRAP_OPS);
+        sched::arch_hooks::register_idle(&ARCH_IDLE_OPS);
         crate::riscv64::mm::register();
         crate::riscv64::syscall::register();
     }
