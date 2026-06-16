@@ -31,6 +31,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
 use crate::riscv64::specific::{kernel_timestamp_ns, phys_to_virt, virt_to_phys};
+use crate::riscv64::time;
 use crate::riscv64::trap;
 use general::dtb::Dtb;
 use general::{
@@ -207,6 +208,41 @@ fn contains_extension(isa: &[u8], ext: &[u8]) -> bool {
     false
 }
 
+fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
+}
+
+/// 解析 RISC-V DTB 的 timebase-frequency，并启动周期性 S-mode timer。
+fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
+    let hz = dtb
+        .root()
+        .and_then(|root| root.find_child("cpus"))
+        .and_then(|cpus| {
+            cpus.find_property("timebase-frequency")
+                .and_then(|prop| read_be_u32_prop(prop.value()))
+                .or_else(|| {
+                    cpus.children()
+                        .filter(|node| node.base_name_bytes().starts_with(b"cpu"))
+                        .find_map(|cpu| {
+                            cpu.find_property("timebase-frequency")
+                                .and_then(|prop| read_be_u32_prop(prop.value()))
+                        })
+                })
+        })
+        .map(|hz| hz as usize)
+        .filter(|&hz| hz != 0)
+        .unwrap_or_else(|| time::STABLE_TIMER_HZ.load(Ordering::Relaxed));
+
+    time::STABLE_TIMER_HZ.store(hz, Ordering::Relaxed);
+    time::init_periodic_timer(time::DEFAULT_TIMER_HZ);
+    log::info!(
+        "[loader] timer configured: stable_hz={} tick_hz={} period_ticks={}",
+        time::stable_counter_hz(),
+        time::timer_hz(),
+        time::timer_period_ticks()
+    );
+}
+
 // ── 堆映射回调 ────────────────────────────────────────────────────────────────
 
 /// allocator 扩展堆时调用，将虚拟地址映射到物理页。
@@ -282,6 +318,9 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
 
     // 检测 ISA 扩展（Zicboz 等）
     detect_isa_extensions(&dtb);
+
+    // 启动 S-mode 周期 timer。sleep/调度 tick 依赖该中断推进。
+    configure_timer_from_dtb(&dtb);
 
     // 构造 StartContext 并移交控制权，从此不再返回
     unsafe {

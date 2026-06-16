@@ -36,6 +36,12 @@ pub const SSTATUS_SUM: usize = 1 << 18; // [18]    S-mode 访问 U 页
 pub const SSTATUS_MXR: usize = 1 << 19; // [19]    execute-only 页可读
 pub const SSTATUS_SD: usize = 1 << 63; // [63]    FS|VS 脏位汇总
 
+// ── sie/sip 位域 ─────────────────────────────────────────────────────────────
+
+pub const SIE_SSIE: usize = 1 << IRQ_S_SOFT; // S-mode 软件中断使能
+pub const SIE_STIE: usize = 1 << IRQ_S_TIMER; // S-mode 定时器中断使能
+pub const SIE_SEIE: usize = 1 << IRQ_S_EXT; // S-mode 外部中断使能
+
 // ── scause ────────────────────────────────────────────────────────────────────
 
 /// 最高位为 1 表示中断，为 0 表示异常。

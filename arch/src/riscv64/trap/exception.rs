@@ -96,26 +96,15 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 
     let from_user = (tf.status & SSTATUS_SPP) == 0;
 
-    // 从用户态进入异常时开中断，允许设备中断在 handler 执行期间被响应。
-    // 这样可以避免在长时间运行的系统调用中错过重要的设备事件。
-    if from_user {
-        set_csr!(sstatus, SSTATUS_SIE);
-    }
-
     if is_interrupt {
         // 对中断而言，最关键的信息是 SCAUSE 位域。与同步异常不同，中断通常不需要 tval，
         // 且多数情况下 PC 只用于诊断，不决定恢复逻辑。
         let intr = decode_interrupt(cause);
-        log::debug!(
-            "[trap][interrupt] {:?} sepc={:#x} cpu={}",
-            intr,
-            tf.sepc,
-            Riscv64MessageInterruptOps::current_cpu_id()
-        );
         // 清除定时器中断标志
         if code == IRQ_S_TIMER {
             // RISC-V 的定时器中断需要软件显式清除，否则在 `sret` 后会立即再次陷入，
             // 形成"看似无法返回"的中断风暴。
+            super::super::time::rearm_periodic_timer();
             let now_ns = kernel_timestamp_ns();
             sched::on_timer_tick(now_ns);
             super::super::vdso::run_timer_tick_hook(now_ns);
@@ -128,6 +117,12 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
             return tf_ptr;
         }
         // 非 timer 中断：SupervisorExternal (PLIC), IPI 等
+        log::debug!(
+            "[trap][interrupt] {:?} sepc={:#x} cpu={}",
+            intr,
+            tf.sepc,
+            Riscv64MessageInterruptOps::current_cpu_id()
+        );
         let now_ns = kernel_timestamp_ns();
         let _ = general::dev::irq::dispatch_interrupt(intr);
         super::super::vdso::run_tty_poll_hook(now_ns);
@@ -139,6 +134,7 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
     } else if code == EXC_ECALL_U || code == EXC_ECALL_S {
         general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
         // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
+        sched::preempt_if_needed(kernel_timestamp_ns());
         tf_ptr
     } else if code == EXC_INST_PAGE_FAULT
         || code == EXC_LOAD_PAGE_FAULT
@@ -160,7 +156,7 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 tf_ptr
             }
             FaultOutcome::Segv => {
-                log::info!(
+                log::debug!(
                     "[trap][mm] user SIGSEGV sepc={:#x} tval={:#x} code={:#x}",
                     tf.sepc,
                     tf.tval,
@@ -243,10 +239,9 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         unsafe { save_fpu_to_frame(tf) };
     }
 
-    // syscall 处理期间开中断，允许 UART 等设备中断被响应
-    set_csr!(sstatus, SSTATUS_SIE);
     general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
     // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
+    sched::preempt_if_needed(kernel_timestamp_ns());
     tf_ptr
 }
 
