@@ -17,9 +17,45 @@ mod syslog;
 use alloc::sync::Arc;
 use general::syscall::register_syscall;
 use sched::Task;
+use sched::ids::{Capability as SchedCapability, Credentials as SchedCredentials};
+use vfs::cred::{
+    CapSet as VfsCapSet, Capability as VfsCapability, Credentials as VfsCredentials, Gid as VfsGid,
+    Uid as VfsUid,
+};
 
 pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
     process::cleanup_task_before_exit(task);
+}
+
+pub(super) fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
+    let mut caps = VfsCapSet::EMPTY;
+    for (sched_cap, vfs_cap) in [
+        (SchedCapability::Chown, VfsCapability::Chown),
+        (SchedCapability::DacOverride, VfsCapability::DacOverride),
+        (SchedCapability::DacReadSearch, VfsCapability::DacReadSearch),
+        (SchedCapability::Fowner, VfsCapability::FOwner),
+        (SchedCapability::Fsetid, VfsCapability::FSetId),
+        (SchedCapability::SysAdmin, VfsCapability::SysAdmin),
+        (SchedCapability::SysBoot, VfsCapability::SysAdmin),
+        (SchedCapability::SysResource, VfsCapability::SysAdmin),
+    ] {
+        if src.has_cap(sched_cap) {
+            caps = caps.with(vfs_cap);
+        }
+    }
+
+    VfsCredentials {
+        uid: VfsUid(src.uid.0),
+        euid: VfsUid(src.euid.0),
+        suid: VfsUid(src.suid.0),
+        fsuid: VfsUid(src.fsuid.0),
+        gid: VfsGid(src.gid.0),
+        egid: VfsGid(src.egid.0),
+        sgid: VfsGid(src.sgid.0),
+        fsgid: VfsGid(src.fsgid.0),
+        groups: src.groups.iter().map(|gid| VfsGid(gid.0)).collect(),
+        caps,
+    }
 }
 
 pub fn register_all() {

@@ -25,7 +25,7 @@ use crate::layout::{
 };
 use crate::map_wr::BlockAllocState;
 use crate::state::{FsState, map_err};
-use crate::{extent_wr, map_wr};
+use crate::{extent_wr, inode::lock_raw, map_wr};
 
 const I_BLOCK_BYTES: usize = 60;
 const MAP_CACHE_MAX_BLOCKS: u32 = 256 * 1024;
@@ -316,7 +316,7 @@ impl ExtRegFileOps {
 impl FileOps for ExtRegFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
         let (flags, size, i_block) = {
-            let g = self.raw.lock();
+            let g = lock_raw(&self.raw);
             let mut i_block = [0u8; I_BLOCK_BYTES];
             i_block.copy_from_slice(crate::inode::i_block_slice(&g.bytes));
             (g.flags(), g.size(), i_block)
@@ -328,7 +328,7 @@ impl FileOps for ExtRegFileOps {
 
         // inline_data 路径
         if flags & EXT4_INLINE_DATA_FL != 0 {
-            let raw_bytes = self.raw.lock().bytes.clone();
+            let raw_bytes = lock_raw(&self.raw).bytes.clone();
             if let Some(inline) =
                 crate::inode::try_inline_data(&self.state, &raw_bytes, size, flags)
             {
@@ -393,7 +393,7 @@ impl FileOps for ExtRegFileOps {
         }
         let _io = self.io_mu.lock();
         {
-            let mut raw_guard = self.raw.lock();
+            let mut raw_guard = lock_raw(&self.raw);
             let old_size = raw_guard.size();
             let start = if offset == u64::MAX { old_size } else { offset };
             let end = start

@@ -26,9 +26,42 @@ if [ -x /sbin/mdev ]; then
     /sbin/mdev -s 2>/dev/null || true
 fi
 
+maybe_enter_shell() {
+    key_file="/tmp/init-key.$$"
+
+    echo "[init] press Ctrl+C within 3 seconds to enter shell"
+    trap 'echo "[init] Ctrl+C detected, entering shell"; exec /bin/sh -i' INT
+    old_stty="$(stty -g < /dev/console 2>/dev/null || true)"
+    stty raw -echo < /dev/console 2>/dev/null || true
+    ( dd bs=1 count=1 of="$key_file" < /dev/console 2>/dev/null ) &
+    key_pid=$!
+    sleep 3
+    if kill -0 "$key_pid" 2>/dev/null; then
+        kill "$key_pid" 2>/dev/null || true
+        wait "$key_pid" 2>/dev/null || true
+    else
+        wait "$key_pid" 2>/dev/null || true
+    fi
+    [ -n "$old_stty" ] && stty "$old_stty" < /dev/console 2>/dev/null || true
+    trap - INT
+
+    key_code="$(od -An -tu1 "$key_file" 2>/dev/null | tr -d '[:space:]')"
+    if [ "$key_code" = "3" ]; then
+        rm -f "$key_file"
+        echo "[init] Ctrl+C detected, entering shell"
+        exec /bin/sh -i
+    fi
+    rm -f "$key_file"
+}
+
 # 测试黑名单
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="ltp unixbench iozone"
+BLACKLIST="unixbench"
+
+LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
+LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
+LTP_SKIP_CASES="${LTP_SKIP_CASES:-clone07 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 crash01 crash02 crypto_user01 crypto_user02 hackbench kill09 pcrypt_aead01}"
+export LTP_TIMEOUT LTP_KILL_GRACE
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do
@@ -51,6 +84,104 @@ _test_teardown() {
     [ -e /dev/tty.real ] && mv /dev/tty.real /dev/tty
 }
 
+kill_ltp_case_group() {
+    target="$1"
+    child="$2"
+
+    kill -TERM "$target" 2>/dev/null || true
+    kill -TERM "$child" 2>/dev/null || true
+    kill -KILL "$target" 2>/dev/null || true
+    kill -KILL "$child" 2>/dev/null || true
+}
+
+run_ltp_case() {
+    file="$1"
+    name="${file##*/}"
+    marker="/tmp/ltp-case-timeout.$$"
+    status="/tmp/ltp-case-status.$$"
+
+    for skip in $LTP_SKIP_CASES; do
+        if [ "$name" = "$skip" ]; then
+            echo "RUN LTP CASE $name"
+            echo "[ltp] 跳过会卡住 runner 的用例：$name"
+            echo "FAIL LTP CASE $name : 124"
+            return 0
+        fi
+    done
+
+    rm -f "$marker" "$status"
+    echo "RUN LTP CASE $name"
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /bin/sh -c '"$1"; echo "$?" > "$2"' sh "$file" "$status" &
+        child=$!
+        kill_target="-$child"
+    else
+        /bin/sh -c '"$1"; echo "$?" > "$2"' sh "$file" "$status" &
+        child=$!
+        kill_target="$child"
+    fi
+
+    elapsed=0
+    while [ ! -f "$status" ]; do
+        if [ "$elapsed" -ge "$LTP_TIMEOUT" ]; then
+            echo "[ltp] 用例超时：$name，超过 ${LTP_TIMEOUT}s"
+            : >"$marker"
+            kill_ltp_case_group "$kill_target" "$child"
+
+            grace=0
+            while [ "$grace" -lt "$LTP_KILL_GRACE" ] && [ ! -f "$status" ]; do
+                sleep 1
+                grace=$((grace + 1))
+            done
+
+            if [ ! -f "$status" ]; then
+                echo "[ltp] 用例已终止但未回收，继续后续用例：$name"
+                rm -f "$marker" "$status"
+                echo "FAIL LTP CASE $name : 124"
+                return 0
+            fi
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    ret="$(cat "$status" 2>/dev/null || echo 124)"
+    kill_ltp_case_group "$kill_target" "$child"
+    wait "$child" 2>/dev/null || true
+
+    if [ -f "$marker" ]; then
+        ret=124
+    fi
+    rm -f "$marker" "$status"
+    echo "FAIL LTP CASE $name : $ret"
+    return 0
+}
+
+run_ltp_script() {
+    script="$1"
+    libc_name="${PWD##*/}"
+    target_dir="ltp/testcases/bin"
+
+    echo "#### OS COMP TEST GROUP START ltp-$libc_name ####"
+    if [ ! -d "$target_dir" ]; then
+        echo "[ltp] LTP 目录不完整：$PWD/$target_dir"
+        echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
+        return 0
+    fi
+
+    echo "[init] 使用 ${script##*/} 触发 LTP，逐用例超时 ${LTP_TIMEOUT}s，跳过：$LTP_SKIP_CASES"
+    for file in "$target_dir"/*; do
+        if [ -f "$file" ]; then
+            run_ltp_case "$file"
+        fi
+    done
+
+    echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
+    return 0
+}
+
 run_test_scripts() {
     _test_setup
     for dir in /mnt/glibc /mnt/musl; do
@@ -64,7 +195,11 @@ run_test_scripts() {
                     echo "[init] skip $name (blacklist)"
                 else
                     echo "[init] run $name"
-                    /bin/sh "$script"
+                    if [ "$name" = "ltp_testcode.sh" ]; then
+                        run_ltp_script "$script"
+                    else
+                        /bin/sh "$script"
+                    fi
                 fi
             done
         fi
@@ -98,6 +233,7 @@ shutdown_after_tests() {
 }
 
 mount -t ext4 /dev/vd0 /mnt 2>/dev/null || true
+maybe_enter_shell
 setup_dynamic_linker
 echo "[init] mount testdisk OK (or skipped)"
 echo "[init] ls /mnt:"

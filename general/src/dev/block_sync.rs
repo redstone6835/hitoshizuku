@@ -2,14 +2,12 @@
 //!
 //! `FsBlockAdapter` 把 [`BlockDevice`] 的 Bio-based API 桥接为
 //! `fatfs::BlockBackend` / `extfs::BlockBackend` 要求的同步 `read_sectors` /
-//! `write_sectors` 接口。内部调用 [`BlockDevice::submit_bio_wait`]，自动根据
-//! 调度器状态选择 WaitQueue 阻塞或自旋等待。
+//! `write_sectors` 接口。内部使用块层同步借用缓冲提交，避免每次文件系统 I/O
+//! 都分配 staging buffer 并做额外 memcpy；等待策略仍由 [`BlockDevice`] 统一维护。
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
-use crate::dev::bio::{BioBuffer, BioError, BioOp, BlockRange};
+use crate::dev::bio::{BioError, BlockRange};
 use crate::dev::block::BlockDevice;
 use crate::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
 
@@ -74,13 +72,10 @@ impl FsBlockAdapter {
         if buf.len() < want {
             return Err(SyncIoError::BufferTooSmall);
         }
-        let owned = zeroed_io_buffer(want)?;
         let range = BlockRange { lba, blocks: count };
-        let bio = self
-            .dev
-            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+        self.dev
+            .submit_bio_wait_borrowed_read(range, &mut buf[..want])
             .map_err(SyncIoError::from)?;
-        buf[..want].copy_from_slice(bio.buffer.as_slice());
         Ok(())
     }
 
@@ -90,11 +85,9 @@ impl FsBlockAdapter {
         if buf.len() < want {
             return Err(SyncIoError::BufferTooSmall);
         }
-        let mut owned = zeroed_io_buffer(want)?;
-        owned.copy_from_slice(&buf[..want]);
         let range = BlockRange { lba, blocks: count };
         self.dev
-            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .submit_bio_wait_borrowed_write(range, &buf[..want])
             .map_err(SyncIoError::from)?;
         Ok(())
     }
@@ -137,14 +130,6 @@ fn checked_io_len(count: u32, bytes_per_sector: usize) -> Option<usize> {
     (count as usize).checked_mul(bytes_per_sector)
 }
 
-fn zeroed_io_buffer(len: usize) -> Result<Box<[u8]>, SyncIoError> {
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(len)
-        .map_err(|_| SyncIoError::OutOfMemory)?;
-    buf.resize(len, 0);
-    Ok(buf.into_boxed_slice())
-}
-
 impl fatfs::BlockBackend for FsBlockAdapter {
     fn sector_size(&self) -> u32 {
         self.sector_size_bytes()
@@ -165,13 +150,10 @@ impl fatfs::BlockBackend for FsBlockAdapter {
         if buf.len() < want {
             return Err(fatfs::BlockBackendError::OutOfRange);
         }
-        let owned = zeroed_io_buffer(want).map_err(|_| fatfs::BlockBackendError::Io)?;
         let range = BlockRange { lba, blocks: count };
-        let bio = self
-            .dev
-            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+        self.dev
+            .submit_bio_wait_borrowed_read(range, &mut buf[..want])
             .map_err(|_| fatfs::BlockBackendError::Io)?;
-        buf[..want].copy_from_slice(bio.buffer.as_slice());
         Ok(())
     }
 
@@ -186,11 +168,9 @@ impl fatfs::BlockBackend for FsBlockAdapter {
         if buf.len() < want {
             return Err(fatfs::BlockBackendError::OutOfRange);
         }
-        let mut owned = zeroed_io_buffer(want).map_err(|_| fatfs::BlockBackendError::Io)?;
-        owned.copy_from_slice(&buf[..want]);
         let range = BlockRange { lba, blocks: count };
         self.dev
-            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .submit_bio_wait_borrowed_write(range, &buf[..want])
             .map_err(|_| fatfs::BlockBackendError::Io)?;
         Ok(())
     }
@@ -216,13 +196,10 @@ impl extfs::BlockBackend for FsBlockAdapter {
         if buf.len() < want {
             return Err(extfs::BlockBackendError::OutOfRange);
         }
-        let owned = zeroed_io_buffer(want).map_err(|_| extfs::BlockBackendError::Io)?;
         let range = BlockRange { lba, blocks: count };
-        let bio = self
-            .dev
-            .submit_bio_wait(BioOp::Read, range, BioBuffer::Owned(owned))
+        self.dev
+            .submit_bio_wait_borrowed_read(range, &mut buf[..want])
             .map_err(|_| extfs::BlockBackendError::Io)?;
-        buf[..want].copy_from_slice(bio.buffer.as_slice());
         Ok(())
     }
 
@@ -237,11 +214,9 @@ impl extfs::BlockBackend for FsBlockAdapter {
         if buf.len() < want {
             return Err(extfs::BlockBackendError::OutOfRange);
         }
-        let mut owned = zeroed_io_buffer(want).map_err(|_| extfs::BlockBackendError::Io)?;
-        owned.copy_from_slice(&buf[..want]);
         let range = BlockRange { lba, blocks: count };
         self.dev
-            .submit_bio_wait(BioOp::Write, range, BioBuffer::Owned(owned))
+            .submit_bio_wait_borrowed_write(range, &buf[..want])
             .map_err(|_| extfs::BlockBackendError::Io)?;
         Ok(())
     }

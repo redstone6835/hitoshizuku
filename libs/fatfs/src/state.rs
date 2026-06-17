@@ -71,10 +71,15 @@ pub(crate) struct FsState {
     pub(crate) fat: FatTable,
     pub(crate) fs_info: Option<FsInfo>,
     pub(crate) read_only: core::sync::atomic::AtomicBool,
+    /// 挂载实例是否被驱动强制为只读。
+    ///
+    /// 该标志来自 `FatFsDriver::new_read_only()`，不同于普通 remount(ro)。
+    /// 强制只读实例不能再通过 remount 切回可写，避免上层把诊断/探测挂载误升级
+    /// 成会修改介质的挂载。
+    force_read_only: bool,
     pub(crate) next_synth_ino: AtomicU64,
     /// 文件系统级写锁：所有修改操作（create/mkdir/unlink/rmdir/rename/write/truncate）
     /// 必须持有此锁。读操作不需要。
-    #[allow(dead_code)]
     pub(crate) write_lock: Spinlock<()>,
 }
 
@@ -94,6 +99,44 @@ impl FsState {
     #[inline]
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn remount_read_only(&self, read_only: bool) -> Result<(), VfsError> {
+        if self.force_read_only && !read_only {
+            return Err(VfsError::ReadOnlyFilesystem);
+        }
+        if read_only {
+            // 切换到只读前必须先等所有写事务退出并刷回 FAT/FSInfo。
+            // 如果先设置 read_only，sync_all() 会按只读挂载直接返回，可能遗漏
+            // 之前已经变脏但尚未写回的 FAT 缓存。
+            let _guard = self.write_lock.lock();
+            if !self.is_read_only() {
+                self.sync_all().map_err(crate::sync_layer::backend_to_vfs)?;
+            }
+            self.read_only.store(true, Ordering::Release);
+        } else {
+            self.read_only.store(false, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// 串行执行一次 FAT 写事务。
+    ///
+    /// FAT 目录项、FAT 表和 FSInfo 没有日志保护；单个 VFS 修改操作可能同时更新
+    /// 多处结构。这里用文件系统级写锁把这些更新收束成互斥事务，防止并发
+    /// create/write/truncate/rename 交错造成目录项和 FAT 链不一致。
+    pub(crate) fn with_write_transaction<R>(
+        &self,
+        f: impl FnOnce() -> VfsResult<R>,
+    ) -> VfsResult<R> {
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFilesystem);
+        }
+        let _guard = self.write_lock.lock();
+        if self.is_read_only() {
+            return Err(VfsError::ReadOnlyFilesystem);
+        }
+        f()
     }
 
     pub(crate) fn alloc_cluster(&self, prev: Option<u32>) -> Result<u32, BlockBackendError> {
@@ -157,6 +200,9 @@ impl FsState {
     }
 
     pub(crate) fn sync_all(&self) -> Result<(), BlockBackendError> {
+        if self.is_read_only() {
+            return Ok(());
+        }
         if let Some(fi) = &self.fs_info {
             self.flush_fs_info(fi)?;
         }
@@ -299,10 +345,7 @@ impl SuperblockOps for FatFsSuperblockOps {
     }
 
     fn remount(&self, _sb: &Arc<Superblock>, new_flags: MountFlags) -> VfsResult<()> {
-        self.state
-            .read_only
-            .store(new_flags.is_rdonly(), Ordering::Release);
-        Ok(())
+        self.state.remount_read_only(new_flags.is_rdonly())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -375,6 +418,7 @@ fn mount_impl(backend: Arc<dyn BlockBackend>, force_ro: bool) -> VfsResult<Arc<S
         fat,
         fs_info,
         read_only: core::sync::atomic::AtomicBool::new(force_ro),
+        force_read_only: force_ro,
         next_synth_ino: AtomicU64::new(1),
         write_lock: Spinlock::new(()),
     });

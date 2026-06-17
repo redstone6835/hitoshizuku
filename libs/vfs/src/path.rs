@@ -298,6 +298,7 @@ fn step(state: &mut WalkState<'_>, name: &str, traverse_mounts: bool) -> VfsResu
 fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsResult<()> {
     let mut components = PathComponents::new(path).peekable();
     let requires_dir = requires_final_directory(path, flags);
+    let cred = state.ctx.cred();
 
     while let Some(component) = components.next() {
         let is_last = components.peek().is_none();
@@ -307,7 +308,7 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
             if let Some(inode) = state.current.inode() {
                 {
                     let meta = inode.meta_snapshot();
-                    if !state.ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                    if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
                         return Err(VfsError::PermissionDenied);
                     }
                 }
@@ -327,6 +328,13 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
                 }
             }
             continue;
+        }
+
+        if let Some(parent_inode) = state.current.inode() {
+            let meta = parent_inode.meta_snapshot();
+            if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                return Err(VfsError::PermissionDenied);
+            }
         }
 
         let traverse_mounts = !flags.has(LookupFlags::NO_MOUNT_LAST);

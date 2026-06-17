@@ -357,6 +357,11 @@ impl FdTable {
         }
     }
 
+    fn release_record_locks_for_removed(removed: &RemovedFd, owner_pid: i32) {
+        crate::vfs::record_lock::release_process_locks_for_file(&removed.entry.file, owner_pid);
+        crate::vfs::lease::release_process_lease_for_file(&removed.entry.file, owner_pid);
+    }
+
     /// 在指定 fd 编号上安装 `file`（用于 `dup2`/`dup3`/标准 fd 初始化）。
     pub fn install_fd(&self, fd: Fd, file: Arc<File>, flags: FdFlags) -> VfsResult<()> {
         let fd = fd.0;
@@ -379,6 +384,39 @@ impl FdTable {
         Ok(())
     }
 
+    /// 在指定 fd 上安装文件，并按当前进程语义释放被替换文件的 record lock。
+    ///
+    /// POSIX byte-range lock 属于进程而不是打开文件描述；因此 `dup2`/标准 fd
+    /// 重定向覆盖旧 fd 时，需要像 `close(oldfd)` 一样释放该进程在旧 inode 上
+    /// 的所有记录锁。普通 VFS 层不主动读取当前任务，把 owner pid 作为参数传入。
+    pub fn install_fd_for_owner(
+        &self,
+        fd: Fd,
+        file: Arc<File>,
+        flags: FdFlags,
+        owner_pid: i32,
+    ) -> VfsResult<()> {
+        let fd = fd.0;
+        let old = {
+            let mut inner = self.inner.lock();
+            if fd >= inner.limit {
+                return Err(VfsError::BadFileDescriptor);
+            }
+            let old = inner.insert(fd, FdEntry { file, flags });
+            old.map(|entry| RemovedFd {
+                fd,
+                last_file_reference: !inner.contains_file(&entry.file),
+                entry,
+            })
+        };
+        if let Some(old) = old.as_ref() {
+            Self::release_record_locks_for_removed(old, owner_pid);
+            self.notify_fd_closed(old);
+        }
+        drop(old);
+        Ok(())
+    }
+
     /// 关闭指定 fd。
     pub fn close_fd(&self, fd: Fd) -> VfsResult<()> {
         let removed = {
@@ -393,6 +431,26 @@ impl FdTable {
         let Some(removed) = removed else {
             return Err(VfsError::BadFileDescriptor);
         };
+        self.notify_fd_closed(&removed);
+        drop(removed);
+        Ok(())
+    }
+
+    /// 关闭 fd，并释放当前进程在该 inode 上持有的 POSIX record lock。
+    pub fn close_fd_for_owner(&self, fd: Fd, owner_pid: i32) -> VfsResult<()> {
+        let removed = {
+            let mut inner = self.inner.lock();
+            let removed = inner.remove(fd.0);
+            removed.map(|entry| RemovedFd {
+                fd: fd.0,
+                last_file_reference: !inner.contains_file(&entry.file),
+                entry,
+            })
+        };
+        let Some(removed) = removed else {
+            return Err(VfsError::BadFileDescriptor);
+        };
+        Self::release_record_locks_for_removed(&removed, owner_pid);
         self.notify_fd_closed(&removed);
         drop(removed);
         Ok(())
@@ -471,6 +529,45 @@ impl FdTable {
             })
         };
         if let Some(replaced) = replaced.as_ref() {
+            self.notify_fd_closed(replaced);
+        }
+        drop(replaced);
+        Ok(new_fd)
+    }
+
+    /// `dup2/dup3` 的进程 owner 版本，用于替换目标 fd 时释放 record lock。
+    pub fn dup2_fd_for_owner(
+        &self,
+        old_fd: Fd,
+        new_fd: Fd,
+        flags: FdFlags,
+        owner_pid: i32,
+    ) -> VfsResult<Fd> {
+        if old_fd == new_fd {
+            return if self.inner.lock().get(old_fd.0).is_some() {
+                Ok(new_fd)
+            } else {
+                Err(VfsError::BadFileDescriptor)
+            };
+        }
+        let replaced = {
+            let mut inner = self.inner.lock();
+            if new_fd.0 >= inner.limit {
+                return Err(VfsError::BadFileDescriptor);
+            }
+            let file = inner
+                .get(old_fd.0)
+                .map(|e| Arc::clone(&e.file))
+                .ok_or(VfsError::BadFileDescriptor)?;
+            let old = inner.insert(new_fd.0, FdEntry { file, flags });
+            old.map(|entry| RemovedFd {
+                fd: new_fd.0,
+                last_file_reference: !inner.contains_file(&entry.file),
+                entry,
+            })
+        };
+        if let Some(replaced) = replaced.as_ref() {
+            Self::release_record_locks_for_removed(replaced, owner_pid);
             self.notify_fd_closed(replaced);
         }
         drop(replaced);
@@ -695,6 +792,76 @@ impl FdTable {
             if batch_count < BATCH {
                 break;
             }
+        }
+    }
+
+    /// `close_range` 的进程 owner 版本，用于批量释放 record lock。
+    pub fn close_range_for_owner(&self, first: u32, last: u32, cloexec_only: bool, owner_pid: i32) {
+        if cloexec_only {
+            self.close_range(first, last, true);
+            return;
+        }
+
+        const BATCH: usize = 64;
+        let mut batch_buf: [Option<RemovedFd>; BATCH] = core::array::from_fn(|_| None);
+        loop {
+            let mut batch_count = 0;
+            {
+                let mut inner = self.inner.lock();
+                if first >= inner.hard_limit {
+                    break;
+                }
+                let upper = last.min(inner.hard_limit.saturating_sub(1));
+                for word_idx in 0..inner.bitmap.len() {
+                    let word_start = word_idx as u32 * 64;
+                    if word_start > upper {
+                        break;
+                    }
+                    let mut word = inner.bitmap[word_idx];
+                    while word != 0 {
+                        let bit = word.trailing_zeros();
+                        let fd = word_idx as u32 * 64 + bit;
+                        word &= word - 1;
+                        if fd < first || fd > upper {
+                            continue;
+                        }
+                        if let Some(removed) = inner.remove(fd) {
+                            let last_file_reference = !inner.contains_file(&removed.file);
+                            batch_buf[batch_count] = Some(RemovedFd {
+                                fd,
+                                entry: removed,
+                                last_file_reference,
+                            });
+                            batch_count += 1;
+                            if batch_count >= BATCH {
+                                break;
+                            }
+                        }
+                    }
+                    if batch_count >= BATCH {
+                        break;
+                    }
+                }
+            }
+            for entry in batch_buf[..batch_count].iter_mut() {
+                if let Some(removed) = entry.take() {
+                    Self::release_record_locks_for_removed(&removed, owner_pid);
+                    self.notify_fd_closed(&removed);
+                    drop(removed);
+                }
+            }
+            if batch_count < BATCH {
+                break;
+            }
+        }
+    }
+
+    /// 进程退出时 fdtable 会整体丢弃；这里先释放该进程所有 record lock，再
+    /// 让 `Arc<File>` 正常 drop，避免 zombie 期间留下阻塞其它进程的记录锁。
+    pub fn release_all_record_locks_for_owner(&self, owner_pid: i32) {
+        for (_, file) in self.snapshot_fds() {
+            crate::vfs::record_lock::release_process_locks_for_file(&file, owner_pid);
+            crate::vfs::lease::release_process_lease_for_file(&file, owner_pid);
         }
     }
 

@@ -18,7 +18,6 @@ RV_CROSS_COMPILE := riscv64-linux-musl-
 RV_KERNEL := kernel-rv
 
 BUSYBOX_SRC := third/busybox-1.36.1
-LUA_SRC := third/lua
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
@@ -36,9 +35,9 @@ kernel-rv: cargo-setup rootfs-rv
 		cargo build -p kernel --target $(RV_TARGET) --features embedded-initramfs --release
 	cp target/$(RV_TARGET)/release/kernel $(RV_KERNEL)
 
-rootfs-la: $(LA_ROOTFS)/bin/busybox $(LA_ROOTFS)/bin/lua
+rootfs-la: $(LA_ROOTFS)/bin/busybox
 
-rootfs-rv: $(RV_ROOTFS)/bin/busybox $(RV_ROOTFS)/bin/lua
+rootfs-rv: $(RV_ROOTFS)/bin/busybox
 
 $(LA_ROOTFS)/bin/busybox:
 	$(MAKE) rootfs-busybox ROOTFS_DIR=$(LA_ROOTFS) CROSS_COMPILE=$(LA_CROSS_COMPILE)
@@ -46,13 +45,7 @@ $(LA_ROOTFS)/bin/busybox:
 $(RV_ROOTFS)/bin/busybox:
 	$(MAKE) rootfs-busybox ROOTFS_DIR=$(RV_ROOTFS) CROSS_COMPILE=$(RV_CROSS_COMPILE)
 
-$(LA_ROOTFS)/bin/lua:
-	$(MAKE) rootfs-lua ROOTFS_DIR=$(LA_ROOTFS) CROSS_COMPILE=$(LA_CROSS_COMPILE)
-
-$(RV_ROOTFS)/bin/lua:
-	$(MAKE) rootfs-lua ROOTFS_DIR=$(RV_ROOTFS) CROSS_COMPILE=$(RV_CROSS_COMPILE)
-
-.PHONY: rootfs-busybox rootfs-lua
+.PHONY: rootfs-busybox
 rootfs-busybox:
 	$(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
 	sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' $(BUSYBOX_SRC)/.config
@@ -64,15 +57,6 @@ rootfs-busybox:
 	$(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) CONFIG_PREFIX=$(abspath $(ROOTFS_DIR)) install
 	-$(CROSS_COMPILE)strip $(ROOTFS_DIR)/bin/busybox
 	$(MAKE) -C $(BUSYBOX_SRC) distclean
-
-rootfs-lua:
-	$(MAKE) -C $(LUA_SRC) all CC=$(CROSS_COMPILE)gcc \
-		MYCFLAGS="-std=c99 -static -fPIE -DLUA_USE_POSIX" \
-		MYLDFLAGS=-static MYLIBS=-lm -j$(JOBS)
-	mkdir -p $(ROOTFS_DIR)/bin
-	cp $(LUA_SRC)/lua $(ROOTFS_DIR)/bin/lua
-	-$(CROSS_COMPILE)strip $(ROOTFS_DIR)/bin/lua
-	$(MAKE) -C $(LUA_SRC) clean
 
 clean:
 	cargo clean

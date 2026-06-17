@@ -21,6 +21,160 @@ pub(super) const MIN_QUEUE_SIZE: u16 = 4;
 /// 设备 status 初始填充值。任何非 OK/UNSUPP 的最终值都按设备错误处理。
 pub(super) const STATUS_PENDING: u8 = 0xff;
 
+/// 一次在途 virtio-blk BIO 的驱动私有状态。
+///
+/// 传输层只负责把请求提交给具体总线并通知设备；descriptor head 到 BIO、DMA
+/// 缓冲与 used ring 校验状态的所有权由公共队列核心维护，避免 MMIO/PCI 两条路径
+/// 在错误恢复和资源回收上产生语义差异。
+pub(super) struct VirtioBlkPendingRequest {
+    pub bio: Bio,
+    pub meta_dma: DmaBuffer,
+    pub data_dma: Option<DmaBuffer>,
+    /// 设备完成时至少应写回的字节数，用于发现 used ring 短写。
+    pub expected_device_write_len: u32,
+}
+
+/// virtio-blk 的传输无关队列核心。
+///
+/// 这个结构只包含 split virtqueue、DMA 缓冲池和 pending 表；真正的寄存器访问、
+/// notify 地址和中断 ack 仍留在各传输层驱动中。这样块协议热路径可以复用同一套
+/// O(1) 完成查找、DMA 复用和失败回收逻辑，同时不把 PCI/MMIO 细节混进公共层。
+pub(super) struct VirtioBlkQueueCore {
+    queue: SplitVirtQueue,
+    /// 请求头/status 的小 DMA 缓冲复用池。
+    meta_pool: alloc::vec::Vec<DmaBuffer>,
+    /// 数据 DMA 缓冲复用池。只缓存已经完成或尚未发布给设备的缓冲。
+    data_pool: DmaBufferPool,
+    /// descriptor head 到在途 BIO 的直接映射。
+    pending: alloc::vec::Vec<Option<VirtioBlkPendingRequest>>,
+    /// 队列协议错误后不再接受新请求。
+    failed: bool,
+}
+
+// Safety: 队列内部的 DMA 指针和 pending 表必须由外层队列锁串行访问；该类型本身
+// 不提供并发可变入口，传输层以 Mutex 包裹后跨 CPU 使用。
+unsafe impl Send for VirtioBlkQueueCore {}
+unsafe impl Sync for VirtioBlkQueueCore {}
+
+impl VirtioBlkQueueCore {
+    pub fn new(queue: SplitVirtQueue) -> Self {
+        let mut pending = alloc::vec::Vec::with_capacity(usize::from(queue.queue_size()));
+        pending.resize_with(usize::from(queue.queue_size()), || None);
+        let meta_pool = alloc::vec::Vec::with_capacity(usize::from(queue.queue_size()));
+        let dma_context = queue.dma_context();
+        Self {
+            queue,
+            meta_pool,
+            data_pool: DmaBufferPool::new(
+                pending.len() as u16,
+                dma_context,
+                DmaBufferPoolProfile::virtio_block_default(),
+            ),
+            pending,
+            failed: false,
+        }
+    }
+
+    pub const fn split_queue(&self) -> &SplitVirtQueue {
+        &self.queue
+    }
+
+    pub fn split_queue_mut(&mut self) -> &mut SplitVirtQueue {
+        &mut self.queue
+    }
+
+    pub const fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub fn take_pending(&mut self, head: u16) -> Option<VirtioBlkPendingRequest> {
+        self.pending
+            .get_mut(usize::from(head))
+            .and_then(Option::take)
+    }
+
+    pub fn set_pending(
+        &mut self,
+        head: u16,
+        pending: VirtioBlkPendingRequest,
+    ) -> Result<(), VirtioBlkPendingRequest> {
+        let Some(slot) = self.pending.get_mut(usize::from(head)) else {
+            return Err(pending);
+        };
+        if slot.is_some() {
+            return Err(pending);
+        }
+        *slot = Some(pending);
+        Ok(())
+    }
+
+    pub fn mark_failed_and_take_pending(
+        &mut self,
+    ) -> alloc::vec::Vec<Option<VirtioBlkPendingRequest>> {
+        self.failed = true;
+        let mut failed = alloc::vec::Vec::new();
+        core::mem::swap(&mut failed, &mut self.pending);
+        failed
+    }
+
+    pub fn recycle_request_dma(&mut self, meta_dma: DmaBuffer, data_dma: Option<DmaBuffer>) {
+        self.recycle_meta_dma(meta_dma);
+        if let Some(data_dma) = data_dma {
+            self.recycle_data_dma(data_dma);
+        }
+    }
+
+    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
+        self.meta_pool.pop()
+    }
+
+    pub fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
+        if self.meta_pool.len() < usize::from(self.queue.queue_size()) {
+            self.meta_pool.push(meta_dma);
+        }
+    }
+
+    fn take_data_dma(
+        &mut self,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBuffer> {
+        self.data_pool.take(len, align, direction)
+    }
+
+    pub fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {
+        self.data_pool.recycle(data_dma);
+    }
+}
+
+impl VirtioBlkDmaQueue for VirtioBlkQueueCore {
+    fn split_queue(&mut self) -> &mut SplitVirtQueue {
+        self.split_queue_mut()
+    }
+
+    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
+        Self::take_meta_dma(self)
+    }
+
+    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
+        Self::recycle_meta_dma(self, meta_dma);
+    }
+
+    fn take_data_dma(
+        &mut self,
+        len: usize,
+        align: usize,
+        direction: DmaDirection,
+    ) -> Option<DmaBuffer> {
+        Self::take_data_dma(self, len, align, direction)
+    }
+
+    fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {
+        Self::recycle_data_dma(self, data_dma);
+    }
+}
+
 /// virtio-blk 队列编号。
 ///
 /// 单队列设备使用默认 I/O 队列；后续接入多队列时，传输层只需要替换队列选择

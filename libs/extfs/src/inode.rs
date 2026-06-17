@@ -20,7 +20,7 @@ use vfs::error::{VfsError, VfsResult};
 use vfs::file::{FileOps, OpenOptions};
 use vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use vfs::stat::{DevId, FileMode, FileType, Timespec};
-use vfs::sync::Spinlock;
+use vfs::sync::{Spinlock, SpinlockGuard};
 
 use crate::inode_wr::{RawInode, read_raw, write_raw};
 use crate::layout::*;
@@ -120,6 +120,20 @@ fn copy_i_block(i_block: &[u8]) -> [u8; I_BLOCK_BYTES] {
     out
 }
 
+/// 获取 inode 原始状态锁；等待时让出 CPU，避免单核上纯自旋饿死持锁 I/O 任务。
+pub(crate) fn lock_raw(raw: &Spinlock<RawInode>) -> SpinlockGuard<'_, RawInode> {
+    loop {
+        if let Some(guard) = raw.try_lock() {
+            return guard;
+        }
+        if sched::is_ready() {
+            sched::schedule_once(sched::now_ns_public());
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// 当 `EXT4_INLINE_DATA_FL` 启用时,尝试读出内联数据。
 pub(crate) fn try_inline_data(
     state: &FsState,
@@ -208,22 +222,22 @@ impl ExtInodeOps {
     }
 
     fn snapshot_meta(&self) -> InodeMetaDisk {
-        let g = self.raw.lock();
+        let g = lock_raw(&self.raw);
         parse_inode_meta(&g.bytes)
     }
 
     fn snapshot_i_block(&self) -> [u8; I_BLOCK_BYTES] {
-        let g = self.raw.lock();
+        let g = lock_raw(&self.raw);
         copy_i_block(i_block_slice(&g.bytes))
     }
 
     #[allow(dead_code)]
     fn snapshot_flags(&self) -> u32 {
-        self.raw.lock().flags()
+        lock_raw(&self.raw).flags()
     }
 
     fn snapshot_all(&self) -> (u32, u64, [u8; I_BLOCK_BYTES]) {
-        let g = self.raw.lock();
+        let g = lock_raw(&self.raw);
         (g.flags(), g.size(), copy_i_block(i_block_slice(&g.bytes)))
     }
 
@@ -399,7 +413,7 @@ impl InodeOps for ExtInodeOps {
             .map_err(map_err)?;
 
         // 在父目录插 entry
-        let mut parent = self.raw.lock();
+        let mut parent = lock_raw(&self.raw);
         let mut i_block = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
@@ -472,7 +486,7 @@ impl InodeOps for ExtInodeOps {
         write_raw(&self.state, &new_raw).map_err(map_err)?;
 
         // 父目录:插 entry + nlink++
-        let mut parent = self.raw.lock();
+        let mut parent = lock_raw(&self.raw);
         let mut pi_block = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
@@ -509,7 +523,7 @@ impl InodeOps for ExtInodeOps {
             return Err(VfsError::IsADirectory);
         }
         // 1) 从父目录移除 entry
-        let mut parent = self.raw.lock();
+        let mut parent = lock_raw(&self.raw);
         let pi_block = copy_i_block(parent.i_block());
         let pflags = parent.flags();
         let ok = dir_wr::remove_entry(
@@ -538,7 +552,7 @@ impl InodeOps for ExtInodeOps {
         let t_ops = target
             .downcast_ops::<ExtInodeOps>()
             .ok_or(VfsError::InvalidArgument)?;
-        let mut traw = t_ops.raw.lock();
+        let mut traw = lock_raw(&t_ops.raw);
         let nl = traw.nlink().saturating_sub(1);
         traw.set_nlink(nl);
         write_raw(&self.state, &traw).map_err(map_err)?;
@@ -559,7 +573,7 @@ impl InodeOps for ExtInodeOps {
             .downcast_ops::<ExtInodeOps>()
             .ok_or(VfsError::InvalidArgument)?;
         {
-            let traw = t_ops.raw.lock();
+            let traw = lock_raw(&t_ops.raw);
             let tib = copy_i_block(i_block_slice(&traw.bytes));
             if !crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
                 .map_err(map_err)?
@@ -568,7 +582,7 @@ impl InodeOps for ExtInodeOps {
             }
         }
         // 从父目录移除
-        let mut parent = self.raw.lock();
+        let mut parent = lock_raw(&self.raw);
         let pib = copy_i_block(parent.i_block());
         let pflags = parent.flags();
         dir_wr::remove_entry(
@@ -592,7 +606,7 @@ impl InodeOps for ExtInodeOps {
 
         // 目标目录已从父目录摘除。这里只把目标目录 nlink 置 0 并写回；
         // 数据块和 inode 位图必须等最后一个打开引用释放时由 evict() 回收。
-        let mut traw = t_ops.raw.lock();
+        let mut traw = lock_raw(&t_ops.raw);
         traw.set_nlink(0);
         write_raw(&self.state, &traw).map_err(map_err)?;
         sync_vfs_meta(&target, &traw);
@@ -642,7 +656,7 @@ impl InodeOps for ExtInodeOps {
         write_raw(&self.state, &new_raw).map_err(map_err)?;
 
         // 父目录插 entry
-        let mut parent = self.raw.lock();
+        let mut parent = lock_raw(&self.raw);
         let mut pib = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
@@ -685,12 +699,12 @@ impl InodeOps for ExtInodeOps {
             .ok_or(VfsError::InvalidArgument)?;
         // nlink++
         {
-            let mut traw = t_ops.raw.lock();
+            let mut traw = lock_raw(&t_ops.raw);
             let new_nl = traw.nlink() + 1;
             traw.set_nlink(new_nl);
             write_raw(&self.state, &traw).map_err(map_err)?;
         }
-        sync_vfs_meta(target, &t_ops.raw.lock());
+        sync_vfs_meta(target, &lock_raw(&t_ops.raw));
 
         // 父目录插 entry
         let file_type_val = match target.kind() {
@@ -702,7 +716,7 @@ impl InodeOps for ExtInodeOps {
             FileType::Socket => DT_SOCK,
             FileType::Directory => unreachable!(),
         };
-        let mut parent = self.raw.lock();
+        let mut parent = lock_raw(&self.raw);
         let mut pib = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
@@ -756,7 +770,7 @@ impl InodeOps for ExtInodeOps {
                 let eops = existing
                     .downcast_ops::<ExtInodeOps>()
                     .ok_or(VfsError::InvalidArgument)?;
-                let traw = eops.raw.lock();
+                let traw = lock_raw(&eops.raw);
                 let tib = copy_i_block(i_block_slice(&traw.bytes));
                 let empty = crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
                     .map_err(map_err)?;
@@ -788,7 +802,7 @@ impl InodeOps for ExtInodeOps {
             FileType::Socket => DT_SOCK,
         };
         if cross_dir {
-            let mut ndir = new_dir_ops.raw.lock();
+            let mut ndir = lock_raw(&new_dir_ops.raw);
             let mut ib = copy_i_block(ndir.i_block());
             let mut flags = ndir.flags();
             let new_size = dir_wr::insert_entry(
@@ -817,7 +831,7 @@ impl InodeOps for ExtInodeOps {
         }
         // 从源目录移除 old_name 条目;跨目录时顺手减 nlink
         {
-            let mut parent = self.raw.lock();
+            let mut parent = lock_raw(&self.raw);
             let mut ib = copy_i_block(parent.i_block());
             let mut flags = parent.flags();
             dir_wr::remove_entry(
@@ -863,7 +877,7 @@ impl InodeOps for ExtInodeOps {
                 .downcast_ops::<ExtInodeOps>()
                 .ok_or(VfsError::InvalidArgument)?;
             let tib = {
-                let g = tops.raw.lock();
+                let g = lock_raw(&tops.raw);
                 (
                     copy_i_block(i_block_slice(&g.bytes)),
                     g.flags(),
@@ -882,7 +896,7 @@ impl InodeOps for ExtInodeOps {
         if file_type_from_mode(meta.mode) != FileType::Regular {
             return Err(VfsError::InvalidArgument);
         }
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         let cur_size = raw.size();
         if new_size == cur_size {
             return Ok(());
@@ -938,7 +952,7 @@ impl InodeOps for ExtInodeOps {
         mtime: Option<Timespec>,
     ) -> VfsResult<()> {
         self.check_writable()?;
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         if let Some(ts) = atime {
             raw.set_atime_sec(ts.secs);
         }
@@ -952,7 +966,7 @@ impl InodeOps for ExtInodeOps {
 
     fn chmod(&self, inode: &Inode, mode: FileMode) -> VfsResult<()> {
         self.check_writable()?;
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         let cur = raw.mode();
         raw.set_mode((cur & S_IFMT) | (mode.bits() & 0o7777));
         write_raw(&self.state, &raw).map_err(map_err)?;
@@ -962,7 +976,7 @@ impl InodeOps for ExtInodeOps {
 
     fn chown(&self, inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> VfsResult<()> {
         self.check_writable()?;
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         if let Some(u) = uid {
             raw.set_uid(u.0);
         }
@@ -1026,7 +1040,7 @@ impl InodeOps for ExtInodeOps {
         }
 
         let is_dir = inode.kind() == FileType::Directory;
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         if raw.nlink() != 0 || raw.mode() == 0 {
             return;
         }

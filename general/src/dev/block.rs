@@ -682,13 +682,15 @@ impl BlockDevice {
         self.validate_bio(op, range, &buffer)?;
         let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
         let submitted_ns = sched::now_ns_public();
-        let (bio, completion) = Bio::new_with_observer(
+        let completion = Completion::new();
+        let bio = Bio::new_with_completion_observer(
             op,
             range,
             buffer,
             self.geometry.logical_block_size(),
             submitted_ns,
             Some(observer),
+            Arc::clone(&completion),
         );
         self.io_stats.begin(op);
         if let Err((err, _bio)) = self.driver.queue_bio(bio) {
@@ -713,6 +715,33 @@ impl BlockDevice {
         completion.wait()
     }
 
+    /// 同步读取到调用者提供的缓冲区。
+    ///
+    /// 该接口专供文件系统同步后端等短生命周期调用者使用：BIO 在函数返回前必定
+    /// 完成，因此底层驱动可以复用同一条提交路径，而无需为每次读额外分配中转
+    /// `Box<[u8]>` 再拷贝回调用者缓冲。
+    pub fn submit_bio_wait_borrowed_read(
+        self: &Arc<Self>,
+        range: BlockRange,
+        buf: &mut [u8],
+    ) -> Result<(), BioError> {
+        self.submit_bio_wait(BioOp::Read, range, BioBuffer::borrowed_read(buf))
+            .map(|_| ())
+    }
+
+    /// 同步写入调用者提供的缓冲区。
+    ///
+    /// 借用缓冲只在本次同步提交期间有效；函数返回后驱动不得再保存或访问该指针。
+    /// 这保持了块层 API 的拥有式异步语义，同时消除同步写路径的 staging 分配和复制。
+    pub fn submit_bio_wait_borrowed_write(
+        self: &Arc<Self>,
+        range: BlockRange,
+        buf: &[u8],
+    ) -> Result<(), BioError> {
+        self.submit_bio_wait(BioOp::Write, range, BioBuffer::borrowed_write(buf))
+            .map(|_| ())
+    }
+
     /// 异步提交，返回 `BioFuture`。
     pub fn submit_bio_async(
         self: &Arc<Self>,
@@ -723,7 +752,7 @@ impl BlockDevice {
         self.validate_bio(op, range, &buffer)?;
         let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
         let submitted_ns = sched::now_ns_public();
-        let (bio, completion) = Bio::new_with_observer(
+        let (bio, completion) = Bio::new_shared_with_observer(
             op,
             range,
             buffer,
@@ -846,14 +875,19 @@ impl BlockDevice {
                     BioReqError::BufferSizeMismatch,
                 )));
             }
+            if !buffer.accepts_op(op) {
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::BufferSizeMismatch,
+                )));
+            }
             if let Some(alignment) = self.limits.buffer_alignment() {
                 let align = alignment.get() as usize;
-                if let BioBuffer::Owned(b) = buffer {
-                    if !(b.as_ptr() as usize).is_multiple_of(align) {
-                        return Err(BioError::Submit(SubmitError::InvalidRequest(
-                            BioReqError::Misaligned,
-                        )));
-                    }
+                if let Some(addr) = buffer.ptr_addr()
+                    && !addr.is_multiple_of(align)
+                {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::Misaligned,
+                    )));
                 }
             }
         }

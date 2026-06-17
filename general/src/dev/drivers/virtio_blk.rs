@@ -13,7 +13,6 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::mem;
 use core::num::NonZeroU32;
 use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -21,19 +20,19 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::mutex::Mutex;
 
 use super::virtio_block_common::{
-    DmaBufferPool, DmaBufferPoolProfile, MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE,
-    VirtioBlkAllocatedRequest, VirtioBlkCapabilities, VirtioBlkConfigReader, VirtioBlkDmaQueue,
-    VirtioBlkQueueId, VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits,
-    free_allocated_request, negotiate_supported_features, read_device_config, status_to_result,
+    MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest, VirtioBlkCapabilities,
+    VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore, VirtioBlkQueueId,
+    VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits, free_allocated_request,
+    negotiate_supported_features, read_device_config, status_to_result,
     validate_bio_buffer_for_plan, validate_used_write_len, write_allocated_request_descriptors,
     write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
-use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, SubmitError};
+use crate::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
-use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
+use crate::dev::dma::DmaContext;
 use crate::dev::function::BlockFunction;
 use crate::dev::platform::PlatformDeviceInfo;
 use crate::dev::pnp::{
@@ -59,145 +58,7 @@ const MMIO_DEVICE_ID: usize = 0x008;
 // MMIO 传输层中设备类型 config 的起始偏移；字段语义由 virtio-blk 公共层解析。
 const BLK_CFG_BASE: usize = 0x100;
 
-// ───────── VirtIO 数据结构 ─────────
-
-struct PendingVirtioRequest {
-    bio: Bio,
-    meta_dma: DmaBuffer,
-    data_dma: Option<DmaBuffer>,
-    /// 设备完成时至少应写回的字节数，用于发现 used ring 短写。
-    expected_device_write_len: u32,
-}
-
 // ───────── 驱动内部状态 ─────────
-
-struct VirtioBlkQueue {
-    /// 公共 split virtqueue 负责 DMA 布局、描述符状态和 ring 索引维护。
-    queue: SplitVirtQueue,
-    /// 请求头/status 的小 DMA 缓冲复用池。
-    ///
-    /// L1/L2 小 I/O 会把每次 BIO 的元数据 DMA 分配成本放大。metadata 只在设备把
-    /// used ring 发布后才回收，且所有访问都在队列锁内完成，因此不会与在途请求共享。
-    meta_pool: Vec<DmaBuffer>,
-    /// 数据 DMA 缓冲复用池。只缓存已经完成或尚未发布给设备的缓冲。
-    data_pool: DmaBufferPool,
-    /// 描述符 head 到在途请求的直接映射。
-    ///
-    /// bench 的 L1/L2 裸块设备测试会放大每次完成的 CPU 开销。used ring 已经返回
-    /// descriptor head，用固定表 O(1) 取回请求，避免中断/轮询热路径随队列深度线性扫描。
-    pending: Vec<Option<PendingVirtioRequest>>,
-    /// 队列协议错误后拒绝新请求；此时设备已被标记 FAILED。
-    failed: bool,
-}
-
-// Safety: VirtioBlkQueue 的裸指针指向 DMA 内存，由 Mutex 保护并发访问
-unsafe impl Send for VirtioBlkQueue {}
-unsafe impl Sync for VirtioBlkQueue {}
-
-impl VirtioBlkQueue {
-    fn new(queue: SplitVirtQueue) -> Self {
-        let mut pending = Vec::with_capacity(usize::from(queue.queue_size()));
-        pending.resize_with(usize::from(queue.queue_size()), || None);
-        let meta_pool = Vec::with_capacity(usize::from(queue.queue_size()));
-        let dma_context = queue.dma_context();
-        Self {
-            queue,
-            meta_pool,
-            data_pool: DmaBufferPool::new(
-                pending.len() as u16,
-                dma_context,
-                DmaBufferPoolProfile::virtio_block_default(),
-            ),
-            pending,
-            failed: false,
-        }
-    }
-
-    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
-        self.meta_pool.pop()
-    }
-
-    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
-        if self.meta_pool.len() < usize::from(self.queue.queue_size()) {
-            self.meta_pool.push(meta_dma);
-        }
-    }
-
-    fn take_data_dma(
-        &mut self,
-        len: usize,
-        align: usize,
-        direction: DmaDirection,
-    ) -> Option<DmaBuffer> {
-        self.data_pool.take(len, align, direction)
-    }
-
-    fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {
-        self.data_pool.recycle(data_dma);
-    }
-
-    fn recycle_request_dma(&mut self, meta_dma: DmaBuffer, data_dma: Option<DmaBuffer>) {
-        self.recycle_meta_dma(meta_dma);
-        if let Some(data_dma) = data_dma {
-            self.recycle_data_dma(data_dma);
-        }
-    }
-
-    fn take_pending(&mut self, head: u16) -> Option<PendingVirtioRequest> {
-        self.pending
-            .get_mut(usize::from(head))
-            .and_then(Option::take)
-    }
-
-    fn set_pending(
-        &mut self,
-        head: u16,
-        pending: PendingVirtioRequest,
-    ) -> Result<(), PendingVirtioRequest> {
-        let Some(slot) = self.pending.get_mut(usize::from(head)) else {
-            return Err(pending);
-        };
-        if slot.is_some() {
-            return Err(pending);
-        }
-        *slot = Some(pending);
-        Ok(())
-    }
-
-    fn mark_failed_and_take_pending(&mut self) -> Vec<Option<PendingVirtioRequest>> {
-        self.failed = true;
-        let mut failed = Vec::new();
-        mem::swap(&mut failed, &mut self.pending);
-        failed
-    }
-}
-
-impl VirtioBlkDmaQueue for VirtioBlkQueue {
-    fn split_queue(&mut self) -> &mut SplitVirtQueue {
-        &mut self.queue
-    }
-
-    fn take_meta_dma(&mut self) -> Option<DmaBuffer> {
-        Self::take_meta_dma(self)
-    }
-
-    fn recycle_meta_dma(&mut self, meta_dma: DmaBuffer) {
-        Self::recycle_meta_dma(self, meta_dma);
-    }
-
-    fn take_data_dma(
-        &mut self,
-        len: usize,
-        align: usize,
-        direction: DmaDirection,
-    ) -> Option<DmaBuffer> {
-        Self::take_data_dma(self, len, align, direction)
-    }
-
-    fn recycle_data_dma(&mut self, data_dma: DmaBuffer) {
-        Self::recycle_data_dma(self, data_dma);
-    }
-}
 
 struct VirtioBlkInner {
     /// MMIO 传输层，封装 legacy/modern 寄存器差异。
@@ -211,7 +72,7 @@ struct VirtioBlkInner {
     /// 当前用于通用块 I/O 的 virtqueue 编号。
     queue_id: VirtioBlkQueueId,
     /// 队列
-    queue: Mutex<VirtioBlkQueue>,
+    queue: Mutex<VirtioBlkQueueCore>,
     /// 中断计数（用于轮询模式）
     irq_count: AtomicUsize,
 }
@@ -373,14 +234,14 @@ impl VirtioBlk {
             block_size,
             capabilities,
             queue_id,
-            queue: Mutex::new(VirtioBlkQueue::new(split_queue)),
+            queue: Mutex::new(VirtioBlkQueueCore::new(split_queue)),
             irq_count: AtomicUsize::new(0),
         });
 
         Ok(Self { inner })
     }
 
-    fn complete_failed_requests(pending: Vec<Option<PendingVirtioRequest>>, error: BioIoError) {
+    fn complete_failed_requests(pending: Vec<Option<VirtioBlkPendingRequest>>, error: BioIoError) {
         for pending in pending.into_iter().flatten() {
             pending.bio.complete(Err(error));
         }
@@ -388,9 +249,9 @@ impl VirtioBlk {
 
     fn fail_queue_locked(
         &self,
-        queue: &mut VirtioBlkQueue,
+        queue: &mut VirtioBlkQueueCore,
         reason: &'static str,
-    ) -> Vec<Option<PendingVirtioRequest>> {
+    ) -> Vec<Option<VirtioBlkPendingRequest>> {
         log::printk!("[virtio-mmio-blk] queue failed: {}", reason);
         self.inner.transport.add_status(VIRTIO_STATUS_FAILED);
         queue.mark_failed_and_take_pending()
@@ -401,7 +262,7 @@ impl VirtioBlk {
         let mut queue = self.inner.queue.lock();
 
         loop {
-            let used = match queue.queue.pop_used() {
+            let used = match queue.split_queue_mut().pop_used() {
                 Ok(Some(used)) => used,
                 Ok(None) => break,
                 Err(_) => {
@@ -427,7 +288,7 @@ impl VirtioBlk {
                 Self::complete_failed_requests(failed, BioIoError::Unavailable);
                 return;
             };
-            let PendingVirtioRequest {
+            let VirtioBlkPendingRequest {
                 mut bio,
                 meta_dma,
                 mut data_dma,
@@ -445,7 +306,11 @@ impl VirtioBlk {
             }
             queue.recycle_meta_dma(meta_dma);
 
-            if queue.queue.free_chain_from_head(desc_head).is_err() {
+            if queue
+                .split_queue_mut()
+                .free_chain_from_head(desc_head)
+                .is_err()
+            {
                 let failed =
                     self.fail_queue_locked(&mut queue, "completed descriptor chain corrupt");
                 drop(queue);
@@ -462,7 +327,8 @@ impl VirtioBlk {
             // 大块顺序读的回拷放到队列锁外,避免 L1/L5 1MiB 请求长时间阻塞提交路径。
             drop(queue);
             if copy_read_data {
-                if let (BioBuffer::Owned(buf), Some(dma)) = (&mut bio.buffer, data_dma.as_ref()) {
+                if let Some(dma) = data_dma.as_ref() {
+                    let buf = bio.buffer.as_mut_slice();
                     if dma.as_slice().len() < buf.len() {
                         result = Err(BioIoError::Unavailable);
                     } else {
@@ -517,10 +383,10 @@ impl VirtioBlk {
         let queue_guard = self.inner.queue.lock();
         let limits = block_limits(
             block_size,
-            queue_guard.queue.dma_context(),
+            queue_guard.split_queue().dma_context(),
             self.inner.capabilities,
         )?;
-        let queue_depth = u32::from(queue_guard.queue.queue_size());
+        let queue_depth = u32::from(queue_guard.split_queue().queue_size());
         drop(queue_guard);
         let attributes = BlockAttributes::new(false, false, NonZeroU32::new(queue_depth), None);
         let features = self.inner.capabilities.block_features(block_size);
@@ -560,7 +426,7 @@ impl BlockDriver for VirtioBlkIo {
         // 进来先尝试 drain 一下硬件已完成的请求，给后面的提交腾描述符。
         self.driver.poll();
         let mut queue = self.driver.inner.queue.lock();
-        if queue.failed {
+        if queue.is_failed() {
             return Err((SubmitError::DeviceGone, bio));
         }
 
@@ -592,7 +458,7 @@ impl BlockDriver for VirtioBlkIo {
                 return Err((err, bio));
             }
             queue = self.driver.inner.queue.lock();
-            if queue.failed {
+            if queue.is_failed() {
                 free_allocated_request(&mut *queue, request);
                 return Err((SubmitError::DeviceGone, bio));
             }
@@ -617,26 +483,26 @@ impl BlockDriver for VirtioBlkIo {
             meta_dma,
             data_dma,
         } = request;
-        let pending = PendingVirtioRequest {
+        let pending = VirtioBlkPendingRequest {
             bio,
             meta_dma,
             data_dma,
             expected_device_write_len,
         };
         if let Err(pending) = queue.set_pending(head_idx, pending) {
-            let PendingVirtioRequest {
+            let VirtioBlkPendingRequest {
                 bio,
                 meta_dma,
                 data_dma,
                 ..
             } = pending;
-            let _ = queue.queue.free_chain(chain);
+            let _ = queue.split_queue_mut().free_chain(chain);
             queue.recycle_request_dma(meta_dma, data_dma);
             return Err((SubmitError::QueueFull, bio));
         }
 
         // 先登记 pending，再把 head 发布到 available ring，避免设备极快完成时找不到请求。
-        if queue.queue.push_avail(head_idx).is_err() {
+        if queue.split_queue_mut().push_avail(head_idx).is_err() {
             let pending = match queue.take_pending(head_idx) {
                 Some(pending) => pending,
                 None => {
@@ -648,13 +514,13 @@ impl BlockDriver for VirtioBlkIo {
                     return Ok(());
                 }
             };
-            let PendingVirtioRequest {
+            let VirtioBlkPendingRequest {
                 bio,
                 meta_dma,
                 data_dma,
                 ..
             } = pending;
-            let _ = queue.queue.free_chain(chain);
+            let _ = queue.split_queue_mut().free_chain(chain);
             queue.recycle_meta_dma(meta_dma);
             if let Some(data_dma) = data_dma {
                 queue.recycle_data_dma(data_dma);

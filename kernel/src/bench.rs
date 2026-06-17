@@ -3058,9 +3058,7 @@ impl BlockDriver for RamBlockIo {
                     bio.complete(Err(BioIoError::MediaError));
                     return Ok(());
                 }
-                if let BioBuffer::Owned(buf) = &mut bio.buffer {
-                    buf[..want].copy_from_slice(&data[off..off + want]);
-                }
+                bio.buffer.as_mut_slice()[..want].copy_from_slice(&data[off..off + want]);
                 drop(data);
                 bio.complete(Ok(()));
             }
@@ -3071,9 +3069,7 @@ impl BlockDriver for RamBlockIo {
                     bio.complete(Err(BioIoError::MediaError));
                     return Ok(());
                 }
-                if let BioBuffer::Owned(buf) = &bio.buffer {
-                    data[off..off + want].copy_from_slice(&buf[..want]);
-                }
+                data[off..off + want].copy_from_slice(&bio.buffer.as_slice()[..want]);
                 drop(data);
                 bio.complete(Ok(()));
             }

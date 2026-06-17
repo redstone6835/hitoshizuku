@@ -49,6 +49,8 @@ const LO_FLAGS_DIRECT_IO: u32 = 16;
 
 const LOOP_SET_FD: usize = 0x4c00;
 const LOOP_CLR_FD: usize = 0x4c01;
+const LOOP_SET_STATUS: usize = 0x4c02;
+const LOOP_GET_STATUS: usize = 0x4c03;
 const LOOP_SET_STATUS64: usize = 0x4c04;
 const LOOP_GET_STATUS64: usize = 0x4c05;
 const LOOP_SET_CAPACITY: usize = 0x4c07;
@@ -60,6 +62,43 @@ const LOOP_CTL_ADD: usize = 0x4c80;
 const LOOP_CTL_REMOVE: usize = 0x4c81;
 const LOOP_CTL_GET_FREE: usize = 0x4c82;
 const ENXIO: Errno = Errno::Other(6);
+
+/// Linux `struct loop_info` 的旧 ABI 布局。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LinuxLoopInfo {
+    lo_number: i32,
+    lo_device: u32,
+    lo_inode: u64,
+    lo_rdevice: u32,
+    lo_offset: i32,
+    lo_encrypt_type: i32,
+    lo_encrypt_key_size: i32,
+    lo_flags: i32,
+    lo_name: [u8; LO_NAME_SIZE],
+    lo_encrypt_key: [u8; LO_KEY_SIZE],
+    lo_init: [u64; 2],
+    reserved: [u8; 4],
+}
+
+impl LinuxLoopInfo {
+    const fn zeroed() -> Self {
+        Self {
+            lo_number: 0,
+            lo_device: 0,
+            lo_inode: 0,
+            lo_rdevice: 0,
+            lo_offset: 0,
+            lo_encrypt_type: 0,
+            lo_encrypt_key_size: 0,
+            lo_flags: 0,
+            lo_name: [0; LO_NAME_SIZE],
+            lo_encrypt_key: [0; LO_KEY_SIZE],
+            lo_init: [0; 2],
+            reserved: [0; 4],
+        }
+    }
+}
 
 /// Linux `struct loop_info64` 的 ABI 布局。
 #[repr(C)]
@@ -321,6 +360,15 @@ fn handle_loop_block_ioctl(driver: &LoopDriver, raw: usize, arg: usize) -> Resul
             driver.detach().map_err(map_loop_errno)?;
             Ok(0)
         }
+        LOOP_GET_STATUS => {
+            let status = driver.status();
+            if !status.attached {
+                return Err(ENXIO);
+            }
+            let info = linux_loop_info_legacy_from_status(&status);
+            write_user_struct(arg, &info)?;
+            Ok(0)
+        }
         LOOP_GET_STATUS64 => {
             let status = driver.status();
             if !status.attached {
@@ -330,16 +378,14 @@ fn handle_loop_block_ioctl(driver: &LoopDriver, raw: usize, arg: usize) -> Resul
             write_user_struct(arg, &info)?;
             Ok(0)
         }
+        LOOP_SET_STATUS => {
+            let info: LinuxLoopInfo = read_user_struct(arg)?;
+            let info64 = linux_loop_info64_from_legacy(info)?;
+            set_loop_status(driver, info64)
+        }
         LOOP_SET_STATUS64 => {
             let info: LinuxLoopInfo64 = read_user_struct(arg)?;
-            reject_unsupported_crypto(&info)?;
-            let flags = loop_flags_from_linux(info.lo_flags);
-            let size_limit = nonzero_limit(info.lo_sizelimit);
-            let file_name = name_from_field(&info.lo_file_name);
-            driver
-                .set_status(info.lo_offset, size_limit, file_name, flags)
-                .map_err(map_loop_errno)?;
-            Ok(0)
+            set_loop_status(driver, info)
         }
         LOOP_SET_CAPACITY => {
             driver.resize_from_backing().map_err(map_loop_errno)?;
@@ -512,6 +558,29 @@ fn file_name_for_fd(fd: u32, file: &Arc<File>) -> Box<str> {
     name.into_boxed_str()
 }
 
+fn linux_loop_info64_from_legacy(info: LinuxLoopInfo) -> Result<LinuxLoopInfo64, Errno> {
+    let mut info64 = LinuxLoopInfo64::zeroed();
+    info64.lo_number = u32::try_from(info.lo_number).unwrap_or(0);
+    info64.lo_offset = u64::try_from(info.lo_offset).map_err(|_| Errno::EINVAL)?;
+    info64.lo_encrypt_type = u32::try_from(info.lo_encrypt_type).map_err(|_| Errno::EINVAL)?;
+    info64.lo_encrypt_key_size =
+        u32::try_from(info.lo_encrypt_key_size).map_err(|_| Errno::EINVAL)?;
+    info64.lo_flags = u32::try_from(info.lo_flags).map_err(|_| Errno::EINVAL)?;
+    info64.lo_file_name = info.lo_name;
+    info64.lo_encrypt_key = info.lo_encrypt_key;
+    info64.lo_init = info.lo_init;
+    Ok(info64)
+}
+
+fn linux_loop_info_legacy_from_status(status: &LoopStatus) -> LinuxLoopInfo {
+    let mut info = LinuxLoopInfo::zeroed();
+    info.lo_number = status.index as i32;
+    info.lo_offset = i32::try_from(status.offset).unwrap_or(i32::MAX);
+    info.lo_flags = linux_flags_from_status(status) as i32;
+    copy_name_to_field(&mut info.lo_name, &status.file_name);
+    info
+}
+
 fn linux_loop_info_from_status(status: &LoopStatus) -> LinuxLoopInfo64 {
     let mut info = LinuxLoopInfo64::zeroed();
     info.lo_offset = status.offset;
@@ -537,6 +606,17 @@ fn linux_flags_from_status(status: &LoopStatus) -> u32 {
         flags |= LO_FLAGS_DIRECT_IO;
     }
     flags
+}
+
+fn set_loop_status(driver: &LoopDriver, info: LinuxLoopInfo64) -> Result<usize, Errno> {
+    reject_unsupported_crypto(&info)?;
+    let flags = loop_flags_from_linux(info.lo_flags);
+    let size_limit = nonzero_limit(info.lo_sizelimit);
+    let file_name = name_from_field(&info.lo_file_name);
+    driver
+        .set_status(info.lo_offset, size_limit, file_name, flags)
+        .map_err(map_loop_errno)?;
+    Ok(0)
 }
 
 fn loop_flags_from_linux(flags: u32) -> LoopFlags {
@@ -597,6 +677,8 @@ fn is_loop_ioctl(raw: usize) -> bool {
         raw,
         LOOP_SET_FD
             | LOOP_CLR_FD
+            | LOOP_SET_STATUS
+            | LOOP_GET_STATUS
             | LOOP_SET_STATUS64
             | LOOP_GET_STATUS64
             | LOOP_SET_CAPACITY

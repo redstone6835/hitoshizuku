@@ -29,8 +29,8 @@ use crate::scheduler::{
     supported_cpu_mask,
 };
 use crate::signal::{
-    DefaultAction, SigAction, SigHandler, SigInfo, SigProcMaskHow, SigSet, SignalNumber,
-    default_action,
+    DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
+    SignalNumber, default_action,
 };
 use crate::spawn::{abort_new_task, activate_task, clone_task, exit_task, reap_matching};
 use crate::task::{Task, TaskUsage};
@@ -849,6 +849,11 @@ fn wait_common(
         }
 
         // 5. 阻塞：按 wait_event 协议挂到 me.exit_waiters，让出 CPU，被唤醒后重试。
+        // 若已有可投递 handler，必须先回到 syscall 分发器构造 sigframe；
+        // SA_RESTART 的重启处理也依赖原始 syscall 参数尚未被返回值覆盖。
+        if has_interrupting_signal(&me) {
+            return Err(Errno::EINTR);
+        }
         me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
         if wait_child_observable(
             &me,
@@ -864,6 +869,9 @@ fn wait_common(
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
         me.exit_waiters.finish_wait(&me);
+        if has_interrupting_signal(&me) {
+            return Err(Errno::EINTR);
+        }
         // 唤醒后重新轮询。
     }
 }
@@ -1140,6 +1148,43 @@ pub fn has_interrupting_signal(task: &Arc<Task>) -> bool {
         }
     }
     false
+}
+
+/// syscall 返回 `EINTR` 前尝试消费一条可自动重启的用户 handler 信号。
+///
+/// `SA_RESTART` 要求 handler 返回后重新执行被打断的 syscall。分发器在写返回值、
+/// 推进 PC 之前调用这里，因此原始参数寄存器仍然完整。
+pub fn consume_restartable_signal() -> Option<(SigInfo, SigAction)> {
+    let me = current_task();
+    let blocked = me.signal.blocked_snapshot().raw();
+    let pending = (me.signal.pending_snapshot().raw()
+        | me.shared_signal().pending_snapshot().raw())
+        & !blocked;
+
+    for raw in 1..crate::signal::NSIG as i32 {
+        let Some(sig) = SignalNumber::from_raw(raw) else {
+            continue;
+        };
+        if (pending & sig.bit()) == 0 {
+            continue;
+        }
+
+        let action = me.shared_signal().get_action(sig);
+        if !matches!(action.handler, SigHandler::Handler(_)) {
+            continue;
+        }
+        if !action.flags.has(SigActionFlags::SA_RESTART) {
+            continue;
+        }
+
+        let info = me
+            .signal
+            .dequeue_one_in(sig.bit())
+            .or_else(|| me.shared_signal().dequeue_one_in(sig.bit()))?;
+        return Some((info, action));
+    }
+
+    None
 }
 
 /// `sigtimedwait(these)` 在不阻塞的情况下尝试消费一条属于 `these` 的信号。

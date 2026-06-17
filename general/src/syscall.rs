@@ -184,6 +184,28 @@ pub fn dispatch(tf: TrapFramePtr) {
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        if ret == -(Errno::EINTR.as_i32() as isize) {
+            if let Some((info, action)) = sched::operation::consume_restartable_signal() {
+                let delivered = sched::process_image_ops()
+                    .and_then(|ops| {
+                        (ops.setup_signal_frame)(
+                            ctx.task(),
+                            info,
+                            action,
+                            sched::UserContextRef::new(tf.as_usize()),
+                        )
+                        .ok()
+                    })
+                    .is_some();
+                if delivered {
+                    // SA_RESTART 分支不写 -EINTR、不推进 PC；sigreturn 后用户态
+                    // 会重新执行原 syscall，参数寄存器也保持进入内核时的值。
+                    sched::run_post_syscall_handoff(sched::now_ns_public());
+                    return;
+                }
+            }
+        }
+
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
         let _ = sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(

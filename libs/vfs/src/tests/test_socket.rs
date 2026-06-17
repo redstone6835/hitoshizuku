@@ -405,7 +405,7 @@ fn make_plain_file(fx: &Fixture) -> Fd {
             access: crate::file::AccessMode::ReadWrite,
             ..Default::default()
         },
-        Arc::clone(&fx.ctx.cred),
+        fx.ctx.cred(),
         Box::new(EmptyFileOps),
         dentry,
         fx.ctx.root.mount(),

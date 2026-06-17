@@ -387,19 +387,21 @@ fn map_socket_error(err: SocketError) -> Errno {
 #[cfg(not(test))]
 fn current_identity(ctx: &VfsContext) -> PeerIdentity {
     let pid = current_task().pid_root().unwrap_or(0) as u32;
+    let cred = ctx.cred();
     PeerIdentity {
         process: pid,
-        user: ctx.cred.euid.0,
-        group: ctx.cred.egid.0,
+        user: cred.euid.0,
+        group: cred.egid.0,
     }
 }
 
 #[cfg(test)]
 fn current_identity(ctx: &VfsContext) -> PeerIdentity {
+    let cred = ctx.cred();
     PeerIdentity {
         process: 0,
-        user: ctx.cred.euid.0,
-        group: ctx.cred.egid.0,
+        user: cred.euid.0,
+        group: cred.egid.0,
     }
 }
 
@@ -533,7 +535,7 @@ pub fn socket(
             FdFlags::default()
         };
         let ops = crate::netlink_socket::create_netlink_socket(protocol as u32, nonblock);
-        let file = new_netlink_socket_file(ops, Arc::clone(&ctx.cred), nonblock);
+        let file = new_netlink_socket_file(ops, ctx.cred(), nonblock);
         return fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno());
     }
 
@@ -543,6 +545,7 @@ pub fn socket(
     } else {
         FdFlags::default()
     };
+    let cred = ctx.cred();
 
     match domain as u16 {
         AF_UNIX => {
@@ -551,7 +554,7 @@ pub fn socket(
             }
             let socket =
                 CoreSocket::new_unix(kind, current_identity(ctx)).map_err(map_socket_error)?;
-            let file = new_socket_file(socket, Arc::clone(&ctx.cred), nonblock);
+            let file = new_socket_file(socket, Arc::clone(&cred), nonblock);
             fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
         }
         crate::addr::AF_INET | crate::addr::AF_INET6 => {
@@ -561,7 +564,7 @@ pub fn socket(
                 protocol as u16,
                 nonblock,
             )?;
-            let file = new_net_socket_file(ops, Arc::clone(&ctx.cred), nonblock);
+            let file = new_net_socket_file(ops, Arc::clone(&cred), nonblock);
             fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
         }
         17 => {
@@ -569,7 +572,7 @@ pub fn socket(
             let protocol = protocol as u16;
             let ops =
                 crate::net_socket::create_net_socket(17, SOCK_RAW as u16, protocol, nonblock)?;
-            let file = new_net_socket_file(ops, Arc::clone(&ctx.cred), nonblock);
+            let file = new_net_socket_file(ops, Arc::clone(&cred), nonblock);
             fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
         }
         _ => Err(Errno::EAFNOSUPPORT),
@@ -597,14 +600,12 @@ pub fn socketpair(
     } else {
         FdFlags::default()
     };
+    let cred = ctx.cred();
     let a = fdt
-        .alloc_fd(
-            new_socket_file(left, Arc::clone(&ctx.cred), nonblock),
-            fd_flags,
-        )
+        .alloc_fd(new_socket_file(left, Arc::clone(&cred), nonblock), fd_flags)
         .map_err(|e| e.to_errno())?;
     let b = match fdt.alloc_fd(
-        new_socket_file(right, Arc::clone(&ctx.cred), nonblock),
+        new_socket_file(right, Arc::clone(&cred), nonblock),
         fd_flags,
     ) {
         Ok(fd) => fd,
@@ -675,7 +676,7 @@ pub fn accept(
             buf.truncate(len);
             Some(buf)
         };
-        let new_file = new_net_socket_file(accepted, Arc::clone(&ctx.cred), nonblock);
+        let new_file = new_net_socket_file(accepted, ctx.cred(), nonblock);
         let new_fd = fdt.alloc_fd(new_file, fd_flags).map_err(|e| e.to_errno())?;
         return Ok((new_fd, peer));
     }
@@ -694,10 +695,7 @@ pub fn accept(
         .ok()
         .map(|addr| encode_sockaddr_un(&addr));
     let new_fd = fdt
-        .alloc_fd(
-            new_socket_file(accepted, Arc::clone(&ctx.cred), nonblock),
-            fd_flags,
-        )
+        .alloc_fd(new_socket_file(accepted, ctx.cred(), nonblock), fd_flags)
         .map_err(|e| e.to_errno())?;
     Ok((new_fd, peer))
 }
@@ -1823,7 +1821,7 @@ fn resolve_connect_address(ctx: &VfsContext, raw: &[u8]) -> Result<UnixAddress, 
                 return Err(Errno::ENOTSOCK);
             }
             let meta = inode.meta_snapshot();
-            if !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
+            if !ctx.cred().can_write(meta.uid, meta.gid, meta.mode) {
                 return Err(Errno::EACCES);
             }
             Ok(UnixAddress::Path {

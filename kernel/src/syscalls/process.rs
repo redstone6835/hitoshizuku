@@ -17,6 +17,8 @@ use sched::sync::Spinlock;
 use sched::task::{RseqRegistration, Task, TaskState};
 use sched::{SchedAttr, SchedPolicy, SignalNumber, WaitId, WaitOptions, WaitStatus};
 
+use super::vfs_cred_from_sched;
+
 // getpriority/setpriority 的 Linux 兼容层编码。调度核心只接收 Task 和 nice，
 // 不理解 which/who 这组用户态选择语义。
 const PRIO_PROCESS: usize = 0;
@@ -106,6 +108,17 @@ fn release_exit_files(task: &Arc<Task>) {
     // A zombie must not keep pipe/socket/file endpoints alive until its parent
     // reaps it.  Shell pipelines rely on writer fd release at process exit to
     // deliver EOF to readers such as wc or command substitution.
+    if let Some(payload) = task.ext_lookup(sched::TASKEXT_VFS_FDTABLE)
+        && let Ok(fdt) = Arc::downcast::<vfs::fdtable::FdTable>(payload)
+    {
+        let owner_pid = task
+            .thread_group()
+            .leader()
+            .and_then(|leader| leader.pid_root())
+            .or_else(|| task.pid_root())
+            .unwrap_or(0);
+        fdt.release_all_record_locks_for_owner(owner_pid);
+    }
     let _ = task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
 }
 
@@ -209,7 +222,7 @@ fn install_clone_pidfd(args: CloneArgs, child: Arc<Task>) -> Result<(), Errno> {
     }
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
-        .map(|ctx| Arc::clone(&ctx.cred))
+        .map(|ctx| ctx.cred())
         .ok_or(Errno::ENOSYS)?;
     let fd = pidfd::create(&fdt, cred, child, false)?;
     if let Err(err) = copy_to_user(args.pidfd, &(fd.as_raw() as i32).to_le_bytes()) {
@@ -769,7 +782,7 @@ pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut out = [0u8; 65 * 6];
     write_uts_field(&mut out, 0, b"MyGo");
     write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"mygo");
-    write_uts_field(&mut out, 2, b"0.1.0");
+    write_uts_field(&mut out, 2, b"10.1.0");
     write_uts_field(&mut out, 3, b"MyGo kernel");
     write_uts_field(&mut out, 4, hal::platform::arch_name().as_bytes());
     write_uts_dynamic_field(&mut out, 5, &UTS_DOMAINNAME, b"localdomain");
@@ -1802,7 +1815,7 @@ pub(super) fn sys_prctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             }
             let mut new = (*current).clone();
             new.cap_bset = CapSet::from_raw(new.cap_bset.raw() & !(1u64 << cap));
-            ctx.task().set_credentials(Arc::new(new));
+            install_credentials(ctx.task(), new);
             Ok(0)
         }
         _ => Ok(0),
@@ -1814,6 +1827,9 @@ pub(super) fn sys_capget(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let datap = ctx.args[1];
     let (version, pid) = read_cap_header(hdrp)?;
     let words = cap_version_words(version)?;
+    if pid < 0 {
+        return Err(Errno::EINVAL);
+    }
     if pid != 0 && Some(pid) != ctx.task().pid_root() {
         return Err(Errno::ESRCH);
     }
@@ -1832,6 +1848,9 @@ pub(super) fn sys_capset(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     let (version, pid) = read_cap_header(hdrp)?;
     let words = cap_version_words(version)?;
+    if pid < 0 {
+        return Err(Errno::EINVAL);
+    }
     if pid != 0 && Some(pid) != ctx.task().pid_root() {
         return Err(Errno::EPERM);
     }
@@ -1842,7 +1861,7 @@ pub(super) fn sys_capset(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     new.caps = requested.effective;
     new.cap_permitted = requested.permitted;
     new.cap_inheritable = requested.inheritable;
-    ctx.task().set_credentials(Arc::new(new));
+    install_credentials(ctx.task(), new);
     Ok(0)
 }
 
@@ -1963,6 +1982,32 @@ fn validate_capset(requested: LinuxCapData, current: &Credentials) -> Result<(),
     Ok(())
 }
 
+fn install_credentials(task: &Arc<Task>, new: Credentials) {
+    let sched_cred = Arc::new(new);
+    task.set_credentials(Arc::clone(&sched_cred));
+    if let Some(vfs_ctx) = vfs::current_vfs_context() {
+        vfs_ctx.set_cred(Arc::new(vfs_cred_from_sched(&sched_cred)));
+    }
+}
+
+fn drop_caps_after_uid_gid_change(old: &Credentials, new: &mut Credentials) {
+    let lost_root_uid = (old.uid == Uid::ROOT || old.euid == Uid::ROOT || old.suid == Uid::ROOT)
+        && new.uid != Uid::ROOT
+        && new.euid != Uid::ROOT
+        && new.suid != Uid::ROOT;
+    let lost_effective_root = old.euid == Uid::ROOT && new.euid != Uid::ROOT;
+    let gained_effective_root = old.euid != Uid::ROOT && new.euid == Uid::ROOT;
+    if lost_root_uid {
+        new.caps = CapSet::EMPTY;
+        new.cap_permitted = CapSet::EMPTY;
+        new.cap_inheritable = CapSet::EMPTY;
+    } else if lost_effective_root {
+        new.caps = CapSet::EMPTY;
+    } else if gained_effective_root {
+        new.caps = new.cap_permitted;
+    }
+}
+
 pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let uid = Uid(ctx.args[0] as u32);
     let creds = ctx.task().credentials();
@@ -1972,7 +2017,8 @@ pub(super) fn sys_setuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         new.euid = uid;
         new.suid = uid;
         new.fsuid = uid;
-        ctx.task().set_credentials(Arc::new(new));
+        drop_caps_after_uid_gid_change(&creds, &mut new);
+        install_credentials(ctx.task(), new);
         Ok(0)
     } else {
         Err(Errno::EPERM)
@@ -1988,7 +2034,8 @@ pub(super) fn sys_setgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         new.egid = gid;
         new.sgid = gid;
         new.fsgid = gid;
-        ctx.task().set_credentials(Arc::new(new));
+        drop_caps_after_uid_gid_change(&creds, &mut new);
+        install_credentials(ctx.task(), new);
         Ok(0)
     } else {
         Err(Errno::EPERM)
@@ -2018,7 +2065,8 @@ pub(super) fn sys_setreuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         new.euid = new_euid;
         new.fsuid = new_euid;
     }
-    ctx.task().set_credentials(Arc::new(new));
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
     Ok(0)
 }
 
@@ -2045,7 +2093,8 @@ pub(super) fn sys_setregid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         new.egid = new_egid;
         new.fsgid = new_egid;
     }
-    ctx.task().set_credentials(Arc::new(new));
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
     Ok(0)
 }
 
@@ -2077,7 +2126,8 @@ pub(super) fn sys_setresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if suid != u32::MAX {
         new.suid = Uid(suid);
     }
-    ctx.task().set_credentials(Arc::new(new));
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
     Ok(0)
 }
 
@@ -2109,7 +2159,8 @@ pub(super) fn sys_setresgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     if sgid != u32::MAX {
         new.sgid = Gid(sgid);
     }
-    ctx.task().set_credentials(Arc::new(new));
+    drop_caps_after_uid_gid_change(&creds, &mut new);
+    install_credentials(ctx.task(), new);
     Ok(0)
 }
 
@@ -2125,7 +2176,7 @@ pub(super) fn sys_setfsuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     {
         let mut new = (*creds).clone();
         new.fsuid = uid;
-        ctx.task().set_credentials(Arc::new(new));
+        install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
 }
@@ -2142,7 +2193,7 @@ pub(super) fn sys_setfsgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     {
         let mut new = (*creds).clone();
         new.fsgid = gid;
-        ctx.task().set_credentials(Arc::new(new));
+        install_credentials(ctx.task(), new);
     }
     Ok(old.0 as usize)
 }
@@ -2183,7 +2234,7 @@ pub(super) fn sys_setgroups(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     }
     let mut new = (*creds).clone();
     new.groups = groups;
-    ctx.task().set_credentials(Arc::new(new));
+    install_credentials(ctx.task(), new);
     Ok(0)
 }
 
@@ -3133,7 +3184,7 @@ pub(super) fn sys_pidfd_open(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
     require_task_access(ctx.task(), &task)?;
     let fdt = vfs::current_fdtable().ok_or(Errno::ENOSYS)?;
     let cred = vfs::current_vfs_context()
-        .map(|ctx| Arc::clone(&ctx.cred))
+        .map(|ctx| ctx.cred())
         .ok_or(Errno::ENOSYS)?;
     let fd = pidfd::create(&fdt, cred, task, (flags & PIDFD_NONBLOCK) != 0)?;
     Ok(fd.as_raw() as usize)

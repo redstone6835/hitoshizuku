@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -96,6 +96,10 @@ impl FsDriver for TmpfsDriver {
                 self_weak: weak_sb,
             }
         });
+
+        // 根目录不会经过 create/mkdir 路径，必须在挂载完成后显式放入 inode 缓存，
+        // 否则 open("/") 会因为找不到 ino=1 而返回 EINVAL。
+        sb.insert_inode(Arc::clone(&sb.root_inode));
 
         Ok(sb)
     }
@@ -953,7 +957,7 @@ impl InodeOps for TmpfsInodeOps {
                 .downcast_ops::<TmpfsInodeOps>()
                 .ok_or(VfsError::InvalidArgument)? as *const TmpfsInodeOps,
             inode: opened_inode,
-            sb: Arc::downgrade(&sb),
+            sb,
         }))
     }
 
@@ -971,7 +975,7 @@ impl InodeOps for TmpfsInodeOps {
 struct TmpfsFileOps {
     inode_ops: *const TmpfsInodeOps,
     inode: Arc<Inode>,
-    sb: Weak<Superblock>,
+    sb: Arc<Superblock>,
 }
 
 unsafe impl Send for TmpfsFileOps {}
@@ -1053,11 +1057,9 @@ impl FileOps for TmpfsFileOps {
             TmpfsInodeData::Directory(entries) => entries,
             _ => return Err(VfsError::NotADirectory),
         };
-        let sb = self.sb.upgrade().ok_or(VfsError::InvalidArgument)?;
-
         let mut current_pos = pos;
         for (name, ino) in entries.iter().skip(pos as usize) {
-            let kind = sb.find_inode(*ino).ok_or(VfsError::NotFound)?.kind();
+            let kind = self.sb.find_inode(*ino).ok_or(VfsError::NotFound)?.kind();
             let entry = DirEntry {
                 ino: *ino,
                 name: SmallStr::from(name.as_str()),

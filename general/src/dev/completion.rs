@@ -24,13 +24,17 @@ pub struct Completion<T> {
 }
 
 impl<T> Completion<T> {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub const fn new_detached() -> Self {
+        Self {
             done: AtomicBool::new(false),
             result: Spinlock::new(None),
             waker: Spinlock::new(None),
             wait_queue: WaitQueue::new(),
-        })
+        }
+    }
+
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::new_detached())
     }
 
     pub fn is_done(&self) -> bool {

@@ -156,8 +156,16 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 tf_ptr
             }
             FaultOutcome::Segv => {
-                log::debug!(
-                    "[trap][mm] user SIGSEGV sepc={:#x} tval={:#x} code={:#x}",
+                let (pid, comm) = if sched::is_ready() {
+                    let task = sched::current_task();
+                    (task.pid_root(), task.comm())
+                } else {
+                    (None, [0; 16])
+                };
+                log::warning!(
+                    "[trap][mem] user SIGSEGV pid={:?} comm={:?} sepc={:#x} tval={:#x} code={:#x}",
+                    pid,
+                    comm,
                     tf.sepc,
                     tf.tval,
                     code

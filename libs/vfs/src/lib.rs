@@ -20,6 +20,7 @@ pub mod fdtable;
 pub mod file;
 pub mod flock;
 pub mod inode;
+pub mod lease;
 pub mod limits;
 pub mod memfd;
 pub mod mount;
@@ -28,6 +29,7 @@ pub mod netlink_socket;
 pub mod operation;
 pub mod path;
 pub mod pipe;
+pub mod record_lock;
 pub mod signalfd;
 pub mod socket;
 pub mod stat;
@@ -55,9 +57,11 @@ mod vfs {
     pub use crate::file;
     pub use crate::flock;
     pub use crate::inode;
+    pub use crate::lease;
     pub use crate::limits;
     pub use crate::mount;
     pub use crate::path;
+    pub use crate::record_lock;
     pub use crate::stat;
     pub use crate::stat::FileMode;
     pub use crate::superblock;
@@ -100,7 +104,7 @@ pub struct VfsContext {
     cwd_state: sync::Spinlock<CwdState>,
     pub root: VfsRoot,
     pub mount_ns: Arc<MountNamespace>,
-    pub cred: Arc<Credentials>,
+    cred: sync::Spinlock<Arc<Credentials>>,
     umask: sync::Spinlock<FileMode>,
     pub limits: Arc<VfsLimits>,
 }
@@ -122,10 +126,15 @@ impl VfsContext {
             cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
             root,
             mount_ns,
-            cred,
+            cred: sync::Spinlock::new(cred),
             umask: sync::Spinlock::new(umask),
             limits,
         }
+    }
+
+    /// 返回当前 VFS 权限检查使用的凭据快照。
+    pub fn cred(&self) -> Arc<Credentials> {
+        Arc::clone(&self.cred.lock())
     }
 
     pub fn cwd(&self) -> Arc<Dentry> {
@@ -165,8 +174,12 @@ impl VfsContext {
         Ok(())
     }
 
-    pub fn set_cred(&mut self, new_cred: Arc<Credentials>) {
-        self.cred = new_cred;
+    /// 更新当前任务的 VFS 凭据。
+    ///
+    /// `setuid`/`capset` 等 syscall 会先替换调度层凭据，再把派生出的 VFS 凭据同步到
+    /// 这里；路径解析和文件创建随后读取该快照，避免继续使用旧的 root 权限。
+    pub fn set_cred(&self, new_cred: Arc<Credentials>) {
+        *self.cred.lock() = new_cred;
     }
 
     pub fn set_umask(&self, new_mask: FileMode) -> FileMode {
@@ -191,7 +204,7 @@ impl VfsContext {
             cwd_state: sync::Spinlock::new(CwdState { cwd, cwd_mount }),
             root: VfsRoot::new(self.root.root(), self.root.mount()),
             mount_ns: Arc::clone(&self.mount_ns),
-            cred: Arc::clone(&self.cred),
+            cred: sync::Spinlock::new(self.cred()),
             umask: sync::Spinlock::new(*self.umask.lock()),
             limits: Arc::clone(&self.limits),
         })
@@ -217,7 +230,7 @@ impl VfsContext {
             }),
             root: VfsRoot::new(root_dentry, new_root_mount),
             mount_ns: new_ns,
-            cred: Arc::clone(&self.cred),
+            cred: sync::Spinlock::new(self.cred()),
             umask: sync::Spinlock::new(*self.umask.lock()),
             limits: Arc::clone(&self.limits),
         })

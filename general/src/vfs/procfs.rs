@@ -60,6 +60,7 @@ const NET_DIR_INO: u64 = 16;
 const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
+const SYS_PID_MAX_INO: u64 = 20;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -78,6 +79,7 @@ const TASK_SLOT_MAPS: u64 = 11;
 const TASK_SLOT_FD_DIR: u64 = 12;
 const TASK_SLOT_TASK_DIR: u64 = 13;
 const TASK_SLOT_MOUNTINFO: u64 = 14;
+const TASK_SLOT_MOUNTS: u64 = 15;
 
 fn procfs_fallible_string(value: &str) -> VfsResult<String> {
     let mut out = String::new();
@@ -217,6 +219,7 @@ enum TaskFileKind {
     Comm,
     Maps,
     Mountinfo,
+    Mounts,
 }
 
 #[derive(Clone, Copy)]
@@ -224,6 +227,7 @@ enum ProcFileKind {
     Root(RootFileKind),
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
+    SysPidMax,
 }
 
 #[derive(Clone, Copy)]
@@ -1072,6 +1076,7 @@ impl InodeOps for ProcSysKernelDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "hotplug" => Ok(proc_sys_hotplug_inode(self.fs_id, &self.weak_sb)),
+            "pid_max" => Ok(proc_sys_pid_max_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1083,11 +1088,18 @@ impl InodeOps for ProcSysKernelDirOps {
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
-            snapshot: vec![DirEntry {
-                ino: SYS_HOTPLUG_INO,
-                name: SmallStr::new("hotplug"),
-                kind: FileType::Regular,
-            }],
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_HOTPLUG_INO,
+                    name: SmallStr::new("hotplug"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_PID_MAX_INO,
+                    name: SmallStr::new("pid_max"),
+                    kind: FileType::Regular,
+                },
+            ],
         }))
     }
 
@@ -1109,6 +1121,20 @@ fn proc_sys_hotplug_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysHotplug,
+        }),
+    )
+}
+
+fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_PID_MAX_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysPidMax,
         }),
     )
 }
@@ -1144,6 +1170,7 @@ fn proc_task_file_ino(pid: PidT, kind: TaskFileKind) -> u64 {
             TaskFileKind::Comm => TASK_SLOT_COMM,
             TaskFileKind::Maps => TASK_SLOT_MAPS,
             TaskFileKind::Mountinfo => TASK_SLOT_MOUNTINFO,
+            TaskFileKind::Mounts => TASK_SLOT_MOUNTS,
         }
 }
 
@@ -1331,6 +1358,12 @@ impl InodeOps for ProcTaskDirOps {
                 self.pid,
                 TaskFileKind::Mountinfo,
             )),
+            "mounts" => Ok(proc_task_file_inode(
+                self.fs_id,
+                &self.weak_sb,
+                self.pid,
+                TaskFileKind::Mounts,
+            )),
             "fd" => Ok(proc_fd_dir_inode(self.fs_id, &self.weak_sb, self.pid)),
             "task" if self.view == TaskDirView::Process => Ok(proc_task_list_dir_inode(
                 self.fs_id,
@@ -1397,6 +1430,11 @@ impl InodeOps for ProcTaskDirOps {
             DirEntry {
                 ino: proc_task_file_ino(self.pid, TaskFileKind::Mountinfo),
                 name: SmallStr::new("mountinfo"),
+                kind: FileType::Regular,
+            },
+            DirEntry {
+                ino: proc_task_file_ino(self.pid, TaskFileKind::Mounts),
+                name: SmallStr::new("mounts"),
                 kind: FileType::Regular,
             },
             DirEntry {
@@ -1751,9 +1789,11 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
                 TaskFileKind::Comm => render_task_comm(&task).into_bytes(),
                 TaskFileKind::Maps => render_task_maps(&task).into_bytes(),
                 TaskFileKind::Mountinfo => render_task_mountinfo(&task)?.into_bytes(),
+                TaskFileKind::Mounts => render_task_mounts(&task)?.into_bytes(),
             })
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
+        ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
     }
 }
 
@@ -2157,6 +2197,11 @@ fn render_task_mountinfo(task: &Arc<Task>) -> VfsResult<String> {
         .dump_mountinfo(&ctx.root.root(), &ctx.root.mount()))
 }
 
+fn render_task_mounts(task: &Arc<Task>) -> VfsResult<String> {
+    let ctx = task_vfs_context(task).ok_or(VfsError::NotFound)?;
+    Ok(ctx.mount_ns.dump_mounts())
+}
+
 fn render_hotplug() -> String {
     let value = HOTPLUG_PATH.lock();
     if value.is_empty() {
@@ -2164,6 +2209,10 @@ fn render_hotplug() -> String {
     } else {
         format!("{}\n", &*value)
     }
+}
+
+fn render_pid_max() -> String {
+    format!("{}\n", sched::pid::DEFAULT_PID_MAX)
 }
 
 fn render_filesystems() -> String {
