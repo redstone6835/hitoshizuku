@@ -18,6 +18,8 @@ RV_CROSS_COMPILE := riscv64-linux-musl-
 RV_KERNEL := kernel-rv
 
 BUSYBOX_SRC := third/busybox-1.36.1
+BUSYBOX_ARCHIVE := third/busybox-1.36.1.tar.gz
+ENSURE_BUSYBOX := scripts/ensure-busybox.sh
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
@@ -46,7 +48,8 @@ $(RV_ROOTFS)/bin/busybox:
 	$(MAKE) rootfs-busybox ROOTFS_DIR=$(RV_ROOTFS) CROSS_COMPILE=$(RV_CROSS_COMPILE)
 
 .PHONY: rootfs-busybox
-rootfs-busybox:
+rootfs-busybox: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE)
+	$(ENSURE_BUSYBOX)
 	$(MAKE) -C $(BUSYBOX_SRC) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
 	sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' $(BUSYBOX_SRC)/.config
 	sed -i 's/.*CONFIG_PIE.*/CONFIG_PIE=y/' $(BUSYBOX_SRC)/.config
