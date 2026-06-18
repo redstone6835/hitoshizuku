@@ -86,7 +86,7 @@ pub struct NetTuning {
 pub const DEFAULT_TCP_BUFFER_BYTES: usize = 64 * 1024;
 
 /// 默认 UDP 数据区大小。
-pub const DEFAULT_UDP_BUFFER_BYTES: usize = 16 * 1024;
+pub const DEFAULT_UDP_BUFFER_BYTES: usize = 128 * 1024;
 
 /// 默认 raw/ICMP 数据区大小。
 pub const DEFAULT_CONTROL_BUFFER_BYTES: usize = 8 * 1024;
