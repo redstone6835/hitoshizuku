@@ -284,7 +284,7 @@ impl ExtRegFileOps {
             let phys = phys_start + (cur - range_byte_start) / block_size;
             let dst_pos = (cur - request_offset) as usize;
             self.state
-                .read_blocks(
+                .read_data_blocks(
                     phys,
                     (aligned_bytes / block_size) as u32,
                     &mut dst[dst_pos..dst_pos + aligned_bytes as usize],
@@ -428,6 +428,7 @@ impl FileOps for ExtRegFileOps {
             // 真正无法容纳时再退化成间接布局。
             let block_size = self.state.ext_sb.block_size as u64;
             let mut map_scratch = Vec::new();
+            let mut newly_allocated_blocks: u64 = 0;
 
             // 把旧 inline 内容(如果有)写回为数据块
             if let Some(old) = inline_recovered {
@@ -446,6 +447,9 @@ impl FileOps for ExtRegFileOps {
                             &mut map_scratch,
                         )
                         .map_err(map_err)?;
+                        if block.is_new() {
+                            newly_allocated_blocks += 1;
+                        }
                         let phys = block.phys();
                         let mut blk = vec![0u8; block_size as usize];
                         if !block.is_new() && (in_block != 0 || want < block_size as usize) {
@@ -453,7 +457,7 @@ impl FileOps for ExtRegFileOps {
                         }
                         blk[in_block..in_block + want]
                             .copy_from_slice(&old[written..written + want]);
-                        self.state.write_block(phys, &blk).map_err(map_err)?;
+                        self.state.write_data_block(phys, &blk).map_err(map_err)?;
                         written += want;
                     }
                     raw_guard.set_size(total as u64);
@@ -473,15 +477,21 @@ impl FileOps for ExtRegFileOps {
                 while written < buf.len() {
                     let lb = (file_off / block_size) as u32;
                     let remain_blocks = ((buf.len() - written) as u64 / block_size) as u32;
+                    // Check if blocks exist before calling ensure_extent_run
+                    let existing_run =
+                        extent_wr::lookup_extent_run_pub(&i_block, lb, remain_blocks);
                     let Some((phys, run_blocks)) =
                         extent_wr::ensure_extent_run(&self.state, &mut i_block, lb, remain_blocks)
                             .map_err(map_err)?
                     else {
                         break;
                     };
+                    if existing_run.is_none() {
+                        newly_allocated_blocks += run_blocks as u64;
+                    }
                     let bytes = run_blocks as usize * block_size as usize;
                     self.state
-                        .write_blocks(phys, run_blocks, &buf[written..written + bytes])
+                        .write_data_blocks(phys, run_blocks, &buf[written..written + bytes])
                         .map_err(map_err)?;
                     written += bytes;
                     file_off += bytes as u64;
@@ -506,11 +516,40 @@ impl FileOps for ExtRegFileOps {
                         &mut map_scratch,
                     )
                     .map_err(map_err)?;
+                    if block.is_new() {
+                        newly_allocated_blocks += 1;
+                    }
                     let phys = block.phys();
+
+                    // 快速路径：块已在 cache 中且非新块，直接原地 partial write，
+                    // 单次加锁替代 read_block + write_block 两次加锁。
+                    if !block.is_new()
+                        && cur_lb != Some(lb)
+                        && self.state.modify_block_partial(
+                            phys,
+                            in_block,
+                            &buf[written..written + want],
+                        )
+                    {
+                        // 前一个块如果在暂存区还未写回，先 flush
+                        if let Some(prev_lb) = cur_lb {
+                            if prev_lb != lb {
+                                self.state
+                                    .write_data_block(cur_phys, &cur_blk_buf)
+                                    .map_err(map_err)?;
+                                cur_lb = None;
+                            }
+                        }
+                        written += want;
+                        file_off += want as u64;
+                        continue;
+                    }
+
+                    // 慢速路径：块不在 cache 或新块，走传统 read-modify-write
                     if let Some(prev_lb) = cur_lb {
                         if prev_lb != lb {
                             self.state
-                                .write_block(cur_phys, &cur_blk_buf)
+                                .write_data_block(cur_phys, &cur_blk_buf)
                                 .map_err(map_err)?;
                         }
                     }
@@ -522,7 +561,6 @@ impl FileOps for ExtRegFileOps {
                                 .read_block(phys, &mut cur_blk_buf)
                                 .map_err(map_err)?;
                         }
-                        // 整块覆盖时 buf 内容会被随后的 copy_from_slice 完整改写,无需清零
                         cur_lb = Some(lb);
                         cur_phys = phys;
                     }
@@ -533,7 +571,7 @@ impl FileOps for ExtRegFileOps {
                 }
                 if cur_lb.is_some() {
                     self.state
-                        .write_block(cur_phys, &cur_blk_buf)
+                        .write_data_block(cur_phys, &cur_blk_buf)
                         .map_err(map_err)?;
                 }
             }
@@ -541,9 +579,10 @@ impl FileOps for ExtRegFileOps {
             let new_size = raw_guard.size().max(end);
             let mapping_changed = flags != old_flags || i_block != old_i_block;
             let size_changed = new_size != old_size;
-            let new_blocks_lo = if mapping_changed || size_changed {
-                crate::inode::blocks_lo_from_mapping(&self.state, flags, &i_block)
-                    .map_err(map_err)?
+            let new_blocks_lo = if newly_allocated_blocks > 0 {
+                let sectors_per_block = (block_size / 512) as u64;
+                let added_sectors = newly_allocated_blocks * sectors_per_block;
+                (old_blocks_lo as u64 + added_sectors).min(u32::MAX as u64) as u32
             } else {
                 old_blocks_lo
             };
@@ -574,8 +613,7 @@ impl FileOps for ExtRegFileOps {
     }
     fn sync(&self) -> VfsResult<()> {
         let _io = self.io_mu.lock();
-        self.state.flush_dirty_inodes().map_err(map_err)?;
-        self.state.flush_alloc_metadata().map_err(map_err)?;
+        self.state.sync_all().map_err(map_err)?;
         Ok(())
     }
     fn poll(&self, interest: PollEvents) -> PollEvents {
@@ -583,12 +621,7 @@ impl FileOps for ExtRegFileOps {
         PollEvents::READ_WRITE_READY.intersect(interest)
     }
     fn release(&self) {
-        if self.sync().is_err() {
-            log::warning!(
-                "[extfs] failed to flush regular file metadata ino={} on release",
-                self.ino
-            );
-        }
+        let _ = self.ino;
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -650,12 +683,20 @@ fn read_partial_block(
     request_offset: u64,
     dst: &mut [u8],
 ) -> Result<(), crate::state::BlockBackendError> {
+    let dst_pos = (cur - request_offset) as usize;
+    // 快速路径：cache 命中时直接拷贝部分字节，无需读出整块
+    {
+        let mut cache = state.block_cache.lock();
+        if cache.read_partial(phys, block_off, &mut dst[dst_pos..dst_pos + take]) {
+            return Ok(());
+        }
+    }
+    // 慢速路径：cache miss，读整块
     let block_size = state.ext_sb.block_size as usize;
     if scratch.len() != block_size {
         scratch.resize(block_size, 0);
     }
     state.read_block(phys, scratch)?;
-    let dst_pos = (cur - request_offset) as usize;
     dst[dst_pos..dst_pos + take].copy_from_slice(&scratch[block_off..block_off + take]);
     Ok(())
 }

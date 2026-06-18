@@ -10,6 +10,7 @@ use core::any::Any;
 use core::future::Future;
 use core::num::NonZeroU32;
 use core::pin::Pin;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
@@ -346,6 +347,39 @@ impl BlockIoStats {
         self.finish_inflight(op);
     }
 
+    fn record_complete(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        block_size: NonZeroU32,
+        elapsed_ns: u64,
+    ) {
+        self.finish_inflight(op);
+        let sectors =
+            (range.blocks as u64).saturating_mul((block_size.get() as u64).max(512) / 512);
+        match op {
+            BioOp::Read => {
+                self.read_ios.fetch_add(1, Ordering::AcqRel);
+                self.read_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.read_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Write => {
+                self.write_ios.fetch_add(1, Ordering::AcqRel);
+                self.write_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.write_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Discard | BioOp::WriteZeroes => {
+                self.discard_ios.fetch_add(1, Ordering::AcqRel);
+                self.discard_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.discard_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Flush => {
+                self.flush_ios.fetch_add(1, Ordering::AcqRel);
+                self.flush_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+        }
+    }
+
     fn finish_inflight(&self, op: BioOp) {
         let counter = if matches!(op, BioOp::Read) {
             &self.read_inflight
@@ -671,8 +705,9 @@ impl BlockDevice {
 
     /// 同步提交并阻塞等待。
     ///
-    /// 当前实现通过主动 drain 推进硬件完成，不依赖中断。
-    /// 调度器就绪时在 drain 间让出 CPU（yield）；否则纯 spin。
+    /// 使用栈上 Completion 避免每次 I/O 的 Arc 堆分配。
+    /// 统计在完成后由本函数直接记录，跳过 observer 回调中的额外时钟读取。
+    /// 通过主动 drain 推进硬件完成，不依赖中断。
     pub fn submit_bio_wait(
         self: &Arc<Self>,
         op: BioOp,
@@ -680,18 +715,19 @@ impl BlockDevice {
         buffer: BioBuffer,
     ) -> Result<Bio, BioError> {
         self.validate_bio(op, range, &buffer)?;
-        let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
         let submitted_ns = sched::now_ns_public();
-        let completion = Completion::new();
-        let bio = Bio::new_with_completion_observer(
-            op,
-            range,
-            buffer,
-            self.geometry.logical_block_size(),
-            submitted_ns,
-            Some(observer),
-            Arc::clone(&completion),
-        );
+        let completion = Completion::<BioResult>::new_detached();
+        let bio = unsafe {
+            Bio::new_inline(
+                op,
+                range,
+                buffer,
+                self.geometry.logical_block_size(),
+                submitted_ns,
+                None,
+                NonNull::from(&completion),
+            )
+        };
         self.io_stats.begin(op);
         if let Err((err, _bio)) = self.driver.queue_bio(bio) {
             self.io_stats.cancel(op);
@@ -704,15 +740,24 @@ impl BlockDevice {
                 break;
             }
             if sched::is_ready() {
-                // 同步块 I/O 等待是 iozone 写路径的热区。用真实时间片让
-                // 持锁/持请求的任务获得公平运行机会，避免零记账 yield
-                // 在高并发小 I/O 下让完成路径长期拿不到 CPU。
                 sched::schedule_once(sched::now_ns_public());
             } else {
                 core::hint::spin_loop();
             }
         }
-        completion.wait()
+        let result = completion.wait();
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        if result.is_ok() {
+            self.io_stats.record_complete(
+                op,
+                range,
+                self.geometry.logical_block_size(),
+                elapsed_ns,
+            );
+        } else {
+            self.io_stats.cancel(op);
+        }
+        result
     }
 
     /// 同步读取到调用者提供的缓冲区。

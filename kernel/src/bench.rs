@@ -15,7 +15,7 @@
 //!   L7  – 顺序写文件（新建文件，无缓存）
 //!   L8  – 元数据操作（readdir、创建/删除文件）
 
-#[cfg(feature = "block-bench")]
+#[cfg(any(feature = "bench", feature = "block-bench"))]
 use alloc::boxed::Box;
 #[cfg(feature = "block-bench")]
 use alloc::string::String;
@@ -51,7 +51,7 @@ use vfs::superblock::Superblock;
 use vfs::sync::Spinlock;
 
 #[cfg(feature = "bench")]
-use general::dev::bio::{Bio, BioIoError, SubmitError};
+use general::dev::bio::{Bio, BioIoError, BioResult, SubmitError};
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::bio::{BioBuffer, BioOp, BlockRange};
 #[cfg(feature = "bench")]
@@ -60,6 +60,8 @@ use general::dev::block::{BlockClass, BlockDeviceInit, BlockDriver, BlockGeometr
 use general::dev::block::{BlockDevice, BlockFeatures};
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::block_sync::SyncBlockBackend;
+#[cfg(any(feature = "bench", feature = "block-bench"))]
+use general::dev::completion::Completion;
 #[cfg(feature = "block-bench")]
 use general::dev::control::{BlockControlRequest, BlockControlResponse};
 #[cfg(feature = "block-bench")]
@@ -90,6 +92,7 @@ pub fn run() {
         run_block_seq_read("ram-raw", &raw_dev);
         run_block_seq_write("ram-raw", &raw_dev);
         run_block_seq_read_instrumented("ram-raw", &raw_dev);
+        run_block_overhead_breakdown("ram-raw", &raw_dev);
         run_block_rand_read("ram-raw", &raw_dev);
 
         let fat_dev = make_ram_device("ramd-fat", FAT_IMG);
@@ -209,6 +212,7 @@ pub fn run_block_device() {
         }
         run_block_seq_read(&raw_tag, &dev);
         run_block_seq_read_repeat(&raw_tag, &dev);
+        run_block_overhead_diagnosis(&raw_tag, &dev);
         run_block_rand_read(&raw_tag, &dev);
     }
 
@@ -2152,6 +2156,216 @@ fn run_block_seq_read_instrumented(tag: &str, dev: &Arc<BlockDevice>) {
 }
 
 #[cfg(feature = "bench")]
+fn run_block_overhead_breakdown(tag: &str, dev: &Arc<BlockDevice>) {
+    let io_ref = match dev.downcast_driver::<RamBlockIo>() {
+        Some(r) => r,
+        None => {
+            log::error!("[bench][{}][OVERHEAD] not a RamBlockIo device", tag);
+            return;
+        }
+    };
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("[bench][{}][OVERHEAD] backend unavailable: {:?}", tag, e);
+            return;
+        }
+    };
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+
+    run_overhead_suite(tag, dev, io_ref, &backend, lbs, 1024 * 1024, "1MiB");
+    run_overhead_suite(tag, dev, io_ref, &backend, lbs, 4096, "4K");
+}
+
+#[cfg(feature = "bench")]
+fn run_overhead_suite(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    io_ref: &RamBlockIo,
+    backend: &SyncBlockBackend,
+    lbs: usize,
+    chunk: usize,
+    chunk_label: &str,
+) {
+    let total_bytes = 4 * 1024 * 1024usize;
+    let iters = total_bytes / chunk;
+    let blocks_per_chunk = (chunk / lbs) as u32;
+    let mut buf = vec![0u8; chunk];
+
+    // warmup
+    for i in 0..iters {
+        let lba = (i as u64) * blocks_per_chunk as u64;
+        let _ = backend.read(lba, blocks_per_chunk, &mut buf);
+    }
+    core::hint::black_box(&buf);
+
+    log::info!(
+        "[bench][{}][OVERHEAD] ── {} x {} ({} total) ──",
+        tag,
+        chunk_label,
+        iters,
+        total_bytes
+    );
+
+    // ── L0: pure memcpy (no lock, no abstraction) ──
+    let src = vec![0xABu8; chunk];
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        buf[..chunk].copy_from_slice(&src);
+        core::hint::black_box(&buf);
+    }
+    let dt_l0 = hal::time::monotonic_ns().saturating_sub(t0);
+
+    // ── L1: spinlock + memcpy (driver data access only) ──
+    let backing_len = io_ref.data.lock().len();
+    let t0 = hal::time::monotonic_ns();
+    for i in 0..iters {
+        let off = (i * chunk) % backing_len.max(chunk);
+        let guard = io_ref.data.lock();
+        let end = (off + chunk).min(guard.len());
+        buf[..end - off].copy_from_slice(&guard[off..end]);
+        core::hint::black_box(&buf);
+        drop(guard);
+    }
+    let dt_l1 = hal::time::monotonic_ns().saturating_sub(t0);
+
+    // ── L2: queue_bio direct (Bio + Completion alloc + driver dispatch, reuse buffer) ──
+    let block_size = dev.geometry().logical_block_size();
+    let mut owned_buf: Box<[u8]> = vec![0u8; chunk].into_boxed_slice();
+    let t0 = hal::time::monotonic_ns();
+    for i in 0..iters {
+        let lba = (i as u64) * blocks_per_chunk as u64;
+        let buffer = BioBuffer::Owned(owned_buf);
+        let range = BlockRange {
+            lba,
+            blocks: blocks_per_chunk,
+        };
+        let completion = Completion::<BioResult>::new();
+        let bio = Bio::new_with_completion_observer(
+            BioOp::Read,
+            range,
+            buffer,
+            block_size,
+            0,
+            None,
+            Arc::clone(&completion),
+        );
+        let _ = io_ref.queue_bio(bio);
+        match completion.wait() {
+            Ok(bio) => {
+                if let BioBuffer::Owned(b) = bio.buffer {
+                    owned_buf = b;
+                } else {
+                    owned_buf = vec![0u8; chunk].into_boxed_slice();
+                }
+            }
+            Err(_) => {
+                owned_buf = vec![0u8; chunk].into_boxed_slice();
+            }
+        }
+    }
+    let dt_l2 = hal::time::monotonic_ns().saturating_sub(t0);
+
+    // ── L4: full SyncBlockBackend path (validate + observer + completion) ──
+    let t0 = hal::time::monotonic_ns();
+    for i in 0..iters {
+        let lba = (i as u64) * blocks_per_chunk as u64;
+        let _ = backend.read(lba, blocks_per_chunk, &mut buf);
+    }
+    core::hint::black_box(&buf);
+    let dt_l4 = hal::time::monotonic_ns().saturating_sub(t0);
+
+    // ── L5: pure Completion alloc+drop cost ──
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        let c = Completion::<BioResult>::new();
+        core::hint::black_box(&c);
+        drop(c);
+    }
+    let dt_l5 = hal::time::monotonic_ns().saturating_sub(t0);
+
+    // ── L6: pure Box<[u8]> alloc+drop cost ──
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..iters {
+        let b: Box<[u8]> = vec![0u8; chunk].into_boxed_slice();
+        core::hint::black_box(&b);
+        drop(b);
+    }
+    let dt_l6 = hal::time::monotonic_ns().saturating_sub(t0);
+
+    // ── Report ──
+    let mib = |dt: u64| (total_bytes as u64) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
+    let per_op = |dt: u64| dt / iters as u64;
+
+    log::info!(
+        "[bench][{}][OVERHEAD]   L0 pure memcpy:       {} ns ({} MiB/s, {} ns/op)",
+        tag,
+        dt_l0,
+        mib(dt_l0),
+        per_op(dt_l0)
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   L1 lock+memcpy:       {} ns ({} MiB/s, {} ns/op)",
+        tag,
+        dt_l1,
+        mib(dt_l1),
+        per_op(dt_l1)
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   L2 queue_bio direct:  {} ns ({} MiB/s, {} ns/op)",
+        tag,
+        dt_l2,
+        mib(dt_l2),
+        per_op(dt_l2)
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   L4 full backend path: {} ns ({} MiB/s, {} ns/op)",
+        tag,
+        dt_l4,
+        mib(dt_l4),
+        per_op(dt_l4)
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   L5 Completion alloc:  {} ns ({} ns/op)",
+        tag,
+        dt_l5,
+        per_op(dt_l5)
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   L6 Box<[u8]> alloc:   {} ns ({} ns/op)",
+        tag,
+        dt_l6,
+        per_op(dt_l6)
+    );
+
+    log::info!(
+        "[bench][{}][OVERHEAD] ── breakdown ({}) ──",
+        tag,
+        chunk_label
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   spinlock cost:       {} ns/op (L1-L0)",
+        tag,
+        per_op(dt_l1.saturating_sub(dt_l0))
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   bio+completion+drv:  {} ns/op (L2-L1)",
+        tag,
+        per_op(dt_l2.saturating_sub(dt_l1))
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   validate+observer:   {} ns/op (L4-L2)",
+        tag,
+        per_op(dt_l4.saturating_sub(dt_l2))
+    );
+    log::info!(
+        "[bench][{}][OVERHEAD]   alloc overhead only: {} ns/op (L5+L6)",
+        tag,
+        per_op(dt_l5 + dt_l6)
+    );
+}
+
+#[cfg(feature = "bench")]
 fn run_block_seq_write(tag: &str, dev: &Arc<BlockDevice>) {
     let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
         Ok(backend) => backend,
@@ -2183,6 +2397,165 @@ fn run_block_seq_write(tag: &str, dev: &Arc<BlockDevice>) {
         "[bench][{}][L1-blk] seq write 4 MiB in {} ns ({} MiB/s)  <-- 裸块层开销",
         tag,
         dt,
+        mibps
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 块设备软件开销诊断（适用于真实硬件设备如 virtio-blk）
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "block-bench")]
+fn run_block_overhead_diagnosis(tag: &str, dev: &Arc<BlockDevice>) {
+    let backend = match SyncBlockBackend::new(Arc::clone(dev)) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("[bench][{}][DIAG] backend unavailable: {:?}", tag, e);
+            return;
+        }
+    };
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+    let total_bytes = 4 * 1024 * 1024usize;
+    if !block_device_has_bytes(dev, total_bytes) {
+        log::warning!("[bench][{}][DIAG] device too small for diagnosis", tag);
+        return;
+    }
+
+    log::info!(
+        "[bench][{}][DIAG] ====== block device overhead diagnosis ======",
+        tag
+    );
+    log::info!("[bench][{}][DIAG] hardware logical_block_size={}", tag, lbs);
+
+    // ── Part A: multi-size sequential read — 测固定 vs 比例开销 ──
+    log::info!(
+        "[bench][{}][DIAG] -- Part A: per-op latency vs I/O size --",
+        tag
+    );
+    let sizes: &[usize] = &[512, 4096, 65536, 1024 * 1024];
+    for &chunk in sizes {
+        if chunk < lbs || chunk % lbs != 0 {
+            continue;
+        }
+        run_diag_chunk(tag, dev, &backend, lbs, chunk, total_bytes);
+    }
+
+    // ── Part B: 软件常量开销（独立于硬件） ──
+    log::info!(
+        "[bench][{}][DIAG] -- Part B: pure software constants --",
+        tag
+    );
+    let n = 5000u64;
+
+    // B1: Completion alloc + drop
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..n {
+        let c = Completion::<()>::new();
+        core::hint::black_box(&c);
+        drop(c);
+    }
+    let dt_completion = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][{}][DIAG]   Completion<()>::new+drop: {} ns/op (n={})",
+        tag,
+        dt_completion / n,
+        n
+    );
+
+    // B2: 2x now_ns_public — 同步路径每次 I/O 都至少调 2 次
+    let t0 = hal::time::monotonic_ns();
+    let mut sink = 0u64;
+    for _ in 0..n {
+        let a = sched::now_ns_public();
+        let b = sched::now_ns_public();
+        sink = sink.wrapping_add(a ^ b);
+    }
+    core::hint::black_box(sink);
+    let dt_now2 = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][{}][DIAG]   2x now_ns_public:         {} ns/op (n={})",
+        tag,
+        dt_now2 / n,
+        n
+    );
+
+    // B3: vec! buffer alloc — 文件系统每次 read_sectors 可能触发
+    let alloc_size = 4096usize;
+    let t0 = hal::time::monotonic_ns();
+    for _ in 0..n {
+        let v: Vec<u8> = vec![0u8; alloc_size];
+        core::hint::black_box(&v);
+        drop(v);
+    }
+    let dt_alloc = hal::time::monotonic_ns().saturating_sub(t0);
+    log::info!(
+        "[bench][{}][DIAG]   vec![0u8; 4096] +drop:    {} ns/op (n={})",
+        tag,
+        dt_alloc / n,
+        n
+    );
+
+    log::info!("[bench][{}][DIAG] ====== diagnosis complete ======", tag);
+}
+
+#[cfg(feature = "block-bench")]
+fn run_diag_chunk(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    backend: &SyncBlockBackend,
+    lbs: usize,
+    chunk: usize,
+    total_bytes: usize,
+) {
+    let blocks_per_chunk = (chunk / lbs) as u32;
+    let iters = (total_bytes / chunk) as u64;
+    if iters == 0 {
+        return;
+    }
+    let mut buf = vec![0u8; chunk];
+
+    // warmup
+    for i in 0..iters {
+        let lba = i * blocks_per_chunk as u64;
+        let _ = backend.read(lba, blocks_per_chunk, &mut buf);
+    }
+    core::hint::black_box(&buf);
+
+    // timed run
+    let before = dev.io_stats();
+    let t0 = hal::time::monotonic_ns();
+    for i in 0..iters {
+        let lba = i * blocks_per_chunk as u64;
+        if backend.read(lba, blocks_per_chunk, &mut buf).is_err() {
+            log::error!("[bench][{}][DIAG] read error at chunk={}", tag, chunk);
+            return;
+        }
+    }
+    core::hint::black_box(&buf);
+    let dt = hal::time::monotonic_ns().saturating_sub(t0);
+    let after = dev.io_stats();
+    let read_ios = after.read_ios.saturating_sub(before.read_ios).max(1);
+    let hw_time = after.read_time_ns.saturating_sub(before.read_time_ns);
+
+    let wall_per_op = dt / iters;
+    let hw_per_op = hw_time / read_ios;
+    let overhead_per_op = wall_per_op.saturating_sub(hw_per_op);
+    let overhead_pct = if wall_per_op > 0 {
+        overhead_per_op * 100 / wall_per_op
+    } else {
+        0
+    };
+    let mibps = (chunk as u64 * iters) * 1_000_000_000 / dt.max(1) / (1024 * 1024);
+
+    log::info!(
+        "[bench][{}][DIAG]   chunk={:>7}B iters={:>4} wall={:>8}ns/op  hw={:>8}ns/op  overhead={:>8}ns/op ({:>2}%)  thr={} MiB/s",
+        tag,
+        chunk,
+        iters,
+        wall_per_op,
+        hw_per_op,
+        overhead_per_op,
+        overhead_pct,
         mibps
     );
 }
@@ -2499,6 +2872,26 @@ fn run_ext_write_breakdown(tag: &str, sb: &Arc<Superblock>) {
             let _ = f.write_at(&small, (i * 4096) as u64);
         }
         let dt_4k = hal::time::monotonic_ns().saturating_sub(t0);
+
+        // 细分：再做一轮 4K overwrite，分段计时
+        let mut dt_4k_warm = 0u64;
+        let t0 = hal::time::monotonic_ns();
+        for i in 0..1024 {
+            let _ = f.write_at(&small, (i * 4096) as u64);
+        }
+        dt_4k_warm = hal::time::monotonic_ns().saturating_sub(t0);
+        log::info!(
+            "[bench][{}][EXT-BREAKDOWN] overwrite 4K x 1024 (cold): {} ns (avg {} ns/call)",
+            tag,
+            dt_4k,
+            dt_4k / 1024
+        );
+        log::info!(
+            "[bench][{}][EXT-BREAKDOWN] overwrite 4K x 1024 (warm): {} ns (avg {} ns/call)",
+            tag,
+            dt_4k_warm,
+            dt_4k_warm / 1024
+        );
 
         let big = vec![0xFF; 1024 * 1024];
         let t0 = hal::time::monotonic_ns();

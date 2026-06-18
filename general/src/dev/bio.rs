@@ -243,13 +243,24 @@ pub type BioResult = Result<Bio, BioError>;
 
 /// BIO 完成槽位。
 ///
-/// 完成回调可能由主动 drain 或设备中断触发，不能依赖提交方栈帧仍然有效。
-/// 因此完成槽统一使用引用计数对象，先保证长时间 LTP/bench 下的生命周期安全。
-struct BioCompletionSlot(Arc<Completion<BioResult>>);
+/// 同步路径使用栈上 Completion 的裸指针（`Inline`），避免每次 I/O 堆分配 Arc。
+/// 异步路径仍使用引用计数的 `Shared` 变体。
+enum BioCompletionSlot {
+    Shared(Arc<Completion<BioResult>>),
+    /// SAFETY: 指向的 Completion 必须在 Bio 完成前保持存活。
+    /// 仅由 `submit_bio_wait` 使用——该函数阻塞直到完成，栈帧始终有效。
+    Inline(NonNull<Completion<BioResult>>),
+}
+
+unsafe impl Send for BioCompletionSlot {}
 
 impl BioCompletionSlot {
     fn complete(self, value: BioResult) {
-        self.0.complete(value);
+        match self {
+            Self::Shared(arc) => arc.complete(value),
+            // 同步路径：调用方通过轮询 is_done 检测完成，无需唤醒 waker/WaitQueue。
+            Self::Inline(ptr) => unsafe { ptr.as_ref().complete_inline(value) },
+        }
     }
 }
 
@@ -313,7 +324,7 @@ impl Bio {
             fua: false,
             submitted_ns,
             observer,
-            completion: Some(BioCompletionSlot(Arc::clone(&completion))),
+            completion: Some(BioCompletionSlot::Shared(Arc::clone(&completion))),
         };
         (bio, completion)
     }
@@ -336,7 +347,33 @@ impl Bio {
             fua: false,
             submitted_ns,
             observer,
-            completion: Some(BioCompletionSlot(completion)),
+            completion: Some(BioCompletionSlot::Shared(completion)),
+        }
+    }
+
+    /// 创建使用栈上 Completion 的 Bio（零堆分配同步快速路径）。
+    ///
+    /// # Safety
+    /// `completion` 指向的 Completion 必须在 Bio 完成前保持存活。
+    /// 调用方必须在同一栈帧内阻塞等待完成（如 `submit_bio_wait`）。
+    pub unsafe fn new_inline(
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+        block_size: NonZeroU32,
+        submitted_ns: u64,
+        observer: Option<Arc<dyn BioCompletionObserver>>,
+        completion: NonNull<Completion<BioResult>>,
+    ) -> Self {
+        Self {
+            op,
+            range,
+            buffer,
+            block_size,
+            fua: false,
+            submitted_ns,
+            observer,
+            completion: Some(BioCompletionSlot::Inline(completion)),
         }
     }
 
