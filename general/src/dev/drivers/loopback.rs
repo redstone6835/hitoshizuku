@@ -60,7 +60,7 @@ impl NetDriver for LoopbackDriver {
             .position(|buf| buf.len() >= len)
             .and_then(|pos| free.remove(pos))
             .unwrap_or_else(|| alloc::vec![0u8; len].into_boxed_slice());
-        Some(TxBuf::new(buf))
+        Some(TxBuf::new_heap(buf))
     }
 
     fn commit_tx(&self, buf: TxBuf) {
@@ -68,7 +68,7 @@ impl NetDriver for LoopbackDriver {
         if len == 0 {
             return;
         }
-        let data = buf.into_storage();
+        let data = buf.into_heap();
         {
             let mut stats = self.stats.lock();
             stats.tx_packets += 1;

@@ -1,5 +1,6 @@
 //! 通用 DMA 分配与同步辅助。
 
+use alloc::boxed::Box;
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use spin::mutex::Mutex;
 
@@ -473,5 +474,19 @@ impl core::ops::Deref for DmaPage {
 impl core::ops::DerefMut for DmaPage {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.buffer
+    }
+}
+
+impl net::driver::DmaBackend for DmaBuffer {
+    fn as_slice(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.as_mut_slice()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn core::any::Any> {
+        self
     }
 }

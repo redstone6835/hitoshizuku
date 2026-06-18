@@ -1679,7 +1679,7 @@ mod tests {
         }
 
         fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
-            Some(TxBuf::new(alloc::vec![0u8; len].into_boxed_slice()))
+            Some(TxBuf::new_heap(alloc::vec![0u8; len].into_boxed_slice()))
         }
 
         fn commit_tx(&self, buf: TxBuf) {
