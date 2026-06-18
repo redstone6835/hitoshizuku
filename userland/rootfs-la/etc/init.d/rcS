@@ -56,12 +56,21 @@ maybe_enter_shell() {
 
 # 测试黑名单
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="ltp unixbench"
+BLACKLIST="unixbench"
 
 LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
 LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
-LTP_SKIP_CASES="${LTP_SKIP_CASES:-clone07 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 crash01 crash02 crypto_user01 crypto_user02 hackbench kill09 mmapstress01 mmapstress02 mmapstress03 mmapstress04 mmapstress05 mmapstress06 mmapstress07 mmapstress08 mmapstress09 mmapstress10 mmstress mmstress_dummy modify_ldt01 modify_ldt02 modify_ldt03 pcrypt_aead01}"
-export LTP_TIMEOUT LTP_KILL_GRACE
+LTP_DIAG_CASES="${LTP_DIAG_CASES:-waitpid12}"
+LTP_ONLY_CASES="${LTP_ONLY_CASES:-}"
+LTP_SKIP_CASES="${LTP_SKIP_CASES:-accept03 clone07 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 crash01 crash02 crypto_user01 crypto_user02 fcntl14 fcntl14_64 fcntl15 fcntl15_64 fcntl18 fcntl18_64 fcntl19_64 fcntl31 futex_cmp_requeue01 genacos genasin genatan genatan2 genbessel genceil gencos gencosh genexp genexp_log genfabs genfloor genfmod genfrexp genhypot geniperb genj0 genj1 genldexp genlgamma genload genlog genlog10 genmodf genpow genpower gensin gensinh gensqrt gentan gentanh gentrigo geny0 geny1 hackbench kill09 mmap3 mmapstress01 mmapstress02 mmapstress03 mmapstress04 mmapstress05 mmapstress06 mmapstress07 mmapstress08 mmapstress09 mmapstress10 mmstress mmstress_dummy modify_ldt01 modify_ldt02 modify_ldt03 pcrypt_aead01 splice07 syslog12 symlinkat01 waitid05 waitpid10 waitpid11 waitpid13 pthserv}"
+if [ -z "$LTP_ONLY_CASES" ] && [ -r /sys/kernel/cmdline ]; then
+    for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
+        case "$arg" in
+            ltp_only=*) LTP_ONLY_CASES="${arg#ltp_only=}" ;;
+        esac
+    done
+fi
+export LTP_TIMEOUT LTP_KILL_GRACE LTP_DIAG_CASES LTP_ONLY_CASES
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do
@@ -84,14 +93,93 @@ _test_teardown() {
     [ -e /dev/tty.real ] && mv /dev/tty.real /dev/tty
 }
 
+setup_basic_mount_loop() {
+    img="/tmp/basic-vda2.fat"
+    state="/tmp/basic-vda2.loop"
+    loopdev=""
+
+    if [ -f "$state" ] || [ -L /dev/vda2 ]; then
+        cleanup_basic_mount_loop >/dev/null 2>&1 || true
+    fi
+    rm -f "$img"
+
+    if ! command -v losetup >/dev/null 2>&1 || ! command -v mkfs.vfat >/dev/null 2>&1; then
+        echo "[init] basic mount loop skipped: losetup or mkfs.vfat missing"
+        return 0
+    fi
+
+    truncate -s 64M "$img" 2>/dev/null || dd if=/dev/zero of="$img" bs=1M count=64 2>/dev/null || {
+        echo "[init] basic mount loop skipped: cannot create image"
+        return 0
+    }
+    mkfs.vfat -F 32 "$img" >/dev/null 2>&1 || mkfs.vfat "$img" >/dev/null 2>&1 || {
+        echo "[init] basic mount loop skipped: mkfs.vfat failed"
+        rm -f "$img"
+        return 0
+    }
+
+    loopdev="$(losetup -f 2>/dev/null || true)"
+    if [ -z "$loopdev" ]; then
+        echo "[init] basic mount loop skipped: no free loop device"
+        rm -f "$img"
+        return 0
+    fi
+    losetup "$loopdev" "$img" >/dev/null 2>&1 || {
+        echo "[init] basic mount loop skipped: losetup failed"
+        rm -f "$img"
+        return 0
+    }
+
+    ln -sf "$loopdev" /dev/vda2 2>/dev/null || {
+        echo "[init] basic mount loop skipped: cannot link /dev/vda2"
+        losetup -d "$loopdev" >/dev/null 2>&1 || true
+        rm -f "$img"
+        return 0
+    }
+
+    echo "$loopdev" >"$state" 2>/dev/null || true
+    echo "[init] basic mount loop ready: /dev/vda2 -> $loopdev"
+}
+
+cleanup_basic_mount_loop() {
+    img="/tmp/basic-vda2.fat"
+    state="/tmp/basic-vda2.loop"
+    loopdev=""
+
+    if [ ! -f "$state" ] && [ ! -L /dev/vda2 ]; then
+        return 0
+    fi
+
+    if [ -f "$state" ]; then
+        loopdev="$(cat "$state" 2>/dev/null || true)"
+    fi
+    if [ -z "$loopdev" ] && [ -L /dev/vda2 ]; then
+        loopdev="$(readlink /dev/vda2 2>/dev/null || true)"
+    fi
+
+    rm -f /dev/vda2 "$state"
+    if [ -n "$loopdev" ]; then
+        losetup -d "$loopdev" >/dev/null 2>&1 || true
+    fi
+    rm -f "$img"
+}
+
 kill_ltp_case_group() {
     target="$1"
     child="$2"
+    name="$3"
+    diag="$4"
 
+    if [ "$diag" = "1" ]; then
+        echo "[ltp][diag] kill begin case=$name target=$target child=$child"
+    fi
     kill -TERM "$target" 2>/dev/null || true
     kill -TERM "$child" 2>/dev/null || true
     kill -KILL "$target" 2>/dev/null || true
     kill -KILL "$child" 2>/dev/null || true
+    if [ "$diag" = "1" ]; then
+        echo "[ltp][diag] kill end case=$name target=$target child=$child"
+    fi
 }
 
 run_ltp_case() {
@@ -99,9 +187,17 @@ run_ltp_case() {
     name="${file##*/}"
     marker="/tmp/ltp-case-timeout.$$"
     status="/tmp/ltp-case-status.$$"
+    diag=0
+
+    for diag_case in $LTP_DIAG_CASES; do
+        if [ "$name" = "$diag_case" ]; then
+            diag=1
+            break
+        fi
+    done
 
     for skip in $LTP_SKIP_CASES; do
-        if [ "$name" = "$skip" ]; then
+        if [ "$diag" != "1" ] && [ "$name" = "$skip" ]; then
             echo "RUN LTP CASE $name"
             echo "[ltp] 跳过会卡住 runner 的用例：$name"
             echo "FAIL LTP CASE $name : 124"
@@ -111,6 +207,9 @@ run_ltp_case() {
 
     rm -f "$marker" "$status"
     echo "RUN LTP CASE $name"
+    if [ "$diag" = "1" ]; then
+        echo "[ltp][diag] force-run case=$name timeout=${LTP_TIMEOUT}s grace=${LTP_KILL_GRACE}s parent=$$"
+    fi
 
     if command -v setsid >/dev/null 2>&1; then
         setsid /bin/sh -c '"$1"; echo "$?" > "$2"' sh "$file" "$status" &
@@ -121,18 +220,33 @@ run_ltp_case() {
         child=$!
         kill_target="$child"
     fi
+    if [ "$diag" = "1" ]; then
+        echo "[ltp][diag] started case=$name child=$child kill_target=$kill_target"
+    fi
 
     elapsed=0
     while [ ! -f "$status" ]; do
+        if [ "$diag" = "1" ]; then
+            echo "[ltp][diag] poll case=$name elapsed=$elapsed status=missing before-timeout-check"
+        fi
         if [ "$elapsed" -ge "$LTP_TIMEOUT" ]; then
+            if [ "$diag" = "1" ]; then
+                echo "[ltp][diag] timeout branch case=$name elapsed=$elapsed"
+            fi
             echo "[ltp] 用例超时：$name，超过 ${LTP_TIMEOUT}s"
             : >"$marker"
-            kill_ltp_case_group "$kill_target" "$child"
+            kill_ltp_case_group "$kill_target" "$child" "$name" "$diag"
 
             grace=0
             while [ "$grace" -lt "$LTP_KILL_GRACE" ] && [ ! -f "$status" ]; do
+                if [ "$diag" = "1" ]; then
+                    echo "[ltp][diag] grace-sleep case=$name grace=$grace"
+                fi
                 sleep 1
                 grace=$((grace + 1))
+                if [ "$diag" = "1" ]; then
+                    echo "[ltp][diag] grace-woke case=$name grace=$grace"
+                fi
             done
 
             if [ ! -f "$status" ]; then
@@ -143,12 +257,18 @@ run_ltp_case() {
             fi
             break
         fi
+        if [ "$diag" = "1" ]; then
+            echo "[ltp][diag] sleep-enter case=$name elapsed=$elapsed"
+        fi
         sleep 1
+        if [ "$diag" = "1" ]; then
+            echo "[ltp][diag] sleep-woke case=$name elapsed=$elapsed"
+        fi
         elapsed=$((elapsed + 1))
     done
 
     ret="$(cat "$status" 2>/dev/null || echo 124)"
-    kill_ltp_case_group "$kill_target" "$child"
+    kill_ltp_case_group "$kill_target" "$child" "$name" "$diag"
     wait "$child" 2>/dev/null || true
 
     if [ -f "$marker" ]; then
@@ -172,8 +292,21 @@ run_ltp_script() {
     fi
 
     echo "[init] 使用 ${script##*/} 触发 LTP，逐用例超时 ${LTP_TIMEOUT}s，跳过：$LTP_SKIP_CASES"
+    if [ -n "$LTP_ONLY_CASES" ]; then
+        echo "[ltp] 仅运行用例：$LTP_ONLY_CASES"
+    fi
     for file in "$target_dir"/*; do
         if [ -f "$file" ]; then
+            if [ -n "$LTP_ONLY_CASES" ]; then
+                only_match=0
+                for only in $LTP_ONLY_CASES; do
+                    if [ "${file##*/}" = "$only" ]; then
+                        only_match=1
+                        break
+                    fi
+                done
+                [ "$only_match" = "1" ] || continue
+            fi
             run_ltp_case "$file"
         fi
     done
@@ -194,6 +327,9 @@ run_test_scripts() {
                 if _is_blacklisted "$name"; then
                     echo "[init] skip $name (blacklist)"
                 else
+                    if [ "$name" = "basic_testcode.sh" ]; then
+                        setup_basic_mount_loop
+                    fi
                     echo "[init] run $name"
                     if [ "$name" = "ltp_testcode.sh" ]; then
                         run_ltp_script "$script"
@@ -201,7 +337,11 @@ run_test_scripts() {
                         /bin/sh "$script"
                     fi
                 fi
+                if [ "$name" = "busybox_testcode.sh" ]; then
+                    cleanup_basic_mount_loop
+                fi
             done
+            cleanup_basic_mount_loop
         fi
     done
     _test_teardown

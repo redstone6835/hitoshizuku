@@ -25,6 +25,7 @@ use vfs::sync::Spinlock;
 
 use crate::bgd::{self, GroupDesc};
 use crate::inode::{ExtInodeOps, load_inode};
+use crate::inode_wr::RawInode;
 use crate::layout::{EXT4_ROOT_INO, ExtKind};
 use crate::sb::{self, Superblock as ExtSb};
 
@@ -193,6 +194,7 @@ pub(crate) struct FsState {
     pub(crate) inode_alloc_hint: core::sync::atomic::AtomicU32,
     pub(crate) alloc_group_dirty: Spinlock<alloc::vec::Vec<u8>>,
     pub(crate) alloc_sb_dirty: AtomicBool,
+    pub(crate) dirty_inodes: Spinlock<alloc::vec::Vec<Arc<Spinlock<RawInode>>>>,
     /// 只读挂载标志(由驱动 flags 或 remount 控制)。
     pub(crate) read_only: core::sync::atomic::AtomicBool,
 }
@@ -444,6 +446,47 @@ impl FsState {
         Ok(())
     }
 
+    pub(crate) fn mark_inode_dirty(&self, raw: &Arc<Spinlock<RawInode>>) {
+        let mut dirty = self.dirty_inodes.lock();
+        if dirty.iter().any(|entry| Arc::ptr_eq(entry, raw)) {
+            return;
+        }
+        dirty.push(Arc::clone(raw));
+    }
+
+    pub(crate) fn flush_dirty_inodes(&self) -> Result<(), BlockBackendError> {
+        let pending = {
+            let mut dirty = self.dirty_inodes.lock();
+            if dirty.is_empty() {
+                return Ok(());
+            }
+            core::mem::take(&mut *dirty)
+        };
+
+        for (idx, raw) in pending.iter().enumerate() {
+            let snapshot = loop {
+                if let Some(guard) = raw.try_lock() {
+                    break guard.clone();
+                }
+                if sched::is_ready() {
+                    sched::schedule_once(sched::now_ns_public());
+                } else {
+                    core::hint::spin_loop();
+                }
+            };
+            if let Err(err) = crate::inode_wr::write_raw(self, &snapshot) {
+                let mut dirty = self.dirty_inodes.lock();
+                for pending_raw in &pending[idx..] {
+                    if !dirty.iter().any(|entry| Arc::ptr_eq(entry, pending_raw)) {
+                        dirty.push(Arc::clone(pending_raw));
+                    }
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn io_epoch(&self) -> u64 {
         self.block_cache_epoch.load(Ordering::Acquire)
@@ -557,6 +600,7 @@ impl SuperblockOps for ExtFsSuperblockOps {
         })
     }
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
+        self.state.flush_dirty_inodes().map_err(map_err)?;
         self.state.flush_alloc_metadata().map_err(map_err)
     }
     fn remount(&self, _sb: &Arc<VfsSuperblock>, _flags: MountFlags) -> VfsResult<()> {
@@ -624,6 +668,7 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
         alloc_group_dirty: Spinlock::new(vec![0u8; group_count]),
         alloc_sb_dirty: AtomicBool::new(false),
+        dirty_inodes: Spinlock::new(Vec::new()),
         read_only: core::sync::atomic::AtomicBool::new(false),
     });
 
@@ -849,6 +894,7 @@ mod tests {
             inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
             alloc_group_dirty: Spinlock::new(vec![0; 1]),
             alloc_sb_dirty: AtomicBool::new(false),
+            dirty_inodes: Spinlock::new(Vec::new()),
             read_only: AtomicBool::new(false),
         }
     }

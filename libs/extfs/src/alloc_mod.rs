@@ -1,6 +1,6 @@
 //! 位图分配/释放(块 + inode) + 超级块/块组计数回写。
 //!
-//! 所有分配都严格按顺序:**位图置位 → 更新计数 → 落盘**。没有日志兜底,
+//! 所有分配都先同步修改 bitmap,再把计数元数据标脏。没有日志兜底,
 //! 中间崩溃会让 FS 损坏。mount 会因此拒绝 `NEEDS_RECOVERY`,要求 clean umount
 //! 或 fsck。
 
@@ -176,7 +176,6 @@ pub(crate) fn alloc_blocks_run(
             state.block_alloc_hint.store(next_rel, Ordering::Relaxed);
             state.adjust_group_free_blocks(group, -(count as i32))?;
             state.adjust_sb_free_blocks(-(count as i64))?;
-            state.flush_alloc_metadata()?;
             return Ok((phys, count));
         }
     }
@@ -365,7 +364,6 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     );
     state.adjust_group_free_blocks(group, 1)?;
     state.adjust_sb_free_blocks(1)?;
-    state.flush_alloc_metadata()?;
     Ok(())
 }
 
@@ -440,7 +438,6 @@ pub(crate) fn free_blocks_run(
     if total_cleared != 0 {
         state.block_alloc_hint.store(first_rel, Ordering::Relaxed);
         state.adjust_sb_free_blocks(total_cleared as i64)?;
-        state.flush_alloc_metadata()?;
     }
     Ok(())
 }
@@ -528,7 +525,6 @@ pub(crate) fn free_blocks_sparse(state: &FsState, blocks: &[u64]) -> Result<(), 
             .block_alloc_hint
             .store(first_cleared_rel.unwrap_or(0), Ordering::Relaxed);
         state.adjust_sb_free_blocks(total_cleared as i64)?;
-        state.flush_alloc_metadata()?;
     }
     Ok(())
 }
@@ -572,7 +568,6 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
                 state.adjust_group_used_dirs(group, 1)?;
             }
             state.adjust_sb_free_inodes(-1)?;
-            state.flush_alloc_metadata()?;
             return Ok(ino);
         }
     }
@@ -600,7 +595,6 @@ pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), 
         state.adjust_group_used_dirs(group, -1)?;
     }
     state.adjust_sb_free_inodes(1)?;
-    state.flush_alloc_metadata()?;
     Ok(())
 }
 

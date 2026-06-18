@@ -707,12 +707,7 @@ fn matches_waitid(child: &Arc<Task>, target: &WaitId, parent: &Arc<Task>) -> boo
     match target {
         WaitId::All => true,
         WaitId::Pid(pid) => child.pid_root() == Some(*pid),
-        WaitId::Pgid(pgid) => child
-            .process_group()
-            .snapshot()
-            .iter()
-            .find_map(|m| m.thread_group().leader().and_then(|l| l.pid_root()))
-            .map_or(false, |p| p == *pgid),
+        WaitId::Pgid(pgid) => child.process_group().pgid() == *pgid,
         WaitId::SameGroup => Arc::ptr_eq(&child.process_group(), &parent.process_group()),
         WaitId::Pidfd(task) => Arc::ptr_eq(child, task),
     }

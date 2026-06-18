@@ -778,14 +778,22 @@ impl Task {
     where
         F: FnMut(&Arc<Task>) -> bool,
     {
-        let mut rel = self.rel.lock();
-        let pos = rel
-            .children
-            .iter()
-            .position(|c| c.state() == TaskState::Zombie && pred(c))?;
-        let zombie = rel.children.swap_remove(pos);
-        zombie.set_state(TaskState::Dead);
-        Some(zombie)
+        loop {
+            let candidate = self
+                .snapshot_children()
+                .into_iter()
+                .find(|c| c.state() == TaskState::Zombie && pred(c))?;
+            let mut rel = self.rel.lock();
+            let Some(pos) = rel.children.iter().position(|c| Arc::ptr_eq(c, &candidate)) else {
+                continue;
+            };
+            if rel.children[pos].state() != TaskState::Zombie {
+                continue;
+            }
+            let zombie = rel.children.swap_remove(pos);
+            zombie.set_state(TaskState::Dead);
+            return Some(zombie);
+        }
     }
 
     /// 列出当前直接子任务的强引用快照；释放锁后再消费，避免持锁回调。

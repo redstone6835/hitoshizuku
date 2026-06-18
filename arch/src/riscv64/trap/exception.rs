@@ -50,6 +50,49 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     }
 }
 
+fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
+    match code {
+        EXC_ILLEGAL_INST => sched::SignalNumber::SIGILL,
+        EXC_BREAKPOINT => sched::SignalNumber::SIGTRAP,
+        EXC_INST_MISALIGNED | EXC_LOAD_MISALIGNED | EXC_STORE_MISALIGNED | EXC_INST_ACCESS
+        | EXC_LOAD_ACCESS | EXC_STORE_ACCESS => sched::SignalNumber::SIGBUS,
+        _ => sched::SignalNumber::SIGSEGV,
+    }
+}
+
+fn terminate_user_exception(tf: &TrapFrame, code: usize, sig: sched::SignalNumber) -> usize {
+    let (pid, comm, uid) = if sched::is_ready() {
+        let task = sched::current_task();
+        (task.pid_root(), task.comm(), task.credentials().uid)
+    } else {
+        (None, [0; sched::TASK_COMM_LEN], sched::Uid::ROOT)
+    };
+
+    log::warning!(
+        "[trap][exception] user exception pid={:?} comm={:?} code={:#x} sepc={:#x} stval={:#x} sig={}",
+        pid,
+        comm,
+        code,
+        tf.sepc,
+        tf.tval,
+        sig.raw()
+    );
+
+    if sched::is_ready() {
+        sched::operation::apply_default_action(sched::SigInfo {
+            sig,
+            code: 0,
+            sender_pid: 0,
+            sender_uid: uid,
+            raw: None,
+        });
+        sched::schedule_once(kernel_timestamp_ns());
+        panic!("[trap][exception] signaled task scheduled back unexpectedly");
+    }
+
+    0
+}
+
 /// 解码中断：从 SCAUSE 寄存器提取中断类型。
 fn decode_interrupt(cause: usize) -> Interrupt {
     // RISC-V 把待处理中断类型压在 SCAUSE 的高比特位。与 LoongArch 不同，RISC-V
@@ -73,6 +116,8 @@ fn decode_exception(code: usize) -> Exception {
         EXC_ILLEGAL_INST => Exception::IllegalInstruction,
         EXC_BREAKPOINT => Exception::Breakpoint,
         EXC_INST_MISALIGNED => Exception::AddressError,
+        EXC_LOAD_MISALIGNED => Exception::AddressError,
+        EXC_STORE_MISALIGNED => Exception::AddressError,
         EXC_LOAD_ACCESS => Exception::AddressError,
         EXC_STORE_ACCESS => Exception::AddressError,
         EXC_INST_ACCESS => Exception::AddressError,
@@ -170,15 +215,21 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                     tf.tval,
                     code
                 );
-                // 投 SIGSEGV 给当前线程；下一次调度边界 deliver_pending_signals
-                // 拿到默认 Term 动作即触发 exit_task。本轮 hello 跑通不应触发；
-                // 兜底替代旧的 halt 行为。
+                // RISC-V 同步缺页若不可恢复，不能先入队 SIGSEGV 再返回同一条
+                // fault 指令；部分 LTP 用例会在相同 PC 上反复触发 fault，造成
+                // 日志风暴并拖住 runner。当前内核尚未完整支持用户态 sigframe，
+                // 这里按默认 SIGSEGV/Core 动作同步终止当前任务。
                 if sched::is_ready() {
                     let me = sched::current_task();
-                    let pid = me.pid_root().unwrap_or(0);
-                    let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
-                    drop(me);
-                    deliver_user_signals_before_return(tf_ptr, from_user);
+                    sched::operation::apply_default_action(sched::SigInfo {
+                        sig: sched::SignalNumber::SIGSEGV,
+                        code: 0,
+                        sender_pid: 0,
+                        sender_uid: me.credentials().uid,
+                        raw: None,
+                    });
+                    sched::schedule_once(kernel_timestamp_ns());
+                    panic!("[trap][mem] SIGSEGV task scheduled back unexpectedly");
                 }
                 tf_ptr
             }
@@ -222,12 +273,17 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         tf.sepc = tf.sepc.wrapping_add(step);
         tf_ptr
     } else {
+        if from_user {
+            return terminate_user_exception(tf, code, signal_for_user_exception(code));
+        }
+
+        let exc = decode_exception(code);
         log::error!(
-            "[trap][exception] UNHANDLED exception code={:#x} sepc={:#x} stval={:#x} from_user={}",
+            "[trap][exception] UNHANDLED kernel exception {:?} code={:#x} sepc={:#x} stval={:#x}",
+            exc,
             code,
             tf.sepc,
-            tf.tval,
-            from_user
+            tf.tval
         );
         0
     }

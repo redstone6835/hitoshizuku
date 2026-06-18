@@ -19,7 +19,7 @@ use vfs::stat::FileType;
 use vfs::superblock::Superblock as VfsSuperblock;
 use vfs::sync::Spinlock;
 
-use crate::inode_wr::{RawInode, write_raw};
+use crate::inode_wr::RawInode;
 use crate::layout::{
     DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EXT4_INLINE_DATA_FL,
 };
@@ -554,7 +554,7 @@ impl FileOps for ExtRegFileOps {
                 raw_guard.set_flags(flags);
                 raw_guard.set_size(new_size);
                 raw_guard.set_blocks_lo(new_blocks_lo);
-                write_raw(&self.state, &raw_guard).map_err(map_err)?;
+                self.state.mark_inode_dirty(&self.raw);
                 if let Some(inode) = self.sb.find_inode(self.ino as u64) {
                     inode.set_size_and_blocks(new_size, new_blocks_lo as u64);
                 }
@@ -573,13 +573,23 @@ impl FileOps for ExtRegFileOps {
         Err(VfsError::NotADirectory)
     }
     fn sync(&self) -> VfsResult<()> {
+        let _io = self.io_mu.lock();
+        self.state.flush_dirty_inodes().map_err(map_err)?;
+        self.state.flush_alloc_metadata().map_err(map_err)?;
         Ok(())
     }
     fn poll(&self, interest: PollEvents) -> PollEvents {
         // 普通文件不会阻塞等待设备事件；读写 readiness 应立即满足。
         PollEvents::READ_WRITE_READY.intersect(interest)
     }
-    fn release(&self) {}
+    fn release(&self) {
+        if self.sync().is_err() {
+            log::warning!(
+                "[extfs] failed to flush regular file metadata ino={} on release",
+                self.ino
+            );
+        }
+    }
     fn as_any(&self) -> &dyn Any {
         self
     }
