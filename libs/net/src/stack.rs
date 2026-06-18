@@ -1605,6 +1605,7 @@ impl NetStack {
         handle: NetSocketHandle,
         buf: &mut [u8],
     ) -> Result<(usize, Endpoint), NetError> {
+        self.poll_now();
         self.udp_recv_info(handle, buf)
             .map(|info| (info.len, info.remote))
     }
