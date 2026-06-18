@@ -56,9 +56,8 @@ impl NetDriver for LoopbackDriver {
     fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
         let mut free = self.free.lock();
         let buf = free
-            .iter()
-            .position(|buf| buf.len() >= len)
-            .and_then(|pos| free.remove(pos))
+            .pop_front()
+            .filter(|buf| buf.len() >= len)
             .unwrap_or_else(|| alloc::vec![0u8; len].into_boxed_slice());
         Some(TxBuf::new_heap(buf))
     }
