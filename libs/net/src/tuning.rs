@@ -92,7 +92,7 @@ pub const DEFAULT_UDP_BUFFER_BYTES: usize = 128 * 1024;
 pub const DEFAULT_CONTROL_BUFFER_BYTES: usize = 8 * 1024;
 
 /// 默认数据包元数据队列深度。
-pub const DEFAULT_PACKET_META_COUNT: usize = 32;
+pub const DEFAULT_PACKET_META_COUNT: usize = 256;
 
 /// 默认主动 poll 预算。
 ///
