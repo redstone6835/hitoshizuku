@@ -967,6 +967,10 @@ impl Task {
         Arc::clone(&self.shared_signal.lock())
     }
 
+    pub fn shared_signal_pending_bits_quick(&self) -> u64 {
+        self.shared_signal.lock().pending_snapshot().raw()
+    }
+
     /// 替换 SharedSignal —— 仅供 spawn 时根据 CLONE_SIGHAND 设定使用。
     pub fn install_shared_signal(&self, shared: Arc<SharedSignal>) {
         *self.shared_signal.lock() = shared;

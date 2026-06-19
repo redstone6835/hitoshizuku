@@ -91,6 +91,8 @@ static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; 
 static RETIRED_TASKS: [Spinlock<Vec<Arc<Task>>>; NR_CPUS] =
     [const { Spinlock::new(Vec::new()) }; NR_CPUS];
 
+static RETIRED_TASKS_NONEMPTY: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SchedulerDiag {
     pub current_slots: usize,
@@ -258,7 +260,6 @@ pub fn init() -> Arc<Task> {
 
     // 8) CPU 0 的 current 指向 init。
     *CURRENT_TASKS[0].lock() = Some(Arc::clone(&init_task));
-
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
@@ -503,6 +504,13 @@ pub fn needs_resched(cpu_id: usize) -> bool {
     cpu_id < NR_CPUS && NEED_RESCHED[cpu_id].load(Ordering::Acquire)
 }
 
+pub fn needs_resched_current() -> bool {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return false;
+    }
+    NEED_RESCHED[cpu()].load(Ordering::Acquire)
+}
+
 pub fn request_resched(cpu_id: usize) {
     if cpu_id >= NR_CPUS {
         return;
@@ -544,12 +552,18 @@ pub fn request_post_syscall_handoff() {
 }
 
 fn cleanup_retired_tasks(cpu_id: usize) {
+    if !RETIRED_TASKS_NONEMPTY[cpu_id].load(Ordering::Acquire) {
+        return;
+    }
     let retired = {
         let mut slot = RETIRED_TASKS[cpu_id].lock();
         if slot.is_empty() {
+            RETIRED_TASKS_NONEMPTY[cpu_id].store(false, Ordering::Release);
             return;
         }
-        core::mem::take(&mut *slot)
+        let taken = core::mem::take(&mut *slot);
+        RETIRED_TASKS_NONEMPTY[cpu_id].store(false, Ordering::Release);
+        taken
     };
     for task in retired.iter() {
         task.cleanup_exit_extensions();
@@ -559,7 +573,9 @@ fn cleanup_retired_tasks(cpu_id: usize) {
 }
 
 fn retire_final_task(cpu_id: usize, task: Arc<Task>) {
-    RETIRED_TASKS[cpu_id].lock().push(task);
+    let mut slot = RETIRED_TASKS[cpu_id].lock();
+    slot.push(task);
+    RETIRED_TASKS_NONEMPTY[cpu_id].store(true, Ordering::Release);
 }
 
 pub fn run_post_syscall_handoff(now_ns: u64) {
@@ -589,6 +605,17 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
         }
         schedule_once(handoff_now);
     }
+}
+
+pub fn run_post_syscall_handoff_lazy() {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu_id = cpu();
+    if POST_SYSCALL_HANDOFF[cpu_id].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    run_post_syscall_handoff(now_ns_internal());
 }
 
 /// 按调度域、亲和性和当前负载选择目标 CPU。
@@ -1056,7 +1083,9 @@ pub fn schedule_once(now_ns: u64) {
 
     // 在调度边界消费当前任务的 pending signal。默认 Term/Core 会把 prev 标成
     // Zombie；后续 pick_next 看到它不再 runnable，就不会放回 runqueue。
-    if prev.state() == TaskState::Running {
+    if prev.state() == TaskState::Running
+        && (prev.signal.has_any_pending() || prev.shared_signal_pending_bits_quick() != 0)
+    {
         let _ = crate::operation::deliver_pending_signals();
     }
 

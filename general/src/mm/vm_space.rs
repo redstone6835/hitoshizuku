@@ -973,7 +973,7 @@ impl VmSpace {
                 let old_access = mapping.access;
                 mapping.access = access_after_fork(area.flags, &mapping.page);
                 if old_access != mapping.access {
-                    self.protect_page(*va, pte_flags_for(area.flags, mapping.access))
+                    self.protect_page_no_flush(*va, pte_flags_for(area.flags, mapping.access))
                         .expect("[mm] fork parent protect failed");
                 }
                 let child_mapping = mapping.clone();
@@ -985,6 +985,9 @@ impl VmSpace {
                 ));
                 child_pages.insert(*va, child_mapping);
             }
+        }
+        if !child_maps.is_empty() {
+            self.flush_full_user_tlb();
         }
 
         for (va, page, flags, access) in &child_maps {
@@ -1254,6 +1257,28 @@ impl VmSpace {
             (ops.invalidate_range)(self.pgd, vaddr, page_size);
         }
         Ok(())
+    }
+
+    fn protect_page_no_flush(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        unsafe {
+            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
+        }
+        Ok(())
+    }
+
+    fn invalidate_user_range(&self, vaddr: usize, len: usize) {
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.invalidate_range)(self.pgd, vaddr, len) };
+        }
+    }
+
+    fn flush_full_user_tlb(&self) {
+        // vaddr=1, len=usize::MAX 会溢出，触发 arch 层全局 flush（with_asid(asid, None)）。
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.invalidate_range)(self.pgd, 1, usize::MAX) };
+        }
     }
 
     fn replace_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {

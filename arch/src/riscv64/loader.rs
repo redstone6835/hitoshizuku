@@ -233,7 +233,7 @@ fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
         .filter(|&hz| hz != 0)
         .unwrap_or_else(|| time::STABLE_TIMER_HZ.load(Ordering::Relaxed));
 
-    time::STABLE_TIMER_HZ.store(hz, Ordering::Relaxed);
+    time::set_stable_counter_hz(hz);
     time::init_periodic_timer(time::DEFAULT_TIMER_HZ);
     log::info!(
         "[loader] timer configured: stable_hz={} tick_hz={} period_ticks={}",

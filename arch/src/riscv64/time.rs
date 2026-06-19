@@ -9,6 +9,18 @@ use super::csr::SIE_STIE;
 /// 稳定计时器频率（Hz），由 DTB timebase-frequency 填充。
 pub static STABLE_TIMER_HZ: AtomicUsize = AtomicUsize::new(10_000_000);
 
+const NS_FACTOR_SHIFT: u32 = 32;
+static NS_FACTOR: AtomicU64 =
+    AtomicU64::new(((1_000_000_000u128 << NS_FACTOR_SHIFT) / 10_000_000) as u64);
+
+/// 设置稳定计时器频率，同时刷新 ns 转换的预算因子。
+pub fn set_stable_counter_hz(hz: usize) {
+    STABLE_TIMER_HZ.store(hz, Ordering::Relaxed);
+    let hz = hz.max(1) as u128;
+    let factor = ((1_000_000_000u128 << NS_FACTOR_SHIFT) / hz) as u64;
+    NS_FACTOR.store(factor, Ordering::Release);
+}
+
 /// 默认周期性调度 tick 频率。
 pub const DEFAULT_TIMER_HZ: usize = 100;
 
@@ -29,14 +41,11 @@ pub fn stable_counter_hz() -> u64 {
 
 #[inline]
 pub fn stable_counter_to_ns(cnt: u64) -> u64 {
-    let hz = stable_counter_hz();
-    if hz == 0 {
+    let factor = NS_FACTOR.load(Ordering::Relaxed);
+    if factor == 0 {
         return 0;
     }
-    // 用 u128 中间值避免 (cnt % hz) * 1e9 溢出
-    let secs = cnt / hz;
-    let rem = cnt % hz;
-    secs * 1_000_000_000 + (rem as u128 * 1_000_000_000 / hz as u128) as u64
+    ((cnt as u128 * factor as u128) >> NS_FACTOR_SHIFT) as u64
 }
 
 #[inline]

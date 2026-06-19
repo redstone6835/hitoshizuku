@@ -139,11 +139,18 @@ fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
         return;
     }
     let page_size = LoongArch64Paging::PAGE_SIZE;
+    const PAGE_THRESHOLD: usize = 64;
     let Some(end) = vaddr.checked_add(len) else {
         unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
         return;
     };
-    let mut va = vaddr & !(page_size - 1);
+    let aligned_start = vaddr & !(page_size - 1);
+    let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
+    if pages > PAGE_THRESHOLD {
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    }
+    let mut va = aligned_start;
     while va < end {
         // Safety: flush_tlb_with_asid 不解引用任何指针，仅发 invtlb。
         unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };

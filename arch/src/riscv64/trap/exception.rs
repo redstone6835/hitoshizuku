@@ -34,11 +34,15 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     if !from_user || !sched::is_ready() {
         return;
     }
-
-    let _ =
-        sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(tf_ptr));
-
-    match sched::current_task().state() {
+    let task = sched::current_task();
+    if !task.signal.has_any_pending() && task.shared_signal_pending_bits_quick() == 0 {
+        return;
+    }
+    let _ = sched::operation::deliver_pending_signals_for_task(
+        &task,
+        sched::UserContextRef::new(tf_ptr),
+    );
+    match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
             sched::schedule_once(kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
@@ -178,8 +182,9 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         tf_ptr
     } else if code == EXC_ECALL_U || code == EXC_ECALL_S {
         general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
-        // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
-        sched::preempt_if_needed(kernel_timestamp_ns());
+        if sched::needs_resched_current() {
+            sched::preempt_if_needed(kernel_timestamp_ns());
+        }
         tf_ptr
     } else if code == EXC_INST_PAGE_FAULT
         || code == EXC_LOAD_PAGE_FAULT
@@ -295,21 +300,28 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// 但只处理 ecall（入口未保存 FPU）。
 ///
 /// 由汇编快速路径在确认 scause=8 后直接调用。
-/// 只有 FS=Dirty 时才保存 FPU；FS=Off 表示该线程尚未使用浮点寄存器，不能在
-/// pthread/futex 这类 syscall 热路径上无条件搬运 32 个浮点寄存器。
+/// 只有 FS=Off 时才允许完全跳过 FPU；FS!=Off 说明用户态可能依赖浮点现场，
+/// 需要保存后走完整恢复路径，避免 signal/resched/full restore 读到旧状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
     let tf = unsafe { trap_frame_mut(tf_ptr) };
 
-    // 惰性保存 FPU：仅在 sstatus.FS=Dirty 时执行。
-    // 这保证 signal delivery 构建 sigframe 时能从 tf.f[] 正确读取用户态浮点状态。
-    if (tf.status & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY {
+    let fpu_dirty = (tf.status & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY;
+    if fpu_dirty {
         unsafe { save_fpu_to_frame(tf) };
     }
 
-    general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
-    // dispatch 内部已经通过 ops.advance_pc 推进了 sepc，不需要再 skip
-    sched::preempt_if_needed(kernel_timestamp_ns());
+    let nr = tf.a7;
+    let args = [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5];
+    general::syscall::dispatch_fast(general::TrapFramePtr::new(tf_ptr), nr, args);
+
+    if sched::needs_resched_current() {
+        sched::preempt_if_needed(kernel_timestamp_ns());
+        return tf_ptr | 1;
+    }
+    if fpu_dirty {
+        return tf_ptr | 1;
+    }
     tf_ptr
 }
 
