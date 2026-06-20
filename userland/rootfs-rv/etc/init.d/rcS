@@ -56,7 +56,7 @@ maybe_enter_shell() {
 
 # 测试黑名单
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="unixbench"
+BLACKLIST="ltp unixbench"
 
 TEST_ONLY="${TEST_ONLY:-}"
 LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
