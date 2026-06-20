@@ -637,9 +637,6 @@ pub fn run_post_syscall_handoff_lazy() {
 #[inline]
 pub fn run_post_syscall_handoff_lazy_unchecked() {
     let cpu_id = cpu();
-    if RETIRED_TASKS_NONEMPTY[cpu_id].load(Ordering::Relaxed) {
-        cleanup_retired_tasks(cpu_id);
-    }
     if POST_SYSCALL_HANDOFF[cpu_id].load(Ordering::Relaxed) == 0 {
         return;
     }
