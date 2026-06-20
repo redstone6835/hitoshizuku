@@ -18,21 +18,20 @@ use mm::UserAccessError;
 use crate::mm::ops::user_access_ops;
 
 /// 从用户地址 `user` 读 `dst.len()` 字节到 `dst`。
+#[inline]
 pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError> {
     let Some(ops) = user_access_ops() else {
         return Err(UserAccessError::Fault);
     };
-    // Safety: dst 切片来自 Rust 借用，长度有效；user 由 arch 内部按 __ex_table
-    //         fixup 处理任何故障。
     unsafe { (ops.copy_from_user)(dst.as_mut_ptr(), user, dst.len()) }
 }
 
 /// 把 `src` 写到用户地址 `user`。
+#[inline]
 pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
     let Some(ops) = user_access_ops() else {
         return Err(UserAccessError::Fault);
     };
-    // Safety: 同上。
     unsafe { (ops.copy_to_user)(user, src.as_ptr(), src.len()) }
 }
 

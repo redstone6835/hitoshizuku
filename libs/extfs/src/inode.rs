@@ -1030,6 +1030,7 @@ impl InodeOps for ExtInodeOps {
                 self.ino,
                 Arc::clone(&self.raw),
             ))),
+            FileType::Fifo => vfs::pipe::open_fifo(inode, opts),
             _ => Err(VfsError::NotSupported),
         }
     }

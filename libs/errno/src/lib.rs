@@ -9,6 +9,7 @@ pub enum Errno {
     ESRCH = 3,
     EINTR = 4,
     EIO = 5,
+    ENXIO = 6,
     E2BIG = 7,
     EAGAIN = 11,
     ECHILD = 10,
@@ -67,6 +68,7 @@ impl Errno {
             3 => Errno::ESRCH,
             4 => Errno::EINTR,
             5 => Errno::EIO,
+            6 => Errno::ENXIO,
             7 => Errno::E2BIG,
             8 => Errno::ENOEXEC,
             9 => Errno::EBADF,
@@ -117,6 +119,7 @@ impl Errno {
         }
     }
 
+    #[inline]
     pub fn as_i32(self) -> i32 {
         match self {
             Errno::ESUCCESS => 0,
@@ -125,6 +128,7 @@ impl Errno {
             Errno::ESRCH => 3,
             Errno::EINTR => 4,
             Errno::EIO => 5,
+            Errno::ENXIO => 6,
             Errno::E2BIG => 7,
             Errno::ENOEXEC => 8,
             Errno::EAGAIN => 11,

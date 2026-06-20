@@ -246,13 +246,15 @@ macro_rules! reg_and_get {
             // 的字段写入对所有读者可见。
             $static.store(ops as *const _ as *mut _, Ordering::Release);
         }
+        #[inline]
         pub fn $get() -> Option<&'static $ty> {
-            let ptr = $static.load(Ordering::Acquire);
+            // Relaxed 安全：指针在 init 阶段由 Release store 写入，
+            // 之后不再变化；所有读取必然在 init 完成后发生。
+            let ptr = $static.load(Ordering::Relaxed);
             if ptr.is_null() {
                 None
             } else {
-                // Safety: 仅由 register_* 写入 'static 引用，永不变；
-                // Acquire 读与 Release 写配对。
+                // Safety: 仅由 register_* 写入 'static 引用，永不变。
                 Some(unsafe { &*(ptr as *const $ty) })
             }
         }

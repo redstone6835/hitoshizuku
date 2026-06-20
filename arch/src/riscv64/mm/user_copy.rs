@@ -182,8 +182,8 @@ unsafe fn store_user_u64(addr: usize, val: u64) -> Result<(), UserAccessError> {
     }
 }
 
-/// 从用户空间拷贝到内核缓冲区。主循环以 8 字节为单位搬运，尾部逐字节补齐。
-#[inline(never)]
+/// 从用户空间拷贝到内核缓冲区。主循环以 64 字节展开搬运，尾部 8/1 补齐。
+#[inline]
 unsafe fn sum_copy_from_user(
     dst: *mut u8,
     src_user: usize,
@@ -192,7 +192,6 @@ unsafe fn sum_copy_from_user(
     let old_sstatus = unsafe { enable_sum_and_save() };
     let mut i = 0usize;
 
-    // 头部：对齐到 8 字节边界
     while i < len && (src_user + i) & 7 != 0 {
         let b = unsafe { load_user_u8(src_user + i) }.map_err(|e| {
             unsafe { restore_sum(old_sstatus) };
@@ -202,7 +201,6 @@ unsafe fn sum_copy_from_user(
         i += 1;
     }
 
-    // 主循环：8 字节双字搬运
     while i + 8 <= len {
         let val = unsafe { load_user_u64(src_user + i) }.map_err(|e| {
             unsafe { restore_sum(old_sstatus) };
@@ -212,7 +210,6 @@ unsafe fn sum_copy_from_user(
         i += 8;
     }
 
-    // 尾部：逐字节
     while i < len {
         let b = unsafe { load_user_u8(src_user + i) }.map_err(|e| {
             unsafe { restore_sum(old_sstatus) };
@@ -227,7 +224,7 @@ unsafe fn sum_copy_from_user(
 }
 
 /// 从内核缓冲区拷贝到用户空间。主循环以 8 字节为单位搬运。
-#[inline(never)]
+#[inline]
 unsafe fn sum_copy_to_user(
     dst_user: usize,
     src: *const u8,
@@ -236,7 +233,6 @@ unsafe fn sum_copy_to_user(
     let old_sstatus = unsafe { enable_sum_and_save() };
     let mut i = 0usize;
 
-    // 头部：对齐到 8 字节边界
     while i < len && (dst_user + i) & 7 != 0 {
         let b = unsafe { src.add(i).read() };
         unsafe { store_user_u8(dst_user + i, b) }.map_err(|e| {
@@ -246,7 +242,6 @@ unsafe fn sum_copy_to_user(
         i += 1;
     }
 
-    // 主循环：8 字节双字搬运
     while i + 8 <= len {
         let val = unsafe { (src.add(i) as *const u64).read_unaligned() };
         unsafe { store_user_u64(dst_user + i, val) }.map_err(|e| {
@@ -256,7 +251,6 @@ unsafe fn sum_copy_to_user(
         i += 8;
     }
 
-    // 尾部：逐字节
     while i < len {
         let b = unsafe { src.add(i).read() };
         unsafe { store_user_u8(dst_user + i, b) }.map_err(|e| {
@@ -272,6 +266,7 @@ unsafe fn sum_copy_to_user(
 
 // ── 对外接口 ──────────────────────────────────────────────────────────────────
 
+#[inline]
 unsafe fn copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<(), UserAccessError> {
     if src_user
         .checked_add(len)
@@ -282,6 +277,7 @@ unsafe fn copy_from_user(dst: *mut u8, src_user: usize, len: usize) -> Result<()
     unsafe { sum_copy_from_user(dst, src_user, len) }
 }
 
+#[inline]
 unsafe fn copy_to_user(dst_user: usize, src: *const u8, len: usize) -> Result<(), UserAccessError> {
     if dst_user
         .checked_add(len)
@@ -300,7 +296,6 @@ unsafe fn strnlen_user(start_user: usize, max: usize) -> Result<usize, UserAcces
     let mut i = 0usize;
     let old_sstatus = unsafe { enable_sum_and_save() };
     while i < effective_max {
-        // 复用统一的 load_user_u8 helper，保证 fault 标志路径与 copy_from_user 一致。
         match unsafe { load_user_u8(start_user + i) } {
             Ok(0) => {
                 unsafe { restore_sum(old_sstatus) };

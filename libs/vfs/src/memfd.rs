@@ -126,6 +126,22 @@ impl MemfdFileData {
         Ok(written)
     }
 
+    fn reserve(&mut self, offset: u64, len: u64, keep_size: bool) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+        let first_page = offset / MEMFD_PAGE_SIZE_U64;
+        let last_page = (end.saturating_sub(1)) / MEMFD_PAGE_SIZE_U64;
+        for page_index in first_page..=last_page {
+            let _ = self.get_or_create_page(page_index)?;
+        }
+        if !keep_size {
+            self.size = self.size.max(end);
+        }
+        Ok(())
+    }
+
     fn page_pos(&self, index: u64) -> Result<usize, usize> {
         self.pages.binary_search_by_key(&index, |page| page.index)
     }
@@ -213,6 +229,25 @@ impl MemfdState {
             return Err(VfsError::OperationNotPermitted);
         }
         inner.file.truncate(size);
+        Self::update_inode_size(&inner);
+        drop(inner);
+        self.waiters.wake_all();
+        Ok(())
+    }
+
+    fn reserve(&self, offset: u64, len: u64, keep_size: bool) -> VfsResult<()> {
+        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+        if end > usize::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
+        let mut inner = self.inner.lock();
+        if (inner.seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
+            return Err(VfsError::OperationNotPermitted);
+        }
+        if !keep_size && end > inner.file.size && (inner.seals & F_SEAL_GROW) != 0 {
+            return Err(VfsError::OperationNotPermitted);
+        }
+        inner.file.reserve(offset, len, keep_size)?;
         Self::update_inode_size(&inner);
         drop(inner);
         self.waiters.wake_all();
@@ -324,11 +359,8 @@ impl FileOps for MemfdFileOps {
         self.state.waiters.remove(task);
     }
 
-    fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
-        let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
-        // memfd/tmpfs backing is sparse: reserve logical size here and allocate
-        // real pages lazily when data is written or a shared mmap page is dirtied.
-        self.state.truncate(end)
+    fn fallocate(&self, offset: u64, len: u64, keep_size: bool) -> VfsResult<()> {
+        self.state.reserve(offset, len, keep_size)
     }
 
     fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {

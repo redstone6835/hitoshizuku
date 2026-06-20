@@ -59,6 +59,7 @@ const DT_REL: u64 = 17;
 const DT_RELSZ: u64 = 18;
 const DT_JMPREL: u64 = 23;
 const DT_PLTRELSZ: u64 = 2;
+const MAX_EXEC_FILE_SIZE: usize = 64 * 1024 * 1024;
 
 pub struct LoadedUserImage {
     pub vm: Arc<VmSpace>,
@@ -717,13 +718,36 @@ fn load_file_from_task_vfs(task: &Arc<Task>, path: &str) -> Result<Vec<u8>, errn
         let _ = tmp_fdt.close_fd(fd);
         return Err(errno::Errno::ENOEXEC);
     }
-    let mut bytes = Vec::new();
-    bytes.resize(size, 0);
+    if size > MAX_EXEC_FILE_SIZE {
+        let _ = tmp_fdt.close_fd(fd);
+        log::info!(
+            "[user] load path={:?} rejected oversized exec image size={}",
+            path,
+            size
+        );
+        return Err(errno::Errno::EFBIG);
+    }
+    let mut bytes = fallible_zeroed_vec(size).map_err(|err| {
+        let _ = tmp_fdt.close_fd(fd);
+        err
+    })?;
     let mut off = 0usize;
     while off < size {
-        let n = file
-            .read_at(&mut bytes[off..], off as u64)
-            .map_err(|err| err.to_errno())?;
+        let n = match file.read_at(&mut bytes[off..], off as u64) {
+            Ok(n) => n,
+            Err(err) => {
+                let errno = err.to_errno();
+                log::warning!(
+                    "[user] load path={:?} read_at failed off={} size={} err={:?}",
+                    path,
+                    off,
+                    size,
+                    errno
+                );
+                let _ = tmp_fdt.close_fd(fd);
+                return Err(errno);
+            }
+        };
         if n == 0 {
             break;
         }
@@ -731,5 +755,17 @@ fn load_file_from_task_vfs(task: &Arc<Task>, path: &str) -> Result<Vec<u8>, errn
     }
     bytes.truncate(off);
     let _ = tmp_fdt.close_fd(fd);
+    Ok(bytes)
+}
+
+fn fallible_zeroed_vec(size: usize) -> Result<Vec<u8>, errno::Errno> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| errno::Errno::ENOMEM)?;
+    unsafe {
+        core::ptr::write_bytes(bytes.as_mut_ptr(), 0, size);
+        bytes.set_len(size);
+    }
     Ok(bytes)
 }

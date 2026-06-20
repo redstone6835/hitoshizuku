@@ -780,7 +780,7 @@ pub(super) fn sys_clock_gettime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
 
 pub(super) fn sys_uname(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let mut out = [0u8; 65 * 6];
-    write_uts_field(&mut out, 0, b"MyGo");
+    write_uts_field(&mut out, 0, b"Linux");
     write_uts_dynamic_field(&mut out, 1, &UTS_HOSTNAME, b"mygo");
     write_uts_field(&mut out, 2, b"10.1.0");
     write_uts_field(&mut out, 3, b"MyGo kernel");

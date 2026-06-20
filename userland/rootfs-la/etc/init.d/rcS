@@ -58,21 +58,35 @@ maybe_enter_shell() {
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
 BLACKLIST="unixbench"
 
+TEST_ONLY="${TEST_ONLY:-}"
 LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
 LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
 LTP_DIAG_CASES="${LTP_DIAG_CASES:-waitpid12}"
 LTP_ONLY_CASES="${LTP_ONLY_CASES:-}"
 LTP_SKIP_CASES="${LTP_SKIP_CASES:-accept03 clone07 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 crash01 crash02 crypto_user01 crypto_user02 fcntl14 fcntl14_64 fcntl15 fcntl15_64 fcntl18 fcntl18_64 fcntl19_64 fcntl31 futex_cmp_requeue01 genacos genasin genatan genatan2 genbessel genceil gencos gencosh genexp genexp_log genfabs genfloor genfmod genfrexp genhypot geniperb genj0 genj1 genldexp genlgamma genload genlog genlog10 genmodf genpow genpower gensin gensinh gensqrt gentan gentanh gentrigo geny0 geny1 hackbench kill09 mmap3 mmapstress01 mmapstress02 mmapstress03 mmapstress04 mmapstress05 mmapstress06 mmapstress07 mmapstress08 mmapstress09 mmapstress10 mmstress mmstress_dummy modify_ldt01 modify_ldt02 modify_ldt03 pcrypt_aead01 splice07 syslog12 symlinkat01 waitid05 waitpid10 waitpid11 waitpid13 pthserv}"
-if [ -z "$LTP_ONLY_CASES" ] && [ -r /sys/kernel/cmdline ]; then
-    for arg in $(cat /sys/kernel/cmdline 2>/dev/null); do
+for cmdline in /sys/kernel/cmdline /proc/cmdline; do
+    [ -r "$cmdline" ] || continue
+    for arg in $(cat "$cmdline" 2>/dev/null); do
         case "$arg" in
+            test_only=*) TEST_ONLY="${arg#test_only=}" ;;
             ltp_only=*) LTP_ONLY_CASES="${arg#ltp_only=}" ;;
+            ltp_timeout=*) LTP_TIMEOUT="${arg#ltp_timeout=}" ;;
+            ltp_kill_grace=*) LTP_KILL_GRACE="${arg#ltp_kill_grace=}" ;;
         esac
     done
-fi
-export LTP_TIMEOUT LTP_KILL_GRACE LTP_DIAG_CASES LTP_ONLY_CASES
+done
+LTP_ONLY_CASES="$(printf '%s' "$LTP_ONLY_CASES" | tr ',' ' ')"
+export TEST_ONLY LTP_TIMEOUT LTP_KILL_GRACE LTP_DIAG_CASES LTP_ONLY_CASES
 
 _is_blacklisted() {
+    if [ -n "$TEST_ONLY" ]; then
+        for _only in $TEST_ONLY; do
+            case "$1" in
+                *${_only}*) return 1 ;;
+            esac
+        done
+        return 0
+    fi
     for _bl in $BLACKLIST; do
         case "$1" in
             *${_bl}*) return 0 ;;
@@ -283,10 +297,15 @@ run_ltp_script() {
     script="$1"
     libc_name="${PWD##*/}"
     target_dir="ltp/testcases/bin"
+    old_path="$PATH"
+    PATH="$PWD/$target_dir:$PATH"
+    export PATH
 
     echo "#### OS COMP TEST GROUP START ltp-$libc_name ####"
     if [ ! -d "$target_dir" ]; then
         echo "[ltp] LTP 目录不完整：$PWD/$target_dir"
+        PATH="$old_path"
+        export PATH
         echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
         return 0
     fi
@@ -311,6 +330,8 @@ run_ltp_script() {
         fi
     done
 
+    PATH="$old_path"
+    export PATH
     echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
     return 0
 }

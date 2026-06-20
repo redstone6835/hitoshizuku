@@ -562,7 +562,7 @@ impl File {
     }
 
     /// 为指定范围分配底层存储。是否支持由具体文件系统决定。
-    pub fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+    pub fn fallocate(&self, offset: u64, len: u64, keep_size: bool) -> VfsResult<()> {
         if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
@@ -576,7 +576,7 @@ impl File {
             return Err(crate::vfs::error::VfsError::IllegalSeek);
         }
         self.mount.check_writable()?;
-        self.ops.fallocate(offset, len)
+        self.ops.fallocate(offset, len, keep_size)
     }
 
     /// 将文件操作对象向下转型为具体驱动类型 `T`。
@@ -804,7 +804,7 @@ pub trait FileOps {
     }
 
     /// 为指定范围分配底层存储。默认表示该文件类型不支持 `fallocate(2)`。
-    fn fallocate(&self, _offset: u64, _len: u64) -> VfsResult<()> {
+    fn fallocate(&self, _offset: u64, _len: u64, _keep_size: bool) -> VfsResult<()> {
         Err(crate::vfs::error::VfsError::NotSupported)
     }
 

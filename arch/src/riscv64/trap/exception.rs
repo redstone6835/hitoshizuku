@@ -98,6 +98,7 @@ fn terminate_user_exception(tf: &TrapFrame, code: usize, sig: sched::SignalNumbe
 }
 
 /// 解码中断：从 SCAUSE 寄存器提取中断类型。
+#[inline]
 fn decode_interrupt(cause: usize) -> Interrupt {
     // RISC-V 把待处理中断类型压在 SCAUSE 的高比特位。与 LoongArch 不同，RISC-V
     // 的中断类型通过单独的 exception code 区分。这里做的就是把硬件编码翻译成上层
@@ -303,6 +304,7 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// 只有 FS=Off 时才允许完全跳过 FPU；FS!=Off 说明用户态可能依赖浮点现场，
 /// 需要保存后走完整恢复路径，避免 signal/resched/full restore 读到旧状态。
 #[unsafe(no_mangle)]
+#[inline]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
     let tf = unsafe { trap_frame_mut(tf_ptr) };
 
@@ -313,9 +315,14 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
 
     let nr = tf.a7;
     let args = [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5];
-    general::syscall::dispatch_fast(general::TrapFramePtr::new(tf_ptr), nr, args);
+    general::syscall::dispatch_fast_with_ops(
+        general::TrapFramePtr::new(tf_ptr),
+        nr,
+        args,
+        &crate::riscv64::syscall::frame_ops::SYSCALL_FRAME_OPS,
+    );
 
-    if sched::needs_resched_current() {
+    if sched::needs_resched_current_unchecked() {
         sched::preempt_if_needed(kernel_timestamp_ns());
         return tf_ptr | 1;
     }

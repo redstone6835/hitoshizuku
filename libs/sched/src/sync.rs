@@ -59,6 +59,13 @@ impl<T> Spinlock<T> {
         }
     }
 
+    /// 不获取锁直接读内部数据的引用。
+    /// Safety: 调用方确保数据在此期间不会被其他线程修改。
+    #[inline]
+    pub unsafe fn get_unchecked(&self) -> &T {
+        unsafe { &*self.data.get() }
+    }
+
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
         while self
             .locked

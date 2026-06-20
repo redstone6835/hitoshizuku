@@ -160,13 +160,15 @@ pub fn register_time(ops: &'static ArchTimeOps) {
 }
 
 /// 取已注入的时间契约。
+#[inline]
 pub fn time() -> Option<&'static ArchTimeOps> {
-    let ptr = TIME_OPS.load(Ordering::Acquire);
+    let ptr = TIME_OPS.load(Ordering::Relaxed);
     if ptr.is_null() {
         None
     } else {
-        // Safety: register_time 仅接受 'static；非空指针永久有效。Acquire 与
-        // register_time 的 Release 配对。
+        // Safety: register_time 仅接受 'static；非空指针永久有效。
+        // 使用 Relaxed 安全：指针在 init 阶段由 Release store 写入，
+        // init 完成后不再变化；热路径调用必然发生在 init 之后。
         Some(unsafe { &*(ptr as *const ArchTimeOps) })
     }
 }

@@ -14,6 +14,7 @@ use core::ptr::addr_of;
 use general::TrapFramePtr;
 use general::mm::{FaultDecodeOps, FaultKind};
 
+use crate::riscv64::addr::KERNEL_VA_OFFSET;
 use crate::riscv64::specific::{
     EXC_INST_PAGE_FAULT, EXC_LOAD_ACCESS, EXC_LOAD_PAGE_FAULT, EXC_STORE_ACCESS,
     EXC_STORE_PAGE_FAULT, SCAUSE_INTERRUPT, TrapFrame,
@@ -75,6 +76,7 @@ fn fault_from_user(tf: TrapFramePtr) -> bool {
 fn try_fixup_kernel_access(tf: TrapFramePtr) -> bool {
     let frame = unsafe { as_tf(tf) };
     let pc = frame.sepc;
+    let canonical_pc = pc.wrapping_add(KERNEL_VA_OFFSET);
 
     let start = addr_of!(__ex_table_start) as usize;
     let end = addr_of!(__ex_table_end) as usize;
@@ -89,7 +91,7 @@ fn try_fixup_kernel_access(tf: TrapFramePtr) -> bool {
 
     for i in 0..count {
         let entry = unsafe { core::ptr::read(table.add(i)) };
-        if entry.fault_pc == pc {
+        if entry.fault_pc == pc || entry.fault_pc == canonical_pc {
             unsafe { as_tf_mut(tf).sepc = entry.fixup_pc };
             return true;
         }

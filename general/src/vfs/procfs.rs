@@ -61,6 +61,13 @@ const NET_DEV_INO: u64 = 17;
 const PNP_INO: u64 = 18;
 const DEVICE_FUNCTIONS_INO: u64 = 19;
 const SYS_PID_MAX_INO: u64 = 20;
+const CMDLINE_INO: u64 = 21;
+const SYS_CORE_PATTERN_INO: u64 = 22;
+const SYS_TAINTED_INO: u64 = 23;
+const SYS_FS_INO: u64 = 24;
+const SYS_FS_PIPE_MAX_SIZE_INO: u64 = 25;
+const SYS_VM_INO: u64 = 26;
+const SYS_VM_OVERCOMMIT_MEMORY_INO: u64 = 27;
 
 const PROC_DYNAMIC_BASE: u64 = 1_000_000;
 const PROC_FD_BASE: u64 = 10_000_000_000;
@@ -208,6 +215,7 @@ enum RootFileKind {
     Devices,
     Pnp,
     DeviceFunctions,
+    Cmdline,
 }
 
 #[derive(Clone, Copy)]
@@ -228,6 +236,10 @@ enum ProcFileKind {
     Task { pid: PidT, kind: TaskFileKind },
     SysHotplug,
     SysPidMax,
+    SysCorePattern,
+    SysTainted,
+    SysFsPipeMaxSize,
+    SysVmOvercommitMemory,
 }
 
 #[derive(Clone, Copy)]
@@ -343,6 +355,7 @@ fn root_inode(fs_id: FsId, weak_sb: &Weak<Superblock>, now: Timespec) -> Arc<Ino
             "device-functions",
             mk_root_file(DEVICE_FUNCTIONS_INO, RootFileKind::DeviceFunctions),
         ),
+        ("cmdline", mk_root_file(CMDLINE_INO, RootFileKind::Cmdline)),
         ("self", self_inode),
         ("thread-self", thread_self_inode),
         ("sys", sys_inode),
@@ -1025,6 +1038,8 @@ impl InodeOps for ProcSysDirOps {
     fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
         match name {
             "kernel" => Ok(proc_sys_kernel_dir_inode(self.fs_id, &self.weak_sb)),
+            "fs" => Ok(proc_sys_fs_dir_inode(self.fs_id, &self.weak_sb)),
+            "vm" => Ok(proc_sys_vm_dir_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1036,11 +1051,23 @@ impl InodeOps for ProcSysDirOps {
         _: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         Ok(Box::new(ProcDirFile {
-            snapshot: vec![DirEntry {
-                ino: SYS_KERNEL_INO,
-                name: SmallStr::new("kernel"),
-                kind: FileType::Directory,
-            }],
+            snapshot: vec![
+                DirEntry {
+                    ino: SYS_KERNEL_INO,
+                    name: SmallStr::new("kernel"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_FS_INO,
+                    name: SmallStr::new("fs"),
+                    kind: FileType::Directory,
+                },
+                DirEntry {
+                    ino: SYS_VM_INO,
+                    name: SmallStr::new("vm"),
+                    kind: FileType::Directory,
+                },
+            ],
         }))
     }
 
@@ -1077,6 +1104,8 @@ impl InodeOps for ProcSysKernelDirOps {
         match name {
             "hotplug" => Ok(proc_sys_hotplug_inode(self.fs_id, &self.weak_sb)),
             "pid_max" => Ok(proc_sys_pid_max_inode(self.fs_id, &self.weak_sb)),
+            "core_pattern" => Ok(proc_sys_core_pattern_inode(self.fs_id, &self.weak_sb)),
+            "tainted" => Ok(proc_sys_tainted_inode(self.fs_id, &self.weak_sb)),
             _ => Err(VfsError::NotFound),
         }
     }
@@ -1097,6 +1126,16 @@ impl InodeOps for ProcSysKernelDirOps {
                 DirEntry {
                     ino: SYS_PID_MAX_INO,
                     name: SmallStr::new("pid_max"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_CORE_PATTERN_INO,
+                    name: SmallStr::new("core_pattern"),
+                    kind: FileType::Regular,
+                },
+                DirEntry {
+                    ino: SYS_TAINTED_INO,
+                    name: SmallStr::new("tainted"),
                     kind: FileType::Regular,
                 },
             ],
@@ -1135,6 +1174,169 @@ fn proc_sys_pid_max_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode>
         1,
         Arc::new(ProcRegularInodeOps {
             kind: ProcFileKind::SysPidMax,
+        }),
+    )
+}
+
+fn proc_sys_core_pattern_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_CORE_PATTERN_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysCorePattern,
+        }),
+    )
+}
+
+fn proc_sys_tainted_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_TAINTED_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysTainted,
+        }),
+    )
+}
+
+fn proc_sys_fs_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysFsDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysFsDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysFsDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "pipe-max-size" => Ok(proc_sys_fs_pipe_max_size_inode(self.fs_id, &self.weak_sb)),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![DirEntry {
+                ino: SYS_FS_PIPE_MAX_SIZE_INO,
+                name: SmallStr::new("pipe-max-size"),
+                kind: FileType::Regular,
+            }],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_fs_pipe_max_size_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_FS_PIPE_MAX_SIZE_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysFsPipeMaxSize,
+        }),
+    )
+}
+
+fn proc_sys_vm_dir_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_VM_INO,
+        FileType::Directory,
+        0o555,
+        2,
+        Arc::new(ProcSysVmDirOps {
+            fs_id,
+            weak_sb: weak_sb.clone(),
+        }),
+    )
+}
+
+struct ProcSysVmDirOps {
+    fs_id: FsId,
+    weak_sb: Weak<Superblock>,
+}
+
+impl InodeOps for ProcSysVmDirOps {
+    fn lookup(&self, _: &Inode, name: &str) -> VfsResult<Arc<Inode>> {
+        match name {
+            "overcommit_memory" => Ok(proc_sys_vm_overcommit_memory_inode(
+                self.fs_id,
+                &self.weak_sb,
+            )),
+            _ => Err(VfsError::NotFound),
+        }
+    }
+
+    fn open(
+        &self,
+        _: &Inode,
+        _: &OpenOptions,
+        _: &Credentials,
+    ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+        Ok(Box::new(ProcDirFile {
+            snapshot: vec![DirEntry {
+                ino: SYS_VM_OVERCOMMIT_MEMORY_INO,
+                name: SmallStr::new("overcommit_memory"),
+                kind: FileType::Regular,
+            }],
+        }))
+    }
+
+    fn readlink(&self, _: &Inode) -> VfsResult<String> {
+        Err(VfsError::InvalidArgument)
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+fn proc_sys_vm_overcommit_memory_inode(fs_id: FsId, weak_sb: &Weak<Superblock>) -> Arc<Inode> {
+    mk_inode(
+        fs_id,
+        weak_sb,
+        SYS_VM_OVERCOMMIT_MEMORY_INO,
+        FileType::Regular,
+        0o444,
+        1,
+        Arc::new(ProcRegularInodeOps {
+            kind: ProcFileKind::SysVmOvercommitMemory,
         }),
     )
 }
@@ -1777,6 +1979,7 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
             RootFileKind::Devices => render_devices().into_bytes(),
             RootFileKind::Pnp => render_pnp().into_bytes(),
             RootFileKind::DeviceFunctions => render_device_functions().into_bytes(),
+            RootFileKind::Cmdline => render_cmdline().into_bytes(),
         }),
         ProcFileKind::Task { pid, kind } => {
             let task = lookup_task(pid).ok_or(VfsError::NotFound)?;
@@ -1794,6 +1997,12 @@ fn render_proc_file(kind: ProcFileKind) -> VfsResult<Vec<u8>> {
         }
         ProcFileKind::SysHotplug => Ok(render_hotplug().into_bytes()),
         ProcFileKind::SysPidMax => Ok(render_pid_max().into_bytes()),
+        ProcFileKind::SysCorePattern => Ok(b"core\n".to_vec()),
+        ProcFileKind::SysTainted => Ok(b"0\n".to_vec()),
+        ProcFileKind::SysFsPipeMaxSize => {
+            Ok(format!("{}\n", vfs::pipe::PIPE_CAPACITY).into_bytes())
+        }
+        ProcFileKind::SysVmOvercommitMemory => Ok(b"0\n".to_vec()),
     }
 }
 
@@ -2213,6 +2422,14 @@ fn render_hotplug() -> String {
 
 fn render_pid_max() -> String {
     format!("{}\n", sched::pid::DEFAULT_PID_MAX)
+}
+
+fn render_cmdline() -> String {
+    let Some(bytes) = crate::start::start_cmdline() else {
+        return "\n".to_string();
+    };
+    let text = crate::cmdline::Cmdline::new(bytes).as_str();
+    format!("{text}\n")
 }
 
 fn render_filesystems() -> String {

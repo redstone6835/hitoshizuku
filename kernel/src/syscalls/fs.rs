@@ -96,6 +96,8 @@ const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_SETPIPE_SZ: usize = 1031;
+const F_GETPIPE_SZ: usize = 1032;
 const F_SETLEASE: usize = 1024;
 const F_GETLEASE: usize = 1025;
 const F_ADD_SEALS: usize = 1033;
@@ -253,8 +255,8 @@ pub(super) fn sys_lseek(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_openat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let flags = decode_open_options(ctx.args[2])?;
     let mode = FileMode::new((ctx.args[3] & 0o7777) as u16);
     let fd =
@@ -290,7 +292,7 @@ pub(super) fn sys_newfstatat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         let fd = fd_arg(raw_dirfd)?;
         operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &fdt, &path)?;
         operation::fstatat(&vfs_ctx, &dirfd, &path, (flags & AT_SYMLINK_NOFOLLOW) != 0)
             .map_err(|e| e.to_errno())?
     };
@@ -323,7 +325,7 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
         }
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &fdt, &path)?;
         operation::fstatat(&vfs_ctx, &dirfd, &path, (flags & AT_SYMLINK_NOFOLLOW) != 0)
             .map_err(|e| e.to_errno())?
     };
@@ -334,8 +336,8 @@ pub(super) fn sys_statx(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_readlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let buf = ctx.args[2];
     let size = ctx.args[3];
 
@@ -448,6 +450,10 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
             fcntl_setlk(ctx, &file, arg, true)
         }
+        F_GETPIPE_SZ | F_SETPIPE_SZ => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            file.ioctl(IoctlCmd::new(cmd), arg)
+        }
         F_SETLEASE => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
             let lock_type = arg as i32;
@@ -543,8 +549,8 @@ pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_mkdirat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let mode = FileMode::new((ctx.args[2] & 0o7777) as u16);
     operation::mkdirat(&vfs_ctx, &dirfd, &path, mode).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -554,9 +560,15 @@ pub(super) fn sys_unlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     const AT_REMOVEDIR: usize = 0x200;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let flags = ctx.args[2];
+    if (flags & !AT_REMOVEDIR) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if path.is_empty() {
+        return Err(Errno::ENOENT);
+    }
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     if (flags & AT_REMOVEDIR) != 0 {
         operation::rmdir(&vfs_ctx, &dirfd, &path).map_err(|e| e.to_errno())?;
     } else {
@@ -584,10 +596,10 @@ fn renameat_common(
 ) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let old_dirfd = dirfd_arg(old_dirfd_raw, &fdt)?;
     let old_path = copy_path_from_user(old_path_user)?;
-    let new_dirfd = dirfd_arg(new_dirfd_raw, &fdt)?;
     let new_path = copy_path_from_user(new_path_user)?;
+    let old_dirfd = dirfd_arg_for_path(old_dirfd_raw, &fdt, &old_path)?;
+    let new_dirfd = dirfd_arg_for_path(new_dirfd_raw, &fdt, &new_path)?;
     if flags != 0 {
         return Err(Errno::EINVAL);
     }
@@ -599,10 +611,10 @@ fn renameat_common(
 pub(super) fn sys_linkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let old_dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let old_path = copy_path_from_user(ctx.args[1])?;
-    let new_dirfd = dirfd_arg(ctx.args[2], &fdt)?;
     let new_path = copy_path_from_user(ctx.args[3])?;
+    let old_dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &old_path)?;
+    let new_dirfd = dirfd_arg_for_path(ctx.args[2], &fdt, &new_path)?;
     let flags = ctx.args[4];
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
     if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
@@ -619,8 +631,8 @@ pub(super) fn sys_symlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let target = copy_path_from_user(ctx.args[0])?;
-    let dirfd = dirfd_arg(ctx.args[1], &fdt)?;
     let link_path = copy_path_from_user(ctx.args[2])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[1], &fdt, &link_path)?;
     operation::symlinkat(&vfs_ctx, &target, &dirfd, &link_path).map_err(|e| e.to_errno())?;
     Ok(0)
 }
@@ -628,8 +640,8 @@ pub(super) fn sys_symlinkat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
 pub(super) fn sys_mknodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let mode = ctx.args[2];
     let dev = ctx.args[3] as u64;
     let kind = match mode & 0o170000 {
@@ -661,8 +673,8 @@ pub(super) fn sys_fchmod(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let mode = FileMode::new((ctx.args[2] & 0o7777) as u16);
     operation::fchmodat(&vfs_ctx, &dirfd, &path, mode, false).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -671,10 +683,21 @@ pub(super) fn sys_fchmodat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
 pub(super) fn sys_fchownat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let (uid, gid) = decode_optional_owner(ctx.args[2] as u32, ctx.args[3] as u32);
     let flags = ctx.args[4];
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if path.is_empty() {
+        if (flags & AT_EMPTY_PATH) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let fd = fd_arg(ctx.args[0])?;
+        operation::fchown(&vfs_ctx, &fdt, fd, uid, gid).map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
     operation::fchownat(&vfs_ctx, &dirfd, &path, uid, gid, no_follow).map_err(|e| e.to_errno())?;
     Ok(0)
@@ -723,8 +746,8 @@ pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         return Ok(0);
     }
 
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(path_user)?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
     operation::utimensat(&vfs_ctx, &dirfd, &path, atime, mtime, no_follow)
         .map_err(|e| e.to_errno())?;
@@ -786,6 +809,9 @@ pub(super) fn sys_ftruncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
     let fd = fd_arg(ctx.args[0])?;
     let size = nonnegative_i64_arg(ctx.args[1])?;
     let file = file_for_fd(fd)?;
+    if file.inode().kind() != FileType::Regular {
+        return Err(Errno::EINVAL);
+    }
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
@@ -1245,18 +1271,23 @@ pub(super) fn sys_copy_file_range(ctx: &mut SyscallContext<'_>) -> Result<usize,
 }
 
 pub(super) fn sys_fallocate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    const FALLOC_FL_KEEP_SIZE: usize = 0x01;
     let fd = fd_arg(ctx.args[0])?;
     let mode = ctx.args[1];
     let offset = nonnegative_i64_arg(ctx.args[2])?;
     let len = nonnegative_i64_arg(ctx.args[3])?;
-    if mode != 0 {
+    if (mode & !FALLOC_FL_KEEP_SIZE) != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     let file = file_for_fd(fd)?;
+    if file.inode().kind() != FileType::Regular {
+        return Err(Errno::ENODEV);
+    }
     if !file.flags().writable() {
         return Err(Errno::EINVAL);
     }
-    file.fallocate(offset, len).map_err(|e| e.to_errno())?;
+    file.fallocate(offset, len, (mode & FALLOC_FL_KEEP_SIZE) != 0)
+        .map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -1843,13 +1874,15 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let pollfds = if total_bytes <= pollfds_stack.len() {
         &mut pollfds_stack[..total_bytes]
     } else {
-        pollfds_heap = vec![0u8; total_bytes];
+        pollfds_heap = zeroed_vec(total_bytes)?;
         pollfds_heap.as_mut_slice()
     };
     copy_from_user(fds_user, pollfds).map_err(|e| e.as_errno())?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let mut lookup_index = Vec::with_capacity(nfds.min(64));
-    let mut lookup_fds = Vec::with_capacity(nfds.min(64));
+    let mut lookup_index = Vec::new();
+    lookup_index.try_reserve(nfds).map_err(|_| Errno::ENOMEM)?;
+    let mut lookup_fds = Vec::new();
+    lookup_fds.try_reserve(nfds).map_err(|_| Errno::ENOMEM)?;
     for i in 0..nfds {
         let off = i * POLLFD_SIZE;
         let fd_raw = i32::from_le_bytes(pollfds[off..off + 4].try_into().unwrap());
@@ -1865,9 +1898,13 @@ pub(super) fn sys_ppoll(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let deadline = timeout_deadline(timeout_ms);
     loop {
         let mut count = 0usize;
-        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> =
-            Vec::with_capacity(lookup_fds.len());
-        let files = fdt.get_files_dense(&lookup_fds);
+        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> = Vec::new();
+        waiters
+            .try_reserve(lookup_fds.len())
+            .map_err(|_| Errno::ENOMEM)?;
+        let files = fdt
+            .get_files_dense_fallible(&lookup_fds)
+            .map_err(|e| e.to_errno())?;
         let mut lookup_cursor = 0usize;
 
         for i in 0..nfds {
@@ -1938,8 +1975,10 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let write_out = &mut write_out_storage[..set_len];
     let except_out = &mut except_out_storage[..set_len];
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let mut lookup_index = Vec::with_capacity(nfds.min(64));
-    let mut lookup_fds = Vec::with_capacity(nfds.min(64));
+    let mut lookup_index = Vec::new();
+    lookup_index.try_reserve(nfds).map_err(|_| Errno::ENOMEM)?;
+    let mut lookup_fds = Vec::new();
+    lookup_fds.try_reserve(nfds).map_err(|_| Errno::ENOMEM)?;
     for fd_num in 0..nfds {
         if fdset_test(&read_in, fd_num)
             || fdset_test(&write_in, fd_num)
@@ -1958,9 +1997,13 @@ pub(super) fn sys_pselect6(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         clear_fdset(write_out);
         clear_fdset(except_out);
         let mut count = 0usize;
-        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> =
-            Vec::with_capacity(lookup_fds.len());
-        let files = fdt.get_files_dense(&lookup_fds);
+        let mut waiters: Vec<(Arc<vfs::file::File>, PollEvents)> = Vec::new();
+        waiters
+            .try_reserve(lookup_fds.len())
+            .map_err(|_| Errno::ENOMEM)?;
+        let files = fdt
+            .get_files_dense_fallible(&lookup_fds)
+            .map_err(|e| e.to_errno())?;
         let mut lookup_cursor = 0usize;
 
         for fd_num in 0..nfds {
@@ -2186,6 +2229,13 @@ pub(super) fn sys_vmsplice(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
         return Err(Errno::EINVAL);
     }
     let file = file_for_fd(fd)?;
+    let writable_pipe = file.downcast_ops::<vfs::pipe::PipeWriteEnd>().is_some()
+        || file
+            .downcast_ops::<vfs::pipe::FifoFileOps>()
+            .is_some_and(|fifo| fifo.is_writable());
+    if !writable_pipe {
+        return Err(Errno::EBADF);
+    }
     write_iovecs(&file, iov, iovcnt, None)
 }
 
@@ -2405,8 +2455,8 @@ pub(super) fn sys_fspick(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
 pub(super) fn sys_openat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     let how = read_open_how(ctx.args[2], ctx.args[3])?;
     let supported_resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS;
     let known_unsupported_resolve = RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED;
@@ -2493,7 +2543,6 @@ pub(super) fn sys_quotactl_fd(_ctx: &mut SyscallContext<'_>) -> Result<usize, Er
 pub(super) fn sys_fchmodat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
     let path = copy_path_from_user(ctx.args[1])?;
     let mode = FileMode::new((ctx.args[2] & 0o7777) as u16);
     let flags = ctx.args[3];
@@ -2504,18 +2553,16 @@ pub(super) fn sys_fchmodat2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         if (flags & AT_EMPTY_PATH) == 0 {
             return Err(Errno::ENOENT);
         }
-        match dirfd {
-            Dirfd::Fd(_) => {
-                let fd = fd_arg(ctx.args[0])?;
-                operation::fchmod(&vfs_ctx, &fdt, fd, mode).map_err(|e| e.to_errno())?;
-            }
-            Dirfd::Cwd => {
-                operation::fchmodat(&vfs_ctx, &Dirfd::Cwd, ".", mode, false)
-                    .map_err(|e| e.to_errno())?;
-            }
+        if ctx.args[0] as isize as i32 == AT_FDCWD {
+            operation::fchmodat(&vfs_ctx, &Dirfd::Cwd, ".", mode, false)
+                .map_err(|e| e.to_errno())?;
+        } else {
+            let fd = fd_arg(ctx.args[0])?;
+            operation::fchmod(&vfs_ctx, &fdt, fd, mode).map_err(|e| e.to_errno())?;
         }
         return Ok(0);
     }
+    let dirfd = dirfd_arg_for_path(ctx.args[0], &fdt, &path)?;
     operation::fchmodat(
         &vfs_ctx,
         &dirfd,
@@ -2724,10 +2771,10 @@ fn read_pselect_sigmask(user: usize) -> Result<Option<SigSet>, Errno> {
 }
 
 fn copy_fdset_from_user(user: usize, len: usize) -> Result<Vec<u8>, Errno> {
+    let mut out = zeroed_vec(len)?;
     if user == 0 {
-        return Ok(vec![0u8; len]);
+        return Ok(out);
     }
-    let mut out = vec![0u8; len];
     copy_from_user(user, &mut out).map_err(|e| e.as_errno())?;
     Ok(out)
 }
@@ -2909,6 +2956,14 @@ fn dirfd_arg(raw: usize, fdt: &vfs::fdtable::FdTable) -> Result<Dirfd, Errno> {
     Ok(Dirfd::Fd(file))
 }
 
+fn dirfd_arg_for_path(raw: usize, fdt: &vfs::fdtable::FdTable, path: &str) -> Result<Dirfd, Errno> {
+    if path.starts_with('/') {
+        Ok(Dirfd::Cwd)
+    } else {
+        dirfd_arg(raw, fdt)
+    }
+}
+
 fn file_for_fd(fd: Fd) -> Result<Arc<vfs::file::File>, Errno> {
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     fdt.get_file(fd).ok_or(Errno::EBADF)
@@ -2970,7 +3025,7 @@ fn faccessat_common(ctx: &mut SyscallContext<'_>, has_flags: bool) -> Result<usi
             file.mount().is_rdonly(),
         )
     } else {
-        let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
+        let dirfd = dirfd_arg_for_path(raw_dirfd, &fdt, &path)?;
         let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
             LookupFlags::NO_FOLLOW
         } else {
@@ -3970,7 +4025,6 @@ fn fcntl_getlk(
     let owner_pid = record_lock_owner_pid(ctx);
     if req.lock_type == vfs::record_lock::RecordLockType::Unlock {
         raw.lock_type = F_UNLCK;
-        raw.pid = 0;
         raw.write(flock_user)?;
         return Ok(0);
     }
@@ -3983,7 +4037,6 @@ fn fcntl_getlk(
         raw.pid = conflict.owner_pid;
     } else {
         raw.lock_type = F_UNLCK;
-        raw.pid = 0;
     }
     raw.write(flock_user)?;
     Ok(0)

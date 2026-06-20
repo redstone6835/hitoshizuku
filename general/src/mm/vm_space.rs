@@ -965,29 +965,26 @@ impl VmSpace {
         let mut child_maps = Vec::new();
 
         {
-            let mut parent_pages = self.pages.lock();
-            for (va, mapping) in parent_pages.iter_mut() {
+            let parent_pages = self.pages.lock();
+            for (va, mapping) in parent_pages.iter() {
                 let Some(area) = cloned_set.find(*va) else {
                     continue;
                 };
-                let old_access = mapping.access;
-                mapping.access = access_after_fork(area.flags, &mapping.page);
-                if old_access != mapping.access {
-                    self.protect_page_no_flush(*va, pte_flags_for(area.flags, mapping.access))
-                        .expect("[mm] fork parent protect failed");
-                }
-                let child_mapping = mapping.clone();
-                child_maps.push((
+                let child_page = if should_share_after_fork(area.flags, &mapping.page) {
+                    Arc::clone(&mapping.page)
+                } else {
+                    clone_page_to_anon(&mapping.page).expect("[mm] fork private page clone failed")
+                };
+                let access = access_for_new_page(area.flags, &child_page);
+                child_maps.push((*va, Arc::clone(&child_page), area.flags, access));
+                child_pages.insert(
                     *va,
-                    child_mapping.page.clone(),
-                    area.flags,
-                    child_mapping.access,
-                ));
-                child_pages.insert(*va, child_mapping);
+                    PageMapping {
+                        page: child_page,
+                        access,
+                    },
+                );
             }
-        }
-        if !child_maps.is_empty() {
-            self.flush_full_user_tlb();
         }
 
         for (va, page, flags, access) in &child_maps {
@@ -1467,6 +1464,10 @@ fn access_after_fork(flags: VmFlags, page: &Arc<ResidentPage>) -> PageAccess {
     }
 }
 
+fn should_share_after_fork(flags: VmFlags, page: &Arc<ResidentPage>) -> bool {
+    flags.has(VmFlags::SHARED) || page.is_direct_shared_writable()
+}
+
 fn pte_flags_for(flags: VmFlags, access: PageAccess) -> VmFlags {
     let flags = flags.with(VmFlags::USER);
     if access.pte_writable() {
@@ -1555,7 +1556,10 @@ fn clone_page_to_anon(source: &ResidentPage) -> Result<Arc<ResidentPage>, Errno>
 
 fn fault_from_errno(err: Errno) -> FaultOutcome {
     match err {
-        Errno::ENOMEM => FaultOutcome::Kernel(KernelFaultReason::UncaughtKernelAccess),
+        // 用户地址空间缺页时分配不到物理页，只能说明当前进程无法继续完成
+        // 这次访问；它不是内核非法访存。归为 Segv，避免 LTP 的压力/探测用例把
+        // 整个系统打成 fatal kernel fault。
+        Errno::ENOMEM => FaultOutcome::Segv,
         _ => FaultOutcome::Segv,
     }
 }

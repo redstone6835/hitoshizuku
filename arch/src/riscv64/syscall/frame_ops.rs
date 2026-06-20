@@ -45,7 +45,7 @@ fn advance_pc(tf: TrapFramePtr) {
     f.sepc = f.sepc.wrapping_add(4);
 }
 
-pub(super) static SYSCALL_FRAME_OPS: SyscallFrameOps = SyscallFrameOps {
+pub(crate) static SYSCALL_FRAME_OPS: SyscallFrameOps = SyscallFrameOps {
     sys_nr,
     sys_args,
     set_sys_ret,

@@ -542,8 +542,9 @@ impl Task {
         task
     }
 
+    #[inline]
     pub fn state(&self) -> TaskState {
-        TaskState::from_u8(self.state.load(Ordering::Acquire))
+        TaskState::from_u8(self.state.load(Ordering::Relaxed))
     }
 
     pub fn kind(&self) -> TaskKind {
@@ -967,8 +968,12 @@ impl Task {
         Arc::clone(&self.shared_signal.lock())
     }
 
+    #[inline]
     pub fn shared_signal_pending_bits_quick(&self) -> u64 {
-        self.shared_signal.lock().pending_snapshot().raw()
+        // 无锁快速路径：shared_signal 的 Arc 指针在 syscall 期间不会被替换
+        // （只有 fork/clone 的 install_shared_signal 会修改），直接读 pending_bits。
+        let shared = unsafe { self.shared_signal.get_unchecked() };
+        shared.pending_snapshot().raw()
     }
 
     /// 替换 SharedSignal —— 仅供 spawn 时根据 CLONE_SIGHAND 设定使用。

@@ -51,6 +51,7 @@ pub fn register_frame_ops(ops: &'static SyscallFrameOps) {
     FRAME_OPS.store(ops as *const _ as *mut _, Ordering::Release);
 }
 
+#[inline]
 pub fn frame_ops() -> Option<&'static SyscallFrameOps> {
     let ptr = FRAME_OPS.load(Ordering::Acquire);
     if ptr.is_null() {
@@ -81,6 +82,7 @@ pub struct SyscallContext<'a> {
 }
 
 impl SyscallContext<'_> {
+    #[inline]
     pub fn task(&self) -> &Arc<sched::Task> {
         self.task.as_ref().expect("[syscall] task already released")
     }
@@ -141,7 +143,16 @@ pub fn dispatch(tf: TrapFramePtr) {
     };
     let nr = (ops.sys_nr)(tf);
     let args = (ops.sys_args)(tf);
+    dispatch_known_ops(tf, nr, args, ops);
+}
 
+#[inline]
+fn dispatch_known_ops(
+    tf: TrapFramePtr,
+    nr: usize,
+    args: [usize; 6],
+    ops: &'static SyscallFrameOps,
+) {
     // 取 current task；sched::init 之前不应触发用户 syscall，但安全起见做防御。
     if !sched::is_ready() {
         log::debug!("[syscall] dispatch before sched ready, nr={}", nr);
@@ -162,8 +173,9 @@ pub fn dispatch(tf: TrapFramePtr) {
 
     // syscall 表只在启动期注册；热路径无锁读取函数指针，避免 lmbench
     // simple syscall 每次都争用全局自旋锁。
+    // Relaxed 安全：表条目一旦设置不再修改，init 阶段的 Release 已经完成。
     let entry = if nr < SYSCALL_TABLE_LEN {
-        let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
+        let ptr = SYSCALL_TABLE[nr].load(Ordering::Relaxed);
         if ptr == 0 {
             None
         } else {
@@ -219,14 +231,14 @@ pub fn dispatch(tf: TrapFramePtr) {
             sched::TaskState::Zombie | sched::TaskState::Dead => {
                 ctx.release_task_ref();
                 sched::schedule_once(0);
-                panic!("[syscall] terminal task scheduled back unexpectedly");
+                panic!("[syscall] terminal task scheduled back");
             }
             sched::TaskState::Stopped | sched::TaskState::Continued => {
                 sched::schedule_once(0);
             }
             _ => {}
         }
-        sched::run_post_syscall_handoff_lazy();
+        sched::run_post_syscall_handoff_lazy_unchecked();
     }
     // syscall 是 libcbench/lmbench 的最热路径，默认不能格式化并写入每次调用。
     // 需要单步追踪时临时打开下面的编译期开关即可。
@@ -239,81 +251,18 @@ pub fn dispatch(tf: TrapFramePtr) {
 /// 的任务引用与信号语义。
 #[inline]
 pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
-    let task = sched::current_task();
+    let Some(ops) = frame_ops() else { return };
+    dispatch_known_ops(tf, nr, args, ops);
+}
 
-    let entry = if nr < SYSCALL_TABLE_LEN {
-        let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
-        if ptr == 0 {
-            None
-        } else {
-            Some(unsafe { core::mem::transmute::<usize, SyscallFn>(ptr) })
-        }
-    } else {
-        None
-    };
-
-    let mut ctx = SyscallContext {
-        nr,
-        args,
-        tf,
-        task: Some(task),
-        frame_finalized: false,
-        _phantom: core::marker::PhantomData,
-    };
-
-    let ret: isize = match entry {
-        Some(f) => match f(&mut ctx) {
-            Ok(v) => v as isize,
-            Err(e) => -(e.as_i32() as isize),
-        },
-        None => -(Errno::ENOSYS.as_i32() as isize),
-    };
-
-    let frame_finalized = ctx.frame_finalized();
-    if !frame_finalized {
-        let Some(ops) = frame_ops() else { return };
-        if ret == -(Errno::EINTR.as_i32() as isize) {
-            if let Some((info, action)) = sched::operation::consume_restartable_signal() {
-                let delivered = sched::process_image_ops()
-                    .and_then(|pops| {
-                        (pops.setup_signal_frame)(
-                            ctx.task(),
-                            info,
-                            action,
-                            sched::UserContextRef::new(tf.as_usize()),
-                        )
-                        .ok()
-                    })
-                    .is_some();
-                if delivered {
-                    sched::run_post_syscall_handoff(sched::now_ns_public());
-                    return;
-                }
-            }
-        }
-
-        (ops.set_sys_ret)(tf, ret);
-        (ops.advance_pc)(tf);
-
-        let task = ctx.task();
-        if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
-            let _ = sched::operation::deliver_pending_signals_for_task(
-                task,
-                sched::UserContextRef::new(tf.as_usize()),
-            );
-        }
-
-        match task.state() {
-            sched::TaskState::Zombie | sched::TaskState::Dead => {
-                ctx.release_task_ref();
-                sched::schedule_once(0);
-                panic!("[syscall] terminal task scheduled back");
-            }
-            sched::TaskState::Stopped | sched::TaskState::Continued => {
-                sched::schedule_once(0);
-            }
-            _ => {}
-        }
-        sched::run_post_syscall_handoff_lazy();
-    }
+/// arch 快速 syscall 路径在已经持有静态 frame ops 时使用，避免每次返回阶段
+/// 再做一次全局 ops 查询。语义与 [`dispatch_fast`] 完全一致。
+#[inline]
+pub fn dispatch_fast_with_ops(
+    tf: TrapFramePtr,
+    nr: usize,
+    args: [usize; 6],
+    ops: &'static SyscallFrameOps,
+) {
+    dispatch_known_ops(tf, nr, args, ops);
 }

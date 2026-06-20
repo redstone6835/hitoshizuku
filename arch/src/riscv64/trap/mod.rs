@@ -67,8 +67,6 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd t5, {t5_off}(t6)",
         "csrr t5, {sscratch}",          // t5 = 用户原始 t6
         "sd t5, {t6_off}(t6)",
-        "csrr t4, {satp}",
-        "sd t4, {satp_off}(t6)",        // 保存用户 satp（resume 时恢复）
         "addi t4, t6, {frame_size}",    // t4 = 内核栈顶（t6 + FRAME_SIZE）
         "sd t4, {kstack_top_off}(t6)",   // 保存内核栈顶，用于恢复 sscratch
         // 不切换 satp — 用户页表高半区已有内核映射，直接在用户 satp 下执行内核代码
@@ -111,12 +109,15 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd s11, {s11_off}(sp)",
         "sd t3, {t3_off}(sp)",
 
+        "csrr t0, {satp}",
+        "sd t0, {satp_off}(sp)",
         "csrr t0, {sepc}",
         "sd t0, {sepc_off}(sp)",
         "csrr t0, {sstatus}",
         "sd t0, {status_off}(sp)",
         "sd t5, {cause_off}(sp)",       // t5 还是 scause=8
-        // stval 对 syscall 无意义，跳过
+        // stval 对 syscall 无意义，但完整 TrapFrame 复用该槽，避免保留旧缺页地址。
+        "sd zero, {tval_off}(sp)",
 
         // 调用 syscall 快速路径 handler（不保存/恢复 FPU）
         "mv a0, sp",
@@ -128,7 +129,7 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "andi t0, a0, 1",
         "bnez t0, 11f",
 
-        // 快速 syscall resume：只恢复 ABI 要求的寄存器
+        // 快速 syscall resume：恢复全部 GPR + CSR，不恢复 FPU
         "mv s11, a0",
         "ld t0, {sepc_off}(s11)",
         "csrw {sepc}, t0",
@@ -172,12 +173,15 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         // 完整恢复路径（FPU active 或需要调度）
         "11:",
-        "andi a0, a0, -2",
+        "andi t1, a0, -2",
+        "mv a0, t1",
         "tail {resume}",
 
         // 保存上下文：
         "4:",
         "mv sp, t6",
+        "csrr t4, {satp}",
+        "sd t4, {satp_off}(sp)",
 
         "sd ra, {ra_off}(sp)",
         "sd t0, {t0_off}(sp)",

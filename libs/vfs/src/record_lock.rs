@@ -143,9 +143,14 @@ impl RecordLockState {
             .map(RecordLock::conflict_view)
     }
 
-    fn apply(&mut self, owner: RecordOwner, req: RecordLockRequest) {
-        let mut out = Vec::with_capacity(self.locks.len().saturating_add(1));
-        for lock in self.locks.drain(..) {
+    fn apply(&mut self, owner: RecordOwner, req: RecordLockRequest) -> Result<(), Errno> {
+        // 对同一 owner，已有锁在每次 apply 后保持不重叠。一个连续请求最多
+        // 把一个旧区间拆成左右两段，再插入一个新区间，因此 len + 2 足够。
+        // 先构造完整新状态，最后替换 self.locks，保证 ENOMEM 时旧锁不丢失。
+        let capacity = self.locks.len().saturating_add(2);
+        let mut out = Vec::new();
+        out.try_reserve(capacity).map_err(|_| Errno::ENOMEM)?;
+        for lock in self.locks.iter().copied() {
             if lock.owner.pid != owner.pid || !lock.overlaps(&req) {
                 out.push(lock);
                 continue;
@@ -171,6 +176,7 @@ impl RecordLockState {
         }
 
         self.locks = normalize(out);
+        Ok(())
     }
 
     fn release_owner(&mut self, owner: RecordOwner) -> bool {
@@ -210,7 +216,7 @@ pub fn setlk(file: &File, owner_pid: i32, req: RecordLockRequest, wait: bool) ->
             let mut table = RECORD_LOCKS.lock();
             let state = table.entry(key).or_insert_with(RecordLockState::new);
             if state.first_conflict(owner, &req).is_none() {
-                state.apply(owner, req);
+                state.apply(owner, req)?;
                 let wake = if state.waiters.len_hint() != 0 {
                     Some(Arc::clone(&state.waiters))
                 } else {
@@ -387,22 +393,27 @@ fn right_piece(lock: RecordLock, req: &RecordLockRequest) -> Option<RecordLock> 
 
 fn normalize(mut locks: Vec<RecordLock>) -> Vec<RecordLock> {
     locks.retain(|lock| lock.end.is_none_or(|end| lock.start < end));
-    locks.sort_by_key(|lock| (lock.owner.pid, lock.lock_type_order(), lock.start));
+    locks.sort_unstable_by_key(|lock| (lock.owner.pid, lock.lock_type_order(), lock.start));
 
-    let mut out: Vec<RecordLock> = Vec::with_capacity(locks.len());
-    for lock in locks {
-        if let Some(last) = out.last_mut()
-            && last.owner.pid == lock.owner.pid
-            && last.lock_type == lock.lock_type
-            && touches_or_overlaps(last.end, lock.start)
-        {
-            last.end = max_end(last.end, lock.end);
-            continue;
+    let mut out_len = 0usize;
+    for idx in 0..locks.len() {
+        let lock = locks[idx];
+        if out_len != 0 {
+            let last = &mut locks[out_len - 1];
+            if last.owner.pid == lock.owner.pid
+                && last.lock_type == lock.lock_type
+                && touches_or_overlaps(last.end, lock.start)
+            {
+                last.end = max_end(last.end, lock.end);
+                continue;
+            }
         }
-        out.push(lock);
+        locks[out_len] = lock;
+        out_len += 1;
     }
-    out.sort_by_key(|lock| lock.start);
-    out
+    locks.truncate(out_len);
+    locks.sort_unstable_by_key(|lock| lock.start);
+    locks
 }
 
 impl RecordLock {

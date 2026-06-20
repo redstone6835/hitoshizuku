@@ -146,8 +146,18 @@ impl SuperblockOps for EpollSuperblockOps {
         Err(VfsError::NotSupported)
     }
 
-    fn statfs(&self, _sb: &Arc<Superblock>) -> VfsResult<crate::vfs::stat::FsStat> {
-        Err(VfsError::NotSupported)
+    fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<crate::vfs::stat::FsStat> {
+        Ok(crate::vfs::stat::FsStat {
+            fs_type: 0x0904_1934,
+            block_size: sb.block_size as u64,
+            total_blocks: 0,
+            free_blocks: 0,
+            avail_blocks: 0,
+            total_inodes: 0,
+            free_inodes: 0,
+            fs_id: sb.fs_id.raw(),
+            name_max: sb.name_max,
+        })
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -276,12 +276,19 @@ impl TmpfsFileData {
         Ok(written)
     }
 
-    fn reserve(&mut self, offset: u64, len: u64) -> VfsResult<()> {
+    fn reserve(&mut self, offset: u64, len: u64, keep_size: bool) -> VfsResult<()> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
         if end > usize::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         }
-        self.size = self.size.max(end);
+        let first_page = offset / TMPFS_PAGE_SIZE_U64;
+        let last_page = (end.saturating_sub(1)) / TMPFS_PAGE_SIZE_U64;
+        for page_index in first_page..=last_page {
+            let _ = self.get_or_create_page(page_index)?;
+        }
+        if !keep_size {
+            self.size = self.size.max(end);
+        }
         Ok(())
     }
 
@@ -939,13 +946,16 @@ impl InodeOps for TmpfsInodeOps {
     fn open(
         &self,
         inode: &Inode,
-        _options: &OpenOptions,
+        options: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         {
             let data = self.data.lock();
             if matches!(&*data, TmpfsInodeData::Special) {
-                return Err(VfsError::NotSupported);
+                return match inode.kind() {
+                    FileType::Fifo => vfs::pipe::open_fifo(inode, options),
+                    _ => Err(VfsError::NotSupported),
+                };
             }
         }
         let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
@@ -1023,7 +1033,7 @@ impl FileOps for TmpfsFileOps {
         Ok(n)
     }
 
-    fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+    fn fallocate(&self, offset: u64, len: u64, keep_size: bool) -> VfsResult<()> {
         let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
         if end > usize::MAX as u64 {
             return Err(VfsError::FileTooLarge);
@@ -1036,10 +1046,10 @@ impl FileOps for TmpfsFileOps {
             _ => return Err(VfsError::InvalidArgument),
         };
 
-        if end > file_data.size {
-            file_data.reserve(offset, len)?;
-            let size = file_data.size;
-            self.inode.set_size_and_blocks(size, file_data.blocks());
+        if end > file_data.size || keep_size {
+            file_data.reserve(offset, len, keep_size)?;
+            self.inode
+                .set_size_and_blocks(file_data.size, file_data.blocks());
             self.inode.touch_mtime();
             self.inode.touch_ctime();
         }

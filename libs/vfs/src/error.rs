@@ -98,6 +98,9 @@ pub enum VfsError {
     /// 设备不存在或驱动未就绪（ENODEV）。
     NoDevice,
 
+    /// 设备或端点不存在（ENXIO）。
+    NoSuchDeviceOrAddress,
+
     /// 设备忙，操作无法立即完成（EBUSY）。
     DeviceBusy,
 
@@ -155,6 +158,7 @@ impl VfsError {
             VfsError::TooManyLinks => Errno::EMLINK,
             VfsError::Io => Errno::EIO,
             VfsError::NoDevice => Errno::ENODEV,
+            VfsError::NoSuchDeviceOrAddress => Errno::ENXIO,
             VfsError::DeviceBusy => Errno::EBUSY,
             VfsError::InvalidArgument => Errno::EINVAL,
             VfsError::NotSupported => Errno::EOPNOTSUPP,

@@ -321,12 +321,18 @@ pub fn pid_count() -> usize {
 ///
 /// [`init`] 之后，在 CPU 0 上必然非空。AP 启动路径落地前，其它 CPU 调用此
 /// 函数会 panic（目前不会发生，因为只有 CPU 0 跑代码）。
+#[inline]
 pub fn current_task() -> Arc<Task> {
     let id = cpu();
-    CURRENT_TASKS[id]
-        .lock()
-        .clone()
-        .expect("[sched] current_task called before sched::init() on this CPU")
+    // 无锁快速路径：syscall handler 在 SIE=0 下执行（trap 入口硬件禁中断），
+    // CURRENT_TASKS[id] 不可能被中断打断修改；直接 clone 避免 spinlock。
+    unsafe {
+        CURRENT_TASKS[id]
+            .get_unchecked()
+            .as_ref()
+            .expect("[sched] current_task called before sched::init() on this CPU")
+            .clone()
+    }
 }
 
 /// 查询指定 CPU 上的 current；未登记时返回 None。
@@ -399,8 +405,9 @@ pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
 }
 
 /// 是否已完成 init（避免有人在早期路径误调 current_task）。
+#[inline]
 pub fn is_ready() -> bool {
-    INIT_READY.load(Ordering::Acquire)
+    INIT_READY.load(Ordering::Relaxed)
 }
 
 pub fn online_cpu_mask() -> u64 {
@@ -504,11 +511,18 @@ pub fn needs_resched(cpu_id: usize) -> bool {
     cpu_id < NR_CPUS && NEED_RESCHED[cpu_id].load(Ordering::Acquire)
 }
 
+#[inline]
 pub fn needs_resched_current() -> bool {
     if !INIT_READY.load(Ordering::Acquire) {
         return false;
     }
     NEED_RESCHED[cpu()].load(Ordering::Acquire)
+}
+
+/// 已知 INIT_READY=true 时的快速版本，跳过冗余的 Acquire load。
+#[inline]
+pub fn needs_resched_current_unchecked() -> bool {
+    NEED_RESCHED[cpu()].load(Ordering::Relaxed)
 }
 
 pub fn request_resched(cpu_id: usize) {
@@ -607,12 +621,26 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     }
 }
 
+#[inline]
 pub fn run_post_syscall_handoff_lazy() {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
     }
     let cpu_id = cpu();
     if POST_SYSCALL_HANDOFF[cpu_id].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    run_post_syscall_handoff(now_ns_internal());
+}
+
+/// 已知 INIT_READY=true 时的快速版本。
+#[inline]
+pub fn run_post_syscall_handoff_lazy_unchecked() {
+    let cpu_id = cpu();
+    if RETIRED_TASKS_NONEMPTY[cpu_id].load(Ordering::Relaxed) {
+        cleanup_retired_tasks(cpu_id);
+    }
+    if POST_SYSCALL_HANDOFF[cpu_id].load(Ordering::Relaxed) == 0 {
         return;
     }
     run_post_syscall_handoff(now_ns_internal());

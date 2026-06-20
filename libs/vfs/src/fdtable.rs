@@ -475,6 +475,18 @@ impl FdTable {
         out
     }
 
+    /// 批量获取一组 fd 对应的文件，分配失败时返回 ENOMEM。
+    pub fn get_files_dense_fallible(&self, fds: &[Fd]) -> VfsResult<Vec<Option<Arc<File>>>> {
+        let inner = self.inner.lock();
+        let mut out = Vec::new();
+        out.try_reserve(fds.len())
+            .map_err(|_| VfsError::OutOfMemory)?;
+        for fd in fds {
+            out.push(inner.get(fd.0).map(|e| Arc::clone(&e.file)));
+        }
+        Ok(out)
+    }
+
     /// 复制描述符（`dup`）。
     pub fn dup_fd(&self, old_fd: Fd) -> VfsResult<Fd> {
         self.dup_fd_from(old_fd, 0, FdFlags::default())
