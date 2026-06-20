@@ -4,6 +4,12 @@ all: cargo-setup kernel-la kernel-rv
 
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 BUILD_DIR := build
+FEATURES ?=
+KERNEL_FEATURES = embedded-initramfs $(FEATURES)
+CARGO_FEATURES = $(subst $(space),$(comma),$(strip $(KERNEL_FEATURES)))
+empty :=
+space := $(empty) $(empty)
+comma := ,
 
 LA_TARGET := loongarch64-unknown-none
 LA_ROOTFS := userland/rootfs-la
@@ -29,12 +35,12 @@ cargo-setup:
 
 kernel-la: cargo-setup rootfs-la
 	INITRAMFS_ROOT=$(LA_ROOTFS) INITRAMFS_CPIO=$(LA_INITRAMFS) \
-		cargo build -p kernel --target $(LA_TARGET) --features embedded-initramfs --release
+		cargo build -p kernel --target $(LA_TARGET) --features "$(CARGO_FEATURES)" --release
 	cp target/$(LA_TARGET)/release/kernel $(LA_KERNEL)
 
 kernel-rv: cargo-setup rootfs-rv
 	INITRAMFS_ROOT=$(RV_ROOTFS) INITRAMFS_CPIO=$(RV_INITRAMFS) \
-		cargo build -p kernel --target $(RV_TARGET) --features embedded-initramfs --release
+		cargo build -p kernel --target $(RV_TARGET) --features "$(CARGO_FEATURES)" --release
 	cp target/$(RV_TARGET)/release/kernel $(RV_KERNEL)
 
 rootfs-la: $(LA_ROOTFS)/bin/busybox

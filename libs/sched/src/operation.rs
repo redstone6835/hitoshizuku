@@ -1384,6 +1384,13 @@ pub fn deliver_pending_signals() -> Option<SigInfo> {
 
 pub fn deliver_pending_signals_with_context(user_ctx: UserContextRef) -> Option<SigInfo> {
     let me = current_task();
+    deliver_pending_signals_for_task(&me, user_ctx)
+}
+
+pub fn deliver_pending_signals_for_task(
+    me: &Arc<Task>,
+    user_ctx: UserContextRef,
+) -> Option<SigInfo> {
     if me.is_kernel_task() {
         return None;
     }
@@ -1404,7 +1411,7 @@ pub fn deliver_pending_signals_with_context(user_ctx: UserContextRef) -> Option<
                 me.signal.deliver(info);
                 return Some(info);
             };
-            match (ops.setup_signal_frame)(&me, info, action, user_ctx) {
+            match (ops.setup_signal_frame)(me, info, action, user_ctx) {
                 Ok(()) => None,
                 Err(Errno::ENOSYS) => {
                     me.signal.deliver(info);

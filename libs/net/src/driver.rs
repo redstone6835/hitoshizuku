@@ -168,13 +168,23 @@ impl TxBuf {
     /// 用堆内存创建 TxBuf。
     pub fn new_heap(data: Box<[u8]>) -> Self {
         let c = data.len();
-        Self { storage: TxStorage::Heap(data), data_offset: 0, len: 0, cap: c }
+        Self {
+            storage: TxStorage::Heap(data),
+            data_offset: 0,
+            len: 0,
+            cap: c,
+        }
     }
 
     /// 用 DMA 缓冲创建 TxBuf。
     pub fn new_dma(dma: Box<dyn DmaBackend>, hdr_size: usize) -> Self {
         let dma_len = dma.as_slice().len();
-        Self { storage: TxStorage::Dma(dma), data_offset: hdr_size, len: 0, cap: dma_len.saturating_sub(hdr_size) }
+        Self {
+            storage: TxStorage::Dma(dma),
+            data_offset: hdr_size,
+            len: 0,
+            cap: dma_len.saturating_sub(hdr_size),
+        }
     }
 
     /// 缓冲区中可供 smoltcp 写入的总容量。

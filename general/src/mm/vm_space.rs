@@ -279,7 +279,7 @@ pub struct VmSpace {
     vmas: spin::Mutex<VmaSet>,
     pages: spin::Mutex<BTreeMap<usize, PageMapping>>,
     pgd: PgdHandle,
-    brk_start: usize,
+    brk_start: AtomicUsize,
     brk_current: AtomicUsize,
     mmap_next: AtomicUsize,
     mlock_future: AtomicBool,
@@ -303,7 +303,7 @@ impl VmSpace {
             vmas: spin::Mutex::new(VmaSet::new()),
             pages: spin::Mutex::new(BTreeMap::new()),
             pgd,
-            brk_start: layout.user_heap_base,
+            brk_start: AtomicUsize::new(layout.user_heap_base),
             brk_current: AtomicUsize::new(layout.user_heap_base),
             mmap_next: AtomicUsize::new(layout.user_mmap_base),
             mlock_future: AtomicBool::new(false),
@@ -335,8 +335,8 @@ impl VmSpace {
     pub fn init_brk_after_load(&self, max_segment_end: usize) {
         let page_size = page_size();
         let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
-        // brk 必须不低于当前最小值，并跟随段尾上移
-        let brk = new_brk.max(self.brk_start);
+        let brk = new_brk.max(self.brk_start.load(Ordering::Relaxed));
+        self.brk_start.store(brk, Ordering::Release);
         self.brk_current.store(brk, Ordering::Release);
     }
 
@@ -344,7 +344,8 @@ impl VmSpace {
         if requested == 0 {
             return self.current_brk();
         }
-        if requested < self.brk_start {
+        let brk_start = self.brk_start.load(Ordering::Relaxed);
+        if requested < brk_start {
             return self.current_brk();
         }
 
@@ -973,7 +974,7 @@ impl VmSpace {
                 let old_access = mapping.access;
                 mapping.access = access_after_fork(area.flags, &mapping.page);
                 if old_access != mapping.access {
-                    self.protect_page(*va, pte_flags_for(area.flags, mapping.access))
+                    self.protect_page_no_flush(*va, pte_flags_for(area.flags, mapping.access))
                         .expect("[mm] fork parent protect failed");
                 }
                 let child_mapping = mapping.clone();
@@ -985,6 +986,9 @@ impl VmSpace {
                 ));
                 child_pages.insert(*va, child_mapping);
             }
+        }
+        if !child_maps.is_empty() {
+            self.flush_full_user_tlb();
         }
 
         for (va, page, flags, access) in &child_maps {
@@ -1007,7 +1011,7 @@ impl VmSpace {
             vmas: spin::Mutex::new(cloned_set),
             pages: spin::Mutex::new(child_pages),
             pgd: new_pgd,
-            brk_start: self.brk_start,
+            brk_start: AtomicUsize::new(self.brk_start.load(Ordering::Relaxed)),
             brk_current: AtomicUsize::new(self.current_brk()),
             mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
             mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
@@ -1254,6 +1258,28 @@ impl VmSpace {
             (ops.invalidate_range)(self.pgd, vaddr, page_size);
         }
         Ok(())
+    }
+
+    fn protect_page_no_flush(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        unsafe {
+            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
+        }
+        Ok(())
+    }
+
+    fn invalidate_user_range(&self, vaddr: usize, len: usize) {
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.invalidate_range)(self.pgd, vaddr, len) };
+        }
+    }
+
+    fn flush_full_user_tlb(&self) {
+        // vaddr=1, len=usize::MAX 会溢出，触发 arch 层全局 flush（with_asid(asid, None)）。
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.invalidate_range)(self.pgd, 1, usize::MAX) };
+        }
     }
 
     fn replace_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {

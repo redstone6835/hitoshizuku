@@ -116,16 +116,63 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "csrr t0, {sstatus}",
         "sd t0, {status_off}(sp)",
         "sd t5, {cause_off}(sp)",       // t5 还是 scause=8
-        "csrr t0, {stval}",
-        "sd t0, {tval_off}(sp)",
+        // stval 对 syscall 无意义，跳过
 
         // 调用 syscall 快速路径 handler（不保存/恢复 FPU）
         "mv a0, sp",
         "ld a1, {sp_off}(sp)",
         "call {fast_handler}",
 
-        // 快速处理器返回陷阱帧指针
+        // 返回值：0=halt, 奇数=完整恢复, 偶数(非零)=快速恢复
         "beqz a0, 6f",
+        "andi t0, a0, 1",
+        "bnez t0, 11f",
+
+        // 快速 syscall resume：只恢复 ABI 要求的寄存器
+        "mv s11, a0",
+        "ld t0, {sepc_off}(s11)",
+        "csrw {sepc}, t0",
+        "ld t0, {status_off}(s11)",
+        "andi t0, t0, -3",
+        "csrw {sstatus}, t0",
+        "ld t0, {kstack_top_off}(s11)",
+        "csrw {sscratch}, t0",
+        "ld ra, {ra_off}(s11)",
+        "ld tp, {tp_off}(s11)",
+        "ld gp, {gp_off}(s11)",
+        "ld t0, {t0_off}(s11)",
+        "ld t1, {t1_off}(s11)",
+        "ld t2, {t2_off}(s11)",
+        "ld s0, {s0_off}(s11)",
+        "ld s1, {s1_off}(s11)",
+        "ld a0, {a0_off}(s11)",
+        "ld a1, {a1_off}(s11)",
+        "ld a2, {a2_off}(s11)",
+        "ld a3, {a3_off}(s11)",
+        "ld a4, {a4_off}(s11)",
+        "ld a5, {a5_off}(s11)",
+        "ld a6, {a6_off}(s11)",
+        "ld a7, {a7_off}(s11)",
+        "ld s2, {s2_off}(s11)",
+        "ld s3, {s3_off}(s11)",
+        "ld s4, {s4_off}(s11)",
+        "ld s5, {s5_off}(s11)",
+        "ld s6, {s6_off}(s11)",
+        "ld s7, {s7_off}(s11)",
+        "ld s8, {s8_off}(s11)",
+        "ld s9, {s9_off}(s11)",
+        "ld s10, {s10_off}(s11)",
+        "ld t3, {t3_off}(s11)",
+        "ld t4, {t4_off}(s11)",
+        "ld t5, {t5_off}(s11)",
+        "ld t6, {t6_off}(s11)",
+        "ld sp, {sp_off}(s11)",
+        "ld s11, {s11_off}(s11)",
+        "sret",
+
+        // 完整恢复路径（FPU active 或需要调度）
+        "11:",
+        "andi a0, a0, -2",
         "tail {resume}",
 
         // 保存上下文：
