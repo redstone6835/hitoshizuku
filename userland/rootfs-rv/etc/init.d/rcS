@@ -297,34 +297,34 @@ run_ltp_script() {
 
 run_test_scripts() {
     _test_setup
-    for dir in /mnt/glibc /mnt/musl; do
-        [ -d "$dir" ] || continue
-        cd "$dir" || continue
-        # 按指定顺序运行测试
-        for name in \
-            iozone_testcode.sh \
-            lmbench_testcode.sh \
-            libcbench_testcode.sh \
-            basic_testcode.sh \
-            busybox_testcode.sh \
-            lua_testcode.sh \
-            libctest_testcode.sh \
-            netperf_testcode.sh \
-            unixbench_testcode.sh \
-            cyclictest_testcode.sh \
-            iperf_testcode.sh \
-            ltp_testcode.sh \
-        ; do
+    # 按指定顺序，每项先跑 glibc 再跑 musl
+    for name in \
+        iozone_testcode.sh \
+        lmbench_testcode.sh \
+        libcbench_testcode.sh \
+        basic_testcode.sh \
+        busybox_testcode.sh \
+        lua_testcode.sh \
+        libctest_testcode.sh \
+        netperf_testcode.sh \
+        unixbench_testcode.sh \
+        cyclictest_testcode.sh \
+        iperf_testcode.sh \
+        ltp_testcode.sh \
+    ; do
+        if _is_blacklisted "$name"; then
+            echo "[init] skip $name (blacklist)"
+            continue
+        fi
+        for dir in /mnt/glibc /mnt/musl; do
+            [ -d "$dir" ] || continue
             script="$dir/$name"
             [ -f "$script" ] || continue
-            if _is_blacklisted "$name"; then
-                echo "[init] skip $name (blacklist)"
-                continue
-            fi
+            cd "$dir" || continue
             if [ "$name" = "basic_testcode.sh" ]; then
                 setup_basic_mount_loop
             fi
-            echo "[init] run $name"
+            echo "[init] run $dir $name"
             if [ "$name" = "ltp_testcode.sh" ]; then
                 run_ltp_script "$script"
             else
@@ -334,7 +334,10 @@ run_test_scripts() {
                 cleanup_basic_mount_loop
             fi
         done
-        # 运行未在列表中的剩余测试脚本
+    done
+    # 运行未在列表中的剩余测试脚本
+    for dir in /mnt/glibc /mnt/musl; do
+        [ -d "$dir" ] || continue
         for script in "$dir"/*_testcode.sh; do
             [ -f "$script" ] || continue
             name="${script##*/}"
@@ -349,11 +352,12 @@ cyclictest_testcode.sh|iperf_testcode.sh|ltp_testcode.sh)
                 echo "[init] skip $name (blacklist)"
                 continue
             fi
-            echo "[init] run $name"
+            cd "$dir" || continue
+            echo "[init] run $dir $name"
             /bin/sh "$script"
         done
-        cleanup_basic_mount_loop
     done
+    cleanup_basic_mount_loop
     _test_teardown
     return 0
 }
