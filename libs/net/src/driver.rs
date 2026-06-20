@@ -120,24 +120,68 @@ impl RxBuf {
 ///
 /// 协议栈承诺：在 `commit_tx` 之前不会让 `TxBuf` 离开当前线程，也不会
 /// 在持有 `TxBuf` 时进行可能阻塞的操作。
+
+/// TxBuf 内部存储的可选 DMA 后端 trait。
+///
+/// 硬件驱动（如 virtio-net）为自己的 DMA 缓冲区实现此 trait，
+/// 使 TxBuf 可以直接向 DMA 内存写入帧数据，避免一次额外的 heap 拷贝。
+pub trait DmaBackend: Send + 'static {
+    fn as_slice(&self) -> &[u8];
+    fn as_mut_slice(&mut self) -> &mut [u8];
+    /// 将 `Box<dyn DmaBackend>` 转换为 `Box<dyn Any>`，允许驱动层恢复具体类型。
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// TxBuf 的内部存储后端
+enum TxStorage {
+    Heap(Box<[u8]>),
+    Dma(Box<dyn DmaBackend>),
+}
+
+impl TxStorage {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            TxStorage::Heap(b) => b,
+            TxStorage::Dma(d) => d.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            TxStorage::Heap(b) => &mut **b,
+            TxStorage::Dma(d) => d.as_mut_slice(),
+        }
+    }
+}
+
 pub struct TxBuf {
-    data: Box<[u8]>,
-    /// 实际写入的字节数（由协议栈在填充后通过 [`set_len`](Self::set_len) 设置）。
+    storage: TxStorage,
+    /// smoltcp 写入的帧数据在 storage 中的字节偏移
+    data_offset: usize,
+    /// 实际写入的字节数（由协议栈在填充后通过 set_len 设置）。
     len: usize,
+    /// 可供写入的总容量（data_offset 之后的部分）
+    cap: usize,
 }
 
 impl TxBuf {
-    /// 创建一个新的发送缓冲区，初始 `len = 0`。
-    pub fn new(data: Box<[u8]>) -> Self {
-        Self { data, len: 0 }
+    /// 用堆内存创建 TxBuf。
+    pub fn new_heap(data: Box<[u8]>) -> Self {
+        let c = data.len();
+        Self { storage: TxStorage::Heap(data), data_offset: 0, len: 0, cap: c }
     }
 
-    /// 缓冲区总容量。
+    /// 用 DMA 缓冲创建 TxBuf。
+    pub fn new_dma(dma: Box<dyn DmaBackend>, hdr_size: usize) -> Self {
+        let dma_len = dma.as_slice().len();
+        Self { storage: TxStorage::Dma(dma), data_offset: hdr_size, len: 0, cap: dma_len.saturating_sub(hdr_size) }
+    }
+
+    /// 缓冲区中可供 smoltcp 写入的总容量。
     pub fn capacity(&self) -> usize {
-        self.data.len()
+        self.cap
     }
 
-    /// 当前已填充字节数。
     pub fn len(&self) -> usize {
         self.len
     }
@@ -147,34 +191,47 @@ impl TxBuf {
     }
 
     /// 协议栈用此切片向缓冲区写入帧数据。
+    /// 返回 storage 中跳过 data_offset 之后的可变切片。
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
+        &mut self.storage.as_mut_slice()[self.data_offset..]
     }
 
-    /// 设置已写入字节数。
-    ///
-    /// # Panics
-    ///
-    /// `len > capacity()` 时 panic——这是协议栈的编程错误，不允许越界。
-    /// 在 release 构建中也会触发，避免堆破坏。
     pub fn set_len(&mut self, len: usize) {
         assert!(
-            len <= self.data.len(),
+            len <= self.cap,
             "TxBuf::set_len: len ({}) exceeds capacity ({})",
             len,
-            self.data.len()
+            self.cap
         );
         self.len = len;
     }
 
     /// 已填充部分的只读视图。
     pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
+        &self.storage.as_slice()[self.data_offset..][..self.len]
     }
 
-    /// 取出底层 `Box<[u8]>`（消费缓冲区）。
-    pub fn into_storage(self) -> Box<[u8]> {
-        self.data
+    /// 取出堆内存 Box<[u8]>（消费缓冲区）。
+    /// 仅 Heap 变体可用；DMA 变体会 panic。
+    pub fn into_heap(self) -> Box<[u8]> {
+        match self.storage {
+            TxStorage::Heap(b) => b,
+            TxStorage::Dma(_) => panic!("into_heap called on DMA-backed TxBuf"),
+        }
+    }
+
+    /// 取出 DMA 缓冲（消费缓冲区）。
+    /// 仅 DMA 变体可用；Heap 变体会 panic。
+    /// 返回 (DmaBackend, data_offset, frame_len)。
+    pub fn into_dma(self) -> (Box<dyn DmaBackend>, usize, usize) {
+        match self.storage {
+            TxStorage::Heap(_) => panic!("into_dma called on heap-backed TxBuf"),
+            TxStorage::Dma(d) => (d, self.data_offset, self.len),
+        }
+    }
+
+    pub fn is_dma(&self) -> bool {
+        matches!(self.storage, TxStorage::Dma(_))
     }
 }
 
