@@ -103,8 +103,8 @@ fn contains_single_letter_extension(isa: &[u8], ext: u8) -> bool {
         .any(|b| b.eq_ignore_ascii_case(&ext))
         || first_underscore < isa.len()
             && isa[first_underscore + 1..]
-            .split(|&b| b == b'_')
-            .any(|chunk| chunk.len() == 1 && chunk[0].eq_ignore_ascii_case(&ext))
+                .split(|&b| b == b'_')
+                .any(|chunk| chunk.len() == 1 && chunk[0].eq_ignore_ascii_case(&ext))
 }
 
 fn read_vlenb() -> usize {

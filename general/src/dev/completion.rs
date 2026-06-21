@@ -89,6 +89,15 @@ impl<T> Completion<T> {
     }
 
     fn wait_blocking(&self) -> T {
+        // 快速路径：virtio 在 QEMU 上几乎同步完成，先 spin 避免不必要的 context switch
+        for _ in 0..64 {
+            if self.done.load(Ordering::Acquire) {
+                if let Some(result) = self.result.lock().take() {
+                    return result;
+                }
+            }
+            core::hint::spin_loop();
+        }
         loop {
             if self.done.load(Ordering::Acquire) {
                 if let Some(result) = self.result.lock().take() {

@@ -322,6 +322,7 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
 
     // 启动 S-mode 周期 timer。sleep/调度 tick 依赖该中断推进。
     configure_timer_from_dtb(&dtb);
+    trap::install_riscv_irq_line_ops();
 
     // 构造 StartContext 并移交控制权，从此不再返回
     unsafe {

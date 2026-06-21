@@ -26,7 +26,8 @@ const PLIC_THRESHOLD_BASE: usize = 0x200000;
 const PLIC_CLAIM_BASE: usize = 0x200004;
 const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 
-const PLIC_HART_CTX: usize = 0; // 单核，只用 hart context 0
+const RISCV_SUPERVISOR_EXTERNAL_IRQ: u32 = 9;
+const PLIC_DEFAULT_PRIORITY: u32 = 1;
 
 struct PlicInner {
     mmio_base: usize,
@@ -35,37 +36,41 @@ struct PlicInner {
 
 struct Plic {
     inner: Spinlock<PlicInner>,
-    controller: u32,
+    context: usize,
 }
 
 impl Plic {
     fn claim(&self) -> u32 {
         let inner = self.inner.lock();
-        let addr = inner.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * PLIC_HART_CTX;
+        let addr = inner.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
         unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
     fn complete(&self, hwirq: u32) {
         let inner = self.inner.lock();
-        let addr = inner.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * PLIC_HART_CTX;
+        let addr = inner.mmio_base + PLIC_CLAIM_BASE + PLIC_CONTEXT_STRIDE * self.context;
         unsafe { core::ptr::write_volatile(addr as *mut u32, hwirq) };
     }
 
-    fn set_priority(&self, hwirq: u32, priority: u32) {
+    fn set_priority(&self, hwirq: u32, priority: u32) -> bool {
         let inner = self.inner.lock();
+        if hwirq == 0 || hwirq > inner.ndev {
+            return false;
+        }
         let addr = inner.mmio_base + PLIC_PRIORITY_BASE + 4 * hwirq as usize;
         unsafe { core::ptr::write_volatile(addr as *mut u32, priority) };
+        true
     }
 
     fn set_enabled(&self, hwirq: u32, enabled: bool) -> bool {
-        if hwirq == 0 || hwirq > self.inner.lock().ndev {
+        let inner = self.inner.lock();
+        if hwirq == 0 || hwirq > inner.ndev {
             return false;
         }
-        let inner = self.inner.lock();
         let reg_idx = hwirq as usize / 32;
         let bit = hwirq % 32;
         let addr =
-            inner.mmio_base + PLIC_ENABLE_BASE + PLIC_ENABLE_STRIDE * PLIC_HART_CTX + 4 * reg_idx;
+            inner.mmio_base + PLIC_ENABLE_BASE + PLIC_ENABLE_STRIDE * self.context + 4 * reg_idx;
         let mut val = unsafe { core::ptr::read_volatile(addr as *const u32) };
         if enabled {
             val |= 1u32 << bit;
@@ -78,7 +83,7 @@ impl Plic {
 
     fn set_threshold(&self, threshold: u32) {
         let inner = self.inner.lock();
-        let addr = inner.mmio_base + PLIC_THRESHOLD_BASE + PLIC_CONTEXT_STRIDE * PLIC_HART_CTX;
+        let addr = inner.mmio_base + PLIC_THRESHOLD_BASE + PLIC_CONTEXT_STRIDE * self.context;
         unsafe { core::ptr::write_volatile(addr as *mut u32, threshold) };
     }
 }
@@ -105,6 +110,9 @@ impl IrqDomain for PlicDomain {
     }
 
     fn set_line_enabled(&self, hwirq: u32, enabled: bool) -> bool {
+        if enabled && !self.plic.set_priority(hwirq, PLIC_DEFAULT_PRIORITY) {
+            return false;
+        }
         self.plic.set_enabled(hwirq, enabled)
     }
 
@@ -152,6 +160,27 @@ impl PlicDriver {
     fn matches_platform(info: &PlatformDeviceInfo) -> bool {
         info.properties.interrupt_controller
             && (info.has_id(COMPAT_SIFIVE_PLIC) || info.has_id(COMPAT_RISCV_PLIC0))
+    }
+
+    fn supervisor_context(info: &PlatformDeviceInfo) -> Result<usize, PnpError> {
+        let mut saw_irq = false;
+        for (index, irq) in info.irq_resources().enumerate() {
+            saw_irq = true;
+            if irq.cells().first().copied() == Some(RISCV_SUPERVISOR_EXTERNAL_IRQ) {
+                return Ok(index);
+            }
+        }
+        if saw_irq {
+            Err(PnpError::malformed(
+                PnpResourceKind::Irq,
+                "plic supervisor external context missing",
+            ))
+        } else {
+            Err(PnpError::missing(
+                PnpResourceKind::Irq,
+                "plic interrupts-extended missing",
+            ))
+        }
     }
 }
 
@@ -201,15 +230,16 @@ impl PnpDriver for PlicDriver {
             return Err(PnpError::missing(PnpResourceKind::Mmio, "plic reg missing"));
         };
         let mmio_base = (self.device_mmio_to_virt)(phys);
+        let context = Self::supervisor_context(info)?;
 
         let plic = Arc::new(Plic {
             inner: Spinlock::new(PlicInner { mmio_base, ndev }),
-            controller,
+            context,
         });
 
         // 初始化：所有源 priority=0（禁用），threshold=0
         for hwirq in 1..=ndev {
-            plic.set_priority(hwirq, 0);
+            let _ = plic.set_priority(hwirq, 0);
         }
         plic.set_threshold(0);
 
@@ -239,10 +269,11 @@ impl PnpDriver for PlicDriver {
         ))?;
 
         log::printk!(
-            "[platform-riscv-plic] bound {} phys={:#x} ndev={}",
+            "[platform-riscv-plic] bound {} phys={:#x} ndev={} context={}",
             dev.id,
             phys,
-            ndev
+            ndev,
+            context
         );
         Ok(())
     }

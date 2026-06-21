@@ -126,6 +126,64 @@ unsafe fn load_user_u64(addr: usize) -> Result<u64, UserAccessError> {
     }
 }
 
+/// 从用户空间半字安全加载。仅在地址 2 字节对齐时调用。
+#[inline(always)]
+unsafe fn load_user_u16(addr: usize) -> Result<u16, UserAccessError> {
+    let val: u16;
+    let faulted: usize;
+    unsafe {
+        core::arch::asm!(
+            "li {ok}, 0",
+            "2: lhu {val}, 0({ptr})",
+            "j 3f",
+            "4: li {ok}, 1",
+            "3:",
+            ".pushsection __ex_table,\"a\"",
+            ".balign 8",
+            ".8byte 2b, 4b",
+            ".popsection",
+            ptr = in(reg) addr,
+            val = out(reg) val,
+            ok = out(reg) faulted,
+            options(nostack, readonly)
+        );
+    }
+    if faulted != 0 {
+        Err(UserAccessError::Fault)
+    } else {
+        Ok(val)
+    }
+}
+
+/// 从用户空间字安全加载。仅在地址 4 字节对齐时调用。
+#[inline(always)]
+unsafe fn load_user_u32(addr: usize) -> Result<u32, UserAccessError> {
+    let val: u32;
+    let faulted: usize;
+    unsafe {
+        core::arch::asm!(
+            "li {ok}, 0",
+            "2: lwu {val}, 0({ptr})",
+            "j 3f",
+            "4: li {ok}, 1",
+            "3:",
+            ".pushsection __ex_table,\"a\"",
+            ".balign 8",
+            ".8byte 2b, 4b",
+            ".popsection",
+            ptr = in(reg) addr,
+            val = out(reg) val,
+            ok = out(reg) faulted,
+            options(nostack, readonly)
+        );
+    }
+    if faulted != 0 {
+        Err(UserAccessError::Fault)
+    } else {
+        Ok(val)
+    }
+}
+
 /// 向用户空间单字节安全存储。
 #[inline(always)]
 unsafe fn store_user_u8(addr: usize, val: u8) -> Result<(), UserAccessError> {
@@ -134,6 +192,62 @@ unsafe fn store_user_u8(addr: usize, val: u8) -> Result<(), UserAccessError> {
         core::arch::asm!(
             "li {ok}, 0",
             "2: sb {val}, 0({ptr})",
+            "j 3f",
+            "4: li {ok}, 1",
+            "3:",
+            ".pushsection __ex_table,\"a\"",
+            ".balign 8",
+            ".8byte 2b, 4b",
+            ".popsection",
+            ptr = in(reg) addr,
+            val = in(reg) val,
+            ok = out(reg) faulted,
+            options(nostack)
+        );
+    }
+    if faulted != 0 {
+        Err(UserAccessError::Fault)
+    } else {
+        Ok(())
+    }
+}
+
+/// 向用户空间半字安全存储。仅在地址 2 字节对齐时调用。
+#[inline(always)]
+unsafe fn store_user_u16(addr: usize, val: u16) -> Result<(), UserAccessError> {
+    let faulted: usize;
+    unsafe {
+        core::arch::asm!(
+            "li {ok}, 0",
+            "2: sh {val}, 0({ptr})",
+            "j 3f",
+            "4: li {ok}, 1",
+            "3:",
+            ".pushsection __ex_table,\"a\"",
+            ".balign 8",
+            ".8byte 2b, 4b",
+            ".popsection",
+            ptr = in(reg) addr,
+            val = in(reg) val,
+            ok = out(reg) faulted,
+            options(nostack)
+        );
+    }
+    if faulted != 0 {
+        Err(UserAccessError::Fault)
+    } else {
+        Ok(())
+    }
+}
+
+/// 向用户空间字安全存储。仅在地址 4 字节对齐时调用。
+#[inline(always)]
+unsafe fn store_user_u32(addr: usize, val: u32) -> Result<(), UserAccessError> {
+    let faulted: usize;
+    unsafe {
+        core::arch::asm!(
+            "li {ok}, 0",
+            "2: sw {val}, 0({ptr})",
             "j 3f",
             "4: li {ok}, 1",
             "3:",
@@ -182,7 +296,7 @@ unsafe fn store_user_u64(addr: usize, val: u64) -> Result<(), UserAccessError> {
     }
 }
 
-/// 从用户空间拷贝到内核缓冲区。主循环以 8 字节为单位搬运，尾部逐字节补齐。
+/// 从用户空间拷贝到内核缓冲区。主循环以 8 字节为单位搬运，尾部按 4/2/1 补齐。
 #[inline(never)]
 unsafe fn sum_copy_from_user(
     dst: *mut u8,
@@ -212,7 +326,23 @@ unsafe fn sum_copy_from_user(
         i += 8;
     }
 
-    // 尾部：逐字节
+    // 尾部：优先使用对齐的 4/2 字节搬运，减少小结构体拷贝中的 asm/fixup 次数。
+    if i + 4 <= len && (src_user + i) & 3 == 0 {
+        let val = unsafe { load_user_u32(src_user + i) }.map_err(|e| {
+            unsafe { restore_sum(old_sstatus) };
+            e
+        })?;
+        unsafe { (dst.add(i) as *mut u32).write_unaligned(val) };
+        i += 4;
+    }
+    if i + 2 <= len && (src_user + i) & 1 == 0 {
+        let val = unsafe { load_user_u16(src_user + i) }.map_err(|e| {
+            unsafe { restore_sum(old_sstatus) };
+            e
+        })?;
+        unsafe { (dst.add(i) as *mut u16).write_unaligned(val) };
+        i += 2;
+    }
     while i < len {
         let b = unsafe { load_user_u8(src_user + i) }.map_err(|e| {
             unsafe { restore_sum(old_sstatus) };
@@ -256,7 +386,23 @@ unsafe fn sum_copy_to_user(
         i += 8;
     }
 
-    // 尾部：逐字节
+    // 尾部：与 copy_from_user 对称，优先使用对齐的 4/2 字节存储。
+    if i + 4 <= len && (dst_user + i) & 3 == 0 {
+        let val = unsafe { (src.add(i) as *const u32).read_unaligned() };
+        unsafe { store_user_u32(dst_user + i, val) }.map_err(|e| {
+            unsafe { restore_sum(old_sstatus) };
+            e
+        })?;
+        i += 4;
+    }
+    if i + 2 <= len && (dst_user + i) & 1 == 0 {
+        let val = unsafe { (src.add(i) as *const u16).read_unaligned() };
+        unsafe { store_user_u16(dst_user + i, val) }.map_err(|e| {
+            unsafe { restore_sum(old_sstatus) };
+            e
+        })?;
+        i += 2;
+    }
     while i < len {
         let b = unsafe { src.add(i).read() };
         unsafe { store_user_u8(dst_user + i, b) }.map_err(|e| {

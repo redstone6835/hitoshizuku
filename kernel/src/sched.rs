@@ -45,8 +45,7 @@ pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
 pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
 
 #[cfg(target_arch = "riscv64")]
-type RiscvVectorSignalStack =
-    Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
+type RiscvVectorSignalStack = Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
 
 pub fn stash_boot_console_name(name: alloc::string::String) {
     *BOOT_CONSOLE_NAME.lock() = Some(name);

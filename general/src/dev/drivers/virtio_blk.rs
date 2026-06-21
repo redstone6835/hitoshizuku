@@ -34,10 +34,11 @@ use crate::dev::block::{
 };
 use crate::dev::dma::DmaContext;
 use crate::dev::function::BlockFunction;
-use crate::dev::platform::PlatformDeviceInfo;
+use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
 use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    PnpResourceKind, register_driver_factory,
+    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDependency, PnpDevice, PnpDriver,
+    PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
 use crate::dev::virtio::{SplitVirtQueue, choose_split_queue_size};
 use crate::dev::virtio_mmio::{
@@ -353,18 +354,22 @@ impl VirtioBlk {
     }
 
     /// 处理中断（由中断处理程序调用）
-    pub fn handle_interrupt(&self) {
+    pub fn handle_interrupt(&self) -> bool {
         // 确认中断
         let status = self.inner.transport.read_interrupt_status();
+        if status == 0 {
+            return false;
+        }
         self.inner.transport.acknowledge_interrupt(status);
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
 
         // 轮询完成的请求
         self.poll();
+        true
     }
 
     /// 创建 BlockDev 包装
-    pub fn into_block_dev(self, name: &str) -> Result<Arc<BlockDevice>, &'static str> {
+    pub fn into_block_dev(self, name: &str) -> Result<(Arc<BlockDevice>, Arc<Self>), &'static str> {
         let capacity = self.inner.capacity;
         let block_size = self.inner.block_size;
         let sector_scale = u64::from(block_size / VIRTIO_BLK_SECTOR_SIZE);
@@ -391,23 +396,41 @@ impl VirtioBlk {
         let attributes = BlockAttributes::new(false, false, NonZeroU32::new(queue_depth), None);
         let features = self.inner.capabilities.block_features(block_size);
 
+        let driver = Arc::new(self);
         let io = Arc::new(VirtioBlkIo {
-            driver: Arc::new(self),
+            driver: Arc::clone(&driver),
         });
 
-        Ok(Arc::new(BlockDevice::new(
-            BlockDeviceInit {
-                name,
-                subsystem: "virtio-blk",
-                class: BlockClass::Whole,
-                geometry,
-                limits,
-                attributes,
-                features,
-            },
-            io,
-            None,
-        )))
+        Ok((
+            Arc::new(BlockDevice::new(
+                BlockDeviceInit {
+                    name,
+                    subsystem: "virtio-blk",
+                    class: BlockClass::Whole,
+                    geometry,
+                    limits,
+                    attributes,
+                    features,
+                },
+                io,
+                None,
+            )),
+            driver,
+        ))
+    }
+}
+
+struct VirtioBlkIrqHandler {
+    driver: Arc<VirtioBlk>,
+}
+
+impl IrqHandler for VirtioBlkIrqHandler {
+    fn handle_irq(&self, _line: IrqLine) -> IrqStatus {
+        if self.driver.handle_interrupt() {
+            IrqStatus::Handled
+        } else {
+            IrqStatus::Unhandled
+        }
     }
 }
 
@@ -589,6 +612,48 @@ impl VirtioMmioBlkDriver {
     }
 }
 
+fn map_irq_error(err: IrqError) -> PnpError {
+    match err {
+        IrqError::OutOfMemory => PnpError::OutOfMemory,
+        IrqError::AlreadyRegistered => PnpError::registration_failed(
+            PnpResourceKind::Irq,
+            "virtio-mmio block irq already registered",
+        ),
+        IrqError::NotFound => {
+            PnpError::registration_failed(PnpResourceKind::Irq, "virtio-mmio block irq not found")
+        }
+    }
+}
+
+fn first_irq_dependency(info: &PlatformDeviceInfo) -> PnpDependency {
+    info.irq_resources()
+        .find_map(|irq| irq.controller())
+        .map(PnpDependency::IrqController)
+        .unwrap_or(PnpDependency::DefaultIrqDomain)
+}
+
+fn register_virtio_mmio_blk_irq(
+    info: &PlatformDeviceInfo,
+    driver: Arc<VirtioBlk>,
+) -> Result<Option<IrqHandle>, PnpError> {
+    let handler: Arc<dyn IrqHandler> = Arc::new(VirtioBlkIrqHandler { driver });
+    match info.register_first_irq_handler(handler) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(PlatformIrqRegistrationError::NoResource) => Ok(None),
+        Err(PlatformIrqRegistrationError::Unresolved) => {
+            Err(PnpError::dependency(first_irq_dependency(info)))
+        }
+        Err(PlatformIrqRegistrationError::RegistrationFailed { line, err }) => {
+            log::printk!(
+                "[platform-virtio-mmio-blk] failed to register irq {:?}: {:?}",
+                line,
+                err
+            );
+            Err(map_irq_error(err))
+        }
+    }
+}
+
 impl PnpDriver for VirtioMmioBlkDriver {
     fn name(&self) -> &'static str {
         "platform-virtio-mmio-blk"
@@ -628,9 +693,17 @@ impl PnpDriver for VirtioMmioBlkDriver {
             PnpError::hardware_failure("virtio-mmio block init failed")
         })?;
         let dev_name = alloc_virtio_blk_dev_name(&dev.name)?;
-        let block_dev = driver.into_block_dev(&dev_name).map_err(|_| {
+        let (block_dev, driver) = driver.into_block_dev(&dev_name).map_err(|_| {
             PnpError::registration_failed(PnpResourceKind::Function, "block function")
         })?;
+        let irq_handle = register_virtio_mmio_blk_irq(info, Arc::clone(&driver))?;
+        if let Some(handle) = irq_handle
+            && let Err(err) =
+                dev.own_resource(irq::irq_handler_pnp_resource(handle, "virtio-mmio-blk-irq"))
+        {
+            let _ = irq::unregister_irq_handler(handle);
+            return Err(err);
+        }
         dev.register_function(Arc::new(BlockFunction::with_projection_name(
             &dev.name, &dev_name, block_dev,
         )))?;
