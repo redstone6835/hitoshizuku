@@ -179,6 +179,7 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
                 HAS_ZICBOZ.store(true, Ordering::Release);
                 log::info!("[loader] ISA: Zicboz detected");
             }
+            crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
             // 检查 riscv,cboz-block-size（如果有）
             if let Some(bs_prop) = cpu_node.find_property("riscv,cboz-block-size") {
                 let val = bs_prop.value();

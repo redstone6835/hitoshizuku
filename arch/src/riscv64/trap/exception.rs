@@ -267,7 +267,11 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 0
             }
         }
-    } else if code == EXC_ILLEGAL_INST && from_user && enable_user_fpu_if_needed(tf) {
+    } else if code == EXC_ILLEGAL_INST
+        && from_user
+        && (crate::riscv64::vector::enable_user_vector_if_needed(tf)
+            || enable_user_fpu_if_needed(tf))
+    {
         // 用户首次触碰浮点状态时按需打开 FS，保持 sepc 不变让原指令重试。
         tf_ptr
     } else if code == EXC_BREAKPOINT {
@@ -310,6 +314,10 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
     if fpu_dirty {
         unsafe { save_fpu_to_frame(tf) };
     }
+    let vector_active = (tf.status & SSTATUS_VS_MASK) != 0;
+    if vector_active {
+        crate::riscv64::vector::save_current_if_active(tf);
+    }
 
     let nr = tf.a7;
     let args = [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5];
@@ -319,7 +327,7 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
         sched::preempt_if_needed(kernel_timestamp_ns());
         return tf_ptr | 1;
     }
-    if fpu_dirty {
+    if fpu_dirty || vector_active {
         return tf_ptr | 1;
     }
     tf_ptr

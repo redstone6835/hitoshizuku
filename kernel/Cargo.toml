@@ -31,6 +31,7 @@ bench = false
 
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
+arch = { path = "../arch" }
 elf = { path = "../libs/elf" }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }

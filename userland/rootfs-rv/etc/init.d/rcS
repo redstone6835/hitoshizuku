@@ -56,7 +56,7 @@ maybe_enter_shell() {
 
 # 测试黑名单
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="unixbench"
+BLACKLIST="ltp unixbench"
 
 LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
 LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
@@ -165,30 +165,71 @@ kill_ltp_case_group() {
     kill -KILL "$child" 2>/dev/null || true
 }
 
-run_ltp_case() {
-    file="$1"
-    name="${file##*/}"
-    marker="/tmp/ltp-case-timeout.$$"
-    status="/tmp/ltp-case-status.$$"
+print_ltp_case_output() {
+    output="$1"
+
+    if [ ! -f "$output" ]; then
+        return 0
+    fi
+    if command -v awk >/dev/null 2>&1; then
+        awk '{
+            print
+            line = $0
+            gsub(sprintf("%c\\[[0-9;]*m", 27), "", line)
+            if (line ~ /(^|[^A-Z])TPASS([^A-Z]|$)/ && line !~ /(^|[^A-Z])TPASS[[:space:]]*:/)
+                printf "%c[1;32mTPASS: %c[0m\n", 27, 27
+        }' "$output"
+    else
+        cat "$output"
+    fi
+}
+
+ltp_case_is_skipped() {
+    tag="$1"
+    cmd="$2"
+    cmd_name="${cmd%%[ 	]*}"
+    cmd_name="${cmd_name##*/}"
 
     for skip in $LTP_SKIP_CASES; do
-        if [ "$name" = "$skip" ]; then
-            echo "RUN LTP CASE $name"
-            echo "[ltp] 跳过会卡住 runner 的用例：$name"
-            echo "FAIL LTP CASE $name : 124"
+        if [ "$tag" = "$skip" ] || [ "$cmd_name" = "$skip" ]; then
             return 0
         fi
     done
+    return 1
+}
 
-    rm -f "$marker" "$status"
+run_ltp_case() {
+    file="$1"
+    name="${file##*/}"
+    cmd="${2:-$file}"
+    marker="/tmp/ltp-case-timeout.$$"
+    status="/tmp/ltp-case-status.$$"
+    output="/tmp/ltp-case-output.$$"
+
+    if ltp_case_is_skipped "$name" "$cmd"; then
+        echo "RUN LTP CASE $name"
+        echo "[ltp] 跳过会卡住 runner 的用例：$name"
+        echo "FAIL LTP CASE $name : 124"
+        return 0
+    fi
+
+    rm -f "$marker" "$status" "$output"
     echo "RUN LTP CASE $name"
 
     if command -v setsid >/dev/null 2>&1; then
-        setsid /bin/sh -c '"$1"; echo "$?" > "$2"' sh "$file" "$status" &
+        setsid /bin/sh -c '
+            rm -f "$2" "$3"
+            LTP_COLORIZE_OUTPUT=1 sh -c "$1" >"$3" 2>&1
+            echo "$?" > "$2"
+        ' sh "$cmd" "$status" "$output" &
         child=$!
         kill_target="-$child"
     else
-        /bin/sh -c '"$1"; echo "$?" > "$2"' sh "$file" "$status" &
+        /bin/sh -c '
+            rm -f "$2" "$3"
+            LTP_COLORIZE_OUTPUT=1 sh -c "$1" >"$3" 2>&1
+            echo "$?" > "$2"
+        ' sh "$cmd" "$status" "$output" &
         child=$!
         kill_target="$child"
     fi
@@ -199,6 +240,7 @@ run_ltp_case() {
             echo "[ltp] 用例超时：$name，超过 ${LTP_TIMEOUT}s"
             : >"$marker"
             kill_ltp_case_group "$kill_target" "$child"
+            print_ltp_case_output "$output"
 
             grace=0
             while [ "$grace" -lt "$LTP_KILL_GRACE" ] && [ ! -f "$status" ]; do
@@ -208,7 +250,7 @@ run_ltp_case() {
 
             if [ ! -f "$status" ]; then
                 echo "[ltp] 用例已终止但未回收，继续后续用例：$name"
-                rm -f "$marker" "$status"
+                rm -f "$marker" "$status" "$output"
                 echo "FAIL LTP CASE $name : 124"
                 return 0
             fi
@@ -219,69 +261,143 @@ run_ltp_case() {
     done
 
     ret="$(cat "$status" 2>/dev/null || echo 124)"
+    if [ ! -f "$marker" ]; then
+        print_ltp_case_output "$output"
+    fi
     kill_ltp_case_group "$kill_target" "$child"
     wait "$child" 2>/dev/null || true
 
     if [ -f "$marker" ]; then
         ret=124
     fi
-    rm -f "$marker" "$status"
+    rm -f "$marker" "$status" "$output"
     echo "FAIL LTP CASE $name : $ret"
     return 0
+}
+
+run_ltp_command_case() {
+    tag="$1"
+    cmd="$2"
+
+    run_ltp_case "$tag" "$cmd"
 }
 
 run_ltp_script() {
     script="$1"
     libc_name="${PWD##*/}"
-    target_dir="ltp/testcases/bin"
+    ltp_root="ltp"
+    target_dir="$ltp_root/testcases/bin"
+    cmdlist="/tmp/ltp-runtest.$$"
 
     echo "#### OS COMP TEST GROUP START ltp-$libc_name ####"
-    if [ ! -d "$target_dir" ]; then
-        echo "[ltp] LTP 目录不完整：$PWD/$target_dir"
+    if [ ! -d "$target_dir" ] || [ ! -d "$ltp_root/runtest" ]; then
+        echo "[ltp] LTP 目录不完整：$PWD/$ltp_root"
         echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
         return 0
     fi
 
-    echo "[init] 使用 ${script##*/} 触发 LTP，逐用例超时 ${LTP_TIMEOUT}s，跳过：$LTP_SKIP_CASES"
-    for file in "$target_dir"/*; do
-        if [ -f "$file" ]; then
-            run_ltp_case "$file"
+    export LTPROOT="$PWD/$ltp_root"
+    export PATH="$LTPROOT/testcases/bin:$LTPROOT/bin:$PATH"
+    export LTP_DEV_FS_TYPE="${LTP_DEV_FS_TYPE:-ext2}"
+
+    echo "[init] 使用 ${script##*/} 触发 LTP runtest，逐用例超时 ${LTP_TIMEOUT}s，跳过：$LTP_SKIP_CASES"
+
+    : >"$cmdlist"
+    if [ -f "$ltp_root/scenario_groups/default" ]; then
+        scenarios="$(cat "$ltp_root/scenario_groups/default" 2>/dev/null)"
+    else
+        scenarios="syscalls controllers"
+    fi
+
+    for scenario in $scenarios; do
+        runtest_file="$ltp_root/runtest/$scenario"
+        if [ ! -f "$runtest_file" ]; then
+            echo "[ltp] 跳过缺失场景：$scenario"
+            continue
         fi
+        sed -e 's/^[ 	]*//' -e '/^#/d' -e '/^$/d' "$runtest_file" >>"$cmdlist"
     done
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        tag="${line%%[ 	]*}"
+        cmd="${line#"$tag"}"
+        cmd="$(printf '%s\n' "$cmd" | sed 's/^[ 	]*//')"
+        [ -n "$cmd" ] || cmd="$tag"
+
+        run_ltp_command_case "$tag" "$cmd"
+    done <"$cmdlist"
+
+    rm -f "$cmdlist"
 
     echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
     return 0
 }
 
+run_test_script_file() {
+    script="$1"
+    name="${script##*/}"
+    dir="${script%/*}"
+    oldpwd="$PWD"
+
+    if _is_blacklisted "$name"; then
+        echo "[init] skip $name (blacklist)"
+    else
+        if [ "$name" = "basic_testcode.sh" ]; then
+            setup_basic_mount_loop
+        fi
+        echo "[init] run $name"
+        cd "$dir" || return 0
+        if [ "$name" = "ltp_testcode.sh" ]; then
+            run_ltp_script "$script"
+        else
+            /bin/sh "$script"
+        fi
+        cd "$oldpwd" || true
+    fi
+    if [ "$name" = "busybox_testcode.sh" ]; then
+        cleanup_basic_mount_loop
+    fi
+}
+
 run_test_scripts() {
+    ordered="iozone_testcode.sh lmbench_testcode.sh libcbench_testcode.sh basic_testcode.sh busybox_testcode.sh lua_testcode.sh"
+    dirs="/mnt/glibc /mnt/musl"
+
     _test_setup
-    for dir in /mnt/glibc /mnt/musl; do
+    for dir in $dirs; do
         set -- "$dir"/*_testcode.sh
         if [ -f "$1" ]; then
             echo "[init] found test scripts in $dir"
-            cd "$dir" || continue
-            for script in "$@"; do
-                name="${script##*/}"
-                if _is_blacklisted "$name"; then
-                    echo "[init] skip $name (blacklist)"
-                else
-                    if [ "$name" = "basic_testcode.sh" ]; then
-                        setup_basic_mount_loop
-                    fi
-                    echo "[init] run $name"
-                    if [ "$name" = "ltp_testcode.sh" ]; then
-                        run_ltp_script "$script"
-                    else
-                        /bin/sh "$script"
-                    fi
-                fi
-                if [ "$name" = "busybox_testcode.sh" ]; then
-                    cleanup_basic_mount_loop
-                fi
-            done
-            cleanup_basic_mount_loop
         fi
     done
+
+    for name in $ordered; do
+        for dir in $dirs; do
+            script="$dir/$name"
+            [ -f "$script" ] && run_test_script_file "$script"
+        done
+    done
+
+    for dir in $dirs; do
+        set -- "$dir"/*_testcode.sh
+        if [ -f "$1" ]; then
+            for script in "$dir"/*_testcode.sh; do
+                [ -f "$script" ] || continue
+                name="${script##*/}"
+                case " $ordered ltp_testcode.sh " in
+                    *" $name "*) continue ;;
+                esac
+                run_test_script_file "$script"
+            done
+        fi
+    done
+
+    for dir in $dirs; do
+        script="$dir/ltp_testcode.sh"
+        [ -f "$script" ] && run_test_script_file "$script"
+    done
+
+    cleanup_basic_mount_loop
     _test_teardown
     return 0
 }

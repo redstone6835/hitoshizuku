@@ -244,6 +244,9 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "5:",
 
         "mv a0, sp",
+        "call {save_vector}",
+
+        "mv a0, sp",
         "ld a1, {sp_off}(sp)",
         "call {handler}",
 
@@ -258,6 +261,7 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         handler = sym riscv64_handle_exception,
         fast_handler = sym riscv64_fast_syscall_dispatch,
+        save_vector = sym crate::riscv64::vector::save_vector_from_trap_entry,
         resume = sym crate::riscv64::task::__riscv64_resume_to_trap_frame,
         frame_size = const FRAME_SIZE,
         kernel_gp_off = const HART_LOCAL_KERNEL_GP_OFF,

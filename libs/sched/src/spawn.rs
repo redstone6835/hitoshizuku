@@ -17,7 +17,7 @@ use crate::scheduler::{
     root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
-use crate::task::{Task, ext_clone_hook, ext_exit_hook};
+use crate::task::{Task, ext_clone_hook};
 use crate::{ExitCode, TaskState};
 
 /// 派生类型：新进程 vs 新线程。
@@ -338,10 +338,6 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                 }
             }
         }
-    }
-
-    if let Some(hook) = ext_exit_hook() {
-        hook.cleanup_on_exit(task);
     }
 
     mark_task_exited(task, code);

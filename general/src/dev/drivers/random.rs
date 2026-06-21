@@ -466,15 +466,15 @@ impl RandomCore {
         true
     }
 
-    fn wait_and_debit_entropy(&self, bits: u64, blocking: bool) -> bool {
+    fn wait_and_debit_entropy(&self, bits: u64, blocking: bool) -> Result<bool, CharIoError> {
         loop {
             if self.try_debit_entropy(bits) {
-                return true;
+                return Ok(true);
             }
             if !blocking {
-                return false;
+                return Ok(false);
             }
-            self.wait_for_entropy(bits);
+            self.wait_for_entropy(bits)?;
         }
     }
 
@@ -484,27 +484,33 @@ impl RandomCore {
     }
 
     /// 阻塞到至少有 `bits` 可用熵。
-    fn wait_for_entropy(&self, bits: u64) {
+    fn wait_for_entropy(&self, bits: u64) -> Result<(), CharIoError> {
         if bits == 0 || self.estimated_entropy_bits() >= bits {
-            return;
+            return Ok(());
         }
 
         if sched::is_ready() {
             loop {
                 if self.estimated_entropy_bits() >= bits {
-                    return;
+                    return Ok(());
                 }
                 let task = sched::current_task();
+                if sched::operation::has_interrupting_signal(&task) {
+                    return Err(CharIoError::Interrupted);
+                }
                 self.entropy_wait
                     .prepare_to_wait(&task, sched::TaskState::Sleeping);
                 if self.estimated_entropy_bits() >= bits {
                     self.entropy_wait.finish_wait(&task);
-                    return;
+                    return Ok(());
                 }
                 drop(task);
                 sched::schedule_once(sched::now_ns_public());
                 let task = sched::current_task();
                 self.entropy_wait.finish_wait(&task);
+                if sched::operation::has_interrupting_signal(&task) {
+                    return Err(CharIoError::Interrupted);
+                }
             }
         }
 
@@ -515,6 +521,7 @@ impl RandomCore {
                 core::hint::spin_loop();
             }
         }
+        Ok(())
     }
 
     /// 走 CSPRNG 输出；不消耗熵。
@@ -548,9 +555,9 @@ impl RandomCore {
     ///
     /// `blocking == true`：熵不足时挂 WaitQueue 阻塞等待。
     /// `blocking == false`：立刻返回 0。
-    fn read_blocking(&self, buf: &mut [u8], blocking: bool) -> usize {
+    fn read_blocking(&self, buf: &mut [u8], blocking: bool) -> Result<usize, CharIoError> {
         if buf.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let mut done = 0usize;
@@ -559,13 +566,13 @@ impl RandomCore {
             // 永远不可能同时满足的 credit 数。
             let chunk = (buf.len() - done).min(POOL_BYTES);
             let need_bits = (chunk as u64).saturating_mul(8);
-            if !self.wait_and_debit_entropy(need_bits, blocking) {
+            if !self.wait_and_debit_entropy(need_bits, blocking)? {
                 break;
             }
             self.crng_fill(&mut buf[done..done + chunk]);
             done += chunk;
         }
-        done
+        Ok(done)
     }
 
     /// `/dev/urandom` 的 read 实现（永不阻塞，从 CSPRNG 直接取）。
@@ -647,7 +654,7 @@ pub struct UrandomDriver;
 
 impl CharDriver for RandomDriver {
     fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
-        Ok(random_core().read_blocking(buf, true))
+        random_core().read_blocking(buf, true)
     }
 
     fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {

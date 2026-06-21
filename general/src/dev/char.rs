@@ -17,6 +17,8 @@ pub enum CharIoError {
     HardwareError,
     /// 设备不可用或已断开。
     Unavailable,
+    /// 阻塞 I/O 被信号打断。
+    Interrupted,
     /// 自旋等待超时（防止硬件故障导致死锁）。
     Timeout,
 }
@@ -231,6 +233,7 @@ fn map_char_control_error(err: CharIoError) -> ControlError {
     match err {
         CharIoError::HardwareError => ControlError::Io,
         CharIoError::Unavailable => ControlError::NoDevice,
+        CharIoError::Interrupted => ControlError::Busy,
         CharIoError::Timeout => ControlError::Busy,
     }
 }

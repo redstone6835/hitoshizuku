@@ -237,18 +237,13 @@ fn lookup_process_group(pgid: PidT) -> Result<Arc<ProcessGroup>, Errno> {
 fn deliver_to_process_group(pg: Arc<ProcessGroup>, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo(sig);
+
     for m in pg.snapshot() {
         if m.is_kernel_task() {
             continue;
         }
         if check_kill_permission(&m).is_ok() {
-            m.thread_group().shared_signal().deliver(info);
-            for x in m.thread_group().snapshot() {
-                if should_wake_for_signal(&x, sig) {
-                    signal_wakeup(&x, &info);
-                    break;
-                }
-            }
+            let _ = deliver_to_thread_group(&m, info);
         }
     }
     Ok(())
@@ -918,6 +913,45 @@ fn should_wake_for_signal(task: &Arc<Task>, sig: SignalNumber) -> bool {
         && (!task.signal.blocked_snapshot().has(sig) || task.signal.sigtimedwait_wants(sig))
 }
 
+fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
+    if target.is_kernel_task() {
+        return false;
+    }
+
+    let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
+    let members = target.thread_group().snapshot();
+    let mut terminated = false;
+
+    for member in members.iter() {
+        if member.is_kernel_task() {
+            continue;
+        }
+        if matches!(member.state(), TaskState::Zombie | TaskState::Dead) {
+            continue;
+        }
+        member.mark_signaled_exit(info.sig, core_dumped);
+        exit_task(member, ExitCode(info.sig.raw() as i32));
+        terminated = true;
+    }
+
+    terminated
+}
+
+fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
+    if info.sig == SignalNumber::SIGKILL {
+        return terminate_thread_group_by_signal(target, info);
+    }
+
+    target.thread_group().shared_signal().deliver(info);
+    for m in target.thread_group().snapshot() {
+        if should_wake_for_signal(&m, info.sig) {
+            signal_wakeup(&m, &info);
+            break;
+        }
+    }
+    true
+}
+
 /// `kill(pid, sig)`：按 POSIX pid 语义投递信号。
 /// - pid > 0：送到整 thread-group（共享 pending）。
 /// - pid == 0：送到调用者同 pgroup 的所有进程。
@@ -933,14 +967,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
         check_kill_permission(&target)?;
         let Some(sig) = sig else { return Ok(()) };
         let info = make_siginfo(sig);
-        target.thread_group().shared_signal().deliver(info);
-        // 唤醒任一合适的 tg 成员。
-        for m in target.thread_group().snapshot() {
-            if should_wake_for_signal(&m, sig) {
-                signal_wakeup(&m, &info);
-                break;
-            }
-        }
+        let _ = deliver_to_thread_group(&target, info);
         return Ok(());
     }
 
@@ -977,14 +1004,7 @@ pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
             if check_kill_permission(&t).is_err() {
                 continue;
             }
-            t.thread_group().shared_signal().deliver(info);
-            for x in t.thread_group().snapshot() {
-                if should_wake_for_signal(&x, sig) {
-                    signal_wakeup(&x, &info);
-                    break;
-                }
-            }
-            delivered = true;
+            delivered |= deliver_to_thread_group(&t, info);
         }
         return if delivered { Ok(()) } else { Err(Errno::EPERM) };
     }
@@ -1007,8 +1027,12 @@ pub fn tkill(tid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     check_kill_permission(&target)?;
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo_with_code(sig, -6);
-    target.signal.deliver(info);
-    signal_wakeup(&target, &info);
+    if sig == SignalNumber::SIGKILL {
+        let _ = terminate_thread_group_by_signal(&target, info);
+    } else {
+        target.signal.deliver(info);
+        signal_wakeup(&target, &info);
+    }
     Ok(())
 }
 
@@ -1029,8 +1053,12 @@ pub fn tgkill(tgid: PidT, tid: PidT, sig: Option<SignalNumber>) -> Result<(), Er
     check_kill_permission(&target)?;
     let Some(sig) = sig else { return Ok(()) };
     let info = make_siginfo_with_code(sig, -6);
-    target.signal.deliver(info);
-    signal_wakeup(&target, &info);
+    if sig == SignalNumber::SIGKILL {
+        let _ = terminate_thread_group_by_signal(&target, info);
+    } else {
+        target.signal.deliver(info);
+        signal_wakeup(&target, &info);
+    }
     Ok(())
 }
 
@@ -1049,8 +1077,12 @@ pub fn tgqueueinfo(tgid: PidT, tid: PidT, info: SigInfo) -> Result<(), Errno> {
         return Err(Errno::ESRCH);
     }
     check_kill_permission(&target)?;
-    target.signal.deliver(info);
-    signal_wakeup(&target, &info);
+    if info.sig == SignalNumber::SIGKILL {
+        let _ = terminate_thread_group_by_signal(&target, info);
+    } else {
+        target.signal.deliver(info);
+        signal_wakeup(&target, &info);
+    }
     Ok(())
 }
 
@@ -1064,13 +1096,7 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
         return Err(Errno::ESRCH);
     }
     check_kill_permission(&target)?;
-    target.thread_group().shared_signal().deliver(info);
-    for member in target.thread_group().snapshot() {
-        if should_wake_for_signal(&member, info.sig) {
-            signal_wakeup(&member, &info);
-            break;
-        }
-    }
+    let _ = deliver_to_thread_group(&target, info);
     Ok(())
 }
 

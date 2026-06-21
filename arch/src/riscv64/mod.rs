@@ -43,6 +43,7 @@ pub mod early_console;
 pub mod specific;
 pub mod time;
 pub mod vdso;
+pub mod vector;
 
 // ── 辅助 ──────────────────────────────────────────────────────────────────────
 

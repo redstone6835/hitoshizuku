@@ -244,8 +244,12 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "1:",
         "csrw {sscratch}, x0",
 
-        // FPU 恢复（检查 sstatus.FS != Off）
+        // Vector 恢复（只在用户态 V active 时真正执行）
         "2:",
+        "mv a0, s11",
+        "call {restore_vector}",
+
+        // FPU 恢复（检查 sstatus.FS != Off）
         "ld t0, {status_off}(s11)",
         "li t1, {fs_mask}",
         "and t1, t0, t1",
@@ -349,6 +353,7 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         sscratch = const CSR_SSCRATCH,
         satp = const crate::riscv64::specific::CSR_SATP,
         fcsr = const CSR_FCSR,
+        restore_vector = sym crate::riscv64::vector::restore_vector_from_resume,
         spp = const SSTATUS_SPP,
         fs_mask = const SSTATUS_FS_MASK,
         satp_off = const crate::riscv64::specific::SATP_OFFSET,

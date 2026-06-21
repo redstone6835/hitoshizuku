@@ -645,6 +645,7 @@ fn map_char_err(e: CharIoError) -> VfsError {
     match e {
         CharIoError::HardwareError => VfsError::Io,
         CharIoError::Unavailable => VfsError::NoDevice,
+        CharIoError::Interrupted => VfsError::Interrupted,
         CharIoError::Timeout => VfsError::TimedOut,
     }
 }

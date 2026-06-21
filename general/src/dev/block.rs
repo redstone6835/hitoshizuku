@@ -10,7 +10,6 @@ use core::any::Any;
 use core::future::Future;
 use core::num::NonZeroU32;
 use core::pin::Pin;
-use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
@@ -705,7 +704,9 @@ impl BlockDevice {
 
     /// 同步提交并阻塞等待。
     ///
-    /// 使用栈上 Completion 避免每次 I/O 的 Arc 堆分配。
+    /// 使用共享 Completion，保证等待任务被信号/超时杀死后，驱动稍后完成 pending
+    /// BIO 时仍有有效 completion 目标。这里不能使用栈上 completion：同步等待期间
+    /// 会让出 CPU，任务可能在 BIO 完成前退出并回收内核栈。
     /// 统计在完成后由本函数直接记录，跳过 observer 回调中的额外时钟读取。
     /// 通过主动 drain 推进硬件完成，不依赖中断。
     pub fn submit_bio_wait(
@@ -716,18 +717,14 @@ impl BlockDevice {
     ) -> Result<Bio, BioError> {
         self.validate_bio(op, range, &buffer)?;
         let submitted_ns = sched::now_ns_public();
-        let completion = Completion::<BioResult>::new_detached();
-        let bio = unsafe {
-            Bio::new_inline(
-                op,
-                range,
-                buffer,
-                self.geometry.logical_block_size(),
-                submitted_ns,
-                None,
-                NonNull::from(&completion),
-            )
-        };
+        let (bio, completion) = Bio::new_shared_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            None,
+        );
         self.io_stats.begin(op);
         if let Err((err, _bio)) = self.driver.queue_bio(bio) {
             self.io_stats.cancel(op);

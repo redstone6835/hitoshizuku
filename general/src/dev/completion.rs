@@ -56,15 +56,6 @@ impl<T> Completion<T> {
         });
     }
 
-    /// 同步快速完成路径：跳过 waker/WaitQueue 唤醒。
-    ///
-    /// 仅当调用方确定无人通过 WaitQueue 或 Waker 等待时使用（如
-    /// `submit_bio_wait` 中驱动同步完成的场景——调用方通过轮询 `is_done` 检测）。
-    pub fn complete_inline(&self, value: T) {
-        *self.result.lock() = Some(value);
-        self.done.store(true, Ordering::Release);
-    }
-
     /// 同步阻塞等待结果。调度器就绪时用 WaitQueue 让出 CPU；否则 spin。
     pub fn wait(&self) -> T {
         if sched::is_ready() {

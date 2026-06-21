@@ -44,6 +44,10 @@ pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = sched::TASKEXT_EXEC_PATH;
 pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
 pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
 
+#[cfg(target_arch = "riscv64")]
+type RiscvVectorSignalStack =
+    Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
+
 pub fn stash_boot_console_name(name: alloc::string::String) {
     *BOOT_CONSOLE_NAME.lock() = Some(name);
 }
@@ -129,6 +133,12 @@ impl TaskExtCloneHook for KernelExtCloneHook {
                     Arc::new(s.fork())
                 }
             }
+            #[cfg(target_arch = "riscv64")]
+            sched::TASKEXT_RISCV_VECTOR_STATE => arch::riscv64::vector::clone_ext_payload(src),
+            #[cfg(target_arch = "riscv64")]
+            sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK => {
+                Arc::new(RiscvVectorSignalStack::new(Vec::new()))
+            }
             _ => Arc::clone(src),
         }
     }
@@ -140,6 +150,12 @@ struct KernelExtExitHook;
 
 impl TaskExtExitHook for KernelExtExitHook {
     fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        #[cfg(target_arch = "riscv64")]
+        arch::riscv64::vector::clear_for_task(task);
+        #[cfg(target_arch = "riscv64")]
+        {
+            let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
+        }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
@@ -327,6 +343,44 @@ fn activate_task_vm(task: &Arc<Task>) {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
+fn push_riscv_vector_signal_snapshot(
+    task: &Arc<Task>,
+    user_ctx: UserContextRef,
+) -> Result<(), Errno> {
+    let tf = unsafe { &mut *(user_ctx.as_usize() as *mut arch::riscv64::TrapFrame) };
+    let snapshot = arch::riscv64::vector::snapshot_current_for_signal(tf);
+    let stack = if let Some(stack) = task
+        .ext_lookup(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
+        .and_then(|payload| payload.downcast::<RiscvVectorSignalStack>().ok())
+    {
+        stack
+    } else {
+        let stack = Arc::new(RiscvVectorSignalStack::new(Vec::new()));
+        task.ext_install(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK, stack.clone());
+        stack
+    };
+    let mut guard = stack.lock();
+    guard.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+    guard.push(snapshot);
+    Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn pop_riscv_vector_signal_snapshot(task: &Arc<Task>, user_ctx: UserContextRef) {
+    let Some(stack) = task
+        .ext_lookup(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
+        .and_then(|payload| payload.downcast::<RiscvVectorSignalStack>().ok())
+    else {
+        return;
+    };
+    let Some(snapshot) = stack.lock().pop() else {
+        return;
+    };
+    let tf = unsafe { &mut *(user_ctx.as_usize() as *mut arch::riscv64::TrapFrame) };
+    arch::riscv64::vector::restore_signal_snapshot(tf, snapshot);
+}
+
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
     let frame = {
         let me = sched::current_task();
@@ -387,6 +441,8 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    #[cfg(target_arch = "riscv64")]
+    arch::riscv64::vector::clear_for_task(task);
     loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
     if let Some(fdt) = task_fdtable(task) {
@@ -545,6 +601,8 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     task.signal
         .block(SigSet::from_raw(restore_mask), SigProcMaskHow::SetMask);
     restored.apply_to_context(user_ctx.as_usize());
+    #[cfg(target_arch = "riscv64")]
+    pop_riscv_vector_signal_snapshot(task, user_ctx);
     Ok(())
 }
 
@@ -638,6 +696,8 @@ fn process_setup_signal_frame(
         return Err(Errno::EINVAL);
     }
     copy_to_user(new_sp, &frame_bytes).map_err(|e| e.as_errno())?;
+    #[cfg(target_arch = "riscv64")]
+    push_riscv_vector_signal_snapshot(task, user_ctx)?;
 
     let mut handler_mask = old_mask.union(action.mask);
     if !action.flags.has(SigActionFlags::SA_NODEFER) {

@@ -14,6 +14,7 @@ const CYCLE_TO_NS_SHIFT: u32 = 24;
 
 pub const CLOCK_REALTIME: usize = 0;
 pub const CLOCK_MONOTONIC: usize = 1;
+pub const CLOCK_MONOTONIC_RAW: usize = 4;
 pub const CLOCK_REALTIME_COARSE: usize = 5;
 pub const CLOCK_MONOTONIC_COARSE: usize = 6;
 pub const CLOCK_BOOTTIME: usize = 7;
@@ -98,7 +99,9 @@ pub fn unregister_realtime_source(source_id: usize) {
 pub fn clock_time_ns(clock_id: usize) -> Option<u64> {
     match clock_id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => Some(realtime_ns()),
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => Some(monotonic_ns()),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+            Some(monotonic_ns())
+        }
         _ => None,
     }
 }
@@ -107,6 +110,7 @@ pub fn clock_getres_ns(clock_id: usize) -> Option<u32> {
     match clock_id {
         CLOCK_REALTIME
         | CLOCK_MONOTONIC
+        | CLOCK_MONOTONIC_RAW
         | CLOCK_REALTIME_COARSE
         | CLOCK_MONOTONIC_COARSE
         | CLOCK_BOOTTIME => Some(1),

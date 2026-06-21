@@ -629,6 +629,7 @@ fn map_uart_char_error(err: CharIoError) -> ControlError {
     match err {
         CharIoError::HardwareError => ControlError::Io,
         CharIoError::Unavailable => ControlError::NoDevice,
+        CharIoError::Interrupted => ControlError::Busy,
         CharIoError::Timeout => ControlError::Busy,
     }
 }

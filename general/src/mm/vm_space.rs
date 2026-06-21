@@ -1114,6 +1114,82 @@ impl VmSpace {
         Ok(())
     }
 
+    /// 立即为一个 ELF 段分配并从文件按页填充。
+    ///
+    /// loader 不能为了装载大可执行文件把整个 ELF 读进内核堆。这个入口只在
+    /// 当前页需要文件内容时读取最多一页，BSS 和页内尾部仍由零页分配保证清零。
+    pub fn commit_file_segment(
+        &self,
+        vaddr: usize,
+        memsz: usize,
+        file_offset: u64,
+        file_size: usize,
+        file: &dyn FileLike,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        if memsz == 0 {
+            return Ok(());
+        }
+        if file_size > memsz {
+            return Err(Errno::EINVAL);
+        }
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+
+        let page_size = page_size();
+        let start = page_base(vaddr);
+        let end_unaligned = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
+        let end = align_up(end_unaligned, page_size).ok_or(Errno::EINVAL)?;
+        let file_end_vaddr = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
+        let area_flags = flags.with(VmFlags::USER).with(VmFlags::ANON);
+
+        self.map_anon(start..end, area_flags)?;
+
+        let mut pages = self.pages.lock();
+        let mut page_va = start;
+        while page_va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let result = (|| {
+                let copy_start_va = page_va.max(vaddr);
+                let copy_end_va = (page_va + page_size).min(file_end_vaddr);
+                if copy_end_va <= copy_start_va {
+                    return Ok(());
+                }
+
+                let seg_off = copy_start_va - vaddr;
+                let len = copy_end_va - copy_start_va;
+                let dst_off_in_page = copy_start_va - page_va;
+                let kva = virt_fn(paddr) + dst_off_in_page;
+                let dst = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
+                let mut done = 0usize;
+                while done < len {
+                    let read_off = file_offset
+                        .checked_add((seg_off + done) as u64)
+                        .ok_or(Errno::EINVAL)?;
+                    let n = file.read_at(read_off, &mut dst[done..])?;
+                    if n == 0 {
+                        return Err(Errno::ENOEXEC);
+                    }
+                    done += n;
+                }
+                Ok(())
+            })();
+            if let Err(err) = result {
+                free_user_page(paddr);
+                return Err(err);
+            }
+
+            let page = ResidentPage::new_anon(paddr);
+            let access = access_for_new_page(area_flags, &page);
+            self.map_page(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
+            pages.insert(page_va, PageMapping { page, access });
+            page_va += page_size;
+        }
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        Ok(())
+    }
+
     fn validate_range(&self, range: &Range<usize>) -> Result<(), Errno> {
         let page_size = page_size();
         if range.start % page_size != 0 || range.end % page_size != 0 {

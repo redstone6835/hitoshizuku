@@ -30,12 +30,23 @@ pub const SSTATUS_SIE: usize = 1 << 1; // [1]     全局中断使能
 pub const SSTATUS_SPIE: usize = 1 << 5; // [5]     trap 前 SIE 备份
 pub const SSTATUS_SPP: usize = 1 << 8; // [8]     trap 前特权级 (0=U,1=S)
 pub const SSTATUS_VS_MASK: usize = 3 << 9; // [10:9]  向量状态
+pub const SSTATUS_VS_INITIAL: usize = 0b01 << 9; // [10:9]  VS = Initial；首次允许用户执行向量指令
+pub const SSTATUS_VS_CLEAN: usize = 0b10 << 9; // [10:9]  VS = Clean；向量上下文已同步到内存
+pub const SSTATUS_VS_DIRTY: usize = 0b11 << 9; // [10:9]  VS = Dirty；向量上下文需要保存
 pub const SSTATUS_FS_MASK: usize = 0b11 << 13; // [14:13] 浮点状态（2-bit 提取掩码）
 pub const SSTATUS_FS_INITIAL: usize = 0b01 << 13; // [14:13] FS = Initial；首次允许用户执行浮点指令
 pub const SSTATUS_FS_DIRTY: usize = 0b11 << 13; // [14:13] FS = Dirty；数值恰等于 MASK（0b11 是最大编码值）
 pub const SSTATUS_SUM: usize = 1 << 18; // [18]    S-mode 访问 U 页
 pub const SSTATUS_MXR: usize = 1 << 19; // [19]    execute-only 页可读
 pub const SSTATUS_SD: usize = 1 << 63; // [63]    FS|VS 脏位汇总
+
+// ── Vector CSR 编号 ─────────────────────────────────────────────────────────
+
+pub const CSR_VSTART: usize = 0x008;
+pub const CSR_VCSR: usize = 0x00f;
+pub const CSR_VL: usize = 0xc20;
+pub const CSR_VTYPE: usize = 0xc21;
+pub const CSR_VLENB: usize = 0xc22;
 
 // ── sie/sip 位域 ─────────────────────────────────────────────────────────────
 

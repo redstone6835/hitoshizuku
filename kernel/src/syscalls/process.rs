@@ -873,6 +873,7 @@ pub(super) fn sys_clock_nanosleep(ctx: &mut SyscallContext<'_>) -> Result<usize,
     let rem_user = ctx.args[3];
     if clock_id != crate::vdso::CLOCK_REALTIME as i32
         && clock_id != crate::vdso::CLOCK_MONOTONIC as i32
+        && clock_id != crate::vdso::CLOCK_MONOTONIC_RAW as i32
     {
         return Err(Errno::EINVAL);
     }
