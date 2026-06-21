@@ -81,7 +81,6 @@ pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let task = Arc::clone(ctx.task());
     #[cfg(feature = "trace-task-lifecycle")]
     log::debug!("[syscall][exit] pid={:?} code={}", task.pid_root(), code);
-    release_exit_files(&task);
     ctx.release_task_ref();
     drop(task);
     sched::operation::exit(code);
@@ -96,9 +95,6 @@ pub(super) fn sys_exit_group(ctx: &mut SyscallContext<'_>) -> Result<usize, Errn
         task.pid_root(),
         code
     );
-    for member in task.thread_group().snapshot() {
-        release_exit_files(&member);
-    }
     ctx.release_task_ref();
     drop(task);
     sched::operation::exit_group(code);
@@ -117,9 +113,34 @@ fn release_exit_files(task: &Arc<Task>) {
             .and_then(|leader| leader.pid_root())
             .or_else(|| task.pid_root())
             .unwrap_or(0);
-        fdt.release_all_record_locks_for_owner(owner_pid);
+        if fdtable_has_other_live_owner(task, &fdt) {
+            fdt.release_all_record_locks_for_owner(owner_pid);
+        } else {
+            fdt.close_all_for_owner(owner_pid);
+        }
     }
     let _ = task.ext_remove(sched::TASKEXT_VFS_FDTABLE);
+}
+
+fn fdtable_has_other_live_owner(task: &Arc<Task>, fdt: &Arc<vfs::fdtable::FdTable>) -> bool {
+    for other in sched::operation::all_tasks_snapshot() {
+        if Arc::ptr_eq(&other, task) || other.is_kernel_task() {
+            continue;
+        }
+        if matches!(other.state(), TaskState::Zombie | TaskState::Dead) {
+            continue;
+        }
+        let Some(payload) = other.ext_lookup(sched::TASKEXT_VFS_FDTABLE) else {
+            continue;
+        };
+        let Ok(other_fdt) = Arc::downcast::<vfs::fdtable::FdTable>(payload) else {
+            continue;
+        };
+        if Arc::ptr_eq(&other_fdt, fdt) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn sys_clone(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3541,6 +3562,7 @@ pub(crate) fn cleanup_task_before_exit(task: &Arc<Task>) {
         return;
     }
     let _ = sched::cancel_sleep_deadline(task);
+    release_exit_files(task);
     let current = sched::current_task();
     if Arc::ptr_eq(&current, task) {
         cleanup_task_before_exit_in_active_vm(task);

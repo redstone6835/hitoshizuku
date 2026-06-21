@@ -921,6 +921,8 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
     let core_dumped = matches!(default_action(info.sig), DefaultAction::Core);
     let members = target.thread_group().snapshot();
     let mut terminated = false;
+    let current = current_task();
+    let mut need_handoff = false;
 
     for member in members.iter() {
         if member.is_kernel_task() {
@@ -930,10 +932,22 @@ fn terminate_thread_group_by_signal(target: &Arc<Task>, info: SigInfo) -> bool {
             continue;
         }
         member.mark_signaled_exit(info.sig, core_dumped);
-        exit_task(member, ExitCode(info.sig.raw() as i32));
+        // 不在发送者上下文直接 exit 目标任务。目标可能正阻塞在
+        // poll/epoll/accept 等 syscall 中，栈上持有 Arc<File> 临时引用；
+        // 远程 exit 会 drain fdtable，但不会运行目标 Rust 栈帧析构，导致
+        // socket listener 等资源被隐藏引用保活。把 fatal signal 投到目标
+        // per-task pending 并唤醒它，让目标在线程自己的调用栈上消费默认动作。
+        member.signal.deliver(info);
+        signal_wakeup(member, &info);
+        if !Arc::ptr_eq(member, &current) {
+            need_handoff = true;
+        }
         terminated = true;
     }
 
+    if need_handoff {
+        request_post_syscall_handoff();
+    }
     terminated
 }
 

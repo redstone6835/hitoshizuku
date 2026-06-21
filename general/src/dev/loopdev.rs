@@ -395,6 +395,8 @@ impl BlockDriver for LoopDriver {
                     .map(|()| BlockControlResponse::Done)
                     .map_err(map_loop_control_error),
             ),
+            #[cfg(feature = "block-profile")]
+            BlockControlRequest::GetDebugProfile => None,
             BlockControlRequest::GetDiskSeq => None,
         }
     }

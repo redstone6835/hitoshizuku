@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 bench = []
-block-bench = []
+block-bench = ["general/block-profile"]
 allocator-bench = []
 embedded-initramfs = []
 trace-task-lifecycle = ["sched/trace-task-lifecycle"]

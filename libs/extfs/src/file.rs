@@ -29,6 +29,7 @@ use crate::{extent_wr, inode::lock_raw, map_wr};
 
 const I_BLOCK_BYTES: usize = 60;
 const MAP_CACHE_MAX_BLOCKS: u32 = 256 * 1024;
+const READ_AHEAD_BLOCKS: u32 = 16;
 
 // ── 目录 ────────────────────────────────────────────────────────────────
 
@@ -126,8 +127,15 @@ pub struct ExtRegFileOps {
     /// I/O 都靠 ino 反查 cache，unlink-but-open 文件会立刻变成 ENOENT。
     raw: Arc<Spinlock<RawInode>>,
     map_cache: Spinlock<BlockMapCache>,
+    read_ahead: Spinlock<ReadAheadState>,
     /// 串行化 append / 扩容。
     io_mu: Mutex<()>,
+}
+
+#[derive(Default)]
+struct ReadAheadState {
+    valid: bool,
+    next_offset: u64,
 }
 
 struct BlockMapCache {
@@ -175,6 +183,7 @@ impl ExtRegFileOps {
             ino,
             raw,
             map_cache: Spinlock::new(BlockMapCache::default()),
+            read_ahead: Spinlock::new(ReadAheadState::default()),
             io_mu: Mutex::new(()),
         }
     }
@@ -252,10 +261,12 @@ impl ExtRegFileOps {
         &self,
         scratch: &mut Vec<u8>,
         range_byte_start: u64,
+        range_byte_end: u64,
         phys_start: u64,
         read_start: u64,
         read_end: u64,
         request_offset: u64,
+        allow_readahead: bool,
         dst: &mut [u8],
     ) -> VfsResult<()> {
         let block_size = self.state.ext_sb.block_size as u64;
@@ -265,6 +276,8 @@ impl ExtRegFileOps {
             let block_off = (cur % block_size) as usize;
             let take = ((block_size as usize - block_off) as u64).min(read_end - cur) as usize;
             let phys = phys_start + (cur - range_byte_start) / block_size;
+            let readahead_blocks =
+                readahead_blocks_for(block_size, range_byte_end, cur, allow_readahead);
             read_partial_block(
                 &self.state,
                 scratch,
@@ -273,6 +286,7 @@ impl ExtRegFileOps {
                 take,
                 cur,
                 request_offset,
+                readahead_blocks,
                 dst,
             )
             .map_err(map_err)?;
@@ -296,6 +310,8 @@ impl ExtRegFileOps {
         if cur < read_end {
             let take = (read_end - cur) as usize;
             let phys = phys_start + (cur - range_byte_start) / block_size;
+            let readahead_blocks =
+                readahead_blocks_for(block_size, range_byte_end, cur, allow_readahead);
             read_partial_block(
                 &self.state,
                 scratch,
@@ -304,6 +320,7 @@ impl ExtRegFileOps {
                 take,
                 cur,
                 request_offset,
+                readahead_blocks,
                 dst,
             )
             .map_err(map_err)?;
@@ -345,9 +362,25 @@ impl FileOps for ExtRegFileOps {
         let first_lb = (offset / block_size) as u32;
         let last_lb = ((offset + remaining as u64 - 1) / block_size) as u32;
         let lb_count = last_lb - first_lb + 1;
+        let allow_readahead = {
+            let mut state = self.read_ahead.lock();
+            let allow = offset == 0 || state.valid && offset == state.next_offset;
+            state.valid = true;
+            state.next_offset = offset.saturating_add(remaining as u64);
+            allow
+        };
+        let map_lb_count = if allow_readahead {
+            let total_blocks = size.div_ceil(block_size).min(u32::MAX as u64) as u32;
+            total_blocks
+                .saturating_sub(first_lb)
+                .min(lb_count.max(READ_AHEAD_BLOCKS))
+                .max(lb_count)
+        } else {
+            lb_count
+        };
 
         let ranges = self
-            .map_ranges(flags, size, &i_block, first_lb, lb_count)
+            .map_ranges(flags, size, &i_block, first_lb, map_lb_count)
             .map_err(map_err)?;
 
         let mut filled_until = 0usize;
@@ -370,10 +403,12 @@ impl FileOps for ExtRegFileOps {
             self.read_mapped_bytes(
                 &mut scratch,
                 range_byte_start,
+                range_byte_end,
                 *phys_start,
                 read_start,
                 read_end,
                 offset,
+                allow_readahead,
                 buf,
             )?;
             filled_until = filled_until.max(buf_pos + overlap_bytes);
@@ -681,6 +716,7 @@ fn read_partial_block(
     take: usize,
     cur: u64,
     request_offset: u64,
+    readahead_blocks: u32,
     dst: &mut [u8],
 ) -> Result<(), crate::state::BlockBackendError> {
     let dst_pos = (cur - request_offset) as usize;
@@ -691,14 +727,31 @@ fn read_partial_block(
             return Ok(());
         }
     }
-    // 慢速路径：cache miss，读整块
+    // 慢速路径：cache miss。顺序小读一次带上后续连续块，摊薄 virtio-mmio 门铃成本。
     let block_size = state.ext_sb.block_size as usize;
-    if scratch.len() != block_size {
-        scratch.resize(block_size, 0);
+    let blocks = readahead_blocks.max(1) as usize;
+    let bytes = block_size * blocks;
+    if scratch.len() != bytes {
+        scratch.resize(bytes, 0);
     }
-    state.read_block(phys, scratch)?;
+    state.read_data_blocks(phys, blocks as u32, scratch)?;
     dst[dst_pos..dst_pos + take].copy_from_slice(&scratch[block_off..block_off + take]);
     Ok(())
+}
+
+fn readahead_blocks_for(
+    block_size: u64,
+    range_byte_end: u64,
+    cur: u64,
+    allow_readahead: bool,
+) -> u32 {
+    if !allow_readahead || block_size == 0 {
+        return 1;
+    }
+    let current_block_start = cur / block_size * block_size;
+    let bytes_left = range_byte_end.saturating_sub(current_block_start);
+    let blocks_left = bytes_left.div_ceil(block_size).min(u32::MAX as u64) as u32;
+    blocks_left.clamp(1, READ_AHEAD_BLOCKS)
 }
 
 fn clip_ranges(ranges: &[(u32, u32, u64)], first_lb: u32, lb_count: u32) -> Vec<(u32, u32, u64)> {

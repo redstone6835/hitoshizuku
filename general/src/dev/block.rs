@@ -33,6 +33,13 @@ pub use crate::dev::bio::{
 /// 底层驱动查找键；驱动若能提供更稳定的介质序列，可在 [`BlockAttributes`] 中覆盖。
 static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 同步块 I/O 等待时，在真正让出 CPU 前主动推进完成队列的次数。
+///
+/// QEMU/virtio 的小请求通常在几十微秒内完成；立即切到 idle 会把一次上下文切换、
+/// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。这里先做一个很小的
+/// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
+const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 16;
+
 fn allocate_block_diskseq() -> u64 {
     loop {
         let current = NEXT_BLOCK_DISKSEQ.load(Ordering::Acquire).max(1);
@@ -314,6 +321,24 @@ pub struct BlockIoStatsSnapshot {
     pub flush_time_ns: u64,
     pub read_inflight: u64,
     pub write_inflight: u64,
+}
+
+/// 单次同步块 I/O 提交路径的分段耗时。
+///
+/// 仅用于基准测试定位固定开销来源；普通 I/O 路径不采集这些字段。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockSubmitProfile {
+    pub total_ns: u64,
+    pub validate_ns: u64,
+    pub build_bio_ns: u64,
+    pub queue_ns: u64,
+    pub drain_ns: u64,
+    pub schedule_ns: u64,
+    pub completion_take_ns: u64,
+    pub stats_ns: u64,
+    pub drain_calls: u64,
+    pub schedule_calls: u64,
+    pub spin_calls: u64,
 }
 
 #[derive(Default)]
@@ -672,6 +697,8 @@ impl BlockDevice {
                     rotational: self.attributes.rotational(),
                 }))
             }
+            #[cfg(feature = "block-profile")]
+            BlockControlRequest::GetDebugProfile => Err(ControlError::Unsupported),
             BlockControlRequest::GetDiskSeq => self
                 .attributes
                 .diskseq()
@@ -732,11 +759,17 @@ impl BlockDevice {
         }
 
         while !completion.is_done() {
-            self.driver.drain();
-            if completion.is_done() {
-                break;
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                self.driver.drain();
+                if completion.is_done() {
+                    break;
+                }
+                core::hint::spin_loop();
             }
             if sched::is_ready() {
+                if completion.is_done() {
+                    break;
+                }
                 sched::schedule_once(sched::now_ns_public());
             } else {
                 core::hint::spin_loop();
@@ -755,6 +788,97 @@ impl BlockDevice {
             self.io_stats.cancel(op);
         }
         result
+    }
+
+    /// 同步提交并返回分段耗时，供 block-bench 定位固定成本。
+    ///
+    /// 该接口刻意不复用 [`Self::submit_bio_wait`]，避免在普通路径中引入 profiling
+    /// 分支和额外时间戳读取。
+    pub fn submit_bio_wait_profiled(
+        self: &Arc<Self>,
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+    ) -> Result<(Bio, BlockSubmitProfile), BioError> {
+        let total_start = sched::now_ns_public();
+        let mut profile = BlockSubmitProfile::default();
+
+        let t0 = sched::now_ns_public();
+        self.validate_bio(op, range, &buffer)?;
+        profile.validate_ns = sched::now_ns_public().saturating_sub(t0);
+
+        let submitted_ns = sched::now_ns_public();
+        let t0 = sched::now_ns_public();
+        let (bio, completion) = Bio::new_shared_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            None,
+        );
+        profile.build_bio_ns = sched::now_ns_public().saturating_sub(t0);
+
+        self.io_stats.begin(op);
+        let t0 = sched::now_ns_public();
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
+            self.io_stats.cancel(op);
+            profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
+            return Err(BioError::Submit(err));
+        }
+        profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
+
+        while !completion.is_done() {
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                let t0 = sched::now_ns_public();
+                self.driver.drain();
+                profile.drain_ns = profile
+                    .drain_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.drain_calls = profile.drain_calls.saturating_add(1);
+                if completion.is_done() {
+                    break;
+                }
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+            if sched::is_ready() {
+                if completion.is_done() {
+                    break;
+                }
+                let t0 = sched::now_ns_public();
+                sched::schedule_once(sched::now_ns_public());
+                profile.schedule_ns = profile
+                    .schedule_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.schedule_calls = profile.schedule_calls.saturating_add(1);
+            } else {
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+        }
+
+        let t0 = sched::now_ns_public();
+        let result = completion.wait();
+        profile.completion_take_ns = sched::now_ns_public().saturating_sub(t0);
+
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        let t0 = sched::now_ns_public();
+        if result.is_ok() {
+            self.io_stats.record_complete(
+                op,
+                range,
+                self.geometry.logical_block_size(),
+                elapsed_ns,
+            );
+        } else {
+            self.io_stats.cancel(op);
+        }
+        profile.stats_ns = sched::now_ns_public().saturating_sub(t0);
+        profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
+
+        result.map(|bio| (bio, profile))
     }
 
     /// 同步读取到调用者提供的缓冲区。

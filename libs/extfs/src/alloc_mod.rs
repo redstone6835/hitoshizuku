@@ -351,6 +351,7 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     if block < sb.first_data_block as u64 {
         return Err(BlockBackendError::OutOfRange);
     }
+    state.discard_cached_blocks(block, 1);
     let rel = block - sb.first_data_block as u64;
     let group = (rel / sb.blocks_per_group as u64) as u32;
     let in_group = (rel % sb.blocks_per_group as u64) as u32;
@@ -388,6 +389,7 @@ pub(crate) fn free_blocks_run(
     }
 
     let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
+    state.discard_cached_blocks(start_block, count);
     let first_rel = start_block - sb.first_data_block as u64;
     let mut rel = first_rel;
     let mut remaining = count;
@@ -458,6 +460,7 @@ pub(crate) fn free_blocks_sparse(state: &FsState, blocks: &[u64]) -> Result<(), 
     let mut sorted = blocks.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
+    discard_sorted_cached_blocks(state, &sorted);
 
     let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
     let mut idx = 0usize;
@@ -527,6 +530,20 @@ pub(crate) fn free_blocks_sparse(state: &FsState, blocks: &[u64]) -> Result<(), 
         state.adjust_sb_free_blocks(total_cleared as i64)?;
     }
     Ok(())
+}
+
+fn discard_sorted_cached_blocks(state: &FsState, blocks: &[u64]) {
+    let mut idx = 0usize;
+    while idx < blocks.len() {
+        let start = blocks[idx];
+        let mut end = start + 1;
+        idx += 1;
+        while idx < blocks.len() && blocks[idx] == end {
+            end += 1;
+            idx += 1;
+        }
+        state.discard_cached_blocks(start, (end - start) as u32);
+    }
 }
 
 /// 分配一个 inode(非目录)。`is_dir` 控制用于 `s_used_dirs` 计数。

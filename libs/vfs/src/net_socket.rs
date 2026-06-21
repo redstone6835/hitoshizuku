@@ -393,11 +393,17 @@ impl FileOps for NetSocketFileOps {
 
     fn release(&self) {
         if let Some(handle) = self.handle.lock().take() {
+            let local = *self.local.lock();
+            let remote = *self.remote.lock();
+            let is_tcp_listener = matches!(handle.socket_type(), SocketType::Tcp)
+                && local.is_some()
+                && remote.is_none();
             let linger_secs = {
                 let options = self.options.lock();
                 if options.linger_on
                     && options.linger_secs > 0
                     && matches!(handle.socket_type(), SocketType::Tcp)
+                    && !is_tcp_listener
                 {
                     net::stack().tcp_close(handle);
                     options.linger_secs
@@ -413,11 +419,18 @@ impl FileOps for NetSocketFileOps {
                 }
             }
             if matches!(handle.socket_type(), SocketType::Tcp) {
-                net::stack().socket_close_detach(handle);
-                // TCP_CRR 这类短连接在 close 后立即发起下一轮 connect。
-                // 这里让对端马上运行一次，及时消费 FIN/EOF，避免只有额外
-                // timer sleeper 存在时协议收尾才继续推进。
-                sched::schedule_once(sched::now_ns_public());
+                if is_tcp_listener {
+                    // smoltcp 会把 listen socket 原地转换为 Established。VFS 的
+                    // 监听 fd 在 accept 前仍然是逻辑 listener，不能按普通连接
+                    // orphan，否则补位 listener / pending accept 会继续占端口。
+                    net::stack().tcp_close_listener(handle, local);
+                } else {
+                    net::stack().socket_close_detach(handle);
+                    // TCP_CRR 这类短连接在 close 后立即发起下一轮 connect。
+                    // 这里让对端马上运行一次，及时消费 FIN/EOF，避免只有额外
+                    // timer sleeper 存在时协议收尾才继续推进。
+                    sched::schedule_once(sched::now_ns_public());
+                }
             } else {
                 net::stack().socket_close_and_remove(handle);
             }

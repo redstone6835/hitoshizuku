@@ -14,11 +14,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::num::NonZeroU32;
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
+#[cfg(feature = "block-profile")]
+use super::virtio_block_common::VirtioBlkProfile;
 use super::virtio_block_common::{
     MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest, VirtioBlkCapabilities,
     VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore, VirtioBlkQueueId,
@@ -32,6 +34,8 @@ use crate::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
 use crate::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
+#[cfg(feature = "block-profile")]
+use crate::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
 use crate::dev::dma::DmaContext;
 use crate::dev::function::BlockFunction;
 use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
@@ -55,6 +59,9 @@ const VIRTIO_MMIO_DEVICE_ID_BLOCK: u32 = 2;
 const MMIO_MAGIC: usize = 0x000;
 const MMIO_VERSION: usize = 0x004;
 const MMIO_DEVICE_ID: usize = 0x008;
+const MMIO_QUEUE_NOTIFY: usize = 0x050;
+const MMIO_INTERRUPT_STATUS: usize = 0x060;
+const MMIO_INTERRUPT_ACK: usize = 0x064;
 
 // MMIO 传输层中设备类型 config 的起始偏移；字段语义由 virtio-blk 公共层解析。
 const BLK_CFG_BASE: usize = 0x100;
@@ -72,10 +79,19 @@ struct VirtioBlkInner {
     capabilities: VirtioBlkCapabilities,
     /// 当前用于通用块 I/O 的 virtqueue 编号。
     queue_id: VirtioBlkQueueId,
+    /// 热路径缓存：MMIO queue notify 寄存器地址。
+    notify_addr: usize,
+    /// 热路径缓存：写入 notify 寄存器的队列号。
+    notify_value: u32,
+    /// 中断状态/ACK 寄存器地址。中断路径也避免 dyn transport 调用。
+    interrupt_status_addr: usize,
+    interrupt_ack_addr: usize,
     /// 队列
     queue: Mutex<VirtioBlkQueueCore>,
     /// 中断计数（用于轮询模式）
     irq_count: AtomicUsize,
+    #[cfg(feature = "block-profile")]
+    profile: VirtioBlkProfile,
 }
 
 pub struct VirtioBlk {
@@ -235,8 +251,14 @@ impl VirtioBlk {
             block_size,
             capabilities,
             queue_id,
+            notify_addr: mmio_base + MMIO_QUEUE_NOTIFY,
+            notify_value: u32::from(queue_id.raw()),
+            interrupt_status_addr: mmio_base + MMIO_INTERRUPT_STATUS,
+            interrupt_ack_addr: mmio_base + MMIO_INTERRUPT_ACK,
             queue: Mutex::new(VirtioBlkQueueCore::new(split_queue)),
             irq_count: AtomicUsize::new(0),
+            #[cfg(feature = "block-profile")]
+            profile: VirtioBlkProfile::new(),
         });
 
         Ok(Self { inner })
@@ -246,6 +268,11 @@ impl VirtioBlk {
         for pending in pending.into_iter().flatten() {
             pending.bio.complete(Err(error));
         }
+    }
+
+    #[cfg(feature = "block-profile")]
+    fn profile_text(&self) -> alloc::string::String {
+        self.inner.profile.format_text("virtio-mmio")
     }
 
     fn fail_queue_locked(
@@ -263,9 +290,34 @@ impl VirtioBlk {
         let mut queue = self.inner.queue.lock();
 
         loop {
+            #[cfg(feature = "block-profile")]
+            let profile_poll_start = queue
+                .sampled_pending_published_ns()
+                .map(|_| sched::now_ns_public());
             let used = match queue.split_queue_mut().pop_used() {
-                Ok(Some(used)) => used,
-                Ok(None) => break,
+                Ok(Some(used)) => {
+                    #[cfg(feature = "block-profile")]
+                    if let Some(start) = profile_poll_start {
+                        self.inner
+                            .profile
+                            .record_used_poll_cost(sched::now_ns_public().saturating_sub(start));
+                    }
+                    used
+                }
+                Ok(None) => {
+                    #[cfg(feature = "block-profile")]
+                    if let Some(published_ns) = queue.sampled_pending_published_ns() {
+                        if let Some(start) = profile_poll_start {
+                            self.inner.profile.record_empty_poll_cost(
+                                sched::now_ns_public().saturating_sub(start),
+                            );
+                        }
+                        self.inner.profile.record_empty_poll_since_publish(
+                            sched::now_ns_public().saturating_sub(published_ns),
+                        );
+                    }
+                    break;
+                }
                 Err(_) => {
                     let failed = self.fail_queue_locked(&mut queue, "used ring corruption");
                     drop(queue);
@@ -294,7 +346,23 @@ impl VirtioBlk {
                 meta_dma,
                 mut data_dma,
                 expected_device_write_len,
+                #[cfg(feature = "block-profile")]
+                profile_published_ns,
+                #[cfg(feature = "block-profile")]
+                profile_notified_ns,
             } = pending;
+            #[cfg(feature = "block-profile")]
+            if profile_published_ns != 0 {
+                let now = sched::now_ns_public();
+                self.inner
+                    .profile
+                    .record_publish_to_used(now.saturating_sub(profile_published_ns));
+                if profile_notified_ns != 0 {
+                    self.inner
+                        .profile
+                        .record_notify_to_used(now.saturating_sub(profile_notified_ns));
+                }
+            }
             core::sync::atomic::fence(Ordering::Acquire);
             meta_dma.sync_for_cpu();
             let status = unsafe {
@@ -356,11 +424,11 @@ impl VirtioBlk {
     /// 处理中断（由中断处理程序调用）
     pub fn handle_interrupt(&self) -> bool {
         // 确认中断
-        let status = self.inner.transport.read_interrupt_status();
+        let status = unsafe { read_volatile(self.inner.interrupt_status_addr as *const u32) };
         if status == 0 {
             return false;
         }
-        self.inner.transport.acknowledge_interrupt(status);
+        unsafe { write_volatile(self.inner.interrupt_ack_addr as *mut u32, status) };
         self.inner.irq_count.fetch_add(1, Ordering::Relaxed);
 
         // 轮询完成的请求
@@ -511,6 +579,10 @@ impl BlockDriver for VirtioBlkIo {
             meta_dma,
             data_dma,
             expected_device_write_len,
+            #[cfg(feature = "block-profile")]
+            profile_published_ns: 0,
+            #[cfg(feature = "block-profile")]
+            profile_notified_ns: 0,
         };
         if let Err(pending) = queue.set_pending(head_idx, pending) {
             let VirtioBlkPendingRequest {
@@ -523,6 +595,8 @@ impl BlockDriver for VirtioBlkIo {
             queue.recycle_request_dma(meta_dma, data_dma);
             return Err((SubmitError::QueueFull, bio));
         }
+        #[cfg(feature = "block-profile")]
+        let profile_sample = self.driver.inner.profile.should_sample_request();
 
         // 先登记 pending，再把 head 发布到 available ring，避免设备极快完成时找不到请求。
         if queue.split_queue_mut().push_avail(head_idx).is_err() {
@@ -550,18 +624,51 @@ impl BlockDriver for VirtioBlkIo {
             }
             return Err((SubmitError::QueueFull, bio));
         }
+        #[cfg(feature = "block-profile")]
+        let profile_published_ns = if profile_sample {
+            let ns = sched::now_ns_public();
+            queue.set_pending_profile_published_ns(head_idx, ns);
+            ns
+        } else {
+            0
+        };
 
         // 通知设备
         drop(queue);
-        self.driver
-            .inner
-            .transport
-            .notify_queue(u32::from(self.driver.inner.queue_id.raw()));
+        unsafe {
+            write_volatile(
+                self.driver.inner.notify_addr as *mut u32,
+                self.driver.inner.notify_value,
+            );
+        }
+        #[cfg(feature = "block-profile")]
+        if profile_sample {
+            let notified_ns = sched::now_ns_public();
+            self.driver
+                .inner
+                .profile
+                .record_publish_to_notify(notified_ns.saturating_sub(profile_published_ns));
+            let mut queue = self.driver.inner.queue.lock();
+            let _ = queue.set_pending_profile_notified_ns(head_idx, notified_ns);
+        }
         Ok(())
     }
 
     fn drain(&self) {
         self.driver.poll();
+    }
+
+    #[cfg(feature = "block-profile")]
+    fn control(
+        &self,
+        req: BlockControlRequest,
+    ) -> Option<Result<BlockControlResponse, ControlError>> {
+        match req {
+            BlockControlRequest::GetDebugProfile => Some(Ok(BlockControlResponse::DebugText(
+                self.driver.profile_text(),
+            ))),
+            _ => None,
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

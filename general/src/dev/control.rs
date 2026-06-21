@@ -4,6 +4,8 @@
 //! request/response 表达控制动作，避免底层驱动解析用户指针或 ioctl number。
 
 use alloc::boxed::Box;
+#[cfg(feature = "block-profile")]
+use alloc::string::String;
 
 /// 类型安全的设备控制接口（字符设备与块设备共用）。
 ///
@@ -80,19 +82,23 @@ pub enum BlockControlRequest {
     GetLogicalBlockSize,
     GetPhysicalBlockSize,
     GetIoHints,
+    #[cfg(feature = "block-profile")]
+    GetDebugProfile,
     /// 返回块设备对象的稳定实例序列号。
     GetDiskSeq,
     Flush,
 }
 
 /// 块设备类的通用控制响应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockControlResponse {
     Done,
     Bool(bool),
     U32(u32),
     U64(u64),
     IoHints(BlockIoHints),
+    #[cfg(feature = "block-profile")]
+    DebugText(String),
 }
 
 /// 网络设备类的通用控制请求。

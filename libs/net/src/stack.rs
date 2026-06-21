@@ -655,6 +655,7 @@ impl NetStack {
             managed
                 .tcp_connect(handle.inner, remote_ep, local_port)
                 .map_err(|_| NetError::ConnectionRefused)?;
+            managed.clear_tcp_bound_endpoint(handle.inner);
         }
         self.poll_now();
         Ok(())
@@ -732,6 +733,7 @@ impl NetStack {
             socket
                 .listen(local_ep)
                 .map_err(|_| NetError::AddressInUse)?;
+            managed.clear_tcp_bound_endpoint(handle.inner);
             return Ok(local);
         }
 
@@ -746,6 +748,7 @@ impl NetStack {
             }
             let socket = managed.tcp_socket_mut(handle.inner);
             if socket.listen(local_ep).is_ok() {
+                managed.clear_tcp_bound_endpoint(handle.inner);
                 return Ok(local);
             }
         }
@@ -1748,6 +1751,26 @@ impl NetStack {
             if managed.handle_is_live(handle) {
                 managed.remove_socket_locked(handle.inner);
             }
+        }
+    }
+
+    /// 关闭监听 fd 对应的 TCP 监听端点，并同步清理由 accept 机制生成的
+    /// successor listener / pending accepted socket。
+    pub fn tcp_close_listener(&self, handle: NetSocketHandle, local: Option<Endpoint>) {
+        if handle.sock_type != SocketType::Tcp {
+            self.socket_close_and_remove(handle);
+            return;
+        }
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            if managed.handle_is_closed(handle) && local.is_none() {
+                return;
+            }
+            let target = local
+                .map(|ep| endpoint_to_smoltcp_listen(&ep))
+                .unwrap_or_else(|| managed.tcp_socket(handle.inner).listen_endpoint());
+            managed.close_tcp_listener(handle.inner, target);
         }
     }
 

@@ -6,6 +6,8 @@
 
 use core::mem;
 use core::num::NonZeroU32;
+#[cfg(feature = "block-profile")]
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
 use crate::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
@@ -15,6 +17,193 @@ use crate::dev::virtio::{
 };
 
 use super::VIRTIO_BLK_SECTOR_SIZE;
+
+#[cfg(feature = "block-profile")]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VirtioBlkProfileSnapshot {
+    pub queue_calls: u64,
+    pub sample_period: u64,
+    pub sampled_requests: u64,
+    pub completed_samples: u64,
+    pub publish_to_used_ns: u64,
+    pub publish_to_used_min_ns: u64,
+    pub publish_to_used_max_ns: u64,
+    pub publish_to_notify_ns: u64,
+    pub publish_to_notify_samples: u64,
+    pub notify_to_used_ns: u64,
+    pub notify_to_used_samples: u64,
+    pub empty_polls_while_sampled: u64,
+    pub empty_poll_since_publish_ns: u64,
+    pub empty_poll_since_publish_max_ns: u64,
+    pub empty_poll_cost_ns: u64,
+    pub empty_poll_cost_samples: u64,
+    pub used_poll_cost_ns: u64,
+    pub used_poll_cost_samples: u64,
+}
+
+#[cfg(feature = "block-profile")]
+#[derive(Default)]
+pub(crate) struct VirtioBlkProfile {
+    queue_calls: AtomicU64,
+    sampled_requests: AtomicU64,
+    completed_samples: AtomicU64,
+    publish_to_used_ns: AtomicU64,
+    publish_to_used_min_ns: AtomicU64,
+    publish_to_used_max_ns: AtomicU64,
+    publish_to_notify_ns: AtomicU64,
+    publish_to_notify_samples: AtomicU64,
+    notify_to_used_ns: AtomicU64,
+    notify_to_used_samples: AtomicU64,
+    empty_polls_while_sampled: AtomicU64,
+    empty_poll_since_publish_ns: AtomicU64,
+    empty_poll_since_publish_max_ns: AtomicU64,
+    empty_poll_cost_ns: AtomicU64,
+    empty_poll_cost_samples: AtomicU64,
+    used_poll_cost_ns: AtomicU64,
+    used_poll_cost_samples: AtomicU64,
+}
+
+#[cfg(feature = "block-profile")]
+impl VirtioBlkProfile {
+    const SAMPLE_PERIOD: u64 = 64;
+
+    pub(crate) const fn new() -> Self {
+        Self {
+            queue_calls: AtomicU64::new(0),
+            sampled_requests: AtomicU64::new(0),
+            completed_samples: AtomicU64::new(0),
+            publish_to_used_ns: AtomicU64::new(0),
+            publish_to_used_min_ns: AtomicU64::new(u64::MAX),
+            publish_to_used_max_ns: AtomicU64::new(0),
+            publish_to_notify_ns: AtomicU64::new(0),
+            publish_to_notify_samples: AtomicU64::new(0),
+            notify_to_used_ns: AtomicU64::new(0),
+            notify_to_used_samples: AtomicU64::new(0),
+            empty_polls_while_sampled: AtomicU64::new(0),
+            empty_poll_since_publish_ns: AtomicU64::new(0),
+            empty_poll_since_publish_max_ns: AtomicU64::new(0),
+            empty_poll_cost_ns: AtomicU64::new(0),
+            empty_poll_cost_samples: AtomicU64::new(0),
+            used_poll_cost_ns: AtomicU64::new(0),
+            used_poll_cost_samples: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn should_sample_request(&self) -> bool {
+        let seq = self
+            .queue_calls
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if seq % Self::SAMPLE_PERIOD == 0 {
+            self.sampled_requests.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn record_publish_to_used(&self, elapsed_ns: u64) {
+        self.completed_samples.fetch_add(1, Ordering::Relaxed);
+        self.publish_to_used_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.publish_to_used_min_ns
+            .fetch_min(elapsed_ns, Ordering::Relaxed);
+        self.publish_to_used_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_publish_to_notify(&self, elapsed_ns: u64) {
+        self.publish_to_notify_samples
+            .fetch_add(1, Ordering::Relaxed);
+        self.publish_to_notify_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_notify_to_used(&self, elapsed_ns: u64) {
+        self.notify_to_used_samples.fetch_add(1, Ordering::Relaxed);
+        self.notify_to_used_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_empty_poll_since_publish(&self, elapsed_ns: u64) {
+        self.empty_polls_while_sampled
+            .fetch_add(1, Ordering::Relaxed);
+        self.empty_poll_since_publish_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.empty_poll_since_publish_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_empty_poll_cost(&self, elapsed_ns: u64) {
+        self.empty_poll_cost_samples.fetch_add(1, Ordering::Relaxed);
+        self.empty_poll_cost_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_used_poll_cost(&self, elapsed_ns: u64) {
+        self.used_poll_cost_samples.fetch_add(1, Ordering::Relaxed);
+        self.used_poll_cost_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> VirtioBlkProfileSnapshot {
+        let min = self.publish_to_used_min_ns.load(Ordering::Relaxed);
+        VirtioBlkProfileSnapshot {
+            queue_calls: self.queue_calls.load(Ordering::Relaxed),
+            sample_period: Self::SAMPLE_PERIOD,
+            sampled_requests: self.sampled_requests.load(Ordering::Relaxed),
+            completed_samples: self.completed_samples.load(Ordering::Relaxed),
+            publish_to_used_ns: self.publish_to_used_ns.load(Ordering::Relaxed),
+            publish_to_used_min_ns: if min == u64::MAX { 0 } else { min },
+            publish_to_used_max_ns: self.publish_to_used_max_ns.load(Ordering::Relaxed),
+            publish_to_notify_ns: self.publish_to_notify_ns.load(Ordering::Relaxed),
+            publish_to_notify_samples: self.publish_to_notify_samples.load(Ordering::Relaxed),
+            notify_to_used_ns: self.notify_to_used_ns.load(Ordering::Relaxed),
+            notify_to_used_samples: self.notify_to_used_samples.load(Ordering::Relaxed),
+            empty_polls_while_sampled: self.empty_polls_while_sampled.load(Ordering::Relaxed),
+            empty_poll_since_publish_ns: self.empty_poll_since_publish_ns.load(Ordering::Relaxed),
+            empty_poll_since_publish_max_ns: self
+                .empty_poll_since_publish_max_ns
+                .load(Ordering::Relaxed),
+            empty_poll_cost_ns: self.empty_poll_cost_ns.load(Ordering::Relaxed),
+            empty_poll_cost_samples: self.empty_poll_cost_samples.load(Ordering::Relaxed),
+            used_poll_cost_ns: self.used_poll_cost_ns.load(Ordering::Relaxed),
+            used_poll_cost_samples: self.used_poll_cost_samples.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn format_text(&self, transport: &str) -> alloc::string::String {
+        let s = self.snapshot();
+        let completed = s.completed_samples.max(1);
+        let notify_samples = s.publish_to_notify_samples.max(1);
+        let notify_to_used_samples = s.notify_to_used_samples.max(1);
+        let empty_polls = s.empty_polls_while_sampled.max(1);
+        let empty_cost_samples = s.empty_poll_cost_samples.max(1);
+        let used_cost_samples = s.used_poll_cost_samples.max(1);
+        alloc::format!(
+            "{} queue_n={} sample_period={} sampled={} completed={} publish_to_used_avg={} publish_to_used_min={} publish_to_used_max={} publish_to_notify_avg={} notify_samples={} notify_to_used_avg={} notify_to_used_samples={} empty_polls={} empty_since_publish_avg={} empty_since_publish_max={} empty_poll_cost_avg={} empty_poll_cost_samples={} used_poll_cost_avg={} used_poll_cost_samples={}",
+            transport,
+            s.queue_calls,
+            s.sample_period,
+            s.sampled_requests,
+            s.completed_samples,
+            s.publish_to_used_ns / completed,
+            s.publish_to_used_min_ns,
+            s.publish_to_used_max_ns,
+            s.publish_to_notify_ns / notify_samples,
+            s.publish_to_notify_samples,
+            s.notify_to_used_ns / notify_to_used_samples,
+            s.notify_to_used_samples,
+            s.empty_polls_while_sampled,
+            s.empty_poll_since_publish_ns / empty_polls,
+            s.empty_poll_since_publish_max_ns,
+            s.empty_poll_cost_ns / empty_cost_samples,
+            s.empty_poll_cost_samples,
+            s.used_poll_cost_ns / used_cost_samples,
+            s.used_poll_cost_samples,
+        )
+    }
+}
 
 /// virtio-blk 普通 I/O 至少需要 header/data/status 三个描述符。
 pub(super) const MIN_QUEUE_SIZE: u16 = 4;
@@ -32,6 +221,10 @@ pub(super) struct VirtioBlkPendingRequest {
     pub data_dma: Option<DmaBuffer>,
     /// 设备完成时至少应写回的字节数，用于发现 used ring 短写。
     pub expected_device_write_len: u32,
+    #[cfg(feature = "block-profile")]
+    pub profile_published_ns: u64,
+    #[cfg(feature = "block-profile")]
+    pub profile_notified_ns: u64,
 }
 
 /// virtio-blk 的传输无关队列核心。
@@ -47,6 +240,10 @@ pub(super) struct VirtioBlkQueueCore {
     data_pool: DmaBufferPool,
     /// descriptor head 到在途 BIO 的直接映射。
     pending: alloc::vec::Vec<Option<VirtioBlkPendingRequest>>,
+    #[cfg(feature = "block-profile")]
+    profile_sampled_pending: u16,
+    #[cfg(feature = "block-profile")]
+    profile_first_sampled_published_ns: u64,
     /// 队列协议错误后不再接受新请求。
     failed: bool,
 }
@@ -71,6 +268,10 @@ impl VirtioBlkQueueCore {
                 DmaBufferPoolProfile::virtio_block_default(),
             ),
             pending,
+            #[cfg(feature = "block-profile")]
+            profile_sampled_pending: 0,
+            #[cfg(feature = "block-profile")]
+            profile_first_sampled_published_ns: 0,
             failed: false,
         }
     }
@@ -88,9 +289,21 @@ impl VirtioBlkQueueCore {
     }
 
     pub fn take_pending(&mut self, head: u16) -> Option<VirtioBlkPendingRequest> {
-        self.pending
+        let pending = self
+            .pending
             .get_mut(usize::from(head))
-            .and_then(Option::take)
+            .and_then(Option::take);
+        #[cfg(feature = "block-profile")]
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.profile_published_ns != 0)
+        {
+            self.profile_sampled_pending = self.profile_sampled_pending.saturating_sub(1);
+            if self.profile_sampled_pending == 0 {
+                self.profile_first_sampled_published_ns = 0;
+            }
+        }
+        pending
     }
 
     pub fn set_pending(
@@ -106,6 +319,38 @@ impl VirtioBlkQueueCore {
         }
         *slot = Some(pending);
         Ok(())
+    }
+
+    #[cfg(feature = "block-profile")]
+    pub fn set_pending_profile_published_ns(&mut self, head: u16, ns: u64) {
+        if let Some(Some(pending)) = self.pending.get_mut(usize::from(head)) {
+            if pending.profile_published_ns == 0 {
+                self.profile_sampled_pending = self.profile_sampled_pending.saturating_add(1);
+                if self.profile_first_sampled_published_ns == 0 {
+                    self.profile_first_sampled_published_ns = ns;
+                }
+                pending.profile_published_ns = ns;
+            }
+        }
+    }
+
+    #[cfg(feature = "block-profile")]
+    pub fn set_pending_profile_notified_ns(&mut self, head: u16, ns: u64) -> bool {
+        if let Some(Some(pending)) = self.pending.get_mut(usize::from(head)) {
+            pending.profile_notified_ns = ns;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(feature = "block-profile")]
+    pub const fn sampled_pending_published_ns(&self) -> Option<u64> {
+        if self.profile_sampled_pending == 0 || self.profile_first_sampled_published_ns == 0 {
+            None
+        } else {
+            Some(self.profile_first_sampled_published_ns)
+        }
     }
 
     pub fn mark_failed_and_take_pending(

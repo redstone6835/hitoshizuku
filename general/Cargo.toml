@@ -9,6 +9,7 @@ doctest = false
 bench = false
 
 [features]
+block-profile = []
 trace-syscall = []
 
 [dependencies]

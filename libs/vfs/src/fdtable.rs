@@ -865,6 +865,57 @@ impl FdTable {
         }
     }
 
+    /// 进程退出时关闭 fdtable 中的全部描述符。
+    ///
+    /// 不能只依赖 `FdTable` 的 `Drop`：共享 fdtable、zombie/reap 时机以及
+    /// 信号终止路径都会让 `Arc<FdTable>` 的析构时机晚于进程实际退出。
+    /// 显式 drain fdtable 可立即触发 `FileOps::release`，及时释放 socket 端口。
+    pub fn close_all_for_owner(&self, owner_pid: i32) {
+        const BATCH: usize = 64;
+        let mut batch_buf: [Option<RemovedFd>; BATCH] = core::array::from_fn(|_| None);
+
+        loop {
+            let mut batch_count = 0;
+            {
+                let mut inner = self.inner.lock();
+                for word_idx in 0..inner.bitmap.len() {
+                    let mut word = inner.bitmap[word_idx];
+                    while word != 0 {
+                        let bit = word.trailing_zeros();
+                        let fd = word_idx as u32 * 64 + bit;
+                        word &= word - 1;
+                        if let Some(removed) = inner.remove(fd) {
+                            let last_file_reference = !inner.contains_file(&removed.file);
+                            batch_buf[batch_count] = Some(RemovedFd {
+                                fd,
+                                entry: removed,
+                                last_file_reference,
+                            });
+                            batch_count += 1;
+                            if batch_count >= BATCH {
+                                break;
+                            }
+                        }
+                    }
+                    if batch_count >= BATCH {
+                        break;
+                    }
+                }
+            }
+
+            for entry in batch_buf[..batch_count].iter_mut() {
+                if let Some(removed) = entry.take() {
+                    Self::release_record_locks_for_removed(&removed, owner_pid);
+                    self.notify_fd_closed(&removed);
+                    drop(removed);
+                }
+            }
+            if batch_count < BATCH {
+                break;
+            }
+        }
+    }
+
     /// 为 `fork` 创建当前描述符表的深拷贝。
     pub fn fork(&self) -> Self {
         let inner = self.inner.lock();

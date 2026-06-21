@@ -173,20 +173,12 @@ pub(crate) fn write_raw(state: &FsState, inode: &RawInode) -> Result<(), BlockBa
         Cow::Borrowed(inode.bytes.as_slice())
     };
 
-    // 写回一个或两个 inode table 块
-    let mut blk = vec![0u8; block_size];
-    state.read_block(block, &mut blk)?;
     if in_block as usize + inode_size <= block_size {
-        blk[in_block as usize..in_block as usize + inode_size].copy_from_slice(&bytes);
-        state.write_block(block, &blk)?;
+        state.write_block_partial(block, in_block as usize, &bytes)?;
     } else {
         let first = block_size - in_block as usize;
-        blk[in_block as usize..].copy_from_slice(&bytes[..first]);
-        state.write_block(block, &blk)?;
-        let mut blk2 = vec![0u8; block_size];
-        state.read_block(block + 1, &mut blk2)?;
-        blk2[..inode_size - first].copy_from_slice(&bytes[first..]);
-        state.write_block(block + 1, &blk2)?;
+        state.write_block_partial(block, in_block as usize, &bytes[..first])?;
+        state.write_block_partial(block + 1, 0, &bytes[first..])?;
     }
     Ok(())
 }

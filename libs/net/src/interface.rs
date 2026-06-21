@@ -625,6 +625,14 @@ impl ManagedInterface {
         self.tcp_bound.insert(handle.into_smoltcp(), endpoint);
     }
 
+    /// 清除 TCP bind 阶段的本地端点预留。
+    ///
+    /// `tcp_bound` 只表示尚未进入 listen/connect 状态的端口占用。一旦 socket
+    /// 交给 smoltcp 进入真实协议状态，端点占用应由 socket 自身状态表示。
+    pub fn clear_tcp_bound_endpoint(&mut self, handle: ProtocolSocketHandle) {
+        self.tcp_bound.remove(&handle.into_smoltcp());
+    }
+
     /// 检查 TCP 本地端口是否已被当前接口上的其它 socket 占用。
     ///
     /// 主动连接自动选择本地端口时必须在同一把接口锁内检查占用，避免两个
@@ -742,6 +750,47 @@ impl ManagedInterface {
             meta.mark_orphaned();
         }
         self.remove_pending_tcp_accept(handle);
+    }
+
+    /// 关闭监听 fd 时同步释放同监听端点上的待 accept backlog 和补位 listener。
+    ///
+    /// smoltcp 会把被 SYN 命中的 listen socket 原地转换为 Established；内核
+    /// 为维持监听能力会额外创建 successor listener。若监听 fd 退出时只关闭
+    /// fd 当前保存的 handle，这些 successor / pending accepted socket 会脱离
+    /// VFS fd 生命周期并继续占用端口，导致后续 netserver 绑定同端口失败。
+    pub fn close_tcp_listener(&mut self, handle: ProtocolSocketHandle, target: IpListenEndpoint) {
+        let primary = handle.into_smoltcp();
+        let mut to_remove = Vec::new();
+        for (socket_handle, socket) in self.sockets.iter() {
+            let smoltcp::socket::Socket::Tcp(tcp) = socket else {
+                continue;
+            };
+            let Some(meta) = self.meta.get(&socket_handle) else {
+                continue;
+            };
+            if meta.socket_type() != SocketType::Tcp || meta.is_removed() || meta.is_orphaned() {
+                continue;
+            }
+            let same_listen = tcp.state() == smoltcp::socket::tcp::State::Listen
+                && listen_endpoint_matches(tcp.listen_endpoint(), target);
+            let pending_accept = tcp_socket_is_pending_accept_candidate(
+                &self.meta,
+                socket_handle,
+                tcp,
+                Some(target),
+            );
+            if socket_handle == primary || same_listen || pending_accept {
+                to_remove.push(socket_handle);
+            }
+        }
+        if !to_remove.contains(&primary) && self.meta.contains_key(&primary) {
+            to_remove.push(primary);
+        }
+        for socket_handle in to_remove {
+            if self.meta.contains_key(&socket_handle) {
+                self.remove_smoltcp_socket_locked(socket_handle);
+            }
+        }
     }
 
     /// 标记 TCP 连接已被 accept 交付给 VFS。
@@ -2303,6 +2352,75 @@ mod tests {
         assert_eq!(iface.pending_accepted.len(), 1);
         iface.remove_socket_locked(successor);
         assert!(iface.pending_accepted.is_empty());
+    }
+
+    #[test]
+    fn closing_listener_removes_pending_accept_and_successor_listener() {
+        let driver = Arc::new(TestDriver::default());
+        let (_iface_id, mut iface) = test_interface_with_driver(driver.clone(), 8);
+        let tuning = NetTuning::defaults();
+        let listener = iface.add_tcp_socket(tuning.tcp);
+        let listen_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
+        iface
+            .tcp_socket_mut(listener)
+            .listen(listen_endpoint)
+            .unwrap();
+
+        drive_inbound_handshake(&mut iface, &driver, listener, 40_003, listen_endpoint.port);
+        iface.refresh_pending_tcp_accepts();
+        iface.ensure_pending_accept_listeners();
+        assert_eq!(iface.pending_accepted.len(), 1);
+        assert!(
+            iface
+                .accept_successors
+                .contains_key(&listener.into_smoltcp())
+        );
+        assert!(iface.tcp_listen_endpoint_in_use(listener, listen_endpoint));
+
+        iface.close_tcp_listener(listener, listen_endpoint);
+        assert!(iface.pending_accepted.is_empty());
+        assert!(iface.accept_successors.is_empty());
+        assert!(iface.accept_published_listeners.is_empty());
+
+        let rebinder = iface.add_tcp_socket(tuning.tcp);
+        assert!(!iface.tcp_listen_endpoint_in_use(rebinder, listen_endpoint));
+    }
+
+    #[test]
+    fn tcp_bound_reservation_does_not_survive_listen_accept_lifecycle() {
+        let driver = Arc::new(TestDriver::default());
+        let (_iface_id, mut iface) = test_interface_with_driver(driver.clone(), 8);
+        let tuning = NetTuning::defaults();
+        let listen_endpoint = IpListenEndpoint {
+            addr: None,
+            port: 8080,
+        };
+        let listener = iface.add_tcp_socket(tuning.tcp);
+
+        iface.set_tcp_bound_endpoint(listener, listen_endpoint);
+        assert_eq!(iface.tcp_bound_endpoint(listener), Some(listen_endpoint));
+        iface
+            .tcp_socket_mut(listener)
+            .listen(listen_endpoint)
+            .unwrap();
+        iface.clear_tcp_bound_endpoint(listener);
+        assert_eq!(iface.tcp_bound_endpoint(listener), None);
+
+        drive_inbound_handshake(&mut iface, &driver, listener, 40_010, listen_endpoint.port);
+        let successor = iface.take_accept_successor(listener).unwrap();
+        iface.mark_socket_accepted(listener);
+
+        assert!(iface.tcp_listen_endpoint_in_use(listener, listen_endpoint));
+        iface.remove_socket_locked(successor);
+        assert!(!iface.tcp_listen_endpoint_in_use(listener, listen_endpoint));
+
+        let rebinder = iface.add_tcp_socket(tuning.tcp);
+        assert!(!iface.tcp_listen_endpoint_in_use(rebinder, listen_endpoint));
+        iface.set_tcp_bound_endpoint(rebinder, listen_endpoint);
+        assert_eq!(iface.tcp_bound_endpoint(rebinder), Some(listen_endpoint));
     }
 
     #[test]

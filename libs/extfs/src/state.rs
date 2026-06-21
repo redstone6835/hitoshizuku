@@ -692,6 +692,40 @@ impl FsState {
         cache.modify_inplace(block, offset, src)
     }
 
+    /// 丢弃一段数据块缓存。释放块前必须清理 dirty cache，避免块被重新分配后
+    /// 旧文件的延迟写回覆盖新文件数据。
+    pub(crate) fn discard_cached_blocks(&self, start_block: u64, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let mut cache = self.block_cache.lock();
+        cache.invalidate_range(start_block, count);
+    }
+
+    /// 修改块内部分字节。cache miss 时只读一次整块，之后转为 write-back dirty。
+    ///
+    /// inode table / bitmap 这类元数据经常在同一个 4K 块内连续修改多个小结构。
+    /// 如果每次都 read-modify-write 整块，会把 iozone 的 create/unlink 阶段放大成
+    /// 大量 4K virtio-mmio 请求；这里优先复用已缓存脏块，miss 时才补一次整块读。
+    pub(crate) fn write_block_partial(
+        &self,
+        block: u64,
+        offset: usize,
+        src: &[u8],
+    ) -> Result<(), BlockBackendError> {
+        if offset + src.len() > self.ext_sb.block_size as usize {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if self.modify_block_partial(block, offset, src) {
+            return Ok(());
+        }
+
+        let mut data = vec![0u8; self.ext_sb.block_size as usize];
+        self.read_block(block, &mut data)?;
+        data[offset..offset + src.len()].copy_from_slice(src);
+        self.write_block(block, &data)
+    }
+
     /// 以块为单位写入（write-back：只更新 cache，延迟落盘）。
     pub(crate) fn write_block(&self, block: u64, data: &[u8]) -> Result<(), BlockBackendError> {
         if data.len() != self.ext_sb.block_size as usize {
@@ -797,9 +831,6 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
-        if count < 4 {
-            return self.read_blocks(start_block, count, out);
-        }
         {
             let mut cache = self.block_cache.lock();
             if cache.read_range(start_block, count, out) {
@@ -823,6 +854,14 @@ impl FsState {
             {
                 let mut cache = self.block_cache.lock();
                 cache.overlay_range(block, n, &mut out[off..off + chunk_bytes]);
+                for i in 0..n {
+                    let cur_block = block + i as u64;
+                    let start = off + bs * i as usize;
+                    let end = start + bs;
+                    if !cache.contains(cur_block) {
+                        cache.try_insert_clean(cur_block, &out[start..end]);
+                    }
+                }
             }
             off += chunk_bytes;
             block += n as u64;
@@ -955,23 +994,56 @@ impl FsState {
 
     pub(crate) fn flush_dirty_blocks(&self) -> Result<(), BlockBackendError> {
         loop {
-            let pending = {
+            let mut pending = {
                 let cache = self.block_cache.lock();
                 cache.dirty_snapshots()
             };
             if pending.is_empty() {
                 return Ok(());
             }
-            for snap in &pending {
-                bgd::write_blocks(
-                    self.backend.as_ref(),
-                    &self.ext_sb,
-                    snap.block,
-                    1,
-                    &snap.data,
-                )?;
+
+            pending.sort_unstable_by_key(|snap| snap.block);
+
+            const MAX_FLUSH_RUN_BLOCKS: usize = 128;
+            let bs = self.ext_sb.block_size as usize;
+            let mut i = 0usize;
+            while i < pending.len() {
+                let run_start = pending[i].block;
+                let mut j = i + 1;
+                while j < pending.len()
+                    && pending[j].block == pending[j - 1].block + 1
+                    && j - i < MAX_FLUSH_RUN_BLOCKS
+                {
+                    j += 1;
+                }
+
+                if j == i + 1 {
+                    bgd::write_blocks(
+                        self.backend.as_ref(),
+                        &self.ext_sb,
+                        run_start,
+                        1,
+                        &pending[i].data,
+                    )?;
+                } else {
+                    let mut merged = Vec::with_capacity(bs * (j - i));
+                    for snap in &pending[i..j] {
+                        merged.extend_from_slice(&snap.data);
+                    }
+                    bgd::write_blocks(
+                        self.backend.as_ref(),
+                        &self.ext_sb,
+                        run_start,
+                        (j - i) as u32,
+                        &merged,
+                    )?;
+                }
+
                 let mut cache = self.block_cache.lock();
-                cache.mark_clean(snap.block, snap.version);
+                for snap in &pending[i..j] {
+                    cache.mark_clean(snap.block, snap.version);
+                }
+                i = j;
             }
             break;
         }

@@ -54,6 +54,8 @@ use vfs::sync::Spinlock;
 use general::dev::bio::{Bio, BioIoError, BioResult, SubmitError};
 #[cfg(any(feature = "bench", feature = "block-bench"))]
 use general::dev::bio::{BioBuffer, BioOp, BlockRange};
+#[cfg(feature = "block-bench")]
+use general::dev::block::BlockSubmitProfile;
 #[cfg(feature = "bench")]
 use general::dev::block::{BlockClass, BlockDeviceInit, BlockDriver, BlockGeometry, BlockLimits};
 #[cfg(any(feature = "bench", feature = "block-bench"))]
@@ -213,6 +215,8 @@ pub fn run_block_device() {
         run_block_seq_read(&raw_tag, &dev);
         run_block_seq_read_repeat(&raw_tag, &dev);
         run_block_overhead_diagnosis(&raw_tag, &dev);
+        run_block_submit_profile(&raw_tag, &dev);
+        log_block_debug_profile(&raw_tag, &dev);
         run_block_rand_read(&raw_tag, &dev);
     }
 
@@ -2558,6 +2562,128 @@ fn run_diag_chunk(
         overhead_pct,
         mibps
     );
+}
+
+#[cfg(feature = "block-bench")]
+fn run_block_submit_profile(tag: &str, dev: &Arc<BlockDevice>) {
+    let lbs = dev.geometry().logical_block_size().get() as usize;
+    let total_bytes = 4 * 1024 * 1024usize;
+    if !block_device_has_bytes(dev, total_bytes) {
+        return;
+    }
+
+    log::info!(
+        "[bench][{}][SUBMIT] ====== sync submit path profile ======",
+        tag
+    );
+    for &chunk in &[512usize, 4096usize] {
+        if chunk < lbs || chunk % lbs != 0 {
+            continue;
+        }
+        run_submit_profile_chunk(tag, dev, lbs, chunk, total_bytes);
+    }
+    log::info!("[bench][{}][SUBMIT] ====== profile complete ======", tag);
+}
+
+#[cfg(feature = "block-bench")]
+fn run_submit_profile_chunk(
+    tag: &str,
+    dev: &Arc<BlockDevice>,
+    lbs: usize,
+    chunk: usize,
+    total_bytes: usize,
+) {
+    let blocks_per_chunk = (chunk / lbs) as u32;
+    let iters = (total_bytes / chunk) as u64;
+    if iters == 0 {
+        return;
+    }
+
+    let mut accum = BlockSubmitProfile::default();
+    let mut ok = 0u64;
+    for i in 0..iters {
+        let lba = i * blocks_per_chunk as u64;
+        let buffer = BioBuffer::Owned(vec![0u8; chunk].into_boxed_slice());
+        let range = BlockRange {
+            lba,
+            blocks: blocks_per_chunk,
+        };
+        match dev.submit_bio_wait_profiled(BioOp::Read, range, buffer) {
+            Ok((_bio, profile)) => {
+                accum_profile(&mut accum, profile);
+                ok = ok.saturating_add(1);
+            }
+            Err(err) => {
+                log::error!(
+                    "[bench][{}][SUBMIT] read error at chunk={} lba={} err={:?}",
+                    tag,
+                    chunk,
+                    lba,
+                    err
+                );
+                break;
+            }
+        }
+    }
+
+    if ok == 0 {
+        return;
+    }
+
+    let accounted = accum
+        .validate_ns
+        .saturating_add(accum.build_bio_ns)
+        .saturating_add(accum.queue_ns)
+        .saturating_add(accum.drain_ns)
+        .saturating_add(accum.schedule_ns)
+        .saturating_add(accum.completion_take_ns)
+        .saturating_add(accum.stats_ns);
+    let unaccounted = accum.total_ns.saturating_sub(accounted);
+    log::info!(
+        "[bench][{}][SUBMIT] chunk={:>5}B n={} total={} validate={} build={} queue={} drain={} sched={} take={} stats={} unacct={} drain_calls={}/op sched_calls={}/op spin_calls={}/op",
+        tag,
+        chunk,
+        ok,
+        accum.total_ns / ok,
+        accum.validate_ns / ok,
+        accum.build_bio_ns / ok,
+        accum.queue_ns / ok,
+        accum.drain_ns / ok,
+        accum.schedule_ns / ok,
+        accum.completion_take_ns / ok,
+        accum.stats_ns / ok,
+        unaccounted / ok,
+        accum.drain_calls / ok,
+        accum.schedule_calls / ok,
+        accum.spin_calls / ok,
+    );
+}
+
+#[cfg(feature = "block-bench")]
+fn accum_profile(accum: &mut BlockSubmitProfile, profile: BlockSubmitProfile) {
+    accum.total_ns = accum.total_ns.saturating_add(profile.total_ns);
+    accum.validate_ns = accum.validate_ns.saturating_add(profile.validate_ns);
+    accum.build_bio_ns = accum.build_bio_ns.saturating_add(profile.build_bio_ns);
+    accum.queue_ns = accum.queue_ns.saturating_add(profile.queue_ns);
+    accum.drain_ns = accum.drain_ns.saturating_add(profile.drain_ns);
+    accum.schedule_ns = accum.schedule_ns.saturating_add(profile.schedule_ns);
+    accum.completion_take_ns = accum
+        .completion_take_ns
+        .saturating_add(profile.completion_take_ns);
+    accum.stats_ns = accum.stats_ns.saturating_add(profile.stats_ns);
+    accum.drain_calls = accum.drain_calls.saturating_add(profile.drain_calls);
+    accum.schedule_calls = accum.schedule_calls.saturating_add(profile.schedule_calls);
+    accum.spin_calls = accum.spin_calls.saturating_add(profile.spin_calls);
+}
+
+#[cfg(feature = "block-bench")]
+fn log_block_debug_profile(tag: &str, dev: &Arc<BlockDevice>) {
+    match dev.control(BlockControlRequest::GetDebugProfile) {
+        Ok(BlockControlResponse::DebugText(text)) => {
+            log::info!("[bench][{}][DRVPROF] {}", tag, text);
+        }
+        Ok(_) | Err(_) => {}
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
