@@ -68,6 +68,11 @@ impl LookupFlags {
     pub const ALLOW_MISSING_LAST: Self = Self(1 << 3);
     /// 路径中间分量也不跟随符号链接（`O_RESOLVE_NO_SYMLINKS` 风格，更安全）。
     pub const NO_SYMLINKS: Self = Self(1 << 4);
+    /// 不穿越最终路径分量上的挂载点。
+    ///
+    /// `mount(2)`/`umount(2)`/`rmdir(2)`/`rename(2)` 需要看到被覆盖的挂载点
+    /// dentry 本身，而不是自动进入覆盖在它上面的挂载根。
+    pub const NO_MOUNT_LAST: Self = Self(1 << 5);
 
     pub const fn has(self, flag: Self) -> bool {
         self.0 & flag.0 == flag.0
@@ -162,6 +167,73 @@ impl<'a> Iterator for PathComponents<'a> {
 
 // ── 核心路径解析函数 ──────────────────────────────────────────────────────────
 
+fn symlink_not_allowed(state: &WalkState<'_>) -> VfsError {
+    let limit = state.ctx.limits.symlink_max_depth;
+    VfsError::SymlinkLoop {
+        depth: limit.saturating_sub(state.symlink_remaining) + 1,
+        limit,
+    }
+}
+
+fn has_trailing_slash(path: &str) -> bool {
+    path.ends_with('/')
+}
+
+fn requires_final_directory(path: &str, flags: LookupFlags) -> bool {
+    flags.has(LookupFlags::DIRECTORY) || has_trailing_slash(path)
+}
+
+fn ensure_directory(dentry: &Arc<Dentry>) -> VfsResult<()> {
+    let inode = dentry.inode().ok_or(VfsError::NotFound)?;
+    if inode.kind != crate::vfs::stat::FileType::Directory {
+        return Err(VfsError::NotADirectory);
+    }
+    Ok(())
+}
+
+fn validate_dirfd(file: &Arc<File>) -> VfsResult<()> {
+    let inode = file.dentry.inode().ok_or(VfsError::NotFound)?;
+    if inode.kind != crate::vfs::stat::FileType::Directory {
+        return Err(VfsError::NotADirectory);
+    }
+    Ok(())
+}
+
+fn lookup_start(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &str,
+) -> VfsResult<(Arc<Dentry>, Arc<Mount>)> {
+    if PathComponents::is_absolute(path) {
+        return Ok((ctx.root.root(), ctx.root.mount()));
+    }
+
+    match dirfd {
+        Dirfd::Cwd => Ok((ctx.cwd(), ctx.cwd_mount())),
+        Dirfd::Fd(file) => {
+            validate_dirfd(file)?;
+            Ok((Arc::clone(&file.dentry), Arc::clone(&file.mount)))
+        }
+    }
+}
+
+fn validate_basename(name: &str) -> VfsResult<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        return Err(VfsError::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn check_name_max(parent: &Arc<Dentry>, name: &str) -> VfsResult<()> {
+    let parent_inode = parent.inode().ok_or(VfsError::NotFound)?;
+    if let Some(sb) = parent_inode.superblock.upgrade()
+        && name.len() > sb.name_max as usize
+    {
+        return Err(VfsError::NameTooLong);
+    }
+    Ok(())
+}
+
 /// 解析路径，返回最终分量对应的 [`LookupResult`]（Dentry + 所在 Mount）。
 ///
 /// 这是所有 `*at` 系统调用的基础，实现了完整的路径解析语义：
@@ -193,15 +265,7 @@ pub fn lookup(
     }
 
     // 确定解析起点及对应的挂载点
-    let (start, start_mount) = if PathComponents::is_absolute(path) {
-        (ctx.root.root(), ctx.root.mount())
-    } else {
-        match dirfd {
-            Dirfd::Cwd => (ctx.cwd(), ctx.cwd_mount()),
-            // File 已在 open 时记录了所在挂载点，直接复用
-            Dirfd::Fd(file) => (Arc::clone(&file.dentry), Arc::clone(&file.mount)),
-        }
-    };
+    let (start, start_mount) = lookup_start(ctx, dirfd, path)?;
 
     let mut state = WalkState {
         current: start,
@@ -211,12 +275,9 @@ pub fn lookup(
     };
     walk_path(&mut state, path, flags)?;
 
-    // 检查 DIRECTORY 标志
-    if flags.has(LookupFlags::DIRECTORY)
-        && let Some(inode) = state.current.inode()
-        && inode.kind != crate::vfs::stat::FileType::Directory
-    {
-        return Err(VfsError::NotADirectory);
+    // 检查 DIRECTORY 标志和尾随斜杠语义。尾随斜杠等价于要求最终对象是目录。
+    if requires_final_directory(path, flags) {
+        ensure_directory(&state.current)?;
     }
 
     Ok(LookupResult {
@@ -225,8 +286,8 @@ pub fn lookup(
     })
 }
 
-fn step(state: &mut WalkState<'_>, name: &str) -> VfsResult<()> {
-    let (dentry, new_mount) = walk_component(state, name)?;
+fn step(state: &mut WalkState<'_>, name: &str, traverse_mounts: bool) -> VfsResult<()> {
+    let (dentry, new_mount) = walk_component(state, name, traverse_mounts)?;
     state.current = dentry;
     if let Some(m) = new_mount {
         state.current_mount = m;
@@ -236,25 +297,32 @@ fn step(state: &mut WalkState<'_>, name: &str) -> VfsResult<()> {
 
 fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsResult<()> {
     let mut components = PathComponents::new(path).peekable();
+    let requires_dir = requires_final_directory(path, flags);
+    let cred = state.ctx.cred();
 
     while let Some(component) = components.next() {
         let is_last = components.peek().is_none();
 
         if !is_last {
-            step(state, component)?;
+            step(state, component, true)?;
             if let Some(inode) = state.current.inode() {
                 {
                     let meta = inode.meta_snapshot();
-                    if !state.ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                    if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
                         return Err(VfsError::PermissionDenied);
                     }
                 }
                 if inode.kind == crate::vfs::stat::FileType::Symlink {
                     if flags.has(LookupFlags::NO_SYMLINKS) {
-                        return Err(VfsError::NotADirectory);
+                        return Err(symlink_not_allowed(state));
                     }
                     let link = Arc::clone(&state.current);
-                    state.current = follow_symlink(state, &link)?;
+                    let link_flags = flags
+                        .without(LookupFlags::NO_FOLLOW)
+                        .without(LookupFlags::DIRECTORY)
+                        .without(LookupFlags::ALLOW_MISSING_LAST)
+                        .without(LookupFlags::NO_MOUNT_LAST);
+                    state.current = follow_symlink(state, &link, link_flags)?;
                 } else if inode.kind != crate::vfs::stat::FileType::Directory {
                     return Err(VfsError::NotADirectory);
                 }
@@ -262,17 +330,31 @@ fn walk_path(state: &mut WalkState<'_>, path: &str, flags: LookupFlags) -> VfsRe
             continue;
         }
 
-        match step(state, component) {
+        if let Some(parent_inode) = state.current.inode() {
+            let meta = parent_inode.meta_snapshot();
+            if !cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+                return Err(VfsError::PermissionDenied);
+            }
+        }
+
+        let traverse_mounts = !flags.has(LookupFlags::NO_MOUNT_LAST);
+        match step(state, component, traverse_mounts) {
             Ok(()) => {
-                if !flags.has(LookupFlags::NO_FOLLOW)
-                    && let Some(inode) = state.current.inode()
+                if let Some(inode) = state.current.inode()
                     && inode.kind == crate::vfs::stat::FileType::Symlink
                 {
-                    let link = Arc::clone(&state.current);
-                    state.current = follow_symlink(state, &link)?;
+                    if flags.has(LookupFlags::NO_SYMLINKS) {
+                        return Err(symlink_not_allowed(state));
+                    }
+                    if !flags.has(LookupFlags::NO_FOLLOW) {
+                        let link = Arc::clone(&state.current);
+                        state.current =
+                            follow_symlink(state, &link, flags.without(LookupFlags::NO_FOLLOW))?;
+                    }
                 }
             }
-            Err(VfsError::NotFound) if flags.has(LookupFlags::ALLOW_MISSING_LAST) => {}
+            Err(VfsError::NotFound)
+                if flags.has(LookupFlags::ALLOW_MISSING_LAST) && !requires_dir => {}
             Err(e) => return Err(e),
         }
     }
@@ -295,9 +377,41 @@ pub fn lookup_parent<'p>(
     dirfd: &Dirfd,
     path: &'p str,
 ) -> VfsResult<(LookupResult, &'p str)> {
-    if path.is_empty() {
+    lookup_parent_inner(ctx, dirfd, path, false)
+}
+
+/// 与 [`lookup_parent`] 相同，但允许路径带尾随斜杠。
+///
+/// 仅目录类操作应使用此入口。POSIX 路径语义中尾随斜杠表示最终对象必须是目录；
+/// 对 `mkdir("foo/")` 和 `rmdir("foo/")`，最终对象本身就是目录，所以需要把尾随
+/// 斜杠规约掉后再提取父目录和叶子名。普通文件创建、硬链接和符号链接仍应使用
+/// [`lookup_parent`]，避免错误接受 `file/` 形式的目标。
+pub fn lookup_parent_dir_leaf<'p>(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &'p str,
+) -> VfsResult<(LookupResult, &'p str)> {
+    lookup_parent_inner(ctx, dirfd, path, true)
+}
+
+fn lookup_parent_inner<'p>(
+    ctx: &VfsContext,
+    dirfd: &Dirfd,
+    path: &'p str,
+    allow_trailing_slash: bool,
+) -> VfsResult<(LookupResult, &'p str)> {
+    if path.is_empty() || path.contains('\0') {
         return Err(VfsError::InvalidArgument);
     }
+    if !allow_trailing_slash && path.ends_with('/') {
+        return Err(VfsError::InvalidArgument);
+    }
+
+    let path = if allow_trailing_slash {
+        trim_trailing_slashes_preserving_root(path)
+    } else {
+        path
+    };
 
     let components: alloc::vec::Vec<&str> = PathComponents::new(path).collect();
     if components.is_empty() {
@@ -307,39 +421,42 @@ pub fn lookup_parent<'p>(
     }
 
     let last_name: &'p str = components.last().ok_or(VfsError::InvalidArgument)?;
+    validate_basename(last_name)?;
 
-    if components.len() == 1 {
+    let result = if components.len() == 1 {
         // 单分量路径，父目录为 dirfd 指定的目录
-        let (parent, parent_mount) = if PathComponents::is_absolute(path) {
-            (ctx.root.root(), ctx.root.mount())
-        } else {
-            match dirfd {
-                Dirfd::Cwd => (ctx.cwd(), ctx.cwd_mount()),
-                Dirfd::Fd(f) => (Arc::clone(&f.dentry), Arc::clone(&f.mount)),
+        let (parent, parent_mount) = lookup_start(ctx, dirfd, path)?;
+        LookupResult {
+            dentry: parent,
+            mount: parent_mount,
+        }
+    } else {
+        // 构造父目录路径（去掉最后一个分量）
+        let parent_path = {
+            // 这里保留 trim 是为了兼容重复斜杠场景。
+            let trimmed = path.trim_end_matches('/');
+            // 找最后一个 '/' 的位置
+            match trimmed.rfind('/') {
+                Some(0) => "/",
+                Some(pos) => &trimmed[..pos],
+                None => "",
             }
         };
-        return Ok((
-            LookupResult {
-                dentry: parent,
-                mount: parent_mount,
-            },
-            last_name,
-        ));
-    }
 
-    // 构造父目录路径（去掉最后一个分量）
-    let parent_path = {
-        let trimmed = path.trim_end_matches('/');
-        // 找最后一个 '/' 的位置
-        match trimmed.rfind('/') {
-            Some(0) => "/",
-            Some(pos) => &trimmed[..pos],
-            None => "",
-        }
+        lookup(ctx, dirfd, parent_path, LookupFlags::DIRECTORY)?
     };
-
-    let result = lookup(ctx, dirfd, parent_path, LookupFlags::default())?;
+    ensure_directory(&result.dentry)?;
+    check_name_max(&result.dentry, last_name)?;
     Ok((result, last_name))
+}
+
+fn trim_trailing_slashes_preserving_root(path: &str) -> &str {
+    let mut end = path.len();
+    let bytes = path.as_bytes();
+    while end > 1 && bytes[end - 1] == b'/' {
+        end -= 1;
+    }
+    &path[..end]
 }
 
 /// 解析单个路径分量 `name`（`.`、`..` 或普通名称），在 `parent` 目录下查找。
@@ -349,6 +466,7 @@ pub fn lookup_parent<'p>(
 fn walk_component(
     state: &WalkState<'_>,
     name: &str,
+    traverse_mounts: bool,
 ) -> VfsResult<(Arc<Dentry>, Option<Arc<crate::vfs::mount::Mount>>)> {
     use crate::vfs::DCACHE;
 
@@ -358,60 +476,81 @@ fn walk_component(
 
     if name == ".." {
         // 不超过进程可见根
-        if state.ctx.root.is_at_root(&state.current) {
+        if state
+            .ctx
+            .root
+            .is_at_root_in_mount(&state.current, &state.current_mount)
+        {
             return Ok((Arc::clone(&state.current), None));
         }
-        // 若当前处于某挂载文件系统的根（mount_root），需先跨越挂载边界回到
-        // 该挂载在父 FS 中的落脚点（mountpoint）。嵌套挂载时可能需要多次跨越，
-        // 直到落脚在非挂载根的 dentry 上。每次 find_mountpoint 单独持锁，不嵌套。
-        let mut effective = Arc::clone(&state.current);
-        while let Some(mp) = state.ctx.mount_ns.find_mountpoint(&effective) {
-            // 已跨到进程可见根，不能再向上
-            if state.ctx.root.is_at_root(&mp) {
-                return Ok((Arc::clone(&mp), None));
+
+        // 若当前处于某挂载文件系统的根（mount_root），`..` 先跨回父 mount 的
+        // mountpoint，再在父 mount 中向上走一级。返回的 dentry 和 mount 必须
+        // 同步更新，否则后续权限检查和 busy 统计会把父 FS 的 dentry 归到子 mount。
+        if Arc::ptr_eq(&state.current, &state.current_mount.mount_root) {
+            let (mountpoint, parent_mount) = {
+                let location = state.current_mount.location.lock();
+                let Some(parent) = location.parent.as_ref().and_then(|p| p.upgrade()) else {
+                    return Ok((Arc::clone(&state.current), None));
+                };
+                (Arc::clone(&location.mountpoint), parent)
+            };
+
+            if state
+                .ctx
+                .root
+                .is_at_root_in_mount(&mountpoint, &parent_mount)
+            {
+                return Ok((mountpoint, Some(parent_mount)));
             }
-            effective = mp;
+
+            let parent = {
+                let meta = mountpoint.meta.lock();
+                meta.parent
+                    .as_ref()
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::clone(&mountpoint))
+            };
+            return Ok((parent, Some(parent_mount)));
         }
+
         let parent = {
-            let meta = effective.meta.lock();
+            let meta = state.current.meta.lock();
             meta.parent
                 .as_ref()
                 .map(Arc::clone)
-                .unwrap_or_else(|| Arc::clone(&effective))
+                .unwrap_or_else(|| Arc::clone(&state.current))
         };
-        // 检查 parent 本身是否也是某个挂载点（进入被挂载 FS）
-        let new_mount = state.ctx.mount_ns.lookup_mount(&parent);
-        return Ok((parent, new_mount));
+        return Ok((parent, None));
     }
 
     if !state.current.is_positive() {
         return Err(VfsError::NotFound);
     }
 
-    // 1. 查 dentry 缓存
-    if let Some(cached) = DCACHE.get(&state.current, name) {
-        // 穿越挂载点
-        if let Some(mount) = state.ctx.mount_ns.lookup_mount(&cached) {
-            let root = Arc::clone(&mount.mount_root);
-            return Ok((root, Some(mount)));
-        }
-        // 负向 dentry
-        if !cached.is_positive() {
-            return Err(VfsError::NotFound);
-        }
-        return Ok((cached, None));
-    }
-
-    // 2. 缓存未命中：检查 name_max 并调用 InodeOps::lookup
+    // 检查 name_max 后再查缓存，确保超长名称不会因为命中 dcache 绕过限制。
     let parent_inode = state.current.inode().ok_or(VfsError::NotFound)?;
-
-    // 检查文件名长度
     if let Some(sb) = parent_inode.superblock.upgrade()
         && name.len() > sb.name_max as usize
     {
         return Err(VfsError::NameTooLong);
     }
 
+    // 1. 查 dentry 缓存
+    if let Some(cached) = DCACHE.get(&state.current, name) {
+        // 负向 dentry
+        if !cached.is_positive() {
+            return Err(VfsError::NotFound);
+        }
+        // 穿越挂载点
+        if traverse_mounts && let Some(mount) = state.ctx.mount_ns.lookup_mount(&cached) {
+            let root = Arc::clone(&mount.mount_root);
+            return Ok((root, Some(mount)));
+        }
+        return Ok((cached, None));
+    }
+
+    // 2. 缓存未命中：调用 InodeOps::lookup
     match parent_inode.ops.lookup(&parent_inode, name) {
         Ok(child_inode) => {
             let dentry = crate::vfs::dentry::Dentry::new_positive(
@@ -421,7 +560,7 @@ fn walk_component(
             );
             let canonical = DCACHE.insert(dentry);
             // 穿越挂载点
-            if let Some(mount) = state.ctx.mount_ns.lookup_mount(&canonical) {
+            if traverse_mounts && let Some(mount) = state.ctx.mount_ns.lookup_mount(&canonical) {
                 let root = Arc::clone(&mount.mount_root);
                 return Ok((root, Some(mount)));
             }
@@ -445,7 +584,11 @@ fn walk_component(
 ///
 /// 链接目标若以 `'/'` 开头，则从进程根重新开始解析（绝对链接）；否则
 /// 以链接本身所在目录为基准（相对链接）。
-fn follow_symlink(state: &mut WalkState<'_>, link_dentry: &Arc<Dentry>) -> VfsResult<Arc<Dentry>> {
+fn follow_symlink(
+    state: &mut WalkState<'_>,
+    link_dentry: &Arc<Dentry>,
+    flags: LookupFlags,
+) -> VfsResult<Arc<Dentry>> {
     if state.symlink_remaining == 0 {
         let limit = state.ctx.limits.symlink_max_depth;
         return Err(VfsError::SymlinkLoop {
@@ -477,7 +620,7 @@ fn follow_symlink(state: &mut WalkState<'_>, link_dentry: &Arc<Dentry>) -> VfsRe
     }
 
     if !target.is_empty() {
-        walk_path(state, &target, LookupFlags::default())?;
+        walk_path(state, &target, flags)?;
     }
 
     Ok(Arc::clone(&state.current))

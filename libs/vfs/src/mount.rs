@@ -104,6 +104,20 @@ fn mount_options(flags: MountFlags) -> alloc::string::String {
     opts
 }
 
+fn escape_mount_field(value: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for ch in value.chars() {
+        match ch {
+            ' ' => out.push_str("\\040"),
+            '\t' => out.push_str("\\011"),
+            '\n' => out.push_str("\\012"),
+            '\\' => out.push_str("\\134"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// 挂载标志，对应 `mount(2)` 的 `mountflags` 参数。
 ///
 /// 这些标志描述文件系统以何种约束挂载，影响该挂载上所有文件操作的行为。
@@ -412,6 +426,34 @@ impl MountNamespace {
         }
         .unwrap_or_else(|| Arc::clone(&self.root.lock()));
 
+        self.mount_at(mountpoint, parent_mount, superblock, flags)
+    }
+
+    /// 重新挂载已覆盖在 `mountpoint` 上的最上层挂载。
+    ///
+    /// `mount(MS_REMOUNT)` 不创建新的 superblock，也不叠加新的挂载层；它只让
+    /// 目标挂载点的文件系统验证新标志，并在验证通过后替换 Mount 级别的访问约束。
+    pub fn remount_at(&self, mountpoint: &Arc<Dentry>, flags: MountFlags) -> VfsResult<Arc<Mount>> {
+        let mount = self
+            .lookup_mount(mountpoint)
+            .ok_or(VfsError::InvalidArgument)?;
+        mount.superblock.remount(flags)?;
+        mount.set_flags(flags);
+        Ok(mount)
+    }
+
+    /// 在已经解析好的挂载点上执行挂载操作。
+    ///
+    /// 调用方必须传入挂载点所在的父 [`Mount`]。这用于 `mount(2)` 路径的最终
+    /// 分量：最终分量不能自动穿越已有挂载，否则新挂载会错误地落到被挂载文件系统
+    /// 的根 dentry 上，而不是被覆盖的挂载点 dentry 上。
+    pub fn mount_at(
+        &self,
+        mountpoint: Arc<Dentry>,
+        parent_mount: Arc<Mount>,
+        superblock: Arc<Superblock>,
+        flags: MountFlags,
+    ) -> VfsResult<Arc<Mount>> {
         let mount_root = Arc::clone(&superblock.root_dentry);
         let new_mount = Mount::new(
             superblock,
@@ -742,28 +784,58 @@ impl MountNamespace {
 
     /// 将当前所有挂载信息格式化为 `/proc/mounts` 格式字符串（用于 procfs）。
     pub fn dump_mounts(&self) -> alloc::string::String {
-        let visible_root = Arc::clone(&self.root.lock().mount_root);
+        let root_mount = Arc::clone(&self.root.lock());
+        let visible_root = Arc::clone(&root_mount.mount_root);
         let data = self.data.lock();
         let mut out = alloc::string::String::new();
         for m in data.mounts.iter() {
             let fs_type = m.superblock.fs_type;
-            let fs_id = m.superblock.fs_id.raw();
-            let mp_path = m
-                .location
-                .lock()
-                .mountpoint
-                .full_path(&visible_root)
-                .unwrap_or_else(|| alloc::string::String::from("?"));
-            let rw = if m.is_rdonly() { "ro" } else { "rw" };
+            let dev = m.superblock.dev_id.unwrap_or_default();
+            let source = if m.superblock.dev_id.is_some() {
+                alloc::format!("{}:{}", dev.major, dev.minor)
+            } else {
+                alloc::string::String::from(fs_type)
+            };
+            let (mountpoint, parent) = {
+                let location = m.location.lock();
+                (
+                    Arc::clone(&location.mountpoint),
+                    location.parent.as_ref().and_then(|w| w.upgrade()),
+                )
+            };
+            let mount_point = match parent.as_ref() {
+                Some(parent_mount) => {
+                    visible_path(&mountpoint, parent_mount, &root_mount, &visible_root)
+                }
+                None => visible_path(&mountpoint, &root_mount, &root_mount, &visible_root),
+            }
+            .unwrap_or_else(|| alloc::string::String::from("?"));
+            let opts = mount_options(m.flags_snapshot());
             out.push_str(&alloc::format!(
-                "{:#x} {} {} {}\n",
-                fs_id,
+                "{} {} {} {} 0 0\n",
+                escape_mount_field(&source),
+                escape_mount_field(&mount_point),
                 fs_type,
-                mp_path,
-                rw
+                opts
             ));
         }
         out
+    }
+
+    /// 同步当前 mount namespace 中所有 superblock。
+    ///
+    /// `sync(2)` 是全局刷盘语义。当前内核没有全局 superblock registry,
+    /// 但每个进程至少能看到自己的挂载命名空间;遍历这里的 mount 列表可以覆盖
+    /// 测试盘 ext4、根 tmpfs、proc/sys/dev 等当前可见文件系统。
+    pub fn sync_all(&self) -> VfsResult<()> {
+        let mounts = {
+            let data = self.data.lock();
+            data.mounts.clone()
+        };
+        for mount in mounts {
+            mount.superblock.sync()?;
+        }
+        Ok(())
     }
 
     /// 将当前所有挂载信息格式化为 Linux `/proc/*/mountinfo` 风格。

@@ -1,6 +1,10 @@
 # 构建输出
-target/
+/target/
 Cargo.lock
+kernel-la
+kernel-rv
+disk.img
+disk-la.img
 
 # IDE
 .idea
@@ -8,6 +12,12 @@ Cargo.lock
 .claude
 .codex
 .deepseek
+AGENTS.md
 
 build
 *.pdf
+userland/rootfs-la/bin/
+userland/rootfs-rv/bin/
+
+# vendor 不受上述规则限制
+!vendor/**

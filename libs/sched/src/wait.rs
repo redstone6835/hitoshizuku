@@ -11,8 +11,8 @@
 //!   会永远无法 drop；
 //! - 已死任务的 upgrade 会自动失败，遍历时顺手清掉即可，不需要显式 "unregister"。
 
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 
 use crate::sync::Spinlock;
 use crate::task::{Task, TaskState};
@@ -24,13 +24,13 @@ pub type WakeFn = fn(&Arc<Task>);
 
 /// 等待队列。
 pub struct WaitQueue {
-    waiters: Spinlock<Vec<Weak<Task>>>,
+    waiters: Spinlock<VecDeque<Weak<Task>>>,
 }
 
 impl WaitQueue {
     pub const fn new() -> Self {
         Self {
-            waiters: Spinlock::new(Vec::new()),
+            waiters: Spinlock::new(VecDeque::new()),
         }
     }
 
@@ -47,7 +47,43 @@ impl WaitQueue {
         }) {
             return;
         }
-        waiters.push(Arc::downgrade(task));
+        waiters.push_back(Arc::downgrade(task));
+    }
+
+    /// 准备进入等待：先把当前任务标成睡眠态，再挂入等待队列。
+    ///
+    /// 调用方必须在 prepare 后重新检查条件；若条件已经满足，应立即
+    /// [`finish_wait`]，不要调度出去。这个协议覆盖"事件发生在首次检查和
+    /// 真正睡眠之间"的窗口。
+    pub fn prepare_to_wait(&self, task: &Arc<Task>, state: TaskState) {
+        debug_assert!(matches!(
+            state,
+            TaskState::Sleeping | TaskState::Uninterruptible
+        ));
+        // 先入队再切状态：若先切 Sleeping 再入队，waker 可能在入队前
+        // 检查队列（空），唤醒丢失。
+        self.enqueue(task);
+        task.set_state(state);
+    }
+
+    /// 结束等待：从队列移除，并把仍处于睡眠态的任务恢复为可运行态。
+    pub fn finish_wait(&self, task: &Arc<Task>) {
+        self.remove(task);
+        transition_from_wait(task);
+    }
+
+    /// 等到 `condition` 为真。每次真正让出 CPU 前都会在已经登记到队列、
+    /// 且任务处于 Sleeping 状态后重新检查一次条件。
+    pub fn wait_event(&self, task: &Arc<Task>, mut condition: impl FnMut() -> bool) {
+        while !condition() {
+            self.prepare_to_wait(task, TaskState::Sleeping);
+            if condition() {
+                self.finish_wait(task);
+                return;
+            }
+            crate::scheduler::schedule_once(crate::scheduler::now_ns_public());
+            self.finish_wait(task);
+        }
     }
 
     /// 从队列中显式移除某个任务。常见于被信号打断、提前超时等场景。
@@ -59,23 +95,32 @@ impl WaitQueue {
         });
     }
 
-    /// 唤醒一个等待者。清理 upgrade 失败的条目后，取出首个有效 Weak。
+    /// 唤醒一个等待者。用 VecDeque 从队头取元素，避免 Vec::remove(0)
+    /// 在 pipe/select 等高频等待路径上反复搬移整段数组。
     /// 返回被唤醒任务的 `Arc`，便于上层决定是否直接转入 runqueue。
     pub fn wake_one(&self, wake: WakeFn) -> Option<Arc<Task>> {
         let picked = {
             let mut w = self.waiters.lock();
+            let initial_len = w.len();
+            let mut pushed_back = 0usize;
             loop {
-                let front = w.first().cloned();
-                match front {
+                let weak = match w.pop_front() {
                     None => break None,
-                    Some(weak) => {
-                        w.remove(0);
-                        if let Some(task) = weak.upgrade() {
-                            break Some(task);
-                        }
-                        // upgrade 失败：任务已死，继续找下一个。
+                    Some(wk) => wk,
+                };
+                let Some(task) = weak.upgrade() else {
+                    continue;
+                };
+                let st = task.state();
+                if st != TaskState::Sleeping && st != TaskState::Uninterruptible {
+                    if pushed_back < initial_len {
+                        w.push_back(weak);
+                        pushed_back += 1;
+                        continue;
                     }
+                    break None;
                 }
+                break Some(task);
             }
         };
         if let Some(ref task) = picked {
@@ -90,9 +135,14 @@ impl WaitQueue {
         self.wake_all_with(default_wake);
     }
 
+    /// 使用默认调度器入口唤醒一个等待者。
+    pub fn wake_one_default(&self) -> Option<Arc<Task>> {
+        self.wake_one(default_wake)
+    }
+
     /// 带回调的全量唤醒。
     pub fn wake_all_with(&self, wake: impl Fn(&Arc<Task>)) {
-        let drained: Vec<Weak<Task>> = {
+        let drained: VecDeque<Weak<Task>> = {
             let mut w = self.waiters.lock();
             core::mem::take(&mut *w)
         };
@@ -109,11 +159,13 @@ impl WaitQueue {
         if n == 0 {
             return 0;
         }
-        let mut taken: Vec<Weak<Task>> = Vec::new();
+        let mut taken: VecDeque<Weak<Task>> = VecDeque::new();
         {
             let mut w = self.waiters.lock();
             while taken.len() < n && !w.is_empty() {
-                taken.push(w.remove(0));
+                if let Some(weak) = w.pop_front() {
+                    taken.push_back(weak);
+                }
             }
         }
         let mut woken = 0usize;
@@ -132,11 +184,9 @@ impl WaitQueue {
         let picked = {
             let mut w = self.waiters.lock();
             loop {
-                let front = w.first().cloned();
-                match front {
+                match w.pop_front() {
                     None => break None,
                     Some(weak) => {
-                        w.remove(0);
                         if let Some(task) = weak.upgrade() {
                             break Some(task);
                         }
@@ -169,6 +219,21 @@ fn transition_to_runnable(task: &Arc<Task>) {
     if !task.cas_state(TaskState::Sleeping, TaskState::Runnable) {
         let _ = task.cas_state(TaskState::Uninterruptible, TaskState::Runnable);
     }
+}
+
+fn transition_from_wait(task: &Arc<Task>) {
+    if crate::scheduler::is_ready() {
+        let current = crate::scheduler::current_task();
+        if Arc::ptr_eq(&current, task) {
+            if !task.cas_state(TaskState::Sleeping, TaskState::Running)
+                && !task.cas_state(TaskState::Uninterruptible, TaskState::Running)
+            {
+                let _ = task.cas_state(TaskState::Runnable, TaskState::Running);
+            }
+            return;
+        }
+    }
+    transition_to_runnable(task);
 }
 
 fn default_wake(task: &Arc<Task>) {

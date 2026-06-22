@@ -16,10 +16,23 @@
 //! 窗口。
 
 use core::alloc::Layout;
+use core::mem::size_of;
 use core::ptr::null_mut;
 
 use crate::boot::BootAllocator;
-use crate::request::{MemoryPlacement, PagePolicy, PhysicalAllocRequest, PhysicalAllocation};
+use crate::request::{
+    AllocationRequestError, MemoryPlacement, PhysicalAllocRequest, PhysicalAllocation,
+};
+
+#[inline]
+fn now_ns() -> u64 {
+    log::get_timestamp_ns()
+}
+
+#[inline]
+fn elapsed_us(start_ns: u64) -> u64 {
+    now_ns().saturating_sub(start_ns) / 1_000
+}
 
 /// 基本页大小：4 KiB。
 pub const PAGE_SIZE: usize = 4096;
@@ -27,8 +40,12 @@ pub const PAGE_SIZE: usize = 4096;
 #[allow(dead_code)]
 pub const PAGE_SHIFT: usize = 12;
 /// 当前机器字长下最大可追踪的 order 值。
-pub const MAX_TRACKED_ORDER: usize = usize::BITS as usize - PAGE_SHIFT;
-/// FreeBSD 风格的空闲链表数量。
+///
+/// `order` 会被频繁换算成字节大小 `(1 << order) * PAGE_SIZE`；保留最高位可以
+/// 保证这个乘法始终落在 `usize` 可表示范围内，避免最大 order 在不同构建模式下
+/// 触发溢出或回绕。
+pub const MAX_TRACKED_ORDER: usize = usize::BITS as usize - PAGE_SHIFT - 1;
+/// 按用途拆分的空闲链表数量。
 pub const VM_NFREELIST: usize = 2;
 /// 默认空闲链表索引。
 pub const VM_FREELIST_DEFAULT: usize = 0;
@@ -36,6 +53,14 @@ pub const VM_FREELIST_DEFAULT: usize = 0;
 pub const VM_FREELIST_DMA: usize = 1;
 /// DMA 区域边界（16 MiB）。
 pub const DMA_ZONE_LIMIT: usize = 16 * 1024 * 1024;
+/// 默认物理区保留的 order-0 热页数量。
+///
+/// page alloc/free 的高频路径如果每次释放都立即向上合并，下一次分配又会把大块重新
+/// split 成 4K 页。保留一个很小的 order-0 自然 free-list 水位，可以降低这种
+/// split/merge 抖动；上限保持在 512KiB，避免长期牺牲高阶连续页。
+pub(crate) const DEFERRED_ORDER0_COALESCE_TARGET: usize = 128;
+/// 物理内存低于该空闲百分比时禁用延迟合并，优先恢复大块连续空间。
+pub(crate) const DEFERRED_ORDER0_MIN_FREE_PERCENT: usize = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemorySegment {
@@ -95,14 +120,114 @@ pub struct BuddyStats {
     pub allocated_pages: usize,
     pub free_pages: usize,
     pub reserved_pages: usize,
+    pub metadata_pages: usize,
     pub segment_count: usize,
     pub max_order: usize,
+    pub hash_bucket_count: usize,
+    pub nonempty_hash_bucket_count: usize,
+    pub node_capacity: usize,
+    pub node_used: usize,
     pub free_count_per_order: [usize; MAX_TRACKED_ORDER + 1],
     pub alloc_requests: u64,
     pub free_requests: u64,
     pub split_count: u64,
     pub coalesce_count: u64,
+    pub deferred_coalesce_count: u64,
+    pub deferred_reclaim_count: u64,
+    pub chain_corruptions: u64,
     pub alloc_failures: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuddyAudit {
+    pub flags: BuddyAuditFlags,
+    pub scanned_segments: usize,
+    pub scanned_total_pages: usize,
+    pub scanned_allocated_pages: usize,
+    pub scanned_free_pages: usize,
+    pub scanned_reserved_pages: usize,
+    pub scanned_hash_nodes: usize,
+    pub scanned_hash_free_nodes: usize,
+    pub scanned_nonempty_hash_buckets: usize,
+    pub scanned_free_nodes: usize,
+    pub scanned_free_list_pages: usize,
+    pub scanned_recycled_nodes: usize,
+    pub scanned_max_hash_chain_len: usize,
+    pub scanned_free_count_per_order: [usize; MAX_TRACKED_ORDER + 1],
+}
+
+impl BuddyAudit {
+    pub const fn is_consistent(self) -> bool {
+        self.flags.is_empty()
+    }
+}
+
+impl Default for BuddyAudit {
+    fn default() -> Self {
+        Self {
+            flags: BuddyAuditFlags::empty(),
+            scanned_segments: 0,
+            scanned_total_pages: 0,
+            scanned_allocated_pages: 0,
+            scanned_free_pages: 0,
+            scanned_reserved_pages: 0,
+            scanned_hash_nodes: 0,
+            scanned_hash_free_nodes: 0,
+            scanned_nonempty_hash_buckets: 0,
+            scanned_free_nodes: 0,
+            scanned_free_list_pages: 0,
+            scanned_recycled_nodes: 0,
+            scanned_max_hash_chain_len: 0,
+            scanned_free_count_per_order: [0; MAX_TRACKED_ORDER + 1],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuddyAuditFlags(u32);
+
+impl BuddyAuditFlags {
+    pub const HASH_CHAIN_LOOP: Self = Self(1 << 0);
+    pub const FREE_LIST_LOOP: Self = Self(1 << 1);
+    pub const NODE_FREELIST_LOOP: Self = Self(1 << 2);
+    pub const HASH_NODE_INVALID: Self = Self(1 << 3);
+    pub const FREE_LIST_NODE_INVALID: Self = Self(1 << 4);
+    pub const NODE_ACCOUNTING_MISMATCH: Self = Self(1 << 5);
+    pub const PAGE_ACCOUNTING_MISMATCH: Self = Self(1 << 6);
+    pub const FREE_COUNT_MISMATCH: Self = Self(1 << 7);
+    pub const SEGMENT_ACCOUNTING_MISMATCH: Self = Self(1 << 8);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+
+    fn insert(&mut self, flag: Self) {
+        self.0 |= flag.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuddyReclaimStats {
+    pub deferred_reclaim_passes: u64,
+    pub merged_blocks: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuddySnapshot {
+    pub stats: BuddyStats,
+    pub audit: BuddyAudit,
 }
 
 impl BuddyStats {
@@ -112,13 +237,21 @@ impl BuddyStats {
             allocated_pages: 0,
             free_pages: 0,
             reserved_pages: 0,
+            metadata_pages: 0,
             segment_count: 0,
             max_order: 0,
+            hash_bucket_count: 0,
+            nonempty_hash_bucket_count: 0,
+            node_capacity: 0,
+            node_used: 0,
             free_count_per_order: [0; MAX_TRACKED_ORDER + 1],
             alloc_requests: 0,
             free_requests: 0,
             split_count: 0,
             coalesce_count: 0,
+            deferred_coalesce_count: 0,
+            deferred_reclaim_count: 0,
+            chain_corruptions: 0,
             alloc_failures: 0,
         }
     }
@@ -144,6 +277,7 @@ pub enum BuddyAllocError {
     BlockOutOfRange,
     BlockNotFree,
     Fragmented,
+    MetadataOutOfMemory,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +289,15 @@ pub enum BuddyFreeError {
     NotAllocated,
     OrderMismatch,
     CorruptTail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuddyReleaseReservedError {
+    NotInitialized,
+    Unaligned,
+    InvalidAddress,
+    OverlapsTrackedBlock,
+    MetadataOutOfMemory,
 }
 
 #[derive(Clone, Copy)]
@@ -210,8 +353,36 @@ impl BlockNode {
 }
 
 const FREE_HEADS: usize = VM_NFREELIST * (MAX_TRACKED_ORDER + 1);
-const MAX_HASH_BUCKETS: usize = 131_072;
-const MIN_HASH_BUCKETS: usize = 256;
+const TARGET_HASH_CHAIN: usize = 4;
+const MAX_HASH_BUCKETS: usize = 1_048_576;
+const MIN_HASH_BUCKETS: usize = 1_024;
+const METADATA_RANGE_COUNT: usize = 1;
+
+struct MetadataBump {
+    cursor: usize,
+    end: usize,
+}
+
+impl MetadataBump {
+    const fn new(base: usize, end: usize) -> Self {
+        Self { cursor: base, end }
+    }
+
+    fn alloc_array<T>(&mut self, count: usize) -> Option<*mut T> {
+        if count == 0 {
+            return Some(null_mut());
+        }
+
+        let layout = Layout::array::<T>(count).ok()?;
+        let aligned = align_up_checked(self.cursor, layout.align())?;
+        let next = aligned.checked_add(layout.size())?;
+        if next > self.end {
+            return None;
+        }
+        self.cursor = next;
+        Some(aligned as *mut T)
+    }
+}
 
 pub struct BuddyAllocator {
     segments: *mut BuddySegment,
@@ -222,9 +393,12 @@ pub struct BuddyAllocator {
     metadata_range_count: usize,
     hash_buckets: *mut usize,
     hash_bucket_count: usize,
+    nonempty_hash_bucket_count: usize,
+    nodes: *mut BlockNode,
+    node_capacity: usize,
+    node_used: usize,
     free_heads: [usize; FREE_HEADS],
     node_freelist: usize,
-    boot_raw: usize,
     initialized: bool,
     stats: BuddyStats,
 }
@@ -241,9 +415,12 @@ impl BuddyAllocator {
             metadata_range_count: 0,
             hash_buckets: null_mut(),
             hash_bucket_count: 0,
+            nonempty_hash_bucket_count: 0,
+            nodes: null_mut(),
+            node_capacity: 0,
+            node_used: 0,
             free_heads: [0; FREE_HEADS],
             node_freelist: 0,
-            boot_raw: 0,
             initialized: false,
             stats: BuddyStats::new(),
         }
@@ -253,9 +430,10 @@ impl BuddyAllocator {
         &mut self,
         segments: &[MemorySegment],
         reserved_regions: &[(usize, usize)],
-        _phys_to_virt: fn(usize) -> usize,
-        boot: &BootAllocator,
+        phys_to_virt: fn(usize) -> usize,
+        _boot: &BootAllocator,
     ) -> Result<(), BuddyInitError> {
+        let init_start_ns = now_ns();
         self.reset();
 
         let effective_count = count_effective_segments(segments);
@@ -263,43 +441,76 @@ impl BuddyAllocator {
             return Err(BuddyInitError::EmptyMemoryMap);
         }
 
-        let total_pages = estimate_total_pages(segments);
+        let total_pages =
+            estimate_total_pages(segments).ok_or(BuddyInitError::MetadataOutOfMemory)?;
         if total_pages == 0 {
             return Err(BuddyInitError::EmptyMemoryMap);
         }
-
-        let boot_before = boot.snapshot().used_bytes;
-
-        let segment_ptr = alloc_boot_array::<BuddySegment>(boot, effective_count)
-            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
-        for idx in 0..effective_count {
-            unsafe { segment_ptr.add(idx).write(BuddySegment::empty()) };
+        if total_pages > usize::MAX / PAGE_SIZE {
+            return Err(BuddyInitError::MetadataOutOfMemory);
         }
 
         let stored_reserved = reserved_regions
             .iter()
             .filter(|(start, end)| end > start)
             .count();
-        let reserved_ptr = alloc_boot_array::<MemorySegment>(boot, stored_reserved)
-            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
-
         let bucket_count = choose_hash_bucket_count(total_pages);
-        let bucket_ptr = alloc_boot_array::<usize>(boot, bucket_count)
+        let node_capacity = total_pages;
+        let metadata_bytes = buddy_metadata_bytes(
+            effective_count,
+            stored_reserved,
+            bucket_count,
+            node_capacity,
+        )
+        .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let metadata_start_ns = now_ns();
+        let metadata_range = carve_metadata_range(segments, reserved_regions, metadata_bytes)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let metadata_base = phys_to_virt(metadata_range.start);
+        let metadata_end = metadata_base
+            .checked_add(metadata_range.size)
             .ok_or(BuddyInitError::MetadataOutOfMemory)?;
         unsafe {
-            core::ptr::write_bytes(
-                bucket_ptr.cast::<u8>(),
-                0,
-                bucket_count * core::mem::size_of::<usize>(),
-            );
+            core::ptr::write_bytes(metadata_base as *mut u8, 0, metadata_range.size);
         }
+        let mut metadata = MetadataBump::new(metadata_base, metadata_end);
+
+        let segment_ptr = metadata
+            .alloc_array::<BuddySegment>(effective_count)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        for idx in 0..effective_count {
+            unsafe { segment_ptr.add(idx).write(BuddySegment::empty()) };
+        }
+
+        let reserved_ptr = metadata
+            .alloc_array::<MemorySegment>(stored_reserved)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let metadata_range_ptr = metadata
+            .alloc_array::<MemorySegment>(1)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        unsafe {
+            metadata_range_ptr.write(metadata_range);
+        }
+        let bucket_ptr = metadata
+            .alloc_array::<usize>(bucket_count)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let node_ptr = metadata
+            .alloc_array::<BlockNode>(node_capacity)
+            .ok_or(BuddyInitError::MetadataOutOfMemory)?;
+        let metadata_us = elapsed_us(metadata_start_ns);
 
         self.segments = segment_ptr;
         self.hash_buckets = bucket_ptr;
         self.hash_bucket_count = bucket_count;
+        self.nonempty_hash_bucket_count = 0;
         self.reserved_ranges = reserved_ptr;
-        self.boot_raw = boot as *const BootAllocator as usize;
+        self.metadata_ranges = metadata_range_ptr;
+        self.metadata_range_count = 1;
+        self.nodes = node_ptr;
+        self.node_capacity = node_capacity;
+        self.node_used = 0;
 
+        let segment_start_ns = now_ns();
         let mut seg_out = 0usize;
         for &raw_segment in segments {
             for_each_effective_segment(raw_segment, |segment, fl_type| {
@@ -311,14 +522,23 @@ impl BuddyAllocator {
                     max_order: max_order_for_pages(total_pages),
                     fl_type,
                 };
-                self.stats.total_pages += total_pages;
+                self.stats.total_pages = self
+                    .stats
+                    .total_pages
+                    .checked_add(total_pages)
+                    .unwrap_or(usize::MAX);
                 self.stats.max_order = self.stats.max_order.max(seg.max_order);
                 seg_out += 1;
             });
         }
         self.segment_count = seg_out;
         self.stats.segment_count = seg_out;
+        self.stats.metadata_pages = metadata_range.size / PAGE_SIZE;
+        self.stats.hash_bucket_count = self.hash_bucket_count;
+        self.stats.node_capacity = self.node_capacity;
+        let segment_us = elapsed_us(segment_start_ns);
 
+        let reserved_start_ns = now_ns();
         let mut reserved_out = 0usize;
         for &(start, end) in reserved_regions {
             if end <= start {
@@ -333,27 +553,83 @@ impl BuddyAllocator {
             reserved_out += 1;
         }
         self.reserved_range_count = reserved_out;
+        let reserved_us = elapsed_us(reserved_start_ns);
 
+        let seed_start_ns = now_ns();
         self.seed_initial_free_ranges(reserved_regions)?;
+        let seed_us = elapsed_us(seed_start_ns);
         self.stats.reserved_pages = self
             .stats
             .total_pages
             .saturating_sub(self.stats.free_pages + self.stats.allocated_pages);
         self.initialized = true;
 
-        let metadata_bytes = boot.snapshot().used_bytes.saturating_sub(boot_before);
         log::info!(
-            "[alloc][buddy] initialized sections={} total_ram={} MiB metadata={} KiB carveouts={}",
+            "[alloc][buddy] initialized sections={} total_ram={} MiB metadata={} KiB metadata_phys={:#x} nodes={} buckets={}",
             self.segment_count,
             (self.stats.total_pages * PAGE_SIZE) / (1024 * 1024),
             metadata_bytes / 1024,
-            0,
+            metadata_range.start,
+            self.node_capacity,
+            self.hash_bucket_count,
+        );
+        log::info!(
+            "[alloc][buddy][timing] total={} us metadata={} us segments={} us reserved={} us seed={} us",
+            elapsed_us(init_start_ns),
+            metadata_us,
+            segment_us,
+            reserved_us,
+            seed_us,
         );
         Ok(())
     }
 
     pub fn release_bootmem(&mut self) {
         // 兼容壳：稀疏实现已经在 `init()` 内完成全部播种。
+    }
+
+    /// 将初始化时保留的整页物理区间重新移交给 buddy free list。
+    ///
+    /// reserved 页没有 allocation node，不能走 [`free_pages()`]。该接口只服务启动期
+    /// 生命周期收口，例如 boot allocator 结束后把未使用尾部回灌给正式物理页分配器。
+    pub fn release_reserved_range(
+        &mut self,
+        start: usize,
+        size: usize,
+    ) -> Result<usize, BuddyReleaseReservedError> {
+        if !self.initialized {
+            return Err(BuddyReleaseReservedError::NotInitialized);
+        }
+        if size == 0 {
+            return Ok(0);
+        }
+        if start % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
+            return Err(BuddyReleaseReservedError::Unaligned);
+        }
+        let Some(end) = start.checked_add(size) else {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        };
+        let Some((seg_idx, start_page)) = self.page_location(start) else {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        };
+        let Some((end_seg_idx, end_last_page)) = self.page_location(end - PAGE_SIZE) else {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        };
+        if seg_idx != end_seg_idx {
+            return Err(BuddyReleaseReservedError::InvalidAddress);
+        }
+
+        let range_end_page = end_last_page + 1;
+        if self.any_tracked_block_overlaps(start, end) {
+            return Err(BuddyReleaseReservedError::OverlapsTrackedBlock);
+        }
+
+        self.seed_free_range(seg_idx, start_page, range_end_page)
+            .map_err(|_| BuddyReleaseReservedError::MetadataOutOfMemory)?;
+
+        let released_pages = size / PAGE_SIZE;
+        self.stats.reserved_pages = self.stats.reserved_pages.saturating_sub(released_pages);
+        Ok(released_pages)
     }
 
     pub fn alloc_pages(&mut self, order: usize) -> Option<usize> {
@@ -365,6 +641,11 @@ impl BuddyAllocator {
 
         if let Some(addr) = self.alloc_from_zone(order, VM_FREELIST_DEFAULT) {
             return Some(addr);
+        }
+        if order > 0 && self.reclaim_deferred_order0() != 0 {
+            if let Some(addr) = self.alloc_from_zone(order, VM_FREELIST_DEFAULT) {
+                return Some(addr);
+            }
         }
         if let Some(addr) = self.alloc_from_zone(order, VM_FREELIST_DMA) {
             return Some(addr);
@@ -380,7 +661,14 @@ impl BuddyAllocator {
         }
 
         self.stats.alloc_requests += 1;
-        let result = self.alloc_from_zone(order, fl_type);
+        let mut result = self.alloc_from_zone(order, fl_type);
+        if result.is_none()
+            && order > 0
+            && fl_type == VM_FREELIST_DEFAULT
+            && self.reclaim_deferred_order0() != 0
+        {
+            result = self.alloc_from_zone(order, fl_type);
+        }
         if result.is_none() {
             self.stats.alloc_failures += 1;
         }
@@ -453,26 +741,11 @@ impl BuddyAllocator {
 
         self.stats.alloc_requests += 1;
 
-        for current_order in order..=seg.max_order {
-            let current_pages = 1usize << current_order;
-            let current_start = align_down(page_idx, current_pages);
-            if current_start + current_pages > seg.total_pages {
-                continue;
-            }
-            let current_addr = seg.range.start + current_start * PAGE_SIZE;
-            let node_addr = self.hash_find(current_addr);
-            if node_addr == 0 {
-                continue;
-            }
-            let node = node_ref(node_addr);
-            if !node.is_free
-                || node.order as usize != current_order
-                || node.seg_idx as usize != seg_idx
-            {
-                continue;
-            }
-
-            if let Some(result) = self.allocate_exact_from_node(node_addr, order, page_idx) {
+        if let Some(result) = self.try_alloc_pages_exact_from_free(addr, order, seg_idx, seg) {
+            return Ok(result);
+        }
+        if order > 0 && self.reclaim_deferred_order0() != 0 {
+            if let Some(result) = self.try_alloc_pages_exact_from_free(addr, order, seg_idx, seg) {
                 return Ok(result);
             }
         }
@@ -519,15 +792,24 @@ impl BuddyAllocator {
         let mut merged_order = order;
         let fl_type = seg.fl_type;
 
-        while merged_order < seg.max_order {
+        let defer_coalesce = self.should_defer_order0_coalesce(merged_order, fl_type);
+        if defer_coalesce {
+            self.stats.deferred_coalesce_count += 1;
+        }
+
+        while !defer_coalesce && merged_order < seg.max_order {
             let block_pages = 1usize << merged_order;
-            let page_idx = (merged_addr - seg.range.start) / PAGE_SIZE;
-            let buddy_idx = page_idx ^ block_pages;
-            if buddy_idx + block_pages > seg.total_pages {
+            let pfn = merged_addr / PAGE_SIZE;
+            let buddy_pfn = pfn ^ block_pages;
+            let buddy_addr = buddy_pfn * PAGE_SIZE;
+            if buddy_addr < seg.range.start {
+                break;
+            }
+            let buddy_page = (buddy_addr - seg.range.start) / PAGE_SIZE;
+            if buddy_page + block_pages > seg.total_pages {
                 break;
             }
 
-            let buddy_addr = seg.range.start + buddy_idx * PAGE_SIZE;
             let buddy_node_addr = self.hash_find(buddy_addr);
             if buddy_node_addr == 0 {
                 break;
@@ -566,6 +848,120 @@ impl BuddyAllocator {
         self.hash_insert(node_addr);
         self.add_to_free_list(node_addr);
         Ok(())
+    }
+
+    fn should_defer_order0_coalesce(&self, order: usize, fl_type: usize) -> bool {
+        if order != 0 || fl_type != VM_FREELIST_DEFAULT {
+            return false;
+        }
+        if self.stats.total_pages == 0 {
+            return false;
+        }
+        if self.stats.free_count_per_order[0] >= DEFERRED_ORDER0_COALESCE_TARGET {
+            return false;
+        }
+        let free_percent = (self.stats.free_pages.saturating_mul(100)) / self.stats.total_pages;
+        free_percent >= DEFERRED_ORDER0_MIN_FREE_PERCENT
+    }
+
+    fn reclaim_deferred_order0(&mut self) -> u64 {
+        let mut merged_total = 0u64;
+        let mut current = self.free_head(VM_FREELIST_DEFAULT, 0);
+        let mut visited = 0usize;
+        while current != 0 {
+            if visited >= self.stats.free_count_per_order[0] {
+                self.note_chain_corruption();
+                break;
+            }
+            visited += 1;
+
+            let next = node_ref(current).free_next;
+            let merged = self.coalesce_free_node(current);
+            if merged != 0 {
+                merged_total = merged_total.saturating_add(merged);
+                // 当前节点可能已经升级为高阶块，buddy 也可能来自原链表的后续节点；
+                // 重启扫描可以避免追踪已回收节点地址。
+                current = self.free_head(VM_FREELIST_DEFAULT, 0);
+                visited = 0;
+            } else {
+                current = next;
+            }
+        }
+        if merged_total != 0 {
+            self.stats.deferred_reclaim_count += 1;
+        }
+        merged_total
+    }
+
+    fn coalesce_free_node(&mut self, node_addr: usize) -> u64 {
+        let node = node_ref(node_addr);
+        if !node.is_free {
+            return 0;
+        }
+        let seg_idx = node.seg_idx as usize;
+        let Some(seg) = self.segment(seg_idx).copied() else {
+            return 0;
+        };
+        let fl_type = node.fl_type as usize;
+        let mut merged_addr = node.start;
+        let mut merged_order = node.order as usize;
+        let mut merged_count = 0u64;
+
+        self.remove_from_free_list(node_addr);
+        self.hash_remove(node_addr);
+
+        while merged_order < seg.max_order {
+            let block_pages = 1usize << merged_order;
+            let pfn = merged_addr / PAGE_SIZE;
+            let buddy_pfn = pfn ^ block_pages;
+            let buddy_addr = buddy_pfn * PAGE_SIZE;
+            if buddy_addr < seg.range.start {
+                break;
+            }
+            let buddy_page = (buddy_addr - seg.range.start) / PAGE_SIZE;
+            if buddy_page + block_pages > seg.total_pages {
+                break;
+            }
+
+            let buddy_node_addr = self.hash_find(buddy_addr);
+            if buddy_node_addr == 0 {
+                break;
+            }
+            let buddy = node_ref(buddy_node_addr);
+            if !buddy.is_free
+                || buddy.order as usize != merged_order
+                || buddy.seg_idx as usize != seg_idx
+                || buddy.fl_type as usize != fl_type
+            {
+                break;
+            }
+
+            self.remove_from_free_list(buddy_node_addr);
+            self.hash_remove(buddy_node_addr);
+            self.recycle_node(buddy_node_addr);
+
+            merged_addr = merged_addr.min(buddy_addr);
+            merged_order += 1;
+            merged_count = merged_count.saturating_add(1);
+            self.stats.coalesce_count += 1;
+        }
+
+        let node = node_mut(node_addr);
+        node.start = merged_addr;
+        node.order = merged_order as u8;
+        node.seg_idx = seg_idx as u32;
+        node.fl_type = fl_type as u8;
+        node.is_free = true;
+        node.ref_count = 0;
+        node.slab_zone_id = 0;
+        node.gc_mark = 0;
+        node.free_next = 0;
+        node.free_prev = 0;
+        node.hash_next = 0;
+
+        self.hash_insert(node_addr);
+        self.add_to_free_list(node_addr);
+        merged_count
     }
 
     pub fn alloc_frame(&mut self) -> Option<usize> {
@@ -614,7 +1010,31 @@ impl BuddyAllocator {
     }
 
     pub fn stats(&self) -> BuddyStats {
-        self.stats
+        let mut stats = self.stats;
+        stats.node_used = self.node_used;
+        stats.nonempty_hash_bucket_count = self.nonempty_hash_bucket_count;
+        stats
+    }
+
+    pub fn audit(&self) -> BuddyAudit {
+        let mut audit = BuddyAudit::default();
+        if !self.initialized {
+            return audit;
+        }
+
+        self.audit_segments(&mut audit);
+        self.audit_hash_buckets(&mut audit);
+        self.audit_free_lists(&mut audit);
+        self.audit_node_freelist(&mut audit);
+        self.audit_accounting(&mut audit);
+        audit
+    }
+
+    pub fn snapshot(&self) -> BuddySnapshot {
+        BuddySnapshot {
+            stats: self.stats(),
+            audit: self.audit(),
+        }
     }
 
     pub fn free_bytes(&self) -> usize {
@@ -671,6 +1091,8 @@ impl BuddyAllocator {
             fl_type: 0,
             order: 0,
             current: 0,
+            current_limit: 0,
+            visited_current: 0,
         }
     }
 
@@ -686,15 +1108,45 @@ impl BuddyAllocator {
     }
 
     pub fn clear_all_gc_marks(&mut self) {
+        let mut nonempty_seen = 0usize;
         for bucket in 0..self.hash_bucket_count {
             let mut node_addr = self.bucket_head(bucket);
+            if node_addr == 0 {
+                continue;
+            }
+            nonempty_seen += 1;
+            let mut visited = 0usize;
             while node_addr != 0 {
+                if visited >= self.node_used {
+                    self.note_chain_corruption();
+                    break;
+                }
+                visited += 1;
+
                 let node = node_mut(node_addr);
                 if !node.is_free {
                     node.gc_mark = 0;
                 }
                 node_addr = node.hash_next;
             }
+            if nonempty_seen >= self.nonempty_hash_bucket_count {
+                break;
+            }
+        }
+        if nonempty_seen != self.nonempty_hash_bucket_count {
+            self.note_chain_corruption();
+        }
+    }
+
+    pub fn reclaim_deferred(&mut self) -> BuddyReclaimStats {
+        let before_passes = self.stats.deferred_reclaim_count;
+        let merged_blocks = self.reclaim_deferred_order0();
+        BuddyReclaimStats {
+            deferred_reclaim_passes: self
+                .stats
+                .deferred_reclaim_count
+                .saturating_sub(before_passes),
+            merged_blocks,
         }
     }
 
@@ -713,6 +1165,270 @@ impl BuddyAllocator {
         self.page_location(addr).map(|(segment_idx, _)| segment_idx)
     }
 
+    fn audit_segments(&self, audit: &mut BuddyAudit) {
+        for seg_idx in 0..self.segment_count {
+            let Some(seg) = self.segment(seg_idx) else {
+                audit
+                    .flags
+                    .insert(BuddyAuditFlags::SEGMENT_ACCOUNTING_MISMATCH);
+                continue;
+            };
+            audit.scanned_segments += 1;
+            audit.scanned_total_pages = audit.scanned_total_pages.saturating_add(seg.total_pages);
+
+            if seg.range.size / PAGE_SIZE != seg.total_pages
+                || seg.range.start % PAGE_SIZE != 0
+                || seg.range.size % PAGE_SIZE != 0
+                || seg.max_order != max_order_for_pages(seg.total_pages)
+                || seg.fl_type >= VM_NFREELIST
+            {
+                audit
+                    .flags
+                    .insert(BuddyAuditFlags::SEGMENT_ACCOUNTING_MISMATCH);
+            }
+        }
+    }
+
+    fn audit_hash_buckets(&self, audit: &mut BuddyAudit) {
+        let mut nonempty_seen = 0usize;
+        for bucket in 0..self.hash_bucket_count {
+            let mut node_addr = self.bucket_head(bucket);
+            if node_addr == 0 {
+                continue;
+            }
+            nonempty_seen += 1;
+            audit.scanned_nonempty_hash_buckets =
+                audit.scanned_nonempty_hash_buckets.saturating_add(1);
+            let mut visited = 0usize;
+            while node_addr != 0 {
+                if visited >= self.node_used {
+                    audit.flags.insert(BuddyAuditFlags::HASH_CHAIN_LOOP);
+                    break;
+                }
+                visited += 1;
+
+                if !self.node_addr_is_allocated_slot(node_addr) {
+                    audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+                    break;
+                }
+
+                let node = node_ref(node_addr);
+                if hash_bucket(node.start, self.hash_bucket_count) != bucket {
+                    audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+                }
+                self.audit_hash_node(node, audit);
+                node_addr = node.hash_next;
+            }
+            audit.scanned_max_hash_chain_len = audit.scanned_max_hash_chain_len.max(visited);
+            if nonempty_seen >= self.nonempty_hash_bucket_count {
+                break;
+            }
+        }
+        if nonempty_seen != self.nonempty_hash_bucket_count {
+            audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+        }
+    }
+
+    fn audit_hash_node(&self, node: &BlockNode, audit: &mut BuddyAudit) {
+        audit.scanned_hash_nodes += 1;
+
+        let Some(block_pages) = self.valid_node_block_pages(node) else {
+            audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+            return;
+        };
+
+        if node.is_free {
+            audit.scanned_hash_free_nodes += 1;
+            audit.scanned_free_pages = audit.scanned_free_pages.saturating_add(block_pages);
+            if node.ref_count != 0 {
+                audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+            }
+        } else {
+            audit.scanned_allocated_pages =
+                audit.scanned_allocated_pages.saturating_add(block_pages);
+            if node.ref_count == 0 || node.free_next != 0 || node.free_prev != 0 {
+                audit.flags.insert(BuddyAuditFlags::HASH_NODE_INVALID);
+            }
+        }
+    }
+
+    fn audit_free_lists(&self, audit: &mut BuddyAudit) {
+        for fl_type in 0..VM_NFREELIST {
+            for order in 0..=MAX_TRACKED_ORDER {
+                let mut node_addr = self.free_head(fl_type, order);
+                let mut prev = 0usize;
+                let mut visited = 0usize;
+                while node_addr != 0 {
+                    if visited >= self.node_used {
+                        audit.flags.insert(BuddyAuditFlags::FREE_LIST_LOOP);
+                        break;
+                    }
+                    visited += 1;
+
+                    if !self.node_addr_is_allocated_slot(node_addr) {
+                        audit.flags.insert(BuddyAuditFlags::FREE_LIST_NODE_INVALID);
+                        break;
+                    }
+
+                    let node = node_ref(node_addr);
+                    if !node.is_free
+                        || node.order as usize != order
+                        || node.fl_type as usize != fl_type
+                        || node.free_prev != prev
+                        || !self.hash_chain_contains_node(node_addr, node.start)
+                    {
+                        audit.flags.insert(BuddyAuditFlags::FREE_LIST_NODE_INVALID);
+                    }
+
+                    let pages = 1usize << order;
+                    audit.scanned_free_nodes += 1;
+                    audit.scanned_free_list_pages =
+                        audit.scanned_free_list_pages.saturating_add(pages);
+                    audit.scanned_free_count_per_order[order] =
+                        audit.scanned_free_count_per_order[order].saturating_add(1);
+                    prev = node_addr;
+                    node_addr = node.free_next;
+                }
+            }
+        }
+    }
+
+    fn audit_node_freelist(&self, audit: &mut BuddyAudit) {
+        let mut node_addr = self.node_freelist;
+        let mut visited = 0usize;
+        while node_addr != 0 {
+            if visited >= self.node_used {
+                audit.flags.insert(BuddyAuditFlags::NODE_FREELIST_LOOP);
+                break;
+            }
+            visited += 1;
+
+            if !self.node_addr_is_allocated_slot(node_addr) {
+                audit
+                    .flags
+                    .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
+                break;
+            }
+
+            let node = node_ref(node_addr);
+            if node.is_free || node.free_next != 0 || node.free_prev != 0 {
+                audit
+                    .flags
+                    .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
+            }
+            audit.scanned_recycled_nodes += 1;
+            node_addr = node.hash_next;
+        }
+    }
+
+    fn audit_accounting(&self, audit: &mut BuddyAudit) {
+        audit.scanned_reserved_pages = audit.scanned_total_pages.saturating_sub(
+            audit
+                .scanned_allocated_pages
+                .saturating_add(audit.scanned_free_pages),
+        );
+
+        if audit.scanned_segments != self.segment_count
+            || audit.scanned_total_pages != self.stats.total_pages
+        {
+            audit
+                .flags
+                .insert(BuddyAuditFlags::SEGMENT_ACCOUNTING_MISMATCH);
+        }
+        if audit.scanned_allocated_pages != self.stats.allocated_pages
+            || audit.scanned_free_pages != self.stats.free_pages
+            || audit.scanned_reserved_pages != self.stats.reserved_pages
+        {
+            audit
+                .flags
+                .insert(BuddyAuditFlags::PAGE_ACCOUNTING_MISMATCH);
+        }
+        if audit
+            .scanned_hash_nodes
+            .saturating_add(audit.scanned_recycled_nodes)
+            != self.node_used
+            || self.node_used > self.node_capacity
+        {
+            audit
+                .flags
+                .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
+        }
+        if audit.scanned_hash_free_nodes != audit.scanned_free_nodes
+            || audit.scanned_free_pages != audit.scanned_free_list_pages
+            || audit.scanned_free_count_per_order != self.stats.free_count_per_order
+        {
+            audit.flags.insert(BuddyAuditFlags::FREE_COUNT_MISMATCH);
+        }
+        if audit.scanned_nonempty_hash_buckets != self.nonempty_hash_bucket_count
+            || self.nonempty_hash_bucket_count > self.hash_bucket_count
+        {
+            audit
+                .flags
+                .insert(BuddyAuditFlags::NODE_ACCOUNTING_MISMATCH);
+        }
+    }
+
+    fn valid_node_block_pages(&self, node: &BlockNode) -> Option<usize> {
+        let order = node.order as usize;
+        if order > MAX_TRACKED_ORDER || node.fl_type as usize >= VM_NFREELIST {
+            return None;
+        }
+
+        let seg = self.segment(node.seg_idx as usize)?;
+        let block_pages = 1usize.checked_shl(order as u32)?;
+        let block_size = block_pages.checked_mul(PAGE_SIZE)?;
+        let block_end = node.start.checked_add(block_size)?;
+        let pfn = node.start / PAGE_SIZE;
+
+        if order > seg.max_order
+            || node.start % PAGE_SIZE != 0
+            || !pfn.is_multiple_of(block_pages)
+            || node.start < seg.range.start
+            || block_end > seg.range.end()
+        {
+            return None;
+        }
+
+        Some(block_pages)
+    }
+
+    fn node_addr_is_allocated_slot(&self, node_addr: usize) -> bool {
+        if self.nodes.is_null() || node_addr == 0 {
+            return false;
+        }
+        let base = self.nodes as usize;
+        let Some(used_bytes) = self.node_used.checked_mul(size_of::<BlockNode>()) else {
+            return false;
+        };
+        let Some(end) = base.checked_add(used_bytes) else {
+            return false;
+        };
+        if node_addr < base || node_addr >= end {
+            return false;
+        }
+        (node_addr - base).is_multiple_of(size_of::<BlockNode>())
+    }
+
+    fn hash_chain_contains_node(&self, expected_node: usize, start: usize) -> bool {
+        if self.hash_bucket_count == 0 {
+            return false;
+        }
+        let bucket = hash_bucket(start, self.hash_bucket_count);
+        let mut node_addr = self.bucket_head(bucket);
+        let mut visited = 0usize;
+        while node_addr != 0 {
+            if visited >= self.node_used || !self.node_addr_is_allocated_slot(node_addr) {
+                return false;
+            }
+            if node_addr == expected_node {
+                return true;
+            }
+            visited += 1;
+            node_addr = node_ref(node_addr).hash_next;
+        }
+        false
+    }
+
     fn reset(&mut self) {
         self.segments = null_mut();
         self.segment_count = 0;
@@ -722,9 +1438,12 @@ impl BuddyAllocator {
         self.metadata_range_count = 0;
         self.hash_buckets = null_mut();
         self.hash_bucket_count = 0;
+        self.nonempty_hash_bucket_count = 0;
+        self.nodes = null_mut();
+        self.node_capacity = 0;
+        self.node_used = 0;
         self.free_heads = [0; FREE_HEADS];
         self.node_freelist = 0;
-        self.boot_raw = 0;
         self.initialized = false;
         self.stats = BuddyStats::new();
     }
@@ -741,7 +1460,7 @@ impl BuddyAllocator {
 
             while current_page < seg.total_pages {
                 let Some((reserved_start, reserved_end)) =
-                    next_reserved_page_run(&seg, current_page, reserved_regions)
+                    self.next_reserved_page_run(&seg, current_page, reserved_regions)
                 else {
                     self.seed_free_range(seg_idx, current_page, seg.total_pages)?;
                     break;
@@ -753,7 +1472,7 @@ impl BuddyAllocator {
 
                 current_page = current_page.max(reserved_end);
                 while let Some((overlap_start, overlap_end)) =
-                    next_reserved_page_run(&seg, current_page, reserved_regions)
+                    self.next_reserved_page_run(&seg, current_page, reserved_regions)
                 {
                     if overlap_start > current_page {
                         break;
@@ -763,6 +1482,68 @@ impl BuddyAllocator {
             }
         }
         Ok(())
+    }
+
+    fn next_reserved_page_run(
+        &self,
+        seg: &BuddySegment,
+        current_page: usize,
+        reserved_regions: &[(usize, usize)],
+    ) -> Option<(usize, usize)> {
+        let mut next = None;
+
+        for &(start, end) in reserved_regions {
+            if let Some(interval) = clipped_page_interval(seg, start, end) {
+                if interval.1 > current_page {
+                    next = choose_earlier_page_interval(next, interval);
+                }
+            }
+        }
+
+        for idx in 0..self.metadata_range_count {
+            let range = unsafe { *self.metadata_ranges.add(idx) };
+            if let Some(interval) = clipped_page_interval(seg, range.start, range.end()) {
+                if interval.1 > current_page {
+                    next = choose_earlier_page_interval(next, interval);
+                }
+            }
+        }
+
+        let (start, mut end) = next?;
+        loop {
+            let mut extended = false;
+
+            for &(candidate_start, candidate_end) in reserved_regions {
+                let Some((candidate_start, candidate_end)) =
+                    clipped_page_interval(seg, candidate_start, candidate_end)
+                else {
+                    continue;
+                };
+                if candidate_start <= end && candidate_end > end {
+                    end = candidate_end;
+                    extended = true;
+                }
+            }
+
+            for idx in 0..self.metadata_range_count {
+                let range = unsafe { *self.metadata_ranges.add(idx) };
+                let Some((candidate_start, candidate_end)) =
+                    clipped_page_interval(seg, range.start, range.end())
+                else {
+                    continue;
+                };
+                if candidate_start <= end && candidate_end > end {
+                    end = candidate_end;
+                    extended = true;
+                }
+            }
+
+            if !extended {
+                break;
+            }
+        }
+
+        Some((start, end.min(seg.total_pages)))
     }
 
     fn seed_free_range(
@@ -795,7 +1576,15 @@ impl BuddyAllocator {
     fn alloc_from_zone(&mut self, order: usize, fl_type: usize) -> Option<usize> {
         for current_order in order..=MAX_TRACKED_ORDER {
             let mut node_addr = self.free_head(fl_type, current_order);
+            let mut visited = 0usize;
+            let visit_limit = self.stats.free_count_per_order[current_order];
             while node_addr != 0 {
+                if visited >= visit_limit {
+                    self.note_chain_corruption();
+                    break;
+                }
+                visited += 1;
+
                 let next = node_ref(node_addr).free_next;
                 if let Some(result) = self.allocate_from_free_node(node_addr, order) {
                     return Some(result);
@@ -856,17 +1645,55 @@ impl BuddyAllocator {
         Some(node.start)
     }
 
+    fn try_alloc_pages_exact_from_free(
+        &mut self,
+        addr: usize,
+        order: usize,
+        seg_idx: usize,
+        seg: BuddySegment,
+    ) -> Option<usize> {
+        let target_pfn = addr / PAGE_SIZE;
+        for current_order in order..=seg.max_order {
+            let current_pages = 1usize << current_order;
+            let current_pfn = align_down(target_pfn, current_pages);
+            let current_addr = current_pfn * PAGE_SIZE;
+            if current_addr < seg.range.start || current_addr >= seg.range.end() {
+                continue;
+            }
+            let current_page = (current_addr - seg.range.start) / PAGE_SIZE;
+            if current_page + current_pages > seg.total_pages {
+                continue;
+            }
+            let node_addr = self.hash_find(current_addr);
+            if node_addr == 0 {
+                continue;
+            }
+            let node = node_ref(node_addr);
+            if !node.is_free
+                || node.order as usize != current_order
+                || node.seg_idx as usize != seg_idx
+            {
+                continue;
+            }
+
+            if let Some(result) = self.allocate_exact_from_node(node_addr, order, addr) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
     fn allocate_exact_from_node(
         &mut self,
         node_addr: usize,
         target_order: usize,
-        target_page_idx: usize,
+        target_addr: usize,
     ) -> Option<usize> {
         let node = node_ref(node_addr);
         let current_order = node.order as usize;
         let seg_idx = node.seg_idx as usize;
         let seg = *self.segment(seg_idx)?;
-        let mut current_start_page = (node.start - seg.range.start) / PAGE_SIZE;
+        let mut current_start = node.start;
         let needed = current_order.saturating_sub(target_order);
 
         let mut split_nodes = [0usize; MAX_TRACKED_ORDER + 1];
@@ -879,11 +1706,11 @@ impl BuddyAllocator {
 
         (0..needed).for_each(|depth| {
             let split_order = current_order - depth - 1;
-            let half_pages = 1usize << split_order;
-            let left_start = seg.range.start + current_start_page * PAGE_SIZE;
-            let right_start = left_start + half_pages * PAGE_SIZE;
+            let half_size = (1usize << split_order) * PAGE_SIZE;
+            let left_start = current_start;
+            let right_start = left_start + half_size;
 
-            if target_page_idx < current_start_page + half_pages {
+            if target_addr < right_start {
                 let buddy_addr = split_nodes[depth];
                 initialize_node(
                     buddy_addr,
@@ -907,13 +1734,13 @@ impl BuddyAllocator {
                 );
                 self.hash_insert(buddy_addr);
                 self.add_to_free_list(buddy_addr);
-                current_start_page += half_pages;
+                current_start = right_start;
             }
             self.stats.split_count += 1;
         });
 
         let node = node_mut(node_addr);
-        node.start = seg.range.start + current_start_page * PAGE_SIZE;
+        node.start = current_start;
         node.order = target_order as u8;
         node.is_free = false;
         node.ref_count = 1;
@@ -974,11 +1801,11 @@ impl BuddyAllocator {
             return Some(node_addr);
         }
 
-        let boot = boot_source(self.boot_raw)?;
-        let ptr = boot.alloc(Layout::new::<BlockNode>()) as usize;
-        if ptr == 0 {
+        if self.nodes.is_null() || self.node_used >= self.node_capacity {
             None
         } else {
+            let ptr = unsafe { self.nodes.add(self.node_used) } as usize;
+            self.node_used += 1;
             unsafe {
                 (ptr as *mut BlockNode).write(BlockNode::empty());
             }
@@ -1035,13 +1862,20 @@ impl BuddyAllocator {
             self.stats.free_count_per_order[order].saturating_sub(1);
     }
 
-    fn hash_find(&self, start: usize) -> usize {
+    fn hash_find(&mut self, start: usize) -> usize {
         if self.hash_bucket_count == 0 {
             return 0;
         }
         let bucket = hash_bucket(start, self.hash_bucket_count);
         let mut node_addr = self.bucket_head(bucket);
+        let mut visited = 0usize;
         while node_addr != 0 {
+            if visited >= self.node_used {
+                self.note_chain_corruption();
+                return 0;
+            }
+            visited += 1;
+
             let node = node_ref(node_addr);
             if node.start == start {
                 return node_addr;
@@ -1067,8 +1901,15 @@ impl BuddyAllocator {
         let bucket = hash_bucket(start, self.hash_bucket_count);
         let mut current = self.bucket_head(bucket);
         let mut prev = 0usize;
+        let mut visited = 0usize;
 
         while current != 0 {
+            if visited >= self.node_used {
+                self.note_chain_corruption();
+                return;
+            }
+            visited += 1;
+
             if current == node_addr {
                 let next = node_ref(current).hash_next;
                 if prev == 0 {
@@ -1084,6 +1925,12 @@ impl BuddyAllocator {
         }
     }
 
+    fn note_chain_corruption(&mut self) {
+        // buddy 是物理页账本的底层结构，hash/free 链一旦损坏不能在持锁路径无限遍历。
+        // 这里保留计数给诊断和审计，让异常以 allocator invariant 的形式暴露。
+        self.stats.chain_corruptions = self.stats.chain_corruptions.saturating_add(1);
+    }
+
     fn bucket_head(&self, bucket: usize) -> usize {
         if self.hash_buckets.is_null() {
             0
@@ -1093,8 +1940,18 @@ impl BuddyAllocator {
     }
 
     fn set_bucket_head(&mut self, bucket: usize, head: usize) {
+        let old = self.bucket_head(bucket);
         unsafe {
             *self.hash_buckets.add(bucket) = head;
+        }
+        match (old == 0, head == 0) {
+            (true, false) => {
+                self.nonempty_hash_bucket_count = self.nonempty_hash_bucket_count.saturating_add(1);
+            }
+            (false, true) => {
+                self.nonempty_hash_bucket_count = self.nonempty_hash_bucket_count.saturating_sub(1);
+            }
+            _ => {}
         }
     }
 
@@ -1125,6 +1982,38 @@ impl BuddyAllocator {
             }
         }
         None
+    }
+
+    fn any_tracked_block_overlaps(&self, start: usize, end: usize) -> bool {
+        let mut nonempty_seen = 0usize;
+        for bucket in 0..self.hash_bucket_count {
+            let mut node_addr = self.bucket_head(bucket);
+            if node_addr == 0 {
+                continue;
+            }
+            nonempty_seen += 1;
+
+            let mut visited = 0usize;
+            while node_addr != 0 {
+                if visited >= self.node_used {
+                    return true;
+                }
+                visited += 1;
+
+                let node = node_ref(node_addr);
+                let size = (1usize << (node.order as usize)).saturating_mul(PAGE_SIZE);
+                let node_end = node.start.saturating_add(size);
+                if node.start < end && start < node_end {
+                    return true;
+                }
+                node_addr = node.hash_next;
+            }
+
+            if nonempty_seen >= self.nonempty_hash_bucket_count {
+                break;
+            }
+        }
+        false
     }
 }
 
@@ -1213,6 +2102,8 @@ pub struct BuddyFreeBlockIter<'a> {
     fl_type: usize,
     order: usize,
     current: usize,
+    current_limit: usize,
+    visited_current: usize,
 }
 
 impl<'a> Iterator for BuddyFreeBlockIter<'a> {
@@ -1221,6 +2112,13 @@ impl<'a> Iterator for BuddyFreeBlockIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.current != 0 {
+                if self.visited_current >= self.current_limit
+                    || !self.allocator.node_addr_is_allocated_slot(self.current)
+                {
+                    self.current = 0;
+                    continue;
+                }
+                self.visited_current += 1;
                 let node_addr = self.current;
                 let node = node_ref(node_addr);
                 self.current = node.free_next;
@@ -1232,13 +2130,19 @@ impl<'a> Iterator for BuddyFreeBlockIter<'a> {
             }
 
             while self.order <= MAX_TRACKED_ORDER {
-                let head = self.allocator.free_head(self.fl_type, self.order);
+                let order = self.order;
+                let head = self.allocator.free_head(self.fl_type, order);
                 self.order += 1;
                 if head != 0 {
-                    let node = node_ref(head);
-                    self.current = node.free_next;
-                    return Some((node.start, node.order as usize));
+                    self.current = head;
+                    self.current_limit = self.allocator.stats.free_count_per_order[order];
+                    self.visited_current = 0;
+                    break;
                 }
+            }
+
+            if self.current != 0 {
+                continue;
             }
 
             self.fl_type += 1;
@@ -1282,23 +2186,6 @@ fn initialize_node(
     };
 }
 
-fn boot_source(raw: usize) -> Option<&'static BootAllocator> {
-    if raw == 0 {
-        None
-    } else {
-        Some(unsafe { &*(raw as *const BootAllocator) })
-    }
-}
-
-fn alloc_boot_array<T>(boot: &BootAllocator, count: usize) -> Option<*mut T> {
-    if count == 0 {
-        return Some(null_mut());
-    }
-    let layout = Layout::array::<T>(count).ok()?;
-    let ptr = boot.alloc(layout) as *mut T;
-    (!ptr.is_null()).then_some(ptr)
-}
-
 fn count_effective_segments(segments: &[MemorySegment]) -> usize {
     let mut count = 0usize;
     for &raw_segment in segments {
@@ -1309,14 +2196,16 @@ fn count_effective_segments(segments: &[MemorySegment]) -> usize {
     count
 }
 
-fn estimate_total_pages(segments: &[MemorySegment]) -> usize {
+fn estimate_total_pages(segments: &[MemorySegment]) -> Option<usize> {
     let mut total = 0usize;
     for &raw_segment in segments {
         for_each_effective_segment(raw_segment, |segment, _fl_type| {
-            total += segment.size / PAGE_SIZE;
+            total = total
+                .checked_add(segment.size / PAGE_SIZE)
+                .unwrap_or(usize::MAX);
         });
     }
-    total
+    (total != usize::MAX).then_some(total)
 }
 
 fn for_each_effective_segment(raw_segment: MemorySegment, mut f: impl FnMut(MemorySegment, usize)) {
@@ -1352,28 +2241,95 @@ fn for_each_effective_segment(raw_segment: MemorySegment, mut f: impl FnMut(Memo
 }
 
 fn normalize_segment(segment: MemorySegment) -> MemorySegment {
-    let start = align_up(segment.start, PAGE_SIZE);
-    let size = segment
-        .size
-        .saturating_sub(start.saturating_sub(segment.start));
-    let size = (size / PAGE_SIZE) * PAGE_SIZE;
+    let Some(raw_end) = segment.start.checked_add(segment.size) else {
+        return MemorySegment { start: 0, size: 0 };
+    };
+    let Some(start) = align_up_checked(segment.start, PAGE_SIZE) else {
+        return MemorySegment { start: 0, size: 0 };
+    };
+    if raw_end <= start {
+        return MemorySegment { start: 0, size: 0 };
+    }
+    let size = ((raw_end - start) / PAGE_SIZE) * PAGE_SIZE;
     MemorySegment { start, size }
 }
 
-fn next_reserved_page_run(
-    seg: &BuddySegment,
-    current_page: usize,
+fn buddy_metadata_bytes(
+    segment_count: usize,
+    reserved_count: usize,
+    bucket_count: usize,
+    node_capacity: usize,
+) -> Option<usize> {
+    let mut cursor = 0usize;
+    bump_metadata_size::<BuddySegment>(&mut cursor, segment_count)?;
+    bump_metadata_size::<MemorySegment>(&mut cursor, reserved_count)?;
+    bump_metadata_size::<MemorySegment>(&mut cursor, METADATA_RANGE_COUNT)?;
+    bump_metadata_size::<usize>(&mut cursor, bucket_count)?;
+    bump_metadata_size::<BlockNode>(&mut cursor, node_capacity)?;
+    align_up_checked(cursor, PAGE_SIZE)
+}
+
+fn bump_metadata_size<T>(cursor: &mut usize, count: usize) -> Option<()> {
+    if count == 0 {
+        return Some(());
+    }
+    let layout = Layout::array::<T>(count).ok()?;
+    let aligned = align_up_checked(*cursor, layout.align())?;
+    *cursor = aligned.checked_add(layout.size())?;
+    Some(())
+}
+
+fn carve_metadata_range(
+    segments: &[MemorySegment],
+    reserved_regions: &[(usize, usize)],
+    size: usize,
+) -> Option<MemorySegment> {
+    let size = align_up_checked(size.max(PAGE_SIZE), PAGE_SIZE)?;
+    let mut best = None;
+    let mut best_fl_type = VM_FREELIST_DMA;
+
+    for &raw_segment in segments {
+        for_each_effective_segment(raw_segment, |segment, fl_type| {
+            let mut current = segment.start;
+            while current < segment.end() {
+                let reserved = next_reserved_phys_run(segment, current, reserved_regions);
+                let gap_end = reserved
+                    .map(|(start, _end)| start)
+                    .unwrap_or_else(|| segment.end());
+                consider_metadata_gap(
+                    current,
+                    gap_end,
+                    size,
+                    fl_type,
+                    &mut best,
+                    &mut best_fl_type,
+                );
+
+                match reserved {
+                    Some((_start, end)) => current = current.max(end),
+                    None => break,
+                }
+            }
+        });
+    }
+
+    best
+}
+
+fn next_reserved_phys_run(
+    segment: MemorySegment,
+    current: usize,
     reserved_regions: &[(usize, usize)],
 ) -> Option<(usize, usize)> {
     let mut next = None;
-
     for &(start, end) in reserved_regions {
-        if let Some(interval) = clipped_page_interval(seg, start, end) {
-            if interval.1 <= current_page {
-                continue;
-            }
-            next = choose_earlier_page_interval(next, interval);
+        let Some(interval) = clipped_phys_interval(segment, start, end) else {
+            continue;
+        };
+        if interval.1 <= current {
+            continue;
         }
+        next = choose_earlier_phys_interval(next, interval);
     }
 
     let (start, mut end) = next?;
@@ -1381,7 +2337,7 @@ fn next_reserved_page_run(
         let mut extended = false;
         for &(candidate_start, candidate_end) in reserved_regions {
             let Some((candidate_start, candidate_end)) =
-                clipped_page_interval(seg, candidate_start, candidate_end)
+                clipped_phys_interval(segment, candidate_start, candidate_end)
             else {
                 continue;
             };
@@ -1394,8 +2350,78 @@ fn next_reserved_page_run(
             break;
         }
     }
+    Some((start, end))
+}
 
-    Some((start, end.min(seg.total_pages)))
+fn clipped_phys_interval(
+    segment: MemorySegment,
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    if end <= start {
+        return None;
+    }
+    let overlap_start = start.max(segment.start);
+    let overlap_end = end.min(segment.end());
+    (overlap_end > overlap_start).then_some((overlap_start, overlap_end))
+}
+
+fn consider_metadata_gap(
+    gap_start: usize,
+    gap_end: usize,
+    size: usize,
+    fl_type: usize,
+    best: &mut Option<MemorySegment>,
+    best_fl_type: &mut usize,
+) {
+    if gap_end <= gap_start || gap_end - gap_start < size {
+        return;
+    }
+    let Some(aligned_end) = align_down_checked(gap_end, PAGE_SIZE) else {
+        return;
+    };
+    let Some(min_end) = gap_start.checked_add(size) else {
+        return;
+    };
+    if aligned_end < min_end {
+        return;
+    }
+    let start = aligned_end - size;
+    let candidate = MemorySegment { start, size };
+    if metadata_candidate_is_better(candidate, fl_type, *best, *best_fl_type) {
+        *best = Some(candidate);
+        *best_fl_type = fl_type;
+    }
+}
+
+fn metadata_candidate_is_better(
+    candidate: MemorySegment,
+    fl_type: usize,
+    best: Option<MemorySegment>,
+    best_fl_type: usize,
+) -> bool {
+    let Some(best) = best else {
+        return true;
+    };
+    if fl_type == VM_FREELIST_DEFAULT && best_fl_type != VM_FREELIST_DEFAULT {
+        return true;
+    }
+    if fl_type != VM_FREELIST_DEFAULT && best_fl_type == VM_FREELIST_DEFAULT {
+        return false;
+    }
+    candidate.start > best.start
+}
+
+#[inline]
+fn choose_earlier_phys_interval(
+    current: Option<(usize, usize)>,
+    candidate: (usize, usize),
+) -> Option<(usize, usize)> {
+    match current {
+        Some(existing) if existing.0 < candidate.0 => Some(existing),
+        Some(existing) if existing.0 == candidate.0 && existing.1 >= candidate.1 => Some(existing),
+        _ => Some(candidate),
+    }
 }
 
 fn clipped_page_interval(seg: &BuddySegment, start: usize, end: usize) -> Option<(usize, usize)> {
@@ -1443,7 +2469,9 @@ fn hash_bucket(start: usize, bucket_count: usize) -> usize {
 }
 
 fn choose_hash_bucket_count(total_pages: usize) -> usize {
-    let mut buckets = (total_pages / 1024).clamp(MIN_HASH_BUCKETS, MAX_HASH_BUCKETS);
+    let mut buckets = total_pages
+        .div_ceil(TARGET_HASH_CHAIN)
+        .clamp(MIN_HASH_BUCKETS, MAX_HASH_BUCKETS);
     if !buckets.is_power_of_two() {
         buckets = buckets.next_power_of_two();
     }
@@ -1485,35 +2513,33 @@ fn pages_to_order_floor(pages: usize) -> usize {
 }
 
 fn required_order_for_request(request: &PhysicalAllocRequest) -> Result<usize, BuddyAllocError> {
-    const MIN_LARGE_PAGE_ORDER: usize = 9;
-    let min_pages = pages_for(request.size.max(1)).max(pages_for(request.align.max(PAGE_SIZE)));
-    let mut order = pages_to_order(min_pages);
-    if matches!(request.page_policy, PagePolicy::RequireLarge) {
-        order = order.max(MIN_LARGE_PAGE_ORDER);
+    request
+        .required_order()
+        .map_err(buddy_alloc_error_from_request)
+}
+
+fn buddy_alloc_error_from_request(err: AllocationRequestError) -> BuddyAllocError {
+    match err {
+        AllocationRequestError::InvalidSize
+        | AllocationRequestError::InvalidAlignment
+        | AllocationRequestError::SizeOverflow
+        | AllocationRequestError::UnsupportedOrder => BuddyAllocError::InvalidOrder,
+        AllocationRequestError::InvalidPlacement => BuddyAllocError::InvalidAddress,
     }
-    if order > MAX_TRACKED_ORDER {
-        return Err(BuddyAllocError::InvalidOrder);
-    }
-    Ok(order)
 }
 
 #[inline]
-fn pages_for(bytes: usize) -> usize {
-    bytes.max(1).div_ceil(PAGE_SIZE).max(1)
-}
-
-#[inline]
-fn pages_to_order(pages: usize) -> usize {
-    let mut order = 0usize;
-    let mut block = 1usize;
-    while block < pages {
-        block <<= 1;
-        order += 1;
+fn align_up_checked(value: usize, align: usize) -> Option<usize> {
+    if align == 0 || !align.is_power_of_two() {
+        return None;
     }
-    order
+    Some(value.checked_add(align - 1)? & !(align - 1))
 }
 
 #[inline]
-const fn align_up(value: usize, align: usize) -> usize {
-    (value + align - 1) & !(align - 1)
+fn align_down_checked(value: usize, align: usize) -> Option<usize> {
+    if align == 0 || !align.is_power_of_two() {
+        return None;
+    }
+    Some(value & !(align - 1))
 }

@@ -38,6 +38,35 @@ unsafe fn trap_frame_mut<'a>(ptr: usize) -> &'a mut TrapFrame {
     unsafe { &mut *(ptr as *mut TrapFrame) }
 }
 
+/// 在从用户态 trap 返回前投递异步信号。
+///
+/// syscall 返回路径已经在 `general::syscall::dispatch` 中带 trap-frame context
+/// 投递一次；这里补齐 timer/外设中断和可恢复异常路径。这样忙循环的用户线程
+/// 即使不再进入 syscall，也能在下一次时钟中断返回前进入用户信号 handler。
+fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
+    if !from_user || !sched::is_ready() {
+        return;
+    }
+    let task = sched::current_task();
+    if !task.signal.has_any_pending() && task.shared_signal_pending_bits_quick() == 0 {
+        return;
+    }
+    let _ = sched::operation::deliver_pending_signals_for_task(
+        &task,
+        sched::UserContextRef::new(tf_ptr),
+    );
+    match task.state() {
+        sched::TaskState::Zombie | sched::TaskState::Dead => {
+            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+            panic!("[trap][signal] terminal task scheduled back unexpectedly");
+        }
+        sched::TaskState::Stopped | sched::TaskState::Continued => {
+            sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+        }
+        _ => {}
+    }
+}
+
 /// 解码中断：从 IS 字段选出最高优先级中断类型。
 fn decode_interrupt(is: usize) -> Interrupt {
     // LoongArch 把待处理中断线压在 ESTAT.IS 位域里，但 Rust 侧更关心语义化后的
@@ -126,17 +155,50 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             }
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
-            sched::on_timer_tick(super::super::specific::kernel_timestamp_ns());
+            let now_ns = super::super::specific::kernel_timestamp_ns();
+            sched::on_timer_tick(now_ns);
+            super::super::vdso::run_timer_tick_hook(now_ns);
+            // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；
+            // 调频若需要更细的节流，kernel 应在 hook 内部按 now_ns 自
+            // 行 throttle。默认每次 tick 都调——smoltcp 的零分配 poll
+            // 路径在 RX 队列空时本身极快（一次 mutex + 几次状态查询）。
+            super::super::vdso::run_net_poll_hook(now_ns);
+            // TTY 输入泵：即使前台任务没有调用 read()，也要及时处理
+            // VINTR/VQUIT/VSUSP 这类控制字符并投递给前台进程组。
+            super::super::vdso::run_tty_poll_hook(now_ns);
+            deliver_user_signals_before_return(arg4, from_user);
+            // 中断可能打断内核临界区。抢占只在返回用户态前消费，内核态返回
+            // 继续执行被打断路径，避免在未知锁/栈状态下切走当前任务。
+            if from_user {
+                sched::preempt_if_needed(now_ns);
+            }
+            return arg4;
         }
+        let now_ns = super::super::specific::kernel_timestamp_ns();
+        let _ = general::dev::irq::dispatch_interrupt(intr);
+        // 串口输入在 UART 外部中断到来时最可靠：此时硬件 FIFO 已经可读，
+        // 需要马上拉进 TTY 行规程，避免没有 reader 的前台任务错过 Ctrl-C。
+        super::super::vdso::run_tty_poll_hook(now_ns);
         // trap 返回前的抢占检查：只有在进入过 sched::init 之后才生效，否则
         // 启动早期的中断会在尚无 current 时 panic。
-        sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+        deliver_user_signals_before_return(arg4, from_user);
+        // 与 timer 分支一致，只在返回用户态前处理抢占请求。
+        if from_user {
+            sched::preempt_if_needed(now_ns);
+        }
         arg4
     } else if ecode == ECODE_SYS {
         // syscall 通过注入的 SyscallFrameOps 读 a7/a0-a5、写返回值、推 PC。
         // general::syscall::dispatch 本轮全部返 ENOSYS；ELF loader 那轮再逐条加 arm。
         // log::debug!("[trap] syscall id={} pc={:#x} from_user={}", tf.a7, arg0, from_user);
         general::syscall::dispatch(general::TrapFramePtr::new(arg4));
+        // syscall 内部可能唤醒了其它任务或新建了子进程，并通过
+        // request_resched() 标记当前 CPU 需要重调度。系统调用返回用户态前
+        // 立即消费该标记，避免当前任务在同一时间片里连续启动 client，
+        // 而刚 fork/唤醒的 server 只能等下一次 timer tick。
+        if sched::needs_resched_current() {
+            sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+        }
         arg4
     } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD | ECODE_ASXD) {
         let enable = match ecode {
@@ -154,7 +216,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         arg4
     } else if matches!(
         ecode,
-        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX
+        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX | ECODE_PPI
     ) {
         // 缺页族 → 统一走 general::mm::dispatch_page_fault。
         // 分派结果：
@@ -165,22 +227,21 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         use general::mm::{FaultOutcome, KernelFaultReason};
         let tf_ptr = general::TrapFramePtr::new(arg4);
         match general::mm::dispatch_page_fault(tf_ptr) {
-            FaultOutcome::Fixed => arg4,
+            FaultOutcome::Fixed => {
+                deliver_user_signals_before_return(arg4, from_user);
+                arg4
+            }
             FaultOutcome::Segv => {
-                log::info!(
-                    "[trap][mm] user SIGSEGV pc={:#x} badv={:#x} ecode={}",
-                    arg0,
-                    arg2,
-                    ecode
-                );
-                // 投 SIGSEGV 给当前线程；下一次调度边界 deliver_pending_signals
-                // 拿到默认 Term 动作即触发 exit_task。本轮 hello 跑通不应触发；
-                // 兜底替代旧的 halt 行为。
+                // 同步 page fault 必须在返回用户态前立刻投递 SIGSEGV。若只把信号
+                // 入队再返回，lmbench lat_sig prot 这类“handler 返回后重试同一条
+                // fault 指令”的测试会在同一 PC 上反复 fault，永远等不到 syscall/
+                // timer 边界来安装用户 signal frame。
                 if sched::is_ready() {
                     let me = sched::current_task();
                     let pid = me.pid_root().unwrap_or(0);
                     let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
-                    sched::schedule_once(super::super::specific::kernel_timestamp_ns());
+                    drop(me);
+                    deliver_user_signals_before_return(arg4, from_user);
                 }
                 arg4
             }

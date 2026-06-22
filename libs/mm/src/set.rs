@@ -9,6 +9,7 @@
 //!
 //! - 任意两条 VMA 的 `range` 不相交（严格 disjoint）。
 //! - key 等于 `area.range.start`；`range.start < range.end`（空 range 不得插入）。
+//! - backing 的 offset / direct paddr 能覆盖整段长度，计算一段末尾不溢出。
 //!
 //! ## 操作风格
 //!
@@ -18,6 +19,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::convert::TryFrom;
 use core::ops::Range;
 
 use errno::Errno;
@@ -29,6 +31,36 @@ use crate::flags::VmFlags;
 #[derive(Default, Clone)]
 pub struct VmaSet {
     tree: BTreeMap<usize, VmArea>,
+}
+
+/// `VmaSet::find_mut` 返回的受限可变视图。
+///
+/// 它刻意不暴露 `&mut VmArea`，避免外部修改 `range.start` 后破坏
+/// `BTreeMap` key 与 VMA range 的一致性。
+pub struct VmAreaMut<'a> {
+    area: &'a mut VmArea,
+}
+
+impl<'a> VmAreaMut<'a> {
+    pub fn as_ref(&self) -> &VmArea {
+        self.area
+    }
+
+    pub fn flags_mut(&mut self) -> &mut VmFlags {
+        &mut self.area.flags
+    }
+
+    pub fn set_flags(&mut self, flags: VmFlags) {
+        self.area.flags = flags;
+    }
+}
+
+impl<'a> core::ops::Deref for VmAreaMut<'a> {
+    type Target = VmArea;
+
+    fn deref(&self) -> &Self::Target {
+        self.area
+    }
 }
 
 impl VmaSet {
@@ -48,7 +80,7 @@ impl VmaSet {
 
     /// 插入新 VMA。与任何已有 VMA 重叠返 `EEXIST`；空 range 返 `EINVAL`。
     pub fn insert(&mut self, area: VmArea) -> Result<(), Errno> {
-        if area.range.start >= area.range.end {
+        if !area.is_well_formed() {
             return Err(Errno::EINVAL);
         }
         if self.iter_overlap(&area.range).next().is_some() {
@@ -62,20 +94,20 @@ impl VmaSet {
     /// 查 `addr` 所在 VMA。
     pub fn find(&self, addr: usize) -> Option<&VmArea> {
         // 最靠后且 start <= addr 的那一条。
-        let (_, area) = self.tree.range(..=addr).next_back()?;
-        if area.contains(addr) {
+        let (key, area) = self.tree.range(..=addr).next_back()?;
+        if area.range.start == *key && area.is_well_formed() && area.contains(addr) {
             Some(area)
         } else {
             None
         }
     }
 
-    /// 同上的可变版。
-    pub fn find_mut(&mut self, addr: usize) -> Option<&mut VmArea> {
+    /// 同上的受限可变版。只允许改 flags，不允许改 range/backing。
+    pub fn find_mut(&mut self, addr: usize) -> Option<VmAreaMut<'_>> {
         let key = *self.tree.range(..=addr).next_back()?.0;
         let area = self.tree.get_mut(&key)?;
-        if area.contains(addr) {
-            Some(area)
+        if area.range.start == key && area.is_well_formed() && area.contains(addr) {
+            Some(VmAreaMut { area })
         } else {
             None
         }
@@ -88,20 +120,28 @@ impl VmaSet {
         page: usize,
         max_growth: usize,
     ) -> Option<(Range<usize>, VmFlags)> {
-        let key = *self.tree.range((page + 1)..).next()?.0;
-        let area = self.tree.get_mut(&key)?;
+        let key = *self.tree.range(page.checked_add(1)?..).next()?.0;
+        let area = self.tree.get(&key)?;
+        if area.range.start != key || !area.is_well_formed() {
+            return None;
+        }
         if page >= area.range.start || !area.flags.has(VmFlags::GROWS_DOWN) {
             return None;
         }
         if !matches!(area.backing, VmBacking::Anon) {
             return None;
         }
+        if let Some((_, prev)) = self.tree.range(..key).next_back() {
+            if prev.range.end > page {
+                return None;
+            }
+        }
         let lowest = area.range.end.saturating_sub(max_growth);
         if page < lowest {
             return None;
         }
+        let mut area = self.tree.remove(&key).expect("key from tree");
         area.range.start = page;
-        let area = self.tree.remove(&key).expect("key from tree");
         let added = page..key;
         let flags = area.flags;
         self.tree.insert(area.range.start, area);
@@ -114,10 +154,9 @@ impl VmaSet {
         range: &'a Range<usize>,
     ) -> impl Iterator<Item = &'a VmArea> + 'a {
         // 两部分合集：start < range.end 的全部，过滤掉 end <= range.start 的。
-        self.tree
-            .range(..range.end)
-            .map(|(_, v)| v)
-            .filter(|v| v.range.end > range.start)
+        self.tree.range(..range.end).map(|(_, v)| v).filter(|v| {
+            range.start < range.end && v.range.start < v.range.end && v.range.end > range.start
+        })
     }
 
     /// `range` 是否完全没有被任何 VMA 占用。
@@ -132,6 +171,9 @@ impl VmaSet {
         }
         let mut cursor = range.start;
         for area in self.iter_overlap(range) {
+            if !area.is_well_formed() {
+                return false;
+            }
             if area.range.start > cursor {
                 return false;
             }
@@ -150,12 +192,16 @@ impl VmaSet {
         }
         let mut cursor = search.start;
         for area in self.tree.range(..search.end).map(|(_, v)| v) {
+            if !area.is_well_formed() {
+                return None;
+            }
             if area.range.end <= search.start {
                 continue;
             }
             let gap_end = area.range.start.min(search.end);
             if gap_end >= cursor && gap_end - cursor >= len {
-                return Some(cursor..cursor + len);
+                let end = cursor.checked_add(len)?;
+                return Some(cursor..end);
             }
             cursor = cursor.max(area.range.end);
             if cursor >= search.end {
@@ -163,7 +209,8 @@ impl VmaSet {
             }
         }
         if search.end >= cursor && search.end - cursor >= len {
-            Some(cursor..cursor + len)
+            let end = cursor.checked_add(len)?;
+            Some(cursor..end)
         } else {
             None
         }
@@ -186,6 +233,9 @@ impl VmaSet {
         let mut removed = Vec::with_capacity(keys.len());
         for k in keys {
             let area = self.tree.remove(&k).expect("key from just-collected set");
+            if area.range.start != k || !area.is_well_formed() {
+                continue;
+            }
             // 左残：area.start..range.start
             let (mid_start, carry_left) = if area.range.start < range.start {
                 let (left, rest) = area
@@ -237,7 +287,25 @@ impl VmaSet {
         out
     }
 
-    /// 合并相邻且 flags/backing 兼容的 VMA（Anon 之间，或同一 File & 偏移衔接）。
+    /// 修改 `range` 内全部 VMA 的非几何属性。跨边界时自动 split，backing 不变。
+    pub fn update_flags_range(
+        &mut self,
+        range: &Range<usize>,
+        update: impl Fn(VmFlags) -> VmFlags,
+    ) -> Vec<(Range<usize>, VmFlags)> {
+        let cut_pieces = self.unmap_range(range);
+        let mut out = Vec::with_capacity(cut_pieces.len());
+        for mut p in cut_pieces {
+            p.flags = update(p.flags);
+            out.push((p.range.clone(), p.flags));
+            let _ = self.insert(p);
+        }
+        self.merge_neighbors();
+        out
+    }
+
+    /// 合并相邻且 flags/backing 兼容的 VMA（Anon、SharedAnon/File 偏移衔接、
+    /// Direct 物理地址衔接）。
     /// 典型调用点：insert 之后的紧邻合并；批量 unmap 之后的收尾。
     pub fn merge_neighbors(&mut self) {
         loop {
@@ -248,30 +316,41 @@ impl VmaSet {
                 let k_right = pair[1];
                 let (can_merge, new_end) = match (self.tree.get(&k_left), self.tree.get(&k_right)) {
                     (Some(l), Some(r)) => {
-                        let adjacent = l.range.end == r.range.start;
-                        let same_flags = l.flags == r.flags;
-                        let same_backing = match (&l.backing, &r.backing) {
-                            (crate::area::VmBacking::Anon, crate::area::VmBacking::Anon) => true,
-                            (
-                                crate::area::VmBacking::SharedAnon { id: il, offset: ol },
-                                crate::area::VmBacking::SharedAnon { id: ir, offset: or },
-                            ) => il == ir && *or == *ol + (l.range.end - l.range.start) as u64,
-                            (
-                                crate::area::VmBacking::File {
-                                    file: fl,
-                                    offset: ol,
-                                },
-                                crate::area::VmBacking::File {
-                                    file: fr,
-                                    offset: or,
-                                },
-                            ) => {
-                                alloc::sync::Arc::ptr_eq(fl, fr)
-                                    && *or == *ol + (l.range.end - l.range.start) as u64
-                            }
-                            _ => false,
-                        };
-                        (adjacent && same_flags && same_backing, r.range.end)
+                        if !l.is_well_formed() || !r.is_well_formed() {
+                            (false, 0)
+                        } else {
+                            let left_len = l.range.end - l.range.start;
+                            let adjacent = l.range.end == r.range.start;
+                            let same_flags = l.flags == r.flags;
+                            let same_backing = match (&l.backing, &r.backing) {
+                                (crate::area::VmBacking::Anon, crate::area::VmBacking::Anon) => {
+                                    true
+                                }
+                                (
+                                    crate::area::VmBacking::SharedAnon { id: il, offset: ol },
+                                    crate::area::VmBacking::SharedAnon { id: ir, offset: or },
+                                ) => il == ir && checked_offset_after(*ol, left_len) == Some(*or),
+                                (
+                                    crate::area::VmBacking::File {
+                                        file: fl,
+                                        offset: ol,
+                                    },
+                                    crate::area::VmBacking::File {
+                                        file: fr,
+                                        offset: or,
+                                    },
+                                ) => {
+                                    alloc::sync::Arc::ptr_eq(fl, fr)
+                                        && checked_offset_after(*ol, left_len) == Some(*or)
+                                }
+                                (
+                                    crate::area::VmBacking::Direct(bl),
+                                    crate::area::VmBacking::Direct(br),
+                                ) => bl.checked_add(left_len) == Some(*br),
+                                _ => false,
+                            };
+                            (adjacent && same_flags && same_backing, r.range.end)
+                        }
                     }
                     _ => (false, 0),
                 };
@@ -301,4 +380,8 @@ impl VmaSet {
     pub fn iter(&self) -> impl Iterator<Item = &VmArea> + '_ {
         self.tree.values()
     }
+}
+
+fn checked_offset_after(offset: u64, len: usize) -> Option<u64> {
+    offset.checked_add(u64::try_from(len).ok()?)
 }

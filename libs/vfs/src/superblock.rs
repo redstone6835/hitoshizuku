@@ -304,6 +304,14 @@ pub trait FsDriver: Send + Sync {
     /// 文件系统的能力标志。
     fn flags(&self) -> FsDriverFlags;
 
+    /// 探测挂载源是否属于本文件系统。
+    ///
+    /// 只有带 [`FsDriverFlags::AUTO_DETECT`] 的驱动需要覆盖该方法；显式
+    /// `mount -t <name>` 仍直接调用 [`FsDriver::mount`]。
+    fn probe(&self, _dev: Option<&str>) -> FsProbe {
+        FsProbe::None
+    }
+
     /// 挂载文件系统，创建并返回 Superblock。
     ///
     /// - `dev`：块设备路径（网络文件系统或内存文件系统传 `None`）；
@@ -335,6 +343,10 @@ impl FsDriverFlags {
     pub const RDONLY: Self = Self(1 << 1);
     /// 同一类型文件系统只能挂载一次（如 sysfs、procfs）。
     pub const SINGLE: Self = Self(1 << 2);
+    /// 文件系统挂载源是块设备。
+    pub const BLOCK: Self = Self(1 << 3);
+    /// 允许在未指定文件系统类型时参与自动探测。
+    pub const AUTO_DETECT: Self = Self(1 << 4);
 
     pub const fn has(self, flag: Self) -> bool {
         self.0 & flag.0 == flag.0
@@ -351,6 +363,17 @@ impl FsDriverFlags {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
+}
+
+/// 文件系统自动探测结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FsProbe {
+    /// 明确不是该文件系统。
+    None,
+    /// 可能匹配，但证据不足，应在强匹配驱动之后尝试。
+    Weak,
+    /// 明确匹配，可以优先尝试挂载。
+    Strong,
 }
 
 // ── 无锁文件系统驱动注册表 ──────────────────────────────────────────────────────

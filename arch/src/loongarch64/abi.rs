@@ -77,6 +77,7 @@ pub fn decode_open_flags(raw: u32) -> OpenOptions {
         truncate: raw & 0o1000 != 0,
         append: raw & 0o2000 != 0,
         nonblock: raw & 0o4000 != 0,
+        direct: raw & 0o40000 != 0,
         sync: raw & 0o4010000 != 0,
         directory: raw & 0o200000 != 0,
         nofollow: raw & 0o400000 != 0,
@@ -122,28 +123,4 @@ pub fn decode_mount_flags(raw: u32) -> MountFlags {
         flags = flags.with(MountFlags::REC);
     }
     flags
-}
-
-// ── 字符设备号映射 ────────────────────────────────────────────────────────────
-
-/// 将 [`general::dev::char::CharDeviceKind`] 映射到 Linux 标准 major/minor 号。
-///
-/// Linux 字符设备号（`<linux/major.h>`）是 ABI 知识，只允许存在于 `arch/` 层。
-/// VFS 层通过 [`general::vfs::stat::DevId`] 表示设备号，不感知具体数值。
-pub fn char_dev_kind_to_dev_id(
-    kind: general::dev::char::CharDeviceKind,
-) -> general::vfs::stat::DevId {
-    use general::dev::char::CharDeviceKind;
-    use general::vfs::stat::DevId;
-    match kind {
-        CharDeviceKind::Null => DevId::new(1, 3),
-        CharDeviceKind::Zero => DevId::new(1, 5),
-        CharDeviceKind::Random => DevId::new(1, 8),
-        CharDeviceKind::Console => DevId::new(5, 1),
-        CharDeviceKind::StandardSerial => DevId::new(4, 64),
-        CharDeviceKind::Ns16550 => DevId::new(4, 64),
-        CharDeviceKind::VirtualTerminal => DevId::new(4, 1),
-        // #[non_exhaustive]：未来新增的 CharDevKind 变体默认分配 major=0（未知设备）
-        _ => DevId::new(0, 0),
-    }
 }

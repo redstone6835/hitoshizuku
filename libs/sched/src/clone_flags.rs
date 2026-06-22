@@ -81,11 +81,26 @@ pub struct CloneArgs {
     /// clone3 set_tid 数组用户指针。
     pub set_tid: usize,
     pub set_tid_size: usize,
+    /// syscall 层解析后的根 namespace 指定 pid；0 表示由分配器自动选择。
+    pub requested_pid: i32,
     /// clone3 cgroup fd。
     pub cgroup: usize,
 }
 
 impl CloneArgs {
+    pub const fn exit_signal_checked(self) -> Option<u8> {
+        let raw = if self.exit_signal != 0 {
+            self.exit_signal
+        } else {
+            self.flags.exit_signal() as u64
+        };
+        if raw == 0 || raw <= 64 {
+            Some(raw as u8)
+        } else {
+            None
+        }
+    }
+
     pub const fn exit_signal_raw(self) -> u8 {
         if self.exit_signal != 0 {
             self.exit_signal as u8
@@ -106,6 +121,7 @@ impl CloneArgs {
             exit_signal: 0,
             set_tid: 0,
             set_tid_size: 0,
+            requested_pid: 0,
             cgroup: 0,
         }
     }
@@ -122,6 +138,7 @@ impl CloneArgs {
             exit_signal: 0,
             set_tid: 0,
             set_tid_size: 0,
+            requested_pid: 0,
             cgroup: 0,
         }
     }

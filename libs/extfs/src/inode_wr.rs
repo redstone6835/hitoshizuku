@@ -3,6 +3,7 @@
 //! 本模块持有"可变 inode"的完整 128+ 字节表示,负责 inode 表块的
 //! 读-改-写 + 重算 checksum。
 
+use alloc::borrow::Cow;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -42,11 +43,20 @@ impl RawInode {
         self.bytes[4..8].copy_from_slice(&(v as u32).to_le_bytes());
         self.bytes[108..112].copy_from_slice(&((v >> 32) as u32).to_le_bytes());
     }
+    pub fn set_atime_sec(&mut self, v: i64) {
+        self.bytes[8..12].copy_from_slice(&(v as u32).to_le_bytes());
+    }
+    pub fn set_mtime_sec(&mut self, v: i64) {
+        self.bytes[16..20].copy_from_slice(&(v as u32).to_le_bytes());
+    }
     pub fn nlink(&self) -> u16 {
         u16::from_le_bytes([self.bytes[26], self.bytes[27]])
     }
     pub fn set_nlink(&mut self, v: u16) {
         self.bytes[26..28].copy_from_slice(&v.to_le_bytes());
+    }
+    pub fn set_dtime(&mut self, v: u32) {
+        self.bytes[20..24].copy_from_slice(&v.to_le_bytes());
     }
     #[allow(dead_code)]
     pub fn uid(&self) -> u32 {
@@ -138,8 +148,9 @@ pub(crate) fn write_raw(state: &FsState, inode: &RawInode) -> Result<(), BlockBa
     let inode_size = state.ext_sb.inode_size as usize;
     let block_size = state.ext_sb.block_size as usize;
 
-    let mut bytes = inode.bytes.clone();
-    if state.ext_sb.metadata_csum && inode_size >= 256 {
+    // 无 metadata checksum 时直接写回原始 inode 字节,避免 L8 元数据热路径每次 clone。
+    let bytes: Cow<'_, [u8]> = if state.ext_sb.metadata_csum && inode_size >= 256 {
+        let mut bytes = inode.bytes.clone();
         // 清零 csum lo/hi 再重算
         bytes[0x7c] = 0;
         bytes[0x7d] = 0;
@@ -157,22 +168,17 @@ pub(crate) fn write_raw(state: &FsState, inode: &RawInode) -> Result<(), BlockBa
         if i_extra_isize >= 4 {
             bytes[0x82..0x84].copy_from_slice(&((sum >> 16) as u16).to_le_bytes());
         }
-    }
+        Cow::Owned(bytes)
+    } else {
+        Cow::Borrowed(inode.bytes.as_slice())
+    };
 
-    // 写回一个或两个 inode table 块
-    let mut blk = vec![0u8; block_size];
-    state.read_block(block, &mut blk)?;
     if in_block as usize + inode_size <= block_size {
-        blk[in_block as usize..in_block as usize + inode_size].copy_from_slice(&bytes);
-        state.write_block(block, &blk)?;
+        state.write_block_partial(block, in_block as usize, &bytes)?;
     } else {
         let first = block_size - in_block as usize;
-        blk[in_block as usize..].copy_from_slice(&bytes[..first]);
-        state.write_block(block, &blk)?;
-        let mut blk2 = vec![0u8; block_size];
-        state.read_block(block + 1, &mut blk2)?;
-        blk2[..inode_size - first].copy_from_slice(&bytes[first..]);
-        state.write_block(block + 1, &blk2)?;
+        state.write_block_partial(block, in_block as usize, &bytes[..first])?;
+        state.write_block_partial(block + 1, 0, &bytes[first..])?;
     }
     Ok(())
 }

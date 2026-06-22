@@ -13,10 +13,9 @@
 //! - **无裸 Inode 暴露**：`File` 持有 `Arc<Inode>` 但不对外暴露。用户空间只能
 //!   通过 fd 编号操作文件，无法直接访问内核的 Inode 结构。
 //!
-//! - **位置串行化**：文件读写偏移量（`pos`）用 `AtomicU64` 保护。
-//!   `load(Acquire)` / `store(Release)` 提供了与原先 Spinlock 相同的可见性保证，
-//!   且无锁开销。多线程并发读写同一描述符时，调用方应使用 `pread`/`pwrite`
-//!   以避免位置竞争，这与 POSIX 语义一致。
+//! - **位置串行化**：文件读写偏移量（`pos`）由 `pos_lock` 串行保护。
+//!   多个 fd 通过 `dup` 共享同一个 [`File`] 时，普通 `read`/`write`/`lseek`
+//!   对打开文件描述的偏移推进保持原子；`pread`/`pwrite` 仍不修改共享偏移。
 //!
 //! - **release 语义**：[`File`] 实现 `Drop`，在析构时自动调用 [`FileOps::release`]，
 //!   保证驱动私有状态（缓冲区、打开计数等）在最后一个引用消失时被正确清理。
@@ -24,7 +23,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use errno::Errno;
 use sched::Task;
@@ -35,6 +34,26 @@ use crate::vfs::cred::Credentials;
 use crate::vfs::error::VfsResult;
 use crate::vfs::inode::Inode;
 use crate::vfs::stat::FileStat;
+use crate::vfs::sync::Spinlock;
+
+static FILE_LIVE: AtomicUsize = AtomicUsize::new(0);
+static FILE_CREATED: AtomicUsize = AtomicUsize::new(0);
+static FILE_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileDiag {
+    pub live: usize,
+    pub created: usize,
+    pub dropped: usize,
+}
+
+pub fn file_diag() -> FileDiag {
+    FileDiag {
+        live: FILE_LIVE.load(Ordering::Acquire),
+        created: FILE_CREATED.load(Ordering::Acquire),
+        dropped: FILE_DROPPED.load(Ordering::Acquire),
+    }
+}
 
 // ── 打开选项（Open Options） ──────────────────────────────────────────────────
 
@@ -82,6 +101,8 @@ pub struct OpenOptions {
     pub nonblock: bool,
     /// 同步写（`O_SYNC`）。
     pub sync: bool,
+    /// 直接 I/O（`O_DIRECT`）。
+    pub direct: bool,
     /// 执行后关闭（`O_CLOEXEC`）。
     pub cloexec: bool,
 }
@@ -138,6 +159,10 @@ impl PollEvents {
     pub const POLLHUP: Self = Self(0x0010);
     /// 描述符无效（仅在 `revents` 中出现，通常表示传入了无效的 fd）。
     pub const POLLNVAL: Self = Self(0x0020);
+    /// 对端关闭写半边（Linux POLLRDHUP / EPOLLRDHUP）。
+    pub const POLLRDHUP: Self = Self(0x2000);
+    /// 非状态型文件的默认就绪集合：读写操作都不会因为等待外部事件而休眠。
+    pub const READ_WRITE_READY: Self = Self::POLLIN.with(Self::POLLOUT);
 
     /// 将两个事件掩码合并。
     pub const fn with(self, other: Self) -> Self {
@@ -172,6 +197,7 @@ impl StatusFlags {
     const APPEND: u32 = 1 << 0;
     const NONBLOCK: u32 = 1 << 1;
     const SYNC: u32 = 1 << 2;
+    const DIRECT: u32 = 1 << 3;
 
     fn from_open_options(opts: OpenOptions) -> Self {
         let mut bits = 0u32;
@@ -184,6 +210,9 @@ impl StatusFlags {
         if opts.sync {
             bits |= Self::SYNC;
         }
+        if opts.direct {
+            bits |= Self::DIRECT;
+        }
         Self(bits)
     }
 
@@ -191,6 +220,7 @@ impl StatusFlags {
         opts.append = (self.0 & Self::APPEND) != 0;
         opts.nonblock = (self.0 & Self::NONBLOCK) != 0;
         opts.sync = (self.0 & Self::SYNC) != 0;
+        opts.direct = (self.0 & Self::DIRECT) != 0;
         opts
     }
 }
@@ -300,15 +330,20 @@ pub struct File {
     /// 可通过 `fcntl(F_SETFL)` 变更的状态位（当前支持 APPEND/NONBLOCK/SYNC）。
     status_flags: AtomicU32,
 
-    /// 当前文件读写偏移量（字节），受自旋锁保护。
-    ///
-    /// 文件读写偏移量。
-    ///
-    /// 使用 `AtomicU64` 替代 `Spinlock<u64>`：实际实现中 pos 的读写已经是
-    /// "先拷贝 pos → 释放锁 → I/O → 再加锁写回"的非原子语义，`AtomicU64`
-    /// 的 `load(Acquire)` / `store(Release)` 提供相同的保证且无锁开销。
-    /// 多线程并发读写同一描述符时，调用方应使用 `pread`/`pwrite` 以避免位置竞争。
+    /// `fcntl(F_SETOWN[_EX])` 维护的异步通知接收者类型。
+    owner_type: AtomicI32,
+
+    /// `fcntl(F_SETOWN[_EX])` 维护的异步通知接收者 pid。
+    owner_pid: AtomicI32,
+
+    /// `fcntl(F_SETSIG)` 维护的异步通知信号号。
+    owner_sig: AtomicI32,
+
+    /// 当前文件读写偏移量（字节）。
     pub(crate) pos: AtomicU64,
+
+    /// 串行化会读取或推进共享偏移的操作。
+    pos_lock: Spinlock<()>,
 
     /// 打开时保存的进程凭据快照（共享引用）。
     ///
@@ -347,11 +382,17 @@ impl File {
         dentry: Arc<crate::vfs::dentry::Dentry>,
         mount: Arc<crate::vfs::mount::Mount>,
     ) -> Self {
+        FILE_CREATED.fetch_add(1, Ordering::Relaxed);
+        FILE_LIVE.fetch_add(1, Ordering::Relaxed);
         Self {
             inode,
             flags,
             status_flags: AtomicU32::new(StatusFlags::from_open_options(flags).0),
+            owner_type: AtomicI32::new(0),
+            owner_pid: AtomicI32::new(0),
+            owner_sig: AtomicI32::new(0),
             pos: AtomicU64::new(0),
+            pos_lock: Spinlock::new(()),
             cred,
             ops,
             dentry,
@@ -379,7 +420,7 @@ impl File {
         StatusFlags(self.status_flags.load(Ordering::Acquire)).apply(self.flags)
     }
 
-    pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool) {
+    pub fn set_status_flags(&self, append: bool, nonblock: bool, sync: bool, direct: bool) {
         let mut bits = 0u32;
         if append {
             bits |= StatusFlags::APPEND;
@@ -390,7 +431,31 @@ impl File {
         if sync {
             bits |= StatusFlags::SYNC;
         }
+        if direct {
+            bits |= StatusFlags::DIRECT;
+        }
         self.status_flags.store(bits, Ordering::Release);
+        self.ops.set_status_flags(self.flags());
+    }
+
+    pub fn owner(&self) -> (i32, i32) {
+        (
+            self.owner_type.load(Ordering::Acquire),
+            self.owner_pid.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.owner_type.store(owner_type, Ordering::Release);
+        self.owner_pid.store(owner_pid, Ordering::Release);
+    }
+
+    pub fn owner_sig(&self) -> i32 {
+        self.owner_sig.load(Ordering::Acquire)
+    }
+
+    pub fn set_owner_sig(&self, sig: i32) {
+        self.owner_sig.store(sig, Ordering::Release);
     }
 
     /// 返回打开时冻结的凭据。
@@ -407,9 +472,10 @@ impl File {
     ///
     /// 对 `O_PATH` 描述符调用 `read` 将返回 `VfsError::BadFileDescriptor`。
     pub fn read(&self, buf: &mut [u8]) -> VfsResult<usize> {
-        if !self.flags.readable() {
+        if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
+        let _pos_guard = self.pos_lock.lock();
         let offset = self.pos.load(Ordering::Acquire);
         let n = self.ops.read_at(buf, offset)?;
         self.pos
@@ -419,10 +485,12 @@ impl File {
 
     /// 将 `buf` 中的数据写入文件，从当前偏移量（或文件末尾，若 `O_APPEND`）开始。
     pub fn write(&self, buf: &[u8]) -> VfsResult<usize> {
-        if !self.flags.writable() {
+        let flags = self.flags();
+        if !flags.writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
-        if self.flags.append {
+        let _pos_guard = self.pos_lock.lock();
+        if flags.append {
             let n = self.ops.write_at(buf, u64::MAX)?;
             let new_eof = self.inode.size();
             self.pos.store(new_eof, Ordering::Release);
@@ -438,7 +506,7 @@ impl File {
 
     /// 在指定偏移量处读取，不改变描述符的当前偏移量（`pread64`）。
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
-        if !self.flags.readable() {
+        if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
@@ -449,7 +517,7 @@ impl File {
 
     /// 在指定偏移量处写入，不改变描述符的当前偏移量（`pwrite64`）。
     pub fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        if !self.flags.writable() {
+        if !self.flags().writable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if !self.ops.is_seekable() {
@@ -460,6 +528,7 @@ impl File {
 
     /// 移动文件偏移量（`lseek`）。返回移动后的绝对偏移量。
     pub fn seek(&self, from: SeekFrom) -> VfsResult<u64> {
+        let _pos_guard = self.pos_lock.lock();
         let new_pos = match from {
             SeekFrom::Start(n) => n,
             SeekFrom::Current(n) => {
@@ -502,16 +571,44 @@ impl File {
     /// 函数返回枚举实际停止时的新游标值（可用于下次 `readdir` 的起始位置）。
     /// 游标语义由驱动自定义（通常为已枚举条目数；不同文件系统实现可能不同）。
     pub fn readdir(&self, sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
-        if !self.flags.readable() {
+        if !self.flags().readable() {
             return Err(crate::vfs::error::VfsError::BadFileDescriptor);
         }
         if self.inode.kind != crate::vfs::stat::FileType::Directory {
             return Err(crate::vfs::error::VfsError::NotADirectory);
         }
+        let _pos_guard = self.pos_lock.lock();
         let pos = self.pos.load(Ordering::Acquire);
         let new_pos = self.ops.readdir(pos, sink)?;
         self.pos.store(new_pos, Ordering::Release);
         Ok(new_pos)
+    }
+
+    /// 修改文件大小，委托给底层文件系统以同步数据容器和 inode 元数据。
+    pub fn truncate(&self, size: u64) -> VfsResult<()> {
+        if !self.flags().writable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        self.mount.check_writable()?;
+        self.inode.ops.truncate(&self.inode, size)
+    }
+
+    /// 为指定范围分配底层存储。是否支持由具体文件系统决定。
+    pub fn fallocate(&self, offset: u64, len: u64) -> VfsResult<()> {
+        if !self.flags().writable() {
+            return Err(crate::vfs::error::VfsError::BadFileDescriptor);
+        }
+        if len == 0 {
+            return Err(crate::vfs::error::VfsError::InvalidArgument);
+        }
+        if offset.checked_add(len).is_none() {
+            return Err(crate::vfs::error::VfsError::FileTooLarge);
+        }
+        if !self.ops.is_seekable() {
+            return Err(crate::vfs::error::VfsError::IllegalSeek);
+        }
+        self.mount.check_writable()?;
+        self.ops.fallocate(offset, len)
     }
 
     /// 将文件操作对象向下转型为具体驱动类型 `T`。
@@ -573,6 +670,14 @@ impl File {
         self.ops.poll_remove_waiter(task)
     }
 
+    pub fn on_fd_closed(&self, fd: u32) {
+        self.ops.on_fd_closed(fd)
+    }
+
+    pub fn on_file_description_closed(&self, file: &Arc<File>) {
+        self.ops.on_file_description_closed(file)
+    }
+
     pub fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
         self.ops.io_timeout_deadline(interest)
     }
@@ -596,6 +701,11 @@ impl Drop for File {
     /// 这保证了无论通过何种路径（正常 `close`、进程退出、`execve` 的 CLOEXEC）
     /// 关闭描述符，驱动的清理逻辑都会被调用且只调用一次（Arc 的唯一性保证）。
     fn drop(&mut self) {
+        // `flock(2)` 的锁属于打开文件描述；最后一个 Arc<File> 消失时自动释放，
+        // 避免进程异常退出后留下无法唤醒的 advisory lock。
+        crate::vfs::flock::unlock_file_ref(self);
+        FILE_DROPPED.fetch_add(1, Ordering::Relaxed);
+        FILE_LIVE.fetch_sub(1, Ordering::Relaxed);
         self.ops.release();
         // 自动递减挂载引用计数，保证 is_busy() 正确反映活跃 fd 数量。
         self.mount.dec_open();
@@ -700,6 +810,18 @@ pub trait FileOps {
     /// 显式移除之前登记的等待者。
     fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
 
+    /// 动态状态位（`F_SETFL`）发生变化时通知底层驱动。
+    fn set_status_flags(&self, _flags: OpenOptions) {}
+
+    /// 某个 fd 号从 fdtable 中关闭或被替换时调用。
+    ///
+    /// 这是描述符级通知，不等同于 [`FileOps::release`]；同一个 `File` 可能仍被
+    /// 其他 dup 出来的 fd 或 epoll/SCM_RIGHTS 持有。
+    fn on_fd_closed(&self, _fd: u32) {}
+
+    /// fdtable 中某个打开文件描述的最后一个 fd 被关闭或替换时调用。
+    fn on_file_description_closed(&self, _file: &Arc<File>) {}
+
     /// 返回普通 read/write 等待对应的超时 deadline。
     ///
     /// `poll(2)`/`epoll_wait(2)` 的显式 timeout 不走这里；这个 hook 只服务于
@@ -711,6 +833,11 @@ pub trait FileOps {
     /// 是否支持 `lseek(2)`。
     fn is_seekable(&self) -> bool {
         true
+    }
+
+    /// 为指定范围分配底层存储。默认表示该文件类型不支持 `fallocate(2)`。
+    fn fallocate(&self, _offset: u64, _len: u64) -> VfsResult<()> {
+        Err(crate::vfs::error::VfsError::NotSupported)
     }
 
     /// 执行文件或设备控制命令。

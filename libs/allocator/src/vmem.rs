@@ -1,24 +1,25 @@
 //! vmem arena 虚拟地址空间区间管理器
 //!
-//! 参照 FreeBSD `kern/subr_vmem.c` 的设计，实现基于边界标签 (boundary tag)
-//! 的资源区间分配器。vmem 用于管理虚拟地址空间、设备 I/O 空间等线性资源。
+//! 通过边界标签 (boundary tag) 管理线性资源区间。vmem 用于管理虚拟地址空间、
+//! 设备 I/O 空间等线性资源。
 //!
 //! 核心特性:
 //! - 基于边界标签的区间管理
 //! - 支持 quantum 对齐分配
 //! - 分离的空闲链表 (power-of-2 大小桶) 加速最佳匹配查找
 //! - 即时合并 (instant coalescing) 机制
-//! - 使用 boot-backed 动态标签池消除固定上限
+//! - 使用自举感知的动态标签池消除固定上限
 
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::boot::BootAllocator;
 use crate::error::VmemError;
 
 const INVALID_TAG: usize = usize::MAX;
 /// 空闲链表的桶数 (按大小的 log2 分桶)
 const VMEM_FREELISTS: usize = 32;
+/// boundary tag 按批补货，避免每次区间切分都进入 metadata allocator。
+const VMEM_TAG_REFILL: usize = 64;
 
 /// 默认 quantum (最小分配单位)
 pub const VMEM_DEFAULT_QUANTUM: usize = 4096;
@@ -113,6 +114,12 @@ pub struct VmemStats {
     pub alloc_failures: u64,
     /// 活跃边界标签数
     pub active_tags: usize,
+    /// arena 私有 tag freelist 中可复用的标签数
+    pub free_tags: usize,
+    /// tag 元数据批量补货次数
+    pub tag_refills: u64,
+    /// 从 metadata allocator 获得过的 tag 总数
+    pub tags_allocated: usize,
     /// 最大连续空闲区间
     pub largest_free_size: usize,
     /// 空闲段数量
@@ -142,6 +149,9 @@ impl VmemStats {
             free_count: 0,
             alloc_failures: 0,
             active_tags: 0,
+            free_tags: 0,
+            tag_refills: 0,
+            tags_allocated: 0,
             largest_free_size: 0,
             free_segments: 0,
             split_count: 0,
@@ -192,8 +202,6 @@ pub struct VmemArena {
     stats: VmemStats,
     /// 是否已初始化
     initialized: bool,
-    /// 动态标签元数据来源
-    metadata_boot: AtomicUsize,
 }
 
 impl VmemArena {
@@ -209,13 +217,7 @@ impl VmemArena {
             policy: VmemAllocPolicy::BestFit,
             stats: VmemStats::new(),
             initialized: false,
-            metadata_boot: AtomicUsize::new(0),
         }
-    }
-
-    pub fn bind_metadata_source(&mut self, boot: &BootAllocator) {
-        self.metadata_boot
-            .store(boot as *const BootAllocator as usize, Ordering::Release);
     }
 
     /// 初始化 vmem arena
@@ -267,46 +269,48 @@ impl VmemArena {
         true
     }
 
-    fn metadata_boot(&self) -> Option<&BootAllocator> {
-        let raw = self.metadata_boot.load(Ordering::Acquire);
-        if raw == 0 {
-            None
-        } else {
-            Some(unsafe { &*(raw as *const BootAllocator) })
-        }
-    }
-
     /// 从标签空闲池获取一个标签
     fn alloc_tag(&mut self) -> Option<usize> {
         // tag 本身也是元数据资源，所以这里优先复用 free tag；没有可复用的 tag 时，
-        // 才去向 metadata allocator / boot allocator 要新的标签存储。
-        if self.tag_free_head != INVALID_TAG {
-            let addr = self.tag_free_head;
-            self.tag_free_head = read_tag(addr).free_next;
-            let mut tag = BoundaryTag::empty();
-            tag.in_use = true;
-            write_tag(addr, tag);
-            self.stats.active_tags += 1;
-            return Some(addr);
-        }
-
-        let addr = {
-            let ptr = crate::alloc_internal_metadata(Layout::new::<BoundaryTag>()) as usize;
-            if ptr != 0 {
-                ptr
-            } else {
-                let boot = self.metadata_boot()?;
-                boot.alloc(Layout::new::<BoundaryTag>()) as usize
-            }
-        };
-        if addr == 0 {
+        // 按批向 crate 级 metadata allocator 要新的标签存储，避免 kheap/slab grow
+        // 过程中每次切分都走一遍 metadata 动态扩容路径。
+        if self.tag_free_head == INVALID_TAG && !self.refill_tags() {
             return None;
         }
+
+        let addr = self.tag_free_head;
+        self.tag_free_head = read_tag(addr).free_next;
         let mut tag = BoundaryTag::empty();
         tag.in_use = true;
         write_tag(addr, tag);
         self.stats.active_tags += 1;
+        self.stats.free_tags = self.stats.free_tags.saturating_sub(1);
         Some(addr)
+    }
+
+    fn refill_tags(&mut self) -> bool {
+        let layout = match Layout::array::<BoundaryTag>(VMEM_TAG_REFILL) {
+            Ok(layout) => layout,
+            Err(_) => return false,
+        };
+        let base = crate::alloc_internal_metadata(layout) as usize;
+        if base == 0 {
+            return false;
+        }
+
+        let mut head = self.tag_free_head;
+        for idx in (0..VMEM_TAG_REFILL).rev() {
+            let addr = base + idx * core::mem::size_of::<BoundaryTag>();
+            let mut tag = BoundaryTag::empty();
+            tag.free_next = head;
+            write_tag(addr, tag);
+            head = addr;
+        }
+        self.tag_free_head = head;
+        self.stats.free_tags += VMEM_TAG_REFILL;
+        self.stats.tag_refills += 1;
+        self.stats.tags_allocated += VMEM_TAG_REFILL;
+        true
     }
 
     /// 归还标签到空闲池
@@ -317,6 +321,7 @@ impl VmemArena {
         tag.free_next = self.tag_free_head;
         write_tag(addr, tag);
         self.tag_free_head = addr;
+        self.stats.free_tags += 1;
         self.stats.active_tags = self.stats.active_tags.saturating_sub(1);
     }
 

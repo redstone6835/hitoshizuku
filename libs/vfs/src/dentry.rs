@@ -336,6 +336,25 @@ impl Dentry {
         self.inode.as_ref().map(Arc::clone)
     }
 
+    /// 该 Dentry 是否可以从缓存中安全驱逐。
+    ///
+    /// 对没有持久化后端的文件系统（tmpfs / ramfs / devtmpfs），驱逐 positive
+    /// Dentry 等同于删除文件——Superblock 的 inode_cache 持有的是 Weak 引用，
+    /// Dentry 是 Inode 的唯一强引用持有者。一旦驱逐，inode 被 drop，文件数据
+    /// 永久丢失。
+    pub fn is_evictable(&self) -> bool {
+        if self.state_flag.load(Ordering::Acquire) != STATE_POSITIVE {
+            return true;
+        }
+        let Some(inode) = self.inode.as_ref() else {
+            return true;
+        };
+        let Some(sb) = inode.superblock() else {
+            return true;
+        };
+        sb.dev_id.is_some()
+    }
+
     /// 将 Dentry 标记为失效（文件被删除时调用）。
     ///
     /// 不清除 `inode` 字段（它是不可变的），只修改状态标志。
@@ -701,7 +720,7 @@ impl DentryShard {
 
     fn evict_one_any(&mut self) -> Option<Arc<Dentry>> {
         self.evict_one_non_positive()
-            .or_else(|| self.evict_from_cursor(|_| true))
+            .or_else(|| self.evict_from_cursor(|d| d.is_evictable()))
     }
 
     /// 扩容：容量翻倍（空表时初始化为 INITIAL_CAPACITY），重新哈希所有条目。
@@ -1137,6 +1156,7 @@ pub struct VfsRoot {
 impl VfsRoot {
     /// 构造一个新的 VFS 根。
     pub fn new(root_dentry: Arc<Dentry>, root_mount: Arc<Mount>) -> Self {
+        root_mount.inc_open();
         Self {
             state: Spinlock::new(VfsRootState {
                 root_dentry,
@@ -1150,10 +1170,16 @@ impl VfsRoot {
     /// `root_mount` 必须是包含 `root_dentry` 的挂载点。调用方通常应使用路径解析
     /// 返回的 [`LookupResult`](crate::vfs::path::LookupResult) 同时取得两者。
     pub fn set(&self, root_dentry: Arc<Dentry>, root_mount: Arc<Mount>) {
-        *self.state.lock() = VfsRootState {
-            root_dentry,
-            root_mount,
-        };
+        root_mount.inc_open();
+        let mut state = self.state.lock();
+        let old = core::mem::replace(
+            &mut *state,
+            VfsRootState {
+                root_dentry,
+                root_mount,
+            },
+        );
+        old.root_mount.dec_open();
     }
 
     /// 判断给定的 dentry 是否为当前进程的根目录。
@@ -1162,6 +1188,16 @@ impl VfsRoot {
     #[inline]
     pub fn is_at_root(&self, dentry: &Arc<Dentry>) -> bool {
         Arc::ptr_eq(&self.state.lock().root_dentry, dentry)
+    }
+
+    /// 判断给定的 dentry 与 mount 是否同时匹配当前进程根目录。
+    ///
+    /// 同一个 dentry 可能在不同 mount 上下文中出现；`..` 跨挂载边界时必须同时
+    /// 比较两者，避免把父文件系统中的 dentry 误判为子挂载的根。
+    #[inline]
+    pub fn is_at_root_in_mount(&self, dentry: &Arc<Dentry>, mount: &Arc<Mount>) -> bool {
+        let state = self.state.lock();
+        Arc::ptr_eq(&state.root_dentry, dentry) && Arc::ptr_eq(&state.root_mount, mount)
     }
 
     /// 返回根目录的克隆引用。
@@ -1174,5 +1210,11 @@ impl VfsRoot {
     #[inline]
     pub fn mount(&self) -> Arc<Mount> {
         Arc::clone(&self.state.lock().root_mount)
+    }
+}
+
+impl Drop for VfsRoot {
+    fn drop(&mut self) {
+        self.state.lock().root_mount.dec_open();
     }
 }

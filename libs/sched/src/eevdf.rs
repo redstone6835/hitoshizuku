@@ -108,6 +108,7 @@ pub struct SchedEntity {
     dl_deadline_ns: AtomicU64,
     dl_period_ns: AtomicU64,
     dl_abs_deadline_ns: AtomicU64,
+    dl_replenish_ns: AtomicU64,
     dl_budget_ns: AtomicU64,
     rr_remaining_ns: AtomicU64,
     rq_vruntime: AtomicU64,
@@ -131,6 +132,7 @@ impl SchedEntity {
             dl_deadline_ns: AtomicU64::new(attr.deadline_ns),
             dl_period_ns: AtomicU64::new(attr.period_ns),
             dl_abs_deadline_ns: AtomicU64::new(0),
+            dl_replenish_ns: AtomicU64::new(0),
             dl_budget_ns: AtomicU64::new(attr.runtime_ns),
             rr_remaining_ns: AtomicU64::new(attr.slice_ns),
             rq_vruntime: AtomicU64::new(0),
@@ -182,6 +184,8 @@ impl SchedEntity {
         self.dl_deadline_ns
             .store(attr.deadline_ns, Ordering::Release);
         self.dl_period_ns.store(attr.period_ns, Ordering::Release);
+        self.dl_abs_deadline_ns.store(0, Ordering::Release);
+        self.dl_replenish_ns.store(0, Ordering::Release);
         self.dl_budget_ns.store(attr.runtime_ns, Ordering::Release);
         self.rr_remaining_ns.store(attr.slice_ns, Ordering::Release);
     }
@@ -276,15 +280,20 @@ impl SchedEntity {
     /// 一次性更新 weight + slice。调用方随后应当调 [`crate::Runqueue::resort_after_weight_change`]
     /// 把 task 在 tree 中的位置重算。
     pub fn set_params(&self, params: SchedParams) {
-        let nice = params.nice.clamp(NICE_MIN, NICE_MAX);
-        self.nice.store(nice as i64, Ordering::Release);
-        self.weight
-            .store(weight_from_nice(nice).max(1), Ordering::Release);
+        self.set_nice(params.nice);
         self.slice_ns.store(params.slice(), Ordering::Release);
         if self.policy() == SchedPolicy::RtRoundRobin {
             self.rr_remaining_ns
                 .store(params.slice().max(1), Ordering::Release);
         }
+    }
+
+    /// 只更新 POSIX nice 与对应权重，不改变策略或时间片。
+    pub fn set_nice(&self, nice: i8) {
+        let nice = nice.clamp(NICE_MIN, NICE_MAX);
+        self.nice.store(nice as i64, Ordering::Release);
+        self.weight
+            .store(weight_from_nice(nice).max(1), Ordering::Release);
     }
 
     pub fn deadline_runtime_ns(&self) -> u64 {
@@ -306,9 +315,16 @@ impl SchedEntity {
     pub(crate) fn replenish_deadline(&self, now_ns: u64) {
         let runtime = self.deadline_runtime_ns();
         let relative_deadline = self.deadline_relative_ns();
+        let period = self.deadline_period_ns();
         self.dl_budget_ns.store(runtime, Ordering::Release);
         self.dl_abs_deadline_ns
             .store(now_ns.saturating_add(relative_deadline), Ordering::Release);
+        self.dl_replenish_ns
+            .store(now_ns.saturating_add(period), Ordering::Release);
+    }
+
+    pub(crate) fn deadline_replenish_ns(&self) -> u64 {
+        self.dl_replenish_ns.load(Ordering::Acquire)
     }
 
     pub(crate) fn deadline_budget_ns(&self) -> u64 {

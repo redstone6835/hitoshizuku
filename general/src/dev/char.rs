@@ -2,14 +2,12 @@
 //!
 //! SMP 多核并发安全，无未定义行为。
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use spin::mutex::Mutex;
-
-pub use super::DriverControl;
+pub use super::control::{CharControlRequest, CharControlResponse, ControlError, DriverControl};
 
 // ─────────────────────────── I/O 错误 ────────────────────────────────────
 /// 字符设备 I/O 错误。
@@ -19,6 +17,8 @@ pub enum CharIoError {
     HardwareError,
     /// 设备不可用或已断开。
     Unavailable,
+    /// 阻塞 I/O 被信号打断。
+    Interrupted,
     /// 自旋等待超时（防止硬件故障导致死锁）。
     Timeout,
 }
@@ -50,6 +50,31 @@ pub trait CharDriver: Send + Sync {
     /// 返回实际读取的字节数。`Ok(0)` 表示当前无可用数据。
     fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError>;
 
+    /// 查询设备底层当前是否有可读数据。
+    ///
+    /// 这是给 `poll(2)`/`select(2)` 的非破坏性快照接口；TTY 行规程仍由
+    /// devtmpfs 负责，驱动只暴露硬件接收 FIFO/软件接收队列是否非空。
+    fn poll_read(&self) -> bool {
+        false
+    }
+
+    /// 登记一个等待底层字符设备就绪的任务。
+    ///
+    /// 设备层只接收“读/写方向”这类通用 I/O 意图，不感知 `poll(2)` 的
+    /// POSIX 位图。没有中断或内部等待队列的驱动保持默认返回 `false`，
+    /// 上层会退化为定期重查 readiness。
+    fn poll_add_waiter(
+        &self,
+        _task: &Arc<sched::Task>,
+        _want_read: bool,
+        _want_write: bool,
+    ) -> bool {
+        false
+    }
+
+    /// 移除此前通过 [`CharDriver::poll_add_waiter`] 登记的等待者。
+    fn poll_remove_waiter(&self, _task: &Arc<sched::Task>) {}
+
     /// 阻塞等待设备内部写缓冲全部排空。
     ///
     /// 默认实现为空操作（无内部缓冲的设备）。
@@ -63,15 +88,28 @@ pub trait CharDriver: Send + Sync {
     /// 对无内部发送缓冲的设备，默认实现为空操作。
     fn poll_write(&self) {}
 
+    /// 执行字符设备类 typed control。
+    ///
+    /// 默认只把通用 drain 请求接到底层 [`flush`](Self::flush)，其它请求返回
+    /// `Unsupported`。丢弃输入/输出队列需要驱动明确知道自己的缓冲结构，
+    /// 不能由类层假定完成。
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        match req {
+            CharControlRequest::DrainTx => {
+                self.flush().map_err(map_char_control_error)?;
+                Ok(CharControlResponse::Done)
+            }
+            _ => Err(ControlError::Unsupported),
+        }
+    }
+
     /// 返回 `self` 的 `&dyn Any` 引用，用于向下转型到具体驱动类型。
     ///
-    /// 这是 `DriverControl` 在通用路径上的"类型恢复桥梁"：
+    /// 类型安全控制路径应优先使用 [`CharDevice::control`]；`as_any` 只作为
+    /// 少数调试或内部恢复具体驱动类型的逃生口。
     ///
     /// ```rust,ignore
-    /// // VFS / ioctl 路径：手持 CharDev，想修改波特率
-    /// if let Some(uart) = dev.downcast_driver::<Uart16550>() {
-    ///     uart.control(UartRequest::SetBaudRate { ... })?;
-    /// }
+    /// let _ = dev.control(CharControlRequest::DrainTx)?;
     /// ```
     ///
     /// 实现者只需写 `fn as_any(&self) -> &dyn Any { self }`。
@@ -98,41 +136,105 @@ pub trait CharDriver: Send + Sync {
         }
         Ok(())
     }
+
+    /// 设备是否具备 TTY/终端语义。覆盖返回 `true` 的设备会被 devtmpfs
+    /// 创建为可交互终端节点（支持 termios/ioctl/job control 等）。
+    fn is_tty(&self) -> bool {
+        false
+    }
+
+    /// 设备是否可作为内核控制台输出。
+    fn is_console(&self) -> bool {
+        false
+    }
 }
 
-// ─────────────────────────── 字符设备种类 ─────────────────────────────────
+impl<T: CharDriver + ?Sized> CharDriver for &'static T {
+    fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
+        (**self).write(buf)
+    }
 
-/// 字符设备的具体类型。
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CharDeviceKind {
-    /// 一般串口。
-    StandardSerial,
-    /// UART NS16550。
-    Ns16550,
-    /// 虚拟终端（VTY / PTY）。
-    VirtualTerminal,
-    /// 空设备（`/dev/null` 语义）。
-    Null,
-    /// 全零设备（`/dev/zero` 语义）。
-    Zero,
-    /// 随机数设备（`/dev/random` 语义）。
-    Random,
-    /// 内核控制台抽象设备。
-    Console,
+    fn read(&self, buf: &mut [u8]) -> Result<usize, CharIoError> {
+        (**self).read(buf)
+    }
+
+    fn poll_read(&self) -> bool {
+        (**self).poll_read()
+    }
+
+    fn poll_add_waiter(&self, task: &Arc<sched::Task>, want_read: bool, want_write: bool) -> bool {
+        (**self).poll_add_waiter(task, want_read, want_write)
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        (**self).poll_remove_waiter(task)
+    }
+
+    fn flush(&self) -> Result<(), CharIoError> {
+        (**self).flush()
+    }
+
+    fn poll_write(&self) {
+        (**self).poll_write();
+    }
+
+    fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        (**self).control(req)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        (**self).as_any()
+    }
+
+    fn write_all(&self, buf: &[u8]) -> Result<(), CharIoError> {
+        (**self).write_all(buf)
+    }
+
+    fn is_tty(&self) -> bool {
+        (**self).is_tty()
+    }
+
+    fn is_console(&self) -> bool {
+        (**self).is_console()
+    }
 }
 
-impl CharDeviceKind {
-    pub fn name(&self) -> &'static str {
-        match self {
-            CharDeviceKind::StandardSerial => "serial",
-            CharDeviceKind::Ns16550 => "uart",
-            CharDeviceKind::VirtualTerminal => "vty",
-            CharDeviceKind::Null => "null",
-            CharDeviceKind::Zero => "zero",
-            CharDeviceKind::Random => "random",
-            CharDeviceKind::Console => "console",
-        }
+/// [`CharDevice::new`] 的驱动输入转换 helper。
+#[doc(hidden)]
+pub trait IntoCharDriverArc {
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver>;
+}
+
+impl IntoCharDriverArc for Arc<dyn CharDriver> {
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        self
+    }
+}
+
+impl<T> IntoCharDriverArc for Arc<T>
+where
+    T: CharDriver + 'static,
+{
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        self
+    }
+}
+
+impl<T> IntoCharDriverArc for &'static T
+where
+    T: CharDriver + ?Sized + 'static,
+{
+    fn into_char_driver_arc(self) -> Arc<dyn CharDriver> {
+        Arc::new(self)
+    }
+}
+
+fn map_char_control_error(err: CharIoError) -> ControlError {
+    match err {
+        CharIoError::HardwareError => ControlError::Io,
+        CharIoError::Unavailable => ControlError::NoDevice,
+        CharIoError::Interrupted => ControlError::Busy,
+        CharIoError::Timeout => ControlError::Busy,
     }
 }
 
@@ -146,9 +248,8 @@ pub enum CharDeviceState {
 }
 
 struct CharDeviceInner {
-    kind: CharDeviceKind,
-    fw_name: &'static str,
-    driver: &'static dyn CharDriver,
+    fw_name: Box<str>,
+    driver: Arc<dyn CharDriver>,
     state: AtomicU8,
 }
 
@@ -164,9 +265,6 @@ pub struct CharDevice {
 
 struct NullCharDriver;
 struct ZeroCharDriver;
-
-static NULL_CHAR_DRIVER: NullCharDriver = NullCharDriver;
-static ZERO_CHAR_DRIVER: ZeroCharDriver = ZeroCharDriver;
 
 impl CharDriver for NullCharDriver {
     fn write(&self, buf: &[u8]) -> Result<usize, CharIoError> {
@@ -192,6 +290,10 @@ impl CharDriver for ZeroCharDriver {
         Ok(buf.len())
     }
 
+    fn poll_read(&self) -> bool {
+        true
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -199,37 +301,43 @@ impl CharDriver for ZeroCharDriver {
 
 impl CharDevice {
     #[inline]
-    pub fn new(
-        kind: CharDeviceKind,
-        fw_name: &'static str,
-        driver: &'static dyn CharDriver,
-    ) -> Self {
+    pub fn new<N, D>(fw_name: N, driver: D) -> Self
+    where
+        N: Into<Box<str>>,
+        D: IntoCharDriverArc,
+    {
         Self {
             inner: Arc::new(CharDeviceInner {
-                kind,
-                fw_name,
-                driver,
+                fw_name: fw_name.into(),
+                driver: driver.into_char_driver_arc(),
                 state: AtomicU8::new(CharDeviceState::Active as u8),
             }),
         }
     }
 
     pub fn null() -> Self {
-        Self::new(CharDeviceKind::Null, "null", &NULL_CHAR_DRIVER)
+        Self::new("null", Arc::new(NullCharDriver))
     }
 
     pub fn zero() -> Self {
-        Self::new(CharDeviceKind::Zero, "zero", &ZERO_CHAR_DRIVER)
+        Self::new("zero", Arc::new(ZeroCharDriver))
+    }
+
+    /// 是否具备 TTY 语义（终端）。委托至底层驱动。
+    #[inline]
+    pub fn is_tty(&self) -> bool {
+        self.inner.driver.is_tty()
+    }
+
+    /// 是否可作为内核控制台输出。委托至底层驱动。
+    #[inline]
+    pub fn is_console(&self) -> bool {
+        self.inner.driver.is_console()
     }
 
     #[inline]
-    pub fn kind(&self) -> CharDeviceKind {
-        self.inner.kind
-    }
-
-    #[inline]
-    pub fn fw_name(&self) -> &'static str {
-        self.inner.fw_name
+    pub fn fw_name(&self) -> &str {
+        self.inner.fw_name.as_ref()
     }
 
     #[inline]
@@ -270,6 +378,35 @@ impl CharDevice {
         self.inner.driver.read(buf)
     }
 
+    /// 查询底层设备当前是否有可读字节（委托至驱动）。
+    #[inline]
+    pub fn poll_read(&self) -> bool {
+        self.is_active() && self.inner.driver.poll_read()
+    }
+
+    /// 将任务挂到字符设备自己的 I/O 等待源上。
+    #[inline]
+    pub fn poll_add_waiter(
+        &self,
+        task: &Arc<sched::Task>,
+        want_read: bool,
+        want_write: bool,
+    ) -> bool {
+        self.is_active()
+            && self
+                .inner
+                .driver
+                .poll_add_waiter(task, want_read, want_write)
+    }
+
+    /// 从字符设备自己的 I/O 等待源移除任务。
+    #[inline]
+    pub fn poll_remove_waiter(&self, task: &Arc<sched::Task>) {
+        if self.is_active() {
+            self.inner.driver.poll_remove_waiter(task);
+        }
+    }
+
     /// 阻塞排空（委托至驱动）。
     #[inline]
     pub fn flush(&self) -> Result<(), CharIoError> {
@@ -296,15 +433,24 @@ impl CharDevice {
         }
     }
 
+    /// 执行字符设备类 typed control。
+    #[inline]
+    pub fn control(&self, req: CharControlRequest) -> Result<CharControlResponse, ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+        self.inner.driver.control(req)
+    }
+
     /// 尝试将驱动向下转型为具体类型 `T`。
     ///
     /// 成功时返回 `Some(&T)`，类型不匹配时返回 `None`。
-    /// 这是从通用 `CharDev` 恢复 [`DriverControl`] 能力的安全路径。
+    /// 通用 ioctl/VFS 路径不应使用此方法做设备类型分派；它们应调用
+    /// [`CharDevice::control`]。本方法仅保留给少数确实需要具体驱动类型的
+    /// 内核内部路径。
     ///
     /// ```rust,ignore
-    /// if let Some(uart) = dev.downcast_driver::<Uart16550>() {
-    ///     uart.control(UartRequest::SetBaudRate { clock_hz: 100_000_000, baud: 9600 })?;
-    /// }
+    /// assert!(dev.downcast_driver::<MyDebugDriver>().is_none());
     /// ```
     #[inline]
     pub fn downcast_driver<T: 'static>(&self) -> Option<&T> {
@@ -318,180 +464,8 @@ impl CharDevice {
 impl core::fmt::Debug for CharDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CharDev")
-            .field("kind", &self.kind())
             .field("fw_name", &self.fw_name())
             .field("state", &self.state())
             .finish()
-    }
-}
-
-// ─────────────────────────── 全局动态设备列表 ─────────────────────────────
-
-/// 字符设备注册表操作错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CharDeviceListError {
-    /// 已存在同名设备。
-    NameExists,
-    /// 设备已经下线。
-    DeviceGone,
-    /// 动态扩容失败。
-    OutOfMemory,
-}
-
-/// 动态字符设备列表（多核并发安全）。
-///
-/// 内部使用 `spin::mutex::Mutex` 保护 `Vec<CharDev>`，不再有固定注册数量上限。
-/// 此注册表面向堆可用后的设备枚举/注册路径；该锁不是 IRQ-safe，且 `push` /
-/// `list` 可能分配内存，因此不要在中断上下文调用这些注册表方法。
-pub struct CharDeviceList {
-    devices: Mutex<Vec<CharDevice>>,
-}
-
-impl CharDeviceList {
-    pub const fn new() -> Self {
-        Self {
-            devices: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// 注册一个字符设备。
-    ///
-    /// 同名设备已存在时返回 `Err(CharDevListError::NameExists)`。
-    /// 设备已下线时返回 `Err(CharDevListError::DeviceGone)`。
-    /// 内存不足时返回 `Err(CharDevListError::OutOfMemory)`。
-    pub fn push(&self, dev: CharDevice) -> Result<(), CharDeviceListError> {
-        if !dev.is_active() {
-            return Err(CharDeviceListError::DeviceGone);
-        }
-
-        {
-            let mut list = self.devices.lock();
-            list.retain(|existing| existing.is_active());
-            if !dev.is_active() {
-                return Err(CharDeviceListError::DeviceGone);
-            }
-            if list
-                .iter()
-                .any(|existing| existing.fw_name() == dev.fw_name() && existing.is_active())
-            {
-                return Err(CharDeviceListError::NameExists);
-            }
-            if list.len() < list.capacity() {
-                list.push(dev);
-                return Ok(());
-            }
-        }
-
-        loop {
-            let initial_len = self.devices.lock().len();
-            let needed = initial_len
-                .checked_add(1)
-                .ok_or(CharDeviceListError::OutOfMemory)?;
-            let mut replacement = Vec::new();
-            replacement
-                .try_reserve(needed)
-                .map_err(|_| CharDeviceListError::OutOfMemory)?;
-
-            let mut list = self.devices.lock();
-            list.retain(|existing| existing.is_active());
-            if !dev.is_active() {
-                return Err(CharDeviceListError::DeviceGone);
-            }
-            if list
-                .iter()
-                .any(|existing| existing.fw_name() == dev.fw_name() && existing.is_active())
-            {
-                return Err(CharDeviceListError::NameExists);
-            }
-            if list.len() < list.capacity() {
-                list.push(dev);
-                return Ok(());
-            }
-
-            let needed = list
-                .len()
-                .checked_add(1)
-                .ok_or(CharDeviceListError::OutOfMemory)?;
-            if needed > replacement.capacity() {
-                continue;
-            }
-
-            replacement.extend(list.iter().cloned());
-            replacement.push(dev);
-            let old = core::mem::replace(&mut *list, replacement);
-            drop(list);
-            drop(old);
-            return Ok(());
-        }
-    }
-
-    /// 根据固件名称查找字符设备。
-    pub fn lookup(&self, fw_name: &str) -> Option<CharDevice> {
-        self.devices
-            .lock()
-            .iter()
-            .find(|dev| dev.fw_name() == fw_name && dev.is_active())
-            .cloned()
-    }
-
-    /// 移除指定固件名称的字符设备，成功时返回被移除的设备条目。
-    pub fn remove(&self, fw_name: &str) -> Option<CharDevice> {
-        let mut list = self.devices.lock();
-        let pos = list.iter().position(|dev| dev.fw_name() == fw_name)?;
-        let dev = list.swap_remove(pos);
-        dev.mark_gone();
-        Some(dev)
-    }
-
-    /// 已注册的设备数量。
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.devices
-            .lock()
-            .iter()
-            .filter(|dev| dev.is_active())
-            .count()
-    }
-
-    /// 列表是否为空。
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// 获取当前字符设备列表快照。
-    pub fn list(&self) -> Result<Vec<CharDevice>, CharDeviceListError> {
-        loop {
-            let len = self.devices.lock().len();
-            let mut snapshot = Vec::new();
-            snapshot
-                .try_reserve(len)
-                .map_err(|_| CharDeviceListError::OutOfMemory)?;
-
-            let list = self.devices.lock();
-            if list.len() <= snapshot.capacity() {
-                snapshot.extend(list.iter().filter(|dev| dev.is_active()).cloned());
-                return Ok(snapshot);
-            }
-        }
-    }
-
-    /// 返回当前设备列表的快照迭代器。
-    ///
-    /// 迭代前先获取一次快照（内存分配在锁外进行），迭代期间**不持有注册表锁**，
-    /// 因此可以在迭代体内安全地调用 `push`/`lookup`/`remove` 等方法而不死锁。
-    /// 若快照分配失败，返回空迭代器。
-    ///
-    /// 需要强一致性视图（不希望迭代过程中看到并发注册的新设备）的调用方应使用
-    /// [`Self::list`]。
-    #[inline]
-    pub fn iter(&self) -> alloc::vec::IntoIter<CharDevice> {
-        self.list().unwrap_or_default().into_iter()
-    }
-}
-
-impl Default for CharDeviceList {
-    fn default() -> Self {
-        Self::new()
     }
 }

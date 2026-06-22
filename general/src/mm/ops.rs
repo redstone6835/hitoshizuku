@@ -30,6 +30,7 @@ pub struct UserVmLayoutOps {
     pub default_stack_size: usize,
     pub main_pie_base: usize,
     pub interp_base: usize,
+    pub vdso_base: usize,
 }
 
 unsafe impl Sync for UserVmLayoutOps {}
@@ -73,6 +74,10 @@ pub fn register_user_vm_layout(ops: &'static UserVmLayoutOps) {
     assert!(
         ops.main_pie_base % ops.page_size == 0 && ops.interp_base % ops.page_size == 0,
         "[mm] ELF load bases must be page aligned"
+    );
+    assert!(
+        ops.vdso_base % ops.page_size == 0 && ops.vdso_base != 0,
+        "[mm] vDSO base must be page aligned and non-zero"
     );
     USER_VM_LAYOUT_OPS.store(ops as *const _ as *mut _, Ordering::Release);
 }

@@ -20,12 +20,14 @@ use vfs::error::{VfsError, VfsResult};
 use vfs::file::{FileOps, OpenOptions};
 use vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use vfs::stat::{DevId, FileMode, FileType, Timespec};
-use vfs::sync::Spinlock;
+use vfs::sync::{Spinlock, SpinlockGuard};
 
 use crate::inode_wr::{RawInode, read_raw, write_raw};
 use crate::layout::*;
 use crate::state::{BlockBackendError, FsState, map_err};
 use crate::{alloc_mod, dir_wr, extent_wr, map_wr};
+
+const I_BLOCK_BYTES: usize = 60;
 
 /// on-disk inode 摘要(由 [`load_inode`] 返回)。
 #[derive(Debug, Clone)]
@@ -36,6 +38,9 @@ pub(crate) struct InodeMetaDisk {
     pub gid: u32,
     pub size: u64,
     pub nlink: u16,
+    pub atime: Timespec,
+    pub mtime: Timespec,
+    pub ctime: Timespec,
     pub flags: u32,
     pub blocks_512: u64,
     pub file_acl_hi: u32,
@@ -58,6 +63,9 @@ fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
     let mode = u16::from_le_bytes([raw[0], raw[1]]);
     let uid_lo = u16::from_le_bytes([raw[2], raw[3]]) as u32;
     let size_lo = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);
+    let atime_sec = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as i64;
+    let ctime_sec = u32::from_le_bytes([raw[12], raw[13], raw[14], raw[15]]) as i64;
+    let mtime_sec = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as i64;
     let gid_lo = u16::from_le_bytes([raw[24], raw[25]]) as u32;
     let nlink = u16::from_le_bytes([raw[26], raw[27]]);
     let blocks_lo = u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]);
@@ -72,6 +80,18 @@ fn parse_inode_meta(raw: &[u8]) -> InodeMetaDisk {
         gid: (gid_hi << 16) | gid_lo,
         size: ((size_hi as u64) << 32) | size_lo as u64,
         nlink,
+        atime: Timespec {
+            secs: atime_sec,
+            nsecs: 0,
+        },
+        mtime: Timespec {
+            secs: mtime_sec,
+            nsecs: 0,
+        },
+        ctime: Timespec {
+            secs: ctime_sec,
+            nsecs: 0,
+        },
         flags,
         blocks_512: blocks_lo as u64,
         file_acl_hi,
@@ -89,7 +109,29 @@ pub(crate) fn load_inode(
 
 #[inline]
 pub(crate) fn i_block_slice(raw: &[u8]) -> &[u8] {
-    &raw[0x28..0x28 + 60]
+    &raw[0x28..0x28 + I_BLOCK_BYTES]
+}
+
+/// 复制 inode 的 `i_block[0..60]` 到栈上固定数组,避免元数据热路径反复分配小 `Vec`。
+#[inline]
+fn copy_i_block(i_block: &[u8]) -> [u8; I_BLOCK_BYTES] {
+    let mut out = [0u8; I_BLOCK_BYTES];
+    out.copy_from_slice(i_block);
+    out
+}
+
+/// 获取 inode 原始状态锁；等待时让出 CPU，避免单核上纯自旋饿死持锁 I/O 任务。
+pub(crate) fn lock_raw(raw: &Spinlock<RawInode>) -> SpinlockGuard<'_, RawInode> {
+    loop {
+        if let Some(guard) = raw.try_lock() {
+            return guard;
+        }
+        if sched::is_ready() {
+            sched::schedule_once(sched::now_ns_public());
+        } else {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// 当 `EXT4_INLINE_DATA_FL` 启用时,尝试读出内联数据。
@@ -162,7 +204,12 @@ pub struct ExtInodeOps {
     pub(crate) state: Arc<FsState>,
     pub(crate) ino: u32,
     /// 原始 inode 字节 + 运行时修改的 Spinlock。写路径先改这里再写回磁盘。
-    pub(crate) raw: Spinlock<RawInode>,
+    ///
+    /// 这里必须是 `Arc`：普通文件打开后会生成 `ExtRegFileOps`，该打开文件
+    /// 可能在 `unlink()` 后继续读写。VFS 会把 nlink=0 的 inode 从
+    /// superblock cache 中摘掉，因此打开文件不能再依赖 `sb.find_inode()` 找回
+    /// 状态，否则会破坏 Linux 的 unlink-but-open 语义。
+    pub(crate) raw: Arc<Spinlock<RawInode>>,
 }
 
 impl ExtInodeOps {
@@ -170,28 +217,28 @@ impl ExtInodeOps {
         Self {
             state,
             ino,
-            raw: Spinlock::new(RawInode::new(ino, bytes)),
+            raw: Arc::new(Spinlock::new(RawInode::new(ino, bytes))),
         }
     }
 
     fn snapshot_meta(&self) -> InodeMetaDisk {
-        let g = self.raw.lock();
+        let g = lock_raw(&self.raw);
         parse_inode_meta(&g.bytes)
     }
 
-    fn snapshot_i_block(&self) -> Vec<u8> {
-        let g = self.raw.lock();
-        i_block_slice(&g.bytes).to_vec()
+    fn snapshot_i_block(&self) -> [u8; I_BLOCK_BYTES] {
+        let g = lock_raw(&self.raw);
+        copy_i_block(i_block_slice(&g.bytes))
     }
 
     #[allow(dead_code)]
     fn snapshot_flags(&self) -> u32 {
-        self.raw.lock().flags()
+        lock_raw(&self.raw).flags()
     }
 
-    fn snapshot_all(&self) -> (u32, u64, Vec<u8>) {
-        let g = self.raw.lock();
-        (g.flags(), g.size(), i_block_slice(&g.bytes).to_vec())
+    fn snapshot_all(&self) -> (u32, u64, [u8; I_BLOCK_BYTES]) {
+        let g = lock_raw(&self.raw);
+        (g.flags(), g.size(), copy_i_block(i_block_slice(&g.bytes)))
     }
 
     fn check_writable(&self) -> VfsResult<()> {
@@ -222,9 +269,9 @@ fn build_inode_for(
         mode,
         uid: Uid(meta.uid),
         gid: Gid(meta.gid),
-        atime: Timespec::ZERO,
-        mtime: Timespec::ZERO,
-        ctime: Timespec::ZERO,
+        atime: meta.atime,
+        mtime: meta.mtime,
+        ctime: meta.ctime,
         blocks: meta.blocks_512,
     };
     let block_size = state.ext_sb.block_size;
@@ -279,11 +326,54 @@ fn create_disk_inode(
 }
 
 fn sync_vfs_meta(inode: &Inode, raw: &RawInode) {
-    inode.set_size(raw.size());
-    inode.set_nlink(raw.nlink() as u32);
-    // mode 改动不经 VFS 镜像(vfs::Inode 没暴露公开 setter),
-    // 下次 stat 读不到新 mode 直到 Inode 被重新创建 —— 只读 FS 不关心,
-    // R/W 场景里 chmod 的常见路径是 open + 用新 handle 再 stat。
+    let meta = parse_inode_meta(&raw.bytes);
+    inode.refresh_meta_from_fs(InodeMeta {
+        size: meta.size,
+        nlink: meta.nlink as u32,
+        mode: FileMode::new((meta.mode & 0o7777) as u16),
+        uid: Uid(meta.uid),
+        gid: Gid(meta.gid),
+        atime: meta.atime,
+        mtime: meta.mtime,
+        ctime: meta.ctime,
+        blocks: meta.blocks_512,
+    });
+}
+
+pub(crate) fn blocks_lo_from_mapping(
+    state: &FsState,
+    flags: u32,
+    i_block: &[u8],
+) -> Result<u32, BlockBackendError> {
+    let fs_blocks = if flags & EXT4_EXTENTS_FL != 0 {
+        extent_wr::count_tree_blocks(state, i_block)?
+    } else {
+        map_wr::count_all_blocks(state, i_block)?
+    };
+    let sectors_per_block = (state.ext_sb.block_size / 512) as u64;
+    let sectors = fs_blocks
+        .checked_mul(sectors_per_block)
+        .ok_or(BlockBackendError::OutOfRange)?;
+    if sectors > u32::MAX as u64 {
+        return Err(BlockBackendError::OutOfRange);
+    }
+    Ok(sectors as u32)
+}
+
+fn refresh_blocks_lo(state: &FsState, raw: &mut RawInode) -> Result<(), BlockBackendError> {
+    let blocks = blocks_lo_from_mapping(state, raw.flags(), raw.i_block())?;
+    raw.set_blocks_lo(blocks);
+    Ok(())
+}
+
+fn clear_deleted_inode(raw: &mut RawInode) {
+    // inode bitmap 清掉后,宿主 e2fsck 仍会扫描 inode 表。若保留 regular/dir 的
+    // i_mode,会被当成残留 orphan inode;清整 inode 只留下非零 dtime 表示已删除。
+    //
+    // dtime 不能写 1: e2fsck 会把过小的删除时间解释成损坏的 orphan 链痕迹。
+    // extfs 作为独立库无法直接访问内核 realtime,这里写一个稳定的合法 epoch 秒。
+    raw.bytes.fill(0);
+    raw.set_dtime(1_700_000_000);
 }
 
 impl InodeOps for ExtInodeOps {
@@ -323,11 +413,13 @@ impl InodeOps for ExtInodeOps {
             .map_err(map_err)?;
 
         // 在父目录插 entry
-        let mut parent = self.raw.lock();
-        let mut i_block = parent.i_block().to_vec();
+        let mut parent = lock_raw(&self.raw);
+        let mut i_block = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
+            self.ino,
+            parent.generation(),
             &mut i_block,
             &mut pflags,
             parent.size(),
@@ -339,6 +431,7 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&i_block);
         parent.set_flags(pflags);
         parent.set_size(new_size);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
@@ -369,12 +462,22 @@ impl InodeOps for ExtInodeOps {
 
         // 给新目录分配第一个块,写入 "." / ".."
         let block = alloc_mod::alloc_block(&self.state).map_err(map_err)?;
-        let init_blk = dir_wr::make_init_dir_block(
+        let has_dir_tail = self.state.ext_sb.metadata_csum
+            && self.state.ext_sb.feature_incompat & INCOMPAT_FILETYPE != 0;
+        let mut init_blk = dir_wr::make_init_dir_block(
             self.state.ext_sb.block_size,
             new_raw.ino,
             self.ino,
             self.state.ext_sb.feature_incompat & INCOMPAT_FILETYPE != 0,
+            has_dir_tail,
         );
+        dir_wr::finish_dir_block(
+            &self.state,
+            new_raw.ino,
+            new_raw.generation(),
+            &mut init_blk,
+        )
+        .map_err(map_err)?;
         self.state.write_block(block, &init_blk).map_err(map_err)?;
         // 把 block 指针写到 new_raw.i_block[0]
         new_raw.i_block_mut()[0..4].copy_from_slice(&(block as u32).to_le_bytes());
@@ -383,11 +486,13 @@ impl InodeOps for ExtInodeOps {
         write_raw(&self.state, &new_raw).map_err(map_err)?;
 
         // 父目录:插 entry + nlink++
-        let mut parent = self.raw.lock();
-        let mut pi_block = parent.i_block().to_vec();
+        let mut parent = lock_raw(&self.raw);
+        let mut pi_block = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
+            self.ino,
+            parent.generation(),
             &mut pi_block,
             &mut pflags,
             parent.size(),
@@ -401,6 +506,7 @@ impl InodeOps for ExtInodeOps {
         parent.set_size(new_size);
         let new_nl = parent.nlink() + 1;
         parent.set_nlink(new_nl);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
@@ -417,45 +523,41 @@ impl InodeOps for ExtInodeOps {
             return Err(VfsError::IsADirectory);
         }
         // 1) 从父目录移除 entry
-        let mut parent = self.raw.lock();
-        let pi_block = parent.i_block().to_vec();
+        let mut parent = lock_raw(&self.raw);
+        let pi_block = copy_i_block(parent.i_block());
         let pflags = parent.flags();
-        let ok = dir_wr::remove_entry(&self.state, &pi_block, pflags, parent.size(), name)
-            .map_err(map_err)?;
+        let ok = dir_wr::remove_entry(
+            &self.state,
+            self.ino,
+            parent.generation(),
+            &pi_block,
+            pflags,
+            parent.size(),
+            name,
+        )
+        .map_err(map_err)?;
         if !ok {
             return Err(VfsError::NotFound);
         }
         parent.i_block_mut().copy_from_slice(&pi_block);
         parent.set_flags(pflags);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
-        // 2) 目标 inode 的 nlink--,到 0 则释放数据
+        // 2) 目标 inode 的 nlink--。nlink 到 0 时只写回元数据，不在 unlink
+        // 现场释放块和 inode；真正回收由 VFS 在最后一个引用释放时调用 evict()。
+        // 这样打开但已 unlink 的文件仍可继续 I/O，符合 POSIX/Linux 语义。
         let t_ops = target
             .downcast_ops::<ExtInodeOps>()
             .ok_or(VfsError::InvalidArgument)?;
-        let mut traw = t_ops.raw.lock();
+        let mut traw = lock_raw(&t_ops.raw);
         let nl = traw.nlink().saturating_sub(1);
         traw.set_nlink(nl);
-        if nl == 0 {
-            let mut ib = traw.i_block().to_vec();
-            let mut flags = traw.flags();
-            extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
-            map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
-            traw.i_block_mut().copy_from_slice(&ib);
-            traw.set_flags(flags);
-            traw.set_size(0);
-            traw.set_blocks_lo(0);
-            write_raw(&self.state, &traw).map_err(map_err)?;
-            let ino_to_free = traw.ino;
-            drop(traw);
-            alloc_mod::free_inode(&self.state, ino_to_free, false).map_err(map_err)?;
-        } else {
-            write_raw(&self.state, &traw).map_err(map_err)?;
-            drop(traw);
-        }
-        sync_vfs_meta(&target, &t_ops.raw.lock());
+        write_raw(&self.state, &traw).map_err(map_err)?;
+        sync_vfs_meta(&target, &traw);
+        drop(traw);
         Ok(())
     }
 
@@ -471,45 +573,44 @@ impl InodeOps for ExtInodeOps {
             .downcast_ops::<ExtInodeOps>()
             .ok_or(VfsError::InvalidArgument)?;
         {
-            let traw = t_ops.raw.lock();
-            let tib = i_block_slice(&traw.bytes).to_vec();
-            let entries =
-                crate::dir::read_all_entries(&self.state, &tib, traw.flags(), traw.size())
-                    .map_err(map_err)?;
-            for e in &entries {
-                if e.name != "." && e.name != ".." {
-                    return Err(VfsError::DirectoryNotEmpty);
-                }
+            let traw = lock_raw(&t_ops.raw);
+            let tib = copy_i_block(i_block_slice(&traw.bytes));
+            if !crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
+                .map_err(map_err)?
+            {
+                return Err(VfsError::DirectoryNotEmpty);
             }
         }
         // 从父目录移除
-        let mut parent = self.raw.lock();
-        let pib = parent.i_block().to_vec();
+        let mut parent = lock_raw(&self.raw);
+        let pib = copy_i_block(parent.i_block());
         let pflags = parent.flags();
-        dir_wr::remove_entry(&self.state, &pib, pflags, parent.size(), name).map_err(map_err)?;
+        dir_wr::remove_entry(
+            &self.state,
+            self.ino,
+            parent.generation(),
+            &pib,
+            pflags,
+            parent.size(),
+            name,
+        )
+        .map_err(map_err)?;
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
         let pn = parent.nlink().saturating_sub(1);
         parent.set_nlink(pn);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
 
-        // 释放目标目录的所有数据块 + inode
-        let mut traw = t_ops.raw.lock();
-        let mut ib = traw.i_block().to_vec();
-        let mut flags = traw.flags();
-        extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
-        map_wr::free_all_blocks(&self.state, &mut ib).map_err(map_err)?;
-        traw.i_block_mut().copy_from_slice(&ib);
-        traw.set_flags(flags);
+        // 目标目录已从父目录摘除。这里只把目标目录 nlink 置 0 并写回；
+        // 数据块和 inode 位图必须等最后一个打开引用释放时由 evict() 回收。
+        let mut traw = lock_raw(&t_ops.raw);
         traw.set_nlink(0);
-        traw.set_size(0);
-        traw.set_blocks_lo(0);
         write_raw(&self.state, &traw).map_err(map_err)?;
-        let ino = traw.ino;
+        sync_vfs_meta(&target, &traw);
         drop(traw);
-        alloc_mod::free_inode(&self.state, ino, true).map_err(map_err)?;
         Ok(())
     }
 
@@ -555,11 +656,13 @@ impl InodeOps for ExtInodeOps {
         write_raw(&self.state, &new_raw).map_err(map_err)?;
 
         // 父目录插 entry
-        let mut parent = self.raw.lock();
-        let mut pib = parent.i_block().to_vec();
+        let mut parent = lock_raw(&self.raw);
+        let mut pib = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
+            self.ino,
+            parent.generation(),
             &mut pib,
             &mut pflags,
             parent.size(),
@@ -571,6 +674,7 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
         parent.set_size(new_size);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         drop(parent);
@@ -595,12 +699,12 @@ impl InodeOps for ExtInodeOps {
             .ok_or(VfsError::InvalidArgument)?;
         // nlink++
         {
-            let mut traw = t_ops.raw.lock();
+            let mut traw = lock_raw(&t_ops.raw);
             let new_nl = traw.nlink() + 1;
             traw.set_nlink(new_nl);
             write_raw(&self.state, &traw).map_err(map_err)?;
         }
-        sync_vfs_meta(target, &t_ops.raw.lock());
+        sync_vfs_meta(target, &lock_raw(&t_ops.raw));
 
         // 父目录插 entry
         let file_type_val = match target.kind() {
@@ -612,11 +716,13 @@ impl InodeOps for ExtInodeOps {
             FileType::Socket => DT_SOCK,
             FileType::Directory => unreachable!(),
         };
-        let mut parent = self.raw.lock();
-        let mut pib = parent.i_block().to_vec();
+        let mut parent = lock_raw(&self.raw);
+        let mut pib = copy_i_block(parent.i_block());
         let mut pflags = parent.flags();
         let new_size = dir_wr::insert_entry(
             &self.state,
+            self.ino,
+            parent.generation(),
             &mut pib,
             &mut pflags,
             parent.size(),
@@ -628,6 +734,7 @@ impl InodeOps for ExtInodeOps {
         parent.i_block_mut().copy_from_slice(&pib);
         parent.set_flags(pflags);
         parent.set_size(new_size);
+        refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
         write_raw(&self.state, &parent).map_err(map_err)?;
         sync_vfs_meta(inode, &parent);
         Ok(())
@@ -663,16 +770,13 @@ impl InodeOps for ExtInodeOps {
                 let eops = existing
                     .downcast_ops::<ExtInodeOps>()
                     .ok_or(VfsError::InvalidArgument)?;
-                let traw = eops.raw.lock();
-                let tib = i_block_slice(&traw.bytes).to_vec();
-                let entries =
-                    crate::dir::read_all_entries(&self.state, &tib, traw.flags(), traw.size())
-                        .map_err(map_err)?;
+                let traw = lock_raw(&eops.raw);
+                let tib = copy_i_block(i_block_slice(&traw.bytes));
+                let empty = crate::dir::is_dir_empty(&self.state, &tib, traw.flags(), traw.size())
+                    .map_err(map_err)?;
                 drop(traw);
-                for e in &entries {
-                    if e.name != "." && e.name != ".." {
-                        return Err(VfsError::DirectoryNotEmpty);
-                    }
+                if !empty {
+                    return Err(VfsError::DirectoryNotEmpty);
                 }
                 if !target_is_dir {
                     // 源不是目录、目标是目录:禁止
@@ -698,11 +802,13 @@ impl InodeOps for ExtInodeOps {
             FileType::Socket => DT_SOCK,
         };
         if cross_dir {
-            let mut ndir = new_dir_ops.raw.lock();
-            let mut ib = ndir.i_block().to_vec();
+            let mut ndir = lock_raw(&new_dir_ops.raw);
+            let mut ib = copy_i_block(ndir.i_block());
             let mut flags = ndir.flags();
             let new_size = dir_wr::insert_entry(
                 &self.state,
+                new_dir_ops.ino,
+                ndir.generation(),
                 &mut ib,
                 &mut flags,
                 ndir.size(),
@@ -719,20 +825,31 @@ impl InodeOps for ExtInodeOps {
                 let nl = ndir.nlink() + 1;
                 ndir.set_nlink(nl);
             }
+            refresh_blocks_lo(&self.state, &mut ndir).map_err(map_err)?;
             write_raw(&self.state, &ndir).map_err(map_err)?;
             sync_vfs_meta(new_dir, &ndir);
         }
         // 从源目录移除 old_name 条目;跨目录时顺手减 nlink
         {
-            let mut parent = self.raw.lock();
-            let mut ib = parent.i_block().to_vec();
+            let mut parent = lock_raw(&self.raw);
+            let mut ib = copy_i_block(parent.i_block());
             let mut flags = parent.flags();
-            dir_wr::remove_entry(&self.state, &ib, flags, parent.size(), old_name)
-                .map_err(map_err)?;
+            dir_wr::remove_entry(
+                &self.state,
+                self.ino,
+                parent.generation(),
+                &ib,
+                flags,
+                parent.size(),
+                old_name,
+            )
+            .map_err(map_err)?;
             // 同目录 rename:就地改名,需要新增 new_name 条目(上面跨目录分支已插过)
             if !cross_dir {
                 let new_size = dir_wr::insert_entry(
                     &self.state,
+                    self.ino,
+                    parent.generation(),
                     &mut ib,
                     &mut flags,
                     parent.size(),
@@ -749,6 +866,7 @@ impl InodeOps for ExtInodeOps {
             }
             parent.i_block_mut().copy_from_slice(&ib);
             parent.set_flags(flags);
+            refresh_blocks_lo(&self.state, &mut parent).map_err(map_err)?;
             write_raw(&self.state, &parent).map_err(map_err)?;
             sync_vfs_meta(inode, &parent);
         }
@@ -759,10 +877,15 @@ impl InodeOps for ExtInodeOps {
                 .downcast_ops::<ExtInodeOps>()
                 .ok_or(VfsError::InvalidArgument)?;
             let tib = {
-                let g = tops.raw.lock();
-                (i_block_slice(&g.bytes).to_vec(), g.flags())
+                let g = lock_raw(&tops.raw);
+                (
+                    copy_i_block(i_block_slice(&g.bytes)),
+                    g.flags(),
+                    g.generation(),
+                )
             };
-            dir_wr::update_dotdot(&self.state, &tib.0, tib.1, new_dir_ops.ino).map_err(map_err)?;
+            dir_wr::update_dotdot(&self.state, tops.ino, tib.2, &tib.0, tib.1, new_dir_ops.ino)
+                .map_err(map_err)?;
         }
         Ok(())
     }
@@ -773,14 +896,14 @@ impl InodeOps for ExtInodeOps {
         if file_type_from_mode(meta.mode) != FileType::Regular {
             return Err(VfsError::InvalidArgument);
         }
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         let cur_size = raw.size();
         if new_size == cur_size {
             return Ok(());
         }
         let block_size = self.state.ext_sb.block_size as u64;
         if new_size < cur_size {
-            let mut ib = raw.i_block().to_vec();
+            let mut ib = copy_i_block(raw.i_block());
             let mut flags = raw.flags();
             // extent 文件先降级成间接布局再做精确释放
             extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).map_err(map_err)?;
@@ -808,8 +931,9 @@ impl InodeOps for ExtInodeOps {
                         self.state.write_block(phys, &blk).map_err(map_err)?;
                     }
                 }
-                let blocks512 = (new_size + 511) / 512;
-                raw.set_blocks_lo(blocks512 as u32);
+                raw.i_block_mut().copy_from_slice(&ib);
+                raw.set_flags(flags);
+                refresh_blocks_lo(&self.state, &mut raw).map_err(map_err)?;
             }
             raw.i_block_mut().copy_from_slice(&ib);
             raw.set_flags(flags);
@@ -821,9 +945,28 @@ impl InodeOps for ExtInodeOps {
         Ok(())
     }
 
+    fn utimes(
+        &self,
+        inode: &Inode,
+        atime: Option<Timespec>,
+        mtime: Option<Timespec>,
+    ) -> VfsResult<()> {
+        self.check_writable()?;
+        let mut raw = lock_raw(&self.raw);
+        if let Some(ts) = atime {
+            raw.set_atime_sec(ts.secs);
+        }
+        if let Some(ts) = mtime {
+            raw.set_mtime_sec(ts.secs);
+        }
+        write_raw(&self.state, &raw).map_err(map_err)?;
+        sync_vfs_meta(inode, &raw);
+        Ok(())
+    }
+
     fn chmod(&self, inode: &Inode, mode: FileMode) -> VfsResult<()> {
         self.check_writable()?;
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         let cur = raw.mode();
         raw.set_mode((cur & S_IFMT) | (mode.bits() & 0o7777));
         write_raw(&self.state, &raw).map_err(map_err)?;
@@ -833,7 +976,7 @@ impl InodeOps for ExtInodeOps {
 
     fn chown(&self, inode: &Inode, uid: Option<Uid>, gid: Option<Gid>) -> VfsResult<()> {
         self.check_writable()?;
-        let mut raw = self.raw.lock();
+        let mut raw = lock_raw(&self.raw);
         if let Some(u) = uid {
             raw.set_uid(u.0);
         }
@@ -866,33 +1009,58 @@ impl InodeOps for ExtInodeOps {
         let meta = self.snapshot_meta();
         let kind = file_type_from_mode(meta.mode);
         match kind {
-            FileType::Directory => {
-                let entries =
-                    crate::dir::read_all_entries(&self.state, &i_block_owned, flags, size)
-                        .map_err(map_err)?;
-                Ok(Box::new(crate::file::ExtDirFileOps::new_with_state(
-                    entries,
-                    &self.state,
-                )))
-            }
+            FileType::Directory => Ok(Box::new(crate::file::ExtDirFileOps::new_with_state(
+                &self.state,
+                &i_block_owned,
+                flags,
+                size,
+            )?)),
             FileType::Regular => {
                 let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
                 Ok(Box::new(crate::file::ExtRegFileOps::new(
                     Arc::clone(&self.state),
                     sb,
                     self.ino,
+                    Arc::clone(&self.raw),
                 )))
             }
             FileType::Symlink => Ok(Box::new(crate::file::ExtRegFileOps::new_empty(
                 Arc::clone(&self.state),
                 inode.superblock().ok_or(VfsError::InvalidArgument)?,
                 self.ino,
+                Arc::clone(&self.raw),
             ))),
             _ => Err(VfsError::NotSupported),
         }
     }
 
-    fn evict(&self, _i: &Inode) {}
+    fn evict(&self, inode: &Inode) {
+        if self.state.is_read_only() {
+            return;
+        }
+
+        let is_dir = inode.kind() == FileType::Directory;
+        let mut raw = lock_raw(&self.raw);
+        if raw.nlink() != 0 || raw.mode() == 0 {
+            return;
+        }
+
+        let ino = raw.ino;
+        let mut ib = copy_i_block(raw.i_block());
+        let mut flags = raw.flags();
+        if extent_wr::demote_if_extent(&self.state, &mut flags, &mut ib).is_err() {
+            return;
+        }
+        if map_wr::free_all_blocks(&self.state, &mut ib).is_err() {
+            return;
+        }
+        clear_deleted_inode(&mut raw);
+        if write_raw(&self.state, &raw).is_err() {
+            return;
+        }
+        drop(raw);
+        let _ = alloc_mod::free_inode(&self.state, ino, is_dir);
+    }
     fn sync_metadata(&self, _i: &Inode) -> VfsResult<()> {
         Ok(())
     }

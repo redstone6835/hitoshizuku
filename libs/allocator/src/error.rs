@@ -22,13 +22,15 @@
 //!   └── VmemError                   (虚拟地址区间管理层)
 //!         └── AddressSpaceError      (地址空间协调层)
 //!               ├── AllocationError  (通用分配层)
-//!               └── DeallocationError(释放路径)
+//!               ├── DeallocationError(普通释放路径)
+//!               └── PhysicalFreeError(显式物理页释放路径)
 //! InitError                          (初始化阶段)
 //! RegistryError                      (分配记录注册表)
 //! OwnershipError                     (所有权查询)
 //! ManagedHandleError                 (受管句柄操作)
 //! ```
 use crate::buddy::{BuddyAllocError, BuddyFreeError};
+use crate::request::{AllocationKind, AllocationRequestError};
 
 /// 分配器初始化阶段错误。
 ///
@@ -217,6 +219,36 @@ pub enum DeallocationError {
     ObjectStillReferenced,
 }
 
+/// 显式物理页释放错误。
+///
+/// `free_physical()` 的历史签名只能返回布尔值，外部 DMA、页表和未来 LKM 风格扩展无法
+/// 判断失败到底来自所有权账本、参数不匹配还是 buddy 层拒绝释放。新的
+/// `try_free_physical()` 使用这个类型返回结构化原因；旧布尔接口保留为兼容包装。
+///
+/// # 变体说明
+///
+/// | 变体 | 含义 |
+/// |------|------|
+/// | `UnknownPointer` | active 后 registry 中不存在该物理页记录 |
+/// | `Registry(RegistryError)` | registry 尚未初始化或发生其它账本错误 |
+/// | `InvalidRecordKind` | 该地址存在记录，但记录不是 `AllocationKind::Physical` |
+/// | `AddressMismatch` | 记录中的物理地址与调用方传入值不一致 |
+/// | `OrderMismatch` | 记录中的 buddy order 与调用方传入值不一致 |
+/// | `PageSizeMismatch` | 记录中的页粒度与调用方传入值不一致 |
+/// | `SizeMismatch` | 记录中的保留大小与调用方传入值不一致 |
+/// | `Buddy(BuddyFreeError)` | registry 校验通过，但 buddy 层拒绝实际释放 |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhysicalFreeError {
+    UnknownPointer,
+    Registry(RegistryError),
+    InvalidRecordKind { actual: AllocationKind },
+    AddressMismatch { expected: usize, actual: usize },
+    OrderMismatch { expected: usize, actual: usize },
+    PageSizeMismatch { expected: usize, actual: usize },
+    SizeMismatch { expected: usize, actual: usize },
+    Buddy(BuddyFreeError),
+}
+
 /// 所有权查询错误。
 ///
 /// 当调用者想知道"这个指针是谁分配的"时，如果指针不属于任何已知分配器，则返回
@@ -306,7 +338,7 @@ impl From<AddressSpaceError> for DeallocationError {
 ///
 /// - `NotInitialized` → `AllocationError::NotInitialized`
 /// - 无效的 order 或地址 → `AllocationError::InvalidLayout`
-/// - 块越界、块不空闲、碎片化 → `AllocationError::OutOfMemory`
+/// - 块越界、块不空闲、碎片化、元数据不足 → `AllocationError::OutOfMemory`
 impl From<BuddyAllocError> for AllocationError {
     fn from(err: BuddyAllocError) -> Self {
         match err {
@@ -316,7 +348,21 @@ impl From<BuddyAllocError> for AllocationError {
             }
             BuddyAllocError::BlockOutOfRange
             | BuddyAllocError::BlockNotFree
-            | BuddyAllocError::Fragmented => AllocationError::OutOfMemory,
+            | BuddyAllocError::Fragmented
+            | BuddyAllocError::MetadataOutOfMemory => AllocationError::OutOfMemory,
+        }
+    }
+}
+
+/// 将请求规范化错误转换为通用分配错误。
+impl From<AllocationRequestError> for AllocationError {
+    fn from(err: AllocationRequestError) -> Self {
+        match err {
+            AllocationRequestError::InvalidSize
+            | AllocationRequestError::InvalidAlignment
+            | AllocationRequestError::SizeOverflow
+            | AllocationRequestError::UnsupportedOrder
+            | AllocationRequestError::InvalidPlacement => AllocationError::InvalidLayout,
         }
     }
 }

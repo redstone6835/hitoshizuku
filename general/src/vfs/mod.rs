@@ -1,24 +1,37 @@
 pub mod blockfs;
+pub mod device_files;
 pub mod devtmpfs;
+pub mod mount_source;
+pub mod pidfd;
 pub mod procfs;
 pub mod sysfs;
 pub mod tmpfs;
+pub mod user_api;
 
 use alloc::string::String;
 
 pub use ::vfs::*;
-pub use blockfs::register_block_filesystems;
+pub use blockfs::{
+    BlockFsDriver, BlockFsProbe, mount_block_device_auto, mount_block_source_auto,
+    register_block_filesystems, register_block_fs_driver,
+};
 pub use devtmpfs::DevTmpfsDriver;
+pub use mount_source::{MountSource, resolve_block_mount_source};
 pub use procfs::ProcFsDriver;
 pub use sysfs::SysFsDriver;
 pub use tmpfs::TmpfsDriver;
+pub use user_api::shm::mount_standard_shm_tmpfs;
 
 pub use ::vfs::cred::Credentials;
 pub use ::vfs::dentry::{Dentry, VfsRoot};
 pub use ::vfs::fdtable::FdTable;
 pub use ::vfs::limits::VfsLimits;
-pub use ::vfs::mount::{Mount, MountNamespace};
+pub use ::vfs::mount::{Mount, MountFlags, MountNamespace};
 pub use ::vfs::stat::FileMode;
+
+/// 设备目录的标准挂载路径。
+pub const DEV_DIR_PATH: &str = "/dev";
+const DEV_DIR_MODE: FileMode = FileMode::new(0o755);
 
 /// 取当前任务的 [`VfsContext`]（通过 sched 的 ext 侧表）。
 ///
@@ -118,4 +131,16 @@ pub fn build_boot_vfs_parts(
         FileMode::new(0),
         VfsLimits::default_arc(),
     )
+}
+
+/// 确保绝对路径上的目录存在。
+///
+/// 启动期多条固件路径都会准备标准挂载点；把逻辑放在 general 层可以避免
+/// ACPI/DTB 互相引用，也让"已存在即成功"的幂等语义保持一致。
+pub fn ensure_dir(ctx: &VfsContext, target: &str, mode: FileMode) -> error::VfsResult<()> {
+    match path::lookup(ctx, &path::Dirfd::Cwd, target, path::LookupFlags::DIRECTORY) {
+        Ok(_) => Ok(()),
+        Err(error::VfsError::NotFound) => operation::mkdirat(ctx, &path::Dirfd::Cwd, target, mode),
+        Err(err) => Err(err),
+    }
 }

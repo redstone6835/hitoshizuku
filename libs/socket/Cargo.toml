@@ -11,3 +11,5 @@ bench = false
 [dependencies]
 sched = { path = "../sched" }
 
+[dev-dependencies]
+ktest = { path = "../ktest" }

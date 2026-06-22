@@ -17,9 +17,11 @@ fn cred_with_caps(uid: u32, gid: u32, caps: CapSet) -> Credentials {
         uid: Uid(uid),
         euid: Uid(uid),
         suid: Uid(uid),
+        fsuid: Uid(uid),
         gid: Gid(gid),
         egid: Gid(gid),
         sgid: Gid(gid),
+        fsgid: Gid(gid),
         groups: vec![],
         caps,
     }
@@ -121,9 +123,11 @@ fn can_read_supplementary_group() {
         uid: Uid(2000),
         euid: Uid(2000),
         suid: Uid(2000),
+        fsuid: Uid(2000),
         gid: Gid(2000),
         egid: Gid(2000),
         sgid: Gid(2000),
+        fsgid: Gid(2000),
         groups: vec![Gid(3000)],
         caps: CapSet::EMPTY,
     };

@@ -9,14 +9,116 @@
 
 use crate::*;
 use core::sync::atomic::{Ordering, compiler_fence};
+use general::dev::irq::{IocsrOps, IrqLine, IrqLineOps};
 
 /// `CSR_CRMD` 中 IE（Interrupt Enable）位的掩码。
 const CSR_CRMD_IE_MASK: usize = 1usize << CSR_CRMD_IE_OFFSET;
+const LOONGARCH_HWI_COUNT: usize = 6;
+const LOONGARCH_HWI_LIE_BASE: usize = 2;
 
 /// 本地中断控制辅助实现（基于 `CSR_CRMD.IE`）。
 pub struct LoongArch64InterruptOps;
 /// 核间消息中断控制辅助实现（基于 `CSR_MSGIE / CSR_MSGIR`）。
 pub struct LoongArch64MessageInterruptOps;
+
+/// 安装设备 IRQ registry 使用的架构级 line 控制回调。
+///
+/// 当前只处理 LoongArch ESTAT/ECFG 中的 HWI0-5。timer/IPI 有独立时钟和消息中断
+/// 语义，级联控制器子线则由对应 controller driver 自己完成 demux/ack。
+pub fn install_loongarch_irq_line_ops() {
+    general::dev::irq::install_irq_line_ops(IrqLineOps {
+        enable: enable_irq_line,
+        disable: disable_irq_line,
+    });
+    general::dev::irq::install_iocsr_ops(IocsrOps {
+        read32: iocsr_read32,
+        write32: iocsr_write32,
+        read64: iocsr_read64,
+        write64: iocsr_write64,
+    });
+}
+
+fn enable_irq_line(line: IrqLine) -> bool {
+    set_irq_line_enabled(line, true)
+}
+
+fn disable_irq_line(line: IrqLine) -> bool {
+    set_irq_line_enabled(line, false)
+}
+
+fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
+    let IrqLine::Hardware(hwi) = line else {
+        return false;
+    };
+    if hwi >= LOONGARCH_HWI_COUNT {
+        return false;
+    }
+    let mask = 1usize << (LOONGARCH_HWI_LIE_BASE + hwi);
+    let val = if enabled { mask } else { 0 };
+    unsafe {
+        core::arch::asm!(
+            "csrxchg {val}, {mask}, {csr}",
+            val = inout(reg) val => _,
+            mask = in(reg) mask,
+            csr = const CSR_ECFG,
+            options(nostack, preserves_flags)
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    true
+}
+
+fn iocsr_read32(offset: usize) -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!(
+            "iocsrrd.w {value}, {offset}",
+            value = out(reg) value,
+            offset = in(reg) offset,
+            options(nostack, preserves_flags)
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    value
+}
+
+fn iocsr_write32(offset: usize, value: u32) {
+    unsafe {
+        core::arch::asm!(
+            "iocsrwr.w {value}, {offset}",
+            value = in(reg) value,
+            offset = in(reg) offset,
+            options(nostack, preserves_flags)
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+fn iocsr_read64(offset: usize) -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!(
+            "iocsrrd.d {value}, {offset}",
+            value = out(reg) value,
+            offset = in(reg) offset,
+            options(nostack, preserves_flags)
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    value
+}
+
+fn iocsr_write64(offset: usize, value: u64) {
+    unsafe {
+        core::arch::asm!(
+            "iocsrwr.d {value}, {offset}",
+            value = in(reg) value,
+            offset = in(reg) offset,
+            options(nostack, preserves_flags)
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+}
 
 impl LoongArch64InterruptOps {
     /// 保存中断状态。

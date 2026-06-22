@@ -8,6 +8,10 @@ test = false
 doctest = false
 bench = false
 
+[features]
+block-profile = []
+trace-syscall = []
+
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false }
 allocator = { path = "../libs/allocator" }
@@ -17,6 +21,8 @@ extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
+net = { path = "../libs/net" }
 sched = { path = "../libs/sched" }
+socket = { path = "../libs/socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 vfs = { path = "../libs/vfs" }

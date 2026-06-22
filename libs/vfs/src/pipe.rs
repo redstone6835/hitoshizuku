@@ -11,7 +11,7 @@ use sched::{Task, WaitQueue};
 use crate::vfs::cred::Credentials;
 use crate::vfs::dentry::Dentry;
 use crate::vfs::error::{VfsError, VfsResult};
-use crate::vfs::file::{DirEntry, File, FileOps, IoctlCmd, OpenOptions, PollEvents};
+use crate::vfs::file::{AccessMode, DirEntry, File, FileOps, IoctlCmd, OpenOptions, PollEvents};
 use crate::vfs::inode::{Inode, InodeId, InodeMeta, InodeOps};
 use crate::vfs::mount::{Mount, MountFlags};
 use crate::vfs::stat::{DevId, FileMode, FileType, FsId, Timespec};
@@ -36,13 +36,17 @@ pub struct Pipe {
 
 impl Pipe {
     fn new() -> Self {
+        Self::with_counts(1, 1)
+    }
+
+    fn with_counts(reader_count: u32, writer_count: u32) -> Self {
         Self {
             inner: Spinlock::new(PipeInner {
                 data: vec![0u8; PIPE_CAPACITY],
                 read_pos: 0,
                 write_pos: 0,
-                reader_count: 1,
-                writer_count: 1,
+                reader_count,
+                writer_count,
             }),
             read_wait: WaitQueue::new(),
             write_wait: WaitQueue::new(),
@@ -94,6 +98,36 @@ impl Pipe {
     }
 }
 
+/// 创建命名 FIFO 的共享 pipe 状态。
+pub fn new_fifo() -> Arc<Pipe> {
+    Arc::new(Pipe::with_counts(0, 0))
+}
+
+/// 打开命名 FIFO。
+///
+/// 这里不实现 Linux 的阻塞 open 配对等待，只维护同一个 FIFO inode 上所有
+/// 打开文件共享的数据通道和端点计数。LTP 中基于 FIFO fd 的 fcntl 用例主要
+/// 依赖 open 能成功，而不是阻塞语义。
+pub fn open_fifo(pipe: Arc<Pipe>, opts: &OpenOptions) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
+    {
+        let mut inner = pipe.inner.lock();
+        match opts.access {
+            AccessMode::ReadOnly => inner.reader_count = inner.reader_count.saturating_add(1),
+            AccessMode::WriteOnly => inner.writer_count = inner.writer_count.saturating_add(1),
+            AccessMode::ReadWrite => {
+                inner.reader_count = inner.reader_count.saturating_add(1);
+                inner.writer_count = inner.writer_count.saturating_add(1);
+            }
+        }
+    }
+
+    match opts.access {
+        AccessMode::ReadOnly => Ok(Box::new(PipeReadEnd::new(pipe, opts.nonblock))),
+        AccessMode::WriteOnly => Ok(Box::new(PipeWriteEnd::new(pipe, opts.nonblock))),
+        AccessMode::ReadWrite => Ok(Box::new(PipeReadWriteEnd::new(pipe, opts.nonblock))),
+    }
+}
+
 pub struct PipeReadEnd {
     pipe: Arc<Pipe>,
 }
@@ -111,12 +145,15 @@ impl FileOps for PipeReadEnd {
         if avail > 0 {
             let n = self.pipe.read_data(&mut inner, buf);
             drop(inner);
-            self.pipe.write_wait.wake_all();
+            // 正常读出数据只释放了部分缓冲空间，唤醒一个写者即可；
+            // 端点关闭等状态变化仍在 release() 中广播给全部等待者。
+            self.pipe.write_wait.wake_one_default();
             return Ok(n);
         }
         if inner.writer_count == 0 {
             return Ok(0);
         }
+
         Err(VfsError::WouldBlock)
     }
 
@@ -139,7 +176,8 @@ impl FileOps for PipeReadEnd {
     fn poll(&self, interest: PollEvents) -> PollEvents {
         let inner = self.pipe.inner.lock();
         let mut ready = PollEvents::default();
-        if self.pipe.available(&inner) > 0 {
+        let avail = self.pipe.available(&inner);
+        if avail > 0 {
             ready = ready.with(PollEvents::POLLIN);
         }
         if inner.writer_count == 0 {
@@ -195,6 +233,125 @@ impl PipeWriteEnd {
     }
 }
 
+pub struct PipeReadWriteEnd {
+    pipe: Arc<Pipe>,
+}
+
+impl PipeReadWriteEnd {
+    pub fn new(pipe: Arc<Pipe>, _nonblock: bool) -> Self {
+        Self { pipe }
+    }
+}
+
+impl FileOps for PipeReadWriteEnd {
+    fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        let mut inner = self.pipe.inner.lock();
+        let avail = self.pipe.available(&inner);
+        if avail > 0 {
+            let n = self.pipe.read_data(&mut inner, buf);
+            drop(inner);
+            self.pipe.write_wait.wake_one_default();
+            return Ok(n);
+        }
+        if inner.writer_count == 0 {
+            return Ok(0);
+        }
+
+        Err(VfsError::WouldBlock)
+    }
+
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        let mut inner = self.pipe.inner.lock();
+        if inner.reader_count == 0 {
+            return Err(VfsError::BrokenPipe);
+        }
+        let free = self.pipe.free_space(&inner);
+        if free > 0 {
+            let n = self.pipe.write_data(&mut inner, buf);
+            drop(inner);
+            self.pipe.read_wait.wake_one_default();
+            return Ok(n);
+        }
+        Err(VfsError::WouldBlock)
+    }
+
+    fn readdir(
+        &self,
+        _pos: u64,
+        _sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        let inner = self.pipe.inner.lock();
+        let mut ready = PollEvents::default();
+        if self.pipe.available(&inner) > 0 {
+            ready = ready.with(PollEvents::POLLIN);
+        }
+        if self.pipe.free_space(&inner) > 0 {
+            ready = ready.with(PollEvents::POLLOUT);
+        }
+        if inner.writer_count == 0 {
+            ready = ready.with(PollEvents::POLLHUP);
+        }
+        if inner.reader_count == 0 {
+            ready = ready.with(PollEvents::POLLERR);
+        }
+        ready.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
+    }
+
+    fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
+        if interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI) {
+            self.pipe.read_wait.enqueue(task);
+        }
+        if interest.has(PollEvents::POLLOUT) {
+            self.pipe.write_wait.enqueue(task);
+        }
+        if interest.has(PollEvents::POLLHUP) || interest.has(PollEvents::POLLERR) {
+            self.pipe.read_wait.enqueue(task);
+            self.pipe.write_wait.enqueue(task);
+        }
+        true
+    }
+
+    fn poll_remove_waiter(&self, task: &Arc<Task>) {
+        self.pipe.read_wait.remove(task);
+        self.pipe.write_wait.remove(task);
+    }
+
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn ioctl(&self, _cmd: IoctlCmd, _arg: usize) -> Result<usize, Errno> {
+        Err(Errno::ENOTTY)
+    }
+
+    fn release(&self) {
+        let mut inner = self.pipe.inner.lock();
+        inner.reader_count = inner.reader_count.saturating_sub(1);
+        inner.writer_count = inner.writer_count.saturating_sub(1);
+        let no_reader = inner.reader_count == 0;
+        let no_writer = inner.writer_count == 0;
+        drop(inner);
+        if no_reader {
+            self.pipe.write_wait.wake_all();
+        }
+        if no_writer {
+            self.pipe.read_wait.wake_all();
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl FileOps for PipeWriteEnd {
     fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         Err(VfsError::BadFileDescriptor)
@@ -209,7 +366,9 @@ impl FileOps for PipeWriteEnd {
         if free > 0 {
             let n = self.pipe.write_data(&mut inner, buf);
             drop(inner);
-            self.pipe.read_wait.wake_all();
+            // 写入后只需要一个读者消费新数据，避免 lmbench pipe 场景
+            // 中把所有等待任务同时推回 runqueue 造成惊群。
+            self.pipe.read_wait.wake_one_default();
             return Ok(n);
         }
         Err(VfsError::WouldBlock)

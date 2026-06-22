@@ -12,6 +12,7 @@ bench = false
 vfs = { path = "../vfs" }
 errno = { path = "../errno" }
 log = { path = "../log" }
+sched = { path = "../sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 [dev-dependencies]

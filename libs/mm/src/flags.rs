@@ -29,6 +29,8 @@ impl VmFlags {
     pub const GROWS_DOWN: u32 = 1 << 10;
     /// 匿名映射：无 file backing。对应 Linux `MAP_ANONYMOUS`。
     pub const ANON: u32 = 1 << 11;
+    /// 已被 mlock/munlockall 状态标记为常驻。当前无换出回收时仅作为策略位。
+    pub const LOCKED: u32 = 1 << 12;
 
     /// 从裸位构造。不做语义校验；校验留给 VmSpace 层。
     pub const fn from_bits(bits: u32) -> Self {
@@ -60,9 +62,9 @@ impl VmFlags {
         Self(self.0 & !flag)
     }
 
-    /// 是否包含所有给定位。与 [`has`] 等价，但语义更明显。
+    /// 是否包含所有给定位。空 mask 返回 false，避免把“未要求任何位”误判为匹配。
     pub const fn contains_all(self, flags: u32) -> bool {
-        (self.0 & flags) == flags
+        flags != 0 && (self.0 & flags) == flags
     }
 }
 

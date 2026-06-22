@@ -605,6 +605,7 @@ pub struct GcObjectEntry {
     pub reserve_size: usize,
     pub object_size: usize,
     pub object_align: usize,
+    pub trace_descriptor_ptr: usize,
     pub active: bool,
 }
 
@@ -617,7 +618,16 @@ impl GcObjectEntry {
             reserve_size: 0,
             object_size: 0,
             object_align: 0,
+            trace_descriptor_ptr: 0,
             active: false,
+        }
+    }
+
+    pub(crate) fn trace_descriptor(self) -> &'static TraceDescriptor {
+        if self.trace_descriptor_ptr == 0 {
+            &EXACT_NO_REFERENCES_DESCRIPTOR
+        } else {
+            unsafe { &*(self.trace_descriptor_ptr as *const TraceDescriptor) }
         }
     }
 
@@ -1245,6 +1255,7 @@ impl GarbageCollector {
         reserve_size: usize,
         object_size: usize,
         object_align: usize,
+        trace_descriptor_ptr: usize,
     ) -> bool {
         if !self.initialized
             || !self.is_in_heap(header_addr)
@@ -1279,6 +1290,7 @@ impl GarbageCollector {
             reserve_size,
             object_size,
             object_align,
+            trace_descriptor_ptr,
             active: true,
         };
         self.live_object_count += 1;
@@ -1504,7 +1516,7 @@ impl GarbageCollector {
                 return;
             };
             let entry = self.objects[idx];
-            let descriptor = header.trace_descriptor();
+            let descriptor = self.trace_descriptor_for_entry(entry);
             if !descriptor.is_exact() {
                 return;
             }
@@ -1573,8 +1585,7 @@ impl GarbageCollector {
     }
 
     pub(crate) fn trace_descriptor_for_entry(&self, entry: GcObjectEntry) -> TraceDescriptor {
-        let header = unsafe { *(entry.header_addr as *const GcObjectHeader) };
-        *header.trace_descriptor()
+        *entry.trace_descriptor()
     }
 
     // ---- 标记阶段 ----

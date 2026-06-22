@@ -150,6 +150,40 @@ pub fn install(info: PowerControlInfo, phys_to_virt: fn(usize) -> usize) {
     );
 }
 
+pub fn install_shutdown(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
+    install_one(Some(runtime_method(method, phys_to_virt)), None);
+}
+
+pub fn install_reboot(method: PowerControlMethod, phys_to_virt: fn(usize) -> usize) {
+    install_one(None, Some(runtime_method(method, phys_to_virt)));
+}
+
+fn install_one(
+    shutdown: Option<RuntimePowerControlMethod>,
+    reboot: Option<RuntimePowerControlMethod>,
+) {
+    let mut controls = if POWER_CONTROLS_VALID.load(Ordering::Acquire) {
+        unsafe { POWER_CONTROLS }
+    } else {
+        RuntimePowerControlInfo::default()
+    };
+    if let Some(method) = shutdown {
+        controls.shutdown = Some(method);
+    }
+    if let Some(method) = reboot {
+        controls.reboot = Some(method);
+    }
+    unsafe {
+        POWER_CONTROLS = controls;
+    }
+    POWER_CONTROLS_VALID.store(true, Ordering::Release);
+    printk!(
+        "[firmware][power] updated: shutdown={} reboot={}",
+        controls.shutdown.is_some() as usize,
+        controls.reboot.is_some() as usize
+    );
+}
+
 pub fn shutdown() -> Result<(), PowerError> {
     let controls = load_controls()?;
     let Some(method) = controls.shutdown else {

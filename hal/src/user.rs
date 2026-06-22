@@ -11,7 +11,9 @@ pub fn default_stack_top() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL user stack layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .default_stack_top
     }
 }
 
@@ -26,7 +28,9 @@ pub fn default_stack_size() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL user stack layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .default_stack_size
     }
 }
 
@@ -41,7 +45,9 @@ pub fn main_pie_base() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL user PIE layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .main_pie_base
     }
 }
 
@@ -56,7 +62,137 @@ pub fn interp_base() -> usize {
 
     #[cfg(target_arch = "riscv64")]
     {
-        todo!("riscv64 HAL interpreter layout is not implemented")
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .interp_base
+    }
+}
+
+/// vDSO 映射基地址。
+pub fn vdso_base() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .vdso_base
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        general::mm::user_vm_layout()
+            .expect("[hal] user VM layout is not registered")
+            .vdso_base
+    }
+}
+
+/// vDSO 数据页偏移。
+pub fn vdso_data_page_offset() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::VDSO_DATA_PAGE_OFFSET
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::VDSO_DATA_PAGE_OFFSET
+    }
+}
+
+/// vDSO 第一页长度（ELF header + text）。
+pub fn vdso_text_page_len() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::VDSO_TEXT_PAGE_SIZE
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::VDSO_TEXT_PAGE_SIZE
+    }
+}
+
+/// vDSO 总映射长度。
+pub fn vdso_total_size() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::VDSO_TOTAL_SIZE
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::VDSO_TOTAL_SIZE
+    }
+}
+
+/// 生成 vDSO ELF 镜像字节。
+pub fn vdso_image() -> alloc::vec::Vec<u8> {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::vdso_image()
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::vdso_image()
+    }
+}
+
+/// vDSO 中 sigreturn trampoline 的用户态虚拟地址。
+pub fn sigreturn_entry_va() -> usize {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        vdso_base() + arch::loongarch64::vdso::sigreturn_entry_offset()
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        vdso_base() + arch::riscv64::vdso::sigreturn_entry_offset()
+    }
+}
+
+/// 注册 LoongArch64 timer tick 时的 vDSO 数据页更新回调。
+pub fn register_vdso_tick_hook(hook: fn(u64)) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::register_timer_tick_hook(hook);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::register_timer_tick_hook(hook);
+    }
+}
+
+/// 注册 LoongArch64 timer tick 时的网络协议栈 poll 回调。
+///
+/// 在 vDSO 的 timer tick hook 旁路加一个**独立**的钩子（同样接受
+/// `now_ns: u64`）——避免把网络 poll 强塞到 vDSO hook 里引发循环依赖
+/// （vDSO 路径应保持精简）。调用方应当只注册一次。
+pub fn register_net_poll_hook(hook: fn(u64)) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::register_net_poll_hook(hook);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::register_net_poll_hook(hook);
+    }
+}
+
+/// 注册 timer tick 时的 TTY 输入泵回调。
+///
+/// 终端控制字符需要在没有用户 read 调用时也能触发信号；该 hook 供 kernel
+/// 把 VFS 兼容层的 TTY 行规程接入架构 timer 路径。
+pub fn register_tty_poll_hook(hook: fn(u64)) {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        arch::loongarch64::vdso::register_tty_poll_hook(hook);
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        arch::riscv64::vdso::register_tty_poll_hook(hook);
     }
 }
 
@@ -77,6 +213,8 @@ pub fn decode_clone_register_args(args: [usize; 6]) -> CloneRegisterArgs {
             flags: args[0] as u64,
             stack: args[1],
             parent_tid: args[2],
+            // musl LoongArch64 clone.s 调用内核的 old clone ABI：
+            // flags, stack, parent_tidptr, child_tidptr, tls。
             child_tid: args[3],
             tls: args[4],
         }
@@ -107,6 +245,19 @@ pub fn patch_interpreter_image(interp: &str, bytes: &mut [u8]) {
     }
 }
 
+/// 启用 SUM（Supervisor User Memory access），允许 S-mode 直接访问 U 标记的页面。
+///
+/// RISC-V 专用；LoongArch 上为空操作。
+pub unsafe fn enable_sum() {
+    #[cfg(target_arch = "loongarch64")]
+    {}
+
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        arch::riscv64::set_sum();
+    }
+}
+
 /// 构造当前架构的用户 trap frame，并切入用户态执行。
 ///
 /// # Safety
@@ -127,8 +278,7 @@ pub unsafe fn enter_user_mode(
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = (entry_pc, user_sp, arg0, kernel_stack_top);
-        todo!("riscv64 HAL user mode entry is not implemented")
+        unsafe { riscv64_enter_user_mode(entry_pc, user_sp, arg0, kernel_stack_top) }
     }
 }
 
@@ -150,6 +300,23 @@ unsafe fn loongarch64_enter_user_mode(
     // Safety: `frame` remains alive until `resume_to_trap_frame` switches to user mode
     // and never returns to this stack frame.
     unsafe { <arch::LoongArch64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
+}
+
+#[cfg(target_arch = "riscv64")]
+unsafe fn riscv64_enter_user_mode(
+    entry_pc: usize,
+    user_sp: usize,
+    arg0: usize,
+    kernel_stack_top: usize,
+) -> ! {
+    use general::{TaskOps, TrapFramePtr};
+
+    let mut frame = arch::TrapFrame::default();
+    let frame_ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
+    <arch::Riscv64TaskOps as TaskOps>::init_user_trap_frame(frame_ptr, entry_pc, user_sp, arg0);
+    frame.kstack_top = kernel_stack_top;
+
+    unsafe { <arch::Riscv64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
 }
 
 #[cfg(target_arch = "loongarch64")]

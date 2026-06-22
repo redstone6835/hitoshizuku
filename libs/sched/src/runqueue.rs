@@ -70,10 +70,28 @@ impl DeadlineKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct DeadlineThrottleKey {
+    replenish_ns: u64,
+    seq: u64,
+    addr: usize,
+}
+
+impl DeadlineThrottleKey {
+    fn of(task: &Arc<Task>, seq: u64) -> Self {
+        Self {
+            replenish_ns: task.sched.deadline_replenish_ns(),
+            seq,
+            addr: task_addr(task),
+        }
+    }
+}
+
 struct RqInner {
     fair_tree: BTreeMap<FairKey, Arc<Task>>,
     rt_tree: BTreeMap<RtKey, Arc<Task>>,
     deadline_tree: BTreeMap<DeadlineKey, Arc<Task>>,
+    deadline_throttled: BTreeMap<DeadlineThrottleKey, Arc<Task>>,
     idle_tree: BTreeMap<RtKey, Arc<Task>>,
     total_weight: u128,
     weighted_vruntime_sum: u128,
@@ -81,6 +99,7 @@ struct RqInner {
     current: Option<Arc<Task>>,
     last_update_ns: u64,
     enqueue_seq: u64,
+    preferred_fair_addr: Option<usize>,
 }
 
 /// 单 CPU 运行队列。每个 online CPU 持有一份。
@@ -95,6 +114,7 @@ impl Runqueue {
                 fair_tree: BTreeMap::new(),
                 rt_tree: BTreeMap::new(),
                 deadline_tree: BTreeMap::new(),
+                deadline_throttled: BTreeMap::new(),
                 idle_tree: BTreeMap::new(),
                 total_weight: 0,
                 weighted_vruntime_sum: 0,
@@ -102,6 +122,7 @@ impl Runqueue {
                 current: None,
                 last_update_ns: 0,
                 enqueue_seq: 0,
+                preferred_fair_addr: None,
             }),
         }
     }
@@ -120,8 +141,41 @@ impl Runqueue {
         inner.fair_tree.len()
             + inner.rt_tree.len()
             + inner.deadline_tree.len()
+            + inner.deadline_throttled.len()
             + inner.idle_tree.len()
             + usize::from(inner.current.is_some())
+    }
+
+    /// 可跨 CPU 迁移的就绪负载。
+    ///
+    /// idle 任务只属于本 CPU，deadline throttled 任务当前不可运行，current 任务
+    /// 不能被远端直接摘走；负载均衡只看能通过 [`take_migratable`] 拉走的队列。
+    pub fn migratable_load(&self) -> usize {
+        let inner = self.inner.lock();
+        inner.fair_tree.len() + inner.rt_tree.len() + inner.deadline_tree.len()
+    }
+
+    /// 对指定 CPU 许可位可迁移的就绪负载。
+    ///
+    /// 亲和性收窄后，任务可能短暂留在旧 CPU 的 rq 中；负载均衡只应选择
+    /// 确实能被目标 CPU 拉走的源队列。
+    pub fn migratable_load_for(&self, allowed_cpu_mask: u64) -> usize {
+        let inner = self.inner.lock();
+        inner
+            .fair_tree
+            .values()
+            .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+            .count()
+            + inner
+                .rt_tree
+                .values()
+                .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+                .count()
+            + inner
+                .deadline_tree
+                .values()
+                .filter(|task| task_allowed_on(task, allowed_cpu_mask))
+                .count()
     }
 
     pub fn set_current(&self, task: Arc<Task>) {
@@ -134,59 +188,120 @@ impl Runqueue {
     }
 
     pub fn enqueue(&self, task: Arc<Task>, now_ns: u64) {
+        self.enqueue_with_preference(task, now_ns, false);
+    }
+
+    pub fn enqueue_preferred(&self, task: Arc<Task>, now_ns: u64) {
+        self.enqueue_with_preference(task, now_ns, true);
+    }
+
+    fn enqueue_with_preference(&self, task: Arc<Task>, now_ns: u64, preferred: bool) {
         let mut inner = self.inner.lock();
+        if !task_can_enter_runqueue(&task) {
+            task.sched.set_on_rq(false);
+            log::warning!(
+                "[sched] reject non-executable task enqueue pid={:?} state={:?}",
+                task.pid_root(),
+                task.state(),
+            );
+            return;
+        }
         if task.sched.on_rq() {
             return;
         }
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
+        if preferred && task.sched.policy() == SchedPolicy::Fair {
+            // futex 唤醒是短等待热路径。只记录一次性候选，
+            // 真正 pick 时仍会复查状态、亲和性和 class，避免破坏长期公平性。
+            inner.preferred_fair_addr = Some(task_addr(&task));
+        }
         enqueue_queued_locked(&mut inner, task, now_ns);
     }
 
     pub fn dequeue(&self, task: &Arc<Task>, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
         dequeue_locked(&mut inner, task)
+    }
+
+    pub fn dequeue_queued(&self, task: &Arc<Task>, now_ns: u64) -> bool {
+        let mut inner = self.inner.lock();
+        let _ = update_curr_locked(&mut inner, now_ns);
+        remove_queued_any_locked(&mut inner, task).is_some()
+    }
+
+    pub fn is_current(&self, task: &Arc<Task>) -> bool {
+        self.inner
+            .lock()
+            .current
+            .as_ref()
+            .is_some_and(|curr| Arc::ptr_eq(curr, task))
     }
 
     pub fn tick(&self, now_ns: u64) -> bool {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let replenished = update_curr_locked(&mut inner, now_ns);
         let Some(curr) = inner.current.as_ref() else {
-            return false;
+            return replenished;
         };
-        match curr.sched.policy() {
-            SchedPolicy::Deadline => {
-                curr.sched.deadline_budget_ns() == 0 || now_ns > curr.sched.absolute_deadline_ns()
+        replenished
+            || match curr.sched.policy() {
+                SchedPolicy::Deadline => {
+                    curr.sched.deadline_budget_ns() == 0
+                        || now_ns > curr.sched.absolute_deadline_ns()
+                }
+                SchedPolicy::RtRoundRobin => {
+                    curr.sched.rr_remaining_ns() == 0
+                        && has_rt_peer_locked(&inner, curr.sched.rt_priority())
+                }
+                SchedPolicy::RtFifo => false,
+                SchedPolicy::Fair | SchedPolicy::Idle => {
+                    curr.sched.vruntime() >= curr.sched.deadline()
+                }
             }
-            SchedPolicy::RtRoundRobin => {
-                curr.sched.rr_remaining_ns() == 0
-                    && has_rt_peer_locked(&inner, curr.sched.rt_priority())
-            }
-            SchedPolicy::RtFifo => false,
-            SchedPolicy::Fair | SchedPolicy::Idle => curr.sched.vruntime() >= curr.sched.deadline(),
-        }
     }
 
     pub fn pick_next(&self, now_ns: u64) -> Option<Arc<Task>> {
+        self.pick_next_on(now_ns, u64::MAX)
+    }
+
+    /// 在指定 CPU 许可位下挑选下一个任务。
+    ///
+    /// 迁移或亲和性更新可能让某个任务暂时留在不再允许它运行的 rq 中；这里
+    /// 只跳过这类任务，不在持有本 rq 锁时跨 CPU 迁移，避免形成跨 rq 锁顺序。
+    pub fn pick_next_on(&self, now_ns: u64, cpu_mask: u64) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
 
         let mut fair_prev_addr = None;
         if let Some(prev) = inner.current.take() {
-            if prev.state() == TaskState::Running || prev.state() == TaskState::Runnable {
+            if task_can_enter_runqueue(&prev)
+                && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
+            {
                 prev.set_state(TaskState::Runnable);
                 if prev.sched.policy() == SchedPolicy::Fair {
                     fair_prev_addr = Some(task_addr(&prev));
                 }
                 enqueue_queued_locked(&mut inner, prev, now_ns);
             } else {
+                if prev.arch_context().is_none()
+                    && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
+                {
+                    log::warning!(
+                        "[sched] drop current without arch context pid={:?} state={:?}",
+                        prev.pid_root(),
+                        prev.state(),
+                    );
+                    prev.set_state(TaskState::Dead);
+                }
                 prev.sched.set_on_rq(false);
             }
         }
 
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr);
+        let preferred_fair_addr = inner.preferred_fair_addr.take();
+        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask);
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
@@ -196,7 +311,7 @@ impl Runqueue {
 
     pub fn take_migratable(&self, allowed_cpu_mask: u64, now_ns: u64) -> Option<Arc<Task>> {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
 
         if let Some(task) = take_fair_migratable_locked(&mut inner, allowed_cpu_mask) {
             return Some(task);
@@ -233,21 +348,26 @@ impl Runqueue {
     }
 
     /// 在 rq 锁内更新 nice / slice，并按旧属性先完成出队记账。
-    pub fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params));
+    pub fn update_params(&self, task: &Arc<Task>, params: SchedParams, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_params(params))
+    }
+
+    /// 在 rq 锁内只更新 nice/weight，保持策略与时间片不变。
+    pub fn update_nice(&self, task: &Arc<Task>, nice: i8, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_nice(nice))
     }
 
     /// 在 rq 锁内更新完整调度属性，并按旧 class / 权重完成出队记账。
-    pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) {
-        self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr));
+    pub fn update_sched_attr(&self, task: &Arc<Task>, attr: SchedAttr, now_ns: u64) -> bool {
+        self.update_sched_entity(task, now_ns, |task| task.sched.set_sched_attr(attr))
     }
 
-    fn update_sched_entity<F>(&self, task: &Arc<Task>, now_ns: u64, update: F)
+    fn update_sched_entity<F>(&self, task: &Arc<Task>, now_ns: u64, update: F) -> bool
     where
         F: FnOnce(&Arc<Task>),
     {
         let mut inner = self.inner.lock();
-        update_curr_locked(&mut inner, now_ns);
+        let _ = update_curr_locked(&mut inner, now_ns);
         let mut update = Some(update);
 
         if let Some(curr) = inner.current.as_ref() {
@@ -256,7 +376,7 @@ impl Runqueue {
                 apply(task);
                 let now = inner.last_update_ns;
                 prepare_running_locked(&mut inner, task, now);
-                return;
+                return true;
             }
         }
 
@@ -267,13 +387,20 @@ impl Runqueue {
             owned.set_state(TaskState::Runnable);
             let now = inner.last_update_ns;
             enqueue_queued_locked(&mut inner, owned, now);
-            return;
+            return true;
+        }
+
+        // 任务声称仍在某个 rq 上，但不属于当前 rq。调用方应重新按 CPU 归属
+        // 定位或扫描其它 rq，避免在迁移窗口里只更新实体而留下旧索引。
+        if task.sched.on_rq() {
+            return false;
         }
 
         let apply = update.take().expect("[sched] update closure consumed");
         apply(task);
         let now = inner.last_update_ns;
         prepare_sleeping_locked(&mut inner, task, now);
+        true
     }
 
     pub fn snapshot_runnable(&self) -> Vec<Arc<Task>> {
@@ -296,11 +423,23 @@ impl Default for Runqueue {
 fn enqueue_queued_locked(inner: &mut RqInner, task: Arc<Task>, now_ns: u64) {
     match task.sched.policy() {
         SchedPolicy::Deadline => {
+            let replenish_at = task.sched.deadline_replenish_ns();
             if task.sched.absolute_deadline_ns() == 0
-                || task.sched.deadline_budget_ns() == 0
-                || now_ns >= task.sched.absolute_deadline_ns()
+                || (replenish_at != 0 && now_ns >= replenish_at)
             {
                 task.sched.replenish_deadline(now_ns);
+            }
+            if task.sched.deadline_budget_ns() == 0 {
+                let replenish_at = task.sched.deadline_replenish_ns();
+                if replenish_at == 0 || now_ns >= replenish_at {
+                    task.sched.replenish_deadline(now_ns);
+                } else {
+                    let seq = next_seq(inner);
+                    inner
+                        .deadline_throttled
+                        .insert(DeadlineThrottleKey::of(&task, seq), task);
+                    return;
+                }
             }
             let seq = next_seq(inner);
             inner
@@ -348,48 +487,145 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
     inner.fair_tree.insert(FairKey::of(&task), task);
 }
 
-fn pick_queued_locked(inner: &mut RqInner, fair_prev_addr: Option<usize>) -> Option<Arc<Task>> {
-    if let Some(key) = inner.deadline_tree.keys().next().copied() {
+fn pick_queued_locked(
+    inner: &mut RqInner,
+    mut fair_prev_addr: Option<usize>,
+    mut preferred_fair_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
+    loop {
+        let task =
+            pick_queued_candidate_locked(inner, fair_prev_addr, preferred_fair_addr, cpu_mask)?;
+        if task_can_run_on(&task, cpu_mask) {
+            return Some(task);
+        }
+        discard_non_runnable_pick(&task);
+        if fair_prev_addr.is_some_and(|addr| addr == task_addr(&task)) {
+            fair_prev_addr = None;
+        }
+        if preferred_fair_addr.is_some_and(|addr| addr == task_addr(&task)) {
+            preferred_fair_addr = None;
+        }
+    }
+}
+
+fn pick_queued_candidate_locked(
+    inner: &mut RqInner,
+    fair_prev_addr: Option<usize>,
+    preferred_fair_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
+    if let Some(key) = inner
+        .deadline_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)
+    {
         return inner.deadline_tree.remove(&key);
     }
-    if let Some(key) = inner.rt_tree.keys().next().copied() {
+    if let Some(key) = inner
+        .rt_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)
+    {
         return inner.rt_tree.remove(&key);
     }
-    if let Some(task) = pick_fair_locked(inner, fair_prev_addr) {
+    if let Some(task) = pick_fair_locked(inner, fair_prev_addr, preferred_fair_addr, cpu_mask) {
         return Some(task);
     }
-    let key = inner.idle_tree.keys().next().copied()?;
+    let key = inner
+        .idle_tree
+        .iter()
+        .find(|(_, task)| task_allowed_on(task, cpu_mask))
+        .map(|(key, _)| *key)?;
     inner.idle_tree.remove(&key)
 }
 
-fn pick_fair_locked(inner: &mut RqInner, skip_addr: Option<usize>) -> Option<Arc<Task>> {
+fn pick_fair_locked(
+    inner: &mut RqInner,
+    skip_addr: Option<usize>,
+    preferred_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
-    let key = if let Some(skip) = skip_addr {
-        inner
-            .fair_tree
-            .iter()
-            .find(|(_, task)| task_addr(task) != skip && task.sched.vruntime() <= avg)
-            .map(|(key, _)| *key)
-            .or_else(|| {
-                inner
-                    .fair_tree
-                    .iter()
-                    .filter(|(_, task)| task_addr(task) != skip)
-                    .min_by_key(|(_, task)| task.sched.vruntime())
-                    .map(|(key, _)| *key)
-            })
-            .or_else(|| inner.fair_tree.keys().next().copied())
+    let mut preferred = None;
+    let mut first_allowed = None;
+    let mut first_eligible = None;
+    let mut min_non_skip: Option<(FairKey, u64)> = None;
+
+    // 调度器持 rq 锁选择下一个 fair 任务。原实现为了保留“优先不选刚让出
+    // CPU 的任务，再退化到最小 vruntime，最后才允许选回它”的语义会多次
+    // 扫描 BTreeMap；这里一次遍历同时收集候选，减少 lmbench syscall/context
+    // switch 热路径里的锁内扫描成本。
+    for (key, task) in inner.fair_tree.iter() {
+        if !task_allowed_on(task, cpu_mask) {
+            continue;
+        }
+
+        if preferred_addr.is_some_and(|addr| task_addr(task) == addr) {
+            preferred = Some(*key);
+        }
+        first_allowed.get_or_insert(*key);
+
+        let is_skip = skip_addr.is_some_and(|skip| task_addr(task) == skip);
+        if !is_skip {
+            let vruntime = task.sched.vruntime();
+            if vruntime <= avg {
+                first_eligible.get_or_insert(*key);
+            }
+            if min_non_skip
+                .as_ref()
+                .is_none_or(|(_, current_min)| vruntime < *current_min)
+            {
+                min_non_skip = Some((*key, vruntime));
+            }
+        } else if skip_addr.is_none() && first_eligible.is_none() && task.sched.vruntime() <= avg {
+            first_eligible = Some(*key);
+        }
+    }
+
+    let key = if skip_addr.is_some() {
+        first_eligible
+            .or_else(|| min_non_skip.map(|(key, _)| key))
+            .or(first_allowed)
     } else {
-        inner
-            .fair_tree
-            .iter()
-            .find(|(_, task)| task.sched.vruntime() <= avg)
-            .map(|(key, _)| *key)
-            .or_else(|| inner.fair_tree.keys().next().copied())
-    }?;
+        first_eligible.or(first_allowed)
+    };
+    let key = preferred.or(key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     Some(task)
+}
+
+fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
+    (task.cpu_affinity() & cpu_mask) != 0
+}
+
+fn task_can_enter_runqueue(task: &Arc<Task>) -> bool {
+    task.arch_context().is_some() && !matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+}
+
+fn task_can_run_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
+    task_allowed_on(task, cpu_mask)
+        && task.state() == TaskState::Runnable
+        && task.arch_context().is_some()
+}
+
+fn discard_non_runnable_pick(task: &Arc<Task>) {
+    let state = task.state();
+    task.sched.set_on_rq(false);
+    if task.arch_context().is_none() && !matches!(state, TaskState::Zombie | TaskState::Dead) {
+        // 已释放执行体的任务绝不能重新进入调度。这里把异常残留终结掉，
+        // 避免调度器在同一个坏任务上反复自旋或切到无效上下文。
+        task.set_state(TaskState::Dead);
+    }
+    log::warning!(
+        "[sched] discard non-runnable queued task pid={:?} state={:?} has_ctx={}",
+        task.pid_root(),
+        state,
+        task.arch_context().is_some(),
+    );
 }
 
 fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
@@ -410,7 +646,12 @@ fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {
         }
         SchedPolicy::RtFifo => {}
         SchedPolicy::Deadline => {
-            if task.sched.absolute_deadline_ns() == 0 || task.sched.deadline_budget_ns() == 0 {
+            let replenish_at = task.sched.deadline_replenish_ns();
+            if task.sched.absolute_deadline_ns() == 0
+                || (replenish_at != 0 && now_ns >= replenish_at)
+                || (task.sched.deadline_budget_ns() == 0
+                    && (replenish_at == 0 || now_ns >= replenish_at))
+            {
                 task.sched.replenish_deadline(now_ns);
             }
         }
@@ -424,7 +665,10 @@ fn prepare_sleeping_locked(inner: &mut RqInner, task: &Arc<Task>, _now_ns: u64) 
     } else if task.sched.policy() == SchedPolicy::RtRoundRobin && task.sched.rr_remaining_ns() == 0
     {
         task.sched.reset_rr_slice();
-    } else if task.sched.policy() == SchedPolicy::Deadline && task.sched.absolute_deadline_ns() == 0
+    } else if task.sched.policy() == SchedPolicy::Deadline
+        && (task.sched.absolute_deadline_ns() == 0
+            || (task.sched.deadline_replenish_ns() != 0
+                && inner.last_update_ns >= task.sched.deadline_replenish_ns()))
     {
         task.sched.replenish_deadline(inner.last_update_ns);
     }
@@ -453,6 +697,9 @@ fn remove_queued_any_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc
         return Some(task);
     }
     if let Some(task) = remove_deadline_locked(inner, task) {
+        return Some(task);
+    }
+    if let Some(task) = remove_deadline_throttled_locked(inner, task) {
         return Some(task);
     }
     remove_idle_locked(inner, task)
@@ -493,6 +740,17 @@ fn remove_deadline_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<T
     Some(task)
 }
 
+fn remove_deadline_throttled_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> {
+    let key = inner
+        .deadline_throttled
+        .iter()
+        .find(|(_, value)| Arc::ptr_eq(value, task))
+        .map(|(key, _)| *key)?;
+    let task = inner.deadline_throttled.remove(&key)?;
+    task.sched.set_on_rq(false);
+    Some(task)
+}
+
 fn remove_idle_locked(inner: &mut RqInner, task: &Arc<Task>) -> Option<Arc<Task>> {
     let key = inner
         .idle_tree
@@ -513,6 +771,7 @@ fn take_fair_migratable_locked(inner: &mut RqInner, allowed_cpu_mask: u64) -> Op
         .map(|(key, _)| *key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
+    store_fair_lag_locked(inner, &task);
     task.sched.set_on_rq(false);
     Some(task)
 }
@@ -544,25 +803,52 @@ fn take_deadline_migratable_locked(
     Some(task)
 }
 
-fn update_curr_locked(inner: &mut RqInner, now_ns: u64) {
-    if now_ns <= inner.last_update_ns {
-        return;
-    }
-    let delta = now_ns - inner.last_update_ns;
-    inner.last_update_ns = now_ns;
-    let Some(curr) = inner.current.as_ref().map(Arc::clone) else {
-        return;
-    };
-    match curr.sched.policy() {
-        SchedPolicy::Fair | SchedPolicy::Idle => update_fair_curr_locked(inner, &curr, delta),
-        SchedPolicy::RtRoundRobin => {
-            let _ = curr.sched.charge_rr_runtime(delta);
+fn update_curr_locked(inner: &mut RqInner, now_ns: u64) -> bool {
+    if now_ns > inner.last_update_ns {
+        let delta = now_ns - inner.last_update_ns;
+        inner.last_update_ns = now_ns;
+        if let Some(curr) = inner.current.as_ref().map(Arc::clone) {
+            match curr.sched.policy() {
+                SchedPolicy::Fair | SchedPolicy::Idle => {
+                    update_fair_curr_locked(inner, &curr, delta)
+                }
+                SchedPolicy::RtRoundRobin => {
+                    let _ = curr.sched.charge_rr_runtime(delta);
+                }
+                SchedPolicy::Deadline => {
+                    let _ = curr.sched.charge_deadline_runtime(delta);
+                }
+                SchedPolicy::RtFifo => {}
+            }
         }
-        SchedPolicy::Deadline => {
-            let _ = curr.sched.charge_deadline_runtime(delta);
-        }
-        SchedPolicy::RtFifo => {}
     }
+    requeue_ready_deadline_locked(inner, now_ns)
+}
+
+fn requeue_ready_deadline_locked(inner: &mut RqInner, now_ns: u64) -> bool {
+    let mut moved = false;
+    loop {
+        let Some(key) = inner.deadline_throttled.keys().next().copied() else {
+            break;
+        };
+        if key.replenish_ns > now_ns {
+            break;
+        }
+        let Some(task) = inner.deadline_throttled.remove(&key) else {
+            break;
+        };
+        if task.state() != TaskState::Runnable {
+            task.sched.set_on_rq(false);
+            continue;
+        }
+        task.sched.replenish_deadline(now_ns);
+        let seq = next_seq(inner);
+        inner
+            .deadline_tree
+            .insert(DeadlineKey::of(&task, seq), task);
+        moved = true;
+    }
+    moved
 }
 
 fn update_fair_curr_locked(inner: &mut RqInner, curr: &Arc<Task>, delta_ns: u64) {

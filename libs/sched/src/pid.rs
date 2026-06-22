@@ -21,6 +21,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI32, Ordering};
 
+use errno::Errno;
+
 use crate::sync::Spinlock;
 use crate::task::Task;
 
@@ -94,20 +96,14 @@ impl PidRegistry {
 
     /// 为 `task` 分配一个 pid。返回 `None` 表示用尽。
     ///
-    /// 分配策略：优先从自由链表取回；否则从 `next_hint` 开始往 `pid_max` 扫描
-    /// 并按需 `push` 新 slot。两种路径都保证 `pid_t >= 1`。
+    /// 分配策略：优先单调扩展 slot；只有达到 `pid_max` 后才复用自由链表。
+    ///
+    /// 不能 LIFO 复用刚释放的 TID：pthread 批量 create/join 时，大量 joinable
+    /// 线程已经退出但还没被用户态 join。若每次都复用同一个 TID，glibc 的线程
+    /// 描述符、栈缓存和用户态锁路径会长时间看到重复 TID，容易进入病态等待。
+    /// Linux 的 pid 分配也会围绕 last_pid 向前推进，而不是立刻拿回刚释放的槽。
     pub fn allocate(&self, task: &Arc<Task>) -> Option<PidT> {
         let mut inner = self.inner.lock();
-
-        if let Some(idx) = inner.free_head.take() {
-            let next = inner.slots[idx as usize].next_free.take();
-            inner.free_head = next;
-            let slot = &mut inner.slots[idx as usize];
-            slot.generation = slot.generation.wrapping_add(1);
-            slot.task = Arc::downgrade(task);
-            slot.occupied = true;
-            return Some(idx as PidT);
-        }
 
         let pid_max = inner.pid_max;
         let len = inner.slots.len() as u32;
@@ -122,7 +118,65 @@ impl PidRegistry {
             inner.next_hint = idx.saturating_add(1);
             return Some(idx as PidT);
         }
+
+        if let Some(idx) = inner.free_head.take() {
+            let next = inner.slots[idx as usize].next_free.take();
+            inner.free_head = next;
+            let slot = &mut inner.slots[idx as usize];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.task = Arc::downgrade(task);
+            slot.occupied = true;
+            inner.next_hint = idx.saturating_add(1).max(1);
+            return Some(idx as PidT);
+        }
         None
+    }
+
+    /// 为 `task` 占用调用者指定的 pid。该入口服务 clone3 `set_tid_size=1`；
+    /// 多 namespace set_tid 需要在更高层先建立完整 namespace 栈后再扩展。
+    pub fn allocate_specific(&self, task: &Arc<Task>, pid: PidT) -> Result<PidT, Errno> {
+        if pid <= PID_INVALID {
+            return Err(Errno::EINVAL);
+        }
+        let idx = pid as u32;
+        let mut inner = self.inner.lock();
+        if idx >= inner.pid_max {
+            return Err(Errno::EINVAL);
+        }
+
+        if (idx as usize) < inner.slots.len() {
+            if inner.slots[idx as usize].occupied {
+                return Err(Errno::EEXIST);
+            }
+            remove_from_free_list(&mut inner, idx);
+            let slot = &mut inner.slots[idx as usize];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.task = Arc::downgrade(task);
+            slot.next_free = None;
+            slot.occupied = true;
+            inner.next_hint = idx.saturating_add(1).max(1);
+            return Ok(pid);
+        }
+
+        while inner.slots.len() < idx as usize {
+            let free_idx = inner.slots.len() as u32;
+            let old_head = inner.free_head;
+            inner.slots.push(Slot {
+                task: Weak::new(),
+                generation: 0,
+                next_free: old_head,
+                occupied: false,
+            });
+            inner.free_head = Some(free_idx);
+        }
+        inner.slots.push(Slot {
+            task: Arc::downgrade(task),
+            generation: 1,
+            next_free: None,
+            occupied: true,
+        });
+        inner.next_hint = idx.saturating_add(1).max(1);
+        Ok(pid)
     }
 
     /// 根据 pid 查找任务的弱引用。`pid <= 0` 或越界都返回 `None`。
@@ -185,6 +239,25 @@ impl PidRegistry {
             out.push((idx as PidT, slot.task.clone()));
         }
         out
+    }
+}
+
+fn remove_from_free_list(inner: &mut RegistryInner, idx: u32) {
+    let mut current = inner.free_head;
+    let mut prev = None;
+    while let Some(cur) = current {
+        if cur == idx {
+            let next = inner.slots[cur as usize].next_free;
+            if let Some(prev_idx) = prev {
+                inner.slots[prev_idx as usize].next_free = next;
+            } else {
+                inner.free_head = next;
+            }
+            inner.slots[cur as usize].next_free = None;
+            return;
+        }
+        prev = current;
+        current = inner.slots[cur as usize].next_free;
     }
 }
 

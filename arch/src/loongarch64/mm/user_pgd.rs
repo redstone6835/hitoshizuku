@@ -1,10 +1,5 @@
 //! LoongArch64 用户态页表能力 → 注入到 [`general::mm::UserPgdOps`]。
 //!
-//! 取代旧的 `arch/src/loongarch64/user_space.rs`：旧文件以 pub `UserAddressSpace`
-//! 直接对外，违反"arch 不暴露业务 API"的新约束；本文件保留全部语义，但
-//! **唯一对外符号**是 `static USER_PGD_OPS`，由 `arch::loongarch64::mm::register`
-//! 在启动期注入到 general 一侧。
-//!
 //! 内部 `UserPgdInner` 是 arch 私有结构，由 `Box::leak` 后用 `NonNull<()>`
 //! 套进 [`PgdHandle`] 传给上层；`drop_pgd` 反向还原。
 //!
@@ -81,9 +76,10 @@ impl Drop for UserPgdInner {
 fn copy_kernel_pgd_entries(dst_pgd_virt: usize, src_pgd_phys: usize) {
     let src_pgd_virt = phys_to_virt(src_pgd_phys);
     let entries = LoongArch64Paging::ENTRIES_PER_TABLE;
+    let half = entries / 2;
     let src = src_pgd_virt as *const usize;
     let dst = dst_pgd_virt as *mut usize;
-    for i in 0..entries {
+    for i in half..entries {
         // Safety: src/dst 指向 PAGE_SIZE 字节的 PGD 缓冲，按 usize 对齐；
         //         本次只读源、独占写目的，无并发访问者。
         let entry = unsafe { core::ptr::read_volatile(src.add(i)) };
@@ -92,13 +88,13 @@ fn copy_kernel_pgd_entries(dst_pgd_virt: usize, src_pgd_phys: usize) {
 }
 
 fn free_page_table_page(paddr: usize) {
-    let allocation = allocator::PhysicalAllocation {
-        paddr,
-        size: allocator::PAGE_SIZE,
-        order: 0,
-        page_size: allocator::PAGE_SIZE,
-    };
-    allocator::KERNEL_ALLOCATOR.free_physical(allocation);
+    if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_physical_addr(paddr) {
+        log::error!(
+            "[arch][mm] failed to free tracked page-table page paddr={:#x}: {:?}",
+            paddr,
+            err
+        );
+    }
 }
 
 fn free_user_page_table_pages(root_vaddr: usize) {
@@ -136,6 +132,34 @@ fn allocate_page_table_page() -> Result<usize, general::MapError> {
         .allocate_physical(request)
         .map_err(|_| general::MapError::OutOfMemory)?;
     Ok(allocation.paddr)
+}
+
+fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let page_size = LoongArch64Paging::PAGE_SIZE;
+    const PAGE_THRESHOLD: usize = 64;
+    let Some(end) = vaddr.checked_add(len) else {
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    };
+    let aligned_start = vaddr & !(page_size - 1);
+    let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
+    if pages > PAGE_THRESHOLD {
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    }
+    let mut va = aligned_start;
+    while va < end {
+        // Safety: flush_tlb_with_asid 不解引用任何指针，仅发 invtlb。
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };
+        let Some(next) = va.checked_add(page_size) else {
+            unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+            return;
+        };
+        va = next;
+    }
 }
 
 // ── PgdHandle 与 UserPgdInner 的来回 ─────────────────────────────────────────
@@ -204,6 +228,7 @@ unsafe fn unmap(handle: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(handle) };
     let _ =
         unmap_range_entries::<LoongArch64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
@@ -234,7 +259,7 @@ unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
         }
         va += LoongArch64Paging::PAGE_SIZE;
     }
-    unsafe { invalidate_range(handle, vaddr, len) };
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range<usize>) {
@@ -254,9 +279,13 @@ unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range
         let page_size = LoongArch64Paging::leaf_page_size(level)
             .expect("[arch][mm] clone_for_fork: unsupported leaf level");
         let src_paddr = LoongArch64Paging::pte_addr(src_pte) + (va & (page_size - 1));
-        let new_paddr = allocator::KERNEL_ALLOCATOR
-            .buddy_alloc_pages(0)
+        let new_alloc = allocator::KERNEL_ALLOCATOR
+            .allocate_physical(allocator::PhysicalAllocRequest::new(
+                allocator::PAGE_SIZE,
+                allocator::PAGE_SIZE,
+            ))
             .expect("[arch][mm] clone_for_fork: OOM");
+        let new_paddr = new_alloc.paddr;
         unsafe {
             core::ptr::copy_nonoverlapping(
                 virt(src_paddr) as *const u8,
@@ -265,7 +294,7 @@ unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range
             );
         }
         let f = LoongArch64Paging::pte_flags(src_pte);
-        walk_and_map::<LoongArch64Paging>(
+        if let Err(err) = walk_and_map::<LoongArch64Paging>(
             dst_inner.pgd_virt(),
             va,
             new_paddr,
@@ -277,8 +306,10 @@ unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range
             LoongArch64Paging::flags_global(f),
             phys_to_virt,
             allocate_page_table_page,
-        )
-        .expect("[arch][mm] clone_for_fork: dst map failed");
+        ) {
+            let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(new_alloc);
+            panic!("[arch][mm] clone_for_fork: dst map failed: {:?}", err);
+        }
         va += LoongArch64Paging::PAGE_SIZE;
     }
 }
@@ -299,15 +330,7 @@ unsafe fn activate(handle: PgdHandle) {
 unsafe fn invalidate_range(handle: PgdHandle, vaddr: usize, len: usize) {
     // Safety: 同上。
     let inner = unsafe { inner_ref(handle) };
-    let mut va = vaddr & !(LoongArch64Paging::PAGE_SIZE - 1);
-    let end = vaddr + len;
-    while va < end {
-        // Safety: flush_tlb_with_asid 不解引用任何指针，仅发 invtlb。
-        unsafe {
-            LoongArch64Paging::flush_tlb_with_asid(inner.asid(), Some(VirtAddr::new(va)));
-        }
-        va += LoongArch64Paging::PAGE_SIZE;
-    }
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn count_mapped(handle: PgdHandle, vaddr: usize, len: usize) -> usize {

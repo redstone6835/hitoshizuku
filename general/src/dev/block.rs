@@ -1,54 +1,56 @@
 //! 块设备抽象接口。
 //!
-//! 这个接口定义了块设备的基本操作，包括读写、提交、注册等。
+//! - 驱动只实现纯异步 `queue_bio`，把请求提交到自己的设备队列。
+//! - 同步是上层薄包装 `submit_bio_wait` = submit + `Completion::wait()`。
+//! - 异步通过 `submit_bio_async` 返回 `BioFuture`（`impl Future`）。
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::any::Any;
+use core::future::Future;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::pin::Pin;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::task::{Context, Poll};
 
-use spin::mutex::Mutex;
+use crate::dev::bio::{
+    Bio, BioBuffer, BioCompletionObserver, BioError, BioIoError, BioOp, BioReqError, BioResult,
+    SubmitError,
+};
+use crate::dev::completion::Completion;
+use crate::dev::control::{
+    BlockControlRequest, BlockControlResponse, BlockIoHints, ControlError, DriverControl,
+};
 
-// ───────── 错误定义 ─────────
+// ── 重导出 ──────────────────────────────────────────────────────────────────
+pub use crate::dev::bio::{
+    BioReqError as BlockRequestError, BlockRange, SubmitError as BlockSubmitError,
+};
 
-/// 硬件 / 协议层 I/O 错误
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockIoError {
-    MediaError,
-    Unavailable,
-    Timeout,
-    ReadOnly,
-    Unsupported,
-}
+/// 块设备对象实例序列号分配器。
+///
+/// 序列号只描述本次内核生命周期内的块设备对象实例，不参与 PnP 身份匹配，也不作为
+/// 底层驱动查找键；驱动若能提供更稳定的介质序列，可在 [`BlockAttributes`] 中覆盖。
+static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 
-/// 调用者传入参数错误（不可恢复）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockRequestError {
-    EmptyRange,
-    OutOfBounds,
-    TooLarge,
-    BufferSizeMismatch,
-    Misaligned,
-}
+/// 同步块 I/O 等待时，在真正让出 CPU 前主动推进完成队列的次数。
+///
+/// QEMU/virtio 的小请求通常在几十微秒内完成；立即切到 idle 会把一次上下文切换、
+/// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。这里先做一个很小的
+/// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
+const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 16;
 
-/// 提交层错误
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockSubmitError {
-    Unsupported,
-    ReadOnly,
-    QueueFull,
-    DeviceGone,
-    OutOfMemory,
-    InvalidRequest(BlockRequestError),
-}
-
-/// 注册表操作错误
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockRegistryError {
-    NameExists,
-    DeviceGone,
-    OutOfMemory,
+fn allocate_block_diskseq() -> u64 {
+    loop {
+        let current = NEXT_BLOCK_DISKSEQ.load(Ordering::Acquire).max(1);
+        let next = current.checked_add(1).unwrap_or(1);
+        if NEXT_BLOCK_DISKSEQ
+            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current;
+        }
+    }
 }
 
 // ───────── 几何信息与限制 ─────────
@@ -57,7 +59,6 @@ pub enum BlockRegistryError {
 pub struct BlockGeometry {
     logical_block_size: NonZeroU32,
     physical_block_size: NonZeroU32,
-    /// 设备容量（逻辑块数），`None` 表示未知或可变
     block_count: Option<u64>,
 }
 
@@ -69,10 +70,10 @@ impl BlockGeometry {
         if !logical.get().is_power_of_two() || !physical.get().is_power_of_two() {
             return None;
         }
-        if let Some(c) = count
-            && c == 0
-        {
-            return None;
+        if let Some(c) = count {
+            if c == 0 {
+                return None;
+            }
         }
         Some(Self {
             logical_block_size: logical,
@@ -104,6 +105,39 @@ pub struct BlockLimits {
     max_blocks_per_io: Option<NonZeroU32>,
     optimal_blocks_per_io: Option<NonZeroU32>,
     buffer_alignment: Option<NonZeroU32>,
+    discard: Option<BlockRangeLimits>,
+    write_zeroes: Option<BlockRangeLimits>,
+}
+
+/// 范围类块命令的限制。
+///
+/// Discard / WriteZeroes 等命令不携带用户数据缓冲，它们的设备限制通常来自介质
+/// 擦除粒度或协议 range descriptor，而不是普通数据 DMA 段大小。用独立结构表达
+/// 可以避免把读写 I/O 的 DMA 限制误套到范围命令上。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockRangeLimits {
+    max_blocks_per_io: Option<NonZeroU32>,
+    alignment_blocks: Option<NonZeroU32>,
+}
+
+impl BlockRangeLimits {
+    pub const fn new(
+        max_blocks_per_io: Option<NonZeroU32>,
+        alignment_blocks: Option<NonZeroU32>,
+    ) -> Self {
+        Self {
+            max_blocks_per_io,
+            alignment_blocks,
+        }
+    }
+
+    pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
+        self.max_blocks_per_io
+    }
+
+    pub const fn alignment_blocks(&self) -> Option<NonZeroU32> {
+        self.alignment_blocks
+    }
 }
 
 impl BlockLimits {
@@ -112,22 +146,22 @@ impl BlockLimits {
         optimal_blocks_per_io: Option<NonZeroU32>,
         buffer_alignment: Option<NonZeroU32>,
     ) -> Option<Self> {
-        if let (Some(max), Some(optimal)) = (max_blocks_per_io, optimal_blocks_per_io)
-            && optimal.get() > max.get()
-        {
-            return None;
+        if let (Some(max), Some(optimal)) = (max_blocks_per_io, optimal_blocks_per_io) {
+            if optimal.get() > max.get() {
+                return None;
+            }
         }
-
-        if let Some(align) = buffer_alignment
-            && !align.get().is_power_of_two()
-        {
-            return None;
+        if let Some(align) = buffer_alignment {
+            if !align.get().is_power_of_two() {
+                return None;
+            }
         }
-
         Some(Self {
             max_blocks_per_io,
             optimal_blocks_per_io,
             buffer_alignment,
+            discard: None,
+            write_zeroes: None,
         })
     }
 
@@ -136,7 +170,19 @@ impl BlockLimits {
             max_blocks_per_io: None,
             optimal_blocks_per_io: None,
             buffer_alignment: None,
+            discard: None,
+            write_zeroes: None,
         }
+    }
+
+    pub const fn with_discard_limits(mut self, limits: Option<BlockRangeLimits>) -> Self {
+        self.discard = limits;
+        self
+    }
+
+    pub const fn with_write_zeroes_limits(mut self, limits: Option<BlockRangeLimits>) -> Self {
+        self.write_zeroes = limits;
+        self
     }
 
     pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
@@ -150,9 +196,78 @@ impl BlockLimits {
     pub const fn buffer_alignment(&self) -> Option<NonZeroU32> {
         self.buffer_alignment
     }
+
+    pub const fn discard_limits(&self) -> Option<BlockRangeLimits> {
+        self.discard
+    }
+
+    pub const fn write_zeroes_limits(&self) -> Option<BlockRangeLimits> {
+        self.write_zeroes
+    }
+
+    pub const fn range_limits_for(&self, op: BioOp) -> Option<BlockRangeLimits> {
+        match op {
+            BioOp::Discard => self.discard,
+            BioOp::WriteZeroes => self.write_zeroes,
+            _ => None,
+        }
+    }
 }
 
-/// 块设备功能标志（手动实现，不引入额外依赖）
+/// 块设备可观测属性。
+///
+/// 这些字段用于 devtmpfs/sysfs/procfs 等兼容视图展示设备能力，不参与底层设备
+/// 身份判定；底层寻址仍由 PnP identity 和 typed device object 完成。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockAttributes {
+    removable: bool,
+    rotational: bool,
+    queue_depth: Option<NonZeroU32>,
+    diskseq: Option<u64>,
+}
+
+impl BlockAttributes {
+    pub const fn new(
+        removable: bool,
+        rotational: bool,
+        queue_depth: Option<NonZeroU32>,
+        diskseq: Option<u64>,
+    ) -> Self {
+        Self {
+            removable,
+            rotational,
+            queue_depth,
+            diskseq,
+        }
+    }
+
+    pub const fn removable(&self) -> bool {
+        self.removable
+    }
+
+    pub const fn rotational(&self) -> bool {
+        self.rotational
+    }
+
+    pub const fn queue_depth(&self) -> Option<NonZeroU32> {
+        self.queue_depth
+    }
+
+    pub const fn diskseq(&self) -> Option<u64> {
+        self.diskseq
+    }
+
+    pub const fn with_diskseq(&self, diskseq: u64) -> Self {
+        Self {
+            removable: self.removable,
+            rotational: self.rotational,
+            queue_depth: self.queue_depth,
+            diskseq: Some(diskseq),
+        }
+    }
+}
+
+/// 块设备功能标志
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct BlockFeatures(pub u32);
 
@@ -162,6 +277,11 @@ impl BlockFeatures {
     pub const DISCARD: Self = Self(1 << 2);
     pub const WRITE_ZEROES: Self = Self(1 << 3);
     pub const FUA: Self = Self(1 << 4);
+    /// Discard 后读取同一区间能够稳定返回零。
+    ///
+    /// 这和 WRITE_ZEROES 是两个能力：WRITE_ZEROES 表示设备支持显式写零命令，
+    /// DISCARD_ZEROES 表示丢弃后的介质可观测内容为零。没有明确保证时不能声明。
+    pub const DISCARD_ZEROES: Self = Self(1 << 5);
 
     #[inline]
     pub fn contains(self, other: Self) -> bool {
@@ -182,124 +302,225 @@ impl core::ops::BitOrAssign for BlockFeatures {
     }
 }
 
-// ───────── 请求与响应 ─────────
-
-#[derive(Clone, Copy, Debug)]
-pub struct BlockRange {
-    pub lba: u64,
-    pub blocks: u32,
-}
-
-/// 块设备 I/O 请求。
+/// 块设备 I/O 统计快照。
 ///
-/// 请求对象携带缓冲区所有权。驱动完成请求时必须把同一个请求对象放入
-/// [`BlockIoCompletion`] 返还给完成回调，保证成功和失败路径都不丢失缓冲区。
-#[derive(Debug)]
-pub enum BlockIoRequest {
-    Read {
-        range: BlockRange,
-        buffer: Box<[u8]>,
-    },
-    Write {
-        range: BlockRange,
-        buffer: Box<[u8]>,
-        fua: bool,
-    },
-    Discard {
-        range: BlockRange,
-    },
-    WriteZeroes {
-        range: BlockRange,
-    },
-    Flush,
+/// 字段使用通用块层语义：完成数按成功完成的 BIO 计数，扇区数按 512 字节兼容
+/// 扇区换算，耗时以纳秒累计。sysfs/procfs 只消费快照，不直接修改这些计数。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockIoStatsSnapshot {
+    pub read_ios: u64,
+    pub read_sectors: u64,
+    pub read_time_ns: u64,
+    pub write_ios: u64,
+    pub write_sectors: u64,
+    pub write_time_ns: u64,
+    pub discard_ios: u64,
+    pub discard_sectors: u64,
+    pub discard_time_ns: u64,
+    pub flush_ios: u64,
+    pub flush_time_ns: u64,
+    pub read_inflight: u64,
+    pub write_inflight: u64,
 }
 
-/// I/O 完成结果。
-pub struct BlockIoCompletion {
-    pub request: BlockIoRequest,
-    pub result: Result<(), BlockIoError>,
+/// 单次同步块 I/O 提交路径的分段耗时。
+///
+/// 仅用于基准测试定位固定开销来源；普通 I/O 路径不采集这些字段。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockSubmitProfile {
+    pub total_ns: u64,
+    pub validate_ns: u64,
+    pub build_bio_ns: u64,
+    pub queue_ns: u64,
+    pub drain_ns: u64,
+    pub schedule_ns: u64,
+    pub completion_take_ns: u64,
+    pub stats_ns: u64,
+    pub drain_calls: u64,
+    pub schedule_calls: u64,
+    pub spin_calls: u64,
 }
 
-/// 异步完成回调。
-pub type BlockCompletion = Box<dyn FnOnce(BlockIoCompletion) + Send>;
+#[derive(Default)]
+struct BlockIoStats {
+    read_ios: AtomicU64,
+    read_sectors: AtomicU64,
+    read_time_ns: AtomicU64,
+    write_ios: AtomicU64,
+    write_sectors: AtomicU64,
+    write_time_ns: AtomicU64,
+    discard_ios: AtomicU64,
+    discard_sectors: AtomicU64,
+    discard_time_ns: AtomicU64,
+    flush_ios: AtomicU64,
+    flush_time_ns: AtomicU64,
+    read_inflight: AtomicU64,
+    write_inflight: AtomicU64,
+}
 
-// ───────── 纯 I/O 接口 ─────────
-
-/// 底层驱动必须实现的异步 I/O 接口
-pub trait BlockIo: Send + Sync {
-    /// 提交 I/O 请求和完成回调。
-    ///
-    /// - 成功返回 `Ok(())` 表示请求已被驱动接受，`completion` 将在未来某个时刻被调用恰好一次。
-    /// - 失败返回 `Err((BlockSubmitError, BlockIoRequest, BlockCompletion))`，
-    ///   此时 `completion` **不会被调用**，请求和回调的所有权交还给调用者。
-    fn submit(
-        &self,
-        req: BlockIoRequest,
-        completion: BlockCompletion,
-    ) -> Result<(), (BlockSubmitError, BlockIoRequest, BlockCompletion)>;
-
-    /// 推进设备完成队列。
-    ///
-    /// 中断驱动设备可以保留默认空实现；轮询或同步等待路径会调用此方法，确保已完成
-    /// 请求可以在没有外部中断入口时被回收并触发 completion。
-    fn poll(&self) {}
-
-    /// 同步读若干扇区到虚拟地址缓冲区。
-    ///
-    /// 驱动内部负责地址转换（RAM 设备直接 memcpy，VirtIO 设备自行 virt_to_phys）。
-    /// 跳过 `Box<[u8]>` 分配和完成回调的全部开销。
-    ///
-    /// 默认实现返回 `Unsupported`，调用方应回退到 `submit` 路径。
-    fn read_sectors_sync(
-        &self,
-        _lba: u64,
-        _count: u32,
-        _buf: &mut [u8],
-    ) -> Result<(), BlockIoError> {
-        Err(BlockIoError::Unsupported)
+impl BlockIoStats {
+    fn begin(&self, op: BioOp) {
+        if matches!(op, BioOp::Read) {
+            self.read_inflight.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.write_inflight.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
-    /// 同步写若干扇区，对称于 `read_sectors_sync`。
-    fn write_sectors_sync(&self, _lba: u64, _count: u32, _buf: &[u8]) -> Result<(), BlockIoError> {
-        Err(BlockIoError::Unsupported)
+    fn cancel(&self, op: BioOp) {
+        self.finish_inflight(op);
     }
 
-    /// 同步读若干扇区到物理地址 `phys`(长度 `len`)的内存范围。
-    ///
-    /// 这是 FS 层调用 [`SyncBlockBackend`](super::block_sync::SyncBlockBackend) 的
-    /// 快速路径 —— 用户缓冲区已是物理连续且内核直接映射,直接把它作为 VirtIO
-    /// 描述符的数据指针,跳过 `Box<[u8]>` 分配 + 双向 memcpy。
-    ///
-    /// 默认实现返回 `Unsupported`,调用方应回退到 `submit` 路径。
-    fn read_sectors_sync_phys(
+    fn record_complete(
         &self,
-        _lba: u64,
-        _count: u32,
-        _phys: u64,
-        _len: usize,
-    ) -> Result<(), BlockIoError> {
-        Err(BlockIoError::Unsupported)
+        op: BioOp,
+        range: BlockRange,
+        block_size: NonZeroU32,
+        elapsed_ns: u64,
+    ) {
+        self.finish_inflight(op);
+        let sectors =
+            (range.blocks as u64).saturating_mul((block_size.get() as u64).max(512) / 512);
+        match op {
+            BioOp::Read => {
+                self.read_ios.fetch_add(1, Ordering::AcqRel);
+                self.read_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.read_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Write => {
+                self.write_ios.fetch_add(1, Ordering::AcqRel);
+                self.write_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.write_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Discard | BioOp::WriteZeroes => {
+                self.discard_ios.fetch_add(1, Ordering::AcqRel);
+                self.discard_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.discard_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Flush => {
+                self.flush_ios.fetch_add(1, Ordering::AcqRel);
+                self.flush_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+        }
     }
 
-    /// 写路径的对称方法,语义同上。
-    fn write_sectors_sync_phys(
+    fn finish_inflight(&self, op: BioOp) {
+        let counter = if matches!(op, BioOp::Read) {
+            &self.read_inflight
+        } else {
+            &self.write_inflight
+        };
+        counter.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> BlockIoStatsSnapshot {
+        BlockIoStatsSnapshot {
+            read_ios: self.read_ios.load(Ordering::Acquire),
+            read_sectors: self.read_sectors.load(Ordering::Acquire),
+            read_time_ns: self.read_time_ns.load(Ordering::Acquire),
+            write_ios: self.write_ios.load(Ordering::Acquire),
+            write_sectors: self.write_sectors.load(Ordering::Acquire),
+            write_time_ns: self.write_time_ns.load(Ordering::Acquire),
+            discard_ios: self.discard_ios.load(Ordering::Acquire),
+            discard_sectors: self.discard_sectors.load(Ordering::Acquire),
+            discard_time_ns: self.discard_time_ns.load(Ordering::Acquire),
+            flush_ios: self.flush_ios.load(Ordering::Acquire),
+            flush_time_ns: self.flush_time_ns.load(Ordering::Acquire),
+            read_inflight: self.read_inflight.load(Ordering::Acquire),
+            write_inflight: self.write_inflight.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl BioCompletionObserver for BlockIoStats {
+    fn on_complete(
         &self,
-        _lba: u64,
-        _count: u32,
-        _phys: u64,
-        _len: usize,
-    ) -> Result<(), BlockIoError> {
-        Err(BlockIoError::Unsupported)
+        op: BioOp,
+        range: BlockRange,
+        block_size: NonZeroU32,
+        submitted_ns: u64,
+        result: Result<(), BioIoError>,
+    ) {
+        self.finish_inflight(op);
+        if result.is_err() {
+            return;
+        }
+
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        let sectors =
+            (range.blocks as u64).saturating_mul((block_size.get() as u64).max(512) / 512);
+        match op {
+            BioOp::Read => {
+                self.read_ios.fetch_add(1, Ordering::AcqRel);
+                self.read_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.read_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Write => {
+                self.write_ios.fetch_add(1, Ordering::AcqRel);
+                self.write_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.write_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Discard | BioOp::WriteZeroes => {
+                self.discard_ios.fetch_add(1, Ordering::AcqRel);
+                self.discard_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.discard_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Flush => {
+                self.flush_ios.fetch_add(1, Ordering::AcqRel);
+                self.flush_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+        }
+    }
+}
+
+// ───────── 块设备驱动 trait（纯异步队列模型） ─────────
+
+/// 块设备底层驱动接口。
+///
+/// 驱动只需实现纯异步提交。完成通知通过 `bio.complete()` 触发，同步/异步
+/// 语义由 `BlockDevice` 上层包装决定——驱动无感。
+pub trait BlockDriver: Send + Sync {
+    /// 接受一个 Bio 请求并排入硬件队列。
+    ///
+    /// 驱动完成请求时必须调用 `bio.complete(Ok(()))` 或 `bio.complete(Err(...))`。
+    /// 返回 `Err` 表示立即拒绝（队列满等），Bio 原样归还。
+    fn queue_bio(&self, bio: Bio) -> Result<(), (SubmitError, Bio)>;
+
+    /// 推进完成队列（中断或主动轮询时调用）。
+    ///
+    /// 驱动在此方法中检查硬件完成状态，对已完成的 Bio 调用 `complete()`。
+    /// 不持有任何外部锁时被调用。
+    fn drain(&self) {}
+
+    /// 一个 VFS 块设备文件被打开时调用。
+    ///
+    /// 这是设备对象层的生命周期通知，不携带 fd、路径或权限位等 POSIX 信息。
+    /// 默认 no-op；需要按打开引用管理资源的虚拟设备可以覆盖。
+    fn open_file(&self) -> Result<(), ControlError> {
+        Ok(())
     }
 
-    /// 用于向下转型，获取具体驱动类型
+    /// 一个 VFS 块设备文件的最后引用释放时调用。
+    ///
+    /// 与 [`open_file`](Self::open_file) 成对使用。默认 no-op，硬件块设备通常
+    /// 不需要感知普通文件描述符生命周期。
+    fn release_file(&self) {}
+
+    /// 处理需要由具体驱动覆盖的块设备 typed control。
+    ///
+    /// 大多数硬件块设备的容量、只读状态和 I/O hint 都可以由 [`BlockDevice`]
+    /// 的静态描述直接回答；loop 这类虚拟设备的 backing file 会在运行期变化，
+    /// 因此允许驱动在这里覆盖特定请求。返回 `None` 表示继续使用块层默认实现。
+    fn control(
+        &self,
+        _req: BlockControlRequest,
+    ) -> Option<Result<BlockControlResponse, ControlError>> {
+        None
+    }
+
+    /// 用于向下转型，获取具体驱动类型。
     fn as_any(&self) -> &dyn Any;
 }
-
-/// 类型安全的块设备控制接口。
-///
-/// 与 [`BlockIo`] 正交：每种驱动自行定义控制请求、响应和错误类型。
-pub use super::DriverControl;
 
 // ───────── 块设备对象 ─────────
 
@@ -310,42 +531,6 @@ pub enum BlockClass {
     Virtual,
 }
 
-/// 块设备的具体类型。
-#[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockDeviceKind {
-    /// VirtIO 块设备。
-    VirtioBlk,
-    /// NVMe 命名空间。
-    NvmeNamespace,
-    /// ATA / SATA 磁盘。
-    AtaDisk,
-    /// SCSI 磁盘。
-    ScsiDisk,
-    /// 内存盘。
-    RamDisk,
-    /// 回环块设备。
-    Loop,
-    /// 其他 MMIO 块设备。
-    Mmio,
-}
-
-impl BlockDeviceKind {
-    /// 返回用户空间可见名称前缀。
-    pub fn name(&self) -> &'static str {
-        match self {
-            BlockDeviceKind::VirtioBlk => "vd",
-            BlockDeviceKind::NvmeNamespace => "nvd",
-            BlockDeviceKind::AtaDisk => "sd",
-            BlockDeviceKind::ScsiDisk => "scd",
-            BlockDeviceKind::RamDisk => "ramd",
-            BlockDeviceKind::Loop => "loop",
-            BlockDeviceKind::Mmio => "blk",
-        }
-    }
-}
-
-/// 设备状态，使用 `AtomicU8` 保证 `Sync`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum DeviceState {
@@ -355,44 +540,53 @@ pub enum DeviceState {
 
 pub struct BlockDevice {
     name: Box<str>,
-    kind: BlockDeviceKind,
+    subsystem: &'static str,
     class: BlockClass,
     geometry: BlockGeometry,
     limits: BlockLimits,
+    attributes: BlockAttributes,
     features: BlockFeatures,
-    io: Arc<dyn BlockIo>,
+    driver: Arc<dyn BlockDriver>,
     parent: Option<Arc<BlockDevice>>,
+    io_stats: Arc<BlockIoStats>,
     state: AtomicU8,
-    in_flight: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct BlockDeviceInit<'a> {
     pub name: &'a str,
-    pub kind: BlockDeviceKind,
+    pub subsystem: &'static str,
     pub class: BlockClass,
     pub geometry: BlockGeometry,
     pub limits: BlockLimits,
+    pub attributes: BlockAttributes,
     pub features: BlockFeatures,
 }
 
 impl BlockDevice {
     pub fn new(
         init: BlockDeviceInit<'_>,
-        io: Arc<dyn BlockIo>,
+        driver: Arc<dyn BlockDriver>,
         parent: Option<Arc<BlockDevice>>,
     ) -> Self {
+        let diskseq = init
+            .attributes
+            .diskseq()
+            .filter(|seq| *seq != 0)
+            .unwrap_or_else(allocate_block_diskseq);
+        let attributes = init.attributes.with_diskseq(diskseq);
         Self {
             name: init.name.into(),
-            kind: init.kind,
+            subsystem: init.subsystem,
             class: init.class,
             geometry: init.geometry,
             limits: init.limits,
+            attributes,
             features: init.features,
-            io,
+            driver,
             parent,
+            io_stats: Arc::new(BlockIoStats::default()),
             state: AtomicU8::new(DeviceState::Active as u8),
-            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -400,8 +594,8 @@ impl BlockDevice {
     pub fn name(&self) -> &str {
         &self.name
     }
-    pub fn kind(&self) -> BlockDeviceKind {
-        self.kind
+    pub fn subsystem(&self) -> &'static str {
+        self.subsystem
     }
     pub fn class(&self) -> BlockClass {
         self.class
@@ -412,14 +606,17 @@ impl BlockDevice {
     pub fn limits(&self) -> &BlockLimits {
         &self.limits
     }
+    pub fn attributes(&self) -> BlockAttributes {
+        self.attributes
+    }
     pub fn features(&self) -> BlockFeatures {
         self.features
     }
     pub fn parent(&self) -> Option<Arc<BlockDevice>> {
         self.parent.as_ref().map(Arc::clone)
     }
-    pub fn in_flight(&self) -> usize {
-        self.in_flight.load(Ordering::Acquire)
+    pub fn io_stats(&self) -> BlockIoStatsSnapshot {
+        self.io_stats.snapshot()
     }
 
     pub fn state(&self) -> DeviceState {
@@ -437,576 +634,467 @@ impl BlockDevice {
         self.state.store(DeviceState::Gone as u8, Ordering::Release);
     }
 
-    pub fn poll(&self) {
-        self.io.poll();
+    /// 推进驱动完成队列。
+    pub fn drain(&self) {
+        self.driver.drain();
     }
 
-    /// 提交经过校验的 I/O 请求。
+    /// 通知底层驱动该块设备节点被打开。
     ///
-    /// 根据请求类型进行精确的参数检查，然后将请求传递给底层 `BlockIo`。
-    /// 若提交失败，返回所有权。
-    pub fn submit(
+    /// VFS 兼容层只在成功创建文件对象前调用一次；失败时打开操作返回给上层。
+    pub fn open_file(&self) -> Result<(), ControlError> {
+        if !self.is_active() {
+            return Err(ControlError::NoDevice);
+        }
+        self.driver.open_file()
+    }
+
+    /// 通知底层驱动该块设备文件对象已释放。
+    pub fn release_file(&self) {
+        self.driver.release_file();
+    }
+
+    /// 执行块设备类 typed control。
+    pub fn control(
         self: &Arc<Self>,
-        req: BlockIoRequest,
-        completion: BlockCompletion,
-    ) -> Result<(), (BlockSubmitError, BlockIoRequest, BlockCompletion)> {
-        if let Err(err) = self.validate_request(&req) {
-            return Err((err, req, completion));
-        }
-
-        let token = match self.try_begin_io() {
-            Ok(token) => token,
-            Err(err) => return Err((err, req, completion)),
-        };
-
-        // 写透设备（无 FLUSH 特性）：flush 是空操作，立即成功完成，不下发给驱动。
-        if matches!(req, BlockIoRequest::Flush) && !self.features.contains(BlockFeatures::FLUSH) {
-            token.finish();
-            completion(BlockIoCompletion {
-                request: req,
-                result: Ok(()),
-            });
-            return Ok(());
-        }
-
-        let completion_token = Arc::clone(&token);
-        let tracked_completion: BlockCompletion = Box::new(move |done| {
-            completion_token.finish();
-            completion(done);
-        });
-
-        match self.io.submit(req, tracked_completion) {
-            Ok(()) => Ok(()),
-            Err((err, req, completion)) => {
-                token.finish();
-                Err((err, req, completion))
-            }
-        }
-    }
-
-    /// 尝试将内部 `BlockIo` 向下转型为具体类型
-    pub fn downcast_io<T: 'static>(&self) -> Option<&T> {
+        req: BlockControlRequest,
+    ) -> Result<BlockControlResponse, ControlError> {
         if !self.is_active() {
-            return None;
-        }
-        self.io.as_any().downcast_ref::<T>()
-    }
-
-    /// 同步读扇区到虚拟地址缓冲区（零拷贝快速路径）。
-    ///
-    /// 驱动内部负责地址转换。跳过 Box 分配和完成回调。
-    /// 不支持时返回 `Unsupported`，调用方回退到 `submit` 路径。
-    pub fn read_sync(
-        self: &Arc<Self>,
-        lba: u64,
-        count: u32,
-        buf: &mut [u8],
-    ) -> Result<(), BlockSubmitError> {
-        if !self.is_active() {
-            return Err(BlockSubmitError::DeviceGone);
-        }
-        if count == 0 {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::EmptyRange,
-            ));
-        }
-        let bps = self.geometry.logical_block_size().get() as usize;
-        let want = (count as usize)
-            .checked_mul(bps)
-            .ok_or(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ))?;
-        if buf.len() < want {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ));
-        }
-        if let Some(total) = self.geometry.block_count() {
-            let end = lba
-                .checked_add(count as u64)
-                .ok_or(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ))?;
-            if end > total {
-                return Err(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ));
-            }
-        }
-        let token = self.try_begin_io()?;
-        let res = self.io.read_sectors_sync(lba, count, buf);
-        token.finish();
-        match res {
-            Ok(()) => Ok(()),
-            Err(BlockIoError::Unsupported) => Err(BlockSubmitError::Unsupported),
-            Err(_) => Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::OutOfBounds,
-            )),
-        }
-    }
-
-    /// 同步写扇区（对称于 `read_sync`）。
-    pub fn write_sync(
-        self: &Arc<Self>,
-        lba: u64,
-        count: u32,
-        buf: &[u8],
-    ) -> Result<(), BlockSubmitError> {
-        if !self.is_active() {
-            return Err(BlockSubmitError::DeviceGone);
-        }
-        if count == 0 {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::EmptyRange,
-            ));
-        }
-        let bps = self.geometry.logical_block_size().get() as usize;
-        let want = (count as usize)
-            .checked_mul(bps)
-            .ok_or(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ))?;
-        if buf.len() < want {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ));
-        }
-        if let Some(total) = self.geometry.block_count() {
-            let end = lba
-                .checked_add(count as u64)
-                .ok_or(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ))?;
-            if end > total {
-                return Err(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ));
-            }
-        }
-        let token = self.try_begin_io()?;
-        let res = self.io.write_sectors_sync(lba, count, buf);
-        token.finish();
-        match res {
-            Ok(()) => Ok(()),
-            Err(BlockIoError::Unsupported) => Err(BlockSubmitError::Unsupported),
-            Err(_) => Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::OutOfBounds,
-            )),
-        }
-    }
-
-    /// 同步读扇区到物理地址 `phys` 的内存范围。
-    ///
-    /// 这是 FS 层绕过 Box 分配 + memcpy 的快速路径。调用方负责:
-    /// - `phys` 指向的内存物理连续、与 VirtIO DMA 兼容;
-    /// - `len == count * logical_block_size`。
-    ///
-    /// 底层驱动若不支持 `read_sectors_sync_phys`,会返回
-    /// `BlockIoError::Unsupported`;调用方应回退到 [`submit`](Self::submit) 路径。
-    pub fn read_sync_phys(
-        self: &Arc<Self>,
-        lba: u64,
-        count: u32,
-        phys: u64,
-        len: usize,
-    ) -> Result<(), BlockSubmitError> {
-        if !self.is_active() {
-            return Err(BlockSubmitError::DeviceGone);
-        }
-        if count == 0 {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::EmptyRange,
-            ));
-        }
-        let bps = self.geometry.logical_block_size().get() as usize;
-        let want = (count as usize)
-            .checked_mul(bps)
-            .ok_or(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ))?;
-        if len < want {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ));
-        }
-        if let Some(max) = self.limits.max_blocks_per_io()
-            && count > max.get()
-        {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::TooLarge,
-            ));
-        }
-        if let Some(total) = self.geometry.block_count() {
-            let end = lba
-                .checked_add(count as u64)
-                .ok_or(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ))?;
-            if end > total {
-                return Err(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ));
-            }
-        }
-        let token = self.try_begin_io()?;
-        let res = self.io.read_sectors_sync_phys(lba, count, phys, want);
-        token.finish();
-        match res {
-            Ok(()) => Ok(()),
-            Err(BlockIoError::Unsupported) => Err(BlockSubmitError::Unsupported),
-            Err(_) => Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::OutOfBounds,
-            )),
-        }
-    }
-
-    /// 写路径的同步快速路径(对称 [`Self::read_sync_phys`])。
-    pub fn write_sync_phys(
-        self: &Arc<Self>,
-        lba: u64,
-        count: u32,
-        phys: u64,
-        len: usize,
-    ) -> Result<(), BlockSubmitError> {
-        if !self.is_active() {
-            return Err(BlockSubmitError::DeviceGone);
-        }
-        if self.features.contains(BlockFeatures::READ_ONLY) {
-            return Err(BlockSubmitError::ReadOnly);
-        }
-        if count == 0 {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::EmptyRange,
-            ));
-        }
-        let bps = self.geometry.logical_block_size().get() as usize;
-        let want = (count as usize)
-            .checked_mul(bps)
-            .ok_or(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ))?;
-        if len < want {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ));
-        }
-        if let Some(max) = self.limits.max_blocks_per_io()
-            && count > max.get()
-        {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::TooLarge,
-            ));
-        }
-        if let Some(total) = self.geometry.block_count() {
-            let end = lba
-                .checked_add(count as u64)
-                .ok_or(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ))?;
-            if end > total {
-                return Err(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ));
-            }
-        }
-        let token = self.try_begin_io()?;
-        let res = self.io.write_sectors_sync_phys(lba, count, phys, want);
-        token.finish();
-        match res {
-            Ok(()) => Ok(()),
-            Err(BlockIoError::Unsupported) => Err(BlockSubmitError::Unsupported),
-            Err(_) => Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::OutOfBounds,
-            )),
-        }
-    }
-
-    fn try_begin_io(self: &Arc<Self>) -> Result<Arc<InFlightToken>, BlockSubmitError> {
-        if !self.is_active() {
-            return Err(BlockSubmitError::DeviceGone);
+            return Err(ControlError::NoDevice);
         }
 
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        if !self.is_active() {
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
-            return Err(BlockSubmitError::DeviceGone);
-        }
-
-        Ok(Arc::new(InFlightToken::new(Arc::clone(self))))
-    }
-
-    fn validate_request(&self, req: &BlockIoRequest) -> Result<(), BlockSubmitError> {
-        if !self.is_active() {
-            return Err(BlockSubmitError::DeviceGone);
+        if let Some(response) = self.driver.control(req) {
+            return response;
         }
 
         match req {
-            BlockIoRequest::Read { range, buffer } => {
-                self.validate_range(*range)?;
-                self.validate_buffer(*range, buffer)
+            BlockControlRequest::GetReadOnly => Ok(BlockControlResponse::Bool(
+                self.features.contains(BlockFeatures::READ_ONLY),
+            )),
+            BlockControlRequest::GetCapacityBytes => self
+                .geometry
+                .capacity_bytes()
+                .map(BlockControlResponse::U64)
+                .ok_or(ControlError::Invalid),
+            BlockControlRequest::GetLogicalBlockSize => Ok(BlockControlResponse::U32(
+                self.geometry.logical_block_size().get(),
+            )),
+            BlockControlRequest::GetPhysicalBlockSize => Ok(BlockControlResponse::U32(
+                self.geometry.physical_block_size().get(),
+            )),
+            BlockControlRequest::GetIoHints => {
+                let logical = self.geometry.logical_block_size().get();
+                let optimal = self
+                    .limits
+                    .optimal_blocks_per_io()
+                    .map(|blocks| blocks.get().saturating_mul(logical))
+                    .unwrap_or(0);
+                Ok(BlockControlResponse::IoHints(BlockIoHints {
+                    min_io_size: logical,
+                    optimal_io_size: optimal,
+                    alignment_offset: self.limits.buffer_alignment().map(|_| 0).unwrap_or(0),
+                    discard_zeroes: self.features.contains(BlockFeatures::DISCARD_ZEROES),
+                    rotational: self.attributes.rotational(),
+                }))
             }
-            BlockIoRequest::Write { range, buffer, fua } => {
-                self.ensure_writable()?;
-                if *fua && !self.features.contains(BlockFeatures::FUA) {
-                    return Err(BlockSubmitError::Unsupported);
+            #[cfg(feature = "block-profile")]
+            BlockControlRequest::GetDebugProfile => Err(ControlError::Unsupported),
+            BlockControlRequest::GetDiskSeq => self
+                .attributes
+                .diskseq()
+                .map(BlockControlResponse::U64)
+                .ok_or(ControlError::Unsupported),
+            BlockControlRequest::Flush => {
+                if !self.features.contains(BlockFeatures::FLUSH) {
+                    return Ok(BlockControlResponse::Done);
                 }
-                self.validate_range(*range)?;
-                self.validate_buffer(*range, buffer)
-            }
-            BlockIoRequest::Discard { range } => {
-                self.ensure_writable()?;
-                if !self.features.contains(BlockFeatures::DISCARD) {
-                    return Err(BlockSubmitError::Unsupported);
-                }
-                self.validate_range(*range)
-            }
-            BlockIoRequest::WriteZeroes { range } => {
-                self.ensure_writable()?;
-                if !self.features.contains(BlockFeatures::WRITE_ZEROES) {
-                    return Err(BlockSubmitError::Unsupported);
-                }
-                self.validate_range(*range)
-            }
-            BlockIoRequest::Flush => {
-                // 写透设备（无 FLUSH 特性）的 flush 由 submit 层直接短路为成功；
-                // 有 FLUSH 特性的设备才会进入此分支。
-                Ok(())
+                self.submit_bio_wait(
+                    BioOp::Flush,
+                    BlockRange { lba: 0, blocks: 0 },
+                    BioBuffer::None,
+                )
+                .map_err(map_bio_control_error)?;
+                Ok(BlockControlResponse::Done)
             }
         }
     }
 
-    fn ensure_writable(&self) -> Result<(), BlockSubmitError> {
-        if self.features.contains(BlockFeatures::READ_ONLY) {
-            Err(BlockSubmitError::ReadOnly)
+    /// 尝试将内部 `BlockDriver` 向下转型为具体类型。
+    pub fn downcast_driver<T: 'static>(&self) -> Option<&T> {
+        if !self.is_active() {
+            return None;
+        }
+        self.driver.as_any().downcast_ref::<T>()
+    }
+
+    // ── Bio 提交 API ──────────────────────────────────────
+
+    /// 同步提交并阻塞等待。
+    ///
+    /// 使用共享 Completion，保证等待任务被信号/超时杀死后，驱动稍后完成 pending
+    /// BIO 时仍有有效 completion 目标。这里不能使用栈上 completion：同步等待期间
+    /// 会让出 CPU，任务可能在 BIO 完成前退出并回收内核栈。
+    /// 统计在完成后由本函数直接记录，跳过 observer 回调中的额外时钟读取。
+    /// 通过主动 drain 推进硬件完成，不依赖中断。
+    pub fn submit_bio_wait(
+        self: &Arc<Self>,
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+    ) -> Result<Bio, BioError> {
+        self.validate_bio(op, range, &buffer)?;
+        let submitted_ns = sched::now_ns_public();
+        let (bio, completion) = Bio::new_shared_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            None,
+        );
+        self.io_stats.begin(op);
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            self.io_stats.cancel(op);
+            return Err(BioError::Submit(err));
+        }
+
+        while !completion.is_done() {
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                self.driver.drain();
+                if completion.is_done() {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+            if sched::is_ready() {
+                if completion.is_done() {
+                    break;
+                }
+                sched::schedule_once(sched::now_ns_public());
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+        let result = completion.wait();
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        if result.is_ok() {
+            self.io_stats.record_complete(
+                op,
+                range,
+                self.geometry.logical_block_size(),
+                elapsed_ns,
+            );
         } else {
-            Ok(())
+            self.io_stats.cancel(op);
         }
+        result
     }
 
-    fn validate_range(&self, range: BlockRange) -> Result<(), BlockSubmitError> {
+    /// 同步提交并返回分段耗时，供 block-bench 定位固定成本。
+    ///
+    /// 该接口刻意不复用 [`Self::submit_bio_wait`]，避免在普通路径中引入 profiling
+    /// 分支和额外时间戳读取。
+    pub fn submit_bio_wait_profiled(
+        self: &Arc<Self>,
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+    ) -> Result<(Bio, BlockSubmitProfile), BioError> {
+        let total_start = sched::now_ns_public();
+        let mut profile = BlockSubmitProfile::default();
+
+        let t0 = sched::now_ns_public();
+        self.validate_bio(op, range, &buffer)?;
+        profile.validate_ns = sched::now_ns_public().saturating_sub(t0);
+
+        let submitted_ns = sched::now_ns_public();
+        let t0 = sched::now_ns_public();
+        let (bio, completion) = Bio::new_shared_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            None,
+        );
+        profile.build_bio_ns = sched::now_ns_public().saturating_sub(t0);
+
+        self.io_stats.begin(op);
+        let t0 = sched::now_ns_public();
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
+            self.io_stats.cancel(op);
+            profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
+            return Err(BioError::Submit(err));
+        }
+        profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
+
+        while !completion.is_done() {
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                let t0 = sched::now_ns_public();
+                self.driver.drain();
+                profile.drain_ns = profile
+                    .drain_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.drain_calls = profile.drain_calls.saturating_add(1);
+                if completion.is_done() {
+                    break;
+                }
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+            if sched::is_ready() {
+                if completion.is_done() {
+                    break;
+                }
+                let t0 = sched::now_ns_public();
+                sched::schedule_once(sched::now_ns_public());
+                profile.schedule_ns = profile
+                    .schedule_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.schedule_calls = profile.schedule_calls.saturating_add(1);
+            } else {
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+        }
+
+        let t0 = sched::now_ns_public();
+        let result = completion.wait();
+        profile.completion_take_ns = sched::now_ns_public().saturating_sub(t0);
+
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        let t0 = sched::now_ns_public();
+        if result.is_ok() {
+            self.io_stats.record_complete(
+                op,
+                range,
+                self.geometry.logical_block_size(),
+                elapsed_ns,
+            );
+        } else {
+            self.io_stats.cancel(op);
+        }
+        profile.stats_ns = sched::now_ns_public().saturating_sub(t0);
+        profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
+
+        result.map(|bio| (bio, profile))
+    }
+
+    /// 同步读取到调用者提供的缓冲区。
+    ///
+    /// 该接口专供文件系统同步后端等短生命周期调用者使用：BIO 在函数返回前必定
+    /// 完成，因此底层驱动可以复用同一条提交路径，而无需为每次读额外分配中转
+    /// `Box<[u8]>` 再拷贝回调用者缓冲。
+    pub fn submit_bio_wait_borrowed_read(
+        self: &Arc<Self>,
+        range: BlockRange,
+        buf: &mut [u8],
+    ) -> Result<(), BioError> {
+        self.submit_bio_wait(BioOp::Read, range, BioBuffer::borrowed_read(buf))
+            .map(|_| ())
+    }
+
+    /// 同步写入调用者提供的缓冲区。
+    ///
+    /// 借用缓冲只在本次同步提交期间有效；函数返回后驱动不得再保存或访问该指针。
+    /// 这保持了块层 API 的拥有式异步语义，同时消除同步写路径的 staging 分配和复制。
+    pub fn submit_bio_wait_borrowed_write(
+        self: &Arc<Self>,
+        range: BlockRange,
+        buf: &[u8],
+    ) -> Result<(), BioError> {
+        self.submit_bio_wait(BioOp::Write, range, BioBuffer::borrowed_write(buf))
+            .map(|_| ())
+    }
+
+    /// 异步提交，返回 `BioFuture`。
+    pub fn submit_bio_async(
+        self: &Arc<Self>,
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+    ) -> Result<BioFuture, BioError> {
+        self.validate_bio(op, range, &buffer)?;
+        let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
+        let submitted_ns = sched::now_ns_public();
+        let (bio, completion) = Bio::new_shared_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            Some(observer),
+        );
+        self.io_stats.begin(op);
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            self.io_stats.cancel(op);
+            return Err(BioError::Submit(err));
+        }
+        Ok(BioFuture { completion })
+    }
+
+    // ── 参数校验 ──────────────────────────────────────
+
+    fn validate_bio(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        buffer: &BioBuffer,
+    ) -> Result<(), BioError> {
+        if !self.is_active() {
+            return Err(BioError::Submit(SubmitError::DeviceGone));
+        }
+        if op.is_write() && self.features.contains(BlockFeatures::READ_ONLY) {
+            return Err(BioError::Submit(SubmitError::ReadOnly));
+        }
+        match op {
+            BioOp::Flush => {
+                if !self.features.contains(BlockFeatures::FLUSH) {
+                    return Err(BioError::Submit(SubmitError::Unsupported));
+                }
+                // Flush 是设备级缓存同步命令，不携带 LBA 范围和数据缓冲区；
+                // 在这里统一拒绝带范围/缓冲区的请求，避免具体驱动各自猜测语义。
+                if range.blocks != 0 {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )));
+                }
+                if !matches!(buffer, BioBuffer::None) {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )));
+                }
+                return Ok(());
+            }
+            BioOp::Discard | BioOp::WriteZeroes => {
+                if op == BioOp::Discard && !self.features.contains(BlockFeatures::DISCARD) {
+                    return Err(BioError::Submit(SubmitError::Unsupported));
+                }
+                if op == BioOp::WriteZeroes && !self.features.contains(BlockFeatures::WRITE_ZEROES)
+                {
+                    return Err(BioError::Submit(SubmitError::Unsupported));
+                }
+            }
+            BioOp::Read | BioOp::Write => {}
+        }
+
         if range.blocks == 0 {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::EmptyRange,
-            ));
+            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                BioReqError::EmptyRange,
+            )));
         }
-
-        if let Some(max) = self.limits.max_blocks_per_io()
-            && range.blocks > max.get()
-        {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::TooLarge,
-            ));
+        match op {
+            BioOp::Discard | BioOp::WriteZeroes => {
+                if let Some(limits) = self.limits.range_limits_for(op) {
+                    if let Some(max) = limits.max_blocks_per_io() {
+                        if range.blocks > max.get() {
+                            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                                BioReqError::TooLarge,
+                            )));
+                        }
+                    }
+                    if let Some(alignment) = limits.alignment_blocks() {
+                        if !range.lba.is_multiple_of(u64::from(alignment.get())) {
+                            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                                BioReqError::Misaligned,
+                            )));
+                        }
+                    }
+                }
+            }
+            BioOp::Read | BioOp::Write => {
+                if let Some(max) = self.limits.max_blocks_per_io() {
+                    if range.blocks > max.get() {
+                        return Err(BioError::Submit(SubmitError::InvalidRequest(
+                            BioReqError::TooLarge,
+                        )));
+                    }
+                }
+            }
+            BioOp::Flush => {}
         }
-
-        let end_lba =
-            range
+        if let Some(count) = self.geometry.block_count() {
+            let end = range
                 .lba
                 .checked_add(range.blocks as u64)
-                .ok_or(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::OutOfBounds,
-                ))?;
-
-        if let Some(count) = self.geometry.block_count()
-            && end_lba > count
-        {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::OutOfBounds,
-            ));
+                .ok_or(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::OutOfBounds,
+                )))?;
+            if end > count {
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::OutOfBounds,
+                )));
+            }
         }
 
+        if op.needs_data() {
+            let block_size = self.geometry.logical_block_size().get() as usize;
+            let expected =
+                (range.blocks as usize)
+                    .checked_mul(block_size)
+                    .ok_or(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::BufferSizeMismatch,
+                    )))?;
+            if buffer.len() != expected {
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::BufferSizeMismatch,
+                )));
+            }
+            if !buffer.accepts_op(op) {
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::BufferSizeMismatch,
+                )));
+            }
+            if let Some(alignment) = self.limits.buffer_alignment() {
+                let align = alignment.get() as usize;
+                if let Some(addr) = buffer.ptr_addr()
+                    && !addr.is_multiple_of(align)
+                {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::Misaligned,
+                    )));
+                }
+            }
+        }
         Ok(())
     }
+}
 
-    fn validate_buffer(&self, range: BlockRange, buffer: &[u8]) -> Result<(), BlockSubmitError> {
-        let block_size = self.geometry.logical_block_size().get() as usize;
-        let expected = (range.blocks as usize).checked_mul(block_size).ok_or(
-            BlockSubmitError::InvalidRequest(BlockRequestError::BufferSizeMismatch),
-        )?;
+impl DriverControl for Arc<BlockDevice> {
+    type Request = BlockControlRequest;
+    type Response = BlockControlResponse;
+    type Error = ControlError;
 
-        if buffer.len() != expected {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::BufferSizeMismatch,
-            ));
-        }
-        if expected > u32::MAX as usize {
-            return Err(BlockSubmitError::InvalidRequest(
-                BlockRequestError::TooLarge,
-            ));
-        }
-
-        if let Some(alignment) = self.limits.buffer_alignment() {
-            let alignment = alignment.get() as usize;
-            if !(buffer.as_ptr() as usize).is_multiple_of(alignment) {
-                return Err(BlockSubmitError::InvalidRequest(
-                    BlockRequestError::Misaligned,
-                ));
-            }
-        }
-
-        Ok(())
+    fn control(&self, req: Self::Request) -> Result<Self::Response, Self::Error> {
+        BlockDevice::control(self, req)
     }
 }
 
-struct InFlightToken {
-    dev: Arc<BlockDevice>,
-    armed: AtomicBool,
-}
-
-impl InFlightToken {
-    fn new(dev: Arc<BlockDevice>) -> Self {
-        Self {
-            dev,
-            armed: AtomicBool::new(true),
+fn map_bio_control_error(err: BioError) -> ControlError {
+    match err {
+        BioError::Submit(SubmitError::DeviceGone) => ControlError::NoDevice,
+        BioError::Submit(SubmitError::QueueFull) => ControlError::Busy,
+        BioError::Submit(SubmitError::ReadOnly) => ControlError::Permission,
+        BioError::Submit(SubmitError::Unsupported) => ControlError::Unsupported,
+        BioError::Submit(SubmitError::OutOfMemory | SubmitError::InvalidRequest(_)) => {
+            ControlError::Invalid
         }
-    }
-
-    fn finish(&self) {
-        if self.armed.swap(false, Ordering::AcqRel) {
-            self.dev.in_flight.fetch_sub(1, Ordering::AcqRel);
-        }
+        BioError::Io(_) => ControlError::Io,
     }
 }
 
-impl Drop for InFlightToken {
-    fn drop(&mut self) {
-        self.finish();
-    }
+// ───────── BioFuture ─────────
+
+/// 块 I/O Future。poll 时检查底层 Completion 状态。
+pub struct BioFuture {
+    completion: Arc<Completion<BioResult>>,
 }
 
-// ───────── 块设备动态注册表 ─────────
+impl Future for BioFuture {
+    type Output = BioResult;
 
-/// 无容量上限的块设备列表（受自旋锁保护）
-///
-/// 使用 `spin::mutex::Mutex` 保护内部 `Vec`，IRQ 安全性由调用方保证
-///（与 `CharDevList` 一样，此列表面向堆可用后的动态注册场景）。
-/// 不要在中断上下文调用 `push` / `remove` / `list`。
-pub struct BlockDeviceList {
-    devices: Mutex<Vec<Arc<BlockDevice>>>,
-}
-
-impl BlockDeviceList {
-    pub const fn new() -> Self {
-        Self {
-            devices: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// 注册设备，返回 `Arc<BlockDev>` 句柄。
-    ///
-    /// 会检查名称唯一性，若重复则返回 `Err(BlockRegistryError::NameExists)`。
-    pub fn push(&self, dev: &Arc<BlockDevice>) -> Result<Arc<BlockDevice>, BlockRegistryError> {
-        if !dev.is_active() {
-            return Err(BlockRegistryError::DeviceGone);
-        }
-
-        {
-            let mut list = self.devices.lock();
-            list.retain(|existing| existing.is_active());
-            if !dev.is_active() {
-                return Err(BlockRegistryError::DeviceGone);
-            }
-            if list.iter().any(|d| d.name() == dev.name()) {
-                return Err(BlockRegistryError::NameExists);
-            }
-            if list.len() < list.capacity() {
-                list.push(Arc::clone(dev));
-                return Ok(Arc::clone(dev));
-            }
-        }
-
-        loop {
-            let initial_len = self.devices.lock().len();
-            let needed = initial_len
-                .checked_add(1)
-                .ok_or(BlockRegistryError::OutOfMemory)?;
-            let mut replacement = Vec::new();
-            replacement
-                .try_reserve(needed)
-                .map_err(|_| BlockRegistryError::OutOfMemory)?;
-
-            let mut list = self.devices.lock();
-            list.retain(|existing| existing.is_active());
-            if !dev.is_active() {
-                return Err(BlockRegistryError::DeviceGone);
-            }
-            if list.iter().any(|d| d.name() == dev.name()) {
-                return Err(BlockRegistryError::NameExists);
-            }
-
-            if list.len() < list.capacity() {
-                list.push(Arc::clone(dev));
-                return Ok(Arc::clone(dev));
-            }
-
-            let needed = list
-                .len()
-                .checked_add(1)
-                .ok_or(BlockRegistryError::OutOfMemory)?;
-            if needed > replacement.capacity() {
-                continue;
-            }
-
-            replacement.extend(list.iter().cloned());
-            replacement.push(Arc::clone(dev));
-            let old = core::mem::replace(&mut *list, replacement);
-            drop(list);
-            drop(old);
-            return Ok(Arc::clone(dev));
-        }
-    }
-
-    /// 根据名称查找设备
-    pub fn lookup(&self, name: &str) -> Option<Arc<BlockDevice>> {
-        let list = self.devices.lock();
-        list.iter()
-            .find(|d| d.name() == name && d.is_active())
-            .cloned()
-    }
-
-    /// 移除指定名称的设备，返回 `true` 表示成功移除
-    pub fn remove(&self, name: &str) -> bool {
-        let mut list = self.devices.lock();
-        if let Some(pos) = list.iter().position(|d| d.name() == name) {
-            list[pos].mark_gone();
-            list.swap_remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// 获取当前设备列表的快照（`Arc` 副本）
-    pub fn list(&self) -> Result<Vec<Arc<BlockDevice>>, BlockRegistryError> {
-        loop {
-            let len = self.devices.lock().len();
-            let mut snapshot = Vec::new();
-            snapshot
-                .try_reserve(len)
-                .map_err(|_| BlockRegistryError::OutOfMemory)?;
-
-            let list = self.devices.lock();
-            if list.len() <= snapshot.capacity() {
-                snapshot.extend(list.iter().filter(|dev| dev.is_active()).cloned());
-                return Ok(snapshot);
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.devices
-            .lock()
-            .iter()
-            .filter(|dev| dev.is_active())
-            .count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-impl Default for BlockDeviceList {
-    fn default() -> Self {
-        Self::new()
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.completion.poll(cx)
     }
 }

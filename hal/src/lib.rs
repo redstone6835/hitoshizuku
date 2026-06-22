@@ -8,11 +8,14 @@
 
 #![no_std]
 
+extern crate alloc;
 extern crate arch;
 
+pub mod abi;
 pub mod console;
 pub mod memory;
 pub mod platform;
+pub mod random;
 pub mod sched;
 pub mod time;
 pub mod user;

@@ -753,6 +753,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
             0, 0, timer_hz, period,
         ));
     }
+    super::trap::install_loongarch_irq_line_ops();
 
     // ═══════════════════════════════════════════════════════════════════════════
     // 步骤 1.2：注册时间戳源 (Timestamp Source)

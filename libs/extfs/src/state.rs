@@ -7,6 +7,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,36 +25,67 @@ use vfs::sync::Spinlock;
 
 use crate::bgd::{self, GroupDesc};
 use crate::inode::{ExtInodeOps, load_inode};
+use crate::inode_wr::RawInode;
 use crate::layout::{EXT4_ROOT_INO, ExtKind};
 use crate::sb::{self, Superblock as ExtSb};
 
-const BLOCK_CACHE_CAP: usize = 512;
+const BLOCK_CACHE_CAP: usize = 8192;
 
 struct BlockCacheSlot {
     block: u64,
     data: Vec<u8>,
     referenced: bool,
     occupied: bool,
+    dirty: bool,
+    version: u64,
+}
+
+struct DirtyBlockSnapshot {
+    block: u64,
+    data: Vec<u8>,
+    version: u64,
 }
 
 /// O(log n) 块缓存：BTreeMap 索引 + Clock eviction。
-struct BlockCache {
+pub(crate) struct BlockCache {
     slots: Vec<BlockCacheSlot>,
     /// block_no → slot 索引。
     index: BTreeMap<u64, usize>,
     /// Clock eviction 指针（循环扫描）。
     hand: usize,
     block_size: usize,
+    write_seq: u64,
 }
 
 impl BlockCache {
     fn new(block_size: u32) -> Self {
+        let bs = block_size as usize;
+        let mut slots = Vec::with_capacity(BLOCK_CACHE_CAP);
+        for _ in 0..BLOCK_CACHE_CAP {
+            slots.push(BlockCacheSlot {
+                block: 0,
+                data: vec![0u8; bs],
+                referenced: false,
+                occupied: false,
+                dirty: false,
+                version: 0,
+            });
+        }
         Self {
-            slots: Vec::new(),
+            slots,
             index: BTreeMap::new(),
             hand: 0,
-            block_size: block_size as usize,
+            block_size: bs,
+            write_seq: 0,
         }
+    }
+
+    fn next_version(&mut self) -> u64 {
+        self.write_seq = self.write_seq.wrapping_add(1);
+        if self.write_seq == 0 {
+            self.write_seq = 1;
+        }
+        self.write_seq
     }
 
     fn read(&mut self, block: u64, out: &mut [u8]) -> bool {
@@ -69,16 +101,114 @@ impl BlockCache {
         false
     }
 
-    fn insert(&mut self, block: u64, data: &[u8]) {
-        if data.len() != self.block_size {
+    /// 在 cache 内原地修改指定块的部分字节，同时将该块标记为 dirty。
+    /// 如果该块不在 cache 中则返回 false，调用方需要回退到 read + modify + write 路径。
+    fn modify_inplace(&mut self, block: u64, offset: usize, src: &[u8]) -> bool {
+        if offset + src.len() > self.block_size {
+            return false;
+        }
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            slot.data[offset..offset + src.len()].copy_from_slice(src);
+            slot.referenced = true;
+            slot.dirty = true;
+            slot.version = {
+                self.write_seq = self.write_seq.wrapping_add(1);
+                if self.write_seq == 0 {
+                    self.write_seq = 1;
+                }
+                self.write_seq
+            };
+            return true;
+        }
+        false
+    }
+
+    /// 在 cache 内原地读取指定块的部分字节到输出缓冲区。
+    /// 如果该块不在 cache 中则返回 false。
+    pub(crate) fn read_partial(&mut self, block: u64, offset: usize, dst: &mut [u8]) -> bool {
+        if offset + dst.len() > self.block_size {
+            return false;
+        }
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            slot.referenced = true;
+            dst.copy_from_slice(&slot.data[offset..offset + dst.len()]);
+            return true;
+        }
+        false
+    }
+
+    fn contains(&self, block: u64) -> bool {
+        self.index.contains_key(&block)
+    }
+
+    fn invalidate(&mut self, block: u64) {
+        if let Some(&idx) = self.index.get(&block) {
+            self.slots[idx].occupied = false;
+            self.slots[idx].dirty = false;
+            self.index.remove(&block);
+        }
+    }
+
+    fn update_if_present(&mut self, block: u64, data: &[u8]) {
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            slot.data.copy_from_slice(data);
+            slot.referenced = true;
+            slot.dirty = false;
+        }
+    }
+
+    fn read_range(&mut self, start: u64, count: u32, out: &mut [u8]) -> bool {
+        if out.len() != self.block_size * count as usize {
+            return false;
+        }
+        for i in 0..count {
+            if !self.index.contains_key(&(start + i as u64)) {
+                return false;
+            }
+        }
+        for i in 0..count {
+            let block = start + i as u64;
+            let idx = self.index[&block];
+            let slot = &mut self.slots[idx];
+            slot.referenced = true;
+            let off = i as usize * self.block_size;
+            out[off..off + self.block_size].copy_from_slice(&slot.data);
+        }
+        true
+    }
+
+    fn overlay_range(&mut self, start: u64, count: u32, out: &mut [u8]) {
+        if out.len() != self.block_size * count as usize {
             return;
         }
+        for i in 0..count {
+            let block = start + i as u64;
+            if let Some(&idx) = self.index.get(&block) {
+                let slot = &mut self.slots[idx];
+                slot.referenced = true;
+                let off = i as usize * self.block_size;
+                out[off..off + self.block_size].copy_from_slice(&slot.data);
+            }
+        }
+    }
+
+    /// Write-back 插入：标记 dirty，驱逐时不做 I/O，返回被驱逐脏块的 (block, data)。
+    fn insert_wb(&mut self, block: u64, data: &[u8]) -> Option<(u64, Vec<u8>)> {
+        if data.len() != self.block_size {
+            return None;
+        }
+        let version = self.next_version();
         // 命中：原地更新
         if let Some(&idx) = self.index.get(&block) {
             let slot = &mut self.slots[idx];
             slot.data.copy_from_slice(data);
             slot.referenced = true;
-            return;
+            slot.dirty = true;
+            slot.version = version;
+            return None;
         }
         // 未满：直接 push
         if self.slots.len() < BLOCK_CACHE_CAP {
@@ -88,9 +218,118 @@ impl BlockCache {
                 data: Vec::from(data),
                 referenced: true,
                 occupied: true,
+                dirty: true,
+                version,
             });
             self.index.insert(block, idx);
-            return;
+            return None;
+        }
+        // 已满：Clock eviction，优先驱逐 clean 块
+        let cap = self.slots.len();
+        let mut evicted: Option<(u64, Vec<u8>)> = None;
+        let mut steps = 0usize;
+        loop {
+            let i = self.hand;
+            self.hand = (self.hand + 1) % cap;
+            let slot = &mut self.slots[i];
+            if !slot.occupied {
+                slot.block = block;
+                slot.data.copy_from_slice(data);
+                slot.referenced = true;
+                slot.occupied = true;
+                slot.dirty = true;
+                slot.version = version;
+                self.index.insert(block, i);
+                return evicted;
+            }
+            if slot.referenced {
+                slot.referenced = false;
+                steps += 1;
+                if steps > cap * 2 {
+                    let old_block = slot.block;
+                    if slot.dirty {
+                        evicted = Some((old_block, slot.data.clone()));
+                    }
+                    self.index.remove(&old_block);
+                    slot.block = block;
+                    slot.data.copy_from_slice(data);
+                    slot.referenced = true;
+                    slot.dirty = true;
+                    slot.version = version;
+                    self.index.insert(block, i);
+                    return evicted;
+                }
+                continue;
+            }
+            // 可驱逐
+            let old_block = slot.block;
+            if slot.dirty {
+                evicted = Some((old_block, slot.data.clone()));
+            }
+            self.index.remove(&old_block);
+            slot.block = block;
+            slot.data.copy_from_slice(data);
+            slot.referenced = true;
+            slot.dirty = true;
+            slot.version = version;
+            self.index.insert(block, i);
+            return evicted;
+        }
+    }
+
+    fn insert_clean<F>(
+        &mut self,
+        block: u64,
+        data: &[u8],
+        flush: F,
+    ) -> Result<(), BlockBackendError>
+    where
+        F: FnMut(u64, &[u8]) -> Result<(), BlockBackendError>,
+    {
+        if self.index.contains_key(&block) {
+            return Ok(());
+        }
+        self.insert(block, data, false, flush)
+    }
+
+    fn insert<F>(
+        &mut self,
+        block: u64,
+        data: &[u8],
+        dirty: bool,
+        mut flush: F,
+    ) -> Result<(), BlockBackendError>
+    where
+        F: FnMut(u64, &[u8]) -> Result<(), BlockBackendError>,
+    {
+        if data.len() != self.block_size {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        let version = if dirty { self.next_version() } else { 0 };
+        // 命中：原地更新
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            slot.data.copy_from_slice(data);
+            slot.referenced = true;
+            if dirty {
+                slot.dirty = true;
+                slot.version = version;
+            }
+            return Ok(());
+        }
+        // 未满：直接 push
+        if self.slots.len() < BLOCK_CACHE_CAP {
+            let idx = self.slots.len();
+            self.slots.push(BlockCacheSlot {
+                block,
+                data: Vec::from(data),
+                referenced: true,
+                occupied: true,
+                dirty,
+                version,
+            });
+            self.index.insert(block, idx);
+            return Ok(());
         }
         // 已满：Clock eviction
         let cap = self.slots.len();
@@ -104,8 +343,10 @@ impl BlockCache {
                 slot.data.copy_from_slice(data);
                 slot.referenced = true;
                 slot.occupied = true;
+                slot.dirty = dirty;
+                slot.version = version;
                 self.index.insert(block, i);
-                return;
+                return Ok(());
             }
             if slot.referenced {
                 slot.referenced = false;
@@ -113,26 +354,131 @@ impl BlockCache {
                 if steps > cap * 2 {
                     // 保险：兜底 LRU 化淘汰
                     let old_block = slot.block;
+                    if slot.dirty {
+                        flush(old_block, &slot.data)?;
+                    }
                     self.index.remove(&old_block);
                     slot.block = block;
                     slot.data.copy_from_slice(data);
                     slot.referenced = true;
+                    slot.dirty = dirty;
+                    slot.version = version;
                     self.index.insert(block, i);
-                    return;
+                    return Ok(());
                 }
                 continue;
             }
             // 命中淘汰
             let old_block = slot.block;
+            if slot.dirty {
+                flush(old_block, &slot.data)?;
+            }
             self.index.remove(&old_block);
             slot.block = block;
             slot.data.copy_from_slice(data);
             slot.referenced = true;
+            slot.dirty = dirty;
+            slot.version = version;
             self.index.insert(block, i);
-            return;
+            return Ok(());
         }
     }
 
+    fn try_insert_clean(&mut self, block: u64, data: &[u8]) -> bool {
+        self.try_insert(block, data, false)
+    }
+
+    fn try_insert_dirty(&mut self, block: u64, data: &[u8]) -> bool {
+        self.try_insert(block, data, true)
+    }
+
+    fn try_insert(&mut self, block: u64, data: &[u8], dirty: bool) -> bool {
+        if data.len() != self.block_size {
+            return false;
+        }
+        if let Some(&idx) = self.index.get(&block) {
+            let version = if dirty { self.next_version() } else { 0 };
+            let slot = &mut self.slots[idx];
+            slot.data.copy_from_slice(data);
+            slot.referenced = true;
+            if dirty {
+                slot.dirty = true;
+                slot.version = version;
+            }
+            return true;
+        }
+        if self.slots.len() < BLOCK_CACHE_CAP {
+            let idx = self.slots.len();
+            let version = if dirty { self.next_version() } else { 0 };
+            self.slots.push(BlockCacheSlot {
+                block,
+                data: Vec::from(data),
+                referenced: true,
+                occupied: true,
+                dirty,
+                version,
+            });
+            self.index.insert(block, idx);
+            return true;
+        }
+        let cap = self.slots.len();
+        let version = if dirty { self.next_version() } else { 0 };
+        let start = self.hand;
+        let mut i = start;
+        let mut steps = 0u32;
+        loop {
+            if steps >= 16 {
+                return false;
+            }
+            let slot = &mut self.slots[i];
+            if !slot.occupied || (!slot.dirty && !slot.referenced) {
+                let old_block = slot.block;
+                if slot.occupied {
+                    self.index.remove(&old_block);
+                }
+                slot.block = block;
+                slot.data.copy_from_slice(data);
+                slot.referenced = true;
+                slot.occupied = true;
+                slot.dirty = dirty;
+                slot.version = version;
+                self.hand = (i + 1) % cap;
+                self.index.insert(block, i);
+                return true;
+            }
+            slot.referenced = false;
+            i = (i + 1) % cap;
+            steps += 1;
+            if i == start {
+                return false;
+            }
+        }
+    }
+
+    fn dirty_snapshots(&self) -> Vec<DirtyBlockSnapshot> {
+        let mut dirty = Vec::new();
+        for slot in &self.slots {
+            if slot.occupied && slot.dirty {
+                dirty.push(DirtyBlockSnapshot {
+                    block: slot.block,
+                    data: slot.data.clone(),
+                    version: slot.version,
+                });
+            }
+        }
+        dirty
+    }
+
+    fn mark_clean(&mut self, block: u64, version: u64) {
+        if let Some(&idx) = self.index.get(&block) {
+            let slot = &mut self.slots[idx];
+            if slot.occupied && slot.dirty && slot.version == version {
+                slot.dirty = false;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     fn invalidate_range(&mut self, start: u64, count: u32) {
         if count == 0 {
             return;
@@ -145,6 +491,7 @@ impl BlockCache {
                 let slot = &mut self.slots[idx];
                 slot.occupied = false;
                 slot.referenced = false;
+                slot.dirty = false;
             }
         }
     }
@@ -184,13 +531,15 @@ pub(crate) struct FsState {
     pub(crate) ext_sb: ExtSb,
     pub(crate) group_desc: Spinlock<alloc::vec::Vec<GroupDesc>>,
     pub(crate) group_counts: Spinlock<alloc::vec::Vec<GroupCounts>>,
-    block_cache: Spinlock<BlockCache>,
+    pub(crate) block_cache: Spinlock<BlockCache>,
     block_cache_epoch: core::sync::atomic::AtomicU64,
     pub(crate) sb_free_blocks: core::sync::atomic::AtomicU64,
     pub(crate) sb_free_inodes: core::sync::atomic::AtomicU32,
     pub(crate) block_alloc_hint: core::sync::atomic::AtomicU64,
     pub(crate) inode_alloc_hint: core::sync::atomic::AtomicU32,
-    pub(crate) alloc_meta_dirty: AtomicBool,
+    pub(crate) alloc_group_dirty: Spinlock<alloc::vec::Vec<u8>>,
+    pub(crate) alloc_sb_dirty: AtomicBool,
+    pub(crate) dirty_inodes: Spinlock<alloc::vec::Vec<Arc<Spinlock<RawInode>>>>,
     /// 只读挂载标志(由驱动 flags 或 remount 控制)。
     pub(crate) read_only: core::sync::atomic::AtomicBool,
 }
@@ -229,8 +578,7 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.free_blocks = apply_delta(c.free_blocks, delta);
         }
-        let _ = group;
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.mark_group_dirty(group)?;
         Ok(())
     }
     pub(crate) fn adjust_group_free_inodes(
@@ -245,8 +593,7 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.free_inodes = apply_delta(c.free_inodes, delta);
         }
-        let _ = group;
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.mark_group_dirty(group)?;
         Ok(())
     }
     pub(crate) fn adjust_group_used_dirs(
@@ -261,8 +608,16 @@ impl FsState {
                 .ok_or(BlockBackendError::OutOfRange)?;
             c.used_dirs = apply_delta(c.used_dirs, delta);
         }
-        let _ = group;
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.mark_group_dirty(group)?;
+        Ok(())
+    }
+
+    fn mark_group_dirty(&self, group: u32) -> Result<(), BlockBackendError> {
+        let mut dirty = self.alloc_group_dirty.lock();
+        let slot = dirty
+            .get_mut(group as usize)
+            .ok_or(BlockBackendError::OutOfRange)?;
+        *slot = 1;
         Ok(())
     }
 
@@ -277,7 +632,7 @@ impl FsState {
         };
         self.sb_free_blocks
             .store(next, core::sync::atomic::Ordering::Release);
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.alloc_sb_dirty.store(true, Ordering::Release);
         Ok(())
     }
     pub(crate) fn adjust_sb_free_inodes(&self, delta: i32) -> Result<(), BlockBackendError> {
@@ -287,7 +642,7 @@ impl FsState {
         let next = apply_delta(prev, delta);
         self.sb_free_inodes
             .store(next, core::sync::atomic::Ordering::Release);
-        self.alloc_meta_dirty.store(true, Ordering::Release);
+        self.alloc_sb_dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -319,19 +674,91 @@ impl FsState {
         let epoch = self.block_cache_epoch.load(Ordering::Acquire);
         bgd::read_blocks(self.backend.as_ref(), &self.ext_sb, block, 1, out)?;
         if self.block_cache_epoch.load(Ordering::Acquire) == epoch {
-            self.block_cache.lock().insert(block, out);
+            let mut cache = self.block_cache.lock();
+            if !cache.read(block, out) {
+                cache.try_insert_clean(block, out);
+            }
         }
         Ok(())
     }
 
-    /// 以块为单位写入。
+    /// 在 cache 内原地修改块的部分字节（partial write 快速路径）。
+    /// 块必须已在 cache 中；若不在则返回 false，调用方回退到 read + modify + write。
+    /// 成功时只需一次加锁、零次 memcpy 整块。
+    /// 注：此方法用于数据块覆盖写，不改变块映射关系，故不递增 epoch。
+    #[inline]
+    pub(crate) fn modify_block_partial(&self, block: u64, offset: usize, src: &[u8]) -> bool {
+        let mut cache = self.block_cache.lock();
+        cache.modify_inplace(block, offset, src)
+    }
+
+    /// 丢弃一段数据块缓存。释放块前必须清理 dirty cache，避免块被重新分配后
+    /// 旧文件的延迟写回覆盖新文件数据。
+    pub(crate) fn discard_cached_blocks(&self, start_block: u64, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let mut cache = self.block_cache.lock();
+        cache.invalidate_range(start_block, count);
+    }
+
+    /// 修改块内部分字节。cache miss 时只读一次整块，之后转为 write-back dirty。
+    ///
+    /// inode table / bitmap 这类元数据经常在同一个 4K 块内连续修改多个小结构。
+    /// 如果每次都 read-modify-write 整块，会把 iozone 的 create/unlink 阶段放大成
+    /// 大量 4K virtio-mmio 请求；这里优先复用已缓存脏块，miss 时才补一次整块读。
+    pub(crate) fn write_block_partial(
+        &self,
+        block: u64,
+        offset: usize,
+        src: &[u8],
+    ) -> Result<(), BlockBackendError> {
+        if offset + src.len() > self.ext_sb.block_size as usize {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if self.modify_block_partial(block, offset, src) {
+            return Ok(());
+        }
+
+        let mut data = vec![0u8; self.ext_sb.block_size as usize];
+        self.read_block(block, &mut data)?;
+        data[offset..offset + src.len()].copy_from_slice(src);
+        self.write_block(block, &data)
+    }
+
+    /// 以块为单位写入（write-back：只更新 cache，延迟落盘）。
     pub(crate) fn write_block(&self, block: u64, data: &[u8]) -> Result<(), BlockBackendError> {
         if data.len() != self.ext_sb.block_size as usize {
             return Err(BlockBackendError::OutOfRange);
         }
-        bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, block, 1, data)?;
+        let evicted = {
+            let mut cache = self.block_cache.lock();
+            cache.insert_wb(block, data)
+        };
+        if let Some((old_block, old_data)) = evicted {
+            bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, old_block, 1, &old_data)?;
+        }
         self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
-        self.block_cache.lock().insert(block, data);
+        Ok(())
+    }
+
+    /// 数据块专用写入：与 write_block 相同的 write-back 语义，
+    /// 但不递增 epoch（数据覆盖不改变块映射关系，避免 map_cache 无效化）。
+    pub(crate) fn write_data_block(
+        &self,
+        block: u64,
+        data: &[u8],
+    ) -> Result<(), BlockBackendError> {
+        if data.len() != self.ext_sb.block_size as usize {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        let evicted = {
+            let mut cache = self.block_cache.lock();
+            cache.insert_wb(block, data)
+        };
+        if let Some((old_block, old_data)) = evicted {
+            bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, old_block, 1, &old_data)?;
+        }
         Ok(())
     }
 
@@ -349,6 +776,9 @@ impl FsState {
         if out.len() != expected {
             return Err(BlockBackendError::OutOfRange);
         }
+        if count == 1 {
+            return self.read_block(start_block, out);
+        }
         // 分批读取，每批不超过 MAX_CHUNK_BLOCKS，避免超出 VirtIO 队列限制
         const MAX_CHUNK_BLOCKS: u32 = 128; // 128×4KB=512KB，VirtIO 256 descriptor 安全范围内
         let mut off = 0usize;
@@ -356,14 +786,84 @@ impl FsState {
         let mut block = start_block;
         while remaining > 0 {
             let n = remaining.min(MAX_CHUNK_BLOCKS);
+            let chunk_bytes = bs * n as usize;
+            {
+                let mut cache = self.block_cache.lock();
+                if cache.read_range(block, n, &mut out[off..off + chunk_bytes]) {
+                    off += chunk_bytes;
+                    block += n as u64;
+                    remaining -= n;
+                    continue;
+                }
+            }
+
             bgd::read_blocks(
                 self.backend.as_ref(),
                 &self.ext_sb,
                 block,
                 n,
-                &mut out[off..off + bs * n as usize],
+                &mut out[off..off + chunk_bytes],
             )?;
-            off += bs * n as usize;
+            let mut cache = self.block_cache.lock();
+            for i in 0..n {
+                let cur_block = block + i as u64;
+                let start = off + bs * i as usize;
+                let end = start + bs;
+                if !cache.contains(cur_block) {
+                    cache.try_insert_clean(cur_block, &out[start..end]);
+                }
+            }
+            off += chunk_bytes;
+            block += n as u64;
+            remaining -= n;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_data_blocks(
+        &self,
+        start_block: u64,
+        count: u32,
+        out: &mut [u8],
+    ) -> Result<(), BlockBackendError> {
+        let bs = self.ext_sb.block_size as usize;
+        let expected = bs * count as usize;
+        if out.len() != expected {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        {
+            let mut cache = self.block_cache.lock();
+            if cache.read_range(start_block, count, out) {
+                return Ok(());
+            }
+        }
+        const MAX_CHUNK_BLOCKS: u32 = 128;
+        let mut off = 0usize;
+        let mut remaining = count;
+        let mut block = start_block;
+        while remaining > 0 {
+            let n = remaining.min(MAX_CHUNK_BLOCKS);
+            let chunk_bytes = bs * n as usize;
+            bgd::read_blocks(
+                self.backend.as_ref(),
+                &self.ext_sb,
+                block,
+                n,
+                &mut out[off..off + chunk_bytes],
+            )?;
+            {
+                let mut cache = self.block_cache.lock();
+                cache.overlay_range(block, n, &mut out[off..off + chunk_bytes]);
+                for i in 0..n {
+                    let cur_block = block + i as u64;
+                    let start = off + bs * i as usize;
+                    let end = start + bs;
+                    if !cache.contains(cur_block) {
+                        cache.try_insert_clean(cur_block, &out[start..end]);
+                    }
+                }
+            }
+            off += chunk_bytes;
             block += n as u64;
             remaining -= n;
         }
@@ -383,26 +883,257 @@ impl FsState {
         if count == 0 {
             return Ok(());
         }
-        bgd::write_blocks(
-            self.backend.as_ref(),
-            &self.ext_sb,
-            start_block,
-            count,
-            data,
-        )?;
+        let bs = self.ext_sb.block_size as usize;
+        let mut evicted_list: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let mut cache = self.block_cache.lock();
+            for i in 0..count {
+                let off = bs * i as usize;
+                let block = start_block + i as u64;
+                if let Some(ev) = cache.insert_wb(block, &data[off..off + bs]) {
+                    evicted_list.push(ev);
+                }
+            }
+        }
+        self.flush_evicted(&mut evicted_list)?;
         self.block_cache_epoch.fetch_add(1, Ordering::AcqRel);
-        self.block_cache.lock().invalidate_range(start_block, count);
+        Ok(())
+    }
+
+    /// 数据块专用批量写入：不递增 epoch（数据覆盖不改变块映射）。
+    pub(crate) fn write_data_blocks(
+        &self,
+        start_block: u64,
+        count: u32,
+        data: &[u8],
+    ) -> Result<(), BlockBackendError> {
+        let expected = self.ext_sb.block_size as usize * count as usize;
+        if data.len() != expected {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        if count >= 4 {
+            let bs = self.ext_sb.block_size as usize;
+            bgd::write_blocks(
+                self.backend.as_ref(),
+                &self.ext_sb,
+                start_block,
+                count,
+                data,
+            )?;
+            let mut cache = self.block_cache.lock();
+            for i in 0..count {
+                let off = bs * i as usize;
+                cache.update_if_present(start_block + i as u64, &data[off..off + bs]);
+            }
+            return Ok(());
+        }
+        let bs = self.ext_sb.block_size as usize;
+        let mut evicted_list: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let mut cache = self.block_cache.lock();
+            for i in 0..count as usize {
+                let off = bs * i;
+                let block = start_block + i as u64;
+                if let Some(ev) = cache.insert_wb(block, &data[off..off + bs]) {
+                    evicted_list.push(ev);
+                }
+            }
+        }
+        self.flush_evicted(&mut evicted_list)?;
+        Ok(())
+    }
+
+    fn flush_evicted(&self, list: &mut Vec<(u64, Vec<u8>)>) -> Result<(), BlockBackendError> {
+        if list.is_empty() {
+            return Ok(());
+        }
+        if list.len() == 1 {
+            let (blk, ref data) = list[0];
+            return bgd::write_blocks(self.backend.as_ref(), &self.ext_sb, blk, 1, data);
+        }
+        list.sort_unstable_by_key(|(blk, _)| *blk);
+        let bs = self.ext_sb.block_size as usize;
+        let mut i = 0;
+        while i < list.len() {
+            let run_start = list[i].0;
+            let mut run_end = run_start;
+            let mut j = i + 1;
+            while j < list.len() && list[j].0 == run_end + 1 {
+                run_end = list[j].0;
+                j += 1;
+            }
+            let run_count = (j - i) as u32;
+            if run_count == 1 {
+                bgd::write_blocks(
+                    self.backend.as_ref(),
+                    &self.ext_sb,
+                    run_start,
+                    1,
+                    &list[i].1,
+                )?;
+            } else {
+                let mut merged = Vec::with_capacity(bs * run_count as usize);
+                for k in i..j {
+                    merged.extend_from_slice(&list[k].1);
+                }
+                bgd::write_blocks(
+                    self.backend.as_ref(),
+                    &self.ext_sb,
+                    run_start,
+                    run_count,
+                    &merged,
+                )?;
+            }
+            i = j;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush_dirty_blocks(&self) -> Result<(), BlockBackendError> {
+        loop {
+            let mut pending = {
+                let cache = self.block_cache.lock();
+                cache.dirty_snapshots()
+            };
+            if pending.is_empty() {
+                return Ok(());
+            }
+
+            pending.sort_unstable_by_key(|snap| snap.block);
+
+            const MAX_FLUSH_RUN_BLOCKS: usize = 128;
+            let bs = self.ext_sb.block_size as usize;
+            let mut i = 0usize;
+            while i < pending.len() {
+                let run_start = pending[i].block;
+                let mut j = i + 1;
+                while j < pending.len()
+                    && pending[j].block == pending[j - 1].block + 1
+                    && j - i < MAX_FLUSH_RUN_BLOCKS
+                {
+                    j += 1;
+                }
+
+                if j == i + 1 {
+                    bgd::write_blocks(
+                        self.backend.as_ref(),
+                        &self.ext_sb,
+                        run_start,
+                        1,
+                        &pending[i].data,
+                    )?;
+                } else {
+                    let mut merged = Vec::with_capacity(bs * (j - i));
+                    for snap in &pending[i..j] {
+                        merged.extend_from_slice(&snap.data);
+                    }
+                    bgd::write_blocks(
+                        self.backend.as_ref(),
+                        &self.ext_sb,
+                        run_start,
+                        (j - i) as u32,
+                        &merged,
+                    )?;
+                }
+
+                let mut cache = self.block_cache.lock();
+                for snap in &pending[i..j] {
+                    cache.mark_clean(snap.block, snap.version);
+                }
+                i = j;
+            }
+            break;
+        }
         Ok(())
     }
 
     pub(crate) fn flush_alloc_metadata(&self) -> Result<(), BlockBackendError> {
-        if !self.alloc_meta_dirty.swap(false, Ordering::AcqRel) {
-            return Ok(());
+        self.flush_dirty_blocks()?;
+        let dirty_groups = {
+            let mut dirty = self.alloc_group_dirty.lock();
+            let mut groups = Vec::new();
+            for (group, is_dirty) in dirty.iter_mut().enumerate() {
+                if *is_dirty != 0 {
+                    *is_dirty = 0;
+                    groups.push(group as u32);
+                }
+            }
+            groups
+        };
+        let sb_dirty = self.alloc_sb_dirty.swap(false, Ordering::AcqRel);
+
+        for (idx, &group) in dirty_groups.iter().enumerate() {
+            if let Err(err) = crate::alloc_mod::flush_group_desc(self, group) {
+                let mut dirty = self.alloc_group_dirty.lock();
+                for &pending_group in &dirty_groups[idx..] {
+                    if let Some(slot) = dirty.get_mut(pending_group as usize) {
+                        *slot = 1;
+                    }
+                }
+                if sb_dirty {
+                    self.alloc_sb_dirty.store(true, Ordering::Release);
+                }
+                return Err(err);
+            }
         }
-        for group in 0..self.ext_sb.groups_count {
-            crate::alloc_mod::flush_group_desc(self, group)?;
+
+        if sb_dirty {
+            if let Err(err) = crate::alloc_mod::write_superblock(self) {
+                self.alloc_sb_dirty.store(true, Ordering::Release);
+                return Err(err);
+            }
         }
-        crate::alloc_mod::write_superblock(self)
+        Ok(())
+    }
+
+    pub(crate) fn sync_all(&self) -> Result<(), BlockBackendError> {
+        self.flush_dirty_inodes()?;
+        self.flush_alloc_metadata()?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_inode_dirty(&self, raw: &Arc<Spinlock<RawInode>>) {
+        let mut dirty = self.dirty_inodes.lock();
+        if dirty.iter().any(|entry| Arc::ptr_eq(entry, raw)) {
+            return;
+        }
+        dirty.push(Arc::clone(raw));
+    }
+
+    pub(crate) fn flush_dirty_inodes(&self) -> Result<(), BlockBackendError> {
+        let pending = {
+            let mut dirty = self.dirty_inodes.lock();
+            if dirty.is_empty() {
+                return Ok(());
+            }
+            core::mem::take(&mut *dirty)
+        };
+
+        for (idx, raw) in pending.iter().enumerate() {
+            let snapshot = loop {
+                if let Some(guard) = raw.try_lock() {
+                    break guard.clone();
+                }
+                if sched::is_ready() {
+                    sched::schedule_once(sched::now_ns_public());
+                } else {
+                    core::hint::spin_loop();
+                }
+            };
+            if let Err(err) = crate::inode_wr::write_raw(self, &snapshot) {
+                let mut dirty = self.dirty_inodes.lock();
+                for pending_raw in &pending[idx..] {
+                    if !dirty.iter().any(|entry| Arc::ptr_eq(entry, pending_raw)) {
+                        dirty.push(Arc::clone(pending_raw));
+                    }
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -512,12 +1243,13 @@ impl SuperblockOps for ExtFsSuperblockOps {
             free_blocks: 0,
             avail_blocks: 0,
             total_inodes: s.inodes_count as u64,
-            free_inodes: 0,
+            free_inodes: s.free_inodes_count as u64,
             fs_id: sb.fs_id.raw(),
             name_max: 255,
         })
     }
     fn sync_fs(&self, _sb: &Arc<VfsSuperblock>) -> VfsResult<()> {
+        self.state.flush_dirty_inodes().map_err(map_err)?;
         self.state.flush_alloc_metadata().map_err(map_err)
     }
     fn remount(&self, _sb: &Arc<VfsSuperblock>, _flags: MountFlags) -> VfsResult<()> {
@@ -527,6 +1259,34 @@ impl SuperblockOps for ExtFsSuperblockOps {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+fn discard_orphan_file(state: &Arc<FsState>) -> Result<(), BlockBackendError> {
+    let ino = state.ext_sb.orphan_file_inum;
+    if ino == 0 || ino > state.ext_sb.inodes_count {
+        return Ok(());
+    }
+
+    let mut raw = crate::inode_wr::read_raw(state, ino)?;
+    let mut i_block = [0u8; 60];
+    i_block.copy_from_slice(raw.i_block());
+
+    // 当前内核没有 ext4 orphan_file 维护逻辑。若直接只清 superblock feature,
+    // 原 orphan file inode 会变成宿主 fsck 眼中的 unattached inode；因此挂载时
+    // 主动丢弃它占用的数据块和 inode 位图，再把 superblock 指针清零。
+    if raw.flags() & crate::layout::EXT4_EXTENTS_FL != 0 {
+        crate::extent_wr::free_tree(state, &i_block)?;
+    } else {
+        crate::map_wr::free_all_blocks(state, &mut i_block)?;
+    }
+
+    raw.bytes.fill(0);
+    // extfs 库层无法直接访问内核 realtime；写合法 epoch 秒即可避免
+    // e2fsck 把过小 dtime 误判为损坏 orphan 链。
+    raw.set_dtime(1_700_000_000);
+    crate::inode_wr::write_raw(state, &raw)?;
+    crate::alloc_mod::free_inode(state, ino, false)?;
+    Ok(())
 }
 
 fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
@@ -540,6 +1300,7 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
             used_dirs: g.used_dirs_count,
         })
         .collect::<alloc::vec::Vec<_>>();
+    let group_count = group_desc.len();
     let free_blocks = ext_sb.free_blocks_count;
     let free_inodes = ext_sb.free_inodes_count;
     let block_size = ext_sb.block_size;
@@ -554,9 +1315,16 @@ fn mount_impl(backend: Arc<dyn BlockBackend>) -> VfsResult<Arc<VfsSuperblock>> {
         sb_free_inodes: core::sync::atomic::AtomicU32::new(free_inodes),
         block_alloc_hint: core::sync::atomic::AtomicU64::new(0),
         inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
-        alloc_meta_dirty: AtomicBool::new(false),
+        alloc_group_dirty: Spinlock::new(vec![0u8; group_count]),
+        alloc_sb_dirty: AtomicBool::new(false),
+        dirty_inodes: Spinlock::new(Vec::new()),
         read_only: core::sync::atomic::AtomicBool::new(false),
     });
+
+    // 当前驱动不维护 ext4 orphan_file。可写挂载后立即规范化 superblock，
+    // 同时清理旧镜像可能残留的 feature 位、s_last_orphan 和 s_orphan_file_inum。
+    discard_orphan_file(&state).map_err(map_err)?;
+    crate::alloc_mod::write_superblock(&state).map_err(map_err)?;
 
     // 加载根 inode(2 号)
     let (root_meta_on_disk, root_raw) = load_inode(&state, EXT4_ROOT_INO).map_err(map_err)?;
@@ -621,5 +1389,219 @@ pub(crate) fn map_err(e: BlockBackendError) -> VfsError {
         BlockBackendError::Io => VfsError::Io,
         BlockBackendError::OutOfRange => VfsError::InvalidArgument,
         BlockBackendError::Unsupported => VfsError::NotSupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use crate::bgd::GroupDesc;
+    use crate::layout::ExtKind;
+    use crate::map_wr::{self, BlockAllocState};
+    use crate::sb::Superblock;
+
+    struct CountingBackend {
+        data: Spinlock<Vec<u8>>,
+        sector_size: u32,
+        reads: Spinlock<Vec<(u64, u32)>>,
+        writes: Spinlock<Vec<(u64, u32)>>,
+    }
+
+    impl CountingBackend {
+        fn new(sector_count: u32, sector_size: u32) -> Self {
+            Self {
+                data: Spinlock::new(vec![0; sector_count as usize * sector_size as usize]),
+                sector_size,
+                reads: Spinlock::new(Vec::new()),
+                writes: Spinlock::new(Vec::new()),
+            }
+        }
+
+        fn seed_block(&self, block: u64, block_size: usize, data: &[u8]) {
+            let start = block as usize * block_size;
+            self.data.lock()[start..start + data.len()].copy_from_slice(data);
+        }
+
+        fn writes(&self) -> Vec<(u64, u32)> {
+            self.writes.lock().clone()
+        }
+
+        fn reads(&self) -> Vec<(u64, u32)> {
+            self.reads.lock().clone()
+        }
+    }
+
+    impl BlockBackend for CountingBackend {
+        fn sector_size(&self) -> u32 {
+            self.sector_size
+        }
+
+        fn sector_count(&self) -> u64 {
+            (self.data.lock().len() / self.sector_size as usize) as u64
+        }
+
+        fn read_sectors(
+            &self,
+            lba: u64,
+            count: u32,
+            buf: &mut [u8],
+        ) -> Result<(), BlockBackendError> {
+            let len = self.sector_size as usize * count as usize;
+            if buf.len() < len {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let start = lba as usize * self.sector_size as usize;
+            let end = start
+                .checked_add(len)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            let data = self.data.lock();
+            if end > data.len() {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            buf[..len].copy_from_slice(&data[start..end]);
+            self.reads.lock().push((lba, count));
+            Ok(())
+        }
+
+        fn write_sectors(&self, lba: u64, count: u32, buf: &[u8]) -> Result<(), BlockBackendError> {
+            let len = self.sector_size as usize * count as usize;
+            if buf.len() < len {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let start = lba as usize * self.sector_size as usize;
+            let end = start
+                .checked_add(len)
+                .ok_or(BlockBackendError::OutOfRange)?;
+            let mut data = self.data.lock();
+            if end > data.len() {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            data[start..end].copy_from_slice(&buf[..len]);
+            self.writes.lock().push((lba, count));
+            Ok(())
+        }
+    }
+
+    fn alloc_test_state(backend: Arc<CountingBackend>) -> FsState {
+        let block_size = 1024;
+        let free_blocks = 60;
+        let ext_sb = Superblock {
+            kind: ExtKind::Ext2,
+            inodes_count: 16,
+            blocks_count: 64,
+            first_data_block: 0,
+            block_size,
+            blocks_per_group: 64,
+            inodes_per_group: 16,
+            inode_size: 128,
+            desc_size: 32,
+            first_ino: 11,
+            s_magic: 0xef53,
+            feature_compat: 0,
+            feature_incompat: 0,
+            feature_ro_compat: 0,
+            uuid: [0; 16],
+            volume_name: [0; 16],
+            metadata_csum: false,
+            csum_seed: 0,
+            free_blocks_count: free_blocks,
+            free_inodes_count: 16,
+            orphan_file_inum: 0,
+            groups_count: 1,
+        };
+        let group_desc = vec![GroupDesc {
+            block_bitmap: 1,
+            inode_bitmap: 2,
+            inode_table: 3,
+            flags: 0,
+            free_blocks_count: free_blocks as u32,
+            free_inodes_count: 16,
+            used_dirs_count: 1,
+        }];
+        let group_counts = vec![GroupCounts {
+            free_blocks: free_blocks as u32,
+            free_inodes: 16,
+            used_dirs: 1,
+        }];
+        let backend: Arc<dyn BlockBackend> = backend;
+        FsState {
+            backend,
+            ext_sb,
+            group_desc: Spinlock::new(group_desc),
+            group_counts: Spinlock::new(group_counts),
+            block_cache: Spinlock::new(BlockCache::new(block_size)),
+            block_cache_epoch: AtomicU64::new(0),
+            sb_free_blocks: AtomicU64::new(free_blocks),
+            sb_free_inodes: core::sync::atomic::AtomicU32::new(16),
+            block_alloc_hint: AtomicU64::new(0),
+            inode_alloc_hint: core::sync::atomic::AtomicU32::new(0),
+            alloc_group_dirty: Spinlock::new(vec![0; 1]),
+            alloc_sb_dirty: AtomicBool::new(false),
+            dirty_inodes: Spinlock::new(Vec::new()),
+            read_only: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn ensure_block_for_write_skips_new_direct_zero_write() {
+        let backend = Arc::new(CountingBackend::new(128, 512));
+        let mut bitmap = vec![0u8; 1024];
+        // 前 4 个块视为元数据，首个可分配数据块为物理块 4。
+        bitmap[0] = 0b0000_1111;
+        backend.seed_block(1, 1024, &bitmap);
+
+        let state = alloc_test_state(Arc::clone(&backend));
+        let mut i_block = [0u8; 60];
+
+        let block = map_wr::ensure_block_for_write(&state, &mut i_block, 0, false)
+            .expect("allocate direct block");
+
+        assert_eq!(block, BlockAllocState::NewlyAllocated(4));
+        assert_eq!(
+            u32::from_le_bytes([i_block[0], i_block[1], i_block[2], i_block[3]]),
+            4
+        );
+        // direct 新块由文件写路径覆盖/补零；alloc 路径只允许写分配元数据，
+        // 不能提前写物理数据块 4，否则小块覆盖写会被大量无意义清零拖慢。
+        let writes = backend.writes();
+        assert!(writes.contains(&(2, 2)));
+        assert!(!writes.contains(&(8, 2)));
+    }
+
+    #[test]
+    fn read_blocks_single_block_uses_block_cache() {
+        let backend = Arc::new(CountingBackend::new(128, 512));
+        let mut data = vec![0u8; 1024];
+        data[0] = 0xaa;
+        backend.seed_block(8, 1024, &data);
+
+        let state = alloc_test_state(Arc::clone(&backend));
+        let mut first = vec![0u8; 1024];
+        let mut second = vec![0u8; 1024];
+
+        state.read_blocks(8, 1, &mut first).expect("first read");
+        state.read_blocks(8, 1, &mut second).expect("cached read");
+
+        assert_eq!(first, data);
+        assert_eq!(second, data);
+        assert_eq!(backend.reads(), vec![(16, 2)]);
+    }
+
+    #[test]
+    fn flush_alloc_metadata_writes_only_dirty_group() {
+        let backend = Arc::new(CountingBackend::new(256, 512));
+        let state = alloc_test_state(Arc::clone(&backend));
+        state.adjust_group_free_blocks(0, -1).expect("mark dirty");
+        backend.writes.lock().clear();
+
+        state.flush_alloc_metadata().expect("flush metadata");
+
+        assert_eq!(backend.writes(), vec![(2, 2)]);
     }
 }

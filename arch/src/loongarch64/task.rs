@@ -1,3 +1,4 @@
+#![allow(named_asm_labels)]
 use general::{TaskOps, TrapFramePtr};
 
 use crate::loongarch64::*;
@@ -25,9 +26,9 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = sp;
     }
 
-    fn set_trap_frame_gp(trap_frame_ptr: TrapFramePtr, gp: usize) {
-        let tf = unsafe { &mut *(trap_frame_ptr.as_usize() as *mut TrapFrame) };
-        tf.tp = gp;
+    fn set_trap_frame_gp(_trap_frame_ptr: TrapFramePtr, _gp: usize) {
+        // LoongArch64 psABI does not expose a dedicated GP register in the
+        // saved trap frame. Do not alias this architecture-neutral hook to TP.
     }
 
     fn set_trap_frame_tp(trap_frame_ptr: TrapFramePtr, tp: usize) {
@@ -65,7 +66,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.pc = entry_pc;
         tf.sp = kernel_sp;
         tf.status = PRMD_KERNEL_IE;
-        tf.euen = 0;
+        tf.euen = EUEN_FPE | EUEN_SXE;
     }
 
     fn init_user_trap_frame(
@@ -80,7 +81,7 @@ impl TaskOps for LoongArch64TaskOps {
         tf.sp = user_sp;
         tf.a0 = arg0;
         tf.status = PRMD_USER_IE;
-        tf.euen = 0;
+        tf.euen = EUEN_FPE | EUEN_SXE;
     }
 
     fn set_user_trap_frame_args(
@@ -93,6 +94,11 @@ impl TaskOps for LoongArch64TaskOps {
         tf.a0 = arg0;
         tf.a1 = arg1;
         tf.a2 = arg2;
+    }
+
+    fn signal_interrupted_syscall_pc(trap_frame_ptr: TrapFramePtr) -> Option<usize> {
+        let tf = unsafe { &*(trap_frame_ptr.as_usize() as *const TrapFrame) };
+        tf.pc.checked_sub(4)
     }
 
     fn init_user_entry() -> unsafe extern "C" fn() -> ! {

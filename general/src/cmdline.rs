@@ -47,4 +47,12 @@ impl<'a> Cmdline<'a> {
         }
         found
     }
+
+    /// 返回去掉 NUL 终止符后的原始命令行文本。
+    ///
+    /// 这里不做键值解析，供 `/sys/kernel/cmdline` 这类诊断视图直接展示启动器
+    /// 交给内核的稳定快照；无效 UTF-8 在构造阶段已经被归一为空字符串。
+    pub fn as_str(&self) -> &'a str {
+        self.text
+    }
 }

@@ -4,11 +4,30 @@
 //! 上完成,由调用方负责把它写回 inode。
 
 use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::alloc_mod;
 use crate::state::{BlockBackendError, FsState};
 
 const DIRECT_COUNT: u32 = 12;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockAllocState {
+    Existing(u64),
+    NewlyAllocated(u64),
+}
+
+impl BlockAllocState {
+    pub(crate) const fn phys(self) -> u64 {
+        match self {
+            Self::Existing(phys) | Self::NewlyAllocated(phys) => phys,
+        }
+    }
+
+    pub(crate) const fn is_new(self) -> bool {
+        matches!(self, Self::NewlyAllocated(_))
+    }
+}
 
 #[inline]
 fn ppb(block_size: u32) -> u32 {
@@ -32,56 +51,172 @@ pub(crate) fn ensure_block(
     i_block: &mut [u8],
     logical: u32,
 ) -> Result<u64, BlockBackendError> {
+    ensure_block_for_write(state, i_block, logical, true).map(BlockAllocState::phys)
+}
+
+/// 给写路径查找或分配逻辑块，并返回该数据块是否刚分配。
+///
+/// `zero_new_data` 只控制新数据块是否立即写零；调用方若会整块覆盖或会自行填零，
+/// 可以跳过这次写盘，避免 bench 写路径里的重复 I/O。间接块本身仍始终清零。
+pub(crate) fn ensure_block_for_write(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    zero_new_data: bool,
+) -> Result<BlockAllocState, BlockBackendError> {
+    let mut scratch = Vec::new();
+    ensure_block_for_write_with_scratch(state, i_block, logical, zero_new_data, &mut scratch)
+}
+
+/// 与 [`ensure_block_for_write`] 相同,但由调用方复用间接块 scratch。
+///
+/// 文件顺序写降级到 indirect 布局时会逐块调用这里；把 block-size 缓冲提升到
+/// 调用层,可以避免每个逻辑块都重新分配一块临时内存。
+pub(crate) fn ensure_block_for_write_with_scratch(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    zero_new_data: bool,
+    scratch: &mut Vec<u8>,
+) -> Result<BlockAllocState, BlockBackendError> {
     let p = ppb(state.ext_sb.block_size);
     if logical < DIRECT_COUNT {
         let cur = read_u32(i_block, logical);
         if cur != 0 {
-            return Ok(cur as u64);
+            return Ok(BlockAllocState::Existing(cur as u64));
         }
         let new = alloc_mod::alloc_block(state)?;
-        zero_block(state, new)?;
+        if zero_new_data {
+            zero_block(state, new)?;
+        }
         write_u32(i_block, logical, new as u32);
-        return Ok(new);
+        return Ok(BlockAllocState::NewlyAllocated(new));
     }
 
     let bs = state.ext_sb.block_size as usize;
+    if scratch.len() != bs {
+        scratch.resize(bs, 0);
+    }
     // 各级间接块共用同一个 scratch buffer,避免重复堆分配。
-    let mut buf = vec![0u8; bs];
+    let buf = scratch.as_mut_slice();
     let rem = logical - DIRECT_COUNT;
     if rem < p {
-        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, &mut buf)?;
+        let new_data = alloc_or_walk_l1(state, i_block, 12, rem, buf, zero_new_data)?;
         return Ok(new_data);
     }
 
     let rem = rem - p;
     if rem < p * p {
         // 二级间接:先确保 L2 索引块存在,把它读到 buf
+        let l2 = ensure_indirect_slot(state, i_block, 13, buf)?;
+        let mid_idx = rem / p;
+        let mut mid = read_u32(buf, mid_idx);
+        if mid == 0 {
+            mid = alloc_mod::alloc_block(state)? as u32;
+            // 新 mid 块逻辑上为零,直接写零到磁盘后续不再 read_block
+            write_u32(buf, mid_idx, mid);
+            state.write_block(l2, buf)?;
+            // mid 块需要置零 (因为我们随后会读它),走 cache insert
+            cache_zero_block(state, mid as u64, buf)?;
+        } else {
+            state.read_block(mid as u64, buf)?;
+        }
+        let inner = rem % p;
+        let cur = read_u32(buf, inner);
+        if cur != 0 {
+            return Ok(BlockAllocState::Existing(cur as u64));
+        }
+        let new = alloc_mod::alloc_block(state)?;
+        if zero_new_data {
+            zero_block(state, new)?;
+        }
+        write_u32(buf, inner, new as u32);
+        state.write_block(mid as u64, buf)?;
+        return Ok(BlockAllocState::NewlyAllocated(new));
+    }
+
+    // 三级间接
+    let rem = rem - p * p;
+    let a = p * p;
+    let l3 = ensure_indirect_slot(state, i_block, 14, buf)?;
+    let top_idx = rem / a;
+    let mut top = read_u32(buf, top_idx);
+    if top == 0 {
+        top = alloc_mod::alloc_block(state)? as u32;
+        write_u32(buf, top_idx, top);
+        state.write_block(l3, buf)?;
+        cache_zero_block(state, top as u64, buf)?;
+    } else {
+        state.read_block(top as u64, buf)?;
+    }
+    let mid_idx = (rem % a) / p;
+    let mut mid = read_u32(buf, mid_idx);
+    if mid == 0 {
+        mid = alloc_mod::alloc_block(state)? as u32;
+        write_u32(buf, mid_idx, mid);
+        state.write_block(top as u64, buf)?;
+        cache_zero_block(state, mid as u64, buf)?;
+    } else {
+        state.read_block(mid as u64, buf)?;
+    }
+    let inner = rem % p;
+    let cur = read_u32(buf, inner);
+    if cur != 0 {
+        return Ok(BlockAllocState::Existing(cur as u64));
+    }
+    let new = alloc_mod::alloc_block(state)?;
+    if zero_new_data {
+        zero_block(state, new)?;
+    }
+    write_u32(buf, inner, new as u32);
+    state.write_block(mid as u64, buf)?;
+    Ok(BlockAllocState::NewlyAllocated(new))
+}
+
+/// 在间接块布局里写入一个既有数据块映射。
+///
+/// 补齐必要的索引块,用于从 extent
+/// 布局保留数据地降级到传统 direct/indirect 布局。
+pub(crate) fn set_existing_block(
+    state: &FsState,
+    i_block: &mut [u8],
+    logical: u32,
+    phys: u64,
+) -> Result<(), BlockBackendError> {
+    let p = ppb(state.ext_sb.block_size);
+    if logical < DIRECT_COUNT {
+        write_u32(i_block, logical, phys as u32);
+        return Ok(());
+    }
+
+    let bs = state.ext_sb.block_size as usize;
+    let mut buf = vec![0u8; bs];
+    let rem = logical - DIRECT_COUNT;
+    if rem < p {
+        let l1 = ensure_indirect_slot(state, i_block, 12, &mut buf)?;
+        write_u32(&mut buf, rem, phys as u32);
+        state.write_block(l1, &buf)?;
+        return Ok(());
+    }
+
+    let rem = rem - p;
+    if rem < p * p {
         let l2 = ensure_indirect_slot(state, i_block, 13, &mut buf)?;
         let mid_idx = rem / p;
         let mut mid = read_u32(&buf, mid_idx);
         if mid == 0 {
             mid = alloc_mod::alloc_block(state)? as u32;
-            // 新 mid 块逻辑上为零,直接写零到磁盘后续不再 read_block
             write_u32(&mut buf, mid_idx, mid);
             state.write_block(l2, &buf)?;
-            // mid 块需要置零 (因为我们随后会读它),走 cache insert
             cache_zero_block(state, mid as u64, &mut buf)?;
         } else {
             state.read_block(mid as u64, &mut buf)?;
         }
-        let inner = rem % p;
-        let cur = read_u32(&buf, inner);
-        if cur != 0 {
-            return Ok(cur as u64);
-        }
-        let new = alloc_mod::alloc_block(state)?;
-        zero_block(state, new)?;
-        write_u32(&mut buf, inner, new as u32);
+        write_u32(&mut buf, rem % p, phys as u32);
         state.write_block(mid as u64, &buf)?;
-        return Ok(new);
+        return Ok(());
     }
 
-    // 三级间接
     let rem = rem - p * p;
     let a = p * p;
     let l3 = ensure_indirect_slot(state, i_block, 14, &mut buf)?;
@@ -105,16 +240,9 @@ pub(crate) fn ensure_block(
     } else {
         state.read_block(mid as u64, &mut buf)?;
     }
-    let inner = rem % p;
-    let cur = read_u32(&buf, inner);
-    if cur != 0 {
-        return Ok(cur as u64);
-    }
-    let new = alloc_mod::alloc_block(state)?;
-    zero_block(state, new)?;
-    write_u32(&mut buf, inner, new as u32);
+    write_u32(&mut buf, rem % p, phys as u32);
     state.write_block(mid as u64, &buf)?;
-    Ok(new)
+    Ok(())
 }
 
 /// 处理一级间接块的分配/查找。`slot` 是 i_block 中索引(12 = 一级)。
@@ -125,17 +253,20 @@ fn alloc_or_walk_l1(
     slot: u32,
     inner: u32,
     buf: &mut [u8],
-) -> Result<u64, BlockBackendError> {
+    zero_new_data: bool,
+) -> Result<BlockAllocState, BlockBackendError> {
     let l1 = ensure_indirect_slot(state, i_block, slot, buf)?;
     let cur = read_u32(buf, inner);
     if cur != 0 {
-        return Ok(cur as u64);
+        return Ok(BlockAllocState::Existing(cur as u64));
     }
     let new = alloc_mod::alloc_block(state)?;
-    zero_block(state, new)?;
+    if zero_new_data {
+        zero_block(state, new)?;
+    }
     write_u32(buf, inner, new as u32);
     state.write_block(l1, buf)?;
-    Ok(new)
+    Ok(BlockAllocState::NewlyAllocated(new))
 }
 
 /// 确保 i_block[slot] 指向一个存在的间接块。`buf` 出参为该间接块的内容。
@@ -175,6 +306,99 @@ fn cache_zero_block(state: &FsState, block: u64, buf: &mut [u8]) -> Result<(), B
     state.write_block(block, buf)
 }
 
+#[inline]
+fn resize_block_scratch(buf: &mut Vec<u8>, bs: usize) {
+    if buf.len() != bs {
+        buf.resize(bs, 0);
+    }
+}
+
+/// 统计传统 direct/indirect 布局实际占用的文件系统块数。
+///
+/// ext4 的 `i_blocks` 记录的是已分配 512B sector 数,不是 `i_size` 四舍五入。
+/// 因此 1 字节文件只要分配了一个 4KiB 数据块,也必须记 8 个 sector。
+pub(crate) fn count_all_blocks(state: &FsState, i_block: &[u8]) -> Result<u64, BlockBackendError> {
+    let bs = state.ext_sb.block_size as usize;
+    let p = ppb(state.ext_sb.block_size);
+    let mut total = 0u64;
+    let mut l1_blk = Vec::new();
+    let mut l2_blk = Vec::new();
+    let mut l3_blk = Vec::new();
+    let mut top_blk = Vec::new();
+    let mut mid_blk = Vec::new();
+
+    for i in 0..DIRECT_COUNT {
+        if read_u32(i_block, i) != 0 {
+            total += 1;
+        }
+    }
+
+    let l1 = read_u32(i_block, 12);
+    if l1 != 0 {
+        total += 1; // 一级间接块本身
+        resize_block_scratch(&mut l1_blk, bs);
+        state.read_block(l1 as u64, &mut l1_blk)?;
+        for i in 0..p {
+            if read_u32(&l1_blk, i) != 0 {
+                total += 1;
+            }
+        }
+    }
+
+    let l2 = read_u32(i_block, 13);
+    if l2 != 0 {
+        total += 1; // 二级间接块本身
+        resize_block_scratch(&mut l2_blk, bs);
+        resize_block_scratch(&mut mid_blk, bs);
+        state.read_block(l2 as u64, &mut l2_blk)?;
+        for i in 0..p {
+            let mid = read_u32(&l2_blk, i);
+            if mid == 0 {
+                continue;
+            }
+            total += 1; // 中间一级间接块
+            state.read_block(mid as u64, &mut mid_blk)?;
+            for j in 0..p {
+                if read_u32(&mid_blk, j) != 0 {
+                    total += 1;
+                }
+            }
+        }
+    }
+
+    let l3 = read_u32(i_block, 14);
+    if l3 != 0 {
+        total += 1; // 三级间接块本身
+        resize_block_scratch(&mut l3_blk, bs);
+        resize_block_scratch(&mut top_blk, bs);
+        resize_block_scratch(&mut mid_blk, bs);
+        state.read_block(l3 as u64, &mut l3_blk)?;
+        for i in 0..p {
+            let top = read_u32(&l3_blk, i);
+            if top == 0 {
+                continue;
+            }
+            total += 1; // 二级索引块
+            state.read_block(top as u64, &mut top_blk)?;
+            for j in 0..p {
+                let mid = read_u32(&top_blk, j);
+                if mid == 0 {
+                    continue;
+                }
+                total += 1; // 一级索引块
+                state.read_block(mid as u64, &mut mid_blk)?;
+                for k in 0..p {
+                    if read_u32(&mid_blk, k) != 0 {
+                        total += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(total)
+}
+
 /// 释放逻辑块号 ≥ `from_lb` 的所有间接指针对应的物理块。用于 partial truncate。
 /// 处理完成后,间接块本身若变空(没有任何指向非零的项)也被释放。
 pub(crate) fn free_blocks_from(
@@ -184,13 +408,19 @@ pub(crate) fn free_blocks_from(
 ) -> Result<(), BlockBackendError> {
     let bs = state.ext_sb.block_size as usize;
     let p = ppb(state.ext_sb.block_size);
+    let mut l1_blk = Vec::new();
+    let mut l2_blk = Vec::new();
+    let mut l3_blk = Vec::new();
+    let mut top_blk = Vec::new();
+    let mut mid_blk = Vec::new();
+    let mut freed_blocks = Vec::new();
 
     // 直接块
     let direct_count = DIRECT_COUNT;
     for i in from_lb..direct_count {
         let b = read_u32(i_block, i);
         if b != 0 {
-            crate::alloc_mod::free_block(state, b as u64)?;
+            freed_blocks.push(b as u64);
             write_u32(i_block, i, 0);
         }
     }
@@ -199,36 +429,36 @@ pub(crate) fn free_blocks_from(
         let rel = from_lb - direct_count;
         let l1 = read_u32(i_block, 12);
         if l1 != 0 {
-            let mut blk = vec![0u8; bs];
-            state.read_block(l1 as u64, &mut blk)?;
+            resize_block_scratch(&mut l1_blk, bs);
+            state.read_block(l1 as u64, &mut l1_blk)?;
             for i in rel..p {
-                let b = read_u32(&blk, i);
+                let b = read_u32(&l1_blk, i);
                 if b != 0 {
-                    crate::alloc_mod::free_block(state, b as u64)?;
-                    write_u32(&mut blk, i, 0);
+                    freed_blocks.push(b as u64);
+                    write_u32(&mut l1_blk, i, 0);
                 }
             }
             if rel == 0 {
                 // 整块都空了,连间接块自身也释放
-                crate::alloc_mod::free_block(state, l1 as u64)?;
+                freed_blocks.push(l1 as u64);
                 write_u32(i_block, 12, 0);
             } else {
-                state.write_block(l1 as u64, &blk)?;
+                state.write_block(l1 as u64, &l1_blk)?;
             }
         }
     } else if from_lb < direct_count {
         // 完全释放一级间接
         let l1 = read_u32(i_block, 12);
         if l1 != 0 {
-            let mut blk = vec![0u8; bs];
-            state.read_block(l1 as u64, &mut blk)?;
+            resize_block_scratch(&mut l1_blk, bs);
+            state.read_block(l1 as u64, &mut l1_blk)?;
             for i in 0..p {
-                let b = read_u32(&blk, i);
+                let b = read_u32(&l1_blk, i);
                 if b != 0 {
-                    crate::alloc_mod::free_block(state, b as u64)?;
+                    freed_blocks.push(b as u64);
                 }
             }
-            crate::alloc_mod::free_block(state, l1 as u64)?;
+            freed_blocks.push(l1 as u64);
             write_u32(i_block, 12, 0);
         }
     }
@@ -241,7 +471,8 @@ pub(crate) fn free_blocks_from(
         let inner_start = rel % p;
         let l2 = read_u32(i_block, 13);
         if l2 != 0 {
-            let mut l2_blk = vec![0u8; bs];
+            resize_block_scratch(&mut l2_blk, bs);
+            resize_block_scratch(&mut mid_blk, bs);
             state.read_block(l2 as u64, &mut l2_blk)?;
             for i in mid_idx_start..p {
                 let mid = read_u32(&l2_blk, i);
@@ -249,24 +480,23 @@ pub(crate) fn free_blocks_from(
                     continue;
                 }
                 let start_in_mid = if i == mid_idx_start { inner_start } else { 0 };
-                let mut mid_blk = vec![0u8; bs];
                 state.read_block(mid as u64, &mut mid_blk)?;
                 for j in start_in_mid..p {
                     let b = read_u32(&mid_blk, j);
                     if b != 0 {
-                        crate::alloc_mod::free_block(state, b as u64)?;
+                        freed_blocks.push(b as u64);
                         write_u32(&mut mid_blk, j, 0);
                     }
                 }
                 if start_in_mid == 0 {
-                    crate::alloc_mod::free_block(state, mid as u64)?;
+                    freed_blocks.push(mid as u64);
                     write_u32(&mut l2_blk, i, 0);
                 } else {
                     state.write_block(mid as u64, &mid_blk)?;
                 }
             }
             if mid_idx_start == 0 && inner_start == 0 {
-                crate::alloc_mod::free_block(state, l2 as u64)?;
+                freed_blocks.push(l2 as u64);
                 write_u32(i_block, 13, 0);
             } else {
                 state.write_block(l2 as u64, &l2_blk)?;
@@ -276,24 +506,24 @@ pub(crate) fn free_blocks_from(
         // 完全释放二级
         let l2 = read_u32(i_block, 13);
         if l2 != 0 {
-            let mut l2_blk = vec![0u8; bs];
+            resize_block_scratch(&mut l2_blk, bs);
+            resize_block_scratch(&mut mid_blk, bs);
             state.read_block(l2 as u64, &mut l2_blk)?;
             for i in 0..p {
                 let mid = read_u32(&l2_blk, i);
                 if mid == 0 {
                     continue;
                 }
-                let mut mid_blk = vec![0u8; bs];
                 state.read_block(mid as u64, &mut mid_blk)?;
                 for j in 0..p {
                     let b = read_u32(&mid_blk, j);
                     if b != 0 {
-                        crate::alloc_mod::free_block(state, b as u64)?;
+                        freed_blocks.push(b as u64);
                     }
                 }
-                crate::alloc_mod::free_block(state, mid as u64)?;
+                freed_blocks.push(mid as u64);
             }
-            crate::alloc_mod::free_block(state, l2 as u64)?;
+            freed_blocks.push(l2 as u64);
             write_u32(i_block, 13, 0);
         }
     }
@@ -308,7 +538,9 @@ pub(crate) fn free_blocks_from(
         let inner_start = rel % p;
         let l3 = read_u32(i_block, 14);
         if l3 != 0 {
-            let mut l3_blk = vec![0u8; bs];
+            resize_block_scratch(&mut l3_blk, bs);
+            resize_block_scratch(&mut top_blk, bs);
+            resize_block_scratch(&mut mid_blk, bs);
             state.read_block(l3 as u64, &mut l3_blk)?;
             for ti in top_idx_start..p {
                 let top = read_u32(&l3_blk, ti);
@@ -321,7 +553,6 @@ pub(crate) fn free_blocks_from(
                     0
                 };
                 let inner_start_here_base = if ti == top_idx_start { inner_start } else { 0 };
-                let mut top_blk = vec![0u8; bs];
                 state.read_block(top as u64, &mut top_blk)?;
                 for mi in mid_start_here..p {
                     let mid = read_u32(&top_blk, mi);
@@ -333,31 +564,30 @@ pub(crate) fn free_blocks_from(
                     } else {
                         0
                     };
-                    let mut mid_blk = vec![0u8; bs];
                     state.read_block(mid as u64, &mut mid_blk)?;
                     for k in inner_start_here..p {
                         let b = read_u32(&mid_blk, k);
                         if b != 0 {
-                            crate::alloc_mod::free_block(state, b as u64)?;
+                            freed_blocks.push(b as u64);
                             write_u32(&mut mid_blk, k, 0);
                         }
                     }
                     if inner_start_here == 0 {
-                        crate::alloc_mod::free_block(state, mid as u64)?;
+                        freed_blocks.push(mid as u64);
                         write_u32(&mut top_blk, mi, 0);
                     } else {
                         state.write_block(mid as u64, &mid_blk)?;
                     }
                 }
                 if mid_start_here == 0 && inner_start_here_base == 0 {
-                    crate::alloc_mod::free_block(state, top as u64)?;
+                    freed_blocks.push(top as u64);
                     write_u32(&mut l3_blk, ti, 0);
                 } else {
                     state.write_block(top as u64, &top_blk)?;
                 }
             }
             if top_idx_start == 0 && mid_idx_start == 0 && inner_start == 0 {
-                crate::alloc_mod::free_block(state, l3 as u64)?;
+                freed_blocks.push(l3 as u64);
                 write_u32(i_block, 14, 0);
             } else {
                 state.write_block(l3 as u64, &l3_blk)?;
@@ -367,36 +597,37 @@ pub(crate) fn free_blocks_from(
         // from_lb 在三级前:整个三级间接释放
         let l3 = read_u32(i_block, 14);
         if l3 != 0 {
-            let mut l3_blk = vec![0u8; bs];
+            resize_block_scratch(&mut l3_blk, bs);
+            resize_block_scratch(&mut top_blk, bs);
+            resize_block_scratch(&mut mid_blk, bs);
             state.read_block(l3 as u64, &mut l3_blk)?;
             for i in 0..p {
                 let top = read_u32(&l3_blk, i);
                 if top == 0 {
                     continue;
                 }
-                let mut top_blk = vec![0u8; bs];
                 state.read_block(top as u64, &mut top_blk)?;
                 for j in 0..p {
                     let mid = read_u32(&top_blk, j);
                     if mid == 0 {
                         continue;
                     }
-                    let mut mid_blk = vec![0u8; bs];
                     state.read_block(mid as u64, &mut mid_blk)?;
                     for k in 0..p {
                         let b = read_u32(&mid_blk, k);
                         if b != 0 {
-                            crate::alloc_mod::free_block(state, b as u64)?;
+                            freed_blocks.push(b as u64);
                         }
                     }
-                    crate::alloc_mod::free_block(state, mid as u64)?;
+                    freed_blocks.push(mid as u64);
                 }
-                crate::alloc_mod::free_block(state, top as u64)?;
+                freed_blocks.push(top as u64);
             }
-            crate::alloc_mod::free_block(state, l3 as u64)?;
+            freed_blocks.push(l3 as u64);
             write_u32(i_block, 14, 0);
         }
     }
+    crate::alloc_mod::free_blocks_sparse(state, &freed_blocks)?;
     Ok(())
 }
 
@@ -407,83 +638,90 @@ pub(crate) fn free_all_blocks(
 ) -> Result<(), BlockBackendError> {
     let bs = state.ext_sb.block_size as usize;
     let p = ppb(state.ext_sb.block_size);
+    let mut l1_blk = Vec::new();
+    let mut l2_blk = Vec::new();
+    let mut l3_blk = Vec::new();
+    let mut top_blk = Vec::new();
+    let mut mid_blk = Vec::new();
+    let mut freed_blocks = Vec::new();
 
     // 直接块
     for i in 0..DIRECT_COUNT {
         let b = read_u32(i_block, i);
         if b != 0 {
-            alloc_mod::free_block(state, b as u64)?;
+            freed_blocks.push(b as u64);
             write_u32(i_block, i, 0);
         }
     }
     // 一级
     let l1 = read_u32(i_block, 12);
     if l1 != 0 {
-        let mut blk = vec![0u8; bs];
-        state.read_block(l1 as u64, &mut blk)?;
+        resize_block_scratch(&mut l1_blk, bs);
+        state.read_block(l1 as u64, &mut l1_blk)?;
         for i in 0..p {
-            let b = read_u32(&blk, i);
+            let b = read_u32(&l1_blk, i);
             if b != 0 {
-                alloc_mod::free_block(state, b as u64)?;
+                freed_blocks.push(b as u64);
             }
         }
-        alloc_mod::free_block(state, l1 as u64)?;
+        freed_blocks.push(l1 as u64);
         write_u32(i_block, 12, 0);
     }
     // 二级
     let l2 = read_u32(i_block, 13);
     if l2 != 0 {
-        let mut l2_blk = vec![0u8; bs];
+        resize_block_scratch(&mut l2_blk, bs);
+        resize_block_scratch(&mut mid_blk, bs);
         state.read_block(l2 as u64, &mut l2_blk)?;
         for i in 0..p {
             let mid = read_u32(&l2_blk, i);
             if mid == 0 {
                 continue;
             }
-            let mut mid_blk = vec![0u8; bs];
             state.read_block(mid as u64, &mut mid_blk)?;
             for j in 0..p {
                 let b = read_u32(&mid_blk, j);
                 if b != 0 {
-                    alloc_mod::free_block(state, b as u64)?;
+                    freed_blocks.push(b as u64);
                 }
             }
-            alloc_mod::free_block(state, mid as u64)?;
+            freed_blocks.push(mid as u64);
         }
-        alloc_mod::free_block(state, l2 as u64)?;
+        freed_blocks.push(l2 as u64);
         write_u32(i_block, 13, 0);
     }
     // 三级
     let l3 = read_u32(i_block, 14);
     if l3 != 0 {
-        let mut l3_blk = vec![0u8; bs];
+        resize_block_scratch(&mut l3_blk, bs);
+        resize_block_scratch(&mut top_blk, bs);
+        resize_block_scratch(&mut mid_blk, bs);
         state.read_block(l3 as u64, &mut l3_blk)?;
         for i in 0..p {
             let top = read_u32(&l3_blk, i);
             if top == 0 {
                 continue;
             }
-            let mut top_blk = vec![0u8; bs];
             state.read_block(top as u64, &mut top_blk)?;
             for j in 0..p {
                 let mid = read_u32(&top_blk, j);
                 if mid == 0 {
                     continue;
                 }
-                let mut mid_blk = vec![0u8; bs];
                 state.read_block(mid as u64, &mut mid_blk)?;
                 for k in 0..p {
                     let b = read_u32(&mid_blk, k);
                     if b != 0 {
-                        alloc_mod::free_block(state, b as u64)?;
+                        freed_blocks.push(b as u64);
                     }
                 }
-                alloc_mod::free_block(state, mid as u64)?;
+                freed_blocks.push(mid as u64);
             }
-            alloc_mod::free_block(state, top as u64)?;
+            freed_blocks.push(top as u64);
         }
-        alloc_mod::free_block(state, l3 as u64)?;
+        freed_blocks.push(l3 as u64);
         write_u32(i_block, 14, 0);
     }
+    alloc_mod::free_blocks_sparse(state, &freed_blocks)?;
     Ok(())
 }

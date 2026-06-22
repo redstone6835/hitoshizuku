@@ -12,8 +12,12 @@
 //!
 //! 调度器内部使用 `WaitStatus(i32)`，构造器封装上述位运算；外部按需提供解码。
 
+use alloc::sync::Arc;
+use core::fmt;
+
 use crate::pid::PidT;
 use crate::signal::SignalNumber;
+use crate::task::{Task, TaskUsage};
 
 /// `wait4` / `waitid` 的标志位。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,7 +46,7 @@ impl WaitOptions {
 }
 
 /// `wait4(pid, ...)` 的 pid 参数解释。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum WaitId {
     /// pid > 0：精确匹配。
     Pid(PidT),
@@ -52,9 +56,36 @@ pub enum WaitId {
     SameGroup,
     /// pid < -1：pgid == -pid 的子。
     Pgid(PidT),
-    /// `waitid` 的 P_PIDFD（占位）。
-    Pidfd(i32),
+    /// `waitid` 的 P_PIDFD：syscall 层已经把 fd 解成具体任务句柄。
+    Pidfd(Arc<Task>),
 }
+
+impl fmt::Debug for WaitId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pid(pid) => f.debug_tuple("Pid").field(pid).finish(),
+            Self::All => f.write_str("All"),
+            Self::SameGroup => f.write_str("SameGroup"),
+            Self::Pgid(pgid) => f.debug_tuple("Pgid").field(pgid).finish(),
+            Self::Pidfd(task) => f.debug_tuple("Pidfd").field(&Arc::as_ptr(task)).finish(),
+        }
+    }
+}
+
+impl PartialEq for WaitId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Pid(lhs), Self::Pid(rhs)) => lhs == rhs,
+            (Self::All, Self::All) => true,
+            (Self::SameGroup, Self::SameGroup) => true,
+            (Self::Pgid(lhs), Self::Pgid(rhs)) => lhs == rhs,
+            (Self::Pidfd(lhs), Self::Pidfd(rhs)) => Arc::ptr_eq(lhs, rhs),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for WaitId {}
 
 impl WaitId {
     /// 把 `wait4` 风格的 `pid` 参数解析成 [`WaitId`]。
@@ -109,7 +140,7 @@ impl WaitStatus {
     }
 
     pub const fn wifexited(self) -> bool {
-        (self.0 & 0x7f) == 0
+        self.0 != 0xffff && (self.0 & 0x7f) == 0
     }
     pub const fn wexitstatus(self) -> i32 {
         (self.0 >> 8) & 0xff
@@ -140,4 +171,5 @@ impl WaitStatus {
 pub struct WaitResult {
     pub pid: PidT,
     pub status: WaitStatus,
+    pub usage: TaskUsage,
 }

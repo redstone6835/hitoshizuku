@@ -3,7 +3,6 @@
 //! 当前 ACPI 的实现只是一个最小的 AIGC 实现，因为工程目前的重心不在于 ACPI，而
 //! 在于 DTB。在决赛的时候可能会对 ACPI 的实现进行充分完善。
 
-use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -15,7 +14,9 @@ use acpi::address::{AddressSpace, GenericAddress};
 use acpi::aml::namespace::{AmlName, NamespaceLevelKind};
 use acpi::aml::object::{Object, WrappedObject};
 use acpi::aml::resource::{
-    AddressSpaceResourceType, MemoryRangeDescriptor, Resource, resource_descriptor_list,
+    AddressSpaceResourceType, InterruptPolarity as AcpiInterruptPolarity,
+    InterruptTrigger as AcpiInterruptTrigger, IrqDescriptor, MemoryRangeDescriptor, Resource,
+    resource_descriptor_list,
 };
 use acpi::aml::{AmlError, Interpreter};
 use acpi::sdt::SdtHeader;
@@ -25,9 +26,14 @@ use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
 use acpi::{AcpiTable, AmlHandler, Handle, Handler, PhysicalMapping};
 
 use allocator::KERNEL_ALLOCATOR;
-use general::dev::char::{CharDevice, CharDeviceKind};
-use general::dev::drivers::{Uart16550, VirtioBlk};
+use general::dev::char::CharDevice;
 use general::dev::enumerate::DEVICES;
+use general::dev::platform::{
+    DeviceMatchId, DeviceProperties, DeviceResource, IrqPolarity, IrqResourceAttributes,
+    IrqSharing, IrqTrigger, PlatformDeviceInfo, PlatformProbeStatus,
+    register_and_probe_platform_device,
+};
+use general::dev::pnp::DevInitContext;
 use general::firmware::power::{
     PowerAccessWidth, PowerControlInfo, PowerControlMethod, PowerRegister, PowerRegisterSpace,
 };
@@ -35,7 +41,8 @@ use general::firmware::{FirmwareTableMapping, SerialPortInfo};
 use general::vfs::FS_REGISTRY;
 use general::vfs::VfsContext;
 use general::vfs::cred::Credentials;
-use general::vfs::dentry::{Dentry, VfsRoot};
+use general::vfs::dentry::VfsRoot;
+use general::vfs::device_files::projection::find_char_device_by_fw_name;
 use general::vfs::devtmpfs::DevTmpfsSuperblockOps;
 use general::vfs::error::VfsError;
 use general::vfs::limits::VfsLimits;
@@ -45,7 +52,6 @@ use general::vfs::stat::FileMode;
 use general::{StartContext, StartFirmware};
 use log::{LogRecord, LogSink, printk};
 
-use crate::dtb::ensure_dir;
 use crate::start;
 
 const ACPI_MADT_TYPE_LOCAL_APIC: u8 = 0;
@@ -225,10 +231,16 @@ impl AmlHandler for AcpiMapper {
 }
 
 #[derive(Clone)]
+struct FirmwareSerialDevice {
+    port: SerialPortInfo,
+    resources: Vec<DeviceResource>,
+}
+
+#[derive(Clone)]
 struct FirmwareMmioDevice {
     name: &'static str,
     phys_addr: usize,
-    size: usize,
+    resources: Vec<DeviceResource>,
 }
 
 pub fn kernel_start_init(context: &StartContext) {
@@ -252,11 +264,11 @@ pub fn kernel_start_init(context: &StartContext) {
         tables.rsdp_revision,
     );
 
-    // ── Step 1: parse ACPI firmware tables ───────────────────────────────────
+    // ── 阶段 1：解析 ACPI 固件表 ───────────────────────────────────────────
 
     let cpu_count = cpu_count_from_madt(&tables).unwrap_or(1).max(1);
-    let serial_port = serial_port_from_spcr(&tables);
-    let console_serial_port_phys = serial_port.map(|port| port.phys_addr);
+    let serial_device = serial_device_from_spcr(&tables);
+    let console_serial_port_phys = serial_device.as_ref().map(|device| device.port.phys_addr);
     let power_controls = parse_power_controls(&tables, mapper);
     let memory_segments = context
         .memory
@@ -266,11 +278,11 @@ pub fn kernel_start_init(context: &StartContext) {
             panic!("[kernel-start][acpi] ACPI firmware requires usable boot memory segments")
         });
 
-    // ── Step 2: install power controls ───────────────────────────────────────
+    // ── 阶段 2：安装电源控制入口 ───────────────────────────────────────────
 
     general::firmware::power::install(power_controls, context.address.phys_to_virt);
 
-    // ── Step 3: initialize layered memory allocator ───────────────────────────
+    // ── 阶段 3：初始化分层内存分配器 ───────────────────────────────────────
 
     KERNEL_ALLOCATOR
         .bind_address_translation(context.address.phys_to_virt, context.address.virt_to_phys);
@@ -317,127 +329,38 @@ pub fn kernel_start_init(context: &StartContext) {
         .command_line
         .map(general::cmdline::Cmdline::new);
 
-    // ── Step 4: discover and register ACPI devices ───────────────────────────
+    // ── 阶段 4：发现并登记 ACPI 设备描述 ──────────────────────────────────
 
-    let mut serial_ports: Vec<SerialPortInfo> = Vec::new();
+    let mut serial_devices: Vec<FirmwareSerialDevice> = Vec::new();
     let mut virtio_mmio_devices: Vec<FirmwareMmioDevice> = Vec::new();
-    discover_acpi_namespace_devices(mapper, &tables, &mut serial_ports, &mut virtio_mmio_devices);
-    if let Some(port) = serial_port
-        && !serial_ports
+    discover_acpi_namespace_devices(
+        mapper,
+        &tables,
+        &mut serial_devices,
+        &mut virtio_mmio_devices,
+    );
+    if let Some(device) = serial_device
+        && !serial_devices
             .iter()
-            .any(|existing| existing.phys_addr == port.phys_addr)
+            .any(|existing| existing.port.phys_addr == device.port.phys_addr)
     {
-        serial_ports.push(port);
+        serial_devices.push(device);
     }
-    let console_serial_port_index = console_serial_port_phys
-        .and_then(|phys| serial_ports.iter().position(|port| port.phys_addr == phys));
-
-    let mut block_index = 0usize;
-    for device in &virtio_mmio_devices {
-        let virt_base = (context.address.device_mmio_to_virt)(device.phys_addr);
-        let driver = match VirtioBlk::new(virt_base, context.address.virt_to_phys) {
-            Ok(driver) => driver,
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] skipped virtio-mmio {} at {:#x}: {}",
-                    device.name,
-                    device.phys_addr,
-                    err
-                );
-                continue;
-            }
-        };
-        let user_name = alloc::format!(
-            "{}{}",
-            general::dev::block::BlockDeviceKind::VirtioBlk.name(),
-            block_index
-        );
-        let block_dev = match driver.into_block_dev(&user_name, context.address.virt_to_phys) {
-            Ok(dev) => dev,
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] failed to create block dev for {} at {:#x}: {}",
-                    device.name,
-                    device.phys_addr,
-                    err
-                );
-                continue;
-            }
-        };
-        match DEVICES.block_devs.push(&block_dev) {
-            Ok(dev) => {
-                printk!(
-                    "[kernel-start][acpi] registered virtio-blk {} → /dev/{} at phys={:#x} size={:#x}",
-                    device.name,
-                    dev.name(),
-                    device.phys_addr,
-                    device.size
-                );
-                block_index += 1;
-            }
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] failed to register virtio-blk {} at {:#x}: {:?}",
-                    device.name,
-                    device.phys_addr,
-                    err
-                );
-            }
-        }
-    }
-
-    let mut char_dev_bindings: alloc::vec::Vec<(&'static str, general::dev::char::CharDevice)> =
-        alloc::vec::Vec::new();
-    for (idx, port) in serial_ports.iter().enumerate() {
-        let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
-        let uart: &'static Uart16550 = if let Some(clock_hz) = port.clock_hz {
-            Box::leak(Box::new(Uart16550::new(virt_base, clock_hz, 115_200)))
-        } else {
-            Box::leak(Box::new(Uart16550::new_preconfigured(virt_base)))
-        };
-        let fw_name: &'static str = port.name;
-        let user_name: &'static str = alloc::format!("uart{}", idx).leak();
-        let dev = CharDevice::new(CharDeviceKind::Ns16550, fw_name, uart);
-        if let Err(err) = DEVICES.char_devs.push(dev.clone()) {
-            printk!(
-                "[kernel-start][acpi] failed to register {} (uart{}) at {:#x}: {:?}",
-                fw_name,
-                idx,
-                port.phys_addr,
-                err
-            );
-        } else {
-            char_dev_bindings.push((user_name, dev));
-            printk!(
-                "[kernel-start][acpi] registered {} -> /dev/{} at phys={:#x}",
-                fw_name,
-                user_name,
-                port.phys_addr
-            );
-        }
-    }
+    let console_serial_port_index = console_serial_port_phys.and_then(|phys| {
+        serial_devices
+            .iter()
+            .position(|device| device.port.phys_addr == phys)
+    });
 
     printk!(
         "[kernel-start][acpi] device discovery complete: {} uart(s), {} virtio block candidate(s)",
-        serial_ports.len(),
+        serial_devices.len(),
         virtio_mmio_devices.len()
     );
 
-    // ── Step 5: mount root filesystem (tmpfs) and devtmpfs on /dev ───────────
+    // ── 阶段 5：挂载根文件系统并准备 /dev ─────────────────────────────────
 
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::TmpfsDriver)))
-        .expect("[kernel-start][acpi] failed to register tmpfs driver");
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::DevTmpfsDriver)))
-        .expect("[kernel-start][acpi] failed to register devtmpfs driver");
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::ProcFsDriver)))
-        .expect("[kernel-start][acpi] failed to register procfs driver");
-    FS_REGISTRY
-        .register(Box::leak(Box::new(general::vfs::SysFsDriver)))
-        .expect("[kernel-start][acpi] failed to register sysfs driver");
-    general::vfs::register_block_filesystems();
+    crate::device_init::register_core_filesystems("acpi");
 
     let root_sb = FS_REGISTRY
         .find("tmpfs")
@@ -457,74 +380,6 @@ pub fn kernel_start_init(context: &StartContext) {
 
     let cred = Credentials::root();
 
-    let dev_inode = root_sb
-        .root_inode
-        .mkdir("dev", FileMode::new(0o755), &cred)
-        .expect("[kernel-start][acpi] failed to create /dev directory");
-    let dev_dentry = general::vfs::DCACHE.insert(Dentry::new_positive(
-        "dev",
-        Some(Arc::clone(&root_sb.root_dentry)),
-        Arc::clone(&dev_inode),
-    ));
-
-    let dev_sb = FS_REGISTRY
-        .find("devtmpfs")
-        .expect("[kernel-start][acpi] devtmpfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][acpi] failed to mount devtmpfs");
-
-    mount_ns
-        .mount(
-            Arc::clone(&dev_dentry),
-            Arc::clone(&dev_sb),
-            MountFlags::default(),
-        )
-        .expect("[kernel-start][acpi] failed to mount devtmpfs on /dev");
-
-    let dev_ops = dev_sb
-        .downcast_ops::<DevTmpfsSuperblockOps>()
-        .expect("[kernel-start][acpi] failed to downcast devtmpfs ops");
-
-    for (name, dev) in [("null", CharDevice::null()), ("zero", CharDevice::zero())] {
-        match dev_ops.bind_char(name, dev) {
-            Ok(()) | Err(VfsError::AlreadyExists) => {}
-            Err(err) => {
-                printk!(
-                    "[kernel-start][acpi] failed to bind standard /dev/{}: {:?}",
-                    name,
-                    err
-                );
-            }
-        }
-    }
-
-    for (user_name, dev) in &char_dev_bindings {
-        if let Err(err) = dev_ops.bind_char(user_name, dev.clone()) {
-            printk!(
-                "[kernel-start][acpi] failed to bind char dev '{}' (fw: {}) to /dev: {:?}",
-                user_name,
-                dev.fw_name(),
-                err
-            );
-        }
-    }
-
-    if let Ok(block_devs) = DEVICES.block_devs.list() {
-        for dev in block_devs {
-            if let Err(err) = dev_ops.bind_block(dev.name(), Arc::clone(&dev)) {
-                printk!(
-                    "[kernel-start][acpi] failed to bind block dev '{}' to /dev: {:?}",
-                    dev.name(),
-                    err
-                );
-            }
-        }
-    }
-
-    printk!("[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev'");
-
-    // ── Step 6: register console and bind log sink ────────────────────────────
-
     let vfs_ctx = VfsContext::new(
         Arc::clone(&root_sb.root_dentry),
         Arc::clone(&root_mount),
@@ -535,6 +390,79 @@ pub fn kernel_start_init(context: &StartContext) {
         VfsLimits::default_arc(),
     );
 
+    let dev_sb = crate::device_init::mount_devtmpfs("acpi");
+    crate::device_init::mount_devtmpfs_on_dev("acpi", &vfs_ctx, Arc::clone(&dev_sb));
+
+    let dev_ops = crate::device_init::devtmpfs_ops(&dev_sb, "acpi");
+
+    crate::device_init::activate_device_subsystem(
+        "acpi",
+        Arc::clone(&dev_sb),
+        DevInitContext::new(context.address.device_mmio_to_virt)
+            .with_realtime_clock(crate::vdso::set_realtime_ns)
+            .with_realtime_source_hooks(
+                crate::vdso::install_realtime_source,
+                crate::vdso::unregister_realtime_source,
+            ),
+    );
+
+    let stdout_phys = console_serial_port_phys;
+    let mut platform_bound = 0usize;
+    for device in &serial_devices {
+        let port = device.port;
+        let mut ids = Vec::new();
+        ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0500.into()));
+        ids.push(DeviceMatchId::AcpiHid(ACPI_HID_PNP0501.into()));
+        let info = PlatformDeviceInfo {
+            fw_name: port.name.into(),
+            fw_path: None,
+            fw_parent_path: None,
+            ids,
+            resources: device.resources.clone(),
+            properties: DeviceProperties {
+                clock_hz: port.clock_hz,
+                baud: port.baud,
+                fw_phandle: None,
+                fw_interrupt_parent: None,
+                interrupt_controller: false,
+                fw_address_cells: None,
+                fw_size_cells: None,
+                fw_parent_address_cells: None,
+                fw_parent_size_cells: None,
+                stdout: stdout_phys == Some(port.phys_addr),
+            },
+            fw_properties: Vec::new(),
+        };
+        if register_platform_device(info, "acpi") {
+            platform_bound += 1;
+        }
+    }
+    for device in &virtio_mmio_devices {
+        let mut ids = Vec::new();
+        ids.push(DeviceMatchId::AcpiHid(ACPI_HID_VIRTIO_MMIO.into()));
+        let info = PlatformDeviceInfo {
+            fw_name: device.name.into(),
+            fw_path: None,
+            fw_parent_path: None,
+            ids,
+            resources: device.resources.clone(),
+            properties: DeviceProperties::default(),
+            fw_properties: Vec::new(),
+        };
+        if register_platform_device(info, "acpi") {
+            platform_bound += 1;
+        }
+    }
+    printk!(
+        "[kernel-start][acpi] platform PnP discovery complete: {} candidate(s), {} bound",
+        serial_devices.len() + virtio_mmio_devices.len(),
+        platform_bound
+    );
+
+    // ── 阶段 6：注册控制台并绑定日志输出 ──────────────────────────────────
+
+    crate::device_init::mount_standard_user_api_filesystems("acpi", &vfs_ctx);
+
     // 把同一套部件交给 sched shim 保管：随后 sched::boot_init 会据此给 init
     // 任务挂上 TASKEXT_VFS_CONTEXT / TASKEXT_VFS_FDTABLE。
     crate::sched::stash_boot_vfs_parts(
@@ -544,23 +472,9 @@ pub fn kernel_start_init(context: &StartContext) {
         Arc::new(cred.clone()),
     );
 
-    ensure_dir(&vfs_ctx, "/sys", FileMode::new(0o555))
-        .expect("[kernel-start][acpi] failed to ensure /sys directory");
-    let sys_dentry = path::lookup(&vfs_ctx, &Dirfd::Cwd, "/sys", LookupFlags::DIRECTORY)
-        .expect("[kernel-start][acpi] failed to resolve /sys")
-        .dentry;
-    let sys_sb = FS_REGISTRY
-        .find("sysfs")
-        .expect("[kernel-start][acpi] sysfs driver not found")
-        .mount(None, "")
-        .expect("[kernel-start][acpi] failed to mount sysfs");
-    mount_ns
-        .mount(
-            Arc::clone(&sys_dentry),
-            Arc::clone(&sys_sb),
-            MountFlags::default(),
-        )
-        .expect("[kernel-start][acpi] failed to mount sysfs on /sys");
+    printk!(
+        "[kernel-start][acpi] VFS ready: tmpfs '/' + devtmpfs '/dev' + tmpfs '/dev/shm' + sysfs '/sys'"
+    );
 
     let console_registered = {
         let cmdline_dev = cmdline
@@ -582,12 +496,8 @@ pub fn kernel_start_init(context: &StartContext) {
                 dev.fw_name()
             );
             Some(dev)
-        } else if let Some(port) = console_serial_port_index.and_then(|i| serial_ports.get(i)) {
-            let virt_base = (context.address.device_mmio_to_virt)(port.phys_addr);
-            let found = DEVICES.char_devs.iter().find(|dev| {
-                dev.downcast_driver::<Uart16550>()
-                    .is_some_and(|uart| uart.base() == virt_base)
-            });
+        } else if let Some(device) = console_serial_port_index.and_then(|i| serial_devices.get(i)) {
+            let found = lookup_char_fw_name(device.port.name);
             if let Some(dev) = found.as_ref() {
                 printk!(
                     "[kernel-start][acpi] console from firmware: {}",
@@ -671,7 +581,43 @@ fn resolve_cmdline_console(
                     .and_then(|dev_name| dev_ops.char_dev(dev_name))
             });
     }
-    DEVICES.char_devs.lookup(name)
+    lookup_char_fw_name(name)
+}
+
+fn lookup_char_fw_name(name: &str) -> Option<CharDevice> {
+    find_char_device_by_fw_name(&DEVICES.functions, name)
+}
+
+fn register_platform_device(info: PlatformDeviceInfo, tag: &str) -> bool {
+    match register_and_probe_platform_device(info) {
+        Ok(reg) => match reg.status {
+            PlatformProbeStatus::Bound => true,
+            PlatformProbeStatus::NoDriver => {
+                printk!(
+                    "[kernel-start][{}] no platform driver for {}",
+                    tag,
+                    reg.device.id
+                );
+                false
+            }
+            PlatformProbeStatus::Deferred => {
+                log::debug!(
+                    "[kernel-start][{}] deferred platform probe for {}",
+                    tag,
+                    reg.device.id
+                );
+                false
+            }
+        },
+        Err(err) => {
+            printk!(
+                "[kernel-start][{}] failed to register/probe platform device: {:?}",
+                tag,
+                err
+            );
+            false
+        }
+    }
 }
 
 fn unsupported_host_operation(operation: &str) -> ! {
@@ -684,7 +630,7 @@ fn unsupported_host_operation(operation: &str) -> ! {
 fn discover_acpi_namespace_devices(
     mapper: AcpiMapper,
     tables: &acpi::AcpiTables<AcpiMapper>,
-    serial_ports: &mut Vec<SerialPortInfo>,
+    serial_devices: &mut Vec<FirmwareSerialDevice>,
     virtio_mmio_devices: &mut Vec<FirmwareMmioDevice>,
 ) {
     let interpreter = match build_acpi_interpreter(mapper, tables) {
@@ -725,7 +671,9 @@ fn discover_acpi_namespace_devices(
         }
 
         let resources = acpi_device_resources(&interpreter, &path);
-        let Some((phys_addr, size)) = resources.into_iter().find(|&(_, size)| size != 0) else {
+        let Some((phys_addr, size)) =
+            first_mmio_resource(&resources).filter(|&(_, size)| size != 0)
+        else {
             printk!(
                 "[kernel-start][acpi] ACPI device {} has supported id but no MMIO resource",
                 path_string
@@ -735,16 +683,25 @@ fn discover_acpi_namespace_devices(
 
         let name = alloc::format!("{}", path).leak();
         if is_serial {
-            if !serial_ports.iter().any(|port| port.phys_addr == phys_addr) {
+            if !serial_devices
+                .iter()
+                .any(|device| device.port.phys_addr == phys_addr)
+            {
                 printk!(
-                    "[kernel-start][acpi] namespace serial: {} phys={:#x}",
-                    name,
-                    phys_addr
-                );
-                serial_ports.push(SerialPortInfo {
+                    "[kernel-start][acpi] namespace serial: {} phys={:#x} size={:#x}",
                     name,
                     phys_addr,
-                    clock_hz: None,
+                    size
+                );
+                serial_devices.push(FirmwareSerialDevice {
+                    port: SerialPortInfo {
+                        name,
+                        phys_addr,
+                        reg_size: Some(size),
+                        clock_hz: None,
+                        baud: None,
+                    },
+                    resources,
                 });
             }
         } else if !virtio_mmio_devices
@@ -760,7 +717,7 @@ fn discover_acpi_namespace_devices(
             virtio_mmio_devices.push(FirmwareMmioDevice {
                 name,
                 phys_addr,
-                size,
+                resources,
             });
         }
     }
@@ -912,7 +869,7 @@ fn acpi_eval_string(
 fn acpi_device_resources(
     interpreter: &Interpreter<AcpiMapper>,
     path: &AmlName,
-) -> Vec<(usize, usize)> {
+) -> Vec<DeviceResource> {
     let object = match interpreter.evaluate_if_present(acpi_child_name(path, "_CRS"), Vec::new()) {
         Ok(Some(object)) => object,
         _ => return Vec::new(),
@@ -929,23 +886,65 @@ fn acpi_device_resources(
         }
     };
 
-    let mut ranges = Vec::new();
+    let mut out = Vec::new();
     for resource in resources {
         match resource {
             Resource::MemoryRange(MemoryRangeDescriptor::FixedLocation {
                 base_address,
                 range_length,
                 ..
-            }) => ranges.push((base_address as usize, range_length as usize)),
+            }) => out.push(DeviceResource::mmio(
+                base_address as usize,
+                range_length as usize,
+            )),
             Resource::AddressSpace(desc)
                 if desc.resource_type == AddressSpaceResourceType::MemoryRange =>
             {
-                ranges.push((desc.address_range.0 as usize, desc.length as usize));
+                out.push(DeviceResource::mmio(
+                    desc.address_range.0 as usize,
+                    desc.length as usize,
+                ));
             }
+            Resource::Irq(irq) => out.push(acpi_irq_resource(&irq)),
             _ => {}
         }
     }
-    ranges
+    out
+}
+
+fn first_mmio_resource(resources: &[DeviceResource]) -> Option<(usize, usize)> {
+    resources.iter().find_map(DeviceResource::as_mmio)
+}
+
+fn acpi_gsi_resource(gsi: u32) -> DeviceResource {
+    let mut cells = Vec::new();
+    cells.push(gsi);
+    DeviceResource::irq(None, cells.into_boxed_slice())
+}
+
+fn acpi_irq_resource(irq: &IrqDescriptor) -> DeviceResource {
+    let mut cells = Vec::new();
+    cells.push(irq.irq);
+    DeviceResource::irq_with_attributes(
+        None,
+        cells.into_boxed_slice(),
+        IrqResourceAttributes {
+            trigger: Some(match irq.trigger {
+                AcpiInterruptTrigger::Edge => IrqTrigger::Edge,
+                AcpiInterruptTrigger::Level => IrqTrigger::Level,
+            }),
+            polarity: Some(match irq.polarity {
+                AcpiInterruptPolarity::ActiveHigh => IrqPolarity::ActiveHigh,
+                AcpiInterruptPolarity::ActiveLow => IrqPolarity::ActiveLow,
+            }),
+            sharing: Some(if irq.is_shared {
+                IrqSharing::Shared
+            } else {
+                IrqSharing::Exclusive
+            }),
+            wake_capable: irq.is_wake_capable,
+        },
+    )
 }
 
 fn acpi_child_name(path: &AmlName, name: &str) -> AmlName {
@@ -1334,7 +1333,7 @@ fn madt_processor_enabled(entry_type: u8, entry: &[u8]) -> bool {
     }
 }
 
-fn serial_port_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<SerialPortInfo> {
+fn serial_device_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<FirmwareSerialDevice> {
     let spcr = tables.find_table::<Spcr>()?;
     if let Err(err) = spcr.validate() {
         printk!("[kernel-start][acpi] invalid SPCR: {:?}", err);
@@ -1365,6 +1364,7 @@ fn serial_port_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<Serial
     }
 
     let clock_hz = spcr.uart_clock_frequency().map(|clock| clock.get());
+    let baud = spcr.baud_rate().map(|baud| baud.get());
     let phys_addr = base_address.address as usize;
     let name = spcr_namespace_name(&spcr)
         .unwrap_or_else(|| alloc::format!("serial@{:#x}", phys_addr).leak());
@@ -1384,10 +1384,23 @@ fn serial_port_from_spcr(tables: &acpi::AcpiTables<AcpiMapper>) -> Option<Serial
         );
     }
 
-    Some(SerialPortInfo {
-        name,
-        phys_addr,
-        clock_hz,
+    let mut resources = Vec::new();
+    resources.push(DeviceResource::mmio(phys_addr, 0));
+    if let Some(gsi) = spcr.global_system_interrupt() {
+        resources.push(acpi_gsi_resource(gsi));
+    } else if let Some(irq) = spcr.irq() {
+        resources.push(acpi_gsi_resource(u32::from(irq)));
+    }
+
+    Some(FirmwareSerialDevice {
+        port: SerialPortInfo {
+            name,
+            phys_addr,
+            reg_size: None,
+            clock_hz,
+            baud,
+        },
+        resources,
     })
 }
 

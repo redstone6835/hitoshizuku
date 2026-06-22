@@ -87,6 +87,12 @@ pub unsafe extern "C" fn _start() {
         "csrwr $r0, 0x182",
         "csrwr $r0, 0x183",
 
+        // 使能 FPU (FPE) 和 SIMD (SXE)。
+        // LLVM 在 release 模式下会生成 LSX 向量指令。
+        // EUEN_FPE = 0x1, EUEN_SXE = 0x2
+        "ori $r12, $r0, 0x3",
+        "csrwr $r12, 0x2",
+
         // 跳转到虚拟化启动入口，继续执行内核的初始化逻辑。
         "la.abs $r12, {entry}",
         "jirl $r0, $r12, 0",

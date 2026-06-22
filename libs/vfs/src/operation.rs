@@ -16,10 +16,11 @@ fn check_sticky(
     parent_meta: &inode::InodeMeta,
     child_uid: cred::Uid,
 ) -> VfsResult<()> {
+    let cred = ctx.cred();
     if parent_meta.mode.sticky()
-        && ctx.cred.euid != parent_meta.uid
-        && ctx.cred.euid != child_uid
-        && !ctx.cred.has_cap(cred::Capability::FOwner)
+        && cred.euid != parent_meta.uid
+        && cred.euid != child_uid
+        && !cred.has_cap(cred::Capability::FOwner)
     {
         return Err(VfsError::OperationNotPermitted);
     }
@@ -36,10 +37,11 @@ fn check_parent_perm(
     sticky_child_uid: Option<cred::Uid>,
 ) -> VfsResult<()> {
     let pmeta = parent_inode.meta_snapshot();
-    if !ctx.cred.can_write(pmeta.uid, pmeta.gid, pmeta.mode) {
+    let cred = ctx.cred();
+    if !cred.can_write(pmeta.uid, pmeta.gid, pmeta.mode) {
         return Err(VfsError::PermissionDenied);
     }
-    if !ctx.cred.can_exec(pmeta.uid, pmeta.gid, pmeta.mode, true) {
+    if !cred.can_exec(pmeta.uid, pmeta.gid, pmeta.mode, true) {
         return Err(VfsError::PermissionDenied);
     }
     if let Some(child_uid) = sticky_child_uid {
@@ -54,10 +56,16 @@ fn check_parent_perm(
 /// VFS 层在传入驱动之前统一清除特殊位，防止权限提升。
 fn apply_create_mode(ctx: &VfsContext, mode: FileMode) -> FileMode {
     let mut m = ctx.apply_umask(mode);
-    if !ctx.cred.has_cap(cred::Capability::FSetId) {
+    if !ctx.cred().has_cap(cred::Capability::FSetId) {
         m = m.without(FileMode::SUID_SGID);
     }
     m
+}
+
+fn unregister_socket_inode(inode: &Inode) {
+    if inode.kind == stat::FileType::Socket {
+        crate::socket::unregister_path_socket(inode.fs_id().raw(), inode.ino());
+    }
 }
 
 /// 将新创建的 inode 插入 inode cache 和 dentry cache。
@@ -96,8 +104,24 @@ pub fn openat(
     flags: OpenOptions,
     mode: FileMode,
 ) -> VfsResult<Fd> {
+    openat_with_lookup_flags(ctx, fdt, dirfd, path, flags, mode, LookupFlags::default())
+}
+
+/// `openat` 的扩展入口，供 `openat2` 传入额外路径解析约束。
+///
+/// 普通 `openat` 只由 `OpenOptions` 派生 lookup 行为；`openat2` 的
+/// `RESOLVE_NO_SYMLINKS` 这类约束属于路径解析策略，不应塞进通用打开标志。
+pub fn openat_with_lookup_flags(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    dirfd: &Dirfd,
+    path: &str,
+    flags: OpenOptions,
+    mode: FileMode,
+    extra_lookup_flags: LookupFlags,
+) -> VfsResult<Fd> {
     let lookup_flags = {
-        let mut f = LookupFlags::default();
+        let mut f = extra_lookup_flags;
         if flags.nofollow {
             f = f.with(LookupFlags::NO_FOLLOW);
         }
@@ -136,10 +160,10 @@ pub fn openat(
 
             // 驱动的 create 负责原子地检查 O_EXCL（若文件已并发创建，返回 AlreadyExists）
             let effective_mode = apply_create_mode(ctx, mode);
-            let new_inode =
-                parent_inode
-                    .ops
-                    .create(&parent_inode, name, effective_mode, &ctx.cred)?;
+            let cred = ctx.cred();
+            let new_inode = parent_inode
+                .ops
+                .create(&parent_inode, name, effective_mode, &cred)?;
 
             let canonical = cache_new_inode(&parent_dentry, name, new_inode);
 
@@ -173,10 +197,11 @@ pub fn openat(
     // ── DAC 权限检查 ──
     {
         let meta = inode.meta_snapshot();
-        if flags.readable() && !ctx.cred.can_read(meta.uid, meta.gid, meta.mode) {
+        let cred = ctx.cred();
+        if flags.readable() && !cred.can_read(meta.uid, meta.gid, meta.mode) {
             return Err(VfsError::PermissionDenied);
         }
-        if flags.writable() && !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
+        if flags.writable() && !cred.can_write(meta.uid, meta.gid, meta.mode) {
             return Err(VfsError::PermissionDenied);
         }
     }
@@ -187,11 +212,12 @@ pub fn openat(
     }
 
     // ── 调用驱动 open，VFS 层组装 File（含 Mount，Drop 时自动 dec_open）──
-    let ops = inode.ops.open(&inode, &flags, &ctx.cred)?;
+    let cred = ctx.cred();
+    let ops = inode.ops.open(&inode, &flags, &cred)?;
     let file = File::new(
         Arc::clone(&inode),
         flags,
-        Arc::clone(&ctx.cred),
+        Arc::clone(&cred),
         ops,
         Arc::clone(&dentry),
         Arc::clone(&mount), // File::drop 时自动 dec_open
@@ -227,7 +253,7 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
         return Err(VfsError::AlreadyExists);
     }
 
-    let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
+    let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
     let parent_mount = parent_result.mount;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;
@@ -239,9 +265,10 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
     check_parent_perm(ctx, &parent_inode, None)?;
 
     let effective_mode = apply_create_mode(ctx, mode);
+    let cred = ctx.cred();
     let new_inode = parent_inode
         .ops
-        .mkdir(&parent_inode, name, effective_mode, &ctx.cred)?;
+        .mkdir(&parent_inode, name, effective_mode, &cred)?;
 
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())
@@ -251,14 +278,21 @@ pub fn mkdirat(ctx: &VfsContext, dirfd: &Dirfd, path: &str, mode: FileMode) -> V
 
 /// `unlinkat(AT_REMOVEDIR)` — 删除空目录。
 pub fn rmdir(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
-    let (parent_result, name) = path::lookup_parent(ctx, dirfd, path)?;
+    let (parent_result, name) = path::lookup_parent_dir_leaf(ctx, dirfd, path)?;
     let parent_dentry = parent_result.dentry;
+    let parent_mount = parent_result.mount;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;
 
-    let target = path::lookup(ctx, dirfd, path, LookupFlags::default())?;
-    if target.mount.is_rdonly() {
-        return Err(VfsError::ReadOnlyFilesystem);
+    let target = path::lookup(
+        ctx,
+        dirfd,
+        path,
+        LookupFlags::NO_FOLLOW.with(LookupFlags::NO_MOUNT_LAST),
+    )?;
+    if ctx.mount_ns.lookup_mount(&target.dentry).is_some() {
+        return Err(VfsError::DeviceBusy);
     }
+    parent_mount.check_writable()?;
 
     let child_inode = target.dentry.inode().ok_or(VfsError::NotFound)?;
     if child_inode.kind != stat::FileType::Directory {
@@ -282,7 +316,12 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let parent_dentry = parent_result.dentry;
     let parent_inode = parent_dentry.inode().ok_or(VfsError::NotFound)?;
 
-    let target = path::lookup(ctx, dirfd, path, LookupFlags::NO_FOLLOW)?;
+    let target = path::lookup(
+        ctx,
+        dirfd,
+        path,
+        LookupFlags::NO_FOLLOW.with(LookupFlags::NO_MOUNT_LAST),
+    )?;
     if target.mount.is_rdonly() {
         return Err(VfsError::ReadOnlyFilesystem);
     }
@@ -296,6 +335,7 @@ pub fn unlink(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     check_parent_perm(ctx, &parent_inode, Some(child_uid))?;
 
     parent_inode.ops.unlink(&parent_inode, name, &child_inode)?;
+    unregister_socket_inode(&child_inode);
     DCACHE.invalidate_dentry(&target.dentry);
     target.dentry.invalidate();
     retire_inode(child_inode);
@@ -319,9 +359,28 @@ pub fn renameat(
     let new_parent_dentry = new_parent_result.dentry;
     let new_mount = new_parent_result.mount;
 
+    let no_follow_no_mount = LookupFlags::NO_FOLLOW.with(LookupFlags::NO_MOUNT_LAST);
+    let old_result = path::lookup(ctx, old_dirfd, old_path, no_follow_no_mount)?;
+    if ctx.mount_ns.lookup_mount(&old_result.dentry).is_some() {
+        return Err(VfsError::DeviceBusy);
+    }
+    let old_inode = old_result.dentry.inode().ok_or(VfsError::NotFound)?;
+
     if Arc::ptr_eq(&old_parent_dentry, &new_parent_dentry) && old_name == new_name {
         return Ok(());
     }
+
+    let new_existing: Option<(Arc<dentry::Dentry>, Arc<inode::Inode>)> =
+        match path::lookup(ctx, new_dirfd, new_path, no_follow_no_mount) {
+            Ok(r) => {
+                if ctx.mount_ns.lookup_mount(&r.dentry).is_some() {
+                    return Err(VfsError::DeviceBusy);
+                }
+                r.dentry.inode().map(|inode| (r.dentry, inode))
+            }
+            Err(VfsError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
 
     let old_parent_inode = old_parent_dentry.inode().ok_or(VfsError::NotFound)?;
     let new_parent_inode = new_parent_dentry.inode().ok_or(VfsError::NotFound)?;
@@ -331,31 +390,26 @@ pub fn renameat(
         return Err(VfsError::CrossDevice);
     }
 
-    let old_result = path::lookup(ctx, old_dirfd, old_path, LookupFlags::NO_FOLLOW)?;
-    let old_inode = old_result.dentry.inode().ok_or(VfsError::NotFound)?;
-
     // 双端只读检查
     old_result.mount.check_writable()?;
     new_mount.check_writable()?;
 
     // 写权限 + sticky bit 检查（双端父目录）
     let old_inode_uid = old_inode.meta_snapshot().uid;
-    let new_existing: Option<(Arc<dentry::Dentry>, Arc<inode::Inode>)> =
-        path::lookup(ctx, new_dirfd, new_path, LookupFlags::NO_FOLLOW)
-            .ok()
-            .and_then(|r| r.dentry.inode().map(|inode| (r.dentry, inode)));
     let new_existing_uid: Option<cred::Uid> =
         new_existing.as_ref().map(|(_, i)| i.meta_snapshot().uid);
     {
         let m = old_parent_inode.meta_snapshot();
-        if !ctx.cred.can_write(m.uid, m.gid, m.mode) {
+        let cred = ctx.cred();
+        if !cred.can_write(m.uid, m.gid, m.mode) {
             return Err(VfsError::PermissionDenied);
         }
         check_sticky(ctx, &m, old_inode_uid)?;
     }
     {
         let m = new_parent_inode.meta_snapshot();
-        if !ctx.cred.can_write(m.uid, m.gid, m.mode) {
+        let cred = ctx.cred();
+        if !cred.can_write(m.uid, m.gid, m.mode) {
             return Err(VfsError::PermissionDenied);
         }
         if let Some(existing_uid) = new_existing_uid {
@@ -385,6 +439,9 @@ pub fn renameat(
 
     // 若替换了已有文件，清理被替换的 inode
     if let Some((_, replaced_inode)) = new_existing {
+        if !Arc::ptr_eq(&old_inode, &replaced_inode) {
+            unregister_socket_inode(&replaced_inode);
+        }
         retire_inode(replaced_inode);
     }
     Ok(())
@@ -423,7 +480,7 @@ pub fn chdir(ctx: &mut VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
     // 需要对目标目录有执行（搜索）权限
     let meta = inode.meta_snapshot();
-    if !ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+    if !ctx.cred().can_exec(meta.uid, meta.gid, meta.mode, true) {
         return Err(VfsError::PermissionDenied);
     }
     ctx.set_cwd(result.dentry, result.mount)
@@ -436,7 +493,7 @@ pub fn fchmodat(
     ctx: &VfsContext,
     dirfd: &Dirfd,
     path: &str,
-    mut mode: FileMode,
+    mode: FileMode,
     no_follow: bool,
 ) -> VfsResult<()> {
     let flags = if no_follow {
@@ -447,18 +504,32 @@ pub fn fchmodat(
     let result = path::lookup(ctx, dirfd, path, flags)?;
     result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    chmod_inode(ctx, &inode, mode)
+}
 
+/// `fchmod(2)` — 通过已打开 fd 修改文件权限位。
+pub fn fchmod(ctx: &VfsContext, fdt: &FdTable, fd: Fd, mode: FileMode) -> VfsResult<()> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    if file.flags().path_only {
+        return Err(VfsError::BadFileDescriptor);
+    }
+    file.mount().check_writable()?;
+    chmod_inode(ctx, file.inode(), mode)
+}
+
+fn chmod_inode(ctx: &VfsContext, inode: &Arc<Inode>, mut mode: FileMode) -> VfsResult<()> {
     let inode_uid = inode.meta_snapshot().uid;
-    if !ctx.cred.is_owner(inode_uid) {
+    let cred = ctx.cred();
+    if !cred.is_owner(inode_uid) {
         return Err(VfsError::OperationNotPermitted);
     }
 
     // POSIX：非特权进程 chmod 时必须清除 setuid/setgid 位，防止权限提升
-    if !ctx.cred.has_cap(cred::Capability::FSetId) {
+    if !cred.has_cap(cred::Capability::FSetId) {
         mode = mode.without(FileMode::SUID_SGID);
     }
 
-    inode.ops.chmod(&inode, mode)
+    inode.ops.chmod(inode, mode)
 }
 
 // ── chown ─────────────────────────────────────────────────────────────────────
@@ -472,6 +543,10 @@ pub fn fchownat(
     gid: Option<cred::Gid>,
     no_follow: bool,
 ) -> VfsResult<()> {
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+
     let flags = if no_follow {
         LookupFlags::NO_FOLLOW
     } else {
@@ -480,7 +555,35 @@ pub fn fchownat(
     let result = path::lookup(ctx, dirfd, path, flags)?;
     result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
+    chown_inode(ctx, &inode, uid, gid)
+}
 
+/// `fchown(2)` — 通过已打开 fd 修改文件所有者或所属组。
+pub fn fchown(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    fd: Fd,
+    uid: Option<cred::Uid>,
+    gid: Option<cred::Gid>,
+) -> VfsResult<()> {
+    if uid.is_none() && gid.is_none() {
+        return Ok(());
+    }
+
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    if file.flags().path_only {
+        return Err(VfsError::BadFileDescriptor);
+    }
+    file.mount().check_writable()?;
+    chown_inode(ctx, file.inode(), uid, gid)
+}
+
+fn chown_inode(
+    ctx: &VfsContext,
+    inode: &Arc<Inode>,
+    uid: Option<cred::Uid>,
+    gid: Option<cred::Gid>,
+) -> VfsResult<()> {
     let (inode_uid, inode_gid) = {
         let m = inode.meta_snapshot();
         (m.uid, m.gid)
@@ -489,7 +592,7 @@ pub fn fchownat(
     // uid 修改：需要 CAP_CHOWN
     if let Some(new_uid) = uid
         && new_uid != inode_uid
-        && !ctx.cred.has_cap(cred::Capability::Chown)
+        && !ctx.cred().has_cap(cred::Capability::Chown)
     {
         return Err(VfsError::OperationNotPermitted);
     }
@@ -497,21 +600,28 @@ pub fn fchownat(
     if let Some(new_gid) = gid
         && new_gid != inode_gid
     {
-        let is_owner = ctx.cred.euid == inode_uid;
-        let gid_ok = ctx.cred.egid == new_gid || ctx.cred.groups.contains(&new_gid);
-        if !(ctx.cred.has_cap(cred::Capability::Chown) || is_owner && gid_ok) {
+        let cred = ctx.cred();
+        let is_owner = cred.euid == inode_uid;
+        let gid_ok = cred.egid == new_gid || cred.groups.contains(&new_gid);
+        if !(cred.has_cap(cred::Capability::Chown) || is_owner && gid_ok) {
             return Err(VfsError::OperationNotPermitted);
         }
     }
 
-    inode.ops.chown(&inode, uid, gid)?;
+    inode.ops.chown(inode, uid, gid)?;
 
-    // POSIX：chown 后必须清除 SUID/SGID，防止权限提升（除非 CAP_FSETID）
-    if (uid.is_some() || gid.is_some()) && !ctx.cred.has_cap(cred::Capability::FSetId) {
+    // Linux regular-file semantics: chown clears SUID, and clears SGID only
+    // when the group execute bit is set. A non-executable SGID regular file
+    // uses the bit for mandatory locking and must keep it.
+    if (uid.is_some() || gid.is_some()) && inode.kind() == stat::FileType::Regular {
         let current_mode = inode.meta_snapshot().mode;
-        let new_mode = current_mode.without(FileMode::SUID_SGID);
+        let mut drop_bits = FileMode::ISUID;
+        if current_mode.has(FileMode::IXGRP) {
+            drop_bits = drop_bits.with(FileMode::ISGID);
+        }
+        let new_mode = current_mode.without(drop_bits);
         if new_mode != current_mode {
-            inode.ops.chmod(&inode, new_mode)?;
+            inode.ops.chmod(inode, new_mode)?;
         }
     }
 
@@ -532,55 +642,100 @@ pub fn mount(
     dev: Option<&str>,
     data: &str,
 ) -> VfsResult<Arc<mount::Mount>> {
-    if !ctx.cred.has_cap(cred::Capability::SysAdmin) {
+    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
     }
-    // 空 fstype 时按常见块文件系统顺序尝试自动检测
-    const CANDIDATES: &[&str] = &["ext2", "ext3", "ext4", "vfat"];
-    let candidates: &[&str] = if fs_type.is_empty() {
-        CANDIDATES
-    } else {
-        core::slice::from_ref(&fs_type)
-    };
-
+    let mountpoint = path::lookup(
+        ctx,
+        dirfd,
+        mountpoint_path,
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )?;
     let mut last_error = VfsError::NoDevice;
-    for &candidate in candidates {
-        let Some(driver) = FS_REGISTRY.find(candidate) else {
-            continue;
-        };
+    if fs_type.is_empty() {
+        for wanted_probe in [superblock::FsProbe::Strong, superblock::FsProbe::Weak] {
+            for entry in FS_REGISTRY.iter() {
+                let driver = entry.driver;
+                let flags = driver.flags();
+                if !flags.has(superblock::FsDriverFlags::BLOCK)
+                    || !flags.has(superblock::FsDriverFlags::AUTO_DETECT)
+                    || driver.probe(dev) != wanted_probe
+                {
+                    continue;
+                }
+                match driver.mount(dev, data) {
+                    Ok(superblock) => {
+                        return ctx.mount_ns.mount_at(
+                            Arc::clone(&mountpoint.dentry),
+                            Arc::clone(&mountpoint.mount),
+                            superblock,
+                            mount_flags,
+                        );
+                    }
+                    Err(e) => {
+                        last_error = e;
+                        continue;
+                    }
+                }
+            }
+        }
+        return Err(last_error);
+    }
+
+    if let Some(driver) = FS_REGISTRY.find(fs_type) {
         match driver.mount(dev, data) {
             Ok(superblock) => {
-                let mountpoint =
-                    path::lookup(ctx, dirfd, mountpoint_path, LookupFlags::DIRECTORY)?.dentry;
-                return ctx.mount_ns.mount(mountpoint, superblock, mount_flags);
+                if driver.flags().has(superblock::FsDriverFlags::SINGLE) {
+                    if let Some(existing) = ctx.mount_ns.lookup_mount(&mountpoint.dentry) {
+                        if Arc::ptr_eq(&existing.superblock, &superblock) {
+                            // SINGLE 文件系统（procfs/sysfs/devtmpfs）在同一挂载点重复
+                            // mount 时应表现为幂等操作。否则用户态 init 脚本再次挂载
+                            // /dev 会叠一层新 Mount，隐藏启动期已经挂好的 /dev/shm。
+                            existing.set_flags(mount_flags);
+                            return Ok(existing);
+                        }
+                    }
+                }
+                return ctx.mount_ns.mount_at(
+                    mountpoint.dentry,
+                    mountpoint.mount,
+                    superblock,
+                    mount_flags,
+                );
             }
             Err(e) => {
                 last_error = e;
-                continue;
             }
         }
     }
+
     Err(last_error)
 }
 
 /// 卸载文件系统。
 pub fn umount(ctx: &VfsContext, dirfd: &Dirfd, path: &str, force: bool) -> VfsResult<()> {
-    if !ctx.cred.has_cap(cred::Capability::SysAdmin) {
+    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
     }
-    let mountpoint = path::lookup(ctx, dirfd, path, LookupFlags::default())?.dentry;
+    let mountpoint = path::lookup(
+        ctx,
+        dirfd,
+        path,
+        LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+    )?
+    .dentry;
     ctx.mount_ns.umount(&mountpoint, force)
 }
 
 /// `chroot(2)` — 修改当前进程可见根目录。
 pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
-    if !ctx.cred.has_cap(cred::Capability::SysAdmin) {
+    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
     }
     let result = path::lookup(ctx, dirfd, path, LookupFlags::DIRECTORY)?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
     let meta = inode.meta_snapshot();
-    if !ctx.cred.can_exec(meta.uid, meta.gid, meta.mode, true) {
+    if !ctx.cred().can_exec(meta.uid, meta.gid, meta.mode, true) {
         return Err(VfsError::PermissionDenied);
     }
     ctx.set_root(result.dentry, result.mount)
@@ -591,7 +746,7 @@ pub fn chroot(ctx: &VfsContext, dirfd: &Dirfd, path: &str) -> VfsResult<()> {
 /// 当前 VFS 的进程根不是对命名空间根的裸引用，因此 pivot 成功后必须同步更新
 /// 调用进程的 root/cwd，后续绝对路径解析才会从新根开始。
 pub fn pivot_root(ctx: &VfsContext, new_root_path: &str, put_old_path: &str) -> VfsResult<()> {
-    if !ctx.cred.has_cap(cred::Capability::SysAdmin) {
+    if !ctx.cred().has_cap(cred::Capability::SysAdmin) {
         return Err(VfsError::OperationNotPermitted);
     }
 
@@ -631,9 +786,10 @@ pub fn symlinkat(ctx: &VfsContext, target: &str, dirfd: &Dirfd, link_path: &str)
 
     check_parent_perm(ctx, &parent_inode, None)?;
 
+    let cred = ctx.cred();
     let new_inode = parent_inode
         .ops
-        .symlink(&parent_inode, name, target, &ctx.cred)?;
+        .symlink(&parent_inode, name, target, &cred)?;
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())
 }
@@ -661,7 +817,7 @@ pub fn truncate(ctx: &VfsContext, dirfd: &Dirfd, path: &str, size: u64) -> VfsRe
     }
     {
         let meta = inode.meta_snapshot();
-        if !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
+        if !ctx.cred().can_write(meta.uid, meta.gid, meta.mode) {
             return Err(VfsError::PermissionDenied);
         }
     }
@@ -685,17 +841,42 @@ pub fn utimensat(
         LookupFlags::default()
     };
     let result = path::lookup(ctx, dirfd, path, flags)?;
-    result.mount.check_writable()?;
     let inode = result.dentry.inode().ok_or(VfsError::NotFound)?;
-    {
-        let meta = inode.meta_snapshot();
-        // 文件所有者或有写权限的进程可以设置时间戳；任意进程设置为当前时间
-        // 此处实现：所有者或有写权限
-        if !ctx.cred.is_owner(meta.uid) && !ctx.cred.can_write(meta.uid, meta.gid, meta.mode) {
-            return Err(VfsError::PermissionDenied);
-        }
+    utimens_inode(ctx, &result.mount, &inode, atime, mtime)
+}
+
+/// `futimens(2)` — 通过已打开 fd 设置文件时间戳。
+pub fn futimens(
+    ctx: &VfsContext,
+    fdt: &FdTable,
+    fd: Fd,
+    atime: Option<stat::Timespec>,
+    mtime: Option<stat::Timespec>,
+) -> VfsResult<()> {
+    let file = fdt.get_file(fd).ok_or(VfsError::BadFileDescriptor)?;
+    if file.flags().path_only {
+        return Err(VfsError::BadFileDescriptor);
     }
-    inode.ops.utimes(&inode, atime, mtime)
+    utimens_inode(ctx, file.mount(), file.inode(), atime, mtime)
+}
+
+fn utimens_inode(
+    ctx: &VfsContext,
+    mount: &Arc<mount::Mount>,
+    inode: &Arc<Inode>,
+    atime: Option<stat::Timespec>,
+    mtime: Option<stat::Timespec>,
+) -> VfsResult<()> {
+    mount.check_writable()?;
+    let meta = inode.meta_snapshot();
+    if atime.is_none() && mtime.is_none() {
+        return Ok(());
+    }
+    let cred = ctx.cred();
+    if !cred.is_owner(meta.uid) && !cred.can_write(meta.uid, meta.gid, meta.mode) {
+        return Err(VfsError::PermissionDenied);
+    }
+    inode.ops.utimes(inode, atime, mtime)
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────
@@ -746,13 +927,14 @@ pub fn linkat(
     // 条件 2/3 是防止攻击者通过硬链接维持对 setuid/setgid 可执行文件的访问。
     // CAP_FOWNER 同样绕过 protected_hardlinks（Linux may_linkat 语义：
     // inode_owner_or_capable 检查 owner OR CAP_FOWNER）。
+    let cred = ctx.cred();
     if old_inode.kind == stat::FileType::Regular
-        && !ctx.cred.has_cap(cred::Capability::DacReadSearch)
-        && !ctx.cred.has_cap(cred::Capability::FOwner)
+        && !cred.has_cap(cred::Capability::DacReadSearch)
+        && !cred.has_cap(cred::Capability::FOwner)
     {
         let meta = old_inode.meta_snapshot();
         let setgid_exec = meta.mode.setgid() && meta.mode.group_exec();
-        if ctx.cred.euid != meta.uid || meta.mode.setuid() || setgid_exec {
+        if cred.euid != meta.uid || meta.mode.setuid() || setgid_exec {
             return Err(VfsError::OperationNotPermitted);
         }
     }
@@ -794,7 +976,7 @@ pub fn mknodat(
     if matches!(
         kind,
         stat::FileType::BlockDevice | stat::FileType::CharDevice
-    ) && !ctx.cred.has_cap(cred::Capability::MkNod)
+    ) && !ctx.cred().has_cap(cred::Capability::MkNod)
     {
         return Err(VfsError::OperationNotPermitted);
     }
@@ -822,10 +1004,11 @@ pub fn mknodat(
     check_parent_perm(ctx, &parent_inode, None)?;
 
     let effective_mode = apply_create_mode(ctx, mode);
+    let cred = ctx.cred();
     let new_inode =
         parent_inode
             .ops
-            .mknod(&parent_inode, name, kind, effective_mode, dev, &ctx.cred)?;
+            .mknod(&parent_inode, name, kind, effective_mode, dev, &cred)?;
 
     cache_new_inode(&parent_dentry, name, new_inode);
     Ok(())

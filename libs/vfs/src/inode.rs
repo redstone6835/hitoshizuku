@@ -259,6 +259,16 @@ impl Inode {
         result
     }
 
+    /// 文件系统驱动完成磁盘 inode 写回后，用精确的底层元数据刷新 VFS 镜像。
+    ///
+    /// 与 `set_times`/`set_mode` 这类 VFS 语义入口不同，本接口不推导 ctime，也不做
+    /// 权限检查；调用方必须已经完成对应的文件系统写操作。
+    pub fn refresh_meta_from_fs(&self, new_meta: InodeMeta) {
+        let mut meta = self.meta.lock();
+        *meta = new_meta;
+        self.sync_meta_hot_fields(&meta);
+    }
+
     fn sync_meta_hot_fields(&self, meta: &InodeMeta) {
         self.cached_size.store(meta.size, Ordering::Release);
         self.cached_nlink.store(meta.nlink, Ordering::Release);
@@ -316,11 +326,50 @@ impl Inode {
         self.cached_size.store(new_size, Ordering::Release);
     }
 
+    /// 同时设置文件大小和块数，避免文件系统在常规写入/截断路径中拆开更新。
+    pub fn set_size_and_blocks(&self, new_size: u64, blocks: u64) {
+        let mut meta = self.meta.lock();
+        meta.size = new_size;
+        meta.blocks = blocks;
+        self.cached_size.store(new_size, Ordering::Release);
+    }
+
     /// 设置硬链接计数。
     pub fn set_nlink(&self, new_nlink: u32) {
         let mut meta = self.meta.lock();
         meta.nlink = new_nlink;
         self.cached_nlink.store(new_nlink, Ordering::Release);
+    }
+
+    /// 设置权限位并更新 ctime。
+    pub fn set_mode(&self, mode: FileMode) {
+        let mut meta = self.meta.lock();
+        meta.mode = mode;
+        meta.ctime = Timespec::now();
+    }
+
+    /// 设置所有者/所属组并更新 ctime；`None` 表示保持原值。
+    pub fn set_owner(&self, uid: Option<Uid>, gid: Option<Gid>) {
+        let mut meta = self.meta.lock();
+        if let Some(uid) = uid {
+            meta.uid = uid;
+        }
+        if let Some(gid) = gid {
+            meta.gid = gid;
+        }
+        meta.ctime = Timespec::now();
+    }
+
+    /// 设置访问/修改时间并更新 ctime；`None` 表示保持原值。
+    pub fn set_times(&self, atime: Option<Timespec>, mtime: Option<Timespec>) {
+        let mut meta = self.meta.lock();
+        if let Some(atime) = atime {
+            meta.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            meta.mtime = mtime;
+        }
+        meta.ctime = Timespec::now();
     }
 
     /// 增加硬链接计数。

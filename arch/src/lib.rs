@@ -9,11 +9,15 @@ extern crate alloc;
 pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use riscv64::*;
+#[cfg(target_arch = "riscv64")]
+pub type CurrentTaskOps = riscv64::Riscv64TaskOps;
 
 #[cfg(target_arch = "loongarch64")]
 pub mod loongarch64;
 #[cfg(target_arch = "loongarch64")]
 pub use loongarch64::*;
+#[cfg(target_arch = "loongarch64")]
+pub type CurrentTaskOps = loongarch64::LoongArch64TaskOps;
 
 /// 清零 BSS 段，确保未初始化的静态变量被正确设置为 0。
 pub(crate) unsafe fn clear_bss() {

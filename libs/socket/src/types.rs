@@ -56,6 +56,8 @@ pub enum SocketType {
     Datagram,
     /// 面向连接的有序报文(SOCK_SEQPACKET)
     Sequenced,
+    /// 原始套接字(SOCK_RAW)
+    Raw,
 }
 
 /// shutdown 方向。
@@ -82,6 +84,8 @@ impl Readiness {
     pub const HANGUP: Self = Self(1 << 2);
     /// 错误(对端读端已关)
     pub const FAULT: Self = Self(1 << 3);
+    /// 对端关闭写端,本端读侧将看到 EOF(POLLRDHUP/EPOLLRDHUP)
+    pub const READ_HANGUP: Self = Self(1 << 4);
 
     /// 空就绪集合
     pub const fn empty() -> Self {
@@ -116,8 +120,18 @@ pub struct PeerIdentity {
 }
 
 /// 可通过套接字传递的内核句柄(如文件描述符)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleIdentity {
+    /// 另一个 socket 句柄,值是 socket crate 内部分配的稳定 ID。
+    Socket(u64),
+}
+
 pub trait SocketHandle: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
+
+    fn identity(&self) -> Option<HandleIdentity> {
+        None
+    }
 }
 
 /// 共享句柄的引用计数指针。
