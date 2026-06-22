@@ -415,6 +415,9 @@ pub struct Task {
     wait_stop_sig: AtomicI32,
     wait_stop_pending: AtomicU8,
     wait_continue_pending: AtomicU8,
+    /// ptrace 的最小状态位。当前只区分任务是否处于 traced 模式，用于把
+    /// 信号投递转换成父进程可 wait 的 signal-delivery-stop。
+    ptrace_traced: AtomicU8,
     pub exit_waiters: WaitQueue,
     rel: Spinlock<Relations>,
     kstack: Spinlock<Option<KernelStack>>,
@@ -503,6 +506,7 @@ impl Task {
             wait_stop_sig: AtomicI32::new(0),
             wait_stop_pending: AtomicU8::new(0),
             wait_continue_pending: AtomicU8::new(0),
+            ptrace_traced: AtomicU8::new(0),
             exit_waiters: WaitQueue::new(),
             rel: Spinlock::new(Relations {
                 parent,
@@ -581,6 +585,20 @@ impl Task {
         self.state
             .compare_exchange(expect as u8, new as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    pub fn enable_ptrace_traced(&self) -> bool {
+        self.ptrace_traced
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn clear_ptrace_traced(&self) {
+        self.ptrace_traced.store(0, Ordering::Release);
+    }
+
+    pub fn is_ptrace_traced(&self) -> bool {
+        self.ptrace_traced.load(Ordering::Acquire) != 0
     }
 
     pub fn parent(&self) -> Option<Arc<Task>> {

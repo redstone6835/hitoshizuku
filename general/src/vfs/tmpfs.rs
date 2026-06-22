@@ -173,6 +173,7 @@ enum TmpfsInodeData {
     File(TmpfsFileData),
     Directory(BTreeMap<String, u64>),
     Symlink(String),
+    Fifo(Arc<vfs::pipe::Pipe>),
     Special,
 }
 
@@ -716,6 +717,11 @@ impl InodeOps for TmpfsInodeOps {
             blocks: 0,
         };
 
+        let inode_data = match kind {
+            FileType::Fifo => TmpfsInodeData::Fifo(vfs::pipe::new_fifo()),
+            _ => TmpfsInodeData::Special,
+        };
+
         let new_inode = Inode::new(
             InodeId {
                 fs_id: sb.fs_id,
@@ -727,7 +733,7 @@ impl InodeOps for TmpfsInodeOps {
             sb.dev_id,
             meta,
             Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::Special),
+                data: Spinlock::new(inode_data),
             }),
             sb.self_weak.clone(),
         );
@@ -939,13 +945,17 @@ impl InodeOps for TmpfsInodeOps {
     fn open(
         &self,
         inode: &Inode,
-        _options: &OpenOptions,
+        options: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         {
             let data = self.data.lock();
-            if matches!(&*data, TmpfsInodeData::Special) {
-                return Err(VfsError::NotSupported);
+            match &*data {
+                TmpfsInodeData::Special => return Err(VfsError::NotSupported),
+                TmpfsInodeData::Fifo(pipe) => {
+                    return vfs::pipe::open_fifo(Arc::clone(pipe), options);
+                }
+                _ => {}
             }
         }
         let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;

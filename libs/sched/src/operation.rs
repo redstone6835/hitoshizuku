@@ -725,7 +725,7 @@ fn wait_child_observable(
         if wait_exited && child.state() == TaskState::Zombie {
             return true;
         }
-        if wait_stopped && child.wait_stopped_status(true).is_some() {
+        if (wait_stopped || child.is_ptrace_traced()) && child.wait_stopped_status(true).is_some() {
             return true;
         }
         if wait_continued && child.wait_continued_status(true).is_some() {
@@ -800,8 +800,8 @@ fn wait_common(
 
         // 2. stopped / continued 是父侧可消费的状态变化事件，不会 reap child。
         let children = me.snapshot_children();
-        if wait_stopped {
-            for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
+        for child in children.iter().filter(|c| matches_waitid(c, &target, &me)) {
+            if wait_stopped || child.is_ptrace_traced() {
                 if let Some(status) = child.wait_stopped_status(nowait) {
                     return Ok(WaitResult {
                         pid: child.pid_root().unwrap_or(0),
@@ -1112,6 +1112,91 @@ pub fn queueinfo(pid: PidT, info: SigInfo) -> Result<(), Errno> {
     check_kill_permission(&target)?;
     let _ = deliver_to_thread_group(&target, info);
     Ok(())
+}
+
+// ── ptrace 最小兼容层 ───────────────────────────────────────────────────────
+
+pub fn ptrace_traceme() -> Result<(), Errno> {
+    let me = current_task();
+    if me.is_kernel_task() || me.parent().is_none() {
+        return Err(Errno::EPERM);
+    }
+    if !me.enable_ptrace_traced() {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+pub fn ptrace_attach(pid: PidT) -> Result<(), Errno> {
+    let target = lookup_pid(pid)?;
+    let me = current_task();
+    if target.is_kernel_task() || Arc::ptr_eq(&target, &me) {
+        return Err(Errno::EPERM);
+    }
+    check_kill_permission(&target)?;
+    if !target.enable_ptrace_traced() {
+        return Err(Errno::EPERM);
+    }
+    let _ = mark_task_stopped(&target, SignalNumber::SIGSTOP);
+    Ok(())
+}
+
+pub fn ptrace_seize(pid: PidT) -> Result<(), Errno> {
+    let target = lookup_pid(pid)?;
+    let me = current_task();
+    if target.is_kernel_task() || Arc::ptr_eq(&target, &me) {
+        return Err(Errno::EPERM);
+    }
+    check_kill_permission(&target)?;
+    if !target.enable_ptrace_traced() {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+pub fn ptrace_interrupt(pid: PidT) -> Result<(), Errno> {
+    let target = lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    check_kill_permission(&target)?;
+    let _ = mark_task_stopped(&target, SignalNumber::SIGTRAP);
+    Ok(())
+}
+
+pub fn ptrace_cont(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let target = lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    check_kill_permission(&target)?;
+    let _ = continue_task(&target);
+    if let Some(sig) = sig {
+        tkill(pid, Some(sig))?;
+    }
+    Ok(())
+}
+
+pub fn ptrace_detach(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
+    let target = lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    check_kill_permission(&target)?;
+    target.clear_ptrace_traced();
+    let _ = continue_task(&target);
+    if let Some(sig) = sig {
+        tkill(pid, Some(sig))?;
+    }
+    Ok(())
+}
+
+pub fn ptrace_kill(pid: PidT) -> Result<(), Errno> {
+    let target = lookup_pid(pid)?;
+    if target.is_kernel_task() || !target.is_ptrace_traced() {
+        return Err(Errno::ESRCH);
+    }
+    tkill(pid, Some(SignalNumber::SIGKILL))
 }
 
 // ── sigaction / sigprocmask / sigpending ─────────────────────────────────────
@@ -1438,6 +1523,10 @@ pub fn deliver_pending_signals_for_task(
         me.shared_signal()
             .dequeue_one(me.signal.blocked_snapshot().raw())
     })?;
+    if me.is_ptrace_traced() && info.sig != SignalNumber::SIGKILL {
+        let _ = mark_task_stopped(me, info.sig);
+        return None;
+    }
     let action = me.shared_signal().get_action(info.sig);
     use crate::signal::SigHandler;
     match action.handler {

@@ -1,4 +1,4 @@
-.PHONY: all clean cargo-setup kernel-la kernel-rv rootfs-la rootfs-rv
+.PHONY: all clean cargo-setup kernel-la kernel-rv rootfs-la rootfs-rv rootfs-ltp-scenarios-la rootfs-ltp-scenarios-rv
 
 all: cargo-setup kernel-la kernel-rv
 
@@ -26,6 +26,8 @@ RV_KERNEL := kernel-rv
 BUSYBOX_SRC := third/busybox-1.36.1
 BUSYBOX_ARCHIVE := third/busybox-1.36.1.tar.gz
 ENSURE_BUSYBOX := scripts/ensure-busybox.sh
+LTP_SCENARIO_SRC := userland/ltp-scenarios
+LTP_TESTCODE_SRC := userland/ltp_testcode.sh
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
@@ -43,9 +45,23 @@ kernel-rv: cargo-setup rootfs-rv
 		cargo build -p kernel --target $(RV_TARGET) --features "$(CARGO_FEATURES)" --release
 	cp target/$(RV_TARGET)/release/kernel $(RV_KERNEL)
 
-rootfs-la: $(LA_ROOTFS)/bin/busybox
+rootfs-la: $(LA_ROOTFS)/bin/busybox rootfs-ltp-scenarios-la
 
-rootfs-rv: $(RV_ROOTFS)/bin/busybox
+rootfs-rv: $(RV_ROOTFS)/bin/busybox rootfs-ltp-scenarios-rv
+
+rootfs-ltp-scenarios-la:
+	mkdir -p $(LA_ROOTFS)/etc/ltp-scenarios
+	rm -f $(LA_ROOTFS)/etc/ltp-scenarios/*
+	cp $(LTP_SCENARIO_SRC)/* $(LA_ROOTFS)/etc/ltp-scenarios/
+	cp $(LTP_TESTCODE_SRC) $(LA_ROOTFS)/etc/ltp_testcode.sh
+	chmod +x $(LA_ROOTFS)/etc/ltp_testcode.sh
+
+rootfs-ltp-scenarios-rv:
+	mkdir -p $(RV_ROOTFS)/etc/ltp-scenarios
+	rm -f $(RV_ROOTFS)/etc/ltp-scenarios/*
+	cp $(LTP_SCENARIO_SRC)/* $(RV_ROOTFS)/etc/ltp-scenarios/
+	cp $(LTP_TESTCODE_SRC) $(RV_ROOTFS)/etc/ltp_testcode.sh
+	chmod +x $(RV_ROOTFS)/etc/ltp_testcode.sh
 
 $(LA_ROOTFS)/bin/busybox:
 	$(MAKE) rootfs-busybox ROOTFS_DIR=$(LA_ROOTFS) CROSS_COMPILE=$(LA_CROSS_COMPILE)

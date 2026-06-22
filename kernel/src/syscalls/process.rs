@@ -45,6 +45,41 @@ const UTS_FIELD_LEN: usize = 65;
 const UTS_NAME_MAX: usize = UTS_FIELD_LEN - 1;
 const EXEC_PATH_MAX: usize = 4096;
 
+const PTRACE_TRACEME: usize = 0;
+const PTRACE_PEEKTEXT: usize = 1;
+const PTRACE_PEEKDATA: usize = 2;
+const PTRACE_PEEKUSR: usize = 3;
+const PTRACE_POKETEXT: usize = 4;
+const PTRACE_POKEDATA: usize = 5;
+const PTRACE_POKEUSR: usize = 6;
+const PTRACE_CONT: usize = 7;
+const PTRACE_KILL: usize = 8;
+const PTRACE_SINGLESTEP: usize = 9;
+const PTRACE_ATTACH: usize = 16;
+const PTRACE_DETACH: usize = 17;
+const PTRACE_OLDSETOPTIONS: usize = 21;
+const PTRACE_SYSCALL: usize = 24;
+const PTRACE_GETFDPIC: usize = 33;
+const PTRACE_SETOPTIONS: usize = 0x4200;
+const PTRACE_GETEVENTMSG: usize = 0x4201;
+const PTRACE_GETSIGINFO: usize = 0x4202;
+const PTRACE_SETSIGINFO: usize = 0x4203;
+const PTRACE_GETREGSET: usize = 0x4204;
+const PTRACE_SETREGSET: usize = 0x4205;
+const PTRACE_SEIZE: usize = 0x4206;
+const PTRACE_INTERRUPT: usize = 0x4207;
+const PTRACE_LISTEN: usize = 0x4208;
+const PTRACE_PEEKSIGINFO: usize = 0x4209;
+const PTRACE_GETSIGMASK: usize = 0x420a;
+const PTRACE_SETSIGMASK: usize = 0x420b;
+const PTRACE_SECCOMP_GET_FILTER: usize = 0x420c;
+const PTRACE_SECCOMP_GET_METADATA: usize = 0x420d;
+const PTRACE_GET_SYSCALL_INFO: usize = 0x420e;
+const PTRACE_GET_RSEQ_CONFIGURATION: usize = 0x420f;
+const PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG: usize = 0x4210;
+const PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG: usize = 0x4211;
+const PTRACE_SET_SYSCALL_INFO: usize = 0x4212;
+
 static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 
@@ -2973,8 +3008,69 @@ pub(super) fn sys_clock_settime(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     clock_settime_common(ctx)
 }
 
-pub(super) fn sys_ptrace(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Err(Errno::ENOSYS)
+pub(super) fn sys_ptrace(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let request = ctx.args[0];
+    let pid = ctx.args[1] as i32;
+    let data = ctx.args[3];
+
+    match request {
+        PTRACE_TRACEME => {
+            sched::operation::ptrace_traceme()?;
+            Ok(0)
+        }
+        PTRACE_ATTACH => {
+            sched::operation::ptrace_attach(pid)?;
+            Ok(0)
+        }
+        PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP => {
+            sched::operation::ptrace_cont(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_KILL => {
+            sched::operation::ptrace_kill(pid)?;
+            Ok(0)
+        }
+        PTRACE_DETACH => {
+            sched::operation::ptrace_detach(pid, ptrace_signal_arg(data)?)?;
+            Ok(0)
+        }
+        PTRACE_SETOPTIONS | PTRACE_OLDSETOPTIONS => Ok(0),
+        PTRACE_SEIZE => {
+            sched::operation::ptrace_seize(pid)?;
+            Ok(0)
+        }
+        PTRACE_INTERRUPT => {
+            sched::operation::ptrace_interrupt(pid)?;
+            Ok(0)
+        }
+        PTRACE_LISTEN => {
+            sched::operation::ptrace_cont(pid, None)?;
+            Ok(0)
+        }
+        PTRACE_PEEKTEXT
+        | PTRACE_PEEKDATA
+        | PTRACE_PEEKUSR
+        | PTRACE_POKETEXT
+        | PTRACE_POKEDATA
+        | PTRACE_POKEUSR
+        | PTRACE_GETFDPIC
+        | PTRACE_GETEVENTMSG
+        | PTRACE_GETSIGINFO
+        | PTRACE_SETSIGINFO
+        | PTRACE_GETREGSET
+        | PTRACE_SETREGSET
+        | PTRACE_PEEKSIGINFO
+        | PTRACE_GETSIGMASK
+        | PTRACE_SETSIGMASK
+        | PTRACE_SECCOMP_GET_FILTER
+        | PTRACE_SECCOMP_GET_METADATA
+        | PTRACE_GET_SYSCALL_INFO
+        | PTRACE_GET_RSEQ_CONFIGURATION
+        | PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
+        | PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG
+        | PTRACE_SET_SYSCALL_INFO => Err(Errno::EIO),
+        _ => Err(Errno::EIO),
+    }
 }
 
 pub(super) fn sys_getresuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -3866,6 +3962,16 @@ fn signal_arg(raw: usize) -> Result<Option<SignalNumber>, Errno> {
         SignalNumber::from_raw(raw as i32)
             .map(Some)
             .ok_or(Errno::EINVAL)
+    }
+}
+
+fn ptrace_signal_arg(raw: usize) -> Result<Option<SignalNumber>, Errno> {
+    if raw == 0 {
+        Ok(None)
+    } else {
+        SignalNumber::from_raw(raw as i32)
+            .map(Some)
+            .ok_or(Errno::EIO)
     }
 }
 

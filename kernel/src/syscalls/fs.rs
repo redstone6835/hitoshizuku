@@ -95,6 +95,18 @@ const F_SETFL: usize = 4;
 const F_GETLK: usize = 5;
 const F_SETLK: usize = 6;
 const F_SETLKW: usize = 7;
+const F_SETOWN: usize = 8;
+const F_GETOWN: usize = 9;
+const F_SETSIG: usize = 10;
+const F_GETSIG: usize = 11;
+const F_GETLK64: usize = 12;
+const F_SETLK64: usize = 13;
+const F_SETLKW64: usize = 14;
+const F_SETOWN_EX: usize = 15;
+const F_GETOWN_EX: usize = 16;
+const F_OFD_GETLK: usize = 36;
+const F_OFD_SETLK: usize = 37;
+const F_OFD_SETLKW: usize = 38;
 const F_DUPFD_CLOEXEC: usize = 1030;
 const F_SETLEASE: usize = 1024;
 const F_GETLEASE: usize = 1025;
@@ -106,6 +118,9 @@ const FIONBIO: usize = 0x5421;
 const F_RDLCK: i16 = 0;
 const F_WRLCK: i16 = 1;
 const F_UNLCK: i16 = 2;
+const F_OWNER_TID: i32 = 0;
+const F_OWNER_PID: i32 = 1;
+const F_OWNER_PGRP: i32 = 2;
 
 const MFD_CLOEXEC: usize = 0x0001;
 const MFD_ALLOW_SEALING: usize = 0x0002;
@@ -436,15 +451,58 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             );
             Ok(0)
         }
-        F_GETLK => {
+        F_SETOWN => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let owner = arg as isize as i32;
+            if owner < 0 {
+                file.set_owner(F_OWNER_PGRP, owner.wrapping_neg());
+            } else {
+                file.set_owner(F_OWNER_PID, owner);
+            }
+            Ok(0)
+        }
+        F_GETOWN => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let (owner_type, owner_pid) = file.owner();
+            let owner = if owner_type == F_OWNER_PGRP {
+                owner_pid.wrapping_neg()
+            } else {
+                owner_pid
+            };
+            Ok(owner as isize as usize)
+        }
+        F_SETSIG => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            file.set_owner_sig(arg as i32);
+            Ok(0)
+        }
+        F_GETSIG => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            Ok(file.owner_sig() as isize as usize)
+        }
+        F_SETOWN_EX => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let (owner_type, owner_pid) = read_f_owner_ex(arg)?;
+            validate_f_owner_type(owner_type)?;
+            file.set_owner(owner_type, owner_pid);
+            Ok(0)
+        }
+        F_GETOWN_EX => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let (owner_type, owner_pid) = file.owner();
+            validate_f_owner_type(owner_type)?;
+            write_f_owner_ex(arg, owner_type, owner_pid)?;
+            Ok(0)
+        }
+        F_GETLK | F_GETLK64 | F_OFD_GETLK => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
             fcntl_getlk(ctx, &file, arg)
         }
-        F_SETLK => {
+        F_SETLK | F_SETLK64 | F_OFD_SETLK => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
             fcntl_setlk(ctx, &file, arg, false)
         }
-        F_SETLKW => {
+        F_SETLKW | F_SETLKW64 | F_OFD_SETLKW => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
             fcntl_setlk(ctx, &file, arg, true)
         }
@@ -3814,6 +3872,10 @@ fn put_u32(out: &mut [u8], off: usize, v: u32) {
     out[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+fn put_i32(out: &mut [u8], off: usize, v: i32) {
+    out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
 fn put_u64(out: &mut [u8], off: usize, v: u64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
@@ -3926,6 +3988,35 @@ fn linux_flock_type_raw(kind: vfs::record_lock::RecordLockType) -> i16 {
     }
 }
 
+fn validate_f_owner_type(owner_type: i32) -> Result<(), Errno> {
+    match owner_type {
+        F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn read_f_owner_ex(user: usize) -> Result<(i32, i32), Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 8];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok((
+        i32::from_le_bytes(raw[0..4].try_into().unwrap()),
+        i32::from_le_bytes(raw[4..8].try_into().unwrap()),
+    ))
+}
+
+fn write_f_owner_ex(user: usize, owner_type: i32, owner_pid: i32) -> Result<(), Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 8];
+    put_i32(&mut raw, 0, owner_type);
+    put_i32(&mut raw, 4, owner_pid);
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+}
+
 fn linux_lease_type(raw: i32) -> Result<vfs::lease::LeaseType, Errno> {
     match raw {
         raw if raw == F_RDLCK as i32 => Ok(vfs::lease::LeaseType::Read),
@@ -3970,7 +4061,6 @@ fn fcntl_getlk(
     let owner_pid = record_lock_owner_pid(ctx);
     if req.lock_type == vfs::record_lock::RecordLockType::Unlock {
         raw.lock_type = F_UNLCK;
-        raw.pid = 0;
         raw.write(flock_user)?;
         return Ok(0);
     }
@@ -3983,7 +4073,6 @@ fn fcntl_getlk(
         raw.pid = conflict.owner_pid;
     } else {
         raw.lock_type = F_UNLCK;
-        raw.pid = 0;
     }
     raw.write(flock_user)?;
     Ok(0)

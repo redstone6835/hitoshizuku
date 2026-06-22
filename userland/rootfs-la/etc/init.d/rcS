@@ -56,14 +56,15 @@ maybe_enter_shell() {
 
 # 测试黑名单
 # basic busybox lua libctest libcbench netperf lmbench ltp unixbench cyclictest iperf iozone
-BLACKLIST="ltp unixbench"
+BLACKLIST="basic busybox lua libctest libcbench lmbench iperf netperf unixbench cyclictest iozone"
 
 LTP_TIMEOUT="${LTP_TIMEOUT:-1}"
 LTP_KILL_GRACE="${LTP_KILL_GRACE:-1}"
 LTP_POLL_USEC="${LTP_POLL_USEC:-100000}"
-LTP_SCENARIOS="${LTP_SCENARIOS:-default}"
+LTP_CUSTOM_SCENARIOS="event signal fs process ipc io time memory"
+LTP_SCENARIOS="${LTP_SCENARIOS:-$LTP_CUSTOM_SCENARIOS}"
 LTP_ONLY_CASES="${LTP_ONLY_CASES:-}"
-LTP_SKIP_BASE="accept03 cgroup_fj_proc cgroup_regression_3_1.sh cgroup_regression_3_2.sh cgroup_regression_5_1.sh cgroup_regression_5_2.sh cgroup_regression_6_1.sh cgroup_regression_6_2.sh cgroup_regression_fork_processes clock_getres01 clock_gettime01 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 clone07 confstr01 cpuctl_def_task01 cpuctl_def_task02 cpuctl_def_task03 cpuctl_def_task04 cpuctl_fj_cpu-hog cpuctl_test01 cpuctl_test02 cpuctl_test03 cpuctl_test04 cpuhotplug_do_disk_write_loop cpuhotplug_do_spin_loop cpuset_cpu_hog cpuset_mem_hog cpuset_memory_test crash01 crash02 crypto_user01 crypto_user02 cve-2016-7117 cve-2017-17052 dirtyc0w dirtyc0w_shmem ebizzy epoll-ltp epoll_pwait03 epoll_wait02 fallocate05 fcntl14 fcntl14_64 fcntl15 fcntl15_64 fcntl18 fcntl18_64 fcntl19_64 fcntl31 float_bessel float_exp_log float_iperb float_power float_trigo fork14 fork_exec_loop fork_procs ftest06 futex_cmp_requeue01 futex_wait05 genacos genasin genatan genatan2 genbessel genceil gencos gencosh genexp genexp_log genfabs genfloor genfmod genfrexp genhypot geniperb genj0 genj1 genldexp genlgamma genload genlog genlog10 genmodf genpow genpower gensin gensinh gensqrt gentan gentanh gentrigo geny0 geny1 getcwd04 gethostid01 getrlimit01 getrlimit03 gettimeofday02 hackbench inode02 kill02 kill09 kill11 linkat01 mallocstress memcg_test_2 memcg_test_4 memctl_test01 mkdir09 mkdirat02 mmap1 mmap18 mmap3 mmapstress01 mmapstress02 mmapstress03 mmapstress04 mmapstress05 mmapstress06 mmapstress07 mmapstress08 mmapstress09 mmapstress10 mmstress mmstress_dummy modify_ldt01 modify_ldt02 modify_ldt03 mount01 mount05 mount06 mount07 mount_setattr01 move_mount01 msync04 mtest01 nanosleep01 nanosleep02 netstress nptl01 open12 openat04 openfile open_tree01 open_tree02 page01 pause01 pause02 pcrypt_aead01 pids_task2 pipe13 pm_get_sched_values poll02 posix_fadvise03 posix_fadvise03_64 ppoll01 prctl09 preadv03 preadv03_64 preadv203 preadv203_64 prot_hsymlinks pselect01 pselect01_64 pthserv pwritev03 pwritev03_64 remap_file_pages01 remap_file_pages02 removexattr01 rename14 run_cpuctl_test_fj.sh run_sched_cliserv.sh select02 semtest_2ns setfsgid03 setfsgid03_16 setitimer01 setpgid03 setrlimit06 setxattr01 shmat1 shm_test signal03 signal04 signal05 splice07 starvation statfs01 statvfs01 swapoff01 symlinkat01 syslog12 tgkill03 timed_forkbomb times03 tst_supported_fs vma05_vdso waitid05 waitpid10 waitpid11 waitpid12 waitpid13 writev03"
+#LTP_SKIP_BASE="accept03 cgroup_fj_proc cgroup_regression_3_1.sh cgroup_regression_3_2.sh cgroup_regression_5_1.sh cgroup_regression_5_2.sh cgroup_regression_6_1.sh cgroup_regression_6_2.sh cgroup_regression_fork_processes clock_getres01 clock_gettime01 clock_nanosleep01 clock_nanosleep02 clock_nanosleep03 clock_nanosleep04 clone07 confstr01 cpuctl_def_task01 cpuctl_def_task02 cpuctl_def_task03 cpuctl_def_task04 cpuctl_fj_cpu-hog cpuctl_test01 cpuctl_test02 cpuctl_test03 cpuctl_test04 cpuhotplug_do_disk_write_loop cpuhotplug_do_spin_loop cpuset_cpu_hog cpuset_mem_hog cpuset_memory_test crash01 crash02 crypto_user01 crypto_user02 cve-2016-7117 cve-2017-17052 dirtyc0w dirtyc0w_shmem ebizzy epoll-ltp epoll_pwait03 epoll_wait02 fallocate05 fcntl14 fcntl14_64 fcntl15 fcntl15_64 fcntl18 fcntl18_64 fcntl19_64 fcntl31 float_bessel float_exp_log float_iperb float_power float_trigo fork14 fork_exec_loop fork_procs ftest06 futex_cmp_requeue01 futex_wait05 genacos genasin genatan genatan2 genbessel genceil gencos gencosh genexp genexp_log genfabs genfloor genfmod genfrexp genhypot geniperb genj0 genj1 genldexp genlgamma genload genlog genlog10 genmodf genpow genpower gensin gensinh gensqrt gentan gentanh gentrigo geny0 geny1 getcwd04 gethostid01 getrlimit01 getrlimit03 gettimeofday02 hackbench inode02 kill02 kill09 kill11 linkat01 mallocstress memcg_test_2 memcg_test_4 memctl_test01 mkdir09 mkdirat02 mmap1 mmap18 mmap3 mmapstress01 mmapstress02 mmapstress03 mmapstress04 mmapstress05 mmapstress06 mmapstress07 mmapstress08 mmapstress09 mmapstress10 mmstress mmstress_dummy modify_ldt01 modify_ldt02 modify_ldt03 mount01 mount05 mount06 mount07 mount_setattr01 move_mount01 msync04 mtest01 nanosleep01 nanosleep02 netstress nptl01 open12 openat04 openfile open_tree01 open_tree02 page01 pause01 pause02 pcrypt_aead01 pids_task2 pipe13 pm_get_sched_values poll02 posix_fadvise03 posix_fadvise03_64 ppoll01 prctl09 preadv03 preadv03_64 preadv203 preadv203_64 prot_hsymlinks pselect01 pselect01_64 pthserv pwritev03 pwritev03_64 remap_file_pages01 remap_file_pages02 removexattr01 rename14 run_cpuctl_test_fj.sh run_sched_cliserv.sh select02 semtest_2ns setfsgid03 setfsgid03_16 setitimer01 setpgid03 setrlimit06 setxattr01 shmat1 shm_test signal03 signal04 signal05 splice07 starvation statfs01 statvfs01 swapoff01 symlinkat01 syslog12 tgkill03 timed_forkbomb times03 tst_supported_fs vma05_vdso waitid05 waitpid10 waitpid11 waitpid12 waitpid13 writev03"
 LTP_SKIP_CASES="${LTP_SKIP_CASES:-$LTP_SKIP_BASE}"
 
 if [ -z "$LTP_ONLY_CASES" ] && [ -r /sys/kernel/cmdline ]; then
@@ -73,12 +74,15 @@ if [ -z "$LTP_ONLY_CASES" ] && [ -r /sys/kernel/cmdline ]; then
             test_blacklist=*) BLACKLIST="$(printf '%s' "${arg#test_blacklist=}" | tr ',' ' ')" ;;
             ltp_only=*) LTP_ONLY_CASES="${arg#ltp_only=}" ;;
             ltp_scenarios=*) LTP_SCENARIOS="${arg#ltp_scenarios=}" ;;
+            ltp_timeout=*) LTP_TIMEOUT="${arg#ltp_timeout=}" ;;
+            ltp_kill_grace=*) LTP_KILL_GRACE="${arg#ltp_kill_grace=}" ;;
+            ltp_poll_usec=*) LTP_POLL_USEC="${arg#ltp_poll_usec=}" ;;
         esac
     done
 fi
 LTP_ONLY_CASES="$(printf '%s' "$LTP_ONLY_CASES" | tr ',' ' ')"
 LTP_SCENARIOS="$(printf '%s' "$LTP_SCENARIOS" | tr ',' ' ')"
-export LTP_TIMEOUT LTP_KILL_GRACE LTP_POLL_USEC LTP_SCENARIOS LTP_ONLY_CASES
+export LTP_TIMEOUT LTP_KILL_GRACE LTP_POLL_USEC LTP_CUSTOM_SCENARIOS LTP_SCENARIOS LTP_ONLY_CASES
 
 _is_blacklisted() {
     for _bl in $BLACKLIST; do
@@ -172,201 +176,19 @@ cleanup_basic_mount_loop() {
     rm -f "$img"
 }
 
-kill_ltp_case_group() {
-    target="$1"
-    child="$2"
+install_ltp_testcode_script() {
+    test_dir="$1"
+    src="/etc/ltp_testcode.sh"
+    dst="$test_dir/ltp_testcode.sh"
 
-    kill -TERM "$target" 2>/dev/null || true
-    kill -TERM "$child" 2>/dev/null || true
-    kill -KILL "$target" 2>/dev/null || true
-    kill -KILL "$child" 2>/dev/null || true
-}
-
-print_ltp_case_output() {
-    output="$1"
-
-    if [ ! -f "$output" ]; then
+    [ -f "$src" ] || return 0
+    [ -d "$test_dir" ] || return 0
+    cp "$src" "$dst" 2>/dev/null || {
+        echo "[init] failed to replace $dst"
         return 0
-    fi
-    if command -v awk >/dev/null 2>&1; then
-        awk '{
-            print
-            line = $0
-            gsub(sprintf("%c\\[[0-9;]*m", 27), "", line)
-            if (line ~ /(^|[^A-Z])TPASS([^A-Z]|$)/ && line !~ /(^|[^A-Z])TPASS[[:space:]]*:/)
-                printf "%c[1;32mTPASS: %c[0m\n", 27, 27
-        }' "$output"
-    else
-        cat "$output"
-    fi
-}
-
-ltp_case_is_skipped() {
-    tag="$1"
-    cmd="$2"
-    cmd_name="${cmd%%[ 	]*}"
-    cmd_name="${cmd_name##*/}"
-
-    for skip in $LTP_SKIP_CASES; do
-        if [ "$tag" = "$skip" ] || [ "$cmd_name" = "$skip" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
-run_ltp_case() {
-    file="$1"
-    name="${file##*/}"
-    cmd="${2:-$file}"
-    marker="/tmp/ltp-case-timeout.$$"
-    status="/tmp/ltp-case-status.$$"
-    output="/tmp/ltp-case-output.$$"
-    timeout_ticks=$((LTP_TIMEOUT * 1000000 / LTP_POLL_USEC))
-    grace_ticks=$((LTP_KILL_GRACE * 1000000 / LTP_POLL_USEC))
-    [ "$timeout_ticks" -gt 0 ] 2>/dev/null || timeout_ticks=1
-    [ "$grace_ticks" -gt 0 ] 2>/dev/null || grace_ticks=1
-
-    if ltp_case_is_skipped "$name" "$cmd"; then
-        echo "RUN LTP CASE $name"
-        echo "[ltp] 跳过会卡住 runner 的用例：$name"
-        echo "FAIL LTP CASE $name : 124"
-        return 0
-    fi
-
-    rm -f "$marker" "$status" "$output"
-    echo "RUN LTP CASE $name"
-
-    if command -v setsid >/dev/null 2>&1; then
-        setsid /bin/sh -c '
-            rm -f "$2" "$3"
-            LTP_COLORIZE_OUTPUT=1 sh -c "$1" >"$3" 2>&1
-            echo "$?" > "$2"
-        ' sh "$cmd" "$status" "$output" &
-        child=$!
-        kill_target="-$child"
-    else
-        /bin/sh -c '
-            rm -f "$2" "$3"
-            LTP_COLORIZE_OUTPUT=1 sh -c "$1" >"$3" 2>&1
-            echo "$?" > "$2"
-        ' sh "$cmd" "$status" "$output" &
-        child=$!
-        kill_target="$child"
-    fi
-
-    elapsed=0
-    while [ ! -f "$status" ]; do
-        if [ "$elapsed" -ge "$timeout_ticks" ]; then
-            echo "[ltp] 用例超时：$name，超过 ${LTP_TIMEOUT}s"
-            : >"$marker"
-            kill_ltp_case_group "$kill_target" "$child"
-            print_ltp_case_output "$output"
-
-            grace=0
-            while [ "$grace" -lt "$grace_ticks" ] && [ ! -f "$status" ]; do
-                usleep "$LTP_POLL_USEC"
-                grace=$((grace + 1))
-            done
-
-            if [ ! -f "$status" ]; then
-                echo "[ltp] 用例已终止但未回收，继续后续用例：$name"
-                rm -f "$marker" "$status" "$output"
-                echo "FAIL LTP CASE $name : 124"
-                return 0
-            fi
-            break
-        fi
-        usleep "$LTP_POLL_USEC"
-        elapsed=$((elapsed + 1))
-    done
-
-    ret="$(cat "$status" 2>/dev/null || echo 124)"
-    if [ ! -f "$marker" ]; then
-        print_ltp_case_output "$output"
-    fi
-    kill_ltp_case_group "$kill_target" "$child"
-    wait "$child" 2>/dev/null || true
-
-    if [ -f "$marker" ]; then
-        ret=124
-    fi
-    rm -f "$marker" "$status" "$output"
-    echo "FAIL LTP CASE $name : $ret"
-    return 0
-}
-
-run_ltp_command_case() {
-    tag="$1"
-    cmd="$2"
-
-    run_ltp_case "$tag" "$cmd"
-}
-
-run_ltp_script() {
-    script="$1"
-    libc_name="${PWD##*/}"
-    ltp_root="ltp"
-    target_dir="$ltp_root/testcases/bin"
-    cmdlist="/tmp/ltp-runtest.$$"
-
-    echo "#### OS COMP TEST GROUP START ltp-$libc_name ####"
-    if [ ! -d "$target_dir" ] || [ ! -d "$ltp_root/runtest" ]; then
-        echo "[ltp] LTP 目录不完整：$PWD/$ltp_root"
-        echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
-        return 0
-    fi
-
-    export LTPROOT="$PWD/$ltp_root"
-    export PATH="$LTPROOT/testcases/bin:$LTPROOT/bin:$PATH"
-    export LTP_DEV_FS_TYPE="${LTP_DEV_FS_TYPE:-ext2}"
-
-    echo "[init] 使用 ${script##*/} 触发 LTP runtest，场景：$LTP_SCENARIOS，逐用例超时 ${LTP_TIMEOUT}s，跳过：$LTP_SKIP_CASES"
-    if [ -n "$LTP_ONLY_CASES" ]; then
-        echo "[ltp] 仅运行用例：$LTP_ONLY_CASES"
-    fi
-
-    : >"$cmdlist"
-    if [ "$LTP_SCENARIOS" = "default" ] && [ -f "$ltp_root/scenario_groups/default" ]; then
-        scenarios="$(cat "$ltp_root/scenario_groups/default" 2>/dev/null)"
-    elif [ "$LTP_SCENARIOS" = "default" ]; then
-        scenarios="syscalls controllers"
-    else
-        scenarios="$LTP_SCENARIOS"
-    fi
-
-    for scenario in $scenarios; do
-        runtest_file="$ltp_root/runtest/$scenario"
-        if [ ! -f "$runtest_file" ]; then
-            echo "[ltp] 跳过缺失场景：$scenario"
-            continue
-        fi
-        sed -e 's/^[ 	]*//' -e '/^#/d' -e '/^$/d' "$runtest_file" >>"$cmdlist"
-    done
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        tag="${line%%[ 	]*}"
-        cmd="${line#"$tag"}"
-        cmd="$(printf '%s\n' "$cmd" | sed 's/^[ 	]*//')"
-        [ -n "$cmd" ] || cmd="$tag"
-
-        if [ -n "$LTP_ONLY_CASES" ]; then
-            only_match=0
-            for only in $LTP_ONLY_CASES; do
-                if [ "$tag" = "$only" ]; then
-                    only_match=1
-                    break
-                fi
-            done
-            [ "$only_match" = "1" ] || continue
-        fi
-
-        run_ltp_command_case "$tag" "$cmd"
-    done <"$cmdlist"
-
-    rm -f "$cmdlist"
-
-    echo "#### OS COMP TEST GROUP END ltp-$libc_name ####"
+    }
+    chmod +x "$dst" 2>/dev/null || true
+    echo "[init] replaced $dst"
     return 0
 }
 
@@ -454,11 +276,7 @@ run_test_script_file() {
                 ;;
             *)
                 cd "$dir" || return 0
-                if [ "$name" = "ltp_testcode.sh" ]; then
-                    run_ltp_script "$script"
-                else
-                    /bin/sh "$script"
-                fi
+                /bin/sh "$script"
                 ;;
         esac
         cd "$oldpwd" || true
@@ -502,6 +320,7 @@ run_test_scripts() {
     done
 
     for dir in $dirs; do
+        install_ltp_testcode_script "$dir"
         script="$dir/ltp_testcode.sh"
         [ -f "$script" ] && run_test_script_file "$script"
     done
