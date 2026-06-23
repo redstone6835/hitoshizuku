@@ -81,35 +81,35 @@
 
 #include "chapters/chapter-06.typ"
 
-// #manual-running-title.update(chapter-07-title)
-// #pagebreak()
+#manual-running-title.update(chapter-07-title)
+#pagebreak()
 
-// #include "chapters/chapter-07.typ"
+#include "chapters/chapter-07.typ"
 
-// #manual-running-title.update(chapter-08-title)
-// #pagebreak()
+#manual-running-title.update(chapter-08-title)
+#pagebreak()
 
-// #include "chapters/chapter-08.typ"
+#include "chapters/chapter-08.typ"
 
-// #manual-running-title.update(chapter-09-title)
-// #pagebreak()
+#manual-running-title.update(chapter-09-title)
+#pagebreak()
 
-// #include "chapters/chapter-09.typ"
+#include "chapters/chapter-09.typ"
 
-// #manual-running-title.update(chapter-10-title)
-// #pagebreak()
+#manual-running-title.update(chapter-10-title)
+#pagebreak()
 
-// #include "chapters/chapter-10.typ"
+#include "chapters/chapter-10.typ"
 
-// #manual-running-title.update(chapter-11-title)
-// #pagebreak()
+#manual-running-title.update(chapter-11-title)
+#pagebreak()
 
-// #include "chapters/chapter-11.typ"
+#include "chapters/chapter-11.typ"
 
-// #manual-running-title.update(chapter-12-title)
-// #pagebreak()
+#manual-running-title.update(chapter-12-title)
+#pagebreak()
 
-// #include "chapters/chapter-12.typ"
+#include "chapters/chapter-12.typ"
 
 // #manual-running-title.update(chapter-13-title)
 // #pagebreak()
