@@ -29,7 +29,7 @@ ELF 解析阶段做了多项前置检查。文件头必须是 64 位 ELF，机�
 
 == 9.2 地址空间构建
 
-装载器为每次执行映像替换创建新的用户虚拟地址空间。主程序和解释器的每个可加载段都通过 `VmSpace::commit_segment` 提交。段权限由 ELF 权限标志转换为 `VmFlags`，例如读、写、执行和用户可访问。文件大小小于内存大小的部分表示未初始化数据段（BSS），需要映射为零填充内存。用户栈则以固定栈顶和默认大小提交，带有 `GROWS_DOWN` 标志。
+装载器为每次执行映像替换创建新的用户虚拟地址空间。主程序的每个可加载段通过 `VmSpace::commit_file_segment` 提交，装载器只保存程序头中的文件偏移和长度，由地址空间层按页从文件填充段内容。解释器当前先读入内核内存并解析为镜像对象，再通过 `VmSpace::commit_segment` 提交。段权限由 ELF 权限标志转换为 `VmFlags`，例如读、写、执行和用户可访问。文件大小小于内存大小的部分表示未初始化数据段（BSS），需要映射为零填充内存。用户栈则以固定栈顶和默认大小提交，带有 `GROWS_DOWN` 标志。
 
 #pseudo-sample("9-1", [ELF 段提交], kind: "代码")[
   ```rust
@@ -41,8 +41,14 @@ ELF 解析阶段做了多项前置检查。文件头必须是 64 位 ELF，机�
           let flags = flags_from_elf_perms(segment.perms)
               .with(VmFlags::USER);
 
-          let bytes = read_file_range(file, segment.file_offset, segment.file_size)?;
-          vm.commit_segment(va, segment.memsz, segment.file_size, &bytes, flags)?;
+          vm.commit_file_segment(
+              va,
+              segment.memsz,
+              segment.file_offset,
+              segment.file_size,
+              file,
+              flags,
+          )?;
       }
 
       Ok(LoadedImage {
@@ -201,7 +207,7 @@ ELF 文件是用户态执行环境的核心输入。内核不能假设文件格�
 
 段权限转换需要克制。ELF 的 `PF_R`、`PF_W` 和 `PF_X` 表示用户程序期望的访问能力，内核还要额外添加 `USER` 标志。内核不应因为实现方便把所有段都映射为可写可执行。代码段通常是只读可执行，数据段通常是读写不可执行，只读数据段（rodata）是只读不可执行。BSS 部分使用零填充页，并继承所在段权限。若未来加入更严格的 W^X 策略，这个转换点就是统一入口。
 
-段范围也需要处理页对齐。ELF 段的虚拟地址和文件偏移通常满足页内偏移一致，但映射时要把起始地址向下对齐，把结束地址向上对齐。文件内容只覆盖 `filesz`，`memsz` 超出的部分需要清零。若起始页包含文件内容前的页内空洞，内核要确保用户不可读到未初始化内核数据。我们通过 `VmSpace::commit_segment` 把这些细节集中处理，装载器只传入段语义。
+段范围也需要处理页对齐。ELF 段的虚拟地址和文件偏移通常满足页内偏移一致，但映射时要把起始地址向下对齐，把结束地址向上对齐。文件内容只覆盖 `filesz`，`memsz` 超出的部分需要清零。若起始页包含文件内容前的页内空洞，内核要确保用户不可读到未初始化内核数据。主程序路径通过 `VmSpace::commit_file_segment` 集中处理这些细节，解释器和 vDSO 等已经位于内核内存中的镜像仍通过 `VmSpace::commit_segment` 处理。装载器只传入段语义，不直接操作页表。
 
 PIE 镜像和普通 `ET_EXEC` 镜像的处理也不同。`ET_EXEC` 通常使用固定虚拟地址。PIE 可以加载到平台布局给出的随机或固定基址。解释器本身也常是 PIE，需要独立基址。我们保留主程序 PIE 基址和解释器基址两组参数，避免主程序和解释器地址相互覆盖。事后回顾，这种地址空间布局也为后续地址空间布局随机化（ASLR）预留了空间。即使当前随机化程度有限，布局边界已经被显式建模。
 
