@@ -50,15 +50,27 @@
 调度系统分为四层。最上层是调度策略模型，把用户态传入的调度属性转换为调度策略（`SchedPolicy`）和调度类（`SchedClass`）。第二层是每个任务的调度实体，保存权重、虚拟时间、截止点、实时优先级和截止时间预算等信息。第三层是每 CPU 运行队列，按调度类保存有序队列。第四层是全局调度入口，处理当前任务、定时器节拍、重调度标志、空闲任务和跨 CPU 均衡请求。
 
 #figure(caption: figure-caption("图", "6-1", [调度系统分层结构]))[
-  #layer-card("系统调用翻译层", [`sched_setattr`、`sched_setscheduler`、`nice`、`sched_yield` 转换为调度属性], fill: soft-fill)
+  #layer-card(
+    "系统调用翻译层",
+    [`sched_setattr`、`sched_setscheduler`、`nice`、`sched_yield` 转换为调度属性],
+    fill: soft-fill,
+  )
   #flow-arrow(label: "规范化调度属性")
   #layer-card("调度实体层", [调度实体保存策略、权重、虚拟运行时间、截止点、实时优先级和截止时间预算], fill: soft-fill)
   #flow-arrow(label: "进入本 CPU 运行队列")
   #layer-card("运行队列层", [截止时间队列、实时队列、公平队列、空闲队列和 EEVDF 聚合量], fill: handoff-fill)
   #flow-arrow(label: "选择下一个任务")
-  #layer-card("全局调度入口", [`schedule_once`、`on_timer_tick`、`NEED_RESCHED`、空闲任务和 `balance_once`], fill: warm-fill)
+  #layer-card(
+    "全局调度入口",
+    [`schedule_once`、`on_timer_tick`、`NEED_RESCHED`、空闲任务和 `balance_once`],
+    fill: warm-fill,
+  )
   #flow-arrow(label: "委托架构切换")
-  #layer-card("架构钩子", [`switch_context`、`now_ns`、`current_cpu_id`、`idle_relax`、`send_resched`], fill: stable-fill)
+  #layer-card(
+    "架构钩子",
+    [`switch_context`、`now_ns`、`current_cpu_id`、`idle_relax`、`send_resched`],
+    fill: stable-fill,
+  )
 ]
 
 这种分层的关键收益是策略和机制分开。调度属性（`SchedAttr`）负责规范化用户请求。调度实体（`SchedEntity`）负责保存单任务状态。运行队列负责排序和选择。`scheduler.rs` 文件负责系统级入口和每 CPU 槽位。架构层只处理硬件相关动作。每层都可以在不重写其它层的前提下演化。例如未来把公平队列内部从有序映射（`BTreeMap`）换成更专用的数据结构，不需要改变任务对象身份模型和系统调用 ABI。
@@ -366,7 +378,7 @@ EEVDF 对 CFS 的一个重要修正，是避免睡眠任务在唤醒后获得过
 
 调度系统把高频执行路径和策略扩展路径分开。高频路径只处理每 CPU 运行队列、原子状态、虚拟时间和架构上下文。策略扩展通过调度策略、调度类、调度属性和子队列完成。这个结构让常规任务、实时任务、截止时间任务和空闲任务都能进入同一调度框架，同时保留各自语义。
 
-调度系统具备以下创新。
+调度系统具备以下创新：
 
 第一是以 EEVDF 作为普通任务的公平调度基础。它把权重公平和延迟敏感放在同一个虚拟时间模型中处理。虚拟运行时间保证任务按权重推进。合格条件防止已经领先平均进度的任务继续占用 CPU。截止点选择让更紧迫的任务更早运行。滞后量保存和恢复解决了睡眠任务跨周期的公平性问题。与简单的最小虚拟运行时间选择相比，EEVDF 更适合处理大量短等待任务和长期运行任务混合的场景。我们在实现中还保留了增量平均虚拟运行时间维护，避免每次调度重新遍历整个公平队列。
 
