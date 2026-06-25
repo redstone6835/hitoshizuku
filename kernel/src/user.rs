@@ -206,7 +206,7 @@ fn load_user_image_from_path_inner(
     } else {
         0
     };
-    let main_loaded = load_exec_image(&vm, &exec_image, &file, main_bias, "exec")?;
+    let main_loaded = load_exec_image(&vm, &exec_image, &file, main_bias, true, "exec")?;
     let exec_path = resolve_exec_path(task, path);
 
     let interp_loaded = if let Some(interp) = exec_image.interpreter.as_deref() {
@@ -608,6 +608,7 @@ fn load_exec_image(
     img: &ExecImage,
     file: &Arc<File>,
     load_bias: usize,
+    update_brk: bool,
     label: &str,
 ) -> Result<LoadedImage, errno::Errno> {
     let mut max_segment_end: usize = 0;
@@ -637,7 +638,13 @@ fn load_exec_image(
             max_segment_end = seg_end;
         }
     }
-    vm.init_brk_after_load(max_segment_end);
+    if update_brk {
+        if img.is_pie {
+            vm.init_brk_after_pie_load(max_segment_end);
+        } else {
+            vm.init_brk_after_load(max_segment_end);
+        }
+    }
     Ok(LoadedImage {
         entry: load_bias
             .checked_add(img.entry)
@@ -1013,7 +1020,6 @@ fn load_image(
             max_segment_end = seg_end;
         }
     }
-    vm.init_brk_after_load(max_segment_end);
     Ok(LoadedImage {
         entry: load_bias
             .checked_add(img.entry())

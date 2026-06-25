@@ -257,6 +257,35 @@ run_tmpfs_test_script() {
     rm -rf "$work"
 }
 
+run_busybox_test_script() {
+    script="$1"
+    dir="${script%/*}"
+    patched="/tmp/busybox-testcode.$$"
+
+    if sed 's/if \[\[ $RTN -ne 0 && "$line" != "false" \]\] ;then/if [ "$RTN" -ne 0 ] \&\& [ "$line" != "false" ]; then/' "$script" >"$patched" 2>/dev/null; then
+        chmod +x "$patched" 2>/dev/null || true
+        cd "$dir" || return 0
+        /bin/sh "$patched"
+        rm -f "$patched"
+    else
+        rm -f "$patched"
+        cd "$dir" || return 0
+        /bin/sh "$script"
+    fi
+}
+
+prepare_libctest_dso_links() {
+    dir="$1"
+
+    [ -d "$dir/lib" ] || return 0
+    for so in dlopen_dso.so tls_align_dso.so tls_get_new-dtv_dso.so tls_init_dso.so; do
+        [ -e "$dir/$so" ] && continue
+        [ -e "$dir/lib/$so" ] || continue
+        # 部分测试盘只把 libctest 的 dlopen 依赖放在 lib/，而用例使用 ./xxx.so。
+        ln -sf "lib/$so" "$dir/$so" 2>/dev/null || true
+    done
+}
+
 run_test_script_file() {
     script="$1"
     name="${script##*/}"
@@ -271,6 +300,14 @@ run_test_script_file() {
         fi
         echo "[init] run $name"
         case "$name" in
+            busybox_testcode.sh)
+                run_busybox_test_script "$script"
+                ;;
+            libctest_testcode.sh)
+                prepare_libctest_dso_links "$dir"
+                cd "$dir" || return 0
+                /bin/sh "$script"
+                ;;
             iozone_testcode.sh|lmbench_testcode.sh)
                 run_tmpfs_test_script "$script"
                 ;;

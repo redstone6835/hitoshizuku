@@ -19,6 +19,8 @@ mod plic;
 
 mod ls7a_rtc;
 
+mod goldfish_rtc;
+
 mod fw_cfg;
 
 mod cfi_flash;
@@ -113,6 +115,7 @@ const BUILTIN_DRIVER_CATALOG: &[BuiltinDriverRegistration] = &[
     BuiltinDriverRegistration::new("loongson-irq", loongson_irq::register_builtin_driver),
     BuiltinDriverRegistration::new("riscv-plic", plic::register_builtin_driver),
     BuiltinDriverRegistration::new("ls7a-rtc", ls7a_rtc::register_builtin_driver),
+    BuiltinDriverRegistration::new("goldfish-rtc", goldfish_rtc::register_builtin_driver),
     BuiltinDriverRegistration::new("fw-cfg", fw_cfg::register_builtin_driver),
     BuiltinDriverRegistration::new("cfi-flash", cfi_flash::register_builtin_driver),
     BuiltinDriverRegistration::new("uart16550", uart16550::register_builtin_driver),
