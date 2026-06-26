@@ -38,7 +38,7 @@ static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 /// QEMU/virtio 的小请求通常在几十微秒内完成；立即切到 idle 会把一次上下文切换、
 /// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。这里先做一个很小的
 /// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
-const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 16;
+const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 256;
 
 fn allocate_block_diskseq() -> u64 {
     loop {
