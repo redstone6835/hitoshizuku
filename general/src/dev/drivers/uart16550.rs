@@ -50,6 +50,8 @@ const UART_DIVISOR_OVERSAMPLE: u32 = 16;
 const UART_DEFAULT_BAUD: u32 = 115_200;
 /// 标准 16550 FIFO 深度。
 const FIFO_DEPTH: usize = 16;
+/// 保守按 THR ready 单字节发送，避免把一次状态快照当成 FIFO 可用容量。
+const TX_FIFO_BATCH: usize = 1;
 /// 软件发送缓冲区大小。
 const TX_SW_BUFFER_SIZE: usize = 32 * 1024;
 /// flush/write_all 等待硬件发送完成时的自旋上限。
@@ -366,7 +368,7 @@ impl Uart16550 {
                 break;
             }
 
-            let count = state.len.min(FIFO_DEPTH);
+            let count = state.len.min(TX_FIFO_BATCH);
             for _ in 0..count {
                 let byte = Self::dequeue_byte(state);
                 unsafe {

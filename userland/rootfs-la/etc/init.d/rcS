@@ -203,6 +203,8 @@ run_tmpfs_test_script() {
     mounted=0
     old_ld_set=0
     old_ld="${LD_LIBRARY_PATH:-}"
+    script_to_run="$script"
+    lmbench_var_tmp_mounted=0
 
     rm -rf "$work"
     if ! mkdir -p "$work"; then
@@ -229,6 +231,20 @@ run_tmpfs_test_script() {
         ln -sf "$item" "$work/$base" 2>/dev/null || true
     done
 
+    if [ "$test_name" = "lmbench" ]; then
+        mkdir -p /var/tmp 2>/dev/null || true
+        if mount -t tmpfs tmpfs /var/tmp 2>/dev/null; then
+            lmbench_var_tmp_mounted=1
+            echo "[init] lmbench uses tmpfs /var/tmp"
+        fi
+        rm -f "$work/hello"
+        {
+            echo '#!/bin/sh'
+            echo "exec \"$work/lmbench_all\" hello \"\$@\""
+        } >"$work/hello" 2>/dev/null || true
+        chmod +x "$work/hello" 2>/dev/null || true
+    fi
+
     [ "${LD_LIBRARY_PATH+x}" = "x" ] && old_ld_set=1
     if [ -d "$dir/lib" ]; then
         case ":${LD_LIBRARY_PATH:-}:" in
@@ -239,7 +255,7 @@ run_tmpfs_test_script() {
     fi
 
     if cd "$work"; then
-        /bin/sh "$script"
+        /bin/sh "$script_to_run"
     else
         echo "[init] $test_name tmpfs setup failed: cannot enter $work"
     fi
@@ -249,6 +265,9 @@ run_tmpfs_test_script() {
         export LD_LIBRARY_PATH
     else
         unset LD_LIBRARY_PATH
+    fi
+    if [ "$lmbench_var_tmp_mounted" = "1" ]; then
+        umount /var/tmp 2>/dev/null || true
     fi
     cd "$oldpwd" || true
     if [ "$mounted" = "1" ]; then

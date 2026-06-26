@@ -1206,11 +1206,12 @@ impl FileOps for CharDevFileOps {
         }
     }
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        if !self.is_tty() || self.nonblock.load(Ordering::Acquire) {
+        if self.nonblock.load(Ordering::Acquire) {
             return self.dev.write(buf).map_err(map_char_err);
         }
         let Some(tty) = self.tty.as_deref() else {
-            return self.dev.write(buf).map_err(map_char_err);
+            self.dev.write_all(buf).map_err(map_char_err)?;
+            return Ok(buf.len());
         };
         let termios = *tty.termios.lock();
         self.write_tty_bytes(buf, termios)?;

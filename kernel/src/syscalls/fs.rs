@@ -3209,11 +3209,11 @@ fn write_from_user_at(
         let chunk = remaining.min(COPY_CHUNK);
         let result = unsafe {
             vm.with_user_read_slice(user_ptr, chunk, |buf| {
-                file_write_user_chunk(file, offset, pos, buf)
+                file_write_user_chunk(file, offset, pos, buf).map(|n| (n, buf.len()))
             })
         };
-        let n = match result {
-            Ok(Ok(n)) => n,
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
             Ok(Err(VfsError::WouldBlock)) if written > 0 => return Ok(written),
             Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
             Ok(Err(VfsError::WouldBlock)) => {
@@ -3240,7 +3240,7 @@ fn write_from_user_at(
             };
         }
         written += n;
-        if n < chunk {
+        if n < window_len {
             break;
         }
         user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
@@ -3326,11 +3326,11 @@ fn read_to_user(
         let chunk = remaining.min(COPY_CHUNK);
         let result = unsafe {
             vm.with_user_write_slice(user_ptr, chunk, |buf| {
-                file_read_user_chunk(file, offset, pos, buf)
+                file_read_user_chunk(file, offset, pos, buf).map(|n| (n, buf.len()))
             })
         };
-        let n = match result {
-            Ok(Ok(n)) => n,
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
             Ok(Err(VfsError::WouldBlock)) if read > 0 => return Ok(read),
             Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
             Ok(Err(VfsError::WouldBlock)) => {
@@ -3349,7 +3349,7 @@ fn read_to_user(
         user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
         pos = pos.saturating_add(n as u64);
         remaining -= n;
-        if n < chunk {
+        if n < window_len {
             break;
         }
     }
