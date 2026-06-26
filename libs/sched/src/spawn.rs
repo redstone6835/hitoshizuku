@@ -80,6 +80,9 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
     child.register_pid(Arc::clone(&root_ns), pid);
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_tgid(pid);
+        child.set_tgid_cache(pid);
+    } else {
+        child.set_tgid_cache(tgroup.tgid());
     }
     if pgroup.pgid() <= 0 {
         pgroup.set_pgid(pid);
@@ -266,6 +269,9 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     child.register_pid(Arc::clone(&root_ns), pid);
     if !flags.has(CloneFlags::CLONE_THREAD) {
         new_tg.set_tgid(pid);
+        child.set_tgid_cache(pid);
+    } else {
+        child.set_tgid_cache(new_tg.tgid());
     }
     if pg.pgid() <= 0 {
         pg.set_pgid(pid);
@@ -467,6 +473,7 @@ pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Ar
     child.register_pid(Arc::clone(&root_ns), pid);
     tgroup.set_leader(&child);
     tgroup.set_tgid(pid);
+    child.set_tgid_cache(pid);
     tgroup.add_member(&child);
     pgroup.set_pgid(pid);
     pgroup.add_member(&child);

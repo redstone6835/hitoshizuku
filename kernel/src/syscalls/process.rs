@@ -83,32 +83,57 @@ const PTRACE_SET_SYSCALL_INFO: usize = 0x4212;
 static UTS_HOSTNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 static UTS_DOMAINNAME: Spinlock<[u8; UTS_FIELD_LEN]> = Spinlock::new([0u8; UTS_FIELD_LEN]);
 
-pub(super) fn sys_getpid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::getpid() as usize)
+pub(super) fn sys_getpid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    let task = ctx.task();
+    Ok(task
+        .tgid_cached()
+        .or_else(|| task.pid_root_cached())
+        .or_else(|| {
+            let tgid = task.thread_group().tgid();
+            if tgid > 0 {
+                Some(tgid)
+            } else {
+                task.pid_root()
+            }
+        })
+        .unwrap_or(0) as usize)
 }
 
-pub(super) fn sys_gettid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::gettid() as usize)
+pub(super) fn sys_gettid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Ok(ctx
+        .task()
+        .pid_root_cached()
+        .or_else(|| ctx.task().pid_root())
+        .unwrap_or(0) as usize)
 }
 
-pub(super) fn sys_getppid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::getppid() as usize)
+pub(super) fn sys_getppid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Ok(ctx
+        .task()
+        .parent()
+        .and_then(|p| {
+            p.tgid_cached().or_else(|| {
+                let tgid = p.thread_group().tgid();
+                if tgid > 0 { Some(tgid) } else { p.pid_root() }
+            })
+        })
+        .unwrap_or(0) as usize)
 }
 
-pub(super) fn sys_getuid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::getuid().0 as usize)
+pub(super) fn sys_getuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Ok(ctx.task().credentials().uid.0 as usize)
 }
 
-pub(super) fn sys_geteuid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::geteuid().0 as usize)
+pub(super) fn sys_geteuid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Ok(ctx.task().credentials().euid.0 as usize)
 }
 
-pub(super) fn sys_getgid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::getgid().0 as usize)
+pub(super) fn sys_getgid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Ok(ctx.task().credentials().gid.0 as usize)
 }
 
-pub(super) fn sys_getegid(_ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
-    Ok(sched::operation::getegid().0 as usize)
+pub(super) fn sys_getegid(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
+    Ok(ctx.task().credentials().egid.0 as usize)
 }
 
 pub(super) fn sys_exit(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {

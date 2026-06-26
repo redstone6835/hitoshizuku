@@ -239,7 +239,21 @@ pub fn dispatch(tf: TrapFramePtr) {
 /// 的任务引用与信号语义。
 #[inline]
 pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
-    let task = sched::current_task();
+    let Some(ops) = frame_ops() else { return };
+    dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
+        (ops.set_sys_ret)(tf, ret);
+        (ops.advance_pc)(tf);
+    });
+}
+
+/// arch 快速 syscall 路径用。调用方直接提供 trap frame 写回逻辑，避免热路径
+/// 每次通过 `frame_ops()` 全局表做原子加载和间接调用。
+#[inline]
+pub fn dispatch_fast_with_frame<F>(tf: TrapFramePtr, nr: usize, args: [usize; 6], mut finish: F)
+where
+    F: FnMut(TrapFramePtr, isize),
+{
+    let task = sched::current_task_fast();
 
     let entry = if nr < SYSCALL_TABLE_LEN {
         let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
@@ -271,7 +285,6 @@ pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
-        let Some(ops) = frame_ops() else { return };
         if ret == -(Errno::EINTR.as_i32() as isize) {
             if let Some((info, action)) = sched::operation::consume_restartable_signal() {
                 let delivered = sched::process_image_ops()
@@ -292,8 +305,7 @@ pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
             }
         }
 
-        (ops.set_sys_ret)(tf, ret);
-        (ops.advance_pc)(tf);
+        finish(tf, ret);
 
         let task = ctx.task();
         if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {

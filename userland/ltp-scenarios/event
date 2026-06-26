@@ -1,5 +1,8 @@
 epoll_ctl03 epoll_ctl03
 access01 access01
+rt_sigaction01 rt_sigaction01
+rt_sigaction02 rt_sigaction02
+rt_sigaction03 rt_sigaction03
 getpid01 getpid01
 pipe11 pipe11
 select03 select03

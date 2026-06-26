@@ -308,20 +308,35 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
 /// 需要保存后走完整恢复路径，避免 signal/resched/full restore 读到旧状态。
 #[unsafe(no_mangle)]
 pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) -> usize {
-    let tf = unsafe { trap_frame_mut(tf_ptr) };
+    let (fpu_dirty, vector_active, nr, args) = {
+        let tf = unsafe { trap_frame_mut(tf_ptr) };
 
-    let fpu_dirty = (tf.status & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY;
-    if fpu_dirty {
-        unsafe { save_fpu_to_frame(tf) };
-    }
-    let vector_active = (tf.status & SSTATUS_VS_MASK) != 0;
-    if vector_active {
-        crate::riscv64::vector::save_current_if_active(tf);
-    }
+        let fpu_dirty = (tf.status & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY;
+        if fpu_dirty {
+            unsafe { save_fpu_to_frame(tf) };
+        }
+        let vector_active = (tf.status & SSTATUS_VS_MASK) != 0;
+        if vector_active {
+            crate::riscv64::vector::save_current_if_active(tf);
+        }
 
-    let nr = tf.a7;
-    let args = [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5];
-    general::syscall::dispatch_fast(general::TrapFramePtr::new(tf_ptr), nr, args);
+        (
+            fpu_dirty,
+            vector_active,
+            tf.a7,
+            [tf.a0, tf.a1, tf.a2, tf.a3, tf.a4, tf.a5],
+        )
+    };
+    general::syscall::dispatch_fast_with_frame(
+        general::TrapFramePtr::new(tf_ptr),
+        nr,
+        args,
+        |tf, ret| {
+            let frame = unsafe { trap_frame_mut(tf.as_usize()) };
+            frame.a0 = ret as usize;
+            frame.sepc = frame.sepc.wrapping_add(4);
+        },
+    );
 
     if sched::needs_resched_current() {
         sched::preempt_if_needed(kernel_timestamp_ns());

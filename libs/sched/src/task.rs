@@ -415,6 +415,8 @@ pub struct Task {
     wait_stop_sig: AtomicI32,
     wait_stop_pending: AtomicU8,
     wait_continue_pending: AtomicU8,
+    root_pid_cache: AtomicI32,
+    tgid_cache: AtomicI32,
     /// ptrace 的最小状态位。当前只区分任务是否处于 traced 模式，用于把
     /// 信号投递转换成父进程可 wait 的 signal-delivery-stop。
     ptrace_traced: AtomicU8,
@@ -506,6 +508,8 @@ impl Task {
             wait_stop_sig: AtomicI32::new(0),
             wait_stop_pending: AtomicU8::new(0),
             wait_continue_pending: AtomicU8::new(0),
+            root_pid_cache: AtomicI32::new(crate::pid::PID_INVALID),
+            tgid_cache: AtomicI32::new(crate::pid::PID_INVALID),
             ptrace_traced: AtomicU8::new(0),
             exit_waiters: WaitQueue::new(),
             rel: Spinlock::new(Relations {
@@ -940,6 +944,9 @@ impl Task {
             "[sched][pid] task already registered in namespace"
         );
         rel.pid_in_ns.push((ns, pid));
+        if rel.pid_in_ns.len() == 1 {
+            self.root_pid_cache.store(pid, Ordering::Release);
+        }
     }
 
     /// 在指定 ns 中查询任务的 pid。从外向内顺序匹配。
@@ -959,6 +966,31 @@ impl Task {
     /// 任务在根 ns 中的 pid（对应 Linux `task->pid`）。
     pub fn pid_root(&self) -> Option<PidT> {
         self.rel.lock().pid_in_ns.first().map(|(_, pid)| *pid)
+    }
+
+    /// 任务在根 ns 中的 pid 快照。热路径使用，避免只读查询进入亲缘锁。
+    pub fn pid_root_cached(&self) -> Option<PidT> {
+        let pid = self.root_pid_cache.load(Ordering::Acquire);
+        if pid > crate::pid::PID_INVALID {
+            Some(pid)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_tgid_cache(&self, pid: PidT) {
+        if pid > crate::pid::PID_INVALID {
+            self.tgid_cache.store(pid, Ordering::Release);
+        }
+    }
+
+    pub fn tgid_cached(&self) -> Option<PidT> {
+        let pid = self.tgid_cache.load(Ordering::Acquire);
+        if pid > crate::pid::PID_INVALID {
+            Some(pid)
+        } else {
+            None
+        }
     }
 
     /// 取出所有 (ns, pid) 登记副本，便于 exit 时反向调用 `release`。
