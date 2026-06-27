@@ -64,12 +64,19 @@ fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
     }
 }
 
-fn terminate_user_exception(tf: &TrapFrame, code: usize, sig: sched::SignalNumber) -> usize {
-    let (pid, comm, uid) = if sched::is_ready() {
+
+fn terminate_user_exception(
+    tf: &TrapFrame,
+    code: usize,
+    sig: sched::SignalNumber,
+    tf_ptr: usize,
+    from_user: bool,
+) -> usize {
+    let (pid, comm) = if sched::is_ready() {
         let task = sched::current_task();
-        (task.pid_root(), task.comm(), task.credentials().uid)
+        (task.pid_root(), task.comm())
     } else {
-        (None, [0; sched::TASK_COMM_LEN], sched::Uid::ROOT)
+        (None, [0; sched::TASK_COMM_LEN])
     };
 
     log::warning!(
@@ -83,18 +90,14 @@ fn terminate_user_exception(tf: &TrapFrame, code: usize, sig: sched::SignalNumbe
     );
 
     if sched::is_ready() {
-        sched::operation::apply_default_action(sched::SigInfo {
-            sig,
-            code: 0,
-            sender_pid: 0,
-            sender_uid: uid,
-            raw: None,
-        });
-        sched::schedule_once(kernel_timestamp_ns());
-        panic!("[trap][exception] signaled task scheduled back unexpectedly");
+        let me = sched::current_task();
+        let pid = me.pid_root().unwrap_or(0);
+        let _ = sched::operation::tkill(pid, Some(sig));
+        drop(me);
+        deliver_user_signals_before_return(tf_ptr, from_user);
     }
 
-    0
+    tf_ptr
 }
 
 /// 解码中断：从 SCAUSE 寄存器提取中断类型。
@@ -220,21 +223,13 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                     tf.tval,
                     code
                 );
-                // RISC-V 同步缺页若不可恢复，不能先入队 SIGSEGV 再返回同一条
-                // fault 指令；部分 LTP 用例会在相同 PC 上反复触发 fault，造成
-                // 日志风暴并拖住 runner。当前内核尚未完整支持用户态 sigframe，
-                // 这里按默认 SIGSEGV/Core 动作同步终止当前任务。
+
                 if sched::is_ready() {
                     let me = sched::current_task();
-                    sched::operation::apply_default_action(sched::SigInfo {
-                        sig: sched::SignalNumber::SIGSEGV,
-                        code: 0,
-                        sender_pid: 0,
-                        sender_uid: me.credentials().uid,
-                        raw: None,
-                    });
-                    sched::schedule_once(kernel_timestamp_ns());
-                    panic!("[trap][mem] SIGSEGV task scheduled back unexpectedly");
+                    let pid = me.pid_root().unwrap_or(0);
+                    let _ = sched::operation::tkill(pid, Some(sched::SignalNumber::SIGSEGV));
+                    drop(me);
+                    deliver_user_signals_before_return(tf_ptr, from_user);
                 }
                 tf_ptr
             }
@@ -269,8 +264,11 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         }
     } else if code == EXC_ILLEGAL_INST
         && from_user
-        && (crate::riscv64::vector::enable_user_vector_if_needed(tf)
-            || enable_user_fpu_if_needed(tf))
+        && {
+            let vec = crate::riscv64::vector::enable_user_vector_if_needed(tf);
+            let fpu = enable_user_fpu_if_needed(tf);
+            vec || fpu
+        }
     {
         // 用户首次触碰浮点状态时按需打开 FS，保持 sepc 不变让原指令重试。
         tf_ptr
@@ -283,7 +281,13 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         tf_ptr
     } else {
         if from_user {
-            return terminate_user_exception(tf, code, signal_for_user_exception(code));
+            return terminate_user_exception(
+                tf,
+                code,
+                signal_for_user_exception(code),
+                tf_ptr,
+                from_user,
+            );
         }
 
         let exc = decode_exception(code);
@@ -349,10 +353,21 @@ pub extern "C" fn riscv64_fast_syscall_dispatch(tf_ptr: usize, _user_sp: usize) 
 }
 
 fn enable_user_fpu_if_needed(tf: &mut TrapFrame) -> bool {
-    if (tf.status & SSTATUS_FS_MASK) != 0 || !looks_like_fpu_instruction(tf.sepc) {
+    if !looks_like_fpu_instruction(tf.sepc) {
         return false;
     }
-    tf.status = (tf.status & !SSTATUS_FS_MASK) | SSTATUS_FS_INITIAL;
+
+    let new_fs = SSTATUS_FS_DIRTY;
+    unsafe {
+        core::arch::asm!(
+            "csrr t0, sstatus",
+            "or t0, t0, {fs}",
+            "csrw sstatus, t0",
+            fs = in(reg) new_fs,
+            out("t0") _,
+        );
+    }
+    tf.status = (tf.status & !SSTATUS_FS_MASK) | new_fs;
     true
 }
 
