@@ -1020,6 +1020,7 @@ fn load_image(
             max_segment_end = seg_end;
         }
     }
+    vm.init_brk_after_load(max_segment_end);
     Ok(LoadedImage {
         entry: load_bias
             .checked_add(img.entry())
