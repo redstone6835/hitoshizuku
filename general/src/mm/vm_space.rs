@@ -331,29 +331,10 @@ impl VmSpace {
         self.brk_current.load(Ordering::Acquire)
     }
 
-    /// ELF loader 装载完成后调用：将 brk 起点对齐到主程序数据段末尾。
-    pub fn init_brk_after_load(&self, max_segment_end: usize) {
-        let page_size = page_size();
-        let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
-        let brk = new_brk.max(self.brk_start.load(Ordering::Relaxed));
-        self.brk_start.store(brk, Ordering::Release);
+    /// ELF loader 装载完成后调用：将 brk 指向独立的堆区域，与程序加载地址解耦。
+    pub fn init_brk_after_load(&self, _max_segment_end: usize) {
+        let brk = self.brk_start.load(Ordering::Relaxed);
         self.brk_current.store(brk, Ordering::Release);
-    }
-
-    /// 对 PIE 主程序使用的 brk 初始化。
-    ///
-    /// `user_heap_base` 是架构选择的独立 brk 区域。低地址 PIE 可以自然落在 heap
-    /// base 之前；LoongArch64 的高地址 PIE 不能把 brk 推到 PIE/解释器映射之后。
-    pub fn init_brk_after_pie_load(&self, max_segment_end: usize) {
-        let page_size = page_size();
-        let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
-        if new_brk <= self.brk_start.load(Ordering::Relaxed) {
-            self.init_brk_after_load(max_segment_end);
-        } else {
-            // PIE 落在 brk 区以上时仍需把 brk 推到程序段末尾之后。
-            self.brk_current
-                .store(new_brk, Ordering::Release);
-        }
     }
 
     pub fn set_brk(&self, requested: usize) -> usize {
