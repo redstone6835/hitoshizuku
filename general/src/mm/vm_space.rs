@@ -349,6 +349,10 @@ impl VmSpace {
         let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
         if new_brk <= self.brk_start.load(Ordering::Relaxed) {
             self.init_brk_after_load(max_segment_end);
+        } else {
+            // PIE 落在 brk 区以上时仍需把 brk 推到程序段末尾之后。
+            self.brk_current
+                .store(new_brk, Ordering::Release);
         }
     }
 
