@@ -11,7 +11,7 @@ use general::{TaskOps, TrapFramePtr};
 
 use crate::riscv64::specific::{
     CSR_FCSR, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, EXC_ECALL_S, EXC_ECALL_U, FRAME_SIZE,
-    SSTATUS_FS_MASK, SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SPP, TrapFrame,
+    SSTATUS_FS_DIRTY, SSTATUS_FS_MASK, SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SPP, TrapFrame,
 };
 use core::arch::naked_asm;
 
@@ -90,9 +90,9 @@ impl TaskOps for Riscv64TaskOps {
         tf.sepc = entry_pc;
         tf.sp = user_sp;
         tf.a0 = arg0;
-        // 默认让 FS=Off，避免纯整数 syscall 路径反复保存/恢复 32 个浮点寄存器。
-        // 用户第一次执行浮点指令会触发 illegal instruction，由 trap 侧按需打开 FS。
-        tf.status = SSTATUS_SPIE | SSTATUS_SIE;
+        // HACK: OpenSBI/QEMU 当前没有把 illegal instruction 委托给 S-mode；
+        // 用户态浮点指令不能依赖 illegal trap 做 lazy enable。
+        tf.status = SSTATUS_SPIE | SSTATUS_SIE | SSTATUS_FS_DIRTY;
         // 初始化时使用当前内核页表。exec 系统调用时会被替换为目标进程的用户页表。
         let satp_val: usize = read_csr!(satp);
         tf.satp = satp_val;
