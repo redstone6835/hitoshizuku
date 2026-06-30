@@ -544,7 +544,7 @@ fn rtc_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>
     let mut nodes = Vec::new();
     let payload: Arc<dyn Any + Send + Sync> = Arc::new(RtcDevNodeEndpoint::new(Arc::clone(&dev)));
     nodes
-        .try_reserve(if dev.index() == 0 { 2 } else { 1 })
+        .try_reserve(if dev.index() == 0 { 3 } else { 1 })
         .map_err(|_| VfsError::OutOfMemory)?;
     nodes.push(DevNodeSpec::custom(CustomDevNodeSpec::try_new(
         dev.name(),
@@ -555,6 +555,10 @@ fn rtc_function_devnodes(func: &dyn DeviceFunction) -> Result<Option<DevNodeSet>
         nodes.push(DevNodeSpec::Symlink {
             name: fallible_box_str("rtc")?,
             target: fallible_box_str(dev.name())?,
+        });
+        nodes.push(DevNodeSpec::Symlink {
+            name: fallible_box_str("misc/rtc")?,
+            target: fallible_box_str("../rtc0")?,
         });
     }
     DevNodeSet::try_new(nodes)

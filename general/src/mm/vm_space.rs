@@ -331,8 +331,21 @@ impl VmSpace {
         self.brk_current.load(Ordering::Acquire)
     }
 
-    /// ELF loader 装载完成后调用：将 brk 起点对齐到已装载段末尾的下一页。
+    /// ELF loader 装载完成后调用：将 brk 起点对齐到主程序数据段末尾。
     pub fn init_brk_after_load(&self, max_segment_end: usize) {
+        let page_size = page_size();
+        let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
+        let brk = new_brk.max(self.brk_start.load(Ordering::Relaxed));
+        self.brk_start.store(brk, Ordering::Release);
+        self.brk_current.store(brk, Ordering::Release);
+    }
+
+    /// 对 PIE 主程序使用的 brk 初始化。
+    ///
+    /// `user_heap_base` 是架构选择的独立 brk 区域。低地址 PIE 可以自然落在 heap
+    /// base 之前；高地址 PIE 则必须把 brk 起点整体放到主程序段之后，不能只更新
+    /// current，否则后续 brk shrink 会跨过一大段非 heap 区间。
+    pub fn init_brk_after_pie_load(&self, max_segment_end: usize) {
         let page_size = page_size();
         let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
         let brk = new_brk.max(self.brk_start.load(Ordering::Relaxed));
@@ -1061,6 +1074,49 @@ impl VmSpace {
         self.commit_fault_page(page, backing, flags, area_start, kind)
     }
 
+    /// 取得从用户地址读取的一页内连续窗口。
+    ///
+    /// 这个接口面向大块 I/O / bulk copy 热路径：先通过 VmSpace 完成权限检查、
+    /// lazy fault-in 和 COW，再把 resident page 的物理页转成内核直映 slice。
+    /// 因此闭包内访问的是内核地址，不需要走 arch uaccess 的逐元素 fixup。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证闭包不会保存传入 slice；用户映射可能被其它线程并发改变，
+    /// 本函数只通过 resident page 的 Arc 保证底层物理页在闭包期间不被释放。
+    pub unsafe fn with_user_read_slice<R>(
+        &self,
+        user: usize,
+        max_len: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, Errno> {
+        let (_page, kva, len) = self.user_page_window(user, max_len, FaultKind::Load)?;
+        let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, len) };
+        Ok(f(slice))
+    }
+
+    /// 取得写入用户地址的一页内连续窗口。
+    ///
+    /// Store fault 会在返回前解析 COW / shared dirty 状态。闭包返回后再次标脏，
+    /// 覆盖 VFS 在闭包内写入用户页但没有显式 fault 的场景。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`Self::with_user_read_slice`]。调用方还必须保证闭包不会制造跨线程可见
+    /// 的长期 `&mut [u8]` 别名。
+    pub unsafe fn with_user_write_slice<R>(
+        &self,
+        user: usize,
+        max_len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, Errno> {
+        let (page, kva, len) = self.user_page_window(user, max_len, FaultKind::Store)?;
+        let slice = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
+        let result = f(slice);
+        page.mark_dirty();
+        Ok(result)
+    }
+
     /// 立即为一个 ELF 段分配并填充物理页。
     pub fn commit_segment(
         &self,
@@ -1199,6 +1255,36 @@ impl VmSpace {
             return Err(Errno::EINVAL);
         }
         Ok(())
+    }
+
+    fn user_page_window(
+        &self,
+        user: usize,
+        max_len: usize,
+        kind: FaultKind,
+    ) -> Result<(Arc<ResidentPage>, usize, usize), Errno> {
+        if max_len == 0 || user.checked_add(max_len - 1).is_none() {
+            return Err(Errno::EFAULT);
+        }
+        match self.handle_fault(user, kind) {
+            FaultOutcome::Fixed => {}
+            FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
+        }
+
+        let page_va = page_base(user);
+        let offset = user - page_va;
+        let len = max_len.min(page_size() - offset);
+        let page = {
+            let pages = self.pages.lock();
+            pages
+                .get(&page_va)
+                .map(|mapping| Arc::clone(&mapping.page))
+                .ok_or(Errno::EFAULT)?
+        };
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        Ok((Arc::clone(&page), virt_fn(page.paddr()) + offset, len))
     }
 
     fn commit_fault_page(

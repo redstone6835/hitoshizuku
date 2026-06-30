@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use errno::Errno;
-use general::mm::{copy_cstr_from_user, copy_from_user, copy_to_user};
+use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::{current_fdtable, current_vfs_context, namespace_path, pidfd};
 use hal::abi::{decode_dev_t, encode_dev_t};
@@ -3194,6 +3194,68 @@ fn write_from_user_at(
     len: usize,
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let Some(vm) = current_vm_space() else {
+        return write_from_user_at_fallback(file, user, len, offset);
+    };
+
+    let mut remaining = len;
+    let mut user_ptr = user;
+    let mut pos = offset.unwrap_or(0);
+    let mut written = 0usize;
+    while remaining > 0 {
+        let chunk = remaining.min(COPY_CHUNK);
+        let result = unsafe {
+            vm.with_user_read_slice(user_ptr, chunk, |buf| {
+                file_write_user_chunk(file, offset, pos, buf).map(|n| (n, buf.len()))
+            })
+        };
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(VfsError::WouldBlock)) if written > 0 => return Ok(written),
+            Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(VfsError::WouldBlock)) => {
+                wait_for_file_readiness(file, PollEvents::POLLOUT)?;
+                continue;
+            }
+            Ok(Err(VfsError::BrokenPipe)) if written == 0 => {
+                deliver_sigpipe();
+                return Err(Errno::EPIPE);
+            }
+            Ok(Err(e)) => return Err(e.to_errno()),
+            Err(e) => {
+                return if written > 0 { Ok(written) } else { Err(e) };
+            }
+        };
+        if n == 0 {
+            // 非空 write 返回 0 表示底层没有取得任何进展。Linux write(2)
+            // 对常规文件通常应返回错误；这里优先返回已写入字节数，避免 libc/测试
+            // 在同一缓冲区上无限重试导致 iozone/lmbench 卡死。
+            return if written > 0 {
+                Ok(written)
+            } else {
+                Err(Errno::EIO)
+            };
+        }
+        written += n;
+        if n < window_len {
+            break;
+        }
+        user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
+        pos = pos.saturating_add(n as u64);
+        remaining -= n;
+    }
+    Ok(written)
+}
+
+fn write_from_user_at_fallback(
+    file: &vfs::file::File,
+    user: usize,
+    len: usize,
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
     let mut remaining = len;
     let mut user_ptr = user;
     let mut pos = offset.unwrap_or(0);
@@ -3208,11 +3270,7 @@ fn write_from_user_at(
                 Err(e.as_errno())
             };
         }
-        let n = match if offset.is_some() {
-            file.write_at(&tmp[..chunk], pos)
-        } else {
-            file.write(&tmp[..chunk])
-        } {
+        let n = match file_write_user_chunk(file, offset, pos, &tmp[..chunk]) {
             Ok(n) => n,
             Err(VfsError::WouldBlock) if written > 0 => return Ok(written),
             Err(VfsError::WouldBlock) if file.flags().nonblock => return Err(Errno::EAGAIN),
@@ -3248,6 +3306,57 @@ fn write_from_user_at(
 }
 
 fn read_to_user(
+    file: &vfs::file::File,
+    user: usize,
+    len: usize,
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let Some(vm) = current_vm_space() else {
+        return read_to_user_fallback(file, user, len, offset);
+    };
+
+    let mut remaining = len;
+    let mut user_ptr = user;
+    let mut pos = offset.unwrap_or(0);
+    let mut read = 0usize;
+    while remaining > 0 {
+        let chunk = remaining.min(COPY_CHUNK);
+        let result = unsafe {
+            vm.with_user_write_slice(user_ptr, chunk, |buf| {
+                file_read_user_chunk(file, offset, pos, buf).map(|n| (n, buf.len()))
+            })
+        };
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(VfsError::WouldBlock)) if read > 0 => return Ok(read),
+            Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(VfsError::WouldBlock)) => {
+                wait_for_file_readiness(file, PollEvents::POLLIN)?;
+                continue;
+            }
+            Ok(Err(e)) => return Err(e.to_errno()),
+            Err(e) => {
+                return if read > 0 { Ok(read) } else { Err(e) };
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        read += n;
+        user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
+        pos = pos.saturating_add(n as u64);
+        remaining -= n;
+        if n < window_len {
+            break;
+        }
+    }
+    Ok(read)
+}
+
+fn read_to_user_fallback(
     file: &vfs::file::File,
     user: usize,
     len: usize,
@@ -3293,6 +3402,42 @@ fn read_to_user(
         }
     }
     Ok(read)
+}
+
+fn file_write_user_chunk(
+    file: &vfs::file::File,
+    offset: Option<u64>,
+    pos: u64,
+    buf: &[u8],
+) -> vfs::error::VfsResult<usize> {
+    if offset.is_some() {
+        file.write_at(buf, pos)
+    } else {
+        file.write(buf)
+    }
+}
+
+fn file_read_user_chunk(
+    file: &vfs::file::File,
+    offset: Option<u64>,
+    pos: u64,
+    buf: &mut [u8],
+) -> vfs::error::VfsResult<usize> {
+    if offset.is_some() {
+        file.read_at(buf, pos)
+    } else {
+        file.read(buf)
+    }
+}
+
+fn current_vm_space() -> Option<Arc<VmSpace>> {
+    if !sched::is_ready() {
+        return None;
+    }
+    sched::current_task()
+        .ext_lookup(sched::TASKEXT_VM_SPACE)?
+        .downcast::<VmSpace>()
+        .ok()
 }
 
 fn read_optional_offset(user: usize) -> Result<Option<u64>, Errno> {

@@ -18,7 +18,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
@@ -74,6 +74,13 @@ static RUNQUEUES: [Runqueue; NR_CPUS] = [const { Runqueue::new() }; NR_CPUS];
 /// 每核当前正在执行的任务。
 static CURRENT_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
     [const { Spinlock::new(None) }; NR_CPUS];
+
+/// 每核当前任务的无所有权热路径指针。
+///
+/// 指针由 `Arc::into_raw` 发布，槽位自身持有一份强引用；切换 current 时释放旧
+/// 指针。这样 syscall/trap 热路径可以不拿 `CURRENT_TASKS` 锁。
+static CURRENT_TASK_RAW: [AtomicPtr<Task>; NR_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; NR_CPUS];
 
 /// 每核 idle 任务句柄。`pick_next` 返 None 时 `schedule_once` 切到这里。
 static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
@@ -172,6 +179,16 @@ fn cpu() -> usize {
     if id < NR_CPUS { id } else { 0 }
 }
 
+fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
+    let raw = Arc::into_raw(Arc::clone(&task)) as *mut Task;
+    *CURRENT_TASKS[cpu_id].lock() = Some(task);
+    let old = CURRENT_TASK_RAW[cpu_id].swap(raw, Ordering::AcqRel);
+    if !old.is_null() {
+        // Safety: 旧指针由上一轮 `publish_current_task` 的 `Arc::into_raw` 产生。
+        unsafe { drop(Arc::from_raw(old)) };
+    }
+}
+
 pub fn current_cpu_id() -> usize {
     cpu()
 }
@@ -234,6 +251,7 @@ pub fn init() -> Arc<Task> {
             init_task.register_pid(Arc::clone(&root_ns), pid);
             root_ns.set_ns_init_pid(pid);
             tgroup.set_tgid(pid);
+            init_task.set_tgid_cache(pid);
             pgroup.set_pgid(pid);
             session.set_sid(pid);
             pid
@@ -259,7 +277,7 @@ pub fn init() -> Arc<Task> {
     INIT_READY.store(true, Ordering::Release);
 
     // 8) CPU 0 的 current 指向 init。
-    *CURRENT_TASKS[0].lock() = Some(Arc::clone(&init_task));
+    publish_current_task(0, Arc::clone(&init_task));
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
@@ -327,6 +345,37 @@ pub fn current_task() -> Arc<Task> {
         .lock()
         .clone()
         .expect("[sched] current_task called before sched::init() on this CPU")
+}
+
+/// 当前 CPU 上正在执行的任务引用。
+///
+/// 该接口不增加引用计数，也不加锁；调用方不能把返回引用保存到可能调度之后。
+pub fn current_task_ref() -> &'static Task {
+    let id = cpu();
+    let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
+    if ptr.is_null() {
+        panic!("[sched] current_task_ref called before sched::init() on this CPU");
+    }
+    // Safety: raw 指针由 `publish_current_task` 的 `Arc::into_raw` 产生，并由
+    // CURRENT_TASK_RAW 槽位持有强引用。
+    unsafe { &*ptr }
+}
+
+/// 当前 CPU 上正在执行的任务句柄，热路径版本。
+///
+/// 与 [`current_task`] 语义相同，但不进入 `CURRENT_TASKS` 锁。
+pub fn current_task_fast() -> Arc<Task> {
+    let id = cpu();
+    let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
+    if ptr.is_null() {
+        panic!("[sched] current_task_fast called before sched::init() on this CPU");
+    }
+    // Safety: raw 指针由 `Arc::into_raw` 发布且槽位强引用仍有效；先增加强引用，
+    // 再用 `from_raw` 接管新增的这一份。
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
 }
 
 /// 查询指定 CPU 上的 current；未登记时返回 None。
@@ -496,7 +545,7 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
         task.adopt_current_context();
     }
     RUNQUEUES[cpu_id].set_current(Arc::clone(&task));
-    *CURRENT_TASKS[cpu_id].lock() = Some(task);
+    publish_current_task(cpu_id, task);
     Ok(())
 }
 
@@ -1126,7 +1175,7 @@ pub fn schedule_once(now_ns: u64) {
     // 刷新 rseq。内核态 uaccess 的缺页处理依赖 current_task()->VmSpace，所以
     // 必须先发布 current，再触碰 next 的用户地址空间。
     next.set_current_cpu(cpu_id);
-    *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));
+    publish_current_task(cpu_id, Arc::clone(&next));
 
     // 5. 取 ctx。
     let prev_ctx = prev

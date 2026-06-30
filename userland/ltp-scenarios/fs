@@ -1,5 +1,7 @@
 access01 access01
-getpid01 getpid01
+rt_sigaction01 rt_sigaction01
+rt_sigaction02 rt_sigaction02
+rt_sigaction03 getpid01
 pipe11 pipe11
 chmod01 chmod01
 chmod06 chmod06
