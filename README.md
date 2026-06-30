@@ -31,11 +31,13 @@
 
 ## 文档
 
-- 初赛技术文档：[`docs/main.typ`](docs/main.typ)
+- 内核技术文档：[`内核技术手册.pdf`](内核技术手册.pdf)
+- 技术汇报 PPT： [`MyGO!!!!! OS 内核技术汇报.pptx`](MyGO!!!!!%20OS%20内核技术汇报.pptx)
+- 测试演示视频：参见 https://pan.baidu.com/s/1xAara1sTKwMhglExJ3PNDw?pwd=tr9h
 - 架构说明：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - 安全分析报告：[`docs/SECURITY_REPORT.md`](docs/SECURITY_REPORT.md)
 - 开发与贡献说明：[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
-- 文档样式约定：[`docs/STYLES.md`](docs/STYLES.md)
+- 代码样式约定：[`docs/STYLES.md`](docs/STYLES.md)
 
 ## 代码目录地图
 
@@ -115,6 +117,10 @@ MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配�
 任务调度、虚拟内存、VFS 投影、设备模型、virtio 块/网卡接入、测试镜像集成和
 比赛测例适配等部分。更详细的来源、差异和创新点说明见
 [`docs/main.typ`](docs/main.typ) 及 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+
+## 许可证
+
+本项目依照 GPL v3 开源协议进行开源，请参阅 [LICENSE](LICENSE)。
 
 ## 备注
 
