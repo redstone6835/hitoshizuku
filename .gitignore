@@ -15,7 +15,6 @@ disk-la.img
 AGENTS.md
 
 build
-*.pdf
 userland/rootfs-la/bin/
 userland/rootfs-rv/bin/
 
