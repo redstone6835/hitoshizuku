@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://www.tyut.edu.cn/__local/C/F7/F9/0713FC3F036E6F49D48EA3B1504_80DE602B_A853.jpg" width="384" alt="太原理工大学" />
+  <img src="docs/assets/tyut-logo.jpg" width="384" alt="太原理工大学" />
 
 </div>
 
@@ -31,10 +31,11 @@
 
 ## 文档
 
-- 初赛技术文档：`doc/main.typ`
-- 初赛技术报告：(待上传)
-- 初赛安全分析报告：(待上传)
-- 初赛 PPT: (待上传)
+- 初赛技术文档：[`docs/main.typ`](docs/main.typ)
+- 架构说明：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- 安全分析报告：[`docs/SECURITY_REPORT.md`](docs/SECURITY_REPORT.md)
+- 开发与贡献说明：[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)
+- 文档样式约定：[`docs/STYLES.md`](docs/STYLES.md)
 
 ## 代码目录地图
 
@@ -61,10 +62,19 @@ docker run --rm -it -v "$PWD":/work -w /work zhouzhouyi/os-contest:20260510 bash
 进入容器后：
 
 ```sh
+make all            # 构建 LoongArch64 和 RISC-V64 内核
 make kernel-la      # 构建 LoongArch64 内核，输出 ./kernel-la
 make kernel-rv      # 构建 RISC-V64 内核，输出 ./kernel-rv
 cargo fmt --all     # 格式化 workspace
 ```
+
+构建目标会自动将可提交的 `cargo-config/` 同步为本地 `.cargo/`，并把用户态
+initramfs 打包进内核镜像。最终输出文件为仓库根目录下的 `kernel-la` 和
+`kernel-rv`。
+
+QEMU 运行示例默认使用 `build/sdcard-la.img` 和 `build/sdcard-rv.img`。
+这些镜像由比赛评测环境提供；本地复现时可从评测数据包中的对应压缩镜像解压到
+`build/` 目录后运行。
 
 ## QEMU 运行示例
 
@@ -94,6 +104,17 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 | extfs 单测 | `cargo test -p extfs` |
 | 内核启动验证 | 使用上方 QEMU 命令启动目标架构 |
 | 用户态集成测试 | 由 `userland/rootfs-*/etc/init.d/rcS` 按测试镜像脚本触发 |
+
+## 第三方组件与参考来源
+
+本仓库包含离线 Cargo 依赖镜像和若干外部组件，主要位于 `vendor/`、`third/`、
+`libs/mygo-smoltcp/` 和 `libs/acpi/`。其中网络协议栈、ACPI 解析、BusyBox
+用户态工具链及 Rust 生态依赖均按其原始许可证保留来源信息。
+
+MyGO!!!!! OS 的主要工作集中在内核架构分层、多架构启动适配、系统调用兼容层、
+任务调度、虚拟内存、VFS 投影、设备模型、virtio 块/网卡接入、测试镜像集成和
+比赛测例适配等部分。更详细的来源、差异和创新点说明见
+[`docs/main.typ`](docs/main.typ) 及 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 备注
 
