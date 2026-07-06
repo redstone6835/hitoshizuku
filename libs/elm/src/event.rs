@@ -26,6 +26,17 @@ pub struct ElmEventRecord {
 }
 
 impl ElmEventRecord {
+    pub const fn zero() -> Self {
+        Self {
+            sequence: 0,
+            kind: 0,
+            cell: 0,
+            port: 0,
+            binding: 0,
+            lease: 0,
+        }
+    }
+
     pub const fn new(
         sequence: ElmEventSequence,
         kind: TopologyEventKind,

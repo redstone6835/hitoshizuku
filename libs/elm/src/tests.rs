@@ -6,18 +6,20 @@ use crate::{
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
     ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO,
-    ElmCellSnapshot, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
-    ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError,
-    ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
-    ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
-    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCellSnapshot, ElmCoreInfo, ElmCtlCommand, ElmEbiArch,
+    ElmEbiEntry, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget,
+    ElmEbiUnit, ElmError, ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction,
+    ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse,
+    ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
     ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
     ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmPortSnapshot, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract,
-    FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, PortId,
-    ResourceLease, TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason,
-    planned_final_state, state_code, status_from_blockers,
+    ElmNexusUnbindRequest, ElmPortSnapshot, ElmRuntimeEventRequest, ElmRuntimeEventResponse,
+    ElmRuntimeLogRequest, ElmRuntimeLogResponse, ElmRuntimePortStatsHeader,
+    ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract, FlowMode,
+    Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, PortId, ResourceLease,
+    TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason, planned_final_state,
+    state_code, status_from_blockers,
 };
 
 fn manifest(name: &str) -> ElmManifest {
@@ -337,6 +339,23 @@ fn lease_registry_tracks_binding_owner() {
 }
 
 #[test]
+fn runtime_port_lease_tracks_write_rights() {
+    let lease = ResourceLease::new(
+        LeaseId(5),
+        ElmId(7),
+        LeaseKind::RuntimePort,
+        LeaseRights::WRITE,
+        Generation::FIRST,
+    )
+    .with_binding(BindingId(9));
+
+    assert_eq!(lease.kind, LeaseKind::RuntimePort);
+    assert!(lease.rights.write);
+    assert!(!lease.rights.control);
+    assert_eq!(lease.binding, Some(BindingId(9)));
+}
+
+#[test]
 fn ctl_command_rejects_unknown_command() {
     assert_eq!(ElmCtlCommand::from_raw(1), Some(ElmCtlCommand::CoreQuery));
     assert_eq!(ElmCtlCommand::from_raw(509), None);
@@ -393,6 +412,12 @@ fn snapshot_header_uses_fixed_entry_sizes() {
 #[test]
 fn builtin_ports_include_mgr_menu_and_todo_ports() {
     let ports = builtin_port_descriptors();
+    assert!(ports.iter().any(|port| {
+        port.contract == "core.log@1" && port.id == crate::PortId(1) && port.implemented
+    }));
+    assert!(ports.iter().any(|port| {
+        port.contract == "core.event@1" && port.id == crate::PortId(2) && port.implemented
+    }));
     assert!(ports.iter().any(|port| port.contract == "mgr.menu.item@1"));
     assert!(ports.iter().any(|port| !port.implemented));
 }
@@ -423,6 +448,80 @@ fn mgr_response_header_reports_payload_status() {
     let invalid = ElmMgrResponseHeader::invalid();
     assert_eq!(invalid.status, ELM_MGR_STATUS_INVALID);
     assert_eq!(invalid.payload_len, 0);
+}
+
+#[test]
+fn runtime_mgr_call_kinds_are_stable() {
+    assert_eq!(
+        ElmMgrCallKind::from_raw(16),
+        Some(ElmMgrCallKind::SubmitRuntimeLog)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(17),
+        Some(ElmMgrCallKind::ReadRuntimeEvent)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(18),
+        Some(ElmMgrCallKind::AckRuntimeEvent)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(19),
+        Some(ElmMgrCallKind::QueryRuntimePorts)
+    );
+}
+
+#[test]
+fn runtime_log_request_truncates_fixed_message_buffer() {
+    let long = "x".repeat(ELM_RUNTIME_LOG_MESSAGE_LEN + 7);
+    let request = ElmRuntimeLogRequest::new(11, 6, &long);
+    assert_eq!(request.binding_id, 11);
+    assert_eq!(request.level, 6);
+    assert_eq!(request.message_len, ELM_RUNTIME_LOG_MESSAGE_LEN as u16);
+    assert_eq!(request.message[0], b'x');
+    assert_eq!(
+        core::mem::size_of::<ElmRuntimeLogRequest>(),
+        24 + ELM_RUNTIME_LOG_MESSAGE_LEN
+    );
+
+    let response = ElmRuntimeLogResponse::new(11, request.message_len as u32, ELM_MGR_STATUS_OK, 1);
+    assert_eq!(response.accepted_len, ELM_RUNTIME_LOG_MESSAGE_LEN as u32);
+    assert_eq!(core::mem::size_of::<ElmRuntimeLogResponse>(), 32);
+}
+
+#[test]
+fn runtime_event_and_stats_records_are_fixed_layout() {
+    let request = ElmRuntimeEventRequest::new(12, 9);
+    assert_eq!(request.binding_id, 12);
+    assert_eq!(request.cursor, 9);
+    assert_eq!(core::mem::size_of::<ElmRuntimeEventRequest>(), 24);
+
+    let event = ElmEventRecord::new(
+        crate::ElmEventSequence(10),
+        TopologyEventKind::BindingAdded,
+        None,
+        None,
+        Some(BindingId(12)),
+        None,
+    );
+    let response = ElmRuntimeEventResponse::with_event(12, 9, event, 0, ELM_MGR_STATUS_OK);
+    assert_eq!(response.has_event, 1);
+    assert_eq!(response.next_cursor, 10);
+    assert_eq!(core::mem::size_of::<ElmRuntimeEventResponse>(), 88);
+
+    let empty = ElmRuntimeEventResponse::empty(12, 10, 0, ELM_MGR_STATUS_OK);
+    assert_eq!(empty.has_event, 0);
+    assert_eq!(empty.event.sequence, 0);
+
+    let header = ElmRuntimePortStatsHeader::new(1, 10);
+    assert_eq!(header.record_count, 1);
+    assert_eq!(header.event_sequence, 10);
+    assert_eq!(core::mem::size_of::<ElmRuntimePortStatsHeader>(), 16);
+
+    let record = ElmRuntimePortStatsRecord::new(12, 7, 2, 13, 10, 3, 4, 1);
+    assert_eq!(record.binding_id, 12);
+    assert_eq!(record.port_id, 2);
+    assert_eq!(record.cursor, 10);
+    assert_eq!(core::mem::size_of::<ElmRuntimePortStatsRecord>(), 72);
 }
 
 #[test]

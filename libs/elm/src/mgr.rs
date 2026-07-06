@@ -1,6 +1,7 @@
 //! 单元管理器调用外壳。
 
 use crate::ctl::ELM_CTL_ABI_VERSION;
+use crate::event::ElmEventRecord;
 use crate::snapshot::state_code;
 use crate::state::ElmState;
 
@@ -29,6 +30,9 @@ pub const ELM_MGR_ACTION_DETACH: u32 = 1 << 2;
 pub const ELM_MGR_ACTION_REPLACE: u32 = 1 << 3;
 pub const ELM_MGR_ACTION_BIND: u32 = 1 << 4;
 pub const ELM_MGR_ACTION_UNBIND: u32 = 1 << 5;
+pub const ELM_MGR_ACTION_RUNTIME_LOG: u32 = 1 << 6;
+pub const ELM_MGR_ACTION_RUNTIME_EVENT_READ: u32 = 1 << 7;
+pub const ELM_MGR_ACTION_RUNTIME_EVENT_ACK: u32 = 1 << 8;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
@@ -59,6 +63,7 @@ pub const ELM_POLICY_BLOCK_BINDING_PROTECTED: u64 = 1 << 16;
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
 pub const ELM_NEXUS_CONTRACT_LEN: usize = 64;
+pub const ELM_RUNTIME_LOG_MESSAGE_LEN: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -78,6 +83,10 @@ pub enum ElmMgrCallKind {
     CommitBind = 13,
     PreflightUnbind = 14,
     CommitUnbind = 15,
+    SubmitRuntimeLog = 16,
+    ReadRuntimeEvent = 17,
+    AckRuntimeEvent = 18,
+    QueryRuntimePorts = 19,
 }
 
 impl ElmMgrCallKind {
@@ -98,6 +107,10 @@ impl ElmMgrCallKind {
             13 => Some(Self::CommitBind),
             14 => Some(Self::PreflightUnbind),
             15 => Some(Self::CommitUnbind),
+            16 => Some(Self::SubmitRuntimeLog),
+            17 => Some(Self::ReadRuntimeEvent),
+            18 => Some(Self::AckRuntimeEvent),
+            19 => Some(Self::QueryRuntimePorts),
             _ => None,
         }
     }
@@ -287,7 +300,10 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_ACTION_RESUME
                 | ELM_MGR_ACTION_DETACH
                 | ELM_MGR_ACTION_BIND
-                | ELM_MGR_ACTION_UNBIND,
+                | ELM_MGR_ACTION_UNBIND
+                | ELM_MGR_ACTION_RUNTIME_LOG
+                | ELM_MGR_ACTION_RUNTIME_EVENT_READ
+                | ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
                 | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
@@ -580,6 +596,181 @@ impl ElmNexusBindingRecord {
         };
         out.contract_len = copy_str(contract, &mut out.contract) as u16;
         out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmRuntimeLogRequest {
+    pub binding_id: u64,
+    pub level: u32,
+    pub flags: u32,
+    pub message_len: u16,
+    pub reserved0: u16,
+    pub reserved1: u32,
+    pub message: [u8; ELM_RUNTIME_LOG_MESSAGE_LEN],
+}
+
+impl ElmRuntimeLogRequest {
+    pub fn new(binding_id: u64, level: u32, message: &str) -> Self {
+        let mut out = Self {
+            binding_id,
+            level,
+            flags: 0,
+            message_len: 0,
+            reserved0: 0,
+            reserved1: 0,
+            message: [0; ELM_RUNTIME_LOG_MESSAGE_LEN],
+        };
+        out.message_len = copy_str(message, &mut out.message) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmRuntimeLogResponse {
+    pub binding_id: u64,
+    pub accepted_len: u32,
+    pub status: i32,
+    pub submitted_logs: u64,
+    pub reserved: u64,
+}
+
+impl ElmRuntimeLogResponse {
+    pub const fn new(binding_id: u64, accepted_len: u32, status: i32, submitted_logs: u64) -> Self {
+        Self {
+            binding_id,
+            accepted_len,
+            status,
+            submitted_logs,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmRuntimeEventRequest {
+    pub binding_id: u64,
+    pub cursor: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmRuntimeEventRequest {
+    pub const fn new(binding_id: u64, cursor: u64) -> Self {
+        Self {
+            binding_id,
+            cursor,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmRuntimeEventResponse {
+    pub binding_id: u64,
+    pub cursor: u64,
+    pub next_cursor: u64,
+    pub dropped_events: u64,
+    pub has_event: u32,
+    pub status: i32,
+    pub event: ElmEventRecord,
+}
+
+impl ElmRuntimeEventResponse {
+    pub const fn empty(binding_id: u64, cursor: u64, dropped_events: u64, status: i32) -> Self {
+        Self {
+            binding_id,
+            cursor,
+            next_cursor: cursor,
+            dropped_events,
+            has_event: 0,
+            status,
+            event: ElmEventRecord::zero(),
+        }
+    }
+
+    pub const fn with_event(
+        binding_id: u64,
+        cursor: u64,
+        event: ElmEventRecord,
+        dropped_events: u64,
+        status: i32,
+    ) -> Self {
+        Self {
+            binding_id,
+            cursor,
+            next_cursor: event.sequence,
+            dropped_events,
+            has_event: 1,
+            status,
+            event,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmRuntimePortStatsHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmRuntimePortStatsHeader {
+    pub const fn new(record_count: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmRuntimePortStatsRecord>() as u16,
+            record_count,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmRuntimePortStatsRecord {
+    pub binding_id: u64,
+    pub cell_id: u64,
+    pub port_id: u64,
+    pub lease_id: u64,
+    pub cursor: u64,
+    pub submitted_logs: u64,
+    pub delivered_events: u64,
+    pub dropped_events: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmRuntimePortStatsRecord {
+    pub const fn new(
+        binding_id: u64,
+        cell_id: u64,
+        port_id: u64,
+        lease_id: u64,
+        cursor: u64,
+        submitted_logs: u64,
+        delivered_events: u64,
+        dropped_events: u64,
+    ) -> Self {
+        Self {
+            binding_id,
+            cell_id,
+            port_id,
+            lease_id,
+            cursor,
+            submitted_logs,
+            delivered_events,
+            dropped_events,
+            flags: 0,
+            reserved: 0,
+        }
     }
 }
 

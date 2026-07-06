@@ -17,6 +17,7 @@ pub enum LeaseKind {
     Block,
     MenuItem,
     Provider,
+    RuntimePort,
     Other,
 }
 
@@ -31,6 +32,12 @@ impl LeaseRights {
     pub const READ: Self = Self {
         read: true,
         write: false,
+        control: false,
+    };
+
+    pub const WRITE: Self = Self {
+        read: false,
+        write: true,
         control: false,
     };
 
@@ -141,6 +148,10 @@ impl LeaseRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.leases.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResourceLease> {
+        self.leases.values()
     }
 
     pub fn busy_owned_by(&self, owner: ElmId) -> usize {

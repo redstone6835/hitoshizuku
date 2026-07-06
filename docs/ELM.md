@@ -286,7 +286,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 
 - 内核启动时注册内建 `elm-mgr`。
 - 实现 `sys_elm_ctl(CORE_QUERY/SNAPSHOT_READ/MGR_CALL)`。
-- 实现 `mgr.menu.item@1` 和 `core.log@1` 两个织网端口。
+- 实现 `mgr.menu.item@1`、`core.log@1` 和 `core.event@1` 三个基础织网端口。
 - 加载一个测试 ELM，作为 `elm-mgr` 菜单拓展。
 
 第三阶段实现目标：
@@ -312,6 +312,10 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - `MGR_CALL(QueryAudit)` 已返回管理操作审计环，包括动作、状态、阻断位和最终状态。
 - `MGR_CALL(QueryNexusBindings)` 已返回能力织网绑定快照。
 - `MGR_CALL(PreflightBind/CommitBind)` 已支持内建菜单端口 `mgr.menu.item@1` 的绑定预检和提交。
+- `core.log@1` 和 `core.event@1` 已支持真实绑定、租约登记、查询快照和撤销。
+- `MGR_CALL(SubmitRuntimeLog)` 已支持通过 `core.log@1` 绑定提交固定长度日志 payload。
+- `MGR_CALL(ReadRuntimeEvent/AckRuntimeEvent)` 已支持通过 `core.event@1` 绑定按游标读取和确认 ELM 事件。
+- `MGR_CALL(QueryRuntimePorts)` 已返回运行时端口绑定统计，包括日志提交数、事件投递数和丢弃事件数。
 - `MGR_CALL(PreflightUnbind/CommitUnbind)` 已支持动态能力绑定的预检和撤销；内建保护绑定不可撤销。
 - 绑定图已记录真实能力绑定边，并将绑定、菜单租约和菜单项纳入同一条撤销链路。
 - EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明和入口声明。
@@ -330,7 +334,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - soyo 文件格式、soyo 解析器以及 soyo 到 EBI 协议对象的转换层。
 - 热替换、影子绑定、状态迁移和回滚。
 - 原生代码单元的暂停、恢复、静默化回调和卸载执行器。
-- `core.log@1`、`core.event@1` 以及设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
+- 设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
 
 ## 12. 禁止事项
 

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use elm_model::{
     ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest,
     ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
-    ElmNexusBindRequest, ElmNexusUnbindRequest,
+    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
 };
 
 use super::{menu, with_core};
@@ -123,6 +123,37 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
             let response = with_core(|core| core.commit_unbind(request));
             response_with_plain_payload(&response)
         }
+        ElmMgrCallKind::SubmitRuntimeLog => {
+            let Some(request) = read_runtime_log_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match with_core(|core| core.submit_runtime_log(request)) {
+                Ok(response) => response_with_plain_payload(&response),
+                Err(status) => response_only(response_header_from_status(status)),
+            }
+        }
+        ElmMgrCallKind::ReadRuntimeEvent => {
+            let Some(request) = read_runtime_event_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match with_core(|core| core.read_runtime_event(request)) {
+                Ok(response) => response_with_plain_payload(&response),
+                Err(status) => response_only(response_header_from_status(status)),
+            }
+        }
+        ElmMgrCallKind::AckRuntimeEvent => {
+            let Some(request) = read_runtime_event_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match with_core(|core| core.ack_runtime_event(request)) {
+                Ok(response) => response_with_plain_payload(&response),
+                Err(status) => response_only(response_header_from_status(status)),
+            }
+        }
+        ElmMgrCallKind::QueryRuntimePorts => {
+            let payload = with_core(|core| core.runtime_ports_bytes());
+            response_with_payload(payload)
+        }
     }
 }
 
@@ -195,6 +226,45 @@ fn read_nexus_unbind_request(payload: &[u8]) -> Option<ElmNexusUnbindRequest> {
         flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
         reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
     })
+}
+
+fn read_runtime_log_request(payload: &[u8]) -> Option<ElmRuntimeLogRequest> {
+    if payload.len() != core::mem::size_of::<ElmRuntimeLogRequest>() {
+        return None;
+    }
+    let mut message = [0u8; elm_model::ELM_RUNTIME_LOG_MESSAGE_LEN];
+    message.copy_from_slice(&payload[24..24 + elm_model::ELM_RUNTIME_LOG_MESSAGE_LEN]);
+    Some(ElmRuntimeLogRequest {
+        binding_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        level: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+        message_len: u16::from_le_bytes(payload[16..18].try_into().ok()?),
+        reserved0: u16::from_le_bytes(payload[18..20].try_into().ok()?),
+        reserved1: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+        message,
+    })
+}
+
+fn read_runtime_event_request(payload: &[u8]) -> Option<ElmRuntimeEventRequest> {
+    if payload.len() != core::mem::size_of::<ElmRuntimeEventRequest>() {
+        return None;
+    }
+    Some(ElmRuntimeEventRequest {
+        binding_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        cursor: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+    })
+}
+
+fn response_header_from_status(status: i32) -> ElmMgrResponseHeader {
+    match status {
+        elm_model::ELM_MGR_STATUS_NOT_FOUND => ElmMgrResponseHeader::not_found(),
+        elm_model::ELM_MGR_STATUS_BUSY => ElmMgrResponseHeader::busy(),
+        elm_model::ELM_MGR_STATUS_TODO => ElmMgrResponseHeader::todo(),
+        elm_model::ELM_MGR_STATUS_UNSUPPORTED => ElmMgrResponseHeader::unsupported(),
+        _ => ElmMgrResponseHeader::invalid(),
+    }
 }
 
 fn response_with_payload(payload: Vec<u8>) -> Vec<u8> {
