@@ -14,6 +14,7 @@ mod acpi;
 mod bench;
 mod device_init;
 mod dtb;
+mod elm;
 mod initramfs;
 mod net_poll;
 mod panic;
@@ -35,6 +36,7 @@ fn main() -> ! {
 
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    elm::init_builtin_mgr();
     // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则
     // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要
     // 调度器 init/idle 完成后才能派生内核线程。
