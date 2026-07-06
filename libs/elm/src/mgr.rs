@@ -2,6 +2,8 @@
 
 use crate::ctl::ELM_CTL_ABI_VERSION;
 use crate::event::ElmEventRecord;
+use crate::frame::{ElmCallFrame, ElmReplyFrame};
+use crate::ports::ElmPortAccessPolicy;
 use crate::snapshot::state_code;
 use crate::state::ElmState;
 
@@ -33,6 +35,10 @@ pub const ELM_MGR_ACTION_UNBIND: u32 = 1 << 5;
 pub const ELM_MGR_ACTION_RUNTIME_LOG: u32 = 1 << 6;
 pub const ELM_MGR_ACTION_RUNTIME_EVENT_READ: u32 = 1 << 7;
 pub const ELM_MGR_ACTION_RUNTIME_EVENT_ACK: u32 = 1 << 8;
+pub const ELM_MGR_ACTION_PROVIDER_REGISTER: u32 = 1 << 9;
+pub const ELM_MGR_ACTION_PROVIDER_UNREGISTER: u32 = 1 << 10;
+pub const ELM_MGR_ACTION_PROVIDER_QUERY: u32 = 1 << 11;
+pub const ELM_MGR_ACTION_PROVIDER_INVOKE: u32 = 1 << 12;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
@@ -41,6 +47,7 @@ pub const ELM_MGR_POLICY_REPLACE_TODO: u64 = 1 << 3;
 pub const ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO: u64 = 1 << 4;
 pub const ELM_MGR_POLICY_NEXUS_BINDING: u64 = 1 << 5;
 pub const ELM_MGR_POLICY_MENU_BINDING: u64 = 1 << 6;
+pub const ELM_MGR_POLICY_PROVIDER_PORTS: u64 = 1 << 7;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -59,11 +66,14 @@ pub const ELM_POLICY_BLOCK_DUPLICATE_BINDING: u64 = 1 << 13;
 pub const ELM_POLICY_BLOCK_PORT_TODO: u64 = 1 << 14;
 pub const ELM_POLICY_BLOCK_BINDING_NOT_FOUND: u64 = 1 << 15;
 pub const ELM_POLICY_BLOCK_BINDING_PROTECTED: u64 = 1 << 16;
+pub const ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND: u64 = 1 << 17;
+pub const ELM_POLICY_BLOCK_PROVIDER_BUSY: u64 = 1 << 18;
 
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
 pub const ELM_NEXUS_CONTRACT_LEN: usize = 64;
 pub const ELM_RUNTIME_LOG_MESSAGE_LEN: usize = 256;
+pub const ELM_PROVIDER_PORT_FLAG_TEST_ECHO: u32 = 1 << 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -87,6 +97,11 @@ pub enum ElmMgrCallKind {
     ReadRuntimeEvent = 17,
     AckRuntimeEvent = 18,
     QueryRuntimePorts = 19,
+    RegisterProviderPort = 20,
+    UnregisterProviderPort = 21,
+    QueryProviderPorts = 22,
+    InvokeProvider = 23,
+    QueryProviderStats = 24,
 }
 
 impl ElmMgrCallKind {
@@ -111,6 +126,11 @@ impl ElmMgrCallKind {
             17 => Some(Self::ReadRuntimeEvent),
             18 => Some(Self::AckRuntimeEvent),
             19 => Some(Self::QueryRuntimePorts),
+            20 => Some(Self::RegisterProviderPort),
+            21 => Some(Self::UnregisterProviderPort),
+            22 => Some(Self::QueryProviderPorts),
+            23 => Some(Self::InvokeProvider),
+            24 => Some(Self::QueryProviderStats),
             _ => None,
         }
     }
@@ -303,14 +323,19 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_ACTION_UNBIND
                 | ELM_MGR_ACTION_RUNTIME_LOG
                 | ELM_MGR_ACTION_RUNTIME_EVENT_READ
-                | ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
+                | ELM_MGR_ACTION_RUNTIME_EVENT_ACK
+                | ELM_MGR_ACTION_PROVIDER_REGISTER
+                | ELM_MGR_ACTION_PROVIDER_UNREGISTER
+                | ELM_MGR_ACTION_PROVIDER_QUERY
+                | ELM_MGR_ACTION_PROVIDER_INVOKE,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
                 | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
                 | ELM_MGR_POLICY_REPLACE_TODO
                 | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO
                 | ELM_MGR_POLICY_NEXUS_BINDING
-                | ELM_MGR_POLICY_MENU_BINDING,
+                | ELM_MGR_POLICY_MENU_BINDING
+                | ELM_MGR_POLICY_PROVIDER_PORTS,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -327,7 +352,9 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_DUPLICATE_BINDING
                 | ELM_POLICY_BLOCK_PORT_TODO
                 | ELM_POLICY_BLOCK_BINDING_NOT_FOUND
-                | ELM_POLICY_BLOCK_BINDING_PROTECTED,
+                | ELM_POLICY_BLOCK_BINDING_PROTECTED
+                | ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND
+                | ELM_POLICY_BLOCK_PROVIDER_BUSY,
             audit_capacity,
             reserved1: 0,
         }
@@ -776,6 +803,235 @@ impl ElmRuntimePortStatsRecord {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderPortRegisterRequest {
+    pub owner_cell_id: u64,
+    pub flags: u32,
+    pub access_policy: u32,
+    pub direction: u32,
+    pub mode: u32,
+    pub contract_len: u16,
+    pub reserved0: u16,
+    pub reserved1: u32,
+    pub contract: [u8; ELM_NEXUS_CONTRACT_LEN],
+}
+
+impl ElmProviderPortRegisterRequest {
+    pub fn new(
+        owner_cell_id: u64,
+        contract: &str,
+        access_policy: ElmPortAccessPolicy,
+        direction: crate::FlowDirection,
+        mode: crate::FlowMode,
+        flags: u32,
+    ) -> Self {
+        let mut out = Self {
+            owner_cell_id,
+            flags,
+            access_policy: access_policy as u32,
+            direction: direction as u32,
+            mode: mode as u32,
+            contract_len: 0,
+            reserved0: 0,
+            reserved1: 0,
+            contract: [0; ELM_NEXUS_CONTRACT_LEN],
+        };
+        out.contract_len = copy_str(contract, &mut out.contract) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderPortRegisterResponse {
+    pub owner_cell_id: u64,
+    pub port_id: u64,
+    pub status: i32,
+    pub access_policy: u32,
+    pub blockers: u64,
+    pub reserved: u64,
+}
+
+impl ElmProviderPortRegisterResponse {
+    pub const fn new(
+        owner_cell_id: u64,
+        port_id: u64,
+        status: i32,
+        access_policy: u32,
+        blockers: u64,
+    ) -> Self {
+        Self {
+            owner_cell_id,
+            port_id,
+            status,
+            access_policy,
+            blockers,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderPortUnregisterRequest {
+    pub port_id: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmProviderPortUnregisterRequest {
+    pub const fn new(port_id: u64) -> Self {
+        Self {
+            port_id,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderInvokeRequest {
+    pub frame: ElmCallFrame,
+}
+
+impl ElmProviderInvokeRequest {
+    pub const fn new(frame: ElmCallFrame) -> Self {
+        Self { frame }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderInvokeResponse {
+    pub reply: ElmReplyFrame,
+}
+
+impl ElmProviderInvokeResponse {
+    pub const fn new(reply: ElmReplyFrame) -> Self {
+        Self { reply }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderPortStatsHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmProviderPortStatsHeader {
+    pub const fn new(record_count: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmProviderPortRecord>() as u16,
+            record_count,
+            event_sequence,
+        }
+    }
+
+    pub const fn new_stats(record_count: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmProviderPortStatsRecord>() as u16,
+            record_count,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderPortRecord {
+    pub port_id: u64,
+    pub owner_cell_id: u64,
+    pub access_policy: u32,
+    pub direction: u32,
+    pub mode: u32,
+    pub implemented: u32,
+    pub invokable: u32,
+    pub binding_count: u32,
+    pub contract_len: u16,
+    pub reserved: u16,
+    pub calls: u64,
+    pub failed_calls: u64,
+    pub revokes: u64,
+    pub contract: [u8; ELM_NEXUS_CONTRACT_LEN],
+}
+
+impl ElmProviderPortRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        port_id: u64,
+        owner_cell_id: u64,
+        access_policy: u32,
+        direction: u32,
+        mode: u32,
+        implemented: bool,
+        invokable: bool,
+        binding_count: u32,
+        calls: u64,
+        failed_calls: u64,
+        revokes: u64,
+        contract: &str,
+    ) -> Self {
+        let mut out = Self {
+            port_id,
+            owner_cell_id,
+            access_policy,
+            direction,
+            mode,
+            implemented: u32::from(implemented),
+            invokable: u32::from(invokable),
+            binding_count,
+            contract_len: 0,
+            reserved: 0,
+            calls,
+            failed_calls,
+            revokes,
+            contract: [0; ELM_NEXUS_CONTRACT_LEN],
+        };
+        out.contract_len = copy_str(contract, &mut out.contract) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderPortStatsRecord {
+    pub port_id: u64,
+    pub owner_cell_id: u64,
+    pub binding_count: u32,
+    pub flags: u32,
+    pub calls: u64,
+    pub failed_calls: u64,
+    pub revokes: u64,
+}
+
+impl ElmProviderPortStatsRecord {
+    pub const fn new(
+        port_id: u64,
+        owner_cell_id: u64,
+        binding_count: u32,
+        calls: u64,
+        failed_calls: u64,
+        revokes: u64,
+    ) -> Self {
+        Self {
+            port_id,
+            owner_cell_id,
+            binding_count,
+            flags: 0,
+            calls,
+            failed_calls,
+            revokes,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmMgrResponseHeader {
     pub status: i32,
     pub payload_len: u32,
@@ -837,7 +1093,11 @@ pub const fn status_from_blockers(blockers: u64) -> i32 {
         ELM_MGR_STATUS_OK
     } else if blockers & ELM_POLICY_BLOCK_CELL_NOT_FOUND != 0 {
         ELM_MGR_STATUS_NOT_FOUND
-    } else if blockers & (ELM_POLICY_BLOCK_PORT_NOT_FOUND | ELM_POLICY_BLOCK_BINDING_NOT_FOUND) != 0
+    } else if blockers
+        & (ELM_POLICY_BLOCK_PORT_NOT_FOUND
+            | ELM_POLICY_BLOCK_BINDING_NOT_FOUND
+            | ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND)
+        != 0
     {
         ELM_MGR_STATUS_NOT_FOUND
     } else if blockers & ELM_POLICY_BLOCK_BUILTIN_PROTECTED != 0 {
@@ -849,7 +1109,8 @@ pub const fn status_from_blockers(blockers: u64) -> i32 {
             | ELM_POLICY_BLOCK_HAS_DEPENDENTS
             | ELM_POLICY_BLOCK_HAS_EXTENSIONS
             | ELM_POLICY_BLOCK_LEASE_BUSY
-            | ELM_POLICY_BLOCK_DUPLICATE_BINDING)
+            | ELM_POLICY_BLOCK_DUPLICATE_BINDING
+            | ELM_POLICY_BLOCK_PROVIDER_BUSY)
         != 0
     {
         ELM_MGR_STATUS_BUSY

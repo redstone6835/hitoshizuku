@@ -4,6 +4,25 @@ use crate::ids::{ElmId, PortId};
 use crate::nexus::{FlowDirection, FlowMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ElmPortAccessPolicy {
+    Internal = 1,
+    Public = 2,
+    ExtensionOnly = 3,
+}
+
+impl ElmPortAccessPolicy {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Internal),
+            2 => Some(Self::Public),
+            3 => Some(Self::ExtensionOnly),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinPort {
     CoreLog,
     CoreEvent,
@@ -29,17 +48,29 @@ pub struct PortDescriptor {
     pub contract: &'static str,
     pub direction: FlowDirection,
     pub mode: FlowMode,
+    pub access: ElmPortAccessPolicy,
+    pub invokable: bool,
     pub implemented: bool,
 }
 
 pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
     [
-        desc(1, "core.log@1", FlowDirection::Sink, FlowMode::Shared, true),
+        desc(
+            1,
+            "core.log@1",
+            FlowDirection::Sink,
+            FlowMode::Shared,
+            ElmPortAccessPolicy::Public,
+            false,
+            true,
+        ),
         desc(
             2,
             "core.event@1",
             FlowDirection::Source,
             FlowMode::Broadcast,
+            ElmPortAccessPolicy::Public,
+            false,
             true,
         ),
         desc(
@@ -47,6 +78,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "mgr.menu.item@1",
             FlowDirection::Sink,
             FlowMode::Ordered,
+            ElmPortAccessPolicy::Public,
+            false,
             true,
         ),
         desc(
@@ -54,6 +87,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "mgr.action.invoke@1",
             FlowDirection::Control,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -61,6 +96,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "device.discovered@1",
             FlowDirection::Source,
             FlowMode::Broadcast,
+            ElmPortAccessPolicy::Internal,
+            false,
             false,
         ),
         desc(
@@ -68,6 +105,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "device.claim@1",
             FlowDirection::Control,
             FlowMode::Exclusive,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -75,6 +114,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "irq.event@1",
             FlowDirection::Source,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            false,
             false,
         ),
         desc(
@@ -82,6 +123,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "dma.buffer@1",
             FlowDirection::Duplex,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -89,6 +132,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "mmio.window@1",
             FlowDirection::Duplex,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -96,6 +141,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "io.block.submit@1",
             FlowDirection::Sink,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -103,6 +150,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "io.packet.rx@1",
             FlowDirection::Source,
             FlowMode::Pipeline,
+            ElmPortAccessPolicy::Internal,
+            false,
             false,
         ),
         desc(
@@ -110,6 +159,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "io.packet.tx@1",
             FlowDirection::Sink,
             FlowMode::Pipeline,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -117,6 +168,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "vfs.lookup@1",
             FlowDirection::Control,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -124,6 +177,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "vfs.read@1",
             FlowDirection::Control,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
         desc(
@@ -131,6 +186,8 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             "vfs.write@1",
             FlowDirection::Control,
             FlowMode::Shared,
+            ElmPortAccessPolicy::Internal,
+            true,
             false,
         ),
     ]
@@ -141,6 +198,8 @@ const fn desc(
     contract: &'static str,
     direction: FlowDirection,
     mode: FlowMode,
+    access: ElmPortAccessPolicy,
+    invokable: bool,
     implemented: bool,
 ) -> PortDescriptor {
     PortDescriptor {
@@ -149,6 +208,8 @@ const fn desc(
         contract,
         direction,
         mode,
+        access,
+        invokable,
         implemented,
     }
 }

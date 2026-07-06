@@ -1,5 +1,6 @@
 //! ELM 核心全局状态。
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -8,28 +9,35 @@ use alloc::vec::Vec;
 use elm_model::{
     ActionId, BindingGraph, BindingId, ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
     ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
-    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
-    ELM_MGR_ACTION_RUNTIME_EVENT_READ, ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND,
-    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
+    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_INVOKE,
+    ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
+    ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
+    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID,
+    ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_UNSUPPORTED,
     ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
     ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
     ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_NATIVE_TODO,
-    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_REPLACE_TODO,
-    ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError,
-    ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
-    ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest,
-    ElmMenuItemKind, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind,
-    ElmMgrRelationRecord, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
-    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
+    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_REPLACE_TODO,
+    ELM_PROVIDER_PORT_FLAG_TEST_ECHO, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCallFrame, ElmCoreInfo,
+    ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId,
+    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
+    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
+    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
+    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
+    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
     ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
-    ElmVersion, FlowContract, FlowMode, Generation, IntentKind, LeaseId, LeaseKind, LeaseRegistry,
-    LeaseRights, NexusIntent, NexusOffer, PortDescriptor, PortId, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
-    status_from_blockers,
+    ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, IntentKind, LeaseId, LeaseKind,
+    LeaseRegistry, LeaseRights, NexusIntent, NexusOffer, PortDescriptor, PortId, ResourceLease,
+    TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason, planned_final_state,
+    state_code, status_from_blockers,
 };
 use sched::sync::Spinlock;
 
@@ -48,6 +56,7 @@ const ELM_CORE_LOG_CONTRACT: &str = "core.log@1";
 const ELM_CORE_EVENT_CONTRACT: &str = "core.event@1";
 const ELM_MGR_MENU_CONTRACT: &str = "mgr.menu.item@1";
 const FIRST_DYNAMIC_CELL_ID: u64 = 100;
+const FIRST_DYNAMIC_PORT_ID: u64 = 100;
 const EVENT_RING_LIMIT: usize = 128;
 const AUDIT_RING_LIMIT: usize = 128;
 
@@ -80,11 +89,30 @@ struct RuntimePortBinding {
     dropped_events: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderOpsKind {
+    Builtin,
+    TestEcho,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderRuntime {
+    port: PortId,
+    owner: Option<ElmId>,
+    access: ElmPortAccessPolicy,
+    ops: ProviderOpsKind,
+    dynamic: bool,
+    calls: u64,
+    failed_calls: u64,
+    revokes: u64,
+}
+
 pub(crate) struct ElmCore {
     initialized: bool,
     graph: BindingGraph,
     cells: Vec<CellRuntime>,
     ports: Vec<PortRuntime>,
+    providers: Vec<ProviderRuntime>,
     runtime_ports: Vec<RuntimePortBinding>,
     menu_items: Vec<MenuItemRuntime>,
     menu_generation: Generation,
@@ -97,6 +125,8 @@ pub(crate) struct ElmCore {
     dropped_audit_count: u32,
     #[allow(dead_code)]
     next_cell_id: u64,
+    #[allow(dead_code)]
+    next_port_id: u64,
     #[allow(dead_code)]
     next_binding_id: u64,
     #[allow(dead_code)]
@@ -114,6 +144,7 @@ impl ElmCore {
             graph: BindingGraph::new(),
             cells: Vec::new(),
             ports: Vec::new(),
+            providers: Vec::new(),
             runtime_ports: Vec::new(),
             menu_items: Vec::new(),
             menu_generation: Generation::FIRST,
@@ -125,6 +156,7 @@ impl ElmCore {
             next_audit_sequence: 1,
             dropped_audit_count: 0,
             next_cell_id: FIRST_DYNAMIC_CELL_ID,
+            next_port_id: FIRST_DYNAMIC_PORT_ID,
             next_binding_id: 100,
             next_lease_id: 100,
             next_action_id: 100,
@@ -331,6 +363,254 @@ impl ElmCore {
             push_plain(&mut out, &record);
         }
         out
+    }
+
+    pub fn provider_ports_bytes(&self) -> Vec<u8> {
+        let header = ElmProviderPortStatsHeader::new(
+            self.providers.len() as u32,
+            self.last_event_sequence(),
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for provider in &self.providers {
+            let Some(port) = self.port_desc(provider.port) else {
+                continue;
+            };
+            let record = ElmProviderPortRecord::new(
+                provider.port.0,
+                provider.owner.map(|owner| owner.0).unwrap_or(0),
+                provider.access as u32,
+                port.direction as u32,
+                port.mode as u32,
+                port.implemented,
+                port.invokable,
+                self.provider_binding_count(provider.port) as u32,
+                provider.calls,
+                provider.failed_calls,
+                provider.revokes,
+                port.contract,
+            );
+            push_plain(&mut out, &record);
+        }
+        out
+    }
+
+    pub fn provider_stats_bytes(&self) -> Vec<u8> {
+        let header = ElmProviderPortStatsHeader::new_stats(
+            self.providers.len() as u32,
+            self.last_event_sequence(),
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for provider in &self.providers {
+            let record = ElmProviderPortStatsRecord::new(
+                provider.port.0,
+                provider.owner.map(|owner| owner.0).unwrap_or(0),
+                self.provider_binding_count(provider.port) as u32,
+                provider.calls,
+                provider.failed_calls,
+                provider.revokes,
+            );
+            push_plain(&mut out, &record);
+        }
+        out
+    }
+
+    pub fn register_provider_port(
+        &mut self,
+        request: ElmProviderPortRegisterRequest,
+    ) -> ElmProviderPortRegisterResponse {
+        let owner = ElmId(request.owner_cell_id);
+        let mut blockers = 0;
+        let access = match ElmPortAccessPolicy::from_raw(request.access_policy) {
+            Some(access) => access,
+            None => {
+                blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+                ElmPortAccessPolicy::Internal
+            }
+        };
+        let direction = match FlowDirection::from_raw(request.direction) {
+            Some(direction) => direction,
+            None => {
+                blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+                FlowDirection::Control
+            }
+        };
+        let mode = match FlowMode::from_raw(request.mode) {
+            Some(mode) => mode,
+            None => {
+                blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+                FlowMode::Shared
+            }
+        };
+        let Some(contract) = provider_request_contract(&request) else {
+            blockers |= ELM_POLICY_BLOCK_CONTRACT_MISMATCH;
+            return self.provider_register_response(owner, PortId(0), access, blockers);
+        };
+        if FlowContract::new(contract).is_err() {
+            blockers |= ELM_POLICY_BLOCK_CONTRACT_MISMATCH;
+        }
+        let owner_state = self.cell_state(owner);
+        if owner_state.is_none() {
+            blockers |= ELM_POLICY_BLOCK_CELL_NOT_FOUND;
+        } else if !matches!(
+            owner_state.unwrap(),
+            ElmState::Loaded | ElmState::Linked | ElmState::Ready | ElmState::Active
+        ) {
+            blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+        }
+        if self.ports.iter().any(|port| port.desc.contract == contract) {
+            blockers |= ELM_POLICY_BLOCK_DUPLICATE_BINDING;
+        }
+        let ops = if request.flags & ELM_PROVIDER_PORT_FLAG_TEST_ECHO != 0 {
+            ProviderOpsKind::TestEcho
+        } else {
+            blockers |= ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND;
+            ProviderOpsKind::Builtin
+        };
+        if !matches!(direction, FlowDirection::Control | FlowDirection::Duplex) {
+            blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+        }
+        if blockers != 0 {
+            return self.provider_register_response(owner, PortId(0), access, blockers);
+        }
+
+        let port = self.alloc_port_id();
+        let contract_static = leak_contract(contract);
+        let desc = PortDescriptor {
+            id: port,
+            owner: Some(owner),
+            contract: contract_static,
+            direction,
+            mode,
+            access,
+            invokable: true,
+            implemented: true,
+        };
+        self.register_port(desc);
+        self.providers.push(ProviderRuntime {
+            port,
+            owner: Some(owner),
+            access,
+            ops,
+            dynamic: true,
+            calls: 0,
+            failed_calls: 0,
+            revokes: 0,
+        });
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_PROVIDER_REGISTER,
+            owner,
+            0,
+            state_code(self.cell_state(owner).unwrap_or(ElmState::Active)),
+        );
+        ElmProviderPortRegisterResponse::new(owner.0, port.0, ELM_MGR_STATUS_OK, access as u32, 0)
+    }
+
+    pub fn unregister_provider_port(
+        &mut self,
+        request: ElmProviderPortUnregisterRequest,
+    ) -> ElmProviderPortRegisterResponse {
+        let port = PortId(request.port_id);
+        let Some(index) = self.provider_index(port) else {
+            return ElmProviderPortRegisterResponse::new(
+                0,
+                request.port_id,
+                ELM_MGR_STATUS_NOT_FOUND,
+                0,
+                ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+            );
+        };
+        let provider = self.providers[index].clone();
+        let owner = provider.owner.unwrap_or(ElmId(0));
+        let blockers = if !provider.dynamic {
+            ELM_POLICY_BLOCK_BUILTIN_PROTECTED
+        } else if self.provider_binding_count(port) != 0 {
+            ELM_POLICY_BLOCK_PROVIDER_BUSY
+        } else {
+            0
+        };
+        if blockers != 0 {
+            self.record_mgr_audit(
+                ELM_MGR_ACTION_PROVIDER_UNREGISTER,
+                owner,
+                blockers,
+                self.cell_state(owner).map(state_code).unwrap_or(0),
+            );
+            return ElmProviderPortRegisterResponse::new(
+                owner.0,
+                port.0,
+                status_from_blockers(blockers),
+                provider.access as u32,
+                blockers,
+            );
+        }
+        self.providers.remove(index);
+        self.ports.retain(|runtime| runtime.desc.id != port);
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_PROVIDER_UNREGISTER,
+            owner,
+            0,
+            self.cell_state(owner).map(state_code).unwrap_or(0),
+        );
+        ElmProviderPortRegisterResponse::new(
+            owner.0,
+            port.0,
+            ELM_MGR_STATUS_OK,
+            provider.access as u32,
+            0,
+        )
+    }
+
+    pub fn invoke_provider(
+        &mut self,
+        request: ElmProviderInvokeRequest,
+    ) -> Result<ElmProviderInvokeResponse, i32> {
+        let frame = request.frame;
+        if usize::from(frame.payload_len) > frame.payload.len() {
+            return Err(ELM_MGR_STATUS_INVALID);
+        }
+        let binding = BindingId(frame.binding_id);
+        let Some(edge) = self.graph.capability_binding(binding).cloned() else {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        };
+        if !edge.active {
+            return Err(ELM_MGR_STATUS_INVALID);
+        }
+        let Some(lease) = edge.lease else {
+            return Err(ELM_MGR_STATUS_INVALID);
+        };
+        if self.leases.get(lease).is_none() {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        }
+        let Some(provider_index) = self.provider_index(edge.port) else {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        };
+        let Some(port) = self.port_desc(edge.port) else {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        };
+        if !port.invokable {
+            self.providers[provider_index].failed_calls = self.providers[provider_index]
+                .failed_calls
+                .saturating_add(1);
+            return Err(ELM_MGR_STATUS_UNSUPPORTED);
+        }
+        let reply = match self.providers[provider_index].ops {
+            ProviderOpsKind::Builtin => {
+                self.providers[provider_index].failed_calls = self.providers[provider_index]
+                    .failed_calls
+                    .saturating_add(1);
+                ElmReplyFrame::empty(binding.0, frame.call_id, ELM_MGR_STATUS_UNSUPPORTED)
+            }
+            ProviderOpsKind::TestEcho => self.invoke_test_echo(provider_index, frame),
+        };
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_PROVIDER_INVOKE,
+            edge.consumer,
+            0,
+            self.cell_state(edge.consumer).map(state_code).unwrap_or(0),
+        );
+        Ok(ElmProviderInvokeResponse::new(reply))
     }
 
     pub fn submit_runtime_log(
@@ -545,6 +825,9 @@ impl ElmCore {
                 if request_contract != Some(desc.contract) {
                     blockers |= ELM_POLICY_BLOCK_CONTRACT_MISMATCH;
                 }
+                if !self.provider_access_allowed(id, desc) {
+                    blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+                }
                 // 已实现端口才允许进入真实绑定提交路径；其它端口只暴露描述和预检。
                 if !self.is_bind_supported_port(desc) {
                     blockers |= ELM_POLICY_BLOCK_PORT_TODO;
@@ -649,6 +932,9 @@ impl ElmCore {
                     LeaseKind::RuntimePort,
                     LeaseRights::READ,
                 )
+            }
+            Some(desc) if self.provider_index(desc.id).is_some() => {
+                self.attach_provider_binding(id, port, contract, binding, lease)
             }
             _ => Err(ElmError::PortNotFound),
         };
@@ -783,6 +1069,7 @@ impl ElmCore {
 
         self.remove_owned_binding(edge.consumer, edge.id);
         self.remove_runtime_binding(edge.id);
+        self.note_provider_revoke(edge.port);
         let removed_menu_items = if edge.port == ELM_MGR_MENU_PORT_ID {
             self.remove_menu_items_owned_by(edge.consumer)
         } else {
@@ -905,6 +1192,9 @@ impl ElmCore {
                 }
                 if self.leases.busy_owned_by(id) != 0 {
                     blockers |= ELM_POLICY_BLOCK_LEASE_BUSY;
+                }
+                if self.provider_busy_owned_by(id) != 0 {
+                    blockers |= ELM_POLICY_BLOCK_PROVIDER_BUSY;
                 }
             }
             ElmLifecycleAction::Replace => {
@@ -1147,6 +1437,9 @@ impl ElmCore {
         let removed_menu_items = self.remove_menu_items_owned_by(id);
         let removed_bindings = self.take_owned_bindings(id);
         for binding in removed_bindings {
+            if let Some(edge) = self.graph.capability_binding(binding).cloned() {
+                self.note_provider_revoke(edge.port);
+            }
             self.remove_runtime_binding(binding);
             self.emit_binding(TopologyEventKind::BindingRemoved, binding);
         }
@@ -1196,9 +1489,10 @@ impl ElmCore {
 
     pub fn debug_dump_bytes(&self) -> Vec<u8> {
         let mut out = format!(
-            "ELM Core 诊断\ncells={}\nports={}\nbindings={}\nleases={}\nruntime_ports={}\nmenu_items={}\nlast_event_sequence={}\n",
+            "ELM Core 诊断\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nmenu_items={}\nlast_event_sequence={}\n",
             self.cells.len(),
             self.ports.len(),
+            self.providers.len(),
             self.graph.capability_bindings().len(),
             self.lease_count(),
             self.runtime_ports.len(),
@@ -1229,12 +1523,33 @@ impl ElmCore {
         for port in &self.ports {
             out.push_str(
                 format!(
-                    "port id={} contract={} direction={:?} mode={:?} implemented={}\n",
+                    "port id={} owner={} contract={} direction={:?} mode={:?} access={:?} invokable={} implemented={}\n",
                     port.desc.id.0,
+                    port.desc.owner.map(|owner| owner.0).unwrap_or(0),
                     port.desc.contract,
                     port.desc.direction,
                     port.desc.mode,
+                    port.desc.access,
+                    port.desc.invokable,
                     port.desc.implemented,
+                )
+                .as_str(),
+            );
+        }
+        out.push_str("[providers]\n");
+        for provider in &self.providers {
+            out.push_str(
+                format!(
+                    "provider port={} owner={} access={:?} ops={:?} dynamic={} bindings={} calls={} failed_calls={} revokes={}\n",
+                    provider.port.0,
+                    provider.owner.map(|owner| owner.0).unwrap_or(0),
+                    provider.access,
+                    provider.ops,
+                    provider.dynamic,
+                    self.provider_binding_count(provider.port),
+                    provider.calls,
+                    provider.failed_calls,
+                    provider.revokes,
                 )
                 .as_str(),
             );
@@ -1295,6 +1610,18 @@ impl ElmCore {
     fn register_builtin_ports(&mut self) {
         for desc in builtin_port_descriptors() {
             self.register_port(desc);
+            if desc.implemented {
+                self.providers.push(ProviderRuntime {
+                    port: desc.id,
+                    owner: desc.owner,
+                    access: desc.access,
+                    ops: ProviderOpsKind::Builtin,
+                    dynamic: false,
+                    calls: 0,
+                    failed_calls: 0,
+                    revokes: 0,
+                });
+            }
         }
         log::info!("[elm] registered {} Nexus ports", self.ports.len());
     }
@@ -1450,12 +1777,106 @@ impl ElmCore {
 
     fn is_bind_supported_port(&self, desc: PortDescriptor) -> bool {
         desc.implemented
-            && matches!(
+            && (matches!(
                 (desc.id, desc.contract),
                 (ELM_CORE_LOG_PORT_ID, ELM_CORE_LOG_CONTRACT)
                     | (ELM_CORE_EVENT_PORT_ID, ELM_CORE_EVENT_CONTRACT)
                     | (ELM_MGR_MENU_PORT_ID, ELM_MGR_MENU_CONTRACT)
-            )
+            ) || self.provider_index(desc.id).is_some())
+    }
+
+    fn provider_register_response(
+        &mut self,
+        owner: ElmId,
+        port: PortId,
+        access: ElmPortAccessPolicy,
+        blockers: u64,
+    ) -> ElmProviderPortRegisterResponse {
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_PROVIDER_REGISTER,
+            owner,
+            blockers,
+            self.cell_state(owner).map(state_code).unwrap_or(0),
+        );
+        ElmProviderPortRegisterResponse::new(
+            owner.0,
+            port.0,
+            status_from_blockers(blockers),
+            access as u32,
+            blockers,
+        )
+    }
+
+    fn provider_index(&self, port: PortId) -> Option<usize> {
+        self.providers
+            .iter()
+            .position(|provider| provider.port == port)
+    }
+
+    fn provider_binding_count(&self, port: PortId) -> usize {
+        self.graph
+            .capability_bindings()
+            .iter()
+            .filter(|edge| edge.active && edge.port == port)
+            .count()
+    }
+
+    fn provider_busy_owned_by(&self, owner: ElmId) -> usize {
+        self.providers
+            .iter()
+            .filter(|provider| provider.owner == Some(owner))
+            .map(|provider| self.provider_binding_count(provider.port))
+            .sum()
+    }
+
+    fn provider_access_allowed(&self, consumer: ElmId, desc: PortDescriptor) -> bool {
+        match desc.access {
+            ElmPortAccessPolicy::Public => true,
+            ElmPortAccessPolicy::Internal => desc.owner == Some(consumer),
+            ElmPortAccessPolicy::ExtensionOnly => {
+                let Some(owner) = desc.owner else {
+                    return false;
+                };
+                owner == consumer
+                    || self
+                        .graph
+                        .extensions()
+                        .iter()
+                        .any(|edge| edge.extension == consumer && edge.target == owner)
+            }
+        }
+    }
+
+    fn invoke_test_echo(&mut self, provider_index: usize, frame: ElmCallFrame) -> ElmReplyFrame {
+        let payload_len = usize::from(frame.payload_len);
+        match frame.opcode {
+            1 => {
+                self.providers[provider_index].calls =
+                    self.providers[provider_index].calls.saturating_add(1);
+                ElmReplyFrame::new(
+                    frame.binding_id,
+                    frame.call_id,
+                    ELM_MGR_STATUS_OK,
+                    &frame.payload[..payload_len],
+                )
+            }
+            2 => {
+                self.providers[provider_index].calls =
+                    self.providers[provider_index].calls.saturating_add(1);
+                let provider = &self.providers[provider_index];
+                let mut payload = [0u8; 24];
+                payload[0..8].copy_from_slice(&provider.calls.to_le_bytes());
+                payload[8..16].copy_from_slice(&provider.failed_calls.to_le_bytes());
+                payload[16..24].copy_from_slice(&provider.revokes.to_le_bytes());
+                ElmReplyFrame::new(frame.binding_id, frame.call_id, ELM_MGR_STATUS_OK, &payload)
+            }
+            _ => {
+                self.providers[provider_index].failed_calls = self.providers[provider_index]
+                    .failed_calls
+                    .saturating_add(1);
+                ElmReplyFrame::empty(frame.binding_id, frame.call_id, ELM_MGR_STATUS_UNSUPPORTED)
+            }
+        }
     }
 
     fn runtime_port_index(&self, binding: BindingId) -> Option<usize> {
@@ -1529,6 +1950,12 @@ impl ElmCore {
     fn remove_runtime_binding(&mut self, binding: BindingId) {
         self.runtime_ports
             .retain(|runtime| runtime.binding != binding);
+    }
+
+    fn note_provider_revoke(&mut self, port: PortId) {
+        if let Some(index) = self.provider_index(port) {
+            self.providers[index].revokes = self.providers[index].revokes.saturating_add(1);
+        }
     }
 
     fn bind_failure_response(
@@ -1691,6 +2118,46 @@ impl ElmCore {
             delivered_events: 0,
             dropped_events: 0,
         });
+        self.emit_binding(TopologyEventKind::BindingAdded, binding);
+        self.emit_lease(TopologyEventKind::LeaseAdded, lease);
+        Ok(())
+    }
+
+    fn attach_provider_binding(
+        &mut self,
+        id: ElmId,
+        port: PortId,
+        contract: FlowContract,
+        binding: BindingId,
+        lease: LeaseId,
+    ) -> Result<(), ElmError> {
+        let generation = self
+            .cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| cell.generation)
+            .ok_or(ElmError::CellNotFound)?;
+        self.graph
+            .add_capability_binding(binding, id, port, contract, generation, Some(lease))?;
+        if let Err(err) = self.leases.insert(
+            ResourceLease::new(
+                lease,
+                id,
+                LeaseKind::Provider,
+                LeaseRights::CONTROL,
+                generation,
+            )
+            .with_binding(binding),
+        ) {
+            let _ = self.graph.remove_capability_binding(binding);
+            return Err(err);
+        }
+        let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) else {
+            let _ = self.leases.revoke_and_remove(lease);
+            let _ = self.graph.remove_capability_binding(binding);
+            return Err(ElmError::CellNotFound);
+        };
+        cell.owned_bindings.push(binding);
         self.emit_binding(TopologyEventKind::BindingAdded, binding);
         self.emit_lease(TopologyEventKind::LeaseAdded, lease);
         Ok(())
@@ -1877,6 +2344,13 @@ impl ElmCore {
     }
 
     #[allow(dead_code)]
+    fn alloc_port_id(&mut self) -> PortId {
+        let id = PortId(self.next_port_id);
+        self.next_port_id += 1;
+        id
+    }
+
+    #[allow(dead_code)]
     fn alloc_binding_id(&mut self) -> BindingId {
         let id = BindingId(self.next_binding_id);
         self.next_binding_id += 1;
@@ -1971,6 +2445,18 @@ fn request_contract(request: &ElmNexusBindRequest) -> Option<&str> {
         return None;
     }
     core::str::from_utf8(&request.contract[..len]).ok()
+}
+
+fn provider_request_contract(request: &ElmProviderPortRegisterRequest) -> Option<&str> {
+    let len = usize::from(request.contract_len);
+    if len == 0 || len > request.contract.len() {
+        return None;
+    }
+    core::str::from_utf8(&request.contract[..len]).ok()
+}
+
+fn leak_contract(contract: &str) -> &'static str {
+    Box::leak(contract.to_string().into_boxed_str())
 }
 
 fn runtime_status_blocker(status: i32) -> u64 {

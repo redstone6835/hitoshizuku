@@ -4,19 +4,22 @@
 
 ELM，全称 **Extensible Loadable Module**，中文统一称为 **可拓展内核单元**。
 
-ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机和能力边界；`elm-mgr` 提供策略、菜单、依赖选择、用户可见管理和运行拓扑编排。
+ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 提供策略、菜单、依赖选择、外部管理入口和运行拓扑编排。
 
 ELM 的基本原则：
 
 - 不兼容 Linux `init_module`、`finit_module`、`delete_module` ABI。
 - 不采用 `ko`、`modprobe`、`export_symbol`、GPL namespace 等传统模型。
 - 不把 ELM 简化为“装入一段代码并调用 init/exit”。
+- 不让 ELM 直接依赖内核内部 trait、裸指针或不稳定符号。
 - ELM 面向 Rust 框架开发；C/C++ 兼容和许可证策略暂不进入目标。
 - 开机时内核加载根管理单元 `elm-mgr`。
 - 后续所有 ELM 都是 `elm-mgr` 管理树下的子单元。
-- 一个 ELM 可以拓展另一个 ELM。
-- ELM 之间可以同时存在父子、依赖、提供和拓展关系。
+- 一个 ELM 可以拓展另一个 ELM，也可以被另一个 ELM 拓展。
+- ELM 之间可以同时存在父子、依赖、提供、拓展和能力绑定关系。
 - ELM 支持热插拔、热替换、暂停、恢复、故障隔离和回滚。
+
+当前设计走向是：ELM 不再被视为“内核模块加载器”，而是收敛为 **能力织网运行时**。内核单元不通过符号互相链接，而是通过带版本的流契约连接到织网端口。资源访问通过租约完成，生命周期变更通过预检和提交完成，运行时状态通过快照、事件和审计可观测。
 
 ## 2. 统一中文术语
 
@@ -26,6 +29,7 @@ ELM 的基本原则：
 | elm-mgr | 单元管理器 | 启动期根管理单元，负责策略和用户可见管理 |
 | Nexus | 能力织网 | ELM 之间和内核能力之间的运行时连接网络 |
 | Nexus Port | 织网端口 | 能力织网中可绑定的能力入口或出口 |
+| Port Provider | 端口提供者 | 向能力织网注册端口并执行端口语义的内核或 ELM 实体 |
 | Flow Contract | 流契约 | 描述一次能力流的输入、输出、错误、并发和背压语义 |
 | Intent | 能力意图 | 内核单元声明自己想消费、提供、拓展或观察的能力 |
 | Offer | 能力提供 | 内核单元声明自己能提供的能力 |
@@ -43,8 +47,8 @@ ELM 的基本原则：
 | Faulted | 故障态 | 单元运行时发生不可继续的错误 |
 | Quarantined | 隔离态 | 故障单元被禁止接收普通流，只允许诊断和退役 |
 | Topology | 运行拓扑 | 当前所有单元、关系、端口、绑定和租约的可观测快照 |
-| Manifest | 单元清单 | ELM 包中的自描述元数据 |
-| EBI | ELM 二进制装载接口 | ELM Binary Interface，描述 ELM Core 消费的稳定装载协议，不是文件格式 |
+| Manifest | 单元清单 | ELM 的自描述元数据 |
+| EBI | ELM 二进制装载接口 | ELM Core 消费的稳定装载协议对象，不是文件格式 |
 | soyo | soyo 可执行容器 | 未来承载 ELM 的可执行文件格式，负责解析文件并导出 EBI 协议对象 |
 
 ## 3. 总体架构
@@ -64,11 +68,12 @@ ELM 的基本原则：
 内核 ELM Core 负责硬约束：
 
 - 加载启动期 `elm-mgr`。
-- 维护真实状态机、运行拓扑、资源租约和绑定图。
-- 校验单元清单、架构匹配、能力权限和依赖合法性。
+- 维护真实状态机、运行拓扑、资源租约、事件序列、审计环和绑定图。
+- 校验单元清单、目标架构、ABI 版本、能力权限、依赖合法性和端口契约。
 - 执行静默化、脱离、退役、故障隔离等安全流程。
 - 提供私有系统调用 `sys_elm_ctl`。
 - 将现有内核子系统桥接成能力织网端口。
+- 保留 EBI 协议对象装载入口，等待 `soyo` 容器解析器接入。
 
 `elm-mgr` 负责策略：
 
@@ -77,6 +82,7 @@ ELM 的基本原则：
 - 决定加载、卸载、启用、禁用、替换和配置策略。
 - 编排普通 ELM 之间的依赖、拓展和能力绑定。
 - 处理外部工具通过 `sys_elm_ctl` 发送的管理请求。
+- 将策略结果转化为内核可验证的预检和提交操作。
 
 普通 ELM 负责能力：
 
@@ -84,8 +90,51 @@ ELM 的基本原则：
 - 通过织网端口参与能力流。
 - 通过资源租约访问内核资源。
 - 遵守状态机、热插拔和故障隔离规则。
+- 不持有裸内核对象指针，不直接调用未声明的内核内部接口。
 
-## 4. 能力织网
+## 4. 核心运行模型
+
+ELM 的运行模型由五个对象构成：
+
+- 内核单元：运行时可管理的最小实体，具有 `ElmId`、名称、类型、状态、切换代和 EBI 装载状态。
+- 织网端口：能力织网中的稳定连接点，具有 `PortId`、流契约、方向、模式和实现状态。
+- 能力绑定：把一个内核单元连接到一个织网端口，具有 `BindingId`、契约、切换代、活动状态和可选租约。
+- 资源租约：把绑定后的资源引用收敛到可撤销对象，具有 `LeaseId`、所有者、类型、权限、状态、活跃引用数和切换代。
+- 事件记录：把单元、端口、绑定和租约变化变成固定布局事件，供管理工具和运行时端口读取。
+
+典型控制路径：
+
+```text
+外部工具
+    -> sys_elm_ctl(MGR_CALL)
+        -> elm-mgr 管理通道
+            -> ELM Core 预检
+                -> ELM Core 提交
+                    -> 绑定图、租约表、事件环、审计环更新
+```
+
+典型运行路径：
+
+```text
+内核单元
+    -> 声明能力意图
+        -> elm-mgr 选择端口
+            -> ELM Core 创建能力绑定
+                -> ELM Core 创建资源租约
+                    -> 端口提供者执行真实语义
+```
+
+当前已经形成闭环的运行路径：
+
+- `core.log@1`：单元通过运行时绑定提交固定长度日志，内核写入日志系统，并累计提交次数。
+- `core.event@1`：单元通过运行时绑定按游标读取 ELM 事件，确认事件游标，并统计投递和丢弃事件数。
+- `mgr.menu.item@1`：单元通过菜单绑定向 `elm-mgr` 注册菜单项，菜单项与绑定、租约处于同一撤销链路。
+- 动态端口提供者：内核单元可以注册带访问策略的 provider 端口，消费者通过能力绑定获得 `Provider` 租约。
+- 同步调用帧：消费者可以通过 `ElmCallFrame` 调用可调用 provider，provider 返回 `ElmReplyFrame`。
+
+第一版同步调用帧固定内联载荷为 256 字节。调用帧只表达 `binding_id`、`call_id`、`opcode`、`flags` 和 payload，不携带指针，也不绑定文件格式。当前内核提供 `test.echo@1` 测试 provider：`opcode=1` 原样返回 payload，`opcode=2` 返回 provider 调用统计。它用于在 `soyo` 和原生执行器接入前验证完整绑定、调用、撤销和观测链路。
+
+## 5. 能力织网
 
 ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交互都经过能力织网。
 
@@ -95,37 +144,83 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
         绑定织网端口
             获得资源租约
                 参与流契约
-                    由事件反应器处理事件
+                    由端口提供者或事件反应器处理事件
 ```
 
 织网端口代表一种可组合能力。它可以表示设备事件、文件系统操作、网络包流、IRQ 事件、菜单项注册、配置变更或诊断输出。内核内部可以存在桥接层，但 ELM 看到的稳定边界永远是织网端口、流契约和资源租约。
 
-示例端口：
+流契约格式：
 
-- `core.log@1`
-- `core.event@1`
-- `mgr.menu.item@1`
-- `mgr.action.invoke@1`
-- `device.discovered@1`
-- `device.claim@1`
-- `irq.event@1`
-- `dma.buffer@1`
-- `mmio.window@1`
-- `io.block.submit@1`
-- `io.packet.rx@1`
-- `io.packet.tx@1`
-- `vfs.lookup@1`
-- `vfs.read@1`
-- `vfs.write@1`
+- 使用 `name@version` 形式。
+- 名称只允许小写字母、数字、`.`、`-` 和 `_`。
+- 版本只允许数字和 `.`。
+- 契约字符串是兼容性边界，不能用 Rust 类型名或内核内部符号替代。
 
-## 5. 关系模型
+流方向：
 
-ELM 关系分为四类：
+- `Source`：端口产生事件或数据。
+- `Sink`：端口消费事件或数据。
+- `Duplex`：端口双向交互。
+- `Control`：端口提供控制面请求响应语义。
+
+流模式：
+
+- `Exclusive`：同一时刻只允许一个有效消费者或提供者。
+- `Shared`：允许多个绑定共享。
+- `Ordered`：要求按绑定或提交顺序处理。
+- `Pipeline`：面向流式数据处理。
+- `Broadcast`：向多个绑定广播事件。
+
+并发与背压模型已经在模型层预留：
+
+- 并发：`Single`、`Parallel`、`Reentrant`。
+- 背压：`Drop`、`Queue`、`Stall`、`Reject`。
+
+当前实现先把方向和模式纳入端口描述，后续端口执行器必须把并发和背压纳入真实调度策略。
+
+## 6. 内建织网端口
+
+| 端口 | 方向 | 模式 | 当前状态 | 设计语义 |
+| --- | --- | --- | --- | --- |
+| `core.log@1` | Sink | Shared | 已实现 | 单元向内核日志提交固定长度运行时日志 |
+| `core.event@1` | Source | Broadcast | 已实现 | 单元按游标读取 ELM 拓扑和管理事件 |
+| `mgr.menu.item@1` | Sink | Ordered | 已实现 | 单元向 `elm-mgr` 注册菜单项 |
+| `mgr.action.invoke@1` | Control | Shared | TODO(elm) | 菜单动作和管理动作调用入口 |
+| `device.discovered@1` | Source | Broadcast | TODO(elm) | 设备发现事件流 |
+| `device.claim@1` | Control | Exclusive | TODO(elm) | 设备声明、抢占和释放控制 |
+| `irq.event@1` | Source | Shared | TODO(elm) | IRQ 事件分发 |
+| `dma.buffer@1` | Duplex | Shared | TODO(elm) | DMA 缓冲区申请、映射、同步和释放 |
+| `mmio.window@1` | Duplex | Shared | TODO(elm) | MMIO 窗口映射和访问租约 |
+| `io.block.submit@1` | Sink | Shared | TODO(elm) | 块 I/O 请求提交 |
+| `io.packet.rx@1` | Source | Pipeline | TODO(elm) | 网络包接收流 |
+| `io.packet.tx@1` | Sink | Pipeline | TODO(elm) | 网络包发送流 |
+| `vfs.lookup@1` | Control | Shared | TODO(elm) | VFS 路径查找控制面 |
+| `vfs.read@1` | Control | Shared | TODO(elm) | VFS 读控制面 |
+| `vfs.write@1` | Control | Shared | TODO(elm) | VFS 写控制面 |
+
+这些端口不是最终能力集合，只是启动期内建端口。后续完整 ELM 设计中，端口提供者也可以来自 ELM 本身：一个 ELM 可以声明新的能力提供，经过 `elm-mgr` 策略和 ELM Core 校验后，把新端口注册进能力织网。这样设备类型、VFS 扩展点、网络处理链、诊断能力和子管理能力都不需要写死在核心中。
+
+动态端口访问策略：
+
+- `Public`：任意合法 cell 可绑定。
+- `ExtensionOnly`：只有 provider owner 自身或挂接到 owner 的拓展单元可绑定。
+- `Internal`：只允许 owner 自身绑定，保留给内核内部 provider。
+
+动态端口注销规则：
+
+- 内建 provider 端口不可注销。
+- 动态 provider 端口仍有活跃 binding 时返回 busy。
+- 注销成功会移除 provider runtime 和端口描述，但不会影响已经撤销的历史审计记录。
+
+## 7. 关系模型
+
+ELM 关系分为五类：
 
 - 父子关系：描述管理归属。
 - 依赖关系：描述启动和运行前置条件。
 - 提供关系：描述当前单元对外提供的能力。
 - 拓展关系：描述当前单元挂接到另一个单元开放的拓展点。
+- 能力绑定关系：描述当前单元连接到某个织网端口。
 
 规则：
 
@@ -136,9 +231,12 @@ ELM 关系分为四类：
 - 被拓展单元必须声明对应拓展点。
 - 拓展项必须匹配拓展点的流契约。
 - 能力提供必须带版本号。
+- 能力绑定不能重复绑定同一个活动的 `(cell, port, contract)`。
 - 能力绑定由 `elm-mgr` 决定策略，内核负责合法性校验。
 
-## 6. 生命周期
+当前内核中的 `elm-mgr` 已开放 `menu.item` 拓展点，内建 `elm-menu-demo` 作为 `elm-mgr` 子单元挂接到该拓展点。动态绑定路径已经可以为 `mgr.menu.item@1`、`core.log@1` 和 `core.event@1` 创建真实绑定和租约。
+
+## 8. 生命周期
 
 ```text
 Discovered -> Verified -> Loaded -> Linked -> Ready -> Active
@@ -176,7 +274,16 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 - 资源租约未撤销不能退役。
 - 故障单元不能继续接收普通流，只允许诊断、隔离和退役。
 
-## 7. 热插拔与热替换
+当前生命周期实现：
+
+- `PauseCell` 支持动态、非原生单元从 `Active` 进入 `Quiescing` 再进入 `Paused`。
+- `ResumeCell` 支持动态、非原生单元从 `Paused` 回到 `Active`。
+- `DetachCell` 支持动态单元撤销租约、移除菜单项、摘除绑定图并退役。
+- `PreflightLifecycle` 会返回阻断位、最终状态和受影响的子单元、依赖者、拓展项数量。
+- 内建单元受保护，默认不能被暂停、脱离或替换。
+- 含原生代码的已激活单元仍阻断生命周期操作，直到卸载执行器完成。
+
+## 9. 热插拔与热替换
 
 热插拔是能力图重排，而不是简单释放代码。
 
@@ -215,35 +322,55 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 - 新流进入新代。
 - 切换失败可以回滚旧绑定。
 - 状态迁移必须显式声明状态版本和迁移函数。
+- 热替换不能绕过父子、依赖、拓展和租约阻断检查。
 
-## 8. 资源租约
+当前 `ReplaceCell` 只保留稳定命令号和结构化预检响应，会记录 `REPLACE_TODO` 审计。完整热替换仍是 `TODO(elm)`：需要影子绑定、状态迁移、切换代回滚、端口执行器暂停和原生代码卸载协作。
+
+## 10. 资源租约
 
 ELM 不保存裸内核对象指针。所有资源都必须通过资源租约访问。
 
-资源租约包括：
+资源租约类型：
 
-- 设备租约
-- IRQ 租约
-- DMA 租约
-- MMIO 租约
-- VFS 节点租约
-- 网络接口租约
-- 块设备租约
-- 菜单项租约
-- 提供者引用租约
+- `Device`：设备对象租约。
+- `Irq`：中断事件或中断线租约。
+- `Dma`：DMA 缓冲区和映射租约。
+- `Mmio`：MMIO 窗口租约。
+- `VfsNode`：VFS 节点租约。
+- `Network`：网络接口或队列租约。
+- `Block`：块设备或请求队列租约。
+- `MenuItem`：菜单项租约。
+- `Provider`：能力提供者引用租约。
+- `RuntimePort`：当前运行时端口绑定租约。
+- `Other`：暂未细分的资源租约。
+
+租约权限：
+
+- `READ`：只读能力。
+- `WRITE`：写入能力。
+- `CONTROL`：读、写和控制能力。
+
+租约状态：
+
+- `Active`：可使用。
+- `Revoking`：正在撤销。
+- `Revoked`：已撤销。
 
 规则：
 
 - 租约归属到具体内核单元实例。
+- 租约可以绑定到具体 `BindingId`，用于形成撤销链路。
 - 静默化后不能创建新租约。
 - 脱离前必须撤销所有可撤销租约。
 - 仍有活跃引用时退役失败。
-- 租约撤销必须触发对应内核桥接层清理。
+- 租约撤销必须触发对应端口提供者清理。
 - 内核维护最终资源所有权，不能完全交给 `elm-mgr`。
 
-## 9. 私有系统调用
+当前实现已经支持按 owner 撤销、按 binding 查询、busy 检查、撤销并移除单个租约、撤销并移除某个单元拥有的所有租约。`core.log@1` 和 `core.event@1` 使用 `RuntimePort` 租约，`mgr.menu.item@1` 使用菜单项租约。
 
-ELM 不使用 Linux 模块系统调用。建议唯一入口：
+## 11. 私有系统调用
+
+ELM 不使用 Linux 模块系统调用。当前唯一入口：
 
 ```text
 sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
@@ -253,51 +380,524 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 
 - `CORE_QUERY`：查询 ELM Core 能力。
 - `MGR_CALL`：向 `elm-mgr` 发送管理请求。
-- `EVENT_READ`：读取 ELM 事件。
-- `EVENT_ACK`：确认事件。
+- `EVENT_READ`：读取全局 ELM 事件。
+- `EVENT_ACK`：确认全局 ELM 事件。
 - `SNAPSHOT_READ`：读取运行拓扑快照。
 - `DEBUG_DUMP`：读取诊断信息。
 
-外部工具规则：
+权限规则：
 
+- `CORE_QUERY`、`SNAPSHOT_READ`、`EVENT_READ` 和 `EVENT_ACK` 是查询型入口。
+- `MGR_CALL` 和 `DEBUG_DUMP` 当前需要 `SysAdmin` 能力。
 - 外部工具不直接加载普通 ELM。
 - 外部工具只向 `elm-mgr` 发请求。
 - `elm-mgr` 根据策略请求内核执行加载、卸载、替换等操作。
 - 内核负责权限检查、缓冲复制、安全校验和最终状态变更。
+- 管理调用输入上限当前为 4096 字节 payload 加管理调用头。
 
-## 10. 落地结构
+## 12. `elm-mgr` 管理通道 ABI
 
-建议分层：
+`MGR_CALL` 的输入由 `ElmMgrCallHeader` 加 payload 组成，输出由 `ElmMgrResponseHeader` 加可选 payload 组成。所有跨边界结构必须是固定布局，不包含内核指针。
 
-- `libs/elm`：纯模型层，不依赖 `kernel/general/arch`。
-- `kernel/src/elm`：内核 ELM Core。
-- `kernel/src/elm/ports`：内核织网端口提供者。
-- `arch/*/elm`：架构相关 EBI 协议对象装入、重定位、代码页权限和指令缓存同步。
+当前命令号：
 
-第一阶段实现目标：
+| 命令 | 编号 | 当前状态 | 说明 |
+| --- | --- | --- | --- |
+| `QueryMenu` | 1 | 已实现 | 返回菜单快照 |
+| `LoadCell` | 2 | TODO(elm) | 等待 `soyo` 解析器提供 EBI 协议对象 |
+| `DetachCell` | 3 | 已实现部分 | 支持动态单元脱离和退役 |
+| `PauseCell` | 4 | 已实现部分 | 支持动态、非原生单元暂停 |
+| `ResumeCell` | 5 | 已实现部分 | 支持动态、非原生单元恢复 |
+| `ReplaceCell` | 6 | TODO(elm) | 保留命令号，返回结构化预检 |
+| `QueryTopology` | 7 | 已实现 | 返回父子、依赖、拓展点和拓展项关系 |
+| `QueryPolicy` | 8 | 已实现 | 返回策略能力、支持动作和阻断位 |
+| `PreflightLifecycle` | 9 | 已实现 | 生命周期操作预检 |
+| `QueryAudit` | 10 | 已实现 | 返回管理操作审计环 |
+| `QueryNexusBindings` | 11 | 已实现 | 返回能力绑定快照 |
+| `PreflightBind` | 12 | 已实现 | 能力绑定预检 |
+| `CommitBind` | 13 | 已实现部分 | 已支持三个已实现端口 |
+| `PreflightUnbind` | 14 | 已实现 | 能力解绑预检 |
+| `CommitUnbind` | 15 | 已实现 | 能力解绑、租约撤销和菜单项移除 |
+| `SubmitRuntimeLog` | 16 | 已实现 | 通过 `core.log@1` 提交运行时日志 |
+| `ReadRuntimeEvent` | 17 | 已实现 | 通过 `core.event@1` 读取运行时事件 |
+| `AckRuntimeEvent` | 18 | 已实现 | 通过 `core.event@1` 确认事件游标 |
+| `QueryRuntimePorts` | 19 | 已实现 | 返回运行时端口绑定统计 |
+| `RegisterProviderPort` | 20 | 已实现 | 注册动态 provider 端口，当前支持内核函数表测试 provider |
+| `UnregisterProviderPort` | 21 | 已实现 | 注销无活跃 binding 的动态 provider 端口 |
+| `QueryProviderPorts` | 22 | 已实现 | 返回 provider 端口、访问策略、调用统计和绑定数量 |
+| `InvokeProvider` | 23 | 已实现 | 通过 `ElmCallFrame` 同步调用可调用 provider |
+| `QueryProviderStats` | 24 | 已实现 | 返回 provider 端口统计记录 |
 
-- 创建 `libs/elm` 纯模型。
-- 实现单元清单、状态机、绑定图、拓展点、租约模型。
-- host 单测覆盖依赖环、父子环、非法拓展、状态迁移和租约撤销。
-- 不接 Linux 模块系统调用。
-- 不实现 EBI 原生代码装载。
+阻断位用于把策略拒绝转化为可观测原因：
 
-第二阶段实现目标：
+- 内建单元受保护。
+- 目标单元不存在。
+- 当前状态不允许操作。
+- 原生代码生命周期执行器未完成。
+- 存在子单元、依赖者或拓展项。
+- 租约忙碌。
+- 热替换尚未完成。
+- 绑定图不一致。
+- 装载需要 `soyo`。
+- 端口不存在、契约不匹配、绑定重复或端口尚未实现。
+- 绑定不存在或受保护。
+- provider 不存在或 provider 仍有活跃 binding。
 
-- 内核启动时注册内建 `elm-mgr`。
-- 实现 `sys_elm_ctl(CORE_QUERY/SNAPSHOT_READ/MGR_CALL)`。
-- 实现 `mgr.menu.item@1`、`core.log@1` 和 `core.event@1` 三个基础织网端口。
-- 加载一个测试 ELM，作为 `elm-mgr` 菜单拓展。
+## 13. EBI 与 soyo
 
-第三阶段实现目标：
+EBI 的全称是 ELM Binary Interface，中文称为 **ELM 二进制装载接口**。
 
-- EBI 二进制装载接口协议对象。
-- 私有 `LoadCell` 命令号保留，等待 soyo 容器解析器接入。
-- 纯声明单元和菜单拓展单元的内核内部协议装载路径。
-- 原生代码装入、重定位、代码页权限和指令缓存同步。
-- 切换代、热替换、状态迁移和故障隔离。
+EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该把某种磁盘格式写进核心。未来 `soyo` 文件格式负责解析文件、校验容器结构、读取元数据、定位段内容，然后导出 EBI 协议对象。ELM Core 只消费 EBI 协议对象。
 
-## 11. 当前实现进度
+当前 EBI 对象包含：
+
+- `ElmEbiTarget`：目标架构、EBI ABI 版本和最低 Core 版本。
+- `ElmEbiArch`：`Any`、`Riscv64`、`LoongArch64`。
+- `ElmEbiUnit`：清单、目标、菜单声明、段声明和入口声明。
+- `ElmEbiSegment`：段类型、大小和 flags。
+- `ElmEbiEntry`：未来原生入口符号名。
+- `ElmEbiMenuDecl`：菜单项 kind、flags、label、description 和 route。
+- `ElmLoadCellResponse`：装载结果、单元 ID、最终状态和原因。
+
+当前 EBI 校验规则：
+
+- ABI 版本必须匹配 `ELM_EBI_ABI_VERSION`。
+- 目标架构必须匹配当前内核架构，或使用 `Any`。
+- `min_core_version` 不能为 0。
+- 段数量不能超过 `ELM_EBI_MAX_SEGMENTS`。
+- 段大小不能为 0。
+- 原生入口符号不能为空。
+- 菜单 label 和 route 不能为空，并且各字段不能超过固定长度。
+
+当前装载语义：
+
+- 纯声明 EBI 协议对象可进入 `Active`。
+- 菜单拓展 EBI 协议对象可挂接到 `elm-mgr` 的 `menu.item` 拓展点，并创建菜单租约和菜单项。
+- 含代码段、重定位段或原生入口的 EBI 会登记为单元并停在 `Loaded`，返回 `NativeCodeTodo`，不执行代码。
+- `MGR_CALL(LoadCell)` 在 `soyo` 接入前不会接受旧 flat EBI 字节格式，只返回 `TODO(elm)` 并记录 `LOAD_REQUIRES_SOYO` 审计。
+
+尚未完成：
+
+- TODO(elm)：`soyo` 文件格式。
+- TODO(elm)：`soyo` 解析器。
+- TODO(elm)：`soyo` 到 EBI 协议对象转换层。
+- TODO(elm)：代码段映射、重定位、只读页和可执行页权限。
+- TODO(elm)：指令缓存同步。
+- TODO(elm)：原生入口调用、暂停回调、静默化回调和卸载执行器。
+
+## 14. 模型层模块设计：`libs/elm`
+
+`libs/elm` 是纯模型层。它是 `no_std` crate，只描述架构无关、内核无关的协议和模型，不能依赖 `kernel`、`general` 或 `arch`。它的目标是让内核、用户态管理工具、测试和未来 Rust ELM 框架共享同一套稳定数据结构。
+
+### `lib.rs`
+
+职责：
+
+- 声明模型层 crate 的模块边界。
+- 统一 re-export 控制面、EBI、错误、事件、绑定图、ID、租约、清单、菜单、管理通道、能力织网、端口、快照、状态机和拓扑模型。
+- 保持 `libs/elm` 对内核实现无依赖，使模型层可以被内核、host 单测和未来用户态工具复用。
+
+设计细节：
+
+- crate 使用 `#![no_std]` 和 `alloc`。
+- `lib.rs` 是 ELM 稳定模型 API 的聚合出口。
+- 后续新增模型必须先判断是否属于稳定协议层；如果只服务某个内核执行器，不应放入 `libs/elm`。
+
+### `ctl.rs`
+
+职责：
+
+- 定义私有控制面协议。
+- 定义 `ELM_CTL_MAGIC`、`ELM_CTL_ABI_VERSION` 和 Core 能力位。
+- 定义 `ElmCtlCommand`：`CoreQuery`、`MgrCall`、`EventRead`、`EventAck`、`SnapshotRead`、`DebugDump`。
+- 定义 `ElmCtlStatus`，把模型层错误映射为控制面状态。
+- 定义 `ElmCtlHeader` 和 `ElmCoreInfo` 固定布局结构。
+
+设计细节：
+
+- `ElmCoreInfo` 暴露 cell、port、lease 数量和最新事件序列。
+- 能力位当前表示快照、事件和管理通道可用。
+- 控制面只暴露 ELM 自己的 ABI，不承诺 Linux 模块兼容。
+
+### `ebi.rs`
+
+职责：
+
+- 定义 EBI 协议对象。
+- 把未来文件格式和 ELM Core 消费对象解耦。
+- 校验目标架构、ABI 版本、段声明、入口声明和菜单声明。
+
+设计细节：
+
+- `ElmEbiArch::Any` 可用于纯声明单元。
+- `Code` 和 `Relocation` 段会触发原生装载器需求。
+- `entry` 存在时也视为需要原生装载器。
+- 当前 `NativeCodeTodo` 是有意的边界，不允许假装执行原生代码。
+
+### `error.rs`
+
+职责：
+
+- 定义 `ElmError` 和 `ElmResult`。
+- 统一表达重复单元、非法名称、非法版本、非法契约、状态迁移错误、图环、租约 busy、权限拒绝等错误。
+
+设计细节：
+
+- 错误类型服务于模型校验，不直接暴露内核 errno。
+- 控制面和管理通道负责把模型错误转成固定 ABI 状态码。
+
+### `event.rs`
+
+职责：
+
+- 定义固定布局事件记录。
+- 定义事件序列号。
+- 把拓扑事件类型编码成跨边界整数。
+
+设计细节：
+
+- `ElmEventRecord` 包含 sequence、kind、cell、port、binding、lease。
+- 空事件由 `ElmEventRecord::zero()` 表示。
+- 事件记录不携带指针，也不携带可变长度字符串。
+
+### `frame.rs`
+
+职责：
+
+- 定义能力织网同步调用帧。
+- 定义 256 字节固定内联 payload。
+- 定义调用状态码和调用 flags。
+
+设计细节：
+
+- `ElmCallFrame` 携带 binding、call、opcode、flags、payload_len 和 payload。
+- `ElmReplyFrame` 携带 binding、call、status、flags、payload_len 和 payload。
+- 调用帧不携带内核指针，不表达 `soyo` 文件格式，也不依赖原生代码装载器。
+- 当前调用帧用于 `InvokeProvider` 管理测试入口和内核内部 provider runtime。
+
+### `graph.rs`
+
+职责：
+
+- 定义绑定图。
+- 管理父子、依赖、拓展点、拓展项和能力绑定关系。
+- 校验父子环、依赖环、拓展环和重复能力绑定。
+
+设计细节：
+
+- `BindingGraph` 只存模型关系，不执行端口语义。
+- `CapabilityBindingEdge` 记录 binding、consumer、port、contract、generation、lease 和 active。
+- `remove_cell` 会移除相关父子、依赖、拓展和能力绑定边。
+- 图校验是生命周期预检和绑定预检的硬约束。
+
+### `ids.rs`
+
+职责：
+
+- 定义强类型 ID：`ElmId`、`PortId`、`BindingId`、`ActionId`、`LeaseId`、`Generation`。
+
+设计细节：
+
+- 所有 ID 都是 `u64` 新类型，避免把不同 ID 混用。
+- `Generation::FIRST` 为 1，`next()` 用于后续热替换切换代。
+
+### `lease.rs`
+
+职责：
+
+- 定义资源租约模型。
+- 定义租约类型、权限、状态和租约注册表。
+- 提供撤销、busy 检查和按 binding 查询能力。
+
+设计细节：
+
+- `ResourceLease` 可选绑定到 `BindingId`。
+- `begin_revoke` 只允许 `Active -> Revoking`。
+- `finish_revoke` 要求没有活跃引用。
+- `LeaseRegistry` 当前支持按 owner 批量撤销和按 binding 撤销。
+
+### `manifest.rs`
+
+职责：
+
+- 定义单元清单。
+- 定义名称、版本、类型、能力意图和能力提供。
+
+设计细节：
+
+- 名称长度上限 128，版本长度上限 64。
+- 名称只允许小写字母、数字、`.`、`-` 和 `_`。
+- 类型包括 Manager、Service、Driver、Extension、Filesystem、Network、Debug 和 Other。
+- 清单是 ELM 的自描述边界，不包含内核内部类型。
+
+### `menu.rs`
+
+职责：
+
+- 定义 `elm-mgr` 菜单固定布局模型。
+- 定义菜单项类型、flags 和快照结构。
+
+设计细节：
+
+- 菜单项类型包括 Group、Action、Toggle 和 Status。
+- flags 包括 TODO、Disabled 和 RequiresSysAdmin。
+- label、description、route 使用固定长度数组，避免跨边界分配。
+
+### `mgr.rs`
+
+职责：
+
+- 定义 `elm-mgr` 管理通道 ABI。
+- 定义命令号、状态码、策略位、阻断位、生命周期请求响应、拓扑快照、审计快照、绑定快照和运行时端口请求响应。
+
+设计细节：
+
+- 当前命令号稳定到 19。
+- 当前命令号已扩展到 24，新增动态 provider 注册、注销、查询、调用和统计。
+- `ElmMgrPolicyInfo` 暴露支持动作、策略 flags、阻断位 mask 和审计容量。
+- `ElmLifecyclePlanResponse` 用 allowed、status、final_state 和 blockers 表示预检结果。
+- `ElmNexusBindRequest` 使用固定长度契约字段。
+- `ElmRuntimeLogRequest` 使用 256 字节固定日志 payload。
+- `ElmRuntimeEventResponse` 使用 `has_event` 区分是否返回事件。
+- `ElmRuntimePortStatsRecord` 暴露 binding、cell、port、lease、cursor、日志提交数、事件投递数和丢弃事件数。
+- `ElmProviderPortRegisterRequest` 描述 provider owner、契约、方向、模式和访问策略。
+- `ElmProviderInvokeRequest` 和 `ElmProviderInvokeResponse` 封装通用调用帧。
+- `ElmProviderPortRecord` 和 `ElmProviderPortStatsRecord` 暴露 provider 绑定数量和调用统计。
+
+### `nexus.rs`
+
+职责：
+
+- 定义能力织网模型。
+- 定义流契约、能力意图、能力提供、方向、模式、并发和背压。
+
+设计细节：
+
+- `FlowContract` 是稳定兼容边界。
+- `NexusIntent` 表达 Consume、Offer、Extend、Observe 和 Control。
+- `NexusOffer` 表达契约和流模式。
+- 并发和背压先进入模型层，真实调度由后续端口执行器实现。
+
+### `ports.rs`
+
+职责：
+
+- 定义内建织网端口描述。
+- 为启动期 ELM Core 提供端口列表。
+
+设计细节：
+
+- 当前有 15 个内建端口。
+- 已实现端口只有 `core.log@1`、`core.event@1` 和 `mgr.menu.item@1`。
+- 其它端口保留契约和方向，绑定预检会返回 `PORT_TODO`。
+- 端口描述已包含访问策略和是否可调用标记。
+
+### `snapshot.rs`
+
+职责：
+
+- 定义固定布局运行拓扑快照。
+- 定义 cell 和 port 快照结构。
+
+设计细节：
+
+- `ElmSnapshotHeader` 携带 ABI 版本、entry size、cell/port/lease 数量和事件序列。
+- `ElmCellSnapshot` 携带 ID、parent、state、kind、EBI 架构、EBI 状态、是否原生代码、generation 和名称。
+- `ElmPortSnapshot` 携带 ID、owner、方向、模式、实现状态和契约。
+
+### `state.rs`
+
+职责：
+
+- 定义内核单元生命周期状态机。
+- 定义合法状态转移。
+
+设计细节：
+
+- 状态机是生命周期预检和提交的共同约束。
+- 非法转移返回 `InvalidTransition`。
+- 热插拔和热替换必须围绕该状态机扩展，不能临时绕过。
+
+### `topology.rs`
+
+职责：
+
+- 定义拓扑事件模型。
+- 定义拓扑快照模型占位。
+
+设计细节：
+
+- 事件类型包括单元增加、状态变化、绑定增加、绑定移除、租约增加、租约撤销、端口增加、菜单项增加、菜单项移除和单元移除。
+- 当前快照导出主要由 `snapshot.rs` 和管理通道固定布局承担。
+
+### `tests.rs`
+
+职责：
+
+- 提供 host 单测。
+- 覆盖模型层名称校验、契约校验、状态迁移、绑定图环检测、租约撤销、管理通道结构和 EBI 校验。
+
+设计细节：
+
+- 单测必须保持在 host 可运行，避免依赖内核环境。
+- 模型层测试是 ELM ABI 稳定性的第一道保护。
+
+## 15. 内核运行时模块设计：`kernel/src/elm`
+
+`kernel/src/elm` 是内核 ELM Core 的落地层。它把 `libs/elm` 的纯模型转换为真实内核状态、系统调用、事件、日志、菜单、绑定和租约。
+
+### `mod.rs`
+
+职责：
+
+- 组织 ELM 内核模块。
+- 提供初始化入口。
+- 导出 `with_core` 访问全局 ELM Core。
+
+设计细节：
+
+- 初始化时注册内建 `elm-mgr`。
+- 对外隐藏全局锁细节，减少其它模块直接接触核心状态。
+
+### `core.rs`
+
+职责：
+
+- 维护 ELM Core 全局状态。
+- 管理 cells、ports、runtime ports、menu items、leases、events、audits 和 binding graph。
+- 实现绑定、解绑、生命周期、EBI 协议对象装载入口、运行时日志、运行时事件和 debug dump。
+
+设计细节：
+
+- `CellRuntime` 保存单元 ID、parent、state、kind、generation、name、EBI 架构、EBI 状态、是否含原生代码、拥有的绑定和菜单项。
+- `RuntimePortBinding` 保存 binding、cell、port、lease、cursor、submitted_logs、delivered_events 和 dropped_events。
+- `ProviderRuntime` 保存 port、owner、访问策略、函数表类型、是否动态、调用次数、失败次数和撤销次数。
+- 事件环和审计环容量当前均为 128。
+- 动态 cell ID 从 100 开始，避免与内建 ID 冲突。
+- 动态 port ID 从 100 开始，避免与内建端口冲突。
+- 内建 `elm-mgr` ID 为 1，内建菜单 demo ID 为 2。
+- 绑定提交会先做 preflight，再分派到具体端口 attach 路径。
+- `core.log@1` 创建 `RuntimePort` 写租约。
+- `core.event@1` 创建 `RuntimePort` 读租约。
+- `mgr.menu.item@1` 创建菜单租约和菜单项。
+- 动态 provider 端口创建 `Provider` 租约。
+- `test.echo@1` 作为第一版内核函数表测试 provider，用于验证同步调用帧。
+- detach 会阻断仍有子单元、依赖者、拓展项或 busy 租约的目标单元。
+- provider owner detach 会阻断仍有活跃 binding 的 provider 端口。
+- debug dump 会输出 cells、ports、bindings、leases、runtime_ports，并保留未完成边界说明。
+
+### `event.rs`
+
+职责：
+
+- 为 `sys_elm_ctl(EVENT_READ/EVENT_ACK)` 提供全局事件读取和确认辅助。
+
+设计细节：
+
+- 全局事件读取使用 Core 内的 acknowledged sequence。
+- 运行时端口事件读取使用每个 `RuntimePortBinding` 自己的 cursor，两者语义不同。
+
+### `menu.rs`
+
+职责：
+
+- 管理 `elm-mgr` 菜单运行时对象。
+- 把菜单项编码为固定布局快照。
+
+设计细节：
+
+- `MenuItemRuntime` 保存运行时字符串和 owner/action。
+- 快照导出时转换为 `ElmMenuItemSnapshot` 固定数组。
+- 菜单 generation 用于外部工具判断菜单变化。
+
+### `mgr_channel.rs`
+
+职责：
+
+- 分发 `MGR_CALL`。
+- 解析固定布局请求。
+- 封装固定布局响应。
+
+设计细节：
+
+- 所有请求解析都显式检查 payload 长度。
+- 不接受长度不匹配的输入。
+- `LoadCell` 当前只记录 `LOAD_REQUIRES_SOYO` 审计并返回 TODO。
+- `ReplaceCell` 当前只执行结构化预检并记录审计。
+- 运行时日志和事件命令会校验 binding 是否存在、端口是否匹配、租约和状态是否允许。
+- provider 注册命令会校验 owner、契约、方向、模式、访问策略和测试 provider 标志。
+- provider 调用命令会校验 binding、租约、端口可调用性和 payload 长度。
+
+### `ports.rs`
+
+职责：
+
+- 定义内核中的端口运行时描述包装。
+
+设计细节：
+
+- 当前 `PortRuntime` 只包装 `PortDescriptor`。
+- provider registry 当前在 ELM Core 中维护，端口描述负责提供契约、方向、模式、访问策略和可调用标记。
+- 后续完整端口提供者需要在这里或子模块中挂接真实执行器表、撤销回调、静默化回调和统计接口。
+
+### `snapshot.rs`
+
+职责：
+
+- 导出 ELM 运行拓扑快照。
+
+设计细节：
+
+- 输出顺序为 header、cell entries、port entries。
+- 快照只包含固定布局结构。
+- 快照记录 EBI 状态和 native_code 标记，方便外部工具区分纯声明单元和等待原生装载器的单元。
+
+### `syscall.rs`
+
+职责：
+
+- 把内核系统调用参数转换为 ELM 控制面命令。
+- 执行用户缓冲区复制、权限检查、输入长度检查和输出长度检查。
+
+设计细节：
+
+- `MgrCall` 和 `DebugDump` 需要 `SysAdmin`。
+- `read_input_bytes` 拒绝超过上限的管理输入。
+- `write_bytes` 在输出缓冲区不足时返回 `EMSGSIZE`。
+- 固定布局结构通过只读字节视图复制给用户态，调用点必须保证结构不包含内核指针。
+
+## 16. 观测、审计与调试
+
+ELM 的可观测性由四条路径组成：
+
+- Core query：快速获取 Core 能力和数量。
+- Snapshot：获取 cells 和 ports 的固定布局快照。
+- Events：按序列读取拓扑变化。
+- Audit：读取管理操作审计环。
+
+审计记录覆盖：
+
+- 生命周期操作。
+- 绑定和解绑。
+- 运行时日志提交。
+- 运行时事件读取和确认。
+- 装载被 `soyo` 边界阻断。
+- 热替换 TODO 阻断。
+
+运行时端口统计覆盖：
+
+- binding ID。
+- cell ID。
+- port ID。
+- lease ID。
+- event cursor。
+- submitted logs。
+- delivered events。
+- dropped events。
+
+这套观测机制的目标是让外部工具不需要解析内核日志，也能判断当前 ELM 拓扑、策略阻断原因和端口运行状态。
+
+## 17. 当前实现进度
 
 已完成：
 
@@ -316,6 +916,11 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - `MGR_CALL(SubmitRuntimeLog)` 已支持通过 `core.log@1` 绑定提交固定长度日志 payload。
 - `MGR_CALL(ReadRuntimeEvent/AckRuntimeEvent)` 已支持通过 `core.event@1` 绑定按游标读取和确认 ELM 事件。
 - `MGR_CALL(QueryRuntimePorts)` 已返回运行时端口绑定统计，包括日志提交数、事件投递数和丢弃事件数。
+- `MGR_CALL(RegisterProviderPort/UnregisterProviderPort)` 已支持动态 provider 端口注册和注销；当前通过内核函数表提供 `test.echo@1` 测试 provider。
+- `MGR_CALL(QueryProviderPorts/QueryProviderStats)` 已返回 provider 端口、访问策略、绑定数量、调用次数、失败次数和撤销次数。
+- `MGR_CALL(InvokeProvider)` 已支持通过 256 字节 `ElmCallFrame` 同步调用可调用 provider，并返回 `ElmReplyFrame`。
+- 动态 provider 端口已支持 `Public`、`ExtensionOnly` 和 `Internal` 三类访问策略。
+- 动态 provider binding 已使用 `Provider` 资源租约，并纳入绑定撤销、单元脱离和 provider busy 阻断链路。
 - `MGR_CALL(PreflightUnbind/CommitUnbind)` 已支持动态能力绑定的预检和撤销；内建保护绑定不可撤销。
 - 绑定图已记录真实能力绑定边，并将绑定、菜单租约和菜单项纳入同一条撤销链路。
 - EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明和入口声明。
@@ -330,13 +935,64 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 
 尚未完成：
 
-- EBI 重定位、代码页权限、入口调用和指令缓存同步。
-- soyo 文件格式、soyo 解析器以及 soyo 到 EBI 协议对象的转换层。
-- 热替换、影子绑定、状态迁移和回滚。
-- 原生代码单元的暂停、恢复、静默化回调和卸载执行器。
-- 设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
+- TODO(elm)：EBI 重定位、代码页权限、入口调用和指令缓存同步。
+- TODO(elm)：`soyo` 文件格式、`soyo` 解析器以及 `soyo` 到 EBI 协议对象的转换层。
+- TODO(elm)：热替换、影子绑定、状态迁移和回滚。
+- TODO(elm)：原生代码单元的暂停、恢复、静默化回调和卸载执行器。
+- TODO(elm)：设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
+- TODO(elm)：由真实 ELM 原生代码提供 provider ops 的执行器。
+- TODO(elm)：端口级并发、背压、队列和故障隔离策略。
+- TODO(elm)：面向 Rust ELM 的开发框架和构建链路。
 
-## 12. 禁止事项
+## 18. 后续阶段路线
+
+第一阶段：模型和管理闭环稳定。
+
+- 固化 `libs/elm` 固定布局结构。
+- 保持 host 单测覆盖模型约束。
+- 保持 `sys_elm_ctl`、`MGR_CALL`、快照、事件和审计 ABI 稳定。
+- 完成 `core.log@1`、`core.event@1`、`mgr.menu.item@1` 三个基础端口的闭环。
+- 完成动态 provider 端口注册、访问策略、同步调用帧、provider 租约、撤销和统计闭环。
+
+第二阶段：`soyo` 与 EBI 接入。
+
+- 设计 `soyo` 容器格式。
+- 实现 `soyo` 解析器。
+- 把 `soyo` 元数据转换为 EBI 协议对象。
+- 让 `LoadCell` 接收 `soyo` 句柄或受控输入，而不是旧 flat EBI 字节。
+- 继续保持 ELM Core 只消费 EBI 对象。
+
+第三阶段：原生代码执行器。
+
+- 实现架构相关段映射。
+- 实现重定位。
+- 实现代码页、只读页、数据页权限。
+- 实现指令缓存同步。
+- 实现入口调用约定。
+- 实现暂停、静默化、卸载和故障回调。
+
+第四阶段：端口提供者体系。
+
+- 为每个端口提供者定义注册、预检、提交、撤销、静默化和统计接口。
+- 将设备发现、设备声明、IRQ、DMA、MMIO、块 I/O、网络包流和 VFS 控制面接入能力织网。
+- 支持 ELM 自身注册新端口类型，让设备类型和子系统拓展不写死在 Core 中。
+
+第五阶段：热替换和故障隔离。
+
+- 实现影子绑定。
+- 实现状态迁移协议。
+- 实现切换代回滚。
+- 实现流排空和旧代退役。
+- 实现故障单元隔离态和受限诊断通道。
+
+第六阶段：用户态工具和 Rust 开发框架。
+
+- 提供 `elm-mgr` 外部管理工具。
+- 提供菜单、拓扑、审计和运行时端口查看命令。
+- 提供 Rust ELM 开发框架。
+- 提供声明式 manifest、端口契约生成、soyo 打包和本地测试工具。
+
+## 19. 禁止事项
 
 实现时必须避免：
 
@@ -350,6 +1006,8 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - 不把依赖解析简化为符号解析。
 - 不把卸载安全简化为引用计数。
 - 不把设备驱动等同于加载一个传统模块。
+- 不把 `soyo` 文件格式耦合进 ELM Core。
+- 不把 `TODO(elm)` 的原生代码边界伪装成已经完整实现。
 
 唯一允许的类比表述：
 

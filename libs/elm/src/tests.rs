@@ -3,23 +3,27 @@ use crate::{
     ELM_LIFECYCLE_REASON_HAS_EXTENSIONS, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND,
     ELM_MGR_ACTION_DETACH, ELM_MGR_ACTION_UNBIND, ELM_MGR_POLICY_AUDIT,
     ELM_MGR_POLICY_MENU_BINDING, ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT,
-    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
-    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
-    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCellSnapshot, ElmCoreInfo, ElmCtlCommand, ElmEbiArch,
-    ElmEbiEntry, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget,
-    ElmEbiUnit, ElmError, ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction,
-    ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse,
-    ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
-    ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
-    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmPortSnapshot, ElmRuntimeEventRequest, ElmRuntimeEventResponse,
-    ElmRuntimeLogRequest, ElmRuntimeLogResponse, ElmRuntimePortStatsHeader,
-    ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract, FlowMode,
-    Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, PortId, ResourceLease,
-    TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason, planned_final_state,
-    state_code, status_from_blockers,
+    ELM_MGR_POLICY_PROVIDER_PORTS, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK,
+    ELM_MGR_STATUS_TODO, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
+    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_PROVIDER_PORT_FLAG_TEST_ECHO, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCallFrame, ElmCellSnapshot,
+    ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus, ElmEbiMenuDecl,
+    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord, ElmId,
+    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
+    ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot,
+    ElmMenuSnapshotHeader, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallKind, ElmMgrPolicyInfo,
+    ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName,
+    ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
+    ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPortSnapshot,
+    ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRecord,
+    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
+    ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest, ElmReplyFrame,
+    ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState, ElmVersion,
+    FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry,
+    LeaseRights, LeaseState, PortId, ResourceLease, TopologyEventKind, builtin_port_descriptors,
+    first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
 };
 
 fn manifest(name: &str) -> ElmManifest {
@@ -582,8 +586,28 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_AUDIT, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_NEXUS_BINDING, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_MENU_BINDING, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_PROVIDER_PORTS, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_BIND, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_UNBIND, 0);
+}
+
+#[test]
+fn call_frame_abi_is_fixed_layout() {
+    let frame = ElmCallFrame::new(11, 9, 1, b"hello");
+    assert_eq!(frame.binding_id, 11);
+    assert_eq!(frame.call_id, 9);
+    assert_eq!(frame.opcode, 1);
+    assert_eq!(frame.payload_len, 5);
+    assert_eq!(&frame.payload[..5], b"hello");
+    assert_eq!(core::mem::size_of::<ElmCallFrame>(), 288);
+
+    let reply = ElmReplyFrame::new(11, 9, ELM_MGR_STATUS_OK, b"world");
+    assert_eq!(reply.binding_id, 11);
+    assert_eq!(reply.call_id, 9);
+    assert_eq!(reply.status, ELM_MGR_STATUS_OK);
+    assert_eq!(reply.payload_len, 5);
+    assert_eq!(&reply.payload[..5], b"world");
+    assert_eq!(core::mem::size_of::<ElmReplyFrame>(), 288);
 }
 
 #[test]
@@ -614,6 +638,97 @@ fn nexus_binding_abi_records_are_fixed_layout() {
     assert_eq!(record.active, 1);
     assert_eq!(record.contract_len, "mgr.menu.item@1".len() as u16);
     assert_eq!(core::mem::size_of::<ElmNexusBindingRecord>(), 120);
+}
+
+#[test]
+fn provider_port_abi_records_are_fixed_layout() {
+    assert_eq!(
+        ElmMgrCallKind::from_raw(20),
+        Some(ElmMgrCallKind::RegisterProviderPort)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(24),
+        Some(ElmMgrCallKind::QueryProviderStats)
+    );
+
+    let request = ElmProviderPortRegisterRequest::new(
+        1,
+        "test.echo@1",
+        ElmPortAccessPolicy::ExtensionOnly,
+        FlowDirection::Control,
+        FlowMode::Shared,
+        ELM_PROVIDER_PORT_FLAG_TEST_ECHO,
+    );
+    assert_eq!(request.owner_cell_id, 1);
+    assert_eq!(
+        request.access_policy,
+        ElmPortAccessPolicy::ExtensionOnly as u32
+    );
+    assert_eq!(request.direction, FlowDirection::Control as u32);
+    assert_eq!(request.mode, FlowMode::Shared as u32);
+    assert_eq!(request.contract_len, "test.echo@1".len() as u16);
+    assert_eq!(core::mem::size_of::<ElmProviderPortRegisterRequest>(), 96);
+
+    let response = ElmProviderPortRegisterResponse::new(
+        1,
+        100,
+        ELM_MGR_STATUS_OK,
+        ElmPortAccessPolicy::ExtensionOnly as u32,
+        0,
+    );
+    assert_eq!(response.port_id, 100);
+    assert_eq!(core::mem::size_of::<ElmProviderPortRegisterResponse>(), 40);
+
+    let unregister = ElmProviderPortUnregisterRequest::new(100);
+    assert_eq!(unregister.port_id, 100);
+    assert_eq!(core::mem::size_of::<ElmProviderPortUnregisterRequest>(), 16);
+
+    let invoke = ElmProviderInvokeRequest::new(ElmCallFrame::new(7, 1, 1, b"abc"));
+    assert_eq!(invoke.frame.binding_id, 7);
+    assert_eq!(core::mem::size_of::<ElmProviderInvokeRequest>(), 288);
+
+    let invoke_response =
+        ElmProviderInvokeResponse::new(ElmReplyFrame::new(7, 1, ELM_MGR_STATUS_OK, b"abc"));
+    assert_eq!(invoke_response.reply.status, ELM_MGR_STATUS_OK);
+    assert_eq!(core::mem::size_of::<ElmProviderInvokeResponse>(), 288);
+
+    let header = ElmProviderPortStatsHeader::new(1, 9);
+    assert_eq!(header.record_count, 1);
+    assert_eq!(header.event_sequence, 9);
+    assert_eq!(core::mem::size_of::<ElmProviderPortStatsHeader>(), 16);
+    let stats_header = ElmProviderPortStatsHeader::new_stats(1, 9);
+    assert_eq!(
+        stats_header.record_entry_size as usize,
+        core::mem::size_of::<ElmProviderPortStatsRecord>()
+    );
+
+    let record = ElmProviderPortRecord::new(
+        100,
+        1,
+        ElmPortAccessPolicy::ExtensionOnly as u32,
+        FlowDirection::Control as u32,
+        FlowMode::Shared as u32,
+        true,
+        true,
+        2,
+        3,
+        1,
+        1,
+        "test.echo@1",
+    );
+    assert_eq!(record.binding_count, 2);
+    assert_eq!(record.calls, 3);
+    assert_eq!(record.contract_len, "test.echo@1".len() as u16);
+    assert_eq!(core::mem::size_of::<ElmProviderPortRecord>(), 136);
+
+    let stats = ElmProviderPortStatsRecord::new(100, 1, 2, 3, 1, 1);
+    assert_eq!(stats.failed_calls, 1);
+    assert_eq!(core::mem::size_of::<ElmProviderPortStatsRecord>(), 48);
+
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_PROVIDER_BUSY),
+        ELM_MGR_STATUS_BUSY
+    );
 }
 
 #[test]

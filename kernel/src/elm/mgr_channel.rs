@@ -5,7 +5,9 @@ use alloc::vec::Vec;
 use elm_model::{
     ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest,
     ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
-    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
+    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmProviderInvokeRequest,
+    ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest, ElmRuntimeEventRequest,
+    ElmRuntimeLogRequest,
 };
 
 use super::{menu, with_core};
@@ -154,6 +156,39 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
             let payload = with_core(|core| core.runtime_ports_bytes());
             response_with_payload(payload)
         }
+        ElmMgrCallKind::RegisterProviderPort => {
+            let Some(request) = read_provider_port_register_request(call_payload(input, header))
+            else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = with_core(|core| core.register_provider_port(request));
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::UnregisterProviderPort => {
+            let Some(request) = read_provider_port_unregister_request(call_payload(input, header))
+            else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = with_core(|core| core.unregister_provider_port(request));
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::QueryProviderPorts => {
+            let payload = with_core(|core| core.provider_ports_bytes());
+            response_with_payload(payload)
+        }
+        ElmMgrCallKind::InvokeProvider => {
+            let Some(request) = read_provider_invoke_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match with_core(|core| core.invoke_provider(request)) {
+                Ok(response) => response_with_plain_payload(&response),
+                Err(status) => response_only(response_header_from_status(status)),
+            }
+        }
+        ElmMgrCallKind::QueryProviderStats => {
+            let payload = with_core(|core| core.provider_stats_bytes());
+            response_with_payload(payload)
+        }
     }
 }
 
@@ -255,6 +290,59 @@ fn read_runtime_event_request(payload: &[u8]) -> Option<ElmRuntimeEventRequest> 
         flags: u32::from_le_bytes(payload[16..20].try_into().ok()?),
         reserved: u32::from_le_bytes(payload[20..24].try_into().ok()?),
     })
+}
+
+fn read_provider_port_register_request(payload: &[u8]) -> Option<ElmProviderPortRegisterRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderPortRegisterRequest>() {
+        return None;
+    }
+    let mut contract = [0u8; elm_model::ELM_NEXUS_CONTRACT_LEN];
+    contract.copy_from_slice(&payload[32..32 + elm_model::ELM_NEXUS_CONTRACT_LEN]);
+    Some(ElmProviderPortRegisterRequest {
+        owner_cell_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        access_policy: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+        direction: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        mode: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+        contract_len: u16::from_le_bytes(payload[24..26].try_into().ok()?),
+        reserved0: u16::from_le_bytes(payload[26..28].try_into().ok()?),
+        reserved1: u32::from_le_bytes(payload[28..32].try_into().ok()?),
+        contract,
+    })
+}
+
+fn read_provider_port_unregister_request(
+    payload: &[u8],
+) -> Option<ElmProviderPortUnregisterRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderPortUnregisterRequest>() {
+        return None;
+    }
+    Some(ElmProviderPortUnregisterRequest {
+        port_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    })
+}
+
+fn read_provider_invoke_request(payload: &[u8]) -> Option<ElmProviderInvokeRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderInvokeRequest>() {
+        return None;
+    }
+    let frame = elm_model::ElmCallFrame {
+        binding_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        call_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        opcode: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+        payload_len: u16::from_le_bytes(payload[24..26].try_into().ok()?),
+        reserved0: u16::from_le_bytes(payload[26..28].try_into().ok()?),
+        reserved1: u32::from_le_bytes(payload[28..32].try_into().ok()?),
+        payload: {
+            let mut payload_out = [0u8; elm_model::ELM_FRAME_PAYLOAD_LEN];
+            payload_out.copy_from_slice(&payload[32..32 + elm_model::ELM_FRAME_PAYLOAD_LEN]);
+            payload_out
+        },
+    };
+    Some(ElmProviderInvokeRequest { frame })
 }
 
 fn response_header_from_status(status: i32) -> ElmMgrResponseHeader {

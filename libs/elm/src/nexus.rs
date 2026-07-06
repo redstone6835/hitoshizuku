@@ -32,20 +32,47 @@ pub enum IntentKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum FlowDirection {
-    Source,
-    Sink,
-    Duplex,
-    Control,
+    Source = 1,
+    Sink = 2,
+    Duplex = 3,
+    Control = 4,
+}
+
+impl FlowDirection {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Source),
+            2 => Some(Self::Sink),
+            3 => Some(Self::Duplex),
+            4 => Some(Self::Control),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum FlowMode {
-    Exclusive,
-    Shared,
-    Ordered,
-    Pipeline,
-    Broadcast,
+    Exclusive = 1,
+    Shared = 2,
+    Ordered = 3,
+    Pipeline = 4,
+    Broadcast = 5,
+}
+
+impl FlowMode {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Exclusive),
+            2 => Some(Self::Shared),
+            3 => Some(Self::Ordered),
+            4 => Some(Self::Pipeline),
+            5 => Some(Self::Broadcast),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
