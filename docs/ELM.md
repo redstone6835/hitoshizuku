@@ -44,7 +44,8 @@ ELM 的基本原则：
 | Quarantined | 隔离态 | 故障单元被禁止接收普通流，只允许诊断和退役 |
 | Topology | 运行拓扑 | 当前所有单元、关系、端口、绑定和租约的可观测快照 |
 | Manifest | 单元清单 | ELM 包中的自描述元数据 |
-| EBI | 可拓展内核单元镜像 | ELM Binary Image，后续动态装载的原生镜像格式 |
+| EBI | ELM 二进制装载接口 | ELM Binary Interface，描述 ELM Core 消费的稳定装载协议，不是文件格式 |
+| soyo | soyo 可执行容器 | 未来承载 ELM 的可执行文件格式，负责解析文件并导出 EBI 协议对象 |
 
 ## 3. 总体架构
 
@@ -271,7 +272,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - `libs/elm`：纯模型层，不依赖 `kernel/general/arch`。
 - `kernel/src/elm`：内核 ELM Core。
 - `kernel/src/elm/ports`：内核织网端口提供者。
-- `arch/*/elm`：架构相关 EBI 装入、重定位、代码页权限和指令缓存同步。
+- `arch/*/elm`：架构相关 EBI 协议对象装入、重定位、代码页权限和指令缓存同步。
 
 第一阶段实现目标：
 
@@ -290,9 +291,9 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 
 第三阶段实现目标：
 
-- EBI 镜像格式。
-- 私有 `LoadCell` 载荷通道。
-- 纯声明单元和菜单拓展单元装载。
+- EBI 二进制装载接口协议对象。
+- 私有 `LoadCell` 命令号保留，等待 soyo 容器解析器接入。
+- 纯声明单元和菜单拓展单元的内核内部协议装载路径。
 - 原生代码装入、重定位、代码页权限和指令缓存同步。
 - 切换代、热替换、状态迁移和故障隔离。
 
@@ -305,10 +306,10 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - 内核启动时已注册一个内建菜单拓展单元 `elm-menu-demo`，它作为 `elm-mgr` 的子单元挂接到 `menu.item` 拓展点。
 - `sys_elm_ctl` 已支持 `CORE_QUERY`、`SNAPSHOT_READ`、`EVENT_READ`、`EVENT_ACK`、`MGR_CALL` 和 `DEBUG_DUMP`。
 - `MGR_CALL(QueryMenu)` 已返回固定布局的菜单快照。
-- EBI 已有固定二进制格式、架构标识、段表、固定清单、解析器和 host 单测。
-- `MGR_CALL(LoadCell)` 已接入 EBI 私有载荷通道。
-- 纯声明 EBI 可进入 `Active`。
-- 菜单拓展 EBI 可挂接到 `elm-mgr` 的 `menu.item` 拓展点，并创建菜单租约和菜单项。
+- EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明和入口声明。
+- `MGR_CALL(LoadCell)` 已保留命令号；在 soyo 解析器接入前返回 `TODO(elm)`，不再接受旧 flat EBI 字节格式。
+- 纯声明 EBI 协议对象可进入 `Active`。
+- 菜单拓展 EBI 协议对象可挂接到 `elm-mgr` 的 `menu.item` 拓展点，并创建菜单租约和菜单项。
 - 含原生代码段或原生入口标记的 EBI 会登记为单元并停在 `Loaded`，响应 `TODO(elm)` 状态，不执行代码。
 - `PauseCell` 和 `ResumeCell` 已支持动态、非原生单元的真实状态切换。
 - `DetachCell` 已支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
@@ -317,6 +318,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 尚未完成：
 
 - EBI 重定位、代码页权限、入口调用和指令缓存同步。
+- soyo 文件格式、soyo 解析器以及 soyo 到 EBI 协议对象的转换层。
 - 真正的 `elm-mgr` 策略运行时。
 - 热替换、影子绑定、状态迁移和回滚。
 - 原生代码单元的暂停、恢复、静默化回调和卸载执行器。

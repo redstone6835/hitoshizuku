@@ -28,12 +28,9 @@ pub use ctl::{
     ELM_CTL_MAGIC, ElmCoreInfo, ElmCtlCommand, ElmCtlHeader, ElmCtlStatus,
 };
 pub use ebi::{
-    ELM_EBI_ABI_VERSION, ELM_EBI_HEADER_SIZE, ELM_EBI_MAGIC, ELM_EBI_MANIFEST_DESCRIPTION_LEN,
-    ELM_EBI_MANIFEST_FLAG_MENU_ITEM, ELM_EBI_MANIFEST_FLAG_NATIVE_ENTRY,
-    ELM_EBI_MANIFEST_LABEL_LEN, ELM_EBI_MANIFEST_NAME_LEN, ELM_EBI_MANIFEST_ROUTE_LEN,
-    ELM_EBI_MANIFEST_VERSION_LEN, ELM_EBI_MAX_IMAGE_SIZE, ELM_EBI_MAX_SECTIONS,
-    ELM_EBI_SECTION_HEADER_SIZE, ElmEbiArch, ElmEbiHeader, ElmEbiImage, ElmEbiLoadStatus,
-    ElmEbiManifestRecord, ElmEbiSectionHeader, ElmEbiSectionKind, ElmLoadCellResponse,
+    ELM_EBI_ABI_VERSION, ELM_EBI_MAX_SEGMENTS, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit,
+    ElmLoadCellResponse,
 };
 pub use error::{ElmError, ElmResult};
 pub use event::{ElmEventRecord, ElmEventSequence};

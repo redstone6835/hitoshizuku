@@ -3,7 +3,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use elm_model::{ELM_EBI_MAX_IMAGE_SIZE, ElmCtlCommand, ElmMgrCallHeader};
+use elm_model::{ElmCtlCommand, ElmMgrCallHeader};
 use errno::Errno;
 use general::mm::{copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
@@ -11,7 +11,8 @@ use sched::ids::Capability;
 
 use super::{event, mgr_channel, snapshot, with_core};
 
-const MAX_MGR_INPUT: usize = ELM_EBI_MAX_IMAGE_SIZE + core::mem::size_of::<ElmMgrCallHeader>();
+const MAX_MGR_PAYLOAD: usize = 4096;
+const MAX_MGR_INPUT: usize = MAX_MGR_PAYLOAD + core::mem::size_of::<ElmMgrCallHeader>();
 
 pub(crate) fn sys_elm_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let command = ElmCtlCommand::from_raw(ctx.args[0]).ok_or(Errno::EINVAL)?;

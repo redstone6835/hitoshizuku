@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use elm_model::{
-    ElmEbiArch, ElmId, ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
+    ElmId, ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
 };
 
 use super::{menu, with_core};
@@ -23,9 +23,8 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
             response_with_payload(payload)
         }
         ElmMgrCallKind::LoadCell => {
-            let payload = call_payload(input, header);
-            let response = with_core(|core| core.load_ebi_cell(payload, current_ebi_arch()));
-            response_with_plain_payload(&response)
+            // TODO(elm): 未来由 soyo 解析器把文件转换为 EBI 协议对象后再装载。
+            response_only(ElmMgrResponseHeader::todo())
         }
         ElmMgrCallKind::PauseCell => {
             let Some(request) = read_lifecycle_request(call_payload(input, header)) else {
@@ -114,20 +113,5 @@ fn plain_bytes<T>(value: &T) -> &[u8] {
     // 安全性：管理通道响应头为 `#[repr(C)]` 固定布局，不包含内核指针。
     unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
-    }
-}
-
-const fn current_ebi_arch() -> ElmEbiArch {
-    #[cfg(target_arch = "riscv64")]
-    {
-        ElmEbiArch::Riscv64
-    }
-    #[cfg(target_arch = "loongarch64")]
-    {
-        ElmEbiArch::LoongArch64
-    }
-    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-    {
-        ElmEbiArch::Any
     }
 }

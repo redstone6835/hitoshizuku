@@ -1,14 +1,11 @@
-use alloc::vec::Vec;
-
 use crate::{
-    ActionId, BindingGraph, ELM_EBI_HEADER_SIZE, ELM_EBI_SECTION_HEADER_SIZE,
-    ELM_LIFECYCLE_REASON_NONE, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ElmCellSnapshot,
-    ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiHeader, ElmEbiImage, ElmEbiLoadStatus,
-    ElmEbiManifestRecord, ElmEbiSectionHeader, ElmEbiSectionKind, ElmError, ElmEventRecord, ElmId,
-    ElmKind, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest, ElmMenuItemKind,
-    ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrResponseHeader, ElmName, ElmPortSnapshot,
-    ElmSnapshotHeader, ElmState, ElmVersion, FlowContract, FlowMode, Generation, LeaseId,
-    LeaseKind, LeaseRegistry, LeaseRights, LeaseState, ResourceLease, TopologyEventKind,
+    ActionId, BindingGraph, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK,
+    ElmCellSnapshot, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError,
+    ElmEventRecord, ElmId, ElmKind, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
+    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrResponseHeader, ElmName,
+    ElmPortSnapshot, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract, FlowMode, Generation,
+    LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, ResourceLease, TopologyEventKind,
     builtin_port_descriptors, state_code,
 };
 
@@ -322,94 +319,79 @@ fn menu_snapshot_entries_are_fixed_layout() {
 }
 
 #[test]
-fn ebi_parser_accepts_menu_extension_image() {
-    let manifest = ElmEbiManifestRecord::new("demo-menu", "0.1.0", ElmKind::Extension)
-        .with_menu_item(
-            ElmMenuItemKind::Action,
-            crate::ELM_MENU_FLAG_TODO,
-            "Demo",
-            "demo item",
-            "demo/run",
-        );
-    let bytes = ebi_bytes(manifest, ElmEbiArch::Any, None);
-    let image = ElmEbiImage::parse(&bytes, ElmEbiArch::Riscv64).unwrap();
+fn ebi_protocol_accepts_menu_extension_unit() {
+    let unit = ElmEbiUnit::new(
+        ElmManifest::new(
+            ElmName::new("demo-menu").unwrap(),
+            ElmVersion::new("0.1.0").unwrap(),
+            ElmKind::Extension,
+        ),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_menu(ElmEbiMenuDecl::new(
+        ElmMenuItemKind::Action,
+        crate::ELM_MENU_FLAG_TODO,
+        "Demo",
+        "demo item",
+        "demo/run",
+    ));
 
-    assert_eq!(image.header.magic, crate::ELM_EBI_MAGIC);
-    assert_eq!(image.manifest.name_str().unwrap(), "demo-menu");
-    assert!(image.manifest.has_menu_item());
-    assert!(!image.has_native_code);
+    assert!(unit.validate(ElmEbiArch::Riscv64).is_ok());
+    assert_eq!(unit.manifest.name.as_str(), "demo-menu");
+    assert!(unit.menu.is_some());
+    assert!(!unit.has_native_code());
 }
 
 #[test]
-fn ebi_parser_rejects_wrong_architecture() {
-    let manifest = ElmEbiManifestRecord::new("wrong-arch", "0.1.0", ElmKind::Service);
-    let bytes = ebi_bytes(manifest, ElmEbiArch::LoongArch64, None);
+fn ebi_protocol_rejects_wrong_architecture() {
+    let unit = ElmEbiUnit::new(
+        manifest("wrong-arch"),
+        ElmEbiTarget::new(ElmEbiArch::LoongArch64),
+    );
     assert_eq!(
-        ElmEbiImage::parse(&bytes, ElmEbiArch::Riscv64),
+        unit.validate(ElmEbiArch::Riscv64),
         Err(ElmEbiLoadStatus::ArchMismatch)
     );
 }
 
 #[test]
-fn ebi_parser_marks_native_code_as_todo_boundary() {
-    let manifest = ElmEbiManifestRecord::new("native-cell", "0.1.0", ElmKind::Service);
-    let bytes = ebi_bytes(manifest, ElmEbiArch::Any, Some(ElmEbiSectionKind::Code));
-    let image = ElmEbiImage::parse(&bytes, ElmEbiArch::Riscv64).unwrap();
-    assert!(image.has_native_code);
+fn ebi_protocol_marks_native_code_as_todo_boundary() {
+    let unit = ElmEbiUnit::new(manifest("native-cell"), ElmEbiTarget::new(ElmEbiArch::Any))
+        .with_segment(ElmEbiSegment::new(ElmEbiSegmentKind::Code, 4096, 0));
+
+    assert!(unit.validate(ElmEbiArch::Riscv64).is_ok());
+    assert!(unit.has_native_code());
 }
 
 #[test]
-fn ebi_parser_rejects_invalid_manifest_name() {
-    let manifest = ElmEbiManifestRecord::new("BadName", "0.1.0", ElmKind::Service);
-    let bytes = ebi_bytes(manifest, ElmEbiArch::Any, None);
+fn ebi_protocol_marks_entry_as_native_boundary() {
+    let unit = ElmEbiUnit::new(manifest("entry-cell"), ElmEbiTarget::new(ElmEbiArch::Any))
+        .with_entry(ElmEbiEntry::new("elm_main"));
+
+    assert!(unit.validate(ElmEbiArch::LoongArch64).is_ok());
+    assert!(unit.has_native_code());
+}
+
+#[test]
+fn ebi_protocol_rejects_invalid_menu_decl() {
+    let unit = ElmEbiUnit::new(manifest("bad-menu"), ElmEbiTarget::new(ElmEbiArch::Any)).with_menu(
+        ElmEbiMenuDecl::new(ElmMenuItemKind::Action, 0, "", "missing label", "bad/menu"),
+    );
+
     assert_eq!(
-        ElmEbiImage::parse(&bytes, ElmEbiArch::Riscv64),
-        Err(ElmEbiLoadStatus::InvalidManifest)
+        unit.validate(ElmEbiArch::Riscv64),
+        Err(ElmEbiLoadStatus::InvalidMenu)
     );
 }
 
-fn ebi_bytes(
-    manifest: ElmEbiManifestRecord,
-    arch: ElmEbiArch,
-    section: Option<ElmEbiSectionKind>,
-) -> Vec<u8> {
-    let section_count = u16::from(section.is_some());
-    let section_table_offset = ELM_EBI_HEADER_SIZE;
-    let manifest_offset =
-        section_table_offset + section_count as usize * ELM_EBI_SECTION_HEADER_SIZE;
-    let manifest_size = core::mem::size_of::<ElmEbiManifestRecord>();
-    let payload_offset = manifest_offset + manifest_size;
-    let payload_size = if section.is_some() { 4 } else { 0 };
-    let image_size = payload_offset + payload_size;
-    let header = ElmEbiHeader::new(
-        image_size as u32,
-        arch,
-        section_count,
-        section_table_offset as u32,
-        manifest_offset as u32,
-        manifest_size as u32,
-        0,
+#[test]
+fn ebi_protocol_rejects_unsupported_abi() {
+    let mut target = ElmEbiTarget::new(ElmEbiArch::Any);
+    target.abi_version = crate::ELM_EBI_ABI_VERSION + 1;
+    let unit = ElmEbiUnit::new(manifest("future-unit"), target);
+
+    assert_eq!(
+        unit.validate(ElmEbiArch::Riscv64),
+        Err(ElmEbiLoadStatus::UnsupportedAbi)
     );
-
-    let mut out = Vec::new();
-    push_plain(&mut out, &header);
-    if let Some(kind) = section {
-        push_plain(
-            &mut out,
-            &ElmEbiSectionHeader::new(kind, payload_offset as u32, payload_size as u32, 0),
-        );
-    }
-    push_plain(&mut out, &manifest);
-    if section.is_some() {
-        out.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
-    }
-    out
-}
-
-fn push_plain<T>(out: &mut Vec<u8>, value: &T) {
-    // 安全性：测试只把固定布局的 EBI 控制结构按原始字节写入测试镜像。
-    let bytes = unsafe {
-        core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
-    };
-    out.extend_from_slice(bytes);
 }

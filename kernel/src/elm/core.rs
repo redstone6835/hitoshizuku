@@ -12,7 +12,7 @@ use elm_model::{
     ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NATIVE_TODO, ELM_LIFECYCLE_REASON_NONE,
     ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO, ELM_MGR_STATUS_BUSY,
     ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION,
-    ELM_MGR_STATUS_TODO, ElmCoreInfo, ElmEbiArch, ElmEbiImage, ElmEbiLoadStatus, ElmError,
+    ELM_MGR_STATUS_TODO, ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError,
     ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleResponse, ElmLoadCellResponse,
     ElmManifest, ElmMenuItemKind, ElmName, ElmState, ElmVersion, FlowContract, FlowMode,
     Generation, IntentKind, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, NexusIntent,
@@ -46,7 +46,6 @@ pub(crate) struct CellRuntime {
     pub ebi_status: ElmEbiLoadStatus,
     pub has_native_code: bool,
     pub owned_bindings: Vec<BindingId>,
-    pub owned_leases: Vec<LeaseId>,
     pub owned_menu_items: Vec<u64>,
 }
 
@@ -61,10 +60,15 @@ pub(crate) struct ElmCore {
     events: Vec<ElmEventRecord>,
     next_event_sequence: ElmEventSequence,
     acknowledged_event_sequence: u64,
+    #[allow(dead_code)]
     next_cell_id: u64,
+    #[allow(dead_code)]
     next_binding_id: u64,
+    #[allow(dead_code)]
     next_lease_id: u64,
+    #[allow(dead_code)]
     next_action_id: u64,
+    #[allow(dead_code)]
     next_menu_item_id: u64,
 }
 
@@ -120,7 +124,6 @@ impl ElmCore {
             ebi_status: ElmEbiLoadStatus::Ok,
             has_native_code: false,
             owned_bindings: Vec::new(),
-            owned_leases: Vec::new(),
             owned_menu_items: Vec::new(),
         });
         self.emit(TopologyEventKind::CellAdded, Some(ELM_MGR_ID));
@@ -176,28 +179,23 @@ impl ElmCore {
         self.acknowledged_event_sequence = self.acknowledged_event_sequence.max(sequence);
     }
 
-    pub fn load_ebi_cell(&mut self, bytes: &[u8], arch: ElmEbiArch) -> ElmLoadCellResponse {
-        let image = match ElmEbiImage::parse(bytes, arch) {
-            Ok(image) => image,
-            Err(status) => return ElmLoadCellResponse::failed(status),
-        };
-        let manifest = match image.manifest.to_manifest() {
-            Ok(manifest) => manifest,
-            Err(status) => return ElmLoadCellResponse::failed(status),
-        };
-        let name = match image.manifest.name_str() {
-            Ok(name) => name.to_string(),
-            Err(status) => return ElmLoadCellResponse::failed(status),
-        };
-        let image_arch = ElmEbiArch::from_raw(image.header.arch).unwrap_or(ElmEbiArch::Any);
+    // TODO(elm): soyo 解析器接入后由容器转换层调用该协议装载入口。
+    #[allow(dead_code)]
+    pub fn load_ebi_unit(&mut self, unit: ElmEbiUnit, arch: ElmEbiArch) -> ElmLoadCellResponse {
+        if let Err(status) = unit.validate(arch) {
+            return ElmLoadCellResponse::failed(status);
+        }
+        let manifest = unit.manifest.clone();
+        let name = manifest.name.as_str().to_string();
+        let image_arch = unit.target.arch;
         let id = self.alloc_cell_id();
 
-        if let Err(err) = self.insert_loaded_cell(id, manifest, name, image_arch, &image) {
+        if let Err(err) = self.insert_loaded_cell(id, manifest, name, image_arch, &unit) {
             log::error!("[elm] EBI cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
         }
 
-        if image.has_native_code {
+        if unit.has_native_code() {
             return ElmLoadCellResponse::new(
                 ElmEbiLoadStatus::NativeCodeTodo,
                 id.0,
@@ -206,7 +204,7 @@ impl ElmCore {
             );
         }
 
-        if let Err(err) = self.activate_loaded_cell(id, &image) {
+        if let Err(err) = self.activate_loaded_cell(id, &unit) {
             log::error!("[elm] EBI cell activation rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::new(
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -482,7 +480,6 @@ impl ElmCore {
             ebi_status: ElmEbiLoadStatus::Ok,
             has_native_code: false,
             owned_bindings: vec![ELM_MENU_DEMO_BINDING_ID],
-            owned_leases: vec![ELM_MENU_DEMO_LEASE_ID],
             owned_menu_items: vec![1],
         });
         self.leases.insert(ResourceLease::new(
@@ -511,13 +508,14 @@ impl ElmCore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn insert_loaded_cell(
         &mut self,
         id: ElmId,
         manifest: ElmManifest,
         name: String,
         ebi_arch: ElmEbiArch,
-        image: &ElmEbiImage,
+        unit: &ElmEbiUnit,
     ) -> Result<(), ElmError> {
         let kind = manifest.kind;
         self.graph.insert_cell(id, manifest)?;
@@ -530,14 +528,13 @@ impl ElmCore {
             generation: Generation::FIRST,
             name,
             ebi_arch,
-            ebi_status: if image.has_native_code {
+            ebi_status: if unit.has_native_code() {
                 ElmEbiLoadStatus::NativeCodeTodo
             } else {
                 ElmEbiLoadStatus::Ok
             },
-            has_native_code: image.has_native_code,
+            has_native_code: unit.has_native_code(),
             owned_bindings: Vec::new(),
-            owned_leases: Vec::new(),
             owned_menu_items: Vec::new(),
         });
         self.emit(TopologyEventKind::CellAdded, Some(id));
@@ -546,8 +543,9 @@ impl ElmCore {
         Ok(())
     }
 
-    fn activate_loaded_cell(&mut self, id: ElmId, image: &ElmEbiImage) -> Result<(), ElmError> {
-        if image.manifest.has_menu_item() {
+    #[allow(dead_code)]
+    fn activate_loaded_cell(&mut self, id: ElmId, unit: &ElmEbiUnit) -> Result<(), ElmError> {
+        if let Some(menu) = &unit.menu {
             let menu_contract = FlowContract::new("mgr.menu.item@1")?;
             self.graph
                 .add_extension(id, ELM_MGR_ID, "menu.item", menu_contract)?;
@@ -570,29 +568,16 @@ impl ElmCore {
                 menu_id,
                 id,
                 action,
-                image
-                    .manifest
-                    .menu_item_kind()
-                    .map_err(|_| ElmError::InvalidName)?,
-                image.manifest.menu_flags | ELM_MENU_FLAG_TODO,
-                image
-                    .manifest
-                    .menu_label_str()
-                    .map_err(|_| ElmError::InvalidName)?,
-                image
-                    .manifest
-                    .menu_description_str()
-                    .map_err(|_| ElmError::InvalidName)?,
-                image
-                    .manifest
-                    .menu_route_str()
-                    .map_err(|_| ElmError::InvalidName)?,
+                menu.kind,
+                menu.flags | ELM_MENU_FLAG_TODO,
+                &menu.label,
+                &menu.description,
+                &menu.route,
             ));
             let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) else {
                 return Err(ElmError::CellNotFound);
             };
             cell.owned_bindings.push(binding);
-            cell.owned_leases.push(lease);
             cell.owned_menu_items.push(menu_id);
             self.menu_generation = self.menu_generation.next();
             self.emit(TopologyEventKind::MenuItemAdded, Some(id));
@@ -728,30 +713,35 @@ impl ElmCore {
         self.cells.retain(|cell| cell.id != id);
     }
 
+    #[allow(dead_code)]
     fn alloc_cell_id(&mut self) -> ElmId {
         let id = ElmId(self.next_cell_id);
         self.next_cell_id += 1;
         id
     }
 
+    #[allow(dead_code)]
     fn alloc_binding_id(&mut self) -> BindingId {
         let id = BindingId(self.next_binding_id);
         self.next_binding_id += 1;
         id
     }
 
+    #[allow(dead_code)]
     fn alloc_lease_id(&mut self) -> LeaseId {
         let id = LeaseId(self.next_lease_id);
         self.next_lease_id += 1;
         id
     }
 
+    #[allow(dead_code)]
     fn alloc_action_id(&mut self) -> ActionId {
         let id = ActionId(self.next_action_id);
         self.next_action_id += 1;
         id
     }
 
+    #[allow(dead_code)]
     fn alloc_menu_item_id(&mut self) -> u64 {
         let id = self.next_menu_item_id;
         self.next_menu_item_id += 1;
