@@ -136,6 +136,13 @@ impl LeaseRegistry {
         self.leases.is_empty()
     }
 
+    pub fn busy_owned_by(&self, owner: ElmId) -> usize {
+        self.leases
+            .values()
+            .filter(|lease| lease.owner == owner && lease.active_refs != 0)
+            .count()
+    }
+
     pub fn revoke_all_owned_by(&mut self, owner: ElmId) -> ElmResult<usize> {
         let mut count = 0;
         for lease in self.leases.values_mut() {

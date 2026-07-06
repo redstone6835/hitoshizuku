@@ -223,12 +223,65 @@ impl BindingGraph {
         self.parents.get(&child).copied()
     }
 
+    pub fn parent_edges(&self) -> Vec<ParentEdge> {
+        self.parents
+            .iter()
+            .map(|(child, parent)| ParentEdge {
+                child: *child,
+                parent: *parent,
+            })
+            .collect()
+    }
+
+    pub fn children_of(&self, parent: ElmId) -> Vec<ElmId> {
+        self.parents
+            .iter()
+            .filter_map(|(child, current_parent)| {
+                if *current_parent == parent {
+                    Some(*child)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn dependencies(&self) -> &[DependencyEdge] {
         &self.dependencies
     }
 
+    pub fn dependents_of(&self, provider: ElmId) -> Vec<ElmId> {
+        self.dependencies
+            .iter()
+            .filter_map(|edge| {
+                if edge.provider == provider {
+                    Some(edge.consumer)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn extension_points(&self) -> Vec<ExtensionPoint> {
+        self.extension_points.values().cloned().collect()
+    }
+
     pub fn extensions(&self) -> &[ExtensionEdge] {
         &self.extensions
+    }
+
+    pub fn extensions_targeting(&self, target: ElmId) -> Vec<ElmId> {
+        self.extensions
+            .iter()
+            .filter_map(|edge| {
+                if edge.target == target {
+                    Some(edge.extension)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn require_cell(&self, id: ElmId) -> ElmResult<()> {

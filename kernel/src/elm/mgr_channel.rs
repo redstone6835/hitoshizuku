@@ -3,7 +3,8 @@
 use alloc::vec::Vec;
 
 use elm_model::{
-    ElmId, ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
 };
 
 use super::{menu, with_core};
@@ -24,6 +25,9 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
         }
         ElmMgrCallKind::LoadCell => {
             // TODO(elm): 未来由 soyo 解析器把文件转换为 EBI 协议对象后再装载。
+            with_core(|core| {
+                core.record_mgr_audit(0, ElmId(0), ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, 0);
+            });
             response_only(ElmMgrResponseHeader::todo())
         }
         ElmMgrCallKind::PauseCell => {
@@ -49,7 +53,42 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
         }
         ElmMgrCallKind::ReplaceCell => {
             // TODO(elm): 热替换需要影子绑定、状态迁移和切换代回滚协议。
-            response_only(ElmMgrResponseHeader::todo())
+            let Some(request) = read_lifecycle_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let plan = with_core(|core| {
+                let plan = core.preflight_lifecycle(ElmLifecyclePlanRequest::new(
+                    request.cell_id,
+                    ElmLifecycleAction::Replace,
+                ));
+                core.record_mgr_audit(
+                    ElmLifecycleAction::Replace as u32,
+                    ElmId(request.cell_id),
+                    plan.blockers,
+                    plan.final_state,
+                );
+                plan
+            });
+            response_with_plain_payload(&plan)
+        }
+        ElmMgrCallKind::QueryTopology => {
+            let payload = with_core(|core| core.topology_bytes());
+            response_with_payload(payload)
+        }
+        ElmMgrCallKind::QueryPolicy => {
+            let policy = with_core(|core| core.policy_info());
+            response_with_plain_payload(&policy)
+        }
+        ElmMgrCallKind::PreflightLifecycle => {
+            let Some(request) = read_lifecycle_plan_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let plan = with_core(|core| core.preflight_lifecycle(request));
+            response_with_plain_payload(&plan)
+        }
+        ElmMgrCallKind::QueryAudit => {
+            let payload = with_core(|core| core.audit_bytes());
+            response_with_payload(payload)
         }
     }
 }
@@ -84,6 +123,17 @@ fn read_lifecycle_request(payload: &[u8]) -> Option<ElmLifecycleRequest> {
         cell_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
         flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
         reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    })
+}
+
+fn read_lifecycle_plan_request(payload: &[u8]) -> Option<ElmLifecyclePlanRequest> {
+    if payload.len() != core::mem::size_of::<ElmLifecyclePlanRequest>() {
+        return None;
+    }
+    Some(ElmLifecyclePlanRequest {
+        cell_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        action: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[12..16].try_into().ok()?),
     })
 }
 

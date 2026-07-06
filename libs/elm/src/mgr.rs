@@ -1,5 +1,9 @@
 //! 单元管理器调用外壳。
 
+use crate::ctl::ELM_CTL_ABI_VERSION;
+use crate::snapshot::state_code;
+use crate::state::ElmState;
+
 pub const ELM_MGR_STATUS_OK: i32 = 0;
 pub const ELM_MGR_STATUS_PERMISSION: i32 = -1;
 pub const ELM_MGR_STATUS_NOT_FOUND: i32 = -2;
@@ -16,6 +20,34 @@ pub const ELM_LIFECYCLE_REASON_LEASE_BUSY: u32 = 4;
 pub const ELM_LIFECYCLE_REASON_CELL_NOT_FOUND: u32 = 5;
 pub const ELM_LIFECYCLE_REASON_HAS_CHILDREN: u32 = 6;
 pub const ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT: u32 = 7;
+pub const ELM_LIFECYCLE_REASON_HAS_DEPENDENTS: u32 = 8;
+pub const ELM_LIFECYCLE_REASON_HAS_EXTENSIONS: u32 = 9;
+
+pub const ELM_MGR_ACTION_PAUSE: u32 = 1 << 0;
+pub const ELM_MGR_ACTION_RESUME: u32 = 1 << 1;
+pub const ELM_MGR_ACTION_DETACH: u32 = 1 << 2;
+pub const ELM_MGR_ACTION_REPLACE: u32 = 1 << 3;
+
+pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
+pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
+pub const ELM_MGR_POLICY_LOAD_REQUIRES_SOYO: u64 = 1 << 2;
+pub const ELM_MGR_POLICY_REPLACE_TODO: u64 = 1 << 3;
+pub const ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO: u64 = 1 << 4;
+
+pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
+pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
+pub const ELM_POLICY_BLOCK_INVALID_STATE: u64 = 1 << 2;
+pub const ELM_POLICY_BLOCK_NATIVE_TODO: u64 = 1 << 3;
+pub const ELM_POLICY_BLOCK_HAS_CHILDREN: u64 = 1 << 4;
+pub const ELM_POLICY_BLOCK_HAS_DEPENDENTS: u64 = 1 << 5;
+pub const ELM_POLICY_BLOCK_HAS_EXTENSIONS: u64 = 1 << 6;
+pub const ELM_POLICY_BLOCK_LEASE_BUSY: u64 = 1 << 7;
+pub const ELM_POLICY_BLOCK_REPLACE_TODO: u64 = 1 << 8;
+pub const ELM_POLICY_BLOCK_GRAPH_INCONSISTENT: u64 = 1 << 9;
+pub const ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO: u64 = 1 << 10;
+
+pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
+pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -26,6 +58,10 @@ pub enum ElmMgrCallKind {
     PauseCell = 4,
     ResumeCell = 5,
     ReplaceCell = 6,
+    QueryTopology = 7,
+    QueryPolicy = 8,
+    PreflightLifecycle = 9,
+    QueryAudit = 10,
 }
 
 impl ElmMgrCallKind {
@@ -37,9 +73,52 @@ impl ElmMgrCallKind {
             4 => Some(Self::PauseCell),
             5 => Some(Self::ResumeCell),
             6 => Some(Self::ReplaceCell),
+            7 => Some(Self::QueryTopology),
+            8 => Some(Self::QueryPolicy),
+            9 => Some(Self::PreflightLifecycle),
+            10 => Some(Self::QueryAudit),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ElmLifecycleAction {
+    Pause = 1,
+    Resume = 2,
+    Detach = 3,
+    Replace = 4,
+}
+
+impl ElmLifecycleAction {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Pause),
+            2 => Some(Self::Resume),
+            3 => Some(Self::Detach),
+            4 => Some(Self::Replace),
+            _ => None,
+        }
+    }
+
+    pub const fn bit(self) -> u32 {
+        match self {
+            Self::Pause => ELM_MGR_ACTION_PAUSE,
+            Self::Resume => ELM_MGR_ACTION_RESUME,
+            Self::Detach => ELM_MGR_ACTION_DETACH,
+            Self::Replace => ELM_MGR_ACTION_REPLACE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ElmMgrRelationKind {
+    Parent = 1,
+    Dependency = 2,
+    Extension = 3,
+    ExtensionPoint = 4,
 }
 
 #[repr(C)]
@@ -104,6 +183,230 @@ impl ElmLifecycleResponse {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmLifecyclePlanRequest {
+    pub cell_id: u64,
+    pub action: u32,
+    pub flags: u32,
+}
+
+impl ElmLifecyclePlanRequest {
+    pub const fn new(cell_id: u64, action: ElmLifecycleAction) -> Self {
+        Self {
+            cell_id,
+            action: action as u32,
+            flags: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmLifecyclePlanResponse {
+    pub cell_id: u64,
+    pub action: u32,
+    pub allowed: u32,
+    pub status: i32,
+    pub final_state: u32,
+    pub blockers: u64,
+    pub affected_children: u32,
+    pub affected_dependents: u32,
+    pub affected_extensions: u32,
+    pub reserved: u32,
+}
+
+impl ElmLifecyclePlanResponse {
+    pub const fn new(
+        cell_id: u64,
+        action: ElmLifecycleAction,
+        allowed: bool,
+        status: i32,
+        final_state: u32,
+        blockers: u64,
+    ) -> Self {
+        Self {
+            cell_id,
+            action: action as u32,
+            allowed: if allowed { 1 } else { 0 },
+            status,
+            final_state,
+            blockers,
+            affected_children: 0,
+            affected_dependents: 0,
+            affected_extensions: 0,
+            reserved: 0,
+        }
+    }
+
+    pub const fn with_affected(mut self, children: u32, dependents: u32, extensions: u32) -> Self {
+        self.affected_children = children;
+        self.affected_dependents = dependents;
+        self.affected_extensions = extensions;
+        self
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmMgrPolicyInfo {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub supported_actions: u32,
+    pub policy_flags: u64,
+    pub blocker_mask: u64,
+    pub audit_capacity: u32,
+    pub reserved1: u32,
+}
+
+impl ElmMgrPolicyInfo {
+    pub const fn new(audit_capacity: u32) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            reserved0: 0,
+            supported_actions: ELM_MGR_ACTION_PAUSE | ELM_MGR_ACTION_RESUME | ELM_MGR_ACTION_DETACH,
+            policy_flags: ELM_MGR_POLICY_PREFLIGHT
+                | ELM_MGR_POLICY_AUDIT
+                | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
+                | ELM_MGR_POLICY_REPLACE_TODO
+                | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO,
+            blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
+                | ELM_POLICY_BLOCK_CELL_NOT_FOUND
+                | ELM_POLICY_BLOCK_INVALID_STATE
+                | ELM_POLICY_BLOCK_NATIVE_TODO
+                | ELM_POLICY_BLOCK_HAS_CHILDREN
+                | ELM_POLICY_BLOCK_HAS_DEPENDENTS
+                | ELM_POLICY_BLOCK_HAS_EXTENSIONS
+                | ELM_POLICY_BLOCK_LEASE_BUSY
+                | ELM_POLICY_BLOCK_REPLACE_TODO
+                | ELM_POLICY_BLOCK_GRAPH_INCONSISTENT
+                | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO,
+            audit_capacity,
+            reserved1: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmMgrTopologyHeader {
+    pub abi_version: u16,
+    pub relation_entry_size: u16,
+    pub relation_count: u32,
+    pub cell_count: u32,
+    pub reserved: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmMgrTopologyHeader {
+    pub const fn new(relation_count: u32, cell_count: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            relation_entry_size: core::mem::size_of::<ElmMgrRelationRecord>() as u16,
+            relation_count,
+            cell_count,
+            reserved: 0,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmMgrRelationRecord {
+    pub kind: u32,
+    pub flags: u32,
+    pub source: u64,
+    pub target: u64,
+    pub contract_len: u16,
+    pub point_len: u16,
+    pub reserved: u32,
+    pub contract: [u8; ELM_MGR_RELATION_CONTRACT_LEN],
+    pub point: [u8; ELM_MGR_RELATION_POINT_LEN],
+}
+
+impl ElmMgrRelationRecord {
+    pub fn new(
+        kind: ElmMgrRelationKind,
+        source: u64,
+        target: u64,
+        contract: &str,
+        point: &str,
+    ) -> Self {
+        let mut out = Self {
+            kind: kind as u32,
+            flags: 0,
+            source,
+            target,
+            contract_len: 0,
+            point_len: 0,
+            reserved: 0,
+            contract: [0; ELM_MGR_RELATION_CONTRACT_LEN],
+            point: [0; ELM_MGR_RELATION_POINT_LEN],
+        };
+        out.contract_len = copy_str(contract, &mut out.contract) as u16;
+        out.point_len = copy_str(point, &mut out.point) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmMgrAuditHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub dropped_count: u32,
+    pub reserved: u32,
+    pub last_sequence: u64,
+}
+
+impl ElmMgrAuditHeader {
+    pub const fn new(record_count: u32, dropped_count: u32, last_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmMgrAuditRecord>() as u16,
+            record_count,
+            dropped_count,
+            reserved: 0,
+            last_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmMgrAuditRecord {
+    pub sequence: u64,
+    pub action: u32,
+    pub status: i32,
+    pub cell_id: u64,
+    pub blockers: u64,
+    pub final_state: u32,
+    pub reserved: u32,
+}
+
+impl ElmMgrAuditRecord {
+    pub const fn new(
+        sequence: u64,
+        action: u32,
+        status: i32,
+        cell_id: u64,
+        blockers: u64,
+        final_state: u32,
+    ) -> Self {
+        Self {
+            sequence,
+            action,
+            status,
+            cell_id,
+            blockers,
+            final_state,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmMgrResponseHeader {
     pub status: i32,
     pub payload_len: u32,
@@ -158,4 +461,71 @@ impl ElmMgrResponseHeader {
             reserved: 0,
         }
     }
+}
+
+pub const fn status_from_blockers(blockers: u64) -> i32 {
+    if blockers == 0 {
+        ELM_MGR_STATUS_OK
+    } else if blockers & ELM_POLICY_BLOCK_CELL_NOT_FOUND != 0 {
+        ELM_MGR_STATUS_NOT_FOUND
+    } else if blockers & ELM_POLICY_BLOCK_BUILTIN_PROTECTED != 0 {
+        ELM_MGR_STATUS_PERMISSION
+    } else if blockers
+        & (ELM_POLICY_BLOCK_HAS_CHILDREN
+            | ELM_POLICY_BLOCK_HAS_DEPENDENTS
+            | ELM_POLICY_BLOCK_HAS_EXTENSIONS
+            | ELM_POLICY_BLOCK_LEASE_BUSY)
+        != 0
+    {
+        ELM_MGR_STATUS_BUSY
+    } else if blockers
+        & (ELM_POLICY_BLOCK_NATIVE_TODO
+            | ELM_POLICY_BLOCK_REPLACE_TODO
+            | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO)
+        != 0
+    {
+        ELM_MGR_STATUS_TODO
+    } else {
+        ELM_MGR_STATUS_INVALID
+    }
+}
+
+pub const fn first_lifecycle_reason(blockers: u64) -> u32 {
+    if blockers & ELM_POLICY_BLOCK_BUILTIN_PROTECTED != 0 {
+        ELM_LIFECYCLE_REASON_BUILTIN_PROTECTED
+    } else if blockers & ELM_POLICY_BLOCK_NATIVE_TODO != 0 {
+        ELM_LIFECYCLE_REASON_NATIVE_TODO
+    } else if blockers & ELM_POLICY_BLOCK_CELL_NOT_FOUND != 0 {
+        ELM_LIFECYCLE_REASON_CELL_NOT_FOUND
+    } else if blockers & ELM_POLICY_BLOCK_HAS_CHILDREN != 0 {
+        ELM_LIFECYCLE_REASON_HAS_CHILDREN
+    } else if blockers & ELM_POLICY_BLOCK_HAS_DEPENDENTS != 0 {
+        ELM_LIFECYCLE_REASON_HAS_DEPENDENTS
+    } else if blockers & ELM_POLICY_BLOCK_HAS_EXTENSIONS != 0 {
+        ELM_LIFECYCLE_REASON_HAS_EXTENSIONS
+    } else if blockers & ELM_POLICY_BLOCK_LEASE_BUSY != 0 {
+        ELM_LIFECYCLE_REASON_LEASE_BUSY
+    } else if blockers & ELM_POLICY_BLOCK_GRAPH_INCONSISTENT != 0 {
+        ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT
+    } else if blockers != 0 {
+        ELM_LIFECYCLE_REASON_INVALID_STATE
+    } else {
+        ELM_LIFECYCLE_REASON_NONE
+    }
+}
+
+pub const fn planned_final_state(action: ElmLifecycleAction, current: ElmState) -> u32 {
+    match action {
+        ElmLifecycleAction::Pause => state_code(ElmState::Paused),
+        ElmLifecycleAction::Resume => state_code(ElmState::Active),
+        ElmLifecycleAction::Detach => state_code(ElmState::Retired),
+        ElmLifecycleAction::Replace => state_code(current),
+    }
+}
+
+fn copy_str(src: &str, dst: &mut [u8]) -> usize {
+    let bytes = src.as_bytes();
+    let n = bytes.len().min(dst.len());
+    dst[..n].copy_from_slice(&bytes[..n]);
+    n
 }

@@ -1,12 +1,18 @@
 use crate::{
-    ActionId, BindingGraph, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK,
+    ActionId, BindingGraph, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
+    ELM_LIFECYCLE_REASON_HAS_EXTENSIONS, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_DETACH,
+    ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_PREFLIGHT, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID,
+    ELM_MGR_STATUS_OK, ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ElmCellSnapshot, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
     ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError,
-    ElmEventRecord, ElmId, ElmKind, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
-    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrResponseHeader, ElmName,
-    ElmPortSnapshot, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract, FlowMode, Generation,
-    LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, state_code,
+    ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
+    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName, ElmPortSnapshot, ElmSnapshotHeader,
+    ElmState, ElmVersion, FlowContract, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry,
+    LeaseRights, LeaseState, ResourceLease, TopologyEventKind, builtin_port_descriptors,
+    first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
 };
 
 fn manifest(name: &str) -> ElmManifest {
@@ -67,6 +73,17 @@ fn binding_graph_tracks_parent_dependency_and_extension() {
     assert_eq!(report.parent_edges, 1);
     assert_eq!(report.dependency_edges, 1);
     assert_eq!(report.extension_edges, 1);
+
+    let parent_edges = graph.parent_edges();
+    assert_eq!(parent_edges[0].child, ElmId(2));
+    assert_eq!(parent_edges[0].parent, ElmId(1));
+    assert_eq!(graph.children_of(ElmId(1)), alloc::vec![ElmId(2)]);
+    assert_eq!(graph.dependents_of(ElmId(1)), alloc::vec![ElmId(2)]);
+    assert_eq!(graph.extensions_targeting(ElmId(1)), alloc::vec![ElmId(2)]);
+
+    let extension_points = graph.extension_points();
+    assert_eq!(extension_points[0].owner, ElmId(1));
+    assert_eq!(extension_points[0].name, "menu.item");
 }
 
 #[test]
@@ -185,6 +202,25 @@ fn lease_registry_revokes_and_removes_owned_leases() {
 }
 
 #[test]
+fn lease_registry_reports_busy_owned_leases() {
+    let mut registry = LeaseRegistry::new();
+    registry
+        .insert(ResourceLease::new(
+            LeaseId(1),
+            ElmId(7),
+            LeaseKind::Provider,
+            LeaseRights::READ,
+            Generation::FIRST,
+        ))
+        .unwrap();
+
+    assert_eq!(registry.busy_owned_by(ElmId(7)), 0);
+    registry.get_mut(LeaseId(1)).unwrap().active_refs = 2;
+    assert_eq!(registry.busy_owned_by(ElmId(7)), 1);
+    assert_eq!(registry.busy_owned_by(ElmId(8)), 0);
+}
+
+#[test]
 fn ctl_command_rejects_unknown_command() {
     assert_eq!(ElmCtlCommand::from_raw(1), Some(ElmCtlCommand::CoreQuery));
     assert_eq!(ElmCtlCommand::from_raw(509), None);
@@ -292,6 +328,98 @@ fn lifecycle_request_and_response_are_fixed_layout() {
     assert_eq!(response.revoked_leases, 1);
     assert_eq!(response.removed_menu_items, 2);
     assert_eq!(core::mem::size_of::<ElmLifecycleResponse>(), 32);
+}
+
+#[test]
+fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
+    assert_eq!(
+        ElmLifecycleAction::from_raw(ElmLifecycleAction::Detach as u32),
+        Some(ElmLifecycleAction::Detach)
+    );
+    assert_eq!(ElmLifecycleAction::Detach.bit(), ELM_MGR_ACTION_DETACH);
+
+    let request = ElmLifecyclePlanRequest::new(7, ElmLifecycleAction::Pause);
+    assert_eq!(request.cell_id, 7);
+    assert_eq!(request.action, ElmLifecycleAction::Pause as u32);
+    assert_eq!(core::mem::size_of::<ElmLifecyclePlanRequest>(), 16);
+
+    let response = ElmLifecyclePlanResponse::new(
+        7,
+        ElmLifecycleAction::Detach,
+        false,
+        ELM_MGR_STATUS_BUSY,
+        state_code(ElmState::Active),
+        ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+    )
+    .with_affected(0, 1, 0);
+    assert_eq!(response.allowed, 0);
+    assert_eq!(response.affected_dependents, 1);
+    assert_eq!(
+        first_lifecycle_reason(response.blockers),
+        ELM_LIFECYCLE_REASON_HAS_DEPENDENTS
+    );
+    assert_eq!(status_from_blockers(response.blockers), ELM_MGR_STATUS_BUSY);
+    assert_eq!(core::mem::size_of::<ElmLifecyclePlanResponse>(), 48);
+
+    let policy = ElmMgrPolicyInfo::new(128);
+    assert_eq!(policy.audit_capacity, 128);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_PREFLIGHT, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_AUDIT, 0);
+}
+
+#[test]
+fn mgr_topology_and_audit_records_are_fixed_layout() {
+    let relation = ElmMgrRelationRecord::new(
+        ElmMgrRelationKind::Extension,
+        2,
+        1,
+        "mgr.menu.item@1",
+        "menu.item",
+    );
+    assert_eq!(relation.source, 2);
+    assert_eq!(relation.target, 1);
+    assert_eq!(relation.contract_len, "mgr.menu.item@1".len() as u16);
+    assert_eq!(relation.point_len, "menu.item".len() as u16);
+    assert_eq!(core::mem::size_of::<ElmMgrRelationRecord>(), 128);
+
+    let topology = ElmMgrTopologyHeader::new(1, 2, 9);
+    assert_eq!(topology.relation_count, 1);
+    assert_eq!(topology.cell_count, 2);
+    assert_eq!(topology.event_sequence, 9);
+    assert_eq!(core::mem::size_of::<ElmMgrTopologyHeader>(), 24);
+
+    let audit = ElmMgrAuditRecord::new(
+        3,
+        ElmLifecycleAction::Detach as u32,
+        ELM_MGR_STATUS_BUSY,
+        7,
+        ELM_POLICY_BLOCK_HAS_EXTENSIONS,
+        state_code(ElmState::Active),
+    );
+    assert_eq!(audit.sequence, 3);
+    assert_eq!(
+        first_lifecycle_reason(audit.blockers),
+        ELM_LIFECYCLE_REASON_HAS_EXTENSIONS
+    );
+    assert_eq!(core::mem::size_of::<ElmMgrAuditRecord>(), 40);
+
+    let audit_header = ElmMgrAuditHeader::new(1, 0, 3);
+    assert_eq!(audit_header.record_count, 1);
+    assert_eq!(audit_header.last_sequence, 3);
+    assert_eq!(core::mem::size_of::<ElmMgrAuditHeader>(), 24);
+}
+
+#[test]
+fn lifecycle_status_helpers_report_planned_result() {
+    assert_eq!(
+        planned_final_state(ElmLifecycleAction::Pause, ElmState::Active),
+        state_code(ElmState::Paused)
+    );
+    assert_eq!(
+        planned_final_state(ElmLifecycleAction::Replace, ElmState::Active),
+        state_code(ElmState::Active)
+    );
+    assert_eq!(status_from_blockers(0), ELM_MGR_STATUS_OK);
 }
 
 #[test]

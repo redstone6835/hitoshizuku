@@ -306,20 +306,24 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - 内核启动时已注册一个内建菜单拓展单元 `elm-menu-demo`，它作为 `elm-mgr` 的子单元挂接到 `menu.item` 拓展点。
 - `sys_elm_ctl` 已支持 `CORE_QUERY`、`SNAPSHOT_READ`、`EVENT_READ`、`EVENT_ACK`、`MGR_CALL` 和 `DEBUG_DUMP`。
 - `MGR_CALL(QueryMenu)` 已返回固定布局的菜单快照。
+- `MGR_CALL(QueryPolicy)` 已返回当前单元管理器策略能力、支持动作、阻断位和审计容量。
+- `MGR_CALL(QueryTopology)` 已返回父子、依赖、拓展点和拓展项组成的关系快照。
+- `MGR_CALL(PreflightLifecycle)` 已支持暂停、恢复、脱离和替换的策略预检。
+- `MGR_CALL(QueryAudit)` 已返回管理操作审计环，包括动作、状态、阻断位和最终状态。
 - EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明和入口声明。
-- `MGR_CALL(LoadCell)` 已保留命令号；在 soyo 解析器接入前返回 `TODO(elm)`，不再接受旧 flat EBI 字节格式。
+- `MGR_CALL(LoadCell)` 已保留命令号；在 soyo 解析器接入前返回 `TODO(elm)` 并记录 `LOAD_REQUIRES_SOYO` 审计，不再接受旧 flat EBI 字节格式。
 - 纯声明 EBI 协议对象可进入 `Active`。
 - 菜单拓展 EBI 协议对象可挂接到 `elm-mgr` 的 `menu.item` 拓展点，并创建菜单租约和菜单项。
 - 含原生代码段或原生入口标记的 EBI 会登记为单元并停在 `Loaded`，响应 `TODO(elm)` 状态，不执行代码。
-- `PauseCell` 和 `ResumeCell` 已支持动态、非原生单元的真实状态切换。
-- `DetachCell` 已支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
-- `ReplaceCell` 已保留稳定命令号，但当前返回 `TODO(elm)` 状态。
+- `PauseCell` 和 `ResumeCell` 已通过统一预检策略支持动态、非原生单元的真实状态切换。
+- `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
+- `DetachCell` 会阻断仍有子单元、依赖者、拓展项或忙碌租约的目标单元，避免破坏当前拓扑。
+- `ReplaceCell` 已保留稳定命令号，当前返回结构化预检结果并记录 `REPLACE_TODO` 审计。
 
 尚未完成：
 
 - EBI 重定位、代码页权限、入口调用和指令缓存同步。
 - soyo 文件格式、soyo 解析器以及 soyo 到 EBI 协议对象的转换层。
-- 真正的 `elm-mgr` 策略运行时。
 - 热替换、影子绑定、状态迁移和回滚。
 - 原生代码单元的暂停、恢复、静默化回调和卸载执行器。
 - 设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实提供者。
