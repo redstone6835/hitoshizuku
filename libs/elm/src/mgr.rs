@@ -27,12 +27,16 @@ pub const ELM_MGR_ACTION_PAUSE: u32 = 1 << 0;
 pub const ELM_MGR_ACTION_RESUME: u32 = 1 << 1;
 pub const ELM_MGR_ACTION_DETACH: u32 = 1 << 2;
 pub const ELM_MGR_ACTION_REPLACE: u32 = 1 << 3;
+pub const ELM_MGR_ACTION_BIND: u32 = 1 << 4;
+pub const ELM_MGR_ACTION_UNBIND: u32 = 1 << 5;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
 pub const ELM_MGR_POLICY_LOAD_REQUIRES_SOYO: u64 = 1 << 2;
 pub const ELM_MGR_POLICY_REPLACE_TODO: u64 = 1 << 3;
 pub const ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO: u64 = 1 << 4;
+pub const ELM_MGR_POLICY_NEXUS_BINDING: u64 = 1 << 5;
+pub const ELM_MGR_POLICY_MENU_BINDING: u64 = 1 << 6;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -45,9 +49,16 @@ pub const ELM_POLICY_BLOCK_LEASE_BUSY: u64 = 1 << 7;
 pub const ELM_POLICY_BLOCK_REPLACE_TODO: u64 = 1 << 8;
 pub const ELM_POLICY_BLOCK_GRAPH_INCONSISTENT: u64 = 1 << 9;
 pub const ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO: u64 = 1 << 10;
+pub const ELM_POLICY_BLOCK_PORT_NOT_FOUND: u64 = 1 << 11;
+pub const ELM_POLICY_BLOCK_CONTRACT_MISMATCH: u64 = 1 << 12;
+pub const ELM_POLICY_BLOCK_DUPLICATE_BINDING: u64 = 1 << 13;
+pub const ELM_POLICY_BLOCK_PORT_TODO: u64 = 1 << 14;
+pub const ELM_POLICY_BLOCK_BINDING_NOT_FOUND: u64 = 1 << 15;
+pub const ELM_POLICY_BLOCK_BINDING_PROTECTED: u64 = 1 << 16;
 
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
+pub const ELM_NEXUS_CONTRACT_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -62,6 +73,11 @@ pub enum ElmMgrCallKind {
     QueryPolicy = 8,
     PreflightLifecycle = 9,
     QueryAudit = 10,
+    QueryNexusBindings = 11,
+    PreflightBind = 12,
+    CommitBind = 13,
+    PreflightUnbind = 14,
+    CommitUnbind = 15,
 }
 
 impl ElmMgrCallKind {
@@ -77,6 +93,11 @@ impl ElmMgrCallKind {
             8 => Some(Self::QueryPolicy),
             9 => Some(Self::PreflightLifecycle),
             10 => Some(Self::QueryAudit),
+            11 => Some(Self::QueryNexusBindings),
+            12 => Some(Self::PreflightBind),
+            13 => Some(Self::CommitBind),
+            14 => Some(Self::PreflightUnbind),
+            15 => Some(Self::CommitUnbind),
             _ => None,
         }
     }
@@ -262,12 +283,18 @@ impl ElmMgrPolicyInfo {
         Self {
             abi_version: ELM_CTL_ABI_VERSION,
             reserved0: 0,
-            supported_actions: ELM_MGR_ACTION_PAUSE | ELM_MGR_ACTION_RESUME | ELM_MGR_ACTION_DETACH,
+            supported_actions: ELM_MGR_ACTION_PAUSE
+                | ELM_MGR_ACTION_RESUME
+                | ELM_MGR_ACTION_DETACH
+                | ELM_MGR_ACTION_BIND
+                | ELM_MGR_ACTION_UNBIND,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
                 | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
                 | ELM_MGR_POLICY_REPLACE_TODO
-                | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO,
+                | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO
+                | ELM_MGR_POLICY_NEXUS_BINDING
+                | ELM_MGR_POLICY_MENU_BINDING,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -278,7 +305,13 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_LEASE_BUSY
                 | ELM_POLICY_BLOCK_REPLACE_TODO
                 | ELM_POLICY_BLOCK_GRAPH_INCONSISTENT
-                | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO,
+                | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO
+                | ELM_POLICY_BLOCK_PORT_NOT_FOUND
+                | ELM_POLICY_BLOCK_CONTRACT_MISMATCH
+                | ELM_POLICY_BLOCK_DUPLICATE_BINDING
+                | ELM_POLICY_BLOCK_PORT_TODO
+                | ELM_POLICY_BLOCK_BINDING_NOT_FOUND
+                | ELM_POLICY_BLOCK_BINDING_PROTECTED,
             audit_capacity,
             reserved1: 0,
         }
@@ -407,6 +440,151 @@ impl ElmMgrAuditRecord {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNexusBindRequest {
+    pub cell_id: u64,
+    pub port_id: u64,
+    pub flags: u32,
+    pub contract_len: u16,
+    pub reserved: u16,
+    pub contract: [u8; ELM_NEXUS_CONTRACT_LEN],
+}
+
+impl ElmNexusBindRequest {
+    pub fn new(cell_id: u64, port_id: u64, contract: &str) -> Self {
+        let mut out = Self {
+            cell_id,
+            port_id,
+            flags: 0,
+            contract_len: 0,
+            reserved: 0,
+            contract: [0; ELM_NEXUS_CONTRACT_LEN],
+        };
+        out.contract_len = copy_str(contract, &mut out.contract) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNexusBindPlanResponse {
+    pub cell_id: u64,
+    pub port_id: u64,
+    pub binding_id: u64,
+    pub lease_id: u64,
+    pub generation: u64,
+    pub status: i32,
+    pub allowed: u32,
+    pub blockers: u64,
+    pub reserved: u64,
+}
+
+impl ElmNexusBindPlanResponse {
+    pub const fn new(
+        cell_id: u64,
+        port_id: u64,
+        binding_id: u64,
+        lease_id: u64,
+        generation: u64,
+        allowed: bool,
+        status: i32,
+        blockers: u64,
+    ) -> Self {
+        Self {
+            cell_id,
+            port_id,
+            binding_id,
+            lease_id,
+            generation,
+            status,
+            allowed: if allowed { 1 } else { 0 },
+            blockers,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNexusUnbindRequest {
+    pub binding_id: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmNexusUnbindRequest {
+    pub const fn new(binding_id: u64) -> Self {
+        Self {
+            binding_id,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNexusBindingSnapshotHeader {
+    pub abi_version: u16,
+    pub binding_entry_size: u16,
+    pub binding_count: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmNexusBindingSnapshotHeader {
+    pub const fn new(binding_count: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            binding_entry_size: core::mem::size_of::<ElmNexusBindingRecord>() as u16,
+            binding_count,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNexusBindingRecord {
+    pub binding_id: u64,
+    pub cell_id: u64,
+    pub port_id: u64,
+    pub lease_id: u64,
+    pub generation: u64,
+    pub active: u32,
+    pub flags: u32,
+    pub contract_len: u16,
+    pub reserved: u16,
+    pub contract: [u8; ELM_NEXUS_CONTRACT_LEN],
+}
+
+impl ElmNexusBindingRecord {
+    pub fn new(
+        binding_id: u64,
+        cell_id: u64,
+        port_id: u64,
+        lease_id: u64,
+        generation: u64,
+        active: bool,
+        contract: &str,
+    ) -> Self {
+        let mut out = Self {
+            binding_id,
+            cell_id,
+            port_id,
+            lease_id,
+            generation,
+            active: if active { 1 } else { 0 },
+            flags: 0,
+            contract_len: 0,
+            reserved: 0,
+            contract: [0; ELM_NEXUS_CONTRACT_LEN],
+        };
+        out.contract_len = copy_str(contract, &mut out.contract) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmMgrResponseHeader {
     pub status: i32,
     pub payload_len: u32,
@@ -468,20 +646,27 @@ pub const fn status_from_blockers(blockers: u64) -> i32 {
         ELM_MGR_STATUS_OK
     } else if blockers & ELM_POLICY_BLOCK_CELL_NOT_FOUND != 0 {
         ELM_MGR_STATUS_NOT_FOUND
+    } else if blockers & (ELM_POLICY_BLOCK_PORT_NOT_FOUND | ELM_POLICY_BLOCK_BINDING_NOT_FOUND) != 0
+    {
+        ELM_MGR_STATUS_NOT_FOUND
     } else if blockers & ELM_POLICY_BLOCK_BUILTIN_PROTECTED != 0 {
+        ELM_MGR_STATUS_PERMISSION
+    } else if blockers & ELM_POLICY_BLOCK_BINDING_PROTECTED != 0 {
         ELM_MGR_STATUS_PERMISSION
     } else if blockers
         & (ELM_POLICY_BLOCK_HAS_CHILDREN
             | ELM_POLICY_BLOCK_HAS_DEPENDENTS
             | ELM_POLICY_BLOCK_HAS_EXTENSIONS
-            | ELM_POLICY_BLOCK_LEASE_BUSY)
+            | ELM_POLICY_BLOCK_LEASE_BUSY
+            | ELM_POLICY_BLOCK_DUPLICATE_BINDING)
         != 0
     {
         ELM_MGR_STATUS_BUSY
     } else if blockers
         & (ELM_POLICY_BLOCK_NATIVE_TODO
             | ELM_POLICY_BLOCK_REPLACE_TODO
-            | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO)
+            | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO
+            | ELM_POLICY_BLOCK_PORT_TODO)
         != 0
     {
         ELM_MGR_STATUS_TODO

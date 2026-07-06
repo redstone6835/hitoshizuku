@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{ElmError, ElmResult};
-use crate::ids::ElmId;
+use crate::ids::{BindingId, ElmId, Generation, LeaseId, PortId};
 use crate::manifest::ElmManifest;
 use crate::nexus::FlowContract;
 
@@ -37,12 +37,24 @@ pub struct ExtensionEdge {
     pub contract: FlowContract,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityBindingEdge {
+    pub id: BindingId,
+    pub consumer: ElmId,
+    pub port: PortId,
+    pub contract: FlowContract,
+    pub generation: Generation,
+    pub lease: Option<LeaseId>,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GraphValidationReport {
     pub cells: usize,
     pub parent_edges: usize,
     pub dependency_edges: usize,
     pub extension_edges: usize,
+    pub capability_bindings: usize,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +64,7 @@ pub struct BindingGraph {
     dependencies: Vec<DependencyEdge>,
     extension_points: BTreeMap<(ElmId, String), ExtensionPoint>,
     extensions: Vec<ExtensionEdge>,
+    capability_bindings: Vec<CapabilityBindingEdge>,
 }
 
 impl BindingGraph {
@@ -62,6 +75,7 @@ impl BindingGraph {
             dependencies: Vec::new(),
             extension_points: BTreeMap::new(),
             extensions: Vec::new(),
+            capability_bindings: Vec::new(),
         }
     }
 
@@ -159,10 +173,50 @@ impl BindingGraph {
         Ok(())
     }
 
+    pub fn add_capability_binding(
+        &mut self,
+        id: BindingId,
+        consumer: ElmId,
+        port: PortId,
+        contract: FlowContract,
+        generation: Generation,
+        lease: Option<LeaseId>,
+    ) -> ElmResult<()> {
+        self.require_cell(consumer)?;
+        if self.capability_bindings.iter().any(|edge| edge.id == id) {
+            return Err(ElmError::DuplicateBinding);
+        }
+        if self.capability_bindings.iter().any(|edge| {
+            edge.active
+                && edge.consumer == consumer
+                && edge.port == port
+                && edge.contract == contract
+        }) {
+            return Err(ElmError::DuplicateBinding);
+        }
+        self.capability_bindings.push(CapabilityBindingEdge {
+            id,
+            consumer,
+            port,
+            contract,
+            generation,
+            lease,
+            active: true,
+        });
+        Ok(())
+    }
+
     pub fn validate(&self) -> ElmResult<GraphValidationReport> {
         for (child, parent) in &self.parents {
             self.require_cell(*child)?;
             self.require_cell(*parent)?;
+        }
+        let mut seen_bindings = BTreeSet::new();
+        for edge in &self.capability_bindings {
+            self.require_cell(edge.consumer)?;
+            if !seen_bindings.insert(edge.id) {
+                return Err(ElmError::DuplicateBinding);
+            }
         }
         if self.has_dependency_cycle() {
             return Err(ElmError::DependencyCycle);
@@ -175,6 +229,7 @@ impl BindingGraph {
             parent_edges: self.parents.len(),
             dependency_edges: self.dependencies.len(),
             extension_edges: self.extensions.len(),
+            capability_bindings: self.capability_bindings.len(),
         })
     }
 
@@ -199,6 +254,10 @@ impl BindingGraph {
             .retain(|edge| edge.extension != id && edge.target != id);
         let extension_edges = before_extensions - self.extensions.len();
 
+        let before_bindings = self.capability_bindings.len();
+        self.capability_bindings.retain(|edge| edge.consumer != id);
+        let capability_bindings = before_bindings - self.capability_bindings.len();
+
         let extension_points: Vec<_> = self
             .extension_points
             .keys()
@@ -216,6 +275,7 @@ impl BindingGraph {
             dependency_edges,
             extension_edges,
             extension_points: extension_point_count,
+            capability_bindings,
         })
     }
 
@@ -284,6 +344,52 @@ impl BindingGraph {
             .collect()
     }
 
+    pub fn capability_bindings(&self) -> &[CapabilityBindingEdge] {
+        &self.capability_bindings
+    }
+
+    pub fn capability_binding(&self, id: BindingId) -> Option<&CapabilityBindingEdge> {
+        self.capability_bindings.iter().find(|edge| edge.id == id)
+    }
+
+    pub fn capability_binding_for(
+        &self,
+        consumer: ElmId,
+        port: PortId,
+        contract: &FlowContract,
+    ) -> Option<&CapabilityBindingEdge> {
+        self.capability_bindings.iter().find(|edge| {
+            edge.active
+                && edge.consumer == consumer
+                && edge.port == port
+                && edge.contract == *contract
+        })
+    }
+
+    pub fn capability_bindings_for_cell(&self, consumer: ElmId) -> Vec<BindingId> {
+        self.capability_bindings
+            .iter()
+            .filter_map(|edge| {
+                if edge.consumer == consumer {
+                    Some(edge.id)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn remove_capability_binding(&mut self, id: BindingId) -> ElmResult<CapabilityBindingEdge> {
+        let Some(index) = self
+            .capability_bindings
+            .iter()
+            .position(|edge| edge.id == id)
+        else {
+            return Err(ElmError::BindingNotFound);
+        };
+        Ok(self.capability_bindings.remove(index))
+    }
+
     fn require_cell(&self, id: ElmId) -> ElmResult<()> {
         if self.cells.contains_key(&id) {
             Ok(())
@@ -333,6 +439,7 @@ pub struct GraphRemovalReport {
     pub dependency_edges: usize,
     pub extension_edges: usize,
     pub extension_points: usize,
+    pub capability_bindings: usize,
 }
 
 fn has_cycle(adjacency: &BTreeMap<ElmId, Vec<ElmId>>) -> bool {

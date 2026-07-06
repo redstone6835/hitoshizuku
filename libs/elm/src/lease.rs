@@ -4,7 +4,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::error::{ElmError, ElmResult};
-use crate::ids::{ElmId, Generation, LeaseId};
+use crate::ids::{BindingId, ElmId, Generation, LeaseId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseKind {
@@ -57,6 +57,7 @@ pub struct ResourceLease {
     pub generation: Generation,
     pub state: LeaseState,
     pub active_refs: usize,
+    pub binding: Option<BindingId>,
 }
 
 impl ResourceLease {
@@ -75,7 +76,13 @@ impl ResourceLease {
             generation,
             state: LeaseState::Active,
             active_refs: 0,
+            binding: None,
         }
+    }
+
+    pub const fn with_binding(mut self, binding: BindingId) -> Self {
+        self.binding = Some(binding);
+        self
     }
 
     pub fn begin_revoke(&mut self) -> ElmResult<()> {
@@ -143,6 +150,12 @@ impl LeaseRegistry {
             .count()
     }
 
+    pub fn get_by_binding(&self, binding: BindingId) -> Option<&ResourceLease> {
+        self.leases
+            .values()
+            .find(|lease| lease.binding == Some(binding))
+    }
+
     pub fn revoke_all_owned_by(&mut self, owner: ElmId) -> ElmResult<usize> {
         let mut count = 0;
         for lease in self.leases.values_mut() {
@@ -152,6 +165,20 @@ impl LeaseRegistry {
             }
         }
         Ok(count)
+    }
+
+    pub fn revoke_and_remove(&mut self, id: LeaseId) -> ElmResult<LeaseId> {
+        let Some(lease) = self.leases.get_mut(&id) else {
+            return Err(ElmError::InvalidLeaseState);
+        };
+        if lease.state == LeaseState::Active {
+            lease.begin_revoke()?;
+        }
+        if lease.state == LeaseState::Revoking {
+            lease.finish_revoke()?;
+        }
+        self.leases.remove(&id);
+        Ok(id)
     }
 
     pub fn revoke_and_remove_owned_by(&mut self, owner: ElmId) -> ElmResult<Vec<LeaseId>> {

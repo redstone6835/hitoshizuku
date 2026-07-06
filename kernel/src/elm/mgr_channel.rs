@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use elm_model::{
     ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest,
     ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrResponseHeader,
+    ElmNexusBindRequest, ElmNexusUnbindRequest,
 };
 
 use super::{menu, with_core};
@@ -90,6 +91,38 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
             let payload = with_core(|core| core.audit_bytes());
             response_with_payload(payload)
         }
+        ElmMgrCallKind::QueryNexusBindings => {
+            let payload = with_core(|core| core.nexus_bindings_bytes());
+            response_with_payload(payload)
+        }
+        ElmMgrCallKind::PreflightBind => {
+            let Some(request) = read_nexus_bind_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let plan = with_core(|core| core.preflight_bind(request));
+            response_with_plain_payload(&plan)
+        }
+        ElmMgrCallKind::CommitBind => {
+            let Some(request) = read_nexus_bind_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = with_core(|core| core.commit_bind(request));
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::PreflightUnbind => {
+            let Some(request) = read_nexus_unbind_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let plan = with_core(|core| core.preflight_unbind(request));
+            response_with_plain_payload(&plan)
+        }
+        ElmMgrCallKind::CommitUnbind => {
+            let Some(request) = read_nexus_unbind_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = with_core(|core| core.commit_unbind(request));
+            response_with_plain_payload(&response)
+        }
     }
 }
 
@@ -134,6 +167,33 @@ fn read_lifecycle_plan_request(payload: &[u8]) -> Option<ElmLifecyclePlanRequest
         cell_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
         action: u32::from_le_bytes(payload[8..12].try_into().ok()?),
         flags: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    })
+}
+
+fn read_nexus_bind_request(payload: &[u8]) -> Option<ElmNexusBindRequest> {
+    if payload.len() != core::mem::size_of::<ElmNexusBindRequest>() {
+        return None;
+    }
+    let mut contract = [0u8; elm_model::ELM_NEXUS_CONTRACT_LEN];
+    contract.copy_from_slice(&payload[24..24 + elm_model::ELM_NEXUS_CONTRACT_LEN]);
+    Some(ElmNexusBindRequest {
+        cell_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        port_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        contract_len: u16::from_le_bytes(payload[20..22].try_into().ok()?),
+        reserved: u16::from_le_bytes(payload[22..24].try_into().ok()?),
+        contract,
+    })
+}
+
+fn read_nexus_unbind_request(payload: &[u8]) -> Option<ElmNexusUnbindRequest> {
+    if payload.len() != core::mem::size_of::<ElmNexusUnbindRequest>() {
+        return None;
+    }
+    Some(ElmNexusUnbindRequest {
+        binding_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
     })
 }
 

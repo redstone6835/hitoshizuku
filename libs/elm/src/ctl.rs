@@ -50,9 +50,10 @@ pub enum ElmCtlStatus {
 impl ElmCtlStatus {
     pub const fn from_error(error: &ElmError) -> Self {
         match error {
-            ElmError::CellNotFound | ElmError::PortNotFound | ElmError::ExtensionPointNotFound => {
-                Self::NotFound
-            }
+            ElmError::CellNotFound
+            | ElmError::PortNotFound
+            | ElmError::BindingNotFound
+            | ElmError::ExtensionPointNotFound => Self::NotFound,
             ElmError::LeaseBusy => Self::Busy,
             ElmError::PermissionDenied => Self::Permission,
             _ => Self::Invalid,

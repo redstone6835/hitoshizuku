@@ -1,18 +1,23 @@
 use crate::{
-    ActionId, BindingGraph, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
-    ELM_LIFECYCLE_REASON_HAS_EXTENSIONS, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_DETACH,
-    ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_PREFLIGHT, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID,
-    ELM_MGR_STATUS_OK, ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
+    ActionId, BindingGraph, BindingId, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
+    ELM_LIFECYCLE_REASON_HAS_EXTENSIONS, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND,
+    ELM_MGR_ACTION_DETACH, ELM_MGR_ACTION_UNBIND, ELM_MGR_POLICY_AUDIT,
+    ELM_MGR_POLICY_MENU_BINDING, ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
+    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO,
     ElmCellSnapshot, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
     ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError,
     ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
     ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
     ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
     ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
-    ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName, ElmPortSnapshot, ElmSnapshotHeader,
-    ElmState, ElmVersion, FlowContract, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry,
-    LeaseRights, LeaseState, ResourceLease, TopologyEventKind, builtin_port_descriptors,
-    first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
+    ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
+    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
+    ElmNexusUnbindRequest, ElmPortSnapshot, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract,
+    FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, PortId,
+    ResourceLease, TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason,
+    planned_final_state, state_code, status_from_blockers,
 };
 
 fn manifest(name: &str) -> ElmManifest {
@@ -87,6 +92,69 @@ fn binding_graph_tracks_parent_dependency_and_extension() {
 }
 
 #[test]
+fn binding_graph_tracks_capability_bindings() {
+    let mut graph = BindingGraph::new();
+    graph.insert_cell(ElmId(1), manifest("elm-mgr")).unwrap();
+    graph.insert_cell(ElmId(2), manifest("menu-demo")).unwrap();
+    graph
+        .add_capability_binding(
+            BindingId(7),
+            ElmId(2),
+            PortId(3),
+            contract("mgr.menu.item@1"),
+            Generation::FIRST,
+            Some(LeaseId(9)),
+        )
+        .unwrap();
+
+    let report = graph.validate().unwrap();
+    assert_eq!(report.capability_bindings, 1);
+
+    let binding = graph.capability_binding(BindingId(7)).unwrap();
+    assert_eq!(binding.consumer, ElmId(2));
+    assert_eq!(binding.port, PortId(3));
+    assert_eq!(binding.lease, Some(LeaseId(9)));
+    assert!(binding.active);
+    assert_eq!(
+        graph.capability_bindings_for_cell(ElmId(2)),
+        alloc::vec![BindingId(7)]
+    );
+    assert!(
+        graph
+            .capability_binding_for(ElmId(2), PortId(3), &contract("mgr.menu.item@1"))
+            .is_some()
+    );
+}
+
+#[test]
+fn binding_graph_rejects_duplicate_capability_binding() {
+    let mut graph = BindingGraph::new();
+    graph.insert_cell(ElmId(2), manifest("menu-demo")).unwrap();
+    graph
+        .add_capability_binding(
+            BindingId(7),
+            ElmId(2),
+            PortId(3),
+            contract("mgr.menu.item@1"),
+            Generation::FIRST,
+            Some(LeaseId(9)),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        graph.add_capability_binding(
+            BindingId(8),
+            ElmId(2),
+            PortId(3),
+            contract("mgr.menu.item@1"),
+            Generation::FIRST,
+            Some(LeaseId(10)),
+        ),
+        Err(ElmError::DuplicateBinding)
+    ));
+}
+
+#[test]
 fn binding_graph_rejects_parent_cycle() {
     let mut graph = BindingGraph::new();
     graph.insert_cell(ElmId(1), manifest("root")).unwrap();
@@ -144,6 +212,30 @@ fn binding_graph_removes_leaf_cell_edges() {
     assert_eq!(report.extension_edges, 1);
     assert!(graph.cell(ElmId(2)).is_none());
     assert!(graph.validate().is_ok());
+}
+
+#[test]
+fn binding_graph_removes_capability_binding() {
+    let mut graph = BindingGraph::new();
+    graph.insert_cell(ElmId(2), manifest("menu-demo")).unwrap();
+    graph
+        .add_capability_binding(
+            BindingId(7),
+            ElmId(2),
+            PortId(3),
+            contract("mgr.menu.item@1"),
+            Generation::FIRST,
+            Some(LeaseId(9)),
+        )
+        .unwrap();
+
+    let removed = graph.remove_capability_binding(BindingId(7)).unwrap();
+    assert_eq!(removed.consumer, ElmId(2));
+    assert!(graph.capability_binding(BindingId(7)).is_none());
+    assert!(matches!(
+        graph.remove_capability_binding(BindingId(7)),
+        Err(ElmError::BindingNotFound)
+    ));
 }
 
 #[test]
@@ -218,6 +310,30 @@ fn lease_registry_reports_busy_owned_leases() {
     registry.get_mut(LeaseId(1)).unwrap().active_refs = 2;
     assert_eq!(registry.busy_owned_by(ElmId(7)), 1);
     assert_eq!(registry.busy_owned_by(ElmId(8)), 0);
+}
+
+#[test]
+fn lease_registry_tracks_binding_owner() {
+    let mut registry = LeaseRegistry::new();
+    registry
+        .insert(
+            ResourceLease::new(
+                LeaseId(1),
+                ElmId(7),
+                LeaseKind::MenuItem,
+                LeaseRights::CONTROL,
+                Generation::FIRST,
+            )
+            .with_binding(BindingId(9)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.get_by_binding(BindingId(9)).map(|lease| lease.id),
+        Some(LeaseId(1))
+    );
+    assert_eq!(registry.revoke_and_remove(LeaseId(1)).unwrap(), LeaseId(1));
+    assert!(registry.get(LeaseId(1)).is_none());
 }
 
 #[test]
@@ -365,6 +481,40 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     assert_eq!(policy.audit_capacity, 128);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_PREFLIGHT, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_AUDIT, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_NEXUS_BINDING, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_MENU_BINDING, 0);
+    assert_ne!(policy.supported_actions & ELM_MGR_ACTION_BIND, 0);
+    assert_ne!(policy.supported_actions & ELM_MGR_ACTION_UNBIND, 0);
+}
+
+#[test]
+fn nexus_binding_abi_records_are_fixed_layout() {
+    let request = ElmNexusBindRequest::new(7, 3, "mgr.menu.item@1");
+    assert_eq!(request.cell_id, 7);
+    assert_eq!(request.port_id, 3);
+    assert_eq!(request.contract_len, "mgr.menu.item@1".len() as u16);
+    assert_eq!(request.contract.len(), ELM_NEXUS_CONTRACT_LEN);
+    assert_eq!(core::mem::size_of::<ElmNexusBindRequest>(), 88);
+
+    let response = ElmNexusBindPlanResponse::new(7, 3, 11, 12, 1, true, ELM_MGR_STATUS_OK, 0);
+    assert_eq!(response.allowed, 1);
+    assert_eq!(response.binding_id, 11);
+    assert_eq!(response.lease_id, 12);
+    assert_eq!(core::mem::size_of::<ElmNexusBindPlanResponse>(), 64);
+
+    let unbind = ElmNexusUnbindRequest::new(11);
+    assert_eq!(unbind.binding_id, 11);
+    assert_eq!(core::mem::size_of::<ElmNexusUnbindRequest>(), 16);
+
+    let header = ElmNexusBindingSnapshotHeader::new(1, 9);
+    assert_eq!(header.binding_count, 1);
+    assert_eq!(header.event_sequence, 9);
+    assert_eq!(core::mem::size_of::<ElmNexusBindingSnapshotHeader>(), 16);
+
+    let record = ElmNexusBindingRecord::new(11, 7, 3, 12, 1, true, "mgr.menu.item@1");
+    assert_eq!(record.active, 1);
+    assert_eq!(record.contract_len, "mgr.menu.item@1".len() as u16);
+    assert_eq!(core::mem::size_of::<ElmNexusBindingRecord>(), 120);
 }
 
 #[test]
@@ -420,6 +570,18 @@ fn lifecycle_status_helpers_report_planned_result() {
         state_code(ElmState::Active)
     );
     assert_eq!(status_from_blockers(0), ELM_MGR_STATUS_OK);
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_PORT_TODO),
+        ELM_MGR_STATUS_TODO
+    );
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_DUPLICATE_BINDING),
+        ELM_MGR_STATUS_BUSY
+    );
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_CONTRACT_MISMATCH),
+        ELM_MGR_STATUS_INVALID
+    );
 }
 
 #[test]

@@ -310,6 +310,10 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - `MGR_CALL(QueryTopology)` 已返回父子、依赖、拓展点和拓展项组成的关系快照。
 - `MGR_CALL(PreflightLifecycle)` 已支持暂停、恢复、脱离和替换的策略预检。
 - `MGR_CALL(QueryAudit)` 已返回管理操作审计环，包括动作、状态、阻断位和最终状态。
+- `MGR_CALL(QueryNexusBindings)` 已返回能力织网绑定快照。
+- `MGR_CALL(PreflightBind/CommitBind)` 已支持内建菜单端口 `mgr.menu.item@1` 的绑定预检和提交。
+- `MGR_CALL(PreflightUnbind/CommitUnbind)` 已支持动态能力绑定的预检和撤销；内建保护绑定不可撤销。
+- 绑定图已记录真实能力绑定边，并将绑定、菜单租约和菜单项纳入同一条撤销链路。
 - EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明和入口声明。
 - `MGR_CALL(LoadCell)` 已保留命令号；在 soyo 解析器接入前返回 `TODO(elm)` 并记录 `LOAD_REQUIRES_SOYO` 审计，不再接受旧 flat EBI 字节格式。
 - 纯声明 EBI 协议对象可进入 `Active`。
@@ -326,7 +330,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 - soyo 文件格式、soyo 解析器以及 soyo 到 EBI 协议对象的转换层。
 - 热替换、影子绑定、状态迁移和回滚。
 - 原生代码单元的暂停、恢复、静默化回调和卸载执行器。
-- 设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实提供者。
+- `core.log@1`、`core.event@1` 以及设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
 
 ## 12. 禁止事项
 
