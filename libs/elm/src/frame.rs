@@ -7,12 +7,65 @@ pub const ELM_FRAME_PAYLOAD_LEN: usize = 256;
 
 pub const ELM_CALL_FLAG_NONE: u32 = 0;
 
+pub const ELM_ACTION_OPCODE_INVOKE: u32 = 1;
+pub const ELM_ACTION_RESULT_HEALTH: u32 = 1;
+
 pub const ELM_CALL_STATUS_OK: i32 = 0;
 pub const ELM_CALL_STATUS_NOT_FOUND: i32 = -2;
 pub const ELM_CALL_STATUS_BUSY: i32 = -16;
 pub const ELM_CALL_STATUS_INVALID: i32 = -22;
 pub const ELM_CALL_STATUS_UNSUPPORTED: i32 = -95;
 pub const ELM_CALL_STATUS_PROVIDER_FAULT: i32 = -4098;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmActionInvokeRequest {
+    pub action_id: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmActionInvokeRequest {
+    pub const fn new(action_id: u64) -> Self {
+        Self {
+            action_id,
+            flags: ELM_CALL_FLAG_NONE,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmActionInvokeReply {
+    pub action_id: u64,
+    pub menu_item_id: u64,
+    pub owner_cell_id: u64,
+    pub result_kind: u32,
+    pub result_code: i32,
+    pub event_sequence: u64,
+    pub reserved: u64,
+}
+
+impl ElmActionInvokeReply {
+    pub const fn health(
+        action_id: u64,
+        menu_item_id: u64,
+        owner_cell_id: u64,
+        result_code: i32,
+        event_sequence: u64,
+    ) -> Self {
+        Self {
+            action_id,
+            menu_item_id,
+            owner_cell_id,
+            result_kind: ELM_ACTION_RESULT_HEALTH,
+            result_code,
+            event_sequence,
+            reserved: 0,
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

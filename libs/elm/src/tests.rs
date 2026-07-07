@@ -1,8 +1,9 @@
 use crate::{
-    ActionId, BindingGraph, BindingId, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_DETAIL_NONE,
-    ELM_HEALTH_FLAG_HAS_FAILURES, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
-    ELM_LIFECYCLE_REASON_HAS_EXTENSIONS, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND,
-    ELM_MGR_ACTION_DETACH, ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_UNBIND, ELM_MGR_MAX_INPUT,
+    ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH,
+    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_DETAIL_NONE, ELM_HEALTH_FLAG_HAS_FAILURES,
+    ELM_LIFECYCLE_REASON_HAS_DEPENDENTS, ELM_LIFECYCLE_REASON_HAS_EXTENSIONS,
+    ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_DETACH,
+    ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_INPUT,
     ELM_MGR_MAX_PAYLOAD, ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING,
     ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT, ELM_MGR_POLICY_PROVIDER_PORTS,
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
@@ -10,13 +11,14 @@ use crate::{
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
     ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_PORT_FLAG_NONE, ELM_RUNTIME_LOG_MESSAGE_LEN,
-    ElmCallFrame, ElmCellSnapshot, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo,
-    ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment,
-    ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord, ElmId, ElmKind,
-    ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleRequest,
-    ElmLifecycleResponse, ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader,
-    ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo,
-    ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName,
+    ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmCellSnapshot,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry,
+    ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit,
+    ElmError, ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
+    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrRelationKind,
+    ElmMgrRelationRecord, ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName,
     ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
     ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPortSnapshot,
     ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRecord,
@@ -426,6 +428,13 @@ fn builtin_ports_include_mgr_menu_and_todo_ports() {
         port.contract == "core.event@1" && port.id == crate::PortId(2) && port.implemented
     }));
     assert!(ports.iter().any(|port| port.contract == "mgr.menu.item@1"));
+    assert!(ports.iter().any(|port| {
+        port.contract == "mgr.action.invoke@1"
+            && port.id == crate::PortId(4)
+            && port.owner == Some(ELM_MGR_BUILTIN_ID)
+            && port.implemented
+            && port.invokable
+    }));
     assert!(ports.iter().any(|port| !port.implemented));
 }
 
@@ -616,6 +625,24 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
 
 #[test]
 fn call_frame_abi_is_fixed_layout() {
+    assert_eq!(ELM_ACTION_OPCODE_INVOKE, 1);
+    assert_eq!(ELM_ACTION_RESULT_HEALTH, 1);
+
+    let action_request = ElmActionInvokeRequest::new(100);
+    assert_eq!(action_request.action_id, 100);
+    assert_eq!(action_request.flags, 0);
+    assert_eq!(action_request.reserved, 0);
+    assert_eq!(core::mem::size_of::<ElmActionInvokeRequest>(), 16);
+
+    let action_reply = ElmActionInvokeReply::health(100, 101, 1, ELM_MGR_STATUS_OK, 9);
+    assert_eq!(action_reply.action_id, 100);
+    assert_eq!(action_reply.menu_item_id, 101);
+    assert_eq!(action_reply.owner_cell_id, 1);
+    assert_eq!(action_reply.result_kind, ELM_ACTION_RESULT_HEALTH);
+    assert_eq!(action_reply.result_code, ELM_MGR_STATUS_OK);
+    assert_eq!(action_reply.event_sequence, 9);
+    assert_eq!(core::mem::size_of::<ElmActionInvokeReply>(), 48);
+
     let frame = ElmCallFrame::new(11, 9, 1, b"hello");
     assert_eq!(frame.binding_id, 11);
     assert_eq!(frame.call_id, 9);

@@ -3,17 +3,21 @@ use ktest::ktest;
 use alloc::vec::Vec;
 
 use elm_model::{
+    ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_CALL_STATUS_INVALID,
+    ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_UNSUPPORTED,
     ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
     ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
-    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_MGR_STATUS_INVALID,
-    ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_NEXUS_CONTRACT_LEN,
-    ELM_POLICY_BLOCK_PORT_TODO, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_TODO_BACKEND,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLoadStatus, ElmEbiMenuDecl,
-    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmId, ElmKind, ElmManifest,
-    ElmMenuItemKind, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrResponseHeader,
-    ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmPortAccessPolicy,
-    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
-    ElmState, ElmVersion, FlowDirection, FlowMode, state_code,
+    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_MENU_FLAG_TODO,
+    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
+    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_PORT_TODO, ELM_PROVIDER_FLAG_DYNAMIC,
+    ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest,
+    ElmCallFrame, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmId, ElmKind,
+    ElmManifest, ElmMenuItemKind, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo,
+    ElmMgrResponseHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderPortRegisterRequest,
+    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmState, ElmVersion,
+    FlowDirection, FlowMode, state_code,
 };
 
 use super::core::{ELM_MGR_ID, ElmCore};
@@ -141,6 +145,14 @@ fn nexus_bind_payload(request: &ElmNexusBindRequest) -> Vec<u8> {
     out
 }
 
+fn action_invoke_payload(request: &ElmActionInvokeRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, request.action_id);
+    push_u32(&mut out, request.flags);
+    push_u32(&mut out, request.reserved);
+    out
+}
+
 fn response_status(bytes: &[u8]) -> i32 {
     read_i32(bytes, 0)
 }
@@ -163,6 +175,10 @@ fn elm_builtin_mgr_init_health_is_clean() {
     assert_eq!(core.cells().len(), 1);
     assert_eq!(core.cells()[0].id, ELM_MGR_ID);
     assert_eq!(core.cells()[0].state, ElmState::Active);
+    assert_eq!(core.menu_items().len(), 1);
+    assert_eq!(core.menu_items()[0].owner, ELM_MGR_ID);
+    assert_eq!(core.menu_items()[0].route, "elm/mgr/health");
+    assert_eq!(core.menu_items()[0].flags & ELM_MENU_FLAG_TODO, 0);
 
     let health = core.health_bytes();
     assert_eq!(read_i32(&health, 8), ELM_MGR_STATUS_OK);
@@ -197,7 +213,7 @@ fn elm_menu_ebi_unit_reaches_active_state() {
     let response = core.load_ebi_unit(menu_unit("elm-test-menu"), ElmEbiArch::Riscv64);
     assert_eq!(response.status, ElmEbiLoadStatus::Ok as i32);
     assert_eq!(response.final_state, state_code(ElmState::Active));
-    assert_eq!(core.menu_items().len(), 1);
+    assert_eq!(core.menu_items().len(), 2);
 
     let cell = core
         .cells()
@@ -206,6 +222,95 @@ fn elm_menu_ebi_unit_reaches_active_state() {
         .unwrap();
     assert_eq!(cell.parent, Some(ELM_MGR_ID));
     assert_eq!(cell.state, ElmState::Active);
+}
+
+#[ktest]
+fn elm_mgr_action_provider_invokes_builtin_health_action() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+
+    let action = core
+        .menu_items()
+        .iter()
+        .find(|item| item.route == "elm/mgr/health")
+        .unwrap()
+        .action;
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, 4, "mgr.action.invoke@1");
+    let plan = core.preflight_bind(bind);
+    assert_eq!(plan.allowed, 1);
+    assert_eq!(plan.status, ELM_MGR_STATUS_OK);
+
+    let bind_response = core.commit_bind(bind);
+    assert_eq!(bind_response.allowed, 1);
+    assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
+
+    let payload = action_invoke_payload(&ElmActionInvokeRequest::new(action.0));
+    let frame = ElmCallFrame::new(
+        bind_response.binding_id,
+        1,
+        ELM_ACTION_OPCODE_INVOKE,
+        &payload,
+    );
+    let response = core
+        .invoke_provider(ElmProviderInvokeRequest::new(frame))
+        .unwrap();
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_OK);
+    assert_eq!(
+        response.reply.payload_len as usize,
+        core::mem::size_of::<elm_model::ElmActionInvokeReply>()
+    );
+    assert_eq!(read_u64(&response.reply.payload, 0), action.0);
+    assert_eq!(read_u64(&response.reply.payload, 16), ELM_MGR_ID.0);
+    assert_eq!(
+        read_u32(&response.reply.payload, 24),
+        ELM_ACTION_RESULT_HEALTH
+    );
+    assert_eq!(read_i32(&response.reply.payload, 28), ELM_MGR_STATUS_OK);
+
+    let payload = action_invoke_payload(&ElmActionInvokeRequest::new(999_999));
+    let frame = ElmCallFrame::new(
+        bind_response.binding_id,
+        2,
+        ELM_ACTION_OPCODE_INVOKE,
+        &payload,
+    );
+    let response = core
+        .invoke_provider(ElmProviderInvokeRequest::new(frame))
+        .unwrap();
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_NOT_FOUND);
+
+    let frame = ElmCallFrame::new(bind_response.binding_id, 3, 0xffff, &[]);
+    let response = core
+        .invoke_provider(ElmProviderInvokeRequest::new(frame))
+        .unwrap();
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_UNSUPPORTED);
+
+    let frame = ElmCallFrame::new(bind_response.binding_id, 4, ELM_ACTION_OPCODE_INVOKE, b"x");
+    let response = core
+        .invoke_provider(ElmProviderInvokeRequest::new(frame))
+        .unwrap();
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_INVALID);
+
+    let stats = core.provider_stats_bytes();
+    let header_size = core::mem::size_of::<ElmProviderPortStatsHeader>();
+    let record_size = read_u16(&stats, 2) as usize;
+    let record_count = read_u32(&stats, 4) as usize;
+    let mut found = false;
+    for index in 0..record_count {
+        let offset = header_size + index * record_size;
+        if read_u64(&stats, offset) != 4 {
+            continue;
+        }
+        found = true;
+        assert_eq!(read_u64(&stats, offset + 8), ELM_MGR_ID.0);
+        assert_eq!(
+            read_u32(&stats, offset + 20),
+            u32::from(ELM_PROVIDER_FLAG_KERNEL_BACKEND)
+        );
+        assert_eq!(read_u64(&stats, offset + 24), 1);
+        assert_eq!(read_u64(&stats, offset + 32), 3);
+    }
+    assert!(found);
 }
 
 #[ktest]

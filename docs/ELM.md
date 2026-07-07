@@ -129,10 +129,11 @@ ELM 的运行模型由五个对象构成：
 - `core.log@1`：单元通过运行时绑定提交固定长度日志，内核写入日志系统，并累计提交次数。
 - `core.event@1`：单元通过运行时绑定按游标读取 ELM 事件，确认事件游标，并统计投递和丢弃事件数。
 - `mgr.menu.item@1`：单元通过菜单绑定向 `elm-mgr` 注册菜单项，菜单项与绑定、租约处于同一撤销链路。
+- `mgr.action.invoke@1`：`elm-mgr` 通过 provider 调用帧执行内建管理动作，当前已支持 Core 健康检查动作。
 - 动态端口提供者：内核单元可以注册带访问策略的 provider 端口，端口会进入快照、审计和统计路径。
-- 同步调用帧：ABI 已稳定为 `ElmCallFrame` / `ElmReplyFrame`，但真实执行器接入前不会把 TODO provider 伪装成可调用能力。
+- 同步调用帧：ABI 已稳定为 `ElmCallFrame` / `ElmReplyFrame`；已接入 kernel-backed 管理动作 provider，动态 ELM 原生 provider 仍保持 TODO 边界。
 
-第一版同步调用帧固定内联载荷为 256 字节。调用帧只表达 `binding_id`、`call_id`、`opcode`、`flags` 和 payload，不携带指针，也不绑定文件格式。当前内核已经移除测试 provider 硬编码；动态 provider 只能作为声明进入能力织网，真实执行器仍是 `TODO(elm)`。
+第一版同步调用帧固定内联载荷为 256 字节。调用帧只表达 `binding_id`、`call_id`、`opcode`、`flags` 和 payload，不携带指针，也不绑定文件格式。`mgr.action.invoke@1` 使用 `ElmActionInvokeRequest` 和 `ElmActionInvokeReply` 作为 payload ABI；动态 provider 只能作为声明进入能力织网，真实 ELM 原生执行器仍是 `TODO(elm)`。
 
 ## 5. 能力织网
 
@@ -185,7 +186,7 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
 | `core.log@1` | Sink | Shared | 已实现 | 单元向内核日志提交固定长度运行时日志 |
 | `core.event@1` | Source | Broadcast | 已实现 | 单元按游标读取 ELM 拓扑和管理事件 |
 | `mgr.menu.item@1` | Sink | Ordered | 已实现 | 单元向 `elm-mgr` 注册菜单项 |
-| `mgr.action.invoke@1` | Control | Shared | TODO(elm) | 菜单动作和管理动作调用入口 |
+| `mgr.action.invoke@1` | Control | Shared | 已实现第一版 | `elm-mgr` 内建管理动作调用入口，当前支持健康检查动作 |
 | `device.discovered@1` | Source | Broadcast | TODO(elm) | 设备发现事件流 |
 | `device.claim@1` | Control | Exclusive | TODO(elm) | 设备声明、抢占和释放控制 |
 | `irq.event@1` | Source | Shared | TODO(elm) | IRQ 事件分发 |
@@ -784,6 +785,7 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - `CellRuntime` 保存单元 ID、parent、state、kind、generation、name、EBI 架构、EBI 状态、是否含原生代码、拥有的绑定和菜单项。
 - `RuntimePortBinding` 保存 binding、cell、port、lease、cursor、submitted_logs、delivered_events 和 dropped_events。
 - `ProviderRuntime` 保存 port、owner、访问策略、执行器状态、是否动态、调用次数、失败次数和撤销次数。
+- `ProviderBackend::Kernel(kind)` 表示已接入的内核 provider 执行器；当前第一个真实执行器是 `MgrActionInvoke`。
 - 事件环和审计环容量当前均为 128。
 - 动态 cell ID 从 100 开始，避免与内建 ID 冲突。
 - 动态 port ID 从 100 开始，避免与内建端口冲突。
@@ -792,7 +794,8 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - `core.log@1` 创建 `RuntimePort` 写租约。
 - `core.event@1` 创建 `RuntimePort` 读租约。
 - `mgr.menu.item@1` 创建菜单租约和菜单项。
-- 动态 provider 端口在真实执行器接入前只登记声明，不创建可调用后端。
+- `elm-mgr` 启动时会注册一个内建健康检查菜单动作，该动作不带 TODO 标志，通过 `mgr.action.invoke@1` 调用。
+- 动态 provider 端口在真实 ELM 原生执行器接入前只登记声明，不创建可调用后端。
 - `ProviderBackend::ElmNativeTodo` 明确标记未来由真实 ELM 原生代码提供的执行器边界。
 - `ProviderRuntime::record_flags()` 是 provider 观测 flags 的唯一派生入口，`QueryProviderPorts` 和 `QueryProviderStats` 使用同一套 flags 语义。
 - detach 会阻断仍有子单元、依赖者、拓展项或 busy 租约的目标单元。
@@ -841,6 +844,7 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - 运行时日志和事件命令会校验 binding 是否存在、端口是否匹配、租约和状态是否允许。
 - provider 注册命令会校验 owner、契约、方向、模式、访问策略和保留 flags。
 - provider 调用命令会校验 binding、租约、端口可调用性和 payload 长度。
+- provider transport 错误通过 `MGR_CALL` response status 返回；provider 业务结果通过 `ElmReplyFrame.status` 和 reply payload 返回。
 
 ### `ports.rs`
 
@@ -932,11 +936,11 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(QueryRuntimePorts)` 已返回运行时端口绑定统计，包括日志提交数、事件投递数和丢弃事件数。
 - `MGR_CALL(RegisterProviderPort/UnregisterProviderPort)` 已支持动态 provider 端口声明注册和注销；动态端口合约由运行时自有字符串保存，不再泄漏为静态字符串。
 - `MGR_CALL(QueryProviderPorts/QueryProviderStats)` 已返回 provider 端口、访问策略、绑定数量、调用次数、失败次数、撤销次数和 provider 观测 flags。
-- `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；没有真实执行器的 provider 会返回 `TODO(elm)` 或 `UNSUPPORTED`，不会伪装成调用成功。
+- `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；`mgr.action.invoke@1` 已接入 kernel-backed 执行器，动态 ELM 原生 provider 仍返回 `TODO(elm)`。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event 和 audit 不变量破坏。
 - `MGR_CALL` 管理通道已收口输入上限、请求头构造器、保留位零值策略和无 payload 查询命令校验；格式错误统一返回 `INVALID`，未知命令号返回 `UNSUPPORTED`。
 - 动态 provider 端口已支持 `Public`、`ExtensionOnly` 和 `Internal` 三类访问策略。
-- 动态 provider 端口在真实执行器接入前会被预检阻断为 `PORT_TODO`，已纳入 provider busy、注销和观测链路。
+- 动态 provider 端口在真实 ELM 原生执行器接入前会被预检阻断为 `PORT_TODO`，已纳入 provider busy、注销和观测链路。
 - `MGR_CALL(PreflightUnbind/CommitUnbind)` 已支持动态能力绑定的预检和撤销；内建保护绑定不可撤销。
 - 绑定图已记录真实能力绑定边，并将绑定、菜单租约和菜单项纳入同一条撤销链路。
 - EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明和入口声明。
@@ -948,7 +952,7 @@ ELM 的可观测性由四条路径组成：
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项或忙碌租约的目标单元，避免破坏当前拓扑。
 - `ReplaceCell` 已保留稳定命令号，当前返回结构化预检结果并记录 `REPLACE_TODO` 审计。
-- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、菜单 EBI 激活、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
+- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 成功调用路径、菜单 EBI 激活、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
 
 尚未完成：
 
@@ -969,8 +973,8 @@ ELM 的可观测性由四条路径组成：
 - 保持 host 单测覆盖模型约束。
 - 保持内核 `kernel-tests` 覆盖第一阶段管理闭环，不让 provider flags、health、管理通道 ABI、EBI 装载状态和动态 provider TODO 边界退化。
 - 保持 `sys_elm_ctl`、`MGR_CALL`、快照、事件和审计 ABI 稳定。
-- 完成 `core.log@1`、`core.event@1`、`mgr.menu.item@1` 三个基础端口的闭环。
-- 完成动态 provider 端口声明注册、访问策略、同步调用帧 ABI、撤销和统计闭环；真实执行器接入前绑定提交保持 TODO 阻断。
+- 完成 `core.log@1`、`core.event@1`、`mgr.menu.item@1` 和 `mgr.action.invoke@1` 四个基础端口的闭环。
+- 完成动态 provider 端口声明注册、访问策略、同步调用帧 ABI、撤销和统计闭环；真实 ELM 原生执行器接入前绑定提交保持 TODO 阻断。
 
 第二阶段：`soyo` 与 EBI 接入。
 

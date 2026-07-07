@@ -18,6 +18,8 @@ pub struct LeaseId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
 
+pub const ELM_MGR_BUILTIN_ID: ElmId = ElmId(1);
+
 impl Generation {
     pub const FIRST: Self = Self(1);
 

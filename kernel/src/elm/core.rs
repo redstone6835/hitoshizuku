@@ -5,20 +5,22 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use elm_model::{
-    ActionId, BindingGraph, BindingId, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
-    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU,
-    ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS,
-    ELM_HEALTH_DETAIL_CONTRACT_INVALID, ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
-    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT, ELM_HEALTH_DETAIL_GRAPH_INVALID,
-    ELM_HEALTH_DETAIL_KIND_MISMATCH, ELM_HEALTH_DETAIL_MISSING_OBJECT,
-    ELM_HEALTH_DETAIL_SEQUENCE_INVALID, ELM_HEALTH_DETAIL_STATE_INVALID,
-    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT, ELM_LIFECYCLE_REASON_LEASE_BUSY,
-    ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO,
-    ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_REGISTER,
-    ELM_MGR_ACTION_PROVIDER_UNREGISTER, ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
-    ELM_MGR_ACTION_RUNTIME_EVENT_READ, ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND,
-    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+    ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_CALL_STATUS_INVALID,
+    ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_UNSUPPORTED,
+    ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
+    ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
+    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
+    ELM_HEALTH_DETAIL_DANGLING_REFERENCE, ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+    ELM_HEALTH_DETAIL_GRAPH_INVALID, ELM_HEALTH_DETAIL_KIND_MISMATCH,
+    ELM_HEALTH_DETAIL_MISSING_OBJECT, ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+    ELM_HEALTH_DETAIL_STATE_INVALID, ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+    ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
+    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_INVOKE,
+    ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
+    ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
+    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_STATUS_BUSY,
+    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
+    ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
     ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
     ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
     ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
@@ -27,35 +29,38 @@ use elm_model::{
     ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
     ELM_POLICY_BLOCK_REPLACE_TODO, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCoreHealthHeader,
-    ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError,
-    ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
-    ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest,
-    ElmMenuItemKind, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind,
-    ElmMgrRelationRecord, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
-    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmProviderInvokeRequest,
-    ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
-    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
-    ElmProviderPortUnregisterRequest, ElmRuntimeEventRequest, ElmRuntimeEventResponse,
-    ElmRuntimeLogRequest, ElmRuntimeLogResponse, ElmRuntimePortStatsHeader,
-    ElmRuntimePortStatsRecord, ElmState, ElmVersion, FlowContract, FlowDirection, FlowMode,
-    Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease,
-    TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason, planned_final_state,
-    state_code, status_from_blockers,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmActionInvokeReply,
+    ElmActionInvokeRequest, ElmCallFrame, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo,
+    ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId,
+    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
+    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
+    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
+    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
+    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
+    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
+    ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind,
+    LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
+    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
+    status_from_blockers,
 };
 use sched::sync::Spinlock;
 
 use super::menu::MenuItemRuntime;
 use super::ports::PortRuntime;
 
-pub(crate) const ELM_MGR_ID: ElmId = ElmId(1);
+pub(crate) const ELM_MGR_ID: ElmId = ELM_MGR_BUILTIN_ID;
 const ELM_CORE_LOG_PORT_ID: PortId = PortId(1);
 const ELM_CORE_EVENT_PORT_ID: PortId = PortId(2);
 const ELM_MGR_MENU_PORT_ID: PortId = PortId(3);
+const ELM_MGR_ACTION_PORT_ID: PortId = PortId(4);
 const ELM_CORE_LOG_CONTRACT: &str = "core.log@1";
 const ELM_CORE_EVENT_CONTRACT: &str = "core.event@1";
 const ELM_MGR_MENU_CONTRACT: &str = "mgr.menu.item@1";
+const ELM_MGR_ACTION_CONTRACT: &str = "mgr.action.invoke@1";
 const FIRST_DYNAMIC_CELL_ID: u64 = 100;
 const FIRST_DYNAMIC_PORT_ID: u64 = 100;
 const EVENT_RING_LIMIT: usize = 128;
@@ -92,8 +97,14 @@ struct RuntimePortBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderBackend {
-    KernelImplemented,
+    Kernel(KernelProviderKind),
     ElmNativeTodo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelProviderKind {
+    StaticPort,
+    MgrActionInvoke,
 }
 
 #[derive(Debug, Clone)]
@@ -115,11 +126,24 @@ impl ProviderRuntime {
             flags |= ELM_PROVIDER_FLAG_DYNAMIC;
         }
         match self.backend {
-            ProviderBackend::KernelImplemented => flags |= ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+            ProviderBackend::Kernel(_) => flags |= ELM_PROVIDER_FLAG_KERNEL_BACKEND,
             ProviderBackend::ElmNativeTodo => flags |= ELM_PROVIDER_FLAG_TODO_BACKEND,
         }
         flags
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MgrActionKind {
+    Health,
+}
+
+#[derive(Debug, Clone)]
+struct MgrActionRuntime {
+    action: ActionId,
+    menu_item: u64,
+    owner: ElmId,
+    kind: MgrActionKind,
 }
 
 pub(crate) struct ElmCore {
@@ -130,6 +154,7 @@ pub(crate) struct ElmCore {
     providers: Vec<ProviderRuntime>,
     runtime_ports: Vec<RuntimePortBinding>,
     menu_items: Vec<MenuItemRuntime>,
+    mgr_actions: Vec<MgrActionRuntime>,
     menu_generation: Generation,
     leases: LeaseRegistry,
     events: Vec<ElmEventRecord>,
@@ -162,6 +187,7 @@ impl ElmCore {
             providers: Vec::new(),
             runtime_ports: Vec::new(),
             menu_items: Vec::new(),
+            mgr_actions: Vec::new(),
             menu_generation: Generation::FIRST,
             leases: LeaseRegistry::new(),
             events: Vec::new(),
@@ -215,6 +241,7 @@ impl ElmCore {
         self.emit(TopologyEventKind::CellAdded, Some(ELM_MGR_ID));
         self.emit(TopologyEventKind::CellStateChanged, Some(ELM_MGR_ID));
         self.register_builtin_ports();
+        self.register_builtin_mgr_actions()?;
         self.initialized = true;
         log::info!("[elm] Core initialized with builtin elm-mgr");
         Ok(())
@@ -616,14 +643,9 @@ impl ElmCore {
                 .saturating_add(1);
             return Err(ELM_MGR_STATUS_UNSUPPORTED);
         }
-        let reply: elm_model::ElmReplyFrame = match self.providers[provider_index].backend {
-            ProviderBackend::KernelImplemented => {
-                // TODO(elm): 未来真实内核 provider 在这里挂接稳定执行器表。
-                self.providers[provider_index].failed_calls = self.providers[provider_index]
-                    .failed_calls
-                    .saturating_add(1);
-                Err(ELM_MGR_STATUS_UNSUPPORTED)
-            }
+        let backend = self.providers[provider_index].backend;
+        let reply = match backend {
+            ProviderBackend::Kernel(kind) => self.invoke_kernel_provider(kind, &edge, frame),
             ProviderBackend::ElmNativeTodo => {
                 self.providers[provider_index].failed_calls = self.providers[provider_index]
                     .failed_calls
@@ -631,6 +653,14 @@ impl ElmCore {
                 Err(ELM_MGR_STATUS_TODO)
             }
         }?;
+        if reply.status == ELM_CALL_STATUS_OK {
+            self.providers[provider_index].calls =
+                self.providers[provider_index].calls.saturating_add(1);
+        } else {
+            self.providers[provider_index].failed_calls = self.providers[provider_index]
+                .failed_calls
+                .saturating_add(1);
+        }
         self.record_mgr_audit(
             ELM_MGR_ACTION_PROVIDER_INVOKE,
             edge.consumer,
@@ -638,6 +668,72 @@ impl ElmCore {
             self.cell_state(edge.consumer).map(state_code).unwrap_or(0),
         );
         Ok(ElmProviderInvokeResponse::new(reply))
+    }
+
+    fn invoke_kernel_provider(
+        &self,
+        kind: KernelProviderKind,
+        edge: &elm_model::CapabilityBindingEdge,
+        frame: ElmCallFrame,
+    ) -> Result<ElmReplyFrame, i32> {
+        match kind {
+            KernelProviderKind::MgrActionInvoke => self.invoke_mgr_action_provider(edge, frame),
+            KernelProviderKind::StaticPort => Ok(ElmReplyFrame::empty(
+                frame.binding_id,
+                frame.call_id,
+                ELM_CALL_STATUS_UNSUPPORTED,
+            )),
+        }
+    }
+
+    fn invoke_mgr_action_provider(
+        &self,
+        _edge: &elm_model::CapabilityBindingEdge,
+        frame: ElmCallFrame,
+    ) -> Result<ElmReplyFrame, i32> {
+        if frame.opcode != ELM_ACTION_OPCODE_INVOKE {
+            return Ok(ElmReplyFrame::empty(
+                frame.binding_id,
+                frame.call_id,
+                ELM_CALL_STATUS_UNSUPPORTED,
+            ));
+        }
+        let Some(request) = read_action_invoke_request(&frame) else {
+            return Ok(ElmReplyFrame::empty(
+                frame.binding_id,
+                frame.call_id,
+                ELM_CALL_STATUS_INVALID,
+            ));
+        };
+        let Some(action) = self
+            .mgr_actions
+            .iter()
+            .find(|action| action.action.0 == request.action_id)
+        else {
+            return Ok(ElmReplyFrame::empty(
+                frame.binding_id,
+                frame.call_id,
+                ELM_CALL_STATUS_NOT_FOUND,
+            ));
+        };
+        match action.kind {
+            MgrActionKind::Health => {
+                let (health_status, _) = self.health_records();
+                let reply = ElmActionInvokeReply::health(
+                    action.action.0,
+                    action.menu_item,
+                    action.owner.0,
+                    health_status,
+                    self.last_event_sequence(),
+                );
+                Ok(ElmReplyFrame::new(
+                    frame.binding_id,
+                    frame.call_id,
+                    ELM_CALL_STATUS_OK,
+                    plain_bytes(&reply),
+                ))
+            }
+        }
     }
 
     pub fn submit_runtime_log(
@@ -1758,7 +1854,7 @@ impl ElmCore {
                 ));
             }
             match provider.backend {
-                ProviderBackend::KernelImplemented if !port.implemented => {
+                ProviderBackend::Kernel(_) if !port.implemented => {
                     records.push(ElmCoreHealthRecord::invalid(
                         ELM_HEALTH_CHECK_PROVIDERS,
                         provider.port.0,
@@ -2140,7 +2236,7 @@ impl ElmCore {
                     port: desc.id,
                     owner: desc.owner,
                     access: desc.access,
-                    backend: ProviderBackend::KernelImplemented,
+                    backend: ProviderBackend::Kernel(kernel_provider_kind(desc.id)),
                     dynamic: false,
                     calls: 0,
                     failed_calls: 0,
@@ -2149,6 +2245,32 @@ impl ElmCore {
             }
         }
         log::info!("[elm] registered {} Nexus ports", self.ports.len());
+    }
+
+    fn register_builtin_mgr_actions(&mut self) -> Result<(), ElmError> {
+        let cell_index = self.cell_index(ELM_MGR_ID).ok_or(ElmError::CellNotFound)?;
+        let action = self.alloc_action_id();
+        let menu_item = self.alloc_menu_item_id();
+        self.menu_items.push(MenuItemRuntime::new(
+            menu_item,
+            ELM_MGR_ID,
+            action,
+            ElmMenuItemKind::Action,
+            ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
+            "ELM Core 健康检查",
+            "调用管理动作 provider 执行 Core 健康检查",
+            "elm/mgr/health",
+        ));
+        self.mgr_actions.push(MgrActionRuntime {
+            action,
+            menu_item,
+            owner: ELM_MGR_ID,
+            kind: MgrActionKind::Health,
+        });
+        self.cells[cell_index].owned_menu_items.push(menu_item);
+        self.menu_generation = self.menu_generation.next();
+        self.emit(TopologyEventKind::MenuItemAdded, Some(ELM_MGR_ID));
+        Ok(())
     }
 
     fn register_port(&mut self, runtime: PortRuntime) {
@@ -2236,6 +2358,7 @@ impl ElmCore {
                 (ELM_CORE_LOG_PORT_ID, ELM_CORE_LOG_CONTRACT)
                     | (ELM_CORE_EVENT_PORT_ID, ELM_CORE_EVENT_CONTRACT)
                     | (ELM_MGR_MENU_PORT_ID, ELM_MGR_MENU_CONTRACT)
+                    | (ELM_MGR_ACTION_PORT_ID, ELM_MGR_ACTION_CONTRACT)
             ) || self.provider_index(desc.id).is_some())
     }
 
@@ -2910,11 +3033,35 @@ fn provider_request_contract(request: &ElmProviderPortRegisterRequest) -> Option
     core::str::from_utf8(&request.contract[..len]).ok()
 }
 
+fn read_action_invoke_request(frame: &ElmCallFrame) -> Option<ElmActionInvokeRequest> {
+    if usize::from(frame.payload_len) != core::mem::size_of::<ElmActionInvokeRequest>() {
+        return None;
+    }
+    let payload = &frame.payload[..core::mem::size_of::<ElmActionInvokeRequest>()];
+    let request = ElmActionInvokeRequest {
+        action_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    };
+    if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
+}
+
 fn runtime_status_blocker(status: i32) -> u64 {
     match status {
         ELM_MGR_STATUS_NOT_FOUND => ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
         ELM_MGR_STATUS_INVALID => ELM_POLICY_BLOCK_INVALID_STATE,
         _ => ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+    }
+}
+
+fn kernel_provider_kind(port: PortId) -> KernelProviderKind {
+    if port == ELM_MGR_ACTION_PORT_ID {
+        KernelProviderKind::MgrActionInvoke
+    } else {
+        KernelProviderKind::StaticPort
     }
 }
 

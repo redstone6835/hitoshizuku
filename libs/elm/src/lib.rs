@@ -36,15 +36,16 @@ pub use ebi::{
 pub use error::{ElmError, ElmResult};
 pub use event::{ElmEventRecord, ElmEventSequence};
 pub use frame::{
-    ELM_CALL_FLAG_NONE, ELM_CALL_STATUS_BUSY, ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND,
-    ELM_CALL_STATUS_OK, ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED,
-    ELM_FRAME_PAYLOAD_LEN, ElmCallFrame, ElmReplyFrame,
+    ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_CALL_FLAG_NONE, ELM_CALL_STATUS_BUSY,
+    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
+    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED, ELM_FRAME_PAYLOAD_LEN,
+    ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmReplyFrame,
 };
 pub use graph::{
     BindingGraph, CapabilityBindingEdge, DependencyEdge, ExtensionEdge, ExtensionPoint,
     GraphRemovalReport, GraphValidationReport, ParentEdge,
 };
-pub use ids::{ActionId, BindingId, ElmId, Generation, LeaseId, PortId};
+pub use ids::{ActionId, BindingId, ELM_MGR_BUILTIN_ID, ElmId, Generation, LeaseId, PortId};
 pub use lease::{LeaseKind, LeaseRegistry, LeaseRights, LeaseState, ResourceLease};
 pub use manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
 pub use menu::{
