@@ -1,51 +1,60 @@
 //! ELM 核心全局状态。
 
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use elm_model::{
-    ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_CALL_STATUS_INVALID,
-    ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_UNSUPPORTED,
-    ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
-    ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
+    ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_CALL_STATUS_BUSY,
+    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
+    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED, ELM_HEALTH_CHECK_AUDITS,
+    ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS,
+    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
     ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
     ELM_HEALTH_DETAIL_DANGLING_REFERENCE, ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
     ELM_HEALTH_DETAIL_GRAPH_INVALID, ELM_HEALTH_DETAIL_KIND_MISMATCH,
     ELM_HEALTH_DETAIL_MISSING_OBJECT, ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
     ELM_HEALTH_DETAIL_STATE_INVALID, ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
     ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
-    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_INVOKE,
-    ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
-    ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
-    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_STATUS_BUSY,
-    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
-    ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
-    ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
-    ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
-    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
-    ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
-    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
-    ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
-    ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_REPLACE_TODO, ELM_PROVIDER_FLAG_DYNAMIC,
-    ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN,
-    ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmCoreHealthHeader,
-    ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError,
-    ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
-    ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest,
-    ElmMenuItemKind, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind,
-    ElmMgrRelationRecord, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
-    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmProviderInvokeRequest,
+    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_ASYNC,
+    ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_REGISTER,
+    ELM_MGR_ACTION_PROVIDER_UNREGISTER, ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
+    ELM_MGR_ACTION_RUNTIME_EVENT_READ, ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND,
+    ELM_MGR_BUILTIN_ID, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND,
+    ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
+    ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
+    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
+    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
+    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
+    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_NATIVE_TODO,
+    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
+    ELM_POLICY_BLOCK_REPLACE_TODO, ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS,
+    ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
+    ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmActionInvokeReply,
+    ElmActionInvokeRequest, ElmCallFrame, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo,
+    ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId,
+    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
+    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
+    ElmPortAccessPolicy, ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse,
+    ElmProviderAsyncPollRequest, ElmProviderAsyncPollResponse, ElmProviderAsyncState,
+    ElmProviderAsyncSubmitRequest, ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest,
     ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
     ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
-    ElmProviderPortUnregisterRequest, ElmReplyFrame, ElmRuntimeEventRequest,
-    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
-    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState, ElmVersion, FlowContract,
-    FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights,
-    NexusOffer, PortId, ResourceLease, TopologyEventKind, builtin_port_descriptors,
-    first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
+    ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord,
+    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
+    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
+    ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind,
+    LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
+    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
+    status_from_blockers,
 };
 use sched::sync::Spinlock;
 
@@ -65,6 +74,8 @@ const FIRST_DYNAMIC_CELL_ID: u64 = 100;
 const FIRST_DYNAMIC_PORT_ID: u64 = 100;
 const EVENT_RING_LIMIT: usize = 128;
 const AUDIT_RING_LIMIT: usize = 128;
+const FIRST_PROVIDER_TICKET_ID: u64 = 1;
+const PROVIDER_RESULT_RING_LIMIT: usize = ELM_PROVIDER_ASYNC_QUEUE_LIMIT as usize;
 
 static CORE: Spinlock<ElmCore> = Spinlock::new(ElmCore::new());
 
@@ -114,9 +125,17 @@ struct ProviderRuntime {
     access: ElmPortAccessPolicy,
     backend: ProviderBackend,
     dynamic: bool,
+    queue_limit: u32,
+    max_in_flight: u32,
+    in_flight: u32,
     calls: u64,
     failed_calls: u64,
     revokes: u64,
+    async_submitted: u64,
+    async_completed: u64,
+    async_canceled: u64,
+    async_expired: u64,
+    async_rejected: u64,
 }
 
 impl ProviderRuntime {
@@ -131,6 +150,29 @@ impl ProviderRuntime {
         }
         flags
     }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderAsyncJob {
+    ticket: u64,
+    frame: ElmCallFrame,
+    consumer: ElmId,
+    port: PortId,
+    lease: LeaseId,
+    deadline_ns: u64,
+    result_ttl_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderAsyncResult {
+    ticket: u64,
+    port: PortId,
+    lease: LeaseId,
+    state: ElmProviderAsyncState,
+    status: i32,
+    reply: ElmReplyFrame,
+    blockers: u64,
+    expires_at_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +194,8 @@ pub(crate) struct ElmCore {
     cells: Vec<CellRuntime>,
     ports: Vec<PortRuntime>,
     providers: Vec<ProviderRuntime>,
+    provider_jobs: VecDeque<ProviderAsyncJob>,
+    provider_results: VecDeque<ProviderAsyncResult>,
     runtime_ports: Vec<RuntimePortBinding>,
     menu_items: Vec<MenuItemRuntime>,
     mgr_actions: Vec<MgrActionRuntime>,
@@ -175,6 +219,7 @@ pub(crate) struct ElmCore {
     next_action_id: u64,
     #[allow(dead_code)]
     next_menu_item_id: u64,
+    next_provider_ticket_id: u64,
 }
 
 impl ElmCore {
@@ -185,6 +230,8 @@ impl ElmCore {
             cells: Vec::new(),
             ports: Vec::new(),
             providers: Vec::new(),
+            provider_jobs: VecDeque::new(),
+            provider_results: VecDeque::new(),
             runtime_ports: Vec::new(),
             menu_items: Vec::new(),
             mgr_actions: Vec::new(),
@@ -202,6 +249,7 @@ impl ElmCore {
             next_lease_id: 100,
             next_action_id: 100,
             next_menu_item_id: 100,
+            next_provider_ticket_id: FIRST_PROVIDER_TICKET_ID,
         }
     }
 
@@ -459,6 +507,344 @@ impl ElmCore {
         out
     }
 
+    pub fn provider_queue_bytes(&mut self, now_ns: u64) -> Vec<u8> {
+        self.cleanup_provider_results_at(now_ns);
+        self.expire_provider_jobs_at(now_ns);
+
+        let header = ElmProviderQueueStatsHeader::new(
+            self.providers.len() as u32,
+            self.last_event_sequence(),
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for provider in &self.providers {
+            let record = ElmProviderQueueStatsRecord::new(
+                provider.port.0,
+                self.provider_queued_count(provider.port) as u32,
+                provider.in_flight,
+                self.provider_retained_result_count(provider.port) as u32,
+                provider.queue_limit,
+                provider.max_in_flight,
+                provider.async_submitted,
+                provider.async_completed,
+                provider.async_canceled,
+                provider.async_expired,
+                provider.async_rejected,
+            );
+            push_plain(&mut out, &record);
+        }
+        out
+    }
+
+    pub fn submit_provider_call(
+        &mut self,
+        request: ElmProviderAsyncSubmitRequest,
+        now_ns: u64,
+    ) -> ElmProviderAsyncSubmitResponse {
+        self.cleanup_provider_results_at(now_ns);
+        self.expire_provider_jobs_at(now_ns);
+
+        let frame = request.frame;
+        if request.flags != 0
+            || request.reserved != 0
+            || usize::from(frame.payload_len) > frame.payload.len()
+        {
+            return ElmProviderAsyncSubmitResponse::new(
+                0,
+                frame.binding_id,
+                frame.call_id,
+                ELM_MGR_STATUS_INVALID,
+                ElmProviderAsyncState::Failed,
+                0,
+                ELM_POLICY_BLOCK_INVALID_STATE,
+            );
+        }
+
+        let submit = self.prepare_provider_async_submit(frame);
+        let (edge, provider_index, lease) = match submit {
+            Ok(prepared) => prepared,
+            Err((status, blockers, port)) => {
+                self.record_provider_async_rejection(port);
+                self.record_provider_async_audit(frame.binding_id, status, blockers);
+                return ElmProviderAsyncSubmitResponse::new(
+                    0,
+                    frame.binding_id,
+                    frame.call_id,
+                    status,
+                    ElmProviderAsyncState::Failed,
+                    port.map(|port| self.provider_queued_count(port) as u32)
+                        .unwrap_or(0),
+                    blockers,
+                );
+            }
+        };
+
+        let provider = &self.providers[provider_index];
+        let pending = self
+            .provider_queued_count(provider.port)
+            .saturating_add(provider.in_flight as usize);
+        if pending >= provider.queue_limit as usize {
+            let blockers = ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL;
+            self.providers[provider_index].async_rejected = self.providers[provider_index]
+                .async_rejected
+                .saturating_add(1);
+            self.record_provider_async_audit(frame.binding_id, ELM_MGR_STATUS_BUSY, blockers);
+            return ElmProviderAsyncSubmitResponse::new(
+                0,
+                frame.binding_id,
+                frame.call_id,
+                ELM_MGR_STATUS_BUSY,
+                ElmProviderAsyncState::Failed,
+                pending as u32,
+                blockers,
+            );
+        }
+
+        if self.leases.add_active_ref(lease).is_err() {
+            let blockers = ELM_POLICY_BLOCK_LEASE_BUSY;
+            self.providers[provider_index].async_rejected = self.providers[provider_index]
+                .async_rejected
+                .saturating_add(1);
+            self.record_provider_async_audit(frame.binding_id, ELM_MGR_STATUS_BUSY, blockers);
+            return ElmProviderAsyncSubmitResponse::new(
+                0,
+                frame.binding_id,
+                frame.call_id,
+                ELM_MGR_STATUS_BUSY,
+                ElmProviderAsyncState::Failed,
+                pending as u32,
+                blockers,
+            );
+        }
+
+        let ticket = self.alloc_provider_ticket_id();
+        let timeout_ns = provider_async_timeout_ns(request.timeout_ms);
+        let result_ttl_ns = provider_async_result_ttl_ns(request.result_ttl_ms);
+        self.provider_jobs.push_back(ProviderAsyncJob {
+            ticket,
+            frame,
+            consumer: edge.consumer,
+            port: edge.port,
+            lease,
+            deadline_ns: now_ns.saturating_add(timeout_ns),
+            result_ttl_ns,
+        });
+        self.providers[provider_index].async_submitted = self.providers[provider_index]
+            .async_submitted
+            .saturating_add(1);
+        let queue_depth = self.provider_queued_count(edge.port) as u32;
+        self.record_provider_async_audit(frame.binding_id, ELM_MGR_STATUS_OK, 0);
+
+        ElmProviderAsyncSubmitResponse::new(
+            ticket,
+            frame.binding_id,
+            frame.call_id,
+            ELM_MGR_STATUS_OK,
+            ElmProviderAsyncState::Queued,
+            queue_depth,
+            0,
+        )
+    }
+
+    pub fn poll_provider_reply(
+        &mut self,
+        request: ElmProviderAsyncPollRequest,
+        now_ns: u64,
+    ) -> ElmProviderAsyncPollResponse {
+        self.cleanup_provider_results_at(now_ns);
+        self.expire_provider_jobs_at(now_ns);
+
+        if request.flags != 0 || request.reserved != 0 || request.ticket_id == 0 {
+            return provider_async_poll_failure(
+                request.ticket_id,
+                ELM_MGR_STATUS_INVALID,
+                ELM_POLICY_BLOCK_INVALID_STATE,
+            );
+        }
+
+        if let Some(job) = self
+            .provider_jobs
+            .iter()
+            .find(|job| job.ticket == request.ticket_id)
+        {
+            return ElmProviderAsyncPollResponse::new(
+                job.ticket,
+                ElmProviderAsyncState::Queued,
+                ELM_MGR_STATUS_BUSY,
+                ElmReplyFrame::empty(
+                    job.frame.binding_id,
+                    job.frame.call_id,
+                    ELM_CALL_STATUS_BUSY,
+                ),
+                0,
+                job.deadline_ns,
+            );
+        }
+
+        if let Some(index) = self
+            .provider_results
+            .iter()
+            .position(|result| result.ticket == request.ticket_id)
+        {
+            let result = self
+                .provider_results
+                .remove(index)
+                .expect("result index valid");
+            self.release_provider_result_lease(result.lease);
+            return ElmProviderAsyncPollResponse::new(
+                result.ticket,
+                result.state,
+                result.status,
+                result.reply,
+                result.blockers,
+                result.expires_at_ns,
+            );
+        }
+
+        provider_async_poll_failure(
+            request.ticket_id,
+            ELM_MGR_STATUS_NOT_FOUND,
+            ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+        )
+    }
+
+    pub fn cancel_provider_call(
+        &mut self,
+        request: ElmProviderAsyncCancelRequest,
+        now_ns: u64,
+    ) -> ElmProviderAsyncCancelResponse {
+        self.cleanup_provider_results_at(now_ns);
+        self.expire_provider_jobs_at(now_ns);
+
+        if request.flags != 0 || request.reserved != 0 || request.ticket_id == 0 {
+            return ElmProviderAsyncCancelResponse::new(
+                request.ticket_id,
+                ElmProviderAsyncState::Failed,
+                ELM_MGR_STATUS_INVALID,
+                ELM_POLICY_BLOCK_INVALID_STATE,
+            );
+        }
+
+        if let Some(index) = self
+            .provider_jobs
+            .iter()
+            .position(|job| job.ticket == request.ticket_id)
+        {
+            let job = self.provider_jobs.remove(index).expect("job index valid");
+            if let Some(provider_index) = self.provider_index(job.port) {
+                self.providers[provider_index].async_canceled = self.providers[provider_index]
+                    .async_canceled
+                    .saturating_add(1);
+            }
+            self.release_provider_result_lease(job.lease);
+            self.record_provider_async_audit(job.frame.binding_id, ELM_MGR_STATUS_OK, 0);
+            return ElmProviderAsyncCancelResponse::new(
+                job.ticket,
+                ElmProviderAsyncState::Canceled,
+                ELM_MGR_STATUS_OK,
+                0,
+            );
+        }
+
+        if let Some(result) = self
+            .provider_results
+            .iter()
+            .find(|result| result.ticket == request.ticket_id)
+        {
+            return ElmProviderAsyncCancelResponse::new(
+                result.ticket,
+                result.state,
+                result.status,
+                result.blockers,
+            );
+        }
+
+        ElmProviderAsyncCancelResponse::new(
+            request.ticket_id,
+            ElmProviderAsyncState::Failed,
+            ELM_MGR_STATUS_NOT_FOUND,
+            ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+        )
+    }
+
+    pub(crate) fn has_provider_async_work(&self) -> bool {
+        !self.provider_jobs.is_empty()
+    }
+
+    pub(crate) fn expire_provider_jobs_at(&mut self, now_ns: u64) -> usize {
+        let mut expired = 0usize;
+        let mut index = 0usize;
+        while index < self.provider_jobs.len() {
+            if self.provider_jobs[index].deadline_ns > now_ns {
+                index += 1;
+                continue;
+            }
+            let job = self.provider_jobs.remove(index).expect("job index valid");
+            self.finish_provider_async_job(
+                job,
+                ElmProviderAsyncState::Expired,
+                ELM_MGR_STATUS_BUSY,
+                ElmReplyFrame::empty(0, 0, ELM_CALL_STATUS_BUSY),
+                ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
+                now_ns,
+            );
+            expired += 1;
+        }
+        expired
+    }
+
+    pub(crate) fn run_one_async_provider_job_at(&mut self, now_ns: u64) -> bool {
+        self.cleanup_provider_results_at(now_ns);
+        if self.expire_provider_jobs_at(now_ns) != 0 {
+            return true;
+        }
+
+        let Some(job_index) = self.next_runnable_provider_job_index() else {
+            return false;
+        };
+        let job = self
+            .provider_jobs
+            .remove(job_index)
+            .expect("job index valid");
+        let Some(provider_index) = self.provider_index(job.port) else {
+            self.finish_provider_async_job(
+                job,
+                ElmProviderAsyncState::Failed,
+                ELM_MGR_STATUS_NOT_FOUND,
+                ElmReplyFrame::empty(0, 0, ELM_CALL_STATUS_NOT_FOUND),
+                ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+                now_ns,
+            );
+            return true;
+        };
+        self.providers[provider_index].in_flight =
+            self.providers[provider_index].in_flight.saturating_add(1);
+
+        let (state, status, reply, blockers) = self.execute_provider_async_job(&job);
+        let finish_ns = sched::now_ns_public();
+        let (state, status, reply, blockers) = if finish_ns >= job.deadline_ns {
+            (
+                ElmProviderAsyncState::Expired,
+                ELM_MGR_STATUS_BUSY,
+                ElmReplyFrame::empty(
+                    job.frame.binding_id,
+                    job.frame.call_id,
+                    ELM_CALL_STATUS_BUSY,
+                ),
+                ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
+            )
+        } else {
+            (state, status, reply, blockers)
+        };
+
+        if let Some(provider_index) = self.provider_index(job.port) {
+            self.providers[provider_index].in_flight =
+                self.providers[provider_index].in_flight.saturating_sub(1);
+        }
+        self.finish_provider_async_job(job, state, status, reply, blockers, finish_ns);
+        true
+    }
+
     pub fn health_bytes(&self) -> Vec<u8> {
         let (status, records) = self.health_records();
         let header =
@@ -542,9 +928,17 @@ impl ElmCore {
             access,
             backend: ProviderBackend::ElmNativeTodo,
             dynamic: true,
+            queue_limit: provider_queue_limit_for_mode(mode),
+            max_in_flight: provider_max_in_flight_for_mode(mode),
+            in_flight: 0,
             calls: 0,
             failed_calls: 0,
             revokes: 0,
+            async_submitted: 0,
+            async_completed: 0,
+            async_canceled: 0,
+            async_expired: 0,
+            async_rejected: 0,
         });
         self.record_mgr_audit(
             ELM_MGR_ACTION_PROVIDER_REGISTER,
@@ -2239,9 +2633,17 @@ impl ElmCore {
                     access: desc.access,
                     backend: ProviderBackend::Kernel(kernel_provider_kind(desc.id)),
                     dynamic: false,
+                    queue_limit: provider_queue_limit_for_mode(desc.mode),
+                    max_in_flight: provider_max_in_flight_for_mode(desc.mode),
+                    in_flight: 0,
                     calls: 0,
                     failed_calls: 0,
                     revokes: 0,
+                    async_submitted: 0,
+                    async_completed: 0,
+                    async_canceled: 0,
+                    async_expired: 0,
+                    async_rejected: 0,
                 });
             }
         }
@@ -2397,6 +2799,301 @@ impl ElmCore {
             .iter()
             .filter(|edge| edge.active && edge.port == port)
             .count()
+    }
+
+    fn provider_queued_count(&self, port: PortId) -> usize {
+        self.provider_jobs
+            .iter()
+            .filter(|job| job.port == port)
+            .count()
+    }
+
+    fn provider_retained_result_count(&self, port: PortId) -> usize {
+        self.provider_results
+            .iter()
+            .filter(|result| result.port == port)
+            .count()
+    }
+
+    fn prepare_provider_async_submit(
+        &self,
+        frame: ElmCallFrame,
+    ) -> Result<(elm_model::CapabilityBindingEdge, usize, LeaseId), (i32, u64, Option<PortId>)>
+    {
+        let binding = BindingId(frame.binding_id);
+        let Some(edge) = self.graph.capability_binding(binding).cloned() else {
+            return Err((
+                ELM_MGR_STATUS_NOT_FOUND,
+                ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+                None,
+            ));
+        };
+        if !edge.active {
+            return Err((
+                ELM_MGR_STATUS_INVALID,
+                ELM_POLICY_BLOCK_INVALID_STATE,
+                Some(edge.port),
+            ));
+        }
+        let Some(lease) = edge.lease else {
+            return Err((
+                ELM_MGR_STATUS_INVALID,
+                ELM_POLICY_BLOCK_INVALID_STATE,
+                Some(edge.port),
+            ));
+        };
+        if self.leases.get(lease).is_none() {
+            return Err((
+                ELM_MGR_STATUS_NOT_FOUND,
+                ELM_POLICY_BLOCK_LEASE_BUSY,
+                Some(edge.port),
+            ));
+        }
+        let Some(provider_index) = self.provider_index(edge.port) else {
+            return Err((
+                ELM_MGR_STATUS_NOT_FOUND,
+                ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+                Some(edge.port),
+            ));
+        };
+        let Some(port) = self.port_desc(edge.port) else {
+            return Err((
+                ELM_MGR_STATUS_NOT_FOUND,
+                ELM_POLICY_BLOCK_PORT_NOT_FOUND,
+                Some(edge.port),
+            ));
+        };
+        if !port.invokable {
+            return Err((
+                ELM_MGR_STATUS_UNSUPPORTED,
+                ELM_POLICY_BLOCK_PORT_TODO,
+                Some(edge.port),
+            ));
+        }
+        if matches!(
+            self.providers[provider_index].backend,
+            ProviderBackend::ElmNativeTodo
+        ) {
+            return Err((
+                ELM_MGR_STATUS_TODO,
+                ELM_POLICY_BLOCK_NATIVE_TODO,
+                Some(edge.port),
+            ));
+        }
+        Ok((edge, provider_index, lease))
+    }
+
+    fn record_provider_async_rejection(&mut self, port: Option<PortId>) {
+        if let Some(port) = port {
+            if let Some(index) = self.provider_index(port) {
+                self.providers[index].async_rejected =
+                    self.providers[index].async_rejected.saturating_add(1);
+            }
+        }
+    }
+
+    fn next_runnable_provider_job_index(&self) -> Option<usize> {
+        self.provider_jobs
+            .iter()
+            .enumerate()
+            .find(|(_, job)| {
+                self.provider_index(job.port)
+                    .and_then(|index| self.providers.get(index))
+                    .is_some_and(|provider| provider.in_flight < provider.max_in_flight)
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn execute_provider_async_job(
+        &mut self,
+        job: &ProviderAsyncJob,
+    ) -> (ElmProviderAsyncState, i32, ElmReplyFrame, u64) {
+        let Some(edge) = self
+            .graph
+            .capability_binding(BindingId(job.frame.binding_id))
+            .cloned()
+        else {
+            return (
+                ElmProviderAsyncState::Failed,
+                ELM_MGR_STATUS_NOT_FOUND,
+                ElmReplyFrame::empty(
+                    job.frame.binding_id,
+                    job.frame.call_id,
+                    ELM_CALL_STATUS_NOT_FOUND,
+                ),
+                ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+            );
+        };
+        if !edge.active || edge.port != job.port || edge.consumer != job.consumer {
+            return (
+                ElmProviderAsyncState::Failed,
+                ELM_MGR_STATUS_INVALID,
+                ElmReplyFrame::empty(
+                    job.frame.binding_id,
+                    job.frame.call_id,
+                    ELM_CALL_STATUS_INVALID,
+                ),
+                ELM_POLICY_BLOCK_INVALID_STATE,
+            );
+        }
+        let Some(provider_index) = self.provider_index(job.port) else {
+            return (
+                ElmProviderAsyncState::Failed,
+                ELM_MGR_STATUS_NOT_FOUND,
+                ElmReplyFrame::empty(
+                    job.frame.binding_id,
+                    job.frame.call_id,
+                    ELM_CALL_STATUS_NOT_FOUND,
+                ),
+                ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+            );
+        };
+        let backend = self.providers[provider_index].backend;
+        let reply = match backend {
+            ProviderBackend::Kernel(kind) => self.invoke_kernel_provider(kind, &edge, job.frame),
+            ProviderBackend::ElmNativeTodo => Err(ELM_MGR_STATUS_TODO),
+        };
+
+        match reply {
+            Ok(reply) if reply.status == ELM_CALL_STATUS_OK => {
+                self.providers[provider_index].calls =
+                    self.providers[provider_index].calls.saturating_add(1);
+                (
+                    ElmProviderAsyncState::Completed,
+                    ELM_MGR_STATUS_OK,
+                    reply,
+                    0,
+                )
+            }
+            Ok(reply) => {
+                self.providers[provider_index].failed_calls = self.providers[provider_index]
+                    .failed_calls
+                    .saturating_add(1);
+                (
+                    ElmProviderAsyncState::Failed,
+                    ELM_MGR_STATUS_INVALID,
+                    reply,
+                    provider_call_blockers(reply.status),
+                )
+            }
+            Err(status) => {
+                self.providers[provider_index].failed_calls = self.providers[provider_index]
+                    .failed_calls
+                    .saturating_add(1);
+                let call_status = provider_async_call_status_from_mgr(status);
+                (
+                    ElmProviderAsyncState::Failed,
+                    status,
+                    ElmReplyFrame::empty(job.frame.binding_id, job.frame.call_id, call_status),
+                    provider_async_blocker_from_mgr_status(status),
+                )
+            }
+        }
+    }
+
+    fn finish_provider_async_job(
+        &mut self,
+        job: ProviderAsyncJob,
+        state: ElmProviderAsyncState,
+        status: i32,
+        reply: ElmReplyFrame,
+        blockers: u64,
+        now_ns: u64,
+    ) {
+        if let Some(provider_index) = self.provider_index(job.port) {
+            match state {
+                ElmProviderAsyncState::Completed => {
+                    self.providers[provider_index].async_completed = self.providers[provider_index]
+                        .async_completed
+                        .saturating_add(1);
+                }
+                ElmProviderAsyncState::Failed => {
+                    self.providers[provider_index].async_completed = self.providers[provider_index]
+                        .async_completed
+                        .saturating_add(1);
+                }
+                ElmProviderAsyncState::Expired => {
+                    self.providers[provider_index].async_expired = self.providers[provider_index]
+                        .async_expired
+                        .saturating_add(1);
+                }
+                ElmProviderAsyncState::Canceled => {
+                    self.providers[provider_index].async_canceled = self.providers[provider_index]
+                        .async_canceled
+                        .saturating_add(1);
+                }
+                ElmProviderAsyncState::Queued | ElmProviderAsyncState::Running => {}
+            }
+        }
+        let reply = if reply.binding_id == 0 && reply.call_id == 0 {
+            ElmReplyFrame::empty(job.frame.binding_id, job.frame.call_id, reply.status)
+        } else {
+            reply
+        };
+        self.push_provider_result(ProviderAsyncResult {
+            ticket: job.ticket,
+            port: job.port,
+            lease: job.lease,
+            state,
+            status,
+            reply,
+            blockers,
+            expires_at_ns: now_ns.saturating_add(job.result_ttl_ns),
+        });
+        self.record_provider_async_audit(job.frame.binding_id, status, blockers);
+    }
+
+    fn push_provider_result(&mut self, result: ProviderAsyncResult) {
+        while self.provider_results.len() >= PROVIDER_RESULT_RING_LIMIT {
+            let Some(evicted) = self.provider_results.pop_front() else {
+                break;
+            };
+            self.release_provider_result_lease(evicted.lease);
+        }
+        self.provider_results.push_back(result);
+    }
+
+    fn cleanup_provider_results_at(&mut self, now_ns: u64) -> usize {
+        let mut removed = 0usize;
+        let mut index = 0usize;
+        while index < self.provider_results.len() {
+            if self.provider_results[index].expires_at_ns > now_ns {
+                index += 1;
+                continue;
+            }
+            let result = self
+                .provider_results
+                .remove(index)
+                .expect("result index valid");
+            self.release_provider_result_lease(result.lease);
+            removed += 1;
+        }
+        removed
+    }
+
+    fn release_provider_result_lease(&mut self, lease: LeaseId) {
+        if let Err(err) = self.leases.release_active_ref(lease) {
+            log::warning!(
+                "[elm] provider async lease release failed lease={} err={:?}",
+                lease.0,
+                err
+            );
+        }
+    }
+
+    fn record_provider_async_audit(&mut self, binding_id: u64, status: i32, blockers: u64) {
+        let cell = self
+            .graph
+            .capability_binding(BindingId(binding_id))
+            .map(|edge| edge.consumer)
+            .unwrap_or(ElmId(0));
+        self.record_audit(
+            ELM_MGR_ACTION_PROVIDER_ASYNC,
+            cell,
+            status,
+            blockers,
+            self.cell_state(cell).map(state_code).unwrap_or(0),
+        );
     }
 
     fn provider_busy_owned_by(&self, owner: ElmId) -> usize {
@@ -2951,6 +3648,15 @@ impl ElmCore {
         id
     }
 
+    fn alloc_provider_ticket_id(&mut self) -> u64 {
+        let id = self.next_provider_ticket_id;
+        self.next_provider_ticket_id = self.next_provider_ticket_id.saturating_add(1);
+        if self.next_provider_ticket_id == 0 {
+            self.next_provider_ticket_id = FIRST_PROVIDER_TICKET_ID;
+        }
+        id
+    }
+
     fn emit(&mut self, kind: TopologyEventKind, cell: Option<ElmId>) {
         let record = ElmEventRecord::new(self.next_event_sequence, kind, cell, None, None, None);
         self.push_event(record);
@@ -3066,11 +3772,79 @@ fn provider_call_blockers(status: i32) -> u64 {
     }
 }
 
+fn provider_async_poll_failure(
+    ticket_id: u64,
+    status: i32,
+    blockers: u64,
+) -> ElmProviderAsyncPollResponse {
+    ElmProviderAsyncPollResponse::new(
+        ticket_id,
+        ElmProviderAsyncState::Failed,
+        status,
+        ElmReplyFrame::empty(0, 0, provider_async_call_status_from_mgr(status)),
+        blockers,
+        0,
+    )
+}
+
+fn provider_async_blocker_from_mgr_status(status: i32) -> u64 {
+    match status {
+        ELM_MGR_STATUS_NOT_FOUND => ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+        ELM_MGR_STATUS_TODO => ELM_POLICY_BLOCK_NATIVE_TODO,
+        ELM_MGR_STATUS_UNSUPPORTED => ELM_POLICY_BLOCK_PORT_TODO,
+        ELM_MGR_STATUS_BUSY => ELM_POLICY_BLOCK_PROVIDER_BUSY,
+        ELM_MGR_STATUS_INVALID => ELM_POLICY_BLOCK_INVALID_STATE,
+        _ => ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    }
+}
+
+fn provider_async_call_status_from_mgr(status: i32) -> i32 {
+    match status {
+        ELM_MGR_STATUS_NOT_FOUND => ELM_CALL_STATUS_NOT_FOUND,
+        ELM_MGR_STATUS_BUSY => ELM_CALL_STATUS_BUSY,
+        ELM_MGR_STATUS_INVALID => ELM_CALL_STATUS_INVALID,
+        ELM_MGR_STATUS_UNSUPPORTED => ELM_CALL_STATUS_UNSUPPORTED,
+        _ => ELM_CALL_STATUS_PROVIDER_FAULT,
+    }
+}
+
+fn provider_async_timeout_ns(timeout_ms: u32) -> u64 {
+    let timeout_ms = normalize_provider_async_ms(timeout_ms, ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS);
+    u64::from(timeout_ms).saturating_mul(1_000_000)
+}
+
+fn provider_async_result_ttl_ns(ttl_ms: u32) -> u64 {
+    let ttl_ms = normalize_provider_async_ms(ttl_ms, ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS);
+    u64::from(ttl_ms).saturating_mul(1_000_000)
+}
+
+fn normalize_provider_async_ms(value: u32, default: u32) -> u32 {
+    let value = if value == 0 { default } else { value };
+    value.min(ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS)
+}
+
 fn kernel_provider_kind(port: PortId) -> KernelProviderKind {
     if port == ELM_MGR_ACTION_PORT_ID {
         KernelProviderKind::MgrActionInvoke
     } else {
         KernelProviderKind::StaticPort
+    }
+}
+
+fn provider_queue_limit_for_mode(mode: FlowMode) -> u32 {
+    match mode {
+        FlowMode::Exclusive => 1,
+        FlowMode::Ordered => 32,
+        FlowMode::Shared | FlowMode::Pipeline | FlowMode::Broadcast => {
+            ELM_PROVIDER_ASYNC_QUEUE_LIMIT
+        }
+    }
+}
+
+fn provider_max_in_flight_for_mode(mode: FlowMode) -> u32 {
+    match mode {
+        FlowMode::Exclusive | FlowMode::Ordered => 1,
+        FlowMode::Shared | FlowMode::Pipeline | FlowMode::Broadcast => 4,
     }
 }
 

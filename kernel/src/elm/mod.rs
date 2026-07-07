@@ -4,6 +4,7 @@
 
 mod core;
 mod event;
+mod executor;
 mod menu;
 mod mgr_channel;
 mod ports;
@@ -14,7 +15,7 @@ mod tests;
 
 pub(crate) fn init_builtin_mgr() {
     match core::with_core(|core| core.init_builtin_mgr()) {
-        Ok(()) => {}
+        Ok(()) => executor::start_provider_worker(),
         Err(err) => log::error!("[elm] init builtin elm-mgr failed: {:?}", err),
     }
 }

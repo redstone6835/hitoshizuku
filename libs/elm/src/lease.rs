@@ -167,6 +167,28 @@ impl LeaseRegistry {
             .find(|lease| lease.binding == Some(binding))
     }
 
+    pub fn add_active_ref(&mut self, id: LeaseId) -> ElmResult<usize> {
+        let Some(lease) = self.leases.get_mut(&id) else {
+            return Err(ElmError::InvalidLeaseState);
+        };
+        if lease.state != LeaseState::Active {
+            return Err(ElmError::InvalidLeaseState);
+        }
+        lease.active_refs = lease.active_refs.saturating_add(1);
+        Ok(lease.active_refs)
+    }
+
+    pub fn release_active_ref(&mut self, id: LeaseId) -> ElmResult<usize> {
+        let Some(lease) = self.leases.get_mut(&id) else {
+            return Err(ElmError::InvalidLeaseState);
+        };
+        if lease.active_refs == 0 {
+            return Err(ElmError::InvalidLeaseState);
+        }
+        lease.active_refs -= 1;
+        Ok(lease.active_refs)
+    }
+
     pub fn revoke_all_owned_by(&mut self, owner: ElmId) -> ElmResult<usize> {
         let mut count = 0;
         for lease in self.leases.values_mut() {

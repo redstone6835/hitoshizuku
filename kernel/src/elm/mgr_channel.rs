@@ -3,14 +3,15 @@
 use alloc::vec::Vec;
 
 use elm_model::{
-    ELM_MGR_MAX_INPUT, ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId, ElmLifecycleAction,
-    ElmLifecyclePlanRequest, ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind,
-    ElmMgrResponseHeader, ElmNexusBindRequest, ElmNexusUnbindRequest, ElmProviderInvokeRequest,
-    ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest, ElmRuntimeEventRequest,
-    ElmRuntimeLogRequest,
+    ELM_MGR_MAX_INPUT, ELM_MGR_STATUS_OK, ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId,
+    ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecycleRequest, ElmMgrCallHeader,
+    ElmMgrCallKind, ElmMgrResponseHeader, ElmNexusBindRequest, ElmNexusUnbindRequest,
+    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncSubmitRequest,
+    ElmProviderInvokeRequest, ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest,
+    ElmRuntimeEventRequest, ElmRuntimeLogRequest,
 };
 
-use super::{core::ElmCore, menu, with_core};
+use super::{core::ElmCore, executor, menu, with_core};
 
 pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
     with_core(|core| dispatch_mgr_call_on_core(core, input))
@@ -205,6 +206,42 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 Ok(response) => response_with_plain_payload(&response),
                 Err(status) => response_only(response_header_from_status(status)),
             }
+        }
+        ElmMgrCallKind::SubmitProviderCall => {
+            let Some(request) = read_provider_async_submit_request(call_payload(input, header))
+            else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = core.submit_provider_call(request, sched::now_ns_public());
+            let should_wake = response.status == ELM_MGR_STATUS_OK;
+            let out = response_with_plain_payload(&response);
+            if should_wake {
+                executor::wake_provider_worker();
+            }
+            out
+        }
+        ElmMgrCallKind::PollProviderReply => {
+            let Some(request) = read_provider_async_poll_request(call_payload(input, header))
+            else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = core.poll_provider_reply(request, sched::now_ns_public());
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::CancelProviderCall => {
+            let Some(request) = read_provider_async_cancel_request(call_payload(input, header))
+            else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = core.cancel_provider_call(request, sched::now_ns_public());
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::QueryProviderQueue => {
+            if !payload_is_empty(header) {
+                return response_only(ElmMgrResponseHeader::invalid());
+            }
+            let payload = core.provider_queue_bytes(sched::now_ns_public());
+            response_with_payload(payload)
         }
         ElmMgrCallKind::QueryProviderStats => {
             if !payload_is_empty(header) {
@@ -413,6 +450,63 @@ fn read_provider_invoke_request(payload: &[u8]) -> Option<ElmProviderInvokeReque
     if payload.len() != core::mem::size_of::<ElmProviderInvokeRequest>() {
         return None;
     }
+    let frame = read_call_frame(payload)?;
+    Some(ElmProviderInvokeRequest { frame })
+}
+
+fn read_provider_async_submit_request(payload: &[u8]) -> Option<ElmProviderAsyncSubmitRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderAsyncSubmitRequest>() {
+        return None;
+    }
+    let frame_size = core::mem::size_of::<elm_model::ElmCallFrame>();
+    let frame = read_call_frame(&payload[..frame_size])?;
+    let request = ElmProviderAsyncSubmitRequest {
+        frame,
+        timeout_ms: u32::from_le_bytes(payload[frame_size..frame_size + 4].try_into().ok()?),
+        result_ttl_ms: u32::from_le_bytes(payload[frame_size + 4..frame_size + 8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[frame_size + 8..frame_size + 12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[frame_size + 12..frame_size + 16].try_into().ok()?),
+    };
+    if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
+}
+
+fn read_provider_async_poll_request(payload: &[u8]) -> Option<ElmProviderAsyncPollRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderAsyncPollRequest>() {
+        return None;
+    }
+    let request = ElmProviderAsyncPollRequest {
+        ticket_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    };
+    if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
+}
+
+fn read_provider_async_cancel_request(payload: &[u8]) -> Option<ElmProviderAsyncCancelRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderAsyncCancelRequest>() {
+        return None;
+    }
+    let request = ElmProviderAsyncCancelRequest {
+        ticket_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    };
+    if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
+}
+
+fn read_call_frame(payload: &[u8]) -> Option<elm_model::ElmCallFrame> {
+    if payload.len() != core::mem::size_of::<elm_model::ElmCallFrame>() {
+        return None;
+    }
     let frame = elm_model::ElmCallFrame {
         binding_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
         call_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
@@ -434,7 +528,7 @@ fn read_provider_invoke_request(payload: &[u8]) -> Option<ElmProviderInvokeReque
     {
         return None;
     }
-    Some(ElmProviderInvokeRequest { frame })
+    Some(frame)
 }
 
 fn response_header_from_status(status: i32) -> ElmMgrResponseHeader {

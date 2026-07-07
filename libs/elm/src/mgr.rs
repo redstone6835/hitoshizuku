@@ -40,6 +40,7 @@ pub const ELM_MGR_ACTION_PROVIDER_UNREGISTER: u32 = 1 << 10;
 pub const ELM_MGR_ACTION_PROVIDER_QUERY: u32 = 1 << 11;
 pub const ELM_MGR_ACTION_PROVIDER_INVOKE: u32 = 1 << 12;
 pub const ELM_MGR_ACTION_HEALTH_QUERY: u32 = 1 << 13;
+pub const ELM_MGR_ACTION_PROVIDER_ASYNC: u32 = 1 << 14;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
@@ -50,6 +51,7 @@ pub const ELM_MGR_POLICY_NEXUS_BINDING: u64 = 1 << 5;
 pub const ELM_MGR_POLICY_MENU_BINDING: u64 = 1 << 6;
 pub const ELM_MGR_POLICY_PROVIDER_PORTS: u64 = 1 << 7;
 pub const ELM_MGR_POLICY_HEALTH: u64 = 1 << 8;
+pub const ELM_MGR_POLICY_PROVIDER_ASYNC: u64 = 1 << 9;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -71,6 +73,9 @@ pub const ELM_POLICY_BLOCK_BINDING_PROTECTED: u64 = 1 << 16;
 pub const ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND: u64 = 1 << 17;
 pub const ELM_POLICY_BLOCK_PROVIDER_BUSY: u64 = 1 << 18;
 pub const ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED: u64 = 1 << 19;
+pub const ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL: u64 = 1 << 20;
+pub const ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED: u64 = 1 << 21;
+pub const ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED: u64 = 1 << 22;
 
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
@@ -82,6 +87,10 @@ pub const ELM_PROVIDER_PORT_FLAG_NONE: u32 = 0;
 pub const ELM_PROVIDER_FLAG_DYNAMIC: u16 = 1 << 0;
 pub const ELM_PROVIDER_FLAG_KERNEL_BACKEND: u16 = 1 << 1;
 pub const ELM_PROVIDER_FLAG_TODO_BACKEND: u16 = 1 << 2;
+pub const ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS: u32 = 5_000;
+pub const ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS: u32 = 30_000;
+pub const ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS: u32 = 60_000;
+pub const ELM_PROVIDER_ASYNC_QUEUE_LIMIT: u32 = 64;
 
 pub const ELM_HEALTH_FLAG_HAS_FAILURES: u32 = 1 << 0;
 
@@ -133,6 +142,10 @@ pub enum ElmMgrCallKind {
     InvokeProvider = 23,
     QueryProviderStats = 24,
     QueryHealth = 25,
+    SubmitProviderCall = 26,
+    PollProviderReply = 27,
+    CancelProviderCall = 28,
+    QueryProviderQueue = 29,
 }
 
 impl ElmMgrCallKind {
@@ -163,6 +176,35 @@ impl ElmMgrCallKind {
             23 => Some(Self::InvokeProvider),
             24 => Some(Self::QueryProviderStats),
             25 => Some(Self::QueryHealth),
+            26 => Some(Self::SubmitProviderCall),
+            27 => Some(Self::PollProviderReply),
+            28 => Some(Self::CancelProviderCall),
+            29 => Some(Self::QueryProviderQueue),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ElmProviderAsyncState {
+    Queued = 1,
+    Running = 2,
+    Completed = 3,
+    Failed = 4,
+    Canceled = 5,
+    Expired = 6,
+}
+
+impl ElmProviderAsyncState {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Queued),
+            2 => Some(Self::Running),
+            3 => Some(Self::Completed),
+            4 => Some(Self::Failed),
+            5 => Some(Self::Canceled),
+            6 => Some(Self::Expired),
             _ => None,
         }
     }
@@ -375,7 +417,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_ACTION_PROVIDER_UNREGISTER
                 | ELM_MGR_ACTION_PROVIDER_QUERY
                 | ELM_MGR_ACTION_PROVIDER_INVOKE
-                | ELM_MGR_ACTION_HEALTH_QUERY,
+                | ELM_MGR_ACTION_HEALTH_QUERY
+                | ELM_MGR_ACTION_PROVIDER_ASYNC,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
                 | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
@@ -384,7 +427,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_POLICY_NEXUS_BINDING
                 | ELM_MGR_POLICY_MENU_BINDING
                 | ELM_MGR_POLICY_PROVIDER_PORTS
-                | ELM_MGR_POLICY_HEALTH,
+                | ELM_MGR_POLICY_HEALTH
+                | ELM_MGR_POLICY_PROVIDER_ASYNC,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -404,7 +448,10 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_BINDING_PROTECTED
                 | ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND
                 | ELM_POLICY_BLOCK_PROVIDER_BUSY
-                | ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+                | ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED
+                | ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL
+                | ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED
+                | ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED,
             audit_capacity,
             reserved1: 0,
         }
@@ -964,6 +1011,156 @@ impl ElmProviderInvokeResponse {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderAsyncSubmitRequest {
+    pub frame: ElmCallFrame,
+    pub timeout_ms: u32,
+    pub result_ttl_ms: u32,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmProviderAsyncSubmitRequest {
+    pub const fn new(frame: ElmCallFrame, timeout_ms: u32, result_ttl_ms: u32) -> Self {
+        Self {
+            frame,
+            timeout_ms,
+            result_ttl_ms,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderAsyncSubmitResponse {
+    pub ticket_id: u64,
+    pub binding_id: u64,
+    pub call_id: u64,
+    pub status: i32,
+    pub state: u32,
+    pub queue_depth: u32,
+    pub reserved: u32,
+    pub blockers: u64,
+}
+
+impl ElmProviderAsyncSubmitResponse {
+    pub const fn new(
+        ticket_id: u64,
+        binding_id: u64,
+        call_id: u64,
+        status: i32,
+        state: ElmProviderAsyncState,
+        queue_depth: u32,
+        blockers: u64,
+    ) -> Self {
+        Self {
+            ticket_id,
+            binding_id,
+            call_id,
+            status,
+            state: state as u32,
+            queue_depth,
+            reserved: 0,
+            blockers,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderAsyncPollRequest {
+    pub ticket_id: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmProviderAsyncPollRequest {
+    pub const fn new(ticket_id: u64) -> Self {
+        Self {
+            ticket_id,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderAsyncPollResponse {
+    pub ticket_id: u64,
+    pub state: u32,
+    pub status: i32,
+    pub reply: ElmReplyFrame,
+    pub blockers: u64,
+    pub expires_at_ns: u64,
+}
+
+impl ElmProviderAsyncPollResponse {
+    pub const fn new(
+        ticket_id: u64,
+        state: ElmProviderAsyncState,
+        status: i32,
+        reply: ElmReplyFrame,
+        blockers: u64,
+        expires_at_ns: u64,
+    ) -> Self {
+        Self {
+            ticket_id,
+            state: state as u32,
+            status,
+            reply,
+            blockers,
+            expires_at_ns,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderAsyncCancelRequest {
+    pub ticket_id: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmProviderAsyncCancelRequest {
+    pub const fn new(ticket_id: u64) -> Self {
+        Self {
+            ticket_id,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderAsyncCancelResponse {
+    pub ticket_id: u64,
+    pub state: u32,
+    pub status: i32,
+    pub blockers: u64,
+}
+
+impl ElmProviderAsyncCancelResponse {
+    pub const fn new(
+        ticket_id: u64,
+        state: ElmProviderAsyncState,
+        status: i32,
+        blockers: u64,
+    ) -> Self {
+        Self {
+            ticket_id,
+            state: state as u32,
+            status,
+            blockers,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmProviderPortStatsHeader {
     pub abi_version: u16,
     pub record_entry_size: u16,
@@ -1078,6 +1275,75 @@ impl ElmProviderPortStatsRecord {
             calls,
             failed_calls,
             revokes,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderQueueStatsHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmProviderQueueStatsHeader {
+    pub const fn new(record_count: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmProviderQueueStatsRecord>() as u16,
+            record_count,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderQueueStatsRecord {
+    pub port_id: u64,
+    pub queued: u32,
+    pub running: u32,
+    pub retained: u32,
+    pub queue_limit: u32,
+    pub max_in_flight: u32,
+    pub reserved: u32,
+    pub submitted: u64,
+    pub completed: u64,
+    pub canceled: u64,
+    pub expired: u64,
+    pub rejected: u64,
+}
+
+impl ElmProviderQueueStatsRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        port_id: u64,
+        queued: u32,
+        running: u32,
+        retained: u32,
+        queue_limit: u32,
+        max_in_flight: u32,
+        submitted: u64,
+        completed: u64,
+        canceled: u64,
+        expired: u64,
+        rejected: u64,
+    ) -> Self {
+        Self {
+            port_id,
+            queued,
+            running,
+            retained,
+            queue_limit,
+            max_in_flight,
+            reserved: 0,
+            submitted,
+            completed,
+            canceled,
+            expired,
+            rejected,
         }
     }
 }
@@ -1219,7 +1485,8 @@ pub const fn status_from_blockers(blockers: u64) -> i32 {
             | ELM_POLICY_BLOCK_HAS_EXTENSIONS
             | ELM_POLICY_BLOCK_LEASE_BUSY
             | ELM_POLICY_BLOCK_DUPLICATE_BINDING
-            | ELM_POLICY_BLOCK_PROVIDER_BUSY)
+            | ELM_POLICY_BLOCK_PROVIDER_BUSY
+            | ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL)
         != 0
     {
         ELM_MGR_STATUS_BUSY

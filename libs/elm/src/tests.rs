@@ -3,28 +3,35 @@ use crate::{
     ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_DETAIL_NONE, ELM_HEALTH_FLAG_HAS_FAILURES,
     ELM_LIFECYCLE_REASON_HAS_DEPENDENTS, ELM_LIFECYCLE_REASON_HAS_EXTENSIONS,
     ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_DETACH,
-    ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_INPUT,
-    ELM_MGR_MAX_PAYLOAD, ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING,
-    ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT, ELM_MGR_POLICY_PROVIDER_PORTS,
+    ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_UNBIND,
+    ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_INPUT, ELM_MGR_MAX_PAYLOAD, ELM_MGR_POLICY_AUDIT,
+    ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING, ELM_MGR_POLICY_NEXUS_BINDING,
+    ELM_MGR_POLICY_PREFLIGHT, ELM_MGR_POLICY_PROVIDER_ASYNC, ELM_MGR_POLICY_PROVIDER_PORTS,
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
     ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
-    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
-    ELM_PROVIDER_PORT_FLAG_NONE, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmActionInvokeReply,
-    ElmActionInvokeRequest, ElmCallFrame, ElmCellSnapshot, ElmCoreHealthHeader,
-    ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
-    ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError,
-    ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED,
+    ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS,
+    ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
+    ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_PORT_FLAG_NONE, ELM_RUNTIME_LOG_MESSAGE_LEN,
+    ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmCellSnapshot,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry,
+    ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit,
+    ElmError, ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
     ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
     ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
     ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrRelationKind,
     ElmMgrRelationRecord, ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName,
     ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
     ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPortSnapshot,
-    ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRecord,
-    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
-    ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest, ElmReplyFrame,
+    ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse, ElmProviderAsyncPollRequest,
+    ElmProviderAsyncPollResponse, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
+    ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
+    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
+    ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord, ElmReplyFrame,
     ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
     ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState, ElmVersion,
     FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry,
@@ -503,6 +510,22 @@ fn runtime_mgr_call_kinds_are_stable() {
         ElmMgrCallKind::from_raw(19),
         Some(ElmMgrCallKind::QueryRuntimePorts)
     );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(26),
+        Some(ElmMgrCallKind::SubmitProviderCall)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(27),
+        Some(ElmMgrCallKind::PollProviderReply)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(28),
+        Some(ElmMgrCallKind::CancelProviderCall)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(29),
+        Some(ElmMgrCallKind::QueryProviderQueue)
+    );
 }
 
 #[test]
@@ -750,6 +773,74 @@ fn provider_port_abi_records_are_fixed_layout() {
     assert_eq!(invoke_response.reply.status, ELM_MGR_STATUS_OK);
     assert_eq!(core::mem::size_of::<ElmProviderInvokeResponse>(), 288);
 
+    assert_eq!(
+        ElmProviderAsyncState::from_raw(1),
+        Some(ElmProviderAsyncState::Queued)
+    );
+    assert_eq!(
+        ElmProviderAsyncState::from_raw(6),
+        Some(ElmProviderAsyncState::Expired)
+    );
+    assert_eq!(ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, 5_000);
+    assert_eq!(ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS, 30_000);
+    assert_eq!(ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS, 60_000);
+    assert_eq!(ELM_PROVIDER_ASYNC_QUEUE_LIMIT, 64);
+
+    let submit = ElmProviderAsyncSubmitRequest::new(
+        ElmCallFrame::new(7, 2, ELM_ACTION_OPCODE_INVOKE, b"abc"),
+        100,
+        200,
+    );
+    assert_eq!(submit.frame.binding_id, 7);
+    assert_eq!(submit.timeout_ms, 100);
+    assert_eq!(submit.result_ttl_ms, 200);
+    assert_eq!(core::mem::size_of::<ElmProviderAsyncSubmitRequest>(), 304);
+
+    let submit_response = ElmProviderAsyncSubmitResponse::new(
+        99,
+        7,
+        2,
+        ELM_MGR_STATUS_OK,
+        ElmProviderAsyncState::Queued,
+        1,
+        0,
+    );
+    assert_eq!(submit_response.ticket_id, 99);
+    assert_eq!(submit_response.state, ElmProviderAsyncState::Queued as u32);
+    assert_eq!(core::mem::size_of::<ElmProviderAsyncSubmitResponse>(), 48);
+
+    let poll = ElmProviderAsyncPollRequest::new(99);
+    assert_eq!(poll.ticket_id, 99);
+    assert_eq!(core::mem::size_of::<ElmProviderAsyncPollRequest>(), 16);
+
+    let poll_response = ElmProviderAsyncPollResponse::new(
+        99,
+        ElmProviderAsyncState::Completed,
+        ELM_MGR_STATUS_OK,
+        ElmReplyFrame::new(7, 2, ELM_MGR_STATUS_OK, b"abc"),
+        0,
+        123,
+    );
+    assert_eq!(poll_response.state, ElmProviderAsyncState::Completed as u32);
+    assert_eq!(poll_response.expires_at_ns, 123);
+    assert_eq!(core::mem::size_of::<ElmProviderAsyncPollResponse>(), 320);
+
+    let cancel = ElmProviderAsyncCancelRequest::new(99);
+    assert_eq!(cancel.ticket_id, 99);
+    assert_eq!(core::mem::size_of::<ElmProviderAsyncCancelRequest>(), 16);
+
+    let cancel_response = ElmProviderAsyncCancelResponse::new(
+        99,
+        ElmProviderAsyncState::Canceled,
+        ELM_MGR_STATUS_OK,
+        0,
+    );
+    assert_eq!(
+        cancel_response.state,
+        ElmProviderAsyncState::Canceled as u32
+    );
+    assert_eq!(core::mem::size_of::<ElmProviderAsyncCancelResponse>(), 24);
+
     let header = ElmProviderPortStatsHeader::new(1, 9);
     assert_eq!(header.record_count, 1);
     assert_eq!(header.event_sequence, 9);
@@ -797,16 +888,43 @@ fn provider_port_abi_records_are_fixed_layout() {
     assert_eq!(stats.failed_calls, 1);
     assert_eq!(core::mem::size_of::<ElmProviderPortStatsRecord>(), 48);
 
+    let queue_header = ElmProviderQueueStatsHeader::new(1, 9);
+    assert_eq!(
+        queue_header.record_entry_size as usize,
+        core::mem::size_of::<ElmProviderQueueStatsRecord>()
+    );
+    assert_eq!(core::mem::size_of::<ElmProviderQueueStatsHeader>(), 16);
+
+    let queue_record = ElmProviderQueueStatsRecord::new(4, 1, 0, 2, 64, 4, 9, 8, 1, 2, 3);
+    assert_eq!(queue_record.port_id, 4);
+    assert_eq!(queue_record.queue_limit, 64);
+    assert_eq!(queue_record.max_in_flight, 4);
+    assert_eq!(queue_record.rejected, 3);
+    assert_eq!(core::mem::size_of::<ElmProviderQueueStatsRecord>(), 72);
+
     assert_eq!(
         status_from_blockers(ELM_POLICY_BLOCK_PROVIDER_BUSY),
         ELM_MGR_STATUS_BUSY
     );
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL),
+        ELM_MGR_STATUS_BUSY
+    );
     assert_eq!(ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, 1 << 19);
+    assert_eq!(ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, 1 << 20);
+    assert_eq!(ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, 1 << 21);
+    assert_eq!(ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED, 1 << 22);
     let policy = ElmMgrPolicyInfo::new(128);
     assert_ne!(
         policy.blocker_mask & ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
         0
     );
+    assert_ne!(
+        policy.blocker_mask & ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
+        0
+    );
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_PROVIDER_ASYNC, 0);
+    assert_ne!(policy.supported_actions & ELM_MGR_ACTION_PROVIDER_ASYNC, 0);
 }
 
 #[test]

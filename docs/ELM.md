@@ -132,8 +132,11 @@ ELM 的运行模型由五个对象构成：
 - `mgr.action.invoke@1`：`elm-mgr` 通过 provider 调用帧执行内建管理动作，当前已支持 Core 健康检查动作。
 - 动态端口提供者：内核单元可以注册带访问策略的 provider 端口，端口会进入快照、审计和统计路径。
 - 同步调用帧：ABI 已稳定为 `ElmCallFrame` / `ElmReplyFrame`；已接入 kernel-backed 管理动作 provider，动态 ELM 原生 provider 仍保持 TODO 边界。
+- 异步 provider 队列：`elm-mgr` 可以提交 provider 调用、轮询结果、取消排队任务并查询队列统计；队列会持有 provider 租约直到结果被领取、TTL 过期或结果环淘汰。
 
 第一版同步调用帧固定内联载荷为 256 字节。调用帧只表达 `binding_id`、`call_id`、`opcode`、`flags` 和 payload，不携带指针，也不绑定文件格式。`mgr.action.invoke@1` 使用 `ElmActionInvokeRequest` 和 `ElmActionInvokeReply` 作为 payload ABI；动态 provider 只能作为声明进入能力织网，真实 ELM 原生执行器仍是 `TODO(elm)`。
+
+异步 provider 队列复用同一个调用帧，不创造第二套 provider ABI。`SubmitProviderCall` 把 `ElmCallFrame` 包进 `ElmProviderAsyncSubmitRequest`，只额外描述超时、结果保留 TTL 和保留 flags。同步 `InvokeProvider` 仍保留，用于低延迟管理动作和兼容现有外部工具；异步路径用于需要背压、取消、超时和结果保留的 provider 调用。
 
 ## 5. 能力织网
 
@@ -439,6 +442,10 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 | `InvokeProvider` | 23 | 已实现边界 | ABI 和校验路径已稳定，真实后端未接入时返回 TODO/UNSUPPORTED |
 | `QueryProviderStats` | 24 | 已实现 | 返回 provider 端口统计记录 |
 | `QueryHealth` | 25 | 已实现 | 返回 Core 结构健康记录，用于发现 graph、cell、port、provider、binding、runtime port、menu、event 和 audit 不变量破坏 |
+| `SubmitProviderCall` | 26 | 已实现 | 提交异步 provider 调用，成功后返回 ticket |
+| `PollProviderReply` | 27 | 已实现 | 按 ticket 查询并领取异步 provider 结果 |
+| `CancelProviderCall` | 28 | 已实现 | 取消尚未执行的排队 provider 调用 |
+| `QueryProviderQueue` | 29 | 已实现 | 返回 provider 异步队列、运行中数量、结果保留和拒绝统计 |
 
 阻断位用于把策略拒绝转化为可观测原因：
 
@@ -664,7 +671,7 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 
 设计细节：
 
-- 当前命令号已扩展到 25，新增动态 provider 注册、注销、查询、调用、统计和 Core 健康查询。
+- 当前命令号已扩展到 29，新增动态 provider 注册、注销、查询、同步调用、异步提交、轮询、取消、队列统计和 Core 健康查询。
 - `ElmMgrPolicyInfo` 暴露支持动作、策略 flags、阻断位 mask 和审计容量。
 - `ElmLifecyclePlanResponse` 用 allowed、status、final_state 和 blockers 表示预检结果。
 - `ElmNexusBindRequest` 使用固定长度契约字段。
@@ -673,6 +680,10 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - `ElmRuntimePortStatsRecord` 暴露 binding、cell、port、lease、cursor、日志提交数、事件投递数和丢弃事件数。
 - `ElmProviderPortRegisterRequest` 描述 provider owner、契约、方向、模式和访问策略。
 - `ElmProviderInvokeRequest` 和 `ElmProviderInvokeResponse` 封装通用调用帧。
+- `ElmProviderAsyncSubmitRequest` 和 `ElmProviderAsyncSubmitResponse` 封装异步提交请求和 ticket 响应；`timeout_ms=0` 使用默认超时，`result_ttl_ms=0` 使用默认结果保留 TTL，非零值会被上限钳制。
+- `ElmProviderAsyncPollRequest` 和 `ElmProviderAsyncPollResponse` 按 ticket 查询状态；终态结果被 poll 后会从结果环移除，并释放对应 provider 租约活跃引用。
+- `ElmProviderAsyncCancelRequest` 和 `ElmProviderAsyncCancelResponse` 取消仍在队列中的任务；已经完成或已经过期的 ticket 不会被强行回滚。
+- `ElmProviderQueueStatsHeader` 和 `ElmProviderQueueStatsRecord` 暴露 queued、running、retained、queue_limit、max_in_flight、submitted、completed、canceled、expired 和 rejected。
 - `ElmProviderPortRecord` 和 `ElmProviderPortStatsRecord` 暴露 provider 绑定数量和调用统计。
 - provider 观测 flags 已稳定为 `DYNAMIC`、`KERNEL_BACKEND` 和 `TODO_BACKEND`，用于区分动态声明端口、内核内建后端和等待 ELM 原生执行器的 TODO 后端。
 - `PROVIDER_CALL_FAILED` 阻断位用于审计 provider transport 成功但 `ElmReplyFrame.status` 失败的业务调用。
@@ -786,6 +797,7 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - `CellRuntime` 保存单元 ID、parent、state、kind、generation、name、EBI 架构、EBI 状态、是否含原生代码、拥有的绑定和菜单项。
 - `RuntimePortBinding` 保存 binding、cell、port、lease、cursor、submitted_logs、delivered_events 和 dropped_events。
 - `ProviderRuntime` 保存 port、owner、访问策略、执行器状态、是否动态、调用次数、失败次数和撤销次数。
+- `ProviderRuntime` 同时保存异步队列上限、并发上限、运行中数量、异步提交数、完成数、取消数、过期数和拒绝数。
 - `ProviderBackend::Kernel(kind)` 表示已接入的内核 provider 执行器；当前第一个真实执行器是 `MgrActionInvoke`。
 - 事件环和审计环容量当前均为 128。
 - 动态 cell ID 从 100 开始，避免与内建 ID 冲突。
@@ -798,6 +810,11 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - `elm-mgr` 启动时会注册一个内建健康检查菜单动作，该动作不带 TODO 标志，通过 `mgr.action.invoke@1` 调用。
 - 动态 provider 端口在真实 ELM 原生执行器接入前只登记声明，不创建可调用后端。
 - `ProviderBackend::ElmNativeTodo` 明确标记未来由真实 ELM 原生代码提供的执行器边界。
+- 异步 provider 队列由 `ProviderAsyncJob` 和 `ProviderAsyncResult` 分离建模；job 表示仍等待执行的调用，result 表示已完成、失败或过期并等待外部领取的终态。
+- 提交异步 job 时会给 binding lease 增加 active ref；job 被取消、result 被 poll、result TTL 过期或结果环淘汰时释放 active ref，因此 `PreflightUnbind` 和生命周期预检能观察到真实忙碌状态。
+- 队列容量按 provider 端口计算，默认上限为 64；`Exclusive` 端口上限为 1，`Ordered` 端口上限为 32，`Shared`、`Pipeline` 和 `Broadcast` 使用默认上限。
+- provider worker 从队列中取出可运行 job，复用同步 provider 后端执行逻辑，并把 `ElmReplyFrame.status != OK` 计为业务失败和 `PROVIDER_CALL_FAILED` 审计。
+- 排队超时会生成 `Expired` 结果并保留到 poll 或 TTL 清理；当前不强抢正在执行的 provider 调用，运行中调用若完成时已经超过 deadline，会被标记为 `Expired`。
 - `ProviderRuntime::record_flags()` 是 provider 观测 flags 的唯一派生入口，`QueryProviderPorts` 和 `QueryProviderStats` 使用同一套 flags 语义。
 - detach 会阻断仍有子单元、依赖者、拓展项或 busy 租约的目标单元。
 - provider owner detach 会阻断仍有活跃 binding 的 provider 端口。
@@ -814,6 +831,20 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 
 - 全局事件读取使用 Core 内的 acknowledged sequence。
 - 运行时端口事件读取使用每个 `RuntimePortBinding` 自己的 cursor，两者语义不同。
+
+### `executor.rs`
+
+职责：
+
+- 启动 ELM 后台执行器。
+- 唤醒 provider 异步队列 worker。
+
+设计细节：
+
+- provider worker 在 `elm-mgr` 初始化成功后启动。
+- worker 只负责等待、唤醒和循环驱动 `ElmCore::run_one_async_provider_job_at`，不直接修改队列内部结构。
+- worker 在空队列时睡眠在 `WaitQueue` 上，`SubmitProviderCall` 成功入队后唤醒。
+- 队列状态、租约 active ref、结果 TTL、审计和统计全部仍由 `core.rs` 维护，避免后台线程复制策略。
 
 ### `menu.rs`
 
@@ -846,6 +877,10 @@ EBI 不是文件格式。ELM Core 不理解未来的容器布局，也不应该�
 - provider 注册命令会校验 owner、契约、方向、模式、访问策略和保留 flags。
 - provider 调用命令会校验 binding、租约、端口可调用性和 payload 长度。
 - provider transport 错误通过 `MGR_CALL` response status 返回；provider 业务结果通过 `ElmReplyFrame.status` 和 reply payload 返回，业务失败会计入 provider failed_calls 并写入 `PROVIDER_CALL_FAILED` 审计。
+- provider 异步提交命令会校验 binding、租约、端口可调用性、后端状态和队列容量；成功提交后返回 ticket，并唤醒 provider worker。
+- provider 异步轮询命令会先清理过期结果和超时 job；终态结果被领取后立即释放租约活跃引用。
+- provider 异步取消命令当前只取消仍在队列中的 job；运行中调用的协作式取消需要未来 provider 执行器协议支持。
+- provider 队列查询命令返回所有 provider 的队列深度、运行中数量、保留结果数、容量、并发上限和累计统计。
 
 ### `ports.rs`
 
@@ -938,6 +973,7 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(RegisterProviderPort/UnregisterProviderPort)` 已支持动态 provider 端口声明注册和注销；动态端口合约由运行时自有字符串保存，不再泄漏为静态字符串。
 - `MGR_CALL(QueryProviderPorts/QueryProviderStats)` 已返回 provider 端口、访问策略、绑定数量、调用次数、失败次数、撤销次数和 provider 观测 flags。
 - `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；`mgr.action.invoke@1` 已接入 kernel-backed 执行器，管理通道已覆盖健康动作调用和业务失败审计，动态 ELM 原生 provider 仍返回 `TODO(elm)`。
+- `MGR_CALL(SubmitProviderCall/PollProviderReply/CancelProviderCall/QueryProviderQueue)` 已形成真实异步队列闭环，支持 ticket、队列容量、超时、结果 TTL、取消、队列统计和租约 active ref 保护。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event 和 audit 不变量破坏。
 - `MGR_CALL` 管理通道已收口输入上限、请求头构造器、保留位零值策略和无 payload 查询命令校验；格式错误统一返回 `INVALID`，未知命令号返回 `UNSUPPORTED`。
 - 动态 provider 端口已支持 `Public`、`ExtensionOnly` 和 `Internal` 三类访问策略。
@@ -953,7 +989,7 @@ ELM 的可观测性由四条路径组成：
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项或忙碌租约的目标单元，避免破坏当前拓扑。
 - `ReplaceCell` 已保留稳定命令号，当前返回结构化预检结果并记录 `REPLACE_TODO` 审计。
-- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 的 Core 直调和 `MGR_CALL(InvokeProvider)` 字节路径、provider 业务失败审计、菜单 EBI 激活、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
+- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 的 Core 直调和 `MGR_CALL(InvokeProvider)` 字节路径、provider 业务失败审计、异步 provider 提交、完成、轮询、取消、超时、队列满、队列查询、菜单 EBI 激活、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
 
 尚未完成：
 
@@ -963,7 +999,7 @@ ELM 的可观测性由四条路径组成：
 - TODO(elm)：原生代码单元的暂停、恢复、静默化回调和卸载执行器。
 - TODO(elm)：设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
 - TODO(elm)：由真实 ELM 原生代码提供 provider backend 的执行器。
-- TODO(elm)：端口级并发、背压、队列和故障隔离策略。
+- TODO(elm)：端口级故障隔离、运行中调用协作式取消和真实 ELM 原生 provider backend。
 - TODO(elm)：面向 Rust ELM 的开发框架和构建链路。
 
 ## 18. 后续阶段路线
@@ -976,6 +1012,7 @@ ELM 的可观测性由四条路径组成：
 - 保持 `sys_elm_ctl`、`MGR_CALL`、快照、事件和审计 ABI 稳定。
 - 完成 `core.log@1`、`core.event@1`、`mgr.menu.item@1` 和 `mgr.action.invoke@1` 四个基础端口的闭环。
 - 完成动态 provider 端口声明注册、访问策略、同步调用帧 ABI、撤销和统计闭环；真实 ELM 原生执行器接入前绑定提交保持 TODO 阻断。
+- 完成 provider 异步队列、ticket、poll、cancel、timeout、result TTL、队列统计和租约 active ref 保护闭环；运行中协作式取消和真实 ELM 原生后端留到执行器阶段。
 
 第二阶段：`soyo` 与 EBI 接入。
 
