@@ -9,6 +9,8 @@ mod mgr_channel;
 mod ports;
 mod snapshot;
 pub(crate) mod syscall;
+#[cfg(feature = "kernel-tests")]
+mod tests;
 
 pub(crate) fn init_builtin_mgr() {
     match core::with_core(|core| core.init_builtin_mgr()) {
