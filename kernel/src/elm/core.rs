@@ -27,25 +27,25 @@ use elm_model::{
     ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
     ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
     ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
-    ELM_POLICY_BLOCK_REPLACE_TODO, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmActionInvokeReply,
-    ElmActionInvokeRequest, ElmCallFrame, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo,
-    ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId,
-    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
-    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
-    ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
-    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
-    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
-    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
-    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
-    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
-    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
-    ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind,
-    LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
-    status_from_blockers,
+    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_REPLACE_TODO, ELM_PROVIDER_FLAG_DYNAMIC,
+    ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN,
+    ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmCoreHealthHeader,
+    ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError,
+    ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest,
+    ElmMenuItemKind, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind,
+    ElmMgrRelationRecord, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
+    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
+    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmProviderInvokeRequest,
+    ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
+    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
+    ElmProviderPortUnregisterRequest, ElmReplyFrame, ElmRuntimeEventRequest,
+    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState, ElmVersion, FlowContract,
+    FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights,
+    NexusOffer, PortId, ResourceLease, TopologyEventKind, builtin_port_descriptors,
+    first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
 };
 use sched::sync::Spinlock;
 
@@ -661,10 +661,11 @@ impl ElmCore {
                 .failed_calls
                 .saturating_add(1);
         }
+        let audit_blockers = provider_call_blockers(reply.status);
         self.record_mgr_audit(
             ELM_MGR_ACTION_PROVIDER_INVOKE,
             edge.consumer,
-            0,
+            audit_blockers,
             self.cell_state(edge.consumer).map(state_code).unwrap_or(0),
         );
         Ok(ElmProviderInvokeResponse::new(reply))
@@ -3054,6 +3055,14 @@ fn runtime_status_blocker(status: i32) -> u64 {
         ELM_MGR_STATUS_NOT_FOUND => ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
         ELM_MGR_STATUS_INVALID => ELM_POLICY_BLOCK_INVALID_STATE,
         _ => ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+    }
+}
+
+fn provider_call_blockers(status: i32) -> u64 {
+    if status == ELM_CALL_STATUS_OK {
+        0
+    } else {
+        ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED
     }
 }
 

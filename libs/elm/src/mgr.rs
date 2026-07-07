@@ -70,6 +70,7 @@ pub const ELM_POLICY_BLOCK_BINDING_NOT_FOUND: u64 = 1 << 15;
 pub const ELM_POLICY_BLOCK_BINDING_PROTECTED: u64 = 1 << 16;
 pub const ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND: u64 = 1 << 17;
 pub const ELM_POLICY_BLOCK_PROVIDER_BUSY: u64 = 1 << 18;
+pub const ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED: u64 = 1 << 19;
 
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
@@ -402,7 +403,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_BINDING_NOT_FOUND
                 | ELM_POLICY_BLOCK_BINDING_PROTECTED
                 | ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND
-                | ELM_POLICY_BLOCK_PROVIDER_BUSY,
+                | ELM_POLICY_BLOCK_PROVIDER_BUSY
+                | ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
             audit_capacity,
             reserved1: 0,
         }

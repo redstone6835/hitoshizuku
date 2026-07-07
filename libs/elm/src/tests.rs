@@ -9,12 +9,13 @@ use crate::{
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
     ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_PORT_FLAG_NONE, ELM_RUNTIME_LOG_MESSAGE_LEN,
-    ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmCellSnapshot,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry,
-    ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit,
-    ElmError, ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
+    ELM_PROVIDER_PORT_FLAG_NONE, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmActionInvokeReply,
+    ElmActionInvokeRequest, ElmCallFrame, ElmCellSnapshot, ElmCoreHealthHeader,
+    ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiEntry, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError,
+    ElmEventRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
     ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
     ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrAuditHeader,
     ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrRelationKind,
@@ -799,6 +800,12 @@ fn provider_port_abi_records_are_fixed_layout() {
     assert_eq!(
         status_from_blockers(ELM_POLICY_BLOCK_PROVIDER_BUSY),
         ELM_MGR_STATUS_BUSY
+    );
+    assert_eq!(ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, 1 << 19);
+    let policy = ElmMgrPolicyInfo::new(128);
+    assert_ne!(
+        policy.blocker_mask & ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+        0
     );
 }
 

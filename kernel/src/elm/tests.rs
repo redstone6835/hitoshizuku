@@ -8,16 +8,17 @@ use elm_model::{
     ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
     ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
     ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_MENU_FLAG_TODO,
-    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
-    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_PORT_TODO, ELM_PROVIDER_FLAG_DYNAMIC,
+    ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
+    ELM_MGR_STATUS_UNSUPPORTED, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_PORT_TODO,
+    ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_PROVIDER_FLAG_DYNAMIC,
     ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest,
     ElmCallFrame, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLoadStatus,
     ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmId, ElmKind,
-    ElmManifest, ElmMenuItemKind, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo,
-    ElmMgrResponseHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
-    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderPortRegisterRequest,
-    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmState, ElmVersion,
-    FlowDirection, FlowMode, state_code,
+    ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
+    ElmMgrPolicyInfo, ElmMgrResponseHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
+    ElmState, ElmVersion, FlowDirection, FlowMode, state_code,
 };
 
 use super::core::{ELM_MGR_ID, ElmCore};
@@ -150,6 +151,20 @@ fn action_invoke_payload(request: &ElmActionInvokeRequest) -> Vec<u8> {
     push_u64(&mut out, request.action_id);
     push_u32(&mut out, request.flags);
     push_u32(&mut out, request.reserved);
+    out
+}
+
+fn provider_invoke_payload(request: &ElmProviderInvokeRequest) -> Vec<u8> {
+    let frame = request.frame;
+    let mut out = Vec::new();
+    push_u64(&mut out, frame.binding_id);
+    push_u64(&mut out, frame.call_id);
+    push_u32(&mut out, frame.opcode);
+    push_u32(&mut out, frame.flags);
+    push_u16(&mut out, frame.payload_len);
+    push_u16(&mut out, frame.reserved0);
+    push_u32(&mut out, frame.reserved1);
+    out.extend_from_slice(&frame.payload);
     out
 }
 
@@ -396,6 +411,97 @@ fn elm_mgr_channel_dispatches_core_queries_and_provider_flow() {
     assert!(response_payload_len(&health) >= core::mem::size_of::<ElmCoreHealthHeader>());
     let health_payload = response_payload(&health);
     assert_eq!(read_i32(health_payload, 8), ELM_MGR_STATUS_OK);
+
+    let action = core
+        .menu_items()
+        .iter()
+        .find(|item| item.route == "elm/mgr/health")
+        .unwrap()
+        .action;
+    let action_bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, 4, "mgr.action.invoke@1");
+    let action_bind_payload = nexus_bind_payload(&action_bind);
+    let action_bind_response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::CommitBind, &action_bind_payload),
+    );
+    assert_eq!(response_status(&action_bind_response), ELM_MGR_STATUS_OK);
+    assert_eq!(
+        response_payload_len(&action_bind_response),
+        core::mem::size_of::<ElmNexusBindPlanResponse>()
+    );
+    let action_bind_response_payload = response_payload(&action_bind_response);
+    assert_eq!(
+        read_i32(action_bind_response_payload, 40),
+        ELM_MGR_STATUS_OK
+    );
+    assert_eq!(read_u32(action_bind_response_payload, 44), 1);
+    let action_binding = read_u64(action_bind_response_payload, 16);
+
+    let action_payload = action_invoke_payload(&ElmActionInvokeRequest::new(action.0));
+    let frame = ElmCallFrame::new(
+        action_binding,
+        10,
+        ELM_ACTION_OPCODE_INVOKE,
+        &action_payload,
+    );
+    let invoke_payload = provider_invoke_payload(&ElmProviderInvokeRequest::new(frame));
+    let invoke_response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::InvokeProvider, &invoke_payload),
+    );
+    assert_eq!(response_status(&invoke_response), ELM_MGR_STATUS_OK);
+    assert_eq!(
+        response_payload_len(&invoke_response),
+        core::mem::size_of::<ElmProviderInvokeResponse>()
+    );
+    let invoke_response_payload = response_payload(&invoke_response);
+    assert_eq!(read_i32(invoke_response_payload, 16), ELM_CALL_STATUS_OK);
+    assert_eq!(
+        read_u16(invoke_response_payload, 24) as usize,
+        core::mem::size_of::<elm_model::ElmActionInvokeReply>()
+    );
+    assert_eq!(
+        read_u32(invoke_response_payload, 32 + 24),
+        ELM_ACTION_RESULT_HEALTH
+    );
+    assert_eq!(
+        read_i32(invoke_response_payload, 32 + 28),
+        ELM_MGR_STATUS_OK
+    );
+
+    let missing_action_payload = action_invoke_payload(&ElmActionInvokeRequest::new(999_999));
+    let frame = ElmCallFrame::new(
+        action_binding,
+        11,
+        ELM_ACTION_OPCODE_INVOKE,
+        &missing_action_payload,
+    );
+    let invoke_payload = provider_invoke_payload(&ElmProviderInvokeRequest::new(frame));
+    let invoke_response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::InvokeProvider, &invoke_payload),
+    );
+    assert_eq!(response_status(&invoke_response), ELM_MGR_STATUS_OK);
+    let invoke_response_payload = response_payload(&invoke_response);
+    assert_eq!(
+        read_i32(invoke_response_payload, 16),
+        ELM_CALL_STATUS_NOT_FOUND
+    );
+
+    let audits = core.audit_bytes();
+    let audit_header_size = core::mem::size_of::<ElmMgrAuditHeader>();
+    let audit_record_size = read_u16(&audits, 2) as usize;
+    let audit_record_count = read_u32(&audits, 4) as usize;
+    let last_audit = audit_header_size + (audit_record_count - 1) * audit_record_size;
+    assert_eq!(
+        read_u32(&audits, last_audit + 8),
+        ELM_MGR_ACTION_PROVIDER_INVOKE
+    );
+    assert_eq!(read_i32(&audits, last_audit + 12), ELM_MGR_STATUS_INVALID);
+    assert_ne!(
+        read_u64(&audits, last_audit + 24) & ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+        0
+    );
 
     let register = ElmProviderPortRegisterRequest::new(
         ELM_MGR_ID.0,
