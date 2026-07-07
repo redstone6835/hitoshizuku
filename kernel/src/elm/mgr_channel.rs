@@ -189,6 +189,10 @@ pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
             let payload = with_core(|core| core.provider_stats_bytes());
             response_with_payload(payload)
         }
+        ElmMgrCallKind::QueryHealth => {
+            let payload = with_core(|core| core.health_bytes());
+            response_with_payload(payload)
+        }
     }
 }
 

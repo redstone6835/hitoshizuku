@@ -30,14 +30,13 @@ pub(crate) fn snapshot_bytes(core: &ElmCore) -> Vec<u8> {
         push_plain(&mut out, &entry);
     }
     for port in core.ports() {
-        let desc = port.desc;
         let entry = ElmPortSnapshot::new(
-            desc.id,
-            desc.owner,
-            desc.contract,
-            desc.direction,
-            desc.mode,
-            desc.implemented,
+            port.id,
+            port.owner,
+            port.contract(),
+            port.direction,
+            port.mode,
+            port.implemented,
         );
         push_plain(&mut out, &entry);
     }

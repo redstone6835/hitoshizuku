@@ -39,6 +39,7 @@ pub const ELM_MGR_ACTION_PROVIDER_REGISTER: u32 = 1 << 9;
 pub const ELM_MGR_ACTION_PROVIDER_UNREGISTER: u32 = 1 << 10;
 pub const ELM_MGR_ACTION_PROVIDER_QUERY: u32 = 1 << 11;
 pub const ELM_MGR_ACTION_PROVIDER_INVOKE: u32 = 1 << 12;
+pub const ELM_MGR_ACTION_HEALTH_QUERY: u32 = 1 << 13;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
@@ -48,6 +49,7 @@ pub const ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO: u64 = 1 << 4;
 pub const ELM_MGR_POLICY_NEXUS_BINDING: u64 = 1 << 5;
 pub const ELM_MGR_POLICY_MENU_BINDING: u64 = 1 << 6;
 pub const ELM_MGR_POLICY_PROVIDER_PORTS: u64 = 1 << 7;
+pub const ELM_MGR_POLICY_HEALTH: u64 = 1 << 8;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -73,7 +75,32 @@ pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
 pub const ELM_NEXUS_CONTRACT_LEN: usize = 64;
 pub const ELM_RUNTIME_LOG_MESSAGE_LEN: usize = 256;
-pub const ELM_PROVIDER_PORT_FLAG_TEST_ECHO: u32 = 1 << 0;
+pub const ELM_PROVIDER_PORT_FLAG_NONE: u32 = 0;
+pub const ELM_PROVIDER_FLAG_DYNAMIC: u16 = 1 << 0;
+pub const ELM_PROVIDER_FLAG_KERNEL_BACKEND: u16 = 1 << 1;
+pub const ELM_PROVIDER_FLAG_TODO_BACKEND: u16 = 1 << 2;
+
+pub const ELM_HEALTH_FLAG_HAS_FAILURES: u32 = 1 << 0;
+
+pub const ELM_HEALTH_CHECK_GRAPH: u32 = 1;
+pub const ELM_HEALTH_CHECK_CELLS: u32 = 2;
+pub const ELM_HEALTH_CHECK_PORTS: u32 = 3;
+pub const ELM_HEALTH_CHECK_PROVIDERS: u32 = 4;
+pub const ELM_HEALTH_CHECK_BINDINGS: u32 = 5;
+pub const ELM_HEALTH_CHECK_RUNTIME_PORTS: u32 = 6;
+pub const ELM_HEALTH_CHECK_MENU: u32 = 7;
+pub const ELM_HEALTH_CHECK_EVENTS: u32 = 8;
+pub const ELM_HEALTH_CHECK_AUDITS: u32 = 9;
+
+pub const ELM_HEALTH_DETAIL_NONE: u64 = 0;
+pub const ELM_HEALTH_DETAIL_GRAPH_INVALID: u64 = 1;
+pub const ELM_HEALTH_DETAIL_MISSING_OBJECT: u64 = 2;
+pub const ELM_HEALTH_DETAIL_DUPLICATE_OBJECT: u64 = 3;
+pub const ELM_HEALTH_DETAIL_DANGLING_REFERENCE: u64 = 4;
+pub const ELM_HEALTH_DETAIL_CONTRACT_INVALID: u64 = 5;
+pub const ELM_HEALTH_DETAIL_SEQUENCE_INVALID: u64 = 6;
+pub const ELM_HEALTH_DETAIL_KIND_MISMATCH: u64 = 7;
+pub const ELM_HEALTH_DETAIL_STATE_INVALID: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -102,6 +129,7 @@ pub enum ElmMgrCallKind {
     QueryProviderPorts = 22,
     InvokeProvider = 23,
     QueryProviderStats = 24,
+    QueryHealth = 25,
 }
 
 impl ElmMgrCallKind {
@@ -131,6 +159,7 @@ impl ElmMgrCallKind {
             22 => Some(Self::QueryProviderPorts),
             23 => Some(Self::InvokeProvider),
             24 => Some(Self::QueryProviderStats),
+            25 => Some(Self::QueryHealth),
             _ => None,
         }
     }
@@ -327,7 +356,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_ACTION_PROVIDER_REGISTER
                 | ELM_MGR_ACTION_PROVIDER_UNREGISTER
                 | ELM_MGR_ACTION_PROVIDER_QUERY
-                | ELM_MGR_ACTION_PROVIDER_INVOKE,
+                | ELM_MGR_ACTION_PROVIDER_INVOKE
+                | ELM_MGR_ACTION_HEALTH_QUERY,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
                 | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
@@ -335,7 +365,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO
                 | ELM_MGR_POLICY_NEXUS_BINDING
                 | ELM_MGR_POLICY_MENU_BINDING
-                | ELM_MGR_POLICY_PROVIDER_PORTS,
+                | ELM_MGR_POLICY_PROVIDER_PORTS
+                | ELM_MGR_POLICY_HEALTH,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -953,7 +984,7 @@ pub struct ElmProviderPortRecord {
     pub invokable: u32,
     pub binding_count: u32,
     pub contract_len: u16,
-    pub reserved: u16,
+    pub flags: u16,
     pub calls: u64,
     pub failed_calls: u64,
     pub revokes: u64,
@@ -971,6 +1002,7 @@ impl ElmProviderPortRecord {
         implemented: bool,
         invokable: bool,
         binding_count: u32,
+        flags: u16,
         calls: u64,
         failed_calls: u64,
         revokes: u64,
@@ -986,7 +1018,7 @@ impl ElmProviderPortRecord {
             invokable: u32::from(invokable),
             binding_count,
             contract_len: 0,
-            reserved: 0,
+            flags,
             calls,
             failed_calls,
             revokes,
@@ -1014,6 +1046,7 @@ impl ElmProviderPortStatsRecord {
         port_id: u64,
         owner_cell_id: u64,
         binding_count: u32,
+        flags: u32,
         calls: u64,
         failed_calls: u64,
         revokes: u64,
@@ -1022,10 +1055,67 @@ impl ElmProviderPortStatsRecord {
             port_id,
             owner_cell_id,
             binding_count,
-            flags: 0,
+            flags,
             calls,
             failed_calls,
             revokes,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmCoreHealthHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub status: i32,
+    pub flags: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmCoreHealthHeader {
+    pub const fn new(record_count: u32, status: i32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmCoreHealthRecord>() as u16,
+            record_count,
+            status,
+            flags: if status == ELM_MGR_STATUS_OK {
+                0
+            } else {
+                ELM_HEALTH_FLAG_HAS_FAILURES
+            },
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmCoreHealthRecord {
+    pub check_kind: u32,
+    pub status: i32,
+    pub subject_id: u64,
+    pub detail: u64,
+}
+
+impl ElmCoreHealthRecord {
+    pub const fn ok(check_kind: u32) -> Self {
+        Self {
+            check_kind,
+            status: ELM_MGR_STATUS_OK,
+            subject_id: 0,
+            detail: ELM_HEALTH_DETAIL_NONE,
+        }
+    }
+
+    pub const fn invalid(check_kind: u32, subject_id: u64, detail: u64) -> Self {
+        Self {
+            check_kind,
+            status: ELM_MGR_STATUS_INVALID,
+            subject_id,
+            detail,
         }
     }
 }

@@ -1,41 +1,46 @@
 //! ELM 核心全局状态。
 
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use alloc::vec::Vec;
 
 use elm_model::{
-    ActionId, BindingGraph, BindingId, ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
-    ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
-    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_INVOKE,
-    ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
-    ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
-    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID,
-    ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_UNSUPPORTED,
-    ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
-    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
-    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
-    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
-    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
-    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_NATIVE_TODO,
-    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
-    ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_REPLACE_TODO,
-    ELM_PROVIDER_PORT_FLAG_TEST_ECHO, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCallFrame, ElmCoreInfo,
-    ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId,
-    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
-    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
-    ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
-    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
-    ElmPortAccessPolicy, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
-    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
-    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
-    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
-    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
-    ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, IntentKind, LeaseId, LeaseKind,
-    LeaseRegistry, LeaseRights, NexusIntent, NexusOffer, PortDescriptor, PortId, ResourceLease,
+    ActionId, BindingGraph, BindingId, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
+    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU,
+    ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS,
+    ELM_HEALTH_DETAIL_CONTRACT_INVALID, ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT, ELM_HEALTH_DETAIL_GRAPH_INVALID,
+    ELM_HEALTH_DETAIL_KIND_MISMATCH, ELM_HEALTH_DETAIL_MISSING_OBJECT,
+    ELM_HEALTH_DETAIL_SEQUENCE_INVALID, ELM_HEALTH_DETAIL_STATE_INVALID,
+    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT, ELM_LIFECYCLE_REASON_LEASE_BUSY,
+    ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO,
+    ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_REGISTER,
+    ELM_MGR_ACTION_PROVIDER_UNREGISTER, ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
+    ELM_MGR_ACTION_RUNTIME_EVENT_READ, ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
+    ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+    ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
+    ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
+    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+    ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO,
+    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+    ELM_POLICY_BLOCK_REPLACE_TODO, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmCoreHealthHeader,
+    ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError,
+    ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest,
+    ElmMenuItemKind, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind,
+    ElmMgrRelationRecord, ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse,
+    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
+    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmProviderInvokeRequest,
+    ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
+    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
+    ElmProviderPortUnregisterRequest, ElmRuntimeEventRequest, ElmRuntimeEventResponse,
+    ElmRuntimeLogRequest, ElmRuntimeLogResponse, ElmRuntimePortStatsHeader,
+    ElmRuntimePortStatsRecord, ElmState, ElmVersion, FlowContract, FlowDirection, FlowMode,
+    Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease,
     TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason, planned_final_state,
     state_code, status_from_blockers,
 };
@@ -45,10 +50,6 @@ use super::menu::MenuItemRuntime;
 use super::ports::PortRuntime;
 
 pub(crate) const ELM_MGR_ID: ElmId = ElmId(1);
-pub(crate) const ELM_MENU_DEMO_ID: ElmId = ElmId(2);
-const ELM_MENU_DEMO_ACTION_ID: ActionId = ActionId(1);
-const ELM_MENU_DEMO_BINDING_ID: BindingId = BindingId(1);
-const ELM_MENU_DEMO_LEASE_ID: LeaseId = LeaseId(1);
 const ELM_CORE_LOG_PORT_ID: PortId = PortId(1);
 const ELM_CORE_EVENT_PORT_ID: PortId = PortId(2);
 const ELM_MGR_MENU_PORT_ID: PortId = PortId(3);
@@ -90,9 +91,9 @@ struct RuntimePortBinding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderOpsKind {
-    Builtin,
-    TestEcho,
+enum ProviderBackend {
+    KernelImplemented,
+    ElmNativeTodo,
 }
 
 #[derive(Debug, Clone)]
@@ -100,11 +101,25 @@ struct ProviderRuntime {
     port: PortId,
     owner: Option<ElmId>,
     access: ElmPortAccessPolicy,
-    ops: ProviderOpsKind,
+    backend: ProviderBackend,
     dynamic: bool,
     calls: u64,
     failed_calls: u64,
     revokes: u64,
+}
+
+impl ProviderRuntime {
+    fn record_flags(&self) -> u16 {
+        let mut flags = 0;
+        if self.dynamic {
+            flags |= ELM_PROVIDER_FLAG_DYNAMIC;
+        }
+        match self.backend {
+            ProviderBackend::KernelImplemented => flags |= ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+            ProviderBackend::ElmNativeTodo => flags |= ELM_PROVIDER_FLAG_TODO_BACKEND,
+        }
+        flags
+    }
 }
 
 pub(crate) struct ElmCore {
@@ -200,9 +215,8 @@ impl ElmCore {
         self.emit(TopologyEventKind::CellAdded, Some(ELM_MGR_ID));
         self.emit(TopologyEventKind::CellStateChanged, Some(ELM_MGR_ID));
         self.register_builtin_ports();
-        self.register_builtin_menu_demo()?;
         self.initialized = true;
-        log::info!("[elm] Core initialized with builtin elm-mgr and menu extension");
+        log::info!("[elm] Core initialized with builtin elm-mgr");
         Ok(())
     }
 
@@ -385,10 +399,11 @@ impl ElmCore {
                 port.implemented,
                 port.invokable,
                 self.provider_binding_count(provider.port) as u32,
+                provider.record_flags(),
                 provider.calls,
                 provider.failed_calls,
                 provider.revokes,
-                port.contract,
+                port.contract(),
             );
             push_plain(&mut out, &record);
         }
@@ -407,11 +422,24 @@ impl ElmCore {
                 provider.port.0,
                 provider.owner.map(|owner| owner.0).unwrap_or(0),
                 self.provider_binding_count(provider.port) as u32,
+                u32::from(provider.record_flags()),
                 provider.calls,
                 provider.failed_calls,
                 provider.revokes,
             );
             push_plain(&mut out, &record);
+        }
+        out
+    }
+
+    pub fn health_bytes(&self) -> Vec<u8> {
+        let (status, records) = self.health_records();
+        let header =
+            ElmCoreHealthHeader::new(records.len() as u32, status, self.last_event_sequence());
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for record in &records {
+            push_plain(&mut out, record);
         }
         out
     }
@@ -459,40 +487,33 @@ impl ElmCore {
         ) {
             blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
         }
-        if self.ports.iter().any(|port| port.desc.contract == contract) {
-            blockers |= ELM_POLICY_BLOCK_DUPLICATE_BINDING;
-        }
-        let ops = if request.flags & ELM_PROVIDER_PORT_FLAG_TEST_ECHO != 0 {
-            ProviderOpsKind::TestEcho
-        } else {
-            blockers |= ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND;
-            ProviderOpsKind::Builtin
-        };
-        if !matches!(direction, FlowDirection::Control | FlowDirection::Duplex) {
+        if request.flags != 0 {
             blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+        }
+        if self.ports.iter().any(|port| port.contract() == contract) {
+            blockers |= ELM_POLICY_BLOCK_DUPLICATE_BINDING;
         }
         if blockers != 0 {
             return self.provider_register_response(owner, PortId(0), access, blockers);
         }
 
         let port = self.alloc_port_id();
-        let contract_static = leak_contract(contract);
-        let desc = PortDescriptor {
-            id: port,
-            owner: Some(owner),
-            contract: contract_static,
+        let runtime = PortRuntime::new(
+            port,
+            Some(owner),
+            contract,
             direction,
             mode,
             access,
-            invokable: true,
-            implemented: true,
-        };
-        self.register_port(desc);
+            false,
+            false,
+        );
+        self.register_port(runtime);
         self.providers.push(ProviderRuntime {
             port,
             owner: Some(owner),
             access,
-            ops,
+            backend: ProviderBackend::ElmNativeTodo,
             dynamic: true,
             calls: 0,
             failed_calls: 0,
@@ -546,7 +567,7 @@ impl ElmCore {
             );
         }
         self.providers.remove(index);
-        self.ports.retain(|runtime| runtime.desc.id != port);
+        self.ports.retain(|runtime| runtime.id != port);
         self.record_mgr_audit(
             ELM_MGR_ACTION_PROVIDER_UNREGISTER,
             owner,
@@ -595,15 +616,21 @@ impl ElmCore {
                 .saturating_add(1);
             return Err(ELM_MGR_STATUS_UNSUPPORTED);
         }
-        let reply = match self.providers[provider_index].ops {
-            ProviderOpsKind::Builtin => {
+        let reply: elm_model::ElmReplyFrame = match self.providers[provider_index].backend {
+            ProviderBackend::KernelImplemented => {
+                // TODO(elm): 未来真实内核 provider 在这里挂接稳定执行器表。
                 self.providers[provider_index].failed_calls = self.providers[provider_index]
                     .failed_calls
                     .saturating_add(1);
-                ElmReplyFrame::empty(binding.0, frame.call_id, ELM_MGR_STATUS_UNSUPPORTED)
+                Err(ELM_MGR_STATUS_UNSUPPORTED)
             }
-            ProviderOpsKind::TestEcho => self.invoke_test_echo(provider_index, frame),
-        };
+            ProviderBackend::ElmNativeTodo => {
+                self.providers[provider_index].failed_calls = self.providers[provider_index]
+                    .failed_calls
+                    .saturating_add(1);
+                Err(ELM_MGR_STATUS_TODO)
+            }
+        }?;
         self.record_mgr_audit(
             ELM_MGR_ACTION_PROVIDER_INVOKE,
             edge.consumer,
@@ -822,14 +849,14 @@ impl ElmCore {
         let request_contract = request_contract(&request);
         let port_desc = match self.port_desc(port) {
             Some(desc) => {
-                if request_contract != Some(desc.contract) {
+                if request_contract != Some(desc.contract()) {
                     blockers |= ELM_POLICY_BLOCK_CONTRACT_MISMATCH;
                 }
-                if !self.provider_access_allowed(id, desc) {
+                if !self.provider_access_allowed(id, &desc) {
                     blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
                 }
                 // 已实现端口才允许进入真实绑定提交路径；其它端口只暴露描述和预检。
-                if !self.is_bind_supported_port(desc) {
+                if !self.is_bind_supported_port(&desc) {
                     blockers |= ELM_POLICY_BLOCK_PORT_TODO;
                 }
                 Some(desc)
@@ -907,7 +934,7 @@ impl ElmCore {
                 self.attach_menu_binding(id, port, contract, binding, lease)
             }
             Some(desc)
-                if desc.id == ELM_CORE_LOG_PORT_ID && desc.contract == ELM_CORE_LOG_CONTRACT =>
+                if desc.id == ELM_CORE_LOG_PORT_ID && desc.contract() == ELM_CORE_LOG_CONTRACT =>
             {
                 self.attach_runtime_port_binding(
                     id,
@@ -921,7 +948,7 @@ impl ElmCore {
             }
             Some(desc)
                 if desc.id == ELM_CORE_EVENT_PORT_ID
-                    && desc.contract == ELM_CORE_EVENT_CONTRACT =>
+                    && desc.contract() == ELM_CORE_EVENT_CONTRACT =>
             {
                 self.attach_runtime_port_binding(
                     id,
@@ -1024,6 +1051,48 @@ impl ElmCore {
         }
 
         let binding = BindingId(request.binding_id);
+        let Some(edge) = self.graph.capability_binding(binding).cloned() else {
+            return ElmNexusBindPlanResponse::new(
+                0,
+                0,
+                request.binding_id,
+                0,
+                0,
+                false,
+                status_from_blockers(ELM_POLICY_BLOCK_BINDING_NOT_FOUND),
+                ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+            );
+        };
+        if let Some(lease) = edge.lease {
+            match self.leases.get(lease) {
+                Some(resource) if resource.active_refs != 0 => {
+                    return ElmNexusBindPlanResponse::new(
+                        edge.consumer.0,
+                        edge.port.0,
+                        edge.id.0,
+                        lease.0,
+                        edge.generation.0,
+                        false,
+                        status_from_blockers(ELM_POLICY_BLOCK_LEASE_BUSY),
+                        ELM_POLICY_BLOCK_LEASE_BUSY,
+                    );
+                }
+                Some(_) => {}
+                None => {
+                    return ElmNexusBindPlanResponse::new(
+                        edge.consumer.0,
+                        edge.port.0,
+                        edge.id.0,
+                        lease.0,
+                        edge.generation.0,
+                        false,
+                        status_from_blockers(ELM_POLICY_BLOCK_GRAPH_INCONSISTENT),
+                        ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+                    );
+                }
+            }
+        }
+
         let Ok(edge) = self.graph.remove_capability_binding(binding) else {
             return ElmNexusBindPlanResponse::new(
                 0,
@@ -1487,9 +1556,462 @@ impl ElmCore {
         self.finish_lifecycle(action, response, 0)
     }
 
+    fn health_records(&self) -> (i32, Vec<ElmCoreHealthRecord>) {
+        let mut records = Vec::new();
+        self.check_health_graph(&mut records);
+        self.check_health_cells(&mut records);
+        self.check_health_ports(&mut records);
+        self.check_health_providers(&mut records);
+        self.check_health_bindings(&mut records);
+        self.check_health_runtime_ports(&mut records);
+        self.check_health_menu(&mut records);
+        self.check_health_events(&mut records);
+        self.check_health_audits(&mut records);
+
+        let status = if records
+            .iter()
+            .any(|record| record.status != ELM_MGR_STATUS_OK)
+        {
+            ELM_MGR_STATUS_INVALID
+        } else {
+            ELM_MGR_STATUS_OK
+        };
+        (status, records)
+    }
+
+    fn check_health_graph(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        match self.graph.validate() {
+            Ok(report) => {
+                if report.cells != self.cells.len() {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_GRAPH,
+                        0,
+                        ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                    ));
+                }
+            }
+            Err(_) => records.push(ElmCoreHealthRecord::invalid(
+                ELM_HEALTH_CHECK_GRAPH,
+                0,
+                ELM_HEALTH_DETAIL_GRAPH_INVALID,
+            )),
+        }
+        if self.initialized && self.graph.cell(ELM_MGR_ID).is_none() {
+            records.push(ElmCoreHealthRecord::invalid(
+                ELM_HEALTH_CHECK_GRAPH,
+                ELM_MGR_ID.0,
+                ELM_HEALTH_DETAIL_MISSING_OBJECT,
+            ));
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_GRAPH);
+    }
+
+    fn check_health_cells(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        for (index, cell) in self.cells.iter().enumerate() {
+            if self.cells[..index].iter().any(|prev| prev.id == cell.id) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_CELLS,
+                    cell.id.0,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+                ));
+            }
+            if self.graph.cell(cell.id).is_none() {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_CELLS,
+                    cell.id.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                ));
+            }
+            if self.graph.parent(cell.id) != cell.parent {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_CELLS,
+                    cell.id.0,
+                    ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            }
+            if cell.state == ElmState::Retired {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_CELLS,
+                    cell.id.0,
+                    ELM_HEALTH_DETAIL_STATE_INVALID,
+                ));
+            }
+            for binding in &cell.owned_bindings {
+                match self.graph.capability_binding(*binding) {
+                    Some(edge) if edge.consumer == cell.id => {}
+                    _ => records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_CELLS,
+                        binding.0,
+                        ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                    )),
+                }
+            }
+            for menu_id in &cell.owned_menu_items {
+                if !self
+                    .menu_items
+                    .iter()
+                    .any(|item| item.id == *menu_id && item.owner == cell.id)
+                {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_CELLS,
+                        *menu_id,
+                        ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                    ));
+                }
+            }
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_CELLS);
+    }
+
+    fn check_health_ports(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        for (index, port) in self.ports.iter().enumerate() {
+            if self.ports[..index].iter().any(|prev| prev.id == port.id) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PORTS,
+                    port.id.0,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+                ));
+            }
+            if self.ports[..index]
+                .iter()
+                .any(|prev| prev.contract() == port.contract())
+            {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PORTS,
+                    port.id.0,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+                ));
+            }
+            if FlowContract::new(port.contract()).is_err() {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PORTS,
+                    port.id.0,
+                    ELM_HEALTH_DETAIL_CONTRACT_INVALID,
+                ));
+            }
+            if let Some(owner) = port.owner {
+                if !self.cell_exists(owner) {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_PORTS,
+                        port.id.0,
+                        ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                    ));
+                }
+            }
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_PORTS);
+    }
+
+    fn check_health_providers(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        for (index, provider) in self.providers.iter().enumerate() {
+            if self.providers[..index]
+                .iter()
+                .any(|prev| prev.port == provider.port)
+            {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PROVIDERS,
+                    provider.port.0,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+                ));
+            }
+
+            let Some(port) = self.ports.iter().find(|port| port.id == provider.port) else {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PROVIDERS,
+                    provider.port.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                ));
+                continue;
+            };
+            if provider.owner != port.owner || provider.access != port.access {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PROVIDERS,
+                    provider.port.0,
+                    ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                ));
+            }
+            if let Some(owner) = provider.owner {
+                if !self.cell_exists(owner) {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_PROVIDERS,
+                        provider.port.0,
+                        ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                    ));
+                }
+            }
+            let flags = provider.record_flags();
+            let backend_flags =
+                flags & (ELM_PROVIDER_FLAG_KERNEL_BACKEND | ELM_PROVIDER_FLAG_TODO_BACKEND);
+            if backend_flags == 0
+                || backend_flags
+                    == (ELM_PROVIDER_FLAG_KERNEL_BACKEND | ELM_PROVIDER_FLAG_TODO_BACKEND)
+                || ((flags & ELM_PROVIDER_FLAG_DYNAMIC) != 0) != provider.dynamic
+            {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PROVIDERS,
+                    provider.port.0,
+                    ELM_HEALTH_DETAIL_STATE_INVALID,
+                ));
+            }
+            match provider.backend {
+                ProviderBackend::KernelImplemented if !port.implemented => {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_PROVIDERS,
+                        provider.port.0,
+                        ELM_HEALTH_DETAIL_STATE_INVALID,
+                    ));
+                }
+                ProviderBackend::ElmNativeTodo if port.implemented || port.invokable => {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_PROVIDERS,
+                        provider.port.0,
+                        ELM_HEALTH_DETAIL_STATE_INVALID,
+                    ));
+                }
+                _ => {}
+            }
+            if provider.dynamic && provider.port.0 < FIRST_DYNAMIC_PORT_ID {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PROVIDERS,
+                    provider.port.0,
+                    ELM_HEALTH_DETAIL_STATE_INVALID,
+                ));
+            }
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_PROVIDERS);
+    }
+
+    fn check_health_bindings(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        for edge in self.graph.capability_bindings() {
+            if !self.cell_exists(edge.consumer) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_BINDINGS,
+                    edge.id.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                ));
+            }
+            match self.port_desc(edge.port) {
+                Some(port) => {
+                    if port.contract() != edge.contract.as_str() {
+                        records.push(ElmCoreHealthRecord::invalid(
+                            ELM_HEALTH_CHECK_BINDINGS,
+                            edge.id.0,
+                            ELM_HEALTH_DETAIL_CONTRACT_INVALID,
+                        ));
+                    }
+                }
+                None => records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_BINDINGS,
+                    edge.id.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                )),
+            }
+            if FlowContract::new(edge.contract.as_str()).is_err() {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_BINDINGS,
+                    edge.id.0,
+                    ELM_HEALTH_DETAIL_CONTRACT_INVALID,
+                ));
+            }
+            let Some(lease) = edge.lease else {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_BINDINGS,
+                    edge.id.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                ));
+                continue;
+            };
+            match self.leases.get(lease) {
+                Some(resource) => {
+                    if resource.owner != edge.consumer
+                        || resource.binding != Some(edge.id)
+                        || resource.generation != edge.generation
+                    {
+                        records.push(ElmCoreHealthRecord::invalid(
+                            ELM_HEALTH_CHECK_BINDINGS,
+                            edge.id.0,
+                            ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                        ));
+                    }
+                    if let Some(expected_kind) = self.expected_lease_kind_for_port(edge.port) {
+                        if resource.kind != expected_kind {
+                            records.push(ElmCoreHealthRecord::invalid(
+                                ELM_HEALTH_CHECK_BINDINGS,
+                                edge.id.0,
+                                ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                            ));
+                        }
+                    }
+                }
+                None => records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_BINDINGS,
+                    edge.id.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                )),
+            }
+            if !self.cell_owns_binding(edge.consumer, edge.id) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_BINDINGS,
+                    edge.id.0,
+                    ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            }
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_BINDINGS);
+    }
+
+    fn check_health_runtime_ports(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        for (index, runtime) in self.runtime_ports.iter().enumerate() {
+            if self.runtime_ports[..index]
+                .iter()
+                .any(|prev| prev.binding == runtime.binding)
+            {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_RUNTIME_PORTS,
+                    runtime.binding.0,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+                ));
+            }
+            if self.validate_runtime_port(index, runtime.port).is_err() {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_RUNTIME_PORTS,
+                    runtime.binding.0,
+                    ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            }
+            if !matches!(runtime.port, ELM_CORE_LOG_PORT_ID | ELM_CORE_EVENT_PORT_ID) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_RUNTIME_PORTS,
+                    runtime.binding.0,
+                    ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                ));
+            }
+            match self.leases.get(runtime.lease) {
+                Some(lease)
+                    if lease.kind == LeaseKind::RuntimePort
+                        && lease.owner == runtime.cell
+                        && lease.binding == Some(runtime.binding) => {}
+                Some(_) => records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_RUNTIME_PORTS,
+                    runtime.binding.0,
+                    ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                )),
+                None => records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_RUNTIME_PORTS,
+                    runtime.binding.0,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                )),
+            }
+            if runtime.cursor > self.last_event_sequence() {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_RUNTIME_PORTS,
+                    runtime.binding.0,
+                    ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+                ));
+            }
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_RUNTIME_PORTS);
+    }
+
+    fn check_health_menu(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        for (index, item) in self.menu_items.iter().enumerate() {
+            if self.menu_items[..index]
+                .iter()
+                .any(|prev| prev.id == item.id)
+            {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_MENU,
+                    item.id,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
+                ));
+            }
+            if !self.cell_exists(item.owner) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_MENU,
+                    item.id,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                ));
+            }
+            if !self.cell_owns_menu_item(item.owner, item.id) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_MENU,
+                    item.id,
+                    ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            }
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_MENU);
+    }
+
+    fn check_health_events(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        let mut previous = 0;
+        for event in &self.events {
+            if event.sequence <= previous {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_EVENTS,
+                    event.sequence,
+                    ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+                ));
+            }
+            previous = event.sequence;
+        }
+        let newest = self.events.last().map(|event| event.sequence).unwrap_or(0);
+        if newest != self.last_event_sequence() {
+            records.push(ElmCoreHealthRecord::invalid(
+                ELM_HEALTH_CHECK_EVENTS,
+                newest,
+                ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+            ));
+        }
+        if self.acknowledged_event_sequence > self.last_event_sequence() {
+            records.push(ElmCoreHealthRecord::invalid(
+                ELM_HEALTH_CHECK_EVENTS,
+                self.acknowledged_event_sequence,
+                ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+            ));
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_EVENTS);
+    }
+
+    fn check_health_audits(&self, records: &mut Vec<ElmCoreHealthRecord>) {
+        let start = records.len();
+        let mut previous = 0;
+        for audit in &self.audits {
+            if audit.sequence <= previous || audit.sequence >= self.next_audit_sequence {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_AUDITS,
+                    audit.sequence,
+                    ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+                ));
+            }
+            previous = audit.sequence;
+        }
+        if self.next_audit_sequence == 0 {
+            records.push(ElmCoreHealthRecord::invalid(
+                ELM_HEALTH_CHECK_AUDITS,
+                0,
+                ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+            ));
+        }
+        push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_AUDITS);
+    }
+
     pub fn debug_dump_bytes(&self) -> Vec<u8> {
+        let (health_status, health_records) = self.health_records();
+        let health_failures = health_records
+            .iter()
+            .filter(|record| record.status != ELM_MGR_STATUS_OK)
+            .count();
         let mut out = format!(
-            "ELM Core 诊断\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nmenu_items={}\nlast_event_sequence={}\n",
+            "ELM Core 诊断\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nmenu_items={}\nlast_event_sequence={}\nhealth_status={}\nhealth_records={}\nhealth_failures={}\n",
             self.cells.len(),
             self.ports.len(),
             self.providers.len(),
@@ -1498,6 +2020,9 @@ impl ElmCore {
             self.runtime_ports.len(),
             self.menu_items.len(),
             self.last_event_sequence(),
+            health_status,
+            health_records.len(),
+            health_failures,
         );
         out.push_str("[cells]\n");
         for cell in &self.cells {
@@ -1524,14 +2049,14 @@ impl ElmCore {
             out.push_str(
                 format!(
                     "port id={} owner={} contract={} direction={:?} mode={:?} access={:?} invokable={} implemented={}\n",
-                    port.desc.id.0,
-                    port.desc.owner.map(|owner| owner.0).unwrap_or(0),
-                    port.desc.contract,
-                    port.desc.direction,
-                    port.desc.mode,
-                    port.desc.access,
-                    port.desc.invokable,
-                    port.desc.implemented,
+                    port.id.0,
+                    port.owner.map(|owner| owner.0).unwrap_or(0),
+                    port.contract(),
+                    port.direction,
+                    port.mode,
+                    port.access,
+                    port.invokable,
+                    port.implemented,
                 )
                 .as_str(),
             );
@@ -1540,11 +2065,11 @@ impl ElmCore {
         for provider in &self.providers {
             out.push_str(
                 format!(
-                    "provider port={} owner={} access={:?} ops={:?} dynamic={} bindings={} calls={} failed_calls={} revokes={}\n",
+                    "provider port={} owner={} access={:?} backend={:?} dynamic={} bindings={} calls={} failed_calls={} revokes={}\n",
                     provider.port.0,
                     provider.owner.map(|owner| owner.0).unwrap_or(0),
                     provider.access,
-                    provider.ops,
+                    provider.backend,
                     provider.dynamic,
                     self.provider_binding_count(provider.port),
                     provider.calls,
@@ -1609,13 +2134,13 @@ impl ElmCore {
 
     fn register_builtin_ports(&mut self) {
         for desc in builtin_port_descriptors() {
-            self.register_port(desc);
+            self.register_port(PortRuntime::from_descriptor(desc));
             if desc.implemented {
                 self.providers.push(ProviderRuntime {
                     port: desc.id,
                     owner: desc.owner,
                     access: desc.access,
-                    ops: ProviderOpsKind::Builtin,
+                    backend: ProviderBackend::KernelImplemented,
                     dynamic: false,
                     calls: 0,
                     failed_calls: 0,
@@ -1626,83 +2151,15 @@ impl ElmCore {
         log::info!("[elm] registered {} Nexus ports", self.ports.len());
     }
 
-    fn register_port(&mut self, desc: PortDescriptor) {
-        let port = desc.id;
-        self.ports.push(PortRuntime::new(desc));
+    fn register_port(&mut self, runtime: PortRuntime) {
+        let port = runtime.id;
+        let contract = runtime.contract().to_string();
+        let implemented = runtime.implemented;
+        self.ports.push(runtime);
         self.emit_port(TopologyEventKind::PortAdded, port);
-        if !desc.implemented {
-            log::debug!(
-                "[elm] port {} registered as TODO(elm) 提供者",
-                desc.contract
-            );
+        if !implemented {
+            log::debug!("[elm] port {} registered as TODO(elm) 提供者", contract);
         }
-    }
-
-    fn register_builtin_menu_demo(&mut self) -> Result<(), ElmError> {
-        let menu_contract = FlowContract::new("mgr.menu.item@1")?;
-        let manifest = ElmManifest::new(
-            ElmName::new("elm-menu-demo")?,
-            ElmVersion::new("0.1.0")?,
-            ElmKind::Extension,
-        )
-        .with_intent(NexusIntent::new(IntentKind::Extend, menu_contract.clone()));
-
-        self.graph.insert_cell(ELM_MENU_DEMO_ID, manifest)?;
-        self.graph.set_parent(ELM_MENU_DEMO_ID, ELM_MGR_ID)?;
-        self.graph.add_extension(
-            ELM_MENU_DEMO_ID,
-            ELM_MGR_ID,
-            "menu.item",
-            menu_contract.clone(),
-        )?;
-        self.graph.add_capability_binding(
-            ELM_MENU_DEMO_BINDING_ID,
-            ELM_MENU_DEMO_ID,
-            ELM_MGR_MENU_PORT_ID,
-            menu_contract,
-            Generation::FIRST,
-            Some(ELM_MENU_DEMO_LEASE_ID),
-        )?;
-        self.cells.push(CellRuntime {
-            id: ELM_MENU_DEMO_ID,
-            parent: Some(ELM_MGR_ID),
-            state: ElmState::Active,
-            kind: ElmKind::Extension,
-            generation: Generation::FIRST,
-            name: "elm-menu-demo".to_string(),
-            ebi_arch: ElmEbiArch::Any,
-            ebi_status: ElmEbiLoadStatus::Ok,
-            has_native_code: false,
-            owned_bindings: vec![ELM_MENU_DEMO_BINDING_ID],
-            owned_menu_items: vec![1],
-        });
-        self.leases.insert(
-            ResourceLease::new(
-                ELM_MENU_DEMO_LEASE_ID,
-                ELM_MENU_DEMO_ID,
-                LeaseKind::MenuItem,
-                LeaseRights::CONTROL,
-                Generation::FIRST,
-            )
-            .with_binding(ELM_MENU_DEMO_BINDING_ID),
-        )?;
-        self.menu_items.push(MenuItemRuntime::new(
-            1,
-            ELM_MENU_DEMO_ID,
-            ELM_MENU_DEMO_ACTION_ID,
-            ElmMenuItemKind::Action,
-            ELM_MENU_FLAG_TODO | ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
-            "ELM 状态",
-            "查看 ELM Core 拓扑、事件和菜单状态",
-            "elm/status",
-        ));
-        self.menu_generation = self.menu_generation.next();
-        self.emit(TopologyEventKind::CellAdded, Some(ELM_MENU_DEMO_ID));
-        self.emit(TopologyEventKind::CellStateChanged, Some(ELM_MENU_DEMO_ID));
-        self.emit_binding(TopologyEventKind::BindingAdded, ELM_MENU_DEMO_BINDING_ID);
-        self.emit_lease(TopologyEventKind::LeaseAdded, ELM_MENU_DEMO_LEASE_ID);
-        self.emit(TopologyEventKind::MenuItemAdded, Some(ELM_MENU_DEMO_ID));
-        Ok(())
     }
 
     #[allow(dead_code)]
@@ -1768,17 +2225,14 @@ impl ElmCore {
         Ok(())
     }
 
-    fn port_desc(&self, id: PortId) -> Option<PortDescriptor> {
-        self.ports
-            .iter()
-            .find(|port| port.desc.id == id)
-            .map(|port| port.desc)
+    fn port_desc(&self, id: PortId) -> Option<PortRuntime> {
+        self.ports.iter().find(|port| port.id == id).cloned()
     }
 
-    fn is_bind_supported_port(&self, desc: PortDescriptor) -> bool {
+    fn is_bind_supported_port(&self, desc: &PortRuntime) -> bool {
         desc.implemented
             && (matches!(
-                (desc.id, desc.contract),
+                (desc.id, desc.contract()),
                 (ELM_CORE_LOG_PORT_ID, ELM_CORE_LOG_CONTRACT)
                     | (ELM_CORE_EVENT_PORT_ID, ELM_CORE_EVENT_CONTRACT)
                     | (ELM_MGR_MENU_PORT_ID, ELM_MGR_MENU_CONTRACT)
@@ -1829,7 +2283,7 @@ impl ElmCore {
             .sum()
     }
 
-    fn provider_access_allowed(&self, consumer: ElmId, desc: PortDescriptor) -> bool {
+    fn provider_access_allowed(&self, consumer: ElmId, desc: &PortRuntime) -> bool {
         match desc.access {
             ElmPortAccessPolicy::Public => true,
             ElmPortAccessPolicy::Internal => desc.owner == Some(consumer),
@@ -1847,35 +2301,12 @@ impl ElmCore {
         }
     }
 
-    fn invoke_test_echo(&mut self, provider_index: usize, frame: ElmCallFrame) -> ElmReplyFrame {
-        let payload_len = usize::from(frame.payload_len);
-        match frame.opcode {
-            1 => {
-                self.providers[provider_index].calls =
-                    self.providers[provider_index].calls.saturating_add(1);
-                ElmReplyFrame::new(
-                    frame.binding_id,
-                    frame.call_id,
-                    ELM_MGR_STATUS_OK,
-                    &frame.payload[..payload_len],
-                )
-            }
-            2 => {
-                self.providers[provider_index].calls =
-                    self.providers[provider_index].calls.saturating_add(1);
-                let provider = &self.providers[provider_index];
-                let mut payload = [0u8; 24];
-                payload[0..8].copy_from_slice(&provider.calls.to_le_bytes());
-                payload[8..16].copy_from_slice(&provider.failed_calls.to_le_bytes());
-                payload[16..24].copy_from_slice(&provider.revokes.to_le_bytes());
-                ElmReplyFrame::new(frame.binding_id, frame.call_id, ELM_MGR_STATUS_OK, &payload)
-            }
-            _ => {
-                self.providers[provider_index].failed_calls = self.providers[provider_index]
-                    .failed_calls
-                    .saturating_add(1);
-                ElmReplyFrame::empty(frame.binding_id, frame.call_id, ELM_MGR_STATUS_UNSUPPORTED)
-            }
+    fn expected_lease_kind_for_port(&self, port: PortId) -> Option<LeaseKind> {
+        match port {
+            ELM_MGR_MENU_PORT_ID => Some(LeaseKind::MenuItem),
+            ELM_CORE_LOG_PORT_ID | ELM_CORE_EVENT_PORT_ID => Some(LeaseKind::RuntimePort),
+            _ if self.provider_index(port).is_some() => Some(LeaseKind::Provider),
+            _ => None,
         }
     }
 
@@ -2032,12 +2463,8 @@ impl ElmCore {
         description: &str,
         route: &str,
     ) -> Result<(), ElmError> {
-        let generation = self
-            .cells
-            .iter()
-            .find(|cell| cell.id == id)
-            .map(|cell| cell.generation)
-            .ok_or(ElmError::CellNotFound)?;
+        let cell_index = self.cell_index(id).ok_or(ElmError::CellNotFound)?;
+        let generation = self.cells[cell_index].generation;
         self.graph
             .add_capability_binding(binding, id, port, contract, generation, Some(lease))?;
         if let Err(err) = self.leases.insert(
@@ -2068,9 +2495,7 @@ impl ElmCore {
             description,
             route,
         ));
-        let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) else {
-            return Err(ElmError::CellNotFound);
-        };
+        let cell = &mut self.cells[cell_index];
         cell.owned_bindings.push(binding);
         cell.owned_menu_items.push(menu_id);
         self.menu_generation = self.menu_generation.next();
@@ -2195,6 +2620,30 @@ impl ElmCore {
             .iter()
             .find(|cell| cell.id == id)
             .map(|cell| cell.state)
+    }
+
+    fn cell_exists(&self, id: ElmId) -> bool {
+        self.cells.iter().any(|cell| cell.id == id)
+    }
+
+    fn cell_owns_binding(&self, id: ElmId, binding: BindingId) -> bool {
+        self.cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| cell.owned_bindings.iter().any(|owned| *owned == binding))
+            .unwrap_or(false)
+    }
+
+    fn cell_owns_menu_item(&self, id: ElmId, menu_item: u64) -> bool {
+        self.cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| {
+                cell.owned_menu_items
+                    .iter()
+                    .any(|owned| *owned == menu_item)
+            })
+            .unwrap_or(false)
     }
 
     fn cell_index(&self, id: ElmId) -> Option<usize> {
@@ -2427,6 +2876,12 @@ pub(crate) fn with_core<R>(f: impl FnOnce(&mut ElmCore) -> R) -> R {
     f(&mut core)
 }
 
+fn push_health_ok_if_clean(records: &mut Vec<ElmCoreHealthRecord>, start: usize, check_kind: u32) {
+    if records.len() == start {
+        records.push(ElmCoreHealthRecord::ok(check_kind));
+    }
+}
+
 fn push_plain<T>(out: &mut Vec<u8>, value: &T) {
     out.extend_from_slice(plain_bytes(value));
 }
@@ -2453,10 +2908,6 @@ fn provider_request_contract(request: &ElmProviderPortRegisterRequest) -> Option
         return None;
     }
     core::str::from_utf8(&request.contract[..len]).ok()
-}
-
-fn leak_contract(contract: &str) -> &'static str {
-    Box::leak(contract.to_string().into_boxed_str())
 }
 
 fn runtime_status_blocker(status: i32) -> u64 {
