@@ -399,6 +399,16 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 
 `MGR_CALL` 的输入由 `ElmMgrCallHeader` 加 payload 组成，输出由 `ElmMgrResponseHeader` 加可选 payload 组成。所有跨边界结构必须是固定布局，不包含内核指针。
 
+管理通道当前稳定边界：
+
+- 输入 payload 上限由模型层常量 `ELM_MGR_MAX_PAYLOAD` 固定为 4096 字节。
+- 完整输入上限由模型层常量 `ELM_MGR_MAX_INPUT` 固定为 `ELM_MGR_MAX_PAYLOAD + sizeof(ElmMgrCallHeader)`。
+- 调用方应使用 `ElmMgrCallHeader::empty()` 或 `ElmMgrCallHeader::new()` 构造请求头，避免手写保留字段。
+- `ElmMgrCallHeader.flags` 和 `ElmMgrCallHeader.reserved` 当前必须为 0。
+- 无 payload 查询命令当前拒绝非空 payload。
+- 已定义请求结构中的 `flags`、`reserved` 和长度字段会在进入 ELM Core 前统一校验；未知命令号返回 `UNSUPPORTED`，格式错误返回 `INVALID`。
+- `dispatch_mgr_call_on_core` 是管理通道的可测试本地 Core 分发入口，用于覆盖字节协议解析，不经过系统调用复制路径。
+
 当前命令号：
 
 | 命令 | 编号 | 当前状态 | 说明 |
@@ -924,6 +934,7 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(QueryProviderPorts/QueryProviderStats)` 已返回 provider 端口、访问策略、绑定数量、调用次数、失败次数、撤销次数和 provider 观测 flags。
 - `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；没有真实执行器的 provider 会返回 `TODO(elm)` 或 `UNSUPPORTED`，不会伪装成调用成功。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event 和 audit 不变量破坏。
+- `MGR_CALL` 管理通道已收口输入上限、请求头构造器、保留位零值策略和无 payload 查询命令校验；格式错误统一返回 `INVALID`，未知命令号返回 `UNSUPPORTED`。
 - 动态 provider 端口已支持 `Public`、`ExtensionOnly` 和 `Internal` 三类访问策略。
 - 动态 provider 端口在真实执行器接入前会被预检阻断为 `PORT_TODO`，已纳入 provider busy、注销和观测链路。
 - `MGR_CALL(PreflightUnbind/CommitUnbind)` 已支持动态能力绑定的预检和撤销；内建保护绑定不可撤销。
@@ -937,7 +948,7 @@ ELM 的可观测性由四条路径组成：
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项或忙碌租约的目标单元，避免破坏当前拓扑。
 - `ReplaceCell` 已保留稳定命令号，当前返回结构化预检结果并记录 `REPLACE_TODO` 审计。
-- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、菜单 EBI 激活、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测以及绑定预检 `PORT_TODO` 阻断。
+- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、菜单 EBI 激活、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
 
 尚未完成：
 
@@ -956,7 +967,7 @@ ELM 的可观测性由四条路径组成：
 
 - 固化 `libs/elm` 固定布局结构。
 - 保持 host 单测覆盖模型约束。
-- 保持内核 `kernel-tests` 覆盖第一阶段管理闭环，不让 provider flags、health、EBI 装载状态和动态 provider TODO 边界退化。
+- 保持内核 `kernel-tests` 覆盖第一阶段管理闭环，不让 provider flags、health、管理通道 ABI、EBI 装载状态和动态 provider TODO 边界退化。
 - 保持 `sys_elm_ctl`、`MGR_CALL`、快照、事件和审计 ABI 稳定。
 - 完成 `core.log@1`、`core.event@1`、`mgr.menu.item@1` 三个基础端口的闭环。
 - 完成动态 provider 端口声明注册、访问策略、同步调用帧 ABI、撤销和统计闭环；真实执行器接入前绑定提交保持 TODO 阻断。
