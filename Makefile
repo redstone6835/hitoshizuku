@@ -1,9 +1,10 @@
-.PHONY: all clean cargo-setup kernel-la kernel-rv rootfs-la rootfs-rv rootfs-ltp-scenarios-la rootfs-ltp-scenarios-rv
+.PHONY: all clean cargo-setup kernel-la kernel-rv rootfs-la rootfs-rv rootfs-ltp-scenarios-la rootfs-ltp-scenarios-rv elm-smoke-la elm-smoke-rv rootfs-elm-smoke-la rootfs-elm-smoke-rv
 
 all: cargo-setup kernel-la kernel-rv
 
 JOBS ?= $(shell nproc 2>/dev/null || echo 4)
 BUILD_DIR := build
+CARGO_TARGET_DIR ?= target
 FEATURES ?=
 KERNEL_FEATURES = embedded-initramfs $(FEATURES)
 CARGO_FEATURES = $(subst $(space),$(comma),$(strip $(KERNEL_FEATURES)))
@@ -16,18 +17,21 @@ LA_ROOTFS := userland/rootfs-la
 LA_INITRAMFS := $(BUILD_DIR)/initramfs-la.cpio
 LA_CROSS_COMPILE := loongarch64-linux-gnu-
 LA_KERNEL := kernel-la
+LA_ELM_SMOKE := $(BUILD_DIR)/elm-smoke-la/elmctl-smoke
 
 RV_TARGET := riscv64gc-unknown-none-elf
 RV_ROOTFS := userland/rootfs-rv
 RV_INITRAMFS := $(BUILD_DIR)/initramfs-rv.cpio
 RV_CROSS_COMPILE := riscv64-linux-musl-
 RV_KERNEL := kernel-rv
+RV_ELM_SMOKE := $(BUILD_DIR)/elm-smoke-rv/elmctl-smoke
 
 BUSYBOX_SRC := third/busybox-1.36.1
 BUSYBOX_ARCHIVE := third/busybox-1.36.1.tar.gz
 ENSURE_BUSYBOX := scripts/ensure-busybox.sh
 LTP_SCENARIO_SRC := userland/ltp-scenarios
 LTP_TESTCODE_SRC := userland/ltp_testcode.sh
+ELM_SMOKE_SRC := userland/elmctl-smoke/elmctl_smoke.c
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
@@ -38,16 +42,16 @@ cargo-setup:
 kernel-la: cargo-setup rootfs-la
 	INITRAMFS_ROOT=$(LA_ROOTFS) INITRAMFS_CPIO=$(LA_INITRAMFS) \
 		cargo build -p kernel --target $(LA_TARGET) --features "$(CARGO_FEATURES)" --release
-	cp target/$(LA_TARGET)/release/kernel $(LA_KERNEL)
+	cp $(CARGO_TARGET_DIR)/$(LA_TARGET)/release/kernel $(LA_KERNEL)
 
 kernel-rv: cargo-setup rootfs-rv
 	INITRAMFS_ROOT=$(RV_ROOTFS) INITRAMFS_CPIO=$(RV_INITRAMFS) \
 		cargo build -p kernel --target $(RV_TARGET) --features "$(CARGO_FEATURES)" --release
-	cp target/$(RV_TARGET)/release/kernel $(RV_KERNEL)
+	cp $(CARGO_TARGET_DIR)/$(RV_TARGET)/release/kernel $(RV_KERNEL)
 
-rootfs-la: $(LA_ROOTFS)/bin/busybox rootfs-ltp-scenarios-la
+rootfs-la: $(LA_ROOTFS)/bin/busybox rootfs-ltp-scenarios-la rootfs-elm-smoke-la
 
-rootfs-rv: $(RV_ROOTFS)/bin/busybox rootfs-ltp-scenarios-rv
+rootfs-rv: $(RV_ROOTFS)/bin/busybox rootfs-ltp-scenarios-rv rootfs-elm-smoke-rv
 
 rootfs-ltp-scenarios-la:
 	mkdir -p $(LA_ROOTFS)/etc/ltp-scenarios
@@ -69,6 +73,32 @@ $(LA_ROOTFS)/bin/busybox:
 $(RV_ROOTFS)/bin/busybox:
 	$(MAKE) rootfs-busybox ROOTFS_DIR=$(RV_ROOTFS) CROSS_COMPILE=$(RV_CROSS_COMPILE)
 
+elm-smoke-la: $(LA_ELM_SMOKE)
+
+elm-smoke-rv: $(RV_ELM_SMOKE)
+
+rootfs-elm-smoke-la: $(LA_ROOTFS)/bin/elmctl-smoke
+
+rootfs-elm-smoke-rv: $(RV_ROOTFS)/bin/elmctl-smoke
+
+$(LA_ELM_SMOKE): $(ELM_SMOKE_SRC)
+	mkdir -p $(dir $@)
+	$(LA_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra $< -o $@
+	-$(LA_CROSS_COMPILE)strip $@
+
+$(RV_ELM_SMOKE): $(ELM_SMOKE_SRC)
+	mkdir -p $(dir $@)
+	$(RV_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra $< -o $@
+	-$(RV_CROSS_COMPILE)strip $@
+
+$(LA_ROOTFS)/bin/elmctl-smoke: $(LA_ELM_SMOKE)
+	mkdir -p $(LA_ROOTFS)/bin
+	install -m 0755 $< $@
+
+$(RV_ROOTFS)/bin/elmctl-smoke: $(RV_ELM_SMOKE)
+	mkdir -p $(RV_ROOTFS)/bin
+	install -m 0755 $< $@
+
 .PHONY: rootfs-busybox
 rootfs-busybox: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE)
 	$(ENSURE_BUSYBOX)
@@ -86,3 +116,4 @@ rootfs-busybox: $(ENSURE_BUSYBOX) $(BUSYBOX_ARCHIVE)
 clean:
 	cargo clean
 	rm -f $(LA_KERNEL) $(RV_KERNEL) build/initramfs.cpio $(LA_INITRAMFS) $(RV_INITRAMFS)
+	rm -rf $(BUILD_DIR)/elm-smoke-la $(BUILD_DIR)/elm-smoke-rv

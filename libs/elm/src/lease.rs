@@ -18,6 +18,7 @@ pub enum LeaseKind {
     MenuItem,
     Provider,
     RuntimePort,
+    EventSubscription,
     Other,
 }
 

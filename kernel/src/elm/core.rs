@@ -16,19 +16,21 @@ use elm_model::{
     ELM_HEALTH_DETAIL_GRAPH_INVALID, ELM_HEALTH_DETAIL_KIND_MISMATCH,
     ELM_HEALTH_DETAIL_MISSING_OBJECT, ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
     ELM_HEALTH_DETAIL_STATE_INVALID, ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
-    ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
-    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_PROVIDER_ASYNC,
-    ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_REGISTER,
-    ELM_MGR_ACTION_PROVIDER_UNREGISTER, ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
-    ELM_MGR_ACTION_RUNTIME_EVENT_READ, ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND,
-    ELM_MGR_BUILTIN_ID, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND,
-    ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
-    ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
-    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
-    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
-    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
-    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
-    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_NATIVE_TODO,
+    ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE,
+    ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND,
+    ELM_MGR_ACTION_EVENT_READ, ELM_MGR_ACTION_EVENT_SUBSCRIBE, ELM_MGR_ACTION_EVENT_UNSUBSCRIBE,
+    ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE,
+    ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
+    ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
+    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_STATUS_BUSY,
+    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
+    ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+    ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
+    ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
+    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+    ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_NATIVE_TODO,
     ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
@@ -36,25 +38,35 @@ use elm_model::{
     ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
     ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
     ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_RUNTIME_LOG_MESSAGE_LEN, ElmActionInvokeReply,
-    ElmActionInvokeRequest, ElmCallFrame, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo,
-    ElmEbiArch, ElmEbiLoadStatus, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId,
-    ElmKind, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
-    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
-    ElmMgrTopologyHeader, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
-    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
-    ElmPortAccessPolicy, ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse,
-    ElmProviderAsyncPollRequest, ElmProviderAsyncPollResponse, ElmProviderAsyncState,
-    ElmProviderAsyncSubmitRequest, ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest,
-    ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
-    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
-    ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord,
-    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
-    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
-    ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind,
-    LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
-    status_from_blockers,
+    ElmActionInvokeRequest, ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord,
+    ElmCoreInfo, ElmEbiArch, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiUnit, ElmError,
+    ElmEventRecord, ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase,
+    ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse,
+    ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader,
+    ElmMgrAuditRecord, ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
+    ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest,
+    ElmMgrEventUnsubscribeResponse, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
+    ElmMgrSubscribedEventReadHeader, ElmMgrSubscribedEventReadRequest, ElmMgrTopologyHeader,
+    ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
+    ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy,
+    ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse, ElmProviderAsyncPollRequest,
+    ElmProviderAsyncPollResponse, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
+    ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
+    ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
+    ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord, ElmReplyFrame, ElmResult,
+    ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState, ElmVersion, FlowContract,
+    FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights,
+    NexusOffer, PortId, ResourceLease, TopologyEventKind, builtin_port_descriptors,
+    first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
+};
+use elm_model::{
+    ELM_MGR_API_FLAG_PROVIDER_OPS, ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_SYSCALL,
+    ELM_MGR_API_FLAG_SYSFS, ELM_MGR_API_FLAG_TODO, ELM_MGR_API_KIND_EVENT,
+    ELM_MGR_API_KIND_PROVIDER, ELM_MGR_API_KIND_SNAPSHOT, ELM_MGR_API_KIND_SUBSYSTEM,
+    ELM_MGR_EVENT_READ_ABSOLUTE_MAX_RECORDS, ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS,
+    ELM_MGR_EVENT_READ_FLAG_ADVANCE,
 };
 use sched::sync::Spinlock;
 
@@ -76,8 +88,15 @@ const EVENT_RING_LIMIT: usize = 128;
 const AUDIT_RING_LIMIT: usize = 128;
 const FIRST_PROVIDER_TICKET_ID: u64 = 1;
 const PROVIDER_RESULT_RING_LIMIT: usize = ELM_PROVIDER_ASYNC_QUEUE_LIMIT as usize;
+const FIRST_EVENT_SUBSCRIPTION_ID: u64 = 1;
+const EVENT_SUBSCRIPTION_LIMIT: usize = 64;
 
 static CORE: Spinlock<ElmCore> = Spinlock::new(ElmCore::new());
+
+pub(crate) trait ElmLifecycleExecutor {
+    fn on_initialize(&mut self, context: &mut ElmContext) -> ElmResult<()>;
+    fn on_finalize(&mut self, context: &mut ElmContext) -> ElmResult<()>;
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct CellRuntime {
@@ -90,6 +109,13 @@ pub(crate) struct CellRuntime {
     pub ebi_arch: ElmEbiArch,
     pub ebi_status: ElmEbiLoadStatus,
     pub has_native_code: bool,
+    pub native_segment_count: u16,
+    pub native_import_count: u16,
+    pub native_export_count: u16,
+    pub lifecycle_hooks_declared: bool,
+    pub lifecycle_executor_ready: bool,
+    pub lifecycle_initialized: bool,
+    pub lifecycle_finalized: bool,
     pub owned_bindings: Vec<BindingId>,
     pub owned_menu_items: Vec<u64>,
 }
@@ -153,6 +179,36 @@ impl ProviderRuntime {
 }
 
 #[derive(Debug, Clone)]
+struct ResolvedEbiTopology {
+    dependencies: Vec<(ElmId, FlowContract)>,
+    extensions: Vec<(ElmId, String, FlowContract)>,
+}
+
+impl ResolvedEbiTopology {
+    fn empty() -> Self {
+        Self {
+            dependencies: Vec::new(),
+            extensions: Vec::new(),
+        }
+    }
+}
+
+fn unit_requires_native_image_loader(unit: &ElmEbiUnit) -> bool {
+    unit.entry.is_some()
+        || unit
+            .segments
+            .iter()
+            .any(|segment| segment.requires_native_loader())
+}
+
+#[derive(Debug, Clone)]
+struct PendingEbiLoad {
+    cell: ElmId,
+    unit: ElmEbiUnit,
+    topology: ResolvedEbiTopology,
+}
+
+#[derive(Debug, Clone)]
 struct ProviderAsyncJob {
     ticket: u64,
     frame: ElmCallFrame,
@@ -188,10 +244,118 @@ struct MgrActionRuntime {
     kind: MgrActionKind,
 }
 
+#[allow(dead_code)]
+pub(crate) trait ElmMgrProviderOps {
+    fn descriptor(&self) -> ElmMgrApiDescriptor;
+    fn invoke(&self, frame: ElmCallFrame) -> ElmReplyFrame;
+    fn poll_ready(&self) -> bool {
+        true
+    }
+    fn snapshot(&self, out: &mut Vec<u8>) -> Result<(), i32>;
+    fn on_revoke(&self, binding: Option<BindingId>, lease: Option<LeaseId>);
+}
+
+#[derive(Debug, Clone)]
+struct EventSubscriptionRuntime {
+    subscription: u64,
+    owner: ElmId,
+    lease: LeaseId,
+    cursor: u64,
+    kind_filter: u32,
+    cell_filter: u64,
+    port_filter: u64,
+    binding_filter: u64,
+    lease_filter: u64,
+    delivered_events: u64,
+    dropped_events: u64,
+}
+
+impl EventSubscriptionRuntime {
+    fn record(&self) -> ElmMgrEventSubscriptionRecord {
+        ElmMgrEventSubscriptionRecord::new(
+            self.subscription,
+            self.owner.0,
+            self.lease.0,
+            self.cursor,
+            self.kind_filter,
+            true,
+            self.cell_filter,
+            self.port_filter,
+            self.binding_filter,
+            self.lease_filter,
+            self.delivered_events,
+            self.dropped_events,
+        )
+    }
+
+    fn matches(&self, event: &ElmEventRecord) -> bool {
+        (self.kind_filter == 0 || self.kind_filter == event.kind)
+            && (self.cell_filter == 0 || self.cell_filter == event.cell)
+            && (self.port_filter == 0 || self.port_filter == event.port)
+            && (self.binding_filter == 0 || self.binding_filter == event.binding)
+            && (self.lease_filter == 0 || self.lease_filter == event.lease)
+    }
+}
+
+#[derive(Debug)]
+struct ElmMgrRuntime {
+    api_registry: Vec<ElmMgrApiDescriptor>,
+    api_generation: Generation,
+    event_subscriptions: Vec<EventSubscriptionRuntime>,
+    next_event_subscription_id: u64,
+}
+
+impl ElmMgrRuntime {
+    const fn new() -> Self {
+        Self {
+            api_registry: Vec::new(),
+            api_generation: Generation::FIRST,
+            event_subscriptions: Vec::new(),
+            next_event_subscription_id: FIRST_EVENT_SUBSCRIPTION_ID,
+        }
+    }
+
+    fn register_api(&mut self, descriptor: ElmMgrApiDescriptor) {
+        if self
+            .api_registry
+            .iter()
+            .any(|existing| existing.id == descriptor.id)
+        {
+            return;
+        }
+        self.api_registry.push(descriptor);
+        self.api_generation = self.api_generation.next();
+    }
+
+    fn alloc_event_subscription_id(&mut self) -> u64 {
+        let id = self.next_event_subscription_id;
+        self.next_event_subscription_id = self.next_event_subscription_id.saturating_add(1);
+        if self.next_event_subscription_id == 0 {
+            self.next_event_subscription_id = FIRST_EVENT_SUBSCRIPTION_ID;
+        }
+        id
+    }
+
+    fn event_subscription_index(&self, subscription: u64) -> Option<usize> {
+        self.event_subscriptions
+            .iter()
+            .position(|entry| entry.subscription == subscription)
+    }
+
+    fn remove_event_subscriptions_owned_by(&mut self, owner: ElmId) -> usize {
+        let before = self.event_subscriptions.len();
+        self.event_subscriptions
+            .retain(|entry| entry.owner != owner);
+        before - self.event_subscriptions.len()
+    }
+}
+
 pub(crate) struct ElmCore {
     initialized: bool,
+    mgr_runtime: ElmMgrRuntime,
     graph: BindingGraph,
     cells: Vec<CellRuntime>,
+    pending_ebi_loads: Vec<PendingEbiLoad>,
     ports: Vec<PortRuntime>,
     providers: Vec<ProviderRuntime>,
     provider_jobs: VecDeque<ProviderAsyncJob>,
@@ -226,8 +390,10 @@ impl ElmCore {
     pub const fn new() -> Self {
         Self {
             initialized: false,
+            mgr_runtime: ElmMgrRuntime::new(),
             graph: BindingGraph::new(),
             cells: Vec::new(),
+            pending_ebi_loads: Vec::new(),
             ports: Vec::new(),
             providers: Vec::new(),
             provider_jobs: VecDeque::new(),
@@ -283,6 +449,13 @@ impl ElmCore {
             ebi_arch: ElmEbiArch::Any,
             ebi_status: ElmEbiLoadStatus::Ok,
             has_native_code: false,
+            native_segment_count: 0,
+            native_import_count: 0,
+            native_export_count: 0,
+            lifecycle_hooks_declared: true,
+            lifecycle_executor_ready: true,
+            lifecycle_initialized: true,
+            lifecycle_finalized: false,
             owned_bindings: Vec::new(),
             owned_menu_items: Vec::new(),
         });
@@ -290,6 +463,7 @@ impl ElmCore {
         self.emit(TopologyEventKind::CellStateChanged, Some(ELM_MGR_ID));
         self.register_builtin_ports();
         self.register_builtin_mgr_actions()?;
+        self.register_builtin_mgr_api();
         self.initialized = true;
         log::info!("[elm] Core initialized with builtin elm-mgr");
         Ok(())
@@ -341,6 +515,261 @@ impl ElmCore {
 
     pub fn policy_info(&self) -> ElmMgrPolicyInfo {
         ElmMgrPolicyInfo::new(AUDIT_RING_LIMIT as u32)
+    }
+
+    pub fn api_registry_bytes(&self) -> Vec<u8> {
+        let header = ElmMgrApiRegistryHeader::new(
+            self.mgr_runtime.api_registry.len() as u32,
+            self.mgr_runtime.api_generation.0,
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for descriptor in &self.mgr_runtime.api_registry {
+            push_plain(&mut out, descriptor);
+        }
+        out
+    }
+
+    pub fn subscribe_event(
+        &mut self,
+        request: ElmMgrEventSubscribeRequest,
+    ) -> ElmMgrEventSubscribeResponse {
+        let owner = ElmId(request.owner_cell_id);
+        if request.flags != 0 {
+            return ElmMgrEventSubscribeResponse::new(
+                0,
+                0,
+                request.owner_cell_id,
+                self.last_event_sequence(),
+                ELM_MGR_STATUS_INVALID,
+                0,
+            );
+        }
+        let Some(cell) = self.cells.iter().find(|cell| cell.id == owner) else {
+            return ElmMgrEventSubscribeResponse::new(
+                0,
+                0,
+                request.owner_cell_id,
+                self.last_event_sequence(),
+                ELM_MGR_STATUS_NOT_FOUND,
+                0,
+            );
+        };
+        let owner_generation = cell.generation;
+        let owner_state = cell.state;
+        if self.mgr_runtime.event_subscriptions.len() >= EVENT_SUBSCRIPTION_LIMIT {
+            return ElmMgrEventSubscribeResponse::new(
+                0,
+                0,
+                request.owner_cell_id,
+                self.last_event_sequence(),
+                ELM_MGR_STATUS_BUSY,
+                0,
+            );
+        }
+
+        let subscription = self.mgr_runtime.alloc_event_subscription_id();
+        let lease = self.alloc_lease_id();
+        let cursor = self.last_event_sequence();
+        if self
+            .leases
+            .insert(ResourceLease::new(
+                lease,
+                owner,
+                LeaseKind::EventSubscription,
+                LeaseRights::READ,
+                owner_generation,
+            ))
+            .is_err()
+        {
+            return ElmMgrEventSubscribeResponse::new(
+                0,
+                0,
+                request.owner_cell_id,
+                cursor,
+                ELM_MGR_STATUS_INVALID,
+                0,
+            );
+        }
+        self.mgr_runtime
+            .event_subscriptions
+            .push(EventSubscriptionRuntime {
+                subscription,
+                owner,
+                lease,
+                cursor,
+                kind_filter: request.kind_filter,
+                cell_filter: request.cell_filter,
+                port_filter: request.port_filter,
+                binding_filter: request.binding_filter,
+                lease_filter: request.lease_filter,
+                delivered_events: 0,
+                dropped_events: 0,
+            });
+        self.emit_lease(TopologyEventKind::LeaseAdded, lease);
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_EVENT_SUBSCRIBE,
+            owner,
+            0,
+            state_code(owner_state),
+        );
+        ElmMgrEventSubscribeResponse::new(
+            subscription,
+            lease.0,
+            owner.0,
+            cursor,
+            ELM_MGR_STATUS_OK,
+            0,
+        )
+    }
+
+    pub fn unsubscribe_event(
+        &mut self,
+        request: ElmMgrEventUnsubscribeRequest,
+    ) -> ElmMgrEventUnsubscribeResponse {
+        if request.flags != 0 || request.reserved != 0 || request.subscription_id == 0 {
+            return ElmMgrEventUnsubscribeResponse::new(
+                request.subscription_id,
+                0,
+                request.owner_cell_id,
+                ELM_MGR_STATUS_INVALID,
+                false,
+                0,
+                0,
+            );
+        }
+        let Some(index) = self
+            .mgr_runtime
+            .event_subscription_index(request.subscription_id)
+        else {
+            return ElmMgrEventUnsubscribeResponse::new(
+                request.subscription_id,
+                0,
+                request.owner_cell_id,
+                ELM_MGR_STATUS_NOT_FOUND,
+                false,
+                0,
+                0,
+            );
+        };
+        let subscription = self.mgr_runtime.event_subscriptions[index].clone();
+        if request.owner_cell_id != 0 && request.owner_cell_id != subscription.owner.0 {
+            return ElmMgrEventUnsubscribeResponse::new(
+                request.subscription_id,
+                subscription.lease.0,
+                subscription.owner.0,
+                ELM_MGR_STATUS_INVALID,
+                false,
+                subscription.delivered_events,
+                subscription.dropped_events,
+            );
+        }
+        self.mgr_runtime.event_subscriptions.remove(index);
+        let revoked = self.leases.revoke_and_remove(subscription.lease).is_ok();
+        if revoked {
+            self.emit_lease(TopologyEventKind::LeaseRevoked, subscription.lease);
+        }
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_EVENT_UNSUBSCRIBE,
+            subscription.owner,
+            0,
+            self.cell_state(subscription.owner)
+                .map(state_code)
+                .unwrap_or(0),
+        );
+        ElmMgrEventUnsubscribeResponse::new(
+            subscription.subscription,
+            subscription.lease.0,
+            subscription.owner.0,
+            ELM_MGR_STATUS_OK,
+            revoked,
+            subscription.delivered_events,
+            subscription.dropped_events,
+        )
+    }
+
+    pub fn event_subscriptions_bytes(&self) -> Vec<u8> {
+        let header = ElmMgrEventSubscriptionHeader::new(
+            self.mgr_runtime.event_subscriptions.len() as u32,
+            self.last_event_sequence(),
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for subscription in &self.mgr_runtime.event_subscriptions {
+            push_plain(&mut out, &subscription.record());
+        }
+        out
+    }
+
+    pub fn read_subscribed_events(
+        &mut self,
+        request: ElmMgrSubscribedEventReadRequest,
+    ) -> Result<Vec<u8>, i32> {
+        if request.subscription_id == 0 || request.flags & !ELM_MGR_EVENT_READ_FLAG_ADVANCE != 0 {
+            return Err(ELM_MGR_STATUS_INVALID);
+        }
+        let Some(index) = self
+            .mgr_runtime
+            .event_subscription_index(request.subscription_id)
+        else {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        };
+        let max_records = normalize_event_read_limit(request.max_records);
+        let mut cursor = if request.cursor == 0 {
+            self.mgr_runtime.event_subscriptions[index].cursor
+        } else {
+            request.cursor
+        };
+        let mut dropped = 0;
+        recover_stale_subscription_cursor(&self.events, &mut cursor, &mut dropped);
+        let subscription = self.mgr_runtime.event_subscriptions[index].clone();
+        let mut records = Vec::new();
+        let mut next_cursor = cursor;
+        for event in self.events.iter().filter(|event| event.sequence > cursor) {
+            next_cursor = event.sequence;
+            if !subscription.matches(event) {
+                continue;
+            }
+            records.push(*event);
+            if records.len() >= max_records {
+                break;
+            }
+        }
+        let record_count = records.len() as u32;
+        let advance = request.flags & ELM_MGR_EVENT_READ_FLAG_ADVANCE != 0;
+        let (owner, dropped_events) = {
+            let subscription = &mut self.mgr_runtime.event_subscriptions[index];
+            if advance {
+                subscription.cursor = next_cursor;
+            }
+            subscription.delivered_events = subscription
+                .delivered_events
+                .saturating_add(record_count as u64);
+            subscription.dropped_events = subscription.dropped_events.saturating_add(dropped);
+            (subscription.owner, subscription.dropped_events)
+        };
+
+        let header = ElmMgrSubscribedEventReadHeader::new(
+            record_count,
+            ELM_MGR_STATUS_OK,
+            request.flags & ELM_MGR_EVENT_READ_FLAG_ADVANCE,
+            request.subscription_id,
+            cursor,
+            next_cursor,
+            dropped_events,
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        for event in &records {
+            push_plain(&mut out, event);
+        }
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_EVENT_READ,
+            owner,
+            0,
+            self.cell_state(owner).map(state_code).unwrap_or(0),
+        );
+        Ok(out)
     }
 
     pub fn topology_bytes(&self) -> Vec<u8> {
@@ -1666,6 +2095,14 @@ impl ElmCore {
         &self,
         request: ElmLifecyclePlanRequest,
     ) -> ElmLifecyclePlanResponse {
+        self.preflight_lifecycle_inner(request, false)
+    }
+
+    fn preflight_lifecycle_inner(
+        &self,
+        request: ElmLifecyclePlanRequest,
+        lifecycle_executor_available: bool,
+    ) -> ElmLifecyclePlanResponse {
         let Some(action) = ElmLifecycleAction::from_raw(request.action) else {
             return ElmLifecyclePlanResponse {
                 cell_id: request.cell_id,
@@ -1727,7 +2164,10 @@ impl ElmCore {
             }
             ElmLifecycleAction::Detach => {
                 // TODO(elm): 原生代码单元需要卸载执行器；当前只允许未激活的原生元数据直接摘除。
-                if self.cell_has_native_code(id) && current != ElmState::Loaded {
+                if self.cell_has_native_code(id)
+                    && current != ElmState::Loaded
+                    && !lifecycle_executor_available
+                {
                     blockers |= ELM_POLICY_BLOCK_NATIVE_TODO;
                 }
                 if !matches!(
@@ -1792,12 +2232,38 @@ impl ElmCore {
         status
     }
 
-    // TODO(elm): soyo 解析器接入后由容器转换层调用该协议装载入口。
+    // TODO(elm): EBI Source 接入层完成后由对应实现体调用该协议装载入口。
     #[allow(dead_code)]
     pub fn load_ebi_unit(&mut self, unit: ElmEbiUnit, arch: ElmEbiArch) -> ElmLoadCellResponse {
+        self.load_ebi_unit_inner(unit, arch, None)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn load_ebi_unit_with_lifecycle_executor(
+        &mut self,
+        unit: ElmEbiUnit,
+        arch: ElmEbiArch,
+        executor: &mut dyn ElmLifecycleExecutor,
+    ) -> ElmLoadCellResponse {
+        self.load_ebi_unit_inner(unit, arch, Some(executor))
+    }
+
+    fn load_ebi_unit_inner(
+        &mut self,
+        unit: ElmEbiUnit,
+        arch: ElmEbiArch,
+        mut executor: Option<&mut dyn ElmLifecycleExecutor>,
+    ) -> ElmLoadCellResponse {
         if let Err(status) = unit.validate(arch) {
             return ElmLoadCellResponse::failed(status);
         }
+        let topology = match self.preflight_ebi_topology(&unit) {
+            Ok(topology) => topology,
+            Err(err) => {
+                log::error!("[elm] EBI topology rejected by runtime: {:?}", err);
+                return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
+            }
+        };
         let manifest = unit.manifest.clone();
         let name = manifest.name.as_str().to_string();
         let image_arch = unit.target.arch;
@@ -1809,6 +2275,17 @@ impl ElmCore {
         }
 
         if unit.has_native_code() {
+            let requires_native_image_loader = unit_requires_native_image_loader(&unit);
+            self.pending_ebi_loads.push(PendingEbiLoad {
+                cell: id,
+                unit: unit.clone(),
+                topology: topology.clone(),
+            });
+            if let Some(executor) = executor.as_deref_mut()
+                && !requires_native_image_loader
+            {
+                return self.initialize_pending_ebi_load(id, executor);
+            }
             return ElmLoadCellResponse::new(
                 ElmEbiLoadStatus::NativeCodeTodo,
                 id.0,
@@ -1817,7 +2294,7 @@ impl ElmCore {
             );
         }
 
-        if let Err(err) = self.activate_loaded_cell(id, &unit) {
+        if let Err(err) = self.activate_loaded_cell(id, &unit, &topology) {
             log::error!("[elm] EBI cell activation rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::new(
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -1827,6 +2304,53 @@ impl ElmCore {
             );
         }
 
+        ElmLoadCellResponse::new(ElmEbiLoadStatus::Ok, id.0, state_code(ElmState::Active), 0)
+    }
+
+    fn initialize_pending_ebi_load(
+        &mut self,
+        id: ElmId,
+        executor: &mut dyn ElmLifecycleExecutor,
+    ) -> ElmLoadCellResponse {
+        let Some(index) = self.pending_ebi_load_index(id) else {
+            return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
+        };
+        let pending = self.pending_ebi_loads[index].clone();
+        let Ok(mut context) = self.lifecycle_context(id, ElmLifecyclePhase::Initialize) else {
+            self.remove_pending_ebi_load(id);
+            return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
+        };
+
+        if executor.on_initialize(&mut context).is_err() {
+            self.quarantine_cell_after_hook_failure(id);
+            self.remove_pending_ebi_load(id);
+            return ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::RuntimeRejected,
+                id.0,
+                state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                ELM_LIFECYCLE_REASON_HOOK_FAILED,
+            );
+        }
+
+        if let Err(err) = self.activate_loaded_cell(id, &pending.unit, &pending.topology) {
+            log::error!("[elm] EBI cell activation rejected by runtime: {:?}", err);
+            self.quarantine_cell_after_hook_failure(id);
+            self.remove_pending_ebi_load(id);
+            return ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::RuntimeRejected,
+                id.0,
+                state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+            );
+        }
+
+        if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) {
+            cell.ebi_status = ElmEbiLoadStatus::Ok;
+            cell.lifecycle_executor_ready = true;
+            cell.lifecycle_initialized = true;
+            cell.lifecycle_finalized = false;
+        }
+        self.remove_pending_ebi_load(id);
         ElmLoadCellResponse::new(ElmEbiLoadStatus::Ok, id.0, state_code(ElmState::Active), 0)
     }
 
@@ -1923,10 +2447,75 @@ impl ElmCore {
     }
 
     pub fn detach_cell(&mut self, id: ElmId) -> ElmLifecycleResponse {
+        self.detach_cell_inner(id, None)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn detach_cell_with_lifecycle_executor(
+        &mut self,
+        id: ElmId,
+        executor: &mut dyn ElmLifecycleExecutor,
+    ) -> ElmLifecycleResponse {
+        self.detach_cell_inner(id, Some(executor))
+    }
+
+    fn detach_cell_inner(
+        &mut self,
+        id: ElmId,
+        mut executor: Option<&mut dyn ElmLifecycleExecutor>,
+    ) -> ElmLifecycleResponse {
         let action = ElmLifecycleAction::Detach;
-        let plan = self.preflight_lifecycle(ElmLifecyclePlanRequest::new(id.0, action));
+        let plan = self.preflight_lifecycle_inner(
+            ElmLifecyclePlanRequest::new(id.0, action),
+            executor.is_some(),
+        );
         if plan.allowed == 0 {
             return self.lifecycle_response_from_plan(action, plan, 0, 0);
+        }
+
+        if self.cell_needs_finalize(id) {
+            let Some(executor) = executor.as_deref_mut() else {
+                let response = self.lifecycle_response(
+                    id,
+                    ELM_MGR_STATUS_TODO,
+                    first_lifecycle_reason(ELM_POLICY_BLOCK_NATIVE_TODO),
+                    0,
+                    0,
+                );
+                return self.finish_lifecycle(action, response, ELM_POLICY_BLOCK_NATIVE_TODO);
+            };
+            let Ok(mut context) = self.lifecycle_context(id, ElmLifecyclePhase::Finalize) else {
+                let response = self.lifecycle_response(
+                    id,
+                    ELM_MGR_STATUS_INVALID,
+                    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+                    0,
+                    0,
+                );
+                return self.finish_lifecycle(
+                    action,
+                    response,
+                    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+                );
+            };
+            if executor.on_finalize(&mut context).is_err() {
+                self.quarantine_cell_after_hook_failure(id);
+                let response = self.lifecycle_response(
+                    id,
+                    ELM_MGR_STATUS_INVALID,
+                    ELM_LIFECYCLE_REASON_HOOK_FAILED,
+                    0,
+                    0,
+                );
+                return self.finish_lifecycle(
+                    action,
+                    response,
+                    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                );
+            }
+            if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) {
+                cell.lifecycle_finalized = true;
+            }
         }
 
         match self.cell_state(id).unwrap_or(ElmState::Retired) {
@@ -2003,6 +2592,9 @@ impl ElmCore {
             self.remove_runtime_binding(binding);
             self.emit_binding(TopologyEventKind::BindingRemoved, binding);
         }
+        let _removed_provider_ports = self.remove_dynamic_providers_owned_by(id);
+        let _removed_event_subscriptions = self.mgr_runtime.remove_event_subscriptions_owned_by(id);
+        self.remove_pending_ebi_load(id);
 
         if self.graph.remove_cell(id).is_err() {
             let response = self.lifecycle_response(
@@ -2469,6 +3061,37 @@ impl ElmCore {
                 ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
             ));
         }
+        for subscription in &self.mgr_runtime.event_subscriptions {
+            if !self.cell_exists(subscription.owner) {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_EVENTS,
+                    subscription.subscription,
+                    ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            }
+            match self.leases.get(subscription.lease) {
+                Some(lease)
+                    if lease.owner == subscription.owner
+                        && lease.kind == LeaseKind::EventSubscription => {}
+                Some(_) => records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_EVENTS,
+                    subscription.subscription,
+                    ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                )),
+                None => records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_EVENTS,
+                    subscription.subscription,
+                    ELM_HEALTH_DETAIL_MISSING_OBJECT,
+                )),
+            }
+            if subscription.cursor > self.last_event_sequence() {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_EVENTS,
+                    subscription.subscription,
+                    ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
+                ));
+            }
+        }
         push_health_ok_if_clean(records, start, ELM_HEALTH_CHECK_EVENTS);
     }
 
@@ -2519,7 +3142,7 @@ impl ElmCore {
         for cell in &self.cells {
             out.push_str(
                 format!(
-                    "cell id={} parent={} name={} state={:?} kind={:?} generation={} ebi_arch={:?} ebi_status={:?} native_code={} owned_bindings={} owned_menu_items={}\n",
+                    "cell id={} parent={} name={} state={:?} kind={:?} generation={} ebi_arch={:?} ebi_status={:?} native_code={} native_segments={} native_imports={} native_exports={} lifecycle_hooks={} lifecycle_executor_ready={} lifecycle_initialized={} lifecycle_finalized={} pending_loads={} owned_bindings={} owned_menu_items={}\n",
                     cell.id.0,
                     cell.parent.map(|id| id.0).unwrap_or(0),
                     cell.name,
@@ -2529,6 +3152,14 @@ impl ElmCore {
                     cell.ebi_arch,
                     cell.ebi_status,
                     cell.has_native_code,
+                    cell.native_segment_count,
+                    cell.native_import_count,
+                    cell.native_export_count,
+                    cell.lifecycle_hooks_declared,
+                    cell.lifecycle_executor_ready,
+                    cell.lifecycle_initialized,
+                    cell.lifecycle_finalized,
+                    self.pending_ebi_loads.iter().filter(|pending| pending.cell == cell.id).count(),
                     cell.owned_bindings.len(),
                     cell.owned_menu_items.len(),
                 )
@@ -2619,8 +3250,304 @@ impl ElmCore {
                 .as_str(),
             );
         }
-        out.push_str("TODO(elm): soyo、原生代码执行、热替换和设备类端口仍未接入。\n");
+        out.push_str(
+            "TODO(elm): EKI 代码段 payload、未来 soyo profile、原生代码执行、热替换和设备类端口仍未接入。\n",
+        );
         out.into_bytes()
+    }
+
+    pub fn sysfs_text(&self, name: &str) -> String {
+        match name {
+            "core" => self.sysfs_core_text(),
+            "policy" => self.sysfs_policy_text(),
+            "health" => self.sysfs_health_text(),
+            "menu" => self.sysfs_menu_text(),
+            "topology" => self.sysfs_topology_text(),
+            "ports" => self.sysfs_ports_text(),
+            "providers" => self.sysfs_providers_text(),
+            "bindings" => self.sysfs_bindings_text(),
+            "events" => self.sysfs_events_text(),
+            "audit" => self.sysfs_audit_text(),
+            "api" => self.sysfs_api_text(),
+            _ => "status=not-found\n".to_string(),
+        }
+    }
+
+    fn sysfs_core_text(&self) -> String {
+        let (health_status, health_records) = self.health_records();
+        format!(
+            "name=elm-mgr\ninitialized={}\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nsubscriptions={}\nmenu_items={}\napi_records={}\nlast_event_sequence={}\nhealth_status={}\nhealth_records={}\n",
+            u32::from(self.initialized),
+            self.cells.len(),
+            self.ports.len(),
+            self.providers.len(),
+            self.graph.capability_bindings().len(),
+            self.lease_count(),
+            self.runtime_ports.len(),
+            self.mgr_runtime.event_subscriptions.len(),
+            self.menu_items.len(),
+            self.mgr_runtime.api_registry.len(),
+            self.last_event_sequence(),
+            health_status,
+            health_records.len(),
+        )
+    }
+
+    fn sysfs_policy_text(&self) -> String {
+        let policy = self.policy_info();
+        format!(
+            "abi_version={}\nsupported_actions=0x{:x}\npolicy_flags=0x{:x}\nblocker_mask=0x{:x}\naudit_capacity={}\n",
+            policy.abi_version,
+            policy.supported_actions,
+            policy.policy_flags,
+            policy.blocker_mask,
+            policy.audit_capacity,
+        )
+    }
+
+    fn sysfs_health_text(&self) -> String {
+        let (status, records) = self.health_records();
+        let mut out = format!("status={}\nrecords={}\n", status, records.len());
+        for record in records {
+            out.push_str(
+                format!(
+                    "check={} status={} subject={} detail={}\n",
+                    record.check_kind, record.status, record.subject_id, record.detail,
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_menu_text(&self) -> String {
+        let mut out = format!(
+            "generation={}\nitems={}\n",
+            self.menu_generation.0,
+            self.menu_items.len()
+        );
+        for item in &self.menu_items {
+            out.push_str(
+                format!(
+                    "item={} owner={} action={} kind={:?} flags=0x{:x} label={} route={}\n",
+                    item.id,
+                    item.owner.0,
+                    item.action.0,
+                    item.kind,
+                    item.flags,
+                    item.label,
+                    item.route,
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_topology_text(&self) -> String {
+        let mut out = format!(
+            "cells={}\nparents={}\ndependencies={}\nextension_points={}\nextensions={}\nevent_sequence={}\n",
+            self.cells.len(),
+            self.graph.parent_edges().len(),
+            self.graph.dependencies().len(),
+            self.graph.extension_points().len(),
+            self.graph.extensions().len(),
+            self.last_event_sequence(),
+        );
+        for edge in self.graph.parent_edges() {
+            out.push_str(
+                format!("parent child={} parent={}\n", edge.child.0, edge.parent.0).as_str(),
+            );
+        }
+        for edge in self.graph.dependencies() {
+            out.push_str(
+                format!(
+                    "dependency consumer={} provider={} contract={}\n",
+                    edge.consumer.0,
+                    edge.provider.0,
+                    edge.contract.as_str(),
+                )
+                .as_str(),
+            );
+        }
+        for point in self.graph.extension_points() {
+            out.push_str(
+                format!(
+                    "extension_point owner={} point={} contract={}\n",
+                    point.owner.0,
+                    point.name,
+                    point.contract.as_str(),
+                )
+                .as_str(),
+            );
+        }
+        for edge in self.graph.extensions() {
+            out.push_str(
+                format!(
+                    "extension extension={} target={} point={} contract={}\n",
+                    edge.extension.0,
+                    edge.target.0,
+                    edge.point,
+                    edge.contract.as_str(),
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_ports_text(&self) -> String {
+        let mut out = format!("ports={}\n", self.ports.len());
+        for port in &self.ports {
+            out.push_str(
+                format!(
+                    "port={} owner={} contract={} direction={:?} mode={:?} access={:?} implemented={} invokable={}\n",
+                    port.id.0,
+                    port.owner.map(|owner| owner.0).unwrap_or(0),
+                    port.contract(),
+                    port.direction,
+                    port.mode,
+                    port.access,
+                    u32::from(port.implemented),
+                    u32::from(port.invokable),
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_providers_text(&self) -> String {
+        let mut out = format!("providers={}\n", self.providers.len());
+        for provider in &self.providers {
+            out.push_str(
+                format!(
+                    "provider_port={} owner={} backend={:?} dynamic={} bindings={} calls={} failed_calls={} revokes={} queued={} running={} retained={}\n",
+                    provider.port.0,
+                    provider.owner.map(|owner| owner.0).unwrap_or(0),
+                    provider.backend,
+                    u32::from(provider.dynamic),
+                    self.provider_binding_count(provider.port),
+                    provider.calls,
+                    provider.failed_calls,
+                    provider.revokes,
+                    self.provider_queued_count(provider.port),
+                    provider.in_flight,
+                    self.provider_retained_result_count(provider.port),
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_bindings_text(&self) -> String {
+        let bindings = self.graph.capability_bindings();
+        let mut out = format!("bindings={}\n", bindings.len());
+        for edge in bindings {
+            out.push_str(
+                format!(
+                    "binding={} cell={} port={} lease={} active={} generation={} contract={}\n",
+                    edge.id.0,
+                    edge.consumer.0,
+                    edge.port.0,
+                    edge.lease.map(|lease| lease.0).unwrap_or(0),
+                    u32::from(edge.active),
+                    edge.generation.0,
+                    edge.contract.as_str(),
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_events_text(&self) -> String {
+        let mut out = format!(
+            "last_event_sequence={}\nacknowledged_event_sequence={}\nevents={}\nsubscriptions={}\n",
+            self.last_event_sequence(),
+            self.acknowledged_event_sequence,
+            self.events.len(),
+            self.mgr_runtime.event_subscriptions.len(),
+        );
+        for event in &self.events {
+            out.push_str(
+                format!(
+                    "event={} kind={} cell={} port={} binding={} lease={}\n",
+                    event.sequence, event.kind, event.cell, event.port, event.binding, event.lease,
+                )
+                .as_str(),
+            );
+        }
+        for subscription in &self.mgr_runtime.event_subscriptions {
+            out.push_str(
+                format!(
+                    "subscription={} owner={} lease={} cursor={} kind_filter={} cell_filter={} port_filter={} binding_filter={} lease_filter={} delivered={} dropped={}\n",
+                    subscription.subscription,
+                    subscription.owner.0,
+                    subscription.lease.0,
+                    subscription.cursor,
+                    subscription.kind_filter,
+                    subscription.cell_filter,
+                    subscription.port_filter,
+                    subscription.binding_filter,
+                    subscription.lease_filter,
+                    subscription.delivered_events,
+                    subscription.dropped_events,
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_audit_text(&self) -> String {
+        let mut out = format!(
+            "records={}\ndropped={}\nlast_sequence={}\n",
+            self.audits.len(),
+            self.dropped_audit_count,
+            self.next_audit_sequence.saturating_sub(1),
+        );
+        for audit in &self.audits {
+            out.push_str(
+                format!(
+                    "audit={} action={} status={} cell={} blockers=0x{:x} final_state={}\n",
+                    audit.sequence,
+                    audit.action,
+                    audit.status,
+                    audit.cell_id,
+                    audit.blockers,
+                    audit.final_state,
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_api_text(&self) -> String {
+        let mut out = format!(
+            "generation={}\nrecords={}\n",
+            self.mgr_runtime.api_generation.0,
+            self.mgr_runtime.api_registry.len(),
+        );
+        for api in &self.mgr_runtime.api_registry {
+            out.push_str(
+                format!(
+                    "api={} namespace={} name={} contract={} kind={} flags=0x{:x} call_kind={} owner={}\n",
+                    api.id,
+                    fixed_field(&api.namespace, api.namespace_len),
+                    fixed_field(&api.name, api.name_len),
+                    fixed_field(&api.contract, api.contract_len),
+                    api.kind,
+                    api.flags,
+                    api.call_kind,
+                    api.owner_cell_id,
+                )
+                .as_str(),
+            );
+        }
+        out
     }
 
     fn register_builtin_ports(&mut self) {
@@ -2676,6 +3603,146 @@ impl ElmCore {
         Ok(())
     }
 
+    fn register_builtin_mgr_api(&mut self) {
+        let stable_syscall = ELM_MGR_API_FLAG_STABLE | ELM_MGR_API_FLAG_SYSCALL;
+        let stable_both = stable_syscall | ELM_MGR_API_FLAG_SYSFS;
+        for descriptor in [
+            mgr_api(
+                1,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryPolicy,
+                "policy",
+                "elm.mgr.policy@1",
+            ),
+            mgr_api(
+                2,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryHealth,
+                "health",
+                "elm.mgr.health@1",
+            ),
+            mgr_api(
+                3,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryMenu,
+                "menu",
+                "elm.mgr.menu@1",
+            ),
+            mgr_api(
+                4,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryTopology,
+                "topology",
+                "elm.mgr.topology@1",
+            ),
+            mgr_api(
+                5,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryNexusBindings,
+                "bindings",
+                "elm.mgr.bindings@1",
+            ),
+            mgr_api(
+                6,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryAudit,
+                "audit",
+                "elm.mgr.audit@1",
+            ),
+            mgr_api(
+                7,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryRuntimePorts,
+                "runtime.ports",
+                "elm.mgr.runtime.ports@1",
+            ),
+            mgr_api(
+                8,
+                ELM_MGR_API_KIND_PROVIDER,
+                stable_both,
+                ElmMgrCallKind::QueryProviderPorts,
+                "providers",
+                "elm.mgr.providers@1",
+            ),
+            mgr_api(
+                9,
+                ELM_MGR_API_KIND_PROVIDER,
+                stable_syscall,
+                ElmMgrCallKind::QueryProviderStats,
+                "provider.stats",
+                "elm.mgr.provider.stats@1",
+            ),
+            mgr_api(
+                10,
+                ELM_MGR_API_KIND_PROVIDER,
+                stable_both,
+                ElmMgrCallKind::QueryProviderQueue,
+                "provider.queue",
+                "elm.mgr.provider.queue@1",
+            ),
+            mgr_api(
+                11,
+                ELM_MGR_API_KIND_SNAPSHOT,
+                stable_both,
+                ElmMgrCallKind::QueryApiRegistry,
+                "api.registry",
+                "elm.mgr.api.registry@1",
+            ),
+            mgr_api(
+                12,
+                ELM_MGR_API_KIND_EVENT,
+                stable_syscall,
+                ElmMgrCallKind::SubscribeEvent,
+                "event.subscribe",
+                "elm.mgr.event.subscribe@1",
+            ),
+            mgr_api(
+                13,
+                ELM_MGR_API_KIND_EVENT,
+                stable_syscall,
+                ElmMgrCallKind::UnsubscribeEvent,
+                "event.unsubscribe",
+                "elm.mgr.event.unsubscribe@1",
+            ),
+            mgr_api(
+                14,
+                ELM_MGR_API_KIND_EVENT,
+                stable_both,
+                ElmMgrCallKind::QueryEventSubscriptions,
+                "event.subscriptions",
+                "elm.mgr.event.subscriptions@1",
+            ),
+            mgr_api(
+                15,
+                ELM_MGR_API_KIND_EVENT,
+                stable_syscall,
+                ElmMgrCallKind::ReadSubscribedEvents,
+                "event.read",
+                "elm.mgr.event.read@1",
+            ),
+        ] {
+            self.mgr_runtime.register_api(descriptor);
+        }
+
+        for descriptor in [
+            subsystem_api(100, "vfs", "elm.subsys.vfs@1"),
+            subsystem_api(101, "device", "elm.subsys.device@1"),
+            subsystem_api(102, "network", "elm.subsys.network@1"),
+            subsystem_api(103, "irq", "elm.subsys.irq@1"),
+            subsystem_api(104, "dma", "elm.subsys.dma@1"),
+            subsystem_api(105, "mmio", "elm.subsys.mmio@1"),
+        ] {
+            self.mgr_runtime.register_api(descriptor);
+        }
+    }
+
     fn register_port(&mut self, runtime: PortRuntime) {
         let port = runtime.id;
         let contract = runtime.contract().to_string();
@@ -2713,6 +3780,13 @@ impl ElmCore {
                 ElmEbiLoadStatus::Ok
             },
             has_native_code: unit.has_native_code(),
+            native_segment_count: unit.segments.len() as u16,
+            native_import_count: unit.imports.len() as u16,
+            native_export_count: unit.exports.len() as u16,
+            lifecycle_hooks_declared: unit.lifecycle_hooks.is_some(),
+            lifecycle_executor_ready: false,
+            lifecycle_initialized: false,
+            lifecycle_finalized: false,
             owned_bindings: Vec::new(),
             owned_menu_items: Vec::new(),
         });
@@ -2723,7 +3797,26 @@ impl ElmCore {
     }
 
     #[allow(dead_code)]
-    fn activate_loaded_cell(&mut self, id: ElmId, unit: &ElmEbiUnit) -> Result<(), ElmError> {
+    fn activate_loaded_cell(
+        &mut self,
+        id: ElmId,
+        unit: &ElmEbiUnit,
+        topology: &ResolvedEbiTopology,
+    ) -> Result<(), ElmError> {
+        for point in &unit.extension_points {
+            self.graph
+                .add_extension_point(id, point.point.clone(), point.contract.clone())?;
+        }
+        for (provider, contract) in &topology.dependencies {
+            self.graph.add_dependency(id, *provider, contract.clone())?;
+        }
+        for (target, point, contract) in &topology.extensions {
+            self.graph
+                .add_extension(id, *target, point.clone(), contract.clone())?;
+        }
+        for provider in &unit.provider_ports {
+            self.register_ebi_provider_port(id, provider)?;
+        }
         if let Some(menu) = &unit.menu {
             let menu_contract = FlowContract::new("mgr.menu.item@1")?;
             self.graph
@@ -2748,6 +3841,72 @@ impl ElmCore {
         self.transition_cell_state(id, ElmState::Ready)?;
         self.transition_cell_state(id, ElmState::Active)?;
         Ok(())
+    }
+
+    fn preflight_ebi_topology(&self, unit: &ElmEbiUnit) -> Result<ResolvedEbiTopology, ElmError> {
+        if self.cell_id_by_name(unit.manifest.name.as_str()).is_some() {
+            return Err(ElmError::DuplicateCell);
+        }
+
+        let mut topology = ResolvedEbiTopology::empty();
+        for dependency in &unit.dependencies {
+            let provider = self.resolve_unique_cell_name(&dependency.provider_name)?;
+            topology
+                .dependencies
+                .push((provider, dependency.contract.clone()));
+        }
+
+        for (index, point) in unit.extension_points.iter().enumerate() {
+            if unit
+                .extension_points
+                .iter()
+                .skip(index + 1)
+                .any(|other| other.point == point.point)
+            {
+                return Err(ElmError::DuplicateExtensionPoint);
+            }
+        }
+
+        for extension in &unit.extensions {
+            let target = self.resolve_unique_cell_name(&extension.target_name)?;
+            let mut point_exists = false;
+            let mut contract_matches = false;
+            for point in self.graph.extension_points() {
+                if point.owner == target && point.name == extension.point {
+                    point_exists = true;
+                    if point.contract == extension.contract {
+                        contract_matches = true;
+                    }
+                }
+            }
+            if !point_exists {
+                return Err(ElmError::ExtensionPointNotFound);
+            }
+            if !contract_matches {
+                return Err(ElmError::ContractMismatch);
+            }
+            topology
+                .extensions
+                .push((target, extension.point.clone(), extension.contract.clone()));
+        }
+
+        let mut provider_contracts = Vec::new();
+        for provider in &unit.provider_ports {
+            if provider.flags != 0 {
+                return Err(ElmError::InvalidTransition);
+            }
+            let contract = provider.contract.as_str();
+            if self.ports.iter().any(|port| port.contract() == contract)
+                || provider_contracts
+                    .iter()
+                    .any(|seen: &String| seen.as_str() == contract)
+            {
+                return Err(ElmError::DuplicatePort);
+            }
+            provider_contracts.push(contract.to_string());
+        }
+
+        Ok(topology)
     }
 
     fn port_desc(&self, id: PortId) -> Option<PortRuntime> {
@@ -2785,6 +3944,61 @@ impl ElmCore {
             access as u32,
             blockers,
         )
+    }
+
+    fn register_ebi_provider_port(
+        &mut self,
+        owner: ElmId,
+        decl: &ElmEbiProviderPortDecl,
+    ) -> Result<(), ElmError> {
+        if decl.flags != 0 {
+            return Err(ElmError::InvalidTransition);
+        }
+        if self
+            .ports
+            .iter()
+            .any(|port| port.contract() == decl.contract.as_str())
+        {
+            return Err(ElmError::DuplicatePort);
+        }
+
+        let port = self.alloc_port_id();
+        let runtime = PortRuntime::new(
+            port,
+            Some(owner),
+            decl.contract.as_str(),
+            decl.direction,
+            decl.mode,
+            decl.access,
+            false,
+            false,
+        );
+        self.register_port(runtime);
+        self.providers.push(ProviderRuntime {
+            port,
+            owner: Some(owner),
+            access: decl.access,
+            backend: ProviderBackend::ElmNativeTodo,
+            dynamic: true,
+            queue_limit: provider_queue_limit_for_mode(decl.mode),
+            max_in_flight: provider_max_in_flight_for_mode(decl.mode),
+            in_flight: 0,
+            calls: 0,
+            failed_calls: 0,
+            revokes: 0,
+            async_submitted: 0,
+            async_completed: 0,
+            async_canceled: 0,
+            async_expired: 0,
+            async_rejected: 0,
+        });
+        self.record_mgr_audit(
+            ELM_MGR_ACTION_PROVIDER_REGISTER,
+            owner,
+            0,
+            state_code(self.cell_state(owner).unwrap_or(ElmState::Loaded)),
+        );
+        Ok(())
     }
 
     fn provider_index(&self, port: PortId) -> Option<usize> {
@@ -3102,6 +4316,36 @@ impl ElmCore {
             .filter(|provider| provider.owner == Some(owner))
             .map(|provider| self.provider_binding_count(provider.port))
             .sum()
+    }
+
+    fn remove_dynamic_providers_owned_by(&mut self, owner: ElmId) -> usize {
+        let ports: Vec<_> = self
+            .providers
+            .iter()
+            .filter_map(|provider| {
+                if provider.dynamic
+                    && provider.owner == Some(owner)
+                    && self.provider_binding_count(provider.port) == 0
+                {
+                    Some(provider.port)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for port in &ports {
+            if let Some(index) = self.provider_index(*port) {
+                self.providers.remove(index);
+            }
+            self.ports.retain(|runtime| runtime.id != *port);
+            self.record_mgr_audit(
+                ELM_MGR_ACTION_PROVIDER_UNREGISTER,
+                owner,
+                0,
+                self.cell_state(owner).map(state_code).unwrap_or(0),
+            );
+        }
+        ports.len()
     }
 
     fn provider_access_allowed(&self, consumer: ElmId, desc: &PortRuntime) -> bool {
@@ -3471,6 +4715,27 @@ impl ElmCore {
         self.cells.iter().position(|cell| cell.id == id)
     }
 
+    fn cell_id_by_name(&self, name: &str) -> Option<ElmId> {
+        self.cells
+            .iter()
+            .find(|cell| cell.name == name)
+            .map(|cell| cell.id)
+    }
+
+    fn resolve_unique_cell_name(&self, name: &str) -> Result<ElmId, ElmError> {
+        let mut found = None;
+        for cell in &self.cells {
+            if cell.name != name {
+                continue;
+            }
+            if found.is_some() {
+                return Err(ElmError::DuplicateCell);
+            }
+            found = Some(cell.id);
+        }
+        found.ok_or(ElmError::CellNotFound)
+    }
+
     fn is_builtin_cell(&self, id: ElmId) -> bool {
         id.0 < FIRST_DYNAMIC_CELL_ID
     }
@@ -3488,6 +4753,60 @@ impl ElmCore {
             .find(|cell| cell.id == id)
             .map(|cell| cell.has_native_code)
             .unwrap_or(false)
+    }
+
+    fn cell_needs_finalize(&self, id: ElmId) -> bool {
+        self.cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| cell.lifecycle_initialized && !cell.lifecycle_finalized)
+            .unwrap_or(false)
+    }
+
+    fn lifecycle_context(
+        &self,
+        id: ElmId,
+        phase: ElmLifecyclePhase,
+    ) -> Result<ElmContext, ElmError> {
+        let Some(cell) = self.cells.iter().find(|cell| cell.id == id) else {
+            return Err(ElmError::CellNotFound);
+        };
+        Ok(ElmContext::new(
+            cell.id,
+            cell.parent,
+            cell.generation,
+            cell.state,
+            phase,
+            0,
+        ))
+    }
+
+    fn pending_ebi_load_index(&self, id: ElmId) -> Option<usize> {
+        self.pending_ebi_loads
+            .iter()
+            .position(|pending| pending.cell == id)
+    }
+
+    fn remove_pending_ebi_load(&mut self, id: ElmId) -> Option<PendingEbiLoad> {
+        self.pending_ebi_load_index(id)
+            .map(|index| self.pending_ebi_loads.remove(index))
+    }
+
+    fn quarantine_cell_after_hook_failure(&mut self, id: ElmId) {
+        match self.cell_state(id) {
+            Some(ElmState::Faulted) => {}
+            Some(ElmState::Quarantined) => return,
+            Some(_) => {
+                if self.transition_cell_state(id, ElmState::Faulted).is_err() {
+                    return;
+                }
+            }
+            None => return,
+        }
+        let _ = self.transition_cell_state(id, ElmState::Quarantined);
+        if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) {
+            cell.ebi_status = ElmEbiLoadStatus::RuntimeRejected;
+        }
     }
 
     fn lifecycle_response(
@@ -3722,6 +5041,69 @@ fn plain_bytes<T>(value: &T) -> &[u8] {
     unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
     }
+}
+
+fn mgr_api(
+    id: u64,
+    kind: u32,
+    flags: u32,
+    call: ElmMgrCallKind,
+    name: &str,
+    contract: &str,
+) -> ElmMgrApiDescriptor {
+    ElmMgrApiDescriptor::new(
+        id,
+        ELM_MGR_ID.0,
+        kind,
+        flags,
+        call as u32,
+        "elm.mgr",
+        name,
+        contract,
+    )
+}
+
+fn subsystem_api(id: u64, name: &str, contract: &str) -> ElmMgrApiDescriptor {
+    ElmMgrApiDescriptor::new(
+        id,
+        ELM_MGR_ID.0,
+        ELM_MGR_API_KIND_SUBSYSTEM,
+        ELM_MGR_API_FLAG_TODO | ELM_MGR_API_FLAG_PROVIDER_OPS,
+        0,
+        "elm.subsys",
+        name,
+        contract,
+    )
+}
+
+fn normalize_event_read_limit(max_records: u32) -> usize {
+    let requested = if max_records == 0 {
+        ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS
+    } else {
+        max_records
+    };
+    requested.min(ELM_MGR_EVENT_READ_ABSOLUTE_MAX_RECORDS) as usize
+}
+
+fn recover_stale_subscription_cursor(
+    events: &[ElmEventRecord],
+    cursor: &mut u64,
+    dropped: &mut u64,
+) {
+    let Some(first) = events.first() else {
+        return;
+    };
+    let next_requested = cursor.saturating_add(1);
+    if next_requested >= first.sequence {
+        return;
+    }
+    *dropped = (*dropped).saturating_add(first.sequence.saturating_sub(next_requested));
+    *cursor = first.sequence.saturating_sub(1);
+}
+
+fn fixed_field(bytes: &[u8], len: u16) -> &str {
+    let len = core::cmp::min(usize::from(len), bytes.len());
+    core::str::from_utf8(&bytes[..len]).unwrap_or("<invalid>")
 }
 
 fn request_contract(request: &ElmNexusBindRequest) -> Option<&str> {

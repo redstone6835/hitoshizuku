@@ -62,6 +62,8 @@ const KERNEL_OSRELEASE_INO: u64 = 21;
 const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
 const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
+const KERNEL_ELM_DIR_INO: u64 = 80;
+const KERNEL_ELM_FILE_BASE_INO: u64 = 81;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -73,12 +75,19 @@ const CPU_TOPOLOGY_SLOTS: u64 = 8;
 
 static SYSFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SYSFS_INO_REGISTRY: Spinlock<Option<SysfsInoRegistry>> = Spinlock::new(None);
+static ELM_SYSFS_RENDERER: Spinlock<Option<ElmSysfsRenderer>> = Spinlock::new(None);
 
 const SYSFS_MAGIC: u64 = 0x6265_6572;
 const SYSFS_DYNAMIC_INO_START: u64 = 1_000_000_000;
 const SYSFS_BLOCK_CLASS: &str = "block";
 const SYSFS_CHAR_CLASS: &str = "char";
 const SYSFS_NET_CLASS: &str = NET_CLASS.as_str();
+
+pub type ElmSysfsRenderer = fn(&str) -> String;
+
+pub fn register_elm_renderer(renderer: ElmSysfsRenderer) {
+    *ELM_SYSFS_RENDERER.lock() = Some(renderer);
+}
 
 /// sysfs 用户视图默认策略。
 ///
@@ -1483,10 +1492,87 @@ enum SysRegFile {
     Version,
     Cmdline,
     DeviceFunctions,
+    Elm {
+        slot: ElmSysfsSlot,
+    },
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ElmSysfsSlot {
+    Core,
+    Policy,
+    Health,
+    Menu,
+    Topology,
+    Ports,
+    Providers,
+    Bindings,
+    Events,
+    Audit,
+    Api,
+}
+
+impl ElmSysfsSlot {
+    const ALL: &'static [Self] = &[
+        Self::Core,
+        Self::Policy,
+        Self::Health,
+        Self::Menu,
+        Self::Topology,
+        Self::Ports,
+        Self::Providers,
+        Self::Bindings,
+        Self::Events,
+        Self::Audit,
+        Self::Api,
+    ];
+
+    fn to_u64(self) -> u64 {
+        match self {
+            Self::Core => 0,
+            Self::Policy => 1,
+            Self::Health => 2,
+            Self::Menu => 3,
+            Self::Topology => 4,
+            Self::Ports => 5,
+            Self::Providers => 6,
+            Self::Bindings => 7,
+            Self::Events => 8,
+            Self::Audit => 9,
+            Self::Api => 10,
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Policy => "policy",
+            Self::Health => "health",
+            Self::Menu => "menu",
+            Self::Topology => "topology",
+            Self::Ports => "ports",
+            Self::Providers => "providers",
+            Self::Bindings => "bindings",
+            Self::Events => "events",
+            Self::Audit => "audit",
+            Self::Api => "api",
+        }
+    }
+}
+
+fn elm_sysfs_slot_by_name(name: &str) -> Option<ElmSysfsSlot> {
+    ElmSysfsSlot::ALL
+        .iter()
+        .find(|slot| slot.file_name() == name)
+        .copied()
+}
+
+fn kernel_elm_slot_ino(slot: ElmSysfsSlot) -> u64 {
+    KERNEL_ELM_FILE_BASE_INO + slot.to_u64()
 }
 
 // ─── 内容渲染 ────────────────────────────────────────────────
@@ -1874,6 +1960,13 @@ fn render_kernel_cmdline() -> String {
     }
 }
 
+fn render_elm_sysfs_file(name: &str) -> String {
+    match *ELM_SYSFS_RENDERER.lock() {
+        Some(renderer) => renderer(name),
+        None => "status=unavailable\n".into(),
+    }
+}
+
 fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
     match kind {
         SysRegFile::BlockDev { idx, slot } => render_block_dev_file(snap, idx, slot),
@@ -1900,6 +1993,7 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
             append_function_projection_diagnostics(&mut out);
             out
         }
+        SysRegFile::Elm { slot } => render_elm_sysfs_file(slot.file_name()),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::stack()
                 .snapshot_interfaces()
@@ -2177,6 +2271,7 @@ enum SysDirKind {
         rdev: DevId,
     },
     Kernel,
+    KernelElm,
     Fs,
     FsCgroup,
     Bus,
@@ -2570,8 +2665,13 @@ impl SysDirInodeOps {
                 "device_functions" => {
                     mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
                 }
+                "elm" => Ok(mk_dir(KERNEL_ELM_DIR_INO, SysDirKind::KernelElm)),
                 _ => Err(VfsError::NotFound),
             },
+            SysDirKind::KernelElm => {
+                let slot = elm_sysfs_slot_by_name(name).ok_or(VfsError::NotFound)?;
+                mk_reg(kernel_elm_slot_ino(slot), SysRegFile::Elm { slot })
+            }
             SysDirKind::Fs => match name {
                 // 当前内核尚未提供 cgroup controller registry；这里暴露稳定的空根目录，
                 // 等 controller 子系统接入后再由 registry 驱动目录内容。
@@ -3151,7 +3251,22 @@ impl SysDirInodeOps {
                     "device_functions",
                     FileType::Regular,
                 ),
+                mk_dir_entry(KERNEL_ELM_DIR_INO, "elm", FileType::Directory),
             ],
+            SysDirKind::KernelElm => {
+                let mut entries = Vec::new();
+                for slot in ElmSysfsSlot::ALL {
+                    if !push_sysfs_dir_entry(
+                        &mut entries,
+                        kernel_elm_slot_ino(*slot),
+                        slot.file_name(),
+                        FileType::Regular,
+                    ) {
+                        return entries;
+                    }
+                }
+                entries
+            }
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),
             SysDirKind::Class => {

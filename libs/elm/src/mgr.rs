@@ -1,5 +1,7 @@
 //! 单元管理器调用外壳。
 
+pub mod api;
+
 use crate::ctl::ELM_CTL_ABI_VERSION;
 use crate::event::ElmEventRecord;
 use crate::frame::{ElmCallFrame, ElmReplyFrame};
@@ -25,6 +27,7 @@ pub const ELM_LIFECYCLE_REASON_HAS_CHILDREN: u32 = 6;
 pub const ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT: u32 = 7;
 pub const ELM_LIFECYCLE_REASON_HAS_DEPENDENTS: u32 = 8;
 pub const ELM_LIFECYCLE_REASON_HAS_EXTENSIONS: u32 = 9;
+pub const ELM_LIFECYCLE_REASON_HOOK_FAILED: u32 = 10;
 
 pub const ELM_MGR_ACTION_PAUSE: u32 = 1 << 0;
 pub const ELM_MGR_ACTION_RESUME: u32 = 1 << 1;
@@ -41,10 +44,14 @@ pub const ELM_MGR_ACTION_PROVIDER_QUERY: u32 = 1 << 11;
 pub const ELM_MGR_ACTION_PROVIDER_INVOKE: u32 = 1 << 12;
 pub const ELM_MGR_ACTION_HEALTH_QUERY: u32 = 1 << 13;
 pub const ELM_MGR_ACTION_PROVIDER_ASYNC: u32 = 1 << 14;
+pub const ELM_MGR_ACTION_API_QUERY: u32 = 1 << 15;
+pub const ELM_MGR_ACTION_EVENT_SUBSCRIBE: u32 = 1 << 16;
+pub const ELM_MGR_ACTION_EVENT_UNSUBSCRIBE: u32 = 1 << 17;
+pub const ELM_MGR_ACTION_EVENT_READ: u32 = 1 << 18;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
-pub const ELM_MGR_POLICY_LOAD_REQUIRES_SOYO: u64 = 1 << 2;
+pub const ELM_MGR_POLICY_LOAD_REQUIRES_EBI_SOURCE: u64 = 1 << 2;
 pub const ELM_MGR_POLICY_REPLACE_TODO: u64 = 1 << 3;
 pub const ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO: u64 = 1 << 4;
 pub const ELM_MGR_POLICY_NEXUS_BINDING: u64 = 1 << 5;
@@ -52,6 +59,8 @@ pub const ELM_MGR_POLICY_MENU_BINDING: u64 = 1 << 6;
 pub const ELM_MGR_POLICY_PROVIDER_PORTS: u64 = 1 << 7;
 pub const ELM_MGR_POLICY_HEALTH: u64 = 1 << 8;
 pub const ELM_MGR_POLICY_PROVIDER_ASYNC: u64 = 1 << 9;
+pub const ELM_MGR_POLICY_API_REGISTRY: u64 = 1 << 10;
+pub const ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS: u64 = 1 << 11;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -63,7 +72,7 @@ pub const ELM_POLICY_BLOCK_HAS_EXTENSIONS: u64 = 1 << 6;
 pub const ELM_POLICY_BLOCK_LEASE_BUSY: u64 = 1 << 7;
 pub const ELM_POLICY_BLOCK_REPLACE_TODO: u64 = 1 << 8;
 pub const ELM_POLICY_BLOCK_GRAPH_INCONSISTENT: u64 = 1 << 9;
-pub const ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO: u64 = 1 << 10;
+pub const ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE: u64 = 1 << 10;
 pub const ELM_POLICY_BLOCK_PORT_NOT_FOUND: u64 = 1 << 11;
 pub const ELM_POLICY_BLOCK_CONTRACT_MISMATCH: u64 = 1 << 12;
 pub const ELM_POLICY_BLOCK_DUPLICATE_BINDING: u64 = 1 << 13;
@@ -76,6 +85,7 @@ pub const ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED: u64 = 1 << 19;
 pub const ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL: u64 = 1 << 20;
 pub const ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED: u64 = 1 << 21;
 pub const ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED: u64 = 1 << 22;
+pub const ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED: u64 = 1 << 23;
 
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
@@ -146,6 +156,11 @@ pub enum ElmMgrCallKind {
     PollProviderReply = 27,
     CancelProviderCall = 28,
     QueryProviderQueue = 29,
+    QueryApiRegistry = 30,
+    SubscribeEvent = 31,
+    UnsubscribeEvent = 32,
+    QueryEventSubscriptions = 33,
+    ReadSubscribedEvents = 34,
 }
 
 impl ElmMgrCallKind {
@@ -180,6 +195,11 @@ impl ElmMgrCallKind {
             27 => Some(Self::PollProviderReply),
             28 => Some(Self::CancelProviderCall),
             29 => Some(Self::QueryProviderQueue),
+            30 => Some(Self::QueryApiRegistry),
+            31 => Some(Self::SubscribeEvent),
+            32 => Some(Self::UnsubscribeEvent),
+            33 => Some(Self::QueryEventSubscriptions),
+            34 => Some(Self::ReadSubscribedEvents),
             _ => None,
         }
     }
@@ -418,17 +438,23 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_ACTION_PROVIDER_QUERY
                 | ELM_MGR_ACTION_PROVIDER_INVOKE
                 | ELM_MGR_ACTION_HEALTH_QUERY
-                | ELM_MGR_ACTION_PROVIDER_ASYNC,
+                | ELM_MGR_ACTION_PROVIDER_ASYNC
+                | ELM_MGR_ACTION_API_QUERY
+                | ELM_MGR_ACTION_EVENT_SUBSCRIBE
+                | ELM_MGR_ACTION_EVENT_UNSUBSCRIBE
+                | ELM_MGR_ACTION_EVENT_READ,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
-                | ELM_MGR_POLICY_LOAD_REQUIRES_SOYO
+                | ELM_MGR_POLICY_LOAD_REQUIRES_EBI_SOURCE
                 | ELM_MGR_POLICY_REPLACE_TODO
                 | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO
                 | ELM_MGR_POLICY_NEXUS_BINDING
                 | ELM_MGR_POLICY_MENU_BINDING
                 | ELM_MGR_POLICY_PROVIDER_PORTS
                 | ELM_MGR_POLICY_HEALTH
-                | ELM_MGR_POLICY_PROVIDER_ASYNC,
+                | ELM_MGR_POLICY_PROVIDER_ASYNC
+                | ELM_MGR_POLICY_API_REGISTRY
+                | ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -439,7 +465,7 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_LEASE_BUSY
                 | ELM_POLICY_BLOCK_REPLACE_TODO
                 | ELM_POLICY_BLOCK_GRAPH_INCONSISTENT
-                | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO
+                | ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE
                 | ELM_POLICY_BLOCK_PORT_NOT_FOUND
                 | ELM_POLICY_BLOCK_CONTRACT_MISMATCH
                 | ELM_POLICY_BLOCK_DUPLICATE_BINDING
@@ -451,7 +477,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED
                 | ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL
                 | ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED
-                | ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED,
+                | ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED
+                | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
             audit_capacity,
             reserved1: 0,
         }
@@ -1493,7 +1520,7 @@ pub const fn status_from_blockers(blockers: u64) -> i32 {
     } else if blockers
         & (ELM_POLICY_BLOCK_NATIVE_TODO
             | ELM_POLICY_BLOCK_REPLACE_TODO
-            | ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO
+            | ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE
             | ELM_POLICY_BLOCK_PORT_TODO)
         != 0
     {
@@ -1520,6 +1547,8 @@ pub const fn first_lifecycle_reason(blockers: u64) -> u32 {
         ELM_LIFECYCLE_REASON_LEASE_BUSY
     } else if blockers & ELM_POLICY_BLOCK_GRAPH_INCONSISTENT != 0 {
         ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT
+    } else if blockers & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED != 0 {
+        ELM_LIFECYCLE_REASON_HOOK_FAILED
     } else if blockers != 0 {
         ELM_LIFECYCLE_REASON_INVALID_STATE
     } else {

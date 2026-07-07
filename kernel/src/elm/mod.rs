@@ -2,6 +2,8 @@
 //!
 //! 本模块只实现 ELM 自己的能力织网和管理入口，不复用 Linux 模块系统调用。
 
+use alloc::string::String;
+
 mod core;
 mod event;
 mod executor;
@@ -15,9 +17,16 @@ mod tests;
 
 pub(crate) fn init_builtin_mgr() {
     match core::with_core(|core| core.init_builtin_mgr()) {
-        Ok(()) => executor::start_provider_worker(),
+        Ok(()) => {
+            general::vfs::sysfs::register_elm_renderer(render_sysfs_file);
+            executor::start_provider_worker();
+        }
         Err(err) => log::error!("[elm] init builtin elm-mgr failed: {:?}", err),
     }
 }
 
 pub(crate) use core::with_core;
+
+fn render_sysfs_file(name: &str) -> String {
+    core::with_core(|core| core.sysfs_text(name))
+}

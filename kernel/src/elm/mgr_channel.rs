@@ -3,12 +3,14 @@
 use alloc::vec::Vec;
 
 use elm_model::{
-    ELM_MGR_MAX_INPUT, ELM_MGR_STATUS_OK, ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, ElmId,
-    ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecycleRequest, ElmMgrCallHeader,
-    ElmMgrCallKind, ElmMgrResponseHeader, ElmNexusBindRequest, ElmNexusUnbindRequest,
-    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncSubmitRequest,
-    ElmProviderInvokeRequest, ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest,
-    ElmRuntimeEventRequest, ElmRuntimeLogRequest,
+    ELM_EBI_SOURCE_ABI_VERSION, ELM_MGR_MAX_INPUT, ELM_MGR_STATUS_OK,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ElmEbiArch, ElmEbiSourceKind, ElmEbiSourceRequest,
+    ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecycleRequest, ElmMgrCallHeader,
+    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest,
+    ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest, ElmNexusBindRequest,
+    ElmNexusUnbindRequest, ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest,
+    ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderPortRegisterRequest,
+    ElmProviderPortUnregisterRequest, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
 };
 
 use super::{core::ElmCore, executor, menu, with_core};
@@ -33,12 +35,35 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
             response_with_payload(payload)
         }
         ElmMgrCallKind::LoadCell => {
-            if !payload_is_empty(header) {
-                return response_only(ElmMgrResponseHeader::invalid());
+            let payload = call_payload(input, header);
+            if payload.is_empty() {
+                core.record_mgr_audit(0, ElmId(0), ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, 0);
+                return response_only(ElmMgrResponseHeader::todo());
             }
-            // TODO(elm): 未来由 soyo 解析器把文件转换为 EBI 协议对象后再装载。
-            core.record_mgr_audit(0, ElmId(0), ELM_POLICY_BLOCK_LOAD_REQUIRES_SOYO, 0);
-            response_only(ElmMgrResponseHeader::todo())
+            let Some((request, source_payload)) = read_ebi_source_request(payload) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let Some(source_kind) = ElmEbiSourceKind::from_raw(request.source_kind) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match source_kind {
+                ElmEbiSourceKind::Eki => match elm_model::parse_eki_ebi_unit(source_payload) {
+                    Ok(unit) => {
+                        let response = core.load_ebi_unit(unit, current_ebi_arch());
+                        response_with_plain_payload(&response)
+                    }
+                    Err(_) => response_only(ElmMgrResponseHeader::invalid()),
+                },
+                _ => {
+                    core.record_mgr_audit(
+                        0,
+                        ElmId(0),
+                        ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+                        0,
+                    );
+                    response_only(ElmMgrResponseHeader::todo())
+                }
+            }
         }
         ElmMgrCallKind::PauseCell => {
             let Some(request) = read_lifecycle_request(call_payload(input, header)) else {
@@ -257,6 +282,44 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
             let payload = core.health_bytes();
             response_with_payload(payload)
         }
+        ElmMgrCallKind::QueryApiRegistry => {
+            if !payload_is_empty(header) {
+                return response_only(ElmMgrResponseHeader::invalid());
+            }
+            let payload = core.api_registry_bytes();
+            response_with_payload(payload)
+        }
+        ElmMgrCallKind::SubscribeEvent => {
+            let Some(request) = read_event_subscribe_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = core.subscribe_event(request);
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::UnsubscribeEvent => {
+            let Some(request) = read_event_unsubscribe_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            let response = core.unsubscribe_event(request);
+            response_with_plain_payload(&response)
+        }
+        ElmMgrCallKind::QueryEventSubscriptions => {
+            if !payload_is_empty(header) {
+                return response_only(ElmMgrResponseHeader::invalid());
+            }
+            let payload = core.event_subscriptions_bytes();
+            response_with_payload(payload)
+        }
+        ElmMgrCallKind::ReadSubscribedEvents => {
+            let Some(request) = read_subscribed_event_read_request(call_payload(input, header))
+            else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match core.read_subscribed_events(request) {
+                Ok(payload) => response_with_payload(payload),
+                Err(status) => response_only(response_header_from_status(status)),
+            }
+        }
     }
 }
 
@@ -306,6 +369,31 @@ fn read_lifecycle_request(payload: &[u8]) -> Option<ElmLifecycleRequest> {
         return None;
     }
     Some(request)
+}
+
+fn read_ebi_source_request(payload: &[u8]) -> Option<(ElmEbiSourceRequest, &[u8])> {
+    let request_size = core::mem::size_of::<ElmEbiSourceRequest>();
+    if payload.len() < request_size {
+        return None;
+    }
+    let request = ElmEbiSourceRequest {
+        abi_version: u16::from_le_bytes(payload[0..2].try_into().ok()?),
+        source_kind: u16::from_le_bytes(payload[2..4].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[4..8].try_into().ok()?),
+        payload_len: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+    };
+    if request.abi_version != ELM_EBI_SOURCE_ABI_VERSION
+        || request.flags != 0
+        || request.reserved != 0
+    {
+        return None;
+    }
+    let end = request_size.checked_add(request.payload_len as usize)?;
+    if payload.len() != end {
+        return None;
+    }
+    Some((request, &payload[request_size..end]))
 }
 
 fn read_lifecycle_plan_request(payload: &[u8]) -> Option<ElmLifecyclePlanRequest> {
@@ -397,6 +485,57 @@ fn read_runtime_event_request(payload: &[u8]) -> Option<ElmRuntimeEventRequest> 
         reserved: u32::from_le_bytes(payload[20..24].try_into().ok()?),
     };
     if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
+}
+
+fn read_event_subscribe_request(payload: &[u8]) -> Option<ElmMgrEventSubscribeRequest> {
+    if payload.len() != core::mem::size_of::<ElmMgrEventSubscribeRequest>() {
+        return None;
+    }
+    let request = ElmMgrEventSubscribeRequest {
+        owner_cell_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        kind_filter: u32::from_le_bytes(payload[8..12].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+        cell_filter: u64::from_le_bytes(payload[16..24].try_into().ok()?),
+        port_filter: u64::from_le_bytes(payload[24..32].try_into().ok()?),
+        binding_filter: u64::from_le_bytes(payload[32..40].try_into().ok()?),
+        lease_filter: u64::from_le_bytes(payload[40..48].try_into().ok()?),
+    };
+    if request.flags != 0 || request.owner_cell_id == 0 {
+        return None;
+    }
+    Some(request)
+}
+
+fn read_event_unsubscribe_request(payload: &[u8]) -> Option<ElmMgrEventUnsubscribeRequest> {
+    if payload.len() != core::mem::size_of::<ElmMgrEventUnsubscribeRequest>() {
+        return None;
+    }
+    let request = ElmMgrEventUnsubscribeRequest {
+        subscription_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        owner_cell_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+    };
+    if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
+}
+
+fn read_subscribed_event_read_request(payload: &[u8]) -> Option<ElmMgrSubscribedEventReadRequest> {
+    if payload.len() != core::mem::size_of::<ElmMgrSubscribedEventReadRequest>() {
+        return None;
+    }
+    let request = ElmMgrSubscribedEventReadRequest {
+        subscription_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        cursor: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        max_records: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+    };
+    if request.subscription_id == 0 {
         return None;
     }
     Some(request)
@@ -568,4 +707,19 @@ fn plain_bytes<T>(value: &T) -> &[u8] {
     unsafe {
         core::slice::from_raw_parts((value as *const T).cast::<u8>(), core::mem::size_of::<T>())
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+fn current_ebi_arch() -> ElmEbiArch {
+    ElmEbiArch::Riscv64
+}
+
+#[cfg(target_arch = "loongarch64")]
+fn current_ebi_arch() -> ElmEbiArch {
+    ElmEbiArch::LoongArch64
+}
+
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+fn current_ebi_arch() -> ElmEbiArch {
+    ElmEbiArch::Any
 }
