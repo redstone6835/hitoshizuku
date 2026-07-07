@@ -3,16 +3,13 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use elm_model::{ElmCtlCommand, ElmMgrCallHeader};
+use elm_model::{ELM_MGR_MAX_INPUT, ElmCtlCommand};
 use errno::Errno;
 use general::mm::{copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use sched::ids::Capability;
 
 use super::{event, mgr_channel, snapshot, with_core};
-
-const MAX_MGR_PAYLOAD: usize = 4096;
-const MAX_MGR_INPUT: usize = MAX_MGR_PAYLOAD + core::mem::size_of::<ElmMgrCallHeader>();
 
 pub(crate) fn sys_elm_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let command = ElmCtlCommand::from_raw(ctx.args[0]).ok_or(Errno::EINVAL)?;
@@ -41,7 +38,7 @@ pub(crate) fn sys_elm_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         }
         ElmCtlCommand::MgrCall => {
             require_sys_admin(ctx)?;
-            let input = read_input_bytes(input_user, input_len, MAX_MGR_INPUT)?;
+            let input = read_input_bytes(input_user, input_len, ELM_MGR_MAX_INPUT)?;
             let response = mgr_channel::dispatch_mgr_call(&input);
             write_bytes(output_user, output_len, &response)
         }

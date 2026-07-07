@@ -75,6 +75,8 @@ pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
 pub const ELM_NEXUS_CONTRACT_LEN: usize = 64;
 pub const ELM_RUNTIME_LOG_MESSAGE_LEN: usize = 256;
+pub const ELM_MGR_MAX_PAYLOAD: usize = 4096;
+pub const ELM_MGR_MAX_INPUT: usize = ELM_MGR_MAX_PAYLOAD + core::mem::size_of::<ElmMgrCallHeader>();
 pub const ELM_PROVIDER_PORT_FLAG_NONE: u32 = 0;
 pub const ELM_PROVIDER_FLAG_DYNAMIC: u16 = 1 << 0;
 pub const ELM_PROVIDER_FLAG_KERNEL_BACKEND: u16 = 1 << 1;
@@ -211,6 +213,21 @@ pub struct ElmMgrCallHeader {
     pub flags: u32,
     pub payload_len: u32,
     pub reserved: u32,
+}
+
+impl ElmMgrCallHeader {
+    pub const fn new(kind: ElmMgrCallKind, payload_len: u32) -> Self {
+        Self {
+            kind: kind as u32,
+            flags: 0,
+            payload_len,
+            reserved: 0,
+        }
+    }
+
+    pub const fn empty(kind: ElmMgrCallKind) -> Self {
+        Self::new(kind, 0)
+    }
 }
 
 #[repr(C)]
