@@ -2,8 +2,8 @@ use crate::{
     ActionId, BindingGraph, BindingId, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_DETAIL_NONE,
     ELM_HEALTH_FLAG_HAS_FAILURES, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
     ELM_LIFECYCLE_REASON_HAS_EXTENSIONS, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND,
-    ELM_MGR_ACTION_DETACH, ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_UNBIND,
-    ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING,
+    ELM_MGR_ACTION_DETACH, ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_UNBIND, ELM_MGR_MAX_INPUT,
+    ELM_MGR_MAX_PAYLOAD, ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING,
     ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT, ELM_MGR_POLICY_PROVIDER_PORTS,
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
     ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
@@ -15,8 +15,8 @@ use crate::{
     ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord, ElmId, ElmKind,
     ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleRequest,
     ElmLifecycleResponse, ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader,
-    ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrRelationKind,
-    ElmMgrRelationRecord, ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName,
+    ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo,
+    ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrResponseHeader, ElmMgrTopologyHeader, ElmName,
     ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
     ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPortSnapshot,
     ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRecord,
@@ -448,6 +448,24 @@ fn event_record_uses_zero_for_absent_objects() {
 
 #[test]
 fn mgr_response_header_reports_payload_status() {
+    assert_eq!(ELM_MGR_MAX_PAYLOAD, 4096);
+    assert_eq!(
+        ELM_MGR_MAX_INPUT,
+        ELM_MGR_MAX_PAYLOAD + core::mem::size_of::<ElmMgrCallHeader>()
+    );
+
+    let query_policy = ElmMgrCallHeader::empty(ElmMgrCallKind::QueryPolicy);
+    assert_eq!(query_policy.kind, ElmMgrCallKind::QueryPolicy as u32);
+    assert_eq!(query_policy.flags, 0);
+    assert_eq!(query_policy.payload_len, 0);
+    assert_eq!(query_policy.reserved, 0);
+
+    let preflight_bind = ElmMgrCallHeader::new(ElmMgrCallKind::PreflightBind, 88);
+    assert_eq!(preflight_bind.kind, ElmMgrCallKind::PreflightBind as u32);
+    assert_eq!(preflight_bind.flags, 0);
+    assert_eq!(preflight_bind.payload_len, 88);
+    assert_eq!(preflight_bind.reserved, 0);
+
     let ok = ElmMgrResponseHeader::ok(16);
     assert_eq!(ok.status, ELM_MGR_STATUS_OK);
     assert_eq!(ok.payload_len, 16);

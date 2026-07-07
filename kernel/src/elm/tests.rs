@@ -1,18 +1,23 @@
 use ktest::ktest;
 
+use alloc::vec::Vec;
+
 use elm_model::{
     ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
     ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
-    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_TODO, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_TODO_BACKEND, ElmCoreHealthRecord, ElmEbiArch,
-    ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit,
-    ElmId, ElmKind, ElmManifest, ElmMenuItemKind, ElmName, ElmNexusBindRequest,
-    ElmPortAccessPolicy, ElmProviderPortRegisterRequest, ElmProviderPortStatsHeader, ElmState,
-    ElmVersion, FlowDirection, FlowMode, state_code,
+    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_MGR_STATUS_INVALID,
+    ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_NEXUS_CONTRACT_LEN,
+    ELM_POLICY_BLOCK_PORT_TODO, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_TODO_BACKEND,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLoadStatus, ElmEbiMenuDecl,
+    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit, ElmId, ElmKind, ElmManifest,
+    ElmMenuItemKind, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrPolicyInfo, ElmMgrResponseHeader,
+    ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmPortAccessPolicy,
+    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
+    ElmState, ElmVersion, FlowDirection, FlowMode, state_code,
 };
 
 use super::core::{ELM_MGR_ID, ElmCore};
+use super::mgr_channel::dispatch_mgr_call_on_core;
 
 fn manifest(name: &str, kind: ElmKind) -> ElmManifest {
     ElmManifest::new(
@@ -77,6 +82,77 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
         bytes[offset + 6],
         bytes[offset + 7],
     ])
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn raw_mgr_call(kind: u32, flags: u32, reserved: u32, payload: &[u8]) -> Vec<u8> {
+    let header = ElmMgrCallHeader {
+        kind,
+        flags,
+        payload_len: payload.len() as u32,
+        reserved,
+    };
+    let mut out = Vec::new();
+    push_u32(&mut out, header.kind);
+    push_u32(&mut out, header.flags);
+    push_u32(&mut out, header.payload_len);
+    push_u32(&mut out, header.reserved);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn mgr_call(kind: ElmMgrCallKind, payload: &[u8]) -> Vec<u8> {
+    raw_mgr_call(kind as u32, 0, 0, payload)
+}
+
+fn provider_register_payload(request: &ElmProviderPortRegisterRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, request.owner_cell_id);
+    push_u32(&mut out, request.flags);
+    push_u32(&mut out, request.access_policy);
+    push_u32(&mut out, request.direction);
+    push_u32(&mut out, request.mode);
+    push_u16(&mut out, request.contract_len);
+    push_u16(&mut out, request.reserved0);
+    push_u32(&mut out, request.reserved1);
+    out.extend_from_slice(&request.contract);
+    out
+}
+
+fn nexus_bind_payload(request: &ElmNexusBindRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, request.cell_id);
+    push_u64(&mut out, request.port_id);
+    push_u32(&mut out, request.flags);
+    push_u16(&mut out, request.contract_len);
+    push_u16(&mut out, request.reserved);
+    out.extend_from_slice(&request.contract);
+    out
+}
+
+fn response_status(bytes: &[u8]) -> i32 {
+    read_i32(bytes, 0)
+}
+
+fn response_payload_len(bytes: &[u8]) -> usize {
+    read_u32(bytes, 4) as usize
+}
+
+fn response_payload(bytes: &[u8]) -> &[u8] {
+    let start = core::mem::size_of::<ElmMgrResponseHeader>();
+    let end = start + response_payload_len(bytes);
+    &bytes[start..end]
 }
 
 #[ktest]
@@ -196,4 +272,146 @@ fn elm_dynamic_provider_is_queryable_and_bind_preflight_is_todo() {
     assert_eq!(plan.allowed, 0);
     assert_eq!(plan.status, ELM_MGR_STATUS_TODO);
     assert_ne!(plan.blockers & ELM_POLICY_BLOCK_PORT_TODO, 0);
+}
+
+#[ktest]
+fn elm_mgr_channel_dispatches_core_queries_and_provider_flow() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+
+    let policy = dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::QueryPolicy, &[]));
+    assert_eq!(response_status(&policy), ELM_MGR_STATUS_OK);
+    assert_eq!(
+        response_payload_len(&policy),
+        core::mem::size_of::<ElmMgrPolicyInfo>()
+    );
+
+    let health = dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::QueryHealth, &[]));
+    assert_eq!(response_status(&health), ELM_MGR_STATUS_OK);
+    assert!(response_payload_len(&health) >= core::mem::size_of::<ElmCoreHealthHeader>());
+    let health_payload = response_payload(&health);
+    assert_eq!(read_i32(health_payload, 8), ELM_MGR_STATUS_OK);
+
+    let register = ElmProviderPortRegisterRequest::new(
+        ELM_MGR_ID.0,
+        "test.channel.provider@1",
+        ElmPortAccessPolicy::Public,
+        FlowDirection::Control,
+        FlowMode::Shared,
+        0,
+    );
+    let register_payload = provider_register_payload(&register);
+    let register_response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::RegisterProviderPort, &register_payload),
+    );
+    assert_eq!(response_status(&register_response), ELM_MGR_STATUS_OK);
+    assert_eq!(
+        response_payload_len(&register_response),
+        core::mem::size_of::<ElmProviderPortRegisterResponse>()
+    );
+    let register_response_payload = response_payload(&register_response);
+    assert_eq!(read_i32(register_response_payload, 16), ELM_MGR_STATUS_OK);
+    let port_id = read_u64(register_response_payload, 8);
+
+    let providers = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryProviderPorts, &[]),
+    );
+    assert_eq!(response_status(&providers), ELM_MGR_STATUS_OK);
+    let provider_payload = response_payload(&providers);
+    let header_size = core::mem::size_of::<ElmProviderPortStatsHeader>();
+    let record_size = read_u16(provider_payload, 2) as usize;
+    let record_count = read_u32(provider_payload, 4) as usize;
+    let mut found = false;
+    for index in 0..record_count {
+        let offset = header_size + index * record_size;
+        if read_u64(provider_payload, offset) != port_id {
+            continue;
+        }
+        found = true;
+        assert_eq!(read_u64(provider_payload, offset + 8), ELM_MGR_ID.0);
+        assert_eq!(
+            read_u16(provider_payload, offset + 42),
+            ELM_PROVIDER_FLAG_DYNAMIC | ELM_PROVIDER_FLAG_TODO_BACKEND
+        );
+    }
+    assert!(found);
+
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "test.channel.provider@1");
+    let bind_payload = nexus_bind_payload(&bind);
+    let plan = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::PreflightBind, &bind_payload),
+    );
+    assert_eq!(response_status(&plan), ELM_MGR_STATUS_OK);
+    assert_eq!(
+        response_payload_len(&plan),
+        core::mem::size_of::<ElmNexusBindPlanResponse>()
+    );
+    let plan_payload = response_payload(&plan);
+    assert_eq!(read_i32(plan_payload, 40), ELM_MGR_STATUS_TODO);
+    assert_eq!(read_u32(plan_payload, 44), 0);
+    assert_ne!(read_u64(plan_payload, 48) & ELM_POLICY_BLOCK_PORT_TODO, 0);
+}
+
+#[ktest]
+fn elm_mgr_channel_rejects_malformed_byte_requests() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+
+    let truncated = [0u8; 3];
+    let response = dispatch_mgr_call_on_core(&mut core, &truncated);
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let header_flags = raw_mgr_call(ElmMgrCallKind::QueryPolicy as u32, 1, 0, &[]);
+    let response = dispatch_mgr_call_on_core(&mut core, &header_flags);
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let header_reserved = raw_mgr_call(ElmMgrCallKind::QueryPolicy as u32, 0, 1, &[]);
+    let response = dispatch_mgr_call_on_core(&mut core, &header_reserved);
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let unsupported = raw_mgr_call(0xffff, 0, 0, &[]);
+    let response = dispatch_mgr_call_on_core(&mut core, &unsupported);
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_UNSUPPORTED);
+
+    let non_empty_query_payload = [1u8];
+    let response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryPolicy, &non_empty_query_payload),
+    );
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let register = ElmProviderPortRegisterRequest::new(
+        ELM_MGR_ID.0,
+        "test.invalid.provider@1",
+        ElmPortAccessPolicy::Public,
+        FlowDirection::Control,
+        FlowMode::Shared,
+        0,
+    );
+    let mut register_payload = provider_register_payload(&register);
+    register_payload[26] = 1;
+    let response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::RegisterProviderPort, &register_payload),
+    );
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let mut register_payload = provider_register_payload(&register);
+    register_payload[28] = 1;
+    let response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::RegisterProviderPort, &register_payload),
+    );
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let mut register_payload = provider_register_payload(&register);
+    register_payload[24..26].copy_from_slice(&((ELM_NEXUS_CONTRACT_LEN as u16) + 1).to_le_bytes());
+    let response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::RegisterProviderPort, &register_payload),
+    );
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
 }
