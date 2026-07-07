@@ -47,6 +47,7 @@ pub mod adapter;
 pub mod config;
 pub mod device;
 pub mod driver;
+pub mod elm;
 mod engine;
 pub mod error;
 pub mod interface;

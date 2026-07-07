@@ -161,6 +161,7 @@ pub enum ElmMgrCallKind {
     UnsubscribeEvent = 32,
     QueryEventSubscriptions = 33,
     ReadSubscribedEvents = 34,
+    QueryProviderSnapshot = 35,
 }
 
 impl ElmMgrCallKind {
@@ -200,6 +201,7 @@ impl ElmMgrCallKind {
             32 => Some(Self::UnsubscribeEvent),
             33 => Some(Self::QueryEventSubscriptions),
             34 => Some(Self::ReadSubscribedEvents),
+            35 => Some(Self::QueryProviderSnapshot),
             _ => None,
         }
     }
@@ -1033,6 +1035,71 @@ pub struct ElmProviderInvokeResponse {
 impl ElmProviderInvokeResponse {
     pub const fn new(reply: ElmReplyFrame) -> Self {
         Self { reply }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderSnapshotRequest {
+    pub port_id: u64,
+    pub binding_id: u64,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmProviderSnapshotRequest {
+    pub const fn by_port(port_id: u64) -> Self {
+        Self {
+            port_id,
+            binding_id: 0,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+
+    pub const fn by_binding(binding_id: u64) -> Self {
+        Self {
+            port_id: 0,
+            binding_id,
+            flags: 0,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProviderSnapshotHeader {
+    pub abi_version: u16,
+    pub header_size: u16,
+    pub status: i32,
+    pub port_id: u64,
+    pub binding_id: u64,
+    pub payload_len: u32,
+    pub record_count: u32,
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+impl ElmProviderSnapshotHeader {
+    pub const fn new(
+        status: i32,
+        port_id: u64,
+        binding_id: u64,
+        payload_len: u32,
+        record_count: u32,
+    ) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            header_size: core::mem::size_of::<Self>() as u16,
+            status,
+            port_id,
+            binding_id,
+            payload_len,
+            record_count,
+            flags: 0,
+            reserved: 0,
+        }
     }
 }
 

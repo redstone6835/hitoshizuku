@@ -1,4 +1,4 @@
-//! 能力织网模型。
+//! 枢纽连接层模型。
 
 use alloc::string::String;
 

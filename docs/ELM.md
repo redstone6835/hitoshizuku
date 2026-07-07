@@ -20,7 +20,7 @@ ELM 的基本原则：
 - ELM 之间可以同时存在父子、依赖、提供、拓展和能力绑定关系。
 - ELM 支持热插拔、热替换、暂停、恢复、故障隔离和回滚。
 
-当前设计走向是：ELM 不再被视为“内核模块加载器”，而是收敛为 **能力织网运行时**。内核单元不通过符号互相链接，而是通过带版本的流契约连接到织网端口。资源访问通过租约完成，生命周期变更通过预检和提交完成，运行时状态通过快照、事件和审计可观测。
+当前设计走向是：ELM 不再被视为“内核模块加载器”，而是收敛为 **枢纽连接层运行时**。内核单元不通过符号互相链接，而是通过带版本的流契约连接到枢纽端口。资源访问通过租约完成，生命周期变更通过预检和提交完成，运行时状态通过快照、事件和审计可观测。
 
 ## 2. 统一中文术语
 
@@ -29,13 +29,13 @@ ELM 的基本原则：
 | ELM Cell | 内核单元 | 一个可管理、可绑定、可拓展的 ELM 实例 |
 | elm-mgr | 单元管理器 | 启动期根管理单元，负责策略和用户可见管理 |
 | elm-mgr API Gateway | 单元 API 网关 | `elm-mgr` 对外公开管理 API、事件 API 和子系统 API 的统一入口 |
-| Nexus | 能力织网 | ELM 之间和内核能力之间的运行时连接网络 |
-| Nexus Port | 织网端口 | 能力织网中可绑定的能力入口或出口 |
-| Port Provider | 端口提供者 | 向能力织网注册端口并执行端口语义的内核或 ELM 实体 |
+| Nexus | 枢纽连接层 | ELM 之间和内核能力之间的运行时连接网络 |
+| Nexus Port | 枢纽端口 | 枢纽连接层中可绑定的能力入口或出口 |
+| Port Provider | 端口提供者 | 向枢纽连接层注册端口并执行端口语义的内核或 ELM 实体 |
 | Flow Contract | 流契约 | 描述一次能力流的输入、输出、错误、并发和背压语义 |
 | Intent | 能力意图 | 内核单元声明自己想消费、提供、拓展或观察的能力 |
 | Offer | 能力提供 | 内核单元声明自己能提供的能力 |
-| Binding | 能力绑定 | 一个能力意图与一个织网端口或能力提供之间的实际连接 |
+| Binding | 能力绑定 | 一个能力意图与一个枢纽端口或能力提供之间的实际连接 |
 | Binding Graph | 绑定图 | 父子、依赖、提供、拓展和能力绑定组成的运行图 |
 | Extension Point | 拓展点 | 内核单元显式开放的可拓展位置 |
 | Extension | 拓展项 | 挂接到某个拓展点的能力实现 |
@@ -94,7 +94,7 @@ ELM 的基本原则：
 普通 ELM 负责能力：
 
 - 声明能力意图、能力提供、依赖和拓展项。
-- 通过织网端口参与能力流。
+- 通过枢纽端口参与能力流。
 - 通过资源租约访问内核资源。
 - 遵守状态机、热插拔和故障隔离规则。
 - 不持有裸内核对象指针，不直接调用未声明的内核内部接口。
@@ -104,8 +104,8 @@ ELM 的基本原则：
 ELM 的运行模型由五个对象构成：
 
 - 内核单元：运行时可管理的最小实体，具有 `ElmId`、名称、类型、状态、切换代和 EBI 装载状态。
-- 织网端口：能力织网中的稳定连接点，具有 `PortId`、流契约、方向、模式和实现状态。
-- 能力绑定：把一个内核单元连接到一个织网端口，具有 `BindingId`、契约、切换代、活动状态和可选租约。
+- 枢纽端口：枢纽连接层中的稳定连接点，具有 `PortId`、流契约、方向、模式和实现状态。
+- 能力绑定：把一个内核单元连接到一个枢纽端口，具有 `BindingId`、契约、切换代、活动状态和可选租约。
 - 资源租约：把绑定后的资源引用收敛到可撤销对象，具有 `LeaseId`、所有者、类型、权限、状态、活跃引用数和切换代。
 - 事件记录：把单元、端口、绑定和租约变化变成固定布局事件，供管理工具和运行时端口读取。
 
@@ -143,24 +143,24 @@ ELM 的运行模型由五个对象构成：
 - `elm.mgr.api.registry@1`：`elm-mgr` 公开 API 注册表，描述当前可用的管理 API、事件 API、provider API 和未来子系统 API。
 - `elm.mgr.event.*@1`：`elm-mgr` 提供事件订阅、订阅查询、订阅读取和退订能力，每个订阅都有独立租约和游标。
 
-第一版同步调用帧固定内联载荷为 256 字节。调用帧只表达 `binding_id`、`call_id`、`opcode`、`flags` 和 payload，不携带指针，也不绑定文件格式。`mgr.action.invoke@1` 使用 `ElmActionInvokeRequest` 和 `ElmActionInvokeReply` 作为 payload ABI；动态 provider 只能作为声明进入能力织网，真实 ELM 原生执行器仍是 `TODO(elm)`。
+第一版同步调用帧固定内联载荷为 256 字节。调用帧只表达 `binding_id`、`call_id`、`opcode`、`flags` 和 payload，不携带指针，也不绑定文件格式。`mgr.action.invoke@1` 使用 `ElmActionInvokeRequest` 和 `ElmActionInvokeReply` 作为 payload ABI；动态 provider 只能作为声明进入枢纽连接层，真实 ELM 原生执行器仍是 `TODO(elm)`。
 
 异步 provider 队列复用同一个调用帧，不创造第二套 provider ABI。`SubmitProviderCall` 把 `ElmCallFrame` 包进 `ElmProviderAsyncSubmitRequest`，只额外描述超时、结果保留 TTL 和保留 flags。同步 `InvokeProvider` 仍保留，用于低延迟管理动作和兼容现有外部工具；异步路径用于需要背压、取消、超时和结果保留的 provider 调用。
 
-## 5. 能力织网
+## 5. 枢纽连接层
 
-ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交互都经过能力织网。
+ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交互都经过枢纽连接层。
 
 ```text
 内核单元
     声明能力意图
-        绑定织网端口
+        绑定枢纽端口
             获得资源租约
                 参与流契约
                     由端口提供者或事件反应器处理事件
 ```
 
-织网端口代表一种可组合能力。它可以表示设备事件、文件系统操作、网络包流、IRQ 事件、菜单项注册、配置变更或诊断输出。内核内部可以存在桥接层，但 ELM 看到的稳定边界永远是织网端口、流契约和资源租约。
+枢纽端口代表一种可组合能力。它可以表示设备事件、文件系统操作、网络包流、IRQ 事件、菜单项注册、配置变更或诊断输出。内核内部可以存在桥接层，但 ELM 看到的稳定边界永远是枢纽端口、流契约和资源租约。
 
 流契约格式：
 
@@ -191,7 +191,7 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
 
 当前实现先把方向和模式纳入端口描述，后续端口执行器必须把并发和背压纳入真实调度策略。
 
-## 6. 内建织网端口
+## 6. 内建枢纽端口
 
 | 端口 | 方向 | 模式 | 当前状态 | 设计语义 |
 | --- | --- | --- | --- | --- |
@@ -199,19 +199,34 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
 | `core.event@1` | Source | Broadcast | 已实现 | 单元按游标读取 ELM 拓扑和管理事件 |
 | `mgr.menu.item@1` | Sink | Ordered | 已实现 | 单元向 `elm-mgr` 注册菜单项 |
 | `mgr.action.invoke@1` | Control | Shared | 已实现第一版 | `elm-mgr` 内建管理动作调用入口，当前支持健康检查动作 |
-| `device.discovered@1` | Source | Broadcast | TODO(elm) | 设备发现事件流 |
-| `device.claim@1` | Control | Exclusive | TODO(elm) | 设备声明、抢占和释放控制 |
-| `irq.event@1` | Source | Shared | TODO(elm) | IRQ 事件分发 |
-| `dma.buffer@1` | Duplex | Shared | TODO(elm) | DMA 缓冲区申请、映射、同步和释放 |
-| `mmio.window@1` | Duplex | Shared | TODO(elm) | MMIO 窗口映射和访问租约 |
-| `io.block.submit@1` | Sink | Shared | TODO(elm) | 块 I/O 请求提交 |
-| `io.packet.rx@1` | Source | Pipeline | TODO(elm) | 网络包接收流 |
-| `io.packet.tx@1` | Sink | Pipeline | TODO(elm) | 网络包发送流 |
-| `vfs.lookup@1` | Control | Shared | TODO(elm) | VFS 路径查找控制面 |
-| `vfs.read@1` | Control | Shared | TODO(elm) | VFS 读控制面 |
-| `vfs.write@1` | Control | Shared | TODO(elm) | VFS 写控制面 |
+这些端口是 ELM 自有端口，不包含 VFS、设备、网络等子系统语义。后续完整 ELM 设计中，端口提供者也可以来自 ELM 本身：一个 ELM 可以声明新的能力提供，经过 `elm-mgr` 策略和 ELM Core 校验后，把新端口注册进枢纽连接层。这样设备类型、VFS 扩展点、网络处理链、诊断能力和子管理能力都不需要写死在核心中。
 
-这些端口不是最终能力集合，只是启动期内建端口。后续完整 ELM 设计中，端口提供者也可以来自 ELM 本身：一个 ELM 可以声明新的能力提供，经过 `elm-mgr` 策略和 ELM Core 校验后，把新端口注册进能力织网。这样设备类型、VFS 扩展点、网络处理链、诊断能力和子管理能力都不需要写死在核心中。
+### 启动期子系统 provider 规格
+
+子系统接口不再写入 `libs/elm::ports` 或 `kernel/src/elm/core.rs`。每个子系统在自己的 crate 内导出 `providers()` 规格表，ELM Core 只消费通用 `ElmKernelProviderSpec`：
+
+| 子系统位置 | 端口 | 方向 | 模式 | 当前状态 | 设计语义 |
+| --- | --- | --- | --- | --- | --- |
+| `general::dev::elm` | `device.discovered@1` | Source | Broadcast | 已实现 snapshot/query | 设备发现只读快照与查询 |
+| `general::dev::elm` | `device.claim@1` | Control | Exclusive | TODO(provider) | 设备声明、抢占和释放控制 |
+| `general::dev::elm` | `irq.event@1` | Source | Shared | TODO(provider) | IRQ 事件分发 |
+| `general::dev::elm` | `dma.buffer@1` | Duplex | Shared | TODO(provider) | DMA 缓冲区申请、映射、同步和释放 |
+| `general::dev::elm` | `mmio.window@1` | Duplex | Shared | TODO(provider) | MMIO 窗口映射和访问租约 |
+| `general::dev::elm` | `io.block.submit@1` | Sink | Shared | TODO(provider) | 块 I/O 请求提交 |
+| `net::elm` | `io.packet.rx@1` | Source | Pipeline | TODO(provider) | 网络包接收流 |
+| `net::elm` | `io.packet.tx@1` | Sink | Pipeline | TODO(provider) | 网络包发送流 |
+| `vfs::elm` | `vfs.lookup@1` | Control | Shared | TODO(provider) | VFS 路径查找控制面 |
+| `vfs::elm` | `vfs.read@1` | Control | Shared | TODO(provider) | VFS 读控制面 |
+| `vfs::elm` | `vfs.write@1` | Control | Shared | TODO(provider) | VFS 写控制面 |
+
+这些 provider specs 会进入 API 注册表、provider 端口快照、sysfs、绑定预检、同步/异步调用、统计、审计和撤销路径。`device.discovered@1` 已由设备层提供真实只读快照和同步 query；其余尚未接入真实语义的子系统回调返回 `UNSUPPORTED`，用于稳定完整链路。真实协议必须在对应子系统的 `elm.rs` 内补齐，不能回到 ELM Core 写特殊分支。
+
+`device.discovered@1` 的 provider payload 由 `general::dev::elm` 定义：
+
+- `ElmDeviceDiscoveryHeader`：`abi_version`、`record_entry_size`、`record_count`、`total_count`、`flags`、`generation`。
+- `ElmDeviceDiscoveryRecord`：`ordinal`、`class_len`、`name_len`、`flags`、固定长度 `class_name[16]` 和 `dev_name[64]`。
+- `ELM_DEV_DISCOVERY_OPCODE_QUERY = 1`：绑定该 provider 后可通过 `InvokeProvider` 读取同一类快照；当 256 字节调用帧载荷不足以容纳全部设备时，设备层在内部 header 中设置 `TRUNCATED`。
+- provider snapshot 路径使用管理通道 4096 字节 payload 上限；同步 query 路径使用 `ElmReplyFrame` 的 256 字节 payload 上限。
 
 动态端口访问策略：
 
@@ -233,7 +248,7 @@ ELM 关系分为五类：
 - 依赖关系：描述启动和运行前置条件。
 - 提供关系：描述当前单元对外提供的能力。
 - 拓展关系：描述当前单元挂接到另一个单元开放的拓展点。
-- 能力绑定关系：描述当前单元连接到某个织网端口。
+- 能力绑定关系：描述当前单元连接到某个枢纽端口。
 
 规则：
 
@@ -460,6 +475,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 | `UnsubscribeEvent` | 32 | 已实现 | 撤销事件订阅租约并移除订阅记录 |
 | `QueryEventSubscriptions` | 33 | 已实现 | 返回当前事件订阅快照 |
 | `ReadSubscribedEvents` | 34 | 已实现 | 按订阅 ID 和游标读取事件，`ADVANCE` flag 控制是否推进订阅游标 |
+| `QueryProviderSnapshot` | 35 | 已实现边界 | 按 port 或 binding 调用 provider snapshot 回调；无回调返回 provider 级 `UNSUPPORTED` |
 
 阻断位用于把策略拒绝转化为可观测原因：
 
@@ -564,7 +580,7 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 职责：
 
 - 声明模型层 crate 的模块边界。
-- 统一 re-export 控制面、EBI、错误、事件、绑定图、ID、租约、清单、菜单、管理通道、能力织网、端口、快照、状态机和拓扑模型。
+- 统一 re-export 控制面、EBI、错误、事件、绑定图、ID、租约、清单、菜单、管理通道、枢纽连接层、端口、快照、状态机和拓扑模型。
 - 保持 `libs/elm` 对内核实现无依赖，使模型层可以被内核、host 单测和未来用户态工具复用。
 
 设计细节：
@@ -638,7 +654,7 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 
 职责：
 
-- 定义能力织网同步调用帧。
+- 定义枢纽连接层同步调用帧。
 - 定义 256 字节固定内联 payload。
 - 定义调用状态码和调用 flags。
 
@@ -726,7 +742,7 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 
 设计细节：
 
-- 当前命令号已扩展到 34，覆盖动态 provider 注册、注销、查询、同步调用、异步提交、轮询、取消、队列统计、Core 健康查询、API 注册表和事件订阅。
+- 当前命令号已扩展到 35，覆盖动态 provider 注册、注销、查询、同步调用、异步提交、轮询、取消、队列统计、provider snapshot、Core 健康查询、API 注册表和事件订阅。
 - `ElmMgrPolicyInfo` 暴露支持动作、策略 flags、阻断位 mask 和审计容量。
 - `ElmLifecyclePlanResponse` 用 allowed、status、final_state 和 blockers 表示预检结果。
 - `ElmNexusBindRequest` 使用固定长度契约字段。
@@ -739,6 +755,7 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - `ElmProviderAsyncPollRequest` 和 `ElmProviderAsyncPollResponse` 按 ticket 查询状态；终态结果被 poll 后会从结果环移除，并释放对应 provider 租约活跃引用。
 - `ElmProviderAsyncCancelRequest` 和 `ElmProviderAsyncCancelResponse` 取消仍在队列中的任务；已经完成或已经过期的 ticket 不会被强行回滚。
 - `ElmProviderQueueStatsHeader` 和 `ElmProviderQueueStatsRecord` 暴露 queued、running、retained、queue_limit、max_in_flight、submitted、completed、canceled、expired 和 rejected。
+- `ElmProviderSnapshotRequest` 和 `ElmProviderSnapshotHeader` 暴露 provider 自有快照读取边界；管理通道成功不等于 provider 成功，provider 状态在 header 内表达。
 - `ElmProviderPortRecord` 和 `ElmProviderPortStatsRecord` 暴露 provider 绑定数量和调用统计。
 - provider 观测 flags 已稳定为 `DYNAMIC`、`KERNEL_BACKEND` 和 `TODO_BACKEND`，用于区分动态声明端口、内核内建后端和等待 ELM 原生执行器的 TODO 后端。
 - `PROVIDER_CALL_FAILED` 阻断位用于审计 provider transport 成功但 `ElmReplyFrame.status` 失败的业务调用。
@@ -763,13 +780,13 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - API 类型分为 Control、Snapshot、Event、Provider 和 Subsystem。
 - API flags 区分 Stable、TODO、Syscall、Sysfs 和 ProviderOps。
 - 事件订阅支持按事件类型、cell、port、binding 和 lease 过滤。
-- 事件订阅读取和 `core.event@1` 运行时端口读取是两条路径：前者是 `elm-mgr` API 网关能力，后者是能力织网端口能力。
+- 事件订阅读取和 `core.event@1` 运行时端口读取是两条路径：前者是 `elm-mgr` API 网关能力，后者是枢纽连接层端口能力。
 
 ### `nexus.rs`
 
 职责：
 
-- 定义能力织网模型。
+- 定义枢纽连接层模型。
 - 定义流契约、能力意图、能力提供、方向、模式、并发和背压。
 
 设计细节：
@@ -783,15 +800,29 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 
 职责：
 
-- 定义内建织网端口描述。
-- 为启动期 ELM Core 提供端口列表。
+- 定义 ELM 自有内建端口描述。
+- 为启动期 ELM Core 提供不含子系统语义的端口列表。
 
 设计细节：
 
-- 当前有 15 个内建端口。
-- 已实现端口只有 `core.log@1`、`core.event@1` 和 `mgr.menu.item@1`。
-- 其它端口保留契约和方向，绑定预检会返回 `PORT_TODO`。
+- 当前有 4 个 ELM 自有内建端口：`core.log@1`、`core.event@1`、`mgr.menu.item@1` 和 `mgr.action.invoke@1`。
+- VFS、设备、网络、IRQ、DMA、MMIO 等端口不在这里声明，必须由各子系统自己的 `elm.rs` 导出 provider specs。
 - 端口描述已包含访问策略和是否可调用标记。
+
+### `provider.rs`
+
+职责：
+
+- 定义 `ElmKernelProviderSpec` 通用规格。
+- 定义内核 provider 的 `invoke`、`snapshot` 和 `on_revoke` 回调形状。
+- 提供默认 unsupported 回调，用于尚未接入真实子系统逻辑的 TODO provider。
+
+设计细节：
+
+- `ElmKernelProviderSpec` 同时描述 API 注册表记录和 provider 端口记录。
+- 规格只保存静态字符串、方向、模式、访问策略和函数指针，不包含子系统私有状态。
+- 子系统 provider 可以使用完整 `ElmKernelProviderSpec::new` 接入真实 `invoke` / `snapshot` / `on_revoke` 回调；`device.discovered@1` 已使用该路径输出设备发现快照。
+- 尚未接入真实语义的子系统 provider 使用 `subsystem_todo` 构造规格，调用会经过完整 provider runtime 后返回 `UNSUPPORTED`。
 
 ### `snapshot.rs`
 
@@ -876,7 +907,8 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - `ProviderRuntime` 同时保存异步队列上限、并发上限、运行中数量、异步提交数、完成数、取消数、过期数和拒绝数。
 - `ElmMgrRuntime` 保存 `elm-mgr` 自身运行时状态，包括 API 注册表、API generation、事件订阅表和订阅 ID 分配器。
 - `EventSubscriptionRuntime` 保存订阅 ID、owner、事件租约、游标、过滤器、投递计数和丢弃计数。
-- `ProviderBackend::Kernel(kind)` 表示已接入的内核 provider 执行器；当前第一个真实执行器是 `MgrActionInvoke`。
+- `ProviderBackend::Kernel(kind)` 表示 ELM 自有内核 provider 执行器；当前第一个真实执行器是 `MgrActionInvoke`。
+- `ProviderBackend::KernelOps(spec)` 表示由某个子系统导出的通用 provider 规格，Core 只根据规格调用 `invoke` / `on_revoke`，不解释子系统语义。
 - 事件环和审计环容量当前均为 128。
 - 动态 cell ID 从 100 开始，避免与内建 ID 冲突。
 - 动态 port ID 从 100 开始，避免与内建端口冲突。
@@ -898,8 +930,8 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - provider owner detach 会阻断仍有活跃 binding 的 provider 端口。
 - owner detach 会移除 owner 持有的事件订阅记录，并通过租约撤销链路释放订阅资源。
 - `register_builtin_mgr_api()` 会注册启动期 `elm-mgr` API 集合：policy、health、menu、topology、bindings、audit、runtime ports、providers、provider stats、provider queue、api registry、event subscribe、event unsubscribe、event subscriptions 和 event read。
-- VFS、device、network、IRQ、DMA、MMIO 当前已经作为 TODO 子系统 API 进入 API 注册表；它们只表达未来可接入能力，不假装已有真实执行器。
-- `ElmMgrProviderOps` 是后续子系统接入 `elm-mgr` 的统一 Ops 形状，负责 descriptor、invoke、ready、snapshot 和 revoke 回调；当前作为设计边界保留。
+- VFS、device、network、IRQ、DMA、MMIO 等子系统 API 由各子系统自己的 `elm.rs` 导出 `ElmKernelProviderSpec`，启动期汇聚层只批量注册这些规格。
+- `ElmKernelProviderSpec` 是当前子系统接入 `elm-mgr` 的统一规格形状，负责 API 描述、端口描述、invoke、snapshot 和 revoke 回调；当前子系统回调先返回 `UNSUPPORTED`，但已经走完整 provider runtime 链路。
 - `health_bytes()` 会输出 graph、cells、ports、providers、bindings、runtime_ports、menu、events 和 audits 九类结构健康记录，并校验 provider 后端、动态端口和观测 flags 的一致性。
 - `health_bytes()` 同时校验事件订阅 owner、事件租约类型和订阅游标，避免订阅表与租约表脱节。
 - `sysfs_text()` 为 `/sys/kernel/elm` 提供只读文本渲染，覆盖 core、policy、health、menu、topology、ports、providers、bindings、events、audit 和 api。
@@ -993,6 +1025,19 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - 快照只包含固定布局结构。
 - 快照记录 EBI 状态和 native_code 标记，方便外部工具区分纯声明单元和等待原生装载器的单元。
 
+### `subsystems.rs`
+
+职责：
+
+- 汇聚各子系统自己导出的 `ElmKernelProviderSpec` 表。
+- 把规格表交给 ELM Core 注册为 API 记录和 provider 端口。
+
+设计细节：
+
+- 当前汇聚 `general::dev::elm`、`net::elm` 和 `vfs::elm`。
+- 本文件不能解释子系统语义，不能增加 VFS、设备、网络等特殊分支。
+- 新增子系统接入时，应先在该子系统 crate 内完成 `elm.rs` 规格表，再把规格表加入汇聚列表。
+
 ### `syscall.rs`
 
 职责：
@@ -1057,7 +1102,7 @@ ELM 的可观测性由四条路径组成：
 - `health`：结构化健康检查文本版本。
 - `menu`：`elm-mgr` 菜单项。
 - `topology`：父子、依赖、拓展点和拓展项。
-- `ports`：织网端口。
+- `ports`：枢纽端口。
 - `providers`：provider 后端、统计和异步队列摘要。
 - `bindings`：能力绑定。
 - `events`：事件环和事件订阅。
@@ -1079,7 +1124,7 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(QueryTopology)` 已返回父子、依赖、拓展点和拓展项组成的关系快照。
 - `MGR_CALL(PreflightLifecycle)` 已支持暂停、恢复、脱离和替换的策略预检。
 - `MGR_CALL(QueryAudit)` 已返回管理操作审计环，包括动作、状态、阻断位和最终状态。
-- `MGR_CALL(QueryNexusBindings)` 已返回能力织网绑定快照。
+- `MGR_CALL(QueryNexusBindings)` 已返回枢纽连接层绑定快照。
 - `MGR_CALL(PreflightBind/CommitBind)` 已支持内建菜单端口 `mgr.menu.item@1` 的绑定预检和提交。
 - `core.log@1` 和 `core.event@1` 已支持真实绑定、租约登记、查询快照和撤销。
 - `MGR_CALL(SubmitRuntimeLog)` 已支持通过 `core.log@1` 绑定提交固定长度日志 payload。
@@ -1087,9 +1132,10 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(QueryRuntimePorts)` 已返回运行时端口绑定统计，包括日志提交数、事件投递数和丢弃事件数。
 - `MGR_CALL(RegisterProviderPort/UnregisterProviderPort)` 已支持动态 provider 端口声明注册和注销；动态端口合约由运行时自有字符串保存，不再泄漏为静态字符串。
 - `MGR_CALL(QueryProviderPorts/QueryProviderStats)` 已返回 provider 端口、访问策略、绑定数量、调用次数、失败次数、撤销次数和 provider 观测 flags。
+- `MGR_CALL(QueryProviderSnapshot)` 已接入 `ElmKernelProviderSpec::snapshot` 回调；`device.discovered@1` 已通过该路径返回真实设备发现 payload，没有 snapshot 回调的 provider 会通过固定 header 返回 `UNSUPPORTED`，动态 ELM 原生 provider 在执行器接入前返回 `TODO(elm)`。
 - `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；`mgr.action.invoke@1` 已接入 kernel-backed 执行器，管理通道已覆盖健康动作调用和业务失败审计，动态 ELM 原生 provider 仍返回 `TODO(elm)`。
 - `MGR_CALL(SubmitProviderCall/PollProviderReply/CancelProviderCall/QueryProviderQueue)` 已形成真实异步队列闭环，支持 ticket、队列容量、超时、结果 TTL、取消、队列统计和租约 active ref 保护。
-- `MGR_CALL(QueryApiRegistry)` 已返回 `elm-mgr` API 注册表，覆盖已实现管理 API、事件 API、provider API 和 TODO 子系统 API。
+- `MGR_CALL(QueryApiRegistry)` 已返回 `elm-mgr` API 注册表，覆盖已实现管理 API、事件 API、provider API 和子系统导出的 provider specs。
 - `MGR_CALL(SubscribeEvent/UnsubscribeEvent/QueryEventSubscriptions/ReadSubscribedEvents)` 已形成事件订阅闭环，支持订阅租约、独立游标、过滤器、只读不推进和读取后推进两种模式。
 - `/sys/kernel/elm` 已提供只读文本观测面，覆盖 core、policy、health、menu、topology、ports、providers、bindings、events、audit 和 api。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event 和 audit 不变量破坏。
@@ -1111,7 +1157,7 @@ ELM 的可观测性由四条路径组成：
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项或忙碌租约的目标单元，避免破坏当前拓扑。
 - `ReplaceCell` 已保留稳定命令号，当前返回结构化预检结果并记录 `REPLACE_TODO` 审计。
-- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 的 Core 直调和 `MGR_CALL(InvokeProvider)` 字节路径、provider 业务失败审计、异步 provider 提交、完成、轮询、取消、超时、队列满、队列查询、API 注册表、事件订阅、订阅读取游标推进语义、菜单 EBI 等待生命周期执行器、测试执行器激活菜单 EBI、EKI Source 装载、EKI 声明式拓扑在执行器前不激活、测试执行器激活 EKI 声明式拓扑、hook failed 隔离、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
+- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 的 Core 直调和 `MGR_CALL(InvokeProvider)` 字节路径、provider snapshot 成功和无回调 `UNSUPPORTED` 路径、`device.discovered@1` 真实 snapshot/query 成功路径、provider 业务失败审计、异步 provider 提交、完成、轮询、取消、超时、队列满、队列查询、API 注册表、事件订阅、订阅读取游标推进语义、菜单 EBI 等待生命周期执行器、测试执行器激活菜单 EBI、EKI Source 装载、EKI 声明式拓扑在执行器前不激活、测试执行器激活 EKI 声明式拓扑、hook failed 隔离、原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
 
 ## 18. 运行期 smoke 测试链路
 
@@ -1126,7 +1172,7 @@ ELM 的可观测性由四条路径组成：
                     -> 菜单、策略、健康检查、API 注册表、事件订阅、能力绑定、provider 调用、审计、EKI 装载边界
 ```
 
-`elm-mgr` 本身是启动期内建 ELM。它在 `sched::boot_init()` 之后、用户态 init 进程启动之前完成初始化，地位类似用户态的 init 进程：后续所有动态 ELM 都挂在 `elm-mgr` 管理树下，所有外部管理工具都通过 `elm-mgr` 暴露的控制面进入 ELM Core。未来 VFS、调度、网络、设备等子系统提供给 ELM 的 API 也应注册为 `elm-mgr` 可发现、可绑定、可转发的能力织网端口，而不是为每个子系统新增私有 ELM syscall。
+`elm-mgr` 本身是启动期内建 ELM。它在 `sched::boot_init()` 之后、用户态 init 进程启动之前完成初始化，地位类似用户态的 init 进程：后续所有动态 ELM 都挂在 `elm-mgr` 管理树下，所有外部管理工具都通过 `elm-mgr` 暴露的控制面进入 ELM Core。未来 VFS、调度、网络、设备等子系统提供给 ELM 的 API 也应注册为 `elm-mgr` 可发现、可绑定、可转发的枢纽连接层端口，而不是为每个子系统新增私有 ELM syscall。
 
 仓库提供 `userland/elmctl-smoke/elmctl_smoke.c` 作为最小用户态 smoke 工具。该工具不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL`。工具会执行以下检查：
 
@@ -1136,7 +1182,10 @@ ELM 的可观测性由四条路径组成：
 - `QueryHealth`：确认 Core 结构化健康检查为 OK。
 - `QueryNexusBindings` / `CommitBind`：复用或创建 `elm-mgr -> mgr.action.invoke@1` 能力绑定。
 - `InvokeProvider`：通过 `ElmCallFrame` 调用健康检查 action provider。
-- `QueryApiRegistry`：确认 `elm-mgr` API 网关至少公开当前已知管理 API、事件 API、provider API 和 TODO 子系统 API。
+- `QueryProviderPorts` / `QueryProviderSnapshot`：确认子系统导出的 `device.discovered@1` provider 可发现，并能返回设备发现 payload。
+- `CommitBind` / `InvokeProvider`：绑定 `device.discovered@1` 后用 `ELM_DEV_DISCOVERY_OPCODE_QUERY` 读取同一类设备快照，证明子系统 provider 已具备真实成功路径。
+- `vfs.lookup@1` TODO 边界：确认 VFS provider 可发现、可绑定，但 snapshot 和 invoke 当前返回 provider 级 `UNSUPPORTED`，避免把尚未实现的 VFS 语义误判成成功。
+- `QueryApiRegistry`：确认 `elm-mgr` API 网关至少公开当前已知管理 API、事件 API、provider API 和子系统导出的 provider specs。
 - `SubscribeEvent` / `QueryEventSubscriptions`：为内建 `elm-mgr` 创建事件订阅租约，并确认订阅快照可读。
 - `LoadCell`：构造一个最小 EKI Source，经 `elm-mgr` 装载为 EBI 协议对象，预期停在 `Loaded + NativeCodeTodo`。
 - `DetachCell`：摘除上一步尚未激活的 EKI 元数据单元，确认元数据路径可清理。
@@ -1177,6 +1226,9 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 [elm-smoke] health query ok
 [elm-smoke] bind mgr action provider ok
 [elm-smoke] invoke health action ok
+[elm-smoke] device discovery payload ok
+[elm-smoke] device discovery provider ok
+[elm-smoke] vfs provider todo boundary ok
 [elm-smoke] api registry ok
 [elm-smoke] event subscribe ok
 [elm-smoke] load minimal EKI ok
@@ -1243,7 +1295,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 第四阶段：端口提供者体系。
 
 - 为每个端口提供者定义注册、预检、提交、撤销、静默化和统计接口。
-- 将设备发现、设备声明、IRQ、DMA、MMIO、块 I/O、网络包流和 VFS 控制面接入能力织网。
+- 将设备发现、设备声明、IRQ、DMA、MMIO、块 I/O、网络包流和 VFS 控制面接入枢纽连接层。
 - 支持 ELM 自身注册新端口类型，让设备类型和子系统拓展不写死在 Core 中。
 
 第五阶段：热替换和故障隔离。
@@ -1280,4 +1332,4 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 唯一允许的类比表述：
 
-> ELM 不采用传统动态内核模块的符号链接模型，而采用能力织网、流契约和资源租约模型。
+> ELM 不采用传统动态内核模块的符号链接模型，而采用枢纽连接层、流契约和资源租约模型。

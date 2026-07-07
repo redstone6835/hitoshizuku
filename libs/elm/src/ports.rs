@@ -1,4 +1,4 @@
-//! 内建织网端口描述。
+//! 内建枢纽端口描述。
 
 use crate::ids::{ELM_MGR_BUILTIN_ID, ElmId, PortId};
 use crate::nexus::{FlowDirection, FlowMode};
@@ -28,17 +28,6 @@ pub enum BuiltinPort {
     CoreEvent,
     MgrMenuItem,
     MgrActionInvoke,
-    DeviceDiscovered,
-    DeviceClaim,
-    IrqEvent,
-    DmaBuffer,
-    MmioWindow,
-    IoBlockSubmit,
-    IoPacketRx,
-    IoPacketTx,
-    VfsLookup,
-    VfsRead,
-    VfsWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +42,7 @@ pub struct PortDescriptor {
     pub implemented: bool,
 }
 
-pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
+pub const fn builtin_port_descriptors() -> [PortDescriptor; 4] {
     [
         desc(
             1,
@@ -91,105 +80,6 @@ pub const fn builtin_port_descriptors() -> [PortDescriptor; 15] {
             ElmPortAccessPolicy::Internal,
             true,
             true,
-        ),
-        desc(
-            5,
-            "device.discovered@1",
-            FlowDirection::Source,
-            FlowMode::Broadcast,
-            ElmPortAccessPolicy::Internal,
-            false,
-            false,
-        ),
-        desc(
-            6,
-            "device.claim@1",
-            FlowDirection::Control,
-            FlowMode::Exclusive,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            7,
-            "irq.event@1",
-            FlowDirection::Source,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            false,
-            false,
-        ),
-        desc(
-            8,
-            "dma.buffer@1",
-            FlowDirection::Duplex,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            9,
-            "mmio.window@1",
-            FlowDirection::Duplex,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            10,
-            "io.block.submit@1",
-            FlowDirection::Sink,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            11,
-            "io.packet.rx@1",
-            FlowDirection::Source,
-            FlowMode::Pipeline,
-            ElmPortAccessPolicy::Internal,
-            false,
-            false,
-        ),
-        desc(
-            12,
-            "io.packet.tx@1",
-            FlowDirection::Sink,
-            FlowMode::Pipeline,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            13,
-            "vfs.lookup@1",
-            FlowDirection::Control,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            14,
-            "vfs.read@1",
-            FlowDirection::Control,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
-        ),
-        desc(
-            15,
-            "vfs.write@1",
-            FlowDirection::Control,
-            FlowMode::Shared,
-            ElmPortAccessPolicy::Internal,
-            true,
-            false,
         ),
     ]
 }

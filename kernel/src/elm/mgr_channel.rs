@@ -10,7 +10,8 @@ use elm_model::{
     ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest, ElmNexusBindRequest,
     ElmNexusUnbindRequest, ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest,
     ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderPortRegisterRequest,
-    ElmProviderPortUnregisterRequest, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
+    ElmProviderPortUnregisterRequest, ElmProviderSnapshotRequest, ElmRuntimeEventRequest,
+    ElmRuntimeLogRequest,
 };
 
 use super::{core::ElmCore, executor, menu, with_core};
@@ -320,6 +321,15 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 Err(status) => response_only(response_header_from_status(status)),
             }
         }
+        ElmMgrCallKind::QueryProviderSnapshot => {
+            let Some(request) = read_provider_snapshot_request(call_payload(input, header)) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match core.provider_snapshot_bytes(request) {
+                Ok(payload) => response_with_payload(payload),
+                Err(status) => response_only(response_header_from_status(status)),
+            }
+        }
     }
 }
 
@@ -591,6 +601,22 @@ fn read_provider_invoke_request(payload: &[u8]) -> Option<ElmProviderInvokeReque
     }
     let frame = read_call_frame(payload)?;
     Some(ElmProviderInvokeRequest { frame })
+}
+
+fn read_provider_snapshot_request(payload: &[u8]) -> Option<ElmProviderSnapshotRequest> {
+    if payload.len() != core::mem::size_of::<ElmProviderSnapshotRequest>() {
+        return None;
+    }
+    let request = ElmProviderSnapshotRequest {
+        port_id: u64::from_le_bytes(payload[0..8].try_into().ok()?),
+        binding_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        flags: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+    };
+    if request.flags != 0 || request.reserved != 0 {
+        return None;
+    }
+    Some(request)
 }
 
 fn read_provider_async_submit_request(payload: &[u8]) -> Option<ElmProviderAsyncSubmitRequest> {

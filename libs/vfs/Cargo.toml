@@ -9,6 +9,7 @@ doctest = false
 bench = false
 
 [dependencies]
+elm_model = { package = "elm", path = "../elm" }
 errno = { path = "../errno" }
 mm = { path = "../mm" }
 net = { path = "../net" }

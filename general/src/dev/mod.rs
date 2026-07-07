@@ -20,6 +20,7 @@ pub mod control;
 pub mod cpu;
 pub mod dma;
 pub mod drivers;
+pub mod elm;
 pub mod enumerate;
 pub mod firmware_bus;
 pub mod flash;

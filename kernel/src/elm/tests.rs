@@ -1,5 +1,7 @@
 use ktest::ktest;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -11,19 +13,20 @@ use elm_model::{
     ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN,
     ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
     ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
-    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_LIFECYCLE_REASON_HOOK_FAILED,
-    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE,
-    ELM_MGR_RELATION_POINT_LEN, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_NEXUS_CONTRACT_LEN,
-    ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
-    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
-    ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
-    ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest, ElmCallFrame, ElmContext,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLifecycleHookKind,
-    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiRustHookSignature, ElmEbiSegment,
-    ElmEbiSegmentKind, ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit,
-    ElmEkiBlockKind, ElmError, ElmId, ElmKind, ElmLifecyclePhase, ElmManifest, ElmMenuItemKind,
+    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_KERNEL_PROVIDER_FLAG_NONE,
+    ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_PROVIDER_ASYNC,
+    ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_API_KIND_SUBSYSTEM, ELM_MGR_RELATION_POINT_LEN,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
+    ELM_MGR_STATUS_UNSUPPORTED, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_PORT_TODO,
+    ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_PROVIDER_ASYNC_QUEUE_LIMIT,
+    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
+    ElmActionInvokeRequest, ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord,
+    ElmEbiArch, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
+    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind,
+    ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind, ElmError, ElmId,
+    ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase, ElmManifest, ElmMenuItemKind,
     ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
     ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
@@ -32,7 +35,8 @@ use elm_model::{
     ElmProviderAsyncPollRequest, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
     ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRegisterRequest,
     ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderQueueStatsHeader,
-    ElmResult, ElmState, ElmVersion, FlowDirection, FlowMode, state_code,
+    ElmProviderSnapshotHeader, ElmProviderSnapshotRequest, ElmReplyFrame, ElmResult, ElmState,
+    ElmVersion, FlowDirection, FlowMode, state_code,
 };
 
 use super::core::{ELM_MGR_ID, ElmCore, ElmLifecycleExecutor};
@@ -125,6 +129,63 @@ impl ElmLifecycleExecutor for RecordingLifecycleExecutor {
         Ok(())
     }
 }
+
+static TEST_PROVIDER_REVOKES: AtomicUsize = AtomicUsize::new(0);
+
+fn test_revoke_provider_invoke(frame: ElmCallFrame) -> ElmReplyFrame {
+    ElmReplyFrame::empty(frame.binding_id, frame.call_id, ELM_CALL_STATUS_OK)
+}
+
+fn test_revoke_provider_on_revoke(
+    binding: Option<elm_model::BindingId>,
+    lease: Option<elm_model::LeaseId>,
+) {
+    if binding.is_some() && lease.is_some() {
+        TEST_PROVIDER_REVOKES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+static TEST_REVOKE_PROVIDERS: [ElmKernelProviderSpec; 1] = [ElmKernelProviderSpec::new(
+    "elm.test",
+    "revoke",
+    "elm.test.revoke@1",
+    ELM_MGR_API_KIND_SUBSYSTEM,
+    0,
+    0,
+    "test.revoke@1",
+    FlowDirection::Control,
+    FlowMode::Shared,
+    ElmPortAccessPolicy::Internal,
+    true,
+    ELM_KERNEL_PROVIDER_FLAG_NONE,
+    test_revoke_provider_invoke,
+    None,
+    Some(test_revoke_provider_on_revoke),
+)];
+
+fn test_snapshot_provider_snapshot(out: &mut [u8]) -> Result<usize, i32> {
+    let payload = b"snapshot-ok";
+    out[..payload.len()].copy_from_slice(payload);
+    Ok(payload.len())
+}
+
+static TEST_SNAPSHOT_PROVIDERS: [ElmKernelProviderSpec; 1] = [ElmKernelProviderSpec::new(
+    "elm.test",
+    "snapshot",
+    "elm.test.snapshot@1",
+    ELM_MGR_API_KIND_SUBSYSTEM,
+    0,
+    0,
+    "test.snapshot@1",
+    FlowDirection::Control,
+    FlowMode::Shared,
+    ElmPortAccessPolicy::Internal,
+    true,
+    ELM_KERNEL_PROVIDER_FLAG_NONE,
+    test_revoke_provider_invoke,
+    Some(test_snapshot_provider_snapshot),
+    None,
+)];
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
@@ -468,6 +529,15 @@ fn provider_invoke_payload(request: &ElmProviderInvokeRequest) -> Vec<u8> {
     out
 }
 
+fn provider_snapshot_payload(request: &ElmProviderSnapshotRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, request.port_id);
+    push_u64(&mut out, request.binding_id);
+    push_u32(&mut out, request.flags);
+    push_u32(&mut out, request.reserved);
+    out
+}
+
 fn event_subscribe_payload(request: &ElmMgrEventSubscribeRequest) -> Vec<u8> {
     let mut out = Vec::new();
     push_u64(&mut out, request.owner_cell_id);
@@ -577,6 +647,44 @@ fn bind_mgr_action_provider(core: &mut ElmCore) -> (u64, ElmNexusBindPlanRespons
     assert_eq!(response.allowed, 1);
     assert_eq!(response.status, ELM_MGR_STATUS_OK);
     (action.0, response)
+}
+
+fn provider_port_id_by_contract(core: &mut ElmCore, contract: &str) -> Option<u64> {
+    let bytes = core.provider_ports_bytes();
+    let header_size = core::mem::size_of::<ElmProviderPortStatsHeader>();
+    let record_size = read_u16(&bytes, 2) as usize;
+    let record_count = read_u32(&bytes, 4) as usize;
+    let contract_offset = record_size.saturating_sub(ELM_NEXUS_CONTRACT_LEN);
+    for index in 0..record_count {
+        let offset = header_size + index * record_size;
+        let contract_len = read_u16(&bytes, offset + 40) as usize;
+        if contract_len == contract.len()
+            && &bytes[offset + contract_offset..offset + contract_offset + contract_len]
+                == contract.as_bytes()
+        {
+            return Some(read_u64(&bytes, offset));
+        }
+    }
+    None
+}
+
+fn provider_stats_by_port(core: &mut ElmCore, port_id: u64) -> Option<(u32, u64, u64, u64)> {
+    let bytes = core.provider_stats_bytes();
+    let header_size = core::mem::size_of::<ElmProviderPortStatsHeader>();
+    let record_size = read_u16(&bytes, 2) as usize;
+    let record_count = read_u32(&bytes, 4) as usize;
+    for index in 0..record_count {
+        let offset = header_size + index * record_size;
+        if read_u64(&bytes, offset) == port_id {
+            return Some((
+                read_u32(&bytes, offset + 20),
+                read_u64(&bytes, offset + 24),
+                read_u64(&bytes, offset + 32),
+                read_u64(&bytes, offset + 40),
+            ));
+        }
+    }
+    None
 }
 
 #[ktest]
@@ -1378,6 +1486,211 @@ fn elm_dynamic_provider_is_queryable_and_bind_preflight_is_todo() {
 }
 
 #[ktest]
+fn elm_subsystem_provider_specs_are_registered_and_invokable() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    assert_eq!(
+        super::subsystems::register_builtin_provider_specs(&mut core).unwrap(),
+        11
+    );
+    assert_eq!(
+        super::subsystems::register_builtin_provider_specs(&mut core).unwrap(),
+        0
+    );
+
+    let port_id = provider_port_id_by_contract(&mut core, "vfs.lookup@1").unwrap();
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_ne!(stats.0 & u32::from(ELM_PROVIDER_FLAG_KERNEL_BACKEND), 0);
+
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "vfs.lookup@1");
+    let plan = core.preflight_bind(bind);
+    assert_eq!(plan.allowed, 1);
+    assert_eq!(plan.status, ELM_MGR_STATUS_OK);
+
+    let bind_response = core.commit_bind(bind);
+    assert_eq!(bind_response.allowed, 1);
+    assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
+
+    let frame = ElmCallFrame::empty(bind_response.binding_id, 77, 0);
+    let response = core
+        .invoke_provider(ElmProviderInvokeRequest::new(frame))
+        .unwrap();
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_UNSUPPORTED);
+
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_eq!(stats.1, 0);
+    assert_eq!(stats.2, 1);
+    assert_eq!(stats.3, 0);
+
+    let unbind = core.commit_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
+    assert_eq!(unbind.status, ELM_MGR_STATUS_OK);
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_eq!(stats.3, 1);
+}
+
+#[ktest]
+fn elm_device_discovery_provider_returns_real_snapshot_and_query_reply() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    super::subsystems::register_builtin_provider_specs(&mut core).unwrap();
+
+    let port_id = provider_port_id_by_contract(&mut core, "device.discovered@1").unwrap();
+    let bytes = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port(port_id))
+        .unwrap();
+    assert_eq!(read_i32(&bytes, 4), ELM_MGR_STATUS_OK);
+    assert_eq!(read_u64(&bytes, 8), port_id);
+
+    let outer_header = core::mem::size_of::<ElmProviderSnapshotHeader>();
+    let payload_len = read_u32(&bytes, 24) as usize;
+    assert_eq!(bytes.len(), outer_header + payload_len);
+    assert!(payload_len >= core::mem::size_of::<general::dev::elm::ElmDeviceDiscoveryHeader>());
+
+    let payload = &bytes[outer_header..];
+    let record_size = read_u16(payload, 2) as usize;
+    let record_count = read_u32(payload, 4) as usize;
+    let total_count = read_u32(payload, 8) as usize;
+    assert_eq!(
+        record_size,
+        core::mem::size_of::<general::dev::elm::ElmDeviceDiscoveryRecord>()
+    );
+    assert!(record_count <= total_count);
+    assert_eq!(
+        payload_len,
+        core::mem::size_of::<general::dev::elm::ElmDeviceDiscoveryHeader>()
+            + record_count * record_size
+    );
+    for index in 0..record_count {
+        let offset = core::mem::size_of::<general::dev::elm::ElmDeviceDiscoveryHeader>()
+            + index * record_size;
+        assert_eq!(read_u64(payload, offset), index as u64 + 1);
+        assert!(
+            read_u16(payload, offset + 8) as usize
+                <= general::dev::elm::ELM_DEV_DISCOVERY_CLASS_LEN
+        );
+        assert!(
+            read_u16(payload, offset + 10) as usize
+                <= general::dev::elm::ELM_DEV_DISCOVERY_NAME_LEN
+        );
+    }
+
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "device.discovered@1");
+    let bind_response = core.commit_bind(bind);
+    assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
+    assert_eq!(bind_response.allowed, 1);
+
+    let frame = ElmCallFrame::empty(
+        bind_response.binding_id,
+        88,
+        general::dev::elm::ELM_DEV_DISCOVERY_OPCODE_QUERY,
+    );
+    let response = core
+        .invoke_provider(ElmProviderInvokeRequest::new(frame))
+        .unwrap();
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_OK);
+    assert!(
+        response.reply.payload_len as usize
+            >= core::mem::size_of::<general::dev::elm::ElmDeviceDiscoveryHeader>()
+    );
+    assert_eq!(
+        read_u16(&response.reply.payload, 2) as usize,
+        core::mem::size_of::<general::dev::elm::ElmDeviceDiscoveryRecord>()
+    );
+
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_eq!(stats.1, 2);
+    assert_eq!(stats.2, 0);
+}
+
+#[ktest]
+fn elm_kernel_provider_spec_revoke_callback_runs_on_unbind() {
+    TEST_PROVIDER_REVOKES.store(0, Ordering::Relaxed);
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    assert_eq!(
+        core.register_kernel_provider_specs(&TEST_REVOKE_PROVIDERS)
+            .unwrap(),
+        1
+    );
+
+    let port_id = provider_port_id_by_contract(&mut core, "test.revoke@1").unwrap();
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "test.revoke@1");
+    let bind_response = core.commit_bind(bind);
+    assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
+
+    let unbind = core.commit_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
+    assert_eq!(unbind.status, ELM_MGR_STATUS_OK);
+    assert_eq!(TEST_PROVIDER_REVOKES.load(Ordering::Relaxed), 1);
+}
+
+#[ktest]
+fn elm_kernel_provider_spec_snapshot_callback_is_routed() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    assert_eq!(
+        core.register_kernel_provider_specs(&TEST_SNAPSHOT_PROVIDERS)
+            .unwrap(),
+        1
+    );
+
+    let port_id = provider_port_id_by_contract(&mut core, "test.snapshot@1").unwrap();
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "test.snapshot@1");
+    let bind_response = core.commit_bind(bind);
+    assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
+
+    let bytes = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_binding(
+            bind_response.binding_id,
+        ))
+        .unwrap();
+    assert_eq!(read_i32(&bytes, 4), ELM_MGR_STATUS_OK);
+    assert_eq!(read_u64(&bytes, 8), port_id);
+    assert_eq!(read_u64(&bytes, 16), bind_response.binding_id);
+    assert_eq!(read_u32(&bytes, 24), "snapshot-ok".len() as u32);
+    assert_eq!(
+        &bytes[core::mem::size_of::<ElmProviderSnapshotHeader>()..],
+        b"snapshot-ok"
+    );
+
+    let bad = ElmProviderSnapshotRequest {
+        port_id: port_id + 1,
+        binding_id: bind_response.binding_id,
+        flags: 0,
+        reserved: 0,
+    };
+    assert_eq!(
+        core.provider_snapshot_bytes(bad).unwrap_err(),
+        ELM_MGR_STATUS_INVALID
+    );
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_eq!(stats.1, 1);
+    assert_eq!(stats.2, 0);
+}
+
+#[ktest]
+fn elm_provider_snapshot_without_callback_returns_provider_status() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    super::subsystems::register_builtin_provider_specs(&mut core).unwrap();
+
+    let port_id = provider_port_id_by_contract(&mut core, "vfs.lookup@1").unwrap();
+    let bytes = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port(port_id))
+        .unwrap();
+    assert_eq!(
+        bytes.len(),
+        core::mem::size_of::<ElmProviderSnapshotHeader>()
+    );
+    assert_eq!(read_i32(&bytes, 4), ELM_MGR_STATUS_UNSUPPORTED);
+    assert_eq!(read_u64(&bytes, 8), port_id);
+    assert_eq!(read_u32(&bytes, 24), 0);
+
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_eq!(stats.1, 0);
+    assert_eq!(stats.2, 1);
+}
+
+#[ktest]
 fn elm_mgr_channel_dispatches_core_queries_and_provider_flow() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
@@ -1532,6 +1845,21 @@ fn elm_mgr_channel_dispatches_core_queries_and_provider_flow() {
     }
     assert!(found);
 
+    let snapshot_payload = provider_snapshot_payload(&ElmProviderSnapshotRequest::by_port(port_id));
+    let snapshot_response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryProviderSnapshot, &snapshot_payload),
+    );
+    assert_eq!(response_status(&snapshot_response), ELM_MGR_STATUS_OK);
+    let snapshot_response_payload = response_payload(&snapshot_response);
+    assert_eq!(
+        snapshot_response_payload.len(),
+        core::mem::size_of::<ElmProviderSnapshotHeader>()
+    );
+    assert_eq!(read_i32(snapshot_response_payload, 4), ELM_MGR_STATUS_TODO);
+    assert_eq!(read_u64(snapshot_response_payload, 8), port_id);
+    assert_eq!(read_u32(snapshot_response_payload, 24), 0);
+
     let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "test.channel.provider@1");
     let bind_payload = nexus_bind_payload(&bind);
     let plan = dispatch_mgr_call_on_core(
@@ -1630,6 +1958,7 @@ fn elm_mgr_channel_dispatches_async_provider_queue_flow() {
 fn elm_mgr_channel_exposes_mgr_runtime_api_and_event_subscriptions() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
+    super::subsystems::register_builtin_provider_specs(&mut core).unwrap();
 
     let api =
         dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::QueryApiRegistry, &[]));

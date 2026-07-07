@@ -51,13 +51,13 @@ use crate::{
     ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRecord,
     ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
     ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader,
-    ElmProviderQueueStatsRecord, ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse,
-    ElmRuntimeLogRequest, ElmRuntimeLogResponse, ElmRuntimePortStatsHeader,
-    ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState, ElmVersion, FlowContract,
-    FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights,
-    LeaseState, PortId, ResourceLease, TopologyEventKind, builtin_port_descriptors,
-    first_lifecycle_reason, parse_eki_ebi_unit, planned_final_state, state_code,
-    status_from_blockers,
+    ElmProviderQueueStatsRecord, ElmProviderSnapshotHeader, ElmProviderSnapshotRequest,
+    ElmReplyFrame, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
+    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmSnapshotHeader,
+    ElmState, ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId, LeaseKind,
+    LeaseRegistry, LeaseRights, LeaseState, PortId, ResourceLease, TopologyEventKind,
+    builtin_port_descriptors, first_lifecycle_reason, parse_eki_ebi_unit, planned_final_state,
+    state_code, status_from_blockers,
 };
 
 fn manifest(name: &str) -> ElmManifest {
@@ -736,8 +736,9 @@ fn snapshot_header_uses_fixed_entry_sizes() {
 }
 
 #[test]
-fn builtin_ports_include_mgr_menu_and_todo_ports() {
+fn builtin_ports_include_only_elm_owned_ports() {
     let ports = builtin_port_descriptors();
+    assert_eq!(ports.len(), 4);
     assert!(ports.iter().any(|port| {
         port.contract == "core.log@1" && port.id == crate::PortId(1) && port.implemented
     }));
@@ -752,7 +753,43 @@ fn builtin_ports_include_mgr_menu_and_todo_ports() {
             && port.implemented
             && port.invokable
     }));
-    assert!(ports.iter().any(|port| !port.implemented));
+    assert!(ports.iter().all(|port| port.implemented));
+    assert!(
+        !ports
+            .iter()
+            .any(|port| port.contract == "device.discovered@1")
+    );
+}
+
+#[test]
+fn kernel_provider_spec_builds_api_and_unsupported_reply() {
+    let spec = crate::ElmKernelProviderSpec::subsystem_todo(
+        "elm.test",
+        "provider",
+        "elm.test.provider@1",
+        "test.provider@1",
+        FlowDirection::Control,
+        FlowMode::Shared,
+        ElmPortAccessPolicy::Internal,
+        true,
+    );
+    let api = spec.api_descriptor(100, ELM_MGR_BUILTIN_ID);
+    assert_eq!(api.id, 100);
+    assert_eq!(api.owner_cell_id, ELM_MGR_BUILTIN_ID.0);
+    assert_ne!(api.flags & crate::ELM_MGR_API_FLAG_PROVIDER_OPS, 0);
+    assert_ne!(api.flags & crate::ELM_MGR_API_FLAG_TODO, 0);
+
+    let port = spec.port_descriptor(crate::PortId(100), ELM_MGR_BUILTIN_ID);
+    assert_eq!(port.contract, "test.provider@1");
+    assert_eq!(port.owner, Some(ELM_MGR_BUILTIN_ID));
+    assert!(port.implemented);
+    assert!(port.invokable);
+
+    let frame = ElmCallFrame::empty(7, 9, 0);
+    let reply = (spec.invoke)(frame);
+    assert_eq!(reply.binding_id, 7);
+    assert_eq!(reply.call_id, 9);
+    assert_eq!(reply.status, crate::ELM_CALL_STATUS_UNSUPPORTED);
 }
 
 #[test]
@@ -1144,6 +1181,10 @@ fn provider_port_abi_records_are_fixed_layout() {
         ElmMgrCallKind::from_raw(25),
         Some(ElmMgrCallKind::QueryHealth)
     );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(35),
+        Some(ElmMgrCallKind::QueryProviderSnapshot)
+    );
     assert_eq!(ELM_PROVIDER_FLAG_DYNAMIC, 1);
     assert_eq!(ELM_PROVIDER_FLAG_KERNEL_BACKEND, 2);
     assert_eq!(ELM_PROVIDER_FLAG_TODO_BACKEND, 4);
@@ -1188,6 +1229,19 @@ fn provider_port_abi_records_are_fixed_layout() {
         ElmProviderInvokeResponse::new(ElmReplyFrame::new(7, 1, ELM_MGR_STATUS_OK, b"abc"));
     assert_eq!(invoke_response.reply.status, ELM_MGR_STATUS_OK);
     assert_eq!(core::mem::size_of::<ElmProviderInvokeResponse>(), 288);
+
+    let snapshot_request = ElmProviderSnapshotRequest::by_binding(7);
+    assert_eq!(snapshot_request.binding_id, 7);
+    assert_eq!(snapshot_request.port_id, 0);
+    assert_eq!(core::mem::size_of::<ElmProviderSnapshotRequest>(), 24);
+
+    let snapshot_header = ElmProviderSnapshotHeader::new(ELM_MGR_STATUS_OK, 100, 7, 8, 1);
+    assert_eq!(snapshot_header.status, ELM_MGR_STATUS_OK);
+    assert_eq!(snapshot_header.port_id, 100);
+    assert_eq!(snapshot_header.binding_id, 7);
+    assert_eq!(snapshot_header.payload_len, 8);
+    assert_eq!(snapshot_header.record_count, 1);
+    assert_eq!(core::mem::size_of::<ElmProviderSnapshotHeader>(), 40);
 
     assert_eq!(
         ElmProviderAsyncState::from_raw(1),

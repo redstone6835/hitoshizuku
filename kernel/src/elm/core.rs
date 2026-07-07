@@ -19,12 +19,12 @@ use elm_model::{
     ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NONE,
     ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND,
     ELM_MGR_ACTION_EVENT_READ, ELM_MGR_ACTION_EVENT_SUBSCRIBE, ELM_MGR_ACTION_EVENT_UNSUBSCRIBE,
-    ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE,
+    ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_QUERY,
     ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
     ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
-    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_STATUS_BUSY,
-    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
-    ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
+    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_PAYLOAD,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
+    ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
     ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
     ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
     ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
@@ -54,19 +54,19 @@ use elm_model::{
     ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
     ElmProviderPortRecord, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
     ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
-    ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord, ElmReplyFrame, ElmResult,
-    ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord, ElmProviderSnapshotHeader,
+    ElmProviderSnapshotRequest, ElmReplyFrame, ElmResult, ElmRuntimeEventRequest,
+    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
     ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState, ElmVersion, FlowContract,
     FlowDirection, FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights,
     NexusOffer, PortId, ResourceLease, TopologyEventKind, builtin_port_descriptors,
     first_lifecycle_reason, planned_final_state, state_code, status_from_blockers,
 };
 use elm_model::{
-    ELM_MGR_API_FLAG_PROVIDER_OPS, ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_SYSCALL,
-    ELM_MGR_API_FLAG_SYSFS, ELM_MGR_API_FLAG_TODO, ELM_MGR_API_KIND_EVENT,
-    ELM_MGR_API_KIND_PROVIDER, ELM_MGR_API_KIND_SNAPSHOT, ELM_MGR_API_KIND_SUBSYSTEM,
+    ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_SYSCALL, ELM_MGR_API_FLAG_SYSFS,
+    ELM_MGR_API_KIND_EVENT, ELM_MGR_API_KIND_PROVIDER, ELM_MGR_API_KIND_SNAPSHOT,
     ELM_MGR_EVENT_READ_ABSOLUTE_MAX_RECORDS, ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS,
-    ELM_MGR_EVENT_READ_FLAG_ADVANCE,
+    ELM_MGR_EVENT_READ_FLAG_ADVANCE, ElmKernelProviderSpec,
 };
 use sched::sync::Spinlock;
 
@@ -84,6 +84,7 @@ const ELM_MGR_MENU_CONTRACT: &str = "mgr.menu.item@1";
 const ELM_MGR_ACTION_CONTRACT: &str = "mgr.action.invoke@1";
 const FIRST_DYNAMIC_CELL_ID: u64 = 100;
 const FIRST_DYNAMIC_PORT_ID: u64 = 100;
+const FIRST_KERNEL_PROVIDER_API_ID: u64 = 100;
 const EVENT_RING_LIMIT: usize = 128;
 const AUDIT_RING_LIMIT: usize = 128;
 const FIRST_PROVIDER_TICKET_ID: u64 = 1;
@@ -132,9 +133,10 @@ struct RuntimePortBinding {
     dropped_events: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 enum ProviderBackend {
     Kernel(KernelProviderKind),
+    KernelOps(&'static ElmKernelProviderSpec),
     ElmNativeTodo,
 }
 
@@ -171,7 +173,9 @@ impl ProviderRuntime {
             flags |= ELM_PROVIDER_FLAG_DYNAMIC;
         }
         match self.backend {
-            ProviderBackend::Kernel(_) => flags |= ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+            ProviderBackend::Kernel(_) | ProviderBackend::KernelOps(_) => {
+                flags |= ELM_PROVIDER_FLAG_KERNEL_BACKEND
+            }
             ProviderBackend::ElmNativeTodo => flags |= ELM_PROVIDER_FLAG_TODO_BACKEND,
         }
         flags
@@ -303,6 +307,7 @@ struct ElmMgrRuntime {
     api_generation: Generation,
     event_subscriptions: Vec<EventSubscriptionRuntime>,
     next_event_subscription_id: u64,
+    next_kernel_provider_api_id: u64,
 }
 
 impl ElmMgrRuntime {
@@ -312,6 +317,7 @@ impl ElmMgrRuntime {
             api_generation: Generation::FIRST,
             event_subscriptions: Vec::new(),
             next_event_subscription_id: FIRST_EVENT_SUBSCRIPTION_ID,
+            next_kernel_provider_api_id: FIRST_KERNEL_PROVIDER_API_ID,
         }
     }
 
@@ -332,6 +338,15 @@ impl ElmMgrRuntime {
         self.next_event_subscription_id = self.next_event_subscription_id.saturating_add(1);
         if self.next_event_subscription_id == 0 {
             self.next_event_subscription_id = FIRST_EVENT_SUBSCRIPTION_ID;
+        }
+        id
+    }
+
+    fn alloc_kernel_provider_api_id(&mut self) -> u64 {
+        let id = self.next_kernel_provider_api_id;
+        self.next_kernel_provider_api_id = self.next_kernel_provider_api_id.saturating_add(1);
+        if self.next_kernel_provider_api_id == 0 {
+            self.next_kernel_provider_api_id = FIRST_KERNEL_PROVIDER_API_ID;
         }
         id
     }
@@ -936,6 +951,99 @@ impl ElmCore {
         out
     }
 
+    pub fn provider_snapshot_bytes(
+        &mut self,
+        request: ElmProviderSnapshotRequest,
+    ) -> Result<Vec<u8>, i32> {
+        if request.flags != 0
+            || request.reserved != 0
+            || (request.port_id == 0 && request.binding_id == 0)
+        {
+            return Err(ELM_MGR_STATUS_INVALID);
+        }
+
+        let binding = if request.binding_id == 0 {
+            None
+        } else {
+            let edge = self
+                .graph
+                .capability_binding(BindingId(request.binding_id))
+                .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
+            if !edge.active {
+                return Err(ELM_MGR_STATUS_INVALID);
+            }
+            Some(edge.clone())
+        };
+        let port = if request.port_id == 0 {
+            binding
+                .as_ref()
+                .map(|edge| edge.port)
+                .ok_or(ELM_MGR_STATUS_INVALID)?
+        } else {
+            let port = PortId(request.port_id);
+            if binding.as_ref().is_some_and(|edge| edge.port != port) {
+                return Err(ELM_MGR_STATUS_INVALID);
+            }
+            port
+        };
+        let Some(provider_index) = self.provider_index(port) else {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        };
+
+        let audit_cell = binding
+            .as_ref()
+            .map(|edge| edge.consumer)
+            .or(self.providers[provider_index].owner)
+            .unwrap_or(ElmId(0));
+        let backend = self.providers[provider_index].backend;
+        let capacity =
+            ELM_MGR_MAX_PAYLOAD.saturating_sub(core::mem::size_of::<ElmProviderSnapshotHeader>());
+        let mut payload = Vec::new();
+        payload.resize(capacity, 0);
+
+        let (status, payload_len) = match backend {
+            ProviderBackend::KernelOps(spec) => match spec.snapshot {
+                Some(snapshot) => match snapshot(&mut payload) {
+                    Ok(len) if len <= capacity => (ELM_MGR_STATUS_OK, len),
+                    Ok(_) => (ELM_MGR_STATUS_INVALID, 0),
+                    Err(status) => (status, 0),
+                },
+                None => (ELM_MGR_STATUS_UNSUPPORTED, 0),
+            },
+            ProviderBackend::ElmNativeTodo => (ELM_MGR_STATUS_TODO, 0),
+            ProviderBackend::Kernel(_) => (ELM_MGR_STATUS_UNSUPPORTED, 0),
+        };
+        payload.truncate(payload_len);
+
+        if status == ELM_MGR_STATUS_OK {
+            self.providers[provider_index].calls =
+                self.providers[provider_index].calls.saturating_add(1);
+        } else {
+            self.providers[provider_index].failed_calls = self.providers[provider_index]
+                .failed_calls
+                .saturating_add(1);
+        }
+        self.record_audit(
+            ELM_MGR_ACTION_PROVIDER_QUERY,
+            audit_cell,
+            status,
+            provider_snapshot_blockers(status),
+            self.cell_state(audit_cell).map(state_code).unwrap_or(0),
+        );
+
+        let header = ElmProviderSnapshotHeader::new(
+            status,
+            port.0,
+            request.binding_id,
+            payload.len() as u32,
+            0,
+        );
+        let mut out = Vec::new();
+        push_plain(&mut out, &header);
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+
     pub fn provider_queue_bytes(&mut self, now_ns: u64) -> Vec<u8> {
         self.cleanup_provider_results_at(now_ns);
         self.expire_provider_jobs_at(now_ns);
@@ -1469,6 +1577,7 @@ impl ElmCore {
         let backend = self.providers[provider_index].backend;
         let reply = match backend {
             ProviderBackend::Kernel(kind) => self.invoke_kernel_provider(kind, &edge, frame),
+            ProviderBackend::KernelOps(spec) => Ok((spec.invoke)(frame)),
             ProviderBackend::ElmNativeTodo => {
                 self.providers[provider_index].failed_calls = self.providers[provider_index]
                     .failed_calls
@@ -2058,7 +2167,7 @@ impl ElmCore {
 
         self.remove_owned_binding(edge.consumer, edge.id);
         self.remove_runtime_binding(edge.id);
-        self.note_provider_revoke(edge.port);
+        self.note_provider_revoke(&edge);
         let removed_menu_items = if edge.port == ELM_MGR_MENU_PORT_ID {
             self.remove_menu_items_owned_by(edge.consumer)
         } else {
@@ -2587,7 +2696,7 @@ impl ElmCore {
         let removed_bindings = self.take_owned_bindings(id);
         for binding in removed_bindings {
             if let Some(edge) = self.graph.capability_binding(binding).cloned() {
-                self.note_provider_revoke(edge.port);
+                self.note_provider_revoke(&edge);
             }
             self.remove_runtime_binding(binding);
             self.emit_binding(TopologyEventKind::BindingRemoved, binding);
@@ -2841,7 +2950,7 @@ impl ElmCore {
                 ));
             }
             match provider.backend {
-                ProviderBackend::Kernel(_) if !port.implemented => {
+                ProviderBackend::Kernel(_) | ProviderBackend::KernelOps(_) if !port.implemented => {
                     records.push(ElmCoreHealthRecord::invalid(
                         ELM_HEALTH_CHECK_PROVIDERS,
                         provider.port.0,
@@ -3730,17 +3839,54 @@ impl ElmCore {
         ] {
             self.mgr_runtime.register_api(descriptor);
         }
+    }
 
-        for descriptor in [
-            subsystem_api(100, "vfs", "elm.subsys.vfs@1"),
-            subsystem_api(101, "device", "elm.subsys.device@1"),
-            subsystem_api(102, "network", "elm.subsys.network@1"),
-            subsystem_api(103, "irq", "elm.subsys.irq@1"),
-            subsystem_api(104, "dma", "elm.subsys.dma@1"),
-            subsystem_api(105, "mmio", "elm.subsys.mmio@1"),
-        ] {
-            self.mgr_runtime.register_api(descriptor);
+    pub(crate) fn register_kernel_provider_specs(
+        &mut self,
+        specs: &'static [ElmKernelProviderSpec],
+    ) -> Result<usize, ElmError> {
+        let mut registered = 0usize;
+        for spec in specs {
+            FlowContract::new(spec.port_contract)?;
+            FlowContract::new(spec.api_contract)?;
+            if self
+                .ports
+                .iter()
+                .any(|port| port.contract() == spec.port_contract)
+            {
+                continue;
+            }
+
+            let port = self.alloc_port_id();
+            let desc = spec.port_descriptor(port, ELM_MGR_ID);
+            self.register_port(PortRuntime::from_descriptor(desc));
+            self.providers.push(ProviderRuntime {
+                port,
+                owner: Some(ELM_MGR_ID),
+                access: spec.access,
+                backend: ProviderBackend::KernelOps(spec),
+                dynamic: false,
+                queue_limit: provider_queue_limit_for_mode(spec.mode),
+                max_in_flight: provider_max_in_flight_for_mode(spec.mode),
+                in_flight: 0,
+                calls: 0,
+                failed_calls: 0,
+                revokes: 0,
+                async_submitted: 0,
+                async_completed: 0,
+                async_canceled: 0,
+                async_expired: 0,
+                async_rejected: 0,
+            });
+            let api_id = self.mgr_runtime.alloc_kernel_provider_api_id();
+            self.mgr_runtime
+                .register_api(spec.api_descriptor(api_id, ELM_MGR_ID));
+            registered = registered.saturating_add(1);
         }
+        if registered != 0 {
+            log::info!("[elm] registered {} kernel provider spec(s)", registered);
+        }
+        Ok(registered)
     }
 
     fn register_port(&mut self, runtime: PortRuntime) {
@@ -4165,6 +4311,7 @@ impl ElmCore {
         let backend = self.providers[provider_index].backend;
         let reply = match backend {
             ProviderBackend::Kernel(kind) => self.invoke_kernel_provider(kind, &edge, job.frame),
+            ProviderBackend::KernelOps(spec) => Ok((spec.invoke)(job.frame)),
             ProviderBackend::ElmNativeTodo => Err(ELM_MGR_STATUS_TODO),
         };
 
@@ -4448,9 +4595,16 @@ impl ElmCore {
             .retain(|runtime| runtime.binding != binding);
     }
 
-    fn note_provider_revoke(&mut self, port: PortId) {
-        if let Some(index) = self.provider_index(port) {
+    fn note_provider_revoke(&mut self, edge: &elm_model::CapabilityBindingEdge) {
+        if let Some(index) = self.provider_index(edge.port) {
+            let on_revoke = match self.providers[index].backend {
+                ProviderBackend::KernelOps(spec) => spec.on_revoke,
+                _ => None,
+            };
             self.providers[index].revokes = self.providers[index].revokes.saturating_add(1);
+            if let Some(on_revoke) = on_revoke {
+                on_revoke(Some(edge.id), edge.lease);
+            }
         }
     }
 
@@ -4499,7 +4653,7 @@ impl ElmCore {
             .map(|cell| cell.name.clone())
             .ok_or(ElmError::CellNotFound)?;
         let label = format!("ELM 单元 {}", name);
-        let description = "通过能力织网绑定生成的菜单项".to_string();
+        let description = "通过枢纽连接层绑定生成的菜单项".to_string();
         let route = format!("elm/cell/{}/action", id.0);
         self.attach_menu_binding_with_menu(
             id,
@@ -5063,19 +5217,6 @@ fn mgr_api(
     )
 }
 
-fn subsystem_api(id: u64, name: &str, contract: &str) -> ElmMgrApiDescriptor {
-    ElmMgrApiDescriptor::new(
-        id,
-        ELM_MGR_ID.0,
-        ELM_MGR_API_KIND_SUBSYSTEM,
-        ELM_MGR_API_FLAG_TODO | ELM_MGR_API_FLAG_PROVIDER_OPS,
-        0,
-        "elm.subsys",
-        name,
-        contract,
-    )
-}
-
 fn normalize_event_read_limit(max_records: u32) -> usize {
     let requested = if max_records == 0 {
         ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS
@@ -5151,6 +5292,18 @@ fn provider_call_blockers(status: i32) -> u64 {
         0
     } else {
         ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED
+    }
+}
+
+fn provider_snapshot_blockers(status: i32) -> u64 {
+    match status {
+        ELM_MGR_STATUS_OK => 0,
+        ELM_MGR_STATUS_NOT_FOUND => ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+        ELM_MGR_STATUS_TODO => ELM_POLICY_BLOCK_NATIVE_TODO,
+        ELM_MGR_STATUS_UNSUPPORTED => ELM_POLICY_BLOCK_PORT_TODO,
+        ELM_MGR_STATUS_BUSY => ELM_POLICY_BLOCK_PROVIDER_BUSY,
+        ELM_MGR_STATUS_INVALID => ELM_POLICY_BLOCK_INVALID_STATE,
+        _ => ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     }
 }
 

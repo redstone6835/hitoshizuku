@@ -2,7 +2,7 @@
 
 //! ELM（可拓展内核单元）纯模型层。
 //!
-//! 本库只描述架构无关、内核无关的模型：单元清单、状态机、能力织网、
+//! 本库只描述架构无关、内核无关的模型：单元清单、状态机、枢纽连接层、
 //! 绑定图、拓展点和资源租约。它不能依赖 `kernel`、`general` 或 `arch`。
 
 extern crate alloc;
@@ -22,6 +22,7 @@ pub mod menu;
 pub mod mgr;
 pub mod nexus;
 pub mod ports;
+pub mod provider;
 pub mod snapshot;
 pub mod state;
 pub mod topology;
@@ -138,7 +139,8 @@ pub use mgr::{
     ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
     ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
     ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord,
-    ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmProviderSnapshotHeader, ElmProviderSnapshotRequest, ElmRuntimeEventRequest,
+    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
     ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, first_lifecycle_reason,
     planned_final_state, status_from_blockers,
 };
@@ -147,6 +149,11 @@ pub use nexus::{
     NexusIntent, NexusOffer,
 };
 pub use ports::{BuiltinPort, ElmPortAccessPolicy, PortDescriptor, builtin_port_descriptors};
+pub use provider::{
+    ELM_KERNEL_PROVIDER_FLAG_NONE, ELM_KERNEL_PROVIDER_FLAG_TODO, ElmKernelProviderInvoke,
+    ElmKernelProviderRevoke, ElmKernelProviderSnapshot, ElmKernelProviderSpec,
+    elm_kernel_provider_unsupported,
+};
 pub use snapshot::{
     ELM_CELL_NAME_LEN, ELM_CONTRACT_NAME_LEN, ElmCellSnapshot, ElmPortSnapshot, ElmSnapshotHeader,
     state_code,

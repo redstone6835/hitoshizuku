@@ -13,6 +13,7 @@ pub mod addr;
 pub mod anon;
 pub mod cred;
 pub mod dentry;
+pub mod elm;
 pub mod epoll;
 pub mod error;
 pub mod eventfd;

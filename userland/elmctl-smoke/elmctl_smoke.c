@@ -18,6 +18,7 @@
 
 #define ELM_MGR_STATUS_OK 0
 #define ELM_MGR_STATUS_TODO (-4096)
+#define ELM_MGR_STATUS_UNSUPPORTED (-95)
 #define ELM_MGR_CALL_QUERY_MENU 1u
 #define ELM_MGR_CALL_LOAD_CELL 2u
 #define ELM_MGR_CALL_DETACH_CELL 3u
@@ -25,6 +26,7 @@
 #define ELM_MGR_CALL_QUERY_AUDIT 10u
 #define ELM_MGR_CALL_QUERY_NEXUS_BINDINGS 11u
 #define ELM_MGR_CALL_COMMIT_BIND 13u
+#define ELM_MGR_CALL_QUERY_PROVIDER_PORTS 22u
 #define ELM_MGR_CALL_INVOKE_PROVIDER 23u
 #define ELM_MGR_CALL_QUERY_HEALTH 25u
 #define ELM_MGR_CALL_QUERY_API_REGISTRY 30u
@@ -32,6 +34,7 @@
 #define ELM_MGR_CALL_UNSUBSCRIBE_EVENT 32u
 #define ELM_MGR_CALL_QUERY_EVENT_SUBSCRIPTIONS 33u
 #define ELM_MGR_CALL_READ_SUBSCRIBED_EVENTS 34u
+#define ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT 35u
 #define ELM_MGR_MAX_INPUT (4096u + 16u)
 
 #define ELM_MGR_BUILTIN_ID 1ull
@@ -61,6 +64,7 @@
 #define ELM_ACTION_OPCODE_INVOKE 1u
 #define ELM_ACTION_RESULT_HEALTH 1u
 #define ELM_CALL_STATUS_OK 0
+#define ELM_CALL_STATUS_UNSUPPORTED (-95)
 
 #define ELM_EBI_SOURCE_ABI_VERSION 1u
 #define ELM_EBI_SOURCE_KIND_EKI 1u
@@ -84,6 +88,12 @@
 
 #define ELM_STATE_LOADED 3u
 #define ELM_STATE_RETIRED 10u
+
+#define ELM_PROVIDER_FLAG_KERNEL_BACKEND (1u << 1)
+
+#define ELM_DEV_DISCOVERY_OPCODE_QUERY 1u
+#define ELM_DEV_DISCOVERY_CLASS_LEN 16u
+#define ELM_DEV_DISCOVERY_NAME_LEN 64u
 
 struct elm_core_info {
     uint32_t magic;
@@ -242,6 +252,67 @@ struct elm_provider_invoke_response {
     struct elm_reply_frame reply;
 };
 
+struct elm_provider_snapshot_request {
+    uint64_t port_id;
+    uint64_t binding_id;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
+struct elm_provider_snapshot_header {
+    uint16_t abi_version;
+    uint16_t header_size;
+    int32_t status;
+    uint64_t port_id;
+    uint64_t binding_id;
+    uint32_t payload_len;
+    uint32_t record_count;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
+struct elm_provider_port_stats_header {
+    uint16_t abi_version;
+    uint16_t record_entry_size;
+    uint32_t record_count;
+    uint64_t event_sequence;
+};
+
+struct elm_provider_port_record {
+    uint64_t port_id;
+    uint64_t owner_cell_id;
+    uint32_t access_policy;
+    uint32_t direction;
+    uint32_t mode;
+    uint32_t implemented;
+    uint32_t invokable;
+    uint32_t binding_count;
+    uint16_t contract_len;
+    uint16_t flags;
+    uint64_t calls;
+    uint64_t failed_calls;
+    uint64_t revokes;
+    uint8_t contract[ELM_NEXUS_CONTRACT_LEN];
+};
+
+struct elm_dev_discovery_header {
+    uint16_t abi_version;
+    uint16_t record_entry_size;
+    uint32_t record_count;
+    uint32_t total_count;
+    uint32_t flags;
+    uint64_t generation;
+};
+
+struct elm_dev_discovery_record {
+    uint64_t ordinal;
+    uint16_t class_len;
+    uint16_t name_len;
+    uint32_t flags;
+    uint8_t class_name[ELM_DEV_DISCOVERY_CLASS_LEN];
+    uint8_t dev_name[ELM_DEV_DISCOVERY_NAME_LEN];
+};
+
 struct elm_lifecycle_request {
     uint64_t cell_id;
     uint32_t flags;
@@ -394,6 +465,12 @@ _Static_assert(sizeof(struct elm_action_invoke_request) == 16, "bad action reque
 _Static_assert(sizeof(struct elm_action_invoke_reply) == 48, "bad action reply size");
 _Static_assert(sizeof(struct elm_call_frame) == 288, "bad call frame size");
 _Static_assert(sizeof(struct elm_provider_invoke_response) == 288, "bad invoke response size");
+_Static_assert(sizeof(struct elm_provider_snapshot_request) == 24, "bad provider snapshot request size");
+_Static_assert(sizeof(struct elm_provider_snapshot_header) == 40, "bad provider snapshot header size");
+_Static_assert(sizeof(struct elm_provider_port_stats_header) == 16, "bad provider port header size");
+_Static_assert(sizeof(struct elm_provider_port_record) == 136, "bad provider port record size");
+_Static_assert(sizeof(struct elm_dev_discovery_header) == 24, "bad dev discovery header size");
+_Static_assert(sizeof(struct elm_dev_discovery_record) == 96, "bad dev discovery record size");
 _Static_assert(sizeof(struct elm_lifecycle_request) == 16, "bad lifecycle request size");
 _Static_assert(sizeof(struct elm_lifecycle_response) == 32, "bad lifecycle response size");
 _Static_assert(sizeof(struct elm_ebi_source_request) == 16, "bad ebi source request size");
@@ -765,6 +842,228 @@ static int run_invoke_health_action(uint8_t *out, size_t out_len, uint64_t bindi
     return 0;
 }
 
+static int find_provider_port(uint8_t *out, size_t out_len, const char *contract,
+                              struct elm_provider_port_record *record)
+{
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    struct elm_provider_port_stats_header header;
+
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_PORTS, NULL, 0, out, out_len,
+                            &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len < sizeof(header)) {
+        return fail_msg("provider-ports", "short payload");
+    }
+    memcpy(&header, payload, sizeof(header));
+    if (header.abi_version != ELM_CTL_ABI_VERSION ||
+        header.record_entry_size != sizeof(struct elm_provider_port_record) ||
+        payload_len != sizeof(header) + header.record_count * header.record_entry_size) {
+        return fail_msg("provider-ports", "bad provider snapshot");
+    }
+    for (uint32_t i = 0; i < header.record_count; i++) {
+        const uint8_t *entry = payload + sizeof(header) + i * header.record_entry_size;
+        struct elm_provider_port_record current;
+        memcpy(&current, entry, sizeof(current));
+        if (field_eq(current.contract, current.contract_len, contract)) {
+            *record = current;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int validate_device_discovery_payload(const char *step, const uint8_t *payload,
+                                             uint32_t payload_len)
+{
+    struct elm_dev_discovery_header header;
+
+    if (payload_len < sizeof(header)) {
+        return fail_msg(step, "short device discovery payload");
+    }
+    memcpy(&header, payload, sizeof(header));
+    if (header.abi_version != ELM_CTL_ABI_VERSION ||
+        header.record_entry_size != sizeof(struct elm_dev_discovery_record) ||
+        header.record_count > header.total_count ||
+        payload_len != sizeof(header) + header.record_count * header.record_entry_size) {
+        return fail_msg(step, "bad device discovery header");
+    }
+    for (uint32_t i = 0; i < header.record_count; i++) {
+        const uint8_t *entry = payload + sizeof(header) + i * header.record_entry_size;
+        struct elm_dev_discovery_record record;
+        memcpy(&record, entry, sizeof(record));
+        if (record.ordinal == 0 || record.class_len > ELM_DEV_DISCOVERY_CLASS_LEN ||
+            record.name_len > ELM_DEV_DISCOVERY_NAME_LEN) {
+            return fail_msg(step, "bad device discovery record");
+        }
+    }
+    printf("[elm-smoke] device discovery payload ok: records=%u total=%u flags=0x%x\n",
+           header.record_count, header.total_count, header.flags);
+    return 0;
+}
+
+static int run_subsystem_provider_query(uint8_t *out, size_t out_len)
+{
+    struct elm_provider_port_record device_provider = {0};
+    struct elm_provider_port_record vfs_provider = {0};
+    struct elm_provider_snapshot_request snapshot_request;
+    struct elm_provider_snapshot_header snapshot_header;
+    struct elm_nexus_bind_request bind_request;
+    struct elm_nexus_bind_response bind_response;
+    struct elm_call_frame call;
+    struct elm_provider_invoke_response invoke_response;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    const char *device_contract = "device.discovered@1";
+    const char *vfs_contract = "vfs.lookup@1";
+
+    int found = find_provider_port(out, out_len, device_contract, &device_provider);
+    if (found < 0) {
+        return -1;
+    }
+    if (found == 0) {
+        return fail_msg("provider-ports", "device.discovered@1 missing");
+    }
+    if ((device_provider.flags & ELM_PROVIDER_FLAG_KERNEL_BACKEND) == 0 ||
+        device_provider.port_id == 0 || device_provider.invokable == 0) {
+        return fail_msg("provider-ports", "bad device provider descriptor");
+    }
+
+    memset(&snapshot_request, 0, sizeof(snapshot_request));
+    snapshot_request.port_id = device_provider.port_id;
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT, &snapshot_request,
+                            sizeof(snapshot_request), out, out_len, &payload,
+                            &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len < sizeof(snapshot_header)) {
+        return fail_msg("provider-snapshot", "bad snapshot payload size");
+    }
+    memcpy(&snapshot_header, payload, sizeof(snapshot_header));
+    if (snapshot_header.abi_version != ELM_CTL_ABI_VERSION ||
+        snapshot_header.header_size != sizeof(snapshot_header) ||
+        snapshot_header.status != ELM_MGR_STATUS_OK ||
+        snapshot_header.port_id != device_provider.port_id ||
+        payload_len != sizeof(snapshot_header) + snapshot_header.payload_len) {
+        return fail_msg("provider-snapshot", "unexpected device snapshot status");
+    }
+    if (validate_device_discovery_payload("device-snapshot", payload + sizeof(snapshot_header),
+                                          snapshot_header.payload_len) != 0) {
+        return -1;
+    }
+
+    memset(&bind_request, 0, sizeof(bind_request));
+    bind_request.cell_id = ELM_MGR_BUILTIN_ID;
+    bind_request.port_id = device_provider.port_id;
+    bind_request.contract_len = (uint16_t)strlen(device_contract);
+    memcpy(bind_request.contract, device_contract, bind_request.contract_len);
+    if (require_mgr_payload(ELM_MGR_CALL_COMMIT_BIND, &bind_request, sizeof(bind_request),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(bind_response)) {
+        return fail_msg("provider-bind", "bad bind payload size");
+    }
+    memcpy(&bind_response, payload, sizeof(bind_response));
+    if (bind_response.status != ELM_MGR_STATUS_OK || bind_response.allowed == 0 ||
+        bind_response.binding_id == 0) {
+        return fail_msg("provider-bind", "subsystem provider bind rejected");
+    }
+
+    memset(&call, 0, sizeof(call));
+    call.binding_id = bind_response.binding_id;
+    call.call_id = 2;
+    call.opcode = ELM_DEV_DISCOVERY_OPCODE_QUERY;
+    if (require_mgr_payload(ELM_MGR_CALL_INVOKE_PROVIDER, &call, sizeof(call), out, out_len,
+                            &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(invoke_response)) {
+        return fail_msg("provider-invoke", "bad invoke payload size");
+    }
+    memcpy(&invoke_response, payload, sizeof(invoke_response));
+    if (invoke_response.reply.status != ELM_CALL_STATUS_OK) {
+        return fail_msg("provider-invoke", "unexpected device provider status");
+    }
+    if (validate_device_discovery_payload("device-invoke", invoke_response.reply.payload,
+                                          invoke_response.reply.payload_len) != 0) {
+        return -1;
+    }
+    printf("[elm-smoke] device discovery provider ok: port=%llu binding=%llu\n",
+           (unsigned long long)device_provider.port_id,
+           (unsigned long long)bind_response.binding_id);
+
+    found = find_provider_port(out, out_len, vfs_contract, &vfs_provider);
+    if (found < 0) {
+        return -1;
+    }
+    if (found == 0) {
+        return fail_msg("provider-ports", "vfs.lookup@1 missing");
+    }
+    if ((vfs_provider.flags & ELM_PROVIDER_FLAG_KERNEL_BACKEND) == 0 ||
+        vfs_provider.port_id == 0 || vfs_provider.invokable == 0) {
+        return fail_msg("provider-ports", "bad vfs provider descriptor");
+    }
+
+    memset(&snapshot_request, 0, sizeof(snapshot_request));
+    snapshot_request.port_id = vfs_provider.port_id;
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT, &snapshot_request,
+                            sizeof(snapshot_request), out, out_len, &payload,
+                            &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(snapshot_header)) {
+        return fail_msg("provider-snapshot", "bad vfs snapshot payload size");
+    }
+    memcpy(&snapshot_header, payload, sizeof(snapshot_header));
+    if (snapshot_header.abi_version != ELM_CTL_ABI_VERSION ||
+        snapshot_header.header_size != sizeof(snapshot_header) ||
+        snapshot_header.status != ELM_MGR_STATUS_UNSUPPORTED ||
+        snapshot_header.port_id != vfs_provider.port_id ||
+        snapshot_header.payload_len != 0) {
+        return fail_msg("provider-snapshot", "unexpected vfs snapshot status");
+    }
+
+    memset(&bind_request, 0, sizeof(bind_request));
+    bind_request.cell_id = ELM_MGR_BUILTIN_ID;
+    bind_request.port_id = vfs_provider.port_id;
+    bind_request.contract_len = (uint16_t)strlen(vfs_contract);
+    memcpy(bind_request.contract, vfs_contract, bind_request.contract_len);
+    if (require_mgr_payload(ELM_MGR_CALL_COMMIT_BIND, &bind_request, sizeof(bind_request),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(bind_response)) {
+        return fail_msg("provider-bind", "bad vfs bind payload size");
+    }
+    memcpy(&bind_response, payload, sizeof(bind_response));
+    if (bind_response.status != ELM_MGR_STATUS_OK || bind_response.allowed == 0 ||
+        bind_response.binding_id == 0) {
+        return fail_msg("provider-bind", "vfs provider bind rejected");
+    }
+
+    memset(&call, 0, sizeof(call));
+    call.binding_id = bind_response.binding_id;
+    call.call_id = 3;
+    if (require_mgr_payload(ELM_MGR_CALL_INVOKE_PROVIDER, &call, sizeof(call), out, out_len,
+                            &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(invoke_response)) {
+        return fail_msg("provider-invoke", "bad vfs invoke payload size");
+    }
+    memcpy(&invoke_response, payload, sizeof(invoke_response));
+    if (invoke_response.reply.status != ELM_CALL_STATUS_UNSUPPORTED) {
+        return fail_msg("provider-invoke", "unexpected vfs provider status");
+    }
+
+    printf("[elm-smoke] vfs provider todo boundary ok: port=%llu binding=%llu status=%d\n",
+           (unsigned long long)vfs_provider.port_id,
+           (unsigned long long)bind_response.binding_id, invoke_response.reply.status);
+    return 0;
+}
+
 static int run_audit_query(uint8_t *out, size_t out_len)
 {
     const uint8_t *payload = NULL;
@@ -1100,6 +1399,9 @@ int main(void)
         return 1;
     }
     if (run_invoke_health_action(out, sizeof(out), binding_id, health_action) != 0) {
+        return 1;
+    }
+    if (run_subsystem_provider_query(out, sizeof(out)) != 0) {
         return 1;
     }
     if (run_mgr_runtime_query(out, sizeof(out)) != 0) {

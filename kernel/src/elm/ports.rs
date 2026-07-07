@@ -1,4 +1,4 @@
-//! 能力织网端口运行时描述。
+//! 枢纽端口运行时描述。
 
 use alloc::string::{String, ToString};
 

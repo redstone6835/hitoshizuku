@@ -9,6 +9,7 @@ doctest = false
 bench = false
 
 [dependencies]
+elm_model = { package = "elm", path = "../elm" }
 socket = { path = "../socket" }
 smoltcp = { path = "../mygo-smoltcp", default-features = false, features = [
     "alloc",
