@@ -454,6 +454,32 @@ impl VirtqDesc {
     }
 }
 
+/// 一次描述符表更新。
+///
+/// 调用方先按协议准备好描述符链，再把若干更新一次性交给队列。队列会先校验所有
+/// descriptor 仍处于 InUse 状态，最后只做一次描述符表同步，避免非 coherent DMA
+/// 平台在提交热路径中对每段 descriptor 反复同步。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtqDescUpdate {
+    pub index: u16,
+    pub addr: u64,
+    pub len: u32,
+    pub flags: u16,
+    pub next: Option<u16>,
+}
+
+impl VirtqDescUpdate {
+    pub const fn new(index: u16, addr: u64, len: u32, flags: u16, next: Option<u16>) -> Self {
+        Self {
+            index,
+            addr,
+            len,
+            flags,
+            next,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VirtqAvailHeader {
@@ -495,19 +521,61 @@ pub enum VirtQueueError {
     CorruptFreeList,
 }
 
+/// 描述符链内联保存的描述符数量。
+///
+/// split virtqueue 的块设备请求通常是 header/data/status 三段，flush 是两段。
+/// 小链内联可以消除每次提交路径上的临时堆分配；更长链仍自动退化到 `Vec`，
+/// 因此这里是缓存策略，不是协议形状假设。
+const INLINE_DESCRIPTOR_CHAIN: usize = 4;
+
+#[derive(Debug)]
+enum DescriptorChainStorage {
+    Inline {
+        len: usize,
+        descriptors: [u16; INLINE_DESCRIPTOR_CHAIN],
+    },
+    Heap(Vec<u16>),
+}
+
 #[derive(Debug)]
 pub struct DescriptorChain {
     head: u16,
-    descriptors: Vec<u16>,
+    storage: DescriptorChainStorage,
 }
 
 impl DescriptorChain {
-    fn new(descriptors: Vec<u16>) -> Result<Self, VirtQueueError> {
-        let head = match descriptors.first() {
-            Some(head) => *head,
-            None => return Err(VirtQueueError::DescriptorCountZero),
+    fn from_slice(descriptors: &[u16]) -> Result<Self, VirtQueueError> {
+        let Some(head) = descriptors.first().copied() else {
+            return Err(VirtQueueError::DescriptorCountZero);
         };
-        Ok(Self { head, descriptors })
+        let storage = if descriptors.len() <= INLINE_DESCRIPTOR_CHAIN {
+            let mut inline = [0; INLINE_DESCRIPTOR_CHAIN];
+            inline[..descriptors.len()].copy_from_slice(descriptors);
+            DescriptorChainStorage::Inline {
+                len: descriptors.len(),
+                descriptors: inline,
+            }
+        } else {
+            let mut heap = Vec::new();
+            reserve_total(&mut heap, descriptors.len())?;
+            heap.extend_from_slice(descriptors);
+            DescriptorChainStorage::Heap(heap)
+        };
+        Ok(Self { head, storage })
+    }
+
+    fn from_vec(descriptors: Vec<u16>) -> Result<Self, VirtQueueError> {
+        let Some(head) = descriptors.first().copied() else {
+            return Err(VirtQueueError::DescriptorCountZero);
+        };
+        if descriptors.len() <= INLINE_DESCRIPTOR_CHAIN {
+            Self::from_slice(descriptors.as_slice())
+        } else {
+            Ok(Self {
+                head,
+                storage: DescriptorChainStorage::Heap(descriptors),
+            })
+        }
     }
 
     pub const fn head(&self) -> u16 {
@@ -515,19 +583,30 @@ impl DescriptorChain {
     }
 
     pub fn len(&self) -> usize {
-        self.descriptors.len()
+        match &self.storage {
+            DescriptorChainStorage::Inline { len, .. } => *len,
+            DescriptorChainStorage::Heap(descriptors) => descriptors.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.descriptors.is_empty()
+        self.len() == 0
     }
 
     pub fn get(&self, offset: usize) -> Option<u16> {
-        self.descriptors.get(offset).copied()
+        match &self.storage {
+            DescriptorChainStorage::Inline { len, descriptors } => {
+                (offset < *len).then(|| descriptors[offset])
+            }
+            DescriptorChainStorage::Heap(descriptors) => descriptors.get(offset).copied(),
+        }
     }
 
     pub fn as_slice(&self) -> &[u16] {
-        self.descriptors.as_slice()
+        match &self.storage {
+            DescriptorChainStorage::Inline { len, descriptors } => &descriptors[..*len],
+            DescriptorChainStorage::Heap(descriptors) => descriptors.as_slice(),
+        }
     }
 }
 
@@ -600,6 +679,11 @@ impl SplitVirtQueue {
     /// 一段物理连续的内存中，通过 QueuePFN 寄存器一次性告知设备。
     /// 布局：desc_table | avail_ring | used_ring（按各自对齐要求）。
     pub fn new_legacy(queue_size: u16) -> Result<Self, VirtQueueError> {
+        Self::new_legacy_in(DmaContext::default_coherent(), queue_size)
+    }
+
+    /// 使用指定设备 DMA 上下文创建 legacy split virtqueue。
+    pub fn new_legacy_in(dma_context: DmaContext, queue_size: u16) -> Result<Self, VirtQueueError> {
         let qsz = validate_queue_size(queue_size)?;
         let desc_len = desc_table_bytes(qsz)?;
         let avail_len = avail_ring_bytes(qsz)?;
@@ -609,26 +693,43 @@ impl SplitVirtQueue {
         // Legacy 要求 Used Ring 页对齐：在 avail 和 used 之间可能有填充
         let used_off = (desc_len + avail_len).next_multiple_of(4096);
         let total = used_off + used_len;
-        let dma_ctx = DmaContext::default_coherent();
-        let buf = DmaBuffer::new_in(dma_ctx, total, page_align, DmaDirection::Bidirectional)
+        let buf = DmaBuffer::new_in(dma_context, total, page_align, DmaDirection::Bidirectional)
             .map_err(VirtQueueError::DmaAllocationFailed)?;
 
         let base_dma = buf.dma_addr();
+        let base_paddr = buf.paddr();
         let base_vaddr = buf.vaddr();
         let master_alloc = buf.take_allocation();
 
         // desc 持有主分配（drop 时释放整段）；avail/used 是零分配视图
-        let desc = DmaBuffer::from_allocation(
-            master_alloc, base_dma, base_vaddr, desc_len, DmaDirection::ToDevice,
+        let desc = DmaBuffer::from_allocation_in(
+            dma_context,
+            master_alloc,
+            base_dma,
+            base_vaddr,
+            desc_len,
+            DmaDirection::ToDevice,
         );
         // Legacy 规范要求 Used Ring 页对齐
         let used_off = (desc_len + avail_len).next_multiple_of(4096);
-        let avail = DmaBuffer::sub_view(base_dma + desc_len, base_vaddr + desc_len, avail_len);
-        let used = DmaBuffer::sub_view(base_dma + used_off, base_vaddr + used_off, used_len);
+        let avail = DmaBuffer::sub_view_in(
+            dma_context,
+            base_dma + desc_len,
+            base_vaddr + desc_len,
+            base_paddr + desc_len,
+            avail_len,
+        );
+        let used = DmaBuffer::sub_view_in(
+            dma_context,
+            base_dma + used_off,
+            base_vaddr + used_off,
+            base_paddr + used_off,
+            used_len,
+        );
 
         let mut queue = Self {
             queue_size,
-            dma_context: dma_ctx,
+            dma_context,
             desc,
             avail,
             used,
@@ -712,34 +813,47 @@ impl SplitVirtQueue {
             return Err(VirtQueueError::QueueFull);
         }
 
-        let mut descriptors = Vec::new();
-        reserve_total(&mut descriptors, count)?;
+        let mut descriptors = [0; INLINE_DESCRIPTOR_CHAIN];
+        let mut heap_descriptors = Vec::new();
+        if count > INLINE_DESCRIPTOR_CHAIN {
+            reserve_total(&mut heap_descriptors, count)?;
+        }
+        let mut allocated = 0;
 
         for _ in 0..count {
             let idx = match self.free_desc.pop() {
                 Some(idx) => idx,
                 None => {
-                    self.rollback_allocated(&descriptors);
+                    self.rollback_allocated(&descriptors, &heap_descriptors, allocated);
                     return Err(VirtQueueError::CorruptFreeList);
                 }
             };
 
             let Some(state) = self.desc_state.get_mut(usize::from(idx)) else {
                 self.free_desc.push(idx);
-                self.rollback_allocated(&descriptors);
+                self.rollback_allocated(&descriptors, &heap_descriptors, allocated);
                 return Err(VirtQueueError::CorruptFreeList);
             };
             if *state != DescState::Free {
                 self.free_desc.push(idx);
-                self.rollback_allocated(&descriptors);
+                self.rollback_allocated(&descriptors, &heap_descriptors, allocated);
                 return Err(VirtQueueError::CorruptFreeList);
             }
 
             *state = DescState::InUse;
-            descriptors.push(idx);
+            if count <= INLINE_DESCRIPTOR_CHAIN {
+                descriptors[allocated] = idx;
+            } else {
+                heap_descriptors.push(idx);
+            }
+            allocated += 1;
         }
 
-        DescriptorChain::new(descriptors)
+        if count <= INLINE_DESCRIPTOR_CHAIN {
+            DescriptorChain::from_slice(&descriptors[..count])
+        } else {
+            DescriptorChain::from_vec(heap_descriptors)
+        }
     }
 
     pub fn free_chain(&mut self, chain: DescriptorChain) -> Result<(), VirtQueueError> {
@@ -748,25 +862,34 @@ impl SplitVirtQueue {
 
     pub fn free_chain_from_head(&mut self, head: u16) -> Result<(), VirtQueueError> {
         self.check_descriptor_in_use(head)?;
+        let queue_len = self.queue_len();
+        reserve_total(&mut self.free_desc, queue_len)?;
 
-        let mut descriptors = Vec::new();
+        let mut descriptors = [0; INLINE_DESCRIPTOR_CHAIN];
+        let mut heap_descriptors = Vec::new();
         let mut current = head;
-        for _ in 0..self.queue_len() {
-            push_checked(&mut descriptors, current)?;
+        for depth in 0..queue_len {
+            if descriptor_record_contains(depth, &descriptors, &heap_descriptors, current) {
+                return Err(VirtQueueError::DuplicateDescriptor);
+            }
+            self.check_descriptor_in_use(current)?;
             let desc = self.read_desc(current)?;
+            record_descriptor(current, depth, &mut descriptors, &mut heap_descriptors)?;
+
             if desc.flags & VIRTQ_DESC_F_NEXT == 0 {
-                let chain = DescriptorChain::new(descriptors)?;
-                return self.free_chain(chain);
+                // 完整校验链表后再统一释放，避免损坏链导致一半描述符被回收到空闲表。
+                self.release_descriptor_record(&descriptors, &heap_descriptors, depth + 1)?;
+                self.desc.sync_for_device();
+                return Ok(());
             }
 
             let next = desc.next;
             if usize::from(next) >= self.queue_len() {
                 return Err(VirtQueueError::InvalidNextDescriptor);
             }
-            if contains_descriptor(descriptors.as_slice(), next) {
+            if descriptor_record_contains(depth + 1, &descriptors, &heap_descriptors, next) {
                 return Err(VirtQueueError::DuplicateDescriptor);
             }
-            self.check_descriptor_in_use(next)?;
             current = next;
         }
 
@@ -781,19 +904,45 @@ impl SplitVirtQueue {
         flags: u16,
         next: Option<u16>,
     ) -> Result<(), VirtQueueError> {
-        self.check_descriptor_in_use(index)?;
+        let update = VirtqDescUpdate::new(index, addr, len, flags, next);
+        self.write_descs(core::slice::from_ref(&update))
+    }
 
-        let mut desc_flags = flags & !VIRTQ_DESC_F_NEXT;
-        let next_idx = match next {
-            Some(next_idx) => {
-                self.check_descriptor_in_use(next_idx)?;
-                desc_flags |= VIRTQ_DESC_F_NEXT;
-                next_idx
+    /// 批量写入一组 split virtqueue descriptor。
+    ///
+    /// 这是块设备等热路径的推荐入口：先完整校验，再连续写入，最后只同步一次
+    /// descriptor table。单个 descriptor 写入仍通过 [`Self::write_desc`] 复用这里。
+    pub fn write_descs(&mut self, updates: &[VirtqDescUpdate]) -> Result<(), VirtQueueError> {
+        if updates.is_empty() {
+            return Err(VirtQueueError::DescriptorCountZero);
+        }
+        for (pos, update) in updates.iter().enumerate() {
+            self.check_descriptor_in_use(update.index)?;
+            for prev in &updates[..pos] {
+                if prev.index == update.index {
+                    return Err(VirtQueueError::DuplicateDescriptor);
+                }
             }
-            None => 0,
-        };
+            if let Some(next_idx) = update.next {
+                self.check_descriptor_in_use(next_idx)?;
+            }
+        }
 
-        self.write_desc_raw(index, VirtqDesc::new(addr, len, desc_flags, next_idx))?;
+        for update in updates.iter().copied() {
+            let mut desc_flags = update.flags & !VIRTQ_DESC_F_NEXT;
+            let next_idx = match update.next {
+                Some(next_idx) => {
+                    desc_flags |= VIRTQ_DESC_F_NEXT;
+                    next_idx
+                }
+                None => 0,
+            };
+            self.write_desc_raw(
+                update.index,
+                VirtqDesc::new(update.addr, update.len, desc_flags, next_idx),
+            )?;
+        }
+
         self.desc.sync_for_device();
         Ok(())
     }
@@ -804,20 +953,44 @@ impl SplitVirtQueue {
     }
 
     pub fn push_avail(&mut self, head: u16) -> Result<(), VirtQueueError> {
-        self.check_descriptor_in_use(head)?;
+        self.push_avail_many(core::slice::from_ref(&head))
+    }
+
+    /// 批量发布一组 descriptor head 到 available ring。
+    ///
+    /// descriptor table 在 `write_descs` / `write_desc` 中已经同步给设备；这里仅负责
+    /// 把 head 写入 avail ring 并推进 avail.idx。批量入口把多次 ring 写入合并成
+    /// 一次 DMA 同步和一次 idx 更新，减少顺序 I/O 或未来合并提交路径上的门铃前
+    /// CPU 开销。调用方仍负责在返回成功后按传输层规则通知设备。
+    pub fn push_avail_many(&mut self, heads: &[u16]) -> Result<(), VirtQueueError> {
+        if heads.is_empty() {
+            return Err(VirtQueueError::DescriptorCountZero);
+        }
+        if heads.len() > self.queue_len() {
+            return Err(VirtQueueError::DescriptorCountTooLarge);
+        }
+        for (pos, head) in heads.iter().copied().enumerate() {
+            self.check_descriptor_in_use(head)?;
+            if contains_descriptor_prefix(heads, pos, head) {
+                return Err(VirtQueueError::DuplicateDescriptor);
+            }
+        }
 
         let qsz = self.queue_len();
         let avail_idx = self.avail_idx();
-        let slot = usize::from(avail_idx) % qsz;
-        let ring_ptr = self.avail_ring_ptr(slot)?;
-
-        unsafe {
-            write_volatile(ring_ptr, head);
+        for (offset, head) in heads.iter().copied().enumerate() {
+            let slot = usize::from(avail_idx.wrapping_add(offset as u16)) % qsz;
+            let ring_ptr = self.avail_ring_ptr(slot)?;
+            unsafe {
+                write_volatile(ring_ptr, head);
+            }
         }
-        self.desc.sync_for_device();
-        self.avail.sync_for_device();
+
+        // 保证设备看到更新后的 idx 前，描述符表和 ring slot 内容已经对设备可见。
+        // 非 coherent 平台由 sync_for_device 执行 cache clean；coherent 平台则依赖
+        // release fence 约束 CPU 写入顺序。
         fence(Ordering::Release);
-        self.set_avail_idx(avail_idx.wrapping_add(1));
+        self.set_avail_idx(avail_idx.wrapping_add(heads.len() as u16));
         self.avail.sync_for_device();
         Ok(())
     }
@@ -884,12 +1057,25 @@ impl SplitVirtQueue {
         usize::from(self.queue_size)
     }
 
-    fn rollback_allocated(&mut self, descriptors: &[u16]) {
-        for idx in descriptors.iter().copied() {
-            if let Some(state) = self.desc_state.get_mut(usize::from(idx)) {
-                *state = DescState::Free;
+    fn rollback_allocated(
+        &mut self,
+        inline_descriptors: &[u16; INLINE_DESCRIPTOR_CHAIN],
+        heap_descriptors: &[u16],
+        allocated: usize,
+    ) {
+        // 长链分配时所有已取出的 descriptor 都记录在 heap fallback 中；
+        // 小链才使用 inline 数组。回滚路径不能按长度猜测存储形态，否则长链
+        // 中途失败会错误回收 inline 数组里的默认值。
+        if !heap_descriptors.is_empty() {
+            for idx in heap_descriptors.iter().take(allocated).copied() {
+                self.rollback_descriptor_raw(idx);
             }
-            self.free_desc.push(idx);
+            return;
+        }
+
+        let inline_len = allocated.min(INLINE_DESCRIPTOR_CHAIN);
+        for idx in inline_descriptors.iter().take(inline_len).copied() {
+            self.rollback_descriptor_raw(idx);
         }
     }
 
@@ -922,13 +1108,44 @@ impl SplitVirtQueue {
         }
 
         for idx in descriptors.iter().copied() {
-            self.write_desc_raw(idx, VirtqDesc::default())?;
-            if let Some(state) = self.desc_state.get_mut(usize::from(idx)) {
-                *state = DescState::Free;
-            }
-            self.free_desc.push(idx);
+            self.release_descriptor_raw(idx)?;
         }
         self.desc.sync_for_device();
+        Ok(())
+    }
+
+    fn release_descriptor_raw(&mut self, idx: u16) -> Result<(), VirtQueueError> {
+        self.write_desc_raw(idx, VirtqDesc::default())?;
+        self.rollback_descriptor_raw(idx);
+        Ok(())
+    }
+
+    fn rollback_descriptor_raw(&mut self, idx: u16) {
+        if let Some(state) = self.desc_state.get_mut(usize::from(idx)) {
+            *state = DescState::Free;
+        }
+        self.free_desc.push(idx);
+    }
+
+    fn release_descriptor_record(
+        &mut self,
+        inline_descriptors: &[u16; INLINE_DESCRIPTOR_CHAIN],
+        heap_descriptors: &[u16],
+        len: usize,
+    ) -> Result<(), VirtQueueError> {
+        let inline_len = len.min(INLINE_DESCRIPTOR_CHAIN);
+        for idx in inline_descriptors.iter().take(inline_len).copied() {
+            self.release_descriptor_raw(idx)?;
+        }
+        if len > INLINE_DESCRIPTOR_CHAIN {
+            for idx in heap_descriptors
+                .iter()
+                .take(len - INLINE_DESCRIPTOR_CHAIN)
+                .copied()
+            {
+                self.release_descriptor_raw(idx)?;
+            }
+        }
         Ok(())
     }
 
@@ -1120,19 +1337,46 @@ fn highest_power_of_two_at_most(value: u16) -> u16 {
     1u16 << (u16::BITS - 1 - value.leading_zeros())
 }
 
-fn push_checked(vec: &mut Vec<u16>, idx: u16) -> Result<(), VirtQueueError> {
-    if vec.len() == vec.capacity() {
-        vec.try_reserve_exact(1)
-            .map_err(|_| VirtQueueError::HostAllocationFailed)?;
+fn contains_descriptor_prefix(descriptors: &[u16], len: usize, needle: u16) -> bool {
+    descriptors.iter().take(len).any(|idx| *idx == needle)
+}
+
+fn record_descriptor(
+    idx: u16,
+    pos: usize,
+    inline_descriptors: &mut [u16; INLINE_DESCRIPTOR_CHAIN],
+    heap_descriptors: &mut Vec<u16>,
+) -> Result<(), VirtQueueError> {
+    if pos < INLINE_DESCRIPTOR_CHAIN {
+        inline_descriptors[pos] = idx;
+    } else {
+        if heap_descriptors.len() == heap_descriptors.capacity() {
+            heap_descriptors
+                .try_reserve_exact(1)
+                .map_err(|_| VirtQueueError::HostAllocationFailed)?;
+        }
+        heap_descriptors.push(idx);
     }
-    vec.push(idx);
     Ok(())
 }
 
-fn contains_descriptor(descriptors: &[u16], needle: u16) -> bool {
-    descriptors.iter().any(|idx| *idx == needle)
-}
-
-fn contains_descriptor_prefix(descriptors: &[u16], len: usize, needle: u16) -> bool {
-    descriptors.iter().take(len).any(|idx| *idx == needle)
+fn descriptor_record_contains(
+    len: usize,
+    inline_descriptors: &[u16; INLINE_DESCRIPTOR_CHAIN],
+    heap_descriptors: &[u16],
+    needle: u16,
+) -> bool {
+    let inline_len = len.min(INLINE_DESCRIPTOR_CHAIN);
+    if inline_descriptors
+        .iter()
+        .take(inline_len)
+        .any(|idx| *idx == needle)
+    {
+        return true;
+    }
+    len > INLINE_DESCRIPTOR_CHAIN
+        && heap_descriptors
+            .iter()
+            .take(len - INLINE_DESCRIPTOR_CHAIN)
+            .any(|idx| *idx == needle)
 }

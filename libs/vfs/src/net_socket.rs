@@ -21,6 +21,7 @@ const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
 const SOCK_RAW: u16 = 3;
 const LOOPBACK_UDP_YIELD_INTERVAL: u64 = 16;
+const TCP_CONNECT_TIMEOUT_NS: u64 = 3_000_000_000;
 
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
 
@@ -392,11 +393,17 @@ impl FileOps for NetSocketFileOps {
 
     fn release(&self) {
         if let Some(handle) = self.handle.lock().take() {
+            let local = *self.local.lock();
+            let remote = *self.remote.lock();
+            let is_tcp_listener = matches!(handle.socket_type(), SocketType::Tcp)
+                && local.is_some()
+                && remote.is_none();
             let linger_secs = {
                 let options = self.options.lock();
                 if options.linger_on
                     && options.linger_secs > 0
                     && matches!(handle.socket_type(), SocketType::Tcp)
+                    && !is_tcp_listener
                 {
                     net::stack().tcp_close(handle);
                     options.linger_secs
@@ -412,11 +419,18 @@ impl FileOps for NetSocketFileOps {
                 }
             }
             if matches!(handle.socket_type(), SocketType::Tcp) {
-                net::stack().socket_close_detach(handle);
-                // TCP_CRR 这类短连接在 close 后立即发起下一轮 connect。
-                // 这里让对端马上运行一次，及时消费 FIN/EOF，避免只有额外
-                // timer sleeper 存在时协议收尾才继续推进。
-                sched::schedule_once(sched::now_ns_public());
+                if is_tcp_listener {
+                    // smoltcp 会把 listen socket 原地转换为 Established。VFS 的
+                    // 监听 fd 在 accept 前仍然是逻辑 listener，不能按普通连接
+                    // orphan，否则补位 listener / pending accept 会继续占端口。
+                    net::stack().tcp_close_listener(handle, local);
+                } else {
+                    net::stack().socket_close_detach(handle);
+                    // TCP_CRR 这类短连接在 close 后立即发起下一轮 connect。
+                    // 这里让对端马上运行一次，及时消费 FIN/EOF，避免只有额外
+                    // timer sleeper 存在时协议收尾才继续推进。
+                    sched::schedule_once(sched::now_ns_public());
+                }
             } else {
                 net::stack().socket_close_and_remove(handle);
             }
@@ -455,13 +469,16 @@ impl NetSocketFileOps {
         let handle = self.rehome_for_endpoint(self.get_handle()?, &ep)?;
         match handle.socket_type() {
             SocketType::Udp => {
-                let bound = net::stack().udp_bind(handle, ep).map_err(map_net_error)?;
+                let allow_reuse = self.udp_bind_reuse_enabled();
+                let bound = net::stack()
+                    .udp_bind_with_reuse(handle, ep, allow_reuse)
+                    .map_err(map_net_error)?;
                 *self.local.lock() = Some(bound);
                 Ok(())
             }
             SocketType::Tcp => {
-                // FIXME: TCP bind 暂不下沉到协议栈，listen/connect 时才应用。
-                *self.local.lock() = Some(ep);
+                let bound = net::stack().tcp_bind(handle, ep).map_err(map_net_error)?;
+                *self.local.lock() = Some(bound);
                 Ok(())
             }
             SocketType::Raw | SocketType::Icmp => {
@@ -545,15 +562,14 @@ impl NetSocketFileOps {
         {
             handle = self.rehome_for_endpoint(handle, &ep)?;
         }
-        // FIXME: remote 是 VFS 层缓存；UDP/RAW/ICMP connect 不会同步到底层
-        // socket，getpeername 可能返回一个协议栈并未验证过的地址。
-        *self.remote.lock() = Some(ep);
         match handle.socket_type() {
             SocketType::Tcp => {
+                *self.remote.lock() = Some(ep);
                 net::stack()
                     .tcp_connect(handle, ep)
                     .map_err(map_net_error)?;
                 if !(self.is_nonblock() || nonblocking) {
+                    let deadline = sched::now_ns_public().saturating_add(TCP_CONNECT_TIMEOUT_NS);
                     loop {
                         let state = net::stack().socket_state(handle);
                         match state {
@@ -563,21 +579,31 @@ impl NetSocketFileOps {
                                 return Ok(());
                             }
                             net::SocketState::Closed => return Err(Errno::ECONNREFUSED),
-                            // FIXME: 阻塞 connect 没有独立超时或错误队列检查，
-                            // 依赖全局 poll 唤醒后再次读取粗粒度 SocketState。
-                            _ => self.yield_wait_until(|| {
-                                matches!(
-                                    net::stack().socket_state(handle),
-                                    net::SocketState::Established | net::SocketState::Closed
-                                )
-                            })?,
+                            _ => {
+                                if sched::now_ns_public() >= deadline {
+                                    return Err(Errno::ETIMEDOUT);
+                                }
+                                net::stack().poll_now();
+                                sched::schedule_once(sched::now_ns_public());
+                            }
                         }
                     }
                 }
                 // 非阻塞 connect：不等待握手完成，返回 EINPROGRESS
                 Err(Errno::EINPROGRESS)
             }
-            SocketType::Udp | SocketType::Raw | SocketType::Icmp => Ok(()),
+            SocketType::Udp => {
+                let local = net::stack()
+                    .udp_connect(handle, ep)
+                    .map_err(map_net_error)?;
+                *self.local.lock() = Some(local);
+                *self.remote.lock() = Some(ep);
+                Ok(())
+            }
+            SocketType::Raw | SocketType::Icmp => {
+                *self.remote.lock() = Some(ep);
+                Ok(())
+            }
         }
     }
 
@@ -1149,10 +1175,19 @@ impl NetSocketFileOps {
                 }
             });
         let bound = net::stack()
-            .udp_bind(handle, Endpoint { addr, port: 0 })
+            .udp_bind_with_reuse(
+                handle,
+                Endpoint { addr, port: 0 },
+                self.udp_bind_reuse_enabled(),
+            )
             .map_err(map_net_error)?;
         *self.local.lock() = Some(bound);
         Ok(handle)
+    }
+
+    fn udp_bind_reuse_enabled(&self) -> bool {
+        let options = self.options.lock();
+        options.reuseaddr || options.reuseport
     }
 
     fn do_recv_with(
@@ -1319,6 +1354,7 @@ fn map_net_error(e: NetError) -> Errno {
         NetError::Closed => Errno::EPIPE,
         NetError::AddressInUse => Errno::EADDRINUSE,
         NetError::TimedOut => Errno::ETIMEDOUT,
+        NetError::Unreachable => Errno::Other(113),
         NetError::InvalidArgument => Errno::EINVAL,
         _ => Errno::EINVAL,
     }

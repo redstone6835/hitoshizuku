@@ -429,6 +429,19 @@ impl MountNamespace {
         self.mount_at(mountpoint, parent_mount, superblock, flags)
     }
 
+    /// 重新挂载已覆盖在 `mountpoint` 上的最上层挂载。
+    ///
+    /// `mount(MS_REMOUNT)` 不创建新的 superblock，也不叠加新的挂载层；它只让
+    /// 目标挂载点的文件系统验证新标志，并在验证通过后替换 Mount 级别的访问约束。
+    pub fn remount_at(&self, mountpoint: &Arc<Dentry>, flags: MountFlags) -> VfsResult<Arc<Mount>> {
+        let mount = self
+            .lookup_mount(mountpoint)
+            .ok_or(VfsError::InvalidArgument)?;
+        mount.superblock.remount(flags)?;
+        mount.set_flags(flags);
+        Ok(mount)
+    }
+
     /// 在已经解析好的挂载点上执行挂载操作。
     ///
     /// 调用方必须传入挂载点所在的父 [`Mount`]。这用于 `mount(2)` 路径的最终

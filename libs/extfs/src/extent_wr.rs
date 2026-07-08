@@ -431,6 +431,12 @@ pub(crate) fn ensure_extent_run(
     }
 }
 
+/// Public wrapper for `lookup_extent_run` — used by file write path to
+/// determine if blocks are already mapped before calling `ensure_extent_run`.
+pub(crate) fn lookup_extent_run_pub(i_block: &[u8], lb: u32, max_count: u32) -> Option<(u64, u32)> {
+    lookup_extent_run(i_block, lb, max_count)
+}
+
 /// 在叶子 extent 中查找从 `lb` 开始的连续映射。
 ///
 /// 返回的 run 长度不会超过 `max_count`，且只来自同一条 extent；extent 条目本身已

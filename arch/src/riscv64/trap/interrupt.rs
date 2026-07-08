@@ -8,11 +8,43 @@
 //! 目标 CPU 核心通过 CSR_MSIP 发送消息中断。
 
 use crate::*;
+use general::dev::irq::{IrqLine, IrqLineOps};
 
 /// 本地中断控制辅助实现（基于 `SSTATUS.SIE`）。
 pub struct Riscv64InterruptOps;
 /// 核间消息中断控制辅助实现（基于 `CSR_SIE / CSR_MSIP`）。
 pub struct Riscv64MessageInterruptOps;
+
+/// 安装设备 IRQ registry 使用的架构级 line 控制回调。
+///
+/// RISC-V 的 PLIC 外部中断统一从 `sie.SEIE` 进入 S-mode trap，PLIC 自己再
+/// 通过 claim/complete 分发具体 hwirq。timer/IPI 仍由独立路径管理。
+pub fn install_riscv_irq_line_ops() {
+    general::dev::irq::install_irq_line_ops(IrqLineOps {
+        enable: enable_irq_line,
+        disable: disable_irq_line,
+    });
+}
+
+fn enable_irq_line(line: IrqLine) -> bool {
+    set_irq_line_enabled(line, true)
+}
+
+fn disable_irq_line(line: IrqLine) -> bool {
+    set_irq_line_enabled(line, false)
+}
+
+fn set_irq_line_enabled(line: IrqLine, enabled: bool) -> bool {
+    let IrqLine::Hardware(0) = line else {
+        return false;
+    };
+    if enabled {
+        set_csr!(sie, SIE_SEIE);
+    } else {
+        clear_csr!(sie, SIE_SEIE);
+    }
+    true
+}
 
 impl Riscv64InterruptOps {
     /// 保存中断状态。

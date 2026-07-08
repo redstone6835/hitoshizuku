@@ -11,6 +11,7 @@
 extern crate alloc;
 extern crate arch;
 
+pub mod abi;
 pub mod console;
 pub mod memory;
 pub mod platform;
@@ -19,4 +20,3 @@ pub mod sched;
 pub mod time;
 pub mod user;
 pub mod user_context;
-pub mod abi;

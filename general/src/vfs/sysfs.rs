@@ -1575,7 +1575,7 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
         }
         BlockQueueSlot::HwSectorSize => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::DiscardZeroes => {
-            if features.contains(crate::dev::block::BlockFeatures::WRITE_ZEROES) {
+            if features.contains(crate::dev::block::BlockFeatures::DISCARD_ZEROES) {
                 "1\n".into()
             } else {
                 "0\n".into()

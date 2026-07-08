@@ -47,14 +47,16 @@ fn deliver_user_signals_before_return(tf_ptr: usize, from_user: bool) {
     if !from_user || !sched::is_ready() {
         return;
     }
-
-    let _ =
-        sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(tf_ptr));
-
-    match sched::current_task().state() {
+    let task = sched::current_task();
+    if !task.signal.has_any_pending() && task.shared_signal_pending_bits_quick() == 0 {
+        return;
+    }
+    let _ = sched::operation::deliver_pending_signals_for_task(
+        &task,
+        sched::UserContextRef::new(tf_ptr),
+    );
+    match task.state() {
         sched::TaskState::Zombie | sched::TaskState::Dead => {
-            // 默认 Term/Core 信号会在投递阶段直接 exit_task；当前任务已不应再
-            // 回到用户态，必须立刻切走，不能依赖 NEED_RESCHED 是否已经置位。
             sched::schedule_once(super::super::specific::kernel_timestamp_ns());
             panic!("[trap][signal] terminal task scheduled back unexpectedly");
         }
@@ -194,7 +196,9 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         // request_resched() 标记当前 CPU 需要重调度。系统调用返回用户态前
         // 立即消费该标记，避免当前任务在同一时间片里连续启动 client，
         // 而刚 fork/唤醒的 server 只能等下一次 timer tick。
-        sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+        if sched::needs_resched_current() {
+            sched::preempt_if_needed(super::super::specific::kernel_timestamp_ns());
+        }
         arg4
     } else if from_user && matches!(ecode, ECODE_FPD | ECODE_SXD | ECODE_ASXD) {
         let enable = match ecode {
@@ -212,7 +216,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
         arg4
     } else if matches!(
         ecode,
-        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX
+        ECODE_PIL | ECODE_PIS | ECODE_PIF | ECODE_PME | ECODE_PNR | ECODE_PNX | ECODE_PPI
     ) {
         // 缺页族 → 统一走 general::mm::dispatch_page_fault。
         // 分派结果：

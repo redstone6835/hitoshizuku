@@ -24,13 +24,17 @@ pub struct Completion<T> {
 }
 
 impl<T> Completion<T> {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub const fn new_detached() -> Self {
+        Self {
             done: AtomicBool::new(false),
             result: Spinlock::new(None),
             waker: Spinlock::new(None),
             wait_queue: WaitQueue::new(),
-        })
+        }
+    }
+
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::new_detached())
     }
 
     pub fn is_done(&self) -> bool {
@@ -85,6 +89,15 @@ impl<T> Completion<T> {
     }
 
     fn wait_blocking(&self) -> T {
+        // 快速路径：virtio 在 QEMU 上几乎同步完成，先 spin 避免不必要的 context switch
+        for _ in 0..64 {
+            if self.done.load(Ordering::Acquire) {
+                if let Some(result) = self.result.lock().take() {
+                    return result;
+                }
+            }
+            core::hint::spin_loop();
+        }
         loop {
             if self.done.load(Ordering::Acquire) {
                 if let Some(result) = self.result.lock().take() {
@@ -97,15 +110,16 @@ impl<T> Completion<T> {
             self.wait_queue.enqueue(&task);
             if self.done.load(Ordering::Acquire) {
                 self.wait_queue.remove(&task);
-                let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
                 if let Some(result) = self.result.lock().take() {
+                    restore_current_after_wait(&task);
                     return result;
                 }
             }
             drop(task);
-            sched::schedule_once(0);
+            sched::schedule_once(sched::now_ns_public());
             let task = sched::current_task();
             self.wait_queue.remove(&task);
+            restore_current_after_wait(&task);
         }
     }
 
@@ -118,5 +132,11 @@ impl<T> Completion<T> {
             }
             core::hint::spin_loop();
         }
+    }
+}
+
+fn restore_current_after_wait(task: &Arc<sched::Task>) {
+    if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
+        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
     }
 }

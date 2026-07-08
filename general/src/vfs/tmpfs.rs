@@ -6,7 +6,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::ControlFlow;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +25,9 @@ use vfs::sync::Spinlock;
 
 /// 全局 tmpfs 实例计数器，用于生成唯一的 fs_id。
 static TMPFS_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+const TMPFS_VIRTUAL_BLOCKS: u64 = 256 * 1024;
+const TMPFS_VIRTUAL_INODES: u64 = 1_000_000;
 
 // ── Tmpfs 驱动 ────────────────────────────────────────────────────────────────
 
@@ -94,6 +97,10 @@ impl FsDriver for TmpfsDriver {
             }
         });
 
+        // 根目录不会经过 create/mkdir 路径，必须在挂载完成后显式放入 inode 缓存，
+        // 否则 open("/") 会因为找不到 ino=1 而返回 EINVAL。
+        sb.insert_inode(Arc::clone(&sb.root_inode));
+
         Ok(sb)
     }
 
@@ -131,14 +138,17 @@ impl SuperblockOps for TmpfsSuperblockOps {
     }
 
     fn statfs(&self, sb: &Arc<Superblock>) -> VfsResult<FsStat> {
+        let used_inodes = self.total_inodes.load(Ordering::Relaxed);
+        let total_inodes = TMPFS_VIRTUAL_INODES.max(used_inodes);
+        let free_inodes = total_inodes.saturating_sub(used_inodes);
         Ok(FsStat {
             fs_type: 0x01021994,
             block_size: sb.block_size as u64,
-            total_blocks: u64::MAX,
-            free_blocks: u64::MAX,
-            avail_blocks: u64::MAX,
-            total_inodes: self.total_inodes.load(Ordering::Relaxed),
-            free_inodes: u64::MAX,
+            total_blocks: TMPFS_VIRTUAL_BLOCKS,
+            free_blocks: TMPFS_VIRTUAL_BLOCKS,
+            avail_blocks: TMPFS_VIRTUAL_BLOCKS,
+            total_inodes,
+            free_inodes,
             fs_id: sb.fs_id.raw(),
             name_max: sb.name_max,
         })
@@ -163,6 +173,7 @@ enum TmpfsInodeData {
     File(TmpfsFileData),
     Directory(BTreeMap<String, u64>),
     Symlink(String),
+    Fifo(Arc<vfs::pipe::Pipe>),
     Special,
 }
 
@@ -706,6 +717,11 @@ impl InodeOps for TmpfsInodeOps {
             blocks: 0,
         };
 
+        let inode_data = match kind {
+            FileType::Fifo => TmpfsInodeData::Fifo(vfs::pipe::new_fifo()),
+            _ => TmpfsInodeData::Special,
+        };
+
         let new_inode = Inode::new(
             InodeId {
                 fs_id: sb.fs_id,
@@ -717,7 +733,7 @@ impl InodeOps for TmpfsInodeOps {
             sb.dev_id,
             meta,
             Arc::new(TmpfsInodeOps {
-                data: Spinlock::new(TmpfsInodeData::Special),
+                data: Spinlock::new(inode_data),
             }),
             sb.self_weak.clone(),
         );
@@ -929,22 +945,29 @@ impl InodeOps for TmpfsInodeOps {
     fn open(
         &self,
         inode: &Inode,
-        _options: &OpenOptions,
+        options: &OpenOptions,
         _cred: &Credentials,
     ) -> VfsResult<Box<dyn FileOps + Send + Sync>> {
         {
             let data = self.data.lock();
-            if matches!(&*data, TmpfsInodeData::Special) {
-                return Err(VfsError::NotSupported);
+            match &*data {
+                TmpfsInodeData::Special => return Err(VfsError::NotSupported),
+                TmpfsInodeData::Fifo(pipe) => {
+                    return vfs::pipe::open_fifo(Arc::clone(pipe), options);
+                }
+                _ => {}
             }
         }
         let sb = inode.superblock().ok_or(VfsError::InvalidArgument)?;
+        let opened_inode = sb
+            .find_inode(inode.ino())
+            .ok_or(VfsError::InvalidArgument)?;
         Ok(Box::new(TmpfsFileOps {
             inode_ops: inode
                 .downcast_ops::<TmpfsInodeOps>()
                 .ok_or(VfsError::InvalidArgument)? as *const TmpfsInodeOps,
-            sb: Arc::downgrade(&sb),
-            ino: inode.ino(),
+            inode: opened_inode,
+            sb,
         }))
     }
 
@@ -961,18 +984,12 @@ impl InodeOps for TmpfsInodeOps {
 
 struct TmpfsFileOps {
     inode_ops: *const TmpfsInodeOps,
-    sb: Weak<Superblock>,
-    ino: u64,
+    inode: Arc<Inode>,
+    sb: Arc<Superblock>,
 }
 
 unsafe impl Send for TmpfsFileOps {}
 unsafe impl Sync for TmpfsFileOps {}
-
-impl TmpfsFileOps {
-    fn inode(&self) -> Option<Arc<Inode>> {
-        self.sb.upgrade().and_then(|sb| sb.find_inode(self.ino))
-    }
-}
 
 impl FileOps for TmpfsFileOps {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
@@ -984,10 +1001,8 @@ impl FileOps for TmpfsFileOps {
         };
 
         let n = file_data.read_at(buf, offset);
-        if n != 0
-            && let Some(inode) = self.inode()
-        {
-            inode.touch_atime();
+        if n != 0 {
+            self.inode.touch_atime();
         }
         Ok(n)
     }
@@ -1009,12 +1024,11 @@ impl FileOps for TmpfsFileOps {
         };
 
         let n = file_data.write_at(buf, start)?;
-        if let Some(inode) = self.inode() {
-            inode.set_size_and_blocks(file_data.size, file_data.blocks());
-            if n != 0 {
-                inode.touch_mtime();
-                inode.touch_ctime();
-            }
+        self.inode
+            .set_size_and_blocks(file_data.size, file_data.blocks());
+        if n != 0 {
+            self.inode.touch_mtime();
+            self.inode.touch_ctime();
         }
         Ok(n)
     }
@@ -1034,12 +1048,10 @@ impl FileOps for TmpfsFileOps {
 
         if end > file_data.size {
             file_data.reserve(offset, len)?;
-            if let Some(inode) = self.inode() {
-                let size = file_data.size;
-                inode.set_size_and_blocks(size, file_data.blocks());
-                inode.touch_mtime();
-                inode.touch_ctime();
-            }
+            let size = file_data.size;
+            self.inode.set_size_and_blocks(size, file_data.blocks());
+            self.inode.touch_mtime();
+            self.inode.touch_ctime();
         }
         Ok(())
     }
@@ -1055,11 +1067,9 @@ impl FileOps for TmpfsFileOps {
             TmpfsInodeData::Directory(entries) => entries,
             _ => return Err(VfsError::NotADirectory),
         };
-        let sb = self.sb.upgrade().ok_or(VfsError::InvalidArgument)?;
-
         let mut current_pos = pos;
         for (name, ino) in entries.iter().skip(pos as usize) {
-            let kind = sb.find_inode(*ino).ok_or(VfsError::NotFound)?.kind();
+            let kind = self.sb.find_inode(*ino).ok_or(VfsError::NotFound)?.kind();
             let entry = DirEntry {
                 ino: *ino,
                 name: SmallStr::from(name.as_str()),

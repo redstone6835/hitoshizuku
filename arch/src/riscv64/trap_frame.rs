@@ -12,37 +12,37 @@ use core::mem::offset_of;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
-    pub ra: usize,   // x1
-    pub tp: usize,   // x4  (trap entry 先存 tp，再存 sp)
-    pub sp: usize,   // x2
-    pub gp: usize,   // x3
-    pub t0: usize,   // x5
-    pub t1: usize,   // x6
-    pub t2: usize,   // x7
-    pub s0: usize,   // x8 (fp)
-    pub s1: usize,   // x9
-    pub a0: usize,   // x10
-    pub a1: usize,   // x11
-    pub a2: usize,   // x12
-    pub a3: usize,   // x13
-    pub a4: usize,   // x14
-    pub a5: usize,   // x15
-    pub a6: usize,   // x16
-    pub a7: usize,   // x17 (syscall nr)
-    pub s2: usize,   // x18
-    pub s3: usize,   // x19
-    pub s4: usize,   // x20
-    pub s5: usize,   // x21
-    pub s6: usize,   // x22
-    pub s7: usize,   // x23
-    pub s8: usize,   // x24
-    pub s9: usize,   // x25
-    pub s10: usize,  // x26
-    pub s11: usize,  // x27
-    pub t3: usize,   // x28
-    pub t4: usize,   // x29
-    pub t5: usize,   // x30
-    pub t6: usize,   // x31
+    pub ra: usize,  // x1
+    pub tp: usize,  // x4  (trap entry 先存 tp，再存 sp)
+    pub sp: usize,  // x2
+    pub gp: usize,  // x3
+    pub t0: usize,  // x5
+    pub t1: usize,  // x6
+    pub t2: usize,  // x7
+    pub s0: usize,  // x8 (fp)
+    pub s1: usize,  // x9
+    pub a0: usize,  // x10
+    pub a1: usize,  // x11
+    pub a2: usize,  // x12
+    pub a3: usize,  // x13
+    pub a4: usize,  // x14
+    pub a5: usize,  // x15
+    pub a6: usize,  // x16
+    pub a7: usize,  // x17 (syscall nr)
+    pub s2: usize,  // x18
+    pub s3: usize,  // x19
+    pub s4: usize,  // x20
+    pub s5: usize,  // x21
+    pub s6: usize,  // x22
+    pub s7: usize,  // x23
+    pub s8: usize,  // x24
+    pub s9: usize,  // x25
+    pub s10: usize, // x26
+    pub s11: usize, // x27
+    pub t3: usize,  // x28
+    pub t4: usize,  // x29
+    pub t5: usize,  // x30
+    pub t6: usize,  // x31
     pub sepc: usize,
     pub status: usize,
     pub cause: usize,
@@ -56,12 +56,22 @@ pub struct TrapFrame {
 }
 
 impl TrapFrame {
-    #[inline] pub fn syscall_id(&self) -> usize { self.a7 }
-    #[inline] pub fn syscall_args(&self) -> [usize; 6] {
+    #[inline]
+    pub fn syscall_id(&self) -> usize {
+        self.a7
+    }
+    #[inline]
+    pub fn syscall_args(&self) -> [usize; 6] {
         [self.a0, self.a1, self.a2, self.a3, self.a4, self.a5]
     }
-    #[inline] pub fn set_syscall_return(&mut self, v: usize) { self.a0 = v; }
-    #[inline] pub fn skip_syscall_insn(&mut self) { self.sepc = self.sepc.wrapping_add(4); }
+    #[inline]
+    pub fn set_syscall_return(&mut self, v: usize) {
+        self.a0 = v;
+    }
+    #[inline]
+    pub fn skip_syscall_insn(&mut self) {
+        self.sepc = self.sepc.wrapping_add(4);
+    }
 }
 
 // ── 偏移常量 ──────────────────────────────────────────────────────────────────

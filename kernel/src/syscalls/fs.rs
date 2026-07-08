@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use errno::Errno;
-use general::mm::{copy_cstr_from_user, copy_from_user, copy_to_user};
+use general::mm::{VmSpace, copy_cstr_from_user, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use general::vfs::{current_fdtable, current_vfs_context, namespace_path, pidfd};
 use hal::abi::{decode_dev_t, encode_dev_t};
@@ -60,6 +60,25 @@ const O_CLOEXEC: usize = 0o02000000;
 const O_PATH: usize = 0o10000000;
 const O_SYNC: usize = 0o4010000;
 
+const MS_RDONLY: usize = 1 << 0;
+const MS_NOSUID: usize = 1 << 1;
+const MS_NODEV: usize = 1 << 2;
+const MS_NOEXEC: usize = 1 << 3;
+const MS_SYNCHRONOUS: usize = 1 << 4;
+const MS_REMOUNT: usize = 1 << 5;
+const MS_BIND: usize = 1 << 12;
+const MS_REC: usize = 1 << 14;
+const MS_SILENT: usize = 1 << 15;
+const MS_NOATIME: usize = 1 << 10;
+const MS_NODIRATIME: usize = 1 << 11;
+const MS_RELATIME: usize = 1 << 21;
+const MS_STRICTATIME: usize = 1 << 24;
+const MS_LAZYTIME: usize = 1 << 25;
+const MS_NOREMOTELOCK: usize = 1 << 27;
+const MS_NOSEC: usize = 1 << 28;
+const MS_BORN: usize = 1 << 29;
+const MS_ACTIVE: usize = 1 << 30;
+
 const OPEN_HOW_SIZE: usize = 24;
 const OPEN_HOW_MAX_SIZE: usize = 4096;
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -73,11 +92,35 @@ const F_GETFD: usize = 1;
 const F_SETFD: usize = 2;
 const F_GETFL: usize = 3;
 const F_SETFL: usize = 4;
+const F_GETLK: usize = 5;
+const F_SETLK: usize = 6;
+const F_SETLKW: usize = 7;
+const F_SETOWN: usize = 8;
+const F_GETOWN: usize = 9;
+const F_SETSIG: usize = 10;
+const F_GETSIG: usize = 11;
+const F_GETLK64: usize = 12;
+const F_SETLK64: usize = 13;
+const F_SETLKW64: usize = 14;
+const F_SETOWN_EX: usize = 15;
+const F_GETOWN_EX: usize = 16;
+const F_OFD_GETLK: usize = 36;
+const F_OFD_SETLK: usize = 37;
+const F_OFD_SETLKW: usize = 38;
 const F_DUPFD_CLOEXEC: usize = 1030;
+const F_SETLEASE: usize = 1024;
+const F_GETLEASE: usize = 1025;
 const F_ADD_SEALS: usize = 1033;
 const F_GET_SEALS: usize = 1034;
 const FD_CLOEXEC: usize = 1;
 const FIONBIO: usize = 0x5421;
+
+const F_RDLCK: i16 = 0;
+const F_WRLCK: i16 = 1;
+const F_UNLCK: i16 = 2;
+const F_OWNER_TID: i32 = 0;
+const F_OWNER_PID: i32 = 1;
+const F_OWNER_PGRP: i32 = 2;
 
 const MFD_CLOEXEC: usize = 0x0001;
 const MFD_ALLOW_SEALING: usize = 0x0002;
@@ -193,7 +236,8 @@ pub(super) fn sys_readv(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
 pub(super) fn sys_close(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let fd = fd_arg(ctx.args[0])?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    fdt.close_fd(fd).map_err(|e| e.to_errno())?;
+    fdt.close_fd_for_owner(fd, record_lock_owner_pid(ctx))
+        .map_err(|e| e.to_errno())?;
     Ok(0)
 }
 
@@ -357,7 +401,7 @@ pub(super) fn sys_dup3(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         FdFlags::default()
     };
     let out = fdt
-        .dup2_fd(old_fd, new_fd, fd_flags)
+        .dup2_fd_for_owner(old_fd, new_fd, fd_flags, record_lock_owner_pid(ctx))
         .map_err(|e| e.to_errno())?;
     Ok(out.as_raw() as usize)
 }
@@ -407,6 +451,78 @@ pub(super) fn sys_fcntl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
             );
             Ok(0)
         }
+        F_SETOWN => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let owner = arg as isize as i32;
+            if owner < 0 {
+                file.set_owner(F_OWNER_PGRP, owner.wrapping_neg());
+            } else {
+                file.set_owner(F_OWNER_PID, owner);
+            }
+            Ok(0)
+        }
+        F_GETOWN => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let (owner_type, owner_pid) = file.owner();
+            let owner = if owner_type == F_OWNER_PGRP {
+                owner_pid.wrapping_neg()
+            } else {
+                owner_pid
+            };
+            Ok(owner as isize as usize)
+        }
+        F_SETSIG => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            file.set_owner_sig(arg as i32);
+            Ok(0)
+        }
+        F_GETSIG => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            Ok(file.owner_sig() as isize as usize)
+        }
+        F_SETOWN_EX => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let (owner_type, owner_pid) = read_f_owner_ex(arg)?;
+            validate_f_owner_type(owner_type)?;
+            file.set_owner(owner_type, owner_pid);
+            Ok(0)
+        }
+        F_GETOWN_EX => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let (owner_type, owner_pid) = file.owner();
+            validate_f_owner_type(owner_type)?;
+            write_f_owner_ex(arg, owner_type, owner_pid)?;
+            Ok(0)
+        }
+        F_GETLK | F_GETLK64 | F_OFD_GETLK => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            fcntl_getlk(ctx, &file, arg)
+        }
+        F_SETLK | F_SETLK64 | F_OFD_SETLK => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            fcntl_setlk(ctx, &file, arg, false)
+        }
+        F_SETLKW | F_SETLKW64 | F_OFD_SETLKW => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            fcntl_setlk(ctx, &file, arg, true)
+        }
+        F_SETLEASE => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            let lock_type = arg as i32;
+            if !file.is_seekable() {
+                return Err(Errno::EINVAL);
+            }
+            let owner_pid = record_lock_owner_pid(ctx);
+            vfs::lease::setlease(&file, owner_pid, linux_lease_type(lock_type)?)?;
+            Ok(0)
+        }
+        F_GETLEASE => {
+            let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+            Ok(
+                linux_lease_type_raw(vfs::lease::getlease(&file, record_lock_owner_pid(ctx)))
+                    as usize,
+            )
+        }
         F_ADD_SEALS => {
             let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
             let memfd = file
@@ -452,7 +568,7 @@ pub(super) fn sys_pipe2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let cloexec = (flags & O_CLOEXEC) != 0;
 
     let (read_end, write_end) =
-        vfs::pipe::new_pipe(vfs_ctx.cred.clone(), nonblock).map_err(|e| e.to_errno())?;
+        vfs::pipe::new_pipe(vfs_ctx.cred(), nonblock).map_err(|e| e.to_errno())?;
 
     let fd_flags = if cloexec {
         FdFlags::CLOEXEC
@@ -648,37 +764,70 @@ fn decode_optional_owner(uid_raw: u32, gid_raw: u32) -> (Option<Uid>, Option<Gid
 pub(super) fn sys_utimensat(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
-    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
-    let path = copy_path_from_user(ctx.args[1])?;
+    let path_user = ctx.args[1];
     let times_user = ctx.args[2];
     let flags = ctx.args[3];
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (atime, mtime) = decode_utimens_times(times_user)?;
+
+    if path_user == 0 {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let fd = fd_arg(ctx.args[0])?;
+        operation::futimens(&vfs_ctx, &fdt, fd, atime, mtime).map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
+
+    let dirfd = dirfd_arg(ctx.args[0], &fdt)?;
+    let path = copy_path_from_user(path_user)?;
     let no_follow = (flags & AT_SYMLINK_NOFOLLOW) != 0;
-
-    let (atime, mtime) = if times_user == 0 {
-        (None, None)
-    } else {
-        let mut raw = [0u8; 32];
-        copy_from_user(times_user, &mut raw).map_err(|e| e.as_errno())?;
-        let read_ts = |off: usize| -> Option<Timespec> {
-            let sec = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
-            let nsec = i64::from_le_bytes(raw[off + 8..off + 16].try_into().unwrap());
-            if sec == 0x3fffffff && nsec == 0x3fffffff {
-                None
-            } else if sec == 0x3ffffffe && nsec == 0x3ffffffe {
-                Some(Timespec::ZERO)
-            } else {
-                Some(Timespec {
-                    secs: sec,
-                    nsecs: nsec as u32,
-                })
-            }
-        };
-        (read_ts(0), read_ts(16))
-    };
-
     operation::utimensat(&vfs_ctx, &dirfd, &path, atime, mtime, no_follow)
         .map_err(|e| e.to_errno())?;
     Ok(0)
+}
+
+fn decode_utimens_times(times_user: usize) -> Result<(Option<Timespec>, Option<Timespec>), Errno> {
+    if times_user == 0 {
+        let now = realtime_timespec();
+        return Ok((Some(now), Some(now)));
+    }
+
+    const UTIME_NOW_NSEC: i64 = 0x3fff_ffff;
+    const UTIME_OMIT_NSEC: i64 = 0x3fff_fffe;
+    const NSEC_PER_SEC: i64 = 1_000_000_000;
+
+    let mut raw = [0u8; 32];
+    copy_from_user(times_user, &mut raw).map_err(|e| e.as_errno())?;
+    let now = realtime_timespec();
+    let read_ts = |off: usize| -> Result<Option<Timespec>, Errno> {
+        let sec = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        let nsec = i64::from_le_bytes(raw[off + 8..off + 16].try_into().unwrap());
+        if nsec == UTIME_NOW_NSEC {
+            return Ok(Some(now));
+        }
+        if nsec == UTIME_OMIT_NSEC {
+            return Ok(None);
+        }
+        if !(0..NSEC_PER_SEC).contains(&nsec) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(Some(Timespec {
+            secs: sec,
+            nsecs: nsec as u32,
+        }))
+    };
+    Ok((read_ts(0)?, read_ts(16)?))
+}
+
+fn realtime_timespec() -> Timespec {
+    let ns = crate::vdso::realtime_ns();
+    Timespec {
+        secs: (ns / 1_000_000_000) as i64,
+        nsecs: (ns % 1_000_000_000) as u32,
+    }
 }
 
 pub(super) fn sys_truncate(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
@@ -800,7 +949,7 @@ pub(super) fn sys_chdir(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         .map_err(|e| e.to_errno())?;
     let inode = result.dentry.inode().ok_or(Errno::ENOENT)?;
     let st = inode.stat().map_err(|e| e.to_errno())?;
-    if !vfs_ctx.cred.can_exec(
+    if !vfs_ctx.cred().can_exec(
         Uid(st.uid),
         Gid(st.gid),
         FileMode::new(st.mode as u16),
@@ -824,7 +973,7 @@ pub(super) fn sys_fchdir(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         .map_err(|e| e.to_errno())?;
     let inode = result.dentry.inode().ok_or(Errno::ENOENT)?;
     let st = inode.stat().map_err(|e| e.to_errno())?;
-    if !vfs_ctx.cred.can_exec(
+    if !vfs_ctx.cred().can_exec(
         Uid(st.uid),
         Gid(st.gid),
         FileMode::new(st.mode as u16),
@@ -852,46 +1001,58 @@ pub(super) fn sys_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     let target = copy_path_from_user(ctx.args[1])?;
     let fs_type = copy_optional_cstr_from_user(ctx.args[2], 64)?;
     let mount_flags_raw = ctx.args[3];
-    // 接受实现的标志位以及常见的可忽略兼容位：SILENT/RELATIME。
-    const KNOWN_MOUNT_FLAGS: usize = (1 << 0)
-        | (1 << 1)
-        | (1 << 2)
-        | (1 << 3)
-        | (1 << 4)
-        | (1 << 10)
-        | (1 << 11)
-        | (1 << 12)
-        | (1 << 15)
-        | (1 << 21);
+    // 只把当前内核真正实现的访问约束转成 VFS MountFlags，其余 Linux 内核内部位
+    // 作为兼容输入接受但不持久化，避免 LTP 的通用 mount helper 在参数校验阶段失败。
+    const KNOWN_MOUNT_FLAGS: usize = MS_RDONLY
+        | MS_NOSUID
+        | MS_NODEV
+        | MS_NOEXEC
+        | MS_SYNCHRONOUS
+        | MS_REMOUNT
+        | MS_NOATIME
+        | MS_NODIRATIME
+        | MS_BIND
+        | MS_REC
+        | MS_SILENT
+        | MS_RELATIME
+        | MS_STRICTATIME
+        | MS_LAZYTIME
+        | MS_NOREMOTELOCK
+        | MS_NOSEC
+        | MS_BORN
+        | MS_ACTIVE;
     if (mount_flags_raw & !KNOWN_MOUNT_FLAGS) != 0 {
         return Err(Errno::EINVAL);
     }
     let data = copy_optional_cstr_from_user(ctx.args[4], 4096)?;
 
     let mut flags = MountFlags::RDONLY.without(MountFlags::RDONLY);
-    if (mount_flags_raw & 1) != 0 {
+    if (mount_flags_raw & MS_RDONLY) != 0 {
         flags = flags.with(MountFlags::RDONLY);
     }
-    if (mount_flags_raw & 2) != 0 {
+    if (mount_flags_raw & MS_NOSUID) != 0 {
         flags = flags.with(MountFlags::NOSUID);
     }
-    if (mount_flags_raw & 4) != 0 {
+    if (mount_flags_raw & MS_NODEV) != 0 {
         flags = flags.with(MountFlags::NODEV);
     }
-    if (mount_flags_raw & 8) != 0 {
+    if (mount_flags_raw & MS_NOEXEC) != 0 {
         flags = flags.with(MountFlags::NOEXEC);
     }
-    if (mount_flags_raw & 16) != 0 {
+    if (mount_flags_raw & MS_SYNCHRONOUS) != 0 {
         flags = flags.with(MountFlags::SYNCHRONOUS);
     }
-    if (mount_flags_raw & 1024) != 0 {
+    if (mount_flags_raw & MS_NOATIME) != 0 {
         flags = flags.with(MountFlags::NOATIME);
     }
-    if (mount_flags_raw & 2048) != 0 {
+    if (mount_flags_raw & MS_NODIRATIME) != 0 {
         flags = flags.with(MountFlags::NODIRATIME);
     }
-    if (mount_flags_raw & 4096) != 0 {
+    if (mount_flags_raw & MS_BIND) != 0 {
         flags = flags.with(MountFlags::BIND);
+    }
+    if (mount_flags_raw & MS_REC) != 0 {
+        flags = flags.with(MountFlags::REC);
     }
 
     let dev = if source.is_empty() {
@@ -900,6 +1061,20 @@ pub(super) fn sys_mount(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         Some(source.as_str())
     };
     let dirfd = Dirfd::Cwd;
+    if (mount_flags_raw & MS_REMOUNT) != 0 {
+        let mountpoint = vfs::path::lookup(
+            &vfs_ctx,
+            &dirfd,
+            &target,
+            LookupFlags::DIRECTORY.with(LookupFlags::NO_MOUNT_LAST),
+        )
+        .map_err(|e| e.to_errno())?;
+        vfs_ctx
+            .mount_ns
+            .remount_at(&mountpoint.dentry, flags)
+            .map_err(|e| e.to_errno())?;
+        return Ok(0);
+    }
     if fs_type.is_empty() || fs_type == "auto" {
         return mount_autodetect(&vfs_ctx, &dirfd, &target, flags, dev, &data);
     }
@@ -1246,6 +1421,8 @@ pub(super) fn sys_close_range(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let fdt = if (flags & CLOSE_RANGE_UNSHARE) != 0 {
         // Linux 语义要求先解除 CLONE_FILES 共享，再在新 fdtable 上执行 close/cloexec。
+        // record lock 属于进程而不是 fdtable；只有新表中实际关闭的 fd
+        // 才会触发对应 inode 的进程锁释放。
         let new_fdt = Arc::new(fdt.fork());
         let _ = ctx.task().ext_remove(sched::TASKEXT_VFS_FDTABLE);
         ctx.task()
@@ -1255,7 +1432,7 @@ pub(super) fn sys_close_range(ctx: &mut SyscallContext<'_>) -> Result<usize, Err
         fdt
     };
     let cloexec = (flags & CLOSE_RANGE_CLOEXEC) != 0;
-    fdt.close_range(first, last, cloexec);
+    fdt.close_range_for_owner(first, last, cloexec, record_lock_owner_pid(ctx));
     Ok(0)
 }
 
@@ -1272,7 +1449,7 @@ pub(super) fn sys_eventfd2(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno>
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fd = vfs::eventfd::create(
         &fdt,
-        Arc::clone(&vfs_ctx.cred),
+        vfs_ctx.cred(),
         initval,
         (flags & EFD_SEMAPHORE) != 0,
         (flags & O_NONBLOCK) != 0,
@@ -1292,7 +1469,7 @@ pub(super) fn sys_timerfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, 
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fd = vfs::timerfd::create(
         &fdt,
-        Arc::clone(&vfs_ctx.cred),
+        vfs_ctx.cred(),
         clock_id,
         (flags & O_NONBLOCK) != 0,
         (flags & O_CLOEXEC) != 0,
@@ -1320,7 +1497,7 @@ pub(super) fn sys_signalfd4(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno
         let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
         let fd = vfs::signalfd::create(
             &fdt,
-            Arc::clone(&vfs_ctx.cred),
+            vfs_ctx.cred(),
             mask,
             (flags & O_NONBLOCK) != 0,
             (flags & O_CLOEXEC) != 0,
@@ -1350,7 +1527,7 @@ pub(super) fn sys_epoll_create1(ctx: &mut SyscallContext<'_>) -> Result<usize, E
     }
     let fdt = current_fdtable().ok_or(Errno::EBADF)?;
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
-    let fd = vfs::epoll::create(&fdt, vfs_ctx.cred.clone(), (flags & O_CLOEXEC) != 0)?;
+    let fd = vfs::epoll::create(&fdt, vfs_ctx.cred(), (flags & O_CLOEXEC) != 0)?;
     Ok(fd.as_raw() as usize)
 }
 
@@ -2176,7 +2353,7 @@ pub(super) fn sys_memfd_create(ctx: &mut SyscallContext<'_>) -> Result<usize, Er
     let vfs_ctx = current_vfs_context().ok_or(Errno::EBADF)?;
     let fd = vfs::memfd::create(
         &fdt,
-        Arc::clone(&vfs_ctx.cred),
+        vfs_ctx.cred(),
         (flags & MFD_ALLOW_SEALING) != 0,
         (flags & MFD_CLOEXEC) != 0,
     )?;
@@ -2843,14 +3020,31 @@ fn faccessat_common(ctx: &mut SyscallContext<'_>, has_flags: bool) -> Result<usi
         return Err(Errno::EINVAL);
     }
 
-    let st = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+    let (st, readonly) = if path.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
         let fd = fd_arg(raw_dirfd)?;
-        operation::fstat(&fdt, fd).map_err(|e| e.to_errno())?
+        let file = fdt.get_file(fd).ok_or(Errno::EBADF)?;
+        (
+            file.stat().map_err(|e| e.to_errno())?,
+            file.mount().is_rdonly(),
+        )
     } else {
         let dirfd = dirfd_arg(raw_dirfd, &fdt)?;
-        operation::fstatat(&vfs_ctx, &dirfd, &path, (flags & AT_SYMLINK_NOFOLLOW) != 0)
-            .map_err(|e| e.to_errno())?
+        let lookup_flags = if (flags & AT_SYMLINK_NOFOLLOW) != 0 {
+            LookupFlags::NO_FOLLOW
+        } else {
+            LookupFlags::default()
+        };
+        let result =
+            vfs::path::lookup(&vfs_ctx, &dirfd, &path, lookup_flags).map_err(|e| e.to_errno())?;
+        let inode = result.dentry.inode().ok_or(Errno::ENOENT)?;
+        (
+            inode.stat().map_err(|e| e.to_errno())?,
+            result.mount.is_rdonly(),
+        )
     };
+    if (mode & W_OK) != 0 && readonly {
+        return Err(Errno::EROFS);
+    }
     if mode == F_OK || access_mode_allowed(ctx, &st, mode, flags) {
         Ok(0)
     } else {
@@ -3000,6 +3194,68 @@ fn write_from_user_at(
     len: usize,
     offset: Option<u64>,
 ) -> Result<usize, Errno> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let Some(vm) = current_vm_space() else {
+        return write_from_user_at_fallback(file, user, len, offset);
+    };
+
+    let mut remaining = len;
+    let mut user_ptr = user;
+    let mut pos = offset.unwrap_or(0);
+    let mut written = 0usize;
+    while remaining > 0 {
+        let chunk = remaining.min(COPY_CHUNK);
+        let result = unsafe {
+            vm.with_user_read_slice(user_ptr, chunk, |buf| {
+                file_write_user_chunk(file, offset, pos, buf).map(|n| (n, buf.len()))
+            })
+        };
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(VfsError::WouldBlock)) if written > 0 => return Ok(written),
+            Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(VfsError::WouldBlock)) => {
+                wait_for_file_readiness(file, PollEvents::POLLOUT)?;
+                continue;
+            }
+            Ok(Err(VfsError::BrokenPipe)) if written == 0 => {
+                deliver_sigpipe();
+                return Err(Errno::EPIPE);
+            }
+            Ok(Err(e)) => return Err(e.to_errno()),
+            Err(e) => {
+                return if written > 0 { Ok(written) } else { Err(e) };
+            }
+        };
+        if n == 0 {
+            // 非空 write 返回 0 表示底层没有取得任何进展。Linux write(2)
+            // 对常规文件通常应返回错误；这里优先返回已写入字节数，避免 libc/测试
+            // 在同一缓冲区上无限重试导致 iozone/lmbench 卡死。
+            return if written > 0 {
+                Ok(written)
+            } else {
+                Err(Errno::EIO)
+            };
+        }
+        written += n;
+        if n < window_len {
+            break;
+        }
+        user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
+        pos = pos.saturating_add(n as u64);
+        remaining -= n;
+    }
+    Ok(written)
+}
+
+fn write_from_user_at_fallback(
+    file: &vfs::file::File,
+    user: usize,
+    len: usize,
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
     let mut remaining = len;
     let mut user_ptr = user;
     let mut pos = offset.unwrap_or(0);
@@ -3014,11 +3270,7 @@ fn write_from_user_at(
                 Err(e.as_errno())
             };
         }
-        let n = match if offset.is_some() {
-            file.write_at(&tmp[..chunk], pos)
-        } else {
-            file.write(&tmp[..chunk])
-        } {
+        let n = match file_write_user_chunk(file, offset, pos, &tmp[..chunk]) {
             Ok(n) => n,
             Err(VfsError::WouldBlock) if written > 0 => return Ok(written),
             Err(VfsError::WouldBlock) if file.flags().nonblock => return Err(Errno::EAGAIN),
@@ -3054,6 +3306,57 @@ fn write_from_user_at(
 }
 
 fn read_to_user(
+    file: &vfs::file::File,
+    user: usize,
+    len: usize,
+    offset: Option<u64>,
+) -> Result<usize, Errno> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let Some(vm) = current_vm_space() else {
+        return read_to_user_fallback(file, user, len, offset);
+    };
+
+    let mut remaining = len;
+    let mut user_ptr = user;
+    let mut pos = offset.unwrap_or(0);
+    let mut read = 0usize;
+    while remaining > 0 {
+        let chunk = remaining.min(COPY_CHUNK);
+        let result = unsafe {
+            vm.with_user_write_slice(user_ptr, chunk, |buf| {
+                file_read_user_chunk(file, offset, pos, buf).map(|n| (n, buf.len()))
+            })
+        };
+        let (n, window_len) = match result {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(VfsError::WouldBlock)) if read > 0 => return Ok(read),
+            Ok(Err(VfsError::WouldBlock)) if file.flags().nonblock => return Err(Errno::EAGAIN),
+            Ok(Err(VfsError::WouldBlock)) => {
+                wait_for_file_readiness(file, PollEvents::POLLIN)?;
+                continue;
+            }
+            Ok(Err(e)) => return Err(e.to_errno()),
+            Err(e) => {
+                return if read > 0 { Ok(read) } else { Err(e) };
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        read += n;
+        user_ptr = user_ptr.checked_add(n).ok_or(Errno::EFAULT)?;
+        pos = pos.saturating_add(n as u64);
+        remaining -= n;
+        if n < window_len {
+            break;
+        }
+    }
+    Ok(read)
+}
+
+fn read_to_user_fallback(
     file: &vfs::file::File,
     user: usize,
     len: usize,
@@ -3099,6 +3402,42 @@ fn read_to_user(
         }
     }
     Ok(read)
+}
+
+fn file_write_user_chunk(
+    file: &vfs::file::File,
+    offset: Option<u64>,
+    pos: u64,
+    buf: &[u8],
+) -> vfs::error::VfsResult<usize> {
+    if offset.is_some() {
+        file.write_at(buf, pos)
+    } else {
+        file.write(buf)
+    }
+}
+
+fn file_read_user_chunk(
+    file: &vfs::file::File,
+    offset: Option<u64>,
+    pos: u64,
+    buf: &mut [u8],
+) -> vfs::error::VfsResult<usize> {
+    if offset.is_some() {
+        file.read_at(buf, pos)
+    } else {
+        file.read(buf)
+    }
+}
+
+fn current_vm_space() -> Option<Arc<VmSpace>> {
+    if !sched::is_ready() {
+        return None;
+    }
+    sched::current_task()
+        .ext_lookup(sched::TASKEXT_VM_SPACE)?
+        .downcast::<VmSpace>()
+        .ok()
 }
 
 fn read_optional_offset(user: usize) -> Result<Option<u64>, Errno> {
@@ -3678,6 +4017,10 @@ fn put_u32(out: &mut [u8], off: usize, v: u32) {
     out[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+fn put_i32(out: &mut [u8], off: usize, v: i32) {
+    out[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
 fn put_u64(out: &mut [u8], off: usize, v: u64) {
     out[off..off + 8].copy_from_slice(&v.to_le_bytes());
 }
@@ -3707,17 +4050,195 @@ fn file_type_to_d_type(kind: FileType) -> u8 {
 
 fn write_linux_statfs(user: usize, st: &FsStat) -> Result<(), Errno> {
     let mut out = [0u8; 120];
+    let total_inodes = st.total_inodes;
+    let free_inodes = st.free_inodes.min(total_inodes);
     put_i64(&mut out, 0, st.fs_type as i64);
     put_i64(&mut out, 8, st.block_size as i64);
     put_u64(&mut out, 16, st.total_blocks);
     put_u64(&mut out, 24, st.free_blocks);
     put_u64(&mut out, 32, st.avail_blocks);
-    put_u64(&mut out, 40, st.total_inodes);
-    put_u64(&mut out, 48, st.free_inodes);
+    put_u64(&mut out, 40, total_inodes);
+    put_u64(&mut out, 48, free_inodes);
     put_u64(&mut out, 56, st.fs_id);
     put_i64(&mut out, 64, st.name_max as i64);
     put_i64(&mut out, 72, st.block_size as i64);
+    put_i64(&mut out, 80, 0);
     copy_to_user(user, &out).map_err(|e| e.as_errno())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LinuxFlock {
+    lock_type: i16,
+    whence: i16,
+    start: i64,
+    len: i64,
+    pid: i32,
+}
+
+impl LinuxFlock {
+    const SIZE: usize = 32;
+
+    fn read(user: usize) -> Result<Self, Errno> {
+        if user == 0 {
+            return Err(Errno::EFAULT);
+        }
+        let mut raw = [0u8; Self::SIZE];
+        copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+        Ok(Self {
+            lock_type: i16::from_le_bytes(raw[0..2].try_into().unwrap()),
+            whence: i16::from_le_bytes(raw[2..4].try_into().unwrap()),
+            start: i64::from_le_bytes(raw[8..16].try_into().unwrap()),
+            len: i64::from_le_bytes(raw[16..24].try_into().unwrap()),
+            pid: i32::from_le_bytes(raw[24..28].try_into().unwrap()),
+        })
+    }
+
+    fn write(self, user: usize) -> Result<(), Errno> {
+        if user == 0 {
+            return Err(Errno::EFAULT);
+        }
+        let mut raw = [0u8; Self::SIZE];
+        raw[0..2].copy_from_slice(&self.lock_type.to_le_bytes());
+        raw[2..4].copy_from_slice(&self.whence.to_le_bytes());
+        put_i64(&mut raw, 8, self.start);
+        put_i64(&mut raw, 16, self.len);
+        raw[24..28].copy_from_slice(&self.pid.to_le_bytes());
+        copy_to_user(user, &raw).map_err(|e| e.as_errno())
+    }
+}
+
+fn record_lock_owner_pid(ctx: &SyscallContext<'_>) -> i32 {
+    ctx.task()
+        .thread_group()
+        .leader()
+        .and_then(|leader| leader.pid_root())
+        .or_else(|| ctx.task().pid_root())
+        .unwrap_or(0)
+}
+
+fn linux_flock_type(raw: i16) -> Result<vfs::record_lock::RecordLockType, Errno> {
+    match raw {
+        F_RDLCK => Ok(vfs::record_lock::RecordLockType::Read),
+        F_WRLCK => Ok(vfs::record_lock::RecordLockType::Write),
+        F_UNLCK => Ok(vfs::record_lock::RecordLockType::Unlock),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn linux_flock_type_raw(kind: vfs::record_lock::RecordLockType) -> i16 {
+    match kind {
+        vfs::record_lock::RecordLockType::Read => F_RDLCK,
+        vfs::record_lock::RecordLockType::Write => F_WRLCK,
+        vfs::record_lock::RecordLockType::Unlock => F_UNLCK,
+    }
+}
+
+fn validate_f_owner_type(owner_type: i32) -> Result<(), Errno> {
+    match owner_type {
+        F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn read_f_owner_ex(user: usize) -> Result<(i32, i32), Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 8];
+    copy_from_user(user, &mut raw).map_err(|e| e.as_errno())?;
+    Ok((
+        i32::from_le_bytes(raw[0..4].try_into().unwrap()),
+        i32::from_le_bytes(raw[4..8].try_into().unwrap()),
+    ))
+}
+
+fn write_f_owner_ex(user: usize, owner_type: i32, owner_pid: i32) -> Result<(), Errno> {
+    if user == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut raw = [0u8; 8];
+    put_i32(&mut raw, 0, owner_type);
+    put_i32(&mut raw, 4, owner_pid);
+    copy_to_user(user, &raw).map_err(|e| e.as_errno())
+}
+
+fn linux_lease_type(raw: i32) -> Result<vfs::lease::LeaseType, Errno> {
+    match raw {
+        raw if raw == F_RDLCK as i32 => Ok(vfs::lease::LeaseType::Read),
+        raw if raw == F_WRLCK as i32 => Ok(vfs::lease::LeaseType::Write),
+        raw if raw == F_UNLCK as i32 => Ok(vfs::lease::LeaseType::Unlock),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+fn linux_lease_type_raw(kind: vfs::lease::LeaseType) -> i32 {
+    match kind {
+        vfs::lease::LeaseType::Read => F_RDLCK as i32,
+        vfs::lease::LeaseType::Write => F_WRLCK as i32,
+        vfs::lease::LeaseType::Unlock => F_UNLCK as i32,
+    }
+}
+
+fn validate_record_lock_access(
+    file: &vfs::file::File,
+    req: &vfs::record_lock::RecordLockRequest,
+) -> Result<(), Errno> {
+    match req.lock_type {
+        vfs::record_lock::RecordLockType::Read if !file.flags().readable() => Err(Errno::EBADF),
+        vfs::record_lock::RecordLockType::Write if !file.flags().writable() => Err(Errno::EBADF),
+        _ => Ok(()),
+    }
+}
+
+fn fcntl_getlk(
+    ctx: &SyscallContext<'_>,
+    file: &vfs::file::File,
+    flock_user: usize,
+) -> Result<usize, Errno> {
+    let raw = LinuxFlock::read(flock_user)?;
+    let lock_type = linux_flock_type(raw.lock_type)?;
+    if !file.is_seekable() {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = raw;
+    let req =
+        vfs::record_lock::request_from_parts(file, lock_type, raw.whence, raw.start, raw.len)?;
+    let owner_pid = record_lock_owner_pid(ctx);
+    if req.lock_type == vfs::record_lock::RecordLockType::Unlock {
+        raw.lock_type = F_UNLCK;
+        raw.write(flock_user)?;
+        return Ok(0);
+    }
+    if let Some(conflict) = vfs::record_lock::getlk(file, owner_pid, req) {
+        let conflict = vfs::record_lock::clipped_conflict(conflict, &req);
+        raw.lock_type = linux_flock_type_raw(conflict.lock_type);
+        raw.whence = 0;
+        raw.start = conflict.start as i64;
+        raw.len = vfs::record_lock::len_from_range(conflict.start, conflict.end) as i64;
+        raw.pid = conflict.owner_pid;
+    } else {
+        raw.lock_type = F_UNLCK;
+    }
+    raw.write(flock_user)?;
+    Ok(0)
+}
+
+fn fcntl_setlk(
+    ctx: &SyscallContext<'_>,
+    file: &vfs::file::File,
+    flock_user: usize,
+    wait: bool,
+) -> Result<usize, Errno> {
+    let raw = LinuxFlock::read(flock_user)?;
+    let lock_type = linux_flock_type(raw.lock_type)?;
+    if !file.is_seekable() {
+        return Err(Errno::EINVAL);
+    }
+    let req =
+        vfs::record_lock::request_from_parts(file, lock_type, raw.whence, raw.start, raw.len)?;
+    validate_record_lock_access(file, &req)?;
+    vfs::record_lock::setlk(file, record_lock_owner_pid(ctx), req, wait)?;
+    Ok(0)
 }
 
 fn clock_now_ns(clock_id: usize) -> Result<u64, Errno> {

@@ -41,57 +41,51 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "csrrw t6, {sscratch}, t6",
         "bnez t6, 2f",
 
-        // from_kernel: t6=0(原sscratch), 原始t6在sscratch中
-        // 切换到 per-hart 中断栈（如果尚未在中断栈上）
+        // from_kernel: sscratch=0 是 S-mode 运行不变量；csrrw 后 sscratch
+        // 临时保存原始 t6，t5 尚未被破坏，可以直接写入 TrapFrame。
         "3:",
-        "csrr t6, {sscratch}",      // 取回原始 t6
+        "addi t6, sp, -{frame_size}",
+        "sd sp, {sp_off}(t6)",
+        "sd tp, {tp_off}(t6)",
+        "sd gp, {gp_off}(t6)",
+        "sd t4, {t4_off}(t6)",
+        "sd t5, {t5_off}(t6)",
+        "csrr t5, {sscratch}",      // 取回原始 t6
+        "sd t5, {t6_off}(t6)",
         "csrw {sscratch}, x0",      // sscratch 归零
-
-        // tp → HartLocal, 取 irq_stack_top
-        "ld t5, {irq_top_off}(tp)",
-        // 判断 sp 是否已在中断栈内：irq_top - IRQ_STACK_SIZE <= sp < irq_top
-        "li t4, {irq_size}",
-        "sub t4, t5, t4",           // t4 = irq_stack_bottom
-        "bltu sp, t4, 11f",         // sp < 底部 → 不在中断栈，切换
-        "bgeu sp, t5, 11f",         // sp >= 顶部 → 不在中断栈，切换
-        // 已在中断栈上（嵌套中断），继续用当前 sp
-        "addi t5, sp, -{frame_size}",
-        "sd sp, {sp_off}(t5)",
-        "sd tp, {tp_off}(t5)",
-        "j 4f",
-        // 不在中断栈，切换 sp 到中断栈顶
-        "11:",
-        "addi t5, t5, -{frame_size}", // t5 = irq_stack_top - FRAME_SIZE
-        "sd sp, {sp_off}(t5)",        // 保存原始内核 sp
-        "sd tp, {tp_off}(t5)",
+        "mv sp, t6",
         "j 4f",
 
         // from_user: t6=内核栈顶(原sscratch), sscratch=用户原t6
         // 统一页表方案：不切 satp，用户 PGD 已包含完整内核映射
         "2:",
-        "addi t5, t6, -{frame_size}",
-        "sd sp, {sp_off}(t5)",          // 保存用户 sp
-        "csrr t6, {sscratch}",          // t6 = 用户原始 t6（恢复用户值）
+        "addi t6, t6, -{frame_size}",
+        "sd sp, {sp_off}(t6)",          // 保存用户 sp
+        "sd tp, {tp_off}(t6)",
+        "sd gp, {gp_off}(t6)",
+        "sd t4, {t4_off}(t6)",
+        "sd t5, {t5_off}(t6)",
+        "csrr t5, {sscratch}",          // t5 = 用户原始 t6
+        "sd t5, {t6_off}(t6)",
         "csrr t4, {satp}",
-        "sd t4, {satp_off}(t5)",        // 保存用户 satp（resume 时恢复）
-        "addi t4, t5, {frame_size}",    // t4 = 内核栈顶（t5 + FRAME_SIZE）
-        "sd t4, {kstack_top_off}(t5)",   // 保存内核栈顶，用于恢复 sscratch
+        "sd t4, {satp_off}(t6)",        // 保存用户 satp（resume 时恢复）
+        "addi t4, t6, {frame_size}",    // t4 = 内核栈顶（t6 + FRAME_SIZE）
+        "sd t4, {kstack_top_off}(t6)",   // 保存内核栈顶，用于恢复 sscratch
         // 不切换 satp — 用户页表高半区已有内核映射，直接在用户 satp 下执行内核代码
         "csrw {sscratch}, x0",
-        "sd tp, {tp_off}(t5)",
         "la tp, {hart_locals_sym}",     // 恢复内核 tp → &HART_LOCALS[0]
+        "ld gp, {kernel_gp_off}(tp)",    // 用户态 gp 不可用于内核代码
 
         // 系统调用快速路径判断：来自 U-mode 的 ecall（scause=8）跳过 FPU 保存
-        "csrr t4, {scause}",
-        "li t3, 8",
-        "beq t4, t3, 10f",
+        "csrr t5, {scause}",
+        "li t4, 8",
+        "beq t5, t4, 10f",
         "j 4f",
 
         // 快速系统调用入口：保存通用寄存器但跳过 FPU
         "10:",
-        "mv sp, t5",
+        "mv sp, t6",
         "sd ra, {ra_off}(sp)",
-        "sd gp, {gp_off}(sp)",
         "sd t0, {t0_off}(sp)",
         "sd t1, {t1_off}(sp)",
         "sd t2, {t2_off}(sp)",
@@ -116,33 +110,76 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd s10, {s10_off}(sp)",
         "sd s11, {s11_off}(sp)",
         "sd t3, {t3_off}(sp)",
-        "sd t4, {t4_off}(sp)",
-        "sd t5, {t5_off}(sp)",
-        "sd t6, {t6_off}(sp)",
 
         "csrr t0, {sepc}",
         "sd t0, {sepc_off}(sp)",
         "csrr t0, {sstatus}",
         "sd t0, {status_off}(sp)",
-        "sd t4, {cause_off}(sp)",       // t4 还是 scause=8
-        "csrr t0, {stval}",
-        "sd t0, {tval_off}(sp)",
+        "sd t5, {cause_off}(sp)",       // t5 还是 scause=8
+        // stval 对 syscall 无意义，跳过
 
         // 调用 syscall 快速路径 handler（不保存/恢复 FPU）
         "mv a0, sp",
         "ld a1, {sp_off}(sp)",
         "call {fast_handler}",
 
-        // 快速处理器返回陷阱帧指针
+        // 返回值：0=halt, 奇数=完整恢复, 偶数(非零)=快速恢复
         "beqz a0, 6f",
+        "andi t0, a0, 1",
+        "bnez t0, 11f",
+
+        // 快速 syscall resume：只恢复 ABI 要求的寄存器
+        "mv s11, a0",
+        "ld t0, {sepc_off}(s11)",
+        "csrw {sepc}, t0",
+        "ld t0, {status_off}(s11)",
+        "andi t0, t0, -3",
+        "csrw {sstatus}, t0",
+        "ld t0, {kstack_top_off}(s11)",
+        "csrw {sscratch}, t0",
+        "ld ra, {ra_off}(s11)",
+        "ld tp, {tp_off}(s11)",
+        "ld gp, {gp_off}(s11)",
+        "ld t0, {t0_off}(s11)",
+        "ld t1, {t1_off}(s11)",
+        "ld t2, {t2_off}(s11)",
+        "ld s0, {s0_off}(s11)",
+        "ld s1, {s1_off}(s11)",
+        "ld a0, {a0_off}(s11)",
+        "ld a1, {a1_off}(s11)",
+        "ld a2, {a2_off}(s11)",
+        "ld a3, {a3_off}(s11)",
+        "ld a4, {a4_off}(s11)",
+        "ld a5, {a5_off}(s11)",
+        "ld a6, {a6_off}(s11)",
+        "ld a7, {a7_off}(s11)",
+        "ld s2, {s2_off}(s11)",
+        "ld s3, {s3_off}(s11)",
+        "ld s4, {s4_off}(s11)",
+        "ld s5, {s5_off}(s11)",
+        "ld s6, {s6_off}(s11)",
+        "ld s7, {s7_off}(s11)",
+        "ld s8, {s8_off}(s11)",
+        "ld s9, {s9_off}(s11)",
+        "ld s10, {s10_off}(s11)",
+        "ld t3, {t3_off}(s11)",
+        "ld t4, {t4_off}(s11)",
+        "ld t5, {t5_off}(s11)",
+        "ld t6, {t6_off}(s11)",
+        "ld sp, {sp_off}(s11)",
+        "ld s11, {s11_off}(s11)",
+        "sret",
+
+        // 完整恢复路径（FPU active 或需要调度）
+        "11:",
+        "andi a0, a0, -2",
         "tail {resume}",
 
         // 保存上下文：
         "4:",
-        "mv sp, t5",
+        "mv sp, t6",
 
         "sd ra, {ra_off}(sp)",
-        "sd gp, {gp_off}(sp)",
         "sd t0, {t0_off}(sp)",
         "sd t1, {t1_off}(sp)",
         "sd t2, {t2_off}(sp)",
@@ -167,9 +204,6 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "sd s10, {s10_off}(sp)",
         "sd s11, {s11_off}(sp)",
         "sd t3, {t3_off}(sp)",
-        "sd t4, {t4_off}(sp)",
-        "sd t5, {t5_off}(sp)",
-        "sd t6, {t6_off}(sp)",
 
         "csrr t0, {sepc}",
         "sd t0, {sepc_off}(sp)",
@@ -210,6 +244,9 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
         "5:",
 
         "mv a0, sp",
+        "call {save_vector}",
+
+        "mv a0, sp",
         "ld a1, {sp_off}(sp)",
         "call {handler}",
 
@@ -224,10 +261,10 @@ pub unsafe extern "C" fn __riscv_exception_entry() {
 
         handler = sym riscv64_handle_exception,
         fast_handler = sym riscv64_fast_syscall_dispatch,
+        save_vector = sym crate::riscv64::vector::save_vector_from_trap_entry,
         resume = sym crate::riscv64::task::__riscv64_resume_to_trap_frame,
         frame_size = const FRAME_SIZE,
-        irq_top_off = const HART_LOCAL_IRQ_STACK_TOP_OFF,
-        irq_size = const IRQ_STACK_SIZE,
+        kernel_gp_off = const HART_LOCAL_KERNEL_GP_OFF,
         hart_locals_sym = sym crate::riscv64::specific::HART_LOCALS,
 
         sscratch = const CSR_SSCRATCH,

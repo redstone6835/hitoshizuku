@@ -9,10 +9,7 @@ use core::arch::naked_asm;
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.efi.entry")]
-pub unsafe extern "C" fn efi_pe_entry_trampoline(
-    _image_handle: usize,
-    _system_table: usize,
-) {
+pub unsafe extern "C" fn efi_pe_entry_trampoline(_image_handle: usize, _system_table: usize) {
     naked_asm!(
         "la a0, {msg}",
         "j {panic_fn}",

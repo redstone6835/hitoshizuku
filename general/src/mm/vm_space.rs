@@ -279,7 +279,7 @@ pub struct VmSpace {
     vmas: spin::Mutex<VmaSet>,
     pages: spin::Mutex<BTreeMap<usize, PageMapping>>,
     pgd: PgdHandle,
-    brk_start: usize,
+    brk_start: AtomicUsize,
     brk_current: AtomicUsize,
     mmap_next: AtomicUsize,
     mlock_future: AtomicBool,
@@ -303,7 +303,7 @@ impl VmSpace {
             vmas: spin::Mutex::new(VmaSet::new()),
             pages: spin::Mutex::new(BTreeMap::new()),
             pgd,
-            brk_start: layout.user_heap_base,
+            brk_start: AtomicUsize::new(layout.user_heap_base),
             brk_current: AtomicUsize::new(layout.user_heap_base),
             mmap_next: AtomicUsize::new(layout.user_mmap_base),
             mlock_future: AtomicBool::new(false),
@@ -331,12 +331,25 @@ impl VmSpace {
         self.brk_current.load(Ordering::Acquire)
     }
 
-    /// ELF loader 装载完成后调用：将 brk 起点对齐到已装载段末尾的下一页。
+    /// ELF loader 装载完成后调用：将 brk 起点对齐到主程序数据段末尾。
     pub fn init_brk_after_load(&self, max_segment_end: usize) {
         let page_size = page_size();
         let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
-        // brk 必须不低于当前最小值，并跟随段尾上移
-        let brk = new_brk.max(self.brk_start);
+        let brk = new_brk.max(self.brk_start.load(Ordering::Relaxed));
+        self.brk_start.store(brk, Ordering::Release);
+        self.brk_current.store(brk, Ordering::Release);
+    }
+
+    /// 对 PIE 主程序使用的 brk 初始化。
+    ///
+    /// `user_heap_base` 是架构选择的独立 brk 区域。低地址 PIE 可以自然落在 heap
+    /// base 之前；高地址 PIE 则必须把 brk 起点整体放到主程序段之后，不能只更新
+    /// current，否则后续 brk shrink 会跨过一大段非 heap 区间。
+    pub fn init_brk_after_pie_load(&self, max_segment_end: usize) {
+        let page_size = page_size();
+        let new_brk = align_up(max_segment_end, page_size).unwrap_or(max_segment_end);
+        let brk = new_brk.max(self.brk_start.load(Ordering::Relaxed));
+        self.brk_start.store(brk, Ordering::Release);
         self.brk_current.store(brk, Ordering::Release);
     }
 
@@ -344,7 +357,8 @@ impl VmSpace {
         if requested == 0 {
             return self.current_brk();
         }
-        if requested < self.brk_start {
+        let brk_start = self.brk_start.load(Ordering::Relaxed);
+        if requested < brk_start {
             return self.current_brk();
         }
 
@@ -391,8 +405,8 @@ impl VmSpace {
             .clamp(layout.user_mmap_base, layout.user_mmap_limit);
         let set = self.vmas.lock();
         let candidates = [
-            (cursor, layout.user_mmap_limit),
             (layout.user_mmap_base, cursor),
+            (cursor, layout.user_mmap_limit),
         ];
         for (start, end) in candidates {
             if start >= end {
@@ -973,7 +987,7 @@ impl VmSpace {
                 let old_access = mapping.access;
                 mapping.access = access_after_fork(area.flags, &mapping.page);
                 if old_access != mapping.access {
-                    self.protect_page(*va, pte_flags_for(area.flags, mapping.access))
+                    self.protect_page_no_flush(*va, pte_flags_for(area.flags, mapping.access))
                         .expect("[mm] fork parent protect failed");
                 }
                 let child_mapping = mapping.clone();
@@ -985,6 +999,9 @@ impl VmSpace {
                 ));
                 child_pages.insert(*va, child_mapping);
             }
+        }
+        if !child_maps.is_empty() {
+            self.flush_full_user_tlb();
         }
 
         for (va, page, flags, access) in &child_maps {
@@ -1007,7 +1024,7 @@ impl VmSpace {
             vmas: spin::Mutex::new(cloned_set),
             pages: spin::Mutex::new(child_pages),
             pgd: new_pgd,
-            brk_start: self.brk_start,
+            brk_start: AtomicUsize::new(self.brk_start.load(Ordering::Relaxed)),
             brk_current: AtomicUsize::new(self.current_brk()),
             mmap_next: AtomicUsize::new(self.mmap_next.load(Ordering::Acquire)),
             mlock_future: AtomicBool::new(self.mlock_future.load(Ordering::Acquire)),
@@ -1055,6 +1072,49 @@ impl VmSpace {
         }
 
         self.commit_fault_page(page, backing, flags, area_start, kind)
+    }
+
+    /// 取得从用户地址读取的一页内连续窗口。
+    ///
+    /// 这个接口面向大块 I/O / bulk copy 热路径：先通过 VmSpace 完成权限检查、
+    /// lazy fault-in 和 COW，再把 resident page 的物理页转成内核直映 slice。
+    /// 因此闭包内访问的是内核地址，不需要走 arch uaccess 的逐元素 fixup。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证闭包不会保存传入 slice；用户映射可能被其它线程并发改变，
+    /// 本函数只通过 resident page 的 Arc 保证底层物理页在闭包期间不被释放。
+    pub unsafe fn with_user_read_slice<R>(
+        &self,
+        user: usize,
+        max_len: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, Errno> {
+        let (_page, kva, len) = self.user_page_window(user, max_len, FaultKind::Load)?;
+        let slice = unsafe { core::slice::from_raw_parts(kva as *const u8, len) };
+        Ok(f(slice))
+    }
+
+    /// 取得写入用户地址的一页内连续窗口。
+    ///
+    /// Store fault 会在返回前解析 COW / shared dirty 状态。闭包返回后再次标脏，
+    /// 覆盖 VFS 在闭包内写入用户页但没有显式 fault 的场景。
+    ///
+    /// # Safety
+    ///
+    /// 同 [`Self::with_user_read_slice`]。调用方还必须保证闭包不会制造跨线程可见
+    /// 的长期 `&mut [u8]` 别名。
+    pub unsafe fn with_user_write_slice<R>(
+        &self,
+        user: usize,
+        max_len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, Errno> {
+        let (page, kva, len) = self.user_page_window(user, max_len, FaultKind::Store)?;
+        let slice = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
+        let result = f(slice);
+        page.mark_dirty();
+        Ok(result)
     }
 
     /// 立即为一个 ELF 段分配并填充物理页。
@@ -1110,6 +1170,82 @@ impl VmSpace {
         Ok(())
     }
 
+    /// 立即为一个 ELF 段分配并从文件按页填充。
+    ///
+    /// loader 不能为了装载大可执行文件把整个 ELF 读进内核堆。这个入口只在
+    /// 当前页需要文件内容时读取最多一页，BSS 和页内尾部仍由零页分配保证清零。
+    pub fn commit_file_segment(
+        &self,
+        vaddr: usize,
+        memsz: usize,
+        file_offset: u64,
+        file_size: usize,
+        file: &dyn FileLike,
+        flags: VmFlags,
+    ) -> Result<(), Errno> {
+        if memsz == 0 {
+            return Ok(());
+        }
+        if file_size > memsz {
+            return Err(Errno::EINVAL);
+        }
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EINVAL)?;
+
+        let page_size = page_size();
+        let start = page_base(vaddr);
+        let end_unaligned = vaddr.checked_add(memsz).ok_or(Errno::EINVAL)?;
+        let end = align_up(end_unaligned, page_size).ok_or(Errno::EINVAL)?;
+        let file_end_vaddr = vaddr.checked_add(file_size).ok_or(Errno::EINVAL)?;
+        let area_flags = flags.with(VmFlags::USER).with(VmFlags::ANON);
+
+        self.map_anon(start..end, area_flags)?;
+
+        let mut pages = self.pages.lock();
+        let mut page_va = start;
+        while page_va < end {
+            let paddr = alloc_zeroed_user_page().ok_or(Errno::ENOMEM)?;
+            let result = (|| {
+                let copy_start_va = page_va.max(vaddr);
+                let copy_end_va = (page_va + page_size).min(file_end_vaddr);
+                if copy_end_va <= copy_start_va {
+                    return Ok(());
+                }
+
+                let seg_off = copy_start_va - vaddr;
+                let len = copy_end_va - copy_start_va;
+                let dst_off_in_page = copy_start_va - page_va;
+                let kva = virt_fn(paddr) + dst_off_in_page;
+                let dst = unsafe { core::slice::from_raw_parts_mut(kva as *mut u8, len) };
+                let mut done = 0usize;
+                while done < len {
+                    let read_off = file_offset
+                        .checked_add((seg_off + done) as u64)
+                        .ok_or(Errno::EINVAL)?;
+                    let n = file.read_at(read_off, &mut dst[done..])?;
+                    if n == 0 {
+                        return Err(Errno::ENOEXEC);
+                    }
+                    done += n;
+                }
+                Ok(())
+            })();
+            if let Err(err) = result {
+                free_user_page(paddr);
+                return Err(err);
+            }
+
+            let page = ResidentPage::new_anon(paddr);
+            let access = access_for_new_page(area_flags, &page);
+            self.map_page(page_va, page.paddr(), pte_flags_for(area_flags, access))?;
+            pages.insert(page_va, PageMapping { page, access });
+            page_va += page_size;
+        }
+        self.mapped_pages.store(pages.len(), Ordering::Release);
+        Ok(())
+    }
+
     fn validate_range(&self, range: &Range<usize>) -> Result<(), Errno> {
         let page_size = page_size();
         if range.start % page_size != 0 || range.end % page_size != 0 {
@@ -1119,6 +1255,36 @@ impl VmSpace {
             return Err(Errno::EINVAL);
         }
         Ok(())
+    }
+
+    fn user_page_window(
+        &self,
+        user: usize,
+        max_len: usize,
+        kind: FaultKind,
+    ) -> Result<(Arc<ResidentPage>, usize, usize), Errno> {
+        if max_len == 0 || user.checked_add(max_len - 1).is_none() {
+            return Err(Errno::EFAULT);
+        }
+        match self.handle_fault(user, kind) {
+            FaultOutcome::Fixed => {}
+            FaultOutcome::Segv | FaultOutcome::Kernel(_) => return Err(Errno::EFAULT),
+        }
+
+        let page_va = page_base(user);
+        let offset = user - page_va;
+        let len = max_len.min(page_size() - offset);
+        let page = {
+            let pages = self.pages.lock();
+            pages
+                .get(&page_va)
+                .map(|mapping| Arc::clone(&mapping.page))
+                .ok_or(Errno::EFAULT)?
+        };
+        let virt_fn = allocator::KERNEL_ALLOCATOR
+            .load_phys_to_virt()
+            .ok_or(Errno::EFAULT)?;
+        Ok((Arc::clone(&page), virt_fn(page.paddr()) + offset, len))
     }
 
     fn commit_fault_page(
@@ -1185,6 +1351,12 @@ impl VmSpace {
         kind: FaultKind,
         mapping: &mut PageMapping,
     ) -> FaultOutcome {
+        if matches!(kind, FaultKind::Privilege) {
+            return match self.protect_page(page_va, pte_flags_for(flags, mapping.access)) {
+                Ok(()) => FaultOutcome::Fixed,
+                Err(err) => fault_from_errno(err),
+            };
+        }
         if !is_write_fault(kind) {
             return FaultOutcome::Fixed;
         }
@@ -1240,8 +1412,36 @@ impl VmSpace {
 
     fn protect_page(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
         let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
-        unsafe { (ops.protect)(self.pgd, vaddr, page_size(), flags.with(VmFlags::USER)) };
+        let page_size = page_size();
+        unsafe {
+            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
+            // mprotect 会在 pthread 创建路径把预留栈从 PROT_NONE 改为 RW。
+            // 权限位修改后必须刷掉旧 TLB，否则用户态可能继续命中旧的不可访问权限。
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
+        }
         Ok(())
+    }
+
+    fn protect_page_no_flush(&self, vaddr: usize, flags: VmFlags) -> Result<(), Errno> {
+        let ops = user_pgd_ops().ok_or(Errno::EINVAL)?;
+        let page_size = page_size();
+        unsafe {
+            (ops.protect)(self.pgd, vaddr, page_size, flags.with(VmFlags::USER));
+        }
+        Ok(())
+    }
+
+    fn invalidate_user_range(&self, vaddr: usize, len: usize) {
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.invalidate_range)(self.pgd, vaddr, len) };
+        }
+    }
+
+    fn flush_full_user_tlb(&self) {
+        // vaddr=1, len=usize::MAX 会溢出，触发 arch 层全局 flush（with_asid(asid, None)）。
+        if let Some(ops) = user_pgd_ops() {
+            unsafe { (ops.invalidate_range)(self.pgd, 1, usize::MAX) };
+        }
     }
 
     fn replace_page(&self, vaddr: usize, paddr: usize, flags: VmFlags) -> Result<(), Errno> {
@@ -1251,6 +1451,7 @@ impl VmSpace {
             (ops.unmap)(self.pgd, vaddr, page_size);
             (ops.invalidate_range)(self.pgd, vaddr, page_size);
             (ops.map)(self.pgd, vaddr, paddr, flags.with(VmFlags::USER));
+            (ops.invalidate_range)(self.pgd, vaddr, page_size);
         }
         Ok(())
     }
@@ -1532,6 +1733,7 @@ fn permits(flags: VmFlags, kind: FaultKind) -> bool {
         FaultKind::Load | FaultKind::PermRead => flags.has(VmFlags::READ),
         FaultKind::Store | FaultKind::PermWrite => flags.has(VmFlags::WRITE),
         FaultKind::Exec | FaultKind::PermExec => flags.has(VmFlags::EXEC),
+        FaultKind::Privilege => flags.permissions().bits() != 0,
     }
 }
 

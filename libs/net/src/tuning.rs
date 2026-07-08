@@ -82,24 +82,24 @@ pub struct NetTuning {
 
 /// 默认 TCP 缓冲区大小。
 ///
-/// 64 KiB 能覆盖常见窗口规模，并且保持单 socket 内存占用可控。
-pub const DEFAULT_TCP_BUFFER_BYTES: usize = 64 * 1024;
+// 默认 TCP 缓冲区大小
+pub const DEFAULT_TCP_BUFFER_BYTES: usize = 256 * 1024;
 
 /// 默认 UDP 数据区大小。
-pub const DEFAULT_UDP_BUFFER_BYTES: usize = 16 * 1024;
+pub const DEFAULT_UDP_BUFFER_BYTES: usize = 128 * 1024;
 
 /// 默认 raw/ICMP 数据区大小。
 pub const DEFAULT_CONTROL_BUFFER_BYTES: usize = 8 * 1024;
 
 /// 默认数据包元数据队列深度。
-pub const DEFAULT_PACKET_META_COUNT: usize = 32;
+pub const DEFAULT_PACKET_META_COUNT: usize = 256;
 
 /// 默认主动 poll 预算。
 ///
 /// 主动 poll 只用于刚产生出站事件后的快速推进；主定时路径仍负责长期重传和
 /// 超时。该预算允许 loopback 在一次系统调用内完成握手，同时避免热路径固定
 /// 空转过多轮。
-pub const DEFAULT_ACTIVE_POLL_ROUNDS: usize = 16;
+pub const DEFAULT_ACTIVE_POLL_ROUNDS: usize = 128;
 
 /// 默认 TCP accept 待连接队列长度。
 pub const DEFAULT_TCP_ACCEPT_BACKLOG: usize = 128;

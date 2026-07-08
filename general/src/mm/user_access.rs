@@ -11,14 +11,44 @@
 //! 任何"用户提供的指针越界 / 未映射"都会回归到 `Err(Fault)`，不会引发 panic。
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 
 use mm::UserAccessError;
 
 use crate::mm::ops::user_access_ops;
+use crate::mm::vm_space::VmSpace;
 
 /// 从用户地址 `user` 读 `dst.len()` 字节到 `dst`。
 pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    if user.checked_add(dst.len()).is_none() {
+        return Err(UserAccessError::Fault);
+    }
+    if let Some(vm) = current_task_vm_space() {
+        let dst_ptr = dst.as_mut_ptr();
+        let total = dst.len();
+        let mut copied = 0usize;
+        while copied < total {
+            let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
+            let n = unsafe {
+                vm.with_user_read_slice(user_ptr, total - copied, |src| {
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr.add(copied), src.len());
+                    src.len()
+                })
+            }
+            .map_err(|_| UserAccessError::Fault)?;
+            if n == 0 {
+                return Err(UserAccessError::Fault);
+            }
+            copied += n;
+        }
+        return Ok(());
+    }
+
     let Some(ops) = user_access_ops() else {
         return Err(UserAccessError::Fault);
     };
@@ -29,6 +59,37 @@ pub fn copy_from_user(user: usize, dst: &mut [u8]) -> Result<(), UserAccessError
 
 /// 把 `src` 写到用户地址 `user`。
 pub fn copy_to_user(user: usize, src: &[u8]) -> Result<(), UserAccessError> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if user.checked_add(src.len()).is_none() {
+        return Err(UserAccessError::Fault);
+    }
+    if let Some(vm) = current_task_vm_space() {
+        let src_ptr = src.as_ptr();
+        let total = src.len();
+        let mut copied = 0usize;
+        while copied < total {
+            let user_ptr = user.checked_add(copied).ok_or(UserAccessError::Fault)?;
+            let n = unsafe {
+                vm.with_user_write_slice(user_ptr, total - copied, |dst| {
+                    core::ptr::copy_nonoverlapping(
+                        src_ptr.add(copied),
+                        dst.as_mut_ptr(),
+                        dst.len(),
+                    );
+                    dst.len()
+                })
+            }
+            .map_err(|_| UserAccessError::Fault)?;
+            if n == 0 {
+                return Err(UserAccessError::Fault);
+            }
+            copied += n;
+        }
+        return Ok(());
+    }
+
     let Some(ops) = user_access_ops() else {
         return Err(UserAccessError::Fault);
     };
@@ -50,4 +111,13 @@ pub fn copy_cstr_from_user(user: usize, max: usize) -> Result<String, UserAccess
     // 用户态可能在 strnlen 之后写入非 UTF-8 字节；这里转换失败回 Fault 而非
     // 自定义错误码——上层只关心"读到了"vs"读不到"。
     String::from_utf8(buf).map_err(|_| UserAccessError::Fault)
+}
+
+fn current_task_vm_space() -> Option<Arc<VmSpace>> {
+    if !sched::is_ready() {
+        return None;
+    }
+    let task = sched::current_task();
+    let payload: Arc<dyn Any + Send + Sync> = task.ext_lookup(sched::TASKEXT_VM_SPACE)?;
+    payload.downcast::<VmSpace>().ok()
 }

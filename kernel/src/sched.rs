@@ -44,6 +44,9 @@ pub(crate) const TASKEXT_EXEC_PATH: TaskExtKey = sched::TASKEXT_EXEC_PATH;
 pub(crate) const TASKEXT_EXEC_ARGS: TaskExtKey = sched::TASKEXT_EXEC_ARGS;
 pub(crate) const TASKEXT_EXEC_ENVP: TaskExtKey = sched::TASKEXT_EXEC_ENVP;
 
+#[cfg(target_arch = "riscv64")]
+type RiscvVectorSignalStack = Spinlock<Vec<Option<arch::riscv64::vector::UserVectorState>>>;
+
 pub fn stash_boot_console_name(name: alloc::string::String) {
     *BOOT_CONSOLE_NAME.lock() = Some(name);
 }
@@ -129,6 +132,12 @@ impl TaskExtCloneHook for KernelExtCloneHook {
                     Arc::new(s.fork())
                 }
             }
+            #[cfg(target_arch = "riscv64")]
+            sched::TASKEXT_RISCV_VECTOR_STATE => arch::riscv64::vector::clone_ext_payload(src),
+            #[cfg(target_arch = "riscv64")]
+            sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK => {
+                Arc::new(RiscvVectorSignalStack::new(Vec::new()))
+            }
             _ => Arc::clone(src),
         }
     }
@@ -140,6 +149,12 @@ struct KernelExtExitHook;
 
 impl TaskExtExitHook for KernelExtExitHook {
     fn cleanup_on_exit(&self, task: &Arc<Task>) {
+        #[cfg(target_arch = "riscv64")]
+        arch::riscv64::vector::clear_for_task(task);
+        #[cfg(target_arch = "riscv64")]
+        {
+            let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
+        }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
@@ -227,10 +242,13 @@ const EXEC_MAX_ARG_BYTES: usize = 128 * 1024;
 const SIGFRAME_MAGIC: u64 = 0x4d59474f_53494746; // "MYGOSIGF"
 const SIGFRAME_HEADER_SIZE: usize = 64;
 const SIGFRAME_SIGINFO_SIZE: usize = 128;
-const SIGFRAME_UCONTEXT_HEAD_SIZE: usize = 64;
+const SIGFRAME_UCONTEXT_SIGMASK_OFF: usize = 40;
+const SIGFRAME_UCONTEXT_MCONTEXT_OFF: usize = 176;
+const SIGFRAME_MCONTEXT_SIZE: usize = 272;
+const SIGFRAME_UCONTEXT_SIZE: usize = SIGFRAME_UCONTEXT_MCONTEXT_OFF + SIGFRAME_MCONTEXT_SIZE;
 const SIGFRAME_SIGINFO_OFF: usize = SIGFRAME_HEADER_SIZE;
 const SIGFRAME_UCONTEXT_OFF: usize = SIGFRAME_SIGINFO_OFF + SIGFRAME_SIGINFO_SIZE;
-const SIGFRAME_TRAP_OFF: usize = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_HEAD_SIZE;
+const SIGFRAME_TRAP_OFF: usize = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_SIZE;
 // 当前 LoongArch64 用户陷阱帧约 552 字节。信号路径不用堆分配，但也不能在
 // 64KiB 内核栈上放 16KiB 大对象；2KiB 给后续寄存器扩展留出余量。
 const SIGFRAME_TRAP_BUF_SIZE: usize = 2048;
@@ -324,14 +342,48 @@ fn activate_task_vm(task: &Arc<Task>) {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
+fn push_riscv_vector_signal_snapshot(
+    task: &Arc<Task>,
+    user_ctx: UserContextRef,
+) -> Result<(), Errno> {
+    let tf = unsafe { &mut *(user_ctx.as_usize() as *mut arch::riscv64::TrapFrame) };
+    let snapshot = arch::riscv64::vector::snapshot_current_for_signal(tf);
+    let stack = if let Some(stack) = task
+        .ext_lookup(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
+        .and_then(|payload| payload.downcast::<RiscvVectorSignalStack>().ok())
+    {
+        stack
+    } else {
+        let stack = Arc::new(RiscvVectorSignalStack::new(Vec::new()));
+        task.ext_install(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK, stack.clone());
+        stack
+    };
+    let mut guard = stack.lock();
+    guard.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
+    guard.push(snapshot);
+    Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+fn pop_riscv_vector_signal_snapshot(task: &Arc<Task>, user_ctx: UserContextRef) {
+    let Some(stack) = task
+        .ext_lookup(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK)
+        .and_then(|payload| payload.downcast::<RiscvVectorSignalStack>().ok())
+    else {
+        return;
+    };
+    let Some(snapshot) = stack.lock().pop() else {
+        return;
+    };
+    let tf = unsafe { &mut *(user_ctx.as_usize() as *mut arch::riscv64::TrapFrame) };
+    arch::riscv64::vector::restore_signal_snapshot(tf, snapshot);
+}
+
 unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
     let frame = {
         let me = sched::current_task();
         activate_task_vm(&me);
-        let kstack_top = me
-            .kernel_stack_top()
-            .expect("[sched][clone] user child missing kernel stack");
-        hal::user_context::set_kernel_trap_stack(kstack_top);
 
         let payload = me
             .ext_remove(TASKEXT_USER_TRAP_FRAME)
@@ -339,7 +391,13 @@ unsafe extern "C" fn user_clone_entry(_arg: usize) -> ! {
         let frame = payload
             .downcast::<UserTrapFrame>()
             .expect("[sched][clone] saved trap frame type mismatch");
-        *frame
+        let mut frame = *frame;
+        let kstack_top = me
+            .kernel_stack_top()
+            .expect("[sched][clone] user child missing kernel stack");
+        frame.set_current_address_space();
+        frame.set_kernel_stack_top(kstack_top);
+        frame
     };
 
     unsafe { frame.resume() }
@@ -382,6 +440,8 @@ fn process_execve(
 
     let _ = task.ext_remove(TASKEXT_VM_SPACE);
     task.ext_install(TASKEXT_VM_SPACE, loaded.vm.clone());
+    #[cfg(target_arch = "riscv64")]
+    arch::riscv64::vector::clear_for_task(task);
     loaded.vm.activate();
     install_exec_metadata(task, &loaded.exec_path, &argv, &envp);
     if let Some(fdt) = task_fdtable(task) {
@@ -395,7 +455,8 @@ fn process_execve(
 
     let kstack_top = task.ensure_kernel_stack();
     hal::user_context::set_kernel_trap_stack(kstack_top);
-    let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    frame.set_kernel_stack_top(kstack_top);
     frame.apply_to_context(user_ctx.as_usize());
     Ok(())
 }
@@ -465,10 +526,6 @@ fn process_clone_user_context(
     }
 
     let _ = child.ext_remove(TASKEXT_USER_TRAP_FRAME);
-    // 清零 kstack_top：clone 帧从父进程拷贝了父的栈顶值，
-    // 若保留会在 resume 时错误覆盖 sscratch 为父进程的栈，
-    // 导致子进程中断处理写入父栈，损坏父进程数据。
-    frame.set_kernel_stack_top(0);
     child.ext_install(TASKEXT_USER_TRAP_FRAME, Arc::new(frame));
     child.into_kernel_thread(user_clone_entry, 0);
     Ok(())
@@ -490,14 +547,33 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     let old_mask = read_u64(&header, 16);
     let trap_off = read_u64(&header, 24) as usize;
     let trap_len = read_u64(&header, 32) as usize;
+    let ucontext_off = read_u64(&header, 48) as usize;
+    let abi_pc = read_u64(&header, 56) as usize;
     let trap_end = trap_off.checked_add(trap_len).ok_or(Errno::EINVAL)?;
+    let ucontext_mcontext = ucontext_off
+        .checked_add(SIGFRAME_UCONTEXT_MCONTEXT_OFF)
+        .ok_or(Errno::EINVAL)?;
+    let ucontext_mcontext_end = ucontext_mcontext
+        .checked_add(SIGFRAME_MCONTEXT_SIZE)
+        .ok_or(Errno::EINVAL)?;
     if trap_off < SIGFRAME_HEADER_SIZE
         || trap_len != UserTrapFrame::encoded_len()
         || trap_end > total
+        || ucontext_off < SIGFRAME_HEADER_SIZE
+        || ucontext_mcontext_end > total
         || total > 16 * 1024
     {
         return Err(Errno::EINVAL);
     }
+
+    let mut mask_raw = [0u8; 8];
+    let mask_addr = sp
+        .checked_add(ucontext_off)
+        .and_then(|base| base.checked_add(SIGFRAME_UCONTEXT_SIGMASK_OFF))
+        .ok_or(Errno::EINVAL)?;
+    let restore_mask = copy_from_user(mask_addr, &mut mask_raw)
+        .map(|_| u64::from_le_bytes(mask_raw))
+        .unwrap_or(old_mask);
 
     // 信号返回是 lmbench lat_sig 的热路径；陷阱帧大小固定，避免每次
     // rt_sigreturn 都走堆分配。
@@ -508,10 +584,24 @@ fn process_sigreturn(task: &Arc<Task>, user_ctx: UserContextRef) -> Result<(), E
     let trap_bytes = &mut trap_storage[..trap_len];
     copy_from_user(sp.checked_add(trap_off).ok_or(Errno::EINVAL)?, trap_bytes)
         .map_err(|e| e.as_errno())?;
-    let restored = UserTrapFrame::read_bytes(trap_bytes).ok_or(Errno::EINVAL)?;
+    let mut restored = UserTrapFrame::read_bytes(trap_bytes).ok_or(Errno::EINVAL)?;
+    let mut mcontext_storage = [0u8; SIGFRAME_MCONTEXT_SIZE];
+    copy_from_user(
+        sp.checked_add(ucontext_mcontext).ok_or(Errno::EINVAL)?,
+        &mut mcontext_storage,
+    )
+    .map_err(|e| e.as_errno())?;
+    let mcontext_pc = read_u64(&mcontext_storage, 0) as usize;
+    if mcontext_pc != abi_pc {
+        if !restored.apply_linux_mcontext(&mcontext_storage) {
+            return Err(Errno::EINVAL);
+        }
+    }
     task.signal
-        .block(SigSet::from_raw(old_mask), SigProcMaskHow::SetMask);
+        .block(SigSet::from_raw(restore_mask), SigProcMaskHow::SetMask);
     restored.apply_to_context(user_ctx.as_usize());
+    #[cfg(target_arch = "riscv64")]
+    pop_riscv_vector_signal_snapshot(task, user_ctx);
     Ok(())
 }
 
@@ -572,7 +662,7 @@ fn process_setup_signal_frame(
     write_u64(frame_bytes, 32, trap_len as u64);
     write_u64(frame_bytes, 40, SIGFRAME_SIGINFO_OFF as u64);
     write_u64(frame_bytes, 48, SIGFRAME_UCONTEXT_OFF as u64);
-    write_u64(frame_bytes, 56, info.sig.raw() as u64);
+    write_u64(frame_bytes, 56, 0);
 
     write_siginfo(
         &mut frame_bytes[SIGFRAME_SIGINFO_OFF..][..SIGFRAME_SIGINFO_SIZE],
@@ -580,11 +670,33 @@ fn process_setup_signal_frame(
     );
     write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF, 0); // uc_flags
     write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF + 8, 0); // uc_link
-    write_u64(frame_bytes, SIGFRAME_UCONTEXT_OFF + 40, old_mask.raw()); // uc_sigmask
+    write_u64(
+        frame_bytes,
+        SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_SIGMASK_OFF,
+        old_mask.raw(),
+    );
+    let mcontext_start = SIGFRAME_UCONTEXT_OFF + SIGFRAME_UCONTEXT_MCONTEXT_OFF;
+    if !saved.write_linux_mcontext(&mut frame_bytes[mcontext_start..][..SIGFRAME_MCONTEXT_SIZE]) {
+        return Err(Errno::EINVAL);
+    }
+    let mut abi_pc = saved.pc();
+    if info.sig.raw() >= 32 && (saved.ret() as isize) == -(Errno::EINTR.as_i32() as isize) {
+        // musl 的取消信号 handler 用 ucontext PC 判断线程是否正处于
+        // __syscall_cp 的可取消区间。syscall dispatcher 已经把真实返回 PC
+        // 推到 syscall 之后；ABI ucontext 需要暴露 syscall 指令位置，而
+        // 内核私有 trap 副本仍保留真实返回位置供 rt_sigreturn 使用。
+        if let Some(syscall_pc) = saved.signal_interrupted_syscall_pc() {
+            write_u64(frame_bytes, mcontext_start, syscall_pc as u64);
+            abi_pc = syscall_pc;
+        }
+    }
+    write_u64(frame_bytes, 56, abi_pc as u64);
     if !saved.write_bytes(&mut frame_bytes[SIGFRAME_TRAP_OFF..]) {
         return Err(Errno::EINVAL);
     }
     copy_to_user(new_sp, &frame_bytes).map_err(|e| e.as_errno())?;
+    #[cfg(target_arch = "riscv64")]
+    push_riscv_vector_signal_snapshot(task, user_ctx)?;
 
     let mut handler_mask = old_mask.union(action.mask);
     if !action.flags.has(SigActionFlags::SA_NODEFER) {
@@ -762,8 +874,9 @@ fn enter_loaded_user_image(
 
     let kstack_top = task.ensure_kernel_stack();
     loaded.vm.activate();
-    let frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
     hal::user_context::set_kernel_trap_stack(kstack_top);
+    let mut frame = UserTrapFrame::init_user(loaded.entry_pc, loaded.user_sp, 0);
+    frame.set_kernel_stack_top(kstack_top);
     unsafe { frame.resume() }
 }
 

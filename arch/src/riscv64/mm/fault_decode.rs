@@ -15,13 +15,8 @@ use general::TrapFramePtr;
 use general::mm::{FaultDecodeOps, FaultKind};
 
 use crate::riscv64::specific::{
-    TrapFrame,
-    EXC_INST_PAGE_FAULT,
-    EXC_LOAD_PAGE_FAULT,
-    EXC_STORE_PAGE_FAULT,
-    EXC_LOAD_ACCESS,
-    EXC_STORE_ACCESS,
-    SCAUSE_INTERRUPT,
+    EXC_INST_PAGE_FAULT, EXC_LOAD_ACCESS, EXC_LOAD_PAGE_FAULT, EXC_STORE_ACCESS,
+    EXC_STORE_PAGE_FAULT, SCAUSE_INTERRUPT, TrapFrame,
 };
 
 // ── __ex_table 符号 ──────────────────────────────────────────────────────────

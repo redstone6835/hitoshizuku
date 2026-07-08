@@ -18,7 +18,7 @@
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
@@ -75,6 +75,13 @@ static RUNQUEUES: [Runqueue; NR_CPUS] = [const { Runqueue::new() }; NR_CPUS];
 static CURRENT_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
     [const { Spinlock::new(None) }; NR_CPUS];
 
+/// 每核当前任务的无所有权热路径指针。
+///
+/// 指针由 `Arc::into_raw` 发布，槽位自身持有一份强引用；切换 current 时释放旧
+/// 指针。这样 syscall/trap 热路径可以不拿 `CURRENT_TASKS` 锁。
+static CURRENT_TASK_RAW: [AtomicPtr<Task>; NR_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; NR_CPUS];
+
 /// 每核 idle 任务句柄。`pick_next` 返 None 时 `schedule_once` 切到这里。
 static IDLE_TASKS: [Spinlock<Option<Arc<Task>>>; NR_CPUS] =
     [const { Spinlock::new(None) }; NR_CPUS];
@@ -90,6 +97,8 @@ static NEED_RESCHED: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; 
 /// 等资源。最终切换前把它移动到这里，后续任意调度边界在当前活任务栈上 drop。
 static RETIRED_TASKS: [Spinlock<Vec<Arc<Task>>>; NR_CPUS] =
     [const { Spinlock::new(Vec::new()) }; NR_CPUS];
+
+static RETIRED_TASKS_NONEMPTY: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; NR_CPUS];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SchedulerDiag {
@@ -116,9 +125,10 @@ static NEED_BALANCE: [AtomicBool; NR_CPUS] = [const { AtomicBool::new(false) }; 
 /// 的机会，同时避免在 clone syscall 内部切换导致父 trap frame 尚未收尾。
 static POST_SYSCALL_HANDOFF: [AtomicU8; NR_CPUS] = [const { AtomicU8::new(0) }; NR_CPUS];
 
-/// 单次 clone 后最多让渡的轮数。每轮仍由 runqueue 正常挑选任务；这不是忙等，
-/// 而是在安全边界多给刚唤醒/刚创建的任务几个调度机会。
-const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 16;
+/// 单次 clone 后让渡的轮数。这里只需要一次安全边界交接：
+/// 再多轮只会放大 fork/daemon 一类短任务的 syscall 收尾开销；pthread
+/// 创建不走这里，线程会自然运行到 futex 等阻塞点再交给被唤醒者。
+const POST_SYSCALL_HANDOFF_ROUNDS: u8 = 1;
 
 struct TimedSleeper {
     deadline_ns: u64,
@@ -167,6 +177,16 @@ fn cpu() -> usize {
     let id = arch_hooks::time().map_or(0, |o| (o.current_cpu_id)());
     debug_assert!(id < NR_CPUS, "[sched] cpu id {} >= NR_CPUS", id);
     if id < NR_CPUS { id } else { 0 }
+}
+
+fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
+    let raw = Arc::into_raw(Arc::clone(&task)) as *mut Task;
+    *CURRENT_TASKS[cpu_id].lock() = Some(task);
+    let old = CURRENT_TASK_RAW[cpu_id].swap(raw, Ordering::AcqRel);
+    if !old.is_null() {
+        // Safety: 旧指针由上一轮 `publish_current_task` 的 `Arc::into_raw` 产生。
+        unsafe { drop(Arc::from_raw(old)) };
+    }
 }
 
 pub fn current_cpu_id() -> usize {
@@ -231,6 +251,7 @@ pub fn init() -> Arc<Task> {
             init_task.register_pid(Arc::clone(&root_ns), pid);
             root_ns.set_ns_init_pid(pid);
             tgroup.set_tgid(pid);
+            init_task.set_tgid_cache(pid);
             pgroup.set_pgid(pid);
             session.set_sid(pid);
             pid
@@ -256,8 +277,7 @@ pub fn init() -> Arc<Task> {
     INIT_READY.store(true, Ordering::Release);
 
     // 8) CPU 0 的 current 指向 init。
-    *CURRENT_TASKS[0].lock() = Some(Arc::clone(&init_task));
-
+    publish_current_task(0, Arc::clone(&init_task));
     log::info!(
         "[sched][init] init task created pid={} nr_running={} weight={}",
         init_pid,
@@ -325,6 +345,37 @@ pub fn current_task() -> Arc<Task> {
         .lock()
         .clone()
         .expect("[sched] current_task called before sched::init() on this CPU")
+}
+
+/// 当前 CPU 上正在执行的任务引用。
+///
+/// 该接口不增加引用计数，也不加锁；调用方不能把返回引用保存到可能调度之后。
+pub fn current_task_ref() -> &'static Task {
+    let id = cpu();
+    let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
+    if ptr.is_null() {
+        panic!("[sched] current_task_ref called before sched::init() on this CPU");
+    }
+    // Safety: raw 指针由 `publish_current_task` 的 `Arc::into_raw` 产生，并由
+    // CURRENT_TASK_RAW 槽位持有强引用。
+    unsafe { &*ptr }
+}
+
+/// 当前 CPU 上正在执行的任务句柄，热路径版本。
+///
+/// 与 [`current_task`] 语义相同，但不进入 `CURRENT_TASKS` 锁。
+pub fn current_task_fast() -> Arc<Task> {
+    let id = cpu();
+    let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
+    if ptr.is_null() {
+        panic!("[sched] current_task_fast called before sched::init() on this CPU");
+    }
+    // Safety: raw 指针由 `Arc::into_raw` 发布且槽位强引用仍有效；先增加强引用，
+    // 再用 `from_raw` 接管新增的这一份。
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
 }
 
 /// 查询指定 CPU 上的 current；未登记时返回 None。
@@ -494,12 +545,19 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
         task.adopt_current_context();
     }
     RUNQUEUES[cpu_id].set_current(Arc::clone(&task));
-    *CURRENT_TASKS[cpu_id].lock() = Some(task);
+    publish_current_task(cpu_id, task);
     Ok(())
 }
 
 pub fn needs_resched(cpu_id: usize) -> bool {
     cpu_id < NR_CPUS && NEED_RESCHED[cpu_id].load(Ordering::Acquire)
+}
+
+pub fn needs_resched_current() -> bool {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return false;
+    }
+    NEED_RESCHED[cpu()].load(Ordering::Acquire)
 }
 
 pub fn request_resched(cpu_id: usize) {
@@ -543,12 +601,18 @@ pub fn request_post_syscall_handoff() {
 }
 
 fn cleanup_retired_tasks(cpu_id: usize) {
+    if !RETIRED_TASKS_NONEMPTY[cpu_id].load(Ordering::Acquire) {
+        return;
+    }
     let retired = {
         let mut slot = RETIRED_TASKS[cpu_id].lock();
         if slot.is_empty() {
+            RETIRED_TASKS_NONEMPTY[cpu_id].store(false, Ordering::Release);
             return;
         }
-        core::mem::take(&mut *slot)
+        let taken = core::mem::take(&mut *slot);
+        RETIRED_TASKS_NONEMPTY[cpu_id].store(false, Ordering::Release);
+        taken
     };
     for task in retired.iter() {
         task.cleanup_exit_extensions();
@@ -558,7 +622,9 @@ fn cleanup_retired_tasks(cpu_id: usize) {
 }
 
 fn retire_final_task(cpu_id: usize, task: Arc<Task>) {
-    RETIRED_TASKS[cpu_id].lock().push(task);
+    let mut slot = RETIRED_TASKS[cpu_id].lock();
+    slot.push(task);
+    RETIRED_TASKS_NONEMPTY[cpu_id].store(true, Ordering::Release);
 }
 
 pub fn run_post_syscall_handoff(now_ns: u64) {
@@ -590,6 +656,17 @@ pub fn run_post_syscall_handoff(now_ns: u64) {
     }
 }
 
+pub fn run_post_syscall_handoff_lazy() {
+    if !INIT_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu_id = cpu();
+    if POST_SYSCALL_HANDOFF[cpu_id].load(Ordering::Acquire) == 0 {
+        return;
+    }
+    run_post_syscall_handoff(now_ns_internal());
+}
+
 /// 按调度域、亲和性和当前负载选择目标 CPU。
 pub fn select_task_cpu(task: &Arc<Task>) -> usize {
     task_sched_placement(task)
@@ -605,6 +682,17 @@ pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
     cpu_id
 }
 
+/// futex 唤醒热路径入口：入队后让下一次本地调度优先尝试运行该任务。
+///
+/// 这不是长期优先级，也不会绕过调度 class。runqueue 在真正 pick 时仍会
+/// 复查任务状态、CPU 亲和性和 class；提示只消费一次，用于避免 pthread
+/// join / condvar / mutex 这类短等待路径退化到等待下一个 tick。
+pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
+    let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true);
+    request_resched(cpu_id);
+    cpu_id
+}
+
 /// 只把任务放回 runqueue，不主动抢占当前任务。
 ///
 /// vfork child 在 exec 完成时需要唤醒父进程，但 child 自己也刚拿到新的用户态
@@ -616,12 +704,34 @@ pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
 }
 
 fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
+    enqueue_task_locked_with_preference(task, now_ns, false)
+}
+
+fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: bool) -> usize {
+    if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+    {
+        // 只有拥有执行体的活任务才能进入 rq。退出清理和 wait/reap 会释放
+        // arch context；若这些任务被等待队列或信号路径误唤醒，必须在统一
+        // 入队口截断，避免后续切换到已经回收的上下文。
+        task.sched.set_on_rq(false);
+        log::warning!(
+            "[sched] reject enqueue without runnable context pid={:?} state={:?} has_ctx={}",
+            task.pid_root(),
+            task.state(),
+            task.arch_context().is_some(),
+        );
+        return task.current_cpu().min(NR_CPUS - 1);
+    }
     if task.sched.on_rq() {
         return task.current_cpu().min(NR_CPUS - 1);
     }
     let cpu_id = select_task_cpu(&task);
     task.set_current_cpu(cpu_id);
-    RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
+    if preferred {
+        RUNQUEUES[cpu_id].enqueue_preferred(Arc::clone(&task), now_ns);
+    } else {
+        RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
+    }
     cpu_id
 }
 
@@ -1022,7 +1132,9 @@ pub fn schedule_once(now_ns: u64) {
 
     // 在调度边界消费当前任务的 pending signal。默认 Term/Core 会把 prev 标成
     // Zombie；后续 pick_next 看到它不再 runnable，就不会放回 runqueue。
-    if prev.state() == TaskState::Running {
+    if prev.state() == TaskState::Running
+        && (prev.signal.has_any_pending() || prev.shared_signal_pending_bits_quick() != 0)
+    {
         let _ = crate::operation::deliver_pending_signals();
     }
 
@@ -1063,7 +1175,7 @@ pub fn schedule_once(now_ns: u64) {
     // 刷新 rseq。内核态 uaccess 的缺页处理依赖 current_task()->VmSpace，所以
     // 必须先发布 current，再触碰 next 的用户地址空间。
     next.set_current_cpu(cpu_id);
-    *CURRENT_TASKS[cpu_id].lock() = Some(Arc::clone(&next));
+    publish_current_task(cpu_id, Arc::clone(&next));
 
     // 5. 取 ctx。
     let prev_ctx = prev
@@ -1217,8 +1329,12 @@ pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
 pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
     // 任务可能登记在任一 CPU 的 rq 上；远端 current 不能被本 CPU 直接摘掉，
     // 只能请求对方在调度边界观察到新状态后自行切走。
+    #[cfg(feature = "trace-task-lifecycle")]
     let removed = dequeue_for_state_change(task, 0);
+    #[cfg(not(feature = "trace-task-lifecycle"))]
+    let _ = dequeue_for_state_change(task, 0);
     task.mark_exited(code);
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][exit] pid={:?} code={} on_rq={} state={:?}",
         task.pid_root(),

@@ -416,20 +416,23 @@ pub(crate) fn install_ecam(
 /// 扫一遍 PCI 总线并给每个 MMIO BAR 分配一段物理地址。必须在
 /// [`install_ecam`] 之后、`pci_scan_and_register` 之前调用。
 pub(crate) fn assign_bars(host: &DtbPcieHostInfo) {
-    let Some(mmio_window) =
-        select_host_mmio_window(host).or_else(hal::platform::default_pci_mmio_window)
-    else {
+    let Some(mmio_windows) = select_host_mmio_windows(host) else {
         log::printk!("[kernel-start][dtb] no fallback PCI MMIO window for this platform");
         return;
     };
     log::printk!(
-        "[kernel-start][dtb] PCI BAR allocator window from {}: {:#x}..{:#x}",
+        "[kernel-start][dtb] PCI BAR allocator window from {}: low={:#x}..{:#x} high={:#x}..{:#x}",
         host.path,
-        mmio_window.start,
-        mmio_window.end
+        mmio_windows.low32.start,
+        mmio_windows.low32.end,
+        mmio_windows.high.start,
+        mmio_windows.high.end
     );
     let devices = pci_scan_raw(host.domain, host.bus_start, host.bus_end);
-    let mut next: u64 = mmio_window.start;
+    let mut next = PciBarAllocatorCursor {
+        low32: mmio_windows.low32.start,
+        high: mmio_windows.high.start,
+    };
     for d in devices.iter() {
         if d.bar_count() == 0 {
             log::debug!(
@@ -445,27 +448,62 @@ pub(crate) fn assign_bars(host: &DtbPcieHostInfo) {
             Some(p) => p,
             None => continue,
         };
-        assign_device_bars(&pci, &mut next, mmio_window.end);
+        assign_device_bars(&pci, &mut next, &mmio_windows);
     }
-    log::printk!("[kernel-start][dtb] assigned PCI BARs up to {:#x}", next);
+    log::printk!(
+        "[kernel-start][dtb] assigned PCI BARs up to low={:#x} high={:#x}",
+        next.low32,
+        next.high
+    );
 }
 
-fn select_host_mmio_window(host: &DtbPcieHostInfo) -> Option<Range<u64>> {
-    let regular = host
+struct PciBarMmioWindows {
+    low32: Range<u64>,
+    high: Range<u64>,
+}
+
+struct PciBarAllocatorCursor {
+    low32: u64,
+    high: u64,
+}
+
+fn select_host_mmio_windows(host: &DtbPcieHostInfo) -> Option<PciBarMmioWindows> {
+    let low32 = host
         .ranges
         .iter()
         .filter(|range| matches!(range.space, DtbPciAddressSpace::Memory))
-        .filter_map(pci_range_mmio_window)
+        .filter_map(pci_range_low32_mmio_window)
         .max_by_key(|range| range.end.saturating_sub(range.start));
-    if regular.is_some() {
-        return regular;
-    }
 
+    let high = select_host_mmio_window(host).or_else(hal::platform::default_pci_mmio_window);
+
+    match (low32, high) {
+        (Some(low32), Some(high)) => Some(PciBarMmioWindows { low32, high }),
+        (Some(low32), None) => Some(PciBarMmioWindows {
+            low32: low32.clone(),
+            high: low32,
+        }),
+        (None, Some(high)) => Some(PciBarMmioWindows {
+            low32: high.clone(),
+            high,
+        }),
+        (None, None) => None,
+    }
+}
+
+fn select_host_mmio_window(host: &DtbPcieHostInfo) -> Option<Range<u64>> {
     host.ranges
         .iter()
-        .filter(|range| matches!(range.space, DtbPciAddressSpace::PrefetchableMemory))
+        .filter(|range| matches!(range.space, DtbPciAddressSpace::Memory))
         .filter_map(pci_range_mmio_window)
         .max_by_key(|range| range.end.saturating_sub(range.start))
+        .or_else(|| {
+            host.ranges
+                .iter()
+                .filter(|range| matches!(range.space, DtbPciAddressSpace::PrefetchableMemory))
+                .filter_map(pci_range_mmio_window)
+                .max_by_key(|range| range.end.saturating_sub(range.start))
+        })
 }
 
 fn pci_range_mmio_window(range: &DtbPciRangeInfo) -> Option<Range<u64>> {
@@ -478,8 +516,18 @@ fn pci_range_mmio_window(range: &DtbPciRangeInfo) -> Option<Range<u64>> {
     (end > start).then_some(start..end)
 }
 
+fn pci_range_low32_mmio_window(range: &DtbPciRangeInfo) -> Option<Range<u64>> {
+    let window = pci_range_mmio_window(range)?;
+    let end = window.end.min(PCI_32BIT_MMIO_END);
+    (end > window.start).then_some(window.start..end)
+}
+
 /// 给一个 PCI 设备的所有 BAR 分配地址。`next` 是 bump allocator 游标。
-fn assign_device_bars(pci: &PciDevice, next: &mut u64, mmio_limit: u64) {
+fn assign_device_bars(
+    pci: &PciDevice,
+    next: &mut PciBarAllocatorCursor,
+    mmio_windows: &PciBarMmioWindows,
+) {
     let bar_count = pci.bar_count();
     if bar_count == 0 {
         return;
@@ -619,11 +667,18 @@ fn assign_device_bars(pci: &PciDevice, next: &mut u64, mmio_limit: u64) {
 
         // BAR size 本身就是对齐要求；至少按 BAR 最低地址粒度对齐。
         let align = size.max(PCI_BAR_MIN_ALIGN);
-        let addr = (*next + align - 1) & !(align - 1);
+        // 优先使用低 32-bit MMIO window：RISC-V 早期内核只直接映射了
+        // PA 0..0x80000000，QEMU virtio-pci 的 64-bit BAR 放到高地址会无法访问。
+        let (cursor, limit) = if is_64 && next.low32 >= mmio_windows.low32.end {
+            (&mut next.high, mmio_windows.high.end)
+        } else {
+            (&mut next.low32, mmio_windows.low32.end)
+        };
+        let addr = (*cursor + align - 1) & !(align - 1);
         let Some(end) = addr.checked_add(size) else {
             log::printk!(
                 "[kernel-start][dtb] PCI BAR pool address overflow (next={:#x} size={:#x})",
-                *next,
+                *cursor,
                 size
             );
             break;
@@ -638,14 +693,14 @@ fn assign_device_bars(pci: &PciDevice, next: &mut u64, mmio_limit: u64) {
             );
             break;
         }
-        if end > mmio_limit {
+        if end > limit {
             log::printk!(
                 "[kernel-start][dtb] PCI BAR pool exhausted (next={:#x})",
-                *next
+                *cursor
             );
             break;
         }
-        *next = end;
+        *cursor = end;
 
         // 写回分配到的基址，保留 BAR 类型/属性位。
         let type_bits = bar_val & 0xf;

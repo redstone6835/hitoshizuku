@@ -5,7 +5,6 @@
 //! 层不会再持有第二份 shm 表，也不会把 attach 计数硬编码到地址记录里。
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use errno::Errno;
 use general::ipc::shm::{
@@ -15,13 +14,11 @@ use general::ipc::shm::{
 use general::mm::{VmSpace, copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
 use mm::{FileLike, VmFlags};
-use sched::ids::{Capability as SchedCapability, Credentials as SchedCredentials};
 use sched::sync::Spinlock;
-use vfs::cred::{
-    CapSet as VfsCapSet, Capability as VfsCapability, Credentials as VfsCredentials, Gid as VfsGid,
-    Uid as VfsUid,
-};
+use vfs::cred::{Gid as VfsGid, Uid as VfsUid};
 use vfs::stat::FileMode;
+
+use super::vfs_cred_from_sched;
 
 const MODE_MASK: u16 = 0o777;
 const SHMAT_KNOWN_FLAGS: u32 = SHM_RDONLY | SHM_RND | SHM_REMAP | SHM_EXEC;
@@ -286,40 +283,6 @@ fn shmat_vm_flags(flags: u32) -> VmFlags {
         vm_flags = vm_flags.with(VmFlags::EXEC);
     }
     vm_flags
-}
-
-fn vfs_cred_from_sched(src: &SchedCredentials) -> VfsCredentials {
-    let mut caps = VfsCapSet::EMPTY;
-    for (sched_cap, vfs_cap) in [
-        (SchedCapability::Chown, VfsCapability::Chown),
-        (SchedCapability::DacOverride, VfsCapability::DacOverride),
-        (SchedCapability::DacReadSearch, VfsCapability::DacReadSearch),
-        (SchedCapability::Fowner, VfsCapability::FOwner),
-        (SchedCapability::Fsetid, VfsCapability::FSetId),
-        (SchedCapability::SysBoot, VfsCapability::SysAdmin),
-        (SchedCapability::SysResource, VfsCapability::SysAdmin),
-    ] {
-        if src.has_cap(sched_cap) {
-            caps = caps.with(vfs_cap);
-        }
-    }
-
-    VfsCredentials {
-        uid: VfsUid(src.uid.0),
-        euid: VfsUid(src.euid.0),
-        suid: VfsUid(src.suid.0),
-        fsuid: VfsUid(src.fsuid.0),
-        gid: VfsGid(src.gid.0),
-        egid: VfsGid(src.egid.0),
-        sgid: VfsGid(src.sgid.0),
-        fsgid: VfsGid(src.fsgid.0),
-        groups: src
-            .groups
-            .iter()
-            .map(|gid| VfsGid(gid.0))
-            .collect::<Vec<_>>(),
-        caps,
-    }
 }
 
 fn now_sec() -> i64 {

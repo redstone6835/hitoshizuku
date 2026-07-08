@@ -10,8 +10,8 @@
 use general::{TaskOps, TrapFramePtr};
 
 use crate::riscv64::specific::{
-    TrapFrame, FRAME_SIZE, SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SPP, SSTATUS_FS_MASK,
-    CSR_SSTATUS, CSR_SSCRATCH, CSR_SEPC, CSR_FCSR,
+    CSR_FCSR, CSR_SEPC, CSR_SSCRATCH, CSR_SSTATUS, EXC_ECALL_S, EXC_ECALL_U, FRAME_SIZE,
+    SSTATUS_FS_DIRTY, SSTATUS_FS_MASK, SSTATUS_SIE, SSTATUS_SPIE, SSTATUS_SPP, TrapFrame,
 };
 use core::arch::naked_asm;
 
@@ -58,8 +58,10 @@ impl TaskOps for Riscv64TaskOps {
         core::mem::align_of::<TrapFrame>()
     }
 
-    fn set_kernel_trap_stack(stack_top: usize) {
-        write_csr!(sscratch, stack_top);
+    fn set_kernel_trap_stack(_stack_top: usize) {
+        // RISC-V trap entry 依赖 sscratch=0 表示当前在 S-mode；
+        // 返回 U-mode 时 resume_to_trap_frame 会写入用户 trap 栈顶。
+        write_csr!(sscratch, 0);
     }
 
     unsafe fn resume_to_trap_frame(trap_frame_ptr: TrapFramePtr) -> ! {
@@ -88,8 +90,9 @@ impl TaskOps for Riscv64TaskOps {
         tf.sepc = entry_pc;
         tf.sp = user_sp;
         tf.a0 = arg0;
-        // S-mode 中断使能 + sret 后开中断 + FS=Initial（允许用户态使用 FPU）
-        tf.status = SSTATUS_SPIE | SSTATUS_SIE | (1 << 13);
+        // HACK: OpenSBI/QEMU 当前没有把 illegal instruction 委托给 S-mode；
+        // 用户态浮点指令不能依赖 illegal trap 做 lazy enable。
+        tf.status = SSTATUS_SPIE | SSTATUS_SIE | SSTATUS_FS_DIRTY;
         // 初始化时使用当前内核页表。exec 系统调用时会被替换为目标进程的用户页表。
         let satp_val: usize = read_csr!(satp);
         tf.satp = satp_val;
@@ -105,6 +108,20 @@ impl TaskOps for Riscv64TaskOps {
         tf.a0 = arg0;
         tf.a1 = arg1;
         tf.a2 = arg2;
+    }
+
+    fn signal_interrupted_syscall_pc(trap_frame_ptr: TrapFramePtr) -> Option<usize> {
+        let tf = unsafe { &*(trap_frame_ptr.as_usize() as *const TrapFrame) };
+        if tf.cause != EXC_ECALL_U && tf.cause != EXC_ECALL_S {
+            return None;
+        }
+        let pc = tf.sepc.checked_sub(4)?;
+
+        // RISC-V C 扩展允许 32 位指令只按 2 字节对齐；确认回退位置确实是 ecall，
+        // 避免把 ucontext PC 暴露到上一条 32 位指令的后半。
+        let mut insn = [0u8; 4];
+        general::mm::copy_from_user(pc, &mut insn).ok()?;
+        (u32::from_le_bytes(insn) == 0x0000_0073).then_some(pc)
     }
 
     fn init_user_entry() -> unsafe extern "C" fn() -> ! {
@@ -209,10 +226,17 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "andi t1, t0, {spp}",
         "bnez t1, 1f",
 
-        // return-to-user：统一页表方案下 satp 未变，无需切换
-        // 仅设置 sscratch（trap entry 依赖 sscratch 区分 from_user/from_kernel）
+        // return-to-user：目标 satp 已经生效时跳过写 CSR 和全局 sfence.vma。
+        // 同一进程的 pthread/futex 热路径会频繁在相同地址空间内往返，重复刷新
+        // TLB 会把短线程 benchmark 放大成页表切换开销。
+        "ld t2, {satp_off}(s11)",
+        "csrr t3, {satp}",
+        "beq t2, t3, 4f",
+        "csrw {satp}, t2",
+        "sfence.vma",
+        "4:",
         "ld t0, {kstack_top_off}(s11)",
-        "beqz t0, 2f",              // kstack_top=0 → 保持当前 sscratch（由调用方预设）
+        "beqz t0, 2f",
         "csrw {sscratch}, t0",
         "j 2f",
 
@@ -220,8 +244,12 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         "1:",
         "csrw {sscratch}, x0",
 
-        // FPU 恢复（检查 sstatus.FS != Off）
+        // Vector 恢复（只在用户态 V active 时真正执行）
         "2:",
+        "mv a0, s11",
+        "call {restore_vector}",
+
+        // FPU 恢复（检查 sstatus.FS != Off）
         "ld t0, {status_off}(s11)",
         "li t1, {fs_mask}",
         "and t1, t0, t1",
@@ -323,9 +351,12 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
         sepc = const CSR_SEPC,
         sstatus = const CSR_SSTATUS,
         sscratch = const CSR_SSCRATCH,
+        satp = const crate::riscv64::specific::CSR_SATP,
         fcsr = const CSR_FCSR,
+        restore_vector = sym crate::riscv64::vector::restore_vector_from_resume,
         spp = const SSTATUS_SPP,
         fs_mask = const SSTATUS_FS_MASK,
+        satp_off = const crate::riscv64::specific::SATP_OFFSET,
     );
 }
 
@@ -335,11 +366,15 @@ pub unsafe extern "C" fn __riscv64_resume_to_trap_frame(_tf_ptr: usize) {
 // 陷阱帧的 sepc 指定，这里仅满足 trait 要求的函数指针返回。
 
 unsafe extern "C" fn __riscv64_user_entry() -> ! {
-    loop { unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) } }
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) }
+    }
 }
 
 unsafe extern "C" fn __riscv64_demo_user_entry() -> ! {
-    loop { unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) } }
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)) }
+    }
 }
 
 unsafe extern "C" fn __riscv64_idle_task() -> ! {

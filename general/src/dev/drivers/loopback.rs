@@ -56,11 +56,10 @@ impl NetDriver for LoopbackDriver {
     fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
         let mut free = self.free.lock();
         let buf = free
-            .iter()
-            .position(|buf| buf.len() >= len)
-            .and_then(|pos| free.remove(pos))
+            .pop_front()
+            .filter(|buf| buf.len() >= len)
             .unwrap_or_else(|| alloc::vec![0u8; len].into_boxed_slice());
-        Some(TxBuf::new(buf))
+        Some(TxBuf::new_heap(buf))
     }
 
     fn commit_tx(&self, buf: TxBuf) {
@@ -68,7 +67,7 @@ impl NetDriver for LoopbackDriver {
         if len == 0 {
             return;
         }
-        let data = buf.into_storage();
+        let data = buf.into_heap();
         {
             let mut stats = self.stats.lock();
             stats.tx_packets += 1;

@@ -13,28 +13,46 @@
 
 // ── CSR 编号 ──────────────────────────────────────────────────────────────────
 
-pub const CSR_SSTATUS:  usize = 0x100; // 监管者状态
-pub const CSR_SIE:      usize = 0x104; // 中断使能（各源独立）
-pub const CSR_STVEC:    usize = 0x105; // 异常入口基地址
+pub const CSR_SSTATUS: usize = 0x100; // 监管者状态
+pub const CSR_SIE: usize = 0x104; // 中断使能（各源独立）
+pub const CSR_STVEC: usize = 0x105; // 异常入口基地址
 pub const CSR_SSCRATCH: usize = 0x140; // 暂存（trap entry 栈交换）
-pub const CSR_SEPC:     usize = 0x141; // 异常返回地址
-pub const CSR_SCAUSE:   usize = 0x142; // 异常/中断原因
-pub const CSR_STVAL:    usize = 0x143; // 异常附加值（fault 地址等）
-pub const CSR_SIP:      usize = 0x144; // 中断待决
-pub const CSR_SATP:     usize = 0x180; // 页表根 + ASID + MODE
-pub const CSR_FCSR:     usize = 0x003; // 浮点控制状态
+pub const CSR_SEPC: usize = 0x141; // 异常返回地址
+pub const CSR_SCAUSE: usize = 0x142; // 异常/中断原因
+pub const CSR_STVAL: usize = 0x143; // 异常附加值（fault 地址等）
+pub const CSR_SIP: usize = 0x144; // 中断待决
+pub const CSR_SATP: usize = 0x180; // 页表根 + ASID + MODE
+pub const CSR_FCSR: usize = 0x003; // 浮点控制状态
 
 // ── sstatus 位域 ──────────────────────────────────────────────────────────────
 
-pub const SSTATUS_SIE:      usize = 1 << 1;  // [1]     全局中断使能
-pub const SSTATUS_SPIE:     usize = 1 << 5;  // [5]     trap 前 SIE 备份
-pub const SSTATUS_SPP:      usize = 1 << 8;  // [8]     trap 前特权级 (0=U,1=S)
-pub const SSTATUS_VS_MASK:  usize = 3 << 9;  // [10:9]  向量状态
-pub const SSTATUS_FS_MASK:  usize = 0b11 << 13; // [14:13] 浮点状态（2-bit 提取掩码）
+pub const SSTATUS_SIE: usize = 1 << 1; // [1]     全局中断使能
+pub const SSTATUS_SPIE: usize = 1 << 5; // [5]     trap 前 SIE 备份
+pub const SSTATUS_SPP: usize = 1 << 8; // [8]     trap 前特权级 (0=U,1=S)
+pub const SSTATUS_VS_MASK: usize = 3 << 9; // [10:9]  向量状态
+pub const SSTATUS_VS_INITIAL: usize = 0b01 << 9; // [10:9]  VS = Initial；首次允许用户执行向量指令
+pub const SSTATUS_VS_CLEAN: usize = 0b10 << 9; // [10:9]  VS = Clean；向量上下文已同步到内存
+pub const SSTATUS_VS_DIRTY: usize = 0b11 << 9; // [10:9]  VS = Dirty；向量上下文需要保存
+pub const SSTATUS_FS_MASK: usize = 0b11 << 13; // [14:13] 浮点状态（2-bit 提取掩码）
+pub const SSTATUS_FS_INITIAL: usize = 0b01 << 13; // [14:13] FS = Initial；首次允许用户执行浮点指令
 pub const SSTATUS_FS_DIRTY: usize = 0b11 << 13; // [14:13] FS = Dirty；数值恰等于 MASK（0b11 是最大编码值）
-pub const SSTATUS_SUM:      usize = 1 << 18; // [18]    S-mode 访问 U 页
-pub const SSTATUS_MXR:      usize = 1 << 19; // [19]    execute-only 页可读
-pub const SSTATUS_SD:       usize = 1 << 63; // [63]    FS|VS 脏位汇总
+pub const SSTATUS_SUM: usize = 1 << 18; // [18]    S-mode 访问 U 页
+pub const SSTATUS_MXR: usize = 1 << 19; // [19]    execute-only 页可读
+pub const SSTATUS_SD: usize = 1 << 63; // [63]    FS|VS 脏位汇总
+
+// ── Vector CSR 编号 ─────────────────────────────────────────────────────────
+
+pub const CSR_VSTART: usize = 0x008;
+pub const CSR_VCSR: usize = 0x00f;
+pub const CSR_VL: usize = 0xc20;
+pub const CSR_VTYPE: usize = 0xc21;
+pub const CSR_VLENB: usize = 0xc22;
+
+// ── sie/sip 位域 ─────────────────────────────────────────────────────────────
+
+pub const SIE_SSIE: usize = 1 << IRQ_S_SOFT; // S-mode 软件中断使能
+pub const SIE_STIE: usize = 1 << IRQ_S_TIMER; // S-mode 定时器中断使能
+pub const SIE_SEIE: usize = 1 << IRQ_S_EXT; // S-mode 外部中断使能
 
 // ── scause ────────────────────────────────────────────────────────────────────
 
@@ -42,9 +60,9 @@ pub const SSTATUS_SD:       usize = 1 << 63; // [63]    FS|VS 脏位汇总
 pub const SCAUSE_INTERRUPT: usize = 1 << 63;
 
 // 中断号（scause[62:0]，需 OR SCAUSE_INTERRUPT）
-pub const IRQ_S_SOFT:  usize = 1; // S-mode 软件中断 (SSIP)
+pub const IRQ_S_SOFT: usize = 1; // S-mode 软件中断 (SSIP)
 pub const IRQ_S_TIMER: usize = 5; // S-mode 定时器中断 (STIP)
-pub const IRQ_S_EXT:   usize = 9; // S-mode 外部中断 (SEIP, PLIC)
+pub const IRQ_S_EXT: usize = 9; // S-mode 外部中断 (SEIP, PLIC)
 
 // 异常号（scause[62:0]，最高位为 0）
 //
@@ -64,19 +82,19 @@ pub const IRQ_S_EXT:   usize = 9; // S-mode 外部中断 (SEIP, PLIC)
 //  13  | 加载页故障              | 页表翻译失败（load 操作）
 //  15  | 存储页故障              | 页表翻译失败（store 操作）
 
-pub const EXC_INST_MISALIGNED:  usize = 0;
-pub const EXC_INST_ACCESS:      usize = 1;
-pub const EXC_ILLEGAL_INST:     usize = 2;
-pub const EXC_BREAKPOINT:       usize = 3;
-pub const EXC_LOAD_MISALIGNED:  usize = 4;
-pub const EXC_LOAD_ACCESS:      usize = 5;
+pub const EXC_INST_MISALIGNED: usize = 0;
+pub const EXC_INST_ACCESS: usize = 1;
+pub const EXC_ILLEGAL_INST: usize = 2;
+pub const EXC_BREAKPOINT: usize = 3;
+pub const EXC_LOAD_MISALIGNED: usize = 4;
+pub const EXC_LOAD_ACCESS: usize = 5;
 pub const EXC_STORE_MISALIGNED: usize = 6;
-pub const EXC_STORE_ACCESS:     usize = 7;
-pub const EXC_ECALL_U:          usize = 8;
-pub const EXC_ECALL_S:          usize = 9;
+pub const EXC_STORE_ACCESS: usize = 7;
+pub const EXC_ECALL_U: usize = 8;
+pub const EXC_ECALL_S: usize = 9;
 // 10, 11: reserved
-pub const EXC_INST_PAGE_FAULT:  usize = 12;
-pub const EXC_LOAD_PAGE_FAULT:  usize = 13;
+pub const EXC_INST_PAGE_FAULT: usize = 12;
+pub const EXC_LOAD_PAGE_FAULT: usize = 13;
 // 14: reserved
 pub const EXC_STORE_PAGE_FAULT: usize = 15;
 

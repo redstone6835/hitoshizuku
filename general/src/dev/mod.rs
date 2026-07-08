@@ -19,7 +19,6 @@ pub mod completion;
 pub mod control;
 pub mod cpu;
 pub mod dma;
-pub mod virtio_mmio;
 pub mod drivers;
 pub mod enumerate;
 pub mod firmware_bus;
@@ -40,6 +39,7 @@ pub mod rtc;
 pub mod syscon;
 pub mod usb;
 pub mod virtio;
+pub mod virtio_mmio;
 
 mod registry_id;
 

@@ -25,7 +25,9 @@ pub const KERNEL_VA_OFFSET: usize = 0xFFFF_FF80_0000_0000;
 /// # 返回值
 /// 对应的内核态虚拟地址。
 #[inline]
-pub fn phys_to_virt(paddr: usize) -> usize { paddr.wrapping_add(KERNEL_VA_OFFSET) }
+pub fn phys_to_virt(paddr: usize) -> usize {
+    paddr.wrapping_add(KERNEL_VA_OFFSET)
+}
 
 /// 内核虚拟地址 → 物理地址（线性偏移逆运算）。
 ///
@@ -35,11 +37,15 @@ pub fn phys_to_virt(paddr: usize) -> usize { paddr.wrapping_add(KERNEL_VA_OFFSET
 /// # 返回值
 /// 对应的物理地址。
 #[inline]
-pub fn virt_to_phys(vaddr: usize) -> usize { vaddr.wrapping_sub(KERNEL_VA_OFFSET) }
+pub fn virt_to_phys(vaddr: usize) -> usize {
+    vaddr.wrapping_sub(KERNEL_VA_OFFSET)
+}
 
 /// 将任意地址投影回直映区虚拟地址。
 ///
 /// 先剥离高位窗口前缀得到物理地址，再重新加上直映偏移。
 /// 用于 loader 在早期统一不同来源的指针。
 #[inline]
-pub fn reset_to_virt(ptr: usize) -> usize { phys_to_virt(virt_to_phys(ptr)) }
+pub fn reset_to_virt(ptr: usize) -> usize {
+    phys_to_virt(virt_to_phys(ptr))
+}

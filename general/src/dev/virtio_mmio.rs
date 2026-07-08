@@ -145,8 +145,12 @@ impl ModernMmioTransport {
 }
 
 impl VirtioMmioTransport for ModernMmioTransport {
-    fn base(&self) -> usize { self.base }
-    fn is_legacy(&self) -> bool { false }
+    fn base(&self) -> usize {
+        self.base
+    }
+    fn is_legacy(&self) -> bool {
+        false
+    }
 
     fn read_status(&self) -> u32 {
         unsafe { self.read_reg(MODERN_STATUS) }
@@ -229,8 +233,12 @@ impl LegacyMmioTransport {
 }
 
 impl VirtioMmioTransport for LegacyMmioTransport {
-    fn base(&self) -> usize { self.base }
-    fn is_legacy(&self) -> bool { true }
+    fn base(&self) -> usize {
+        self.base
+    }
+    fn is_legacy(&self) -> bool {
+        true
+    }
 
     fn read_status(&self) -> u32 {
         unsafe { self.read_reg(LEGACY_STATUS) }
@@ -275,7 +283,7 @@ impl VirtioMmioTransport for LegacyMmioTransport {
     fn configure_queue_addresses(&self, desc_dma: u64, _avail_dma: u64, _used_dma: u64) {
         let pfn = (desc_dma >> 12) as u32;
         unsafe {
-            self.write_reg(0x028, 4096);        // GuestPageSize
+            self.write_reg(0x028, 4096); // GuestPageSize
             self.write_reg(LEGACY_QUEUE_ALIGN, 4096);
             self.write_reg(LEGACY_QUEUE_PFN, pfn);
         }

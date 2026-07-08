@@ -184,20 +184,17 @@ pub unsafe extern "C" fn _start() {
 #[unsafe(link_section = ".text.entry")]
 unsafe extern "C" fn _start_virtualized() {
     naked_asm!(
-        "mv ra, zero",               // 标记调用栈终点
-        "la sp, __tmp_stack_top",    // 临时栈（链接脚本定义）
-
+        "mv ra, zero",            // 标记调用栈终点
+        "la sp, __tmp_stack_top", // 临时栈（链接脚本定义）
         // 使能 FPU：设置 SSTATUS.FS = Dirty（3 << 13）
         // LLVM 在 release 模式下可能生成浮点指令，必须在调用 Rust 代码前开启 FPU 支持
         "li t0, 3 << 13",
         "csrs sstatus, t0",
-
         // pre_boot_init(hartid, dtb_paddr)
         "mv a0, s0",
         "mv a1, s1",
         "la t0, pre_boot_init",
         "jalr t0",
-
         // __kernel_arch_loader(hartid, dtb_paddr) — 不返回
         "mv a0, s0",
         "mv a1, s1",
@@ -213,7 +210,7 @@ unsafe extern "C" fn _start_virtualized() {
 /// 必须先 clear_bss 再写静态变量，否则 BSS 清零会覆盖已写入的值。
 #[unsafe(no_mangle)]
 unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
-    use crate::riscv64::specific::{IRQ_STACKS, IRQ_STACK_SIZE};
+    use crate::riscv64::specific::{IRQ_STACK_SIZE, IRQ_STACKS};
 
     unsafe { clear_bss() };
 
@@ -225,7 +222,10 @@ unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
     // 初始化 boot hart（index 0）的 per-hart 数据
     unsafe {
         let hl = crate::riscv64::specific::boot_hart_local_ptr();
+        let kernel_gp: usize;
+        core::arch::asm!("mv {}, gp", out(reg) kernel_gp, options(nomem, nostack));
         (*hl).hart_id = hartid;
+        (*hl).kernel_gp = kernel_gp;
         // 中断栈栈顶 = IRQ_STACKS[0] 末尾（栈向低地址增长）
         (*hl).irq_stack_top = core::ptr::addr_of!(IRQ_STACKS) as usize + IRQ_STACK_SIZE;
         core::sync::atomic::compiler_fence(Ordering::Release);

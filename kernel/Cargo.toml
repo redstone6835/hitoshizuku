@@ -5,9 +5,10 @@ edition = "2024"
 
 [features]
 bench = []
-block-bench = []
+block-bench = ["general/block-profile"]
 allocator-bench = []
 embedded-initramfs = []
+trace-task-lifecycle = ["sched/trace-task-lifecycle"]
 allocator-tests = [
     "ktest/kernel",
     "allocator/ktest-kernel",
@@ -30,6 +31,7 @@ bench = false
 
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
+arch = { path = "../arch" }
 elf = { path = "../libs/elf" }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }

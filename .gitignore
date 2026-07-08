@@ -12,6 +12,7 @@ disk-la.img
 .claude
 .codex
 .deepseek
+AGENTS.md
 
 build
 userland/rootfs-la/bin/

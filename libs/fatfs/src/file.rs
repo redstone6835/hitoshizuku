@@ -447,59 +447,57 @@ impl FileOps for RegFileOps {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize> {
-        if self.state.is_read_only() {
-            return Err(VfsError::ReadOnlyFilesystem);
-        }
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let _io = self.io_mu.lock();
-        self.with_inode_ops(|inode, fops| {
-            // 处理 O_APPEND:offset == u64::MAX 时从 EOF 开始
-            let cur_size = fops.current_size() as u64;
-            let start_offset = if offset == u64::MAX { cur_size } else { offset };
-            let new_end = start_offset
-                .checked_add(buf.len() as u64)
-                .ok_or(VfsError::FileTooLarge)?;
-            if new_end > u32::MAX as u64 {
-                return Err(VfsError::FileTooLarge);
+        self.state.with_write_transaction(|| {
+            if buf.is_empty() {
+                return Ok(0);
             }
 
-            // 稀疏写暂不支持:若起点超过当前 size,先扩 size 并用 0 填补
-            if new_end > cur_size {
-                fops.grow_to(new_end)?;
-                // 如果起点超 EOF,把中间洞清零
-                if start_offset > cur_size {
-                    self.zero_range(fops.current_first(), cur_size, start_offset)?;
+            let _io = self.io_mu.lock();
+            self.with_inode_ops(|inode, fops| {
+                // 处理 O_APPEND:offset == u64::MAX 时从 EOF 开始。
+                let cur_size = fops.current_size() as u64;
+                let start_offset = if offset == u64::MAX { cur_size } else { offset };
+                let new_end = start_offset
+                    .checked_add(buf.len() as u64)
+                    .ok_or(VfsError::FileTooLarge)?;
+                if new_end > u32::MAX as u64 {
+                    return Err(VfsError::FileTooLarge);
                 }
-                inode.set_size(new_end);
-            }
 
-            // 真正写盘
-            let first_cluster = fops.current_first();
-            let cluster_size = self.state.cluster_size as u64;
-            let mut written = 0usize;
-            let total = buf.len();
+                // FAT 不支持真正的 sparse extent；写过 EOF 时先分配簇并把空洞置零，
+                // 避免后续读出未初始化介质内容。
+                if new_end > cur_size {
+                    fops.grow_to(new_end)?;
+                    if start_offset > cur_size {
+                        self.zero_range(fops.current_first(), cur_size, start_offset)?;
+                    }
+                    inode.set_size_and_blocks(new_end, new_end.div_ceil(512));
+                }
 
-            while written < total {
-                let file_pos = start_offset + written as u64;
-                let cluster_idx = (file_pos / cluster_size) as u32;
-                let in_cluster = file_pos % cluster_size;
-                let max_clusters =
-                    ((total - written) as u64 + in_cluster).div_ceil(cluster_size) as u32;
-                let Some((cluster, run_clusters)) =
-                    self.contiguous_run(first_cluster, cluster_idx, max_clusters)?
-                else {
-                    return Err(VfsError::Io);
-                };
-                let run_bytes =
-                    (run_clusters as u64 * cluster_size).saturating_sub(in_cluster) as usize;
-                let want = run_bytes.min(total - written);
-                self.write_run(cluster, in_cluster, &buf[written..written + want])?;
-                written += want;
-            }
-            Ok(written)
+                let first_cluster = fops.current_first();
+                let cluster_size = self.state.cluster_size as u64;
+                let mut written = 0usize;
+                let total = buf.len();
+
+                while written < total {
+                    let file_pos = start_offset + written as u64;
+                    let cluster_idx = (file_pos / cluster_size) as u32;
+                    let in_cluster = file_pos % cluster_size;
+                    let max_clusters =
+                        ((total - written) as u64 + in_cluster).div_ceil(cluster_size) as u32;
+                    let Some((cluster, run_clusters)) =
+                        self.contiguous_run(first_cluster, cluster_idx, max_clusters)?
+                    else {
+                        return Err(VfsError::Io);
+                    };
+                    let run_bytes =
+                        (run_clusters as u64 * cluster_size).saturating_sub(in_cluster) as usize;
+                    let want = run_bytes.min(total - written);
+                    self.write_run(cluster, in_cluster, &buf[written..written + want])?;
+                    written += want;
+                }
+                Ok(written)
+            })
         })
     }
 

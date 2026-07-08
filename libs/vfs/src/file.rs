@@ -23,7 +23,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use errno::Errno;
 use sched::Task;
@@ -330,6 +330,15 @@ pub struct File {
     /// 可通过 `fcntl(F_SETFL)` 变更的状态位（当前支持 APPEND/NONBLOCK/SYNC）。
     status_flags: AtomicU32,
 
+    /// `fcntl(F_SETOWN[_EX])` 维护的异步通知接收者类型。
+    owner_type: AtomicI32,
+
+    /// `fcntl(F_SETOWN[_EX])` 维护的异步通知接收者 pid。
+    owner_pid: AtomicI32,
+
+    /// `fcntl(F_SETSIG)` 维护的异步通知信号号。
+    owner_sig: AtomicI32,
+
     /// 当前文件读写偏移量（字节）。
     pub(crate) pos: AtomicU64,
 
@@ -379,6 +388,9 @@ impl File {
             inode,
             flags,
             status_flags: AtomicU32::new(StatusFlags::from_open_options(flags).0),
+            owner_type: AtomicI32::new(0),
+            owner_pid: AtomicI32::new(0),
+            owner_sig: AtomicI32::new(0),
             pos: AtomicU64::new(0),
             pos_lock: Spinlock::new(()),
             cred,
@@ -424,6 +436,26 @@ impl File {
         }
         self.status_flags.store(bits, Ordering::Release);
         self.ops.set_status_flags(self.flags());
+    }
+
+    pub fn owner(&self) -> (i32, i32) {
+        (
+            self.owner_type.load(Ordering::Acquire),
+            self.owner_pid.load(Ordering::Acquire),
+        )
+    }
+
+    pub fn set_owner(&self, owner_type: i32, owner_pid: i32) {
+        self.owner_type.store(owner_type, Ordering::Release);
+        self.owner_pid.store(owner_pid, Ordering::Release);
+    }
+
+    pub fn owner_sig(&self) -> i32 {
+        self.owner_sig.load(Ordering::Acquire)
+    }
+
+    pub fn set_owner_sig(&self, sig: i32) {
+        self.owner_sig.store(sig, Ordering::Release);
     }
 
     /// 返回打开时冻结的凭据。

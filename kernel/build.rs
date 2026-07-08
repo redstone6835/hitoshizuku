@@ -1,209 +1,117 @@
-//! 内核构建脚本：在 cargo 编译前交叉编译 busybox、lua，并打包 initramfs。
+//! 内核构建脚本：校验并打包当前目标架构的 initramfs。
 //!
-//! 每步检查产物是否存在以支持增量构建。通过 `TARGET` 环境变量自动选择架构。
+//! 用户态 rootfs 的生成由顶层 Makefile 编排；这里仅把 Cargo 当前目标需要的
+//! rootfs 打包为架构专属 CPIO，并把路径暴露给内核源码的 `include_bytes!`。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Arch {
-    La,
-    Rv,
-}
-
-impl Arch {
-    fn from_target(target: &str) -> Self {
-        if target.starts_with("loongarch64") {
-            Arch::La
-        } else if target.starts_with("riscv64") {
-            Arch::Rv
-        } else {
-            panic!("unsupported TARGET: {target}");
-        }
-    }
-
-    fn rootfs_dir(self) -> &'static str {
-        match self {
-            Arch::La => "userland/rootfs-la",
-            Arch::Rv => "userland/rootfs-rv",
-        }
-    }
-
-    fn cross_prefix(self) -> &'static str {
-        match self {
-            Arch::La => "loongarch64-linux-gnu-",
-            Arch::Rv => "riscv64-linux-musl-",
-        }
-    }
-}
-
 fn main() {
-    let target = std::env::var("TARGET").expect("TARGET not set by cargo");
-    let arch = Arch::from_target(&target);
+    let target = std::env::var("TARGET").expect("Cargo 未设置 TARGET 环境变量");
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
 
-    build_busybox(&root, arch);
-    build_lua(&root, arch);
-    pack_initramfs(&root, arch);
+    let initramfs_root = env_path("INITRAMFS_ROOT", &root).unwrap_or_else(|| {
+        root.join(
+            default_rootfs_dir(&target)
+                .unwrap_or_else(|| panic!("不支持的目标 {target}，必须显式设置 INITRAMFS_ROOT")),
+        )
+    });
+    let initramfs_cpio = env_path("INITRAMFS_CPIO", &root).unwrap_or_else(|| {
+        root.join(
+            default_initramfs_cpio(&target)
+                .unwrap_or_else(|| panic!("不支持的目标 {target}，必须显式设置 INITRAMFS_CPIO")),
+        )
+    });
 
+    pack_initramfs(&initramfs_root, &initramfs_cpio);
+
+    println!("cargo:rerun-if-env-changed=INITRAMFS_ROOT");
+    println!("cargo:rerun-if-env-changed=INITRAMFS_CPIO");
+    emit_initramfs_rerun_inputs(&initramfs_root);
     println!(
-        "cargo:rerun-if-changed={}",
-        root.join(arch.rootfs_dir()).display()
+        "cargo:rustc-env=MYGO_INITRAMFS_CPIO={}",
+        initramfs_cpio.display()
     );
 }
 
-// ── busybox ─────────────────────────────────────────────────────────────────────
-
-fn build_busybox(root: &Path, arch: Arch) {
-    let dest_bin = root.join(arch.rootfs_dir()).join("bin/busybox");
-    if dest_bin.exists() {
-        return;
-    }
-
-    let src = root.join("third/busybox-1.36.1");
-    let cross = format!("CROSS_COMPILE={}", arch.cross_prefix());
-
-    // defconfig
-    let config = src.join(".config");
-    if !config.exists() {
-        run_cmd(
-            Command::new("make")
-                .arg("-C").arg(&src).arg(&cross)
-                .arg("defconfig"),
-        );
-    }
-
-    // 配置 CONFIG_STATIC=y, CONFIG_PIE=y, CONFIG_TC=n
-    run_cmd(Command::new("sh").arg("-c").arg(&format!(
-        "sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' {} && \
-         sed -i 's/.*CONFIG_PIE.*/CONFIG_PIE=y/' {} && \
-         sed -i 's/^CONFIG_TC=.*/# CONFIG_TC is not set/' {}",
-        config.display(), config.display(), config.display()
-    )));
-
-    // 非交互式 oldconfig
-    run_cmd(Command::new("sh").arg("-c").arg(&format!(
-        "yes '' | make -C {} {} oldconfig",
-        src.display(), cross
-    )));
-
-    // 编译
-    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    run_cmd(
-        Command::new("make")
-            .arg("-C").arg(&src).arg(&cross)
-            .arg(format!("-j{jobs}")),
-    );
-
-    // 安装
-    let dest = root.join(arch.rootfs_dir());
-    let _ = std::fs::create_dir_all(&dest);
-    run_cmd(
-        Command::new("make")
-            .arg("-C").arg(&src).arg(&cross)
-            .arg(format!("CONFIG_PREFIX={}", dest.display()))
-            .arg("install"),
-    );
-
-    // strip
-    let _ = Command::new(format!("{}strip", arch.cross_prefix()))
-        .arg(&dest_bin)
-        .status();
-
-    // distclean
-    run_cmd(Command::new("make").arg("-C").arg(&src).arg("distclean"));
+fn env_path(name: &str, root: &Path) -> Option<PathBuf> {
+    let value = std::env::var_os(name)?;
+    let path = PathBuf::from(value);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
 }
 
-// ── lua ─────────────────────────────────────────────────────────────────────────
-
-fn build_lua(root: &Path, arch: Arch) {
-    let dest_bin = root.join(arch.rootfs_dir()).join("bin/lua");
-    if dest_bin.exists() {
-        return;
+fn default_rootfs_dir(target: &str) -> Option<&'static str> {
+    if target.starts_with("loongarch64") {
+        Some("userland/rootfs-la")
+    } else if target.starts_with("riscv64") {
+        Some("userland/rootfs-rv")
+    } else {
+        None
     }
-
-    let src = root.join("third/lua");
-    let cc = format!("CC={}gcc", arch.cross_prefix());
-
-    let jobs = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    run_cmd(
-        Command::new("make")
-            .arg("-C").arg(&src)
-            .arg("all")
-            .arg(&cc)
-            .arg("MYCFLAGS=-std=c99 -static -fPIE -DLUA_USE_POSIX")
-            .arg("MYLDFLAGS=-static")
-            .arg("MYLIBS=-lm")
-            .arg(format!("-j{jobs}")),
-    );
-
-    let dest = root.join(arch.rootfs_dir()).join("bin");
-    let _ = std::fs::create_dir_all(&dest);
-    std::fs::copy(src.join("lua"), &dest_bin).unwrap();
-
-    let _ = Command::new(format!("{}strip", arch.cross_prefix()))
-        .arg(&dest_bin)
-        .status();
-
-    let _ = Command::new("make").arg("-C").arg(&src).arg("clean").status();
 }
 
-// ── initramfs ───────────────────────────────────────────────────────────────────
-
-fn pack_initramfs(root: &Path, arch: Arch) {
-    let cpio_arch = match arch {
-        Arch::La => "initramfs-la.cpio",
-        Arch::Rv => "initramfs-rv.cpio",
-    };
-    let out_cpio = root.join("build/initramfs.cpio");
-    let save = root.join("build").join(cpio_arch);
-    let src = root.join(arch.rootfs_dir());
-
-
-    if save.exists() {
-        if let Ok(save_time) = std::fs::metadata(&save).and_then(|m| m.modified()) {
-            let mut newer = false;
-            check_modified(&src, save_time, &mut newer);
-            if !newer {
-                let _ = std::fs::copy(&save, &out_cpio);
-                return;
-            }
-        }
+fn default_initramfs_cpio(target: &str) -> Option<&'static str> {
+    if target.starts_with("loongarch64") {
+        Some("build/initramfs-la.cpio")
+    } else if target.starts_with("riscv64") {
+        Some("build/initramfs-rv.cpio")
+    } else {
+        None
     }
+}
 
-    let _ = std::fs::create_dir_all(out_cpio.parent().unwrap());
+fn pack_initramfs(src: &Path, out_cpio: &Path) {
+    if !src.is_dir() {
+        panic!("initramfs 根目录不存在或不是目录：{src:?}");
+    }
+    let parent = out_cpio
+        .parent()
+        .unwrap_or_else(|| panic!("initramfs 输出路径没有父目录：{out_cpio:?}"));
+    std::fs::create_dir_all(parent)
+        .unwrap_or_else(|err| panic!("创建 initramfs 输出目录 {parent:?} 失败：{err}"));
+
     run_cmd(Command::new("sh").arg("-c").arg(&format!(
         "cd {} && find . -print0 | cpio --quiet -o -0 -H newc > {}",
-        src.display(),
-        out_cpio.display()
+        shell_quote(src),
+        shell_quote(out_cpio)
     )));
-
-    let _ = std::fs::copy(&out_cpio, &save);
 }
 
-fn check_modified(dir: &Path, ref_time: std::time::SystemTime, result: &mut bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        if *result {
-            return;
+fn emit_initramfs_rerun_inputs(root: &Path) {
+    // Cargo 对目录的 rerun-if-changed 不是递归语义。initramfs 里 rcS、
+    // busybox applet 链接等任一文件变更都必须触发重新打包，否则内嵌
+    // cpio 会继续使用旧内容，启动行为和源码工作区不一致。
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        println!("cargo:rerun-if-changed={}", path.display());
+        if !path.is_dir() {
+            continue;
         }
-        if let Ok(meta) = entry.metadata() {
-            if meta.modified().map_or(false, |t| t > ref_time) {
-                *result = true;
-                return;
-            }
-            if meta.is_dir() {
-                check_modified(&entry.path(), ref_time, result);
-            }
+        let mut entries = std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("读取 initramfs 目录 {path:?} 失败：{err}"))
+            .map(|entry| {
+                entry.unwrap_or_else(|err| panic!("读取 initramfs 目录项 {path:?} 失败：{err}"))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries.into_iter().rev() {
+            stack.push(entry.path());
         }
     }
 }
 
-// ── helper ──────────────────────────────────────────────────────────────────────
+fn shell_quote(path: &Path) -> String {
+    let raw = path.as_os_str().to_string_lossy();
+    format!("'{}'", raw.replace('\'', "'\\''"))
+}
 
 fn run_cmd(cmd: &mut Command) {
     let status = cmd
         .status()
-        .unwrap_or_else(|e| panic!("failed to spawn {cmd:?}: {e}"));
-    assert!(status.success(), "{cmd:?} exited with {status:?}");
+        .unwrap_or_else(|e| panic!("启动命令 {cmd:?} 失败：{e}"));
+    assert!(status.success(), "命令 {cmd:?} 退出状态异常：{status:?}");
 }

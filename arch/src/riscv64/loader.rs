@@ -24,13 +24,14 @@
 //!   └─────────────────────┘
 //! ```
 
+use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::cell::UnsafeCell;
 
 use crate::riscv64::early_console;
 use crate::riscv64::heap_vm;
 use crate::riscv64::specific::{kernel_timestamp_ns, phys_to_virt, virt_to_phys};
+use crate::riscv64::time;
 use crate::riscv64::trap;
 use general::dtb::Dtb;
 use general::{
@@ -110,7 +111,10 @@ struct LineBuf {
 
 impl LineBuf {
     const fn new() -> Self {
-        Self { buf: [0u8; 1280], len: 0 }
+        Self {
+            buf: [0u8; 1280],
+            len: 0,
+        }
     }
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
@@ -138,7 +142,13 @@ impl fmt::Write for LineBuf {
 fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
     let (secs, nanos) = log::format_timestamp(record.timestamp);
     let mut buf = LineBuf::new();
-    let _ = writeln!(&mut buf, "[{:6}.{:06}] {}", secs, nanos / 1000, record.message);
+    let _ = writeln!(
+        &mut buf,
+        "[{:6}.{:06}] {}",
+        secs,
+        nanos / 1000,
+        record.message
+    );
     buf
 }
 
@@ -146,7 +156,7 @@ fn format_log_line(record: &log::LogRecord<'_>) -> LineBuf {
 
 /// 从 DTB 的 `/cpus/cpu@*` 节点解析 `riscv,isa` 属性，检测硬件扩展支持。
 fn detect_isa_extensions(dtb: &Dtb<'_>) {
-    use crate::riscv64::specific::{HAS_ZICBOZ, CBO_BLOCK_SIZE};
+    use crate::riscv64::specific::{CBO_BLOCK_SIZE, HAS_ZICBOZ};
     use core::sync::atomic::Ordering;
 
     let root = match dtb.root() {
@@ -169,6 +179,7 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
                 HAS_ZICBOZ.store(true, Ordering::Release);
                 log::info!("[loader] ISA: Zicboz detected");
             }
+            crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
             // 检查 riscv,cboz-block-size（如果有）
             if let Some(bs_prop) = cpu_node.find_property("riscv,cboz-block-size") {
                 let val = bs_prop.value();
@@ -196,6 +207,41 @@ fn contains_extension(isa: &[u8], ext: &[u8]) -> bool {
         }
     }
     false
+}
+
+fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
+}
+
+/// 解析 RISC-V DTB 的 timebase-frequency，并启动周期性 S-mode timer。
+fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
+    let hz = dtb
+        .root()
+        .and_then(|root| root.find_child("cpus"))
+        .and_then(|cpus| {
+            cpus.find_property("timebase-frequency")
+                .and_then(|prop| read_be_u32_prop(prop.value()))
+                .or_else(|| {
+                    cpus.children()
+                        .filter(|node| node.base_name_bytes().starts_with(b"cpu"))
+                        .find_map(|cpu| {
+                            cpu.find_property("timebase-frequency")
+                                .and_then(|prop| read_be_u32_prop(prop.value()))
+                        })
+                })
+        })
+        .map(|hz| hz as usize)
+        .filter(|&hz| hz != 0)
+        .unwrap_or_else(|| time::STABLE_TIMER_HZ.load(Ordering::Relaxed));
+
+    time::set_stable_counter_hz(hz);
+    time::init_periodic_timer(time::DEFAULT_TIMER_HZ);
+    log::info!(
+        "[loader] timer configured: stable_hz={} tick_hz={} period_ticks={}",
+        time::stable_counter_hz(),
+        time::timer_hz(),
+        time::timer_period_ticks()
+    );
 }
 
 // ── 堆映射回调 ────────────────────────────────────────────────────────────────
@@ -231,17 +277,25 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
             let line = format_log_line(record);
             early_console::e_write_bytes(line.as_bytes());
         }
-        static SINK: log::LogSink = log::LogSink { write_record: sink_write };
+        static SINK: log::LogSink = log::LogSink {
+            write_record: sink_write,
+        };
         log::bind_log_sink(&SINK);
     }
-    log::info!("[loader] RISC-V64 boot: hart={} dtb={:#x}", hart_id, dtb_addr);
+    log::info!(
+        "[loader] RISC-V64 boot: hart={} dtb={:#x}",
+        hart_id,
+        dtb_addr
+    );
 
     // 初始化引导期分配器
     {
         allocator::KERNEL_ALLOCATOR.bind_address_translation(phys_to_virt, virt_to_phys);
 
         HART_ID.store(hart_id, Ordering::Relaxed);
-        fn get_cpu_id() -> usize { HART_ID.load(Ordering::Relaxed) }
+        fn get_cpu_id() -> usize {
+            HART_ID.load(Ordering::Relaxed)
+        }
         allocator::KERNEL_ALLOCATOR.bind_cpu_id(get_cpu_id);
 
         unsafe extern "C" {
@@ -251,17 +305,24 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
         let heap_start = sheap as usize;
         let heap_end = eheap as usize;
         allocator::KERNEL_ALLOCATOR.init_boot(heap_start, heap_end - heap_start);
-        log::info!("[loader] boot heap: {:#x}..{:#x} ({} MiB)",
-            heap_start, heap_end, (heap_end - heap_start) / (1024 * 1024));
+        log::info!(
+            "[loader] boot heap: {:#x}..{:#x} ({} MiB)",
+            heap_start,
+            heap_end,
+            (heap_end - heap_start) / (1024 * 1024)
+        );
     }
 
     // 快照 DTB 到内核缓冲区
-    let dtb = store_kernel_dtb(dtb_addr)
-        .unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
+    let dtb = store_kernel_dtb(dtb_addr).unwrap_or_else(|e| panic!("[loader] DTB: {}", e));
     log::info!("[loader] DTB: {} bytes", dtb.as_bytes().len());
 
     // 检测 ISA 扩展（Zicboz 等）
     detect_isa_extensions(&dtb);
+
+    // 启动 S-mode 周期 timer。sleep/调度 tick 依赖该中断推进。
+    configure_timer_from_dtb(&dtb);
+    trap::install_riscv_irq_line_ops();
 
     // 构造 StartContext 并移交控制权，从此不再返回
     unsafe {

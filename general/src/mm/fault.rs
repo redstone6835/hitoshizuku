@@ -33,6 +33,8 @@ pub enum FaultKind {
     PermWrite,
     /// 权限：执行不允许。
     PermExec,
+    /// 权限等级异常：硬件未提供读/写/取指细分，按 VMA 权限重新校正 PTE。
+    Privilege,
 }
 
 /// 缺页处理结论。

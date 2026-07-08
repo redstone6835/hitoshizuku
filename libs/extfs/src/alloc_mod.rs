@@ -1,6 +1,6 @@
 //! 位图分配/释放(块 + inode) + 超级块/块组计数回写。
 //!
-//! 所有分配都严格按顺序:**位图置位 → 更新计数 → 落盘**。没有日志兜底,
+//! 所有分配都先同步修改 bitmap,再把计数元数据标脏。没有日志兜底,
 //! 中间崩溃会让 FS 损坏。mount 会因此拒绝 `NEEDS_RECOVERY`,要求 clean umount
 //! 或 fsck。
 
@@ -23,10 +23,11 @@ fn lock_alloc() -> SpinlockGuard<'static, ()> {
         if let Some(guard) = ALLOC_LOCK.try_lock() {
             return guard;
         }
-        // FIXME: extfs 分配临界区当前会触发块 I/O，等待方不能纯自旋；
-        // 后续应改成正式睡眠锁，或缩小临界区避免持锁 I/O。
+        // extfs 分配临界区当前会触发块 I/O，等待方不能纯自旋，否则单核
+        // 下持锁任务拿不到 CPU。这里必须用真实时间戳推进 fair 调度；
+        // `schedule_once(0)` 不记账，在 iozone 多进程写入时会放大成饥饿。
         if sched::is_ready() {
-            sched::schedule_once(0);
+            sched::schedule_once(sched::now_ns_public());
         } else {
             core::hint::spin_loop();
         }
@@ -175,7 +176,6 @@ pub(crate) fn alloc_blocks_run(
             state.block_alloc_hint.store(next_rel, Ordering::Relaxed);
             state.adjust_group_free_blocks(group, -(count as i32))?;
             state.adjust_sb_free_blocks(-(count as i64))?;
-            state.flush_alloc_metadata()?;
             return Ok((phys, count));
         }
     }
@@ -351,6 +351,7 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     if block < sb.first_data_block as u64 {
         return Err(BlockBackendError::OutOfRange);
     }
+    state.discard_cached_blocks(block, 1);
     let rel = block - sb.first_data_block as u64;
     let group = (rel / sb.blocks_per_group as u64) as u32;
     let in_group = (rel % sb.blocks_per_group as u64) as u32;
@@ -364,7 +365,6 @@ pub(crate) fn free_block(state: &FsState, block: u64) -> Result<(), BlockBackend
     );
     state.adjust_group_free_blocks(group, 1)?;
     state.adjust_sb_free_blocks(1)?;
-    state.flush_alloc_metadata()?;
     Ok(())
 }
 
@@ -389,6 +389,7 @@ pub(crate) fn free_blocks_run(
     }
 
     let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
+    state.discard_cached_blocks(start_block, count);
     let first_rel = start_block - sb.first_data_block as u64;
     let mut rel = first_rel;
     let mut remaining = count;
@@ -437,13 +438,112 @@ pub(crate) fn free_blocks_run(
     }
 
     if total_cleared != 0 {
-        state
-            .block_alloc_hint
-            .store(first_rel, Ordering::Relaxed);
+        state.block_alloc_hint.store(first_rel, Ordering::Relaxed);
         state.adjust_sb_free_blocks(total_cleared as i64)?;
-        state.flush_alloc_metadata()?;
     }
     Ok(())
+}
+
+/// 批量释放任意一组数据块，并把 bitmap / group descriptor / superblock 刷新合并。
+///
+/// iozone 多进程写入会把同一个文件的物理块打散成 stride 形态；这类文件删除时
+/// 无法靠连续 run 合并。这里按块号排序后每个块组只读写一次 bitmap，最后统一
+/// 刷新分配元数据，避免逐块释放把收尾阶段放大成长期卡住。
+pub(crate) fn free_blocks_sparse(state: &FsState, blocks: &[u64]) -> Result<(), BlockBackendError> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+
+    let _g = lock_alloc();
+    let sb = &state.ext_sb;
+    let first_data = sb.first_data_block as u64;
+    let mut sorted = blocks.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    discard_sorted_cached_blocks(state, &sorted);
+
+    let mut bitmap_scratch = vec![0u8; sb.block_size as usize];
+    let mut idx = 0usize;
+    let mut first_cleared_rel = None;
+    let mut total_cleared = 0u64;
+
+    while idx < sorted.len() {
+        let block = sorted[idx];
+        if block < first_data {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        let rel = block - first_data;
+        let group = (rel / sb.blocks_per_group as u64) as u32;
+        if group >= sb.groups_count {
+            return Err(BlockBackendError::OutOfRange);
+        }
+
+        let bits_in_group = if group == sb.groups_count - 1 {
+            let used_before = group as u64 * sb.blocks_per_group as u64;
+            let remain = sb.blocks_count.saturating_sub(used_before);
+            remain.min(sb.blocks_per_group as u64) as u32
+        } else {
+            sb.blocks_per_group
+        };
+        let gd = state.group_desc_mut(group)?;
+        state.read_block(gd.block_bitmap, &mut bitmap_scratch)?;
+
+        let mut cleared = 0u32;
+        while idx < sorted.len() {
+            let block = sorted[idx];
+            if block < first_data {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let rel = block - first_data;
+            let block_group = (rel / sb.blocks_per_group as u64) as u32;
+            if block_group != group {
+                break;
+            }
+            let in_group = (rel % sb.blocks_per_group as u64) as u32;
+            if in_group >= bits_in_group {
+                return Err(BlockBackendError::OutOfRange);
+            }
+            let byte_idx = (in_group / 8) as usize;
+            let mask = 1u8 << ((in_group % 8) as u8);
+            if bitmap_scratch[byte_idx] & mask != 0 {
+                bitmap_scratch[byte_idx] &= !mask;
+                first_cleared_rel.get_or_insert(rel);
+                cleared += 1;
+            }
+            idx += 1;
+        }
+
+        if cleared != 0 {
+            state.write_block(gd.block_bitmap, &bitmap_scratch)?;
+            state.adjust_group_free_blocks(group, cleared as i32)?;
+            total_cleared += cleared as u64;
+        }
+    }
+
+    if total_cleared != 0 {
+        if total_cleared > i64::MAX as u64 {
+            return Err(BlockBackendError::OutOfRange);
+        }
+        state
+            .block_alloc_hint
+            .store(first_cleared_rel.unwrap_or(0), Ordering::Relaxed);
+        state.adjust_sb_free_blocks(total_cleared as i64)?;
+    }
+    Ok(())
+}
+
+fn discard_sorted_cached_blocks(state: &FsState, blocks: &[u64]) {
+    let mut idx = 0usize;
+    while idx < blocks.len() {
+        let start = blocks[idx];
+        let mut end = start + 1;
+        idx += 1;
+        while idx < blocks.len() && blocks[idx] == end {
+            end += 1;
+            idx += 1;
+        }
+        state.discard_cached_blocks(start, (end - start) as u32);
+    }
 }
 
 /// 分配一个 inode(非目录)。`is_dir` 控制用于 `s_used_dirs` 计数。
@@ -485,7 +585,6 @@ pub(crate) fn alloc_inode(state: &FsState, is_dir: bool) -> Result<u32, BlockBac
                 state.adjust_group_used_dirs(group, 1)?;
             }
             state.adjust_sb_free_inodes(-1)?;
-            state.flush_alloc_metadata()?;
             return Ok(ino);
         }
     }
@@ -513,7 +612,6 @@ pub(crate) fn free_inode(state: &FsState, ino: u32, is_dir: bool) -> Result<(), 
         state.adjust_group_used_dirs(group, -1)?;
     }
     state.adjust_sb_free_inodes(1)?;
-    state.flush_alloc_metadata()?;
     Ok(())
 }
 

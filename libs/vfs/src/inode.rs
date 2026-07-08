@@ -259,6 +259,16 @@ impl Inode {
         result
     }
 
+    /// 文件系统驱动完成磁盘 inode 写回后，用精确的底层元数据刷新 VFS 镜像。
+    ///
+    /// 与 `set_times`/`set_mode` 这类 VFS 语义入口不同，本接口不推导 ctime，也不做
+    /// 权限检查；调用方必须已经完成对应的文件系统写操作。
+    pub fn refresh_meta_from_fs(&self, new_meta: InodeMeta) {
+        let mut meta = self.meta.lock();
+        *meta = new_meta;
+        self.sync_meta_hot_fields(&meta);
+    }
+
     fn sync_meta_hot_fields(&self, meta: &InodeMeta) {
         self.cached_size.store(meta.size, Ordering::Release);
         self.cached_nlink.store(meta.nlink, Ordering::Release);

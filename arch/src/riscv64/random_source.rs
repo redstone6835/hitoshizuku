@@ -26,7 +26,9 @@ impl EntropySource for Riscv64EntropySource {
         ra
     }
 
-    fn name(&self) -> &'static str { "riscv64-jitter" }
+    fn name(&self) -> &'static str {
+        "riscv64-jitter"
+    }
 
     fn sample(&self, out: &mut [u8]) {
         // 收集 4 个 u64 种子值
@@ -38,7 +40,9 @@ impl EntropySource for Riscv64EntropySource {
         // 简单混合：xorshift64 变体，将 4 个值折叠成伪随机流
         let mut state = ts1 ^ sp.rotate_left(17) ^ ra.rotate_left(31) ^ ts2.rotate_left(47);
         // xorshift64 的不动点是 0，用非零常量兜底
-        if state == 0 { state = 0xdeadbeef_cafebabe; }
+        if state == 0 {
+            state = 0xdeadbeef_cafebabe;
+        }
         for chunk in out.chunks_mut(8) {
             state ^= state << 13;
             state ^= state >> 7;
@@ -48,7 +52,9 @@ impl EntropySource for Riscv64EntropySource {
         }
     }
 
-    fn as_any(&self) -> &dyn core::any::Any { self }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
 }
 
 static SOURCE: Riscv64EntropySource = Riscv64EntropySource;

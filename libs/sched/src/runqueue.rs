@@ -99,6 +99,7 @@ struct RqInner {
     current: Option<Arc<Task>>,
     last_update_ns: u64,
     enqueue_seq: u64,
+    preferred_fair_addr: Option<usize>,
 }
 
 /// 单 CPU 运行队列。每个 online CPU 持有一份。
@@ -121,6 +122,7 @@ impl Runqueue {
                 current: None,
                 last_update_ns: 0,
                 enqueue_seq: 0,
+                preferred_fair_addr: None,
             }),
         }
     }
@@ -186,13 +188,35 @@ impl Runqueue {
     }
 
     pub fn enqueue(&self, task: Arc<Task>, now_ns: u64) {
+        self.enqueue_with_preference(task, now_ns, false);
+    }
+
+    pub fn enqueue_preferred(&self, task: Arc<Task>, now_ns: u64) {
+        self.enqueue_with_preference(task, now_ns, true);
+    }
+
+    fn enqueue_with_preference(&self, task: Arc<Task>, now_ns: u64, preferred: bool) {
         let mut inner = self.inner.lock();
+        if !task_can_enter_runqueue(&task) {
+            task.sched.set_on_rq(false);
+            log::warning!(
+                "[sched] reject non-executable task enqueue pid={:?} state={:?}",
+                task.pid_root(),
+                task.state(),
+            );
+            return;
+        }
         if task.sched.on_rq() {
             return;
         }
         let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
         task.sched.set_on_rq(true);
+        if preferred && task.sched.policy() == SchedPolicy::Fair {
+            // futex 唤醒是短等待热路径。只记录一次性候选，
+            // 真正 pick 时仍会复查状态、亲和性和 class，避免破坏长期公平性。
+            inner.preferred_fair_addr = Some(task_addr(&task));
+        }
         enqueue_queued_locked(&mut inner, task, now_ns);
     }
 
@@ -253,18 +277,31 @@ impl Runqueue {
 
         let mut fair_prev_addr = None;
         if let Some(prev) = inner.current.take() {
-            if prev.state() == TaskState::Running || prev.state() == TaskState::Runnable {
+            if task_can_enter_runqueue(&prev)
+                && (prev.state() == TaskState::Running || prev.state() == TaskState::Runnable)
+            {
                 prev.set_state(TaskState::Runnable);
                 if prev.sched.policy() == SchedPolicy::Fair {
                     fair_prev_addr = Some(task_addr(&prev));
                 }
                 enqueue_queued_locked(&mut inner, prev, now_ns);
             } else {
+                if prev.arch_context().is_none()
+                    && !matches!(prev.state(), TaskState::Zombie | TaskState::Dead)
+                {
+                    log::warning!(
+                        "[sched] drop current without arch context pid={:?} state={:?}",
+                        prev.pid_root(),
+                        prev.state(),
+                    );
+                    prev.set_state(TaskState::Dead);
+                }
                 prev.sched.set_on_rq(false);
             }
         }
 
-        let picked = pick_queued_locked(&mut inner, fair_prev_addr, cpu_mask);
+        let preferred_fair_addr = inner.preferred_fair_addr.take();
+        let picked = pick_queued_locked(&mut inner, fair_prev_addr, preferred_fair_addr, cpu_mask);
         if let Some(ref task) = picked {
             prepare_running_locked(&mut inner, task, now_ns);
             inner.current = Some(Arc::clone(task));
@@ -452,7 +489,30 @@ fn enqueue_fair_locked(inner: &mut RqInner, task: Arc<Task>) {
 
 fn pick_queued_locked(
     inner: &mut RqInner,
+    mut fair_prev_addr: Option<usize>,
+    mut preferred_fair_addr: Option<usize>,
+    cpu_mask: u64,
+) -> Option<Arc<Task>> {
+    loop {
+        let task =
+            pick_queued_candidate_locked(inner, fair_prev_addr, preferred_fair_addr, cpu_mask)?;
+        if task_can_run_on(&task, cpu_mask) {
+            return Some(task);
+        }
+        discard_non_runnable_pick(&task);
+        if fair_prev_addr.is_some_and(|addr| addr == task_addr(&task)) {
+            fair_prev_addr = None;
+        }
+        if preferred_fair_addr.is_some_and(|addr| addr == task_addr(&task)) {
+            preferred_fair_addr = None;
+        }
+    }
+}
+
+fn pick_queued_candidate_locked(
+    inner: &mut RqInner,
     fair_prev_addr: Option<usize>,
+    preferred_fair_addr: Option<usize>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     if let Some(key) = inner
@@ -471,7 +531,7 @@ fn pick_queued_locked(
     {
         return inner.rt_tree.remove(&key);
     }
-    if let Some(task) = pick_fair_locked(inner, fair_prev_addr, cpu_mask) {
+    if let Some(task) = pick_fair_locked(inner, fair_prev_addr, preferred_fair_addr, cpu_mask) {
         return Some(task);
     }
     let key = inner
@@ -485,9 +545,11 @@ fn pick_queued_locked(
 fn pick_fair_locked(
     inner: &mut RqInner,
     skip_addr: Option<usize>,
+    preferred_addr: Option<usize>,
     cpu_mask: u64,
 ) -> Option<Arc<Task>> {
     let avg = avg_vruntime_locked(inner);
+    let mut preferred = None;
     let mut first_allowed = None;
     let mut first_eligible = None;
     let mut min_non_skip: Option<(FairKey, u64)> = None;
@@ -501,6 +563,9 @@ fn pick_fair_locked(
             continue;
         }
 
+        if preferred_addr.is_some_and(|addr| task_addr(task) == addr) {
+            preferred = Some(*key);
+        }
         first_allowed.get_or_insert(*key);
 
         let is_skip = skip_addr.is_some_and(|skip| task_addr(task) == skip);
@@ -526,7 +591,8 @@ fn pick_fair_locked(
             .or(first_allowed)
     } else {
         first_eligible.or(first_allowed)
-    }?;
+    };
+    let key = preferred.or(key)?;
     let task = inner.fair_tree.remove(&key)?;
     account_fair_remove_locked(inner, &task);
     Some(task)
@@ -534,6 +600,32 @@ fn pick_fair_locked(
 
 fn task_allowed_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
     (task.cpu_affinity() & cpu_mask) != 0
+}
+
+fn task_can_enter_runqueue(task: &Arc<Task>) -> bool {
+    task.arch_context().is_some() && !matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+}
+
+fn task_can_run_on(task: &Arc<Task>, cpu_mask: u64) -> bool {
+    task_allowed_on(task, cpu_mask)
+        && task.state() == TaskState::Runnable
+        && task.arch_context().is_some()
+}
+
+fn discard_non_runnable_pick(task: &Arc<Task>) {
+    let state = task.state();
+    task.sched.set_on_rq(false);
+    if task.arch_context().is_none() && !matches!(state, TaskState::Zombie | TaskState::Dead) {
+        // 已释放执行体的任务绝不能重新进入调度。这里把异常残留终结掉，
+        // 避免调度器在同一个坏任务上反复自旋或切到无效上下文。
+        task.set_state(TaskState::Dead);
+    }
+    log::warning!(
+        "[sched] discard non-runnable queued task pid={:?} state={:?} has_ctx={}",
+        task.pid_root(),
+        state,
+        task.arch_context().is_some(),
+    );
 }
 
 fn prepare_running_locked(inner: &mut RqInner, task: &Arc<Task>, now_ns: u64) {

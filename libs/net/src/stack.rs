@@ -647,14 +647,63 @@ impl NetStack {
                 return Err(NetError::Closed);
             }
             let remote_ep = endpoint_to_smoltcp(&remote);
-            let local_port =
-                select_tcp_ephemeral_port(&managed, handle.inner, self.tuning.ephemeral_ports)?;
+            let local_port = if let Some(bound) = managed.tcp_bound_endpoint(handle.inner) {
+                bound.port
+            } else {
+                select_tcp_ephemeral_port(&managed, handle.inner, self.tuning.ephemeral_ports)?
+            };
             managed
                 .tcp_connect(handle.inner, remote_ep, local_port)
                 .map_err(|_| NetError::ConnectionRefused)?;
+            managed.clear_tcp_bound_endpoint(handle.inner);
         }
         self.poll_now();
         Ok(())
+    }
+
+    /// TCP bind（保留本地端点，不进入 listen/connect 状态）。
+    pub fn tcp_bind(
+        &self,
+        handle: NetSocketHandle,
+        mut local: Endpoint,
+    ) -> Result<Endpoint, NetError> {
+        if handle.sock_type != SocketType::Tcp {
+            return Err(NetError::InvalidArgument);
+        }
+        let table = self.interfaces.read();
+        let iface_lock = table
+            .get(&handle.iface_id)
+            .ok_or(NetError::InterfaceNotFound)?;
+        let mut managed = iface_lock.lock();
+        if managed.handle_is_closed(handle) {
+            return Err(NetError::Closed);
+        }
+        if managed.tcp_bound_endpoint(handle.inner).is_some() {
+            return Err(NetError::InvalidArgument);
+        }
+        if managed.tcp_socket(handle.inner).state() != smoltcp::socket::tcp::State::Closed {
+            return Err(NetError::InvalidArgument);
+        }
+        ensure_local_addr_available(&managed, &local.addr)?;
+        if local.port != 0 {
+            let local_ep = endpoint_to_smoltcp_listen(&local);
+            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+                return Err(NetError::AddressInUse);
+            }
+            managed.set_tcp_bound_endpoint(handle.inner, local_ep);
+            return Ok(local);
+        }
+
+        for candidate in EphemeralPortCursor::new(self.tuning.ephemeral_ports) {
+            local.port = candidate;
+            let local_ep = endpoint_to_smoltcp_listen(&local);
+            if managed.tcp_listen_endpoint_in_use(handle.inner, local_ep) {
+                continue;
+            }
+            managed.set_tcp_bound_endpoint(handle.inner, local_ep);
+            return Ok(local);
+        }
+        Err(NetError::AddressInUse)
     }
 
     /// TCP listen（开始监听）。
@@ -684,6 +733,7 @@ impl NetStack {
             socket
                 .listen(local_ep)
                 .map_err(|_| NetError::AddressInUse)?;
+            managed.clear_tcp_bound_endpoint(handle.inner);
             return Ok(local);
         }
 
@@ -698,6 +748,7 @@ impl NetStack {
             }
             let socket = managed.tcp_socket_mut(handle.inner);
             if socket.listen(local_ep).is_ok() {
+                managed.clear_tcp_bound_endpoint(handle.inner);
                 return Ok(local);
             }
         }
@@ -1417,10 +1468,16 @@ impl NetStack {
     // ── UDP 操作 ─────────────────────────────────────────────────────────
 
     /// UDP bind。绑定本地端口后可收发数据报。
-    pub fn udp_bind(
+    pub fn udp_bind(&self, handle: NetSocketHandle, local: Endpoint) -> Result<Endpoint, NetError> {
+        self.udp_bind_with_reuse(handle, local, false)
+    }
+
+    /// UDP bind，允许调用方传入 SO_REUSEADDR/SO_REUSEPORT 状态。
+    pub fn udp_bind_with_reuse(
         &self,
         handle: NetSocketHandle,
         mut local: Endpoint,
+        allow_reuse: bool,
     ) -> Result<Endpoint, NetError> {
         if handle.sock_type != SocketType::Udp {
             return Err(NetError::InvalidArgument);
@@ -1436,11 +1493,12 @@ impl NetStack {
         ensure_local_addr_available(&managed, &local.addr)?;
         if local.port != 0 {
             let local_ep = endpoint_to_smoltcp_listen(&local);
-            if managed.udp_endpoint_in_use(handle.inner, local_ep) {
+            if managed.udp_endpoint_conflicts(handle.inner, local_ep, allow_reuse) {
                 return Err(NetError::AddressInUse);
             }
             let socket = managed.udp_socket_mut(handle.inner);
             socket.bind(local_ep).map_err(|_| NetError::AddressInUse)?;
+            managed.set_udp_reuse_bind(handle.inner, allow_reuse);
             return Ok(local);
         }
 
@@ -1454,6 +1512,7 @@ impl NetStack {
             }
             let socket = managed.udp_socket_mut(handle.inner);
             if socket.bind(local_ep).is_ok() {
+                managed.set_udp_reuse_bind(handle.inner, allow_reuse);
                 return Ok(local);
             }
         }
@@ -1549,6 +1608,7 @@ impl NetStack {
         handle: NetSocketHandle,
         buf: &mut [u8],
     ) -> Result<(usize, Endpoint), NetError> {
+        self.poll_now();
         self.udp_recv_info(handle, buf)
             .map(|info| (info.len, info.remote))
     }
@@ -1691,6 +1751,26 @@ impl NetStack {
             if managed.handle_is_live(handle) {
                 managed.remove_socket_locked(handle.inner);
             }
+        }
+    }
+
+    /// 关闭监听 fd 对应的 TCP 监听端点，并同步清理由 accept 机制生成的
+    /// successor listener / pending accepted socket。
+    pub fn tcp_close_listener(&self, handle: NetSocketHandle, local: Option<Endpoint>) {
+        if handle.sock_type != SocketType::Tcp {
+            self.socket_close_and_remove(handle);
+            return;
+        }
+        let table = self.interfaces.read();
+        if let Some(iface_lock) = table.get(&handle.iface_id) {
+            let mut managed = iface_lock.lock();
+            if managed.handle_is_closed(handle) && local.is_none() {
+                return;
+            }
+            let target = local
+                .map(|ep| endpoint_to_smoltcp_listen(&ep))
+                .unwrap_or_else(|| managed.tcp_socket(handle.inner).listen_endpoint());
+            managed.close_tcp_listener(handle.inner, target);
         }
     }
 
@@ -2646,7 +2726,7 @@ mod tests {
         }
 
         fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
-            Some(TxBuf::new(alloc::vec![0u8; len].into_boxed_slice()))
+            Some(TxBuf::new_heap(alloc::vec![0u8; len].into_boxed_slice()))
         }
 
         fn commit_tx(&self, buf: TxBuf) {
@@ -2973,6 +3053,47 @@ mod tests {
             Err(NetError::InvalidArgument)
         );
         assert_eq!(stack.udp_local_endpoint(handle), None);
+    }
+
+    #[test]
+    fn udp_bind_reuse_requires_both_sockets_to_opt_in() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-udp-reuse-requires-both",
+            IfConfig::static_v4(Ipv4Addr::new(10, 7, 3, 2), 24, None),
+        );
+        let first = stack.socket_udp_on(iface).unwrap();
+        let second = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 5001,
+        };
+
+        assert_eq!(stack.udp_bind(first, local), Ok(local));
+        assert_eq!(
+            stack.udp_bind_with_reuse(second, local, true),
+            Err(NetError::AddressInUse)
+        );
+    }
+
+    #[test]
+    fn udp_bind_reuse_allows_duplicate_local_port() {
+        let stack = NetStack::new();
+        let iface = attach_test_iface(
+            &stack,
+            "eth-udp-reuse-ok",
+            IfConfig::static_v4(Ipv4Addr::new(10, 7, 4, 2), 24, None),
+        );
+        let first = stack.socket_udp_on(iface).unwrap();
+        let second = stack.socket_udp_on(iface).unwrap();
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port: 5001,
+        };
+
+        assert_eq!(stack.udp_bind_with_reuse(first, local, true), Ok(local));
+        assert_eq!(stack.udp_bind_with_reuse(second, local, true), Ok(local));
     }
 
     #[test]

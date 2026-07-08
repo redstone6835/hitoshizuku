@@ -106,7 +106,8 @@ pub type SyscallFn = fn(&mut SyscallContext<'_>) -> Result<usize, Errno>;
 /// 表大小：覆盖 Linux asm-generic 全部 syscall 号（最大约 450）。
 pub const SYSCALL_TABLE_LEN: usize = 512;
 
-static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] = [const { AtomicUsize::new(0) }; SYSCALL_TABLE_LEN];
+static SYSCALL_TABLE: [AtomicUsize; SYSCALL_TABLE_LEN] =
+    [const { AtomicUsize::new(0) }; SYSCALL_TABLE_LEN];
 
 /// 在启动期注册一个 syscall 号 → fn 的映射。重复注册会 panic（防止表条目被
 /// 静默覆盖）。
@@ -117,12 +118,8 @@ pub fn register_syscall(nr: usize, f: SyscallFn) {
         nr,
         SYSCALL_TABLE_LEN - 1
     );
-    let old = SYSCALL_TABLE[nr].compare_exchange(
-        0,
-        f as usize,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    let old =
+        SYSCALL_TABLE[nr].compare_exchange(0, f as usize, Ordering::AcqRel, Ordering::Acquire);
     assert!(old.is_ok(), "[syscall] nr {} already registered", nr);
 }
 
@@ -187,15 +184,39 @@ pub fn dispatch(tf: TrapFramePtr) {
 
     let frame_finalized = ctx.frame_finalized();
     if !frame_finalized {
+        if ret == -(Errno::EINTR.as_i32() as isize) {
+            if let Some((info, action)) = sched::operation::consume_restartable_signal() {
+                let delivered = sched::process_image_ops()
+                    .and_then(|ops| {
+                        (ops.setup_signal_frame)(
+                            ctx.task(),
+                            info,
+                            action,
+                            sched::UserContextRef::new(tf.as_usize()),
+                        )
+                        .ok()
+                    })
+                    .is_some();
+                if delivered {
+                    sched::run_post_syscall_handoff(sched::now_ns_public());
+                    return;
+                }
+            }
+        }
+
         (ops.set_sys_ret)(tf, ret);
         (ops.advance_pc)(tf);
-        let _ = sched::operation::deliver_pending_signals_with_context(sched::UserContextRef::new(
-            tf.as_usize(),
-        ));
-        match ctx.task().state() {
+
+        let task = ctx.task();
+        if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
+            let _ = sched::operation::deliver_pending_signals_for_task(
+                &task,
+                sched::UserContextRef::new(tf.as_usize()),
+            );
+        }
+
+        match task.state() {
             sched::TaskState::Zombie | sched::TaskState::Dead => {
-                // 当前任务已经终止，下面的调度切换不会回到这段内核栈。
-                // 先释放 syscall context 持有的 Arc，避免把 dead task 永久钉在旧栈上。
                 ctx.release_task_ref();
                 sched::schedule_once(0);
                 panic!("[syscall] terminal task scheduled back unexpectedly");
@@ -205,7 +226,106 @@ pub fn dispatch(tf: TrapFramePtr) {
             }
             _ => {}
         }
-        sched::run_post_syscall_handoff(sched::now_ns_public());
+        sched::run_post_syscall_handoff_lazy();
     }
+    // syscall 是 libcbench/lmbench 的最热路径，默认不能格式化并写入每次调用。
+    // 需要单步追踪时临时打开下面的编译期开关即可。
+    #[cfg(feature = "trace-syscall")]
     log::debug!("[syscall] nr={} args={:?} -> {}", nr, args, ret);
+}
+
+/// arch 快速 syscall 路径用。调用方已经从 trap frame 取出 syscall 号和参数，
+/// 因而这里跳过 frame_ops 的 sys_nr/sys_args 间接调用，但保持普通 dispatch
+/// 的任务引用与信号语义。
+#[inline]
+pub fn dispatch_fast(tf: TrapFramePtr, nr: usize, args: [usize; 6]) {
+    let Some(ops) = frame_ops() else { return };
+    dispatch_fast_with_frame(tf, nr, args, |tf, ret| {
+        (ops.set_sys_ret)(tf, ret);
+        (ops.advance_pc)(tf);
+    });
+}
+
+/// arch 快速 syscall 路径用。调用方直接提供 trap frame 写回逻辑，避免热路径
+/// 每次通过 `frame_ops()` 全局表做原子加载和间接调用。
+#[inline]
+pub fn dispatch_fast_with_frame<F>(tf: TrapFramePtr, nr: usize, args: [usize; 6], mut finish: F)
+where
+    F: FnMut(TrapFramePtr, isize),
+{
+    let task = sched::current_task_fast();
+
+    let entry = if nr < SYSCALL_TABLE_LEN {
+        let ptr = SYSCALL_TABLE[nr].load(Ordering::Acquire);
+        if ptr == 0 {
+            None
+        } else {
+            Some(unsafe { core::mem::transmute::<usize, SyscallFn>(ptr) })
+        }
+    } else {
+        None
+    };
+
+    let mut ctx = SyscallContext {
+        nr,
+        args,
+        tf,
+        task: Some(task),
+        frame_finalized: false,
+        _phantom: core::marker::PhantomData,
+    };
+
+    let ret: isize = match entry {
+        Some(f) => match f(&mut ctx) {
+            Ok(v) => v as isize,
+            Err(e) => -(e.as_i32() as isize),
+        },
+        None => -(Errno::ENOSYS.as_i32() as isize),
+    };
+
+    let frame_finalized = ctx.frame_finalized();
+    if !frame_finalized {
+        if ret == -(Errno::EINTR.as_i32() as isize) {
+            if let Some((info, action)) = sched::operation::consume_restartable_signal() {
+                let delivered = sched::process_image_ops()
+                    .and_then(|pops| {
+                        (pops.setup_signal_frame)(
+                            ctx.task(),
+                            info,
+                            action,
+                            sched::UserContextRef::new(tf.as_usize()),
+                        )
+                        .ok()
+                    })
+                    .is_some();
+                if delivered {
+                    sched::run_post_syscall_handoff(sched::now_ns_public());
+                    return;
+                }
+            }
+        }
+
+        finish(tf, ret);
+
+        let task = ctx.task();
+        if task.signal.has_any_pending() || task.shared_signal_pending_bits_quick() != 0 {
+            let _ = sched::operation::deliver_pending_signals_for_task(
+                task,
+                sched::UserContextRef::new(tf.as_usize()),
+            );
+        }
+
+        match task.state() {
+            sched::TaskState::Zombie | sched::TaskState::Dead => {
+                ctx.release_task_ref();
+                sched::schedule_once(0);
+                panic!("[syscall] terminal task scheduled back");
+            }
+            sched::TaskState::Stopped | sched::TaskState::Continued => {
+                sched::schedule_once(0);
+            }
+            _ => {}
+        }
+        sched::run_post_syscall_handoff_lazy();
+    }
 }

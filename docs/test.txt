@@ -1,0 +1,1093 @@
+评测完成
+开始时间：2026-06-26 19:25:19.341693+08:00
+
+结束时间：2026-06-26 21:30:12.785375+08:00
+
+总分：2505.0015025326447
+
+得分详情
+测试点	glibc-la	glibc-rv	musl-la	musl-rv	总分
+basic	102	97	102	97	398
+busybox	54	54	54	54	216
+cyclictest	4.0	4.0	4.0	4.0	16.0
+iozone	37.49509489779119	32.2667433922673	36.83535661725453	30.45203495047521	137.04922985778825
+iperf	6.0	5.0	6.0	6.0	23.0
+libcbench	31.76814169810831	29.660722486673194	28.94586213812795	27.0	117.37472632290945
+libctest	-	-	215	215	430
+lmbench	38.85593835969354	36.98211603315343	39.89844669041081	38.55954737333708	154.29604845659486
+ltp	4563	4508	4381	4606	18058
+lua	9	9	9	9	36
+netperf	5.0	5.0	2.0	5.0	17.0
+总分	4851.119174955593	4780.909581912094	4878.679665445793	5092.011582323812	2505.0015025326447
+basic-glibc
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+test_brk	3	3	3	3	3	3	6
+test_chdir	3	3	3	3	3	3	6
+test_clone	4	4	4	4	4	4	8
+test_close	2	2	2	2	2	2	4
+test_dup	2	2	2	2	2	2	4
+test_dup2	2	2	2	2	2	2	4
+test_execve	3	3	3	3	3	3	6
+test_exit	0	2	0	2	2	2	2
+test_fork	3	3	3	3	3	3	6
+test_fstat	3	3	3	3	3	3	6
+test_getcwd	2	2	2	2	2	2	4
+test_getdents	5	5	5	5	5	5	10
+test_getpid	3	3	3	3	3	3	6
+test_getppid	2	2	2	2	2	2	4
+test_gettimeofday	3	3	3	3	3	3	6
+test_mkdir	3	3	3	3	3	3	6
+test_mmap	3	3	3	3	3	3	6
+test_mount	5	5	5	5	5	5	10
+test_munmap	4	4	4	4	4	4	8
+test_open	0	3	0	3	3	3	3
+test_openat	4	4	4	4	4	4	8
+test_pipe	4	4	4	4	4	4	8
+test_read	3	3	3	3	3	3	6
+test_sleep	2	2	2	2	2	2	4
+test_times	6	6	6	6	6	6	12
+test_umount	5	5	5	5	5	5	10
+test_uname	2	2	2	2	2	2	4
+test_unlink	2	2	2	2	2	2	4
+test_wait	4	4	4	4	4	4	8
+test_waitpid	4	4	4	4	4	4	8
+test_write	2	2	2	2	2	2	4
+test_yield	4	4	4	4	4	4	8
+总分			97			102	199
+
+basic-musl
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+test_brk	3	3	3	3	3	3	6
+test_chdir	3	3	3	3	3	3	6
+test_clone	4	4	4	4	4	4	8
+test_close	2	2	2	2	2	2	4
+test_dup	2	2	2	2	2	2	4
+test_dup2	2	2	2	2	2	2	4
+test_execve	3	3	3	3	3	3	6
+test_exit	0	2	0	2	2	2	2
+test_fork	3	3	3	3	3	3	6
+test_fstat	3	3	3	3	3	3	6
+test_getcwd	2	2	2	2	2	2	4
+test_getdents	5	5	5	5	5	5	10
+test_getpid	3	3	3	3	3	3	6
+test_getppid	2	2	2	2	2	2	4
+test_gettimeofday	3	3	3	3	3	3	6
+test_mkdir	3	3	3	3	3	3	6
+test_mmap	3	3	3	3	3	3	6
+test_mount	5	5	5	5	5	5	10
+test_munmap	4	4	4	4	4	4	8
+test_open	0	3	0	3	3	3	3
+test_openat	4	4	4	4	4	4	8
+test_pipe	4	4	4	4	4	4	8
+test_read	3	3	3	3	3	3	6
+test_sleep	2	2	2	2	2	2	4
+test_times	6	6	6	6	6	6	12
+test_umount	5	5	5	5	5	5	10
+test_uname	2	2	2	2	2	2	4
+test_unlink	2	2	2	2	2	2	4
+test_wait	4	4	4	4	4	4	8
+test_waitpid	4	4	4	4	4	4	8
+test_write	2	2	2	2	2	2	4
+test_yield	4	4	4	4	4	4	8
+总分			97			102	199
+
+busybox-glibc
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+busybox [ -f test.txt ]	1	1	1	1	1	1	2
+busybox ash -c exit	1	1	1	1	1	1	2
+busybox basename /aaa/bbb	1	1	1	1	1	1	2
+busybox cal	1	1	1	1	1	1	2
+busybox cat test.txt	1	1	1	1	1	1	2
+busybox clear	1	1	1	1	1	1	2
+busybox cp busybox_cmd.txt busybox_cmd.bak	1	1	1	1	1	1	2
+busybox cut -c 3 test.txt	1	1	1	1	1	1	2
+busybox date	1	1	1	1	1	1	2
+busybox df	1	1	1	1	1	1	2
+busybox dirname /aaa/bbb	1	1	1	1	1	1	2
+busybox dmesg	1	1	1	1	1	1	2
+busybox du	1	1	1	1	1	1	2
+busybox echo "#### file opration test"	1	1	1	1	1	1	2
+busybox echo "#### independent command test"	1	1	1	1	1	1	2
+busybox echo "1111111" >> test.txt	1	1	1	1	1	1	2
+busybox echo "2222222" >> test.txt	1	1	1	1	1	1	2
+busybox echo "aaaaaaa" >> test.txt	1	1	1	1	1	1	2
+busybox echo "bbbbbbb" >> test.txt	1	1	1	1	1	1	2
+busybox echo "ccccccc" >> test.txt	1	1	1	1	1	1	2
+busybox echo "hello world" > test.txt	1	1	1	1	1	1	2
+busybox expr 1 + 1	1	1	1	1	1	1	2
+busybox false	1	1	1	1	1	1	2
+busybox find -name "busybox_cmd.txt"	1	1	1	1	1	1	2
+busybox free	1	1	1	1	1	1	2
+busybox grep hello busybox_cmd.txt	1	1	1	1	1	1	2
+busybox head test.txt	1	1	1	1	1	1	2
+busybox hexdump -C test.txt	1	1	1	1	1	1	2
+busybox hwclock	1	1	1	1	1	1	2
+busybox kill 10	0	1	0	0	1	0	0
+busybox ls	1	1	1	1	1	1	2
+busybox md5sum test.txt	1	1	1	1	1	1	2
+busybox mkdir test_dir	1	1	1	1	1	1	2
+busybox more test.txt	1	1	1	1	1	1	2
+busybox mv test_dir test	1	1	1	1	1	1	2
+busybox od test.txt	1	1	1	1	1	1	2
+busybox printf "abcn"	1	1	1	1	1	1	2
+busybox ps	1	1	1	1	1	1	2
+busybox pwd	1	1	1	1	1	1	2
+busybox rm busybox_cmd.bak	1	1	1	1	1	1	2
+busybox rm test.txt	1	1	1	1	1	1	2
+busybox rmdir test	1	1	1	1	1	1	2
+busybox sh -c 'sleep 5' & ./busybox kill $!	1	1	1	1	1	1	2
+busybox sh -c exit	1	1	1	1	1	1	2
+busybox sleep 1	1	1	1	1	1	1	2
+busybox sort test.txt | ./busybox uniq	1	1	1	1	1	1	2
+busybox stat test.txt	1	1	1	1	1	1	2
+busybox strings test.txt	1	1	1	1	1	1	2
+busybox tail test.txt	1	1	1	1	1	1	2
+busybox touch test.txt	1	1	1	1	1	1	2
+busybox true	1	1	1	1	1	1	2
+busybox uname	1	1	1	1	1	1	2
+busybox uptime	1	1	1	1	1	1	2
+busybox wc test.txt	1	1	1	1	1	1	2
+busybox which ls	1	1	1	1	1	1	2
+总分			54			54	108
+
+busybox-musl
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+busybox [ -f test.txt ]	1	1	1	1	1	1	2
+busybox ash -c exit	1	1	1	1	1	1	2
+busybox basename /aaa/bbb	1	1	1	1	1	1	2
+busybox cal	1	1	1	1	1	1	2
+busybox cat test.txt	1	1	1	1	1	1	2
+busybox clear	1	1	1	1	1	1	2
+busybox cp busybox_cmd.txt busybox_cmd.bak	1	1	1	1	1	1	2
+busybox cut -c 3 test.txt	1	1	1	1	1	1	2
+busybox date	1	1	1	1	1	1	2
+busybox df	1	1	1	1	1	1	2
+busybox dirname /aaa/bbb	1	1	1	1	1	1	2
+busybox dmesg	1	1	1	1	1	1	2
+busybox du	1	1	1	1	1	1	2
+busybox echo "#### file opration test"	1	1	1	1	1	1	2
+busybox echo "#### independent command test"	1	1	1	1	1	1	2
+busybox echo "1111111" >> test.txt	1	1	1	1	1	1	2
+busybox echo "2222222" >> test.txt	1	1	1	1	1	1	2
+busybox echo "aaaaaaa" >> test.txt	1	1	1	1	1	1	2
+busybox echo "bbbbbbb" >> test.txt	1	1	1	1	1	1	2
+busybox echo "ccccccc" >> test.txt	1	1	1	1	1	1	2
+busybox echo "hello world" > test.txt	1	1	1	1	1	1	2
+busybox expr 1 + 1	1	1	1	1	1	1	2
+busybox false	1	1	1	1	1	1	2
+busybox find -name "busybox_cmd.txt"	1	1	1	1	1	1	2
+busybox free	1	1	1	1	1	1	2
+busybox grep hello busybox_cmd.txt	1	1	1	1	1	1	2
+busybox head test.txt	1	1	1	1	1	1	2
+busybox hexdump -C test.txt	1	1	1	1	1	1	2
+busybox hwclock	1	1	1	1	1	1	2
+busybox kill 10	0	1	0	0	1	0	0
+busybox ls	1	1	1	1	1	1	2
+busybox md5sum test.txt	1	1	1	1	1	1	2
+busybox mkdir test_dir	1	1	1	1	1	1	2
+busybox more test.txt	1	1	1	1	1	1	2
+busybox mv test_dir test	1	1	1	1	1	1	2
+busybox od test.txt	1	1	1	1	1	1	2
+busybox printf "abcn"	1	1	1	1	1	1	2
+busybox ps	1	1	1	1	1	1	2
+busybox pwd	1	1	1	1	1	1	2
+busybox rm busybox_cmd.bak	1	1	1	1	1	1	2
+busybox rm test.txt	1	1	1	1	1	1	2
+busybox rmdir test	1	1	1	1	1	1	2
+busybox sh -c 'sleep 5' & ./busybox kill $!	1	1	1	1	1	1	2
+busybox sh -c exit	1	1	1	1	1	1	2
+busybox sleep 1	1	1	1	1	1	1	2
+busybox sort test.txt | ./busybox uniq	1	1	1	1	1	1	2
+busybox stat test.txt	1	1	1	1	1	1	2
+busybox strings test.txt	1	1	1	1	1	1	2
+busybox tail test.txt	1	1	1	1	1	1	2
+busybox touch test.txt	1	1	1	1	1	1	2
+busybox true	1	1	1	1	1	1	2
+busybox uname	1	1	1	1	1	1	2
+busybox uptime	1	1	1	1	1	1	2
+busybox wc test.txt	1	1	1	1	1	1	2
+busybox which ls	1	1	1	1	1	1	2
+总分			54			54	108
+
+cyclictest-glibc
+测试点	rv	la	总分
+baseline	score	baseline	score
+cyclictest NO_STRESS_P1 (microseconds)	1862.0	1.0	1862.0	1.0	2.0
+cyclictest NO_STRESS_P8 (microseconds)	1558.125	1.0	1558.125	1.0	2.0
+cyclictest STRESS_P1 (microseconds)	1310.0	1.0	1310.0	1.0	2.0
+cyclictest STRESS_P8 (microseconds)	13842.75	1.0	13842.75	1.0	2.0
+总分		4.0		4.0	8.0
+
+cyclictest-musl
+测试点	rv	la	总分
+baseline	score	baseline	score
+cyclictest NO_STRESS_P1 (microseconds)	1862.0	1.0	1862.0	1.0	2.0
+cyclictest NO_STRESS_P8 (microseconds)	1558.125	1.0	1558.125	1.0	2.0
+cyclictest STRESS_P1 (microseconds)	1310.0	1.0	1310.0	1.0	2.0
+cyclictest STRESS_P8 (microseconds)	13842.75	1.0	13842.75	1.0	2.0
+总分		4.0		4.0	8.0
+
+iozone-glibc
+测试点	rv	la	总分
+result	baseline	score	result	baseline	score
+iozone fwrite/fread 4 freaders (kb/sec)	24347.36	7123.18	1.7074352209028	130898.55	7123.18	1.94558243769698	3.6530176585997802
+iozone fwrite/fread 4 fwriters (kb/sec)	7095.1	3204.25	1.5483855054897042	6741.45	3204.25	1.5246942423365892	3.0730797478262932
+iozone pwrite/pread 4 pread readers (kb/sec)	99072.33	14183.61	1.8568358087470034	126297.17	14183.61	1.8876965335011069	3.7445323422481103
+iozone pwrite/pread 4 pwrite writers (kb/sec)	8276.16	3724.0	1.5500328654835092	36436.06	3724.0	1.8977935594573068	3.447826424940816
+iozone pwritev/preadv 4 initial writers (kb/sec)	6231.44	3609.25	1.4208000077028744	36215.77	3609.25	1.900340376581804	3.3211403842846785
+iozone pwritev/preadv 4 rewriters (kb/sec)	21685.75	8305.9	1.6169881143146998	86573.17	8305.9	1.9040591906245319	3.5210473049392315
+iozone random-read 4 initial writers (kb/sec)	8131.64	3401.72	1.5816686424878623	33221.89	3401.72	1.897606066361667	3.4792747088495295
+iozone random-read 4 random readers (kb/sec)	21126.89	11082.03	1.4754537937197572	60623.8	11082.03	1.81720001055691	3.292653804276667
+iozone random-read 4 random writers (kb/sec)	12336.62	7140.81	1.4211696558700844	106635.14	7140.81	1.9330351139408641	3.3542047698109485
+iozone random-read 4 rewriters (kb/sec)	113398.97	7196.32	1.9365398116049908	153018.86	7196.32	1.9529710259245168	3.8895108375295075
+iozone read-backwards 4 initial writers (kb/sec)	11524.12	3331.39	1.7109202264467918	34094.78	3331.39	1.9022903212749869	3.6132105477217786
+iozone read-backwards 4 reverse readers (kb/sec)	11158.31	10743.42	1.037182153928328	45155.8	10743.42	1.7620810615690565	2.799263215497384
+iozone read-backwards 4 rewriters (kb/sec)	112463.62	4906.05	1.9563765598155207	117430.91	4906.05	1.958221817407359	3.9145983772228794
+iozone stride-read 4 initial writers (kb/sec)	7513.56	3468.09	1.538422532062032	28617.66	3468.09	1.8788129427772922	3.417235474839324
+iozone stride-read 4 rewriters (kb/sec)	107282.84	7004.64	1.9347086635663262	91323.94	7004.64	1.9232989728651655	3.8580076364314917
+iozone stride-read 4 stride readers (kb/sec)	22028.63	11848.11	1.462149484557142	93158.18	11848.11	1.8728172877572318	3.334966772314374
+iozone write/read 4 initial writers (kb/sec)	4718.57	3524.04	1.253155087240414	36163.45	3524.04	1.9025524389957262	3.1557075262361405
+iozone write/read 4 re-readers (kb/sec)	107552.09	13064.75	1.8785263029291202	85761.41	13064.75	1.8476616697416706	3.7261879726707905
+iozone write/read 4 readers (kb/sec)	23759.31	13135.64	1.4471371432924611	85691.26	13135.64	1.8467096877791271	3.2938468310715883
+iozone write/read 4 rewriters (kb/sec)	111269.05	7471.07	1.932855812105882	123837.02	7471.07	1.9396701406413042	3.8725259527471865
+总分			32.2667433922673			37.49509489779119	69.7618382900585
+
+iozone-musl
+测试点	rv	la	总分
+result	baseline	score	result	baseline	score
+iozone fwrite/fread 4 freaders (kb/sec)	13750.5	7123.18	1.4819693829315297	52504.16	7123.18	1.864331131095136	3.346300514026666
+iozone fwrite/fread 4 fwriters (kb/sec)	5477.11	3204.25	1.4149743203988965	34449.19	3204.25	1.9069862019977828	3.3219605223966795
+iozone pwrite/pread 4 pread readers (kb/sec)	20357.82	14183.61	1.3032844381176374	99417.27	14183.61	1.8573325338746478	3.160616971992285
+iozone pwrite/pread 4 pwrite writers (kb/sec)	6168.41	3724.0	1.3962787817281925	6280.36	3724.0	1.4070403607436517	2.803319142471844
+iozone pwritev/preadv 4 initial writers (kb/sec)	3896.85	3609.25	1.0738032000205293	7521.11	3609.25	1.5201173762915314	2.593920576312061
+iozone pwritev/preadv 4 rewriters (kb/sec)	115367.29	8305.9	1.928004723002508	86486.01	8305.9	1.9039625021434103	3.8319672251459185
+iozone random-read 4 initial writers (kb/sec)	6850.51	3401.72	1.5034355106408137	31522.32	3401.72	1.8920853541236813	3.395520864764495
+iozone random-read 4 random readers (kb/sec)	8093.33	11082.03	1.0	66579.72	11082.03	1.8335524691302396	2.8335524691302396
+iozone random-read 4 random writers (kb/sec)	21824.79	7140.81	1.672811972073958	47967.21	7140.81	1.8511314291575431	3.5239434012315014
+iozone random-read 4 rewriters (kb/sec)	87134.81	7196.32	1.9174116521284663	87828.7	7196.32	1.9180641407649208	3.835475792893387
+iozone read-backwards 4 initial writers (kb/sec)	4872.29	3331.39	1.3162578582145152	35943.91	3331.39	1.9073169836002817	3.2235748418147967
+iozone read-backwards 4 reverse readers (kb/sec)	9858.58	10743.42	1.0	49342.58	10743.42	1.782268782864617	2.782268782864617
+iozone read-backwards 4 rewriters (kb/sec)	10031.37	4906.05	1.5109292150523808	97710.97	4906.05	1.949790182207791	3.4607193972601715
+iozone stride-read 4 initial writers (kb/sec)	8329.94	3468.09	1.5836596662160831	39544.19	3468.09	1.912298367977698	3.495958034193781
+iozone stride-read 4 rewriters (kb/sec)	116641.86	7004.64	1.9399474596855708	86749.78	7004.64	1.9192546655449731	3.859202125230544
+iozone stride-read 4 stride readers (kb/sec)	22161.64	11848.11	1.4653775623103704	101719.02	11848.11	1.883521193971393	3.3488987562817636
+iozone write/read 4 initial writers (kb/sec)	11778.79	3524.04	1.7008147695985751	35207.13	3524.04	1.8999055020957403	3.6007202716943154
+iozone write/read 4 re-readers (kb/sec)	23096.96	13064.75	1.434351966665743	95478.9	13064.75	1.8631661026677098	3.297518069333453
+iozone write/read 4 readers (kb/sec)	105994.05	13135.64	1.8760719115837163	86143.27	13135.64	1.8475140309858216	3.723585942569538
+iozone write/read 4 rewriters (kb/sec)	110929.95	7471.07	1.9326505601057244	88642.99	7471.07	1.9157173060159636	3.848367866121688
+总分			30.45203495047521			36.83535661725453	67.28739156772974
+
+iperf-glibc
+测试点	rv	la	总分
+baseline	score	baseline	score
+iperf BASIC_TCP (Mbits/sec)	796.0	1.0	796.0	1.0	2.0
+iperf BASIC_UDP (Mbits/sec)	393.0	1.0	393.0	1.0	2.0
+iperf PARALLEL_TCP (Mbits/sec)	1310.72	1.0	1310.72	1.0	2.0
+iperf PARALLEL_UDP (Mbits/sec)	442.0	1.0	442.0	1.0	2.0
+iperf REVERSE_TCP (Mbits/sec)	792.0	1.0	792.0	1.0	2.0
+iperf REVERSE_UDP (Mbits/sec)	381.0	0.0	381.0	1.0	1.0
+总分		5.0		6.0	11.0
+
+iperf-musl
+测试点	rv	la	总分
+baseline	score	baseline	score
+iperf BASIC_TCP (Mbits/sec)	796.0	1.0	796.0	1.0	2.0
+iperf BASIC_UDP (Mbits/sec)	393.0	1.0	393.0	1.0	2.0
+iperf PARALLEL_TCP (Mbits/sec)	1310.72	1.0	1310.72	1.0	2.0
+iperf PARALLEL_UDP (Mbits/sec)	442.0	1.0	442.0	1.0	2.0
+iperf REVERSE_TCP (Mbits/sec)	792.0	1.0	792.0	1.0	2.0
+iperf REVERSE_UDP (Mbits/sec)	381.0	1.0	381.0	1.0	2.0
+总分		6.0		6.0	12.0
+
+libcbench-glibc
+测试点	rv	la	总分
+baseline	score	baseline	score
+libc-bench b_malloc_big1 (0) (seconds)	0.118578071	1.0	0.118578071	1.0	2.0
+libc-bench b_malloc_big2 (0) (seconds)	0.107088632	1.0	0.107088632	1.0	2.0
+libc-bench b_malloc_bubble (0) (seconds)	0.36015349	1.0	0.36015349	1.0	2.0
+libc-bench b_malloc_sparse (0) (seconds)	0.384919462	1.0	0.384919462	1.0	2.0
+libc-bench b_malloc_thread_local (0) (seconds)	0.096989785	1.0	0.096989785	1.0	2.0
+libc-bench b_malloc_thread_stress (0) (seconds)	0.09632549	1.0	0.09632549	1.0	2.0
+libc-bench b_malloc_tiny1 (0) (seconds)	0.014186324	1.0	0.014186324	1.0	2.0
+libc-bench b_malloc_tiny2 (0) (seconds)	0.010810043	1.0	0.010810043	1.0	2.0
+libc-bench b_pthread_create_serial1 (0) (seconds)	0.892420718	1.0	0.892420718	1.947503034101456	2.947503034101456
+libc-bench b_pthread_createjoin_serial1 (0) (seconds)	1.284791557	1.0	1.284791557	1.987002475297244	2.9870024752972437
+libc-bench b_pthread_createjoin_serial2 (0) (seconds)	1.006433722	1.0	1.006433722	1.0	2.0
+libc-bench b_pthread_uselesslock (0) (seconds)	0.080551368	1.0	0.080551368	1.0	2.0
+libc-bench b_regex_compile ("(a|b|c)*d*b") (seconds)	0.088259223	1.1290825209281525	0.088259223	1.293426931710015	2.4225094526381676
+libc-bench b_regex_search ("(a|b|c)*d*b") (seconds)	0.083251251	1.770738580252686	0.083251251	1.7306329967341871	3.501371576986873
+libc-bench b_regex_search ("a{25}b") (seconds)	0.286712251	1.0	0.286712251	1.0	2.0
+libc-bench b_stdio_putcgetc (0) (seconds)	0.767822967	1.0	0.767822967	1.0	2.0
+libc-bench b_stdio_putcgetc_unlocked (0) (seconds)	0.765147171	1.0	0.765147171	1.0	2.0
+libc-bench b_string_memset (0) (seconds)	0.025313365	1.0	0.025313365	1.0	2.0
+libc-bench b_string_strchr (0) (seconds)	0.012811332	1.0	0.012811332	1.0	2.0
+libc-bench b_string_strlen (0) (seconds)	0.013459429	1.0	0.013459429	1.0	2.0
+libc-bench b_string_strstr ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac") (seconds)	0.013963025	1.0	0.013963025	1.0	2.0
+libc-bench b_string_strstr ("aaaaaaaaaaaaaaaaaaaaaaaaac") (seconds)	0.011749838	1.0	0.011749838	1.0	2.0
+libc-bench b_string_strstr ("aaaaaaaaaaaaaacccccccccccc") (seconds)	0.011944437	1.0	0.011944437	1.0	2.0
+libc-bench b_string_strstr ("abcdefghijklmnopqrstuvwxyz") (seconds)	0.011402239	1.0	0.011402239	1.0	2.0
+libc-bench b_string_strstr ("azbycxdwevfugthsirjqkplomn") (seconds)	0.020868089	1.0	0.020868089	1.0	2.0
+libc-bench b_utf8_bigbuf (0) (seconds)	0.036977802	1.7750163733366304	0.036977802	1.8240214494090266	3.599037822745657
+libc-bench b_utf8_onebyone (0) (seconds)	0.109599811	1.9858850121557234	0.109599811	1.98555481085638	3.9714398230121035
+总分		29.660722486673194		31.76814169810831	61.4288641847815
+
+libcbench-musl
+测试点	rv	la	总分
+baseline	score	baseline	score
+libc-bench b_malloc_big1 (0) (seconds)	0.118578071	1.0	0.118578071	1.0	2.0
+libc-bench b_malloc_big2 (0) (seconds)	0.107088632	1.0	0.107088632	1.0	2.0
+libc-bench b_malloc_bubble (0) (seconds)	0.36015349	1.0	0.36015349	1.0	2.0
+libc-bench b_malloc_sparse (0) (seconds)	0.384919462	1.0	0.384919462	1.0	2.0
+libc-bench b_malloc_thread_local (0) (seconds)	0.096989785	1.0	0.096989785	1.0	2.0
+libc-bench b_malloc_thread_stress (0) (seconds)	0.09632549	1.0	0.09632549	1.0	2.0
+libc-bench b_malloc_tiny1 (0) (seconds)	0.014186324	1.0	0.014186324	1.0	2.0
+libc-bench b_malloc_tiny2 (0) (seconds)	0.010810043	1.0	0.010810043	1.0	2.0
+libc-bench b_pthread_create_serial1 (0) (seconds)	0.892420718	1.0	0.892420718	1.970538794685401	2.970538794685401
+libc-bench b_pthread_createjoin_serial1 (0) (seconds)	1.284791557	1.0	1.284791557	1.9753233434425503	2.9753233434425503
+libc-bench b_pthread_createjoin_serial2 (0) (seconds)	1.006433722	1.0	1.006433722	1.0	2.0
+libc-bench b_pthread_uselesslock (0) (seconds)	0.080551368	1.0	0.080551368	1.0	2.0
+libc-bench b_regex_compile ("(a|b|c)*d*b") (seconds)	0.088259223	1.0	0.088259223	1.0	2.0
+libc-bench b_regex_search ("(a|b|c)*d*b") (seconds)	0.083251251	1.0	0.083251251	1.0	2.0
+libc-bench b_regex_search ("a{25}b") (seconds)	0.286712251	1.0	0.286712251	1.0	2.0
+libc-bench b_stdio_putcgetc (0) (seconds)	0.767822967	1.0	0.767822967	1.0	2.0
+libc-bench b_stdio_putcgetc_unlocked (0) (seconds)	0.765147171	1.0	0.765147171	1.0	2.0
+libc-bench b_string_memset (0) (seconds)	0.025313365	1.0	0.025313365	1.0	2.0
+libc-bench b_string_strchr (0) (seconds)	0.012811332	1.0	0.012811332	1.0	2.0
+libc-bench b_string_strlen (0) (seconds)	0.013459429	1.0	0.013459429	1.0	2.0
+libc-bench b_string_strstr ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac") (seconds)	0.013963025	1.0	0.013963025	1.0	2.0
+libc-bench b_string_strstr ("aaaaaaaaaaaaaaaaaaaaaaaaac") (seconds)	0.011749838	1.0	0.011749838	1.0	2.0
+libc-bench b_string_strstr ("aaaaaaaaaaaaaacccccccccccc") (seconds)	0.011944437	1.0	0.011944437	1.0	2.0
+libc-bench b_string_strstr ("abcdefghijklmnopqrstuvwxyz") (seconds)	0.011402239	1.0	0.011402239	1.0	2.0
+libc-bench b_string_strstr ("azbycxdwevfugthsirjqkplomn") (seconds)	0.020868089	1.0	0.020868089	1.0	2.0
+libc-bench b_utf8_bigbuf (0) (seconds)	0.036977802	1.0	0.036977802	1.0	2.0
+libc-bench b_utf8_onebyone (0) (seconds)	0.109599811	1.0	0.109599811	1.0	2.0
+总分		27.0		28.94586213812795	55.94586213812795
+
+libctest-musl
+测试点	rv	la	总分
+pass	score	pass	score
+libctest dynamic argv	1	1	1	1	2
+libctest dynamic basename	1	1	1	1	2
+libctest dynamic clocale_mbfuncs	0	0	1	1	1
+libctest dynamic clock_gettime	1	1	1	1	2
+libctest dynamic crypt	0	0	0	0	0
+libctest dynamic daemon_failure	1	1	1	1	2
+libctest dynamic dirname	1	1	1	1	2
+libctest dynamic dlopen	0	0	0	0	0
+libctest dynamic dn_expand_empty	1	1	1	1	2
+libctest dynamic dn_expand_ptr_0	1	1	1	1	2
+libctest dynamic env	1	1	1	1	2
+libctest dynamic fdopen	1	1	1	1	2
+libctest dynamic fflush_exit	1	1	1	1	2
+libctest dynamic fgets_eof	1	1	1	1	2
+libctest dynamic fgetwc_buffering	1	1	1	1	2
+libctest dynamic fnmatch	1	1	1	1	2
+libctest dynamic fpclassify_invalid_ld80	1	1	1	1	2
+libctest dynamic fscanf	1	1	1	1	2
+libctest dynamic ftello_unflushed_append	1	1	1	1	2
+libctest dynamic fwscanf	1	1	1	1	2
+libctest dynamic getpwnam_r_crash	1	1	1	1	2
+libctest dynamic getpwnam_r_errno	1	1	1	1	2
+libctest dynamic iconv_open	1	1	1	1	2
+libctest dynamic iconv_roundtrips	1	1	1	1	2
+libctest dynamic inet_ntop_v4mapped	1	1	1	1	2
+libctest dynamic inet_pton	1	1	1	1	2
+libctest dynamic inet_pton_empty_last_field	1	1	1	1	2
+libctest dynamic iswspace_null	1	1	1	1	2
+libctest dynamic lrand48_signextend	1	1	1	1	2
+libctest dynamic lseek_large	1	1	1	1	2
+libctest dynamic malloc_0	1	1	1	1	2
+libctest dynamic mbc	1	1	1	1	2
+libctest dynamic mbsrtowcs_overflow	1	1	1	1	2
+libctest dynamic memmem_oob	1	1	1	1	2
+libctest dynamic memmem_oob_read	1	1	1	1	2
+libctest dynamic memstream	1	1	1	1	2
+libctest dynamic mkdtemp_failure	1	1	1	1	2
+libctest dynamic mkstemp_failure	1	1	1	1	2
+libctest dynamic printf_1e9_oob	1	1	1	1	2
+libctest dynamic printf_fmt_g_round	1	1	1	1	2
+libctest dynamic printf_fmt_g_zeros	1	1	1	1	2
+libctest dynamic printf_fmt_n	1	1	1	1	2
+libctest dynamic pthread_cancel	1	1	1	1	2
+libctest dynamic pthread_cancel_points	1	1	1	1	2
+libctest dynamic pthread_cond	1	1	1	1	2
+libctest dynamic pthread_cond_smasher	1	1	1	1	2
+libctest dynamic pthread_condattr_setclock	1	1	1	1	2
+libctest dynamic pthread_exit_cancel	1	1	1	1	2
+libctest dynamic pthread_once_deadlock	1	1	1	1	2
+libctest dynamic pthread_robust_detach	1	1	1	1	2
+libctest dynamic pthread_rwlock_ebusy	1	1	1	1	2
+libctest dynamic pthread_tsd	1	1	1	1	2
+libctest dynamic putenv_doublefree	1	1	1	1	2
+libctest dynamic qsort	1	1	1	1	2
+libctest dynamic random	1	1	1	1	2
+libctest dynamic regex_backref_0	1	1	1	1	2
+libctest dynamic regex_bracket_icase	1	1	1	1	2
+libctest dynamic regex_ere_backref	1	1	1	1	2
+libctest dynamic regex_escaped_high_byte	1	1	1	1	2
+libctest dynamic regex_negated_range	1	1	1	1	2
+libctest dynamic regexec_nosub	1	1	1	1	2
+libctest dynamic rewind_clear_error	1	1	1	1	2
+libctest dynamic rlimit_open_files	1	1	1	1	2
+libctest dynamic scanf_bytes_consumed	1	1	1	1	2
+libctest dynamic scanf_match_literal_eof	1	1	1	1	2
+libctest dynamic scanf_nullbyte_char	1	1	1	1	2
+libctest dynamic search_hsearch	1	1	1	1	2
+libctest dynamic search_insque	1	1	1	1	2
+libctest dynamic search_lsearch	1	1	1	1	2
+libctest dynamic search_tsearch	1	1	1	1	2
+libctest dynamic sem_init	1	1	1	1	2
+libctest dynamic setjmp	1	1	1	1	2
+libctest dynamic setvbuf_unget	1	1	1	1	2
+libctest dynamic sigprocmask_internal	1	1	1	1	2
+libctest dynamic snprintf	1	1	1	1	2
+libctest dynamic socket	1	1	1	1	2
+libctest dynamic sscanf	1	1	1	1	2
+libctest dynamic sscanf_eof	1	1	1	1	2
+libctest dynamic sscanf_long	1	1	1	1	2
+libctest dynamic stat	1	1	1	1	2
+libctest dynamic statvfs	1	1	1	1	2
+libctest dynamic strftime	1	1	1	1	2
+libctest dynamic string	1	1	1	1	2
+libctest dynamic string_memcpy	1	1	1	1	2
+libctest dynamic string_memmem	1	1	1	1	2
+libctest dynamic string_memset	1	1	1	1	2
+libctest dynamic string_strchr	1	1	1	1	2
+libctest dynamic string_strcspn	1	1	1	1	2
+libctest dynamic string_strstr	1	1	1	1	2
+libctest dynamic strptime	1	1	1	1	2
+libctest dynamic strtod	1	1	1	1	2
+libctest dynamic strtod_simple	1	1	1	1	2
+libctest dynamic strtof	1	1	1	1	2
+libctest dynamic strtol	1	1	1	1	2
+libctest dynamic strtold	1	1	1	1	2
+libctest dynamic strverscmp	1	1	1	1	2
+libctest dynamic swprintf	1	1	1	1	2
+libctest dynamic syscall_sign_extend	1	1	1	1	2
+libctest dynamic tgmath	1	1	1	1	2
+libctest dynamic time	1	1	1	1	2
+libctest dynamic tls_get_new_dtv	1	1	1	1	2
+libctest dynamic tls_init	1	1	1	1	2
+libctest dynamic tls_local_exec	1	1	1	1	2
+libctest dynamic udiv	1	1	1	1	2
+libctest dynamic ungetc	1	1	1	1	2
+libctest dynamic uselocale_0	1	1	1	1	2
+libctest dynamic utime	1	1	1	1	2
+libctest dynamic wcsncpy_read_overflow	1	1	1	1	2
+libctest dynamic wcsstr	1	1	1	1	2
+libctest dynamic wcsstr_false_negative	1	1	1	1	2
+libctest dynamic wcstol	1	1	1	1	2
+libctest static argv	1	1	1	1	2
+libctest static basename	1	1	1	1	2
+libctest static clocale_mbfuncs	1	1	0	0	1
+libctest static clock_gettime	1	1	1	1	2
+libctest static crypt	0	0	0	0	0
+libctest static daemon_failure	1	1	1	1	2
+libctest static dirname	1	1	1	1	2
+libctest static dn_expand_empty	1	1	1	1	2
+libctest static dn_expand_ptr_0	1	1	1	1	2
+libctest static env	1	1	1	1	2
+libctest static fdopen	1	1	1	1	2
+libctest static fflush_exit	1	1	1	1	2
+libctest static fgets_eof	1	1	1	1	2
+libctest static fgetwc_buffering	1	1	1	1	2
+libctest static fnmatch	1	1	1	1	2
+libctest static fpclassify_invalid_ld80	1	1	1	1	2
+libctest static fscanf	1	1	1	1	2
+libctest static ftello_unflushed_append	1	1	1	1	2
+libctest static fwscanf	1	1	1	1	2
+libctest static getpwnam_r_crash	1	1	1	1	2
+libctest static getpwnam_r_errno	1	1	1	1	2
+libctest static iconv_open	1	1	1	1	2
+libctest static iconv_roundtrips	1	1	1	1	2
+libctest static inet_ntop_v4mapped	1	1	1	1	2
+libctest static inet_pton	1	1	1	1	2
+libctest static inet_pton_empty_last_field	1	1	1	1	2
+libctest static iswspace_null	1	1	1	1	2
+libctest static lrand48_signextend	1	1	1	1	2
+libctest static lseek_large	1	1	1	1	2
+libctest static malloc_0	1	1	1	1	2
+libctest static mbc	1	1	1	1	2
+libctest static mbsrtowcs_overflow	1	1	1	1	2
+libctest static memmem_oob	1	1	1	1	2
+libctest static memmem_oob_read	1	1	1	1	2
+libctest static memstream	1	1	1	1	2
+libctest static mkdtemp_failure	1	1	1	1	2
+libctest static mkstemp_failure	1	1	1	1	2
+libctest static pleval	0	0	0	0	0
+libctest static printf_1e9_oob	1	1	1	1	2
+libctest static printf_fmt_g_round	1	1	1	1	2
+libctest static printf_fmt_g_zeros	1	1	1	1	2
+libctest static printf_fmt_n	1	1	1	1	2
+libctest static pthread_cancel	1	1	1	1	2
+libctest static pthread_cancel_points	1	1	1	1	2
+libctest static pthread_cancel_sem_wait	1	1	1	1	2
+libctest static pthread_cond	1	1	1	1	2
+libctest static pthread_cond_smasher	1	1	1	1	2
+libctest static pthread_condattr_setclock	1	1	1	1	2
+libctest static pthread_exit_cancel	1	1	1	1	2
+libctest static pthread_once_deadlock	1	1	1	1	2
+libctest static pthread_robust_detach	1	1	1	1	2
+libctest static pthread_rwlock_ebusy	1	1	1	1	2
+libctest static pthread_tsd	1	1	1	1	2
+libctest static putenv_doublefree	1	1	1	1	2
+libctest static qsort	1	1	1	1	2
+libctest static random	1	1	1	1	2
+libctest static regex_backref_0	1	1	1	1	2
+libctest static regex_bracket_icase	1	1	1	1	2
+libctest static regex_ere_backref	1	1	1	1	2
+libctest static regex_escaped_high_byte	1	1	1	1	2
+libctest static regex_negated_range	1	1	1	1	2
+libctest static regexec_nosub	1	1	1	1	2
+libctest static rewind_clear_error	1	1	1	1	2
+libctest static rlimit_open_files	1	1	1	1	2
+libctest static scanf_bytes_consumed	1	1	1	1	2
+libctest static scanf_match_literal_eof	1	1	1	1	2
+libctest static scanf_nullbyte_char	1	1	1	1	2
+libctest static search_hsearch	1	1	1	1	2
+libctest static search_insque	1	1	1	1	2
+libctest static search_lsearch	1	1	1	1	2
+libctest static search_tsearch	1	1	1	1	2
+libctest static setjmp	1	1	1	1	2
+libctest static setvbuf_unget	1	1	1	1	2
+libctest static sigprocmask_internal	1	1	1	1	2
+libctest static snprintf	1	1	1	1	2
+libctest static socket	1	1	1	1	2
+libctest static sscanf	1	1	1	1	2
+libctest static sscanf_eof	1	1	1	1	2
+libctest static sscanf_long	1	1	1	1	2
+libctest static stat	1	1	1	1	2
+libctest static statvfs	1	1	1	1	2
+libctest static strftime	1	1	1	1	2
+libctest static string	1	1	1	1	2
+libctest static string_memcpy	1	1	1	1	2
+libctest static string_memmem	1	1	1	1	2
+libctest static string_memset	1	1	1	1	2
+libctest static string_strchr	1	1	1	1	2
+libctest static string_strcspn	1	1	1	1	2
+libctest static string_strstr	1	1	1	1	2
+libctest static strptime	1	1	1	1	2
+libctest static strtod	1	1	1	1	2
+libctest static strtod_simple	1	1	1	1	2
+libctest static strtof	1	1	1	1	2
+libctest static strtol	1	1	1	1	2
+libctest static strtold	1	1	1	1	2
+libctest static strverscmp	1	1	1	1	2
+libctest static swprintf	1	1	1	1	2
+libctest static syscall_sign_extend	1	1	1	1	2
+libctest static tgmath	1	1	1	1	2
+libctest static time	1	1	1	1	2
+libctest static tls_align	1	1	1	1	2
+libctest static udiv	1	1	1	1	2
+libctest static ungetc	1	1	1	1	2
+libctest static uselocale_0	1	1	1	1	2
+libctest static utime	1	1	1	1	2
+libctest static wcsncpy_read_overflow	1	1	1	1	2
+libctest static wcsstr	1	1	1	1	2
+libctest static wcsstr_false_negative	1	1	1	1	2
+libctest static wcstol	1	1	1	1	2
+总分		215		215	430
+
+lmbench-glibc
+测试点	rv	la	总分
+baseline	score	baseline	score
+lmbench Pagefaults on /var/tmp/XXX:(microseconds)	978.2374643	0.0	978.2374643	0.0	0.0
+lmbench Pipe bandwidth:(MB/sec)	127.244	1.0	127.244	1.0	2.0
+lmbench Pipe latency:(microseconds)	141.9106	1.0	141.9106	1.0	2.0
+lmbench Process fork+/bin/sh -c:(microseconds)	920010.2	1.8339985795809655	920010.2	1.5720855413342156	3.406084120915181
+lmbench Process fork+execve:(microseconds)	2004.3333	1.0	2004.3333	1.0	2.0
+lmbench Process fork+exit:(microseconds)	4409.188	1.0	4409.188	1.0	2.0
+lmbench Select on 100 fd's:(microseconds)	56.05561	1.0	56.05561	1.0	2.0
+lmbench Signal handler installation:(microseconds)	18.84948	1.0964631385056776	18.84948	1.1985667509130224	2.2950298894187
+lmbench Signal handler overhead:(microseconds)	25.89064	1.0	25.89064	1.0	2.0
+lmbench Simple fstat:(microseconds)	29.54674	1.3978726587095565	29.54674	1.5982365567233474	2.996109215432904
+lmbench Simple open/close:(microseconds)	501.2352	1.8949830339130214	501.2352	1.866725042455119	3.7617080763681403
+lmbench Simple read:(microseconds)	16.8192	1.0	16.8192	1.5709902968036529	2.570990296803653
+lmbench Simple stat:(microseconds)	425.2565	1.8827792167785795	425.2565	1.9716357069204116	3.8544149236989913
+lmbench Simple syscall:(microseconds)	9.25013	1.0	9.25013	1.607248762990358	2.6072487629903582
+lmbench Simple write:(microseconds)	16.87553	1.0448062964540967	16.87553	1.7472020138034183	2.792008310257515
+lmbench bw_file_rd io_only	71703.7	1.0	71703.7	1.0	2.0
+lmbench bw_file_rd open2close	2637.494	0.0	2637.494	0.0	0.0
+lmbench bw_mmap_rd mmap_only	1037.403	0.0	1037.403	0.0	0.0
+lmbench bw_mmap_rd open2close	187.0208	0.0	187.0208	0.0	0.0
+lmbench context switch 16:(microseconds)	40.77077	1.0	40.77077	1.0	2.0
+lmbench context switch 24:(microseconds)	43.86385	1.0	43.86385	1.0	2.0
+lmbench context switch 2:(microseconds)	41.24	1.0	41.24	1.0	2.0
+lmbench context switch 32:(microseconds)	47.74923	1.0	47.74923	1.0	2.0
+lmbench context switch 4:(microseconds)	41.58071	1.0	41.58071	1.0	2.0
+lmbench context switch 64:(microseconds)	8703.026	1.9695060085997675	8703.026	1.9508148085504973	3.920320817150265
+lmbench context switch 8:(microseconds)	41.04231	1.0	41.04231	1.0	2.0
+lmbench context switch 96:(microseconds)	2952.14	1.8617071006117596	2952.14	1.7724328791994959	3.6341399798112555
+lmbench fs latency 0k create	24573	1.0	24573	1.0	2.0
+lmbench fs latency 0k remove	30703	1.0	30703	1.0	2.0
+lmbench fs latency 10k create	11723	1.0	11723	1.0	2.0
+lmbench fs latency 10k remove	23688	1.0	23688	1.0	2.0
+lmbench fs latency 1k create	15130	1.0	15130	1.0	2.0
+lmbench fs latency 1k remove	255558	1.0	255558	1.0	2.0
+lmbench fs latency 4k create	13265	1.0	13265	1.0	2.0
+lmbench fs latency 4k remove	126595	1.0	126595	1.0	2.0
+lmbench lat_mmap:(microseconds)	4109.0	1.0	4109.0	1.0	2.0
+总分		36.98211603315343		38.85593835969354	75.83805439284696
+
+lmbench-musl
+测试点	rv	la	总分
+baseline	score	baseline	score
+lmbench Pagefaults on /var/tmp/XXX:(microseconds)	978.2374643	0.0	978.2374643	0.0	0.0
+lmbench Pipe bandwidth:(MB/sec)	127.244	1.0	127.244	1.0	2.0
+lmbench Pipe latency:(microseconds)	141.9106	1.0	141.9106	1.0	2.0
+lmbench Process fork+/bin/sh -c:(microseconds)	920010.2	1.827159524970484	920010.2	1.6150542678765953	3.4422137928470793
+lmbench Process fork+execve:(microseconds)	2004.3333	1.0	2004.3333	1.0	2.0
+lmbench Process fork+exit:(microseconds)	4409.188	1.0	4409.188	1.0	2.0
+lmbench Select on 100 fd's:(microseconds)	56.05561	1.0	56.05561	1.0	2.0
+lmbench Signal handler installation:(microseconds)	18.84948	1.010964758709524	18.84948	1.707095368148087	2.718060126857611
+lmbench Signal handler overhead:(microseconds)	25.89064	1.0	25.89064	1.0412056248899217	2.0412056248899217
+lmbench Simple fstat:(microseconds)	29.54674	1.497927690161419	29.54674	1.7984549226073672	3.2963826127687863
+lmbench Simple open/close:(microseconds)	501.2352	1.8941101901861641	501.2352	1.9531760738272173	3.8472862640133814
+lmbench Simple read:(microseconds)	16.8192	1.579878947869102	16.8192	1.7521582477168949	3.332037195585997
+lmbench Simple stat:(microseconds)	425.2565	1.916889688928917	425.2565	1.9707830450563366	3.8876727339852537
+lmbench Simple syscall:(microseconds)	9.25013	1.5921462725388724	9.25013	1.793948841800061	3.3860951143389335
+lmbench Simple write:(microseconds)	16.87553	1.5980926228687338	16.87553	1.5611811895685648	3.1592738124372985
+lmbench bw_file_rd io_only	71703.7	1.0	71703.7	1.0	2.0
+lmbench bw_file_rd open2close	2637.494	0.0	2637.494	0.0	0.0
+lmbench bw_mmap_rd mmap_only	1037.403	0.0	1037.403	0.0	0.0
+lmbench bw_mmap_rd open2close	187.0208	0.0	187.0208	0.0	0.0
+lmbench context switch 16:(microseconds)	40.77077	1.0	40.77077	1.0	2.0
+lmbench context switch 24:(microseconds)	43.86385	1.0	43.86385	1.0	2.0
+lmbench context switch 2:(microseconds)	41.24	1.0	41.24	1.0	2.0
+lmbench context switch 32:(microseconds)	47.74923	1.0	47.74923	1.0	2.0
+lmbench context switch 4:(microseconds)	41.58071	1.0	41.58071	1.0	2.0
+lmbench context switch 64:(microseconds)	8703.026	1.9552557926403988	8703.026	1.9390602762763205	3.8943160689167193
+lmbench context switch 8:(microseconds)	41.04231	1.0	41.04231	1.0	2.0
+lmbench context switch 96:(microseconds)	2952.14	1.6871218844634739	2952.14	1.7663288326434383	3.453450717106912
+lmbench fs latency 0k create	24573	1.0	24573	1.0	2.0
+lmbench fs latency 0k remove	30703	1.0	30703	1.0	2.0
+lmbench fs latency 10k create	11723	1.0	11723	1.0	2.0
+lmbench fs latency 10k remove	23688	1.0	23688	1.0	2.0
+lmbench fs latency 1k create	15130	1.0	15130	1.0	2.0
+lmbench fs latency 1k remove	255558	1.0	255558	1.0	2.0
+lmbench fs latency 4k create	13265	1.0	13265	1.0	2.0
+lmbench fs latency 4k remove	126595	1.0	126595	1.0	2.0
+lmbench lat_mmap:(microseconds)	4109.0	1.0	4109.0	1.0	2.0
+总分		38.55954737333708		39.89844669041081	78.45799406374789
+
+ltp-glibc
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+0001_epoll_ctl03	256	256	256	256	256	256	512
+0002_access01	87	87	87	19	19	19	106
+0003_getpid01	42	42	42	12	13	12	54
+0004_pipe11	0	1	0	0	1	0	0
+0005_select03	16	16	16	16	40	16	32
+0006_select04	4	7	4	4	7	4	8
+0007_epoll_wait07	5	5	5	5	5	5	10
+0008_accept4_01	8	9	8	8	9	8	16
+0009_socketpair02	4	4	4	4	4	4	8
+0010_socket02	4	4	4	4	4	4	8
+0011_rt_sigaction01	155	155	155	155	155	155	310
+0012_rt_sigaction02	155	155	155	155	155	155	310
+0013_rt_sigaction03	155	155	155	155	155	155	310
+0014_epoll_ctl03	256	256	256	256	256	256	512
+0015_access01	103	103	103	144	145	144	247
+0016_getpid01	64	64	64	72	72	72	136
+0017_pipe11	0	1	0	0	1	0	0
+0018_signal01	6	6	6	6	6	6	12
+0019_signal02	3	3	3	3	3	3	6
+0020_sigaction02	3	3	3	3	3	3	6
+0021_sigwait01	3	3	3	3	3	3	6
+0022_access01	82	82	82	143	143	143	225
+0023_getpid01	66	66	66	59	59	59	125
+0024_pipe11	0	1	0	0	1	0	0
+0025_chmod01	32	32	32	32	32	32	64
+0026_chmod06	9	9	9	9	9	9	18
+0027_chmod03	4	4	4	4	4	4	8
+0028_chdir01	0	0	0	0	0	0	0
+0029_mkdir03	11	11	11	0	0	0	11
+0030_rmdir02	9	9	9	9	9	9	18
+0031_stat01	12	12	12	12	12	12	24
+0032_stat01_64	12	12	12	12	12	12	24
+0033_stat03	6	6	6	6	6	6	12
+0034_stat03_64	6	6	6	6	6	6	12
+0035_stat04	3	3	3	3	3	3	6
+0036_stat04_64	3	3	3	3	3	3	6
+0037_statx01	10	11	10	10	11	10	20
+0038_statx02	5	5	5	5	5	5	10
+0039_statfs02	6	6	6	6	6	6	12
+0040_statfs02_64	6	6	6	6	6	6	12
+0041_statvfs02	5	5	5	5	5	5	10
+0042_lstat02	6	6	6	6	6	6	12
+0043_lstat02_64	6	6	6	6	6	6	12
+0044_lchown01	6	6	6	6	6	6	12
+0045_lchown02	6	6	6	6	6	6	12
+0046_fchmod01	8	8	8	8	8	8	16
+0047_fchmodat01	6	6	6	0	0	0	6
+0048_fchmodat02	6	6	6	6	6	6	12
+0049_chown04	8	8	8	8	8	8	16
+0050_chown05	6	6	6	6	6	6	12
+0051_fchown05	6	6	6	6	6	6	12
+0052_open08	6	6	6	6	6	6	12
+0053_creat01	6	6	6	6	6	6	12
+0054_creat06	8	8	8	8	8	8	16
+0055_pathconf01	17	17	17	17	17	17	34
+0056_pathconf02	6	6	6	6	6	6	12
+0057_fpathconf01	9	9	9	9	9	9	18
+0058_fsync01	0	0	0	0	0	0	0
+0059_readlinkat02	6	6	6	6	6	6	12
+0060_symlink01	0	0	0	5	5	5	5
+0061_unlink08	4	4	4	4	4	4	8
+0062_link08	4	4	4	4	4	4	8
+0063_rename01	0	0	0	0	0	0	0
+0064_rename03	0	0	0	0	0	0	0
+0065_utime01	0	0	0	0	0	0	0
+0066_utime02	0	0	0	0	0	0	0
+0067_utime04	0	0	0	0	0	0	0
+0068_utime05	0	0	0	0	0	0	0
+0069_utime07	5	5	5	5	5	5	10
+0070_mknod01	7	7	7	7	7	7	14
+0071_mknodat01	5	5	5	5	5	5	10
+0072_mkdirat01	5	5	5	0	0	0	5
+0073_chroot03	5	5	5	5	5	5	10
+0074_getpid01	59	59	59	77	77	77	136
+0075_epoll_ctl03	256	256	256	256	256	256	512
+0076_access01	186	187	186	160	161	160	346
+0077_rt_sigaction01	155	155	155	155	155	155	310
+0078_rt_sigaction02	155	155	155	155	155	155	310
+0079_rt_sigaction03	155	155	155	155	155	155	310
+0080_pipe11	0	1	0	0	1	0	0
+0081_gettid02	11	12	11	11	11	11	22
+0082_getpgid01	8	8	8	8	8	8	16
+0083_getpriority02	4	4	4	4	4	4	8
+0084_setpriority02	7	7	7	5	5	5	12
+0085_getgroups01	4	4	4	4	4	4	8
+0086_waitid01	5	5	5	5	5	5	10
+0087_waitid06	6	6	6	6	6	6	12
+0088_waitid07	5	5	5	5	5	5	10
+0089_waitid08	10	10	10	10	10	10	20
+0090_waitid11	5	5	5	5	5	5	10
+0091_waitpid09	4	4	4	4	4	4	8
+0092_prctl05	8	8	8	8	8	8	16
+0093_kcmp01	5	5	5	5	5	5	10
+0094_get_robust_list01	5	5	5	5	5	5	10
+0095_syscall01	3	3	3	3	3	3	6
+0096_ulimit01	3	3	3	3	3	3	6
+0097_setreuid01	7	7	7	7	7	7	14
+0098_setreuid03	14	14	14	14	14	14	28
+0099_setreuid04	3	3	3	3	3	3	6
+0100_setreuid06	3	3	3	3	3	3	6
+0101_setreuid07	3	3	3	3	3	3	6
+0102_setresuid01	0	0	0	9	9	9	9
+0103_setresuid02	4	4	4	4	4	4	8
+0104_setresuid03	3	3	3	3	3	3	6
+0105_setresuid04	3	3	3	3	3	3	6
+0106_setregid01	5	5	5	5	5	5	10
+0107_setregid02	12	12	12	12	12	12	24
+0108_setregid04	9	9	9	9	9	9	18
+0109_setresgid01	5	5	5	5	5	5	10
+0110_setresgid02	6	6	6	6	6	6	12
+0111_setresgid03	4	4	4	4	4	4	8
+0112_sethostname02	6	6	6	6	6	6	12
+0113_setdomainname02	6	6	6	6	6	6	12
+0114_pipe11	0	1	0	0	1	0	0
+0115_epoll_ctl03	256	256	256	256	256	256	512
+0116_access01	120	120	120	190	190	190	310
+0117_rt_sigaction01	155	155	155	155	155	155	310
+0118_rt_sigaction02	155	155	155	155	155	155	310
+0119_rt_sigaction03	155	155	155	155	155	155	310
+0120_getpid01	47	47	47	100	100	100	147
+0121_pipe2_01	7	7	7	7	7	7	14
+0122_futex_wake01	6	6	6	6	6	6	12
+0123_futex_wake02	11	11	11	0	0	0	11
+0124_futex_wake03	11	11	11	6	6	6	17
+0125_futex_wait01	4	4	4	4	4	4	8
+0126_futex_waitv01	0	1	0	9	9	9	9
+0127_socketpair02	4	4	4	4	4	4	8
+0128_socket02	4	4	4	4	4	4	8
+0129_recvmmsg01	10	10	10	10	10	10	20
+0130_sendmmsg02	4	4	4	0	0	0	4
+0131_setsockopt01	0	0	0	8	8	8	8
+0132_accept01	5	5	5	0	0	0	5
+0133_flock04	6	6	6	6	6	6	12
+0134_flock06	4	4	4	4	4	4	8
+0135_getpid01	62	62	62	81	81	81	143
+0136_pipe11	0	1	0	0	1	0	0
+0137_readv01	10	10	10	10	10	10	20
+0138_writev07	8	8	8	0	0	0	8
+0139_write05	3	3	3	0	0	0	3
+0140_preadv201	6	6	6	0	0	0	6
+0141_preadv201_64	6	6	6	6	6	6	12
+0142_pwritev201	6	6	6	6	6	6	12
+0143_pwritev201_64	6	6	6	6	6	6	12
+0144_pwrite02	5	5	5	0	0	0	5
+0145_pwrite02_64	0	0	0	0	0	0	0
+0146_sendfile04	0	0	0	0	0	0	0
+0147_sendfile04_64	5	5	5	0	0	0	5
+0148_close_range02	11	11	11	11	11	11	22
+0149_dup201	4	4	4	0	0	0	4
+0150_dup202	6	6	6	6	6	6	12
+0151_dup203	4	4	4	4	4	4	8
+0152_dup204	0	0	0	4	4	4	4
+0153_dup07	0	0	0	3	3	3	3
+0154_dup3_01	0	0	0	2	2	2	2
+0155_dup3_02	0	0	0	3	3	3	3
+0156_llseek03	18	18	18	18	18	18	36
+0157_lseek01	4	4	4	4	4	4	8
+0158_posix_fadvise01	6	6	6	6	6	6	12
+0159_posix_fadvise01_64	6	6	6	6	6	6	12
+0160_posix_fadvise02	6	6	6	6	6	6	12
+0161_posix_fadvise02_64	6	6	6	6	6	6	12
+0162_posix_fadvise04	6	6	6	6	6	6	12
+0163_posix_fadvise04_64	6	6	6	6	6	6	12
+0164_getrandom01	4	4	4	4	4	4	8
+0165_getrandom02	4	4	4	4	4	4	8
+0166_getrandom03	9	9	9	9	9	9	18
+0167_clock_settime01	4	4	4	4	4	4	8
+0168_clock_settime02	12	12	12	12	12	12	24
+0169_timerfd01	12	12	12	10	12	10	22
+0170_timerfd02	6	6	6	6	6	6	12
+0171_timerfd_settime01	4	4	4	4	4	4	8
+0172_alarm02	6	6	6	6	6	6	12
+0173_epoll_ctl03	256	256	256	256	256	256	512
+0174_getpid01	64	64	64	28	28	28	92
+0175_pipe11	0	1	0	0	1	0	0
+0176_mlock01	4	4	4	4	4	4	8
+0177_mlock03	20	20	20	20	20	20	40
+0178_munlock01	4	4	4	0	0	0	4
+0179_madvise01	5	20	5	0	0	0	5
+0180_mallopt01	5	5	5	5	5	5	10
+总分			4508			4563	9071
+
+ltp-musl
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+0001_epoll_ctl03	256	256	256	0	0	0	256
+0002_access01	152	153	152	118	118	118	270
+0003_getpid01	33	34	33	44	45	44	77
+0004_pipe11	0	1	0	0	1	0	0
+0005_select03	16	40	16	16	30	16	32
+0006_select04	4	7	4	4	7	4	8
+0007_epoll_wait07	5	5	5	5	5	5	10
+0008_accept4_01	1	2	1	8	9	8	9
+0009_socketpair02	4	4	4	4	4	4	8
+0010_socket02	4	4	4	4	4	4	8
+0011_rt_sigaction01	150	150	150	150	150	150	300
+0012_rt_sigaction02	150	150	150	150	150	150	300
+0013_rt_sigaction03	150	150	150	150	150	150	300
+0014_epoll_ctl03	256	256	256	256	256	256	512
+0015_access01	139	139	139	165	165	165	304
+0016_getpid01	51	52	51	100	100	100	151
+0017_pipe11	0	1	0	0	1	0	0
+0018_signal01	6	6	6	0	0	0	6
+0019_signal02	3	3	3	3	3	3	6
+0020_sigaction02	3	3	3	3	3	3	6
+0021_sigwait01	3	3	3	3	3	3	6
+0022_access01	149	150	149	168	168	168	317
+0023_getpid01	89	90	89	100	100	100	189
+0024_pipe11	0	1	0	0	1	0	0
+0025_chmod01	32	32	32	0	0	0	32
+0026_chmod06	9	9	9	9	9	9	18
+0027_chmod03	4	4	4	0	0	0	4
+0028_chdir01	0	0	0	0	0	0	0
+0029_mkdir03	11	11	11	0	0	0	11
+0030_rmdir02	9	9	9	0	0	0	9
+0031_stat01	12	12	12	0	0	0	12
+0032_stat01_64	0	0	0	12	12	12	12
+0033_stat03	6	6	6	6	6	6	12
+0034_stat03_64	0	0	0	6	6	6	6
+0035_stat04	3	3	3	3	3	3	6
+0036_stat04_64	3	3	3	3	3	3	6
+0037_statx01	10	11	10	10	11	10	20
+0038_statx02	5	5	5	5	5	5	10
+0039_statfs02	5	5	5	6	6	6	11
+0040_statfs02_64	0	0	0	6	6	6	6
+0041_statvfs02	0	0	0	5	5	5	5
+0042_lstat02	6	6	6	6	6	6	12
+0043_lstat02_64	6	6	6	6	6	6	12
+0044_lchown01	0	0	0	6	6	6	6
+0045_lchown02	0	0	0	6	6	6	6
+0046_fchmod01	8	8	8	8	8	8	16
+0047_fchmodat01	6	6	6	6	6	6	12
+0048_fchmodat02	6	6	6	6	6	6	12
+0049_chown04	0	0	0	8	8	8	8
+0050_chown05	0	0	0	6	6	6	6
+0051_fchown05	6	6	6	6	6	6	12
+0052_open08	0	0	0	6	6	6	6
+0053_creat01	6	6	6	6	6	6	12
+0054_creat06	8	8	8	8	8	8	16
+0055_pathconf01	17	17	17	17	17	17	34
+0056_pathconf02	1	6	1	1	6	1	2
+0057_fpathconf01	9	9	9	9	9	9	18
+0058_fsync01	0	0	0	10	10	10	10
+0059_readlinkat02	6	6	6	5	6	5	11
+0060_symlink01	5	5	5	5	5	5	10
+0061_unlink08	0	0	0	4	4	4	4
+0062_link08	4	4	4	4	4	4	8
+0063_rename01	0	0	0	0	0	0	0
+0064_rename03	0	0	0	0	0	0	0
+0065_utime01	0	0	0	0	0	0	0
+0066_utime02	0	0	0	0	0	0	0
+0067_utime04	0	0	0	0	0	0	0
+0068_utime05	0	0	0	0	0	0	0
+0069_utime07	5	5	5	5	5	5	10
+0070_mknod01	7	7	7	7	7	7	14
+0071_mknodat01	5	5	5	5	5	5	10
+0072_mkdirat01	5	5	5	5	5	5	10
+0073_chroot03	5	5	5	5	5	5	10
+0074_getpid01	100	100	100	62	63	62	162
+0075_epoll_ctl03	256	256	256	256	256	256	512
+0076_access01	129	130	129	0	0	0	129
+0077_rt_sigaction01	150	150	150	150	150	150	300
+0078_rt_sigaction02	150	150	150	150	150	150	300
+0079_rt_sigaction03	150	150	150	150	150	150	300
+0080_pipe11	0	1	0	0	1	0	0
+0081_gettid02	10	11	10	11	11	11	21
+0082_getpgid01	8	8	8	8	8	8	16
+0083_getpriority02	4	4	4	4	4	4	8
+0084_setpriority02	7	7	7	7	7	7	14
+0085_getgroups01	3	4	3	3	4	3	6
+0086_waitid01	5	5	5	5	5	5	10
+0087_waitid06	6	6	6	6	6	6	12
+0088_waitid07	5	5	5	5	5	5	10
+0089_waitid08	10	10	10	10	10	10	20
+0090_waitid11	5	5	5	5	5	5	10
+0091_waitpid09	4	4	4	4	4	4	8
+0092_prctl05	8	8	8	8	8	8	16
+0093_kcmp01	5	5	5	5	5	5	10
+0094_get_robust_list01	5	5	5	5	5	5	10
+0095_syscall01	3	3	3	3	3	3	6
+0096_ulimit01	3	3	3	3	3	3	6
+0097_setreuid01	7	7	7	7	7	7	14
+0098_setreuid03	14	14	14	14	14	14	28
+0099_setreuid04	3	3	3	3	3	3	6
+0100_setreuid06	3	3	3	3	3	3	6
+0101_setreuid07	3	3	3	3	3	3	6
+0102_setresuid01	9	9	9	9	9	9	18
+0103_setresuid02	4	4	4	4	4	4	8
+0104_setresuid03	3	3	3	3	3	3	6
+0105_setresuid04	3	3	3	3	3	3	6
+0106_setregid01	5	5	5	5	5	5	10
+0107_setregid02	12	12	12	12	12	12	24
+0108_setregid04	9	9	9	9	9	9	18
+0109_setresgid01	5	5	5	5	5	5	10
+0110_setresgid02	6	6	6	6	6	6	12
+0111_setresgid03	4	4	4	4	4	4	8
+0112_sethostname02	6	6	6	6	6	6	12
+0113_setdomainname02	6	6	6	6	6	6	12
+0114_pipe11	0	1	0	0	1	0	0
+0115_epoll_ctl03	256	256	256	256	256	256	512
+0116_access01	108	108	108	154	154	154	262
+0117_rt_sigaction01	150	150	150	150	150	150	300
+0118_rt_sigaction02	150	150	150	150	150	150	300
+0119_rt_sigaction03	150	150	150	150	150	150	300
+0120_getpid01	89	89	89	100	100	100	189
+0121_pipe2_01	7	7	7	7	7	7	14
+0122_futex_wake01	6	6	6	6	6	6	12
+0123_futex_wake02	11	11	11	11	11	11	22
+0124_futex_wake03	0	1	0	9	10	9	9
+0125_futex_wait01	4	4	4	4	4	4	8
+0126_futex_waitv01	0	1	0	9	9	9	9
+0127_socketpair02	4	4	4	4	4	4	8
+0128_socket02	4	4	4	4	4	4	8
+0129_recvmmsg01	1	2	1	1	2	1	2
+0130_sendmmsg02	4	4	4	4	4	4	8
+0131_setsockopt01	8	8	8	8	8	8	16
+0132_accept01	5	5	5	5	5	5	10
+0133_flock04	6	6	6	6	6	6	12
+0134_flock06	4	4	4	4	4	4	8
+0135_getpid01	70	70	70	99	99	99	169
+0136_pipe11	0	1	0	0	1	0	0
+0137_readv01	10	10	10	10	10	10	20
+0138_writev07	8	8	8	8	8	8	16
+0139_write05	3	3	3	3	3	3	6
+0140_preadv201	6	6	6	6	6	6	12
+0141_preadv201_64	6	6	6	6	6	6	12
+0142_pwritev201	6	6	6	6	6	6	12
+0143_pwritev201_64	6	6	6	6	6	6	12
+0144_pwrite02	5	5	5	5	5	5	10
+0145_pwrite02_64	5	5	5	5	5	5	10
+0146_sendfile04	5	5	5	5	5	5	10
+0147_sendfile04_64	5	5	5	5	5	5	10
+0148_close_range02	11	11	11	11	11	11	22
+0149_dup201	4	4	4	4	4	4	8
+0150_dup202	6	6	6	6	6	6	12
+0151_dup203	4	4	4	4	4	4	8
+0152_dup204	4	4	4	4	4	4	8
+0153_dup07	3	3	3	3	3	3	6
+0154_dup3_01	2	2	2	2	2	2	4
+0155_dup3_02	3	3	3	3	3	3	6
+0156_llseek03	18	18	18	18	18	18	36
+0157_lseek01	4	4	4	4	4	4	8
+0158_posix_fadvise01	6	6	6	6	6	6	12
+0159_posix_fadvise01_64	6	6	6	6	6	6	12
+0160_posix_fadvise02	6	6	6	6	6	6	12
+0161_posix_fadvise02_64	6	6	6	6	6	6	12
+0162_posix_fadvise04	6	6	6	6	6	6	12
+0163_posix_fadvise04_64	6	6	6	6	6	6	12
+0164_getrandom01	4	4	4	4	4	4	8
+0165_getrandom02	4	4	4	4	4	4	8
+0166_getrandom03	9	9	9	9	9	9	18
+0167_clock_settime01	4	4	4	4	4	4	8
+0168_clock_settime02	12	12	12	0	0	0	12
+0169_timerfd01	11	12	11	12	12	12	23
+0170_timerfd02	6	6	6	6	6	6	12
+0171_timerfd_settime01	4	4	4	4	4	4	8
+0172_alarm02	6	6	6	6	6	6	12
+0173_epoll_ctl03	256	256	256	256	256	256	512
+0174_getpid01	78	79	78	92	92	92	170
+0175_pipe11	0	1	0	0	1	0	0
+0176_mlock01	4	4	4	4	4	4	8
+0177_mlock03	20	20	20	20	20	20	40
+0178_munlock01	4	4	4	4	4	4	8
+0179_madvise01	5	20	5	5	20	5	10
+0180_mallopt01	0	1	0	0	1	0	0
+总分			4606			4381	8987
+
+lua-glibc
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+lua date.lua	1	1	1	1	1	1	2
+lua file_io.lua	1	1	1	1	1	1	2
+lua max_min.lua	1	1	1	1	1	1	2
+lua random.lua	1	1	1	1	1	1	2
+lua remove.lua	1	1	1	1	1	1	2
+lua round_num.lua	1	1	1	1	1	1	2
+lua sin30.lua	1	1	1	1	1	1	2
+lua sort.lua	1	1	1	1	1	1	2
+lua strings.lua	1	1	1	1	1	1	2
+总分			9			9	18
+
+lua-musl
+测试点	rv	la	总分
+pass	all	score	pass	all	score
+lua date.lua	1	1	1	1	1	1	2
+lua file_io.lua	1	1	1	1	1	1	2
+lua max_min.lua	1	1	1	1	1	1	2
+lua random.lua	1	1	1	1	1	1	2
+lua remove.lua	1	1	1	1	1	1	2
+lua round_num.lua	1	1	1	1	1	1	2
+lua sin30.lua	1	1	1	1	1	1	2
+lua sort.lua	1	1	1	1	1	1	2
+lua strings.lua	1	1	1	1	1	1	2
+总分			9			9	18
+
+netperf-glibc
+测试点	rv	la	总分
+baseline	score	baseline	score
+netperf TCP_CRR (Trans. Rate/sec)	390.53	1.0	390.53	1.0	2.0
+netperf TCP_RR (Trans. Rate/sec)	2017.98	1.0	2017.98	1.0	2.0
+netperf TCP_STREAM (Throughput 10^6bits/sec)	79.75	1.0	79.75	1.0	2.0
+netperf UDP_RR (Trans. Rate/sec)	2070.62	1.0	2070.62	1.0	2.0
+netperf UDP_STREAM (Trans. Rate/sec)	27.5	1.0	27.5	1.0	2.0
+总分		5.0		5.0	10.0
+
+netperf-musl
+测试点	rv	la	总分
+baseline	score	baseline	score
+netperf TCP_CRR (Trans. Rate/sec)	390.53	1.0	390.53	1.0	2.0
+netperf TCP_RR (Trans. Rate/sec)	2017.98	1.0	2017.98	1.0	2.0
+netperf TCP_STREAM (Throughput 10^6bits/sec)	79.75	1.0	79.75	0.0	1.0
+netperf UDP_RR (Trans. Rate/sec)	2070.62	1.0	2070.62	0.0	1.0
+netperf UDP_STREAM (Trans. Rate/sec)	27.5	1.0	27.5	0.0	1.0
+总分		5.0		2.0	7.0

@@ -23,10 +23,7 @@ use general::vfs::stat::DevId;
 #[inline]
 pub fn encode_dev_t(dev: DevId) -> u64 {
     let (maj, min) = (dev.major as u64, dev.minor as u64);
-    (min & 0xFF)
-        | ((maj & 0xFFF) << 8)
-        | ((min & !0xFFu64) << 12)
-        | ((maj & !0xFFFu64) << 32)
+    (min & 0xFF) | ((maj & 0xFFF) << 8) | ((min & !0xFFu64) << 12) | ((maj & !0xFFFu64) << 32)
 }
 
 /// 解码 Linux 64-bit `dev_t` → `DevId`。

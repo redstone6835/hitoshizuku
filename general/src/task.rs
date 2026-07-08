@@ -37,6 +37,8 @@ pub trait TaskOps {
         arg2: usize,
     );
 
+    fn signal_interrupted_syscall_pc(trap_frame_ptr: TrapFramePtr) -> Option<usize>;
+
     fn init_user_entry() -> unsafe extern "C" fn() -> !;
 
     fn demo_user_entry() -> unsafe extern "C" fn() -> !;

@@ -2,8 +2,8 @@
 //!
 //! `general::PagingArch` 的 RISC-V64 后端。Sv48 四级页表，支持 4KiB / 2MiB / 1GiB 页。
 
-use general::{PagingArch, PhysPageTableRoot, VirtAddr};
 use crate::riscv64::specific::*;
+use general::{PagingArch, PhysPageTableRoot, VirtAddr};
 
 // ── PTE 位域 ──────────────────────────────────────────────────────────────────
 
@@ -46,11 +46,17 @@ pub struct Riscv64Pte(pub usize);
 pub struct Riscv64Flags(pub usize);
 
 impl Riscv64Flags {
-    #[inline] pub const fn bits(self) -> usize { self.0 }
+    #[inline]
+    pub const fn bits(self) -> usize {
+        self.0
+    }
 }
 
 impl Riscv64Pte {
-    #[inline] pub const fn bits(self) -> usize { self.0 }
+    #[inline]
+    pub const fn bits(self) -> usize {
+        self.0
+    }
 }
 
 // ── Riscv64Paging ─────────────────────────────────────────────────────────────
@@ -77,17 +83,31 @@ impl Riscv64Paging {
 
     const fn leaf_flags(r: bool, w: bool, x: bool, u: bool, g: bool) -> usize {
         let mut f = PTE_V | PTE_A;
-        if w { f |= PTE_D; }
-        if r { f |= PTE_R; }
-        if w { f |= PTE_W; }
-        if x { f |= PTE_X; }
-        if u { f |= PTE_U; }
-        if g { f |= PTE_G; }
+        if w {
+            f |= PTE_D;
+        }
+        if r {
+            f |= PTE_R;
+        }
+        if w {
+            f |= PTE_W;
+        }
+        if x {
+            f |= PTE_X;
+        }
+        if u {
+            f |= PTE_U;
+        }
+        if g {
+            f |= PTE_G;
+        }
         f
     }
 
     #[inline]
-    pub const fn invalid_pte() -> Riscv64Pte { Riscv64Pte(0) }
+    pub const fn invalid_pte() -> Riscv64Pte {
+        Riscv64Pte(0)
+    }
 
     #[inline]
     pub const fn make_table_pte(next_table_paddr: usize) -> Riscv64Pte {
@@ -95,7 +115,14 @@ impl Riscv64Paging {
     }
 
     #[inline]
-    pub const fn make_leaf_pte(pa: usize, r: bool, w: bool, x: bool, u: bool, g: bool) -> Riscv64Pte {
+    pub const fn make_leaf_pte(
+        pa: usize,
+        r: bool,
+        w: bool,
+        x: bool,
+        u: bool,
+        g: bool,
+    ) -> Riscv64Pte {
         Riscv64Pte((Self::make_ppn(pa) << 10) | Self::leaf_flags(r, w, x, u, g))
     }
 
@@ -108,9 +135,21 @@ impl Riscv64Paging {
     /// - `asid` 与目标地址空间匹配
     /// - 调用发生在上下文切换临界区（中断已关闭或不会被抢占）
     pub unsafe fn activate_with_asid(root: PhysPageTableRoot, asid: usize) {
-        let satp = SATP_MODE_SV48
-            | ((asid & ASID_MASK) << PPN_BITS)
-            | (Self::make_ppn(root.as_usize()));
+        let satp =
+            SATP_MODE_SV48 | ((asid & ASID_MASK) << PPN_BITS) | (Self::make_ppn(root.as_usize()));
+        let current: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrr {current}, satp",
+                current = out(reg) current,
+                options(nostack, preserves_flags)
+            );
+        }
+        if current == satp {
+            // 同一进程内的 pthread 切换会反复进入 VmSpace::activate。
+            // root/asid 未变化时不需要重写 satp，也不能白白做全局 sfence.vma。
+            return;
+        }
         unsafe {
             core::arch::asm!(
                 "csrw satp, {val}",
@@ -166,7 +205,9 @@ impl Riscv64Paging {
     /// 同 [`flush_tlb_with_asid`](Self::flush_tlb_with_asid)。
     #[inline]
     pub unsafe fn flush_tlb_current_asid(vaddr: Option<VirtAddr>) {
-        unsafe { Self::flush_tlb_with_asid(Self::current_asid(), vaddr); }
+        unsafe {
+            Self::flush_tlb_with_asid(Self::current_asid(), vaddr);
+        }
     }
 }
 
@@ -198,17 +239,47 @@ impl PagingArch for Riscv64Paging {
         (va48 >> shift) & VPN_MASK
     }
 
-    #[inline] fn invalid_pte() -> Self::Pte { Riscv64Paging::invalid_pte() }
-    #[inline] fn pte_is_valid(pte: Self::Pte) -> bool { pte.0 & PTE_V != 0 }
-    #[inline] fn pte_is_leaf(pte: Self::Pte) -> bool { pte.0 & PTE_V != 0 && pte.0 & (PTE_R | PTE_W | PTE_X) != 0 }
-    #[inline] fn pte_addr(pte: Self::Pte) -> usize { ((pte.0 >> 10) & PPN_FIELD_MASK) << PAGE_SHIFT }
-    #[inline] fn pte_flags(pte: Self::Pte) -> Self::Flags { Riscv64Flags(pte.0 & 0x3FF) }
+    #[inline]
+    fn invalid_pte() -> Self::Pte {
+        Riscv64Paging::invalid_pte()
+    }
+    #[inline]
+    fn pte_is_valid(pte: Self::Pte) -> bool {
+        pte.0 & PTE_V != 0
+    }
+    #[inline]
+    fn pte_is_leaf(pte: Self::Pte) -> bool {
+        pte.0 & PTE_V != 0 && pte.0 & (PTE_R | PTE_W | PTE_X) != 0
+    }
+    #[inline]
+    fn pte_addr(pte: Self::Pte) -> usize {
+        ((pte.0 >> 10) & PPN_FIELD_MASK) << PAGE_SHIFT
+    }
+    #[inline]
+    fn pte_flags(pte: Self::Pte) -> Self::Flags {
+        Riscv64Flags(pte.0 & 0x3FF)
+    }
 
-    #[inline] fn flags_readable(f: Self::Flags) -> bool { f.0 & PTE_R != 0 }
-    #[inline] fn flags_writable(f: Self::Flags) -> bool { f.0 & PTE_W != 0 }
-    #[inline] fn flags_executable(f: Self::Flags) -> bool { f.0 & PTE_X != 0 }
-    #[inline] fn flags_user_accessible(f: Self::Flags) -> bool { f.0 & PTE_U != 0 }
-    #[inline] fn flags_global(f: Self::Flags) -> bool { f.0 & PTE_G != 0 }
+    #[inline]
+    fn flags_readable(f: Self::Flags) -> bool {
+        f.0 & PTE_R != 0
+    }
+    #[inline]
+    fn flags_writable(f: Self::Flags) -> bool {
+        f.0 & PTE_W != 0
+    }
+    #[inline]
+    fn flags_executable(f: Self::Flags) -> bool {
+        f.0 & PTE_X != 0
+    }
+    #[inline]
+    fn flags_user_accessible(f: Self::Flags) -> bool {
+        f.0 & PTE_U != 0
+    }
+    #[inline]
+    fn flags_global(f: Self::Flags) -> bool {
+        f.0 & PTE_G != 0
+    }
 
     #[inline]
     fn make_table_pte(next_table: usize) -> Self::Pte {
@@ -216,7 +287,13 @@ impl PagingArch for Riscv64Paging {
     }
 
     #[inline]
-    fn is_valid_leaf_perm(read: bool, write: bool, _execute: bool, _user: bool, _global: bool) -> bool {
+    fn is_valid_leaf_perm(
+        read: bool,
+        write: bool,
+        _execute: bool,
+        _user: bool,
+        _global: bool,
+    ) -> bool {
         // RISC-V 规范：W=1 且 R=0 是保留编码，不允许使用。
         // 这是一个架构约束，必须在页表映射时检查。
         !(write && !read)
@@ -227,26 +304,50 @@ impl PagingArch for Riscv64Paging {
         Riscv64Paging::make_leaf_pte(pa, r, w, x, u, g)
     }
 
-    #[inline] fn supported_leaf_levels() -> &'static [usize] { &SUPPORTED_LEAF_LEVELS }
-    #[inline] fn leaf_page_size(level: usize) -> Option<usize> { Riscv64Paging::level_page_size(level) }
+    #[inline]
+    fn supported_leaf_levels() -> &'static [usize] {
+        &SUPPORTED_LEAF_LEVELS
+    }
+    #[inline]
+    fn leaf_page_size(level: usize) -> Option<usize> {
+        Riscv64Paging::level_page_size(level)
+    }
 
     #[inline]
     fn make_leaf_pte_for_level(
-        level: usize, pa: usize, r: bool, w: bool, x: bool, u: bool, g: bool,
+        level: usize,
+        pa: usize,
+        r: bool,
+        w: bool,
+        x: bool,
+        u: bool,
+        g: bool,
     ) -> Option<Self::Pte> {
         let size = Riscv64Paging::level_page_size(level)?;
-        if pa & (size - 1) != 0 { return None; }
+        if pa & (size - 1) != 0 {
+            return None;
+        }
         Some(Riscv64Paging::make_leaf_pte(pa, r, w, x, u, g))
     }
 
     unsafe fn activate(root: PhysPageTableRoot) {
-        unsafe { Riscv64Paging::activate_with_asid(root, Riscv64Paging::current_asid()); }
+        unsafe {
+            Riscv64Paging::activate_with_asid(root, Riscv64Paging::current_asid());
+        }
     }
 
-    #[inline] fn pte_to_usize(pte: Self::Pte) -> usize { pte.0 }
-    #[inline] fn pte_from_usize(bits: usize) -> Self::Pte { Riscv64Pte(bits) }
+    #[inline]
+    fn pte_to_usize(pte: Self::Pte) -> usize {
+        pte.0
+    }
+    #[inline]
+    fn pte_from_usize(bits: usize) -> Self::Pte {
+        Riscv64Pte(bits)
+    }
 
     unsafe fn flush_tlb(vaddr: Option<VirtAddr>) {
-        unsafe { Riscv64Paging::flush_tlb_current_asid(vaddr); }
+        unsafe {
+            Riscv64Paging::flush_tlb_current_asid(vaddr);
+        }
     }
 }

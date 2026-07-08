@@ -645,6 +645,7 @@ fn map_char_err(e: CharIoError) -> VfsError {
     match e {
         CharIoError::HardwareError => VfsError::Io,
         CharIoError::Unavailable => VfsError::NoDevice,
+        CharIoError::Interrupted => VfsError::Interrupted,
         CharIoError::Timeout => VfsError::TimedOut,
     }
 }
@@ -1205,11 +1206,12 @@ impl FileOps for CharDevFileOps {
         }
     }
     fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        if !self.is_tty() || self.nonblock.load(Ordering::Acquire) {
+        if self.nonblock.load(Ordering::Acquire) {
             return self.dev.write(buf).map_err(map_char_err);
         }
         let Some(tty) = self.tty.as_deref() else {
-            return self.dev.write(buf).map_err(map_char_err);
+            self.dev.write_all(buf).map_err(map_char_err)?;
+            return Ok(buf.len());
         };
         let termios = *tty.termios.lock();
         self.write_tty_bytes(buf, termios)?;
@@ -1360,18 +1362,30 @@ fn map_bio_err(err: BioError) -> VfsError {
     }
 }
 
+fn map_bio_errno(err: BioError) -> Errno {
+    match err {
+        BioError::Submit(s) => match s {
+            crate::dev::bio::SubmitError::Unsupported => Errno::ENOTTY,
+            crate::dev::bio::SubmitError::ReadOnly => Errno::EROFS,
+            crate::dev::bio::SubmitError::QueueFull => Errno::EAGAIN,
+            crate::dev::bio::SubmitError::DeviceGone => Errno::ENODEV,
+            crate::dev::bio::SubmitError::OutOfMemory => Errno::ENOMEM,
+            crate::dev::bio::SubmitError::InvalidRequest(_) => Errno::EINVAL,
+        },
+        BioError::Io(i) => match i {
+            crate::dev::bio::BioIoError::MediaError => Errno::EIO,
+            crate::dev::bio::BioIoError::Unavailable => Errno::ENODEV,
+            crate::dev::bio::BioIoError::Timeout => Errno::ETIMEDOUT,
+            crate::dev::bio::BioIoError::ReadOnly => Errno::EROFS,
+            crate::dev::bio::BioIoError::Unsupported => Errno::ENOTTY,
+        },
+    }
+}
+
 fn boxed_zeroed(len: usize) -> VfsResult<Box<[u8]>> {
     let mut data = Vec::new();
     data.try_reserve(len).map_err(|_| VfsError::OutOfMemory)?;
     data.resize(len, 0);
-    Ok(data.into_boxed_slice())
-}
-
-fn boxed_copy(buf: &[u8]) -> VfsResult<Box<[u8]>> {
-    let mut data = Vec::new();
-    data.try_reserve(buf.len())
-        .map_err(|_| VfsError::OutOfMemory)?;
-    data.extend_from_slice(buf);
     Ok(data.into_boxed_slice())
 }
 
@@ -1436,40 +1450,28 @@ impl BlockDeviceIoctlContext for BlockDevFileOps {
     fn io_hints(&self) -> Result<BlockIoHints, Errno> {
         block_io_hints(&self.dev)
     }
-}
 
-fn block_read_exact(dev: &Arc<BlockDevice>, lba: u64, blocks: u32) -> VfsResult<Box<[u8]>> {
-    let block_size = dev.geometry().logical_block_size().get() as usize;
-    let len = (blocks as usize)
-        .checked_mul(block_size)
-        .ok_or(VfsError::InvalidArgument)?;
-    let owned = boxed_zeroed(len)?;
-    let bio = dev
-        .submit_bio_wait(
-            BioOp::Read,
-            BlockRange { lba, blocks },
-            BioBuffer::Owned(owned),
-        )
-        .map_err(map_bio_err)?;
-    match bio.buffer {
-        BioBuffer::Owned(buf) => Ok(buf),
-        BioBuffer::None => Err(VfsError::Io),
+    fn submit_range(&self, op: BioOp, range: BlockRange) -> Result<(), Errno> {
+        // ioctl 层已经把用户 ABI 的字节区间转换为块范围；这里仅提交 typed BIO，
+        // 不解析 ioctl number，也不接触用户指针。
+        self.dev
+            .submit_bio_wait(op, range, BioBuffer::None)
+            .map(|_| ())
+            .map_err(map_bio_errno)
     }
 }
 
-fn block_write_exact(dev: &Arc<BlockDevice>, lba: u64, data: Box<[u8]>) -> VfsResult<()> {
-    let block_size = dev.geometry().logical_block_size().get() as usize;
-    if data.len() == 0 || !data.len().is_multiple_of(block_size) {
-        return Err(VfsError::InvalidArgument);
-    }
-    let blocks = u32::try_from(data.len() / block_size).map_err(|_| VfsError::InvalidArgument)?;
-    dev.submit_bio_wait(
-        BioOp::Write,
-        BlockRange { lba, blocks },
-        BioBuffer::Owned(data),
-    )
-    .map_err(map_bio_err)?;
-    Ok(())
+fn block_read_into(dev: &Arc<BlockDevice>, lba: u64, blocks: u32, buf: &mut [u8]) -> VfsResult<()> {
+    // 块设备文件整块读的热路径直接复用调用者缓冲，避免先分配 BIO owned buffer
+    // 再复制到 VFS buffer。生命周期由同步提交接口收束，驱动完成后函数才返回。
+    dev.submit_bio_wait_borrowed_read(BlockRange { lba, blocks }, buf)
+        .map_err(map_bio_err)
+}
+
+fn block_write_from(dev: &Arc<BlockDevice>, lba: u64, blocks: u32, buf: &[u8]) -> VfsResult<()> {
+    // 与读路径对称：整块写直接借用调用者缓冲提交，去掉 boxed_copy 和一次 memcpy。
+    dev.submit_bio_wait_borrowed_write(BlockRange { lba, blocks }, buf)
+        .map_err(map_bio_err)
 }
 
 fn flush_if_supported(dev: &Arc<BlockDevice>) -> VfsResult<()> {
@@ -1503,9 +1505,8 @@ impl FileOps for BlockDevFileOps {
             let max_blocks = max_blocks_per_io(&self.dev) as usize;
             while remaining_blocks != 0 {
                 let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
-                let data = block_read_exact(&self.dev, lba, blocks)?;
-                let bytes = data.len();
-                buf[done..done + bytes].copy_from_slice(&data);
+                let bytes = blocks as usize * block_size;
+                block_read_into(&self.dev, lba, blocks, &mut buf[done..done + bytes])?;
                 done += bytes;
                 lba += blocks as u64;
                 remaining_blocks -= blocks as usize;
@@ -1519,9 +1520,8 @@ impl FileOps for BlockDevFileOps {
             let max_blocks = max_blocks_per_io(&self.dev) as usize;
             while remaining_blocks != 0 {
                 let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
-                let data = block_read_exact(&self.dev, lba, blocks)?;
-                let bytes = data.len();
-                buf[done..done + bytes].copy_from_slice(&data);
+                let bytes = blocks as usize * block_size;
+                block_read_into(&self.dev, lba, blocks, &mut buf[done..done + bytes])?;
                 done += bytes;
                 lba += blocks as u64;
                 remaining_blocks -= blocks as usize;
@@ -1529,13 +1529,14 @@ impl FileOps for BlockDevFileOps {
             return Ok(done);
         }
 
+        let mut scratch = boxed_zeroed(block_size)?;
         while done < len {
             let abs = offset.saturating_add(done as u64);
             let lba = abs / block_size as u64;
             let in_block = (abs % block_size as u64) as usize;
             let take = (block_size - in_block).min(len - done);
-            let data = block_read_exact(&self.dev, lba, 1)?;
-            buf[done..done + take].copy_from_slice(&data[in_block..in_block + take]);
+            block_read_into(&self.dev, lba, 1, &mut scratch)?;
+            buf[done..done + take].copy_from_slice(&scratch[in_block..in_block + take]);
             done += take;
         }
         Ok(done)
@@ -1559,8 +1560,7 @@ impl FileOps for BlockDevFileOps {
             while remaining_blocks != 0 {
                 let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
                 let bytes = blocks as usize * block_size;
-                let owned = boxed_copy(&buf[done..done + bytes])?;
-                block_write_exact(&self.dev, lba, owned)?;
+                block_write_from(&self.dev, lba, blocks, &buf[done..done + bytes])?;
                 done += bytes;
                 lba += blocks as u64;
                 remaining_blocks -= blocks as usize;
@@ -1572,21 +1572,21 @@ impl FileOps for BlockDevFileOps {
             while remaining_blocks != 0 {
                 let blocks = remaining_blocks.min(max_blocks).min(u32::MAX as usize) as u32;
                 let bytes = blocks as usize * block_size;
-                let owned = boxed_copy(&buf[done..done + bytes])?;
-                block_write_exact(&self.dev, lba, owned)?;
+                block_write_from(&self.dev, lba, blocks, &buf[done..done + bytes])?;
                 done += bytes;
                 lba += blocks as u64;
                 remaining_blocks -= blocks as usize;
             }
         } else {
+            let mut scratch = boxed_zeroed(block_size)?;
             while done < len {
                 let abs = offset.saturating_add(done as u64);
                 let lba = abs / block_size as u64;
                 let in_block = (abs % block_size as u64) as usize;
                 let take = (block_size - in_block).min(len - done);
-                let mut data = block_read_exact(&self.dev, lba, 1)?;
-                data[in_block..in_block + take].copy_from_slice(&buf[done..done + take]);
-                block_write_exact(&self.dev, lba, data)?;
+                block_read_into(&self.dev, lba, 1, &mut scratch)?;
+                scratch[in_block..in_block + take].copy_from_slice(&buf[done..done + take]);
+                block_write_from(&self.dev, lba, 1, &scratch)?;
                 done += take;
             }
         }

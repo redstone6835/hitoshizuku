@@ -28,9 +28,9 @@
 //! - `PreferLarge`：优先 2MiB 大页，失败降级到 4KiB
 //! - `RequireLarge`：强制 2MiB 大页，失败返回错误
 
-use allocator::{PagePolicy, PAGE_SIZE, PhysicalAllocRequest};
+use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use general::{MapError, VirtAddr, find_leaf, walk_and_map, unmap_range_entries, PagingArch};
+use general::{MapError, PagingArch, find_leaf, unmap_range_entries, walk_and_map};
 
 use crate::riscv64::paging::Riscv64Paging;
 use crate::riscv64::specific::phys_to_virt;
@@ -231,16 +231,25 @@ fn verify_kernel_segments(root_paddr: usize) {
             let r = <Riscv64Paging as PagingArch>::flags_readable(flags);
             let w = <Riscv64Paging as PagingArch>::flags_writable(flags);
             let x = <Riscv64Paging as PagingArch>::flags_executable(flags);
-            debug_assert!(r == expect_r && w == expect_w && x == expect_x,
+            debug_assert!(
+                r == expect_r && w == expect_w && x == expect_x,
                 "[heap_vm] segment '{}' at {:#x}: perm R={} W={} X={}, expected R={} W={} X={}",
-                name, va, r, w, x, expect_r, expect_w, expect_x);
+                name,
+                va,
+                r,
+                w,
+                x,
+                expect_r,
+                expect_w,
+                expect_x
+            );
         }
     };
 
     // W^X 权限验证
-    check(".text", stext as usize, true, false, true);   // R+X
+    check(".text", stext as usize, true, false, true); // R+X
     check(".rodata", srodata as usize, true, false, false); // R
-    check(".data", sdata as usize, true, true, false);   // R+W
+    check(".data", sdata as usize, true, true, false); // R+W
 }
 
 /// 对标 LoongArch：动态搜索 2 MiB 叶子层级，不硬编码 level 1（1 GiB）。
@@ -271,7 +280,11 @@ fn map_range_with_policy(
                 current_vaddr,
                 current_paddr,
                 find_smallest_leaf_level(),
-                true, true, true, false, true,
+                true,
+                true,
+                true,
+                false,
+                true,
                 phys_to_virt,
                 alloc_page_table_page,
             )?;
@@ -283,7 +296,11 @@ fn map_range_with_policy(
                 current_vaddr,
                 current_paddr,
                 target_level,
-                true, true, true, false, true,
+                true,
+                true,
+                true,
+                false,
+                true,
                 phys_to_virt,
                 alloc_page_table_page,
             );
@@ -297,7 +314,11 @@ fn map_range_with_policy(
                     current_vaddr,
                     current_paddr,
                     find_smallest_leaf_level(),
-                    true, true, true, false, true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    true,
                     phys_to_virt,
                     alloc_page_table_page,
                 )?;

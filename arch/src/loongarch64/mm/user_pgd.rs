@@ -76,9 +76,10 @@ impl Drop for UserPgdInner {
 fn copy_kernel_pgd_entries(dst_pgd_virt: usize, src_pgd_phys: usize) {
     let src_pgd_virt = phys_to_virt(src_pgd_phys);
     let entries = LoongArch64Paging::ENTRIES_PER_TABLE;
+    let half = entries / 2;
     let src = src_pgd_virt as *const usize;
     let dst = dst_pgd_virt as *mut usize;
-    for i in 0..entries {
+    for i in half..entries {
         // Safety: src/dst 指向 PAGE_SIZE 字节的 PGD 缓冲，按 usize 对齐；
         //         本次只读源、独占写目的，无并发访问者。
         let entry = unsafe { core::ptr::read_volatile(src.add(i)) };
@@ -131,6 +132,34 @@ fn allocate_page_table_page() -> Result<usize, general::MapError> {
         .allocate_physical(request)
         .map_err(|_| general::MapError::OutOfMemory)?;
     Ok(allocation.paddr)
+}
+
+fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let page_size = LoongArch64Paging::PAGE_SIZE;
+    const PAGE_THRESHOLD: usize = 64;
+    let Some(end) = vaddr.checked_add(len) else {
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    };
+    let aligned_start = vaddr & !(page_size - 1);
+    let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
+    if pages > PAGE_THRESHOLD {
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    }
+    let mut va = aligned_start;
+    while va < end {
+        // Safety: flush_tlb_with_asid 不解引用任何指针，仅发 invtlb。
+        unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };
+        let Some(next) = va.checked_add(page_size) else {
+            unsafe { LoongArch64Paging::flush_tlb_with_asid(asid, None) };
+            return;
+        };
+        va = next;
+    }
 }
 
 // ── PgdHandle 与 UserPgdInner 的来回 ─────────────────────────────────────────
@@ -199,6 +228,7 @@ unsafe fn unmap(handle: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(handle) };
     let _ =
         unmap_range_entries::<LoongArch64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
@@ -229,7 +259,7 @@ unsafe fn protect(handle: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
         }
         va += LoongArch64Paging::PAGE_SIZE;
     }
-    unsafe { invalidate_range(handle, vaddr, len) };
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn clone_for_fork(src: PgdHandle, dst: PgdHandle, range: core::ops::Range<usize>) {
@@ -300,15 +330,7 @@ unsafe fn activate(handle: PgdHandle) {
 unsafe fn invalidate_range(handle: PgdHandle, vaddr: usize, len: usize) {
     // Safety: 同上。
     let inner = unsafe { inner_ref(handle) };
-    let mut va = vaddr & !(LoongArch64Paging::PAGE_SIZE - 1);
-    let end = vaddr + len;
-    while va < end {
-        // Safety: flush_tlb_with_asid 不解引用任何指针，仅发 invtlb。
-        unsafe {
-            LoongArch64Paging::flush_tlb_with_asid(inner.asid(), Some(VirtAddr::new(va)));
-        }
-        va += LoongArch64Paging::PAGE_SIZE;
-    }
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn count_mapped(handle: PgdHandle, vaddr: usize, len: usize) -> usize {

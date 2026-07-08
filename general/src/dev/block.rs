@@ -33,6 +33,13 @@ pub use crate::dev::bio::{
 /// 底层驱动查找键；驱动若能提供更稳定的介质序列，可在 [`BlockAttributes`] 中覆盖。
 static NEXT_BLOCK_DISKSEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 同步块 I/O 等待时，在真正让出 CPU 前主动推进完成队列的次数。
+///
+/// QEMU/virtio 的小请求通常在几十微秒内完成；立即切到 idle 会把一次上下文切换、
+/// 中断返回和再次切回的固定成本叠到每个 512B/4KiB I/O 上。这里先做一个很小的
+/// bounded poll 窗口，完成不了再睡眠，避免长 I/O 忙等。
+const SYNC_WAIT_ACTIVE_DRAIN_LIMIT: usize = 256;
+
 fn allocate_block_diskseq() -> u64 {
     loop {
         let current = NEXT_BLOCK_DISKSEQ.load(Ordering::Acquire).max(1);
@@ -98,6 +105,39 @@ pub struct BlockLimits {
     max_blocks_per_io: Option<NonZeroU32>,
     optimal_blocks_per_io: Option<NonZeroU32>,
     buffer_alignment: Option<NonZeroU32>,
+    discard: Option<BlockRangeLimits>,
+    write_zeroes: Option<BlockRangeLimits>,
+}
+
+/// 范围类块命令的限制。
+///
+/// Discard / WriteZeroes 等命令不携带用户数据缓冲，它们的设备限制通常来自介质
+/// 擦除粒度或协议 range descriptor，而不是普通数据 DMA 段大小。用独立结构表达
+/// 可以避免把读写 I/O 的 DMA 限制误套到范围命令上。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockRangeLimits {
+    max_blocks_per_io: Option<NonZeroU32>,
+    alignment_blocks: Option<NonZeroU32>,
+}
+
+impl BlockRangeLimits {
+    pub const fn new(
+        max_blocks_per_io: Option<NonZeroU32>,
+        alignment_blocks: Option<NonZeroU32>,
+    ) -> Self {
+        Self {
+            max_blocks_per_io,
+            alignment_blocks,
+        }
+    }
+
+    pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
+        self.max_blocks_per_io
+    }
+
+    pub const fn alignment_blocks(&self) -> Option<NonZeroU32> {
+        self.alignment_blocks
+    }
 }
 
 impl BlockLimits {
@@ -120,6 +160,8 @@ impl BlockLimits {
             max_blocks_per_io,
             optimal_blocks_per_io,
             buffer_alignment,
+            discard: None,
+            write_zeroes: None,
         })
     }
 
@@ -128,7 +170,19 @@ impl BlockLimits {
             max_blocks_per_io: None,
             optimal_blocks_per_io: None,
             buffer_alignment: None,
+            discard: None,
+            write_zeroes: None,
         }
+    }
+
+    pub const fn with_discard_limits(mut self, limits: Option<BlockRangeLimits>) -> Self {
+        self.discard = limits;
+        self
+    }
+
+    pub const fn with_write_zeroes_limits(mut self, limits: Option<BlockRangeLimits>) -> Self {
+        self.write_zeroes = limits;
+        self
     }
 
     pub const fn max_blocks_per_io(&self) -> Option<NonZeroU32> {
@@ -141,6 +195,22 @@ impl BlockLimits {
 
     pub const fn buffer_alignment(&self) -> Option<NonZeroU32> {
         self.buffer_alignment
+    }
+
+    pub const fn discard_limits(&self) -> Option<BlockRangeLimits> {
+        self.discard
+    }
+
+    pub const fn write_zeroes_limits(&self) -> Option<BlockRangeLimits> {
+        self.write_zeroes
+    }
+
+    pub const fn range_limits_for(&self, op: BioOp) -> Option<BlockRangeLimits> {
+        match op {
+            BioOp::Discard => self.discard,
+            BioOp::WriteZeroes => self.write_zeroes,
+            _ => None,
+        }
     }
 }
 
@@ -207,6 +277,11 @@ impl BlockFeatures {
     pub const DISCARD: Self = Self(1 << 2);
     pub const WRITE_ZEROES: Self = Self(1 << 3);
     pub const FUA: Self = Self(1 << 4);
+    /// Discard 后读取同一区间能够稳定返回零。
+    ///
+    /// 这和 WRITE_ZEROES 是两个能力：WRITE_ZEROES 表示设备支持显式写零命令，
+    /// DISCARD_ZEROES 表示丢弃后的介质可观测内容为零。没有明确保证时不能声明。
+    pub const DISCARD_ZEROES: Self = Self(1 << 5);
 
     #[inline]
     pub fn contains(self, other: Self) -> bool {
@@ -248,6 +323,24 @@ pub struct BlockIoStatsSnapshot {
     pub write_inflight: u64,
 }
 
+/// 单次同步块 I/O 提交路径的分段耗时。
+///
+/// 仅用于基准测试定位固定开销来源；普通 I/O 路径不采集这些字段。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlockSubmitProfile {
+    pub total_ns: u64,
+    pub validate_ns: u64,
+    pub build_bio_ns: u64,
+    pub queue_ns: u64,
+    pub drain_ns: u64,
+    pub schedule_ns: u64,
+    pub completion_take_ns: u64,
+    pub stats_ns: u64,
+    pub drain_calls: u64,
+    pub schedule_calls: u64,
+    pub spin_calls: u64,
+}
+
 #[derive(Default)]
 struct BlockIoStats {
     read_ios: AtomicU64,
@@ -276,6 +369,39 @@ impl BlockIoStats {
 
     fn cancel(&self, op: BioOp) {
         self.finish_inflight(op);
+    }
+
+    fn record_complete(
+        &self,
+        op: BioOp,
+        range: BlockRange,
+        block_size: NonZeroU32,
+        elapsed_ns: u64,
+    ) {
+        self.finish_inflight(op);
+        let sectors =
+            (range.blocks as u64).saturating_mul((block_size.get() as u64).max(512) / 512);
+        match op {
+            BioOp::Read => {
+                self.read_ios.fetch_add(1, Ordering::AcqRel);
+                self.read_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.read_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Write => {
+                self.write_ios.fetch_add(1, Ordering::AcqRel);
+                self.write_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.write_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Discard | BioOp::WriteZeroes => {
+                self.discard_ios.fetch_add(1, Ordering::AcqRel);
+                self.discard_sectors.fetch_add(sectors, Ordering::AcqRel);
+                self.discard_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+            BioOp::Flush => {
+                self.flush_ios.fetch_add(1, Ordering::AcqRel);
+                self.flush_time_ns.fetch_add(elapsed_ns, Ordering::AcqRel);
+            }
+        }
     }
 
     fn finish_inflight(&self, op: BioOp) {
@@ -567,10 +693,12 @@ impl BlockDevice {
                     min_io_size: logical,
                     optimal_io_size: optimal,
                     alignment_offset: self.limits.buffer_alignment().map(|_| 0).unwrap_or(0),
-                    discard_zeroes: self.features.contains(BlockFeatures::WRITE_ZEROES),
+                    discard_zeroes: self.features.contains(BlockFeatures::DISCARD_ZEROES),
                     rotational: self.attributes.rotational(),
                 }))
             }
+            #[cfg(feature = "block-profile")]
+            BlockControlRequest::GetDebugProfile => Err(ControlError::Unsupported),
             BlockControlRequest::GetDiskSeq => self
                 .attributes
                 .diskseq()
@@ -603,8 +731,11 @@ impl BlockDevice {
 
     /// 同步提交并阻塞等待。
     ///
-    /// 当前实现通过主动 drain 推进硬件完成，不依赖中断。
-    /// 调度器就绪时在 drain 间让出 CPU（yield）；否则纯 spin。
+    /// 使用共享 Completion，保证等待任务被信号/超时杀死后，驱动稍后完成 pending
+    /// BIO 时仍有有效 completion 目标。这里不能使用栈上 completion：同步等待期间
+    /// 会让出 CPU，任务可能在 BIO 完成前退出并回收内核栈。
+    /// 统计在完成后由本函数直接记录，跳过 observer 回调中的额外时钟读取。
+    /// 通过主动 drain 推进硬件完成，不依赖中断。
     pub fn submit_bio_wait(
         self: &Arc<Self>,
         op: BioOp,
@@ -612,15 +743,14 @@ impl BlockDevice {
         buffer: BioBuffer,
     ) -> Result<Bio, BioError> {
         self.validate_bio(op, range, &buffer)?;
-        let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
         let submitted_ns = sched::now_ns_public();
-        let (bio, completion) = Bio::new_with_observer(
+        let (bio, completion) = Bio::new_shared_with_observer(
             op,
             range,
             buffer,
             self.geometry.logical_block_size(),
             submitted_ns,
-            Some(observer),
+            None,
         );
         self.io_stats.begin(op);
         if let Err((err, _bio)) = self.driver.queue_bio(bio) {
@@ -629,17 +759,153 @@ impl BlockDevice {
         }
 
         while !completion.is_done() {
-            self.driver.drain();
-            if completion.is_done() {
-                break;
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                self.driver.drain();
+                if completion.is_done() {
+                    break;
+                }
+                core::hint::spin_loop();
             }
             if sched::is_ready() {
-                sched::schedule_once(0);
+                if completion.is_done() {
+                    break;
+                }
+                sched::schedule_once(sched::now_ns_public());
             } else {
                 core::hint::spin_loop();
             }
         }
-        completion.wait()
+        let result = completion.wait();
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        if result.is_ok() {
+            self.io_stats.record_complete(
+                op,
+                range,
+                self.geometry.logical_block_size(),
+                elapsed_ns,
+            );
+        } else {
+            self.io_stats.cancel(op);
+        }
+        result
+    }
+
+    /// 同步提交并返回分段耗时，供 block-bench 定位固定成本。
+    ///
+    /// 该接口刻意不复用 [`Self::submit_bio_wait`]，避免在普通路径中引入 profiling
+    /// 分支和额外时间戳读取。
+    pub fn submit_bio_wait_profiled(
+        self: &Arc<Self>,
+        op: BioOp,
+        range: BlockRange,
+        buffer: BioBuffer,
+    ) -> Result<(Bio, BlockSubmitProfile), BioError> {
+        let total_start = sched::now_ns_public();
+        let mut profile = BlockSubmitProfile::default();
+
+        let t0 = sched::now_ns_public();
+        self.validate_bio(op, range, &buffer)?;
+        profile.validate_ns = sched::now_ns_public().saturating_sub(t0);
+
+        let submitted_ns = sched::now_ns_public();
+        let t0 = sched::now_ns_public();
+        let (bio, completion) = Bio::new_shared_with_observer(
+            op,
+            range,
+            buffer,
+            self.geometry.logical_block_size(),
+            submitted_ns,
+            None,
+        );
+        profile.build_bio_ns = sched::now_ns_public().saturating_sub(t0);
+
+        self.io_stats.begin(op);
+        let t0 = sched::now_ns_public();
+        if let Err((err, _bio)) = self.driver.queue_bio(bio) {
+            profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
+            self.io_stats.cancel(op);
+            profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
+            return Err(BioError::Submit(err));
+        }
+        profile.queue_ns = sched::now_ns_public().saturating_sub(t0);
+
+        while !completion.is_done() {
+            for _ in 0..SYNC_WAIT_ACTIVE_DRAIN_LIMIT {
+                let t0 = sched::now_ns_public();
+                self.driver.drain();
+                profile.drain_ns = profile
+                    .drain_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.drain_calls = profile.drain_calls.saturating_add(1);
+                if completion.is_done() {
+                    break;
+                }
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+            if sched::is_ready() {
+                if completion.is_done() {
+                    break;
+                }
+                let t0 = sched::now_ns_public();
+                sched::schedule_once(sched::now_ns_public());
+                profile.schedule_ns = profile
+                    .schedule_ns
+                    .saturating_add(sched::now_ns_public().saturating_sub(t0));
+                profile.schedule_calls = profile.schedule_calls.saturating_add(1);
+            } else {
+                core::hint::spin_loop();
+                profile.spin_calls = profile.spin_calls.saturating_add(1);
+            }
+        }
+
+        let t0 = sched::now_ns_public();
+        let result = completion.wait();
+        profile.completion_take_ns = sched::now_ns_public().saturating_sub(t0);
+
+        let elapsed_ns = sched::now_ns_public().saturating_sub(submitted_ns);
+        let t0 = sched::now_ns_public();
+        if result.is_ok() {
+            self.io_stats.record_complete(
+                op,
+                range,
+                self.geometry.logical_block_size(),
+                elapsed_ns,
+            );
+        } else {
+            self.io_stats.cancel(op);
+        }
+        profile.stats_ns = sched::now_ns_public().saturating_sub(t0);
+        profile.total_ns = sched::now_ns_public().saturating_sub(total_start);
+
+        result.map(|bio| (bio, profile))
+    }
+
+    /// 同步读取到调用者提供的缓冲区。
+    ///
+    /// 该接口专供文件系统同步后端等短生命周期调用者使用：BIO 在函数返回前必定
+    /// 完成，因此底层驱动可以复用同一条提交路径，而无需为每次读额外分配中转
+    /// `Box<[u8]>` 再拷贝回调用者缓冲。
+    pub fn submit_bio_wait_borrowed_read(
+        self: &Arc<Self>,
+        range: BlockRange,
+        buf: &mut [u8],
+    ) -> Result<(), BioError> {
+        self.submit_bio_wait(BioOp::Read, range, BioBuffer::borrowed_read(buf))
+            .map(|_| ())
+    }
+
+    /// 同步写入调用者提供的缓冲区。
+    ///
+    /// 借用缓冲只在本次同步提交期间有效；函数返回后驱动不得再保存或访问该指针。
+    /// 这保持了块层 API 的拥有式异步语义，同时消除同步写路径的 staging 分配和复制。
+    pub fn submit_bio_wait_borrowed_write(
+        self: &Arc<Self>,
+        range: BlockRange,
+        buf: &[u8],
+    ) -> Result<(), BioError> {
+        self.submit_bio_wait(BioOp::Write, range, BioBuffer::borrowed_write(buf))
+            .map(|_| ())
     }
 
     /// 异步提交，返回 `BioFuture`。
@@ -652,7 +918,7 @@ impl BlockDevice {
         self.validate_bio(op, range, &buffer)?;
         let observer: Arc<dyn BioCompletionObserver> = self.io_stats.clone();
         let submitted_ns = sched::now_ns_public();
-        let (bio, completion) = Bio::new_with_observer(
+        let (bio, completion) = Bio::new_shared_with_observer(
             op,
             range,
             buffer,
@@ -718,12 +984,35 @@ impl BlockDevice {
                 BioReqError::EmptyRange,
             )));
         }
-        if let Some(max) = self.limits.max_blocks_per_io() {
-            if range.blocks > max.get() {
-                return Err(BioError::Submit(SubmitError::InvalidRequest(
-                    BioReqError::TooLarge,
-                )));
+        match op {
+            BioOp::Discard | BioOp::WriteZeroes => {
+                if let Some(limits) = self.limits.range_limits_for(op) {
+                    if let Some(max) = limits.max_blocks_per_io() {
+                        if range.blocks > max.get() {
+                            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                                BioReqError::TooLarge,
+                            )));
+                        }
+                    }
+                    if let Some(alignment) = limits.alignment_blocks() {
+                        if !range.lba.is_multiple_of(u64::from(alignment.get())) {
+                            return Err(BioError::Submit(SubmitError::InvalidRequest(
+                                BioReqError::Misaligned,
+                            )));
+                        }
+                    }
+                }
             }
+            BioOp::Read | BioOp::Write => {
+                if let Some(max) = self.limits.max_blocks_per_io() {
+                    if range.blocks > max.get() {
+                        return Err(BioError::Submit(SubmitError::InvalidRequest(
+                            BioReqError::TooLarge,
+                        )));
+                    }
+                }
+            }
+            BioOp::Flush => {}
         }
         if let Some(count) = self.geometry.block_count() {
             let end = range
@@ -752,14 +1041,19 @@ impl BlockDevice {
                     BioReqError::BufferSizeMismatch,
                 )));
             }
+            if !buffer.accepts_op(op) {
+                return Err(BioError::Submit(SubmitError::InvalidRequest(
+                    BioReqError::BufferSizeMismatch,
+                )));
+            }
             if let Some(alignment) = self.limits.buffer_alignment() {
                 let align = alignment.get() as usize;
-                if let BioBuffer::Owned(b) = buffer {
-                    if !(b.as_ptr() as usize).is_multiple_of(align) {
-                        return Err(BioError::Submit(SubmitError::InvalidRequest(
-                            BioReqError::Misaligned,
-                        )));
-                    }
+                if let Some(addr) = buffer.ptr_addr()
+                    && !addr.is_multiple_of(align)
+                {
+                    return Err(BioError::Submit(SubmitError::InvalidRequest(
+                        BioReqError::Misaligned,
+                    )));
                 }
             }
         }

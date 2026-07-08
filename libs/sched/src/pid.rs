@@ -96,20 +96,14 @@ impl PidRegistry {
 
     /// 为 `task` 分配一个 pid。返回 `None` 表示用尽。
     ///
-    /// 分配策略：优先从自由链表取回；否则从 `next_hint` 开始往 `pid_max` 扫描
-    /// 并按需 `push` 新 slot。两种路径都保证 `pid_t >= 1`。
+    /// 分配策略：优先单调扩展 slot；只有达到 `pid_max` 后才复用自由链表。
+    ///
+    /// 不能 LIFO 复用刚释放的 TID：pthread 批量 create/join 时，大量 joinable
+    /// 线程已经退出但还没被用户态 join。若每次都复用同一个 TID，glibc 的线程
+    /// 描述符、栈缓存和用户态锁路径会长时间看到重复 TID，容易进入病态等待。
+    /// Linux 的 pid 分配也会围绕 last_pid 向前推进，而不是立刻拿回刚释放的槽。
     pub fn allocate(&self, task: &Arc<Task>) -> Option<PidT> {
         let mut inner = self.inner.lock();
-
-        if let Some(idx) = inner.free_head.take() {
-            let next = inner.slots[idx as usize].next_free.take();
-            inner.free_head = next;
-            let slot = &mut inner.slots[idx as usize];
-            slot.generation = slot.generation.wrapping_add(1);
-            slot.task = Arc::downgrade(task);
-            slot.occupied = true;
-            return Some(idx as PidT);
-        }
 
         let pid_max = inner.pid_max;
         let len = inner.slots.len() as u32;
@@ -122,6 +116,17 @@ impl PidRegistry {
                 occupied: true,
             });
             inner.next_hint = idx.saturating_add(1);
+            return Some(idx as PidT);
+        }
+
+        if let Some(idx) = inner.free_head.take() {
+            let next = inner.slots[idx as usize].next_free.take();
+            inner.free_head = next;
+            let slot = &mut inner.slots[idx as usize];
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.task = Arc::downgrade(task);
+            slot.occupied = true;
+            inner.next_hint = idx.saturating_add(1).max(1);
             return Some(idx as PidT);
         }
         None

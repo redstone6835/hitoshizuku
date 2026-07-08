@@ -247,6 +247,14 @@ impl EpollFileOps {
             .retain(|watch| !Arc::ptr_eq(&watch.file, file));
     }
 
+    fn clear_watches(&self) {
+        let watches = {
+            let mut state = self.state.lock();
+            core::mem::take(&mut state.watches)
+        };
+        drop(watches);
+    }
+
     fn any_ready(&self) -> bool {
         let state = self.state.lock();
         state.watches.iter().any(|watch| peek_watch_ready(watch))
@@ -394,7 +402,12 @@ impl FileOps for EpollFileOps {
         Err(Errno::ENOTTY)
     }
 
-    fn release(&self) {}
+    fn release(&self) {
+        // epoll watch 持有被监听文件的 Arc<File>。epoll fd 关闭时必须同步
+        // 释放这些引用，否则被监听的 socket 会跳过 FileOps::release，端口
+        // 和协议栈 socket 继续存活到进程消失之后。
+        self.clear_watches();
+    }
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -415,7 +428,7 @@ fn peek_watch_ready(watch: &EpollWatch) -> bool {
 
 fn timeout_deadline(timeout_ms: i64) -> Option<u64> {
     if timeout_ms >= 0 {
-        Some(sched::now_ns_public() + (timeout_ms as u64) * 1_000_000)
+        Some(sched::now_ns_public().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)))
     } else {
         None
     }
@@ -425,10 +438,17 @@ fn timeout_expired(deadline: Option<u64>) -> bool {
     deadline.is_some_and(|dl| sched::now_ns_public() >= dl)
 }
 
+fn restore_current_task_after_wait(task: &Arc<sched::Task>) {
+    if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
+        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
+    }
+}
+
 fn wait_on_sources(
     sources: &[(Arc<File>, PollEvents)],
     deadline: Option<u64>,
 ) -> Result<(), Errno> {
+    const EPOLL_RECHECK_NS: u64 = 10_000_000;
     let task = current_task();
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
@@ -444,8 +464,17 @@ fn wait_on_sources(
     for (file, interest) in sources {
         registered_waiter |= file.poll_add_waiter(&task, *interest);
     }
+
+    // epoll 的底层 waiter 可能来自 socket/pipe/嵌套 epoll 等不同对象。
+    // 为避免丢失精确唤醒后永久睡眠，和 poll/select 一样使用短周期兜底
+    // recheck；用户指定 timeout 仍以原始 deadline 为准。
+    let recheck_deadline = {
+        let now = sched::now_ns_public();
+        let quantum = now.saturating_add(EPOLL_RECHECK_NS);
+        Some(deadline.map_or(quantum, |dl| dl.min(quantum)))
+    };
     let deadline_armed =
-        deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
+        recheck_deadline.is_some_and(|deadline| sched::register_sleep_deadline(&task, deadline));
 
     if sources
         .iter()
@@ -457,7 +486,7 @@ fn wait_on_sources(
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
     if timeout_expired(deadline) {
@@ -467,22 +496,26 @@ fn wait_on_sources(
         if deadline_armed {
             sched::cancel_sleep_deadline(&task);
         }
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
         return Ok(());
     }
 
     if !registered_waiter && !deadline_armed {
-        let _ = task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Runnable);
+        restore_current_task_after_wait(&task);
+        drop(task);
         return sched::operation::sched_yield();
     }
 
+    drop(task);
     sched::schedule_once(sched::now_ns_public());
+    let task = current_task();
     for (file, _) in sources {
         file.poll_remove_waiter(&task);
     }
     if deadline_armed {
         sched::cancel_sleep_deadline(&task);
     }
+    restore_current_task_after_wait(&task);
     if has_unblocked_signal(&task) {
         return Err(Errno::EINTR);
     }

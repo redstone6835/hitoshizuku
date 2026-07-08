@@ -17,7 +17,7 @@ use crate::scheduler::{
     root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
-use crate::task::{Task, ext_clone_hook, ext_exit_hook};
+use crate::task::{Task, ext_clone_hook};
 use crate::{ExitCode, TaskState};
 
 /// 派生类型：新进程 vs 新线程。
@@ -80,11 +80,15 @@ pub fn spawn_child(parent: &Arc<Task>, kind: SpawnKind, params: SchedParams) -> 
     child.register_pid(Arc::clone(&root_ns), pid);
     if matches!(kind, SpawnKind::Process) {
         tgroup.set_tgid(pid);
+        child.set_tgid_cache(pid);
+    } else {
+        child.set_tgid_cache(tgroup.tgid());
     }
     if pgroup.pgid() <= 0 {
         pgroup.set_pgid(pid);
     }
 
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][spawn] kind={:?} pid={} parent_pid={:?}",
         kind,
@@ -265,6 +269,9 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
     child.register_pid(Arc::clone(&root_ns), pid);
     if !flags.has(CloneFlags::CLONE_THREAD) {
         new_tg.set_tgid(pid);
+        child.set_tgid_cache(pid);
+    } else {
+        child.set_tgid_cache(new_tg.tgid());
     }
     if pg.pgid() <= 0 {
         pg.set_pgid(pid);
@@ -283,6 +290,7 @@ pub fn clone_task(parent: &Arc<Task>, args: CloneArgs, params: SchedParams) -> A
         }
     }
 
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][clone] pid={} parent_pid={:?} flags={:#x} exit_sig={}",
         pid,
@@ -336,10 +344,6 @@ pub fn exit_task(task: &Arc<Task>, code: ExitCode) {
                 }
             }
         }
-    }
-
-    if let Some(hook) = ext_exit_hook() {
-        hook.cleanup_on_exit(task);
     }
 
     mark_task_exited(task, code);
@@ -419,6 +423,7 @@ where
     zombie.retire_execution();
 
     debug_assert_eq!(zombie.state(), TaskState::Dead);
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][reap] parent_pid={:?} child_pid={:?} code={}",
         parent.pid_root(),
@@ -468,6 +473,7 @@ pub fn kthread_create(entry: KernelEntry, arg: usize, params: SchedParams) -> Ar
     child.register_pid(Arc::clone(&root_ns), pid);
     tgroup.set_leader(&child);
     tgroup.set_tgid(pid);
+    child.set_tgid_cache(pid);
     tgroup.add_member(&child);
     pgroup.set_pgid(pid);
     pgroup.add_member(&child);
@@ -490,6 +496,7 @@ pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc
         );
         return child;
     }
+    #[cfg(feature = "trace-task-lifecycle")]
     log::debug!(
         "[sched][kthread] spawned pid={:?} entry={:#x}",
         child.pid_root(),

@@ -14,7 +14,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use general::mm::{PgdHandle, UserPgdOps};
-use general::{PhysPageTableRoot, VirtAddr, find_leaf, walk_and_map, unmap_range_entries, PagingArch};
+use general::{
+    PagingArch, PhysPageTableRoot, VirtAddr, find_leaf, unmap_range_entries, walk_and_map,
+};
 use mm::VmFlags;
 
 use crate::riscv64::paging::Riscv64Paging;
@@ -33,10 +35,15 @@ fn alloc_asid() -> usize {
         let cur = NEXT_ASID.load(Ordering::Relaxed);
         let max = MAX_ASID.load(Ordering::Relaxed);
         let next = if cur >= max { 1 } else { cur + 1 };
-        if NEXT_ASID.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if NEXT_ASID
+            .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
             if cur >= max {
                 // 回绕：flush 全 TLB（所有 ASID）
-                unsafe { core::arch::asm!("sfence.vma zero, zero"); }
+                unsafe {
+                    core::arch::asm!("sfence.vma zero, zero");
+                }
             }
             return cur;
         }
@@ -103,24 +110,47 @@ impl UserPgdInner {
 
 impl Drop for UserPgdInner {
     fn drop(&mut self) {
-        // 前提：上层 VmSpace 在 drop 前已通过 unmap_range_entries(free_table_pages=true)
-        // 释放了所有用户区域及其子页表。此处只需释放 PGD 根页本身。
-        #[cfg(debug_assertions)]
-        {
-            let ptr = self.pgd_virt as *const usize;
-            let half = Riscv64Paging::ENTRIES_PER_TABLE / 2;
-            for i in 0..half {
-                let pte = unsafe { core::ptr::read_volatile(ptr.add(i)) };
-                debug_assert!(pte == 0, "user PGD entry[{i}] not zero at drop: {pte:#x}");
-            }
+        free_user_page_table_pages(self.pgd_virt);
+        free_page_table_page(self.pgd_phys);
+    }
+}
+
+fn free_page_table_page(paddr: usize) {
+    if let Err(err) = allocator::KERNEL_ALLOCATOR.try_free_physical_addr(paddr) {
+        log::error!(
+            "[arch][mm] failed to free tracked page-table page paddr={:#x}: {:?}",
+            paddr,
+            err
+        );
+    }
+}
+
+fn free_user_page_table_pages(root_vaddr: usize) {
+    let entries = Riscv64Paging::ENTRIES_PER_TABLE / 2;
+    free_table_entries(root_vaddr, 0, entries);
+}
+
+fn free_table_entries(table_vaddr: usize, level: usize, entries: usize) {
+    for i in 0..entries {
+        let pte_ptr = (table_vaddr + i * core::mem::size_of::<usize>()) as *mut usize;
+        let bits = unsafe { core::ptr::read_volatile(pte_ptr) };
+        let pte = Riscv64Paging::pte_from_usize(bits);
+        if !Riscv64Paging::pte_is_valid(pte) || Riscv64Paging::pte_is_leaf(pte) {
+            continue;
         }
-        let alloc = allocator::PhysicalAllocation {
-            paddr: self.pgd_phys,
-            size: allocator::PAGE_SIZE,
-            order: 0,
-            page_size: allocator::PAGE_SIZE,
+        if level + 1 >= Riscv64Paging::LEVELS {
+            continue;
+        }
+        let child_paddr = Riscv64Paging::pte_addr(pte);
+        let child_vaddr = phys_to_virt(child_paddr);
+        free_table_entries(child_vaddr, level + 1, Riscv64Paging::ENTRIES_PER_TABLE);
+        unsafe {
+            core::ptr::write_volatile(
+                pte_ptr,
+                Riscv64Paging::pte_to_usize(Riscv64Paging::invalid_pte()),
+            )
         };
-        let _ = allocator::KERNEL_ALLOCATOR.free_physical(alloc);
+        free_page_table_page(child_paddr);
     }
 }
 
@@ -149,28 +179,46 @@ fn pgd_phys(pgd: PgdHandle) -> PhysPageTableRoot {
 unsafe fn activate(pgd: PgdHandle) {
     let inner = unsafe { inner_ref(pgd) };
     unsafe {
-        Riscv64Paging::activate_with_asid(
-            PhysPageTableRoot::new(inner.pgd_phys()),
-            inner.asid(),
-        );
+        Riscv64Paging::activate_with_asid(PhysPageTableRoot::new(inner.pgd_phys()), inner.asid());
     }
 }
 
 fn allocate_page_table_page() -> Result<usize, general::MapError> {
-    let request =
-        allocator::PhysicalAllocRequest::new(allocator::PAGE_SIZE, allocator::PAGE_SIZE);
+    let request = allocator::PhysicalAllocRequest::new(allocator::PAGE_SIZE, allocator::PAGE_SIZE);
     allocator::KERNEL_ALLOCATOR
         .allocate_physical(request)
         .map(|a| a.paddr)
         .map_err(|_| general::MapError::OutOfMemory)
 }
 
-unsafe fn map_user_pages(
-    pgd: PgdHandle,
-    vaddr: usize,
-    paddr: usize,
-    flags: VmFlags,
-) {
+fn flush_user_tlb_range(asid: usize, vaddr: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let page_size = Riscv64Paging::PAGE_SIZE;
+    const PAGE_THRESHOLD: usize = 64;
+    let Some(end) = vaddr.checked_add(len) else {
+        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    };
+    let aligned_start = vaddr & !(page_size - 1);
+    let pages = end.saturating_sub(aligned_start).div_ceil(page_size);
+    if pages > PAGE_THRESHOLD {
+        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+        return;
+    }
+    let mut va = aligned_start;
+    while va < end {
+        unsafe { Riscv64Paging::flush_tlb_with_asid(asid, Some(VirtAddr::new(va))) };
+        let Some(next) = va.checked_add(page_size) else {
+            unsafe { Riscv64Paging::flush_tlb_with_asid(asid, None) };
+            return;
+        };
+        va = next;
+    }
+}
+
+unsafe fn map_user_pages(pgd: PgdHandle, vaddr: usize, paddr: usize, flags: VmFlags) {
     let inner = unsafe { inner_ref(pgd) };
     let root_virt = inner.pgd_virt();
     let read = flags.has(VmFlags::READ);
@@ -196,9 +244,7 @@ unsafe fn map_user_pages(
 unsafe fn unmap_user_pages(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
     let _ = unmap_range_entries::<Riscv64Paging>(inner.pgd_virt(), vaddr, len, true, phys_to_virt);
-    unsafe {
-        Riscv64Paging::flush_tlb_with_asid(inner.asid(), Some(VirtAddr::new(vaddr)));
-    }
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: VmFlags) {
@@ -228,12 +274,7 @@ unsafe fn protect_user_pages(pgd: PgdHandle, vaddr: usize, len: usize, flags: Vm
         }
         va += Riscv64Paging::PAGE_SIZE;
     }
-    // flush 整个修改范围的 TLB
-    let mut flush_va = vaddr & !(Riscv64Paging::PAGE_SIZE - 1);
-    while flush_va < end {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(inner.asid(), Some(VirtAddr::new(flush_va))) };
-        flush_va += Riscv64Paging::PAGE_SIZE;
-    }
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn clone_for_fork_user_pages(
@@ -254,13 +295,11 @@ unsafe fn clone_for_fork_user_pages(
         let page_size = Riscv64Paging::leaf_page_size(level)
             .expect("[arch][mm] clone_for_fork_user_pages: unsupported leaf level");
         let src_paddr = Riscv64Paging::pte_addr(src_pte) + (va & (page_size - 1));
-        let request = allocator::PhysicalAllocRequest::new(allocator::PAGE_SIZE, allocator::PAGE_SIZE);
+        let request =
+            allocator::PhysicalAllocRequest::new(allocator::PAGE_SIZE, allocator::PAGE_SIZE);
         let new_alloc = match allocator::KERNEL_ALLOCATOR.allocate_physical(request) {
             Ok(a) => a,
-            Err(_) => {
-                va += Riscv64Paging::PAGE_SIZE;
-                continue;
-            }
+            Err(_) => panic!("[arch][mm] clone_for_fork_user_pages: OOM"),
         };
         let new_paddr = new_alloc.paddr;
         unsafe {
@@ -271,7 +310,7 @@ unsafe fn clone_for_fork_user_pages(
             );
         }
         let f = Riscv64Paging::pte_flags(src_pte);
-        let _ = walk_and_map::<Riscv64Paging>(
+        if let Err(err) = walk_and_map::<Riscv64Paging>(
             dst_inner.pgd_virt(),
             va,
             new_paddr,
@@ -283,7 +322,13 @@ unsafe fn clone_for_fork_user_pages(
             Riscv64Paging::flags_global(f),
             phys_to_virt,
             allocate_page_table_page,
-        );
+        ) {
+            let _ = allocator::KERNEL_ALLOCATOR.try_free_physical(new_alloc);
+            panic!(
+                "[arch][mm] clone_for_fork_user_pages: dst map failed: {:?}",
+                err
+            );
+        }
         va += Riscv64Paging::PAGE_SIZE;
     }
 }
@@ -304,12 +349,7 @@ fn get_asid(pgd: PgdHandle) -> usize {
 
 unsafe fn invalidate_range(pgd: PgdHandle, vaddr: usize, len: usize) {
     let inner = unsafe { inner_ref(pgd) };
-    let mut va = vaddr & !(Riscv64Paging::PAGE_SIZE - 1);
-    let end = vaddr.saturating_add(len);
-    while va < end {
-        unsafe { Riscv64Paging::flush_tlb_with_asid(inner.asid(), Some(VirtAddr::new(va))); }
-        va += Riscv64Paging::PAGE_SIZE;
-    }
+    flush_user_tlb_range(inner.asid(), vaddr, len);
 }
 
 unsafe fn count_mapped_pages(pgd: PgdHandle, vaddr: usize, len: usize) -> usize {

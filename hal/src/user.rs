@@ -192,8 +192,7 @@ pub fn register_tty_poll_hook(hook: fn(u64)) {
 
     #[cfg(target_arch = "riscv64")]
     {
-        let _ = hook;
-        todo!("riscv64 HAL tty poll hook is not implemented")
+        arch::riscv64::vdso::register_tty_poll_hook(hook);
     }
 }
 
@@ -214,13 +213,10 @@ pub fn decode_clone_register_args(args: [usize; 6]) -> CloneRegisterArgs {
             flags: args[0] as u64,
             stack: args[1],
             parent_tid: args[2],
-            // LoongArch64 传统 clone syscall 使用 asm-generic 新架构顺序：
-            // flags, stack, parent_tidptr, tls, child_tidptr。pthread_create()
-            // 会同时传 CLONE_SETTLS 与 CLONE_CHILD_CLEARTID，若把 tls 和
-            // child_tidptr 反解，会导致新线程 TLS 错乱，glibc 线程创建路径
-            // 可能在后续调度属性设置阶段以 EINVAL 失败。
-            tls: args[3],
-            child_tid: args[4],
+            // musl LoongArch64 clone.s 调用内核的 old clone ABI：
+            // flags, stack, parent_tidptr, child_tidptr, tls。
+            child_tid: args[3],
+            tls: args[4],
         }
     }
 
@@ -254,8 +250,7 @@ pub fn patch_interpreter_image(interp: &str, bytes: &mut [u8]) {
 /// RISC-V 专用；LoongArch 上为空操作。
 pub unsafe fn enable_sum() {
     #[cfg(target_arch = "loongarch64")]
-    {
-    }
+    {}
 
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -316,11 +311,10 @@ unsafe fn riscv64_enter_user_mode(
 ) -> ! {
     use general::{TaskOps, TrapFramePtr};
 
-    <arch::Riscv64TaskOps as TaskOps>::set_kernel_trap_stack(kernel_stack_top);
-
     let mut frame = arch::TrapFrame::default();
     let frame_ptr = TrapFramePtr::new(&mut frame as *mut _ as usize);
     <arch::Riscv64TaskOps as TaskOps>::init_user_trap_frame(frame_ptr, entry_pc, user_sp, arg0);
+    frame.kstack_top = kernel_stack_top;
 
     unsafe { <arch::Riscv64TaskOps as TaskOps>::resume_to_trap_frame(frame_ptr) }
 }

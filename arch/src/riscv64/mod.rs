@@ -16,33 +16,34 @@
 pub mod csr;
 
 pub mod boot;
-pub mod loader;
-pub(crate) mod efi_stub; // RISC-V 不走 UEFI，仅提供 panic stub
+pub(crate) mod efi_stub;
+pub mod loader; // RISC-V 不走 UEFI，仅提供 panic stub
 
 // ── 异常与中断 ────────────────────────────────────────────────────────────────
 
+pub mod syscall;
 pub mod trap;
 pub mod trap_frame;
-pub mod syscall;
 
 // ── 内存管理 ──────────────────────────────────────────────────────────────────
 
 pub mod addr;
+pub mod heap_vm;
 pub mod mm;
 pub mod paging;
-pub mod heap_vm;
 
 // ── 任务 ──────────────────────────────────────────────────────────────────────
 
-pub mod task;
 pub mod sched_ctx;
+pub mod task;
 
 // ── 平台服务 ──────────────────────────────────────────────────────────────────
 
-pub mod time;
-pub mod vdso;
 pub mod early_console;
 pub mod specific;
+pub mod time;
+pub mod vdso;
+pub mod vector;
 
 // ── 辅助 ──────────────────────────────────────────────────────────────────────
 
@@ -54,8 +55,8 @@ mod random_source;
 // `specific` 聚合了 csr / trap_frame / addr / time 的全量符号并追加别名常量，
 // 通过 glob re-export 让上层可以 `use crate::riscv64::*` 统一引用 arch 符号。
 
-pub use specific::*;
+pub use mm::user_copy::set_sum;
 pub use random_source::register as register_entropy_source;
 pub use sched_ctx::register as register_sched_ctx;
+pub use specific::*;
 pub use task::Riscv64TaskOps;
-pub use mm::user_copy::set_sum;

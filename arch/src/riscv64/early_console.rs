@@ -36,11 +36,11 @@ const LCR: usize = 3; // Line Control Register
 const MCR: usize = 4; // Modem Control Register
 const LSR: usize = 5; // Line Status Register
 
-const LSR_THRE: u8 = 1 << 5;        // TX holding register empty
-const LCR_DLAB: u8 = 1 << 7;        // Divisor Latch Access Bit
-const LCR_8N1: u8 = 0x03;           // 8 data bits, no parity, 1 stop
-const FCR_ENABLE_CLEAR: u8 = 0x07;  // FIFO enable + clear RX/TX
-const MCR_DTR_RTS: u8 = 0x03;       // DTR + RTS asserted
+const LSR_THRE: u8 = 1 << 5; // TX holding register empty
+const LCR_DLAB: u8 = 1 << 7; // Divisor Latch Access Bit
+const LCR_8N1: u8 = 0x03; // 8 data bits, no parity, 1 stop
+const FCR_ENABLE_CLEAR: u8 = 0x07; // FIFO enable + clear RX/TX
+const MCR_DTR_RTS: u8 = 0x03; // DTR + RTS asserted
 
 // 波特率 115200 @ 1.8432 MHz 参考时钟（QEMU 不关心实际值）
 const DLL: u8 = 1;
@@ -103,15 +103,16 @@ fn write_bytes(bytes: &[u8]) {
     unsafe {
         if !INITED.load(Ordering::Acquire) {
             // 防重入：如果已经在初始化中（被中断嵌套调用），跳过初始化直接输出
-            if INITIALIZING.compare_exchange(
-                false, true, Ordering::Acquire, Ordering::Relaxed
-            ).is_ok() {
+            if INITIALIZING
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 // 16550 标准初始化序列
-                reg(base, IER).write_volatile(0x00);       // 关闭所有中断
-                reg(base, LCR).write_volatile(LCR_DLAB);   // 开 DLAB 设波特率
-                reg(base, THR).write_volatile(DLL);        // Divisor Latch Low
-                reg(base, IER).write_volatile(DLM);        // Divisor Latch High
-                reg(base, LCR).write_volatile(LCR_8N1);    // 8N1, 关 DLAB
+                reg(base, IER).write_volatile(0x00); // 关闭所有中断
+                reg(base, LCR).write_volatile(LCR_DLAB); // 开 DLAB 设波特率
+                reg(base, THR).write_volatile(DLL); // Divisor Latch Low
+                reg(base, IER).write_volatile(DLM); // Divisor Latch High
+                reg(base, LCR).write_volatile(LCR_8N1); // 8N1, 关 DLAB
                 reg(base, FCR).write_volatile(FCR_ENABLE_CLEAR); // 使能并清空 FIFO
                 reg(base, MCR).write_volatile(MCR_DTR_RTS); // 拉高 DTR/RTS
                 INITED.store(true, Ordering::Release);

@@ -336,6 +336,25 @@ impl Dentry {
         self.inode.as_ref().map(Arc::clone)
     }
 
+    /// 该 Dentry 是否可以从缓存中安全驱逐。
+    ///
+    /// 对没有持久化后端的文件系统（tmpfs / ramfs / devtmpfs），驱逐 positive
+    /// Dentry 等同于删除文件——Superblock 的 inode_cache 持有的是 Weak 引用，
+    /// Dentry 是 Inode 的唯一强引用持有者。一旦驱逐，inode 被 drop，文件数据
+    /// 永久丢失。
+    pub fn is_evictable(&self) -> bool {
+        if self.state_flag.load(Ordering::Acquire) != STATE_POSITIVE {
+            return true;
+        }
+        let Some(inode) = self.inode.as_ref() else {
+            return true;
+        };
+        let Some(sb) = inode.superblock() else {
+            return true;
+        };
+        sb.dev_id.is_some()
+    }
+
     /// 将 Dentry 标记为失效（文件被删除时调用）。
     ///
     /// 不清除 `inode` 字段（它是不可变的），只修改状态标志。
@@ -701,7 +720,7 @@ impl DentryShard {
 
     fn evict_one_any(&mut self) -> Option<Arc<Dentry>> {
         self.evict_one_non_positive()
-            .or_else(|| self.evict_from_cursor(|_| true))
+            .or_else(|| self.evict_from_cursor(|d| d.is_evictable()))
     }
 
     /// 扩容：容量翻倍（空表时初始化为 INITIAL_CAPACITY），重新哈希所有条目。

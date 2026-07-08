@@ -415,6 +415,11 @@ pub struct Task {
     wait_stop_sig: AtomicI32,
     wait_stop_pending: AtomicU8,
     wait_continue_pending: AtomicU8,
+    root_pid_cache: AtomicI32,
+    tgid_cache: AtomicI32,
+    /// ptrace 的最小状态位。当前只区分任务是否处于 traced 模式，用于把
+    /// 信号投递转换成父进程可 wait 的 signal-delivery-stop。
+    ptrace_traced: AtomicU8,
     pub exit_waiters: WaitQueue,
     rel: Spinlock<Relations>,
     kstack: Spinlock<Option<KernelStack>>,
@@ -503,6 +508,9 @@ impl Task {
             wait_stop_sig: AtomicI32::new(0),
             wait_stop_pending: AtomicU8::new(0),
             wait_continue_pending: AtomicU8::new(0),
+            root_pid_cache: AtomicI32::new(crate::pid::PID_INVALID),
+            tgid_cache: AtomicI32::new(crate::pid::PID_INVALID),
+            ptrace_traced: AtomicU8::new(0),
             exit_waiters: WaitQueue::new(),
             rel: Spinlock::new(Relations {
                 parent,
@@ -581,6 +589,20 @@ impl Task {
         self.state
             .compare_exchange(expect as u8, new as u8, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    pub fn enable_ptrace_traced(&self) -> bool {
+        self.ptrace_traced
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn clear_ptrace_traced(&self) {
+        self.ptrace_traced.store(0, Ordering::Release);
+    }
+
+    pub fn is_ptrace_traced(&self) -> bool {
+        self.ptrace_traced.load(Ordering::Acquire) != 0
     }
 
     pub fn parent(&self) -> Option<Arc<Task>> {
@@ -778,14 +800,22 @@ impl Task {
     where
         F: FnMut(&Arc<Task>) -> bool,
     {
-        let mut rel = self.rel.lock();
-        let pos = rel
-            .children
-            .iter()
-            .position(|c| c.state() == TaskState::Zombie && pred(c))?;
-        let zombie = rel.children.swap_remove(pos);
-        zombie.set_state(TaskState::Dead);
-        Some(zombie)
+        loop {
+            let candidate = self
+                .snapshot_children()
+                .into_iter()
+                .find(|c| c.state() == TaskState::Zombie && pred(c))?;
+            let mut rel = self.rel.lock();
+            let Some(pos) = rel.children.iter().position(|c| Arc::ptr_eq(c, &candidate)) else {
+                continue;
+            };
+            if rel.children[pos].state() != TaskState::Zombie {
+                continue;
+            }
+            let zombie = rel.children.swap_remove(pos);
+            zombie.set_state(TaskState::Dead);
+            return Some(zombie);
+        }
     }
 
     /// 列出当前直接子任务的强引用快照；释放锁后再消费，避免持锁回调。
@@ -914,6 +944,9 @@ impl Task {
             "[sched][pid] task already registered in namespace"
         );
         rel.pid_in_ns.push((ns, pid));
+        if rel.pid_in_ns.len() == 1 {
+            self.root_pid_cache.store(pid, Ordering::Release);
+        }
     }
 
     /// 在指定 ns 中查询任务的 pid。从外向内顺序匹配。
@@ -933,6 +966,31 @@ impl Task {
     /// 任务在根 ns 中的 pid（对应 Linux `task->pid`）。
     pub fn pid_root(&self) -> Option<PidT> {
         self.rel.lock().pid_in_ns.first().map(|(_, pid)| *pid)
+    }
+
+    /// 任务在根 ns 中的 pid 快照。热路径使用，避免只读查询进入亲缘锁。
+    pub fn pid_root_cached(&self) -> Option<PidT> {
+        let pid = self.root_pid_cache.load(Ordering::Acquire);
+        if pid > crate::pid::PID_INVALID {
+            Some(pid)
+        } else {
+            None
+        }
+    }
+
+    pub fn set_tgid_cache(&self, pid: PidT) {
+        if pid > crate::pid::PID_INVALID {
+            self.tgid_cache.store(pid, Ordering::Release);
+        }
+    }
+
+    pub fn tgid_cached(&self) -> Option<PidT> {
+        let pid = self.tgid_cache.load(Ordering::Acquire);
+        if pid > crate::pid::PID_INVALID {
+            Some(pid)
+        } else {
+            None
+        }
     }
 
     /// 取出所有 (ns, pid) 登记副本，便于 exit 时反向调用 `release`。
@@ -957,6 +1015,10 @@ impl Task {
     /// 取本任务当前的 SharedSignal（thread-group 共享部分）。
     pub fn shared_signal(&self) -> Arc<SharedSignal> {
         Arc::clone(&self.shared_signal.lock())
+    }
+
+    pub fn shared_signal_pending_bits_quick(&self) -> u64 {
+        self.shared_signal.lock().pending_snapshot().raw()
     }
 
     /// 替换 SharedSignal —— 仅供 spawn 时根据 CLONE_SIGHAND 设定使用。
@@ -1180,6 +1242,10 @@ pub const TASKEXT_VFS_FDTABLE: TaskExtKey = 0x0001_0001;
 pub const TASKEXT_VM_SPACE: TaskExtKey = 0x0001_0002;
 /// 已保存的用户 trap frame（kernel/hal 通过此键挂在 Task 的 ext 表上）。
 pub const TASKEXT_USER_TRAP_FRAME: TaskExtKey = 0x0001_0003;
+/// RISC-V64 用户态 Vector 上下文（arch 专用，按线程独立保存）。
+pub const TASKEXT_RISCV_VECTOR_STATE: TaskExtKey = 0x0001_0004;
+/// RISC-V64 信号投递期间暂存的 Vector 上下文栈。
+pub const TASKEXT_RISCV_VECTOR_SIGNAL_STACK: TaskExtKey = 0x0001_0005;
 /// 当前任务的可执行路径（kernel execve 安装，procfs `/proc/self/exe` 读取）。
 pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 /// 当前任务的 argv 快照（kernel execve 安装，procfs `/proc/[pid]/cmdline` 读取）。
@@ -1219,7 +1285,11 @@ impl HotTaskExt {
             return false;
         };
         let mut guard = slot.lock();
-        debug_assert!(guard.is_none(), "[sched][ext] key 0x{:x} already installed", key);
+        debug_assert!(
+            guard.is_none(),
+            "[sched][ext] key 0x{:x} already installed",
+            key
+        );
         *guard = Some(Arc::clone(payload));
         true
     }

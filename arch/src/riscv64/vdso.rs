@@ -14,7 +14,6 @@ use core::arch::global_asm;
 use core::mem::size_of;
 use core::ptr::addr_of;
 use core::slice;
-use core::sync::atomic::AtomicUsize;
 
 global_asm!(include_str!("vdso_text.S"));
 
@@ -57,6 +56,7 @@ type TickHookFn = fn(u64);
 
 static TIMER_TICK_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static NET_POLL_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static TTY_POLL_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 pub fn sigreturn_entry_offset() -> usize {
     symbol_offset(addr_of!(__mygo_rv64_vdso_rt_sigreturn))
@@ -80,6 +80,18 @@ pub fn register_net_poll_hook(hook: fn(u64)) {
 
 pub fn run_net_poll_hook(now_ns: u64) {
     let raw = NET_POLL_HOOK.load(Ordering::Acquire);
+    if !raw.is_null() {
+        let hook: TickHookFn = unsafe { core::mem::transmute::<*mut (), TickHookFn>(raw) };
+        hook(now_ns);
+    }
+}
+
+pub fn register_tty_poll_hook(hook: fn(u64)) {
+    TTY_POLL_HOOK.store(hook as *mut (), Ordering::Release);
+}
+
+pub fn run_tty_poll_hook(now_ns: u64) {
+    let raw = TTY_POLL_HOOK.load(Ordering::Acquire);
     if !raw.is_null() {
         let hook: TickHookFn = unsafe { core::mem::transmute::<*mut (), TickHookFn>(raw) };
         hook(now_ns);
@@ -220,12 +232,23 @@ fn build_hash(b: &mut [u8]) {
 
 fn build_dynamic(b: &mut [u8]) {
     let mut off = DYNAMIC_OFF;
-    w64(b, off, 6); w64(b, off + 8, DYNSYM_OFF as u64); off += 16;
-    w64(b, off, 5); w64(b, off + 8, DYNSTR_OFF as u64); off += 16;
-    w64(b, off, 10); w64(b, off + 8, dynstr_total_len() as u64); off += 16;
-    w64(b, off, 4); w64(b, off + 8, HASH_OFF as u64); off += 16;
-    w64(b, off, 11); w64(b, off + 8, 24); off += 16;
-    w64(b, off, 0); w64(b, off + 8, 0);
+    w64(b, off, 6);
+    w64(b, off + 8, DYNSYM_OFF as u64);
+    off += 16;
+    w64(b, off, 5);
+    w64(b, off + 8, DYNSTR_OFF as u64);
+    off += 16;
+    w64(b, off, 10);
+    w64(b, off + 8, dynstr_total_len() as u64);
+    off += 16;
+    w64(b, off, 4);
+    w64(b, off + 8, HASH_OFF as u64);
+    off += 16;
+    w64(b, off, 11);
+    w64(b, off + 8, 24);
+    off += 16;
+    w64(b, off, 0);
+    w64(b, off + 8, 0);
 }
 
 fn build_text(b: &mut [u8]) {
@@ -271,7 +294,9 @@ fn elf_hash(name: &[u8]) -> u32 {
     for &c in name {
         h = (h << 4).wrapping_add(c as u32);
         let g = h & 0xF000_0000;
-        if g != 0 { h ^= g >> 24; }
+        if g != 0 {
+            h ^= g >> 24;
+        }
         h &= !g;
     }
     h

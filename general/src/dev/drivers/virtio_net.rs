@@ -4,6 +4,7 @@
 //! 使用两个 virtqueue（RX queue 0 + TX queue 1）实现以太网帧收发。
 //! 实现 `net::NetDriver` trait，可直接接入 smoltcp 协议栈。
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -134,6 +135,7 @@ struct VirtioNetInner {
     rx_queue: VirtioNetQueue,
     tx_queue: VirtioNetQueue,
     rx_buffers: Vec<DmaBuffer>,
+    tx_buffers: Vec<DmaBuffer>,
     tx_free_descs: VecDeque<u16>,
     /// TX 描述符号到在途 DMA 缓冲区的直接映射。
     ///
@@ -346,12 +348,13 @@ impl VirtioNetPci {
         transport.notify_queue(rx_queue.notify_addr, RX_QUEUE);
 
         // TX 队列的空闲描述符池。
-        let mut tx_free_descs = VecDeque::with_capacity(tx_queue.queue_size as usize);
+        let tx_queue_size = tx_queue.queue_size;
+        let mut tx_free_descs = VecDeque::with_capacity(tx_queue_size as usize);
         for i in (0..tx_queue.queue_size).rev() {
             tx_free_descs.push_back(i);
         }
-        let mut pending_tx = Vec::with_capacity(tx_queue.queue_size as usize);
-        pending_tx.resize_with(tx_queue.queue_size as usize, || None);
+        let mut pending_tx = Vec::with_capacity(tx_queue_size as usize);
+        pending_tx.resize_with(tx_queue_size as usize, || None);
 
         // 完成设备初始化握手。
         transport.add_status(VIRTIO_STATUS_DRIVER_OK);
@@ -374,6 +377,7 @@ impl VirtioNetPci {
                 rx_queue,
                 tx_queue,
                 rx_buffers,
+                tx_buffers: Vec::with_capacity(tx_queue_size as usize),
                 tx_free_descs,
                 pending_tx,
             }),
@@ -435,7 +439,7 @@ impl net::NetDriver for VirtioNetPci {
     }
 
     fn alloc_tx(&self, len: usize) -> Option<net::TxBuf> {
-        if len > ETHERNET_MAX_FRAME_LEN {
+        if len > ETHERNET_MAX_FRAME_LEN - VIRTIO_NET_HDR_SIZE {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -445,63 +449,58 @@ impl net::NetDriver for VirtioNetPci {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let buf = alloc::vec![0u8; len].into_boxed_slice();
-        Some(net::TxBuf::new(buf))
+        let dma = inner.tx_buffers.pop().or_else(|| {
+            DmaBuffer::page_in(inner.tx_queue.dma_context, DmaDirection::ToDevice).ok()
+        })?;
+        Some(net::TxBuf::new_dma(Box::new(dma), VIRTIO_NET_HDR_SIZE))
     }
 
     fn commit_tx(&self, buf: net::TxBuf) {
+        let (backend, data_offset, data_len) = buf.into_dma();
+        let total_len = data_offset + data_len;
+
+        // 从 Box<dyn DmaBackend> 恢复 DmaBuffer
+        let dma = match backend.into_any().downcast::<DmaBuffer>() {
+            Ok(d) => *d,
+            Err(_) => {
+                self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
         let mut inner = self.inner.lock();
         self.reclaim_tx(&mut inner);
         let transport = inner.transport;
+
         let Some(desc_idx) = inner.tx_free_descs.pop_front() else {
             self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
 
-        // 分配 DMA buffer 并写入 virtio_net_hdr + frame
-        let frame_data = buf.as_slice();
-        let total_len = VIRTIO_NET_HDR_SIZE + frame_data.len();
-        let tx_buf = match DmaBuffer::page_in(inner.tx_queue.dma_context, DmaDirection::ToDevice) {
-            Ok(a) => a,
-            Err(_) => {
-                inner.tx_free_descs.push_front(desc_idx);
-                self.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
-        let tx_vaddr = tx_buf.vaddr();
+        // 写入 VirtIO header
         unsafe {
-            // 写入默认 virtio-net header；所有 offload 功能未协商时字段必须为 0。
-            debug_assert_eq!(core::mem::size_of::<VirtioNetHdr>(), VIRTIO_NET_HDR_SIZE);
             let hdr = VirtioNetHdr::default();
             core::ptr::copy_nonoverlapping(
                 (&hdr as *const VirtioNetHdr).cast::<u8>(),
-                tx_vaddr as *mut u8,
+                dma.vaddr() as *mut u8,
                 VIRTIO_NET_HDR_SIZE,
             );
-            // 拷贝帧数据
-            core::ptr::copy_nonoverlapping(
-                frame_data.as_ptr(),
-                (tx_vaddr + VIRTIO_NET_HDR_SIZE) as *mut u8,
-                frame_data.len(),
-            );
         }
-        tx_buf.sync_for_device();
+        dma.sync_for_device();
 
+        // 构建描述符
         let tq = &mut inner.tx_queue;
-        let tx_dma = tx_buf.dma_addr() as u64;
-
-        // 写入设备可读的 TX 描述符。
+        let tx_dma = dma.dma_addr() as u64;
         unsafe {
             let desc = &mut *tq.desc_table.add(desc_idx as usize);
             desc.addr = tx_dma;
             desc.len = total_len as u32;
-            desc.flags = 0; // 设备只读。
+            desc.flags = 0;
             desc.next = 0;
         }
         tq.desc_dma.sync_for_device();
 
-        // 添加到 available ring。
+        // 添加到 available ring
         unsafe {
             let avail = &mut *tq.avail_ring;
             let avail_idx = avail.idx;
@@ -512,15 +511,15 @@ impl net::NetDriver for VirtioNetPci {
         tq.avail_dma.sync_for_device();
         let notify_addr = tq.notify_addr;
 
-        // 延迟回收：先登记 pending，再通知设备，避免设备快速完成时 used ring
-        // 先于 pending_tx 可见。描述符来自空闲池,这里的槽位按协议应为空。
+        // 登记 pending
         let pending_slot = &mut inner.pending_tx[desc_idx as usize];
         debug_assert!(pending_slot.is_none());
-        *pending_slot = Some(tx_buf);
+        *pending_slot = Some(dma);
+
         self.stats.tx_packets.fetch_add(1, Ordering::Relaxed);
         self.stats
             .tx_bytes
-            .fetch_add(frame_data.len() as u64, Ordering::Relaxed);
+            .fetch_add(data_len as u64, Ordering::Relaxed);
         transport.notify_queue(notify_addr, TX_QUEUE);
     }
 
@@ -580,6 +579,7 @@ impl VirtioNetPci {
     }
 
     fn reclaim_tx(&self, inner: &mut VirtioNetInner) {
+        let tx_queue_size = inner.tx_queue.queue_size as usize;
         let tq = &mut inner.tx_queue;
         loop {
             tq.used_dma.sync_for_cpu();
@@ -596,10 +596,13 @@ impl VirtioNetPci {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            // used ring 给出的 head id 直接索引 pending 表；take 后 DMA buffer drop,
-            // 再把描述符归还空闲池,避免同一描述符被重复提交时保留旧缓冲区。
-            if inner.pending_tx[desc_idx as usize].take().is_some() {
+            // used ring 给出的 head id 直接索引 pending 表；取出 DMA 缓冲区
+            // 优先回收到 tx_buffers 池复用，避免频繁分配/释放 DMA 页。
+            if let Some(dma) = inner.pending_tx[desc_idx as usize].take() {
                 inner.tx_free_descs.push_back(desc_idx);
+                if inner.tx_buffers.len() < tx_queue_size {
+                    inner.tx_buffers.push(dma);
+                }
             } else {
                 self.stats.tx_errors.fetch_add(1, Ordering::Relaxed);
             }
