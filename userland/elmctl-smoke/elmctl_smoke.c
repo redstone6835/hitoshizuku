@@ -35,6 +35,7 @@
 #define ELM_MGR_CALL_QUERY_EVENT_SUBSCRIPTIONS 33u
 #define ELM_MGR_CALL_READ_SUBSCRIBED_EVENTS 34u
 #define ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT 35u
+#define ELM_MGR_CALL_QUERY_TODO_REGISTRY 37u
 #define ELM_MGR_MAX_INPUT (4096u + 16u)
 
 #define ELM_MGR_BUILTIN_ID 1ull
@@ -44,10 +45,12 @@
 #define ELM_MGR_ACTION_API_QUERY (1u << 15)
 #define ELM_MGR_ACTION_EVENT_SUBSCRIBE (1u << 16)
 #define ELM_MGR_ACTION_EVENT_READ (1u << 18)
+#define ELM_MGR_ACTION_TODO_QUERY (1u << 20)
 #define ELM_MGR_POLICY_HEALTH (1ull << 8)
 #define ELM_MGR_POLICY_PROVIDER_ASYNC (1ull << 9)
 #define ELM_MGR_POLICY_API_REGISTRY (1ull << 10)
 #define ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS (1ull << 11)
+#define ELM_MGR_POLICY_TODO_REGISTRY (1ull << 13)
 #define ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED (1ull << 23)
 
 #define ELM_MGR_API_NAMESPACE_LEN 32u
@@ -60,6 +63,11 @@
 #define ELM_MENU_DESCRIPTION_LEN 128u
 #define ELM_MENU_ROUTE_LEN 64u
 #define ELM_FRAME_PAYLOAD_LEN 256u
+#define ELM_TODO_REGISTRY_FLAG_TRUNCATED (1u << 0)
+#define ELM_TODO_FLAG_STATIC (1u << 0)
+#define ELM_TODO_FLAG_ACTIVE (1u << 1)
+#define ELM_TODO_NAME_LEN 64u
+#define ELM_TODO_DETAIL_LEN 128u
 
 #define ELM_ACTION_OPCODE_INVOKE 1u
 #define ELM_ACTION_RESULT_HEALTH 1u
@@ -450,6 +458,28 @@ struct elm_mgr_subscribed_event_read_header {
     uint64_t dropped_events;
 };
 
+struct elm_todo_registry_header {
+    uint16_t abi_version;
+    uint16_t record_entry_size;
+    uint32_t record_count;
+    uint32_t active_count;
+    uint32_t flags;
+    uint64_t event_sequence;
+};
+
+struct elm_todo_registry_record {
+    uint32_t kind;
+    uint32_t flags;
+    uint64_t blocker;
+    uint64_t subject_id;
+    int32_t status;
+    uint16_t name_len;
+    uint16_t detail_len;
+    uint32_t reserved;
+    uint8_t name[ELM_TODO_NAME_LEN];
+    uint8_t detail[ELM_TODO_DETAIL_LEN];
+};
+
 _Static_assert(sizeof(struct elm_mgr_call_header) == 16, "bad mgr call header size");
 _Static_assert(sizeof(struct elm_mgr_response_header) == 16, "bad mgr response header size");
 _Static_assert(sizeof(struct elm_core_info) == 40, "bad core info size");
@@ -485,6 +515,8 @@ _Static_assert(sizeof(struct elm_mgr_event_subscription_header) == 16, "bad even
 _Static_assert(sizeof(struct elm_mgr_event_subscription_record) == 88, "bad event subscription record size");
 _Static_assert(sizeof(struct elm_mgr_subscribed_event_read_request) == 24, "bad subscribed event read request size");
 _Static_assert(sizeof(struct elm_mgr_subscribed_event_read_header) == 48, "bad subscribed event read header size");
+_Static_assert(sizeof(struct elm_todo_registry_header) == 24, "bad todo registry header size");
+_Static_assert(sizeof(struct elm_todo_registry_record) == 232, "bad todo registry record size");
 
 static int fail_msg(const char *step, const char *msg)
 {
@@ -647,13 +679,15 @@ static int run_policy_query(uint8_t *out, size_t out_len)
         (policy.supported_actions & ELM_MGR_ACTION_HEALTH_QUERY) == 0 ||
         (policy.supported_actions & ELM_MGR_ACTION_API_QUERY) == 0 ||
         (policy.supported_actions & ELM_MGR_ACTION_EVENT_SUBSCRIBE) == 0 ||
-        (policy.supported_actions & ELM_MGR_ACTION_EVENT_READ) == 0) {
+        (policy.supported_actions & ELM_MGR_ACTION_EVENT_READ) == 0 ||
+        (policy.supported_actions & ELM_MGR_ACTION_TODO_QUERY) == 0) {
         return fail_msg("policy-query", "missing supported action");
     }
     if ((policy.policy_flags & ELM_MGR_POLICY_HEALTH) == 0 ||
         (policy.policy_flags & ELM_MGR_POLICY_PROVIDER_ASYNC) == 0 ||
         (policy.policy_flags & ELM_MGR_POLICY_API_REGISTRY) == 0 ||
-        (policy.policy_flags & ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS) == 0) {
+        (policy.policy_flags & ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS) == 0 ||
+        (policy.policy_flags & ELM_MGR_POLICY_TODO_REGISTRY) == 0) {
         return fail_msg("policy-query", "missing policy flag");
     }
     if ((policy.blocker_mask & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED) == 0) {
@@ -715,11 +749,49 @@ static int run_health_query(uint8_t *out, size_t out_len)
     }
     memcpy(&header, payload, sizeof(header));
     if (header.abi_version != ELM_CTL_ABI_VERSION || header.status != ELM_MGR_STATUS_OK ||
-        header.record_count < 9) {
+        header.record_count < 11) {
         return fail_msg("health-query", "core is not healthy");
     }
     printf("[elm-smoke] health query ok: checks=%u event=%llu\n", header.record_count,
            (unsigned long long)header.event_sequence);
+    return 0;
+}
+
+static int run_todo_registry_query(uint8_t *out, size_t out_len)
+{
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    struct elm_todo_registry_header header;
+    int saw_static = 0;
+
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_TODO_REGISTRY, NULL, 0, out, out_len,
+                            &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len < sizeof(header)) {
+        return fail_msg("todo-registry", "short payload");
+    }
+    memcpy(&header, payload, sizeof(header));
+    if (header.abi_version != ELM_CTL_ABI_VERSION ||
+        header.record_entry_size != sizeof(struct elm_todo_registry_record) ||
+        header.record_count < 8 || header.active_count < 8 ||
+        payload_len != sizeof(header) + header.record_count * header.record_entry_size) {
+        return fail_msg("todo-registry", "bad registry");
+    }
+    for (uint32_t i = 0; i < header.record_count; i++) {
+        size_t off = sizeof(header) + (size_t)i * header.record_entry_size;
+        struct elm_todo_registry_record record;
+        memcpy(&record, payload + off, sizeof(record));
+        if ((record.flags & ELM_TODO_FLAG_STATIC) != 0 &&
+            (record.flags & ELM_TODO_FLAG_ACTIVE) != 0) {
+            saw_static = 1;
+        }
+    }
+    if (!saw_static) {
+        return fail_msg("todo-registry", "missing static todo record");
+    }
+    printf("[elm-smoke] todo registry ok: records=%u active=%u flags=0x%x\n",
+           header.record_count, header.active_count, header.flags);
     return 0;
 }
 
@@ -1393,6 +1465,9 @@ int main(void)
         return 1;
     }
     if (run_health_query(out, sizeof(out)) != 0) {
+        return 1;
+    }
+    if (run_todo_registry_query(out, sizeof(out)) != 0) {
         return 1;
     }
     if (run_bind_action_provider(out, sizeof(out), &binding_id) != 0) {

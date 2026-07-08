@@ -279,6 +279,43 @@ impl BindingGraph {
         })
     }
 
+    pub fn remove_cell_relations(&mut self, id: ElmId) -> ElmResult<GraphRemovalReport> {
+        self.require_cell(id)?;
+
+        let before_dependencies = self.dependencies.len();
+        self.dependencies
+            .retain(|edge| edge.consumer != id && edge.provider != id);
+        let dependency_edges = before_dependencies - self.dependencies.len();
+
+        let before_extensions = self.extensions.len();
+        self.extensions
+            .retain(|edge| edge.extension != id && edge.target != id);
+        let extension_edges = before_extensions - self.extensions.len();
+
+        let before_bindings = self.capability_bindings.len();
+        self.capability_bindings.retain(|edge| edge.consumer != id);
+        let capability_bindings = before_bindings - self.capability_bindings.len();
+
+        let extension_points: Vec<_> = self
+            .extension_points
+            .keys()
+            .filter(|(owner, _)| *owner == id)
+            .cloned()
+            .collect();
+        let extension_point_count = extension_points.len();
+        for key in extension_points {
+            self.extension_points.remove(&key);
+        }
+
+        Ok(GraphRemovalReport {
+            parent_edges: 0,
+            dependency_edges,
+            extension_edges,
+            extension_points: extension_point_count,
+            capability_bindings,
+        })
+    }
+
     pub fn parent(&self, child: ElmId) -> Option<ElmId> {
         self.parents.get(&child).copied()
     }
@@ -377,6 +414,15 @@ impl BindingGraph {
                 }
             })
             .collect()
+    }
+
+    pub fn capability_bindings_mut_for_cell(
+        &mut self,
+        consumer: ElmId,
+    ) -> impl Iterator<Item = &mut CapabilityBindingEdge> {
+        self.capability_bindings
+            .iter_mut()
+            .filter(move |edge| edge.consumer == consumer)
     }
 
     pub fn remove_capability_binding(&mut self, id: BindingId) -> ElmResult<CapabilityBindingEdge> {

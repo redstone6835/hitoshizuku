@@ -155,6 +155,10 @@ impl LeaseRegistry {
         self.leases.values()
     }
 
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ResourceLease> {
+        self.leases.values_mut()
+    }
+
     pub fn busy_owned_by(&self, owner: ElmId) -> usize {
         self.leases
             .values()

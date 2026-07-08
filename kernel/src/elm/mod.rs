@@ -9,6 +9,7 @@ mod event;
 mod executor;
 mod menu;
 mod mgr_channel;
+mod native;
 mod ports;
 mod snapshot;
 mod subsystems;

@@ -1,6 +1,6 @@
 //! EBI 二进制装载接口协议。
 //!
-//! EBI 不是文件格式。EKI、未来的 soyo profile、启动期内建对象或测试内存对象
+//! EBI 不是文件格式。EKI、未来的投影产物、启动期内建对象或测试内存对象
 //! 都可以作为 EBI Source 产出这里定义的协议对象；ELM Core 只消费这些对象，
 //! 不理解任何具体镜像或容器布局。
 
@@ -24,6 +24,8 @@ pub const ELM_EBI_MAX_EXTENSIONS: usize = 16;
 pub const ELM_EBI_MAX_PROVIDER_PORTS: usize = 16;
 pub const ELM_EBI_MAX_IMPORTS: usize = 64;
 pub const ELM_EBI_MAX_EXPORTS: usize = 64;
+pub const ELM_EBI_MAX_SYMBOL_LOCATIONS: usize = 128;
+pub const ELM_EBI_MAX_RELOCATIONS: usize = 512;
 pub const ELM_EBI_NAME_LEN: usize = 128;
 pub const ELM_EBI_SYMBOL_NAME_LEN: usize = 128;
 pub const ELM_EBI_SOURCE_FLAG_NONE: u32 = 0;
@@ -34,10 +36,19 @@ pub const ELM_EBI_SEGMENT_FLAG_EXECUTE: u32 = 1 << 2;
 pub const ELM_EBI_SEGMENT_FLAG_ZERO_FILL: u32 = 1 << 3;
 pub const ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT: u32 = 1 << 4;
 pub const ELM_EBI_SYMBOL_FLAG_NONE: u32 = 0;
+pub const ELM_EBI_SYMBOL_LOCATION_FLAG_NONE: u32 = 0;
+pub const ELM_EBI_RELOCATION_FLAG_NONE: u32 = 0;
 pub const ELM_EBI_RUST_ABI_VERSION: u16 = 1;
 pub const ELM_EBI_HOOK_FLAG_NONE: u32 = 0;
 pub const ELM_EBI_HOOK_ON_INITIALIZE: &str = "on_initialize";
 pub const ELM_EBI_HOOK_ON_FINALIZE: &str = "on_finalize";
+pub const ELM_EBI_HOOK_ON_QUIESCE: &str = "on_quiesce";
+pub const ELM_EBI_HOOK_ON_PAUSE: &str = "on_pause";
+pub const ELM_EBI_HOOK_ON_RESUME: &str = "on_resume";
+pub const ELM_EBI_HOOK_ON_MIGRATE_EXPORT: &str = "on_migrate_export";
+pub const ELM_EBI_HOOK_ON_MIGRATE_IMPORT: &str = "on_migrate_import";
+pub const ELM_EBI_HOOK_ON_MIGRATE_ABORT: &str = "on_migrate_abort";
+pub const ELM_MIGRATION_STATE_MAX: usize = 64 * 1024;
 
 const ELM_EBI_SEGMENT_FLAG_MASK: u32 = ELM_EBI_SEGMENT_FLAG_READ
     | ELM_EBI_SEGMENT_FLAG_WRITE
@@ -49,7 +60,7 @@ const ELM_EBI_SEGMENT_FLAG_MASK: u32 = ELM_EBI_SEGMENT_FLAG_READ
 #[repr(u16)]
 pub enum ElmEbiSourceKind {
     Eki = 1,
-    SoyoProfile = 2,
+    Projection = 2,
     Builtin = 3,
     Memory = 4,
     Remote = 5,
@@ -59,7 +70,7 @@ impl ElmEbiSourceKind {
     pub const fn from_raw(raw: u16) -> Option<Self> {
         match raw {
             1 => Some(Self::Eki),
-            2 => Some(Self::SoyoProfile),
+            2 => Some(Self::Projection),
             3 => Some(Self::Builtin),
             4 => Some(Self::Memory),
             5 => Some(Self::Remote),
@@ -129,6 +140,9 @@ pub enum ElmEbiSegmentKind {
 pub enum ElmEbiLifecycleHookKind {
     Initialize = 1,
     Finalize = 2,
+    MigrateExport = 3,
+    MigrateImport = 4,
+    MigrateAbort = 5,
 }
 
 impl ElmEbiLifecycleHookKind {
@@ -136,6 +150,9 @@ impl ElmEbiLifecycleHookKind {
         match raw {
             1 => Some(Self::Initialize),
             2 => Some(Self::Finalize),
+            3 => Some(Self::MigrateExport),
+            4 => Some(Self::MigrateImport),
+            5 => Some(Self::MigrateAbort),
             _ => None,
         }
     }
@@ -151,6 +168,35 @@ impl ElmEbiRustHookSignature {
     pub const fn from_raw(raw: u16) -> Option<Self> {
         match raw {
             1 => Some(Self::ContextResult),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ElmEbiRelocationKind {
+    ImageBase64 = 1,
+    SegmentBase64 = 2,
+    SymbolAbs64 = 3,
+    SymbolRel32 = 4,
+    SymbolRel64 = 5,
+    ImportAbs64 = 6,
+    ImportRel32 = 7,
+    ImportRel64 = 8,
+}
+
+impl ElmEbiRelocationKind {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::ImageBase64),
+            2 => Some(Self::SegmentBase64),
+            3 => Some(Self::SymbolAbs64),
+            4 => Some(Self::SymbolRel32),
+            5 => Some(Self::SymbolRel64),
+            6 => Some(Self::ImportAbs64),
+            7 => Some(Self::ImportRel32),
+            8 => Some(Self::ImportRel64),
             _ => None,
         }
     }
@@ -344,6 +390,101 @@ impl ElmEbiEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElmEbiSegmentPayload {
+    pub segment_index: u32,
+    pub source_index: u32,
+    pub kind: ElmEbiSegmentKind,
+    pub file_size: u64,
+    pub mem_size: u64,
+    pub bytes: Vec<u8>,
+}
+
+impl ElmEbiSegmentPayload {
+    pub fn new(
+        segment_index: u32,
+        source_index: u32,
+        kind: ElmEbiSegmentKind,
+        file_size: u64,
+        mem_size: u64,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            segment_index,
+            source_index,
+            kind,
+            file_size,
+            mem_size,
+            bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElmEbiSymbolLocationDecl {
+    pub name: String,
+    pub segment_index: u32,
+    pub offset: u64,
+    pub size: u64,
+    pub flags: u32,
+}
+
+impl ElmEbiSymbolLocationDecl {
+    pub fn new(
+        name: impl Into<String>,
+        segment_index: u32,
+        offset: u64,
+        size: u64,
+        flags: u32,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        let name = name.into();
+        validate_symbol_name(&name)?;
+        if flags != ELM_EBI_SYMBOL_LOCATION_FLAG_NONE || size == 0 {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        Ok(Self {
+            name,
+            segment_index,
+            offset,
+            size,
+            flags,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElmEbiRelocationDecl {
+    pub kind: ElmEbiRelocationKind,
+    pub flags: u32,
+    pub target_segment_index: u32,
+    pub target_offset: u64,
+    pub value_index: u32,
+    pub addend: i64,
+}
+
+impl ElmEbiRelocationDecl {
+    pub fn new(
+        kind: ElmEbiRelocationKind,
+        flags: u32,
+        target_segment_index: u32,
+        target_offset: u64,
+        value_index: u32,
+        addend: i64,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        if flags != ELM_EBI_RELOCATION_FLAG_NONE {
+            return Err(ElmEbiLoadStatus::InvalidSegment);
+        }
+        Ok(Self {
+            kind,
+            flags,
+            target_segment_index,
+            target_offset,
+            value_index,
+            addend,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElmEbiLifecycleHookDecl {
     pub kind: ElmEbiLifecycleHookKind,
     pub symbol: String,
@@ -376,6 +517,9 @@ impl ElmEbiLifecycleHookDecl {
 pub struct ElmEbiLifecycleHooks {
     pub initialize: ElmEbiLifecycleHookDecl,
     pub finalize: ElmEbiLifecycleHookDecl,
+    pub migrate_export: Option<ElmEbiLifecycleHookDecl>,
+    pub migrate_import: Option<ElmEbiLifecycleHookDecl>,
+    pub migrate_abort: Option<ElmEbiLifecycleHookDecl>,
 }
 
 impl ElmEbiLifecycleHooks {
@@ -386,9 +530,25 @@ impl ElmEbiLifecycleHooks {
         let hooks = Self {
             initialize,
             finalize,
+            migrate_export: None,
+            migrate_import: None,
+            migrate_abort: None,
         };
         validate_lifecycle_hooks(Some(&hooks))?;
         Ok(hooks)
+    }
+
+    pub fn with_migration_hooks(
+        mut self,
+        migrate_export: Option<ElmEbiLifecycleHookDecl>,
+        migrate_import: Option<ElmEbiLifecycleHookDecl>,
+        migrate_abort: Option<ElmEbiLifecycleHookDecl>,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        self.migrate_export = migrate_export;
+        self.migrate_import = migrate_import;
+        self.migrate_abort = migrate_abort;
+        validate_lifecycle_hooks(Some(&self))?;
+        Ok(self)
     }
 
     pub fn rust_context_result_v1() -> Self {
@@ -407,6 +567,49 @@ impl ElmEbiLifecycleHooks {
                 signature: ElmEbiRustHookSignature::ContextResult,
                 flags: ELM_EBI_HOOK_FLAG_NONE,
             },
+            migrate_export: None,
+            migrate_import: None,
+            migrate_abort: None,
+        }
+    }
+
+    pub fn rust_context_result_v1_with_migration() -> Self {
+        Self {
+            initialize: ElmEbiLifecycleHookDecl {
+                kind: ElmEbiLifecycleHookKind::Initialize,
+                symbol: String::from(ELM_EBI_HOOK_ON_INITIALIZE),
+                rust_abi_version: ELM_EBI_RUST_ABI_VERSION,
+                signature: ElmEbiRustHookSignature::ContextResult,
+                flags: ELM_EBI_HOOK_FLAG_NONE,
+            },
+            finalize: ElmEbiLifecycleHookDecl {
+                kind: ElmEbiLifecycleHookKind::Finalize,
+                symbol: String::from(ELM_EBI_HOOK_ON_FINALIZE),
+                rust_abi_version: ELM_EBI_RUST_ABI_VERSION,
+                signature: ElmEbiRustHookSignature::ContextResult,
+                flags: ELM_EBI_HOOK_FLAG_NONE,
+            },
+            migrate_export: Some(ElmEbiLifecycleHookDecl {
+                kind: ElmEbiLifecycleHookKind::MigrateExport,
+                symbol: String::from(ELM_EBI_HOOK_ON_MIGRATE_EXPORT),
+                rust_abi_version: ELM_EBI_RUST_ABI_VERSION,
+                signature: ElmEbiRustHookSignature::ContextResult,
+                flags: ELM_EBI_HOOK_FLAG_NONE,
+            }),
+            migrate_import: Some(ElmEbiLifecycleHookDecl {
+                kind: ElmEbiLifecycleHookKind::MigrateImport,
+                symbol: String::from(ELM_EBI_HOOK_ON_MIGRATE_IMPORT),
+                rust_abi_version: ELM_EBI_RUST_ABI_VERSION,
+                signature: ElmEbiRustHookSignature::ContextResult,
+                flags: ELM_EBI_HOOK_FLAG_NONE,
+            }),
+            migrate_abort: Some(ElmEbiLifecycleHookDecl {
+                kind: ElmEbiLifecycleHookKind::MigrateAbort,
+                symbol: String::from(ELM_EBI_HOOK_ON_MIGRATE_ABORT),
+                rust_abi_version: ELM_EBI_RUST_ABI_VERSION,
+                signature: ElmEbiRustHookSignature::ContextResult,
+                flags: ELM_EBI_HOOK_FLAG_NONE,
+            }),
         }
     }
 }
@@ -513,6 +716,8 @@ pub struct ElmEbiProviderPortDecl {
     pub direction: FlowDirection,
     pub mode: FlowMode,
     pub flags: u32,
+    pub handler_symbol: Option<String>,
+    pub snapshot_symbol: Option<String>,
 }
 
 impl ElmEbiProviderPortDecl {
@@ -531,7 +736,29 @@ impl ElmEbiProviderPortDecl {
             direction,
             mode,
             flags,
+            handler_symbol: None,
+            snapshot_symbol: None,
         })
+    }
+
+    pub fn with_handler_symbol(
+        mut self,
+        symbol: impl Into<String>,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        let symbol = symbol.into();
+        validate_symbol_name(&symbol)?;
+        self.handler_symbol = Some(symbol);
+        Ok(self)
+    }
+
+    pub fn with_snapshot_symbol(
+        mut self,
+        symbol: impl Into<String>,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        let symbol = symbol.into();
+        validate_symbol_name(&symbol)?;
+        self.snapshot_symbol = Some(symbol);
+        Ok(self)
     }
 }
 
@@ -670,6 +897,12 @@ impl ElmEbiUnit {
                 return Err(ElmEbiLoadStatus::InvalidManifest);
             }
             validate_contract_len(&provider.contract)?;
+            if let Some(symbol) = &provider.handler_symbol {
+                validate_symbol_name(symbol)?;
+            }
+            if let Some(symbol) = &provider.snapshot_symbol {
+                validate_symbol_name(symbol)?;
+            }
         }
         for import in &self.imports {
             validate_symbol_decl(&import.name, &import.contract, import.flags)?;
@@ -688,6 +921,186 @@ impl ElmEbiUnit {
                 .segments
                 .iter()
                 .any(ElmEbiSegment::requires_native_loader)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElmEbiImage {
+    pub unit: ElmEbiUnit,
+    pub payloads: Vec<ElmEbiSegmentPayload>,
+    pub symbol_locations: Vec<ElmEbiSymbolLocationDecl>,
+    pub relocations: Vec<ElmEbiRelocationDecl>,
+}
+
+impl ElmEbiImage {
+    pub fn new(unit: ElmEbiUnit) -> Self {
+        Self {
+            unit,
+            payloads: Vec::new(),
+            symbol_locations: Vec::new(),
+            relocations: Vec::new(),
+        }
+    }
+
+    pub fn with_payload(mut self, payload: ElmEbiSegmentPayload) -> Self {
+        self.payloads.push(payload);
+        self
+    }
+
+    pub fn with_symbol_location(mut self, symbol: ElmEbiSymbolLocationDecl) -> Self {
+        self.symbol_locations.push(symbol);
+        self
+    }
+
+    pub fn with_relocation(mut self, relocation: ElmEbiRelocationDecl) -> Self {
+        self.relocations.push(relocation);
+        self
+    }
+
+    pub fn validate(&self, expected_arch: ElmEbiArch) -> Result<(), ElmEbiLoadStatus> {
+        self.unit.validate(expected_arch)?;
+        if self.symbol_locations.len() > ELM_EBI_MAX_SYMBOL_LOCATIONS
+            || self.relocations.len() > ELM_EBI_MAX_RELOCATIONS
+        {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        for payload in &self.payloads {
+            let Some(segment) = self.unit.segments.get(payload.segment_index as usize) else {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            };
+            if payload.kind != segment.kind
+                || payload.source_index != segment.source_index
+                || payload.file_size != segment.file_size
+                || payload.mem_size != segment.mem_size
+                || payload.bytes.len() as u64 != payload.file_size
+            {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            }
+            if matches!(payload.kind, ElmEbiSegmentKind::Bss) && !payload.bytes.is_empty() {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            }
+        }
+        for symbol in &self.symbol_locations {
+            validate_symbol_name(&symbol.name)?;
+            if symbol.flags != ELM_EBI_SYMBOL_LOCATION_FLAG_NONE || symbol.size == 0 {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
+            let Some(segment) = self.unit.segments.get(symbol.segment_index as usize) else {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            };
+            let Some(end) = symbol.offset.checked_add(symbol.size) else {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            };
+            if end > segment.mem_size {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
+        }
+        if self.has_code_segment()
+            && let Some(hooks) = &self.unit.lifecycle_hooks
+        {
+            let init = self.symbol_location(&hooks.initialize.symbol);
+            let fini = self.symbol_location(&hooks.finalize.symbol);
+            if !matches!(init, Some(symbol) if self.symbol_is_code(symbol))
+                || !matches!(fini, Some(symbol) if self.symbol_is_code(symbol))
+            {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
+        }
+        if self.has_code_segment()
+            && let Some(entry) = &self.unit.entry
+            && !matches!(self.symbol_location(&entry.symbol), Some(symbol) if self.symbol_is_code(symbol))
+        {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        for relocation in &self.relocations {
+            if relocation.flags != ELM_EBI_RELOCATION_FLAG_NONE {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            }
+            let Some(target) = self
+                .unit
+                .segments
+                .get(relocation.target_segment_index as usize)
+            else {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            };
+            let width = relocation_width(relocation.kind);
+            let Some(end) = relocation.target_offset.checked_add(width) else {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            };
+            if end > target.mem_size || matches!(target.kind, ElmEbiSegmentKind::Relocation) {
+                return Err(ElmEbiLoadStatus::InvalidSegment);
+            }
+            match relocation.kind {
+                ElmEbiRelocationKind::ImageBase64 => {}
+                ElmEbiRelocationKind::SegmentBase64 => {
+                    if self
+                        .unit
+                        .segments
+                        .get(relocation.value_index as usize)
+                        .is_none()
+                    {
+                        return Err(ElmEbiLoadStatus::InvalidSegment);
+                    }
+                }
+                ElmEbiRelocationKind::SymbolAbs64
+                | ElmEbiRelocationKind::SymbolRel32
+                | ElmEbiRelocationKind::SymbolRel64 => {
+                    if self
+                        .symbol_locations
+                        .get(relocation.value_index as usize)
+                        .is_none()
+                    {
+                        return Err(ElmEbiLoadStatus::InvalidSegment);
+                    }
+                }
+                ElmEbiRelocationKind::ImportAbs64
+                | ElmEbiRelocationKind::ImportRel32
+                | ElmEbiRelocationKind::ImportRel64 => {
+                    if self
+                        .unit
+                        .imports
+                        .get(relocation.value_index as usize)
+                        .is_none()
+                    {
+                        return Err(ElmEbiLoadStatus::InvalidSegment);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn symbol_location(&self, name: &str) -> Option<&ElmEbiSymbolLocationDecl> {
+        self.symbol_locations
+            .iter()
+            .find(|symbol| symbol.name == name)
+    }
+
+    fn symbol_is_code(&self, symbol: &ElmEbiSymbolLocationDecl) -> bool {
+        self.unit
+            .segments
+            .get(symbol.segment_index as usize)
+            .map(|segment| matches!(segment.kind, ElmEbiSegmentKind::Code))
+            .unwrap_or(false)
+    }
+
+    pub fn has_code_segment(&self) -> bool {
+        self.unit
+            .segments
+            .iter()
+            .any(|segment| matches!(segment.kind, ElmEbiSegmentKind::Code))
+    }
+}
+
+pub const fn relocation_width(kind: ElmEbiRelocationKind) -> u64 {
+    match kind {
+        ElmEbiRelocationKind::ImageBase64
+        | ElmEbiRelocationKind::SegmentBase64
+        | ElmEbiRelocationKind::SymbolAbs64
+        | ElmEbiRelocationKind::SymbolRel64
+        | ElmEbiRelocationKind::ImportAbs64
+        | ElmEbiRelocationKind::ImportRel64 => 8,
+        ElmEbiRelocationKind::SymbolRel32 | ElmEbiRelocationKind::ImportRel32 => 4,
     }
 }
 
@@ -843,6 +1256,27 @@ fn validate_lifecycle_hooks(hooks: Option<&ElmEbiLifecycleHooks>) -> Result<(), 
         ElmEbiLifecycleHookKind::Finalize,
         ELM_EBI_HOOK_ON_FINALIZE,
     )?;
+    if let Some(hook) = &hooks.migrate_export {
+        validate_lifecycle_hook(
+            hook,
+            ElmEbiLifecycleHookKind::MigrateExport,
+            ELM_EBI_HOOK_ON_MIGRATE_EXPORT,
+        )?;
+    }
+    if let Some(hook) = &hooks.migrate_import {
+        validate_lifecycle_hook(
+            hook,
+            ElmEbiLifecycleHookKind::MigrateImport,
+            ELM_EBI_HOOK_ON_MIGRATE_IMPORT,
+        )?;
+    }
+    if let Some(hook) = &hooks.migrate_abort {
+        validate_lifecycle_hook(
+            hook,
+            ElmEbiLifecycleHookKind::MigrateAbort,
+            ELM_EBI_HOOK_ON_MIGRATE_ABORT,
+        )?;
+    }
     Ok(())
 }
 

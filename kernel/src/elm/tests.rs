@@ -1,7 +1,9 @@
 use ktest::ktest;
 
+use core::any::Any;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -11,36 +13,57 @@ use elm_model::{
     ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_NAME_LEN,
     ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
     ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN,
-    ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
-    ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_PORTS,
-    ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_KERNEL_PROVIDER_FLAG_NONE,
+    ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
+    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU,
+    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROVIDERS,
+    ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_TODO_REGISTRY, ELM_KERNEL_PROVIDER_FLAG_NONE,
     ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_PROVIDER_ASYNC,
     ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_API_KIND_SUBSYSTEM, ELM_MGR_RELATION_POINT_LEN,
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
-    ELM_MGR_STATUS_UNSUPPORTED, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_MGR_STATUS_UNSUPPORTED, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NEXUS_CONTRACT_LEN,
+    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
     ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_PROVIDER_ASYNC_QUEUE_LIMIT,
-    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
-    ElmActionInvokeRequest, ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord,
-    ElmEbiArch, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
-    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind,
-    ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind, ElmError, ElmId,
-    ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase, ElmManifest, ElmMenuItemKind,
-    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
-    ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
+    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_NATIVE_BACKEND,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest, ElmCallFrame, ElmContext,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLifecycleHookKind,
+    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiRustHookSignature, ElmEbiSegment,
+    ElmEbiSegmentKind, ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit,
+    ElmEkiBlockKind, ElmError, ElmId, ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase,
+    ElmManifest, ElmMenuItemKind, ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader,
+    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
-    ElmMgrSubscribedEventReadRequest, ElmName, ElmNexusBindPlanResponse, ElmNexusBindRequest,
-    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmProviderAsyncCancelRequest,
-    ElmProviderAsyncPollRequest, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
-    ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRegisterRequest,
-    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderQueueStatsHeader,
-    ElmProviderSnapshotHeader, ElmProviderSnapshotRequest, ElmReplyFrame, ElmResult, ElmState,
-    ElmVersion, FlowDirection, FlowMode, state_code,
+    ElmMgrSubscribedEventReadRequest, ElmName, ElmNativeCapabilityHeader, ElmNativeEntryFrameV1,
+    ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusUnbindRequest, ElmPortAccessPolicy,
+    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncState,
+    ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
+    ElmProviderQueueStatsHeader, ElmProviderSnapshotHeader, ElmProviderSnapshotRequest,
+    ElmReplaceCellRequestV1, ElmReplyFrame, ElmResult, ElmState, ElmTodoRegistryHeader,
+    ElmTodoRegistryRecord, ElmVersion, FlowDirection, FlowMode, Generation, state_code,
 };
 
 use super::core::{ELM_MGR_ID, ElmCore, ElmLifecycleExecutor};
 use super::mgr_channel::dispatch_mgr_call_on_core;
+
+struct TestElmDeviceFunction;
+
+impl general::dev::function::DeviceFunction for TestElmDeviceFunction {
+    fn class_id(&self) -> general::dev::function::DeviceClassId {
+        general::dev::function::DeviceClassId::new("elmtest")
+    }
+
+    fn dev_name(&self) -> &str {
+        "elm-claim-test"
+    }
+
+    fn mark_gone(&self) {}
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 fn manifest(name: &str, kind: ElmKind) -> ElmManifest {
     ElmManifest::new(
@@ -131,6 +154,45 @@ impl ElmLifecycleExecutor for RecordingLifecycleExecutor {
 }
 
 static TEST_PROVIDER_REVOKES: AtomicUsize = AtomicUsize::new(0);
+static TEST_NATIVE_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn test_native_entry_ok(frame: *mut ElmNativeEntryFrameV1) -> i32 {
+    if frame.is_null() {
+        return -1;
+    }
+    // 安全性：调用方按照 ELM native entry v1 约定传入可写帧指针。
+    let frame = unsafe { &mut *frame };
+    if frame.cell_id == 7
+        && frame.parent_id == ELM_MGR_ID.0
+        && frame.generation == 3
+        && frame.state == state_code(ElmState::Active)
+        && frame.exit_code == 0
+    {
+        TEST_NATIVE_ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
+        0
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn test_native_entry_returns_error(frame: *mut ElmNativeEntryFrameV1) -> i32 {
+    if !frame.is_null() {
+        TEST_NATIVE_ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    -1
+}
+
+unsafe extern "C" fn test_native_entry_mutates_frame(frame: *mut ElmNativeEntryFrameV1) -> i32 {
+    if frame.is_null() {
+        return -1;
+    }
+    // 安全性：调用方按照 ELM native entry v1 约定传入可写帧指针。
+    unsafe {
+        (*frame).cell_id = 0xdead;
+    }
+    TEST_NATIVE_ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
+    0
+}
 
 fn test_revoke_provider_invoke(frame: ElmCallFrame) -> ElmReplyFrame {
     ElmReplyFrame::empty(frame.binding_id, frame.call_id, ELM_CALL_STATUS_OK)
@@ -294,6 +356,13 @@ fn eki_menu_block(label: &str, description: &str, route: &str) -> Vec<u8> {
     out
 }
 
+fn eki_entry_block(symbol: &str) -> Vec<u8> {
+    let mut out = vec![0; 8 + ELM_EBI_SYMBOL_NAME_LEN];
+    write_u16(&mut out, 0, symbol.len() as u16);
+    fixed_copy(&mut out, 8, ELM_EBI_SYMBOL_NAME_LEN, symbol);
+    out
+}
+
 fn eki_segments_block(
     kind: ElmEbiSegmentKind,
     flags: u32,
@@ -328,6 +397,21 @@ fn eki_lifecycle_hooks_block() -> Vec<u8> {
         ElmEbiLifecycleHookKind::Finalize,
         ELM_EBI_HOOK_ON_FINALIZE,
     );
+    out
+}
+
+fn eki_symbol_locations_block(entries: &[(&str, u32, u64, u64)]) -> Vec<u8> {
+    let record_size = ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE;
+    let mut out = vec![0; 8 + entries.len() * record_size];
+    write_u32(&mut out, 0, entries.len() as u32);
+    for (index, (name, segment_index, offset, size)) in entries.iter().enumerate() {
+        let record = 8 + index * record_size;
+        write_u16(&mut out, record, name.len() as u16);
+        write_u32(&mut out, record + 8, *segment_index);
+        write_u64(&mut out, record + 16, *offset);
+        write_u64(&mut out, record + 24, *size);
+        fixed_copy(&mut out, record + 32, ELM_EBI_SYMBOL_NAME_LEN, name);
+    }
     out
 }
 
@@ -529,6 +613,47 @@ fn provider_invoke_payload(request: &ElmProviderInvokeRequest) -> Vec<u8> {
     out
 }
 
+fn device_claim_payload(class_name: &str, dev_name: &str) -> Vec<u8> {
+    let request = general::dev::elm::ElmDeviceClaimRequest::new(class_name, dev_name);
+    let mut out = Vec::new();
+    push_u16(&mut out, request.abi_version);
+    push_u16(&mut out, request.flags);
+    push_u16(&mut out, request.class_len);
+    push_u16(&mut out, request.name_len);
+    out.extend_from_slice(&request.class_name);
+    out.extend_from_slice(&request.dev_name);
+    out
+}
+
+fn vfs_lookup_payload(path: &str) -> Vec<u8> {
+    let request = vfs::elm::ElmVfsLookupRequest::new(path);
+    let mut out = Vec::new();
+    push_u16(&mut out, request.abi_version);
+    push_u16(&mut out, request.flags);
+    push_u32(&mut out, request.dirfd_kind);
+    push_u32(&mut out, request.lookup_flags);
+    push_u16(&mut out, request.path_len);
+    push_u16(&mut out, request.reserved);
+    out.extend_from_slice(&request.path[..request.path_len as usize]);
+    out
+}
+
+fn device_claim_snapshot_has_binding(payload: &[u8], binding_id: u64) -> bool {
+    let header_size = core::mem::size_of::<general::dev::elm::ElmDeviceClaimSnapshotHeader>();
+    if payload.len() < header_size {
+        return false;
+    }
+    let record_size = read_u16(payload, 2) as usize;
+    let record_count = read_u32(payload, 4) as usize;
+    for index in 0..record_count {
+        let offset = header_size + index * record_size;
+        if payload.len() >= offset + record_size && read_u64(payload, offset) == binding_id {
+            return true;
+        }
+    }
+    false
+}
+
 fn provider_snapshot_payload(request: &ElmProviderSnapshotRequest) -> Vec<u8> {
     let mut out = Vec::new();
     push_u64(&mut out, request.port_id);
@@ -590,6 +715,28 @@ fn provider_async_cancel_payload(request: &ElmProviderAsyncCancelRequest) -> Vec
     push_u64(&mut out, request.ticket_id);
     push_u32(&mut out, request.flags);
     push_u32(&mut out, request.reserved);
+    out
+}
+
+fn lifecycle_request_payload(request: &elm_model::ElmLifecycleRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, request.cell_id);
+    push_u32(&mut out, request.flags);
+    push_u32(&mut out, request.reserved);
+    out
+}
+
+fn replace_cell_payload(request: &ElmReplaceCellRequestV1, source_payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u16(&mut out, request.abi_version);
+    push_u16(&mut out, request.flags);
+    push_u16(&mut out, request.source_kind);
+    push_u16(&mut out, request.reserved0);
+    push_u64(&mut out, request.target_cell_id);
+    push_u32(&mut out, request.migration_limit);
+    push_u32(&mut out, request.source_payload_len);
+    push_u64(&mut out, request.reserved1);
+    out.extend_from_slice(source_payload);
     out
 }
 
@@ -703,7 +850,7 @@ fn elm_builtin_mgr_init_health_is_clean() {
     let health = core.health_bytes();
     assert_eq!(read_i32(&health, 8), ELM_MGR_STATUS_OK);
     assert_eq!(read_u32(&health, 12), 0);
-    assert_eq!(read_u32(&health, 4), 9);
+    assert_eq!(read_u32(&health, 4), 11);
 
     let record_size = read_u16(&health, 2) as usize;
     assert_eq!(record_size, core::mem::size_of::<ElmCoreHealthRecord>());
@@ -723,6 +870,83 @@ fn elm_builtin_mgr_init_health_is_clean() {
     assert_ne!(checks & (1 << ELM_HEALTH_CHECK_MENU), 0);
     assert_ne!(checks & (1 << ELM_HEALTH_CHECK_EVENTS), 0);
     assert_ne!(checks & (1 << ELM_HEALTH_CHECK_AUDITS), 0);
+    assert_ne!(checks & (1 << ELM_HEALTH_CHECK_NATIVE_CAPABILITIES), 0);
+    assert_ne!(checks & (1 << ELM_HEALTH_CHECK_TODO_REGISTRY), 0);
+}
+
+#[ktest]
+fn elm_native_capability_snapshot_is_empty_after_builtin_init() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+
+    let bytes = core.native_capabilities_bytes();
+    assert_eq!(
+        read_u16(&bytes, 2) as usize,
+        core::mem::size_of::<elm_model::ElmNativeCapabilityRecord>()
+    );
+    assert_eq!(read_u32(&bytes, 4), 0);
+    assert_eq!(
+        read_u32(&bytes, 8) & ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
+        0
+    );
+    assert_eq!(read_u64(&bytes, 16), core.last_event_sequence());
+    assert_eq!(
+        bytes.len(),
+        core::mem::size_of::<ElmNativeCapabilityHeader>()
+    );
+}
+
+#[ktest]
+fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+
+    let bytes = core.todo_registry_bytes();
+    assert_eq!(
+        read_u16(&bytes, 2) as usize,
+        core::mem::size_of::<ElmTodoRegistryRecord>()
+    );
+    assert!(read_u32(&bytes, 4) >= 8);
+    assert!(read_u32(&bytes, 8) >= 8);
+    assert_eq!(
+        bytes.len(),
+        core::mem::size_of::<ElmTodoRegistryHeader>()
+            + read_u32(&bytes, 4) as usize * core::mem::size_of::<ElmTodoRegistryRecord>()
+    );
+
+    let register = ElmProviderPortRegisterRequest::new(
+        ELM_MGR_ID.0,
+        "elm.test.todo.dynamic@1",
+        ElmPortAccessPolicy::Internal,
+        FlowDirection::Control,
+        FlowMode::Shared,
+        0,
+    );
+    let response = core.register_provider_port(register);
+    assert_eq!(response.status, ELM_MGR_STATUS_OK);
+
+    let bytes =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::QueryTodoRegistry, &[]));
+    assert_eq!(response_status(&bytes), ELM_MGR_STATUS_OK);
+    let payload = response_payload(&bytes);
+    let record_size = read_u16(payload, 2) as usize;
+    let record_count = read_u32(payload, 4) as usize;
+    let mut found_dynamic_provider = false;
+    for index in 0..record_count {
+        let offset = core::mem::size_of::<ElmTodoRegistryHeader>() + index * record_size;
+        let subject = read_u64(payload, offset + 16);
+        if subject == response.port_id {
+            found_dynamic_provider = true;
+            assert_eq!(read_i32(payload, offset + 24), ELM_MGR_STATUS_TODO);
+        }
+    }
+    assert!(found_dynamic_provider);
+
+    let bad = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryTodoRegistry, &[1]),
+    );
+    assert_eq!(response_status(&bad), ELM_MGR_STATUS_INVALID);
 }
 
 #[ktest]
@@ -921,6 +1145,13 @@ fn elm_mgr_loads_native_eki_source_as_native_todo() {
         ),
         (ElmEkiBlockKind::Code, code),
         (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 2),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 2, 2),
+            ]),
+        ),
     ]);
     let payload = ebi_source_payload(ElmEbiSourceKind::Eki, &image);
 
@@ -945,6 +1176,103 @@ fn elm_mgr_loads_native_eki_source_as_native_todo() {
 }
 
 #[ktest]
+fn elm_mgr_keeps_eki_entry_pending_without_image_ops() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let code = vec![0x13, 0, 0, 0];
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("eki-entry-cell", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::Entry, eki_entry_block("elm_main")),
+        (
+            ElmEkiBlockKind::Segments,
+            eki_segments_block(
+                ElmEbiSegmentKind::Code,
+                0,
+                code.len() as u64,
+                code.len() as u64,
+            ),
+        ),
+        (ElmEkiBlockKind::Code, code),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 2),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 2, 2),
+                ("elm_main", 0, 0, 2),
+            ]),
+        ),
+    ]);
+    let payload = ebi_source_payload(ElmEbiSourceKind::Eki, &image);
+
+    let response =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_OK);
+    let load = response_payload(&response);
+    assert_eq!(read_i32(load, 8), ElmEbiLoadStatus::NativeCodeTodo as i32);
+    assert_eq!(read_u32(load, 12), state_code(ElmState::Loaded));
+    let cell_id = read_u64(load, 0);
+    let cell = core
+        .cells()
+        .iter()
+        .find(|cell| cell.id == ElmId(cell_id))
+        .unwrap();
+    assert_eq!(cell.state, ElmState::Loaded);
+    assert!(!cell.lifecycle_initialized);
+}
+
+#[ktest]
+fn elm_native_entry_accepts_valid_frame() {
+    TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
+
+    let result = super::native::test_call_native_entry(
+        test_native_entry_ok as usize,
+        ElmId(7),
+        Some(ELM_MGR_ID),
+        Generation(3),
+        ElmState::Active,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(TEST_NATIVE_ENTRY_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[ktest]
+fn elm_native_entry_rejects_error_return() {
+    TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
+
+    let result = super::native::test_call_native_entry(
+        test_native_entry_returns_error as usize,
+        ElmId(7),
+        Some(ELM_MGR_ID),
+        Generation(3),
+        ElmState::Active,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(TEST_NATIVE_ENTRY_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[ktest]
+fn elm_native_entry_rejects_frame_mutation() {
+    TEST_NATIVE_ENTRY_CALLS.store(0, Ordering::Relaxed);
+
+    let result = super::native::test_call_native_entry(
+        test_native_entry_mutates_frame as usize,
+        ElmId(7),
+        Some(ELM_MGR_ID),
+        Generation(3),
+        ElmState::Active,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(TEST_NATIVE_ENTRY_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[ktest]
 fn elm_mgr_rejects_corrupt_eki_source() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
@@ -958,6 +1286,86 @@ fn elm_mgr_rejects_corrupt_eki_source() {
     let response =
         dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
     assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+}
+
+#[ktest]
+fn elm_mgr_replace_cell_rejects_legacy_lifecycle_payload_shape() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let legacy = lifecycle_request_payload(&elm_model::ElmLifecycleRequest::new(ELM_MGR_ID.0));
+
+    let response =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::ReplaceCell, &legacy));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+}
+
+#[ktest]
+fn elm_mgr_replace_cell_non_eki_source_reports_source_todo() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let request =
+        ElmReplaceCellRequestV1::new(ELM_MGR_ID.0, ElmEbiSourceKind::Projection as u16, 0);
+    let payload = replace_cell_payload(&request, &[]);
+
+    let response =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::ReplaceCell, &payload));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_TODO);
+
+    let audits = core.audit_bytes();
+    let audit_header_size = core::mem::size_of::<ElmMgrAuditHeader>();
+    let audit_record_size = read_u16(&audits, 2) as usize;
+    let audit_record_count = read_u32(&audits, 4) as usize;
+    let last_audit = audit_header_size + (audit_record_count - 1) * audit_record_size;
+    assert_ne!(
+        read_u64(&audits, last_audit + 24) & ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+        0
+    );
+}
+
+#[ktest]
+fn elm_mgr_replace_cell_eki_source_enters_real_preflight_path() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let original_image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("replace-target", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+    ]);
+    let original_payload = ebi_source_payload(ElmEbiSourceKind::Eki, &original_image);
+    let load = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::LoadCell, &original_payload),
+    );
+    assert_eq!(response_status(&load), ELM_MGR_STATUS_OK);
+    let load_payload = response_payload(&load);
+    assert_eq!(
+        read_i32(load_payload, 8),
+        ElmEbiLoadStatus::NativeCodeTodo as i32
+    );
+    let cell_id = read_u64(load_payload, 0);
+
+    let replacement_image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("replace-target", "0.1.1", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+    ]);
+    let request = ElmReplaceCellRequestV1::new(
+        cell_id,
+        ElmEbiSourceKind::Eki as u16,
+        replacement_image.len() as u32,
+    );
+    let payload = replace_cell_payload(&request, &replacement_image);
+
+    let response =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::ReplaceCell, &payload));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_OK);
+    let replace = response_payload(&response);
+    assert_eq!(read_i32(replace, 8), ELM_MGR_STATUS_INVALID);
+    assert_ne!(read_u64(replace, 32) & ELM_POLICY_BLOCK_INVALID_STATE, 0);
 }
 
 #[ktest]
@@ -1472,6 +1880,10 @@ fn elm_dynamic_provider_is_queryable_and_bind_preflight_is_todo() {
             read_u16(&provider_bytes, offset + 42),
             ELM_PROVIDER_FLAG_DYNAMIC | ELM_PROVIDER_FLAG_TODO_BACKEND
         );
+        assert_eq!(
+            read_u16(&provider_bytes, offset + 42) & ELM_PROVIDER_FLAG_NATIVE_BACKEND,
+            0
+        );
     }
     assert!(found);
 
@@ -1511,15 +1923,51 @@ fn elm_subsystem_provider_specs_are_registered_and_invokable() {
     assert_eq!(bind_response.allowed, 1);
     assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
 
-    let frame = ElmCallFrame::empty(bind_response.binding_id, 77, 0);
+    let payload = vfs_lookup_payload("/");
+    let frame = ElmCallFrame::new(
+        bind_response.binding_id,
+        77,
+        vfs::elm::ELM_VFS_LOOKUP_OPCODE_QUERY,
+        &payload,
+    );
     let response = core
         .invoke_provider(ElmProviderInvokeRequest::new(frame))
         .unwrap();
-    assert_eq!(response.reply.status, ELM_CALL_STATUS_UNSUPPORTED);
+    assert_eq!(response.reply.status, ELM_CALL_STATUS_NOT_FOUND);
+    assert_eq!(
+        response.reply.payload_len as usize,
+        vfs::elm::ELM_VFS_LOOKUP_REPLY_FIXED_LEN
+    );
+    assert_eq!(
+        read_i32(&response.reply.payload, 4),
+        errno::Errno::EBADF.as_i32()
+    );
 
     let stats = provider_stats_by_port(&mut core, port_id).unwrap();
     assert_eq!(stats.1, 0);
     assert_eq!(stats.2, 1);
+    assert_eq!(stats.3, 0);
+
+    let malformed = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::empty(
+            bind_response.binding_id,
+            78,
+            vfs::elm::ELM_VFS_LOOKUP_OPCODE_QUERY,
+        )))
+        .unwrap();
+    assert_eq!(malformed.reply.status, ELM_CALL_STATUS_INVALID);
+    assert_eq!(
+        malformed.reply.payload_len as usize,
+        vfs::elm::ELM_VFS_LOOKUP_REPLY_FIXED_LEN
+    );
+    assert_eq!(
+        read_i32(&malformed.reply.payload, 4),
+        errno::Errno::EINVAL.as_i32()
+    );
+
+    let stats = provider_stats_by_port(&mut core, port_id).unwrap();
+    assert_eq!(stats.1, 0);
+    assert_eq!(stats.2, 2);
     assert_eq!(stats.3, 0);
 
     let unbind = core.commit_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
@@ -1600,6 +2048,131 @@ fn elm_device_discovery_provider_returns_real_snapshot_and_query_reply() {
     let stats = provider_stats_by_port(&mut core, port_id).unwrap();
     assert_eq!(stats.1, 2);
     assert_eq!(stats.2, 0);
+}
+
+#[ktest]
+fn elm_device_claim_provider_acquires_releases_and_revokes_claims() {
+    let function: Arc<dyn general::dev::function::DeviceFunction> = Arc::new(TestElmDeviceFunction);
+    general::dev::enumerate::DEVICES.unregister_function(&function);
+    general::dev::enumerate::DEVICES
+        .register_function(Arc::clone(&function))
+        .unwrap();
+
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    super::subsystems::register_builtin_provider_specs(&mut core).unwrap();
+
+    let port_id = provider_port_id_by_contract(&mut core, "device.claim@1").unwrap();
+    let bind = ElmNexusBindRequest::new(ELM_MGR_ID.0, port_id, "device.claim@1");
+    let bind_response = core.commit_bind(bind);
+    assert_eq!(bind_response.status, ELM_MGR_STATUS_OK);
+    assert_eq!(bind_response.allowed, 1);
+
+    let payload = device_claim_payload("elmtest", "elm-claim-test");
+    let acquire = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::new(
+            bind_response.binding_id,
+            1,
+            general::dev::elm::ELM_DEV_CLAIM_OPCODE_ACQUIRE,
+            &payload,
+        )))
+        .unwrap();
+    assert_eq!(acquire.reply.status, ELM_CALL_STATUS_OK);
+    assert_eq!(
+        acquire.reply.payload_len as usize,
+        core::mem::size_of::<general::dev::elm::ElmDeviceClaimReply>()
+    );
+    assert_eq!(
+        read_u64(&acquire.reply.payload, 8),
+        bind_response.binding_id
+    );
+    assert_eq!(
+        read_u16(&acquire.reply.payload, 24) as usize,
+        "elmtest".len()
+    );
+    assert_eq!(
+        read_u16(&acquire.reply.payload, 26) as usize,
+        "elm-claim-test".len()
+    );
+
+    let duplicate = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::new(
+            bind_response.binding_id,
+            2,
+            general::dev::elm::ELM_DEV_CLAIM_OPCODE_ACQUIRE,
+            &payload,
+        )))
+        .unwrap();
+    assert_eq!(duplicate.reply.status, ELM_CALL_STATUS_OK);
+
+    let query = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::new(
+            bind_response.binding_id,
+            3,
+            general::dev::elm::ELM_DEV_CLAIM_OPCODE_QUERY,
+            &payload,
+        )))
+        .unwrap();
+    assert_eq!(query.reply.status, ELM_CALL_STATUS_OK);
+
+    let bytes = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port(port_id))
+        .unwrap();
+    assert_eq!(read_i32(&bytes, 4), ELM_MGR_STATUS_OK);
+    let outer_header = core::mem::size_of::<ElmProviderSnapshotHeader>();
+    let snapshot_payload = &bytes[outer_header..];
+    assert_eq!(
+        read_u16(snapshot_payload, 2) as usize,
+        core::mem::size_of::<general::dev::elm::ElmDeviceClaimRecord>()
+    );
+    assert!(read_u32(snapshot_payload, 4) >= 1);
+    assert!(device_claim_snapshot_has_binding(
+        snapshot_payload,
+        bind_response.binding_id
+    ));
+
+    let release = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::new(
+            bind_response.binding_id,
+            4,
+            general::dev::elm::ELM_DEV_CLAIM_OPCODE_RELEASE,
+            &payload,
+        )))
+        .unwrap();
+    assert_eq!(release.reply.status, ELM_CALL_STATUS_OK);
+
+    let query_after_release = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::new(
+            bind_response.binding_id,
+            5,
+            general::dev::elm::ELM_DEV_CLAIM_OPCODE_QUERY,
+            &payload,
+        )))
+        .unwrap();
+    assert_eq!(query_after_release.reply.status, ELM_CALL_STATUS_NOT_FOUND);
+
+    let reacquire = core
+        .invoke_provider(ElmProviderInvokeRequest::new(ElmCallFrame::new(
+            bind_response.binding_id,
+            6,
+            general::dev::elm::ELM_DEV_CLAIM_OPCODE_ACQUIRE,
+            &payload,
+        )))
+        .unwrap();
+    assert_eq!(reacquire.reply.status, ELM_CALL_STATUS_OK);
+
+    let unbind = core.commit_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
+    assert_eq!(unbind.status, ELM_MGR_STATUS_OK);
+    let bytes = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port(port_id))
+        .unwrap();
+    let snapshot_payload = &bytes[core::mem::size_of::<ElmProviderSnapshotHeader>()..];
+    assert!(!device_claim_snapshot_has_binding(
+        snapshot_payload,
+        bind_response.binding_id
+    ));
+
+    general::dev::enumerate::DEVICES.unregister_function(&function);
 }
 
 #[ktest]
@@ -1972,6 +2545,23 @@ fn elm_mgr_channel_exposes_mgr_runtime_api_and_event_subscriptions() {
         api_payload.len(),
         core::mem::size_of::<ElmMgrApiRegistryHeader>() + api_record_count * api_record_size
     );
+
+    let native_caps = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryNativeCapabilities, &[]),
+    );
+    assert_eq!(response_status(&native_caps), ELM_MGR_STATUS_OK);
+    let native_caps_payload = response_payload(&native_caps);
+    assert_eq!(
+        native_caps_payload.len(),
+        core::mem::size_of::<ElmNativeCapabilityHeader>()
+    );
+    assert_eq!(read_u32(native_caps_payload, 4), 0);
+    let native_caps_bad = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryNativeCapabilities, &[1]),
+    );
+    assert_eq!(response_status(&native_caps_bad), ELM_MGR_STATUS_INVALID);
 
     let subscribe_payload =
         event_subscribe_payload(&ElmMgrEventSubscribeRequest::new(ELM_MGR_ID.0));

@@ -148,6 +148,60 @@ pub fn unmap_range_entries<P: PagingArch>(
     Ok(())
 }
 
+/// 原地修改已存在叶子映射的权限。
+///
+/// 此函数只更新覆盖范围内的完整叶子页，不拆分大页，也不创建新映射。调用方如果需要
+/// 对一个段做精确 W^X，应保证该段按最小页大小独立映射，避免和其它段共享同一叶子页。
+pub fn protect_range_entries<P: PagingArch>(
+    root_vaddr: usize,
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+    user: bool,
+    global: bool,
+    phys_to_virt: fn(usize) -> usize,
+) -> Result<(), MapError> {
+    if size == 0 || vaddr % P::PAGE_SIZE != 0 || size % P::PAGE_SIZE != 0 {
+        return Err(MapError::Misaligned);
+    }
+    if !P::is_valid_leaf_perm(read, write, execute, user, global) {
+        return Err(MapError::InvalidPermission);
+    }
+
+    let end_vaddr = vaddr.checked_add(size).ok_or(MapError::Misaligned)?;
+    let mut current_vaddr = vaddr;
+
+    while current_vaddr < end_vaddr {
+        let (level, pte_ptr, old_pte) = find_leaf::<P>(root_vaddr, current_vaddr, phys_to_virt)?;
+        let page_size = P::leaf_page_size(level).ok_or(MapError::UnsupportedLevel)?;
+        let leaf_base = current_vaddr & !(page_size - 1);
+        let next_vaddr = current_vaddr
+            .checked_add(page_size)
+            .ok_or(MapError::Misaligned)?;
+
+        if leaf_base != current_vaddr || next_vaddr > end_vaddr {
+            return Err(MapError::Misaligned);
+        }
+
+        let new_pte = P::make_leaf_pte_for_level(
+            level,
+            P::pte_addr(old_pte),
+            read,
+            write,
+            execute,
+            user,
+            global,
+        )
+        .ok_or(MapError::InvalidPermission)?;
+        unsafe { core::ptr::write_volatile(pte_ptr, P::pte_to_usize(new_pte)) };
+        current_vaddr = next_vaddr;
+    }
+
+    Ok(())
+}
+
 /// 页表遍历并创建映射。
 ///
 /// 这是页表操作的核心函数，负责从页表根开始逐层遍历，按需分配中间页表页，

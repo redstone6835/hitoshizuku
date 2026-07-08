@@ -4,6 +4,9 @@
 //! 不描述底层文件格式，也不暴露内核指针。
 
 pub const ELM_FRAME_PAYLOAD_LEN: usize = 256;
+pub const ELM_NATIVE_ENTRY_ABI_VERSION: u16 = 1;
+pub const ELM_NATIVE_PROVIDER_CALL_ABI_VERSION: u16 = 1;
+pub const ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION: u16 = 1;
 
 pub const ELM_CALL_FLAG_NONE: u32 = 0;
 
@@ -114,6 +117,117 @@ pub struct ElmReplyFrame {
     pub reserved0: u16,
     pub reserved1: u32,
     pub payload: [u8; ELM_FRAME_PAYLOAD_LEN],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeProviderCallV1 {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub reserved0: u32,
+    pub cell_id: u64,
+    pub port_id: u64,
+    pub lease_id: u64,
+    pub binding_id: u64,
+    pub request: ElmCallFrame,
+    pub reply: ElmReplyFrame,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeEntryFrameV1 {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub reserved0: u32,
+    pub cell_id: u64,
+    pub parent_id: u64,
+    pub generation: u64,
+    pub state: u32,
+    pub exit_code: i32,
+    pub reserved1: u64,
+}
+
+impl ElmNativeEntryFrameV1 {
+    pub const fn new(cell_id: u64, parent_id: u64, generation: u64, state: u32) -> Self {
+        Self {
+            abi_version: ELM_NATIVE_ENTRY_ABI_VERSION,
+            flags: 0,
+            reserved0: 0,
+            cell_id,
+            parent_id,
+            generation,
+            state,
+            exit_code: 0,
+            reserved1: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeProviderSnapshotV1 {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub reserved0: u32,
+    pub cell_id: u64,
+    pub port_id: u64,
+    pub binding_id: u64,
+    pub lease_id: u64,
+    pub status: i32,
+    pub reserved1: u32,
+    pub capacity: u32,
+    pub payload_len: u32,
+    pub record_count: u32,
+    pub reserved2: u32,
+    pub payload_addr: u64,
+}
+
+impl ElmNativeProviderSnapshotV1 {
+    pub const fn new(
+        cell_id: u64,
+        port_id: u64,
+        binding_id: u64,
+        lease_id: u64,
+        payload_addr: u64,
+        capacity: u32,
+    ) -> Self {
+        Self {
+            abi_version: ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
+            flags: 0,
+            reserved0: 0,
+            cell_id,
+            port_id,
+            binding_id,
+            lease_id,
+            status: ELM_CALL_STATUS_PROVIDER_FAULT,
+            reserved1: 0,
+            capacity,
+            payload_len: 0,
+            record_count: 0,
+            reserved2: 0,
+            payload_addr,
+        }
+    }
+}
+
+impl ElmNativeProviderCallV1 {
+    pub const fn new(cell_id: u64, port_id: u64, lease_id: u64, request: ElmCallFrame) -> Self {
+        Self {
+            abi_version: ELM_NATIVE_PROVIDER_CALL_ABI_VERSION,
+            flags: 0,
+            reserved0: 0,
+            cell_id,
+            port_id,
+            lease_id,
+            binding_id: request.binding_id,
+            request,
+            reply: ElmReplyFrame::empty(
+                request.binding_id,
+                request.call_id,
+                ELM_CALL_STATUS_PROVIDER_FAULT,
+            ),
+        }
+    }
 }
 
 impl ElmReplyFrame {

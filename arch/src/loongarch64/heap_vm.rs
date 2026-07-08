@@ -235,10 +235,12 @@
 //! 7. **统计信息**：记录大页使用率、TLB miss 率等性能指标
 use crate::loongarch64::paging::LoongArch64Paging;
 use crate::loongarch64::specific::phys_to_virt;
+use crate::loongarch64::task::LoongArch64TaskOps;
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
-    MapError, PagingArch, PhysPageTableRoot, find_leaf, unmap_range_entries, walk_and_map,
+    MapError, PagingArch, PhysPageTableRoot, find_leaf, protect_range_entries, unmap_range_entries,
+    walk_and_map,
 };
 
 /// 内核堆虚拟地址区域基址（在 DMW 窗口之外）
@@ -863,5 +865,53 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> bool {
     //     vaddr,
     //     size
     // );
+    true
+}
+
+pub fn sync_icache() {
+    <LoongArch64TaskOps as general::TaskOps>::sync_icache();
+}
+
+pub fn protect_kernel_heap_range(
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> bool {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    if root_paddr == 0 {
+        log::error!(
+            "[arch][heap_vm] page table not initialized yet, cannot protect: vaddr={:#x} size={:#x}",
+            vaddr,
+            size
+        );
+        return false;
+    }
+
+    let root_vaddr = phys_to_virt(root_paddr);
+    if let Err(err) = protect_range_entries::<LoongArch64Paging>(
+        root_vaddr,
+        vaddr,
+        size,
+        read,
+        write,
+        execute,
+        false,
+        true,
+        phys_to_virt,
+    ) {
+        log::error!(
+            "[arch][heap_vm] failed to protect kernel heap range: vaddr={:#x} size={:#x} error={:?}",
+            vaddr,
+            size,
+            err
+        );
+        return false;
+    }
+
+    unsafe {
+        LoongArch64Paging::flush_tlb(None);
+    }
     true
 }

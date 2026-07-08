@@ -19,6 +19,7 @@ mod start;
 mod task;
 mod trap;
 
+pub mod elm_image;
 pub use page_walk::*;
 pub use paging::*;
 pub use platform::*;

@@ -4,14 +4,14 @@ use alloc::vec::Vec;
 
 use elm_model::{
     ELM_EBI_SOURCE_ABI_VERSION, ELM_MGR_MAX_INPUT, ELM_MGR_STATUS_OK,
-    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ElmEbiArch, ElmEbiSourceKind, ElmEbiSourceRequest,
-    ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest, ElmLifecycleRequest, ElmMgrCallHeader,
-    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest,
-    ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest, ElmNexusBindRequest,
-    ElmNexusUnbindRequest, ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest,
-    ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderPortRegisterRequest,
-    ElmProviderPortUnregisterRequest, ElmProviderSnapshotRequest, ElmRuntimeEventRequest,
-    ElmRuntimeLogRequest,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_REPLACE_CELL_ABI_VERSION, ElmEbiArch,
+    ElmEbiSourceKind, ElmEbiSourceRequest, ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest,
+    ElmMgrEventUnsubscribeRequest, ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest,
+    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmProviderAsyncCancelRequest,
+    ElmProviderAsyncPollRequest, ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest,
+    ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest, ElmProviderSnapshotRequest,
+    ElmReplaceCellRequestV1, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
 };
 
 use super::{core::ElmCore, executor, menu, with_core};
@@ -48,9 +48,9 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 return response_only(ElmMgrResponseHeader::invalid());
             };
             match source_kind {
-                ElmEbiSourceKind::Eki => match elm_model::parse_eki_ebi_unit(source_payload) {
-                    Ok(unit) => {
-                        let response = core.load_ebi_unit(unit, current_ebi_arch());
+                ElmEbiSourceKind::Eki => match elm_model::parse_eki_image(source_payload) {
+                    Ok(image) => {
+                        let response = core.load_ebi_image(image, current_ebi_arch());
                         response_with_plain_payload(&response)
                     }
                     Err(_) => response_only(ElmMgrResponseHeader::invalid()),
@@ -88,21 +88,37 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
             response_with_plain_payload(&response)
         }
         ElmMgrCallKind::ReplaceCell => {
-            // TODO(elm): 热替换需要影子绑定、状态迁移和切换代回滚协议。
-            let Some(request) = read_lifecycle_request(call_payload(input, header)) else {
+            let Some((request, source_payload)) =
+                read_replace_cell_request(call_payload(input, header))
+            else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
-            let plan = core.preflight_lifecycle(ElmLifecyclePlanRequest::new(
-                request.cell_id,
-                ElmLifecycleAction::Replace,
-            ));
-            core.record_mgr_audit(
-                ElmLifecycleAction::Replace as u32,
-                ElmId(request.cell_id),
-                plan.blockers,
-                plan.final_state,
-            );
-            response_with_plain_payload(&plan)
+            let Some(source_kind) = ElmEbiSourceKind::from_raw(request.source_kind) else {
+                return response_only(ElmMgrResponseHeader::invalid());
+            };
+            match source_kind {
+                ElmEbiSourceKind::Eki => match elm_model::parse_eki_image(source_payload) {
+                    Ok(image) => {
+                        let response = core.replace_cell_from_ebi_image(
+                            ElmId(request.target_cell_id),
+                            image,
+                            current_ebi_arch(),
+                            request.migration_limit,
+                        );
+                        response_with_plain_payload(&response)
+                    }
+                    Err(_) => response_only(ElmMgrResponseHeader::invalid()),
+                },
+                _ => {
+                    core.record_mgr_audit(
+                        ElmLifecycleAction::Replace as u32,
+                        ElmId(request.target_cell_id),
+                        ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+                        0,
+                    );
+                    response_only(ElmMgrResponseHeader::todo())
+                }
+            }
         }
         ElmMgrCallKind::QueryTopology => {
             if !payload_is_empty(header) {
@@ -330,6 +346,20 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 Err(status) => response_only(response_header_from_status(status)),
             }
         }
+        ElmMgrCallKind::QueryNativeCapabilities => {
+            if !payload_is_empty(header) {
+                return response_only(ElmMgrResponseHeader::invalid());
+            }
+            let payload = core.native_capabilities_bytes();
+            response_with_payload(payload)
+        }
+        ElmMgrCallKind::QueryTodoRegistry => {
+            if !payload_is_empty(header) {
+                return response_only(ElmMgrResponseHeader::invalid());
+            }
+            let payload = core.todo_registry_bytes();
+            response_with_payload(payload)
+        }
     }
 }
 
@@ -400,6 +430,36 @@ fn read_ebi_source_request(payload: &[u8]) -> Option<(ElmEbiSourceRequest, &[u8]
         return None;
     }
     let end = request_size.checked_add(request.payload_len as usize)?;
+    if payload.len() != end {
+        return None;
+    }
+    Some((request, &payload[request_size..end]))
+}
+
+fn read_replace_cell_request(payload: &[u8]) -> Option<(ElmReplaceCellRequestV1, &[u8])> {
+    let request_size = core::mem::size_of::<ElmReplaceCellRequestV1>();
+    if payload.len() < request_size {
+        return None;
+    }
+    let request = ElmReplaceCellRequestV1 {
+        abi_version: u16::from_le_bytes(payload[0..2].try_into().ok()?),
+        flags: u16::from_le_bytes(payload[2..4].try_into().ok()?),
+        source_kind: u16::from_le_bytes(payload[4..6].try_into().ok()?),
+        reserved0: u16::from_le_bytes(payload[6..8].try_into().ok()?),
+        target_cell_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
+        migration_limit: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+        source_payload_len: u32::from_le_bytes(payload[20..24].try_into().ok()?),
+        reserved1: u64::from_le_bytes(payload[24..32].try_into().ok()?),
+    };
+    if request.abi_version != ELM_REPLACE_CELL_ABI_VERSION
+        || request.flags != 0
+        || request.reserved0 != 0
+        || request.reserved1 != 0
+        || request.target_cell_id == 0
+    {
+        return None;
+    }
+    let end = request_size.checked_add(request.source_payload_len as usize)?;
     if payload.len() != end {
         return None;
     }

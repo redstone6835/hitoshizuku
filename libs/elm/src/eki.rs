@@ -10,11 +10,14 @@ use core::str;
 use crate::ebi::{
     ELM_EBI_ABI_VERSION, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
-    ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_SEGMENTS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN,
-    ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
-    ElmEbiExtensionPointDecl, ElmEbiImportDecl, ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind,
-    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiProviderPortDecl,
-    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiTarget, ElmEbiUnit,
+    ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS,
+    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN, ElmEbiArch,
+    ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiLifecycleHookDecl,
+    ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
+    ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
+    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget,
+    ElmEbiUnit,
 };
 use crate::manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
 use crate::menu::{
@@ -46,9 +49,15 @@ const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
     8 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_RECORD_SIZE: usize =
     8 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
-const EKI_PROVIDER_PORT_RECORD_SIZE: usize = 24 + ELM_NEXUS_CONTRACT_LEN;
+pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1: usize = 24 + ELM_NEXUS_CONTRACT_LEN;
+pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2: usize =
+    ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1 + ELM_EBI_SYMBOL_NAME_LEN;
+pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE: usize =
+    ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2 + ELM_EBI_SYMBOL_NAME_LEN;
 const EKI_SYMBOL_RECORD_SIZE: usize = 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_LIFECYCLE_HOOK_RECORD_SIZE: usize = 20 + ELM_EBI_SYMBOL_NAME_LEN;
+pub const ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE: usize = 32 + ELM_EBI_SYMBOL_NAME_LEN;
+pub const ELM_EKI_RELOCATION_RECORD_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -71,6 +80,7 @@ pub enum ElmEkiBlockKind {
     Extensions = 16,
     ProviderPorts = 17,
     LifecycleHooks = 18,
+    SymbolLocations = 19,
 }
 
 impl ElmEkiBlockKind {
@@ -94,6 +104,7 @@ impl ElmEkiBlockKind {
             16 => Some(Self::Extensions),
             17 => Some(Self::ProviderPorts),
             18 => Some(Self::LifecycleHooks),
+            19 => Some(Self::SymbolLocations),
             _ => None,
         }
     }
@@ -151,6 +162,10 @@ struct EkiPayloadSegment {
 }
 
 pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> {
+    parse_eki_image(bytes).map(|image| image.unit)
+}
+
+pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     let header = parse_header(bytes)?;
     validate_header(bytes, &header)?;
 
@@ -166,6 +181,8 @@ pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> 
     let mut imports = None;
     let mut exports = None;
     let mut lifecycle_hooks = None;
+    let mut symbol_locations = None;
+    let mut relocations = None;
 
     for index in 0..header.block_count as usize {
         let desc_offset = header.block_table_offset as usize + index * ELM_EKI_BLOCK_DESC_SIZE;
@@ -208,9 +225,15 @@ pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> 
             | ElmEkiBlockKind::ReadOnlyData
             | ElmEkiBlockKind::Data
             | ElmEkiBlockKind::Bss
-            | ElmEkiBlockKind::Relocation
             | ElmEkiBlockKind::Notes => {
                 payload_segments.push(parse_payload_segment(kind, &desc, index as u32, payload)?);
+            }
+            ElmEkiBlockKind::Relocation => {
+                payload_segments.push(parse_payload_segment(kind, &desc, index as u32, payload)?);
+                if relocations.is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidSegment);
+                }
+                relocations = Some(parse_relocations(payload)?);
             }
             ElmEkiBlockKind::Imports => {
                 if imports.is_some() {
@@ -229,6 +252,12 @@ pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> 
                     return Err(ElmEbiLoadStatus::InvalidManifest);
                 }
                 lifecycle_hooks = Some(parse_lifecycle_hooks(payload)?);
+            }
+            ElmEkiBlockKind::SymbolLocations => {
+                if symbol_locations.is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidManifest);
+                }
+                symbol_locations = Some(parse_symbol_locations(payload)?);
             }
             ElmEkiBlockKind::Dependencies => {
                 if dependencies.is_some() {
@@ -306,8 +335,48 @@ pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> 
     if let Some(hooks) = lifecycle_hooks {
         unit = unit.with_lifecycle_hooks(hooks);
     }
-    unit.validate(ElmEbiArch::Any)?;
-    Ok(unit)
+    let segments = unit.segments.clone();
+    let mut image = ElmEbiImage::new(unit);
+    for (segment_index, segment) in segments.iter().enumerate() {
+        if !matches!(
+            segment.kind,
+            ElmEbiSegmentKind::Code
+                | ElmEbiSegmentKind::ReadOnlyData
+                | ElmEbiSegmentKind::Data
+                | ElmEbiSegmentKind::Bss
+        ) {
+            continue;
+        }
+        let payload = payload_segments
+            .iter()
+            .find(|payload| payload.source_index == segment.source_index)
+            .ok_or(ElmEbiLoadStatus::InvalidSegment)?;
+        let payload_bytes = if matches!(segment.kind, ElmEbiSegmentKind::Bss) {
+            Vec::new()
+        } else {
+            block_bytes_by_source(bytes, segment.source_index)?.to_vec()
+        };
+        image = image.with_payload(ElmEbiSegmentPayload::new(
+            segment_index as u32,
+            segment.source_index,
+            payload.kind,
+            payload.file_size,
+            payload.mem_size,
+            payload_bytes,
+        ));
+    }
+    if let Some(symbols) = symbol_locations {
+        for symbol in symbols {
+            image = image.with_symbol_location(symbol);
+        }
+    }
+    if let Some(relocations) = relocations {
+        for relocation in relocations {
+            image = image.with_relocation(relocation);
+        }
+    }
+    image.validate(ElmEbiArch::Any)?;
+    Ok(image)
 }
 
 fn parse_header(bytes: &[u8]) -> Result<ElmEkiHeader, ElmEbiLoadStatus> {
@@ -663,14 +732,10 @@ fn parse_extensions(payload: &[u8]) -> Result<Vec<ElmEbiExtensionDecl>, ElmEbiLo
 }
 
 fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, ElmEbiLoadStatus> {
-    let count = parse_table_count(
-        payload,
-        ELM_EBI_MAX_PROVIDER_PORTS,
-        EKI_PROVIDER_PORT_RECORD_SIZE,
-    )?;
+    let (count, record_size) = parse_provider_port_table_shape(payload)?;
     let mut providers = Vec::new();
     for index in 0..count {
-        let offset = EKI_TABLE_HEADER_SIZE + index * EKI_PROVIDER_PORT_RECORD_SIZE;
+        let offset = EKI_TABLE_HEADER_SIZE + index * record_size;
         let access = ElmPortAccessPolicy::from_raw(read_u32(payload, offset)?)
             .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
         let direction = FlowDirection::from_raw(read_u32(payload, offset + 4)?)
@@ -679,19 +744,80 @@ fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, E
             .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
         let flags = read_u32(payload, offset + 12)?;
         let contract_len = read_u16(payload, offset + 16)? as usize;
-        if read_u16(payload, offset + 18)? != 0 || read_u32(payload, offset + 20)? != 0 {
+        let handler_len = read_u16(payload, offset + 18)? as usize;
+        let snapshot_len = if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE {
+            read_u16(payload, offset + 20)? as usize
+        } else {
+            if read_u32(payload, offset + 20)? != 0 {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
+            0
+        };
+        if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE && read_u16(payload, offset + 22)? != 0
+        {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        if contract_len > ELM_NEXUS_CONTRACT_LEN
+            || handler_len > ELM_EBI_SYMBOL_NAME_LEN
+            || snapshot_len > ELM_EBI_SYMBOL_NAME_LEN
+        {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1 && handler_len != 0 {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        if record_size != ELM_EKI_PROVIDER_PORT_RECORD_SIZE && snapshot_len != 0 {
             return Err(ElmEbiLoadStatus::InvalidManifest);
         }
         let contract_start = offset + 24;
-        providers.push(ElmEbiProviderPortDecl::new(
+        let mut provider = ElmEbiProviderPortDecl::new(
             fixed_str(payload, contract_start, contract_len)?,
             access,
             direction,
             mode,
             flags,
-        )?);
+        )?;
+        if record_size != ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1 {
+            let handler_start = contract_start + ELM_NEXUS_CONTRACT_LEN;
+            if handler_len != 0 {
+                provider = provider.with_handler_symbol(fixed_str(
+                    payload,
+                    handler_start,
+                    handler_len,
+                )?)?;
+            }
+            if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE && snapshot_len != 0 {
+                let snapshot_start = handler_start + ELM_EBI_SYMBOL_NAME_LEN;
+                provider = provider.with_snapshot_symbol(fixed_str(
+                    payload,
+                    snapshot_start,
+                    snapshot_len,
+                )?)?;
+            }
+        }
+        providers.push(provider);
     }
     Ok(providers)
+}
+
+fn parse_provider_port_table_shape(payload: &[u8]) -> Result<(usize, usize), ElmEbiLoadStatus> {
+    if payload.len() < EKI_TABLE_HEADER_SIZE {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    let count = read_u32(payload, 0)? as usize;
+    let reserved = read_u32(payload, 4)?;
+    if reserved != 0 || count > ELM_EBI_MAX_PROVIDER_PORTS {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    let old_size = table_expected_size(count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1)?;
+    let v2_size = table_expected_size(count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2)?;
+    let new_size = table_expected_size(count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE)?;
+    match payload.len() {
+        len if len == new_size => Ok((count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE)),
+        len if len == v2_size => Ok((count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2)),
+        len if len == old_size => Ok((count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1)),
+        _ => Err(ElmEbiLoadStatus::InvalidManifest),
+    }
 }
 
 fn parse_imports(payload: &[u8]) -> Result<Vec<ElmEbiImportDecl>, ElmEbiLoadStatus> {
@@ -717,12 +843,15 @@ fn parse_exports(payload: &[u8]) -> Result<Vec<ElmEbiExportDecl>, ElmEbiLoadStat
 }
 
 fn parse_lifecycle_hooks(payload: &[u8]) -> Result<ElmEbiLifecycleHooks, ElmEbiLoadStatus> {
-    let count = parse_table_count(payload, 2, EKI_LIFECYCLE_HOOK_RECORD_SIZE)?;
-    if count != 2 {
+    let count = parse_table_count(payload, 5, EKI_LIFECYCLE_HOOK_RECORD_SIZE)?;
+    if !(2..=5).contains(&count) {
         return Err(ElmEbiLoadStatus::InvalidManifest);
     }
     let mut initialize = None;
     let mut finalize = None;
+    let mut migrate_export = None;
+    let mut migrate_import = None;
+    let mut migrate_abort = None;
     for index in 0..count {
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_LIFECYCLE_HOOK_RECORD_SIZE;
         let hook = parse_lifecycle_hook_record(payload, offset)?;
@@ -737,12 +866,28 @@ fn parse_lifecycle_hooks(payload: &[u8]) -> Result<ElmEbiLifecycleHooks, ElmEbiL
                     return Err(ElmEbiLoadStatus::InvalidManifest);
                 }
             }
+            ElmEbiLifecycleHookKind::MigrateExport => {
+                if migrate_export.replace(hook).is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidManifest);
+                }
+            }
+            ElmEbiLifecycleHookKind::MigrateImport => {
+                if migrate_import.replace(hook).is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidManifest);
+                }
+            }
+            ElmEbiLifecycleHookKind::MigrateAbort => {
+                if migrate_abort.replace(hook).is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidManifest);
+                }
+            }
         }
     }
     ElmEbiLifecycleHooks::new(
         initialize.ok_or(ElmEbiLoadStatus::InvalidManifest)?,
         finalize.ok_or(ElmEbiLoadStatus::InvalidManifest)?,
-    )
+    )?
+    .with_migration_hooks(migrate_export, migrate_import, migrate_abort)
 }
 
 fn parse_lifecycle_hook_record(
@@ -766,6 +911,67 @@ fn parse_lifecycle_hook_record(
         signature,
         flags,
     )
+}
+
+fn parse_symbol_locations(
+    payload: &[u8],
+) -> Result<Vec<ElmEbiSymbolLocationDecl>, ElmEbiLoadStatus> {
+    let count = parse_table_count(
+        payload,
+        ELM_EBI_MAX_SYMBOL_LOCATIONS,
+        ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE,
+    )?;
+    let mut symbols = Vec::new();
+    for index in 0..count {
+        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE;
+        let name_len = read_u16(payload, offset)? as usize;
+        if name_len > ELM_EBI_SYMBOL_NAME_LEN || read_u16(payload, offset + 2)? != 0 {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        let flags = read_u32(payload, offset + 4)?;
+        let segment_index = read_u32(payload, offset + 8)?;
+        if read_u32(payload, offset + 12)? != 0 {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        let symbol_offset = read_u64(payload, offset + 16)?;
+        let symbol_size = read_u64(payload, offset + 24)?;
+        symbols.push(ElmEbiSymbolLocationDecl::new(
+            fixed_str(payload, offset + 32, name_len)?,
+            segment_index,
+            symbol_offset,
+            symbol_size,
+            flags,
+        )?);
+    }
+    Ok(symbols)
+}
+
+fn parse_relocations(payload: &[u8]) -> Result<Vec<ElmEbiRelocationDecl>, ElmEbiLoadStatus> {
+    let count = parse_table_count(
+        payload,
+        ELM_EBI_MAX_RELOCATIONS,
+        ELM_EKI_RELOCATION_RECORD_SIZE,
+    )?;
+    let mut relocations = Vec::new();
+    for index in 0..count {
+        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_RELOCATION_RECORD_SIZE;
+        let kind = ElmEbiRelocationKind::from_raw(read_u32(payload, offset)?)
+            .ok_or(ElmEbiLoadStatus::InvalidSegment)?;
+        let flags = read_u32(payload, offset + 4)?;
+        let target_segment_index = read_u32(payload, offset + 8)?;
+        let value_index = read_u32(payload, offset + 12)?;
+        let target_offset = read_u64(payload, offset + 16)?;
+        let addend = read_i64(payload, offset + 24)?;
+        relocations.push(ElmEbiRelocationDecl::new(
+            kind,
+            flags,
+            target_segment_index,
+            target_offset,
+            value_index,
+            addend,
+        )?);
+    }
+    Ok(relocations)
 }
 
 fn parse_symbol_record(
@@ -811,17 +1017,21 @@ fn parse_table_count(
     if reserved != 0 || count > max_count {
         return Err(ElmEbiLoadStatus::InvalidManifest);
     }
-    let expected = EKI_TABLE_HEADER_SIZE
+    let expected = table_expected_size(count, record_size)?;
+    if payload.len() != expected {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    Ok(count)
+}
+
+fn table_expected_size(count: usize, record_size: usize) -> Result<usize, ElmEbiLoadStatus> {
+    EKI_TABLE_HEADER_SIZE
         .checked_add(
             count
                 .checked_mul(record_size)
                 .ok_or(ElmEbiLoadStatus::InvalidManifest)?,
         )
-        .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
-    if payload.len() != expected {
-        return Err(ElmEbiLoadStatus::InvalidManifest);
-    }
-    Ok(count)
+        .ok_or(ElmEbiLoadStatus::InvalidManifest)
 }
 
 fn fixed_str(bytes: &[u8], offset: usize, len: usize) -> Result<String, ElmEbiLoadStatus> {
@@ -854,8 +1064,29 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ElmEbiLoadStatus> {
     ))
 }
 
+fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, ElmEbiLoadStatus> {
+    Ok(i64::from_le_bytes(
+        read_bytes(bytes, offset, 8)?
+            .try_into()
+            .map_err(|_| ElmEbiLoadStatus::InvalidUnit)?,
+    ))
+}
+
 fn read_bytes(bytes: &[u8], offset: usize, len: usize) -> Result<&[u8], ElmEbiLoadStatus> {
     checked_range(bytes, offset, len)
+}
+
+fn block_bytes_by_source(bytes: &[u8], source_index: u32) -> Result<&[u8], ElmEbiLoadStatus> {
+    let header = parse_header(bytes)?;
+    validate_header(bytes, &header)?;
+    if source_index >= header.block_count {
+        return Err(ElmEbiLoadStatus::InvalidSegment);
+    }
+    let desc_offset =
+        header.block_table_offset as usize + source_index as usize * ELM_EKI_BLOCK_DESC_SIZE;
+    let desc = parse_block_desc(bytes, desc_offset)?;
+    validate_block_desc(bytes, &desc)?;
+    block_payload(bytes, &desc)
 }
 
 fn checked_range(bytes: &[u8], offset: usize, len: usize) -> Result<&[u8], ElmEbiLoadStatus> {

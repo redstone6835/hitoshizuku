@@ -48,6 +48,8 @@ pub const ELM_MGR_ACTION_API_QUERY: u32 = 1 << 15;
 pub const ELM_MGR_ACTION_EVENT_SUBSCRIBE: u32 = 1 << 16;
 pub const ELM_MGR_ACTION_EVENT_UNSUBSCRIBE: u32 = 1 << 17;
 pub const ELM_MGR_ACTION_EVENT_READ: u32 = 1 << 18;
+pub const ELM_MGR_ACTION_NATIVE_CAPABILITY_QUERY: u32 = 1 << 19;
+pub const ELM_MGR_ACTION_TODO_QUERY: u32 = 1 << 20;
 
 pub const ELM_MGR_POLICY_PREFLIGHT: u64 = 1 << 0;
 pub const ELM_MGR_POLICY_AUDIT: u64 = 1 << 1;
@@ -61,6 +63,8 @@ pub const ELM_MGR_POLICY_HEALTH: u64 = 1 << 8;
 pub const ELM_MGR_POLICY_PROVIDER_ASYNC: u64 = 1 << 9;
 pub const ELM_MGR_POLICY_API_REGISTRY: u64 = 1 << 10;
 pub const ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS: u64 = 1 << 11;
+pub const ELM_MGR_POLICY_NATIVE_CAPABILITIES: u64 = 1 << 12;
+pub const ELM_MGR_POLICY_TODO_REGISTRY: u64 = 1 << 13;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -97,10 +101,28 @@ pub const ELM_PROVIDER_PORT_FLAG_NONE: u32 = 0;
 pub const ELM_PROVIDER_FLAG_DYNAMIC: u16 = 1 << 0;
 pub const ELM_PROVIDER_FLAG_KERNEL_BACKEND: u16 = 1 << 1;
 pub const ELM_PROVIDER_FLAG_TODO_BACKEND: u16 = 1 << 2;
+pub const ELM_PROVIDER_FLAG_NATIVE_BACKEND: u16 = 1 << 3;
 pub const ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS: u32 = 5_000;
 pub const ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS: u32 = 30_000;
 pub const ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS: u32 = 60_000;
 pub const ELM_PROVIDER_ASYNC_QUEUE_LIMIT: u32 = 64;
+pub const ELM_NATIVE_CAPABILITY_KIND_EXPORT: u32 = 1;
+pub const ELM_NATIVE_CAPABILITY_KIND_IMPORT: u32 = 2;
+pub const ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED: u32 = 1 << 0;
+pub const ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD: u32 = 1 << 1;
+pub const ELM_NATIVE_CAPABILITY_NAME_LEN: usize = 128;
+pub const ELM_REPLACE_CELL_ABI_VERSION: u16 = 1;
+pub const ELM_REPLACE_MIGRATION_STATE_MAX: usize = 64 * 1024;
+pub const ELM_TODO_KIND_RUNTIME: u32 = 1;
+pub const ELM_TODO_KIND_PROVIDER: u32 = 2;
+pub const ELM_TODO_KIND_SOURCE: u32 = 3;
+pub const ELM_TODO_KIND_NATIVE: u32 = 4;
+pub const ELM_TODO_KIND_FRAMEWORK: u32 = 5;
+pub const ELM_TODO_REGISTRY_FLAG_TRUNCATED: u32 = 1 << 0;
+pub const ELM_TODO_FLAG_STATIC: u32 = 1 << 0;
+pub const ELM_TODO_FLAG_ACTIVE: u32 = 1 << 1;
+pub const ELM_TODO_NAME_LEN: usize = 64;
+pub const ELM_TODO_DETAIL_LEN: usize = 128;
 
 pub const ELM_HEALTH_FLAG_HAS_FAILURES: u32 = 1 << 0;
 
@@ -113,6 +135,8 @@ pub const ELM_HEALTH_CHECK_RUNTIME_PORTS: u32 = 6;
 pub const ELM_HEALTH_CHECK_MENU: u32 = 7;
 pub const ELM_HEALTH_CHECK_EVENTS: u32 = 8;
 pub const ELM_HEALTH_CHECK_AUDITS: u32 = 9;
+pub const ELM_HEALTH_CHECK_NATIVE_CAPABILITIES: u32 = 10;
+pub const ELM_HEALTH_CHECK_TODO_REGISTRY: u32 = 11;
 
 pub const ELM_HEALTH_DETAIL_NONE: u64 = 0;
 pub const ELM_HEALTH_DETAIL_GRAPH_INVALID: u64 = 1;
@@ -162,6 +186,8 @@ pub enum ElmMgrCallKind {
     QueryEventSubscriptions = 33,
     ReadSubscribedEvents = 34,
     QueryProviderSnapshot = 35,
+    QueryNativeCapabilities = 36,
+    QueryTodoRegistry = 37,
 }
 
 impl ElmMgrCallKind {
@@ -202,6 +228,8 @@ impl ElmMgrCallKind {
             33 => Some(Self::QueryEventSubscriptions),
             34 => Some(Self::ReadSubscribedEvents),
             35 => Some(Self::QueryProviderSnapshot),
+            36 => Some(Self::QueryNativeCapabilities),
+            37 => Some(Self::QueryTodoRegistry),
             _ => None,
         }
     }
@@ -348,6 +376,68 @@ impl ElmLifecycleResponse {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmReplaceCellRequestV1 {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub source_kind: u16,
+    pub reserved0: u16,
+    pub target_cell_id: u64,
+    pub migration_limit: u32,
+    pub source_payload_len: u32,
+    pub reserved1: u64,
+}
+
+impl ElmReplaceCellRequestV1 {
+    pub const fn new(target_cell_id: u64, source_kind: u16, source_payload_len: u32) -> Self {
+        Self {
+            abi_version: ELM_REPLACE_CELL_ABI_VERSION,
+            flags: 0,
+            source_kind,
+            reserved0: 0,
+            target_cell_id,
+            migration_limit: 0,
+            source_payload_len,
+            reserved1: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmReplaceCellResponseV1 {
+    pub cell_id: u64,
+    pub status: i32,
+    pub final_state: u32,
+    pub generation: u64,
+    pub migrated_len: u32,
+    pub reason: u32,
+    pub blockers: u64,
+}
+
+impl ElmReplaceCellResponseV1 {
+    pub const fn new(
+        cell_id: u64,
+        status: i32,
+        final_state: u32,
+        generation: u64,
+        migrated_len: u32,
+        reason: u32,
+        blockers: u64,
+    ) -> Self {
+        Self {
+            cell_id,
+            status,
+            final_state,
+            generation,
+            migrated_len,
+            reason,
+            blockers,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmLifecyclePlanRequest {
     pub cell_id: u64,
     pub action: u32,
@@ -444,11 +534,13 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_ACTION_API_QUERY
                 | ELM_MGR_ACTION_EVENT_SUBSCRIBE
                 | ELM_MGR_ACTION_EVENT_UNSUBSCRIBE
-                | ELM_MGR_ACTION_EVENT_READ,
+                | ELM_MGR_ACTION_EVENT_READ
+                | ELM_MGR_ACTION_NATIVE_CAPABILITY_QUERY
+                | ELM_MGR_ACTION_TODO_QUERY
+                | ELM_MGR_ACTION_REPLACE,
             policy_flags: ELM_MGR_POLICY_PREFLIGHT
                 | ELM_MGR_POLICY_AUDIT
                 | ELM_MGR_POLICY_LOAD_REQUIRES_EBI_SOURCE
-                | ELM_MGR_POLICY_REPLACE_TODO
                 | ELM_MGR_POLICY_NATIVE_LIFECYCLE_TODO
                 | ELM_MGR_POLICY_NEXUS_BINDING
                 | ELM_MGR_POLICY_MENU_BINDING
@@ -456,7 +548,9 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_POLICY_HEALTH
                 | ELM_MGR_POLICY_PROVIDER_ASYNC
                 | ELM_MGR_POLICY_API_REGISTRY
-                | ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS,
+                | ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS
+                | ELM_MGR_POLICY_NATIVE_CAPABILITIES
+                | ELM_MGR_POLICY_TODO_REGISTRY,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -465,7 +559,6 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_HAS_DEPENDENTS
                 | ELM_POLICY_BLOCK_HAS_EXTENSIONS
                 | ELM_POLICY_BLOCK_LEASE_BUSY
-                | ELM_POLICY_BLOCK_REPLACE_TODO
                 | ELM_POLICY_BLOCK_GRAPH_INCONSISTENT
                 | ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE
                 | ELM_POLICY_BLOCK_PORT_NOT_FOUND
@@ -484,6 +577,157 @@ impl ElmMgrPolicyInfo {
             audit_capacity,
             reserved1: 0,
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeCapabilityHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub flags: u32,
+    pub reserved: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmNativeCapabilityHeader {
+    pub const fn new(record_count: u32, flags: u32, event_sequence: u64) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmNativeCapabilityRecord>() as u16,
+            record_count,
+            flags,
+            reserved: 0,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeCapabilityRecord {
+    pub kind: u32,
+    pub status: i32,
+    pub owner_cell_id: u64,
+    pub peer_cell_id: u64,
+    pub requested_version: u32,
+    pub selected_version: u32,
+    pub flags: u32,
+    pub name_len: u16,
+    pub contract_len: u16,
+    pub reserved: u32,
+    pub name: [u8; ELM_NATIVE_CAPABILITY_NAME_LEN],
+    pub contract: [u8; ELM_NEXUS_CONTRACT_LEN],
+}
+
+impl ElmNativeCapabilityRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: u32,
+        status: i32,
+        owner_cell_id: u64,
+        peer_cell_id: u64,
+        requested_version: u32,
+        selected_version: u32,
+        flags: u32,
+        name: &str,
+        contract: &str,
+    ) -> Self {
+        let mut out = Self {
+            kind,
+            status,
+            owner_cell_id,
+            peer_cell_id,
+            requested_version,
+            selected_version,
+            flags,
+            name_len: 0,
+            contract_len: 0,
+            reserved: 0,
+            name: [0; ELM_NATIVE_CAPABILITY_NAME_LEN],
+            contract: [0; ELM_NEXUS_CONTRACT_LEN],
+        };
+        out.name_len = copy_str(name, &mut out.name) as u16;
+        out.contract_len = copy_str(contract, &mut out.contract) as u16;
+        out
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmTodoRegistryHeader {
+    pub abi_version: u16,
+    pub record_entry_size: u16,
+    pub record_count: u32,
+    pub active_count: u32,
+    pub flags: u32,
+    pub event_sequence: u64,
+}
+
+impl ElmTodoRegistryHeader {
+    pub const fn new(record_count: u32, active_count: u32, event_sequence: u64) -> Self {
+        Self::new_with_flags(record_count, active_count, 0, event_sequence)
+    }
+
+    pub const fn new_with_flags(
+        record_count: u32,
+        active_count: u32,
+        flags: u32,
+        event_sequence: u64,
+    ) -> Self {
+        Self {
+            abi_version: ELM_CTL_ABI_VERSION,
+            record_entry_size: core::mem::size_of::<ElmTodoRegistryRecord>() as u16,
+            record_count,
+            active_count,
+            flags,
+            event_sequence,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmTodoRegistryRecord {
+    pub kind: u32,
+    pub flags: u32,
+    pub blocker: u64,
+    pub subject_id: u64,
+    pub status: i32,
+    pub name_len: u16,
+    pub detail_len: u16,
+    pub reserved: u32,
+    pub name: [u8; ELM_TODO_NAME_LEN],
+    pub detail: [u8; ELM_TODO_DETAIL_LEN],
+}
+
+impl ElmTodoRegistryRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: u32,
+        flags: u32,
+        blocker: u64,
+        subject_id: u64,
+        status: i32,
+        name: &str,
+        detail: &str,
+    ) -> Self {
+        let mut out = Self {
+            kind,
+            flags,
+            blocker,
+            subject_id,
+            status,
+            name_len: 0,
+            detail_len: 0,
+            reserved: 0,
+            name: [0; ELM_TODO_NAME_LEN],
+            detail: [0; ELM_TODO_DETAIL_LEN],
+        };
+        out.name_len = copy_str(name, &mut out.name) as u16;
+        out.detail_len = copy_str(detail, &mut out.detail) as u16;
+        out
     }
 }
 

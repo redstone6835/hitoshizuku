@@ -150,6 +150,10 @@ pub fn kernel_start_init(context: &StartContext) {
             alloc_ops.map_kernel_heap_range,
             alloc_ops.unmap_kernel_heap_range,
         );
+        general::elm_image::register_elm_image_ops(
+            alloc_ops.protect_kernel_heap_range,
+            alloc_ops.sync_icache,
+        );
         (alloc_ops.init_kernel_page_table)();
         KERNEL_ALLOCATOR
             .init_vmem(&kernel_reserved)

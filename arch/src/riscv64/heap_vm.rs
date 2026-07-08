@@ -30,7 +30,9 @@
 
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use general::{MapError, PagingArch, find_leaf, unmap_range_entries, walk_and_map};
+use general::{
+    MapError, PagingArch, find_leaf, protect_range_entries, unmap_range_entries, walk_and_map,
+};
 
 use crate::riscv64::paging::Riscv64Paging;
 use crate::riscv64::specific::phys_to_virt;
@@ -416,6 +418,37 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> Result<(), MapError
     let root_vaddr = phys_to_virt(root_paddr);
 
     unmap_range_entries::<Riscv64Paging>(root_vaddr, vaddr, size, true, phys_to_virt)?;
+
+    unsafe {
+        Riscv64Paging::flush_tlb(None);
+    }
+    Ok(())
+}
+
+pub fn protect_kernel_heap_range(
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> Result<(), MapError> {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    if root_paddr == 0 {
+        return Err(MapError::OutOfMemory);
+    }
+    let root_vaddr = phys_to_virt(root_paddr);
+
+    protect_range_entries::<Riscv64Paging>(
+        root_vaddr,
+        vaddr,
+        size,
+        read,
+        write,
+        execute,
+        false,
+        true,
+        phys_to_virt,
+    )?;
 
     unsafe {
         Riscv64Paging::flush_tlb(None);
