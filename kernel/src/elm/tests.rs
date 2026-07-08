@@ -8,11 +8,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use elm_model::{
-    ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_CALL_STATUS_INVALID,
-    ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_UNSUPPORTED,
-    ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_NAME_LEN,
-    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
-    ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN,
+    ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_CALL_STATUS_BUSY,
+    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
+    ELM_CALL_STATUS_UNSUPPORTED, ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE,
+    ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_FORMAT_VERSION,
+    ELM_EKI_HEADER_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN,
     ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
     ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU,
     ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROVIDERS,
@@ -23,16 +23,17 @@ use elm_model::{
     ELM_MGR_STATUS_UNSUPPORTED, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NEXUS_CONTRACT_LEN,
     ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
     ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
-    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_PROVIDER_ASYNC_QUEUE_LIMIT,
-    ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_NATIVE_BACKEND,
-    ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest, ElmCallFrame, ElmContext,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiLifecycleHookKind,
-    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiRustHookSignature, ElmEbiSegment,
-    ElmEbiSegmentKind, ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit,
-    ElmEkiBlockKind, ElmError, ElmId, ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase,
-    ElmManifest, ElmMenuItemKind, ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader,
-    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
+    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
+    ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
+    ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
+    ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest,
+    ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch,
+    ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
+    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind,
+    ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind, ElmError, ElmId,
+    ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase, ElmManifest, ElmMenuItemKind,
+    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
+    ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest, ElmName, ElmNativeCapabilityHeader, ElmNativeEntryFrameV1,
     ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusUnbindRequest, ElmPortAccessPolicy,
@@ -834,6 +835,33 @@ fn provider_stats_by_port(core: &mut ElmCore, port_id: u64) -> Option<(u32, u64,
     None
 }
 
+#[allow(clippy::type_complexity)]
+fn provider_queue_stats_by_port(
+    core: &mut ElmCore,
+    port_id: u64,
+    now_ns: u64,
+) -> Option<(u32, u32, u32, u64, u64, u64, u64)> {
+    let bytes = core.provider_queue_bytes(now_ns);
+    let header_size = core::mem::size_of::<ElmProviderQueueStatsHeader>();
+    let record_size = read_u16(&bytes, 2) as usize;
+    let record_count = read_u32(&bytes, 4) as usize;
+    for index in 0..record_count {
+        let offset = header_size + index * record_size;
+        if read_u64(&bytes, offset) == port_id {
+            return Some((
+                read_u32(&bytes, offset + 8),
+                read_u32(&bytes, offset + 12),
+                read_u32(&bytes, offset + 16),
+                read_u64(&bytes, offset + 32),
+                read_u64(&bytes, offset + 40),
+                read_u64(&bytes, offset + 48),
+                read_u64(&bytes, offset + 56),
+            ));
+        }
+    }
+    None
+}
+
 #[ktest]
 fn elm_builtin_mgr_init_health_is_clean() {
     let mut core = ElmCore::new();
@@ -906,8 +934,13 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
         read_u16(&bytes, 2) as usize,
         core::mem::size_of::<ElmTodoRegistryRecord>()
     );
-    assert!(read_u32(&bytes, 4) >= 8);
-    assert!(read_u32(&bytes, 8) >= 8);
+    assert!(read_u32(&bytes, 4) >= 7);
+    assert!(read_u32(&bytes, 8) >= 7);
+    assert!(
+        !bytes
+            .windows("runtime.running_call_cancel".len())
+            .any(|window| window == b"runtime.running_call_cancel")
+    );
     assert_eq!(
         bytes.len(),
         core::mem::size_of::<ElmTodoRegistryHeader>()
@@ -1731,6 +1764,119 @@ fn elm_provider_async_cancel_queued_job_releases_lease() {
     let unbind = core.preflight_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
     assert_eq!(unbind.status, ELM_MGR_STATUS_OK);
     assert_eq!(unbind.allowed, 1);
+}
+
+#[ktest]
+fn elm_provider_async_running_job_is_observable_and_cancelable() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let (action, bind_response) = bind_mgr_action_provider(&mut core);
+
+    let payload = action_invoke_payload(&ElmActionInvokeRequest::new(action));
+    let frame = ElmCallFrame::new(
+        bind_response.binding_id,
+        103,
+        ELM_ACTION_OPCODE_INVOKE,
+        &payload,
+    );
+    let now = sched::now_ns_public();
+    let submit =
+        core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1_000, 1_000), now);
+    assert_eq!(submit.status, ELM_MGR_STATUS_OK);
+    assert!(
+        core.move_provider_ticket_to_running_for_test(submit.ticket_id, now.saturating_add(1_000))
+    );
+
+    let poll = core.poll_provider_reply(
+        ElmProviderAsyncPollRequest::new(submit.ticket_id),
+        now.saturating_add(2_000),
+    );
+    assert_eq!(poll.state, ElmProviderAsyncState::Running as u32);
+    assert_eq!(poll.status, ELM_MGR_STATUS_BUSY);
+    assert_eq!(poll.reply.status, ELM_CALL_STATUS_BUSY);
+    assert_eq!(poll.blockers, 0);
+
+    let stats = provider_queue_stats_by_port(&mut core, 4, now.saturating_add(3_000)).unwrap();
+    assert_eq!(stats.0, 0);
+    assert_eq!(stats.1, 1);
+    assert_eq!(stats.2, 0);
+    assert_eq!(stats.5, 0);
+
+    let cancel = core.cancel_provider_call(
+        ElmProviderAsyncCancelRequest::new(submit.ticket_id),
+        now.saturating_add(4_000),
+    );
+    assert_eq!(cancel.state, ElmProviderAsyncState::Running as u32);
+    assert_eq!(cancel.status, ELM_MGR_STATUS_BUSY);
+    assert_ne!(cancel.blockers & ELM_POLICY_BLOCK_PROVIDER_BUSY, 0);
+
+    let poll = core.poll_provider_reply(
+        ElmProviderAsyncPollRequest::new(submit.ticket_id),
+        now.saturating_add(5_000),
+    );
+    assert_eq!(poll.state, ElmProviderAsyncState::Running as u32);
+    assert_ne!(poll.blockers & ELM_POLICY_BLOCK_PROVIDER_BUSY, 0);
+
+    let unbind = core.preflight_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
+    assert_eq!(unbind.status, ELM_MGR_STATUS_BUSY);
+    assert_ne!(unbind.blockers & ELM_POLICY_BLOCK_LEASE_BUSY, 0);
+
+    assert!(core.finish_provider_ticket_for_test(submit.ticket_id, now.saturating_add(6_000)));
+    let poll = core.poll_provider_reply(
+        ElmProviderAsyncPollRequest::new(submit.ticket_id),
+        now.saturating_add(7_000),
+    );
+    assert_eq!(poll.state, ElmProviderAsyncState::Canceled as u32);
+    assert_eq!(poll.status, ELM_MGR_STATUS_OK);
+    assert_eq!(poll.reply.status, ELM_CALL_STATUS_BUSY);
+
+    let stats = provider_queue_stats_by_port(&mut core, 4, now.saturating_add(8_000)).unwrap();
+    assert_eq!(stats.1, 0);
+    assert_eq!(stats.2, 0);
+    assert_eq!(stats.5, 1);
+
+    let unbind = core.preflight_unbind(ElmNexusUnbindRequest::new(bind_response.binding_id));
+    assert_eq!(unbind.status, ELM_MGR_STATUS_OK);
+    assert_eq!(unbind.allowed, 1);
+}
+
+#[ktest]
+fn elm_provider_async_running_timeout_is_retained_until_poll() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let (action, bind_response) = bind_mgr_action_provider(&mut core);
+
+    let payload = action_invoke_payload(&ElmActionInvokeRequest::new(action));
+    let frame = ElmCallFrame::new(
+        bind_response.binding_id,
+        104,
+        ELM_ACTION_OPCODE_INVOKE,
+        &payload,
+    );
+    let now = sched::now_ns_public();
+    let submit =
+        core.submit_provider_call(ElmProviderAsyncSubmitRequest::new(frame, 1, 1_000), now);
+    assert_eq!(submit.status, ELM_MGR_STATUS_OK);
+    assert!(
+        core.move_provider_ticket_to_running_for_test(
+            submit.ticket_id,
+            now.saturating_add(100_000)
+        )
+    );
+    assert!(core.finish_provider_ticket_for_test(submit.ticket_id, now.saturating_add(2_000_000)));
+
+    let poll = core.poll_provider_reply(
+        ElmProviderAsyncPollRequest::new(submit.ticket_id),
+        now.saturating_add(2_100_000),
+    );
+    assert_eq!(poll.state, ElmProviderAsyncState::Expired as u32);
+    assert_eq!(poll.status, ELM_MGR_STATUS_BUSY);
+    assert_ne!(poll.blockers & ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, 0);
+
+    let stats = provider_queue_stats_by_port(&mut core, 4, now.saturating_add(2_200_000)).unwrap();
+    assert_eq!(stats.1, 0);
+    assert_eq!(stats.2, 0);
+    assert_eq!(stats.6, 1);
 }
 
 #[ktest]

@@ -302,6 +302,13 @@ struct ProviderAsyncJob {
 }
 
 #[derive(Debug, Clone)]
+struct ProviderRunningCall {
+    job: ProviderAsyncJob,
+    started_at_ns: u64,
+    cancel_requested: bool,
+}
+
+#[derive(Debug, Clone)]
 struct ProviderAsyncResult {
     ticket: u64,
     port: PortId,
@@ -455,6 +462,7 @@ pub(crate) struct ElmCore {
     ports: Vec<PortRuntime>,
     providers: Vec<ProviderRuntime>,
     provider_jobs: VecDeque<ProviderAsyncJob>,
+    provider_running: Vec<ProviderRunningCall>,
     provider_results: VecDeque<ProviderAsyncResult>,
     runtime_ports: Vec<RuntimePortBinding>,
     menu_items: Vec<MenuItemRuntime>,
@@ -496,6 +504,7 @@ impl ElmCore {
             ports: Vec::new(),
             providers: Vec::new(),
             provider_jobs: VecDeque::new(),
+            provider_running: Vec::new(),
             provider_results: VecDeque::new(),
             runtime_ports: Vec::new(),
             menu_items: Vec::new(),
@@ -1286,7 +1295,7 @@ impl ElmCore {
             let record = ElmProviderQueueStatsRecord::new(
                 provider.port.0,
                 self.provider_queued_count(provider.port) as u32,
-                provider.in_flight,
+                self.provider_running_count(provider.port) as u32,
                 self.provider_retained_result_count(provider.port) as u32,
                 provider.queue_limit,
                 provider.max_in_flight,
@@ -1347,7 +1356,7 @@ impl ElmCore {
         let provider = &self.providers[provider_index];
         let pending = self
             .provider_queued_count(provider.port)
-            .saturating_add(provider.in_flight as usize);
+            .saturating_add(self.provider_in_flight_count(provider));
         if pending >= provider.queue_limit as usize {
             let blockers = ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL;
             self.providers[provider_index].async_rejected = self.providers[provider_index]
@@ -1446,6 +1455,30 @@ impl ElmCore {
             );
         }
 
+        if let Some(running) = self
+            .provider_running
+            .iter()
+            .find(|running| running.job.ticket == request.ticket_id)
+        {
+            let blockers = if running.cancel_requested {
+                ELM_POLICY_BLOCK_PROVIDER_BUSY
+            } else {
+                0
+            };
+            return ElmProviderAsyncPollResponse::new(
+                running.job.ticket,
+                ElmProviderAsyncState::Running,
+                ELM_MGR_STATUS_BUSY,
+                ElmReplyFrame::empty(
+                    running.job.frame.binding_id,
+                    running.job.frame.call_id,
+                    ELM_CALL_STATUS_BUSY,
+                ),
+                blockers,
+                running.job.deadline_ns,
+            );
+        }
+
         if let Some(index) = self
             .provider_results
             .iter()
@@ -1508,6 +1541,28 @@ impl ElmCore {
                 ElmProviderAsyncState::Canceled,
                 ELM_MGR_STATUS_OK,
                 0,
+            );
+        }
+
+        if let Some(index) = self
+            .provider_running
+            .iter()
+            .position(|running| running.job.ticket == request.ticket_id)
+        {
+            if !self.provider_running[index].cancel_requested {
+                let binding_id = self.provider_running[index].job.frame.binding_id;
+                self.provider_running[index].cancel_requested = true;
+                self.record_provider_async_audit(
+                    binding_id,
+                    ELM_MGR_STATUS_BUSY,
+                    ELM_POLICY_BLOCK_PROVIDER_BUSY,
+                );
+            }
+            return ElmProviderAsyncCancelResponse::new(
+                request.ticket_id,
+                ElmProviderAsyncState::Running,
+                ELM_MGR_STATUS_BUSY,
+                ELM_POLICY_BLOCK_PROVIDER_BUSY,
             );
         }
 
@@ -1582,32 +1637,68 @@ impl ElmCore {
             );
             return true;
         };
-        self.providers[provider_index].in_flight =
-            self.providers[provider_index].in_flight.saturating_add(1);
+        self.begin_provider_running_call(job.clone(), provider_index, now_ns);
 
         let (state, status, reply, blockers) = self.execute_provider_async_job(&job);
         let finish_ns = sched::now_ns_public();
-        let (state, status, reply, blockers) = if finish_ns >= job.deadline_ns {
-            (
-                ElmProviderAsyncState::Expired,
-                ELM_MGR_STATUS_BUSY,
-                ElmReplyFrame::empty(
-                    job.frame.binding_id,
-                    job.frame.call_id,
-                    ELM_CALL_STATUS_BUSY,
-                ),
-                ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
-            )
-        } else {
-            (state, status, reply, blockers)
-        };
-
-        if let Some(provider_index) = self.provider_index(job.port) {
-            self.providers[provider_index].in_flight =
-                self.providers[provider_index].in_flight.saturating_sub(1);
-        }
-        self.finish_provider_async_job(job, state, status, reply, blockers, finish_ns);
+        self.finish_provider_running_call(job.ticket, state, status, reply, blockers, finish_ns);
         true
+    }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn move_provider_ticket_to_running_for_test(
+        &mut self,
+        ticket: u64,
+        now_ns: u64,
+    ) -> bool {
+        let Some(job_index) = self
+            .provider_jobs
+            .iter()
+            .position(|job| job.ticket == ticket)
+        else {
+            return false;
+        };
+        let job = self
+            .provider_jobs
+            .remove(job_index)
+            .expect("job index valid");
+        let Some(provider_index) = self.provider_index(job.port) else {
+            self.finish_provider_async_job(
+                job,
+                ElmProviderAsyncState::Failed,
+                ELM_MGR_STATUS_NOT_FOUND,
+                ElmReplyFrame::empty(0, 0, ELM_CALL_STATUS_NOT_FOUND),
+                ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
+                now_ns,
+            );
+            return false;
+        };
+        self.begin_provider_running_call(job, provider_index, now_ns);
+        true
+    }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn finish_provider_ticket_for_test(&mut self, ticket: u64, finish_ns: u64) -> bool {
+        let Some(running) = self
+            .provider_running
+            .iter()
+            .find(|running| running.job.ticket == ticket)
+        else {
+            return false;
+        };
+        let reply = ElmReplyFrame::empty(
+            running.job.frame.binding_id,
+            running.job.frame.call_id,
+            ELM_CALL_STATUS_OK,
+        );
+        self.finish_provider_running_call(
+            ticket,
+            ElmProviderAsyncState::Completed,
+            ELM_MGR_STATUS_OK,
+            reply,
+            0,
+            finish_ns,
+        )
     }
 
     pub fn health_bytes(&self) -> Vec<u8> {
@@ -1735,7 +1826,7 @@ impl ElmCore {
         } else if self.provider_binding_count(port) != 0
             || self.provider_queued_count(port) != 0
             || self.provider_retained_result_count(port) != 0
-            || provider.in_flight != 0
+            || self.provider_in_flight_count(&provider) != 0
         {
             ELM_POLICY_BLOCK_PROVIDER_BUSY
         } else {
@@ -3677,14 +3768,6 @@ impl ElmCore {
         records.push(todo_record(
             ELM_TODO_KIND_RUNTIME,
             static_flags,
-            ELM_POLICY_BLOCK_PROVIDER_BUSY,
-            0,
-            "runtime.running_call_cancel",
-            "运行中的 provider 调用尚未支持协作式取消",
-        ));
-        records.push(todo_record(
-            ELM_TODO_KIND_RUNTIME,
-            static_flags,
             ELM_POLICY_BLOCK_NATIVE_TODO,
             0,
             "runtime.resource_quota",
@@ -3767,14 +3850,14 @@ impl ElmCore {
             }
         }
         for provider in &self.providers {
-            if provider.in_flight != 0 {
+            if self.provider_in_flight_count(provider) != 0 {
                 records.push(todo_record(
                     ELM_TODO_KIND_RUNTIME,
                     ELM_TODO_FLAG_ACTIVE,
                     ELM_POLICY_BLOCK_PROVIDER_BUSY,
                     provider.port.0,
                     "runtime.provider_in_flight",
-                    "该 provider 当前存在运行中调用；取消只能等待调用返回",
+                    "该 provider 当前存在运行中调用；已支持取消意图，强抢占仍依赖后续故障隔离",
                 ));
             }
         }
@@ -4009,6 +4092,15 @@ impl ElmCore {
                 _ => {}
             }
             if provider.dynamic && provider.port.0 < FIRST_DYNAMIC_PORT_ID {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_PROVIDERS,
+                    provider.port.0,
+                    ELM_HEALTH_DETAIL_STATE_INVALID,
+                ));
+            }
+            if provider.in_flight as usize != self.provider_running_count(provider.port)
+                || provider.in_flight > provider.max_in_flight
+            {
                 records.push(ElmCoreHealthRecord::invalid(
                     ELM_HEALTH_CHECK_PROVIDERS,
                     provider.port.0,
@@ -4668,7 +4760,7 @@ impl ElmCore {
         for provider in &self.providers {
             out.push_str(
                 format!(
-                    "provider_port={} owner={} backend={:?} dynamic={} bindings={} calls={} failed_calls={} revokes={} queued={} running={} retained={}\n",
+                    "provider_port={} owner={} backend={:?} dynamic={} bindings={} calls={} failed_calls={} revokes={} queued={} running={} retained={} oldest_running_start_ns={}\n",
                     provider.port.0,
                     provider.owner.map(|owner| owner.0).unwrap_or(0),
                     provider.backend,
@@ -4678,8 +4770,9 @@ impl ElmCore {
                     provider.failed_calls,
                     provider.revokes,
                     self.provider_queued_count(provider.port),
-                    provider.in_flight,
+                    self.provider_running_count(provider.port),
                     self.provider_retained_result_count(provider.port),
+                    self.provider_oldest_running_start_ns(provider.port),
                 )
                 .as_str(),
             );
@@ -5663,6 +5756,27 @@ impl ElmCore {
             .count()
     }
 
+    fn provider_running_count(&self, port: PortId) -> usize {
+        self.provider_running
+            .iter()
+            .filter(|running| running.job.port == port)
+            .count()
+    }
+
+    fn provider_oldest_running_start_ns(&self, port: PortId) -> u64 {
+        self.provider_running
+            .iter()
+            .filter(|running| running.job.port == port)
+            .map(|running| running.started_at_ns)
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn provider_in_flight_count(&self, provider: &ProviderRuntime) -> usize {
+        self.provider_running_count(provider.port)
+            .max(provider.in_flight as usize)
+    }
+
     fn provider_retained_result_count(&self, port: PortId) -> usize {
         self.provider_results
             .iter()
@@ -5762,6 +5876,21 @@ impl ElmCore {
             .map(|(index, _)| index)
     }
 
+    fn begin_provider_running_call(
+        &mut self,
+        job: ProviderAsyncJob,
+        provider_index: usize,
+        started_at_ns: u64,
+    ) {
+        self.providers[provider_index].in_flight =
+            self.providers[provider_index].in_flight.saturating_add(1);
+        self.provider_running.push(ProviderRunningCall {
+            job,
+            started_at_ns,
+            cancel_requested: false,
+        });
+    }
+
     fn execute_provider_async_job(
         &mut self,
         job: &ProviderAsyncJob,
@@ -5851,6 +5980,58 @@ impl ElmCore {
                 )
             }
         }
+    }
+
+    fn finish_provider_running_call(
+        &mut self,
+        ticket: u64,
+        state: ElmProviderAsyncState,
+        status: i32,
+        reply: ElmReplyFrame,
+        blockers: u64,
+        finish_ns: u64,
+    ) -> bool {
+        let Some(index) = self
+            .provider_running
+            .iter()
+            .position(|running| running.job.ticket == ticket)
+        else {
+            return false;
+        };
+        let running = self.provider_running.remove(index);
+        if let Some(provider_index) = self.provider_index(running.job.port) {
+            self.providers[provider_index].in_flight =
+                self.providers[provider_index].in_flight.saturating_sub(1);
+        }
+
+        let (state, status, reply, blockers) = if running.cancel_requested {
+            (
+                ElmProviderAsyncState::Canceled,
+                ELM_MGR_STATUS_OK,
+                ElmReplyFrame::empty(
+                    running.job.frame.binding_id,
+                    running.job.frame.call_id,
+                    ELM_CALL_STATUS_BUSY,
+                ),
+                0,
+            )
+        } else if finish_ns >= running.job.deadline_ns {
+            (
+                ElmProviderAsyncState::Expired,
+                ELM_MGR_STATUS_BUSY,
+                ElmReplyFrame::empty(
+                    running.job.frame.binding_id,
+                    running.job.frame.call_id,
+                    ELM_CALL_STATUS_BUSY,
+                ),
+                ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
+            )
+        } else {
+            (state, status, reply, blockers)
+        };
+
+        self.finish_provider_async_job(running.job, state, status, reply, blockers, finish_ns);
+        true
     }
 
     fn finish_provider_async_job(
@@ -5966,7 +6147,7 @@ impl ElmCore {
                 self.provider_binding_count(provider.port)
                     .saturating_add(self.provider_queued_count(provider.port))
                     .saturating_add(self.provider_retained_result_count(provider.port))
-                    .saturating_add(provider.in_flight as usize)
+                    .saturating_add(self.provider_in_flight_count(provider))
             })
             .sum()
     }
@@ -5978,7 +6159,7 @@ impl ElmCore {
             .map(|provider| {
                 self.provider_queued_count(provider.port)
                     .saturating_add(self.provider_retained_result_count(provider.port))
-                    .saturating_add(provider.in_flight as usize)
+                    .saturating_add(self.provider_in_flight_count(provider))
             })
             .sum()
     }
@@ -6016,7 +6197,7 @@ impl ElmCore {
                     && self.provider_binding_count(provider.port) == 0
                     && self.provider_queued_count(provider.port) == 0
                     && self.provider_retained_result_count(provider.port) == 0
-                    && provider.in_flight == 0
+                    && self.provider_in_flight_count(provider) == 0
                 {
                     Some(provider.port)
                 } else {

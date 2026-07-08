@@ -1232,8 +1232,8 @@ fn todo_registry_records_are_fixed_layout() {
         ELM_POLICY_BLOCK_PROVIDER_BUSY,
         7,
         ELM_MGR_STATUS_BUSY,
-        "runtime.running_call_cancel",
-        "运行中的 provider 调用尚未支持协作式取消",
+        "runtime.provider_in_flight",
+        "运行中的 provider 调用已支持取消意图",
     );
     assert_eq!(record.kind, ELM_TODO_KIND_RUNTIME);
     assert_eq!(record.flags & ELM_TODO_FLAG_ACTIVE, ELM_TODO_FLAG_ACTIVE);
