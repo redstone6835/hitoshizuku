@@ -14,12 +14,14 @@ use elm_model::{
     ELM_EBI_HOOK_ON_MIGRATE_ABORT, ELM_EBI_HOOK_ON_MIGRATE_EXPORT, ELM_EBI_HOOK_ON_MIGRATE_IMPORT,
     ELM_EBI_HOOK_ON_PAUSE, ELM_EBI_HOOK_ON_QUIESCE, ELM_EBI_HOOK_ON_RESUME, ELM_MGR_STATUS_INVALID,
     ELM_MGR_STATUS_OK, ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ElmCallFrame,
-    ElmContext, ElmEbiImage, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiRelocationKind,
-    ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmError, ElmId, ElmNativeEntryFrameV1,
-    ElmNativeHookContextV1, ElmNativeMigrationContextV1, ElmNativeProviderCallV1,
-    ElmNativeProviderSnapshotV1, ElmReplyFrame, ElmResult, Generation, LeaseId, PortId,
-    relocation_width, state_code,
+    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED,
+    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ElmCallFrame, ElmContext, ElmEbiImage,
+    ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiSegmentKind,
+    ElmEbiSegmentPayload, ElmError, ElmId, ElmNativeEntryFrameV1, ElmNativeHookContextV1,
+    ElmNativeMigrationContextV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
+    ElmReplyFrame, ElmResult, Generation, LeaseId, PortId, relocation_width, state_code,
 };
 
 use super::core::ElmLifecycleExecutor;
@@ -834,10 +836,12 @@ pub(crate) fn invoke_provider_snapshot(
     port: PortId,
     binding_id: u64,
     lease: LeaseId,
+    request_flags: u32,
+    cursor: u32,
     payload: &mut [u8],
-) -> (i32, usize, u32) {
+) -> (i32, usize, u32, u32, u32) {
     if address == 0 {
-        return (ELM_MGR_STATUS_INVALID, 0, 0);
+        return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
     }
     let capacity = payload.len().min(u32::MAX as usize) as u32;
     let payload_addr = payload.as_mut_ptr() as u64;
@@ -849,30 +853,55 @@ pub(crate) fn invoke_provider_snapshot(
         payload_addr,
         capacity,
     );
+    let request_paged = request_flags & ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED != 0;
+    if request_paged {
+        frame.flags = ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED;
+        frame.reserved2 = cursor;
+    }
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内；
     // payload 指向 Core 准备的临时内核缓冲区，长度由 capacity 固定约束。
     let snapshot: NativeProviderSnapshot = unsafe { core::mem::transmute(address) };
     let call_status = unsafe { snapshot(&mut frame as *mut ElmNativeProviderSnapshotV1) };
+    let allowed_flags = if request_paged {
+        ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK
+    } else {
+        0
+    };
+    let response_more = frame.flags & ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE != 0;
     if call_status != 0
         || frame.abi_version != ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION
-        || frame.flags != 0
+        || frame.flags & !allowed_flags != 0
         || frame.reserved0 != 0
         || frame.cell_id != cell.0
         || frame.port_id != port.0
         || frame.binding_id != binding_id
         || frame.lease_id != lease.0
         || frame.reserved1 != 0
-        || frame.reserved2 != 0
+        || (frame.status == ELM_MGR_STATUS_OK && !response_more && frame.reserved2 != 0)
+        || (frame.status == ELM_MGR_STATUS_OK
+            && response_more
+            && (!request_paged || frame.reserved2 == 0 || frame.reserved2 == cursor))
         || frame.payload_addr != payload_addr
         || frame.capacity != capacity
         || frame.payload_len > frame.capacity
     {
-        return (ELM_MGR_STATUS_INVALID, 0, 0);
+        return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
     }
     if frame.status == ELM_MGR_STATUS_OK {
-        (frame.status, frame.payload_len as usize, frame.record_count)
+        let flags = if response_more {
+            ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE
+        } else {
+            0
+        };
+        (
+            frame.status,
+            frame.payload_len as usize,
+            frame.record_count,
+            flags,
+            frame.reserved2,
+        )
     } else {
-        (frame.status, 0, 0)
+        (frame.status, 0, 0, 0, 0)
     }
 }
 

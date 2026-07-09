@@ -5,6 +5,7 @@
 
 use crate::frame::{ELM_CALL_STATUS_UNSUPPORTED, ElmCallFrame, ElmReplyFrame};
 use crate::ids::{BindingId, ElmId, LeaseId, PortId};
+use crate::mgr::ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE;
 use crate::mgr::api::{
     ELM_MGR_API_FLAG_PROVIDER_OPS, ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_TODO,
     ELM_MGR_API_KIND_SUBSYSTEM, ElmMgrApiDescriptor,
@@ -17,7 +18,37 @@ pub const ELM_KERNEL_PROVIDER_FLAG_TODO: u32 = 1 << 0;
 
 pub type ElmKernelProviderInvoke = fn(ElmCallFrame) -> ElmReplyFrame;
 pub type ElmKernelProviderSnapshot = fn(&mut [u8]) -> Result<usize, i32>;
+pub type ElmKernelProviderSnapshotPaged =
+    fn(cursor: u32, out: &mut [u8]) -> Result<ElmKernelProviderSnapshotPage, i32>;
 pub type ElmKernelProviderRevoke = fn(Option<BindingId>, Option<LeaseId>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmKernelProviderSnapshotPage {
+    pub payload_len: usize,
+    pub record_count: u32,
+    pub flags: u32,
+    pub next_cursor: u32,
+}
+
+impl ElmKernelProviderSnapshotPage {
+    pub const fn final_page(payload_len: usize, record_count: u32) -> Self {
+        Self {
+            payload_len,
+            record_count,
+            flags: 0,
+            next_cursor: 0,
+        }
+    }
+
+    pub const fn more(payload_len: usize, record_count: u32, next_cursor: u32) -> Self {
+        Self {
+            payload_len,
+            record_count,
+            flags: ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
+            next_cursor,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ElmKernelProviderSpec {
@@ -35,6 +66,7 @@ pub struct ElmKernelProviderSpec {
     pub flags: u32,
     pub invoke: ElmKernelProviderInvoke,
     pub snapshot: Option<ElmKernelProviderSnapshot>,
+    pub snapshot_paged: Option<ElmKernelProviderSnapshotPaged>,
     pub on_revoke: Option<ElmKernelProviderRevoke>,
 }
 
@@ -72,8 +104,17 @@ impl ElmKernelProviderSpec {
             flags,
             invoke,
             snapshot,
+            snapshot_paged: None,
             on_revoke,
         }
+    }
+
+    pub const fn with_paged_snapshot(
+        mut self,
+        snapshot_paged: ElmKernelProviderSnapshotPaged,
+    ) -> Self {
+        self.snapshot_paged = Some(snapshot_paged);
+        self
     }
 
     pub const fn subsystem_todo(

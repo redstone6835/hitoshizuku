@@ -226,7 +226,7 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
 - `ElmDeviceDiscoveryHeader`：`abi_version`、`record_entry_size`、`record_count`、`total_count`、`flags`、`generation`。
 - `ElmDeviceDiscoveryRecord`：`ordinal`、`class_len`、`name_len`、`flags`、固定长度 `class_name[16]` 和 `dev_name[64]`。
 - `ELM_DEV_DISCOVERY_OPCODE_QUERY = 1`：绑定该 provider 后可通过 `InvokeProvider` 读取同一类快照；当 256 字节调用帧载荷不足以容纳全部设备时，设备层在内部 header 中设置 `TRUNCATED`。
-- provider snapshot 路径使用管理通道 4096 字节 payload 上限；同步 query 路径使用 `ElmReplyFrame` 的 256 字节 payload 上限。
+- provider snapshot 路径使用管理通道单页 payload 上限；`ElmProviderSnapshotRequest.flags/reserved` 表达分页请求和 cursor，`ElmProviderSnapshotHeader.flags/reserved` 表达是否存在下一页和 next cursor。同步 query 路径使用 `ElmReplyFrame` 的 256 字节 payload 上限。
 
 `device.claim@1` 的 provider payload 同样由 `general::dev::elm` 定义：
 
@@ -496,7 +496,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 | `UnsubscribeEvent` | 32 | 已实现 | 撤销事件订阅租约并移除订阅记录 |
 | `QueryEventSubscriptions` | 33 | 已实现 | 返回当前事件订阅快照 |
 | `ReadSubscribedEvents` | 34 | 已实现 | 按订阅 ID 和游标读取事件，`ADVANCE` flag 控制是否推进订阅游标 |
-| `QueryProviderSnapshot` | 35 | 已实现边界 | 按 port 或 binding 调用 provider snapshot 回调；无回调返回 provider 级 `UNSUPPORTED` |
+| `QueryProviderSnapshot` | 35 | 已实现 | 按 port 或 binding 调用 provider snapshot 回调；支持 cursor 分页；无回调返回 provider 级 `UNSUPPORTED` |
 | `QueryNativeCapabilities` | 36 | 已实现 | 返回原生 ELM imports/exports 快照 |
 | `QueryTodoRegistry` | 37 | 已实现 | 返回运行时 TODO registry，覆盖静态未完成项和当前动态 TODO 后端 |
 
@@ -842,14 +842,14 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 职责：
 
 - 定义 `ElmKernelProviderSpec` 通用规格。
-- 定义内核 provider 的 `invoke`、`snapshot` 和 `on_revoke` 回调形状。
+- 定义内核 provider 的 `invoke`、单页 `snapshot`、分页 `snapshot_paged` 和 `on_revoke` 回调形状。
 - 提供默认 unsupported 回调，用于尚未接入真实子系统逻辑的 TODO provider。
 
 设计细节：
 
 - `ElmKernelProviderSpec` 同时描述 API 注册表记录和 provider 端口记录。
 - 规格只保存静态字符串、方向、模式、访问策略和函数指针，不包含子系统私有状态。
-- 子系统 provider 可以使用完整 `ElmKernelProviderSpec::new` 接入真实 `invoke` / `snapshot` / `on_revoke` 回调；`device.discovered@1` 已使用该路径输出设备发现快照。
+- 子系统 provider 可以使用完整 `ElmKernelProviderSpec::new` 接入真实 `invoke` / `snapshot` / `on_revoke` 回调，并可通过 `with_paged_snapshot` 增加 cursor 分页快照；`device.discovered@1` 已使用该路径输出设备发现快照。
 - 尚未接入真实语义的子系统 provider 使用 `subsystem_todo` 构造规格，调用会经过完整 provider runtime 后返回 `UNSUPPORTED`。
 
 ### `snapshot.rs`
@@ -960,7 +960,7 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - owner detach 会移除 owner 持有的事件订阅记录，并通过租约撤销链路释放订阅资源。
 - `register_builtin_mgr_api()` 会注册启动期 `elm-mgr` API 集合：policy、health、menu、topology、bindings、audit、runtime ports、providers、provider stats、provider queue、api registry、event subscribe、event unsubscribe、event subscriptions 和 event read。
 - VFS、device、network、IRQ、DMA、MMIO 等子系统 API 由各子系统自己的 `elm.rs` 导出 `ElmKernelProviderSpec`，启动期汇聚层只批量注册这些规格。
-- `ElmKernelProviderSpec` 是当前子系统接入 `elm-mgr` 的统一规格形状，负责 API 描述、端口描述、invoke、snapshot 和 revoke 回调；当前子系统回调先返回 `UNSUPPORTED`，但已经走完整 provider runtime 链路。
+- `ElmKernelProviderSpec` 是当前子系统接入 `elm-mgr` 的统一规格形状，负责 API 描述、端口描述、invoke、单页 snapshot、分页 snapshot 和 revoke 回调；当前子系统回调先返回 `UNSUPPORTED`，但已经走完整 provider runtime 链路。
 - `health_bytes()` 会输出 graph、cells、ports、providers、bindings、runtime_ports、menu、events 和 audits 九类结构健康记录，并校验 provider 后端、动态端口和观测 flags 的一致性。
 - `health_bytes()` 同时校验事件订阅 owner、事件租约类型和订阅游标，避免订阅表与租约表脱节。
 - `sysfs_text()` 为 `/sys/kernel/elm` 提供只读文本渲染，覆盖 core、policy、health、menu、topology、ports、providers、bindings、events、audit、api、native-capabilities 和 todo-registry。
@@ -1163,11 +1163,11 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(QueryRuntimePorts)` 已返回运行时端口绑定统计，包括日志提交数、事件投递数和丢弃事件数。
 - `MGR_CALL(RegisterProviderPort/UnregisterProviderPort)` 已支持动态 provider 端口声明注册和注销；动态端口合约由运行时自有字符串保存，不再泄漏为静态字符串。
 - `MGR_CALL(QueryProviderPorts/QueryProviderStats)` 已返回 provider 端口、访问策略、绑定数量、调用次数、失败次数、撤销次数和 provider 观测 flags。
-- `MGR_CALL(QueryProviderSnapshot)` 已接入 `ElmKernelProviderSpec::snapshot` 回调；`device.discovered@1` 已通过该路径返回真实设备发现 payload，`device.claim@1` 已返回当前设备声明 payload，没有 snapshot 回调的 provider 会通过固定 header 返回 `UNSUPPORTED`，ELM 原生 provider 当前不提供 snapshot 时返回 `UNSUPPORTED`。
+- `MGR_CALL(QueryProviderSnapshot)` 已接入 `ElmKernelProviderSpec::snapshot`、`snapshot_paged` 和 ELM 原生 snapshot 回调；`device.discovered@1` 已通过该路径返回真实设备发现 payload，`device.claim@1` 已返回当前设备声明 payload，没有 snapshot 回调的 provider 会通过固定 header 返回 `UNSUPPORTED`，ELM 原生 provider 当前不提供 snapshot 时返回 `UNSUPPORTED`。
 - `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；`mgr.action.invoke@1` 已接入 kernel-backed 执行器，管理通道已覆盖健康动作调用和业务失败审计，带 `handler_symbol` 的动态 ELM 原生 provider 会进入 `ElmNativeProviderCallV1` 调用边界。
 - `MGR_CALL(SubmitProviderCall/PollProviderReply/CancelProviderCall/QueryProviderQueue)` 已形成真实异步队列闭环，支持 ticket、队列容量、运行中观测、超时、结果 TTL、排队取消、运行中取消意图、队列统计和租约 active ref 保护。
 - `MGR_CALL(QueryApiRegistry)` 已返回 `elm-mgr` API 注册表，覆盖已实现管理 API、事件 API、provider API 和子系统导出的 provider specs。
-- `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，覆盖非 EKI Source、资源配额、native fault 隔离、native snapshot 分页、elm-mgr EKI 自举和外部 Rust 开发框架等运行时边界；缺 handler 的动态 provider、pending native EBI 和当前运行中的 provider 会作为动态记录出现。
+- `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，覆盖非 EKI Source、资源配额、native fault 隔离、elm-mgr EKI 自举和外部 Rust 开发框架等运行时边界；缺 handler 的动态 provider、pending native EBI 和当前运行中的 provider 会作为动态记录出现。
 - `MGR_CALL(SubscribeEvent/UnsubscribeEvent/QueryEventSubscriptions/ReadSubscribedEvents)` 已形成事件订阅闭环，支持订阅租约、独立游标、过滤器、只读不推进和读取后推进两种模式。
 - `/sys/kernel/elm` 已提供只读文本观测面，覆盖 core、policy、health、menu、topology、ports、providers、bindings、events、audit、api、native-capabilities 和 todo-registry。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event、audit、native capability 和 TODO registry 不变量破坏。
@@ -1283,7 +1283,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - TODO(elm)：未来 soyo ELM profile 的 EBI 产出层。
 - TODO(elm)：跨单元 native import 自动重绑定、无停机影子 binding 切换和运行中 provider 强抢占。
 - TODO(elm)：设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
-- TODO(elm)：端口级故障隔离、运行中调用强抢占和 provider snapshot 的原生扩展协议。
+- TODO(elm)：端口级故障隔离、运行中调用强抢占和 provider snapshot 的零拷贝/流式扩展协议。
 - TODO(elm)：面向 Rust ELM 的开发框架和构建链路。
 
 阶段收束结论：
@@ -1292,7 +1292,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - 当前阶段不再继续把零散能力堆进 `MGR_CALL`，后续新增能力必须归入明确主线：原生执行器、子系统 provider 接入、热替换与故障隔离、Rust 开发框架、网络栈 ELM 化。
 - `elm-mgr` 是所有 ELM 通向内核能力的唯一网关；后续 VFS、设备、调度、网络、IRQ、DMA、MMIO 等能力只通过 `elm-mgr` API 注册表和 provider Ops 暴露，不新增私有 ELM syscall。
 - `EKI` 是近期原生 ELM 镜像承载方式，`soyo` 仍保持后置；ELM Core 继续只消费 EBI 协议对象，不绑定具体文件格式。
-- 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用；EKI Source 的受限热替换迁移事务和运行中 provider 调用排空链路已经接入。跨单元 native import 自动重绑定、运行中调用强抢占、provider snapshot 原生扩展协议和更细的 import 权限策略仍必须继续停在 `TODO(elm)` 边界，不能用测试执行器或声明式拓扑伪装为已经实现。
+- 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用；EKI Source 的受限热替换迁移事务、运行中 provider 调用排空链路和 provider snapshot cursor 分页已经接入。跨单元 native import 自动重绑定、运行中调用强抢占、provider snapshot 零拷贝/流式扩展协议和更细的 import 权限策略仍必须继续停在 `TODO(elm)` 边界，不能用测试执行器或声明式拓扑伪装为已经实现。
 
 ## 19. 后续阶段路线
 
@@ -1304,7 +1304,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - 保持 `sys_elm_ctl`、`MGR_CALL`、快照、事件和审计 ABI 稳定。
 - 完成 `core.log@1`、`core.event@1`、`mgr.menu.item@1` 和 `mgr.action.invoke@1` 四个基础端口的闭环。
 - 完成动态 provider 端口声明注册、访问策略、同步调用帧 ABI、撤销和统计闭环；缺少 handler 的动态端口绑定提交保持 TODO 阻断。
-- 完成 provider 异步队列、ticket、poll、cancel、timeout、result TTL、运行中观测、取消意图、队列统计和租约 active ref 保护闭环；强抢占式取消和 provider snapshot 原生扩展协议留到后续阶段。
+- 完成 provider 异步队列、ticket、poll、cancel、timeout、result TTL、运行中观测、取消意图、队列统计和租约 active ref 保护闭环；完成 provider snapshot cursor 分页；强抢占式取消和 provider snapshot 零拷贝/流式扩展协议留到后续阶段。
 - 完成 `elm-mgr` API 注册表、事件订阅、订阅读取和 `/sys/kernel/elm` 只读观测闭环，使外部工具和未来 Rust ELM 框架都能以 `elm::mgr::api::*` 作为入口。
 
 第二阶段：EBI Source 与 EKI 深化。

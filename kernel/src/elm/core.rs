@@ -41,11 +41,13 @@ use elm_model::{
     ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
     ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
     ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
-    ELM_REPLACE_MIGRATION_STATE_MAX, ELM_RUNTIME_LOG_MESSAGE_LEN, ELM_TODO_FLAG_ACTIVE,
-    ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER,
-    ELM_TODO_KIND_RUNTIME, ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest,
-    ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch,
-    ElmEbiImage, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiUnit, ElmError, ElmEventRecord,
+    ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
+    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK, ELM_REPLACE_MIGRATION_STATE_MAX,
+    ELM_RUNTIME_LOG_MESSAGE_LEN, ELM_TODO_FLAG_ACTIVE, ELM_TODO_FLAG_STATIC,
+    ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER, ELM_TODO_KIND_RUNTIME,
+    ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmContext,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiImage,
+    ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiUnit, ElmError, ElmEventRecord,
     ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase,
     ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse,
     ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader,
@@ -318,6 +320,37 @@ struct ProviderAsyncResult {
     reply: ElmReplyFrame,
     blockers: u64,
     expires_at_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderSnapshotPageResult {
+    status: i32,
+    payload_len: usize,
+    record_count: u32,
+    flags: u32,
+    next_cursor: u32,
+}
+
+impl ProviderSnapshotPageResult {
+    const fn new(
+        status: i32,
+        payload_len: usize,
+        record_count: u32,
+        flags: u32,
+        next_cursor: u32,
+    ) -> Self {
+        Self {
+            status,
+            payload_len,
+            record_count,
+            flags,
+            next_cursor,
+        }
+    }
+
+    const fn status_only(status: i32) -> Self {
+        Self::new(status, 0, 0, 0, 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1150,8 +1183,8 @@ impl ElmCore {
         &mut self,
         request: ElmProviderSnapshotRequest,
     ) -> Result<Vec<u8>, i32> {
-        if request.flags != 0
-            || request.reserved != 0
+        if request.flags & !ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK != 0
+            || (!request.is_paged() && request.reserved != 0)
             || (request.port_id == 0 && request.binding_id == 0)
         {
             return Err(ELM_MGR_STATUS_INVALID);
@@ -1185,6 +1218,8 @@ impl ElmCore {
             return Err(ELM_MGR_STATUS_NOT_FOUND);
         };
 
+        let paged = request.is_paged();
+        let cursor = request.cursor();
         let audit_cell = binding
             .as_ref()
             .map(|edge| edge.consumer)
@@ -1196,16 +1231,54 @@ impl ElmCore {
         let mut payload = Vec::new();
         payload.resize(capacity, 0);
 
-        let (status, payload_len) = match backend {
-            ProviderBackend::KernelOps(spec) => match spec.snapshot {
-                Some(snapshot) => match snapshot(&mut payload) {
-                    Ok(len) if len <= capacity => (ELM_MGR_STATUS_OK, len),
-                    Ok(_) => (ELM_MGR_STATUS_INVALID, 0),
-                    Err(status) => (status, 0),
-                },
-                None => (ELM_MGR_STATUS_UNSUPPORTED, 0),
-            },
-            ProviderBackend::ElmNativeTodo => (ELM_MGR_STATUS_TODO, 0),
+        let page = match backend {
+            ProviderBackend::KernelOps(spec) => {
+                if paged {
+                    match spec.snapshot_paged {
+                        Some(snapshot) => match snapshot(cursor, &mut payload) {
+                            Ok(page)
+                                if provider_snapshot_page_is_valid(
+                                    page.payload_len,
+                                    capacity,
+                                    page.flags,
+                                    page.next_cursor,
+                                    paged,
+                                    cursor,
+                                ) =>
+                            {
+                                ProviderSnapshotPageResult::new(
+                                    ELM_MGR_STATUS_OK,
+                                    page.payload_len,
+                                    page.record_count,
+                                    page.flags,
+                                    page.next_cursor,
+                                )
+                            }
+                            Ok(_) => {
+                                ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_INVALID)
+                            }
+                            Err(status) => ProviderSnapshotPageResult::status_only(status),
+                        },
+                        None => ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_UNSUPPORTED),
+                    }
+                } else {
+                    match spec.snapshot {
+                        Some(snapshot) => match snapshot(&mut payload) {
+                            Ok(len) if len <= capacity => {
+                                ProviderSnapshotPageResult::new(ELM_MGR_STATUS_OK, len, 0, 0, 0)
+                            }
+                            Ok(_) => {
+                                ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_INVALID)
+                            }
+                            Err(status) => ProviderSnapshotPageResult::status_only(status),
+                        },
+                        None => ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_UNSUPPORTED),
+                    }
+                }
+            }
+            ProviderBackend::ElmNativeTodo => {
+                ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_TODO)
+            }
             ProviderBackend::ElmNative(native) => match native.snapshot {
                 Some(snapshot) => {
                     let binding_id = binding.as_ref().map(|edge| edge.id.0).unwrap_or(0);
@@ -1213,46 +1286,49 @@ impl ElmCore {
                         .as_ref()
                         .and_then(|edge| edge.lease)
                         .unwrap_or(LeaseId(0));
-                    let (status, len, record_count) = super::native::invoke_provider_snapshot(
-                        snapshot,
-                        native.owner,
-                        port,
-                        binding_id,
-                        lease,
-                        &mut payload,
-                    );
-                    if status == ELM_MGR_STATUS_OK && len <= capacity {
-                        payload.truncate(len);
-                        let header = ElmProviderSnapshotHeader::new(
+                    let (status, len, record_count, flags, next_cursor) =
+                        super::native::invoke_provider_snapshot(
+                            snapshot,
+                            native.owner,
+                            port,
+                            binding_id,
+                            lease,
+                            request.flags,
+                            cursor,
+                            &mut payload,
+                        );
+                    if status == ELM_MGR_STATUS_OK
+                        && provider_snapshot_page_is_valid(
+                            len,
+                            capacity,
+                            flags,
+                            next_cursor,
+                            paged,
+                            cursor,
+                        )
+                    {
+                        ProviderSnapshotPageResult::new(
                             status,
-                            port.0,
-                            request.binding_id,
-                            payload.len() as u32,
+                            len,
                             record_count,
-                        );
-                        let mut out = Vec::new();
-                        push_plain(&mut out, &header);
-                        out.extend_from_slice(&payload);
-                        self.providers[provider_index].calls =
-                            self.providers[provider_index].calls.saturating_add(1);
-                        self.record_audit(
-                            ELM_MGR_ACTION_PROVIDER_QUERY,
-                            audit_cell,
-                            status,
-                            provider_snapshot_blockers(status),
-                            self.cell_state(audit_cell).map(state_code).unwrap_or(0),
-                        );
-                        return Ok(out);
+                            flags,
+                            next_cursor,
+                        )
+                    } else if status == ELM_MGR_STATUS_OK {
+                        ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_INVALID)
+                    } else {
+                        ProviderSnapshotPageResult::status_only(status)
                     }
-                    (status, 0)
                 }
-                None => (ELM_MGR_STATUS_UNSUPPORTED, 0),
+                None => ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_UNSUPPORTED),
             },
-            ProviderBackend::Kernel(_) => (ELM_MGR_STATUS_UNSUPPORTED, 0),
+            ProviderBackend::Kernel(_) => {
+                ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_UNSUPPORTED)
+            }
         };
-        payload.truncate(payload_len);
+        payload.truncate(page.payload_len);
 
-        if status == ELM_MGR_STATUS_OK {
+        if page.status == ELM_MGR_STATUS_OK {
             self.providers[provider_index].calls =
                 self.providers[provider_index].calls.saturating_add(1);
         } else {
@@ -1263,18 +1339,19 @@ impl ElmCore {
         self.record_audit(
             ELM_MGR_ACTION_PROVIDER_QUERY,
             audit_cell,
-            status,
-            provider_snapshot_blockers(status),
+            page.status,
+            provider_snapshot_blockers(page.status),
             self.cell_state(audit_cell).map(state_code).unwrap_or(0),
         );
 
         let header = ElmProviderSnapshotHeader::new(
-            status,
+            page.status,
             port.0,
             request.binding_id,
             payload.len() as u32,
-            0,
-        );
+            page.record_count,
+        )
+        .with_page(page.flags, page.next_cursor);
         let mut out = Vec::new();
         push_plain(&mut out, &header);
         out.extend_from_slice(&payload);
@@ -3788,14 +3865,6 @@ impl ElmCore {
             0,
             "native.fault_isolation",
             "原生 ELM 调用缺少独立故障围栏、超时看门和 panic 边界",
-        ));
-        records.push(todo_record(
-            ELM_TODO_KIND_NATIVE,
-            static_flags,
-            ELM_POLICY_BLOCK_NATIVE_TODO,
-            0,
-            "native.snapshot_paging",
-            "原生 provider snapshot 仍是固定缓冲区 v1，尚未支持分页快照",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_FRAMEWORK,
@@ -7301,6 +7370,25 @@ fn provider_snapshot_blockers(status: i32) -> u64 {
         ELM_MGR_STATUS_BUSY => ELM_POLICY_BLOCK_PROVIDER_BUSY,
         ELM_MGR_STATUS_INVALID => ELM_POLICY_BLOCK_INVALID_STATE,
         _ => ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    }
+}
+
+fn provider_snapshot_page_is_valid(
+    payload_len: usize,
+    capacity: usize,
+    flags: u32,
+    next_cursor: u32,
+    paged: bool,
+    cursor: u32,
+) -> bool {
+    if payload_len > capacity || flags & !ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK != 0 {
+        return false;
+    }
+    let has_more = flags & ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE != 0;
+    if has_more {
+        paged && next_cursor != 0 && next_cursor != cursor
+    } else {
+        next_cursor == 0
     }
 }
 

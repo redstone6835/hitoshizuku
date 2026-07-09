@@ -19,20 +19,21 @@ use elm_model::{
     ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_TODO_REGISTRY, ELM_KERNEL_PROVIDER_FLAG_NONE,
     ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_PROVIDER_ASYNC,
     ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_API_KIND_SUBSYSTEM, ELM_MGR_RELATION_POINT_LEN,
-    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
-    ELM_MGR_STATUS_UNSUPPORTED, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NEXUS_CONTRACT_LEN,
-    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
+    ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
+    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
     ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
     ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
     ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ElmActionInvokeRequest,
-    ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch,
-    ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
+    ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
+    ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
+    ElmActionInvokeRequest, ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord,
+    ElmEbiArch, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
     ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind,
     ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind, ElmError, ElmId,
-    ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase, ElmManifest, ElmMenuItemKind,
-    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
+    ElmKernelProviderSnapshotPage, ElmKernelProviderSpec, ElmKind, ElmLifecyclePhase, ElmManifest,
+    ElmMenuItemKind, ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
     ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest, ElmName, ElmNativeCapabilityHeader, ElmNativeEntryFrameV1,
@@ -249,6 +250,42 @@ static TEST_SNAPSHOT_PROVIDERS: [ElmKernelProviderSpec; 1] = [ElmKernelProviderS
     Some(test_snapshot_provider_snapshot),
     None,
 )];
+
+fn test_paged_snapshot_provider_snapshot(
+    cursor: u32,
+    out: &mut [u8],
+) -> Result<ElmKernelProviderSnapshotPage, i32> {
+    let payload = match cursor {
+        0 => b"page-a".as_slice(),
+        1 => b"page-b".as_slice(),
+        _ => return Err(ELM_MGR_STATUS_NOT_FOUND),
+    };
+    out[..payload.len()].copy_from_slice(payload);
+    if cursor == 0 {
+        Ok(ElmKernelProviderSnapshotPage::more(payload.len(), 1, 1))
+    } else {
+        Ok(ElmKernelProviderSnapshotPage::final_page(payload.len(), 1))
+    }
+}
+
+static TEST_PAGED_SNAPSHOT_PROVIDERS: [ElmKernelProviderSpec; 1] = [ElmKernelProviderSpec::new(
+    "elm.test",
+    "snapshot-paged",
+    "elm.test.snapshot.paged@1",
+    ELM_MGR_API_KIND_SUBSYSTEM,
+    0,
+    0,
+    "test.snapshot.paged@1",
+    FlowDirection::Control,
+    FlowMode::Shared,
+    ElmPortAccessPolicy::Internal,
+    true,
+    ELM_KERNEL_PROVIDER_FLAG_NONE,
+    test_revoke_provider_invoke,
+    None,
+    None,
+)
+.with_paged_snapshot(test_paged_snapshot_provider_snapshot)];
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
@@ -934,12 +971,17 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
         read_u16(&bytes, 2) as usize,
         core::mem::size_of::<ElmTodoRegistryRecord>()
     );
-    assert!(read_u32(&bytes, 4) >= 7);
-    assert!(read_u32(&bytes, 8) >= 7);
+    assert!(read_u32(&bytes, 4) >= 6);
+    assert!(read_u32(&bytes, 8) >= 6);
     assert!(
         !bytes
             .windows("runtime.running_call_cancel".len())
             .any(|window| window == b"runtime.running_call_cancel")
+    );
+    assert!(
+        !bytes
+            .windows("native.snapshot_paging".len())
+            .any(|window| window == b"native.snapshot_paging")
     );
     assert_eq!(
         bytes.len(),
@@ -2384,6 +2426,87 @@ fn elm_kernel_provider_spec_snapshot_callback_is_routed() {
     let stats = provider_stats_by_port(&mut core, port_id).unwrap();
     assert_eq!(stats.1, 1);
     assert_eq!(stats.2, 0);
+
+    let paged = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_binding_paged(
+            bind_response.binding_id,
+            0,
+        ))
+        .unwrap();
+    assert_eq!(read_i32(&paged, 4), ELM_MGR_STATUS_UNSUPPORTED);
+    assert_eq!(read_u64(&paged, 8), port_id);
+    assert_eq!(read_u32(&paged, 24), 0);
+}
+
+#[ktest]
+fn elm_kernel_provider_spec_paged_snapshot_callback_is_routed() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    assert_eq!(
+        core.register_kernel_provider_specs(&TEST_PAGED_SNAPSHOT_PROVIDERS)
+            .unwrap(),
+        1
+    );
+
+    let port_id = provider_port_id_by_contract(&mut core, "test.snapshot.paged@1").unwrap();
+    let first = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port_paged(port_id, 0))
+        .unwrap();
+    assert_eq!(read_i32(&first, 4), ELM_MGR_STATUS_OK);
+    assert_eq!(read_u64(&first, 8), port_id);
+    assert_eq!(read_u32(&first, 24), "page-a".len() as u32);
+    assert_eq!(read_u32(&first, 28), 1);
+    assert_eq!(
+        read_u32(&first, 32) & ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
+        ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE
+    );
+    assert_eq!(read_u32(&first, 36), 1);
+    assert_eq!(
+        &first[core::mem::size_of::<ElmProviderSnapshotHeader>()..],
+        b"page-a"
+    );
+
+    let second = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port_paged(port_id, 1))
+        .unwrap();
+    assert_eq!(read_i32(&second, 4), ELM_MGR_STATUS_OK);
+    assert_eq!(read_u32(&second, 24), "page-b".len() as u32);
+    assert_eq!(read_u32(&second, 28), 1);
+    assert_eq!(read_u32(&second, 32), 0);
+    assert_eq!(read_u32(&second, 36), 0);
+    assert_eq!(
+        &second[core::mem::size_of::<ElmProviderSnapshotHeader>()..],
+        b"page-b"
+    );
+
+    let bad_cursor = core
+        .provider_snapshot_bytes(ElmProviderSnapshotRequest::by_port_paged(port_id, 99))
+        .unwrap();
+    assert_eq!(read_i32(&bad_cursor, 4), ELM_MGR_STATUS_NOT_FOUND);
+
+    let bad = ElmProviderSnapshotRequest {
+        port_id,
+        binding_id: 0,
+        flags: ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED << 1,
+        reserved: 0,
+    };
+    assert_eq!(
+        core.provider_snapshot_bytes(bad).unwrap_err(),
+        ELM_MGR_STATUS_INVALID
+    );
+
+    let request = provider_snapshot_payload(&ElmProviderSnapshotRequest::by_port_paged(port_id, 0));
+    let response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::QueryProviderSnapshot, &request),
+    );
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_OK);
+    let payload = response_payload(&response);
+    assert_eq!(read_i32(payload, 4), ELM_MGR_STATUS_OK);
+    assert_ne!(
+        read_u32(payload, 32) & ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
+        0
+    );
 }
 
 #[ktest]

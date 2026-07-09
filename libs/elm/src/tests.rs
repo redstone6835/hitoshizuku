@@ -28,7 +28,9 @@ use crate::{
     ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT,
     ELM_NATIVE_CAPABILITY_NAME_LEN, ELM_NATIVE_ENTRY_ABI_VERSION,
     ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
-    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_NEXUS_CONTRACT_LEN,
+    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED,
@@ -37,6 +39,8 @@ use crate::{
     ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
     ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
     ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_PORT_FLAG_NONE,
+    ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
+    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK,
     ELM_REPLACE_CELL_ABI_VERSION, ELM_REPLACE_MIGRATION_STATE_MAX, ELM_RUNTIME_LOG_MESSAGE_LEN,
     ELM_TODO_DETAIL_LEN, ELM_TODO_FLAG_ACTIVE, ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_RUNTIME,
     ELM_TODO_NAME_LEN, ELM_TODO_REGISTRY_FLAG_TRUNCATED, ElmActionInvokeReply,
@@ -1411,11 +1415,16 @@ fn call_frame_abi_is_fixed_layout() {
         snapshot.abi_version,
         ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION
     );
+    assert_eq!(snapshot.flags, 0);
+    assert_eq!(snapshot.reserved2, 0);
     assert_eq!(snapshot.cell_id, 7);
     assert_eq!(snapshot.port_id, 100);
     assert_eq!(snapshot.binding_id, 11);
     assert_eq!(snapshot.payload_addr, 0x1000);
     assert_eq!(snapshot.capacity, 256);
+    assert_eq!(ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, 1);
+    assert_eq!(ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, 2);
+    assert_eq!(ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, 3);
     assert_eq!(core::mem::size_of::<ElmNativeProviderSnapshotV1>(), 72);
 }
 
@@ -1516,14 +1525,38 @@ fn provider_port_abi_records_are_fixed_layout() {
     let snapshot_request = ElmProviderSnapshotRequest::by_binding(7);
     assert_eq!(snapshot_request.binding_id, 7);
     assert_eq!(snapshot_request.port_id, 0);
+    assert_eq!(snapshot_request.flags, 0);
+    assert_eq!(snapshot_request.cursor(), 0);
+    assert!(!snapshot_request.is_paged());
+    let snapshot_request = ElmProviderSnapshotRequest::by_binding_paged(7, 3);
+    assert_eq!(snapshot_request.binding_id, 7);
+    assert_eq!(snapshot_request.port_id, 0);
+    assert_eq!(
+        snapshot_request.flags,
+        ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED
+    );
+    assert_eq!(snapshot_request.cursor(), 3);
+    assert!(snapshot_request.is_paged());
+    let snapshot_request = ElmProviderSnapshotRequest::by_port_paged(100, 4);
+    assert_eq!(snapshot_request.port_id, 100);
+    assert_eq!(snapshot_request.binding_id, 0);
+    assert_eq!(snapshot_request.cursor(), 4);
+    assert_eq!(ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK, 1);
     assert_eq!(core::mem::size_of::<ElmProviderSnapshotRequest>(), 24);
 
-    let snapshot_header = ElmProviderSnapshotHeader::new(ELM_MGR_STATUS_OK, 100, 7, 8, 1);
+    let snapshot_header = ElmProviderSnapshotHeader::new(ELM_MGR_STATUS_OK, 100, 7, 8, 1)
+        .with_page(ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, 9);
     assert_eq!(snapshot_header.status, ELM_MGR_STATUS_OK);
     assert_eq!(snapshot_header.port_id, 100);
     assert_eq!(snapshot_header.binding_id, 7);
     assert_eq!(snapshot_header.payload_len, 8);
     assert_eq!(snapshot_header.record_count, 1);
+    assert_eq!(
+        snapshot_header.flags,
+        ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE
+    );
+    assert_eq!(snapshot_header.reserved, 9);
+    assert_eq!(ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK, 1);
     assert_eq!(core::mem::size_of::<ElmProviderSnapshotHeader>(), 40);
 
     assert_eq!(

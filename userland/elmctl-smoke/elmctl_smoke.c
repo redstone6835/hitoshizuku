@@ -37,6 +37,8 @@
 #define ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT 35u
 #define ELM_MGR_CALL_QUERY_TODO_REGISTRY 37u
 #define ELM_MGR_MAX_INPUT (4096u + 16u)
+#define ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED (1u << 0)
+#define ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE (1u << 0)
 
 #define ELM_MGR_BUILTIN_ID 1ull
 #define ELM_MGR_ACTION_PORT_ID 4ull
@@ -1017,6 +1019,7 @@ static int run_subsystem_provider_query(uint8_t *out, size_t out_len)
         snapshot_header.header_size != sizeof(snapshot_header) ||
         snapshot_header.status != ELM_MGR_STATUS_OK ||
         snapshot_header.port_id != device_provider.port_id ||
+        snapshot_header.flags != 0 || snapshot_header.reserved != 0 ||
         payload_len != sizeof(snapshot_header) + snapshot_header.payload_len) {
         return fail_msg("provider-snapshot", "unexpected device snapshot status");
     }
@@ -1093,8 +1096,30 @@ static int run_subsystem_provider_query(uint8_t *out, size_t out_len)
         snapshot_header.header_size != sizeof(snapshot_header) ||
         snapshot_header.status != ELM_MGR_STATUS_UNSUPPORTED ||
         snapshot_header.port_id != vfs_provider.port_id ||
-        snapshot_header.payload_len != 0) {
+        snapshot_header.payload_len != 0 || snapshot_header.flags != 0 ||
+        snapshot_header.reserved != 0) {
         return fail_msg("provider-snapshot", "unexpected vfs snapshot status");
+    }
+
+    memset(&snapshot_request, 0, sizeof(snapshot_request));
+    snapshot_request.port_id = vfs_provider.port_id;
+    snapshot_request.flags = ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED;
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT, &snapshot_request,
+                            sizeof(snapshot_request), out, out_len, &payload,
+                            &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(snapshot_header)) {
+        return fail_msg("provider-snapshot", "bad paged vfs snapshot payload size");
+    }
+    memcpy(&snapshot_header, payload, sizeof(snapshot_header));
+    if (snapshot_header.abi_version != ELM_CTL_ABI_VERSION ||
+        snapshot_header.header_size != sizeof(snapshot_header) ||
+        snapshot_header.status != ELM_MGR_STATUS_UNSUPPORTED ||
+        snapshot_header.port_id != vfs_provider.port_id ||
+        snapshot_header.payload_len != 0 || snapshot_header.flags != 0 ||
+        snapshot_header.reserved != 0) {
+        return fail_msg("provider-snapshot", "unexpected paged vfs snapshot status");
     }
 
     memset(&bind_request, 0, sizeof(bind_request));

@@ -97,6 +97,10 @@ pub const ELM_NEXUS_CONTRACT_LEN: usize = 64;
 pub const ELM_RUNTIME_LOG_MESSAGE_LEN: usize = 256;
 pub const ELM_MGR_MAX_PAYLOAD: usize = 4096;
 pub const ELM_MGR_MAX_INPUT: usize = ELM_MGR_MAX_PAYLOAD + core::mem::size_of::<ElmMgrCallHeader>();
+pub const ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED: u32 = 1 << 0;
+pub const ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK: u32 = ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED;
+pub const ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE: u32 = 1 << 0;
+pub const ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK: u32 = ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE;
 pub const ELM_PROVIDER_PORT_FLAG_NONE: u32 = 0;
 pub const ELM_PROVIDER_FLAG_DYNAMIC: u16 = 1 << 0;
 pub const ELM_PROVIDER_FLAG_KERNEL_BACKEND: u16 = 1 << 1;
@@ -1301,6 +1305,15 @@ impl ElmProviderSnapshotRequest {
         }
     }
 
+    pub const fn by_port_paged(port_id: u64, cursor: u32) -> Self {
+        Self {
+            port_id,
+            binding_id: 0,
+            flags: ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED,
+            reserved: cursor,
+        }
+    }
+
     pub const fn by_binding(binding_id: u64) -> Self {
         Self {
             port_id: 0,
@@ -1308,6 +1321,23 @@ impl ElmProviderSnapshotRequest {
             flags: 0,
             reserved: 0,
         }
+    }
+
+    pub const fn by_binding_paged(binding_id: u64, cursor: u32) -> Self {
+        Self {
+            port_id: 0,
+            binding_id,
+            flags: ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED,
+            reserved: cursor,
+        }
+    }
+
+    pub const fn is_paged(&self) -> bool {
+        self.flags & ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED != 0
+    }
+
+    pub const fn cursor(&self) -> u32 {
+        self.reserved
     }
 }
 
@@ -1344,6 +1374,12 @@ impl ElmProviderSnapshotHeader {
             flags: 0,
             reserved: 0,
         }
+    }
+
+    pub const fn with_page(mut self, flags: u32, next_cursor: u32) -> Self {
+        self.flags = flags;
+        self.reserved = next_cursor;
+        self
     }
 }
 
