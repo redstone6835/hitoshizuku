@@ -885,11 +885,35 @@ fn snapshot_entries_truncate_names_safely() {
         ElmEbiArch::Any,
         ElmEbiLoadStatus::Ok,
         false,
+        ElmEbiSourceKind::Builtin,
+        0,
+        0,
+        0,
+        true,
+        true,
+        true,
+        false,
+        ElmResourceBudget::ROOT,
+        ElmResourceUsage::default(),
+        false,
+        0,
+        0,
     );
     assert_eq!(cell.id, 1);
     assert_eq!(cell.parent, 0);
     assert_eq!(cell.name_len, 7);
     assert_eq!(&cell.name[..7], b"elm-mgr");
+    assert_eq!(cell.ebi_source, ElmEbiSourceKind::Builtin as u32);
+    assert_ne!(
+        cell.lifecycle_flags & crate::ELM_CELL_LIFECYCLE_HOOKS_DECLARED,
+        0
+    );
+    assert_eq!(
+        cell.budget_max_provider_ports,
+        ElmResourceBudget::ROOT.max_provider_ports
+    );
+    assert_eq!(cell.usage_provider_ports, 0);
+    assert_eq!(cell.isolated, 0);
 
     let port = ElmPortSnapshot::new(
         crate::PortId(1),

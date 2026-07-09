@@ -620,6 +620,7 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - crate 使用 `#![no_std]` 和 `alloc`。
 - `lib.rs` 是 ELM 稳定模型 API 的聚合出口。
 - 后续新增模型必须先判断是否属于稳定协议层；如果只服务某个内核执行器，不应放入 `libs/elm`。
+- 用户态 C 工具通过 `userland/elmctl/include/elmctl_abi.h` 镜像这些固定布局 ABI；头文件对关键结构使用 `_Static_assert`，确保 `repr(C)` 布局变化会在交叉编译阶段暴露。
 
 ### `ctl.rs`
 
@@ -1108,6 +1109,8 @@ ELM 的可观测性由四条路径组成：
 - Audit：读取管理操作审计环。
 - Sysfs：通过 `/sys/kernel/elm/*` 读取只读文本诊断快照。
 
+Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、generation 和名称，还包含 EBI Source 类型、生命周期钩子/执行状态、原生段/import/export 数量、native fault 数、软隔离状态、隔离 blocker、资源预算和当前资源占用。该快照是 `/bin/elmctl snapshot` 和后续用户态管理器判断单元是否可热插拔、可替换、可恢复的稳定观测入口。
+
 审计记录覆盖：
 
 - 生命周期操作。
@@ -1201,7 +1204,7 @@ ELM 的可观测性由四条路径组成：
 当前已经具备从用户态进入 `elm-mgr` 的完整运行链路：
 
 ```text
-用户态 /bin/elmctl-smoke
+用户态 /bin/elmctl 或 /bin/elmctl-smoke
     -> syscall(SYS_ELM_CTL = 509)
         -> ElmCtlCommand::MgrCall
             -> elm-mgr 管理通道
@@ -1211,7 +1214,12 @@ ELM 的可观测性由四条路径组成：
 
 `elm-mgr` 本身是启动期内建 ELM。它在 `sched::boot_init()` 之后、用户态 init 进程启动之前完成初始化，地位类似用户态的 init 进程：后续所有动态 ELM 都挂在 `elm-mgr` 管理树下，所有外部管理工具都通过 `elm-mgr` 暴露的控制面进入 ELM Core。未来 VFS、调度、网络、设备等子系统提供给 ELM 的 API 也应注册为 `elm-mgr` 可发现、可绑定、可转发的枢纽连接层端口，而不是为每个子系统新增私有 ELM syscall。
 
-仓库提供 `userland/elmctl-smoke/elmctl_smoke.c` 作为最小用户态 smoke 工具。该工具不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL`。工具会执行以下检查：
+仓库提供两个用户态入口：
+
+- `userland/elmctl/`：正式管理工具骨架，构建后安装为 `/bin/elmctl`。它使用共享 C ABI 头和 client helper，支持 Core query、snapshot、全局事件、debug dump、所有 `elm-mgr` 查询命令、EKI 装载/替换、生命周期操作、绑定/解绑、runtime log/event、provider 注册/注销/调用、异步 provider、provider snapshot 和事件订阅。管理器自有查询表会结构化解码；具体子系统 provider 的业务 payload 保持十六进制输出，由对应子系统协议解释。
+- `userland/elmctl-smoke/elmctl_smoke.c`：运行期验收工具，构建后安装为 `/bin/elmctl-smoke`。它不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL` 并执行固定验收步骤。
+
+`elmctl-smoke` 会执行以下检查：
 
 - `CoreQuery`：确认 ELM Core magic、ABI、能力位、cell 数量和端口数量。
 - `QueryPolicy`：确认 `elm-mgr` 支持 provider invoke、健康检查、异步 provider、TODO registry、资源预算策略、lifecycle hook failed blocker 和 resource quota blocker。
@@ -1239,7 +1247,7 @@ make kernel-rv
 make kernel-la
 ```
 
-`make kernel-rv` 会把 RISC-V64 静态链接版本安装到 `userland/rootfs-rv/bin/elmctl-smoke`，并重新打包到 `build/initramfs-rv.cpio`。`make kernel-la` 同理安装 LoongArch64 版本到 `userland/rootfs-la/bin/elmctl-smoke`。
+`make kernel-rv` 会把 RISC-V64 静态链接版本安装到 `userland/rootfs-rv/bin/elmctl` 和 `userland/rootfs-rv/bin/elmctl-smoke`，并重新打包到 `build/initramfs-rv.cpio`。`make kernel-la` 同理安装 LoongArch64 版本到 `userland/rootfs-la/bin/elmctl` 和 `userland/rootfs-la/bin/elmctl-smoke`。
 
 RISC-V64 手动运行方式：
 
@@ -1254,6 +1262,19 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 ```sh
 /bin/elmctl-smoke
+```
+
+人工诊断时可以运行：
+
+```sh
+/bin/elmctl core
+/bin/elmctl snapshot
+/bin/elmctl menu
+/bin/elmctl policy
+/bin/elmctl health
+/bin/elmctl providers
+/bin/elmctl api
+/bin/elmctl todo
 ```
 
 预期输出包含：

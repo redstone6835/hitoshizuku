@@ -184,8 +184,9 @@ pub use provider::{
 };
 pub use resource::{ElmResourceBudget, ElmResourceKind, ElmResourceUsage};
 pub use snapshot::{
-    ELM_CELL_NAME_LEN, ELM_CONTRACT_NAME_LEN, ElmCellSnapshot, ElmPortSnapshot, ElmSnapshotHeader,
-    state_code,
+    ELM_CELL_LIFECYCLE_EXECUTOR_READY, ELM_CELL_LIFECYCLE_FINALIZED,
+    ELM_CELL_LIFECYCLE_HOOKS_DECLARED, ELM_CELL_LIFECYCLE_INITIALIZED, ELM_CELL_NAME_LEN,
+    ELM_CONTRACT_NAME_LEN, ElmCellSnapshot, ElmPortSnapshot, ElmSnapshotHeader, state_code,
 };
 pub use state::{ElmState, ElmTransition};
 pub use topology::{TopologyEvent, TopologyEventKind, TopologySnapshot};

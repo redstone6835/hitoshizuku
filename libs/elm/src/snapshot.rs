@@ -1,13 +1,18 @@
 //! 固定布局的运行拓扑快照。
 
-use crate::ebi::{ElmEbiArch, ElmEbiLoadStatus};
+use crate::ebi::{ElmEbiArch, ElmEbiLoadStatus, ElmEbiSourceKind};
 use crate::ids::{ElmId, Generation, PortId};
 use crate::manifest::ElmKind;
 use crate::nexus::{FlowDirection, FlowMode};
+use crate::resource::{ElmResourceBudget, ElmResourceUsage};
 use crate::state::ElmState;
 
 pub const ELM_CELL_NAME_LEN: usize = 64;
 pub const ELM_CONTRACT_NAME_LEN: usize = 64;
+pub const ELM_CELL_LIFECYCLE_HOOKS_DECLARED: u32 = 1 << 0;
+pub const ELM_CELL_LIFECYCLE_EXECUTOR_READY: u32 = 1 << 1;
+pub const ELM_CELL_LIFECYCLE_INITIALIZED: u32 = 1 << 2;
+pub const ELM_CELL_LIFECYCLE_FINALIZED: u32 = 1 << 3;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,9 +62,34 @@ pub struct ElmCellSnapshot {
     pub name_len: u16,
     pub reserved: u16,
     pub name: [u8; ELM_CELL_NAME_LEN],
+    pub ebi_source: u32,
+    pub lifecycle_flags: u32,
+    pub native_segment_count: u16,
+    pub native_import_count: u16,
+    pub native_export_count: u16,
+    pub native_faults: u16,
+    pub isolated: u32,
+    pub reserved1: u32,
+    pub isolation_blocker: u64,
+    pub budget_max_provider_ports: u16,
+    pub budget_max_provider_queue: u16,
+    pub budget_max_event_subscriptions: u16,
+    pub budget_max_pending_loads: u16,
+    pub budget_max_native_images: u16,
+    pub budget_max_native_faults: u16,
+    pub budget_max_audit_records: u16,
+    pub usage_provider_ports: u16,
+    pub usage_provider_queue: u16,
+    pub usage_event_subscriptions: u16,
+    pub usage_pending_loads: u16,
+    pub usage_native_images: u16,
+    pub usage_native_faults: u16,
+    pub usage_audit_records: u16,
+    pub reserved2: u32,
 }
 
 impl ElmCellSnapshot {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: ElmId,
         parent: Option<ElmId>,
@@ -70,6 +100,19 @@ impl ElmCellSnapshot {
         ebi_arch: ElmEbiArch,
         ebi_status: ElmEbiLoadStatus,
         native_code: bool,
+        ebi_source: ElmEbiSourceKind,
+        native_segment_count: u16,
+        native_import_count: u16,
+        native_export_count: u16,
+        lifecycle_hooks_declared: bool,
+        lifecycle_executor_ready: bool,
+        lifecycle_initialized: bool,
+        lifecycle_finalized: bool,
+        budget: ElmResourceBudget,
+        usage: ElmResourceUsage,
+        isolated: bool,
+        native_faults: u16,
+        isolation_blocker: u64,
     ) -> Self {
         let mut out = Self {
             id: id.0,
@@ -84,6 +127,35 @@ impl ElmCellSnapshot {
             name_len: 0,
             reserved: 0,
             name: [0; ELM_CELL_NAME_LEN],
+            ebi_source: ebi_source as u32,
+            lifecycle_flags: lifecycle_flags(
+                lifecycle_hooks_declared,
+                lifecycle_executor_ready,
+                lifecycle_initialized,
+                lifecycle_finalized,
+            ),
+            native_segment_count,
+            native_import_count,
+            native_export_count,
+            native_faults,
+            isolated: u32::from(isolated),
+            reserved1: 0,
+            isolation_blocker,
+            budget_max_provider_ports: budget.max_provider_ports,
+            budget_max_provider_queue: budget.max_provider_queue,
+            budget_max_event_subscriptions: budget.max_event_subscriptions,
+            budget_max_pending_loads: budget.max_pending_loads,
+            budget_max_native_images: budget.max_native_images,
+            budget_max_native_faults: budget.max_native_faults,
+            budget_max_audit_records: budget.max_audit_records,
+            usage_provider_ports: usage.provider_ports,
+            usage_provider_queue: usage.provider_queue,
+            usage_event_subscriptions: usage.event_subscriptions,
+            usage_pending_loads: usage.pending_loads,
+            usage_native_images: usage.native_images,
+            usage_native_faults: usage.native_faults,
+            usage_audit_records: usage.audit_records,
+            reserved2: 0,
         };
         let bytes = name.as_bytes();
         let n = bytes.len().min(ELM_CELL_NAME_LEN);
@@ -91,6 +163,31 @@ impl ElmCellSnapshot {
         out.name_len = n as u16;
         out
     }
+}
+
+const fn lifecycle_flags(
+    hooks_declared: bool,
+    executor_ready: bool,
+    initialized: bool,
+    finalized: bool,
+) -> u32 {
+    (if hooks_declared {
+        ELM_CELL_LIFECYCLE_HOOKS_DECLARED
+    } else {
+        0
+    }) | (if executor_ready {
+        ELM_CELL_LIFECYCLE_EXECUTOR_READY
+    } else {
+        0
+    }) | (if initialized {
+        ELM_CELL_LIFECYCLE_INITIALIZED
+    } else {
+        0
+    }) | (if finalized {
+        ELM_CELL_LIFECYCLE_FINALIZED
+    } else {
+        0
+    })
 }
 
 #[repr(C)]

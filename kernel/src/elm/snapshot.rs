@@ -26,6 +26,19 @@ pub(crate) fn snapshot_bytes(core: &ElmCore) -> Vec<u8> {
             cell.ebi_arch,
             cell.ebi_status,
             cell.has_native_code,
+            cell.ebi_source,
+            cell.native_segment_count,
+            cell.native_import_count,
+            cell.native_export_count,
+            cell.lifecycle_hooks_declared,
+            cell.lifecycle_executor_ready,
+            cell.lifecycle_initialized,
+            cell.lifecycle_finalized,
+            cell.resource_budget,
+            core.cell_resource_usage(cell.id),
+            cell.isolated,
+            cell.native_faults,
+            cell.isolation_blocker,
         );
         push_plain(&mut out, &entry);
     }

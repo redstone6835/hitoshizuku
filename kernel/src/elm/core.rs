@@ -7019,7 +7019,7 @@ impl ElmCore {
             .unwrap_or(ElmResourceBudget::DEFAULT)
     }
 
-    fn cell_resource_usage(&self, id: ElmId) -> ElmResourceUsage {
+    pub(crate) fn cell_resource_usage(&self, id: ElmId) -> ElmResourceUsage {
         let provider_ports = self
             .providers
             .iter()
