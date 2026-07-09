@@ -377,7 +377,7 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 
 当前 `ReplaceCell` 已具备受限热替换事务：输入为 `ElmReplaceCellRequestV1 + EKI payload`，目标必须是 `Active` 或 `Paused` 的动态原生单元，新旧单元的 manifest name 和 kind 必须一致，声明式拓扑、provider surface、imports/exports 和生命周期钩子必须通过兼容性校验。替换过程会影子装载新 EKI、执行新 `on_initialize`、静默旧单元、调用旧 `on_migrate_export` 导出最多 64 KiB 状态、调用新 `on_migrate_import` 导入状态、执行旧 `on_finalize`，最后提交 generation、provider backend、菜单元数据、绑定和租约代际更新。失败时会调用新 `on_migrate_abort` 与 `on_finalize`，旧钩子失败会把旧单元隔离到诊断状态。
 
-当前仍然主动阻断的场景包括：内建单元、Projection/Remote Source、Builtin/Memory 外部替换请求、目标存在子单元/依赖者/拓展项、忙碌租约、provider 队列、运行中调用或保留结果仍未排空、外部原生 import 仍指向旧 exports、缺少原生 code segment、缺少迁移钩子、native 装载器无法安全重定位。无停机影子 provider 调用迁移、运行中调用强抢占和跨单元 native import 自动重绑定仍属于后续故障隔离主线。
+当前仍然主动阻断的场景包括：内建单元、Projection/Remote Source、Builtin/Memory 外部替换请求、目标存在子单元/依赖者/拓展项、忙碌租约、provider 队列、运行中调用或保留结果仍未排空、缺少原生 code segment、缺少迁移钩子、native 装载器无法安全重定位，或外部 importer 无法安全 patch 到新 export。跨单元 native import 自动重绑定只支持落在可写 Data/Bss 段内的 import slot/GOT 形态；若 import relocation 落在已 seal 的 Code 段内，会被视为不可安全重绑定。无停机影子 provider 调用迁移和运行中调用强抢占仍属于后续故障隔离主线。
 
 ## 10. 资源租约
 
@@ -600,8 +600,8 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 尚未完成：
 
 - TODO(elm)：Projection/Remote Source、未来 soyo ELM profile 和其他容器到 EBI 协议对象的产出层。
-- TODO(elm)：跨单元 native import 自动重绑定、跨版本 export 选择策略和更细粒度的 import 权限策略。
-- TODO(elm)：trap 级故障捕获、panic 恢复、运行中调用强抢占和更细粒度强隔离边界。
+- TODO(elm)：跨版本 export 策略扩展和更细粒度的 import 权限策略。
+- TODO(elm)：trap 级故障捕获、panic 恢复、运行中调用强抢占和更细粒度硬隔离边界。
 
 ## 14. 模型层模块设计：`libs/elm`
 
@@ -1174,7 +1174,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；`mgr.action.invoke@1` 已接入 kernel-backed 执行器，管理通道已覆盖健康动作调用和业务失败审计，带 `handler_symbol` 的动态 ELM 原生 provider 会进入 `ElmNativeProviderCallV1` 调用边界。
 - `MGR_CALL(SubmitProviderCall/PollProviderReply/CancelProviderCall/QueryProviderQueue)` 已形成真实异步队列闭环，支持 ticket、队列容量、运行中观测、超时、结果 TTL、排队取消、运行中取消意图、队列统计和租约 active ref 保护。
 - `MGR_CALL(QueryApiRegistry)` 已返回 `elm-mgr` API 注册表，覆盖已实现管理 API、事件 API、provider API 和子系统导出的 provider specs。
-- `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，静态项只保留文件投影/远程分发、trap 级强隔离、热替换重绑定和外部 Rust 开发框架等大方向；缺 handler 的动态 provider、pending native EBI 和当前运行中的 provider 会作为动态记录出现。
+- `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，静态项只保留文件投影/远程分发、trap 级硬恢复、provider snapshot 流式协议和外部 Rust 开发框架等大方向；缺 handler 的动态 provider、pending native EBI 和当前运行中的 provider 会作为动态记录出现。
 - `MGR_CALL(SubscribeEvent/UnsubscribeEvent/QueryEventSubscriptions/ReadSubscribedEvents)` 已形成事件订阅闭环，支持订阅租约、独立游标、过滤器、只读不推进和读取后推进两种模式。
 - `/sys/kernel/elm` 已提供只读文本观测面，覆盖 core、policy、health、menu、topology、ports、providers、bindings、events、audit、api、native-capabilities 和 todo-registry。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event、audit、native capability 和 TODO registry 不变量破坏。
@@ -1305,10 +1305,10 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 尚未完成：
 
 - TODO(elm)：Projection/Remote Source、未来 soyo ELM profile 和其他容器到 EBI 协议对象的产出层。
-- TODO(elm)：跨单元 native import 自动重绑定、无停机影子 binding 切换和运行中 provider 强抢占。
-- TODO(elm)：trap 级故障捕获、panic 恢复和强隔离边界。
+- TODO(elm)：无停机影子 binding 切换和运行中 provider 强抢占。
+- TODO(elm)：trap 级故障捕获、panic 恢复和硬恢复边界。
 - TODO(elm)：设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
-- TODO(elm)：端口级故障隔离、运行中调用强抢占和 provider snapshot 的零拷贝/流式扩展协议。
+- TODO(elm)：provider snapshot 的零拷贝/流式扩展协议。
 - TODO(elm)：面向 Rust ELM 的开发框架和构建链路。
 
 阶段收束结论：
@@ -1317,7 +1317,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - 当前阶段不再继续把零散能力堆进 `MGR_CALL`，后续新增能力必须归入明确主线：原生执行器、子系统 provider 接入、热替换与故障隔离、Rust 开发框架、网络栈 ELM 化。
 - `elm-mgr` 是所有 ELM 通向内核能力的唯一网关；后续 VFS、设备、调度、网络、IRQ、DMA、MMIO 等能力只通过 `elm-mgr` API 注册表和 provider Ops 暴露，不新增私有 ELM syscall。
 - `EKI` 是近期原生 ELM 镜像承载方式，`soyo` 仍保持后置；ELM Core 继续只消费 EBI 协议对象，不绑定具体文件格式。
-- 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用；EKI Source 的受限热替换迁移事务、运行中 provider 调用排空链路、provider snapshot cursor 分页、资源预算阻断和 native fault 软隔离已经接入。跨单元 native import 自动重绑定、运行中调用强抢占、trap 级恢复、provider snapshot 零拷贝/流式扩展协议和更细的 import 权限策略仍必须继续停在 `TODO(elm)` 边界，不能用测试执行器或声明式拓扑伪装为已经实现。
+- 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用；EKI Source 的受限热替换迁移事务、跨单元 native import 自动重绑定、运行中 provider 调用排空链路、provider snapshot cursor 分页、资源预算阻断和 native fault 软隔离已经接入。运行中调用强抢占、trap 级恢复、provider snapshot 零拷贝/流式扩展协议和更细的 import 权限策略仍必须继续停在 `TODO(elm)` 边界，不能用测试执行器或声明式拓扑伪装为已经实现。
 
 ## 19. 后续阶段路线
 
@@ -1347,7 +1347,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - 已完成原生 EKI 镜像执行器：段复制、EKI relocation v1、代码页/只读页/数据页 W^X 权限、指令缓存同步和生命周期 hook 调用。
 - 已完成架构映射 ops：RISC-V64 和 LoongArch64 通过 `general::elm_image` 注册堆页权限切换和 icache 同步入口。
 - 已完成入口调用约定；待完成更细粒度的 import 权限策略、跨版本 export 选择和故障回调。
-- 已完成受限热替换迁移事务和运行中 provider 调用排空；待完成跨单元 native import 自动重绑定和强抢占式故障隔离。
+- 已完成受限热替换迁移事务、跨单元 native import 自动重绑定和运行中 provider 调用排空；待完成强抢占式故障隔离和无停机影子 binding 切换。
 
 第四阶段：端口提供者体系。
 
@@ -1358,7 +1358,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 第五阶段：热替换和故障隔离。
 
 - 完善无停机影子绑定和 provider 调用迁移。
-- 完善跨单元 native import 自动重绑定。
+- 完善无停机影子 binding 切换。
 - 完善切换代回滚和流排空。
 - 完善旧代退役和原生镜像故障围栏。
 - 实现故障单元隔离态和受限诊断通道。

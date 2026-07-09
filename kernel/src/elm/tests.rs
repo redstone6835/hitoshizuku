@@ -983,6 +983,7 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
         "runtime.resource_quota",
         "source.non_eki",
         "native.fault_isolation",
+        "runtime.hot_replace_rebind",
     ] {
         assert!(
             !bytes
@@ -994,6 +995,16 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
         bytes
             .windows("source.projection_remote".len())
             .any(|window| window == b"source.projection_remote")
+    );
+    assert!(
+        bytes
+            .windows("native.trap_recovery".len())
+            .any(|window| window == b"native.trap_recovery")
+    );
+    assert!(
+        bytes
+            .windows("provider.snapshot_streaming".len())
+            .any(|window| window == b"provider.snapshot_streaming")
     );
     assert!(
         !bytes
@@ -1373,6 +1384,15 @@ fn elm_native_entry_rejects_frame_mutation() {
 
     assert!(result.is_err());
     assert_eq!(TEST_NATIVE_ENTRY_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[ktest]
+fn elm_native_import_rebind_rewrites_absolute_slot() {
+    let mut slot = 0x1000_u64;
+    let result = super::native::test_rewrite_import_abs64(&mut slot, 0xfeed_cafe);
+
+    assert!(result.is_ok());
+    assert_eq!(slot, 0xfeed_cafe);
 }
 
 #[ktest]

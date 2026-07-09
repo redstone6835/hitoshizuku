@@ -291,6 +291,7 @@ struct NativeExportRuntime {
 struct NativeImportRuntime {
     owner: ElmId,
     provider: ElmId,
+    import_index: u32,
     name: String,
     contract: FlowContract,
     requested_version: u32,
@@ -1347,7 +1348,11 @@ impl ElmCore {
                             next_cursor,
                         )
                     } else if status == ELM_MGR_STATUS_OK {
+                        self.mark_native_fault(native.owner, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED);
                         ProviderSnapshotPageResult::status_only(ELM_MGR_STATUS_INVALID)
+                    } else if matches!(status, ELM_MGR_STATUS_INVALID) {
+                        self.mark_native_fault(native.owner, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED);
+                        ProviderSnapshotPageResult::status_only(status)
                     } else {
                         ProviderSnapshotPageResult::status_only(status)
                     }
@@ -2816,9 +2821,6 @@ impl ElmCore {
                 if self.leases.busy_owned_by(id) != 0 {
                     blockers |= ELM_POLICY_BLOCK_LEASE_BUSY;
                 }
-                if self.native_export_importer_count(id) != 0 {
-                    blockers |= ELM_POLICY_BLOCK_HAS_DEPENDENTS;
-                }
             }
         }
 
@@ -3209,6 +3211,14 @@ impl ElmCore {
                 );
             }
         };
+        if !self.can_rebind_native_importers_for_replace(id, &exports) {
+            return fail(
+                self,
+                ELM_MGR_STATUS_BUSY,
+                ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+                ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
+            );
+        }
 
         let Some(old_image_index) = self.native_image_index(id) else {
             return fail(
@@ -3953,16 +3963,16 @@ impl ElmCore {
             static_flags,
             ELM_POLICY_BLOCK_NATIVE_TODO,
             0,
-            "native.trap_isolation",
-            "trap 级故障捕获、panic 恢复和运行中强抢占属于强隔离主线",
+            "native.trap_recovery",
+            "trap 级故障捕获、panic 恢复和硬恢复边界仍需架构层支持",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_RUNTIME,
             static_flags,
             ELM_POLICY_BLOCK_NATIVE_TODO,
             0,
-            "runtime.hot_replace_rebind",
-            "跨单元 import 自动重绑定和无停机影子 binding 属于热替换主线",
+            "provider.snapshot_streaming",
+            "provider snapshot 零拷贝和流式扩展协议仍未实现",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_FRAMEWORK,
@@ -4757,7 +4767,7 @@ impl ElmCore {
                 .as_str(),
             );
         }
-        out.push_str("TODO(elm): 文件投影/远程分发、trap 级强隔离、热替换重绑定、子系统 provider 和 Rust 开发框架仍是后续主线。\n");
+        out.push_str("TODO(elm): 文件投影/远程分发、trap 级硬恢复、provider snapshot 流式协议、子系统 provider 和 Rust 开发框架仍是后续主线。\n");
         out.into_bytes()
     }
 
@@ -5696,7 +5706,7 @@ impl ElmCore {
         let mut values = Vec::new();
         let mut dependencies = Vec::new();
         let mut imports = Vec::new();
-        for import in &unit.imports {
+        for (import_index, import) in unit.imports.iter().enumerate() {
             let candidates: Vec<_> = self
                 .native_exports
                 .iter()
@@ -5740,6 +5750,7 @@ impl ElmCore {
             imports.push(NativeImportRuntime {
                 owner,
                 provider: export.owner,
+                import_index: import_index as u32,
                 name: import.name.clone(),
                 contract: import.contract.clone(),
                 requested_version: import.version,
@@ -6437,6 +6448,85 @@ impl ElmCore {
         before.saturating_sub(self.native_imports.len())
     }
 
+    fn rebind_native_importers_for_replace(
+        &mut self,
+        owner: ElmId,
+        new_exports: &[NativeExportRuntime],
+    ) -> bool {
+        let mut plans = Vec::new();
+        for (import_runtime_index, import) in self.native_imports.iter().enumerate() {
+            if import.provider != owner || import.owner == owner {
+                continue;
+            }
+            let Some(export) = new_exports.iter().find(|export| {
+                export.owner == owner
+                    && export.name == import.name
+                    && export.contract == import.contract
+                    && export.version == import.selected_version
+            }) else {
+                return false;
+            };
+            let Some(image_index) = self.native_image_index(import.owner) else {
+                return false;
+            };
+            if !self.native_images[image_index]
+                .can_rebind_import_to(import.import_index, export.address)
+            {
+                return false;
+            }
+            plans.push((
+                import_runtime_index,
+                image_index,
+                import.import_index,
+                export.address,
+            ));
+        }
+
+        for (_, image_index, import_index, address) in &plans {
+            if self.native_images[*image_index]
+                .rebind_import(*import_index, *address)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        for (import_runtime_index, _, _, address) in plans {
+            if let Some(import) = self.native_imports.get_mut(import_runtime_index) {
+                import.address = address;
+            }
+        }
+        true
+    }
+
+    fn can_rebind_native_importers_for_replace(
+        &self,
+        owner: ElmId,
+        new_exports: &[NativeExportRuntime],
+    ) -> bool {
+        for import in self.native_imports.iter() {
+            if import.provider != owner || import.owner == owner {
+                continue;
+            }
+            let Some(export) = new_exports.iter().find(|export| {
+                export.owner == owner
+                    && export.name == import.name
+                    && export.contract == import.contract
+                    && export.version == import.selected_version
+            }) else {
+                return false;
+            };
+            let Some(image_index) = self.native_image_index(import.owner) else {
+                return false;
+            };
+            if !self.native_images[image_index]
+                .can_rebind_import_to(import.import_index, export.address)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn rollback_activated_cell_to_quarantine(&mut self, id: ElmId) {
         let _ = self.leases.revoke_and_remove_owned_by(id);
         let removed_bindings = self.take_owned_bindings(id);
@@ -6468,6 +6558,7 @@ impl ElmCore {
         exports: Vec<NativeExportRuntime>,
         imports: Vec<NativeImportRuntime>,
     ) {
+        let _ = self.rebind_native_importers_for_replace(id, &exports);
         self.remove_native_exports_owned_by(id);
         self.remove_native_imports_owned_by(id);
         self.native_exports.extend(exports);

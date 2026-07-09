@@ -46,12 +46,22 @@ struct NativeSymbol {
     address: usize,
 }
 
+#[derive(Debug, Clone)]
+struct NativeImportRelocation {
+    import_index: u32,
+    kind: ElmEbiRelocationKind,
+    target_addr: usize,
+    addend: i64,
+    rebindable: bool,
+}
+
 pub(crate) struct LoadedElmImage {
     cell: ElmId,
     base: usize,
     size: usize,
     segments: Vec<NativeSegment>,
     symbols: Vec<NativeSymbol>,
+    import_relocations: Vec<NativeImportRelocation>,
     initialize: usize,
     finalize: usize,
     quiesce: Option<usize>,
@@ -105,6 +115,7 @@ impl LoadedElmImage {
                 })
                 .collect(),
             symbols: Vec::new(),
+            import_relocations: Vec::new(),
             initialize: 0,
             finalize: 0,
             quiesce: None,
@@ -120,10 +131,13 @@ impl LoadedElmImage {
             drop(loaded);
             return Err(status);
         }
-        if let Err(status) = loaded.apply_relocations(image, imports) {
-            drop(loaded);
-            return Err(status);
-        }
+        loaded.import_relocations = match loaded.apply_relocations(image, imports) {
+            Ok(import_relocations) => import_relocations,
+            Err(status) => {
+                drop(loaded);
+                return Err(status);
+            }
+        };
         loaded.symbols = loaded.collect_symbols(image)?;
         loaded.initialize = loaded
             .symbol_address(ELM_EBI_HOOK_ON_INITIALIZE)
@@ -191,6 +205,45 @@ impl LoadedElmImage {
             .ok_or(ElmEbiLoadStatus::InvalidManifest)
     }
 
+    pub(crate) fn can_rebind_import_to(&self, import_index: u32, new_address: usize) -> bool {
+        let mut found = false;
+        for relocation in self
+            .import_relocations
+            .iter()
+            .filter(|relocation| relocation.import_index == import_index)
+        {
+            found = true;
+            if !relocation.rebindable || !import_relocation_value_fits(relocation, new_address) {
+                return false;
+            }
+        }
+        found
+    }
+
+    pub(crate) fn rebind_import(
+        &self,
+        import_index: u32,
+        new_address: usize,
+    ) -> Result<(), ElmEbiLoadStatus> {
+        if !self.can_rebind_import_to(import_index, new_address) {
+            return Err(ElmEbiLoadStatus::RuntimeRejected);
+        }
+        let mut patched = 0usize;
+        for relocation in self
+            .import_relocations
+            .iter()
+            .filter(|relocation| relocation.import_index == import_index)
+        {
+            write_import_relocation(relocation, new_address)?;
+            patched += 1;
+        }
+        if patched == 0 {
+            Err(ElmEbiLoadStatus::RuntimeRejected)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn provider_handler_for_decl(
         &self,
         decl: &ElmEbiProviderPortDecl,
@@ -238,7 +291,8 @@ impl LoadedElmImage {
         &self,
         image: &ElmEbiImage,
         imports: &[usize],
-    ) -> Result<(), ElmEbiLoadStatus> {
+    ) -> Result<Vec<NativeImportRelocation>, ElmEbiLoadStatus> {
+        let mut import_relocations = Vec::new();
         for relocation in &image.relocations {
             let Some(target) = self.segment_by_unit_index(relocation.target_segment_index) else {
                 return Err(ElmEbiLoadStatus::InvalidSegment);
@@ -271,8 +325,25 @@ impl LoadedElmImage {
                     write_unsigned_relocation(target_addr, absolute, width)?;
                 }
             }
+            if matches!(
+                relocation.kind,
+                ElmEbiRelocationKind::ImportAbs64
+                    | ElmEbiRelocationKind::ImportRel32
+                    | ElmEbiRelocationKind::ImportRel64
+            ) {
+                import_relocations.push(NativeImportRelocation {
+                    import_index: relocation.value_index,
+                    kind: relocation.kind,
+                    target_addr,
+                    addend: relocation.addend,
+                    rebindable: matches!(
+                        target.kind,
+                        ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
+                    ),
+                });
+            }
         }
-        Ok(())
+        Ok(import_relocations)
     }
 
     fn relocation_value(
@@ -601,6 +672,47 @@ fn write_signed_relocation(
     }
 }
 
+fn write_import_relocation(
+    relocation: &NativeImportRelocation,
+    new_address: usize,
+) -> Result<(), ElmEbiLoadStatus> {
+    if !relocation.rebindable {
+        return Err(ElmEbiLoadStatus::RuntimeRejected);
+    }
+    match relocation.kind {
+        ElmEbiRelocationKind::ImportAbs64 => {
+            let absolute = add_signed(new_address, relocation.addend)?;
+            write_unsigned_relocation(relocation.target_addr, absolute, 8)
+        }
+        ElmEbiRelocationKind::ImportRel32 => {
+            let signed = signed_delta(new_address, relocation.addend, relocation.target_addr)?;
+            write_signed_relocation(relocation.target_addr, signed, 4)
+        }
+        ElmEbiRelocationKind::ImportRel64 => {
+            let signed = signed_delta(new_address, relocation.addend, relocation.target_addr)?;
+            write_signed_relocation(relocation.target_addr, signed, 8)
+        }
+        _ => Err(ElmEbiLoadStatus::InvalidSegment),
+    }
+}
+
+fn import_relocation_value_fits(relocation: &NativeImportRelocation, new_address: usize) -> bool {
+    match relocation.kind {
+        ElmEbiRelocationKind::ImportAbs64 => add_signed(new_address, relocation.addend).is_ok(),
+        ElmEbiRelocationKind::ImportRel32 => {
+            let Ok(value) = signed_delta(new_address, relocation.addend, relocation.target_addr)
+            else {
+                return false;
+            };
+            i32::try_from(value).is_ok()
+        }
+        ElmEbiRelocationKind::ImportRel64 => {
+            signed_delta(new_address, relocation.addend, relocation.target_addr).is_ok()
+        }
+        _ => false,
+    }
+}
+
 fn call_native_hook(address: usize, context: &ElmContext) -> ElmResult<()> {
     if address == 0 {
         return Err(ElmError::InvalidTransition);
@@ -903,6 +1015,18 @@ pub(crate) fn invoke_provider_snapshot(
     } else {
         (frame.status, 0, 0, 0, 0)
     }
+}
+
+#[cfg(feature = "kernel-tests")]
+pub(crate) fn test_rewrite_import_abs64(slot: &mut u64, new_address: usize) -> ElmResult<()> {
+    let relocation = NativeImportRelocation {
+        import_index: 0,
+        kind: ElmEbiRelocationKind::ImportAbs64,
+        target_addr: slot as *mut u64 as usize,
+        addend: 0,
+        rebindable: true,
+    };
+    write_import_relocation(&relocation, new_address).map_err(|_| ElmError::InvalidTransition)
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
