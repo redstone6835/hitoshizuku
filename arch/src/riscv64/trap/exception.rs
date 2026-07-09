@@ -158,6 +158,7 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
             // 形成"看似无法返回"的中断风暴。
             super::super::time::rearm_periodic_timer();
             let now_ns = kernel_timestamp_ns();
+            let _ = general::elm_guard::request_timeout_if_expired(now_ns);
             sched::on_timer_tick(now_ns);
             super::super::vdso::run_timer_tick_hook(now_ns);
             super::super::vdso::run_net_poll_hook(now_ns);

@@ -156,6 +156,7 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
             // 通知调度器推进虚拟时间；若时间片用完会置 NEED_RESCHED，下方
             // 返回前的 preempt_if_needed 会真正切换。
             let now_ns = super::super::specific::kernel_timestamp_ns();
+            let _ = general::elm_guard::request_timeout_if_expired(now_ns);
             sched::on_timer_tick(now_ns);
             super::super::vdso::run_timer_tick_hook(now_ns);
             // 网络协议栈 poll：每 ~10ms 推一帧即可覆盖常见用例；

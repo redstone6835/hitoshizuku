@@ -17,6 +17,7 @@ use crate::ports::ElmPortAccessPolicy;
 
 pub const ELM_EBI_ABI_VERSION: u16 = 1;
 pub const ELM_EBI_SOURCE_ABI_VERSION: u16 = 1;
+pub const ELM_EBI_PROJECTION_SOURCE_ABI_VERSION: u16 = 1;
 pub const ELM_EBI_MAX_SEGMENTS: usize = 32;
 pub const ELM_EBI_MAX_DEPENDENCIES: usize = 16;
 pub const ELM_EBI_MAX_EXTENSION_POINTS: usize = 16;
@@ -95,6 +96,28 @@ impl ElmEbiSourceRequest {
             abi_version: ELM_EBI_SOURCE_ABI_VERSION,
             source_kind: kind as u16,
             flags: ELM_EBI_SOURCE_FLAG_NONE,
+            payload_len,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmProjectionSourceRequest {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub provider_id: u64,
+    pub payload_len: u32,
+    pub reserved: u32,
+}
+
+impl ElmProjectionSourceRequest {
+    pub const fn new(provider_id: u64, payload_len: u32) -> Self {
+        Self {
+            abi_version: ELM_EBI_PROJECTION_SOURCE_ABI_VERSION,
+            flags: 0,
+            provider_id,
             payload_len,
             reserved: 0,
         }

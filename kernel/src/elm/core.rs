@@ -44,34 +44,34 @@ use elm_model::{
     ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
     ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK,
     ELM_REPLACE_MIGRATION_STATE_MAX, ELM_RUNTIME_LOG_MESSAGE_LEN, ELM_TODO_FLAG_ACTIVE,
-    ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER,
-    ELM_TODO_KIND_RUNTIME, ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest,
-    ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch,
-    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
-    ElmEbiProviderPortDecl, ElmEbiSourceKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord,
-    ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase,
-    ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse,
-    ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
-    ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest,
-    ElmMgrEventUnsubscribeResponse, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
-    ElmMgrSubscribedEventReadHeader, ElmMgrSubscribedEventReadRequest, ElmMgrTopologyHeader,
-    ElmName, ElmNativeCapabilityHeader, ElmNativeCapabilityRecord, ElmNexusBindPlanResponse,
-    ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
-    ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmProviderAsyncCancelRequest,
-    ElmProviderAsyncCancelResponse, ElmProviderAsyncPollRequest, ElmProviderAsyncPollResponse,
-    ElmProviderAsyncState, ElmProviderAsyncSubmitRequest, ElmProviderAsyncSubmitResponse,
-    ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRecord,
-    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
-    ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader,
-    ElmProviderQueueStatsRecord, ElmProviderSnapshotHeader, ElmProviderSnapshotRequest,
-    ElmReplaceCellResponseV1, ElmReplyFrame, ElmResourceBudget, ElmResourceKind, ElmResourceUsage,
-    ElmResult, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
-    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
-    ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmVersion, FlowContract, FlowDirection,
-    FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId,
-    ResourceLease, TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason,
-    planned_final_state, state_code, status_from_blockers,
+    ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_RUNTIME,
+    ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmContext,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiExtensionPointDecl,
+    ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiSourceKind,
+    ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence, ElmId, ElmKind,
+    ElmLifecycleAction, ElmLifecyclePhase, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse,
+    ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor,
+    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallKind,
+    ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse, ElmMgrEventSubscriptionHeader,
+    ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest, ElmMgrEventUnsubscribeResponse,
+    ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrSubscribedEventReadHeader,
+    ElmMgrSubscribedEventReadRequest, ElmMgrTopologyHeader, ElmName, ElmNativeCapabilityHeader,
+    ElmNativeCapabilityRecord, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest,
+    ElmPortAccessPolicy, ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse,
+    ElmProviderAsyncPollRequest, ElmProviderAsyncPollResponse, ElmProviderAsyncState,
+    ElmProviderAsyncSubmitRequest, ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest,
+    ElmProviderInvokeResponse, ElmProviderPortRecord, ElmProviderPortRegisterRequest,
+    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord,
+    ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord,
+    ElmProviderSnapshotHeader, ElmProviderSnapshotRequest, ElmReplaceCellResponseV1, ElmReplyFrame,
+    ElmResourceBudget, ElmResourceKind, ElmResourceUsage, ElmResult, ElmRuntimeEventRequest,
+    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState, ElmTodoRegistryHeader,
+    ElmTodoRegistryRecord, ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId,
+    LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
+    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
+    status_from_blockers,
 };
 use elm_model::{
     ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_SYSCALL, ELM_MGR_API_FLAG_SYSFS,
@@ -2049,7 +2049,7 @@ impl ElmCore {
             ProviderBackend::Kernel(kind) => self.invoke_kernel_provider(kind, &edge, frame),
             ProviderBackend::KernelOps(spec) => Ok((spec.invoke)(frame)),
             ProviderBackend::ElmNative(native) => {
-                Ok(self.invoke_native_provider(native, &edge, lease, frame))
+                Ok(self.invoke_native_provider(native, &edge, lease, frame, 0))
             }
             ProviderBackend::ElmNativeTodo => {
                 self.providers[provider_index].failed_calls = self.providers[provider_index]
@@ -2103,6 +2103,7 @@ impl ElmCore {
         edge: &elm_model::CapabilityBindingEdge,
         lease: LeaseId,
         frame: ElmCallFrame,
+        deadline_ns: u64,
     ) -> ElmReplyFrame {
         super::native::invoke_provider_handler(
             native.handler,
@@ -2110,6 +2111,7 @@ impl ElmCore {
             edge.port,
             lease,
             frame,
+            deadline_ns,
         )
     }
 
@@ -2769,7 +2771,7 @@ impl ElmCore {
                 }
             }
             ElmLifecycleAction::Detach => {
-                // TODO(elm): 原生代码单元需要卸载执行器；当前只允许未激活的原生元数据直接摘除。
+                // 已激活的原生单元必须能拿到生命周期执行器，确保卸载前执行 finalize。
                 if self.cell_has_native_code(id)
                     && current != ElmState::Loaded
                     && !lifecycle_executor_available
@@ -2853,7 +2855,7 @@ impl ElmCore {
         status
     }
 
-    // TODO(elm): EBI Source 接入层完成后由对应实现体调用该协议装载入口。
+    // 内核内部测试和内建路径可直接提交 EBI unit；外部通道必须先经过 Source 分发。
     #[allow(dead_code)]
     pub fn load_ebi_unit(&mut self, unit: ElmEbiUnit, arch: ElmEbiArch) -> ElmLoadCellResponse {
         self.load_ebi_unit_inner(unit, arch, None)
@@ -3955,24 +3957,16 @@ impl ElmCore {
             static_flags,
             ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
             0,
-            "source.projection_remote",
-            "Projection、Remote 和 soyo EBI 产出层属于文件投影与分发主线",
+            "source.remote_soyo",
+            "Remote Source 和 soyo EBI 产出层属于后续文件分发主线",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_NATIVE,
             static_flags,
             ELM_POLICY_BLOCK_NATIVE_TODO,
             0,
-            "native.trap_recovery",
-            "trap 级故障捕获、panic 恢复和硬恢复边界仍需架构层支持",
-        ));
-        records.push(todo_record(
-            ELM_TODO_KIND_RUNTIME,
-            static_flags,
-            ELM_POLICY_BLOCK_NATIVE_TODO,
-            0,
-            "provider.snapshot_streaming",
-            "provider snapshot 零拷贝和流式扩展协议仍未实现",
+            "native.trap_trampoline",
+            "ELM protected-call guard 已接入，trap frame 重定向 trampoline 仍需架构层完成",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_FRAMEWORK,
@@ -3983,22 +3977,6 @@ impl ElmCore {
             "外部 Rust ELM 开发框架和构建链路仍未纳入内核仓库实现",
         ));
 
-        for provider in &self.providers {
-            if !matches!(provider.backend, ProviderBackend::ElmNativeTodo) {
-                continue;
-            }
-            let Some(port) = self.port_desc(provider.port) else {
-                continue;
-            };
-            records.push(todo_record(
-                ELM_TODO_KIND_PROVIDER,
-                ELM_TODO_FLAG_ACTIVE,
-                ELM_POLICY_BLOCK_NATIVE_TODO,
-                provider.port.0,
-                "provider.backend.todo",
-                port.contract(),
-            ));
-        }
         for pending in &self.pending_ebi_loads {
             records.push(todo_record(
                 ELM_TODO_KIND_NATIVE,
@@ -4034,7 +4012,7 @@ impl ElmCore {
                     ELM_POLICY_BLOCK_PROVIDER_BUSY,
                     provider.port.0,
                     "runtime.provider_in_flight",
-                    "该 provider 当前存在运行中调用；已支持取消意图，强抢占仍依赖后续故障隔离",
+                    "该 provider 当前存在运行中调用；已接入取消和超时意图保护域",
                 ));
             }
         }
@@ -4767,7 +4745,7 @@ impl ElmCore {
                 .as_str(),
             );
         }
-        out.push_str("TODO(elm): 文件投影/远程分发、trap 级硬恢复、provider snapshot 流式协议、子系统 provider 和 Rust 开发框架仍是后续主线。\n");
+        out.push_str("TODO(elm): Remote/soyo 分发、trap trampoline、子系统 provider 和 Rust 开发框架仍是后续主线。\n");
         out.into_bytes()
     }
 
@@ -6135,9 +6113,13 @@ impl ElmCore {
         let reply = match backend {
             ProviderBackend::Kernel(kind) => self.invoke_kernel_provider(kind, &edge, job.frame),
             ProviderBackend::KernelOps(spec) => Ok((spec.invoke)(job.frame)),
-            ProviderBackend::ElmNative(native) => {
-                Ok(self.invoke_native_provider(native, &edge, job.lease, job.frame))
-            }
+            ProviderBackend::ElmNative(native) => Ok(self.invoke_native_provider(
+                native,
+                &edge,
+                job.lease,
+                job.frame,
+                job.deadline_ns,
+            )),
             ProviderBackend::ElmNativeTodo => Err(ELM_MGR_STATUS_TODO),
         };
 

@@ -12,6 +12,7 @@ mod mgr_channel;
 mod native;
 mod ports;
 mod snapshot;
+mod source;
 mod subsystems;
 pub(crate) mod syscall;
 #[cfg(feature = "kernel-tests")]

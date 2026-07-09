@@ -40,12 +40,13 @@ use elm_model::{
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest, ElmName, ElmNativeCapabilityHeader, ElmNativeEntryFrameV1,
     ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusUnbindRequest, ElmPortAccessPolicy,
-    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncState,
-    ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
-    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
-    ElmProviderQueueStatsHeader, ElmProviderSnapshotHeader, ElmProviderSnapshotRequest,
-    ElmReplaceCellRequestV1, ElmReplyFrame, ElmResult, ElmState, ElmTodoRegistryHeader,
-    ElmTodoRegistryRecord, ElmVersion, FlowDirection, FlowMode, Generation, state_code,
+    ElmProjectionSourceRequest, ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest,
+    ElmProviderAsyncState, ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest,
+    ElmProviderInvokeResponse, ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse,
+    ElmProviderPortStatsHeader, ElmProviderQueueStatsHeader, ElmProviderSnapshotHeader,
+    ElmProviderSnapshotRequest, ElmReplaceCellRequestV1, ElmReplyFrame, ElmResult, ElmState,
+    ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmVersion, FlowDirection, FlowMode, Generation,
+    state_code,
 };
 
 use super::core::{ELM_MGR_ID, ElmCore, ElmLifecycleExecutor};
@@ -198,6 +199,16 @@ unsafe extern "C" fn test_native_entry_mutates_frame(frame: *mut ElmNativeEntryF
     0
 }
 
+unsafe extern "C" fn test_native_entry_requests_abort(frame: *mut ElmNativeEntryFrameV1) -> i32 {
+    if frame.is_null() {
+        return -1;
+    }
+    // 安全性：调用方按照 ELM native entry v1 约定传入可读帧指针。
+    let cell = unsafe { (*frame).cell_id };
+    let _ = general::elm_guard::request_panic_recovery(cell);
+    0
+}
+
 fn test_revoke_provider_invoke(frame: ElmCallFrame) -> ElmReplyFrame {
     ElmReplyFrame::empty(frame.binding_id, frame.call_id, ELM_CALL_STATUS_OK)
 }
@@ -233,6 +244,13 @@ fn test_snapshot_provider_snapshot(out: &mut [u8]) -> Result<usize, i32> {
     let payload = b"snapshot-ok";
     out[..payload.len()].copy_from_slice(payload);
     Ok(payload.len())
+}
+
+fn test_projection_source_provider(
+    payload: &[u8],
+    _arch: ElmEbiArch,
+) -> Result<elm_model::ElmEbiImage, ElmEbiLoadStatus> {
+    elm_model::parse_eki_image(payload).map_err(|_| ElmEbiLoadStatus::InvalidUnit)
 }
 
 static TEST_SNAPSHOT_PROVIDERS: [ElmKernelProviderSpec; 1] = [ElmKernelProviderSpec::new(
@@ -580,6 +598,18 @@ fn ebi_source_payload(kind: ElmEbiSourceKind, payload: &[u8]) -> Vec<u8> {
     push_u16(&mut out, request.abi_version);
     push_u16(&mut out, request.source_kind);
     push_u32(&mut out, request.flags);
+    push_u32(&mut out, request.payload_len);
+    push_u32(&mut out, request.reserved);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn projection_source_payload(provider_id: u64, payload: &[u8]) -> Vec<u8> {
+    let request = ElmProjectionSourceRequest::new(provider_id, payload.len() as u32);
+    let mut out = Vec::new();
+    push_u16(&mut out, request.abi_version);
+    push_u16(&mut out, request.flags);
+    push_u64(&mut out, request.provider_id);
     push_u32(&mut out, request.payload_len);
     push_u32(&mut out, request.reserved);
     out.extend_from_slice(payload);
@@ -982,8 +1012,11 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
         "runtime.elm_mgr_eki_boot",
         "runtime.resource_quota",
         "source.non_eki",
+        "source.projection_remote",
         "native.fault_isolation",
+        "native.trap_recovery",
         "runtime.hot_replace_rebind",
+        "provider.snapshot_streaming",
     ] {
         assert!(
             !bytes
@@ -993,18 +1026,13 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
     }
     assert!(
         bytes
-            .windows("source.projection_remote".len())
-            .any(|window| window == b"source.projection_remote")
+            .windows("source.remote_soyo".len())
+            .any(|window| window == b"source.remote_soyo")
     );
     assert!(
         bytes
-            .windows("native.trap_recovery".len())
-            .any(|window| window == b"native.trap_recovery")
-    );
-    assert!(
-        bytes
-            .windows("provider.snapshot_streaming".len())
-            .any(|window| window == b"provider.snapshot_streaming")
+            .windows("native.trap_trampoline".len())
+            .any(|window| window == b"native.trap_trampoline")
     );
     assert!(
         !bytes
@@ -1239,6 +1267,38 @@ fn elm_mgr_loads_menu_eki_source() {
 }
 
 #[ktest]
+fn elm_mgr_loads_projection_source_from_registered_provider() {
+    const TEST_PROJECTION_PROVIDER: u64 = 0x454c_4d50_524f_4a31;
+
+    let _ = super::source::register_projection_source(
+        TEST_PROJECTION_PROVIDER,
+        test_projection_source_provider,
+    );
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("projection-menu-cell", "0.1.0", ElmKind::Extension),
+        ),
+        (
+            ElmEkiBlockKind::Menu,
+            eki_menu_block("投影菜单", "来自 Projection Source", "projection/menu"),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+    ]);
+    let projection = projection_source_payload(TEST_PROJECTION_PROVIDER, &image);
+    let payload = ebi_source_payload(ElmEbiSourceKind::Projection, &projection);
+
+    let response =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_OK);
+    let load = response_payload(&response);
+    assert_eq!(read_i32(load, 8), ElmEbiLoadStatus::NativeCodeTodo as i32);
+    assert_eq!(core.menu_items().len(), 1);
+}
+
+#[ktest]
 fn elm_mgr_loads_native_eki_source_as_native_todo() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
@@ -1384,6 +1444,19 @@ fn elm_native_entry_rejects_frame_mutation() {
 
     assert!(result.is_err());
     assert_eq!(TEST_NATIVE_ENTRY_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[ktest]
+fn elm_native_entry_rejects_guard_abort() {
+    let result = super::native::test_call_native_entry(
+        test_native_entry_requests_abort as usize,
+        ElmId(7),
+        Some(ELM_MGR_ID),
+        Generation(3),
+        ElmState::Active,
+    );
+
+    assert!(result.is_err());
 }
 
 #[ktest]

@@ -23,6 +23,10 @@ use elm_model::{
     ElmNativeMigrationContextV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
     ElmReplyFrame, ElmResult, Generation, LeaseId, PortId, relocation_width, state_code,
 };
+use general::elm_guard::{
+    ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_MIGRATION,
+    ELM_GUARD_PHASE_PROVIDER_CALL, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT, ElmGuard,
+};
 
 use super::core::ElmLifecycleExecutor;
 
@@ -717,11 +721,17 @@ fn call_native_hook(address: usize, context: &ElmContext) -> ElmResult<()> {
     if address == 0 {
         return Err(ElmError::InvalidTransition);
     }
+    let Some(guard) = ElmGuard::enter(context.cell_id().0, ELM_GUARD_PHASE_HOOK, 0) else {
+        return Err(ElmError::InvalidTransition);
+    };
     let mut native_context = ElmNativeHookContextV1::from_context(context);
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内。
     // 调用约定固定为 ELM native hook v1：`fn(*mut ElmNativeHookContextV1) -> i32`。
     let hook: NativeHook = unsafe { core::mem::transmute(address) };
     let status = unsafe { hook(&mut native_context as *mut ElmNativeHookContextV1) };
+    if guard.aborted() {
+        return Err(ElmError::InvalidTransition);
+    }
     if status == 0 {
         Ok(())
     } else {
@@ -819,6 +829,9 @@ fn call_native_migration_hook(
     if address == 0 || len > buffer.len() {
         return Err(ElmError::InvalidTransition);
     }
+    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_MIGRATION, 0) else {
+        return Err(ElmError::InvalidTransition);
+    };
     let mut context = ElmNativeMigrationContextV1::new(
         phase,
         cell,
@@ -833,6 +846,9 @@ fn call_native_migration_hook(
     // 迁移缓冲区由内核托管，容量和初始长度已在调用前完成边界检查。
     let hook: NativeMigrationHook = unsafe { core::mem::transmute(address) };
     let status = unsafe { hook(&mut context as *mut ElmNativeMigrationContextV1) };
+    if guard.aborted() {
+        return Err(ElmError::InvalidTransition);
+    }
     if status == 0
         && context.abi_version == ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION
         && context.phase == expected_phase
@@ -865,6 +881,9 @@ fn call_optional_native_entry(
     if address == 0 {
         return Err(ElmError::InvalidTransition);
     }
+    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_ENTRY, 0) else {
+        return Err(ElmError::InvalidTransition);
+    };
     let mut frame = ElmNativeEntryFrameV1::new(
         cell.0,
         parent.map(|id| id.0).unwrap_or(0),
@@ -875,6 +894,9 @@ fn call_optional_native_entry(
     // 调用约定固定为 ELM native entry v1。
     let entry: NativeEntry = unsafe { core::mem::transmute(address) };
     let status = unsafe { entry(&mut frame as *mut ElmNativeEntryFrameV1) };
+    if guard.aborted() {
+        return Err(ElmError::InvalidTransition);
+    }
     if status == 0
         && frame.abi_version == ELM_NATIVE_ENTRY_ABI_VERSION
         && frame.flags == 0
@@ -909,6 +931,7 @@ pub(crate) fn invoke_provider_handler(
     port: PortId,
     lease: LeaseId,
     frame: ElmCallFrame,
+    deadline_ns: u64,
 ) -> ElmReplyFrame {
     if address == 0 {
         return ElmReplyFrame::empty(
@@ -917,12 +940,20 @@ pub(crate) fn invoke_provider_handler(
             ELM_CALL_STATUS_PROVIDER_FAULT,
         );
     }
+    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_PROVIDER_CALL, deadline_ns) else {
+        return ElmReplyFrame::empty(
+            frame.binding_id,
+            frame.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    };
     let mut call = ElmNativeProviderCallV1::new(cell.0, port.0, lease.0, frame);
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内。
     // 调用约定固定为 ELM native provider call v1。
     let handler: NativeProviderHandler = unsafe { core::mem::transmute(address) };
     let status = unsafe { handler(&mut call as *mut ElmNativeProviderCallV1) };
-    if status != 0
+    if guard.aborted()
+        || status != 0
         || call.abi_version != ELM_NATIVE_PROVIDER_CALL_ABI_VERSION
         || call.flags != 0
         || call.reserved0 != 0
@@ -955,6 +986,9 @@ pub(crate) fn invoke_provider_snapshot(
     if address == 0 {
         return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
     }
+    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT, 0) else {
+        return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
+    };
     let capacity = payload.len().min(u32::MAX as usize) as u32;
     let payload_addr = payload.as_mut_ptr() as u64;
     let mut frame = ElmNativeProviderSnapshotV1::new(
@@ -980,7 +1014,8 @@ pub(crate) fn invoke_provider_snapshot(
         0
     };
     let response_more = frame.flags & ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE != 0;
-    if call_status != 0
+    if guard.aborted()
+        || call_status != 0
         || frame.abi_version != ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION
         || frame.flags & !allowed_flags != 0
         || frame.reserved0 != 0

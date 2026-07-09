@@ -3,18 +3,19 @@
 use alloc::vec::Vec;
 
 use elm_model::{
-    ELM_EBI_SOURCE_ABI_VERSION, ELM_MGR_MAX_INPUT, ELM_MGR_STATUS_OK,
-    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_REPLACE_CELL_ABI_VERSION, ElmEbiArch,
-    ElmEbiSourceKind, ElmEbiSourceRequest, ElmId, ElmLifecycleAction, ElmLifecyclePlanRequest,
+    ELM_EBI_PROJECTION_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_ABI_VERSION, ELM_MGR_MAX_INPUT,
+    ELM_MGR_STATUS_OK, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_REPLACE_CELL_ABI_VERSION,
+    ElmEbiArch, ElmEbiSourceKind, ElmEbiSourceRequest, ElmId, ElmLifecyclePlanRequest,
     ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest,
     ElmMgrEventUnsubscribeRequest, ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest,
-    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmProviderAsyncCancelRequest,
-    ElmProviderAsyncPollRequest, ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest,
-    ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest, ElmProviderSnapshotRequest,
-    ElmReplaceCellRequestV1, ElmRuntimeEventRequest, ElmRuntimeLogRequest,
+    ElmNexusBindRequest, ElmNexusUnbindRequest, ElmProjectionSourceRequest,
+    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncSubmitRequest,
+    ElmProviderInvokeRequest, ElmProviderPortRegisterRequest, ElmProviderPortUnregisterRequest,
+    ElmProviderSnapshotRequest, ElmReplaceCellRequestV1, ElmRuntimeEventRequest,
+    ElmRuntimeLogRequest,
 };
 
-use super::{core::ElmCore, executor, menu, with_core};
+use super::{core::ElmCore, executor, menu, source, with_core};
 
 pub(crate) fn dispatch_mgr_call(input: &[u8]) -> Vec<u8> {
     with_core(|core| dispatch_mgr_call_on_core(core, input))
@@ -55,18 +56,19 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                     }
                     Err(_) => response_only(ElmMgrResponseHeader::invalid()),
                 },
+                ElmEbiSourceKind::Projection => {
+                    match load_projection_image(source_payload, current_ebi_arch()) {
+                        Ok(image) => {
+                            let response = core.load_ebi_image(image, current_ebi_arch());
+                            response_with_plain_payload(&response)
+                        }
+                        Err(_) => response_only(ElmMgrResponseHeader::invalid()),
+                    }
+                }
                 ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
                     response_only(ElmMgrResponseHeader::unsupported())
                 }
-                ElmEbiSourceKind::Projection | ElmEbiSourceKind::Remote => {
-                    core.record_mgr_audit(
-                        0,
-                        ElmId(0),
-                        ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
-                        0,
-                    );
-                    response_only(ElmMgrResponseHeader::todo())
-                }
+                ElmEbiSourceKind::Remote => response_only(ElmMgrResponseHeader::unsupported()),
             }
         }
         ElmMgrCallKind::PauseCell => {
@@ -112,18 +114,24 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                     }
                     Err(_) => response_only(ElmMgrResponseHeader::invalid()),
                 },
+                ElmEbiSourceKind::Projection => {
+                    match load_projection_image(source_payload, current_ebi_arch()) {
+                        Ok(image) => {
+                            let response = core.replace_cell_from_ebi_image(
+                                ElmId(request.target_cell_id),
+                                image,
+                                current_ebi_arch(),
+                                request.migration_limit,
+                            );
+                            response_with_plain_payload(&response)
+                        }
+                        Err(_) => response_only(ElmMgrResponseHeader::invalid()),
+                    }
+                }
                 ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
                     response_only(ElmMgrResponseHeader::unsupported())
                 }
-                ElmEbiSourceKind::Projection | ElmEbiSourceKind::Remote => {
-                    core.record_mgr_audit(
-                        ElmLifecycleAction::Replace as u32,
-                        ElmId(request.target_cell_id),
-                        ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
-                        0,
-                    );
-                    response_only(ElmMgrResponseHeader::todo())
-                }
+                ElmEbiSourceKind::Remote => response_only(ElmMgrResponseHeader::unsupported()),
             }
         }
         ElmMgrCallKind::QueryTopology => {
@@ -431,6 +439,42 @@ fn read_ebi_source_request(payload: &[u8]) -> Option<(ElmEbiSourceRequest, &[u8]
     };
     if request.abi_version != ELM_EBI_SOURCE_ABI_VERSION
         || request.flags != 0
+        || request.reserved != 0
+    {
+        return None;
+    }
+    let end = request_size.checked_add(request.payload_len as usize)?;
+    if payload.len() != end {
+        return None;
+    }
+    Some((request, &payload[request_size..end]))
+}
+
+fn load_projection_image(
+    payload: &[u8],
+    arch: ElmEbiArch,
+) -> Result<elm_model::ElmEbiImage, elm_model::ElmEbiLoadStatus> {
+    let Some((request, provider_payload)) = read_projection_source_request(payload) else {
+        return Err(elm_model::ElmEbiLoadStatus::InvalidUnit);
+    };
+    source::project_ebi_image(request.provider_id, provider_payload, arch)
+}
+
+fn read_projection_source_request(payload: &[u8]) -> Option<(ElmProjectionSourceRequest, &[u8])> {
+    let request_size = core::mem::size_of::<ElmProjectionSourceRequest>();
+    if payload.len() < request_size {
+        return None;
+    }
+    let request = ElmProjectionSourceRequest {
+        abi_version: u16::from_le_bytes(payload[0..2].try_into().ok()?),
+        flags: u16::from_le_bytes(payload[2..4].try_into().ok()?),
+        provider_id: u64::from_le_bytes(payload[4..12].try_into().ok()?),
+        payload_len: u32::from_le_bytes(payload[12..16].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[16..20].try_into().ok()?),
+    };
+    if request.abi_version != ELM_EBI_PROJECTION_SOURCE_ABI_VERSION
+        || request.flags != 0
+        || request.provider_id == 0
         || request.reserved != 0
     {
         return None;
