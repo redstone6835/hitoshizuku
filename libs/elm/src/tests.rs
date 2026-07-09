@@ -22,23 +22,24 @@ use crate::{
     ELM_MGR_MAX_PAYLOAD, ELM_MGR_POLICY_API_REGISTRY, ELM_MGR_POLICY_AUDIT,
     ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING,
     ELM_MGR_POLICY_NATIVE_CAPABILITIES, ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT,
-    ELM_MGR_POLICY_PROVIDER_ASYNC, ELM_MGR_POLICY_PROVIDER_PORTS, ELM_MGR_POLICY_TODO_REGISTRY,
-    ELM_MGR_RELATION_POINT_LEN, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_TODO, ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD,
-    ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT,
-    ELM_NATIVE_CAPABILITY_NAME_LEN, ELM_NATIVE_ENTRY_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_NEXUS_CONTRACT_LEN,
-    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_MGR_POLICY_PROVIDER_ASYNC, ELM_MGR_POLICY_PROVIDER_PORTS, ELM_MGR_POLICY_RESOURCE_BUDGET,
+    ELM_MGR_POLICY_TODO_REGISTRY, ELM_MGR_RELATION_POINT_LEN, ELM_MGR_STATUS_BUSY,
+    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
+    ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD, ELM_NATIVE_CAPABILITY_KIND_EXPORT,
+    ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_CAPABILITY_NAME_LEN,
+    ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_PROVIDER_CALL_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK,
+    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
-    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS,
-    ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
-    ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_PORT_FLAG_NONE,
+    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+    ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS, ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS,
+    ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS, ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC,
+    ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_NATIVE_BACKEND,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_PORT_FLAG_NONE,
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
     ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK,
     ELM_REPLACE_CELL_ABI_VERSION, ELM_REPLACE_MIGRATION_STATE_MAX, ELM_RUNTIME_LOG_MESSAGE_LEN,
@@ -70,7 +71,8 @@ use crate::{
     ElmProviderPortStatsHeader, ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest,
     ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord, ElmProviderSnapshotHeader,
     ElmProviderSnapshotRequest, ElmReplaceCellRequestV1, ElmReplaceCellResponseV1, ElmReplyFrame,
-    ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
+    ElmResourceBudget, ElmResourceKind, ElmResourceUsage, ElmRuntimeEventRequest,
+    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
     ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState,
     ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmVersion, FlowContract, FlowDirection,
     FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, PortId,
@@ -1312,6 +1314,7 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_NATIVE_CAPABILITIES, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_TODO_REGISTRY, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_RESOURCE_BUDGET, 0);
     assert_eq!(policy.policy_flags & ELM_MGR_POLICY_REPLACE_TODO, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_BIND, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_UNBIND, 0);
@@ -1325,6 +1328,7 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     );
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_TODO_QUERY, 0);
     assert_eq!(policy.blocker_mask & ELM_POLICY_BLOCK_REPLACE_TODO, 0);
+    assert_ne!(policy.blocker_mask & ELM_POLICY_BLOCK_RESOURCE_QUOTA, 0);
 
     let replace = ElmReplaceCellRequestV1::new(7, ElmEbiSourceKind::Eki as u16, 128);
     assert_eq!(replace.abi_version, ELM_REPLACE_CELL_ABI_VERSION);
@@ -1348,6 +1352,30 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     assert_eq!(replace_response.generation, 2);
     assert_eq!(replace_response.migrated_len, 16);
     assert_eq!(core::mem::size_of::<ElmReplaceCellResponseV1>(), 40);
+}
+
+#[test]
+fn resource_budget_model_is_stable() {
+    assert!(
+        ElmResourceBudget::ROOT.max_provider_ports > ElmResourceBudget::DEFAULT.max_provider_ports
+    );
+    assert!(ElmResourceBudget::DEFAULT.max_native_faults != 0);
+
+    let usage = ElmResourceUsage {
+        provider_ports: 1,
+        provider_queue: 2,
+        event_subscriptions: 3,
+        pending_loads: 4,
+        native_images: 5,
+        native_faults: 6,
+        audit_records: 7,
+    };
+    assert_eq!(usage.provider_queue, 2);
+    assert_eq!(ElmResourceKind::NativeFault, ElmResourceKind::NativeFault);
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_RESOURCE_QUOTA),
+        ELM_MGR_STATUS_BUSY
+    );
 }
 
 #[test]
@@ -1700,6 +1728,7 @@ fn provider_port_abi_records_are_fixed_layout() {
     assert_eq!(ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, 1 << 20);
     assert_eq!(ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, 1 << 21);
     assert_eq!(ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED, 1 << 22);
+    assert_eq!(ELM_POLICY_BLOCK_RESOURCE_QUOTA, 1 << 24);
     let policy = ElmMgrPolicyInfo::new(128);
     assert_ne!(
         policy.blocker_mask & ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,

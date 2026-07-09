@@ -65,6 +65,7 @@ pub const ELM_MGR_POLICY_API_REGISTRY: u64 = 1 << 10;
 pub const ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS: u64 = 1 << 11;
 pub const ELM_MGR_POLICY_NATIVE_CAPABILITIES: u64 = 1 << 12;
 pub const ELM_MGR_POLICY_TODO_REGISTRY: u64 = 1 << 13;
+pub const ELM_MGR_POLICY_RESOURCE_BUDGET: u64 = 1 << 14;
 
 pub const ELM_POLICY_BLOCK_BUILTIN_PROTECTED: u64 = 1 << 0;
 pub const ELM_POLICY_BLOCK_CELL_NOT_FOUND: u64 = 1 << 1;
@@ -90,6 +91,7 @@ pub const ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL: u64 = 1 << 20;
 pub const ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED: u64 = 1 << 21;
 pub const ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED: u64 = 1 << 22;
 pub const ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED: u64 = 1 << 23;
+pub const ELM_POLICY_BLOCK_RESOURCE_QUOTA: u64 = 1 << 24;
 
 pub const ELM_MGR_RELATION_CONTRACT_LEN: usize = 64;
 pub const ELM_MGR_RELATION_POINT_LEN: usize = 32;
@@ -554,7 +556,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_MGR_POLICY_API_REGISTRY
                 | ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS
                 | ELM_MGR_POLICY_NATIVE_CAPABILITIES
-                | ELM_MGR_POLICY_TODO_REGISTRY,
+                | ELM_MGR_POLICY_TODO_REGISTRY
+                | ELM_MGR_POLICY_RESOURCE_BUDGET,
             blocker_mask: ELM_POLICY_BLOCK_BUILTIN_PROTECTED
                 | ELM_POLICY_BLOCK_CELL_NOT_FOUND
                 | ELM_POLICY_BLOCK_INVALID_STATE
@@ -577,7 +580,8 @@ impl ElmMgrPolicyInfo {
                 | ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL
                 | ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED
                 | ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED
-                | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED
+                | ELM_POLICY_BLOCK_RESOURCE_QUOTA,
             audit_capacity,
             reserved1: 0,
         }
@@ -1860,7 +1864,8 @@ pub const fn status_from_blockers(blockers: u64) -> i32 {
             | ELM_POLICY_BLOCK_LEASE_BUSY
             | ELM_POLICY_BLOCK_DUPLICATE_BINDING
             | ELM_POLICY_BLOCK_PROVIDER_BUSY
-            | ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL)
+            | ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL
+            | ELM_POLICY_BLOCK_RESOURCE_QUOTA)
         != 0
     {
         ELM_MGR_STATUS_BUSY

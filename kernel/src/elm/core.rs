@@ -37,17 +37,18 @@ use elm_model::{
     ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
     ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
-    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS,
-    ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS, ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS,
-    ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
-    ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
-    ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
-    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK, ELM_REPLACE_MIGRATION_STATE_MAX,
-    ELM_RUNTIME_LOG_MESSAGE_LEN, ELM_TODO_FLAG_ACTIVE, ELM_TODO_FLAG_STATIC,
-    ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER, ELM_TODO_KIND_RUNTIME,
-    ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest, ElmCallFrame, ElmContext,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiImage,
-    ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiUnit, ElmError, ElmEventRecord,
+    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+    ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS, ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS,
+    ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS, ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC,
+    ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_NATIVE_BACKEND,
+    ELM_PROVIDER_FLAG_TODO_BACKEND, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
+    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAGS_MASK,
+    ELM_REPLACE_MIGRATION_STATE_MAX, ELM_RUNTIME_LOG_MESSAGE_LEN, ELM_TODO_FLAG_ACTIVE,
+    ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER,
+    ELM_TODO_KIND_RUNTIME, ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest,
+    ElmCallFrame, ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
+    ElmEbiProviderPortDecl, ElmEbiSourceKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord,
     ElmEventSequence, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase,
     ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse,
     ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader,
@@ -64,13 +65,13 @@ use elm_model::{
     ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
     ElmProviderPortStatsRecord, ElmProviderPortUnregisterRequest, ElmProviderQueueStatsHeader,
     ElmProviderQueueStatsRecord, ElmProviderSnapshotHeader, ElmProviderSnapshotRequest,
-    ElmReplaceCellResponseV1, ElmReplyFrame, ElmResult, ElmRuntimeEventRequest,
-    ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
-    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState, ElmTodoRegistryHeader,
-    ElmTodoRegistryRecord, ElmVersion, FlowContract, FlowDirection, FlowMode, Generation, LeaseId,
-    LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, first_lifecycle_reason, planned_final_state, state_code,
-    status_from_blockers,
+    ElmReplaceCellResponseV1, ElmReplyFrame, ElmResourceBudget, ElmResourceKind, ElmResourceUsage,
+    ElmResult, ElmRuntimeEventRequest, ElmRuntimeEventResponse, ElmRuntimeLogRequest,
+    ElmRuntimeLogResponse, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmState,
+    ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmVersion, FlowContract, FlowDirection,
+    FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId,
+    ResourceLease, TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason,
+    planned_final_state, state_code, status_from_blockers,
 };
 use elm_model::{
     ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_SYSCALL, ELM_MGR_API_FLAG_SYSFS,
@@ -158,6 +159,7 @@ pub(crate) struct CellRuntime {
     pub kind: ElmKind,
     pub generation: Generation,
     pub name: String,
+    pub ebi_source: ElmEbiSourceKind,
     pub ebi_arch: ElmEbiArch,
     pub ebi_status: ElmEbiLoadStatus,
     pub has_native_code: bool,
@@ -168,6 +170,10 @@ pub(crate) struct CellRuntime {
     pub lifecycle_executor_ready: bool,
     pub lifecycle_initialized: bool,
     pub lifecycle_finalized: bool,
+    pub resource_budget: ElmResourceBudget,
+    pub native_faults: u16,
+    pub isolated: bool,
+    pub isolation_blocker: u64,
     pub owned_bindings: Vec<BindingId>,
     pub owned_menu_items: Vec<u64>,
 }
@@ -313,6 +319,7 @@ struct ProviderRunningCall {
 #[derive(Debug, Clone)]
 struct ProviderAsyncResult {
     ticket: u64,
+    consumer: ElmId,
     port: PortId,
     lease: LeaseId,
     state: ElmProviderAsyncState,
@@ -574,29 +581,44 @@ impl ElmCore {
             FlowContract::new("mgr.menu.item@1")?,
             FlowMode::Ordered,
         ));
-        self.graph.insert_cell(ELM_MGR_ID, manifest)?;
-        self.graph.add_extension_point(
-            ELM_MGR_ID,
-            "menu.item",
-            FlowContract::new("mgr.menu.item@1")?,
-        )?;
+        let unit = ElmEbiUnit::new(manifest, ElmEbiTarget::new(ElmEbiArch::Any))
+            .with_extension_point(
+                ElmEbiExtensionPointDecl::new("menu.item", "mgr.menu.item@1")
+                    .map_err(|_| ElmError::InvalidTransition)?,
+            )
+            .with_lifecycle_hooks(ElmEbiLifecycleHooks::rust_context_result_v1());
+        unit.validate(ElmEbiArch::Any)
+            .map_err(|_| ElmError::InvalidTransition)?;
+        self.graph.insert_cell(ELM_MGR_ID, unit.manifest.clone())?;
+        for point in &unit.extension_points {
+            self.graph.add_extension_point(
+                ELM_MGR_ID,
+                point.point.clone(),
+                point.contract.clone(),
+            )?;
+        }
         self.cells.push(CellRuntime {
             id: ELM_MGR_ID,
             parent: None,
             state: ElmState::Active,
-            kind: ElmKind::Manager,
+            kind: unit.manifest.kind,
             generation: Generation::FIRST,
-            name: "elm-mgr".to_string(),
-            ebi_arch: ElmEbiArch::Any,
+            name: unit.manifest.name.as_str().to_string(),
+            ebi_source: ElmEbiSourceKind::Builtin,
+            ebi_arch: unit.target.arch,
             ebi_status: ElmEbiLoadStatus::Ok,
             has_native_code: false,
-            native_segment_count: 0,
-            native_import_count: 0,
-            native_export_count: 0,
-            lifecycle_hooks_declared: true,
+            native_segment_count: unit.segments.len() as u16,
+            native_import_count: unit.imports.len() as u16,
+            native_export_count: unit.exports.len() as u16,
+            lifecycle_hooks_declared: unit.lifecycle_hooks.is_some(),
             lifecycle_executor_ready: true,
             lifecycle_initialized: true,
             lifecycle_finalized: false,
+            resource_budget: ElmResourceBudget::ROOT,
+            native_faults: 0,
+            isolated: false,
+            isolation_blocker: 0,
             owned_bindings: Vec::new(),
             owned_menu_items: Vec::new(),
         });
@@ -800,6 +822,16 @@ impl ElmCore {
         };
         let owner_generation = cell.generation;
         let owner_state = cell.state;
+        if self.cell_resource_over_quota(owner, ElmResourceKind::EventSubscription) {
+            return ElmMgrEventSubscribeResponse::new(
+                0,
+                0,
+                request.owner_cell_id,
+                self.last_event_sequence(),
+                ELM_MGR_STATUS_BUSY,
+                ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+            );
+        }
         if self.mgr_runtime.event_subscriptions.len() >= EVENT_SUBSCRIPTION_LIMIT {
             return ElmMgrEventSubscribeResponse::new(
                 0,
@@ -1430,6 +1462,23 @@ impl ElmCore {
             }
         };
 
+        let provider_port = self.providers[provider_index].port;
+        if self.cell_resource_over_quota(edge.consumer, ElmResourceKind::ProviderQueue) {
+            let blockers = ELM_POLICY_BLOCK_RESOURCE_QUOTA;
+            self.providers[provider_index].async_rejected = self.providers[provider_index]
+                .async_rejected
+                .saturating_add(1);
+            self.record_provider_async_audit(frame.binding_id, ELM_MGR_STATUS_BUSY, blockers);
+            return ElmProviderAsyncSubmitResponse::new(
+                0,
+                frame.binding_id,
+                frame.call_id,
+                ELM_MGR_STATUS_BUSY,
+                ElmProviderAsyncState::Failed,
+                self.provider_queued_count(provider_port) as u32,
+                blockers,
+            );
+        }
         let provider = &self.providers[provider_index];
         let pending = self
             .provider_queued_count(provider.port)
@@ -1832,6 +1881,10 @@ impl ElmCore {
             ElmState::Loaded | ElmState::Linked | ElmState::Ready | ElmState::Active
         ) {
             blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+        } else if self.cell_is_isolated(owner) {
+            blockers |= ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED;
+        } else if self.cell_resource_over_quota(owner, ElmResourceKind::ProviderPort) {
+            blockers |= ELM_POLICY_BLOCK_RESOURCE_QUOTA;
         }
         if request.flags != 0 {
             blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
@@ -2000,6 +2053,11 @@ impl ElmCore {
                 Err(ELM_MGR_STATUS_TODO)
             }
         }?;
+        if let ProviderBackend::ElmNative(native) = backend
+            && reply.status == ELM_CALL_STATUS_PROVIDER_FAULT
+        {
+            self.mark_native_fault(native.owner, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED);
+        }
         if reply.status == ELM_CALL_STATUS_OK {
             self.providers[provider_index].calls =
                 self.providers[provider_index].calls.saturating_add(1);
@@ -2297,6 +2355,9 @@ impl ElmCore {
                     ElmState::Loaded | ElmState::Linked | ElmState::Ready | ElmState::Active
                 ) {
                     blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
+                }
+                if cell.isolated {
+                    blockers |= ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED;
                 }
                 cell.generation
             }
@@ -2826,7 +2887,14 @@ impl ElmCore {
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
         }
 
-        if let Err(err) = self.insert_loaded_cell(id, manifest, name, image_arch, &image.unit) {
+        if let Err(err) = self.insert_loaded_cell(
+            id,
+            manifest,
+            name,
+            image_arch,
+            &image.unit,
+            ElmEbiSourceKind::Eki,
+        ) {
             log::error!("[elm] EBI image cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
         }
@@ -2834,6 +2902,15 @@ impl ElmCore {
         let loaded = match LoadedElmImage::load(id, &image, &imports) {
             Ok(loaded) => loaded,
             Err(ElmEbiLoadStatus::NativeCodeTodo) => {
+                if self.cell_resource_over_quota(id, ElmResourceKind::PendingLoad) {
+                    self.quarantine_cell_after_hook_failure(id);
+                    return ElmLoadCellResponse::new(
+                        ElmEbiLoadStatus::RuntimeRejected,
+                        id.0,
+                        state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                        ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                    );
+                }
                 self.pending_ebi_loads.push(PendingEbiLoad {
                     cell: id,
                     unit: image.unit.clone(),
@@ -2935,6 +3012,19 @@ impl ElmCore {
                 id.0,
                 state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
                 ELM_LIFECYCLE_REASON_HOOK_FAILED,
+            );
+        }
+        if self.cell_resource_over_quota(id, ElmResourceKind::NativeImage) {
+            if let Ok(mut context) = self.lifecycle_context(id, ElmLifecyclePhase::Finalize) {
+                let mut executor = loaded.lifecycle_executor();
+                let _ = executor.on_finalize(&mut context);
+            }
+            self.rollback_activated_cell_to_quarantine(id);
+            return ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::RuntimeRejected,
+                id.0,
+                state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                ELM_LIFECYCLE_REASON_LEASE_BUSY,
             );
         }
         self.native_exports.extend(exports);
@@ -3339,13 +3429,29 @@ impl ElmCore {
         let image_arch = unit.target.arch;
         let id = self.alloc_cell_id();
 
-        if let Err(err) = self.insert_loaded_cell(id, manifest, name, image_arch, &unit) {
+        if let Err(err) = self.insert_loaded_cell(
+            id,
+            manifest,
+            name,
+            image_arch,
+            &unit,
+            ElmEbiSourceKind::Memory,
+        ) {
             log::error!("[elm] EBI cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
         }
 
         if unit.has_native_code() {
             let requires_native_image_loader = unit_requires_native_image_loader(&unit);
+            if self.cell_resource_over_quota(id, ElmResourceKind::PendingLoad) {
+                self.quarantine_cell_after_hook_failure(id);
+                return ElmLoadCellResponse::new(
+                    ElmEbiLoadStatus::RuntimeRejected,
+                    id.0,
+                    state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                    ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                );
+            }
             self.pending_ebi_loads.push(PendingEbiLoad {
                 cell: id,
                 unit: unit.clone(),
@@ -3835,36 +3941,28 @@ impl ElmCore {
         let mut records = Vec::new();
         let static_flags = ELM_TODO_FLAG_STATIC | ELM_TODO_FLAG_ACTIVE;
         records.push(todo_record(
-            ELM_TODO_KIND_RUNTIME,
-            static_flags,
-            ELM_POLICY_BLOCK_NATIVE_TODO,
-            ELM_MGR_ID.0,
-            "runtime.elm_mgr_eki_boot",
-            "elm-mgr 仍由内建根单元启动，尚未改为 EKI 自举",
-        ));
-        records.push(todo_record(
-            ELM_TODO_KIND_RUNTIME,
-            static_flags,
-            ELM_POLICY_BLOCK_NATIVE_TODO,
-            0,
-            "runtime.resource_quota",
-            "单元级内存、队列、事件和执行时间配额尚未接入",
-        ));
-        records.push(todo_record(
             ELM_TODO_KIND_SOURCE,
             static_flags,
             ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
             0,
-            "source.non_eki",
-            "Projection、Builtin、Memory 和 Remote Source 仍只保留 EBI 协议入口",
+            "source.projection_remote",
+            "Projection、Remote 和 soyo EBI 产出层属于文件投影与分发主线",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_NATIVE,
             static_flags,
             ELM_POLICY_BLOCK_NATIVE_TODO,
             0,
-            "native.fault_isolation",
-            "原生 ELM 调用缺少独立故障围栏、超时看门和 panic 边界",
+            "native.trap_isolation",
+            "trap 级故障捕获、panic 恢复和运行中强抢占属于强隔离主线",
+        ));
+        records.push(todo_record(
+            ELM_TODO_KIND_RUNTIME,
+            static_flags,
+            ELM_POLICY_BLOCK_NATIVE_TODO,
+            0,
+            "runtime.hot_replace_rebind",
+            "跨单元 import 自动重绑定和无停机影子 binding 属于热替换主线",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_FRAMEWORK,
@@ -4518,13 +4616,14 @@ impl ElmCore {
         for cell in &self.cells {
             out.push_str(
                 format!(
-                    "cell id={} parent={} name={} state={:?} kind={:?} generation={} ebi_arch={:?} ebi_status={:?} native_code={} native_segments={} native_imports={} native_exports={} lifecycle_hooks={} lifecycle_executor_ready={} lifecycle_initialized={} lifecycle_finalized={} pending_loads={} owned_bindings={} owned_menu_items={}\n",
+                    "cell id={} parent={} name={} state={:?} kind={:?} generation={} source={:?} ebi_arch={:?} ebi_status={:?} native_code={} native_segments={} native_imports={} native_exports={} lifecycle_hooks={} lifecycle_executor_ready={} lifecycle_initialized={} lifecycle_finalized={} isolated={} native_faults={} isolation_blocker=0x{:x} pending_loads={} owned_bindings={} owned_menu_items={}\n",
                     cell.id.0,
                     cell.parent.map(|id| id.0).unwrap_or(0),
                     cell.name,
                     cell.state,
                     cell.kind,
                     cell.generation.0,
+                    cell.ebi_source,
                     cell.ebi_arch,
                     cell.ebi_status,
                     cell.has_native_code,
@@ -4535,6 +4634,9 @@ impl ElmCore {
                     cell.lifecycle_executor_ready,
                     cell.lifecycle_initialized,
                     cell.lifecycle_finalized,
+                    u32::from(cell.isolated),
+                    cell.native_faults,
+                    cell.isolation_blocker,
                     self.pending_ebi_loads.iter().filter(|pending| pending.cell == cell.id).count(),
                     cell.owned_bindings.len(),
                     cell.owned_menu_items.len(),
@@ -4655,7 +4757,7 @@ impl ElmCore {
                 .as_str(),
             );
         }
-        out.push_str("TODO(elm): 非 EKI Source、native 故障隔离和设备类端口仍未完整接入。\n");
+        out.push_str("TODO(elm): 文件投影/远程分发、trap 级强隔离、热替换重绑定、子系统 provider 和 Rust 开发框架仍是后续主线。\n");
         out.into_bytes()
     }
 
@@ -5291,6 +5393,7 @@ impl ElmCore {
         name: String,
         ebi_arch: ElmEbiArch,
         unit: &ElmEbiUnit,
+        source: ElmEbiSourceKind,
     ) -> Result<(), ElmError> {
         let kind = manifest.kind;
         self.graph.insert_cell(id, manifest)?;
@@ -5302,6 +5405,7 @@ impl ElmCore {
             kind,
             generation: Generation::FIRST,
             name,
+            ebi_source: source,
             ebi_arch,
             ebi_status: if unit.has_native_code() {
                 ElmEbiLoadStatus::NativeCodeTodo
@@ -5316,6 +5420,10 @@ impl ElmCore {
             lifecycle_executor_ready: false,
             lifecycle_initialized: false,
             lifecycle_finalized: false,
+            resource_budget: ElmResourceBudget::DEFAULT,
+            native_faults: 0,
+            isolated: false,
+            isolation_blocker: 0,
             owned_bindings: Vec::new(),
             owned_menu_items: Vec::new(),
         });
@@ -5619,6 +5727,9 @@ impl ElmCore {
             if !self.cell_exists(export.owner) {
                 return Err(ElmEbiLoadStatus::RuntimeRejected);
             }
+            if self.cell_is_isolated(export.owner) {
+                return Err(ElmEbiLoadStatus::RuntimeRejected);
+            }
             values.push(export.address);
             if !dependencies
                 .iter()
@@ -5736,6 +5847,11 @@ impl ElmCore {
         native_image: Option<&LoadedElmImage>,
     ) -> Result<(), ElmError> {
         if decl.flags != 0 {
+            return Err(ElmError::InvalidTransition);
+        }
+        if self.cell_is_isolated(owner)
+            || self.cell_resource_over_quota(owner, ElmResourceKind::ProviderPort)
+        {
             return Err(ElmError::InvalidTransition);
         }
         if self
@@ -6026,6 +6142,11 @@ impl ElmCore {
                 )
             }
             Ok(reply) => {
+                if let ProviderBackend::ElmNative(native) = backend
+                    && reply.status == ELM_CALL_STATUS_PROVIDER_FAULT
+                {
+                    self.mark_native_fault(native.owner, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED);
+                }
                 self.providers[provider_index].failed_calls = self.providers[provider_index]
                     .failed_calls
                     .saturating_add(1);
@@ -6099,6 +6220,12 @@ impl ElmCore {
             (state, status, reply, blockers)
         };
 
+        if matches!(state, ElmProviderAsyncState::Expired)
+            && let Some(provider_index) = self.provider_index(running.job.port)
+            && let ProviderBackend::ElmNative(native) = self.providers[provider_index].backend
+        {
+            self.mark_native_fault(native.owner, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED);
+        }
         self.finish_provider_async_job(running.job, state, status, reply, blockers, finish_ns);
         true
     }
@@ -6144,6 +6271,7 @@ impl ElmCore {
         };
         self.push_provider_result(ProviderAsyncResult {
             ticket: job.ticket,
+            consumer: job.consumer,
             port: job.port,
             lease: job.lease,
             state,
@@ -6248,10 +6376,18 @@ impl ElmCore {
         if !matches!(self.cell_state(edge.consumer), Some(ElmState::Active)) {
             return Some(ELM_POLICY_BLOCK_INVALID_STATE);
         }
+        if self.cell_is_isolated(edge.consumer) {
+            return Some(ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED);
+        }
         if let Some(owner) = provider.owner
             && !matches!(self.cell_state(owner), Some(ElmState::Active))
         {
             return Some(ELM_POLICY_BLOCK_PROVIDER_BUSY);
+        }
+        if let Some(owner) = provider.owner
+            && self.cell_is_isolated(owner)
+        {
+            return Some(ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED);
         }
         None
     }
@@ -6867,6 +7003,100 @@ impl ElmCore {
             .unwrap_or(false)
     }
 
+    fn cell_is_isolated(&self, id: ElmId) -> bool {
+        self.cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| cell.isolated)
+            .unwrap_or(false)
+    }
+
+    fn cell_resource_budget(&self, id: ElmId) -> ElmResourceBudget {
+        self.cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| cell.resource_budget)
+            .unwrap_or(ElmResourceBudget::DEFAULT)
+    }
+
+    fn cell_resource_usage(&self, id: ElmId) -> ElmResourceUsage {
+        let provider_ports = self
+            .providers
+            .iter()
+            .filter(|provider| provider.dynamic && provider.owner == Some(id))
+            .count() as u16;
+        let provider_queue = self
+            .provider_jobs
+            .iter()
+            .filter(|job| job.consumer == id)
+            .count()
+            .saturating_add(
+                self.provider_running
+                    .iter()
+                    .filter(|running| running.job.consumer == id)
+                    .count(),
+            )
+            .saturating_add(
+                self.provider_results
+                    .iter()
+                    .filter(|result| result.consumer == id)
+                    .count(),
+            ) as u16;
+        let event_subscriptions = self
+            .mgr_runtime
+            .event_subscriptions
+            .iter()
+            .filter(|subscription| subscription.owner == id)
+            .count() as u16;
+        let pending_loads = self
+            .pending_ebi_loads
+            .iter()
+            .filter(|pending| pending.cell == id)
+            .count() as u16;
+        let native_images = self
+            .native_images
+            .iter()
+            .filter(|image| image.cell() == id)
+            .count() as u16;
+        let native_faults = self
+            .cells
+            .iter()
+            .find(|cell| cell.id == id)
+            .map(|cell| cell.native_faults)
+            .unwrap_or(0);
+        let audit_records = self
+            .audits
+            .iter()
+            .filter(|audit| audit.cell_id == id.0)
+            .count() as u16;
+
+        ElmResourceUsage {
+            provider_ports,
+            provider_queue,
+            event_subscriptions,
+            pending_loads,
+            native_images,
+            native_faults,
+            audit_records,
+        }
+    }
+
+    fn cell_resource_over_quota(&self, id: ElmId, kind: ElmResourceKind) -> bool {
+        let budget = self.cell_resource_budget(id);
+        let usage = self.cell_resource_usage(id);
+        match kind {
+            ElmResourceKind::ProviderPort => usage.provider_ports >= budget.max_provider_ports,
+            ElmResourceKind::ProviderQueue => usage.provider_queue >= budget.max_provider_queue,
+            ElmResourceKind::EventSubscription => {
+                usage.event_subscriptions >= budget.max_event_subscriptions
+            }
+            ElmResourceKind::PendingLoad => usage.pending_loads >= budget.max_pending_loads,
+            ElmResourceKind::NativeImage => usage.native_images >= budget.max_native_images,
+            ElmResourceKind::NativeFault => usage.native_faults >= budget.max_native_faults,
+            ElmResourceKind::AuditRecord => usage.audit_records >= budget.max_audit_records,
+        }
+    }
+
     fn cell_needs_finalize(&self, id: ElmId) -> bool {
         self.cells
             .iter()
@@ -6947,6 +7177,7 @@ impl ElmCore {
     }
 
     fn quarantine_cell_after_hook_failure(&mut self, id: ElmId) {
+        self.mark_native_fault(id, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED);
         match self.cell_state(id) {
             Some(ElmState::Faulted) => {}
             Some(ElmState::Quarantined) => return,
@@ -6961,6 +7192,20 @@ impl ElmCore {
         if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) {
             cell.ebi_status = ElmEbiLoadStatus::RuntimeRejected;
         }
+    }
+
+    fn mark_native_fault(&mut self, id: ElmId, blocker: u64) {
+        let over_quota = self.cell_resource_over_quota(id, ElmResourceKind::NativeFault);
+        let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == id) else {
+            return;
+        };
+        cell.native_faults = cell.native_faults.saturating_add(1);
+        cell.isolated = true;
+        cell.isolation_blocker = if over_quota {
+            ELM_POLICY_BLOCK_RESOURCE_QUOTA
+        } else {
+            blocker
+        };
     }
 
     fn lifecycle_response(

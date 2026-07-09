@@ -55,7 +55,10 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                     }
                     Err(_) => response_only(ElmMgrResponseHeader::invalid()),
                 },
-                _ => {
+                ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                    response_only(ElmMgrResponseHeader::unsupported())
+                }
+                ElmEbiSourceKind::Projection | ElmEbiSourceKind::Remote => {
                     core.record_mgr_audit(
                         0,
                         ElmId(0),
@@ -109,7 +112,10 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                     }
                     Err(_) => response_only(ElmMgrResponseHeader::invalid()),
                 },
-                _ => {
+                ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                    response_only(ElmMgrResponseHeader::unsupported())
+                }
+                ElmEbiSourceKind::Projection | ElmEbiSourceKind::Remote => {
                     core.record_mgr_audit(
                         ElmLifecycleAction::Replace as u32,
                         ElmId(request.target_cell_id),

@@ -3,6 +3,7 @@ use ktest::ktest;
 use core::any::Any;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -22,9 +23,10 @@ use elm_model::{
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
     ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
     ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_LEASE_BUSY,
-    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_PORT_TODO,
-    ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
-    ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
+    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
+    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA,
     ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC, ELM_PROVIDER_FLAG_KERNEL_BACKEND,
     ELM_PROVIDER_FLAG_NATIVE_BACKEND, ELM_PROVIDER_FLAG_TODO_BACKEND,
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
@@ -907,6 +909,9 @@ fn elm_builtin_mgr_init_health_is_clean() {
     assert_eq!(core.cells().len(), 1);
     assert_eq!(core.cells()[0].id, ELM_MGR_ID);
     assert_eq!(core.cells()[0].state, ElmState::Active);
+    assert_eq!(core.cells()[0].ebi_source, ElmEbiSourceKind::Builtin);
+    assert_eq!(core.cells()[0].resource_budget.max_provider_ports, 256);
+    assert!(!core.cells()[0].isolated);
     assert_eq!(core.menu_items().len(), 1);
     assert_eq!(core.menu_items()[0].owner, ELM_MGR_ID);
     assert_eq!(core.menu_items()[0].route, "elm/mgr/health");
@@ -971,8 +976,25 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
         read_u16(&bytes, 2) as usize,
         core::mem::size_of::<ElmTodoRegistryRecord>()
     );
-    assert!(read_u32(&bytes, 4) >= 6);
-    assert!(read_u32(&bytes, 8) >= 6);
+    assert!(read_u32(&bytes, 4) >= 4);
+    assert!(read_u32(&bytes, 8) >= 4);
+    for removed in [
+        "runtime.elm_mgr_eki_boot",
+        "runtime.resource_quota",
+        "source.non_eki",
+        "native.fault_isolation",
+    ] {
+        assert!(
+            !bytes
+                .windows(removed.len())
+                .any(|window| window == removed.as_bytes())
+        );
+    }
+    assert!(
+        bytes
+            .windows("source.projection_remote".len())
+            .any(|window| window == b"source.projection_remote")
+    );
     assert!(
         !bytes
             .windows("runtime.running_call_cancel".len())
@@ -1112,6 +1134,12 @@ fn elm_menu_ebi_initialize_failure_quarantines_without_activation() {
     assert_eq!(cell.state, ElmState::Quarantined);
     assert!(!cell.lifecycle_initialized);
     assert!(!cell.lifecycle_finalized);
+    assert!(cell.isolated);
+    assert_eq!(cell.native_faults, 1);
+    assert_ne!(
+        cell.isolation_blocker & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+        0
+    );
 
     let detach = core.detach_cell_with_lifecycle_executor(ElmId(response.cell_id), &mut executor);
     assert_eq!(detach.status, ELM_MGR_STATUS_OK);
@@ -2083,6 +2111,53 @@ fn elm_dynamic_provider_is_queryable_and_bind_preflight_is_todo() {
     assert_eq!(plan.allowed, 0);
     assert_eq!(plan.status, ELM_MGR_STATUS_TODO);
     assert_ne!(plan.blockers & ELM_POLICY_BLOCK_PORT_TODO, 0);
+}
+
+#[ktest]
+fn elm_dynamic_provider_registration_respects_cell_resource_budget() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let mut executor = RecordingLifecycleExecutor::default();
+    let response = core.load_ebi_unit_with_lifecycle_executor(
+        menu_unit("elm-quota-provider"),
+        ElmEbiArch::Riscv64,
+        &mut executor,
+    );
+    assert_eq!(response.status, ElmEbiLoadStatus::Ok as i32);
+    let owner = ElmId(response.cell_id);
+    let limit = core
+        .cells()
+        .iter()
+        .find(|cell| cell.id == owner)
+        .unwrap()
+        .resource_budget
+        .max_provider_ports;
+
+    for index in 0..limit {
+        let contract = format!("quota.provider.{}@1", index);
+        let register = ElmProviderPortRegisterRequest::new(
+            owner.0,
+            &contract,
+            ElmPortAccessPolicy::Internal,
+            FlowDirection::Control,
+            FlowMode::Shared,
+            0,
+        );
+        let response = core.register_provider_port(register);
+        assert_eq!(response.status, ELM_MGR_STATUS_OK);
+    }
+
+    let register = ElmProviderPortRegisterRequest::new(
+        owner.0,
+        "quota.provider.overflow@1",
+        ElmPortAccessPolicy::Internal,
+        FlowDirection::Control,
+        FlowMode::Shared,
+        0,
+    );
+    let response = core.register_provider_port(register);
+    assert_eq!(response.status, ELM_MGR_STATUS_BUSY);
+    assert_ne!(response.blockers & ELM_POLICY_BLOCK_RESOURCE_QUOTA, 0);
 }
 
 #[ktest]

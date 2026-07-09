@@ -147,6 +147,10 @@ ELM 的运行模型由五个对象构成：
 
 异步 provider 队列复用同一个调用帧，不创造第二套 provider ABI。`SubmitProviderCall` 把 `ElmCallFrame` 包进 `ElmProviderAsyncSubmitRequest`，只额外描述超时、结果保留 TTL 和保留 flags。同步 `InvokeProvider` 仍保留，用于低延迟管理动作和兼容现有外部工具；异步路径用于需要背压、取消、超时和结果保留的 provider 调用。
 
+单元级资源预算已经进入运行时模型。启动期 `elm-mgr` 使用 Root 预算，动态单元使用默认预算；provider 端口数量、异步 provider 队列占用、事件订阅、pending load、原生镜像、native fault 和审计记录都会进入 `ElmResourceUsage`。超过预算的操作统一返回 `RESOURCE_QUOTA` blocker，并按管理通道策略映射为 `BUSY`，避免单个 ELM 把管理面队列、订阅或 provider 资源耗尽。
+
+原生故障隔离当前已经完成软边界：生命周期 hook 失败、原生 provider fault、异步原生 provider 超时等会记录 native fault，把目标单元标记为 isolated，并阻断后续 provider 注册、provider 调用、绑定预检和 native import 解析。trap 级恢复、panic 边界和运行中强抢占仍属于后续强隔离主线，不能在当前阶段宣称完成。
+
 ## 5. 枢纽连接层
 
 ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交互都经过枢纽连接层。
@@ -373,7 +377,7 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 
 当前 `ReplaceCell` 已具备受限热替换事务：输入为 `ElmReplaceCellRequestV1 + EKI payload`，目标必须是 `Active` 或 `Paused` 的动态原生单元，新旧单元的 manifest name 和 kind 必须一致，声明式拓扑、provider surface、imports/exports 和生命周期钩子必须通过兼容性校验。替换过程会影子装载新 EKI、执行新 `on_initialize`、静默旧单元、调用旧 `on_migrate_export` 导出最多 64 KiB 状态、调用新 `on_migrate_import` 导入状态、执行旧 `on_finalize`，最后提交 generation、provider backend、菜单元数据、绑定和租约代际更新。失败时会调用新 `on_migrate_abort` 与 `on_finalize`，旧钩子失败会把旧单元隔离到诊断状态。
 
-当前仍然主动阻断的场景包括：内建单元、非 EKI Source、目标存在子单元/依赖者/拓展项、忙碌租约、provider 队列、运行中调用或保留结果仍未排空、外部原生 import 仍指向旧 exports、缺少原生 code segment、缺少迁移钩子、native 装载器无法安全重定位。无停机影子 provider 调用迁移、运行中调用强抢占和跨单元 native import 自动重绑定仍属于后续故障隔离主线。
+当前仍然主动阻断的场景包括：内建单元、Projection/Remote Source、Builtin/Memory 外部替换请求、目标存在子单元/依赖者/拓展项、忙碌租约、provider 队列、运行中调用或保留结果仍未排空、外部原生 import 仍指向旧 exports、缺少原生 code segment、缺少迁移钩子、native 装载器无法安全重定位。无停机影子 provider 调用迁移、运行中调用强抢占和跨单元 native import 自动重绑定仍属于后续故障隔离主线。
 
 ## 10. 资源租约
 
@@ -467,7 +471,7 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 | `DetachCell` | 3 | 已实现部分 | 支持动态单元脱离和退役 |
 | `PauseCell` | 4 | 已实现 | 支持动态单元暂停，原生单元可选执行 `on_quiesce` / `on_pause` |
 | `ResumeCell` | 5 | 已实现 | 支持动态单元恢复，原生单元可选执行 `on_resume` |
-| `ReplaceCell` | 6 | 已实现受限事务 | 支持 EKI Source 的迁移式热替换；非 EKI Source 仍返回 TODO |
+| `ReplaceCell` | 6 | 已实现受限事务 | 支持 EKI Source 的迁移式热替换；Projection/Remote Source 仍返回 TODO，Builtin/Memory 外部请求返回 Unsupported |
 | `QueryTopology` | 7 | 已实现 | 返回父子、依赖、拓展点和拓展项关系 |
 | `QueryPolicy` | 8 | 已实现 | 返回策略能力、支持动作和阻断位 |
 | `PreflightLifecycle` | 9 | 已实现 | 生命周期操作预检 |
@@ -583,21 +587,21 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 - 原生 EKI 在解析 imports、复制段、应用重定位、切换 W^X 权限并同步指令缓存后调用 `on_initialize`；初始化成功的单元才会把依赖、拓展点、拓展项和 provider port 登记到 BindingGraph、PortRuntime 和 ProviderRuntime。普通能力绑定仍由 `PreflightBind/CommitBind` 完成，不在装载时自动创建。
 - provider port 声明会在激活阶段注册为动态 provider；声明 `handler_symbol` 且符号可定位时注册为 ELM 原生 provider backend，否则作为 `TODO(elm)` 后端或被原生镜像预检拒绝。
 - 带 Code payload 且声明 `entry` 的 EKI 会在原生执行器中解析入口符号，并在激活到 `Active` 后调用 `ElmNativeEntryFrameV1` 入口帧。
-- 没有 payload 的裸 EBI 元数据、缺少架构映射 ops 的环境或尚未支持的 Source kind 会停在 `Loaded + NativeCodeTodo`，不执行代码。
-- `MGR_CALL(LoadCell)` 接收 `ElmEbiSourceRequest + source payload`，当前只支持 `Eki` Source。
+- 没有 payload 的裸 EBI 元数据或缺少架构映射 ops 的环境会停在 `Loaded + NativeCodeTodo`，不执行代码；Projection/Remote Source 需要先由对应产出层转换为 EBI 协议对象。
+- `MGR_CALL(LoadCell)` 接收 `ElmEbiSourceRequest + source payload`，当前外部通道只支持 `Eki` Source；启动期 `elm-mgr` 使用内建 Builtin Source，测试和内核内部可直接走 Memory Source 的 EBI 单元入口。
 - EKI Source 会校验 `Code`、`ReadOnlyData`、`Data`、`Bss`、`Relocation`、`Notes` payload block 与 `Segments` 表逐项一致，再展开为 EBI segment 元数据。
 - EKI Source 已支持 `LifecycleHooks` 元数据 block，并要求它展开成完整 EBI 生命周期钩子声明。
 - EKI Source 已支持 `SymbolLocations` 元数据 block，用于把生命周期钩子和后续原生符号定位到段内偏移。
 - EKI Source 已支持 imports 和 exports 元数据 block；imports 当前通过 ELM Core 的原生 export 注册表解析，并在装载时转化为依赖关系和 import relocation 输入。
-- `MGR_CALL(ReplaceCell)` 接收 `ElmReplaceCellRequestV1 + source payload`，当前只支持 EKI Source。`migration_limit == 0` 表示使用默认 64 KiB 上限，非 0 时不得超过该上限。
-- 空 payload 或尚未实现的 Source kind 会返回 `TODO(elm)` 并记录 `LOAD_REQUIRES_EBI_SOURCE` 审计。
-- 非法 EBI Source 请求、损坏 EKI 或未知 Source kind 会返回 `INVALID`。
+- `MGR_CALL(ReplaceCell)` 接收 `ElmReplaceCellRequestV1 + source payload`，当前外部通道只支持 EKI Source。`migration_limit == 0` 表示使用默认 64 KiB 上限，非 0 时不得超过该上限。
+- Projection/Remote Source 会返回 `TODO(elm)` 并记录 `LOAD_REQUIRES_EBI_SOURCE` 审计；Builtin/Memory 外部请求返回 `UNSUPPORTED`。
+- 空 payload、非法 EBI Source 请求、损坏 EKI 或未知 Source kind 会返回 `INVALID`。
 
 尚未完成：
 
-- TODO(elm)：未来 soyo ELM profile 的 EBI 产出层。
-- TODO(elm)：由 `elm-mgr` 暴露的稳定能力寻址、跨版本 export 选择策略和更细粒度的 import 权限策略。
-- TODO(elm)：外部 native import 自动重绑定、运行中调用强抢占和更细粒度 native 故障隔离。
+- TODO(elm)：Projection/Remote Source、未来 soyo ELM profile 和其他容器到 EBI 协议对象的产出层。
+- TODO(elm)：跨单元 native import 自动重绑定、跨版本 export 选择策略和更细粒度的 import 权限策略。
+- TODO(elm)：trap 级故障捕获、panic 恢复、运行中调用强抢占和更细粒度强隔离边界。
 
 ## 14. 模型层模块设计：`libs/elm`
 
@@ -1016,8 +1020,8 @@ soyo 是未来可拓展文件类型。soyo 本身不实现 EBI，也不应成为
 
 - 所有请求解析都显式检查 payload 长度。
 - 不接受长度不匹配的输入。
-- `LoadCell` 当前接收 EBI Source 请求，支持 EKI 元数据解析并通过 EBI 装载入口注册单元；空 payload 和未实现 Source 仍记录 `LOAD_REQUIRES_EBI_SOURCE` 审计并返回 TODO。
-- `ReplaceCell` 会解析 `ElmReplaceCellRequestV1`，对 EKI Source 进入热替换事务；非 EKI Source 仍记录 `LOAD_REQUIRES_EBI_SOURCE` 审计并返回 TODO。
+- `LoadCell` 当前接收 EBI Source 请求，支持 EKI 元数据解析并通过 EBI 装载入口注册单元；Builtin/Memory 是内核内部 Source，不通过外部管理通道直接装载；Projection/Remote Source 仍记录 `LOAD_REQUIRES_EBI_SOURCE` 审计并返回 TODO。
+- `ReplaceCell` 会解析 `ElmReplaceCellRequestV1`，对 EKI Source 进入热替换事务；Builtin/Memory 外部请求返回 `UNSUPPORTED`，Projection/Remote Source 仍记录 `LOAD_REQUIRES_EBI_SOURCE` 审计并返回 TODO。
 - 运行时日志和事件命令会校验 binding 是否存在、端口是否匹配、租约和状态是否允许。
 - provider 注册命令会校验 owner、契约、方向、模式、访问策略和保留 flags。
 - provider 调用命令会校验 binding、租约、端口可调用性和 payload 长度。
@@ -1110,8 +1114,8 @@ ELM 的可观测性由四条路径组成：
 - 绑定和解绑。
 - 运行时日志提交。
 - 运行时事件读取和确认。
-- 装载被缺失或未实现的 EBI Source 边界阻断。
-- 热替换预检阻断、非 EKI Source 阻断和生命周期钩子失败。
+- 装载被缺失、Projection/Remote Source 或非法 EBI Source 边界阻断。
+- 热替换预检阻断、Projection/Remote Source 阻断、Builtin/Memory 外部请求拒绝和生命周期钩子失败。
 
 运行时端口统计覆盖：
 
@@ -1167,7 +1171,7 @@ ELM 的可观测性由四条路径组成：
 - `MGR_CALL(InvokeProvider)` 已保留 256 字节 `ElmCallFrame` / `ElmReplyFrame` ABI；`mgr.action.invoke@1` 已接入 kernel-backed 执行器，管理通道已覆盖健康动作调用和业务失败审计，带 `handler_symbol` 的动态 ELM 原生 provider 会进入 `ElmNativeProviderCallV1` 调用边界。
 - `MGR_CALL(SubmitProviderCall/PollProviderReply/CancelProviderCall/QueryProviderQueue)` 已形成真实异步队列闭环，支持 ticket、队列容量、运行中观测、超时、结果 TTL、排队取消、运行中取消意图、队列统计和租约 active ref 保护。
 - `MGR_CALL(QueryApiRegistry)` 已返回 `elm-mgr` API 注册表，覆盖已实现管理 API、事件 API、provider API 和子系统导出的 provider specs。
-- `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，覆盖非 EKI Source、资源配额、native fault 隔离、elm-mgr EKI 自举和外部 Rust 开发框架等运行时边界；缺 handler 的动态 provider、pending native EBI 和当前运行中的 provider 会作为动态记录出现。
+- `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，静态项只保留文件投影/远程分发、trap 级强隔离、热替换重绑定和外部 Rust 开发框架等大方向；缺 handler 的动态 provider、pending native EBI 和当前运行中的 provider 会作为动态记录出现。
 - `MGR_CALL(SubscribeEvent/UnsubscribeEvent/QueryEventSubscriptions/ReadSubscribedEvents)` 已形成事件订阅闭环，支持订阅租约、独立游标、过滤器、只读不推进和读取后推进两种模式。
 - `/sys/kernel/elm` 已提供只读文本观测面，覆盖 core、policy、health、menu、topology、ports、providers、bindings、events、audit、api、native-capabilities 和 todo-registry。
 - `MGR_CALL(QueryHealth)` 已返回结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event、audit、native capability 和 TODO registry 不变量破坏。
@@ -1181,16 +1185,16 @@ ELM 的可观测性由四条路径组成：
 - 动态 EBI 单元已强制要求 `on_initialize` 和 `on_finalize`，钩子 ABI 暂定为 Rust ABI v1。
 - EKI Source 已支持依赖、拓展点、拓展项、provider port、原生 payload segment、imports、exports、符号位置、EKI relocation v1 和生命周期钩子元数据；装载时会完成解析、预检和 EBI image 展开。
 - 带 Code payload、生命周期符号位置和可解析 relocation 的原生 EKI 会进入原生镜像执行器；执行器完成段复制、重定位、W^X 权限封口、指令缓存同步和 `on_initialize` 调用后，激活声明式拓扑，并在进入 `Active` 后调用可选 `entry`。
-- 无 Code 段但声明生命周期钩子的 EBI、缺少 payload 的裸 EBI 元数据、缺少架构映射 ops 的环境或尚未支持的 Source kind 会登记为 `Loaded + NativeCodeTodo`，不执行代码。
-- Core 已记录动态单元生命周期声明、测试执行器可用性、初始化状态、完成卸载状态和 pending EBI load 计划；启动期内建 `elm-mgr` 当前使用合成生命周期状态。
+- 无 Code 段但声明生命周期钩子的 EBI、缺少 payload 的裸 EBI 元数据或缺少架构映射 ops 的环境会登记为 `Loaded + NativeCodeTodo`，不执行代码。
+- Core 已记录动态单元生命周期声明、测试执行器可用性、初始化状态、完成卸载状态、pending EBI load 计划、EBI Source kind、资源预算、native fault 次数和软隔离状态；启动期 `elm-mgr` 当前作为 Builtin Source 根单元进入同一套 EBI 模型。
 - `ElmContext` 已作为 Rust 生命周期上下文进入模型层，当前不进入 `sys_elm_ctl` 字节 ABI。
 - kernel-tests 已具备受控生命周期测试执行器：可验证无原生镜像单元初始化后激活菜单、拓扑和 provider，初始化失败隔离，卸载前 finalize，以及 finalize 失败保留资源。
 - 受控测试执行器不会激活带原生 entry、代码段或重定位段的单元；带代码段的单元只能由原生 EKI 执行器处理，带 `entry` 的 Code EKI 已由原生执行器负责入口调用。
 - `PauseCell` 和 `ResumeCell` 已通过统一预检策略支持动态单元的真实状态切换；原生单元会调用可选 `on_quiesce`、`on_pause` 和 `on_resume`，暂停后的单元不能继续发起或承载 provider 调用。
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项、忙碌租约、provider 队列/保留结果/运行中调用或 native export 被其他单元 import 的目标单元，避免破坏当前拓扑。
-- `ReplaceCell` 已支持 EKI Source 的受限迁移式热替换事务，包括新镜像影子装载、新 `on_initialize`、旧 `on_quiesce`、旧 `on_migrate_export`、新 `on_migrate_import`、旧 `on_finalize`、失败 abort/finalize 和 generation 提交；非 EKI Source 仍作为 Source TODO 边界。
-- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 的 Core 直调和 `MGR_CALL(InvokeProvider)` 字节路径、provider snapshot 成功和无回调 `UNSUPPORTED` 路径、`device.discovered@1` 真实 snapshot/query 成功路径、`device.claim@1` acquire/query/release/snapshot/绑定撤销清理成功路径、provider 业务失败审计、异步 provider 提交、完成、轮询、取消、超时、队列满、队列查询、API 注册表、事件订阅、订阅读取游标推进语义、菜单 EBI 等待生命周期执行器、测试执行器激活菜单 EBI、EKI Source 装载、EKI 声明式拓扑在执行器前不激活、测试执行器激活 EKI 声明式拓扑、EKI entry ABI 调用约定、EKI 迁移钩子解析、ReplaceCell malformed/非 EKI Source/真实预检路径、hook failed 隔离、无 payload/无执行器的原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
+- `ReplaceCell` 已支持 EKI Source 的受限迁移式热替换事务，包括新镜像影子装载、新 `on_initialize`、旧 `on_quiesce`、旧 `on_migrate_export`、新 `on_migrate_import`、旧 `on_finalize`、失败 abort/finalize 和 generation 提交；Projection/Remote Source 仍作为文件投影与分发主线，Builtin/Memory 外部请求不进入替换事务。
+- `kernel-tests` 已覆盖启动期 `elm-mgr` 健康检查、内建健康菜单动作、`mgr.action.invoke@1` 的 Core 直调和 `MGR_CALL(InvokeProvider)` 字节路径、provider snapshot 成功和无回调 `UNSUPPORTED` 路径、`device.discovered@1` 真实 snapshot/query 成功路径、`device.claim@1` acquire/query/release/snapshot/绑定撤销清理成功路径、provider 业务失败审计、异步 provider 提交、完成、轮询、取消、超时、队列满、队列查询、资源预算阻断、API 注册表、事件订阅、订阅读取游标推进语义、菜单 EBI 等待生命周期执行器、测试执行器激活菜单 EBI、EKI Source 装载、EKI 声明式拓扑在执行器前不激活、测试执行器激活 EKI 声明式拓扑、EKI entry ABI 调用约定、EKI 迁移钩子解析、ReplaceCell malformed/Source 边界/真实预检路径、hook failed 软隔离、无 payload/无执行器的原生 EBI 停在 `Loaded + NativeCodeTodo`、动态 provider 可观测、绑定预检 `PORT_TODO` 阻断，以及管理通道字节协议的成功路径和 malformed 请求拒绝。
 
 ## 18. 运行期 smoke 测试链路
 
@@ -1210,7 +1214,7 @@ ELM 的可观测性由四条路径组成：
 仓库提供 `userland/elmctl-smoke/elmctl_smoke.c` 作为最小用户态 smoke 工具。该工具不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL`。工具会执行以下检查：
 
 - `CoreQuery`：确认 ELM Core magic、ABI、能力位、cell 数量和端口数量。
-- `QueryPolicy`：确认 `elm-mgr` 支持 provider invoke、健康检查、异步 provider、TODO registry 和 lifecycle hook failed blocker。
+- `QueryPolicy`：确认 `elm-mgr` 支持 provider invoke、健康检查、异步 provider、TODO registry、资源预算策略、lifecycle hook failed blocker 和 resource quota blocker。
 - `QueryMenu`：确认内建健康检查菜单项 `elm/mgr/health` 存在，并读取其 action id。
 - `QueryHealth`：确认 Core 结构化健康检查为 OK。
 - `QueryTodoRegistry`：确认运行时 TODO registry 可通过用户态管理通道查询。
@@ -1279,20 +1283,20 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 尚未完成：
 
-- TODO(elm)：由 `elm-mgr` 暴露的稳定能力寻址、import 权限策略和跨版本 export 选择策略。
-- TODO(elm)：未来 soyo ELM profile 的 EBI 产出层。
+- TODO(elm)：Projection/Remote Source、未来 soyo ELM profile 和其他容器到 EBI 协议对象的产出层。
 - TODO(elm)：跨单元 native import 自动重绑定、无停机影子 binding 切换和运行中 provider 强抢占。
+- TODO(elm)：trap 级故障捕获、panic 恢复和强隔离边界。
 - TODO(elm)：设备、VFS、网络、IRQ、DMA、MMIO 等端口的真实绑定执行器和提供者。
 - TODO(elm)：端口级故障隔离、运行中调用强抢占和 provider snapshot 的零拷贝/流式扩展协议。
 - TODO(elm)：面向 Rust ELM 的开发框架和构建链路。
 
 阶段收束结论：
 
-- 当前 ELM 已经从“模型草案”进入“管理运行时和原生 EKI 装载边界可验证”阶段：`elm-mgr` 可以作为外界入口管理菜单、策略、拓扑、审计、provider、事件订阅、API 注册表和 EBI/EKI 装载状态。
+- 当前 ELM 已经从“模型草案”进入“管理运行时和原生 EKI 装载边界可验证”阶段：`elm-mgr` 可以作为外界入口管理菜单、策略、拓扑、审计、provider、事件订阅、资源预算、软隔离状态、API 注册表和 EBI/EKI 装载状态。
 - 当前阶段不再继续把零散能力堆进 `MGR_CALL`，后续新增能力必须归入明确主线：原生执行器、子系统 provider 接入、热替换与故障隔离、Rust 开发框架、网络栈 ELM 化。
 - `elm-mgr` 是所有 ELM 通向内核能力的唯一网关；后续 VFS、设备、调度、网络、IRQ、DMA、MMIO 等能力只通过 `elm-mgr` API 注册表和 provider Ops 暴露，不新增私有 ELM syscall。
 - `EKI` 是近期原生 ELM 镜像承载方式，`soyo` 仍保持后置；ELM Core 继续只消费 EBI 协议对象，不绑定具体文件格式。
-- 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用；EKI Source 的受限热替换迁移事务、运行中 provider 调用排空链路和 provider snapshot cursor 分页已经接入。跨单元 native import 自动重绑定、运行中调用强抢占、provider snapshot 零拷贝/流式扩展协议和更细的 import 权限策略仍必须继续停在 `TODO(elm)` 边界，不能用测试执行器或声明式拓扑伪装为已经实现。
+- 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用；EKI Source 的受限热替换迁移事务、运行中 provider 调用排空链路、provider snapshot cursor 分页、资源预算阻断和 native fault 软隔离已经接入。跨单元 native import 自动重绑定、运行中调用强抢占、trap 级恢复、provider snapshot 零拷贝/流式扩展协议和更细的 import 权限策略仍必须继续停在 `TODO(elm)` 边界，不能用测试执行器或声明式拓扑伪装为已经实现。
 
 ## 19. 后续阶段路线
 

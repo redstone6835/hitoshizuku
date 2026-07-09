@@ -53,7 +53,9 @@
 #define ELM_MGR_POLICY_API_REGISTRY (1ull << 10)
 #define ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS (1ull << 11)
 #define ELM_MGR_POLICY_TODO_REGISTRY (1ull << 13)
+#define ELM_MGR_POLICY_RESOURCE_BUDGET (1ull << 14)
 #define ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED (1ull << 23)
+#define ELM_POLICY_BLOCK_RESOURCE_QUOTA (1ull << 24)
 
 #define ELM_MGR_API_NAMESPACE_LEN 32u
 #define ELM_MGR_API_NAME_LEN 48u
@@ -689,11 +691,13 @@ static int run_policy_query(uint8_t *out, size_t out_len)
         (policy.policy_flags & ELM_MGR_POLICY_PROVIDER_ASYNC) == 0 ||
         (policy.policy_flags & ELM_MGR_POLICY_API_REGISTRY) == 0 ||
         (policy.policy_flags & ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS) == 0 ||
-        (policy.policy_flags & ELM_MGR_POLICY_TODO_REGISTRY) == 0) {
+        (policy.policy_flags & ELM_MGR_POLICY_TODO_REGISTRY) == 0 ||
+        (policy.policy_flags & ELM_MGR_POLICY_RESOURCE_BUDGET) == 0) {
         return fail_msg("policy-query", "missing policy flag");
     }
-    if ((policy.blocker_mask & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED) == 0) {
-        return fail_msg("policy-query", "missing hook failure blocker");
+    if ((policy.blocker_mask & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED) == 0 ||
+        (policy.blocker_mask & ELM_POLICY_BLOCK_RESOURCE_QUOTA) == 0) {
+        return fail_msg("policy-query", "missing blocker");
     }
     printf("[elm-smoke] policy query ok: actions=0x%x policy=0x%llx blockers=0x%llx\n",
            policy.supported_actions, (unsigned long long)policy.policy_flags,
