@@ -49,13 +49,15 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 return response_only(ElmMgrResponseHeader::invalid());
             };
             match source_kind {
-                ElmEbiSourceKind::Eki => match elm_model::parse_eki_image(source_payload) {
-                    Ok(image) => {
-                        let response = core.load_ebi_image(image, current_ebi_arch());
-                        response_with_plain_payload(&response)
+                ElmEbiSourceKind::Eki => {
+                    match source::project_builtin_eki_image(source_payload, current_ebi_arch()) {
+                        Ok(image) => {
+                            let response = core.load_ebi_image(image, current_ebi_arch());
+                            response_with_plain_payload(&response)
+                        }
+                        Err(_) => response_only(ElmMgrResponseHeader::invalid()),
                     }
-                    Err(_) => response_only(ElmMgrResponseHeader::invalid()),
-                },
+                }
                 ElmEbiSourceKind::Projection => {
                     match load_projection_image(source_payload, current_ebi_arch()) {
                         Ok(image) => {
@@ -68,7 +70,6 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
                     response_only(ElmMgrResponseHeader::unsupported())
                 }
-                ElmEbiSourceKind::Remote => response_only(ElmMgrResponseHeader::unsupported()),
             }
         }
         ElmMgrCallKind::PauseCell => {
@@ -102,18 +103,20 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 return response_only(ElmMgrResponseHeader::invalid());
             };
             match source_kind {
-                ElmEbiSourceKind::Eki => match elm_model::parse_eki_image(source_payload) {
-                    Ok(image) => {
-                        let response = core.replace_cell_from_ebi_image(
-                            ElmId(request.target_cell_id),
-                            image,
-                            current_ebi_arch(),
-                            request.migration_limit,
-                        );
-                        response_with_plain_payload(&response)
+                ElmEbiSourceKind::Eki => {
+                    match source::project_builtin_eki_image(source_payload, current_ebi_arch()) {
+                        Ok(image) => {
+                            let response = core.replace_cell_from_ebi_image(
+                                ElmId(request.target_cell_id),
+                                image,
+                                current_ebi_arch(),
+                                request.migration_limit,
+                            );
+                            response_with_plain_payload(&response)
+                        }
+                        Err(_) => response_only(ElmMgrResponseHeader::invalid()),
                     }
-                    Err(_) => response_only(ElmMgrResponseHeader::invalid()),
-                },
+                }
                 ElmEbiSourceKind::Projection => {
                     match load_projection_image(source_payload, current_ebi_arch()) {
                         Ok(image) => {
@@ -131,7 +134,6 @@ pub(crate) fn dispatch_mgr_call_on_core(core: &mut ElmCore, input: &[u8]) -> Vec
                 ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
                     response_only(ElmMgrResponseHeader::unsupported())
                 }
-                ElmEbiSourceKind::Remote => response_only(ElmMgrResponseHeader::unsupported()),
             }
         }
         ElmMgrCallKind::QueryTopology => {

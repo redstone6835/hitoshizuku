@@ -13,6 +13,7 @@
 #define ELM_CTL_ABI_VERSION 1u
 #define ELM_CTL_CMD_CORE_QUERY 1u
 #define ELM_CTL_CMD_MGR_CALL 2u
+#define ELM_CTL_CMD_SNAPSHOT_READ 5u
 
 #define ELM_CORE_CAP_MGR_CHANNEL (1ull << 2)
 
@@ -25,7 +26,11 @@
 #define ELM_MGR_CALL_QUERY_POLICY 8u
 #define ELM_MGR_CALL_QUERY_AUDIT 10u
 #define ELM_MGR_CALL_QUERY_NEXUS_BINDINGS 11u
+#define ELM_MGR_CALL_PREFLIGHT_BIND 12u
 #define ELM_MGR_CALL_COMMIT_BIND 13u
+#define ELM_MGR_CALL_COMMIT_UNBIND 15u
+#define ELM_MGR_CALL_REGISTER_PROVIDER_PORT 20u
+#define ELM_MGR_CALL_UNREGISTER_PROVIDER_PORT 21u
 #define ELM_MGR_CALL_QUERY_PROVIDER_PORTS 22u
 #define ELM_MGR_CALL_INVOKE_PROVIDER 23u
 #define ELM_MGR_CALL_QUERY_HEALTH 25u
@@ -39,8 +44,12 @@
 #define ELM_MGR_MAX_INPUT (4096u + 16u)
 #define ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED (1u << 0)
 #define ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE (1u << 0)
+#define ELM_PORT_ACCESS_PUBLIC 1u
+#define ELM_FLOW_CONTROL 4u
+#define ELM_FLOW_SHARED 2u
 
 #define ELM_MGR_BUILTIN_ID 1ull
+#define ELM_EKI_BUILTIN_ID 2ull
 #define ELM_MGR_ACTION_PORT_ID 4ull
 #define ELM_MGR_ACTION_PROVIDER_INVOKE (1u << 12)
 #define ELM_MGR_ACTION_HEALTH_QUERY (1u << 13)
@@ -56,12 +65,14 @@
 #define ELM_MGR_POLICY_RESOURCE_BUDGET (1ull << 14)
 #define ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED (1ull << 23)
 #define ELM_POLICY_BLOCK_RESOURCE_QUOTA (1ull << 24)
+#define ELM_POLICY_BLOCK_PORT_TODO (1ull << 14)
 
 #define ELM_MGR_API_NAMESPACE_LEN 32u
 #define ELM_MGR_API_NAME_LEN 48u
 #define ELM_MGR_API_CONTRACT_LEN 48u
 #define ELM_MGR_EVENT_READ_FLAG_ADVANCE (1u << 0)
 
+#define ELM_CELL_NAME_LEN 64u
 #define ELM_NEXUS_CONTRACT_LEN 64u
 #define ELM_MENU_LABEL_LEN 64u
 #define ELM_MENU_DESCRIPTION_LEN 128u
@@ -80,6 +91,7 @@
 
 #define ELM_EBI_SOURCE_ABI_VERSION 1u
 #define ELM_EBI_SOURCE_KIND_EKI 1u
+#define ELM_EBI_SOURCE_KIND_BUILTIN 3u
 #define ELM_EBI_LOAD_NATIVE_CODE_TODO (-4096)
 
 #define ELM_EKI_FORMAT_VERSION 1u
@@ -90,6 +102,8 @@
 #define ELM_EKI_BLOCK_MANIFEST 1u
 #define ELM_EKI_BLOCK_MENU 2u
 #define ELM_EKI_BLOCK_LIFECYCLE_HOOKS 18u
+#define ELM_KIND_MANAGER 1u
+#define ELM_KIND_SERVICE 2u
 #define ELM_KIND_EXTENSION 4u
 #define ELM_MENU_KIND_ACTION 2u
 #define ELM_LIFECYCLE_HOOK_INITIALIZE 1u
@@ -99,9 +113,12 @@
 #define ELM_EBI_SYMBOL_NAME_LEN 128u
 
 #define ELM_STATE_LOADED 3u
+#define ELM_STATE_ACTIVE 6u
 #define ELM_STATE_RETIRED 10u
 
+#define ELM_PROVIDER_FLAG_DYNAMIC (1u << 0)
 #define ELM_PROVIDER_FLAG_KERNEL_BACKEND (1u << 1)
+#define ELM_PROVIDER_FLAG_TODO_BACKEND (1u << 2)
 
 #define ELM_DEV_DISCOVERY_OPCODE_QUERY 1u
 #define ELM_DEV_DISCOVERY_CLASS_LEN 16u
@@ -116,6 +133,56 @@ struct elm_core_info {
     uint32_t port_count;
     uint32_t lease_count;
     uint64_t event_sequence;
+};
+
+struct elm_snapshot_header {
+    uint16_t abi_version;
+    uint16_t cell_entry_size;
+    uint16_t port_entry_size;
+    uint16_t reserved;
+    uint32_t cell_count;
+    uint32_t port_count;
+    uint32_t lease_count;
+    uint64_t event_sequence;
+};
+
+struct elm_cell_snapshot {
+    uint64_t id;
+    uint64_t parent;
+    uint32_t state;
+    uint32_t kind;
+    uint32_t ebi_arch;
+    int32_t ebi_status;
+    uint32_t native_code;
+    uint32_t reserved0;
+    uint64_t generation;
+    uint16_t name_len;
+    uint16_t reserved;
+    uint8_t name[ELM_CELL_NAME_LEN];
+    uint32_t ebi_source;
+    uint32_t lifecycle_flags;
+    uint16_t native_segment_count;
+    uint16_t native_import_count;
+    uint16_t native_export_count;
+    uint16_t native_faults;
+    uint32_t isolated;
+    uint32_t reserved1;
+    uint64_t isolation_blocker;
+    uint16_t budget_max_provider_ports;
+    uint16_t budget_max_provider_queue;
+    uint16_t budget_max_event_subscriptions;
+    uint16_t budget_max_pending_loads;
+    uint16_t budget_max_native_images;
+    uint16_t budget_max_native_faults;
+    uint16_t budget_max_audit_records;
+    uint16_t usage_provider_ports;
+    uint16_t usage_provider_queue;
+    uint16_t usage_event_subscriptions;
+    uint16_t usage_pending_loads;
+    uint16_t usage_native_images;
+    uint16_t usage_native_faults;
+    uint16_t usage_audit_records;
+    uint32_t reserved2;
 };
 
 struct elm_mgr_call_header {
@@ -200,6 +267,12 @@ struct elm_nexus_bind_response {
     uint32_t allowed;
     uint64_t blockers;
     uint64_t reserved;
+};
+
+struct elm_nexus_unbind_request {
+    uint64_t binding_id;
+    uint32_t flags;
+    uint32_t reserved;
 };
 
 struct elm_nexus_binding_snapshot_header {
@@ -305,6 +378,33 @@ struct elm_provider_port_record {
     uint64_t failed_calls;
     uint64_t revokes;
     uint8_t contract[ELM_NEXUS_CONTRACT_LEN];
+};
+
+struct elm_provider_port_register_request {
+    uint64_t owner_cell_id;
+    uint32_t flags;
+    uint32_t access_policy;
+    uint32_t direction;
+    uint32_t mode;
+    uint16_t contract_len;
+    uint16_t reserved0;
+    uint32_t reserved1;
+    uint8_t contract[ELM_NEXUS_CONTRACT_LEN];
+};
+
+struct elm_provider_port_register_response {
+    uint64_t owner_cell_id;
+    uint64_t port_id;
+    int32_t status;
+    uint32_t access_policy;
+    uint64_t blockers;
+    uint64_t reserved;
+};
+
+struct elm_provider_port_unregister_request {
+    uint64_t port_id;
+    uint32_t flags;
+    uint32_t reserved;
 };
 
 struct elm_dev_discovery_header {
@@ -487,6 +587,8 @@ struct elm_todo_registry_record {
 _Static_assert(sizeof(struct elm_mgr_call_header) == 16, "bad mgr call header size");
 _Static_assert(sizeof(struct elm_mgr_response_header) == 16, "bad mgr response header size");
 _Static_assert(sizeof(struct elm_core_info) == 40, "bad core info size");
+_Static_assert(sizeof(struct elm_snapshot_header) == 32, "bad snapshot header size");
+_Static_assert(sizeof(struct elm_cell_snapshot) == 184, "bad cell snapshot size");
 _Static_assert(sizeof(struct elm_mgr_policy_info) == 32, "bad policy info size");
 _Static_assert(sizeof(struct elm_menu_snapshot_header) == 16, "bad menu header size");
 _Static_assert(sizeof(struct elm_menu_item_snapshot) == 296, "bad menu item size");
@@ -494,6 +596,7 @@ _Static_assert(sizeof(struct elm_core_health_header) == 24, "bad health header s
 _Static_assert(sizeof(struct elm_mgr_audit_header) == 24, "bad audit header size");
 _Static_assert(sizeof(struct elm_nexus_bind_request) == 88, "bad bind request size");
 _Static_assert(sizeof(struct elm_nexus_bind_response) == 64, "bad bind response size");
+_Static_assert(sizeof(struct elm_nexus_unbind_request) == 16, "bad unbind request size");
 _Static_assert(sizeof(struct elm_nexus_binding_record) == 120, "bad binding record size");
 _Static_assert(sizeof(struct elm_action_invoke_request) == 16, "bad action request size");
 _Static_assert(sizeof(struct elm_action_invoke_reply) == 48, "bad action reply size");
@@ -503,6 +606,12 @@ _Static_assert(sizeof(struct elm_provider_snapshot_request) == 24, "bad provider
 _Static_assert(sizeof(struct elm_provider_snapshot_header) == 40, "bad provider snapshot header size");
 _Static_assert(sizeof(struct elm_provider_port_stats_header) == 16, "bad provider port header size");
 _Static_assert(sizeof(struct elm_provider_port_record) == 136, "bad provider port record size");
+_Static_assert(sizeof(struct elm_provider_port_register_request) == 96,
+               "bad provider register request size");
+_Static_assert(sizeof(struct elm_provider_port_register_response) == 40,
+               "bad provider register response size");
+_Static_assert(sizeof(struct elm_provider_port_unregister_request) == 16,
+               "bad provider unregister request size");
 _Static_assert(sizeof(struct elm_dev_discovery_header) == 24, "bad dev discovery header size");
 _Static_assert(sizeof(struct elm_dev_discovery_record) == 96, "bad dev discovery record size");
 _Static_assert(sizeof(struct elm_lifecycle_request) == 16, "bad lifecycle request size");
@@ -653,12 +762,81 @@ static int run_core_query(void)
     if ((info.capabilities & ELM_CORE_CAP_MGR_CHANNEL) == 0) {
         return fail_msg("core-query", "missing mgr channel capability");
     }
-    if (info.cell_count < 1 || info.port_count < 4) {
+    if (info.cell_count < 2 || info.port_count < 4) {
         return fail_msg("core-query", "elm-mgr core objects missing");
     }
     printf("[elm-smoke] core query ok: cells=%u ports=%u leases=%u events=%llu\n",
            info.cell_count, info.port_count, info.lease_count,
            (unsigned long long)info.event_sequence);
+    return 0;
+}
+
+static int find_snapshot_cell(const uint8_t *bytes, size_t len, uint64_t id,
+                              struct elm_cell_snapshot *out)
+{
+    struct elm_snapshot_header header;
+    const uint8_t *cursor;
+
+    if (len < sizeof(header)) {
+        return -1;
+    }
+    memcpy(&header, bytes, sizeof(header));
+    if (header.abi_version != ELM_CTL_ABI_VERSION ||
+        header.cell_entry_size < sizeof(struct elm_cell_snapshot)) {
+        return -1;
+    }
+    if (len < sizeof(header) + (size_t)header.cell_count * header.cell_entry_size) {
+        return -1;
+    }
+    cursor = bytes + sizeof(header);
+    for (uint32_t i = 0; i < header.cell_count; i++) {
+        struct elm_cell_snapshot cell;
+        memset(&cell, 0, sizeof(cell));
+        memcpy(&cell, cursor, sizeof(cell));
+        if (cell.id == id) {
+            *out = cell;
+            return 0;
+        }
+        cursor += header.cell_entry_size;
+    }
+    return -1;
+}
+
+static int read_snapshot(uint8_t *out, size_t out_len, ssize_t *written)
+{
+    if (elm_ctl(ELM_CTL_CMD_SNAPSHOT_READ, NULL, 0, out, out_len, written) != 0) {
+        return fail_errno("snapshot");
+    }
+    if (*written < 0 || (size_t)*written < sizeof(struct elm_snapshot_header)) {
+        return fail_msg("snapshot", "bad output size");
+    }
+    return 0;
+}
+
+static int run_builtin_snapshot_query(uint8_t *out, size_t out_len)
+{
+    ssize_t written = 0;
+    struct elm_cell_snapshot mgr;
+    struct elm_cell_snapshot eki;
+
+    if (read_snapshot(out, out_len, &written) != 0) {
+        return -1;
+    }
+    if (find_snapshot_cell(out, (size_t)written, ELM_MGR_BUILTIN_ID, &mgr) != 0 ||
+        find_snapshot_cell(out, (size_t)written, ELM_EKI_BUILTIN_ID, &eki) != 0) {
+        return fail_msg("snapshot", "missing builtin elm-mgr or eki");
+    }
+    if (mgr.parent != 0 || mgr.state != ELM_STATE_ACTIVE || mgr.kind != ELM_KIND_MANAGER ||
+        mgr.ebi_source != ELM_EBI_SOURCE_KIND_BUILTIN ||
+        !field_eq(mgr.name, mgr.name_len, "elm-mgr")) {
+        return fail_msg("snapshot", "bad elm-mgr builtin cell");
+    }
+    if (eki.parent != ELM_MGR_BUILTIN_ID || eki.state != ELM_STATE_ACTIVE ||
+        eki.kind != ELM_KIND_SERVICE || eki.ebi_source != ELM_EBI_SOURCE_KIND_BUILTIN ||
+        !field_eq(eki.name, eki.name_len, "eki")) {
+        return fail_msg("snapshot", "bad builtin eki cell");
+    }
+    printf("[elm-smoke] builtin snapshot ok: elm-mgr=<builtin> eki=<builtin>\n");
     return 0;
 }
 
@@ -769,6 +947,10 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
     uint32_t payload_len = 0;
     struct elm_todo_registry_header header;
     int saw_static = 0;
+    int saw_soyo_projection = 0;
+    int saw_external_resolver = 0;
+    int saw_trap_trampoline = 0;
+    int saw_rust_framework = 0;
 
     if (require_mgr_payload(ELM_MGR_CALL_QUERY_TODO_REGISTRY, NULL, 0, out, out_len,
                             &payload, &payload_len) != 0) {
@@ -780,7 +962,7 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
     memcpy(&header, payload, sizeof(header));
     if (header.abi_version != ELM_CTL_ABI_VERSION ||
         header.record_entry_size != sizeof(struct elm_todo_registry_record) ||
-        header.record_count < 8 || header.active_count < 8 ||
+        header.record_count < 4 || header.active_count < 4 ||
         payload_len != sizeof(header) + header.record_count * header.record_entry_size) {
         return fail_msg("todo-registry", "bad registry");
     }
@@ -792,8 +974,18 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
             (record.flags & ELM_TODO_FLAG_ACTIVE) != 0) {
             saw_static = 1;
         }
+        if (field_eq(record.name, record.name_len, "projection.soyo_profile")) {
+            saw_soyo_projection = 1;
+        } else if (field_eq(record.name, record.name_len, "provenance.external_resolver")) {
+            saw_external_resolver = 1;
+        } else if (field_eq(record.name, record.name_len, "native.trap_trampoline")) {
+            saw_trap_trampoline = 1;
+        } else if (field_eq(record.name, record.name_len, "framework.rust_elm")) {
+            saw_rust_framework = 1;
+        }
     }
-    if (!saw_static) {
+    if (!saw_static || !saw_soyo_projection || !saw_external_resolver ||
+        !saw_trap_trampoline || !saw_rust_framework) {
         return fail_msg("todo-registry", "missing static todo record");
     }
     printf("[elm-smoke] todo registry ok: records=%u active=%u flags=0x%x\n",
@@ -952,216 +1144,197 @@ static int find_provider_port(uint8_t *out, size_t out_len, const char *contract
     return 0;
 }
 
-static int validate_device_discovery_payload(const char *step, const uint8_t *payload,
-                                             uint32_t payload_len)
-{
-    struct elm_dev_discovery_header header;
+static int build_minimal_eki(uint8_t *image, size_t cap, size_t *image_len);
 
-    if (payload_len < sizeof(header)) {
-        return fail_msg(step, "short device discovery payload");
+static int load_minimal_eki_cell(uint8_t *out, size_t out_len, uint64_t *cell_id)
+{
+    uint8_t image[1024];
+    uint8_t request[sizeof(struct elm_ebi_source_request) + sizeof(image)];
+    struct elm_ebi_source_request source;
+    struct elm_load_cell_response load;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    size_t image_len = 0;
+
+    if (build_minimal_eki(image, sizeof(image), &image_len) != 0) {
+        return -1;
     }
-    memcpy(&header, payload, sizeof(header));
-    if (header.abi_version != ELM_CTL_ABI_VERSION ||
-        header.record_entry_size != sizeof(struct elm_dev_discovery_record) ||
-        header.record_count > header.total_count ||
-        payload_len != sizeof(header) + header.record_count * header.record_entry_size) {
-        return fail_msg(step, "bad device discovery header");
+    memset(&source, 0, sizeof(source));
+    source.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
+    source.source_kind = ELM_EBI_SOURCE_KIND_EKI;
+    source.payload_len = (uint32_t)image_len;
+    memcpy(request, &source, sizeof(source));
+    memcpy(request + sizeof(source), image, image_len);
+    if (require_mgr_payload(ELM_MGR_CALL_LOAD_CELL, request, sizeof(source) + image_len,
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
     }
-    for (uint32_t i = 0; i < header.record_count; i++) {
-        const uint8_t *entry = payload + sizeof(header) + i * header.record_entry_size;
-        struct elm_dev_discovery_record record;
-        memcpy(&record, entry, sizeof(record));
-        if (record.ordinal == 0 || record.class_len > ELM_DEV_DISCOVERY_CLASS_LEN ||
-            record.name_len > ELM_DEV_DISCOVERY_NAME_LEN) {
-            return fail_msg(step, "bad device discovery record");
-        }
+    if (payload_len != sizeof(load)) {
+        return fail_msg("load-eki", "bad load response size");
     }
-    printf("[elm-smoke] device discovery payload ok: records=%u total=%u flags=0x%x\n",
-           header.record_count, header.total_count, header.flags);
+    memcpy(&load, payload, sizeof(load));
+    if (load.status != ELM_EBI_LOAD_NATIVE_CODE_TODO || load.final_state != ELM_STATE_LOADED ||
+        load.cell_id == 0) {
+        return fail_msg("load-eki", "unexpected load response");
+    }
+    *cell_id = load.cell_id;
     return 0;
 }
 
-static int run_subsystem_provider_query(uint8_t *out, size_t out_len)
+static int detach_cell(uint8_t *out, size_t out_len, uint64_t cell_id)
 {
-    struct elm_provider_port_record device_provider = {0};
-    struct elm_provider_port_record vfs_provider = {0};
+    struct elm_lifecycle_request request;
+    struct elm_lifecycle_response response;
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+
+    memset(&request, 0, sizeof(request));
+    request.cell_id = cell_id;
+    if (require_mgr_payload(ELM_MGR_CALL_DETACH_CELL, &request, sizeof(request), out, out_len,
+                            &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(response)) {
+        return fail_msg("detach", "bad detach payload size");
+    }
+    memcpy(&response, payload, sizeof(response));
+    if (response.status != ELM_MGR_STATUS_OK || response.final_state != ELM_STATE_RETIRED) {
+        return fail_msg("detach", "detach failed");
+    }
+    return 0;
+}
+
+static int run_dynamic_provider_query(uint8_t *out, size_t out_len)
+{
+    struct elm_provider_port_register_request register_request;
+    struct elm_provider_port_register_response register_response;
+    struct elm_provider_port_unregister_request unregister_request;
+    struct elm_provider_port_record provider = {0};
     struct elm_provider_snapshot_request snapshot_request;
     struct elm_provider_snapshot_header snapshot_header;
     struct elm_nexus_bind_request bind_request;
     struct elm_nexus_bind_response bind_response;
-    struct elm_call_frame call;
-    struct elm_provider_invoke_response invoke_response;
     const uint8_t *payload = NULL;
     uint32_t payload_len = 0;
-    const char *device_contract = "device.discovered@1";
-    const char *vfs_contract = "vfs.lookup@1";
+    const char *contract = "elm.smoke.dynamic@1";
+    uint64_t cell_id = 0;
 
-    int found = find_provider_port(out, out_len, device_contract, &device_provider);
-    if (found < 0) {
+    if (load_minimal_eki_cell(out, out_len, &cell_id) != 0) {
         return -1;
     }
-    if (found == 0) {
-        return fail_msg("provider-ports", "device.discovered@1 missing");
-    }
-    if ((device_provider.flags & ELM_PROVIDER_FLAG_KERNEL_BACKEND) == 0 ||
-        device_provider.port_id == 0 || device_provider.invokable == 0) {
-        return fail_msg("provider-ports", "bad device provider descriptor");
-    }
 
-    memset(&snapshot_request, 0, sizeof(snapshot_request));
-    snapshot_request.port_id = device_provider.port_id;
-    if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT, &snapshot_request,
-                            sizeof(snapshot_request), out, out_len, &payload,
+    memset(&register_request, 0, sizeof(register_request));
+    register_request.owner_cell_id = cell_id;
+    register_request.access_policy = ELM_PORT_ACCESS_PUBLIC;
+    register_request.direction = ELM_FLOW_CONTROL;
+    register_request.mode = ELM_FLOW_SHARED;
+    register_request.contract_len = (uint16_t)strlen(contract);
+    memcpy(register_request.contract, contract, register_request.contract_len);
+    if (require_mgr_payload(ELM_MGR_CALL_REGISTER_PROVIDER_PORT, &register_request,
+                            sizeof(register_request), out, out_len, &payload,
                             &payload_len) != 0) {
         return -1;
     }
-    if (payload_len < sizeof(snapshot_header)) {
-        return fail_msg("provider-snapshot", "bad snapshot payload size");
+    if (payload_len != sizeof(register_response)) {
+        return fail_msg("provider-register", "bad register payload size");
     }
-    memcpy(&snapshot_header, payload, sizeof(snapshot_header));
-    if (snapshot_header.abi_version != ELM_CTL_ABI_VERSION ||
-        snapshot_header.header_size != sizeof(snapshot_header) ||
-        snapshot_header.status != ELM_MGR_STATUS_OK ||
-        snapshot_header.port_id != device_provider.port_id ||
-        snapshot_header.flags != 0 || snapshot_header.reserved != 0 ||
-        payload_len != sizeof(snapshot_header) + snapshot_header.payload_len) {
-        return fail_msg("provider-snapshot", "unexpected device snapshot status");
-    }
-    if (validate_device_discovery_payload("device-snapshot", payload + sizeof(snapshot_header),
-                                          snapshot_header.payload_len) != 0) {
-        return -1;
+    memcpy(&register_response, payload, sizeof(register_response));
+    if (register_response.status != ELM_MGR_STATUS_OK || register_response.port_id == 0 ||
+        register_response.owner_cell_id != cell_id) {
+        return fail_msg("provider-register", "dynamic provider rejected");
     }
 
-    memset(&bind_request, 0, sizeof(bind_request));
-    bind_request.cell_id = ELM_MGR_BUILTIN_ID;
-    bind_request.port_id = device_provider.port_id;
-    bind_request.contract_len = (uint16_t)strlen(device_contract);
-    memcpy(bind_request.contract, device_contract, bind_request.contract_len);
-    if (require_mgr_payload(ELM_MGR_CALL_COMMIT_BIND, &bind_request, sizeof(bind_request),
-                            out, out_len, &payload, &payload_len) != 0) {
-        return -1;
-    }
-    if (payload_len != sizeof(bind_response)) {
-        return fail_msg("provider-bind", "bad bind payload size");
-    }
-    memcpy(&bind_response, payload, sizeof(bind_response));
-    if (bind_response.status != ELM_MGR_STATUS_OK || bind_response.allowed == 0 ||
-        bind_response.binding_id == 0) {
-        return fail_msg("provider-bind", "subsystem provider bind rejected");
-    }
-
-    memset(&call, 0, sizeof(call));
-    call.binding_id = bind_response.binding_id;
-    call.call_id = 2;
-    call.opcode = ELM_DEV_DISCOVERY_OPCODE_QUERY;
-    if (require_mgr_payload(ELM_MGR_CALL_INVOKE_PROVIDER, &call, sizeof(call), out, out_len,
-                            &payload, &payload_len) != 0) {
-        return -1;
-    }
-    if (payload_len != sizeof(invoke_response)) {
-        return fail_msg("provider-invoke", "bad invoke payload size");
-    }
-    memcpy(&invoke_response, payload, sizeof(invoke_response));
-    if (invoke_response.reply.status != ELM_CALL_STATUS_OK) {
-        return fail_msg("provider-invoke", "unexpected device provider status");
-    }
-    if (validate_device_discovery_payload("device-invoke", invoke_response.reply.payload,
-                                          invoke_response.reply.payload_len) != 0) {
-        return -1;
-    }
-    printf("[elm-smoke] device discovery provider ok: port=%llu binding=%llu\n",
-           (unsigned long long)device_provider.port_id,
-           (unsigned long long)bind_response.binding_id);
-
-    found = find_provider_port(out, out_len, vfs_contract, &vfs_provider);
+    int found = find_provider_port(out, out_len, contract, &provider);
     if (found < 0) {
         return -1;
     }
-    if (found == 0) {
-        return fail_msg("provider-ports", "vfs.lookup@1 missing");
-    }
-    if ((vfs_provider.flags & ELM_PROVIDER_FLAG_KERNEL_BACKEND) == 0 ||
-        vfs_provider.port_id == 0 || vfs_provider.invokable == 0) {
-        return fail_msg("provider-ports", "bad vfs provider descriptor");
+    if (found == 0 || provider.port_id != register_response.port_id ||
+        provider.owner_cell_id != cell_id ||
+        (provider.flags & ELM_PROVIDER_FLAG_DYNAMIC) == 0 ||
+        (provider.flags & ELM_PROVIDER_FLAG_TODO_BACKEND) == 0 ||
+        (provider.flags & ELM_PROVIDER_FLAG_KERNEL_BACKEND) != 0 ||
+        provider.implemented != 0 || provider.invokable != 0) {
+        return fail_msg("provider-ports", "bad dynamic provider descriptor");
     }
 
     memset(&snapshot_request, 0, sizeof(snapshot_request));
-    snapshot_request.port_id = vfs_provider.port_id;
+    snapshot_request.port_id = provider.port_id;
     if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT, &snapshot_request,
                             sizeof(snapshot_request), out, out_len, &payload,
                             &payload_len) != 0) {
         return -1;
     }
     if (payload_len != sizeof(snapshot_header)) {
-        return fail_msg("provider-snapshot", "bad vfs snapshot payload size");
+        return fail_msg("provider-snapshot", "bad dynamic snapshot payload size");
     }
     memcpy(&snapshot_header, payload, sizeof(snapshot_header));
     if (snapshot_header.abi_version != ELM_CTL_ABI_VERSION ||
         snapshot_header.header_size != sizeof(snapshot_header) ||
-        snapshot_header.status != ELM_MGR_STATUS_UNSUPPORTED ||
-        snapshot_header.port_id != vfs_provider.port_id ||
-        snapshot_header.payload_len != 0 || snapshot_header.flags != 0 ||
-        snapshot_header.reserved != 0) {
-        return fail_msg("provider-snapshot", "unexpected vfs snapshot status");
-    }
-
-    memset(&snapshot_request, 0, sizeof(snapshot_request));
-    snapshot_request.port_id = vfs_provider.port_id;
-    snapshot_request.flags = ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED;
-    if (require_mgr_payload(ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT, &snapshot_request,
-                            sizeof(snapshot_request), out, out_len, &payload,
-                            &payload_len) != 0) {
-        return -1;
-    }
-    if (payload_len != sizeof(snapshot_header)) {
-        return fail_msg("provider-snapshot", "bad paged vfs snapshot payload size");
-    }
-    memcpy(&snapshot_header, payload, sizeof(snapshot_header));
-    if (snapshot_header.abi_version != ELM_CTL_ABI_VERSION ||
-        snapshot_header.header_size != sizeof(snapshot_header) ||
-        snapshot_header.status != ELM_MGR_STATUS_UNSUPPORTED ||
-        snapshot_header.port_id != vfs_provider.port_id ||
-        snapshot_header.payload_len != 0 || snapshot_header.flags != 0 ||
-        snapshot_header.reserved != 0) {
-        return fail_msg("provider-snapshot", "unexpected paged vfs snapshot status");
+        snapshot_header.status != ELM_MGR_STATUS_TODO ||
+        snapshot_header.port_id != provider.port_id || snapshot_header.payload_len != 0 ||
+        snapshot_header.flags != 0 || snapshot_header.reserved != 0) {
+        return fail_msg("provider-snapshot", "unexpected dynamic snapshot status");
     }
 
     memset(&bind_request, 0, sizeof(bind_request));
-    bind_request.cell_id = ELM_MGR_BUILTIN_ID;
-    bind_request.port_id = vfs_provider.port_id;
-    bind_request.contract_len = (uint16_t)strlen(vfs_contract);
-    memcpy(bind_request.contract, vfs_contract, bind_request.contract_len);
+    bind_request.cell_id = cell_id;
+    bind_request.port_id = provider.port_id;
+    bind_request.contract_len = (uint16_t)strlen(contract);
+    memcpy(bind_request.contract, contract, bind_request.contract_len);
+    if (require_mgr_payload(ELM_MGR_CALL_PREFLIGHT_BIND, &bind_request, sizeof(bind_request),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(bind_response)) {
+        return fail_msg("provider-bind", "bad dynamic preflight payload size");
+    }
+    memcpy(&bind_response, payload, sizeof(bind_response));
+    if (bind_response.status != ELM_MGR_STATUS_TODO || bind_response.allowed != 0 ||
+        bind_response.binding_id != 0 ||
+        (bind_response.blockers & ELM_POLICY_BLOCK_PORT_TODO) == 0) {
+        return fail_msg("provider-bind", "dynamic provider preflight did not report TODO");
+    }
+
     if (require_mgr_payload(ELM_MGR_CALL_COMMIT_BIND, &bind_request, sizeof(bind_request),
                             out, out_len, &payload, &payload_len) != 0) {
         return -1;
     }
     if (payload_len != sizeof(bind_response)) {
-        return fail_msg("provider-bind", "bad vfs bind payload size");
+        return fail_msg("provider-bind", "bad dynamic commit payload size");
     }
     memcpy(&bind_response, payload, sizeof(bind_response));
-    if (bind_response.status != ELM_MGR_STATUS_OK || bind_response.allowed == 0 ||
-        bind_response.binding_id == 0) {
-        return fail_msg("provider-bind", "vfs provider bind rejected");
+    if (bind_response.status != ELM_MGR_STATUS_TODO || bind_response.allowed != 0 ||
+        bind_response.binding_id != 0 ||
+        (bind_response.blockers & ELM_POLICY_BLOCK_PORT_TODO) == 0) {
+        return fail_msg("provider-bind", "dynamic provider commit did not preserve TODO boundary");
     }
 
-    memset(&call, 0, sizeof(call));
-    call.binding_id = bind_response.binding_id;
-    call.call_id = 3;
-    if (require_mgr_payload(ELM_MGR_CALL_INVOKE_PROVIDER, &call, sizeof(call), out, out_len,
-                            &payload, &payload_len) != 0) {
+    memset(&unregister_request, 0, sizeof(unregister_request));
+    unregister_request.port_id = provider.port_id;
+    if (require_mgr_payload(ELM_MGR_CALL_UNREGISTER_PROVIDER_PORT, &unregister_request,
+                            sizeof(unregister_request), out, out_len, &payload,
+                            &payload_len) != 0) {
         return -1;
     }
-    if (payload_len != sizeof(invoke_response)) {
-        return fail_msg("provider-invoke", "bad vfs invoke payload size");
+    if (payload_len != sizeof(register_response)) {
+        return fail_msg("provider-unregister", "bad unregister payload size");
     }
-    memcpy(&invoke_response, payload, sizeof(invoke_response));
-    if (invoke_response.reply.status != ELM_CALL_STATUS_UNSUPPORTED) {
-        return fail_msg("provider-invoke", "unexpected vfs provider status");
+    memcpy(&register_response, payload, sizeof(register_response));
+    if (register_response.status != ELM_MGR_STATUS_OK ||
+        register_response.port_id != provider.port_id || register_response.owner_cell_id != cell_id) {
+        return fail_msg("provider-unregister", "dynamic provider unregister rejected");
+    }
+    found = find_provider_port(out, out_len, contract, &provider);
+    if (found != 0) {
+        return fail_msg("provider-unregister", "dynamic provider still visible");
+    }
+    if (detach_cell(out, out_len, cell_id) != 0) {
+        return -1;
     }
 
-    printf("[elm-smoke] vfs provider todo boundary ok: port=%llu binding=%llu status=%d\n",
-           (unsigned long long)vfs_provider.port_id,
-           (unsigned long long)bind_response.binding_id, invoke_response.reply.status);
+    printf("[elm-smoke] dynamic provider todo boundary ok: cell=%llu port=%llu blocker=0x%llx\n",
+           (unsigned long long)cell_id, (unsigned long long)register_response.port_id,
+           (unsigned long long)bind_response.blockers);
     return 0;
 }
 
@@ -1312,9 +1485,11 @@ static int run_load_minimal_eki(uint8_t *out, size_t out_len)
     struct elm_load_cell_response load;
     struct elm_lifecycle_request detach_request;
     struct elm_lifecycle_response detach;
+    struct elm_cell_snapshot loaded_cell;
     const uint8_t *payload = NULL;
     uint32_t payload_len = 0;
     size_t image_len = 0;
+    ssize_t snapshot_len = 0;
 
     if (build_minimal_eki(image, sizeof(image), &image_len) != 0) {
         return -1;
@@ -1340,6 +1515,17 @@ static int run_load_minimal_eki(uint8_t *out, size_t out_len)
     }
     printf("[elm-smoke] load minimal EKI ok: cell=%llu status=%d state=%u\n",
            (unsigned long long)load.cell_id, load.status, load.final_state);
+
+    if (read_snapshot(out, out_len, &snapshot_len) != 0) {
+        return -1;
+    }
+    if (find_snapshot_cell(out, (size_t)snapshot_len, load.cell_id, &loaded_cell) != 0) {
+        return fail_msg("load-eki", "loaded cell missing from snapshot");
+    }
+    if (loaded_cell.parent != ELM_MGR_BUILTIN_ID || loaded_cell.state != ELM_STATE_LOADED ||
+        loaded_cell.ebi_source != ELM_EBI_SOURCE_KIND_EKI) {
+        return fail_msg("load-eki", "loaded cell has wrong parent/state/source");
+    }
 
     memset(&detach_request, 0, sizeof(detach_request));
     detach_request.cell_id = load.cell_id;
@@ -1382,7 +1568,7 @@ static int run_mgr_runtime_query(uint8_t *out, size_t out_len)
     memcpy(&api, payload, sizeof(api));
     if (api.abi_version != ELM_CTL_ABI_VERSION ||
         api.record_entry_size != sizeof(struct elm_mgr_api_descriptor) ||
-        api.record_count < 21 ||
+        api.record_count < 17 ||
         payload_len != sizeof(api) + api.record_count * api.record_entry_size) {
         return fail_msg("api-query", "bad registry");
     }
@@ -1487,6 +1673,9 @@ int main(void)
     if (run_core_query() != 0) {
         return 1;
     }
+    if (run_builtin_snapshot_query(out, sizeof(out)) != 0) {
+        return 1;
+    }
     if (run_policy_query(out, sizeof(out)) != 0) {
         return 1;
     }
@@ -1505,7 +1694,7 @@ int main(void)
     if (run_invoke_health_action(out, sizeof(out), binding_id, health_action) != 0) {
         return 1;
     }
-    if (run_subsystem_provider_query(out, sizeof(out)) != 0) {
+    if (run_dynamic_provider_query(out, sizeof(out)) != 0) {
         return 1;
     }
     if (run_mgr_runtime_query(out, sizeof(out)) != 0) {

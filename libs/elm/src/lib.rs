@@ -81,7 +81,9 @@ pub use graph::{
     BindingGraph, CapabilityBindingEdge, DependencyEdge, ExtensionEdge, ExtensionPoint,
     GraphRemovalReport, GraphValidationReport, ParentEdge,
 };
-pub use ids::{ActionId, BindingId, ELM_MGR_BUILTIN_ID, ElmId, Generation, LeaseId, PortId};
+pub use ids::{
+    ActionId, BindingId, ELM_EKI_BUILTIN_ID, ELM_MGR_BUILTIN_ID, ElmId, Generation, LeaseId, PortId,
+};
 pub use lease::{LeaseKind, LeaseRegistry, LeaseRights, LeaseState, ResourceLease};
 pub use manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
 pub use menu::{

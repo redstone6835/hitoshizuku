@@ -8,20 +8,21 @@ use alloc::vec::Vec;
 use elm_model::{
     ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_CALL_STATUS_BUSY,
     ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
-    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED, ELM_HEALTH_CHECK_AUDITS,
-    ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS,
-    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
-    ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RUNTIME_PORTS,
-    ELM_HEALTH_CHECK_TODO_REGISTRY, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
-    ELM_HEALTH_DETAIL_DANGLING_REFERENCE, ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
-    ELM_HEALTH_DETAIL_GRAPH_INVALID, ELM_HEALTH_DETAIL_KIND_MISMATCH,
-    ELM_HEALTH_DETAIL_MISSING_OBJECT, ELM_HEALTH_DETAIL_SEQUENCE_INVALID,
-    ELM_HEALTH_DETAIL_STATE_INVALID, ELM_LIFECYCLE_REASON_CELL_NOT_FOUND,
-    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
-    ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_LIFECYCLE_REASON_INVALID_STATE,
-    ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NATIVE_TODO, ELM_LIFECYCLE_REASON_NONE,
-    ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND,
-    ELM_MGR_ACTION_EVENT_READ, ELM_MGR_ACTION_EVENT_SUBSCRIBE, ELM_MGR_ACTION_EVENT_UNSUBSCRIBE,
+    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED, ELM_EKI_BUILTIN_ID,
+    ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
+    ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_MENU,
+    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROVIDERS,
+    ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_TODO_REGISTRY,
+    ELM_HEALTH_DETAIL_CONTRACT_INVALID, ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT, ELM_HEALTH_DETAIL_GRAPH_INVALID,
+    ELM_HEALTH_DETAIL_KIND_MISMATCH, ELM_HEALTH_DETAIL_MISSING_OBJECT,
+    ELM_HEALTH_DETAIL_SEQUENCE_INVALID, ELM_HEALTH_DETAIL_STATE_INVALID,
+    ELM_LIFECYCLE_REASON_CELL_NOT_FOUND, ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+    ELM_LIFECYCLE_REASON_HAS_DEPENDENTS, ELM_LIFECYCLE_REASON_HOOK_FAILED,
+    ELM_LIFECYCLE_REASON_INVALID_STATE, ELM_LIFECYCLE_REASON_LEASE_BUSY,
+    ELM_LIFECYCLE_REASON_NATIVE_TODO, ELM_LIFECYCLE_REASON_NONE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
+    ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_EVENT_READ,
+    ELM_MGR_ACTION_EVENT_SUBSCRIBE, ELM_MGR_ACTION_EVENT_UNSUBSCRIBE,
     ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_QUERY,
     ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
     ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
@@ -88,6 +89,7 @@ use super::native::LoadedElmImage;
 use super::ports::PortRuntime;
 
 pub(crate) const ELM_MGR_ID: ElmId = ELM_MGR_BUILTIN_ID;
+pub(crate) const ELM_EKI_ID: ElmId = ELM_EKI_BUILTIN_ID;
 const ELM_CORE_LOG_PORT_ID: PortId = PortId(1);
 const ELM_CORE_EVENT_PORT_ID: PortId = PortId(2);
 const ELM_MGR_MENU_PORT_ID: PortId = PortId(3);
@@ -623,8 +625,48 @@ impl ElmCore {
             owned_bindings: Vec::new(),
             owned_menu_items: Vec::new(),
         });
+        let eki_manifest = ElmManifest::new(
+            ElmName::new("eki")?,
+            ElmVersion::new("0.1.0")?,
+            ElmKind::Service,
+        );
+        let eki_unit = ElmEbiUnit::new(eki_manifest, ElmEbiTarget::new(ElmEbiArch::Any))
+            .with_lifecycle_hooks(ElmEbiLifecycleHooks::rust_context_result_v1());
+        eki_unit
+            .validate(ElmEbiArch::Any)
+            .map_err(|_| ElmError::InvalidTransition)?;
+        self.graph
+            .insert_cell(ELM_EKI_ID, eki_unit.manifest.clone())?;
+        self.graph.set_parent(ELM_EKI_ID, ELM_MGR_ID)?;
+        self.cells.push(CellRuntime {
+            id: ELM_EKI_ID,
+            parent: Some(ELM_MGR_ID),
+            state: ElmState::Active,
+            kind: eki_unit.manifest.kind,
+            generation: Generation::FIRST,
+            name: eki_unit.manifest.name.as_str().to_string(),
+            ebi_source: ElmEbiSourceKind::Builtin,
+            ebi_arch: eki_unit.target.arch,
+            ebi_status: ElmEbiLoadStatus::Ok,
+            has_native_code: false,
+            native_segment_count: eki_unit.segments.len() as u16,
+            native_import_count: eki_unit.imports.len() as u16,
+            native_export_count: eki_unit.exports.len() as u16,
+            lifecycle_hooks_declared: eki_unit.lifecycle_hooks.is_some(),
+            lifecycle_executor_ready: true,
+            lifecycle_initialized: true,
+            lifecycle_finalized: false,
+            resource_budget: ElmResourceBudget::DEFAULT,
+            native_faults: 0,
+            isolated: false,
+            isolation_blocker: 0,
+            owned_bindings: Vec::new(),
+            owned_menu_items: Vec::new(),
+        });
         self.emit(TopologyEventKind::CellAdded, Some(ELM_MGR_ID));
         self.emit(TopologyEventKind::CellStateChanged, Some(ELM_MGR_ID));
+        self.emit(TopologyEventKind::CellAdded, Some(ELM_EKI_ID));
+        self.emit(TopologyEventKind::CellStateChanged, Some(ELM_EKI_ID));
         self.register_builtin_ports();
         self.register_builtin_mgr_actions()?;
         self.register_builtin_mgr_api();
@@ -2858,7 +2900,7 @@ impl ElmCore {
     // 内核内部测试和内建路径可直接提交 EBI unit；外部通道必须先经过 Source 分发。
     #[allow(dead_code)]
     pub fn load_ebi_unit(&mut self, unit: ElmEbiUnit, arch: ElmEbiArch) -> ElmLoadCellResponse {
-        self.load_ebi_unit_inner(unit, arch, None)
+        self.load_ebi_unit_inner(unit, arch, ElmEbiSourceKind::Memory, None)
     }
 
     pub fn load_ebi_image(&mut self, image: ElmEbiImage, arch: ElmEbiArch) -> ElmLoadCellResponse {
@@ -2866,7 +2908,7 @@ impl ElmCore {
             return ElmLoadCellResponse::failed(status);
         }
         if !image.has_code_segment() {
-            return self.load_ebi_unit_inner(image.unit, arch, None);
+            return self.load_ebi_unit_inner(image.unit, arch, ElmEbiSourceKind::Eki, None);
         }
         let mut topology = match self.preflight_ebi_topology(&image.unit) {
             Ok(topology) => topology,
@@ -3417,13 +3459,14 @@ impl ElmCore {
         arch: ElmEbiArch,
         executor: &mut dyn ElmLifecycleExecutor,
     ) -> ElmLoadCellResponse {
-        self.load_ebi_unit_inner(unit, arch, Some(executor))
+        self.load_ebi_unit_inner(unit, arch, ElmEbiSourceKind::Memory, Some(executor))
     }
 
     fn load_ebi_unit_inner(
         &mut self,
         unit: ElmEbiUnit,
         arch: ElmEbiArch,
+        source: ElmEbiSourceKind,
         mut executor: Option<&mut dyn ElmLifecycleExecutor>,
     ) -> ElmLoadCellResponse {
         if let Err(status) = unit.validate(arch) {
@@ -3441,14 +3484,7 @@ impl ElmCore {
         let image_arch = unit.target.arch;
         let id = self.alloc_cell_id();
 
-        if let Err(err) = self.insert_loaded_cell(
-            id,
-            manifest,
-            name,
-            image_arch,
-            &unit,
-            ElmEbiSourceKind::Memory,
-        ) {
+        if let Err(err) = self.insert_loaded_cell(id, manifest, name, image_arch, &unit, source) {
             log::error!("[elm] EBI cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
         }
@@ -3957,8 +3993,16 @@ impl ElmCore {
             static_flags,
             ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
             0,
-            "source.remote_soyo",
-            "Remote Source 和 soyo EBI 产出层属于后续文件分发主线",
+            "projection.soyo_profile",
+            "soyo 只能通过 Projection provider 产出 EBI，不能成为 ELM Core 内建来源",
+        ));
+        records.push(todo_record(
+            ELM_TODO_KIND_SOURCE,
+            static_flags,
+            ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+            0,
+            "provenance.external_resolver",
+            "远端分发由用户态或外部解析器完成，内核只接收已解析本地输入和来源证明",
         ));
         records.push(todo_record(
             ELM_TODO_KIND_NATIVE,
@@ -4745,7 +4789,7 @@ impl ElmCore {
                 .as_str(),
             );
         }
-        out.push_str("TODO(elm): Remote/soyo 分发、trap trampoline、子系统 provider 和 Rust 开发框架仍是后续主线。\n");
+        out.push_str("TODO(elm): soyo 投影、外部来源证明、trap trampoline、子系统自注册 provider 和 Rust 开发框架仍是后续主线。\n");
         out.into_bytes()
     }
 

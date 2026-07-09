@@ -1,8 +1,9 @@
 //! EBI 二进制装载接口协议。
 //!
 //! EBI 不是文件格式。EKI、未来的投影产物、启动期内建对象或测试内存对象
-//! 都可以作为 EBI Source 产出这里定义的协议对象；ELM Core 只消费这些对象，
-//! 不理解任何具体镜像或容器布局。
+//! 都可以通过 EBI Source 产出这里定义的协议对象；ELM Core 只消费这些对象，
+//! 不理解任何具体镜像或容器布局。当前内核把 EKI 投影能力归属到内建 `eki`
+//! 子单元，而不是让根管理器或 Core 直接拥有某种文件格式。
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -64,7 +65,6 @@ pub enum ElmEbiSourceKind {
     Projection = 2,
     Builtin = 3,
     Memory = 4,
-    Remote = 5,
 }
 
 impl ElmEbiSourceKind {
@@ -74,7 +74,6 @@ impl ElmEbiSourceKind {
             2 => Some(Self::Projection),
             3 => Some(Self::Builtin),
             4 => Some(Self::Memory),
-            5 => Some(Self::Remote),
             _ => None,
         }
     }

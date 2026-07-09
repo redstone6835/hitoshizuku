@@ -19,6 +19,7 @@ pub struct LeaseId(pub u64);
 pub struct Generation(pub u64);
 
 pub const ELM_MGR_BUILTIN_ID: ElmId = ElmId(1);
+pub const ELM_EKI_BUILTIN_ID: ElmId = ElmId(2);
 
 impl Generation {
     pub const FIRST: Self = Self(1);

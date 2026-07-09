@@ -64,7 +64,6 @@ fn signal_for_user_exception(code: usize) -> sched::SignalNumber {
     }
 }
 
-
 fn terminate_user_exception(
     tf: &TrapFrame,
     code: usize,
@@ -263,14 +262,11 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 0
             }
         }
-    } else if code == EXC_ILLEGAL_INST
-        && from_user
-        && {
-            let vec = crate::riscv64::vector::enable_user_vector_if_needed(tf);
-            let fpu = enable_user_fpu_if_needed(tf);
-            vec || fpu
-        }
-    {
+    } else if code == EXC_ILLEGAL_INST && from_user && {
+        let vec = crate::riscv64::vector::enable_user_vector_if_needed(tf);
+        let fpu = enable_user_fpu_if_needed(tf);
+        vec || fpu
+    } {
         // 用户首次触碰浮点状态时按需打开 FS，保持 sepc 不变让原指令重试。
         tf_ptr
     } else if code == EXC_BREAKPOINT {

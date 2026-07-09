@@ -5,7 +5,7 @@
 
 use alloc::vec::Vec;
 
-use elm_model::{ElmEbiArch, ElmEbiImage, ElmEbiLoadStatus};
+use elm_model::{ElmEbiArch, ElmEbiImage, ElmEbiLoadStatus, parse_eki_image};
 use sched::sync::Spinlock;
 
 pub(crate) type ElmProjectionSourceProvider =
@@ -48,4 +48,14 @@ pub(crate) fn project_ebi_image(
         Some(provider) => provider(payload, arch),
         None => Err(ElmEbiLoadStatus::RuntimeRejected),
     }
+}
+
+pub(crate) fn project_builtin_eki_image(
+    payload: &[u8],
+    arch: ElmEbiArch,
+) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
+    // 这是内建 `eki` 子单元的投影入口；管理通道只选择 Source，不直接拥有格式解析。
+    let image = parse_eki_image(payload)?;
+    image.validate(arch)?;
+    Ok(image)
 }

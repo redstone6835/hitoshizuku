@@ -2227,6 +2227,7 @@ fn ebi_source_request_is_fixed_layout() {
     assert_eq!(request.flags, 0);
     assert_eq!(request.payload_len, 128);
     assert_eq!(request.reserved, 0);
+    assert_eq!(ElmEbiSourceKind::from_raw(5), None);
 }
 
 #[test]

@@ -229,18 +229,18 @@ const char *elmctl_status_name(int32_t status)
 const char *elmctl_state_name(uint32_t state)
 {
     switch (state) {
-    case 1: return "Discovered";
-    case 2: return "Verified";
-    case 3: return "Loaded";
-    case 4: return "Linked";
-    case 5: return "Ready";
-    case 6: return "Active";
-    case 7: return "Quiescing";
-    case 8: return "Paused";
-    case 9: return "Detached";
-    case 10: return "Retired";
-    case 11: return "Faulted";
-    case 12: return "Quarantined";
+    case ELM_STATE_DISCOVERED: return "Discovered";
+    case ELM_STATE_VERIFIED: return "Verified";
+    case ELM_STATE_LOADED: return "Loaded";
+    case ELM_STATE_LINKED: return "Linked";
+    case ELM_STATE_READY: return "Ready";
+    case ELM_STATE_ACTIVE: return "Active";
+    case ELM_STATE_QUIESCING: return "Quiescing";
+    case ELM_STATE_PAUSED: return "Paused";
+    case ELM_STATE_DETACHED: return "Detached";
+    case ELM_STATE_RETIRED: return "Retired";
+    case ELM_STATE_FAULTED: return "Faulted";
+    case ELM_STATE_QUARANTINED: return "Quarantined";
     default: return "Unknown";
     }
 }
@@ -248,14 +248,14 @@ const char *elmctl_state_name(uint32_t state)
 const char *elmctl_kind_name(uint32_t kind)
 {
     switch (kind) {
-    case 1: return "Manager";
-    case 2: return "Service";
-    case 3: return "Driver";
-    case 4: return "Extension";
-    case 5: return "Filesystem";
-    case 6: return "Network";
-    case 7: return "Debug";
-    case 255: return "Other";
+    case ELM_KIND_MANAGER: return "Manager";
+    case ELM_KIND_SERVICE: return "Service";
+    case ELM_KIND_DRIVER: return "Driver";
+    case ELM_KIND_EXTENSION: return "Extension";
+    case ELM_KIND_FILESYSTEM: return "Filesystem";
+    case ELM_KIND_NETWORK: return "Network";
+    case ELM_KIND_DEBUG: return "Debug";
+    case ELM_KIND_OTHER: return "Other";
     default: return "Unknown";
     }
 }
@@ -263,12 +263,11 @@ const char *elmctl_kind_name(uint32_t kind)
 const char *elmctl_source_name(uint32_t source)
 {
     switch (source) {
-    case ELM_EBI_SOURCE_KIND_EKI: return "Eki";
-    case ELM_EBI_SOURCE_KIND_PROJECTION: return "Projection";
-    case ELM_EBI_SOURCE_KIND_BUILTIN: return "Builtin";
-    case ELM_EBI_SOURCE_KIND_MEMORY: return "Memory";
-    case ELM_EBI_SOURCE_KIND_REMOTE: return "Remote";
-    default: return "Unknown";
+    case ELM_EBI_SOURCE_KIND_EKI: return "eki";
+    case ELM_EBI_SOURCE_KIND_PROJECTION: return "projection";
+    case ELM_EBI_SOURCE_KIND_BUILTIN: return "<builtin>";
+    case ELM_EBI_SOURCE_KIND_MEMORY: return "memory";
+    default: return "unknown";
     }
 }
 

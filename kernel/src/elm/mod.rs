@@ -13,7 +13,6 @@ mod native;
 mod ports;
 mod snapshot;
 mod source;
-mod subsystems;
 pub(crate) mod syscall;
 #[cfg(feature = "kernel-tests")]
 mod tests;
@@ -21,7 +20,6 @@ mod tests;
 pub(crate) fn init_builtin_mgr() {
     match core::with_core(|core| {
         core.init_builtin_mgr()?;
-        subsystems::register_builtin_provider_specs(core)?;
         Ok::<(), elm_model::ElmError>(())
     }) {
         Ok(()) => {
