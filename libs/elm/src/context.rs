@@ -3,8 +3,9 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::ids::{ElmId, Generation};
-use crate::mgr::ELM_CELL_POLICY_ALLOW_ALL;
 use crate::state::ElmState;
+
+const ELM_CONTEXT_ALLOWED_ACTIONS_ALL: u32 = (1 << 9) - 1;
 
 pub const ELM_NATIVE_HOOK_CONTEXT_ABI_VERSION: u16 = 1;
 pub const ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION: u16 = 1;
@@ -64,7 +65,7 @@ impl ElmContext {
             state,
             phase,
             flags,
-            allowed_actions: ELM_CELL_POLICY_ALLOW_ALL,
+            allowed_actions: ELM_CONTEXT_ALLOWED_ACTIONS_ALL,
         }
     }
 
@@ -148,7 +149,7 @@ static CURRENT_PHASE: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
 static CURRENT_FLAGS: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU32::new(0) }; ELM_CONTEXT_SLOT_COUNT];
 static CURRENT_ALLOWED_ACTIONS: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
-    [const { AtomicU32::new(ELM_CELL_POLICY_ALLOW_ALL) }; ELM_CONTEXT_SLOT_COUNT];
+    [const { AtomicU32::new(ELM_CONTEXT_ALLOWED_ACTIONS_ALL) }; ELM_CONTEXT_SLOT_COUNT];
 
 #[derive(Debug)]
 pub struct ElmCurrentContextGuard {
@@ -302,7 +303,7 @@ fn clear_context_slot(slot: usize) {
     CURRENT_STATE[slot].store(0, Ordering::Release);
     CURRENT_PHASE[slot].store(0, Ordering::Release);
     CURRENT_FLAGS[slot].store(0, Ordering::Release);
-    CURRENT_ALLOWED_ACTIONS[slot].store(ELM_CELL_POLICY_ALLOW_ALL, Ordering::Release);
+    CURRENT_ALLOWED_ACTIONS[slot].store(ELM_CONTEXT_ALLOWED_ACTIONS_ALL, Ordering::Release);
 }
 
 fn phase_to_raw(phase: ElmLifecyclePhase) -> u32 {

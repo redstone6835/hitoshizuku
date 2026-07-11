@@ -1235,6 +1235,7 @@ pub(crate) fn invoke_provider_handler(
     frame: ElmCallFrame,
     deadline_ns: u64,
     allowed_actions: u32,
+    reply_flags_mask: u32,
 ) -> ElmReplyFrame {
     if address == 0 {
         return ElmReplyFrame::empty(
@@ -1287,7 +1288,7 @@ pub(crate) fn invoke_provider_handler(
         || call.reserved0 != 0
         || call.reply.binding_id != frame.binding_id
         || call.reply.call_id != frame.call_id
-        || call.reply.flags != 0
+        || call.reply.flags & !reply_flags_mask != 0
         || call.reply.reserved0 != 0
         || call.reply.reserved1 != 0
         || usize::from(call.reply.payload_len) > call.reply.payload.len()

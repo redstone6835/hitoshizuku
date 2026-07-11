@@ -685,8 +685,6 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
         hash.u64(segment.file_size);
         hash.u64(segment.mem_size);
         hash.u64(segment.align);
-        hash.u32(segment.source_index);
-        hash.u64(segment.source_offset);
         hash.u64(segment.content_hash);
     }
 
@@ -767,7 +765,6 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
     hash.u64(image.payloads.len() as u64);
     for payload in &image.payloads {
         hash.u32(payload.segment_index);
-        hash.u32(payload.source_index);
         hash.u32(segment_kind_raw(payload.kind));
         hash.u64(payload.file_size);
         hash.u64(payload.mem_size);

@@ -4,7 +4,9 @@
 //! 再通过根表取得运行时表或按 identifier 查询其他命名空间，避免把内核实现符号直接
 //! 暴露给模块。这里使用固定布局和显式函数指针；Rust 开发包在其上提供安全包装。
 
+#[cfg(feature = "runtime-model")]
 use alloc::string::String;
+#[cfg(feature = "runtime-model")]
 use core::fmt::Write as _;
 
 use crate::context::ElmLifecyclePhase;
@@ -175,6 +177,7 @@ unsafe impl Sync for ElmApiRootV1 {}
 ///
 /// 清单直接读取真实 Rust 类型布局，不依赖人工维护的版本字符串。任何字段顺序、
 /// 大小、对齐、函数签名或表能力变化都会改变清单摘要，从而在装载前拒绝不兼容镜像。
+#[cfg(feature = "runtime-model")]
 pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
     macro_rules! write_layout {
         ($out:expr, $ty:ty, $name:literal, [$($field:ident),+ $(,)?]) => {{

@@ -1,28 +1,34 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::path::Path;
 
 use ed25519_dalek::{Signer, SigningKey};
 
 use elm::{
-    ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
-    ELM_API_VERSION_V1,
     ELM_EBI_ABI_VERSION, ELM_EBI_RUST_ABI_VERSION as RUST_ABI, ELM_EBI_SEGMENT_FLAG_EXECUTE,
     ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SEGMENT_FLAG_ZERO_FILL,
-    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_FORMAT_VERSION,
-    ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE,
-    ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_HEADER_SIZE,
-    ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC,
-    ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
-    ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN,
-    ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE, ELM_PROOF_ABI_VERSION,
-    ELM_PROOF_ED25519_SIGNATURE_LEN, ELM_PROOF_SHA256_LEN,
-    ELM_PROOF_SOURCE_IDENTIFIER_LEN, ELM_RUNTIME_LOG_EXPORT_CONTRACT, ELM_RUNTIME_LOG_EXPORT_NAME,
-    ELM_RUNTIME_LOG_EXPORT_VERSION, ElmEbiArch, ElmEbiRelocationKind, ElmEbiSegmentKind,
-    ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiProofV1, ElmEkiBlockKind, ElmKind,
-    ElmPanicStrategy, ElmPortAccessPolicy, ElmRustAbiFingerprintV1, ElmTrustAnchor, ElmTrustStore,
-    FlowDirection, FlowMode, canonical_ebi_digest, kernel_api_manifest_v1, parse_eki_image, sha256,
-    sha256_with_zeroed_range, sha256_with_zeroed_ranges,
+    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE,
+    ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION,
+    ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE,
+    ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN,
+    ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION,
+    ELM_PROOF_ED25519_SIGNATURE_LEN, ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN,
+    ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiArch, ElmEbiProofV1, ElmEbiRelocationKind,
+    ElmEbiSegmentKind, ElmEkiBlockKind, ElmKind, ElmPanicStrategy, ElmRustAbiFingerprintV1,
+    ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest, kernel_api_manifest_v1, parse_eki_image,
+    sha256, sha256_with_zeroed_range, sha256_with_zeroed_ranges,
+};
+
+mod project;
+mod rust_metadata;
+
+use project::{
+    ElmProjectDependency, ElmProjectManifest, cargo_build, scaffold_project, sync_framework,
+};
+use rust_metadata::{
+    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, NativeMetadata, ProviderSpec,
 };
 
 const ELM_TOOL_PAGE_SIZE: u64 = 4096;
@@ -40,6 +46,9 @@ const BLOCK_LIFECYCLE_HOOKS: u32 = ElmEkiBlockKind::LifecycleHooks as u32;
 const BLOCK_SYMBOL_LOCATIONS: u32 = ElmEkiBlockKind::SymbolLocations as u32;
 const BLOCK_RELOCATIONS: u32 = ElmEkiBlockKind::Relocation as u32;
 const BLOCK_PROVIDER_PORTS: u32 = ElmEkiBlockKind::ProviderPorts as u32;
+const BLOCK_DEPENDENCIES: u32 = ElmEkiBlockKind::Dependencies as u32;
+const BLOCK_EXTENSION_POINTS: u32 = ElmEkiBlockKind::ExtensionPoints as u32;
+const BLOCK_EXTENSIONS: u32 = ElmEkiBlockKind::Extensions as u32;
 const BLOCK_API_COMPATIBILITY: u32 = ElmEkiBlockKind::ApiCompatibility as u32;
 const BLOCK_ABI_FINGERPRINT: u32 = ElmEkiBlockKind::AbiFingerprint as u32;
 const BLOCK_PROOF: u32 = ElmEkiBlockKind::Signature as u32;
@@ -52,265 +61,26 @@ const EKI_SEGMENT_RECORD_SIZE: usize = 32;
 const EKI_SYMBOL_RECORD_SIZE: usize = 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_SYMBOL_LOCATION_RECORD_SIZE: usize = 32 + ELM_EBI_SYMBOL_NAME_LEN;
 const EKI_RELOCATION_RECORD_SIZE: usize = 32;
-
-const GENERATED_ELMMGR_CARGO_TOML: &str = r#"[package]
-name = "elmmgr"
-version = "0.1.0"
-edition = "2024"
-license = "GPL-3.0-only"
-
-[lib]
-path = "src/lib.rs"
-
-[workspace]
-"#;
-
-const GENERATED_ELMMGR_LIB_RS: &str = r#"#![no_std]
-
-//! 由 `elm-tools generate-elmmgr` 生成的独立 ELM API 包。
-//! 本包只描述稳定 API 根，不依赖内核源码或工作区 crate。
-
-pub mod api {
-    pub const VERSION: u16 = 1;
-    pub const ROOT_MAGIC: u64 = u64::from_le_bytes(*b"ELMAPI1\0");
-    pub const FEATURE_DISPATCH: u64 = 1 << 0;
-    pub const FEATURE_CONTEXT: u64 = 1 << 1;
-    pub const FEATURE_NAMESPACE_QUERY: u64 = 1 << 2;
-    pub const FEATURE_LOG: u64 = 1 << 3;
-    pub const FEATURE_ABORT: u64 = 1 << 4;
-    pub const FEATURE_MANAGED_CALL: u64 = 1 << 5;
-    pub const ABORT_REASON_PANIC: u32 = 4;
-    pub const STATUS_BUFFER_TOO_SMALL: i32 = -4;
-    pub const FRAME_PAYLOAD_LEN: usize = 256;
-
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct CallFrame {
-        pub binding_id: u64,
-        pub call_id: u64,
-        pub opcode: u32,
-        pub flags: u32,
-        pub payload_len: u16,
-        pub reserved0: u16,
-        pub reserved1: u32,
-        pub payload: [u8; FRAME_PAYLOAD_LEN],
-    }
-
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ReplyFrame {
-        pub binding_id: u64,
-        pub call_id: u64,
-        pub status: i32,
-        pub flags: u32,
-        pub payload_len: u16,
-        pub reserved0: u16,
-        pub reserved1: u32,
-        pub payload: [u8; FRAME_PAYLOAD_LEN],
-    }
-
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Context {
-        pub struct_size: u32,
-        pub flags: u32,
-        pub cell_id: u64,
-        pub parent_id: u64,
-        pub generation: u64,
-        pub state: u32,
-        pub phase: u32,
-        pub allowed_actions: u32,
-        pub reserved: u32,
-    }
-
-    impl Context {
-        pub const fn empty() -> Self {
-            Self {
-                struct_size: core::mem::size_of::<Self>() as u32,
-                flags: 0,
-                cell_id: 0,
-                parent_id: 0,
-                generation: 0,
-                state: 0,
-                phase: 0,
-                allowed_actions: 0,
-                reserved: 0,
-            }
-        }
-    }
-
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Namespace {
-        pub struct_size: u32,
-        pub flags: u32,
-        pub selected_version: u16,
-        pub reserved0: u16,
-        pub table_size: u32,
-        pub table_address: usize,
-        pub generation: u64,
-        pub capabilities: u64,
-    }
-
-    impl Namespace {
-        pub const fn empty() -> Self {
-            Self {
-                struct_size: core::mem::size_of::<Self>() as u32,
-                flags: 0,
-                selected_version: 0,
-                reserved0: 0,
-                table_size: 0,
-                table_address: 0,
-                generation: 0,
-                capabilities: 0,
-            }
-        }
-    }
-
-    type DispatchFn = extern "C" fn(u32, *const u8, usize, *mut u8, usize, *mut usize) -> i32;
-    type ContextFn = extern "C" fn(*mut Context) -> i32;
-    type LogFn = extern "C" fn(u32, *const u8, usize) -> i32;
-    type AbortFn = extern "C" fn(u32) -> !;
-    type InvokeManagedFn = extern "C" fn(u64, *const CallFrame, *mut ReplyFrame) -> i32;
-    type QueryNamespaceFn =
-        extern "C" fn(*const u8, usize, *const u16, usize, *mut Namespace) -> i32;
-
-    #[repr(C)]
-    struct RuntimeTable {
-        struct_size: u32,
-        abi_version: u16,
-        reserved0: u16,
-        features: u64,
-        dispatch: DispatchFn,
-        current_context: ContextFn,
-        log: LogFn,
-        abort_current: AbortFn,
-        invoke_managed: InvokeManagedFn,
-    }
-
-    #[repr(C)]
-    struct Root {
-        magic: u64,
-        struct_size: u32,
-        abi_version: u16,
-        selected_version: u16,
-        features: u64,
-        runtime_table: *const RuntimeTable,
-        runtime_table_size: u32,
-        reserved0: u32,
-        query_namespace: QueryNamespaceFn,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Error {
-        RootUnavailable,
-        IncompatibleRoot,
-        RuntimeUnavailable,
-        BufferTooSmall(usize),
-        Status(i32),
-    }
-
-    #[unsafe(no_mangle)]
-    #[unsafe(link_section = ".data.elm_imports")]
-    #[used]
-    pub static mut __ELM_API_ROOT_SLOT: usize = 0;
-
-    fn root() -> Result<&'static Root, Error> {
-        let address = unsafe { core::ptr::read_volatile(&raw const __ELM_API_ROOT_SLOT) };
-        if address == 0 {
-            return Err(Error::RootUnavailable);
-        }
-        let root = unsafe { &*(address as *const Root) };
-        if root.magic != ROOT_MAGIC
-            || root.abi_version != VERSION
-            || root.selected_version != VERSION
-            || root.struct_size < core::mem::size_of::<Root>() as u32
-        {
-            return Err(Error::IncompatibleRoot);
-        }
-        Ok(root)
-    }
-
-    fn runtime() -> Result<&'static RuntimeTable, Error> {
-        let root = root()?;
-        if root.runtime_table.is_null()
-            || root.runtime_table_size < core::mem::size_of::<RuntimeTable>() as u32
-        {
-            return Err(Error::RuntimeUnavailable);
-        }
-        let runtime = unsafe { &*root.runtime_table };
-        if runtime.abi_version != VERSION
-            || runtime.struct_size < core::mem::size_of::<RuntimeTable>() as u32
-        {
-            return Err(Error::RuntimeUnavailable);
-        }
-        Ok(runtime)
-    }
-
-    pub fn features() -> Result<u64, Error> {
-        Ok(root()?.features)
-    }
-
-    pub fn log(level: u32, message: &str) -> Result<(), Error> {
-        let status = (runtime()?.log)(level, message.as_ptr(), message.len());
-        if status == 0 { Ok(()) } else { Err(Error::Status(status)) }
-    }
-
-    pub fn abort_current(reason: u32) -> ! {
-        (runtime().unwrap_or_else(|_| loop { core::hint::spin_loop() }).abort_current)(reason)
-    }
-
-    pub fn invoke_managed(import_handle: u64, request: &CallFrame) -> Result<ReplyFrame, Error> {
-        let mut reply = ReplyFrame {
-            binding_id: request.binding_id,
-            call_id: request.call_id,
-            status: -4098,
-            flags: 0,
-            payload_len: 0,
-            reserved0: 0,
-            reserved1: 0,
-            payload: [0; FRAME_PAYLOAD_LEN],
-        };
-        let status = (runtime()?.invoke_managed)(import_handle, request, &mut reply);
-        if status == 0 { Ok(reply) } else { Err(Error::Status(status)) }
-    }
-
-    pub fn current_context() -> Result<Context, Error> {
-        let mut output = Context::empty();
-        let status = (runtime()?.current_context)(&mut output);
-        if status == 0 { Ok(output) } else { Err(Error::Status(status)) }
-    }
-
-    pub fn dispatch(kind: u32, input: &[u8], output: &mut [u8]) -> Result<(i32, usize), Error> {
-        let mut output_len = 0usize;
-        let status = (runtime()?.dispatch)(
-            kind,
-            input.as_ptr(),
-            input.len(),
-            output.as_mut_ptr(),
-            output.len(),
-            &mut output_len,
-        );
-        if status == STATUS_BUFFER_TOO_SMALL {
-            Err(Error::BufferTooSmall(output_len))
-        } else {
-            Ok((status, output_len))
-        }
-    }
-
-    pub fn query_namespace(identifier: &str, versions: &[u16]) -> Result<Namespace, Error> {
-        let mut output = Namespace::empty();
-        let status = (root()?.query_namespace)(
-            identifier.as_ptr(),
-            identifier.len(),
-            versions.as_ptr(),
-            versions.len(),
-            &mut output,
-        );
-        if status == 0 { Ok(output) } else { Err(Error::Status(status)) }
-    }
-}
-"#;
+const EKI_DEPENDENCY_RECORD_SIZE: usize = 8 + elm::ELM_EBI_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
+const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
+    16 + elm::ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
+const EKI_EXTENSION_RECORD_SIZE: usize =
+    24 + elm::ELM_EBI_NAME_LEN + elm::ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN * 2;
+const ELF_TYPE_DYN: u16 = 3;
+const ELF_SECTION_RELA: u32 = 4;
+const ELF_SECTION_REL: u32 = 9;
+const ELF_SECTION_FLAG_ALLOC: u64 = 1 << 1;
+const ELF_RELOCATION_RELATIVE: u32 = 3;
+const ELF_SYMBOL_TABLE: u32 = 2;
+const ELF_SYMBOL_BIND_GLOBAL: u8 = 1;
+const ELF_SYMBOL_TYPE_OBJECT: u8 = 1;
+const ELF_SYMBOL_TYPE_FUNCTION: u8 = 2;
+const ELF_SECTION_INDEX_UNDEFINED: u16 = 0;
+const ELF_PROGRAM_FLAG_EXECUTE: u32 = 1;
+const ELF_PROGRAM_FLAG_WRITE: u32 = 2;
+const ELF_PROGRAM_FLAG_READ: u32 = 4;
+const ELF_MAX_PROGRAM_HEADERS: u16 = 64;
+const ELF_MAX_SECTION_HEADERS: u16 = 4096;
 
 #[derive(Clone)]
 struct PackerBlock {
@@ -345,51 +115,10 @@ impl PackerBlock {
 }
 
 #[derive(Clone)]
-struct ImportSlotSpec {
-    slot_symbol: String,
-    import_name: String,
-    contract: String,
-    version: u32,
-}
-
-#[derive(Clone)]
-struct ExportSpec {
-    symbol: String,
-    contract: String,
-    version: u32,
-}
-
-#[derive(Clone)]
-struct ProviderSpec {
-    contract: String,
-    access: ElmPortAccessPolicy,
-    direction: FlowDirection,
-    mode: FlowMode,
-    handler_symbol: String,
-    snapshot_symbol: Option<String>,
-}
-
-#[derive(Clone)]
 struct ElmApiSpec {
     root_import_index: u32,
     versions: Vec<u16>,
     required_features: u64,
-}
-
-#[derive(Clone)]
-struct NativePackOptions {
-    out: String,
-    elf: String,
-    name: String,
-    version: String,
-    kind: ElmKind,
-    arch: Option<ElmEbiArch>,
-    entry: Option<String>,
-    menu: Option<(String, String, String)>,
-    import_slots: Vec<ImportSlotSpec>,
-    exports: Vec<ExportSpec>,
-    providers: Vec<ProviderSpec>,
-    elmapi: Option<ElmApiSpec>,
 }
 
 fn main() {
@@ -406,6 +135,9 @@ fn run() -> Result<(), String> {
         return Err("missing command".to_string());
     };
     match command {
+        "new" => cmd_new(&args[2..]),
+        "sync-framework" => cmd_sync_framework(&args[2..]),
+        "build" => cmd_build(&args[2..]),
         "pack-metadata" | "pack" => cmd_pack_metadata(&args[2..]),
         "pack-elf" => cmd_pack_elf(&args[2..]),
         "inspect" => cmd_inspect(&args[2..]),
@@ -413,7 +145,6 @@ fn run() -> Result<(), String> {
         "keygen" => cmd_keygen(&args[2..]),
         "sign" => cmd_sign(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
-        "generate-elmmgr" => cmd_generate_elmmgr(&args[2..]),
         "fingerprint-header" => cmd_fingerprint_header(&args[2..]),
         "help" | "-h" | "--help" => {
             usage();
@@ -425,29 +156,175 @@ fn run() -> Result<(), String> {
 
 fn usage() {
     eprintln!("elm-tools commands:");
+    eprintln!("  new <directory> --name <name> --kind <kind> --source <identifier>");
+    eprintln!("  sync-framework <project-directory>");
+    eprintln!(
+        "  build <project-directory> --arch <riscv64|loongarch64|all> --key <seed> --epoch <n>"
+    );
+    eprintln!("  build <project-directory> --arch <riscv64|loongarch64|all> --unsigned");
     eprintln!(
         "  pack-metadata <out.eki> <name> <version> <kind> [--menu <label> <description> <route>]"
     );
     eprintln!("  pack <out.eki> <name> <version> <kind> [--menu <label> <description> <route>]");
-    eprintln!(
-        "  pack-elf <out.eki> <image.elf> <name> <version> <kind> [--arch any|riscv64|loongarch64] [--entry <symbol>] [--menu <label> <description> <route>]"
-    );
-    eprintln!(
-        "           [--runtime-log-slot <slot-symbol>] [--import-slot <slot-symbol> <import-name> <contract> <version>]"
-    );
-    eprintln!(
-        "           [--elmapi-root-slot <slot-symbol> <versions-comma> <required-features>]"
-    );
-    eprintln!(
-        "           [--export <symbol> <contract> <version>] [--provider <contract> <access> <direction> <mode> <handler-symbol> <snapshot-symbol|->]"
-    );
+    eprintln!("  pack-elf <project-directory> <image.elf> <out.eki>");
     eprintln!("  inspect <file.eki>");
     eprintln!("  hash <in.eki> <out.eki>");
     eprintln!("  keygen <private-seed.bin> <public-key.bin>");
     eprintln!("  sign <in.eki> <out.eki> <private-seed.bin> <source-id> <release-epoch>");
     eprintln!("  verify <file.eki>");
-    eprintln!("  generate-elmmgr <output-directory>");
     eprintln!("  fingerprint-header <target-triple> <output-header>");
+}
+
+fn cmd_new(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        usage();
+        return Err("new 缺少目标目录".to_string());
+    }
+    let directory = Path::new(&args[0]);
+    let options = parse_named_options(&args[1..], &["--name", "--kind", "--source"])?;
+    scaffold_project(
+        directory,
+        required_option(&options, "--name")?,
+        required_option(&options, "--kind")?,
+        required_option(&options, "--source")?,
+    )?;
+    println!("created ELM project: {}", directory.display());
+    Ok(())
+}
+
+fn cmd_sync_framework(args: &[String]) -> Result<(), String> {
+    if args.len() != 1 {
+        usage();
+        return Err("sync-framework 参数无效".to_string());
+    }
+    sync_framework(Path::new(&args[0]))?;
+    println!("framework synchronized: {}", args[0]);
+    Ok(())
+}
+
+fn cmd_build(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        usage();
+        return Err("build 缺少工程目录".to_string());
+    }
+    let project = Path::new(&args[0]);
+    let mut arch = None;
+    let mut key = None;
+    let mut epoch = None;
+    let mut unsigned = false;
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--arch" => {
+                arch = Some(option_arg(args, index + 1, "--arch")?.to_string());
+                index += 2;
+            }
+            "--key" => {
+                key = Some(option_arg(args, index + 1, "--key")?.to_string());
+                index += 2;
+            }
+            "--epoch" => {
+                epoch = Some(parse_u64(
+                    option_arg(args, index + 1, "--epoch")?,
+                    "release epoch",
+                )?);
+                index += 2;
+            }
+            "--unsigned" => {
+                if unsigned {
+                    return Err("--unsigned 只能指定一次".to_string());
+                }
+                unsigned = true;
+                index += 1;
+            }
+            option => return Err(format!("未知 build 参数: {option}")),
+        }
+    }
+    let arch = arch.ok_or_else(|| "build 必须指定 --arch".to_string())?;
+    if unsigned {
+        if key.is_some() || epoch.is_some() {
+            return Err("--unsigned 不能与 --key/--epoch 同时使用".to_string());
+        }
+    } else if key.is_none() || epoch.is_none() || epoch == Some(0) {
+        return Err("签名构建必须提供 --key 和非零 --epoch".to_string());
+    }
+    let targets: &[(&str, &str)] = match arch.as_str() {
+        "riscv64" => &[("riscv64", "riscv64gc-unknown-none-elf")],
+        "loongarch64" => &[("loongarch64", "loongarch64-unknown-none")],
+        "all" => &[
+            ("riscv64", "riscv64gc-unknown-none-elf"),
+            ("loongarch64", "loongarch64-unknown-none"),
+        ],
+        _ => return Err(format!("未知 build arch: {arch}")),
+    };
+    let manifest = ElmProjectManifest::load(project)?;
+    if !project.join(".elm/framework/elm/Cargo.toml").is_file() {
+        sync_framework(project)?;
+    }
+    let output_dir = project.join("dist");
+    fs::create_dir_all(&output_dir)
+        .map_err(|err| format!("创建 {} 失败: {err}", output_dir.display()))?;
+    let signing = match key {
+        Some(path) => Some(SigningKey::from_bytes(&read_fixed_file::<32>(
+            &path,
+            "private seed",
+        )?)),
+        None => None,
+    };
+    for (arch_name, target) in targets {
+        let elf = cargo_build(project, target, &manifest.cargo_name())?;
+        let unsigned_path = output_dir.join(format!(".{}-{arch_name}.unsigned.eki", manifest.name));
+        let output_path = output_dir.join(format!("{}-{arch_name}.eki", manifest.name));
+        pack_elf_project(project, &elf, &unsigned_path)?;
+        if let Some(signing) = &signing {
+            let bytes = fs::read(&unsigned_path)
+                .map_err(|err| format!("读取 {} 失败: {err}", unsigned_path.display()))?;
+            let signed = sign_eki_image(
+                &bytes,
+                signing,
+                &manifest.source,
+                epoch.expect("已校验签名 epoch"),
+            )?;
+            fs::write(&output_path, signed)
+                .map_err(|err| format!("写入 {} 失败: {err}", output_path.display()))?;
+            fs::remove_file(&unsigned_path).map_err(|err| format!("删除临时镜像失败: {err}"))?;
+        } else {
+            fs::rename(&unsigned_path, &output_path)
+                .map_err(|err| format!("写入 {} 失败: {err}", output_path.display()))?;
+        }
+        println!("built {}", output_path.display());
+    }
+    Ok(())
+}
+
+fn parse_named_options(
+    args: &[String],
+    allowed: &[&str],
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut options = std::collections::BTreeMap::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let option = args[index].as_str();
+        if !allowed.contains(&option) {
+            return Err(format!("未知参数: {option}"));
+        }
+        let value = option_arg(args, index + 1, option)?.to_string();
+        if options.insert(option.to_string(), value).is_some() {
+            return Err(format!("重复参数: {option}"));
+        }
+        index += 2;
+    }
+    Ok(options)
+}
+
+fn required_option<'a>(
+    options: &'a std::collections::BTreeMap<String, String>,
+    name: &str,
+) -> Result<&'a str, String> {
+    options
+        .get(name)
+        .map(String::as_str)
+        .ok_or_else(|| format!("缺少参数 {name}"))
 }
 
 fn cmd_fingerprint_header(args: &[String]) -> Result<(), String> {
@@ -472,8 +349,7 @@ fn cmd_fingerprint_header(args: &[String]) -> Result<(), String> {
     append_c_byte_list(&mut header, &fingerprint.kernel_api_hash);
     header.push_str("\n#endif\n");
     if let Some(parent) = std::path::Path::new(&args[1]).parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create {}: {err}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
     fs::write(&args[1], header).map_err(|err| format!("write {}: {err}", args[1]))
 }
@@ -487,21 +363,6 @@ fn append_c_byte_list(out: &mut String, bytes: &[u8]) {
         }
         write!(out, "0x{byte:02x}").unwrap();
     }
-}
-
-fn cmd_generate_elmmgr(args: &[String]) -> Result<(), String> {
-    if args.len() != 1 {
-        usage();
-        return Err("bad generate-elmmgr arguments".to_string());
-    }
-    let root = std::path::Path::new(&args[0]);
-    let src = root.join("src");
-    fs::create_dir_all(&src).map_err(|err| format!("create {}: {err}", src.display()))?;
-    fs::write(root.join("Cargo.toml"), GENERATED_ELMMGR_CARGO_TOML)
-        .map_err(|err| format!("write generated Cargo.toml: {err}"))?;
-    fs::write(src.join("lib.rs"), GENERATED_ELMMGR_LIB_RS)
-        .map_err(|err| format!("write generated lib.rs: {err}"))?;
-    Ok(())
 }
 
 fn cmd_pack_metadata(args: &[String]) -> Result<(), String> {
@@ -525,7 +386,10 @@ fn cmd_pack_metadata(args: &[String]) -> Result<(), String> {
         if args[4] != "--menu" {
             return Err("expected --menu".to_string());
         }
-        blocks.insert(1, PackerBlock::new(BLOCK_MENU, menu_block(&args[5], &args[6], &args[7])?));
+        blocks.insert(
+            1,
+            PackerBlock::new(BLOCK_MENU, menu_block(&args[5], &args[6], &args[7])?),
+        );
     }
     let image = eki_image_with_hash(ElmEbiArch::Any, &blocks);
     fs::write(out, image).map_err(|err| format!("write {out}: {err}"))?;
@@ -533,34 +397,65 @@ fn cmd_pack_metadata(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_pack_elf(args: &[String]) -> Result<(), String> {
-    let options = parse_native_pack_options(args)?;
-    let elf_bytes = fs::read(&options.elf).map_err(|err| format!("read {}: {err}", options.elf))?;
-    let elf = ElfImage::parse(&elf_bytes)?;
-    let arch = options.arch.unwrap_or_else(|| elf.arch);
-    if arch != ElmEbiArch::Any && elf.arch != ElmEbiArch::Any && arch != elf.arch {
-        return Err("requested --arch does not match ELF machine".to_string());
+    if args.len() != 3 {
+        usage();
+        return Err("bad pack-elf arguments".to_string());
     }
-    validate_runtime_layout(&elf.load_segments)?;
+    pack_elf_project(
+        Path::new(&args[0]),
+        Path::new(&args[1]),
+        Path::new(&args[2]),
+    )
+}
 
-    let mut blocks = Vec::new();
-    blocks.push(PackerBlock::new(
-        BLOCK_MANIFEST,
-        manifest_block(&options.name, &options.version, options.kind)?,
-    ));
-    blocks.push(PackerBlock::new(
-        BLOCK_ABI_FINGERPRINT,
-        abi_fingerprint_block(&default_abi_fingerprint(arch)),
-    ));
-    if let Some((label, description, route)) = &options.menu {
+fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<(), String> {
+    let manifest = ElmProjectManifest::load(project)?;
+    let kind = parse_kind(&manifest.kind)?;
+    let elf_bytes =
+        fs::read(elf_path).map_err(|err| format!("读取 {} 失败: {err}", elf_path.display()))?;
+    let elf = ElfImage::parse(&elf_bytes)?;
+    validate_runtime_layout(&elf.load_segments)?;
+    let metadata_section = elf.elm_metadata_section(&elf_bytes)?;
+    let metadata = NativeMetadata::parse(metadata_section)?;
+    validate_native_symbols(&elf, &metadata)?;
+    let relocations = native_relocations_block(&elf, &elf_bytes, &metadata.imports)?;
+    let mut blocks = vec![
+        PackerBlock::new(
+            BLOCK_MANIFEST,
+            manifest_block(&manifest.name, &manifest.version, kind)?,
+        ),
+        PackerBlock::new(
+            BLOCK_ABI_FINGERPRINT,
+            abi_fingerprint_block(&default_abi_fingerprint(elf.arch)),
+        ),
+    ];
+    if let Some(menu) = &manifest.menu {
         blocks.push(PackerBlock::new(
             BLOCK_MENU,
-            menu_block(label, description, route)?,
+            menu_block(&menu.label, &menu.description, &menu.route)?,
         ));
     }
-    if let Some(entry) = &options.entry {
+    if let Some(entry) = &metadata.entry {
         blocks.push(PackerBlock::new(BLOCK_ENTRY, entry_block(entry)?));
     }
-    let relocations = import_slot_relocations_block(&elf, &options.import_slots)?;
+    if !manifest.dependencies.is_empty() {
+        blocks.push(PackerBlock::new(
+            BLOCK_DEPENDENCIES,
+            dependencies_block(&manifest.dependencies)?,
+        ));
+    }
+    if !metadata.extension_points.is_empty() {
+        blocks.push(PackerBlock::new(
+            BLOCK_EXTENSION_POINTS,
+            extension_points_block(&metadata.extension_points)?,
+        ));
+    }
+    if !metadata.extensions.is_empty() {
+        blocks.push(PackerBlock::new(
+            BLOCK_EXTENSIONS,
+            extensions_block(&metadata.extensions)?,
+        ));
+    }
     blocks.push(PackerBlock::new(
         BLOCK_SEGMENTS,
         segments_block(&elf.load_segments, relocation_segment_len(&relocations)),
@@ -568,209 +463,52 @@ fn cmd_pack_elf(args: &[String]) -> Result<(), String> {
     for segment in &elf.load_segments {
         blocks.push(segment_block(segment, &elf_bytes)?);
     }
-    if !options.import_slots.is_empty() {
-        blocks.push(PackerBlock::new(
-            BLOCK_IMPORTS,
-            symbol_records_block(
-                &options
-                    .import_slots
-                    .iter()
-                    .map(|slot| {
-                        (
-                            slot.import_name.as_str(),
-                            slot.contract.as_str(),
-                            slot.version,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )?,
-        ));
-    }
-    if let Some(elmapi) = &options.elmapi {
-        blocks.push(PackerBlock::new(
-            BLOCK_API_COMPATIBILITY,
-            elmapi_compatibility_block(elmapi),
-        ));
-    }
-    if !options.exports.is_empty() {
+    blocks.push(PackerBlock::new(
+        BLOCK_IMPORTS,
+        import_records_block(&metadata.imports)?,
+    ));
+    blocks.push(PackerBlock::new(
+        BLOCK_API_COMPATIBILITY,
+        elmapi_compatibility_block(&ElmApiSpec {
+            root_import_index: metadata.api_root_import_index,
+            versions: metadata.api_versions.clone(),
+            required_features: metadata.api_required_features,
+        }),
+    ));
+    if !metadata.exports.is_empty() {
         blocks.push(PackerBlock::new(
             BLOCK_EXPORTS,
-            symbol_records_block(
-                &options
-                    .exports
-                    .iter()
-                    .map(|export| (export.symbol.as_str(), export.contract.as_str(), export.version))
-                    .collect::<Vec<_>>(),
-            )?,
+            export_records_block(&metadata.exports)?,
         ));
     }
-    if !options.providers.is_empty() {
+    if !metadata.providers.is_empty() {
         blocks.push(PackerBlock::new(
             BLOCK_PROVIDER_PORTS,
-            provider_ports_block(&options.providers)?,
+            provider_ports_block(&metadata.providers)?,
         ));
     }
     blocks.push(PackerBlock::new(
         BLOCK_LIFECYCLE_HOOKS,
-        lifecycle_hooks_block(),
+        lifecycle_hooks_block_from_metadata(&metadata)?,
     ));
-
-    let mut symbol_names = vec!["on_initialize".to_string(), "on_finalize".to_string()];
-    if let Some(entry) = &options.entry {
-        symbol_names.push(entry.clone());
+    blocks.push(PackerBlock::new(
+        BLOCK_SYMBOL_LOCATIONS,
+        symbol_locations_block(&elf, &metadata.symbol_names())?,
+    ));
+    let relocation_len = relocations.len() as u64;
+    blocks.push(PackerBlock::segment(
+        BLOCK_RELOCATIONS,
+        relocations,
+        relocation_len,
+        8,
+    ));
+    let image = eki_image_with_hash(elf.arch, &blocks);
+    parse_eki_image(&image).map_err(|status| format!("生成的 EKI 无法通过自校验: {status:?}"))?;
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("创建 {} 失败: {err}", parent.display()))?;
     }
-    for slot in &options.import_slots {
-        symbol_names.push(slot.slot_symbol.clone());
-    }
-    for export in &options.exports {
-        symbol_names.push(export.symbol.clone());
-    }
-    for provider in &options.providers {
-        symbol_names.push(provider.handler_symbol.clone());
-        if let Some(snapshot) = &provider.snapshot_symbol {
-            symbol_names.push(snapshot.clone());
-        }
-    }
-    symbol_names.sort();
-    symbol_names.dedup();
-    let symbol_locations = symbol_locations_block(&elf, &symbol_names)?;
-    blocks.push(PackerBlock::new(BLOCK_SYMBOL_LOCATIONS, symbol_locations));
-
-    if !options.import_slots.is_empty() {
-        let len = relocations.len() as u64;
-        blocks.push(PackerBlock::segment(BLOCK_RELOCATIONS, relocations, len, 8));
-    }
-
-    let image = eki_image_with_hash(arch, &blocks);
-    fs::write(&options.out, image).map_err(|err| format!("write {}: {err}", options.out))?;
-    Ok(())
-}
-
-fn parse_native_pack_options(args: &[String]) -> Result<NativePackOptions, String> {
-    if args.len() < 5 {
-        usage();
-        return Err("bad pack-elf arguments".to_string());
-    }
-    let mut options = NativePackOptions {
-        out: args[0].clone(),
-        elf: args[1].clone(),
-        name: args[2].clone(),
-        version: args[3].clone(),
-        kind: parse_kind(&args[4])?,
-        arch: None,
-        entry: None,
-        menu: None,
-        import_slots: Vec::new(),
-        exports: Vec::new(),
-        providers: Vec::new(),
-        elmapi: None,
-    };
-    let mut index = 5;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--arch" => {
-                let value = option_arg(args, index + 1, "--arch")?;
-                options.arch = Some(parse_arch(value)?);
-                index += 2;
-            }
-            "--entry" => {
-                options.entry = Some(option_arg(args, index + 1, "--entry")?.to_string());
-                index += 2;
-            }
-            "--menu" => {
-                let label = option_arg(args, index + 1, "--menu")?.to_string();
-                let description = option_arg(args, index + 2, "--menu")?.to_string();
-                let route = option_arg(args, index + 3, "--menu")?.to_string();
-                options.menu = Some((label, description, route));
-                index += 4;
-            }
-            "--runtime-log-slot" => {
-                let slot_symbol = option_arg(args, index + 1, "--runtime-log-slot")?.to_string();
-                options.import_slots.push(ImportSlotSpec {
-                    slot_symbol,
-                    import_name: ELM_RUNTIME_LOG_EXPORT_NAME.to_string(),
-                    contract: ELM_RUNTIME_LOG_EXPORT_CONTRACT.to_string(),
-                    version: ELM_RUNTIME_LOG_EXPORT_VERSION,
-                });
-                index += 2;
-            }
-            "--import-slot" => {
-                let slot_symbol = option_arg(args, index + 1, "--import-slot")?.to_string();
-                let import_name = option_arg(args, index + 2, "--import-slot")?.to_string();
-                let contract = option_arg(args, index + 3, "--import-slot")?.to_string();
-                let version = parse_u32(option_arg(args, index + 4, "--import-slot")?, "version")?;
-                options.import_slots.push(ImportSlotSpec {
-                    slot_symbol,
-                    import_name,
-                    contract,
-                    version,
-                });
-                index += 5;
-            }
-            "--elmapi-root-slot" => {
-                if options.elmapi.is_some() {
-                    return Err("--elmapi-root-slot may only be specified once".to_string());
-                }
-                let slot_symbol = option_arg(args, index + 1, "--elmapi-root-slot")?.to_string();
-                let versions = parse_elmapi_versions(option_arg(
-                    args,
-                    index + 2,
-                    "--elmapi-root-slot",
-                )?)?;
-                let required_features = parse_u64(
-                    option_arg(args, index + 3, "--elmapi-root-slot")?,
-                    "required features",
-                )?;
-                let root_import_index = options.import_slots.len() as u32;
-                options.import_slots.push(ImportSlotSpec {
-                    slot_symbol,
-                    import_name: ELM_API_ROOT_IMPORT_NAME.to_string(),
-                    contract: ELM_API_ROOT_IMPORT_CONTRACT.to_string(),
-                    version: 0,
-                });
-                options.elmapi = Some(ElmApiSpec {
-                    root_import_index,
-                    versions,
-                    required_features,
-                });
-                index += 4;
-            }
-            "--export" => {
-                let symbol = option_arg(args, index + 1, "--export")?.to_string();
-                let contract = option_arg(args, index + 2, "--export")?.to_string();
-                let version = parse_u32(option_arg(args, index + 3, "--export")?, "version")?;
-                options.exports.push(ExportSpec {
-                    symbol,
-                    contract,
-                    version,
-                });
-                index += 4;
-            }
-            "--provider" => {
-                let contract = option_arg(args, index + 1, "--provider")?.to_string();
-                let access = parse_access(option_arg(args, index + 2, "--provider")?)?;
-                let direction = parse_direction(option_arg(args, index + 3, "--provider")?)?;
-                let mode = parse_mode(option_arg(args, index + 4, "--provider")?)?;
-                let handler_symbol = option_arg(args, index + 5, "--provider")?.to_string();
-                let snapshot = option_arg(args, index + 6, "--provider")?;
-                options.providers.push(ProviderSpec {
-                    contract,
-                    access,
-                    direction,
-                    mode,
-                    handler_symbol,
-                    snapshot_symbol: if snapshot == "-" {
-                        None
-                    } else {
-                        Some(snapshot.to_string())
-                    },
-                });
-                index += 7;
-            }
-            other => return Err(format!("unknown pack-elf option: {other}")),
-        }
-    }
-    Ok(options)
+    fs::write(output, image).map_err(|err| format!("写入 {} 失败: {err}", output.display()))
 }
 
 fn option_arg<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -779,81 +517,11 @@ fn option_arg<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a 
         .ok_or_else(|| format!("missing argument for {option}"))
 }
 
-fn parse_u32(raw: &str, name: &str) -> Result<u32, String> {
-    raw.parse::<u32>()
-        .map_err(|_| format!("bad {name}: {raw}"))
-}
-
 fn parse_u64(raw: &str, name: &str) -> Result<u64, String> {
     if let Some(hex) = raw.strip_prefix("0x") {
         u64::from_str_radix(hex, 16).map_err(|_| format!("bad {name}: {raw}"))
     } else {
-        raw.parse::<u64>()
-            .map_err(|_| format!("bad {name}: {raw}"))
-    }
-}
-
-fn parse_elmapi_versions(raw: &str) -> Result<Vec<u16>, String> {
-    let mut versions = Vec::new();
-    for value in raw.split(',') {
-        let version = value
-            .parse::<u16>()
-            .map_err(|_| format!("bad elmapi version: {value}"))?;
-        if version == 0 || versions.contains(&version) {
-            return Err(format!("bad or duplicate elmapi version: {value}"));
-        }
-        versions.push(version);
-    }
-    versions.sort_unstable();
-    if versions.is_empty() || versions.len() > ELM_API_MAX_COMPATIBLE_VERSIONS {
-        return Err(format!(
-            "elmapi compatibility set must contain 1..={ELM_API_MAX_COMPATIBLE_VERSIONS} versions"
-        ));
-    }
-    if versions.as_slice() != [ELM_API_VERSION_V1] {
-        return Err(format!(
-            "unpublished elmapi only accepts version {ELM_API_VERSION_V1}"
-        ));
-    }
-    Ok(versions)
-}
-
-fn parse_arch(raw: &str) -> Result<ElmEbiArch, String> {
-    match raw {
-        "any" => Ok(ElmEbiArch::Any),
-        "riscv64" => Ok(ElmEbiArch::Riscv64),
-        "loongarch64" => Ok(ElmEbiArch::LoongArch64),
-        _ => Err(format!("unknown arch: {raw}")),
-    }
-}
-
-fn parse_access(raw: &str) -> Result<ElmPortAccessPolicy, String> {
-    match raw {
-        "internal" => Ok(ElmPortAccessPolicy::Internal),
-        "public" => Ok(ElmPortAccessPolicy::Public),
-        "extension-only" => Ok(ElmPortAccessPolicy::ExtensionOnly),
-        _ => Err(format!("unknown provider access: {raw}")),
-    }
-}
-
-fn parse_direction(raw: &str) -> Result<FlowDirection, String> {
-    match raw {
-        "source" => Ok(FlowDirection::Source),
-        "sink" => Ok(FlowDirection::Sink),
-        "duplex" => Ok(FlowDirection::Duplex),
-        "control" => Ok(FlowDirection::Control),
-        _ => Err(format!("unknown provider direction: {raw}")),
-    }
-}
-
-fn parse_mode(raw: &str) -> Result<FlowMode, String> {
-    match raw {
-        "exclusive" => Ok(FlowMode::Exclusive),
-        "shared" => Ok(FlowMode::Shared),
-        "ordered" => Ok(FlowMode::Ordered),
-        "pipeline" => Ok(FlowMode::Pipeline),
-        "broadcast" => Ok(FlowMode::Broadcast),
-        _ => Err(format!("unknown provider mode: {raw}")),
+        raw.parse::<u64>().map_err(|_| format!("bad {name}: {raw}"))
     }
 }
 
@@ -888,11 +556,15 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
             desc.flags
         );
     }
-    let image = parse_eki_image(&bytes).map_err(|status| format!("EKI parse failed: {status:?}"))?;
+    let image =
+        parse_eki_image(&bytes).map_err(|status| format!("EKI parse failed: {status:?}"))?;
     if let Some(elmapi) = &image.unit.api_compatibility {
         println!("elmapi.root_import_index={}", elmapi.root_import_index);
         println!("elmapi.required_features=0x{:x}", elmapi.required_features);
-        println!("elmapi.compatible_versions={:?}", elmapi.compatible_versions);
+        println!(
+            "elmapi.compatible_versions={:?}",
+            elmapi.compatible_versions
+        );
     }
     Ok(())
 }
@@ -937,7 +609,12 @@ fn cmd_sign(args: &[String]) -> Result<(), String> {
     if release_epoch == 0 {
         return Err("release epoch must be nonzero".to_string());
     }
-    let output = sign_eki_image(&input, &SigningKey::from_bytes(&seed), &args[3], release_epoch)?;
+    let output = sign_eki_image(
+        &input,
+        &SigningKey::from_bytes(&seed),
+        &args[3],
+        release_epoch,
+    )?;
     fs::write(&args[1], output).map_err(|err| format!("write {}: {err}", args[1]))?;
     Ok(())
 }
@@ -953,7 +630,8 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
         Some(HashState::Invalid) => return Err("image hash mismatch".to_string()),
         Some(HashState::Missing) | None => return Err("image hash missing".to_string()),
     }
-    let image = parse_eki_image(&bytes).map_err(|status| format!("EKI parse failed: {status:?}"))?;
+    let image =
+        parse_eki_image(&bytes).map_err(|status| format!("EKI parse failed: {status:?}"))?;
     let proof = image
         .proof
         .as_ref()
@@ -1026,14 +704,36 @@ fn sign_eki_image(
         flags: 0,
         signature: [0; ELM_PROOF_ED25519_SIGNATURE_LEN],
     };
-    proof.signature = signing.sign(&proof.unsigned_message(fingerprint)).to_bytes();
+    proof.signature = signing
+        .sign(&proof.unsigned_message(fingerprint))
+        .to_bytes();
     let proof_payload = proof_block(&proof)?;
     let index = blocks
         .iter()
         .position(|block| block.kind == BLOCK_PROOF)
         .ok_or_else(|| "proof block disappeared".to_string())?;
     blocks[index] = PackerBlock::new(BLOCK_PROOF, proof_payload);
-    Ok(eki_image_with_hash(arch, &blocks))
+    let signed = eki_image_with_hash(arch, &blocks);
+    let signed_header = Header::parse(&signed)?;
+    let signed_proof = find_block(&signed, &signed_header, BLOCK_PROOF)?;
+    let mut signed_ranges = [
+        (
+            signed_header.image_hash_offset as usize,
+            signed_header.image_hash_size as usize,
+        ),
+        (
+            signed_proof.offset as usize,
+            signed_proof.file_size as usize,
+        ),
+    ];
+    signed_ranges.sort_unstable_by_key(|range| range.0);
+    let signed_source_digest = sha256_with_zeroed_ranges(&signed, &signed_ranges)
+        .ok_or_else(|| "signed proof source digest range invalid".to_string())?;
+    if signed_source_digest != proof.source_digest {
+        return Err("签名后 source digest 自校验失败".to_string());
+    }
+    parse_eki_image(&signed).map_err(|status| format!("签名后 EKI 自校验失败: {status:?}"))?;
+    Ok(signed)
 }
 
 fn extract_packer_blocks(bytes: &[u8], header: &Header) -> Result<Vec<PackerBlock>, String> {
@@ -1165,6 +865,7 @@ impl BlockDesc {
 struct ElfImage {
     arch: ElmEbiArch,
     load_segments: Vec<ElfLoadSegment>,
+    sections: Vec<ElfSection>,
     symbols: Vec<ElfSymbol>,
 }
 
@@ -1185,10 +886,21 @@ struct ElfSymbol {
     name: String,
     value: u64,
     size: u64,
+    symbol_type: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EkiRelocationSpec {
+    kind: ElmEbiRelocationKind,
+    target_segment_index: u32,
+    value_index: u32,
+    target_offset: u64,
+    addend: i64,
 }
 
 #[derive(Clone, Copy)]
 struct ElfHeader {
+    file_type: u16,
     machine: u16,
     phoff: u64,
     shoff: u64,
@@ -1199,9 +911,11 @@ struct ElfHeader {
     shstrndx: u16,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ElfSection {
+    name: String,
     section_type: u32,
+    flags: u64,
     offset: u64,
     size: u64,
     link: u32,
@@ -1211,6 +925,9 @@ struct ElfSection {
 impl ElfImage {
     fn parse(bytes: &[u8]) -> Result<Self, String> {
         let header = parse_elf_header(bytes)?;
+        if header.file_type != ELF_TYPE_DYN {
+            return Err("ELM 原生 ELF 必须是 PIE/ET_DYN；请通过 elm-tools build 构建".to_string());
+        }
         let arch = arch_from_machine(header.machine)?;
         let mut load_segments = parse_elf_load_segments(bytes, &header)?;
         if load_segments.is_empty() {
@@ -1225,19 +942,27 @@ impl ElfImage {
         Ok(Self {
             arch,
             load_segments,
+            sections,
             symbols,
         })
     }
 
     fn symbol(&self, name: &str) -> Result<&ElfSymbol, String> {
-        self.symbols
-            .iter()
-            .find(|symbol| symbol.name == name)
-            .ok_or_else(|| format!("symbol not found in ELF: {name}"))
+        let mut matches = self.symbols.iter().filter(|symbol| symbol.name == name);
+        let symbol = matches
+            .next()
+            .ok_or_else(|| format!("symbol not found in ELF: {name}"))?;
+        if matches.next().is_some() {
+            return Err(format!("ELF symbol is ambiguous: {name}"));
+        }
+        Ok(symbol)
     }
 
     fn symbol_location(&self, name: &str) -> Result<(u32, u64, u64), String> {
         let symbol = self.symbol(name)?;
+        if symbol.size == 0 {
+            return Err(format!("ELF symbol has zero size: {name}"));
+        }
         let segment = self
             .load_segments
             .iter()
@@ -1247,11 +972,65 @@ impl ElfImage {
             })
             .ok_or_else(|| format!("symbol is outside PT_LOAD segments: {name}"))?;
         let offset = symbol.value - segment.vaddr;
-        let size = symbol.size.max(1);
+        let size = symbol.size;
         if offset.saturating_add(size) > segment.mem_size {
             return Err(format!("symbol range is outside segment: {name}"));
         }
         Ok((segment.index, offset, size))
+    }
+
+    fn contains_image_address(&self, vaddr: u64) -> bool {
+        self.load_segments.iter().any(|segment| {
+            segment
+                .vaddr
+                .checked_add(segment.mem_size)
+                .is_some_and(|end| vaddr >= segment.vaddr && vaddr < end)
+        })
+    }
+
+    fn relocation_target(&self, vaddr: u64, width: u64) -> Result<(u32, u64), String> {
+        let end = vaddr
+            .checked_add(width)
+            .ok_or_else(|| "ELF relocation target overflow".to_string())?;
+        let segment = self
+            .load_segments
+            .iter()
+            .find(|segment| {
+                vaddr >= segment.vaddr && end <= segment.vaddr.saturating_add(segment.mem_size)
+            })
+            .ok_or_else(|| format!("ELF relocation target is outside PT_LOAD: 0x{vaddr:x}"))?;
+        if matches!(segment.kind, ElmEbiSegmentKind::Code) {
+            return Err(format!("ELM 不允许 text relocation: 0x{vaddr:x}"));
+        }
+        Ok((segment.index, vaddr - segment.vaddr))
+    }
+
+    fn elm_metadata_section<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8], String> {
+        let mut sections = self
+            .sections
+            .iter()
+            .filter(|section| section.name == ".elm.meta");
+        let section = sections
+            .next()
+            .ok_or_else(|| "ELF 缺少非装载段 .elm.meta".to_string())?;
+        if sections.next().is_some() {
+            return Err("ELF 包含多个 .elm.meta section".to_string());
+        }
+        if section.section_type != 1 || section.flags & 0x2 != 0 || section.size == 0 {
+            return Err(".elm.meta 必须是非空、非 SHF_ALLOC 的 PROGBITS section".to_string());
+        }
+        let metadata_start = section.offset;
+        let metadata_end = metadata_start
+            .checked_add(section.size)
+            .ok_or_else(|| ".elm.meta 文件范围溢出".to_string())?;
+        if self.load_segments.iter().any(|segment| {
+            let start = segment.offset;
+            let end = start.saturating_add(segment.file_size);
+            metadata_start < end && start < metadata_end
+        }) {
+            return Err(".elm.meta 不得落入任何 PT_LOAD 文件范围".to_string());
+        }
+        checked_slice(bytes, section.offset as usize, section.size as usize)
     }
 }
 
@@ -1262,7 +1041,11 @@ fn parse_elf_header(bytes: &[u8]) -> Result<ElfHeader, String> {
     if read_u8(bytes, 4)? != 2 || read_u8(bytes, 5)? != 1 || read_u8(bytes, 6)? != 1 {
         return Err("only ELF64 little-endian v1 is supported".to_string());
     }
-    Ok(ElfHeader {
+    if read_u32(bytes, 20)? != 1 || read_u16(bytes, 52)? != 64 {
+        return Err("unsupported ELF64 header version or size".to_string());
+    }
+    let header = ElfHeader {
+        file_type: read_u16(bytes, 16)?,
         machine: read_u16(bytes, 18)?,
         phoff: read_u64(bytes, 32)?,
         shoff: read_u64(bytes, 40)?,
@@ -1271,7 +1054,29 @@ fn parse_elf_header(bytes: &[u8]) -> Result<ElfHeader, String> {
         shentsize: read_u16(bytes, 58)?,
         shnum: read_u16(bytes, 60)?,
         shstrndx: read_u16(bytes, 62)?,
-    })
+    };
+    if header.phnum == 0
+        || header.phnum > ELF_MAX_PROGRAM_HEADERS
+        || header.shnum == 0
+        || header.shnum > ELF_MAX_SECTION_HEADERS
+    {
+        return Err("ELF header table count exceeds ELM limits".to_string());
+    }
+    let phoff = usize::try_from(header.phoff)
+        .map_err(|_| "ELF program header offset exceeds host address space".to_string())?;
+    let shoff = usize::try_from(header.shoff)
+        .map_err(|_| "ELF section header offset exceeds host address space".to_string())?;
+    checked_slice(
+        bytes,
+        phoff,
+        usize::from(header.phnum) * usize::from(header.phentsize),
+    )?;
+    checked_slice(
+        bytes,
+        shoff,
+        usize::from(header.shnum) * usize::from(header.shentsize),
+    )?;
+    Ok(header)
 }
 
 fn arch_from_machine(machine: u16) -> Result<ElmEbiArch, String> {
@@ -1308,13 +1113,33 @@ fn parse_elf_load_segments(
         if file_size > mem_size {
             return Err("ELF PT_LOAD file size exceeds memory size".to_string());
         }
+        if p_flags != ELF_PROGRAM_FLAG_READ
+            && p_flags != (ELF_PROGRAM_FLAG_READ | ELF_PROGRAM_FLAG_EXECUTE)
+            && p_flags != (ELF_PROGRAM_FLAG_READ | ELF_PROGRAM_FLAG_WRITE)
+        {
+            return Err(format!("ELM PT_LOAD 权限无效或包含 W+X: 0x{p_flags:x}"));
+        }
+        if align < ELM_TOOL_PAGE_SIZE
+            || !align.is_power_of_two()
+            || file_offset % align != vaddr % align
+            || file_offset % ELM_TOOL_PAGE_SIZE != 0
+            || vaddr % ELM_TOOL_PAGE_SIZE != 0
+        {
+            return Err("ELM PT_LOAD 必须满足页对齐及 ELF offset/vaddr 同余约束".to_string());
+        }
+        vaddr
+            .checked_add(mem_size)
+            .ok_or_else(|| "ELF PT_LOAD memory range overflow".to_string())?;
+        file_offset
+            .checked_add(file_size)
+            .ok_or_else(|| "ELF PT_LOAD file range overflow".to_string())?;
         checked_slice(bytes, file_offset as usize, file_size as usize)?;
-        let kind = if p_flags & 1 != 0 {
+        let kind = if p_flags & ELF_PROGRAM_FLAG_EXECUTE != 0 {
             if file_size == 0 {
                 return Err("executable PT_LOAD segment cannot be empty".to_string());
             }
             ElmEbiSegmentKind::Code
-        } else if p_flags & 2 != 0 {
+        } else if p_flags & ELF_PROGRAM_FLAG_WRITE != 0 {
             if file_size == 0 {
                 ElmEbiSegmentKind::Bss
             } else {
@@ -1350,53 +1175,107 @@ fn parse_elf_sections(bytes: &[u8], header: &ElfHeader) -> Result<Vec<ElfSection
     if header.shstrndx as usize >= header.shnum as usize {
         return Err("bad ELF section string table index".to_string());
     }
-    let mut out = Vec::new();
+    #[derive(Clone, Copy)]
+    struct RawSection {
+        name_offset: u32,
+        section_type: u32,
+        flags: u64,
+        offset: u64,
+        size: u64,
+        link: u32,
+        entsize: u64,
+    }
+
+    let mut raw_sections = Vec::new();
     for index in 0..header.shnum as usize {
         let offset = checked_add(header.shoff as usize, index * header.shentsize as usize)?;
-        let section = ElfSection {
+        let section = RawSection {
+            name_offset: read_u32(bytes, offset)?,
             section_type: read_u32(bytes, offset + 4)?,
+            flags: read_u64(bytes, offset + 8)?,
             offset: read_u64(bytes, offset + 24)?,
             size: read_u64(bytes, offset + 32)?,
             link: read_u32(bytes, offset + 40)?,
             entsize: read_u64(bytes, offset + 56)?,
         };
-        checked_slice(bytes, section.offset as usize, section.size as usize)?;
-        out.push(section);
+        if section.section_type != 8 {
+            checked_slice(bytes, section.offset as usize, section.size as usize)?;
+        }
+        raw_sections.push(section);
+    }
+    let string_section = raw_sections
+        .get(header.shstrndx as usize)
+        .ok_or_else(|| "bad ELF section string table index".to_string())?;
+    if string_section.section_type != 3 {
+        return Err("ELF section name table is not STRTAB".to_string());
+    }
+    let strings = checked_slice(
+        bytes,
+        string_section.offset as usize,
+        string_section.size as usize,
+    )?;
+    let mut out = Vec::new();
+    for section in raw_sections {
+        out.push(ElfSection {
+            name: if section.name_offset == 0 {
+                String::new()
+            } else {
+                read_cstr(strings, section.name_offset as usize)?
+            },
+            section_type: section.section_type,
+            flags: section.flags,
+            offset: section.offset,
+            size: section.size,
+            link: section.link,
+            entsize: section.entsize,
+        });
     }
     Ok(out)
 }
 
 fn parse_elf_symbols(bytes: &[u8], sections: &[ElfSection]) -> Result<Vec<ElfSymbol>, String> {
+    let mut tables = sections
+        .iter()
+        .filter(|section| section.section_type == ELF_SYMBOL_TABLE);
+    let table = tables
+        .next()
+        .ok_or_else(|| "ELF 缺少用于 ELM 元数据绑定的 .symtab".to_string())?;
+    if tables.next().is_some() {
+        return Err("ELF 包含多个静态符号表".to_string());
+    }
+    if table.entsize != 24 || table.size % table.entsize != 0 {
+        return Err("bad ELF64 symbol table entry size".to_string());
+    }
+    let strings = sections
+        .get(table.link as usize)
+        .ok_or_else(|| "bad ELF symbol string table link".to_string())?;
+    if strings.section_type != 3 {
+        return Err("ELF symbol table link is not STRTAB".to_string());
+    }
+    let strtab = checked_slice(bytes, strings.offset as usize, strings.size as usize)?;
     let mut out = Vec::new();
-    for section in sections {
-        if section.section_type != 2 && section.section_type != 11 {
+    let count = table.size / table.entsize;
+    for index in 0..count as usize {
+        let offset = checked_add(table.offset as usize, index * table.entsize as usize)?;
+        let name_offset = read_u32(bytes, offset)? as usize;
+        if name_offset == 0 {
             continue;
         }
-        if section.entsize == 0 || section.size % section.entsize != 0 {
-            return Err("bad ELF symbol table entry size".to_string());
+        let info = read_u8(bytes, offset + 4)?;
+        let section_index = read_u16(bytes, offset + 6)?;
+        if info >> 4 != ELF_SYMBOL_BIND_GLOBAL || section_index == ELF_SECTION_INDEX_UNDEFINED {
+            continue;
         }
-        let strings = sections
-            .get(section.link as usize)
-            .ok_or_else(|| "bad ELF symbol string table link".to_string())?;
-        if strings.section_type != 3 {
-            return Err("ELF symbol table link is not STRTAB".to_string());
+        let name = read_cstr(strtab, name_offset)?;
+        if name.is_empty() {
+            continue;
         }
-        let strtab = checked_slice(bytes, strings.offset as usize, strings.size as usize)?;
-        let count = section.size / section.entsize;
-        for index in 0..count as usize {
-            let offset = checked_add(section.offset as usize, index * section.entsize as usize)?;
-            let name_offset = read_u32(bytes, offset)? as usize;
-            if name_offset == 0 {
-                continue;
-            }
-            let name = read_cstr(strtab, name_offset)?;
-            if name.is_empty() {
-                continue;
-            }
-            let value = read_u64(bytes, offset + 8)?;
-            let size = read_u64(bytes, offset + 16)?;
-            out.push(ElfSymbol { name, value, size });
-        }
+        out.push(ElfSymbol {
+            name,
+            symbol_type: info & 0xf,
+            value: read_u64(bytes, offset + 8)?,
+            size: read_u64(bytes, offset + 16)?,
+        });
     }
     if out.is_empty() {
         return Err("ELF has no symbols; build without stripping".to_string());
@@ -1408,16 +1287,92 @@ fn validate_runtime_layout(segments: &[ElfLoadSegment]) -> Result<(), String> {
     let Some(first) = segments.first() else {
         return Err("ELF has no load segments".to_string());
     };
-    let base = first.vaddr;
+    if first.vaddr != 0 {
+        return Err("ELM PIE 的第一个 PT_LOAD 必须从虚拟地址 0 开始".to_string());
+    }
     let mut expected = 0u64;
     for segment in segments {
-        if segment.vaddr != base.saturating_add(expected) {
+        if segment.vaddr != expected {
             return Err(format!(
                 "ELF PT_LOAD layout is not ELM-compatible at vaddr=0x{:x}; use page-aligned contiguous LOAD segments",
                 segment.vaddr
             ));
         }
-        expected = align_up_u64(expected.saturating_add(segment.mem_size), ELM_TOOL_PAGE_SIZE)?;
+        let end = segment
+            .vaddr
+            .checked_add(segment.mem_size)
+            .ok_or_else(|| "ELF PT_LOAD memory range overflow".to_string())?;
+        expected = align_up_u64(end, ELM_TOOL_PAGE_SIZE)?;
+    }
+    for (index, left) in segments.iter().enumerate() {
+        let left_end = left
+            .offset
+            .checked_add(left.file_size)
+            .ok_or_else(|| "ELF PT_LOAD file range overflow".to_string())?;
+        for right in &segments[index + 1..] {
+            let right_end = right
+                .offset
+                .checked_add(right.file_size)
+                .ok_or_else(|| "ELF PT_LOAD file range overflow".to_string())?;
+            if left.offset < right_end && right.offset < left_end {
+                return Err("ELM PT_LOAD 文件范围不得重叠".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_native_symbols(elf: &ElfImage, metadata: &NativeMetadata) -> Result<(), String> {
+    for hook in &metadata.lifecycle {
+        validate_code_symbol(elf, &hook.symbol)?;
+    }
+    if let Some(entry) = &metadata.entry {
+        validate_code_symbol(elf, entry)?;
+    }
+    for export in &metadata.exports {
+        validate_code_symbol(elf, &export.symbol)?;
+    }
+    for provider in &metadata.providers {
+        validate_code_symbol(elf, &provider.handler_symbol)?;
+        if let Some(snapshot) = &provider.snapshot_symbol {
+            validate_code_symbol(elf, snapshot)?;
+        }
+    }
+    for import in &metadata.imports {
+        let symbol = elf.symbol(&import.slot_symbol)?;
+        if symbol.symbol_type != ELF_SYMBOL_TYPE_OBJECT || symbol.size != 8 {
+            return Err(format!(
+                "import slot 必须是 8 字节全局 OBJECT: {}",
+                import.slot_symbol
+            ));
+        }
+        let (segment_index, offset, _) = elf.symbol_location(&import.slot_symbol)?;
+        let segment = &elf.load_segments[segment_index as usize];
+        if !matches!(
+            segment.kind,
+            ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
+        ) || offset & 7 != 0
+        {
+            return Err(format!(
+                "import slot 必须位于 8 字节对齐的可写段: {}",
+                import.slot_symbol
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_code_symbol(elf: &ElfImage, name: &str) -> Result<(), String> {
+    let symbol = elf.symbol(name)?;
+    if symbol.symbol_type != ELF_SYMBOL_TYPE_FUNCTION {
+        return Err(format!("ELM ABI 函数符号类型不是 FUNC: {name}"));
+    }
+    let (segment_index, _, _) = elf.symbol_location(name)?;
+    if !matches!(
+        elf.load_segments[segment_index as usize].kind,
+        ElmEbiSegmentKind::Code
+    ) {
+        return Err(format!("ELM ABI 函数符号不在可执行段: {name}"));
     }
     Ok(())
 }
@@ -1672,6 +1627,29 @@ fn lifecycle_hooks_block() -> Vec<u8> {
     out
 }
 
+fn lifecycle_hooks_block_from_metadata(metadata: &NativeMetadata) -> Result<Vec<u8>, String> {
+    let hooks: Vec<_> = metadata
+        .lifecycle
+        .iter()
+        .filter(|hook| hook.kind <= 5)
+        .collect();
+    if !(2..=5).contains(&hooks.len()) {
+        return Err("EKI lifecycle block 必须包含 2..=5 个规范钩子".to_string());
+    }
+    let record_size = 20 + ELM_EBI_SYMBOL_NAME_LEN;
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + hooks.len() * record_size];
+    write_u32(&mut out, 0, hooks.len() as u32);
+    for (index, hook) in hooks.iter().enumerate() {
+        lifecycle_hook_record(
+            &mut out,
+            EKI_TABLE_HEADER_SIZE + index * record_size,
+            hook.kind,
+            &hook.symbol,
+        );
+    }
+    Ok(out)
+}
+
 fn elmapi_compatibility_block(spec: &ElmApiSpec) -> Vec<u8> {
     let mut out = vec![0u8; ELM_EKI_ELMAPI_BLOCK_SIZE];
     write_u16(&mut out, 0, ELM_EKI_ELMAPI_BLOCK_VERSION);
@@ -1748,25 +1726,131 @@ fn segment_block(segment: &ElfLoadSegment, elf_bytes: &[u8]) -> Result<PackerBlo
     ))
 }
 
-fn symbol_records_block(entries: &[(&str, &str, u32)]) -> Result<Vec<u8>, String> {
+fn import_records_block(entries: &[ImportSpec]) -> Result<Vec<u8>, String> {
+    let records: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.as_str(),
+                entry.contract.as_str(),
+                entry.min_version,
+                entry.max_version,
+                entry.flags,
+            )
+        })
+        .collect();
+    symbol_records_block(&records)
+}
+
+fn export_records_block(entries: &[ExportSpec]) -> Result<Vec<u8>, String> {
+    let records: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.as_str(),
+                entry.contract.as_str(),
+                entry.version,
+                entry.version,
+                entry.flags,
+            )
+        })
+        .collect();
+    symbol_records_block(&records)
+}
+
+fn symbol_records_block(entries: &[(&str, &str, u32, u32, u32)]) -> Result<Vec<u8>, String> {
     let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_SYMBOL_RECORD_SIZE];
     write_u32(&mut out, 0, entries.len() as u32);
-    for (index, (name, contract, version)) in entries.iter().enumerate() {
+    for (index, (name, contract, min_version, max_version, flags)) in entries.iter().enumerate() {
         if name.len() > ELM_EBI_SYMBOL_NAME_LEN || contract.len() > ELM_NEXUS_CONTRACT_LEN {
             return Err("native symbol record field too long".to_string());
         }
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_SYMBOL_RECORD_SIZE;
-        let (min_version, max_version) = if *version == 0 {
-            (1, u32::MAX)
-        } else {
-            (*version, *version)
-        };
-        write_u32(&mut out, offset, min_version);
+        write_u32(&mut out, offset, *min_version);
+        write_u32(&mut out, offset + 4, *flags);
         write_u16(&mut out, offset + 8, name.len() as u16);
         write_u16(&mut out, offset + 10, contract.len() as u16);
-        write_u32(&mut out, offset + 12, max_version);
+        write_u32(&mut out, offset + 12, *max_version);
         copy_fixed(&mut out, offset + 16, name);
         copy_fixed(&mut out, offset + 16 + ELM_EBI_SYMBOL_NAME_LEN, contract);
+    }
+    Ok(out)
+}
+
+fn dependencies_block(entries: &[ElmProjectDependency]) -> Result<Vec<u8>, String> {
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_DEPENDENCY_RECORD_SIZE];
+    write_u32(&mut out, 0, entries.len() as u32);
+    for (index, dependency) in entries.iter().enumerate() {
+        if dependency.provider.len() > elm::ELM_EBI_NAME_LEN
+            || dependency.contract.len() > ELM_NEXUS_CONTRACT_LEN
+        {
+            return Err("dependency 字段超过 EKI v1 上限".to_string());
+        }
+        let offset = EKI_TABLE_HEADER_SIZE + index * EKI_DEPENDENCY_RECORD_SIZE;
+        write_u16(&mut out, offset, dependency.provider.len() as u16);
+        write_u16(&mut out, offset + 2, dependency.contract.len() as u16);
+        copy_fixed(&mut out, offset + 8, &dependency.provider);
+        copy_fixed(
+            &mut out,
+            offset + 8 + elm::ELM_EBI_NAME_LEN,
+            &dependency.contract,
+        );
+    }
+    Ok(out)
+}
+
+fn extension_points_block(entries: &[ExtensionPointSpec]) -> Result<Vec<u8>, String> {
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_EXTENSION_POINT_RECORD_SIZE];
+    write_u32(&mut out, 0, entries.len() as u32);
+    for (index, point) in entries.iter().enumerate() {
+        if point.point.len() > elm::ELM_MGR_RELATION_POINT_LEN
+            || point.contract.len() > ELM_NEXUS_CONTRACT_LEN
+        {
+            return Err("mixin point 字段超过 EKI v1 上限".to_string());
+        }
+        let offset = EKI_TABLE_HEADER_SIZE + index * EKI_EXTENSION_POINT_RECORD_SIZE;
+        write_u16(&mut out, offset, point.point.len() as u16);
+        write_u16(&mut out, offset + 2, point.contract.len() as u16);
+        write_u32(&mut out, offset + 4, point.mode as u32);
+        copy_fixed(&mut out, offset + 16, &point.point);
+        copy_fixed(
+            &mut out,
+            offset + 16 + elm::ELM_MGR_RELATION_POINT_LEN,
+            &point.contract,
+        );
+    }
+    Ok(out)
+}
+
+fn extensions_block(entries: &[ExtensionSpec]) -> Result<Vec<u8>, String> {
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_EXTENSION_RECORD_SIZE];
+    write_u32(&mut out, 0, entries.len() as u32);
+    for (index, extension) in entries.iter().enumerate() {
+        if extension.target.len() > elm::ELM_EBI_NAME_LEN
+            || extension.point.len() > elm::ELM_MGR_RELATION_POINT_LEN
+            || extension.contract.len() > ELM_NEXUS_CONTRACT_LEN
+            || extension.handler_contract.len() > ELM_NEXUS_CONTRACT_LEN
+        {
+            return Err("mixin 字段超过 EKI v1 上限".to_string());
+        }
+        let offset = EKI_TABLE_HEADER_SIZE + index * EKI_EXTENSION_RECORD_SIZE;
+        write_u16(&mut out, offset, extension.target.len() as u16);
+        write_u16(&mut out, offset + 2, extension.point.len() as u16);
+        write_u16(&mut out, offset + 4, extension.contract.len() as u16);
+        write_u16(
+            &mut out,
+            offset + 6,
+            extension.handler_contract.len() as u16,
+        );
+        write_u32(&mut out, offset + 8, extension.priority as u32);
+        let target_start = offset + 24;
+        let point_start = target_start + elm::ELM_EBI_NAME_LEN;
+        let contract_start = point_start + elm::ELM_MGR_RELATION_POINT_LEN;
+        let handler_start = contract_start + ELM_NEXUS_CONTRACT_LEN;
+        copy_fixed(&mut out, target_start, &extension.target);
+        copy_fixed(&mut out, point_start, &extension.point);
+        copy_fixed(&mut out, contract_start, &extension.contract);
+        copy_fixed(&mut out, handler_start, &extension.handler_contract);
     }
     Ok(out)
 }
@@ -1789,12 +1873,9 @@ fn provider_ports_block(providers: &[ProviderSpec]) -> Result<Vec<u8>, String> {
         write_u32(&mut out, offset, provider.access as u32);
         write_u32(&mut out, offset + 4, provider.direction as u32);
         write_u32(&mut out, offset + 8, provider.mode as u32);
+        write_u32(&mut out, offset + 12, provider.flags);
         write_u16(&mut out, offset + 16, provider.contract.len() as u16);
-        write_u16(
-            &mut out,
-            offset + 18,
-            provider.handler_symbol.len() as u16,
-        );
+        write_u16(&mut out, offset + 18, provider.handler_symbol.len() as u16);
         let snapshot_len = provider
             .snapshot_symbol
             .as_ref()
@@ -1832,27 +1913,101 @@ fn symbol_locations_block(elf: &ElfImage, symbol_names: &[String]) -> Result<Vec
     Ok(out)
 }
 
-fn import_slot_relocations_block(
+fn native_relocations_block(
     elf: &ElfImage,
-    slots: &[ImportSlotSpec],
+    elf_bytes: &[u8],
+    slots: &[ImportSpec],
 ) -> Result<Vec<u8>, String> {
-    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + slots.len() * EKI_RELOCATION_RECORD_SIZE];
-    write_u32(&mut out, 0, slots.len() as u32);
+    let mut records = dynamic_relative_relocations(elf, elf_bytes)?;
     for (index, slot) in slots.iter().enumerate() {
         let (segment_index, offset_in_segment, size) = elf.symbol_location(&slot.slot_symbol)?;
-        if size < 8 {
+        if size != 8 {
             return Err(format!(
-                "import slot must be at least 8 bytes: {}",
+                "import slot must be exactly 8 bytes: {}",
                 slot.slot_symbol
             ));
         }
+        records.push(EkiRelocationSpec {
+            kind: ElmEbiRelocationKind::ImportAbs64,
+            target_segment_index: segment_index,
+            value_index: index as u32,
+            target_offset: offset_in_segment,
+            addend: 0,
+        });
+    }
+    records.sort_by_key(|record| (record.target_segment_index, record.target_offset));
+    if records.windows(2).any(|items| {
+        items[0].target_segment_index == items[1].target_segment_index
+            && items[0].target_offset == items[1].target_offset
+    }) {
+        return Err("ELF 包含指向同一槽位的重复运行时重定位".to_string());
+    }
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + records.len() * EKI_RELOCATION_RECORD_SIZE];
+    write_u32(&mut out, 0, records.len() as u32);
+    for (index, record) in records.iter().enumerate() {
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_RELOCATION_RECORD_SIZE;
-        write_u32(&mut out, offset, ElmEbiRelocationKind::ImportAbs64 as u32);
-        write_u32(&mut out, offset + 8, segment_index);
-        write_u32(&mut out, offset + 12, index as u32);
-        write_u64(&mut out, offset + 16, offset_in_segment);
+        write_u32(&mut out, offset, record.kind as u32);
+        write_u32(&mut out, offset + 8, record.target_segment_index);
+        write_u32(&mut out, offset + 12, record.value_index);
+        write_u64(&mut out, offset + 16, record.target_offset);
+        write_u64(&mut out, offset + 24, record.addend as u64);
     }
     Ok(out)
+}
+
+fn dynamic_relative_relocations(
+    elf: &ElfImage,
+    bytes: &[u8],
+) -> Result<Vec<EkiRelocationSpec>, String> {
+    let mut records = Vec::new();
+    let mut found_dynamic_relocations = false;
+    for section in &elf.sections {
+        if section.flags & ELF_SECTION_FLAG_ALLOC == 0
+            || !matches!(section.section_type, ELF_SECTION_RELA | ELF_SECTION_REL)
+        {
+            continue;
+        }
+        if section.name != ".rela.dyn" || section.section_type != ELF_SECTION_RELA {
+            return Err(format!(
+                "ELM PIE 包含不支持的动态重定位 section: {}",
+                section.name
+            ));
+        }
+        if found_dynamic_relocations {
+            return Err("ELM PIE 包含重复 .rela.dyn section".to_string());
+        }
+        found_dynamic_relocations = true;
+        if section.entsize != 24 || section.size % section.entsize != 0 {
+            return Err("ELM PIE 的 .rela.dyn entry size 无效".to_string());
+        }
+        for index in 0..(section.size / section.entsize) as usize {
+            let offset = checked_add(section.offset as usize, index * section.entsize as usize)?;
+            let target_vaddr = read_u64(bytes, offset)?;
+            let info = read_u64(bytes, offset + 8)?;
+            let addend = read_i64(bytes, offset + 16)?;
+            let relocation_type = info as u32;
+            let symbol_index = (info >> 32) as u32;
+            if relocation_type != ELF_RELOCATION_RELATIVE || symbol_index != 0 {
+                return Err(format!(
+                    "ELM PIE 只允许无符号 R_*_RELATIVE，发现 type={relocation_type} symbol={symbol_index}"
+                ));
+            }
+            if target_vaddr & 7 != 0 || addend < 0 || !elf.contains_image_address(addend as u64) {
+                return Err(format!(
+                    "ELM PIE relative relocation 范围无效: target=0x{target_vaddr:x} addend={addend}"
+                ));
+            }
+            let (target_segment_index, target_offset) = elf.relocation_target(target_vaddr, 8)?;
+            records.push(EkiRelocationSpec {
+                kind: ElmEbiRelocationKind::ImageBase64,
+                target_segment_index,
+                value_index: 0,
+                target_offset,
+                addend,
+            });
+        }
+    }
+    Ok(records)
 }
 
 fn parse_kind(raw: &str) -> Result<ElmKind, String> {
@@ -1904,6 +2059,13 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
     Ok(u64::from_le_bytes(raw.try_into().unwrap()))
 }
 
+fn read_i64(bytes: &[u8], offset: usize) -> Result<i64, String> {
+    let raw = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| "i64 out of range".to_string())?;
+    Ok(i64::from_le_bytes(raw.try_into().unwrap()))
+}
+
 fn write_u16(out: &mut [u8], offset: usize, value: u16) {
     out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -1918,4 +2080,83 @@ fn write_u64(out: &mut [u8], offset: usize, value: u64) {
 
 fn copy_fixed(out: &mut [u8], offset: usize, value: &str) {
     out[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn relocation_fixture(relocation_type: u32) -> (ElfImage, Vec<u8>) {
+        let elf = ElfImage {
+            arch: ElmEbiArch::LoongArch64,
+            load_segments: vec![
+                ElfLoadSegment {
+                    index: 0,
+                    kind: ElmEbiSegmentKind::Code,
+                    flags: ELM_EBI_SEGMENT_FLAG_READ | ELM_EBI_SEGMENT_FLAG_EXECUTE,
+                    offset: 0,
+                    vaddr: 0,
+                    file_size: 0x100,
+                    mem_size: 0x100,
+                    align: 0x1000,
+                },
+                ElfLoadSegment {
+                    index: 1,
+                    kind: ElmEbiSegmentKind::Data,
+                    flags: ELM_EBI_SEGMENT_FLAG_READ | ELM_EBI_SEGMENT_FLAG_WRITE,
+                    offset: 0x100,
+                    vaddr: 0x1000,
+                    file_size: 0x10,
+                    mem_size: 0x10,
+                    align: 0x1000,
+                },
+            ],
+            sections: vec![ElfSection {
+                name: ".rela.dyn".to_string(),
+                section_type: ELF_SECTION_RELA,
+                flags: ELF_SECTION_FLAG_ALLOC,
+                offset: 0,
+                size: 24,
+                link: 0,
+                entsize: 24,
+            }],
+            symbols: Vec::new(),
+        };
+        let mut bytes = vec![0; 24];
+        write_u64(&mut bytes, 0, 0x1008);
+        write_u64(&mut bytes, 8, u64::from(relocation_type));
+        write_u64(&mut bytes, 16, 0x20);
+        (elf, bytes)
+    }
+
+    #[test]
+    fn converts_elf_relative_relocation_to_image_base() {
+        let (elf, bytes) = relocation_fixture(ELF_RELOCATION_RELATIVE);
+        let records = dynamic_relative_relocations(&elf, &bytes).unwrap();
+
+        assert_eq!(
+            records,
+            vec![EkiRelocationSpec {
+                kind: ElmEbiRelocationKind::ImageBase64,
+                target_segment_index: 1,
+                value_index: 0,
+                target_offset: 8,
+                addend: 0x20,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_non_relative_dynamic_relocation() {
+        let (elf, bytes) = relocation_fixture(4);
+        assert!(dynamic_relative_relocations(&elf, &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_relative_relocation_into_segment_gap() {
+        let (elf, mut bytes) = relocation_fixture(ELF_RELOCATION_RELATIVE);
+        write_u64(&mut bytes, 16, 0x800);
+
+        assert!(dynamic_relative_relocations(&elf, &bytes).is_err());
+    }
 }

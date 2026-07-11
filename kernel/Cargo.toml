@@ -33,7 +33,7 @@ bench = false
 acpi = { path = "../libs/acpi", default-features = false, features = ["aml", "alloc"] }
 arch = { path = "../arch" }
 elf = { path = "../libs/elf" }
-elm_model = { package = "elm", path = "../libs/elm" }
+elm_model = { package = "elm", path = "../libs/elm", default-features = false, features = ["runtime-model"] }
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "zeroize"] }
 errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }

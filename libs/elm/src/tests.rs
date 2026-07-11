@@ -544,6 +544,58 @@ fn proof_sha256_matches_standard_vectors() {
     );
 }
 
+#[test]
+fn canonical_ebi_digest_ignores_container_block_layout() {
+    let code = vec![0x13, 0, 0, 0];
+    let manifest = (
+        ElmEkiBlockKind::Manifest,
+        eki_manifest_block("canonical-layout", "0.1.0", ElmKind::Service),
+    );
+    let segments = (
+        ElmEkiBlockKind::Segments,
+        eki_segments_block(
+            ElmEbiSegmentKind::Code,
+            0,
+            code.len() as u64,
+            code.len() as u64,
+        ),
+    );
+    let lifecycle = (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block());
+    let symbols = (
+        ElmEkiBlockKind::SymbolLocations,
+        eki_symbol_locations_block(&[
+            (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 2),
+            (ELM_EBI_HOOK_ON_FINALIZE, 0, 2, 2),
+        ]),
+    );
+    let first = parse_eki_image(&eki_image(&[
+        manifest.clone(),
+        segments.clone(),
+        (ElmEkiBlockKind::Code, code.clone()),
+        lifecycle.clone(),
+        symbols.clone(),
+    ]))
+    .unwrap();
+    let second = parse_eki_image(&eki_image(&[
+        manifest,
+        lifecycle,
+        segments,
+        (ElmEkiBlockKind::Code, code),
+        symbols,
+    ]))
+    .unwrap();
+
+    assert_ne!(
+        first.unit.segments[0].source_index,
+        second.unit.segments[0].source_index
+    );
+    assert_ne!(
+        first.unit.segments[0].source_offset,
+        second.unit.segments[0].source_offset
+    );
+    assert_eq!(canonical_ebi_digest(&first), canonical_ebi_digest(&second));
+}
+
 fn trust_fixture(
     name: &str,
     release_epoch: u64,

@@ -478,6 +478,19 @@ struct NativeImportRuntime {
     address: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeImportStageKey {
+    owner: ElmId,
+    owner_generation: Generation,
+}
+
+#[derive(Debug)]
+struct StagedNativeImports {
+    key: NativeImportStageKey,
+    execution: CellExecutionToken,
+    imports: Vec<NativeImportRuntime>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NativeImportRebindPlan {
     runtime_index: usize,
@@ -581,6 +594,7 @@ struct ProviderCallExecutionPlan {
     edge: elm_model::CapabilityBindingEdge,
     frame: ElmCallFrame,
     deadline_ns: u64,
+    reply_flags_mask: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -595,8 +609,33 @@ struct ProviderSnapshotExecutionPlan {
     capacity: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ManagedCallerReservation {
+    Active(CellExecutionToken),
+    Staged {
+        stage: NativeImportStageKey,
+        execution: CellExecutionToken,
+    },
+}
+
+impl ManagedCallerReservation {
+    const fn cell(self) -> ElmId {
+        match self {
+            Self::Active(token) => token.cell,
+            Self::Staged { stage, .. } => stage.owner,
+        }
+    }
+
+    const fn generation(self) -> Generation {
+        match self {
+            Self::Active(token) => token.generation,
+            Self::Staged { stage, .. } => stage.owner_generation,
+        }
+    }
+}
+
 struct ManagedCallExecutionPlan {
-    caller: CellExecutionToken,
+    caller: ManagedCallerReservation,
     callee: CellExecutionToken,
     import_handle: u64,
     address: usize,
@@ -811,13 +850,15 @@ struct NativeLoadExecutionPlan {
     topology: ResolvedEbiTopology,
     loaded: LoadedElmImage,
     exports: Vec<NativeExportRuntime>,
-    imports: Vec<NativeImportRuntime>,
+    import_stage: NativeImportStageKey,
     initialize: ElmContext,
     trust: PreparedImageTrust,
 }
 
 struct NativeLoadFailurePlan {
     id: ElmId,
+    token: CellExecutionToken,
+    import_stage: NativeImportStageKey,
     loaded: LoadedElmImage,
     finalize: ElmContext,
     response: ElmLoadCellResponse,
@@ -844,7 +885,7 @@ struct NativeReplaceExecutionPlan {
     unit: ElmEbiUnit,
     loaded: LoadedElmImage,
     exports: Vec<NativeExportRuntime>,
-    imports: Vec<NativeImportRuntime>,
+    import_stage: NativeImportStageKey,
     old_executor: NativeHookExecutor,
     new_executor: NativeHookExecutor,
     new_initialize: ElmContext,
@@ -858,11 +899,55 @@ struct NativeReplaceExecutionPlan {
 
 struct NativeReplaceExecutionOutcome {
     commit: bool,
-    quarantine_old: bool,
+    old_execution: OldGenerationExecutionState,
     status: i32,
     blockers: u64,
     reason: u32,
     migrated_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OldGenerationExecutionState {
+    Untouched,
+    Quiesced,
+    Resumed,
+    Compromised,
+}
+
+impl OldGenerationExecutionState {
+    const fn recovered(self) -> bool {
+        matches!(self, Self::Untouched | Self::Resumed)
+    }
+}
+
+#[cfg(feature = "kernel-tests")]
+#[derive(Default)]
+struct ReplaceRecoveryTestExecutor {
+    resume_calls: u32,
+    fail_resume: bool,
+}
+
+#[cfg(feature = "kernel-tests")]
+impl ElmLifecycleExecutor for ReplaceRecoveryTestExecutor {
+    fn on_initialize(&mut self, _context: &mut ElmContext) -> ElmResult<()> {
+        Ok(())
+    }
+
+    fn on_finalize(&mut self, _context: &mut ElmContext) -> ElmResult<()> {
+        Ok(())
+    }
+
+    fn on_resume(&mut self, context: &mut ElmContext) -> ElmResult<()> {
+        if context.phase() != ElmLifecyclePhase::Resume {
+            return Err(ElmError::InvalidTransition);
+        }
+        self.resume_calls += 1;
+        if self.fail_resume {
+            Err(ElmError::InvalidTransition)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 enum PreparedNativeReplace {
@@ -1031,6 +1116,7 @@ pub(crate) struct ElmCore {
     retired_native_images: Vec<RetiredNativeImage>,
     native_exports: Vec<NativeExportRuntime>,
     native_imports: Vec<NativeImportRuntime>,
+    staged_native_imports: Vec<StagedNativeImports>,
     ports: Vec<PortRuntime>,
     providers: Vec<ProviderRuntime>,
     provider_jobs: VecDeque<ProviderAsyncJob>,
@@ -1096,6 +1182,7 @@ impl ElmCore {
             retired_native_images: Vec::new(),
             native_exports: Vec::new(),
             native_imports: Vec::new(),
+            staged_native_imports: Vec::new(),
             ports: Vec::new(),
             providers: Vec::new(),
             provider_jobs: VecDeque::new(),
@@ -1714,10 +1801,8 @@ impl ElmCore {
             return false;
         };
         let mut total = ResourceBudgetAccumulator::default();
-        total.add_usage(
-            self.cell_resource_usage(parent),
-            parent_budget.cpu_period_ns,
-        );
+        let parent_usage = self.cell_resource_usage(parent);
+        total.add_usage(parent_usage, parent_budget.cpu_period_ns);
         total.add(replacement);
         for child in self.cells.iter().filter(|cell| {
             cell.parent == Some(parent)
@@ -3339,6 +3424,31 @@ impl ElmCore {
                 .then_with(|| left.extension.0.cmp(&right.extension.0))
         });
         if matched_edges.is_empty() {
+            if request.flags & elm_model::ELM_EXTENSION_DISPATCH_FLAG_ALLOW_EMPTY != 0 {
+                self.record_mgr_audit(
+                    ELM_MGR_ACTION_EXTENSION_DISPATCH,
+                    target,
+                    0,
+                    self.cell_state(target).map(state_code).unwrap_or(0),
+                );
+                self.push_mixin_trace(
+                    target,
+                    requested_extension.unwrap_or(ElmId(0)),
+                    ELM_MGR_STATUS_OK,
+                    0,
+                    0,
+                );
+                return PreparedExtensionDispatch::Immediate(Ok(
+                    ElmExtensionDispatchResponse::new(
+                        ELM_MGR_STATUS_OK,
+                        0,
+                        0,
+                        0,
+                        ElmReplyFrame::empty(0, u64::from(request.opcode), ELM_CALL_STATUS_OK),
+                    )
+                    .with_mode(mode),
+                ));
+            }
             let blockers = ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND;
             self.record_mgr_audit(
                 ELM_MGR_ACTION_EXTENSION_DISPATCH,
@@ -3465,6 +3575,7 @@ impl ElmCore {
                 edge,
                 frame,
                 deadline_ns: 0,
+                reply_flags_mask: ELM_MIXIN_REPLY_FLAGS_MASK,
             },
             ephemeral_lease: lease,
         })
@@ -4540,6 +4651,7 @@ impl ElmCore {
                 edge,
                 frame: job.frame,
                 deadline_ns: job.deadline_ns,
+                reply_flags_mask: 0,
             },
         })
     }
@@ -5891,7 +6003,7 @@ impl ElmCore {
     ) -> ElmLoadCellResponse {
         let mut executor = failure.loaded.lifecycle_executor();
         let result = executor.on_finalize(&mut failure.finalize);
-        self.complete_native_load_failure(failure.id, result);
+        self.complete_native_load_failure(failure.id, failure.token, failure.import_stage, result);
         failure.response
     }
 
@@ -5947,7 +6059,13 @@ impl ElmCore {
                             ElmEbiLoadStatus::RuntimeRejected,
                         ));
                     }
-                    topology.dependencies.extend(dependencies);
+                    for dependency in dependencies {
+                        if !topology.dependencies.iter().any(|existing| {
+                            existing.0 == dependency.0 && existing.1 == dependency.1
+                        }) {
+                            topology.dependencies.push(dependency);
+                        }
+                    }
                     (imports, resolved_imports)
                 }
                 Err(status) => {
@@ -5964,7 +6082,7 @@ impl ElmCore {
             parent,
             budget,
             manifest,
-            name,
+            name.clone(),
             image_arch,
             &image.unit,
             source,
@@ -6022,6 +6140,12 @@ impl ElmCore {
                 ));
             }
             Err(status) => {
+                log::error!(
+                    "[elm] 原生镜像装载器拒绝 cell={} name={} status={:?}",
+                    id.0,
+                    name,
+                    status
+                );
                 self.quarantine_cell_after_hook_failure(id);
                 return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
                     status,
@@ -6041,6 +6165,11 @@ impl ElmCore {
             ));
         }
         if !self.native_provider_handlers_available(&image, &loaded) {
+            log::error!(
+                "[elm] 原生 provider 符号校验失败 cell={} name={}",
+                id.0,
+                name
+            );
             self.quarantine_cell_after_hook_failure(id);
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -6052,6 +6181,12 @@ impl ElmCore {
         let exports = match self.collect_native_exports(id, Generation::FIRST, &image, &loaded) {
             Ok(exports) => exports,
             Err(status) => {
+                log::error!(
+                    "[elm] 原生 export 收集失败 cell={} name={} status={:?}",
+                    id.0,
+                    name,
+                    status
+                );
                 self.quarantine_cell_after_hook_failure(id);
                 return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
                     status,
@@ -6062,10 +6197,6 @@ impl ElmCore {
             }
         };
         if self.native_exports.try_reserve(exports.len()).is_err()
-            || self
-                .native_imports
-                .try_reserve(resolved_native_imports.len())
-                .is_err()
             || self.native_images.try_reserve(1).is_err()
         {
             self.quarantine_cell_after_hook_failure(id);
@@ -6113,6 +6244,21 @@ impl ElmCore {
                 ));
             }
         };
+        let import_stage =
+            match self.stage_native_imports(token, Generation::FIRST, resolved_native_imports) {
+                Ok(stage) => stage,
+                Err(()) => {
+                    self.abort_image_trust(&trust);
+                    self.release_cell_execution(token);
+                    self.quarantine_cell_after_hook_failure(id);
+                    return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
+                        ElmEbiLoadStatus::RuntimeRejected,
+                        id.0,
+                        state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                        ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                    ));
+                }
+            };
         PreparedNativeLoad::Initialize(NativeLoadExecutionPlan {
             token,
             id,
@@ -6125,7 +6271,7 @@ impl ElmCore {
             topology,
             loaded,
             exports,
-            imports: resolved_native_imports,
+            import_stage,
             initialize,
             trust,
         })
@@ -6138,6 +6284,7 @@ impl ElmCore {
     ) -> NativeLoadCommit {
         if result.is_err() {
             self.abort_image_trust(&plan.trust);
+            self.discard_native_import_stage(plan.import_stage);
             self.release_cell_execution(plan.token);
             self.quarantine_cell_after_hook_failure(plan.id);
             return NativeLoadCommit::Complete(ElmLoadCellResponse::new(
@@ -6147,7 +6294,9 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_HOOK_FAILED,
             ));
         }
-        if !self.cell_execution_is_current(plan.token) {
+        if !self.cell_execution_is_current(plan.token)
+            || !self.native_import_stage_is_current(plan.import_stage)
+        {
             return NativeLoadCommit::Finalize(self.abort_native_load_after_initialize(
                 plan,
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -6172,7 +6321,10 @@ impl ElmCore {
         plan: NativeLoadExecutionPlan,
         result: ElmResult<()>,
     ) -> NativeLoadCommit {
-        if result.is_err() || !self.cell_execution_is_current(plan.token) {
+        if result.is_err()
+            || !self.cell_execution_is_current(plan.token)
+            || !self.native_import_stage_is_current(plan.import_stage)
+        {
             return NativeLoadCommit::Finalize(self.abort_native_load_after_initialize(
                 plan,
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -6180,6 +6332,13 @@ impl ElmCore {
             ));
         }
         if self.cell_resource_over_quota(plan.id, ElmResourceKind::NativeImage) {
+            return NativeLoadCommit::Finalize(self.abort_native_load_after_initialize(
+                plan,
+                ElmEbiLoadStatus::RuntimeRejected,
+                ELM_LIFECYCLE_REASON_LEASE_BUSY,
+            ));
+        }
+        if !self.reserve_native_import_stage_promotion(plan.import_stage) {
             return NativeLoadCommit::Finalize(self.abort_native_load_after_initialize(
                 plan,
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -6198,8 +6357,22 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_LEASE_BUSY,
             ));
         }
+        if !self.promote_native_import_stage(plan.import_stage) {
+            log::error!(
+                "[elm] 原生 import 暂存事务在提交时丢失 cell={} generation={}",
+                plan.id.0,
+                plan.token.generation.0
+            );
+            self.rollback_activated_cell_to_quarantine(plan.id);
+            self.release_cell_execution(plan.token);
+            return NativeLoadCommit::Complete(ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::RuntimeRejected,
+                plan.id.0,
+                state_code(self.cell_state(plan.id).unwrap_or(ElmState::Quarantined)),
+                ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+            ));
+        }
         self.native_exports.extend(plan.exports);
-        self.native_imports.extend(plan.imports);
         if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == plan.id) {
             cell.ebi_status = ElmEbiLoadStatus::Ok;
             cell.lifecycle_executor_ready = true;
@@ -6229,9 +6402,10 @@ impl ElmCore {
             ElmLifecyclePhase::Finalize,
         );
         self.rollback_activated_cell_to_quarantine(plan.id);
-        self.release_cell_execution(plan.token);
         NativeLoadFailurePlan {
             id: plan.id,
+            token: plan.token,
+            import_stage: plan.import_stage,
             loaded: plan.loaded,
             finalize,
             response: ElmLoadCellResponse::new(
@@ -6243,7 +6417,15 @@ impl ElmCore {
         }
     }
 
-    fn complete_native_load_failure(&mut self, id: ElmId, result: ElmResult<()>) {
+    fn complete_native_load_failure(
+        &mut self,
+        id: ElmId,
+        token: CellExecutionToken,
+        import_stage: NativeImportStageKey,
+        result: ElmResult<()>,
+    ) {
+        self.discard_native_import_stage(import_stage);
+        self.release_cell_execution(token);
         if result.is_err() {
             self.mark_native_fault(id, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED);
         }
@@ -6353,7 +6535,7 @@ impl ElmCore {
                 ELM_POLICY_BLOCK_INVALID_STATE,
             ));
         }
-        let topology = match self.preflight_ebi_topology_for_replace(id, &image.unit) {
+        let mut topology = match self.preflight_ebi_topology_for_replace(id, &image.unit) {
             Ok(topology) => topology,
             Err(_) => {
                 return PreparedNativeReplace::Immediate(self.replace_response(
@@ -6367,17 +6549,6 @@ impl ElmCore {
                 ));
             }
         };
-        if !self.replace_surface_compatible(id, &image.unit, &topology) {
-            return PreparedNativeReplace::Immediate(self.replace_response(
-                id,
-                ELM_MGR_STATUS_INVALID,
-                old_state,
-                old_generation,
-                0,
-                first_lifecycle_reason(ELM_POLICY_BLOCK_CONTRACT_MISMATCH),
-                ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
-            ));
-        }
         if !self.prepare_replace_commit_capacity(id, &image.unit) {
             return PreparedNativeReplace::Immediate(self.replace_response(
                 id,
@@ -6417,6 +6588,28 @@ impl ElmCore {
                             ELM_POLICY_BLOCK_HAS_DEPENDENTS,
                         ));
                     }
+                    if topology
+                        .dependencies
+                        .try_reserve(dependencies.len())
+                        .is_err()
+                    {
+                        return PreparedNativeReplace::Immediate(self.replace_response(
+                            id,
+                            ELM_MGR_STATUS_BUSY,
+                            old_state,
+                            old_generation,
+                            0,
+                            ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                            ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+                        ));
+                    }
+                    for dependency in dependencies {
+                        if !topology.dependencies.iter().any(|existing| {
+                            existing.0 == dependency.0 && existing.1 == dependency.1
+                        }) {
+                            topology.dependencies.push(dependency);
+                        }
+                    }
                     (imports, resolved_imports)
                 }
                 Err(_) => {
@@ -6431,6 +6624,17 @@ impl ElmCore {
                     ));
                 }
             };
+        if !self.replace_surface_compatible(id, &image.unit, &topology) {
+            return PreparedNativeReplace::Immediate(self.replace_response(
+                id,
+                ELM_MGR_STATUS_INVALID,
+                old_state,
+                old_generation,
+                0,
+                first_lifecycle_reason(ELM_POLICY_BLOCK_CONTRACT_MISMATCH),
+                ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
+            ));
+        }
         if !self.native_exports_available_for_replace(id, &image.unit) {
             return PreparedNativeReplace::Immediate(self.replace_response(
                 id,
@@ -6515,10 +6719,6 @@ impl ElmCore {
             ));
         }
         if self.native_exports.try_reserve(exports.len()).is_err()
-            || self
-                .native_imports
-                .try_reserve(resolved_native_imports.len())
-                .is_err()
             || self.retired_native_images.try_reserve(1).is_err()
         {
             return PreparedNativeReplace::Immediate(self.replace_response(
@@ -6652,6 +6852,30 @@ impl ElmCore {
                 ));
             }
         };
+        let import_stage =
+            match self.stage_native_imports(token, new_generation, resolved_native_imports) {
+                Ok(stage) => stage,
+                Err(()) => {
+                    self.abort_image_trust(&trust);
+                    let sources_restored =
+                        self.resume_projection_sources_for_cell(id, old_generation);
+                    self.release_cell_execution(token);
+                    let mut blockers = ELM_POLICY_BLOCK_RESOURCE_QUOTA;
+                    if !sources_restored {
+                        blockers |= ELM_POLICY_BLOCK_GRAPH_INCONSISTENT;
+                        self.quarantine_cell_after_hook_failure(id);
+                    }
+                    return PreparedNativeReplace::Immediate(self.replace_response(
+                        id,
+                        status_from_blockers(blockers),
+                        self.cell_state(id).unwrap_or(old_state),
+                        old_generation,
+                        0,
+                        first_lifecycle_reason(blockers),
+                        blockers,
+                    ));
+                }
+            };
         let new_executor = loaded.lifecycle_executor();
         PreparedNativeReplace::Execute(NativeReplaceExecutionPlan {
             token,
@@ -6663,7 +6887,7 @@ impl ElmCore {
             unit: image.unit,
             loaded,
             exports,
-            imports: resolved_native_imports,
+            import_stage,
             old_executor: self.native_images[old_image_index].lifecycle_executor(),
             new_executor,
             new_initialize,
@@ -6681,25 +6905,55 @@ impl ElmCore {
         mut plan: NativeReplaceExecutionPlan,
         outcome: NativeReplaceExecutionOutcome,
     ) -> ElmReplaceCellResponseV1 {
-        let current = self.cell_execution_is_current(plan.token);
+        let current = self.cell_execution_is_current(plan.token)
+            && self.native_import_stage_is_current(plan.import_stage);
         if outcome.commit && current {
+            if !self.reserve_native_import_stage_promotion(plan.import_stage) {
+                let old_recovered = recover_old_replace_generation(
+                    &mut plan.old_executor,
+                    plan.old_resume.as_mut(),
+                    outcome.old_execution,
+                );
+                let sources_restored = self.rollback_projection_source_replace(
+                    plan.id,
+                    plan.old_generation,
+                    plan.new_generation,
+                );
+                self.abort_image_trust(&plan.trust);
+                self.discard_native_import_stage(plan.import_stage);
+                self.release_cell_execution(plan.token);
+                if !old_recovered || !sources_restored {
+                    self.quarantine_cell_after_hook_failure(plan.id);
+                }
+                return self.replace_response(
+                    plan.id,
+                    ELM_MGR_STATUS_BUSY,
+                    self.cell_state(plan.id).unwrap_or(plan.old_state),
+                    plan.old_generation,
+                    outcome.migrated_len as u32,
+                    ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                    ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+                );
+            }
             if let Err(err) = self.commit_image_trust_acceptance(&plan.trust) {
                 log::error!(
                     "[elm] 替换提交前无法固化镜像信任 cell={}: {:?}",
                     plan.id.0,
                     err
                 );
-                let resumed = plan
-                    .old_resume
-                    .as_mut()
-                    .is_none_or(|context| plan.old_executor.on_resume(context).is_ok());
+                let old_recovered = recover_old_replace_generation(
+                    &mut plan.old_executor,
+                    plan.old_resume.as_mut(),
+                    outcome.old_execution,
+                );
                 let sources_restored = self.rollback_projection_source_replace(
                     plan.id,
                     plan.old_generation,
                     plan.new_generation,
                 );
+                self.discard_native_import_stage(plan.import_stage);
                 self.release_cell_execution(plan.token);
-                if !resumed || !sources_restored {
+                if !old_recovered || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
                 return self.replace_response(
@@ -6724,7 +6978,7 @@ impl ElmCore {
                         &plan.unit,
                         &plan.loaded,
                         plan.exports,
-                        plan.imports,
+                        plan.import_stage,
                     )
                 },
             )
@@ -6735,13 +6989,15 @@ impl ElmCore {
                     plan.old_generation,
                     plan.new_generation,
                 );
-                let resumed = plan
-                    .old_resume
-                    .as_mut()
-                    .is_none_or(|context| plan.old_executor.on_resume(context).is_ok());
-                if !sources_restored || !resumed {
+                let old_recovered = recover_old_replace_generation(
+                    &mut plan.old_executor,
+                    plan.old_resume.as_mut(),
+                    outcome.old_execution,
+                );
+                if !sources_restored || !old_recovered {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
+                self.discard_native_import_stage(plan.import_stage);
                 self.release_cell_execution(plan.token);
                 return self.replace_response(
                     plan.id,
@@ -6779,13 +7035,19 @@ impl ElmCore {
             );
         }
 
+        let old_recovered = recover_old_replace_generation(
+            &mut plan.old_executor,
+            plan.old_resume.as_mut(),
+            outcome.old_execution,
+        );
         let sources_restored = self.rollback_projection_source_replace(
             plan.id,
             plan.old_generation,
             plan.new_generation,
         );
         self.abort_image_trust(&plan.trust);
-        if outcome.quarantine_old || (outcome.commit && !current) || !sources_restored {
+        self.discard_native_import_stage(plan.import_stage);
+        if !old_recovered || !sources_restored {
             self.quarantine_cell_after_hook_failure(plan.id);
         }
         self.release_cell_execution(plan.token);
@@ -8181,8 +8443,8 @@ impl ElmCore {
             static_flags,
             ELM_POLICY_BLOCK_NATIVE_TODO,
             0,
-            "framework.rust_elm_highlevel",
-            "外部 Rust ELM 高级宏、仓库模板、调试体验和发布工具仍未完成",
+            "framework.rust_elm_distribution",
+            "外部 Rust ELM 的调试符号归档、依赖锁定和发布仓库流程仍未完成",
         ));
         for pending in &self.pending_ebi_loads {
             records.push(todo_record(
@@ -9509,7 +9771,7 @@ impl ElmCore {
                 .as_str(),
             );
         }
-        out.push_str("[remaining_scope]\n子系统 provider 接入、完整用户态管理工具和 Rust ELM 开发体验属于后续独立主线。\n");
+        out.push_str("[remaining_scope]\n子系统 provider 接入、完整用户态管理工具以及 ELM 调试与发布生态属于后续独立主线。\n");
         out.into_bytes()
     }
 
@@ -10695,7 +10957,10 @@ impl ElmCore {
         unit: &ElmEbiUnit,
         source: ElmEbiSourceKind,
     ) -> Result<(), ElmError> {
-        self.cells.try_reserve(1).map_err(|_| ElmError::LeaseBusy)?;
+        self.cells.try_reserve(1).map_err(|_| {
+            log::error!("[elm] 单元表扩容失败 cell={} parent={}", id.0, parent.0);
+            ElmError::LeaseBusy
+        })?;
         let parent_policy = {
             let parent_cell = self
                 .cells
@@ -10703,29 +10968,50 @@ impl ElmCore {
                 .find(|cell| cell.id == parent)
                 .ok_or(ElmError::CellNotFound)?;
             if parent_cell.state != ElmState::Active || parent_cell.isolated {
+                log::error!(
+                    "[elm] 父单元不可接纳子单元 cell={} parent={} state={:?} isolated={}",
+                    id.0,
+                    parent.0,
+                    parent_cell.state,
+                    parent_cell.isolated
+                );
                 return Err(ElmError::InvalidTransition);
             }
             if !budget_is_subset(resource_budget, parent_cell.resource_budget)
                 || !self.child_budget_allocation_fits(parent, id, resource_budget)
             {
+                log::error!(
+                    "[elm] 子单元预算超出父单元配额 cell={} parent={}",
+                    id.0,
+                    parent.0
+                );
                 return Err(ElmError::LeaseBusy);
             }
             parent_cell.cell_policy
         };
         let kind = manifest.kind;
         if !super::resource_accounting::register_cell(id, resource_budget) {
+            log::error!("[elm] 资源账本拒绝登记 cell={}", id.0);
             return Err(ElmError::LeaseBusy);
         }
         if !super::owned_resource::register_owner(id, Generation::FIRST) {
+            log::error!("[elm] 所有权资源表拒绝登记 cell={}", id.0);
             let _ = super::resource_accounting::retire_cell(id);
             return Err(ElmError::LeaseBusy);
         }
         if let Err(err) = self.graph.insert_cell(id, manifest) {
+            log::error!("[elm] 绑定图拒绝插入 cell={}: {:?}", id.0, err);
             let _ = super::owned_resource::retire_owner(id, Generation::FIRST);
             let _ = super::resource_accounting::retire_cell(id);
             return Err(err);
         }
         if let Err(err) = self.graph.set_parent(id, parent) {
+            log::error!(
+                "[elm] 绑定图拒绝父子关系 cell={} parent={}: {:?}",
+                id.0,
+                parent.0,
+                err
+            );
             let _ = self.graph.remove_cell(id);
             let _ = super::owned_resource::retire_owner(id, Generation::FIRST);
             let _ = super::resource_accounting::retire_cell(id);
@@ -10785,6 +11071,7 @@ impl ElmCore {
             .transition_cell_state(id, ElmState::Verified)
             .and_then(|_| self.transition_cell_state(id, ElmState::Loaded))
         {
+            log::error!("[elm] 单元初始状态迁移失败 cell={}: {:?}", id.0, err);
             self.cells.retain(|cell| cell.id != id);
             let _ = self.graph.remove_cell(id);
             let _ = super::owned_resource::retire_owner(id, Generation::FIRST);
@@ -11038,6 +11325,12 @@ impl ElmCore {
                     })
                 })
         {
+            log::error!(
+                "[elm] 替换表面不兼容：dependency cell={} runtime={} image={}",
+                id.0,
+                current_dependency_count,
+                topology.dependencies.len()
+            );
             return false;
         }
 
@@ -11063,6 +11356,12 @@ impl ElmCore {
                     })
                 })
         {
+            log::error!(
+                "[elm] 替换表面不兼容：extension cell={} runtime={} image={}",
+                id.0,
+                current_extension_count,
+                topology.extensions.len()
+            );
             return false;
         }
 
@@ -11084,10 +11383,17 @@ impl ElmCore {
                     })
                 })
         {
+            log::error!(
+                "[elm] 替换表面不兼容：extension point cell={} runtime={} image={}",
+                id.0,
+                current_point_count,
+                unit.extension_points.len()
+            );
             return false;
         }
 
         if unit.menu.is_some() != self.menu_items.iter().any(|item| item.owner == id) {
+            log::error!("[elm] 替换表面不兼容：menu cell={}", id.0);
             return false;
         }
 
@@ -11112,10 +11418,20 @@ impl ElmCore {
                     })
                 })
         {
+            log::error!(
+                "[elm] 替换表面不兼容：provider port cell={} runtime={} image={}",
+                id.0,
+                current_port_count,
+                unit.provider_ports.len()
+            );
             return false;
         }
 
-        self.native_export_surface_compatible_for_replace(id, unit)
+        let compatible = self.native_export_surface_compatible_for_replace(id, unit);
+        if !compatible {
+            log::error!("[elm] 替换表面不兼容：native export cell={}", id.0);
+        }
+        compatible
     }
 
     fn native_export_surface_compatible_for_replace(
@@ -11676,10 +11992,179 @@ impl ElmCore {
         })
     }
 
+    fn stage_native_imports(
+        &mut self,
+        execution: CellExecutionToken,
+        owner_generation: Generation,
+        imports: Vec<NativeImportRuntime>,
+    ) -> Result<NativeImportStageKey, ()> {
+        let key = NativeImportStageKey {
+            owner: execution.cell,
+            owner_generation,
+        };
+        if !execution.exclusive
+            || !self.cell_execution_is_current(execution)
+            || self
+                .staged_native_imports
+                .iter()
+                .any(|stage| stage.key == key)
+            || imports.iter().any(|import| {
+                import.owner != key.owner || import.owner_generation != key.owner_generation
+            })
+        {
+            return Err(());
+        }
+        for import in imports
+            .iter()
+            .filter(|import| native_import_is_managed(import.flags))
+        {
+            if import.handle == 0
+                || self
+                    .native_imports
+                    .iter()
+                    .any(|active| active.handle == import.handle)
+                || self.staged_native_imports.iter().any(|stage| {
+                    stage
+                        .imports
+                        .iter()
+                        .any(|staged| staged.handle == import.handle)
+                })
+            {
+                return Err(());
+            }
+        }
+        self.staged_native_imports.try_reserve(1).map_err(|_| ())?;
+        self.staged_native_imports.push(StagedNativeImports {
+            key,
+            execution,
+            imports,
+        });
+        Ok(key)
+    }
+
+    fn native_import_stage_is_current(&self, key: NativeImportStageKey) -> bool {
+        self.staged_native_imports
+            .iter()
+            .find(|stage| stage.key == key)
+            .is_some_and(|stage| self.native_import_stage_execution_is_current(stage.execution))
+    }
+
+    fn native_import_stage_execution_is_current(&self, execution: CellExecutionToken) -> bool {
+        execution.exclusive
+            && self.cells.iter().any(|cell| {
+                cell.id == execution.cell
+                    && cell.generation == execution.generation
+                    && cell.policy_epoch == execution.policy_epoch
+                    && cell.exclusive_execution
+                    && cell.active_executions != 0
+            })
+    }
+
+    fn reserve_native_import_stage_promotion(&mut self, key: NativeImportStageKey) -> bool {
+        let Some(import_count) = self
+            .staged_native_imports
+            .iter()
+            .find(|stage| stage.key == key)
+            .map(|stage| stage.imports.len())
+        else {
+            return false;
+        };
+        self.native_imports.try_reserve(import_count).is_ok()
+    }
+
+    fn promote_native_import_stage(&mut self, key: NativeImportStageKey) -> bool {
+        let Some(index) = self
+            .staged_native_imports
+            .iter()
+            .position(|stage| stage.key == key)
+        else {
+            return false;
+        };
+        if !self
+            .native_import_stage_execution_is_current(self.staged_native_imports[index].execution)
+        {
+            return false;
+        }
+        let mut stage = self.staged_native_imports.swap_remove(index);
+        self.native_imports.append(&mut stage.imports);
+        true
+    }
+
+    fn discard_native_import_stage(&mut self, key: NativeImportStageKey) -> usize {
+        let Some(index) = self
+            .staged_native_imports
+            .iter()
+            .position(|stage| stage.key == key)
+        else {
+            return 0;
+        };
+        self.staged_native_imports.swap_remove(index).imports.len()
+    }
+
+    fn staged_native_import(
+        &self,
+        caller: ElmId,
+        caller_generation: Generation,
+        import_handle: u64,
+        phase: ElmLifecyclePhase,
+    ) -> Result<
+        (
+            NativeImportRuntime,
+            NativeImportStageKey,
+            CellExecutionToken,
+        ),
+        i32,
+    > {
+        if !native_import_stage_phase_allowed(phase) {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        }
+        let Some(stage) = self.staged_native_imports.iter().find(|stage| {
+            stage
+                .imports
+                .iter()
+                .any(|import| import.handle == import_handle)
+        }) else {
+            return Err(ELM_MGR_STATUS_NOT_FOUND);
+        };
+        if stage.key.owner != caller
+            || stage.key.owner_generation != caller_generation
+            || !stage.execution.exclusive
+            || !self.native_import_stage_execution_is_current(stage.execution)
+        {
+            return Err(ELM_MGR_STATUS_PERMISSION);
+        }
+        let import = stage
+            .imports
+            .iter()
+            .find(|import| import.handle == import_handle)
+            .cloned()
+            .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
+        Ok((import, stage.key, stage.execution))
+    }
+
+    fn managed_caller_is_current(&self, caller: ManagedCallerReservation) -> bool {
+        match caller {
+            ManagedCallerReservation::Active(token) => self.cell_execution_is_current(token),
+            ManagedCallerReservation::Staged { stage, execution } => {
+                self.native_import_stage_execution_is_current(execution)
+                    && self.staged_native_imports.iter().any(|candidate| {
+                        candidate.key == stage && candidate.execution.cell == execution.cell
+                    })
+            }
+        }
+    }
+
+    fn release_managed_caller(&mut self, caller: ManagedCallerReservation) {
+        if let ManagedCallerReservation::Active(token) = caller {
+            self.release_cell_execution(token);
+        }
+    }
+
     fn prepare_managed_call(
         &mut self,
         caller: ElmId,
         caller_generation: Generation,
+        caller_phase: ElmLifecyclePhase,
         import_handle: u64,
         frame: ElmCallFrame,
     ) -> Result<ManagedCallExecutionPlan, i32> {
@@ -11691,18 +12176,34 @@ impl ElmCore {
         {
             return Err(ELM_MGR_STATUS_INVALID);
         }
-        let import = self
+        let active_import = self
             .native_imports
             .iter()
             .find(|import| import.handle == import_handle)
-            .cloned()
-            .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
-        if import.owner != caller
-            || import.owner_generation != caller_generation
-            || !native_import_is_managed(import.flags)
-        {
-            return Err(ELM_MGR_STATUS_PERMISSION);
-        }
+            .cloned();
+        let (import, staged_caller) = match active_import {
+            Some(import) => {
+                if import.owner != caller
+                    || import.owner_generation != caller_generation
+                    || !native_import_is_managed(import.flags)
+                {
+                    return Err(ELM_MGR_STATUS_PERMISSION);
+                }
+                (import, None)
+            }
+            None => {
+                let (import, stage, execution) = self.staged_native_import(
+                    caller,
+                    caller_generation,
+                    import_handle,
+                    caller_phase,
+                )?;
+                if !native_import_is_managed(import.flags) {
+                    return Err(ELM_MGR_STATUS_PERMISSION);
+                }
+                (import, Some((stage, execution)))
+            }
+        };
         let export = self
             .native_exports
             .iter()
@@ -11717,30 +12218,36 @@ impl ElmCore {
             .cloned()
             .ok_or(ELM_MGR_STATUS_NOT_FOUND)?;
         let bounds = export.bounds.ok_or(ELM_MGR_STATUS_INVALID)?;
-        if self.cell_state(caller) != Some(ElmState::Active)
-            || self.cell_state(import.provider) != Some(ElmState::Active)
+        if self.cell_state(import.provider) != Some(ElmState::Active)
+            || (staged_caller.is_none() && self.cell_state(caller) != Some(ElmState::Active))
         {
             return Err(ELM_MGR_STATUS_BUSY);
         }
-        let caller_token = self.reserve_cell_execution(caller)?;
-        if caller_token.generation != caller_generation {
-            self.release_cell_execution(caller_token);
-            return Err(ELM_MGR_STATUS_BUSY);
-        }
+        let caller_reservation = match staged_caller {
+            Some((stage, execution)) => ManagedCallerReservation::Staged { stage, execution },
+            None => {
+                let token = self.reserve_cell_execution(caller)?;
+                if token.generation != caller_generation {
+                    self.release_cell_execution(token);
+                    return Err(ELM_MGR_STATUS_BUSY);
+                }
+                ManagedCallerReservation::Active(token)
+            }
+        };
         let callee_token = match self.reserve_cell_execution(import.provider) {
             Ok(token) => token,
             Err(status) => {
-                self.release_cell_execution(caller_token);
+                self.release_managed_caller(caller_reservation);
                 return Err(status);
             }
         };
         if callee_token.generation != import.provider_generation {
             self.release_cell_execution(callee_token);
-            self.release_cell_execution(caller_token);
+            self.release_managed_caller(caller_reservation);
             return Err(ELM_MGR_STATUS_BUSY);
         }
         Ok(ManagedCallExecutionPlan {
-            caller: caller_token,
+            caller: caller_reservation,
             callee: callee_token,
             import_handle,
             address: export.address,
@@ -11754,10 +12261,10 @@ impl ElmCore {
         plan: ManagedCallExecutionPlan,
         reply: ElmReplyFrame,
     ) -> Result<ElmReplyFrame, i32> {
-        let current = self.cell_execution_is_current(plan.caller)
+        let current = self.managed_caller_is_current(plan.caller)
             && self.cell_execution_is_current(plan.callee);
         self.release_cell_execution(plan.callee);
-        self.release_cell_execution(plan.caller);
+        self.release_managed_caller(plan.caller);
         if !current {
             return Err(ELM_MGR_STATUS_BUSY);
         }
@@ -12063,6 +12570,7 @@ impl ElmCore {
                     edge,
                     frame,
                     deadline_ns: 0,
+                    reply_flags_mask: 0,
                 }))
             }
         }
@@ -12907,7 +13415,7 @@ impl ElmCore {
         unit: &ElmEbiUnit,
         loaded: &LoadedElmImage,
         exports: Vec<NativeExportRuntime>,
-        imports: Vec<NativeImportRuntime>,
+        import_stage: NativeImportStageKey,
     ) -> bool {
         if !self.replace_commit_capacity_available(id, unit) {
             return false;
@@ -12927,7 +13435,15 @@ impl ElmCore {
         self.remove_native_exports_owned_by(id);
         self.remove_native_imports_owned_by(id);
         self.native_exports.extend(exports);
-        self.native_imports.extend(imports);
+        if !self.promote_native_import_stage(import_stage) {
+            log::error!(
+                "[elm] 替换提交时原生 import 暂存事务丢失 cell={} generation={}",
+                id.0,
+                generation.0
+            );
+            let _ = super::owned_resource::replace_owner_generation(id, generation, old_generation);
+            return false;
+        }
         self.replace_dynamic_provider_backends(id, generation, unit, loaded);
         self.replace_menu_metadata(id, unit);
         self.rewrite_owned_generation(id, generation);
@@ -14542,6 +15058,237 @@ impl ElmCore {
 
         highest && duplicate_rejected && direct_blocks_replace
     }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn test_native_import_staging_transaction() -> bool {
+        let mut core = Self::new();
+        if core.init_builtin_mgr().is_err() {
+            return false;
+        }
+        let owner = ELM_EKI_ID;
+        let provider = ELM_MGR_ID;
+        let contract = match FlowContract::new("test.staged-import@1") {
+            Ok(contract) => contract,
+            Err(_) => return false,
+        };
+        core.native_exports.push(NativeExportRuntime {
+            owner: provider,
+            generation: Generation::FIRST,
+            name: "test.staged-call".to_string(),
+            contract: contract.clone(),
+            version: 1,
+            flags: ELM_EBI_EXPORT_FLAG_MANAGED,
+            address: 0x1100,
+            bounds: Some(NativeExecutionBounds {
+                code_start: 0x1000,
+                code_end: 0x2000,
+                image_start: 0x1000,
+                image_end: 0x3000,
+            }),
+        });
+        let import = |handle, generation| NativeImportRuntime {
+            handle,
+            owner,
+            owner_generation: generation,
+            provider,
+            provider_generation: Generation::FIRST,
+            name: "test.staged-call".to_string(),
+            contract: contract.clone(),
+            min_version: 1,
+            max_version: 1,
+            selected_version: 1,
+            flags: ELM_EBI_IMPORT_FLAG_MANAGED,
+            address: 0x1100,
+        };
+        let frame = ElmCallFrame::empty(0, 1, 0);
+
+        // 首次装载事务只能在受允许的生命周期阶段看见暂存 handle。
+        let first_token = match core.reserve_cell_execution_exclusive(owner) {
+            Ok(token) => token,
+            Err(_) => return false,
+        };
+        let first_stage = match core.stage_native_imports(
+            first_token,
+            Generation::FIRST,
+            alloc::vec![import(0x100, Generation::FIRST)],
+        ) {
+            Ok(stage) => stage,
+            Err(_) => return false,
+        };
+        let wrong_phase_rejected = matches!(
+            core.prepare_managed_call(
+                owner,
+                Generation::FIRST,
+                ElmLifecyclePhase::Pause,
+                0x100,
+                frame,
+            ),
+            Err(ELM_MGR_STATUS_NOT_FOUND)
+        );
+        let wrong_generation_rejected = matches!(
+            core.prepare_managed_call(
+                owner,
+                Generation(2),
+                ElmLifecyclePhase::Initialize,
+                0x100,
+                frame,
+            ),
+            Err(ELM_MGR_STATUS_PERMISSION)
+        );
+        let first_plan = match core.prepare_managed_call(
+            owner,
+            Generation::FIRST,
+            ElmLifecyclePhase::Initialize,
+            0x100,
+            frame,
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return false,
+        };
+        let first_visible = first_plan.caller.generation() == Generation::FIRST
+            && core
+                .complete_managed_call(first_plan, ElmReplyFrame::empty(0, 1, ELM_CALL_STATUS_OK))
+                .is_ok();
+        let first_discarded = core.discard_native_import_stage(first_stage) == 1
+            && core.staged_native_imports.is_empty()
+            && !core
+                .native_imports
+                .iter()
+                .any(|candidate| candidate.handle == 0x100);
+        core.release_cell_execution(first_token);
+
+        // 替换事务使用新逻辑代际，但仍由旧代际的独占执行令牌保护。
+        let replace_token = match core.reserve_cell_execution_exclusive(owner) {
+            Ok(token) => token,
+            Err(_) => return false,
+        };
+        let replace_stage = match core.stage_native_imports(
+            replace_token,
+            Generation(2),
+            alloc::vec![import(0x101, Generation(2))],
+        ) {
+            Ok(stage) => stage,
+            Err(_) => return false,
+        };
+        let replace_plan = match core.prepare_managed_call(
+            owner,
+            Generation(2),
+            ElmLifecyclePhase::MigrateImport,
+            0x101,
+            frame,
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return false,
+        };
+        let replace_visible = replace_plan.caller.generation() == Generation(2)
+            && core
+                .complete_managed_call(replace_plan, ElmReplyFrame::empty(0, 1, ELM_CALL_STATUS_OK))
+                .is_ok();
+        let replace_discarded = core.discard_native_import_stage(replace_stage) == 1
+            && matches!(
+                core.prepare_managed_call(
+                    owner,
+                    Generation(2),
+                    ElmLifecyclePhase::Initialize,
+                    0x101,
+                    frame,
+                ),
+                Err(ELM_MGR_STATUS_NOT_FOUND)
+            );
+        core.release_cell_execution(replace_token);
+
+        // 成功提交只移动一次暂存记录，随后按正式 Active import 使用。
+        let promote_token = match core.reserve_cell_execution_exclusive(owner) {
+            Ok(token) => token,
+            Err(_) => return false,
+        };
+        let promote_stage = match core.stage_native_imports(
+            promote_token,
+            Generation::FIRST,
+            alloc::vec![import(0x102, Generation::FIRST)],
+        ) {
+            Ok(stage) => stage,
+            Err(_) => return false,
+        };
+        let promoted = core.reserve_native_import_stage_promotion(promote_stage)
+            && core.promote_native_import_stage(promote_stage)
+            && core.staged_native_imports.is_empty()
+            && core
+                .native_imports
+                .iter()
+                .filter(|candidate| candidate.handle == 0x102)
+                .count()
+                == 1
+            && !core.promote_native_import_stage(promote_stage);
+        core.release_cell_execution(promote_token);
+        let active_plan = match core.prepare_managed_call(
+            owner,
+            Generation::FIRST,
+            ElmLifecyclePhase::Pause,
+            0x102,
+            frame,
+        ) {
+            Ok(plan) => plan,
+            Err(_) => return false,
+        };
+        let active_visible = core
+            .complete_managed_call(active_plan, ElmReplyFrame::empty(0, 1, ELM_CALL_STATUS_OK))
+            .is_ok();
+
+        wrong_phase_rejected
+            && wrong_generation_rejected
+            && first_visible
+            && first_discarded
+            && replace_visible
+            && replace_discarded
+            && promoted
+            && active_visible
+    }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn test_native_replace_old_generation_recovery() -> bool {
+        let mut context = ElmContext::new(
+            ELM_EKI_ID,
+            Some(ELM_MGR_ID),
+            Generation::FIRST,
+            ElmState::Active,
+            ElmLifecyclePhase::Resume,
+            0,
+        );
+        let mut executor = ReplaceRecoveryTestExecutor::default();
+        let untouched = resume_old_replace_generation(
+            &mut executor,
+            Some(&mut context),
+            OldGenerationExecutionState::Untouched,
+        );
+        let resumed = resume_old_replace_generation(
+            &mut executor,
+            Some(&mut context),
+            OldGenerationExecutionState::Quiesced,
+        );
+
+        let mut failed_executor = ReplaceRecoveryTestExecutor {
+            fail_resume: true,
+            ..ReplaceRecoveryTestExecutor::default()
+        };
+        let compromised = resume_old_replace_generation(
+            &mut failed_executor,
+            Some(&mut context),
+            OldGenerationExecutionState::Quiesced,
+        );
+        let missing_context = resume_old_replace_generation(
+            &mut executor,
+            None,
+            OldGenerationExecutionState::Quiesced,
+        );
+
+        untouched == OldGenerationExecutionState::Untouched
+            && resumed == OldGenerationExecutionState::Resumed
+            && compromised == OldGenerationExecutionState::Compromised
+            && missing_context == OldGenerationExecutionState::Compromised
+            && executor.resume_calls == 1
+            && failed_executor.resume_calls == 1
+    }
 }
 
 pub(crate) fn with_core<R>(f: impl FnOnce(&mut ElmCore) -> R) -> R {
@@ -14908,7 +15655,7 @@ pub(crate) fn replace_cell_unlocked(
             Ok(response)
         }
         PreparedNativeReplace::Execute(mut plan) => {
-            let outcome = execute_native_replace_plan(&mut plan);
+            let mut outcome = execute_native_replace_plan(&mut plan);
             with_core(|core| {
                 let current = authorization_execution_is_current(
                     core,
@@ -14920,17 +15667,11 @@ pub(crate) fn replace_cell_unlocked(
                 let response = if current {
                     Ok(core.complete_native_replace_execution(plan, outcome))
                 } else {
-                    let _ = core.complete_native_replace_execution(
-                        plan,
-                        NativeReplaceExecutionOutcome {
-                            commit: false,
-                            quarantine_old: true,
-                            status: ELM_MGR_STATUS_PERMISSION,
-                            blockers: ELM_POLICY_BLOCK_CALLER_STALE,
-                            reason: ELM_LIFECYCLE_REASON_INVALID_STATE,
-                            migrated_len: outcome.migrated_len,
-                        },
-                    );
+                    outcome.commit = false;
+                    outcome.status = ELM_MGR_STATUS_PERMISSION;
+                    outcome.blockers = ELM_POLICY_BLOCK_CALLER_STALE;
+                    outcome.reason = ELM_LIFECYCLE_REASON_INVALID_STATE;
+                    let _ = core.complete_native_replace_execution(plan, outcome);
                     Err(ELM_MGR_STATUS_PERMISSION)
                 };
                 core.release_mgr_authorization_execution(authorization_execution);
@@ -14943,7 +15684,9 @@ pub(crate) fn replace_cell_unlocked(
 fn finish_failed_native_load(mut failure: NativeLoadFailurePlan) -> ElmLoadCellResponse {
     let mut executor = failure.loaded.lifecycle_executor();
     let result = executor.on_finalize(&mut failure.finalize);
-    with_core(|core| core.complete_native_load_failure(failure.id, result));
+    with_core(|core| {
+        core.complete_native_load_failure(failure.id, failure.token, failure.import_stage, result)
+    });
     failure.response
 }
 
@@ -15016,18 +15759,25 @@ pub(crate) fn run_one_async_provider_job_unlocked(now_ns: u64) -> bool {
 fn invoke_managed_unlocked(
     caller: ElmId,
     caller_generation: Generation,
+    caller_phase: ElmLifecyclePhase,
     import_handle: u64,
     frame: ElmCallFrame,
 ) -> Result<ElmReplyFrame, i32> {
     let plan = with_core(|core| {
-        core.prepare_managed_call(caller, caller_generation, import_handle, frame)
+        core.prepare_managed_call(
+            caller,
+            caller_generation,
+            caller_phase,
+            import_handle,
+            frame,
+        )
     })?;
     let reply = super::native::invoke_managed_export(
         plan.address,
         plan.bounds,
         plan.import_handle,
-        plan.caller.cell,
-        plan.caller.generation,
+        plan.caller.cell(),
+        plan.caller.generation(),
         plan.callee.cell,
         plan.callee.generation,
         plan.frame,
@@ -15057,6 +15807,7 @@ fn execute_provider_call_plan(plan: &ProviderCallExecutionPlan) -> Result<ElmRep
                 plan.frame,
                 plan.deadline_ns,
                 allowed_actions,
+                plan.reply_flags_mask,
             ))
         }
         ProviderBackend::Kernel(_) | ProviderBackend::ElmNativeTodo => {
@@ -15160,18 +15911,47 @@ fn execute_native_lifecycle_plan(
     }
 }
 
+fn resume_old_replace_generation<E: ElmLifecycleExecutor>(
+    executor: &mut E,
+    resume: Option<&mut ElmContext>,
+    state: OldGenerationExecutionState,
+) -> OldGenerationExecutionState {
+    if state != OldGenerationExecutionState::Quiesced {
+        return state;
+    }
+    let Some(context) = resume else {
+        return OldGenerationExecutionState::Compromised;
+    };
+    if executor.on_resume(context).is_ok() {
+        OldGenerationExecutionState::Resumed
+    } else {
+        OldGenerationExecutionState::Compromised
+    }
+}
+
+fn recover_old_replace_generation<E: ElmLifecycleExecutor>(
+    executor: &mut E,
+    resume: Option<&mut ElmContext>,
+    state: OldGenerationExecutionState,
+) -> bool {
+    resume_old_replace_generation(executor, resume, state).recovered()
+}
+
 fn execute_native_replace_plan(
     plan: &mut NativeReplaceExecutionPlan,
 ) -> NativeReplaceExecutionOutcome {
-    if plan
-        .new_executor
-        .on_initialize(&mut plan.new_initialize)
-        .is_err()
-    {
+    if let Err(err) = plan.new_executor.on_initialize(&mut plan.new_initialize) {
+        log::error!(
+            "[elm] 原生热替换失败 cell={} old_generation={} new_generation={} stage=initialize err={:?}",
+            plan.id.0,
+            plan.old_generation.0,
+            plan.new_generation.0,
+            err
+        );
         let _ = plan.new_executor.on_finalize(&mut plan.new_finalize);
         return NativeReplaceExecutionOutcome {
             commit: false,
-            quarantine_old: false,
+            old_execution: OldGenerationExecutionState::Untouched,
             status: ELM_MGR_STATUS_INVALID,
             blockers: ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
             reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
@@ -15185,10 +15965,17 @@ fn execute_native_replace_plan(
             plan.new_generation,
         )
     {
+        log::error!(
+            "[elm] 原生热替换失败 cell={} old_generation={} new_generation={} stage=projection-source-ready suspended={}",
+            plan.id.0,
+            plan.old_generation.0,
+            plan.new_generation.0,
+            plan.suspended_projection_sources
+        );
         let _ = plan.new_executor.on_finalize(&mut plan.new_finalize);
         return NativeReplaceExecutionOutcome {
             commit: false,
-            quarantine_old: false,
+            old_execution: OldGenerationExecutionState::Untouched,
             status: ELM_MGR_STATUS_INVALID,
             blockers: ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
             reason: ELM_LIFECYCLE_REASON_INVALID_STATE,
@@ -15196,9 +15983,16 @@ fn execute_native_replace_plan(
         };
     }
 
-    let mut old_quiesced = false;
+    let mut old_execution = OldGenerationExecutionState::Untouched;
     if let Some(context) = plan.old_quiesce.as_mut() {
-        if plan.old_executor.on_quiesce(context).is_err() {
+        if let Err(err) = plan.old_executor.on_quiesce(context) {
+            log::error!(
+                "[elm] 原生热替换失败 cell={} old_generation={} new_generation={} stage=quiesce err={:?}",
+                plan.id.0,
+                plan.old_generation.0,
+                plan.new_generation.0,
+                err
+            );
             let _ = plan.new_executor.on_migrate_abort(
                 plan.id,
                 plan.old_generation,
@@ -15209,24 +16003,33 @@ fn execute_native_replace_plan(
             let _ = plan.new_executor.on_finalize(&mut plan.new_finalize);
             return NativeReplaceExecutionOutcome {
                 commit: false,
-                quarantine_old: true,
+                old_execution: OldGenerationExecutionState::Compromised,
                 status: ELM_MGR_STATUS_INVALID,
                 blockers: ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
                 reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
                 migrated_len: 0,
             };
         }
-        old_quiesced = true;
+        old_execution = OldGenerationExecutionState::Quiesced;
     }
 
-    let migrated_len = match plan.old_executor.on_migrate_export(
+    let export_result = plan.old_executor.on_migrate_export(
         plan.id,
         plan.old_generation,
         plan.new_generation,
         &mut plan.migration,
-    ) {
+    );
+    let migrated_len = match export_result {
         Ok(len) if len <= plan.migration.len() => len,
-        _ => {
+        result => {
+            log::error!(
+                "[elm] 原生热替换失败 cell={} old_generation={} new_generation={} stage=migrate-export capacity={} result={:?}",
+                plan.id.0,
+                plan.old_generation.0,
+                plan.new_generation.0,
+                plan.migration.len(),
+                result
+            );
             let _ = plan.new_executor.on_migrate_abort(
                 plan.id,
                 plan.old_generation,
@@ -15235,12 +16038,22 @@ fn execute_native_replace_plan(
                 0,
             );
             let _ = plan.new_executor.on_finalize(&mut plan.new_finalize);
-            if old_quiesced && let Some(context) = plan.old_resume.as_mut() {
-                let _ = plan.old_executor.on_resume(context);
+            old_execution = resume_old_replace_generation(
+                &mut plan.old_executor,
+                plan.old_resume.as_mut(),
+                old_execution,
+            );
+            if old_execution == OldGenerationExecutionState::Compromised {
+                log::error!(
+                    "[elm] 原生热替换回滚失败 cell={} old_generation={} new_generation={} stage=resume-after-migrate-export",
+                    plan.id.0,
+                    plan.old_generation.0,
+                    plan.new_generation.0
+                );
             }
             return NativeReplaceExecutionOutcome {
                 commit: false,
-                quarantine_old: true,
+                old_execution,
                 status: ELM_MGR_STATUS_INVALID,
                 blockers: ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
                 reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
@@ -15249,17 +16062,21 @@ fn execute_native_replace_plan(
         }
     };
 
-    if plan
-        .new_executor
-        .on_migrate_import(
-            plan.id,
-            plan.old_generation,
-            plan.new_generation,
-            &mut plan.migration,
+    if let Err(err) = plan.new_executor.on_migrate_import(
+        plan.id,
+        plan.old_generation,
+        plan.new_generation,
+        &mut plan.migration,
+        migrated_len,
+    ) {
+        log::error!(
+            "[elm] 原生热替换失败 cell={} old_generation={} new_generation={} stage=migrate-import migrated_len={} err={:?}",
+            plan.id.0,
+            plan.old_generation.0,
+            plan.new_generation.0,
             migrated_len,
-        )
-        .is_err()
-    {
+            err
+        );
         let _ = plan.new_executor.on_migrate_abort(
             plan.id,
             plan.old_generation,
@@ -15268,16 +16085,22 @@ fn execute_native_replace_plan(
             migrated_len,
         );
         let _ = plan.new_executor.on_finalize(&mut plan.new_finalize);
-        let resumed = if old_quiesced {
-            plan.old_resume
-                .as_mut()
-                .is_some_and(|context| plan.old_executor.on_resume(context).is_ok())
-        } else {
-            true
-        };
+        old_execution = resume_old_replace_generation(
+            &mut plan.old_executor,
+            plan.old_resume.as_mut(),
+            old_execution,
+        );
+        if old_execution == OldGenerationExecutionState::Compromised {
+            log::error!(
+                "[elm] 原生热替换回滚失败 cell={} old_generation={} new_generation={} stage=resume-after-migrate-import",
+                plan.id.0,
+                plan.old_generation.0,
+                plan.new_generation.0
+            );
+        }
         return NativeReplaceExecutionOutcome {
             commit: false,
-            quarantine_old: !resumed,
+            old_execution,
             status: ELM_MGR_STATUS_INVALID,
             blockers: ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
             reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
@@ -15287,7 +16110,7 @@ fn execute_native_replace_plan(
 
     NativeReplaceExecutionOutcome {
         commit: true,
-        quarantine_old: false,
+        old_execution,
         status: ELM_MGR_STATUS_OK,
         blockers: 0,
         reason: ELM_LIFECYCLE_REASON_NONE,
@@ -15579,6 +16402,16 @@ const fn native_import_is_managed(flags: u32) -> bool {
 
 const fn native_export_is_managed(flags: u32) -> bool {
     flags & ELM_EBI_EXPORT_FLAG_MANAGED != 0
+}
+
+const fn native_import_stage_phase_allowed(phase: ElmLifecyclePhase) -> bool {
+    matches!(
+        phase,
+        ElmLifecyclePhase::Initialize
+            | ElmLifecyclePhase::Finalize
+            | ElmLifecyclePhase::MigrateImport
+            | ElmLifecyclePhase::MigrateAbort
+    )
 }
 
 fn select_managed_export_for_import<'a>(
@@ -16391,7 +17224,13 @@ extern "C" fn elm_api_invoke_managed_v1(
     }
     // 安全性：范围已经由任务级 ELM 执行边界验证，随后立即复制到内核栈。
     let frame = unsafe { request.read() };
-    match invoke_managed_unlocked(context.cell_id, context.generation, import_handle, frame) {
+    match invoke_managed_unlocked(
+        context.cell_id,
+        context.generation,
+        context.phase,
+        import_handle,
+        frame,
+    ) {
         Ok(response) => {
             // 安全性：输出槽已经完成可写范围验证。
             unsafe { reply.write(response) };

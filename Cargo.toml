@@ -17,6 +17,7 @@ members = [
     "libs/fatfs",
     "libs/extfs",
     "libs/elm",
+    "libs/elm/macros",
     "libs/mygo-smoltcp",
     "arch",
     "hal",

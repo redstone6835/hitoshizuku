@@ -2246,8 +2246,8 @@ fn elm_todo_registry_reports_static_and_dynamic_boundaries() {
     );
     assert!(
         bytes
-            .windows("framework.rust_elm_highlevel".len())
-            .any(|window| window == b"framework.rust_elm_highlevel")
+            .windows("framework.rust_elm_distribution".len())
+            .any(|window| window == b"framework.rust_elm_distribution")
     );
     assert!(
         !bytes
@@ -5211,4 +5211,14 @@ fn elm_monotonic_identifiers_never_wrap_or_reuse() {
 #[ktest]
 fn elm_native_replace_selects_highest_unique_managed_export() {
     assert!(ElmCore::test_native_replace_selection_policy());
+}
+
+#[ktest]
+fn elm_native_import_staging_is_transactional() {
+    assert!(ElmCore::test_native_import_staging_transaction());
+}
+
+#[ktest]
+fn elm_native_replace_recovers_only_a_healthy_old_generation() {
+    assert!(ElmCore::test_native_replace_old_generation_recovery());
 }

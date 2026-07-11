@@ -53,7 +53,7 @@
 #define ELM_MGR_MAX_INPUT (ELM_MGR_MAX_PAYLOAD + 16u)
 #define ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED (1u << 0)
 #define ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE (1u << 0)
-#define ELM_PORT_ACCESS_PUBLIC 1u
+#define ELM_PORT_ACCESS_PUBLIC 2u
 #define ELM_FLOW_CONTROL 4u
 #define ELM_FLOW_SHARED 2u
 
@@ -138,7 +138,7 @@ static uint8_t g_out[ELM_MGR_MAX_INPUT];
 #define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_STACK_BYTES (4ull * 1024ull * 1024ull)
 #define ELM_RESOURCE_BUDGET_DEFAULT_DYNAMIC_ALLOC_BYTES (64ull * 1024ull * 1024ull)
 #define ELM_RESOURCE_BUDGET_DEFAULT_CPU_TIME_NS_PER_CALL 1000000000ull
-#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD 5000000000ull
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD 2500000000ull
 #define ELM_RESOURCE_BUDGET_DEFAULT_CPU_PERIOD_NS 10000000000ull
 
 #define ELM_EKI_FORMAT_VERSION 1u
@@ -1166,7 +1166,7 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
     struct elm_todo_registry_header header;
     int saw_static = 0;
     int saw_soyo_projection = 0;
-    int saw_rust_framework = 0;
+    int saw_rust_distribution = 0;
 
     if (require_mgr_payload(ELM_MGR_CALL_QUERY_TODO_REGISTRY, NULL, 0, out, out_len,
                             &payload, &payload_len) != 0) {
@@ -1192,11 +1192,11 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
         }
         if (field_eq(record.name, record.name_len, "projection.soyo_profile")) {
             saw_soyo_projection = 1;
-        } else if (field_eq(record.name, record.name_len, "framework.rust_elm_highlevel")) {
-            saw_rust_framework = 1;
+        } else if (field_eq(record.name, record.name_len, "framework.rust_elm_distribution")) {
+            saw_rust_distribution = 1;
         }
     }
-    if (!saw_static || !saw_soyo_projection || !saw_rust_framework) {
+    if (!saw_static || !saw_soyo_projection || !saw_rust_distribution) {
         return fail_msg("todo-registry", "missing static todo record");
     }
     printf("[elm-smoke] todo registry ok: records=%u active=%u flags=0x%x\n",

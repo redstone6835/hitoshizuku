@@ -9,10 +9,14 @@ doctest = false
 bench = false
 
 [features]
-default = []
+default = ["runtime-model", "macros"]
+runtime-model = ["dep:ed25519-dalek"]
+module = []
+macros = ["dep:elm-macros"]
 
 [dependencies]
-ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "zeroize"] }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "zeroize"], optional = true }
+elm-macros = { path = "macros", optional = true }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
