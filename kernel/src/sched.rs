@@ -138,6 +138,9 @@ impl TaskExtCloneHook for KernelExtCloneHook {
             sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK => {
                 Arc::new(RiscvVectorSignalStack::new(Vec::new()))
             }
+            sched::TASKEXT_ELM_EXECUTION => {
+                Arc::new(general::elm_guard::ElmTaskExecutionState::new())
+            }
             _ => Arc::clone(src),
         }
     }
@@ -156,6 +159,7 @@ impl TaskExtExitHook for KernelExtExitHook {
             let _ = task.ext_remove(sched::TASKEXT_RISCV_VECTOR_SIGNAL_STACK);
         }
         let _ = task.ext_remove(TASKEXT_USER_TRAP_FRAME);
+        let _ = task.ext_remove(sched::TASKEXT_ELM_EXECUTION);
         let _ = task.ext_remove(TASKEXT_VM_SPACE);
         let _ = task.ext_remove(TASKEXT_VFS_FDTABLE);
         let _ = task.ext_remove(TASKEXT_VFS_CONTEXT);

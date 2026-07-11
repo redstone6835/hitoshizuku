@@ -26,6 +26,20 @@
 #define ELM_MGR_STATUS_UNSUPPORTED (-95)
 #define ELM_MGR_STATUS_TODO (-4096)
 
+#define ELM_EBI_LOAD_STATUS_OK 0
+#define ELM_EBI_LOAD_STATUS_INVALID_UNIT (-1)
+#define ELM_EBI_LOAD_STATUS_UNSUPPORTED_ABI (-2)
+#define ELM_EBI_LOAD_STATUS_INVALID_TARGET (-3)
+#define ELM_EBI_LOAD_STATUS_INVALID_SEGMENT (-4)
+#define ELM_EBI_LOAD_STATUS_ARCH_MISMATCH (-5)
+#define ELM_EBI_LOAD_STATUS_INVALID_MANIFEST (-6)
+#define ELM_EBI_LOAD_STATUS_INVALID_MENU (-7)
+#define ELM_EBI_LOAD_STATUS_NATIVE_CODE_TODO (-4096)
+#define ELM_EBI_LOAD_STATUS_RUNTIME_REJECTED (-4097)
+#define ELM_EBI_LOAD_STATUS_UNTRUSTED_IMAGE (-4098)
+#define ELM_EBI_LOAD_STATUS_ABI_FINGERPRINT_REJECTED (-4099)
+#define ELM_EBI_LOAD_STATUS_ROLLBACK_REJECTED (-4100)
+
 #define ELM_CALL_STATUS_OK 0
 #define ELM_CALL_STATUS_NOT_FOUND (-2)
 #define ELM_CALL_STATUS_BUSY (-16)
@@ -70,8 +84,74 @@
 #define ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT 35u
 #define ELM_MGR_CALL_QUERY_NATIVE_CAPABILITIES 36u
 #define ELM_MGR_CALL_QUERY_TODO_REGISTRY 37u
+#define ELM_MGR_CALL_QUERY_EXTENSIONS 38u
+#define ELM_MGR_CALL_PREFLIGHT_EXTENSION_ATTACH 39u
+#define ELM_MGR_CALL_COMMIT_EXTENSION_ATTACH 40u
+#define ELM_MGR_CALL_COMMIT_EXTENSION_DETACH 41u
+#define ELM_MGR_CALL_DISPATCH_EXTENSION 42u
+#define ELM_MGR_CALL_QUERY_FAULT_DUMP 43u
+#define ELM_MGR_CALL_QUERY_LIFECYCLE_TRACE 44u
+#define ELM_MGR_CALL_QUERY_PROVIDER_CALL_TRACE 45u
+#define ELM_MGR_CALL_QUERY_MIXIN_TRACE 46u
+#define ELM_MGR_CALL_QUERY_REPLACE_TRACE 47u
+#define ELM_MGR_CALL_QUERY_POLICY_TRACE 48u
+#define ELM_MGR_CALL_QUERY_RESOURCE_DIAGNOSTICS 49u
+#define ELM_MGR_CALL_QUERY_RUNTIME_JOURNAL 50u
+#define ELM_MGR_CALL_QUERY_CELL_POLICY 51u
+#define ELM_MGR_CALL_UPDATE_CELL_POLICY 52u
+#define ELM_MGR_CALL_QUERY_RESOURCE_BUDGET 53u
+#define ELM_MGR_CALL_UPDATE_RESOURCE_BUDGET 54u
+#define ELM_MGR_CALL_QUERY_TRUST_STATE 55u
 
-#define ELM_MGR_MAX_PAYLOAD 4096u
+#define ELM_POLICY_BLOCK_BUILTIN_PROTECTED (1ull << 0)
+#define ELM_POLICY_BLOCK_CELL_NOT_FOUND (1ull << 1)
+#define ELM_POLICY_BLOCK_INVALID_STATE (1ull << 2)
+#define ELM_POLICY_BLOCK_NATIVE_TODO (1ull << 3)
+#define ELM_POLICY_BLOCK_HAS_CHILDREN (1ull << 4)
+#define ELM_POLICY_BLOCK_HAS_DEPENDENTS (1ull << 5)
+#define ELM_POLICY_BLOCK_HAS_EXTENSIONS (1ull << 6)
+#define ELM_POLICY_BLOCK_LEASE_BUSY (1ull << 7)
+#define ELM_POLICY_BLOCK_GRAPH_INCONSISTENT (1ull << 9)
+#define ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE (1ull << 10)
+#define ELM_POLICY_BLOCK_PORT_NOT_FOUND (1ull << 11)
+#define ELM_POLICY_BLOCK_CONTRACT_MISMATCH (1ull << 12)
+#define ELM_POLICY_BLOCK_DUPLICATE_BINDING (1ull << 13)
+#define ELM_POLICY_BLOCK_PORT_TODO (1ull << 14)
+#define ELM_POLICY_BLOCK_BINDING_NOT_FOUND (1ull << 15)
+#define ELM_POLICY_BLOCK_BINDING_PROTECTED (1ull << 16)
+#define ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND (1ull << 17)
+#define ELM_POLICY_BLOCK_PROVIDER_BUSY (1ull << 18)
+#define ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED (1ull << 19)
+#define ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL (1ull << 20)
+#define ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED (1ull << 21)
+#define ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED (1ull << 22)
+#define ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED (1ull << 23)
+#define ELM_POLICY_BLOCK_RESOURCE_QUOTA (1ull << 24)
+#define ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND (1ull << 25)
+#define ELM_POLICY_BLOCK_EXTENSION_DUPLICATE (1ull << 26)
+#define ELM_POLICY_BLOCK_CAPABILITY_DENIED (1ull << 28)
+#define ELM_POLICY_BLOCK_UNTRUSTED_IMAGE (1ull << 29)
+#define ELM_POLICY_BLOCK_ABI_FINGERPRINT (1ull << 30)
+#define ELM_POLICY_BLOCK_ROLLBACK_REJECTED (1ull << 31)
+#define ELM_POLICY_BLOCK_CALLER_NOT_FOUND (1ull << 32)
+#define ELM_POLICY_BLOCK_CALLER_STALE (1ull << 33)
+#define ELM_POLICY_BLOCK_SCOPE_DENIED (1ull << 34)
+#define ELM_POLICY_BLOCK_POLICY_ESCALATION (1ull << 35)
+#define ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE (1ull << 36)
+
+#define ELM_CELL_POLICY_FLAG_LOCKED (1u << 0)
+#define ELM_CELL_POLICY_FLAG_DENY_CHILD_ESCALATION (1u << 1)
+#define ELM_CELL_POLICY_FLAG_AUDIT_ALL (1u << 2)
+
+#define ELM_TRUST_FLAG_SEALED (1u << 0)
+#define ELM_TRUST_FLAG_ALLOW_UNSIGNED (1u << 1)
+#define ELM_TRUST_FLAG_UNSIGNED_ACTIVE (1u << 2)
+
+#define ELM_CELL_TRUST_INTERNAL (1u << 0)
+#define ELM_CELL_TRUST_SIGNED (1u << 1)
+#define ELM_CELL_TRUST_UNSIGNED (1u << 2)
+
+#define ELM_MGR_MAX_PAYLOAD (256u * 1024u)
 #define ELM_MGR_MAX_INPUT (ELM_MGR_MAX_PAYLOAD + 16u)
 #define ELM_FRAME_PAYLOAD_LEN 256u
 #define ELM_NEXUS_CONTRACT_LEN 64u
@@ -94,10 +174,26 @@
 #define ELM_EKI_BUILTIN_ID 2ull
 
 #define ELM_EBI_SOURCE_ABI_VERSION 1u
-#define ELM_EBI_SOURCE_KIND_EKI 1u
 #define ELM_EBI_SOURCE_KIND_PROJECTION 2u
 #define ELM_EBI_SOURCE_KIND_BUILTIN 3u
 #define ELM_EBI_SOURCE_KIND_MEMORY 4u
+#define ELM_EBI_PROJECTION_SOURCE_ABI_VERSION 1u
+#define ELM_EKI_PROJECTION_SOURCE_ID 0x454b490000000001ull
+
+#define ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS 16u
+#define ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE 64u
+#define ELM_RESOURCE_BUDGET_DEFAULT_EVENT_SUBSCRIPTIONS 16u
+#define ELM_RESOURCE_BUDGET_DEFAULT_PENDING_LOADS 4u
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGES 8u
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_FAULTS 3u
+#define ELM_RESOURCE_BUDGET_DEFAULT_AUDIT_RECORDS 128u
+#define ELM_RESOURCE_BUDGET_DEFAULT_CONCURRENT_CALLS 16u
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGE_BYTES (16ull * 1024ull * 1024ull)
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_STACK_BYTES (4ull * 1024ull * 1024ull)
+#define ELM_RESOURCE_BUDGET_DEFAULT_DYNAMIC_ALLOC_BYTES (64ull * 1024ull * 1024ull)
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_TIME_NS_PER_CALL 1000000000ull
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD 5000000000ull
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_PERIOD_NS 10000000000ull
 
 #define ELM_REPLACE_CELL_ABI_VERSION 1u
 #define ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED (1u << 0)
@@ -221,7 +317,19 @@ struct elm_cell_snapshot {
     uint16_t usage_native_images;
     uint16_t usage_native_faults;
     uint16_t usage_audit_records;
-    uint32_t reserved2;
+    uint32_t trust_flags;
+    uint64_t release_epoch;
+    uint8_t signer_key_id[32];
+};
+
+struct elm_trust_runtime_info_v1 {
+    uint16_t abi_version;
+    uint16_t struct_size;
+    uint32_t flags;
+    uint32_t anchor_count;
+    uint32_t revoked_count;
+    uint32_t accepted_epoch_count;
+    uint32_t reserved;
 };
 
 struct elm_port_snapshot {
@@ -287,12 +395,41 @@ struct elm_replace_cell_request_v1 {
     uint64_t reserved1;
 };
 
+struct elm_resource_budget {
+    uint16_t max_provider_ports;
+    uint16_t max_provider_queue;
+    uint16_t max_event_subscriptions;
+    uint16_t max_pending_loads;
+    uint16_t max_native_images;
+    uint16_t max_native_faults;
+    uint16_t max_audit_records;
+    uint16_t max_concurrent_calls;
+    uint64_t max_native_image_bytes;
+    uint64_t max_native_stack_bytes;
+    uint64_t max_dynamic_alloc_bytes;
+    uint64_t max_cpu_time_ns_per_call;
+    uint64_t cpu_budget_ns_per_period;
+    uint64_t cpu_period_ns;
+};
+
 struct elm_ebi_source_request {
     uint16_t abi_version;
     uint16_t source_kind;
     uint32_t flags;
+    uint64_t parent_cell_id;
+    struct elm_resource_budget budget;
+    uint16_t reserved0;
     uint32_t payload_len;
-    uint32_t reserved;
+    uint32_t reserved1;
+};
+
+struct elm_projection_source_request {
+    uint16_t abi_version;
+    uint16_t flags;
+    uint32_t reserved0;
+    uint64_t provider_id;
+    uint32_t payload_len;
+    uint32_t reserved1;
 };
 
 struct elm_load_cell_response {
@@ -493,7 +630,14 @@ struct elm_mgr_audit_record {
     uint64_t cell_id;
     uint64_t blockers;
     uint32_t final_state;
-    uint32_t reserved;
+    uint32_t flags;
+    uint32_t actor_kind;
+    uint32_t authority;
+    uint64_t actor_id;
+    uint64_t authority_id;
+    uint64_t actor_generation;
+    uint64_t policy_epoch;
+    uint64_t credential_id;
 };
 
 struct elm_nexus_binding_snapshot_header {
@@ -796,7 +940,7 @@ _Static_assert(sizeof(struct elm_mgr_call_header) == 16, "bad mgr call header si
 _Static_assert(sizeof(struct elm_mgr_response_header) == 16, "bad mgr response header size");
 _Static_assert(sizeof(struct elm_core_info) == 40, "bad core info size");
 _Static_assert(sizeof(struct elm_snapshot_header) == 32, "bad snapshot header size");
-_Static_assert(sizeof(struct elm_cell_snapshot) == 184, "bad cell snapshot size");
+_Static_assert(sizeof(struct elm_cell_snapshot) == 224, "bad cell snapshot size");
 _Static_assert(sizeof(struct elm_port_snapshot) == 96, "bad port snapshot size");
 _Static_assert(sizeof(struct elm_event_record) == 48, "bad event record size");
 _Static_assert(sizeof(struct elm_menu_snapshot_header) == 16, "bad menu header size");
@@ -804,14 +948,17 @@ _Static_assert(sizeof(struct elm_menu_item_snapshot) == 296, "bad menu item size
 _Static_assert(sizeof(struct elm_mgr_topology_header) == 24, "bad topology header size");
 _Static_assert(sizeof(struct elm_mgr_relation_record) == 128, "bad relation record size");
 _Static_assert(sizeof(struct elm_mgr_audit_header) == 24, "bad audit header size");
-_Static_assert(sizeof(struct elm_mgr_audit_record) == 40, "bad audit record size");
+_Static_assert(sizeof(struct elm_mgr_audit_record) == 88, "bad audit record size");
 _Static_assert(sizeof(struct elm_nexus_binding_snapshot_header) == 16, "bad binding header size");
 _Static_assert(sizeof(struct elm_nexus_binding_record) == 120, "bad binding record size");
 _Static_assert(sizeof(struct elm_call_frame) == 288, "bad call frame size");
 _Static_assert(sizeof(struct elm_reply_frame) == 288, "bad reply frame size");
 _Static_assert(sizeof(struct elm_lifecycle_request) == 16, "bad lifecycle request size");
 _Static_assert(sizeof(struct elm_lifecycle_response) == 32, "bad lifecycle response size");
-_Static_assert(sizeof(struct elm_ebi_source_request) == 16, "bad ebi source request size");
+_Static_assert(sizeof(struct elm_resource_budget) == 64, "bad resource budget size");
+_Static_assert(sizeof(struct elm_ebi_source_request) == 96, "bad ebi source request size");
+_Static_assert(sizeof(struct elm_projection_source_request) == 24,
+               "bad projection source request size");
 _Static_assert(sizeof(struct elm_replace_cell_request_v1) == 32, "bad replace request size");
 _Static_assert(sizeof(struct elm_nexus_bind_request) == 88, "bad bind request size");
 _Static_assert(sizeof(struct elm_provider_snapshot_request) == 24, "bad provider snapshot request size");

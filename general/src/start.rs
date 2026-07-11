@@ -38,6 +38,8 @@ pub type DeviceMmioToVirtFn = fn(phys_addr: usize) -> usize;
 pub type InitKernelPageTableFn = fn();
 pub type ProtectKernelHeapRangeFn =
     fn(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool;
+pub type ValidateKernelHeapRangeFn =
+    fn(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool;
 pub type SyncIcacheFn = fn();
 
 /// 使用排他上界的物理地址范围。
@@ -342,6 +344,8 @@ pub struct StartAllocatorOps {
     pub unmap_kernel_heap_range: UnmapKernelHeapRangeFn,
     /// 修改内核堆页权限，供 ELM 原生镜像完成 W^X 切换。
     pub protect_kernel_heap_range: ProtectKernelHeapRangeFn,
+    /// 只读校验内核堆映射权限，供 ELM 原生 API 验证跨边界裸指针。
+    pub validate_kernel_heap_range: ValidateKernelHeapRangeFn,
     /// 同步指令缓存，供 ELM 原生镜像完成代码发布。
     pub sync_icache: SyncIcacheFn,
     /// 安装映射的堆页所需的架构页表状态。

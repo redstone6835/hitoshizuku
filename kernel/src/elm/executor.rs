@@ -25,9 +25,7 @@ pub(crate) fn wake_provider_worker() {
 
 unsafe extern "C" fn provider_worker(_arg: usize) -> ! {
     loop {
-        while super::core::with_core(|core| {
-            core.run_one_async_provider_job_at(sched::now_ns_public())
-        }) {}
+        while super::core::run_one_async_provider_job_unlocked(sched::now_ns_public()) {}
 
         let current = sched::current_task();
         PROVIDER_WORK_QUEUE.wait_event(&current, || {

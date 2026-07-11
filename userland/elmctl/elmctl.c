@@ -7,13 +7,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-static uint8_t g_out[16384];
+static uint8_t g_out[ELM_MGR_MAX_INPUT];
 
 static void usage(void)
 {
     puts("elmctl commands:");
     puts("  core | snapshot | event-read | event-ack <seq> | debug-dump");
-    puts("  menu | policy | health | topology | audit | bindings | runtime-ports");
+    puts("  menu | policy | trust | health | topology | audit | bindings | runtime-ports");
     puts("  providers | provider-stats | provider-queue | api | subscriptions | native | todo");
     puts("  load-eki <file> | replace-eki <cell> <file>");
     puts("  detach <cell> | pause <cell> | resume <cell> | preflight-lifecycle <cell> <action>");
@@ -88,6 +88,27 @@ static int cmd_policy(void)
     printf("policy: actions=0x%x flags=0x%llx blockers=0x%llx audit_capacity=%u\n",
            info.supported_actions, (unsigned long long)info.policy_flags,
            (unsigned long long)info.blocker_mask, info.audit_capacity);
+    return 0;
+}
+
+static int cmd_trust(void)
+{
+    struct elmctl_mgr_response response;
+    struct elm_trust_runtime_info_v1 info;
+    if (elmctl_mgr_call_empty(ELM_MGR_CALL_QUERY_TRUST_STATE, g_out, sizeof(g_out), &response) != 0) {
+        return fail("trust");
+    }
+    if (require_payload(&response, sizeof(info), "trust") != 0) return 2;
+    memcpy(&info, response.payload, sizeof(info));
+    if (info.abi_version != ELM_CTL_ABI_VERSION || info.struct_size != sizeof(info)) {
+        errno = EPROTO;
+        return fail("trust-layout");
+    }
+    printf("trust: flags=0x%x sealed=%u allow_unsigned=%u unsigned_active=%u anchors=%u revoked=%u accepted_epochs=%u\n",
+           info.flags, !!(info.flags & ELM_TRUST_FLAG_SEALED),
+           !!(info.flags & ELM_TRUST_FLAG_ALLOW_UNSIGNED),
+           !!(info.flags & ELM_TRUST_FLAG_UNSIGNED_ACTIVE), info.anchor_count,
+           info.revoked_count, info.accepted_epoch_count);
     return 0;
 }
 
@@ -206,10 +227,15 @@ static int cmd_audit(void)
             return fail("audit-record");
         }
         memcpy(&record, cursor, sizeof(record));
-        printf("audit seq=%llu action=%u status=%d(%s) cell=%llu blockers=0x%llx final=%u\n",
+        printf("audit seq=%llu action=%u status=%d(%s) cell=%llu blockers=0x%llx final=%u flags=0x%x actor_kind=%u actor=%llu authority=%u authority_id=%llu generation=%llu policy_epoch=%llu credential=%llu\n",
                (unsigned long long)record.sequence, record.action, record.status,
                elmctl_status_name(record.status), (unsigned long long)record.cell_id,
-               (unsigned long long)record.blockers, record.final_state);
+               (unsigned long long)record.blockers, record.final_state, record.flags,
+               record.actor_kind, (unsigned long long)record.actor_id, record.authority,
+               (unsigned long long)record.authority_id,
+               (unsigned long long)record.actor_generation,
+               (unsigned long long)record.policy_epoch,
+               (unsigned long long)record.credential_id);
         cursor += header.record_entry_size;
     }
     return 0;
@@ -558,6 +584,10 @@ static int cmd_snapshot(void)
                cell.usage_provider_queue, cell.usage_event_subscriptions,
                cell.usage_pending_loads, cell.usage_native_images, cell.usage_native_faults,
                cell.usage_audit_records);
+        printf("  trust flags=0x%x release_epoch=%llu signer_key_id=",
+               cell.trust_flags, (unsigned long long)cell.release_epoch);
+        elmctl_print_hex(cell.signer_key_id, sizeof(cell.signer_key_id));
+        putchar('\n');
         cursor += header.cell_entry_size;
     }
     for (uint32_t i = 0; i < header.port_count; i++) {
@@ -663,72 +693,117 @@ static int cmd_preflight_lifecycle(int argc, char **argv)
 static int source_request_from_file(const char *path, uint8_t *out, size_t cap, size_t *len)
 {
     struct elm_ebi_source_request request;
+    struct elm_projection_source_request projection;
     size_t image_len = 0;
-    if (cap < sizeof(request)) {
+    size_t prefix = sizeof(request) + sizeof(projection);
+    if (cap < prefix) {
         errno = EMSGSIZE;
         return -1;
     }
-    if (elmctl_read_file(path, out + sizeof(request), cap - sizeof(request), &image_len) != 0) {
+    if (elmctl_read_file(path, out + prefix, cap - prefix, &image_len) != 0) {
         return -1;
     }
+    memset(&request, 0, sizeof(request));
+    memset(&projection, 0, sizeof(projection));
     request.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
-    request.source_kind = ELM_EBI_SOURCE_KIND_EKI;
+    request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
     request.flags = 0;
-    request.payload_len = (uint32_t)image_len;
-    request.reserved = 0;
+    request.parent_cell_id = ELM_MGR_BUILTIN_ID;
+    request.budget.max_provider_ports = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS;
+    request.budget.max_provider_queue = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE;
+    request.budget.max_event_subscriptions = ELM_RESOURCE_BUDGET_DEFAULT_EVENT_SUBSCRIPTIONS;
+    request.budget.max_pending_loads = ELM_RESOURCE_BUDGET_DEFAULT_PENDING_LOADS;
+    request.budget.max_native_images = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGES;
+    request.budget.max_native_faults = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_FAULTS;
+    request.budget.max_audit_records = ELM_RESOURCE_BUDGET_DEFAULT_AUDIT_RECORDS;
+    request.budget.max_concurrent_calls = ELM_RESOURCE_BUDGET_DEFAULT_CONCURRENT_CALLS;
+    request.budget.max_native_image_bytes = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGE_BYTES;
+    request.budget.max_native_stack_bytes = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_STACK_BYTES;
+    request.budget.max_dynamic_alloc_bytes = ELM_RESOURCE_BUDGET_DEFAULT_DYNAMIC_ALLOC_BYTES;
+    request.budget.max_cpu_time_ns_per_call = ELM_RESOURCE_BUDGET_DEFAULT_CPU_TIME_NS_PER_CALL;
+    request.budget.cpu_budget_ns_per_period = ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD;
+    request.budget.cpu_period_ns = ELM_RESOURCE_BUDGET_DEFAULT_CPU_PERIOD_NS;
+    request.payload_len = (uint32_t)(sizeof(projection) + image_len);
+    projection.abi_version = ELM_EBI_PROJECTION_SOURCE_ABI_VERSION;
+    projection.provider_id = ELM_EKI_PROJECTION_SOURCE_ID;
+    projection.payload_len = (uint32_t)image_len;
     memcpy(out, &request, sizeof(request));
-    *len = sizeof(request) + image_len;
+    memcpy(out + sizeof(request), &projection, sizeof(projection));
+    *len = prefix + image_len;
     return 0;
 }
 
 static int cmd_load_eki(int argc, char **argv)
 {
-    uint8_t input[ELM_MGR_MAX_INPUT];
+    uint8_t *input = NULL;
     size_t input_len = 0;
     struct elmctl_mgr_response response;
+    int ret;
     if (argc < 3) {
         usage();
         return 1;
     }
-    if (source_request_from_file(argv[2], input, sizeof(input), &input_len) != 0) {
+    input = malloc(ELM_MGR_MAX_INPUT);
+    if (input == NULL) {
+        errno = ENOMEM;
+        return fail("load-eki");
+    }
+    if (source_request_from_file(argv[2], input, ELM_MGR_MAX_INPUT, &input_len) != 0) {
+        free(input);
         return fail("load-eki");
     }
     if (elmctl_mgr_call(ELM_MGR_CALL_LOAD_CELL, input, input_len, g_out, sizeof(g_out),
                         &response) != 0) {
+        free(input);
         return fail("load-eki");
     }
-    return print_mgr_response("load-eki", &response);
+    ret = print_mgr_response("load-eki", &response);
+    free(input);
+    return ret;
 }
 
 static int cmd_replace_eki(int argc, char **argv)
 {
-    uint8_t input[ELM_MGR_MAX_INPUT];
+    uint8_t *input = NULL;
     struct elm_replace_cell_request_v1 request;
+    struct elm_projection_source_request projection;
     uint64_t cell;
     size_t image_len = 0;
+    size_t prefix = sizeof(request) + sizeof(projection);
     struct elmctl_mgr_response response;
+    int ret;
     if (argc < 4 || require_u64(argv[2], &cell) != 0) {
         usage();
         return 1;
     }
-    if (elmctl_read_file(argv[3], input + sizeof(request), sizeof(input) - sizeof(request),
-                         &image_len) != 0) {
+    input = malloc(ELM_MGR_MAX_INPUT);
+    if (input == NULL) {
+        errno = ENOMEM;
         return fail("replace-eki");
     }
+    if (elmctl_read_file(argv[3], input + prefix, ELM_MGR_MAX_INPUT - prefix, &image_len) != 0) {
+        free(input);
+        return fail("replace-eki");
+    }
+    memset(&request, 0, sizeof(request));
+    memset(&projection, 0, sizeof(projection));
     request.abi_version = ELM_REPLACE_CELL_ABI_VERSION;
-    request.flags = 0;
-    request.source_kind = ELM_EBI_SOURCE_KIND_EKI;
-    request.reserved0 = 0;
+    request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
     request.target_cell_id = cell;
-    request.migration_limit = 0;
-    request.source_payload_len = (uint32_t)image_len;
-    request.reserved1 = 0;
+    request.source_payload_len = (uint32_t)(sizeof(projection) + image_len);
+    projection.abi_version = ELM_EBI_PROJECTION_SOURCE_ABI_VERSION;
+    projection.provider_id = ELM_EKI_PROJECTION_SOURCE_ID;
+    projection.payload_len = (uint32_t)image_len;
     memcpy(input, &request, sizeof(request));
-    if (elmctl_mgr_call(ELM_MGR_CALL_REPLACE_CELL, input, sizeof(request) + image_len, g_out,
+    memcpy(input + sizeof(request), &projection, sizeof(projection));
+    if (elmctl_mgr_call(ELM_MGR_CALL_REPLACE_CELL, input, prefix + image_len, g_out,
                         sizeof(g_out), &response) != 0) {
+        free(input);
         return fail("replace-eki");
     }
-    return print_mgr_response("replace-eki", &response);
+    ret = print_mgr_response("replace-eki", &response);
+    free(input);
+    return ret;
 }
 
 static int bind_common(int argc, char **argv, uint32_t kind, const char *name)
@@ -1027,6 +1102,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "debug-dump") == 0) return cmd_debug_dump();
     if (strcmp(argv[1], "menu") == 0) return cmd_menu();
     if (strcmp(argv[1], "policy") == 0) return cmd_policy();
+    if (strcmp(argv[1], "trust") == 0) return cmd_trust();
     if (strcmp(argv[1], "health") == 0) return cmd_health();
     if (strcmp(argv[1], "topology") == 0) return cmd_topology();
     if (strcmp(argv[1], "audit") == 0) return cmd_audit();

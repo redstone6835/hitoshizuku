@@ -3,7 +3,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use elm_model::{ELM_MGR_MAX_INPUT, ElmCtlCommand};
+use elm_model::{ELM_MGR_MAX_INPUT, ElmCtlCommand, ElmPrincipal};
 use errno::Errno;
 use general::mm::{copy_from_user, copy_to_user};
 use general::syscall::SyscallContext;
@@ -39,7 +39,11 @@ pub(crate) fn sys_elm_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         ElmCtlCommand::MgrCall => {
             require_sys_admin(ctx)?;
             let input = read_input_bytes(input_user, input_len, ELM_MGR_MAX_INPUT)?;
-            let response = mgr_channel::dispatch_mgr_call(&input);
+            let principal = ElmPrincipal::user_admin(
+                ctx.task().pid_root().unwrap_or(0) as u64,
+                u64::from(ctx.task().credentials().euid.0),
+            );
+            let response = mgr_channel::dispatch_mgr_call_as(principal, &input);
             write_bytes(output_user, output_len, &response)
         }
         ElmCtlCommand::DebugDump => {

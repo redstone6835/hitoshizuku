@@ -1,4 +1,4 @@
-.PHONY: all clean cargo-setup kernel-la kernel-rv rootfs-la rootfs-rv rootfs-ltp-scenarios-la rootfs-ltp-scenarios-rv elm-smoke-la elm-smoke-rv elmctl-la elmctl-rv rootfs-elm-smoke-la rootfs-elm-smoke-rv rootfs-elmctl-la rootfs-elmctl-rv
+.PHONY: all clean cargo-setup kernel-la kernel-rv rootfs-la rootfs-rv rootfs-ltp-scenarios-la rootfs-ltp-scenarios-rv elm-smoke-la elm-smoke-rv elmctl-la elmctl-rv elmapi rootfs-elm-smoke-la rootfs-elm-smoke-rv rootfs-elmctl-la rootfs-elmctl-rv
 
 all: cargo-setup kernel-la kernel-rv
 
@@ -34,14 +34,26 @@ ENSURE_BUSYBOX := scripts/ensure-busybox.sh
 LTP_SCENARIO_SRC := userland/ltp-scenarios
 LTP_TESTCODE_SRC := userland/ltp_testcode.sh
 ELM_SMOKE_SRC := userland/elmctl-smoke/elmctl_smoke.c
+ELM_FINGERPRINT_GEN := scripts/gen-elm-fingerprint-header.sh
+ELM_FINGERPRINT_INPUTS := $(wildcard libs/elm/src/*.rs libs/elm/src/mgr/*.rs tools/elm-tools/src/*.rs) \
+	libs/elm/Cargo.toml tools/elm-tools/Cargo.toml
+LA_ELM_FINGERPRINT := $(BUILD_DIR)/elm-smoke-la/elm_fingerprint.h
+RV_ELM_FINGERPRINT := $(BUILD_DIR)/elm-smoke-rv/elm_fingerprint.h
 ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 ELMCTL_HEADERS := userland/elmctl/include/elmctl_abi.h userland/elmctl/include/elmctl_client.h
+ELM_TOOLS_MANIFEST := tools/elm-tools/Cargo.toml
+ELMAPI_OUTPUT := $(BUILD_DIR)/elmapi/v1/elmmgr
+HOST_TARGET := x86_64-unknown-linux-gnu
 
 cargo-setup:
 	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
 		cp -r cargo-config .cargo; \
 		echo "cargo-config → .cargo"; \
 	fi
+
+elmapi:
+	cargo run --manifest-path $(ELM_TOOLS_MANIFEST) --target $(HOST_TARGET) -- \
+		generate-elmmgr $(ELMAPI_OUTPUT)
 
 kernel-la: cargo-setup rootfs-la
 	INITRAMFS_ROOT=$(LA_ROOTFS) INITRAMFS_CPIO=$(LA_INITRAMFS) \
@@ -93,14 +105,20 @@ rootfs-elmctl-la: $(LA_ROOTFS)/bin/elmctl
 
 rootfs-elmctl-rv: $(RV_ROOTFS)/bin/elmctl
 
-$(LA_ELM_SMOKE): $(ELM_SMOKE_SRC)
+$(LA_ELM_FINGERPRINT): $(ELM_FINGERPRINT_GEN) $(ELM_FINGERPRINT_INPUTS)
+	$(ELM_FINGERPRINT_GEN) $(LA_TARGET) $@
+
+$(RV_ELM_FINGERPRINT): $(ELM_FINGERPRINT_GEN) $(ELM_FINGERPRINT_INPUTS)
+	$(ELM_FINGERPRINT_GEN) $(RV_TARGET) $@
+
+$(LA_ELM_SMOKE): $(ELM_SMOKE_SRC) $(LA_ELM_FINGERPRINT)
 	mkdir -p $(dir $@)
-	$(LA_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra $< -o $@
+	$(LA_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra -I$(dir $@) $< -o $@
 	-$(LA_CROSS_COMPILE)strip $@
 
-$(RV_ELM_SMOKE): $(ELM_SMOKE_SRC)
+$(RV_ELM_SMOKE): $(ELM_SMOKE_SRC) $(RV_ELM_FINGERPRINT)
 	mkdir -p $(dir $@)
-	$(RV_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra $< -o $@
+	$(RV_CROSS_COMPILE)gcc -std=c11 -static -Os -Wall -Wextra -I$(dir $@) $< -o $@
 	-$(RV_CROSS_COMPILE)strip $@
 
 $(LA_ELMCTL): $(ELMCTL_SRC) $(ELMCTL_HEADERS)

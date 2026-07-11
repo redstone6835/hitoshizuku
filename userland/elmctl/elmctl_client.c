@@ -68,7 +68,7 @@ int elmctl_debug_dump(uint8_t *out, size_t out_len, ssize_t *written)
 int elmctl_mgr_call(uint32_t kind, const void *payload, size_t payload_len, uint8_t *out,
                     size_t out_len, struct elmctl_mgr_response *response)
 {
-    uint8_t input[ELM_MGR_MAX_INPUT];
+    uint8_t *input = NULL;
     struct elm_mgr_call_header header = {
         .kind = kind,
         .flags = 0,
@@ -77,20 +77,26 @@ int elmctl_mgr_call(uint32_t kind, const void *payload, size_t payload_len, uint
     };
     ssize_t written = 0;
     struct elm_mgr_response_header reply;
+    size_t input_len = sizeof(header) + payload_len;
 
-    if (payload_len > ELM_MGR_MAX_PAYLOAD ||
-        payload_len + sizeof(header) > sizeof(input)) {
+    if (payload_len > ELM_MGR_MAX_PAYLOAD || input_len > ELM_MGR_MAX_INPUT) {
         errno = EMSGSIZE;
+        return -1;
+    }
+    input = malloc(input_len);
+    if (input == NULL) {
+        errno = ENOMEM;
         return -1;
     }
     memcpy(input, &header, sizeof(header));
     if (payload_len != 0) {
         memcpy(input + sizeof(header), payload, payload_len);
     }
-    if (elmctl_syscall(ELM_CTL_CMD_MGR_CALL, input, sizeof(header) + payload_len, out, out_len,
-                       &written) != 0) {
+    if (elmctl_syscall(ELM_CTL_CMD_MGR_CALL, input, input_len, out, out_len, &written) != 0) {
+        free(input);
         return -1;
     }
+    free(input);
     if ((size_t)written < sizeof(reply)) {
         errno = EPROTO;
         return -1;
@@ -263,7 +269,6 @@ const char *elmctl_kind_name(uint32_t kind)
 const char *elmctl_source_name(uint32_t source)
 {
     switch (source) {
-    case ELM_EBI_SOURCE_KIND_EKI: return "eki";
     case ELM_EBI_SOURCE_KIND_PROJECTION: return "projection";
     case ELM_EBI_SOURCE_KIND_BUILTIN: return "<builtin>";
     case ELM_EBI_SOURCE_KIND_MEMORY: return "memory";

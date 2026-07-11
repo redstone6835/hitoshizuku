@@ -1096,6 +1096,7 @@ pub unsafe extern "C" fn __kernel_arch_loader() {
                 map_kernel_heap_range,
                 unmap_kernel_heap_range,
                 protect_kernel_heap_range,
+                validate_kernel_heap_range,
                 sync_icache,
                 init_kernel_page_table,
             }),

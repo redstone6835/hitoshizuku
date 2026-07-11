@@ -260,6 +260,10 @@ fn protect_kernel_heap(vaddr: usize, size: usize, read: bool, write: bool, execu
     heap_vm::protect_kernel_heap_range(vaddr, size, read, write, execute).is_ok()
 }
 
+fn validate_kernel_heap(vaddr: usize, size: usize, read: bool, write: bool, execute: bool) -> bool {
+    heap_vm::validate_kernel_heap_range(vaddr, size, read, write, execute).is_ok()
+}
+
 fn sync_icache() {
     <crate::riscv64::task::Riscv64TaskOps as general::TaskOps>::sync_icache();
 }
@@ -365,6 +369,7 @@ pub extern "C" fn __kernel_arch_loader(hart_id: usize, dtb_addr: usize) -> ! {
                 map_kernel_heap_range: map_kernel_heap,
                 unmap_kernel_heap_range: unmap_kernel_heap,
                 protect_kernel_heap_range: protect_kernel_heap,
+                validate_kernel_heap_range: validate_kernel_heap,
                 sync_icache,
                 init_kernel_page_table: heap_vm::init_kernel_page_table,
             }),

@@ -465,6 +465,11 @@ pub struct Task {
     current_cpu: AtomicUsize,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
+    /// 当前任务挂载的运行时执行状态裸指针。
+    ///
+    /// 指针的所有权始终由 `TASKEXT_ELM_EXECUTION` 对应的 `Arc` 持有；这里仅为
+    /// trap/IRQ 热路径提供无锁查询，避免中断打断 TaskExt 自旋锁后再次取锁。
+    elm_execution_ptr: AtomicUsize,
     /// 子系统侧表：VFS context / fdtable 等通过 [`TaskExtKey`] 挂载。
     /// 详见模块级 [`TaskExtCloneHook`]。
     ///
@@ -541,6 +546,7 @@ impl Task {
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
             ioprio: AtomicU32::new(0),
+            elm_execution_ptr: AtomicUsize::new(0),
             hot_ext: HotTaskExt::new(),
             ext: Spinlock::new(Vec::new()),
             ext_exit_cleaned: AtomicBool::new(false),
@@ -1175,7 +1181,16 @@ impl Task {
 
     /// 安装一个子系统状态。同 key 重复装入视作配置错误（debug_assert）。
     pub fn ext_install(&self, key: TaskExtKey, payload: Arc<dyn Any + Send + Sync>) {
+        let execution_ptr = if key == TASKEXT_ELM_EXECUTION {
+            Arc::as_ptr(&payload) as *const () as usize
+        } else {
+            0
+        };
         if self.hot_ext.install(key, &payload) {
+            if execution_ptr != 0 {
+                self.elm_execution_ptr
+                    .store(execution_ptr, Ordering::Release);
+            }
             return;
         }
         let mut ext = self.ext.lock();
@@ -1185,6 +1200,10 @@ impl Task {
             key,
         );
         ext.push(TaskExt { key, payload });
+        if execution_ptr != 0 {
+            self.elm_execution_ptr
+                .store(execution_ptr, Ordering::Release);
+        }
     }
 
     /// 查询某个子系统状态；不存在返回 `None`。
@@ -1201,6 +1220,9 @@ impl Task {
 
     /// 移除并返回某个子系统状态。
     pub fn ext_remove(&self, key: TaskExtKey) -> Option<Arc<dyn Any + Send + Sync>> {
+        if key == TASKEXT_ELM_EXECUTION {
+            self.elm_execution_ptr.store(0, Ordering::Release);
+        }
         if let Some(payload) = self.hot_ext.remove(key) {
             return Some(payload);
         }
@@ -1219,6 +1241,14 @@ impl Task {
                 .map(|e| (e.key, Arc::clone(&e.payload))),
         );
         out
+    }
+
+    /// 返回当前任务的 ELM 执行状态地址。
+    ///
+    /// 返回值只在当前任务仍持有 `TASKEXT_ELM_EXECUTION` 时有效。调用方只能在
+    /// 当前任务上下文或 trap/IRQ 现场临时解引用，不能跨调度点保存。
+    pub fn elm_execution_ptr(&self) -> usize {
+        self.elm_execution_ptr.load(Ordering::Acquire)
     }
 }
 
@@ -1252,6 +1282,8 @@ pub const TASKEXT_EXEC_PATH: TaskExtKey = 0x0002_0000;
 pub const TASKEXT_EXEC_ARGS: TaskExtKey = 0x0002_0001;
 /// 当前任务的 envp 快照（kernel execve 安装，procfs `/proc/[pid]/environ` 读取）。
 pub const TASKEXT_EXEC_ENVP: TaskExtKey = 0x0002_0002;
+/// ELM 当前执行域、恢复帧和生命周期上下文。
+pub const TASKEXT_ELM_EXECUTION: TaskExtKey = 0x0003_0000;
 
 struct HotTaskExt {
     vfs_context: Spinlock<Option<Arc<dyn Any + Send + Sync>>>,

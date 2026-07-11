@@ -7,6 +7,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "elm_fingerprint.h"
+
 #define SYS_ELM_CTL 509
 
 #define ELM_CTL_MAGIC 0x314d4c45u
@@ -41,7 +43,14 @@
 #define ELM_MGR_CALL_READ_SUBSCRIBED_EVENTS 34u
 #define ELM_MGR_CALL_QUERY_PROVIDER_SNAPSHOT 35u
 #define ELM_MGR_CALL_QUERY_TODO_REGISTRY 37u
-#define ELM_MGR_MAX_INPUT (4096u + 16u)
+#define ELM_MGR_CALL_QUERY_EXTENSIONS 38u
+#define ELM_MGR_CALL_PREFLIGHT_EXTENSION_ATTACH 39u
+#define ELM_MGR_CALL_COMMIT_EXTENSION_ATTACH 40u
+#define ELM_MGR_CALL_COMMIT_EXTENSION_DETACH 41u
+#define ELM_MGR_CALL_DISPATCH_EXTENSION 42u
+#define ELM_MGR_CALL_QUERY_TRUST_STATE 55u
+#define ELM_MGR_MAX_PAYLOAD (256u * 1024u)
+#define ELM_MGR_MAX_INPUT (ELM_MGR_MAX_PAYLOAD + 16u)
 #define ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED (1u << 0)
 #define ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE (1u << 0)
 #define ELM_PORT_ACCESS_PUBLIC 1u
@@ -50,6 +59,8 @@
 
 #define ELM_MGR_BUILTIN_ID 1ull
 #define ELM_EKI_BUILTIN_ID 2ull
+
+static uint8_t g_out[ELM_MGR_MAX_INPUT];
 #define ELM_MGR_ACTION_PORT_ID 4ull
 #define ELM_MGR_ACTION_PROVIDER_INVOKE (1u << 12)
 #define ELM_MGR_ACTION_HEALTH_QUERY (1u << 13)
@@ -57,12 +68,24 @@
 #define ELM_MGR_ACTION_EVENT_SUBSCRIBE (1u << 16)
 #define ELM_MGR_ACTION_EVENT_READ (1u << 18)
 #define ELM_MGR_ACTION_TODO_QUERY (1u << 20)
+#define ELM_MGR_ACTION_EXTENSION_QUERY (1u << 21)
+#define ELM_MGR_ACTION_EXTENSION_ATTACH (1u << 22)
+#define ELM_MGR_ACTION_EXTENSION_DETACH (1u << 23)
+#define ELM_MGR_ACTION_EXTENSION_DISPATCH (1u << 24)
+#define ELM_MGR_ACTION_TRUST_QUERY (1u << 29)
 #define ELM_MGR_POLICY_HEALTH (1ull << 8)
 #define ELM_MGR_POLICY_PROVIDER_ASYNC (1ull << 9)
 #define ELM_MGR_POLICY_API_REGISTRY (1ull << 10)
 #define ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS (1ull << 11)
 #define ELM_MGR_POLICY_TODO_REGISTRY (1ull << 13)
 #define ELM_MGR_POLICY_RESOURCE_BUDGET (1ull << 14)
+#define ELM_MGR_POLICY_EXTENSION_RUNTIME (1ull << 15)
+#define ELM_MGR_POLICY_TRUST (1ull << 20)
+#define ELM_TRUST_FLAG_SEALED (1u << 0)
+#define ELM_TRUST_FLAG_ALLOW_UNSIGNED (1u << 1)
+#define ELM_TRUST_FLAG_UNSIGNED_ACTIVE (1u << 2)
+#define ELM_CELL_TRUST_INTERNAL (1u << 0)
+#define ELM_CELL_TRUST_UNSIGNED (1u << 2)
 #define ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED (1ull << 23)
 #define ELM_POLICY_BLOCK_RESOURCE_QUOTA (1ull << 24)
 #define ELM_POLICY_BLOCK_PORT_TODO (1ull << 14)
@@ -74,6 +97,13 @@
 
 #define ELM_CELL_NAME_LEN 64u
 #define ELM_NEXUS_CONTRACT_LEN 64u
+#define ELM_MGR_EXTENSION_POINT_LEN 32u
+#define ELM_MGR_EXTENSION_CONTRACT_LEN 64u
+#define ELM_MGR_EXTENSION_HANDLER_CONTRACT_LEN 64u
+#define ELM_MGR_EXTENSION_PAYLOAD_LEN 256u
+#define ELM_MIXIN_MODE_CHAIN 1u
+#define ELM_MIXIN_MODE_OBSERVER 2u
+#define ELM_MIXIN_MODE_EXCLUSIVE 3u
 #define ELM_MENU_LABEL_LEN 64u
 #define ELM_MENU_DESCRIPTION_LEN 128u
 #define ELM_MENU_ROUTE_LEN 64u
@@ -90,9 +120,26 @@
 #define ELM_CALL_STATUS_UNSUPPORTED (-95)
 
 #define ELM_EBI_SOURCE_ABI_VERSION 1u
-#define ELM_EBI_SOURCE_KIND_EKI 1u
+#define ELM_EBI_SOURCE_KIND_PROJECTION 2u
 #define ELM_EBI_SOURCE_KIND_BUILTIN 3u
-#define ELM_EBI_LOAD_NATIVE_CODE_TODO (-4096)
+#define ELM_EBI_PROJECTION_SOURCE_ABI_VERSION 1u
+#define ELM_EKI_PROJECTION_SOURCE_ID 0x454b490000000001ull
+#define ELM_EBI_LOAD_STATUS_NATIVE_CODE_TODO (-4096)
+#define ELM_EBI_LOAD_STATUS_UNTRUSTED_IMAGE (-4098)
+#define ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS 16u
+#define ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE 64u
+#define ELM_RESOURCE_BUDGET_DEFAULT_EVENT_SUBSCRIPTIONS 16u
+#define ELM_RESOURCE_BUDGET_DEFAULT_PENDING_LOADS 4u
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGES 8u
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_FAULTS 3u
+#define ELM_RESOURCE_BUDGET_DEFAULT_AUDIT_RECORDS 128u
+#define ELM_RESOURCE_BUDGET_DEFAULT_CONCURRENT_CALLS 16u
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGE_BYTES (16ull * 1024ull * 1024ull)
+#define ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_STACK_BYTES (4ull * 1024ull * 1024ull)
+#define ELM_RESOURCE_BUDGET_DEFAULT_DYNAMIC_ALLOC_BYTES (64ull * 1024ull * 1024ull)
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_TIME_NS_PER_CALL 1000000000ull
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD 5000000000ull
+#define ELM_RESOURCE_BUDGET_DEFAULT_CPU_PERIOD_NS 10000000000ull
 
 #define ELM_EKI_FORMAT_VERSION 1u
 #define ELM_EKI_HEADER_SIZE 64u
@@ -102,6 +149,10 @@
 #define ELM_EKI_BLOCK_MANIFEST 1u
 #define ELM_EKI_BLOCK_MENU 2u
 #define ELM_EKI_BLOCK_LIFECYCLE_HOOKS 18u
+#define ELM_EKI_BLOCK_ABI_FINGERPRINT 21u
+#define ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE 120u
+#define ELM_RUST_ABI_FINGERPRINT_VERSION 1u
+#define ELM_PANIC_ABORT_THROUGH_RUNTIME 1u
 #define ELM_KIND_MANAGER 1u
 #define ELM_KIND_SERVICE 2u
 #define ELM_KIND_EXTENSION 4u
@@ -182,7 +233,19 @@ struct elm_cell_snapshot {
     uint16_t usage_native_images;
     uint16_t usage_native_faults;
     uint16_t usage_audit_records;
-    uint32_t reserved2;
+    uint32_t trust_flags;
+    uint64_t release_epoch;
+    uint8_t signer_key_id[32];
+};
+
+struct elm_trust_runtime_info_v1 {
+    uint16_t abi_version;
+    uint16_t struct_size;
+    uint32_t flags;
+    uint32_t anchor_count;
+    uint32_t revoked_count;
+    uint32_t accepted_epoch_count;
+    uint32_t reserved;
 };
 
 struct elm_mgr_call_header {
@@ -441,12 +504,41 @@ struct elm_lifecycle_response {
     uint32_t reserved;
 };
 
+struct elm_resource_budget {
+    uint16_t max_provider_ports;
+    uint16_t max_provider_queue;
+    uint16_t max_event_subscriptions;
+    uint16_t max_pending_loads;
+    uint16_t max_native_images;
+    uint16_t max_native_faults;
+    uint16_t max_audit_records;
+    uint16_t max_concurrent_calls;
+    uint64_t max_native_image_bytes;
+    uint64_t max_native_stack_bytes;
+    uint64_t max_dynamic_alloc_bytes;
+    uint64_t max_cpu_time_ns_per_call;
+    uint64_t cpu_budget_ns_per_period;
+    uint64_t cpu_period_ns;
+};
+
 struct elm_ebi_source_request {
     uint16_t abi_version;
     uint16_t source_kind;
     uint32_t flags;
+    uint64_t parent_cell_id;
+    struct elm_resource_budget budget;
+    uint16_t reserved0;
     uint32_t payload_len;
-    uint32_t reserved;
+    uint32_t reserved1;
+};
+
+struct elm_projection_source_request {
+    uint16_t abi_version;
+    uint16_t flags;
+    uint32_t reserved0;
+    uint64_t provider_id;
+    uint32_t payload_len;
+    uint32_t reserved1;
 };
 
 struct elm_load_cell_response {
@@ -584,11 +676,93 @@ struct elm_todo_registry_record {
     uint8_t detail[ELM_TODO_DETAIL_LEN];
 };
 
+struct elm_extension_snapshot_header {
+    uint16_t abi_version;
+    uint16_t record_entry_size;
+    uint32_t point_count;
+    uint32_t edge_count;
+    uint32_t reserved;
+    uint64_t event_sequence;
+};
+
+struct elm_extension_snapshot_record {
+    uint32_t kind;
+    uint32_t flags;
+    uint64_t owner_cell_id;
+    uint64_t target_cell_id;
+    uint64_t extension_cell_id;
+    uint32_t mode;
+    int32_t priority;
+    uint16_t point_len;
+    uint16_t contract_len;
+    uint16_t handler_contract_len;
+    uint16_t reserved;
+    uint8_t point[ELM_MGR_EXTENSION_POINT_LEN];
+    uint8_t contract[ELM_MGR_EXTENSION_CONTRACT_LEN];
+    uint8_t handler_contract[ELM_MGR_EXTENSION_HANDLER_CONTRACT_LEN];
+};
+
+struct elm_extension_attach_request {
+    uint64_t extension_cell_id;
+    uint64_t target_cell_id;
+    uint32_t flags;
+    int32_t priority;
+    uint16_t point_len;
+    uint16_t contract_len;
+    uint16_t handler_contract_len;
+    uint16_t reserved;
+    uint8_t point[ELM_MGR_EXTENSION_POINT_LEN];
+    uint8_t contract[ELM_MGR_EXTENSION_CONTRACT_LEN];
+    uint8_t handler_contract[ELM_MGR_EXTENSION_HANDLER_CONTRACT_LEN];
+};
+
+struct elm_extension_detach_request {
+    uint64_t extension_cell_id;
+    uint64_t target_cell_id;
+    uint32_t flags;
+    uint16_t point_len;
+    uint16_t reserved;
+    uint8_t point[ELM_MGR_EXTENSION_POINT_LEN];
+};
+
+struct elm_extension_attach_response {
+    uint64_t extension_cell_id;
+    uint64_t target_cell_id;
+    uint64_t generation;
+    int32_t status;
+    uint32_t allowed;
+    uint64_t blockers;
+};
+
+struct elm_extension_dispatch_request {
+    uint64_t target_cell_id;
+    uint64_t extension_cell_id;
+    uint32_t opcode;
+    uint32_t flags;
+    uint16_t point_len;
+    uint16_t contract_len;
+    uint16_t payload_len;
+    uint16_t reserved0;
+    uint32_t reserved1;
+    uint8_t point[ELM_MGR_EXTENSION_POINT_LEN];
+    uint8_t contract[ELM_MGR_EXTENSION_CONTRACT_LEN];
+    uint8_t payload[ELM_MGR_EXTENSION_PAYLOAD_LEN];
+};
+
+struct elm_extension_dispatch_response {
+    int32_t status;
+    uint32_t matched_extensions;
+    uint32_t called_extensions;
+    uint32_t mode;
+    uint64_t blockers;
+    struct elm_reply_frame reply;
+};
+
 _Static_assert(sizeof(struct elm_mgr_call_header) == 16, "bad mgr call header size");
 _Static_assert(sizeof(struct elm_mgr_response_header) == 16, "bad mgr response header size");
 _Static_assert(sizeof(struct elm_core_info) == 40, "bad core info size");
 _Static_assert(sizeof(struct elm_snapshot_header) == 32, "bad snapshot header size");
-_Static_assert(sizeof(struct elm_cell_snapshot) == 184, "bad cell snapshot size");
+_Static_assert(sizeof(struct elm_cell_snapshot) == 224, "bad cell snapshot size");
 _Static_assert(sizeof(struct elm_mgr_policy_info) == 32, "bad policy info size");
 _Static_assert(sizeof(struct elm_menu_snapshot_header) == 16, "bad menu header size");
 _Static_assert(sizeof(struct elm_menu_item_snapshot) == 296, "bad menu item size");
@@ -616,7 +790,10 @@ _Static_assert(sizeof(struct elm_dev_discovery_header) == 24, "bad dev discovery
 _Static_assert(sizeof(struct elm_dev_discovery_record) == 96, "bad dev discovery record size");
 _Static_assert(sizeof(struct elm_lifecycle_request) == 16, "bad lifecycle request size");
 _Static_assert(sizeof(struct elm_lifecycle_response) == 32, "bad lifecycle response size");
-_Static_assert(sizeof(struct elm_ebi_source_request) == 16, "bad ebi source request size");
+_Static_assert(sizeof(struct elm_resource_budget) == 64, "bad resource budget size");
+_Static_assert(sizeof(struct elm_ebi_source_request) == 96, "bad ebi source request size");
+_Static_assert(sizeof(struct elm_projection_source_request) == 24,
+               "bad projection source request size");
 _Static_assert(sizeof(struct elm_load_cell_response) == 24, "bad load response size");
 _Static_assert(sizeof(struct elm_mgr_api_registry_header) == 24, "bad api registry header size");
 _Static_assert(sizeof(struct elm_mgr_api_descriptor) == 176, "bad api descriptor size");
@@ -630,6 +807,13 @@ _Static_assert(sizeof(struct elm_mgr_subscribed_event_read_request) == 24, "bad 
 _Static_assert(sizeof(struct elm_mgr_subscribed_event_read_header) == 48, "bad subscribed event read header size");
 _Static_assert(sizeof(struct elm_todo_registry_header) == 24, "bad todo registry header size");
 _Static_assert(sizeof(struct elm_todo_registry_record) == 232, "bad todo registry record size");
+_Static_assert(sizeof(struct elm_extension_snapshot_header) == 24, "bad extension header size");
+_Static_assert(sizeof(struct elm_extension_snapshot_record) == 208, "bad extension record size");
+_Static_assert(sizeof(struct elm_extension_attach_request) == 192, "bad extension attach request size");
+_Static_assert(sizeof(struct elm_extension_detach_request) == 56, "bad extension detach request size");
+_Static_assert(sizeof(struct elm_extension_attach_response) == 40, "bad extension attach response size");
+_Static_assert(sizeof(struct elm_extension_dispatch_request) == 392, "bad extension dispatch request size");
+_Static_assert(sizeof(struct elm_extension_dispatch_response) == 312, "bad extension dispatch response size");
 
 static int fail_msg(const char *step, const char *msg)
 {
@@ -703,7 +887,7 @@ static int mgr_call(uint32_t kind, const void *payload, size_t payload_len, uint
     struct elm_mgr_response_header response;
     size_t input_len = sizeof(header) + payload_len;
 
-    if (payload_len > 4096u || input_len > sizeof(input)) {
+    if (input_len > sizeof(input)) {
         return fail_msg("mgr-call", "payload too large");
     }
     memcpy(input, &header, sizeof(header));
@@ -828,11 +1012,13 @@ static int run_builtin_snapshot_query(uint8_t *out, size_t out_len)
     }
     if (mgr.parent != 0 || mgr.state != ELM_STATE_ACTIVE || mgr.kind != ELM_KIND_MANAGER ||
         mgr.ebi_source != ELM_EBI_SOURCE_KIND_BUILTIN ||
+        mgr.trust_flags != ELM_CELL_TRUST_INTERNAL ||
         !field_eq(mgr.name, mgr.name_len, "elm-mgr")) {
         return fail_msg("snapshot", "bad elm-mgr builtin cell");
     }
     if (eki.parent != ELM_MGR_BUILTIN_ID || eki.state != ELM_STATE_ACTIVE ||
         eki.kind != ELM_KIND_SERVICE || eki.ebi_source != ELM_EBI_SOURCE_KIND_BUILTIN ||
+        eki.trust_flags != ELM_CELL_TRUST_INTERNAL ||
         !field_eq(eki.name, eki.name_len, "eki")) {
         return fail_msg("snapshot", "bad builtin eki cell");
     }
@@ -862,7 +1048,12 @@ static int run_policy_query(uint8_t *out, size_t out_len)
         (policy.supported_actions & ELM_MGR_ACTION_API_QUERY) == 0 ||
         (policy.supported_actions & ELM_MGR_ACTION_EVENT_SUBSCRIBE) == 0 ||
         (policy.supported_actions & ELM_MGR_ACTION_EVENT_READ) == 0 ||
-        (policy.supported_actions & ELM_MGR_ACTION_TODO_QUERY) == 0) {
+        (policy.supported_actions & ELM_MGR_ACTION_TODO_QUERY) == 0 ||
+        (policy.supported_actions & ELM_MGR_ACTION_EXTENSION_QUERY) == 0 ||
+        (policy.supported_actions & ELM_MGR_ACTION_EXTENSION_ATTACH) == 0 ||
+        (policy.supported_actions & ELM_MGR_ACTION_EXTENSION_DETACH) == 0 ||
+        (policy.supported_actions & ELM_MGR_ACTION_EXTENSION_DISPATCH) == 0 ||
+        (policy.supported_actions & ELM_MGR_ACTION_TRUST_QUERY) == 0) {
         return fail_msg("policy-query", "missing supported action");
     }
     if ((policy.policy_flags & ELM_MGR_POLICY_HEALTH) == 0 ||
@@ -870,7 +1061,9 @@ static int run_policy_query(uint8_t *out, size_t out_len)
         (policy.policy_flags & ELM_MGR_POLICY_API_REGISTRY) == 0 ||
         (policy.policy_flags & ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS) == 0 ||
         (policy.policy_flags & ELM_MGR_POLICY_TODO_REGISTRY) == 0 ||
-        (policy.policy_flags & ELM_MGR_POLICY_RESOURCE_BUDGET) == 0) {
+        (policy.policy_flags & ELM_MGR_POLICY_EXTENSION_RUNTIME) == 0 ||
+        (policy.policy_flags & ELM_MGR_POLICY_RESOURCE_BUDGET) == 0 ||
+        (policy.policy_flags & ELM_MGR_POLICY_TRUST) == 0) {
         return fail_msg("policy-query", "missing policy flag");
     }
     if ((policy.blocker_mask & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED) == 0 ||
@@ -880,6 +1073,31 @@ static int run_policy_query(uint8_t *out, size_t out_len)
     printf("[elm-smoke] policy query ok: actions=0x%x policy=0x%llx blockers=0x%llx\n",
            policy.supported_actions, (unsigned long long)policy.policy_flags,
            (unsigned long long)policy.blocker_mask);
+    return 0;
+}
+
+static int run_trust_query(uint8_t *out, size_t out_len, int *allow_unsigned)
+{
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    struct elm_trust_runtime_info_v1 trust;
+
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_TRUST_STATE, NULL, 0, out, out_len,
+                            &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(trust)) {
+        return fail_msg("trust-query", "bad payload size");
+    }
+    memcpy(&trust, payload, sizeof(trust));
+    if (trust.abi_version != ELM_CTL_ABI_VERSION || trust.struct_size != sizeof(trust) ||
+        (trust.flags & ELM_TRUST_FLAG_SEALED) == 0 ||
+        (trust.flags & ELM_TRUST_FLAG_UNSIGNED_ACTIVE) != 0) {
+        return fail_msg("trust-query", "bad trust state");
+    }
+    *allow_unsigned = (trust.flags & ELM_TRUST_FLAG_ALLOW_UNSIGNED) != 0;
+    printf("[elm-smoke] trust query ok: flags=0x%x anchors=%u revoked=%u epochs=%u\n",
+           trust.flags, trust.anchor_count, trust.revoked_count, trust.accepted_epoch_count);
     return 0;
 }
 
@@ -948,8 +1166,6 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
     struct elm_todo_registry_header header;
     int saw_static = 0;
     int saw_soyo_projection = 0;
-    int saw_external_resolver = 0;
-    int saw_trap_trampoline = 0;
     int saw_rust_framework = 0;
 
     if (require_mgr_payload(ELM_MGR_CALL_QUERY_TODO_REGISTRY, NULL, 0, out, out_len,
@@ -962,7 +1178,7 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
     memcpy(&header, payload, sizeof(header));
     if (header.abi_version != ELM_CTL_ABI_VERSION ||
         header.record_entry_size != sizeof(struct elm_todo_registry_record) ||
-        header.record_count < 4 || header.active_count < 4 ||
+        header.record_count < 2 || header.active_count < 2 ||
         payload_len != sizeof(header) + header.record_count * header.record_entry_size) {
         return fail_msg("todo-registry", "bad registry");
     }
@@ -976,16 +1192,11 @@ static int run_todo_registry_query(uint8_t *out, size_t out_len)
         }
         if (field_eq(record.name, record.name_len, "projection.soyo_profile")) {
             saw_soyo_projection = 1;
-        } else if (field_eq(record.name, record.name_len, "provenance.external_resolver")) {
-            saw_external_resolver = 1;
-        } else if (field_eq(record.name, record.name_len, "native.trap_trampoline")) {
-            saw_trap_trampoline = 1;
-        } else if (field_eq(record.name, record.name_len, "framework.rust_elm")) {
+        } else if (field_eq(record.name, record.name_len, "framework.rust_elm_highlevel")) {
             saw_rust_framework = 1;
         }
     }
-    if (!saw_static || !saw_soyo_projection || !saw_external_resolver ||
-        !saw_trap_trampoline || !saw_rust_framework) {
+    if (!saw_static || !saw_soyo_projection || !saw_rust_framework) {
         return fail_msg("todo-registry", "missing static todo record");
     }
     printf("[elm-smoke] todo registry ok: records=%u active=%u flags=0x%x\n",
@@ -1144,40 +1355,95 @@ static int find_provider_port(uint8_t *out, size_t out_len, const char *contract
     return 0;
 }
 
-static int build_minimal_eki(uint8_t *image, size_t cap, size_t *image_len);
+static int build_minimal_eki(uint8_t *image, size_t cap, int include_menu, size_t *image_len);
 
-static int load_minimal_eki_cell(uint8_t *out, size_t out_len, uint64_t *cell_id)
+static void init_default_eki_source(struct elm_ebi_source_request *source,
+                                    struct elm_projection_source_request *projection,
+                                    size_t image_len)
 {
-    uint8_t image[1024];
-    uint8_t request[sizeof(struct elm_ebi_source_request) + sizeof(image)];
+    memset(source, 0, sizeof(*source));
+    memset(projection, 0, sizeof(*projection));
+    source->abi_version = ELM_EBI_SOURCE_ABI_VERSION;
+    source->source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
+    source->parent_cell_id = ELM_MGR_BUILTIN_ID;
+    source->budget.max_provider_ports = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS;
+    source->budget.max_provider_queue = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE;
+    source->budget.max_event_subscriptions = ELM_RESOURCE_BUDGET_DEFAULT_EVENT_SUBSCRIPTIONS;
+    source->budget.max_pending_loads = ELM_RESOURCE_BUDGET_DEFAULT_PENDING_LOADS;
+    source->budget.max_native_images = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGES;
+    source->budget.max_native_faults = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_FAULTS;
+    source->budget.max_audit_records = ELM_RESOURCE_BUDGET_DEFAULT_AUDIT_RECORDS;
+    source->budget.max_concurrent_calls = ELM_RESOURCE_BUDGET_DEFAULT_CONCURRENT_CALLS;
+    source->budget.max_native_image_bytes = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_IMAGE_BYTES;
+    source->budget.max_native_stack_bytes = ELM_RESOURCE_BUDGET_DEFAULT_NATIVE_STACK_BYTES;
+    source->budget.max_dynamic_alloc_bytes = ELM_RESOURCE_BUDGET_DEFAULT_DYNAMIC_ALLOC_BYTES;
+    source->budget.max_cpu_time_ns_per_call = ELM_RESOURCE_BUDGET_DEFAULT_CPU_TIME_NS_PER_CALL;
+    source->budget.cpu_budget_ns_per_period = ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD;
+    source->budget.cpu_period_ns = ELM_RESOURCE_BUDGET_DEFAULT_CPU_PERIOD_NS;
+    source->payload_len = (uint32_t)(sizeof(*projection) + image_len);
+    projection->abi_version = ELM_EBI_PROJECTION_SOURCE_ABI_VERSION;
+    projection->provider_id = ELM_EKI_PROJECTION_SOURCE_ID;
+    projection->payload_len = (uint32_t)image_len;
+}
+
+static int request_minimal_eki_load(uint8_t *out, size_t out_len, int include_menu,
+                                    struct elm_load_cell_response *load)
+{
+    uint8_t image[4096];
+    uint8_t request[sizeof(struct elm_ebi_source_request) +
+                    sizeof(struct elm_projection_source_request) + sizeof(image)];
     struct elm_ebi_source_request source;
-    struct elm_load_cell_response load;
+    struct elm_projection_source_request projection;
     const uint8_t *payload = NULL;
     uint32_t payload_len = 0;
     size_t image_len = 0;
 
-    if (build_minimal_eki(image, sizeof(image), &image_len) != 0) {
+    if (build_minimal_eki(image, sizeof(image), include_menu, &image_len) != 0) {
         return -1;
     }
-    memset(&source, 0, sizeof(source));
-    source.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
-    source.source_kind = ELM_EBI_SOURCE_KIND_EKI;
-    source.payload_len = (uint32_t)image_len;
+    init_default_eki_source(&source, &projection, image_len);
     memcpy(request, &source, sizeof(source));
-    memcpy(request + sizeof(source), image, image_len);
-    if (require_mgr_payload(ELM_MGR_CALL_LOAD_CELL, request, sizeof(source) + image_len,
+    memcpy(request + sizeof(source), &projection, sizeof(projection));
+    memcpy(request + sizeof(source) + sizeof(projection), image, image_len);
+    if (require_mgr_payload(ELM_MGR_CALL_LOAD_CELL, request,
+                            sizeof(source) + sizeof(projection) + image_len,
                             out, out_len, &payload, &payload_len) != 0) {
         return -1;
     }
-    if (payload_len != sizeof(load)) {
+    if (payload_len != sizeof(*load)) {
         return fail_msg("load-eki", "bad load response size");
     }
-    memcpy(&load, payload, sizeof(load));
-    if (load.status != ELM_EBI_LOAD_NATIVE_CODE_TODO || load.final_state != ELM_STATE_LOADED ||
+    memcpy(load, payload, sizeof(*load));
+    return 0;
+}
+
+static int load_minimal_eki_cell(uint8_t *out, size_t out_len, uint64_t *cell_id)
+{
+    struct elm_load_cell_response load;
+
+    if (request_minimal_eki_load(out, out_len, 0, &load) != 0) {
+        return -1;
+    }
+    if (load.status != ELM_MGR_STATUS_OK || load.final_state != ELM_STATE_ACTIVE ||
         load.cell_id == 0) {
         return fail_msg("load-eki", "unexpected load response");
     }
     *cell_id = load.cell_id;
+    return 0;
+}
+
+static int run_unsigned_eki_rejection(uint8_t *out, size_t out_len)
+{
+    struct elm_load_cell_response load;
+
+    if (request_minimal_eki_load(out, out_len, 1, &load) != 0) {
+        return -1;
+    }
+    if (load.status != ELM_EBI_LOAD_STATUS_UNTRUSTED_IMAGE || load.cell_id != 0 ||
+        load.final_state != 0 || load.reason != 0 || load.reserved != 0) {
+        return fail_msg("load-eki", "secure trust policy accepted unsigned image");
+    }
+    printf("[elm-smoke] unsigned EKI rejection ok: status=%d\n", load.status);
     return 0;
 }
 
@@ -1352,11 +1618,139 @@ static int run_audit_query(uint8_t *out, size_t out_len)
         return fail_msg("audit-query", "short payload");
     }
     memcpy(&header, payload, sizeof(header));
-    if (header.abi_version != ELM_CTL_ABI_VERSION || header.record_count == 0) {
+    if (header.abi_version != ELM_CTL_ABI_VERSION || header.record_entry_size != 88u ||
+        header.record_count == 0) {
         return fail_msg("audit-query", "empty audit stream");
     }
     printf("[elm-smoke] audit query ok: records=%u last=%llu dropped=%u\n", header.record_count,
            (unsigned long long)header.last_sequence, header.dropped_count);
+    return 0;
+}
+
+static int run_extension_runtime_query(uint8_t *out, size_t out_len)
+{
+    const uint8_t *payload = NULL;
+    uint32_t payload_len = 0;
+    struct elm_extension_snapshot_header snapshot;
+    struct elm_extension_attach_request attach;
+    struct elm_extension_detach_request detach;
+    struct elm_extension_attach_response attach_response;
+    struct elm_extension_dispatch_request dispatch;
+    struct elm_extension_dispatch_response dispatch_response;
+    const char *point = "menu.item";
+    const char *contract = "mgr.menu.item@1";
+    uint64_t cell_id = 0;
+
+    if (require_mgr_payload(ELM_MGR_CALL_QUERY_EXTENSIONS, NULL, 0, out, out_len, &payload,
+                            &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len < sizeof(snapshot)) {
+        return fail_msg("extension-query", "short payload");
+    }
+    memcpy(&snapshot, payload, sizeof(snapshot));
+    if (snapshot.abi_version != ELM_CTL_ABI_VERSION ||
+        snapshot.record_entry_size != sizeof(struct elm_extension_snapshot_record) ||
+        snapshot.point_count == 0 ||
+        payload_len != sizeof(snapshot) +
+                           (snapshot.point_count + snapshot.edge_count) *
+                               snapshot.record_entry_size) {
+        return fail_msg("extension-query", "bad snapshot");
+    }
+
+    if (load_minimal_eki_cell(out, out_len, &cell_id) != 0) {
+        return -1;
+    }
+
+    memset(&attach, 0, sizeof(attach));
+    attach.extension_cell_id = cell_id;
+    attach.target_cell_id = ELM_MGR_BUILTIN_ID;
+    attach.point_len = (uint16_t)strlen(point);
+    attach.contract_len = (uint16_t)strlen(contract);
+    attach.handler_contract_len = (uint16_t)strlen(contract);
+    memcpy(attach.point, point, attach.point_len);
+    memcpy(attach.contract, contract, attach.contract_len);
+    memcpy(attach.handler_contract, contract, attach.handler_contract_len);
+
+    if (require_mgr_payload(ELM_MGR_CALL_PREFLIGHT_EXTENSION_ATTACH, &attach, sizeof(attach),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(attach_response)) {
+        return fail_msg("extension-attach", "bad preflight payload size");
+    }
+    memcpy(&attach_response, payload, sizeof(attach_response));
+    if (attach_response.status != ELM_MGR_STATUS_OK || attach_response.allowed == 0 ||
+        attach_response.extension_cell_id != cell_id ||
+        attach_response.target_cell_id != ELM_MGR_BUILTIN_ID) {
+        fprintf(stderr,
+                "[elm-smoke] extension preflight detail: cell=%llu generation=%llu "
+                "status=%d allowed=%u blockers=0x%llx\n",
+                (unsigned long long)attach_response.extension_cell_id,
+                (unsigned long long)attach_response.generation, attach_response.status,
+                attach_response.allowed, (unsigned long long)attach_response.blockers);
+        return fail_msg("extension-attach", "preflight rejected");
+    }
+
+    if (require_mgr_payload(ELM_MGR_CALL_COMMIT_EXTENSION_ATTACH, &attach, sizeof(attach),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(attach_response)) {
+        return fail_msg("extension-attach", "bad commit payload size");
+    }
+    memcpy(&attach_response, payload, sizeof(attach_response));
+    if (attach_response.status != ELM_MGR_STATUS_OK || attach_response.allowed == 0) {
+        return fail_msg("extension-attach", "commit rejected");
+    }
+
+    memset(&dispatch, 0, sizeof(dispatch));
+    dispatch.target_cell_id = ELM_MGR_BUILTIN_ID;
+    dispatch.extension_cell_id = cell_id;
+    dispatch.opcode = 1;
+    dispatch.point_len = (uint16_t)strlen(point);
+    dispatch.contract_len = (uint16_t)strlen(contract);
+    memcpy(dispatch.point, point, dispatch.point_len);
+    memcpy(dispatch.contract, contract, dispatch.contract_len);
+    if (require_mgr_payload(ELM_MGR_CALL_DISPATCH_EXTENSION, &dispatch, sizeof(dispatch),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(dispatch_response)) {
+        return fail_msg("extension-dispatch", "bad payload size");
+    }
+    memcpy(&dispatch_response, payload, sizeof(dispatch_response));
+    if (dispatch_response.status != ELM_MGR_STATUS_UNSUPPORTED ||
+        dispatch_response.matched_extensions != 1 ||
+        dispatch_response.called_extensions != 0 ||
+        dispatch_response.mode != ELM_MIXIN_MODE_CHAIN ||
+        (dispatch_response.blockers & ELM_POLICY_BLOCK_PORT_TODO) == 0) {
+        return fail_msg("extension-dispatch", "dispatch boundary changed");
+    }
+
+    memset(&detach, 0, sizeof(detach));
+    detach.extension_cell_id = cell_id;
+    detach.target_cell_id = ELM_MGR_BUILTIN_ID;
+    detach.point_len = (uint16_t)strlen(point);
+    memcpy(detach.point, point, detach.point_len);
+    if (require_mgr_payload(ELM_MGR_CALL_COMMIT_EXTENSION_DETACH, &detach, sizeof(detach),
+                            out, out_len, &payload, &payload_len) != 0) {
+        return -1;
+    }
+    if (payload_len != sizeof(attach_response)) {
+        return fail_msg("extension-detach", "bad payload size");
+    }
+    memcpy(&attach_response, payload, sizeof(attach_response));
+    if (attach_response.status != ELM_MGR_STATUS_OK || attach_response.allowed == 0) {
+        return fail_msg("extension-detach", "detach rejected");
+    }
+
+    if (detach_cell(out, out_len, cell_id) != 0) {
+        return -1;
+    }
+
+    printf("[elm-smoke] extension runtime ok: cell=%llu point=%s dispatch=%d\n",
+           (unsigned long long)cell_id, point, dispatch_response.status);
     return 0;
 }
 
@@ -1429,35 +1823,66 @@ static size_t write_lifecycle_hooks_block(uint8_t *payload)
     return size;
 }
 
-static int build_minimal_eki(uint8_t *image, size_t cap, size_t *image_len)
+static size_t write_abi_fingerprint_block(uint8_t *payload)
+{
+    static const uint8_t rustc_hash[32] = { ELM_FINGERPRINT_RUSTC_HASH_BYTES };
+    static const uint8_t target_hash[32] = { ELM_FINGERPRINT_TARGET_HASH_BYTES };
+    static const uint8_t kernel_api_hash[32] = { ELM_FINGERPRINT_KERNEL_API_HASH_BYTES };
+
+    memset(payload, 0, ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE);
+    put_u16(payload, 0, ELM_RUST_ABI_FINGERPRINT_VERSION);
+    put_u16(payload, 2, 1);
+    payload[4] = ELM_PANIC_ABORT_THROUGH_RUNTIME;
+    payload[5] = 1;
+    memcpy(payload + 24, rustc_hash, sizeof(rustc_hash));
+    memcpy(payload + 56, target_hash, sizeof(target_hash));
+    memcpy(payload + 88, kernel_api_hash, sizeof(kernel_api_hash));
+    return ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE;
+}
+
+static int build_minimal_eki(uint8_t *image, size_t cap, int include_menu, size_t *image_len)
 {
     char name[64];
-    size_t block_count = 3;
+    size_t block_count = include_menu ? 4u : 3u;
     size_t table_off = ELM_EKI_HEADER_SIZE;
     size_t payload_off = table_off + block_count * ELM_EKI_BLOCK_DESC_SIZE;
+    size_t desc_index = 0;
     size_t off = payload_off;
     size_t size = 0;
 
     if (snprintf(name, sizeof(name), "smoke-%ld", (long)getpid()) <= 0) {
         return fail_msg("load-eki", "cannot build unique name");
     }
-    if (cap < 1024) {
+    if (cap < 2048) {
         return fail_msg("load-eki", "image buffer too small");
     }
     memset(image, 0, cap);
 
     size = write_manifest_block(image + off, name);
-    write_block_desc(image, table_off, ELM_EKI_BLOCK_MANIFEST, off, size);
+    write_block_desc(image, table_off + desc_index++ * ELM_EKI_BLOCK_DESC_SIZE,
+                     ELM_EKI_BLOCK_MANIFEST, off, size);
     off += size;
 
-    size = write_menu_block(image + off);
-    write_block_desc(image, table_off + ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_BLOCK_MENU, off, size);
-    off += size;
+    if (include_menu) {
+        size = write_menu_block(image + off);
+        write_block_desc(image, table_off + desc_index++ * ELM_EKI_BLOCK_DESC_SIZE,
+                         ELM_EKI_BLOCK_MENU, off, size);
+        off += size;
+    }
 
     size = write_lifecycle_hooks_block(image + off);
-    write_block_desc(image, table_off + 2u * ELM_EKI_BLOCK_DESC_SIZE,
+    write_block_desc(image, table_off + desc_index++ * ELM_EKI_BLOCK_DESC_SIZE,
                      ELM_EKI_BLOCK_LIFECYCLE_HOOKS, off, size);
     off += size;
+
+    size = write_abi_fingerprint_block(image + off);
+    write_block_desc(image, table_off + desc_index++ * ELM_EKI_BLOCK_DESC_SIZE,
+                     ELM_EKI_BLOCK_ABI_FINGERPRINT, off, size);
+    off += size;
+
+    if (desc_index != block_count) {
+        return fail_msg("load-eki", "internal block count mismatch");
+    }
 
     memcpy(image, "ELM_EKI", 7);
     image[7] = 0;
@@ -1467,7 +1892,7 @@ static int build_minimal_eki(uint8_t *image, size_t cap, size_t *image_len)
     put_u64(image, 16, off);
     put_u64(image, 24, table_off);
     put_u64(image, 32, 0);
-    put_u32(image, 40, 0);
+    put_u32(image, 40, ELM_FINGERPRINT_ARCH);
     put_u16(image, 44, 1);
     put_u16(image, 46, 0);
     put_u32(image, 48, (uint32_t)block_count);
@@ -1479,38 +1904,18 @@ static int build_minimal_eki(uint8_t *image, size_t cap, size_t *image_len)
 
 static int run_load_minimal_eki(uint8_t *out, size_t out_len)
 {
-    uint8_t image[1024];
-    uint8_t source[sizeof(struct elm_ebi_source_request) + sizeof(image)];
-    struct elm_ebi_source_request source_request;
     struct elm_load_cell_response load;
     struct elm_lifecycle_request detach_request;
     struct elm_lifecycle_response detach;
     struct elm_cell_snapshot loaded_cell;
     const uint8_t *payload = NULL;
     uint32_t payload_len = 0;
-    size_t image_len = 0;
     ssize_t snapshot_len = 0;
 
-    if (build_minimal_eki(image, sizeof(image), &image_len) != 0) {
+    if (request_minimal_eki_load(out, out_len, 1, &load) != 0) {
         return -1;
     }
-    memset(&source_request, 0, sizeof(source_request));
-    source_request.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
-    source_request.source_kind = ELM_EBI_SOURCE_KIND_EKI;
-    source_request.payload_len = (uint32_t)image_len;
-    memcpy(source, &source_request, sizeof(source_request));
-    memcpy(source + sizeof(source_request), image, image_len);
-
-    if (require_mgr_payload(ELM_MGR_CALL_LOAD_CELL, source, sizeof(source_request) + image_len,
-                            out, out_len, &payload, &payload_len) != 0) {
-        return -1;
-    }
-    if (payload_len != sizeof(load)) {
-        return fail_msg("load-eki", "bad payload size");
-    }
-    memcpy(&load, payload, sizeof(load));
-    if (load.status != ELM_EBI_LOAD_NATIVE_CODE_TODO || load.final_state != ELM_STATE_LOADED ||
-        load.cell_id == 0) {
+    if (load.status != ELM_MGR_STATUS_OK || load.final_state != ELM_STATE_ACTIVE || load.cell_id == 0) {
         return fail_msg("load-eki", "unexpected load result");
     }
     printf("[elm-smoke] load minimal EKI ok: cell=%llu status=%d state=%u\n",
@@ -1522,8 +1927,9 @@ static int run_load_minimal_eki(uint8_t *out, size_t out_len)
     if (find_snapshot_cell(out, (size_t)snapshot_len, load.cell_id, &loaded_cell) != 0) {
         return fail_msg("load-eki", "loaded cell missing from snapshot");
     }
-    if (loaded_cell.parent != ELM_MGR_BUILTIN_ID || loaded_cell.state != ELM_STATE_LOADED ||
-        loaded_cell.ebi_source != ELM_EBI_SOURCE_KIND_EKI) {
+    if (loaded_cell.parent != ELM_MGR_BUILTIN_ID || loaded_cell.state != ELM_STATE_ACTIVE ||
+        loaded_cell.ebi_source != ELM_EBI_SOURCE_KIND_PROJECTION ||
+        loaded_cell.trust_flags != ELM_CELL_TRUST_UNSIGNED) {
         return fail_msg("load-eki", "loaded cell has wrong parent/state/source");
     }
 
@@ -1545,7 +1951,7 @@ static int run_load_minimal_eki(uint8_t *out, size_t out_len)
     return 0;
 }
 
-static int run_mgr_runtime_query(uint8_t *out, size_t out_len)
+static int run_mgr_runtime_query(uint8_t *out, size_t out_len, int allow_unsigned)
 {
     const uint8_t *payload = NULL;
     uint32_t payload_len = 0;
@@ -1568,7 +1974,7 @@ static int run_mgr_runtime_query(uint8_t *out, size_t out_len)
     memcpy(&api, payload, sizeof(api));
     if (api.abi_version != ELM_CTL_ABI_VERSION ||
         api.record_entry_size != sizeof(struct elm_mgr_api_descriptor) ||
-        api.record_count < 17 ||
+        api.record_count < 22 ||
         payload_len != sizeof(api) + api.record_count * api.record_entry_size) {
         return fail_msg("api-query", "bad registry");
     }
@@ -1608,8 +2014,12 @@ static int run_mgr_runtime_query(uint8_t *out, size_t out_len)
         return fail_msg("event-subscriptions", "bad subscription snapshot");
     }
 
-    if (run_load_minimal_eki(out, out_len) != 0) {
-        return -1;
+    if (allow_unsigned) {
+        if (run_load_minimal_eki(out, out_len) != 0) {
+            return -1;
+        }
+    } else {
+        printf("[elm-smoke] unsigned EKI load skipped: secure trust policy is active\n");
     }
 
     memset(&read_request, 0, sizeof(read_request));
@@ -1666,44 +2076,58 @@ static int run_mgr_runtime_query(uint8_t *out, size_t out_len)
 
 int main(void)
 {
-    uint8_t out[8192];
     uint64_t health_action = 0;
     uint64_t binding_id = 0;
+    int allow_unsigned = 0;
 
     if (run_core_query() != 0) {
         return 1;
     }
-    if (run_builtin_snapshot_query(out, sizeof(out)) != 0) {
+    if (run_builtin_snapshot_query(g_out, sizeof(g_out)) != 0) {
         return 1;
     }
-    if (run_policy_query(out, sizeof(out)) != 0) {
+    if (run_policy_query(g_out, sizeof(g_out)) != 0) {
         return 1;
     }
-    if (run_menu_query(out, sizeof(out), &health_action) != 0) {
+    if (run_trust_query(g_out, sizeof(g_out), &allow_unsigned) != 0) {
         return 1;
     }
-    if (run_health_query(out, sizeof(out)) != 0) {
+    if (run_menu_query(g_out, sizeof(g_out), &health_action) != 0) {
         return 1;
     }
-    if (run_todo_registry_query(out, sizeof(out)) != 0) {
+    if (run_health_query(g_out, sizeof(g_out)) != 0) {
         return 1;
     }
-    if (run_bind_action_provider(out, sizeof(out), &binding_id) != 0) {
+    if (run_todo_registry_query(g_out, sizeof(g_out)) != 0) {
         return 1;
     }
-    if (run_invoke_health_action(out, sizeof(out), binding_id, health_action) != 0) {
+    if (run_bind_action_provider(g_out, sizeof(g_out), &binding_id) != 0) {
         return 1;
     }
-    if (run_dynamic_provider_query(out, sizeof(out)) != 0) {
+    if (run_invoke_health_action(g_out, sizeof(g_out), binding_id, health_action) != 0) {
         return 1;
     }
-    if (run_mgr_runtime_query(out, sizeof(out)) != 0) {
+    if (allow_unsigned) {
+        if (run_dynamic_provider_query(g_out, sizeof(g_out)) != 0) {
+            return 1;
+        }
+        if (run_extension_runtime_query(g_out, sizeof(g_out)) != 0) {
+            return 1;
+        }
+    } else {
+        if (run_unsigned_eki_rejection(g_out, sizeof(g_out)) != 0) {
+            return 1;
+        }
+        printf("[elm-smoke] dynamic provider skipped: secure trust policy is active\n");
+        printf("[elm-smoke] extension runtime skipped: secure trust policy is active\n");
+    }
+    if (run_mgr_runtime_query(g_out, sizeof(g_out), allow_unsigned) != 0) {
         return 1;
     }
-    if (run_audit_query(out, sizeof(out)) != 0) {
+    if (run_audit_query(g_out, sizeof(g_out)) != 0) {
         return 1;
     }
-    if (run_health_query(out, sizeof(out)) != 0) {
+    if (run_health_query(g_out, sizeof(g_out)) != 0) {
         return 1;
     }
 

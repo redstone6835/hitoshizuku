@@ -1,7 +1,8 @@
 //! `elm-mgr` 对外 API 与事件订阅协议。
 //!
-//! 本模块只定义稳定的 Rust ABI 固定布局。ELM 模组只能依赖这里描述的
-//! `elm::mgr::api::*` 协议，不直接依赖内核内部子系统。
+//! 本模块只定义稳定的 Rust ABI 固定布局。新代码优先使用
+//! `elm::elmmgr::api::*`；`elm::mgr::api::*` 保留为兼容路径。这里描述的是
+//! ELM 运行时自身能力，不是访问 VFS、调度、内存分配等子系统的唯一入口。
 
 use crate::ctl::ELM_CTL_ABI_VERSION;
 use crate::event::ElmEventRecord;
@@ -21,6 +22,10 @@ pub const ELM_MGR_API_FLAG_TODO: u32 = 1 << 1;
 pub const ELM_MGR_API_FLAG_SYSCALL: u32 = 1 << 2;
 pub const ELM_MGR_API_FLAG_SYSFS: u32 = 1 << 3;
 pub const ELM_MGR_API_FLAG_PROVIDER_OPS: u32 = 1 << 4;
+
+pub const ELM_RUNTIME_LOG_EXPORT_NAME: &str = "elm.runtime.log";
+pub const ELM_RUNTIME_LOG_EXPORT_CONTRACT: &str = "elm.runtime.log@1";
+pub const ELM_RUNTIME_LOG_EXPORT_VERSION: u32 = 1;
 
 pub const ELM_MGR_EVENT_FILTER_ANY: u32 = 0;
 pub const ELM_MGR_EVENT_SUBSCRIPTION_FLAG_ACTIVE: u32 = 1 << 0;

@@ -9,6 +9,25 @@ use crate::ids::{BindingId, ElmId, Generation, LeaseId, PortId};
 use crate::manifest::ElmManifest;
 use crate::nexus::FlowContract;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ElmMixinMode {
+    Chain = 1,
+    Observer = 2,
+    Exclusive = 3,
+}
+
+impl ElmMixinMode {
+    pub const fn from_raw(raw: u32) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Chain),
+            2 => Some(Self::Observer),
+            3 => Some(Self::Exclusive),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentEdge {
     pub child: ElmId,
@@ -27,6 +46,7 @@ pub struct ExtensionPoint {
     pub owner: ElmId,
     pub name: String,
     pub contract: FlowContract,
+    pub mode: ElmMixinMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +55,8 @@ pub struct ExtensionEdge {
     pub target: ElmId,
     pub point: String,
     pub contract: FlowContract,
+    pub handler_contract: FlowContract,
+    pub priority: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +79,7 @@ pub struct GraphValidationReport {
     pub capability_bindings: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BindingGraph {
     cells: BTreeMap<ElmId, ElmManifest>,
     parents: BTreeMap<ElmId, ElmId>,
@@ -84,6 +106,24 @@ impl BindingGraph {
             return Err(ElmError::DuplicateCell);
         }
         self.cells.insert(id, manifest);
+        Ok(())
+    }
+
+    pub fn try_reserve_edges(
+        &mut self,
+        dependencies: usize,
+        extensions: usize,
+        capability_bindings: usize,
+    ) -> ElmResult<()> {
+        self.dependencies
+            .try_reserve(dependencies)
+            .map_err(|_| ElmError::LeaseBusy)?;
+        self.extensions
+            .try_reserve(extensions)
+            .map_err(|_| ElmError::LeaseBusy)?;
+        self.capability_bindings
+            .try_reserve(capability_bindings)
+            .map_err(|_| ElmError::LeaseBusy)?;
         Ok(())
     }
 
@@ -127,6 +167,16 @@ impl BindingGraph {
         name: impl Into<String>,
         contract: FlowContract,
     ) -> ElmResult<()> {
+        self.add_extension_point_with_mode(owner, name, contract, ElmMixinMode::Chain)
+    }
+
+    pub fn add_extension_point_with_mode(
+        &mut self,
+        owner: ElmId,
+        name: impl Into<String>,
+        contract: FlowContract,
+        mode: ElmMixinMode,
+    ) -> ElmResult<()> {
         self.require_cell(owner)?;
         let name = name.into();
         let key = (owner, name.clone());
@@ -139,6 +189,7 @@ impl BindingGraph {
                 owner,
                 name,
                 contract,
+                mode,
             },
         );
         Ok(())
@@ -151,6 +202,19 @@ impl BindingGraph {
         point: impl Into<String>,
         contract: FlowContract,
     ) -> ElmResult<()> {
+        let handler_contract = contract.clone();
+        self.add_extension_with_dispatch(extension, target, point, contract, handler_contract, 0)
+    }
+
+    pub fn add_extension_with_dispatch(
+        &mut self,
+        extension: ElmId,
+        target: ElmId,
+        point: impl Into<String>,
+        contract: FlowContract,
+        handler_contract: FlowContract,
+        priority: i32,
+    ) -> ElmResult<()> {
         self.require_cell(extension)?;
         self.require_cell(target)?;
         let point = point.into();
@@ -160,11 +224,29 @@ impl BindingGraph {
         if extension_point.contract != contract {
             return Err(ElmError::ContractMismatch);
         }
+        if extension_point.mode == ElmMixinMode::Exclusive
+            && self
+                .extensions
+                .iter()
+                .any(|edge| edge.target == target && edge.point == point)
+        {
+            return Err(ElmError::DuplicateBinding);
+        }
+        if self.extensions.iter().any(|edge| {
+            edge.extension == extension
+                && edge.target == target
+                && edge.point == point
+                && edge.contract == contract
+        }) {
+            return Err(ElmError::DuplicateBinding);
+        }
         self.extensions.push(ExtensionEdge {
             extension,
             target,
             point,
             contract,
+            handler_contract,
+            priority,
         });
         if self.has_extension_cycle() {
             self.extensions.pop();
@@ -218,6 +300,31 @@ impl BindingGraph {
                 return Err(ElmError::DuplicateBinding);
             }
         }
+        for edge in &self.extensions {
+            self.require_cell(edge.extension)?;
+            self.require_cell(edge.target)?;
+            let Some(point) = self
+                .extension_points
+                .get(&(edge.target, edge.point.clone()))
+            else {
+                return Err(ElmError::ExtensionPointNotFound);
+            };
+            if point.contract != edge.contract {
+                return Err(ElmError::ContractMismatch);
+            }
+            if point.mode == ElmMixinMode::Exclusive
+                && self
+                    .extensions
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.target == edge.target && candidate.point == edge.point
+                    })
+                    .count()
+                    != 1
+            {
+                return Err(ElmError::DuplicateBinding);
+            }
+        }
         if self.has_dependency_cycle() {
             return Err(ElmError::DependencyCycle);
         }
@@ -258,16 +365,9 @@ impl BindingGraph {
         self.capability_bindings.retain(|edge| edge.consumer != id);
         let capability_bindings = before_bindings - self.capability_bindings.len();
 
-        let extension_points: Vec<_> = self
-            .extension_points
-            .keys()
-            .filter(|(owner, _)| *owner == id)
-            .cloned()
-            .collect();
-        let extension_point_count = extension_points.len();
-        for key in extension_points {
-            self.extension_points.remove(&key);
-        }
+        let before_extension_points = self.extension_points.len();
+        self.extension_points.retain(|(owner, _), _| *owner != id);
+        let extension_point_count = before_extension_points - self.extension_points.len();
 
         self.cells.remove(&id);
         Ok(GraphRemovalReport {
@@ -296,16 +396,9 @@ impl BindingGraph {
         self.capability_bindings.retain(|edge| edge.consumer != id);
         let capability_bindings = before_bindings - self.capability_bindings.len();
 
-        let extension_points: Vec<_> = self
-            .extension_points
-            .keys()
-            .filter(|(owner, _)| *owner == id)
-            .cloned()
-            .collect();
-        let extension_point_count = extension_points.len();
-        for key in extension_points {
-            self.extension_points.remove(&key);
-        }
+        let before_extension_points = self.extension_points.len();
+        self.extension_points.retain(|(owner, _), _| *owner != id);
+        let extension_point_count = before_extension_points - self.extension_points.len();
 
         Ok(GraphRemovalReport {
             parent_edges: 0,
@@ -360,8 +453,28 @@ impl BindingGraph {
             .collect()
     }
 
+    pub fn dependent_count(&self, provider: ElmId) -> usize {
+        self.dependencies
+            .iter()
+            .filter(|edge| edge.provider == provider)
+            .count()
+    }
+
     pub fn extension_points(&self) -> Vec<ExtensionPoint> {
         self.extension_points.values().cloned().collect()
+    }
+
+    pub fn extension_points_iter(&self) -> impl Iterator<Item = &ExtensionPoint> {
+        self.extension_points.values()
+    }
+
+    pub fn extension_point(&self, owner: ElmId, name: &str) -> Option<&ExtensionPoint> {
+        self.extension_points
+            .iter()
+            .find(|((current_owner, current_name), _)| {
+                *current_owner == owner && current_name.as_str() == name
+            })
+            .map(|(_, point)| point)
     }
 
     pub fn extensions(&self) -> &[ExtensionEdge] {
@@ -379,6 +492,42 @@ impl BindingGraph {
                 }
             })
             .collect()
+    }
+
+    pub fn extension_target_count(&self, target: ElmId) -> usize {
+        self.extensions
+            .iter()
+            .filter(|edge| edge.target == target)
+            .count()
+    }
+
+    pub fn extension_exists(
+        &self,
+        extension: ElmId,
+        target: ElmId,
+        point: &str,
+        contract: &FlowContract,
+    ) -> bool {
+        self.extensions.iter().any(|edge| {
+            edge.extension == extension
+                && edge.target == target
+                && edge.point == point
+                && &edge.contract == contract
+        })
+    }
+
+    pub fn remove_extension(
+        &mut self,
+        extension: ElmId,
+        target: ElmId,
+        point: &str,
+    ) -> Option<ExtensionEdge> {
+        self.extensions
+            .iter()
+            .position(|edge| {
+                edge.extension == extension && edge.target == target && edge.point == point
+            })
+            .map(|index| self.extensions.remove(index))
     }
 
     pub fn capability_bindings(&self) -> &[CapabilityBindingEdge] {

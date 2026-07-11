@@ -9,8 +9,11 @@ pub struct ElmEventSequence(pub u64);
 impl ElmEventSequence {
     pub const FIRST: Self = Self(1);
 
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) if value != 0 => Some(Self(value)),
+            _ => None,
+        }
     }
 }
 

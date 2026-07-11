@@ -112,8 +112,8 @@ pub use spawn::{
     reparent_to_init, spawn_child,
 };
 pub use task::{
-    ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_EXEC_ARGS,
-    TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
+    ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION,
+    TASKEXT_EXEC_ARGS, TASKEXT_EXEC_ENVP, TASKEXT_EXEC_PATH, TASKEXT_RISCV_VECTOR_SIGNAL_STACK,
     TASKEXT_RISCV_VECTOR_STATE, TASKEXT_USER_TRAP_FRAME, TASKEXT_VFS_CONTEXT, TASKEXT_VFS_FDTABLE,
     TASKEXT_VM_SPACE, Task, TaskDiag, TaskExt, TaskExtCloneHook, TaskExtExitHook, TaskExtKey,
     TaskKind, TaskPreExitHook, TaskState, TaskUsage, ext_clone_hook, ext_exit_hook, pre_exit_hook,

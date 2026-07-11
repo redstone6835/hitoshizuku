@@ -1,41 +1,52 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::mgr::{ELM_MGR_POLICY_REPLACE_TODO, ELM_POLICY_BLOCK_REPLACE_TODO};
+use ed25519_dalek::{Signer, SigningKey};
+
 use crate::{
     ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH,
+    ELM_API_FEATURE_LOG, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
     ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_HOOK_ON_MIGRATE_ABORT,
-    ELM_EBI_HOOK_ON_MIGRATE_EXPORT, ELM_EBI_HOOK_ON_MIGRATE_IMPORT, ELM_EBI_NAME_LEN,
-    ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE,
-    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE,
-    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
-    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
-    ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2,
+    ELM_EBI_HOOK_ON_MIGRATE_EXPORT, ELM_EBI_HOOK_ON_MIGRATE_IMPORT, ELM_EBI_IMPORT_FLAG_MANAGED,
+    ELM_EBI_NAME_LEN, ELM_EBI_PROJECTION_SOURCE_ABI_VERSION,
+    ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE, ELM_EBI_SEGMENT_FLAG_EXECUTE,
+    ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SOURCE_ABI_VERSION,
+    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE,
+    ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
+    ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROJECTION_SOURCE_ID, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
     ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_DETAIL_NONE, ELM_HEALTH_FLAG_HAS_FAILURES,
     ELM_LIFECYCLE_REASON_HAS_DEPENDENTS, ELM_LIFECYCLE_REASON_HAS_EXTENSIONS,
     ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_LIFECYCLE_REASON_NONE, ELM_MGR_ACTION_BIND,
     ELM_MGR_ACTION_DETACH, ELM_MGR_ACTION_EVENT_READ, ELM_MGR_ACTION_EVENT_SUBSCRIBE,
-    ELM_MGR_ACTION_HEALTH_QUERY, ELM_MGR_ACTION_NATIVE_CAPABILITY_QUERY,
-    ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_REPLACE, ELM_MGR_ACTION_TODO_QUERY,
-    ELM_MGR_ACTION_UNBIND, ELM_MGR_API_CONTRACT_LEN, ELM_MGR_API_FLAG_STABLE,
-    ELM_MGR_API_KIND_EVENT, ELM_MGR_BUILTIN_ID, ELM_MGR_EVENT_READ_FLAG_ADVANCE, ELM_MGR_MAX_INPUT,
-    ELM_MGR_MAX_PAYLOAD, ELM_MGR_POLICY_API_REGISTRY, ELM_MGR_POLICY_AUDIT,
-    ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_MENU_BINDING,
-    ELM_MGR_POLICY_NATIVE_CAPABILITIES, ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT,
+    ELM_MGR_ACTION_EXTENSION_ATTACH, ELM_MGR_ACTION_EXTENSION_DETACH,
+    ELM_MGR_ACTION_EXTENSION_DISPATCH, ELM_MGR_ACTION_EXTENSION_QUERY, ELM_MGR_ACTION_HEALTH_QUERY,
+    ELM_MGR_ACTION_NATIVE_CAPABILITY_QUERY, ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_REPLACE,
+    ELM_MGR_ACTION_TODO_QUERY, ELM_MGR_ACTION_TRUST_QUERY, ELM_MGR_ACTION_UNBIND,
+    ELM_MGR_API_CONTRACT_LEN, ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_KIND_EVENT, ELM_MGR_BUILTIN_ID,
+    ELM_MGR_EVENT_READ_FLAG_ADVANCE, ELM_MGR_EXTENSION_CONTRACT_LEN,
+    ELM_MGR_EXTENSION_HANDLER_CONTRACT_LEN, ELM_MGR_EXTENSION_PAYLOAD_LEN,
+    ELM_MGR_EXTENSION_POINT_LEN, ELM_MGR_MAX_INPUT, ELM_MGR_MAX_PAYLOAD,
+    ELM_MGR_POLICY_API_REGISTRY, ELM_MGR_POLICY_AUDIT, ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS,
+    ELM_MGR_POLICY_EXTENSION_RUNTIME, ELM_MGR_POLICY_HEALTH, ELM_MGR_POLICY_HOT_REPLACE,
+    ELM_MGR_POLICY_MENU_BINDING, ELM_MGR_POLICY_NATIVE_CAPABILITIES,
+    ELM_MGR_POLICY_NATIVE_LIFECYCLE, ELM_MGR_POLICY_NEXUS_BINDING, ELM_MGR_POLICY_PREFLIGHT,
     ELM_MGR_POLICY_PROVIDER_ASYNC, ELM_MGR_POLICY_PROVIDER_PORTS, ELM_MGR_POLICY_RESOURCE_BUDGET,
-    ELM_MGR_POLICY_TODO_REGISTRY, ELM_MGR_RELATION_POINT_LEN, ELM_MGR_STATUS_BUSY,
-    ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_TODO,
-    ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD, ELM_NATIVE_CAPABILITY_KIND_EXPORT,
-    ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_CAPABILITY_NAME_LEN,
-    ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_PROVIDER_CALL_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK,
-    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_MGR_POLICY_TODO_REGISTRY, ELM_MGR_POLICY_TRUST, ELM_MGR_RELATION_POINT_LEN,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
+    ELM_MGR_STATUS_TODO, ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD,
+    ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT,
+    ELM_NATIVE_CAPABILITY_NAME_LEN, ELM_NATIVE_ENTRY_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_NEXUS_CONTRACT_LEN,
+    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_POLICY_BLOCK_EXTENSION_DUPLICATE, ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_PORT_TODO,
     ELM_POLICY_BLOCK_PROVIDER_BUSY, ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
-    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+    ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA, ELM_PROOF_SHA256_LEN,
     ELM_PROVIDER_ASYNC_DEFAULT_RESULT_TTL_MS, ELM_PROVIDER_ASYNC_DEFAULT_TIMEOUT_MS,
     ELM_PROVIDER_ASYNC_MAX_TIMEOUT_MS, ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC,
     ELM_PROVIDER_FLAG_KERNEL_BACKEND, ELM_PROVIDER_FLAG_NATIVE_BACKEND,
@@ -49,21 +60,24 @@ use crate::{
     ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry,
     ElmEbiExportDecl, ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
     ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
-    ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
-    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind, ElmEbiSourceRequest,
-    ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind, ElmError, ElmEventRecord,
-    ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase, ElmLifecyclePlanRequest,
-    ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
-    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrApiDescriptor,
-    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader,
-    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
+    ElmEbiMenuDecl, ElmEbiProofV1, ElmEbiProviderPortDecl, ElmEbiRelocationKind,
+    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind,
+    ElmEbiSourceRequest, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind,
+    ElmError, ElmEventRecord, ElmExtensionAttachRequest, ElmExtensionAttachResponse,
+    ElmExtensionDetachRequest, ElmExtensionDispatchRequest, ElmExtensionDispatchResponse,
+    ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord, ElmId, ElmKind, ElmLifecycleAction,
+    ElmLifecyclePhase, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleRequest,
+    ElmLifecycleResponse, ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader,
+    ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrAuditRecord,
+    ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
     ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest,
     ElmMgrEventUnsubscribeResponse, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
     ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader, ElmMgrSubscribedEventReadRequest,
-    ElmMgrTopologyHeader, ElmName, ElmNativeCapabilityHeader, ElmNativeCapabilityRecord,
-    ElmNativeEntryFrameV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
-    ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusBindingRecord,
-    ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPortAccessPolicy, ElmPortSnapshot,
+    ElmMgrTopologyHeader, ElmMixinMode, ElmName, ElmNativeCapabilityHeader,
+    ElmNativeCapabilityRecord, ElmNativeEntryFrameV1, ElmNativeProviderCallV1,
+    ElmNativeProviderSnapshotV1, ElmNexusBindPlanResponse, ElmNexusBindRequest,
+    ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader, ElmNexusUnbindRequest, ElmPanicStrategy,
+    ElmPortAccessPolicy, ElmPortSnapshot, ElmProjectionSourceRequest,
     ElmProviderAsyncCancelRequest, ElmProviderAsyncCancelResponse, ElmProviderAsyncPollRequest,
     ElmProviderAsyncPollResponse, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
     ElmProviderAsyncSubmitResponse, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
@@ -73,11 +87,13 @@ use crate::{
     ElmProviderSnapshotRequest, ElmReplaceCellRequestV1, ElmReplaceCellResponseV1, ElmReplyFrame,
     ElmResourceBudget, ElmResourceKind, ElmResourceUsage, ElmRuntimeEventRequest,
     ElmRuntimeEventResponse, ElmRuntimeLogRequest, ElmRuntimeLogResponse,
-    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmSnapshotHeader, ElmState,
-    ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmVersion, FlowContract, FlowDirection,
+    ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord, ElmRustAbiFingerprintV1,
+    ElmSnapshotHeader, ElmState, ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmTrustAcceptance,
+    ElmTrustAnchor, ElmTrustError, ElmTrustStore, ElmVersion, FlowContract, FlowDirection,
     FlowMode, Generation, LeaseId, LeaseKind, LeaseRegistry, LeaseRights, LeaseState, PortId,
-    ResourceLease, TopologyEventKind, builtin_port_descriptors, first_lifecycle_reason,
-    parse_eki_ebi_unit, parse_eki_image, planned_final_state, state_code, status_from_blockers,
+    ResourceLease, TopologyEventKind, builtin_port_descriptors, canonical_ebi_digest,
+    first_lifecycle_reason, parse_eki_ebi_unit, parse_eki_image, planned_final_state, sha256,
+    sha256_with_zeroed_range, state_code, status_from_blockers,
 };
 
 fn manifest(name: &str) -> ElmManifest {
@@ -197,12 +213,23 @@ fn eki_segments_blocks(entries: &[(ElmEbiSegmentKind, u32, u64, u64)]) -> Vec<u8
 }
 
 fn eki_symbol_block(name: &str, contract: &str, version: u32) -> Vec<u8> {
+    eki_symbol_block_with_flags(name, contract, version, 0)
+}
+
+fn eki_symbol_block_with_flags(name: &str, contract: &str, version: u32, flags: u32) -> Vec<u8> {
     let record = 8;
     let mut out = vec![0; record + 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN];
     write_u32(&mut out, 0, 1);
-    write_u32(&mut out, record, version);
+    let (min_version, max_version) = if version == 0 {
+        (1, u32::MAX)
+    } else {
+        (version, version)
+    };
+    write_u32(&mut out, record, min_version);
+    write_u32(&mut out, record + 4, flags);
     write_u16(&mut out, record + 8, name.len() as u16);
     write_u16(&mut out, record + 10, contract.len() as u16);
+    write_u32(&mut out, record + 12, max_version);
     fixed_copy(&mut out, record + 16, ELM_EBI_SYMBOL_NAME_LEN, name);
     fixed_copy(
         &mut out,
@@ -210,6 +237,18 @@ fn eki_symbol_block(name: &str, contract: &str, version: u32) -> Vec<u8> {
         ELM_NEXUS_CONTRACT_LEN,
         contract,
     );
+    out
+}
+
+fn eki_elmapi_block(root_import_index: u32, required_features: u64, versions: &[u16]) -> Vec<u8> {
+    let mut out = vec![0; ELM_EKI_ELMAPI_BLOCK_SIZE];
+    write_u16(&mut out, 0, ELM_EKI_ELMAPI_BLOCK_VERSION);
+    write_u16(&mut out, 2, versions.len() as u16);
+    write_u32(&mut out, 4, root_import_index);
+    write_u64(&mut out, 8, required_features);
+    for (index, version) in versions.iter().enumerate() {
+        write_u16(&mut out, 16 + index * 2, *version);
+    }
     out
 }
 
@@ -329,45 +368,63 @@ fn eki_dependency_block(provider_name: &str, contract: &str) -> Vec<u8> {
     out
 }
 
-fn eki_extension_point_block(point: &str, contract: &str) -> Vec<u8> {
+fn eki_extension_point_block_with_mode(point: &str, contract: &str, mode: ElmMixinMode) -> Vec<u8> {
     let record = 8;
-    let mut out = vec![0; record + 8 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN];
+    let mut out = vec![0; record + 16 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN];
     write_u32(&mut out, 0, 1);
     write_u16(&mut out, record, point.len() as u16);
     write_u16(&mut out, record + 2, contract.len() as u16);
-    fixed_copy(&mut out, record + 8, ELM_MGR_RELATION_POINT_LEN, point);
+    write_u32(&mut out, record + 4, mode as u32);
+    fixed_copy(&mut out, record + 16, ELM_MGR_RELATION_POINT_LEN, point);
     fixed_copy(
         &mut out,
-        record + 8 + ELM_MGR_RELATION_POINT_LEN,
+        record + 16 + ELM_MGR_RELATION_POINT_LEN,
         ELM_NEXUS_CONTRACT_LEN,
         contract,
     );
     out
 }
 
-fn eki_extension_block(target_name: &str, point: &str, contract: &str) -> Vec<u8> {
+fn eki_extension_block_with_dispatch(
+    target_name: &str,
+    point: &str,
+    contract: &str,
+    handler_contract: &str,
+    priority: i32,
+) -> Vec<u8> {
     let record = 8;
-    let mut out =
-        vec![
-            0;
-            record + 8 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN
-        ];
+    let mut out = vec![
+        0;
+        record
+            + 24
+            + ELM_EBI_NAME_LEN
+            + ELM_MGR_RELATION_POINT_LEN
+            + ELM_NEXUS_CONTRACT_LEN * 2
+    ];
     write_u32(&mut out, 0, 1);
     write_u16(&mut out, record, target_name.len() as u16);
     write_u16(&mut out, record + 2, point.len() as u16);
     write_u16(&mut out, record + 4, contract.len() as u16);
-    fixed_copy(&mut out, record + 8, ELM_EBI_NAME_LEN, target_name);
+    write_u16(&mut out, record + 6, handler_contract.len() as u16);
+    write_u32(&mut out, record + 8, priority as u32);
+    fixed_copy(&mut out, record + 24, ELM_EBI_NAME_LEN, target_name);
     fixed_copy(
         &mut out,
-        record + 8 + ELM_EBI_NAME_LEN,
+        record + 24 + ELM_EBI_NAME_LEN,
         ELM_MGR_RELATION_POINT_LEN,
         point,
     );
     fixed_copy(
         &mut out,
-        record + 8 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN,
+        record + 24 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN,
         ELM_NEXUS_CONTRACT_LEN,
         contract,
+    );
+    fixed_copy(
+        &mut out,
+        record + 24 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN,
+        ELM_NEXUS_CONTRACT_LEN,
+        handler_contract,
     );
     out
 }
@@ -428,50 +485,6 @@ fn eki_provider_port_block_with_symbols(
     out
 }
 
-fn eki_provider_port_block_v2(
-    contract: &str,
-    access: ElmPortAccessPolicy,
-    direction: FlowDirection,
-    mode: FlowMode,
-    handler: Option<&str>,
-) -> Vec<u8> {
-    let record = 8;
-    let mut out = vec![0; record + ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2];
-    write_u32(&mut out, 0, 1);
-    write_u32(&mut out, record, access as u32);
-    write_u32(&mut out, record + 4, direction as u32);
-    write_u32(&mut out, record + 8, mode as u32);
-    write_u16(&mut out, record + 16, contract.len() as u16);
-    if let Some(handler) = handler {
-        write_u16(&mut out, record + 18, handler.len() as u16);
-        fixed_copy(
-            &mut out,
-            record + 24 + ELM_NEXUS_CONTRACT_LEN,
-            ELM_EBI_SYMBOL_NAME_LEN,
-            handler,
-        );
-    }
-    fixed_copy(&mut out, record + 24, ELM_NEXUS_CONTRACT_LEN, contract);
-    out
-}
-
-fn eki_provider_port_block_v1(
-    contract: &str,
-    access: ElmPortAccessPolicy,
-    direction: FlowDirection,
-    mode: FlowMode,
-) -> Vec<u8> {
-    let record = 8;
-    let mut out = vec![0; record + ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1];
-    write_u32(&mut out, 0, 1);
-    write_u32(&mut out, record, access as u32);
-    write_u32(&mut out, record + 4, direction as u32);
-    write_u32(&mut out, record + 8, mode as u32);
-    write_u16(&mut out, record + 16, contract.len() as u16);
-    fixed_copy(&mut out, record + 24, ELM_NEXUS_CONTRACT_LEN, contract);
-    out
-}
-
 fn eki_image(blocks: &[(ElmEkiBlockKind, Vec<u8>)]) -> Vec<u8> {
     let block_count = blocks.len();
     let mut out = vec![0; ELM_EKI_HEADER_SIZE + block_count * ELM_EKI_BLOCK_DESC_SIZE];
@@ -496,6 +509,247 @@ fn eki_image(blocks: &[(ElmEkiBlockKind, Vec<u8>)]) -> Vec<u8> {
     write_u16(&mut out, 44, 1);
     write_u32(&mut out, 48, block_count as u32);
     out
+}
+
+fn eki_image_with_header_hash(blocks: &[(ElmEkiBlockKind, Vec<u8>)]) -> Vec<u8> {
+    let mut out = eki_image(blocks);
+    let hash_offset = out.len();
+    out.extend_from_slice(&[0; ELM_PROOF_SHA256_LEN]);
+    let file_size = out.len() as u64;
+    write_u64(&mut out, 16, file_size);
+    write_u64(&mut out, 32, hash_offset as u64);
+    write_u32(&mut out, 52, ELM_EKI_IMAGE_HASH_SHA256_SIZE);
+    let digest = sha256_with_zeroed_range(&out, hash_offset, ELM_PROOF_SHA256_LEN).unwrap();
+    out[hash_offset..hash_offset + ELM_PROOF_SHA256_LEN].copy_from_slice(&digest);
+    out
+}
+
+#[test]
+fn proof_sha256_matches_standard_vectors() {
+    assert_eq!(
+        sha256(b""),
+        [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ]
+    );
+    assert_eq!(
+        sha256(b"abc"),
+        [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ]
+    );
+}
+
+fn trust_fixture(
+    name: &str,
+    release_epoch: u64,
+    signing: &SigningKey,
+) -> (ElmEbiImage, ElmRustAbiFingerprintV1, ElmEbiProofV1) {
+    let fingerprint = ElmRustAbiFingerprintV1::new(
+        sha256(b"rustc-test"),
+        sha256(b"target-test"),
+        sha256(b"kernel-api-test"),
+        1,
+        ElmPanicStrategy::AbortThroughRuntime,
+        1,
+        0,
+    );
+    let unit = ElmEbiUnit::new(
+        ElmManifest::new(
+            ElmName::new(name).unwrap(),
+            ElmVersion::new("1.0.0").unwrap(),
+            ElmKind::Service,
+        ),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks());
+    let image = ElmEbiImage::new(unit).with_abi_fingerprint(fingerprint.clone());
+    let public_key = signing.verifying_key().to_bytes();
+    let mut proof = ElmEbiProofV1 {
+        source_identifier: "test-fixture".into(),
+        source_digest: sha256(b"test-source"),
+        subject_digest: canonical_ebi_digest(&image),
+        signer_key_id: sha256(&public_key),
+        signer_public_key: public_key,
+        release_epoch,
+        flags: 0,
+        signature: [1; 64],
+    };
+    proof.signature = signing
+        .sign(&proof.unsigned_message(&fingerprint))
+        .to_bytes();
+    (image, fingerprint, proof)
+}
+
+#[test]
+fn trust_store_commits_epoch_only_after_acceptance() {
+    let signing = SigningKey::from_bytes(&[7; 32]);
+    let (image, fingerprint, proof) = trust_fixture("signed-cell", 3, &signing);
+    let mut store = ElmTrustStore::new();
+    store
+        .register_anchor(ElmTrustAnchor::new("test-root", proof.signer_public_key).unwrap())
+        .unwrap();
+
+    let acceptance = store.verify(&image, &proof, &fingerprint).unwrap();
+    assert!(store.accepted_epochs().is_empty());
+    store.try_accept(acceptance).unwrap();
+    assert_eq!(store.accepted_epochs().len(), 1);
+    assert_eq!(store.accepted_epochs()[0].release_epoch(), 3);
+}
+
+#[test]
+fn trust_store_reservation_is_explicit_and_balanced() {
+    let signing = SigningKey::from_bytes(&[8; 32]);
+    let (image, fingerprint, proof) = trust_fixture("reserved-cell", 2, &signing);
+    let mut store = ElmTrustStore::new();
+    store
+        .register_anchor(ElmTrustAnchor::new("reserved-root", proof.signer_public_key).unwrap())
+        .unwrap();
+    let acceptance = store.verify(&image, &proof, &fingerprint).unwrap();
+
+    assert!(store.reserve_acceptance(&acceptance).unwrap());
+    assert_eq!(store.pending_acceptance_slots(), 1);
+    store.cancel_acceptance_reservation(true).unwrap();
+    assert_eq!(store.pending_acceptance_slots(), 0);
+    assert_eq!(
+        store.cancel_acceptance_reservation(true),
+        Err(ElmTrustError::ReservationMissing)
+    );
+
+    assert!(store.reserve_acceptance(&acceptance).unwrap());
+    store.accept_reserved(acceptance.clone(), true).unwrap();
+    assert_eq!(store.pending_acceptance_slots(), 0);
+    assert_eq!(store.accepted_epochs().len(), 1);
+    assert!(!store.reserve_acceptance(&acceptance).unwrap());
+}
+
+#[test]
+fn trust_store_rejects_unknown_and_revoked_signers() {
+    let signing = SigningKey::from_bytes(&[9; 32]);
+    let (image, fingerprint, proof) = trust_fixture("signed-cell", 1, &signing);
+    let mut unknown = ElmTrustStore::new();
+    let other = SigningKey::from_bytes(&[10; 32]);
+    unknown
+        .register_anchor(
+            ElmTrustAnchor::new("other-root", other.verifying_key().to_bytes()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        unknown.verify(&image, &proof, &fingerprint),
+        Err(ElmTrustError::UnknownSigner)
+    );
+
+    let mut revoked = ElmTrustStore::new();
+    revoked
+        .register_anchor(ElmTrustAnchor::new("test-root", proof.signer_public_key).unwrap())
+        .unwrap();
+    revoked.revoke(proof.signer_key_id).unwrap();
+    assert_eq!(
+        revoked.verify(&image, &proof, &fingerprint),
+        Err(ElmTrustError::Revoked)
+    );
+}
+
+#[test]
+fn trust_store_rejects_rollback_and_invalid_signature() {
+    let signing = SigningKey::from_bytes(&[11; 32]);
+    let (image, fingerprint, current) = trust_fixture("signed-cell", 5, &signing);
+    let (_, _, previous) = trust_fixture("signed-cell", 4, &signing);
+    let mut store = ElmTrustStore::new();
+    store
+        .register_anchor(ElmTrustAnchor::new("test-root", current.signer_public_key).unwrap())
+        .unwrap();
+    let acceptance = store.verify(&image, &current, &fingerprint).unwrap();
+    store.try_accept(acceptance).unwrap();
+    assert_eq!(
+        store.verify(&image, &previous, &fingerprint),
+        Err(ElmTrustError::Rollback)
+    );
+
+    let mut invalid = current.clone();
+    invalid.signature[0] ^= 0x80;
+    assert_eq!(
+        store.verify(&image, &invalid, &fingerprint),
+        Err(ElmTrustError::SignatureMismatch)
+    );
+}
+
+#[test]
+fn trust_store_rollback_authority_survives_key_rotation_and_restore() {
+    let old_signing = SigningKey::from_bytes(&[12; 32]);
+    let new_signing = SigningKey::from_bytes(&[13; 32]);
+    let (current_image, fingerprint, current) =
+        trust_fixture("rotated-signed-cell", 8, &old_signing);
+    let (previous_image, _, previous) = trust_fixture("rotated-signed-cell", 7, &new_signing);
+    let old_anchor = ElmTrustAnchor::new_with_rollback_authority(
+        "vendor-key-2026-a",
+        "vendor.example/kernel-modules",
+        current.signer_public_key,
+    )
+    .unwrap();
+    let new_anchor = ElmTrustAnchor::new_with_rollback_authority(
+        "vendor-key-2026-b",
+        "vendor.example/kernel-modules",
+        previous.signer_public_key,
+    )
+    .unwrap();
+    let rollback_authority_id = old_anchor.rollback_authority_id();
+    assert_eq!(rollback_authority_id, new_anchor.rollback_authority_id());
+
+    let mut store = ElmTrustStore::new();
+    store.register_anchor(old_anchor).unwrap();
+    store.register_anchor(new_anchor.clone()).unwrap();
+    let acceptance = store
+        .verify(&current_image, &current, &fingerprint)
+        .unwrap();
+    assert_eq!(acceptance.rollback_authority_id(), rollback_authority_id);
+    store.try_accept(acceptance.clone()).unwrap();
+    assert_eq!(
+        store.verify(&previous_image, &previous, &fingerprint),
+        Err(ElmTrustError::Rollback)
+    );
+
+    let mut restored = ElmTrustStore::new();
+    restored.register_anchor(new_anchor).unwrap();
+    restored
+        .try_accept(
+            ElmTrustAcceptance::from_persisted(
+                acceptance.signer_key_id(),
+                acceptance.rollback_authority_id(),
+                acceptance.module_digest(),
+                acceptance.release_epoch(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        restored.verify(&previous_image, &previous, &fingerprint),
+        Err(ElmTrustError::Rollback)
+    );
+}
+
+#[test]
+fn eki_header_hash_verifies_whole_image() {
+    let image = eki_image_with_header_hash(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("hashed-eki", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+    ]);
+    assert!(parse_eki_image(&image).is_ok());
+
+    let mut tampered = image.clone();
+    let last = tampered.len() - ELM_PROOF_SHA256_LEN - 1;
+    tampered[last] ^= 0x1;
+    assert_eq!(
+        parse_eki_image(&tampered),
+        Err(ElmEbiLoadStatus::InvalidUnit)
+    );
 }
 
 #[test]
@@ -525,8 +779,17 @@ fn state_machine_accepts_unplug_paths() {
 
 #[test]
 fn state_machine_accepts_lifecycle_fault_paths() {
+    assert!(
+        ElmState::Discovered
+            .transition_to(ElmState::Faulted)
+            .is_ok()
+    );
+    assert!(ElmState::Verified.transition_to(ElmState::Faulted).is_ok());
     assert!(ElmState::Loaded.transition_to(ElmState::Faulted).is_ok());
+    assert!(ElmState::Linked.transition_to(ElmState::Faulted).is_ok());
+    assert!(ElmState::Ready.transition_to(ElmState::Faulted).is_ok());
     assert!(ElmState::Active.transition_to(ElmState::Faulted).is_ok());
+    assert!(ElmState::Quiescing.transition_to(ElmState::Active).is_ok());
     assert!(ElmState::Paused.transition_to(ElmState::Faulted).is_ok());
     assert!(
         ElmState::Faulted
@@ -780,6 +1043,28 @@ fn lease_revoke_waits_for_active_refs() {
 }
 
 #[test]
+fn lease_active_reference_counter_never_saturates() {
+    let mut registry = LeaseRegistry::new();
+    let id = LeaseId(99);
+    registry
+        .insert(ResourceLease::new(
+            id,
+            ElmId(7),
+            LeaseKind::Provider,
+            LeaseRights::CONTROL,
+            Generation::FIRST,
+        ))
+        .unwrap();
+    registry
+        .iter_mut()
+        .find(|lease| lease.id == id)
+        .unwrap()
+        .active_refs = usize::MAX;
+    assert_eq!(registry.add_active_ref(id), Err(ElmError::LeaseBusy));
+    assert_eq!(registry.get(id).unwrap().active_refs, usize::MAX);
+}
+
+#[test]
 fn lease_registry_revokes_and_removes_owned_leases() {
     let mut registry = LeaseRegistry::new();
     registry
@@ -796,6 +1081,35 @@ fn lease_registry_revokes_and_removes_owned_leases() {
     assert_eq!(revoked, alloc::vec![LeaseId(1)]);
     assert!(registry.get(LeaseId(1)).is_none());
     assert!(registry.is_empty());
+}
+
+#[test]
+fn lease_registry_busy_batch_revoke_is_atomic() {
+    let mut registry = LeaseRegistry::new();
+    for id in [LeaseId(1), LeaseId(2)] {
+        registry
+            .insert(ResourceLease::new(
+                id,
+                ElmId(7),
+                LeaseKind::Provider,
+                LeaseRights::CONTROL,
+                Generation::FIRST,
+            ))
+            .unwrap();
+    }
+    registry.get_mut(LeaseId(2)).unwrap().active_refs = 1;
+
+    assert_eq!(
+        registry.revoke_and_remove_owned_by(ElmId(7)),
+        Err(ElmError::LeaseBusy)
+    );
+    assert_eq!(registry.get(LeaseId(1)).unwrap().state, LeaseState::Active);
+    assert_eq!(registry.get(LeaseId(2)).unwrap().state, LeaseState::Active);
+    assert_eq!(
+        registry.revoke_and_remove(LeaseId(2)),
+        Err(ElmError::LeaseBusy)
+    );
+    assert_eq!(registry.get(LeaseId(2)).unwrap().state, LeaseState::Active);
 }
 
 #[test]
@@ -898,6 +1212,9 @@ fn snapshot_entries_truncate_names_safely() {
         false,
         0,
         0,
+        false,
+        [0; 32],
+        0,
     );
     assert_eq!(cell.id, 1);
     assert_eq!(cell.parent, 0);
@@ -914,6 +1231,8 @@ fn snapshot_entries_truncate_names_safely() {
     );
     assert_eq!(cell.usage_provider_ports, 0);
     assert_eq!(cell.isolated, 0);
+    assert_eq!(cell.trust_flags, crate::ELM_CELL_TRUST_INTERNAL);
+    assert_eq!(cell.release_epoch, 0);
 
     let port = ElmPortSnapshot::new(
         crate::PortId(1),
@@ -1012,7 +1331,7 @@ fn event_record_uses_zero_for_absent_objects() {
 
 #[test]
 fn mgr_response_header_reports_payload_status() {
-    assert_eq!(ELM_MGR_MAX_PAYLOAD, 4096);
+    assert_eq!(ELM_MGR_MAX_PAYLOAD, 256 * 1024);
     assert_eq!(
         ELM_MGR_MAX_INPUT,
         ELM_MGR_MAX_PAYLOAD + core::mem::size_of::<ElmMgrCallHeader>()
@@ -1105,6 +1424,60 @@ fn runtime_mgr_call_kinds_are_stable() {
         ElmMgrCallKind::from_raw(37),
         Some(ElmMgrCallKind::QueryTodoRegistry)
     );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(56),
+        Some(ElmMgrCallKind::BeginImageSession)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(57),
+        Some(ElmMgrCallKind::WriteImageSession)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(58),
+        Some(ElmMgrCallKind::SealImageSession)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(59),
+        Some(ElmMgrCallKind::AbortImageSession)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(60),
+        Some(ElmMgrCallKind::QueryImageSession)
+    );
+}
+
+#[test]
+fn image_session_abi_is_fixed_layout() {
+    let digest = crate::sha256(b"image-session");
+    let begin = crate::ElmImageSessionBeginRequestV1::new(4096, 5000, digest);
+    assert_eq!(begin.abi_version, crate::ELM_IMAGE_SESSION_ABI_VERSION);
+    assert_eq!(begin.hash_alg, crate::ELM_IMAGE_SESSION_HASH_SHA256);
+    assert_eq!(core::mem::size_of_val(&begin), 64);
+
+    let write = crate::ElmImageSessionWriteRequestV1::new(7, 64, 32);
+    assert_eq!(write.session_id, 7);
+    assert_eq!(core::mem::size_of_val(&write), 32);
+    assert_eq!(core::mem::size_of::<crate::ElmImageSessionRequestV1>(), 16);
+    assert_eq!(core::mem::size_of::<crate::ElmImageSessionInfoV1>(), 120);
+    assert_eq!(
+        core::mem::size_of::<crate::ElmImageSessionReferenceV1>(),
+        16
+    );
+    assert_eq!(crate::ELM_IMAGE_SESSION_MAX_CHUNK, 64 * 1024);
+}
+
+#[test]
+fn kernel_api_manifest_tracks_layout_and_target() {
+    let riscv = crate::kernel_api_manifest_v1(crate::ElmEbiArch::Riscv64 as u32);
+    let loongarch = crate::kernel_api_manifest_v1(crate::ElmEbiArch::LoongArch64 as u32);
+    assert_ne!(
+        crate::sha256(riscv.as_bytes()),
+        crate::sha256(loongarch.as_bytes())
+    );
+    assert!(riscv.contains("type=ElmApiRootV1 size="));
+    assert!(riscv.contains("field=ElmRuntimeApiV1.invoke_managed offset="));
+    assert!(riscv.contains("fn.abort-current=extern-C(u32)->never"));
+    assert!(riscv.ends_with('\n'));
 }
 
 #[test]
@@ -1338,8 +1711,10 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_EVENT_SUBSCRIPTIONS, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_NATIVE_CAPABILITIES, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_TODO_REGISTRY, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_TRUST, 0);
     assert_ne!(policy.policy_flags & ELM_MGR_POLICY_RESOURCE_BUDGET, 0);
-    assert_eq!(policy.policy_flags & ELM_MGR_POLICY_REPLACE_TODO, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_HOT_REPLACE, 0);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_NATIVE_LIFECYCLE, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_BIND, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_UNBIND, 0);
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_REPLACE, 0);
@@ -1351,13 +1726,13 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
         0
     );
     assert_ne!(policy.supported_actions & ELM_MGR_ACTION_TODO_QUERY, 0);
-    assert_eq!(policy.blocker_mask & ELM_POLICY_BLOCK_REPLACE_TODO, 0);
+    assert_ne!(policy.supported_actions & ELM_MGR_ACTION_TRUST_QUERY, 0);
     assert_ne!(policy.blocker_mask & ELM_POLICY_BLOCK_RESOURCE_QUOTA, 0);
 
-    let replace = ElmReplaceCellRequestV1::new(7, ElmEbiSourceKind::Eki as u16, 128);
+    let replace = ElmReplaceCellRequestV1::new(7, ElmEbiSourceKind::Projection as u16, 128);
     assert_eq!(replace.abi_version, ELM_REPLACE_CELL_ABI_VERSION);
     assert_eq!(replace.target_cell_id, 7);
-    assert_eq!(replace.source_kind, ElmEbiSourceKind::Eki as u16);
+    assert_eq!(replace.source_kind, ElmEbiSourceKind::Projection as u16);
     assert_eq!(replace.migration_limit, 0);
     assert_eq!(replace.source_payload_len, 128);
     assert_eq!(core::mem::size_of::<ElmReplaceCellRequestV1>(), 32);
@@ -1393,6 +1768,7 @@ fn resource_budget_model_is_stable() {
         native_images: 5,
         native_faults: 6,
         audit_records: 7,
+        ..ElmResourceUsage::default()
     };
     assert_eq!(usage.provider_queue, 2);
     assert_eq!(ElmResourceKind::NativeFault, ElmResourceKind::NativeFault);
@@ -1771,6 +2147,107 @@ fn provider_port_abi_records_are_fixed_layout() {
 }
 
 #[test]
+fn extension_mgr_abi_records_are_fixed_layout() {
+    assert_eq!(
+        ElmMgrCallKind::from_raw(38),
+        Some(ElmMgrCallKind::QueryExtensions)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(39),
+        Some(ElmMgrCallKind::PreflightExtensionAttach)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(40),
+        Some(ElmMgrCallKind::CommitExtensionAttach)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(41),
+        Some(ElmMgrCallKind::CommitExtensionDetach)
+    );
+    assert_eq!(
+        ElmMgrCallKind::from_raw(42),
+        Some(ElmMgrCallKind::DispatchExtension)
+    );
+
+    let header = ElmExtensionSnapshotHeader::new(1, 2, 9);
+    assert_eq!(
+        header.record_entry_size as usize,
+        core::mem::size_of::<ElmExtensionSnapshotRecord>()
+    );
+    assert_eq!(core::mem::size_of::<ElmExtensionSnapshotHeader>(), 24);
+
+    let point = ElmExtensionSnapshotRecord::point_with_mode(
+        1,
+        "menu.item",
+        "mgr.menu.item@1",
+        ElmMixinMode::Observer,
+    );
+    assert_eq!(point.point_len, "menu.item".len() as u16);
+    assert_eq!(point.contract_len, "mgr.menu.item@1".len() as u16);
+    assert_eq!(point.mode, ElmMixinMode::Observer as u32);
+    assert_eq!(core::mem::size_of::<ElmExtensionSnapshotRecord>(), 208);
+
+    let attach = ElmExtensionAttachRequest::new(100, 1, "menu.item", "mgr.menu.item@1")
+        .with_dispatch("demo.handler@1", -10);
+    assert_eq!(attach.point.len(), ELM_MGR_EXTENSION_POINT_LEN);
+    assert_eq!(attach.contract.len(), ELM_MGR_EXTENSION_CONTRACT_LEN);
+    assert_eq!(
+        attach.handler_contract.len(),
+        ELM_MGR_EXTENSION_HANDLER_CONTRACT_LEN
+    );
+    assert_eq!(attach.priority, -10);
+    assert_eq!(attach.handler_contract_len, "demo.handler@1".len() as u16);
+    assert_eq!(core::mem::size_of::<ElmExtensionAttachRequest>(), 192);
+
+    let detach = ElmExtensionDetachRequest::new(100, 1, "menu.item");
+    assert_eq!(detach.point_len, "menu.item".len() as u16);
+    assert_eq!(core::mem::size_of::<ElmExtensionDetachRequest>(), 56);
+
+    let response = ElmExtensionAttachResponse::new(100, 1, 1, true, ELM_MGR_STATUS_OK, 0);
+    assert_eq!(response.allowed, 1);
+    assert_eq!(core::mem::size_of::<ElmExtensionAttachResponse>(), 40);
+
+    let dispatch = ElmExtensionDispatchRequest::new(1, 100, 7, "menu.item", "mgr.menu.item@1");
+    assert_eq!(dispatch.payload.len(), ELM_MGR_EXTENSION_PAYLOAD_LEN);
+    assert_eq!(core::mem::size_of::<ElmExtensionDispatchRequest>(), 392);
+
+    let dispatch_response = ElmExtensionDispatchResponse::new(
+        ELM_MGR_STATUS_OK,
+        1,
+        1,
+        0,
+        ElmReplyFrame::empty(0, 7, ELM_MGR_STATUS_OK),
+    );
+    assert_eq!(dispatch_response.matched_extensions, 1);
+    assert_eq!(dispatch_response.mode, ElmMixinMode::Chain as u32);
+    assert_eq!(core::mem::size_of::<ElmExtensionDispatchResponse>(), 312);
+
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND),
+        ELM_MGR_STATUS_NOT_FOUND
+    );
+    assert_eq!(
+        status_from_blockers(ELM_POLICY_BLOCK_EXTENSION_DUPLICATE),
+        ELM_MGR_STATUS_BUSY
+    );
+    let policy = ElmMgrPolicyInfo::new(128);
+    assert_ne!(policy.policy_flags & ELM_MGR_POLICY_EXTENSION_RUNTIME, 0);
+    assert_ne!(policy.supported_actions & ELM_MGR_ACTION_EXTENSION_QUERY, 0);
+    assert_ne!(
+        policy.supported_actions & ELM_MGR_ACTION_EXTENSION_ATTACH,
+        0
+    );
+    assert_ne!(
+        policy.supported_actions & ELM_MGR_ACTION_EXTENSION_DETACH,
+        0
+    );
+    assert_ne!(
+        policy.supported_actions & ELM_MGR_ACTION_EXTENSION_DISPATCH,
+        0
+    );
+}
+
+#[test]
 fn native_capability_records_are_fixed_layout() {
     let header = ElmNativeCapabilityHeader::new(1, 0, 9);
     assert_eq!(
@@ -1877,7 +2354,9 @@ fn mgr_topology_and_audit_records_are_fixed_layout() {
         first_lifecycle_reason(audit.blockers),
         ELM_LIFECYCLE_REASON_HAS_EXTENSIONS
     );
-    assert_eq!(core::mem::size_of::<ElmMgrAuditRecord>(), 40);
+    assert_eq!(audit.flags, crate::ELM_AUDIT_FLAG_OPERATION);
+    assert_eq!(audit.authority, crate::ELM_AUDIT_AUTHORITY_KERNEL);
+    assert_eq!(core::mem::size_of::<ElmMgrAuditRecord>(), 88);
 
     let audit_header = ElmMgrAuditHeader::new(1, 0, 3);
     assert_eq!(audit_header.record_count, 1);
@@ -1964,7 +2443,7 @@ fn ebi_protocol_accepts_menu_extension_unit() {
     assert!(unit.validate(ElmEbiArch::Riscv64).is_ok());
     assert_eq!(unit.manifest.name.as_str(), "demo-menu");
     assert!(unit.menu.is_some());
-    assert!(unit.has_native_code());
+    assert!(!unit.has_native_code());
 }
 
 #[test]
@@ -2212,8 +2691,9 @@ fn ebi_protocol_rejects_unsupported_abi() {
 
 #[test]
 fn ebi_source_request_is_fixed_layout() {
-    let request = ElmEbiSourceRequest::new(ElmEbiSourceKind::Eki, 128);
-    assert_eq!(core::mem::size_of::<ElmEbiSourceRequest>(), 16);
+    let request = ElmEbiSourceRequest::new(ElmEbiSourceKind::Projection, 128);
+    assert_eq!(core::mem::size_of::<ElmEbiSourceRequest>(), 96);
+    assert_eq!(crate::ELM_EBI_SOURCE_REQUEST_SIZE, 96);
     assert_eq!(
         core::mem::size_of::<crate::ElmEkiHeader>(),
         ELM_EKI_HEADER_SIZE
@@ -2223,11 +2703,27 @@ fn ebi_source_request_is_fixed_layout() {
         ELM_EKI_BLOCK_DESC_SIZE
     );
     assert_eq!(request.abi_version, ELM_EBI_SOURCE_ABI_VERSION);
-    assert_eq!(request.source_kind, ElmEbiSourceKind::Eki as u16);
+    assert_eq!(request.source_kind, ElmEbiSourceKind::Projection as u16);
     assert_eq!(request.flags, 0);
+    assert_eq!(request.parent_cell_id, crate::ELM_MGR_BUILTIN_ID.0);
+    assert_eq!(request.budget, crate::ElmResourceBudget::DEFAULT);
+    assert_eq!(request.reserved0, 0);
     assert_eq!(request.payload_len, 128);
-    assert_eq!(request.reserved, 0);
+    assert_eq!(request.reserved1, 0);
     assert_eq!(ElmEbiSourceKind::from_raw(5), None);
+}
+
+#[test]
+fn projection_source_request_is_fixed_layout() {
+    let request = ElmProjectionSourceRequest::new(ELM_EKI_PROJECTION_SOURCE_ID, 128);
+    assert_eq!(ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE, 24);
+    assert_eq!(core::mem::size_of::<ElmProjectionSourceRequest>(), 24);
+    assert_eq!(request.abi_version, ELM_EBI_PROJECTION_SOURCE_ABI_VERSION);
+    assert_eq!(request.flags, 0);
+    assert_eq!(request.reserved0, 0);
+    assert_eq!(request.provider_id, ELM_EKI_PROJECTION_SOURCE_ID);
+    assert_eq!(request.payload_len, 128);
+    assert_eq!(request.reserved1, 0);
 }
 
 #[test]
@@ -2248,7 +2744,7 @@ fn eki_parser_accepts_menu_unit() {
     assert_eq!(unit.manifest.name.as_str(), "eki-menu");
     assert_eq!(unit.manifest.kind, ElmKind::Extension);
     assert!(unit.menu.is_some());
-    assert!(unit.has_native_code());
+    assert!(!unit.has_native_code());
 }
 
 #[test]
@@ -2419,6 +2915,244 @@ fn eki_parser_accepts_import_relocations() {
 }
 
 #[test]
+fn eki_parser_accepts_managed_import_only_in_aligned_data_slot() {
+    let code = vec![0; 8];
+    let data = vec![0; 16];
+    let relocs = eki_relocations_block(&[(ElmEbiRelocationKind::ImportAbs64, 1, 0, 8, 0)]);
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("eki-managed-import", "0.1.0", ElmKind::Service),
+        ),
+        (
+            ElmEkiBlockKind::Imports,
+            eki_symbol_block_with_flags(
+                "runtime.invoke",
+                "mgr.action.invoke@1",
+                1,
+                ELM_EBI_IMPORT_FLAG_MANAGED,
+            ),
+        ),
+        (
+            ElmEkiBlockKind::Segments,
+            eki_segments_blocks(&[
+                (
+                    ElmEbiSegmentKind::Code,
+                    0,
+                    code.len() as u64,
+                    code.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Data,
+                    0,
+                    data.len() as u64,
+                    data.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Relocation,
+                    0,
+                    relocs.len() as u64,
+                    relocs.len() as u64,
+                ),
+            ]),
+        ),
+        (ElmEkiBlockKind::Code, code),
+        (ElmEkiBlockKind::Data, data),
+        (ElmEkiBlockKind::Relocation, relocs),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 4),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 4, 4),
+            ]),
+        ),
+    ]);
+
+    assert!(parse_eki_image(&image).is_ok());
+}
+
+#[test]
+fn eki_parser_rejects_managed_import_outside_aligned_abs64_slot() {
+    for (kind, segment_index, target_offset) in [
+        (ElmEbiRelocationKind::ImportAbs64, 0, 0),
+        (ElmEbiRelocationKind::ImportAbs64, 1, 1),
+        (ElmEbiRelocationKind::ImportRel64, 1, 8),
+    ] {
+        let code = vec![0; 16];
+        let data = vec![0; 16];
+        let relocs = eki_relocations_block(&[(kind, segment_index, 0, target_offset, 0)]);
+        let image = eki_image(&[
+            (
+                ElmEkiBlockKind::Manifest,
+                eki_manifest_block("eki-bad-managed-import", "0.1.0", ElmKind::Service),
+            ),
+            (
+                ElmEkiBlockKind::Imports,
+                eki_symbol_block_with_flags(
+                    "runtime.invoke",
+                    "mgr.action.invoke@1",
+                    1,
+                    ELM_EBI_IMPORT_FLAG_MANAGED,
+                ),
+            ),
+            (
+                ElmEkiBlockKind::Segments,
+                eki_segments_blocks(&[
+                    (
+                        ElmEbiSegmentKind::Code,
+                        0,
+                        code.len() as u64,
+                        code.len() as u64,
+                    ),
+                    (
+                        ElmEbiSegmentKind::Data,
+                        0,
+                        data.len() as u64,
+                        data.len() as u64,
+                    ),
+                    (
+                        ElmEbiSegmentKind::Relocation,
+                        0,
+                        relocs.len() as u64,
+                        relocs.len() as u64,
+                    ),
+                ]),
+            ),
+            (ElmEkiBlockKind::Code, code),
+            (ElmEkiBlockKind::Data, data),
+            (ElmEkiBlockKind::Relocation, relocs),
+            (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+            (
+                ElmEkiBlockKind::SymbolLocations,
+                eki_symbol_locations_block(&[
+                    (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 4),
+                    (ELM_EBI_HOOK_ON_FINALIZE, 0, 4, 4),
+                ]),
+            ),
+        ]);
+
+        assert_eq!(
+            parse_eki_image(&image),
+            Err(ElmEbiLoadStatus::InvalidTarget)
+        );
+    }
+}
+
+#[test]
+fn eki_parser_accepts_elmapi_compatibility_and_root_slot() {
+    let code = vec![0; 8];
+    let data = vec![0; 8];
+    let relocs = eki_relocations_block(&[(ElmEbiRelocationKind::ImportAbs64, 1, 0, 0, 0)]);
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("eki-elmapi", "0.1.0", ElmKind::Service),
+        ),
+        (
+            ElmEkiBlockKind::Imports,
+            eki_symbol_block(ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_IMPORT_CONTRACT, 0),
+        ),
+        (
+            ElmEkiBlockKind::ApiCompatibility,
+            eki_elmapi_block(0, ELM_API_FEATURE_LOG, &[1]),
+        ),
+        (
+            ElmEkiBlockKind::Segments,
+            eki_segments_blocks(&[
+                (
+                    ElmEbiSegmentKind::Code,
+                    0,
+                    code.len() as u64,
+                    code.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Data,
+                    0,
+                    data.len() as u64,
+                    data.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Relocation,
+                    0,
+                    relocs.len() as u64,
+                    relocs.len() as u64,
+                ),
+            ]),
+        ),
+        (ElmEkiBlockKind::Code, code),
+        (ElmEkiBlockKind::Data, data),
+        (ElmEkiBlockKind::Relocation, relocs),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 4),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 4, 4),
+            ]),
+        ),
+    ]);
+
+    let image = parse_eki_image(&image).unwrap();
+    let compatibility = image.unit.api_compatibility.unwrap();
+    assert_eq!(compatibility.root_import_index, 0);
+    assert_eq!(compatibility.required_features, ELM_API_FEATURE_LOG);
+    assert_eq!(compatibility.compatible_versions, vec![1]);
+}
+
+#[test]
+fn eki_parser_rejects_elmapi_root_relocation_in_code() {
+    let code = vec![0; 16];
+    let relocs = eki_relocations_block(&[(ElmEbiRelocationKind::ImportAbs64, 0, 0, 8, 0)]);
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("eki-elmapi-code-slot", "0.1.0", ElmKind::Service),
+        ),
+        (
+            ElmEkiBlockKind::Imports,
+            eki_symbol_block(ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_IMPORT_CONTRACT, 0),
+        ),
+        (
+            ElmEkiBlockKind::ApiCompatibility,
+            eki_elmapi_block(0, 0, &[1]),
+        ),
+        (
+            ElmEkiBlockKind::Segments,
+            eki_segments_blocks(&[
+                (
+                    ElmEbiSegmentKind::Code,
+                    0,
+                    code.len() as u64,
+                    code.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Relocation,
+                    0,
+                    relocs.len() as u64,
+                    relocs.len() as u64,
+                ),
+            ]),
+        ),
+        (ElmEkiBlockKind::Code, code),
+        (ElmEkiBlockKind::Relocation, relocs),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 4),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 4, 4),
+            ]),
+        ),
+    ]);
+
+    assert_eq!(
+        parse_eki_image(&image),
+        Err(ElmEbiLoadStatus::InvalidTarget)
+    );
+}
+
+#[test]
 fn eki_parser_rejects_payload_segment_without_declaration() {
     let image = eki_image(&[
         (
@@ -2457,7 +3191,7 @@ fn eki_parser_accepts_imports_exports_metadata() {
     assert_eq!(unit.exports.len(), 1);
     assert_eq!(unit.imports[0].name, "runtime.invoke");
     assert_eq!(unit.exports[0].contract.as_str(), "demo.provider@1");
-    assert!(unit.has_native_code());
+    assert!(!unit.has_native_code());
 }
 
 #[test]
@@ -2473,11 +3207,21 @@ fn eki_parser_accepts_declarative_topology_blocks() {
         ),
         (
             ElmEkiBlockKind::ExtensionPoints,
-            eki_extension_point_block("demo.point", "demo.point@1"),
+            eki_extension_point_block_with_mode(
+                "demo.point",
+                "demo.point@1",
+                ElmMixinMode::Observer,
+            ),
         ),
         (
             ElmEkiBlockKind::Extensions,
-            eki_extension_block("elm-mgr", "menu.item", "mgr.menu.item@1"),
+            eki_extension_block_with_dispatch(
+                "elm-mgr",
+                "menu.item",
+                "mgr.menu.item@1",
+                "demo.provider@1",
+                -7,
+            ),
         ),
         (
             ElmEkiBlockKind::ProviderPorts,
@@ -2495,21 +3239,27 @@ fn eki_parser_accepts_declarative_topology_blocks() {
     assert_eq!(unit.manifest.name.as_str(), "eki-topology");
     assert_eq!(unit.dependencies[0].provider_name, "elm-mgr");
     assert_eq!(unit.extension_points[0].point, "demo.point");
+    assert_eq!(unit.extension_points[0].mode, ElmMixinMode::Observer);
     assert_eq!(unit.extensions[0].target_name, "elm-mgr");
+    assert_eq!(
+        unit.extensions[0].handler_contract.as_str(),
+        "demo.provider@1"
+    );
+    assert_eq!(unit.extensions[0].priority, -7);
     assert_eq!(unit.provider_ports[0].contract.as_str(), "demo.provider@1");
     assert_eq!(unit.provider_ports[0].handler_symbol, None);
 }
 
 #[test]
 fn eki_parser_accepts_provider_port_handler_symbol() {
-    let block = eki_provider_port_block_v2(
+    let block = eki_provider_port_block_with_handler(
         "demo.native.provider@1",
         ElmPortAccessPolicy::Public,
         FlowDirection::Control,
         FlowMode::Shared,
         Some("demo_provider_call"),
     );
-    assert_eq!(block.len(), 8 + ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2);
+    assert_eq!(block.len(), 8 + ELM_EKI_PROVIDER_PORT_RECORD_SIZE);
     let image = eki_image(&[
         (
             ElmEkiBlockKind::Manifest,
@@ -2565,34 +3315,6 @@ fn eki_parser_accepts_provider_port_snapshot_symbol() {
 }
 
 #[test]
-fn eki_parser_accepts_legacy_provider_port_record() {
-    let block = eki_provider_port_block_v1(
-        "demo.legacy.provider@1",
-        ElmPortAccessPolicy::ExtensionOnly,
-        FlowDirection::Control,
-        FlowMode::Shared,
-    );
-    assert_eq!(block.len(), 8 + ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1);
-    let image = eki_image(&[
-        (
-            ElmEkiBlockKind::Manifest,
-            eki_manifest_block("eki-provider-v1", "0.1.0", ElmKind::Service),
-        ),
-        (ElmEkiBlockKind::ProviderPorts, block),
-        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
-    ]);
-
-    let unit = parse_eki_ebi_unit(&image).unwrap();
-    assert_eq!(unit.provider_ports.len(), 1);
-    assert_eq!(
-        unit.provider_ports[0].contract.as_str(),
-        "demo.legacy.provider@1"
-    );
-    assert_eq!(unit.provider_ports[0].handler_symbol, None);
-    assert_eq!(unit.provider_ports[0].snapshot_symbol, None);
-}
-
-#[test]
 fn eki_parser_rejects_missing_lifecycle_hooks() {
     let image = eki_image(&[(
         ElmEkiBlockKind::Manifest,
@@ -2640,4 +3362,68 @@ fn eki_parser_rejects_bad_magic() {
         parse_eki_ebi_unit(&image),
         Err(ElmEbiLoadStatus::InvalidUnit)
     );
+}
+
+#[test]
+fn current_context_policy_check_uses_entered_snapshot() {
+    assert!(crate::current_context().is_none());
+    assert!(crate::current_cell_allows(
+        crate::ELM_CELL_POLICY_ALLOW_PROVIDER
+    ));
+
+    let context = crate::ElmContext::new(
+        crate::ElmId(42),
+        Some(crate::ELM_MGR_BUILTIN_ID),
+        crate::Generation(7),
+        crate::ElmState::Active,
+        crate::ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_allowed_actions(crate::ELM_CELL_POLICY_ALLOW_EVENT);
+
+    {
+        let _guard = crate::enter_current_context(&context).expect("测试上下文必须可进入");
+        assert_eq!(crate::current_cell(), Some(crate::ElmId(42)));
+        assert!(crate::current_cell_allows(
+            crate::ELM_CELL_POLICY_ALLOW_EVENT
+        ));
+        let denied = crate::check_current_cell(crate::ELM_CELL_POLICY_ALLOW_PROVIDER);
+        assert!(!denied.allowed);
+        assert_eq!(denied.status, crate::ELM_MGR_STATUS_PERMISSION);
+    }
+
+    assert!(crate::current_context().is_none());
+}
+
+#[test]
+fn elmmgr_api_namespace_reexports_runtime_api_types() {
+    let record = crate::elmmgr::api::ElmMgrApiDescriptor::new(
+        1,
+        crate::ELM_MGR_BUILTIN_ID.0,
+        crate::ELM_MGR_API_KIND_EVENT,
+        crate::ELM_MGR_API_FLAG_STABLE,
+        crate::ElmMgrCallKind::SubscribeEvent as u32,
+        "elm.event",
+        "subscribe",
+        "elm.event.subscribe@1",
+    );
+
+    assert_eq!(record.kind, crate::ELM_MGR_API_KIND_EVENT);
+    assert_ne!(record.flags & crate::ELM_MGR_API_FLAG_STABLE, 0);
+}
+
+#[test]
+fn elmapi_compatibility_selects_highest_common_version() {
+    let compatibility = crate::ElmEbiApiCompatibility::new(0, 0, [1]).unwrap();
+    assert_eq!(compatibility.select_highest_common(&[1]), Some(1));
+    assert_eq!(compatibility.select_highest_common(&[]), None);
+    assert!(crate::ElmEbiApiCompatibility::new(0, 0, [1, 1]).is_err());
+}
+
+#[test]
+fn elmapi_v1_tables_have_fixed_layout() {
+    assert_eq!(core::mem::size_of::<crate::ElmApiContextV1>(), 48);
+    assert_eq!(core::mem::size_of::<crate::ElmApiNamespaceV1>(), 40);
+    assert_eq!(core::mem::size_of::<crate::ElmRuntimeApiV1>(), 56);
+    assert_eq!(core::mem::size_of::<crate::ElmApiRootV1>(), 48);
 }

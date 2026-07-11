@@ -239,8 +239,8 @@ use crate::loongarch64::task::LoongArch64TaskOps;
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
-    MapError, PagingArch, PhysPageTableRoot, find_leaf, protect_range_entries, unmap_range_entries,
-    walk_and_map,
+    MapError, PagingArch, PhysPageTableRoot, find_leaf, protect_range_entries,
+    replace_empty_table_with_leaf, unmap_range_entries, validate_range_permissions, walk_and_map,
 };
 
 /// 内核堆虚拟地址区域基址（在 DMW 窗口之外）
@@ -426,6 +426,12 @@ fn allocate_page_table_page() -> Result<usize, MapError> {
     Ok(allocation.paddr)
 }
 
+fn free_page_table_page(paddr: usize) -> bool {
+    allocator::KERNEL_ALLOCATOR
+        .try_free_physical_addr(paddr)
+        .is_ok()
+}
+
 /// 根据 PagePolicy 映射地址范围
 ///
 /// 这是页表映射的主入口函数，负责把 allocator 请求的"虚拟地址 + 物理地址 + 大小"
@@ -587,7 +593,7 @@ fn map_range_with_policy(
     let end_vaddr = vaddr + size;
 
     while current_vaddr < end_vaddr {
-        if let Err(err) = walk_and_map::<LoongArch64Paging>(
+        if let Err(mut err) = walk_and_map::<LoongArch64Paging>(
             root_vaddr,
             current_vaddr,
             current_paddr,
@@ -600,6 +606,37 @@ fn map_range_with_policy(
             phys_to_virt,
             allocate_page_table_page,
         ) {
+            if matches!(err, MapError::AlreadyMapped)
+                && !matches!(page_policy, PagePolicy::BaseOnly)
+            {
+                match replace_empty_table_with_leaf::<LoongArch64Paging>(
+                    root_vaddr,
+                    current_vaddr,
+                    current_paddr,
+                    target_level,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    phys_to_virt,
+                    free_page_table_page,
+                ) {
+                    Ok(reclaim_failures) => {
+                        if reclaim_failures != 0 {
+                            log::error!(
+                                "[arch][heap_vm] promoted empty page-table subtree with {} unreclaimed page(s): vaddr={:#x}",
+                                reclaim_failures,
+                                current_vaddr
+                            );
+                        }
+                        current_vaddr += page_size;
+                        current_paddr += page_size;
+                        continue;
+                    }
+                    Err(promote_err) => err = promote_err,
+                }
+            }
             let mapped_size = current_vaddr - vaddr;
             let mut rollback_failed = false;
             if mapped_size != 0
@@ -914,4 +951,27 @@ pub fn protect_kernel_heap_range(
         LoongArch64Paging::flush_tlb(None);
     }
     true
+}
+
+pub fn validate_kernel_heap_range(
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> bool {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    if root_paddr == 0 {
+        return false;
+    }
+    validate_range_permissions::<LoongArch64Paging>(
+        phys_to_virt(root_paddr),
+        vaddr,
+        size,
+        read,
+        write,
+        execute,
+        phys_to_virt,
+    )
+    .is_ok()
 }

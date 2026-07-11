@@ -13,6 +13,9 @@ pub const ELM_CELL_LIFECYCLE_HOOKS_DECLARED: u32 = 1 << 0;
 pub const ELM_CELL_LIFECYCLE_EXECUTOR_READY: u32 = 1 << 1;
 pub const ELM_CELL_LIFECYCLE_INITIALIZED: u32 = 1 << 2;
 pub const ELM_CELL_LIFECYCLE_FINALIZED: u32 = 1 << 3;
+pub const ELM_CELL_TRUST_INTERNAL: u32 = 1 << 0;
+pub const ELM_CELL_TRUST_SIGNED: u32 = 1 << 1;
+pub const ELM_CELL_TRUST_UNSIGNED: u32 = 1 << 2;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,7 +88,9 @@ pub struct ElmCellSnapshot {
     pub usage_native_images: u16,
     pub usage_native_faults: u16,
     pub usage_audit_records: u16,
-    pub reserved2: u32,
+    pub trust_flags: u32,
+    pub release_epoch: u64,
+    pub signer_key_id: [u8; 32],
 }
 
 impl ElmCellSnapshot {
@@ -113,7 +118,17 @@ impl ElmCellSnapshot {
         isolated: bool,
         native_faults: u16,
         isolation_blocker: u64,
+        trust_unsigned: bool,
+        signer_key_id: [u8; 32],
+        release_epoch: u64,
     ) -> Self {
+        let trust_flags = if trust_unsigned {
+            ELM_CELL_TRUST_UNSIGNED
+        } else if signer_key_id != [0; 32] {
+            ELM_CELL_TRUST_SIGNED
+        } else {
+            ELM_CELL_TRUST_INTERNAL
+        };
         let mut out = Self {
             id: id.0,
             parent: parent.map(|id| id.0).unwrap_or(0),
@@ -155,7 +170,9 @@ impl ElmCellSnapshot {
             usage_native_images: usage.native_images,
             usage_native_faults: usage.native_faults,
             usage_audit_records: usage.audit_records,
-            reserved2: 0,
+            trust_flags,
+            release_epoch,
+            signer_key_id,
         };
         let bytes = name.as_bytes();
         let n = bytes.len().min(ELM_CELL_NAME_LEN);

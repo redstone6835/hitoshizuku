@@ -137,6 +137,8 @@ fn decode_exception(code: usize) -> Exception {
 /// 本函数由汇编入口调用，必须遵循参数约定传递有效的 TrapFrame 指针。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize) -> usize {
+    // trap 内发生的日志、调度和设备分配属于内核基础设施，不能归入被中断的 ELM。
+    let _accounting_suspension = allocator::suspend_implicit_allocation_accounting();
     // 汇编入口已经完成最危险的硬件现场保存；Rust 端从这里开始处理"解释现场并决定命运"。
     // 返回非零表示异常可恢复，汇编端将按该 TrapFrame 恢复寄存器并执行 `sret`；
     // 返回零表示当前策略认定无法恢复，汇编端进入停机路径。
@@ -158,6 +160,22 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
             super::super::time::rearm_periodic_timer();
             let now_ns = kernel_timestamp_ns();
             let _ = general::elm_guard::request_timeout_if_expired(now_ns);
+            if !from_user
+                && let Some(recovery) = general::elm_guard::try_recover_requested_abort(tf.sepc)
+            {
+                log::warning!(
+                    "[trap][elm] forced native exit cell={} phase={} reason={} return_pc={:#x} return_sp={:#x}",
+                    recovery.cell,
+                    recovery.phase,
+                    recovery.reason,
+                    recovery.return_pc,
+                    recovery.return_sp
+                );
+                tf.sepc = recovery.return_pc;
+                tf.sp = recovery.return_sp;
+                tf.a0 = recovery.return_value;
+                return tf_ptr;
+            }
             sched::on_timer_tick(now_ns);
             super::super::vdso::run_timer_tick_hook(now_ns);
             super::super::vdso::run_net_poll_hook(now_ns);
@@ -177,6 +195,14 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         );
         let now_ns = kernel_timestamp_ns();
         let _ = general::dev::irq::dispatch_interrupt(intr);
+        if !from_user
+            && let Some(recovery) = general::elm_guard::try_recover_requested_abort(tf.sepc)
+        {
+            tf.sepc = recovery.return_pc;
+            tf.sp = recovery.return_sp;
+            tf.a0 = recovery.return_value;
+            return tf_ptr;
+        }
         super::super::vdso::run_tty_poll_hook(now_ns);
         deliver_user_signals_before_return(tf_ptr, from_user);
         if from_user {
@@ -184,6 +210,25 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         }
         tf_ptr
     } else if code == EXC_ECALL_U || code == EXC_ECALL_S {
+        if !from_user
+            && let Some(recovery) =
+                general::elm_guard::try_recover_kernel_fault(tf.sepc, tf.tval, code)
+        {
+            log::warning!(
+                "[trap][elm] recovered native ecall cell={} phase={} sepc={:#x} tval={:#x} code={:#x} return_pc={:#x} return_sp={:#x}",
+                recovery.cell,
+                recovery.phase,
+                tf.sepc,
+                tf.tval,
+                code,
+                recovery.return_pc,
+                recovery.return_sp
+            );
+            tf.sepc = recovery.return_pc;
+            tf.sp = recovery.return_sp;
+            tf.a0 = recovery.return_value;
+            return tf_ptr;
+        }
         general::syscall::dispatch(general::TrapFramePtr::new(tf_ptr));
         if sched::needs_resched_current() {
             sched::preempt_if_needed(kernel_timestamp_ns());
@@ -234,6 +279,25 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
                 tf_ptr
             }
             FaultOutcome::Kernel(reason) => {
+                if !from_user
+                    && let Some(recovery) =
+                        general::elm_guard::try_recover_kernel_fault(tf.sepc, tf.tval, code)
+                {
+                    log::warning!(
+                        "[trap][elm] recovered native fault cell={} phase={} sepc={:#x} tval={:#x} code={:#x} return_pc={:#x} return_sp={:#x}",
+                        recovery.cell,
+                        recovery.phase,
+                        tf.sepc,
+                        tf.tval,
+                        code,
+                        recovery.return_pc,
+                        recovery.return_sp
+                    );
+                    tf.sepc = recovery.return_pc;
+                    tf.sp = recovery.return_sp;
+                    tf.a0 = recovery.return_value;
+                    return tf_ptr;
+                }
                 let (pid, kind, state, comm) = if sched::is_ready() {
                     let task = sched::current_task();
                     (task.pid_root(), task.kind(), task.state(), task.comm())
@@ -268,6 +332,23 @@ pub unsafe extern "C" fn riscv64_handle_exception(tf_ptr: usize, _user_sp: usize
         vec || fpu
     } {
         // 用户首次触碰浮点状态时按需打开 FS，保持 sepc 不变让原指令重试。
+        tf_ptr
+    } else if !from_user
+        && let Some(recovery) = general::elm_guard::try_recover_kernel_fault(tf.sepc, tf.tval, code)
+    {
+        log::warning!(
+            "[trap][elm] recovered native exception cell={} phase={} sepc={:#x} tval={:#x} code={:#x} return_pc={:#x} return_sp={:#x}",
+            recovery.cell,
+            recovery.phase,
+            tf.sepc,
+            tf.tval,
+            code,
+            recovery.return_pc,
+            recovery.return_sp
+        );
+        tf.sepc = recovery.return_pc;
+        tf.sp = recovery.return_sp;
+        tf.a0 = recovery.return_value;
         tf_ptr
     } else if code == EXC_BREAKPOINT {
         // ebreak 指令可能是 4 字节标准格式或 2 字节压缩格式（c.ebreak）。

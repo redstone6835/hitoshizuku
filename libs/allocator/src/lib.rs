@@ -167,6 +167,73 @@ pub type MapKernelHeapRangeFn =
     fn(vaddr: usize, paddr: usize, size: usize, page_policy: PagePolicy) -> bool;
 pub type UnmapKernelHeapRangeFn = fn(vaddr: usize, size: usize) -> bool;
 
+/// 可选的外部分配计量后端。
+///
+/// allocator 只传递无语义的所有者编号和字节数，不依赖任何上层扩展框架。所有回调都
+/// 可能出现在分配热路径或 allocator 内部锁附近，因此实现不得分配内存、阻塞或重入
+/// allocator。
+#[derive(Clone, Copy)]
+pub struct AllocationAccountingOps {
+    pub current_owner: fn() -> u64,
+    pub try_reserve: fn(owner: u64, bytes: u64) -> bool,
+    pub try_resize: fn(owner: u64, old_bytes: u64, new_bytes: u64) -> bool,
+    pub release: fn(owner: u64, bytes: u64),
+}
+
+static ALLOCATION_ACCOUNTING_OPS: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATION_ACCOUNTING_SUSPEND_DEPTH: [AtomicUsize; MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; MAX_CPUS];
+
+/// 暂停当前 CPU 上由执行上下文推导出的隐式分配计量。
+///
+/// trap、故障恢复和其它内核基础设施路径可以使用该守卫，避免把内核自身的延迟分配
+/// 错记到被中断的扩展单元。显式指定 `accounting_owner` 的请求不受影响。
+#[must_use = "计量暂停守卫必须保持到内核基础设施路径结束"]
+pub struct AllocationAccountingSuspension {
+    cpu_id: usize,
+}
+
+impl Drop for AllocationAccountingSuspension {
+    fn drop(&mut self) {
+        let result = ALLOCATION_ACCOUNTING_SUSPEND_DEPTH[self.cpu_id].fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |depth| depth.checked_sub(1),
+        );
+        debug_assert!(result.is_ok(), "隐式分配计量暂停深度发生下溢");
+    }
+}
+
+/// 在当前 CPU 上暂停隐式分配计量。
+///
+/// 该守卫只适合不会迁移 CPU 的短临界路径；架构 trap 入口满足这一约束。
+pub fn suspend_implicit_allocation_accounting() -> Option<AllocationAccountingSuspension> {
+    let cpu_id = KERNEL_ALLOCATOR.current_cpu_id().min(MAX_CPUS - 1);
+    ALLOCATION_ACCOUNTING_SUSPEND_DEPTH[cpu_id]
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+            depth.checked_add(1)
+        })
+        .ok()?;
+    Some(AllocationAccountingSuspension { cpu_id })
+}
+
+/// 安装唯一的外部分配计量后端。
+///
+/// 重复安装同一个静态表是幂等操作；尝试替换已经生效的后端会失败，避免活跃分配在
+/// 两套账本之间失去归属。
+pub fn register_allocation_accounting_ops(ops: &'static AllocationAccountingOps) -> bool {
+    let address = ops as *const AllocationAccountingOps as usize;
+    match ALLOCATION_ACCOUNTING_OPS.compare_exchange(
+        0,
+        address,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => true,
+        Err(current) => current == address,
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AllocStats {
     pub total_allocs: u64,
@@ -223,6 +290,52 @@ enum TrackedReallocProbe {
     },
     NeedsMove(AllocationRecord),
     Untracked,
+    QuotaDenied,
+}
+
+fn allocation_accounting_ops() -> Option<&'static AllocationAccountingOps> {
+    let address = ALLOCATION_ACCOUNTING_OPS.load(Ordering::Acquire);
+    if address == 0 {
+        return None;
+    }
+    // 安全性：该原子只保存 `register_allocation_accounting_ops` 接收的静态表地址，
+    // 注册后永不替换或释放。
+    Some(unsafe { &*(address as *const AllocationAccountingOps) })
+}
+
+fn resolve_accounting_owner(explicit: Option<u64>) -> u64 {
+    if let Some(owner) = explicit {
+        return owner;
+    }
+    let cpu_id = KERNEL_ALLOCATOR.current_cpu_id().min(MAX_CPUS - 1);
+    if ALLOCATION_ACCOUNTING_SUSPEND_DEPTH[cpu_id].load(Ordering::Acquire) != 0 {
+        return 0;
+    }
+    allocation_accounting_ops()
+        .map(|ops| (ops.current_owner)())
+        .unwrap_or(0)
+}
+
+fn try_reserve_accounting(owner: u64, bytes: usize) -> bool {
+    owner == 0
+        || allocation_accounting_ops()
+            .map(|ops| (ops.try_reserve)(owner, bytes as u64))
+            .unwrap_or(true)
+}
+
+fn try_resize_accounting(owner: u64, old_bytes: usize, new_bytes: usize) -> bool {
+    owner == 0
+        || allocation_accounting_ops()
+            .map(|ops| (ops.try_resize)(owner, old_bytes as u64, new_bytes as u64))
+            .unwrap_or(true)
+}
+
+fn release_accounting(owner: u64, bytes: usize) {
+    if owner != 0
+        && let Some(ops) = allocation_accounting_ops()
+    {
+        (ops.release)(owner, bytes as u64);
+    }
 }
 
 impl KernelMemorySubsystem {
@@ -901,17 +1014,34 @@ impl KernelMemorySubsystem {
         &self,
         request: PhysicalAllocRequest,
     ) -> Result<PhysicalAllocation, buddy::BuddyAllocError> {
-        request.validate().map_err(buddy_alloc_error_from_request)?;
-        let allocation = self.allocate_physical_raw(request)?;
-        if !self.active.load(Ordering::Acquire) {
+        let request = request.validate().map_err(buddy_alloc_error_from_request)?;
+        let active = self.active.load(Ordering::Acquire);
+        let accounting_owner = if active {
+            resolve_accounting_owner(request.accounting_owner())
+        } else {
+            0
+        };
+        if !try_reserve_accounting(accounting_owner, request.size) {
+            return Err(buddy::BuddyAllocError::Fragmented);
+        }
+        let request = request.with_accounting_owner(accounting_owner);
+        let allocation = match self.allocate_physical_raw(request) {
+            Ok(allocation) => allocation,
+            Err(err) => {
+                release_accounting(accounting_owner, request.size);
+                return Err(err);
+            }
+        };
+        if !active {
             return Ok(allocation);
         }
 
-        let record = physical_record_from_allocation(request, allocation);
+        let record = physical_record_from_allocation(request, allocation, accounting_owner);
         match self.registry.register_result(&self.boot, record) {
             Ok(()) => Ok(allocation),
             Err(err) => {
                 let _ = self.free_physical_raw(allocation);
+                release_accounting(accounting_owner, request.size);
                 Err(match err {
                     RegistryError::NotInitialized => buddy::BuddyAllocError::NotInitialized,
                     RegistryError::InvalidRecord => buddy::BuddyAllocError::InvalidAddress,
@@ -985,7 +1115,10 @@ impl KernelMemorySubsystem {
         }
 
         match self.try_free_physical_raw(allocation) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                release_accounting(record.accounting_owner(), record.size);
+                Ok(())
+            }
             Err(err) => {
                 let _ = self.registry.register_result(&self.boot, record);
                 Err(PhysicalFreeError::Buddy(err))
@@ -1023,7 +1156,10 @@ impl KernelMemorySubsystem {
         }
 
         match self.try_free_physical_raw(allocation) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                release_accounting(record.accounting_owner(), record.size);
+                Ok(())
+            }
             Err(err) => {
                 // buddy 拒绝释放时，物理页实际仍由调用方持有；必须恢复 registry
                 // 账本，否则下一次释放会变成未知指针，审计也会漏掉该页。
@@ -1062,11 +1198,23 @@ impl KernelMemorySubsystem {
     }
 
     pub fn allocate(&self, request: MemoryRequest) -> Result<AllocationRecord, AllocationError> {
-        request.validate()?;
+        let request = request.validate()?;
         let active = self.active.load(Ordering::Acquire);
-
+        let accounting_owner = if active {
+            resolve_accounting_owner(request.accounting_owner())
+        } else {
+            0
+        };
+        if !try_reserve_accounting(accounting_owner, request.size) {
+            return Err(AllocationError::OutOfMemory);
+        }
+        let request = request.with_accounting_owner(accounting_owner);
         if !active {
-            return self.allocate_boot(request);
+            let result = self.allocate_boot(request);
+            if result.is_err() {
+                release_accounting(accounting_owner, request.size);
+            }
+            return result;
         }
 
         let mut allocation = self.allocate_active_once(request);
@@ -1097,7 +1245,10 @@ impl KernelMemorySubsystem {
         }
         match allocation {
             Ok(record) => Ok(record),
-            Err(err) => Err(err),
+            Err(err) => {
+                release_accounting(accounting_owner, request.size);
+                Err(err)
+            }
         }
     }
 
@@ -1149,6 +1300,20 @@ impl KernelMemorySubsystem {
     /// 推导出对象所有权。
     pub fn query_tracked_allocation(&self, ptr: usize) -> Result<AllocationRecord, OwnershipError> {
         self.registry.get(ptr).ok_or(OwnershipError::UnknownPointer)
+    }
+
+    /// 查询完整覆盖给定范围的逐对象分配记录。
+    ///
+    /// 该接口用于 ELM 等跨 ABI 边界验证内部指针；返回成功只证明范围仍属于一个活跃
+    /// 分配，调用方仍必须检查记录中的资源所有者和访问权限。
+    pub fn query_containing_allocation(
+        &self,
+        ptr: usize,
+        len: usize,
+    ) -> Result<AllocationRecord, OwnershipError> {
+        self.registry
+            .find_containing(ptr, len)
+            .ok_or(OwnershipError::UnknownPointer)
     }
 
     /// 判断裸指针是否属于当前 allocator 逐对象跟踪的活跃分配。
@@ -1231,7 +1396,7 @@ impl KernelMemorySubsystem {
             .registry
             .remove(ptr)
             .ok_or(DeallocationError::UnknownPointer)?;
-        match record.kind {
+        let result = match record.kind {
             AllocationKind::Boot => Ok(()),
             AllocationKind::Small => {
                 if self.slab.free_record_reclaiming(
@@ -1283,7 +1448,11 @@ impl KernelMemorySubsystem {
                     ),
                 }
             }
+        };
+        if result.is_ok() {
+            release_accounting(record.accounting_owner(), record.size);
         }
+        result
     }
 
     /// 调整一个普通内核分配的大小，并返回更新后的分配记录。
@@ -1309,6 +1478,7 @@ impl KernelMemorySubsystem {
             return Err(AllocationError::InvalidLayout);
         }
 
+        let request = request.validate()?;
         let new_layout = request.layout()?;
         let old_record = match self.probe_tracked_realloc(ptr, new_layout, request.size) {
             Ok(TrackedReallocProbe::Updated { old_size, record }) => {
@@ -1322,6 +1492,7 @@ impl KernelMemorySubsystem {
                 return Ok(record);
             }
             Ok(TrackedReallocProbe::NeedsMove(record)) => record,
+            Ok(TrackedReallocProbe::QuotaDenied) => return Err(AllocationError::OutOfMemory),
             Ok(TrackedReallocProbe::Untracked) | Err(_) => {
                 return Err(AllocationError::InvalidLayout);
             }
@@ -1333,7 +1504,15 @@ impl KernelMemorySubsystem {
             return Err(AllocationError::InvalidLayout);
         }
 
-        let new_record = self.allocate(request)?;
+        let caller = resolve_accounting_owner(request.accounting_owner());
+        if caller != 0
+            && old_record.accounting_owner() != 0
+            && caller != old_record.accounting_owner()
+        {
+            return Err(AllocationError::InvalidLayout);
+        }
+        let new_record =
+            self.allocate(request.with_accounting_owner(old_record.accounting_owner()))?;
         let copy_len = old_record.size.min(new_record.size);
         unsafe {
             core::ptr::copy_nonoverlapping(ptr as *const u8, new_record.ptr as *mut u8, copy_len);
@@ -1359,7 +1538,8 @@ impl KernelMemorySubsystem {
             }
         }
         let record = AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr)
-            .with_sizes(request.size, request.size, request.align);
+            .with_sizes(request.size, request.size, request.align)
+            .with_accounting_owner(request.accounting_owner().unwrap_or(0));
         Ok(record)
     }
 
@@ -1406,6 +1586,7 @@ impl KernelMemorySubsystem {
                     )
                     .with_arena(AllocationArena::Kernel)
                     .with_sizes(request.size, range.size, request.align)
+                    .with_accounting_owner(request.accounting_owner().unwrap_or(0))
                     .with_physical(
                         range.paddr,
                         range.order,
@@ -1445,6 +1626,7 @@ impl KernelMemorySubsystem {
                         )
                         .with_arena(AllocationArena::Kernel)
                         .with_sizes(request.size, usable_size, request.align)
+                        .with_accounting_owner(request.accounting_owner().unwrap_or(0))
                         .with_backend_cookie(allocation.slab_node);
                         self.register_allocation(record, || {
                             self.slab.free_record_reclaiming(
@@ -1492,7 +1674,8 @@ impl KernelMemorySubsystem {
                             )?
                         }
                         Err(err) => return Err(err),
-                    };
+                    }
+                    .with_accounting_owner(request.accounting_owner().unwrap_or(0));
                 self.register_allocation(record, || {
                     let _ = self.managed.free(record.ptr, &self.vmem);
                 })?;
@@ -1501,11 +1684,16 @@ impl KernelMemorySubsystem {
             MemoryDomain::Physical => {
                 let physical_request = PhysicalAllocRequest::new(request.size, request.align)
                     .with_page_policy(request.page_policy)
-                    .with_placement(request.placement);
+                    .with_placement(request.placement)
+                    .with_accounting_owner(request.accounting_owner().unwrap_or(0));
                 let allocation = self
                     .allocate_physical_raw(physical_request)
                     .map_err(AllocationError::from)?;
-                let record = physical_record_from_allocation(physical_request, allocation);
+                let record = physical_record_from_allocation(
+                    physical_request,
+                    allocation,
+                    request.accounting_owner().unwrap_or(0),
+                );
                 self.register_allocation(record, || {
                     let _ = self.free_physical_raw(allocation);
                 })?;
@@ -1543,19 +1731,41 @@ impl KernelMemorySubsystem {
 
     fn reclaim_managed_from_gc(&self, header_addr: usize, _size: usize) {
         if let Some(ptr) = self.managed.reclaim_from_gc(header_addr, &self.vmem) {
-            let _ = self.registry.remove(ptr);
+            if let Some(record) = self.registry.remove(ptr) {
+                release_accounting(record.accounting_owner(), record.size);
+            }
         }
     }
 
-    fn retarget_managed_registry(&self, old_ptr: usize, new_record: AllocationRecord) -> bool {
+    fn retarget_managed_registry(&self, old_ptr: usize, mut new_record: AllocationRecord) -> bool {
         if old_ptr == 0 || new_record.ptr == 0 {
             return false;
         }
         if old_ptr == new_record.ptr {
-            return self
+            let Ok(old_record) = self.registry.get_result(old_ptr) else {
+                return false;
+            };
+            if !try_resize_accounting(
+                old_record.accounting_owner(),
+                old_record.size,
+                new_record.size,
+            ) {
+                return false;
+            }
+            new_record = new_record.with_accounting_owner(old_record.accounting_owner());
+            if self
                 .registry
                 .update_existing_result(old_ptr, new_record)
-                .is_ok();
+                .is_ok()
+            {
+                return true;
+            }
+            let _ = try_resize_accounting(
+                old_record.accounting_owner(),
+                new_record.size,
+                old_record.size,
+            );
+            return false;
         }
 
         let old_record = match self.registry.remove_result(old_ptr) {
@@ -1563,6 +1773,15 @@ impl KernelMemorySubsystem {
             Err(_) => return false,
         };
 
+        if !try_resize_accounting(
+            old_record.accounting_owner(),
+            old_record.size,
+            new_record.size,
+        ) {
+            let _ = self.registry.register_result(&self.boot, old_record);
+            return false;
+        }
+        new_record = new_record.with_accounting_owner(old_record.accounting_owner());
         let result = match self.registry.get_result(new_record.ptr) {
             Ok(_) => self
                 .registry
@@ -1576,6 +1795,11 @@ impl KernelMemorySubsystem {
         match result {
             Ok(()) => true,
             Err(_) => {
+                let _ = try_resize_accounting(
+                    old_record.accounting_owner(),
+                    new_record.size,
+                    old_record.size,
+                );
                 let _ = self.registry.register_result(&self.boot, old_record);
                 false
             }
@@ -1712,6 +1936,7 @@ impl KernelMemorySubsystem {
                 record
             ),
         }
+        release_accounting(record.accounting_owner(), record.size);
     }
 
     fn retire_moved_kernel_allocation<F>(
@@ -1748,27 +1973,29 @@ impl KernelMemorySubsystem {
         new_layout: Layout,
         new_size: usize,
     ) -> Result<TrackedReallocProbe, RegistryError> {
-        // GlobalAlloc::realloc 是最热的 resize 入口之一。这里把“查记录 + 判断能否
-        // 原地复用 + 更新逻辑大小”合并到 registry 的单次 shard 加锁中，避免同一
-        // 指针连续两次哈希、加锁和链表扫描；无法原地复用时直接把旧记录带回，
-        // 后续搬迁复制也不需要再查一次账本。
-        let mut old_size = 0usize;
-        match self
-            .registry
-            .update_existing_maybe_result(ptr, |mut record| {
-                old_size = record.size;
-                if !self.can_reuse_allocation(record, new_layout) {
-                    return None;
-                }
-                record.size = new_size;
-                record.align = new_layout.align();
-                Some(record)
-            }) {
-            Ok((record, true)) => Ok(TrackedReallocProbe::Updated { old_size, record }),
-            Ok((record, false)) => Ok(TrackedReallocProbe::NeedsMove(record)),
-            Err(RegistryError::UnknownPointer) => Ok(TrackedReallocProbe::Untracked),
-            Err(err) => Err(err),
+        let record = match self.registry.get_result(ptr) {
+            Ok(record) => record,
+            Err(RegistryError::UnknownPointer) => return Ok(TrackedReallocProbe::Untracked),
+            Err(err) => return Err(err),
+        };
+        if !self.can_reuse_allocation(record, new_layout) {
+            return Ok(TrackedReallocProbe::NeedsMove(record));
         }
+        if !try_resize_accounting(record.accounting_owner(), record.size, new_size) {
+            return Ok(TrackedReallocProbe::QuotaDenied);
+        }
+
+        let mut updated = record;
+        updated.size = new_size;
+        updated.align = new_layout.align();
+        if let Err(err) = self.registry.update_existing_result(ptr, updated) {
+            let _ = try_resize_accounting(record.accounting_owner(), new_size, record.size);
+            return Err(err);
+        }
+        Ok(TrackedReallocProbe::Updated {
+            old_size: record.size,
+            record: updated,
+        })
     }
 
     fn record_oom(&self) {
@@ -1811,7 +2038,9 @@ impl KernelMemorySubsystem {
                     _ => false,
                 };
                 if can_remove {
-                    let _ = self.registry.remove(record.ptr);
+                    if let Some(stale) = self.registry.remove(record.ptr) {
+                        release_accounting(stale.accounting_owner(), stale.size);
+                    }
                     // 重试插入
                     if self.registry.register_result(&self.boot, record).is_ok() {
                         return Ok(());
@@ -1851,6 +2080,7 @@ fn is_small_request(request: MemoryRequest) -> bool {
 fn physical_record_from_allocation(
     request: PhysicalAllocRequest,
     allocation: PhysicalAllocation,
+    accounting_owner: u64,
 ) -> AllocationRecord {
     AllocationRecord::new(
         AllocationKind::Physical,
@@ -1859,6 +2089,7 @@ fn physical_record_from_allocation(
     )
     .with_physical(allocation.paddr, allocation.order, allocation.page_size)
     .with_sizes(request.size, allocation.size, request.align)
+    .with_accounting_owner(accounting_owner)
 }
 
 fn physical_allocation_from_record(record: AllocationRecord) -> PhysicalAllocation {
@@ -2019,6 +2250,10 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             match self.probe_tracked_realloc(ptr as usize, new_layout, new_size) {
                 Ok(TrackedReallocProbe::Updated { .. }) => return ptr,
                 Ok(TrackedReallocProbe::NeedsMove(record)) => Some(record),
+                Ok(TrackedReallocProbe::QuotaDenied) => {
+                    self.record_oom();
+                    return null_mut();
+                }
                 Ok(TrackedReallocProbe::Untracked) if self.boot.contains(ptr as usize) => Some(
                     AllocationRecord::new(AllocationKind::Boot, MemoryDomain::Kernel, ptr as usize)
                         .with_sizes(layout.size(), layout.size(), layout.align()),
@@ -2054,10 +2289,20 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
             return null_mut();
         }
 
-        let new_ptr = unsafe { self.alloc(new_layout) };
-        if new_ptr.is_null() {
-            return null_mut();
-        }
+        let request = MemoryRequest::for_kernel_layout(new_layout)
+            .with_reclaim(ReclaimPolicy::TryAllocatorReclaim)
+            .with_accounting_owner(owner.accounting_owner());
+        self.total_allocs.fetch_add(1, Ordering::Relaxed);
+        self.total_bytes_allocated
+            .fetch_add(new_layout.size() as u64, Ordering::Relaxed);
+        let new_record = match self.allocate(request) {
+            Ok(record) => record,
+            Err(_) => {
+                self.record_oom();
+                return null_mut();
+            }
+        };
+        let new_ptr = new_record.ptr as *mut u8;
 
         let old_size = realloc_copy_source_size(owner, layout.size());
         let copy_len = old_size.min(new_size);

@@ -31,10 +31,12 @@
 use allocator::{PAGE_SIZE, PagePolicy, PhysicalAllocRequest};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use general::{
-    MapError, PagingArch, find_leaf, protect_range_entries, unmap_range_entries, walk_and_map,
+    MapError, PagingArch, find_leaf, replace_empty_table_with_leaf, validate_range_permissions,
+    walk_and_map,
 };
 
 use crate::riscv64::paging::Riscv64Paging;
+use crate::riscv64::paging::Riscv64Pte;
 use crate::riscv64::specific::phys_to_virt;
 
 // ── 常量与静态 ──────────────────────────────────────────────────────────────────
@@ -53,6 +55,9 @@ pub const MMIO_VIRT_BASE: usize = 0xFFFF_FF00_0000_0000;
 /// 内核 direct map 覆盖物理 RAM 的基址和大小（QEMU virt 默认从 0x80000000 开始）。
 const KERNEL_PHYS_BASE: usize = 0x8000_0000;
 const KERNEL_DIRECT_MAP_SIZE: usize = 0x4000_0000; // 1 GiB
+const PTE_VALID: usize = 1 << 0;
+const PTE_SOFTWARE_LEVEL_SHIFT: usize = 8;
+const PTE_SOFTWARE_LEVEL_MASK: usize = 0b11 << PTE_SOFTWARE_LEVEL_SHIFT;
 
 /// 内核 direct map 对应的虚拟基址（高半区，独立于 identity phys_to_virt）。
 const KERNEL_VIRT_BASE: usize = KERNEL_PHYS_BASE.wrapping_add(0xFFFF_FF80_0000_0000);
@@ -89,6 +94,12 @@ fn alloc_page_table_page() -> Result<usize, MapError> {
         .allocate_physical(request)
         .map(|alloc| alloc.paddr)
         .map_err(|_| MapError::OutOfMemory)
+}
+
+fn free_page_table_page(paddr: usize) -> bool {
+    allocator::KERNEL_ALLOCATOR
+        .try_free_physical_addr(paddr)
+        .is_ok()
 }
 
 /// 对标 LoongArch：原地修改早期页表 PUD_kernel[2] 从 1GiB leaf → table PTE
@@ -284,7 +295,7 @@ fn map_range_with_policy(
                 find_smallest_leaf_level(),
                 true,
                 true,
-                true,
+                false,
                 false,
                 true,
                 phys_to_virt,
@@ -293,19 +304,45 @@ fn map_range_with_policy(
             current_vaddr += PAGE_SIZE;
             current_paddr += PAGE_SIZE;
         } else {
-            let result = walk_and_map::<Riscv64Paging>(
+            let mut result = walk_and_map::<Riscv64Paging>(
                 root_vaddr,
                 current_vaddr,
                 current_paddr,
                 target_level,
                 true,
                 true,
-                true,
+                false,
                 false,
                 true,
                 phys_to_virt,
                 alloc_page_table_page,
             );
+            if matches!(result, Err(MapError::AlreadyMapped))
+                && !matches!(page_policy, PagePolicy::BaseOnly)
+            {
+                result = replace_empty_table_with_leaf::<Riscv64Paging>(
+                    root_vaddr,
+                    current_vaddr,
+                    current_paddr,
+                    target_level,
+                    true,
+                    true,
+                    false,
+                    false,
+                    true,
+                    phys_to_virt,
+                    free_page_table_page,
+                )
+                .map(|reclaim_failures| {
+                    if reclaim_failures != 0 {
+                        log::error!(
+                            "[arch][heap_vm] promoted empty page-table subtree with {} unreclaimed page(s): vaddr={:#x}",
+                            reclaim_failures,
+                            current_vaddr
+                        );
+                    }
+                });
+            }
             if result.is_err() {
                 if page_policy == PagePolicy::RequireLarge {
                     return result;
@@ -318,7 +355,7 @@ fn map_range_with_policy(
                     find_smallest_leaf_level(),
                     true,
                     true,
-                    true,
+                    false,
                     false,
                     true,
                     phys_to_virt,
@@ -417,7 +454,7 @@ pub fn unmap_kernel_heap_range(vaddr: usize, size: usize) -> Result<(), MapError
     }
     let root_vaddr = phys_to_virt(root_paddr);
 
-    unmap_range_entries::<Riscv64Paging>(root_vaddr, vaddr, size, true, phys_to_virt)?;
+    unmap_kernel_heap_entries(root_vaddr, vaddr, size)?;
 
     unsafe {
         Riscv64Paging::flush_tlb(None);
@@ -438,20 +475,165 @@ pub fn protect_kernel_heap_range(
     }
     let root_vaddr = phys_to_virt(root_paddr);
 
-    protect_range_entries::<Riscv64Paging>(
-        root_vaddr,
-        vaddr,
-        size,
-        read,
-        write,
-        execute,
-        false,
-        true,
-        phys_to_virt,
-    )?;
+    protect_kernel_heap_entries(root_vaddr, vaddr, size, read, write, execute)?;
 
     unsafe {
         Riscv64Paging::flush_tlb(None);
     }
     Ok(())
+}
+
+pub fn validate_kernel_heap_range(
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> Result<(), MapError> {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    if root_paddr == 0 {
+        return Err(MapError::OutOfMemory);
+    }
+    validate_range_permissions::<Riscv64Paging>(
+        phys_to_virt(root_paddr),
+        vaddr,
+        size,
+        read,
+        write,
+        execute,
+        phys_to_virt,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct KernelHeapLeaf {
+    level: usize,
+    pte_ptr: *mut usize,
+    pte: Riscv64Pte,
+}
+
+fn find_kernel_heap_leaf_or_guard(
+    root_vaddr: usize,
+    vaddr: usize,
+) -> Result<KernelHeapLeaf, MapError> {
+    let mut table_vaddr = root_vaddr;
+    for level in 0..Riscv64Paging::LEVELS {
+        let index = Riscv64Paging::level_index(vaddr, level);
+        let pte_ptr = (table_vaddr + index * core::mem::size_of::<usize>()) as *mut usize;
+        let pte = Riscv64Paging::pte_from_usize(unsafe { core::ptr::read_volatile(pte_ptr) });
+        if !Riscv64Paging::pte_is_valid(pte) {
+            if software_guard_level(pte) == Some(level) {
+                return Ok(KernelHeapLeaf {
+                    level,
+                    pte_ptr,
+                    pte,
+                });
+            }
+            return Err(MapError::NotMapped);
+        }
+        if Riscv64Paging::pte_is_leaf(pte) {
+            return Ok(KernelHeapLeaf {
+                level,
+                pte_ptr,
+                pte,
+            });
+        }
+        table_vaddr = phys_to_virt(Riscv64Paging::pte_addr(pte));
+    }
+    Err(MapError::NotMapped)
+}
+
+fn protect_kernel_heap_entries(
+    root_vaddr: usize,
+    vaddr: usize,
+    size: usize,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> Result<(), MapError> {
+    if size == 0 || vaddr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
+        return Err(MapError::Misaligned);
+    }
+    if !Riscv64Paging::is_valid_leaf_perm(read, write, execute, false, true) {
+        return Err(MapError::InvalidPermission);
+    }
+    let end = vaddr.checked_add(size).ok_or(MapError::Misaligned)?;
+    let mut current = vaddr;
+    while current < end {
+        let leaf = find_kernel_heap_leaf_or_guard(root_vaddr, current)?;
+        let page_size =
+            Riscv64Paging::leaf_page_size(leaf.level).ok_or(MapError::UnsupportedLevel)?;
+        let next = current.checked_add(page_size).ok_or(MapError::Misaligned)?;
+        if current & (page_size - 1) != 0 || next > end {
+            return Err(MapError::Misaligned);
+        }
+
+        let pte = if !read && !write && !execute {
+            software_guard_pte(leaf.level, Riscv64Paging::pte_addr(leaf.pte))?
+        } else {
+            Riscv64Paging::make_leaf_pte_for_level(
+                leaf.level,
+                Riscv64Paging::pte_addr(leaf.pte),
+                read,
+                write,
+                execute,
+                false,
+                true,
+            )
+            .ok_or(MapError::InvalidPermission)?
+        };
+        unsafe {
+            core::ptr::write_volatile(leaf.pte_ptr, Riscv64Paging::pte_to_usize(pte));
+        }
+        current = next;
+    }
+    Ok(())
+}
+
+fn unmap_kernel_heap_entries(root_vaddr: usize, vaddr: usize, size: usize) -> Result<(), MapError> {
+    if size == 0 || vaddr % PAGE_SIZE != 0 || size % PAGE_SIZE != 0 {
+        return Err(MapError::Misaligned);
+    }
+    let end = vaddr.checked_add(size).ok_or(MapError::Misaligned)?;
+    let mut current = vaddr;
+    while current < end {
+        let leaf = find_kernel_heap_leaf_or_guard(root_vaddr, current)?;
+        let page_size =
+            Riscv64Paging::leaf_page_size(leaf.level).ok_or(MapError::UnsupportedLevel)?;
+        let next = current.checked_add(page_size).ok_or(MapError::Misaligned)?;
+        if current & (page_size - 1) != 0 || next > end {
+            return Err(MapError::Misaligned);
+        }
+        unsafe {
+            core::ptr::write_volatile(
+                leaf.pte_ptr,
+                Riscv64Paging::pte_to_usize(Riscv64Paging::invalid_pte()),
+            );
+        }
+        current = next;
+    }
+    Ok(())
+}
+
+fn software_guard_pte(level: usize, paddr: usize) -> Result<Riscv64Pte, MapError> {
+    if !Riscv64Paging::supported_leaf_levels().contains(&level)
+        || level == 0
+        || level > PTE_SOFTWARE_LEVEL_MASK >> PTE_SOFTWARE_LEVEL_SHIFT
+        || paddr % PAGE_SIZE != 0
+    {
+        return Err(MapError::UnsupportedLevel);
+    }
+    Ok(Riscv64Pte(
+        ((paddr >> 12) << 10) | (level << PTE_SOFTWARE_LEVEL_SHIFT),
+    ))
+}
+
+fn software_guard_level(pte: Riscv64Pte) -> Option<usize> {
+    if pte.bits() & PTE_VALID != 0 {
+        return None;
+    }
+    let level = (pte.bits() & PTE_SOFTWARE_LEVEL_MASK) >> PTE_SOFTWARE_LEVEL_SHIFT;
+    Riscv64Paging::supported_leaf_levels()
+        .contains(&level)
+        .then_some(level)
 }

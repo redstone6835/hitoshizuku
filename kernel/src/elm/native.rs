@@ -2,10 +2,9 @@
 //!
 //! 本模块只处理 EKI 产出的 EBI 原生镜像：复制段、应用 EKI 原生重定位、切换 W^X
 //! 权限并调用生命周期钩子。imports 的地址解析由 Core 提供，本模块只消费已解析地址；
-//! 原生 provider handler 和 snapshot 通过显式 symbol 暴露；热替换迁移仍由上层保留为
-//! `TODO(elm)` 边界。
+//! 原生 provider handler、snapshot 与热替换迁移钩子都通过显式 symbol 暴露。
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use allocator::{KERNEL_ALLOCATOR, MemoryDomain, MemoryRequest, PAGE_SIZE, PagePolicy, Zeroing};
@@ -13,28 +12,203 @@ use elm_model::{
     ELM_CALL_STATUS_PROVIDER_FAULT, ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE,
     ELM_EBI_HOOK_ON_MIGRATE_ABORT, ELM_EBI_HOOK_ON_MIGRATE_EXPORT, ELM_EBI_HOOK_ON_MIGRATE_IMPORT,
     ELM_EBI_HOOK_ON_PAUSE, ELM_EBI_HOOK_ON_QUIESCE, ELM_EBI_HOOK_ON_RESUME, ELM_MGR_STATUS_INVALID,
-    ELM_MGR_STATUS_OK, ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED,
-    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ElmCallFrame, ElmContext, ElmEbiImage,
-    ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiSegmentKind,
-    ElmEbiSegmentPayload, ElmError, ElmId, ElmNativeEntryFrameV1, ElmNativeHookContextV1,
+    ELM_MGR_STATUS_OK, ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_MANAGED_CALL_ABI_VERSION,
+    ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION, ELM_NATIVE_PROVIDER_CALL_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK,
+    ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
+    ElmCallFrame, ElmContext, ElmEbiImage, ElmEbiLoadStatus, ElmEbiProviderPortDecl,
+    ElmEbiRelocationKind, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmError, ElmId,
+    ElmLifecyclePhase, ElmNativeEntryFrameV1, ElmNativeHookContextV1, ElmNativeManagedCallV1,
     ElmNativeMigrationContextV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
-    ElmReplyFrame, ElmResult, Generation, LeaseId, PortId, relocation_width, state_code,
+    ElmReplyFrame, ElmResult, ElmState, Generation, LeaseId, PortId, relocation_width, state_code,
+    try_enter_current_context,
 };
 use general::elm_guard::{
-    ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_MIGRATION,
-    ELM_GUARD_PHASE_PROVIDER_CALL, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT, ElmGuard,
+    ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_MANAGED_CALL,
+    ELM_GUARD_PHASE_MIGRATION, ELM_GUARD_PHASE_PROVIDER_CALL, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT,
+    ElmExecutionDomain, ElmGuard,
 };
 
 use super::core::ElmLifecycleExecutor;
 
-type NativeHook = unsafe extern "C" fn(*mut ElmNativeHookContextV1) -> i32;
-type NativeEntry = unsafe extern "C" fn(*mut ElmNativeEntryFrameV1) -> i32;
-type NativeMigrationHook = unsafe extern "C" fn(*mut ElmNativeMigrationContextV1) -> i32;
-type NativeProviderHandler = unsafe extern "C" fn(*mut ElmNativeProviderCallV1) -> i32;
-type NativeProviderSnapshot = unsafe extern "C" fn(*mut ElmNativeProviderSnapshotV1) -> i32;
+const ELM_NATIVE_STACK_SIZE: usize = 64 * 1024;
+const ELM_NATIVE_STACK_GUARD_SIZE: usize = PAGE_SIZE;
+const ELM_NATIVE_STACK_TOTAL_SIZE: usize = ELM_NATIVE_STACK_SIZE + ELM_NATIVE_STACK_GUARD_SIZE * 2;
+
+struct NativeCallStack {
+    base: usize,
+}
+
+impl NativeCallStack {
+    fn allocate() -> ElmResult<Self> {
+        let request =
+            MemoryRequest::new(MemoryDomain::Kernel, ELM_NATIVE_STACK_TOTAL_SIZE, PAGE_SIZE)
+                .with_page_policy(PagePolicy::BaseOnly)
+                .with_zeroing(Zeroing::Zeroed)
+                .without_external_accounting();
+        let record = KERNEL_ALLOCATOR
+            .allocate(request)
+            .map_err(|_| ElmError::LeaseBusy)?;
+        let stack = Self { base: record.ptr };
+        let lower_guard = general::elm_image::protect_elm_image_range(
+            stack.base,
+            ELM_NATIVE_STACK_GUARD_SIZE,
+            false,
+            false,
+            false,
+        );
+        let upper_guard = general::elm_image::protect_elm_image_range(
+            stack.base + ELM_NATIVE_STACK_GUARD_SIZE + ELM_NATIVE_STACK_SIZE,
+            ELM_NATIVE_STACK_GUARD_SIZE,
+            false,
+            false,
+            false,
+        );
+        let body = general::elm_image::protect_elm_image_range(
+            stack.base + ELM_NATIVE_STACK_GUARD_SIZE,
+            ELM_NATIVE_STACK_SIZE,
+            true,
+            true,
+            false,
+        );
+        if lower_guard && upper_guard && body {
+            Ok(stack)
+        } else {
+            drop(stack);
+            Err(ElmError::InvalidTransition)
+        }
+    }
+
+    fn top(&self) -> usize {
+        self.base + ELM_NATIVE_STACK_GUARD_SIZE + ELM_NATIVE_STACK_SIZE
+    }
+
+    fn start(&self) -> usize {
+        self.base + ELM_NATIVE_STACK_GUARD_SIZE
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeExecutionBounds {
+    pub code_start: usize,
+    pub code_end: usize,
+    pub image_start: usize,
+    pub image_end: usize,
+}
+
+struct NativeInvocation {
+    guard: ElmGuard,
+    accounting: super::resource_accounting::NativeCallPermit,
+    stack: NativeCallStack,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeInvocationResult {
+    aborted: bool,
+    budget_exceeded: bool,
+}
+
+impl NativeInvocation {
+    fn enter(cell: ElmId, phase: u32, requested_deadline_ns: u64) -> ElmResult<Self> {
+        let now_ns = sched::now_ns_public();
+        let accounting = super::resource_accounting::begin_native_call(
+            cell,
+            ELM_NATIVE_STACK_TOTAL_SIZE as u64,
+            requested_deadline_ns,
+            now_ns,
+        )
+        .map_err(|_| ElmError::LeaseBusy)?;
+        let stack = NativeCallStack::allocate()?;
+        let guard = ElmGuard::enter(cell.0, phase, accounting.effective_deadline_ns())
+            .ok_or(ElmError::InvalidTransition)?;
+        Ok(Self {
+            guard,
+            accounting,
+            stack,
+        })
+    }
+
+    unsafe fn invoke<T>(
+        &self,
+        address: usize,
+        context: *mut T,
+        bounds: NativeExecutionBounds,
+        extra_host_ranges: &[(usize, usize)],
+    ) -> i32 {
+        let context_start = context as usize;
+        let Some(context_end) = context_start.checked_add(core::mem::size_of::<T>()) else {
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        };
+        let mut host_ranges = [(0usize, 0usize); general::elm_guard::ELM_GUARD_MAX_HOST_RANGES];
+        let required_ranges = 1usize.saturating_add(extra_host_ranges.len());
+        if required_ranges > host_ranges.len()
+            || context_start == 0
+            || context_start >= context_end
+            || address < bounds.code_start
+            || address >= bounds.code_end
+        {
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        }
+        host_ranges[0] = (context_start, context_end);
+        for (index, range) in extra_host_ranges.iter().copied().enumerate() {
+            host_ranges[index + 1] = range;
+        }
+        if !self.guard.configure_native_bounds(
+            bounds.code_start,
+            bounds.code_end,
+            bounds.image_start,
+            bounds.image_end,
+            self.stack.start(),
+            self.stack.top(),
+            &host_ranges[..required_ranges],
+        ) {
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        }
+        let Some(_domain) = self.guard.enter_domain(ElmExecutionDomain::ElmCode) else {
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        };
+        // 安全性：调用方保证入口地址与上下文 ABI；架构调用门只使用本对象持有的隔离栈。
+        unsafe { arch::call_elm_native(address, context.cast::<u8>(), self.stack.top()) }
+    }
+
+    fn finish(self) -> NativeInvocationResult {
+        let aborted = self.guard.aborted();
+        let accounting = self.accounting.finish(sched::now_ns_public());
+        NativeInvocationResult {
+            aborted,
+            budget_exceeded: accounting.call_budget_exceeded || accounting.period_budget_exceeded,
+        }
+    }
+}
+
+impl Drop for NativeCallStack {
+    fn drop(&mut self) {
+        if !general::elm_image::protect_elm_image_range(
+            self.base,
+            ELM_NATIVE_STACK_TOTAL_SIZE,
+            true,
+            true,
+            false,
+        ) {
+            // 权限无法恢复时必须保留映射，避免 allocator 把仍带 guard/RX 属性的区间复用。
+            log::error!(
+                "[elm] 无法恢复原生调用栈权限，保留映射 base=0x{:x} size={}",
+                self.base,
+                ELM_NATIVE_STACK_TOTAL_SIZE
+            );
+            return;
+        }
+        if let Err(err) = KERNEL_ALLOCATOR.deallocate(self.base) {
+            log::error!(
+                "[elm] 无法释放原生调用栈 base=0x{:x} size={}: {:?}",
+                self.base,
+                ELM_NATIVE_STACK_TOTAL_SIZE,
+                err
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct NativeSegment {
@@ -50,22 +224,12 @@ struct NativeSymbol {
     address: usize,
 }
 
-#[derive(Debug, Clone)]
-struct NativeImportRelocation {
-    import_index: u32,
-    kind: ElmEbiRelocationKind,
-    target_addr: usize,
-    addend: i64,
-    rebindable: bool,
-}
-
 pub(crate) struct LoadedElmImage {
     cell: ElmId,
     base: usize,
     size: usize,
     segments: Vec<NativeSegment>,
     symbols: Vec<NativeSymbol>,
-    import_relocations: Vec<NativeImportRelocation>,
     initialize: usize,
     finalize: usize,
     quiesce: Option<usize>,
@@ -97,29 +261,33 @@ impl LoadedElmImage {
             .and_then(|segment| segment.vaddr.checked_add(segment.size))
             .ok_or(ElmEbiLoadStatus::InvalidSegment)?;
         let total_size = align_up(total_size, PAGE_SIZE).ok_or(ElmEbiLoadStatus::InvalidSegment)?;
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(layouts.len())
+            .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
         let request = MemoryRequest::new(MemoryDomain::Kernel, total_size, PAGE_SIZE)
             .with_page_policy(PagePolicy::BaseOnly)
-            .with_zeroing(Zeroing::Zeroed);
+            .with_zeroing(Zeroing::Zeroed)
+            .without_external_accounting();
         let record = KERNEL_ALLOCATOR
             .allocate(request)
             .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
         let base = record.ptr;
+        for segment in layouts {
+            segments.push(NativeSegment {
+                unit_segment_index: segment.unit_segment_index,
+                kind: segment.kind,
+                vaddr: base + segment.vaddr,
+                size: segment.size,
+            });
+        }
 
         let mut loaded = Self {
             cell,
             base,
             size: total_size,
-            segments: layouts
-                .into_iter()
-                .map(|segment| NativeSegment {
-                    unit_segment_index: segment.unit_segment_index,
-                    kind: segment.kind,
-                    vaddr: base + segment.vaddr,
-                    size: segment.size,
-                })
-                .collect(),
+            segments,
             symbols: Vec::new(),
-            import_relocations: Vec::new(),
             initialize: 0,
             finalize: 0,
             quiesce: None,
@@ -135,13 +303,10 @@ impl LoadedElmImage {
             drop(loaded);
             return Err(status);
         }
-        loaded.import_relocations = match loaded.apply_relocations(image, imports) {
-            Ok(import_relocations) => import_relocations,
-            Err(status) => {
-                drop(loaded);
-                return Err(status);
-            }
-        };
+        if let Err(status) = loaded.apply_relocations(image, imports) {
+            drop(loaded);
+            return Err(status);
+        }
         loaded.symbols = loaded.collect_symbols(image)?;
         loaded.initialize = loaded
             .symbol_address(ELM_EBI_HOOK_ON_INITIALIZE)
@@ -178,6 +343,10 @@ impl LoadedElmImage {
         self.cell
     }
 
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
     pub(crate) fn on_initialize(&self, context: &ElmContext) -> ElmResult<()> {
         self.call_hook(self.initialize, context)
     }
@@ -188,7 +357,14 @@ impl LoadedElmImage {
         generation: Generation,
         state: elm_model::ElmState,
     ) -> ElmResult<()> {
-        call_optional_native_entry(self.entry, self.cell, parent, generation, state)
+        call_optional_native_entry(
+            self.entry,
+            self.cell,
+            parent,
+            generation,
+            state,
+            self.execution_bounds()?,
+        )
     }
 
     pub(crate) fn lifecycle_executor(&self) -> NativeHookExecutor {
@@ -201,51 +377,49 @@ impl LoadedElmImage {
             migrate_export: self.migrate_export,
             migrate_import: self.migrate_import,
             migrate_abort: self.migrate_abort,
+            bounds: self.execution_bounds().unwrap_or(NativeExecutionBounds {
+                code_start: 0,
+                code_end: 0,
+                image_start: 0,
+                image_end: 0,
+            }),
         }
+    }
+
+    pub(crate) fn execution_bounds(&self) -> Result<NativeExecutionBounds, ElmError> {
+        let mut code_start = usize::MAX;
+        let mut code_end = 0usize;
+        for segment in self
+            .segments
+            .iter()
+            .filter(|segment| segment.kind == ElmEbiSegmentKind::Code)
+        {
+            code_start = code_start.min(segment.vaddr);
+            code_end = code_end.max(
+                segment
+                    .vaddr
+                    .checked_add(segment.size)
+                    .ok_or(ElmError::InvalidTransition)?,
+            );
+        }
+        let image_end = self
+            .base
+            .checked_add(self.size)
+            .ok_or(ElmError::InvalidTransition)?;
+        if code_start == usize::MAX || code_start >= code_end || image_end <= self.base {
+            return Err(ElmError::InvalidTransition);
+        }
+        Ok(NativeExecutionBounds {
+            code_start,
+            code_end,
+            image_start: self.base,
+            image_end,
+        })
     }
 
     pub(crate) fn export_address(&self, name: &str) -> Result<usize, ElmEbiLoadStatus> {
         self.symbol_address(name)
             .ok_or(ElmEbiLoadStatus::InvalidManifest)
-    }
-
-    pub(crate) fn can_rebind_import_to(&self, import_index: u32, new_address: usize) -> bool {
-        let mut found = false;
-        for relocation in self
-            .import_relocations
-            .iter()
-            .filter(|relocation| relocation.import_index == import_index)
-        {
-            found = true;
-            if !relocation.rebindable || !import_relocation_value_fits(relocation, new_address) {
-                return false;
-            }
-        }
-        found
-    }
-
-    pub(crate) fn rebind_import(
-        &self,
-        import_index: u32,
-        new_address: usize,
-    ) -> Result<(), ElmEbiLoadStatus> {
-        if !self.can_rebind_import_to(import_index, new_address) {
-            return Err(ElmEbiLoadStatus::RuntimeRejected);
-        }
-        let mut patched = 0usize;
-        for relocation in self
-            .import_relocations
-            .iter()
-            .filter(|relocation| relocation.import_index == import_index)
-        {
-            write_import_relocation(relocation, new_address)?;
-            patched += 1;
-        }
-        if patched == 0 {
-            Err(ElmEbiLoadStatus::RuntimeRejected)
-        } else {
-            Ok(())
-        }
     }
 
     pub(crate) fn provider_handler_for_decl(
@@ -295,8 +469,7 @@ impl LoadedElmImage {
         &self,
         image: &ElmEbiImage,
         imports: &[usize],
-    ) -> Result<Vec<NativeImportRelocation>, ElmEbiLoadStatus> {
-        let mut import_relocations = Vec::new();
+    ) -> Result<(), ElmEbiLoadStatus> {
         for relocation in &image.relocations {
             let Some(target) = self.segment_by_unit_index(relocation.target_segment_index) else {
                 return Err(ElmEbiLoadStatus::InvalidSegment);
@@ -329,25 +502,8 @@ impl LoadedElmImage {
                     write_unsigned_relocation(target_addr, absolute, width)?;
                 }
             }
-            if matches!(
-                relocation.kind,
-                ElmEbiRelocationKind::ImportAbs64
-                    | ElmEbiRelocationKind::ImportRel32
-                    | ElmEbiRelocationKind::ImportRel64
-            ) {
-                import_relocations.push(NativeImportRelocation {
-                    import_index: relocation.value_index,
-                    kind: relocation.kind,
-                    target_addr,
-                    addend: relocation.addend,
-                    rebindable: matches!(
-                        target.kind,
-                        ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
-                    ),
-                });
-            }
         }
-        Ok(import_relocations)
+        Ok(())
     }
 
     fn relocation_value(
@@ -384,6 +540,9 @@ impl LoadedElmImage {
 
     fn collect_symbols(&self, image: &ElmEbiImage) -> Result<Vec<NativeSymbol>, ElmEbiLoadStatus> {
         let mut symbols = Vec::new();
+        symbols
+            .try_reserve_exact(image.symbol_locations.len())
+            .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
         for symbol in &image.symbol_locations {
             let segment = self
                 .segment_by_unit_index(symbol.segment_index)
@@ -396,8 +555,12 @@ impl LoadedElmImage {
                 .checked_add(size)
                 .filter(|end| *end <= segment.size)
                 .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
+            let mut name = String::new();
+            name.try_reserve_exact(symbol.name.len())
+                .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
+            name.push_str(&symbol.name);
             symbols.push(NativeSymbol {
-                name: symbol.name.to_string(),
+                name,
                 address: segment
                     .vaddr
                     .checked_add(offset)
@@ -447,7 +610,7 @@ impl LoadedElmImage {
     }
 
     fn call_hook(&self, address: usize, context: &ElmContext) -> ElmResult<()> {
-        call_native_hook(address, context)
+        call_native_hook(address, context, self.execution_bounds()?)
     }
 
     fn segment_by_unit_index(&self, unit_segment_index: u32) -> Option<&NativeSegment> {
@@ -457,6 +620,7 @@ impl LoadedElmImage {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct NativeHookExecutor {
     initialize: usize,
     finalize: usize,
@@ -466,27 +630,28 @@ pub(crate) struct NativeHookExecutor {
     migrate_export: Option<usize>,
     migrate_import: Option<usize>,
     migrate_abort: Option<usize>,
+    bounds: NativeExecutionBounds,
 }
 
 impl ElmLifecycleExecutor for NativeHookExecutor {
     fn on_initialize(&mut self, context: &mut ElmContext) -> ElmResult<()> {
-        call_native_hook(self.initialize, context)
+        call_native_hook(self.initialize, context, self.bounds)
     }
 
     fn on_finalize(&mut self, context: &mut ElmContext) -> ElmResult<()> {
-        call_native_hook(self.finalize, context)
+        call_native_hook(self.finalize, context, self.bounds)
     }
 
     fn on_quiesce(&mut self, context: &mut ElmContext) -> ElmResult<()> {
-        call_optional_native_hook(self.quiesce, context)
+        call_optional_native_hook(self.quiesce, context, self.bounds)
     }
 
     fn on_pause(&mut self, context: &mut ElmContext) -> ElmResult<()> {
-        call_optional_native_hook(self.pause, context)
+        call_optional_native_hook(self.pause, context, self.bounds)
     }
 
     fn on_resume(&mut self, context: &mut ElmContext) -> ElmResult<()> {
-        call_optional_native_hook(self.resume, context)
+        call_optional_native_hook(self.resume, context, self.bounds)
     }
 
     fn on_migrate_export(
@@ -502,6 +667,7 @@ impl ElmLifecycleExecutor for NativeHookExecutor {
             old_generation,
             new_generation,
             buffer,
+            self.bounds,
         )
     }
 
@@ -520,6 +686,7 @@ impl ElmLifecycleExecutor for NativeHookExecutor {
             new_generation,
             buffer,
             len,
+            self.bounds,
         )
     }
 
@@ -538,6 +705,7 @@ impl ElmLifecycleExecutor for NativeHookExecutor {
             new_generation,
             buffer,
             len,
+            self.bounds,
         )
     }
 }
@@ -545,9 +713,24 @@ impl ElmLifecycleExecutor for NativeHookExecutor {
 impl Drop for LoadedElmImage {
     fn drop(&mut self) {
         // 释放前恢复普通内核堆权限，避免 allocator 后续复用同一虚拟区间时继承 RX/RO。
-        let _ =
-            general::elm_image::protect_elm_image_range(self.base, self.size, true, true, false);
-        let _ = KERNEL_ALLOCATOR.deallocate(self.base);
+        if !general::elm_image::protect_elm_image_range(self.base, self.size, true, true, false) {
+            log::error!(
+                "[elm] 无法恢复原生镜像权限，保留映射 cell={} base=0x{:x} size={}",
+                self.cell.0,
+                self.base,
+                self.size
+            );
+            return;
+        }
+        if let Err(err) = KERNEL_ALLOCATOR.deallocate(self.base) {
+            log::error!(
+                "[elm] 无法释放原生镜像 cell={} base=0x{:x} size={}: {:?}",
+                self.cell.0,
+                self.base,
+                self.size,
+                err
+            );
+        }
     }
 }
 
@@ -562,6 +745,9 @@ struct SegmentLayout {
 fn layout_runtime_segments(image: &ElmEbiImage) -> Result<Vec<SegmentLayout>, ElmEbiLoadStatus> {
     let mut offset = 0usize;
     let mut layouts = Vec::new();
+    layouts
+        .try_reserve_exact(image.unit.segments.len())
+        .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
     for (segment_index, segment) in image.unit.segments.iter().enumerate() {
         if !matches!(
             segment.kind,
@@ -676,60 +862,31 @@ fn write_signed_relocation(
     }
 }
 
-fn write_import_relocation(
-    relocation: &NativeImportRelocation,
-    new_address: usize,
-) -> Result<(), ElmEbiLoadStatus> {
-    if !relocation.rebindable {
-        return Err(ElmEbiLoadStatus::RuntimeRejected);
-    }
-    match relocation.kind {
-        ElmEbiRelocationKind::ImportAbs64 => {
-            let absolute = add_signed(new_address, relocation.addend)?;
-            write_unsigned_relocation(relocation.target_addr, absolute, 8)
-        }
-        ElmEbiRelocationKind::ImportRel32 => {
-            let signed = signed_delta(new_address, relocation.addend, relocation.target_addr)?;
-            write_signed_relocation(relocation.target_addr, signed, 4)
-        }
-        ElmEbiRelocationKind::ImportRel64 => {
-            let signed = signed_delta(new_address, relocation.addend, relocation.target_addr)?;
-            write_signed_relocation(relocation.target_addr, signed, 8)
-        }
-        _ => Err(ElmEbiLoadStatus::InvalidSegment),
-    }
-}
-
-fn import_relocation_value_fits(relocation: &NativeImportRelocation, new_address: usize) -> bool {
-    match relocation.kind {
-        ElmEbiRelocationKind::ImportAbs64 => add_signed(new_address, relocation.addend).is_ok(),
-        ElmEbiRelocationKind::ImportRel32 => {
-            let Ok(value) = signed_delta(new_address, relocation.addend, relocation.target_addr)
-            else {
-                return false;
-            };
-            i32::try_from(value).is_ok()
-        }
-        ElmEbiRelocationKind::ImportRel64 => {
-            signed_delta(new_address, relocation.addend, relocation.target_addr).is_ok()
-        }
-        _ => false,
-    }
-}
-
-fn call_native_hook(address: usize, context: &ElmContext) -> ElmResult<()> {
+fn call_native_hook(
+    address: usize,
+    context: &ElmContext,
+    bounds: NativeExecutionBounds,
+) -> ElmResult<()> {
     if address == 0 {
         return Err(ElmError::InvalidTransition);
     }
-    let Some(guard) = ElmGuard::enter(context.cell_id().0, ELM_GUARD_PHASE_HOOK, 0) else {
+    let invocation = NativeInvocation::enter(context.cell_id(), ELM_GUARD_PHASE_HOOK, 0)?;
+    let Some(_current) = try_enter_current_context(context) else {
         return Err(ElmError::InvalidTransition);
     };
     let mut native_context = ElmNativeHookContextV1::from_context(context);
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内。
     // 调用约定固定为 ELM native hook v1：`fn(*mut ElmNativeHookContextV1) -> i32`。
-    let hook: NativeHook = unsafe { core::mem::transmute(address) };
-    let status = unsafe { hook(&mut native_context as *mut ElmNativeHookContextV1) };
-    if guard.aborted() {
+    let status = unsafe {
+        invocation.invoke(
+            address,
+            &mut native_context as *mut ElmNativeHookContextV1,
+            bounds,
+            &[],
+        )
+    };
+    let outcome = invocation.finish();
+    if outcome.aborted || outcome.budget_exceeded {
         return Err(ElmError::InvalidTransition);
     }
     if status == 0 {
@@ -739,9 +896,13 @@ fn call_native_hook(address: usize, context: &ElmContext) -> ElmResult<()> {
     }
 }
 
-fn call_optional_native_hook(address: Option<usize>, context: &ElmContext) -> ElmResult<()> {
+fn call_optional_native_hook(
+    address: Option<usize>,
+    context: &ElmContext,
+    bounds: NativeExecutionBounds,
+) -> ElmResult<()> {
     match address {
-        Some(address) => call_native_hook(address, context),
+        Some(address) => call_native_hook(address, context, bounds),
         None => Ok(()),
     }
 }
@@ -752,18 +913,20 @@ fn call_native_migration_export(
     old_generation: Generation,
     new_generation: Generation,
     buffer: &mut [u8],
+    bounds: NativeExecutionBounds,
 ) -> ElmResult<usize> {
     let Some(address) = address else {
         return Err(ElmError::InvalidTransition);
     };
     call_native_migration_hook(
         address,
-        elm_model::ElmLifecyclePhase::MigrateExport,
+        ElmLifecyclePhase::MigrateExport,
         cell,
         old_generation,
         new_generation,
         buffer,
         0,
+        bounds,
     )
 }
 
@@ -774,18 +937,20 @@ fn call_native_migration_import(
     new_generation: Generation,
     buffer: &mut [u8],
     len: usize,
+    bounds: NativeExecutionBounds,
 ) -> ElmResult<()> {
     let Some(address) = address else {
         return Err(ElmError::InvalidTransition);
     };
     let out_len = call_native_migration_hook(
         address,
-        elm_model::ElmLifecyclePhase::MigrateImport,
+        ElmLifecyclePhase::MigrateImport,
         cell,
         old_generation,
         new_generation,
         buffer,
         len,
+        bounds,
     )?;
     if out_len == len {
         Ok(())
@@ -801,35 +966,40 @@ fn call_optional_native_migration_abort(
     new_generation: Generation,
     buffer: &mut [u8],
     len: usize,
+    bounds: NativeExecutionBounds,
 ) -> ElmResult<()> {
     let Some(address) = address else {
         return Ok(());
     };
     let _ = call_native_migration_hook(
         address,
-        elm_model::ElmLifecyclePhase::MigrateAbort,
+        ElmLifecyclePhase::MigrateAbort,
         cell,
         old_generation,
         new_generation,
         buffer,
         len,
+        bounds,
     )?;
     Ok(())
 }
 
 fn call_native_migration_hook(
     address: usize,
-    phase: elm_model::ElmLifecyclePhase,
+    phase: ElmLifecyclePhase,
     cell: ElmId,
     old_generation: Generation,
     new_generation: Generation,
     buffer: &mut [u8],
     len: usize,
+    bounds: NativeExecutionBounds,
 ) -> ElmResult<usize> {
     if address == 0 || len > buffer.len() {
         return Err(ElmError::InvalidTransition);
     }
-    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_MIGRATION, 0) else {
+    let invocation = NativeInvocation::enter(cell, ELM_GUARD_PHASE_MIGRATION, 0)?;
+    let elm_context = ElmContext::new(cell, None, new_generation, ElmState::Active, phase, 0);
+    let Some(_current) = try_enter_current_context(&elm_context) else {
         return Err(ElmError::InvalidTransition);
     };
     let mut context = ElmNativeMigrationContextV1::new(
@@ -844,9 +1014,20 @@ fn call_native_migration_hook(
     let expected_phase = context.phase;
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内；
     // 迁移缓冲区由内核托管，容量和初始长度已在调用前完成边界检查。
-    let hook: NativeMigrationHook = unsafe { core::mem::transmute(address) };
-    let status = unsafe { hook(&mut context as *mut ElmNativeMigrationContextV1) };
-    if guard.aborted() {
+    let buffer_start = buffer.as_mut_ptr() as usize;
+    let buffer_end = buffer_start
+        .checked_add(buffer.len())
+        .ok_or(ElmError::InvalidTransition)?;
+    let status = unsafe {
+        invocation.invoke(
+            address,
+            &mut context as *mut ElmNativeMigrationContextV1,
+            bounds,
+            &[(buffer_start, buffer_end)],
+        )
+    };
+    let outcome = invocation.finish();
+    if outcome.aborted || outcome.budget_exceeded {
         return Err(ElmError::InvalidTransition);
     }
     if status == 0
@@ -874,6 +1055,7 @@ fn call_optional_native_entry(
     parent: Option<ElmId>,
     generation: Generation,
     state: elm_model::ElmState,
+    bounds: NativeExecutionBounds,
 ) -> ElmResult<()> {
     let Some(address) = address else {
         return Ok(());
@@ -881,7 +1063,16 @@ fn call_optional_native_entry(
     if address == 0 {
         return Err(ElmError::InvalidTransition);
     }
-    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_ENTRY, 0) else {
+    let invocation = NativeInvocation::enter(cell, ELM_GUARD_PHASE_ENTRY, 0)?;
+    let elm_context = ElmContext::new(
+        cell,
+        parent,
+        generation,
+        state,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let Some(_current) = try_enter_current_context(&elm_context) else {
         return Err(ElmError::InvalidTransition);
     };
     let mut frame = ElmNativeEntryFrameV1::new(
@@ -892,9 +1083,16 @@ fn call_optional_native_entry(
     );
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内。
     // 调用约定固定为 ELM native entry v1。
-    let entry: NativeEntry = unsafe { core::mem::transmute(address) };
-    let status = unsafe { entry(&mut frame as *mut ElmNativeEntryFrameV1) };
-    if guard.aborted() {
+    let status = unsafe {
+        invocation.invoke(
+            address,
+            &mut frame as *mut ElmNativeEntryFrameV1,
+            bounds,
+            &[],
+        )
+    };
+    let outcome = invocation.finish();
+    if outcome.aborted || outcome.budget_exceeded {
         return Err(ElmError::InvalidTransition);
     }
     if status == 0
@@ -922,16 +1120,121 @@ pub(crate) fn test_call_native_entry(
     generation: Generation,
     state: elm_model::ElmState,
 ) -> ElmResult<()> {
-    call_optional_native_entry(Some(address), cell, parent, generation, state)
+    let _ = super::resource_accounting::register_cell(cell, elm_model::ElmResourceBudget::DEFAULT);
+    let page_start = address & !(PAGE_SIZE - 1);
+    let page_end = page_start
+        .checked_add(PAGE_SIZE)
+        .ok_or(ElmError::InvalidTransition)?;
+    call_optional_native_entry(
+        Some(address),
+        cell,
+        parent,
+        generation,
+        state,
+        NativeExecutionBounds {
+            code_start: page_start,
+            code_end: page_end,
+            image_start: page_start,
+            image_end: page_end,
+        },
+    )
+}
+
+pub(crate) fn invoke_managed_export(
+    address: usize,
+    bounds: NativeExecutionBounds,
+    import_handle: u64,
+    caller: ElmId,
+    caller_generation: Generation,
+    callee: ElmId,
+    callee_generation: Generation,
+    request: ElmCallFrame,
+    allowed_actions: u32,
+) -> ElmReplyFrame {
+    if address == 0 {
+        return ElmReplyFrame::empty(
+            request.binding_id,
+            request.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    }
+    let Ok(invocation) = NativeInvocation::enter(callee, ELM_GUARD_PHASE_MANAGED_CALL, 0) else {
+        return ElmReplyFrame::empty(
+            request.binding_id,
+            request.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    };
+    let elm_context = ElmContext::new(
+        callee,
+        None,
+        callee_generation,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_allowed_actions(allowed_actions);
+    let Some(_current) = try_enter_current_context(&elm_context) else {
+        return ElmReplyFrame::empty(
+            request.binding_id,
+            request.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    };
+    let mut call = ElmNativeManagedCallV1::new(
+        import_handle,
+        caller.0,
+        caller_generation.0,
+        callee.0,
+        callee_generation.0,
+        request,
+    );
+    let status = unsafe {
+        invocation.invoke(
+            address,
+            &mut call as *mut ElmNativeManagedCallV1,
+            bounds,
+            &[],
+        )
+    };
+    let outcome = invocation.finish();
+    if outcome.aborted
+        || outcome.budget_exceeded
+        || status != 0
+        || call.abi_version != ELM_NATIVE_MANAGED_CALL_ABI_VERSION
+        || call.flags != 0
+        || call.reserved0 != 0
+        || call.import_handle != import_handle
+        || call.caller_cell_id != caller.0
+        || call.caller_generation != caller_generation.0
+        || call.callee_cell_id != callee.0
+        || call.callee_generation != callee_generation.0
+        || call.reply.binding_id != request.binding_id
+        || call.reply.call_id != request.call_id
+        || call.reply.flags != 0
+        || call.reply.reserved0 != 0
+        || call.reply.reserved1 != 0
+        || usize::from(call.reply.payload_len) > call.reply.payload.len()
+    {
+        return ElmReplyFrame::empty(
+            request.binding_id,
+            request.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    }
+    call.reply
 }
 
 pub(crate) fn invoke_provider_handler(
     address: usize,
+    bounds: NativeExecutionBounds,
     cell: ElmId,
+    generation: Generation,
     port: PortId,
     lease: LeaseId,
     frame: ElmCallFrame,
     deadline_ns: u64,
+    allowed_actions: u32,
 ) -> ElmReplyFrame {
     if address == 0 {
         return ElmReplyFrame::empty(
@@ -940,7 +1243,24 @@ pub(crate) fn invoke_provider_handler(
             ELM_CALL_STATUS_PROVIDER_FAULT,
         );
     }
-    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_PROVIDER_CALL, deadline_ns) else {
+    let Ok(invocation) = NativeInvocation::enter(cell, ELM_GUARD_PHASE_PROVIDER_CALL, deadline_ns)
+    else {
+        return ElmReplyFrame::empty(
+            frame.binding_id,
+            frame.call_id,
+            ELM_CALL_STATUS_PROVIDER_FAULT,
+        );
+    };
+    let elm_context = ElmContext::new(
+        cell,
+        None,
+        generation,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_allowed_actions(allowed_actions);
+    let Some(_current) = try_enter_current_context(&elm_context) else {
         return ElmReplyFrame::empty(
             frame.binding_id,
             frame.call_id,
@@ -950,9 +1270,17 @@ pub(crate) fn invoke_provider_handler(
     let mut call = ElmNativeProviderCallV1::new(cell.0, port.0, lease.0, frame);
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内。
     // 调用约定固定为 ELM native provider call v1。
-    let handler: NativeProviderHandler = unsafe { core::mem::transmute(address) };
-    let status = unsafe { handler(&mut call as *mut ElmNativeProviderCallV1) };
-    if guard.aborted()
+    let status = unsafe {
+        invocation.invoke(
+            address,
+            &mut call as *mut ElmNativeProviderCallV1,
+            bounds,
+            &[],
+        )
+    };
+    let outcome = invocation.finish();
+    if outcome.aborted
+        || outcome.budget_exceeded
         || status != 0
         || call.abi_version != ELM_NATIVE_PROVIDER_CALL_ABI_VERSION
         || call.flags != 0
@@ -975,18 +1303,33 @@ pub(crate) fn invoke_provider_handler(
 
 pub(crate) fn invoke_provider_snapshot(
     address: usize,
+    bounds: NativeExecutionBounds,
     cell: ElmId,
+    generation: Generation,
     port: PortId,
     binding_id: u64,
     lease: LeaseId,
     request_flags: u32,
     cursor: u32,
     payload: &mut [u8],
+    allowed_actions: u32,
 ) -> (i32, usize, u32, u32, u32) {
     if address == 0 {
         return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
     }
-    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT, 0) else {
+    let Ok(invocation) = NativeInvocation::enter(cell, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT, 0) else {
+        return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
+    };
+    let elm_context = ElmContext::new(
+        cell,
+        None,
+        generation,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_allowed_actions(allowed_actions);
+    let Some(_current) = try_enter_current_context(&elm_context) else {
         return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0);
     };
     let capacity = payload.len().min(u32::MAX as usize) as u32;
@@ -1006,15 +1349,28 @@ pub(crate) fn invoke_provider_snapshot(
     }
     // 安全性：地址来自已验证的 EKI 符号位置表，落在已 seal 为 RX 的 Code 段内；
     // payload 指向 Core 准备的临时内核缓冲区，长度由 capacity 固定约束。
-    let snapshot: NativeProviderSnapshot = unsafe { core::mem::transmute(address) };
-    let call_status = unsafe { snapshot(&mut frame as *mut ElmNativeProviderSnapshotV1) };
+    let payload_start = payload.as_mut_ptr() as usize;
+    let payload_end = match payload_start.checked_add(payload.len()) {
+        Some(end) => end,
+        None => return (ELM_MGR_STATUS_INVALID, 0, 0, 0, 0),
+    };
+    let call_status = unsafe {
+        invocation.invoke(
+            address,
+            &mut frame as *mut ElmNativeProviderSnapshotV1,
+            bounds,
+            &[(payload_start, payload_end)],
+        )
+    };
+    let outcome = invocation.finish();
     let allowed_flags = if request_paged {
         ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK
     } else {
         0
     };
     let response_more = frame.flags & ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE != 0;
-    if guard.aborted()
+    if outcome.aborted
+        || outcome.budget_exceeded
         || call_status != 0
         || frame.abi_version != ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION
         || frame.flags & !allowed_flags != 0
@@ -1054,14 +1410,8 @@ pub(crate) fn invoke_provider_snapshot(
 
 #[cfg(feature = "kernel-tests")]
 pub(crate) fn test_rewrite_import_abs64(slot: &mut u64, new_address: usize) -> ElmResult<()> {
-    let relocation = NativeImportRelocation {
-        import_index: 0,
-        kind: ElmEbiRelocationKind::ImportAbs64,
-        target_addr: slot as *mut u64 as usize,
-        addend: 0,
-        rebindable: true,
-    };
-    write_import_relocation(&relocation, new_address).map_err(|_| ElmError::InvalidTransition)
+    write_unsigned_relocation(slot as *mut u64 as usize, new_address, 8)
+        .map_err(|_| ElmError::InvalidTransition)
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {

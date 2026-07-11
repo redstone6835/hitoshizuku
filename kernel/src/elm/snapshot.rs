@@ -39,6 +39,9 @@ pub(crate) fn snapshot_bytes(core: &ElmCore) -> Vec<u8> {
             cell.isolated,
             cell.native_faults,
             cell.isolation_blocker,
+            cell.trust_unsigned,
+            cell.signer_key_id,
+            cell.release_epoch,
         );
         push_plain(&mut out, &entry);
     }

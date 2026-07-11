@@ -6,6 +6,7 @@
 pub const ELM_FRAME_PAYLOAD_LEN: usize = 256;
 pub const ELM_NATIVE_ENTRY_ABI_VERSION: u16 = 1;
 pub const ELM_NATIVE_PROVIDER_CALL_ABI_VERSION: u16 = 1;
+pub const ELM_NATIVE_MANAGED_CALL_ABI_VERSION: u16 = 1;
 pub const ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION: u16 = 1;
 pub const ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED: u16 = 1 << 0;
 pub const ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE: u16 = 1 << 1;
@@ -137,6 +138,24 @@ pub struct ElmNativeProviderCallV1 {
     pub reply: ElmReplyFrame,
 }
 
+/// 受管 import/export 的固定原生调用帧。
+///
+/// import 槽只保存 `import_handle`；实际目标、代际和权限由运行时调用门解析。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeManagedCallV1 {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub reserved0: u32,
+    pub import_handle: u64,
+    pub caller_cell_id: u64,
+    pub caller_generation: u64,
+    pub callee_cell_id: u64,
+    pub callee_generation: u64,
+    pub request: ElmCallFrame,
+    pub reply: ElmReplyFrame,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmNativeEntryFrameV1 {
@@ -224,6 +243,34 @@ impl ElmNativeProviderCallV1 {
             port_id,
             lease_id,
             binding_id: request.binding_id,
+            request,
+            reply: ElmReplyFrame::empty(
+                request.binding_id,
+                request.call_id,
+                ELM_CALL_STATUS_PROVIDER_FAULT,
+            ),
+        }
+    }
+}
+
+impl ElmNativeManagedCallV1 {
+    pub const fn new(
+        import_handle: u64,
+        caller_cell_id: u64,
+        caller_generation: u64,
+        callee_cell_id: u64,
+        callee_generation: u64,
+        request: ElmCallFrame,
+    ) -> Self {
+        Self {
+            abi_version: ELM_NATIVE_MANAGED_CALL_ABI_VERSION,
+            flags: 0,
+            reserved0: 0,
+            import_handle,
+            caller_cell_id,
+            caller_generation,
+            callee_cell_id,
+            callee_generation,
             request,
             reply: ElmReplyFrame::empty(
                 request.binding_id,

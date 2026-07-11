@@ -1514,6 +1514,12 @@ enum ElmSysfsSlot {
     Events,
     Audit,
     Api,
+    Trust,
+    ProjectionSources,
+    Journal,
+    Executions,
+    OwnedResources,
+    Diagnostics,
 }
 
 impl ElmSysfsSlot {
@@ -1529,6 +1535,12 @@ impl ElmSysfsSlot {
         Self::Events,
         Self::Audit,
         Self::Api,
+        Self::Trust,
+        Self::ProjectionSources,
+        Self::Journal,
+        Self::Executions,
+        Self::OwnedResources,
+        Self::Diagnostics,
     ];
 
     fn to_u64(self) -> u64 {
@@ -1544,6 +1556,12 @@ impl ElmSysfsSlot {
             Self::Events => 8,
             Self::Audit => 9,
             Self::Api => 10,
+            Self::Trust => 11,
+            Self::ProjectionSources => 12,
+            Self::Journal => 13,
+            Self::Executions => 14,
+            Self::OwnedResources => 15,
+            Self::Diagnostics => 16,
         }
     }
 
@@ -1560,6 +1578,12 @@ impl ElmSysfsSlot {
             Self::Events => "events",
             Self::Audit => "audit",
             Self::Api => "api",
+            Self::Trust => "trust",
+            Self::ProjectionSources => "projection-sources",
+            Self::Journal => "journal",
+            Self::Executions => "executions",
+            Self::OwnedResources => "owned-resources",
+            Self::Diagnostics => "diagnostics",
         }
     }
 }

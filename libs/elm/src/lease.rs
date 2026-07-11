@@ -179,7 +179,10 @@ impl LeaseRegistry {
         if lease.state != LeaseState::Active {
             return Err(ElmError::InvalidLeaseState);
         }
-        lease.active_refs = lease.active_refs.saturating_add(1);
+        lease.active_refs = lease
+            .active_refs
+            .checked_add(1)
+            .ok_or(ElmError::LeaseBusy)?;
         Ok(lease.active_refs)
     }
 
@@ -209,6 +212,9 @@ impl LeaseRegistry {
         let Some(lease) = self.leases.get_mut(&id) else {
             return Err(ElmError::InvalidLeaseState);
         };
+        if lease.active_refs != 0 {
+            return Err(ElmError::LeaseBusy);
+        }
         if lease.state == LeaseState::Active {
             lease.begin_revoke()?;
         }
@@ -220,7 +226,22 @@ impl LeaseRegistry {
     }
 
     pub fn revoke_and_remove_owned_by(&mut self, owner: ElmId) -> ElmResult<Vec<LeaseId>> {
+        let owned_count = self
+            .leases
+            .values()
+            .filter(|lease| lease.owner == owner)
+            .count();
         let mut revoked = Vec::new();
+        revoked
+            .try_reserve_exact(owned_count)
+            .map_err(|_| ElmError::LeaseBusy)?;
+        if self
+            .leases
+            .values()
+            .any(|lease| lease.owner == owner && lease.active_refs != 0)
+        {
+            return Err(ElmError::LeaseBusy);
+        }
         for lease in self.leases.values_mut() {
             if lease.owner != owner {
                 continue;
@@ -230,8 +251,8 @@ impl LeaseRegistry {
             }
             if lease.state == LeaseState::Revoking {
                 lease.finish_revoke()?;
-                revoked.push(lease.id);
             }
+            revoked.push(lease.id);
         }
         for id in &revoked {
             self.leases.remove(id);

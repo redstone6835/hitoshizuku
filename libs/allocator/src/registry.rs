@@ -388,6 +388,47 @@ impl AllocationRegistry {
         self.get_result(ptr).ok()
     }
 
+    /// 查询完整覆盖给定地址范围的活跃分配记录。
+    ///
+    /// 注册表按分配起点散列，内部指针无法直接命中桶，因此该接口会遍历各 shard。
+    /// 它只用于跨 ABI 裸指针校验，不应放进常规分配热路径。
+    pub fn find_containing(&self, ptr: usize, len: usize) -> Option<AllocationRecord> {
+        if ptr == 0 || len == 0 {
+            return None;
+        }
+        let end = ptr.checked_add(len)?;
+        for shard in &self.shards {
+            let mut inner = shard.inner.lock();
+            if !inner.initialized {
+                continue;
+            }
+            for bucket in 0..inner.bucket_count {
+                let mut current = bucket_head(&inner, bucket);
+                let mut visited = 0usize;
+                while current != 0 {
+                    if visited >= inner.nodes_allocated {
+                        note_chain_corruption_locked(&mut inner);
+                        return None;
+                    }
+                    let node = read_node(current);
+                    let record = node.record;
+                    let usable = record.usable_size.max(record.size);
+                    if usable != 0
+                        && record
+                            .ptr
+                            .checked_add(usable)
+                            .is_some_and(|record_end| record.ptr <= ptr && end <= record_end)
+                    {
+                        return Some(record);
+                    }
+                    current = node.next;
+                    visited += 1;
+                }
+            }
+        }
+        None
+    }
+
     pub fn get_result(&self, ptr: usize) -> Result<AllocationRecord, RegistryError> {
         let hash = hash_ptr(ptr);
         let mut inner = self.shard_for_hash(hash).inner.lock();

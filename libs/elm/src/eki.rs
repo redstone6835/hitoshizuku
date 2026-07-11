@@ -11,14 +11,16 @@ use crate::ebi::{
     ELM_EBI_ABI_VERSION, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
     ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS,
-    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN, ElmEbiArch,
-    ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
-    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiLifecycleHookDecl,
-    ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl,
-    ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
-    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget,
-    ElmEbiUnit,
+    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN,
+    ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl,
+    ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
+    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind,
+    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload,
+    ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
 };
+use crate::elmapi::ELM_API_MAX_COMPATIBLE_VERSIONS;
+use crate::graph::ElmMixinMode;
 use crate::manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
 use crate::menu::{
     ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ElmMenuItemKind,
@@ -26,6 +28,11 @@ use crate::menu::{
 use crate::mgr::{ELM_MGR_RELATION_POINT_LEN, ELM_NEXUS_CONTRACT_LEN};
 use crate::nexus::{FlowDirection, FlowMode};
 use crate::ports::ElmPortAccessPolicy;
+use crate::proof::{
+    ELM_PROOF_ED25519_SIGNATURE_LEN, ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN,
+    ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiProofV1, ElmPanicStrategy, ElmRustAbiFingerprintV1,
+    sha256_with_zeroed_range, sha256_with_zeroed_ranges,
+};
 
 pub const ELM_EKI_MAGIC: [u8; 8] = *b"ELM_EKI\0";
 pub const ELM_EKI_FORMAT_VERSION: u16 = 1;
@@ -36,6 +43,12 @@ pub const ELM_EKI_MANIFEST_NAME_LEN: usize = 128;
 pub const ELM_EKI_MANIFEST_VERSION_LEN: usize = 64;
 pub const ELM_EKI_ENTRY_SYMBOL_LEN: usize = 128;
 pub const ELM_EKI_BLOCK_FLAG_REQUIRED: u32 = 1 << 0;
+pub const ELM_EKI_IMAGE_HASH_SHA256_SIZE: u32 = ELM_PROOF_SHA256_LEN as u32;
+pub const ELM_EKI_ELMAPI_BLOCK_VERSION: u16 = 1;
+pub const ELM_EKI_ELMAPI_BLOCK_SIZE: usize = 16 + ELM_API_MAX_COMPATIBLE_VERSIONS * 2;
+pub const ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE: usize = 120;
+pub const ELM_EKI_PROOF_BLOCK_SIZE: usize = 280 + ELM_PROOF_ED25519_SIGNATURE_LEN;
+pub const ELM_EKI_PROOF_ALGORITHM_ED25519: u16 = 1;
 
 const EKI_MANIFEST_BLOCK_SIZE: usize =
     16 + ELM_EKI_MANIFEST_NAME_LEN + ELM_EKI_MANIFEST_VERSION_LEN;
@@ -46,14 +59,11 @@ const EKI_TABLE_HEADER_SIZE: usize = 8;
 const EKI_SEGMENT_RECORD_SIZE: usize = 32;
 const EKI_DEPENDENCY_RECORD_SIZE: usize = 8 + ELM_EBI_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
-    8 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
+    16 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_RECORD_SIZE: usize =
-    8 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
-pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1: usize = 24 + ELM_NEXUS_CONTRACT_LEN;
-pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2: usize =
-    ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1 + ELM_EBI_SYMBOL_NAME_LEN;
+    24 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN * 2;
 pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE: usize =
-    ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2 + ELM_EBI_SYMBOL_NAME_LEN;
+    24 + ELM_NEXUS_CONTRACT_LEN + ELM_EBI_SYMBOL_NAME_LEN * 2;
 const EKI_SYMBOL_RECORD_SIZE: usize = 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_LIFECYCLE_HOOK_RECORD_SIZE: usize = 20 + ELM_EBI_SYMBOL_NAME_LEN;
 pub const ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE: usize = 32 + ELM_EBI_SYMBOL_NAME_LEN;
@@ -81,6 +91,8 @@ pub enum ElmEkiBlockKind {
     ProviderPorts = 17,
     LifecycleHooks = 18,
     SymbolLocations = 19,
+    ApiCompatibility = 20,
+    AbiFingerprint = 21,
 }
 
 impl ElmEkiBlockKind {
@@ -105,6 +117,8 @@ impl ElmEkiBlockKind {
             17 => Some(Self::ProviderPorts),
             18 => Some(Self::LifecycleHooks),
             19 => Some(Self::SymbolLocations),
+            20 => Some(Self::ApiCompatibility),
+            21 => Some(Self::AbiFingerprint),
             _ => None,
         }
     }
@@ -183,6 +197,10 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     let mut lifecycle_hooks = None;
     let mut symbol_locations = None;
     let mut relocations = None;
+    let mut api_compatibility = None;
+    let mut abi_fingerprint = None;
+    let mut proof = None;
+    let mut proof_range = None;
 
     for index in 0..header.block_count as usize {
         let desc_offset = header.block_table_offset as usize + index * ELM_EKI_BLOCK_DESC_SIZE;
@@ -283,7 +301,25 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
                 }
                 provider_ports = Some(parse_provider_ports(payload)?);
             }
-            _ => {}
+            ElmEkiBlockKind::ApiCompatibility => {
+                if api_compatibility.is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidTarget);
+                }
+                api_compatibility = Some(parse_api_compatibility(payload)?);
+            }
+            ElmEkiBlockKind::AbiFingerprint => {
+                if abi_fingerprint.is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidTarget);
+                }
+                abi_fingerprint = Some(parse_abi_fingerprint(payload)?);
+            }
+            ElmEkiBlockKind::Signature => {
+                if proof.is_some() {
+                    return Err(ElmEbiLoadStatus::RuntimeRejected);
+                }
+                proof = Some(parse_proof(payload)?);
+                proof_range = Some((desc.offset as usize, desc.file_size as usize));
+            }
         }
     }
 
@@ -335,6 +371,9 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     if let Some(hooks) = lifecycle_hooks {
         unit = unit.with_lifecycle_hooks(hooks);
     }
+    if let Some(compatibility) = api_compatibility {
+        unit = unit.with_api_compatibility(compatibility);
+    }
     let segments = unit.segments.clone();
     let mut image = ElmEbiImage::new(unit);
     for (segment_index, segment) in segments.iter().enumerate() {
@@ -374,6 +413,26 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
         for relocation in relocations {
             image = image.with_relocation(relocation);
         }
+    }
+    if let Some(fingerprint) = abi_fingerprint {
+        image = image.with_abi_fingerprint(fingerprint);
+    }
+    if let Some(proof) = proof {
+        let proof_range = proof_range.ok_or(ElmEbiLoadStatus::RuntimeRejected)?;
+        let mut ranges = [
+            (
+                header.image_hash_offset as usize,
+                header.image_hash_size as usize,
+            ),
+            proof_range,
+        ];
+        ranges.sort_unstable_by_key(|range| range.0);
+        let source_digest =
+            sha256_with_zeroed_ranges(bytes, &ranges).ok_or(ElmEbiLoadStatus::RuntimeRejected)?;
+        if proof.source_digest != source_digest {
+            return Err(ElmEbiLoadStatus::RuntimeRejected);
+        }
+        image = image.with_proof(proof);
     }
     image.validate(ElmEbiArch::Any)?;
     Ok(image)
@@ -428,11 +487,23 @@ fn validate_header(bytes: &[u8], header: &ElmEkiHeader) -> Result<(), ElmEbiLoad
         .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
     checked_range(bytes, header.block_table_offset as usize, table_size)?;
     if header.image_hash_size != 0 {
-        checked_range(
+        if header.image_hash_size != ELM_EKI_IMAGE_HASH_SHA256_SIZE {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
+        let expected = checked_range(
             bytes,
             header.image_hash_offset as usize,
             header.image_hash_size as usize,
         )?;
+        let actual = sha256_with_zeroed_range(
+            bytes,
+            header.image_hash_offset as usize,
+            header.image_hash_size as usize,
+        )
+        .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+        if expected != actual {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
     }
     Ok(())
 }
@@ -540,6 +611,114 @@ fn parse_entry(payload: &[u8]) -> Result<ElmEbiEntry, ElmEbiLoadStatus> {
         return Err(ElmEbiLoadStatus::InvalidSegment);
     }
     Ok(ElmEbiEntry::new(fixed_str(payload, 8, symbol_len)?))
+}
+
+fn parse_api_compatibility(payload: &[u8]) -> Result<ElmEbiApiCompatibility, ElmEbiLoadStatus> {
+    if payload.len() != ELM_EKI_ELMAPI_BLOCK_SIZE
+        || read_u16(payload, 0)? != ELM_EKI_ELMAPI_BLOCK_VERSION
+    {
+        return Err(ElmEbiLoadStatus::InvalidTarget);
+    }
+    let count = usize::from(read_u16(payload, 2)?);
+    if count == 0 || count > ELM_API_MAX_COMPATIBLE_VERSIONS {
+        return Err(ElmEbiLoadStatus::InvalidTarget);
+    }
+    let root_import_index = read_u32(payload, 4)?;
+    let required_features = read_u64(payload, 8)?;
+    let mut versions = Vec::new();
+    for index in 0..ELM_API_MAX_COMPATIBLE_VERSIONS {
+        let version = read_u16(payload, 16 + index * 2)?;
+        if index < count {
+            versions.push(version);
+        } else if version != 0 {
+            return Err(ElmEbiLoadStatus::InvalidTarget);
+        }
+    }
+    ElmEbiApiCompatibility::new(root_import_index, required_features, versions)
+}
+
+fn parse_abi_fingerprint(payload: &[u8]) -> Result<ElmRustAbiFingerprintV1, ElmEbiLoadStatus> {
+    if payload.len() != ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE
+        || read_u16(payload, 0)? != ELM_RUST_ABI_FINGERPRINT_VERSION
+        || read_u16(payload, 6)? != 0
+        || read_u32(payload, 20)? != 0
+    {
+        return Err(ElmEbiLoadStatus::UnsupportedAbi);
+    }
+    let panic_strategy =
+        ElmPanicStrategy::from_raw(payload[4]).ok_or(ElmEbiLoadStatus::UnsupportedAbi)?;
+    let mut rustc_commit_hash = [0u8; ELM_PROOF_SHA256_LEN];
+    let mut target_spec_hash = [0u8; ELM_PROOF_SHA256_LEN];
+    let mut kernel_api_hash = [0u8; ELM_PROOF_SHA256_LEN];
+    rustc_commit_hash.copy_from_slice(read_bytes(payload, 24, ELM_PROOF_SHA256_LEN)?);
+    target_spec_hash.copy_from_slice(read_bytes(payload, 56, ELM_PROOF_SHA256_LEN)?);
+    kernel_api_hash.copy_from_slice(read_bytes(payload, 88, ELM_PROOF_SHA256_LEN)?);
+    let fingerprint = ElmRustAbiFingerprintV1 {
+        rustc_commit_hash,
+        target_spec_hash,
+        kernel_api_hash,
+        elmapi_version: read_u16(payload, 2)?,
+        panic_strategy,
+        code_model: payload[5],
+        target_features: read_u64(payload, 8)?,
+        flags: read_u32(payload, 16)?,
+    };
+    fingerprint.validate()?;
+    Ok(fingerprint)
+}
+
+fn parse_proof(payload: &[u8]) -> Result<ElmEbiProofV1, ElmEbiLoadStatus> {
+    if payload.len() != ELM_EKI_PROOF_BLOCK_SIZE
+        || read_u16(payload, 0)? != crate::proof::ELM_PROOF_ABI_VERSION
+        || read_u16(payload, 2)? != ELM_EKI_PROOF_ALGORITHM_ED25519
+        || read_u16(payload, 18)? != 0
+        || read_u32(payload, 20)? != 0
+    {
+        return Err(ElmEbiLoadStatus::RuntimeRejected);
+    }
+    let source_identifier_len = usize::from(read_u16(payload, 16)?);
+    if source_identifier_len == 0 || source_identifier_len > ELM_PROOF_SOURCE_IDENTIFIER_LEN {
+        return Err(ElmEbiLoadStatus::RuntimeRejected);
+    }
+    let source_identifier = fixed_str(payload, 24, source_identifier_len)?;
+    let mut source_digest = [0u8; ELM_PROOF_SHA256_LEN];
+    let mut subject_digest = [0u8; ELM_PROOF_SHA256_LEN];
+    let mut signer_key_id = [0u8; ELM_PROOF_SHA256_LEN];
+    let mut signer_public_key = [0u8; crate::proof::ELM_PROOF_ED25519_PUBLIC_KEY_LEN];
+    let mut signature = [0u8; ELM_PROOF_ED25519_SIGNATURE_LEN];
+    source_digest.copy_from_slice(read_bytes(
+        payload,
+        24 + ELM_PROOF_SOURCE_IDENTIFIER_LEN,
+        ELM_PROOF_SHA256_LEN,
+    )?);
+    subject_digest.copy_from_slice(read_bytes(
+        payload,
+        24 + ELM_PROOF_SOURCE_IDENTIFIER_LEN + ELM_PROOF_SHA256_LEN,
+        ELM_PROOF_SHA256_LEN,
+    )?);
+    signer_key_id.copy_from_slice(read_bytes(
+        payload,
+        24 + ELM_PROOF_SOURCE_IDENTIFIER_LEN + ELM_PROOF_SHA256_LEN * 2,
+        ELM_PROOF_SHA256_LEN,
+    )?);
+    signer_public_key.copy_from_slice(read_bytes(
+        payload,
+        24 + ELM_PROOF_SOURCE_IDENTIFIER_LEN + ELM_PROOF_SHA256_LEN * 3,
+        crate::proof::ELM_PROOF_ED25519_PUBLIC_KEY_LEN,
+    )?);
+    signature.copy_from_slice(read_bytes(payload, 280, ELM_PROOF_ED25519_SIGNATURE_LEN)?);
+    let proof = ElmEbiProofV1 {
+        source_identifier,
+        source_digest,
+        subject_digest,
+        signer_key_id,
+        signer_public_key,
+        release_epoch: read_u64(payload, 8)?,
+        flags: read_u32(payload, 4)?,
+        signature,
+    };
+    proof.validate_shape()?;
+    Ok(proof)
 }
 
 fn parse_segments(payload: &[u8]) -> Result<Vec<EkiSegmentDecl>, ElmEbiLoadStatus> {
@@ -695,15 +874,20 @@ fn parse_extension_points(
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_EXTENSION_POINT_RECORD_SIZE;
         let point_len = read_u16(payload, offset)? as usize;
         let contract_len = read_u16(payload, offset + 2)? as usize;
-        if read_u32(payload, offset + 4)? != 0 {
+        let mode = ElmMixinMode::from_raw(read_u32(payload, offset + 4)?)
+            .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
+        if read_u32(payload, offset + 8)? != 0 || read_u32(payload, offset + 12)? != 0 {
             return Err(ElmEbiLoadStatus::InvalidManifest);
         }
-        let point_start = offset + 8;
+        let point_start = offset + 16;
         let contract_start = point_start + ELM_MGR_RELATION_POINT_LEN;
-        points.push(ElmEbiExtensionPointDecl::new(
-            fixed_str(payload, point_start, point_len)?,
-            fixed_str(payload, contract_start, contract_len)?,
-        )?);
+        points.push(
+            ElmEbiExtensionPointDecl::new(
+                fixed_str(payload, point_start, point_len)?,
+                fixed_str(payload, contract_start, contract_len)?,
+            )?
+            .with_mode(mode),
+        );
     }
     Ok(points)
 }
@@ -716,26 +900,44 @@ fn parse_extensions(payload: &[u8]) -> Result<Vec<ElmEbiExtensionDecl>, ElmEbiLo
         let target_len = read_u16(payload, offset)? as usize;
         let point_len = read_u16(payload, offset + 2)? as usize;
         let contract_len = read_u16(payload, offset + 4)? as usize;
-        if read_u16(payload, offset + 6)? != 0 {
+        let handler_contract_len = read_u16(payload, offset + 6)? as usize;
+        let priority = read_u32(payload, offset + 8)? as i32;
+        if read_u32(payload, offset + 12)? != 0
+            || read_u32(payload, offset + 16)? != 0
+            || read_u32(payload, offset + 20)? != 0
+        {
             return Err(ElmEbiLoadStatus::InvalidManifest);
         }
-        let target_start = offset + 8;
+        let target_start = offset + 24;
         let point_start = target_start + ELM_EBI_NAME_LEN;
         let contract_start = point_start + ELM_MGR_RELATION_POINT_LEN;
-        extensions.push(ElmEbiExtensionDecl::new(
-            fixed_str(payload, target_start, target_len)?,
-            fixed_str(payload, point_start, point_len)?,
-            fixed_str(payload, contract_start, contract_len)?,
-        )?);
+        let handler_contract_start = contract_start + ELM_NEXUS_CONTRACT_LEN;
+        extensions.push(
+            ElmEbiExtensionDecl::new(
+                fixed_str(payload, target_start, target_len)?,
+                fixed_str(payload, point_start, point_len)?,
+                fixed_str(payload, contract_start, contract_len)?,
+            )?
+            .with_handler_contract(fixed_str(
+                payload,
+                handler_contract_start,
+                handler_contract_len,
+            )?)?
+            .with_priority(priority),
+        );
     }
     Ok(extensions)
 }
 
 fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, ElmEbiLoadStatus> {
-    let (count, record_size) = parse_provider_port_table_shape(payload)?;
+    let count = parse_table_count(
+        payload,
+        ELM_EBI_MAX_PROVIDER_PORTS,
+        ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
+    )?;
     let mut providers = Vec::new();
     for index in 0..count {
-        let offset = EKI_TABLE_HEADER_SIZE + index * record_size;
+        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_PROVIDER_PORT_RECORD_SIZE;
         let access = ElmPortAccessPolicy::from_raw(read_u32(payload, offset)?)
             .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
         let direction = FlowDirection::from_raw(read_u32(payload, offset + 4)?)
@@ -745,16 +947,8 @@ fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, E
         let flags = read_u32(payload, offset + 12)?;
         let contract_len = read_u16(payload, offset + 16)? as usize;
         let handler_len = read_u16(payload, offset + 18)? as usize;
-        let snapshot_len = if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE {
-            read_u16(payload, offset + 20)? as usize
-        } else {
-            if read_u32(payload, offset + 20)? != 0 {
-                return Err(ElmEbiLoadStatus::InvalidManifest);
-            }
-            0
-        };
-        if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE && read_u16(payload, offset + 22)? != 0
-        {
+        let snapshot_len = read_u16(payload, offset + 20)? as usize;
+        if read_u16(payload, offset + 22)? != 0 {
             return Err(ElmEbiLoadStatus::InvalidManifest);
         }
         if contract_len > ELM_NEXUS_CONTRACT_LEN
@@ -763,13 +957,9 @@ fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, E
         {
             return Err(ElmEbiLoadStatus::InvalidManifest);
         }
-        if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1 && handler_len != 0 {
-            return Err(ElmEbiLoadStatus::InvalidManifest);
-        }
-        if record_size != ELM_EKI_PROVIDER_PORT_RECORD_SIZE && snapshot_len != 0 {
-            return Err(ElmEbiLoadStatus::InvalidManifest);
-        }
         let contract_start = offset + 24;
+        let handler_start = contract_start + ELM_NEXUS_CONTRACT_LEN;
+        let snapshot_start = handler_start + ELM_EBI_SYMBOL_NAME_LEN;
         let mut provider = ElmEbiProviderPortDecl::new(
             fixed_str(payload, contract_start, contract_len)?,
             access,
@@ -777,47 +967,17 @@ fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, E
             mode,
             flags,
         )?;
-        if record_size != ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1 {
-            let handler_start = contract_start + ELM_NEXUS_CONTRACT_LEN;
-            if handler_len != 0 {
-                provider = provider.with_handler_symbol(fixed_str(
-                    payload,
-                    handler_start,
-                    handler_len,
-                )?)?;
-            }
-            if record_size == ELM_EKI_PROVIDER_PORT_RECORD_SIZE && snapshot_len != 0 {
-                let snapshot_start = handler_start + ELM_EBI_SYMBOL_NAME_LEN;
-                provider = provider.with_snapshot_symbol(fixed_str(
-                    payload,
-                    snapshot_start,
-                    snapshot_len,
-                )?)?;
-            }
+        if handler_len != 0 {
+            provider =
+                provider.with_handler_symbol(fixed_str(payload, handler_start, handler_len)?)?;
+        }
+        if snapshot_len != 0 {
+            provider =
+                provider.with_snapshot_symbol(fixed_str(payload, snapshot_start, snapshot_len)?)?;
         }
         providers.push(provider);
     }
     Ok(providers)
-}
-
-fn parse_provider_port_table_shape(payload: &[u8]) -> Result<(usize, usize), ElmEbiLoadStatus> {
-    if payload.len() < EKI_TABLE_HEADER_SIZE {
-        return Err(ElmEbiLoadStatus::InvalidManifest);
-    }
-    let count = read_u32(payload, 0)? as usize;
-    let reserved = read_u32(payload, 4)?;
-    if reserved != 0 || count > ELM_EBI_MAX_PROVIDER_PORTS {
-        return Err(ElmEbiLoadStatus::InvalidManifest);
-    }
-    let old_size = table_expected_size(count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1)?;
-    let v2_size = table_expected_size(count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2)?;
-    let new_size = table_expected_size(count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE)?;
-    match payload.len() {
-        len if len == new_size => Ok((count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE)),
-        len if len == v2_size => Ok((count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V2)),
-        len if len == old_size => Ok((count, ELM_EKI_PROVIDER_PORT_RECORD_SIZE_V1)),
-        _ => Err(ElmEbiLoadStatus::InvalidManifest),
-    }
 }
 
 fn parse_imports(payload: &[u8]) -> Result<Vec<ElmEbiImportDecl>, ElmEbiLoadStatus> {
@@ -825,8 +985,15 @@ fn parse_imports(payload: &[u8]) -> Result<Vec<ElmEbiImportDecl>, ElmEbiLoadStat
     let mut imports = Vec::new();
     for index in 0..count {
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_SYMBOL_RECORD_SIZE;
-        let (name, contract, version, flags) = parse_symbol_record(payload, offset)?;
-        imports.push(ElmEbiImportDecl::new(name, contract, version, flags)?);
+        let (name, contract, min_version, max_version, flags) =
+            parse_symbol_record(payload, offset)?;
+        imports.push(ElmEbiImportDecl::new_range(
+            name,
+            contract,
+            min_version,
+            max_version,
+            flags,
+        )?);
     }
     Ok(imports)
 }
@@ -836,7 +1003,10 @@ fn parse_exports(payload: &[u8]) -> Result<Vec<ElmEbiExportDecl>, ElmEbiLoadStat
     let mut exports = Vec::new();
     for index in 0..count {
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_SYMBOL_RECORD_SIZE;
-        let (name, contract, version, flags) = parse_symbol_record(payload, offset)?;
+        let (name, contract, version, max_version, flags) = parse_symbol_record(payload, offset)?;
+        if max_version != version {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
         exports.push(ElmEbiExportDecl::new(name, contract, version, flags)?);
     }
     Ok(exports)
@@ -977,20 +1147,19 @@ fn parse_relocations(payload: &[u8]) -> Result<Vec<ElmEbiRelocationDecl>, ElmEbi
 fn parse_symbol_record(
     payload: &[u8],
     offset: usize,
-) -> Result<(String, String, u32, u32), ElmEbiLoadStatus> {
-    let version = read_u32(payload, offset)?;
+) -> Result<(String, String, u32, u32, u32), ElmEbiLoadStatus> {
+    let min_version = read_u32(payload, offset)?;
     let flags = read_u32(payload, offset + 4)?;
     let name_len = read_u16(payload, offset + 8)? as usize;
     let contract_len = read_u16(payload, offset + 10)? as usize;
-    if read_u32(payload, offset + 12)? != 0 {
-        return Err(ElmEbiLoadStatus::InvalidManifest);
-    }
+    let max_version = read_u32(payload, offset + 12)?;
     let name_start = offset + 16;
     let contract_start = name_start + ELM_EBI_SYMBOL_NAME_LEN;
     Ok((
         fixed_str(payload, name_start, name_len)?,
         fixed_str(payload, contract_start, contract_len)?,
-        version,
+        min_version,
+        max_version,
         flags,
     ))
 }

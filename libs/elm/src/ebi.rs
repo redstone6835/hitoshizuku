@@ -8,6 +8,11 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::elmapi::{
+    ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
+};
+use crate::graph::ElmMixinMode;
+use crate::ids::{ELM_MGR_BUILTIN_ID, ElmId};
 use crate::manifest::{ElmManifest, ElmName};
 use crate::menu::{
     ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ElmMenuItemKind,
@@ -15,10 +20,18 @@ use crate::menu::{
 use crate::mgr::{ELM_MGR_RELATION_POINT_LEN, ELM_NEXUS_CONTRACT_LEN};
 use crate::nexus::{FlowContract, FlowDirection, FlowMode};
 use crate::ports::ElmPortAccessPolicy;
+use crate::proof::{ElmEbiProofV1, ElmRustAbiFingerprintV1, canonical_ebi_digest};
+use crate::resource::ElmResourceBudget;
 
 pub const ELM_EBI_ABI_VERSION: u16 = 1;
 pub const ELM_EBI_SOURCE_ABI_VERSION: u16 = 1;
+pub const ELM_EBI_SOURCE_REQUEST_SIZE: usize = core::mem::size_of::<ElmEbiSourceRequest>();
 pub const ELM_EBI_PROJECTION_SOURCE_ABI_VERSION: u16 = 1;
+pub const ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE: usize =
+    core::mem::size_of::<ElmProjectionSourceRequest>();
+pub const ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION: u16 = 1 << 0;
+pub const ELM_EBI_PROJECTION_SOURCE_FLAGS_MASK: u16 = ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION;
+pub const ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION: u16 = 1;
 pub const ELM_EBI_MAX_SEGMENTS: usize = 32;
 pub const ELM_EBI_MAX_DEPENDENCIES: usize = 16;
 pub const ELM_EBI_MAX_EXTENSION_POINTS: usize = 16;
@@ -38,6 +51,26 @@ pub const ELM_EBI_SEGMENT_FLAG_EXECUTE: u32 = 1 << 2;
 pub const ELM_EBI_SEGMENT_FLAG_ZERO_FILL: u32 = 1 << 3;
 pub const ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT: u32 = 1 << 4;
 pub const ELM_EBI_SYMBOL_FLAG_NONE: u32 = 0;
+pub const ELM_EBI_IMPORT_FLAG_OPTIONAL: u32 = 1 << 0;
+pub const ELM_EBI_IMPORT_FLAG_MANAGED: u32 = 1 << 1;
+pub const ELM_EBI_IMPORT_FLAG_DIRECT_PINNED: u32 = 1 << 2;
+pub const ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR: u32 = 1 << 3;
+pub const ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN: u32 = 1 << 4;
+pub const ELM_EBI_IMPORT_FLAGS_MASK: u32 = ELM_EBI_IMPORT_FLAG_OPTIONAL
+    | ELM_EBI_IMPORT_FLAG_MANAGED
+    | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED
+    | ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR
+    | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN;
+pub const ELM_EBI_EXPORT_FLAG_MANAGED: u32 = 1 << 0;
+pub const ELM_EBI_EXPORT_FLAG_DIRECT_PINNED: u32 = 1 << 1;
+pub const ELM_EBI_EXPORT_FLAG_PRIVATE: u32 = 1 << 2;
+pub const ELM_EBI_EXPORT_FLAG_DEPENDENCY: u32 = 1 << 3;
+pub const ELM_EBI_EXPORT_FLAG_SUBTREE: u32 = 1 << 4;
+pub const ELM_EBI_EXPORT_FLAGS_MASK: u32 = ELM_EBI_EXPORT_FLAG_MANAGED
+    | ELM_EBI_EXPORT_FLAG_DIRECT_PINNED
+    | ELM_EBI_EXPORT_FLAG_PRIVATE
+    | ELM_EBI_EXPORT_FLAG_DEPENDENCY
+    | ELM_EBI_EXPORT_FLAG_SUBTREE;
 pub const ELM_EBI_SYMBOL_LOCATION_FLAG_NONE: u32 = 0;
 pub const ELM_EBI_RELOCATION_FLAG_NONE: u32 = 0;
 pub const ELM_EBI_RUST_ABI_VERSION: u16 = 1;
@@ -58,10 +91,14 @@ const ELM_EBI_SEGMENT_FLAG_MASK: u32 = ELM_EBI_SEGMENT_FLAG_READ
     | ELM_EBI_SEGMENT_FLAG_ZERO_FILL
     | ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT;
 
+/// 内建 `eki` 子单元提供的 EKI -> EBI 投影源标识。
+///
+/// ELM Core 只按 Projection Source 协议调用该标识，不识别 EKI 文件格式本身。
+pub const ELM_EKI_PROJECTION_SOURCE_ID: u64 = 0x454b_4900_0000_0001;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ElmEbiSourceKind {
-    Eki = 1,
     Projection = 2,
     Builtin = 3,
     Memory = 4,
@@ -70,7 +107,6 @@ pub enum ElmEbiSourceKind {
 impl ElmEbiSourceKind {
     pub const fn from_raw(raw: u16) -> Option<Self> {
         match raw {
-            1 => Some(Self::Eki),
             2 => Some(Self::Projection),
             3 => Some(Self::Builtin),
             4 => Some(Self::Memory),
@@ -85,18 +121,38 @@ pub struct ElmEbiSourceRequest {
     pub abi_version: u16,
     pub source_kind: u16,
     pub flags: u32,
+    pub parent_cell_id: u64,
+    pub budget: ElmResourceBudget,
+    pub reserved0: u16,
     pub payload_len: u32,
-    pub reserved: u32,
+    pub reserved1: u32,
 }
 
 impl ElmEbiSourceRequest {
     pub const fn new(kind: ElmEbiSourceKind, payload_len: u32) -> Self {
+        Self::new_under_parent(
+            kind,
+            ELM_MGR_BUILTIN_ID,
+            ElmResourceBudget::DEFAULT,
+            payload_len,
+        )
+    }
+
+    pub const fn new_under_parent(
+        kind: ElmEbiSourceKind,
+        parent: ElmId,
+        budget: ElmResourceBudget,
+        payload_len: u32,
+    ) -> Self {
         Self {
             abi_version: ELM_EBI_SOURCE_ABI_VERSION,
             source_kind: kind as u16,
             flags: ELM_EBI_SOURCE_FLAG_NONE,
+            parent_cell_id: parent.0,
+            budget,
+            reserved0: 0,
             payload_len,
-            reserved: 0,
+            reserved1: 0,
         }
     }
 }
@@ -106,9 +162,10 @@ impl ElmEbiSourceRequest {
 pub struct ElmProjectionSourceRequest {
     pub abi_version: u16,
     pub flags: u16,
+    pub reserved0: u32,
     pub provider_id: u64,
     pub payload_len: u32,
-    pub reserved: u32,
+    pub reserved1: u32,
 }
 
 impl ElmProjectionSourceRequest {
@@ -116,10 +173,99 @@ impl ElmProjectionSourceRequest {
         Self {
             abi_version: ELM_EBI_PROJECTION_SOURCE_ABI_VERSION,
             flags: 0,
+            reserved0: 0,
             provider_id,
             payload_len,
-            reserved: 0,
+            reserved1: 0,
         }
+    }
+
+    pub const fn from_image_session(provider_id: u64) -> Self {
+        Self {
+            abi_version: ELM_EBI_PROJECTION_SOURCE_ABI_VERSION,
+            flags: ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION,
+            reserved0: 0,
+            provider_id,
+            payload_len: core::mem::size_of::<ElmImageSessionReferenceV1>() as u32,
+            reserved1: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmImageSessionReferenceV1 {
+    pub abi_version: u16,
+    pub flags: u16,
+    pub reserved: u32,
+    pub session_id: u64,
+}
+
+impl ElmImageSessionReferenceV1 {
+    pub const fn new(session_id: u64) -> Self {
+        Self {
+            abi_version: ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION,
+            flags: 0,
+            reserved: 0,
+            session_id,
+        }
+    }
+}
+
+/// Projection Source 的随机访问输入。
+///
+/// Core 只提供只读 reader，不暴露镜像会话或具体容器的存储方式。投影器必须按
+/// `read_at` 读取输入，因此内联载荷、分段会话以及后续其他来源使用同一条协议。
+pub trait ElmImageReader {
+    fn len(&self) -> u64;
+
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<(), ElmEbiLoadStatus>;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn read_all(&self, max_len: usize) -> Result<Vec<u8>, ElmEbiLoadStatus> {
+        let len = usize::try_from(self.len()).map_err(|_| ElmEbiLoadStatus::InvalidUnit)?;
+        if len > max_len {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
+        bytes.resize(len, 0);
+        self.read_at(0, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+pub struct ElmSliceImageReader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ElmSliceImageReader<'a> {
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+}
+
+impl ElmImageReader for ElmSliceImageReader<'_> {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<(), ElmEbiLoadStatus> {
+        let start = usize::try_from(offset).map_err(|_| ElmEbiLoadStatus::InvalidUnit)?;
+        let end = start
+            .checked_add(output.len())
+            .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+        let source = self
+            .bytes
+            .get(start..end)
+            .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+        output.copy_from_slice(source);
+        Ok(())
     }
 }
 
@@ -251,6 +397,9 @@ pub enum ElmEbiLoadStatus {
     InvalidMenu = -7,
     NativeCodeTodo = -4096,
     RuntimeRejected = -4097,
+    UntrustedImage = -4098,
+    AbiFingerprintRejected = -4099,
+    RollbackRejected = -4100,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +407,55 @@ pub struct ElmEbiTarget {
     pub arch: ElmEbiArch,
     pub abi_version: u16,
     pub min_core_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElmEbiApiCompatibility {
+    pub root_import_index: u32,
+    pub required_features: u64,
+    pub compatible_versions: Vec<u16>,
+}
+
+impl ElmEbiApiCompatibility {
+    pub fn new(
+        root_import_index: u32,
+        required_features: u64,
+        compatible_versions: impl IntoIterator<Item = u16>,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        let compatible_versions: Vec<_> = compatible_versions.into_iter().collect();
+        let value = Self {
+            root_import_index,
+            required_features,
+            compatible_versions,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), ElmEbiLoadStatus> {
+        if self.compatible_versions.is_empty()
+            || self.compatible_versions.len() > ELM_API_MAX_COMPATIBLE_VERSIONS
+            || self.compatible_versions.iter().any(|version| *version == 0)
+        {
+            return Err(ElmEbiLoadStatus::InvalidTarget);
+        }
+        if self
+            .compatible_versions
+            .windows(2)
+            .any(|versions| versions[0] >= versions[1])
+        {
+            return Err(ElmEbiLoadStatus::InvalidTarget);
+        }
+        Ok(())
+    }
+
+    pub fn select_highest_common(&self, supported: &[u16]) -> Option<u16> {
+        self.compatible_versions
+            .iter()
+            .rev()
+            .copied()
+            .find(|version| supported.contains(version))
+    }
 }
 
 impl ElmEbiTarget {
@@ -348,7 +546,8 @@ impl ElmEbiSegment {
 pub struct ElmEbiImportDecl {
     pub name: String,
     pub contract: FlowContract,
-    pub version: u32,
+    pub min_version: u32,
+    pub max_version: u32,
     pub flags: u32,
 }
 
@@ -359,15 +558,60 @@ impl ElmEbiImportDecl {
         version: u32,
         flags: u32,
     ) -> Result<Self, ElmEbiLoadStatus> {
+        let (min_version, max_version) = if version == 0 {
+            (1, u32::MAX)
+        } else {
+            (version, version)
+        };
+        Self::new_range(name, contract, min_version, max_version, flags)
+    }
+
+    pub fn new_range(
+        name: impl Into<String>,
+        contract: impl Into<String>,
+        min_version: u32,
+        max_version: u32,
+        flags: u32,
+    ) -> Result<Self, ElmEbiLoadStatus> {
         let name = name.into();
         validate_symbol_name(&name)?;
-        Ok(Self {
+        let value = Self {
             name,
             contract: FlowContract::new(contract.into())
                 .map_err(|_| ElmEbiLoadStatus::InvalidManifest)?,
-            version,
+            min_version,
+            max_version,
             flags,
-        })
+        };
+        validate_import_decl(&value)?;
+        Ok(value)
+    }
+
+    pub const fn accepts_version(&self, version: u32) -> bool {
+        version >= self.min_version && version <= self.max_version
+    }
+
+    pub const fn is_optional(&self) -> bool {
+        self.flags & ELM_EBI_IMPORT_FLAG_OPTIONAL != 0
+    }
+
+    pub const fn is_managed(&self) -> bool {
+        self.flags & ELM_EBI_IMPORT_FLAG_MANAGED != 0
+    }
+
+    pub const fn is_direct_pinned(&self) -> bool {
+        self.flags & (ELM_EBI_IMPORT_FLAG_MANAGED | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED) == 0
+            || self.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0
+    }
+
+    pub const fn allows_ancestor(&self) -> bool {
+        self.flags & (ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN) == 0
+            || self.flags & ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR != 0
+    }
+
+    pub const fn allows_builtin(&self) -> bool {
+        self.flags & (ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN) == 0
+            || self.flags & ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN != 0
     }
 }
 
@@ -388,13 +632,37 @@ impl ElmEbiExportDecl {
     ) -> Result<Self, ElmEbiLoadStatus> {
         let name = name.into();
         validate_symbol_name(&name)?;
-        Ok(Self {
+        let value = Self {
             name,
             contract: FlowContract::new(contract.into())
                 .map_err(|_| ElmEbiLoadStatus::InvalidManifest)?,
             version,
             flags,
-        })
+        };
+        validate_export_decl(&value)?;
+        Ok(value)
+    }
+
+    pub const fn is_managed(&self) -> bool {
+        self.flags & ELM_EBI_EXPORT_FLAG_MANAGED != 0
+    }
+
+    pub const fn is_direct_pinned(&self) -> bool {
+        self.flags & (ELM_EBI_EXPORT_FLAG_MANAGED | ELM_EBI_EXPORT_FLAG_DIRECT_PINNED) == 0
+            || self.flags & ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
+    }
+
+    pub const fn visible_to_dependency(&self) -> bool {
+        self.flags
+            & (ELM_EBI_EXPORT_FLAG_PRIVATE
+                | ELM_EBI_EXPORT_FLAG_DEPENDENCY
+                | ELM_EBI_EXPORT_FLAG_SUBTREE)
+            == 0
+            || self.flags & ELM_EBI_EXPORT_FLAG_DEPENDENCY != 0
+    }
+
+    pub const fn visible_to_subtree(&self) -> bool {
+        self.flags & ELM_EBI_EXPORT_FLAG_SUBTREE != 0
     }
 }
 
@@ -688,6 +956,7 @@ impl ElmEbiDependencyDecl {
 pub struct ElmEbiExtensionPointDecl {
     pub point: String,
     pub contract: FlowContract,
+    pub mode: ElmMixinMode,
 }
 
 impl ElmEbiExtensionPointDecl {
@@ -701,7 +970,13 @@ impl ElmEbiExtensionPointDecl {
             point,
             contract: FlowContract::new(contract.into())
                 .map_err(|_| ElmEbiLoadStatus::InvalidManifest)?,
+            mode: ElmMixinMode::Chain,
         })
+    }
+
+    pub const fn with_mode(mut self, mode: ElmMixinMode) -> Self {
+        self.mode = mode;
+        self
     }
 }
 
@@ -710,6 +985,8 @@ pub struct ElmEbiExtensionDecl {
     pub target_name: String,
     pub point: String,
     pub contract: FlowContract,
+    pub handler_contract: FlowContract,
+    pub priority: i32,
 }
 
 impl ElmEbiExtensionDecl {
@@ -722,12 +999,29 @@ impl ElmEbiExtensionDecl {
         let point = point.into();
         validate_ebi_name(&target_name)?;
         validate_ebi_point(&point)?;
+        let contract =
+            FlowContract::new(contract.into()).map_err(|_| ElmEbiLoadStatus::InvalidManifest)?;
         Ok(Self {
             target_name,
             point,
-            contract: FlowContract::new(contract.into())
-                .map_err(|_| ElmEbiLoadStatus::InvalidManifest)?,
+            handler_contract: contract.clone(),
+            contract,
+            priority: 0,
         })
+    }
+
+    pub fn with_handler_contract(
+        mut self,
+        handler_contract: impl Into<String>,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        self.handler_contract = FlowContract::new(handler_contract.into())
+            .map_err(|_| ElmEbiLoadStatus::InvalidManifest)?;
+        Ok(self)
+    }
+
+    pub const fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
@@ -798,6 +1092,7 @@ pub struct ElmEbiUnit {
     pub imports: Vec<ElmEbiImportDecl>,
     pub exports: Vec<ElmEbiExportDecl>,
     pub lifecycle_hooks: Option<ElmEbiLifecycleHooks>,
+    pub api_compatibility: Option<ElmEbiApiCompatibility>,
 }
 
 impl ElmEbiUnit {
@@ -815,6 +1110,7 @@ impl ElmEbiUnit {
             imports: Vec::new(),
             exports: Vec::new(),
             lifecycle_hooks: None,
+            api_compatibility: None,
         }
     }
 
@@ -868,6 +1164,11 @@ impl ElmEbiUnit {
         self
     }
 
+    pub fn with_api_compatibility(mut self, compatibility: ElmEbiApiCompatibility) -> Self {
+        self.api_compatibility = Some(compatibility);
+        self
+    }
+
     pub fn validate(&self, expected_arch: ElmEbiArch) -> Result<(), ElmEbiLoadStatus> {
         if self.target.abi_version != ELM_EBI_ABI_VERSION {
             return Err(ElmEbiLoadStatus::UnsupportedAbi);
@@ -913,6 +1214,7 @@ impl ElmEbiUnit {
             validate_ebi_name(&extension.target_name)?;
             validate_ebi_point(&extension.point)?;
             validate_contract_len(&extension.contract)?;
+            validate_contract_len(&extension.handler_contract)?;
         }
         for provider in &self.provider_ports {
             if provider.flags != 0 {
@@ -927,18 +1229,33 @@ impl ElmEbiUnit {
             }
         }
         for import in &self.imports {
-            validate_symbol_decl(&import.name, &import.contract, import.flags)?;
+            validate_import_decl(import)?;
         }
         for export in &self.exports {
-            validate_symbol_decl(&export.name, &export.contract, export.flags)?;
+            validate_export_decl(export)?;
+        }
+        if let Some(compatibility) = &self.api_compatibility {
+            compatibility.validate()?;
+            let root_index = usize::try_from(compatibility.root_import_index)
+                .map_err(|_| ElmEbiLoadStatus::InvalidTarget)?;
+            let root = self
+                .imports
+                .get(root_index)
+                .ok_or(ElmEbiLoadStatus::InvalidTarget)?;
+            if root.name != ELM_API_ROOT_IMPORT_NAME
+                || root.contract.as_str() != ELM_API_ROOT_IMPORT_CONTRACT
+                || root.min_version != 1
+                || root.max_version != u32::MAX
+            {
+                return Err(ElmEbiLoadStatus::InvalidTarget);
+            }
         }
         validate_lifecycle_hooks(self.lifecycle_hooks.as_ref())?;
         Ok(())
     }
 
     pub fn has_native_code(&self) -> bool {
-        self.lifecycle_hooks.is_some()
-            || self.entry.is_some()
+        self.entry.is_some()
             || self
                 .segments
                 .iter()
@@ -952,6 +1269,8 @@ pub struct ElmEbiImage {
     pub payloads: Vec<ElmEbiSegmentPayload>,
     pub symbol_locations: Vec<ElmEbiSymbolLocationDecl>,
     pub relocations: Vec<ElmEbiRelocationDecl>,
+    pub abi_fingerprint: Option<ElmRustAbiFingerprintV1>,
+    pub proof: Option<ElmEbiProofV1>,
 }
 
 impl ElmEbiImage {
@@ -961,6 +1280,8 @@ impl ElmEbiImage {
             payloads: Vec::new(),
             symbol_locations: Vec::new(),
             relocations: Vec::new(),
+            abi_fingerprint: None,
+            proof: None,
         }
     }
 
@@ -976,6 +1297,16 @@ impl ElmEbiImage {
 
     pub fn with_relocation(mut self, relocation: ElmEbiRelocationDecl) -> Self {
         self.relocations.push(relocation);
+        self
+    }
+
+    pub fn with_abi_fingerprint(mut self, fingerprint: ElmRustAbiFingerprintV1) -> Self {
+        self.abi_fingerprint = Some(fingerprint);
+        self
+    }
+
+    pub fn with_proof(mut self, proof: ElmEbiProofV1) -> Self {
+        self.proof = Some(proof);
         self
     }
 
@@ -1017,9 +1348,7 @@ impl ElmEbiImage {
                 return Err(ElmEbiLoadStatus::InvalidManifest);
             }
         }
-        if self.has_code_segment()
-            && let Some(hooks) = &self.unit.lifecycle_hooks
-        {
+        if let (true, Some(hooks)) = (self.has_code_segment(), &self.unit.lifecycle_hooks) {
             let init = self.symbol_location(&hooks.initialize.symbol);
             let fini = self.symbol_location(&hooks.finalize.symbol);
             if !matches!(init, Some(symbol) if self.symbol_is_code(symbol))
@@ -1028,11 +1357,11 @@ impl ElmEbiImage {
                 return Err(ElmEbiLoadStatus::InvalidManifest);
             }
         }
-        if self.has_code_segment()
-            && let Some(entry) = &self.unit.entry
-            && !matches!(self.symbol_location(&entry.symbol), Some(symbol) if self.symbol_is_code(symbol))
-        {
-            return Err(ElmEbiLoadStatus::InvalidManifest);
+        if let (true, Some(entry)) = (self.has_code_segment(), &self.unit.entry) {
+            if !matches!(self.symbol_location(&entry.symbol), Some(symbol) if self.symbol_is_code(symbol))
+            {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
         }
         for relocation in &self.relocations {
             if relocation.flags != ELM_EBI_RELOCATION_FLAG_NONE {
@@ -1087,6 +1416,80 @@ impl ElmEbiImage {
                         return Err(ElmEbiLoadStatus::InvalidSegment);
                     }
                 }
+            }
+        }
+        for (import_index, import) in self.unit.imports.iter().enumerate() {
+            if !import.is_managed() {
+                continue;
+            }
+            let mut relocation_count = 0usize;
+            for relocation in self.relocations.iter().filter(|relocation| {
+                relocation.value_index == import_index as u32
+                    && matches!(
+                        relocation.kind,
+                        ElmEbiRelocationKind::ImportAbs64
+                            | ElmEbiRelocationKind::ImportRel32
+                            | ElmEbiRelocationKind::ImportRel64
+                    )
+            }) {
+                relocation_count += 1;
+                if relocation.kind != ElmEbiRelocationKind::ImportAbs64
+                    || relocation.target_offset & 7 != 0
+                    || !self
+                        .unit
+                        .segments
+                        .get(relocation.target_segment_index as usize)
+                        .is_some_and(|segment| {
+                            matches!(
+                                segment.kind,
+                                ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
+                            )
+                        })
+                {
+                    return Err(ElmEbiLoadStatus::InvalidTarget);
+                }
+            }
+            if relocation_count == 0 {
+                return Err(ElmEbiLoadStatus::InvalidTarget);
+            }
+        }
+        if let Some(compatibility) = &self.unit.api_compatibility {
+            let root_relocations: Vec<_> = self
+                .relocations
+                .iter()
+                .filter(|relocation| {
+                    relocation.value_index == compatibility.root_import_index
+                        && matches!(
+                            relocation.kind,
+                            ElmEbiRelocationKind::ImportAbs64
+                                | ElmEbiRelocationKind::ImportRel32
+                                | ElmEbiRelocationKind::ImportRel64
+                        )
+                })
+                .collect();
+            if root_relocations.len() != 1
+                || root_relocations[0].kind != ElmEbiRelocationKind::ImportAbs64
+                || !self
+                    .unit
+                    .segments
+                    .get(root_relocations[0].target_segment_index as usize)
+                    .is_some_and(|segment| {
+                        matches!(
+                            segment.kind,
+                            ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
+                        )
+                    })
+            {
+                return Err(ElmEbiLoadStatus::InvalidTarget);
+            }
+        }
+        if let Some(fingerprint) = &self.abi_fingerprint {
+            fingerprint.validate()?;
+        }
+        if let Some(proof) = &self.proof {
+            proof.validate_shape()?;
+            if proof.subject_digest != canonical_ebi_digest(self) {
+                return Err(ElmEbiLoadStatus::RuntimeRejected);
             }
         }
         Ok(())
@@ -1251,14 +1654,33 @@ fn validate_segment(segment: &ElmEbiSegment) -> Result<(), ElmEbiLoadStatus> {
     Ok(())
 }
 
-fn validate_symbol_decl(
-    name: &str,
-    contract: &FlowContract,
-    flags: u32,
-) -> Result<(), ElmEbiLoadStatus> {
-    validate_symbol_name(name)?;
-    validate_contract_len(contract)?;
-    if flags != ELM_EBI_SYMBOL_FLAG_NONE {
+fn validate_import_decl(import: &ElmEbiImportDecl) -> Result<(), ElmEbiLoadStatus> {
+    validate_symbol_name(&import.name)?;
+    validate_contract_len(&import.contract)?;
+    if import.min_version == 0
+        || import.max_version < import.min_version
+        || import.flags & !ELM_EBI_IMPORT_FLAGS_MASK != 0
+        || import.flags & ELM_EBI_IMPORT_FLAG_MANAGED != 0
+            && import.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0
+    {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    Ok(())
+}
+
+fn validate_export_decl(export: &ElmEbiExportDecl) -> Result<(), ElmEbiLoadStatus> {
+    validate_symbol_name(&export.name)?;
+    validate_contract_len(&export.contract)?;
+    let visibility = export.flags
+        & (ELM_EBI_EXPORT_FLAG_PRIVATE
+            | ELM_EBI_EXPORT_FLAG_DEPENDENCY
+            | ELM_EBI_EXPORT_FLAG_SUBTREE);
+    if export.version == 0
+        || export.flags & !ELM_EBI_EXPORT_FLAGS_MASK != 0
+        || export.flags & ELM_EBI_EXPORT_FLAG_MANAGED != 0
+            && export.flags & ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
+        || visibility.count_ones() > 1
+    {
         return Err(ElmEbiLoadStatus::InvalidManifest);
     }
     Ok(())
