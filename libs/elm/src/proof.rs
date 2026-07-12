@@ -2,6 +2,14 @@
 //!
 //! 这里保持 `no_std`，避免把内核装载路径绑定到用户态工具链。内容摘要和签名
 //! 都属于 EBI 协议，不绑定 EKI 或其他容器。
+//!
+//! 规范摘要覆盖 EBI 语义、镜像内容和来源 identifier，并使用 SHA-256；可选 Ed25519 proof
+//! 把摘要绑定到 trust anchor、release epoch 和来源。trust store 负责 signer 查找、撤销、
+//! 最低 epoch、防回滚、容量和持久化策略。
+//!
+//! [`ElmRustAbiFingerprintV1`] 单独绑定 target arch、pointer width、endian、rustc commit、
+//! panic strategy、code model、target features 和 kernel API manifest hash。签名有效但 ABI
+//! 指纹不兼容的镜像仍必须拒绝执行。
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -10,27 +18,39 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::ebi::{ElmEbiImage, ElmEbiLoadStatus, ElmEbiRelocationKind, ElmEbiSegmentKind};
 
+/// `ELM_PROOF_SHA256_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_PROOF_SHA256_LEN: usize = 32;
+/// `ELM_PROOF_ED25519_PUBLIC_KEY_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_PROOF_ED25519_PUBLIC_KEY_LEN: usize = 32;
+/// `ELM_PROOF_ED25519_SIGNATURE_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_PROOF_ED25519_SIGNATURE_LEN: usize = 64;
+/// `ELM_PROOF_SOURCE_IDENTIFIER_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_PROOF_SOURCE_IDENTIFIER_LEN: usize = 128;
+/// `ELM_PROOF_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_PROOF_ABI_VERSION: u16 = 1;
+/// `ELM_RUST_ABI_FINGERPRINT_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_RUST_ABI_FINGERPRINT_VERSION: u16 = 1;
 
 const ELM_EBI_CANONICAL_DOMAIN: &[u8] = b"ELM-EBI-CANONICAL-V1\0";
 const ELM_EBI_SIGNATURE_DOMAIN: &[u8] = b"ELM-EBI-SIGNATURE-V1\0";
 
+/// `ELM_RUST_ABI_TARGET_FEATURE_FLOAT` 能力位；协商成功前调用方不得假定对应功能可用。
 pub const ELM_RUST_ABI_TARGET_FEATURE_FLOAT: u64 = 1 << 0;
+/// `ELM_RUST_ABI_TARGET_FEATURE_VECTOR` 能力位；协商成功前调用方不得假定对应功能可用。
 pub const ELM_RUST_ABI_TARGET_FEATURE_VECTOR: u64 = 1 << 1;
+/// `ELM_RUST_ABI_TARGET_FEATURE_SIMD` 能力位；协商成功前调用方不得假定对应功能可用。
 pub const ELM_RUST_ABI_TARGET_FEATURE_SIMD: u64 = 1 << 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+/// `ElmPanicStrategy` 列举该协议位置允许出现的全部稳定类别；未知数值不得直接转为此枚举。
 pub enum ElmPanicStrategy {
+    /// `AbortThroughRuntime` 表示 `ElmPanicStrategy` 的执行策略：`abort through runtime`。
     AbortThroughRuntime = 1,
 }
 
 impl ElmPanicStrategy {
+    /// 校验并把原始协议数值转换为强类型表示；未知值返回空值或错误。
     pub const fn from_raw(raw: u8) -> Option<Self> {
         match raw {
             1 => Some(Self::AbortThroughRuntime),
@@ -40,18 +60,28 @@ impl ElmPanicStrategy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 绑定 Rust 工具链、目标、布局、panic 策略和内核 API manifest 的 ABI 指纹。
 pub struct ElmRustAbiFingerprintV1 {
+    /// `rustc_commit_hash` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
     pub rustc_commit_hash: [u8; ELM_PROOF_SHA256_LEN],
+    /// `target_spec_hash` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
     pub target_spec_hash: [u8; ELM_PROOF_SHA256_LEN],
+    /// `kernel_api_hash` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
     pub kernel_api_hash: [u8; ELM_PROOF_SHA256_LEN],
+    /// `elmapi_version` 是该对象、ABI 或契约的版本值，用于装载和协商兼容性。
     pub elmapi_version: u16,
+    /// 镜像声明的 panic 处理策略，必须与运行时 ABI 要求匹配。
     pub panic_strategy: ElmPanicStrategy,
+    /// 编译镜像采用的目标代码模型。
     pub code_model: u8,
+    /// 参与 Rust ABI 指纹的目标 CPU 特性位。
     pub target_features: u64,
+    /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
 }
 
 impl ElmRustAbiFingerprintV1 {
+    /// 构造一个字段满足当前 ABI 基本不变量的新值。
     pub const fn new(
         rustc_commit_hash: [u8; ELM_PROOF_SHA256_LEN],
         target_spec_hash: [u8; ELM_PROOF_SHA256_LEN],
@@ -73,6 +103,7 @@ impl ElmRustAbiFingerprintV1 {
         }
     }
 
+    /// 验证当前对象及其关联记录满足全部结构、范围和关系不变量。
     pub fn validate(&self) -> Result<(), ElmEbiLoadStatus> {
         if self.elmapi_version == 0
             || self.code_model == 0
@@ -99,18 +130,28 @@ impl ElmRustAbiFingerprintV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// EBI 规范摘要、签名算法、signer、release epoch 和来源 identifier 的证明记录。
 pub struct ElmEbiProofV1 {
+    /// `source_identifier` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
     pub source_identifier: String,
+    /// `source_digest` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
     pub source_digest: [u8; ELM_PROOF_SHA256_LEN],
+    /// `subject_digest` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
     pub subject_digest: [u8; ELM_PROOF_SHA256_LEN],
+    /// `signer_key_id` 所指对象的稳定运行时标识符。
     pub signer_key_id: [u8; ELM_PROOF_SHA256_LEN],
+    /// `signer_public_key` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
     pub signer_public_key: [u8; ELM_PROOF_ED25519_PUBLIC_KEY_LEN],
+    /// `release_epoch` 是单调发布或策略纪元，用于拒绝回滚和陈旧更新。
     pub release_epoch: u64,
+    /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
+    /// 覆盖规范 EBI 摘要的签名字节。
     pub signature: [u8; ELM_PROOF_ED25519_SIGNATURE_LEN],
 }
 
 impl ElmEbiProofV1 {
+    /// 执行 `unsigned_message` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn unsigned_message(&self, fingerprint: &ElmRustAbiFingerprintV1) -> [u8; 32] {
         let mut hash = CanonicalHash::new(ELM_EBI_SIGNATURE_DOMAIN);
         hash.string(&self.source_identifier);
@@ -124,6 +165,7 @@ impl ElmEbiProofV1 {
         hash.finish()
     }
 
+    /// 验证当前对象及其关联记录满足全部结构、范围和关系不变量。
     pub fn validate_shape(&self) -> Result<(), ElmEbiLoadStatus> {
         if self.source_identifier.is_empty()
             || self.source_identifier.len() > ELM_PROOF_SOURCE_IDENTIFIER_LEN
@@ -144,14 +186,20 @@ impl ElmEbiProofV1 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// trust store 中一个 signer 的公钥、撤销状态和最低允许 release epoch。
 pub struct ElmTrustAnchor {
+    /// 对象或命名空间的规范 identifier；匹配必须比较完整字节串。
     pub identifier: String,
+    /// `rollback_authority_identifier` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
     pub rollback_authority_identifier: String,
+    /// 签名验证使用的 Ed25519 公钥字节。
     pub public_key: [u8; ELM_PROOF_ED25519_PUBLIC_KEY_LEN],
+    /// `key_id` 所指对象的稳定运行时标识符。
     pub key_id: [u8; ELM_PROOF_SHA256_LEN],
 }
 
 impl ElmTrustAnchor {
+    /// 构造一个字段满足当前 ABI 基本不变量的新值。
     pub fn new(
         identifier: impl Into<String>,
         public_key: [u8; ELM_PROOF_ED25519_PUBLIC_KEY_LEN],
@@ -160,6 +208,7 @@ impl ElmTrustAnchor {
         Self::new_with_rollback_authority(identifier.clone(), identifier, public_key)
     }
 
+    /// 执行 `new_with_rollback_authority` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn new_with_rollback_authority(
         identifier: impl Into<String>,
         rollback_authority_identifier: impl Into<String>,
@@ -181,28 +230,43 @@ impl ElmTrustAnchor {
         })
     }
 
+    /// 执行 `rollback_authority_id` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn rollback_authority_id(&self) -> [u8; ELM_PROOF_SHA256_LEN] {
         sha256(self.rollback_authority_identifier.as_bytes())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ElmTrustError` 列举该协议位置允许出现的全部稳定类别；未知数值不得直接转为此枚举。
 pub enum ElmTrustError {
+    /// `Sealed` 表示 `ElmTrustError` 的错误：`sealed`。
     Sealed,
+    /// `Duplicate` 表示 `ElmTrustError` 的错误：`duplicate`。
     Duplicate,
+    /// `Capacity` 表示 `ElmTrustError` 的错误：`capacity`。
     Capacity,
+    /// `ReservationMissing` 表示 `ElmTrustError` 的错误：`reservation missing`。
     ReservationMissing,
+    /// `InvalidAnchor` 表示 `ElmTrustError` 的错误：`invalid anchor`。
     InvalidAnchor,
+    /// `UnknownSigner` 表示 `ElmTrustError` 的错误：`unknown signer`。
     UnknownSigner,
+    /// `Revoked` 表示 `ElmTrustError` 的错误：`revoked`。
     Revoked,
+    /// `Rollback` 表示 `ElmTrustError` 的错误：`rollback`。
     Rollback,
+    /// `InvalidProof` 表示 `ElmTrustError` 的错误：`invalid proof`。
     InvalidProof,
+    /// `DigestMismatch` 表示 `ElmTrustError` 的错误：`digest mismatch`。
     DigestMismatch,
+    /// `SignatureMismatch` 表示 `ElmTrustError` 的错误：`signature mismatch`。
     SignatureMismatch,
+    /// `Persistence` 表示 `ElmTrustError` 的错误：`persistence`。
     Persistence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 镜像证明通过后返回的 signer 身份、epoch、摘要和策略接受结果。
 pub struct ElmTrustAcceptance {
     signer_key_id: [u8; ELM_PROOF_SHA256_LEN],
     rollback_authority_id: [u8; ELM_PROOF_SHA256_LEN],
@@ -211,22 +275,27 @@ pub struct ElmTrustAcceptance {
 }
 
 impl ElmTrustAcceptance {
+    /// 执行 `signer_key_id` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn signer_key_id(&self) -> [u8; ELM_PROOF_SHA256_LEN] {
         self.signer_key_id
     }
 
+    /// 执行 `rollback_authority_id` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn rollback_authority_id(&self) -> [u8; ELM_PROOF_SHA256_LEN] {
         self.rollback_authority_id
     }
 
+    /// 执行 `module_digest` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn module_digest(&self) -> [u8; ELM_PROOF_SHA256_LEN] {
         self.module_digest
     }
 
+    /// 执行 `release_epoch` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn release_epoch(&self) -> u64 {
         self.release_epoch
     }
 
+    /// 执行 `from_persisted` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn from_persisted(
         signer_key_id: [u8; ELM_PROOF_SHA256_LEN],
         rollback_authority_id: [u8; ELM_PROOF_SHA256_LEN],
@@ -250,6 +319,7 @@ impl ElmTrustAcceptance {
 }
 
 #[derive(Debug, Clone, Default)]
+/// 管理 trust anchor、撤销、防回滚 reservation 和持久化状态的信任库。
 pub struct ElmTrustStore {
     anchors: Vec<ElmTrustAnchor>,
     revoked: Vec<[u8; ELM_PROOF_SHA256_LEN]>,
@@ -259,6 +329,7 @@ pub struct ElmTrustStore {
 }
 
 impl ElmTrustStore {
+    /// 构造一个字段满足当前 ABI 基本不变量的新值。
     pub const fn new() -> Self {
         Self {
             anchors: Vec::new(),
@@ -269,6 +340,7 @@ impl ElmTrustStore {
         }
     }
 
+    /// 注册 `anchor`；成功前不会向其他单元公开该对象。
     pub fn register_anchor(&mut self, anchor: ElmTrustAnchor) -> Result<(), ElmTrustError> {
         if self.sealed {
             return Err(ElmTrustError::Sealed);
@@ -290,14 +362,17 @@ impl ElmTrustStore {
         Ok(())
     }
 
+    /// 执行 `seal` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn seal(&mut self) {
         self.sealed = true;
     }
 
+    /// 执行 `sealed` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn sealed(&self) -> bool {
         self.sealed
     }
 
+    /// 执行 `revoke` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn revoke(&mut self, key_id: [u8; ELM_PROOF_SHA256_LEN]) -> Result<(), ElmTrustError> {
         if !self.anchors.iter().any(|anchor| anchor.key_id == key_id) {
             return Err(ElmTrustError::UnknownSigner);
@@ -311,6 +386,7 @@ impl ElmTrustStore {
         Ok(())
     }
 
+    /// 执行 `verify` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn verify(
         &self,
         image: &ElmEbiImage,
@@ -360,6 +436,7 @@ impl ElmTrustStore {
         })
     }
 
+    /// 执行 `reserve_acceptance` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn reserve_acceptance(
         &mut self,
         acceptance: &ElmTrustAcceptance,
@@ -381,6 +458,7 @@ impl ElmTrustStore {
         Ok(true)
     }
 
+    /// 执行 `cancel_acceptance_reservation` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn cancel_acceptance_reservation(&mut self, reserved: bool) -> Result<(), ElmTrustError> {
         if !reserved {
             return Ok(());
@@ -392,6 +470,7 @@ impl ElmTrustStore {
         Ok(())
     }
 
+    /// 执行 `accept_reserved` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn accept_reserved(
         &mut self,
         acceptance: ElmTrustAcceptance,
@@ -422,23 +501,28 @@ impl ElmTrustStore {
         Ok(())
     }
 
+    /// 执行 `try_accept` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn try_accept(&mut self, acceptance: ElmTrustAcceptance) -> Result<(), ElmTrustError> {
         let reserved = self.reserve_acceptance(&acceptance)?;
         self.accept_reserved(acceptance, reserved)
     }
 
+    /// 执行 `anchors` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn anchors(&self) -> &[ElmTrustAnchor] {
         &self.anchors
     }
 
+    /// 执行 `revoked` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn revoked(&self) -> &[[u8; ELM_PROOF_SHA256_LEN]] {
         &self.revoked
     }
 
+    /// 执行 `accepted_epochs` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn accepted_epochs(&self) -> &[ElmTrustAcceptance] {
         &self.accepted_epochs
     }
 
+    /// 执行 `pending_acceptance_slots` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn pending_acceptance_slots(&self) -> usize {
         self.pending_acceptance_slots
     }
@@ -466,6 +550,7 @@ const SHA256_K: [u32; 64] = [
 ];
 
 #[derive(Clone)]
+/// 无堆增量 SHA-256 计算器，用于规范 EBI 摘要和内容完整性验证。
 pub struct Sha256 {
     state: [u32; 8],
     buffer: [u8; 64],
@@ -474,6 +559,7 @@ pub struct Sha256 {
 }
 
 impl Sha256 {
+    /// 构造一个字段满足当前 ABI 基本不变量的新值。
     pub const fn new() -> Self {
         Self {
             state: SHA256_INITIAL,
@@ -483,6 +569,7 @@ impl Sha256 {
         }
     }
 
+    /// 执行 `update` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn update(&mut self, mut input: &[u8]) {
         self.total_len = self.total_len.wrapping_add(input.len() as u64);
         if self.buffer_len != 0 {
@@ -509,6 +596,7 @@ impl Sha256 {
         }
     }
 
+    /// 执行 `finish` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn finish(mut self) -> [u8; ELM_PROOF_SHA256_LEN] {
         let bit_len = self.total_len.wrapping_mul(8);
         self.buffer[self.buffer_len] = 0x80;
@@ -540,12 +628,14 @@ impl Default for Sha256 {
     }
 }
 
+/// 执行 `sha256` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn sha256(input: &[u8]) -> [u8; ELM_PROOF_SHA256_LEN] {
     let mut state = Sha256::new();
     state.update(input);
     state.finish()
 }
 
+/// 执行 `sha256_with_zeroed_range` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn sha256_with_zeroed_range(
     bytes: &[u8],
     zero_offset: usize,
@@ -568,6 +658,7 @@ pub fn sha256_with_zeroed_range(
     Some(state.finish())
 }
 
+/// 执行 `sha256_with_zeroed_ranges` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn sha256_with_zeroed_ranges(
     bytes: &[u8],
     ranges: &[(usize, usize)],
@@ -638,6 +729,7 @@ impl CanonicalHash {
     }
 }
 
+/// 执行 `canonical_ebi_digest` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
     let mut hash = CanonicalHash::new(ELM_EBI_CANONICAL_DOMAIN);
     let unit = &image.unit;

@@ -2,6 +2,44 @@
 //!
 //! 本模块只在 `management` feature 下公开。调用方不能取得裸分发入口，所有管理命令
 //! 都必须经过这里的固定请求、固定回复或分页回复校验。
+//!
+//! # 权限边界
+//!
+//! [`Client::acquire`] 通过根 API 查询 `org.elm.management` 命名空间。内核只有在当前调用
+//! 来自 `Manager` kind、镜像证明可信、cell 处于可管理状态、generation 当前且策略显式授予
+//! management capability 时才返回函数表。取得 `Client` 不是永久授权：每次 dispatch 都会
+//! 在内核重新鉴权，因此热替换、暂停、策略收紧或信任撤销会立即影响后续调用。
+//!
+//! 普通 ELM 不应启用此 feature。事件注册、日志、受管 import 和 mixin 分发等普通运行时
+//! 能力位于 [`crate::runtime`] 或对应安全包装，不需要管理命名空间。
+//!
+//! # 回复校验
+//!
+//! `Client` 从不把裸 output 指针或管理函数表暴露给业务代码。固定回复必须精确等于目标类型
+//! 尺寸；分页回复必须同时满足 ABI 版本、记录尺寸、记录数量和总缓冲区长度；provider 快照
+//! 还会校验 header size、flags 和 payload length。任何保留字段、长度或状态不一致都返回
+//! [`Error::MalformedResponse`]。
+//!
+//! 对可变长查询，调用方提供工作缓冲区。容量不足时返回 [`Error::BufferTooSmall`]，其中携带
+//! 运行时报告的所需尺寸，调用方可以扩大缓冲区后重试。所有页对象借用该缓冲区，页或迭代器
+//! 存活期间不能再次把同一缓冲区交给其他管理调用。
+//!
+//! # 示例
+//!
+//! ```no_run
+//! use elm::management::{Client, Error};
+//!
+//! let manager = Client::acquire()?;
+//! let policy = manager.query_policy()?;
+//! let mut storage = [0_u8; 4096];
+//! let health = manager.query_health(&mut storage)?;
+//! for record in health.records() {
+//!     if record.status != elm::ELM_MGR_STATUS_OK {
+//!         // 根据 record.check 和 record.detail 输出诊断。
+//!     }
+//! }
+//! # Ok::<(), Error>(())
+//! ```
 
 use core::marker::PhantomData;
 
@@ -60,6 +98,14 @@ management_requests!(
 
 macro_rules! fixed_method {
     ($name:ident, $kind:ident, $request:ty, $response:ty) => {
+        #[doc = concat!("执行管理动作 `", stringify!($kind), "`，并返回固定布局回复。")]
+        #[doc = ""]
+        #[doc = concat!("请求类型为 `", stringify!($request), "`，回复类型为 `", stringify!($response), "`。")]
+        #[doc = "客户端会把请求按当前小端固定布局发送，验证通用回复头、管理状态和精确 payload 尺寸后才构造返回值。"]
+        #[doc = ""]
+        #[doc = "# 错误"]
+        #[doc = ""]
+        #[doc = "权限或策略拒绝、对象不存在、状态冲突等返回 `Error::Status`；固定回复超过内部 4096 字节容量时返回 `Error::BufferTooSmall`；任何布局不一致返回 `Error::MalformedResponse`。"]
         pub fn $name(&self, request: &$request) -> Result<$response, Error> {
             self.call_fixed(ElmMgrCallKind::$kind, wire_bytes(request))
         }
@@ -68,6 +114,10 @@ macro_rules! fixed_method {
 
 macro_rules! empty_fixed_method {
     ($name:ident, $kind:ident, $response:ty) => {
+        #[doc = concat!("执行无请求载荷的管理动作 `", stringify!($kind), "`。")]
+        #[doc = ""]
+        #[doc = concat!("成功时返回已经过状态、保留字段和尺寸校验的 `", stringify!($response), "`。")]
+        #[doc = "失败可能是重新鉴权拒绝、运行时业务状态错误、内部固定回复容量不足或畸形回复。"]
         pub fn $name(&self) -> Result<$response, Error> {
             self.call_fixed(ElmMgrCallKind::$kind, &[])
         }
@@ -76,6 +126,10 @@ macro_rules! empty_fixed_method {
 
 macro_rules! page_method {
     ($name:ident, $kind:ident, $alias:ident, $header:ty, $record:ty) => {
+        #[doc = concat!("查询管理快照 `", stringify!($kind), "`。")]
+        #[doc = ""]
+        #[doc = concat!("`output` 同时承载通用回复头、`", stringify!($header), "` 和零条或多条 `", stringify!($record), "`。成功后返回 `", stringify!($alias), "`，其生命周期受 `output` 约束。")]
+        #[doc = "客户端会验证 ABI 版本、单条记录尺寸、记录数量乘法溢出和总长度，不会接受截断页或尾随字节。缓冲区不足时错误携带所需尺寸，可扩大后重试。"]
         pub fn $name<'a>(&self, output: &'a mut [u8]) -> Result<$alias<'a>, Error> {
             let payload = self.call(ElmMgrCallKind::$kind, &[], output)?;
             RecordPage::<$header, $record>::parse(payload)
@@ -85,6 +139,10 @@ macro_rules! page_method {
 
 macro_rules! fixed_page_method {
     ($name:ident, $kind:ident, $request:ty, $alias:ident, $header:ty, $record:ty) => {
+        #[doc = concat!("使用 `", stringify!($request), "` 查询分页管理快照 `", stringify!($kind), "`。")]
+        #[doc = ""]
+        #[doc = concat!("回复由 `", stringify!($header), "` 和零条或多条 `", stringify!($record), "` 构成；返回的 `", stringify!($alias), "` 借用 `output`。")]
+        #[doc = "客户端会验证游标请求的固定布局、通用回复状态、记录尺寸、数量和总长度。容量不足时返回所需字节数，畸形分页数据不会部分暴露。"]
         pub fn $name<'a>(
             &self,
             request: &$request,
@@ -97,10 +155,19 @@ macro_rules! fixed_page_method {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 类型化管理客户端可观察的失败。
+///
+/// 此枚举保留运行时链接错误、输出容量问题、管理业务状态和协议破坏之间的区别。调用方只应
+/// 对明确可重试的 `BufferTooSmall` 或特定 `Status` 重试；`MalformedResponse` 表示当前内核
+/// 与框架存在 ABI 不一致或内核回复已损坏。
 pub enum Error {
+    /// 查询管理命名空间或访问根 API 时发生的错误。
     Runtime(RuntimeApiError),
+    /// 调用方输出或拼接输入缓冲区不足，携带所需最小字节数。
     BufferTooSmall(usize),
+    /// ELM API 或 elm-mgr 返回非成功状态码。
     Status(i32),
+    /// 回复的版本、尺寸、保留字段、标志、数量或载荷边界违反 v1 协议。
     MalformedResponse,
 }
 
@@ -111,11 +178,26 @@ impl From<RuntimeApiError> for Error {
 }
 
 #[derive(Clone, Copy)]
+/// 受授权 Manager ELM 使用的类型化管理客户端。
+///
+/// `Client` 只保存由根 API 发布、与内核同寿命的只读 dispatch 表引用。它可以按值复制，
+/// 但复制不会冻结权限或 generation；内核仍会在每次调用时根据当前上下文重新鉴权。
+///
+/// 该类型不能从裸地址公开构造，唯一入口是 [`Client::acquire`]。
 pub struct Client {
     table: &'static ElmManagementApiV1,
 }
 
 impl Client {
+    /// 为当前 Manager ELM 取得 v1 管理命名空间。
+    ///
+    /// 方法要求根表支持命名空间查询，并只请求 [`ELM_API_VERSION_V1`]。返回前会验证命名空间
+    /// 结构尺寸、选择版本、表地址、表尺寸、generation、保留字段以及 management capability。
+    ///
+    /// # 错误
+    ///
+    /// 当前单元不是获授权 Manager、镜像不可信、根表不可用或命名空间不存在时返回相应
+    /// `Runtime`/`Status` 错误；任何表布局不一致返回 [`Error::MalformedResponse`]。
     pub fn acquire() -> Result<Self, Error> {
         let namespace = crate::developer::runtime_api::query_namespace(
             ELM_API_MANAGEMENT_IDENTIFIER,
@@ -493,6 +575,19 @@ impl Client {
         ElmImageSessionInfoV1
     );
 
+    /// 从任意实现 EBI projection source 协议的数据源装载一个 ELM cell。
+    ///
+    /// `request` 描述 source kind、来源标志和尾随 payload 长度，`source_payload` 是该来源的
+    /// 不透明请求数据；例如 image-session 引用并不等价于把镜像字节直接塞入请求。方法先验证
+    /// 两处长度一致，再把固定头和尾随数据拼入 `input` 后提交 `LoadCell`。
+    ///
+    /// 装载仍会经过来源解析、证明链、ABI 指纹、依赖、策略、资源预算、原生镜像执行和
+    /// `on_initialize` 事务。返回成功只表示整个事务已经提交。
+    ///
+    /// # 缓冲区
+    ///
+    /// `input` 至少需要 `size_of::<ElmEbiSourceRequest>() + source_payload.len()` 字节；不足时
+    /// 返回包含所需尺寸的 [`Error::BufferTooSmall`]。
     pub fn load_cell(
         &self,
         request: &ElmEbiSourceRequest,
@@ -506,6 +601,14 @@ impl Client {
         self.call_fixed(ElmMgrCallKind::LoadCell, input)
     }
 
+    /// 使用新的 EBI projection source 对现有 cell 执行强一致热替换。
+    ///
+    /// `request` 指定目标 cell、预期 generation、来源信息和迁移约束，`source_payload` 是来源
+    /// 私有数据。客户端只负责安全拼接和协议校验；内核会执行影子装载、兼容性选择、调用排空、
+    /// 状态迁移、generation 切换、import rebind、旧代终结和失败回滚。
+    ///
+    /// 请求中的 `source_payload_len` 必须与切片长度精确一致。`input` 容量不足时不会提交任何
+    /// 替换步骤；运行时返回失败时应结合 replace trace 和 response 中的 rollback 状态诊断。
     pub fn replace_cell(
         &self,
         request: &ElmReplaceCellRequestV1,
@@ -519,6 +622,12 @@ impl Client {
         self.call_fixed(ElmMgrCallKind::ReplaceCell, input)
     }
 
+    /// 查询一个 provider 或 binding 暴露的契约特定快照。
+    ///
+    /// 回复载荷不是 elm-mgr 统一记录数组，而是 provider 自己定义的字节协议，因此返回
+    /// [`ProviderSnapshot`]：通用 provider snapshot header 已验证，内部 payload 仍须由调用方
+    /// 按 provider 契约解析。分页请求和下一游标由 `ElmProviderSnapshotRequest` 与回复 flags
+    /// 表达。
     pub fn query_provider_snapshot<'a>(
         &self,
         request: &ElmProviderSnapshotRequest,
@@ -532,6 +641,11 @@ impl Client {
         ProviderSnapshot::parse(payload)
     }
 
+    /// 查询全部补缀点和已附着 extension 的统一快照。
+    ///
+    /// header 分别给出 point 与 edge 数量，随后两类对象都编码为
+    /// [`ElmExtensionSnapshotRecord`]。客户端使用 checked addition 合并数量，再验证记录区长度，
+    /// 因而不会接受计数溢出、缺失记录或尾随字节。
     pub fn query_extensions<'a>(&self, output: &'a mut [u8]) -> Result<ExtensionPage<'a>, Error> {
         let payload = self.call(ElmMgrCallKind::QueryExtensions, &[], output)?;
         if payload.len() < core::mem::size_of::<ElmExtensionSnapshotHeader>() {
@@ -545,6 +659,11 @@ impl Client {
         RecordPage::parse_with_count(payload, count)
     }
 
+    /// 向尚未封口的 image session 写入一段镜像字节。
+    ///
+    /// `request` 指定 session、偏移和 chunk 长度，`chunk` 是实际数据。方法要求两处长度完全
+    /// 一致，并使用 `input` 拼接固定头和数据。运行时负责所有者、generation、session 状态、
+    /// 区间重叠、总长度、TTL 和资源配额检查；写入成功不等于镜像已验证，仍需 seal。
     pub fn write_image_session(
         &self,
         request: &ElmImageSessionWriteRequestV1,
@@ -608,6 +727,11 @@ impl Client {
     }
 }
 
+/// 已完成边界校验的管理记录页。
+///
+/// `H` 是按值复制的页头，`R` 是每条固定记录的类型。记录字节继续借用调用方 output 缓冲区，
+/// 并通过 [`RecordIter`] 使用非对齐读取按值产生记录，避免把任意 `u8` 缓冲区错误转换为对齐
+/// slice。`RecordPage` 只能由 [`Client`] 的查询方法构造。
 pub struct RecordPage<'a, H: Copy, R: Copy> {
     header: H,
     records: &'a [u8],
@@ -647,10 +771,12 @@ impl<'a, H: Copy, R: Copy> RecordPage<'a, H, R> {
         })
     }
 
+    /// 按值返回经过 ABI 版本和记录尺寸校验的页头。
     pub const fn header(&self) -> H {
         self.header
     }
 
+    /// 返回按值遍历全部记录的精确长度迭代器。
     pub fn records(&self) -> RecordIter<'_, R> {
         RecordIter {
             bytes: self.records,
@@ -660,15 +786,21 @@ impl<'a, H: Copy, R: Copy> RecordPage<'a, H, R> {
         }
     }
 
+    /// 返回页中的记录数量。
     pub const fn len(&self) -> usize {
         self.count
     }
 
+    /// 判断页中是否没有记录。
     pub const fn is_empty(&self) -> bool {
         self.count == 0
     }
 }
 
+/// [`RecordPage`] 的按值记录迭代器。
+///
+/// 迭代器不会返回对 output 缓冲区的潜在未对齐引用。它实现 `ExactSizeIterator`，每次
+/// `next` 都在已经验证的记录区内执行一次 `read_unaligned`。
 pub struct RecordIter<'a, R: Copy> {
     bytes: &'a [u8],
     index: usize,
@@ -697,6 +829,10 @@ impl<R: Copy> Iterator for RecordIter<'_, R> {
 
 impl<R: Copy> ExactSizeIterator for RecordIter<'_, R> {}
 
+/// 已验证通用头部、但保留契约私有 payload 的 provider 快照。
+///
+/// 该视图借用调用方 output 缓冲区。header 中的状态、flags、header size 和 payload length
+/// 已经验证；`payload` 的内部结构由被查询 provider 的契约定义，elm-mgr 不替它解释。
 pub struct ProviderSnapshot<'a> {
     header: ElmProviderSnapshotHeader,
     payload: &'a [u8],
@@ -725,36 +861,55 @@ impl<'a> ProviderSnapshot<'a> {
         })
     }
 
+    /// 返回已经过通用 snapshot 规则校验的头部。
     pub const fn header(&self) -> ElmProviderSnapshotHeader {
         self.header
     }
 
+    /// 返回 provider 写入的契约私有有效载荷。
     pub const fn payload(&self) -> &'a [u8] {
         self.payload
     }
 }
 
+/// elm-mgr 模组菜单项快照页。
 pub type MenuPage<'a> = RecordPage<'a, ElmMenuSnapshotHeader, ElmMenuItemSnapshot>;
+/// cell 父子、依赖、binding 和 extension 关系拓扑页。
 pub type TopologyPage<'a> = RecordPage<'a, ElmMgrTopologyHeader, ElmMgrRelationRecord>;
+/// 管理授权与操作审计记录页。
 pub type AuditPage<'a> = RecordPage<'a, ElmMgrAuditHeader, ElmMgrAuditRecord>;
+/// 当前 Nexus 能力绑定快照页。
 pub type NexusBindingPage<'a> =
     RecordPage<'a, ElmNexusBindingSnapshotHeader, ElmNexusBindingRecord>;
+/// elm-mgr 内建运行时端口统计页。
 pub type RuntimePortPage<'a> = RecordPage<'a, ElmRuntimePortStatsHeader, ElmRuntimePortStatsRecord>;
+/// 已注册 provider 端口清单页。
 pub type ProviderPortPage<'a> = RecordPage<'a, ElmProviderPortStatsHeader, ElmProviderPortRecord>;
+/// provider 端口调用与故障统计页。
 pub type ProviderStatsPage<'a> =
     RecordPage<'a, ElmProviderPortStatsHeader, ElmProviderPortStatsRecord>;
+/// ELM 运行时各不变量检查结果页。
 pub type HealthPage<'a> = RecordPage<'a, ElmCoreHealthHeader, ElmCoreHealthRecord>;
+/// provider 异步队列容量、积压和过期统计页。
 pub type ProviderQueuePage<'a> =
     RecordPage<'a, ElmProviderQueueStatsHeader, ElmProviderQueueStatsRecord>;
+/// elm-mgr 已公开管理 API 描述符注册表页。
 pub type ApiRegistryPage<'a> = RecordPage<'a, ElmMgrApiRegistryHeader, ElmMgrApiDescriptor>;
+/// 当前事件订阅及其游标状态页。
 pub type EventSubscriptionPage<'a> =
     RecordPage<'a, ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord>;
+/// 某个订阅读取返回的事件记录页。
 pub type SubscribedEventPage<'a> = RecordPage<'a, ElmMgrSubscribedEventReadHeader, ElmEventRecord>;
+/// 当前原生 import/export 能力及授权信息页。
 pub type NativeCapabilityPage<'a> =
     RecordPage<'a, ElmNativeCapabilityHeader, ElmNativeCapabilityRecord>;
+/// 明确未实现且会阻断功能的运行时 TODO 注册表页。
 pub type TodoRegistryPage<'a> = RecordPage<'a, ElmTodoRegistryHeader, ElmTodoRegistryRecord>;
+/// 补缀点和 extension edge 的合并快照页。
 pub type ExtensionPage<'a> = RecordPage<'a, ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord>;
+/// 原生故障、恢复出口和调用现场摘要页。
 pub type FaultDumpPage<'a> = RecordPage<'a, ElmFaultDumpHeader, ElmFaultDumpRecord>;
+/// 生命周期、provider、mixin、替换、策略、资源或 journal 结构化追踪页。
 pub type TracePage<'a> = RecordPage<'a, ElmRuntimeTraceHeader, ElmRuntimeTraceRecord>;
 
 fn join_request<'a, T: ManagementRequest>(

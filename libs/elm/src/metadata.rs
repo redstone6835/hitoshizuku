@@ -2,52 +2,95 @@
 //!
 //! attribute 宏把规范记录写入非装载段 `.elm.meta`，宿主工具只解析本协议，
 //! 不依赖 Rust 符号修饰规则，也不从函数名猜测 EBI 拓扑。
+//!
+//! 每条 `ELMMETA1` 记录具有固定头、记录 kind、已排序字段、payload CRC32 和八字节零填充。
+//! parser 拒绝重复/乱序字段、未知 value kind、非零 padding、非法 UTF-8、越界长度和错误
+//! checksum。`.elm.meta` 不属于运行时映射，打包器读取后将其规范化为 EBI 声明。
+//!
+//! 该协议是 Rust attribute 与 `elm-tools` 之间的构建协议，不是模块运行时 API，也不能被
+//! 模块用来在装载后修改自身拓扑。
 
 use alloc::vec::Vec;
 use core::str;
 
+/// `ELM_RUST_METADATA_MAGIC` 的固定魔数；解析器必须先校验该值，再解释后续布局。
 pub const ELM_RUST_METADATA_MAGIC: [u8; 8] = *b"ELMMETA1";
+/// `ELM_RUST_METADATA_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_RUST_METADATA_VERSION: u16 = 1;
+/// `ELM_RUST_METADATA_HEADER_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_RUST_METADATA_HEADER_SIZE: usize = 32;
+/// `ELM_RUST_METADATA_FIELD_HEADER_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_RUST_METADATA_FIELD_HEADER_SIZE: usize = 8;
+/// `ELM_RUST_METADATA_ALIGNMENT` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_RUST_METADATA_ALIGNMENT: usize = 8;
+/// `ELM_RUST_METADATA_MAX_RECORD_SIZE` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_RUST_METADATA_MAX_RECORD_SIZE: usize = 64 * 1024;
 
+/// `.elm.meta` 字段表中标识 `symbol` 属性的稳定 tag。
 pub const ELM_META_FIELD_SYMBOL: u16 = 1;
+/// `.elm.meta` 字段表中标识 `hook_kind` 属性的稳定 tag。
 pub const ELM_META_FIELD_HOOK_KIND: u16 = 2;
+/// `ELM_META_FIELD_NAME` 的规范 identifier 或契约名称；比较时使用完整字节串而不是截断哈希。
 pub const ELM_META_FIELD_NAME: u16 = 3;
+/// `ELM_META_FIELD_CONTRACT` 的规范 identifier 或契约名称；比较时使用完整字节串而不是截断哈希。
 pub const ELM_META_FIELD_CONTRACT: u16 = 4;
+/// `ELM_META_FIELD_MIN_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_META_FIELD_MIN_VERSION: u16 = 5;
+/// `ELM_META_FIELD_MAX_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_META_FIELD_MAX_VERSION: u16 = 6;
+/// `ELM_META_FIELD_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_META_FIELD_VERSION: u16 = 7;
+/// `.elm.meta` 字段表中标识 `flags` 属性的稳定 tag。
 pub const ELM_META_FIELD_FLAGS: u16 = 8;
+/// `.elm.meta` 字段表中标识 `access` 属性的稳定 tag。
 pub const ELM_META_FIELD_ACCESS: u16 = 9;
+/// `.elm.meta` 字段表中标识 `direction` 属性的稳定 tag。
 pub const ELM_META_FIELD_DIRECTION: u16 = 10;
+/// `.elm.meta` 字段表中标识 `mode` 属性的稳定 tag。
 pub const ELM_META_FIELD_MODE: u16 = 11;
+/// `.elm.meta` 字段表中标识 `target` 属性的稳定 tag。
 pub const ELM_META_FIELD_TARGET: u16 = 12;
+/// `.elm.meta` 字段表中标识 `point` 属性的稳定 tag。
 pub const ELM_META_FIELD_POINT: u16 = 13;
+/// `.elm.meta` 字段表中标识 `stage` 属性的稳定 tag。
 pub const ELM_META_FIELD_STAGE: u16 = 14;
+/// `.elm.meta` 字段表中标识 `priority` 属性的稳定 tag。
 pub const ELM_META_FIELD_PRIORITY: u16 = 15;
+/// `ELM_META_FIELD_HANDLER_CONTRACT` 的规范 identifier 或契约名称；比较时使用完整字节串而不是截断哈希。
 pub const ELM_META_FIELD_HANDLER_CONTRACT: u16 = 16;
+/// `ELM_META_FIELD_PAYLOAD_CONTRACT` 的规范 identifier 或契约名称；比较时使用完整字节串而不是截断哈希。
 pub const ELM_META_FIELD_PAYLOAD_CONTRACT: u16 = 17;
+/// `ELM_META_FIELD_WIRE_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_META_FIELD_WIRE_SIZE: u16 = 18;
+/// `.elm.meta` 字段表中标识 `stages` 属性的稳定 tag。
 pub const ELM_META_FIELD_STAGES: u16 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+/// `ElmRustMetadataKind` 列举该协议位置允许出现的全部稳定类别；未知数值不得直接转为此枚举。
 pub enum ElmRustMetadataKind {
+    /// `Lifecycle` 表示 `ElmRustMetadataKind` 的对象类别：`lifecycle`。
     Lifecycle = 1,
+    /// `Entry` 表示 `ElmRustMetadataKind` 的对象类别：`entry`。
     Entry = 2,
+    /// `Provider` 表示 `ElmRustMetadataKind` 的对象类别：`provider`。
     Provider = 3,
+    /// `ProviderSnapshot` 表示 `ElmRustMetadataKind` 的对象类别：`provider snapshot`。
     ProviderSnapshot = 4,
+    /// `Export` 表示 `ElmRustMetadataKind` 的对象类别：`export`。
     Export = 5,
+    /// `Import` 表示 `ElmRustMetadataKind` 的对象类别：`import`。
     Import = 6,
+    /// `ExtensionPoint` 表示 `ElmRustMetadataKind` 的对象类别：`extension point`。
     ExtensionPoint = 7,
+    /// `Extension` 表示 `ElmRustMetadataKind` 的对象类别：`extension`。
     Extension = 8,
+    /// `Payload` 表示 `ElmRustMetadataKind` 的对象类别：`payload`。
     Payload = 9,
 }
 
 impl ElmRustMetadataKind {
+    /// 校验并把原始协议数值转换为强类型表示；未知值返回空值或错误。
     pub const fn from_raw(raw: u16) -> Option<Self> {
         match raw {
             1 => Some(Self::Lifecycle),
@@ -66,15 +109,22 @@ impl ElmRustMetadataKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
+/// `ElmRustMetadataValueKind` 列举该协议位置允许出现的全部稳定类别；未知数值不得直接转为此枚举。
 pub enum ElmRustMetadataValueKind {
+    /// `Utf8` 表示 `ElmRustMetadataValueKind` 的对象类别：`utf8`。
     Utf8 = 1,
+    /// `U32` 表示 `ElmRustMetadataValueKind` 的对象类别：`u32`。
     U32 = 2,
+    /// `I32` 表示 `ElmRustMetadataValueKind` 的对象类别：`i32`。
     I32 = 3,
+    /// `U64` 表示 `ElmRustMetadataValueKind` 的对象类别：`u64`。
     U64 = 4,
+    /// `Bool` 表示 `ElmRustMetadataValueKind` 的对象类别：`bool`。
     Bool = 5,
 }
 
 impl ElmRustMetadataValueKind {
+    /// 校验并把原始协议数值转换为强类型表示；未知值返回空值或错误。
     pub const fn from_raw(raw: u16) -> Option<Self> {
         match raw {
             1 => Some(Self::Utf8),
@@ -88,28 +138,45 @@ impl ElmRustMetadataValueKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ElmRustMetadataError` 列举该协议位置允许出现的全部稳定类别；未知数值不得直接转为此枚举。
 pub enum ElmRustMetadataError {
+    /// `Truncated` 表示 `ElmRustMetadataError` 的错误：`truncated`。
     Truncated,
+    /// `InvalidMagic` 表示 `ElmRustMetadataError` 的错误：`invalid magic`。
     InvalidMagic,
+    /// `UnsupportedVersion` 表示 `ElmRustMetadataError` 的错误：`unsupported version`。
     UnsupportedVersion,
+    /// `InvalidKind` 表示 `ElmRustMetadataError` 的错误：`invalid kind`。
     InvalidKind,
+    /// `InvalidHeader` 表示 `ElmRustMetadataError` 的错误：`invalid header`。
     InvalidHeader,
+    /// `InvalidRecordSize` 表示 `ElmRustMetadataError` 的错误：`invalid record size`。
     InvalidRecordSize,
+    /// `InvalidChecksum` 表示 `ElmRustMetadataError` 的错误：`invalid checksum`。
     InvalidChecksum,
+    /// `InvalidField` 表示 `ElmRustMetadataError` 的错误：`invalid field`。
     InvalidField,
+    /// `DuplicateOrUnsortedField` 表示 `ElmRustMetadataError` 的错误：`duplicate or unsorted field`。
     DuplicateOrUnsortedField,
+    /// `InvalidUtf8` 表示 `ElmRustMetadataError` 的错误：`invalid utf8`。
     InvalidUtf8,
+    /// `NonZeroPadding` 表示 `ElmRustMetadataError` 的错误：`non zero padding`。
     NonZeroPadding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 一条 `.elm.meta` 记录中已验证 tag、value kind 和原始值的字段视图。
 pub struct ElmRustMetadataField<'a> {
+    /// `tag` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
     pub tag: u16,
+    /// 该记录、资源或关系的类别编码。
     pub kind: ElmRustMetadataValueKind,
+    /// `bytes` 保存所属对象声明或快照中的有序记录集合。
     pub bytes: &'a [u8],
 }
 
 impl<'a> ElmRustMetadataField<'a> {
+    /// 执行 `utf8` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn utf8(self) -> Result<&'a str, ElmRustMetadataError> {
         if self.kind != ElmRustMetadataValueKind::Utf8 || self.bytes.contains(&0) {
             return Err(ElmRustMetadataError::InvalidField);
@@ -117,6 +184,7 @@ impl<'a> ElmRustMetadataField<'a> {
         str::from_utf8(self.bytes).map_err(|_| ElmRustMetadataError::InvalidUtf8)
     }
 
+    /// 执行 `u32` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn u32(self) -> Result<u32, ElmRustMetadataError> {
         if self.kind != ElmRustMetadataValueKind::U32 || self.bytes.len() != 4 {
             return Err(ElmRustMetadataError::InvalidField);
@@ -128,6 +196,7 @@ impl<'a> ElmRustMetadataField<'a> {
         ))
     }
 
+    /// 执行 `i32` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn i32(self) -> Result<i32, ElmRustMetadataError> {
         if self.kind != ElmRustMetadataValueKind::I32 || self.bytes.len() != 4 {
             return Err(ElmRustMetadataError::InvalidField);
@@ -139,6 +208,7 @@ impl<'a> ElmRustMetadataField<'a> {
         ))
     }
 
+    /// 执行 `u64` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn u64(self) -> Result<u64, ElmRustMetadataError> {
         if self.kind != ElmRustMetadataValueKind::U64 || self.bytes.len() != 8 {
             return Err(ElmRustMetadataError::InvalidField);
@@ -150,6 +220,7 @@ impl<'a> ElmRustMetadataField<'a> {
         ))
     }
 
+    /// 执行 `boolean` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn boolean(self) -> Result<bool, ElmRustMetadataError> {
         if self.kind != ElmRustMetadataValueKind::Bool || self.bytes.len() != 1 {
             return Err(ElmRustMetadataError::InvalidField);
@@ -163,17 +234,23 @@ impl<'a> ElmRustMetadataField<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ElmRustMetadataRecord` 是可观测快照或协议表中的单条固定布局记录。
 pub struct ElmRustMetadataRecord<'a> {
+    /// 该记录、资源或关系的类别编码。
     pub kind: ElmRustMetadataKind,
+    /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
+    /// 该元数据记录已经按 tag 排序并验证的字段集合。
     pub fields: Vec<ElmRustMetadataField<'a>>,
 }
 
 impl<'a> ElmRustMetadataRecord<'a> {
+    /// 执行 `field` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn field(&self, tag: u16) -> Option<ElmRustMetadataField<'a>> {
         self.fields.iter().find(|field| field.tag == tag).copied()
     }
 
+    /// 执行 `require_field` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn require_field(
         &self,
         tag: u16,
@@ -182,6 +259,7 @@ impl<'a> ElmRustMetadataRecord<'a> {
     }
 }
 
+/// 执行 `parse_rust_metadata_section` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn parse_rust_metadata_section(
     bytes: &[u8],
 ) -> Result<Vec<ElmRustMetadataRecord<'_>>, ElmRustMetadataError> {
@@ -283,6 +361,7 @@ pub fn parse_rust_metadata_section(
     Ok(records)
 }
 
+/// 执行 `crc32` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for byte in bytes {

@@ -2,6 +2,14 @@
 //!
 //! EKI 是 ELM 原生镜像格式。本模块只把 EKI v1 元数据展开为 EBI 协议对象；
 //! 代码段映射、重定位和入口调用仍属于后续原生执行器。
+//!
+//! EKI 天然以 EBI 为语义核心：header 指向一组有版本、尺寸、flags 和范围的标准块，解析器
+//! 先验证整个文件区间、块表、必需块唯一性、内容哈希和 proof，再把块记录投影为
+//! [`ElmEbiUnit`]。未知必需块会拒绝，未知非必需块可安全忽略。
+//!
+//! `parse_eki_image` 只做格式与完整性解析；`parse_eki_ebi_unit` 进一步构造并验证 EBI。
+//! 成功解析不等于可执行，内核仍需执行信任策略、ABI 指纹、目标架构、资源预算、W^X、重定位
+//! 和生命周期事务检查。
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -34,20 +42,35 @@ use crate::proof::{
 };
 use crate::wire::ElmMixinMode;
 
+/// `ELM_EKI_MAGIC` 的固定魔数；解析器必须先校验该值，再解释后续布局。
 pub const ELM_EKI_MAGIC: [u8; 8] = *b"ELM_EKI\0";
+/// `ELM_EKI_FORMAT_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_EKI_FORMAT_VERSION: u16 = 1;
+/// `ELM_EKI_HEADER_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_HEADER_SIZE: usize = 64;
+/// `ELM_EKI_BLOCK_DESC_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_BLOCK_DESC_SIZE: usize = 48;
+/// `ELM_EKI_MAX_BLOCKS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EKI_MAX_BLOCKS: usize = 64;
+/// `ELM_EKI_MANIFEST_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_MANIFEST_NAME_LEN: usize = 128;
+/// `ELM_EKI_MANIFEST_VERSION_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_MANIFEST_VERSION_LEN: usize = 64;
+/// `ELM_EKI_ENTRY_SYMBOL_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_ENTRY_SYMBOL_LEN: usize = 128;
+/// `ELM_EKI_BLOCK_FLAG_REQUIRED` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EKI_BLOCK_FLAG_REQUIRED: u32 = 1 << 0;
+/// `ELM_EKI_IMAGE_HASH_SHA256_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_IMAGE_HASH_SHA256_SIZE: u32 = ELM_PROOF_SHA256_LEN as u32;
+/// `ELM_EKI_ELMAPI_BLOCK_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_EKI_ELMAPI_BLOCK_VERSION: u16 = 1;
+/// `ELM_EKI_ELMAPI_BLOCK_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_ELMAPI_BLOCK_SIZE: usize = 16 + ELM_API_MAX_COMPATIBLE_VERSIONS * 2;
+/// `ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE: usize = 120;
+/// `ELM_EKI_PROOF_BLOCK_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_PROOF_BLOCK_SIZE: usize = 280 + ELM_PROOF_ED25519_SIGNATURE_LEN;
+/// EKI proof block 使用 Ed25519 验证规范 EBI 摘要的算法编号。
 pub const ELM_EKI_PROOF_ALGORITHM_ED25519: u16 = 1;
 
 const EKI_MANIFEST_BLOCK_SIZE: usize =
@@ -62,40 +85,66 @@ const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
     16 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_RECORD_SIZE: usize =
     24 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN * 2;
+/// `ELM_EKI_PROVIDER_PORT_RECORD_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE: usize =
     24 + ELM_NEXUS_CONTRACT_LEN + ELM_EBI_SYMBOL_NAME_LEN * 2;
 const EKI_SYMBOL_RECORD_SIZE: usize = 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_LIFECYCLE_HOOK_RECORD_SIZE: usize = 20 + ELM_EBI_SYMBOL_NAME_LEN;
+/// `ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE: usize = 32 + ELM_EBI_SYMBOL_NAME_LEN;
+/// `ELM_EKI_RELOCATION_RECORD_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_RELOCATION_RECORD_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+/// `ElmEkiBlockKind` 列举该协议位置允许出现的全部稳定类别；未知数值不得直接转为此枚举。
 pub enum ElmEkiBlockKind {
+    /// `Manifest` 表示 `ElmEkiBlockKind` 的对象类别：`manifest`。
     Manifest = 1,
+    /// `Menu` 表示 `ElmEkiBlockKind` 的对象类别：`menu`。
     Menu = 2,
+    /// `Entry` 表示 `ElmEkiBlockKind` 的对象类别：`entry`。
     Entry = 3,
+    /// `Segments` 表示 `ElmEkiBlockKind` 的对象类别：`segments`。
     Segments = 4,
+    /// `Code` 表示 `ElmEkiBlockKind` 的对象类别：`code`。
     Code = 5,
+    /// `ReadOnlyData` 表示 `ElmEkiBlockKind` 的对象类别：`read only data`。
     ReadOnlyData = 6,
+    /// `Data` 表示 `ElmEkiBlockKind` 的对象类别：`data`。
     Data = 7,
+    /// `Bss` 表示 `ElmEkiBlockKind` 的对象类别：`bss`。
     Bss = 8,
+    /// `Relocation` 表示 `ElmEkiBlockKind` 的对象类别：`relocation`。
     Relocation = 9,
+    /// `Imports` 表示 `ElmEkiBlockKind` 的对象类别：`imports`。
     Imports = 10,
+    /// `Exports` 表示 `ElmEkiBlockKind` 的对象类别：`exports`。
     Exports = 11,
+    /// `Notes` 表示 `ElmEkiBlockKind` 的对象类别：`notes`。
     Notes = 12,
+    /// `Signature` 表示 `ElmEkiBlockKind` 的对象类别：`signature`。
     Signature = 13,
+    /// `Dependencies` 表示 `ElmEkiBlockKind` 的对象类别：`dependencies`。
     Dependencies = 14,
+    /// `ExtensionPoints` 表示 `ElmEkiBlockKind` 的对象类别：`extension points`。
     ExtensionPoints = 15,
+    /// `Extensions` 表示 `ElmEkiBlockKind` 的对象类别：`extensions`。
     Extensions = 16,
+    /// `ProviderPorts` 表示 `ElmEkiBlockKind` 的对象类别：`provider ports`。
     ProviderPorts = 17,
+    /// `LifecycleHooks` 表示 `ElmEkiBlockKind` 的对象类别：`lifecycle hooks`。
     LifecycleHooks = 18,
+    /// `SymbolLocations` 表示 `ElmEkiBlockKind` 的对象类别：`symbol locations`。
     SymbolLocations = 19,
+    /// `ApiCompatibility` 表示 `ElmEkiBlockKind` 的对象类别：`api compatibility`。
     ApiCompatibility = 20,
+    /// `AbiFingerprint` 表示 `ElmEkiBlockKind` 的对象类别：`abi fingerprint`。
     AbiFingerprint = 21,
 }
 
 impl ElmEkiBlockKind {
+    /// 校验并把原始协议数值转换为强类型表示；未知值返回空值或错误。
     pub const fn from_raw(raw: u32) -> Option<Self> {
         match raw {
             1 => Some(Self::Manifest),
@@ -126,32 +175,55 @@ impl ElmEkiBlockKind {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ElmEkiHeader` 描述后续可变长记录区的头部；记录数量、尺寸与总缓冲区长度必须相互一致。
 pub struct ElmEkiHeader {
+    /// 识别该线格式的固定魔数。
     pub magic: [u8; 8],
+    /// `format_version` 是该对象、ABI 或契约的版本值，用于装载和协商兼容性。
     pub format_version: u16,
+    /// `ebi_abi_version` 是该对象、ABI 或契约的版本值，用于装载和协商兼容性。
     pub ebi_abi_version: u16,
+    /// 头部占用的字节数；载荷或记录区从该偏移之后开始。
     pub header_size: u32,
+    /// `file_size` 对应区域或资源的字节数量；参与运算前必须检查整数溢出。
     pub file_size: u64,
+    /// `block_table_offset` 是相对于所属块、段或文件起点的字节偏移；与长度相加前必须检查溢出。
     pub block_table_offset: u64,
+    /// `image_hash_offset` 是相对于所属块、段或文件起点的字节偏移；与长度相加前必须检查溢出。
     pub image_hash_offset: u64,
+    /// `arch` 是所属枚举的稳定判别值；未知值必须拒绝。
     pub arch: u32,
+    /// `min_core_version` 是该对象、ABI 或契约的版本值，用于装载和协商兼容性。
     pub min_core_version: u16,
+    /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u16,
+    /// `block_count` 对应记录或资源的数量；解析器必须验证它与实际缓冲区长度一致。
     pub block_count: u32,
+    /// `image_hash_size` 对应区域或资源的字节数量；参与运算前必须检查整数溢出。
     pub image_hash_size: u32,
+    /// 保留字段；生产者必须写零，消费者在当前版本必须拒绝非零值。
     pub reserved: [u8; 8],
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// EKI 块表中记录 kind、版本、flags、文件范围、记录布局和完整性信息的描述符。
 pub struct ElmEkiBlockDesc {
+    /// 该记录、资源或关系的类别编码。
     pub kind: u32,
+    /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
+    /// `offset` 是相对于所属块、段或文件起点的字节偏移；与长度相加前必须检查溢出。
     pub offset: u64,
+    /// `file_size` 对应区域或资源的字节数量；参与运算前必须检查整数溢出。
     pub file_size: u64,
+    /// `mem_size` 对应区域或资源的字节数量；参与运算前必须检查整数溢出。
     pub mem_size: u64,
+    /// `align` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
     pub align: u64,
+    /// 覆盖对应元数据 payload 的校验值。
     pub checksum: u32,
+    /// 保留字段；生产者必须写零，消费者在当前版本必须拒绝非零值。
     pub reserved: u32,
 }
 
@@ -175,10 +247,12 @@ struct EkiPayloadSegment {
     content_hash: u64,
 }
 
+/// 执行 `parse_eki_ebi_unit` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> {
     parse_eki_image(bytes).map(|image| image.unit)
 }
 
+/// 执行 `parse_eki_image` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     let header = parse_header(bytes)?;
     validate_header(bytes, &header)?;

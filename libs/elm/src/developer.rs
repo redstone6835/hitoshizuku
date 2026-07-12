@@ -1,7 +1,12 @@
 //! Rust ELM 开发侧安全边界。
 //!
 //! 本模块把 EBI v1 的裸函数指针、原始地址和固定布局帧收敛到少量内部调用门。
-//! ELM 业务代码只处理借用、结果类型和显式固定线编码载荷。
+//! ELM 业务代码只处理借用、结果类型和显式固定线编码载荷。这里的公开项会在 crate 根
+//! 重导出；模块作者通常直接使用 `elm::LifecycleContext`、`elm::ManagedImport` 等路径。
+//!
+//! attribute 生成的 trampoline 是唯一应接触原生 ABI frame 的代码。业务函数不得保存
+//! 请求借用、迁移缓冲区、当前上下文或原始回复帧内部地址，也不得让 panic 穿过 trampoline。
+//! 跨 ELM 的长期关系应使用受管 import、binding、lease 和运行时登记资源表达。
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -30,22 +35,40 @@ use crate::module_wire::{
     ModuleExtensionDispatchRequest, ModuleExtensionDispatchResponse, ModuleMgrResponseHeader,
 };
 
+/// 装载器注入 ELM 根 API 表地址时使用的固定导入槽符号。
+///
+/// 每个由 Rust 框架构建的原生 ELM 都包含此槽。打包器把它投影为受运行时管理的特殊重定位，
+/// 装载器在执行任何模块代码前写入 [`ElmApiRootV1`] 地址。模块不得自行定义同名符号。
 pub const ELM_API_ROOT_SLOT_SYMBOL: &str = "__elm_api_root_slot_v1";
+/// 启用 mixin 的 ingress 阶段，即原始函数执行前的输入补缀。
 pub const ELM_MIXIN_STAGE_INGRESS: u32 = 1 << 0;
+/// 启用 mixin 的 substitute 阶段，该阶段可替换帧并跳过原始函数。
 pub const ELM_MIXIN_STAGE_SUBSTITUTE: u32 = 1 << 1;
+/// 启用 mixin 的 egress 阶段，即原始函数或替代逻辑完成后的输出补缀。
 pub const ELM_MIXIN_STAGE_EGRESS: u32 = 1 << 2;
+/// 启用 mixin 的 observe 阶段；该阶段最后执行，主要用于只读观察和审计。
 pub const ELM_MIXIN_STAGE_OBSERVE: u32 = 1 << 3;
+/// 当前 ABI 支持的全部 mixin 阶段位集合。
 pub const ELM_MIXIN_STAGES_ALL: u32 = ELM_MIXIN_STAGE_INGRESS
     | ELM_MIXIN_STAGE_SUBSTITUTE
     | ELM_MIXIN_STAGE_EGRESS
     | ELM_MIXIN_STAGE_OBSERVE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 生命周期、entry、provider 和补缀点业务函数返回的稳定错误。
+///
+/// 错误只携带一个非零状态码，以便 trampoline 无需分配即可把失败传播给运行时。状态码的
+/// 具体命名空间由调用契约决定；框架保留 `ELM_CALL_STATUS_*` 作为通用调用错误。
 pub struct HookError {
     status: i32,
 }
 
 impl HookError {
+    /// 从状态码构造错误。
+    ///
+    /// 零表示成功，不能用于错误；传入零时会归一化为
+    /// [`ELM_CALL_STATUS_INVALID`](crate::ELM_CALL_STATUS_INVALID)，从而保证 `HookError`
+    /// 永远表示失败。
     pub const fn new(status: i32) -> Self {
         Self {
             status: if status == 0 {
@@ -56,32 +79,79 @@ impl HookError {
         }
     }
 
+    /// 返回将由 ABI trampoline 传播给运行时的非零状态码。
     pub const fn status(self) -> i32 {
         self.status
     }
 }
 
+/// 生命周期钩子使用的结果类型；成功不携带载荷，失败携带稳定状态码。
 pub type HookResult = Result<(), HookError>;
+/// [`entry`](crate::entry) 业务函数使用的结果类型。
 pub type EntryResult = HookResult;
+/// [`mixin_point`](crate::mixin_point) 原始函数使用的结果类型。
 pub type PointResult = HookResult;
+/// 迁移状态导出钩子的结果类型；成功值是实际写入迁移缓冲区的字节数。
 pub type MigrationExportResult = Result<usize, HookError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 固定 ELM 载荷编码或解码失败。
 pub enum PayloadError {
+    /// 调用方提供的输出缓冲区小于 [`ElmPayload::WIRE_SIZE`]。
     BufferTooSmall,
+    /// 输入长度不等于该契约的固定线格式尺寸，或编码器写入长度不一致。
     SizeMismatch,
+    /// `bool` 字段在线格式中的字节既不是 0 也不是 1。
     InvalidBoolean,
 }
 
+/// 可跨 provider、受管 import/export 或 mixin 边界传输的固定线格式载荷。
+///
+/// 实现必须与 Rust 内存布局无关，并对同一值产生确定的小端字节串。推荐始终通过
+/// [`payload`](crate::payload) 派生；手工实现者必须保证 `WIRE_SIZE` 固定、`encode` 恰好
+/// 写入该长度、`decode` 拒绝任何其他长度，并验证所有受限字段。
+///
+/// # 示例
+///
+/// ```
+/// use elm::ElmPayload;
+///
+/// #[elm::payload("example.counter@1")]
+/// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// struct Counter {
+///     value: u32,
+///     enabled: bool,
+/// }
+///
+/// let value = Counter { value: 0x1122_3344, enabled: true };
+/// let mut bytes = [0_u8; Counter::WIRE_SIZE];
+/// assert_eq!(value.encode(&mut bytes), Ok(5));
+/// assert_eq!(bytes, [0x44, 0x33, 0x22, 0x11, 1]);
+/// assert_eq!(Counter::decode(&bytes), Ok(value));
+/// ```
 pub trait ElmPayload: Sized {
+    /// 载荷的完整 `identifier@version` 契约。
+    ///
+    /// 绑定和 mixin 分发必须按完整字节串匹配该值，不能只比较哈希或 Rust 类型名。
     const CONTRACT: &'static str;
+    /// 该载荷在线格式中的精确字节数。
     const WIRE_SIZE: usize;
 
+    /// 按稳定线格式编码到 `output`，成功时返回写入字节数。
+    ///
+    /// 输出容量不足时返回 [`PayloadError::BufferTooSmall`]；成功长度必须等于 `WIRE_SIZE`。
     fn encode(&self, output: &mut [u8]) -> Result<usize, PayloadError>;
+    /// 从完整固定载荷解码一个值。
+    ///
+    /// 实现必须拒绝长度不等于 `WIRE_SIZE` 的输入和任何非规范编码。
     fn decode(input: &[u8]) -> Result<Self, PayloadError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 生命周期钩子看到的当前单元只读上下文。
+///
+/// 该类型从原生 ABI frame 复制稳定标量，不暴露内核指针。值只描述本次钩子调用，不能作为
+/// 后续操作的授权凭据；运行时会在每个调用边界重新校验 generation、状态和策略。
 pub struct LifecycleContext {
     cell_id: u64,
     parent_id: u64,
@@ -103,10 +173,12 @@ impl LifecycleContext {
         }
     }
 
+    /// 返回正在执行生命周期钩子的 cell id。
     pub const fn cell_id(self) -> u64 {
         self.cell_id
     }
 
+    /// 返回父 ELM 的 cell id；根单元的原始值为零并映射为 `None`。
     pub const fn parent_id(self) -> Option<u64> {
         if self.parent_id == 0 {
             None
@@ -115,24 +187,34 @@ impl LifecycleContext {
         }
     }
 
+    /// 返回当前 cell generation。
+    ///
+    /// 热替换提交后旧 generation 立即陈旧，不得把此值缓存为永久身份。
     pub const fn generation(self) -> u64 {
         self.generation
     }
 
+    /// 返回进入钩子时的 [`ElmState`](crate::ElmState) 原始编码。
     pub const fn state(self) -> u32 {
         self.state
     }
 
+    /// 返回当前 [`ElmLifecyclePhase`](crate::ElmLifecyclePhase) 的原始编码。
     pub const fn phase(self) -> u16 {
         self.phase
     }
 
+    /// 返回本次生命周期调用的附加标志；v1 未定义的位必须由 trampoline 拒绝。
     pub const fn flags(self) -> u32 {
         self.flags
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 热替换迁移钩子看到的代际上下文。
+///
+/// 同一个替换事务会把等价的上下文传给旧代导出、新代导入和新代回滚钩子。迁移缓冲区不在
+/// 此结构中暴露，而是作为受调用期约束的切片单独传给业务函数。
 pub struct MigrationContext {
     cell_id: u64,
     old_generation: u64,
@@ -150,24 +232,32 @@ impl MigrationContext {
         }
     }
 
+    /// 返回被替换逻辑单元的稳定 cell id。
     pub const fn cell_id(self) -> u64 {
         self.cell_id
     }
 
+    /// 返回替换事务开始时对外服务的旧 generation。
     pub const fn old_generation(self) -> u64 {
         self.old_generation
     }
 
+    /// 返回影子装载的新 generation；仅在提交成功后才成为公开 generation。
     pub const fn new_generation(self) -> u64 {
         self.new_generation
     }
 
+    /// 返回当前迁移阶段的原始编码，用于区分 export、import 和 abort。
     pub const fn phase(self) -> u16 {
         self.phase
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 可选 entry 函数在单元激活后收到的只读上下文。
+///
+/// entry 在初始化和声明式拓扑激活完成后执行。该上下文不包含生命周期 phase，因为 entry
+/// 不是生命周期提交钩子。
 pub struct EntryContext {
     cell_id: u64,
     parent_id: u64,
@@ -185,10 +275,12 @@ impl EntryContext {
         }
     }
 
+    /// 返回执行 entry 的 cell id。
     pub const fn cell_id(self) -> u64 {
         self.cell_id
     }
 
+    /// 返回父 ELM 的 cell id；根单元返回 `None`。
     pub const fn parent_id(self) -> Option<u64> {
         if self.parent_id == 0 {
             None
@@ -197,54 +289,86 @@ impl EntryContext {
         }
     }
 
+    /// 返回 entry 所属的当前 generation。
     pub const fn generation(self) -> u64 {
         self.generation
     }
 
+    /// 返回调用 entry 时的 [`ElmState`](crate::ElmState) 原始编码，通常为 `Active`。
     pub const fn state(self) -> u32 {
         self.state
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `#[elm::provider]` 业务函数收到的已验证请求视图。
+///
+/// trampoline 已经检查原生 frame 的 ABI 版本、保留字段、binding 关联和载荷边界。此结构
+/// 按值复制固定调用帧，业务代码仍不应把 id 当作对象指针，也不能绕过 lease 去长期使用对应
+/// 内核资源。
 pub struct ProviderRequest {
+    /// 实现该 provider 的 cell id。
     pub cell_id: u64,
+    /// 本次调用命中的 provider port id。
     pub port_id: u64,
+    /// 覆盖本次调用生命周期的 lease id。
     pub lease_id: u64,
+    /// 请求的通用固定调用帧，包含 binding、call id、opcode、flags 和载荷。
     pub frame: ElmCallFrame,
 }
 
 impl ProviderRequest {
+    /// 返回调用帧中前 `payload_len` 字节的有效载荷。
     pub fn payload(&self) -> &[u8] {
         &self.frame.payload[..usize::from(self.frame.payload_len)]
     }
 
+    /// 使用 `T` 的固定载荷契约解码请求。
+    ///
+    /// 此方法只负责线格式校验；provider 实现仍应确认端口契约和 opcode 是否允许该类型。
     pub fn decode<T: ElmPayload>(&self) -> Result<T, PayloadError> {
         T::decode(self.payload())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `#[elm::export]` 业务函数收到的已验证受管调用。
+///
+/// 运行时已经完成 import handle 解析、作用域授权、版本选择和 generation 路由。调用方与被
+/// 调用方信息用于审计和细粒度策略，不代表业务函数可以访问对应 cell 的内部内存。
 pub struct ManagedRequest {
+    /// 解析到本 export 的受管 import handle。
     pub import_handle: u64,
+    /// 发起调用的 ELM 单元标识符。
     pub caller_cell_id: u64,
+    /// 调用方代际，用于在分发前检测陈旧调用。
     pub caller_generation: u64,
+    /// 接收调用的 ELM 单元标识符。
     pub callee_cell_id: u64,
+    /// 被调用方代际，用于将调用路由到正确的热替换版本。
     pub callee_generation: u64,
+    /// 请求的通用固定调用帧。
     pub frame: ElmCallFrame,
 }
 
 impl ManagedRequest {
+    /// 返回调用帧中前 `payload_len` 字节的有效载荷。
     pub fn payload(&self) -> &[u8] {
         &self.frame.payload[..usize::from(self.frame.payload_len)]
     }
 
+    /// 使用 `T` 的固定载荷契约解码请求。
     pub fn decode<T: ElmPayload>(&self) -> Result<T, PayloadError> {
         T::decode(self.payload())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// provider、受管 export 和 mixin trampoline 使用的安全回复构造器。
+///
+/// 该类型隐藏固定容量数组和长度维护，避免业务代码构造 `payload_len` 越界的
+/// [`ElmReplyFrame`]。普通 provider 与 export 应返回零状态表示成功；mixin trampoline 会
+/// 额外设置控制标志。
 pub struct ProviderReply {
     status: i32,
     flags: u32,
@@ -253,6 +377,7 @@ pub struct ProviderReply {
 }
 
 impl ProviderReply {
+    /// 构造指定状态且不携带载荷的回复。
     pub const fn empty(status: i32) -> Self {
         Self {
             status,
@@ -262,10 +387,15 @@ impl ProviderReply {
         }
     }
 
+    /// 构造状态为 [`ELM_CALL_STATUS_OK`](crate::ELM_CALL_STATUS_OK) 的空成功回复。
     pub const fn ok() -> Self {
         Self::empty(ELM_CALL_STATUS_OK)
     }
 
+    /// 从原始字节构造回复。
+    ///
+    /// `payload` 超过 [`ELM_FRAME_PAYLOAD_LEN`](crate::ELM_FRAME_PAYLOAD_LEN) 时返回
+    /// [`PayloadError::BufferTooSmall`]，不会截断数据。
     pub fn bytes(status: i32, payload: &[u8]) -> Result<Self, PayloadError> {
         if payload.len() > ELM_FRAME_PAYLOAD_LEN {
             return Err(PayloadError::BufferTooSmall);
@@ -276,6 +406,9 @@ impl ProviderReply {
         Ok(reply)
     }
 
+    /// 编码类型化载荷并构造回复。
+    ///
+    /// `T::WIRE_SIZE` 必须能放入固定回复帧；编码器返回的实际长度会成为 `payload_len`。
     pub fn payload<T: ElmPayload>(status: i32, payload: &T) -> Result<Self, PayloadError> {
         if T::WIRE_SIZE > ELM_FRAME_PAYLOAD_LEN {
             return Err(PayloadError::BufferTooSmall);
@@ -286,6 +419,10 @@ impl ProviderReply {
         Ok(reply)
     }
 
+    /// 设置协议回复标志并返回更新后的构造器值。
+    ///
+    /// 普通业务代码不应随意设置未知位。当前主要由 mixin trampoline 写入
+    /// `CONTINUE`、`STOP`、`REPLACE` 或 `DENY` 控制标志。
     pub const fn with_flags(mut self, flags: u32) -> Self {
         self.flags = flags;
         self
@@ -300,10 +437,16 @@ impl ProviderReply {
     }
 }
 
+/// provider 处理函数的规范结果类型。
 pub type ProviderResult = Result<ProviderReply, HookError>;
+/// 受管 export 处理函数的规范结果类型。
 pub type ManagedResult = ProviderResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`ManagedImport`] 调用返回的已验证回复包装。
+///
+/// 构造阶段已经验证保留字段和载荷边界，并核对底层 reply 的 binding/call id。业务代码可先
+/// 检查状态，再按契约读取字节或解码固定载荷。
 pub struct ManagedReply {
     frame: ElmReplyFrame,
 }
@@ -319,46 +462,74 @@ impl ManagedReply {
         Ok(Self { frame })
     }
 
+    /// 返回被调用 export 写入的业务状态码。
     pub const fn status(self) -> i32 {
         self.frame.status
     }
 
+    /// 返回回复标志；调用契约未定义的位应视为不兼容。
     pub const fn flags(self) -> u32 {
         self.frame.flags
     }
 
+    /// 返回回复中前 `payload_len` 字节的有效载荷。
     pub fn payload(&self) -> &[u8] {
         &self.frame.payload[..usize::from(self.frame.payload_len)]
     }
 
+    /// 使用 `T` 的固定载荷契约解码回复。
     pub fn decode<T: ElmPayload>(&self) -> Result<T, RuntimeApiError> {
         T::decode(self.payload()).map_err(RuntimeApiError::Payload)
     }
 
+    /// 消费安全包装并取得底层固定布局回复帧。
+    ///
+    /// 只有需要转交给其他框架 API 时才应使用此方法；普通业务代码优先使用 `status`、
+    /// `payload` 和 `decode`。
     pub const fn into_frame(self) -> ElmReplyFrame {
         self.frame
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `#[elm::provider_snapshot]` 业务函数收到的快照请求。
+///
+/// 快照调用由运行时用 lease 保护。分页请求的 `cursor` 只对同一 provider、binding 和快照
+/// 契约有意义；实现不得把它解释为可直接解引用的地址。
 pub struct SnapshotRequest {
+    /// 实现该快照入口的 cell id。
     pub cell_id: u64,
+    /// 被查询的 provider port id。
     pub port_id: u64,
+    /// 发起快照查询的 binding id。
     pub binding_id: u64,
+    /// 覆盖本次快照生成过程的 lease id。
     pub lease_id: u64,
+    /// 是否请求分页快照。
     pub paged: bool,
+    /// 当前分页游标；非分页请求恒为零。
     pub cursor: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// provider 快照函数对输出缓冲区的描述。
+///
+/// 实际字节由处理函数写入 trampoline 提供的切片，本结构只报告状态、有效前缀、记录数量和
+/// 分页游标。`payload_len` 不能大于输出容量；存在下一页时 `next_cursor` 必须非零且不同于
+/// 请求游标。
 pub struct SnapshotReply {
+    /// 操作结果状态码；零或专用成功码表示成功，其余值按所属协议解释。
     pub status: i32,
+    /// 有效载荷的实际字节数；不得超过相邻载荷缓冲区容量。
     pub payload_len: usize,
+    /// 回复中包含的完整记录数量。
     pub record_count: u32,
+    /// 下一页游标；`None` 表示本次回复已经完整结束。
     pub next_cursor: Option<u32>,
 }
 
 impl SnapshotReply {
+    /// 构造不再有后续页面的成功回复。
     pub const fn complete(payload_len: usize, record_count: u32) -> Self {
         Self {
             status: MGR_STATUS_OK,
@@ -368,6 +539,9 @@ impl SnapshotReply {
         }
     }
 
+    /// 构造仍有后续页面的成功回复。
+    ///
+    /// 调用方必须确保当前请求启用了分页，且 `next_cursor` 非零并向前推进。
     pub const fn more(payload_len: usize, record_count: u32, next_cursor: u32) -> Self {
         Self {
             status: MGR_STATUS_OK,
@@ -377,6 +551,7 @@ impl SnapshotReply {
         }
     }
 
+    /// 构造不携带载荷和记录的失败回复。
     pub const fn error(status: i32) -> Self {
         Self {
             status,
@@ -387,49 +562,105 @@ impl SnapshotReply {
     }
 }
 
+/// provider 快照处理函数的规范结果类型。
 pub type SnapshotResult = Result<SnapshotReply, HookError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// mixin 处理器对当前补缀阶段的控制结果。
 pub enum MixinControl {
+    /// 不替换帧，继续执行当前阶段的后续处理器。
     Continue,
+    /// 不替换帧，但停止当前阶段的后续处理器。
     Stop,
+    /// 用处理器修改后的帧替换当前帧，然后继续当前阶段。
     Replace,
+    /// 替换当前帧并停止当前阶段的后续处理器。
     ReplaceAndStop,
+    /// 拒绝整个补缀点调用；包装函数返回失败且不再执行原函数或后续阶段。
     Deny,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 一个分阶段 mixin 补缀点的静态描述。
+///
+/// 此类型主要由 [`mixin_point`](crate::mixin_point) 展开代码构造。每个非空点名已经包含阶段
+/// 后缀，例如 `scheduler.select.ingress`；`None` 表示该阶段未启用。
 pub struct MixinPointDescriptor {
+    /// 各阶段共享的固定载荷契约。
     pub contract: &'static str,
+    /// 原函数执行前的 ingress 点名。
     pub ingress: Option<&'static str>,
+    /// 可替代原函数的 substitute 点名。
     pub substitute: Option<&'static str>,
+    /// 原函数或替代逻辑完成后的 egress 点名。
     pub egress: Option<&'static str>,
+    /// 最后执行的 observe 点名。
     pub observe: Option<&'static str>,
 }
 
 #[repr(transparent)]
 #[derive(Debug)]
+/// 由装载器写入受管句柄的安全 import 槽。
+///
+/// 该类型必须作为不可变 `static` 并由 [`import`](crate::import) 标记。装载器只写入不透明
+/// handle；每次调用都回到运行时执行代际路由、授权、并发和回复关联校验，因此它是支持热替换
+/// 的默认跨 ELM 调用方式。
+///
+/// # 示例
+///
+/// ```no_run
+/// use elm::ManagedImport;
+///
+/// #[elm::import(
+///     name = "example.echo",
+///     contract = "example.echo@1",
+///     version = 1,
+///     optional = true
+/// )]
+/// static ECHO: ManagedImport = ManagedImport::new();
+///
+/// let reply = ECHO.call_bytes(1, b"hello")?;
+/// if reply.status() != elm::ELM_CALL_STATUS_OK {
+///     return Err(elm::RuntimeApiError::Status(reply.status()));
+/// }
+/// # Ok::<(), elm::RuntimeApiError>(())
+/// ```
 pub struct ManagedImport {
     slot: ImportSlot,
 }
 
 impl ManagedImport {
+    /// 构造尚未绑定的零值 import 槽。
+    ///
+    /// 只有装载器可以在模块激活前写入该槽；业务代码不能自行绑定 handle。
     pub const fn new() -> Self {
         Self {
             slot: ImportSlot::new(),
         }
     }
 
+    /// 返回装载器写入的不透明 handle；可选 import 未解析时返回 `None`。
+    ///
+    /// handle 不是地址，不能解引用，也不应持久化到镜像外部。
     pub fn handle(&self) -> Option<u64> {
         let value = self.slot.read();
         (value != 0).then_some(value as u64)
     }
 
+    /// 使用已经构造的固定调用帧执行一次受管调用。
+    ///
+    /// 运行时会覆盖路由语义并验证返回的 binding/call id。多数业务代码应使用
+    /// [`call_bytes`](Self::call_bytes)、[`call_payload`](Self::call_payload) 或
+    /// [`call`](Self::call)，避免自行维护 call id。
     pub fn invoke(&self, request: &ElmCallFrame) -> Result<ElmReplyFrame, RuntimeApiError> {
         let handle = self.handle().ok_or(RuntimeApiError::ImportUnavailable)?;
         runtime_api::invoke_managed(handle, request)
     }
 
+    /// 用原始载荷执行受管调用。
+    ///
+    /// 框架自动生成非零 call id，并以 binding id 0 请求运行时按 import handle 路由。载荷
+    /// 超过固定帧容量时不会截断，而是返回 [`PayloadError::BufferTooSmall`]。
     pub fn call_bytes(&self, opcode: u32, payload: &[u8]) -> Result<ManagedReply, RuntimeApiError> {
         if payload.len() > ELM_FRAME_PAYLOAD_LEN {
             return Err(RuntimeApiError::Payload(PayloadError::BufferTooSmall));
@@ -438,6 +669,9 @@ impl ManagedImport {
         ManagedReply::from_frame(self.invoke(&request)?)
     }
 
+    /// 编码一个 [`ElmPayload`] 请求并执行受管调用。
+    ///
+    /// 此方法不自动要求回复状态成功，也不解码回复，适合一个操作可能返回多种载荷契约的场景。
     pub fn call_payload<T: ElmPayload>(
         &self,
         opcode: u32,
@@ -454,6 +688,10 @@ impl ManagedImport {
         self.call_bytes(opcode, &bytes[..len])
     }
 
+    /// 执行完整的类型化请求/回复调用。
+    ///
+    /// 请求使用 `T` 编码；只有回复状态为 `ELM_CALL_STATUS_OK` 时才使用 `R` 解码。状态失败、
+    /// 线格式错误和运行时错误都通过 [`RuntimeApiError`] 返回。
     pub fn call<T: ElmPayload, R: ElmPayload>(
         &self,
         opcode: u32,
@@ -475,18 +713,30 @@ impl Default for ManagedImport {
 
 #[repr(transparent)]
 #[derive(Debug)]
+/// 由装载器写入原生地址的直接固定 import 槽。
+///
+/// 该路径绕过受管调用帧，只适合已由运行时授予 native import 能力、ABI 指纹完全匹配且目标
+/// generation 被固定的低层场景。直接导入会限制或阻止目标热替换；普通 ELM 应使用
+/// [`ManagedImport`]。
 pub struct UnsafeDirectImport {
     slot: ImportSlot,
 }
 
 impl UnsafeDirectImport {
+    /// 构造尚未绑定的零值直接导入槽。
     pub const fn new() -> Self {
         Self {
             slot: ImportSlot::new(),
         }
     }
 
-    /// 调用方必须自行证明目标函数签名、生命周期和代际固定关系均匹配。
+    /// 返回装载器写入的原生目标地址。
+    ///
+    /// # 安全性
+    ///
+    /// 调用方必须自行证明地址来自与声明完全一致的函数签名和 Rust ABI 指纹，目标 generation
+    /// 在整个调用期间被 pin，目标代码和数据仍映射，调用权限仍有效，并且 panic 不会跨 ABI
+    /// 展开。把地址转换为错误函数类型或在解绑、卸载、替换后调用会导致未定义行为。
     pub unsafe fn address(&self) -> Option<usize> {
         let value = self.slot.read();
         (value != 0).then_some(value)
@@ -538,14 +788,26 @@ fn next_managed_call_id() -> u64 {
 static ELM_API_ROOT_SLOT: RootImportSlot = RootImportSlot(UnsafeCell::new(0));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 安全开发包装访问 ELM 根 API、运行时表或受管 import 时的错误。
+///
+/// 该枚举区分装载链接问题、协议布局问题、业务状态和固定载荷问题，便于模块决定是降级、
+/// 返回 `HookError` 还是主动中止。它不包含内核内部错误类型，因而可以稳定存在于外部框架。
 pub enum RuntimeApiError {
+    /// 根 API 导入槽仍为零，通常表示模块没有通过合规装载器启动。
     RootUnavailable,
+    /// 根表魔数、版本、选择版本或最小结构尺寸与当前框架不兼容。
     IncompatibleRoot,
+    /// 根表没有提供兼容的普通运行时函数表。
     RuntimeUnavailable,
+    /// 受管 import 槽未绑定；可选 import 在没有匹配 export 时会产生此错误。
     ImportUnavailable,
+    /// 调用方缓冲区不足；携带运行时报告的所需最小字节数。
     BufferTooSmall(usize),
+    /// 运行时回复违反结构尺寸、保留字段、载荷边界或调用关联不变量。
     MalformedResponse,
+    /// 运行时或被调用 export 返回了非零稳定状态码。
     Status(i32),
+    /// 请求编码或回复解码失败。
     Payload(PayloadError),
 }
 
@@ -692,6 +954,19 @@ pub(crate) mod runtime_api {
     }
 }
 
+/// 按固定阶段顺序执行一个 mixin 补缀点。
+///
+/// 此函数主要供 [`mixin_point`](crate::mixin_point) 展开代码调用。它把 `frame` 编码后交给
+/// elm-mgr 的 extension dispatcher，并严格按 ingress、substitute、原实现、egress、observe
+/// 顺序推进。substitute 返回替换帧时跳过 `original`；observe 阶段返回的替换标志会被忽略，
+/// 但拒绝和协议错误仍会使调用失败。
+///
+/// `descriptor.contract` 必须与 `T::CONTRACT` 以及所有 attached mixin 声明一致，且
+/// `T::WIRE_SIZE` 不得超过运行时扩展载荷容量。任何阶段返回 deny、blocker、非成功状态、
+/// 错误长度或不可解码替换载荷时返回 [`HookError`]。
+///
+/// 普通模块不应手工拼装描述符；使用 attribute 可以同时生成正确的阶段名称和 `.elm.meta`
+/// 扩展点声明。
 pub fn run_mixin_point<T: ElmPayload>(
     descriptor: MixinPointDescriptor,
     frame: &mut T,

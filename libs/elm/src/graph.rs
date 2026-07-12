@@ -1,4 +1,11 @@
-//! 绑定图模型。
+//! ELM cell、依赖、能力绑定与 extension 的一致性图模型。
+//!
+//! [`BindingGraph`] 同时维护 parent tree、dependency edge、Nexus binding、补缀点和 extension
+//! edge。所有新增和移除都必须保持端点存在、generation 匹配、契约一致、id 唯一以及禁止的
+//! 环不存在。管理预检使用只读验证报告，提交阶段再在核心事务锁内重新检查。
+//!
+//! graph 只表达关系，不执行 provider 调用或资源回收。移除报告列出受影响的子单元、依赖者、
+//! extension、binding 和 lease，供生命周期事务决定是否阻断、级联或排空。
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -11,57 +18,91 @@ use crate::nexus::FlowContract;
 pub use crate::wire::ElmMixinMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// child cell 到唯一 parent cell 的有向层级边。
 pub struct ParentEdge {
+    /// 子对象或子 cell 的标识符。
     pub child: ElmId,
+    /// 父对象或父 cell 的标识符，用于建立层级关系。
     pub parent: ElmId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// consumer cell 对 provider cell 的必需或可选依赖边。
 pub struct DependencyEdge {
+    /// 消费该能力、export 或资源的 cell id。
     pub consumer: ElmId,
+    /// 提供该能力或处理入口的 cell/port 引用。
     pub provider: ElmId,
+    /// 端口、调用或载荷采用的完整契约 identifier。
     pub contract: FlowContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 由目标 cell 拥有、允许 extension 附着的命名补缀点。
 pub struct ExtensionPoint {
+    /// 拥有该对象的 cell id；所有生命周期和权限检查都归属于该 owner。
     pub owner: ElmId,
+    /// 对象的固定长度名称缓冲区；实际字符串以首个零字节结束。
     pub name: String,
+    /// 端口、调用或载荷采用的完整契约 identifier。
     pub contract: FlowContract,
+    /// 端口、绑定或扩展点采用的并发/分发模式编码。
     pub mode: ElmMixinMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// extension cell 到目标补缀点的已验证附着关系。
 pub struct ExtensionEdge {
+    /// `extension` 是该结构定义的协议属性；其取值范围和生命周期由所属类型约束。
     pub extension: ElmId,
+    /// 关系、重定位或调用的目标对象。
     pub target: ElmId,
+    /// 补缀点的完整 identifier，通常包含阶段后缀。
     pub point: String,
+    /// 端口、调用或载荷采用的完整契约 identifier。
     pub contract: FlowContract,
+    /// mixin/provider 处理器自身的调用契约。
     pub handler_contract: FlowContract,
+    /// 同一扩展点中的调度优先级；排序规则由扩展运行时定义。
     pub priority: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 两个端口之间携带 generation 与 lease 的已提交能力绑定边。
 pub struct CapabilityBindingEdge {
+    /// 该对象在所属表或运行时注册表中的稳定标识符。
     pub id: BindingId,
+    /// 消费该能力、export 或资源的 cell id。
     pub consumer: ElmId,
+    /// 该记录关联的 port id。
     pub port: PortId,
+    /// 端口、调用或载荷采用的完整契约 identifier。
     pub contract: FlowContract,
+    /// 对象当前代际；用于拒绝热替换前遗留的陈旧引用。
     pub generation: Generation,
+    /// 该记录关联的 lease id。
     pub lease: Option<LeaseId>,
+    /// `active` 表示该条件在当前快照或计划中是否成立。
     pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// 对整个 binding graph 执行一致性检查得到的错误计数和诊断摘要。
 pub struct GraphValidationReport {
+    /// 当前快照或移除报告包含的 cell 集合。
     pub cells: usize,
+    /// 当前图中的父子关系边集合。
     pub parent_edges: usize,
+    /// 当前图中的依赖关系边集合。
     pub dependency_edges: usize,
+    /// 当前图中的 extension 附着边集合。
     pub extension_edges: usize,
+    /// 当前图中的能力 binding 边集合。
     pub capability_bindings: usize,
 }
 
 #[derive(Debug, Clone, Default)]
+/// 保存全部 cell、关系边、端口和补缀点索引的 ELM 一致性图。
 pub struct BindingGraph {
     cells: BTreeMap<ElmId, ElmManifest>,
     parents: BTreeMap<ElmId, ElmId>,
@@ -72,6 +113,7 @@ pub struct BindingGraph {
 }
 
 impl BindingGraph {
+    /// 构造一个字段满足当前 ABI 基本不变量的新值。
     pub const fn new() -> Self {
         Self {
             cells: BTreeMap::new(),
@@ -83,6 +125,7 @@ impl BindingGraph {
         }
     }
 
+    /// 执行 `insert_cell` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn insert_cell(&mut self, id: ElmId, manifest: ElmManifest) -> ElmResult<()> {
         if self.cells.contains_key(&id) {
             return Err(ElmError::DuplicateCell);
@@ -91,6 +134,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 执行 `try_reserve_edges` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn try_reserve_edges(
         &mut self,
         dependencies: usize,
@@ -109,6 +153,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 更新 `parent`，同时保持所属类型定义的不变量。
     pub fn set_parent(&mut self, child: ElmId, parent: ElmId) -> ElmResult<()> {
         self.require_cell(child)?;
         self.require_cell(parent)?;
@@ -123,6 +168,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 向模型注册 `dependency`，并拒绝重复 id、非法关系或环。
     pub fn add_dependency(
         &mut self,
         consumer: ElmId,
@@ -143,6 +189,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 向模型注册 `extension_point`，并拒绝重复 id、非法关系或环。
     pub fn add_extension_point(
         &mut self,
         owner: ElmId,
@@ -152,6 +199,7 @@ impl BindingGraph {
         self.add_extension_point_with_mode(owner, name, contract, ElmMixinMode::Chain)
     }
 
+    /// 向模型注册 `extension_point_with_mode`，并拒绝重复 id、非法关系或环。
     pub fn add_extension_point_with_mode(
         &mut self,
         owner: ElmId,
@@ -177,6 +225,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 向模型注册 `extension`，并拒绝重复 id、非法关系或环。
     pub fn add_extension(
         &mut self,
         extension: ElmId,
@@ -188,6 +237,7 @@ impl BindingGraph {
         self.add_extension_with_dispatch(extension, target, point, contract, handler_contract, 0)
     }
 
+    /// 向模型注册 `extension_with_dispatch`，并拒绝重复 id、非法关系或环。
     pub fn add_extension_with_dispatch(
         &mut self,
         extension: ElmId,
@@ -237,6 +287,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 向模型注册 `capability_binding`，并拒绝重复 id、非法关系或环。
     pub fn add_capability_binding(
         &mut self,
         id: BindingId,
@@ -270,6 +321,7 @@ impl BindingGraph {
         Ok(())
     }
 
+    /// 验证当前对象及其关联记录满足全部结构、范围和关系不变量。
     pub fn validate(&self) -> ElmResult<GraphValidationReport> {
         for (child, parent) in &self.parents {
             self.require_cell(*child)?;
@@ -322,10 +374,12 @@ impl BindingGraph {
         })
     }
 
+    /// 执行 `cell` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn cell(&self, id: ElmId) -> Option<&ElmManifest> {
         self.cells.get(&id)
     }
 
+    /// 从模型移除 `cell`，并返回或检查受影响关系。
     pub fn remove_cell(&mut self, id: ElmId) -> ElmResult<GraphRemovalReport> {
         self.require_cell(id)?;
         if self.parents.values().any(|parent| *parent == id) {
@@ -361,6 +415,7 @@ impl BindingGraph {
         })
     }
 
+    /// 从模型移除 `cell_relations`，并返回或检查受影响关系。
     pub fn remove_cell_relations(&mut self, id: ElmId) -> ElmResult<GraphRemovalReport> {
         self.require_cell(id)?;
 
@@ -391,10 +446,12 @@ impl BindingGraph {
         })
     }
 
+    /// 执行 `parent` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn parent(&self, child: ElmId) -> Option<ElmId> {
         self.parents.get(&child).copied()
     }
 
+    /// 执行 `parent_edges` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn parent_edges(&self) -> Vec<ParentEdge> {
         self.parents
             .iter()
@@ -405,6 +462,7 @@ impl BindingGraph {
             .collect()
     }
 
+    /// 执行 `children_of` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn children_of(&self, parent: ElmId) -> Vec<ElmId> {
         self.parents
             .iter()
@@ -418,10 +476,12 @@ impl BindingGraph {
             .collect()
     }
 
+    /// 执行 `dependencies` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn dependencies(&self) -> &[DependencyEdge] {
         &self.dependencies
     }
 
+    /// 执行 `dependents_of` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn dependents_of(&self, provider: ElmId) -> Vec<ElmId> {
         self.dependencies
             .iter()
@@ -435,6 +495,7 @@ impl BindingGraph {
             .collect()
     }
 
+    /// 执行 `dependent_count` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn dependent_count(&self, provider: ElmId) -> usize {
         self.dependencies
             .iter()
@@ -442,14 +503,17 @@ impl BindingGraph {
             .count()
     }
 
+    /// 执行 `extension_points` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extension_points(&self) -> Vec<ExtensionPoint> {
         self.extension_points.values().cloned().collect()
     }
 
+    /// 执行 `extension_points_iter` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extension_points_iter(&self) -> impl Iterator<Item = &ExtensionPoint> {
         self.extension_points.values()
     }
 
+    /// 执行 `extension_point` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extension_point(&self, owner: ElmId, name: &str) -> Option<&ExtensionPoint> {
         self.extension_points
             .iter()
@@ -459,10 +523,12 @@ impl BindingGraph {
             .map(|(_, point)| point)
     }
 
+    /// 执行 `extensions` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extensions(&self) -> &[ExtensionEdge] {
         &self.extensions
     }
 
+    /// 执行 `extensions_targeting` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extensions_targeting(&self, target: ElmId) -> Vec<ElmId> {
         self.extensions
             .iter()
@@ -476,6 +542,7 @@ impl BindingGraph {
             .collect()
     }
 
+    /// 执行 `extension_target_count` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extension_target_count(&self, target: ElmId) -> usize {
         self.extensions
             .iter()
@@ -483,6 +550,7 @@ impl BindingGraph {
             .count()
     }
 
+    /// 执行 `extension_exists` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn extension_exists(
         &self,
         extension: ElmId,
@@ -498,6 +566,7 @@ impl BindingGraph {
         })
     }
 
+    /// 从模型移除 `extension`，并返回或检查受影响关系。
     pub fn remove_extension(
         &mut self,
         extension: ElmId,
@@ -512,14 +581,17 @@ impl BindingGraph {
             .map(|index| self.extensions.remove(index))
     }
 
+    /// 执行 `capability_bindings` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn capability_bindings(&self) -> &[CapabilityBindingEdge] {
         &self.capability_bindings
     }
 
+    /// 执行 `capability_binding` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn capability_binding(&self, id: BindingId) -> Option<&CapabilityBindingEdge> {
         self.capability_bindings.iter().find(|edge| edge.id == id)
     }
 
+    /// 执行 `capability_binding_for` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn capability_binding_for(
         &self,
         consumer: ElmId,
@@ -534,6 +606,7 @@ impl BindingGraph {
         })
     }
 
+    /// 执行 `capability_bindings_for_cell` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn capability_bindings_for_cell(&self, consumer: ElmId) -> Vec<BindingId> {
         self.capability_bindings
             .iter()
@@ -547,6 +620,7 @@ impl BindingGraph {
             .collect()
     }
 
+    /// 执行 `capability_bindings_mut_for_cell` 定义的模型或协议操作；返回值反映校验后的结果。
     pub fn capability_bindings_mut_for_cell(
         &mut self,
         consumer: ElmId,
@@ -556,6 +630,7 @@ impl BindingGraph {
             .filter(move |edge| edge.consumer == consumer)
     }
 
+    /// 从模型移除 `capability_binding`，并返回或检查受影响关系。
     pub fn remove_capability_binding(&mut self, id: BindingId) -> ElmResult<CapabilityBindingEdge> {
         let Some(index) = self
             .capability_bindings
@@ -611,11 +686,17 @@ impl BindingGraph {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// 移除 cell 前枚举子单元、依赖者、extension、binding、lease 和菜单影响的报告。
 pub struct GraphRemovalReport {
+    /// 当前图中的父子关系边集合。
     pub parent_edges: usize,
+    /// 当前图中的依赖关系边集合。
     pub dependency_edges: usize,
+    /// 当前图中的 extension 附着边集合。
     pub extension_edges: usize,
+    /// 该单元允许其他 ELM 附着的补缀点集合。
     pub extension_points: usize,
+    /// 当前图中的能力 binding 边集合。
     pub capability_bindings: usize,
 }
 

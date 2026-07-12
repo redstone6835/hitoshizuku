@@ -1,9 +1,81 @@
 #![no_std]
+#![warn(missing_docs)]
 
-//! ELM（可拓展内核单元）模型、协议与 Rust 开发框架。
+//! ELM（Extensible Loadable Module，可拓展可加载单元）模型、协议与 Rust 开发框架。
 //!
-//! 本库描述架构无关、内核无关的模型与固定 ABI，并提供外部 Rust ELM 使用的安全
-//! 包装和 attribute。它不能依赖 `kernel`、`general` 或 `arch`。
+//! ELM 不是 Linux LKM 或 FreeBSD KLD 的兼容层。它把可加载代码建模为具有父子关系、
+//! 依赖、受管导入/导出、能力端口、生命周期、资源所有权、热替换和可观测状态的运行时
+//! 单元。内核只识别实现 EBI（ELM Binary Interface）协议的投影结果，不把 EKI、SOYO、
+//! ELF 或其他容器格式写死为唯一输入。
+//!
+//! 本 crate 同时承担三类职责：
+//!
+//! - 定义架构无关、内核无关的 EBI、ELM API 和管理协议固定布局；
+//! - 为外部 Rust ELM 提供安全上下文、固定载荷、受管导入、运行时 API 和 attribute；
+//! - 为内核侧 ELM 运行时提供状态机、图、租约、策略、证明、快照和 provider 模型。
+//!
+//! 为保持依赖方向，本 crate 不能依赖 `kernel`、`general` 或 `arch`。具体子系统能力由各
+//! 子系统 crate 定义并通过 provider/集成层接入；ELM 框架本身只提供稳定协议和运行时机制。
+//!
+//! # 功能开关
+//!
+//! - `module`：外部 ELM 的最小编译面，包含稳定 ABI 类型和安全开发包装；
+//! - `macros`：重导出生命周期、provider、import/export、payload 和 mixin attribute；
+//! - `management`：仅供受授权 Manager 类型 ELM 使用的 [`management::Client`]；
+//! - `runtime-model`：内核侧运行时模型，默认启用，不应成为普通外部 ELM 的依赖。
+//!
+//! 普通外部工程通常使用 `default-features = false, features = ["module", "macros"]`；
+//! Manager ELM 再增加 `management`。启用 feature 只让代码可编译，实际管理权限仍由内核
+//! 按 ELM kind、镜像信任、当前代际、运行状态和 per-cell policy 在每次调用时重新鉴权。
+//!
+//! # 最小 ELM
+//!
+//! 每个动态 ELM 必须提供一个初始化前钩子和一个卸载前钩子。业务函数使用安全 Rust ABI，
+//! attribute 自动生成 EBI trampoline 和 `.elm.meta`；模块作者不应手写 `extern "C"`。
+//!
+//! ```no_run
+//! use elm::{HookError, HookResult, LifecycleContext};
+//!
+//! #[elm::on_initialize]
+//! fn initialize(_context: &LifecycleContext) -> HookResult {
+//!     elm::runtime::log(6, "demo.hello: initialized")
+//!         .map_err(|_| HookError::new(-1))
+//! }
+//!
+//! #[elm::on_finalize]
+//! fn finalize(_context: &LifecycleContext) -> HookResult {
+//!     elm::runtime::log(6, "demo.hello: finalized")
+//!         .map_err(|_| HookError::new(-1))
+//! }
+//! ```
+//!
+//! 实际模块工程还需要 `#![no_std]`、`#![no_main]`、目标架构链接脚本、panic handler 和
+//! `elm-tools` 打包步骤。panic handler 应调用 [`runtime::abort_panic`]，使运行时记录故障并
+//! 走受保护的终止出口，而不是在模块代码中无限展开或越过 ABI 边界。
+//!
+//! # 开发 API 分层
+//!
+//! - [`runtime`]：所有普通 ELM 都可使用的当前上下文、日志和主动中止接口；
+//! - [`management`]：Manager ELM 的类型化控制、查询、装载、热替换和策略接口；
+//! - [`ElmPayload`]：跨单元固定载荷的编码协议，通常由 [`payload`] 生成；
+//! - [`ManagedImport`]：推荐的受管 import 槽，提供代际路由和回复校验；
+//! - [`ProviderRequest`]、[`ManagedRequest`] 和 [`SnapshotRequest`]：宏 trampoline 已校验后
+//!   交给业务代码的安全请求视图；
+//! - [`LifecycleContext`]、[`MigrationContext`] 和 [`EntryContext`]：生命周期只读上下文；
+//! - [`MixinControl`] 与 [`mixin_point`]：可授权、可排序、可观测的分阶段补缀机制。
+//!
+//! 固定布局、状态码和线格式类型主要面向框架、打包器和内核实现。普通模块应优先使用上述
+//! 安全包装，不要直接调用 [`ElmRuntimeApiV1`] 中的函数指针或自行构造原生 ABI frame。
+//!
+//! # ABI 与安全边界
+//!
+//! ELM API v1 使用显式版本、结构尺寸、保留字段、有效标志掩码和固定宽度整数。跨镜像边界
+//! 不传递 Rust 引用、trait object、`Vec`、`String`、`usize` 或未固定布局的枚举。所有指针
+//! 和借用只在对应调用期间有效；热替换后的旧 generation 句柄必须由运行时拒绝。
+//!
+//! [`payload`] 生成的载荷采用紧密排列的小端线格式，不依赖 Rust 内存布局。原生 ABI
+//! trampoline 会在进入业务函数前检查版本、保留字段、长度、关联 id 和缓冲区边界；镜像
+//! 装载器还会验证证明链、ABI 指纹、段权限、重定位、导入导出和元数据一致性。
 //!
 //! 未发布的旧管理路径不会进入 v1 公开面：
 //!
