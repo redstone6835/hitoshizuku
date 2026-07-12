@@ -9,20 +9,13 @@ use crate::ids::{ElmId, Generation};
 use crate::mgr::{
     ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION, ELM_POLICY_BLOCK_CAPABILITY_DENIED,
 };
+pub use crate::wire::ElmPrincipalKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElmPolicyCheck {
     pub allowed: bool,
     pub status: i32,
     pub blockers: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ElmPrincipalKind {
-    Kernel = 1,
-    UserAdmin = 2,
-    ElmCell = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

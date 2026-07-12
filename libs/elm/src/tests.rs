@@ -2760,8 +2760,13 @@ fn ebi_source_request_is_fixed_layout() {
     assert_eq!(request.parent_cell_id, crate::ELM_MGR_BUILTIN_ID.0);
     assert_eq!(request.budget, crate::ElmResourceBudget::DEFAULT);
     assert_eq!(request.reserved0, 0);
-    assert_eq!(request.payload_len, 128);
     assert_eq!(request.reserved1, 0);
+    assert_eq!(request.payload_len, 128);
+    assert_eq!(request.reserved2, 0);
+    assert_eq!(request.reserved3, 0);
+    let manager = request.with_management_grant();
+    assert!(manager.grants_management());
+    assert_eq!(manager.flags, crate::ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT);
     assert_eq!(ElmEbiSourceKind::from_raw(5), None);
 }
 
@@ -3448,8 +3453,8 @@ fn current_context_policy_check_uses_entered_snapshot() {
 }
 
 #[test]
-fn elmmgr_api_namespace_reexports_runtime_api_types() {
-    let record = crate::elmmgr::api::ElmMgrApiDescriptor::new(
+fn manager_api_descriptor_is_available_from_elm_root() {
+    let record = crate::ElmMgrApiDescriptor::new(
         1,
         crate::ELM_MGR_BUILTIN_ID.0,
         crate::ELM_MGR_API_KIND_EVENT,
@@ -3474,8 +3479,9 @@ fn elmapi_compatibility_selects_highest_common_version() {
 
 #[test]
 fn elmapi_v1_tables_have_fixed_layout() {
-    assert_eq!(core::mem::size_of::<crate::ElmApiContextV1>(), 48);
+    assert_eq!(core::mem::size_of::<crate::ElmApiContextV1>(), 56);
     assert_eq!(core::mem::size_of::<crate::ElmApiNamespaceV1>(), 40);
     assert_eq!(core::mem::size_of::<crate::ElmRuntimeApiV1>(), 56);
+    assert_eq!(core::mem::size_of::<crate::ElmManagementApiV1>(), 16);
     assert_eq!(core::mem::size_of::<crate::ElmApiRootV1>(), 48);
 }

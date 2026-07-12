@@ -1,6 +1,8 @@
 //! ELM 事件记录模型。
 
+#[cfg(feature = "runtime-model")]
 use crate::ids::{BindingId, ElmId, LeaseId, PortId};
+#[cfg(feature = "runtime-model")]
 use crate::topology::TopologyEventKind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +42,7 @@ impl ElmEventRecord {
         }
     }
 
+    #[cfg(feature = "runtime-model")]
     pub const fn new(
         sequence: ElmEventSequence,
         kind: TopologyEventKind,
@@ -71,6 +74,7 @@ impl ElmEventRecord {
     }
 }
 
+#[cfg(feature = "runtime-model")]
 pub const fn event_kind_code(kind: TopologyEventKind) -> u32 {
     match kind {
         TopologyEventKind::CellAdded => 1,

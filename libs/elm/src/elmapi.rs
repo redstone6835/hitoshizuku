@@ -1,6 +1,6 @@
 //! ELM 原生 API 根协议。
 //!
-//! `elmapi` 是 ELM 原生代码与 `elm-mgr` 之间的稳定入口。模块只导入一个根槽位，
+//! `elmapi` 是 ELM 原生代码与 ELM 运行时之间的稳定入口。模块只导入一个根槽位，
 //! 再通过根表取得运行时表或按 identifier 查询其他命名空间，避免把内核实现符号直接
 //! 暴露给模块。这里使用固定布局和显式函数指针；Rust 开发包在其上提供安全包装。
 
@@ -18,14 +18,15 @@ pub const ELM_API_CURRENT_VERSION: u16 = ELM_API_VERSION_V1;
 pub const ELM_API_ROOT_MAGIC: u64 = u64::from_le_bytes(*b"ELMAPI1\0");
 pub const ELM_API_ROOT_IMPORT_NAME: &str = "elm.api.root";
 pub const ELM_API_ROOT_IMPORT_CONTRACT: &str = "elm.api.root@1";
-pub const ELM_API_RUNTIME_IDENTIFIER: &str = "elmmgr.runtime";
-pub const ELM_API_FEATURE_DISPATCH: u64 = 1 << 0;
+pub const ELM_API_RUNTIME_IDENTIFIER: &str = "elm.runtime";
+pub const ELM_API_MANAGEMENT_IDENTIFIER: &str = "elm.management";
+pub const ELM_API_FEATURE_MIXIN_DISPATCH: u64 = 1 << 0;
 pub const ELM_API_FEATURE_CONTEXT: u64 = 1 << 1;
 pub const ELM_API_FEATURE_NAMESPACE_QUERY: u64 = 1 << 2;
 pub const ELM_API_FEATURE_LOG: u64 = 1 << 3;
 pub const ELM_API_FEATURE_ABORT: u64 = 1 << 4;
 pub const ELM_API_FEATURE_MANAGED_CALL: u64 = 1 << 5;
-pub const ELM_API_FEATURES_V1: u64 = ELM_API_FEATURE_DISPATCH
+pub const ELM_API_FEATURES_V1: u64 = ELM_API_FEATURE_MIXIN_DISPATCH
     | ELM_API_FEATURE_CONTEXT
     | ELM_API_FEATURE_NAMESPACE_QUERY
     | ELM_API_FEATURE_LOG
@@ -43,7 +44,14 @@ pub const ELM_API_STATUS_UNSUPPORTED: i32 = -3;
 pub const ELM_API_STATUS_BUFFER_TOO_SMALL: i32 = -4;
 pub const ELM_API_STATUS_PERMISSION: i32 = -5;
 
-pub type ElmApiDispatchV1 = extern "C" fn(
+pub type ElmApiMixinDispatchV1 = extern "C" fn(
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32;
+pub type ElmManagementDispatchV1 = extern "C" fn(
     kind: u32,
     input: *const u8,
     input_len: usize,
@@ -77,6 +85,7 @@ pub struct ElmApiContextV1 {
     pub generation: u64,
     pub state: u32,
     pub phase: u32,
+    pub kind: u32,
     pub allowed_actions: u32,
     pub reserved: u32,
 }
@@ -91,6 +100,7 @@ impl ElmApiContextV1 {
             generation: 0,
             state: 0,
             phase: 0,
+            kind: 0,
             allowed_actions: 0,
             reserved: 0,
         }
@@ -149,11 +159,20 @@ pub struct ElmRuntimeApiV1 {
     pub abi_version: u16,
     pub reserved0: u16,
     pub features: u64,
-    pub dispatch: ElmApiDispatchV1,
+    pub dispatch_mixin: ElmApiMixinDispatchV1,
     pub current_context: ElmApiCurrentContextV1,
     pub log: ElmApiLogV1,
     pub abort_current: ElmApiAbortCurrentV1,
     pub invoke_managed: ElmApiInvokeManagedV1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ElmManagementApiV1 {
+    pub struct_size: u32,
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub dispatch: ElmManagementDispatchV1,
 }
 
 #[repr(C)]
@@ -215,6 +234,7 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
     writeln!(out, "root.import-name={ELM_API_ROOT_IMPORT_NAME}").unwrap();
     writeln!(out, "root.import-contract={ELM_API_ROOT_IMPORT_CONTRACT}").unwrap();
     writeln!(out, "runtime.identifier={ELM_API_RUNTIME_IDENTIFIER}").unwrap();
+    writeln!(out, "management.identifier={ELM_API_MANAGEMENT_IDENTIFIER}").unwrap();
     writeln!(out, "runtime.version={ELM_API_VERSION_V1}").unwrap();
     writeln!(out, "runtime.features={ELM_API_FEATURES_V1}").unwrap();
 
@@ -230,6 +250,7 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
             generation,
             state,
             phase,
+            kind,
             allowed_actions,
             reserved,
         ]
@@ -258,12 +279,18 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
             abi_version,
             reserved0,
             features,
-            dispatch,
+            dispatch_mixin,
             current_context,
             log,
             abort_current,
             invoke_managed,
         ]
+    );
+    write_layout!(
+        out,
+        ElmManagementApiV1,
+        "ElmManagementApiV1",
+        [struct_size, abi_version, reserved0, dispatch,]
     );
     write_layout!(
         out,
@@ -417,7 +444,12 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
 
     writeln!(
         out,
-        "fn.dispatch=extern-C(u32,*const-u8,usize,*mut-u8,usize,*mut-usize)->i32"
+        "fn.dispatch-mixin=extern-C(*const-u8,usize,*mut-u8,usize,*mut-usize)->i32"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "fn.management-dispatch=extern-C(u32,*const-u8,usize,*mut-u8,usize,*mut-usize)->i32"
     )
     .unwrap();
     writeln!(

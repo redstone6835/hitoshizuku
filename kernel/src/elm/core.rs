@@ -7,20 +7,20 @@ use alloc::vec::Vec;
 
 use elm_model::{
     ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_API_CURRENT_VERSION,
-    ELM_API_FEATURES_V1, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
-    ELM_API_ROOT_MAGIC, ELM_API_RUNTIME_IDENTIFIER, ELM_API_STATUS_BUFFER_TOO_SMALL,
-    ELM_API_STATUS_INVALID, ELM_API_STATUS_NOT_FOUND, ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION,
-    ELM_API_STATUS_UNSUPPORTED, ELM_CALL_STATUS_BUSY, ELM_CALL_STATUS_INVALID,
-    ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_PROVIDER_FAULT,
-    ELM_CALL_STATUS_UNSUPPORTED, ELM_EBI_EXPORT_FLAG_MANAGED, ELM_EBI_IMPORT_FLAG_MANAGED,
-    ELM_EKI_BUILTIN_ID, ELM_EXTENSION_DISPATCH_FLAG_REQUIRE_EXACT_EXTENSION,
-    ELM_EXTENSION_DISPATCH_FLAGS_MASK, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
-    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_EXECUTIONS,
-    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_JOURNAL, ELM_HEALTH_CHECK_MENU,
-    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS,
-    ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RESOURCES,
-    ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES, ELM_HEALTH_CHECK_TODO_REGISTRY,
-    ELM_HEALTH_CHECK_TRUST, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
+    ELM_API_FEATURES_V1, ELM_API_MANAGEMENT_IDENTIFIER, ELM_API_ROOT_IMPORT_CONTRACT,
+    ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_MAGIC, ELM_API_RUNTIME_IDENTIFIER,
+    ELM_API_STATUS_BUFFER_TOO_SMALL, ELM_API_STATUS_INVALID, ELM_API_STATUS_NOT_FOUND,
+    ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION, ELM_API_STATUS_UNSUPPORTED, ELM_CALL_STATUS_BUSY,
+    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
+    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED, ELM_EBI_EXPORT_FLAG_MANAGED,
+    ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EKI_BUILTIN_ID,
+    ELM_EXTENSION_DISPATCH_FLAG_REQUIRE_EXACT_EXTENSION, ELM_EXTENSION_DISPATCH_FLAGS_MASK,
+    ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
+    ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_EXECUTIONS, ELM_HEALTH_CHECK_GRAPH,
+    ELM_HEALTH_CHECK_JOURNAL, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
+    ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS,
+    ELM_HEALTH_CHECK_RESOURCES, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES,
+    ELM_HEALTH_CHECK_TODO_REGISTRY, ELM_HEALTH_CHECK_TRUST, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
     ELM_HEALTH_DETAIL_COUNTER_EXHAUSTED, ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
     ELM_HEALTH_DETAIL_DUPLICATE_OBJECT, ELM_HEALTH_DETAIL_GRAPH_INVALID,
     ELM_HEALTH_DETAIL_KIND_MISMATCH, ELM_HEALTH_DETAIL_MISSING_OBJECT,
@@ -30,30 +30,31 @@ use elm_model::{
     ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT, ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
     ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_LIFECYCLE_REASON_INVALID_STATE,
     ELM_LIFECYCLE_REASON_LEASE_BUSY, ELM_LIFECYCLE_REASON_NATIVE_TODO, ELM_LIFECYCLE_REASON_NONE,
-    ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_BIND,
-    ELM_MGR_ACTION_EVENT_READ, ELM_MGR_ACTION_EVENT_SUBSCRIBE, ELM_MGR_ACTION_EVENT_UNSUBSCRIBE,
-    ELM_MGR_ACTION_EXTENSION_ATTACH, ELM_MGR_ACTION_EXTENSION_DETACH,
-    ELM_MGR_ACTION_EXTENSION_DISPATCH, ELM_MGR_ACTION_POLICY_UPDATE, ELM_MGR_ACTION_PROVIDER_ASYNC,
-    ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_ACTION_PROVIDER_QUERY,
-    ELM_MGR_ACTION_PROVIDER_REGISTER, ELM_MGR_ACTION_PROVIDER_UNREGISTER,
-    ELM_MGR_ACTION_RESOURCE_UPDATE, ELM_MGR_ACTION_RUNTIME_EVENT_ACK,
-    ELM_MGR_ACTION_RUNTIME_EVENT_READ, ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND,
-    ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_PAYLOAD, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID,
-    ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION, ELM_MGR_STATUS_TODO,
-    ELM_MGR_STATUS_UNSUPPORTED, ELM_MIXIN_REPLY_CONTINUE, ELM_MIXIN_REPLY_DENY,
-    ELM_MIXIN_REPLY_FLAGS_MASK, ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP,
-    ELM_POLICY_BLOCK_ABI_FINGERPRINT, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
-    ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
-    ELM_POLICY_BLOCK_CALLER_NOT_FOUND, ELM_POLICY_BLOCK_CALLER_STALE,
-    ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
-    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_EXTENSION_DUPLICATE,
-    ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
-    ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
-    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE,
-    ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE, ELM_POLICY_BLOCK_LEASE_BUSY,
-    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
-    ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_POLICY_ESCALATION,
-    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN, ELM_MENU_FLAG_TODO,
+    ELM_MGR_ACTION_BIND, ELM_MGR_ACTION_EVENT_READ, ELM_MGR_ACTION_EVENT_SUBSCRIBE,
+    ELM_MGR_ACTION_EVENT_UNSUBSCRIBE, ELM_MGR_ACTION_EXTENSION_ATTACH,
+    ELM_MGR_ACTION_EXTENSION_DETACH, ELM_MGR_ACTION_EXTENSION_DISPATCH,
+    ELM_MGR_ACTION_POLICY_UPDATE, ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE,
+    ELM_MGR_ACTION_PROVIDER_QUERY, ELM_MGR_ACTION_PROVIDER_REGISTER,
+    ELM_MGR_ACTION_PROVIDER_UNREGISTER, ELM_MGR_ACTION_RESOURCE_UPDATE,
+    ELM_MGR_ACTION_RUNTIME_EVENT_ACK, ELM_MGR_ACTION_RUNTIME_EVENT_READ,
+    ELM_MGR_ACTION_RUNTIME_LOG, ELM_MGR_ACTION_UNBIND, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_PAYLOAD,
+    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
+    ELM_MGR_STATUS_PERMISSION, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
+    ELM_MIXIN_REPLY_CONTINUE, ELM_MIXIN_REPLY_DENY, ELM_MIXIN_REPLY_FLAGS_MASK,
+    ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP, ELM_POLICY_BLOCK_ABI_FINGERPRINT,
+    ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
+    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CALLER_NOT_FOUND,
+    ELM_POLICY_BLOCK_CALLER_STALE, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
+    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_POLICY_BLOCK_EXTENSION_DUPLICATE, ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND,
+    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
+    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
+    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE,
+    ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_NATIVE_TODO,
+    ELM_POLICY_BLOCK_POLICY_ESCALATION, ELM_POLICY_BLOCK_PORT_NOT_FOUND,
+    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND, ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL,
     ELM_POLICY_BLOCK_RESOURCE_QUOTA, ELM_POLICY_BLOCK_ROLLBACK_REJECTED,
@@ -67,19 +68,19 @@ use elm_model::{
     ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER,
     ELM_TODO_KIND_RUNTIME, ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest,
     ElmApiContextV1, ElmApiNamespaceV1, ElmApiRootV1, ElmCallFrame, ElmContext,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmEbiArch, ElmEbiExtensionPointDecl,
-    ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiSourceKind,
-    ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord, ElmEventSequence,
-    ElmExtensionAttachRequest, ElmExtensionAttachResponse, ElmExtensionDetachRequest,
-    ElmExtensionDetachResponse, ElmExtensionDispatchRequest, ElmExtensionDispatchResponse,
-    ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord, ElmFaultDumpHeader, ElmFaultDumpRecord,
-    ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase, ElmLifecyclePlanRequest,
-    ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse, ElmManifest,
-    ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader,
-    ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest,
-    ElmMgrEventSubscribeResponse, ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord,
-    ElmMgrEventUnsubscribeRequest, ElmMgrEventUnsubscribeResponse, ElmMgrPolicyInfo,
-    ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrSubscribedEventReadHeader,
+    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCurrentContext, ElmEbiArch,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
+    ElmEbiProviderPortDecl, ElmEbiSourceKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord,
+    ElmEventSequence, ElmExtensionAttachRequest, ElmExtensionAttachResponse,
+    ElmExtensionDetachRequest, ElmExtensionDetachResponse, ElmExtensionDispatchRequest,
+    ElmExtensionDispatchResponse, ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord,
+    ElmFaultDumpHeader, ElmFaultDumpRecord, ElmId, ElmKind, ElmLifecycleAction, ElmLifecyclePhase,
+    ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleResponse, ElmLoadCellResponse,
+    ElmManagementApiV1, ElmManifest, ElmMenuItemKind, ElmMgrApiDescriptor, ElmMgrApiRegistryHeader,
+    ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader, ElmMgrCallKind,
+    ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse, ElmMgrEventSubscriptionHeader,
+    ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest, ElmMgrEventUnsubscribeResponse,
+    ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest, ElmMgrTopologyHeader, ElmMixinMode, ElmName,
     ElmNativeCapabilityHeader, ElmNativeCapabilityRecord, ElmNexusBindPlanResponse,
     ElmNexusBindRequest, ElmNexusBindingRecord, ElmNexusBindingSnapshotHeader,
@@ -103,37 +104,38 @@ use elm_model::{
     state_code, status_from_blockers,
 };
 use elm_model::{
-    ELM_AUDIT_AUTHORITY_ANCESTOR, ELM_AUDIT_AUTHORITY_KERNEL, ELM_AUDIT_AUTHORITY_MANAGER,
-    ELM_AUDIT_AUTHORITY_SELF, ELM_AUDIT_AUTHORITY_USER_ADMIN, ELM_AUDIT_FLAG_AUTHORIZATION,
-    ELM_AUDIT_FLAG_OPERATION, ELM_CELL_POLICY_ALLOW_ALL, ELM_CELL_POLICY_ALLOW_BIND,
-    ELM_CELL_POLICY_ALLOW_EVENT, ELM_CELL_POLICY_ALLOW_EXTENSION, ELM_CELL_POLICY_ALLOW_LIFECYCLE,
-    ELM_CELL_POLICY_ALLOW_NATIVE, ELM_CELL_POLICY_ALLOW_OBSERVE,
+    ELM_AUDIT_AUTHORITY_ANCESTOR, ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER,
+    ELM_AUDIT_AUTHORITY_KERNEL, ELM_AUDIT_AUTHORITY_MANAGER, ELM_AUDIT_AUTHORITY_SELF,
+    ELM_AUDIT_AUTHORITY_USER_ADMIN, ELM_AUDIT_FLAG_AUTHORIZATION, ELM_AUDIT_FLAG_OPERATION,
+    ELM_CELL_POLICY_ALLOW_ALL, ELM_CELL_POLICY_ALLOW_BIND, ELM_CELL_POLICY_ALLOW_EVENT,
+    ELM_CELL_POLICY_ALLOW_EXTENSION, ELM_CELL_POLICY_ALLOW_LIFECYCLE,
+    ELM_CELL_POLICY_ALLOW_MANAGEMENT, ELM_CELL_POLICY_ALLOW_NATIVE, ELM_CELL_POLICY_ALLOW_OBSERVE,
     ELM_CELL_POLICY_ALLOW_POLICY_UPDATE, ELM_CELL_POLICY_ALLOW_PROVIDER,
-    ELM_CELL_POLICY_ALLOW_RESOURCE_UPDATE, ELM_CELL_POLICY_FLAG_AUDIT_ALL,
-    ELM_CELL_POLICY_FLAG_DENY_CHILD_ESCALATION, ELM_CELL_POLICY_FLAG_LOCKED,
-    ELM_CELL_POLICY_FLAGS_MASK, ELM_EXTENSION_POLICY_ACCEPT, ELM_EXTENSION_POLICY_ALL,
-    ELM_EXTENSION_POLICY_ATTACH, ELM_EXTENSION_POLICY_DETACH, ELM_EXTENSION_POLICY_DISPATCH,
-    ELM_EXTENSION_POLICY_MIXIN_PATCH, ELM_MGR_API_FLAG_STABLE, ELM_MGR_API_FLAG_SYSCALL,
-    ELM_MGR_API_FLAG_SYSFS, ELM_MGR_API_KIND_CONTROL, ELM_MGR_API_KIND_EVENT,
-    ELM_MGR_API_KIND_PROVIDER, ELM_MGR_API_KIND_SNAPSHOT, ELM_MGR_EVENT_READ_ABSOLUTE_MAX_RECORDS,
-    ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS, ELM_MGR_EVENT_READ_FLAG_ADVANCE,
-    ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD,
-    ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_POLICY_ALL,
-    ELM_NATIVE_POLICY_EXECUTE, ELM_NATIVE_POLICY_EXPORT, ELM_NATIVE_POLICY_IMPORT,
-    ELM_NATIVE_POLICY_MIXIN_PATCH, ELM_NATIVE_POLICY_REPLACE, ELM_POLICY_BLOCK_CAPABILITY_DENIED,
-    ELM_PROVIDER_POLICY_ALL, ELM_PROVIDER_POLICY_ASYNC, ELM_PROVIDER_POLICY_INVOKE,
-    ELM_PROVIDER_POLICY_REGISTER, ELM_PROVIDER_POLICY_SNAPSHOT, ELM_PROVIDER_POLICY_UNREGISTER,
-    ELM_RESOURCE_POLICY_ALL, ELM_RESOURCE_POLICY_OWN, ELM_RESOURCE_POLICY_QUERY,
-    ELM_RESOURCE_POLICY_UPDATE, ELM_RUNTIME_LOG_EXPORT_CONTRACT, ELM_RUNTIME_LOG_EXPORT_NAME,
-    ELM_RUNTIME_LOG_EXPORT_VERSION, ELM_RUNTIME_TRACE_KIND_JOURNAL,
-    ELM_RUNTIME_TRACE_KIND_LIFECYCLE, ELM_RUNTIME_TRACE_KIND_MIXIN_DISPATCH,
-    ELM_RUNTIME_TRACE_KIND_POLICY, ELM_RUNTIME_TRACE_KIND_PROVIDER_CALL,
-    ELM_RUNTIME_TRACE_KIND_REPLACE, ELM_RUNTIME_TRACE_KIND_RESOURCE,
-    ELM_RUST_ABI_TARGET_FEATURE_FLOAT, ELM_RUST_ABI_TARGET_FEATURE_SIMD,
-    ELM_RUST_ABI_TARGET_FEATURE_VECTOR, ELM_TODO_REGISTRY_FLAG_TRUNCATED,
-    ELM_TRUST_FLAG_ALLOW_UNSIGNED, ELM_TRUST_FLAG_SEALED, ELM_TRUST_FLAG_UNSIGNED_ACTIVE,
-    ElmCellPolicyRequest, ElmCellPolicyV1, ElmKernelProviderRevoke, ElmKernelProviderSpec,
-    ElmPanicStrategy, current_cell, current_context, sha256,
+    ELM_CELL_POLICY_ALLOW_RESOURCE_UPDATE, ELM_CELL_POLICY_ALLOWED_ACTIONS_MASK,
+    ELM_CELL_POLICY_FLAG_AUDIT_ALL, ELM_CELL_POLICY_FLAG_DENY_CHILD_ESCALATION,
+    ELM_CELL_POLICY_FLAG_LOCKED, ELM_CELL_POLICY_FLAGS_MASK, ELM_EXTENSION_POLICY_ACCEPT,
+    ELM_EXTENSION_POLICY_ALL, ELM_EXTENSION_POLICY_ATTACH, ELM_EXTENSION_POLICY_DETACH,
+    ELM_EXTENSION_POLICY_DISPATCH, ELM_EXTENSION_POLICY_MIXIN_PATCH, ELM_MGR_API_FLAG_STABLE,
+    ELM_MGR_API_FLAG_SYSCALL, ELM_MGR_API_FLAG_SYSFS, ELM_MGR_API_KIND_CONTROL,
+    ELM_MGR_API_KIND_EVENT, ELM_MGR_API_KIND_PROVIDER, ELM_MGR_API_KIND_SNAPSHOT,
+    ELM_MGR_EVENT_READ_ABSOLUTE_MAX_RECORDS, ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS,
+    ELM_MGR_EVENT_READ_FLAG_ADVANCE, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
+    ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD, ELM_NATIVE_CAPABILITY_KIND_EXPORT,
+    ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_POLICY_ALL, ELM_NATIVE_POLICY_EXECUTE,
+    ELM_NATIVE_POLICY_EXPORT, ELM_NATIVE_POLICY_IMPORT, ELM_NATIVE_POLICY_MIXIN_PATCH,
+    ELM_NATIVE_POLICY_REPLACE, ELM_POLICY_BLOCK_CAPABILITY_DENIED, ELM_PROVIDER_POLICY_ALL,
+    ELM_PROVIDER_POLICY_ASYNC, ELM_PROVIDER_POLICY_INVOKE, ELM_PROVIDER_POLICY_REGISTER,
+    ELM_PROVIDER_POLICY_SNAPSHOT, ELM_PROVIDER_POLICY_UNREGISTER, ELM_RESOURCE_POLICY_ALL,
+    ELM_RESOURCE_POLICY_OWN, ELM_RESOURCE_POLICY_QUERY, ELM_RESOURCE_POLICY_UPDATE,
+    ELM_RUNTIME_LOG_EXPORT_CONTRACT, ELM_RUNTIME_LOG_EXPORT_NAME, ELM_RUNTIME_LOG_EXPORT_VERSION,
+    ELM_RUNTIME_TRACE_KIND_JOURNAL, ELM_RUNTIME_TRACE_KIND_LIFECYCLE,
+    ELM_RUNTIME_TRACE_KIND_MIXIN_DISPATCH, ELM_RUNTIME_TRACE_KIND_POLICY,
+    ELM_RUNTIME_TRACE_KIND_PROVIDER_CALL, ELM_RUNTIME_TRACE_KIND_REPLACE,
+    ELM_RUNTIME_TRACE_KIND_RESOURCE, ELM_RUST_ABI_TARGET_FEATURE_FLOAT,
+    ELM_RUST_ABI_TARGET_FEATURE_SIMD, ELM_RUST_ABI_TARGET_FEATURE_VECTOR,
+    ELM_TODO_REGISTRY_FLAG_TRUNCATED, ELM_TRUST_FLAG_ALLOW_UNSIGNED, ELM_TRUST_FLAG_SEALED,
+    ELM_TRUST_FLAG_UNSIGNED_ACTIVE, ElmCellPolicyRequest, ElmCellPolicyV1, ElmKernelProviderRevoke,
+    ElmKernelProviderSpec, ElmPanicStrategy, current_cell, current_context, sha256,
 };
 use sched::sync::Spinlock;
 
@@ -170,11 +172,18 @@ static ELM_RUNTIME_API_V1: ElmRuntimeApiV1 = ElmRuntimeApiV1 {
     abi_version: ELM_API_CURRENT_VERSION,
     reserved0: 0,
     features: ELM_API_FEATURES_V1,
-    dispatch: elm_api_dispatch_v1,
+    dispatch_mixin: elm_api_dispatch_mixin_v1,
     current_context: elm_api_current_context_v1,
     log: elm_runtime_log_v1,
     abort_current: elm_api_abort_current_v1,
     invoke_managed: elm_api_invoke_managed_v1,
+};
+
+static ELM_MANAGEMENT_API_V1: ElmManagementApiV1 = ElmManagementApiV1 {
+    struct_size: core::mem::size_of::<ElmManagementApiV1>() as u32,
+    abi_version: ELM_API_CURRENT_VERSION,
+    reserved0: 0,
+    dispatch: elm_api_management_dispatch_v1,
 };
 
 static ELM_API_ROOT_V1: ElmApiRootV1 = ElmApiRootV1 {
@@ -1410,6 +1419,8 @@ impl ElmCore {
             principal,
             authority: if actor_id == ELM_MGR_ID {
                 ELM_AUDIT_AUTHORITY_MANAGER
+            } else if self.cell_has_global_management_scope(actor_id) {
+                ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER
             } else {
                 ELM_AUDIT_AUTHORITY_SELF
             },
@@ -1444,7 +1455,9 @@ impl ElmCore {
 
         match target {
             ElmMgrAccessTarget::Global => {
-                if actor_id != ELM_MGR_ID && mgr_call_is_manager_only_query(kind) {
+                if !self.cell_has_global_management_scope(actor_id)
+                    && mgr_call_is_manager_only_query(kind)
+                {
                     authorization.blockers = ELM_POLICY_BLOCK_SCOPE_DENIED;
                 }
             }
@@ -1468,7 +1481,7 @@ impl ElmCore {
                     .and_then(|port| port.owner);
                 match owner {
                     Some(owner) => self.apply_cell_scope(actor_id, owner, &mut authorization),
-                    None if actor_id != ELM_MGR_ID => {
+                    None if !self.cell_has_global_management_scope(actor_id) => {
                         authorization.blockers = ELM_POLICY_BLOCK_SCOPE_DENIED;
                     }
                     None => {}
@@ -1561,8 +1574,12 @@ impl ElmCore {
         authorization.subject_id = target.0;
         if self.cell_index(target).is_none() {
             authorization.blockers = ELM_POLICY_BLOCK_CELL_NOT_FOUND;
-        } else if actor == ELM_MGR_ID {
-            authorization.authority = ELM_AUDIT_AUTHORITY_MANAGER;
+        } else if self.cell_has_global_management_scope(actor) {
+            authorization.authority = if actor == ELM_MGR_ID {
+                ELM_AUDIT_AUTHORITY_MANAGER
+            } else {
+                ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER
+            };
         } else if actor == target {
             authorization.authority = ELM_AUDIT_AUTHORITY_SELF;
         } else if self.cell_is_descendant_of(target, actor) {
@@ -1590,25 +1607,29 @@ impl ElmCore {
                     authorization.blockers = ELM_POLICY_BLOCK_CELL_NOT_FOUND;
                     return;
                 };
-                if actor != ELM_MGR_ID
+                if !self.cell_has_global_management_scope(actor)
                     && target.cell_policy.extension_flags & ELM_EXTENSION_POLICY_ACCEPT == 0
                 {
                     authorization.blockers = ELM_POLICY_BLOCK_CAPABILITY_DENIED;
                 }
             }
             ElmMgrCallKind::CommitExtensionDetach => {
-                let first_in_scope = actor == ELM_MGR_ID
+                let first_in_scope = self.cell_has_global_management_scope(actor)
                     || actor == first
                     || self.cell_is_descendant_of(first, actor);
-                let second_in_scope = actor == ELM_MGR_ID
+                let second_in_scope = self.cell_has_global_management_scope(actor)
                     || actor == second
                     || self.cell_is_descendant_of(second, actor);
                 if !first_in_scope && !second_in_scope {
                     authorization.blockers = ELM_POLICY_BLOCK_SCOPE_DENIED;
                 } else {
                     authorization.subject_id = first.0;
-                    authorization.authority = if actor == ELM_MGR_ID {
-                        ELM_AUDIT_AUTHORITY_MANAGER
+                    authorization.authority = if self.cell_has_global_management_scope(actor) {
+                        if actor == ELM_MGR_ID {
+                            ELM_AUDIT_AUTHORITY_MANAGER
+                        } else {
+                            ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER
+                        }
                     } else if actor == first || actor == second {
                         ELM_AUDIT_AUTHORITY_SELF
                     } else {
@@ -1647,7 +1668,9 @@ impl ElmCore {
         } else {
             actor.cell_policy
         };
-        if !policy_capabilities_subset(policy, ceiling)
+        if policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT
+            != target.cell_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT
+            || !policy_capabilities_subset(policy, ceiling)
             || (actor.id == target_id && target.cell_policy.flags & !policy.flags != 0)
             || !self.policy_update_respects_hierarchy(target_id, policy)
         {
@@ -1669,6 +1692,30 @@ impl ElmCore {
         {
             authorization.blockers = ELM_POLICY_BLOCK_PROVIDER_BUSY;
         }
+    }
+
+    fn cell_has_global_management_scope(&self, id: ElmId) -> bool {
+        id == ELM_MGR_ID
+            || self.cells.iter().any(|cell| {
+                cell.id == id
+                    && cell.kind == ElmKind::Manager
+                    && cell.cell_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT != 0
+                    && !matches!(
+                        cell.state,
+                        ElmState::Detached
+                            | ElmState::Retired
+                            | ElmState::Faulted
+                            | ElmState::Quarantined
+                    )
+            })
+    }
+
+    fn cell_requires_signed_management(&self, id: ElmId) -> bool {
+        self.cells.iter().any(|cell| {
+            cell.id == id
+                && cell.kind == ElmKind::Manager
+                && cell.cell_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT != 0
+        })
     }
 
     fn policy_update_respects_hierarchy(
@@ -1973,6 +2020,27 @@ impl ElmCore {
         }
     }
 
+    fn grant_management_to_loaded_cell(&mut self, id: ElmId, trust: &PreparedImageTrust) -> bool {
+        if trust.unsigned || trust.acceptance.is_none() {
+            return false;
+        }
+        let Some(index) = self.cell_index(id) else {
+            return false;
+        };
+        let Some(parent) = self.cells[index].parent else {
+            return false;
+        };
+        let parent_allows_management = self.cells.iter().any(|cell| {
+            cell.id == parent
+                && cell.cell_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT != 0
+        });
+        if self.cells[index].kind != ElmKind::Manager || !parent_allows_management {
+            return false;
+        }
+        self.cells[index].cell_policy.allowed_actions |= ELM_CELL_POLICY_ALLOW_MANAGEMENT;
+        true
+    }
+
     pub fn init_builtin_mgr(&mut self) -> Result<(), ElmError> {
         if self.initialized {
             return Ok(());
@@ -2051,7 +2119,7 @@ impl ElmCore {
             cell_policy: ElmCellPolicyV1::new(
                 ELM_MGR_ID.0,
                 Generation::FIRST.0,
-                ELM_CELL_POLICY_ALLOW_ALL,
+                ELM_CELL_POLICY_ALLOW_ALL | ELM_CELL_POLICY_ALLOW_MANAGEMENT,
                 ELM_MGR_STATUS_OK,
                 0,
             ),
@@ -2350,7 +2418,7 @@ impl ElmCore {
             || policy.status != ELM_MGR_STATUS_OK
             || policy.blockers != 0
             || policy.flags & !ELM_CELL_POLICY_FLAGS_MASK != 0
-            || policy.allowed_actions & !ELM_CELL_POLICY_ALLOW_ALL != 0
+            || policy.allowed_actions & !ELM_CELL_POLICY_ALLOWED_ACTIONS_MASK != 0
             || policy.provider_flags & !ELM_PROVIDER_POLICY_ALL != 0
             || policy.extension_flags & !ELM_EXTENSION_POLICY_ALL != 0
             || policy.native_flags & !ELM_NATIVE_POLICY_ALL != 0
@@ -2378,6 +2446,14 @@ impl ElmCore {
         if self.cells[index].cell_policy.flags & ELM_CELL_POLICY_FLAG_LOCKED != 0 {
             policy.status = ELM_MGR_STATUS_PERMISSION;
             policy.blockers = ELM_POLICY_BLOCK_CAPABILITY_DENIED;
+            self.push_policy_trace(policy.cell_id, 0, policy.status, policy.blockers);
+            return policy;
+        }
+        if policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT
+            != self.cells[index].cell_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT
+        {
+            policy.status = ELM_MGR_STATUS_PERMISSION;
+            policy.blockers = ELM_POLICY_BLOCK_POLICY_ESCALATION;
             self.push_policy_trace(policy.cell_id, 0, policy.status, policy.blockers);
             return policy;
         }
@@ -5903,6 +5979,7 @@ impl ElmCore {
             ElmEbiSourceKind::Projection,
             ELM_MGR_ID,
             ElmResourceBudget::DEFAULT,
+            false,
         )
     }
 
@@ -5913,7 +5990,15 @@ impl ElmCore {
         parent: ElmId,
         budget: ElmResourceBudget,
     ) -> ElmLoadCellResponse {
-        self.load_ebi_unit_inner(unit, arch, ElmEbiSourceKind::Memory, parent, budget, None)
+        self.load_ebi_unit_inner(
+            unit,
+            arch,
+            ElmEbiSourceKind::Memory,
+            parent,
+            budget,
+            false,
+            None,
+        )
     }
 
     pub(crate) fn load_declarative_ebi_image_from_source_under_parent(
@@ -5923,6 +6008,7 @@ impl ElmCore {
         source: ElmEbiSourceKind,
         parent: ElmId,
         budget: ElmResourceBudget,
+        grant_management: bool,
     ) -> ElmLoadCellResponse {
         if let Err(status) = image.validate(arch) {
             return ElmLoadCellResponse::failed(status);
@@ -5938,7 +6024,19 @@ impl ElmCore {
             Ok(trust) => trust,
             Err(status) => return ElmLoadCellResponse::failed(status),
         };
-        let response = self.load_ebi_unit_inner(image.unit, arch, source, parent, budget, None);
+        if grant_management && (image.unit.manifest.kind != ElmKind::Manager || trust.unsigned) {
+            self.abort_image_trust(&trust);
+            return ElmLoadCellResponse::failed(ElmEbiLoadStatus::UntrustedImage);
+        }
+        let response = self.load_ebi_unit_inner(
+            image.unit,
+            arch,
+            source,
+            parent,
+            budget,
+            grant_management,
+            None,
+        );
         if response.status != ElmEbiLoadStatus::Ok as i32 {
             self.abort_image_trust(&trust);
             return response;
@@ -5968,8 +6066,16 @@ impl ElmCore {
         source: ElmEbiSourceKind,
         parent: ElmId,
         budget: ElmResourceBudget,
+        grant_management: bool,
     ) -> ElmLoadCellResponse {
-        let plan = match self.prepare_native_load_execution(image, arch, source, parent, budget) {
+        let plan = match self.prepare_native_load_execution(
+            image,
+            arch,
+            source,
+            parent,
+            budget,
+            grant_management,
+        ) {
             PreparedNativeLoad::Immediate(response) => return response,
             PreparedNativeLoad::Initialize(plan) => plan,
         };
@@ -6014,6 +6120,7 @@ impl ElmCore {
         source: ElmEbiSourceKind,
         parent: ElmId,
         budget: ElmResourceBudget,
+        grant_management: bool,
     ) -> PreparedNativeLoad {
         if let Err(status) = image.validate(arch) {
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(status));
@@ -6023,10 +6130,20 @@ impl ElmCore {
                 ElmEbiLoadStatus::RuntimeRejected,
             ));
         }
+        if grant_management && image.unit.manifest.kind != ElmKind::Manager {
+            return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(
+                ElmEbiLoadStatus::RuntimeRejected,
+            ));
+        }
         if !image.has_code_segment() {
             return PreparedNativeLoad::Immediate(
                 self.load_declarative_ebi_image_from_source_under_parent(
-                    image, arch, source, parent, budget,
+                    image,
+                    arch,
+                    source,
+                    parent,
+                    budget,
+                    grant_management,
                 ),
             );
         }
@@ -6086,6 +6203,7 @@ impl ElmCore {
             image_arch,
             &image.unit,
             source,
+            false,
         ) {
             log::error!("[elm] EBI image cell rejected by runtime: {:?}", err);
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(
@@ -6126,6 +6244,16 @@ impl ElmCore {
                         ));
                     }
                 };
+                if grant_management && !self.grant_management_to_loaded_cell(id, &trust) {
+                    self.abort_image_trust(&trust);
+                    self.quarantine_cell_after_hook_failure(id);
+                    return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
+                        ElmEbiLoadStatus::UntrustedImage,
+                        id.0,
+                        state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                        ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
+                    ));
+                }
                 self.pending_ebi_loads.push(PendingEbiLoad {
                     cell: id,
                     unit: image.unit.clone(),
@@ -6207,18 +6335,6 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_LEASE_BUSY,
             ));
         }
-        let initialize = match self.lifecycle_context(id, ElmLifecyclePhase::Initialize) {
-            Ok(context) => context,
-            Err(_) => {
-                self.quarantine_cell_after_hook_failure(id);
-                return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
-                    ElmEbiLoadStatus::RuntimeRejected,
-                    id.0,
-                    state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
-                    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
-                ));
-            }
-        };
         let token = match self.reserve_cell_execution_exclusive(id) {
             Ok(token) => token,
             Err(_) => {
@@ -6241,6 +6357,31 @@ impl ElmCore {
                     id.0,
                     state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
                     ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                ));
+            }
+        };
+        if grant_management && !self.grant_management_to_loaded_cell(id, &trust) {
+            self.abort_image_trust(&trust);
+            self.release_cell_execution(token);
+            self.quarantine_cell_after_hook_failure(id);
+            return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::UntrustedImage,
+                id.0,
+                state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
+            ));
+        }
+        let initialize = match self.lifecycle_context(id, ElmLifecyclePhase::Initialize) {
+            Ok(context) => context,
+            Err(_) => {
+                self.abort_image_trust(&trust);
+                self.release_cell_execution(token);
+                self.quarantine_cell_after_hook_failure(id);
+                return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
+                    ElmEbiLoadStatus::RuntimeRejected,
+                    id.0,
+                    state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
                 ));
             }
         };
@@ -6852,6 +6993,27 @@ impl ElmCore {
                 ));
             }
         };
+        if self.cell_requires_signed_management(id)
+            && (trust.unsigned || trust.acceptance.is_none())
+        {
+            self.abort_image_trust(&trust);
+            let sources_restored = self.resume_projection_sources_for_cell(id, old_generation);
+            self.release_cell_execution(token);
+            let mut blockers = ELM_POLICY_BLOCK_UNTRUSTED_IMAGE;
+            if !sources_restored {
+                blockers |= ELM_POLICY_BLOCK_GRAPH_INCONSISTENT;
+                self.quarantine_cell_after_hook_failure(id);
+            }
+            return PreparedNativeReplace::Immediate(self.replace_response(
+                id,
+                status_from_blockers(blockers),
+                self.cell_state(id).unwrap_or(old_state),
+                old_generation,
+                0,
+                ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
+                blockers,
+            ));
+        }
         let import_stage =
             match self.stage_native_imports(token, new_generation, resolved_native_imports) {
                 Ok(stage) => stage,
@@ -7216,6 +7378,17 @@ impl ElmCore {
                 );
             }
         };
+        if self.cell_requires_signed_management(id)
+            && (trust.unsigned || trust.acceptance.is_none())
+        {
+            self.abort_image_trust(&trust);
+            return fail(
+                self,
+                ELM_MGR_STATUS_PERMISSION,
+                ELM_POLICY_BLOCK_UNTRUSTED_IMAGE,
+                ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
+            );
+        }
         if !self.commit_replaced_declarative_cell(id, old_state, new_generation, &image.unit) {
             self.abort_image_trust(&trust);
             return fail(
@@ -7265,6 +7438,7 @@ impl ElmCore {
             ElmEbiSourceKind::Memory,
             ELM_MGR_ID,
             ElmResourceBudget::DEFAULT,
+            false,
             Some(executor),
         )
     }
@@ -7276,6 +7450,7 @@ impl ElmCore {
         source: ElmEbiSourceKind,
         parent: ElmId,
         budget: ElmResourceBudget,
+        grant_management: bool,
         mut executor: Option<&mut dyn ElmLifecycleExecutor>,
     ) -> ElmLoadCellResponse {
         if let Err(status) = unit.validate(arch) {
@@ -7302,7 +7477,15 @@ impl ElmCore {
         };
 
         if let Err(err) = self.insert_loaded_cell(
-            id, parent, budget, manifest, name, image_arch, &unit, source,
+            id,
+            parent,
+            budget,
+            manifest,
+            name,
+            image_arch,
+            &unit,
+            source,
+            grant_management,
         ) {
             log::error!("[elm] EBI cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
@@ -10956,6 +11139,7 @@ impl ElmCore {
         ebi_arch: ElmEbiArch,
         unit: &ElmEbiUnit,
         source: ElmEbiSourceKind,
+        grant_management: bool,
     ) -> Result<(), ElmError> {
         self.cells.try_reserve(1).map_err(|_| {
             log::error!("[elm] 单元表扩容失败 cell={} parent={}", id.0, parent.0);
@@ -11017,10 +11201,23 @@ impl ElmCore {
             let _ = super::resource_accounting::retire_cell(id);
             return Err(err);
         }
+        if grant_management
+            && (kind != ElmKind::Manager
+                || parent_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT == 0)
+        {
+            let _ = self.graph.remove_cell(id);
+            let _ = super::owned_resource::retire_owner(id, Generation::FIRST);
+            let _ = super::resource_accounting::retire_cell(id);
+            return Err(ElmError::PermissionDenied);
+        }
+        let mut allowed_actions = parent_policy.allowed_actions & !ELM_CELL_POLICY_ALLOW_MANAGEMENT;
+        if grant_management {
+            allowed_actions |= ELM_CELL_POLICY_ALLOW_MANAGEMENT;
+        }
         let mut cell_policy = ElmCellPolicyV1::new(
             id.0,
             Generation::FIRST.0,
-            parent_policy.allowed_actions,
+            allowed_actions,
             ELM_MGR_STATUS_OK,
             0,
         );
@@ -14361,6 +14558,7 @@ impl ElmCore {
         };
         Ok(
             ElmContext::new(cell.id, cell.parent, cell.generation, cell.state, phase, 0)
+                .with_kind(cell.kind)
                 .with_allowed_actions(cell.cell_policy.allowed_actions),
         )
     }
@@ -14376,6 +14574,7 @@ impl ElmCore {
         };
         Ok(
             ElmContext::new(cell.id, cell.parent, generation, cell.state, phase, 0)
+                .with_kind(cell.kind)
                 .with_allowed_actions(cell.cell_policy.allowed_actions),
         )
     }
@@ -15547,12 +15746,20 @@ pub(crate) fn load_ebi_image_unlocked(
     source: ElmEbiSourceKind,
     parent: ElmId,
     budget: ElmResourceBudget,
+    grant_management: bool,
     authorization: &mut ElmMgrAuthorization,
 ) -> Result<ElmLoadCellResponse, i32> {
     let target = ElmMgrAccessTarget::Load(parent, budget);
     let (prepared, authorization_execution) =
         prepare_authorized_unlocked(authorization, ElmMgrCallKind::LoadCell, target, |core| {
-            core.prepare_native_load_execution(image, arch, source, parent, budget)
+            core.prepare_native_load_execution(
+                image,
+                arch,
+                source,
+                parent,
+                budget,
+                grant_management,
+            )
         })?;
     let plan = match prepared {
         PreparedNativeLoad::Immediate(response) => {
@@ -16985,7 +17192,45 @@ const fn trust_blocker(status: ElmEbiLoadStatus) -> u64 {
     }
 }
 
-extern "C" fn elm_api_dispatch_v1(
+extern "C" fn elm_api_dispatch_mixin_v1(
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    elm_api_dispatch_command_v1(
+        false,
+        ElmMgrCallKind::DispatchExtension as u32,
+        input,
+        input_len,
+        output,
+        output_capacity,
+        output_len,
+    )
+}
+
+extern "C" fn elm_api_management_dispatch_v1(
+    kind: u32,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    elm_api_dispatch_command_v1(
+        true,
+        kind,
+        input,
+        input_len,
+        output,
+        output_capacity,
+        output_len,
+    )
+}
+
+fn elm_api_dispatch_command_v1(
+    require_management: bool,
     kind: u32,
     input: *const u8,
     input_len: usize,
@@ -17001,6 +17246,9 @@ extern "C" fn elm_api_dispatch_v1(
     let Some(context) = current_context() else {
         return ELM_API_STATUS_PERMISSION;
     };
+    if require_management && !management_namespace_allowed(context) {
+        return ELM_API_STATUS_PERMISSION;
+    }
     if output_len.is_null()
         || (input.is_null() && input_len != 0)
         || (output.is_null() && output_capacity != 0)
@@ -17083,6 +17331,7 @@ extern "C" fn elm_api_current_context_v1(output: *mut ElmApiContextV1) -> i32 {
         generation: context.generation.0,
         state: ElmApiContextV1::state_code(context.state),
         phase: ElmApiContextV1::phase_code(context.phase),
+        kind: context.kind.as_raw(),
         allowed_actions: context.allowed_actions,
         reserved: 0,
     };
@@ -17132,9 +17381,6 @@ extern "C" fn elm_api_query_namespace_v1(
     let identifier = unsafe { core::slice::from_raw_parts(identifier, identifier_len) };
     let versions =
         unsafe { core::slice::from_raw_parts(compatible_versions, compatible_version_count) };
-    if identifier != ELM_API_RUNTIME_IDENTIFIER.as_bytes() {
-        return ELM_API_STATUS_NOT_FOUND;
-    }
     let Some(selected) = versions
         .iter()
         .copied()
@@ -17143,19 +17389,50 @@ extern "C" fn elm_api_query_namespace_v1(
     else {
         return ELM_API_STATUS_UNSUPPORTED;
     };
-    let namespace = ElmApiNamespaceV1 {
-        struct_size: core::mem::size_of::<ElmApiNamespaceV1>() as u32,
-        flags: 0,
-        selected_version: selected,
-        reserved0: 0,
-        table_size: core::mem::size_of::<ElmRuntimeApiV1>() as u32,
-        table_address: &ELM_RUNTIME_API_V1 as *const ElmRuntimeApiV1 as usize,
-        generation: 1,
-        capabilities: ELM_API_FEATURES_V1,
+    let namespace = if identifier == ELM_API_RUNTIME_IDENTIFIER.as_bytes() {
+        ElmApiNamespaceV1 {
+            struct_size: core::mem::size_of::<ElmApiNamespaceV1>() as u32,
+            flags: 0,
+            selected_version: selected,
+            reserved0: 0,
+            table_size: core::mem::size_of::<ElmRuntimeApiV1>() as u32,
+            table_address: &ELM_RUNTIME_API_V1 as *const ElmRuntimeApiV1 as usize,
+            generation: 1,
+            capabilities: ELM_API_FEATURES_V1,
+        }
+    } else if identifier == ELM_API_MANAGEMENT_IDENTIFIER.as_bytes() {
+        let Some(context) = current_context() else {
+            return ELM_API_STATUS_PERMISSION;
+        };
+        if !management_namespace_allowed(context) {
+            return ELM_API_STATUS_PERMISSION;
+        }
+        ElmApiNamespaceV1 {
+            struct_size: core::mem::size_of::<ElmApiNamespaceV1>() as u32,
+            flags: 0,
+            selected_version: selected,
+            reserved0: 0,
+            table_size: core::mem::size_of::<ElmManagementApiV1>() as u32,
+            table_address: &ELM_MANAGEMENT_API_V1 as *const ElmManagementApiV1 as usize,
+            generation: context.generation.0,
+            capabilities: ELM_CELL_POLICY_ALLOW_MANAGEMENT as u64,
+        }
+    } else {
+        return ELM_API_STATUS_NOT_FOUND;
     };
     // 安全性：调用方提供固定布局输出槽，原生 guard 处理意外地址故障。
     unsafe { output.write(namespace) };
     ELM_API_STATUS_OK
+}
+
+pub(crate) fn management_namespace_allowed(context: ElmCurrentContext) -> bool {
+    context.kind == ElmKind::Manager
+        && context.generation.0 != 0
+        && context.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT != 0
+        && !matches!(
+            context.state,
+            ElmState::Detached | ElmState::Retired | ElmState::Faulted | ElmState::Quarantined
+        )
 }
 
 extern "C" fn elm_runtime_log_v1(level: u32, message_ptr: *const u8, message_len: usize) -> i32 {

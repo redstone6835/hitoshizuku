@@ -3,6 +3,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::ids::{ElmId, Generation};
+use crate::kind::ElmKind;
 use crate::state::ElmState;
 
 const ELM_CONTEXT_ALLOWED_ACTIONS_ALL: u32 = (1 << 9) - 1;
@@ -45,6 +46,7 @@ pub struct ElmContext {
     generation: Generation,
     state: ElmState,
     phase: ElmLifecyclePhase,
+    kind: ElmKind,
     flags: u32,
     allowed_actions: u32,
 }
@@ -64,6 +66,7 @@ impl ElmContext {
             generation,
             state,
             phase,
+            kind: ElmKind::Other,
             flags,
             allowed_actions: ELM_CONTEXT_ALLOWED_ACTIONS_ALL,
         }
@@ -89,6 +92,10 @@ impl ElmContext {
         self.phase
     }
 
+    pub const fn kind(&self) -> ElmKind {
+        self.kind
+    }
+
     pub const fn flags(&self) -> u32 {
         self.flags
     }
@@ -99,6 +106,11 @@ impl ElmContext {
 
     pub const fn with_allowed_actions(mut self, allowed_actions: u32) -> Self {
         self.allowed_actions = allowed_actions;
+        self
+    }
+
+    pub const fn with_kind(mut self, kind: ElmKind) -> Self {
+        self.kind = kind;
         self
     }
 
@@ -114,6 +126,7 @@ pub struct ElmCurrentContext {
     pub generation: Generation,
     pub state: ElmState,
     pub phase: ElmLifecyclePhase,
+    pub kind: ElmKind,
     pub flags: u32,
     pub allowed_actions: u32,
 }
@@ -126,6 +139,7 @@ impl ElmCurrentContext {
             generation: context.generation(),
             state: context.state(),
             phase: context.phase(),
+            kind: context.kind(),
             flags: context.flags(),
             allowed_actions: context.allowed_actions(),
         }
@@ -146,6 +160,8 @@ static CURRENT_STATE: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU32::new(0) }; ELM_CONTEXT_SLOT_COUNT];
 static CURRENT_PHASE: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU32::new(0) }; ELM_CONTEXT_SLOT_COUNT];
+static CURRENT_KIND: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
+    [const { AtomicU32::new(ElmKind::Other as u32) }; ELM_CONTEXT_SLOT_COUNT];
 static CURRENT_FLAGS: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
     [const { AtomicU32::new(0) }; ELM_CONTEXT_SLOT_COUNT];
 static CURRENT_ALLOWED_ACTIONS: [AtomicU32; ELM_CONTEXT_SLOT_COUNT] =
@@ -233,6 +249,8 @@ pub fn current_context() -> Option<ElmCurrentContext> {
         generation: Generation(CURRENT_GENERATION[slot].load(Ordering::Acquire)),
         state: state_from_raw(CURRENT_STATE[slot].load(Ordering::Acquire)),
         phase: phase_from_raw(CURRENT_PHASE[slot].load(Ordering::Acquire)),
+        kind: ElmKind::from_raw(CURRENT_KIND[slot].load(Ordering::Acquire))
+            .unwrap_or(ElmKind::Other),
         flags: CURRENT_FLAGS[slot].load(Ordering::Acquire),
         allowed_actions: CURRENT_ALLOWED_ACTIONS[slot].load(Ordering::Acquire),
     })
@@ -291,6 +309,7 @@ fn store_context_slot(slot: usize, context: ElmCurrentContext) {
     CURRENT_GENERATION[slot].store(context.generation.0, Ordering::Release);
     CURRENT_STATE[slot].store(context.state as u32, Ordering::Release);
     CURRENT_PHASE[slot].store(phase_to_raw(context.phase), Ordering::Release);
+    CURRENT_KIND[slot].store(context.kind as u32, Ordering::Release);
     CURRENT_FLAGS[slot].store(context.flags, Ordering::Release);
     CURRENT_ALLOWED_ACTIONS[slot].store(context.allowed_actions, Ordering::Release);
     CURRENT_CELL_ID[slot].store(context.cell_id.0, Ordering::Release);
@@ -302,6 +321,7 @@ fn clear_context_slot(slot: usize) {
     CURRENT_GENERATION[slot].store(0, Ordering::Release);
     CURRENT_STATE[slot].store(0, Ordering::Release);
     CURRENT_PHASE[slot].store(0, Ordering::Release);
+    CURRENT_KIND[slot].store(ElmKind::Other as u32, Ordering::Release);
     CURRENT_FLAGS[slot].store(0, Ordering::Release);
     CURRENT_ALLOWED_ACTIONS[slot].store(ELM_CONTEXT_ALLOWED_ACTIONS_ALL, Ordering::Release);
 }

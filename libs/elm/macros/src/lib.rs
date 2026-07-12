@@ -221,7 +221,7 @@ fn lifecycle_impl(
             context: *mut ::elm::ElmNativeHookContextV1,
         ) -> i32 {
             unsafe {
-                ::elm::developer::__private::lifecycle_trampoline(context, #phase, #ident)
+                ::elm::__private::lifecycle_trampoline(context, #phase, #ident)
             }
         }
 
@@ -264,7 +264,7 @@ fn migration_export_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<To
             context: *mut ::elm::ElmNativeMigrationContextV1,
         ) -> i32 {
             unsafe {
-                ::elm::developer::__private::migration_export_trampoline(context, #ident)
+                ::elm::__private::migration_export_trampoline(context, #ident)
             }
         }
 
@@ -318,7 +318,7 @@ fn migration_input_impl(
             context: *mut ::elm::ElmNativeMigrationContextV1,
         ) -> i32 {
             unsafe {
-                ::elm::developer::__private::migration_input_trampoline(
+                ::elm::__private::migration_input_trampoline(
                     context,
                     #phase,
                     #ident,
@@ -351,7 +351,7 @@ fn entry_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2>
         pub unsafe extern "C" fn #abi_ident(
             frame: *mut ::elm::ElmNativeEntryFrameV1,
         ) -> i32 {
-            unsafe { ::elm::developer::__private::entry_trampoline(frame, #ident) }
+            unsafe { ::elm::__private::entry_trampoline(frame, #ident) }
         }
 
         #metadata
@@ -395,7 +395,7 @@ fn provider_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStrea
         pub unsafe extern "C" fn #abi_ident(
             frame: *mut ::elm::ElmNativeProviderCallV1,
         ) -> i32 {
-            unsafe { ::elm::developer::__private::provider_trampoline(frame, #ident) }
+            unsafe { ::elm::__private::provider_trampoline(frame, #ident) }
         }
 
         #metadata
@@ -432,7 +432,7 @@ fn provider_snapshot_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<T
         pub unsafe extern "C" fn #abi_ident(
             frame: *mut ::elm::ElmNativeProviderSnapshotV1,
         ) -> i32 {
-            unsafe { ::elm::developer::__private::snapshot_trampoline(frame, #ident) }
+            unsafe { ::elm::__private::snapshot_trampoline(frame, #ident) }
         }
 
         #metadata
@@ -492,7 +492,7 @@ fn export_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2
         pub unsafe extern "C" fn #abi_ident(
             frame: *mut ::elm::ElmNativeManagedCallV1,
         ) -> i32 {
-            unsafe { ::elm::developer::__private::managed_trampoline(frame, #ident) }
+            unsafe { ::elm::__private::managed_trampoline(frame, #ident) }
         }
 
         #metadata
@@ -792,7 +792,7 @@ fn mixin_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2>
             frame: *mut ::elm::ElmNativeProviderCallV1,
         ) -> i32 {
             unsafe {
-                ::elm::developer::__private::mixin_trampoline::<#frame_ty>(frame, #ident)
+                ::elm::__private::mixin_trampoline::<#frame_ty>(frame, #ident)
             }
         }
 
@@ -1334,31 +1334,31 @@ impl WireType {
     fn encoder(&self, ident: &Ident) -> TokenStream2 {
         match self {
             Self::U8 => quote! {
-                ::elm::developer::__private::write_bytes(output, &mut offset, &[self.#ident])?;
+                ::elm::__private::write_bytes(output, &mut offset, &[self.#ident])?;
             },
             Self::I8 => quote! {
-                ::elm::developer::__private::write_bytes(
+                ::elm::__private::write_bytes(
                     output,
                     &mut offset,
                     &self.#ident.to_le_bytes(),
                 )?;
             },
             Self::Bool => quote! {
-                ::elm::developer::__private::write_bytes(
+                ::elm::__private::write_bytes(
                     output,
                     &mut offset,
                     &[u8::from(self.#ident)],
                 )?;
             },
             Self::U16 | Self::U32 | Self::U64 | Self::I16 | Self::I32 | Self::I64 => quote! {
-                ::elm::developer::__private::write_bytes(
+                ::elm::__private::write_bytes(
                     output,
                     &mut offset,
                     &self.#ident.to_le_bytes(),
                 )?;
             },
             Self::Bytes(_) => quote! {
-                ::elm::developer::__private::write_bytes(output, &mut offset, &self.#ident)?;
+                ::elm::__private::write_bytes(output, &mut offset, &self.#ident)?;
             },
         }
     }
@@ -1366,11 +1366,11 @@ impl WireType {
     fn decoder(&self, ident: &Ident) -> TokenStream2 {
         match self {
             Self::U8 => quote! {
-                #ident: ::elm::developer::__private::read_array::<1>(input, &mut offset)?[0]
+                #ident: ::elm::__private::read_array::<1>(input, &mut offset)?[0]
             },
             Self::I8 => quote! {
                 #ident: i8::from_le_bytes(
-                    ::elm::developer::__private::read_array::<1>(input, &mut offset)?,
+                    ::elm::__private::read_array::<1>(input, &mut offset)?,
                 )
             },
             Self::U16 => decode_integer(ident, quote!(u16), 2),
@@ -1380,10 +1380,10 @@ impl WireType {
             Self::I32 => decode_integer(ident, quote!(i32), 4),
             Self::I64 => decode_integer(ident, quote!(i64), 8),
             Self::Bool => quote! {
-                #ident: ::elm::developer::__private::read_bool(input, &mut offset)?
+                #ident: ::elm::__private::read_bool(input, &mut offset)?
             },
             Self::Bytes(length) => quote! {
-                #ident: ::elm::developer::__private::read_array::<#length>(input, &mut offset)?
+                #ident: ::elm::__private::read_array::<#length>(input, &mut offset)?
             },
         }
     }
@@ -1392,7 +1392,7 @@ impl WireType {
 fn decode_integer(ident: &Ident, ty: TokenStream2, size: usize) -> TokenStream2 {
     quote! {
         #ident: #ty::from_le_bytes(
-            ::elm::developer::__private::read_array::<#size>(input, &mut offset)?,
+            ::elm::__private::read_array::<#size>(input, &mut offset)?,
         )
     }
 }

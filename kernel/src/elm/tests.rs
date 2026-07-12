@@ -12,17 +12,17 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use elm_model::{
     ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_API_CURRENT_VERSION,
-    ELM_AUDIT_FLAG_AUTHORIZATION, ELM_AUDIT_FLAG_OPERATION, ELM_CALL_STATUS_BUSY,
-    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
-    ELM_CALL_STATUS_UNSUPPORTED, ELM_CELL_POLICY_FLAG_LOCKED, ELM_CTL_ABI_VERSION,
-    ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_NAME_LEN,
-    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
-    ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN,
-    ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE,
-    ELM_EXTENSION_POLICY_MIXIN_PATCH, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
-    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_EXECUTIONS,
-    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_JOURNAL, ELM_HEALTH_CHECK_MENU,
-    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS,
+    ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER, ELM_AUDIT_FLAG_AUTHORIZATION, ELM_AUDIT_FLAG_OPERATION,
+    ELM_CALL_STATUS_BUSY, ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
+    ELM_CALL_STATUS_UNSUPPORTED, ELM_CELL_POLICY_ALLOW_MANAGEMENT, ELM_CELL_POLICY_FLAG_LOCKED,
+    ELM_CTL_ABI_VERSION, ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_NAME_LEN,
+    ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE,
+    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
+    ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE, ELM_EXTENSION_POLICY_MIXIN_PATCH, ELM_HEALTH_CHECK_AUDITS,
+    ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS,
+    ELM_HEALTH_CHECK_EXECUTIONS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_JOURNAL,
+    ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS,
     ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RESOURCES,
     ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES, ELM_HEALTH_CHECK_TODO_REGISTRY,
     ELM_HEALTH_CHECK_TRUST, ELM_KERNEL_PROVIDER_FLAG_NONE, ELM_LIFECYCLE_REASON_BUILTIN_PROTECTED,
@@ -66,7 +66,10 @@ use elm_model::{
     ElmVersion, FlowDirection, FlowMode, Generation, canonical_ebi_digest, sha256, state_code,
 };
 
-use super::core::{ELM_EKI_ID, ELM_MGR_ID, ElmCore, ElmLifecycleExecutor, ElmMgrAccessTarget};
+use super::core::{
+    ELM_EKI_ID, ELM_MGR_ID, ElmCore, ElmLifecycleExecutor, ElmMgrAccessTarget,
+    management_namespace_allowed,
+};
 use super::mgr_channel::{dispatch_mgr_call_on_core, dispatch_mgr_call_on_core_as};
 
 static OWNED_RESOURCE_TRACE: AtomicU64 = AtomicU64::new(0);
@@ -972,12 +975,18 @@ fn kernel_abi_fingerprint(arch: ElmEbiArch) -> ElmRustAbiFingerprintV1 {
 }
 
 fn signed_metadata_image(name: &str, release_epoch: u64, signing: &SigningKey) -> ElmEbiImage {
+    signed_metadata_image_with_kind(name, ElmKind::Service, release_epoch, signing)
+}
+
+fn signed_metadata_image_with_kind(
+    name: &str,
+    kind: ElmKind,
+    release_epoch: u64,
+    signing: &SigningKey,
+) -> ElmEbiImage {
     let fingerprint = kernel_abi_fingerprint(ElmEbiArch::Any);
-    let unit = ElmEbiUnit::new(
-        manifest(name, ElmKind::Service),
-        ElmEbiTarget::new(ElmEbiArch::Any),
-    )
-    .with_lifecycle_hooks(lifecycle_hooks());
+    let unit = ElmEbiUnit::new(manifest(name, kind), ElmEbiTarget::new(ElmEbiArch::Any))
+        .with_lifecycle_hooks(lifecycle_hooks());
     let image = ElmEbiImage::new(unit).with_abi_fingerprint(fingerprint.clone());
     let public_key = signing.verifying_key().to_bytes();
     let mut proof = ElmEbiProofV1 {
@@ -1078,10 +1087,10 @@ fn ebi_source_payload_under_parent(
     push_u64(&mut out, request.parent_cell_id);
     push_resource_budget(&mut out, request.budget);
     push_u16(&mut out, request.reserved0);
-    push_u16(&mut out, 0);
+    push_u16(&mut out, request.reserved1);
     push_u32(&mut out, request.payload_len);
-    push_u32(&mut out, request.reserved1);
-    push_u32(&mut out, 0);
+    push_u32(&mut out, request.reserved2);
+    push_u32(&mut out, request.reserved3);
     out.extend_from_slice(payload);
     out
 }
@@ -1937,6 +1946,201 @@ fn elm_mgr_manager_and_user_admin_principals_have_global_authority() {
 }
 
 #[ktest]
+fn elm_delegated_manager_requires_signed_explicit_grant_and_has_global_scope() {
+    let signing = SigningKey::from_bytes(&[41; 32]);
+    let public_key = signing.verifying_key().to_bytes();
+    let mut core = ElmCore::new();
+    core.set_allow_unsigned_external(false).unwrap();
+    core.register_trust_anchor(ElmTrustAnchor::new("delegated-manager-root", public_key).unwrap())
+        .unwrap();
+    core.init_builtin_mgr().unwrap();
+
+    let loaded = core.load_declarative_ebi_image_from_source_under_parent(
+        signed_metadata_image_with_kind("delegated-manager", ElmKind::Manager, 1, &signing),
+        ElmEbiArch::Any,
+        ElmEbiSourceKind::Projection,
+        ELM_MGR_ID,
+        ElmResourceBudget::DEFAULT,
+        true,
+    );
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let manager_id = ElmId(loaded.cell_id);
+    let manager = core
+        .cells()
+        .iter()
+        .find(|cell| cell.id == manager_id)
+        .unwrap();
+    assert_eq!(manager.kind, ElmKind::Manager);
+    assert_ne!(
+        manager.cell_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT,
+        0
+    );
+    let manager_generation = manager.generation;
+
+    let target = core.load_ebi_unit(menu_unit("delegated-manager-target"), ElmEbiArch::Any);
+    assert_eq!(target.status, ElmEbiLoadStatus::Ok as i32);
+    let authorization = core.authorize_mgr_call(
+        ElmPrincipal::elm_cell(manager_id, manager_generation),
+        ElmMgrCallKind::PauseCell,
+        ElmMgrAccessTarget::Cell(ElmId(target.cell_id)),
+    );
+    assert!(authorization.allowed());
+    assert_eq!(
+        authorization.authority,
+        ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER
+    );
+
+    let child = core.load_ebi_unit_under_parent(
+        menu_unit("delegated-manager-child"),
+        ElmEbiArch::Any,
+        manager_id,
+        delegated_budget(1),
+    );
+    assert_eq!(child.status, ElmEbiLoadStatus::Ok as i32);
+    let child_policy = core.query_cell_policy(ElmCellPolicyRequest::new(child.cell_id));
+    assert_eq!(
+        child_policy.allowed_actions & ELM_CELL_POLICY_ALLOW_MANAGEMENT,
+        0
+    );
+
+    let mut manager_policy = core.query_cell_policy(ElmCellPolicyRequest::new(manager_id.0));
+    manager_policy.allowed_actions &= !ELM_CELL_POLICY_ALLOW_MANAGEMENT;
+    let denied = core.update_cell_policy(manager_policy);
+    assert_eq!(denied.status, ELM_MGR_STATUS_PERMISSION);
+    assert_eq!(denied.blockers, ELM_POLICY_BLOCK_POLICY_ESCALATION);
+}
+
+#[ktest]
+fn elm_management_grant_rejects_wrong_kind_unsigned_image_and_self_grant() {
+    let signing = SigningKey::from_bytes(&[42; 32]);
+    let public_key = signing.verifying_key().to_bytes();
+    let mut core = ElmCore::new();
+    core.set_allow_unsigned_external(false).unwrap();
+    core.register_trust_anchor(ElmTrustAnchor::new("management-kind-root", public_key).unwrap())
+        .unwrap();
+    core.init_builtin_mgr().unwrap();
+
+    let wrong_kind = core.load_declarative_ebi_image_from_source_under_parent(
+        signed_metadata_image_with_kind("not-a-manager", ElmKind::Service, 1, &signing),
+        ElmEbiArch::Any,
+        ElmEbiSourceKind::Projection,
+        ELM_MGR_ID,
+        ElmResourceBudget::DEFAULT,
+        true,
+    );
+    assert_eq!(wrong_kind.status, ElmEbiLoadStatus::UntrustedImage as i32);
+
+    let service = core.load_ebi_unit(menu_unit("self-grant-service"), ElmEbiArch::Any);
+    let mut policy = core.query_cell_policy(ElmCellPolicyRequest::new(service.cell_id));
+    policy.allowed_actions |= ELM_CELL_POLICY_ALLOW_MANAGEMENT;
+    let denied = core.update_cell_policy(policy);
+    assert_eq!(denied.status, ELM_MGR_STATUS_PERMISSION);
+    assert_eq!(denied.blockers, ELM_POLICY_BLOCK_POLICY_ESCALATION);
+
+    let mut unsigned_core = ElmCore::new();
+    unsigned_core.set_allow_unsigned_external(true).unwrap();
+    unsigned_core.init_builtin_mgr().unwrap();
+    let unsigned_unit = ElmEbiUnit::new(
+        manifest("unsigned-manager", ElmKind::Manager),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks());
+    let unsigned_image = ElmEbiImage::new(unsigned_unit)
+        .with_abi_fingerprint(kernel_abi_fingerprint(ElmEbiArch::Any));
+    let unsigned = unsigned_core.load_declarative_ebi_image_from_source_under_parent(
+        unsigned_image,
+        ElmEbiArch::Any,
+        ElmEbiSourceKind::Projection,
+        ELM_MGR_ID,
+        ElmResourceBudget::DEFAULT,
+        true,
+    );
+    assert_eq!(unsigned.status, ElmEbiLoadStatus::UntrustedImage as i32);
+}
+
+#[ktest]
+fn elm_management_namespace_requires_manager_kind_state_generation_and_capability() {
+    let base = ElmContext::new(
+        ElmId(100),
+        Some(ELM_MGR_ID),
+        Generation::FIRST,
+        ElmState::Loaded,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let granted = base
+        .with_kind(ElmKind::Manager)
+        .with_allowed_actions(ELM_CELL_POLICY_ALLOW_MANAGEMENT);
+    let guard = elm_model::enter_current_context(&granted).unwrap();
+    assert!(management_namespace_allowed(
+        elm_model::current_context().unwrap()
+    ));
+    drop(guard);
+
+    let service = base
+        .with_kind(ElmKind::Service)
+        .with_allowed_actions(ELM_CELL_POLICY_ALLOW_MANAGEMENT);
+    let guard = elm_model::enter_current_context(&service).unwrap();
+    assert!(!management_namespace_allowed(
+        elm_model::current_context().unwrap()
+    ));
+    drop(guard);
+
+    let ungranted = base.with_kind(ElmKind::Manager).with_allowed_actions(0);
+    let guard = elm_model::enter_current_context(&ungranted).unwrap();
+    assert!(!management_namespace_allowed(
+        elm_model::current_context().unwrap()
+    ));
+    drop(guard);
+
+    let faulted = ElmContext::new(
+        ElmId(100),
+        Some(ELM_MGR_ID),
+        Generation::FIRST,
+        ElmState::Faulted,
+        ElmLifecyclePhase::Finalize,
+        0,
+    )
+    .with_kind(ElmKind::Manager)
+    .with_allowed_actions(ELM_CELL_POLICY_ALLOW_MANAGEMENT);
+    let guard = elm_model::enter_current_context(&faulted).unwrap();
+    assert!(!management_namespace_allowed(
+        elm_model::current_context().unwrap()
+    ));
+    drop(guard);
+}
+
+#[ktest]
+fn elm_non_builtin_cell_cannot_request_management_grant() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let actor = core.load_ebi_unit(menu_unit("grant-request-actor"), ElmEbiArch::Any);
+    let actor_id = ElmId(actor.cell_id);
+    let generation = core
+        .cells()
+        .iter()
+        .find(|cell| cell.id == actor_id)
+        .unwrap()
+        .generation;
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("grant-request-manager", "0.1.0", ElmKind::Manager),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+    ]);
+    let mut payload = eki_source_payload(&image);
+    write_u32(&mut payload, 4, ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT);
+    let response = dispatch_mgr_call_on_core_as(
+        &mut core,
+        ElmPrincipal::elm_cell(actor_id, generation),
+        &mgr_call(ElmMgrCallKind::LoadCell, &payload),
+    );
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_PERMISSION);
+    assert_eq!(core.cells().len(), 3);
+}
+
+#[ktest]
 fn elm_mgr_load_request_attaches_child_to_explicit_parent() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
@@ -2777,6 +2981,26 @@ fn elm_mgr_rejects_external_distribution_source_kind() {
 
     let response =
         dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+}
+
+#[ktest]
+fn elm_mgr_rejects_unknown_source_flags_and_cross_protocol_session_flags() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+
+    let mut source = raw_ebi_source_payload(ElmEbiSourceKind::Projection as u16, &[]);
+    write_u32(&mut source, 4, 1 << 31);
+    let response =
+        dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &source));
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+
+    let mut session = image_session_begin_payload(b"image", 1_000);
+    write_u32(&mut session, 4, ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT);
+    let response = dispatch_mgr_call_on_core(
+        &mut core,
+        &mgr_call(ElmMgrCallKind::BeginImageSession, &session),
+    );
     assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
 }
 

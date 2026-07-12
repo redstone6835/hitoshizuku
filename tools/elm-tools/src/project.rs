@@ -207,7 +207,10 @@ pub fn scaffold_project(
     fs::create_dir_all(directory.join("src")).map_err(|err| format!("创建 src 失败: {err}"))?;
     fs::create_dir_all(directory.join(".cargo"))
         .map_err(|err| format!("创建 .cargo 失败: {err}"))?;
-    write_new(&directory.join("Cargo.toml"), &cargo_toml(&cargo_name))?;
+    write_new(
+        &directory.join("Cargo.toml"),
+        &cargo_toml(&cargo_name, kind),
+    )?;
     write_new(&directory.join("Elm.toml"), &elm_toml(name, kind, source))?;
     write_new(&directory.join("src/main.rs"), &main_rs(name))?;
     write_new(&directory.join("elm.ld"), ELM_LINKER_SCRIPT)?;
@@ -224,6 +227,8 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
             project.display()
         ));
     }
+    let project_manifest = ElmProjectManifest::load(project)?;
+    migrate_cargo_manifest(&manifest, &project_manifest.kind)?;
     let source = framework_source_root()?;
     let elm_source = source.join("libs/elm");
     if !elm_source.join("Cargo.toml").is_file() {
@@ -240,7 +245,6 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     fs::create_dir_all(&temporary)
         .map_err(|err| format!("创建 {} 失败: {err}", temporary.display()))?;
     copy_tree(&elm_source, &temporary.join("elm"))?;
-    write_elmmgr_package(&temporary.join("elmmgr"))?;
     if destination.exists() {
         fs::rename(&destination, &backup).map_err(|err| {
             format!(
@@ -344,37 +348,6 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_elmmgr_package(root: &Path) -> Result<(), String> {
-    fs::create_dir_all(root.join("src")).map_err(|err| format!("创建 elmmgr 包失败: {err}"))?;
-    fs::write(
-        root.join("Cargo.toml"),
-        r#"[package]
-name = "elmmgr"
-version.workspace = true
-edition.workspace = true
-
-[lib]
-path = "src/lib.rs"
-
-[dependencies]
-elm = { path = "../elm", default-features = false, features = ["module"] }
-"#,
-    )
-    .map_err(|err| format!("写入 elmmgr Cargo.toml 失败: {err}"))?;
-    fs::write(
-        root.join("src/lib.rs"),
-        r#"#![no_std]
-
-//! ELM 工程使用的 elm-mgr 运行时入口。
-
-pub mod api {
-    pub use elm::elmmgr::api::*;
-}
-"#,
-    )
-    .map_err(|err| format!("写入 elmmgr lib.rs 失败: {err}"))
-}
-
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     if path.is_dir() {
         fs::remove_dir_all(path).map_err(|err| format!("删除 {} 失败: {err}", path.display()))?;
@@ -391,7 +364,8 @@ fn write_new(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents).map_err(|err| format!("写入 {} 失败: {err}", path.display()))
 }
 
-fn cargo_toml(name: &str) -> String {
+fn cargo_toml(name: &str, kind: &str) -> String {
+    let features = elm_features(kind);
     format!(
         r#"[workspace]
 resolver = "2"
@@ -399,7 +373,6 @@ members = [
     ".",
     ".elm/framework/elm",
     ".elm/framework/elm/macros",
-    ".elm/framework/elmmgr",
 ]
 
 [workspace.package]
@@ -418,8 +391,7 @@ test = false
 bench = false
 
 [dependencies]
-elm = {{ path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }}
-elmmgr = {{ path = ".elm/framework/elmmgr" }}
+elm = {{ path = ".elm/framework/elm", default-features = false, features = [{features}] }}
 
 [profile.release]
 panic = "abort"
@@ -450,24 +422,74 @@ use elm::{{HookResult, LifecycleContext}};
 
 #[elm::on_initialize]
 fn initialize(_context: &LifecycleContext) -> HookResult {{
-    elmmgr::api::log(6, "{name}: initialized")
+    elm::runtime::log(6, "{name}: initialized")
         .map_err(|_| elm::HookError::new(-1))?;
     Ok(())
 }}
 
 #[elm::on_finalize]
 fn finalize(_context: &LifecycleContext) -> HookResult {{
-    elmmgr::api::log(6, "{name}: finalized")
+    elm::runtime::log(6, "{name}: finalized")
         .map_err(|_| elm::HookError::new(-1))?;
     Ok(())
 }}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {{
-    elmmgr::api::abort_panic()
+    elm::runtime::abort_panic()
 }}
 "#
     )
+}
+
+fn elm_features(kind: &str) -> &'static str {
+    if kind == "manager" {
+        "\"module\", \"macros\", \"management\""
+    } else {
+        "\"module\", \"macros\""
+    }
+}
+
+fn migrate_cargo_manifest(path: &Path, kind: &str) -> Result<(), String> {
+    let input =
+        fs::read_to_string(path).map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
+    let mut output = input
+        .replace("    \".elm/framework/elmmgr\",\n", "")
+        .replace("elmmgr = { path = \".elm/framework/elmmgr\" }\n", "");
+    if output.contains("elmmgr") {
+        return Err(format!(
+            "{} 仍包含定制化 elmmgr 依赖或路径；ELM v1 只允许 elm::runtime 和 elm::management，请手动移除后重试",
+            path.display()
+        ));
+    }
+
+    let standard_module = "elm = { path = \".elm/framework/elm\", default-features = false, features = [\"module\", \"macros\"] }";
+    let standard_manager = "elm = { path = \".elm/framework/elm\", default-features = false, features = [\"module\", \"macros\", \"management\"] }";
+    let desired = if kind == "manager" {
+        standard_manager
+    } else {
+        standard_module
+    };
+    if output.contains(standard_module) {
+        output = output.replace(standard_module, desired);
+    } else if output.contains(standard_manager) {
+        output = output.replace(standard_manager, desired);
+    } else if !output
+        .lines()
+        .any(|line| line.trim_start().starts_with("elm ="))
+    {
+        return Err(format!("{} 缺少 elm 框架依赖", path.display()));
+    } else if kind == "manager" && !output.contains("\"management\"") {
+        return Err(format!(
+            "{} 使用定制化 elm 依赖，但 Manager 工程未启用 management feature",
+            path.display()
+        ));
+    }
+
+    if output != input {
+        fs::write(path, output).map_err(|err| format!("迁移 {} 失败: {err}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn strip_comment(line: &str) -> Result<&str, String> {
@@ -690,7 +712,36 @@ SECTIONS
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "elm-tools-{name}-{}-{sequence}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn parses_complete_manifest() {
@@ -732,5 +783,101 @@ uri = "forbidden"
         )
         .unwrap_err();
         assert!(error.contains("未知字段 uri"));
+    }
+
+    #[test]
+    fn scaffolds_single_framework_for_service_and_manager_projects() {
+        let service = TestDirectory::new("service-project");
+        scaffold_project(service.path(), "demo.service", "service", "local.test").unwrap();
+        let service_cargo = fs::read_to_string(service.path().join("Cargo.toml")).unwrap();
+        let service_source = fs::read_to_string(service.path().join("src/main.rs")).unwrap();
+        assert!(service_cargo.contains("features = [\"module\", \"macros\"]"));
+        assert!(!service_cargo.contains("management"));
+        assert!(!service_cargo.contains("elmmgr"));
+        assert!(service_source.contains("elm::runtime::log"));
+        assert!(service_source.contains("elm::runtime::abort_panic"));
+        assert!(
+            service
+                .path()
+                .join(".elm/framework/elm/Cargo.toml")
+                .is_file()
+        );
+        assert!(!service.path().join(".elm/framework/elmmgr").exists());
+
+        let manager = TestDirectory::new("manager-project");
+        scaffold_project(manager.path(), "demo.manager", "manager", "local.test").unwrap();
+        let manager_cargo = fs::read_to_string(manager.path().join("Cargo.toml")).unwrap();
+        assert!(manager_cargo.contains("features = [\"module\", \"macros\", \"management\"]"));
+        assert!(!manager_cargo.contains("elmmgr"));
+        assert!(!manager.path().join(".elm/framework/elmmgr").exists());
+    }
+
+    #[test]
+    fn migrates_only_the_retired_standard_elmmgr_layout() {
+        let directory = TestDirectory::new("legacy-migration");
+        let manifest = directory.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[workspace]
+members = [
+    ".",
+    ".elm/framework/elm",
+    ".elm/framework/elm/macros",
+    ".elm/framework/elmmgr",
+]
+
+[dependencies]
+elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
+elmmgr = { path = ".elm/framework/elmmgr" }
+"#,
+        )
+        .unwrap();
+        migrate_cargo_manifest(&manifest, "manager").unwrap();
+        let migrated = fs::read_to_string(&manifest).unwrap();
+        assert!(!migrated.contains("elmmgr"));
+        assert!(migrated.contains("features = [\"module\", \"macros\", \"management\"]"));
+
+        fs::write(
+            &manifest,
+            r#"[dependencies]
+elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
+elmmgr = { path = "custom/elmmgr" }
+"#,
+        )
+        .unwrap();
+        let error = migrate_cargo_manifest(&manifest, "service").unwrap_err();
+        assert!(error.contains("定制化 elmmgr"));
+        assert!(
+            fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("custom/elmmgr")
+        );
+    }
+
+    #[test]
+    fn migration_enforces_management_feature_by_project_kind() {
+        let directory = TestDirectory::new("feature-migration");
+        let manifest = directory.path().join("Cargo.toml");
+        fs::write(
+            &manifest,
+            r#"[dependencies]
+elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros", "management"] }
+"#,
+        )
+        .unwrap();
+        migrate_cargo_manifest(&manifest, "service").unwrap();
+        let service = fs::read_to_string(&manifest).unwrap();
+        assert!(service.contains("features = [\"module\", \"macros\"]"));
+        assert!(!service.contains("management"));
+
+        fs::write(
+            &manifest,
+            r#"[dependencies]
+elm = { path = "custom/elm", default-features = false, features = ["module", "macros"] }
+"#,
+        )
+        .unwrap();
+        let error = migrate_cargo_manifest(&manifest, "manager").unwrap_err();
+        assert!(error.contains("Manager 工程未启用 management feature"));
     }
 }

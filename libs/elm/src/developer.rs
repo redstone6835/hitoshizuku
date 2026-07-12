@@ -10,9 +10,11 @@ use crate::context::{
     ELM_NATIVE_HOOK_CONTEXT_ABI_VERSION, ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION,
     ElmNativeHookContextV1, ElmNativeMigrationContextV1,
 };
+#[cfg(feature = "management")]
+use crate::elmapi::ElmApiNamespaceV1;
 use crate::elmapi::{
     ELM_API_ABORT_REASON_PANIC, ELM_API_ROOT_MAGIC, ELM_API_STATUS_BUFFER_TOO_SMALL,
-    ELM_API_VERSION_V1, ElmApiContextV1, ElmApiNamespaceV1, ElmApiRootV1, ElmRuntimeApiV1,
+    ELM_API_VERSION_V1, ElmApiContextV1, ElmApiRootV1, ElmRuntimeApiV1,
 };
 use crate::frame::{
     ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_PROVIDER_FAULT,
@@ -23,10 +25,9 @@ use crate::frame::{
     ElmNativeManagedCallV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1, ElmReplyFrame,
 };
 use crate::module_wire::{
-    EXTENSION_DISPATCH_CALL_KIND, MGR_EXTENSION_DISPATCH_RESPONSE_SIZE, MGR_EXTENSION_PAYLOAD_LEN,
-    MGR_RESPONSE_HEADER_SIZE, MGR_STATUS_OK, MIXIN_REPLY_CONTINUE, MIXIN_REPLY_DENY,
-    MIXIN_REPLY_REPLACE, MIXIN_REPLY_STOP, ModuleExtensionDispatchRequest,
-    ModuleExtensionDispatchResponse, ModuleMgrResponseHeader,
+    MGR_EXTENSION_DISPATCH_RESPONSE_SIZE, MGR_EXTENSION_PAYLOAD_LEN, MGR_RESPONSE_HEADER_SIZE,
+    MGR_STATUS_OK, MIXIN_REPLY_CONTINUE, MIXIN_REPLY_DENY, MIXIN_REPLY_REPLACE, MIXIN_REPLY_STOP,
+    ModuleExtensionDispatchRequest, ModuleExtensionDispatchResponse, ModuleMgrResponseHeader,
 };
 
 pub const ELM_API_ROOT_SLOT_SYMBOL: &str = "__elm_api_root_slot_v1";
@@ -554,7 +555,7 @@ impl From<PayloadError> for RuntimeApiError {
     }
 }
 
-pub mod runtime_api {
+pub(crate) mod runtime_api {
     use super::*;
 
     pub fn features() -> Result<u64, RuntimeApiError> {
@@ -586,10 +587,9 @@ pub mod runtime_api {
         Ok(output)
     }
 
-    pub fn dispatch(kind: u32, input: &[u8], output: &mut [u8]) -> Result<usize, RuntimeApiError> {
+    pub fn dispatch_mixin(input: &[u8], output: &mut [u8]) -> Result<usize, RuntimeApiError> {
         let mut output_len = 0usize;
-        let status = (runtime()?.dispatch)(
-            kind,
+        let status = (runtime()?.dispatch_mixin)(
             input.as_ptr(),
             input.len(),
             output.as_mut_ptr(),
@@ -623,6 +623,7 @@ pub mod runtime_api {
         Ok(reply)
     }
 
+    #[cfg(feature = "management")]
     pub fn query_namespace(
         identifier: &str,
         versions: &[u16],
@@ -732,8 +733,8 @@ fn dispatch_mixin_stage<T: ElmPayload>(
     request.payload_len = payload_len as u16;
     let input = request.encode();
     let mut output = [0u8; MGR_RESPONSE_HEADER_SIZE + MGR_EXTENSION_DISPATCH_RESPONSE_SIZE];
-    let output_len = runtime_api::dispatch(EXTENSION_DISPATCH_CALL_KIND, &input, &mut output)
-        .map_err(runtime_error_to_hook)?;
+    let output_len =
+        runtime_api::dispatch_mixin(&input, &mut output).map_err(runtime_error_to_hook)?;
     let header_size = MGR_RESPONSE_HEADER_SIZE;
     let response_size = MGR_EXTENSION_DISPATCH_RESPONSE_SIZE;
     if output_len != header_size + response_size {

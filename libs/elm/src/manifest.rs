@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{ElmError, ElmResult};
+pub use crate::kind::ElmKind;
 use crate::nexus::{NexusIntent, NexusOffer};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,47 +40,6 @@ impl ElmVersion {
 
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ElmKind {
-    Manager,
-    Service,
-    Driver,
-    Extension,
-    Filesystem,
-    Network,
-    Debug,
-    Other,
-}
-
-impl ElmKind {
-    pub const fn from_raw(raw: u32) -> Option<Self> {
-        match raw {
-            1 => Some(Self::Manager),
-            2 => Some(Self::Service),
-            3 => Some(Self::Driver),
-            4 => Some(Self::Extension),
-            5 => Some(Self::Filesystem),
-            6 => Some(Self::Network),
-            7 => Some(Self::Debug),
-            8 => Some(Self::Other),
-            _ => None,
-        }
-    }
-
-    pub const fn as_raw(self) -> u32 {
-        match self {
-            Self::Manager => 1,
-            Self::Service => 2,
-            Self::Driver => 3,
-            Self::Extension => 4,
-            Self::Filesystem => 5,
-            Self::Network => 6,
-            Self::Debug => 7,
-            Self::Other => 8,
-        }
     }
 }
 

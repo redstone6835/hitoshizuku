@@ -1,8 +1,9 @@
 //! `elm-mgr` 对外 API 与事件订阅协议。
 //!
-//! 本模块只定义稳定的 Rust ABI 固定布局。新代码优先使用
-//! `elm::elmmgr::api::*`；`elm::mgr::api::*` 保留为兼容路径。这里描述的是
-//! ELM 运行时自身能力，不是访问 VFS、调度、内存分配等子系统的唯一入口。
+//! 本模块只定义稳定的 Rust ABI 固定布局，并作为 `elm` crate 的私有实现细节存在。
+//! 对外管理操作统一通过 `elm::management::Client`，普通运行时操作统一通过
+//! `elm::runtime`；这里描述的是 ELM 运行时自身能力，不是访问 VFS、调度、内存分配
+//! 等子系统的唯一入口。
 
 use crate::ctl::ELM_CTL_ABI_VERSION;
 use crate::event::ElmEventRecord;

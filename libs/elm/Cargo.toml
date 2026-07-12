@@ -5,13 +5,14 @@ edition.workspace = true
 
 [lib]
 test = true
-doctest = false
+doctest = true
 bench = false
 
 [features]
 default = ["runtime-model", "macros"]
 runtime-model = ["dep:ed25519-dalek"]
 module = []
+management = ["module"]
 macros = ["dep:elm-macros"]
 
 [dependencies]

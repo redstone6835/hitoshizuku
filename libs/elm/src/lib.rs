@@ -1,40 +1,58 @@
 #![no_std]
 
-//! ELM（可拓展内核单元）纯模型层。
+//! ELM（可拓展内核单元）模型、协议与 Rust 开发框架。
 //!
-//! 本库只描述架构无关、内核无关的模型：单元清单、状态机、枢纽连接层、
-//! 绑定图、拓展点和资源租约。它不能依赖 `kernel`、`general` 或 `arch`。
+//! 本库描述架构无关、内核无关的模型与固定 ABI，并提供外部 Rust ELM 使用的安全
+//! 包装和 attribute。它不能依赖 `kernel`、`general` 或 `arch`。
+//!
+//! 未发布的旧管理路径不会进入 v1 公开面：
+//!
+//! ```compile_fail
+//! use elm::mgr;
+//! ```
+//!
+//! ```compile_fail
+//! use elm::elmmgr;
+//! ```
+//!
+//! ```compile_fail
+//! use elm::developer;
+//! ```
 
 #[cfg(feature = "runtime-model")]
 extern crate alloc;
 
 pub mod context;
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub mod ctl;
-pub mod developer;
+mod developer;
 #[cfg(feature = "runtime-model")]
 pub mod ebi;
+#[cfg(any(feature = "runtime-model", feature = "management"))]
+mod ebi_wire;
 #[cfg(feature = "runtime-model")]
 pub mod eki;
 pub mod elmapi;
-pub mod elmmgr;
 pub mod error;
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub mod event;
 pub mod frame;
 #[cfg(feature = "runtime-model")]
 pub mod graph;
 pub mod ids;
+pub mod kind;
 #[cfg(feature = "runtime-model")]
 pub mod lease;
+#[cfg(feature = "management")]
+pub mod management;
 #[cfg(feature = "runtime-model")]
 pub mod manifest;
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub mod menu;
 #[cfg(feature = "runtime-model")]
 pub mod metadata;
-#[cfg(feature = "runtime-model")]
-pub mod mgr;
+#[cfg(any(feature = "runtime-model", feature = "management"))]
+mod mgr;
 pub(crate) mod module_wire;
 #[cfg(feature = "runtime-model")]
 pub mod native;
@@ -48,13 +66,15 @@ pub mod ports;
 pub mod proof;
 #[cfg(feature = "runtime-model")]
 pub mod provider;
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub mod resource;
+pub mod runtime;
 #[cfg(feature = "runtime-model")]
 pub mod snapshot;
 pub mod state;
 #[cfg(feature = "runtime-model")]
 pub mod topology;
+pub mod wire;
 
 #[cfg(not(any(feature = "runtime-model", feature = "module")))]
 compile_error!("elm crate 必须启用 runtime-model 或 module 编译面");
@@ -73,7 +93,7 @@ pub use context::{
     ElmNativeMigrationContextV1, current_cell, current_context, enter_current_context,
     register_current_context_ops, register_current_cpu_id, try_enter_current_context,
 };
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use ctl::{
     ELM_CORE_CAP_EVENTS, ELM_CORE_CAP_MGR_CHANNEL, ELM_CORE_CAP_SNAPSHOT, ELM_CTL_ABI_VERSION,
     ELM_CTL_MAGIC, ElmCoreInfo, ElmCtlCommand, ElmCtlHeader, ElmCtlStatus,
@@ -87,6 +107,21 @@ pub use developer::{
     ProviderResult, RuntimeApiError, SnapshotReply, SnapshotRequest, SnapshotResult,
     UnsafeDirectImport, run_mixin_point,
 };
+#[cfg(any(feature = "runtime-model", feature = "management"))]
+pub use ebi_wire::{
+    ELM_EBI_PROJECTION_SOURCE_ABI_VERSION, ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION,
+    ELM_EBI_PROJECTION_SOURCE_FLAGS_MASK, ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE,
+    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SOURCE_FLAG_NONE,
+    ELM_EBI_SOURCE_FLAGS_MASK, ELM_EBI_SOURCE_REQUEST_SIZE,
+    ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION, ElmEbiLoadStatus, ElmEbiSourceKind,
+    ElmEbiSourceRequest, ElmImageSessionReferenceV1, ElmLoadCellResponse,
+    ElmProjectionSourceRequest,
+};
+
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::developer::__private::*;
+}
 #[cfg(feature = "runtime-model")]
 pub use ebi::{
     ELM_EBI_ABI_VERSION, ELM_EBI_EXPORT_FLAG_DEPENDENCY, ELM_EBI_EXPORT_FLAG_DIRECT_PINNED,
@@ -99,22 +134,17 @@ pub use ebi::{
     ELM_EBI_IMPORT_FLAGS_MASK, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
     ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS,
-    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_PROJECTION_SOURCE_ABI_VERSION,
-    ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION, ELM_EBI_PROJECTION_SOURCE_FLAGS_MASK,
-    ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE, ELM_EBI_RELOCATION_FLAG_NONE, ELM_EBI_RUST_ABI_VERSION,
-    ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT,
-    ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SEGMENT_SOURCE_NONE,
-    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_NONE, ELM_EBI_SOURCE_REQUEST_SIZE,
-    ELM_EBI_SYMBOL_FLAG_NONE, ELM_EBI_SYMBOL_LOCATION_FLAG_NONE, ELM_EBI_SYMBOL_NAME_LEN,
-    ELM_EKI_PROJECTION_SOURCE_ID, ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION, ELM_MIGRATION_STATE_MAX,
-    ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl,
-    ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
-    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
-    ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind,
-    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload,
-    ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
-    ElmImageReader, ElmImageSessionReferenceV1, ElmLoadCellResponse, ElmProjectionSourceRequest,
-    ElmSliceImageReader, default_segment_flags, relocation_width,
+    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_RELOCATION_FLAG_NONE,
+    ELM_EBI_RUST_ABI_VERSION, ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ,
+    ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT, ELM_EBI_SEGMENT_FLAG_WRITE,
+    ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SEGMENT_SOURCE_NONE, ELM_EBI_SYMBOL_FLAG_NONE,
+    ELM_EBI_SYMBOL_LOCATION_FLAG_NONE, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_PROJECTION_SOURCE_ID,
+    ELM_MIGRATION_STATE_MAX, ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry,
+    ElmEbiExportDecl, ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
+    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiMenuDecl,
+    ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
+    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget,
+    ElmEbiUnit, ElmImageReader, ElmSliceImageReader, default_segment_flags, relocation_width,
 };
 #[cfg(feature = "runtime-model")]
 pub use eki::{
@@ -130,18 +160,19 @@ pub use eki::{
 pub use elmapi::kernel_api_manifest_v1;
 pub use elmapi::{
     ELM_API_ABORT_REASON_CANCEL, ELM_API_ABORT_REASON_PANIC, ELM_API_ABORT_REASON_TIMEOUT,
-    ELM_API_CURRENT_VERSION, ELM_API_FEATURE_ABORT, ELM_API_FEATURE_CONTEXT,
-    ELM_API_FEATURE_DISPATCH, ELM_API_FEATURE_LOG, ELM_API_FEATURE_MANAGED_CALL,
-    ELM_API_FEATURE_NAMESPACE_QUERY, ELM_API_FEATURES_V1, ELM_API_MAX_COMPATIBLE_VERSIONS,
+    ELM_API_CURRENT_VERSION, ELM_API_FEATURE_ABORT, ELM_API_FEATURE_CONTEXT, ELM_API_FEATURE_LOG,
+    ELM_API_FEATURE_MANAGED_CALL, ELM_API_FEATURE_MIXIN_DISPATCH, ELM_API_FEATURE_NAMESPACE_QUERY,
+    ELM_API_FEATURES_V1, ELM_API_MANAGEMENT_IDENTIFIER, ELM_API_MAX_COMPATIBLE_VERSIONS,
     ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_MAGIC,
     ELM_API_RUNTIME_IDENTIFIER, ELM_API_STATUS_BUFFER_TOO_SMALL, ELM_API_STATUS_INVALID,
     ELM_API_STATUS_NOT_FOUND, ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION,
     ELM_API_STATUS_UNSUPPORTED, ELM_API_VERSION_V1, ElmApiAbortCurrentV1, ElmApiContextV1,
-    ElmApiCurrentContextV1, ElmApiDispatchV1, ElmApiInvokeManagedV1, ElmApiLogV1,
-    ElmApiNamespaceV1, ElmApiQueryNamespaceV1, ElmApiRootV1, ElmRuntimeApiV1,
+    ElmApiCurrentContextV1, ElmApiInvokeManagedV1, ElmApiLogV1, ElmApiMixinDispatchV1,
+    ElmApiNamespaceV1, ElmApiQueryNamespaceV1, ElmApiRootV1, ElmManagementApiV1,
+    ElmManagementDispatchV1, ElmRuntimeApiV1,
 };
 pub use error::{ElmError, ElmResult};
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use event::{ElmEventRecord, ElmEventSequence};
 pub use frame::{
     ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_CALL_FLAG_NONE, ELM_CALL_STATUS_BUSY,
@@ -156,17 +187,18 @@ pub use frame::{
 };
 #[cfg(feature = "runtime-model")]
 pub use graph::{
-    BindingGraph, CapabilityBindingEdge, DependencyEdge, ElmMixinMode, ExtensionEdge,
-    ExtensionPoint, GraphRemovalReport, GraphValidationReport, ParentEdge,
+    BindingGraph, CapabilityBindingEdge, DependencyEdge, ExtensionEdge, ExtensionPoint,
+    GraphRemovalReport, GraphValidationReport, ParentEdge,
 };
 pub use ids::{
     ActionId, BindingId, ELM_EKI_BUILTIN_ID, ELM_MGR_BUILTIN_ID, ElmId, Generation, LeaseId, PortId,
 };
+pub use kind::ElmKind;
 #[cfg(feature = "runtime-model")]
 pub use lease::{LeaseKind, LeaseRegistry, LeaseRights, LeaseState, ResourceLease};
 #[cfg(feature = "runtime-model")]
-pub use manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
-#[cfg(feature = "runtime-model")]
+pub use manifest::{ElmManifest, ElmName, ElmVersion};
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use menu::{
     ELM_MENU_DESCRIPTION_LEN, ELM_MENU_FLAG_DISABLED, ELM_MENU_FLAG_REQUIRES_SYS_ADMIN,
     ELM_MENU_FLAG_TODO, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ElmMenuItemKind,
@@ -185,7 +217,7 @@ pub use metadata::{
     ElmRustMetadataField, ElmRustMetadataKind, ElmRustMetadataRecord, ElmRustMetadataValueKind,
     crc32, parse_rust_metadata_section,
 };
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use mgr::api::{
     ELM_MGR_API_CONTRACT_LEN, ELM_MGR_API_FLAG_PROVIDER_OPS, ELM_MGR_API_FLAG_STABLE,
     ELM_MGR_API_FLAG_SYSCALL, ELM_MGR_API_FLAG_SYSFS, ELM_MGR_API_FLAG_TODO,
@@ -200,24 +232,26 @@ pub use mgr::api::{
     ElmMgrEventUnsubscribeRequest, ElmMgrEventUnsubscribeResponse, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest,
 };
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use mgr::{
-    ELM_AUDIT_AUTHORITY_ANCESTOR, ELM_AUDIT_AUTHORITY_KERNEL, ELM_AUDIT_AUTHORITY_MANAGER,
-    ELM_AUDIT_AUTHORITY_SELF, ELM_AUDIT_AUTHORITY_USER_ADMIN, ELM_AUDIT_FLAG_AUTHORIZATION,
-    ELM_AUDIT_FLAG_OPERATION, ELM_CELL_POLICY_ALLOW_ALL, ELM_CELL_POLICY_ALLOW_BIND,
-    ELM_CELL_POLICY_ALLOW_EVENT, ELM_CELL_POLICY_ALLOW_EXTENSION, ELM_CELL_POLICY_ALLOW_LIFECYCLE,
-    ELM_CELL_POLICY_ALLOW_NATIVE, ELM_CELL_POLICY_ALLOW_OBSERVE,
+    ELM_AUDIT_AUTHORITY_ANCESTOR, ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER,
+    ELM_AUDIT_AUTHORITY_KERNEL, ELM_AUDIT_AUTHORITY_MANAGER, ELM_AUDIT_AUTHORITY_SELF,
+    ELM_AUDIT_AUTHORITY_USER_ADMIN, ELM_AUDIT_FLAG_AUTHORIZATION, ELM_AUDIT_FLAG_OPERATION,
+    ELM_CELL_POLICY_ALLOW_ALL, ELM_CELL_POLICY_ALLOW_BIND, ELM_CELL_POLICY_ALLOW_EVENT,
+    ELM_CELL_POLICY_ALLOW_EXTENSION, ELM_CELL_POLICY_ALLOW_LIFECYCLE,
+    ELM_CELL_POLICY_ALLOW_MANAGEMENT, ELM_CELL_POLICY_ALLOW_NATIVE, ELM_CELL_POLICY_ALLOW_OBSERVE,
     ELM_CELL_POLICY_ALLOW_POLICY_UPDATE, ELM_CELL_POLICY_ALLOW_PROVIDER,
-    ELM_CELL_POLICY_ALLOW_RESOURCE_UPDATE, ELM_CELL_POLICY_FLAG_AUDIT_ALL,
-    ELM_CELL_POLICY_FLAG_DENY_CHILD_ESCALATION, ELM_CELL_POLICY_FLAG_LOCKED,
-    ELM_CELL_POLICY_FLAGS_MASK, ELM_EXTENSION_DISPATCH_FLAG_ALLOW_EMPTY,
-    ELM_EXTENSION_DISPATCH_FLAG_REQUIRE_EXACT_EXTENSION, ELM_EXTENSION_DISPATCH_FLAGS_MASK,
-    ELM_EXTENSION_POLICY_ACCEPT, ELM_EXTENSION_POLICY_ALL, ELM_EXTENSION_POLICY_ATTACH,
-    ELM_EXTENSION_POLICY_DETACH, ELM_EXTENSION_POLICY_DISPATCH, ELM_EXTENSION_POLICY_MIXIN_PATCH,
-    ELM_EXTENSION_RECORD_KIND_EDGE, ELM_EXTENSION_RECORD_KIND_POINT, ELM_HEALTH_CHECK_AUDITS,
-    ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS,
-    ELM_HEALTH_CHECK_EXECUTIONS, ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_JOURNAL,
-    ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS,
+    ELM_CELL_POLICY_ALLOW_RESOURCE_UPDATE, ELM_CELL_POLICY_ALLOWED_ACTIONS_MASK,
+    ELM_CELL_POLICY_FLAG_AUDIT_ALL, ELM_CELL_POLICY_FLAG_DENY_CHILD_ESCALATION,
+    ELM_CELL_POLICY_FLAG_LOCKED, ELM_CELL_POLICY_FLAGS_MASK,
+    ELM_EXTENSION_DISPATCH_FLAG_ALLOW_EMPTY, ELM_EXTENSION_DISPATCH_FLAG_REQUIRE_EXACT_EXTENSION,
+    ELM_EXTENSION_DISPATCH_FLAGS_MASK, ELM_EXTENSION_POLICY_ACCEPT, ELM_EXTENSION_POLICY_ALL,
+    ELM_EXTENSION_POLICY_ATTACH, ELM_EXTENSION_POLICY_DETACH, ELM_EXTENSION_POLICY_DISPATCH,
+    ELM_EXTENSION_POLICY_MIXIN_PATCH, ELM_EXTENSION_RECORD_KIND_EDGE,
+    ELM_EXTENSION_RECORD_KIND_POINT, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
+    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_EXECUTIONS,
+    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_JOURNAL, ELM_HEALTH_CHECK_MENU,
+    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS,
     ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RESOURCES,
     ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES, ELM_HEALTH_CHECK_TODO_REGISTRY,
     ELM_HEALTH_CHECK_TRUST, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
@@ -333,15 +367,14 @@ pub use mgr::{
 };
 #[cfg(feature = "runtime-model")]
 pub use nexus::{
-    FlowBackpressure, FlowConcurrency, FlowContract, FlowDirection, FlowMode, IntentKind,
-    NexusIntent, NexusOffer,
+    FlowBackpressure, FlowConcurrency, FlowContract, IntentKind, NexusIntent, NexusOffer,
 };
 #[cfg(feature = "runtime-model")]
 pub use policy::{
     ElmPolicyCheck, ElmPrincipal, ElmPrincipalKind, check_current_cell, current_cell_allows,
 };
 #[cfg(feature = "runtime-model")]
-pub use ports::{BuiltinPort, ElmPortAccessPolicy, PortDescriptor, builtin_port_descriptors};
+pub use ports::{BuiltinPort, PortDescriptor, builtin_port_descriptors};
 #[cfg(feature = "runtime-model")]
 pub use proof::{
     ELM_PROOF_ABI_VERSION, ELM_PROOF_ED25519_PUBLIC_KEY_LEN, ELM_PROOF_ED25519_SIGNATURE_LEN,
@@ -357,7 +390,7 @@ pub use provider::{
     ElmKernelProviderRevoke, ElmKernelProviderSnapshot, ElmKernelProviderSnapshotPage,
     ElmKernelProviderSnapshotPaged, ElmKernelProviderSpec, elm_kernel_provider_unsupported,
 };
-#[cfg(feature = "runtime-model")]
+#[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use resource::{
     ELM_OWNED_RESOURCE_ABI_VERSION, ELM_OWNED_RESOURCE_FLAG_NONE, ElmOwnedResourceKind,
     ElmOwnedResourceOp, ElmOwnedResourceOpsV1, ElmOwnedResourceSnapshotV1, ElmOwnedResourceState,
@@ -373,6 +406,7 @@ pub use snapshot::{
 pub use state::{ElmState, ElmTransition};
 #[cfg(feature = "runtime-model")]
 pub use topology::{TopologyEvent, TopologyEventKind, TopologySnapshot};
+pub use wire::{ElmMixinMode, ElmPortAccessPolicy, FlowDirection, FlowMode};
 
 #[cfg(test)]
 mod tests;

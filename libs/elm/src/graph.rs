@@ -8,25 +8,7 @@ use crate::error::{ElmError, ElmResult};
 use crate::ids::{BindingId, ElmId, Generation, LeaseId, PortId};
 use crate::manifest::ElmManifest;
 use crate::nexus::FlowContract;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ElmMixinMode {
-    Chain = 1,
-    Observer = 2,
-    Exclusive = 3,
-}
-
-impl ElmMixinMode {
-    pub const fn from_raw(raw: u32) -> Option<Self> {
-        match raw {
-            1 => Some(Self::Chain),
-            2 => Some(Self::Observer),
-            3 => Some(Self::Exclusive),
-            _ => None,
-        }
-    }
-}
+pub use crate::wire::ElmMixinMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentEdge {

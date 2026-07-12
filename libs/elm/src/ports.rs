@@ -2,25 +2,7 @@
 
 use crate::ids::{ELM_MGR_BUILTIN_ID, ElmId, PortId};
 use crate::nexus::{FlowDirection, FlowMode};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ElmPortAccessPolicy {
-    Internal = 1,
-    Public = 2,
-    ExtensionOnly = 3,
-}
-
-impl ElmPortAccessPolicy {
-    pub const fn from_raw(raw: u32) -> Option<Self> {
-        match raw {
-            1 => Some(Self::Internal),
-            2 => Some(Self::Public),
-            3 => Some(Self::ExtensionOnly),
-            _ => None,
-        }
-    }
-}
+pub use crate::wire::ElmPortAccessPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinPort {

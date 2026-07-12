@@ -20,7 +20,6 @@ use crate::ebi::{
     ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
 };
 use crate::elmapi::ELM_API_MAX_COMPATIBLE_VERSIONS;
-use crate::graph::ElmMixinMode;
 use crate::manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
 use crate::menu::{
     ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ElmMenuItemKind,
@@ -33,6 +32,7 @@ use crate::proof::{
     ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiProofV1, ElmPanicStrategy, ElmRustAbiFingerprintV1,
     sha256_with_zeroed_range, sha256_with_zeroed_ranges,
 };
+use crate::wire::ElmMixinMode;
 
 pub const ELM_EKI_MAGIC: [u8; 8] = *b"ELM_EKI\0";
 pub const ELM_EKI_FORMAT_VERSION: u16 = 1;

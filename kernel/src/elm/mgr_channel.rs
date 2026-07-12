@@ -5,14 +5,15 @@ use alloc::vec::Vec;
 use elm_model::{
     ELM_EBI_PROJECTION_SOURCE_ABI_VERSION, ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION,
     ELM_EBI_PROJECTION_SOURCE_FLAGS_MASK, ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE,
-    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_REQUEST_SIZE, ELM_IMAGE_SESSION_ABI_VERSION,
-    ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION, ELM_MGR_MAX_INPUT, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_PERMISSION, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SOURCE_FLAGS_MASK,
+    ELM_EBI_SOURCE_REQUEST_SIZE, ELM_IMAGE_SESSION_ABI_VERSION, ELM_IMAGE_SESSION_FLAG_NONE,
+    ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_INPUT,
+    ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
     ELM_REPLACE_CELL_ABI_VERSION, ElmCellPolicyRequest, ElmCellPolicyV1, ElmEbiArch,
     ElmEbiSourceKind, ElmEbiSourceRequest, ElmExtensionAttachRequest, ElmExtensionDetachRequest,
     ElmExtensionDispatchRequest, ElmId, ElmImageSessionBeginRequestV1, ElmImageSessionReferenceV1,
-    ElmImageSessionRequestV1, ElmImageSessionWriteRequestV1, ElmLifecyclePlanRequest,
+    ElmImageSessionRequestV1, ElmImageSessionWriteRequestV1, ElmKind, ElmLifecyclePlanRequest,
     ElmLifecycleRequest, ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest,
     ElmMgrEventUnsubscribeRequest, ElmMgrResponseHeader, ElmMgrSubscribedEventReadRequest,
     ElmNexusBindRequest, ElmNexusUnbindRequest, ElmPrincipal, ElmProjectionSourceRequest,
@@ -60,6 +61,10 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                 return response_only(ElmMgrResponseHeader::invalid());
             };
             let parent = ElmId(request.parent_cell_id);
+            let grant_management = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0;
+            if grant_management && !management_grant_caller_allowed(principal) {
+                return response_only(ElmMgrResponseHeader::permission());
+            }
             let Some(mut authorization) = authorize_unlocked_call(
                 principal,
                 kind,
@@ -77,12 +82,16 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
             };
             return match image {
                 Ok(image) => {
+                    if grant_management && image.unit.manifest.kind != ElmKind::Manager {
+                        return response_only(ElmMgrResponseHeader::permission());
+                    }
                     let response = match load_ebi_image_unlocked(
                         image,
                         current_ebi_arch(),
                         source_kind,
                         parent,
                         request.budget,
+                        grant_management,
                         &mut authorization,
                     ) {
                         Ok(response) => response_with_plain_payload(&response),
@@ -328,10 +337,17 @@ fn dispatch_mgr_call_on_core_unchecked(
                 return response_only(ElmMgrResponseHeader::invalid());
             };
             let parent = ElmId(request.parent_cell_id);
+            let grant_management = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0;
+            if grant_management && !management_grant_caller_allowed(principal) {
+                return response_only(ElmMgrResponseHeader::permission());
+            }
             match source_kind {
                 ElmEbiSourceKind::Projection => {
                     match load_projection_image(principal, source_payload, current_ebi_arch()) {
                         Ok(image) => {
+                            if grant_management && image.unit.manifest.kind != ElmKind::Manager {
+                                return response_only(ElmMgrResponseHeader::permission());
+                            }
                             // 局部 Core 不持有全局自旋锁，可以完整执行原生装载事务。
                             let response = core.load_ebi_image_in_detached_core(
                                 image,
@@ -339,6 +355,7 @@ fn dispatch_mgr_call_on_core_unchecked(
                                 source_kind,
                                 parent,
                                 request.budget,
+                                grant_management,
                             );
                             response_with_plain_payload(&response)
                         }
@@ -1118,13 +1135,20 @@ fn read_image_session_begin_request(payload: &[u8]) -> Option<ElmImageSessionBeg
         reserved1: u64::from_le_bytes(payload[56..64].try_into().ok()?),
     };
     if request.abi_version != ELM_IMAGE_SESSION_ABI_VERSION
-        || request.flags != 0
+        || request.flags != ELM_IMAGE_SESSION_FLAG_NONE
         || request.reserved0 != 0
         || request.reserved1 != 0
     {
         return None;
     }
     Some(request)
+}
+
+fn management_grant_caller_allowed(principal: ElmPrincipal) -> bool {
+    match principal.kind {
+        elm_model::ElmPrincipalKind::Kernel | elm_model::ElmPrincipalKind::UserAdmin => true,
+        elm_model::ElmPrincipalKind::ElmCell => principal.actor_id == ELM_MGR_BUILTIN_ID.0,
+    }
 }
 
 fn read_image_session_write_request(
@@ -1230,16 +1254,18 @@ fn read_ebi_source_request(payload: &[u8]) -> Option<(ElmEbiSourceRequest, &[u8]
         parent_cell_id: u64::from_le_bytes(payload[8..16].try_into().ok()?),
         budget: read_resource_budget_at(payload, 16)?,
         reserved0: u16::from_le_bytes(payload[80..82].try_into().ok()?),
+        reserved1: u16::from_le_bytes(payload[82..84].try_into().ok()?),
         payload_len: u32::from_le_bytes(payload[84..88].try_into().ok()?),
-        reserved1: u32::from_le_bytes(payload[88..92].try_into().ok()?),
+        reserved2: u32::from_le_bytes(payload[88..92].try_into().ok()?),
+        reserved3: u32::from_le_bytes(payload[92..96].try_into().ok()?),
     };
     if request.abi_version != ELM_EBI_SOURCE_ABI_VERSION
-        || request.flags != 0
+        || request.flags & !ELM_EBI_SOURCE_FLAGS_MASK != 0
         || request.parent_cell_id == 0
         || request.reserved0 != 0
         || request.reserved1 != 0
-        || payload[82..84].iter().any(|byte| *byte != 0)
-        || payload[92..request_size].iter().any(|byte| *byte != 0)
+        || request.reserved2 != 0
+        || request.reserved3 != 0
     {
         return None;
     }
@@ -1733,10 +1759,12 @@ fn read_extension_dispatch_request(payload: &[u8]) -> Option<ElmExtensionDispatc
         point,
         contract,
         payload: dispatch_payload,
+        reserved2: u32::from_le_bytes(payload[388..392].try_into().ok()?),
     };
     if request.flags & !elm_model::ELM_EXTENSION_DISPATCH_FLAGS_MASK != 0
         || request.reserved0 != 0
         || request.reserved1 != 0
+        || request.reserved2 != 0
         || request.target_cell_id == 0
         || usize::from(request.point_len) > elm_model::ELM_MGR_EXTENSION_POINT_LEN
         || usize::from(request.contract_len) > elm_model::ELM_MGR_EXTENSION_CONTRACT_LEN

@@ -5,11 +5,9 @@ pub mod api;
 use crate::ctl::ELM_CTL_ABI_VERSION;
 use crate::event::ElmEventRecord;
 use crate::frame::{ElmCallFrame, ElmReplyFrame};
-use crate::graph::ElmMixinMode;
-use crate::ports::ElmPortAccessPolicy;
 use crate::resource::ElmResourceBudget;
-use crate::snapshot::state_code;
 use crate::state::ElmState;
+use crate::wire::{ElmMixinMode, ElmPortAccessPolicy, ElmPrincipalKind};
 
 pub const ELM_MGR_STATUS_OK: i32 = 0;
 pub const ELM_MGR_STATUS_PERMISSION: i32 = -1;
@@ -205,6 +203,7 @@ pub const ELM_CELL_POLICY_ALLOW_NATIVE: u32 = 1 << 5;
 pub const ELM_CELL_POLICY_ALLOW_RESOURCE_UPDATE: u32 = 1 << 6;
 pub const ELM_CELL_POLICY_ALLOW_POLICY_UPDATE: u32 = 1 << 7;
 pub const ELM_CELL_POLICY_ALLOW_OBSERVE: u32 = 1 << 8;
+pub const ELM_CELL_POLICY_ALLOW_MANAGEMENT: u32 = 1 << 9;
 pub const ELM_CELL_POLICY_ALLOW_ALL: u32 = ELM_CELL_POLICY_ALLOW_LIFECYCLE
     | ELM_CELL_POLICY_ALLOW_BIND
     | ELM_CELL_POLICY_ALLOW_PROVIDER
@@ -214,6 +213,8 @@ pub const ELM_CELL_POLICY_ALLOW_ALL: u32 = ELM_CELL_POLICY_ALLOW_LIFECYCLE
     | ELM_CELL_POLICY_ALLOW_RESOURCE_UPDATE
     | ELM_CELL_POLICY_ALLOW_POLICY_UPDATE
     | ELM_CELL_POLICY_ALLOW_OBSERVE;
+pub const ELM_CELL_POLICY_ALLOWED_ACTIONS_MASK: u32 =
+    ELM_CELL_POLICY_ALLOW_ALL | ELM_CELL_POLICY_ALLOW_MANAGEMENT;
 
 pub const ELM_CELL_POLICY_FLAG_LOCKED: u32 = 1 << 0;
 pub const ELM_CELL_POLICY_FLAG_DENY_CHILD_ESCALATION: u32 = 1 << 1;
@@ -266,6 +267,7 @@ pub const ELM_AUDIT_AUTHORITY_USER_ADMIN: u32 = 2;
 pub const ELM_AUDIT_AUTHORITY_MANAGER: u32 = 3;
 pub const ELM_AUDIT_AUTHORITY_ANCESTOR: u32 = 4;
 pub const ELM_AUDIT_AUTHORITY_SELF: u32 = 5;
+pub const ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER: u32 = 6;
 pub const ELM_AUDIT_FLAG_OPERATION: u32 = 1 << 0;
 pub const ELM_AUDIT_FLAG_AUTHORIZATION: u32 = 1 << 1;
 
@@ -1481,6 +1483,7 @@ pub struct ElmExtensionDispatchRequest {
     pub point: [u8; ELM_MGR_EXTENSION_POINT_LEN],
     pub contract: [u8; ELM_MGR_EXTENSION_CONTRACT_LEN],
     pub payload: [u8; ELM_MGR_EXTENSION_PAYLOAD_LEN],
+    pub reserved2: u32,
 }
 
 impl ElmExtensionDispatchRequest {
@@ -1504,6 +1507,7 @@ impl ElmExtensionDispatchRequest {
             point: [0; ELM_MGR_EXTENSION_POINT_LEN],
             contract: [0; ELM_MGR_EXTENSION_CONTRACT_LEN],
             payload: [0; ELM_MGR_EXTENSION_PAYLOAD_LEN],
+            reserved2: 0,
         };
         out.point_len = copy_str(point, &mut out.point) as u16;
         out.contract_len = copy_str(contract, &mut out.contract) as u16;
@@ -1820,7 +1824,7 @@ impl ElmMgrAuditRecord {
             blockers,
             final_state,
             flags: ELM_AUDIT_FLAG_OPERATION,
-            actor_kind: crate::policy::ElmPrincipalKind::Kernel as u32,
+            actor_kind: ElmPrincipalKind::Kernel as u32,
             authority: ELM_AUDIT_AUTHORITY_KERNEL,
             actor_id: 0,
             authority_id: 0,
@@ -2953,6 +2957,23 @@ pub const fn planned_final_state(action: ElmLifecycleAction, current: ElmState) 
         ElmLifecycleAction::Resume => state_code(ElmState::Active),
         ElmLifecycleAction::Detach => state_code(ElmState::Retired),
         ElmLifecycleAction::Replace => state_code(current),
+    }
+}
+
+const fn state_code(state: ElmState) -> u32 {
+    match state {
+        ElmState::Discovered => 1,
+        ElmState::Verified => 2,
+        ElmState::Loaded => 3,
+        ElmState::Linked => 4,
+        ElmState::Ready => 5,
+        ElmState::Active => 6,
+        ElmState::Quiescing => 7,
+        ElmState::Paused => 8,
+        ElmState::Detached => 9,
+        ElmState::Retired => 10,
+        ElmState::Faulted => 11,
+        ElmState::Quarantined => 12,
     }
 }
 

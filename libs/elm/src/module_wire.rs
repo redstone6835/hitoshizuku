@@ -5,7 +5,6 @@
 
 use crate::frame::{ELM_FRAME_PAYLOAD_LEN, ElmReplyFrame};
 
-pub(crate) const EXTENSION_DISPATCH_CALL_KIND: u32 = 42;
 pub(crate) const EXTENSION_DISPATCH_FLAG_ALLOW_EMPTY: u32 = 1 << 1;
 pub(crate) const MGR_EXTENSION_POINT_LEN: usize = 32;
 pub(crate) const MGR_EXTENSION_CONTRACT_LEN: usize = 64;
@@ -34,6 +33,7 @@ pub(crate) struct ModuleExtensionDispatchRequest {
     pub point: [u8; MGR_EXTENSION_POINT_LEN],
     pub contract: [u8; MGR_EXTENSION_CONTRACT_LEN],
     pub payload: [u8; MGR_EXTENSION_PAYLOAD_LEN],
+    pub reserved2: u32,
 }
 
 impl ModuleExtensionDispatchRequest {
@@ -58,6 +58,7 @@ impl ModuleExtensionDispatchRequest {
             point: [0; MGR_EXTENSION_POINT_LEN],
             contract: [0; MGR_EXTENSION_CONTRACT_LEN],
             payload: [0; MGR_EXTENSION_PAYLOAD_LEN],
+            reserved2: 0,
         };
         output.point[..point.len()].copy_from_slice(point.as_bytes());
         output.contract[..contract.len()].copy_from_slice(contract.as_bytes());
@@ -78,6 +79,7 @@ impl ModuleExtensionDispatchRequest {
         output[36..68].copy_from_slice(&self.point);
         output[68..132].copy_from_slice(&self.contract);
         output[132..388].copy_from_slice(&self.payload);
+        output[388..392].copy_from_slice(&self.reserved2.to_le_bytes());
         output
     }
 }
