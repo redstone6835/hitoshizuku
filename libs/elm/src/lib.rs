@@ -153,9 +153,9 @@ compile_error!("elm crate 必须启用 runtime-model 或 module 编译面");
 
 #[cfg(feature = "macros")]
 pub use elm_macros::{
-    entry, export, import, mixin, mixin_point, on_finalize, on_initialize, on_migrate_abort,
-    on_migrate_export, on_migrate_import, on_pause, on_quiesce, on_resume, payload, provider,
-    provider_snapshot,
+    entry, export, import, kernel_api, mixin, mixin_point, on_finalize, on_initialize,
+    on_migrate_abort, on_migrate_export, on_migrate_import, on_pause, on_quiesce, on_resume,
+    payload, provider, provider_snapshot,
 };
 
 pub use context::{
@@ -205,28 +205,30 @@ pub use ebi::{
     ELM_EBI_IMPORT_FLAG_DIRECT_PINNED, ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EBI_IMPORT_FLAG_OPTIONAL,
     ELM_EBI_IMPORT_FLAGS_MASK, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
-    ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS,
-    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_RELOCATION_FLAG_NONE,
-    ELM_EBI_RUST_ABI_VERSION, ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ,
-    ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT, ELM_EBI_SEGMENT_FLAG_WRITE,
+    ELM_EBI_MAX_KERNEL_API_REQUIREMENTS, ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS,
+    ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN,
+    ELM_EBI_RELOCATION_FLAG_NONE, ELM_EBI_RUST_ABI_VERSION, ELM_EBI_SEGMENT_FLAG_EXECUTE,
+    ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT, ELM_EBI_SEGMENT_FLAG_WRITE,
     ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SEGMENT_SOURCE_NONE, ELM_EBI_SYMBOL_FLAG_NONE,
     ELM_EBI_SYMBOL_LOCATION_FLAG_NONE, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_PROJECTION_SOURCE_ID,
     ELM_MIGRATION_STATE_MAX, ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry,
     ElmEbiExportDecl, ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
-    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiMenuDecl,
-    ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
-    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget,
-    ElmEbiUnit, ElmImageReader, ElmSliceImageReader, default_segment_flags, relocation_width,
+    ElmEbiKernelApiRequirement, ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind,
+    ElmEbiLifecycleHooks, ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl,
+    ElmEbiRelocationKind, ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind,
+    ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit, ElmImageReader,
+    ElmSliceImageReader, default_segment_flags, relocation_width,
 };
 #[cfg(feature = "runtime-model")]
 pub use eki::{
     ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_BLOCK_FLAG_REQUIRED,
     ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_ENTRY_SYMBOL_LEN,
-    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC,
-    ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_MAX_BLOCKS,
-    ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
-    ELM_EKI_RELOCATION_RECORD_SIZE, ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE, ElmEkiBlockDesc,
-    ElmEkiBlockKind, ElmEkiHeader, parse_eki_ebi_unit, parse_eki_image,
+    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE,
+    ELM_EKI_KERNEL_API_RECORD_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_MAX_BLOCKS, ELM_EKI_PROOF_ALGORITHM_ED25519,
+    ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_EKI_RELOCATION_RECORD_SIZE,
+    ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE, ElmEkiBlockDesc, ElmEkiBlockKind, ElmEkiHeader,
+    parse_eki_ebi_unit, parse_eki_image,
 };
 #[cfg(feature = "runtime-model")]
 pub use elmapi::kernel_api_manifest_v1;
@@ -235,13 +237,16 @@ pub use elmapi::{
     ELM_API_CURRENT_VERSION, ELM_API_FEATURE_ABORT, ELM_API_FEATURE_CONTEXT, ELM_API_FEATURE_LOG,
     ELM_API_FEATURE_MANAGED_CALL, ELM_API_FEATURE_MIXIN_DISPATCH, ELM_API_FEATURE_NAMESPACE_QUERY,
     ELM_API_FEATURES_V1, ELM_API_MANAGEMENT_IDENTIFIER, ELM_API_MAX_COMPATIBLE_VERSIONS,
-    ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_MAGIC,
-    ELM_API_RUNTIME_IDENTIFIER, ELM_API_STATUS_BUFFER_TOO_SMALL, ELM_API_STATUS_INVALID,
-    ELM_API_STATUS_NOT_FOUND, ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION,
-    ELM_API_STATUS_UNSUPPORTED, ELM_API_VERSION_V1, ElmApiAbortCurrentV1, ElmApiContextV1,
-    ElmApiCurrentContextV1, ElmApiInvokeManagedV1, ElmApiLogV1, ElmApiMixinDispatchV1,
-    ElmApiNamespaceV1, ElmApiQueryNamespaceV1, ElmApiRootV1, ElmManagementApiV1,
-    ElmManagementDispatchV1, ElmRuntimeApiV1,
+    ELM_API_NAMESPACE_FLAG_MANAGEMENT, ELM_API_NAMESPACE_FLAG_PUBLIC,
+    ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT, ELM_API_NAMESPACE_FLAGS_V1, ELM_API_ROOT_IMPORT_CONTRACT,
+    ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_MAGIC, ELM_API_RUNTIME_IDENTIFIER,
+    ELM_API_STATUS_BUFFER_TOO_SMALL, ELM_API_STATUS_INVALID, ELM_API_STATUS_NOT_FOUND,
+    ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION, ELM_API_STATUS_UNSUPPORTED, ELM_API_VERSION_V1,
+    ELM_KERNEL_API_IDENTIFIER_MAX_LEN, ELM_KERNEL_API_LAYOUT_HASH_LEN, ElmApiAbortCurrentV1,
+    ElmApiContextV1, ElmApiCurrentContextV1, ElmApiInvokeManagedV1, ElmApiLogV1,
+    ElmApiMixinDispatchV1, ElmApiNamespaceDescriptorV1, ElmApiNamespaceV1, ElmApiQueryNamespaceV1,
+    ElmApiRootV1, ElmManagementApiV1, ElmManagementDispatchV1, ElmRuntimeApiV1,
+    is_valid_kernel_api_identifier,
 };
 pub use error::{ElmError, ElmResult};
 #[cfg(any(feature = "runtime-model", feature = "management"))]
@@ -278,16 +283,16 @@ pub use menu::{
 };
 #[cfg(feature = "runtime-model")]
 pub use metadata::{
-    ELM_META_FIELD_ACCESS, ELM_META_FIELD_CONTRACT, ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS,
-    ELM_META_FIELD_HANDLER_CONTRACT, ELM_META_FIELD_HOOK_KIND, ELM_META_FIELD_MAX_VERSION,
-    ELM_META_FIELD_MIN_VERSION, ELM_META_FIELD_MODE, ELM_META_FIELD_NAME,
-    ELM_META_FIELD_PAYLOAD_CONTRACT, ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY,
-    ELM_META_FIELD_STAGE, ELM_META_FIELD_STAGES, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET,
-    ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE, ELM_RUST_METADATA_ALIGNMENT,
-    ELM_RUST_METADATA_FIELD_HEADER_SIZE, ELM_RUST_METADATA_HEADER_SIZE, ELM_RUST_METADATA_MAGIC,
-    ELM_RUST_METADATA_MAX_RECORD_SIZE, ELM_RUST_METADATA_VERSION, ElmRustMetadataError,
-    ElmRustMetadataField, ElmRustMetadataKind, ElmRustMetadataRecord, ElmRustMetadataValueKind,
-    crc32, parse_rust_metadata_section,
+    ELM_META_FIELD_ACCESS, ELM_META_FIELD_CAPABILITIES, ELM_META_FIELD_CONTRACT,
+    ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS, ELM_META_FIELD_HANDLER_CONTRACT,
+    ELM_META_FIELD_HOOK_KIND, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
+    ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
+    ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_STAGE, ELM_META_FIELD_STAGES,
+    ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE,
+    ELM_RUST_METADATA_ALIGNMENT, ELM_RUST_METADATA_FIELD_HEADER_SIZE,
+    ELM_RUST_METADATA_HEADER_SIZE, ELM_RUST_METADATA_MAGIC, ELM_RUST_METADATA_MAX_RECORD_SIZE,
+    ELM_RUST_METADATA_VERSION, ElmRustMetadataError, ElmRustMetadataField, ElmRustMetadataKind,
+    ElmRustMetadataRecord, ElmRustMetadataValueKind, crc32, parse_rust_metadata_section,
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use mgr::api::{

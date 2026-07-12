@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use elm::{
     ELM_API_FEATURES_V1, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
+    ELM_META_FIELD_CAPABILITIES,
     ELM_API_ROOT_SLOT_SYMBOL, ELM_API_VERSION_V1, ELM_META_FIELD_ACCESS, ELM_META_FIELD_CONTRACT,
     ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS, ELM_META_FIELD_HANDLER_CONTRACT,
     ELM_META_FIELD_HOOK_KIND, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
@@ -21,6 +22,7 @@ pub struct NativeMetadata {
     pub providers: Vec<ProviderSpec>,
     pub extension_points: Vec<ExtensionPointSpec>,
     pub extensions: Vec<ExtensionSpec>,
+    pub kernel_apis: Vec<KernelApiSpec>,
     pub api_root_import_index: u32,
     pub api_versions: Vec<u16>,
     pub api_required_features: u64,
@@ -85,6 +87,14 @@ pub struct PayloadSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct KernelApiSpec {
+    pub namespace: String,
+    pub version: u16,
+    pub capabilities: u64,
+    pub layout_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
 struct SnapshotSpec {
     contract: String,
     symbol: String,
@@ -113,6 +123,7 @@ impl NativeMetadata {
         let mut extension_points = Vec::new();
         let mut extensions = Vec::new();
         let mut payloads = Vec::new();
+        let mut kernel_apis = Vec::new();
         for record in &records {
             if record.flags != 0 {
                 return Err(format!("元数据记录 {:?} 使用了未知 flags", record.kind));
@@ -285,6 +296,36 @@ impl NativeMetadata {
                         wire_size,
                     });
                 }
+                ElmRustMetadataKind::KernelApi => {
+                    expect_fields(
+                        record,
+                        &[
+                            ELM_META_FIELD_NAME,
+                            ELM_META_FIELD_VERSION,
+                            ELM_META_FIELD_CAPABILITIES,
+                        ],
+                    )?;
+                    let namespace = field_string(record, ELM_META_FIELD_NAME)?;
+                    let raw_version = field_u32(record, ELM_META_FIELD_VERSION)?;
+                    let version = u16::try_from(raw_version)
+                        .map_err(|_| "Kernel API version 超出 u16".to_string())?;
+                    let layout = kernel_api::layout(&namespace, version).ok_or_else(|| {
+                        format!("Kernel API {namespace}@{version} 未由当前 kernel-api crate 发布")
+                    })?;
+                    let capabilities = field_u64(record, ELM_META_FIELD_CAPABILITIES)?;
+                    if capabilities & !layout.capabilities != 0 {
+                        return Err(format!(
+                            "Kernel API {namespace}@{version} 请求了未定义能力位 0x{:x}",
+                            capabilities & !layout.capabilities
+                        ));
+                    }
+                    kernel_apis.push(KernelApiSpec {
+                        namespace,
+                        version,
+                        capabilities,
+                        layout_hash: layout.layout_hash,
+                    });
+                }
             }
         }
         validate_and_sort(
@@ -296,6 +337,7 @@ impl NativeMetadata {
             &mut extension_points,
             &mut extensions,
             &mut payloads,
+            &mut kernel_apis,
         )?;
         Ok(Self {
             lifecycle,
@@ -305,6 +347,7 @@ impl NativeMetadata {
             providers,
             extension_points,
             extensions,
+            kernel_apis,
             api_root_import_index: 0,
             api_versions: vec![ELM_API_VERSION_V1],
             api_required_features: ELM_API_FEATURES_V1,
@@ -345,6 +388,7 @@ fn validate_and_sort(
     extension_points: &mut Vec<ExtensionPointSpec>,
     extensions: &mut Vec<ExtensionSpec>,
     payloads: &mut Vec<PayloadSpec>,
+    kernel_apis: &mut Vec<KernelApiSpec>,
 ) -> Result<(), String> {
     lifecycle.sort_by_key(|hook| hook.kind);
     for kind in [1, 2] {
@@ -438,6 +482,17 @@ fn validate_and_sort(
         .any(|items| items[0].contract == items[1].contract)
     {
         return Err("重复 payload contract".to_string());
+    }
+    kernel_apis.sort_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    if kernel_apis
+        .windows(2)
+        .any(|items| items[0].namespace == items[1].namespace)
+    {
+        return Err("同一 ELM 不能重复声明 Kernel API namespace".to_string());
     }
     for point in extension_points.iter() {
         if !payloads
@@ -572,6 +627,14 @@ fn field_i32(record: &ElmRustMetadataRecord<'_>, tag: u16) -> Result<i32, String
         .map_err(|_| format!("元数据 {:?} 字段 {tag} 不是 i32", record.kind))
 }
 
+fn field_u64(record: &ElmRustMetadataRecord<'_>, tag: u16) -> Result<u64, String> {
+    record
+        .require_field(tag)
+        .map_err(|_| format!("元数据 {:?} 缺少字段 {tag}", record.kind))?
+        .u64()
+        .map_err(|_| format!("元数据 {:?} 字段 {tag} 不是 u64", record.kind))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +681,7 @@ mod tests {
             &mut exports,
             &mut Vec::new(),
             Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),

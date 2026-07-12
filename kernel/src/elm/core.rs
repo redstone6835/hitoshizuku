@@ -7,20 +7,21 @@ use alloc::vec::Vec;
 
 use elm_model::{
     ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_API_CURRENT_VERSION,
-    ELM_API_FEATURES_V1, ELM_API_MANAGEMENT_IDENTIFIER, ELM_API_ROOT_IMPORT_CONTRACT,
-    ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_MAGIC, ELM_API_RUNTIME_IDENTIFIER,
-    ELM_API_STATUS_BUFFER_TOO_SMALL, ELM_API_STATUS_INVALID, ELM_API_STATUS_NOT_FOUND,
-    ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION, ELM_API_STATUS_UNSUPPORTED, ELM_CALL_STATUS_BUSY,
-    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
-    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_CALL_STATUS_UNSUPPORTED, ELM_EBI_EXPORT_FLAG_MANAGED,
-    ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EKI_BUILTIN_ID,
-    ELM_EXTENSION_DISPATCH_FLAG_REQUIRE_EXACT_EXTENSION, ELM_EXTENSION_DISPATCH_FLAGS_MASK,
-    ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS, ELM_HEALTH_CHECK_CELLS,
-    ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_EXECUTIONS, ELM_HEALTH_CHECK_GRAPH,
-    ELM_HEALTH_CHECK_JOURNAL, ELM_HEALTH_CHECK_MENU, ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
-    ELM_HEALTH_CHECK_PORTS, ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS,
-    ELM_HEALTH_CHECK_RESOURCES, ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES,
-    ELM_HEALTH_CHECK_TODO_REGISTRY, ELM_HEALTH_CHECK_TRUST, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
+    ELM_API_FEATURES_V1, ELM_API_MANAGEMENT_IDENTIFIER, ELM_API_NAMESPACE_FLAG_MANAGEMENT,
+    ELM_API_NAMESPACE_FLAG_PUBLIC, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
+    ELM_API_ROOT_MAGIC, ELM_API_RUNTIME_IDENTIFIER, ELM_API_STATUS_BUFFER_TOO_SMALL,
+    ELM_API_STATUS_INVALID, ELM_API_STATUS_NOT_FOUND, ELM_API_STATUS_OK, ELM_API_STATUS_PERMISSION,
+    ELM_API_STATUS_UNSUPPORTED, ELM_CALL_STATUS_BUSY, ELM_CALL_STATUS_INVALID,
+    ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_PROVIDER_FAULT,
+    ELM_CALL_STATUS_UNSUPPORTED, ELM_EBI_EXPORT_FLAG_MANAGED, ELM_EBI_IMPORT_FLAG_MANAGED,
+    ELM_EKI_BUILTIN_ID, ELM_EXTENSION_DISPATCH_FLAG_REQUIRE_EXACT_EXTENSION,
+    ELM_EXTENSION_DISPATCH_FLAGS_MASK, ELM_HEALTH_CHECK_AUDITS, ELM_HEALTH_CHECK_BINDINGS,
+    ELM_HEALTH_CHECK_CELLS, ELM_HEALTH_CHECK_EVENTS, ELM_HEALTH_CHECK_EXECUTIONS,
+    ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_CHECK_JOURNAL, ELM_HEALTH_CHECK_MENU,
+    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES, ELM_HEALTH_CHECK_PORTS,
+    ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RESOURCES,
+    ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES, ELM_HEALTH_CHECK_TODO_REGISTRY,
+    ELM_HEALTH_CHECK_TRUST, ELM_HEALTH_DETAIL_CONTRACT_INVALID,
     ELM_HEALTH_DETAIL_COUNTER_EXHAUSTED, ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
     ELM_HEALTH_DETAIL_DUPLICATE_OBJECT, ELM_HEALTH_DETAIL_GRAPH_INVALID,
     ELM_HEALTH_DETAIL_KIND_MISMATCH, ELM_HEALTH_DETAIL_MISSING_OBJECT,
@@ -67,9 +68,9 @@ use elm_model::{
     ELM_REPLACE_MIGRATION_STATE_MAX, ELM_RUNTIME_LOG_MESSAGE_LEN, ELM_TODO_FLAG_ACTIVE,
     ELM_TODO_FLAG_STATIC, ELM_TODO_KIND_FRAMEWORK, ELM_TODO_KIND_NATIVE, ELM_TODO_KIND_PROVIDER,
     ELM_TODO_KIND_RUNTIME, ELM_TODO_KIND_SOURCE, ElmActionInvokeReply, ElmActionInvokeRequest,
-    ElmApiContextV1, ElmApiNamespaceV1, ElmApiRootV1, ElmCallFrame, ElmContext,
-    ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCurrentContext, ElmEbiArch,
-    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
+    ElmApiContextV1, ElmApiNamespaceDescriptorV1, ElmApiNamespaceV1, ElmApiRootV1, ElmCallFrame,
+    ElmContext, ElmCoreHealthHeader, ElmCoreHealthRecord, ElmCoreInfo, ElmCurrentContext,
+    ElmEbiArch, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
     ElmEbiProviderPortDecl, ElmEbiSourceKind, ElmEbiTarget, ElmEbiUnit, ElmError, ElmEventRecord,
     ElmEventSequence, ElmExtensionAttachRequest, ElmExtensionAttachResponse,
     ElmExtensionDetachRequest, ElmExtensionDetachResponse, ElmExtensionDispatchRequest,
@@ -197,6 +198,24 @@ static ELM_API_ROOT_V1: ElmApiRootV1 = ElmApiRootV1 {
     reserved0: 0,
     query_namespace: elm_api_query_namespace_v1,
 };
+
+static ELM_RUNTIME_NAMESPACE_V1: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDescriptorV1::new(
+    ELM_API_RUNTIME_IDENTIFIER,
+    ELM_API_CURRENT_VERSION,
+    ELM_API_NAMESPACE_FLAG_PUBLIC,
+    ELM_API_FEATURES_V1,
+    &ELM_RUNTIME_API_V1,
+    [0; 32],
+);
+
+static ELM_MANAGEMENT_NAMESPACE_V1: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDescriptorV1::new(
+    ELM_API_MANAGEMENT_IDENTIFIER,
+    ELM_API_CURRENT_VERSION,
+    ELM_API_NAMESPACE_FLAG_MANAGEMENT,
+    ELM_CELL_POLICY_ALLOW_MANAGEMENT as u64,
+    &ELM_MANAGEMENT_API_V1,
+    [0; 32],
+);
 
 pub(crate) trait ElmLifecycleExecutor {
     fn on_initialize(&mut self, context: &mut ElmContext) -> ElmResult<()>;
@@ -2045,6 +2064,10 @@ impl ElmCore {
         if self.initialized {
             return Ok(());
         }
+        super::register_kernel_api_namespace(&ELM_RUNTIME_NAMESPACE_V1)
+            .map_err(|_| ElmError::InvalidTransition)?;
+        super::register_kernel_api_namespace(&ELM_MANAGEMENT_NAMESPACE_V1)
+            .map_err(|_| ElmError::InvalidTransition)?;
         if !super::resource_accounting::init()
             || !super::resource_accounting::register_cell(ELM_MGR_ID, ElmResourceBudget::ROOT)
         {
@@ -6210,6 +6233,25 @@ impl ElmCore {
                 ElmEbiLoadStatus::RuntimeRejected,
             ));
         }
+        if let Err(err) = super::api_registry::grant_requirements(
+            id,
+            Generation::FIRST,
+            &image.unit.kernel_api_requirements,
+        ) {
+            log::error!(
+                "[elm] Kernel API 依赖拒绝 cell={} name={}: {:?}",
+                id.0,
+                name,
+                err
+            );
+            self.quarantine_cell_after_hook_failure(id);
+            return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::RuntimeRejected,
+                id.0,
+                state_code(ElmState::Quarantined),
+                ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+            ));
+        }
 
         let loaded = match LoadedElmImage::load(id, &image, &imports) {
             Ok(loaded) => loaded,
@@ -7038,6 +7080,36 @@ impl ElmCore {
                     ));
                 }
             };
+        if let Err(err) = super::api_registry::grant_requirements(
+            id,
+            new_generation,
+            &image.unit.kernel_api_requirements,
+        ) {
+            log::error!(
+                "[elm] 替换镜像 Kernel API 依赖拒绝 cell={} generation={}: {:?}",
+                id.0,
+                new_generation.0,
+                err
+            );
+            self.discard_native_import_stage(import_stage);
+            self.abort_image_trust(&trust);
+            let sources_restored = self.resume_projection_sources_for_cell(id, old_generation);
+            self.release_cell_execution(token);
+            let mut blockers = ELM_POLICY_BLOCK_CAPABILITY_DENIED;
+            if !sources_restored {
+                blockers |= ELM_POLICY_BLOCK_GRAPH_INCONSISTENT;
+                self.quarantine_cell_after_hook_failure(id);
+            }
+            return PreparedNativeReplace::Immediate(self.replace_response(
+                id,
+                status_from_blockers(blockers),
+                self.cell_state(id).unwrap_or(old_state),
+                old_generation,
+                0,
+                first_lifecycle_reason(blockers),
+                blockers,
+            ));
+        }
         let new_executor = loaded.lifecycle_executor();
         PreparedNativeReplace::Execute(NativeReplaceExecutionPlan {
             token,
@@ -7083,6 +7155,7 @@ impl ElmCore {
                 );
                 self.abort_image_trust(&plan.trust);
                 self.discard_native_import_stage(plan.import_stage);
+                super::api_registry::remove_generation(plan.id, plan.new_generation);
                 self.release_cell_execution(plan.token);
                 if !old_recovered || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
@@ -7114,6 +7187,7 @@ impl ElmCore {
                     plan.new_generation,
                 );
                 self.discard_native_import_stage(plan.import_stage);
+                super::api_registry::remove_generation(plan.id, plan.new_generation);
                 self.release_cell_execution(plan.token);
                 if !old_recovered || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
@@ -7160,6 +7234,7 @@ impl ElmCore {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
                 self.discard_native_import_stage(plan.import_stage);
+                super::api_registry::remove_generation(plan.id, plan.new_generation);
                 self.release_cell_execution(plan.token);
                 return self.replace_response(
                     plan.id,
@@ -7184,6 +7259,7 @@ impl ElmCore {
                 );
             }
             self.retire_replaced_native_image(plan.id, plan.old_generation);
+            super::api_registry::remove_generation(plan.id, plan.old_generation);
             self.native_images.push(plan.loaded);
             self.release_cell_execution(plan.token);
             return self.replace_response(
@@ -7209,6 +7285,7 @@ impl ElmCore {
         );
         self.abort_image_trust(&plan.trust);
         self.discard_native_import_stage(plan.import_stage);
+        super::api_registry::remove_generation(plan.id, plan.new_generation);
         if !old_recovered || !sources_restored {
             self.quarantine_cell_after_hook_failure(plan.id);
         }
@@ -7389,7 +7466,27 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
             );
         }
+        if let Err(err) = super::api_registry::grant_requirements(
+            id,
+            new_generation,
+            &image.unit.kernel_api_requirements,
+        ) {
+            log::error!(
+                "[elm] 声明式替换 Kernel API 依赖拒绝 cell={} generation={}: {:?}",
+                id.0,
+                new_generation.0,
+                err
+            );
+            self.abort_image_trust(&trust);
+            return fail(
+                self,
+                ELM_MGR_STATUS_PERMISSION,
+                ELM_POLICY_BLOCK_CAPABILITY_DENIED,
+                first_lifecycle_reason(ELM_POLICY_BLOCK_CAPABILITY_DENIED),
+            );
+        }
         if !self.commit_replaced_declarative_cell(id, old_state, new_generation, &image.unit) {
+            super::api_registry::remove_generation(id, new_generation);
             self.abort_image_trust(&trust);
             return fail(
                 self,
@@ -7415,6 +7512,7 @@ impl ElmCore {
                 ELM_POLICY_BLOCK_RESOURCE_QUOTA,
             );
         }
+        super::api_registry::remove_generation(id, old_generation);
         self.replace_response(
             id,
             ELM_MGR_STATUS_OK,
@@ -7489,6 +7587,20 @@ impl ElmCore {
         ) {
             log::error!("[elm] EBI cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
+        }
+        if let Err(err) = super::api_registry::grant_requirements(
+            id,
+            Generation::FIRST,
+            &unit.kernel_api_requirements,
+        ) {
+            log::error!("[elm] Kernel API 依赖拒绝 cell={}: {:?}", id.0, err);
+            self.quarantine_cell_after_hook_failure(id);
+            return ElmLoadCellResponse::new(
+                ElmEbiLoadStatus::RuntimeRejected,
+                id.0,
+                state_code(ElmState::Quarantined),
+                ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+            );
         }
 
         if unit.has_native_code() {
@@ -10427,6 +10539,7 @@ impl ElmCore {
                 .as_str(),
             );
         }
+        out.push_str(super::api_registry::diagnostic_text().as_str());
         out
     }
 
@@ -14639,6 +14752,7 @@ impl ElmCore {
     }
 
     fn quarantine_cell_after_hook_failure(&mut self, id: ElmId) {
+        super::api_registry::remove_cell(id);
         self.mark_native_fault(id, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED);
         match self.cell_state(id) {
             Some(ElmState::Faulted) => {}
@@ -14657,6 +14771,7 @@ impl ElmCore {
     }
 
     fn quarantine_cell_after_resource_failure(&mut self, id: ElmId) {
+        super::api_registry::remove_cell(id);
         self.mark_native_fault(id, ELM_POLICY_BLOCK_RESOURCE_QUOTA);
         match self.cell_state(id) {
             Some(ElmState::Faulted) => {}
@@ -15055,6 +15170,7 @@ impl ElmCore {
             self.mark_native_fault(id, ELM_POLICY_BLOCK_LEASE_BUSY);
             return false;
         }
+        super::api_registry::remove_cell(id);
         self.cells.retain(|cell| cell.id != id);
         true
     }
@@ -17354,7 +17470,7 @@ extern "C" fn elm_api_query_namespace_v1(
     };
     if identifier.is_null()
         || identifier_len == 0
-        || identifier_len > 128
+        || identifier_len > elm_model::ELM_KERNEL_API_IDENTIFIER_MAX_LEN
         || compatible_versions.is_null()
         || compatible_version_count == 0
         || compatible_version_count > elm_model::ELM_API_MAX_COMPATIBLE_VERSIONS
@@ -17381,44 +17497,27 @@ extern "C" fn elm_api_query_namespace_v1(
     let identifier = unsafe { core::slice::from_raw_parts(identifier, identifier_len) };
     let versions =
         unsafe { core::slice::from_raw_parts(compatible_versions, compatible_version_count) };
-    let Some(selected) = versions
-        .iter()
-        .copied()
-        .filter(|version| *version == ELM_API_CURRENT_VERSION)
-        .max()
-    else {
-        return ELM_API_STATUS_UNSUPPORTED;
+    let Some(context) = current_context() else {
+        return ELM_API_STATUS_PERMISSION;
     };
-    let namespace = if identifier == ELM_API_RUNTIME_IDENTIFIER.as_bytes() {
-        ElmApiNamespaceV1 {
-            struct_size: core::mem::size_of::<ElmApiNamespaceV1>() as u32,
-            flags: 0,
-            selected_version: selected,
-            reserved0: 0,
-            table_size: core::mem::size_of::<ElmRuntimeApiV1>() as u32,
-            table_address: &ELM_RUNTIME_API_V1 as *const ElmRuntimeApiV1 as usize,
-            generation: 1,
-            capabilities: ELM_API_FEATURES_V1,
+    let namespace = match super::api_registry::query(
+        context.cell_id,
+        context.generation,
+        identifier,
+        versions,
+        management_namespace_allowed(context),
+    ) {
+        Ok(namespace) => namespace,
+        Err(super::api_registry::ApiRegistryError::NamespaceUnavailable) => {
+            return ELM_API_STATUS_NOT_FOUND;
         }
-    } else if identifier == ELM_API_MANAGEMENT_IDENTIFIER.as_bytes() {
-        let Some(context) = current_context() else {
+        Err(super::api_registry::ApiRegistryError::VersionUnsupported) => {
+            return ELM_API_STATUS_UNSUPPORTED;
+        }
+        Err(super::api_registry::ApiRegistryError::CapabilityDenied) => {
             return ELM_API_STATUS_PERMISSION;
-        };
-        if !management_namespace_allowed(context) {
-            return ELM_API_STATUS_PERMISSION;
         }
-        ElmApiNamespaceV1 {
-            struct_size: core::mem::size_of::<ElmApiNamespaceV1>() as u32,
-            flags: 0,
-            selected_version: selected,
-            reserved0: 0,
-            table_size: core::mem::size_of::<ElmManagementApiV1>() as u32,
-            table_address: &ELM_MANAGEMENT_API_V1 as *const ElmManagementApiV1 as usize,
-            generation: context.generation.0,
-            capabilities: ELM_CELL_POLICY_ALLOW_MANAGEMENT as u64,
-        }
-    } else {
-        return ELM_API_STATUS_NOT_FOUND;
+        Err(_) => return ELM_API_STATUS_INVALID,
     };
     // 安全性：调用方提供固定布局输出槽，原生 guard 处理意外地址故障。
     unsafe { output.write(namespace) };

@@ -24,7 +24,7 @@
 //! ```
 
 use crate::developer::runtime_api;
-use crate::{ELM_API_CURRENT_VERSION, ElmApiContextV1, RuntimeApiError};
+use crate::{ELM_API_CURRENT_VERSION, ElmApiContextV1, ElmApiNamespaceV1, RuntimeApiError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// 当前模块看到的 ELM 运行时协商结果。
@@ -65,6 +65,17 @@ pub fn info() -> Result<RuntimeInfo, RuntimeApiError> {
 /// 运行时表不可用、当前线程不处于 ELM 调用上下文或返回结构校验失败时返回错误。
 pub fn context() -> Result<ElmApiContextV1, RuntimeApiError> {
     runtime_api::current_context()
+}
+
+/// 按 identifier 和兼容版本列表取得一个额外的运行时命名空间。
+///
+/// 普通业务代码通常应使用 `kernel-api` 提供的类型化客户端，而不是直接处理函数表地址。
+/// 本入口公开是为了让独立门面 crate 在不依赖内核实现的前提下完成统一协商。
+pub fn query_namespace(
+    identifier: &str,
+    versions: &[u16],
+) -> Result<ElmApiNamespaceV1, RuntimeApiError> {
+    runtime_api::query_namespace(identifier, versions)
 }
 
 /// 向 elm-mgr 提交一条归属于当前 ELM 的运行时日志。

@@ -15,11 +15,9 @@ use crate::context::{
     ELM_NATIVE_HOOK_CONTEXT_ABI_VERSION, ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION,
     ElmNativeHookContextV1, ElmNativeMigrationContextV1,
 };
-#[cfg(feature = "management")]
-use crate::elmapi::ElmApiNamespaceV1;
 use crate::elmapi::{
     ELM_API_ABORT_REASON_PANIC, ELM_API_ROOT_MAGIC, ELM_API_STATUS_BUFFER_TOO_SMALL,
-    ELM_API_VERSION_V1, ElmApiContextV1, ElmApiRootV1, ElmRuntimeApiV1,
+    ELM_API_VERSION_V1, ElmApiContextV1, ElmApiNamespaceV1, ElmApiRootV1, ElmRuntimeApiV1,
 };
 use crate::frame::{
     ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_OK, ELM_CALL_STATUS_PROVIDER_FAULT,
@@ -885,7 +883,6 @@ pub(crate) mod runtime_api {
         Ok(reply)
     }
 
-    #[cfg(feature = "management")]
     pub fn query_namespace(
         identifier: &str,
         versions: &[u16],

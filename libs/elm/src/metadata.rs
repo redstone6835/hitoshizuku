@@ -64,6 +64,8 @@ pub const ELM_META_FIELD_PAYLOAD_CONTRACT: u16 = 17;
 pub const ELM_META_FIELD_WIRE_SIZE: u16 = 18;
 /// `.elm.meta` 字段表中标识 `stages` 属性的稳定 tag。
 pub const ELM_META_FIELD_STAGES: u16 = 19;
+/// `.elm.meta` 字段表中标识 64 位能力集合的稳定 tag。
+pub const ELM_META_FIELD_CAPABILITIES: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -87,6 +89,8 @@ pub enum ElmRustMetadataKind {
     Extension = 8,
     /// `Payload` 表示 `ElmRustMetadataKind` 的对象类别：`payload`。
     Payload = 9,
+    /// `KernelApi` 表示一个装载前 Kernel API 命名空间依赖。
+    KernelApi = 10,
 }
 
 impl ElmRustMetadataKind {
@@ -102,6 +106,7 @@ impl ElmRustMetadataKind {
             7 => Some(Self::ExtensionPoint),
             8 => Some(Self::Extension),
             9 => Some(Self::Payload),
+            10 => Some(Self::KernelApi),
             _ => None,
         }
     }

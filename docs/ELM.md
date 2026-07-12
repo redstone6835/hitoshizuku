@@ -4,7 +4,7 @@
 
 ELM，全称 **Extensible Loadable Module**，中文统一称为 **可拓展内核单元**。
 
-ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。子系统能力不再强制绕行 `elm-mgr`，稳定 Rust crate API 可以被 ELM 像内核代码一样直接调用；需要运行时发现、绑定、审计或异步流控的能力再通过 provider 端口进入枢纽连接层。
+ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。子系统热路径不再强制绕行 `elm-mgr`，外部 ELM 通过 `kernel-api` 契约门面获得接近内核内开发的类型化直接调用体验，但不会依赖或看到子系统实现 crate；需要运行时发现、绑定、审计或异步流控的能力再通过 provider 端口进入枢纽连接层。
 
 ELM 的基本原则：
 
@@ -78,7 +78,7 @@ ELM 的基本原则：
 - 校验单元清单、目标架构、ABI 版本、能力权限、依赖合法性和端口契约。
 - 执行静默化、脱离、退役、故障隔离等安全流程。
 - 提供私有系统调用 `sys_elm_ctl`。
-- 为 `elm-mgr` 提供可信执行底座和可验证提交路径，并为直接调用稳定子系统 crate API 的 ELM 提供当前上下文和策略快照。
+- 为 `elm-mgr` 提供可信执行底座和可验证提交路径，并为通过 `kernel-api` 调用稳定子系统契约的 ELM 提供当前上下文和策略快照。
 - 提供稳定的 EBI Source 输入 ABI，并把具体镜像格式隔离在 Projection Source 之后。
 
 `elm-mgr` 负责策略：
@@ -860,7 +860,7 @@ demo    source=eki
 
 - 定义 `elm-mgr` 管理协议使用的固定布局记录；该文件是 `elm` crate 的私有实现模块，不构成公开 Rust 模块路径。
 - 把 API 注册表、事件订阅和订阅读取结构从管理通道主文件中拆出；公开的类型由 `elm` crate 根统一导出，管理操作由 `elm::management::Client` 提供类型化方法。
-- 为运行时管理 API 和可发现 provider API 保留统一描述格式；普通稳定子系统 crate API 不需要伪装成 `elm-mgr` API，ELM 可以按工程依赖顺序直接使用。
+- 为运行时管理 API 和可发现 provider API 保留统一描述格式；普通稳定子系统契约不需要伪装成 `elm-mgr` API，而由 `kernel-api` 门面提供类型化直接调用。
 
 设计细节：
 
@@ -1266,13 +1266,13 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
                     -> 菜单、策略、健康检查、TODO registry、API 注册表、事件订阅、能力绑定、provider 调用、审计、Projection Source 装载边界
 ```
 
-`elm-mgr` 本身是启动期内建 ELM。它在 `sched::boot_init()` 之后、用户态 init 进程启动之前完成初始化，地位类似用户态的 init 进程：后续所有动态 ELM 都位于 `elm-mgr` 管理树中，但可以通过装载请求挂到任意合法动态父单元之下；所有外部管理工具都通过 `elm-mgr` 暴露的控制面进入 ELM Core。`elm-mgr` 的来源固定显示为 `<builtin>`，不会显示为 EKI、soyo、ELF 或其他镜像类型。内建 `eki` 是 `elm-mgr` 的子 ELM，来源同样显示为 `<builtin>`，它只负责提供 EKI 投影能力。未来 VFS、调度、网络、设备等子系统如果需要对外提供可发现、可绑定、可审计的运行时服务，应注册为 `elm-mgr` 可发现、可绑定、可转发的枢纽连接层端口；如果只是 ELM 像内核代码一样使用稳定 Rust API，则直接依赖对应子系统 crate，不为每个子系统新增私有 ELM syscall。
+`elm-mgr` 本身是启动期内建 ELM。它在 `sched::boot_init()` 之后、用户态 init 进程启动之前完成初始化，地位类似用户态的 init 进程：后续所有动态 ELM 都位于 `elm-mgr` 管理树中，但可以通过装载请求挂到任意合法动态父单元之下；所有外部管理工具都通过 `elm-mgr` 暴露的控制面进入 ELM Core。`elm-mgr` 的来源固定显示为 `<builtin>`，不会显示为 EKI、soyo、ELF 或其他镜像类型。内建 `eki` 是 `elm-mgr` 的子 ELM，来源同样显示为 `<builtin>`，它只负责提供 EKI 投影能力。未来 VFS、调度、设备等常驻子系统如果需要对外提供可发现、可绑定、可审计的运行时服务，应注册为 `elm-mgr` 可发现、可绑定、可转发的枢纽连接层端口；计划迁出的网络栈由对应 ELM 自己发布端口。如果只是 ELM 像内核代码一样使用稳定 Rust API，则由常驻子系统实现 `kernel-api` 中的版本化契约，不把实现 crate 加入外部工程，也不为每个子系统新增私有 ELM syscall。
 
 仓库提供两个用户态入口：
 
 - `userland/elmctl/`：正式管理工具骨架，构建后安装为 `/bin/elmctl`。它使用共享 C ABI 头和 client helper，支持 Core query、snapshot、全局事件、debug dump、所有 `elm-mgr` 查询命令、EKI 装载/替换、生命周期操作、绑定/解绑、runtime log/event、provider 注册/注销/调用、异步 provider、provider snapshot 和事件订阅。管理器自有查询表会结构化解码；具体子系统 provider 的业务 payload 保持十六进制输出，由对应子系统协议解释。
 - `userland/elmctl-smoke/elmctl_smoke.c`：运行期验收工具，构建后安装为 `/bin/elmctl-smoke`。它不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL` 并执行固定验收步骤。
-- `tools/elm-tools/`：宿主侧 EKI 与 Rust ELM 工程工具，不加入主 workspace。当前支持 `new` 创建独立仓库、`sync-framework` 同步唯一的 `elm` 框架 crate、`build` 执行双架构 PIE 构建/打包/签名，以及 `pack-metadata`、`pack-elf`、`inspect`、`hash`、`keygen`、`sign`、`verify`。由于容器默认 Cargo target 是内核 bare-metal 目标，构建该工具时必须显式使用 host target，例如 `cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- verify demo.eki`。
+- `tools/elm-tools/`：宿主侧 EKI 与 Rust ELM 工程工具，不加入主 workspace。当前支持 `new` 创建独立仓库、`sync-framework` 同步 `elm` 与根目录 `kernel-api` 两个契约 crate、`build` 执行双架构 PIE 构建/打包/签名，以及 `pack-metadata`、`pack-elf`、`inspect`、`hash`、`keygen`、`sign`、`verify`。由于容器默认 Cargo target 是内核 bare-metal 目标，构建该工具时必须显式使用 host target，例如 `cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- verify demo.eki`。
 
 ### elmapi v1 与单一 API 根
 
@@ -1285,11 +1285,19 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 5. 受授权 Manager 通过 identifier `elm.management` 取得独立的 `ElmManagementApiV1`。`elm::management::Client` 在取得表时校验版本、尺寸、切换代和 capability，并在每次调用后校验管理响应头、固定回复或分页回复；内核在每次分发时再次校验当前单元种类、状态、切换代和 management capability。
 6. 普通 ELM 使用 `elm::runtime::*`；Manager ELM 只有在工程启用 `management` feature 且镜像获得显式 management capability 后才能使用 `elm::management::*`。`elm::mgr`、`elm::elmmgr`、独立 `elmmgr` crate 和裸管理 dispatch 均不是 v1 API 的一部分。
 7. management capability 不从父单元自动继承，不能通过 `UpdateCellPolicy` 自行添加或移除。授予请求只接受 Kernel、UserAdmin 或内建 `elm-mgr`，目标镜像必须声明 `ElmKind::Manager`、通过完整签名信任验证，并挂在已经持有 management capability 的父单元下；热替换同样保持签名要求。
-8. 后续子系统 API 可以通过独立版本化表或稳定子系统 crate 接入，不扩大内核全局导出符号面，也不允许模块依赖子系统实现 crate 的内部布局。
+8. Kernel API 通过根目录 `kernel-api` crate 提供类型化 Rust 门面。`#[elm::kernel_api]` 把 namespace、精确版本和能力位写入非装载元数据，`elm-tools` 使用当前门面的规范布局摘要生成 EBI/EKI requirement；Core 在执行任何模块代码前完成 namespace、版本、布局、能力和 generation 授权。
+9. 内核使用通用 namespace 注册表发布静态只读函数表，权限拒绝、版本不兼容和命名空间不存在分别返回不同状态。ELM 首次取得表后缓存地址，普通调用不经过 `elm-mgr` 管理分发；函数表实现仍必须验证当前 ELM 上下文、generation、能力和资源所有权。
+10. 本机制不扩大内核全局 Rust 符号面，也不允许模块依赖 `kernel`、`general`、`hal` 或子系统实现 crate 的内部布局。网络、netdev、socket 和 netlink 接口不进入当前导出批次。
+
+每个 `kernel.*` requirement 在装载事务中解析为一个不可复用的非零 grant。`ElmApiNamespaceV1` 同时返回静态表地址、选中版本、generation、能力集合和 `grant_id`；公开的 `elm.runtime` 与受管理的 `elm.management` 不属于 Kernel API grant，二者的 `grant_id` 固定为零。grant 与 cell、generation、namespace、版本和能力集合共同绑定，装载回滚、隔离、卸载和成功热替换都会撤销不再有效的代际授权。
+
+`kernel-api::ApiImport<Table>` 只在首次访问时协商并缓存表地址和 grant，`Table` 必须实现由 `kernel-api` 内部封闭的 `KernelApiTable`，因此外部 ELM 不能用任意 Rust 类型重新解释函数表。返回的 `ApiTableRef` 同时持有 `ApiGrantTokenV1`。所有 Kernel API 函数表入口都必须把该 token 作为第一个参数；内核 thunk 必须在进入受保护的 `KernelCall` 执行域后，使用当前 ELM 上下文重新校验 token，而不能把表地址、顺序 grant id 或 EBI 自声明当作权限真值。随后还必须由实际子系统校验句柄所有权、内存范围、资源预算和操作级权限。
+
+第一批只完成命名空间、requirement、布局摘要、grant 生命周期、类型化导入和外部工程同步，不发布任何真实 `kernel.*` namespace。第一个子系统表进入注册表前，必须把镜像签名、内建来源或管理员批准接入 grant 决策；未完成该策略边界的 namespace 不得注册，避免把“镜像声明需要能力”错误等同于“系统批准授予能力”。
 
 ### Rust ELM 独立仓库开发框架
 
-外部 ELM 不再生成或维护第二套独立 ABI 源码。唯一实现位于 `libs/elm`；`elm-tools sync-framework` 只把该 crate 的 module 编译面同步到工程内的 `.elm/framework/elm`。普通开发代码通过 `elm::runtime::*` 调用日志、上下文和终止等运行时能力，通过 `elm::*` 使用固定帧、载荷、import/export 和 attribute；Manager 工程额外启用 `management` feature，并通过 `elm::management::Client` 调用类型化管理 API。工程中不存在第二个框架 crate，也不存在重复结构体或漂移的常量副本。
+外部 ELM 不再生成或维护第二套独立 ABI 源码。基础运行时协议唯一实现位于 `libs/elm`，内核开发门面唯一实现位于根目录 `kernel-api`；`elm-tools sync-framework` 把两者的 module 编译面同步到工程内的 `.elm/framework/elm` 与 `.elm/framework/kernel-api`。普通开发代码通过 `elm::runtime::*` 调用日志、上下文和终止等运行时能力，通过 `kernel_api::*` 使用经过授权的内核函数表，通过 `elm::*` 使用固定帧、载荷、import/export 和 attribute；Manager 工程额外启用 `management` feature，并通过 `elm::management::Client` 调用类型化管理 API。两个契约 crate 都不包含内核子系统实现源码。
 
 创建一个独立仓库：
 
@@ -1303,7 +1311,7 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
 
 生成结果包含：
 
-- `Cargo.toml`：独立 workspace，只依赖同步后的 `elm`；普通工程启用 `module, macros`，Manager 工程额外启用 `management`。
+- `Cargo.toml`：独立 workspace，依赖同步后的 `elm` 与 `kernel-api`；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`，`kernel-api` 启用 `module`。
 - `Elm.toml`：名称、版本、种类、来源 identifier、菜单和单元依赖的唯一声明源。
 - `src/main.rs`：`no_std + no_main` 生命周期模板。
 - `elm.ld`：固定的连续 `PT_LOAD`、非装载 `.elm.meta` 和动态重定位布局。
@@ -1494,6 +1502,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 当前剩余主线：
 
+- Kernel API 导出：按基础服务、执行、设备、VFS/存储、固件和受控 syscall 六个批次，把运行期内核能力接入版本化函数表；尚未完整实现的 namespace 不得公开占位。
 - 子系统 provider：设备、VFS、网络、IRQ、DMA、MMIO 等真实能力必须在各自子系统内部实现并显式注册。
 - 用户态管理工具：补齐面向实际部署的策略编辑、镜像仓库、交互式诊断和运维工作流。
 - ELM 调试与发布生态：补齐调试符号归档、IDE 映射、依赖锁定、可复现发布索引和镜像仓库；attribute、独立仓库模板、双架构 PIE、EKI、签名和运行期装载链路已经具备。
@@ -1503,7 +1512,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 - 当前 ELM 已经形成稳定的管理运行时和原生执行边界：`elm-mgr` 可以作为外界入口管理菜单、策略、拓扑、审计、provider、事件订阅、资源预算、隔离状态、完整 60 项 API 注册表、信任、Projection Source、journal、镜像会话和 EBI 装载状态；EKI 由内建 `eki` 子单元以固定 Projection Source ID 接入。
 - 当前阶段不再继续把零散能力堆进 `MGR_CALL`。后续新增能力必须归入子系统 provider、用户态管理工具、ELM 调试与发布生态、其他格式 Projection Source 或网络栈 ELM 化等明确主线。
-- `elm-mgr` 是所有 ELM 通向运行时管理能力的唯一网关，但不是所有内核子系统 API 的唯一网关；后续 VFS、设备、调度、网络、IRQ、DMA、MMIO 等能力可以按稳定 Rust crate API 直接调用，只有需要运行时发现、绑定、审计、跨单元调用或异步流控时才通过 `elm-mgr` API 注册表和 provider Ops 暴露。不新增私有 ELM syscall。
+- `elm-mgr` 是所有 ELM 通向运行时管理能力的唯一网关，但不是内核数据热路径。后续 VFS、设备、调度、IRQ、DMA、MMIO 等能力通过 `kernel-api` 的版本化表直接调用，只有需要运行时发现、绑定、审计、跨单元调用或异步流控时才通过 provider Ops；不为每个子系统新增私有 syscall，未来只提供由 ELM 自行声明、冲突拒绝且随生命周期撤销的受控 syscall 注册机制。
 - `EKI` 是近期原生 ELM 镜像承载方式，`soyo` 仍保持后置；ELM Core 继续只消费 EBI 协议对象，不绑定具体文件格式，具体镜像类型必须通过 Projection Source 进入。
 - 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，受管 import 可选择唯一最高兼容 export 并在替换时回滚，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用。迁移式热替换、调用排空、Projection Source 原子 generation 切换、provider snapshot 分页、资源预算、隔离、同步 fault、panic 恢复和 timer 强制退出均已进入双架构验证链路。
 
@@ -1511,7 +1520,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 第一主线：子系统 provider 接入。
 
-- 在设备、VFS、网络、IRQ、DMA、MMIO、块 I/O 等子系统内部实现各自 `Ops`、snapshot、revoke 和协议结构。
+- 在设备、VFS、IRQ、DMA、MMIO、块 I/O 等常驻子系统内部实现各自 `Ops`、snapshot、revoke 和协议结构；计划迁移为 ELM 的网络栈不新增内建 provider。
 - 子系统初始化成功后显式注册 `ElmKernelProviderSpec`，Core 不保存子系统特殊分支。
 - 以真实负载验证同步、异步、取消、配额、热插拔和审计语义。
 
@@ -1524,7 +1533,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 第三主线：ELM 调试与发布生态。
 
 - 为现有 attribute 与独立仓库框架补齐调试符号归档、源文件映射、测试 harness 和 IDE 集成。
-- 固化 `elm::runtime::*`、`elm::management::*` 与可直接依赖的子系统 crate API 的版本和发布边界。
+- 固化 `elm::runtime::*`、`elm::management::*` 与 `kernel-api` 契约门面的版本和发布边界。
 - 在现有 PIE -> EKI、签名和验签链路上补齐依赖锁定、可复现构建、发布索引与镜像仓库。
 
 第四主线：其他格式 Projection Source。

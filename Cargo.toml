@@ -18,6 +18,7 @@ members = [
     "libs/extfs",
     "libs/elm",
     "libs/elm/macros",
+    "kernel-api",
     "libs/mygo-smoltcp",
     "arch",
     "hal",

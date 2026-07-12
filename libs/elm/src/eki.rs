@@ -18,16 +18,19 @@ use core::str;
 use crate::ebi::{
     ELM_EBI_ABI_VERSION, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
-    ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS,
-    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN,
+    ELM_EBI_MAX_KERNEL_API_REQUIREMENTS, ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS,
+    ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN,
     ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl,
     ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
-    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
-    ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind,
-    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload,
-    ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
+    ElmEbiKernelApiRequirement, ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind,
+    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiProviderPortDecl,
+    ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature, ElmEbiSegment,
+    ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
 };
-use crate::elmapi::ELM_API_MAX_COMPATIBLE_VERSIONS;
+use crate::elmapi::{
+    ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_KERNEL_API_IDENTIFIER_MAX_LEN,
+    ELM_KERNEL_API_LAYOUT_HASH_LEN,
+};
 use crate::manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
 use crate::menu::{
     ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ElmMenuItemKind,
@@ -81,6 +84,9 @@ const EKI_ENTRY_BLOCK_SIZE: usize = 8 + ELM_EKI_ENTRY_SYMBOL_LEN;
 const EKI_TABLE_HEADER_SIZE: usize = 8;
 const EKI_SEGMENT_RECORD_SIZE: usize = 32;
 const EKI_DEPENDENCY_RECORD_SIZE: usize = 8 + ELM_EBI_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
+/// EKI v1 Kernel API requirement 固定记录长度。
+pub const ELM_EKI_KERNEL_API_RECORD_SIZE: usize =
+    16 + ELM_KERNEL_API_LAYOUT_HASH_LEN + ELM_KERNEL_API_IDENTIFIER_MAX_LEN;
 const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
     16 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_RECORD_SIZE: usize =
@@ -141,6 +147,8 @@ pub enum ElmEkiBlockKind {
     ApiCompatibility = 20,
     /// `AbiFingerprint` 表示 `ElmEkiBlockKind` 的对象类别：`abi fingerprint`。
     AbiFingerprint = 21,
+    /// `KernelApis` 保存模块装载前必须取得的 Kernel API 命名空间。
+    KernelApis = 22,
 }
 
 impl ElmEkiBlockKind {
@@ -168,6 +176,7 @@ impl ElmEkiBlockKind {
             19 => Some(Self::SymbolLocations),
             20 => Some(Self::ApiCompatibility),
             21 => Some(Self::AbiFingerprint),
+            22 => Some(Self::KernelApis),
             _ => None,
         }
     }
@@ -263,6 +272,7 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     let mut segment_decls = None;
     let mut payload_segments = Vec::new();
     let mut dependencies = None;
+    let mut kernel_api_requirements = None;
     let mut extension_points = None;
     let mut extensions = None;
     let mut provider_ports = None;
@@ -357,6 +367,12 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
                 }
                 dependencies = Some(parse_dependencies(payload)?);
             }
+            ElmEkiBlockKind::KernelApis => {
+                if kernel_api_requirements.is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidManifest);
+                }
+                kernel_api_requirements = Some(parse_kernel_api_requirements(payload)?);
+            }
             ElmEkiBlockKind::ExtensionPoints => {
                 if extension_points.is_some() {
                     return Err(ElmEbiLoadStatus::InvalidManifest);
@@ -415,6 +431,11 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     if let Some(dependencies) = dependencies {
         for dependency in dependencies {
             unit = unit.with_dependency(dependency);
+        }
+    }
+    if let Some(requirements) = kernel_api_requirements {
+        for requirement in requirements {
+            unit = unit.with_kernel_api_requirement(requirement);
         }
     }
     if let Some(extension_points) = extension_points {
@@ -933,6 +954,52 @@ fn parse_dependencies(payload: &[u8]) -> Result<Vec<ElmEbiDependencyDecl>, ElmEb
         )?);
     }
     Ok(dependencies)
+}
+
+fn parse_kernel_api_requirements(
+    payload: &[u8],
+) -> Result<Vec<ElmEbiKernelApiRequirement>, ElmEbiLoadStatus> {
+    let count = parse_table_count(
+        payload,
+        ELM_EBI_MAX_KERNEL_API_REQUIREMENTS,
+        ELM_EKI_KERNEL_API_RECORD_SIZE,
+    )?;
+    let mut requirements = Vec::new();
+    for index in 0..count {
+        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_KERNEL_API_RECORD_SIZE;
+        let identifier_len = read_u16(payload, offset)? as usize;
+        let version = read_u16(payload, offset + 2)?;
+        if read_u32(payload, offset + 4)? != 0 {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        let capabilities = read_u64(payload, offset + 8)?;
+        let hash_start = offset + 16;
+        let mut layout_hash = [0; ELM_KERNEL_API_LAYOUT_HASH_LEN];
+        layout_hash.copy_from_slice(read_bytes(
+            payload,
+            hash_start,
+            ELM_KERNEL_API_LAYOUT_HASH_LEN,
+        )?);
+        let identifier_start = hash_start + ELM_KERNEL_API_LAYOUT_HASH_LEN;
+        requirements.push(ElmEbiKernelApiRequirement::new(
+            fixed_str(payload, identifier_start, identifier_len)?,
+            version,
+            capabilities,
+            layout_hash,
+        )?);
+    }
+    requirements.sort_by(|left, right| {
+        left.identifier
+            .cmp(&right.identifier)
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    if requirements
+        .windows(2)
+        .any(|items| items[0].identifier == items[1].identifier)
+    {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    Ok(requirements)
 }
 
 fn parse_extension_points(

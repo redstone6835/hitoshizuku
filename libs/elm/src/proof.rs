@@ -793,6 +793,13 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
         hash.string(&dependency.provider_name);
         hash.string(dependency.contract.as_str());
     }
+    hash.u64(unit.kernel_api_requirements.len() as u64);
+    for requirement in &unit.kernel_api_requirements {
+        hash.string(&requirement.identifier);
+        hash.u16(requirement.version);
+        hash.u64(requirement.required_capabilities);
+        hash.bytes(&requirement.layout_hash);
+    }
     hash.u64(unit.extension_points.len() as u64);
     for point in &unit.extension_points {
         hash.string(&point.point);

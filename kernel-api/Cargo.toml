@@ -1,0 +1,17 @@
+[package]
+name = "kernel-api"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+test = true
+doctest = true
+bench = false
+
+[features]
+default = ["runtime-model"]
+runtime-model = ["elm/runtime-model"]
+module = ["elm/module"]
+
+[dependencies]
+elm = { path = "../libs/elm", default-features = false }

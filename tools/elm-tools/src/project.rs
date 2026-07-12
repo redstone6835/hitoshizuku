@@ -231,8 +231,15 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     migrate_cargo_manifest(&manifest, &project_manifest.kind)?;
     let source = framework_source_root()?;
     let elm_source = source.join("libs/elm");
+    let kernel_api_source = source.join("kernel-api");
     if !elm_source.join("Cargo.toml").is_file() {
         return Err(format!("找不到框架源目录: {}", elm_source.display()));
+    }
+    if !kernel_api_source.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "找不到 Kernel API 门面源目录: {}",
+            kernel_api_source.display()
+        ));
     }
     let elm_root = project.join(".elm");
     fs::create_dir_all(&elm_root)
@@ -245,6 +252,8 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     fs::create_dir_all(&temporary)
         .map_err(|err| format!("创建 {} 失败: {err}", temporary.display()))?;
     copy_tree(&elm_source, &temporary.join("elm"))?;
+    copy_tree(&kernel_api_source, &temporary.join("kernel-api"))?;
+    rewrite_synced_kernel_api_manifest(&temporary.join("kernel-api/Cargo.toml"))?;
     if destination.exists() {
         fs::rename(&destination, &backup).map_err(|err| {
             format!(
@@ -348,6 +357,16 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn rewrite_synced_kernel_api_manifest(path: &Path) -> Result<(), String> {
+    let input = fs::read_to_string(path)
+        .map_err(|err| format!("读取同步后的 {} 失败: {err}", path.display()))?;
+    let output = input.replace("path = \"../libs/elm\"", "path = \"../elm\"");
+    if output == input {
+        return Err(format!("{} 不包含规范 elm 依赖路径", path.display()));
+    }
+    fs::write(path, output).map_err(|err| format!("重写 {} 失败: {err}", path.display()))
+}
+
 fn remove_if_exists(path: &Path) -> Result<(), String> {
     if path.is_dir() {
         fs::remove_dir_all(path).map_err(|err| format!("删除 {} 失败: {err}", path.display()))?;
@@ -373,6 +392,7 @@ members = [
     ".",
     ".elm/framework/elm",
     ".elm/framework/elm/macros",
+    ".elm/framework/kernel-api",
 ]
 
 [workspace.package]
@@ -392,6 +412,7 @@ bench = false
 
 [dependencies]
 elm = {{ path = ".elm/framework/elm", default-features = false, features = [{features}] }}
+kernel-api = {{ path = ".elm/framework/kernel-api", default-features = false, features = ["module"] }}
 
 [profile.release]
 panic = "abort"
@@ -484,6 +505,28 @@ fn migrate_cargo_manifest(path: &Path, kind: &str) -> Result<(), String> {
             "{} 使用定制化 elm 依赖，但 Manager 工程未启用 management feature",
             path.display()
         ));
+    }
+
+    if !output.contains(".elm/framework/kernel-api") {
+        output = output.replace(
+            "    \".elm/framework/elm/macros\",\n",
+            "    \".elm/framework/elm/macros\",\n    \".elm/framework/kernel-api\",\n",
+        );
+        let dependency =
+            "kernel-api = { path = \".elm/framework/kernel-api\", default-features = false, features = [\"module\"] }";
+        if output.contains(desired) {
+            output = output.replace(desired, format!("{desired}\n{dependency}").as_str());
+        } else {
+            let dependencies = "[dependencies]\n";
+            if output.contains(dependencies) {
+                output = output.replace(
+                    dependencies,
+                    format!("{dependencies}{dependency}\n").as_str(),
+                );
+            } else {
+                return Err(format!("{} 缺少 [dependencies]", path.display()));
+            }
+        }
     }
 
     if output != input {
@@ -792,6 +835,8 @@ uri = "forbidden"
         let service_cargo = fs::read_to_string(service.path().join("Cargo.toml")).unwrap();
         let service_source = fs::read_to_string(service.path().join("src/main.rs")).unwrap();
         assert!(service_cargo.contains("features = [\"module\", \"macros\"]"));
+        assert!(service_cargo.contains(".elm/framework/kernel-api"));
+        assert!(service_cargo.contains("kernel-api ="));
         assert!(!service_cargo.contains("management"));
         assert!(!service_cargo.contains("elmmgr"));
         assert!(service_source.contains("elm::runtime::log"));
@@ -800,6 +845,12 @@ uri = "forbidden"
             service
                 .path()
                 .join(".elm/framework/elm/Cargo.toml")
+                .is_file()
+        );
+        assert!(
+            service
+                .path()
+                .join(".elm/framework/kernel-api/Cargo.toml")
                 .is_file()
         );
         assert!(!service.path().join(".elm/framework/elmmgr").exists());
@@ -836,6 +887,8 @@ elmmgr = { path = ".elm/framework/elmmgr" }
         let migrated = fs::read_to_string(&manifest).unwrap();
         assert!(!migrated.contains("elmmgr"));
         assert!(migrated.contains("features = [\"module\", \"macros\", \"management\"]"));
+        assert!(migrated.contains(".elm/framework/kernel-api"));
+        assert!(migrated.contains("kernel-api ="));
 
         fs::write(
             &manifest,

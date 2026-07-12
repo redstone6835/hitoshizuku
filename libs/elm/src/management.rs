@@ -214,6 +214,7 @@ impl Client {
             || namespace.table_size < core::mem::size_of::<ElmManagementApiV1>() as u32
             || namespace.table_address == 0
             || namespace.generation == 0
+            || namespace.grant_id != 0
             || namespace.capabilities & u64::from(ELM_CELL_POLICY_ALLOW_MANAGEMENT) == 0
         {
             return Err(Error::MalformedResponse);
@@ -1198,6 +1199,7 @@ mod tests {
             table_size: core::mem::size_of::<ElmManagementApiV1>() as u32,
             table_address: table as *const ElmManagementApiV1 as usize,
             generation: 1,
+            grant_id: 0,
             capabilities: u64::from(ELM_CELL_POLICY_ALLOW_MANAGEMENT),
         }
     }

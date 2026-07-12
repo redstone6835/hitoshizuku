@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 pub use crate::ebi_wire::*;
 use crate::elmapi::{
     ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
+    ELM_KERNEL_API_LAYOUT_HASH_LEN, is_valid_kernel_api_identifier,
 };
 use crate::manifest::{ElmManifest, ElmName};
 use crate::menu::{
@@ -46,6 +47,8 @@ pub const ELM_EBI_MAX_PROVIDER_PORTS: usize = 16;
 pub const ELM_EBI_MAX_IMPORTS: usize = 64;
 /// `ELM_EBI_MAX_EXPORTS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_EXPORTS: usize = 64;
+/// 单个 ELM 可以声明的 Kernel API 命名空间依赖上限。
+pub const ELM_EBI_MAX_KERNEL_API_REQUIREMENTS: usize = 64;
 /// `ELM_EBI_MAX_SYMBOL_LOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_SYMBOL_LOCATIONS: usize = 128;
 /// `ELM_EBI_MAX_RELOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
@@ -1004,6 +1007,38 @@ impl ElmEbiDependencyDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// ELM 对一个版本化 Kernel API 命名空间的装载前依赖声明。
+pub struct ElmEbiKernelApiRequirement {
+    /// 命名空间 identifier。
+    pub identifier: String,
+    /// 当前 v1 使用的精确函数表版本。
+    pub version: u16,
+    /// 模块实际需要的能力位。
+    pub required_capabilities: u64,
+    /// 对应版本函数表的规范布局 SHA-256。
+    pub layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
+}
+
+impl ElmEbiKernelApiRequirement {
+    /// 构造并校验一个 Kernel API 依赖声明。
+    pub fn new(
+        identifier: impl Into<String>,
+        version: u16,
+        required_capabilities: u64,
+        layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        let requirement = Self {
+            identifier: identifier.into(),
+            version,
+            required_capabilities,
+            layout_hash,
+        };
+        validate_kernel_api_requirement(&requirement)?;
+        Ok(requirement)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// 目标单元公开的补缀点名称、契约、阶段和组合模式声明。
 pub struct ElmEbiExtensionPointDecl {
     /// 补缀点的完整 identifier，通常包含阶段后缀。
@@ -1170,6 +1205,8 @@ pub struct ElmEbiUnit {
     pub entry: Option<ElmEbiEntry>,
     /// 该单元声明的必需或可选依赖集合。
     pub dependencies: Vec<ElmEbiDependencyDecl>,
+    /// 该单元在执行任何原生代码前必须取得的 Kernel API 命名空间集合。
+    pub kernel_api_requirements: Vec<ElmEbiKernelApiRequirement>,
     /// 该单元允许其他 ELM 附着的补缀点集合。
     pub extension_points: Vec<ElmEbiExtensionPointDecl>,
     /// 该单元声明的 extension/mixin 附着集合。
@@ -1196,6 +1233,7 @@ impl ElmEbiUnit {
             segments: Vec::new(),
             entry: None,
             dependencies: Vec::new(),
+            kernel_api_requirements: Vec::new(),
             extension_points: Vec::new(),
             extensions: Vec::new(),
             provider_ports: Vec::new(),
@@ -1227,6 +1265,12 @@ impl ElmEbiUnit {
     /// 设置 `dependency` 并返回更新后的值，便于构建器式初始化。
     pub fn with_dependency(mut self, dependency: ElmEbiDependencyDecl) -> Self {
         self.dependencies.push(dependency);
+        self
+    }
+
+    /// 添加一个装载前 Kernel API 依赖声明。
+    pub fn with_kernel_api_requirement(mut self, requirement: ElmEbiKernelApiRequirement) -> Self {
+        self.kernel_api_requirements.push(requirement);
         self
     }
 
@@ -1287,6 +1331,7 @@ impl ElmEbiUnit {
             return Err(ElmEbiLoadStatus::InvalidSegment);
         }
         if self.dependencies.len() > ELM_EBI_MAX_DEPENDENCIES
+            || self.kernel_api_requirements.len() > ELM_EBI_MAX_KERNEL_API_REQUIREMENTS
             || self.extension_points.len() > ELM_EBI_MAX_EXTENSION_POINTS
             || self.extensions.len() > ELM_EBI_MAX_EXTENSIONS
             || self.provider_ports.len() > ELM_EBI_MAX_PROVIDER_PORTS
@@ -1309,6 +1354,16 @@ impl ElmEbiUnit {
         for dependency in &self.dependencies {
             validate_ebi_name(&dependency.provider_name)?;
             validate_contract_len(&dependency.contract)?;
+        }
+        for requirement in &self.kernel_api_requirements {
+            validate_kernel_api_requirement(requirement)?;
+        }
+        if self.kernel_api_requirements.windows(2).any(|items| {
+            items[0].identifier >= items[1].identifier
+                || (items[0].identifier == items[1].identifier
+                    && items[0].version >= items[1].version)
+        }) {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
         }
         for point in &self.extension_points {
             validate_ebi_point(&point.point)?;
@@ -1366,6 +1421,18 @@ impl ElmEbiUnit {
                 .iter()
                 .any(ElmEbiSegment::requires_native_loader)
     }
+}
+
+fn validate_kernel_api_requirement(
+    requirement: &ElmEbiKernelApiRequirement,
+) -> Result<(), ElmEbiLoadStatus> {
+    if !is_valid_kernel_api_identifier(&requirement.identifier)
+        || requirement.version == 0
+        || requirement.layout_hash == [0; ELM_KERNEL_API_LAYOUT_HASH_LEN]
+    {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

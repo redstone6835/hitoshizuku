@@ -9,7 +9,7 @@
 //!
 //! # 共同函数约束
 //!
-//! 除 [`payload`] 和 [`import`] 外，本 crate 的 attribute 均作用于函数。被标记函数必须：
+//! 除 [`macro@payload`] 和 [`macro@import`] 外，本 crate 的 attribute 均作用于函数。被标记函数必须：
 //!
 //! - 是普通安全 Rust 函数，不能是 `unsafe fn`；
 //! - 不能声明 `extern` ABI、`async`、`const`、可变参数或泛型参数；
@@ -88,10 +88,12 @@ const KIND_IMPORT: u16 = 6;
 const KIND_EXTENSION_POINT: u16 = 7;
 const KIND_EXTENSION: u16 = 8;
 const KIND_PAYLOAD: u16 = 9;
+const KIND_KERNEL_API: u16 = 10;
 
 const VALUE_UTF8: u16 = 1;
 const VALUE_U32: u16 = 2;
 const VALUE_I32: u16 = 3;
+const VALUE_U64: u16 = 4;
 
 const FIELD_SYMBOL: u16 = 1;
 const FIELD_HOOK_KIND: u16 = 2;
@@ -111,6 +113,7 @@ const FIELD_PRIORITY: u16 = 15;
 const FIELD_HANDLER_CONTRACT: u16 = 16;
 const FIELD_PAYLOAD_CONTRACT: u16 = 17;
 const FIELD_WIRE_SIZE: u16 = 18;
+const FIELD_CAPABILITIES: u16 = 20;
 
 const IMPORT_OPTIONAL: u32 = 1 << 0;
 const IMPORT_MANAGED: u32 = 1 << 1;
@@ -671,6 +674,27 @@ pub fn export(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as ItemStatic);
     match import_impl(attr.into(), item) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+/// 声明当前 ELM 在初始化前必须取得的 Kernel API 命名空间。
+///
+/// attribute 只能标记不可变 `static`。静态对象使用 `kernel_api::ApiImport<Table>`，其
+/// initializer 中的 identifier、版本和能力必须与 attribute 保持一致；打包器会把该声明
+/// 转换为 EBI Kernel API requirement，内核在执行 `on_initialize` 前完成版本、布局、权限和
+/// capability 校验。
+///
+/// ```ignore
+/// #[elm::kernel_api(namespace = "kernel.time", version = 1, capabilities = 3)]
+/// static TIME: kernel_api::ApiImport<kernel_api::time::TimeApiV1> =
+///     kernel_api::ApiImport::new("kernel.time", 1, 3);
+/// ```
+pub fn kernel_api(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as ItemStatic);
+    match kernel_api_impl(attr.into(), item) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -1254,6 +1278,159 @@ fn import_impl(attr: TokenStream2, mut item: ItemStatic) -> syn::Result<TokenStr
     })
 }
 
+fn kernel_api_impl(attr: TokenStream2, item: ItemStatic) -> syn::Result<TokenStream2> {
+    let args = MetaArgs::parse(attr)?;
+    let namespace = args.required_string("namespace")?;
+    let version = args.u32_or("version", 1)?;
+    let capabilities = args.u64_or("capabilities", 0)?;
+    if namespace.len() > 64
+        || !namespace.starts_with("kernel.")
+        || namespace.ends_with('.')
+        || namespace.contains("..")
+        || !namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+    {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "Kernel API namespace 必须是长度不超过 64 的 kernel.* identifier",
+        ));
+    }
+    if version == 0 || version > u16::MAX as u32 {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "Kernel API version 必须位于 1..=65535",
+        ));
+    }
+    if matches!(item.mutability, syn::StaticMutability::Mut(_)) {
+        return Err(syn::Error::new_spanned(
+            &item.mutability,
+            "Kernel API 导入槽必须是不可变 static",
+        ));
+    }
+    validate_kernel_api_slot(&item, &namespace, version, capabilities)?;
+    args.finish()?;
+    let ident = item.ident.clone();
+    let metadata = metadata_item(
+        &ident,
+        "kernel_api",
+        metadata_record(
+            KIND_KERNEL_API,
+            vec![
+                MetaField::utf8(FIELD_NAME, &namespace),
+                MetaField::u32(FIELD_VERSION, version),
+                MetaField::u64(FIELD_CAPABILITIES, capabilities),
+            ],
+        ),
+    );
+    Ok(quote! {
+        #item
+        #metadata
+    })
+}
+
+fn validate_kernel_api_slot(
+    item: &ItemStatic,
+    namespace: &str,
+    version: u32,
+    capabilities: u64,
+) -> syn::Result<()> {
+    let Type::Path(path) = item.ty.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &item.ty,
+            "Kernel API 导入槽类型必须是 kernel_api::ApiImport<Table>",
+        ));
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return Err(syn::Error::new_spanned(
+            &item.ty,
+            "Kernel API 导入槽类型必须是 kernel_api::ApiImport<Table>",
+        ));
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return Err(syn::Error::new_spanned(
+            &item.ty,
+            "Kernel API 导入槽必须绑定一个由 kernel-api 发布的函数表类型",
+        ));
+    };
+    if path.qself.is_some()
+        || segment.ident != "ApiImport"
+        || arguments.args.len() != 1
+        || !matches!(arguments.args.first(), Some(syn::GenericArgument::Type(_)))
+    {
+        return Err(syn::Error::new_spanned(
+            &item.ty,
+            "Kernel API 导入槽类型必须是 kernel_api::ApiImport<Table>",
+        ));
+    }
+
+    let Expr::Call(call) = item.expr.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &item.expr,
+            "Kernel API 导入槽必须使用 ApiImport::new(namespace, version, capabilities) 初始化",
+        ));
+    };
+    let Expr::Path(function) = call.func.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &call.func,
+            "Kernel API 导入槽必须调用 ApiImport::new",
+        ));
+    };
+    if function
+        .path
+        .segments
+        .last()
+        .is_none_or(|segment| segment.ident != "new")
+        || call.args.len() != 3
+    {
+        return Err(syn::Error::new_spanned(
+            call,
+            "Kernel API 导入槽必须调用 ApiImport::new(namespace, version, capabilities)",
+        ));
+    }
+
+    let mut args = call.args.iter();
+    let initializer_namespace = expression_string(args.next().expect("参数数量已检查"))?;
+    let initializer_version = expression_u64(args.next().expect("参数数量已检查"))?;
+    let initializer_capabilities = expression_u64(args.next().expect("参数数量已检查"))?;
+    if initializer_namespace != namespace
+        || initializer_version != u64::from(version)
+        || initializer_capabilities != capabilities
+    {
+        return Err(syn::Error::new_spanned(
+            &item.expr,
+            "ApiImport::new 的 namespace、version 和 capabilities 必须与 attribute 完全一致",
+        ));
+    }
+    Ok(())
+}
+
+fn expression_string(expression: &Expr) -> syn::Result<String> {
+    match expression {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) => Ok(value.value()),
+        _ => Err(syn::Error::new_spanned(
+            expression,
+            "此参数必须是字符串字面量",
+        )),
+    }
+}
+
+fn expression_u64(expression: &Expr) -> syn::Result<u64> {
+    match expression {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(value),
+            ..
+        }) => value.base10_parse(),
+        _ => Err(syn::Error::new_spanned(
+            expression,
+            "此参数必须是非负整数字面量",
+        )),
+    }
+}
+
 fn payload_impl(attr: TokenStream2, item: ItemStruct) -> syn::Result<TokenStream2> {
     let contract = syn::parse2::<LitStr>(attr)?.value();
     validate_contract(&contract)?;
@@ -1743,6 +1920,7 @@ fn require_empty_attr(attr: TokenStream2) -> syn::Result<()> {
 enum MetaValue {
     String(String),
     U32(u32),
+    U64(u64),
     I32(i32),
     Bool(bool),
     Stages(u32),
@@ -1835,6 +2013,18 @@ impl MetaArgs {
                 Span::call_site(),
                 format!("缺少必需参数 {name}"),
             )),
+        }
+    }
+
+    fn u64_or(&self, name: &str, default: u64) -> syn::Result<u64> {
+        match self.values.borrow_mut().remove(name) {
+            Some(MetaValue::U32(value)) => Ok(u64::from(value)),
+            Some(MetaValue::U64(value)) => Ok(value),
+            Some(_) => Err(syn::Error::new(
+                Span::call_site(),
+                format!("{name} 必须是 u64 字面量"),
+            )),
+            None => Ok(default),
         }
     }
 
@@ -1935,9 +2125,13 @@ fn parse_integer_literal(value: syn::LitInt) -> syn::Result<MetaValue> {
         parse_negative_integer_literal(value)
     } else {
         let parsed = digits
-            .parse::<u32>()
-            .map_err(|_| syn::Error::new_spanned(&value, "u32 参数越界"))?;
-        Ok(MetaValue::U32(parsed))
+            .parse::<u64>()
+            .map_err(|_| syn::Error::new_spanned(&value, "u64 参数越界"))?;
+        if let Ok(value) = u32::try_from(parsed) {
+            Ok(MetaValue::U32(value))
+        } else {
+            Ok(MetaValue::U64(parsed))
+        }
     }
 }
 
@@ -2120,6 +2314,14 @@ impl MetaField {
             bytes: value.to_le_bytes().to_vec(),
         }
     }
+
+    fn u64(tag: u16, value: u64) -> Self {
+        Self {
+            tag,
+            kind: VALUE_U64,
+            bytes: value.to_le_bytes().to_vec(),
+        }
+    }
 }
 
 fn metadata_record(kind: u16, mut fields: Vec<MetaField>) -> Vec<u8> {
@@ -2237,6 +2439,38 @@ mod tests {
         assert!(validate_import_slot(&managed, "managed").is_ok());
         assert!(validate_import_slot(&direct, "direct-pinned").is_ok());
         assert!(validate_import_slot(&managed, "direct-pinned").is_err());
+    }
+
+    #[test]
+    fn validates_kernel_api_slot_initializer() {
+        let valid: ItemStatic = syn::parse_quote! {
+            static TIME: ::kernel_api::ApiImport<::kernel_api::time::TimeApiV1> =
+                ::kernel_api::ApiImport::new("kernel.time", 1, 3);
+        };
+        assert!(validate_kernel_api_slot(&valid, "kernel.time", 1, 3).is_ok());
+
+        let mismatched: ItemStatic = syn::parse_quote! {
+            static TIME: ::kernel_api::ApiImport<::kernel_api::time::TimeApiV1> =
+                ::kernel_api::ApiImport::new("kernel.random", 1, 3);
+        };
+        assert!(validate_kernel_api_slot(&mismatched, "kernel.time", 1, 3).is_err());
+
+        let wrong_type: ItemStatic = syn::parse_quote! {
+            static TIME: usize = 0;
+        };
+        assert!(validate_kernel_api_slot(&wrong_type, "kernel.time", 1, 3).is_err());
+    }
+
+    #[test]
+    fn rejects_noncanonical_kernel_api_namespace() {
+        let slot: ItemStatic = syn::parse_quote! {
+            static TIME: ::kernel_api::ApiImport<::kernel_api::time::TimeApiV1> =
+                ::kernel_api::ApiImport::new("kernel.time", 1, 3);
+        };
+        let trailing_dot = quote!(namespace = "kernel.", version = 1, capabilities = 3);
+        assert!(kernel_api_impl(trailing_dot, slot.clone()).is_err());
+        let empty_segment = quote!(namespace = "kernel..time", version = 1, capabilities = 3);
+        assert!(kernel_api_impl(empty_segment, slot).is_err());
     }
 
     #[test]

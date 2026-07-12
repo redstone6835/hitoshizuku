@@ -59,17 +59,18 @@ use crate::{
     ElmActionInvokeRequest, ElmCallFrame, ElmCellSnapshot, ElmContext, ElmCoreHealthHeader,
     ElmCoreHealthRecord, ElmCoreInfo, ElmCtlCommand, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry,
     ElmEbiExportDecl, ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
-    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
-    ElmEbiMenuDecl, ElmEbiProofV1, ElmEbiProviderPortDecl, ElmEbiRelocationKind,
-    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSourceKind,
-    ElmEbiSourceRequest, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind,
-    ElmError, ElmEventRecord, ElmExtensionAttachRequest, ElmExtensionAttachResponse,
-    ElmExtensionDetachRequest, ElmExtensionDispatchRequest, ElmExtensionDispatchResponse,
-    ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord, ElmId, ElmKind, ElmLifecycleAction,
-    ElmLifecyclePhase, ElmLifecyclePlanRequest, ElmLifecyclePlanResponse, ElmLifecycleRequest,
-    ElmLifecycleResponse, ElmManifest, ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader,
-    ElmMgrApiDescriptor, ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrAuditRecord,
-    ElmMgrCallHeader, ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
+    ElmEbiKernelApiRequirement, ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind,
+    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiProofV1, ElmEbiProviderPortDecl,
+    ElmEbiRelocationKind, ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind,
+    ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
+    ElmEkiBlockKind, ElmError, ElmEventRecord, ElmExtensionAttachRequest,
+    ElmExtensionAttachResponse, ElmExtensionDetachRequest, ElmExtensionDispatchRequest,
+    ElmExtensionDispatchResponse, ElmExtensionSnapshotHeader, ElmExtensionSnapshotRecord, ElmId,
+    ElmKind, ElmLifecycleAction, ElmLifecyclePhase, ElmLifecyclePlanRequest,
+    ElmLifecyclePlanResponse, ElmLifecycleRequest, ElmLifecycleResponse, ElmManifest,
+    ElmMenuItemKind, ElmMenuItemSnapshot, ElmMenuSnapshotHeader, ElmMgrApiDescriptor,
+    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrAuditRecord, ElmMgrCallHeader,
+    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventSubscribeResponse,
     ElmMgrEventSubscriptionHeader, ElmMgrEventSubscriptionRecord, ElmMgrEventUnsubscribeRequest,
     ElmMgrEventUnsubscribeResponse, ElmMgrPolicyInfo, ElmMgrRelationKind, ElmMgrRelationRecord,
     ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader, ElmMgrSubscribedEventReadRequest,
@@ -115,6 +116,24 @@ fn lifecycle_hooks() -> ElmEbiLifecycleHooks {
 fn ebi_unit(name: &str) -> ElmEbiUnit {
     ElmEbiUnit::new(manifest(name), ElmEbiTarget::new(ElmEbiArch::Any))
         .with_lifecycle_hooks(lifecycle_hooks())
+}
+
+#[test]
+fn ebi_kernel_api_requirements_are_validated_and_ordered() {
+    let valid = ElmEbiKernelApiRequirement::new("kernel.time", 1, 0x3, [1; 32]).unwrap();
+    let unit = ebi_unit("kernel-api-test").with_kernel_api_requirement(valid);
+    assert_eq!(unit.validate(ElmEbiArch::Riscv64), Ok(()));
+
+    let duplicate = ElmEbiKernelApiRequirement::new("kernel.time", 1, 0x1, [2; 32]).unwrap();
+    let invalid = unit.with_kernel_api_requirement(duplicate);
+    assert_eq!(
+        invalid.validate(ElmEbiArch::Riscv64),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+    assert_eq!(
+        ElmEbiKernelApiRequirement::new("Kernel.Time", 1, 0x1, [3; 32]),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
 }
 
 fn push_u32(out: &mut Vec<u8>, value: u32) {
@@ -364,6 +383,28 @@ fn eki_dependency_block(provider_name: &str, contract: &str) -> Vec<u8> {
         record + 8 + ELM_EBI_NAME_LEN,
         ELM_NEXUS_CONTRACT_LEN,
         contract,
+    );
+    out
+}
+
+fn eki_kernel_api_block(
+    identifier: &str,
+    version: u16,
+    capabilities: u64,
+    layout_hash: [u8; 32],
+) -> Vec<u8> {
+    let record = 8;
+    let mut out = vec![0; record + crate::ELM_EKI_KERNEL_API_RECORD_SIZE];
+    write_u32(&mut out, 0, 1);
+    write_u16(&mut out, record, identifier.len() as u16);
+    write_u16(&mut out, record + 2, version);
+    write_u64(&mut out, record + 8, capabilities);
+    out[record + 16..record + 48].copy_from_slice(&layout_hash);
+    fixed_copy(
+        &mut out,
+        record + 48,
+        crate::ELM_KERNEL_API_IDENTIFIER_MAX_LEN,
+        identifier,
     );
     out
 }
@@ -2805,6 +2846,28 @@ fn eki_parser_accepts_menu_unit() {
 }
 
 #[test]
+fn eki_parser_accepts_kernel_api_requirements() {
+    let bytes = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("kernel-api-eki", "1.0.0", ElmKind::Service),
+        ),
+        (
+            ElmEkiBlockKind::KernelApis,
+            eki_kernel_api_block("kernel.time", 1, 0x3, [0x5a; 32]),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+    ]);
+    let unit = crate::parse_eki_ebi_unit(&bytes).unwrap();
+    assert_eq!(unit.kernel_api_requirements.len(), 1);
+    let requirement = &unit.kernel_api_requirements[0];
+    assert_eq!(requirement.identifier, "kernel.time");
+    assert_eq!(requirement.version, 1);
+    assert_eq!(requirement.required_capabilities, 0x3);
+    assert_eq!(requirement.layout_hash, [0x5a; 32]);
+}
+
+#[test]
 fn eki_parser_accepts_migration_lifecycle_hooks() {
     let image = eki_image(&[
         (
@@ -3480,8 +3543,62 @@ fn elmapi_compatibility_selects_highest_common_version() {
 #[test]
 fn elmapi_v1_tables_have_fixed_layout() {
     assert_eq!(core::mem::size_of::<crate::ElmApiContextV1>(), 56);
-    assert_eq!(core::mem::size_of::<crate::ElmApiNamespaceV1>(), 40);
+    assert_eq!(core::mem::size_of::<crate::ElmApiNamespaceV1>(), 48);
     assert_eq!(core::mem::size_of::<crate::ElmRuntimeApiV1>(), 56);
     assert_eq!(core::mem::size_of::<crate::ElmManagementApiV1>(), 16);
     assert_eq!(core::mem::size_of::<crate::ElmApiRootV1>(), 48);
+}
+
+#[test]
+fn kernel_api_namespace_descriptor_requires_canonical_identifier_and_layout() {
+    static TABLE: u64 = 0;
+    let valid = crate::ElmApiNamespaceDescriptorV1::new(
+        "kernel.test",
+        1,
+        crate::ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT,
+        1,
+        &TABLE,
+        [0x5a; 32],
+    );
+    assert!(valid.validate());
+
+    let invalid_name = crate::ElmApiNamespaceDescriptorV1::new(
+        "elm.test",
+        1,
+        crate::ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT,
+        1,
+        &TABLE,
+        [0x5a; 32],
+    );
+    assert!(!invalid_name.validate());
+
+    let missing_layout = crate::ElmApiNamespaceDescriptorV1::new(
+        "kernel.test",
+        1,
+        crate::ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT,
+        1,
+        &TABLE,
+        [0; 32],
+    );
+    assert!(!missing_layout.validate());
+
+    let public_kernel_namespace = crate::ElmApiNamespaceDescriptorV1::new(
+        "kernel.test",
+        1,
+        crate::ELM_API_NAMESPACE_FLAG_PUBLIC,
+        1,
+        &TABLE,
+        [0x5a; 32],
+    );
+    assert!(!public_kernel_namespace.validate());
+
+    let malformed_public_kernel_namespace = crate::ElmApiNamespaceDescriptorV1::new(
+        "kernel..test",
+        1,
+        crate::ELM_API_NAMESPACE_FLAG_PUBLIC,
+        1,
+        &TABLE,
+        [0x5a; 32],
+    );
+    assert!(!malformed_public_kernel_namespace.validate());
 }

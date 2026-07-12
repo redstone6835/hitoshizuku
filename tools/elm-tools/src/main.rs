@@ -11,6 +11,7 @@ use elm::{
     ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE,
     ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION,
     ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EKI_KERNEL_API_RECORD_SIZE,
     ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE,
     ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN,
     ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION,
@@ -28,7 +29,8 @@ use project::{
     ElmProjectDependency, ElmProjectManifest, cargo_build, scaffold_project, sync_framework,
 };
 use rust_metadata::{
-    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, NativeMetadata, ProviderSpec,
+    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, KernelApiSpec, NativeMetadata,
+    ProviderSpec,
 };
 
 const ELM_TOOL_PAGE_SIZE: u64 = 4096;
@@ -51,6 +53,7 @@ const BLOCK_EXTENSION_POINTS: u32 = ElmEkiBlockKind::ExtensionPoints as u32;
 const BLOCK_EXTENSIONS: u32 = ElmEkiBlockKind::Extensions as u32;
 const BLOCK_API_COMPATIBILITY: u32 = ElmEkiBlockKind::ApiCompatibility as u32;
 const BLOCK_ABI_FINGERPRINT: u32 = ElmEkiBlockKind::AbiFingerprint as u32;
+const BLOCK_KERNEL_APIS: u32 = ElmEkiBlockKind::KernelApis as u32;
 const BLOCK_PROOF: u32 = ElmEkiBlockKind::Signature as u32;
 const MENU_KIND_ACTION: u32 = 2;
 const HOOK_INITIALIZE: u32 = 1;
@@ -442,6 +445,12 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
         blocks.push(PackerBlock::new(
             BLOCK_DEPENDENCIES,
             dependencies_block(&manifest.dependencies)?,
+        ));
+    }
+    if !metadata.kernel_apis.is_empty() {
+        blocks.push(PackerBlock::new(
+            BLOCK_KERNEL_APIS,
+            kernel_api_requirements_block(&metadata.kernel_apis)?,
         ));
     }
     if !metadata.extension_points.is_empty() {
@@ -1795,6 +1804,24 @@ fn dependencies_block(entries: &[ElmProjectDependency]) -> Result<Vec<u8>, Strin
             offset + 8 + elm::ELM_EBI_NAME_LEN,
             &dependency.contract,
         );
+    }
+    Ok(out)
+}
+
+fn kernel_api_requirements_block(entries: &[KernelApiSpec]) -> Result<Vec<u8>, String> {
+    let mut out =
+        vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * ELM_EKI_KERNEL_API_RECORD_SIZE];
+    write_u32(&mut out, 0, entries.len() as u32);
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.namespace.len() > elm::ELM_KERNEL_API_IDENTIFIER_MAX_LEN {
+            return Err(format!("Kernel API namespace {} 过长", entry.namespace));
+        }
+        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_KERNEL_API_RECORD_SIZE;
+        write_u16(&mut out, offset, entry.namespace.len() as u16);
+        write_u16(&mut out, offset + 2, entry.version);
+        write_u64(&mut out, offset + 8, entry.capabilities);
+        out[offset + 16..offset + 48].copy_from_slice(&entry.layout_hash);
+        copy_fixed(&mut out, offset + 48, &entry.namespace);
     }
     Ok(out)
 }

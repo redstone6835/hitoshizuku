@@ -4,6 +4,7 @@
 
 use alloc::string::String;
 
+mod api_registry;
 mod core;
 mod event;
 mod executor;
@@ -33,6 +34,10 @@ pub(crate) fn init_builtin_mgr() {
     }
     if !owned_resource::init() {
         log::error!("[elm] 所有权资源注册表初始化失败");
+        return;
+    }
+    if !api_registry::init() {
+        log::error!("[elm] Kernel API 注册表初始化失败");
         return;
     }
     if let Err(err) = journal::init() {
@@ -101,6 +106,57 @@ pub(crate) fn register_trust_anchor(
 
 pub(crate) use core::with_core;
 pub(crate) use journal::{ElmJournalBackendOps, JournalError as ElmJournalError};
+
+/// 注册一个由常驻内核子系统实现的版本化 Kernel API 函数表。
+pub(crate) fn register_kernel_api_namespace(
+    descriptor: &'static elm_model::ElmApiNamespaceDescriptorV1,
+) -> Result<(), api_registry::ApiRegistryError> {
+    if descriptor.flags & elm_model::ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT != 0 {
+        let address = descriptor.table_address as usize;
+        if descriptor.table_size < ::core::mem::size_of::<kernel_api::ApiTableHeaderV1>() as u32
+            || address % ::core::mem::align_of::<kernel_api::ApiTableHeaderV1>() != 0
+        {
+            return Err(api_registry::ApiRegistryError::InvalidDescriptor);
+        }
+        // Safety: 描述符已经通过非空、尺寸和对齐检查，且只允许常驻静态函数表注册。
+        let header = unsafe { &*(descriptor.table_address as *const kernel_api::ApiTableHeaderV1) };
+        if header.struct_size != descriptor.table_size
+            || header.abi_version != descriptor.version
+            || header.reserved0 != 0
+            || header.capabilities != descriptor.capabilities
+        {
+            return Err(api_registry::ApiRegistryError::InvalidDescriptor);
+        }
+    }
+    api_registry::register(descriptor)
+}
+
+/// 在 Kernel API 入口处验证调用令牌并返回当前 ELM 身份。
+///
+/// 子系统 thunk 必须先进入 `ElmExecutionDomain::KernelCall`，再调用本函数；授权成功后仍要
+/// 按具体资源执行所有权、参数范围和预算检查。函数表地址和令牌数值都不是权限真值。
+#[allow(dead_code)]
+pub(crate) fn authorize_kernel_api_call(
+    token: kernel_api::ApiGrantTokenV1,
+    identifier: &'static str,
+    version: u16,
+    required_capabilities: u64,
+) -> Result<elm_model::ElmCurrentContext, api_registry::ApiRegistryError> {
+    let context =
+        elm_model::current_context().ok_or(api_registry::ApiRegistryError::CapabilityDenied)?;
+    if !token.is_well_formed() || token.generation() != context.generation.0 {
+        return Err(api_registry::ApiRegistryError::CapabilityDenied);
+    }
+    api_registry::authorize(
+        token.grant_id(),
+        context.cell_id,
+        context.generation,
+        identifier.as_bytes(),
+        version,
+        required_capabilities,
+    )?;
+    Ok(context)
+}
 
 /// 由子系统 provider 为指定 ELM 登记一个可排空资源。
 ///

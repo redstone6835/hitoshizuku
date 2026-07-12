@@ -36,6 +36,35 @@ pub const ELM_API_ROOT_IMPORT_CONTRACT: &str = "elm.api.root@1";
 pub const ELM_API_RUNTIME_IDENTIFIER: &str = "elm.runtime";
 /// 受授权 Manager ELM 使用的管理命名空间 identifier。
 pub const ELM_API_MANAGEMENT_IDENTIFIER: &str = "elm.management";
+/// Kernel API 命名空间 identifier 的最大 UTF-8 字节数。
+pub const ELM_KERNEL_API_IDENTIFIER_MAX_LEN: usize = 64;
+/// Kernel API 规范布局摘要的固定 SHA-256 长度。
+pub const ELM_KERNEL_API_LAYOUT_HASH_LEN: usize = 32;
+/// 命名空间可以被所有 ELM 查询。
+pub const ELM_API_NAMESPACE_FLAG_PUBLIC: u32 = 1 << 0;
+/// 命名空间只允许持有显式 Kernel API 租约的 ELM 查询。
+pub const ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT: u32 = 1 << 1;
+/// 命名空间只允许通过 elm-mgr 管理鉴权的 Manager ELM 查询。
+pub const ELM_API_NAMESPACE_FLAG_MANAGEMENT: u32 = 1 << 2;
+/// v1 允许的全部命名空间发布标志。
+pub const ELM_API_NAMESPACE_FLAGS_V1: u32 = ELM_API_NAMESPACE_FLAG_PUBLIC
+    | ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT
+    | ELM_API_NAMESPACE_FLAG_MANAGEMENT;
+
+/// 检查一个 identifier 是否属于规范的 Kernel API 命名空间。
+///
+/// v1 名称必须以 `kernel.` 开头，只包含小写 ASCII 字母、数字、点、连字符和下划线，
+/// 且不能包含空段。该检查同时被 EBI、内核注册表和开发工具使用，避免各层接受不同名称。
+pub fn is_valid_kernel_api_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier.len() <= ELM_KERNEL_API_IDENTIFIER_MAX_LEN
+        && identifier.starts_with("kernel.")
+        && !identifier.ends_with('.')
+        && !identifier.contains("..")
+        && identifier.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+}
 /// 普通运行时表支持 mixin 阶段分发。
 pub const ELM_API_FEATURE_MIXIN_DISPATCH: u64 = 1 << 0;
 /// 普通运行时表支持查询当前 ELM 上下文。
@@ -213,6 +242,11 @@ pub struct ElmApiNamespaceV1 {
     pub table_address: usize,
     /// 发布该命名空间时当前调用 cell 的 generation。
     pub generation: u64,
+    /// 该命名空间授权租约的非零标识；公开和管理命名空间使用零。
+    ///
+    /// Kernel API 函数表入口必须把该值与当前 cell、generation、namespace 和所需能力一起
+    /// 校验，不能只依赖函数表地址的保密性。
+    pub grant_id: u64,
     /// 协商得到的能力位集合；调用可选入口前必须先检查对应位。
     pub capabilities: u64,
 }
@@ -228,10 +262,80 @@ impl ElmApiNamespaceV1 {
             table_size: 0,
             table_address: 0,
             generation: 0,
+            grant_id: 0,
             capabilities: 0,
         }
     }
 }
+
+#[derive(Debug, Clone, Copy)]
+/// 内核向 ELM 根表注册一个静态版本化函数表所需的完整描述。
+///
+/// 描述符本身只存在于内核地址空间，不进入 EKI。`identifier`、版本和布局摘要必须与
+/// `kernel-api` crate 发布的契约完全一致；同名同版本描述符只能注册一次。
+pub struct ElmApiNamespaceDescriptorV1 {
+    /// 命名空间 identifier。
+    pub identifier: &'static str,
+    /// 精确 ABI 版本。
+    pub version: u16,
+    /// 发布与授权策略标志。
+    pub flags: u32,
+    /// 函数表实现支持的全部能力位。
+    pub capabilities: u64,
+    /// 只读静态函数表地址。
+    pub table_address: *const (),
+    /// 函数表完整字节数。
+    pub table_size: u32,
+    /// 规范函数表布局摘要。
+    pub layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
+}
+
+impl ElmApiNamespaceDescriptorV1 {
+    /// 构造一个静态命名空间描述符。
+    pub const fn new<T>(
+        identifier: &'static str,
+        version: u16,
+        flags: u32,
+        capabilities: u64,
+        table: &'static T,
+        layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
+    ) -> Self {
+        Self {
+            identifier,
+            version,
+            flags,
+            capabilities,
+            table_address: table as *const T as *const (),
+            table_size: core::mem::size_of::<T>() as u32,
+            layout_hash,
+        }
+    }
+
+    /// 验证不依赖运行时注册表的描述符不变量。
+    pub fn validate(&self) -> bool {
+        let kernel_prefixed = self.identifier.starts_with("kernel.");
+        let canonical_kernel_identifier = is_valid_kernel_api_identifier(self.identifier);
+        !self.identifier.is_empty()
+            && self.identifier.len() <= ELM_KERNEL_API_IDENTIFIER_MAX_LEN
+            && self.identifier.is_ascii()
+            && !self.identifier.as_bytes().contains(&0)
+            && self.version != 0
+            && self.flags != 0
+            && self.flags & !ELM_API_NAMESPACE_FLAGS_V1 == 0
+            && self.flags.count_ones() == 1
+            && !self.table_address.is_null()
+            && self.table_size != 0
+            && (!kernel_prefixed
+                || (canonical_kernel_identifier
+                    && self.flags == ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT))
+            && (self.flags & ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT == 0
+                || (self.layout_hash != [0; ELM_KERNEL_API_LAYOUT_HASH_LEN]
+                    && canonical_kernel_identifier))
+    }
+}
+
+// Safety: 描述符只包含静态字符串、只读静态表地址和不可变标量。
+unsafe impl Sync for ElmApiNamespaceDescriptorV1 {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -382,6 +486,7 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
             table_size,
             table_address,
             generation,
+            grant_id,
             capabilities,
         ]
     );

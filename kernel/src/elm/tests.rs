@@ -74,6 +74,11 @@ use super::mgr_channel::{dispatch_mgr_call_on_core, dispatch_mgr_call_on_core_as
 
 static OWNED_RESOURCE_TRACE: AtomicU64 = AtomicU64::new(0);
 
+#[ktest]
+fn elm_kernel_api_registry_grants_declared_namespace() {
+    assert!(super::api_registry::test_requirement_roundtrip());
+}
+
 fn push_owned_resource_trace(stage: u64, handle: u64) -> Result<(), i32> {
     OWNED_RESOURCE_TRACE
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
