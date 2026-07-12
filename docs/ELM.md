@@ -1293,7 +1293,11 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 `kernel-api::ApiImport<Table>` 只在首次访问时协商并缓存表地址和 grant，`Table` 必须实现由 `kernel-api` 内部封闭的 `KernelApiTable`，因此外部 ELM 不能用任意 Rust 类型重新解释函数表。返回的 `ApiTableRef` 同时持有 `ApiGrantTokenV1`。所有 Kernel API 函数表入口都必须把该 token 作为第一个参数；内核 thunk 必须在进入受保护的 `KernelCall` 执行域后，使用当前 ELM 上下文重新校验 token，而不能把表地址、顺序 grant id 或 EBI 自声明当作权限真值。随后还必须由实际子系统校验句柄所有权、内存范围、资源预算和操作级权限。
 
-第一批只完成命名空间、requirement、布局摘要、grant 生命周期、类型化导入和外部工程同步，不发布任何真实 `kernel.*` namespace。第一个子系统表进入注册表前，必须把镜像签名、内建来源或管理员批准接入 grant 决策；未完成该策略边界的 namespace 不得注册，避免把“镜像声明需要能力”错误等同于“系统批准授予能力”。
+首个真实子系统命名空间为 `kernel.memory@1`。Kernel API requirement 本身只表达模块需求，不构成授权：内建 `Builtin` 和内核内部 `Memory` 来源由 Kernel authority 批准；外部 Projection 镜像必须通过签名信任验证，装载或替换请求必须显式设置 Kernel API grant 标志，调用主体还必须是 Kernel、UserAdmin 或内建 `elm-mgr`。未签名镜像、普通子 ELM 和只声明 requirement 而未取得批准的镜像均不能获得 `kernel.*` grant。grant 诊断记录保存来源、批准 authority、authority id 和 signer key id，以便把能力来源追溯到具体装载事务。
+
+`kernel.memory@1` 发布 `ALLOCATE`、`RESIZE`、`QUERY` 和 `STATS` 四项独立 capability，以及 `allocate`、`deallocate`、`reallocate`、`query`、`stats` 五个固定布局入口。它只开放 allocator 逐对象跟踪的普通 Kernel 域分配，不开放 boot allocator、物理页、受管堆、slab/buddy 内部控制或回收策略。每个分配强制绑定当前 cell 的资源 owner，创建和调整大小进入现有动态内存预算，查询、释放和调整大小都必须精确匹配 owner；其它 cell 即使持有或猜中地址也只能得到权限拒绝。
+
+内存函数表的输出槽必须位于当前 ELM 可写范围。重分配额外在 allocator 的同一地址串行化事务中验证输出槽与旧对象不重叠，避免移动旧对象后向失效地址写回结果。热替换为新 generation 预建独立 grant：任何预检、requirement 解析或提交失败都会删除新 grant 并保留旧 generation；提交成功后才撤销旧 grant。所有函数入口仍会逐次校验当前上下文和 token，因此撤销后缓存表地址与旧 token 不能继续使用。
 
 ### Rust ELM 独立仓库开发框架
 
@@ -1502,7 +1506,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 当前剩余主线：
 
-- Kernel API 导出：按基础服务、执行、设备、VFS/存储、固件和受控 syscall 六个批次，把运行期内核能力接入版本化函数表；尚未完整实现的 namespace 不得公开占位。
+- Kernel API 导出：基础服务批次已完整发布 `kernel.memory@1`；后续继续按时间、随机数、日志、执行、设备、VFS/存储、固件和受控 syscall 等独立批次接入版本化函数表，尚未完整实现的 namespace 不得公开占位。
 - 子系统 provider：设备、VFS、网络、IRQ、DMA、MMIO 等真实能力必须在各自子系统内部实现并显式注册。
 - 用户态管理工具：补齐面向实际部署的策略编辑、镜像仓库、交互式诊断和运维工作流。
 - ELM 调试与发布生态：补齐调试符号归档、IDE 映射、依赖锁定、可复现发布索引和镜像仓库；attribute、独立仓库模板、双架构 PIE、EKI、签名和运行期装载链路已经具备。
@@ -1513,6 +1517,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - 当前 ELM 已经形成稳定的管理运行时和原生执行边界：`elm-mgr` 可以作为外界入口管理菜单、策略、拓扑、审计、provider、事件订阅、资源预算、隔离状态、完整 60 项 API 注册表、信任、Projection Source、journal、镜像会话和 EBI 装载状态；EKI 由内建 `eki` 子单元以固定 Projection Source ID 接入。
 - 当前阶段不再继续把零散能力堆进 `MGR_CALL`。后续新增能力必须归入子系统 provider、用户态管理工具、ELM 调试与发布生态、其他格式 Projection Source 或网络栈 ELM 化等明确主线。
 - `elm-mgr` 是所有 ELM 通向运行时管理能力的唯一网关，但不是内核数据热路径。后续 VFS、设备、调度、IRQ、DMA、MMIO 等能力通过 `kernel-api` 的版本化表直接调用，只有需要运行时发现、绑定、审计、跨单元调用或异步流控时才通过 provider Ops；不为每个子系统新增私有 syscall，未来只提供由 ELM 自行声明、冲突拒绝且随生命周期撤销的受控 syscall 注册机制。
+- Kernel API 授权链和首个真实函数表已经进入双架构验证：`kernel.memory@1` 可在原生 ELM 上下文中完成分配、查询、统计、扩容和释放，跨 cell 操作、输出槽别名、未批准 requirement、陈旧 generation 和已撤销 token 均被拒绝。
 - `EKI` 是近期原生 ELM 镜像承载方式，`soyo` 仍保持后置；ELM Core 继续只消费 EBI 协议对象，不绑定具体文件格式，具体镜像类型必须通过 Projection Source 进入。
 - 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，受管 import 可选择唯一最高兼容 export 并在替换时回滚，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用。迁移式热替换、调用排空、Projection Source 原子 generation 切换、provider snapshot 分页、资源预算、隔离、同步 fault、panic 恢复和 timer 强制退出均已进入双架构验证链路。
 

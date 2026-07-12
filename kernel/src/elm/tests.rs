@@ -12,8 +12,9 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use elm_model::{
     ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH, ELM_API_CURRENT_VERSION,
-    ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER, ELM_AUDIT_FLAG_AUTHORIZATION, ELM_AUDIT_FLAG_OPERATION,
-    ELM_CALL_STATUS_BUSY, ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
+    ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER, ELM_AUDIT_AUTHORITY_MANAGER,
+    ELM_AUDIT_FLAG_AUTHORIZATION, ELM_AUDIT_FLAG_OPERATION, ELM_CALL_STATUS_BUSY,
+    ELM_CALL_STATUS_INVALID, ELM_CALL_STATUS_NOT_FOUND, ELM_CALL_STATUS_OK,
     ELM_CALL_STATUS_UNSUPPORTED, ELM_CELL_POLICY_ALLOW_MANAGEMENT, ELM_CELL_POLICY_FLAG_LOCKED,
     ELM_CTL_ABI_VERSION, ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_NAME_LEN,
     ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE,
@@ -45,13 +46,14 @@ use elm_model::{
     ELM_TRUST_FLAG_ALLOW_UNSIGNED, ELM_TRUST_FLAG_SEALED, ELM_TRUST_FLAG_UNSIGNED_ACTIVE,
     ElmActionInvokeRequest, ElmCallFrame, ElmCellPolicyRequest, ElmCellPolicyV1, ElmContext,
     ElmCoreHealthHeader, ElmCoreHealthRecord, ElmEbiArch, ElmEbiExtensionPointDecl, ElmEbiImage,
-    ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiProofV1,
-    ElmEbiProviderPortDecl, ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind,
-    ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit, ElmEkiBlockKind, ElmError,
-    ElmExtensionAttachRequest, ElmExtensionDispatchRequest, ElmId, ElmKernelProviderSnapshotPage,
-    ElmKernelProviderSpec, ElmKind, ElmLifecycleAction, ElmLifecyclePhase, ElmLifecyclePlanRequest,
-    ElmManifest, ElmMenuItemKind, ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader,
-    ElmMgrCallKind, ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
+    ElmEbiKernelApiRequirement, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiProofV1, ElmEbiProviderPortDecl, ElmEbiRustHookSignature, ElmEbiSegment,
+    ElmEbiSegmentKind, ElmEbiSourceKind, ElmEbiSourceRequest, ElmEbiTarget, ElmEbiUnit,
+    ElmEkiBlockKind, ElmError, ElmExtensionAttachRequest, ElmExtensionDispatchRequest, ElmId,
+    ElmKernelProviderSnapshotPage, ElmKernelProviderSpec, ElmKind, ElmLifecycleAction,
+    ElmLifecyclePhase, ElmLifecyclePlanRequest, ElmManifest, ElmMenuItemKind,
+    ElmMgrApiRegistryHeader, ElmMgrAuditHeader, ElmMgrCallHeader, ElmMgrCallKind,
+    ElmMgrEventSubscribeRequest, ElmMgrEventUnsubscribeRequest, ElmMgrPolicyInfo,
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest, ElmMixinMode, ElmName, ElmNativeCapabilityHeader,
     ElmNativeEntryFrameV1, ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusUnbindRequest,
@@ -68,7 +70,7 @@ use elm_model::{
 
 use super::core::{
     ELM_EKI_ID, ELM_MGR_ID, ElmCore, ElmLifecycleExecutor, ElmMgrAccessTarget,
-    management_namespace_allowed,
+    KernelApiGrantRequest, management_namespace_allowed,
 };
 use super::mgr_channel::{dispatch_mgr_call_on_core, dispatch_mgr_call_on_core_as};
 
@@ -77,6 +79,175 @@ static OWNED_RESOURCE_TRACE: AtomicU64 = AtomicU64::new(0);
 #[ktest]
 fn elm_kernel_api_registry_grants_declared_namespace() {
     assert!(super::api_registry::test_requirement_roundtrip());
+}
+
+#[ktest]
+fn elm_kernel_memory_allocator_enforces_exact_owner() {
+    let before = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_public());
+    let request = allocator::MemoryRequest::new(allocator::MemoryDomain::Kernel, 64, 16)
+        .with_zeroing(allocator::Zeroing::Zeroed);
+    let record = allocator::KERNEL_ALLOCATOR
+        .allocate_owned(ELM_MGR_ID.0, request)
+        .expect("ELM owner 分配应成功");
+    assert_eq!(record.accounting_owner(), ELM_MGR_ID.0);
+    // Safety: 测试持有该分配的独占所有权，且逻辑长度由 allocator 记录确认。
+    let bytes = unsafe { core::slice::from_raw_parts(record.ptr as *const u8, record.size) };
+    assert!(bytes.iter().all(|byte| *byte == 0));
+    assert_eq!(
+        allocator::KERNEL_ALLOCATOR.query_owned_allocation(ELM_EKI_ID.0, record.ptr),
+        Err(allocator::OwnedAllocationError::PermissionDenied)
+    );
+    assert_eq!(
+        allocator::KERNEL_ALLOCATOR.deallocate_owned(ELM_EKI_ID.0, record.ptr),
+        Err(allocator::OwnedAllocationError::PermissionDenied)
+    );
+    assert_eq!(
+        allocator::KERNEL_ALLOCATOR.reallocate_owned_excluding_range(
+            ELM_MGR_ID.0,
+            record.ptr,
+            allocator::MemoryRequest::new(allocator::MemoryDomain::Kernel, 160, 32),
+            record.ptr,
+            core::mem::size_of::<kernel_api::memory::KernelMemoryAllocationV1>(),
+        ),
+        Err(allocator::OwnedAllocationError::AliasedRange)
+    );
+    let grown = allocator::KERNEL_ALLOCATOR
+        .reallocate_owned(
+            ELM_MGR_ID.0,
+            record.ptr,
+            allocator::MemoryRequest::new(allocator::MemoryDomain::Kernel, 160, 32),
+        )
+        .expect("同一 owner 扩容应成功");
+    assert_eq!(grown.accounting_owner(), ELM_MGR_ID.0);
+    assert_eq!(grown.size, 160);
+    allocator::KERNEL_ALLOCATOR
+        .deallocate_owned(ELM_MGR_ID.0, grown.ptr)
+        .expect("同一 owner 释放应成功");
+    let after = super::resource_accounting::snapshot(ELM_MGR_ID, sched::now_ns_public());
+    assert_eq!(after.dynamic_alloc_bytes, before.dynamic_alloc_bytes);
+    assert!(after.peak_dynamic_alloc_bytes >= before.peak_dynamic_alloc_bytes);
+}
+
+#[ktest]
+fn elm_kernel_memory_function_table_executes_with_live_grant() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let requirement = ElmEbiKernelApiRequirement::new(
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER,
+        kernel_api::memory::KERNEL_MEMORY_API_VERSION,
+        kernel_api::memory::KERNEL_MEMORY_CAPABILITIES,
+        kernel_api::memory::KERNEL_MEMORY_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let unit = ElmEbiUnit::new(
+        manifest("kernel-memory-client", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(requirement);
+    let loaded = core.load_ebi_unit(unit, ElmEbiArch::Any);
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let id = ElmId(loaded.cell_id);
+    let namespace = super::api_registry::query(
+        id,
+        Generation::FIRST,
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+        &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+        false,
+    )
+    .expect("完整内存能力 requirement 应取得函数表");
+    // Safety: ApiGrantTokenV1 是已由布局测试固定为两个连续 u64 的 repr(C) 值；测试只用
+    // 注册表刚返回的 grant 和 generation 构造与该 namespace 配套的调用令牌。
+    let token = unsafe {
+        core::mem::transmute::<[u64; 2], kernel_api::ApiGrantTokenV1>([
+            namespace.grant_id,
+            namespace.generation,
+        ])
+    };
+    // Safety: namespace 注册表只保存经过静态尺寸、对齐和表头校验的常驻函数表地址。
+    let table =
+        unsafe { &*(namespace.table_address as *const kernel_api::memory::KernelMemoryApiV1) };
+
+    let context = ElmContext::new(
+        id,
+        Some(ELM_MGR_ID),
+        Generation::FIRST,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_kind(ElmKind::Service);
+    let _context = elm_model::enter_current_context(&context).expect("应建立测试 ELM 上下文");
+    let native_guard =
+        general::elm_guard::ElmGuard::enter(id.0, general::elm_guard::ELM_GUARD_PHASE_HOOK, 0)
+            .expect("应建立测试原生边界");
+    let stack_anchor = 0u64;
+    let stack_middle = &stack_anchor as *const u64 as usize;
+    assert!(native_guard.configure_native_bounds(
+        0x10_0000,
+        0x10_1000,
+        0x10_0000,
+        0x10_2000,
+        stack_middle.saturating_sub(64 * 1024),
+        stack_middle.saturating_add(64 * 1024),
+        &[],
+    ));
+
+    let allocation = table
+        .allocate_memory(
+            token,
+            kernel_api::memory::KernelMemoryRequestV1::new(64, 16).zeroed(),
+        )
+        .expect("带有效 grant 的分配应成功");
+    assert_eq!(allocation.size, 64);
+    // Safety: 返回记录证明该地址是当前 cell 持有的 64 字节活跃分配。
+    let bytes = unsafe { core::slice::from_raw_parts(allocation.address as *const u8, 64) };
+    assert!(bytes.iter().all(|byte| *byte == 0));
+    assert_eq!(
+        table
+            .query_memory(token, allocation.address)
+            .expect("查询自有分配应成功")
+            .address,
+        allocation.address
+    );
+    assert_eq!(
+        table
+            .memory_stats(token)
+            .expect("读取当前 cell 内存账本应成功")
+            .current_bytes,
+        64
+    );
+    // Safety: 测试没有保留指向旧对象的活跃引用，扩容后只使用返回的新地址。
+    let grown = unsafe {
+        table.reallocate_memory(
+            token,
+            allocation.address,
+            kernel_api::memory::KernelMemoryRequestV1::new(160, 32),
+        )
+    }
+    .expect("带有效 grant 的扩容应成功");
+    assert_eq!(grown.size, 160);
+    assert_eq!(
+        table
+            .memory_stats(token)
+            .expect("扩容后账本应可读取")
+            .current_bytes,
+        160
+    );
+    // Safety: 测试不再持有 grown 指向对象的任何引用。
+    unsafe { table.deallocate_memory(token, grown.address) }.expect("释放自有分配应成功");
+    assert_eq!(
+        table
+            .memory_stats(token)
+            .expect("释放后账本应可读取")
+            .current_bytes,
+        0
+    );
+    assert_eq!(super::api_registry::remove_cell(id), 1);
+    assert_eq!(
+        table.memory_stats(token),
+        Err(kernel_api::memory::KERNEL_MEMORY_STATUS_PERMISSION)
+    );
 }
 
 fn push_owned_resource_trace(stage: u64, handle: u64) -> Result<(), i32> {
@@ -989,9 +1160,13 @@ fn signed_metadata_image_with_kind(
     release_epoch: u64,
     signing: &SigningKey,
 ) -> ElmEbiImage {
-    let fingerprint = kernel_abi_fingerprint(ElmEbiArch::Any);
     let unit = ElmEbiUnit::new(manifest(name, kind), ElmEbiTarget::new(ElmEbiArch::Any))
         .with_lifecycle_hooks(lifecycle_hooks());
+    signed_unit_image(unit, release_epoch, signing)
+}
+
+fn signed_unit_image(unit: ElmEbiUnit, release_epoch: u64, signing: &SigningKey) -> ElmEbiImage {
+    let fingerprint = kernel_abi_fingerprint(ElmEbiArch::Any);
     let image = ElmEbiImage::new(unit).with_abi_fingerprint(fingerprint.clone());
     let public_key = signing.verifying_key().to_bytes();
     let mut proof = ElmEbiProofV1 {
@@ -2013,6 +2188,283 @@ fn elm_delegated_manager_requires_signed_explicit_grant_and_has_global_scope() {
     let denied = core.update_cell_policy(manager_policy);
     assert_eq!(denied.status, ELM_MGR_STATUS_PERMISSION);
     assert_eq!(denied.blockers, ELM_POLICY_BLOCK_POLICY_ESCALATION);
+}
+
+#[ktest]
+fn elm_kernel_api_requires_signed_explicit_external_approval() {
+    let signing = SigningKey::from_bytes(&[43; 32]);
+    let public_key = signing.verifying_key().to_bytes();
+    let mut core = ElmCore::new();
+    core.set_allow_unsigned_external(false).unwrap();
+    core.register_trust_anchor(ElmTrustAnchor::new("kernel-api-root", public_key).unwrap())
+        .unwrap();
+    core.init_builtin_mgr().unwrap();
+
+    let requirement = ElmEbiKernelApiRequirement::new(
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER,
+        kernel_api::memory::KERNEL_MEMORY_API_VERSION,
+        kernel_api::memory::KERNEL_MEMORY_CAP_ALLOCATE
+            | kernel_api::memory::KERNEL_MEMORY_CAP_QUERY,
+        kernel_api::memory::KERNEL_MEMORY_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let denied_unit = ElmEbiUnit::new(
+        manifest("kernel-api-no-approval", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(requirement.clone());
+    let denied = core.load_declarative_ebi_image_from_source_under_parent(
+        signed_unit_image(denied_unit, 1, &signing),
+        ElmEbiArch::Any,
+        ElmEbiSourceKind::Projection,
+        ELM_MGR_ID,
+        ElmResourceBudget::DEFAULT,
+        false,
+    );
+    assert_eq!(denied.status, ElmEbiLoadStatus::RuntimeRejected as i32);
+    assert_eq!(
+        super::api_registry::query(
+            ElmId(denied.cell_id),
+            Generation::FIRST,
+            kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+            &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+            false,
+        ),
+        Err(super::api_registry::ApiRegistryError::CapabilityDenied)
+    );
+
+    let approved_unit = ElmEbiUnit::new(
+        manifest("kernel-api-approved", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(requirement);
+    let principal = ElmPrincipal::user_admin(77, 43);
+    let authorization = core.authorize_mgr_call(
+        principal,
+        ElmMgrCallKind::LoadCell,
+        ElmMgrAccessTarget::Load(ELM_MGR_ID, ElmResourceBudget::DEFAULT),
+    );
+    assert!(authorization.allowed());
+    let approved = core.load_declarative_ebi_image_from_source_under_parent_with_kernel_api_grant(
+        signed_unit_image(approved_unit, 1, &signing),
+        ElmEbiArch::Any,
+        ElmEbiSourceKind::Projection,
+        ELM_MGR_ID,
+        ElmResourceBudget::DEFAULT,
+        false,
+        KernelApiGrantRequest::from_authorization(true, authorization),
+    );
+    assert_eq!(approved.status, ElmEbiLoadStatus::Ok as i32);
+    let approved_id = ElmId(approved.cell_id);
+    let namespace = super::api_registry::query(
+        approved_id,
+        Generation::FIRST,
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+        &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+        false,
+    )
+    .expect("签名且显式批准的 requirement 应取得函数表");
+    assert_ne!(namespace.grant_id, 0);
+    assert_eq!(
+        namespace.capabilities,
+        kernel_api::memory::KERNEL_MEMORY_CAP_ALLOCATE
+            | kernel_api::memory::KERNEL_MEMORY_CAP_QUERY
+    );
+    assert_eq!(super::api_registry::remove_cell(approved_id), 1);
+
+    let manager_requirement = ElmEbiKernelApiRequirement::new(
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER,
+        kernel_api::memory::KERNEL_MEMORY_API_VERSION,
+        kernel_api::memory::KERNEL_MEMORY_CAP_STATS,
+        kernel_api::memory::KERNEL_MEMORY_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let manager_unit = ElmEbiUnit::new(
+        manifest("kernel-api-manager-approved", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(manager_requirement);
+    let manager_authorization = core.authorize_mgr_call(
+        ElmPrincipal::elm_cell(ELM_MGR_ID, Generation::FIRST),
+        ElmMgrCallKind::LoadCell,
+        ElmMgrAccessTarget::Load(ELM_MGR_ID, ElmResourceBudget::DEFAULT),
+    );
+    assert!(manager_authorization.allowed());
+    assert_eq!(manager_authorization.authority, ELM_AUDIT_AUTHORITY_MANAGER);
+    let manager_approved = core
+        .load_declarative_ebi_image_from_source_under_parent_with_kernel_api_grant(
+            signed_unit_image(manager_unit, 1, &signing),
+            ElmEbiArch::Any,
+            ElmEbiSourceKind::Projection,
+            ELM_MGR_ID,
+            ElmResourceBudget::DEFAULT,
+            false,
+            KernelApiGrantRequest::from_authorization(true, manager_authorization),
+        );
+    assert_eq!(manager_approved.status, ElmEbiLoadStatus::Ok as i32);
+    assert_eq!(
+        super::api_registry::remove_cell(ElmId(manager_approved.cell_id)),
+        1
+    );
+}
+
+#[ktest]
+fn elm_kernel_api_internal_memory_source_is_automatically_approved() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let requirement = ElmEbiKernelApiRequirement::new(
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER,
+        kernel_api::memory::KERNEL_MEMORY_API_VERSION,
+        kernel_api::memory::KERNEL_MEMORY_CAP_STATS,
+        kernel_api::memory::KERNEL_MEMORY_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let unit = ElmEbiUnit::new(
+        manifest("kernel-api-internal", ElmKind::Other),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(requirement);
+    let loaded = core.load_ebi_unit(unit, ElmEbiArch::Any);
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let id = ElmId(loaded.cell_id);
+    let namespace = super::api_registry::query(
+        id,
+        Generation::FIRST,
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+        &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+        false,
+    )
+    .expect("内核 Memory 来源应自动批准 requirements");
+    assert_eq!(
+        namespace.capabilities,
+        kernel_api::memory::KERNEL_MEMORY_CAP_STATS
+    );
+    assert_eq!(super::api_registry::remove_cell(id), 1);
+}
+
+#[ktest]
+fn elm_kernel_api_replace_switches_generation_transactionally() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let initial_requirement = ElmEbiKernelApiRequirement::new(
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER,
+        kernel_api::memory::KERNEL_MEMORY_API_VERSION,
+        kernel_api::memory::KERNEL_MEMORY_CAP_QUERY,
+        kernel_api::memory::KERNEL_MEMORY_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let initial_unit = ElmEbiUnit::new(
+        manifest("kernel-api-replace", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(initial_requirement);
+    let loaded = core.load_ebi_unit(initial_unit, ElmEbiArch::Any);
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let id = ElmId(loaded.cell_id);
+    assert!(
+        super::api_registry::query(
+            id,
+            Generation::FIRST,
+            kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+            &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+            false,
+        )
+        .is_ok_and(|namespace| {
+            namespace.capabilities == kernel_api::memory::KERNEL_MEMORY_CAP_QUERY
+        })
+    );
+
+    let next_requirement = ElmEbiKernelApiRequirement::new(
+        kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER,
+        kernel_api::memory::KERNEL_MEMORY_API_VERSION,
+        kernel_api::memory::KERNEL_MEMORY_CAP_STATS,
+        kernel_api::memory::KERNEL_MEMORY_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let missing_requirement =
+        ElmEbiKernelApiRequirement::new("kernel.missing", 1, 1, [0x91; 32]).unwrap();
+    let rejected_unit = ElmEbiUnit::new(
+        manifest("kernel-api-replace", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(next_requirement.clone())
+    .with_kernel_api_requirement(missing_requirement);
+    let rejected = core.replace_declarative_cell_from_ebi_image_with_source(
+        id,
+        ElmEbiImage::new(rejected_unit),
+        ElmEbiArch::Any,
+        0,
+        ElmEbiSourceKind::Memory,
+    );
+    assert_eq!(rejected.status, ELM_MGR_STATUS_PERMISSION);
+    assert_eq!(rejected.generation, Generation::FIRST.0);
+    assert!(
+        super::api_registry::query(
+            id,
+            Generation::FIRST,
+            kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+            &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+            false,
+        )
+        .is_ok_and(|namespace| {
+            namespace.capabilities == kernel_api::memory::KERNEL_MEMORY_CAP_QUERY
+        })
+    );
+    assert_eq!(
+        super::api_registry::query(
+            id,
+            Generation(2),
+            kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+            &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+            false,
+        ),
+        Err(super::api_registry::ApiRegistryError::CapabilityDenied)
+    );
+
+    let replacement_unit = ElmEbiUnit::new(
+        manifest("kernel-api-replace", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(next_requirement);
+    let replaced = core.replace_declarative_cell_from_ebi_image_with_source(
+        id,
+        ElmEbiImage::new(replacement_unit),
+        ElmEbiArch::Any,
+        0,
+        ElmEbiSourceKind::Memory,
+    );
+    assert_eq!(replaced.status, ELM_MGR_STATUS_OK);
+    assert_eq!(replaced.generation, 2);
+    assert_eq!(
+        super::api_registry::query(
+            id,
+            Generation::FIRST,
+            kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+            &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+            false,
+        ),
+        Err(super::api_registry::ApiRegistryError::CapabilityDenied)
+    );
+    assert!(
+        super::api_registry::query(
+            id,
+            Generation(2),
+            kernel_api::memory::KERNEL_MEMORY_API_IDENTIFIER.as_bytes(),
+            &[kernel_api::memory::KERNEL_MEMORY_API_VERSION],
+            false,
+        )
+        .is_ok_and(|namespace| {
+            namespace.capabilities == kernel_api::memory::KERNEL_MEMORY_CAP_STATS
+        })
+    );
+    assert_eq!(super::api_registry::remove_cell(id), 1);
 }
 
 #[ktest]

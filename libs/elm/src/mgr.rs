@@ -339,6 +339,10 @@ pub const ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD: u32 = 1 << 1;
 pub const ELM_NATIVE_CAPABILITY_NAME_LEN: usize = 128;
 /// `ELM_REPLACE_CELL_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_REPLACE_CELL_ABI_VERSION: u16 = 1;
+/// 热替换请求显式批准为新 generation 建立镜像声明的 Kernel API grant。
+pub const ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API: u16 = 1 << 0;
+/// v1 热替换请求支持的全部标志位。
+pub const ELM_REPLACE_CELL_FLAGS_MASK: u16 = ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
 /// `ELM_REPLACE_MIGRATION_STATE_MAX` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_REPLACE_MIGRATION_STATE_MAX: usize = 64 * 1024;
 /// `ELM_TODO_KIND_RUNTIME` 稳定类别编号，用于在线格式中区分对应记录或对象。
@@ -1184,6 +1188,17 @@ impl ElmReplaceCellRequestV1 {
             source_payload_len,
             reserved1: 0,
         }
+    }
+
+    /// 显式请求为替换后的新 generation 建立 Kernel API grant。
+    pub const fn with_kernel_api_grant(mut self) -> Self {
+        self.flags |= ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
+        self
+    }
+
+    /// 返回该替换事务是否请求 Kernel API grant。
+    pub const fn grants_kernel_api(self) -> bool {
+        self.flags & ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API != 0
     }
 }
 

@@ -9,6 +9,7 @@ mod core;
 mod event;
 mod executor;
 mod journal;
+mod memory_api;
 mod menu;
 mod mgr_channel;
 mod native;
@@ -38,6 +39,10 @@ pub(crate) fn init_builtin_mgr() {
     }
     if !api_registry::init() {
         log::error!("[elm] Kernel API 注册表初始化失败");
+        return;
+    }
+    if let Err(err) = memory_api::init() {
+        log::error!("[elm] kernel.memory@1 注册失败: {:?}", err);
         return;
     }
     if let Err(err) = journal::init() {

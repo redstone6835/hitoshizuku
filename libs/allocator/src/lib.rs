@@ -100,6 +100,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use spin::mutex::Mutex;
 
+const OWNED_ALLOCATION_LOCK_COUNT: usize = 64;
+static OWNED_ALLOCATION_LOCKS: [Mutex<()>; OWNED_ALLOCATION_LOCK_COUNT] =
+    [const { Mutex::new(()) }; OWNED_ALLOCATION_LOCK_COUNT];
+
 use boot::BootAllocator;
 use buddy::BuddyAllocator;
 use kheap::KernelHeap;
@@ -114,7 +118,7 @@ pub use buddy::{
 };
 pub use error::{
     AddressSpaceError, AllocationError, DeallocationError, InitError, ManagedHandleError,
-    OwnershipError, PhysicalFreeError, RegistryError, VmemError,
+    OwnedAllocationError, OwnershipError, PhysicalFreeError, RegistryError, VmemError,
 };
 pub use gc::{
     FinalizerFn, GcCell, GcCollectionKind, GcControlSnapshot, GcHandle, GcMode, GcObjectHeader,
@@ -314,6 +318,36 @@ fn resolve_accounting_owner(explicit: Option<u64>) -> u64 {
     allocation_accounting_ops()
         .map(|ops| (ops.current_owner)())
         .unwrap_or(0)
+}
+
+#[inline]
+fn owned_allocation_lock_index(ptr: usize) -> usize {
+    (ptr >> 4) & (OWNED_ALLOCATION_LOCK_COUNT - 1)
+}
+
+#[inline]
+fn ranges_overlap(
+    first_start: usize,
+    first_len: usize,
+    second_start: usize,
+    second_len: usize,
+) -> bool {
+    let Some(first_end) = first_start.checked_add(first_len) else {
+        return true;
+    };
+    let Some(second_end) = second_start.checked_add(second_len) else {
+        return true;
+    };
+    first_start < second_end && second_start < first_end
+}
+
+fn map_owned_allocation_error(error: AllocationError) -> OwnedAllocationError {
+    match error {
+        AllocationError::NotInitialized => OwnedAllocationError::Unavailable,
+        AllocationError::InvalidLayout => OwnedAllocationError::InvalidRequest,
+        AllocationError::OutOfMemory => OwnedAllocationError::OutOfMemory,
+        AllocationError::AddressSpace(_) => OwnedAllocationError::BackendFailure,
+    }
 }
 
 fn try_reserve_accounting(owner: u64, bytes: usize) -> bool {
@@ -1314,6 +1348,170 @@ impl KernelMemorySubsystem {
         self.registry
             .find_containing(ptr, len)
             .ok_or(OwnershipError::UnknownPointer)
+    }
+
+    /// 为一个非零外部所有者创建普通 Kernel 域分配。
+    ///
+    /// 该入口强制覆盖请求中的计量 owner，不能借助调用方构造的 `MemoryRequest` 把资源
+    /// 记到内核或其它 cell。它只接受 slab/kheap 可处理的普通 Kernel 域请求。
+    pub fn allocate_owned(
+        &self,
+        owner: u64,
+        request: MemoryRequest,
+    ) -> Result<AllocationRecord, OwnedAllocationError> {
+        if owner == 0 {
+            return Err(OwnedAllocationError::InvalidOwner);
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return Err(OwnedAllocationError::Unavailable);
+        }
+        if request.domain != MemoryDomain::Kernel || request.validate().is_err() {
+            return Err(OwnedAllocationError::InvalidRequest);
+        }
+        let record = self
+            .allocate(request.with_accounting_owner(owner))
+            .map_err(map_owned_allocation_error)?;
+        if record.accounting_owner() != owner
+            || !matches!(record.kind, AllocationKind::Small | AllocationKind::Large)
+        {
+            let _ = self.deallocate(record.ptr);
+            return Err(OwnedAllocationError::BackendFailure);
+        }
+        Ok(record)
+    }
+
+    /// 查询一个由指定非零所有者持有的普通 Kernel 域分配。
+    pub fn query_owned_allocation(
+        &self,
+        owner: u64,
+        ptr: usize,
+    ) -> Result<AllocationRecord, OwnedAllocationError> {
+        if owner == 0 {
+            return Err(OwnedAllocationError::InvalidOwner);
+        }
+        if ptr == 0 {
+            return Err(OwnedAllocationError::UnknownPointer);
+        }
+        let _operation = OWNED_ALLOCATION_LOCKS[owned_allocation_lock_index(ptr)].lock();
+        self.query_owned_allocation_unlocked(owner, ptr)
+    }
+
+    /// 释放一个由指定非零所有者持有的普通 Kernel 域分配。
+    ///
+    /// 同一地址的外部操作由分片锁串行化，使 owner 查询与注册表移除之间不会被另一条
+    /// ELM Kernel API 调用插入。普通内核代码仍必须遵守对象自身的独占释放规则。
+    pub fn deallocate_owned(&self, owner: u64, ptr: usize) -> Result<(), OwnedAllocationError> {
+        if owner == 0 {
+            return Err(OwnedAllocationError::InvalidOwner);
+        }
+        if ptr == 0 {
+            return Err(OwnedAllocationError::UnknownPointer);
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return Err(OwnedAllocationError::Unavailable);
+        }
+        let _operation = OWNED_ALLOCATION_LOCKS[owned_allocation_lock_index(ptr)].lock();
+        self.query_owned_allocation_unlocked(owner, ptr)?;
+        self.deallocate(ptr).map_err(|error| match error {
+            DeallocationError::UnknownPointer => OwnedAllocationError::UnknownPointer,
+            _ => OwnedAllocationError::BackendFailure,
+        })
+    }
+
+    /// 调整一个由指定非零所有者持有的普通 Kernel 域分配。
+    ///
+    /// 返回记录始终继续绑定原 owner。调用方必须把旧地址视为已经失效，即使本次调整
+    /// 恰好原地完成。
+    pub fn reallocate_owned(
+        &self,
+        owner: u64,
+        ptr: usize,
+        request: MemoryRequest,
+    ) -> Result<AllocationRecord, OwnedAllocationError> {
+        self.reallocate_owned_inner(owner, ptr, request, None)
+    }
+
+    /// 调整外部所有者持有的普通分配，同时保证指定区间不属于待调整对象。
+    ///
+    /// 该接口用于跨 ABI 调用中的结果槽保护：若结果槽位于旧对象内部，移动式重分配会先
+    /// 释放旧对象，再向已经失效的结果槽写入记录。排除区间检查与 owner 校验、重分配由
+    /// 同一地址分片锁串行化，因此其它受约束操作不能在检查和提交之间制造地址复用。
+    pub fn reallocate_owned_excluding_range(
+        &self,
+        owner: u64,
+        ptr: usize,
+        request: MemoryRequest,
+        excluded_start: usize,
+        excluded_len: usize,
+    ) -> Result<AllocationRecord, OwnedAllocationError> {
+        if excluded_start == 0
+            || excluded_len == 0
+            || excluded_start.checked_add(excluded_len).is_none()
+        {
+            return Err(OwnedAllocationError::InvalidRequest);
+        }
+        self.reallocate_owned_inner(owner, ptr, request, Some((excluded_start, excluded_len)))
+    }
+
+    fn reallocate_owned_inner(
+        &self,
+        owner: u64,
+        ptr: usize,
+        request: MemoryRequest,
+        excluded: Option<(usize, usize)>,
+    ) -> Result<AllocationRecord, OwnedAllocationError> {
+        if owner == 0 {
+            return Err(OwnedAllocationError::InvalidOwner);
+        }
+        if ptr == 0 {
+            return Err(OwnedAllocationError::UnknownPointer);
+        }
+        if !self.active.load(Ordering::Acquire) {
+            return Err(OwnedAllocationError::Unavailable);
+        }
+        if request.domain != MemoryDomain::Kernel || request.validate().is_err() {
+            return Err(OwnedAllocationError::InvalidRequest);
+        }
+        let _operation = OWNED_ALLOCATION_LOCKS[owned_allocation_lock_index(ptr)].lock();
+        let old_record = self.query_owned_allocation_unlocked(owner, ptr)?;
+        if let Some((excluded_start, excluded_len)) = excluded
+            && ranges_overlap(
+                old_record.ptr,
+                old_record.usable_size.max(old_record.size),
+                excluded_start,
+                excluded_len,
+            )
+        {
+            return Err(OwnedAllocationError::AliasedRange);
+        }
+        let record = self
+            .reallocate(ptr, request.with_accounting_owner(owner))
+            .map_err(map_owned_allocation_error)?;
+        if record.accounting_owner() != owner
+            || !matches!(record.kind, AllocationKind::Small | AllocationKind::Large)
+        {
+            return Err(OwnedAllocationError::BackendFailure);
+        }
+        Ok(record)
+    }
+
+    fn query_owned_allocation_unlocked(
+        &self,
+        owner: u64,
+        ptr: usize,
+    ) -> Result<AllocationRecord, OwnedAllocationError> {
+        let record = self
+            .query_tracked_allocation(ptr)
+            .map_err(|_| OwnedAllocationError::UnknownPointer)?;
+        if record.accounting_owner() != owner {
+            return Err(OwnedAllocationError::PermissionDenied);
+        }
+        if record.domain != MemoryDomain::Kernel
+            || !matches!(record.kind, AllocationKind::Small | AllocationKind::Large)
+        {
+            return Err(OwnedAllocationError::InvalidRequest);
+        }
+        Ok(record)
     }
 
     /// 判断裸指针是否属于当前 allocator 逐对象跟踪的活跃分配。

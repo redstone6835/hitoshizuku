@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 
 use elm_model::{
     ELM_API_NAMESPACE_FLAG_MANAGEMENT, ELM_API_NAMESPACE_FLAG_PUBLIC,
-    ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT, ElmApiNamespaceDescriptorV1, ElmApiNamespaceV1,
-    ElmEbiKernelApiRequirement, ElmId, Generation,
+    ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT, ELM_AUDIT_AUTHORITY_KERNEL, ELM_AUDIT_AUTHORITY_MANAGER,
+    ELM_AUDIT_AUTHORITY_USER_ADMIN, ElmApiNamespaceDescriptorV1, ElmApiNamespaceV1,
+    ElmEbiKernelApiRequirement, ElmEbiSourceKind, ElmId, Generation,
 };
 use sched::sync::Spinlock;
 
@@ -27,6 +28,71 @@ pub(crate) enum ApiRegistryError {
     OutOfMemory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApiGrantApproval {
+    source: ElmEbiSourceKind,
+    authority: u32,
+    authority_id: u64,
+    signer_key_id: [u8; 32],
+}
+
+impl ApiGrantApproval {
+    pub(crate) const fn internal(source: ElmEbiSourceKind) -> Option<Self> {
+        if matches!(source, ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory) {
+            Some(Self {
+                source,
+                authority: ELM_AUDIT_AUTHORITY_KERNEL,
+                authority_id: 0,
+                signer_key_id: [0; 32],
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn signed_projection(
+        authority: u32,
+        authority_id: u64,
+        signer_key_id: [u8; 32],
+    ) -> Option<Self> {
+        if signer_key_id == [0; 32]
+            || !matches!(
+                authority,
+                ELM_AUDIT_AUTHORITY_KERNEL
+                    | ELM_AUDIT_AUTHORITY_USER_ADMIN
+                    | ELM_AUDIT_AUTHORITY_MANAGER
+            )
+        {
+            return None;
+        }
+        Some(Self {
+            source: ElmEbiSourceKind::Projection,
+            authority,
+            authority_id,
+            signer_key_id,
+        })
+    }
+
+    fn valid(self) -> bool {
+        match self.source {
+            ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                self.authority == ELM_AUDIT_AUTHORITY_KERNEL
+                    && self.authority_id == 0
+                    && self.signer_key_id == [0; 32]
+            }
+            ElmEbiSourceKind::Projection => {
+                self.signer_key_id != [0; 32]
+                    && matches!(
+                        self.authority,
+                        ELM_AUDIT_AUTHORITY_KERNEL
+                            | ELM_AUDIT_AUTHORITY_USER_ADMIN
+                            | ELM_AUDIT_AUTHORITY_MANAGER
+                    )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ApiGrant {
     id: u64,
@@ -34,6 +100,7 @@ struct ApiGrant {
     generation: Generation,
     descriptor_index: usize,
     capabilities: u64,
+    approval: ApiGrantApproval,
 }
 
 struct ApiRegistry {
@@ -99,11 +166,14 @@ impl ApiRegistry {
         cell: ElmId,
         generation: Generation,
         requirements: &[ElmEbiKernelApiRequirement],
+        approval: Option<ApiGrantApproval>,
     ) -> Result<usize, ApiRegistryError> {
-        // TODO: 发布首个真实 kernel.* 命名空间前，把签名、内建来源或管理员批准接入此授权事务。
         if requirements.is_empty() {
             return Ok(0);
         }
+        let approval = approval
+            .filter(|approval| approval.valid())
+            .ok_or(ApiRegistryError::CapabilityDenied)?;
         let mut resolved = Vec::new();
         resolved
             .try_reserve_exact(requirements.len())
@@ -142,6 +212,7 @@ impl ApiRegistry {
                 generation,
                 descriptor_index,
                 capabilities: requirement.required_capabilities,
+                approval,
             });
         }
         self.grants
@@ -296,10 +367,11 @@ pub(crate) fn grant_requirements(
     cell: ElmId,
     generation: Generation,
     requirements: &[ElmEbiKernelApiRequirement],
+    approval: Option<ApiGrantApproval>,
 ) -> Result<usize, ApiRegistryError> {
     API_REGISTRY
         .lock()
-        .grant_requirements(cell, generation, requirements)
+        .grant_requirements(cell, generation, requirements, approval)
 }
 
 pub(crate) fn query(
@@ -365,13 +437,17 @@ pub(crate) fn diagnostic_text() -> String {
         let descriptor = registry.namespaces[grant.descriptor_index];
         out.push_str(
             format!(
-                "kernel_grant id={} cell={} generation={} identifier={} version={} capabilities=0x{:x}\n",
+                "kernel_grant id={} cell={} generation={} identifier={} version={} capabilities=0x{:x} source={:?} authority={} authority_id={} signer_key_id={:02x?}\n",
                 grant.id,
                 grant.cell.0,
                 grant.generation.0,
                 descriptor.identifier,
                 descriptor.version,
-                grant.capabilities
+                grant.capabilities,
+                grant.approval.source,
+                grant.approval.authority,
+                grant.approval.authority_id,
+                grant.approval.signer_key_id
             )
             .as_str(),
         );
@@ -382,6 +458,17 @@ pub(crate) fn diagnostic_text() -> String {
 #[cfg(feature = "kernel-tests")]
 pub(crate) fn test_requirement_roundtrip() -> bool {
     use kernel_api::ApiTableHeaderV1;
+
+    if ApiGrantApproval::signed_projection(ELM_AUDIT_AUTHORITY_MANAGER, 1, [1; 32]).is_none()
+        || ApiGrantApproval::signed_projection(
+            elm_model::ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER,
+            2,
+            [1; 32],
+        )
+        .is_some()
+    {
+        return false;
+    }
 
     #[repr(C)]
     struct TestApiV1 {
@@ -441,14 +528,16 @@ pub(crate) fn test_requirement_roundtrip() -> bool {
         Ok(requirement) => requirement,
         Err(_) => return false,
     };
-    if grant_requirements(cell, generation, &[requirement]).ok() != Some(1) {
+    let approval = ApiGrantApproval::internal(ElmEbiSourceKind::Memory);
+    if grant_requirements(cell, generation, &[requirement], approval).ok() != Some(1) {
         return false;
     }
     let duplicate = match ElmEbiKernelApiRequirement::new("kernel.test", 1, 0x1, [0x5a; 32]) {
         Ok(requirement) => requirement,
         Err(_) => return false,
     };
-    if grant_requirements(cell, generation, &[duplicate]) != Err(ApiRegistryError::DuplicateGrant)
+    if grant_requirements(cell, generation, &[duplicate], approval)
+        != Err(ApiRegistryError::DuplicateGrant)
     {
         return false;
     }
@@ -464,17 +553,24 @@ pub(crate) fn test_requirement_roundtrip() -> bool {
             Err(_) => return false,
         },
     ];
-    if grant_requirements(transactional_cell, generation, &transactional)
+    if grant_requirements(transactional_cell, generation, &transactional, approval)
         != Err(ApiRegistryError::NamespaceUnavailable)
-        || query(
-            transactional_cell,
-            generation,
-            b"kernel.test",
-            &[1],
-            false,
-        ) != Err(ApiRegistryError::CapabilityDenied)
+        || query(transactional_cell, generation, b"kernel.test", &[1], false)
+            != Err(ApiRegistryError::CapabilityDenied)
         || !query(cell, generation, b"elm.test-public", &[1], false)
             .is_ok_and(|namespace| namespace.grant_id == 0 && namespace.capabilities == 0x3)
+    {
+        remove_cell(cell);
+        return false;
+    }
+    let unauthorized_cell = ElmId(cell.0 - 3);
+    remove_cell(unauthorized_cell);
+    let unauthorized = match ElmEbiKernelApiRequirement::new("kernel.test", 1, 0x1, [0x5a; 32]) {
+        Ok(requirement) => requirement,
+        Err(_) => return false,
+    };
+    if grant_requirements(unauthorized_cell, generation, &[unauthorized], None)
+        != Err(ApiRegistryError::CapabilityDenied)
     {
         remove_cell(cell);
         return false;

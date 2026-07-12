@@ -24,12 +24,16 @@ pub enum ApiImportError {
 /// generation、能力租约和资源所有权，不能把缓存地址视为永久授权。
 ///
 /// ```ignore
-/// #[elm::kernel_api(namespace = "kernel.time", version = 1, capabilities = 1)]
-/// static TIME: kernel_api::ApiImport<kernel_api::time::TimeApiV1> =
-///     kernel_api::ApiImport::new("kernel.time", 1, 1);
+/// #[elm::kernel_api(namespace = "kernel.memory", version = 1, capabilities = 1)]
+/// static MEMORY: kernel_api::ApiImport<kernel_api::memory::KernelMemoryApiV1> =
+///     kernel_api::ApiImport::new("kernel.memory", 1, kernel_api::memory::KERNEL_MEMORY_CAP_ALLOCATE);
 ///
-/// let table = TIME.acquire()?;
-/// let now = (table.table().monotonic_ns)(table.token());
+/// let table = MEMORY.acquire()?;
+/// let allocation = table.table().allocate_memory(
+///     table.token(),
+///     kernel_api::memory::KernelMemoryRequestV1::new(4096, 16).zeroed(),
+/// )?;
+/// # let _ = allocation;
 /// ```
 pub struct ApiImport<T: KernelApiTable> {
     identifier: &'static str,

@@ -5,12 +5,14 @@ use alloc::vec::Vec;
 use elm_model::{
     ELM_EBI_PROJECTION_SOURCE_ABI_VERSION, ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION,
     ELM_EBI_PROJECTION_SOURCE_FLAGS_MASK, ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE,
-    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SOURCE_FLAGS_MASK,
-    ELM_EBI_SOURCE_REQUEST_SIZE, ELM_IMAGE_SESSION_ABI_VERSION, ELM_IMAGE_SESSION_FLAG_NONE,
+    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API,
+    ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SOURCE_FLAGS_MASK, ELM_EBI_SOURCE_REQUEST_SIZE,
+    ELM_IMAGE_SESSION_ABI_VERSION, ELM_IMAGE_SESSION_FLAG_NONE,
     ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_INPUT,
     ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
-    ELM_REPLACE_CELL_ABI_VERSION, ElmCellPolicyRequest, ElmCellPolicyV1, ElmEbiArch,
+    ELM_REPLACE_CELL_ABI_VERSION, ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API,
+    ELM_REPLACE_CELL_FLAGS_MASK, ElmCellPolicyRequest, ElmCellPolicyV1, ElmEbiArch,
     ElmEbiSourceKind, ElmEbiSourceRequest, ElmExtensionAttachRequest, ElmExtensionDetachRequest,
     ElmExtensionDispatchRequest, ElmId, ElmImageSessionBeginRequestV1, ElmImageSessionReferenceV1,
     ElmImageSessionRequestV1, ElmImageSessionWriteRequestV1, ElmKind, ElmLifecyclePlanRequest,
@@ -62,7 +64,9 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
             };
             let parent = ElmId(request.parent_cell_id);
             let grant_management = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0;
-            if grant_management && !management_grant_caller_allowed(principal) {
+            let grant_kernel_api = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API != 0;
+            if (grant_management || grant_kernel_api) && !privileged_grant_caller_allowed(principal)
+            {
                 return response_only(ElmMgrResponseHeader::permission());
             }
             let Some(mut authorization) = authorize_unlocked_call(
@@ -92,6 +96,7 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                         parent,
                         request.budget,
                         grant_management,
+                        grant_kernel_api,
                         &mut authorization,
                     ) {
                         Ok(response) => response_with_plain_payload(&response),
@@ -111,6 +116,10 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
             let Some(source_kind) = ElmEbiSourceKind::from_raw(request.source_kind) else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
+            let grant_kernel_api = request.flags & ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API != 0;
+            if grant_kernel_api && !privileged_grant_caller_allowed(principal) {
+                return response_only(ElmMgrResponseHeader::permission());
+            }
             let Some(mut authorization) = authorize_unlocked_call(
                 principal,
                 kind,
@@ -134,6 +143,7 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                         current_ebi_arch(),
                         request.migration_limit,
                         source_kind,
+                        grant_kernel_api,
                         &mut authorization,
                     ) {
                         Ok(response) => response_with_plain_payload(&response),
@@ -338,7 +348,9 @@ fn dispatch_mgr_call_on_core_unchecked(
             };
             let parent = ElmId(request.parent_cell_id);
             let grant_management = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0;
-            if grant_management && !management_grant_caller_allowed(principal) {
+            let grant_kernel_api = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API != 0;
+            if (grant_management || grant_kernel_api) && !privileged_grant_caller_allowed(principal)
+            {
                 return response_only(ElmMgrResponseHeader::permission());
             }
             match source_kind {
@@ -349,6 +361,16 @@ fn dispatch_mgr_call_on_core_unchecked(
                                 return response_only(ElmMgrResponseHeader::permission());
                             }
                             // 局部 Core 不持有全局自旋锁，可以完整执行原生装载事务。
+                            let authorization = core.authorize_mgr_call(
+                                principal,
+                                ElmMgrCallKind::LoadCell,
+                                ElmMgrAccessTarget::Load(parent, request.budget),
+                            );
+                            let kernel_api_grant =
+                                super::core::KernelApiGrantRequest::from_authorization(
+                                    grant_kernel_api,
+                                    authorization,
+                                );
                             let response = core.load_ebi_image_in_detached_core(
                                 image,
                                 current_ebi_arch(),
@@ -356,6 +378,7 @@ fn dispatch_mgr_call_on_core_unchecked(
                                 parent,
                                 request.budget,
                                 grant_management,
+                                kernel_api_grant,
                             );
                             response_with_plain_payload(&response)
                         }
@@ -397,17 +420,32 @@ fn dispatch_mgr_call_on_core_unchecked(
             let Some(source_kind) = ElmEbiSourceKind::from_raw(request.source_kind) else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
+            let grant_kernel_api = request.flags & ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API != 0;
+            if grant_kernel_api && !privileged_grant_caller_allowed(principal) {
+                return response_only(ElmMgrResponseHeader::permission());
+            }
             match source_kind {
                 ElmEbiSourceKind::Projection => {
                     match load_projection_image(principal, source_payload, current_ebi_arch()) {
                         Ok(image) => {
+                            let authorization = core.authorize_mgr_call(
+                                principal,
+                                ElmMgrCallKind::ReplaceCell,
+                                ElmMgrAccessTarget::Cell(ElmId(request.target_cell_id)),
+                            );
+                            let kernel_api_grant =
+                                super::core::KernelApiGrantRequest::from_authorization(
+                                    grant_kernel_api,
+                                    authorization,
+                                );
                             let response = core
-                                .replace_declarative_cell_from_ebi_image_with_source(
+                                .replace_declarative_cell_from_ebi_image_with_source_and_kernel_api_grant(
                                     ElmId(request.target_cell_id),
                                     image,
                                     current_ebi_arch(),
                                     request.migration_limit,
                                     ElmEbiSourceKind::Projection,
+                                    kernel_api_grant,
                                 );
                             response_with_plain_payload(&response)
                         }
@@ -1144,7 +1182,7 @@ fn read_image_session_begin_request(payload: &[u8]) -> Option<ElmImageSessionBeg
     Some(request)
 }
 
-fn management_grant_caller_allowed(principal: ElmPrincipal) -> bool {
+fn privileged_grant_caller_allowed(principal: ElmPrincipal) -> bool {
     match principal.kind {
         elm_model::ElmPrincipalKind::Kernel | elm_model::ElmPrincipalKind::UserAdmin => true,
         elm_model::ElmPrincipalKind::ElmCell => principal.actor_id == ELM_MGR_BUILTIN_ID.0,
@@ -1383,7 +1421,7 @@ fn read_replace_cell_request(payload: &[u8]) -> Option<(ElmReplaceCellRequestV1,
         reserved1: u64::from_le_bytes(payload[24..32].try_into().ok()?),
     };
     if request.abi_version != ELM_REPLACE_CELL_ABI_VERSION
-        || request.flags != 0
+        || request.flags & !ELM_REPLACE_CELL_FLAGS_MASK != 0
         || request.reserved0 != 0
         || request.reserved1 != 0
         || request.target_cell_id == 0

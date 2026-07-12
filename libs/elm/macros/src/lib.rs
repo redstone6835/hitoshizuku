@@ -688,9 +688,9 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// capability 校验。
 ///
 /// ```ignore
-/// #[elm::kernel_api(namespace = "kernel.time", version = 1, capabilities = 3)]
-/// static TIME: kernel_api::ApiImport<kernel_api::time::TimeApiV1> =
-///     kernel_api::ApiImport::new("kernel.time", 1, 3);
+/// #[elm::kernel_api(namespace = "kernel.memory", version = 1, capabilities = 3)]
+/// static MEMORY: kernel_api::ApiImport<kernel_api::memory::KernelMemoryApiV1> =
+///     kernel_api::ApiImport::new("kernel.memory", 1, 3);
 /// ```
 pub fn kernel_api(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as ItemStatic);

@@ -707,7 +707,7 @@ static int source_request_from_file(const char *path, uint8_t *out, size_t cap, 
     memset(&projection, 0, sizeof(projection));
     request.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
     request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
-    request.flags = 0;
+    request.flags = ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API;
     request.parent_cell_id = ELM_MGR_BUILTIN_ID;
     request.budget.max_provider_ports = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS;
     request.budget.max_provider_queue = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE;
@@ -788,6 +788,7 @@ static int cmd_replace_eki(int argc, char **argv)
     memset(&request, 0, sizeof(request));
     memset(&projection, 0, sizeof(projection));
     request.abi_version = ELM_REPLACE_CELL_ABI_VERSION;
+    request.flags = ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
     request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
     request.target_cell_id = cell;
     request.source_payload_len = (uint32_t)(sizeof(projection) + image_len);

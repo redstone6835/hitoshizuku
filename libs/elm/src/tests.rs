@@ -1828,6 +1828,9 @@ fn lifecycle_plan_and_mgr_policy_are_fixed_layout() {
     assert_eq!(replace.source_kind, ElmEbiSourceKind::Projection as u16);
     assert_eq!(replace.migration_limit, 0);
     assert_eq!(replace.source_payload_len, 128);
+    let replace = replace.with_kernel_api_grant();
+    assert!(replace.grants_kernel_api());
+    assert_eq!(replace.flags, crate::ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API);
     assert_eq!(core::mem::size_of::<ElmReplaceCellRequestV1>(), 32);
     assert_eq!(ELM_REPLACE_MIGRATION_STATE_MAX, 64 * 1024);
 
@@ -2808,6 +2811,12 @@ fn ebi_source_request_is_fixed_layout() {
     let manager = request.with_management_grant();
     assert!(manager.grants_management());
     assert_eq!(manager.flags, crate::ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT);
+    let kernel_api = request.with_kernel_api_grant();
+    assert!(kernel_api.grants_kernel_api());
+    assert_eq!(
+        kernel_api.flags,
+        crate::ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API
+    );
     assert_eq!(ElmEbiSourceKind::from_raw(5), None);
 }
 

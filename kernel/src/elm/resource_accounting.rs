@@ -15,6 +15,7 @@ const RESOURCE_ACCOUNTING_CAPACITY: usize = 1024;
 pub(crate) struct ResourceAccountingSnapshot {
     pub dynamic_alloc_bytes: u64,
     pub peak_dynamic_alloc_bytes: u64,
+    pub max_dynamic_alloc_bytes: u64,
     pub native_stack_bytes: u64,
     pub active_native_calls: u32,
     pub cpu_time_ns_total: u64,
@@ -76,6 +77,7 @@ impl ResourceEntry {
         ResourceAccountingSnapshot {
             dynamic_alloc_bytes: self.dynamic_alloc_bytes,
             peak_dynamic_alloc_bytes: self.peak_dynamic_alloc_bytes,
+            max_dynamic_alloc_bytes: self.budget.max_dynamic_alloc_bytes,
             native_stack_bytes: self.native_stack_bytes,
             active_native_calls: self.active_native_calls,
             cpu_time_ns_total: self.cpu_time_ns_total,

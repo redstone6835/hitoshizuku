@@ -8,6 +8,7 @@
 //! 使用缓存函数表，不经过 elm-mgr 管理通道。
 
 mod import;
+pub mod memory;
 mod table;
 
 pub use import::{ApiImport, ApiImportError, ApiTableRef};

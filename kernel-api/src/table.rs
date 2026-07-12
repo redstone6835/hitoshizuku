@@ -132,8 +132,13 @@ impl KernelApiLayoutV1 {
 }
 
 /// 查询当前已经公开的函数表布局。
-pub(crate) fn layout(_identifier: &str, _version: u16) -> Option<KernelApiLayoutV1> {
-    None
+pub(crate) fn layout(identifier: &str, version: u16) -> Option<KernelApiLayoutV1> {
+    match (identifier, version) {
+        (crate::memory::KERNEL_MEMORY_API_IDENTIFIER, crate::memory::KERNEL_MEMORY_API_VERSION) => {
+            Some(KernelApiLayoutV1::of::<crate::memory::KernelMemoryApiV1>())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
