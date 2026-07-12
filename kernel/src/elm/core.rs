@@ -5908,6 +5908,11 @@ impl ElmCore {
                 if !matches!(current, ElmState::Active | ElmState::Paused) {
                     blockers |= ELM_POLICY_BLOCK_INVALID_STATE;
                 }
+                if super::resource_accounting::has_live_allocations(id) {
+                    // 普通动态分配当前按 cell 计量，不能在代际切换时证明其中不存在旧镜像
+                    // 的 Rust 引用。要求替换前清空堆状态，避免新 generation 继承裸指针。
+                    blockers |= ELM_POLICY_BLOCK_RESOURCE_QUOTA;
+                }
                 if children != 0 {
                     blockers |= ELM_POLICY_BLOCK_HAS_CHILDREN;
                 }

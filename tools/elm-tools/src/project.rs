@@ -439,11 +439,24 @@ fn main_rs(name: &str) -> String {
         r#"#![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use alloc::{{boxed::Box, string::String, sync::Arc, vec::Vec}};
 use elm::{{HookResult, LifecycleContext}};
+
+kernel_api::elm_global_allocator!();
 
 #[elm::on_initialize]
 fn initialize(_context: &LifecycleContext) -> HookResult {{
-    elm::runtime::log(6, "{name}: initialized")
+    let mut values = Vec::new();
+    values.extend_from_slice(&[1_u32, 2, 3]);
+    let boxed = Box::new(values.iter().copied().sum::<u32>());
+    let shared = Arc::new(String::from("{name}: initialized"));
+    core::hint::black_box((&values, &boxed, &shared));
+    if *boxed != 6 || Arc::strong_count(&shared) != 1 {{
+        return Err(elm::HookError::new(-1));
+    }}
+    elm::runtime::log(6, shared.as_str())
         .map_err(|_| elm::HookError::new(-1))?;
     Ok(())
 }}
@@ -512,8 +525,7 @@ fn migrate_cargo_manifest(path: &Path, kind: &str) -> Result<(), String> {
             "    \".elm/framework/elm/macros\",\n",
             "    \".elm/framework/elm/macros\",\n    \".elm/framework/kernel-api\",\n",
         );
-        let dependency =
-            "kernel-api = { path = \".elm/framework/kernel-api\", default-features = false, features = [\"module\"] }";
+        let dependency = "kernel-api = { path = \".elm/framework/kernel-api\", default-features = false, features = [\"module\"] }";
         if output.contains(desired) {
             output = output.replace(desired, format!("{desired}\n{dependency}").as_str());
         } else {
@@ -839,6 +851,12 @@ uri = "forbidden"
         assert!(service_cargo.contains("kernel-api ="));
         assert!(!service_cargo.contains("management"));
         assert!(!service_cargo.contains("elmmgr"));
+        assert!(service_source.contains("kernel_api::elm_global_allocator!()"));
+        assert!(service_source.contains("extern crate alloc"));
+        assert!(service_source.contains("Vec::new()"));
+        assert!(service_source.contains("Box::new"));
+        assert!(service_source.contains("Arc::new"));
+        assert!(service_source.contains("core::hint::black_box"));
         assert!(service_source.contains("elm::runtime::log"));
         assert!(service_source.contains("elm::runtime::abort_panic"));
         assert!(

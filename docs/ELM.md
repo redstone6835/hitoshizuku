@@ -1239,7 +1239,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - 内建 EKI Projection Source 已支持依赖、拓展点、拓展项、provider port、原生 payload segment、imports、exports、符号位置、EKI relocation v1 和生命周期钩子元数据；EKI v1 的拓展点记录显式编码组合模式，拓展项记录显式编码 handler 契约和优先级，装载时会完成保留位、固定记录长度、枚举值和字符串边界校验，再展开为 EBI image。
 - 带 Code payload、生命周期符号位置和可解析 relocation 的原生 EKI 会进入原生镜像执行器；执行器完成段复制、重定位、W^X 权限封口、指令缓存同步和 `on_initialize` 调用后，激活声明式拓扑，并在进入 `Active` 后调用可选 `entry`。
 - 无 Code/entry/relocation 的声明式 EBI 会由运行时默认生命周期闭合并直接进入 `Active`；带 Code/entry/relocation 但缺少架构映射 ops 的环境会登记为 `Loaded + NativeCodeTodo`，不执行代码。
-- `libs/elm::native` 已提供 `ElmNoHeapAllocator` 和 `elm_no_heap_allocator!()`，用于外部 no_std Rust ELM 明确声明“当前镜像不使用堆”；需要堆的 ELM 后续必须通过稳定 allocator 能力或子系统 crate 接入，不能隐式复用内核堆。
+- 外部 no_std Rust ELM 可以通过 `kernel_api::elm_global_allocator!()` 把 Rust `alloc` 接到 `kernel.memory@1`，直接使用 `Box`、`Vec`、`String` 和 `Arc`；明确不使用堆的镜像仍可选择 `elm::elm_no_heap_allocator!()`。两种宏互斥，模块不能隐式链接 allocator crate 或内核全局分配器符号。
 - `elm` 已提供独立的 module 编译面和 attribute 开发框架：`#[elm::on_initialize]`、`#[elm::on_finalize]`、迁移钩子、`#[elm::entry]`、`#[elm::provider]`、`#[elm::import]`、`#[elm::export]`、`#[elm::payload]`、`#[elm::mixin_point]` 与 `#[elm::mixin]` 会生成固定 ABI trampoline 和非装载 `.elm.meta`，业务代码不手写 `extern "C"`、导出名或原始元数据。
 - `tools/elm-tools build` 已能把外部 Rust 仓库固定构建为 ELF64 little-endian PIE，再转换为带 header SHA-256 的 EKI：它会抽取页对齐连续 `PT_LOAD` 段、生命周期符号位置、可选 entry、native import/export、provider、mixin 和 payload 元数据，并把 `R_RISCV_RELATIVE` / `R_LARCH_RELATIVE` 转换为 EBI `ImageBase64` 重定位。非 `ET_DYN`、text relocation、未知动态重定位或不兼容布局会在打包期被拒绝。
 - `elm-tools new`、`sync-framework`、`build`、`sign` 和 `verify` 已形成独立仓库闭环；同一 hello ELM 已在 RISC-V64 与 LoongArch64 QEMU 中通过签名装载，生命周期日志、`Active` 状态、信任 epoch、故障计数和 Core health 均验证通过。
@@ -1297,6 +1297,10 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 `kernel.memory@1` 发布 `ALLOCATE`、`RESIZE`、`QUERY` 和 `STATS` 四项独立 capability，以及 `allocate`、`deallocate`、`reallocate`、`query`、`stats` 五个固定布局入口。它只开放 allocator 逐对象跟踪的普通 Kernel 域分配，不开放 boot allocator、物理页、受管堆、slab/buddy 内部控制或回收策略。每个分配强制绑定当前 cell 的资源 owner，创建和调整大小进入现有动态内存预算，查询、释放和调整大小都必须精确匹配 owner；其它 cell 即使持有或猜中地址也只能得到权限拒绝。
 
+`kernel-api::memory::ElmKernelAllocator` 在该函数表上实现 Rust `GlobalAlloc`。`kernel_api::elm_global_allocator!()` 会生成唯一的全局分配器、静态 `ApiImport` 和 `ALLOCATE | RESIZE` requirement，因此 `Box`、`Vec`、`String`、`Arc` 及其它 `alloc` 容器与手工函数表调用共享同一份 grant、owner 和预算账本。分配与扩容的普通内存不足返回空指针；权限失效、未知地址、重复释放或损坏函数表属于运行时不变量错误，会先写入 ELM 日志，再通过受保护 panic 终止出口隔离当前调用。适配器本身不分配内存，首次 namespace 协商也必须保持无堆，避免 allocator 递归。
+
+动态 Rust 对象只允许在一个 ELM 镜像内部存在，不能把 `Vec`、`String`、trait object 或 Rust 引用直接放入 provider、受管 export、mixin 或迁移载荷。长期堆状态必须在发起热替换前显式释放或编码为固定迁移数据；replace 预检会以 `RESOURCE_QUOTA` blocker 拒绝仍持有动态分配的 cell。detach 在 `on_finalize` 后再次验证资源账本，仍有分配时拒绝退役。该规则保证现有按 cell 计量的裸地址不会被下一 generation 隐式继承。
+
 内存函数表的输出槽必须位于当前 ELM 可写范围。重分配额外在 allocator 的同一地址串行化事务中验证输出槽与旧对象不重叠，避免移动旧对象后向失效地址写回结果。热替换为新 generation 预建独立 grant：任何预检、requirement 解析或提交失败都会删除新 grant 并保留旧 generation；提交成功后才撤销旧 grant。所有函数入口仍会逐次校验当前上下文和 token，因此撤销后缓存表地址与旧 token 不能继续使用。
 
 ### Rust ELM 独立仓库开发框架
@@ -1317,7 +1321,7 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
 
 - `Cargo.toml`：独立 workspace，依赖同步后的 `elm` 与 `kernel-api`；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`，`kernel-api` 启用 `module`。
 - `Elm.toml`：名称、版本、种类、来源 identifier、菜单和单元依赖的唯一声明源。
-- `src/main.rs`：`no_std + no_main` 生命周期模板。
+- `src/main.rs`：`no_std + no_main` 生命周期模板，默认安装 `kernel_api::elm_global_allocator!()`，并用 `Vec`、`String`、`Box` 和 `Arc` 验证 Rust 堆；示例对象在初始化钩子结束前全部析构。
 - `elm.ld`：固定的连续 `PT_LOAD`、非装载 `.elm.meta` 和动态重定位布局。
 - `.cargo/config.toml`：RISC-V64 与 LoongArch64 的 PIE、small code model 和 linker 配置。
 - `.elm/framework`：与内核源码解耦的框架快照；更新工具后使用 `sync-framework` 显式同步。
@@ -1506,7 +1510,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 当前剩余主线：
 
-- Kernel API 导出：基础服务批次已完整发布 `kernel.memory@1`；后续继续按时间、随机数、日志、执行、设备、VFS/存储、固件和受控 syscall 等独立批次接入版本化函数表，尚未完整实现的 namespace 不得公开占位。
+- Kernel API 导出：基础服务批次已完整发布 `kernel.memory@1`，包括显式函数表和 Rust `GlobalAlloc` 适配器；后续继续按时间、随机数、日志、执行、设备、VFS/存储、固件和受控 syscall 等独立批次接入版本化函数表，尚未完整实现的 namespace 不得公开占位。
 - 子系统 provider：设备、VFS、网络、IRQ、DMA、MMIO 等真实能力必须在各自子系统内部实现并显式注册。
 - 用户态管理工具：补齐面向实际部署的策略编辑、镜像仓库、交互式诊断和运维工作流。
 - ELM 调试与发布生态：补齐调试符号归档、IDE 映射、依赖锁定、可复现发布索引和镜像仓库；attribute、独立仓库模板、双架构 PIE、EKI、签名和运行期装载链路已经具备。
@@ -1517,7 +1521,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 - 当前 ELM 已经形成稳定的管理运行时和原生执行边界：`elm-mgr` 可以作为外界入口管理菜单、策略、拓扑、审计、provider、事件订阅、资源预算、隔离状态、完整 60 项 API 注册表、信任、Projection Source、journal、镜像会话和 EBI 装载状态；EKI 由内建 `eki` 子单元以固定 Projection Source ID 接入。
 - 当前阶段不再继续把零散能力堆进 `MGR_CALL`。后续新增能力必须归入子系统 provider、用户态管理工具、ELM 调试与发布生态、其他格式 Projection Source 或网络栈 ELM 化等明确主线。
 - `elm-mgr` 是所有 ELM 通向运行时管理能力的唯一网关，但不是内核数据热路径。后续 VFS、设备、调度、IRQ、DMA、MMIO 等能力通过 `kernel-api` 的版本化表直接调用，只有需要运行时发现、绑定、审计、跨单元调用或异步流控时才通过 provider Ops；不为每个子系统新增私有 syscall，未来只提供由 ELM 自行声明、冲突拒绝且随生命周期撤销的受控 syscall 注册机制。
-- Kernel API 授权链和首个真实函数表已经进入双架构验证：`kernel.memory@1` 可在原生 ELM 上下文中完成分配、查询、统计、扩容和释放，跨 cell 操作、输出槽别名、未批准 requirement、陈旧 generation 和已撤销 token 均被拒绝。
+- Kernel API 授权链和首个真实函数表已经进入双架构验证：`kernel.memory@1` 可在原生 ELM 上下文中完成分配、查询、统计、扩容和释放；独立 ELM 工程可直接使用 `Box`、`Vec`、`String` 和 `Arc`，并生成规范 `kernel.memory@1` requirement。跨 cell 操作、输出槽别名、未批准 requirement、陈旧 generation、已撤销 token 和带活跃堆对象的热替换均被拒绝。
 - `EKI` 是近期原生 ELM 镜像承载方式，`soyo` 仍保持后置；ELM Core 继续只消费 EBI 协议对象，不绑定具体文件格式，具体镜像类型必须通过 Projection Source 进入。
 - 当前带 Code payload 的原生 EKI 已接入真实镜像执行器；imports 已可通过已装载原生 exports 解析，受管 import 可选择唯一最高兼容 export 并在替换时回滚，带 `handler_symbol` 的 ELM 原生 provider 已可调用，原生 `entry` 已通过 `ElmNativeEntryFrameV1` 在激活后调用。迁移式热替换、调用排空、Projection Source 原子 generation 切换、provider snapshot 分页、资源预算、隔离、同步 fault、panic 恢复和 timer 强制退出均已进入双架构验证链路。
 

@@ -1865,6 +1865,41 @@ fn elm_owned_resources_block_replace_and_drain_before_detach() {
 }
 
 #[ktest]
+fn elm_dynamic_allocations_block_generation_replace_until_released() {
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let loaded = core.load_ebi_unit(menu_unit("heap-owner-cell"), ElmEbiArch::Any);
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let cell = ElmId(loaded.cell_id);
+
+    let allocation = allocator::KERNEL_ALLOCATOR
+        .allocate_owned(
+            cell.0,
+            allocator::MemoryRequest::new(allocator::MemoryDomain::Kernel, 96, 16),
+        )
+        .expect("ELM 动态分配应成功");
+    let blocked = core.preflight_lifecycle(ElmLifecyclePlanRequest::new(
+        cell.0,
+        ElmLifecycleAction::Replace,
+    ));
+    assert_eq!(blocked.allowed, 0);
+    assert_ne!(blocked.blockers & ELM_POLICY_BLOCK_RESOURCE_QUOTA, 0);
+
+    allocator::KERNEL_ALLOCATOR
+        .deallocate_owned(cell.0, allocation.ptr)
+        .expect("释放 ELM 动态分配应成功");
+    let allowed = core.preflight_lifecycle(ElmLifecyclePlanRequest::new(
+        cell.0,
+        ElmLifecycleAction::Replace,
+    ));
+    assert_eq!(allowed.allowed, 1);
+    assert_eq!(allowed.blockers & ELM_POLICY_BLOCK_RESOURCE_QUOTA, 0);
+
+    let detached = core.detach_cell(cell);
+    assert_eq!(detached.status, ELM_MGR_STATUS_OK);
+}
+
+#[ktest]
 fn elm_mgr_reports_sealed_unsigned_test_policy() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();

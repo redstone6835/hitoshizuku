@@ -4,7 +4,10 @@
 //! boot allocator、受管堆和 allocator 内部缓存均不属于该契约。每个返回地址都绑定到
 //! 发起调用的 ELM cell；其它 cell 即使猜中地址，也不能查询、调整或释放该对象。
 
-use crate::{ApiGrantTokenV1, ApiTableHeaderV1, KernelApiTable};
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::null_mut;
+
+use crate::{ApiGrantTokenV1, ApiImport, ApiTableHeaderV1, KernelApiTable};
 
 /// 内存服务的规范命名空间 identifier。
 pub const KERNEL_MEMORY_API_IDENTIFIER: &str = "kernel.memory";
@@ -24,6 +27,9 @@ pub const KERNEL_MEMORY_CAPABILITIES: u64 = KERNEL_MEMORY_CAP_ALLOCATE
     | KERNEL_MEMORY_CAP_RESIZE
     | KERNEL_MEMORY_CAP_QUERY
     | KERNEL_MEMORY_CAP_STATS;
+/// Rust 全局分配器适配器要求的能力集合。
+pub const KERNEL_MEMORY_GLOBAL_ALLOCATOR_CAPABILITIES: u64 =
+    KERNEL_MEMORY_CAP_ALLOCATE | KERNEL_MEMORY_CAP_RESIZE;
 
 /// 请求返回的内存必须清零。
 pub const KERNEL_MEMORY_REQUEST_ZEROED: u32 = 1 << 0;
@@ -178,6 +184,116 @@ pub struct KernelMemoryApiV1 {
     pub stats: extern "C" fn(ApiGrantTokenV1, *mut KernelMemoryStatsV1) -> i32,
 }
 
+/// 把 Rust `alloc` 请求转发到当前 ELM 的 `kernel.memory@1` 导入槽。
+///
+/// 此适配器让原生 ELM 使用 `Box`、`Vec`、`String` 和 `Arc` 等 Rust 容器，同时保留
+/// 内核对 cell、generation、grant 和动态内存预算的逐次校验。它不直接链接内核的
+/// allocator crate，也不暴露内核全局分配器符号。
+///
+/// 普通模块应使用 [`crate::elm_global_allocator!`] 一次性声明导入槽并安装全局分配器，
+/// 不需要手工构造本类型。
+///
+/// # 失败语义
+///
+/// 资源预算耗尽和普通内存不足按 [`GlobalAlloc`] 约定返回空指针。权限失效、陈旧
+/// generation、未知地址或损坏的函数表属于模块运行时不变量错误，适配器会记录诊断并经
+/// ELM 受保护终止出口结束当前调用，不能静默忽略释放失败。
+pub struct ElmKernelAllocator {
+    memory: &'static ApiImport<KernelMemoryApiV1>,
+}
+
+impl ElmKernelAllocator {
+    /// 创建绑定到静态 `kernel.memory@1` 导入槽的 Rust 全局分配器。
+    ///
+    /// `memory` 必须声明 [`KERNEL_MEMORY_GLOBAL_ALLOCATOR_CAPABILITIES`]。推荐通过
+    /// [`crate::elm_global_allocator!`] 生成该槽，避免 capability 与 EBI requirement 不一致。
+    pub const fn new(memory: &'static ApiImport<KernelMemoryApiV1>) -> Self {
+        Self { memory }
+    }
+
+    fn acquire(&self) -> crate::ApiTableRef<'_, KernelMemoryApiV1> {
+        match self.memory.acquire() {
+            Ok(memory) => memory,
+            Err(_) => allocator_invariant_failure("ELM 全局分配器无法取得 kernel.memory@1"),
+        }
+    }
+
+    fn allocate_layout(&self, layout: Layout, zeroed: bool) -> *mut u8 {
+        if layout.size() == 0 {
+            return null_mut();
+        }
+        let memory = self.acquire();
+        let mut request = KernelMemoryRequestV1::new(layout.size() as u64, layout.align() as u64);
+        if zeroed {
+            request = request.zeroed();
+        }
+        match memory.table().allocate_memory(memory.token(), request) {
+            Ok(allocation) => allocation.address as *mut u8,
+            Err(KERNEL_MEMORY_STATUS_OUT_OF_MEMORY) => null_mut(),
+            Err(_) => allocator_invariant_failure("ELM 全局分配器分配请求违反运行时约束"),
+        }
+    }
+}
+
+// Safety: 所有分配、调整和释放都经稳定函数表转发到内核；内核按当前 ELM 上下文验证
+// grant、generation、地址所有权和布局。适配器本身只持有线程安全的静态 ApiImport。
+unsafe impl GlobalAlloc for ElmKernelAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.allocate_layout(layout, false)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        self.allocate_layout(layout, true)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        if ptr.is_null() {
+            return;
+        }
+        let memory = self.acquire();
+        // Safety: GlobalAlloc 的调用契约保证 ptr 来自当前分配器且已经失去全部活跃引用；
+        // 内核还会再次验证该地址属于当前 cell。
+        if unsafe { memory.table().deallocate_memory(memory.token(), ptr as u64) }.is_err() {
+            allocator_invariant_failure("ELM 全局分配器拒绝释放未知或失效的地址");
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+                return null_mut();
+            };
+            return self.allocate_layout(new_layout, false);
+        }
+        if new_size == 0 {
+            // Safety: 调用方已按 GlobalAlloc::realloc 契约交出 ptr 的独占所有权。
+            unsafe { self.dealloc(ptr, layout) };
+            return null_mut();
+        }
+        let Ok(request) = u64::try_from(new_size)
+            .map(|size| KernelMemoryRequestV1::new(size, layout.align() as u64))
+        else {
+            return null_mut();
+        };
+        let memory = self.acquire();
+        // Safety: GlobalAlloc 的调用契约保证 ptr 属于当前分配器，且成功后旧引用全部失效。
+        match unsafe {
+            memory
+                .table()
+                .reallocate_memory(memory.token(), ptr as u64, request)
+        } {
+            Ok(allocation) => allocation.address as *mut u8,
+            Err(KERNEL_MEMORY_STATUS_OUT_OF_MEMORY) => null_mut(),
+            Err(_) => allocator_invariant_failure("ELM 全局分配器调整大小违反运行时约束"),
+        }
+    }
+}
+
+fn allocator_invariant_failure(message: &'static str) -> ! {
+    let _ = elm::runtime::log(3, message);
+    elm::runtime::abort_panic()
+}
+
 impl KernelMemoryApiV1 {
     /// 通过函数表创建分配，并把非零状态原样返回给调用方。
     pub fn allocate_memory(
@@ -213,10 +329,10 @@ impl KernelMemoryApiV1 {
     ///
     /// # Safety
     ///
-    /// `address` 必须属于当前 cell。它通常由当前 generation 创建；若对象跨热替换保留，
-    /// 则必须由迁移协议显式转交给当前 generation。调用发生时不得再存在任何访问该对象的
-    /// 引用、裸指针操作、DMA 或异步内核任务。成功返回后该地址立即失效，不能再次查询或
-    /// 释放。
+    /// `address` 必须属于当前 cell 和当前有效 generation。普通动态对象不得跨热替换保留；
+    /// 需要迁移的状态必须编码到固定迁移载荷，再由新 generation 重新分配。调用发生时不得
+    /// 再存在任何访问该对象的引用、裸指针操作、DMA 或异步内核任务。成功返回后该地址立即
+    /// 失效，不能再次查询或释放。
     pub unsafe fn deallocate_memory(
         &self,
         token: ApiGrantTokenV1,
