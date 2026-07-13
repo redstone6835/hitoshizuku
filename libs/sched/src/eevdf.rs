@@ -298,7 +298,7 @@ impl SchedEntity {
         vr.saturating_add(scaled_slice)
     }
 
-    /// 一次性更新 weight + slice。调用方随后应当调 [`crate::Runqueue::resort_after_weight_change`]
+    /// 一次性更新 weight + slice。调用方随后应当让所属 runqueue 重新排序。
     /// 把 task 在 tree 中的位置重算。
     pub fn set_params(&self, params: SchedParams) {
         self.set_nice(params.nice);

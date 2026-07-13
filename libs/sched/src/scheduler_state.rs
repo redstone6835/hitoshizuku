@@ -51,7 +51,7 @@ impl CpuSchedState {
         }
     }
 
-    pub fn runqueue(&self) -> &Runqueue {
+    pub(crate) fn runqueue(&self) -> &Runqueue {
         &self.runqueue
     }
 

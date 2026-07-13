@@ -26,7 +26,7 @@ use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
     migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
     root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
-    supported_cpu_mask,
+    supported_cpu_mask, task_runqueue_cpu,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
@@ -356,23 +356,8 @@ fn update_task_sched_entity(
     mut update: impl FnMut(usize, &Arc<Task>, u64) -> bool,
 ) -> Result<(), Errno> {
     let now_ns = crate::scheduler::now_ns_public();
-    let owner = task.current_cpu();
-    if owner < NR_CPUS && update(owner, task, now_ns) {
-        return Ok(());
-    }
-
-    for cpu_id in 0..NR_CPUS {
-        if cpu_id == owner {
-            continue;
-        }
-        if update(cpu_id, task, now_ns) {
-            return Ok(());
-        }
-    }
-
-    if task.sched.on_rq() {
-        Err(Errno::EBUSY)
-    } else if update(task.current_cpu().min(NR_CPUS - 1), task, now_ns) {
+    let owner = task_runqueue_cpu(task).map_or(0, CpuId::get);
+    if update(owner, task, now_ns) {
         Ok(())
     } else {
         Err(Errno::EBUSY)
@@ -400,11 +385,8 @@ pub fn sched_reset_on_fork(pid: PidT) -> Result<bool, Errno> {
 pub fn set_task_nice(task: &Arc<Task>, nice: i8) {
     let mut attr = task.sched.sched_attr();
     attr.nice = nice.clamp(crate::eevdf::NICE_MIN, crate::eevdf::NICE_MAX);
-    runqueue_of(task.current_cpu()).update_sched_attr(
-        task,
-        attr,
-        crate::scheduler::now_ns_public(),
-    );
+    let owner = task_runqueue_cpu(task).map_or(0, CpuId::get);
+    runqueue_of(owner).update_sched_attr(task, attr, crate::scheduler::now_ns_public());
 }
 
 pub fn task_usage(pid: PidT) -> Result<TaskUsage, Errno> {

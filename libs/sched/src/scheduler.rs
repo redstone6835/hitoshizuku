@@ -302,12 +302,13 @@ pub fn init_task() -> Arc<Task> {
 }
 
 /// 当前 CPU 的 runqueue。
-pub fn runqueue() -> &'static Runqueue {
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn runqueue() -> &'static Runqueue {
     SCHEDULER.cpu_or_boot(cpu()).runqueue()
 }
 
 /// 指定 CPU 的 runqueue。
-pub fn runqueue_of(cpu_id: usize) -> &'static Runqueue {
+pub(crate) fn runqueue_of(cpu_id: usize) -> &'static Runqueue {
     assert!(cpu_id < NR_CPUS, "[sched] runqueue cpu id out of range");
     SCHEDULER.cpu_or_boot(cpu_id).runqueue()
 }
@@ -500,6 +501,27 @@ pub(crate) fn refresh_task_placement(scheduler: &crate::Scheduler, task: &Task) 
     task.refresh_placement_topology(source, domain_id, snapshot.generation)
 }
 
+/// 按已提交的 placement 返回任务所属 runqueue。
+///
+/// placement 是 runqueue 所有权的唯一依据。拓扑代际变化时先刷新 domain 信息；
+/// `current_cpu` 只保留为兼容旧查询路径的镜像，不参与任务定位。
+pub(crate) fn task_runqueue_cpu_on(scheduler: &crate::Scheduler, task: &Task) -> Option<CpuId> {
+    let _ = refresh_task_placement(scheduler, task);
+    let placement = task.placement();
+    if placement.state == crate::PlacementState::Unbound {
+        return None;
+    }
+    let cpu = placement.cpu?;
+    if task.current_cpu() != cpu.get() {
+        task.set_current_cpu(cpu.get());
+    }
+    Some(cpu)
+}
+
+pub(crate) fn task_runqueue_cpu(task: &Task) -> Option<CpuId> {
+    task_runqueue_cpu_on(&SCHEDULER, task)
+}
+
 pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
     let cpu = CpuId::new(cpu_id)?;
     sched_topology()
@@ -593,6 +615,8 @@ pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
     Ok(())
 }
 
+/// TODO(smp): AP 只能在 current 和 idle 都安装完成后激活；底层通常应通过
+/// [`cpu_start_scheduling`] 完成这一步，而不是提前直接调用本函数。
 pub fn activate_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
@@ -612,6 +636,9 @@ pub(crate) fn cpu_ready_for_activation(scheduler: &crate::Scheduler, cpu_id: usi
 }
 
 /// 兼容旧调用：一次完成 online 和 active 发布。
+///
+/// TODO(smp): AP 启动路径不得调用该兼容接口；它不会检查 per-CPU current、idle
+/// 和架构本地状态是否准备完成。
 pub fn register_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     register_cpu_locked(cpu_id)
@@ -821,6 +848,9 @@ fn restore_unmoved_tasks(
 
 /// AP 启动路径的调度接入口框架：把当前 CPU 正在执行的 task 登记为该 CPU 的
 /// current。当前 kernel 启动链路不调用它；AP bring-up 落地时可直接接入。
+///
+/// TODO(smp): AP 完成 per-CPU 栈、trap、页表和本地数据初始化后调用。
+/// 本 CPU idle task，最后进入 [`cpu_start_scheduling`]。
 pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Errno> {
     if CpuId::new(cpu_id).is_none() {
         return Err(errno::Errno::EINVAL);
@@ -1760,6 +1790,8 @@ pub fn schedule_once(now_ns: u64) {
 /// 定时器中断回调。推进 current 的虚拟时间，若时间片用完则请求 reschedule。
 /// 真正的切换由 trap 返回路径上的 [`preempt_if_needed`] 完成——本函数仅
 /// 记录意图，避免在 IRQ 上下文里持锁切换造成栈污染。
+///
+/// TODO(smp): 每个 AP 的本地 timer 中断都必须调用该接口。
 pub fn on_timer_tick(now_ns: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
@@ -1774,6 +1806,9 @@ pub fn on_timer_tick(now_ns: u64) {
 
 /// 在合适的边界（trap 返回前、syscall 返回前、显式让渡入口）调用。读到
 /// CPU 的 reschedule 意图被置位时即清零并切一次。
+///
+/// TODO(smp): AP 的 timer、reschedule IPI 和 syscall/trap 返回路径都必须在
+/// 恢复用户态前经过该接口；硬中断处理程序不得直接切换上下文。
 pub fn preempt_if_needed(now_ns: u64) {
     if !INIT_READY.load(Ordering::Acquire) {
         return;
@@ -1842,12 +1877,17 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
 }
 
 /// [`spawn_idle_for`] 的显式 SMP 命名别名，供未来 AP bring-up 使用。
+///
+/// TODO(smp): AP 调用 [`adopt_cpu_current`] 后为本 CPU 创建并安装 idle task。
 pub fn spawn_idle_for_cpu(cpu_id: usize) -> Arc<Task> {
     spawn_idle_for(cpu_id)
 }
 
 /// AP 调度循环框架。当前启动链路不接入；真实 AP 代码应先调用
 /// [`adopt_cpu_current`] / [`spawn_idle_for_cpu`] 完成本 CPU 槽位初始化。
+///
+/// TODO(smp): 架构 secondary entry 完成 per-CPU 初始化后以此作为调度入口；
+/// 本函数会检查初始化状态、激活 CPU，并开始消费本地 runqueue。
 pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
     activate_cpu(cpu_id).expect("[sched] CPU must be online before scheduling loop");
     loop {
@@ -1880,29 +1920,29 @@ pub(crate) fn mark_task_exited(task: &Arc<Task>, code: ExitCode) {
 }
 
 fn dequeue_for_state_change(task: &Arc<Task>, now_ns: u64) -> bool {
-    let local_cpu = cpu();
-    let owner = task.current_cpu();
-    if owner < NR_CPUS && dequeue_on_cpu_for_state_change(task, owner, local_cpu, now_ns) {
-        return true;
-    }
-    for cpu_id in 0..NR_CPUS {
-        if cpu_id == owner {
-            continue;
-        }
-        if dequeue_on_cpu_for_state_change(task, cpu_id, local_cpu, now_ns) {
-            return true;
-        }
-    }
-    false
+    dequeue_for_state_change_on(&SCHEDULER, task, cpu(), now_ns)
+}
+
+pub(crate) fn dequeue_for_state_change_on(
+    scheduler: &crate::Scheduler,
+    task: &Arc<Task>,
+    local_cpu: usize,
+    now_ns: u64,
+) -> bool {
+    let Some(owner) = task_runqueue_cpu_on(scheduler, task) else {
+        return false;
+    };
+    dequeue_on_cpu_for_state_change(scheduler, task, owner.get(), local_cpu, now_ns)
 }
 
 fn dequeue_on_cpu_for_state_change(
+    scheduler: &crate::Scheduler,
     task: &Arc<Task>,
     cpu_id: usize,
     local_cpu: usize,
     now_ns: u64,
 ) -> bool {
-    let rq = SCHEDULER.cpu_or_boot(cpu_id).runqueue();
+    let rq = scheduler.cpu_or_boot(cpu_id).runqueue();
     if cpu_id == local_cpu {
         return rq.dequeue(task, now_ns);
     }
@@ -1910,7 +1950,7 @@ fn dequeue_on_cpu_for_state_change(
         return true;
     }
     if rq.is_current(task) {
-        request_resched(cpu_id);
+        scheduler.cpu_or_boot(cpu_id).request_resched();
     }
     false
 }

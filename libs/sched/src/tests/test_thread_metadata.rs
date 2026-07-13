@@ -8,9 +8,10 @@ use core::ptr::NonNull;
 
 use ktest::ktest;
 
+use crate::runqueue::Runqueue;
 use crate::{
-    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue,
-    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, SchedAttr,
+    SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
     supported_cpu_mask,
 };
 

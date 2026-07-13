@@ -5,10 +5,10 @@ use alloc::sync::Arc;
 use ktest::ktest;
 
 use super::test_thread_metadata::make_task;
-use crate::scheduler::validate_migration_target;
+use crate::scheduler::{runqueue_of, validate_migration_target};
 use crate::{
     CpuId, CpuMask, MigrationContext, PlacementSnapshot, PlacementState, SchedTopology,
-    TopologySnapshot, enqueue_task, migrate_task, register_cpu, runqueue_of,
+    TopologySnapshot, enqueue_task, migrate_task, register_cpu,
 };
 
 #[ktest]

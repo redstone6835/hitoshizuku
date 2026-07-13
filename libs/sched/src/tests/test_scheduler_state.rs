@@ -10,8 +10,9 @@ use ktest::ktest;
 
 use super::test_thread_metadata::make_task;
 use crate::scheduler::{
-    cpu_ready_for_activation, enqueue_task_on_scheduler, offline_cpu_with_scheduler,
-    refresh_task_placement, requeue_balance_task_on,
+    cpu_ready_for_activation, dequeue_for_state_change_on, enqueue_task_on_scheduler,
+    offline_cpu_with_scheduler, refresh_task_placement, requeue_balance_task_on,
+    task_runqueue_cpu_on,
 };
 use crate::{
     CpuId, CpuMask, PlacementState, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass,
@@ -314,6 +315,44 @@ fn topology_refresh_updates_runnable_and_sleeping_placements() {
         assert_eq!(task.placement().topology_generation, new_generation);
         assert_eq!(task.placement().state, PlacementState::Bound);
     }
+}
+
+#[ktest]
+fn runqueue_owner_refreshes_topology_and_current_cpu_mirror() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    task.set_current_cpu(0);
+
+    scheduler.install_topology(SchedTopology::bootstrap());
+    let generation = scheduler.topology_snapshot().generation;
+
+    assert_eq!(task_runqueue_cpu_on(&scheduler, &task), CpuId::new(1));
+    assert_eq!(task.current_cpu(), 1);
+    assert_eq!(task.placement().domain_id, 0);
+    assert_eq!(task.placement().topology_generation, generation);
+}
+
+#[ktest]
+fn state_change_uses_placement_when_current_cpu_mirror_is_stale() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    assert!(
+        scheduler
+            .cpu_or_boot(1)
+            .runqueue()
+            .enqueue(Arc::clone(&task), 1)
+    );
+    task.set_current_cpu(0);
+
+    assert!(dequeue_for_state_change_on(&scheduler, &task, 0, 2));
+    assert_eq!(task.current_cpu(), 1);
+    assert!(!task.sched.on_rq());
+    assert_eq!(scheduler.cpu_or_boot(0).runqueue().nr_running(), 0);
+    assert_eq!(scheduler.cpu_or_boot(1).runqueue().nr_running(), 0);
 }
 
 #[ktest]

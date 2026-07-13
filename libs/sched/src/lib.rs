@@ -62,7 +62,7 @@ pub mod pid;
 pub mod placement;
 pub mod process_ops;
 pub mod rlimit;
-pub mod runqueue;
+mod runqueue;
 pub mod sched_class;
 pub mod scheduler;
 pub mod scheduler_state;
@@ -89,7 +89,7 @@ pub use process_ops::{
     ExecRequest, ProcessImageOps, UserContextRef, process_image_ops, register_process_image_ops,
 };
 pub use rlimit::{Resource, Rlim, RlimitError, RlimitPair, Rlimits, RlimitsLock};
-pub use runqueue::{Runqueue, RunqueueClassLoad};
+pub use runqueue::RunqueueClassLoad;
 pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
     RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
@@ -102,9 +102,8 @@ pub use scheduler::{
     mark_cpu_online, migrate_task, needs_resched, needs_resched_current, now_ns_public,
     offline_cpu, on_timer_tick, online_cpu_mask, pid_count, preempt_if_needed, register_cpu,
     register_sleep_deadline, request_balance, request_post_syscall_handoff, request_resched,
-    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, runqueue, runqueue_of,
-    schedule_once, scheduler_diag, set_realtime_itimer, signal_wakeup, spawn_idle_for,
-    supported_cpu_mask,
+    root_pid_ns, run_post_syscall_handoff, run_post_syscall_handoff_lazy, schedule_once,
+    scheduler_diag, set_realtime_itimer, signal_wakeup, spawn_idle_for, supported_cpu_mask,
 };
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
