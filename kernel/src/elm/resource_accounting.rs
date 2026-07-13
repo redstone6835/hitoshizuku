@@ -28,6 +28,7 @@ pub(crate) struct ResourceAccountingSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeCallAdmissionError {
     CellNotRegistered,
+    RegistryBusy,
     StackQuota,
     ConcurrentQuota,
     CpuQuota,
@@ -264,7 +265,11 @@ impl NativeCallPermit {
     }
 
     pub(crate) fn finish(mut self, now_ns: u64) -> NativeCallAccountingResult {
-        let result = finish_native_call(self.cell, self.stack_bytes, self.started_at_ns, now_ns);
+        let mut result =
+            finish_native_call(self.cell, self.stack_bytes, self.started_at_ns, now_ns);
+        if self.effective_deadline_ns != 0 && now_ns > self.effective_deadline_ns {
+            result.call_budget_exceeded = true;
+        }
         self.finished = true;
         result
     }
@@ -291,6 +296,44 @@ pub(crate) fn begin_native_call(
     now_ns: u64,
 ) -> Result<NativeCallPermit, NativeCallAdmissionError> {
     let mut registry = RESOURCE_REGISTRY.lock();
+    begin_native_call_locked(
+        &mut registry,
+        cell,
+        stack_bytes,
+        requested_deadline_ns,
+        now_ns,
+    )
+}
+
+/// 在中断上下文中尝试取得原生调用预算。
+///
+/// 该入口绝不等待账本锁。若中断打断了正在更新同一账本的内核路径，会直接返回
+/// `RegistryBusy`，避免当前 CPU 等待只能由被打断路径释放的锁。
+pub(crate) fn try_begin_native_call(
+    cell: ElmId,
+    stack_bytes: u64,
+    requested_deadline_ns: u64,
+    now_ns: u64,
+) -> Result<NativeCallPermit, NativeCallAdmissionError> {
+    let mut registry = RESOURCE_REGISTRY
+        .try_lock()
+        .ok_or(NativeCallAdmissionError::RegistryBusy)?;
+    begin_native_call_locked(
+        &mut registry,
+        cell,
+        stack_bytes,
+        requested_deadline_ns,
+        now_ns,
+    )
+}
+
+fn begin_native_call_locked(
+    registry: &mut ResourceRegistry,
+    cell: ElmId,
+    stack_bytes: u64,
+    requested_deadline_ns: u64,
+    now_ns: u64,
+) -> Result<NativeCallPermit, NativeCallAdmissionError> {
     let Some(entry) = registry.entry_mut(cell.0) else {
         return Err(NativeCallAdmissionError::CellNotRegistered);
     };
@@ -340,6 +383,42 @@ pub(crate) fn begin_native_call(
         effective_deadline_ns,
         finished: false,
     })
+}
+
+/// 为长期存在的原生调用栈预留预算。
+pub(crate) fn reserve_native_stack(cell: ElmId, stack_bytes: u64) -> bool {
+    if stack_bytes == 0 {
+        return true;
+    }
+    let mut registry = RESOURCE_REGISTRY.lock();
+    let Some(entry) = registry.entry_mut(cell.0) else {
+        return false;
+    };
+    let Some(next_stack) = entry.native_stack_bytes.checked_add(stack_bytes) else {
+        entry.quota_denials = entry.quota_denials.saturating_add(1);
+        return false;
+    };
+    if next_stack > entry.budget.max_native_stack_bytes {
+        entry.quota_denials = entry.quota_denials.saturating_add(1);
+        return false;
+    }
+    entry.native_stack_bytes = next_stack;
+    true
+}
+
+/// 归还长期存在的原生调用栈预算。
+pub(crate) fn release_native_stack(cell: ElmId, stack_bytes: u64) {
+    if stack_bytes == 0 {
+        return;
+    }
+    let mut registry = RESOURCE_REGISTRY.lock();
+    let Some(entry) = registry.entry_mut(cell.0) else {
+        return;
+    };
+    if entry.native_stack_bytes < stack_bytes {
+        entry.accounting_errors = entry.accounting_errors.saturating_add(1);
+    }
+    entry.native_stack_bytes = entry.native_stack_bytes.saturating_sub(stack_bytes);
 }
 
 fn finish_native_call(

@@ -388,10 +388,10 @@ struct SysPnpDeviceSnapshot {
     sysfs_name: String,
     /// PnP core 内部登记名，保留原始固件/总线语义用于展示。
     name: String,
-    bus_type: &'static str,
+    bus_type: String,
     id: PnpId,
     state: &'static str,
-    driver: Option<&'static str>,
+    driver: Option<String>,
     parent: Option<String>,
     child_count: usize,
     functions: Vec<Arc<dyn DeviceFunction>>,
@@ -487,7 +487,7 @@ fn push_sysfs_dir_entry(out: &mut Vec<DirEntry>, ino: u64, name: &str, kind: Fil
 struct SysSnapshot {
     devices: Vec<SysDeviceSnapshot>,
     pnp_devices: Vec<SysPnpDeviceSnapshot>,
-    pnp_buses: Vec<&'static str>,
+    pnp_buses: Vec<String>,
     virtual_devices: Vec<SysVirtualDeviceSnapshot>,
     virtual_classes: Vec<&'static str>,
     classes: Vec<SysClassSnapshot>,
@@ -635,7 +635,7 @@ impl SysSnapshot {
         // PnP 设备是 dev core 的硬件身份与 driver 绑定视图。这里先把它们放入
         // sysfs 快照，即便设备没有 `/dev` 投影，也能在 `/sys/devices/pnp` 中诊断。
         for dev in PNP_DEVICES.try_list().unwrap_or_default() {
-            let bus_type = dev.info.bus_type().as_str();
+            let bus_type = dev.info.bus_name().to_string();
             let mut sysfs_name = sysfs_component_name(&dev.name);
             if snap
                 .pnp_devices
@@ -663,7 +663,7 @@ impl SysSnapshot {
             snap.pnp_devices.push(SysPnpDeviceSnapshot {
                 sysfs_name,
                 name: dev.name.to_string(),
-                bus_type,
+                bus_type: bus_type.clone(),
                 id: dev.id.clone(),
                 state: pnp_state_name(dev.state()),
                 driver: dev.bound_driver_name(),
@@ -1732,6 +1732,7 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
         PnpDeviceSlot::State => format!("{}\n", dev.state),
         PnpDeviceSlot::Driver => dev
             .driver
+            .as_deref()
             .map(|name| format!("{name}\n"))
             .unwrap_or_default(),
         PnpDeviceSlot::Parent => dev
@@ -2282,10 +2283,10 @@ enum SysDirKind {
     },
     DevicesPnp,
     DevicesPnpBus {
-        bus: &'static str,
+        bus: String,
     },
     PnpDevice {
-        bus: &'static str,
+        bus: String,
         name: String,
     },
     Dev,
@@ -2300,10 +2301,10 @@ enum SysDirKind {
     FsCgroup,
     Bus,
     BusClass {
-        bus: &'static str,
+        bus: String,
     },
     BusClassDevices {
-        bus: &'static str,
+        bus: String,
     },
     Class,
     ClassDir {
@@ -2594,9 +2595,9 @@ impl SysDirInodeOps {
                     .position(|bus| *bus == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
-                    pnp_bus_ino(snap.pnp_buses[bus_idx]),
+                    pnp_bus_ino(&snap.pnp_buses[bus_idx]),
                     SysDirKind::DevicesPnpBus {
-                        bus: snap.pnp_buses[bus_idx],
+                        bus: snap.pnp_buses[bus_idx].clone(),
                     },
                 ))
             }
@@ -2609,7 +2610,7 @@ impl SysDirInodeOps {
                     return Err(VfsError::NotFound);
                 }
                 Ok(mk_dir(
-                    pnp_device_ino(bus, name),
+                    pnp_device_ino(&bus, name),
                     SysDirKind::PnpDevice {
                         bus,
                         name: name.to_string(),
@@ -2627,7 +2628,7 @@ impl SysDirInodeOps {
                     .ok_or(VfsError::NotFound)?;
                 let slot = pnp_device_slot_by_name(name).ok_or(VfsError::NotFound)?;
                 mk_reg(
-                    pnp_device_slot_ino(bus, &dev_name, slot.to_u64()),
+                    pnp_device_slot_ino(&bus, &dev_name, slot.to_u64()),
                     SysRegFile::PnpDevice { idx, slot },
                 )
             }
@@ -2766,15 +2767,15 @@ impl SysDirInodeOps {
                     .position(|bus| *bus == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_dir(
-                    bus_class_ino(snap.pnp_buses[bus_idx]),
+                    bus_class_ino(&snap.pnp_buses[bus_idx]),
                     SysDirKind::BusClass {
-                        bus: snap.pnp_buses[bus_idx],
+                        bus: snap.pnp_buses[bus_idx].clone(),
                     },
                 ))
             }
             SysDirKind::BusClass { bus } => match name {
                 "devices" => Ok(mk_dir(
-                    bus_class_devices_ino(bus),
+                    bus_class_devices_ino(&bus),
                     SysDirKind::BusClassDevices { bus },
                 )),
                 _ => Err(VfsError::NotFound),
@@ -2789,7 +2790,7 @@ impl SysDirInodeOps {
                     .position(|dev| dev.bus_type == bus && dev.sysfs_name == name)
                     .ok_or(VfsError::NotFound)?;
                 Ok(mk_link(
-                    bus_class_device_link_ino(bus, name),
+                    bus_class_device_link_ino(&bus, name),
                     format!(
                         "../../../devices/pnp/{}/{}",
                         bus, snap.pnp_devices[idx].sysfs_name
@@ -3173,7 +3174,7 @@ impl SysDirInodeOps {
                 for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        pnp_device_ino(dev.bus_type, &dev.sysfs_name),
+                        pnp_device_ino(&dev.bus_type, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Directory,
                     ) {
@@ -3194,7 +3195,7 @@ impl SysDirInodeOps {
                 for slot in PnpDeviceSlot::ALL {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        pnp_device_slot_ino(bus, &name, slot.to_u64()),
+                        pnp_device_slot_ino(&bus, &name, slot.to_u64()),
                         slot.file_name(),
                         FileType::Regular,
                     ) {
@@ -3384,7 +3385,7 @@ impl SysDirInodeOps {
                     return Vec::new();
                 };
                 vec![mk_dir_entry(
-                    bus_class_devices_ino(bus),
+                    bus_class_devices_ino(&bus),
                     "devices",
                     FileType::Directory,
                 )]
@@ -3397,7 +3398,7 @@ impl SysDirInodeOps {
                 for dev in snap.pnp_devices.iter().filter(|dev| dev.bus_type == bus) {
                     if !push_sysfs_dir_entry(
                         &mut entries,
-                        bus_class_device_link_ino(bus, &dev.sysfs_name),
+                        bus_class_device_link_ino(&bus, &dev.sysfs_name),
                         &dev.sysfs_name,
                         FileType::Symlink,
                     ) {

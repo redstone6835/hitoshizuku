@@ -227,6 +227,34 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
 
 显式注册后的 provider specs 会进入 API 注册表、provider 端口快照、sysfs、绑定预检、同步/异步调用、统计、审计和撤销路径。`device.discovered@1`、`device.claim@1` 和 `vfs.lookup@1` 当前只在测试或子系统显式注册后可用，不再属于启动期内建能力。其余尚未接入真实语义的子系统回调返回 `UNSUPPORTED`，用于稳定完整链路。真实协议必须在对应子系统的 `elm.rs` 内补齐，不能回到 ELM Core 写特殊分支。
 
+### `kernel.device@1` 设备函数表
+
+`kernel.device@1` 是设备子系统直接向原生 ELM 公布的版本化热路径函数表，与上面的设备 provider 控制面互补。它直接投影现有 `PnP -> DeviceFunction -> 可选投影` 模型，不定义 Unix 设备号、inode、`file_operations`，也不把设备写死为字符、块、网络或显示类别。新总线、新身份契约和新 function class 都通过运行期注册进入同一设备图，因此 ELM 可以实现设备发现源、驱动、function 以及这些对象的销毁逻辑。
+
+v1 函数表已经实现下列能力，并通过 grant capability 分别授权：
+
+- `OBSERVE`：枚举设备，查询拓扑、状态、身份、属性、资源和 function。
+- `DRIVER`：注册带 `match/probe/remove` 回调的 PnP 驱动，并在注销时排空回调和解绑设备。
+- `DISCOVERY`：注册动态总线，发布带父子关系的设备，并执行热拔。
+- `FUNCTION` 与 `INVOKE`：注册动态 function class、function 实例和操作契约，并进行受控调用。
+- `MMIO`：按设备资源取得映射句柄，执行带窗口、宽度和对齐校验的 volatile 读写；物理地址零本身是合法资源，只有无法取得有效虚拟映射时才拒绝。
+- `IRQ`：按设备资源索引或先前取得的 MSI handle 注册 top-half/deferred handler；top-half 使用计入 cell 长期栈预算的每 CPU 预分配隔离栈，并在进入前以非阻塞方式取得并发与 CPU 预算。top-half 单次执行硬上限为 `KERNEL_DEVICE_IRQ_TOP_HALF_BUDGET_NS`，执行域禁止重入可能加锁、分配或调度的普通 Kernel API，只能访问预先保存的 ELM 内存和 MMIO 映射；复杂工作必须使用由专用工作线程执行的 deferred handler。MSI handler 建立后才启用设备 MSI，摘除时先屏蔽 MSI、排空回调，再注销 IRQ。
+- `MSI`：PCI 设备通过 BDF、capability 和固件 MSI 路由配置单 vector；动态设备只能使用自身明确声明且 controller/requester 精确匹配的 MSI 资源。仍绑定 IRQ 的 vector 返回 `BUSY`，显式注销 controller 时也会拒绝活跃或在途 vector。PnP 热拔改用“停止接纳并延迟退役”语义：已有 vector 释放后自动摘除 controller，不会留下可见但不可管理的 tombstone。未提供标准 MSI 资源模型的 platform/USB 设备返回 `UNSUPPORTED`。
+- `DMA`：按设备和资源索引取得 per-device `DmaContext`，执行约束内的物理分配、地址转换、同步和释放。PCI 与 platform 使用各自总线建立的 DMA 上下文，动态设备必须显式声明 DMA 资源。
+
+动态发现源发布的标准资源使用以下固定编码；自定义资源从 `KERNEL_DEVICE_RESOURCE_CUSTOM_BASE` 开始，其载荷由对应总线契约解释：
+
+- MMIO：`start` 是物理起点，`length` 是非零窗口长度，标准资源不带 payload。
+- IRQ：`start` 是 line number；`flags[7:0]` 是 IPI、Hardware、Controller 或 Other 类别，`flags[63:32]` 是可选 controller/domain，其余位必须为零。
+- MSI：`start` 是 controller identifier，`length` 是 requester identifier，二者都必须可表示为 `u32`。
+- DMA：`start` 是设备地址上限掩码，`length` 是单 segment 最大长度；flags 表达 coherent、scatter-gather、允许 bounce，以及 `flags[31:16]` 中的非零最大 segment 数。
+
+设备运行时对所有动态对象表执行固定容量和不可回绕句柄分配，PnP 对象编号耗尽也返回错误而不触发 panic。任何外部注册、结果写回或账本提交失败都会撤销已建立的 bus、driver、PnP、function class、function、MMIO、IRQ、MSI 或 DMA 对象；发布失败不会保留不可达 device view。设备进入 `Removing/Gone` 后不再接受新资源，PnP 全局表只按精确 `Arc<PnpDevice>` 摘除旧对象，旧热拔流程不能误删同身份的新枚举对象。通用驱动必须同时声明 `KERNEL_DEVICE_DRIVER_FLAG_GENERIC` 和 `generic` 总线；普通驱动不能借用 `generic` identifier，避免局部总线声明被静默提升为全局兜底匹配器。
+
+动态总线的 publish 和 driver-register 使用在途租约；注销先关闭接纳，再确认没有在途提交、活跃设备或依赖驱动，因而不会产生“总线已删除但对象刚提交”的孤儿。PnP 驱动的 accepting 状态与 Bound 提交在同一注册表临界区内裁决，`match/probe/remove` 都有在途计数；ELM 镜像只有在这些回调、function I/O 和 IRQ 全部排空后才能释放。其它 ELM 仍依赖某个动态总线时，总线 owner 的卸载返回 `BUSY`，而不是强制破坏跨 ELM 依赖。每个 cell generation 只操作本代对象，卸载时依次停止发现和回调、注销驱动、热拔已发布设备、排空 function/IRQ、释放 MMIO/MSI/DMA、注销 function class 和动态总线。
+
+开发框架提供 `#[elm::device_driver]`、`#[elm::device_match]`、`#[elm::device_probe]`、`#[elm::device_remove]`、`#[elm::device_function]`、`#[elm::device_irq]` 和 `#[elm::device_discovery]`。这些 attribute 生成稳定回调符号、请求构造信息和 EKI 元数据，ELM 源码不手写 `extern "C"`。布局摘要覆盖函数表及所有间接参数结构，不允许只对函数指针数组求摘要；当前 v1 摘要为 `10357e37f890e1f17b65bb0240d1bee59b2a63e17be891ba6bf1753141191d2e`。
+
 `device.discovered@1` 的 provider payload 由 `general::dev::elm` 定义：
 
 - `ElmDeviceDiscoveryHeader`：`abi_version`、`record_entry_size`、`record_count`、`total_count`、`flags`、`generation`。
@@ -335,6 +363,10 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 - `PreflightLifecycle` 会返回阻断位、最终状态和受影响的子单元、依赖者、拓展项数量。
 - 内建单元受保护，默认不能被暂停、脱离或替换。
 - 含原生代码的已激活单元支持 pause/resume/detach 生命周期执行器；`ReplaceCell` 已支持 EKI Projection Source 和其他已注册 Projection Source 的迁移式热替换事务。
+
+子系统受托资源使用与 cell 生命周期同一提交边界。每项资源必须向常驻内核登记完整的 `suspend/resume/quiesce/cancel/drain/release` 操作表；暂停按登记逆序执行 `suspend`，恢复按登记正序执行 `resume`，从而先停用依赖者、后停用基础资源，并以相反顺序重建。`suspend` 和 `resume` 都是失败即保持调用前状态的事务回调；中途失败时，注册表会逆向调用已经成功步骤的对偶操作，并在全部回滚成功后恢复 owner 接纳门。子系统内部若无法恢复调用前状态，必须返回 `ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED`；运行时会把资源标记为 `Failed`、保持接纳门关闭并隔离 cell，不能伪装成普通失败或成功暂停。进入 detach 后不再执行可逆恢复，而是允许从 `Active` 或 `Suspended` 状态进入不可逆的四阶段退役。
+
+`kernel.device@1` 为每个 cell generation 登记一个设备聚合受托资源。暂停先关闭动态总线、驱动和 function 的新工作，排空 function/IRQ 在途调用，再禁用 MSI 并注销 IRQ handler；恢复先重新注册 IRQ handler、启用 MSI，最后重新开放总线、驱动和 function。任一步失败都会按相反顺序恢复事务前状态。IRQ 即使在恢复窗口内已经重新接入硬件，也必须等 cell 提交为 `Active` 后才能取得回调执行许可，因此生命周期提交期间不会出现跨状态运行的 top-half。
 
 ## 9. 热插拔与热替换
 
@@ -1251,7 +1283,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项、忙碌租约、provider 队列/保留结果/运行中调用或 native export 被其他单元 import 的目标单元，避免破坏当前拓扑。
 - `ReplaceCell` 已支持所有已注册 Projection Source 的热替换入口：声明式 image 可直接提交 generation 和元数据更新；原生 image 支持迁移式事务，包括新镜像影子装载、初始化期 import 暂存、新 `on_initialize`、旧 `on_quiesce`、旧 `on_migrate_export`、新 `on_migrate_import`、暂存 import 提升、旧 `on_finalize`、失败 abort/finalize、旧代恢复、source 回滚和 generation 提交；Builtin/Memory 外部请求不进入替换事务。
-- RISC-V64 与 LoongArch64 release QEMU 均已通过 175/175 项 `kernel-tests`。测试覆盖启动期 `elm-mgr` 与内建 `eki` 子单元拓扑、显式父单元装载、父子策略继承、祖先授权 execution token、陈旧 policy epoch、锁定策略、层级预算委派与退役释放、内建 ELM 生命周期保护、健康菜单动作、完整 60 项 API 注册表、受签名约束的 delegated Manager 授权、management 命名空间隔离、事件订阅、provider 同步/异步调用、资源预算、EKI Projection Source 装载、声明式与原生生命周期、初始化/替换期受管 import 暂存、mixin handler 精确路由和控制回复、优先级链、Observer 广播和 Exclusive 单挂接、热替换迁移及旧代恢复、受管 import 重绑定、签名信任链与 rollback 拒绝、同步 fault、panic、timer 强制退出、Projection Source 影子切换，以及 Busy 退役失败不污染 source 状态。
+- RISC-V64 与 LoongArch64 release QEMU 均已通过 189/189 项 `kernel-tests`。测试覆盖启动期 `elm-mgr` 与内建 `eki` 子单元拓扑、显式父单元装载、父子策略继承、祖先授权 execution token、陈旧 policy epoch、锁定策略、层级预算委派与退役释放、内建 ELM 生命周期保护、健康菜单动作、完整 60 项 API 注册表、受签名约束的 delegated Manager 授权、management 命名空间隔离、事件订阅、provider 同步/异步调用、资源预算、受托资源暂停/恢复及失败原子回滚、EKI Projection Source 装载、声明式与原生生命周期、初始化/替换期受管 import 暂存、mixin handler 精确路由和控制回复、优先级链、Observer 广播和 Exclusive 单挂接、热替换迁移及旧代恢复、受管 import 重绑定、签名信任链与 rollback 拒绝、同步 fault、panic、timer 强制退出、Projection Source 影子切换、动态 PnP 驱动/function/热拔、真实 `kernel.device@1` grant 调用、probe 中驱动注销竞态、MSI controller/vector 延迟退役、IRQ top-half 执行域隔离，以及 Busy 退役失败不污染 source 状态。
 
 ## 18. 运行期 smoke 测试链路
 
@@ -1510,7 +1542,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 
 当前剩余主线：
 
-- Kernel API 导出：基础服务批次已完整发布 `kernel.memory@1`，包括显式函数表和 Rust `GlobalAlloc` 适配器；后续继续按时间、随机数、日志、执行、设备、VFS/存储、固件和受控 syscall 等独立批次接入版本化函数表，尚未完整实现的 namespace 不得公开占位。
+- Kernel API 导出：基础服务批次已完整发布 `kernel.memory@1`，设备批次已发布 `kernel.device@1`；后续继续按时间、随机数、日志、执行、VFS/存储、固件和受控 syscall 等独立批次接入版本化函数表，尚未完整实现的 namespace 不得公开占位。
 - 子系统 provider：设备、VFS、网络、IRQ、DMA、MMIO 等真实能力必须在各自子系统内部实现并显式注册。
 - 用户态管理工具：补齐面向实际部署的策略编辑、镜像仓库、交互式诊断和运维工作流。
 - ELM 调试与发布生态：补齐调试符号归档、IDE 映射、依赖锁定、可复现发布索引和镜像仓库；attribute、独立仓库模板、双架构 PIE、EKI、签名和运行期装载链路已经具备。

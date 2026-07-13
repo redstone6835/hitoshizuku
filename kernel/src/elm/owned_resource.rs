@@ -1,14 +1,15 @@
 //! ELM 子系统资源所有权注册表。
 //!
-//! 注册表只保存所有权和退役操作表。回调始终在释放注册表锁后执行，避免子系统
-//! 回调重入 Core 或睡眠时持有自旋锁。单元一旦进入排空阶段就永久关闭该代际的
-//! 新资源登记；失败单元保持隔离，不能重新激活旧回调。
+//! 注册表只保存所有权和生命周期操作表。回调始终在释放注册表锁后执行，避免
+//! 子系统回调重入 Core 或睡眠时持有自旋锁。暂停会暂时关闭该代际的新资源登记，
+//! 恢复事务成功后重新开放；进入不可逆排空阶段后则永久关闭。失败单元保持隔离，
+//! 不能重新激活旧回调。
 
 use alloc::vec::Vec;
 
 use elm_model::{
-    ElmId, ElmOwnedResourceKind, ElmOwnedResourceOpsV1, ElmOwnedResourceSnapshotV1,
-    ElmOwnedResourceState, Generation,
+    ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED, ElmId, ElmOwnedResourceKind, ElmOwnedResourceOpsV1,
+    ElmOwnedResourceSnapshotV1, ElmOwnedResourceState, Generation,
 };
 use sched::sync::Spinlock;
 
@@ -25,11 +26,17 @@ pub(crate) enum OwnedResourceError {
     Busy,
     Capacity,
     Callback(i32),
+    Rollback(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OwnedResourceDrainReport {
     pub drained: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnedResourceTransitionReport {
+    pub transitioned: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +288,193 @@ pub(crate) fn count_owned_by(owner: ElmId, generation: Generation) -> usize {
         .count()
 }
 
+pub(crate) fn suspend_owner(
+    owner: ElmId,
+    generation: Generation,
+) -> Result<OwnedResourceTransitionReport, OwnedResourceError> {
+    let work = {
+        let mut registry = OWNED_RESOURCES.lock();
+        let Some(owner_index) = registry.owner_index(owner) else {
+            return Err(OwnedResourceError::NotFound);
+        };
+        if registry.owners[owner_index].generation != generation {
+            return Err(OwnedResourceError::StaleGeneration);
+        }
+        if !registry.owners[owner_index].accepting
+            || registry.resources.iter().any(|resource| {
+                resource.owner == owner
+                    && resource.generation == generation
+                    && resource.state != ElmOwnedResourceState::Active
+            })
+        {
+            return Err(OwnedResourceError::Busy);
+        }
+        let count = registry
+            .resources
+            .iter()
+            .filter(|resource| resource.owner == owner && resource.generation == generation)
+            .count();
+        let mut work = Vec::new();
+        work.try_reserve_exact(count)
+            .map_err(|_| OwnedResourceError::Capacity)?;
+        registry.owners[owner_index].accepting = false;
+        for resource in registry
+            .resources
+            .iter_mut()
+            .rev()
+            .filter(|resource| resource.owner == owner && resource.generation == generation)
+        {
+            resource.state = ElmOwnedResourceState::Suspending;
+            resource.last_status = 0;
+            work.push(DrainWork {
+                id: resource.id,
+                owner,
+                generation,
+                handle: resource.handle,
+                ops: resource.ops,
+            });
+        }
+        work
+    };
+
+    for (index, item) in work.iter().enumerate() {
+        if let Err(status) = (item.ops.suspend)(item.owner, item.generation, item.handle) {
+            let callback_rollback_failed = status == ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED;
+            set_resource_state(
+                item,
+                if callback_rollback_failed {
+                    ElmOwnedResourceState::Failed
+                } else {
+                    ElmOwnedResourceState::Active
+                },
+                status,
+            )?;
+            let mut rollback_error = callback_rollback_failed.then_some(status);
+            // 失败回调按契约保持调用前状态，只回滚此前已经成功暂停的资源。
+            for rollback in work[..index].iter().rev() {
+                let result =
+                    (rollback.ops.resume)(rollback.owner, rollback.generation, rollback.handle);
+                let (state, last_status) = match result {
+                    Ok(()) => (ElmOwnedResourceState::Active, 0),
+                    Err(rollback_status) => {
+                        rollback_error.get_or_insert(rollback_status);
+                        (ElmOwnedResourceState::Failed, rollback_status)
+                    }
+                };
+                set_resource_state(rollback, state, last_status)?;
+            }
+            for untouched in &work[index + 1..] {
+                set_resource_state(untouched, ElmOwnedResourceState::Active, 0)?;
+            }
+            let mut registry = OWNED_RESOURCES.lock();
+            if let Some(owner_index) = registry.owner_index(owner) {
+                registry.owners[owner_index].accepting = rollback_error.is_none();
+            }
+            return Err(match rollback_error {
+                Some(rollback_status) => OwnedResourceError::Rollback(rollback_status),
+                None => OwnedResourceError::Callback(status),
+            });
+        }
+        set_resource_state(item, ElmOwnedResourceState::Suspended, 0)?;
+    }
+    Ok(OwnedResourceTransitionReport {
+        transitioned: work.len(),
+    })
+}
+
+pub(crate) fn resume_owner(
+    owner: ElmId,
+    generation: Generation,
+) -> Result<OwnedResourceTransitionReport, OwnedResourceError> {
+    let work = {
+        let mut registry = OWNED_RESOURCES.lock();
+        let Some(owner_index) = registry.owner_index(owner) else {
+            return Err(OwnedResourceError::NotFound);
+        };
+        if registry.owners[owner_index].generation != generation {
+            return Err(OwnedResourceError::StaleGeneration);
+        }
+        if registry.owners[owner_index].accepting
+            || registry.resources.iter().any(|resource| {
+                resource.owner == owner
+                    && resource.generation == generation
+                    && resource.state != ElmOwnedResourceState::Suspended
+            })
+        {
+            return Err(OwnedResourceError::Busy);
+        }
+        let count = registry
+            .resources
+            .iter()
+            .filter(|resource| resource.owner == owner && resource.generation == generation)
+            .count();
+        let mut work = Vec::new();
+        work.try_reserve_exact(count)
+            .map_err(|_| OwnedResourceError::Capacity)?;
+        for resource in registry
+            .resources
+            .iter_mut()
+            .filter(|resource| resource.owner == owner && resource.generation == generation)
+        {
+            resource.state = ElmOwnedResourceState::Resuming;
+            resource.last_status = 0;
+            work.push(DrainWork {
+                id: resource.id,
+                owner,
+                generation,
+                handle: resource.handle,
+                ops: resource.ops,
+            });
+        }
+        work
+    };
+
+    for (index, item) in work.iter().enumerate() {
+        if let Err(status) = (item.ops.resume)(item.owner, item.generation, item.handle) {
+            let callback_rollback_failed = status == ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED;
+            set_resource_state(
+                item,
+                if callback_rollback_failed {
+                    ElmOwnedResourceState::Failed
+                } else {
+                    ElmOwnedResourceState::Suspended
+                },
+                status,
+            )?;
+            let mut rollback_error = callback_rollback_failed.then_some(status);
+            // 失败回调按契约保持调用前状态，只回滚此前已经成功恢复的资源。
+            for rollback in work[..index].iter().rev() {
+                let result =
+                    (rollback.ops.suspend)(rollback.owner, rollback.generation, rollback.handle);
+                let (state, last_status) = match result {
+                    Ok(()) => (ElmOwnedResourceState::Suspended, 0),
+                    Err(rollback_status) => {
+                        rollback_error.get_or_insert(rollback_status);
+                        (ElmOwnedResourceState::Failed, rollback_status)
+                    }
+                };
+                set_resource_state(rollback, state, last_status)?;
+            }
+            for untouched in &work[index + 1..] {
+                set_resource_state(untouched, ElmOwnedResourceState::Suspended, 0)?;
+            }
+            return Err(match rollback_error {
+                Some(rollback_status) => OwnedResourceError::Rollback(rollback_status),
+                None => OwnedResourceError::Callback(status),
+            });
+        }
+        set_resource_state(item, ElmOwnedResourceState::Active, 0)?;
+    }
+    let mut registry = OWNED_RESOURCES.lock();
+    let Some(owner_index) = registry.owner_index(owner) else {
+        return Err(OwnedResourceError::NotFound);
+    };
+    registry.owners[owner_index].accepting = true;
+    Ok(OwnedResourceTransitionReport {
+        transitioned: work.len(),
+    })
+}
+
 pub(crate) fn stop_accepting(
     owner: ElmId,
     generation: Generation,
@@ -311,7 +505,10 @@ pub(crate) fn drain_owner(
         if registry.resources.iter().any(|resource| {
             resource.owner == owner
                 && resource.generation == generation
-                && resource.state != ElmOwnedResourceState::Active
+                && !matches!(
+                    resource.state,
+                    ElmOwnedResourceState::Active | ElmOwnedResourceState::Suspended
+                )
         }) {
             return Err(OwnedResourceError::Busy);
         }
@@ -427,6 +624,24 @@ fn run_stage(
             Err(OwnedResourceError::Callback(status))
         }
     }
+}
+
+fn set_resource_state(
+    item: &DrainWork,
+    state: ElmOwnedResourceState,
+    last_status: i32,
+) -> Result<(), OwnedResourceError> {
+    let mut registry = OWNED_RESOURCES.lock();
+    let Some(index) = registry.resource_index(item.id) else {
+        return Err(OwnedResourceError::NotFound);
+    };
+    let resource = &mut registry.resources[index];
+    if resource.owner != item.owner || resource.generation != item.generation {
+        return Err(OwnedResourceError::StaleGeneration);
+    }
+    resource.state = state;
+    resource.last_status = last_status;
+    Ok(())
 }
 
 pub(crate) fn snapshots() -> Result<Vec<ElmOwnedResourceSnapshotV1>, OwnedResourceError> {

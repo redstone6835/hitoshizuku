@@ -17,7 +17,7 @@
 //! // Bus 层：扫描到设备后创建 PnpDevice + PciDevice
 //! let info = Box::new(PciInfo { vendor: 0x8086, device_id: 0x100e, ... });
 //! let id = PnpId::Pci { segment: 0, bus: 1, device: 0, function: 0 };
-//! let pnp = PnpDevice::new(id, "pci-0000:01:00.0".into(), info);
+//! let pnp = PnpDevice::new(id, "pci-0000:01:00.0".into(), info)?;
 //! let pci_dev = PciDevice::from_pnp(&pnp).unwrap();
 //!
 //! // 驱动 probe 中使用 PciDevice
@@ -1031,6 +1031,12 @@ impl PciDevice {
         Ok(())
     }
 
+    /// 禁用已经完成 message 编程、但仍保留 vector 所有权的 MSI。
+    pub fn try_disable_configured_msi(&self, handle: PciMsiHandle) -> Result<(), PciMsiError> {
+        self.try_msi_disable(handle.cap_offset)?;
+        Ok(())
+    }
+
     pub fn bar_count(&self) -> usize {
         self.info().map(PciInfo::bar_count).unwrap_or(0)
     }
@@ -1228,7 +1234,7 @@ fn rollback_pci_registration(dev: &Arc<PnpDevice>, inserted: bool) {
     if let Some(parent) = dev.parent() {
         parent.detach_child(dev);
     }
-    PNP_DEVICES.remove(&dev.id);
+    PNP_DEVICES.remove_exact(dev);
 }
 
 impl PciDevice {
@@ -1254,7 +1260,7 @@ impl PciDevice {
             .ok_or(PciRegisterError::NotPresent)?;
 
         let name = pci_hardware_name(segment, bus, device, function);
-        let new_dev = PnpDevice::new(id, name, Box::new(info));
+        let new_dev = PnpDevice::new(id, name, Box::new(info)).map_err(PciRegisterError::Pnp)?;
         let registration = PNP_DEVICES
             .get_or_insert(Arc::clone(&new_dev))
             .map_err(PciRegisterError::Pnp)?;
@@ -1337,7 +1343,8 @@ impl PciDevice {
             id,
             pci_hardware_name(segment, bus, device, function),
             Box::new(info),
-        );
+        )
+        .ok()?;
         Some(Self { pnp })
     }
 

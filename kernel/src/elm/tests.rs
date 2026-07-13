@@ -57,15 +57,16 @@ use elm_model::{
     ElmMgrRelationKind, ElmMgrResponseHeader, ElmMgrSubscribedEventReadHeader,
     ElmMgrSubscribedEventReadRequest, ElmMixinMode, ElmName, ElmNativeCapabilityHeader,
     ElmNativeEntryFrameV1, ElmNexusBindPlanResponse, ElmNexusBindRequest, ElmNexusUnbindRequest,
-    ElmOwnedResourceKind, ElmOwnedResourceOpsV1, ElmPanicStrategy, ElmPortAccessPolicy,
-    ElmPrincipal, ElmPrincipalKind, ElmProjectionSourceRequest, ElmProviderAsyncCancelRequest,
-    ElmProviderAsyncPollRequest, ElmProviderAsyncState, ElmProviderAsyncSubmitRequest,
-    ElmProviderInvokeRequest, ElmProviderInvokeResponse, ElmProviderPortRegisterRequest,
-    ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader, ElmProviderQueueStatsHeader,
-    ElmProviderSnapshotHeader, ElmProviderSnapshotRequest, ElmReplaceCellRequestV1, ElmReplyFrame,
-    ElmResourceBudget, ElmResourceBudgetUpdateRequest, ElmResult, ElmRustAbiFingerprintV1,
-    ElmState, ElmTodoRegistryHeader, ElmTodoRegistryRecord, ElmTrustAnchor, ElmTrustRuntimeInfoV1,
-    ElmVersion, FlowDirection, FlowMode, Generation, canonical_ebi_digest, sha256, state_code,
+    ElmOwnedResourceKind, ElmOwnedResourceOpsV1, ElmOwnedResourceState, ElmPanicStrategy,
+    ElmPortAccessPolicy, ElmPrincipal, ElmPrincipalKind, ElmProjectionSourceRequest,
+    ElmProviderAsyncCancelRequest, ElmProviderAsyncPollRequest, ElmProviderAsyncState,
+    ElmProviderAsyncSubmitRequest, ElmProviderInvokeRequest, ElmProviderInvokeResponse,
+    ElmProviderPortRegisterRequest, ElmProviderPortRegisterResponse, ElmProviderPortStatsHeader,
+    ElmProviderQueueStatsHeader, ElmProviderSnapshotHeader, ElmProviderSnapshotRequest,
+    ElmReplaceCellRequestV1, ElmReplyFrame, ElmResourceBudget, ElmResourceBudgetUpdateRequest,
+    ElmResult, ElmRustAbiFingerprintV1, ElmState, ElmTodoRegistryHeader, ElmTodoRegistryRecord,
+    ElmTrustAnchor, ElmTrustRuntimeInfoV1, ElmVersion, FlowDirection, FlowMode, Generation,
+    canonical_ebi_digest, sha256, state_code,
 };
 
 use super::core::{
@@ -75,6 +76,7 @@ use super::core::{
 use super::mgr_channel::{dispatch_mgr_call_on_core, dispatch_mgr_call_on_core_as};
 
 static OWNED_RESOURCE_TRACE: AtomicU64 = AtomicU64::new(0);
+static OWNED_RESOURCE_FAILURE_MODE: AtomicU64 = AtomicU64::new(0);
 
 #[ktest]
 fn elm_kernel_api_registry_grants_declared_namespace() {
@@ -265,6 +267,14 @@ fn test_resource_quiesce(_: ElmId, _: Generation, handle: u64) -> Result<(), i32
     push_owned_resource_trace(1, handle)
 }
 
+fn test_resource_suspend(_: ElmId, _: Generation, handle: u64) -> Result<(), i32> {
+    push_owned_resource_trace(5, handle)
+}
+
+fn test_resource_resume(_: ElmId, _: Generation, handle: u64) -> Result<(), i32> {
+    push_owned_resource_trace(6, handle)
+}
+
 fn test_resource_cancel(_: ElmId, _: Generation, handle: u64) -> Result<(), i32> {
     push_owned_resource_trace(2, handle)
 }
@@ -278,6 +288,39 @@ fn test_resource_release(_: ElmId, _: Generation, handle: u64) -> Result<(), i32
 }
 
 static TEST_OWNED_RESOURCE_OPS: ElmOwnedResourceOpsV1 = ElmOwnedResourceOpsV1::new(
+    test_resource_suspend,
+    test_resource_resume,
+    test_resource_quiesce,
+    test_resource_cancel,
+    test_resource_drain,
+    test_resource_release,
+);
+
+fn test_transactional_resource_suspend(
+    owner: ElmId,
+    generation: Generation,
+    handle: u64,
+) -> Result<(), i32> {
+    if OWNED_RESOURCE_FAILURE_MODE.load(Ordering::Acquire) == 1 && handle == 1 {
+        return Err(-77);
+    }
+    test_resource_suspend(owner, generation, handle)
+}
+
+fn test_transactional_resource_resume(
+    owner: ElmId,
+    generation: Generation,
+    handle: u64,
+) -> Result<(), i32> {
+    if OWNED_RESOURCE_FAILURE_MODE.load(Ordering::Acquire) == 2 && handle == 2 {
+        return Err(-78);
+    }
+    test_resource_resume(owner, generation, handle)
+}
+
+static TEST_TRANSACTIONAL_RESOURCE_OPS: ElmOwnedResourceOpsV1 = ElmOwnedResourceOpsV1::new(
+    test_transactional_resource_suspend,
+    test_transactional_resource_resume,
     test_resource_quiesce,
     test_resource_cancel,
     test_resource_drain,
@@ -299,6 +342,210 @@ impl general::dev::function::DeviceFunction for TestElmDeviceFunction {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+const SYNTHETIC_DEVICE_BUS_ID: u64 = 0xfeed_0000_0000_0011;
+const SYNTHETIC_DEVICE_RESOURCE_ID: u64 = 0xfeed_0000_0000_0012;
+const SELF_UNREGISTER_DEVICE_BUS_ID: u64 = 0xfeed_0000_0000_0013;
+const SYNTHETIC_MSI_CONTROLLER_ID: u32 = 0xfe00_0014;
+const RETIRING_MSI_CONTROLLER_ID: u32 = 0xfe00_0015;
+
+struct SyntheticDeviceFunction {
+    gone: Arc<AtomicUsize>,
+}
+
+impl general::dev::function::DeviceFunction for SyntheticDeviceFunction {
+    fn class_id(&self) -> general::dev::function::DeviceClassId {
+        general::dev::function::DeviceClassId::new("elm.synthetic.function")
+    }
+
+    fn dev_name(&self) -> &str {
+        "elm-synthetic-function"
+    }
+
+    fn mark_gone(&self) {
+        self.gone.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct SyntheticDeviceResource {
+    released: Arc<AtomicUsize>,
+}
+
+impl general::dev::pnp::PnpResource for SyntheticDeviceResource {
+    fn kind(&self) -> general::dev::pnp::PnpResourceKind {
+        general::dev::pnp::PnpResourceKind::Other("elm-synthetic-resource")
+    }
+
+    fn label(&self) -> &'static str {
+        "elm-synthetic-resource"
+    }
+
+    fn identity(&self) -> Option<u64> {
+        Some(SYNTHETIC_DEVICE_RESOURCE_ID)
+    }
+
+    fn release(
+        self: alloc::boxed::Box<Self>,
+    ) -> Result<(), general::dev::pnp::PnpResourceReleaseError> {
+        self.released.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+struct SyntheticDeviceDriver {
+    probes: Arc<AtomicUsize>,
+    removes: Arc<AtomicUsize>,
+    released: Arc<AtomicUsize>,
+    function_gone: Arc<AtomicUsize>,
+}
+
+impl general::dev::pnp::PnpDriver for SyntheticDeviceDriver {
+    fn name(&self) -> &str {
+        "elm-synthetic-driver"
+    }
+
+    fn bus_type(&self) -> general::dev::pnp::BusType {
+        general::dev::pnp::BusType::dynamic(SYNTHETIC_DEVICE_BUS_ID)
+    }
+
+    fn matches(
+        &self,
+        id: &general::dev::pnp::PnpId,
+        info: &dyn general::dev::pnp::PnpBusInfo,
+    ) -> bool {
+        let expected = general::dev::pnp::BusType::dynamic(SYNTHETIC_DEVICE_BUS_ID);
+        info.bus_type() == expected
+            && matches!(
+                id,
+                general::dev::pnp::PnpId::Dynamic {
+                    bus,
+                    contract,
+                    identity
+                } if *bus == expected
+                    && contract.as_ref() == "elm.synthetic.identity"
+                    && identity.as_ref() == b"synthetic-device"
+            )
+    }
+
+    fn probe(
+        &self,
+        device: &Arc<general::dev::pnp::PnpDevice>,
+    ) -> Result<(), general::dev::pnp::PnpError> {
+        self.probes.fetch_add(1, Ordering::AcqRel);
+        device.own_resource(SyntheticDeviceResource {
+            released: Arc::clone(&self.released),
+        })?;
+        let function: Arc<dyn general::dev::function::DeviceFunction> =
+            Arc::new(SyntheticDeviceFunction {
+                gone: Arc::clone(&self.function_gone),
+            });
+        device.register_function(function)
+    }
+
+    fn remove(&self, _device: &Arc<general::dev::pnp::PnpDevice>) {
+        self.removes.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct SyntheticDeviceFactory {
+    driver: Arc<SyntheticDeviceDriver>,
+}
+
+struct SelfUnregisteringDriver {
+    handle: sched::sync::Spinlock<Option<general::dev::pnp::DriverHandle>>,
+    released: Arc<AtomicUsize>,
+}
+
+impl general::dev::pnp::PnpDriver for SelfUnregisteringDriver {
+    fn name(&self) -> &str {
+        "elm-self-unregister-driver"
+    }
+
+    fn bus_type(&self) -> general::dev::pnp::BusType {
+        general::dev::pnp::BusType::dynamic(SELF_UNREGISTER_DEVICE_BUS_ID)
+    }
+
+    fn matches(
+        &self,
+        _id: &general::dev::pnp::PnpId,
+        info: &dyn general::dev::pnp::PnpBusInfo,
+    ) -> bool {
+        info.bus_type() == self.bus_type()
+    }
+
+    fn probe(
+        &self,
+        device: &Arc<general::dev::pnp::PnpDevice>,
+    ) -> Result<(), general::dev::pnp::PnpError> {
+        device.own_resource(SyntheticDeviceResource {
+            released: Arc::clone(&self.released),
+        })?;
+        let handle = self
+            .handle
+            .lock()
+            .ok_or(general::dev::pnp::PnpError::InvalidState)?;
+        general::dev::pnp::PNP_DRIVERS.unregister(handle)
+    }
+
+    fn remove(&self, _device: &Arc<general::dev::pnp::PnpDevice>) {}
+}
+
+struct SelfUnregisteringFactory {
+    driver: Arc<SelfUnregisteringDriver>,
+}
+
+impl general::dev::pnp::DriverFactory for SelfUnregisteringFactory {
+    fn name(&self) -> &str {
+        general::dev::pnp::PnpDriver::name(self.driver.as_ref())
+    }
+
+    fn create(
+        &self,
+        _context: &general::dev::pnp::DevInitContext,
+    ) -> Result<Arc<dyn general::dev::pnp::PnpDriver>, general::dev::pnp::PnpError> {
+        Ok(Arc::clone(&self.driver) as Arc<dyn general::dev::pnp::PnpDriver>)
+    }
+}
+
+struct SyntheticMsiController {
+    allocations: Arc<AtomicUsize>,
+    releases: Arc<AtomicUsize>,
+}
+
+impl general::dev::msi::MsiController for SyntheticMsiController {
+    fn allocate_vector(&self, requester: u32) -> Option<general::dev::msi::MsiVector> {
+        self.allocations.fetch_add(1, Ordering::AcqRel);
+        Some(general::dev::msi::MsiVector {
+            hwirq: requester,
+            line: general::dev::irq::IrqLine::Other(requester as usize),
+            message: general::dev::msi::MsiMessage {
+                address: 0xfee0_0000,
+                data: requester,
+            },
+        })
+    }
+
+    fn free_vector(&self, _hwirq: u32) {
+        self.releases.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl general::dev::pnp::DriverFactory for SyntheticDeviceFactory {
+    fn name(&self) -> &str {
+        general::dev::pnp::PnpDriver::name(self.driver.as_ref())
+    }
+
+    fn create(
+        &self,
+        _context: &general::dev::pnp::DevInitContext,
+    ) -> Result<Arc<dyn general::dev::pnp::PnpDriver>, general::dev::pnp::PnpError> {
+        Ok(Arc::clone(&self.driver) as Arc<dyn general::dev::pnp::PnpDriver>)
     }
 }
 
@@ -1846,8 +2093,25 @@ fn elm_owned_resources_block_replace_and_drain_before_detach() {
         cell.0,
         ElmLifecycleAction::Pause,
     ));
-    assert_eq!(pause.allowed, 0);
-    assert_ne!(pause.blockers & ELM_POLICY_BLOCK_LEASE_BUSY, 0);
+    assert_eq!(pause.allowed, 1);
+    assert_eq!(pause.blockers, 0);
+    let paused = core.pause_cell(cell);
+    assert_eq!(paused.status, ELM_MGR_STATUS_OK);
+    assert_eq!(paused.final_state, state_code(ElmState::Paused));
+    assert_eq!(OWNED_RESOURCE_TRACE.load(Ordering::Acquire), 5_251);
+    let paused_owner = super::owned_resource::owner_snapshot(cell).unwrap();
+    assert!(!paused_owner.accepting);
+    assert_eq!(paused_owner.resource_count, 2);
+
+    let resumed = core.resume_cell(cell);
+    assert_eq!(resumed.status, ELM_MGR_STATUS_OK);
+    assert_eq!(resumed.final_state, state_code(ElmState::Active));
+    assert_eq!(OWNED_RESOURCE_TRACE.load(Ordering::Acquire), 52_516_162);
+    let active_owner = super::owned_resource::owner_snapshot(cell).unwrap();
+    assert!(active_owner.accepting);
+    assert_eq!(active_owner.resource_count, 2);
+
+    OWNED_RESOURCE_TRACE.store(0, Ordering::Release);
 
     let detached = core.detach_cell(cell);
     assert_eq!(detached.status, ELM_MGR_STATUS_OK);
@@ -1862,6 +2126,114 @@ fn elm_owned_resources_block_replace_and_drain_before_detach() {
         0
     );
     assert!(core.cells().iter().all(|runtime| runtime.id != cell));
+}
+
+#[ktest]
+fn elm_owned_resource_pause_and_resume_failures_rollback_atomically() {
+    OWNED_RESOURCE_TRACE.store(0, Ordering::Release);
+    OWNED_RESOURCE_FAILURE_MODE.store(0, Ordering::Release);
+    let mut core = ElmCore::new();
+    core.init_builtin_mgr().unwrap();
+    let loaded = core.load_ebi_unit(menu_unit("owned-resource-rollback-cell"), ElmEbiArch::Any);
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let cell = ElmId(loaded.cell_id);
+
+    let first = super::owned_resource::register(
+        cell,
+        Generation::FIRST,
+        ElmOwnedResourceKind::Timer,
+        1,
+        TEST_TRANSACTIONAL_RESOURCE_OPS,
+    )
+    .unwrap();
+    let second = super::owned_resource::register(
+        cell,
+        Generation::FIRST,
+        ElmOwnedResourceKind::WorkItem,
+        2,
+        TEST_TRANSACTIONAL_RESOURCE_OPS,
+    )
+    .unwrap();
+
+    OWNED_RESOURCE_FAILURE_MODE.store(1, Ordering::Release);
+    assert_eq!(
+        super::owned_resource::suspend_owner(cell, Generation::FIRST),
+        Err(super::owned_resource::OwnedResourceError::Callback(-77))
+    );
+    assert!(
+        super::owned_resource::owner_snapshot(cell)
+            .unwrap()
+            .accepting
+    );
+    let snapshots = super::owned_resource::snapshots().unwrap();
+    assert_eq!(
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.owner_cell_id == cell.0)
+            .count(),
+        2
+    );
+    assert!(
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.owner_cell_id == cell.0)
+            .all(|snapshot| snapshot.state == ElmOwnedResourceState::Active as u32)
+    );
+
+    OWNED_RESOURCE_FAILURE_MODE.store(0, Ordering::Release);
+    assert_eq!(
+        super::owned_resource::suspend_owner(cell, Generation::FIRST)
+            .unwrap()
+            .transitioned,
+        2
+    );
+    assert!(
+        !super::owned_resource::owner_snapshot(cell)
+            .unwrap()
+            .accepting
+    );
+
+    OWNED_RESOURCE_FAILURE_MODE.store(2, Ordering::Release);
+    assert_eq!(
+        super::owned_resource::resume_owner(cell, Generation::FIRST),
+        Err(super::owned_resource::OwnedResourceError::Callback(-78))
+    );
+    assert!(
+        !super::owned_resource::owner_snapshot(cell)
+            .unwrap()
+            .accepting
+    );
+    let snapshots = super::owned_resource::snapshots().unwrap();
+    assert_eq!(
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.owner_cell_id == cell.0)
+            .count(),
+        2
+    );
+    assert!(
+        snapshots
+            .iter()
+            .filter(|snapshot| snapshot.owner_cell_id == cell.0)
+            .all(|snapshot| snapshot.state == ElmOwnedResourceState::Suspended as u32)
+    );
+
+    OWNED_RESOURCE_FAILURE_MODE.store(0, Ordering::Release);
+    assert_eq!(
+        super::owned_resource::resume_owner(cell, Generation::FIRST)
+            .unwrap()
+            .transitioned,
+        2
+    );
+    assert!(
+        super::owned_resource::owner_snapshot(cell)
+            .unwrap()
+            .accepting
+    );
+    super::owned_resource::release(first, cell, Generation::FIRST).unwrap();
+    super::owned_resource::release(second, cell, Generation::FIRST).unwrap();
+    assert_eq!(core.detach_cell(cell).status, ELM_MGR_STATUS_OK);
+    OWNED_RESOURCE_FAILURE_MODE.store(0, Ordering::Release);
 }
 
 #[ktest]
@@ -4887,6 +5259,351 @@ fn elm_device_discovery_provider_returns_real_snapshot_and_query_reply() {
 }
 
 #[ktest]
+fn elm_device_model_completes_dynamic_probe_unbind_and_hot_remove() {
+    let bus = general::dev::pnp::BusType::dynamic(SYNTHETIC_DEVICE_BUS_ID);
+    let id = general::dev::pnp::PnpId::dynamic(bus, "elm.synthetic.identity", b"synthetic-device")
+        .unwrap();
+    let info = general::dev::pnp::DynamicPnpBusInfo::new(
+        bus,
+        "elm-synthetic-bus",
+        "elm.synthetic.identity",
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let device = general::dev::pnp::PnpDevice::new(
+        id,
+        alloc::string::String::from("elm-synthetic-device").into_boxed_str(),
+        alloc::boxed::Box::new(info),
+    )
+    .unwrap();
+    let registration = general::dev::pnp::PNP_DEVICES
+        .get_or_insert(Arc::clone(&device))
+        .unwrap();
+    assert!(registration.inserted);
+
+    let probes = Arc::new(AtomicUsize::new(0));
+    let removes = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicUsize::new(0));
+    let function_gone = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(SyntheticDeviceDriver {
+        probes: Arc::clone(&probes),
+        removes: Arc::clone(&removes),
+        released: Arc::clone(&released),
+        function_gone: Arc::clone(&function_gone),
+    });
+    let factory: Arc<dyn general::dev::pnp::DriverFactory> =
+        Arc::new(SyntheticDeviceFactory { driver });
+    let driver_handle = general::dev::pnp::PNP_DRIVERS
+        .register_factory(factory)
+        .unwrap();
+
+    assert_eq!(device.state(), general::dev::pnp::PnpState::Bound);
+    assert_eq!(probes.load(Ordering::Acquire), 1);
+    assert_eq!(device.functions().len(), 1);
+    assert_eq!(device.owned_resources().len(), 1);
+
+    general::dev::pnp::PNP_DRIVERS
+        .unregister(driver_handle)
+        .unwrap();
+    assert_eq!(device.state(), general::dev::pnp::PnpState::Discovered);
+    assert_eq!(removes.load(Ordering::Acquire), 1);
+    assert_eq!(released.load(Ordering::Acquire), 1);
+    assert_eq!(function_gone.load(Ordering::Acquire), 1);
+    assert!(device.functions().is_empty());
+    assert!(device.owned_resources().is_empty());
+
+    device.remove_device();
+    assert_eq!(device.state(), general::dev::pnp::PnpState::Gone);
+    assert!(general::dev::pnp::PNP_DEVICES.lookup(&device.id).is_none());
+}
+
+#[ktest]
+fn elm_pnp_probe_cannot_rebind_a_driver_removed_during_callback() {
+    let released = Arc::new(AtomicUsize::new(0));
+    let driver = Arc::new(SelfUnregisteringDriver {
+        handle: sched::sync::Spinlock::new(None),
+        released: Arc::clone(&released),
+    });
+    let factory: Arc<dyn general::dev::pnp::DriverFactory> = Arc::new(SelfUnregisteringFactory {
+        driver: Arc::clone(&driver),
+    });
+    let handle = general::dev::pnp::PNP_DRIVERS
+        .register_factory(factory)
+        .unwrap();
+    *driver.handle.lock() = Some(handle);
+
+    let bus = general::dev::pnp::BusType::dynamic(SELF_UNREGISTER_DEVICE_BUS_ID);
+    let id = general::dev::pnp::PnpId::dynamic(
+        bus,
+        "elm.self-unregister.identity",
+        b"self-unregister-device",
+    )
+    .unwrap();
+    let info = general::dev::pnp::DynamicPnpBusInfo::new(
+        bus,
+        "elm-self-unregister-bus",
+        "elm.self-unregister.identity",
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let device = general::dev::pnp::PnpDevice::new(
+        id,
+        alloc::string::String::from("elm-self-unregister-device").into_boxed_str(),
+        alloc::boxed::Box::new(info),
+    )
+    .unwrap();
+    assert!(
+        general::dev::pnp::PNP_DEVICES
+            .get_or_insert(Arc::clone(&device))
+            .unwrap()
+            .inserted
+    );
+
+    assert_eq!(
+        general::dev::pnp::PNP_DRIVERS.probe_device(&device),
+        Err(general::dev::pnp::PnpError::NoDriver)
+    );
+    assert_eq!(device.state(), general::dev::pnp::PnpState::Discovered);
+    assert!(!device.is_bound());
+    assert!(device.owned_resources().is_empty());
+    assert_eq!(released.load(Ordering::Acquire), 1);
+    assert_eq!(
+        general::dev::pnp::PNP_DRIVERS.unregister(handle),
+        Err(general::dev::pnp::PnpError::NoDriver)
+    );
+    device.remove_device();
+}
+
+#[ktest]
+fn elm_msi_controller_waits_for_live_vectors_before_unregister() {
+    let allocations = Arc::new(AtomicUsize::new(0));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let controller: Arc<dyn general::dev::msi::MsiController> = Arc::new(SyntheticMsiController {
+        allocations: Arc::clone(&allocations),
+        releases: Arc::clone(&releases),
+    });
+    let controller_handle =
+        general::dev::msi::register_msi_controller(SYNTHETIC_MSI_CONTROLLER_ID, controller)
+            .unwrap();
+    let vector = general::dev::msi::allocate_msi(SYNTHETIC_MSI_CONTROLLER_ID, 41).unwrap();
+    assert_eq!(allocations.load(Ordering::Acquire), 1);
+    assert_eq!(
+        general::dev::msi::unregister_msi_controller(controller_handle),
+        Err(general::dev::msi::MsiError::Busy)
+    );
+    general::dev::msi::free_msi(vector).unwrap();
+    assert_eq!(releases.load(Ordering::Acquire), 1);
+    assert_eq!(
+        general::dev::msi::free_msi(vector),
+        Err(general::dev::msi::MsiError::NotFound)
+    );
+    general::dev::msi::unregister_msi_controller(controller_handle).unwrap();
+}
+
+#[ktest]
+fn elm_msi_pnp_resource_retires_after_last_vector() {
+    let allocations = Arc::new(AtomicUsize::new(0));
+    let releases = Arc::new(AtomicUsize::new(0));
+    let controller: Arc<dyn general::dev::msi::MsiController> = Arc::new(SyntheticMsiController {
+        allocations: Arc::clone(&allocations),
+        releases: Arc::clone(&releases),
+    });
+    let controller_handle =
+        general::dev::msi::register_msi_controller(RETIRING_MSI_CONTROLLER_ID, controller).unwrap();
+    let vector = general::dev::msi::allocate_msi(RETIRING_MSI_CONTROLLER_ID, 42).unwrap();
+    let resource =
+        general::dev::msi::controller_pnp_resource(controller_handle, "elm-test-msi-controller");
+
+    general::dev::pnp::PnpResource::release(alloc::boxed::Box::new(resource)).unwrap();
+    assert_eq!(
+        general::dev::msi::allocate_msi(RETIRING_MSI_CONTROLLER_ID, 43),
+        Err(general::dev::msi::MsiError::NotFound)
+    );
+
+    general::dev::msi::free_msi(vector).unwrap();
+    assert_eq!(releases.load(Ordering::Acquire), 1);
+    assert_eq!(
+        general::dev::msi::unregister_msi_controller(controller_handle),
+        Err(general::dev::msi::MsiError::NotFound)
+    );
+}
+
+#[ktest]
+fn elm_kernel_device_api_publishes_queries_and_retires_dynamic_device() {
+    use kernel_api::device as api;
+
+    let requirement = ElmEbiKernelApiRequirement::new(
+        api::KERNEL_DEVICE_API_IDENTIFIER,
+        api::KERNEL_DEVICE_API_VERSION,
+        api::KERNEL_DEVICE_CAP_OBSERVE | api::KERNEL_DEVICE_CAP_DISCOVERY,
+        api::KERNEL_DEVICE_LAYOUT_HASH_V1,
+    )
+    .unwrap();
+    let unit = ElmEbiUnit::new(
+        manifest("kernel-device-client", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks())
+    .with_kernel_api_requirement(requirement);
+    let loaded = super::with_core(|core| core.load_ebi_unit(unit, ElmEbiArch::Any));
+    assert_eq!(loaded.status, ElmEbiLoadStatus::Ok as i32);
+    let id = ElmId(loaded.cell_id);
+    let namespace = super::api_registry::query(
+        id,
+        Generation::FIRST,
+        api::KERNEL_DEVICE_API_IDENTIFIER.as_bytes(),
+        &[api::KERNEL_DEVICE_API_VERSION],
+        false,
+    )
+    .expect("设备 requirement 应取得函数表");
+    // Safety: grant token 的固定布局是两个连续 u64，来源是当前 namespace 查询结果。
+    let token = unsafe {
+        core::mem::transmute::<[u64; 2], kernel_api::ApiGrantTokenV1>([
+            namespace.grant_id,
+            namespace.generation,
+        ])
+    };
+    // Safety: API 注册表只返回已校验、常驻且布局匹配的函数表地址。
+    let table = unsafe { &*(namespace.table_address as *const api::KernelDeviceApiV1) };
+    let context = ElmContext::new(
+        id,
+        Some(ELM_MGR_ID),
+        Generation::FIRST,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    )
+    .with_kind(ElmKind::Service);
+    let _context = elm_model::enter_current_context(&context).expect("应建立测试 ELM 上下文");
+    let native_guard =
+        general::elm_guard::ElmGuard::enter(id.0, general::elm_guard::ELM_GUARD_PHASE_HOOK, 0)
+            .expect("应建立测试原生边界");
+    let stack_anchor = 0u64;
+    let stack_middle = &stack_anchor as *const u64 as usize;
+    assert!(native_guard.configure_native_bounds(
+        0x20_0000,
+        0x20_1000,
+        0x20_0000,
+        0x20_2000,
+        stack_middle.saturating_sub(64 * 1024),
+        stack_middle.saturating_add(64 * 1024),
+        &[],
+    ));
+
+    let bus = table
+        .register_device_bus(
+            token,
+            &api::KernelDeviceBusRequestV1::new(
+                "elm-test-dynamic-bus",
+                "elm.test.dynamic.identity",
+            )
+            .unwrap(),
+        )
+        .expect("动态总线注册应成功");
+    let mut resources = [api::KernelDeviceResourceV1::empty(); api::KERNEL_DEVICE_MAX_RESOURCES];
+    resources[0].kind = api::KERNEL_DEVICE_RESOURCE_MMIO;
+    resources[0].index = 4;
+    resources[0].start = 0;
+    resources[0].length = 0x1000;
+    resources[1].kind = api::KERNEL_DEVICE_RESOURCE_IRQ;
+    resources[1].index = 7;
+    resources[1].start = 41;
+    resources[1].flags = u64::from(api::KERNEL_DEVICE_IRQ_LINE_KIND_HARDWARE);
+    resources[2].kind = api::KERNEL_DEVICE_RESOURCE_MSI;
+    resources[2].index = 2;
+    resources[2].start = 3;
+    resources[2].length = 0x101;
+    resources[3].kind = api::KERNEL_DEVICE_RESOURCE_DMA;
+    resources[3].index = 9;
+    resources[3].start = u64::MAX;
+    resources[3].length = 64 * 1024;
+    resources[3].flags = api::KERNEL_DEVICE_DMA_RESOURCE_COHERENT
+        | (1u64 << api::KERNEL_DEVICE_DMA_RESOURCE_MAX_SEGMENTS_SHIFT);
+    let mut properties =
+        [api::KernelDevicePropertyV1::default(); api::KERNEL_DEVICE_MAX_PROPERTIES];
+    properties[0] = api::KernelDevicePropertyV1::new("elm.test.mode", b"synthetic").unwrap();
+    let mut identity = [0u8; api::KERNEL_DEVICE_IDENTITY_LEN];
+    identity[..14].copy_from_slice(b"dynamic-device");
+    let request = api::KernelDevicePublishRequestV1 {
+        struct_size: core::mem::size_of::<api::KernelDevicePublishRequestV1>() as u32,
+        flags: 0,
+        bus,
+        parent: api::KernelDeviceHandleV1::default(),
+        name: api::KernelDeviceNameV1::new("elm-dynamic-device").unwrap(),
+        identity_contract: api::KernelDeviceIdentifierV1::new("elm.test.dynamic.identity").unwrap(),
+        identity_len: 14,
+        resource_count: 4,
+        property_count: 1,
+        identity,
+        resources,
+        properties,
+    };
+    let device = table.publish(token, &request).expect("动态设备发布应成功");
+    let snapshot = table.device(token, device).expect("动态设备应可查询");
+    assert_eq!(snapshot.bus.as_str(), Some("elm-test-dynamic-bus"));
+    assert_eq!(snapshot.resource_count, 4);
+    assert_eq!(snapshot.property_count, 1);
+    assert_eq!(snapshot.bound, 0);
+    let irq = table.resource(token, device, 1).unwrap();
+    assert_eq!(irq.kind, api::KERNEL_DEVICE_RESOURCE_IRQ);
+    assert_eq!(irq.index, 7);
+    assert!(irq.has_valid_dynamic_encoding());
+    let property = table.property(token, device, 0).unwrap();
+    assert_eq!(property.name.as_str(), Some("elm.test.mode"));
+    assert_eq!(&property.value[..property.value_len as usize], b"synthetic");
+
+    table.remove(token, device).expect("动态设备热拔应成功");
+    assert!(matches!(
+        table.device(token, device),
+        Err(api::KERNEL_DEVICE_STATUS_NOT_FOUND)
+    ));
+    table
+        .unregister_device_bus(token, bus)
+        .expect("空动态总线应可注销");
+    drop(native_guard);
+    drop(_context);
+
+    let (execution, callback_context) = super::core::try_reserve_device_callback_execution(
+        id,
+        Generation::FIRST,
+        ElmLifecyclePhase::Initialize,
+    )
+    .expect("活跃 cell 应允许设备回调");
+    assert_eq!(callback_context.state, ElmState::Active);
+    let busy_pause = super::with_core(|core| core.pause_cell(id));
+    assert_eq!(busy_pause.status, ELM_MGR_STATUS_BUSY);
+    drop(execution);
+
+    let paused = super::with_core(|core| core.pause_cell(id));
+    assert_eq!(paused.status, ELM_MGR_STATUS_OK);
+    assert!(
+        super::core::try_reserve_device_callback_execution(
+            id,
+            Generation::FIRST,
+            ElmLifecyclePhase::Initialize,
+        )
+        .is_none()
+    );
+    let resumed = super::with_core(|core| core.resume_cell(id));
+    assert_eq!(resumed.status, ELM_MGR_STATUS_OK);
+    let (execution, callback_context) = super::core::try_reserve_device_callback_execution(
+        id,
+        Generation::FIRST,
+        ElmLifecyclePhase::Initialize,
+    )
+    .expect("恢复后的 cell 应重新允许设备回调");
+    assert_eq!(callback_context.state, ElmState::Active);
+    drop(execution);
+
+    let detached = super::with_core(|core| core.detach_cell(id));
+    assert_eq!(detached.status, ELM_MGR_STATUS_OK);
+    assert!(super::owned_resource::owner_snapshot(id).is_none());
+    assert_eq!(super::api_registry::remove_cell(id), 0);
+}
+
+#[ktest]
 fn elm_device_claim_provider_acquires_releases_and_revokes_claims() {
     let function: Arc<dyn general::dev::function::DeviceFunction> = Arc::new(TestElmDeviceFunction);
     general::dev::enumerate::DEVICES.unregister_function(&function);
@@ -5678,6 +6395,32 @@ fn elm_guard_does_not_recover_without_controlled_exit() {
 
     assert!(general::elm_guard::try_recover_kernel_fault(0x10, 0x20, 0x30).is_none());
     assert!(!guard.aborted());
+}
+
+#[ktest]
+fn elm_guard_interrupt_domain_rejects_kernel_api_reentry() {
+    let guard = general::elm_guard::ElmGuard::enter(
+        0x1112,
+        general::elm_guard::ELM_GUARD_PHASE_DEVICE_IRQ,
+        u64::MAX,
+    )
+    .expect("guard enter");
+    assert!(guard.configure_native_bounds(0x40, 0x100, 0x40, 0x200, 0x1000, 0x5000, &[]));
+    let _interrupt = guard
+        .enter_domain(general::elm_guard::ElmExecutionDomain::Interrupt)
+        .expect("interrupt domain");
+
+    assert!(
+        general::elm_guard::enter_current_domain(
+            general::elm_guard::ElmExecutionDomain::KernelCall
+        )
+        .is_none()
+    );
+    assert!(general::elm_guard::arm_current_recovery(0x1000, 0x2000));
+    let recovery =
+        general::elm_guard::try_recover_kernel_fault(0x50, 0x60, 0x70).expect("irq recovery");
+    assert_eq!(recovery.cell, 0x1112);
+    assert!(guard.aborted());
 }
 
 #[ktest]

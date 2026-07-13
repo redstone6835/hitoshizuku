@@ -195,6 +195,16 @@ impl DeviceList {
             publish_function_event(DeviceFunctionEventKind::Unregistered, removed);
         }
     }
+
+    /// 从全局表摘除已经由 PnP 核心完成停机和排空的 function。
+    pub(crate) fn unregister_quiesced_function(&self, func: &Arc<dyn DeviceFunction>) {
+        if let Some(removed) = self
+            .functions
+            .remove_quiesced(func.class_id(), func.dev_name())
+        {
+            publish_function_event(DeviceFunctionEventKind::Unregistered, removed);
+        }
+    }
 }
 
 pub static DEVICES: DeviceList = DeviceList::new();

@@ -7,6 +7,7 @@
 //! 外部 ELM 通过 [`ApiImport`] 在初始化阶段取得一个版本化命名空间，后续调用直接
 //! 使用缓存函数表，不经过 elm-mgr 管理通道。
 
+pub mod device;
 mod import;
 pub mod memory;
 mod table;

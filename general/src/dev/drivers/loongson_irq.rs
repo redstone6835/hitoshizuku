@@ -1055,6 +1055,7 @@ fn map_msi_error(err: MsiError) -> PnpError {
         MsiError::AllocationFailed => {
             PnpError::registration_failed(PnpResourceKind::Msi, "msi allocation failed")
         }
+        MsiError::Busy => PnpError::InvalidState,
     }
 }
 

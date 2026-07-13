@@ -89,6 +89,13 @@ const KIND_EXTENSION_POINT: u16 = 7;
 const KIND_EXTENSION: u16 = 8;
 const KIND_PAYLOAD: u16 = 9;
 const KIND_KERNEL_API: u16 = 10;
+const KIND_DEVICE_DRIVER: u16 = 11;
+const KIND_DEVICE_MATCH: u16 = 12;
+const KIND_DEVICE_PROBE: u16 = 13;
+const KIND_DEVICE_REMOVE: u16 = 14;
+const KIND_DEVICE_FUNCTION: u16 = 15;
+const KIND_DEVICE_IRQ: u16 = 16;
+const KIND_DEVICE_DISCOVERY: u16 = 17;
 
 const VALUE_UTF8: u16 = 1;
 const VALUE_U32: u16 = 2;
@@ -114,6 +121,12 @@ const FIELD_HANDLER_CONTRACT: u16 = 16;
 const FIELD_PAYLOAD_CONTRACT: u16 = 17;
 const FIELD_WIRE_SIZE: u16 = 18;
 const FIELD_CAPABILITIES: u16 = 20;
+const FIELD_BUS: u16 = 21;
+const FIELD_CALLBACK: u16 = 22;
+const FIELD_RESOURCE: u16 = 23;
+const FIELD_MATCH_CALLBACK: u16 = 24;
+const FIELD_PROBE_CALLBACK: u16 = 25;
+const FIELD_REMOVE_CALLBACK: u16 = 26;
 
 const IMPORT_OPTIONAL: u32 = 1 << 0;
 const IMPORT_MANAGED: u32 = 1 << 1;
@@ -695,6 +708,98 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn kernel_api(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as ItemStatic);
     match kernel_api_impl(attr.into(), item) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+/// 声明一个设备驱动请求构造器。
+///
+/// 被标记函数必须是无参数、无返回类型且函数体为空的标记函数。attribute 接受 name、
+/// bus、priority、generic，以及 match_callback、probe_callback、remove_callback。后三项
+/// 必须是同一模块内分别由 device_match、device_probe 和 device_remove 标记的函数名。
+/// 宏把标记函数替换为返回完整 KernelDeviceDriverRequestV1 的普通 Rust 构造器，模块
+/// 初始化时可直接把结果交给 kernel.device@1 注册。回调地址、稳定 ABI 符号和元数据均由
+/// 宏生成，模块代码不需要手写 extern ABI 或地址转换。
+pub fn device_driver(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let function = parse_macro_input!(item as ItemFn);
+    match device_driver_impl(attr.into(), function) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+/// 声明设备驱动匹配函数。
+///
+/// 规范签名为 fn(&kernel_api::device::KernelDeviceSnapshotV1) -> bool。宏生成固定匹配
+/// 帧 trampoline；返回 true 表示驱动愿意参与该设备的优先级选择。
+pub fn device_match(attr: TokenStream, item: TokenStream) -> TokenStream {
+    device_callback_attribute(attr, item, DeviceCallbackKind::Match)
+}
+
+#[proc_macro_attribute]
+/// 声明设备驱动 probe 函数。
+///
+/// 规范签名为 fn(&kernel_api::device::KernelDeviceSnapshotV1) -> elm::HookResult。函数可在
+/// 调用期间通过 kernel.device@1 取得资源并注册 function；失败状态会写回 probe 事务。
+pub fn device_probe(attr: TokenStream, item: TokenStream) -> TokenStream {
+    device_callback_attribute(attr, item, DeviceCallbackKind::Probe)
+}
+
+#[proc_macro_attribute]
+/// 声明设备驱动 remove 函数。
+///
+/// 规范签名为 fn(&kernel_api::device::KernelDeviceSnapshotV1) -> elm::HookResult。PnP core
+/// 已先阻止新 function 调用，并会在回调后释放登记资源；函数只负责设备私有停机逻辑。
+pub fn device_remove(attr: TokenStream, item: TokenStream) -> TokenStream {
+    device_callback_attribute(attr, item, DeviceCallbackKind::Remove)
+}
+
+#[proc_macro_attribute]
+/// 声明通用设备 function 的契约调用函数。
+///
+/// 必需参数 contract 指明 opcode 与 payload 的完整契约。规范签名为
+/// fn(&mut kernel_api::device::KernelDeviceIoFrameV1) -> elm::HookResult。宏校验输入帧并
+/// 生成 function ABI trampoline，同时生成 名称_function_callback_address 辅助函数供
+/// KernelDeviceFunctionRequestV1 使用。
+pub fn device_function(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let function = parse_macro_input!(item as ItemFn);
+    match device_function_impl(attr.into(), function) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+/// 声明设备 IRQ 回调。
+///
+/// mode 必须是 top-half 或 deferred。规范签名为
+/// fn(&kernel_api::device::KernelDeviceIrqFrameV1) -> elm::DeviceIrqResult。top-half 函数
+/// 不能阻塞、分配或进入任何 ELM 运行时/Kernel API，只能访问自身内存和初始化阶段
+/// 保存的 MMIO 映射，并受 `KERNEL_DEVICE_IRQ_TOP_HALF_BUDGET_NS` 硬截止时间限制；
+/// deferred 函数由内核工作线程执行并可使用正常 API。宏生成
+/// 名称_irq_callback_address 辅助函数供 KernelDeviceIrqRequestV1 使用。限制由运行时
+/// 执行域强制实施，而不是仅依赖开发者约定。
+pub fn device_irq(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let function = parse_macro_input!(item as ItemFn);
+    match device_irq_impl(attr.into(), function) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+/// 标记由模块生命周期主动执行的设备发现函数。
+///
+/// 必需参数 bus 是动态总线 identifier。规范签名与初始化钩子一致：
+/// fn(&elm::LifecycleContext) -> elm::HookResult。该函数保持普通 Rust 调用语义，应由
+/// on_initialize 调用并通过 kernel.device@1 发布设备；统一设备资源事务会在卸载或
+/// 热替换时撤销其设备。宏只生成可审计元数据，不另造不可达的运行时入口。
+pub fn device_discovery(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let function = parse_macro_input!(item as ItemFn);
+    match device_discovery_impl(attr.into(), function) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -1326,6 +1431,372 @@ fn kernel_api_impl(attr: TokenStream2, item: ItemStatic) -> syn::Result<TokenStr
     Ok(quote! {
         #item
         #metadata
+    })
+}
+
+#[derive(Clone, Copy)]
+enum DeviceCallbackKind {
+    Match,
+    Probe,
+    Remove,
+}
+
+impl DeviceCallbackKind {
+    fn metadata_kind(self) -> u16 {
+        match self {
+            Self::Match => KIND_DEVICE_MATCH,
+            Self::Probe => KIND_DEVICE_PROBE,
+            Self::Remove => KIND_DEVICE_REMOVE,
+        }
+    }
+
+    fn export_prefix(self) -> &'static str {
+        match self {
+            Self::Match => "__elm_device_match_",
+            Self::Probe => "__elm_device_probe_",
+            Self::Remove => "__elm_device_remove_",
+        }
+    }
+
+    fn abi_prefix(self) -> &'static str {
+        match self {
+            Self::Match => "__elm_abi_device_match_",
+            Self::Probe => "__elm_abi_device_probe_",
+            Self::Remove => "__elm_abi_device_remove_",
+        }
+    }
+
+    fn address_suffix(self) -> &'static str {
+        match self {
+            Self::Match => "match_callback_address",
+            Self::Probe => "probe_callback_address",
+            Self::Remove => "remove_callback_address",
+        }
+    }
+
+    fn role(self) -> &'static str {
+        match self {
+            Self::Match => "match",
+            Self::Probe => "probe",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+fn device_callback_attribute(
+    attr: TokenStream,
+    item: TokenStream,
+    kind: DeviceCallbackKind,
+) -> TokenStream {
+    let function = parse_macro_input!(item as ItemFn);
+    match device_callback_impl(attr.into(), function, kind) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+fn device_callback_impl(
+    attr: TokenStream2,
+    function: ItemFn,
+    kind: DeviceCallbackKind,
+) -> syn::Result<TokenStream2> {
+    require_empty_attr(attr)?;
+    validate_function(&function, 1)?;
+    let ident = &function.sig.ident;
+    let symbol = format!("{}{}", kind.export_prefix(), ident);
+    validate_symbol(&symbol, "device callback symbol")?;
+    let abi_ident = format_ident!("{}{}", kind.abi_prefix(), ident);
+    let address_ident = format_ident!("{}_{}", ident, kind.address_suffix());
+    let metadata = metadata_item(
+        ident,
+        "device_callback",
+        metadata_record(
+            kind.metadata_kind(),
+            vec![
+                MetaField::utf8(FIELD_SYMBOL, &symbol),
+                MetaField::utf8(FIELD_CALLBACK, kind.role()),
+            ],
+        ),
+    );
+    let trampoline = match kind {
+        DeviceCallbackKind::Match => quote! {
+            unsafe {
+                ::kernel_api::device::__private::device_match_trampoline(
+                    frame,
+                    |device| #ident(device),
+                )
+            }
+        },
+        DeviceCallbackKind::Probe => quote! {
+            unsafe {
+                ::kernel_api::device::__private::device_probe_trampoline(
+                    frame,
+                    |device| #ident(device).map_err(|error| error.status()),
+                )
+            }
+        },
+        DeviceCallbackKind::Remove => quote! {
+            unsafe {
+                ::kernel_api::device::__private::device_remove_trampoline(
+                    frame,
+                    |device| #ident(device).map_err(|error| error.status()),
+                )
+            }
+        },
+    };
+    let frame_ty = match kind {
+        DeviceCallbackKind::Match => quote!(::kernel_api::device::KernelDeviceMatchFrameV1),
+        DeviceCallbackKind::Probe => quote!(::kernel_api::device::KernelDeviceProbeFrameV1),
+        DeviceCallbackKind::Remove => quote!(::kernel_api::device::KernelDeviceRemoveFrameV1),
+    };
+    Ok(quote! {
+        #function
+
+        #[doc(hidden)]
+        #[unsafe(export_name = #symbol)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn #abi_ident(frame: *mut #frame_ty) -> i32 {
+            #trampoline
+        }
+
+        #[doc(hidden)]
+        pub fn #address_ident() -> u64 {
+            #abi_ident as usize as u64
+        }
+
+        #metadata
+    })
+}
+
+fn device_driver_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<TokenStream2> {
+    let args = MetaArgs::parse(attr)?;
+    let name = args.required_string("name")?;
+    let bus = args.required_string("bus")?;
+    let priority = args.i32_or("priority", 0)?;
+    let generic = args.bool_or("generic", false)?;
+    let match_callback =
+        callback_ident(&args.required_string("match_callback")?, "match_callback")?;
+    let probe_callback =
+        callback_ident(&args.required_string("probe_callback")?, "probe_callback")?;
+    let remove_callback =
+        callback_ident(&args.required_string("remove_callback")?, "remove_callback")?;
+    args.finish()?;
+    validate_identifier(&name, 64, "device driver name")?;
+    validate_identifier(&bus, 64, "device driver bus")?;
+    if priority < i32::from(i16::MIN) || priority > i32::from(i16::MAX) {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "device driver priority 超出 i16",
+        ));
+    }
+    if !function.sig.inputs.is_empty()
+        || !matches!(function.sig.output, ReturnType::Default)
+        || function.sig.constness.is_some()
+        || function.sig.asyncness.is_some()
+        || function.sig.unsafety.is_some()
+        || function.sig.abi.is_some()
+        || function.sig.variadic.is_some()
+        || !function.sig.generics.params.is_empty()
+        || !function.block.stmts.is_empty()
+    {
+        return Err(syn::Error::new_spanned(
+            &function.sig,
+            "device_driver 必须标记无参数、无返回值且函数体为空的构造器",
+        ));
+    }
+    let ident = function.sig.ident.clone();
+    let match_symbol = format!("__elm_device_match_{}", match_callback);
+    let probe_symbol = format!("__elm_device_probe_{}", probe_callback);
+    let remove_symbol = format!("__elm_device_remove_{}", remove_callback);
+    let match_abi_ident = format_ident!("__elm_abi_device_match_{}", match_callback);
+    let probe_abi_ident = format_ident!("__elm_abi_device_probe_{}", probe_callback);
+    let remove_abi_ident = format_ident!("__elm_abi_device_remove_{}", remove_callback);
+    validate_symbol(&match_symbol, "device match callback symbol")?;
+    validate_symbol(&probe_symbol, "device probe callback symbol")?;
+    validate_symbol(&remove_symbol, "device remove callback symbol")?;
+    let flags = u32::from(generic);
+    let priority = priority as i16;
+    let metadata = metadata_item(
+        &ident,
+        "device_driver",
+        metadata_record(
+            KIND_DEVICE_DRIVER,
+            vec![
+                MetaField::utf8(FIELD_NAME, &name),
+                MetaField::utf8(FIELD_BUS, &bus),
+                MetaField::i32(FIELD_PRIORITY, i32::from(priority)),
+                MetaField::u32(FIELD_FLAGS, flags),
+                MetaField::utf8(FIELD_MATCH_CALLBACK, &match_symbol),
+                MetaField::utf8(FIELD_PROBE_CALLBACK, &probe_symbol),
+                MetaField::utf8(FIELD_REMOVE_CALLBACK, &remove_symbol),
+            ],
+        ),
+    );
+    let body: syn::Block = syn::parse_quote!({
+        ::kernel_api::device::KernelDeviceDriverRequestV1 {
+            struct_size: ::core::mem::size_of::<::kernel_api::device::KernelDeviceDriverRequestV1>()
+                as u32,
+            flags: #flags,
+            name: ::kernel_api::device::KernelDeviceNameV1::new(#name)
+                .expect("device_driver attribute 已验证名称"),
+            bus: ::kernel_api::device::KernelDeviceIdentifierV1::new(#bus)
+                .expect("device_driver attribute 已验证总线"),
+            priority: #priority,
+            reserved0: 0,
+            reserved1: 0,
+            match_callback: #match_abi_ident as usize as u64,
+            probe_callback: #probe_abi_ident as usize as u64,
+            remove_callback: #remove_abi_ident as usize as u64,
+        }
+    });
+    function.sig.output = syn::parse_quote!(
+        -> ::kernel_api::device::KernelDeviceDriverRequestV1
+    );
+    function.block = Box::new(body);
+    Ok(quote! {
+        #function
+        #metadata
+    })
+}
+
+fn device_function_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
+    let args = MetaArgs::parse(attr)?;
+    let contract = args.required_string("contract")?;
+    args.finish()?;
+    validate_contract(&contract)?;
+    validate_function(&function, 1)?;
+    let ident = &function.sig.ident;
+    let symbol = format!("__elm_device_function_{}", ident);
+    let abi_ident = format_ident!("__elm_abi_device_function_{}", ident);
+    let address_ident = format_ident!("{}_function_callback_address", ident);
+    validate_symbol(&symbol, "device function symbol")?;
+    let metadata = metadata_item(
+        ident,
+        "device_function",
+        metadata_record(
+            KIND_DEVICE_FUNCTION,
+            vec![
+                MetaField::utf8(FIELD_SYMBOL, &symbol),
+                MetaField::utf8(FIELD_CONTRACT, &contract),
+            ],
+        ),
+    );
+    Ok(quote! {
+        #function
+
+        #[doc(hidden)]
+        #[unsafe(export_name = #symbol)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn #abi_ident(
+            frame: *mut ::kernel_api::device::KernelDeviceIoFrameV1,
+        ) -> i32 {
+            unsafe {
+                ::kernel_api::device::__private::device_function_trampoline(
+                    frame,
+                    |frame| #ident(frame).map_err(|error| error.status()),
+                )
+            }
+        }
+
+        #[doc(hidden)]
+        pub fn #address_ident() -> u64 {
+            #abi_ident as usize as u64
+        }
+
+        #metadata
+    })
+}
+
+fn device_irq_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
+    let args = MetaArgs::parse(attr)?;
+    let mode = args.required_string("mode")?;
+    let contract = args.string_or("contract", "device.irq@1")?;
+    args.finish()?;
+    let mode_code = match mode.as_str() {
+        "top-half" => 1,
+        "deferred" => 2,
+        _ => {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "device IRQ mode 必须是 top-half 或 deferred",
+            ));
+        }
+    };
+    validate_contract(&contract)?;
+    validate_function(&function, 1)?;
+    let ident = &function.sig.ident;
+    let symbol = format!("__elm_device_irq_{}", ident);
+    let abi_ident = format_ident!("__elm_abi_device_irq_{}", ident);
+    let address_ident = format_ident!("{}_irq_callback_address", ident);
+    validate_symbol(&symbol, "device IRQ symbol")?;
+    let metadata = metadata_item(
+        ident,
+        "device_irq",
+        metadata_record(
+            KIND_DEVICE_IRQ,
+            vec![
+                MetaField::utf8(FIELD_SYMBOL, &symbol),
+                MetaField::utf8(FIELD_CONTRACT, &contract),
+                MetaField::u32(FIELD_MODE, mode_code),
+            ],
+        ),
+    );
+    Ok(quote! {
+        #function
+
+        #[doc(hidden)]
+        #[unsafe(export_name = #symbol)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn #abi_ident(
+            frame: *mut ::kernel_api::device::KernelDeviceIrqFrameV1,
+        ) -> i32 {
+            unsafe {
+                ::kernel_api::device::__private::device_irq_trampoline(
+                    frame,
+                    |frame| #ident(frame).map_err(|error| error.status()),
+                )
+            }
+        }
+
+        #[doc(hidden)]
+        pub fn #address_ident() -> u64 {
+            #abi_ident as usize as u64
+        }
+
+        #metadata
+    })
+}
+
+fn device_discovery_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
+    let args = MetaArgs::parse(attr)?;
+    let bus = args.required_string("bus")?;
+    args.finish()?;
+    validate_identifier(&bus, 64, "device discovery bus")?;
+    validate_function(&function, 1)?;
+    let ident = &function.sig.ident;
+    let metadata = metadata_item(
+        ident,
+        "device_discovery",
+        metadata_record(
+            KIND_DEVICE_DISCOVERY,
+            vec![
+                MetaField::utf8(FIELD_SYMBOL, &ident.to_string()),
+                MetaField::utf8(FIELD_RESOURCE, &bus),
+            ],
+        ),
+    );
+    Ok(quote! {
+        #function
+        #metadata
+    })
+}
+
+fn callback_ident(value: &str, label: &str) -> syn::Result<Ident> {
+    syn::parse_str::<Ident>(value).map_err(|_| {
+        syn::Error::new(
+            Span::call_site(),
+            format!("{label} 必须是同一模块内的 Rust 函数标识符"),
+        )
     })
 }
 

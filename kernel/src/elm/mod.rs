@@ -6,6 +6,7 @@ use alloc::string::String;
 
 mod api_registry;
 mod core;
+mod device_api;
 mod event;
 mod executor;
 mod journal;
@@ -43,6 +44,10 @@ pub(crate) fn init_builtin_mgr() {
     }
     if let Err(err) = memory_api::init() {
         log::error!("[elm] kernel.memory@1 注册失败: {:?}", err);
+        return;
+    }
+    if let Err(err) = device_api::init() {
+        log::error!("[elm] kernel.device@1 注册失败: {:?}", err);
         return;
     }
     if let Err(err) = journal::init() {
@@ -197,7 +202,8 @@ fn map_owned_resource_error(error: owned_resource::OwnedResourceError) -> elm_mo
         owned_resource::OwnedResourceError::Invalid
         | owned_resource::OwnedResourceError::StaleGeneration
         | owned_resource::OwnedResourceError::OwnerQuiescing
-        | owned_resource::OwnedResourceError::Callback(_) => elm_model::ElmError::InvalidTransition,
+        | owned_resource::OwnedResourceError::Callback(_)
+        | owned_resource::OwnedResourceError::Rollback(_) => elm_model::ElmError::InvalidTransition,
         owned_resource::OwnedResourceError::Duplicate
         | owned_resource::OwnedResourceError::Busy
         | owned_resource::OwnedResourceError::Capacity => elm_model::ElmError::LeaseBusy,

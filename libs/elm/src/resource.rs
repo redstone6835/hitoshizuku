@@ -14,6 +14,8 @@ use crate::ids::{ElmId, Generation};
 pub const ELM_OWNED_RESOURCE_ABI_VERSION: u16 = 1;
 /// `ELM_OWNED_RESOURCE_FLAG_NONE` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_OWNED_RESOURCE_FLAG_NONE: u32 = 0;
+/// 子系统回调已无法恢复调用前状态，运行时必须隔离 owner 并禁止继续接纳资源。
+pub const ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED: i32 = -0x45_4c_4d;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -31,8 +33,10 @@ pub enum ElmOwnedResourceKind {
     IrqCallback = 5,
     /// `AsyncRequest` 表示 `ElmOwnedResourceKind` 的对象类别：`async request`。
     AsyncRequest = 6,
+    /// `Device` 表示由设备抽象层统一排空的总线、驱动、function 和硬件资源集合。
+    Device = 7,
     /// `Custom` 表示 `ElmOwnedResourceKind` 的对象类别：`custom`。
-    Custom = 7,
+    Custom = 8,
 }
 
 impl ElmOwnedResourceKind {
@@ -45,7 +49,8 @@ impl ElmOwnedResourceKind {
             4 => Some(Self::Callback),
             5 => Some(Self::IrqCallback),
             6 => Some(Self::AsyncRequest),
-            7 => Some(Self::Custom),
+            7 => Some(Self::Device),
+            8 => Some(Self::Custom),
             _ => None,
         }
     }
@@ -67,18 +72,27 @@ pub enum ElmOwnedResourceState {
     Releasing = 5,
     /// `Failed` 表示 `ElmOwnedResourceState` 的生命周期状态：`failed`。
     Failed = 6,
+    /// `Suspending` 表示资源正在进入可恢复暂停状态。
+    Suspending = 7,
+    /// `Suspended` 表示资源已停止接纳和执行，但仍保留所有权与恢复信息。
+    Suspended = 8,
+    /// `Resuming` 表示资源正在从暂停状态恢复。
+    Resuming = 9,
 }
 
 /// `ElmOwnedResourceOp` 为该调用路径使用的规范类型别名，统一公开签名并避免重复表达底层布局。
 pub type ElmOwnedResourceOp =
     fn(owner: ElmId, generation: Generation, handle: u64) -> Result<(), i32>;
 
-/// 子系统资源的完整退役操作表。
+/// 子系统资源的完整暂停、恢复与退役操作表。
 ///
-/// 四个阶段均为必需项。子系统没有对应动作时必须显式提供成功的空操作，不能用
-/// 缺失函数指针隐式跳过安全边界。所有函数返回前必须完成对应阶段，不得把回调
-/// 或执行现场留在待卸载 ELM 镜像中。操作表和函数入口必须由常驻内核子系统提供，
-/// 不得存放在可卸载 ELM 镜像内；ELM 只持有子系统分配的资源句柄。
+/// 六个阶段均为必需项。子系统没有对应动作时必须显式提供成功的空操作，不能用
+/// 缺失函数指针隐式跳过安全边界。`suspend` 与 `resume` 是可回滚事务：返回错误时
+/// 必须保持调用前状态，返回成功后才允许注册表推进资源状态。所有函数返回前必须
+/// 完成对应阶段，不得把回调或执行现场留在待卸载 ELM 镜像中。操作表和函数入口
+/// 必须由常驻内核子系统提供，不得存放在可卸载 ELM 镜像内；ELM 只持有子系统
+/// 分配的资源句柄。子系统若已尝试回滚但无法恢复调用前状态，必须返回
+/// [`ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED`]，不能用普通错误掩盖半提交状态。
 #[derive(Clone, Copy)]
 pub struct ElmOwnedResourceOpsV1 {
     /// 该结构遵循的 ABI 版本；解析其余字段前必须验证兼容性。
@@ -87,6 +101,10 @@ pub struct ElmOwnedResourceOpsV1 {
     pub reserved: u16,
     /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
+    /// 暂停资源并保留可恢复状态；成功后不得继续接纳新工作。
+    pub suspend: ElmOwnedResourceOp,
+    /// 恢复已暂停资源；成功返回前必须重新建立完整接纳能力。
+    pub resume: ElmOwnedResourceOp,
     /// 执行 `quiesce` 操作的受控回调；调用方必须遵守所属表的生命周期和故障边界。
     pub quiesce: ElmOwnedResourceOp,
     /// 执行 `cancel` 操作的受控回调；调用方必须遵守所属表的生命周期和故障边界。
@@ -100,6 +118,8 @@ pub struct ElmOwnedResourceOpsV1 {
 impl ElmOwnedResourceOpsV1 {
     /// 构造一个字段满足当前 ABI 基本不变量的新值。
     pub const fn new(
+        suspend: ElmOwnedResourceOp,
+        resume: ElmOwnedResourceOp,
         quiesce: ElmOwnedResourceOp,
         cancel: ElmOwnedResourceOp,
         drain: ElmOwnedResourceOp,
@@ -109,6 +129,8 @@ impl ElmOwnedResourceOpsV1 {
             abi_version: ELM_OWNED_RESOURCE_ABI_VERSION,
             reserved: 0,
             flags: ELM_OWNED_RESOURCE_FLAG_NONE,
+            suspend,
+            resume,
             quiesce,
             cancel,
             drain,

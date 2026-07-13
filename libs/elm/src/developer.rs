@@ -85,6 +85,8 @@ impl HookError {
 
 /// 生命周期钩子使用的结果类型；成功不携带载荷，失败携带稳定状态码。
 pub type HookResult = Result<(), HookError>;
+/// 设备 IRQ 业务回调使用的结果类型；成功值表示本处理器是否消费了该中断。
+pub type DeviceIrqResult = Result<bool, HookError>;
 /// [`entry`](crate::entry) 业务函数使用的结果类型。
 pub type EntryResult = HookResult;
 /// [`mixin_point`](crate::mixin_point) 原始函数使用的结果类型。

@@ -6,6 +6,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use allocator::{KERNEL_ALLOCATOR, MemoryDomain, MemoryRequest, PAGE_SIZE, PagePolicy, Zeroing};
 use elm_model::{
@@ -17,12 +18,12 @@ use elm_model::{
     ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE,
     ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK,
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
-    ElmCallFrame, ElmContext, ElmEbiImage, ElmEbiLoadStatus, ElmEbiProviderPortDecl,
-    ElmEbiRelocationKind, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmError, ElmId,
-    ElmLifecyclePhase, ElmNativeEntryFrameV1, ElmNativeHookContextV1, ElmNativeManagedCallV1,
-    ElmNativeMigrationContextV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
-    ElmReplyFrame, ElmResult, ElmState, Generation, LeaseId, PortId, relocation_width, state_code,
-    try_enter_current_context,
+    ElmCallFrame, ElmContext, ElmCurrentContext, ElmEbiImage, ElmEbiLoadStatus,
+    ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiSegmentKind, ElmEbiSegmentPayload,
+    ElmError, ElmId, ElmLifecyclePhase, ElmNativeEntryFrameV1, ElmNativeHookContextV1,
+    ElmNativeManagedCallV1, ElmNativeMigrationContextV1, ElmNativeProviderCallV1,
+    ElmNativeProviderSnapshotV1, ElmReplyFrame, ElmResult, ElmState, Generation, LeaseId, PortId,
+    relocation_width, state_code, try_enter_current_context,
 };
 use general::elm_guard::{
     ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_MANAGED_CALL,
@@ -38,6 +39,155 @@ const ELM_NATIVE_STACK_TOTAL_SIZE: usize = ELM_NATIVE_STACK_SIZE + ELM_NATIVE_ST
 
 struct NativeCallStack {
     base: usize,
+}
+
+struct NativeIrqStackSlot {
+    stack: NativeCallStack,
+    busy: AtomicBool,
+}
+
+/// IRQ top-half 使用的每 CPU 预分配 ELM 调用栈。
+pub(crate) struct NativeIrqStackSet {
+    slots: Vec<NativeIrqStackSlot>,
+    owner: ElmId,
+    accounted_bytes: u64,
+}
+
+impl NativeIrqStackSet {
+    /// 为当前内核支持的每个 CPU 预分配隔离栈。
+    pub(crate) fn allocate(owner: ElmId) -> Result<Self, i32> {
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(sched::NR_CPUS)
+            .map_err(|_| kernel_api::device::KERNEL_DEVICE_STATUS_NO_MEMORY)?;
+        for _ in 0..sched::NR_CPUS {
+            slots.push(NativeIrqStackSlot {
+                stack: NativeCallStack::allocate()
+                    .map_err(|_| kernel_api::device::KERNEL_DEVICE_STATUS_NO_MEMORY)?,
+                busy: AtomicBool::new(false),
+            });
+        }
+        let accounted_bytes = u64::try_from(ELM_NATIVE_STACK_TOTAL_SIZE)
+            .ok()
+            .and_then(|bytes| bytes.checked_mul(sched::NR_CPUS as u64))
+            .ok_or(kernel_api::device::KERNEL_DEVICE_STATUS_NO_MEMORY)?;
+        if !super::resource_accounting::reserve_native_stack(owner, accounted_bytes) {
+            return Err(kernel_api::device::KERNEL_DEVICE_STATUS_NO_MEMORY);
+        }
+        Ok(Self {
+            slots,
+            owner,
+            accounted_bytes,
+        })
+    }
+
+    /// 在当前 CPU 的预分配栈上执行一次 top-half 回调。
+    pub(crate) fn invoke<T>(
+        &self,
+        address: u64,
+        bounds: NativeExecutionBounds,
+        context: ElmCurrentContext,
+        frame: &mut T,
+    ) -> i32 {
+        let cpu = sched::current_cpu_id().min(self.slots.len().saturating_sub(1));
+        let Some(slot) = self.slots.get(cpu) else {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+        };
+        if slot
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_BUSY;
+        }
+        struct BusyGuard<'a>(&'a AtomicBool);
+        impl Drop for BusyGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(&slot.busy);
+        let Ok(address) = usize::try_from(address) else {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_INVALID;
+        };
+        let now_ns = sched::now_ns_public();
+        let requested_deadline_ns =
+            now_ns.saturating_add(kernel_api::device::KERNEL_DEVICE_IRQ_TOP_HALF_BUDGET_NS);
+        let accounting = match super::resource_accounting::try_begin_native_call(
+            context.cell_id,
+            0,
+            requested_deadline_ns,
+            now_ns,
+        ) {
+            Ok(accounting) => accounting,
+            Err(
+                super::resource_accounting::NativeCallAdmissionError::RegistryBusy
+                | super::resource_accounting::NativeCallAdmissionError::ConcurrentQuota,
+            ) => return kernel_api::device::KERNEL_DEVICE_STATUS_BUSY,
+            Err(_) => return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT,
+        };
+        let Some(guard) = ElmGuard::enter(
+            context.cell_id.0,
+            general::elm_guard::ELM_GUARD_PHASE_DEVICE_IRQ,
+            accounting.effective_deadline_ns(),
+        ) else {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+        };
+        let context_start = frame as *mut T as usize;
+        let Some(context_end) = context_start.checked_add(core::mem::size_of::<T>()) else {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_INVALID;
+        };
+        if !guard.configure_native_bounds(
+            bounds.code_start,
+            bounds.code_end,
+            bounds.image_start,
+            bounds.image_end,
+            slot.stack.start(),
+            slot.stack.top(),
+            &[(context_start, context_end)],
+        ) {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+        }
+        let elm_context = ElmContext::new(
+            context.cell_id,
+            context.parent_id,
+            context.generation,
+            context.state,
+            context.phase,
+            context.flags,
+        )
+        .with_kind(context.kind)
+        .with_allowed_actions(context.allowed_actions);
+        let Some(_current) = try_enter_current_context(&elm_context) else {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+        };
+        let Some(domain) = guard.enter_domain(ElmExecutionDomain::Interrupt) else {
+            return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+        };
+        // Safety: 地址和执行边界在注册时由当前 ELM guard 验证；frame 的完整范围
+        // 已登记为 host range，调用使用当前 CPU 独占的预分配隔离栈。
+        let status = unsafe {
+            arch::call_elm_native(address, (frame as *mut T).cast::<u8>(), slot.stack.top())
+        };
+        let aborted = guard.aborted();
+        drop(domain);
+        let accounting = accounting.finish(sched::now_ns_public());
+        if aborted
+            || accounting.call_budget_exceeded
+            || accounting.period_budget_exceeded
+            || status != 0
+        {
+            kernel_api::device::KERNEL_DEVICE_STATUS_FAULT
+        } else {
+            kernel_api::device::KERNEL_DEVICE_STATUS_OK
+        }
+    }
+}
+
+impl Drop for NativeIrqStackSet {
+    fn drop(&mut self) {
+        super::resource_accounting::release_native_stack(self.owner, self.accounted_bytes);
+    }
 }
 
 impl NativeCallStack {
@@ -95,6 +245,61 @@ pub(crate) struct NativeExecutionBounds {
     pub code_end: usize,
     pub image_start: usize,
     pub image_end: usize,
+}
+
+/// 验证回调地址并复制当前装载镜像的执行边界。
+///
+/// 该入口供 ELM 在 `on_initialize` 中注册设备回调；此时镜像尚未提交到 Core 的
+/// `native_images`，唯一可信来源是当前受保护调用帧中的装载器边界。
+pub(crate) fn current_callback_bounds(address: usize) -> Option<NativeExecutionBounds> {
+    if !general::elm_guard::validate_current_code_address(address) {
+        return None;
+    }
+    let bounds = general::elm_guard::current_native_bounds()?;
+    Some(NativeExecutionBounds {
+        code_start: bounds.code_start,
+        code_end: bounds.code_end,
+        image_start: bounds.image_start,
+        image_end: bounds.image_end,
+    })
+}
+
+/// 在 ELM 隔离栈和 fault recovery 边界中执行一个设备回调。
+pub(crate) fn invoke_device_callback<T>(
+    address: usize,
+    bounds: NativeExecutionBounds,
+    context: ElmCurrentContext,
+    phase: u32,
+    frame: &mut T,
+) -> i32 {
+    if address == 0 || phase == general::elm_guard::ELM_GUARD_PHASE_NONE {
+        return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+    }
+    let Ok(invocation) = NativeInvocation::enter(context.cell_id, phase, 0) else {
+        return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+    };
+    let elm_context = ElmContext::new(
+        context.cell_id,
+        context.parent_id,
+        context.generation,
+        context.state,
+        context.phase,
+        context.flags,
+    )
+    .with_kind(context.kind)
+    .with_allowed_actions(context.allowed_actions);
+    let Some(_current) = try_enter_current_context(&elm_context) else {
+        return kernel_api::device::KERNEL_DEVICE_STATUS_FAULT;
+    };
+    // Safety: 回调地址在注册时已经验证为当前 ELM 的 RX 代码；frame 使用固定
+    // repr(C) 设备 ABI，并且整个可写范围作为 host range 交给调用门。
+    let status = unsafe { invocation.invoke(address, frame as *mut T, bounds, &[]) };
+    let outcome = invocation.finish();
+    if outcome.aborted || outcome.budget_exceeded || status != 0 {
+        kernel_api::device::KERNEL_DEVICE_STATUS_FAULT
+    } else {
+        kernel_api::device::KERNEL_DEVICE_STATUS_OK
+    }
 }
 
 struct NativeInvocation {

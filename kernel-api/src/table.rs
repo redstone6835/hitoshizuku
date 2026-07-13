@@ -137,6 +137,9 @@ pub(crate) fn layout(identifier: &str, version: u16) -> Option<KernelApiLayoutV1
         (crate::memory::KERNEL_MEMORY_API_IDENTIFIER, crate::memory::KERNEL_MEMORY_API_VERSION) => {
             Some(KernelApiLayoutV1::of::<crate::memory::KernelMemoryApiV1>())
         }
+        (crate::device::KERNEL_DEVICE_API_IDENTIFIER, crate::device::KERNEL_DEVICE_API_VERSION) => {
+            Some(KernelApiLayoutV1::of::<crate::device::KernelDeviceApiV1>())
+        }
         _ => None,
     }
 }

@@ -20,6 +20,12 @@ pub const ELM_GUARD_PHASE_ENTRY: u32 = 3;
 pub const ELM_GUARD_PHASE_PROVIDER_CALL: u32 = 4;
 pub const ELM_GUARD_PHASE_PROVIDER_SNAPSHOT: u32 = 5;
 pub const ELM_GUARD_PHASE_MANAGED_CALL: u32 = 6;
+pub const ELM_GUARD_PHASE_DEVICE_MATCH: u32 = 7;
+pub const ELM_GUARD_PHASE_DEVICE_PROBE: u32 = 8;
+pub const ELM_GUARD_PHASE_DEVICE_REMOVE: u32 = 9;
+pub const ELM_GUARD_PHASE_DEVICE_IO: u32 = 10;
+pub const ELM_GUARD_PHASE_DEVICE_IRQ: u32 = 11;
+pub const ELM_GUARD_PHASE_DEVICE_DISCOVERY: u32 = 12;
 
 pub const ELM_GUARD_ABORT_NONE: usize = 0;
 pub const ELM_GUARD_ABORT_CANCEL: usize = 1;
@@ -57,6 +63,13 @@ impl ElmExecutionDomain {
             _ => None,
         }
     }
+}
+
+const fn domain_transition_allowed(current: ElmExecutionDomain, next: ElmExecutionDomain) -> bool {
+    // top-half 运行时不能进入可能持锁、分配或调度的普通内核 API。中断回调只允许
+    // 操作预先映射的设备寄存器和自身内存；复杂工作必须提交给延后回调。
+    !matches!(current, ElmExecutionDomain::Interrupt)
+        || matches!(next, ElmExecutionDomain::Interrupt)
 }
 
 struct ElmGuardFrame {
@@ -264,6 +277,15 @@ pub struct ElmGuardFaultSnapshot {
     pub return_sp: usize,
 }
 
+/// 当前原生 ELM 调用的可执行镜像边界。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmNativeBounds {
+    pub code_start: usize,
+    pub code_end: usize,
+    pub image_start: usize,
+    pub image_end: usize,
+}
+
 pub struct ElmGuard {
     state: Arc<ElmTaskExecutionState>,
     depth: usize,
@@ -347,10 +369,13 @@ impl ElmGuard {
         if self.state.guard_depth.load(Ordering::Acquire) != self.depth + 1 {
             return None;
         }
-        let previous = self.state.frames[self.depth]
-            .domain
-            .swap(domain as usize, Ordering::AcqRel);
-        ElmExecutionDomain::from_raw(previous)?;
+        let frame = &self.state.frames[self.depth];
+        let previous = frame.domain.load(Ordering::Acquire);
+        let current = ElmExecutionDomain::from_raw(previous)?;
+        if !domain_transition_allowed(current, domain) {
+            return None;
+        }
+        frame.domain.store(domain as usize, Ordering::Release);
         Some(ElmExecutionDomainGuard {
             state: Arc::clone(&self.state),
             depth: self.depth,
@@ -415,8 +440,12 @@ pub fn register_task_context_backend() -> bool {
 pub fn enter_current_domain(domain: ElmExecutionDomain) -> Option<ElmExecutionDomainGuard> {
     let state = current_state_arc()?;
     let (depth, frame) = state.current_frame()?;
-    let previous = frame.domain.swap(domain as usize, Ordering::AcqRel);
-    ElmExecutionDomain::from_raw(previous)?;
+    let previous = frame.domain.load(Ordering::Acquire);
+    let current = ElmExecutionDomain::from_raw(previous)?;
+    if !domain_transition_allowed(current, domain) {
+        return None;
+    }
+    frame.domain.store(domain as usize, Ordering::Release);
     Some(ElmExecutionDomainGuard {
         state,
         depth,
@@ -549,9 +578,10 @@ pub fn try_recover_kernel_fault(
 ) -> Option<ElmTrapRecovery> {
     let state = current_state_ref()?;
     let (_, frame) = state.current_frame()?;
-    if ElmExecutionDomain::from_raw(frame.domain.load(Ordering::Acquire))
-        != Some(ElmExecutionDomain::ElmCode)
-        || !pc_in_current_code(frame, fault_pc)
+    if !matches!(
+        ElmExecutionDomain::from_raw(frame.domain.load(Ordering::Acquire)),
+        Some(ElmExecutionDomain::ElmCode | ElmExecutionDomain::Interrupt)
+    ) || !pc_in_current_code(frame, fault_pc)
     {
         return None;
     }
@@ -566,14 +596,17 @@ pub fn try_recover_kernel_fault(
 
 /// timer/IRQ 返回前尝试落实已经投递的取消或超时。
 ///
-/// 只有中断现场位于 ELM 可执行段且执行域为 `ElmCode` 时才允许改写 trap frame。
+/// 只有中断现场位于 ELM 可执行段且执行域为普通代码或 top-half 时才允许改写
+/// trap frame。
 pub fn try_recover_requested_abort(interrupted_pc: usize) -> Option<ElmTrapRecovery> {
     let state = current_state_ref()?;
     let (_, frame) = state.current_frame()?;
     let reason = frame.abort_reason.load(Ordering::Acquire);
     if !matches!(reason, ELM_GUARD_ABORT_CANCEL | ELM_GUARD_ABORT_TIMEOUT)
-        || ElmExecutionDomain::from_raw(frame.domain.load(Ordering::Acquire))
-            != Some(ElmExecutionDomain::ElmCode)
+        || !matches!(
+            ElmExecutionDomain::from_raw(frame.domain.load(Ordering::Acquire)),
+            Some(ElmExecutionDomain::ElmCode | ElmExecutionDomain::Interrupt)
+        )
         || !pc_in_current_code(frame, interrupted_pc)
     {
         return None;
@@ -644,6 +677,37 @@ pub fn validate_current_memory_range(address: usize, len: usize, write: bool) ->
     allocator::KERNEL_ALLOCATOR
         .query_containing_allocation(address, len)
         .is_ok_and(|record| record.accounting_owner() == cell)
+}
+
+/// 返回当前 ELM 调用已经由装载器验证的代码和镜像边界。
+pub fn current_native_bounds() -> Option<ElmNativeBounds> {
+    let state = current_state_ref()?;
+    let (_, frame) = state.current_frame()?;
+    let bounds = ElmNativeBounds {
+        code_start: frame.code_start.load(Ordering::Acquire),
+        code_end: frame.code_end.load(Ordering::Acquire),
+        image_start: frame.image_start.load(Ordering::Acquire),
+        image_end: frame.image_end.load(Ordering::Acquire),
+    };
+    if bounds.code_start == 0
+        || bounds.code_start >= bounds.code_end
+        || bounds.image_start == 0
+        || bounds.image_start >= bounds.image_end
+        || bounds.code_start < bounds.image_start
+        || bounds.code_end > bounds.image_end
+    {
+        return None;
+    }
+    Some(bounds)
+}
+
+/// 验证一个回调入口是否落在当前 ELM 已封闭的可执行段。
+pub fn validate_current_code_address(address: usize) -> bool {
+    current_native_bounds().is_some_and(|bounds| {
+        address >= bounds.code_start
+            && address < bounds.code_end
+            && crate::elm_image::validate_elm_image_range(address, 1, true, false, true)
+    })
 }
 
 fn consume_current_recovery(

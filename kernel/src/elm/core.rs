@@ -866,9 +866,14 @@ enum NativeLifecycleWork {
     Pause {
         quiesce: ElmContext,
         pause: ElmContext,
+        rollback_resume: ElmContext,
+        owner: ElmId,
+        generation: Generation,
     },
     Resume {
         resume: ElmContext,
+        owner: ElmId,
+        generation: Generation,
     },
     Detach {
         quiesce: Option<ElmContext>,
@@ -891,6 +896,7 @@ struct NativeLifecycleExecutionOutcome {
     blockers: u64,
     reason: u32,
     drained_resources: u32,
+    resource_rollback_failed: bool,
 }
 
 enum PreparedNativeLifecycle {
@@ -5826,17 +5832,6 @@ impl ElmCore {
                     .cells
                     .iter()
                     .find(|cell| cell.id == id)
-                    .is_some_and(|cell| {
-                        super::owned_resource::count_owned_by(id, cell.generation) != 0
-                    })
-                {
-                    // v1 资源操作表只定义不可逆退役阶段，不能伪造可恢复的暂停语义。
-                    blockers |= ELM_POLICY_BLOCK_LEASE_BUSY;
-                }
-                if self
-                    .cells
-                    .iter()
-                    .find(|cell| cell.id == id)
                     .is_some_and(|cell| super::source::owner_generation_busy(id, cell.generation))
                 {
                     blockers |= ELM_POLICY_BLOCK_PROVIDER_BUSY;
@@ -7897,8 +7892,8 @@ impl ElmCore {
 
         let state = self.cell_state(id).unwrap_or(ElmState::Retired);
         let needs_external_execution = match action {
-            ElmLifecycleAction::Pause => executor_available && state == ElmState::Active,
-            ElmLifecycleAction::Resume => executor_available && state == ElmState::Paused,
+            ElmLifecycleAction::Pause => state == ElmState::Active,
+            ElmLifecycleAction::Resume => state == ElmState::Paused,
             // 声明式单元也必须在 Core 锁外排空其拥有的子系统资源。
             ElmLifecycleAction::Detach => true,
             ElmLifecycleAction::Replace => false,
@@ -7956,7 +7951,37 @@ impl ElmCore {
                     }
                 };
                 pause.set_state(ElmState::Quiescing);
-                NativeLifecycleWork::Pause { quiesce, pause }
+                let mut rollback_resume =
+                    match self.lifecycle_context(id, ElmLifecyclePhase::Resume) {
+                        Ok(context) => context,
+                        Err(_) => {
+                            return PreparedNativeLifecycle::Immediate(self.finish_lifecycle(
+                                action,
+                                self.lifecycle_response(
+                                    id,
+                                    ELM_MGR_STATUS_INVALID,
+                                    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+                                    0,
+                                    0,
+                                ),
+                                ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+                            ));
+                        }
+                    };
+                rollback_resume.set_state(ElmState::Paused);
+                let generation = self
+                    .cells
+                    .iter()
+                    .find(|cell| cell.id == id)
+                    .map(|cell| cell.generation)
+                    .unwrap_or(Generation(0));
+                NativeLifecycleWork::Pause {
+                    quiesce,
+                    pause,
+                    rollback_resume,
+                    owner: id,
+                    generation,
+                }
             }
             ElmLifecycleAction::Resume => {
                 let resume = match self.lifecycle_context(id, ElmLifecyclePhase::Resume) {
@@ -7975,7 +8000,17 @@ impl ElmCore {
                         ));
                     }
                 };
-                NativeLifecycleWork::Resume { resume }
+                let generation = self
+                    .cells
+                    .iter()
+                    .find(|cell| cell.id == id)
+                    .map(|cell| cell.generation)
+                    .unwrap_or(Generation(0));
+                NativeLifecycleWork::Resume {
+                    resume,
+                    owner: id,
+                    generation,
+                }
             }
             ElmLifecycleAction::Detach => {
                 let generation = self
@@ -8113,7 +8148,12 @@ impl ElmCore {
             );
         }
         if outcome.result.is_err() {
-            if let Some(suspension) = plan.source_suspension.take() {
+            let lifecycle_hook_failed =
+                outcome.blockers & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED != 0;
+            let resource_rollback_failed = outcome.resource_rollback_failed;
+            if (lifecycle_hook_failed || resource_rollback_failed)
+                && let Some(suspension) = plan.source_suspension.take()
+            {
                 let _ = suspension.keep_suspended();
             }
             if outcome.drained_resources != 0 || outcome.blockers & ELM_POLICY_BLOCK_LEASE_BUSY != 0
@@ -8125,7 +8165,11 @@ impl ElmCore {
                     outcome.blockers,
                 );
             }
-            self.quarantine_cell_after_hook_failure(id);
+            if lifecycle_hook_failed {
+                self.quarantine_cell_after_hook_failure(id);
+            } else if resource_rollback_failed {
+                self.quarantine_cell_after_resource_failure(id);
+            }
             return self.finish_lifecycle(
                 plan.action,
                 self.lifecycle_response(
@@ -8144,11 +8188,16 @@ impl ElmCore {
                 if self.transition_cell_state(id, ElmState::Quiescing).is_err()
                     || self.transition_cell_state(id, ElmState::Paused).is_err()
                 {
+                    let resources_resumed =
+                        super::owned_resource::resume_owner(id, plan.token.generation).is_ok();
                     if self.transition_cell_state(id, ElmState::Active).is_err() {
                         if let Some(suspension) = plan.source_suspension.take() {
                             let _ = suspension.keep_suspended();
                         }
                         self.quarantine_cell_after_hook_failure(id);
+                    }
+                    if !resources_resumed {
+                        self.quarantine_cell_after_resource_failure(id);
                     }
                     return self.finish_lifecycle(
                         plan.action,
@@ -8173,6 +8222,7 @@ impl ElmCore {
             }
             ElmLifecycleAction::Resume => {
                 if !self.resume_projection_sources_for_cell(id, plan.token.generation) {
+                    let _ = super::owned_resource::suspend_owner(id, plan.token.generation);
                     self.quarantine_cell_after_hook_failure(id);
                     return self.finish_lifecycle(
                         plan.action,
@@ -8187,6 +8237,7 @@ impl ElmCore {
                     );
                 }
                 if self.transition_cell_state(id, ElmState::Active).is_err() {
+                    let _ = super::owned_resource::suspend_owner(id, plan.token.generation);
                     let _ = super::source::suspend_projection_sources(id, plan.token.generation);
                     self.quarantine_cell_after_hook_failure(id);
                     return self.finish_lifecycle(
@@ -8290,12 +8341,38 @@ impl ElmCore {
 
         match self.cell_state(id).unwrap_or(ElmState::Retired) {
             ElmState::Active => {
+                if let Err(error) = super::owned_resource::suspend_owner(id, generation) {
+                    let rollback_failed = matches!(
+                        error,
+                        super::owned_resource::OwnedResourceError::Rollback(_)
+                    );
+                    if rollback_failed {
+                        let _ = source_suspension.keep_suspended();
+                        self.quarantine_cell_after_resource_failure(id);
+                    }
+                    return self.finish_lifecycle(
+                        action,
+                        self.lifecycle_response(
+                            id,
+                            ELM_MGR_STATUS_BUSY,
+                            ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                            0,
+                            0,
+                        ),
+                        ELM_POLICY_BLOCK_LEASE_BUSY,
+                    );
+                }
                 if self.transition_cell_state(id, ElmState::Quiescing).is_err()
                     || self.transition_cell_state(id, ElmState::Paused).is_err()
                 {
+                    let resources_resumed =
+                        super::owned_resource::resume_owner(id, generation).is_ok();
                     if self.transition_cell_state(id, ElmState::Active).is_err() {
                         let _ = source_suspension.keep_suspended();
                         self.quarantine_cell_after_hook_failure(id);
+                    }
+                    if !resources_resumed {
+                        self.quarantine_cell_after_resource_failure(id);
                     }
                     let response = self.lifecycle_response(
                         id,
@@ -8381,7 +8458,29 @@ impl ElmCore {
                         ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
                     );
                 }
+                if let Err(error) = super::owned_resource::resume_owner(id, generation) {
+                    let _ = super::source::suspend_projection_sources(id, generation);
+                    let rollback_failed = matches!(
+                        error,
+                        super::owned_resource::OwnedResourceError::Rollback(_)
+                    );
+                    if rollback_failed {
+                        self.quarantine_cell_after_resource_failure(id);
+                    }
+                    return self.finish_lifecycle(
+                        action,
+                        self.lifecycle_response(
+                            id,
+                            ELM_MGR_STATUS_BUSY,
+                            ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                            0,
+                            0,
+                        ),
+                        ELM_POLICY_BLOCK_LEASE_BUSY,
+                    );
+                }
                 if self.transition_cell_state(id, ElmState::Active).is_err() {
+                    let _ = super::owned_resource::suspend_owner(id, generation);
                     let _ = super::source::suspend_projection_sources(id, generation);
                     self.quarantine_cell_after_hook_failure(id);
                     return self.finish_lifecycle(
@@ -14902,7 +15001,7 @@ impl ElmCore {
 
     fn quarantine_cell_after_resource_failure(&mut self, id: ElmId) {
         super::api_registry::remove_cell(id);
-        self.mark_native_fault(id, ELM_POLICY_BLOCK_RESOURCE_QUOTA);
+        self.mark_native_fault(id, ELM_POLICY_BLOCK_LEASE_BUSY);
         match self.cell_state(id) {
             Some(ElmState::Faulted) => {}
             Some(ElmState::Quarantined) => return,
@@ -15742,6 +15841,93 @@ pub(crate) fn with_core<R>(f: impl FnOnce(&mut ElmCore) -> R) -> R {
     f(&mut core)
 }
 
+/// 设备回调持有的 cell 执行许可。
+///
+/// 许可存续期间，暂停、替换、策略更新和隔离事务会观察到活跃执行计数，不能在
+/// 回调中途提交状态或权限变化。
+pub(crate) struct DeviceCallbackExecutionPermit {
+    token: Option<CellExecutionToken>,
+}
+
+impl Drop for DeviceCallbackExecutionPermit {
+    fn drop(&mut self) {
+        let Some(token) = self.token.take() else {
+            return;
+        };
+        CORE.lock().release_cell_execution(token);
+    }
+}
+
+/// 非阻塞地取得一次设备回调执行许可和实时 cell 上下文。
+///
+/// top-half 可能打断正持有 Core 锁的路径，因此这里不能等待。普通设备回调也使用
+/// 同一入口，避免发现/probe 在生命周期提交持锁区内形成递归锁依赖。
+pub(crate) fn try_reserve_device_callback_execution(
+    id: ElmId,
+    generation: Generation,
+    phase: ElmLifecyclePhase,
+) -> Option<(DeviceCallbackExecutionPermit, ElmCurrentContext)> {
+    let mut core = CORE.try_lock()?;
+    let index = core.cell_index(id)?;
+    let cell = &core.cells[index];
+    if cell.isolated {
+        return None;
+    }
+
+    let exact_generation = cell.generation == generation;
+    let staged_generation = cell.exclusive_execution
+        && cell.generation.checked_next() == Some(generation)
+        && matches!(cell.state, ElmState::Active | ElmState::Paused);
+    let exact_state_allows_callback = exact_generation
+        && (matches!(
+            cell.state,
+            ElmState::Loaded | ElmState::Linked | ElmState::Ready
+        ) || cell.state == ElmState::Quiescing
+            || cell.state == ElmState::Active && !cell.exclusive_execution);
+    if !exact_state_allows_callback && !staged_generation {
+        return None;
+    }
+
+    let active_executions = cell.active_executions.checked_add(1)?;
+    let token = CellExecutionToken {
+        cell: id,
+        generation: cell.generation,
+        policy_epoch: cell.policy_epoch,
+        allowed_actions: cell.cell_policy.allowed_actions,
+        exclusive: false,
+    };
+    let context = ElmCurrentContext {
+        cell_id: id,
+        parent_id: cell.parent,
+        generation,
+        state: cell.state,
+        phase,
+        kind: cell.kind,
+        flags: 0,
+        allowed_actions: cell.cell_policy.allowed_actions,
+    };
+    core.cells[index].active_executions = active_executions;
+    drop(core);
+    Some((
+        DeviceCallbackExecutionPermit { token: Some(token) },
+        context,
+    ))
+}
+
+/// 记录设备回调的原生执行故障并隔离对应 cell。
+pub(crate) fn record_device_callback_fault(id: ElmId, generation: Generation) {
+    let mut core = CORE.lock();
+    let Some(cell) = core.cells.iter().find(|cell| cell.id == id) else {
+        return;
+    };
+    let generation_matches = cell.generation == generation
+        || cell.exclusive_execution && cell.generation.checked_next() == Some(generation);
+    if !generation_matches {
+        return;
+    }
+    core.mark_native_fault(id, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED);
+}
+
 fn prepare_authorized_unlocked<T>(
     authorization: &mut ElmMgrAuthorization,
     kind: ElmMgrCallKind,
@@ -16291,37 +16477,130 @@ fn execute_native_lifecycle_plan(
         blockers: ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
         reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
         drained_resources: 0,
+        resource_rollback_failed: false,
     };
     match &mut plan.work {
-        NativeLifecycleWork::Pause { quiesce, pause } => {
-            let Some(executor) = plan.executor.as_mut() else {
-                return hook_failure(Err(ElmError::InvalidTransition));
-            };
-            if let Err(err) = executor.on_quiesce(quiesce) {
+        NativeLifecycleWork::Pause {
+            quiesce,
+            pause,
+            rollback_resume,
+            owner,
+            generation,
+        } => {
+            if let Some(executor) = plan.executor.as_mut()
+                && let Err(err) = executor.on_quiesce(quiesce)
+            {
                 return hook_failure(Err(err));
             }
-            match executor.on_pause(pause) {
-                Ok(()) => NativeLifecycleExecutionOutcome {
-                    result: Ok(()),
-                    blockers: 0,
-                    reason: ELM_LIFECYCLE_REASON_NONE,
-                    drained_resources: 0,
-                },
-                Err(err) => hook_failure(Err(err)),
+            let suspended = match super::owned_resource::suspend_owner(*owner, *generation) {
+                Ok(report) => report.transitioned,
+                Err(error) => {
+                    if matches!(
+                        error,
+                        super::owned_resource::OwnedResourceError::Rollback(_)
+                    ) {
+                        return NativeLifecycleExecutionOutcome {
+                            result: Err(ElmError::LeaseBusy),
+                            blockers: ELM_POLICY_BLOCK_LEASE_BUSY,
+                            reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                            drained_resources: 0,
+                            resource_rollback_failed: true,
+                        };
+                    }
+                    if let Some(executor) = plan.executor.as_mut()
+                        && executor.on_resume(rollback_resume).is_err()
+                    {
+                        return NativeLifecycleExecutionOutcome {
+                            result: Err(ElmError::LeaseBusy),
+                            blockers: ELM_POLICY_BLOCK_LEASE_BUSY
+                                | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                            reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
+                            drained_resources: 0,
+                            resource_rollback_failed: false,
+                        };
+                    }
+                    return NativeLifecycleExecutionOutcome {
+                        result: Err(ElmError::LeaseBusy),
+                        blockers: ELM_POLICY_BLOCK_LEASE_BUSY,
+                        reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                        drained_resources: 0,
+                        resource_rollback_failed: false,
+                    };
+                }
+            };
+            if let Some(executor) = plan.executor.as_mut()
+                && let Err(err) = executor.on_pause(pause)
+            {
+                if let Err(error) = super::owned_resource::resume_owner(*owner, *generation) {
+                    let resource_rollback_failed = matches!(
+                        error,
+                        super::owned_resource::OwnedResourceError::Rollback(_)
+                    );
+                    return NativeLifecycleExecutionOutcome {
+                        result: Err(ElmError::LeaseBusy),
+                        blockers: ELM_POLICY_BLOCK_LEASE_BUSY
+                            | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                        reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                        drained_resources: suspended.min(u32::MAX as usize) as u32,
+                        resource_rollback_failed,
+                    };
+                }
+                return hook_failure(Err(err));
+            }
+            NativeLifecycleExecutionOutcome {
+                result: Ok(()),
+                blockers: 0,
+                reason: ELM_LIFECYCLE_REASON_NONE,
+                drained_resources: 0,
+                resource_rollback_failed: false,
             }
         }
-        NativeLifecycleWork::Resume { resume } => {
-            let Some(executor) = plan.executor.as_mut() else {
-                return hook_failure(Err(ElmError::InvalidTransition));
+        NativeLifecycleWork::Resume {
+            resume,
+            owner,
+            generation,
+        } => {
+            let resumed = match super::owned_resource::resume_owner(*owner, *generation) {
+                Ok(report) => report.transitioned,
+                Err(error) => {
+                    let resource_rollback_failed = matches!(
+                        error,
+                        super::owned_resource::OwnedResourceError::Rollback(_)
+                    );
+                    return NativeLifecycleExecutionOutcome {
+                        result: Err(ElmError::LeaseBusy),
+                        blockers: ELM_POLICY_BLOCK_LEASE_BUSY,
+                        reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                        drained_resources: 0,
+                        resource_rollback_failed,
+                    };
+                }
             };
-            match executor.on_resume(resume) {
-                Ok(()) => NativeLifecycleExecutionOutcome {
-                    result: Ok(()),
-                    blockers: 0,
-                    reason: ELM_LIFECYCLE_REASON_NONE,
-                    drained_resources: 0,
-                },
-                Err(err) => hook_failure(Err(err)),
+            if let Some(executor) = plan.executor.as_mut()
+                && let Err(err) = executor.on_resume(resume)
+            {
+                if let Err(error) = super::owned_resource::suspend_owner(*owner, *generation) {
+                    let resource_rollback_failed = matches!(
+                        error,
+                        super::owned_resource::OwnedResourceError::Rollback(_)
+                    );
+                    return NativeLifecycleExecutionOutcome {
+                        result: Err(ElmError::LeaseBusy),
+                        blockers: ELM_POLICY_BLOCK_LEASE_BUSY
+                            | ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+                        reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                        drained_resources: resumed.min(u32::MAX as usize) as u32,
+                        resource_rollback_failed,
+                    };
+                }
+                return hook_failure(Err(err));
+            }
+            NativeLifecycleExecutionOutcome {
+                result: Ok(()),
+                blockers: 0,
+                reason: ELM_LIFECYCLE_REASON_NONE,
+                drained_resources: 0,
+                resource_rollback_failed: false,
             }
         }
         NativeLifecycleWork::Detach {
@@ -16352,6 +16631,7 @@ fn execute_native_lifecycle_plan(
                         reason: ELM_LIFECYCLE_REASON_LEASE_BUSY,
                         drained_resources: before.saturating_sub(remaining).min(u32::MAX as usize)
                             as u32,
+                        resource_rollback_failed: false,
                     };
                 }
             };
@@ -16365,6 +16645,7 @@ fn execute_native_lifecycle_plan(
                         blockers: ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
                         reason: ELM_LIFECYCLE_REASON_HOOK_FAILED,
                         drained_resources,
+                        resource_rollback_failed: false,
                     };
                 }
             }
@@ -16373,6 +16654,7 @@ fn execute_native_lifecycle_plan(
                 blockers: 0,
                 reason: ELM_LIFECYCLE_REASON_NONE,
                 drained_resources,
+                resource_rollback_failed: false,
             }
         }
     }

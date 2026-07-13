@@ -153,9 +153,10 @@ compile_error!("elm crate 必须启用 runtime-model 或 module 编译面");
 
 #[cfg(feature = "macros")]
 pub use elm_macros::{
-    entry, export, import, kernel_api, mixin, mixin_point, on_finalize, on_initialize,
-    on_migrate_abort, on_migrate_export, on_migrate_import, on_pause, on_quiesce, on_resume,
-    payload, provider, provider_snapshot,
+    device_discovery, device_driver, device_function, device_irq, device_match, device_probe,
+    device_remove, entry, export, import, kernel_api, mixin, mixin_point, on_finalize,
+    on_initialize, on_migrate_abort, on_migrate_export, on_migrate_import, on_pause, on_quiesce,
+    on_resume, payload, provider, provider_snapshot,
 };
 
 pub use context::{
@@ -171,7 +172,7 @@ pub use ctl::{
     ELM_CTL_MAGIC, ElmCoreInfo, ElmCtlCommand, ElmCtlHeader, ElmCtlStatus,
 };
 pub use developer::{
-    ELM_API_ROOT_SLOT_SYMBOL, ELM_MIXIN_STAGE_EGRESS, ELM_MIXIN_STAGE_INGRESS,
+    DeviceIrqResult, ELM_API_ROOT_SLOT_SYMBOL, ELM_MIXIN_STAGE_EGRESS, ELM_MIXIN_STAGE_INGRESS,
     ELM_MIXIN_STAGE_OBSERVE, ELM_MIXIN_STAGE_SUBSTITUTE, ELM_MIXIN_STAGES_ALL, ElmPayload,
     EntryContext, EntryResult, HookError, HookResult, LifecycleContext, ManagedImport,
     ManagedReply, ManagedRequest, ManagedResult, MigrationContext, MigrationExportResult,
@@ -283,13 +284,15 @@ pub use menu::{
 };
 #[cfg(feature = "runtime-model")]
 pub use metadata::{
-    ELM_META_FIELD_ACCESS, ELM_META_FIELD_CAPABILITIES, ELM_META_FIELD_CONTRACT,
-    ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS, ELM_META_FIELD_HANDLER_CONTRACT,
-    ELM_META_FIELD_HOOK_KIND, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
+    ELM_META_FIELD_ACCESS, ELM_META_FIELD_BUS, ELM_META_FIELD_CALLBACK,
+    ELM_META_FIELD_CAPABILITIES, ELM_META_FIELD_CONTRACT, ELM_META_FIELD_DIRECTION,
+    ELM_META_FIELD_FLAGS, ELM_META_FIELD_HANDLER_CONTRACT, ELM_META_FIELD_HOOK_KIND,
+    ELM_META_FIELD_MATCH_CALLBACK, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
     ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
-    ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_STAGE, ELM_META_FIELD_STAGES,
-    ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE,
-    ELM_RUST_METADATA_ALIGNMENT, ELM_RUST_METADATA_FIELD_HEADER_SIZE,
+    ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_PROBE_CALLBACK,
+    ELM_META_FIELD_REMOVE_CALLBACK, ELM_META_FIELD_RESOURCE, ELM_META_FIELD_STAGE,
+    ELM_META_FIELD_STAGES, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION,
+    ELM_META_FIELD_WIRE_SIZE, ELM_RUST_METADATA_ALIGNMENT, ELM_RUST_METADATA_FIELD_HEADER_SIZE,
     ELM_RUST_METADATA_HEADER_SIZE, ELM_RUST_METADATA_MAGIC, ELM_RUST_METADATA_MAX_RECORD_SIZE,
     ELM_RUST_METADATA_VERSION, ElmRustMetadataError, ElmRustMetadataField, ElmRustMetadataKind,
     ElmRustMetadataRecord, ElmRustMetadataValueKind, crc32, parse_rust_metadata_section,
@@ -470,9 +473,10 @@ pub use provider::{
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use resource::{
-    ELM_OWNED_RESOURCE_ABI_VERSION, ELM_OWNED_RESOURCE_FLAG_NONE, ElmOwnedResourceKind,
-    ElmOwnedResourceOp, ElmOwnedResourceOpsV1, ElmOwnedResourceSnapshotV1, ElmOwnedResourceState,
-    ElmResourceBudget, ElmResourceKind, ElmResourceUsage,
+    ELM_OWNED_RESOURCE_ABI_VERSION, ELM_OWNED_RESOURCE_FLAG_NONE,
+    ELM_OWNED_RESOURCE_STATUS_ROLLBACK_FAILED, ElmOwnedResourceKind, ElmOwnedResourceOp,
+    ElmOwnedResourceOpsV1, ElmOwnedResourceSnapshotV1, ElmOwnedResourceState, ElmResourceBudget,
+    ElmResourceKind, ElmResourceUsage,
 };
 #[cfg(feature = "runtime-model")]
 pub use snapshot::{

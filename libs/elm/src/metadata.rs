@@ -66,6 +66,18 @@ pub const ELM_META_FIELD_WIRE_SIZE: u16 = 18;
 pub const ELM_META_FIELD_STAGES: u16 = 19;
 /// `.elm.meta` 字段表中标识 64 位能力集合的稳定 tag。
 pub const ELM_META_FIELD_CAPABILITIES: u16 = 20;
+/// `.elm.meta` 字段表中标识设备总线 identifier 的稳定 tag。
+pub const ELM_META_FIELD_BUS: u16 = 21;
+/// `.elm.meta` 字段表中标识设备回调角色或关联符号的稳定 tag。
+pub const ELM_META_FIELD_CALLBACK: u16 = 22;
+/// `.elm.meta` 字段表中标识设备资源或发现类别的稳定 tag。
+pub const ELM_META_FIELD_RESOURCE: u16 = 23;
+/// `.elm.meta` 字段表中标识驱动匹配回调符号的稳定 tag。
+pub const ELM_META_FIELD_MATCH_CALLBACK: u16 = 24;
+/// `.elm.meta` 字段表中标识驱动 probe 回调符号的稳定 tag。
+pub const ELM_META_FIELD_PROBE_CALLBACK: u16 = 25;
+/// `.elm.meta` 字段表中标识驱动 remove 回调符号的稳定 tag。
+pub const ELM_META_FIELD_REMOVE_CALLBACK: u16 = 26;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -91,6 +103,20 @@ pub enum ElmRustMetadataKind {
     Payload = 9,
     /// `KernelApi` 表示一个装载前 Kernel API 命名空间依赖。
     KernelApi = 10,
+    /// `DeviceDriver` 表示一组可注册到 PnP core 的 ELM 驱动声明。
+    DeviceDriver = 11,
+    /// `DeviceMatch` 表示设备驱动的安全匹配回调。
+    DeviceMatch = 12,
+    /// `DeviceProbe` 表示设备驱动的安全初始化回调。
+    DeviceProbe = 13,
+    /// `DeviceRemove` 表示设备驱动的安全撤销回调。
+    DeviceRemove = 14,
+    /// `DeviceFunction` 表示设备 function 的契约调用回调。
+    DeviceFunction = 15,
+    /// `DeviceIrq` 表示设备 IRQ 回调。
+    DeviceIrq = 16,
+    /// `DeviceDiscovery` 表示由 ELM 生命周期主动执行的设备发现逻辑。
+    DeviceDiscovery = 17,
 }
 
 impl ElmRustMetadataKind {
@@ -107,6 +133,13 @@ impl ElmRustMetadataKind {
             8 => Some(Self::Extension),
             9 => Some(Self::Payload),
             10 => Some(Self::KernelApi),
+            11 => Some(Self::DeviceDriver),
+            12 => Some(Self::DeviceMatch),
+            13 => Some(Self::DeviceProbe),
+            14 => Some(Self::DeviceRemove),
+            15 => Some(Self::DeviceFunction),
+            16 => Some(Self::DeviceIrq),
+            17 => Some(Self::DeviceDiscovery),
             _ => None,
         }
     }

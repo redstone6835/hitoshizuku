@@ -2,13 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use elm::{
     ELM_API_FEATURES_V1, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
-    ELM_META_FIELD_CAPABILITIES,
+    ELM_META_FIELD_BUS, ELM_META_FIELD_CALLBACK, ELM_META_FIELD_CAPABILITIES,
     ELM_API_ROOT_SLOT_SYMBOL, ELM_API_VERSION_V1, ELM_META_FIELD_ACCESS, ELM_META_FIELD_CONTRACT,
     ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS, ELM_META_FIELD_HANDLER_CONTRACT,
     ELM_META_FIELD_HOOK_KIND, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
     ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
-    ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_STAGE, ELM_META_FIELD_SYMBOL,
-    ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE, ElmMixinMode,
+    ELM_META_FIELD_MATCH_CALLBACK, ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY,
+    ELM_META_FIELD_PROBE_CALLBACK, ELM_META_FIELD_REMOVE_CALLBACK, ELM_META_FIELD_RESOURCE,
+    ELM_META_FIELD_STAGE, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION,
+    ELM_META_FIELD_WIRE_SIZE, ElmMixinMode,
     ElmPortAccessPolicy, ElmRustMetadataKind, ElmRustMetadataRecord, FlowDirection, FlowMode,
     parse_rust_metadata_section,
 };
@@ -23,6 +25,7 @@ pub struct NativeMetadata {
     pub extension_points: Vec<ExtensionPointSpec>,
     pub extensions: Vec<ExtensionSpec>,
     pub kernel_apis: Vec<KernelApiSpec>,
+    pub device_symbols: Vec<String>,
     pub api_root_import_index: u32,
     pub api_versions: Vec<u16>,
     pub api_required_features: u64,
@@ -100,6 +103,13 @@ struct SnapshotSpec {
     symbol: String,
 }
 
+#[derive(Debug, Clone)]
+struct DeviceDriverSpec {
+    match_callback: String,
+    probe_callback: String,
+    remove_callback: String,
+}
+
 impl NativeMetadata {
     pub fn parse(section: &[u8]) -> Result<Self, String> {
         let records = parse_rust_metadata_section(section)
@@ -124,6 +134,9 @@ impl NativeMetadata {
         let mut extensions = Vec::new();
         let mut payloads = Vec::new();
         let mut kernel_apis = Vec::new();
+        let mut device_symbols = Vec::new();
+        let mut device_callbacks = BTreeMap::new();
+        let mut device_drivers = Vec::new();
         for record in &records {
             if record.flags != 0 {
                 return Err(format!("元数据记录 {:?} 使用了未知 flags", record.kind));
@@ -326,7 +339,126 @@ impl NativeMetadata {
                         layout_hash: layout.layout_hash,
                     });
                 }
+                ElmRustMetadataKind::DeviceMatch
+                | ElmRustMetadataKind::DeviceProbe
+                | ElmRustMetadataKind::DeviceRemove => {
+                    expect_fields(
+                        record,
+                        &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CALLBACK],
+                    )?;
+                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
+                    let role = field_string(record, ELM_META_FIELD_CALLBACK)?;
+                    let expected = match record.kind {
+                        ElmRustMetadataKind::DeviceMatch => "match",
+                        ElmRustMetadataKind::DeviceProbe => "probe",
+                        ElmRustMetadataKind::DeviceRemove => "remove",
+                        _ => unreachable!(),
+                    };
+                    if role != expected {
+                        return Err(format!(
+                            "设备回调 {symbol} 的角色 {role} 与元数据种类不一致"
+                        ));
+                    }
+                    if device_callbacks
+                        .insert(symbol.clone(), expected)
+                        .is_some()
+                    {
+                        return Err(format!("重复设备回调符号 {symbol}"));
+                    }
+                    device_symbols.push(symbol);
+                }
+                ElmRustMetadataKind::DeviceDriver => {
+                    expect_fields(
+                        record,
+                        &[
+                            ELM_META_FIELD_NAME,
+                            ELM_META_FIELD_FLAGS,
+                            ELM_META_FIELD_PRIORITY,
+                            ELM_META_FIELD_BUS,
+                            ELM_META_FIELD_MATCH_CALLBACK,
+                            ELM_META_FIELD_PROBE_CALLBACK,
+                            ELM_META_FIELD_REMOVE_CALLBACK,
+                        ],
+                    )?;
+                    let name = field_string(record, ELM_META_FIELD_NAME)?;
+                    let bus = field_string(record, ELM_META_FIELD_BUS)?;
+                    let flags = field_u32(record, ELM_META_FIELD_FLAGS)?;
+                    let priority = field_i32(record, ELM_META_FIELD_PRIORITY)?;
+                    if name.is_empty()
+                        || name.len() > 64
+                        || bus.is_empty()
+                        || bus.len() > 64
+                        || flags & !1 != 0
+                        || priority < i32::from(i16::MIN)
+                        || priority > i32::from(i16::MAX)
+                    {
+                        return Err(format!("设备驱动 {name} 的固定元数据无效"));
+                    }
+                    device_drivers.push(DeviceDriverSpec {
+                        match_callback: field_string(record, ELM_META_FIELD_MATCH_CALLBACK)?,
+                        probe_callback: field_string(record, ELM_META_FIELD_PROBE_CALLBACK)?,
+                        remove_callback: field_string(record, ELM_META_FIELD_REMOVE_CALLBACK)?,
+                    });
+                }
+                ElmRustMetadataKind::DeviceFunction => {
+                    expect_fields(
+                        record,
+                        &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CONTRACT],
+                    )?;
+                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
+                    let contract = field_string(record, ELM_META_FIELD_CONTRACT)?;
+                    if contract.is_empty() || !contract.contains('@') {
+                        return Err(format!("设备 function {symbol} 的契约无效"));
+                    }
+                    device_symbols.push(symbol);
+                }
+                ElmRustMetadataKind::DeviceIrq => {
+                    expect_fields(
+                        record,
+                        &[
+                            ELM_META_FIELD_SYMBOL,
+                            ELM_META_FIELD_CONTRACT,
+                            ELM_META_FIELD_MODE,
+                        ],
+                    )?;
+                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
+                    let mode = field_u32(record, ELM_META_FIELD_MODE)?;
+                    if !matches!(mode, 1 | 2)
+                        || field_string(record, ELM_META_FIELD_CONTRACT)?.is_empty()
+                    {
+                        return Err(format!("设备 IRQ {symbol} 的元数据无效"));
+                    }
+                    device_symbols.push(symbol);
+                }
+                ElmRustMetadataKind::DeviceDiscovery => {
+                    expect_fields(
+                        record,
+                        &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_RESOURCE],
+                    )?;
+                    let name = field_string(record, ELM_META_FIELD_SYMBOL)?;
+                    let bus = field_string(record, ELM_META_FIELD_RESOURCE)?;
+                    if name.is_empty() || bus.is_empty() || bus.len() > 64 {
+                        return Err("设备发现元数据无效".to_string());
+                    }
+                }
             }
+        }
+        for driver in &device_drivers {
+            for (symbol, expected_role) in [
+                (&driver.match_callback, "match"),
+                (&driver.probe_callback, "probe"),
+                (&driver.remove_callback, "remove"),
+            ] {
+                if device_callbacks.get(symbol).copied() != Some(expected_role) {
+                    return Err(format!(
+                        "设备驱动引用的 {expected_role} 回调 {symbol} 不存在或角色不匹配"
+                    ));
+                }
+            }
+        }
+        device_symbols.sort();
+        if device_symbols.windows(2).any(|symbols| symbols[0] == symbols[1]) {
+            return Err("设备 ABI 回调导出符号重复".to_string());
         }
         validate_and_sort(
             &mut lifecycle,
@@ -348,6 +480,7 @@ impl NativeMetadata {
             extension_points,
             extensions,
             kernel_apis,
+            device_symbols,
             api_root_import_index: 0,
             api_versions: vec![ELM_API_VERSION_V1],
             api_required_features: ELM_API_FEATURES_V1,
@@ -373,6 +506,9 @@ impl NativeMetadata {
             if let Some(snapshot) = &provider.snapshot_symbol {
                 names.insert(snapshot.clone());
             }
+        }
+        for symbol in &self.device_symbols {
+            names.insert(symbol.clone());
         }
         names.into_iter().collect()
     }

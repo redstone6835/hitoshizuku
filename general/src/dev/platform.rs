@@ -519,7 +519,7 @@ pub fn register_and_probe_platform_device(
         name: name.clone(),
         identity,
     };
-    let new_dev = PnpDevice::new(id, name, Box::new(info));
+    let new_dev = PnpDevice::new(id, name, Box::new(info))?;
     let registration = PNP_DEVICES.get_or_insert(Arc::clone(&new_dev))?;
     let dev = registration.device;
     let inserted = registration.inserted;
@@ -534,7 +534,7 @@ pub fn register_and_probe_platform_device(
         PnpState::Discovered => {}
         PnpState::Probing | PnpState::Removing | PnpState::Gone => {
             if inserted {
-                PNP_DEVICES.remove(&dev.id);
+                PNP_DEVICES.remove_exact(&dev);
             }
             return Err(PnpError::InvalidState);
         }
@@ -555,7 +555,7 @@ pub fn register_and_probe_platform_device(
         }),
         Err(err) => {
             if inserted {
-                PNP_DEVICES.remove(&dev.id);
+                PNP_DEVICES.remove_exact(&dev);
             }
             Err(err)
         }

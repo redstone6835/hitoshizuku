@@ -6,6 +6,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-elm = { path = "../../libs/elm", default-features = false, features = ["runtime-model"] }
+elm = { path = "../../libs/elm", default-features = false, features = ["runtime-model", "macros"] }
 kernel-api = { path = "../../kernel-api", default-features = false, features = ["runtime-model"] }
 ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
