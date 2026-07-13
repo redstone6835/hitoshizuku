@@ -589,19 +589,18 @@ pub fn clone_with_context_outcome(
                 break;
             }
             let parent = current_task();
-            wait_child
+            let entry = wait_child
                 .vfork_done
                 .prepare_to_wait(&parent, TaskState::Sleeping);
             if !wait_child.is_vforking() {
-                wait_child.vfork_done.finish_wait(&parent);
+                wait_child.vfork_done.finish_wait(&entry);
                 break;
             }
             drop(wait_child);
             drop(parent);
             schedule_once(crate::scheduler::now_ns_public());
-            let parent = current_task();
             if let Some(wait_child) = child_wait.upgrade() {
-                wait_child.vfork_done.finish_wait(&parent);
+                wait_child.vfork_done.finish_wait(&entry);
             }
         }
     } else if !args.flags.has(CloneFlags::CLONE_THREAD) {
@@ -844,7 +843,7 @@ fn wait_common(
         if has_interrupting_signal(&me) {
             return Err(Errno::EINTR);
         }
-        me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
+        let entry = me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
         if wait_child_observable(
             &me,
             target.clone(),
@@ -852,13 +851,13 @@ fn wait_common(
             wait_stopped,
             wait_continued,
         ) {
-            me.exit_waiters.finish_wait(&me);
+            me.exit_waiters.finish_wait(&entry);
             continue;
         }
         drop(me);
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
-        me.exit_waiters.finish_wait(&me);
+        me.exit_waiters.finish_wait(&entry);
         if has_interrupting_signal(&me) {
             return Err(Errno::EINTR);
         }

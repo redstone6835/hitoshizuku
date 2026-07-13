@@ -11,3 +11,4 @@ mod test_scheduler_state;
 mod test_signal;
 mod test_thread_metadata;
 mod test_wait_flags;
+mod test_wait_queue;

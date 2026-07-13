@@ -105,21 +105,18 @@ impl<T> Completion<T> {
                 }
             }
             let task = sched::current_task();
-            let _ = task.cas_state(sched::TaskState::Running, sched::TaskState::Sleeping);
-            let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Sleeping);
-            self.wait_queue.enqueue(&task);
+            let entry = self
+                .wait_queue
+                .prepare_to_wait(&task, sched::TaskState::Sleeping);
             if self.done.load(Ordering::Acquire) {
-                self.wait_queue.remove(&task);
+                self.wait_queue.finish_wait(&entry);
                 if let Some(result) = self.result.lock().take() {
-                    restore_current_after_wait(&task);
                     return result;
                 }
             }
             drop(task);
             sched::schedule_once(sched::now_ns_public());
-            let task = sched::current_task();
-            self.wait_queue.remove(&task);
-            restore_current_after_wait(&task);
+            self.wait_queue.finish_wait(&entry);
         }
     }
 
@@ -132,11 +129,5 @@ impl<T> Completion<T> {
             }
             core::hint::spin_loop();
         }
-    }
-}
-
-fn restore_current_after_wait(task: &Arc<sched::Task>) {
-    if !task.cas_state(sched::TaskState::Sleeping, sched::TaskState::Running) {
-        let _ = task.cas_state(sched::TaskState::Runnable, sched::TaskState::Running);
     }
 }

@@ -125,7 +125,7 @@ pub use task::{
     TaskKind, TaskPreExitHook, TaskState, TaskUsage, ext_clone_hook, ext_exit_hook, pre_exit_hook,
     register_ext_clone_hook, register_ext_exit_hook, register_pre_exit_hook, task_diag,
 };
-pub use wait::WaitQueue;
+pub use wait::{WaitQueue, WaitQueueEntry};
 pub use wait_flags::{WaitId, WaitOptions, WaitResult, WaitStatus};
 
 #[cfg(test)]

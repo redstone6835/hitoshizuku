@@ -244,7 +244,7 @@ impl SchedDomain {
 
 /// 某个任务在当前拓扑下的调度放置快照。
 ///
-/// 这个结构只描述调度核心的通用事实，不包含任何用户态 ABI 编码。`affinity`
+/// 这个结构只描述调度器的通用事实，不包含任何用户态 ABI 编码。`affinity`
 /// 是任务声明的 CPU 许可集，`effective` 是再与在线 CPU 集相交后的实际可运行集；
 /// `preferred_cpu` 是按当前负载、调度域和是否优先保持原 CPU 计算出的候选 CPU。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
