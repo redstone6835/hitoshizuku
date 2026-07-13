@@ -1,4 +1,4 @@
-//! 调度域核心与每 CPU 运行状态所有权。
+//! 调度器与每 CPU 运行状态所有权。
 //!
 //! 本模块只收拢调度系统的运行期状态，不改变 EEVDF、RT、Deadline 或任务迁移
 //! 策略。所有策略入口仍由 `scheduler` 门面提供，但真实状态只能通过
@@ -10,8 +10,11 @@ use alloc::vec::Vec;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 
-use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedTopology};
-use crate::runqueue::Runqueue;
+use crate::cpu::{
+    CpuId, CpuMask, MAX_CPUS, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedTopology,
+};
+use crate::runqueue::{Runqueue, RunqueueClassLoad};
+use crate::sched_class::SchedClass;
 use crate::sync::Spinlock;
 use crate::task::Task;
 
@@ -157,6 +160,7 @@ pub struct Scheduler {
     cpus: [CpuSchedState; MAX_CPUS],
     online: AtomicU64,
     topology: Spinlock<TopologyState>,
+    domain_stats: Spinlock<[SchedDomainStats; MAX_SCHED_DOMAINS]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +176,43 @@ pub struct TopologySnapshot {
     pub online: CpuMask,
 }
 
+/// 一个调度域在指定拓扑代际下的聚合负载与有效容量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedDomainStats {
+    pub generation: u64,
+    pub online: CpuMask,
+    pub capacity: u64,
+    pub load: RunqueueClassLoad,
+}
+
+impl SchedDomainStats {
+    pub const fn empty() -> Self {
+        Self {
+            generation: 0,
+            online: CpuMask::EMPTY,
+            capacity: 0,
+            load: RunqueueClassLoad {
+                deadline: 0,
+                deadline_utilization: 0,
+                realtime: 0,
+                fair: 0,
+                fair_weight: 0,
+            },
+        }
+    }
+
+    /// 以 [`SCHED_CAPACITY_SCALE`] 为 100% 计算指定调度类的平均利用率。
+    pub fn utilization(self, class: SchedClass) -> u64 {
+        if self.capacity == 0 {
+            return 0;
+        }
+        self.load
+            .balance_load(class)
+            .saturating_mul(SCHED_CAPACITY_SCALE)
+            / self.capacity
+    }
+}
+
 impl Scheduler {
     pub const fn new() -> Self {
         Self {
@@ -181,6 +222,7 @@ impl Scheduler {
                 topology: SchedTopology::bootstrap(),
                 generation: 1,
             }),
+            domain_stats: Spinlock::new([SchedDomainStats::empty(); MAX_SCHED_DOMAINS]),
         }
     }
 
@@ -202,6 +244,7 @@ impl Scheduler {
 
     pub fn register_cpu(&self, cpu: CpuId) {
         self.online.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
+        *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
     }
 
     pub fn topology(&self) -> SchedTopology {
@@ -217,10 +260,50 @@ impl Scheduler {
         }
     }
 
+    pub fn update_domain_stats(
+        &self,
+        snapshot: TopologySnapshot,
+        cpu_loads: &[RunqueueClassLoad; MAX_CPUS],
+    ) {
+        let mut stats = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
+        for domain_id in 0..snapshot.topology.len() {
+            let Some(domain) = snapshot.topology.domain(domain_id) else {
+                continue;
+            };
+            let cpus = domain.span().intersection(snapshot.online);
+            let mut load = RunqueueClassLoad::default();
+            for cpu in cpus.iter() {
+                load = load.add(cpu_loads[cpu.get()]);
+            }
+            stats[domain_id] = SchedDomainStats {
+                generation: snapshot.generation,
+                online: snapshot.online,
+                capacity: domain.effective_capacity(snapshot.online),
+                load,
+            };
+        }
+        let state = self.topology.lock();
+        if state.generation == snapshot.generation && self.online_set() == snapshot.online {
+            *self.domain_stats.lock() = stats;
+        }
+    }
+
+    pub fn domain_stats(&self, domain_id: usize) -> Option<SchedDomainStats> {
+        let snapshot = self.topology_snapshot();
+        let stats = self.domain_stats.lock();
+        let value = *stats.get(domain_id)?;
+        (value.capacity != 0
+            && value.generation == snapshot.generation
+            && value.online == snapshot.online)
+            .then_some(value)
+    }
+
     pub fn install_topology(&self, topology: SchedTopology) {
         let mut state = self.topology.lock();
         state.topology = topology;
         state.generation = state.generation.wrapping_add(1).max(1);
+        drop(state);
+        *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
     }
 }
 

@@ -10,7 +10,7 @@ use ktest::ktest;
 
 use crate::{
     ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue,
-    SchedAttr, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    SchedAttr, SchedClass, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
     supported_cpu_mask,
 };
 
@@ -148,6 +148,67 @@ fn runqueue_migratable_load_filters_cpu_affinity() {
 
     assert!(rq.dequeue(&cpu0, 2));
     assert!(rq.dequeue(&cpu1, 2));
+}
+
+#[ktest]
+fn runqueue_reports_migratable_load_by_sched_class() {
+    let fair = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+    let deadline = make_task();
+    deadline
+        .sched
+        .set_sched_attr(SchedAttr::deadline(1_000_000, 4_000_000, 4_000_000));
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&realtime), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&deadline), 1);
+
+    let load = rq.migratable_class_load();
+    assert_eq!(load.fair, 1);
+    assert_eq!(load.realtime, 1);
+    assert_eq!(load.deadline, 1);
+    assert_eq!(load.deadline_utilization, 256);
+    assert_eq!(load.fair_weight, 1024);
+    assert_eq!(load.total(), 3);
+
+    assert!(rq.dequeue(&fair, 2));
+    assert!(rq.dequeue(&realtime, 2));
+    assert!(rq.dequeue(&deadline, 2));
+}
+
+#[ktest]
+fn runqueue_takes_migratable_task_from_requested_class() {
+    let fair = make_task();
+    let realtime = make_task();
+    realtime.sched.set_sched_attr(SchedAttr::rt_fifo(20));
+
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&realtime), 1);
+
+    let pulled = rq
+        .take_migratable_from_class(SchedClass::Realtime, CpuMask::single_raw(0).bits(), 2)
+        .expect("realtime task should be migratable");
+    assert!(alloc::sync::Arc::ptr_eq(&pulled, &realtime));
+    assert_eq!(rq.migratable_class_load().fair, 1);
+    assert_eq!(rq.migratable_class_load().realtime, 0);
+
+    assert!(rq.dequeue(&fair, 3));
+}
+
+#[ktest]
+fn runqueue_class_load_includes_current_task() {
+    let fair = make_task();
+    let rq = Runqueue::new();
+    rq.enqueue(alloc::sync::Arc::clone(&fair), 1);
+    let current = rq.pick_next(2).expect("current task");
+
+    assert_eq!(rq.migratable_class_load().fair, 0);
+    assert_eq!(rq.class_load().fair, 1);
+
+    assert!(rq.dequeue(&current, 3));
 }
 
 #[ktest]

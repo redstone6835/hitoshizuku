@@ -22,13 +22,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch_hooks;
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
-use crate::eevdf::SchedParams;
+use crate::eevdf::{NICE_0_WEIGHT, SchedParams};
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
 use crate::migration::MigrationContext;
 use crate::pid::PidNamespace;
-use crate::runqueue::Runqueue;
-use crate::sched_class::SchedAttr;
+use crate::runqueue::{Runqueue, RunqueueClassLoad};
+use crate::sched_class::{SchedAttr, SchedClass};
 use crate::scheduler_state::{SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
@@ -65,6 +65,34 @@ impl RunqueueLoadSnapshot {
 
     pub(crate) fn load_of(self, cpu: CpuId) -> usize {
         self.loads[cpu.get()]
+    }
+}
+
+/// 一次域平衡决策内使用的各调度类负载快照。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunqueueClassLoadSnapshot {
+    loads: [RunqueueClassLoad; NR_CPUS],
+}
+
+impl RunqueueClassLoadSnapshot {
+    pub(crate) fn collect<F>(cpus: CpuMask, mut load_of: F) -> Self
+    where
+        F: FnMut(CpuId) -> RunqueueClassLoad,
+    {
+        let sampled = cpus.intersection(CpuMask::SUPPORTED);
+        let mut loads = [RunqueueClassLoad::default(); NR_CPUS];
+        for cpu in sampled.iter() {
+            loads[cpu.get()] = load_of(cpu);
+        }
+        Self { loads }
+    }
+
+    pub(crate) fn load_of(self, cpu: CpuId) -> RunqueueClassLoad {
+        self.loads[cpu.get()]
+    }
+
+    pub(crate) fn loads(&self) -> &[RunqueueClassLoad; NR_CPUS] {
+        &self.loads
     }
 }
 
@@ -438,6 +466,12 @@ pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
         .map(|domain| domain.id())
 }
 
+/// 刷新并返回指定调度域的负载统计。
+pub fn sched_domain_stats(domain_id: usize) -> Option<crate::SchedDomainStats> {
+    refresh_domain_stats();
+    SCHEDULER.domain_stats(domain_id)
+}
+
 /// 查询某个任务在当前拓扑下的调度放置状态。
 ///
 /// 返回值只是快照：函数不会迁移任务，也不承诺下一次入队一定选中同一 CPU。
@@ -458,6 +492,14 @@ fn collect_rq_load_snapshot(cpus: CpuMask) -> RunqueueLoadSnapshot {
     RunqueueLoadSnapshot::collect(cpus, |cpu| {
         SCHEDULER.cpu_or_boot(cpu.get()).runqueue().nr_running()
     })
+}
+
+fn refresh_domain_stats() {
+    let snapshot = SCHEDULER.topology_snapshot();
+    let loads = RunqueueClassLoadSnapshot::collect(snapshot.online, |cpu| {
+        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
+    });
+    SCHEDULER.update_domain_stats(snapshot, loads.loads());
 }
 
 /// 按当前拓扑、在线 CPU 和一次性 rq 负载快照选择目标 CPU。
@@ -1003,31 +1045,51 @@ pub fn balance_once(cpu_id: usize) -> bool {
         return false;
     }
 
-    let topology = sched_topology();
+    let topology_snapshot = SCHEDULER.topology_snapshot();
+    let topology = topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
-    let sample_cpus = topology
-        .balance_sources(local_cpu, online)
-        .union(CpuMask::single(local_cpu));
-    let load_snapshot = RunqueueLoadSnapshot::collect(sample_cpus, |cpu| {
+    let domain_loads = RunqueueClassLoadSnapshot::collect(online, |cpu| {
+        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
+    });
+    SCHEDULER.update_domain_stats(topology_snapshot, domain_loads.loads());
+
+    let load_snapshot = RunqueueClassLoadSnapshot::collect(online, |cpu| {
         SCHEDULER
             .cpu_or_boot(cpu.get())
             .runqueue()
-            .migratable_load_for(allowed)
+            .migratable_class_load_for(allowed)
     });
-    let local_load = load_snapshot.load_of(local_cpu);
-    let Some(src) = select_balance_source(topology, local_cpu, online, local_load, |cpu| {
-        load_snapshot.load_of(cpu)
-    })
-    .map(|cpu| cpu.get()) else {
+    let classes = [SchedClass::Deadline, SchedClass::Realtime, SchedClass::Fair];
+    let Some((src, class)) = classes.into_iter().find_map(|class| {
+        select_balance_source_for_class(topology, local_cpu, online, class, |cpu| {
+            load_snapshot.load_of(cpu)
+        })
+        .map(|source| (source.get(), class))
+    }) else {
         return false;
     };
     let Some(task) = SCHEDULER
         .cpu_or_boot(src)
         .runqueue()
-        .take_migratable(allowed, now_ns_internal())
+        .take_migratable_from_class(class, allowed, now_ns_internal())
     else {
         return false;
     };
+    if class == SchedClass::Deadline {
+        let target_load = domain_loads.load_of(local_cpu);
+        let task_utilization = deadline_task_utilization(&task);
+        if !deadline_has_capacity(
+            target_load,
+            task_utilization,
+            topology.cpu_capacity(local_cpu),
+        ) {
+            SCHEDULER
+                .cpu_or_boot(src)
+                .runqueue()
+                .enqueue(task, now_ns_internal());
+            return false;
+        }
+    }
     let source = task.placement();
     let topology_snapshot = SCHEDULER.topology_snapshot();
     let target_domain = topology_snapshot
@@ -1054,35 +1116,106 @@ pub fn balance_once(cpu_id: usize) -> bool {
     attach_migrated_task(&task, context, true).is_ok()
 }
 
-pub(crate) fn select_balance_source<F>(
+pub(crate) fn select_balance_source_for_class<F>(
     topology: SchedTopology,
     local_cpu: CpuId,
     online: CpuMask,
-    local_load: usize,
+    class: SchedClass,
     mut load_of: F,
 ) -> Option<CpuId>
 where
-    F: FnMut(CpuId) -> usize,
+    F: FnMut(CpuId) -> RunqueueClassLoad,
 {
-    let mut busiest = None;
-    let mut busiest_load = local_load;
-    let sources = topology.balance_sources(local_cpu, online);
-    for other in sources.iter() {
-        let load = load_of(other);
-        if load == 0 {
-            continue;
-        }
-        let should_pull = if local_load == 0 {
-            busiest.is_none() || load > busiest_load
-        } else {
-            load > local_load.saturating_add(1) && load > busiest_load
-        };
-        if should_pull {
-            busiest = Some(other);
-            busiest_load = load;
-        }
+    if class == SchedClass::Idle {
+        return None;
     }
-    busiest
+    let local_load = load_of(local_cpu);
+    let local_capacity = topology.cpu_capacity(local_cpu);
+    let local_utilization = normalized_load(local_load.balance_load(class), local_capacity);
+    let mut domain = topology
+        .domain_for_cpu(local_cpu)
+        .unwrap_or_else(|| topology.root_domain());
+
+    loop {
+        let mut busiest = None;
+        let mut busiest_utilization = local_utilization;
+        for other in domain.span().intersection(online).without(local_cpu).iter() {
+            let load = load_of(other);
+            if !class_allows_pull(class, local_load, load) {
+                continue;
+            }
+            let utilization =
+                normalized_load(load.balance_load(class), topology.cpu_capacity(other));
+            if utilization > busiest_utilization {
+                busiest = Some(other);
+                busiest_utilization = utilization;
+            }
+        }
+        if busiest.is_some() {
+            return busiest;
+        }
+        let Some(parent) = domain.parent() else {
+            return None;
+        };
+        domain = topology.domain(parent)?;
+    }
+}
+
+fn normalized_load(load: u64, capacity: u64) -> u64 {
+    if capacity == 0 {
+        return 0;
+    }
+    load.saturating_mul(crate::SCHED_CAPACITY_SCALE) / capacity
+}
+
+fn class_allows_pull(
+    class: SchedClass,
+    local_load: RunqueueClassLoad,
+    source_load: RunqueueClassLoad,
+) -> bool {
+    match class {
+        // 迁移单个 Deadline 任务不会增加并行度，还会破坏已有 CPU 局部性。
+        SchedClass::Deadline => {
+            source_load.deadline > local_load.deadline.saturating_add(1)
+                && source_load.deadline_utilization > local_load.deadline_utilization
+        }
+        SchedClass::Realtime => {
+            if local_load.realtime == 0 {
+                source_load.realtime > 0
+            } else {
+                source_load.realtime > local_load.realtime.saturating_add(1)
+            }
+        }
+        SchedClass::Fair => {
+            if local_load.fair == 0 {
+                source_load.fair > 0
+            } else {
+                source_load.fair_weight > local_load.fair_weight.saturating_add(NICE_0_WEIGHT)
+            }
+        }
+        SchedClass::Idle => false,
+    }
+}
+
+fn deadline_task_utilization(task: &Arc<Task>) -> u64 {
+    let runtime = task.sched.deadline_runtime_ns();
+    let period = task.sched.deadline_period_ns();
+    if runtime == 0 || period == 0 {
+        return 0;
+    }
+    ((runtime as u128 * crate::SCHED_CAPACITY_SCALE as u128) / period as u128).min(u64::MAX as u128)
+        as u64
+}
+
+pub(crate) fn deadline_has_capacity(
+    target_load: RunqueueClassLoad,
+    task_utilization: u64,
+    capacity: u64,
+) -> bool {
+    target_load
+        .deadline_utilization
+        .saturating_add(task_utilization)
+        <= capacity
 }
 
 fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usize) {

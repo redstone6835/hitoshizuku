@@ -1,8 +1,11 @@
-//! 调度域核心所有权与 per-CPU 状态隔离测试。
+//! 调度器状态所有权与 per-CPU 状态隔离测试。
 
 use ktest::ktest;
 
-use crate::{CpuId, CpuMask, SchedDomain, SchedTopology, Scheduler};
+use crate::{
+    CpuId, CpuMask, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedClass, SchedDomain,
+    SchedTopology, Scheduler,
+};
 
 #[ktest]
 fn scheduler_state_bootstraps_root_and_boot_cpu() {
@@ -56,4 +59,39 @@ fn scheduler_state_installs_topology_and_online_cpu_together() {
     assert!(core.topology_snapshot().generation > old_generation);
     assert!(core.online_set().contains(CpuId::boot()));
     assert!(core.online_set().contains(CpuId::new(1).unwrap()));
+}
+
+#[ktest]
+fn scheduler_state_aggregates_load_for_nested_domains() {
+    let scheduler = Scheduler::new();
+    let cluster = SchedDomain::new(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+    )
+    .expect("cluster domain");
+    let cpu0 = SchedDomain::new(2, CpuMask::single_raw(0), 2, Some(1)).expect("cpu0 domain");
+    let topology =
+        SchedTopology::from_domains(&[SchedDomain::root(), cluster, cpu0]).expect("valid topology");
+    scheduler.install_topology(topology);
+    scheduler.register_cpu(CpuId::new(1).expect("cpu1"));
+
+    let mut cpu_loads = [RunqueueClassLoad::default(); crate::NR_CPUS];
+    cpu_loads[0].fair = 2;
+    cpu_loads[0].fair_weight = 2 * SCHED_CAPACITY_SCALE;
+    cpu_loads[1].realtime = 1;
+    let snapshot = scheduler.topology_snapshot();
+    scheduler.update_domain_stats(snapshot, &cpu_loads);
+
+    let root = scheduler.domain_stats(0).expect("root stats");
+    let cluster = scheduler.domain_stats(1).expect("cluster stats");
+    let leaf = scheduler.domain_stats(2).expect("leaf stats");
+    assert_eq!(root.load, cluster.load);
+    assert_eq!(cluster.load.fair, 2);
+    assert_eq!(cluster.load.realtime, 1);
+    assert_eq!(cluster.capacity, 2 * SCHED_CAPACITY_SCALE);
+    assert_eq!(leaf.load.fair, 2);
+    assert_eq!(leaf.capacity, SCHED_CAPACITY_SCALE);
+    assert_eq!(cluster.utilization(SchedClass::Fair), SCHED_CAPACITY_SCALE);
 }

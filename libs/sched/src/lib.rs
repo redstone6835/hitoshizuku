@@ -75,7 +75,10 @@ pub mod wait_flags;
 
 pub use arch_hooks::{ArchContextOps, CpuControlOps, KernelEntry, TaskCpuStateOps};
 pub use clone_flags::{CloneArgs, CloneFlags};
-pub use cpu::{CpuId, CpuMask, SchedDomain, SchedPlacement, SchedTopology};
+pub use cpu::{
+    CpuId, CpuMask, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedDomain, SchedPlacement,
+    SchedTopology,
+};
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
@@ -86,7 +89,7 @@ pub use process_ops::{
     ExecRequest, ProcessImageOps, UserContextRef, process_image_ops, register_process_image_ops,
 };
 pub use rlimit::{Resource, Rlim, RlimitError, RlimitPair, Rlimits, RlimitsLock};
-pub use runqueue::Runqueue;
+pub use runqueue::{Runqueue, RunqueueClassLoad};
 pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
     RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
@@ -105,9 +108,10 @@ pub use scheduler::{
 pub use scheduler::{RealtimeItimerSpec, get_realtime_itimer};
 pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu};
 pub use scheduler::{
-    current_sched_domain_id, install_sched_topology, sched_topology, task_sched_placement,
+    current_sched_domain_id, install_sched_topology, sched_domain_stats, sched_topology,
+    task_sched_placement,
 };
-pub use scheduler_state::{CpuSchedState, Scheduler, TopologySnapshot};
+pub use scheduler_state::{CpuSchedState, SchedDomainStats, Scheduler, TopologySnapshot};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
     SigSet, SignalNumber, SignalState,
