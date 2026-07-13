@@ -31,7 +31,7 @@ static TEST_ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
     switch_context: switch_test_context,
 };
 
-fn make_task() -> alloc::sync::Arc<Task> {
+pub(super) fn make_task() -> alloc::sync::Arc<Task> {
     crate::arch_hooks::register(&TEST_ARCH_CONTEXT_OPS);
     let session = Session::new();
     let pg = ProcessGroup::new(&session);

@@ -1187,6 +1187,25 @@ impl Task {
         self.set_current_cpu(cpu.get());
     }
 
+    pub(crate) fn begin_migration(&self, source: PlacementSnapshot) -> bool {
+        self.placement.begin_migration(source)
+    }
+
+    pub(crate) fn commit_migration(
+        &self,
+        cpu: crate::CpuId,
+        domain_id: usize,
+        topology_generation: u64,
+    ) {
+        self.placement
+            .store_bound(cpu, domain_id, topology_generation);
+        self.set_current_cpu(cpu.get());
+    }
+
+    pub(crate) fn rollback_migration(&self, source: PlacementSnapshot) {
+        self.placement.rollback(source);
+    }
+
     pub fn ioprio(&self) -> u16 {
         self.ioprio.load(Ordering::Acquire) as u16
     }

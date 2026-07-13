@@ -67,6 +67,28 @@ impl TaskPlacement {
     }
 
     pub(crate) fn bind(&self, cpu: CpuId, domain_id: usize, topology_generation: u64) {
+        self.store_bound(cpu, domain_id, topology_generation);
+    }
+
+    pub(crate) fn begin_migration(&self, source: PlacementSnapshot) -> bool {
+        if source.state != PlacementState::Bound {
+            return false;
+        }
+        let migrating = PlacementSnapshot {
+            state: PlacementState::Migrating,
+            ..source
+        };
+        self.encoded
+            .compare_exchange(
+                encode(source),
+                encode(migrating),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn store_bound(&self, cpu: CpuId, domain_id: usize, topology_generation: u64) {
         self.encoded.store(
             encode(PlacementSnapshot {
                 cpu: Some(cpu),
@@ -76,6 +98,10 @@ impl TaskPlacement {
             }),
             Ordering::Release,
         );
+    }
+
+    pub(crate) fn rollback(&self, source: PlacementSnapshot) {
+        self.encoded.store(encode(source), Ordering::Release);
     }
 }
 

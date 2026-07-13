@@ -25,10 +25,11 @@ use crate::cpu::{CpuId, CpuMask, MAX_CPUS, SchedPlacement, SchedTopology};
 use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::ids::Uid;
+use crate::migration::MigrationContext;
 use crate::pid::PidNamespace;
 use crate::runqueue::Runqueue;
 use crate::sched_class::SchedAttr;
-use crate::scheduler_state::SCHEDULER;
+use crate::scheduler_state::{SCHEDULER, TopologySnapshot};
 use crate::signal::{DefaultAction, SigHandler, SigInfo, SignalNumber, default_action};
 use crate::sync::Spinlock;
 use crate::task::Task;
@@ -859,7 +860,10 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
     }
 }
 
-pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
+fn migration_context(
+    task: &Arc<Task>,
+    target_cpu: usize,
+) -> Result<MigrationContext, errno::Errno> {
     let Some(target) = CpuId::new(target_cpu) else {
         return Err(errno::Errno::EINVAL);
     };
@@ -873,45 +877,120 @@ pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Er
     if task.state() == TaskState::Running {
         return Err(errno::Errno::EBUSY);
     }
-    if !task.sched.on_rq() {
-        bind_task_to_cpu(task, target_cpu);
-        return Ok(());
+    let mut source = task.placement();
+    if source.state == crate::PlacementState::Unbound {
+        bind_task_to_cpu(task, task.current_cpu().min(NR_CPUS - 1));
+        source = task.placement();
     }
-    let now = now_ns_internal();
-    let mut removed = false;
-    let owner = task.current_cpu();
-    if owner < NR_CPUS {
-        let owner_rq = SCHEDULER.cpu_or_boot(owner).runqueue();
-        removed = owner_rq.dequeue_queued(task, now);
-        if !removed && owner_rq.is_current(task) {
+    if source.state != crate::PlacementState::Bound {
+        return Err(errno::Errno::EBUSY);
+    }
+    let topology = SCHEDULER.topology_snapshot();
+    if source.topology_generation != topology.generation {
+        return Err(errno::Errno::EAGAIN);
+    }
+    let target_domain = topology
+        .topology
+        .domain_for_cpu(target)
+        .unwrap_or_else(|| topology.topology.root_domain())
+        .id();
+    if !task.begin_migration(source) {
+        return Err(errno::Errno::EBUSY);
+    }
+    Ok(MigrationContext {
+        source,
+        target_cpu: target,
+        target_domain,
+        topology_generation: topology.generation,
+    })
+}
+
+fn rollback_migration(task: &Arc<Task>, context: MigrationContext, requeue_source: bool) {
+    if requeue_source {
+        SCHEDULER
+            .cpu_or_boot(context.source.cpu.map_or(0, CpuId::get))
+            .runqueue()
+            .enqueue(Arc::clone(task), now_ns_internal());
+    }
+    task.rollback_migration(context.source);
+}
+
+pub(crate) fn validate_migration_target(
+    context: MigrationContext,
+    topology: TopologySnapshot,
+    affinity: CpuMask,
+) -> Result<(), errno::Errno> {
+    if topology.generation != context.topology_generation {
+        return Err(errno::Errno::EAGAIN);
+    }
+    if !topology.online.contains(context.target_cpu) || !affinity.contains(context.target_cpu) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(())
+}
+
+fn attach_migrated_task(
+    task: &Arc<Task>,
+    context: MigrationContext,
+    source_detached: bool,
+) -> Result<(), errno::Errno> {
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    let topology = SCHEDULER.topology_snapshot();
+    if let Err(error) = validate_migration_target(context, topology, affinity) {
+        rollback_migration(task, context, source_detached);
+        return Err(error);
+    }
+    if !source_detached {
+        let source_cpu = context.source.cpu.map_or(0, CpuId::get);
+        if !SCHEDULER
+            .cpu_or_boot(source_cpu)
+            .runqueue()
+            .dequeue_queued(task, now_ns_internal())
+        {
+            rollback_migration(task, context, false);
             return Err(errno::Errno::EBUSY);
         }
     }
-    if !removed {
-        for (cpu_id, cpu_state) in SCHEDULER.cpus().iter().enumerate() {
-            if cpu_id == owner {
-                continue;
-            }
-            let rq = cpu_state.runqueue();
-            if rq.dequeue_queued(task, now) {
-                removed = true;
-                break;
-            }
-            if rq.is_current(task) {
-                return Err(errno::Errno::EBUSY);
-            }
-        }
-    }
-    if !removed {
-        return Err(errno::Errno::EBUSY);
-    }
-    bind_task_to_cpu(task, target_cpu);
     SCHEDULER
-        .cpu_or_boot(target_cpu)
+        .cpu_or_boot(context.target_cpu.get())
         .runqueue()
-        .enqueue(Arc::clone(task), now);
-    request_resched(target_cpu);
+        .enqueue(Arc::clone(task), now_ns_internal());
+    if !task.sched.on_rq() {
+        rollback_migration(task, context, true);
+        return Err(errno::Errno::EIO);
+    }
+    let commit_topology = SCHEDULER.topology_snapshot();
+    let commit_affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    if validate_migration_target(context, commit_topology, commit_affinity).is_err() {
+        let _ = SCHEDULER
+            .cpu_or_boot(context.target_cpu.get())
+            .runqueue()
+            .dequeue_queued(task, now_ns_internal());
+        rollback_migration(task, context, true);
+        return Err(errno::Errno::EAGAIN);
+    }
+    task.commit_migration(
+        context.target_cpu,
+        context.target_domain,
+        context.topology_generation,
+    );
+    request_resched(context.target_cpu.get());
     Ok(())
+}
+
+pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
+    if !task.sched.on_rq() {
+        let target = CpuId::new(target_cpu).ok_or(errno::Errno::EINVAL)?;
+        if !online_cpu_set().contains(target)
+            || !CpuMask::from_bits_or_boot(task.cpu_affinity()).contains(target)
+        {
+            return Err(errno::Errno::EINVAL);
+        }
+        bind_task_to_cpu(task, target_cpu);
+        return Ok(());
+    }
+    let context = migration_context(task, target_cpu)?;
+    attach_migrated_task(task, context, false)
 }
 
 /// 从最忙 CPU 拉一个任务到 `cpu_id`。AP 启动后可由 idle/tick 路径周期调用。
@@ -949,13 +1028,30 @@ pub fn balance_once(cpu_id: usize) -> bool {
     else {
         return false;
     };
-    bind_task_to_cpu(&task, cpu_id);
-    SCHEDULER
-        .cpu_or_boot(cpu_id)
-        .runqueue()
-        .enqueue(task, now_ns_internal());
-    request_resched(cpu_id);
-    true
+    let source = task.placement();
+    let topology_snapshot = SCHEDULER.topology_snapshot();
+    let target_domain = topology_snapshot
+        .topology
+        .domain_for_cpu(local_cpu)
+        .unwrap_or_else(|| topology_snapshot.topology.root_domain())
+        .id();
+    if source.state != crate::PlacementState::Bound
+        || source.topology_generation != topology_snapshot.generation
+        || !task.begin_migration(source)
+    {
+        SCHEDULER
+            .cpu_or_boot(src)
+            .runqueue()
+            .enqueue(task, now_ns_internal());
+        return false;
+    }
+    let context = MigrationContext {
+        source,
+        target_cpu: local_cpu,
+        target_domain,
+        topology_generation: topology_snapshot.generation,
+    };
+    attach_migrated_task(&task, context, true).is_ok()
 }
 
 pub(crate) fn select_balance_source<F>(

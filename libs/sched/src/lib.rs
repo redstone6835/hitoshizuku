@@ -55,6 +55,7 @@ pub mod cpu;
 pub mod eevdf;
 pub mod group;
 pub mod ids;
+pub mod migration;
 pub mod mutex;
 pub mod operation;
 pub mod pid;
@@ -78,6 +79,7 @@ pub use cpu::{CpuId, CpuMask, SchedDomain, SchedPlacement, SchedTopology};
 pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
+pub use migration::MigrationContext;
 pub use pid::{PidNamespace, PidRegistry, PidT};
 pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};
 pub use process_ops::{
