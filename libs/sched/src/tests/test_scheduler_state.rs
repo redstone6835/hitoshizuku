@@ -1,11 +1,18 @@
 //! 调度器状态所有权与 per-CPU 状态隔离测试。
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use super::std::sync::Barrier;
+use super::std::thread;
 use ktest::ktest;
 
 use super::test_thread_metadata::make_task;
-use crate::scheduler::{offline_cpu_with_scheduler, refresh_task_placement};
+use crate::scheduler::{
+    cpu_ready_for_activation, enqueue_task_on_scheduler, offline_cpu_with_scheduler,
+    refresh_task_placement, requeue_balance_task_on,
+};
 use crate::{
     CpuId, CpuMask, PlacementState, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass,
     SchedDomain, SchedTopology, Scheduler, TaskState,
@@ -80,6 +87,77 @@ fn scheduler_state_deactivates_cpu_before_removing_online_state() {
     assert!(scheduler.unregister_cpu(cpu1));
     assert!(!scheduler.online_set().contains(cpu1));
     assert!(!scheduler.active_set().contains(cpu1));
+}
+
+#[ktest]
+fn scheduler_state_publishes_online_before_active() {
+    let scheduler = Scheduler::new();
+    let cpu1 = CpuId::new(1).expect("cpu1");
+
+    assert!(scheduler.mark_cpu_online(cpu1));
+    assert!(scheduler.online_set().contains(cpu1));
+    assert!(!scheduler.active_set().contains(cpu1));
+    assert!(scheduler.activate_cpu(cpu1));
+    assert!(scheduler.active_set().contains(cpu1));
+    assert!(!scheduler.mark_cpu_offline(cpu1));
+    assert!(scheduler.deactivate_cpu(cpu1));
+    assert!(scheduler.mark_cpu_offline(cpu1));
+}
+
+#[ktest]
+fn cpu_activation_requires_current_and_idle() {
+    let scheduler = Scheduler::new();
+    let cpu1 = CpuId::new(1).expect("cpu1");
+    let current = make_task();
+    let idle = make_task();
+    idle.mark_idle_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+    scheduler.mark_cpu_online(cpu1);
+
+    assert!(!cpu_ready_for_activation(&scheduler, 1));
+    scheduler
+        .cpu_or_boot(1)
+        .runqueue()
+        .set_current(Arc::clone(&current));
+    scheduler
+        .cpu_or_boot(1)
+        .publish_current(Arc::clone(&current));
+    assert!(!cpu_ready_for_activation(&scheduler, 1));
+    assert!(scheduler.cpu_or_boot(1).install_idle(idle).is_ok());
+    assert!(cpu_ready_for_activation(&scheduler, 1));
+
+    let _ = scheduler.cpu_or_boot(1).clear_current();
+    assert!(scheduler.cpu_or_boot(1).runqueue().dequeue(&current, 1));
+    let _ = scheduler.cpu_or_boot(1).clear_idle();
+}
+
+#[ktest]
+fn cpu_deactivation_waits_for_enqueue_in_progress() {
+    let scheduler = Arc::new(two_cpu_scheduler());
+    let cpu1 = CpuId::new(1).expect("cpu1");
+    let enqueue_guard = scheduler.cpu_or_boot(1).begin_enqueue();
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+
+    let worker_scheduler = Arc::clone(&scheduler);
+    let worker_started = Arc::clone(&started);
+    let worker_finished = Arc::clone(&finished);
+    let worker = thread::spawn(move || {
+        worker_started.store(true, Ordering::Release);
+        assert!(worker_scheduler.deactivate_cpu(cpu1));
+        worker_finished.store(true, Ordering::Release);
+    });
+
+    while !started.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    while scheduler.active_set().contains(cpu1) {
+        thread::yield_now();
+    }
+    assert!(!finished.load(Ordering::Acquire));
+    drop(enqueue_guard);
+    worker.join().expect("deactivate worker");
+    assert!(finished.load(Ordering::Acquire));
 }
 
 #[ktest]
@@ -236,6 +314,77 @@ fn topology_refresh_updates_runnable_and_sleeping_placements() {
         assert_eq!(task.placement().topology_generation, new_generation);
         assert_eq!(task.placement().state, PlacementState::Bound);
     }
+}
+
+#[ktest]
+fn task_enqueue_falls_back_when_previous_cpu_is_inactive() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_state(TaskState::Sleeping);
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    assert!(scheduler.deactivate_cpu(CpuId::new(1).expect("cpu1")));
+
+    let cpu_id = enqueue_task_on_scheduler(&scheduler, Arc::clone(&task), 1, false, true);
+
+    assert_eq!(cpu_id, 0);
+    assert_eq!(task.placement().cpu, CpuId::new(0));
+    assert!(scheduler.cpu_or_boot(0).runqueue().dequeue_queued(&task, 2));
+}
+
+#[ktest]
+fn balance_requeue_avoids_inactive_source_cpu() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_state(TaskState::Runnable);
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    assert!(scheduler.deactivate_cpu(CpuId::new(1).expect("cpu1")));
+
+    let cpu_id = requeue_balance_task_on(&scheduler, Arc::clone(&task), 1, 1);
+
+    assert_eq!(cpu_id, 0);
+    assert_eq!(task.placement().cpu, CpuId::new(0));
+    assert!(scheduler.cpu_or_boot(0).runqueue().dequeue_queued(&task, 2));
+}
+
+#[ktest]
+fn concurrent_wake_enqueues_task_once() {
+    let scheduler = Arc::new(two_cpu_scheduler());
+    let task = make_task();
+    task.set_state(TaskState::Sleeping);
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+
+    for now_ns in [1, 2] {
+        let worker_scheduler = Arc::clone(&scheduler);
+        let worker_task = Arc::clone(&task);
+        let worker_barrier = Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            worker_barrier.wait();
+            enqueue_task_on_scheduler(&worker_scheduler, worker_task, now_ns, false, true)
+        }));
+    }
+    barrier.wait();
+    for worker in workers {
+        let _ = worker.join().expect("wake worker");
+    }
+
+    let placement = task.placement();
+    let mut queued = 0usize;
+    for cpu_id in 0..=1 {
+        if scheduler
+            .cpu_or_boot(cpu_id)
+            .runqueue()
+            .dequeue_queued(&task, 3)
+        {
+            assert_eq!(placement.cpu, CpuId::new(cpu_id));
+            queued += 1;
+        }
+    }
+    assert_eq!(queued, 1);
 }
 
 fn two_cpu_scheduler() -> Scheduler {

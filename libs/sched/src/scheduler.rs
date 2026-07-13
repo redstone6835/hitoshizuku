@@ -165,8 +165,12 @@ fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
 }
 
 fn bind_task_to_cpu(task: &Task, cpu_id: usize) {
+    bind_task_to_cpu_on(&SCHEDULER, task, cpu_id);
+}
+
+fn bind_task_to_cpu_on(scheduler: &crate::Scheduler, task: &Task, cpu_id: usize) {
     let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
-    let snapshot = SCHEDULER.topology_snapshot();
+    let snapshot = scheduler.topology_snapshot();
     let domain_id = snapshot
         .topology
         .domain_for_cpu(cpu)
@@ -442,6 +446,10 @@ pub fn online_cpu_mask() -> u64 {
     SCHEDULER.online_set().bits()
 }
 
+pub fn active_cpu_mask() -> u64 {
+    SCHEDULER.active_set().bits()
+}
+
 pub const fn supported_cpu_mask() -> u64 {
     CpuMask::SUPPORTED.bits()
 }
@@ -510,16 +518,22 @@ pub fn sched_domain_stats(domain_id: usize) -> Option<crate::SchedDomainStats> {
 /// 返回值只是快照：函数不会迁移任务，也不承诺下一次入队一定选中同一 CPU。
 /// 调用方可用它向用户态或诊断路径解释“为什么这个任务能在哪些 CPU 上运行”。
 pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
-    let _ = refresh_task_placement(&SCHEDULER, task);
+    task_sched_placement_on(&SCHEDULER, task)
+}
+
+fn task_sched_placement_on(scheduler: &crate::Scheduler, task: &Arc<Task>) -> SchedPlacement {
+    let _ = refresh_task_placement(scheduler, task);
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
-    let active = active_cpu_set();
+    let active = scheduler.active_set();
     let current = CpuId::new(task.current_cpu());
     let prefer_current = task.state() != TaskState::New;
-    let load_snapshot = collect_rq_load_snapshot_for(&SCHEDULER, affinity.intersection(active));
+    let load_snapshot = collect_rq_load_snapshot_for(scheduler, affinity.intersection(active));
 
-    sched_topology().describe_placement(affinity, active, current, prefer_current, |cpu| {
-        load_snapshot.load_of(cpu)
-    })
+    scheduler
+        .topology()
+        .describe_placement(affinity, active, current, prefer_current, |cpu| {
+            load_snapshot.load_of(cpu)
+        })
 }
 
 fn collect_rq_load_snapshot_for(
@@ -568,6 +582,36 @@ pub fn is_cpu_online(cpu_id: usize) -> bool {
     CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.online_set().contains(cpu))
 }
 
+pub fn is_cpu_active(cpu_id: usize) -> bool {
+    CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.active_set().contains(cpu))
+}
+
+pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+    let _ = SCHEDULER.mark_cpu_online(cpu);
+    Ok(())
+}
+
+pub fn activate_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+    if !cpu_ready_for_activation(&SCHEDULER, cpu_id) {
+        return Err(errno::Errno::EBUSY);
+    }
+    if !SCHEDULER.activate_cpu(cpu) {
+        return Err(errno::Errno::EINVAL);
+    }
+    Ok(())
+}
+
+pub(crate) fn cpu_ready_for_activation(scheduler: &crate::Scheduler, cpu_id: usize) -> bool {
+    scheduler
+        .cpu(cpu_id)
+        .is_some_and(|cpu_state| cpu_state.current().is_some() && cpu_state.idle().is_some())
+}
+
+/// 兼容旧调用：一次完成 online 和 active 发布。
 pub fn register_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     register_cpu_locked(cpu_id)
@@ -577,7 +621,10 @@ fn register_cpu_locked(cpu_id: usize) -> Result<(), errno::Errno> {
     let Some(cpu) = CpuId::new(cpu_id) else {
         return Err(errno::Errno::EINVAL);
     };
-    SCHEDULER.register_cpu(cpu);
+    let _ = SCHEDULER.mark_cpu_online(cpu);
+    if !SCHEDULER.activate_cpu(cpu) {
+        return Err(errno::Errno::EINVAL);
+    }
     Ok(())
 }
 
@@ -706,7 +753,9 @@ pub(crate) fn offline_cpu_with_scheduler(
         stop_cpu_task(cpu_state, task, now_ns);
     }
     cpu_state.clear_scheduling_requests();
-    scheduler.unregister_cpu(cpu);
+    if !scheduler.mark_cpu_offline(cpu) {
+        return Err(errno::Errno::EBUSY);
+    }
     Ok(())
 }
 
@@ -776,7 +825,7 @@ pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Er
     if CpuId::new(cpu_id).is_none() {
         return Err(errno::Errno::EINVAL);
     }
-    register_cpu(cpu_id)?;
+    mark_cpu_online(cpu_id)?;
     bind_task_to_cpu(&task, cpu_id);
     if task.arch_context().is_none() {
         task.adopt_current_context();
@@ -807,6 +856,10 @@ pub fn request_resched(cpu_id: usize) {
         return;
     }
     SCHEDULER.cpu_or_boot(cpu_id).request_resched();
+    notify_resched(cpu_id);
+}
+
+fn notify_resched(cpu_id: usize) {
     if cpu_id != cpu() {
         if let Some(ops) = arch_hooks::cpu_control() {
             if (ops.is_online)(cpu_id) {
@@ -896,8 +949,8 @@ pub fn select_task_cpu(task: &Arc<Task>) -> usize {
 
 /// 统一入队入口：设置任务 CPU 归属、入目标 runqueue、请求该 CPU 调度。
 pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
-    let cpu_id = enqueue_task_locked(task, now_ns);
-    request_resched(cpu_id);
+    let cpu_id = enqueue_task_locked(task, now_ns, true);
+    notify_resched(cpu_id);
     cpu_id
 }
 
@@ -907,8 +960,8 @@ pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
 /// 复查任务状态、CPU 亲和性和 class；提示只消费一次，用于避免 pthread
 /// join / condvar / mutex 这类短等待路径退化到等待下一个 tick。
 pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
-    let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true);
-    request_resched(cpu_id);
+    let cpu_id = enqueue_task_locked_with_preference(task, now_ns, true, true);
+    notify_resched(cpu_id);
     cpu_id
 }
 
@@ -919,14 +972,29 @@ pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
 /// bind/listen。这个入口仅用于这类“父可运行，但当前 child 应先返回用户态”的
 /// 场景。
 pub fn enqueue_task_deferred(task: Arc<Task>, now_ns: u64) -> usize {
-    enqueue_task_locked(task, now_ns)
+    enqueue_task_locked(task, now_ns, false)
 }
 
-fn enqueue_task_locked(task: Arc<Task>, now_ns: u64) -> usize {
-    enqueue_task_locked_with_preference(task, now_ns, false)
+fn enqueue_task_locked(task: Arc<Task>, now_ns: u64, request_reschedule: bool) -> usize {
+    enqueue_task_locked_with_preference(task, now_ns, false, request_reschedule)
 }
 
-fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: bool) -> usize {
+fn enqueue_task_locked_with_preference(
+    task: Arc<Task>,
+    now_ns: u64,
+    preferred: bool,
+    request_reschedule: bool,
+) -> usize {
+    enqueue_task_on_scheduler(&SCHEDULER, task, now_ns, preferred, request_reschedule)
+}
+
+pub(crate) fn enqueue_task_on_scheduler(
+    scheduler: &crate::Scheduler,
+    task: Arc<Task>,
+    now_ns: u64,
+    preferred: bool,
+    request_reschedule: bool,
+) -> usize {
     if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
     {
         // 只有拥有执行体的活任务才能进入 rq。退出清理和 wait/reap 会释放
@@ -939,26 +1007,47 @@ fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: 
             task.state(),
             task.arch_context().is_some(),
         );
-        return task.current_cpu().min(NR_CPUS - 1);
+        let cpu_id = task.current_cpu().min(NR_CPUS - 1);
+        if request_reschedule {
+            scheduler.cpu_or_boot(cpu_id).request_resched();
+        }
+        return cpu_id;
     }
-    if task.sched.on_rq() {
-        return task.current_cpu().min(NR_CPUS - 1);
+    let Some(_task_enqueue_guard) = task.sched.try_begin_enqueue() else {
+        let cpu_id = task.current_cpu().min(NR_CPUS - 1);
+        if request_reschedule {
+            scheduler.cpu_or_boot(cpu_id).request_resched();
+        }
+        return cpu_id;
+    };
+
+    for _ in 0..NR_CPUS {
+        let cpu_id = task_sched_placement_on(scheduler, &task)
+            .preferred_cpu
+            .unwrap_or_else(CpuId::boot)
+            .get();
+        let cpu = CpuId::new(cpu_id).unwrap_or_else(CpuId::boot);
+        let cpu_state = scheduler.cpu_or_boot(cpu_id);
+        let _enqueue_guard = cpu_state.begin_enqueue();
+        if !scheduler.active_set().contains(cpu) {
+            continue;
+        }
+
+        bind_task_to_cpu_on(scheduler, &task, cpu_id);
+        let queued = if preferred {
+            cpu_state
+                .runqueue()
+                .enqueue_preferred(Arc::clone(&task), now_ns)
+        } else {
+            cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns)
+        };
+        if queued && request_reschedule {
+            cpu_state.request_resched();
+        }
+        return cpu_id;
     }
-    let _guard = CPU_HOTPLUG_LOCK.lock();
-    let cpu_id = select_task_cpu(&task);
-    bind_task_to_cpu(&task, cpu_id);
-    if preferred {
-        SCHEDULER
-            .cpu_or_boot(cpu_id)
-            .runqueue()
-            .enqueue_preferred(Arc::clone(&task), now_ns);
-    } else {
-        SCHEDULER
-            .cpu_or_boot(cpu_id)
-            .runqueue()
-            .enqueue(Arc::clone(&task), now_ns);
-    }
-    cpu_id
+
+    unreachable!("[sched] boot CPU must accept task enqueue")
 }
 
 /// Register a sleeping task for deadline-based wakeup.
@@ -1325,10 +1414,8 @@ pub fn balance_once(cpu_id: usize) -> bool {
             task_utilization,
             topology.cpu_capacity(local_cpu),
         ) {
-            SCHEDULER
-                .cpu_or_boot(src)
-                .runqueue()
-                .enqueue(task, now_ns_internal());
+            let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
+            notify_resched(target);
             return false;
         }
     }
@@ -1343,10 +1430,8 @@ pub fn balance_once(cpu_id: usize) -> bool {
         || source.topology_generation != topology_snapshot.generation
         || !task.begin_migration(source)
     {
-        SCHEDULER
-            .cpu_or_boot(src)
-            .runqueue()
-            .enqueue(task, now_ns_internal());
+        let target = requeue_balance_task_on(&SCHEDULER, task, src, now_ns_internal());
+        notify_resched(target);
         return false;
     }
     let context = MigrationContext {
@@ -1356,6 +1441,25 @@ pub fn balance_once(cpu_id: usize) -> bool {
         topology_generation: topology_snapshot.generation,
     };
     attach_migrated_task(&task, context, true).is_ok()
+}
+
+pub(crate) fn requeue_balance_task_on(
+    scheduler: &crate::Scheduler,
+    task: Arc<Task>,
+    source_cpu: usize,
+    now_ns: u64,
+) -> usize {
+    if let Some(source) = CpuId::new(source_cpu) {
+        let cpu_state = scheduler.cpu_or_boot(source_cpu);
+        let _enqueue_guard = cpu_state.begin_enqueue();
+        if scheduler.active_set().contains(source) {
+            if cpu_state.runqueue().enqueue(Arc::clone(&task), now_ns) {
+                cpu_state.request_resched();
+            }
+            return source_cpu;
+        }
+    }
+    enqueue_task_on_scheduler(scheduler, task, now_ns, false, true)
 }
 
 pub(crate) fn select_balance_source_for_class<F>(
@@ -1705,7 +1809,7 @@ unsafe extern "C" fn idle_entry(_cpu_arg: usize) -> ! {
 
 /// 把 idle 任务装到指定 CPU 的槽位。一个 CPU 同时只能有一个 idle。
 pub fn install_idle(cpu_id: usize, t: Arc<Task>) {
-    register_cpu(cpu_id).expect("[sched] invalid idle cpu id");
+    mark_cpu_online(cpu_id).expect("[sched] invalid idle cpu id");
     bind_task_to_cpu(&t, cpu_id);
     let installed = SCHEDULER.cpu_or_boot(cpu_id).install_idle(t);
     assert!(
@@ -1745,7 +1849,7 @@ pub fn spawn_idle_for_cpu(cpu_id: usize) -> Arc<Task> {
 /// AP 调度循环框架。当前启动链路不接入；真实 AP 代码应先调用
 /// [`adopt_cpu_current`] / [`spawn_idle_for_cpu`] 完成本 CPU 槽位初始化。
 pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
-    register_cpu(cpu_id).expect("[sched] invalid CPU id for scheduling loop");
+    activate_cpu(cpu_id).expect("[sched] CPU must be online before scheduling loop");
     loop {
         let _ = balance_once(cpu_id);
         schedule_once(now_ns_internal());

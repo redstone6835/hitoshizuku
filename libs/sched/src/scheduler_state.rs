@@ -8,7 +8,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use crate::cpu::{
     CpuId, CpuMask, MAX_CPUS, MAX_SCHED_DOMAINS, SCHED_CAPACITY_SCALE, SchedTopology,
@@ -32,6 +32,7 @@ pub struct CpuSchedState {
     need_resched: AtomicBool,
     need_balance: AtomicBool,
     post_syscall_handoff: AtomicU8,
+    enqueue_in_progress: AtomicUsize,
 }
 
 impl CpuSchedState {
@@ -46,6 +47,7 @@ impl CpuSchedState {
             need_resched: AtomicBool::new(false),
             need_balance: AtomicBool::new(false),
             post_syscall_handoff: AtomicU8::new(0),
+            enqueue_in_progress: AtomicUsize::new(0),
         }
     }
 
@@ -148,6 +150,17 @@ impl CpuSchedState {
         self.post_syscall_handoff.store(0, Ordering::Release);
     }
 
+    pub(crate) fn begin_enqueue(&self) -> CpuEnqueueGuard<'_> {
+        self.enqueue_in_progress.fetch_add(1, Ordering::AcqRel);
+        CpuEnqueueGuard { cpu: self }
+    }
+
+    fn wait_for_enqueues(&self) {
+        while self.enqueue_in_progress.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+        }
+    }
+
     pub fn has_post_syscall_handoff(&self) -> bool {
         self.post_syscall_handoff.load(Ordering::Acquire) != 0
     }
@@ -169,6 +182,16 @@ impl CpuSchedState {
 
     pub fn retired_len(&self) -> usize {
         self.retired.lock().len()
+    }
+}
+
+pub(crate) struct CpuEnqueueGuard<'a> {
+    cpu: &'a CpuSchedState,
+}
+
+impl Drop for CpuEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.cpu.enqueue_in_progress.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -268,16 +291,28 @@ impl Scheduler {
         CpuMask::from_bits_truncate(self.active.load(Ordering::Acquire)).or_boot()
     }
 
-    pub fn register_cpu(&self, cpu: CpuId) {
-        self.online.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
-        self.active.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
+    pub fn mark_cpu_online(&self, cpu: CpuId) -> bool {
+        let old = self.online.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
         *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
+        (old & cpu.mask().bits()) == 0
+    }
+
+    pub fn register_cpu(&self, cpu: CpuId) {
+        let _ = self.mark_cpu_online(cpu);
+        let _ = self.activate_cpu(cpu);
     }
 
     pub fn deactivate_cpu(&self, cpu: CpuId) -> bool {
+        if cpu == CpuId::boot() {
+            return false;
+        }
         let old = self.active.fetch_and(!cpu.mask().bits(), Ordering::AcqRel);
+        if old & cpu.mask().bits() == 0 {
+            return false;
+        }
+        self.cpu_or_boot(cpu.get()).wait_for_enqueues();
         *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
-        (old & cpu.mask().bits()) != 0
+        true
     }
 
     pub fn activate_cpu(&self, cpu: CpuId) -> bool {
@@ -289,11 +324,21 @@ impl Scheduler {
         true
     }
 
-    pub fn unregister_cpu(&self, cpu: CpuId) -> bool {
-        self.active.fetch_and(!cpu.mask().bits(), Ordering::AcqRel);
+    pub fn mark_cpu_offline(&self, cpu: CpuId) -> bool {
+        if cpu == CpuId::boot() || self.active_set().contains(cpu) {
+            return false;
+        }
+        self.cpu_or_boot(cpu.get()).wait_for_enqueues();
         let old = self.online.fetch_and(!cpu.mask().bits(), Ordering::AcqRel);
         *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
         (old & cpu.mask().bits()) != 0
+    }
+
+    pub fn unregister_cpu(&self, cpu: CpuId) -> bool {
+        let was_online = self.online_set().contains(cpu);
+        let _ = self.deactivate_cpu(cpu);
+        let _ = self.mark_cpu_offline(cpu);
+        was_online && !self.online_set().contains(cpu)
     }
 
     pub fn topology(&self) -> SchedTopology {
