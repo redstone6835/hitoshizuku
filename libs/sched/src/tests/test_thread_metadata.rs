@@ -4,20 +4,42 @@ extern crate alloc;
 extern crate std;
 
 use alloc::sync::Weak;
+use core::ptr::NonNull;
 
 use ktest::ktest;
 
 use crate::{
-    CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue, SchedAttr,
-    SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup, supported_cpu_mask,
+    ArchContextOps, CpuMask, NR_CPUS, ProcessGroup, RobustListState, RseqRegistration, Runqueue,
+    SchedAttr, SchedParams, SchedPolicy, Session, TASK_COMM_LEN, Task, ThreadGroup,
+    supported_cpu_mask,
+};
+
+unsafe fn init_test_context(
+    _ctx: NonNull<u8>,
+    _stack_top: usize,
+    _entry: crate::KernelEntry,
+    _arg: usize,
+) {
+}
+
+unsafe extern "C" fn switch_test_context(_prev: NonNull<u8>, _next: NonNull<u8>) {}
+
+static TEST_ARCH_CONTEXT_OPS: ArchContextOps = ArchContextOps {
+    context_size: 16,
+    context_align: 16,
+    init_kernel_context: init_test_context,
+    switch_context: switch_test_context,
 };
 
 fn make_task() -> alloc::sync::Arc<Task> {
+    crate::arch_hooks::register(&TEST_ARCH_CONTEXT_OPS);
     let session = Session::new();
     let pg = ProcessGroup::new(&session);
     session.register_group(&pg);
     let tg = ThreadGroup::new();
-    Task::new(SchedParams::default_fair(), Weak::new(), tg, pg)
+    let task = Task::new(SchedParams::default_fair(), Weak::new(), tg, pg);
+    task.adopt_current_context();
+    task
 }
 
 #[ktest]

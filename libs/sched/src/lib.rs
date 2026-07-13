@@ -58,11 +58,13 @@ pub mod ids;
 pub mod mutex;
 pub mod operation;
 pub mod pid;
+pub mod placement;
 pub mod process_ops;
 pub mod rlimit;
 pub mod runqueue;
 pub mod sched_class;
 pub mod scheduler;
+pub mod scheduler_state;
 pub mod signal;
 pub mod spawn;
 pub mod sync;
@@ -77,6 +79,7 @@ pub use eevdf::{SchedEntity, SchedParams, Weight};
 pub use group::{ProcessGroup, Session, ThreadGroup};
 pub use ids::{CapSet, Capability, Credentials, Gid, Uid};
 pub use pid::{PidNamespace, PidRegistry, PidT};
+pub use placement::{PlacementSnapshot, PlacementState, TaskPlacement};
 pub use process_ops::{
     ExecRequest, ProcessImageOps, UserContextRef, process_image_ops, register_process_image_ops,
 };
@@ -102,6 +105,7 @@ pub use scheduler::{adopt_cpu_current, cpu_start_scheduling, spawn_idle_for_cpu}
 pub use scheduler::{
     current_sched_domain_id, install_sched_topology, sched_topology, task_sched_placement,
 };
+pub use scheduler_state::{CpuSchedState, Scheduler, TopologySnapshot};
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
     SigSet, SignalNumber, SignalState,

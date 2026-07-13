@@ -38,6 +38,7 @@ use crate::eevdf::{SchedEntity, SchedParams};
 use crate::group::{ProcessGroup, ThreadGroup};
 use crate::ids::Credentials;
 use crate::pid::{PidNamespace, PidT};
+use crate::placement::{PlacementSnapshot, TaskPlacement};
 use crate::signal::{SharedSignal, SignalNumber, SignalState};
 use crate::sync::Spinlock;
 use crate::wait::WaitQueue;
@@ -463,6 +464,8 @@ pub struct Task {
     cpu_affinity: AtomicU64,
     /// 最近一次绑定或运行的 CPU。迁移/唤醒选择使用，默认 0。
     current_cpu: AtomicUsize,
+    /// CPU、调度域、拓扑代际和迁移状态的一致调度归属快照。
+    placement: TaskPlacement,
     /// Linux ioprio ABI 保存值。调度器暂不消费，但 syscall get/set 需保持一致。
     ioprio: AtomicU32,
     /// 当前任务挂载的运行时执行状态裸指针。
@@ -545,6 +548,7 @@ impl Task {
             sched_reset_on_fork: AtomicBool::new(false),
             cpu_affinity: AtomicU64::new(u64::MAX),
             current_cpu: AtomicUsize::new(0),
+            placement: TaskPlacement::unbound(),
             ioprio: AtomicU32::new(0),
             elm_execution_ptr: AtomicUsize::new(0),
             hot_ext: HotTaskExt::new(),
@@ -1167,6 +1171,20 @@ impl Task {
 
     pub(crate) fn set_current_cpu(&self, cpu_id: usize) {
         self.current_cpu.store(cpu_id, Ordering::Release);
+    }
+
+    pub fn placement(&self) -> PlacementSnapshot {
+        self.placement.snapshot()
+    }
+
+    pub(crate) fn bind_placement(
+        &self,
+        cpu: crate::CpuId,
+        domain_id: usize,
+        topology_generation: u64,
+    ) {
+        self.placement.bind(cpu, domain_id, topology_generation);
+        self.set_current_cpu(cpu.get());
     }
 
     pub fn ioprio(&self) -> u16 {
