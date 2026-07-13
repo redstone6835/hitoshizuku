@@ -266,21 +266,21 @@ impl SchedDomain {
         self.capacity
     }
 
-    /// 返回只计入在线 CPU 后的有效容量。
-    pub fn effective_capacity(self, online: CpuMask) -> u64 {
+    /// 返回只计入 active CPU 后的有效容量。
+    pub fn effective_capacity(self, active: CpuMask) -> u64 {
         let total_cpus = self.span.count() as u64;
-        let online_cpus = self.span.intersection(online).count() as u64;
-        if total_cpus == 0 || online_cpus == 0 {
+        let active_cpus = self.span.intersection(active).count() as u64;
+        if total_cpus == 0 || active_cpus == 0 {
             return 0;
         }
-        self.capacity.saturating_mul(online_cpus) / total_cpus
+        self.capacity.saturating_mul(active_cpus) / total_cpus
     }
 }
 
 /// 某个任务在当前拓扑下的调度放置快照。
 ///
 /// 这个结构只描述调度器的通用事实，不包含任何用户态 ABI 编码。`affinity`
-/// 是任务声明的 CPU 许可集，`effective` 是再与在线 CPU 集相交后的实际可运行集；
+/// 是任务声明的 CPU 许可集，`effective` 是再与 active CPU 集相交后的实际可运行集；
 /// `preferred_cpu` 是按当前负载、调度域和是否优先保持原 CPU 计算出的候选 CPU。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedPlacement {
@@ -307,6 +307,31 @@ impl SchedTopology {
             domains,
             len: 1,
             cpu_domain: [ROOT_SCHED_DOMAIN_ID; MAX_CPUS],
+        }
+    }
+
+    /// 构造 `Root -> Cpu` 的合成拓扑。
+    pub const fn with_cpu_domains() -> Self {
+        let mut domains = [SchedDomain::empty(); MAX_SCHED_DOMAINS];
+        let mut cpu_domain = [ROOT_SCHED_DOMAIN_ID; MAX_CPUS];
+        domains[ROOT_SCHED_DOMAIN_ID] = SchedDomain::root();
+        let mut cpu = 0usize;
+        while cpu < MAX_CPUS {
+            let domain_id = cpu + 1;
+            domains[domain_id] = SchedDomain {
+                id: domain_id,
+                span: CpuMask::single_raw(cpu),
+                level: 1,
+                parent: Some(ROOT_SCHED_DOMAIN_ID),
+                capacity: SCHED_CAPACITY_SCALE,
+            };
+            cpu_domain[cpu] = domain_id;
+            cpu += 1;
+        }
+        Self {
+            domains,
+            len: MAX_CPUS + 1,
+            cpu_domain,
         }
     }
 
@@ -418,7 +443,7 @@ impl SchedTopology {
     pub fn select_cpu<F>(
         self,
         allowed: CpuMask,
-        online: CpuMask,
+        active: CpuMask,
         current: Option<CpuId>,
         prefer_current: bool,
         mut load_of: F,
@@ -426,7 +451,7 @@ impl SchedTopology {
     where
         F: FnMut(CpuId) -> usize,
     {
-        let eligible = allowed.intersection(online);
+        let eligible = allowed.intersection(active);
         if eligible.is_empty() {
             return None;
         }
@@ -457,7 +482,7 @@ impl SchedTopology {
     pub fn describe_placement<F>(
         self,
         affinity: CpuMask,
-        online: CpuMask,
+        active: CpuMask,
         current: Option<CpuId>,
         prefer_current: bool,
         load_of: F,
@@ -466,11 +491,11 @@ impl SchedTopology {
         F: FnMut(CpuId) -> usize,
     {
         let affinity = affinity.or_boot();
-        let effective = affinity.intersection(online);
+        let effective = affinity.intersection(active);
         let current_domain = current
             .and_then(|cpu| self.domain_for_cpu(cpu))
             .map(|domain| domain.id());
-        let preferred_cpu = self.select_cpu(affinity, online, current, prefer_current, load_of);
+        let preferred_cpu = self.select_cpu(affinity, active, current, prefer_current, load_of);
         SchedPlacement {
             current_cpu: current,
             current_domain,
@@ -481,11 +506,11 @@ impl SchedTopology {
     }
 
     /// 返回最近可拉取任务的调度域 CPU 集，不包含本 CPU。
-    pub fn balance_sources(self, cpu: CpuId, online: CpuMask) -> CpuMask {
+    pub fn balance_sources(self, cpu: CpuId, active: CpuMask) -> CpuMask {
         let mut domain_id = self.cpu_domain[cpu.get()];
         loop {
             let domain = self.domain(domain_id).unwrap_or_else(|| self.root_domain());
-            let sources = domain.span.intersection(online).without(cpu);
+            let sources = domain.span.intersection(active).without(cpu);
             if !sources.is_empty() || domain.id == ROOT_SCHED_DOMAIN_ID {
                 return sources;
             }

@@ -58,7 +58,7 @@ fn migration_rejects_stale_topology_generation() {
     let topology = TopologySnapshot {
         topology: SchedTopology::bootstrap(),
         generation: 5,
-        online: CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        active: CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
     };
 
     assert!(validate_migration_target(context, topology, CpuMask::SUPPORTED).is_err());
@@ -70,7 +70,7 @@ fn migration_rejects_offline_target_cpu() {
     let topology = TopologySnapshot {
         topology: SchedTopology::bootstrap(),
         generation: 4,
-        online: CpuMask::BOOT,
+        active: CpuMask::BOOT,
     };
 
     assert!(validate_migration_target(context, topology, CpuMask::SUPPORTED).is_err());

@@ -131,6 +131,19 @@ fn sched_domain_capacity_tracks_online_cpus() {
 }
 
 #[ktest]
+fn synthetic_topology_assigns_each_cpu_to_its_own_domain() {
+    let topology = SchedTopology::with_cpu_domains();
+
+    assert_eq!(topology.len(), MAX_CPUS + 1);
+    for cpu_id in 0..MAX_CPUS {
+        let cpu = CpuId::new(cpu_id).expect("cpu");
+        let domain = topology.domain_for_cpu(cpu).expect("cpu domain");
+        assert_eq!(domain.span(), CpuMask::single(cpu));
+        assert_eq!(domain.parent(), Some(ROOT_SCHED_DOMAIN_ID));
+    }
+}
+
+#[ktest]
 fn sched_topology_selects_inside_local_domain_first() {
     let root = SchedDomain::root();
     let local = SchedDomain::new(

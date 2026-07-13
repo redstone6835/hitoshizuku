@@ -212,6 +212,28 @@ fn runqueue_class_load_includes_current_task() {
 }
 
 #[ktest]
+fn runqueue_drain_queued_keeps_current_and_idle_tasks() {
+    let current = make_task();
+    let queued = make_task();
+    let idle = make_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+
+    let rq = Runqueue::new();
+    rq.set_current(alloc::sync::Arc::clone(&current));
+    rq.enqueue(alloc::sync::Arc::clone(&queued), 1);
+    rq.enqueue(alloc::sync::Arc::clone(&idle), 1);
+
+    let drained = rq.drain_queued(2);
+
+    assert_eq!(drained.len(), 1);
+    assert!(alloc::sync::Arc::ptr_eq(&drained[0], &queued));
+    assert!(rq.is_current(&current));
+    assert_eq!(rq.nr_running(), 2);
+    assert!(rq.dequeue(&current, 3));
+    assert!(rq.dequeue(&idle, 3));
+}
+
+#[ktest]
 fn runqueue_take_migratable_respects_cpu_affinity() {
     let cpu0 = make_task();
     let cpu1 = make_task();

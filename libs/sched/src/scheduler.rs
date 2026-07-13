@@ -13,7 +13,7 @@
 //! ## per-CPU 结构
 //!
 //! [`Scheduler`](crate::scheduler_state::Scheduler) 统一拥有 topology、
-//! online CPU 集和每 CPU 运行状态；用 [`current_cpu_id`] 选择本地 CPU 槽。
+//! online/active CPU 集和每 CPU 运行状态；用 [`current_cpu_id`] 选择本地 CPU 槽。
 //! AP 启动尚未落地，当前永远只有 CPU 0 被填充。
 
 use alloc::sync::{Arc, Weak};
@@ -65,6 +65,10 @@ impl RunqueueLoadSnapshot {
 
     pub(crate) fn load_of(self, cpu: CpuId) -> usize {
         self.loads[cpu.get()]
+    }
+
+    fn add_task(&mut self, cpu: CpuId) {
+        self.loads[cpu.get()] = self.loads[cpu.get()].saturating_add(1);
     }
 }
 
@@ -138,6 +142,7 @@ struct RealtimeItimer {
 }
 
 static REALTIME_ITIMERS: Spinlock<Vec<RealtimeItimer>> = Spinlock::new(Vec::new());
+static CPU_HOTPLUG_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// init 任务全局锚点。写入即 Release，读取必须 Acquire。
 static mut INIT_TASK: Option<Arc<Task>> = None;
@@ -198,6 +203,8 @@ pub fn init() -> Arc<Task> {
         crate::arch_hooks::ops().is_some(),
         "[sched] init() before arch_hooks::register — call it first"
     );
+
+    SCHEDULER.install_topology(SchedTopology::with_cpu_domains());
 
     // 1) 身份骨架：session / pgroup / thread_group 互指但未填 leader。
     let session = Session::new();
@@ -432,15 +439,15 @@ pub fn is_ready() -> bool {
 }
 
 pub fn online_cpu_mask() -> u64 {
-    online_cpu_set().bits()
+    SCHEDULER.online_set().bits()
 }
 
 pub const fn supported_cpu_mask() -> u64 {
     CpuMask::SUPPORTED.bits()
 }
 
-fn online_cpu_set() -> CpuMask {
-    SCHEDULER.online_set()
+fn active_cpu_set() -> CpuMask {
+    SCHEDULER.active_set()
 }
 
 pub fn sched_topology() -> SchedTopology {
@@ -448,6 +455,7 @@ pub fn sched_topology() -> SchedTopology {
 }
 
 pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
     if !topology
         .root_domain()
         .span()
@@ -457,6 +465,31 @@ pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errn
     }
     SCHEDULER.install_topology(topology);
     Ok(())
+}
+
+pub(crate) fn refresh_task_placement(scheduler: &crate::Scheduler, task: &Task) -> bool {
+    let source = task.placement();
+    if source.state != crate::PlacementState::Bound {
+        return false;
+    }
+    let Some(cpu) = source.cpu else {
+        return false;
+    };
+    let snapshot = scheduler.topology_snapshot();
+    if !snapshot.active.contains(cpu)
+        || !CpuMask::from_bits_or_boot(task.cpu_affinity()).contains(cpu)
+    {
+        return false;
+    }
+    let domain_id = snapshot
+        .topology
+        .domain_for_cpu(cpu)
+        .unwrap_or_else(|| snapshot.topology.root_domain())
+        .id();
+    if source.topology_generation == snapshot.generation && source.domain_id == domain_id {
+        return true;
+    }
+    task.refresh_placement_topology(source, domain_id, snapshot.generation)
 }
 
 pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
@@ -477,26 +510,30 @@ pub fn sched_domain_stats(domain_id: usize) -> Option<crate::SchedDomainStats> {
 /// 返回值只是快照：函数不会迁移任务，也不承诺下一次入队一定选中同一 CPU。
 /// 调用方可用它向用户态或诊断路径解释“为什么这个任务能在哪些 CPU 上运行”。
 pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
+    let _ = refresh_task_placement(&SCHEDULER, task);
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
-    let online = online_cpu_set();
+    let active = active_cpu_set();
     let current = CpuId::new(task.current_cpu());
     let prefer_current = task.state() != TaskState::New;
-    let load_snapshot = collect_rq_load_snapshot(affinity.intersection(online));
+    let load_snapshot = collect_rq_load_snapshot_for(&SCHEDULER, affinity.intersection(active));
 
-    sched_topology().describe_placement(affinity, online, current, prefer_current, |cpu| {
+    sched_topology().describe_placement(affinity, active, current, prefer_current, |cpu| {
         load_snapshot.load_of(cpu)
     })
 }
 
-fn collect_rq_load_snapshot(cpus: CpuMask) -> RunqueueLoadSnapshot {
+fn collect_rq_load_snapshot_for(
+    scheduler: &crate::Scheduler,
+    cpus: CpuMask,
+) -> RunqueueLoadSnapshot {
     RunqueueLoadSnapshot::collect(cpus, |cpu| {
-        SCHEDULER.cpu_or_boot(cpu.get()).runqueue().nr_running()
+        scheduler.cpu_or_boot(cpu.get()).runqueue().nr_running()
     })
 }
 
 fn refresh_domain_stats() {
     let snapshot = SCHEDULER.topology_snapshot();
-    let loads = RunqueueClassLoadSnapshot::collect(snapshot.online, |cpu| {
+    let loads = RunqueueClassLoadSnapshot::collect(snapshot.active, |cpu| {
         SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
     });
     SCHEDULER.update_domain_stats(snapshot, loads.loads());
@@ -508,24 +545,229 @@ pub(crate) fn select_cpu_for_mask(
     current: Option<CpuId>,
     prefer_current: bool,
 ) -> Option<CpuId> {
-    let online = online_cpu_set();
-    let eligible = allowed.intersection(online);
-    let load_snapshot = collect_rq_load_snapshot(eligible);
-    sched_topology().select_cpu(allowed, online, current, prefer_current, |cpu| {
-        load_snapshot.load_of(cpu)
-    })
+    select_cpu_for_mask_on(&SCHEDULER, allowed, current, prefer_current)
+}
+
+fn select_cpu_for_mask_on(
+    scheduler: &crate::Scheduler,
+    allowed: CpuMask,
+    current: Option<CpuId>,
+    prefer_current: bool,
+) -> Option<CpuId> {
+    let active = scheduler.active_set();
+    let eligible = allowed.intersection(active);
+    let load_snapshot = collect_rq_load_snapshot_for(scheduler, eligible);
+    scheduler
+        .topology()
+        .select_cpu(allowed, active, current, prefer_current, |cpu| {
+            load_snapshot.load_of(cpu)
+        })
 }
 
 pub fn is_cpu_online(cpu_id: usize) -> bool {
-    CpuId::new(cpu_id).is_some_and(|cpu| online_cpu_set().contains(cpu))
+    CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.online_set().contains(cpu))
 }
 
 pub fn register_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    register_cpu_locked(cpu_id)
+}
+
+fn register_cpu_locked(cpu_id: usize) -> Result<(), errno::Errno> {
     let Some(cpu) = CpuId::new(cpu_id) else {
         return Err(errno::Errno::EINVAL);
     };
     SCHEDULER.register_cpu(cpu);
     Ok(())
+}
+
+struct CpuOfflineTask {
+    task: Arc<Task>,
+    source: crate::PlacementSnapshot,
+    target_cpu: CpuId,
+    target_domain: usize,
+}
+
+/// 将一个非启动 CPU 下线并迁移其排队任务。
+pub fn offline_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
+    offline_cpu_with_scheduler(&SCHEDULER, cpu_id, now_ns_internal())
+}
+
+pub(crate) fn offline_cpu_with_scheduler(
+    scheduler: &crate::Scheduler,
+    cpu_id: usize,
+    now_ns: u64,
+) -> Result<(), errno::Errno> {
+    let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+    if cpu == CpuId::boot() {
+        return Err(errno::Errno::EBUSY);
+    }
+    if !scheduler.online_set().contains(cpu) {
+        return Ok(());
+    }
+
+    let cpu_state = scheduler.cpu_or_boot(cpu_id);
+    if cpu_state
+        .current()
+        .is_some_and(|current| !current.is_idle_task())
+    {
+        return Err(errno::Errno::EBUSY);
+    }
+
+    if !scheduler.deactivate_cpu(cpu) {
+        return Err(errno::Errno::EBUSY);
+    }
+    let drained = cpu_state.runqueue().drain_queued(now_ns);
+    let snapshot = scheduler.topology_snapshot();
+    let mut planned_load = collect_rq_load_snapshot_for(scheduler, snapshot.active);
+    let mut tasks = Vec::new();
+    for task in &drained {
+        let _ = refresh_task_placement(scheduler, task);
+        let source = task.placement();
+        if source.state != crate::PlacementState::Bound
+            || source.cpu != Some(cpu)
+            || task.arch_context().is_none()
+            || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+        {
+            restore_drained_tasks(scheduler, cpu, &drained, now_ns);
+            return Err(errno::Errno::EBUSY);
+        }
+        let allowed = CpuMask::from_bits_or_boot(task.cpu_affinity()).intersection(snapshot.active);
+        let Some(target_cpu) =
+            snapshot
+                .topology
+                .select_cpu(allowed, snapshot.active, None, false, |cpu| {
+                    planned_load.load_of(cpu)
+                })
+        else {
+            restore_drained_tasks(scheduler, cpu, &drained, now_ns);
+            return Err(errno::Errno::EBUSY);
+        };
+        planned_load.add_task(target_cpu);
+        let target_domain = snapshot
+            .topology
+            .domain_for_cpu(target_cpu)
+            .unwrap_or_else(|| snapshot.topology.root_domain())
+            .id();
+        tasks.push(CpuOfflineTask {
+            task: Arc::clone(task),
+            source,
+            target_cpu,
+            target_domain,
+        });
+    }
+
+    let mut prepared = 0usize;
+    for item in &tasks {
+        if !item.task.begin_offline_repair(item.source) {
+            restore_prepared_tasks(scheduler, cpu, &tasks, prepared, now_ns);
+            return Err(errno::Errno::EBUSY);
+        }
+        prepared += 1;
+    }
+
+    for (index, item) in tasks.iter().enumerate() {
+        item.task
+            .commit_migration(item.target_cpu, item.target_domain, snapshot.generation);
+        if !scheduler
+            .cpu_or_boot(item.target_cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(&item.task), now_ns)
+        {
+            restore_unmoved_tasks(scheduler, cpu, &tasks, index, now_ns);
+            return Err(errno::Errno::EIO);
+        }
+        scheduler
+            .cpu_or_boot(item.target_cpu.get())
+            .request_resched();
+    }
+
+    let late = cpu_state.runqueue().drain_queued(now_ns);
+    if !late.is_empty()
+        || cpu_state
+            .current()
+            .is_some_and(|current| !current.is_idle_task())
+    {
+        restore_drained_tasks(scheduler, cpu, &late, now_ns);
+        return Err(errno::Errno::EBUSY);
+    }
+
+    let current = cpu_state.clear_current();
+    let idle = cpu_state.clear_idle();
+    if let Some(task) = current.as_ref() {
+        stop_cpu_task(cpu_state, task, now_ns);
+    }
+    if let Some(task) = idle.as_ref()
+        && current
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, task))
+    {
+        stop_cpu_task(cpu_state, task, now_ns);
+    }
+    cpu_state.clear_scheduling_requests();
+    scheduler.unregister_cpu(cpu);
+    Ok(())
+}
+
+fn stop_cpu_task(cpu_state: &crate::CpuSchedState, task: &Arc<Task>, now_ns: u64) {
+    let _ = cpu_state.runqueue().dequeue(task, now_ns);
+    task.set_state(TaskState::Stopped);
+    task.unbind_placement();
+}
+
+fn restore_drained_tasks(
+    scheduler: &crate::Scheduler,
+    cpu: CpuId,
+    tasks: &[Arc<Task>],
+    now_ns: u64,
+) {
+    let _ = scheduler.activate_cpu(cpu);
+    for task in tasks {
+        let _ = refresh_task_placement(scheduler, task);
+        let _ = scheduler
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(task), now_ns);
+    }
+}
+
+fn restore_prepared_tasks(
+    scheduler: &crate::Scheduler,
+    cpu: CpuId,
+    tasks: &[CpuOfflineTask],
+    prepared: usize,
+    now_ns: u64,
+) {
+    let _ = scheduler.activate_cpu(cpu);
+    for (index, item) in tasks.iter().enumerate() {
+        if index < prepared {
+            item.task.rollback_migration(item.source);
+        }
+        let _ = refresh_task_placement(scheduler, &item.task);
+        let _ = scheduler
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(&item.task), now_ns);
+    }
+}
+
+fn restore_unmoved_tasks(
+    scheduler: &crate::Scheduler,
+    cpu: CpuId,
+    tasks: &[CpuOfflineTask],
+    first_unmoved: usize,
+    now_ns: u64,
+) {
+    let _ = scheduler.activate_cpu(cpu);
+    for item in &tasks[first_unmoved..] {
+        item.task.rollback_migration(item.source);
+        let _ = refresh_task_placement(scheduler, &item.task);
+        let _ = scheduler
+            .cpu_or_boot(cpu.get())
+            .runqueue()
+            .enqueue(Arc::clone(&item.task), now_ns);
+    }
 }
 
 /// AP 启动路径的调度接入口框架：把当前 CPU 正在执行的 task 登记为该 CPU 的
@@ -702,6 +944,7 @@ fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: 
     if task.sched.on_rq() {
         return task.current_cpu().min(NR_CPUS - 1);
     }
+    let _guard = CPU_HOTPLUG_LOCK.lock();
     let cpu_id = select_task_cpu(&task);
     bind_task_to_cpu(&task, cpu_id);
     if preferred {
@@ -909,7 +1152,7 @@ fn migration_context(
     let Some(target) = CpuId::new(target_cpu) else {
         return Err(errno::Errno::EINVAL);
     };
-    if !online_cpu_set().contains(target) {
+    if !active_cpu_set().contains(target) {
         return Err(errno::Errno::EINVAL);
     }
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
@@ -919,6 +1162,7 @@ fn migration_context(
     if task.state() == TaskState::Running {
         return Err(errno::Errno::EBUSY);
     }
+    let _ = refresh_task_placement(&SCHEDULER, task);
     let mut source = task.placement();
     if source.state == crate::PlacementState::Unbound {
         bind_task_to_cpu(task, task.current_cpu().min(NR_CPUS - 1));
@@ -948,13 +1192,14 @@ fn migration_context(
 }
 
 fn rollback_migration(task: &Arc<Task>, context: MigrationContext, requeue_source: bool) {
+    task.rollback_migration(context.source);
+    let _ = refresh_task_placement(&SCHEDULER, task);
     if requeue_source {
         SCHEDULER
             .cpu_or_boot(context.source.cpu.map_or(0, CpuId::get))
             .runqueue()
             .enqueue(Arc::clone(task), now_ns_internal());
     }
-    task.rollback_migration(context.source);
 }
 
 pub(crate) fn validate_migration_target(
@@ -965,7 +1210,7 @@ pub(crate) fn validate_migration_target(
     if topology.generation != context.topology_generation {
         return Err(errno::Errno::EAGAIN);
     }
-    if !topology.online.contains(context.target_cpu) || !affinity.contains(context.target_cpu) {
+    if !topology.active.contains(context.target_cpu) || !affinity.contains(context.target_cpu) {
         return Err(errno::Errno::EINVAL);
     }
     Ok(())
@@ -976,6 +1221,7 @@ fn attach_migrated_task(
     context: MigrationContext,
     source_detached: bool,
 ) -> Result<(), errno::Errno> {
+    let _guard = CPU_HOTPLUG_LOCK.lock();
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let topology = SCHEDULER.topology_snapshot();
     if let Err(error) = validate_migration_target(context, topology, affinity) {
@@ -993,21 +1239,9 @@ fn attach_migrated_task(
             return Err(errno::Errno::EBUSY);
         }
     }
-    SCHEDULER
-        .cpu_or_boot(context.target_cpu.get())
-        .runqueue()
-        .enqueue(Arc::clone(task), now_ns_internal());
-    if !task.sched.on_rq() {
-        rollback_migration(task, context, true);
-        return Err(errno::Errno::EIO);
-    }
     let commit_topology = SCHEDULER.topology_snapshot();
     let commit_affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     if validate_migration_target(context, commit_topology, commit_affinity).is_err() {
-        let _ = SCHEDULER
-            .cpu_or_boot(context.target_cpu.get())
-            .runqueue()
-            .dequeue_queued(task, now_ns_internal());
         rollback_migration(task, context, true);
         return Err(errno::Errno::EAGAIN);
     }
@@ -1016,6 +1250,14 @@ fn attach_migrated_task(
         context.target_domain,
         context.topology_generation,
     );
+    if !SCHEDULER
+        .cpu_or_boot(context.target_cpu.get())
+        .runqueue()
+        .enqueue(Arc::clone(task), now_ns_internal())
+    {
+        rollback_migration(task, context, true);
+        return Err(errno::Errno::EIO);
+    }
     request_resched(context.target_cpu.get());
     Ok(())
 }
@@ -1023,7 +1265,7 @@ fn attach_migrated_task(
 pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
     if !task.sched.on_rq() {
         let target = CpuId::new(target_cpu).ok_or(errno::Errno::EINVAL)?;
-        if !online_cpu_set().contains(target)
+        if !active_cpu_set().contains(target)
             || !CpuMask::from_bits_or_boot(task.cpu_affinity()).contains(target)
         {
             return Err(errno::Errno::EINVAL);
@@ -1040,20 +1282,20 @@ pub fn balance_once(cpu_id: usize) -> bool {
     let Some(local_cpu) = CpuId::new(cpu_id) else {
         return false;
     };
-    let online = online_cpu_set();
-    if !online.contains(local_cpu) {
+    let active = active_cpu_set();
+    if !active.contains(local_cpu) {
         return false;
     }
 
     let topology_snapshot = SCHEDULER.topology_snapshot();
     let topology = topology_snapshot.topology;
     let allowed = CpuMask::single(local_cpu).bits();
-    let domain_loads = RunqueueClassLoadSnapshot::collect(online, |cpu| {
+    let domain_loads = RunqueueClassLoadSnapshot::collect(active, |cpu| {
         SCHEDULER.cpu_or_boot(cpu.get()).runqueue().class_load()
     });
     SCHEDULER.update_domain_stats(topology_snapshot, domain_loads.loads());
 
-    let load_snapshot = RunqueueClassLoadSnapshot::collect(online, |cpu| {
+    let load_snapshot = RunqueueClassLoadSnapshot::collect(active, |cpu| {
         SCHEDULER
             .cpu_or_boot(cpu.get())
             .runqueue()
@@ -1061,7 +1303,7 @@ pub fn balance_once(cpu_id: usize) -> bool {
     });
     let classes = [SchedClass::Deadline, SchedClass::Realtime, SchedClass::Fair];
     let Some((src, class)) = classes.into_iter().find_map(|class| {
-        select_balance_source_for_class(topology, local_cpu, online, class, |cpu| {
+        select_balance_source_for_class(topology, local_cpu, active, class, |cpu| {
             load_snapshot.load_of(cpu)
         })
         .map(|source| (source.get(), class))
@@ -1119,7 +1361,7 @@ pub fn balance_once(cpu_id: usize) -> bool {
 pub(crate) fn select_balance_source_for_class<F>(
     topology: SchedTopology,
     local_cpu: CpuId,
-    online: CpuMask,
+    active: CpuMask,
     class: SchedClass,
     mut load_of: F,
 ) -> Option<CpuId>
@@ -1139,7 +1381,7 @@ where
     loop {
         let mut busiest = None;
         let mut busiest_utilization = local_utilization;
-        for other in domain.span().intersection(online).without(local_cpu).iter() {
+        for other in domain.span().intersection(active).without(local_cpu).iter() {
             let load = load_of(other);
             if !class_allows_pull(class, local_load, load) {
                 continue;
@@ -1231,8 +1473,8 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
         return;
     }
 
-    let online = online_cpu_set();
-    let allowed = affinity.intersection(online).without(source);
+    let active = active_cpu_set();
+    let allowed = affinity.intersection(active).without(source);
     if allowed.is_empty() {
         return;
     }

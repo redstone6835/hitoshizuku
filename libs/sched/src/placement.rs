@@ -88,6 +88,24 @@ impl TaskPlacement {
             .is_ok()
     }
 
+    pub(crate) fn begin_offline_repair(&self, source: PlacementSnapshot) -> bool {
+        if source.state != PlacementState::Bound {
+            return false;
+        }
+        let repairing = PlacementSnapshot {
+            state: PlacementState::OfflineRepair,
+            ..source
+        };
+        self.encoded
+            .compare_exchange(
+                encode(source),
+                encode(repairing),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     pub(crate) fn store_bound(&self, cpu: CpuId, domain_id: usize, topology_generation: u64) {
         self.encoded.store(
             encode(PlacementSnapshot {
@@ -100,8 +118,37 @@ impl TaskPlacement {
         );
     }
 
+    pub(crate) fn refresh_topology(
+        &self,
+        source: PlacementSnapshot,
+        domain_id: usize,
+        topology_generation: u64,
+    ) -> bool {
+        if source.state != PlacementState::Bound || source.cpu.is_none() {
+            return false;
+        }
+        let refreshed = PlacementSnapshot {
+            domain_id,
+            topology_generation,
+            ..source
+        };
+        self.encoded
+            .compare_exchange(
+                encode(source),
+                encode(refreshed),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     pub(crate) fn rollback(&self, source: PlacementSnapshot) {
         self.encoded.store(encode(source), Ordering::Release);
+    }
+
+    pub(crate) fn unbind(&self) {
+        self.encoded
+            .store(encode(PlacementSnapshot::unbound()), Ordering::Release);
     }
 }
 

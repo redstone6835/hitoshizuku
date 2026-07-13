@@ -1,10 +1,14 @@
 //! 调度器状态所有权与 per-CPU 状态隔离测试。
 
+use alloc::sync::Arc;
+
 use ktest::ktest;
 
+use super::test_thread_metadata::make_task;
+use crate::scheduler::{offline_cpu_with_scheduler, refresh_task_placement};
 use crate::{
-    CpuId, CpuMask, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedClass, SchedDomain,
-    SchedTopology, Scheduler,
+    CpuId, CpuMask, PlacementState, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedAttr, SchedClass,
+    SchedDomain, SchedTopology, Scheduler, TaskState,
 };
 
 #[ktest]
@@ -12,6 +16,7 @@ fn scheduler_state_bootstraps_root_and_boot_cpu() {
     let core = Scheduler::new();
 
     assert_eq!(core.online_set(), CpuMask::BOOT);
+    assert_eq!(core.active_set(), CpuMask::BOOT);
     assert_eq!(core.topology(), SchedTopology::bootstrap());
     assert!(core.cpu(CpuId::boot().get()).is_some());
     assert!(core.cpu(crate::scheduler::NR_CPUS).is_none());
@@ -59,6 +64,22 @@ fn scheduler_state_installs_topology_and_online_cpu_together() {
     assert!(core.topology_snapshot().generation > old_generation);
     assert!(core.online_set().contains(CpuId::boot()));
     assert!(core.online_set().contains(CpuId::new(1).unwrap()));
+    assert!(core.active_set().contains(CpuId::new(1).unwrap()));
+}
+
+#[ktest]
+fn scheduler_state_deactivates_cpu_before_removing_online_state() {
+    let scheduler = two_cpu_scheduler();
+    let cpu1 = CpuId::new(1).expect("cpu1");
+
+    assert!(scheduler.deactivate_cpu(cpu1));
+    assert!(scheduler.online_set().contains(cpu1));
+    assert!(!scheduler.active_set().contains(cpu1));
+    assert!(scheduler.activate_cpu(cpu1));
+    assert!(scheduler.active_set().contains(cpu1));
+    assert!(scheduler.unregister_cpu(cpu1));
+    assert!(!scheduler.online_set().contains(cpu1));
+    assert!(!scheduler.active_set().contains(cpu1));
 }
 
 #[ktest]
@@ -94,4 +115,139 @@ fn scheduler_state_aggregates_load_for_nested_domains() {
     assert_eq!(leaf.load.fair, 2);
     assert_eq!(leaf.capacity, SCHED_CAPACITY_SCALE);
     assert_eq!(cluster.utilization(SchedClass::Fair), SCHED_CAPACITY_SCALE);
+}
+
+#[ktest]
+fn cpu_offline_drains_queued_tasks_to_active_cpu() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(0).union(CpuMask::single_raw(1)).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    assert!(
+        scheduler
+            .cpu_or_boot(1)
+            .runqueue()
+            .enqueue(Arc::clone(&task), 1)
+    );
+
+    offline_cpu_with_scheduler(&scheduler, 1, 2).expect("offline cpu1");
+
+    let cpu1 = CpuId::new(1).expect("cpu1");
+    assert!(!scheduler.online_set().contains(cpu1));
+    assert!(!scheduler.active_set().contains(cpu1));
+    assert_eq!(task.placement().cpu, CpuId::new(0));
+    assert_eq!(task.placement().state, PlacementState::Bound);
+    assert!(scheduler.cpu_or_boot(0).runqueue().dequeue_queued(&task, 3));
+    assert_eq!(scheduler.cpu_or_boot(1).runqueue().nr_running(), 0);
+}
+
+#[ktest]
+fn cpu_offline_restores_source_when_affinity_has_no_target() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    task.set_cpu_affinity(CpuMask::single_raw(1).bits());
+    bind_to_cpu(&scheduler, &task, 1);
+    let source = task.placement();
+    assert!(
+        scheduler
+            .cpu_or_boot(1)
+            .runqueue()
+            .enqueue(Arc::clone(&task), 1)
+    );
+
+    assert_eq!(
+        offline_cpu_with_scheduler(&scheduler, 1, 2),
+        Err(errno::Errno::EBUSY)
+    );
+
+    let cpu1 = CpuId::new(1).expect("cpu1");
+    assert!(scheduler.online_set().contains(cpu1));
+    assert!(scheduler.active_set().contains(cpu1));
+    assert_eq!(task.placement(), source);
+    assert!(scheduler.cpu_or_boot(1).runqueue().dequeue_queued(&task, 3));
+}
+
+#[ktest]
+fn cpu_offline_rejects_non_idle_current_and_boot_cpu() {
+    let scheduler = two_cpu_scheduler();
+    let task = make_task();
+    bind_to_cpu(&scheduler, &task, 1);
+    let cpu1 = scheduler.cpu_or_boot(1);
+    cpu1.runqueue().set_current(Arc::clone(&task));
+    cpu1.publish_current(Arc::clone(&task));
+
+    assert_eq!(
+        offline_cpu_with_scheduler(&scheduler, 1, 2),
+        Err(errno::Errno::EBUSY)
+    );
+    assert_eq!(
+        offline_cpu_with_scheduler(&scheduler, 0, 2),
+        Err(errno::Errno::EBUSY)
+    );
+
+    let _ = cpu1.clear_current();
+    assert!(cpu1.runqueue().dequeue(&task, 3));
+}
+
+#[ktest]
+fn cpu_offline_removes_idle_current_and_cpu_requests() {
+    let scheduler = two_cpu_scheduler();
+    let idle = make_task();
+    idle.mark_idle_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+    idle.set_cpu_affinity(CpuMask::single_raw(1).bits());
+    bind_to_cpu(&scheduler, &idle, 1);
+    let cpu1 = scheduler.cpu_or_boot(1);
+    assert!(cpu1.install_idle(Arc::clone(&idle)).is_ok());
+    cpu1.runqueue().set_current(Arc::clone(&idle));
+    cpu1.publish_current(Arc::clone(&idle));
+    cpu1.request_resched();
+    cpu1.request_balance();
+
+    offline_cpu_with_scheduler(&scheduler, 1, 2).expect("offline idle cpu");
+
+    assert!(cpu1.current().is_none());
+    assert!(cpu1.idle().is_none());
+    assert!(cpu1.runqueue().current().is_none());
+    assert!(!cpu1.needs_resched());
+    assert!(!cpu1.take_balance());
+    assert_eq!(idle.state(), TaskState::Stopped);
+    assert_eq!(idle.placement().state, PlacementState::Unbound);
+}
+
+#[ktest]
+fn topology_refresh_updates_runnable_and_sleeping_placements() {
+    let scheduler = two_cpu_scheduler();
+    let old_generation = scheduler.topology_snapshot().generation;
+    let runnable = make_task();
+    let sleeping = make_task();
+    runnable.set_state(TaskState::Runnable);
+    sleeping.set_state(TaskState::Sleeping);
+    runnable.bind_placement(CpuId::boot(), 0, old_generation);
+    sleeping.bind_placement(CpuId::boot(), 0, old_generation);
+
+    scheduler.install_topology(SchedTopology::with_cpu_domains());
+    let new_generation = scheduler.topology_snapshot().generation;
+    assert!(refresh_task_placement(&scheduler, &runnable));
+    assert!(refresh_task_placement(&scheduler, &sleeping));
+
+    for task in [&runnable, &sleeping] {
+        assert_eq!(task.placement().domain_id, 1);
+        assert_eq!(task.placement().topology_generation, new_generation);
+        assert_eq!(task.placement().state, PlacementState::Bound);
+    }
+}
+
+fn two_cpu_scheduler() -> Scheduler {
+    let scheduler = Scheduler::new();
+    scheduler.install_topology(SchedTopology::with_cpu_domains());
+    scheduler.register_cpu(CpuId::new(1).expect("cpu1"));
+    scheduler
+}
+
+fn bind_to_cpu(scheduler: &Scheduler, task: &crate::Task, cpu_id: usize) {
+    let cpu = CpuId::new(cpu_id).expect("cpu");
+    let snapshot = scheduler.topology_snapshot();
+    let domain = snapshot.topology.domain_for_cpu(cpu).expect("cpu domain");
+    task.bind_placement(cpu, domain.id(), snapshot.generation);
 }

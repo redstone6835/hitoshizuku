@@ -64,3 +64,18 @@ fn task_placement_commits_migration_as_one_snapshot() {
         }
     );
 }
+
+#[ktest]
+fn task_placement_marks_offline_repair_as_single_state_change() {
+    let placement = TaskPlacement::unbound();
+    let cpu = CpuId::new(1).unwrap();
+    placement.bind(cpu, 2, 7);
+    let source = placement.snapshot();
+
+    assert!(placement.begin_offline_repair(source));
+    assert_eq!(placement.snapshot().state, PlacementState::OfflineRepair);
+    assert!(!placement.begin_offline_repair(source));
+
+    placement.rollback(source);
+    assert_eq!(placement.snapshot(), source);
+}

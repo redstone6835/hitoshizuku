@@ -1191,6 +1191,10 @@ impl Task {
         self.placement.begin_migration(source)
     }
 
+    pub(crate) fn begin_offline_repair(&self, source: PlacementSnapshot) -> bool {
+        self.placement.begin_offline_repair(source)
+    }
+
     pub(crate) fn commit_migration(
         &self,
         cpu: crate::CpuId,
@@ -1202,8 +1206,22 @@ impl Task {
         self.set_current_cpu(cpu.get());
     }
 
+    pub(crate) fn refresh_placement_topology(
+        &self,
+        source: PlacementSnapshot,
+        domain_id: usize,
+        topology_generation: u64,
+    ) -> bool {
+        self.placement
+            .refresh_topology(source, domain_id, topology_generation)
+    }
+
     pub(crate) fn rollback_migration(&self, source: PlacementSnapshot) {
         self.placement.rollback(source);
+    }
+
+    pub(crate) fn unbind_placement(&self) {
+        self.placement.unbind();
     }
 
     pub fn ioprio(&self) -> u16 {

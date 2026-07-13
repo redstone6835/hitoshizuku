@@ -254,15 +254,15 @@ impl Runqueue {
         inner.current = Some(task);
     }
 
-    pub fn enqueue(&self, task: Arc<Task>, now_ns: u64) {
-        self.enqueue_with_preference(task, now_ns, false);
+    pub fn enqueue(&self, task: Arc<Task>, now_ns: u64) -> bool {
+        self.enqueue_with_preference(task, now_ns, false)
     }
 
-    pub fn enqueue_preferred(&self, task: Arc<Task>, now_ns: u64) {
-        self.enqueue_with_preference(task, now_ns, true);
+    pub fn enqueue_preferred(&self, task: Arc<Task>, now_ns: u64) -> bool {
+        self.enqueue_with_preference(task, now_ns, true)
     }
 
-    fn enqueue_with_preference(&self, task: Arc<Task>, now_ns: u64, preferred: bool) {
+    fn enqueue_with_preference(&self, task: Arc<Task>, now_ns: u64, preferred: bool) -> bool {
         let mut inner = self.inner.lock();
         if !task_can_enter_runqueue(&task) {
             task.sched.set_on_rq(false);
@@ -271,10 +271,10 @@ impl Runqueue {
                 task.pid_root(),
                 task.state(),
             );
-            return;
+            return false;
         }
         if task.sched.on_rq() {
-            return;
+            return false;
         }
         let _ = update_curr_locked(&mut inner, now_ns);
         task.set_state(TaskState::Runnable);
@@ -285,6 +285,7 @@ impl Runqueue {
             inner.preferred_fair_addr = Some(task_addr(&task));
         }
         enqueue_queued_locked(&mut inner, task, now_ns);
+        true
     }
 
     pub fn dequeue(&self, task: &Arc<Task>, now_ns: u64) -> bool {
@@ -404,6 +405,38 @@ impl Runqueue {
             SchedClass::Fair => take_fair_migratable_locked(&mut inner, allowed_cpu_mask),
             SchedClass::Idle => None,
         }
+    }
+
+    /// 排空 CPU 下线时需要迁移的队列任务。
+    ///
+    /// current 和 Idle 类任务由 CPU 生命周期代码单独处理；其余已排队任务
+    /// 都从本 runqueue 摘除并清除 `on_rq`。
+    pub fn drain_queued(&self, now_ns: u64) -> Vec<Arc<Task>> {
+        let mut inner = self.inner.lock();
+        let _ = update_curr_locked(&mut inner, now_ns);
+        let mut drained = Vec::new();
+
+        while let Some(task) = inner.fair_tree.values().next().cloned() {
+            if let Some(task) = remove_fair_locked(&mut inner, &task) {
+                drained.push(task);
+            }
+        }
+        while let Some(task) = inner.rt_tree.values().next().cloned() {
+            if let Some(task) = remove_rt_locked(&mut inner, &task) {
+                drained.push(task);
+            }
+        }
+        while let Some(task) = inner.deadline_tree.values().next().cloned() {
+            if let Some(task) = remove_deadline_locked(&mut inner, &task) {
+                drained.push(task);
+            }
+        }
+        while let Some(task) = inner.deadline_throttled.values().next().cloned() {
+            if let Some(task) = remove_deadline_throttled_locked(&mut inner, &task) {
+                drained.push(task);
+            }
+        }
+        drained
     }
 
     pub fn current(&self) -> Option<Arc<Task>> {

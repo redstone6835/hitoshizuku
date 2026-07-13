@@ -2,7 +2,7 @@
 //!
 //! 本模块只收拢调度系统的运行期状态，不改变 EEVDF、RT、Deadline 或任务迁移
 //! 策略。所有策略入口仍由 `scheduler` 门面提供，但真实状态只能通过
-//! [`Scheduler`] 访问，避免 topology、online mask 与多组 per-CPU 数组
+//! [`Scheduler`] 访问，避免 topology、CPU 生命周期位图与多组 per-CPU 数组
 //! 分别演进。
 
 use alloc::sync::Arc;
@@ -61,6 +61,16 @@ impl CpuSchedState {
         self.current_raw.load(Ordering::Acquire)
     }
 
+    pub fn clear_current(&self) -> Option<Arc<Task>> {
+        let current = self.current.lock().take();
+        let raw = self.current_raw.swap(null_mut(), Ordering::AcqRel);
+        if !raw.is_null() {
+            // Safety: raw 由 publish_current 中的 Arc::into_raw 产生。
+            unsafe { drop(Arc::from_raw(raw)) };
+        }
+        current
+    }
+
     /// 同时发布 owning current 槽和无锁热路径指针。
     pub fn publish_current(&self, task: Arc<Task>) {
         let raw = Arc::into_raw(Arc::clone(&task)) as *mut Task;
@@ -75,6 +85,10 @@ impl CpuSchedState {
 
     pub fn idle(&self) -> Option<Arc<Task>> {
         self.idle.lock().clone()
+    }
+
+    pub fn clear_idle(&self) -> Option<Arc<Task>> {
+        self.idle.lock().take()
     }
 
     pub fn install_idle(&self, task: Arc<Task>) -> Result<(), Arc<Task>> {
@@ -128,6 +142,12 @@ impl CpuSchedState {
         self.post_syscall_handoff.swap(0, Ordering::AcqRel)
     }
 
+    pub fn clear_scheduling_requests(&self) {
+        self.need_resched.store(false, Ordering::Release);
+        self.need_balance.store(false, Ordering::Release);
+        self.post_syscall_handoff.store(0, Ordering::Release);
+    }
+
     pub fn has_post_syscall_handoff(&self) -> bool {
         self.post_syscall_handoff.load(Ordering::Acquire) != 0
     }
@@ -154,11 +174,12 @@ impl CpuSchedState {
 
 /// 调度器运行期状态的唯一所有者。
 ///
-/// 第一阶段由它统一拥有 topology、online CPU 集和所有 CPU 运行状态。后续的
+/// 由它统一拥有 topology、online/active CPU 集和所有 CPU 运行状态。后续的
 /// placement、域负载和迁移事务继续挂到该对象上，而不是重新引入旁路全局状态。
 pub struct Scheduler {
     cpus: [CpuSchedState; MAX_CPUS],
     online: AtomicU64,
+    active: AtomicU64,
     topology: Spinlock<TopologyState>,
     domain_stats: Spinlock<[SchedDomainStats; MAX_SCHED_DOMAINS]>,
 }
@@ -173,14 +194,14 @@ struct TopologyState {
 pub struct TopologySnapshot {
     pub topology: SchedTopology,
     pub generation: u64,
-    pub online: CpuMask,
+    pub active: CpuMask,
 }
 
 /// 一个调度域在指定拓扑代际下的聚合负载与有效容量。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedDomainStats {
     pub generation: u64,
-    pub online: CpuMask,
+    pub active: CpuMask,
     pub capacity: u64,
     pub load: RunqueueClassLoad,
 }
@@ -189,7 +210,7 @@ impl SchedDomainStats {
     pub const fn empty() -> Self {
         Self {
             generation: 0,
-            online: CpuMask::EMPTY,
+            active: CpuMask::EMPTY,
             capacity: 0,
             load: RunqueueClassLoad {
                 deadline: 0,
@@ -218,6 +239,7 @@ impl Scheduler {
         Self {
             cpus: [const { CpuSchedState::new() }; MAX_CPUS],
             online: AtomicU64::new(CpuMask::BOOT.bits()),
+            active: AtomicU64::new(CpuMask::BOOT.bits()),
             topology: Spinlock::new(TopologyState {
                 topology: SchedTopology::bootstrap(),
                 generation: 1,
@@ -242,9 +264,36 @@ impl Scheduler {
         CpuMask::from_bits_truncate(self.online.load(Ordering::Acquire)).or_boot()
     }
 
+    pub fn active_set(&self) -> CpuMask {
+        CpuMask::from_bits_truncate(self.active.load(Ordering::Acquire)).or_boot()
+    }
+
     pub fn register_cpu(&self, cpu: CpuId) {
         self.online.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
+        self.active.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
         *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
+    }
+
+    pub fn deactivate_cpu(&self, cpu: CpuId) -> bool {
+        let old = self.active.fetch_and(!cpu.mask().bits(), Ordering::AcqRel);
+        *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
+        (old & cpu.mask().bits()) != 0
+    }
+
+    pub fn activate_cpu(&self, cpu: CpuId) -> bool {
+        if !self.online_set().contains(cpu) {
+            return false;
+        }
+        self.active.fetch_or(cpu.mask().bits(), Ordering::AcqRel);
+        *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
+        true
+    }
+
+    pub fn unregister_cpu(&self, cpu: CpuId) -> bool {
+        self.active.fetch_and(!cpu.mask().bits(), Ordering::AcqRel);
+        let old = self.online.fetch_and(!cpu.mask().bits(), Ordering::AcqRel);
+        *self.domain_stats.lock() = [SchedDomainStats::empty(); MAX_SCHED_DOMAINS];
+        (old & cpu.mask().bits()) != 0
     }
 
     pub fn topology(&self) -> SchedTopology {
@@ -256,7 +305,7 @@ impl Scheduler {
         TopologySnapshot {
             topology: state.topology,
             generation: state.generation,
-            online: self.online_set(),
+            active: self.active_set(),
         }
     }
 
@@ -270,20 +319,20 @@ impl Scheduler {
             let Some(domain) = snapshot.topology.domain(domain_id) else {
                 continue;
             };
-            let cpus = domain.span().intersection(snapshot.online);
+            let cpus = domain.span().intersection(snapshot.active);
             let mut load = RunqueueClassLoad::default();
             for cpu in cpus.iter() {
                 load = load.add(cpu_loads[cpu.get()]);
             }
             stats[domain_id] = SchedDomainStats {
                 generation: snapshot.generation,
-                online: snapshot.online,
-                capacity: domain.effective_capacity(snapshot.online),
+                active: snapshot.active,
+                capacity: domain.effective_capacity(snapshot.active),
                 load,
             };
         }
         let state = self.topology.lock();
-        if state.generation == snapshot.generation && self.online_set() == snapshot.online {
+        if state.generation == snapshot.generation && self.active_set() == snapshot.active {
             *self.domain_stats.lock() = stats;
         }
     }
@@ -294,7 +343,7 @@ impl Scheduler {
         let value = *stats.get(domain_id)?;
         (value.capacity != 0
             && value.generation == snapshot.generation
-            && value.online == snapshot.online)
+            && value.active == snapshot.active)
             .then_some(value)
     }
 
