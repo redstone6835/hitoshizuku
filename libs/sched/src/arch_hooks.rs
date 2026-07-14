@@ -146,7 +146,7 @@ pub struct ArchTimeOps {
     pub now_ns: fn() -> u64,
     /// 当前 CPU 的逻辑 id。`0..NR_CPUS`。
     ///
-    /// TODO(smp): AP 启动后必须返回稳定且连续的逻辑 CPU id。
+    /// AP 启动后必须返回稳定且连续的逻辑 CPU id。
     /// 回退到 boot CPU 的槽位。
     pub current_cpu_id: fn() -> usize,
 }
@@ -189,7 +189,7 @@ unsafe impl Send for CpuControlOps {}
 
 static CPU_CONTROL_OPS: AtomicPtr<CpuControlOps> = AtomicPtr::new(core::ptr::null_mut());
 
-/// TODO(smp): 架构层接通 AP 和 reschedule IPI 后必须注册该接口。
+/// 支持 SMP 的架构在接通 AP 和 reschedule IPI 后注册该接口。
 /// `send_resched` 只负责通知目标 CPU，实际切换仍在安全的调度边界完成。
 pub fn register_cpu_control(ops: &'static CpuControlOps) {
     register_once(&CPU_CONTROL_OPS, ops as *const _ as *mut _, "CpuControlOps");

@@ -41,6 +41,16 @@ fn main() -> ! {
     // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要
     // 调度器 init/idle 完成后才能派生内核线程。
     tty_poll::register();
+
+    let secondary_cpus = hal::sched::start_secondary_cpus();
+    log::info!(
+        "[smp] CPU startup complete: detected={} started={} failed={} online_mask={:#x} active_mask={:#x}",
+        secondary_cpus.detected,
+        secondary_cpus.started,
+        secondary_cpus.failed,
+        ::sched::online_cpu_mask(),
+        ::sched::active_cpu_mask(),
+    );
     /*
     #[cfg(debug_assertions)]
     sched::smoketest();

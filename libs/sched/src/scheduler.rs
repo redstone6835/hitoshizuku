@@ -689,7 +689,7 @@ pub(crate) fn offline_cpu_with_scheduler(
         return Err(errno::Errno::EBUSY);
     }
 
-    if !scheduler.deactivate_cpu(cpu) {
+    if scheduler.active_set().contains(cpu) && !scheduler.deactivate_cpu(cpu) {
         return Err(errno::Errno::EBUSY);
     }
     let drained = cpu_state.runqueue().drain_queued(now_ns);
@@ -846,10 +846,9 @@ fn restore_unmoved_tasks(
     }
 }
 
-/// AP 启动路径的调度接入口框架：把当前 CPU 正在执行的 task 登记为该 CPU 的
-/// current。当前 kernel 启动链路不调用它；AP bring-up 落地时可直接接入。
+/// AP 启动路径的调度接入口：把当前 CPU 正在执行的 task 登记为该 CPU 的 current。
 ///
-/// TODO(smp): AP 完成 per-CPU 栈、trap、页表和本地数据初始化后调用。
+/// AP 完成 per-CPU 栈、trap、页表和本地数据初始化后调用。
 /// 本 CPU idle task，最后进入 [`cpu_start_scheduling`]。
 pub fn adopt_cpu_current(cpu_id: usize, task: Arc<Task>) -> Result<(), errno::Errno> {
     if CpuId::new(cpu_id).is_none() {
@@ -1876,24 +1875,27 @@ pub fn spawn_idle_for(cpu_id: usize) -> Arc<Task> {
     t
 }
 
-/// [`spawn_idle_for`] 的显式 SMP 命名别名，供未来 AP bring-up 使用。
+/// [`spawn_idle_for`] 的显式 SMP 命名别名，供架构 AP 启动路径使用。
 ///
-/// TODO(smp): AP 调用 [`adopt_cpu_current`] 后为本 CPU 创建并安装 idle task。
+/// AP 启动前由 boot CPU 创建并安装本 CPU 的 idle task。
 pub fn spawn_idle_for_cpu(cpu_id: usize) -> Arc<Task> {
     spawn_idle_for(cpu_id)
 }
 
-/// AP 调度循环框架。当前启动链路不接入；真实 AP 代码应先调用
+/// AP 调度循环。架构代码应先调用
 /// [`adopt_cpu_current`] / [`spawn_idle_for_cpu`] 完成本 CPU 槽位初始化。
 ///
-/// TODO(smp): 架构 secondary entry 完成 per-CPU 初始化后以此作为调度入口；
+/// secondary entry 完成 per-CPU 初始化后以此作为调度入口；
 /// 本函数会检查初始化状态、激活 CPU，并开始消费本地 runqueue。
 pub fn cpu_start_scheduling(cpu_id: usize) -> ! {
     activate_cpu(cpu_id).expect("[sched] CPU must be online before scheduling loop");
     loop {
-        let _ = balance_once(cpu_id);
         schedule_once(now_ns_internal());
-        core::hint::spin_loop();
+        if let Some(ops) = arch_hooks::idle() {
+            (ops.idle_relax)();
+        } else {
+            core::hint::spin_loop();
+        }
     }
 }
 

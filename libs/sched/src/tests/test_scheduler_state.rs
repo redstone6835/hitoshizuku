@@ -295,6 +295,33 @@ fn cpu_offline_removes_idle_current_and_cpu_requests() {
 }
 
 #[ktest]
+fn cpu_offline_cancels_inactive_startup_cpu() {
+    let scheduler = Scheduler::new();
+    let cpu1_id = CpuId::new(1).expect("cpu1");
+    let idle = make_task();
+    idle.mark_idle_task();
+    idle.sched.set_sched_attr(SchedAttr::idle());
+    idle.set_cpu_affinity(CpuMask::single_raw(1).bits());
+    bind_to_cpu(&scheduler, &idle, 1);
+
+    assert!(scheduler.mark_cpu_online(cpu1_id));
+    assert!(
+        scheduler
+            .cpu_or_boot(1)
+            .install_idle(Arc::clone(&idle))
+            .is_ok()
+    );
+    assert!(!scheduler.active_set().contains(cpu1_id));
+
+    offline_cpu_with_scheduler(&scheduler, 1, 2).expect("cancel inactive CPU startup");
+
+    assert!(!scheduler.online_set().contains(cpu1_id));
+    assert!(scheduler.cpu_or_boot(1).idle().is_none());
+    assert_eq!(idle.state(), TaskState::Stopped);
+    assert_eq!(idle.placement().state, PlacementState::Unbound);
+}
+
+#[ktest]
 fn topology_refresh_updates_runnable_and_sleeping_placements() {
     let scheduler = two_cpu_scheduler();
     let old_generation = scheduler.topology_snapshot().generation;
