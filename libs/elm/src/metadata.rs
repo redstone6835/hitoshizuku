@@ -78,6 +78,11 @@ pub const ELM_META_FIELD_MATCH_CALLBACK: u16 = 24;
 pub const ELM_META_FIELD_PROBE_CALLBACK: u16 = 25;
 /// `.elm.meta` 字段表中标识驱动 remove 回调符号的稳定 tag。
 pub const ELM_META_FIELD_REMOVE_CALLBACK: u16 = 26;
+/// `.elm.meta` 字段表中标识规范 Rust 函数指针签名的稳定 tag。
+///
+/// 该字段只用于直接固定 import/export 和内核直接符号。构建工具必须对完整 UTF-8 字节串
+/// 计算 SHA-256，并把摘要写入 EBI；运行时不得仅凭函数名或版本接受裸地址。
+pub const ELM_META_FIELD_RUST_ABI: u16 = 27;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -117,6 +122,8 @@ pub enum ElmRustMetadataKind {
     DeviceIrq = 16,
     /// `DeviceDiscovery` 表示由 ELM 生命周期主动执行的设备发现逻辑。
     DeviceDiscovery = 17,
+    /// `Module` 表示当前镜像唯一的统一模块描述符。
+    Module = 18,
 }
 
 impl ElmRustMetadataKind {
@@ -140,6 +147,7 @@ impl ElmRustMetadataKind {
             15 => Some(Self::DeviceFunction),
             16 => Some(Self::DeviceIrq),
             17 => Some(Self::DeviceDiscovery),
+            18 => Some(Self::Module),
             _ => None,
         }
     }

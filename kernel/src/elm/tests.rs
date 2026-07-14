@@ -27,16 +27,17 @@ use elm_model::{
     ELM_HEALTH_CHECK_PROJECTION_SOURCES, ELM_HEALTH_CHECK_PROVIDERS, ELM_HEALTH_CHECK_RESOURCES,
     ELM_HEALTH_CHECK_RUNTIME_PORTS, ELM_HEALTH_CHECK_SEQUENCES, ELM_HEALTH_CHECK_TODO_REGISTRY,
     ELM_HEALTH_CHECK_TRUST, ELM_KERNEL_PROVIDER_FLAG_NONE, ELM_LIFECYCLE_REASON_BUILTIN_PROTECTED,
-    ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_MENU_FLAG_TODO, ELM_MGR_ACTION_PROVIDER_ASYNC,
-    ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_API_KIND_SUBSYSTEM, ELM_MGR_RELATION_POINT_LEN,
-    ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_PERMISSION, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
-    ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
-    ELM_NATIVE_POLICY_MIXIN_PATCH, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
-    ELM_POLICY_BLOCK_CALLER_STALE, ELM_POLICY_BLOCK_CAPABILITY_DENIED,
-    ELM_POLICY_BLOCK_EXTENSION_DUPLICATE, ELM_POLICY_BLOCK_LEASE_BUSY,
-    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
-    ELM_POLICY_BLOCK_POLICY_ESCALATION, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT, ELM_LIFECYCLE_REASON_HOOK_FAILED, ELM_MENU_FLAG_TODO,
+    ELM_MGR_ACTION_PROVIDER_ASYNC, ELM_MGR_ACTION_PROVIDER_INVOKE, ELM_MGR_API_KIND_SUBSYSTEM,
+    ELM_MGR_RELATION_POINT_LEN, ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID,
+    ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION, ELM_MGR_STATUS_TODO,
+    ELM_MGR_STATUS_UNSUPPORTED, ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP,
+    ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NATIVE_POLICY_MIXIN_PATCH, ELM_NEXUS_CONTRACT_LEN,
+    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CALLER_STALE,
+    ELM_POLICY_BLOCK_CAPABILITY_DENIED, ELM_POLICY_BLOCK_EXTENSION_DUPLICATE,
+    ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
+    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_POLICY_ESCALATION,
+    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
     ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED,
     ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA,
     ELM_POLICY_BLOCK_SCOPE_DENIED, ELM_PROVIDER_ASYNC_QUEUE_LIMIT, ELM_PROVIDER_FLAG_DYNAMIC,
@@ -4035,7 +4036,7 @@ fn elm_mgr_loads_projection_source_from_registered_provider() {
 }
 
 #[ktest]
-fn elm_mgr_quarantines_faulting_native_eki_hooks() {
+fn elm_mgr_rejects_legacy_native_eki_lifecycle_symbols() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
     let code = vec![0x13, 0, 0, 0];
@@ -4069,9 +4070,9 @@ fn elm_mgr_quarantines_faulting_native_eki_hooks() {
         dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
     assert_eq!(response_status(&response), ELM_MGR_STATUS_OK);
     let load = response_payload(&response);
-    assert_eq!(read_i32(load, 8), ElmEbiLoadStatus::RuntimeRejected as i32);
+    assert_eq!(read_i32(load, 8), ElmEbiLoadStatus::InvalidManifest as i32);
     assert_eq!(read_u32(load, 12), state_code(ElmState::Quarantined));
-    assert_eq!(read_u32(load, 16), ELM_LIFECYCLE_REASON_HOOK_FAILED);
+    assert_eq!(read_u32(load, 16), ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT);
     let cell_id = read_u64(load, 0);
     let cell = core
         .cells()
@@ -4091,7 +4092,7 @@ fn elm_mgr_quarantines_faulting_native_eki_hooks() {
 }
 
 #[ktest]
-fn elm_mgr_quarantines_entry_image_with_faulting_initialize_hook() {
+fn elm_mgr_rejects_legacy_entry_image_without_module_descriptor() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
     let code = vec![0x13, 0, 0, 0];
@@ -4127,9 +4128,9 @@ fn elm_mgr_quarantines_entry_image_with_faulting_initialize_hook() {
         dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
     assert_eq!(response_status(&response), ELM_MGR_STATUS_OK);
     let load = response_payload(&response);
-    assert_eq!(read_i32(load, 8), ElmEbiLoadStatus::RuntimeRejected as i32);
+    assert_eq!(read_i32(load, 8), ElmEbiLoadStatus::InvalidManifest as i32);
     assert_eq!(read_u32(load, 12), state_code(ElmState::Quarantined));
-    assert_eq!(read_u32(load, 16), ELM_LIFECYCLE_REASON_HOOK_FAILED);
+    assert_eq!(read_u32(load, 16), ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT);
     let cell_id = read_u64(load, 0);
     let cell = core
         .cells()
@@ -6673,6 +6674,16 @@ fn elm_native_replace_selects_highest_unique_managed_export() {
 }
 
 #[ktest]
+fn elm_native_direct_pinned_import_requires_exact_rust_abi() {
+    assert!(ElmCore::test_native_direct_pinned_resolution());
+}
+
+#[ktest]
+fn elm_kernel_symbol_backend_is_explicit_todo() {
+    assert!(ElmCore::test_kernel_symbol_backend_is_explicit_todo());
+}
+
+#[ktest]
 fn elm_native_import_staging_is_transactional() {
     assert!(ElmCore::test_native_import_staging_transaction());
 }
@@ -6680,4 +6691,9 @@ fn elm_native_import_staging_is_transactional() {
 #[ktest]
 fn elm_native_replace_recovers_only_a_healthy_old_generation() {
     assert!(ElmCore::test_native_replace_old_generation_recovery());
+}
+
+#[ktest]
+fn elm_kernel_symbol_import_bookkeeping_is_transactional() {
+    assert!(ElmCore::test_kernel_symbol_import_bookkeeping());
 }

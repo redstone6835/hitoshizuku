@@ -247,7 +247,7 @@ pub struct ElmNativeManagedCallV1 {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// 内核调用原生 `#[elm::entry]` trampoline 使用的 ABI v1 frame。
+/// 内核调用 [`ElmModule::entry`](crate::ElmModule::entry) trampoline 使用的 ABI v1 frame。
 pub struct ElmNativeEntryFrameV1 {
     /// 该结构遵循的 ABI 版本；解析其余字段前必须验证兼容性。
     pub abi_version: u16,

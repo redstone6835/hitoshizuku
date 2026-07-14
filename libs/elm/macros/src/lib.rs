@@ -9,11 +9,12 @@
 //!
 //! # 共同函数约束
 //!
-//! 除 [`macro@payload`] 和 [`macro@import`] 外，本 crate 的 attribute 均作用于函数。被标记函数必须：
+//! [`macro@module`] 作用于 `ElmModule` Trait 实现，并可在该实现中收纳 provider、export、
+//! device 与 mixin 方法。生命周期和激活入口只能使用 trait 方法；被注册的业务方法必须：
 //!
 //! - 是普通安全 Rust 函数，不能是 `unsafe fn`；
 //! - 不能声明 `extern` ABI、`async`、`const`、可变参数或泛型参数；
-//! - 不能包含 `self` 接收者；
+//! - 独立函数不能包含 `self`；根模块内回调必须使用 `&self`，设备发现可使用 `&mut self`；
 //! - 必须显式写出文档规定的返回类型；
 //! - 参数数量和类型必须与对应 attribute 的规范签名一致。
 //!
@@ -34,33 +35,30 @@
 //!
 //! # 完整示例
 //!
-//! 以下代码展示生命周期、固定载荷和 provider 的组合。示例标记为 `ignore`，因为实际
+//! 以下代码展示根模块、固定载荷和 provider 的组合。示例标记为 `ignore`，因为实际
 //! ELM 工程还需要 `#![no_std]`、`#![no_main]`、专用链接脚本和 `elm-tools` 打包步骤。
 //!
 //! ```ignore
-//! use elm::{
-//!     HookResult, LifecycleContext, ProviderReply, ProviderRequest, ProviderResult,
-//! };
+//! use elm::{ElmModule, HookError, HookResult, LifecycleContext, ProviderReply,
+//!     ProviderRequest, ProviderResult};
 //!
 //! #[elm::payload("demo.request@1")]
 //! struct Request {
 //!     opcode: u32,
 //! }
 //!
-//! #[elm::on_initialize]
-//! fn initialize(_context: &LifecycleContext) -> HookResult {
-//!     elm::runtime::log(6, "demo: initialized")
-//!         .map_err(|_| elm::HookError::new(-1))
-//! }
+//! struct Demo;
 //!
-//! #[elm::on_finalize]
-//! fn finalize(_context: &LifecycleContext) -> HookResult {
-//!     Ok(())
-//! }
+//! #[elm::module]
+//! impl ElmModule for Demo {
+//!     fn create(_context: &LifecycleContext) -> Result<Self, HookError> { Ok(Self) }
+//!     fn initialize(&mut self, _context: &LifecycleContext) -> HookResult { Ok(()) }
+//!     fn finalize(&mut self, _context: &LifecycleContext) -> HookResult { Ok(()) }
 //!
-//! #[elm::provider(contract = "demo.service@1")]
-//! fn service(_request: &ProviderRequest) -> ProviderResult {
-//!     Ok(ProviderReply::ok())
+//!     #[elm::provider(contract = "demo.service@1")]
+//!     fn service(&self, _request: &ProviderRequest) -> ProviderResult {
+//!         Ok(ProviderReply::ok())
+//!     }
 //! }
 //! ```
 
@@ -71,16 +69,15 @@ use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{
-    Expr, ExprLit, ExprUnary, Fields, FnArg, ItemFn, ItemStatic, ItemStruct, Lit, LitStr, Meta,
-    Pat, ReturnType, Token, Type, UnOp, parse_macro_input,
+    Expr, ExprLit, ExprUnary, Fields, FnArg, GenericArgument, ImplItem, ImplItemFn, ItemFn,
+    ItemImpl, ItemStatic, ItemStruct, Lit, LitStr, Meta, Pat, PathArguments, ReturnType, Signature,
+    Token, Type, TypeBareFn, UnOp, parse_macro_input,
 };
 
 const META_MAGIC: &[u8; 8] = b"ELMMETA1";
 const META_VERSION: u16 = 1;
 const META_HEADER_SIZE: usize = 32;
 
-const KIND_LIFECYCLE: u16 = 1;
-const KIND_ENTRY: u16 = 2;
 const KIND_PROVIDER: u16 = 3;
 const KIND_PROVIDER_SNAPSHOT: u16 = 4;
 const KIND_EXPORT: u16 = 5;
@@ -96,6 +93,7 @@ const KIND_DEVICE_REMOVE: u16 = 14;
 const KIND_DEVICE_FUNCTION: u16 = 15;
 const KIND_DEVICE_IRQ: u16 = 16;
 const KIND_DEVICE_DISCOVERY: u16 = 17;
+const KIND_MODULE: u16 = 18;
 
 const VALUE_UTF8: u16 = 1;
 const VALUE_U32: u16 = 2;
@@ -103,7 +101,6 @@ const VALUE_I32: u16 = 3;
 const VALUE_U64: u16 = 4;
 
 const FIELD_SYMBOL: u16 = 1;
-const FIELD_HOOK_KIND: u16 = 2;
 const FIELD_NAME: u16 = 3;
 const FIELD_CONTRACT: u16 = 4;
 const FIELD_MIN_VERSION: u16 = 5;
@@ -127,12 +124,14 @@ const FIELD_RESOURCE: u16 = 23;
 const FIELD_MATCH_CALLBACK: u16 = 24;
 const FIELD_PROBE_CALLBACK: u16 = 25;
 const FIELD_REMOVE_CALLBACK: u16 = 26;
+const FIELD_RUST_ABI: u16 = 27;
 
 const IMPORT_OPTIONAL: u32 = 1 << 0;
 const IMPORT_MANAGED: u32 = 1 << 1;
 const IMPORT_DIRECT_PINNED: u32 = 1 << 2;
 const IMPORT_ALLOW_ANCESTOR: u32 = 1 << 3;
 const IMPORT_ALLOW_BUILTIN: u32 = 1 << 4;
+const IMPORT_KERNEL_SYMBOL: u32 = 1 << 5;
 const EXPORT_MANAGED: u32 = 1 << 0;
 const EXPORT_DIRECT_PINNED: u32 = 1 << 1;
 const EXPORT_PRIVATE: u32 = 1 << 2;
@@ -144,324 +143,33 @@ const NEXUS_CONTRACT_LEN: usize = 64;
 const RELATION_POINT_LEN: usize = 32;
 
 #[proc_macro_attribute]
-/// 声明 ELM 的必需初始化前钩子。
+/// 注册当前镜像唯一的 [`elm::ElmModule`] 实现。
 ///
-/// # 调用时机
-///
-/// 装载器完成镜像验证、段映射、重定位、W^X 封口、指令缓存同步、根 API 表注入和导入槽
-/// 暂存后调用此钩子。返回成功后，运行时才会公开该单元的依赖边、扩展点、provider 端口
-/// 和菜单项，并把单元推进到 `Active`。初始化失败时，单元不会对外可见，运行时进入回滚
-/// 和隔离路径。
-///
-/// 每个动态 ELM 必须且只能声明一个初始化钩子。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::LifecycleContext) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数。业务函数保持 Rust ABI；宏生成导出名精确为 `on_initialize` 的
-/// ABI trampoline，并写入生命周期种类为 initialize 的 `.elm.meta` 记录。
-///
-/// 返回 `Ok(())` 表示初始化事务可以继续提交。返回 `Err(HookError)` 时，错误状态码原样
-/// 传播给运行时；状态码不能为零，`HookError::new(0)` 会归一化为无效调用错误。
-///
-/// # 限制
-///
-/// 初始化函数不能手工声明 `extern "C"`、`unsafe`、泛型、`async` 或 `const`。不要把尚未
-/// 提升的导入句柄、当前上下文借用或内核临时地址保存到钩子返回之后。需要长期存在的对象
-/// 必须通过运行时认可的资源所有权接口登记，以便卸载和热替换时排空。
-///
-/// # 示例
+/// attribute 必须标记 `impl elm::ElmModule for T`，不接受参数，也不允许泛型实现。宏会
+/// 生成当前 generation 唯一的实例槽、统一模块描述符，以及动态和编译期内化构建使用的
+/// 生命周期入口。模块作者不再为每个生命周期方法单独添加 attribute。
 ///
 /// ```ignore
-/// use elm::{HookError, HookResult, LifecycleContext};
+/// struct Demo;
 ///
-/// #[elm::on_initialize]
-/// fn initialize(context: &LifecycleContext) -> HookResult {
-///     let message = if context.parent_id().is_some() {
-///         "child ELM initialized"
-///     } else {
-///         "root ELM initialized"
-///     };
-///     elm::runtime::log(6, message).map_err(|_| HookError::new(-1))
-/// }
-/// ```
-pub fn on_initialize(attr: TokenStream, item: TokenStream) -> TokenStream {
-    lifecycle_attribute(attr, item, 1, 1, "on_initialize")
-}
-
-#[proc_macro_attribute]
-/// 声明 ELM 的必需卸载前钩子。
-///
-/// # 调用时机
-///
-/// 运行时已经阻止新调用并完成必要排空后，在撤销单元拓扑、导入、provider、菜单和已登记
-/// 资源之前调用此钩子。钩子负责撤销模块自定义状态、注销由模块主动创建的对象以及停止不再
-/// 接受框架托管的工作。每个动态 ELM 必须且只能声明一个终结钩子。
-///
-/// 正常卸载、初始化失败回滚和热替换旧代退役均可能触发终结。代码必须允许“初始化只完成了
-/// 一部分”的情况，并应设计为幂等或至少能根据模块自身状态安全收口。终结失败时，运行时会
-/// 保留单元及其资源用于诊断，而不是伪装成卸载成功。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::LifecycleContext) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数。宏生成导出名 `on_finalize`、对应 ABI trampoline 和生命周期
-/// 元数据。`Ok(())` 允许卸载事务继续；`Err(HookError)` 中止提交并进入故障诊断路径。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{HookResult, LifecycleContext};
-///
-/// #[elm::on_finalize]
-/// fn finalize(_context: &LifecycleContext) -> HookResult {
-///     elm::runtime::log(6, "demo: finalizing")
-///         .map_err(|_| elm::HookError::new(-1))?;
-///     Ok(())
-/// }
-/// ```
-pub fn on_finalize(attr: TokenStream, item: TokenStream) -> TokenStream {
-    lifecycle_attribute(attr, item, 2, 2, "on_finalize")
-}
-
-#[proc_macro_attribute]
-/// 声明进入静默阶段前的可选钩子。
-///
-/// `on_quiesce` 在暂停或热替换需要旧代停止产生新工作时调用。钩子应关闭模块自有的工作
-/// 入口、停止创建新异步请求，并促使已登记资源进入可排空状态；它不应直接释放仍可能被在途
-/// 调用访问的对象。成功后运行时继续等待调用和租约排空，再进入暂停或迁移阶段。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::LifecycleContext) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数，最多声明一次。宏导出 `on_quiesce` 并生成对应生命周期元数据。
-/// 返回错误会阻止暂停或替换事务继续。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{HookResult, LifecycleContext};
-///
-/// #[elm::on_quiesce]
-/// fn quiesce(_context: &LifecycleContext) -> HookResult {
-///     // 在此停止模块自有的生产入口；资源释放留给 finalize。
-///     Ok(())
-/// }
-/// ```
-pub fn on_quiesce(attr: TokenStream, item: TokenStream) -> TokenStream {
-    lifecycle_attribute(attr, item, 6, 3, "on_quiesce")
-}
-
-#[proc_macro_attribute]
-/// 声明单元完成排空后进入 `Paused` 前的可选钩子。
-///
-/// 运行时只在 `on_quiesce` 成功且受管调用、provider 调用及相关租约满足暂停条件后调用
-/// `on_pause`。该钩子用于保存轻量暂停状态或切换模块内部状态机；它不是卸载钩子，不能假定
-/// 导入、导出、镜像内存或已登记资源即将消失。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::LifecycleContext) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数，最多声明一次。成功后单元进入 `Paused`；失败则暂停事务失败，
-/// 运行时依据恢复结果保留活动状态或进入故障隔离。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{HookResult, LifecycleContext};
-///
-/// #[elm::on_pause]
-/// fn pause(_context: &LifecycleContext) -> HookResult {
-///     Ok(())
-/// }
-/// ```
-pub fn on_pause(attr: TokenStream, item: TokenStream) -> TokenStream {
-    lifecycle_attribute(attr, item, 7, 4, "on_pause")
-}
-
-#[proc_macro_attribute]
-/// 声明暂停单元恢复活动前的可选钩子。
-///
-/// `on_resume` 在单元仍处于受保护的恢复事务中调用。钩子应重新打开由 `on_quiesce` 关闭
-/// 的模块自有入口，并恢复暂停期间冻结的状态。只有钩子成功后，运行时才把单元重新推进到
-/// `Active` 并允许新调用进入。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::LifecycleContext) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数，最多声明一次。失败时单元保持不可服务状态并留下诊断记录。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{HookResult, LifecycleContext};
-///
-/// #[elm::on_resume]
-/// fn resume(_context: &LifecycleContext) -> HookResult {
-///     Ok(())
-/// }
-/// ```
-pub fn on_resume(attr: TokenStream, item: TokenStream) -> TokenStream {
-    lifecycle_attribute(attr, item, 8, 5, "on_resume")
-}
-
-#[proc_macro_attribute]
-/// 声明热替换旧代的可选状态导出钩子。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::MigrationContext, &mut [u8]) -> elm::MigrationExportResult
-/// ```
-///
-/// attribute 不接受参数，最多声明一次。运行时在新镜像完成影子装载和初始化、旧代完成
-/// 静默后调用此钩子。第二个参数是运行时拥有的迁移缓冲区，钩子应写入自描述、版本化的
-/// 模块状态，并返回实际写入长度。返回长度大于缓冲容量会被 trampoline 视为 ABI 错误。
-///
-/// 宏生成导出名 `on_migrate_export`、迁移 ABI trampoline 和生命周期元数据。缓冲区只在
-/// 本次调用期间有效；不得保存其地址。状态编码由模块定义，但新旧版本必须明确约定兼容性，
-/// 并建议在首部放置模块私有版本和长度。
-///
-/// # 错误语义
-///
-/// 返回 `Err(HookError)` 会终止替换提交。运行时随后尝试恢复旧代，并调用新代的
-/// `on_migrate_abort` 与 `on_finalize`。因此导出逻辑不应在成功提交前破坏旧代唯一状态。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{MigrationContext, MigrationExportResult};
-///
-/// #[elm::on_migrate_export]
-/// fn export_state(
-///     _context: &MigrationContext,
-///     output: &mut [u8],
-/// ) -> MigrationExportResult {
-///     let state = 7_u64.to_le_bytes();
-///     if output.len() < state.len() {
-///         return Err(elm::HookError::new(-12));
+/// #[elm::module]
+/// impl elm::ElmModule for Demo {
+///     fn create(_context: &elm::LifecycleContext) -> Result<Self, elm::HookError> {
+///         Ok(Self)
 ///     }
-///     output[..state.len()].copy_from_slice(&state);
-///     Ok(state.len())
+///
+///     fn initialize(&mut self, _context: &elm::LifecycleContext) -> elm::HookResult {
+///         Ok(())
+///     }
+///
+///     fn finalize(&mut self, _context: &elm::LifecycleContext) -> elm::HookResult {
+///         Ok(())
+///     }
 /// }
 /// ```
-pub fn on_migrate_export(attr: TokenStream, item: TokenStream) -> TokenStream {
-    migration_export_attribute(attr, item)
-}
-
-#[proc_macro_attribute]
-/// 声明热替换新代的可选状态导入钩子。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::MigrationContext, &[u8]) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数，最多声明一次。运行时把旧代 `on_migrate_export` 成功产生的完整
-/// 字节串传给该钩子。新代应先验证模块私有状态版本和长度，再构造尚未对外公开的新状态。
-/// 输入切片只在调用期间有效。
-///
-/// 返回成功仅表示新代接受了迁移状态；导入、provider backend、绑定和代际仍要在运行时
-/// 提交点原子切换。返回错误会触发新代 abort/finalize 和旧代恢复，不会公开半完成的新代。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{HookError, HookResult, MigrationContext};
-///
-/// #[elm::on_migrate_import]
-/// fn import_state(_context: &MigrationContext, input: &[u8]) -> HookResult {
-///     let bytes: [u8; 8] = input.try_into().map_err(|_| HookError::new(-22))?;
-///     let _state = u64::from_le_bytes(bytes);
-///     Ok(())
-/// }
-/// ```
-pub fn on_migrate_import(attr: TokenStream, item: TokenStream) -> TokenStream {
-    migration_input_attribute(attr, item, 4, 7, "on_migrate_import")
-}
-
-#[proc_macro_attribute]
-/// 声明热替换新代在事务回滚时执行的可选清理钩子。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::MigrationContext, &[u8]) -> elm::HookResult
-/// ```
-///
-/// attribute 不接受参数，最多声明一次。新代初始化后，只要迁移或最终提交失败，运行时就可能
-/// 调用此钩子。输入是本次替换使用的迁移状态；如果失败发生在状态导出之前，输入可以为空。
-/// 钩子应撤销 `on_migrate_import` 已创建但尚未公开的模块私有状态，并能处理部分导入。
-///
-/// abort 之后运行时仍会调用新代 `on_finalize`。两者职责应区分：abort 撤销迁移事务特有的
-/// 状态，finalize 完成单元通用收口。返回错误会被记录为回滚故障，可能使新旧代进入隔离。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{HookResult, MigrationContext};
-///
-/// #[elm::on_migrate_abort]
-/// fn abort_migration(_context: &MigrationContext, _input: &[u8]) -> HookResult {
-///     Ok(())
-/// }
-/// ```
-pub fn on_migrate_abort(attr: TokenStream, item: TokenStream) -> TokenStream {
-    migration_input_attribute(attr, item, 5, 8, "on_migrate_abort")
-}
-
-#[proc_macro_attribute]
-/// 声明 ELM 激活后的可选一次性入口。
-///
-/// # 调用时机
-///
-/// `entry` 在必需初始化钩子成功、声明式拓扑激活且单元进入 `Active` 后调用。它适合启动
-/// 模块自己的受托工作或执行一次性自检，但不替代 `on_initialize`，也不能用于声明必须在
-/// 单元公开前完成的不变量。一个 ELM 最多声明一个 entry。
-///
-/// # 规范签名
-///
-/// ```text
-/// fn(&elm::EntryContext) -> elm::EntryResult
-/// ```
-///
-/// attribute 不接受参数。若函数名为 `start`，宏生成导出符号 `__elm_entry_start`、ABI
-/// trampoline 和 entry 元数据。业务函数名会成为符号的一部分，因此必须满足 EBI symbol
-/// 字符约束。
-///
-/// 返回错误会写入 entry frame 的 `exit_code` 并报告给运行时；是否隔离单元由运行时策略
-/// 决定。入口上下文和其中的代际信息只代表本次调用。
-///
-/// # 示例
-///
-/// ```ignore
-/// use elm::{EntryContext, EntryResult};
-///
-/// #[elm::entry]
-/// fn start(context: &EntryContext) -> EntryResult {
-///     let _generation = context.generation();
-///     Ok(())
-/// }
-/// ```
-pub fn entry(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let function = parse_macro_input!(item as ItemFn);
-    match entry_impl(attr.into(), function) {
+pub fn module(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let implementation = parse_macro_input!(item as ItemImpl);
+    match module_impl(attr.into(), implementation) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -574,7 +282,7 @@ pub fn provider_snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-/// 声明一个供其他 ELM 通过受管导入调用的 export。
+/// 声明一个供其他 ELM 调用的 export。
 ///
 /// # 参数语法
 ///
@@ -594,11 +302,12 @@ pub fn provider_snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `visibility` 可为 `"dependency"`、`"private"` 或 `"subtree"`，默认
 ///   `"dependency"`。
 ///
-/// `name` 必须满足 EBI symbol 约束，`contract` 必须包含版本。当前 Rust 开发框架只为函数
-/// 生成受管调用 trampoline；选择 `direct-pinned` 会把导出声明为直接固定能力，调用双方必须
-/// 额外满足运行时的原生能力、代际固定和策略要求。
+/// `name` 必须满足 EBI symbol 约束，`contract` 必须包含版本。`managed` 模式生成固定调用帧
+/// trampoline；`direct-pinned` 模式导出真实 Rust 函数，构建链从函数指针类型生成规范签名并
+/// 写入 SHA-256。运行时只有在名称、契约、版本和 ABI 摘要全部匹配时才写入调用方槽位，并在
+/// 直接调用者存活期间固定 provider generation。
 ///
-/// # 规范签名
+/// # 受管模式签名
 ///
 /// ```text
 /// fn(&elm::ManagedRequest) -> elm::ManagedResult
@@ -606,6 +315,9 @@ pub fn provider_snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// trampoline 校验调用方、被调用方代际和载荷边界，再把 `ManagedResult` 写回固定回复帧。
 /// 热替换时，受管调用按 generation 路由；实现不得把 `ManagedRequest` 中的借用保存到返回后。
+/// `direct-pinned` 可以使用不含泛型、`impl Trait` 或显式 `extern` 的普通 Rust 函数签名；参数
+/// 与返回值必须遵循同一 rustc、target spec、panic 策略和目标特性生成的 Rust ABI。跨边界
+/// 借用的有效期不能超过一次调用，panic 必须通过 ELM 受保护终止出口收敛。
 ///
 /// # 示例
 ///
@@ -623,6 +335,21 @@ pub fn provider_snapshot(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///         .map_err(|_| elm::HookError::new(-22))?)
 /// }
 /// ```
+///
+/// 直接固定导出保留普通 Rust 调用形式：
+///
+/// ```ignore
+/// #[elm::export(
+///     name = "demo.add",
+///     contract = "demo.add@1",
+///     version = 1,
+///     mode = "direct-pinned",
+///     visibility = "dependency"
+/// )]
+/// fn add(left: u64, right: u64) -> u64 {
+///     left + right
+/// }
+/// ```
 pub fn export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
     match export_impl(attr.into(), function) {
@@ -638,7 +365,7 @@ pub fn export(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// `import` 只能标记不可变 `static`。`mode = "managed"` 时槽类型必须精确为
 /// `elm::ManagedImport`，初始化值通常为 `ManagedImport::new()`；
-/// `mode = "direct-pinned"` 时必须为 `elm::UnsafeDirectImport`。禁止 `static mut`，也禁止
+/// `mode = "direct-pinned"` 时必须为 `elm::DirectImport<fn(...) -> ...>`。禁止 `static mut`，也禁止
 /// 手写 `used`、`no_mangle`、`export_name` 或 `link_section`，因为这些属性由宏独占管理。
 ///
 /// # 参数语法
@@ -666,9 +393,9 @@ pub fn export(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// 元数据。装载器在初始化事务中写入句柄或直接地址；必需 import 无匹配目标时镜像不能激活，
 /// 可选 import 保持未绑定状态。
 ///
-/// `ManagedImport` 是推荐路径，负责 call id、固定载荷编码和回复关联校验。直接固定导入返回
-/// 裸地址，调用方必须在 `unsafe` 代码中自行证明函数签名、代际固定、生命周期和权限，且它会
-/// 限制热替换能力。
+/// `ManagedImport` 负责 call id、固定载荷编码和回复关联校验。`DirectImport<F>` 返回已经过
+/// ABI 摘要校验的类型化 Rust 函数指针；调用方仍需在 `unsafe` 代码中证明业务参数、借用与
+/// panic 约束。直接固定依赖会阻止 provider 卸载，并限制其热替换能力。
 ///
 /// # 示例
 ///
@@ -684,9 +411,60 @@ pub fn export(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// )]
 /// static ECHO: ManagedImport = ManagedImport::new();
 /// ```
+///
+/// 直接固定导入必须显式携带函数指针类型：
+///
+/// ```ignore
+/// #[elm::import(
+///     name = "demo.add",
+///     contract = "demo.add@1",
+///     version = 1,
+///     mode = "direct-pinned"
+/// )]
+/// static ADD: elm::DirectImport<fn(u64, u64) -> u64> = elm::DirectImport::new();
+///
+/// // Safety: 装载器已校验 Rust ABI 摘要；调用方仍负责业务参数与 panic 约束。
+/// let add = unsafe { ADD.get() }.ok_or(elm::HookError::new(-2))?;
+/// assert_eq!(add(20, 22), 42);
+/// # Ok::<(), elm::HookError>(())
+/// ```
 pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as ItemStatic);
     match import_impl(attr.into(), item) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+#[proc_macro_attribute]
+/// 声明一个由内核直接符号目录解析的 Rust 函数地址槽。
+///
+/// 该 attribute 只供 `elm-tools` 同步的子系统接口投影使用。它必须标记不可变
+/// `static elm::DirectImport<fn(...) -> ...>`，并要求 `name`、`contract` 与非零 `version`。宏会
+/// 生成内核符号 import 元数据和八字节地址槽；装载器在调用任何模块代码前按名称、契约和
+/// 版本精确解析并写入地址。解析过程不经过 elm-mgr、provider、受管调用帧或 ELM export。
+///
+/// 投影 crate 应在普通安全函数中把槽地址转换为与目录声明完全一致的 Rust 函数指针，模块
+/// 作者不应直接使用此 attribute。内核与 ELM 必须通过同一工具链、目标特性和 ABI 指纹校验；
+/// 错误签名转换属于未定义行为，因此符号目录与投影必须由同一份接口定义生成。
+///
+/// 每个槽使用确定名称的内部链接和独立 `.data.elm_imports.<slot>` 输入段。接口投影必须启用
+/// nightly `linkage` feature，并以非内联薄包装引用槽；链接器因此只保留业务代码实际调用的
+/// 槽。`.elm.meta` 可以保存完整接口目录，但 `elm-tools` 只把最终 ELF 中仍存在的槽投影为
+/// EBI import，避免“依赖一个接口 crate 就获得整组符号”的权限扩张。
+///
+/// ```ignore
+/// #[elm::kernel_symbol(
+///     name = "sched.now_ns_public",
+///     contract = "kernel.sched.now-ns@1",
+///     version = 1,
+///     abi = "fn()->u64"
+/// )]
+/// static NOW_NS: elm::DirectImport<fn() -> u64> = elm::DirectImport::new();
+/// ```
+pub fn kernel_symbol(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(item as ItemStatic);
+    match kernel_symbol_impl(attr.into(), item) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -697,8 +475,8 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// attribute 只能标记不可变 `static`。静态对象使用 `kernel_api::ApiImport<Table>`，其
 /// initializer 中的 identifier、版本和能力必须与 attribute 保持一致；打包器会把该声明
-/// 转换为 EBI Kernel API requirement，内核在执行 `on_initialize` 前完成版本、布局、权限和
-/// capability 校验。
+/// 转换为 EBI Kernel API requirement，内核在执行 `elm::ElmModule::initialize` 前完成
+/// 版本、布局、权限和 capability 校验。
 ///
 /// ```ignore
 /// #[elm::kernel_api(namespace = "kernel.memory", version = 1, capabilities = 3)]
@@ -795,7 +573,7 @@ pub fn device_irq(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// 必需参数 bus 是动态总线 identifier。规范签名与初始化钩子一致：
 /// fn(&elm::LifecycleContext) -> elm::HookResult。该函数保持普通 Rust 调用语义，应由
-/// on_initialize 调用并通过 kernel.device@1 发布设备；统一设备资源事务会在卸载或
+/// `ElmModule::initialize` 调用并通过 kernel.device@1 发布设备；统一设备资源事务会在卸载或
 /// 热替换时撤销其设备。宏只生成可审计元数据，不另造不可达的运行时入口。
 pub fn device_discovery(attr: TokenStream, item: TokenStream) -> TokenStream {
     let function = parse_macro_input!(item as ItemFn);
@@ -997,184 +775,558 @@ pub fn mixin(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn lifecycle_attribute(
-    attr: TokenStream,
-    item: TokenStream,
-    hook_kind: u32,
-    phase: u16,
-    symbol: &str,
-) -> TokenStream {
-    let function = parse_macro_input!(item as ItemFn);
-    match lifecycle_impl(attr.into(), function, hook_kind, phase, symbol) {
-        Ok(tokens) => tokens.into(),
-        Err(error) => error.to_compile_error().into(),
-    }
+#[derive(Clone, Copy)]
+enum ModuleMethodKind {
+    Provider,
+    ProviderSnapshot,
+    Export,
+    DeviceDriver,
+    DeviceMatch,
+    DeviceProbe,
+    DeviceRemove,
+    DeviceFunction,
+    DeviceIrq,
+    DeviceDiscovery,
+    MixinPoint,
+    Mixin,
 }
 
-fn lifecycle_impl(
+struct ModuleMethodExpansion {
+    inherent_methods: Vec<ImplItemFn>,
+    generated: TokenStream2,
+}
+
+fn take_module_method_attribute(
+    method: &mut ImplItemFn,
+) -> syn::Result<Option<(ModuleMethodKind, TokenStream2)>> {
+    let mut selected = None;
+    let mut retained = Vec::with_capacity(method.attrs.len());
+    for attribute in core::mem::take(&mut method.attrs) {
+        let Some(name) = attribute
+            .path()
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+        else {
+            retained.push(attribute);
+            continue;
+        };
+        if matches!(
+            name.as_str(),
+            "on_initialize"
+                | "on_finalize"
+                | "on_quiesce"
+                | "on_pause"
+                | "on_resume"
+                | "on_migrate_export"
+                | "on_migrate_import"
+                | "on_migrate_abort"
+                | "entry"
+        ) {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "生命周期和 entry 已由 ElmModule trait 方法定义，不得再添加 attribute",
+            ));
+        }
+        let kind = match name.as_str() {
+            "provider" => ModuleMethodKind::Provider,
+            "provider_snapshot" => ModuleMethodKind::ProviderSnapshot,
+            "export" => ModuleMethodKind::Export,
+            "device_driver" => ModuleMethodKind::DeviceDriver,
+            "device_match" => ModuleMethodKind::DeviceMatch,
+            "device_probe" => ModuleMethodKind::DeviceProbe,
+            "device_remove" => ModuleMethodKind::DeviceRemove,
+            "device_function" => ModuleMethodKind::DeviceFunction,
+            "device_irq" => ModuleMethodKind::DeviceIrq,
+            "device_discovery" => ModuleMethodKind::DeviceDiscovery,
+            "mixin_point" => ModuleMethodKind::MixinPoint,
+            "mixin" => ModuleMethodKind::Mixin,
+            _ => {
+                retained.push(attribute);
+                continue;
+            }
+        };
+        if selected.is_some() {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "同一个 ElmModule 方法只能声明一种 ELM 运行时角色",
+            ));
+        }
+        let tokens = match attribute.meta {
+            Meta::Path(_) => TokenStream2::new(),
+            Meta::List(list) => list.tokens,
+            Meta::NameValue(value) => {
+                return Err(syn::Error::new_spanned(
+                    value,
+                    "ELM 方法 attribute 不接受 name-value 外层语法",
+                ));
+            }
+        };
+        selected = Some((kind, tokens));
+    }
+    method.attrs = retained;
+    Ok(selected)
+}
+
+fn validate_module_callback_method(
+    method: &ImplItemFn,
+    argument_count: usize,
+    allow_mutable_receiver: bool,
+    require_output: bool,
+) -> syn::Result<Vec<Ident>> {
+    if method.sig.constness.is_some()
+        || method.sig.asyncness.is_some()
+        || method.sig.unsafety.is_some()
+        || method.sig.abi.is_some()
+        || method.sig.variadic.is_some()
+        || !method.sig.generics.params.is_empty()
+    {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "ELM 模块回调必须是非泛型安全 Rust 方法，不能手写 extern ABI",
+        ));
+    }
+    if method.sig.inputs.len() != argument_count + 1 {
+        return Err(syn::Error::new_spanned(
+            &method.sig.inputs,
+            format!("该 ELM 模块回调要求一个 self 接收者和 {argument_count} 个普通参数"),
+        ));
+    }
+    let Some(FnArg::Receiver(receiver)) = method.sig.inputs.first() else {
+        return Err(syn::Error::new_spanned(
+            &method.sig.inputs,
+            "ElmModule 内的运行时回调必须使用 &self 接收者",
+        ));
+    };
+    if receiver.reference.is_none()
+        || receiver.colon_token.is_some()
+        || (!allow_mutable_receiver && receiver.mutability.is_some())
+    {
+        let expected = if allow_mutable_receiver {
+            "&self 或 &mut self"
+        } else {
+            "&self"
+        };
+        return Err(syn::Error::new_spanned(
+            receiver,
+            format!("该 ELM 模块回调的接收者必须是 {expected}"),
+        ));
+    }
+    if require_output && matches!(method.sig.output, ReturnType::Default) {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "ELM 模块回调必须显式返回对应的结果类型",
+        ));
+    }
+    if method.attrs.iter().any(|attribute| {
+        attribute
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| matches!(segment.ident.to_string().as_str(), "cfg" | "cfg_attr"))
+    }) {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "已注册的 ElmModule 方法不得单独使用 cfg；镜像元数据必须在所有构建中保持闭合",
+        ));
+    }
+    let mut arguments = Vec::with_capacity(argument_count);
+    for input in method.sig.inputs.iter().skip(1) {
+        let FnArg::Typed(argument) = input else {
+            unreachable!();
+        };
+        let Pat::Ident(pattern) = argument.pat.as_ref() else {
+            return Err(syn::Error::new_spanned(
+                &argument.pat,
+                "ElmModule 回调参数必须使用简单标识符",
+            ));
+        };
+        arguments.push(pattern.ident.clone());
+    }
+    Ok(arguments)
+}
+
+fn module_proxy_function(method: &ImplItemFn, body: TokenStream2) -> syn::Result<ItemFn> {
+    let ident = &method.sig.ident;
+    let inputs = method.sig.inputs.iter().skip(1);
+    let output = &method.sig.output;
+    syn::parse2(quote! {
+        #[doc(hidden)]
+        fn #ident(#(#inputs),*) #output {
+            #body
+        }
+    })
+}
+
+fn module_result_proxy(method: &ImplItemFn, target: &Ident) -> syn::Result<ItemFn> {
+    let arguments =
+        validate_module_callback_method(method, method.sig.inputs.len() - 1, false, true)?;
+    module_proxy_function(
+        method,
+        quote! {
+            __ELM_MODULE_SLOT_V1.with_active(|module| module.#target(#(#arguments),*))?
+        },
+    )
+}
+
+fn export_mode(attr: &TokenStream2) -> syn::Result<String> {
+    let args = MetaArgs::parse(attr.clone())?;
+    args.string_or("mode", "managed")
+}
+
+fn expand_module_method(
+    _module_ty: &Type,
+    kind: ModuleMethodKind,
     attr: TokenStream2,
-    function: ItemFn,
-    hook_kind: u32,
-    phase: u16,
-    symbol: &str,
-) -> syn::Result<TokenStream2> {
+    mut method: ImplItemFn,
+) -> syn::Result<ModuleMethodExpansion> {
+    let ident = method.sig.ident.clone();
+    let (inherent_methods, generated) = match kind {
+        ModuleMethodKind::Provider => {
+            validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_result_proxy(&method, &ident)?;
+            (vec![method], provider_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::ProviderSnapshot => {
+            validate_module_callback_method(&method, 2, false, true)?;
+            let proxy = module_result_proxy(&method, &ident)?;
+            (vec![method], provider_snapshot_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::Export => {
+            let mode = export_mode(&attr)?;
+            let proxy = if mode == "direct-pinned" {
+                let arguments = validate_module_callback_method(
+                    &method,
+                    method.sig.inputs.len().saturating_sub(1),
+                    false,
+                    false,
+                )?;
+                module_proxy_function(
+                    &method,
+                    quote! {
+                        match __ELM_MODULE_SLOT_V1
+                            .with_active(|module| module.#ident(#(#arguments),*))
+                        {
+                            Ok(value) => value,
+                            Err(_) => ::elm::runtime::abort_panic(),
+                        }
+                    },
+                )?
+            } else {
+                validate_module_callback_method(&method, 1, false, true)?;
+                module_result_proxy(&method, &ident)?
+            };
+            (vec![method], export_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::DeviceMatch => {
+            let arguments = validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_proxy_function(
+                &method,
+                quote! {
+                    __ELM_MODULE_SLOT_V1
+                        .with_active(|module| module.#ident(#(#arguments),*))
+                        .unwrap_or(false)
+                },
+            )?;
+            (
+                vec![method],
+                device_callback_impl(attr, proxy, DeviceCallbackKind::Match)?,
+            )
+        }
+        ModuleMethodKind::DeviceProbe => {
+            validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_result_proxy(&method, &ident)?;
+            (
+                vec![method],
+                device_callback_impl(attr, proxy, DeviceCallbackKind::Probe)?,
+            )
+        }
+        ModuleMethodKind::DeviceRemove => {
+            validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_result_proxy(&method, &ident)?;
+            (
+                vec![method],
+                device_callback_impl(attr, proxy, DeviceCallbackKind::Remove)?,
+            )
+        }
+        ModuleMethodKind::DeviceFunction => {
+            validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_result_proxy(&method, &ident)?;
+            (vec![method], device_function_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::DeviceIrq => {
+            validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_result_proxy(&method, &ident)?;
+            (vec![method], device_irq_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::DeviceDiscovery => {
+            validate_module_callback_method(&method, 1, true, true)?;
+            let args = MetaArgs::parse(attr)?;
+            let bus = args.required_string("bus")?;
+            args.finish()?;
+            validate_identifier(&bus, 64, "device discovery bus")?;
+            let metadata = metadata_item(
+                &ident,
+                "device_discovery",
+                metadata_record(
+                    KIND_DEVICE_DISCOVERY,
+                    vec![
+                        MetaField::utf8(FIELD_SYMBOL, &ident.to_string()),
+                        MetaField::utf8(FIELD_RESOURCE, &bus),
+                    ],
+                ),
+            );
+            (vec![method], metadata)
+        }
+        ModuleMethodKind::Mixin => {
+            let arguments = validate_module_callback_method(&method, 1, false, true)?;
+            let proxy = module_proxy_function(
+                &method,
+                quote! {
+                    __ELM_MODULE_SLOT_V1
+                        .with_active(|module| module.#ident(#(#arguments),*))
+                        .unwrap_or(::elm::MixinControl::Deny)
+                },
+            )?;
+            (vec![method], mixin_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::MixinPoint => {
+            let arguments = validate_module_callback_method(&method, 1, false, true)?;
+            let original_ident = format_ident!("__elm_module_original_{}", ident);
+            let mut original = method.clone();
+            original.sig.ident = original_ident.clone();
+            method.block = syn::parse_quote!({
+                #ident(#(#arguments),*)
+            });
+            let proxy = module_result_proxy(&original, &original_ident).map(|mut proxy| {
+                proxy.sig.ident = ident.clone();
+                proxy
+            })?;
+            (vec![original, method], mixin_point_impl(attr, proxy)?)
+        }
+        ModuleMethodKind::DeviceDriver => {
+            validate_module_callback_method(&method, 0, false, false)?;
+            if !matches!(method.sig.output, ReturnType::Default) || !method.block.stmts.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &method.sig,
+                    "device_driver 模块方法必须只有 &self、无返回声明且函数体为空",
+                ));
+            }
+            let marker: ItemFn = syn::parse2(quote! { fn #ident() {} })?;
+            let generated = device_driver_impl(attr, marker)?;
+            method.sig.output = syn::parse_quote!(
+                -> ::kernel_api::device::KernelDeviceDriverRequestV1
+            );
+            method.block = syn::parse_quote!({ #ident() });
+            (vec![method], generated)
+        }
+    };
+    Ok(ModuleMethodExpansion {
+        inherent_methods,
+        generated,
+    })
+}
+
+fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<TokenStream2> {
     require_empty_attr(attr)?;
-    validate_function(&function, 1)?;
-    let ident = &function.sig.ident;
-    let abi_ident = format_ident!("__elm_abi_{}", symbol);
+    if implementation.unsafety.is_some() {
+        return Err(syn::Error::new_spanned(
+            &implementation.impl_token,
+            "ElmModule 实现不能声明为 unsafe",
+        ));
+    }
+    if !implementation.generics.params.is_empty() || implementation.generics.where_clause.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            &implementation.generics,
+            "#[elm::module] 不支持泛型模块实现",
+        ));
+    }
+    let Some((negative, trait_path, _)) = &implementation.trait_ else {
+        return Err(syn::Error::new_spanned(
+            &implementation.self_ty,
+            "#[elm::module] 必须标记 impl elm::ElmModule for T",
+        ));
+    };
+    if negative.is_some()
+        || trait_path
+            .segments
+            .last()
+            .map(|segment| segment.ident != "ElmModule")
+            .unwrap_or(true)
+    {
+        return Err(syn::Error::new_spanned(
+            trait_path,
+            "#[elm::module] 只能注册 ElmModule trait 实现",
+        ));
+    }
+    for required in ["create", "initialize", "finalize"] {
+        let found = implementation
+            .items
+            .iter()
+            .any(|item| matches!(item, ImplItem::Fn(function) if function.sig.ident == required));
+        if !found {
+            return Err(syn::Error::new_spanned(
+                &implementation.self_ty,
+                format!("ElmModule 实现缺少必需方法 {required}"),
+            ));
+        }
+    }
+
+    let module_ty = implementation.self_ty.clone();
+    let mut inherent_methods = Vec::new();
+    let mut generated_methods = Vec::new();
+    let mut trait_items = Vec::with_capacity(implementation.items.len());
+    for item in core::mem::take(&mut implementation.items) {
+        let ImplItem::Fn(mut method) = item else {
+            trait_items.push(item);
+            continue;
+        };
+        let Some((kind, method_attr)) = take_module_method_attribute(&mut method)? else {
+            trait_items.push(ImplItem::Fn(method));
+            continue;
+        };
+        let expansion = expand_module_method(&module_ty, kind, method_attr, method)?;
+        inherent_methods.extend(expansion.inherent_methods);
+        generated_methods.push(expansion.generated);
+    }
+    implementation.items = trait_items;
+    let metadata_anchor = format_ident!("__elm_module");
     let metadata = metadata_item(
-        ident,
-        symbol,
+        &metadata_anchor,
+        "descriptor",
         metadata_record(
-            KIND_LIFECYCLE,
-            vec![
-                MetaField::utf8(FIELD_SYMBOL, symbol),
-                MetaField::u32(FIELD_HOOK_KIND, hook_kind),
-            ],
+            KIND_MODULE,
+            vec![MetaField::utf8(FIELD_SYMBOL, "__elm_module_descriptor_v1")],
         ),
     );
+
     Ok(quote! {
-        #function
+        #implementation
+
+        impl #module_ty {
+            #(#inherent_methods)*
+        }
+
+        #(#generated_methods)*
 
         #[doc(hidden)]
-        #[unsafe(export_name = #symbol)]
+        static __ELM_MODULE_SLOT_V1: ::elm::ModuleSlot<#module_ty> = ::elm::ModuleSlot::new();
+
+        #[doc(hidden)]
         #[unsafe(link_section = ".text.elm.abi")]
-        pub unsafe extern "C" fn #abi_ident(
+        pub unsafe extern "C" fn __elm_module_initialize_v1(
             context: *mut ::elm::ElmNativeHookContextV1,
         ) -> i32 {
             unsafe {
-                ::elm::__private::lifecycle_trampoline(context, #phase, #ident)
+                ::elm::__private::module_initialize_trampoline(&__ELM_MODULE_SLOT_V1, context)
             }
         }
 
-        #metadata
-    })
-}
-
-fn migration_export_attribute(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let function = parse_macro_input!(item as ItemFn);
-    match migration_export_impl(attr.into(), function) {
-        Ok(tokens) => tokens.into(),
-        Err(error) => error.to_compile_error().into(),
-    }
-}
-
-fn migration_export_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
-    require_empty_attr(attr)?;
-    validate_function(&function, 2)?;
-    let ident = &function.sig.ident;
-    let symbol = "on_migrate_export";
-    let abi_ident = format_ident!("__elm_abi_on_migrate_export");
-    let metadata = metadata_item(
-        ident,
-        symbol,
-        metadata_record(
-            KIND_LIFECYCLE,
-            vec![
-                MetaField::utf8(FIELD_SYMBOL, symbol),
-                MetaField::u32(FIELD_HOOK_KIND, 3),
-            ],
-        ),
-    );
-    Ok(quote! {
-        #function
-
         #[doc(hidden)]
-        #[unsafe(export_name = #symbol)]
         #[unsafe(link_section = ".text.elm.abi")]
-        pub unsafe extern "C" fn #abi_ident(
-            context: *mut ::elm::ElmNativeMigrationContextV1,
+        pub unsafe extern "C" fn __elm_module_finalize_v1(
+            context: *mut ::elm::ElmNativeHookContextV1,
         ) -> i32 {
             unsafe {
-                ::elm::__private::migration_export_trampoline(context, #ident)
+                ::elm::__private::module_finalize_trampoline(&__ELM_MODULE_SLOT_V1, context)
             }
         }
 
-        #metadata
-    })
-}
-
-fn migration_input_attribute(
-    attr: TokenStream,
-    item: TokenStream,
-    hook_kind: u32,
-    phase: u16,
-    symbol: &str,
-) -> TokenStream {
-    let function = parse_macro_input!(item as ItemFn);
-    match migration_input_impl(attr.into(), function, hook_kind, phase, symbol) {
-        Ok(tokens) => tokens.into(),
-        Err(error) => error.to_compile_error().into(),
-    }
-}
-
-fn migration_input_impl(
-    attr: TokenStream2,
-    function: ItemFn,
-    hook_kind: u32,
-    phase: u16,
-    symbol: &str,
-) -> syn::Result<TokenStream2> {
-    require_empty_attr(attr)?;
-    validate_function(&function, 2)?;
-    let ident = &function.sig.ident;
-    let abi_ident = format_ident!("__elm_abi_{}", symbol);
-    let metadata = metadata_item(
-        ident,
-        symbol,
-        metadata_record(
-            KIND_LIFECYCLE,
-            vec![
-                MetaField::utf8(FIELD_SYMBOL, symbol),
-                MetaField::u32(FIELD_HOOK_KIND, hook_kind),
-            ],
-        ),
-    );
-    Ok(quote! {
-        #function
+        #[doc(hidden)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn __elm_module_quiesce_v1(
+            context: *mut ::elm::ElmNativeHookContextV1,
+        ) -> i32 {
+            unsafe {
+                ::elm::__private::module_quiesce_trampoline(&__ELM_MODULE_SLOT_V1, context)
+            }
+        }
 
         #[doc(hidden)]
-        #[unsafe(export_name = #symbol)]
         #[unsafe(link_section = ".text.elm.abi")]
-        pub unsafe extern "C" fn #abi_ident(
+        pub unsafe extern "C" fn __elm_module_pause_v1(
+            context: *mut ::elm::ElmNativeHookContextV1,
+        ) -> i32 {
+            unsafe {
+                ::elm::__private::module_pause_trampoline(&__ELM_MODULE_SLOT_V1, context)
+            }
+        }
+
+        #[doc(hidden)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn __elm_module_resume_v1(
+            context: *mut ::elm::ElmNativeHookContextV1,
+        ) -> i32 {
+            unsafe {
+                ::elm::__private::module_resume_trampoline(&__ELM_MODULE_SLOT_V1, context)
+            }
+        }
+
+        #[doc(hidden)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn __elm_module_migrate_export_v1(
             context: *mut ::elm::ElmNativeMigrationContextV1,
         ) -> i32 {
             unsafe {
-                ::elm::__private::migration_input_trampoline(
+                ::elm::__private::module_migration_export_trampoline(
+                    &__ELM_MODULE_SLOT_V1,
                     context,
-                    #phase,
-                    #ident,
                 )
             }
         }
 
-        #metadata
-    })
-}
-
-fn entry_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
-    require_empty_attr(attr)?;
-    validate_function(&function, 1)?;
-    let ident = &function.sig.ident;
-    let symbol = format!("__elm_entry_{}", ident);
-    validate_symbol(&symbol, "entry symbol")?;
-    let abi_ident = format_ident!("__elm_abi_entry_{}", ident);
-    let metadata = metadata_item(
-        ident,
-        "entry",
-        metadata_record(KIND_ENTRY, vec![MetaField::utf8(FIELD_SYMBOL, &symbol)]),
-    );
-    Ok(quote! {
-        #function
+        #[doc(hidden)]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn __elm_module_migrate_import_v1(
+            context: *mut ::elm::ElmNativeMigrationContextV1,
+        ) -> i32 {
+            unsafe {
+                ::elm::__private::module_migration_import_trampoline(
+                    &__ELM_MODULE_SLOT_V1,
+                    context,
+                )
+            }
+        }
 
         #[doc(hidden)]
-        #[unsafe(export_name = #symbol)]
         #[unsafe(link_section = ".text.elm.abi")]
-        pub unsafe extern "C" fn #abi_ident(
-            frame: *mut ::elm::ElmNativeEntryFrameV1,
+        pub unsafe extern "C" fn __elm_module_migrate_abort_v1(
+            context: *mut ::elm::ElmNativeMigrationContextV1,
         ) -> i32 {
-            unsafe { ::elm::__private::entry_trampoline(frame, #ident) }
+            unsafe {
+                ::elm::__private::module_migration_abort_trampoline(
+                    &__ELM_MODULE_SLOT_V1,
+                    context,
+                )
+            }
         }
+
+        #[doc(hidden)]
+        #[unsafe(export_name = "__elm_module_entry_v1")]
+        #[unsafe(link_section = ".text.elm.abi")]
+        pub unsafe extern "C" fn __elm_module_entry_v1(
+            context: *mut ::elm::ElmNativeEntryFrameV1,
+        ) -> i32 {
+            unsafe { ::elm::__private::module_entry_trampoline(&__ELM_MODULE_SLOT_V1, context) }
+        }
+
+        #[doc(hidden)]
+        #[used]
+        #[unsafe(export_name = "__elm_module_descriptor_v1")]
+        #[unsafe(link_section = ".rodata.elm.module")]
+        pub static __ELM_MODULE_DESCRIPTOR_V1: ::elm::ElmModuleDescriptorV1 =
+            ::elm::ElmModuleDescriptorV1::new::<#module_ty>(
+                __elm_module_initialize_v1,
+                __elm_module_finalize_v1,
+                __elm_module_quiesce_v1,
+                __elm_module_pause_v1,
+                __elm_module_resume_v1,
+                __elm_module_migrate_export_v1,
+                __elm_module_migrate_import_v1,
+                __elm_module_migrate_abort_v1,
+                __elm_module_entry_v1,
+            );
 
         #metadata
     })
@@ -1261,8 +1413,7 @@ fn provider_snapshot_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<T
     })
 }
 
-fn export_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {
-    validate_function(&function, 1)?;
+fn export_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<TokenStream2> {
     let args = MetaArgs::parse(attr)?;
     let name = args.string_or("name", &function.sig.ident.to_string())?;
     let contract = args.required_string("contract")?;
@@ -1277,9 +1428,15 @@ fn export_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2
     }
     let mode = args.string_or("mode", "managed")?;
     let visibility = args.string_or("visibility", "dependency")?;
-    let mut flags = match mode.as_str() {
-        "managed" => EXPORT_MANAGED,
-        "direct-pinned" => EXPORT_DIRECT_PINNED,
+    let (mut flags, rust_abi) = match mode.as_str() {
+        "managed" => {
+            validate_function(&function, 1)?;
+            (EXPORT_MANAGED, None)
+        }
+        "direct-pinned" => (
+            EXPORT_DIRECT_PINNED,
+            Some(canonical_function_abi(&function.sig)?),
+        ),
         _ => return Err(syn::Error::new(Span::call_site(), "未知 export mode")),
     };
     flags |= match visibility.as_str() {
@@ -1290,35 +1447,45 @@ fn export_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2
     };
     args.finish()?;
     let ident = &function.sig.ident;
-    let abi_ident = format_ident!("__elm_abi_export_{}", ident);
-    let metadata = metadata_item(
-        ident,
-        "export",
-        metadata_record(
-            KIND_EXPORT,
-            vec![
-                MetaField::utf8(FIELD_SYMBOL, &name),
-                MetaField::utf8(FIELD_NAME, &name),
-                MetaField::utf8(FIELD_CONTRACT, &contract),
-                MetaField::u32(FIELD_VERSION, version),
-                MetaField::u32(FIELD_FLAGS, flags),
-            ],
-        ),
-    );
-    Ok(quote! {
-        #function
+    let mut fields = vec![
+        MetaField::utf8(FIELD_SYMBOL, &name),
+        MetaField::utf8(FIELD_NAME, &name),
+        MetaField::utf8(FIELD_CONTRACT, &contract),
+        MetaField::u32(FIELD_VERSION, version),
+        MetaField::u32(FIELD_FLAGS, flags),
+    ];
+    if let Some(rust_abi) = &rust_abi {
+        fields.push(MetaField::utf8(FIELD_RUST_ABI, rust_abi));
+    }
+    let metadata = metadata_item(ident, "export", metadata_record(KIND_EXPORT, fields));
+    if rust_abi.is_some() {
+        function
+            .attrs
+            .push(syn::parse_quote!(#[unsafe(export_name = #name)]));
+        function
+            .attrs
+            .push(syn::parse_quote!(#[unsafe(link_section = ".text.elm.abi")]));
+        Ok(quote! {
+            #function
+            #metadata
+        })
+    } else {
+        let abi_ident = format_ident!("__elm_abi_export_{}", ident);
+        Ok(quote! {
+            #function
 
-        #[doc(hidden)]
-        #[unsafe(export_name = #name)]
-        #[unsafe(link_section = ".text.elm.abi")]
-        pub unsafe extern "C" fn #abi_ident(
-            frame: *mut ::elm::ElmNativeManagedCallV1,
-        ) -> i32 {
-            unsafe { ::elm::__private::managed_trampoline(frame, #ident) }
-        }
+            #[doc(hidden)]
+            #[unsafe(export_name = #name)]
+            #[unsafe(link_section = ".text.elm.abi")]
+            pub unsafe extern "C" fn #abi_ident(
+                frame: *mut ::elm::ElmNativeManagedCallV1,
+            ) -> i32 {
+                unsafe { ::elm::__private::managed_trampoline(frame, #ident) }
+            }
 
-        #metadata
-    })
+            #metadata
+        })
+    }
 }
 
 fn import_impl(attr: TokenStream2, mut item: ItemStatic) -> syn::Result<TokenStream2> {
@@ -1336,7 +1503,7 @@ fn import_impl(attr: TokenStream2, mut item: ItemStatic) -> syn::Result<TokenStr
         ));
     }
     let mode = args.string_or("mode", "managed")?;
-    validate_import_slot(&item, &mode)?;
+    let rust_abi = validate_import_slot(&item, &mode)?;
     let scope = args.string_or("scope", "any")?;
     let optional = args.bool_or("optional", false)?;
     let mut flags = match mode.as_str() {
@@ -1362,18 +1529,75 @@ fn import_impl(attr: TokenStream2, mut item: ItemStatic) -> syn::Result<TokenStr
         .push(syn::parse_quote!(#[unsafe(export_name = #symbol)]));
     item.attrs
         .push(syn::parse_quote!(#[unsafe(link_section = ".data.elm_imports")]));
+    let mut fields = vec![
+        MetaField::utf8(FIELD_SYMBOL, &symbol),
+        MetaField::utf8(FIELD_NAME, &name),
+        MetaField::utf8(FIELD_CONTRACT, &contract),
+        MetaField::u32(FIELD_MIN_VERSION, min_version),
+        MetaField::u32(FIELD_MAX_VERSION, max_version),
+        MetaField::u32(FIELD_FLAGS, flags),
+    ];
+    if let Some(rust_abi) = rust_abi {
+        fields.push(MetaField::utf8(FIELD_RUST_ABI, &rust_abi));
+    }
+    let metadata = metadata_item(&ident, "import", metadata_record(KIND_IMPORT, fields));
+    Ok(quote! {
+        #item
+        #metadata
+    })
+}
+
+fn kernel_symbol_impl(attr: TokenStream2, mut item: ItemStatic) -> syn::Result<TokenStream2> {
+    let args = MetaArgs::parse(attr)?;
+    let name = args.required_string("name")?;
+    let contract = args.required_string("contract")?;
+    let version = args.required_u32("version")?;
+    let declared_rust_abi = args.required_string("abi")?;
+    args.finish()?;
+    validate_symbol(&name, "kernel symbol name")?;
+    validate_contract(&contract)?;
+    if version == 0 {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "kernel symbol version 必须大于 0",
+        ));
+    }
+    let rust_abi = validate_import_slot(&item, "direct-pinned")?
+        .ok_or_else(|| syn::Error::new_spanned(&item.ty, "内核直接符号缺少 Rust ABI 类型"))?;
+    if declared_rust_abi != rust_abi {
+        return Err(syn::Error::new_spanned(
+            &item.ty,
+            format!("内核直接符号 ABI 声明不匹配：声明 {declared_rust_abi}，类型为 {rust_abi}"),
+        ));
+    }
+    let ident = item.ident.clone();
+    let symbol = format!(
+        "__elm_kernel_symbol_{}",
+        ident.to_string().to_ascii_lowercase()
+    );
+    let section = format!(
+        ".data.elm_imports.{}",
+        ident.to_string().to_ascii_lowercase()
+    );
+    validate_symbol(&symbol, "kernel symbol slot")?;
+    item.attrs.push(syn::parse_quote!(#[linkage = "internal"]));
+    item.attrs
+        .push(syn::parse_quote!(#[unsafe(export_name = #symbol)]));
+    item.attrs
+        .push(syn::parse_quote!(#[unsafe(link_section = #section)]));
     let metadata = metadata_item(
         &ident,
-        "import",
+        "kernel_symbol",
         metadata_record(
             KIND_IMPORT,
             vec![
                 MetaField::utf8(FIELD_SYMBOL, &symbol),
                 MetaField::utf8(FIELD_NAME, &name),
                 MetaField::utf8(FIELD_CONTRACT, &contract),
-                MetaField::u32(FIELD_MIN_VERSION, min_version),
-                MetaField::u32(FIELD_MAX_VERSION, max_version),
-                MetaField::u32(FIELD_FLAGS, flags),
+                MetaField::u32(FIELD_MIN_VERSION, version),
+                MetaField::u32(FIELD_MAX_VERSION, version),
+                MetaField::u32(FIELD_FLAGS, IMPORT_KERNEL_SYMBOL),
+                MetaField::utf8(FIELD_RUST_ABI, &declared_rust_abi),
             ],
         ),
     );
@@ -2268,7 +2492,7 @@ fn validate_contract(value: &str) -> syn::Result<()> {
     Ok(())
 }
 
-fn validate_import_slot(item: &ItemStatic, mode: &str) -> syn::Result<()> {
+fn validate_import_slot(item: &ItemStatic, mode: &str) -> syn::Result<Option<String>> {
     if matches!(item.mutability, syn::StaticMutability::Mut(_)) {
         return Err(syn::Error::new_spanned(
             &item.mutability,
@@ -2287,30 +2511,119 @@ fn validate_import_slot(item: &ItemStatic, mode: &str) -> syn::Result<()> {
             "ELM import 槽的导出名和段属性由 #[elm::import] 独占管理",
         ));
     }
-    let expected = match mode {
-        "managed" => "ManagedImport",
-        "direct-pinned" => "UnsafeDirectImport",
-        _ => return Err(syn::Error::new(Span::call_site(), "未知 import mode")),
-    };
     let Type::Path(path) = item.ty.as_ref() else {
         return Err(syn::Error::new_spanned(
             &item.ty,
-            format!("{mode} import 槽类型必须是 {expected}"),
+            "ELM import 槽必须使用框架定义的 import 类型",
         ));
     };
     let Some(segment) = path.path.segments.last() else {
         return Err(syn::Error::new_spanned(&item.ty, "ELM import 槽类型无效"));
     };
-    if path.qself.is_some()
-        || segment.ident != expected
-        || !matches!(segment.arguments, syn::PathArguments::None)
-    {
+    if path.qself.is_some() {
         return Err(syn::Error::new_spanned(
             &item.ty,
-            format!("{mode} import 槽类型必须是 {expected}"),
+            "ELM import 槽不能使用限定类型",
         ));
     }
-    Ok(())
+    match mode {
+        "managed"
+            if segment.ident == "ManagedImport"
+                && matches!(segment.arguments, PathArguments::None) =>
+        {
+            Ok(None)
+        }
+        "direct-pinned" if segment.ident == "DirectImport" => {
+            let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return Err(syn::Error::new_spanned(
+                    &item.ty,
+                    "direct-pinned import 槽必须是 DirectImport<fn(...) -> ...>",
+                ));
+            };
+            if arguments.args.len() != 1 {
+                return Err(syn::Error::new_spanned(
+                    &item.ty,
+                    "DirectImport 必须且只能携带一个 Rust 函数指针类型",
+                ));
+            }
+            let Some(GenericArgument::Type(Type::BareFn(function))) = arguments.args.first() else {
+                return Err(syn::Error::new_spanned(
+                    &item.ty,
+                    "DirectImport 的类型参数必须是 Rust 函数指针",
+                ));
+            };
+            canonical_bare_fn_abi(function).map(Some)
+        }
+        "managed" => Err(syn::Error::new_spanned(
+            &item.ty,
+            "managed import 槽类型必须是 ManagedImport",
+        )),
+        "direct-pinned" => Err(syn::Error::new_spanned(
+            &item.ty,
+            "direct-pinned import 槽类型必须是 DirectImport<fn(...) -> ...>",
+        )),
+        _ => Err(syn::Error::new(Span::call_site(), "未知 import mode")),
+    }
+}
+
+fn canonical_bare_fn_abi(function: &TypeBareFn) -> syn::Result<String> {
+    if function.abi.is_some() || function.variadic.is_some() {
+        return Err(syn::Error::new_spanned(
+            function,
+            "直接固定 ABI 只接受非可变参数的 Rust 函数指针",
+        ));
+    }
+    let lifetimes = &function.lifetimes;
+    let unsafety = &function.unsafety;
+    let arguments = function.inputs.iter().map(|argument| &argument.ty);
+    let result: Type = match &function.output {
+        ReturnType::Default => syn::parse_quote!(()),
+        ReturnType::Type(_, result) => (**result).clone(),
+    };
+    Ok(normalize_abi_tokens(
+        quote!(#lifetimes #unsafety fn(#(#arguments),*) -> #result),
+    ))
+}
+
+fn canonical_function_abi(signature: &Signature) -> syn::Result<String> {
+    if signature.constness.is_some()
+        || signature.asyncness.is_some()
+        || signature.abi.is_some()
+        || signature.variadic.is_some()
+        || !signature.generics.params.is_empty()
+        || signature.generics.where_clause.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            signature,
+            "直接固定导出必须是非泛型、非 async、非 const 的 Rust 函数",
+        ));
+    }
+    let mut arguments = Vec::with_capacity(signature.inputs.len());
+    for argument in &signature.inputs {
+        let FnArg::Typed(argument) = argument else {
+            return Err(syn::Error::new_spanned(
+                argument,
+                "直接固定导出不能直接暴露 self 接收者",
+            ));
+        };
+        arguments.push(argument.ty.as_ref());
+    }
+    let unsafety = &signature.unsafety;
+    let result: Type = match &signature.output {
+        ReturnType::Default => syn::parse_quote!(()),
+        ReturnType::Type(_, result) => (**result).clone(),
+    };
+    Ok(normalize_abi_tokens(
+        quote!(#unsafety fn(#(#arguments),*) -> #result),
+    ))
+}
+
+fn normalize_abi_tokens(tokens: TokenStream2) -> String {
+    tokens
+        .to_string()
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect()
 }
 
 fn validate_point(value: &str) -> syn::Result<()> {
@@ -2557,6 +2870,9 @@ impl MetaArgs {
 
 fn parse_meta_value(value: Expr) -> syn::Result<MetaValue> {
     match value {
+        // macro_rules 插值会用透明分组保留捕获片段的语法类别；该分组不改变字面量语义。
+        Expr::Group(value) => parse_meta_value(*value.expr),
+        Expr::Paren(value) => parse_meta_value(*value.expr),
         Expr::Lit(ExprLit {
             lit: Lit::Str(value),
             ..
@@ -2905,7 +3221,7 @@ mod tests {
             static REMOTE: ::elm::ManagedImport = ::elm::ManagedImport::new();
         };
         let direct: ItemStatic = syn::parse_quote! {
-            static REMOTE: ::elm::UnsafeDirectImport = ::elm::UnsafeDirectImport::new();
+            static REMOTE: ::elm::DirectImport<fn(u64) -> u64> = ::elm::DirectImport::new();
         };
         assert!(validate_import_slot(&managed, "managed").is_ok());
         assert!(validate_import_slot(&direct, "direct-pinned").is_ok());

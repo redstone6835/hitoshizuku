@@ -11,15 +11,27 @@
 //! # 示例
 //!
 //! ```no_run
-//! use elm::{HookError, HookResult, LifecycleContext};
+//! use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 //!
-//! #[elm::on_initialize]
-//! fn initialize(_context: &LifecycleContext) -> HookResult {
-//!     let info = elm::runtime::info().map_err(|_| HookError::new(-1))?;
-//!     if info.api_version != elm::ELM_API_VERSION_V1 {
-//!         return Err(HookError::new(-95));
+//! struct Demo;
+//!
+//! #[elm::module]
+//! impl ElmModule for Demo {
+//!     fn create(_context: &LifecycleContext) -> Result<Self, HookError> {
+//!         Ok(Self)
 //!     }
-//!     elm::runtime::log(6, "runtime API ready").map_err(|_| HookError::new(-1))
+//!
+//!     fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
+//!         let info = elm::runtime::info().map_err(|_| HookError::new(-1))?;
+//!         if info.api_version != elm::ELM_API_VERSION_V1 {
+//!             return Err(HookError::new(-95));
+//!         }
+//!         elm::runtime::log(6, "runtime API ready").map_err(|_| HookError::new(-1))
+//!     }
+//!
+//!     fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {
+//!         Ok(())
+//!     }
 //! }
 //! ```
 
@@ -69,8 +81,9 @@ pub fn context() -> Result<ElmApiContextV1, RuntimeApiError> {
 
 /// 按 identifier 和兼容版本列表取得一个额外的运行时命名空间。
 ///
-/// 普通业务代码通常应使用 `kernel-api` 提供的类型化客户端，而不是直接处理函数表地址。
-/// 本入口公开是为了让独立门面 crate 在不依赖内核实现的前提下完成统一协商。
+/// 本入口供 `elm.management` 等 ELM 自有命名空间以及当前已经注册的受管内核 API 完成
+/// 统一协商。直接内核符号协议不经过本入口，但其目录后端尚未安装；业务代码不得自行
+/// 解释本函数返回的裸函数表地址。
 pub fn query_namespace(
     identifier: &str,
     versions: &[u16],

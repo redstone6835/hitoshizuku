@@ -21,9 +21,12 @@
 #define ELM_MGR_STATUS_OK 0
 #define ELM_MGR_STATUS_PERMISSION (-1)
 #define ELM_MGR_STATUS_NOT_FOUND (-2)
+#define ELM_MGR_STATUS_NO_MEMORY (-12)
 #define ELM_MGR_STATUS_BUSY (-16)
 #define ELM_MGR_STATUS_INVALID (-22)
+#define ELM_MGR_STATUS_INTEGRITY (-74)
 #define ELM_MGR_STATUS_UNSUPPORTED (-95)
+#define ELM_MGR_STATUS_EXPIRED (-110)
 #define ELM_MGR_STATUS_TODO (-4096)
 
 #define ELM_EBI_LOAD_STATUS_OK 0
@@ -102,6 +105,11 @@
 #define ELM_MGR_CALL_QUERY_RESOURCE_BUDGET 53u
 #define ELM_MGR_CALL_UPDATE_RESOURCE_BUDGET 54u
 #define ELM_MGR_CALL_QUERY_TRUST_STATE 55u
+#define ELM_MGR_CALL_BEGIN_IMAGE_SESSION 56u
+#define ELM_MGR_CALL_WRITE_IMAGE_SESSION 57u
+#define ELM_MGR_CALL_SEAL_IMAGE_SESSION 58u
+#define ELM_MGR_CALL_ABORT_IMAGE_SESSION 59u
+#define ELM_MGR_CALL_QUERY_IMAGE_SESSION 60u
 
 #define ELM_POLICY_BLOCK_BUILTIN_PROTECTED (1ull << 0)
 #define ELM_POLICY_BLOCK_CELL_NOT_FOUND (1ull << 1)
@@ -178,7 +186,18 @@
 #define ELM_EBI_SOURCE_KIND_BUILTIN 3u
 #define ELM_EBI_SOURCE_KIND_MEMORY 4u
 #define ELM_EBI_PROJECTION_SOURCE_ABI_VERSION 1u
+#define ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION (1u << 0)
 #define ELM_EKI_PROJECTION_SOURCE_ID 0x454b490000000001ull
+
+#define ELM_IMAGE_SESSION_ABI_VERSION 1u
+#define ELM_IMAGE_SESSION_HASH_SHA256 1u
+#define ELM_IMAGE_SESSION_DIGEST_LEN 32u
+#define ELM_IMAGE_SESSION_MAX_CHUNK (64u * 1024u)
+#define ELM_IMAGE_SESSION_MAX_LENGTH (256ull * 1024ull * 1024ull)
+#define ELM_IMAGE_SESSION_DEFAULT_TTL_MS 60000u
+#define ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION 1u
+#define ELM_IMAGE_SESSION_STATE_UPLOADING 1u
+#define ELM_IMAGE_SESSION_STATE_SEALED 2u
 
 #define ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS 16u
 #define ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE 64u
@@ -434,12 +453,74 @@ struct elm_projection_source_request {
     uint32_t reserved1;
 };
 
+struct elm_image_session_begin_request_v1 {
+    uint16_t abi_version;
+    uint16_t hash_alg;
+    uint32_t flags;
+    uint64_t total_len;
+    uint32_t ttl_ms;
+    uint16_t digest_len;
+    uint16_t reserved0;
+    uint8_t expected_digest[ELM_IMAGE_SESSION_DIGEST_LEN];
+    uint64_t reserved1;
+};
+
+struct elm_image_session_write_request_v1 {
+    uint16_t abi_version;
+    uint16_t flags;
+    uint32_t reserved0;
+    uint64_t session_id;
+    uint64_t offset;
+    uint32_t chunk_len;
+    uint32_t reserved1;
+};
+
+struct elm_image_session_request_v1 {
+    uint16_t abi_version;
+    uint16_t flags;
+    uint32_t reserved;
+    uint64_t session_id;
+};
+
+struct elm_image_session_info_v1 {
+    uint16_t abi_version;
+    uint16_t struct_size;
+    uint32_t state;
+    uint64_t session_id;
+    uint64_t total_len;
+    uint64_t written_len;
+    uint64_t created_at_ns;
+    uint64_t expires_at_ns;
+    uint16_t hash_alg;
+    uint16_t digest_len;
+    uint32_t flags;
+    uint8_t expected_digest[ELM_IMAGE_SESSION_DIGEST_LEN];
+    uint8_t actual_digest[ELM_IMAGE_SESSION_DIGEST_LEN];
+};
+
+struct elm_image_session_reference_v1 {
+    uint16_t abi_version;
+    uint16_t flags;
+    uint32_t reserved;
+    uint64_t session_id;
+};
+
 struct elm_load_cell_response {
     uint64_t cell_id;
     int32_t status;
     uint32_t final_state;
     uint32_t reason;
     uint32_t reserved;
+};
+
+struct elm_replace_cell_response_v1 {
+    uint64_t cell_id;
+    int32_t status;
+    uint32_t final_state;
+    uint64_t generation;
+    uint32_t migrated_len;
+    uint32_t reason;
+    uint64_t blockers;
 };
 
 struct elm_nexus_bind_request {
@@ -961,6 +1042,16 @@ _Static_assert(sizeof(struct elm_resource_budget) == 64, "bad resource budget si
 _Static_assert(sizeof(struct elm_ebi_source_request) == 96, "bad ebi source request size");
 _Static_assert(sizeof(struct elm_projection_source_request) == 24,
                "bad projection source request size");
+_Static_assert(sizeof(struct elm_image_session_begin_request_v1) == 64,
+               "bad image session begin request size");
+_Static_assert(sizeof(struct elm_image_session_write_request_v1) == 32,
+               "bad image session write request size");
+_Static_assert(sizeof(struct elm_image_session_request_v1) == 16,
+               "bad image session request size");
+_Static_assert(sizeof(struct elm_image_session_info_v1) == 120,
+               "bad image session info size");
+_Static_assert(sizeof(struct elm_image_session_reference_v1) == 16,
+               "bad image session reference size");
 _Static_assert(sizeof(struct elm_replace_cell_request_v1) == 32, "bad replace request size");
 _Static_assert(sizeof(struct elm_nexus_bind_request) == 88, "bad bind request size");
 _Static_assert(sizeof(struct elm_provider_snapshot_request) == 24, "bad provider snapshot request size");

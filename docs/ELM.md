@@ -4,24 +4,24 @@
 
 ELM，全称 **Extensible Loadable Module**，中文统一称为 **可拓展内核单元**。
 
-ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。子系统热路径不再强制绕行 `elm-mgr`，外部 ELM 通过 `kernel-api` 契约门面获得接近内核内开发的类型化直接调用体验，但不会依赖或看到子系统实现 crate；需要运行时发现、绑定、审计或异步流控的能力再通过 provider 端口进入枢纽连接层。
+ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。当前外部 ELM 通过 `kernel-api` 的受管契约访问已接入子系统；需要运行时发现、绑定、审计或异步流控的能力通过 provider 端口进入枢纽连接层。EBI 同时定义了带完整 Rust ABI 摘要的直接内核符号协议，但内核符号目录后端尚未安装，任何此类导入都会明确返回 `NativeCodeTodo`，不得误绑定或静默降级。
 
 ELM 的基本原则：
 
 - 不兼容 Linux `init_module`、`finit_module`、`delete_module` ABI。
 - 不采用 `ko`、`modprobe`、`export_symbol`、GPL namespace 等传统模型。
 - 不把 ELM 简化为“装入一段代码并调用 init/exit”。
-- 不让 ELM 直接依赖内核内部 trait、裸指针或不稳定符号。
+- 不允许 ELM 猜测或直接链接未登记的内核 trait、裸指针和私有符号。
 - ELM 面向 Rust 框架开发；C/C++ 兼容和许可证策略暂不进入目标。
 - 开机时内核创建根管理单元 `elm-mgr`，它是永久内建 ELM，元数据来源显示为 `<builtin>`，不使用 EKI、soyo、ELF 或其他镜像自举。
 - 开机时内核同时创建 `elm-mgr` 的内建子单元 `eki`，由它提供 EKI 到 EBI 的本地投影能力。
 - 后续所有 ELM 都是 `elm-mgr` 管理树下的子单元。
-- 每个动态 ELM 都必须提供 Rust 生命周期钩子 `on_initialize` 和 `on_finalize`。
+- 每个动态 ELM 都必须实现统一的 `ElmModule` trait，并通过 `#[elm::module]` 注册；`create`、`initialize` 和 `finalize` 是必需方法。
 - 一个 ELM 可以拓展另一个 ELM，也可以被另一个 ELM 拓展。
 - ELM 之间可以同时存在父子、依赖、提供、拓展和能力绑定关系。
 - ELM 支持热插拔、热替换、暂停、恢复、故障隔离和回滚。
 
-当前设计走向是：ELM 不再被视为“内核模块加载器”，而是收敛为 **枢纽连接层运行时**。内核单元不通过符号互相链接，而是通过带版本的流契约连接到枢纽端口。资源访问通过租约完成，生命周期变更通过预检和提交完成，运行时状态通过快照、事件和审计可观测。
+当前设计走向是：ELM 不再被视为“内核模块加载器”，而是收敛为 **可管理执行单元运行时**。跨单元服务默认通过带版本的流契约连接到枢纽端口；对延迟敏感且 ABI 可以严格固定的调用可以使用 `direct-pinned` 导入导出。资源访问通过租约完成，生命周期变更通过预检和提交完成，运行时状态通过快照、事件和审计可观测。
 
 ## 2. 统一中文术语
 
@@ -155,7 +155,7 @@ ELM 的运行模型由五个对象构成：
 
 ## 5. 枢纽连接层
 
-ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交互都经过枢纽连接层。
+ELM 不允许任意扫描或链接内核符号。运行时交互分为三条边界：ELM 自有能力使用 `elm::runtime`/`elm::management`，可发现和可审计服务使用枢纽连接层，明确声明为 `direct-pinned` 的 ELM 导入导出或 `kernel-symbol` 导入使用固定槽和完整 Rust ABI 摘要。第三条路径不经过 provider 调用帧，但会固定目标代际；内核符号目录后端完成前，`kernel-symbol` 导入只返回 `NativeCodeTodo`。
 
 ```text
 内核单元
@@ -166,7 +166,7 @@ ELM 不直接适配内核 trait，也不直接导出或导入符号。所有交�
                     由端口提供者或事件反应器处理事件
 ```
 
-枢纽端口代表一种可组合能力。它可以表示设备事件、文件系统操作、网络包流、IRQ 事件、菜单项注册、配置变更或诊断输出。内核内部可以存在桥接层，但 ELM 看到的稳定边界永远是枢纽端口、流契约和资源租约。
+枢纽端口代表一种可组合能力。它可以表示设备事件、文件系统操作、网络包流、IRQ 事件、菜单项注册、配置变更或诊断输出。枢纽端口是需要发现、授权、审计、代际路由或异步流控时的稳定边界；它不强制承载所有本地同步调用。
 
 流契约格式：
 
@@ -357,8 +357,8 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 
 当前生命周期实现：
 
-- `PauseCell` 支持动态单元从 `Active` 进入 `Quiescing` 再进入 `Paused`；原生单元会先调用可选 `on_quiesce`，再调用可选 `on_pause`。
-- `ResumeCell` 支持动态单元从 `Paused` 回到 `Active`；原生单元会先调用可选 `on_resume`。
+- `PauseCell` 支持动态单元从 `Active` 进入 `Quiescing` 再进入 `Paused`；原生单元会先调用 `ElmModule::quiesce`，再调用 `ElmModule::pause`。
+- `ResumeCell` 支持动态单元从 `Paused` 回到 `Active`；原生单元会先调用 `ElmModule::resume`。
 - `DetachCell` 支持动态单元撤销租约、移除菜单项、摘除绑定图并退役。
 - `PreflightLifecycle` 会返回阻断位、最终状态和受影响的子单元、依赖者、拓展项数量。
 - 内建单元受保护，默认不能被暂停、脱离或替换。
@@ -409,7 +409,7 @@ Active -> Faulted -> Quarantined -> Detached -> Retired
 - 状态迁移必须显式声明状态版本和迁移函数。
 - 热替换不能绕过父子、依赖、拓展和租约阻断检查。
 
-当前 `ReplaceCell` 已具备双路径热替换事务：声明式 EBI image 在同名、同类型、surface 兼容且无 native imports/exports 时直接提交 generation、菜单元数据、provider 元数据、绑定和租约代际更新；原生目标必须是 `Active` 或 `Paused` 的动态原生单元，新旧单元的 manifest name 和 kind 必须一致，声明式拓扑、provider surface、imports/exports 和生命周期钩子必须通过兼容性校验。原生替换过程会影子装载新 image，使用新逻辑 generation 暂存其受管 import，在执行新 `on_initialize` 后静默旧单元，调用旧 `on_migrate_export` 导出最多 64 KiB 状态，再调用新 `on_migrate_import` 导入状态；提交点才会提升暂存 import、原子切换 Projection Source generation、provider backend、菜单元数据、绑定和租约代际，随后执行旧 `on_finalize` 并退役旧镜像。失败时会调用新 `on_migrate_abort` 与 `on_finalize`、丢弃尚未公开的暂存 import、撤销新代际 source 并恢复旧代际 source。运行时显式区分旧代际未触碰、已静默、已恢复和状态受损四种结果；新代初始化/迁移失败或调用方授权在事务末尾失效时，只要旧代恢复成功就继续保持 `Active`，只有旧代钩子或恢复本身失败时才进入隔离诊断状态。
+当前 `ReplaceCell` 已具备双路径热替换事务：声明式 EBI image 在同名、同类型、surface 兼容且无 native imports/exports 时直接提交 generation、菜单元数据、provider 元数据、绑定和租约代际更新；原生目标必须是 `Active` 或 `Paused` 的动态原生单元，新旧单元的 manifest name 和 kind 必须一致，声明式拓扑、provider surface、imports/exports 和统一模块描述符必须通过兼容性校验。原生替换过程会影子装载新 image，使用新逻辑 generation 暂存其受管 import，在执行新 `ElmModule::initialize` 后静默旧单元，调用旧 `migrate_export` 导出最多 64 KiB 状态，再调用新 `migrate_import` 导入状态；提交点才会提升暂存 import、原子切换 Projection Source generation、provider backend、菜单元数据、绑定和租约代际，随后执行旧 `ElmModule::finalize` 并退役旧镜像。失败时会调用新模块的 `migrate_abort` 与 `finalize`、丢弃尚未公开的暂存 import、撤销新代际 source 并恢复旧代际 source。运行时显式区分旧代际未触碰、已静默、已恢复和状态受损四种结果；新代初始化/迁移失败或调用方授权在事务末尾失效时，只要旧代恢复成功就继续保持 `Active`，只有旧代钩子或恢复本身失败时才进入隔离诊断状态。
 
 当前仍然主动阻断的场景包括：内建单元、Builtin/Memory 外部替换请求、未知或未注册 Projection Source、目标存在子单元/依赖者/拓展项、忙碌租约、provider 队列、运行中调用或保留结果仍未排空、缺少原生 code segment、缺少迁移钩子、native 装载器无法安全重定位，或外部 importer 无法安全 patch 到新 export。跨单元 native import 自动重绑定只支持落在可写 Data/Bss 段内的 import slot/GOT 形态；若 import relocation 落在已 seal 的 Code 段内，会被视为不可安全重绑定。v1 采用“先排空、后原子切换”的强一致语义，不承诺让同一调用跨两个 generation 继续执行；绑定对象保持原位，provider backend 与受管 import 在提交点切换。
 
@@ -503,8 +503,8 @@ sys_elm_ctl(cmd, in_ptr, in_len, out_ptr, out_len) -> isize
 | `QueryMenu` | 1 | 已实现 | 返回菜单快照 |
 | `LoadCell` | 2 | 已实现 | 接收带父单元和初始预算的 EBI Source 请求，外部输入统一通过已注册 Projection Source 展开为 EBI |
 | `DetachCell` | 3 | 已实现 | 执行 finalize、撤销资源、退役 source、移除拓扑并回收动态单元 |
-| `PauseCell` | 4 | 已实现 | 支持动态单元暂停，原生单元可选执行 `on_quiesce` / `on_pause` |
-| `ResumeCell` | 5 | 已实现 | 支持动态单元恢复，原生单元可选执行 `on_resume` |
+| `PauseCell` | 4 | 已实现 | 支持动态单元暂停，原生单元执行 `ElmModule::quiesce` / `pause` |
+| `ResumeCell` | 5 | 已实现 | 支持动态单元恢复，原生单元执行 `ElmModule::resume` |
 | `ReplaceCell` | 6 | 已实现 | 支持任意已注册 Projection Source 的迁移式热替换；Builtin/Memory 外部请求返回 Unsupported |
 | `QueryTopology` | 7 | 已实现 | 返回父子、依赖、拓展点和拓展项关系 |
 | `QueryPolicy` | 8 | 已实现 | 返回策略能力、支持动作和阻断位 |
@@ -609,15 +609,16 @@ demo    source=eki
 - `ElmEbiArch`：`Any`、`Riscv64`、`LoongArch64`。
 - `ElmEbiUnit`：清单、目标、菜单声明、段声明、入口声明、依赖声明、拓展点声明、拓展声明、provider port 声明、imports 和 exports 元数据。
 - `ElmEbiSegment`：段类型、大小、权限 flags、file size、mem size、对齐、EBI Source block 索引、Source 偏移和内容 hash。
-- `ElmEbiEntry`：未来原生入口符号名。
+- `ElmEbiEntry`：旧式独立原生入口描述；新 Rust ELM 不再单独生成该记录。
 - `ElmEbiMenuDecl`：菜单项 kind、flags、label、description 和 route。
 - `ElmEbiDependencyDecl`：依赖的目标单元名和契约。
 - `ElmEbiExtensionPointDecl`：当前单元开放的拓展点名和契约。
 - `ElmEbiExtensionDecl`：当前单元挂接的目标单元名、拓展点名和契约。
 - `ElmEbiProviderPortDecl`：当前单元声明的 provider port 契约、访问策略、方向和模式。
-- `ElmEbiImportDecl`：当前单元需要的原生能力入口元数据，不表达传统符号链接。
-- `ElmEbiExportDecl`：当前单元开放的原生能力入口元数据，不表达 Linux LKM 符号表。
-- `ElmEbiLifecycleHooks`：当前单元必须声明的 Rust 生命周期钩子。
+- `ElmEbiImportDecl`：当前单元需要的受管、`direct-pinned` 或 `kernel-symbol` 能力入口元数据；直接调用必须携带完整 Rust ABI SHA-256。
+- `ElmEbiExportDecl`：当前单元开放的受管或 `direct-pinned` 能力入口元数据；它不是不受约束的全局符号表。
+- `ElmModuleDescriptorV1`：原生 Rust ELM 唯一的统一模块描述符，固定导出为 `__elm_module_descriptor_v1`，集中给出生命周期、迁移和 entry 入口。
+- `ElmEbiLifecycleHooks`：旧式生命周期表记录。解析器仍能识别该结构，但新原生镜像必须使用统一模块描述符，不能用该表代替描述符。
 - `ElmLoadCellResponse`：装载结果、单元 ID、最终状态和原因。
 
 当前 EBI 校验规则：
@@ -628,30 +629,28 @@ demo    source=eki
 - 段数量不能超过 `ELM_EBI_MAX_SEGMENTS`。
 - 段大小、内存大小不能为 0，`file_size` 不能大于 `mem_size`，`align` 非 0 时必须是 2 的幂。
 - 代码段必须可执行且不可写；只读数据段不可写不可执行；数据段可写不可执行；BSS 必须 `file_size == 0` 且带零填充语义；重定位段必须标记为重定位输入。
-- 原生入口符号不能为空，并且必须通过 EBI 符号名校验。
+- 若旧式原生入口记录存在，其符号不能为空并且必须通过 EBI 符号名校验；新镜像的 entry 来自统一模块描述符。
 - 菜单 label 和 route 不能为空，并且各字段不能超过固定长度。
 - 依赖、拓展点、拓展项和 provider port 声明数量不能超过固定上限。
 - 依赖和拓展目标使用 manifest name；provider port 复用现有访问策略、方向和模式枚举。
 - provider port 声明的 flags 当前必须为 0。
-- imports 和 exports 数量不能超过固定上限，契约名必须通过能力契约校验；v1 允许受管 import/export flag，用于热替换时选择唯一最高兼容版本并重绑定可写 import slot。解析成功的跨单元 import 会自动形成隐式 dependency，首次装载与热替换都必须在稳定 surface 比较前合并该依赖，不能让显式清单与实际调用边产生两套拓扑。
-- 原生 EBI image 可以携带 payload、符号位置表和 EKI 原生重定位表；带 Code 段的动态单元必须能在符号位置表中定位 `on_initialize` 和 `on_finalize`。
+- imports 和 exports 数量不能超过固定上限，契约名必须通过能力契约校验。受管 import/export 用于代际路由和热替换重绑定；`direct-pinned` import/export 还必须提供非零 Rust ABI 摘要并固定目标 generation。`kernel-symbol` import 不参与 ELM export 选择，不能携带 ELM 作用域位；当前没有目录后端，装载器必须返回 `NativeCodeTodo`。
+- 原生 EBI image 可以携带 payload、符号位置表和 EKI 原生重定位表；带 Code 段的新动态单元必须能在只读段中定位尺寸、对齐和固定头均有效的 `__elm_module_descriptor_v1`，描述符中的所有入口都必须落在 Code 段内。
 - EKI 原生重定位当前使用 EKI relocation v1，不直接消费 ELF relocation；支持 image base、segment base、symbol absolute 和 symbol relative 写入语义。
-- 动态 EBI 单元必须声明 `on_initialize` 和 `on_finalize` 两个生命周期钩子。
-- 生命周期钩子当前只接受 Rust ABI v1；开发侧由 Rust 框架包装，机器边界固定为 `ElmNativeHookContextV1` 指针和 `i32` 状态码。
-- 生命周期钩子的符号名必须精确等于 `on_initialize` 和 `on_finalize`，迁移钩子的符号名必须精确等于 `on_migrate_export`、`on_migrate_import` 和 `on_migrate_abort`，flags 必须为 0。
+- 动态原生 ELM 必须实现 `ElmModule` 并导出唯一的 `ElmModuleDescriptorV1`；`create`、`initialize` 和 `finalize` 不允许缺失。
+- 开发侧只写安全 Rust trait 方法。`#[elm::module]` 生成固定机器边界，生命周期入口使用 `ElmNativeHookContextV1` 指针和 `i32` 状态码，迁移和 entry 使用各自固定 frame。
+- 描述符固定头、ABI 版本、结构尺寸、实例布局和所有入口地址都会在执行任何模块代码前校验。模块实例由 `ModuleSlot<T>` 按 generation 管理，不保存在描述符中。
 
 生命周期执行语义：
 
-- `on_initialize` 是单元被加载后的前钩子，负责单元自定义初始化、服务注册、事件订阅、工具能力发布或数据结构准备。
-- `on_finalize` 是单元被卸载前的前钩子，负责撤销自定义状态、注销服务、解除订阅和释放由单元持有的资源。
-- 两个钩子是 ELM 的强制契约，不代表传统模块 `init/exit` ABI；它们由 ELM Rust 框架生成或显式实现。
-- 一个 ELM 可以只是工具单元，只导出函数、类型描述或数据结构定义，但仍必须具备两个生命周期钩子。
-- `on_migrate_export`、`on_migrate_import` 和 `on_migrate_abort` 是热替换迁移钩子；成功热替换要求旧单元能导出状态、新单元能导入状态，abort 钩子用于回滚新单元临时状态。
-- 原生 import 在 `on_initialize` 前进入与独占 execution token 绑定的暂存事务。暂存 handle 只在 `Initialize`、`Finalize`、`MigrateImport` 和 `MigrateAbort` 阶段可见；首次装载使用 generation 1，热替换使用尚未公开的新逻辑 generation。只有镜像信任、生命周期、入口和提交校验全部成功后，暂存记录才一次性提升为 Active import，任何失败路径都会在 finalize 完成后丢弃暂存记录。
-- 当前阶段已具备 `ElmContext`、固定原生 hook 帧和原生 EKI 生命周期执行器；没有 Code/entry/relocation 的声明式单元可由运行时默认生命周期闭合，内核测试仍可传入受控测试执行器验证失败与 finalize 路径。
-- 测试执行器只允许无原生 entry、无代码段、无重定位段的声明式 ELM 完成 `on_initialize`，用于验证菜单、拓扑和 provider 激活链路。
-- `on_initialize` 失败时不会激活拓扑，单元进入 `Faulted -> Quarantined`，返回 hook failed reason。
-- 已初始化单元卸载前必须执行 `on_finalize`；失败时保留资源和单元用于诊断，成功后才撤销租约、菜单、binding、provider 和图节点。
+- `ElmModule::create` 为当前 generation 构造唯一模块实例，`initialize` 负责服务注册、事件订阅、工具能力发布或数据结构准备。
+- `ElmModule::finalize` 负责撤销自定义状态、注销服务、解除订阅和释放由单元持有的资源；成功后运行时才销毁实例。
+- 这些方法是 ELM 的强制运行时契约，不代表传统模块 `init/exit` ABI。一个 ELM 可以只是工具单元，但仍必须实现统一 trait。
+- `migrate_export`、`migrate_import` 和 `migrate_abort` 是热替换迁移方法；默认导出和导入返回不支持，避免未实现迁移的模块被误判为可安全替换。
+- 原生 import 在 `initialize` 前进入与独占 execution token 绑定的暂存事务。暂存 handle 只在允许的生命周期阶段可见；首次装载使用 generation 1，热替换使用尚未公开的新逻辑 generation。只有镜像信任、生命周期、entry 和提交校验全部成功后，暂存记录才一次性提升为 Active import，任何失败路径都会在 finalize 完成后丢弃暂存记录。
+- 当前阶段已具备 `ElmContext`、固定原生 frame、统一模块描述符和原生 EKI 生命周期执行器；没有 Code/entry/relocation 的声明式单元可由运行时默认生命周期闭合。
+- `initialize` 失败时不会激活拓扑，单元进入 `Faulted -> Quarantined`，返回 hook failed reason。
+- 已初始化单元卸载前必须执行 `finalize`；失败时保留资源和单元用于诊断，成功后才撤销租约、菜单、binding、provider 和图节点。
 - 内建 `elm-mgr` 和内建 `eki` 目前使用启动期合成生命周期状态，二者都以 `<builtin>` 来源进入同一套可观测 cell 模型。
 
 当前装载语义：
@@ -660,12 +659,12 @@ demo    source=eki
 - 新单元的普通 capability policy 从直接父单元向下继承，不能获得父单元没有的 action、provider、extension、native 或 resource 权限；`LOCKED` 不自动继承，`DENY_CHILD_ESCALATION` 与 `AUDIT_ALL` 会沿管理树继承。management capability 永不自动继承。父策略缩减若会让现有子策略越过新上限，则事务被拒绝。
 - 装载事务会在执行外部原生钩子前持有调用者和动态父单元的 execution token；装载期间不能并发替换、暂停、调整策略或调整预算。提交阶段重新校验 principal、generation、policy epoch、父单元状态和授权作用域。
 - 初始预算必须位于直接父单元预算内，并且父单元当前用量加所有活跃直接子预算再加新预算不得超过父单元总预算。
-- 动态 EBI 协议对象必须先完成生命周期钩子校验；带 Code 段且具备 payload、符号位置表和可解析 EKI relocation v1 的 EKI image 会进入原生执行器。
+- 动态 EBI 协议对象必须先完成统一模块描述符或声明式生命周期校验；带 Code 段且具备 payload、符号位置表和可解析 EKI relocation v1 的 EKI image 会进入原生执行器。
 - 菜单拓展 EBI 协议对象会被解析和预检；无 Code/entry/relocation 的声明式对象由运行时默认生命周期闭合并直接进入 `Active`，随后挂接到 `elm-mgr` 的 `menu.item` 拓展点并创建菜单租约和菜单项。
 - 声明式拓扑 EBI 会在改状态前预检 manifest name 唯一性、依赖目标存在性、拓展点存在性、契约匹配和 provider port 契约冲突。
-- 原生 EKI 在解析 imports、复制段、应用重定位、切换 W^X 权限并同步指令缓存后调用 `on_initialize`；初始化成功的单元才会把依赖、拓展点、拓展项和 provider port 登记到 BindingGraph、PortRuntime 和 ProviderRuntime。普通能力绑定仍由 `PreflightBind/CommitBind` 完成，不在装载时自动创建。
+- 原生 EKI 在解析 imports、复制段、应用重定位、切换 W^X 权限、同步指令缓存并校验统一模块描述符后调用 `ElmModule::initialize`；初始化成功的单元才会把依赖、拓展点、拓展项和 provider port 登记到 BindingGraph、PortRuntime 和 ProviderRuntime。普通能力绑定仍由 `PreflightBind/CommitBind` 完成，不在装载时自动创建。
 - provider port 声明会在激活阶段注册为动态 provider；声明 `handler_symbol` 且符号可定位时注册为 ELM 原生 provider backend，否则保持不可调用或被原生镜像预检拒绝。
-- 带 Code payload 且声明 `entry` 的 EKI 会在原生执行器中解析入口符号，并在激活到 `Active` 后调用 `ElmNativeEntryFrameV1` 入口帧。
+- 带 Code payload 的新 EKI 从统一模块描述符取得 entry，并在激活到 `Active` 后通过 `ElmNativeEntryFrameV1` 调用；框架提供默认空 entry，因此描述符入口始终完整。
 - 带 Code/entry/relocation 但缺少架构映射 ops 的环境会停在 `Loaded + NativeCodeTodo`，不执行代码；Projection Source 通过内核 Projection Source registry 转换为 EBI 协议对象。
 - `MGR_CALL(LoadCell)` 接收 96 字节 `ElmEbiSourceRequest`，当 `source_kind == Projection` 时，其后必须是 24 字节 `ElmProjectionSourceRequest` 和对应格式 payload。请求必须显式给出非零父单元 ID 和初始预算。`ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT` 只允许 Kernel、UserAdmin 或内建 `elm-mgr` 发起，并且只对经过完整签名验证、kind 为 Manager、父单元已持有 management capability 的镜像生效；普通子单元不会继承该能力。EKI 使用 provider ID `0x454b_4900_0000_0001`；启动期 `elm-mgr` 和 `eki` 均使用 Builtin source，测试和内核内部可直接走 Memory source 的 EBI 单元入口。
 - 内建 EKI Projection Source 会校验 `Code`、`ReadOnlyData`、`Data`、`Bss`、`Relocation`、`Notes` payload block 与 `Segments` 表逐项一致，再展开为 EBI segment 元数据。
@@ -674,9 +673,9 @@ demo    source=eki
 - `ElmEbiProofV1` 对 canonical EBI digest、来源 identifier、来源摘要、签名者 key id、公钥、release epoch 和 ABI fingerprint 进行 Ed25519 签名。无效 proof 即使在允许 unsigned 的测试策略下也不能降级为 unsigned 装载。
 - 构建时可通过 `ELM_TRUST_ANCHORS_FILE=<path>` 注入信任根。兼容格式为 `<key-identifier> <64位Ed25519公钥十六进制>`，完整格式为 `<key-identifier> <rollback-authority-identifier> <64位Ed25519公钥十六进制>`；兼容格式把 key identifier 同时作为 rollback authority。多个轮换 key 可以共享同一个稳定 rollback authority，构建脚本会拒绝无效 identifier、公钥长度、十六进制、公钥、重复 key identifier 和重复公钥；信任根在 `elm-mgr` 初始化时恢复持久回滚下界后立即 seal。
 - 信任库按“稳定 rollback authority 摘要 + 模块名摘要”记录已接受 release epoch，而不是按签名 key 划分回滚域。轮换 key 只负责当前镜像验签，不能通过更换 key 绕过已有 epoch；低于已接受 epoch 的镜像会返回 `ROLLBACK_REJECTED`。验签接受记录先写入 runtime journal，再提交内存信任状态；持久 journal 启动回放会压缩并恢复每个回滚域的最高 epoch。`QueryTrustState` 暴露 sealed、anchor、revocation、accepted epoch 和 unsigned-active 状态。
-- 内建 EKI Projection Source 已支持 `LifecycleHooks` 元数据 block，并要求它展开成完整 EBI 生命周期钩子声明。
-- 内建 EKI Projection Source 已支持 `SymbolLocations` 元数据 block，用于把生命周期钩子和后续原生符号定位到段内偏移。
-- 内建 EKI Projection Source 已支持 imports 和 exports 元数据 block；imports 当前通过 ELM Core 的原生 export 注册表解析，并在装载时转化为依赖关系和 import relocation 输入。
+- 内建 EKI Projection Source 仍能解析旧式 `LifecycleHooks` block，但 `elm-tools` 不再为新 Rust ELM 生成该 block。
+- 内建 EKI Projection Source 已支持 `SymbolLocations` 元数据 block，用于定位统一模块描述符、provider、import/export 和其他原生符号。
+- 内建 EKI Projection Source 已支持 imports 和 exports 元数据 block。受管和 `direct-pinned` import 通过 ELM Core 的原生 export 注册表解析；`kernel-symbol` 只完成协议校验，目录后端仍为 TODO。
 - `MGR_CALL(ReplaceCell)` 接收 `ElmReplaceCellRequestV1 + ElmProjectionSourceRequest + source payload`，适用于所有已注册 Projection Source。`migration_limit == 0` 表示使用默认 64 KiB 上限，非 0 时不得超过该上限。
 - Projection Source 会按 provider ID 调用已注册投影器；注册表负责 owner、generation、影子 source、活动引用、暂停、原子切换和退役。Busy 退役与恢复冲突会在修改状态前失败，不产生半退役 source。Builtin/Memory 外部请求返回 `UNSUPPORTED`。
 - 空 payload、非法 EBI Source 请求、损坏 EKI 或未知 Source kind 会返回 `INVALID`。
@@ -727,19 +726,19 @@ demo    source=eki
 
 - 定义 EBI 协议对象。
 - 把未来文件格式和 ELM Core 消费对象解耦。
-- 校验目标架构、ABI 版本、段声明、入口声明、菜单声明和生命周期钩子声明。
+- 校验目标架构、ABI 版本、段声明、菜单声明、统一模块描述符和旧式生命周期表。
 
 设计细节：
 
 - `ElmEbiArch::Any` 可用于架构无关的声明和工具单元。
-- `ElmEbiLifecycleHooks` 固定要求 `on_initialize` 和 `on_finalize`。
-- 生命周期钩子当前只定义 Rust ABI v1，不定义 C/C++ ABI。
-- 生命周期钩子开发语义由 Rust 框架包装；原生机器边界固定为 `ElmNativeHookContextV1` 指针和 `i32` 状态码。
+- `ElmEbiLifecycleHooks` 是旧式表结构；若出现仍要求完整初始化和终结记录，但新原生 ELM 不再生成它。
+- `ElmModuleDescriptorV1` 是当前原生 Rust ELM 的唯一生命周期入口表，不定义 C/C++ ABI。
+- 生命周期开发语义由 `ElmModule` trait 和 `#[elm::module]` 包装；原生机器边界使用固定 frame 和 `i32` 状态码。
 - `Code` 和 `Relocation` 段会触发原生装载器需求。
 - `entry` 存在时也视为需要原生装载器。
-- 单独声明 `on_initialize` 和 `on_finalize` 不再表示需要原生装载器；无 Code/entry/relocation 的 EBI 由运行时默认生命周期闭合。
+- 无 Code/entry/relocation 的声明式 EBI 由运行时默认生命周期闭合；带 Code 的新镜像必须提供统一模块描述符。
 - `ElmEbiImage` 在 `ElmEbiUnit` 之外携带 payload、符号位置和 EKI relocation v1，供内核原生执行器消费。
-- `NativeCodeTodo` 现在表示带 Code/entry/relocation 的镜像缺少映射能力或命中尚未支持的原生能力边界；imports 已进入原生 export 注册表解析路径。
+- `NativeCodeTodo` 表示镜像缺少映射能力或命中尚未支持的原生能力边界；当前也明确用于尚未安装目录后端的 `kernel-symbol` import。
 
 ### `error.rs`
 
@@ -1265,25 +1264,26 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - `MGR_CALL(PreflightUnbind/CommitUnbind)` 已支持动态能力绑定的预检和撤销；内建保护绑定不可撤销。
 - 拓展快照会同时返回模式、优先级、拓展点契约和 handler 契约；dispatch 响应回显实际组合模式及 matched/called 数量。provider 缺失时返回 `UNSUPPORTED`，handler 调用已经发生但其返回值被策略拒绝时仍计入 called 数量，使审计与实际执行一致。
 - 绑定图已记录真实能力绑定边，并将绑定、菜单租约和菜单项纳入同一条撤销链路。
-- EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明、入口声明、声明式拓扑声明和生命周期钩子声明。
+- EBI 已重构为稳定装载协议对象，包括目标架构、ABI 版本、清单、菜单声明、段声明、声明式拓扑、统一模块描述符定位、imports/exports 和完整 Rust ABI 摘要。
 - `MGR_CALL(LoadCell)` 已接收 EBI Source 请求；外部输入必须通过 Projection Source，内建 EKI 投影器只是 provider ID `0x454b_4900_0000_0001` 对应的一种实现，并拒绝旧裸 EBI 字节格式。
-- 动态 EBI 单元已强制要求 `on_initialize` 和 `on_finalize`，钩子 ABI 暂定为 Rust ABI v1。
-- 内建 EKI Projection Source 已支持依赖、拓展点、拓展项、provider port、原生 payload segment、imports、exports、符号位置、EKI relocation v1 和生命周期钩子元数据；EKI v1 的拓展点记录显式编码组合模式，拓展项记录显式编码 handler 契约和优先级，装载时会完成保留位、固定记录长度、枚举值和字符串边界校验，再展开为 EBI image。
-- 带 Code payload、生命周期符号位置和可解析 relocation 的原生 EKI 会进入原生镜像执行器；执行器完成段复制、重定位、W^X 权限封口、指令缓存同步和 `on_initialize` 调用后，激活声明式拓扑，并在进入 `Active` 后调用可选 `entry`。
+- 动态原生 ELM 已强制要求唯一 `ElmModuleDescriptorV1`；`#[elm::module]` 统一生成生命周期、迁移和 entry trampoline，旧式独立生命周期 attribute 不再存在。
+- 内建 EKI Projection Source 已支持依赖、拓展点、拓展项、provider port、原生 payload segment、imports、exports、Rust ABI 摘要、符号位置和 EKI relocation v1；EKI v1 的拓展点记录显式编码组合模式，拓展项记录显式编码 handler 契约和优先级，装载时会完成保留位、固定记录长度、枚举值和字符串边界校验，再展开为 EBI image。
+- 带 Code payload、统一模块描述符位置和可解析 relocation 的原生 EKI 会进入原生镜像执行器；执行器完成段复制、重定位、W^X 权限封口、指令缓存同步和描述符校验后调用 `ElmModule::initialize`，激活声明式拓扑，并在进入 `Active` 后调用描述符 entry。
 - 无 Code/entry/relocation 的声明式 EBI 会由运行时默认生命周期闭合并直接进入 `Active`；带 Code/entry/relocation 但缺少架构映射 ops 的环境会登记为 `Loaded + NativeCodeTodo`，不执行代码。
 - 外部 no_std Rust ELM 可以通过 `kernel_api::elm_global_allocator!()` 把 Rust `alloc` 接到 `kernel.memory@1`，直接使用 `Box`、`Vec`、`String` 和 `Arc`；明确不使用堆的镜像仍可选择 `elm::elm_no_heap_allocator!()`。两种宏互斥，模块不能隐式链接 allocator crate 或内核全局分配器符号。
-- `elm` 已提供独立的 module 编译面和 attribute 开发框架：`#[elm::on_initialize]`、`#[elm::on_finalize]`、迁移钩子、`#[elm::entry]`、`#[elm::provider]`、`#[elm::import]`、`#[elm::export]`、`#[elm::payload]`、`#[elm::mixin_point]` 与 `#[elm::mixin]` 会生成固定 ABI trampoline 和非装载 `.elm.meta`，业务代码不手写 `extern "C"`、导出名或原始元数据。
-- `tools/elm-tools build` 已能把外部 Rust 仓库固定构建为 ELF64 little-endian PIE，再转换为带 header SHA-256 的 EKI：它会抽取页对齐连续 `PT_LOAD` 段、生命周期符号位置、可选 entry、native import/export、provider、mixin 和 payload 元数据，并把 `R_RISCV_RELATIVE` / `R_LARCH_RELATIVE` 转换为 EBI `ImageBase64` 重定位。非 `ET_DYN`、text relocation、未知动态重定位或不兼容布局会在打包期被拒绝。
+- `elm` 已提供独立的 module 编译面和 attribute 开发框架：`#[elm::module]` 注册唯一 `ElmModule` 实现；provider、export、设备和 mixin attribute 可以标记该实现的方法；`#[elm::import]`、`#[elm::kernel_symbol]` 和 `#[elm::payload]` 声明镜像级静态协议。业务代码不手写 `extern "C"`、导出名或原始元数据。
+- `tools/elm-tools build` 已能把外部 Rust 仓库固定构建为 ELF64 little-endian PIE，再转换为带 header SHA-256 的 EKI：它会抽取页对齐连续 `PT_LOAD` 段、统一模块描述符、native import/export、Rust ABI 摘要、provider、mixin 和 payload 元数据，并把 `R_RISCV_RELATIVE` / `R_LARCH_RELATIVE` 转换为 EBI `ImageBase64` 重定位。非 `ET_DYN`、text relocation、未知动态重定位或不兼容布局会在打包期被拒绝。
+- `DirectImport<F>` 和 `direct-pinned` export 已按规范函数签名生成完整 SHA-256，并在 ELM 间解析时要求名称、契约、版本和摘要全部匹配。`#[elm::kernel_symbol]` 使用同一槽协议，但当前内核没有符号目录实现，任何此类装载都会明确停在 `NativeCodeTodo`。
 - `elm-tools new`、`sync-framework`、`build`、`sign` 和 `verify` 已形成独立仓库闭环；同一 hello ELM 已在 RISC-V64 与 LoongArch64 QEMU 中通过签名装载，生命周期日志、`Active` 状态、信任 epoch、故障计数和 Core health 均验证通过。
 - Core 已记录动态单元生命周期声明、测试执行器可用性、初始化状态、完成卸载状态、pending EBI load 计划、EBI Source kind、资源预算、native fault 次数和软隔离状态；启动期 `elm-mgr` 作为 Builtin Source 根单元进入同一套 EBI 模型，启动期 `eki` 作为 Builtin Source 子单元挂在 `elm-mgr` 下。
 - `ElmContext` 已作为 Rust 生命周期上下文进入模型层，当前不进入 `sys_elm_ctl` 字节 ABI。
 - kernel-tests 已具备受控生命周期测试执行器：可验证无原生镜像单元初始化后激活菜单、拓扑和 provider，初始化失败隔离，卸载前 finalize，以及 finalize 失败保留资源。
 - 受控测试执行器不会激活带原生 entry、代码段或重定位段的单元；带代码段的单元只能由原生 EKI 执行器处理，带 `entry` 的 Code EKI 已由原生执行器负责入口调用。
-- `PauseCell` 和 `ResumeCell` 已通过统一预检策略支持动态单元的真实状态切换；原生单元会调用可选 `on_quiesce`、`on_pause` 和 `on_resume`，暂停后的单元不能继续发起或承载 provider 调用。
+- `PauseCell` 和 `ResumeCell` 已通过统一预检策略支持动态单元的真实状态切换；原生单元会调用 `ElmModule::quiesce`、`pause` 和 `resume`，暂停后的单元不能继续发起或承载 provider 调用。
 - `DetachCell` 已通过统一预检策略支持动态单元的资源租约撤销、菜单项移除、绑定图摘除和退役；尚未激活的原生 TODO 单元可作为元数据直接摘除。
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项、忙碌租约、provider 队列/保留结果/运行中调用或 native export 被其他单元 import 的目标单元，避免破坏当前拓扑。
-- `ReplaceCell` 已支持所有已注册 Projection Source 的热替换入口：声明式 image 可直接提交 generation 和元数据更新；原生 image 支持迁移式事务，包括新镜像影子装载、初始化期 import 暂存、新 `on_initialize`、旧 `on_quiesce`、旧 `on_migrate_export`、新 `on_migrate_import`、暂存 import 提升、旧 `on_finalize`、失败 abort/finalize、旧代恢复、source 回滚和 generation 提交；Builtin/Memory 外部请求不进入替换事务。
-- RISC-V64 与 LoongArch64 release QEMU 均已通过 189/189 项 `kernel-tests`。测试覆盖启动期 `elm-mgr` 与内建 `eki` 子单元拓扑、显式父单元装载、父子策略继承、祖先授权 execution token、陈旧 policy epoch、锁定策略、层级预算委派与退役释放、内建 ELM 生命周期保护、健康菜单动作、完整 60 项 API 注册表、受签名约束的 delegated Manager 授权、management 命名空间隔离、事件订阅、provider 同步/异步调用、资源预算、受托资源暂停/恢复及失败原子回滚、EKI Projection Source 装载、声明式与原生生命周期、初始化/替换期受管 import 暂存、mixin handler 精确路由和控制回复、优先级链、Observer 广播和 Exclusive 单挂接、热替换迁移及旧代恢复、受管 import 重绑定、签名信任链与 rollback 拒绝、同步 fault、panic、timer 强制退出、Projection Source 影子切换、动态 PnP 驱动/function/热拔、真实 `kernel.device@1` grant 调用、probe 中驱动注销竞态、MSI controller/vector 延迟退役、IRQ top-half 执行域隔离，以及 Busy 退役失败不污染 source 状态。
+- `ReplaceCell` 已支持所有已注册 Projection Source 的热替换入口：声明式 image 可直接提交 generation 和元数据更新；原生 image 支持迁移式事务，包括新镜像影子装载、初始化期 import 暂存、新 `initialize`、旧 `quiesce`、旧 `migrate_export`、新 `migrate_import`、暂存 import 提升、旧 `finalize`、失败 abort/finalize、旧代恢复、source 回滚和 generation 提交；Builtin/Memory 外部请求不进入替换事务。
+- 本轮统一模块和符号协议改动已通过 `elm` 106 项单元测试、2 项宏集成测试、`elm-tools` 14 项测试、两架构 `arch` 检查、两架构 release 内核构建、两架构 `kernel-tests` 192/192 以及两架构 `elmctl-smoke`。smoke 覆盖 17 类 Core health、信任拒绝、API 注册表、事件订阅和审计链。
 
 ## 18. 运行期 smoke 测试链路
 
@@ -1319,7 +1319,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 7. management capability 不从父单元自动继承，不能通过 `UpdateCellPolicy` 自行添加或移除。授予请求只接受 Kernel、UserAdmin 或内建 `elm-mgr`，目标镜像必须声明 `ElmKind::Manager`、通过完整签名信任验证，并挂在已经持有 management capability 的父单元下；热替换同样保持签名要求。
 8. Kernel API 通过根目录 `kernel-api` crate 提供类型化 Rust 门面。`#[elm::kernel_api]` 把 namespace、精确版本和能力位写入非装载元数据，`elm-tools` 使用当前门面的规范布局摘要生成 EBI/EKI requirement；Core 在执行任何模块代码前完成 namespace、版本、布局、能力和 generation 授权。
 9. 内核使用通用 namespace 注册表发布静态只读函数表，权限拒绝、版本不兼容和命名空间不存在分别返回不同状态。ELM 首次取得表后缓存地址，普通调用不经过 `elm-mgr` 管理分发；函数表实现仍必须验证当前 ELM 上下文、generation、能力和资源所有权。
-10. 本机制不扩大内核全局 Rust 符号面，也不允许模块依赖 `kernel`、`general`、`hal` 或子系统实现 crate 的内部布局。网络、netdev、socket 和 netlink 接口不进入当前导出批次。
+10. EBI 已保留 `kernel-symbol` 直接导入协议：槽地址、名称、契约、版本和完整 Rust ABI 摘要必须同时匹配，精确 Rust API 还可把外部接口目录身份混入摘要。当前内核没有该目录后端，因此所有 `kernel-symbol` import 都返回 `NativeCodeTodo`，包括 optional import；在后端完成前，不允许模块依赖 `kernel`、`general`、`hal` 或子系统实现 crate 的内部布局。
 
 每个 `kernel.*` requirement 在装载事务中解析为一个不可复用的非零 grant。`ElmApiNamespaceV1` 同时返回静态表地址、选中版本、generation、能力集合和 `grant_id`；公开的 `elm.runtime` 与受管理的 `elm.management` 不属于 Kernel API grant，二者的 `grant_id` 固定为零。grant 与 cell、generation、namespace、版本和能力集合共同绑定，装载回滚、隔离、卸载和成功热替换都会撤销不再有效的代际授权。
 
@@ -1331,7 +1331,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 `kernel-api::memory::ElmKernelAllocator` 在该函数表上实现 Rust `GlobalAlloc`。`kernel_api::elm_global_allocator!()` 会生成唯一的全局分配器、静态 `ApiImport` 和 `ALLOCATE | RESIZE` requirement，因此 `Box`、`Vec`、`String`、`Arc` 及其它 `alloc` 容器与手工函数表调用共享同一份 grant、owner 和预算账本。分配与扩容的普通内存不足返回空指针；权限失效、未知地址、重复释放或损坏函数表属于运行时不变量错误，会先写入 ELM 日志，再通过受保护 panic 终止出口隔离当前调用。适配器本身不分配内存，首次 namespace 协商也必须保持无堆，避免 allocator 递归。
 
-动态 Rust 对象只允许在一个 ELM 镜像内部存在，不能把 `Vec`、`String`、trait object 或 Rust 引用直接放入 provider、受管 export、mixin 或迁移载荷。长期堆状态必须在发起热替换前显式释放或编码为固定迁移数据；replace 预检会以 `RESOURCE_QUOTA` blocker 拒绝仍持有动态分配的 cell。detach 在 `on_finalize` 后再次验证资源账本，仍有分配时拒绝退役。该规则保证现有按 cell 计量的裸地址不会被下一 generation 隐式继承。
+动态 Rust 对象只允许在一个 ELM 镜像内部存在，不能把 `Vec`、`String`、trait object 或 Rust 引用直接放入 provider、受管 export、mixin 或迁移载荷。长期堆状态必须在发起热替换前显式释放或编码为固定迁移数据；replace 预检会以 `RESOURCE_QUOTA` blocker 拒绝仍持有动态分配的 cell。detach 在 `ElmModule::finalize` 后再次验证资源账本，仍有分配时拒绝退役。该规则保证现有按 cell 计量的裸地址不会被下一 generation 隐式继承。
 
 内存函数表的输出槽必须位于当前 ELM 可写范围。重分配额外在 allocator 的同一地址串行化事务中验证输出槽与旧对象不重叠，避免移动旧对象后向失效地址写回结果。热替换为新 generation 预建独立 grant：任何预检、requirement 解析或提交失败都会删除新 grant 并保留旧 generation；提交成功后才撤销旧 grant。所有函数入口仍会逐次校验当前上下文和 token，因此撤销后缓存表地址与旧 token 不能继续使用。
 
@@ -1364,18 +1364,25 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
 #![no_std]
 #![no_main]
 
-use elm::{HookResult, LifecycleContext};
+use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 
-#[elm::on_initialize]
-fn initialize(_context: &LifecycleContext) -> HookResult {
-    elm::runtime::log(6, "demo.hello: initialized")
-        .map_err(|_| elm::HookError::new(-1))
-}
+struct Demo;
 
-#[elm::on_finalize]
-fn finalize(_context: &LifecycleContext) -> HookResult {
-    elm::runtime::log(6, "demo.hello: finalized")
-        .map_err(|_| elm::HookError::new(-1))
+#[elm::module]
+impl ElmModule for Demo {
+    fn create(_context: &LifecycleContext) -> Result<Self, HookError> {
+        Ok(Self)
+    }
+
+    fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
+        elm::runtime::log(6, "demo.hello: initialized")
+            .map_err(|_| HookError::new(-1))
+    }
+
+    fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {
+        elm::runtime::log(6, "demo.hello: finalized")
+            .map_err(|_| HookError::new(-1))
+    }
 }
 
 #[panic_handler]
@@ -1400,11 +1407,11 @@ let policy = manager
 
 当前 attribute 语义已经固定为 v1：
 
-- `#[elm::on_initialize]` 与 `#[elm::on_finalize]` 必须且只能各出现一次；可选钩子为 `on_quiesce`、`on_pause`、`on_resume`、`on_migrate_export`、`on_migrate_import` 和 `on_migrate_abort`。
-- `#[elm::entry]` 声明激活后的可选入口。
-- `#[elm::provider(...)]` 与 `#[elm::provider_snapshot(...)]` 声明原生 provider 调用门和快照调用门。
-- `#[elm::import(...)]` 作用于 `ManagedImport` 或显式不安全的 `UnsafeDirectImport` 静态槽；`ManagedImport::call_bytes`、`call_payload` 和 `call` 负责 call id、定长编码、传输状态和响应校验。
-- `#[elm::export(...)]` 生成受管 export trampoline；导出名称就是运行时查找的 ELF symbol，工具拒绝名称与符号不一致的元数据。
+- `#[elm::module]` 必须且只能标记一个 `impl ElmModule for T`。`create`、`initialize` 和 `finalize` 是必需 trait 方法；`quiesce`、`pause`、`resume`、迁移方法和 `entry` 是可覆盖的 trait 方法，不再使用独立 attribute。
+- provider、provider snapshot、export、设备回调和 mixin attribute 可以直接标记 `ElmModule` 实现中的 `&self` 方法；宏通过当前 generation 的 `ModuleSlot<T>` 调用唯一活动实例。
+- `#[elm::import(...)]` 作用于 `ManagedImport` 或 `DirectImport<F>` 静态槽；`ManagedImport` 负责固定帧、代际路由和回复校验，`DirectImport<F>` 只在 ABI 摘要完全匹配并固定目标 generation 后返回类型化函数指针。
+- `#[elm::kernel_symbol(...)]` 声明由内核直接符号目录解析的 `DirectImport<F>`。宏验证显式 ABI 字符串与函数指针类型一致；当前目录后端未实现，镜像不会被误绑定。
+- `#[elm::export(...)]` 在 `managed` 模式生成固定调用帧 trampoline，在 `direct-pinned` 模式导出真实 Rust 函数并写入规范签名摘要；工具拒绝名称、符号、模式或摘要不一致的元数据。
 - `#[elm::payload("contract@version")]` 为具名字段结构体生成固定小端线编码，只接受定宽整数、`bool` 和 `[u8; N]`，v1 总尺寸不得超过 256 字节。
 - `#[elm::mixin_point(..., stages(...))]` 把普通安全 Rust 函数包装为 ingress、substitute、egress、observe 补缀点；`#[elm::mixin(...)]` 生成对应 provider 和拓展声明，支持完整有符号优先级。
 - 宏在编译期拒绝手写 `extern`、`unsafe fn`、泛型 ABI 函数、非法契约、无效版本范围、重复 stage、超长补缀点和越界优先级；打包器再次执行独立的元数据与 EBI 校验。
@@ -1426,9 +1433,9 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
 `build` 的完整链路是：
 
 ```text
-Elm.toml + Rust attribute 源码
+Elm.toml + `ElmModule`/Rust attribute 源码
     -> rustc/rust-lld PIE（ET_DYN）
-    -> .elm.meta + PT_LOAD + .rela.dyn
+    -> 统一模块描述符 + .elm.meta + PT_LOAD + .rela.dyn
     -> elm-tools 严格解析
     -> R_RISCV_RELATIVE / R_LARCH_RELATIVE 投影为 EBI ImageBase64
     -> import slot 投影为 EBI ImportAbs64
@@ -1446,7 +1453,7 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
   pack-elf <project-directory> <image.elf> <out.eki>
 ```
 
-`pack-elf` 的身份、版本、来源、菜单和依赖只读取 `Elm.toml`，provider、import/export、payload、mixin 和生命周期只读取 `.elm.meta`；命令行不再接受手工重复声明这些信息的参数。签名与验签可以独立执行：
+`pack-elf` 的身份、版本、来源、菜单和依赖只读取 `Elm.toml`；统一模块描述符、provider、import/export、payload 和 mixin 从 ELF 符号与 `.elm.meta` 读取。命令行不再接受手工重复声明这些信息的参数。签名与验签可以独立执行：
 
 ```sh
 cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- \
@@ -1456,7 +1463,7 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
   verify signed.eki
 ```
 
-运行时通过 `/bin/elmctl load-eki <file>` 装载。仓库中的 `scripts/elm-qemu-smoke-init.sh` 可在测试构建时临时安装为 init，自动执行 trust、load、snapshot 和 health 检查；该脚本不进入正常 initramfs。当前同一签名 hello ELM 已在两种架构上验证：`on_initialize` 日志可见，单元进入 `Active`，`native_faults == 0`，签名者 key id 与 release epoch 正确，17 类 Core health 全部为 `OK`。
+运行时通过 `/bin/elmctl load-eki <file>` 装载。仓库中的 `scripts/elm-qemu-smoke-init.sh` 可在测试构建时临时安装为 init，自动执行 trust、load、snapshot 和 health 检查；该脚本不进入正常 initramfs。统一模块描述符会在执行 `initialize` 前完成固定头、实例布局、只读段位置和全部入口地址校验。
 
 elmapi 尚未发布，因此上述全部接口都是 v1；不存在 v2、兼容别名或旧式直接日志导入路径。未来正式发布后才允许在现有兼容版本集合上演进。
 

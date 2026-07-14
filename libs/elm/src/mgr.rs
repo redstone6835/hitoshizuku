@@ -335,6 +335,8 @@ pub const ELM_NATIVE_CAPABILITY_KIND_IMPORT: u32 = 2;
 pub const ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED: u32 = 1 << 0;
 /// `ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD: u32 = 1 << 1;
+/// 该能力记录描述由内核直接符号目录解析的 Rust 地址，不属于其他 ELM 的 export。
+pub const ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL: u32 = 1 << 2;
 /// `ELM_NATIVE_CAPABILITY_NAME_LEN` 能力位；协商成功前调用方不得假定对应功能可用。
 pub const ELM_NATIVE_CAPABILITY_NAME_LEN: usize = 128;
 /// `ELM_REPLACE_CELL_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。

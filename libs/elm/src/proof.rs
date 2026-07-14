@@ -828,6 +828,7 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
         hash.u32(import.min_version);
         hash.u32(import.max_version);
         hash.u32(import.flags);
+        hash.bytes(&import.rust_abi_hash);
     }
     hash.u64(unit.exports.len() as u64);
     for export in &unit.exports {
@@ -835,6 +836,7 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
         hash.string(export.contract.as_str());
         hash.u32(export.version);
         hash.u32(export.flags);
+        hash.bytes(&export.rust_abi_hash);
     }
 
     match &unit.lifecycle_hooks {

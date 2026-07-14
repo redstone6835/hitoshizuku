@@ -20,7 +20,7 @@
 //! # 功能开关
 //!
 //! - `module`：外部 ELM 的最小编译面，包含稳定 ABI 类型和安全开发包装；
-//! - `macros`：重导出生命周期、provider、import/export、payload 和 mixin attribute；
+//! - `macros`：重导出根模块、provider、import/export、payload 和 mixin attribute；
 //! - `management`：仅供受授权 Manager 类型 ELM 使用的 [`management::Client`]；
 //! - `runtime-model`：内核侧运行时模型，默认启用，不应成为普通外部 ELM 的依赖。
 //!
@@ -30,22 +30,29 @@
 //!
 //! # 最小 ELM
 //!
-//! 每个动态 ELM 必须提供一个初始化前钩子和一个卸载前钩子。业务函数使用安全 Rust ABI，
-//! attribute 自动生成 EBI trampoline 和 `.elm.meta`；模块作者不应手写 `extern "C"`。
+//! 每个 ELM 镜像必须注册一个 [`ElmModule`] 实现。根 attribute 生成唯一实例槽、统一描述符、
+//! ABI trampoline 和 `.elm.meta`；模块作者不应手写 `extern "C"`。
 //!
 //! ```no_run
-//! use elm::{HookError, HookResult, LifecycleContext};
+//! use elm::{ElmModule, HookError, HookResult, LifecycleContext};
 //!
-//! #[elm::on_initialize]
-//! fn initialize(_context: &LifecycleContext) -> HookResult {
-//!     elm::runtime::log(6, "demo.hello: initialized")
-//!         .map_err(|_| HookError::new(-1))
-//! }
+//! struct Demo;
 //!
-//! #[elm::on_finalize]
-//! fn finalize(_context: &LifecycleContext) -> HookResult {
-//!     elm::runtime::log(6, "demo.hello: finalized")
-//!         .map_err(|_| HookError::new(-1))
+//! #[elm::module]
+//! impl ElmModule for Demo {
+//!     fn create(_context: &LifecycleContext) -> Result<Self, HookError> {
+//!         Ok(Self)
+//!     }
+//!
+//!     fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {
+//!         elm::runtime::log(6, "demo.hello: initialized")
+//!             .map_err(|_| HookError::new(-1))
+//!     }
+//!
+//!     fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {
+//!         elm::runtime::log(6, "demo.hello: finalized")
+//!             .map_err(|_| HookError::new(-1))
+//!     }
 //! }
 //! ```
 //!
@@ -126,7 +133,6 @@ pub mod metadata;
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 mod mgr;
 pub(crate) mod module_wire;
-#[cfg(feature = "runtime-model")]
 pub mod native;
 #[cfg(feature = "runtime-model")]
 pub mod nexus;
@@ -154,9 +160,8 @@ compile_error!("elm crate 必须启用 runtime-model 或 module 编译面");
 #[cfg(feature = "macros")]
 pub use elm_macros::{
     device_discovery, device_driver, device_function, device_irq, device_match, device_probe,
-    device_remove, entry, export, import, kernel_api, mixin, mixin_point, on_finalize,
-    on_initialize, on_migrate_abort, on_migrate_export, on_migrate_import, on_pause, on_quiesce,
-    on_resume, payload, provider, provider_snapshot,
+    device_remove, export, import, kernel_api, kernel_symbol, mixin, mixin_point, module, payload,
+    provider, provider_snapshot,
 };
 
 pub use context::{
@@ -172,13 +177,16 @@ pub use ctl::{
     ELM_CTL_MAGIC, ElmCoreInfo, ElmCtlCommand, ElmCtlHeader, ElmCtlStatus,
 };
 pub use developer::{
-    DeviceIrqResult, ELM_API_ROOT_SLOT_SYMBOL, ELM_MIXIN_STAGE_EGRESS, ELM_MIXIN_STAGE_INGRESS,
-    ELM_MIXIN_STAGE_OBSERVE, ELM_MIXIN_STAGE_SUBSTITUTE, ELM_MIXIN_STAGES_ALL, ElmPayload,
+    DeviceIrqResult, DirectImport, ELM_API_ROOT_SLOT_SYMBOL, ELM_MIXIN_STAGE_EGRESS,
+    ELM_MIXIN_STAGE_INGRESS, ELM_MIXIN_STAGE_OBSERVE, ELM_MIXIN_STAGE_SUBSTITUTE,
+    ELM_MIXIN_STAGES_ALL, ELM_MODULE_DESCRIPTOR_ABI_VERSION, ELM_MODULE_DESCRIPTOR_FLAGS_MASK,
+    ELM_MODULE_DESCRIPTOR_MAGIC, ELM_MODULE_DESCRIPTOR_SYMBOL, ElmModule, ElmModuleDescriptorV1,
+    ElmModuleEntryV1, ElmModuleLifecycleEntryV1, ElmModuleMigrationEntryV1, ElmPayload,
     EntryContext, EntryResult, HookError, HookResult, LifecycleContext, ManagedImport,
     ManagedReply, ManagedRequest, ManagedResult, MigrationContext, MigrationExportResult,
-    MixinControl, MixinPointDescriptor, PayloadError, PointResult, ProviderReply, ProviderRequest,
-    ProviderResult, RuntimeApiError, SnapshotReply, SnapshotRequest, SnapshotResult,
-    UnsafeDirectImport, run_mixin_point,
+    MixinControl, MixinPointDescriptor, ModuleSlot, PayloadError, PointResult, ProviderReply,
+    ProviderRequest, ProviderResult, RuntimeApiError, SnapshotReply, SnapshotRequest,
+    SnapshotResult, run_mixin_point,
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use ebi_wire::{
@@ -203,22 +211,24 @@ pub use ebi::{
     ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_HOOK_ON_MIGRATE_ABORT, ELM_EBI_HOOK_ON_MIGRATE_EXPORT,
     ELM_EBI_HOOK_ON_MIGRATE_IMPORT, ELM_EBI_HOOK_ON_PAUSE, ELM_EBI_HOOK_ON_QUIESCE,
     ELM_EBI_HOOK_ON_RESUME, ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR, ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN,
-    ELM_EBI_IMPORT_FLAG_DIRECT_PINNED, ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EBI_IMPORT_FLAG_OPTIONAL,
+    ELM_EBI_IMPORT_FLAG_DIRECT_PINNED, ELM_EBI_IMPORT_FLAG_EXACT_RUST_API,
+    ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL, ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EBI_IMPORT_FLAG_OPTIONAL,
     ELM_EBI_IMPORT_FLAGS_MASK, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
     ELM_EBI_MAX_KERNEL_API_REQUIREMENTS, ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS,
     ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN,
-    ELM_EBI_RELOCATION_FLAG_NONE, ELM_EBI_RUST_ABI_VERSION, ELM_EBI_SEGMENT_FLAG_EXECUTE,
-    ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT, ELM_EBI_SEGMENT_FLAG_WRITE,
-    ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SEGMENT_SOURCE_NONE, ELM_EBI_SYMBOL_FLAG_NONE,
-    ELM_EBI_SYMBOL_LOCATION_FLAG_NONE, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_PROJECTION_SOURCE_ID,
-    ELM_MIGRATION_STATE_MAX, ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry,
-    ElmEbiExportDecl, ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
-    ElmEbiKernelApiRequirement, ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind,
-    ElmEbiLifecycleHooks, ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl,
-    ElmEbiRelocationKind, ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind,
-    ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit, ElmImageReader,
-    ElmSliceImageReader, default_segment_flags, relocation_width,
+    ELM_EBI_RELOCATION_FLAG_NONE, ELM_EBI_RUST_ABI_HASH_LEN, ELM_EBI_RUST_ABI_VERSION,
+    ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT,
+    ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SEGMENT_SOURCE_NONE,
+    ELM_EBI_SYMBOL_FLAG_NONE, ELM_EBI_SYMBOL_LOCATION_FLAG_NONE, ELM_EBI_SYMBOL_NAME_LEN,
+    ELM_EKI_PROJECTION_SOURCE_ID, ELM_MIGRATION_STATE_MAX, ElmEbiApiCompatibility, ElmEbiArch,
+    ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiKernelApiRequirement,
+    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiMenuDecl,
+    ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
+    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget,
+    ElmEbiUnit, ElmImageReader, ElmSliceImageReader, default_segment_flags,
+    kernel_symbol_interface_abi_hash, relocation_width,
 };
 #[cfg(feature = "runtime-model")]
 pub use eki::{
@@ -290,12 +300,13 @@ pub use metadata::{
     ELM_META_FIELD_MATCH_CALLBACK, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
     ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
     ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_PROBE_CALLBACK,
-    ELM_META_FIELD_REMOVE_CALLBACK, ELM_META_FIELD_RESOURCE, ELM_META_FIELD_STAGE,
-    ELM_META_FIELD_STAGES, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION,
-    ELM_META_FIELD_WIRE_SIZE, ELM_RUST_METADATA_ALIGNMENT, ELM_RUST_METADATA_FIELD_HEADER_SIZE,
-    ELM_RUST_METADATA_HEADER_SIZE, ELM_RUST_METADATA_MAGIC, ELM_RUST_METADATA_MAX_RECORD_SIZE,
-    ELM_RUST_METADATA_VERSION, ElmRustMetadataError, ElmRustMetadataField, ElmRustMetadataKind,
-    ElmRustMetadataRecord, ElmRustMetadataValueKind, crc32, parse_rust_metadata_section,
+    ELM_META_FIELD_REMOVE_CALLBACK, ELM_META_FIELD_RESOURCE, ELM_META_FIELD_RUST_ABI,
+    ELM_META_FIELD_STAGE, ELM_META_FIELD_STAGES, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET,
+    ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE, ELM_RUST_METADATA_ALIGNMENT,
+    ELM_RUST_METADATA_FIELD_HEADER_SIZE, ELM_RUST_METADATA_HEADER_SIZE, ELM_RUST_METADATA_MAGIC,
+    ELM_RUST_METADATA_MAX_RECORD_SIZE, ELM_RUST_METADATA_VERSION, ElmRustMetadataError,
+    ElmRustMetadataField, ElmRustMetadataKind, ElmRustMetadataRecord, ElmRustMetadataValueKind,
+    crc32, parse_rust_metadata_section,
 };
 #[cfg(any(feature = "runtime-model", feature = "management"))]
 pub use mgr::api::{
@@ -381,24 +392,24 @@ pub use mgr::{
     ELM_MGR_STATUS_NO_MEMORY, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
     ELM_MGR_STATUS_PERMISSION, ELM_MGR_STATUS_TODO, ELM_MGR_STATUS_UNSUPPORTED,
     ELM_MIXIN_REPLY_CONTINUE, ELM_MIXIN_REPLY_DENY, ELM_MIXIN_REPLY_FLAGS_MASK,
-    ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
-    ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD, ELM_NATIVE_CAPABILITY_KIND_EXPORT,
-    ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_CAPABILITY_NAME_LEN, ELM_NATIVE_POLICY_ALL,
-    ELM_NATIVE_POLICY_EXECUTE, ELM_NATIVE_POLICY_EXPORT, ELM_NATIVE_POLICY_IMPORT,
-    ELM_NATIVE_POLICY_MIXIN_PATCH, ELM_NATIVE_POLICY_REPLACE, ELM_NEXUS_CONTRACT_LEN,
-    ELM_POLICY_BLOCK_ABI_FINGERPRINT, ELM_POLICY_BLOCK_BINDING_NOT_FOUND,
-    ELM_POLICY_BLOCK_BINDING_PROTECTED, ELM_POLICY_BLOCK_BUILTIN_PROTECTED,
-    ELM_POLICY_BLOCK_CALLER_NOT_FOUND, ELM_POLICY_BLOCK_CALLER_STALE,
-    ELM_POLICY_BLOCK_CAPABILITY_DENIED, ELM_POLICY_BLOCK_CELL_NOT_FOUND,
-    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
-    ELM_POLICY_BLOCK_EXTENSION_DUPLICATE, ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND,
-    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT, ELM_POLICY_BLOCK_HAS_CHILDREN,
-    ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
-    ELM_POLICY_BLOCK_INVALID_STATE, ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE,
-    ELM_POLICY_BLOCK_LEASE_BUSY, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED,
-    ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE, ELM_POLICY_BLOCK_NATIVE_TODO,
-    ELM_POLICY_BLOCK_POLICY_ESCALATION, ELM_POLICY_BLOCK_PORT_NOT_FOUND,
-    ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
+    ELM_MIXIN_REPLY_REPLACE, ELM_MIXIN_REPLY_STOP, ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL,
+    ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD,
+    ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT,
+    ELM_NATIVE_CAPABILITY_NAME_LEN, ELM_NATIVE_POLICY_ALL, ELM_NATIVE_POLICY_EXECUTE,
+    ELM_NATIVE_POLICY_EXPORT, ELM_NATIVE_POLICY_IMPORT, ELM_NATIVE_POLICY_MIXIN_PATCH,
+    ELM_NATIVE_POLICY_REPLACE, ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_ABI_FINGERPRINT,
+    ELM_POLICY_BLOCK_BINDING_NOT_FOUND, ELM_POLICY_BLOCK_BINDING_PROTECTED,
+    ELM_POLICY_BLOCK_BUILTIN_PROTECTED, ELM_POLICY_BLOCK_CALLER_NOT_FOUND,
+    ELM_POLICY_BLOCK_CALLER_STALE, ELM_POLICY_BLOCK_CAPABILITY_DENIED,
+    ELM_POLICY_BLOCK_CELL_NOT_FOUND, ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
+    ELM_POLICY_BLOCK_DUPLICATE_BINDING, ELM_POLICY_BLOCK_EXTENSION_DUPLICATE,
+    ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND, ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+    ELM_POLICY_BLOCK_HAS_CHILDREN, ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+    ELM_POLICY_BLOCK_HAS_EXTENSIONS, ELM_POLICY_BLOCK_INVALID_STATE,
+    ELM_POLICY_BLOCK_JOURNAL_UNAVAILABLE, ELM_POLICY_BLOCK_LEASE_BUSY,
+    ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
+    ELM_POLICY_BLOCK_NATIVE_TODO, ELM_POLICY_BLOCK_POLICY_ESCALATION,
+    ELM_POLICY_BLOCK_PORT_NOT_FOUND, ELM_POLICY_BLOCK_PORT_TODO, ELM_POLICY_BLOCK_PROVIDER_BUSY,
     ELM_POLICY_BLOCK_PROVIDER_CALL_CANCELED, ELM_POLICY_BLOCK_PROVIDER_CALL_EXPIRED,
     ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED, ELM_POLICY_BLOCK_PROVIDER_NOT_FOUND,
     ELM_POLICY_BLOCK_PROVIDER_QUEUE_FULL, ELM_POLICY_BLOCK_RESOURCE_QUOTA,

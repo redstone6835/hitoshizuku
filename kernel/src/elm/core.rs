@@ -120,23 +120,24 @@ use elm_model::{
     ELM_MGR_API_FLAG_SYSCALL, ELM_MGR_API_FLAG_SYSFS, ELM_MGR_API_KIND_CONTROL,
     ELM_MGR_API_KIND_EVENT, ELM_MGR_API_KIND_PROVIDER, ELM_MGR_API_KIND_SNAPSHOT,
     ELM_MGR_EVENT_READ_ABSOLUTE_MAX_RECORDS, ELM_MGR_EVENT_READ_DEFAULT_MAX_RECORDS,
-    ELM_MGR_EVENT_READ_FLAG_ADVANCE, ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED,
-    ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD, ELM_NATIVE_CAPABILITY_KIND_EXPORT,
-    ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_POLICY_ALL, ELM_NATIVE_POLICY_EXECUTE,
-    ELM_NATIVE_POLICY_EXPORT, ELM_NATIVE_POLICY_IMPORT, ELM_NATIVE_POLICY_MIXIN_PATCH,
-    ELM_NATIVE_POLICY_REPLACE, ELM_POLICY_BLOCK_CAPABILITY_DENIED, ELM_PROVIDER_POLICY_ALL,
-    ELM_PROVIDER_POLICY_ASYNC, ELM_PROVIDER_POLICY_INVOKE, ELM_PROVIDER_POLICY_REGISTER,
-    ELM_PROVIDER_POLICY_SNAPSHOT, ELM_PROVIDER_POLICY_UNREGISTER, ELM_RESOURCE_POLICY_ALL,
-    ELM_RESOURCE_POLICY_OWN, ELM_RESOURCE_POLICY_QUERY, ELM_RESOURCE_POLICY_UPDATE,
-    ELM_RUNTIME_LOG_EXPORT_CONTRACT, ELM_RUNTIME_LOG_EXPORT_NAME, ELM_RUNTIME_LOG_EXPORT_VERSION,
-    ELM_RUNTIME_TRACE_KIND_JOURNAL, ELM_RUNTIME_TRACE_KIND_LIFECYCLE,
-    ELM_RUNTIME_TRACE_KIND_MIXIN_DISPATCH, ELM_RUNTIME_TRACE_KIND_POLICY,
-    ELM_RUNTIME_TRACE_KIND_PROVIDER_CALL, ELM_RUNTIME_TRACE_KIND_REPLACE,
-    ELM_RUNTIME_TRACE_KIND_RESOURCE, ELM_RUST_ABI_TARGET_FEATURE_FLOAT,
-    ELM_RUST_ABI_TARGET_FEATURE_SIMD, ELM_RUST_ABI_TARGET_FEATURE_VECTOR,
-    ELM_TODO_REGISTRY_FLAG_TRUNCATED, ELM_TRUST_FLAG_ALLOW_UNSIGNED, ELM_TRUST_FLAG_SEALED,
-    ELM_TRUST_FLAG_UNSIGNED_ACTIVE, ElmCellPolicyRequest, ElmCellPolicyV1, ElmKernelProviderRevoke,
-    ElmKernelProviderSpec, ElmPanicStrategy, current_cell, current_context, sha256,
+    ELM_MGR_EVENT_READ_FLAG_ADVANCE, ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL,
+    ELM_NATIVE_CAPABILITY_FLAG_TRUNCATED, ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD,
+    ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_POLICY_ALL,
+    ELM_NATIVE_POLICY_EXECUTE, ELM_NATIVE_POLICY_EXPORT, ELM_NATIVE_POLICY_IMPORT,
+    ELM_NATIVE_POLICY_MIXIN_PATCH, ELM_NATIVE_POLICY_REPLACE, ELM_POLICY_BLOCK_CAPABILITY_DENIED,
+    ELM_PROVIDER_POLICY_ALL, ELM_PROVIDER_POLICY_ASYNC, ELM_PROVIDER_POLICY_INVOKE,
+    ELM_PROVIDER_POLICY_REGISTER, ELM_PROVIDER_POLICY_SNAPSHOT, ELM_PROVIDER_POLICY_UNREGISTER,
+    ELM_RESOURCE_POLICY_ALL, ELM_RESOURCE_POLICY_OWN, ELM_RESOURCE_POLICY_QUERY,
+    ELM_RESOURCE_POLICY_UPDATE, ELM_RUNTIME_LOG_EXPORT_CONTRACT, ELM_RUNTIME_LOG_EXPORT_NAME,
+    ELM_RUNTIME_LOG_EXPORT_VERSION, ELM_RUNTIME_TRACE_KIND_JOURNAL,
+    ELM_RUNTIME_TRACE_KIND_LIFECYCLE, ELM_RUNTIME_TRACE_KIND_MIXIN_DISPATCH,
+    ELM_RUNTIME_TRACE_KIND_POLICY, ELM_RUNTIME_TRACE_KIND_PROVIDER_CALL,
+    ELM_RUNTIME_TRACE_KIND_REPLACE, ELM_RUNTIME_TRACE_KIND_RESOURCE,
+    ELM_RUST_ABI_TARGET_FEATURE_FLOAT, ELM_RUST_ABI_TARGET_FEATURE_SIMD,
+    ELM_RUST_ABI_TARGET_FEATURE_VECTOR, ELM_TODO_REGISTRY_FLAG_TRUNCATED,
+    ELM_TRUST_FLAG_ALLOW_UNSIGNED, ELM_TRUST_FLAG_SEALED, ELM_TRUST_FLAG_UNSIGNED_ACTIVE,
+    ElmCellPolicyRequest, ElmCellPolicyV1, ElmKernelProviderRevoke, ElmKernelProviderSpec,
+    ElmPanicStrategy, current_cell, current_context, sha256,
 };
 use sched::sync::Spinlock;
 
@@ -514,6 +515,7 @@ struct NativeExportRuntime {
     contract: FlowContract,
     version: u32,
     flags: u32,
+    rust_abi_hash: [u8; 32],
     address: usize,
     bounds: Option<NativeExecutionBounds>,
 }
@@ -531,6 +533,20 @@ struct NativeImportRuntime {
     max_version: u32,
     selected_version: u32,
     flags: u32,
+    rust_abi_hash: [u8; 32],
+    address: usize,
+}
+
+#[derive(Debug, Clone)]
+struct KernelSymbolImportRuntime {
+    owner: ElmId,
+    owner_generation: Generation,
+    name: String,
+    contract: FlowContract,
+    min_version: u32,
+    max_version: u32,
+    selected_version: u32,
+    rust_abi_hash: [u8; 32],
     address: usize,
 }
 
@@ -912,6 +928,7 @@ struct NativeLoadExecutionPlan {
     topology: ResolvedEbiTopology,
     loaded: LoadedElmImage,
     exports: Vec<NativeExportRuntime>,
+    kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
     import_stage: NativeImportStageKey,
     initialize: ElmContext,
     trust: PreparedImageTrust,
@@ -947,6 +964,7 @@ struct NativeReplaceExecutionPlan {
     unit: ElmEbiUnit,
     loaded: LoadedElmImage,
     exports: Vec<NativeExportRuntime>,
+    kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
     import_stage: NativeImportStageKey,
     old_executor: NativeHookExecutor,
     new_executor: NativeHookExecutor,
@@ -1178,6 +1196,7 @@ pub(crate) struct ElmCore {
     retired_native_images: Vec<RetiredNativeImage>,
     native_exports: Vec<NativeExportRuntime>,
     native_imports: Vec<NativeImportRuntime>,
+    kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
     staged_native_imports: Vec<StagedNativeImports>,
     ports: Vec<PortRuntime>,
     providers: Vec<ProviderRuntime>,
@@ -1244,6 +1263,7 @@ impl ElmCore {
             retired_native_images: Vec::new(),
             native_exports: Vec::new(),
             native_imports: Vec::new(),
+            kernel_symbol_imports: Vec::new(),
             staged_native_imports: Vec::new(),
             ports: Vec::new(),
             providers: Vec::new(),
@@ -2698,7 +2718,8 @@ impl ElmCore {
         let total_records = self
             .native_exports
             .len()
-            .saturating_add(self.native_imports.len());
+            .saturating_add(self.native_imports.len())
+            .saturating_add(self.kernel_symbol_imports.len());
         let header_size = core::mem::size_of::<ElmNativeCapabilityHeader>();
         let record_size = core::mem::size_of::<ElmNativeCapabilityRecord>();
         let max_records = ELM_MGR_MAX_PAYLOAD
@@ -2751,6 +2772,28 @@ impl ElmCore {
                 ELM_MGR_STATUS_OK,
                 import.owner.0,
                 import.provider.0,
+                import.min_version,
+                import.selected_version,
+                flags,
+                &import.name,
+                import.contract.as_str(),
+            );
+            push_plain(&mut out, &record);
+            emitted += 1;
+        }
+        for import in &self.kernel_symbol_imports {
+            if emitted >= emitted_records {
+                break;
+            }
+            let mut flags = ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL;
+            if import.min_version != import.max_version {
+                flags |= ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD;
+            }
+            let record = ElmNativeCapabilityRecord::new(
+                ELM_NATIVE_CAPABILITY_KIND_IMPORT,
+                ELM_MGR_STATUS_OK,
+                import.owner.0,
+                0,
                 import.min_version,
                 import.selected_version,
                 flags,
@@ -6261,9 +6304,9 @@ impl ElmCore {
                 ElmEbiLoadStatus::RuntimeRejected,
             ));
         };
-        let (imports, resolved_native_imports) =
+        let (imports, resolved_native_imports, kernel_symbol_imports) =
             match self.resolve_native_imports(id, parent, Generation::FIRST, &image.unit) {
-                Ok((imports, dependencies, resolved_imports)) => {
+                Ok((imports, dependencies, resolved_imports, kernel_symbol_imports)) => {
                     if topology
                         .dependencies
                         .try_reserve(dependencies.len())
@@ -6280,7 +6323,7 @@ impl ElmCore {
                             topology.dependencies.push(dependency);
                         }
                     }
-                    (imports, resolved_imports)
+                    (imports, resolved_imports, kernel_symbol_imports)
                 }
                 Err(status) => {
                     return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(status));
@@ -6443,6 +6486,10 @@ impl ElmCore {
             }
         };
         if self.native_exports.try_reserve(exports.len()).is_err()
+            || self
+                .kernel_symbol_imports
+                .try_reserve(kernel_symbol_imports.len())
+                .is_err()
             || self.native_images.try_reserve(1).is_err()
         {
             self.quarantine_cell_after_hook_failure(id);
@@ -6553,6 +6600,7 @@ impl ElmCore {
             topology,
             loaded,
             exports,
+            kernel_symbol_imports,
             import_stage,
             initialize,
             trust,
@@ -6655,6 +6703,8 @@ impl ElmCore {
             ));
         }
         self.native_exports.extend(plan.exports);
+        self.kernel_symbol_imports
+            .extend(plan.kernel_symbol_imports);
         if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == plan.id) {
             cell.ebi_status = ElmEbiLoadStatus::Ok;
             cell.lifecycle_executor_ready = true;
@@ -6856,9 +6906,9 @@ impl ElmCore {
             ));
         };
         let replace_parent = old_cell.parent.unwrap_or(ELM_MGR_ID);
-        let (imports, resolved_native_imports) =
+        let (imports, resolved_native_imports, kernel_symbol_imports) =
             match self.resolve_native_imports(id, replace_parent, new_generation, &image.unit) {
-                Ok((imports, dependencies, resolved_imports)) => {
+                Ok((imports, dependencies, resolved_imports, kernel_symbol_imports)) => {
                     if dependencies.iter().any(|(provider, _)| *provider == id)
                         || resolved_imports.iter().any(|import| import.provider == id)
                     {
@@ -6894,7 +6944,7 @@ impl ElmCore {
                             topology.dependencies.push(dependency);
                         }
                     }
-                    (imports, resolved_imports)
+                    (imports, resolved_imports, kernel_symbol_imports)
                 }
                 Err(_) => {
                     return PreparedNativeReplace::Immediate(self.replace_response(
@@ -7003,6 +7053,10 @@ impl ElmCore {
             ));
         }
         if self.native_exports.try_reserve(exports.len()).is_err()
+            || self
+                .kernel_symbol_imports
+                .try_reserve(kernel_symbol_imports.len())
+                .is_err()
             || self.retired_native_images.try_reserve(1).is_err()
         {
             return PreparedNativeReplace::Immediate(self.replace_response(
@@ -7223,6 +7277,7 @@ impl ElmCore {
             unit: image.unit,
             loaded,
             exports,
+            kernel_symbol_imports,
             import_stage,
             old_executor: self.native_images[old_image_index].lifecycle_executor(),
             new_executor,
@@ -7316,6 +7371,7 @@ impl ElmCore {
                         &plan.unit,
                         &plan.loaded,
                         plan.exports,
+                        plan.kernel_symbol_imports,
                         plan.import_stage,
                     )
                 },
@@ -8882,6 +8938,7 @@ impl ElmCore {
         let _removed_event_subscriptions = self.mgr_runtime.remove_event_subscriptions_owned_by(id);
         self.remove_native_exports_owned_by(id);
         self.remove_native_imports_owned_by(id);
+        self.remove_kernel_symbol_imports_owned_by(id);
         self.discard_pending_ebi_load(id);
 
         if self.graph.remove_cell(id).is_err() {
@@ -9593,6 +9650,8 @@ impl ElmCore {
                     && export.name == import.name
                     && export.contract == import.contract
                     && export.version == import.selected_version
+                    && (native_import_is_managed(import.flags)
+                        || export.rust_abi_hash == import.rust_abi_hash)
                     && export.address == import.address
                     && export.generation == import.provider_generation
             });
@@ -9601,6 +9660,40 @@ impl ElmCore {
                     ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
                     import.owner.0,
                     ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            }
+        }
+        for (index, import) in self.kernel_symbol_imports.iter().enumerate() {
+            let owner_current = self
+                .cells
+                .iter()
+                .find(|cell| cell.id == import.owner)
+                .is_some_and(|cell| cell.generation == import.owner_generation);
+            let duplicate = self.kernel_symbol_imports[..index].iter().any(|previous| {
+                previous.owner == import.owner
+                    && previous.owner_generation == import.owner_generation
+                    && previous.name == import.name
+                    && previous.contract == import.contract
+                    && previous.selected_version == import.selected_version
+            });
+            if !owner_current {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
+                    import.owner.0,
+                    ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
+                ));
+            } else {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
+                    import.owner.0,
+                    ELM_HEALTH_DETAIL_STATE_INVALID,
+                ));
+            }
+            if duplicate {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
+                    import.owner.0,
+                    ELM_HEALTH_DETAIL_DUPLICATE_OBJECT,
                 ));
             }
         }
@@ -10085,7 +10178,9 @@ impl ElmCore {
             self.runtime_ports.len(),
             self.menu_items.len(),
             self.native_exports.len(),
-            self.native_imports.len(),
+            self.native_imports
+                .len()
+                .saturating_add(self.kernel_symbol_imports.len()),
             projection_sources.len(),
             self.active_provider_executions.len(),
             self.trust_store.anchors().len(),
@@ -10227,6 +10322,22 @@ impl ElmCore {
                 .as_str(),
             );
         }
+        for import in &self.kernel_symbol_imports {
+            out.push_str(
+                format!(
+                    "kernel_symbol_import owner={} generation={} name={} contract={} version_range={}..={} selected_version={} address=0x{:x}\n",
+                    import.owner.0,
+                    import.owner_generation.0,
+                    import.name,
+                    import.contract.as_str(),
+                    import.min_version,
+                    import.max_version,
+                    import.selected_version,
+                    import.address,
+                )
+                .as_str(),
+            );
+        }
         out.push_str("[projection_sources]\n");
         for source in &projection_sources {
             out.push_str(
@@ -10340,7 +10451,9 @@ impl ElmCore {
             self.menu_items.len(),
             self.mgr_runtime.api_registry.len(),
             self.native_exports.len(),
-            self.native_imports.len(),
+            self.native_imports
+                .len()
+                .saturating_add(self.kernel_symbol_imports.len()),
             self.last_event_sequence(),
             health_status,
             health_records.len(),
@@ -10776,7 +10889,9 @@ impl ElmCore {
         let mut out = format!(
             "exports={}\nimports={}\nevent_sequence={}\n",
             self.native_exports.len(),
-            self.native_imports.len(),
+            self.native_imports
+                .len()
+                .saturating_add(self.kernel_symbol_imports.len()),
             self.last_event_sequence(),
         );
         for export in &self.native_exports {
@@ -10798,6 +10913,22 @@ impl ElmCore {
                     "import owner={} provider={} name={} contract={} version_range={}..={} selected_version={} address=0x{:x}\n",
                     import.owner.0,
                     import.provider.0,
+                    import.name,
+                    import.contract.as_str(),
+                    import.min_version,
+                    import.max_version,
+                    import.selected_version,
+                    import.address,
+                )
+                .as_str(),
+            );
+        }
+        for import in &self.kernel_symbol_imports {
+            out.push_str(
+                format!(
+                    "kernel_symbol_import owner={} generation={} name={} contract={} version_range={}..={} selected_version={} address=0x{:x}\n",
+                    import.owner.0,
+                    import.owner_generation.0,
                     import.name,
                     import.contract.as_str(),
                     import.min_version,
@@ -11357,6 +11488,7 @@ impl ElmCore {
             contract: FlowContract::new(ELM_API_ROOT_IMPORT_CONTRACT)?,
             version: u32::from(ELM_API_CURRENT_VERSION),
             flags: 0,
+            rust_abi_hash: [0; 32],
             address: &ELM_API_ROOT_V1 as *const ElmApiRootV1 as usize,
             bounds: None,
         });
@@ -11367,6 +11499,7 @@ impl ElmCore {
             contract: FlowContract::new(ELM_RUNTIME_LOG_EXPORT_CONTRACT)?,
             version: ELM_RUNTIME_LOG_EXPORT_VERSION,
             flags: 0,
+            rust_abi_hash: [0; 32],
             address: elm_runtime_log_v1 as usize,
             bounds: None,
         });
@@ -11990,6 +12123,7 @@ impl ElmCore {
                             && export.contract == requested.contract
                             && export.version == requested.version
                             && export.flags == requested.flags
+                            && export.rust_abi_hash == requested.rust_abi_hash
                     })
             })
         {
@@ -12007,6 +12141,7 @@ impl ElmCore {
                             && export.contract == import.contract
                             && export.version == import.selected_version
                             && !native_export_is_managed(export.flags)
+                            && export.rust_abi_hash == import.rust_abi_hash
                     });
                 }
                 let Some(highest) = unit
@@ -12066,6 +12201,7 @@ impl ElmCore {
             Vec<usize>,
             Vec<(ElmId, FlowContract)>,
             Vec<NativeImportRuntime>,
+            Vec<KernelSymbolImportRuntime>,
         ),
         ElmEbiLoadStatus,
     > {
@@ -12073,6 +12209,7 @@ impl ElmCore {
         let mut values = Vec::new();
         let mut dependencies = Vec::new();
         let mut imports = Vec::new();
+        let mut kernel_symbol_imports = Vec::new();
         values
             .try_reserve_exact(unit.imports.len())
             .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
@@ -12082,6 +12219,9 @@ impl ElmCore {
         imports
             .try_reserve_exact(unit.imports.len())
             .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
+        kernel_symbol_imports
+            .try_reserve_exact(unit.imports.len())
+            .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
         for (import_index, import) in unit.imports.iter().enumerate() {
             let elmapi_root = unit
                 .api_compatibility
@@ -12089,6 +12229,20 @@ impl ElmCore {
                 .is_some_and(|compatibility| {
                     compatibility.root_import_index == import_index as u32
                 });
+            if import.is_kernel_symbol() {
+                if elmapi_root {
+                    return Err(ElmEbiLoadStatus::InvalidTarget);
+                }
+                log::error!(
+                    "[elm] kernel symbol backend is not installed: name={} contract={} versions={}..={} optional={}",
+                    import.name,
+                    import.contract.as_str(),
+                    import.min_version,
+                    import.max_version,
+                    import.is_optional()
+                );
+                return Err(ElmEbiLoadStatus::NativeCodeTodo);
+            }
             let required_version = if elmapi_root {
                 Some(u32::from(
                     selected_elmapi.ok_or(ElmEbiLoadStatus::UnsupportedAbi)?,
@@ -12106,6 +12260,8 @@ impl ElmCore {
                     && required_version.is_none_or(|version| export.version == version)
                     && native_import_is_managed(import.flags)
                         == native_export_is_managed(export.flags)
+                    && (native_import_is_managed(import.flags)
+                        || import.rust_abi_hash == export.rust_abi_hash)
                     && self.native_export_visible_to_import(parent, unit, import, export)
             }) {
                 match selected_export {
@@ -12150,10 +12306,6 @@ impl ElmCore {
             if managed && export.bounds.is_none() {
                 return Err(ElmEbiLoadStatus::RuntimeRejected);
             }
-            if !managed && export.owner != ELM_MGR_ID {
-                // 动态 ELM 之间不得建立裸 Rust 地址依赖；直接固定只保留给内建根表。
-                return Err(ElmEbiLoadStatus::RuntimeRejected);
-            }
             let handle = if managed {
                 take_monotonic_id(&mut self.next_managed_import_handle)
                     .ok_or(ElmEbiLoadStatus::RuntimeRejected)?
@@ -12183,10 +12335,11 @@ impl ElmCore {
                 max_version: import.max_version,
                 selected_version: export.version,
                 flags: import.flags,
+                rust_abi_hash: import.rust_abi_hash,
                 address: export.address,
             });
         }
-        Ok((values, dependencies, imports))
+        Ok((values, dependencies, imports, kernel_symbol_imports))
     }
 
     fn native_export_visible_to_import(
@@ -12297,9 +12450,6 @@ impl ElmCore {
             .try_reserve_exact(image.unit.exports.len())
             .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
         for export in &image.unit.exports {
-            if !native_export_is_managed(export.flags) {
-                return Err(ElmEbiLoadStatus::RuntimeRejected);
-            }
             exports.push(NativeExportRuntime {
                 owner,
                 generation,
@@ -12307,6 +12457,7 @@ impl ElmCore {
                 contract: export.contract.clone(),
                 version: export.version,
                 flags: export.flags,
+                rust_abi_hash: export.rust_abi_hash,
                 address: loaded.export_address(&export.name)?,
                 bounds: Some(bounds),
             });
@@ -13756,6 +13907,23 @@ impl ElmCore {
         before.saturating_sub(self.native_imports.len())
     }
 
+    fn remove_kernel_symbol_imports_owned_by(&mut self, owner: ElmId) -> usize {
+        let before = self.kernel_symbol_imports.len();
+        self.kernel_symbol_imports
+            .retain(|import| import.owner != owner);
+        before.saturating_sub(self.kernel_symbol_imports.len())
+    }
+
+    fn replace_kernel_symbol_imports_owned_by(
+        &mut self,
+        owner: ElmId,
+        imports: Vec<KernelSymbolImportRuntime>,
+    ) {
+        debug_assert!(imports.iter().all(|import| import.owner == owner));
+        self.remove_kernel_symbol_imports_owned_by(owner);
+        self.kernel_symbol_imports.extend(imports);
+    }
+
     fn rebind_native_importers_for_replace(
         &mut self,
         owner: ElmId,
@@ -13886,6 +14054,7 @@ impl ElmCore {
         self.mgr_runtime.remove_event_subscriptions_owned_by(id);
         self.remove_native_exports_owned_by(id);
         self.remove_native_imports_owned_by(id);
+        self.remove_kernel_symbol_imports_owned_by(id);
         self.discard_pending_ebi_load(id);
         if let Err(err) = self.graph.remove_cell_relations(id) {
             log::error!("[elm] 激活回滚无法删除拓扑关系 cell={}: {:?}", id.0, err);
@@ -13954,6 +14123,7 @@ impl ElmCore {
         unit: &ElmEbiUnit,
         loaded: &LoadedElmImage,
         exports: Vec<NativeExportRuntime>,
+        kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
         import_stage: NativeImportStageKey,
     ) -> bool {
         if !self.replace_commit_capacity_available(id, unit) {
@@ -13983,6 +14153,7 @@ impl ElmCore {
             let _ = super::owned_resource::replace_owner_generation(id, generation, old_generation);
             return false;
         }
+        self.replace_kernel_symbol_imports_owned_by(id, kernel_symbol_imports);
         self.replace_dynamic_provider_backends(id, generation, unit, loaded);
         self.replace_menu_metadata(id, unit);
         self.rewrite_owned_generation(id, generation);
@@ -15573,6 +15744,7 @@ impl ElmCore {
             max_version: 3,
             selected_version: 1,
             flags: ELM_EBI_IMPORT_FLAG_MANAGED,
+            rust_abi_hash: [0; 32],
             address: 0x1000,
         };
         let export = |version, address| NativeExportRuntime {
@@ -15582,6 +15754,7 @@ impl ElmCore {
             contract: contract.clone(),
             version,
             flags: ELM_EBI_EXPORT_FLAG_MANAGED,
+            rust_abi_hash: [0; 32],
             address,
             bounds: None,
         };
@@ -15604,6 +15777,125 @@ impl ElmCore {
     }
 
     #[cfg(feature = "kernel-tests")]
+    pub(crate) fn test_native_direct_pinned_resolution() -> bool {
+        let mut core = Self::new();
+        if core.init_builtin_mgr().is_err() {
+            return false;
+        }
+        let contract = match FlowContract::new("test.direct-call@1") {
+            Ok(contract) => contract,
+            Err(_) => return false,
+        };
+        let rust_abi_hash = sha256(b"fn(u64)->u64");
+        core.native_exports.push(NativeExportRuntime {
+            owner: ELM_EKI_ID,
+            generation: Generation::FIRST,
+            name: "test.direct-call".to_string(),
+            contract: contract.clone(),
+            version: 1,
+            flags: elm_model::ELM_EBI_EXPORT_FLAG_DIRECT_PINNED
+                | elm_model::ELM_EBI_EXPORT_FLAG_DEPENDENCY,
+            rust_abi_hash,
+            address: 0x4100,
+            bounds: Some(NativeExecutionBounds {
+                code_start: 0x4000,
+                code_end: 0x5000,
+                image_start: 0x4000,
+                image_end: 0x6000,
+            }),
+        });
+        let manifest = match (
+            ElmName::new("test-direct-consumer"),
+            ElmVersion::new("0.1.0"),
+        ) {
+            (Ok(name), Ok(version)) => ElmManifest::new(name, version, ElmKind::Service),
+            _ => return false,
+        };
+        let import = match elm_model::ElmEbiImportDecl::new(
+            "test.direct-call",
+            contract.as_str(),
+            1,
+            elm_model::ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+            rust_abi_hash,
+        ) {
+            Ok(import) => import,
+            Err(_) => return false,
+        };
+        let dependency = match elm_model::ElmEbiDependencyDecl::new("eki", contract.as_str()) {
+            Ok(dependency) => dependency,
+            Err(_) => return false,
+        };
+        let unit = ElmEbiUnit::new(manifest.clone(), ElmEbiTarget::new(ElmEbiArch::Any))
+            .with_dependency(dependency.clone())
+            .with_import(import);
+        let owner = ElmId(100);
+        let Ok((values, dependencies, imports, kernel_symbols)) =
+            core.resolve_native_imports(owner, ELM_MGR_ID, Generation::FIRST, &unit)
+        else {
+            return false;
+        };
+        let resolved = values == [0x4100]
+            && dependencies == [(ELM_EKI_ID, contract.clone())]
+            && kernel_symbols.is_empty()
+            && imports.len() == 1
+            && imports[0].provider == ELM_EKI_ID
+            && imports[0].rust_abi_hash == rust_abi_hash
+            && imports[0].address == 0x4100;
+
+        let mismatched_import = match elm_model::ElmEbiImportDecl::new(
+            "test.direct-call",
+            contract.as_str(),
+            1,
+            elm_model::ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+            sha256(b"fn(u32)->u32"),
+        ) {
+            Ok(import) => import,
+            Err(_) => return false,
+        };
+        let mismatched = ElmEbiUnit::new(manifest, ElmEbiTarget::new(ElmEbiArch::Any))
+            .with_dependency(dependency)
+            .with_import(mismatched_import);
+        let mismatch_rejected = matches!(
+            core.resolve_native_imports(owner, ELM_MGR_ID, Generation::FIRST, &mismatched),
+            Err(ElmEbiLoadStatus::RuntimeRejected)
+        );
+
+        resolved && mismatch_rejected
+    }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn test_kernel_symbol_backend_is_explicit_todo() -> bool {
+        let mut core = Self::new();
+        if core.init_builtin_mgr().is_err() {
+            return false;
+        }
+        let manifest = match (
+            ElmName::new("test-kernel-symbol-consumer"),
+            ElmVersion::new("0.1.0"),
+        ) {
+            (Ok(name), Ok(version)) => ElmManifest::new(name, version, ElmKind::Service),
+            _ => return false,
+        };
+        let import = match elm_model::ElmEbiImportDecl::new(
+            "kernel.test.optional",
+            "kernel.test.optional@1",
+            1,
+            elm_model::ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL | elm_model::ELM_EBI_IMPORT_FLAG_OPTIONAL,
+            sha256(b"fn()->u64"),
+        ) {
+            Ok(import) => import,
+            Err(_) => return false,
+        };
+        let unit =
+            ElmEbiUnit::new(manifest, ElmEbiTarget::new(ElmEbiArch::Any)).with_import(import);
+
+        matches!(
+            core.resolve_native_imports(ElmId(100), ELM_MGR_ID, Generation::FIRST, &unit,),
+            Err(ElmEbiLoadStatus::NativeCodeTodo)
+        )
+    }
+
+    #[cfg(feature = "kernel-tests")]
     pub(crate) fn test_native_import_staging_transaction() -> bool {
         let mut core = Self::new();
         if core.init_builtin_mgr().is_err() {
@@ -15622,6 +15914,7 @@ impl ElmCore {
             contract: contract.clone(),
             version: 1,
             flags: ELM_EBI_EXPORT_FLAG_MANAGED,
+            rust_abi_hash: [0; 32],
             address: 0x1100,
             bounds: Some(NativeExecutionBounds {
                 code_start: 0x1000,
@@ -15642,6 +15935,7 @@ impl ElmCore {
             max_version: 1,
             selected_version: 1,
             flags: ELM_EBI_IMPORT_FLAG_MANAGED,
+            rust_abi_hash: [0; 32],
             address: 0x1100,
         };
         let frame = ElmCallFrame::empty(0, 1, 0);
@@ -15832,6 +16126,51 @@ impl ElmCore {
             && missing_context == OldGenerationExecutionState::Compromised
             && executor.resume_calls == 1
             && failed_executor.resume_calls == 1
+    }
+
+    #[cfg(feature = "kernel-tests")]
+    pub(crate) fn test_kernel_symbol_import_bookkeeping() -> bool {
+        let mut core = Self::new();
+        if core.init_builtin_mgr().is_err() {
+            return false;
+        }
+        let owner = ELM_EKI_ID;
+        let contract = match FlowContract::new("kernel.test.symbol@1") {
+            Ok(contract) => contract,
+            Err(_) => return false,
+        };
+        let record =
+            |generation: Generation, name: &str, address: usize| KernelSymbolImportRuntime {
+                owner,
+                owner_generation: generation,
+                name: name.to_string(),
+                contract: contract.clone(),
+                min_version: 1,
+                max_version: 1,
+                selected_version: 1,
+                rust_abi_hash: [0; 32],
+                address,
+            };
+
+        core.kernel_symbol_imports
+            .push(record(Generation::FIRST, "kernel.test.old", 0x1000));
+        let candidate = alloc::vec![
+            record(Generation(2), "kernel.test.new-a", 0x2000),
+            record(Generation(2), "kernel.test.new-b", 0x3000),
+        ];
+        let rollback_preserved = core.kernel_symbol_imports.len() == 1
+            && core.kernel_symbol_imports[0].owner_generation == Generation::FIRST;
+
+        core.replace_kernel_symbol_imports_owned_by(owner, candidate);
+        let replaced = core.kernel_symbol_imports.len() == 2
+            && core
+                .kernel_symbol_imports
+                .iter()
+                .all(|import| import.owner == owner && import.owner_generation == Generation(2));
+        let removed = core.remove_kernel_symbol_imports_owned_by(owner) == 2
+            && core.kernel_symbol_imports.is_empty();
+
+        rollback_preserved && replaced && removed
     }
 }
 

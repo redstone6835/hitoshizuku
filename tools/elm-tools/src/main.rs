@@ -1,4 +1,5 @@
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -6,20 +7,21 @@ use std::path::Path;
 use ed25519_dalek::{Signer, SigningKey};
 
 use elm::{
-    ELM_EBI_ABI_VERSION, ELM_EBI_RUST_ABI_VERSION as RUST_ABI, ELM_EBI_SEGMENT_FLAG_EXECUTE,
-    ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SEGMENT_FLAG_ZERO_FILL,
-    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE,
-    ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION,
-    ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
-    ELM_EKI_KERNEL_API_RECORD_SIZE,
-    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE,
-    ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN,
-    ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION,
+    ELM_EBI_ABI_VERSION, ELM_EBI_RUST_ABI_VERSION as RUST_ABI,
+    ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE,
+    ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SYMBOL_NAME_LEN,
+    ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE,
+    ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
+    ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_KERNEL_API_RECORD_SIZE, ELM_EKI_MAGIC,
+    ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROOF_ALGORITHM_ED25519,
+    ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN,
+    ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION,
     ELM_PROOF_ED25519_SIGNATURE_LEN, ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN,
     ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiArch, ElmEbiProofV1, ElmEbiRelocationKind,
-    ElmEbiSegmentKind, ElmEkiBlockKind, ElmKind, ElmPanicStrategy, ElmRustAbiFingerprintV1,
-    ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest, kernel_api_manifest_v1, parse_eki_image,
-    sha256, sha256_with_zeroed_range, sha256_with_zeroed_ranges,
+    ElmEbiSegmentKind, ElmEkiBlockKind, ElmKind, ElmModuleDescriptorV1, ElmPanicStrategy,
+    ElmRustAbiFingerprintV1, ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest,
+    kernel_api_manifest_v1, parse_eki_image, sha256, sha256_with_zeroed_range,
+    sha256_with_zeroed_ranges,
 };
 
 mod project;
@@ -30,13 +32,12 @@ use project::{
 };
 use rust_metadata::{
     ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, KernelApiSpec, NativeMetadata,
-    ProviderSpec,
+    ProviderSpec, retain_linked_kernel_symbol_imports,
 };
 
 const ELM_TOOL_PAGE_SIZE: u64 = 4096;
 const BLOCK_MANIFEST: u32 = ElmEkiBlockKind::Manifest as u32;
 const BLOCK_MENU: u32 = ElmEkiBlockKind::Menu as u32;
-const BLOCK_ENTRY: u32 = ElmEkiBlockKind::Entry as u32;
 const BLOCK_SEGMENTS: u32 = ElmEkiBlockKind::Segments as u32;
 const BLOCK_CODE: u32 = ElmEkiBlockKind::Code as u32;
 const BLOCK_RODATA: u32 = ElmEkiBlockKind::ReadOnlyData as u32;
@@ -61,7 +62,7 @@ const HOOK_FINALIZE: u32 = 2;
 const RUST_HOOK_CONTEXT_RESULT: u16 = 1;
 const EKI_TABLE_HEADER_SIZE: usize = 8;
 const EKI_SEGMENT_RECORD_SIZE: usize = 32;
-const EKI_SYMBOL_RECORD_SIZE: usize = 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
+const EKI_SYMBOL_RECORD_SIZE: usize = 48 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_SYMBOL_LOCATION_RECORD_SIZE: usize = 32 + ELM_EBI_SYMBOL_NAME_LEN;
 const EKI_RELOCATION_RECORD_SIZE: usize = 32;
 const EKI_DEPENDENCY_RECORD_SIZE: usize = 8 + elm::ELM_EBI_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
@@ -261,9 +262,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         _ => return Err(format!("未知 build arch: {arch}")),
     };
     let manifest = ElmProjectManifest::load(project)?;
-    if !project.join(".elm/framework/elm/Cargo.toml").is_file() {
-        sync_framework(project)?;
-    }
+    sync_framework(project)?;
     let output_dir = project.join("dist");
     fs::create_dir_all(&output_dir)
         .map_err(|err| format!("创建 {} 失败: {err}", output_dir.display()))?;
@@ -419,9 +418,13 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
     let elf = ElfImage::parse(&elf_bytes)?;
     validate_runtime_layout(&elf.load_segments)?;
     let metadata_section = elf.elm_metadata_section(&elf_bytes)?;
-    let metadata = NativeMetadata::parse(metadata_section)?;
+    let mut metadata = NativeMetadata::parse(metadata_section)?;
+    retain_linked_kernel_symbol_imports(&mut metadata.imports, |symbol| {
+        elf.symbols.iter().any(|candidate| candidate.name == symbol)
+    });
     validate_native_symbols(&elf, &metadata)?;
-    let relocations = native_relocations_block(&elf, &elf_bytes, &metadata.imports)?;
+    let relocation_records = dynamic_relative_relocations(&elf, &elf_bytes)?;
+    let relocations = native_relocations_block(&elf, &metadata.imports, relocation_records)?;
     let mut blocks = vec![
         PackerBlock::new(
             BLOCK_MANIFEST,
@@ -437,9 +440,6 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
             BLOCK_MENU,
             menu_block(&menu.label, &menu.description, &menu.route)?,
         ));
-    }
-    if let Some(entry) = &metadata.entry {
-        blocks.push(PackerBlock::new(BLOCK_ENTRY, entry_block(entry)?));
     }
     if !manifest.dependencies.is_empty() {
         blocks.push(PackerBlock::new(
@@ -496,10 +496,6 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
             provider_ports_block(&metadata.providers)?,
         ));
     }
-    blocks.push(PackerBlock::new(
-        BLOCK_LIFECYCLE_HOOKS,
-        lifecycle_hooks_block_from_metadata(&metadata)?,
-    ));
     blocks.push(PackerBlock::new(
         BLOCK_SYMBOL_LOCATIONS,
         symbol_locations_block(&elf, &metadata.symbol_names())?,
@@ -575,7 +571,38 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
             elmapi.compatible_versions
         );
     }
+    for (index, import) in image.unit.imports.iter().enumerate() {
+        println!(
+            "import[{index}] name={} contract={} versions={}..={} flags=0x{:x} kernel_symbol={} rust_abi_sha256={}",
+            import.name,
+            import.contract.as_str(),
+            import.min_version,
+            import.max_version,
+            import.flags,
+            import.is_kernel_symbol(),
+            hex_digest(&import.rust_abi_hash),
+        );
+    }
+    for (index, export) in image.unit.exports.iter().enumerate() {
+        println!(
+            "export[{index}] name={} contract={} version={} flags=0x{:x} direct_pinned={} rust_abi_sha256={}",
+            export.name,
+            export.contract.as_str(),
+            export.version,
+            export.flags,
+            export.is_direct_pinned(),
+            hex_digest(&export.rust_abi_hash),
+        );
+    }
     Ok(())
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("写入 String 不会失败");
+    }
+    output
 }
 
 fn cmd_hash(args: &[String]) -> Result<(), String> {
@@ -1272,11 +1299,15 @@ fn parse_elf_symbols(bytes: &[u8], sections: &[ElfSection]) -> Result<Vec<ElfSym
         }
         let info = read_u8(bytes, offset + 4)?;
         let section_index = read_u16(bytes, offset + 6)?;
-        if info >> 4 != ELF_SYMBOL_BIND_GLOBAL || section_index == ELF_SECTION_INDEX_UNDEFINED {
+        if section_index == ELF_SECTION_INDEX_UNDEFINED {
             continue;
         }
         let name = read_cstr(strtab, name_offset)?;
         if name.is_empty() {
+            continue;
+        }
+        let binding = info >> 4;
+        if binding != ELF_SYMBOL_BIND_GLOBAL && !name.starts_with("__elm_kernel_symbol_") {
             continue;
         }
         out.push(ElfSymbol {
@@ -1332,11 +1363,26 @@ fn validate_runtime_layout(segments: &[ElfLoadSegment]) -> Result<(), String> {
 }
 
 fn validate_native_symbols(elf: &ElfImage, metadata: &NativeMetadata) -> Result<(), String> {
-    for hook in &metadata.lifecycle {
-        validate_code_symbol(elf, &hook.symbol)?;
+    let descriptor = elf.symbol(&metadata.module_descriptor)?;
+    if descriptor.symbol_type != ELF_SYMBOL_TYPE_OBJECT
+        || descriptor.size < core::mem::size_of::<ElmModuleDescriptorV1>() as u64
+    {
+        return Err(format!(
+            "统一模块描述符必须是尺寸完整的 OBJECT: {}",
+            metadata.module_descriptor
+        ));
     }
-    if let Some(entry) = &metadata.entry {
-        validate_code_symbol(elf, entry)?;
+    let (descriptor_segment, descriptor_offset, _) =
+        elf.symbol_location(&metadata.module_descriptor)?;
+    if !matches!(
+        elf.load_segments[descriptor_segment as usize].kind,
+        ElmEbiSegmentKind::ReadOnlyData
+    ) || descriptor_offset % core::mem::align_of::<ElmModuleDescriptorV1>() as u64 != 0
+    {
+        return Err(format!(
+            "统一模块描述符必须位于按 ABI 对齐的只读段: {}",
+            metadata.module_descriptor
+        ));
     }
     for export in &metadata.exports {
         validate_code_symbol(elf, &export.symbol)?;
@@ -1348,14 +1394,17 @@ fn validate_native_symbols(elf: &ElfImage, metadata: &NativeMetadata) -> Result<
         }
     }
     for import in &metadata.imports {
-        let symbol = elf.symbol(&import.slot_symbol)?;
+        let Some(slot_symbol) = import.slot_symbol.as_deref() else {
+            continue;
+        };
+        let symbol = elf.symbol(slot_symbol)?;
         if symbol.symbol_type != ELF_SYMBOL_TYPE_OBJECT || symbol.size != 8 {
             return Err(format!(
                 "import slot 必须是 8 字节全局 OBJECT: {}",
-                import.slot_symbol
+                slot_symbol
             ));
         }
-        let (segment_index, offset, _) = elf.symbol_location(&import.slot_symbol)?;
+        let (segment_index, offset, _) = elf.symbol_location(slot_symbol)?;
         let segment = &elf.load_segments[segment_index as usize];
         if !matches!(
             segment.kind,
@@ -1364,7 +1413,7 @@ fn validate_native_symbols(elf: &ElfImage, metadata: &NativeMetadata) -> Result<
         {
             return Err(format!(
                 "import slot 必须位于 8 字节对齐的可写段: {}",
-                import.slot_symbol
+                slot_symbol
             ));
         }
     }
@@ -1617,16 +1666,6 @@ fn menu_block(label: &str, description: &str, route: &str) -> Result<Vec<u8>, St
     Ok(out)
 }
 
-fn entry_block(symbol: &str) -> Result<Vec<u8>, String> {
-    if symbol.len() > ELM_EBI_SYMBOL_NAME_LEN {
-        return Err("entry symbol too long".to_string());
-    }
-    let mut out = vec![0; 8 + ELM_EBI_SYMBOL_NAME_LEN];
-    write_u16(&mut out, 0, symbol.len() as u16);
-    copy_fixed(&mut out, 8, symbol);
-    Ok(out)
-}
-
 fn lifecycle_hooks_block() -> Vec<u8> {
     let record_size = 20 + ELM_EBI_SYMBOL_NAME_LEN;
     let mut out = vec![0; 8 + 2 * record_size];
@@ -1634,29 +1673,6 @@ fn lifecycle_hooks_block() -> Vec<u8> {
     lifecycle_hook_record(&mut out, 8, HOOK_INITIALIZE, "on_initialize");
     lifecycle_hook_record(&mut out, 8 + record_size, HOOK_FINALIZE, "on_finalize");
     out
-}
-
-fn lifecycle_hooks_block_from_metadata(metadata: &NativeMetadata) -> Result<Vec<u8>, String> {
-    let hooks: Vec<_> = metadata
-        .lifecycle
-        .iter()
-        .filter(|hook| hook.kind <= 5)
-        .collect();
-    if !(2..=5).contains(&hooks.len()) {
-        return Err("EKI lifecycle block 必须包含 2..=5 个规范钩子".to_string());
-    }
-    let record_size = 20 + ELM_EBI_SYMBOL_NAME_LEN;
-    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + hooks.len() * record_size];
-    write_u32(&mut out, 0, hooks.len() as u32);
-    for (index, hook) in hooks.iter().enumerate() {
-        lifecycle_hook_record(
-            &mut out,
-            EKI_TABLE_HEADER_SIZE + index * record_size,
-            hook.kind,
-            &hook.symbol,
-        );
-    }
-    Ok(out)
 }
 
 fn elmapi_compatibility_block(spec: &ElmApiSpec) -> Vec<u8> {
@@ -1745,6 +1761,7 @@ fn import_records_block(entries: &[ImportSpec]) -> Result<Vec<u8>, String> {
                 entry.min_version,
                 entry.max_version,
                 entry.flags,
+                entry.rust_abi_hash,
             )
         })
         .collect();
@@ -1761,16 +1778,21 @@ fn export_records_block(entries: &[ExportSpec]) -> Result<Vec<u8>, String> {
                 entry.version,
                 entry.version,
                 entry.flags,
+                entry.rust_abi_hash,
             )
         })
         .collect();
     symbol_records_block(&records)
 }
 
-fn symbol_records_block(entries: &[(&str, &str, u32, u32, u32)]) -> Result<Vec<u8>, String> {
+fn symbol_records_block(
+    entries: &[(&str, &str, u32, u32, u32, [u8; 32])],
+) -> Result<Vec<u8>, String> {
     let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_SYMBOL_RECORD_SIZE];
     write_u32(&mut out, 0, entries.len() as u32);
-    for (index, (name, contract, min_version, max_version, flags)) in entries.iter().enumerate() {
+    for (index, (name, contract, min_version, max_version, flags, rust_abi_hash)) in
+        entries.iter().enumerate()
+    {
         if name.len() > ELM_EBI_SYMBOL_NAME_LEN || contract.len() > ELM_NEXUS_CONTRACT_LEN {
             return Err("native symbol record field too long".to_string());
         }
@@ -1780,8 +1802,9 @@ fn symbol_records_block(entries: &[(&str, &str, u32, u32, u32)]) -> Result<Vec<u
         write_u16(&mut out, offset + 8, name.len() as u16);
         write_u16(&mut out, offset + 10, contract.len() as u16);
         write_u32(&mut out, offset + 12, *max_version);
-        copy_fixed(&mut out, offset + 16, name);
-        copy_fixed(&mut out, offset + 16 + ELM_EBI_SYMBOL_NAME_LEN, contract);
+        out[offset + 16..offset + 48].copy_from_slice(rust_abi_hash);
+        copy_fixed(&mut out, offset + 48, name);
+        copy_fixed(&mut out, offset + 48 + ELM_EBI_SYMBOL_NAME_LEN, contract);
     }
     Ok(out)
 }
@@ -1809,8 +1832,7 @@ fn dependencies_block(entries: &[ElmProjectDependency]) -> Result<Vec<u8>, Strin
 }
 
 fn kernel_api_requirements_block(entries: &[KernelApiSpec]) -> Result<Vec<u8>, String> {
-    let mut out =
-        vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * ELM_EKI_KERNEL_API_RECORD_SIZE];
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * ELM_EKI_KERNEL_API_RECORD_SIZE];
     write_u32(&mut out, 0, entries.len() as u32);
     for (index, entry) in entries.iter().enumerate() {
         if entry.namespace.len() > elm::ELM_KERNEL_API_IDENTIFIER_MAX_LEN {
@@ -1942,16 +1964,18 @@ fn symbol_locations_block(elf: &ElfImage, symbol_names: &[String]) -> Result<Vec
 
 fn native_relocations_block(
     elf: &ElfImage,
-    elf_bytes: &[u8],
     slots: &[ImportSpec],
+    mut records: Vec<EkiRelocationSpec>,
 ) -> Result<Vec<u8>, String> {
-    let mut records = dynamic_relative_relocations(elf, elf_bytes)?;
     for (index, slot) in slots.iter().enumerate() {
-        let (segment_index, offset_in_segment, size) = elf.symbol_location(&slot.slot_symbol)?;
+        let Some(slot_symbol) = slot.slot_symbol.as_deref() else {
+            continue;
+        };
+        let (segment_index, offset_in_segment, size) = elf.symbol_location(slot_symbol)?;
         if size != 8 {
             return Err(format!(
                 "import slot must be exactly 8 bytes: {}",
-                slot.slot_symbol
+                slot_symbol
             ));
         }
         records.push(EkiRelocationSpec {
@@ -2185,5 +2209,18 @@ mod tests {
         write_u64(&mut bytes, 16, 0x800);
 
         assert!(dynamic_relative_relocations(&elf, &bytes).is_err());
+    }
+
+    #[test]
+    fn formats_full_abi_digest_as_lowercase_hex() {
+        let mut digest = [0u8; 32];
+        digest[0] = 0xab;
+        digest[31] = 0xcd;
+
+        let encoded = hex_digest(&digest);
+
+        assert_eq!(encoded.len(), 64);
+        assert!(encoded.starts_with("ab00"));
+        assert!(encoded.ends_with("00cd"));
     }
 }

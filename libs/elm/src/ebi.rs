@@ -17,6 +17,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::developer::{ELM_MODULE_DESCRIPTOR_SYMBOL, ElmModuleDescriptorV1};
 pub use crate::ebi_wire::*;
 use crate::elmapi::{
     ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
@@ -28,7 +29,7 @@ use crate::menu::{
 };
 use crate::mgr::{ELM_MGR_RELATION_POINT_LEN, ELM_NEXUS_CONTRACT_LEN};
 use crate::nexus::{FlowContract, FlowDirection, FlowMode};
-use crate::proof::{ElmEbiProofV1, ElmRustAbiFingerprintV1, canonical_ebi_digest};
+use crate::proof::{ElmEbiProofV1, ElmRustAbiFingerprintV1, canonical_ebi_digest, sha256};
 use crate::wire::{ElmMixinMode, ElmPortAccessPolicy};
 
 /// `ELM_EBI_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
@@ -57,6 +58,8 @@ pub const ELM_EBI_MAX_RELOCATIONS: usize = 512;
 pub const ELM_EBI_NAME_LEN: usize = 128;
 /// `ELM_EBI_SYMBOL_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EBI_SYMBOL_NAME_LEN: usize = 128;
+/// 直接固定 Rust 符号签名使用的完整 SHA-256 摘要长度。
+pub const ELM_EBI_RUST_ABI_HASH_LEN: usize = 32;
 /// 表示该 EBI 段没有外部 payload 来源，通常用于 BSS 零填充段。
 pub const ELM_EBI_SEGMENT_SOURCE_NONE: u32 = u32::MAX;
 /// `ELM_EBI_SEGMENT_FLAG_READ` 协议标志位；可在所属字段允许时与同组标志按位或组合。
@@ -81,12 +84,21 @@ pub const ELM_EBI_IMPORT_FLAG_DIRECT_PINNED: u32 = 1 << 2;
 pub const ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR: u32 = 1 << 3;
 /// `ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN: u32 = 1 << 4;
+/// 表示该 import 由内核直接符号目录解析，不参与 ELM export 选择或代际绑定。
+pub const ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL: u32 = 1 << 5;
+/// 表示该内核符号使用精确 Rust API 身份，ABI 摘要同时绑定外部接口目录身份。
+///
+/// v1 只固化该协议位和摘要算法；当前内核尚未安装对应目录后端，装载时会明确返回
+/// `NativeCodeTodo`。
+pub const ELM_EBI_IMPORT_FLAG_EXACT_RUST_API: u32 = 1 << 6;
 /// `ELM_EBI_IMPORT_FLAGS_MASK` 定义当前版本认可的全部标志位；输入包含掩码外位时必须拒绝或按调用契约报错。
 pub const ELM_EBI_IMPORT_FLAGS_MASK: u32 = ELM_EBI_IMPORT_FLAG_OPTIONAL
     | ELM_EBI_IMPORT_FLAG_MANAGED
     | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED
     | ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR
-    | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN;
+    | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN
+    | ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL
+    | ELM_EBI_IMPORT_FLAG_EXACT_RUST_API;
 /// `ELM_EBI_EXPORT_FLAG_MANAGED` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_EXPORT_FLAG_MANAGED: u32 = 1 << 0;
 /// `ELM_EBI_EXPORT_FLAG_DIRECT_PINNED` 协议标志位；可在所属字段允许时与同组标志按位或组合。
@@ -109,6 +121,24 @@ pub const ELM_EBI_SYMBOL_LOCATION_FLAG_NONE: u32 = 0;
 pub const ELM_EBI_RELOCATION_FLAG_NONE: u32 = 0;
 /// `ELM_EBI_RUST_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_EBI_RUST_ABI_VERSION: u16 = 1;
+
+/// 计算精确 Rust 内核符号接口使用的 ABI 摘要。
+///
+/// 普通直接符号只摘要规范签名；精确接口导入还必须绑定由具体符号目录定义的完整接口
+/// 身份，防止相同函数签名在不同 crate identity、类型布局或 feature 图之间被错误复用。
+pub fn kernel_symbol_interface_abi_hash(
+    rust_abi: &[u8],
+    interface_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
+) -> [u8; ELM_EBI_RUST_ABI_HASH_LEN] {
+    const DOMAIN: &[u8] = b"ELM-KERNEL-RUST-INTERFACE-V1\0";
+
+    let mut input = Vec::with_capacity(DOMAIN.len() + 8 + rust_abi.len() + interface_hash.len());
+    input.extend_from_slice(DOMAIN);
+    input.extend_from_slice(&(rust_abi.len() as u64).to_le_bytes());
+    input.extend_from_slice(rust_abi);
+    input.extend_from_slice(&interface_hash);
+    sha256(&input)
+}
 /// `ELM_EBI_HOOK_FLAG_NONE` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_HOOK_FLAG_NONE: u32 = 0;
 /// 生命周期 hook presence mask 中表示 `initialize` 钩子已声明的位。
@@ -531,6 +561,8 @@ pub struct ElmEbiImportDecl {
     pub max_version: u32,
     /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
+    /// 直接固定 Rust 函数指针规范签名的 SHA-256；受管 import 必须全零。
+    pub rust_abi_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
 }
 
 impl ElmEbiImportDecl {
@@ -540,13 +572,21 @@ impl ElmEbiImportDecl {
         contract: impl Into<String>,
         version: u32,
         flags: u32,
+        rust_abi_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
     ) -> Result<Self, ElmEbiLoadStatus> {
         let (min_version, max_version) = if version == 0 {
             (1, u32::MAX)
         } else {
             (version, version)
         };
-        Self::new_range(name, contract, min_version, max_version, flags)
+        Self::new_range(
+            name,
+            contract,
+            min_version,
+            max_version,
+            flags,
+            rust_abi_hash,
+        )
     }
 
     /// 执行 `new_range` 定义的模型或协议操作；返回值反映校验后的结果。
@@ -556,6 +596,7 @@ impl ElmEbiImportDecl {
         min_version: u32,
         max_version: u32,
         flags: u32,
+        rust_abi_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
     ) -> Result<Self, ElmEbiLoadStatus> {
         let name = name.into();
         validate_symbol_name(&name)?;
@@ -566,6 +607,7 @@ impl ElmEbiImportDecl {
             min_version,
             max_version,
             flags,
+            rust_abi_hash,
         };
         validate_import_decl(&value)?;
         Ok(value)
@@ -588,8 +630,17 @@ impl ElmEbiImportDecl {
 
     /// 执行 `is_direct_pinned` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn is_direct_pinned(&self) -> bool {
-        self.flags & (ELM_EBI_IMPORT_FLAG_MANAGED | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED) == 0
-            || self.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0
+        self.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0
+    }
+
+    /// 返回该导入是否必须由内核直接符号目录解析。
+    pub const fn is_kernel_symbol(&self) -> bool {
+        self.flags & ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL != 0
+    }
+
+    /// 返回该导入是否要求与目标内核同构的精确 Rust API 身份。
+    pub const fn is_exact_rust_api(&self) -> bool {
+        self.flags & ELM_EBI_IMPORT_FLAG_EXACT_RUST_API != 0
     }
 
     /// 执行 `allows_ancestor` 定义的模型或协议操作；返回值反映校验后的结果。
@@ -616,6 +667,8 @@ pub struct ElmEbiExportDecl {
     pub version: u32,
     /// 该记录的标志位集合；不得设置所属有效掩码之外的位。
     pub flags: u32,
+    /// 直接固定 Rust 函数指针规范签名的 SHA-256；受管 export 必须全零。
+    pub rust_abi_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
 }
 
 impl ElmEbiExportDecl {
@@ -625,6 +678,7 @@ impl ElmEbiExportDecl {
         contract: impl Into<String>,
         version: u32,
         flags: u32,
+        rust_abi_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
     ) -> Result<Self, ElmEbiLoadStatus> {
         let name = name.into();
         validate_symbol_name(&name)?;
@@ -634,6 +688,7 @@ impl ElmEbiExportDecl {
                 .map_err(|_| ElmEbiLoadStatus::InvalidManifest)?,
             version,
             flags,
+            rust_abi_hash,
         };
         validate_export_decl(&value)?;
         Ok(value)
@@ -646,8 +701,7 @@ impl ElmEbiExportDecl {
 
     /// 执行 `is_direct_pinned` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn is_direct_pinned(&self) -> bool {
-        self.flags & (ELM_EBI_EXPORT_FLAG_MANAGED | ELM_EBI_EXPORT_FLAG_DIRECT_PINNED) == 0
-            || self.flags & ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
+        self.flags & ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
     }
 
     /// 执行 `visible_to_dependency` 定义的模型或协议操作；返回值反映校验后的结果。
@@ -1387,8 +1441,23 @@ impl ElmEbiUnit {
                 validate_symbol_name(symbol)?;
             }
         }
-        for import in &self.imports {
+        let root_import_index = self
+            .api_compatibility
+            .as_ref()
+            .and_then(|compatibility| usize::try_from(compatibility.root_import_index).ok());
+        for (index, import) in self.imports.iter().enumerate() {
             validate_import_decl(import)?;
+            let root_import = root_import_index == Some(index);
+            let kernel_symbol = import.flags & ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL != 0;
+            let mode =
+                import.flags & (ELM_EBI_IMPORT_FLAG_MANAGED | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED);
+            if root_import {
+                if import.flags != 0 || import.rust_abi_hash != [0; ELM_EBI_RUST_ABI_HASH_LEN] {
+                    return Err(ElmEbiLoadStatus::InvalidTarget);
+                }
+            } else if !kernel_symbol && mode.count_ones() != 1 {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
         }
         for export in &self.exports {
             validate_export_decl(export)?;
@@ -1534,6 +1603,22 @@ impl ElmEbiImage {
                 return Err(ElmEbiLoadStatus::InvalidManifest);
             }
         }
+        if self.has_code_segment() && self.unit.lifecycle_hooks.is_none() {
+            let descriptor = self
+                .symbol_location(ELM_MODULE_DESCRIPTOR_SYMBOL)
+                .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
+            let segment = self
+                .unit
+                .segments
+                .get(descriptor.segment_index as usize)
+                .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
+            if !matches!(segment.kind, ElmEbiSegmentKind::ReadOnlyData)
+                || descriptor.size < core::mem::size_of::<ElmModuleDescriptorV1>() as u64
+                || descriptor.offset % core::mem::align_of::<ElmModuleDescriptorV1>() as u64 != 0
+            {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
+        }
         if let (true, Some(hooks)) = (self.has_code_segment(), &self.unit.lifecycle_hooks) {
             let init = self.symbol_location(&hooks.initialize.symbol);
             let fini = self.symbol_location(&hooks.finalize.symbol);
@@ -1605,9 +1690,6 @@ impl ElmEbiImage {
             }
         }
         for (import_index, import) in self.unit.imports.iter().enumerate() {
-            if !import.is_managed() {
-                continue;
-            }
             let mut relocation_count = 0usize;
             for relocation in self.relocations.iter().filter(|relocation| {
                 relocation.value_index == import_index as u32
@@ -1619,18 +1701,19 @@ impl ElmEbiImage {
                     )
             }) {
                 relocation_count += 1;
-                if relocation.kind != ElmEbiRelocationKind::ImportAbs64
-                    || relocation.target_offset & 7 != 0
-                    || !self
-                        .unit
-                        .segments
-                        .get(relocation.target_segment_index as usize)
-                        .is_some_and(|segment| {
-                            matches!(
-                                segment.kind,
-                                ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
-                            )
-                        })
+                if import.is_managed()
+                    && (relocation.kind != ElmEbiRelocationKind::ImportAbs64
+                        || relocation.target_offset & 7 != 0
+                        || !self
+                            .unit
+                            .segments
+                            .get(relocation.target_segment_index as usize)
+                            .is_some_and(|segment| {
+                                matches!(
+                                    segment.kind,
+                                    ElmEbiSegmentKind::Data | ElmEbiSegmentKind::Bss
+                                )
+                            }))
                 {
                     return Err(ElmEbiLoadStatus::InvalidTarget);
                 }
@@ -1655,6 +1738,7 @@ impl ElmEbiImage {
                 .collect();
             if root_relocations.len() != 1
                 || root_relocations[0].kind != ElmEbiRelocationKind::ImportAbs64
+                || root_relocations[0].target_offset & 7 != 0
                 || !self
                     .unit
                     .segments
@@ -1816,11 +1900,22 @@ fn validate_segment(segment: &ElmEbiSegment) -> Result<(), ElmEbiLoadStatus> {
 fn validate_import_decl(import: &ElmEbiImportDecl) -> Result<(), ElmEbiLoadStatus> {
     validate_symbol_name(&import.name)?;
     validate_contract_len(&import.contract)?;
+    let kernel_symbol = import.flags & ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL != 0;
+    let exact_rust_api = import.flags & ELM_EBI_IMPORT_FLAG_EXACT_RUST_API != 0;
+    let elm_modes =
+        import.flags & (ELM_EBI_IMPORT_FLAG_MANAGED | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED);
+    let elm_scopes =
+        import.flags & (ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN);
+    let requires_rust_abi = kernel_symbol || import.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0;
     if import.min_version == 0
         || import.max_version < import.min_version
         || import.flags & !ELM_EBI_IMPORT_FLAGS_MASK != 0
         || import.flags & ELM_EBI_IMPORT_FLAG_MANAGED != 0
             && import.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0
+        || exact_rust_api && !kernel_symbol
+        || kernel_symbol && (elm_modes != 0 || elm_scopes != 0)
+        || requires_rust_abi && import.rust_abi_hash == [0; ELM_EBI_RUST_ABI_HASH_LEN]
+        || !requires_rust_abi && import.rust_abi_hash != [0; ELM_EBI_RUST_ABI_HASH_LEN]
     {
         return Err(ElmEbiLoadStatus::InvalidManifest);
     }
@@ -1834,11 +1929,14 @@ fn validate_export_decl(export: &ElmEbiExportDecl) -> Result<(), ElmEbiLoadStatu
         & (ELM_EBI_EXPORT_FLAG_PRIVATE
             | ELM_EBI_EXPORT_FLAG_DEPENDENCY
             | ELM_EBI_EXPORT_FLAG_SUBTREE);
+    let mode = export.flags & (ELM_EBI_EXPORT_FLAG_MANAGED | ELM_EBI_EXPORT_FLAG_DIRECT_PINNED);
+    let direct = mode == ELM_EBI_EXPORT_FLAG_DIRECT_PINNED;
     if export.version == 0
         || export.flags & !ELM_EBI_EXPORT_FLAGS_MASK != 0
-        || export.flags & ELM_EBI_EXPORT_FLAG_MANAGED != 0
-            && export.flags & ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0
+        || mode.count_ones() != 1
         || visibility.count_ones() > 1
+        || direct && export.rust_abi_hash == [0; ELM_EBI_RUST_ABI_HASH_LEN]
+        || !direct && export.rust_abi_hash != [0; ELM_EBI_RUST_ABI_HASH_LEN]
     {
         return Err(ElmEbiLoadStatus::InvalidManifest);
     }
@@ -1847,7 +1945,7 @@ fn validate_export_decl(export: &ElmEbiExportDecl) -> Result<(), ElmEbiLoadStatu
 
 fn validate_lifecycle_hooks(hooks: Option<&ElmEbiLifecycleHooks>) -> Result<(), ElmEbiLoadStatus> {
     let Some(hooks) = hooks else {
-        return Err(ElmEbiLoadStatus::InvalidManifest);
+        return Ok(());
     };
     validate_lifecycle_hook(
         &hooks.initialize,

@@ -9,7 +9,9 @@
 //! 跨 ELM 的长期关系应使用受管 import、binding、lease 和运行时登记资源表达。
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::context::{
     ELM_NATIVE_HOOK_CONTEXT_ABI_VERSION, ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION,
@@ -87,12 +89,355 @@ impl HookError {
 pub type HookResult = Result<(), HookError>;
 /// 设备 IRQ 业务回调使用的结果类型；成功值表示本处理器是否消费了该中断。
 pub type DeviceIrqResult = Result<bool, HookError>;
-/// [`entry`](crate::entry) 业务函数使用的结果类型。
+/// [`ElmModule::entry`] 业务函数使用的结果类型。
 pub type EntryResult = HookResult;
 /// [`mixin_point`](crate::mixin_point) 原始函数使用的结果类型。
 pub type PointResult = HookResult;
 /// 迁移状态导出钩子的结果类型；成功值是实际写入迁移缓冲区的字节数。
 pub type MigrationExportResult = Result<usize, HookError>;
+
+/// ELM 模块描述符使用的固定魔数。
+pub const ELM_MODULE_DESCRIPTOR_MAGIC: [u8; 8] = *b"ELMMOD01";
+/// ELM 镜像导出统一模块描述符时使用的固定符号名。
+pub const ELM_MODULE_DESCRIPTOR_SYMBOL: &str = "__elm_module_descriptor_v1";
+/// ELM 模块描述符 ABI 版本。
+pub const ELM_MODULE_DESCRIPTOR_ABI_VERSION: u16 = 1;
+/// ELM 模块描述符中尚未定义任何公开标志。
+pub const ELM_MODULE_DESCRIPTOR_FLAGS_MASK: u32 = 0;
+
+/// 统一 ELM 模块实现接口。
+///
+/// 每个 ELM 镜像只能通过 [`module`](crate::module) 注册一个实现。运行时先调用
+/// [`ElmModule::create`] 构造当前 generation 的唯一实例，再调用
+/// [`ElmModule::initialize`]。只有初始化成功后，provider、事件、mixin 和其它回调才允许
+/// 取得该实例。卸载时会在所有在途调用排空后调用 [`ElmModule::finalize`]，成功后销毁实例。
+///
+/// `quiesce`、`pause` 和 `resume` 默认是无状态成功操作。迁移方法默认返回不支持，因此没有
+/// 实现迁移协议的模块不会被热替换流程误认为可以安全迁移。
+pub trait ElmModule: Send + Sync + Sized + 'static {
+    /// 构造当前 generation 的唯一模块实例。
+    fn create(context: &LifecycleContext) -> Result<Self, HookError>;
+
+    /// 完成模块初始化并发布可以对外使用的状态。
+    fn initialize(&mut self, context: &LifecycleContext) -> HookResult;
+
+    /// 撤销模块发布的状态并释放所有长期资源。
+    fn finalize(&mut self, context: &LifecycleContext) -> HookResult;
+
+    /// 停止接受新工作并排空可以排空的活动。
+    fn quiesce(&mut self, _context: &LifecycleContext) -> HookResult {
+        Ok(())
+    }
+
+    /// 暂停模块提供的活动能力。
+    fn pause(&mut self, _context: &LifecycleContext) -> HookResult {
+        Ok(())
+    }
+
+    /// 恢复此前暂停的模块能力。
+    fn resume(&mut self, _context: &LifecycleContext) -> HookResult {
+        Ok(())
+    }
+
+    /// 导出热替换需要的固定状态。
+    fn migrate_export(
+        &self,
+        _context: &MigrationContext,
+        _output: &mut [u8],
+    ) -> MigrationExportResult {
+        Err(HookError::new(crate::ELM_CALL_STATUS_UNSUPPORTED))
+    }
+
+    /// 导入旧 generation 导出的固定状态。
+    fn migrate_import(&mut self, _context: &MigrationContext, _input: &[u8]) -> HookResult {
+        Err(HookError::new(crate::ELM_CALL_STATUS_UNSUPPORTED))
+    }
+
+    /// 撤销尚未提交的迁移状态。
+    fn migrate_abort(&mut self, _context: &MigrationContext, _input: &[u8]) -> HookResult {
+        Ok(())
+    }
+
+    /// 在模块激活后执行可选的一次性入口逻辑。
+    fn entry(&self, _context: &EntryContext) -> EntryResult {
+        Ok(())
+    }
+}
+
+/// 原生模块普通生命周期入口类型。
+pub type ElmModuleLifecycleEntryV1 = unsafe extern "C" fn(*mut ElmNativeHookContextV1) -> i32;
+/// 原生模块迁移入口类型。
+pub type ElmModuleMigrationEntryV1 = unsafe extern "C" fn(*mut ElmNativeMigrationContextV1) -> i32;
+/// 原生模块激活后入口类型。
+pub type ElmModuleEntryV1 = unsafe extern "C" fn(*mut ElmNativeEntryFrameV1) -> i32;
+
+#[repr(C)]
+/// 一个 ELM 镜像唯一的模块描述符。
+///
+/// 描述符本身只保存固定布局和原生入口，不保存实例地址。实例由 attribute 生成的
+/// [`ModuleSlot`] 管理，从而保证旧 generation 的描述符不能取得新 generation 的状态。
+pub struct ElmModuleDescriptorV1 {
+    /// 固定魔数 [`ELM_MODULE_DESCRIPTOR_MAGIC`]。
+    pub magic: [u8; 8],
+    /// 固定 ABI 版本 [`ELM_MODULE_DESCRIPTOR_ABI_VERSION`]。
+    pub abi_version: u16,
+    /// 当前结构的完整字节数。
+    pub struct_size: u16,
+    /// 当前版本必须为零。
+    pub flags: u32,
+    /// 模块实例的 Rust 内存布局尺寸。
+    pub instance_size: u64,
+    /// 模块实例的 Rust 内存布局对齐。
+    pub instance_align: u64,
+    /// 构造实例并执行初始化的入口。
+    pub initialize: ElmModuleLifecycleEntryV1,
+    /// 执行终结并销毁实例的入口。
+    pub finalize: ElmModuleLifecycleEntryV1,
+    /// 静默入口。
+    pub quiesce: ElmModuleLifecycleEntryV1,
+    /// 暂停入口。
+    pub pause: ElmModuleLifecycleEntryV1,
+    /// 恢复入口。
+    pub resume: ElmModuleLifecycleEntryV1,
+    /// 迁移导出入口。
+    pub migrate_export: ElmModuleMigrationEntryV1,
+    /// 迁移导入入口。
+    pub migrate_import: ElmModuleMigrationEntryV1,
+    /// 迁移撤销入口。
+    pub migrate_abort: ElmModuleMigrationEntryV1,
+    /// 激活后入口。
+    pub entry: ElmModuleEntryV1,
+}
+
+impl ElmModuleDescriptorV1 {
+    /// 使用完整入口表构造模块描述符。
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new<T: ElmModule>(
+        initialize: ElmModuleLifecycleEntryV1,
+        finalize: ElmModuleLifecycleEntryV1,
+        quiesce: ElmModuleLifecycleEntryV1,
+        pause: ElmModuleLifecycleEntryV1,
+        resume: ElmModuleLifecycleEntryV1,
+        migrate_export: ElmModuleMigrationEntryV1,
+        migrate_import: ElmModuleMigrationEntryV1,
+        migrate_abort: ElmModuleMigrationEntryV1,
+        entry: ElmModuleEntryV1,
+    ) -> Self {
+        Self {
+            magic: ELM_MODULE_DESCRIPTOR_MAGIC,
+            abi_version: ELM_MODULE_DESCRIPTOR_ABI_VERSION,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            instance_size: core::mem::size_of::<T>() as u64,
+            instance_align: core::mem::align_of::<T>() as u64,
+            initialize,
+            finalize,
+            quiesce,
+            pause,
+            resume,
+            migrate_export,
+            migrate_import,
+            migrate_abort,
+            entry,
+        }
+    }
+
+    /// 检查固定头部、入口和实例布局是否满足统一模块 ABI。
+    pub fn valid(&self) -> bool {
+        self.magic == ELM_MODULE_DESCRIPTOR_MAGIC
+            && self.abi_version == ELM_MODULE_DESCRIPTOR_ABI_VERSION
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.flags & !ELM_MODULE_DESCRIPTOR_FLAGS_MASK == 0
+            && self.instance_align != 0
+            && self.instance_align.is_power_of_two()
+            && self.instance_size <= usize::MAX as u64
+            && self.initialize as usize != 0
+            && self.finalize as usize != 0
+            && self.quiesce as usize != 0
+            && self.pause as usize != 0
+            && self.resume as usize != 0
+            && self.migrate_export as usize != 0
+            && self.migrate_import as usize != 0
+            && self.migrate_abort as usize != 0
+            && self.entry as usize != 0
+    }
+
+    /// 检查固定头部和实例布局是否与 `T` 完全一致。
+    pub fn valid_for<T: ElmModule>(&self) -> bool {
+        self.valid()
+            && self.instance_size == core::mem::size_of::<T>() as u64
+            && self.instance_align == core::mem::align_of::<T>() as u64
+    }
+}
+
+const MODULE_SLOT_EMPTY: u8 = 0;
+const MODULE_SLOT_CONSTRUCTING: u8 = 1;
+const MODULE_SLOT_ACTIVE: u8 = 2;
+const MODULE_SLOT_TRANSITIONING: u8 = 3;
+
+#[doc(hidden)]
+/// attribute 生成代码使用的单 generation 模块实例槽。
+pub struct ModuleSlot<T: ElmModule> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T: ElmModule> ModuleSlot<T> {
+    /// 构造空实例槽。
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(MODULE_SLOT_EMPTY),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    fn active_ref(&self) -> Result<&T, HookError> {
+        if self.state.load(Ordering::Acquire) != MODULE_SLOT_ACTIVE {
+            return Err(HookError::new(ELM_CALL_STATUS_INVALID));
+        }
+        // Safety: ACTIVE 只会在 T 已完整写入后发布；终结前运行时已经排空所有共享调用。
+        Ok(unsafe { (&*self.value.get()).assume_init_ref() })
+    }
+
+    #[doc(hidden)]
+    /// 在当前 generation 的活动实例上执行一个共享回调。
+    ///
+    /// 该入口只供 `#[elm::module]` 生成的 trampoline 使用。运行时必须在终结前排空
+    /// 所有回调；模块内部的可变状态应自行使用锁或原子类型同步。
+    pub fn with_active<R>(&self, callback: impl FnOnce(&T) -> R) -> Result<R, HookError> {
+        self.active_ref().map(callback)
+    }
+
+    fn transitioning_mut(&self) -> &mut T {
+        // Safety: 生命周期事务由运行时串行执行，TRANSITIONING 状态阻止新的共享借用。
+        unsafe { (&mut *self.value.get()).assume_init_mut() }
+    }
+
+    fn begin_transition(&self) -> Result<(), HookError> {
+        self.state
+            .compare_exchange(
+                MODULE_SLOT_ACTIVE,
+                MODULE_SLOT_TRANSITIONING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| HookError::new(ELM_CALL_STATUS_INVALID))
+    }
+
+    fn finish_transition(&self) {
+        self.state.store(MODULE_SLOT_ACTIVE, Ordering::Release);
+    }
+
+    /// 构造实例并执行初始化。
+    pub fn initialize(&self, context: &LifecycleContext) -> HookResult {
+        self.state
+            .compare_exchange(
+                MODULE_SLOT_EMPTY,
+                MODULE_SLOT_CONSTRUCTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| HookError::new(ELM_CALL_STATUS_INVALID))?;
+        let mut module = match T::create(context) {
+            Ok(module) => module,
+            Err(error) => {
+                self.state.store(MODULE_SLOT_EMPTY, Ordering::Release);
+                return Err(error);
+            }
+        };
+        if let Err(error) = module.initialize(context) {
+            let _ = module.finalize(context);
+            self.state.store(MODULE_SLOT_EMPTY, Ordering::Release);
+            return Err(error);
+        }
+        // Safety: 槽仍处于 CONSTRUCTING，当前事务独占尚未发布的存储。
+        unsafe { (&mut *self.value.get()).write(module) };
+        self.state.store(MODULE_SLOT_ACTIVE, Ordering::Release);
+        Ok(())
+    }
+
+    /// 执行终结并在成功后销毁实例。
+    pub fn finalize(&self, context: &LifecycleContext) -> HookResult {
+        self.begin_transition()?;
+        if let Err(error) = self.transitioning_mut().finalize(context) {
+            self.finish_transition();
+            return Err(error);
+        }
+        // Safety: 生命周期事务独占实例，finalize 成功后不会再有共享调用。
+        unsafe { (&mut *self.value.get()).assume_init_drop() };
+        self.state.store(MODULE_SLOT_EMPTY, Ordering::Release);
+        Ok(())
+    }
+
+    /// 调用静默钩子。
+    pub fn quiesce(&self, context: &LifecycleContext) -> HookResult {
+        self.begin_transition()?;
+        let result = self.transitioning_mut().quiesce(context);
+        self.finish_transition();
+        result
+    }
+
+    /// 调用暂停钩子。
+    pub fn pause(&self, context: &LifecycleContext) -> HookResult {
+        self.begin_transition()?;
+        let result = self.transitioning_mut().pause(context);
+        self.finish_transition();
+        result
+    }
+
+    /// 调用恢复钩子。
+    pub fn resume(&self, context: &LifecycleContext) -> HookResult {
+        self.begin_transition()?;
+        let result = self.transitioning_mut().resume(context);
+        self.finish_transition();
+        result
+    }
+
+    /// 调用迁移状态导出钩子。
+    pub fn migrate_export(
+        &self,
+        context: &MigrationContext,
+        output: &mut [u8],
+    ) -> MigrationExportResult {
+        self.active_ref()?.migrate_export(context, output)
+    }
+
+    /// 调用迁移状态导入钩子。
+    pub fn migrate_import(&self, context: &MigrationContext, input: &[u8]) -> HookResult {
+        self.begin_transition()?;
+        let result = self.transitioning_mut().migrate_import(context, input);
+        self.finish_transition();
+        result
+    }
+
+    /// 调用迁移撤销钩子。
+    pub fn migrate_abort(&self, context: &MigrationContext, input: &[u8]) -> HookResult {
+        self.begin_transition()?;
+        let result = self.transitioning_mut().migrate_abort(context, input);
+        self.finish_transition();
+        result
+    }
+
+    /// 调用激活后入口。
+    pub fn entry(&self, context: &EntryContext) -> EntryResult {
+        self.active_ref()?.entry(context)
+    }
+
+    /// 在模块处于活动状态时借用唯一实例。
+    pub fn with<R>(&self, call: impl FnOnce(&T) -> R) -> Result<R, HookError> {
+        self.active_ref().map(call)
+    }
+}
+
+impl<T: ElmModule> Default for ModuleSlot<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Safety: 状态机只在初始化完成后发布 T；T: Send + Sync 且生命周期事务由运行时串行化。
+unsafe impl<T: ElmModule> Sync for ModuleSlot<T> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// 固定 ELM 载荷编码或解码失败。
@@ -713,37 +1058,48 @@ impl Default for ManagedImport {
 
 #[repr(transparent)]
 #[derive(Debug)]
-/// 由装载器写入原生地址的直接固定 import 槽。
+/// 由装载器写入原生地址的类型化直接固定 import 槽。
 ///
-/// 该路径绕过受管调用帧，只适合已由运行时授予 native import 能力、ABI 指纹完全匹配且目标
-/// generation 被固定的低层场景。直接导入会限制或阻止目标热替换；普通 ELM 应使用
-/// [`ManagedImport`]。
-pub struct UnsafeDirectImport {
+/// 该路径绕过受管调用帧。attribute 会从 `F` 生成规范 Rust ABI 字符串，打包器将其 SHA-256
+/// 写入 EBI/EKI；装载器只在名称、契约、版本和摘要全部匹配时写入函数地址。动态 provider 的
+/// generation 会被固定，直到所有直接调用者卸载；因此该路径会限制 provider 热替换。需要
+/// generation 路由、固定载荷隔离或失败重试时应使用 [`ManagedImport`]。
+pub struct DirectImport<F> {
     slot: ImportSlot,
+    marker: PhantomData<fn() -> F>,
 }
 
-impl UnsafeDirectImport {
+impl<F> DirectImport<F> {
     /// 构造尚未绑定的零值直接导入槽。
     pub const fn new() -> Self {
         Self {
             slot: ImportSlot::new(),
+            marker: PhantomData,
         }
     }
 
-    /// 返回装载器写入的原生目标地址。
+    /// 返回装载器写入的原生目标函数。
     ///
     /// # 安全性
     ///
-    /// 调用方必须自行证明地址来自与声明完全一致的函数签名和 Rust ABI 指纹，目标 generation
-    /// 在整个调用期间被 pin，目标代码和数据仍映射，调用权限仍有效，并且 panic 不会跨 ABI
-    /// 展开。把地址转换为错误函数类型或在解绑、卸载、替换后调用会导致未定义行为。
-    pub unsafe fn address(&self) -> Option<usize> {
+    /// `F` 必须是 `#[elm::import]` 或 `#[elm::kernel_symbol]` 已写入元数据的 Rust 函数指针
+    /// 类型。调用方还必须保证参数满足目标函数的语义前置条件，且 panic 不会跨 ELM 边界
+    /// 展开。装载器负责在激活前核对签名摘要并固定目标 generation。
+    pub unsafe fn get(&self) -> Option<F>
+    where
+        F: Copy,
+    {
         let value = self.slot.read();
-        (value != 0).then_some(value)
+        if value == 0 {
+            return None;
+        }
+        assert_eq!(core::mem::size_of::<F>(), core::mem::size_of::<usize>());
+        // Safety: 宏只允许 Rust 函数指针作为 F，装载器已按同一规范签名摘要解析该地址。
+        Some(unsafe { core::mem::transmute_copy::<usize, F>(&value) })
     }
 }
 
-impl Default for UnsafeDirectImport {
+impl<F> Default for DirectImport<F> {
     fn default() -> Self {
         Self::new()
     }
@@ -1052,6 +1408,188 @@ fn runtime_error_to_hook(error: RuntimeApiError) -> HookError {
 #[doc(hidden)]
 pub mod __private {
     use super::*;
+
+    unsafe fn module_lifecycle_call(
+        raw: *mut ElmNativeHookContextV1,
+        expected_phase: u16,
+        call: impl FnOnce(&LifecycleContext) -> HookResult,
+    ) -> i32 {
+        runtime_api::ensure_linked();
+        let Some(raw) = (unsafe { raw.as_ref() }) else {
+            return ELM_CALL_STATUS_INVALID;
+        };
+        if raw.abi_version != ELM_NATIVE_HOOK_CONTEXT_ABI_VERSION
+            || raw.phase != expected_phase
+            || raw.reserved != 0
+        {
+            return ELM_CALL_STATUS_INVALID;
+        }
+        match call(&LifecycleContext::from_raw(*raw)) {
+            Ok(()) => 0,
+            Err(error) => error.status(),
+        }
+    }
+
+    /// 构造模块实例并执行初始化。
+    pub unsafe fn module_initialize_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeHookContextV1,
+    ) -> i32 {
+        unsafe { module_lifecycle_call(raw, 1, |context| slot.initialize(context)) }
+    }
+
+    /// 执行模块终结并销毁实例。
+    pub unsafe fn module_finalize_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeHookContextV1,
+    ) -> i32 {
+        unsafe { module_lifecycle_call(raw, 2, |context| slot.finalize(context)) }
+    }
+
+    /// 调用模块静默钩子。
+    pub unsafe fn module_quiesce_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeHookContextV1,
+    ) -> i32 {
+        unsafe { module_lifecycle_call(raw, 3, |context| slot.quiesce(context)) }
+    }
+
+    /// 调用模块暂停钩子。
+    pub unsafe fn module_pause_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeHookContextV1,
+    ) -> i32 {
+        unsafe { module_lifecycle_call(raw, 4, |context| slot.pause(context)) }
+    }
+
+    /// 调用模块恢复钩子。
+    pub unsafe fn module_resume_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeHookContextV1,
+    ) -> i32 {
+        unsafe { module_lifecycle_call(raw, 5, |context| slot.resume(context)) }
+    }
+
+    /// 调用模块迁移导出钩子。
+    pub unsafe fn module_migration_export_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeMigrationContextV1,
+    ) -> i32 {
+        runtime_api::ensure_linked();
+        let Some(raw) = (unsafe { raw.as_mut() }) else {
+            return ELM_CALL_STATUS_INVALID;
+        };
+        if !migration_context_valid(raw, 6) {
+            return ELM_CALL_STATUS_INVALID;
+        }
+        let Ok(capacity) = usize::try_from(raw.buffer_capacity) else {
+            return ELM_CALL_STATUS_INVALID;
+        };
+        if raw.buffer_ptr == 0 && capacity != 0 {
+            return ELM_CALL_STATUS_INVALID;
+        }
+        let output = if capacity == 0 {
+            &mut []
+        } else {
+            // Safety: 原生 frame 已验证非空地址和完整容量，借用只持续本次钩子调用。
+            unsafe { core::slice::from_raw_parts_mut(raw.buffer_ptr as *mut u8, capacity) }
+        };
+        match slot.migrate_export(&MigrationContext::from_raw(raw), output) {
+            Ok(len) if len <= capacity => {
+                raw.buffer_len = len as u64;
+                raw.status = 0;
+                0
+            }
+            Ok(_) => ELM_CALL_STATUS_INVALID,
+            Err(error) => error.status(),
+        }
+    }
+
+    unsafe fn module_migration_input_call<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeMigrationContextV1,
+        expected_phase: u16,
+        call: impl FnOnce(&ModuleSlot<T>, &MigrationContext, &[u8]) -> HookResult,
+    ) -> i32 {
+        runtime_api::ensure_linked();
+        let Some(raw) = (unsafe { raw.as_mut() }) else {
+            return ELM_CALL_STATUS_INVALID;
+        };
+        if !migration_context_valid(raw, expected_phase)
+            || raw.buffer_len > raw.buffer_capacity
+            || raw.buffer_ptr == 0 && raw.buffer_len != 0
+        {
+            return ELM_CALL_STATUS_INVALID;
+        }
+        let Ok(len) = usize::try_from(raw.buffer_len) else {
+            return ELM_CALL_STATUS_INVALID;
+        };
+        let input = if len == 0 {
+            &[]
+        } else {
+            // Safety: 原生 frame 已验证非空地址和有效长度，借用只持续本次钩子调用。
+            unsafe { core::slice::from_raw_parts(raw.buffer_ptr as *const u8, len) }
+        };
+        match call(slot, &MigrationContext::from_raw(raw), input) {
+            Ok(()) => {
+                raw.status = 0;
+                0
+            }
+            Err(error) => error.status(),
+        }
+    }
+
+    /// 调用模块迁移导入钩子。
+    pub unsafe fn module_migration_import_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeMigrationContextV1,
+    ) -> i32 {
+        unsafe {
+            module_migration_input_call(slot, raw, 7, |slot, context, input| {
+                slot.migrate_import(context, input)
+            })
+        }
+    }
+
+    /// 调用模块迁移撤销钩子。
+    pub unsafe fn module_migration_abort_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeMigrationContextV1,
+    ) -> i32 {
+        unsafe {
+            module_migration_input_call(slot, raw, 8, |slot, context, input| {
+                slot.migrate_abort(context, input)
+            })
+        }
+    }
+
+    /// 调用模块激活后入口。
+    pub unsafe fn module_entry_trampoline<T: ElmModule>(
+        slot: &'static ModuleSlot<T>,
+        raw: *mut ElmNativeEntryFrameV1,
+    ) -> i32 {
+        runtime_api::ensure_linked();
+        let Some(raw) = (unsafe { raw.as_mut() }) else {
+            return ELM_CALL_STATUS_INVALID;
+        };
+        if raw.abi_version != ELM_NATIVE_ENTRY_ABI_VERSION
+            || raw.flags != 0
+            || raw.reserved0 != 0
+            || raw.reserved1 != 0
+        {
+            return ELM_CALL_STATUS_INVALID;
+        }
+        match slot.entry(&EntryContext::from_raw(*raw)) {
+            Ok(()) => {
+                raw.exit_code = 0;
+                0
+            }
+            Err(error) => {
+                raw.exit_code = error.status();
+                error.status()
+            }
+        }
+    }
 
     pub unsafe fn lifecycle_trampoline(
         raw: *mut ElmNativeHookContextV1,
@@ -1386,7 +1924,7 @@ mod tests {
             core::mem::size_of::<usize>()
         );
         assert_eq!(
-            core::mem::size_of::<UnsafeDirectImport>(),
+            core::mem::size_of::<DirectImport<fn()>>(),
             core::mem::size_of::<usize>()
         );
     }

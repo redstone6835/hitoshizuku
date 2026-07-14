@@ -442,30 +442,35 @@ fn main_rs(name: &str) -> String {
 extern crate alloc;
 
 use alloc::{{boxed::Box, string::String, sync::Arc, vec::Vec}};
-use elm::{{HookResult, LifecycleContext}};
+use elm::{{ElmModule, HookError, HookResult, LifecycleContext}};
 
 kernel_api::elm_global_allocator!();
 
-#[elm::on_initialize]
-fn initialize(_context: &LifecycleContext) -> HookResult {{
-    let mut values = Vec::new();
-    values.extend_from_slice(&[1_u32, 2, 3]);
-    let boxed = Box::new(values.iter().copied().sum::<u32>());
-    let shared = Arc::new(String::from("{name}: initialized"));
-    core::hint::black_box((&values, &boxed, &shared));
-    if *boxed != 6 || Arc::strong_count(&shared) != 1 {{
-        return Err(elm::HookError::new(-1));
-    }}
-    elm::runtime::log(6, shared.as_str())
-        .map_err(|_| elm::HookError::new(-1))?;
-    Ok(())
-}}
+struct Module;
 
-#[elm::on_finalize]
-fn finalize(_context: &LifecycleContext) -> HookResult {{
-    elm::runtime::log(6, "{name}: finalized")
-        .map_err(|_| elm::HookError::new(-1))?;
-    Ok(())
+#[elm::module]
+impl ElmModule for Module {{
+    fn create(_context: &LifecycleContext) -> Result<Self, HookError> {{
+        Ok(Self)
+    }}
+
+    fn initialize(&mut self, _context: &LifecycleContext) -> HookResult {{
+        let mut values = Vec::new();
+        values.extend_from_slice(&[1_u32, 2, 3]);
+        let boxed = Box::new(values.iter().copied().sum::<u32>());
+        let shared = Arc::new(String::from("{name}: initialized"));
+        core::hint::black_box((&values, &boxed, &shared));
+        if *boxed != 6 || Arc::strong_count(&shared) != 1 {{
+            return Err(HookError::new(-1));
+        }}
+        elm::runtime::log(6, shared.as_str()).map_err(|_| HookError::new(-1))?;
+        Ok(())
+    }}
+
+    fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {{
+        elm::runtime::log(6, "{name}: finalized").map_err(|_| HookError::new(-1))?;
+        Ok(())
+    }}
 }}
 
 #[panic_handler]
@@ -702,7 +707,7 @@ rustflags = [
 ]
 "#;
 
-const ELM_LINKER_SCRIPT: &str = r#"ENTRY(on_initialize)
+const ELM_LINKER_SCRIPT: &str = r#"ENTRY(__elm_module_entry_v1)
 
 PHDRS
 {
@@ -723,6 +728,7 @@ SECTIONS
     . = ALIGN(4096);
     .rodata :
     {
+        KEEP(*(.rodata.elm.module))
         *(.rodata .rodata.* .srodata .srodata.*)
         *(.eh_frame .eh_frame_hdr)
     } :rodata
@@ -859,6 +865,7 @@ uri = "forbidden"
         assert!(service_source.contains("core::hint::black_box"));
         assert!(service_source.contains("elm::runtime::log"));
         assert!(service_source.contains("elm::runtime::abort_panic"));
+        assert!(service_source.contains("impl ElmModule for Module"));
         assert!(
             service
                 .path()

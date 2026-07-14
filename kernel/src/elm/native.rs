@@ -10,20 +10,19 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use allocator::{KERNEL_ALLOCATOR, MemoryDomain, MemoryRequest, PAGE_SIZE, PagePolicy, Zeroing};
 use elm_model::{
-    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE,
-    ELM_EBI_HOOK_ON_MIGRATE_ABORT, ELM_EBI_HOOK_ON_MIGRATE_EXPORT, ELM_EBI_HOOK_ON_MIGRATE_IMPORT,
-    ELM_EBI_HOOK_ON_PAUSE, ELM_EBI_HOOK_ON_QUIESCE, ELM_EBI_HOOK_ON_RESUME, ELM_MGR_STATUS_INVALID,
-    ELM_MGR_STATUS_OK, ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_MANAGED_CALL_ABI_VERSION,
-    ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION, ELM_NATIVE_PROVIDER_CALL_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK,
-    ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE,
-    ElmCallFrame, ElmContext, ElmCurrentContext, ElmEbiImage, ElmEbiLoadStatus,
-    ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiSegmentKind, ElmEbiSegmentPayload,
-    ElmError, ElmId, ElmLifecyclePhase, ElmNativeEntryFrameV1, ElmNativeHookContextV1,
-    ElmNativeManagedCallV1, ElmNativeMigrationContextV1, ElmNativeProviderCallV1,
-    ElmNativeProviderSnapshotV1, ElmReplyFrame, ElmResult, ElmState, Generation, LeaseId, PortId,
-    relocation_width, state_code, try_enter_current_context,
+    ELM_CALL_STATUS_PROVIDER_FAULT, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_OK,
+    ELM_MODULE_DESCRIPTOR_SYMBOL, ELM_NATIVE_ENTRY_ABI_VERSION,
+    ELM_NATIVE_MANAGED_CALL_ABI_VERSION, ELM_NATIVE_MIGRATION_CONTEXT_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED,
+    ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ElmCallFrame, ElmContext, ElmCurrentContext,
+    ElmEbiImage, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiSegmentKind,
+    ElmEbiSegmentPayload, ElmError, ElmId, ElmLifecyclePhase, ElmModuleDescriptorV1,
+    ElmNativeEntryFrameV1, ElmNativeHookContextV1, ElmNativeManagedCallV1,
+    ElmNativeMigrationContextV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
+    ElmReplyFrame, ElmResult, ElmState, Generation, LeaseId, PortId, relocation_width, state_code,
+    try_enter_current_context,
 };
 use general::elm_guard::{
     ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_MANAGED_CALL,
@@ -323,10 +322,35 @@ impl NativeInvocation {
             requested_deadline_ns,
             now_ns,
         )
-        .map_err(|_| ElmError::LeaseBusy)?;
-        let stack = NativeCallStack::allocate()?;
-        let guard = ElmGuard::enter(cell.0, phase, accounting.effective_deadline_ns())
-            .ok_or(ElmError::InvalidTransition)?;
+        .map_err(|error| {
+            log::error!(
+                "[elm] 原生调用预算拒绝 cell={} phase={} error={:?}",
+                cell.0,
+                phase,
+                error
+            );
+            ElmError::LeaseBusy
+        })?;
+        let stack = NativeCallStack::allocate().map_err(|error| {
+            log::error!(
+                "[elm] 原生调用隔离栈分配失败 cell={} phase={} error={:?}",
+                cell.0,
+                phase,
+                error
+            );
+            error
+        })?;
+        let guard = ElmGuard::enter(cell.0, phase, accounting.effective_deadline_ns()).ok_or_else(
+            || {
+                log::error!(
+                    "[elm] 原生调用保护域拒绝进入 cell={} phase={} deadline_ns={}",
+                    cell.0,
+                    phase,
+                    accounting.effective_deadline_ns()
+                );
+                ElmError::InvalidTransition
+            },
+        )?;
         Ok(Self {
             guard,
             accounting,
@@ -513,26 +537,75 @@ impl LoadedElmImage {
             return Err(status);
         }
         loaded.symbols = loaded.collect_symbols(image)?;
-        loaded.initialize = loaded
-            .symbol_address(ELM_EBI_HOOK_ON_INITIALIZE)
+        let descriptor_address = loaded
+            .symbol_address(ELM_MODULE_DESCRIPTOR_SYMBOL)
             .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
-        loaded.finalize = loaded
-            .symbol_address(ELM_EBI_HOOK_ON_FINALIZE)
+        let descriptor_symbol = image
+            .symbol_location(ELM_MODULE_DESCRIPTOR_SYMBOL)
             .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
-        loaded.quiesce = loaded.symbol_address(ELM_EBI_HOOK_ON_QUIESCE);
-        loaded.pause = loaded.symbol_address(ELM_EBI_HOOK_ON_PAUSE);
-        loaded.resume = loaded.symbol_address(ELM_EBI_HOOK_ON_RESUME);
-        loaded.migrate_export = loaded.symbol_address(ELM_EBI_HOOK_ON_MIGRATE_EXPORT);
-        loaded.migrate_import = loaded.symbol_address(ELM_EBI_HOOK_ON_MIGRATE_IMPORT);
-        loaded.migrate_abort = loaded.symbol_address(ELM_EBI_HOOK_ON_MIGRATE_ABORT);
-        loaded.entry = match &image.unit.entry {
-            Some(entry) => Some(
-                loaded
-                    .symbol_address(&entry.symbol)
-                    .ok_or(ElmEbiLoadStatus::InvalidManifest)?,
-            ),
-            None => None,
-        };
+        if descriptor_symbol.size < core::mem::size_of::<ElmModuleDescriptorV1>() as u64
+            || descriptor_address % core::mem::align_of::<ElmModuleDescriptorV1>() != 0
+        {
+            log::error!(
+                "[elm] module descriptor layout invalid cell={} address=0x{:x} symbol_size={} expected_size={} align={}",
+                cell.0,
+                descriptor_address,
+                descriptor_symbol.size,
+                core::mem::size_of::<ElmModuleDescriptorV1>(),
+                core::mem::align_of::<ElmModuleDescriptorV1>()
+            );
+            drop(loaded);
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        // Safety: symbol_location 已由 collect_symbols 校验位于已映射段内，且上面验证了尺寸和对齐。
+        let descriptor = unsafe { &*(descriptor_address as *const ElmModuleDescriptorV1) };
+        if !descriptor.valid() {
+            log::error!(
+                "[elm] module descriptor invalid cell={} magic={:02x?} abi={} size={} flags=0x{:x} instance_size={} instance_align={}",
+                cell.0,
+                descriptor.magic,
+                descriptor.abi_version,
+                descriptor.struct_size,
+                descriptor.flags,
+                descriptor.instance_size,
+                descriptor.instance_align
+            );
+            drop(loaded);
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        let entries = [
+            descriptor.initialize as usize,
+            descriptor.finalize as usize,
+            descriptor.quiesce as usize,
+            descriptor.pause as usize,
+            descriptor.resume as usize,
+            descriptor.migrate_export as usize,
+            descriptor.migrate_import as usize,
+            descriptor.migrate_abort as usize,
+            descriptor.entry as usize,
+        ];
+        if entries
+            .iter()
+            .any(|address| !loaded.code_contains(*address))
+        {
+            log::error!(
+                "[elm] module descriptor entry outside code cell={} entries={:x?} code={:?}",
+                cell.0,
+                entries,
+                loaded.execution_bounds()
+            );
+            drop(loaded);
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        loaded.initialize = descriptor.initialize as usize;
+        loaded.finalize = descriptor.finalize as usize;
+        loaded.quiesce = Some(descriptor.quiesce as usize);
+        loaded.pause = Some(descriptor.pause as usize);
+        loaded.resume = Some(descriptor.resume as usize);
+        loaded.migrate_export = Some(descriptor.migrate_export as usize);
+        loaded.migrate_import = Some(descriptor.migrate_import as usize);
+        loaded.migrate_abort = Some(descriptor.migrate_abort as usize);
+        loaded.entry = Some(descriptor.entry as usize);
         if !loaded.seal_permissions() {
             drop(loaded);
             return Err(ElmEbiLoadStatus::RuntimeRejected);
@@ -694,6 +767,24 @@ impl LoadedElmImage {
                 .ok_or(ElmEbiLoadStatus::InvalidSegment)?;
             let value =
                 self.relocation_value(image, imports, relocation.kind, relocation.value_index)?;
+            if matches!(
+                relocation.kind,
+                ElmEbiRelocationKind::ImportAbs64
+                    | ElmEbiRelocationKind::ImportRel32
+                    | ElmEbiRelocationKind::ImportRel64
+            ) && image
+                .unit
+                .imports
+                .get(relocation.value_index as usize)
+                .is_some_and(|import| import.is_kernel_symbol())
+            {
+                log::info!(
+                    "[elm] relocated direct kernel symbol import={} target=0x{:x} value=0x{:x}",
+                    relocation.value_index,
+                    target_addr,
+                    value
+                );
+            }
             match relocation.kind {
                 ElmEbiRelocationKind::SymbolRel32
                 | ElmEbiRelocationKind::SymbolRel64
@@ -780,6 +871,18 @@ impl LoadedElmImage {
             .iter()
             .find(|symbol| symbol.name == name)
             .map(|symbol| symbol.address)
+    }
+
+    fn code_contains(&self, address: usize) -> bool {
+        self.segments
+            .iter()
+            .filter(|segment| segment.kind == ElmEbiSegmentKind::Code)
+            .any(|segment| {
+                segment
+                    .vaddr
+                    .checked_add(segment.size)
+                    .is_some_and(|end| address >= segment.vaddr && address < end)
+            })
     }
 
     fn symbol_address_from_image(&self, image: &ElmEbiImage, name: &str) -> Option<usize> {
@@ -1073,10 +1176,20 @@ fn call_native_hook(
     bounds: NativeExecutionBounds,
 ) -> ElmResult<()> {
     if address == 0 {
+        log::error!(
+            "[elm] 原生生命周期入口为空 cell={} phase={:?}",
+            context.cell_id().0,
+            context.phase()
+        );
         return Err(ElmError::InvalidTransition);
     }
     let invocation = NativeInvocation::enter(context.cell_id(), ELM_GUARD_PHASE_HOOK, 0)?;
     let Some(_current) = try_enter_current_context(context) else {
+        log::error!(
+            "[elm] 原生生命周期上下文拒绝进入 cell={} phase={:?}",
+            context.cell_id().0,
+            context.phase()
+        );
         return Err(ElmError::InvalidTransition);
     };
     let mut native_context = ElmNativeHookContextV1::from_context(context);
@@ -1092,11 +1205,27 @@ fn call_native_hook(
     };
     let outcome = invocation.finish();
     if outcome.aborted || outcome.budget_exceeded {
+        log::error!(
+            "[elm] native lifecycle aborted cell={} phase={:?} address=0x{:x} aborted={} budget_exceeded={} status={}",
+            context.cell_id().0,
+            context.phase(),
+            address,
+            outcome.aborted,
+            outcome.budget_exceeded,
+            status
+        );
         return Err(ElmError::InvalidTransition);
     }
     if status == 0 {
         Ok(())
     } else {
+        log::error!(
+            "[elm] native lifecycle returned error cell={} phase={:?} address=0x{:x} status={}",
+            context.cell_id().0,
+            context.phase(),
+            address,
+            status
+        );
         Err(ElmError::InvalidTransition)
     }
 }
@@ -1233,6 +1362,14 @@ fn call_native_migration_hook(
     };
     let outcome = invocation.finish();
     if outcome.aborted || outcome.budget_exceeded {
+        log::error!(
+            "[elm] native entry aborted cell={} address=0x{:x} aborted={} budget_exceeded={} status={}",
+            cell.0,
+            address,
+            outcome.aborted,
+            outcome.budget_exceeded,
+            status
+        );
         return Err(ElmError::InvalidTransition);
     }
     if status == 0
@@ -1266,6 +1403,7 @@ fn call_optional_native_entry(
         return Ok(());
     };
     if address == 0 {
+        log::error!("[elm] 原生模块入口为空 cell={}", cell.0);
         return Err(ElmError::InvalidTransition);
     }
     let invocation = NativeInvocation::enter(cell, ELM_GUARD_PHASE_ENTRY, 0)?;
@@ -1278,6 +1416,7 @@ fn call_optional_native_entry(
         0,
     );
     let Some(_current) = try_enter_current_context(&elm_context) else {
+        log::error!("[elm] 原生模块入口上下文拒绝进入 cell={}", cell.0);
         return Err(ElmError::InvalidTransition);
     };
     let mut frame = ElmNativeEntryFrameV1::new(
@@ -1298,6 +1437,14 @@ fn call_optional_native_entry(
     };
     let outcome = invocation.finish();
     if outcome.aborted || outcome.budget_exceeded {
+        log::error!(
+            "[elm] 原生模块入口中止 cell={} address=0x{:x} aborted={} budget_exceeded={} status={}",
+            cell.0,
+            address,
+            outcome.aborted,
+            outcome.budget_exceeded,
+            status
+        );
         return Err(ElmError::InvalidTransition);
     }
     if status == 0
@@ -1313,6 +1460,13 @@ fn call_optional_native_entry(
     {
         Ok(())
     } else {
+        log::error!(
+            "[elm] native entry invalid cell={} address=0x{:x} status={} frame={:?}",
+            cell.0,
+            address,
+            status,
+            frame
+        );
         Err(ElmError::InvalidTransition)
     }
 }

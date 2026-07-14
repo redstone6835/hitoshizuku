@@ -19,13 +19,14 @@ use crate::ebi::{
     ELM_EBI_ABI_VERSION, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
     ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
     ELM_EBI_MAX_KERNEL_API_REQUIREMENTS, ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS,
-    ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_SYMBOL_NAME_LEN,
-    ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl,
-    ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
-    ElmEbiKernelApiRequirement, ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind,
-    ElmEbiLifecycleHooks, ElmEbiLoadStatus, ElmEbiMenuDecl, ElmEbiProviderPortDecl,
-    ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature, ElmEbiSegment,
-    ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
+    ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN,
+    ELM_EBI_RUST_ABI_HASH_LEN, ELM_EBI_SYMBOL_NAME_LEN, ElmEbiApiCompatibility, ElmEbiArch,
+    ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiKernelApiRequirement,
+    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
+    ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind,
+    ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload,
+    ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
 };
 use crate::elmapi::{
     ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_KERNEL_API_IDENTIFIER_MAX_LEN,
@@ -94,7 +95,8 @@ const EKI_EXTENSION_RECORD_SIZE: usize =
 /// `ELM_EKI_PROVIDER_PORT_RECORD_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE: usize =
     24 + ELM_NEXUS_CONTRACT_LEN + ELM_EBI_SYMBOL_NAME_LEN * 2;
-const EKI_SYMBOL_RECORD_SIZE: usize = 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
+const EKI_SYMBOL_RECORD_SIZE: usize =
+    16 + ELM_EBI_RUST_ABI_HASH_LEN + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_LIFECYCLE_HOOK_RECORD_SIZE: usize = 20 + ELM_EBI_SYMBOL_NAME_LEN;
 /// `ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE: usize = 32 + ELM_EBI_SYMBOL_NAME_LEN;
@@ -1126,7 +1128,7 @@ fn parse_imports(payload: &[u8]) -> Result<Vec<ElmEbiImportDecl>, ElmEbiLoadStat
     let mut imports = Vec::new();
     for index in 0..count {
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_SYMBOL_RECORD_SIZE;
-        let (name, contract, min_version, max_version, flags) =
+        let (name, contract, min_version, max_version, flags, rust_abi_hash) =
             parse_symbol_record(payload, offset)?;
         imports.push(ElmEbiImportDecl::new_range(
             name,
@@ -1134,6 +1136,7 @@ fn parse_imports(payload: &[u8]) -> Result<Vec<ElmEbiImportDecl>, ElmEbiLoadStat
             min_version,
             max_version,
             flags,
+            rust_abi_hash,
         )?);
     }
     Ok(imports)
@@ -1144,11 +1147,18 @@ fn parse_exports(payload: &[u8]) -> Result<Vec<ElmEbiExportDecl>, ElmEbiLoadStat
     let mut exports = Vec::new();
     for index in 0..count {
         let offset = EKI_TABLE_HEADER_SIZE + index * EKI_SYMBOL_RECORD_SIZE;
-        let (name, contract, version, max_version, flags) = parse_symbol_record(payload, offset)?;
+        let (name, contract, version, max_version, flags, rust_abi_hash) =
+            parse_symbol_record(payload, offset)?;
         if max_version != version {
             return Err(ElmEbiLoadStatus::InvalidManifest);
         }
-        exports.push(ElmEbiExportDecl::new(name, contract, version, flags)?);
+        exports.push(ElmEbiExportDecl::new(
+            name,
+            contract,
+            version,
+            flags,
+            rust_abi_hash,
+        )?);
     }
     Ok(exports)
 }
@@ -1288,13 +1298,25 @@ fn parse_relocations(payload: &[u8]) -> Result<Vec<ElmEbiRelocationDecl>, ElmEbi
 fn parse_symbol_record(
     payload: &[u8],
     offset: usize,
-) -> Result<(String, String, u32, u32, u32), ElmEbiLoadStatus> {
+) -> Result<
+    (
+        String,
+        String,
+        u32,
+        u32,
+        u32,
+        [u8; ELM_EBI_RUST_ABI_HASH_LEN],
+    ),
+    ElmEbiLoadStatus,
+> {
     let min_version = read_u32(payload, offset)?;
     let flags = read_u32(payload, offset + 4)?;
     let name_len = read_u16(payload, offset + 8)? as usize;
     let contract_len = read_u16(payload, offset + 10)? as usize;
     let max_version = read_u32(payload, offset + 12)?;
-    let name_start = offset + 16;
+    let mut rust_abi_hash = [0; ELM_EBI_RUST_ABI_HASH_LEN];
+    rust_abi_hash.copy_from_slice(read_bytes(payload, offset + 16, ELM_EBI_RUST_ABI_HASH_LEN)?);
+    let name_start = offset + 16 + ELM_EBI_RUST_ABI_HASH_LEN;
     let contract_start = name_start + ELM_EBI_SYMBOL_NAME_LEN;
     Ok((
         fixed_str(payload, name_start, name_len)?,
@@ -1302,6 +1324,7 @@ fn parse_symbol_record(
         min_version,
         max_version,
         flags,
+        rust_abi_hash,
     ))
 }
 

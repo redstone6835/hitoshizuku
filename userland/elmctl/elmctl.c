@@ -690,21 +690,23 @@ static int cmd_preflight_lifecycle(int argc, char **argv)
     return print_mgr_response("preflight-lifecycle", &response);
 }
 
-static int source_request_from_file(const char *path, uint8_t *out, size_t cap, size_t *len)
+static int source_request_from_session(uint64_t session_id, uint8_t *out, size_t cap, size_t *len)
 {
     struct elm_ebi_source_request request;
     struct elm_projection_source_request projection;
-    size_t image_len = 0;
-    size_t prefix = sizeof(request) + sizeof(projection);
-    if (cap < prefix) {
-        errno = EMSGSIZE;
+    struct elm_image_session_reference_v1 reference;
+    size_t total = sizeof(request) + sizeof(projection) + sizeof(reference);
+    if (session_id == 0) {
+        errno = EINVAL;
         return -1;
     }
-    if (elmctl_read_file(path, out + prefix, cap - prefix, &image_len) != 0) {
+    if (cap < total) {
+        errno = EMSGSIZE;
         return -1;
     }
     memset(&request, 0, sizeof(request));
     memset(&projection, 0, sizeof(projection));
+    memset(&reference, 0, sizeof(reference));
     request.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
     request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
     request.flags = ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API;
@@ -723,87 +725,133 @@ static int source_request_from_file(const char *path, uint8_t *out, size_t cap, 
     request.budget.max_cpu_time_ns_per_call = ELM_RESOURCE_BUDGET_DEFAULT_CPU_TIME_NS_PER_CALL;
     request.budget.cpu_budget_ns_per_period = ELM_RESOURCE_BUDGET_DEFAULT_CPU_BUDGET_NS_PER_PERIOD;
     request.budget.cpu_period_ns = ELM_RESOURCE_BUDGET_DEFAULT_CPU_PERIOD_NS;
-    request.payload_len = (uint32_t)(sizeof(projection) + image_len);
+    request.payload_len = (uint32_t)(sizeof(projection) + sizeof(reference));
     projection.abi_version = ELM_EBI_PROJECTION_SOURCE_ABI_VERSION;
+    projection.flags = ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION;
     projection.provider_id = ELM_EKI_PROJECTION_SOURCE_ID;
-    projection.payload_len = (uint32_t)image_len;
+    projection.payload_len = sizeof(reference);
+    reference.abi_version = ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION;
+    reference.session_id = session_id;
     memcpy(out, &request, sizeof(request));
     memcpy(out + sizeof(request), &projection, sizeof(projection));
-    *len = prefix + image_len;
+    memcpy(out + sizeof(request) + sizeof(projection), &reference, sizeof(reference));
+    *len = total;
     return 0;
+}
+
+static void abort_session_preserving_errno(uint64_t session_id)
+{
+    int saved = errno;
+    (void)elmctl_abort_image_session(session_id);
+    errno = saved;
 }
 
 static int cmd_load_eki(int argc, char **argv)
 {
-    uint8_t *input = NULL;
+    uint8_t input[sizeof(struct elm_ebi_source_request) +
+                  sizeof(struct elm_projection_source_request) +
+                  sizeof(struct elm_image_session_reference_v1)];
     size_t input_len = 0;
+    uint64_t session_id = 0;
     struct elmctl_mgr_response response;
+    struct elm_load_cell_response load;
     int ret;
     if (argc < 3) {
         usage();
         return 1;
     }
-    input = malloc(ELM_MGR_MAX_INPUT);
-    if (input == NULL) {
-        errno = ENOMEM;
+    if (elmctl_upload_image_file(argv[2], &session_id) != 0) {
         return fail("load-eki");
     }
-    if (source_request_from_file(argv[2], input, ELM_MGR_MAX_INPUT, &input_len) != 0) {
-        free(input);
+    if (source_request_from_session(session_id, input, sizeof(input), &input_len) != 0) {
+        abort_session_preserving_errno(session_id);
         return fail("load-eki");
     }
     if (elmctl_mgr_call(ELM_MGR_CALL_LOAD_CELL, input, input_len, g_out, sizeof(g_out),
                         &response) != 0) {
-        free(input);
+        abort_session_preserving_errno(session_id);
         return fail("load-eki");
     }
-    ret = print_mgr_response("load-eki", &response);
-    free(input);
+    if (response.status != ELM_MGR_STATUS_OK) {
+        abort_session_preserving_errno(session_id);
+        ret = print_mgr_response("load-eki", &response);
+    } else if (response.payload_len != sizeof(load)) {
+        errno = EPROTO;
+        ret = fail("load-eki-response");
+    } else {
+        memcpy(&load, response.payload, sizeof(load));
+        if (load.reserved != 0) {
+            errno = EPROTO;
+            ret = fail("load-eki-response");
+        } else {
+            printf("load-eki: cell=%llu status=%d(%s) state=%s reason=%u\n",
+                   (unsigned long long)load.cell_id, load.status,
+                   elmctl_ebi_load_status_name(load.status),
+                   elmctl_state_name(load.final_state), load.reason);
+            ret = load.status == ELM_EBI_LOAD_STATUS_OK ? 0 : 2;
+        }
+    }
     return ret;
 }
 
 static int cmd_replace_eki(int argc, char **argv)
 {
-    uint8_t *input = NULL;
+    uint8_t input[sizeof(struct elm_replace_cell_request_v1) +
+                  sizeof(struct elm_projection_source_request) +
+                  sizeof(struct elm_image_session_reference_v1)];
     struct elm_replace_cell_request_v1 request;
     struct elm_projection_source_request projection;
+    struct elm_image_session_reference_v1 reference;
     uint64_t cell;
-    size_t image_len = 0;
-    size_t prefix = sizeof(request) + sizeof(projection);
+    uint64_t session_id = 0;
+    size_t input_len = sizeof(input);
     struct elmctl_mgr_response response;
+    struct elm_replace_cell_response_v1 replace;
     int ret;
     if (argc < 4 || require_u64(argv[2], &cell) != 0) {
         usage();
         return 1;
     }
-    input = malloc(ELM_MGR_MAX_INPUT);
-    if (input == NULL) {
-        errno = ENOMEM;
-        return fail("replace-eki");
-    }
-    if (elmctl_read_file(argv[3], input + prefix, ELM_MGR_MAX_INPUT - prefix, &image_len) != 0) {
-        free(input);
+    if (elmctl_upload_image_file(argv[3], &session_id) != 0) {
         return fail("replace-eki");
     }
     memset(&request, 0, sizeof(request));
     memset(&projection, 0, sizeof(projection));
+    memset(&reference, 0, sizeof(reference));
     request.abi_version = ELM_REPLACE_CELL_ABI_VERSION;
     request.flags = ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
     request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
     request.target_cell_id = cell;
-    request.source_payload_len = (uint32_t)(sizeof(projection) + image_len);
+    request.source_payload_len = (uint32_t)(sizeof(projection) + sizeof(reference));
     projection.abi_version = ELM_EBI_PROJECTION_SOURCE_ABI_VERSION;
+    projection.flags = ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION;
     projection.provider_id = ELM_EKI_PROJECTION_SOURCE_ID;
-    projection.payload_len = (uint32_t)image_len;
+    projection.payload_len = sizeof(reference);
+    reference.abi_version = ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION;
+    reference.session_id = session_id;
     memcpy(input, &request, sizeof(request));
     memcpy(input + sizeof(request), &projection, sizeof(projection));
-    if (elmctl_mgr_call(ELM_MGR_CALL_REPLACE_CELL, input, prefix + image_len, g_out,
+    memcpy(input + sizeof(request) + sizeof(projection), &reference, sizeof(reference));
+    if (elmctl_mgr_call(ELM_MGR_CALL_REPLACE_CELL, input, input_len, g_out,
                         sizeof(g_out), &response) != 0) {
-        free(input);
+        abort_session_preserving_errno(session_id);
         return fail("replace-eki");
     }
-    ret = print_mgr_response("replace-eki", &response);
-    free(input);
+    if (response.status != ELM_MGR_STATUS_OK) {
+        abort_session_preserving_errno(session_id);
+        ret = print_mgr_response("replace-eki", &response);
+    } else if (response.payload_len != sizeof(replace)) {
+        errno = EPROTO;
+        ret = fail("replace-eki-response");
+    } else {
+        memcpy(&replace, response.payload, sizeof(replace));
+        printf("replace-eki: cell=%llu status=%d(%s) state=%s generation=%llu migrated=%u reason=%u blockers=0x%llx\n",
+               (unsigned long long)replace.cell_id, replace.status,
+               elmctl_status_name(replace.status), elmctl_state_name(replace.final_state),
+               (unsigned long long)replace.generation, replace.migrated_len, replace.reason,
+               (unsigned long long)replace.blockers);
+        ret = replace.status == ELM_MGR_STATUS_OK ? 0 : 2;
+    }
     return ret;
 }
 

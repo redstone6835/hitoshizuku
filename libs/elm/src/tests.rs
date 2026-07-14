@@ -6,14 +6,15 @@ use ed25519_dalek::{Signer, SigningKey};
 use crate::{
     ActionId, BindingGraph, BindingId, ELM_ACTION_OPCODE_INVOKE, ELM_ACTION_RESULT_HEALTH,
     ELM_API_FEATURE_LOG, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
-    ELM_EBI_HOOK_ON_FINALIZE, ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_HOOK_ON_MIGRATE_ABORT,
-    ELM_EBI_HOOK_ON_MIGRATE_EXPORT, ELM_EBI_HOOK_ON_MIGRATE_IMPORT, ELM_EBI_IMPORT_FLAG_MANAGED,
-    ELM_EBI_NAME_LEN, ELM_EBI_PROJECTION_SOURCE_ABI_VERSION,
-    ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE, ELM_EBI_SEGMENT_FLAG_EXECUTE,
-    ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SOURCE_ABI_VERSION,
-    ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE,
-    ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
-    ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EBI_EXPORT_FLAG_DIRECT_PINNED, ELM_EBI_EXPORT_FLAG_MANAGED, ELM_EBI_HOOK_ON_FINALIZE,
+    ELM_EBI_HOOK_ON_INITIALIZE, ELM_EBI_HOOK_ON_MIGRATE_ABORT, ELM_EBI_HOOK_ON_MIGRATE_EXPORT,
+    ELM_EBI_HOOK_ON_MIGRATE_IMPORT, ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+    ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL, ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EBI_NAME_LEN,
+    ELM_EBI_PROJECTION_SOURCE_ABI_VERSION, ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE,
+    ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE,
+    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_BLOCK_DESC_SIZE,
+    ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION,
+    ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
     ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROJECTION_SOURCE_ID, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
     ELM_HEALTH_CHECK_GRAPH, ELM_HEALTH_DETAIL_NONE, ELM_HEALTH_FLAG_HAS_FAILURES,
     ELM_LIFECYCLE_REASON_HAS_DEPENDENTS, ELM_LIFECYCLE_REASON_HAS_EXTENSIONS,
@@ -34,13 +35,13 @@ use crate::{
     ELM_MGR_POLICY_PROVIDER_ASYNC, ELM_MGR_POLICY_PROVIDER_PORTS, ELM_MGR_POLICY_RESOURCE_BUDGET,
     ELM_MGR_POLICY_TODO_REGISTRY, ELM_MGR_POLICY_TRUST, ELM_MGR_RELATION_POINT_LEN,
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_INVALID, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_OK,
-    ELM_MGR_STATUS_TODO, ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD,
-    ELM_NATIVE_CAPABILITY_KIND_EXPORT, ELM_NATIVE_CAPABILITY_KIND_IMPORT,
-    ELM_NATIVE_CAPABILITY_NAME_LEN, ELM_NATIVE_ENTRY_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_CALL_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
-    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_NEXUS_CONTRACT_LEN,
-    ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
+    ELM_MGR_STATUS_TODO, ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL,
+    ELM_NATIVE_CAPABILITY_FLAG_VERSION_WILDCARD, ELM_NATIVE_CAPABILITY_KIND_EXPORT,
+    ELM_NATIVE_CAPABILITY_KIND_IMPORT, ELM_NATIVE_CAPABILITY_NAME_LEN,
+    ELM_NATIVE_ENTRY_ABI_VERSION, ELM_NATIVE_PROVIDER_CALL_ABI_VERSION,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_ABI_VERSION, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE,
+    ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK,
+    ELM_NEXUS_CONTRACT_LEN, ELM_POLICY_BLOCK_CONTRACT_MISMATCH, ELM_POLICY_BLOCK_DUPLICATE_BINDING,
     ELM_POLICY_BLOCK_EXTENSION_DUPLICATE, ELM_POLICY_BLOCK_EXTENSION_NOT_FOUND,
     ELM_POLICY_BLOCK_HAS_DEPENDENTS, ELM_POLICY_BLOCK_HAS_EXTENSIONS,
     ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED, ELM_POLICY_BLOCK_PORT_TODO,
@@ -132,6 +133,82 @@ fn ebi_kernel_api_requirements_are_validated_and_ordered() {
     );
     assert_eq!(
         ElmEbiKernelApiRequirement::new("Kernel.Time", 1, 0x1, [3; 32]),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+}
+
+#[test]
+fn ebi_direct_symbols_require_exact_rust_abi_hashes() {
+    assert_eq!(
+        ElmEbiExportDecl::new("test.legacy", "test.legacy@1", 1, 0, [0; 32]),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+    let legacy_import =
+        ElmEbiImportDecl::new("test.legacy", "test.legacy@1", 1, 0, [0; 32]).unwrap();
+    assert_eq!(
+        ebi_unit("legacy-direct-import")
+            .with_import(legacy_import)
+            .validate(ElmEbiArch::Riscv64),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+    assert_eq!(
+        ElmEbiImportDecl::new(
+            "test.direct",
+            "test.direct@1",
+            1,
+            ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+            [0; 32],
+        ),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+    assert!(
+        ElmEbiImportDecl::new(
+            "test.direct",
+            "test.direct@1",
+            1,
+            ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+            [1; 32],
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        ElmEbiExportDecl::new(
+            "test.direct",
+            "test.direct@1",
+            1,
+            ELM_EBI_EXPORT_FLAG_DIRECT_PINNED,
+            [0; 32],
+        ),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+    assert!(
+        ElmEbiExportDecl::new(
+            "test.direct",
+            "test.direct@1",
+            1,
+            ELM_EBI_EXPORT_FLAG_DIRECT_PINNED,
+            [2; 32],
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        ElmEbiImportDecl::new(
+            "test.managed",
+            "test.managed@1",
+            1,
+            ELM_EBI_IMPORT_FLAG_MANAGED,
+            [3; 32],
+        ),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+    assert_eq!(
+        ElmEbiExportDecl::new(
+            "test.managed",
+            "test.managed@1",
+            1,
+            ELM_EBI_EXPORT_FLAG_MANAGED,
+            [4; 32],
+        ),
         Err(ElmEbiLoadStatus::InvalidManifest)
     );
 }
@@ -236,8 +313,18 @@ fn eki_symbol_block(name: &str, contract: &str, version: u32) -> Vec<u8> {
 }
 
 fn eki_symbol_block_with_flags(name: &str, contract: &str, version: u32, flags: u32) -> Vec<u8> {
+    eki_symbol_block_with_flags_and_hash(name, contract, version, flags, [0; 32])
+}
+
+fn eki_symbol_block_with_flags_and_hash(
+    name: &str,
+    contract: &str,
+    version: u32,
+    flags: u32,
+    rust_abi_hash: [u8; 32],
+) -> Vec<u8> {
     let record = 8;
-    let mut out = vec![0; record + 16 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN];
+    let mut out = vec![0; record + 48 + ELM_EBI_SYMBOL_NAME_LEN + ELM_NEXUS_CONTRACT_LEN];
     write_u32(&mut out, 0, 1);
     let (min_version, max_version) = if version == 0 {
         (1, u32::MAX)
@@ -249,10 +336,11 @@ fn eki_symbol_block_with_flags(name: &str, contract: &str, version: u32, flags: 
     write_u16(&mut out, record + 8, name.len() as u16);
     write_u16(&mut out, record + 10, contract.len() as u16);
     write_u32(&mut out, record + 12, max_version);
-    fixed_copy(&mut out, record + 16, ELM_EBI_SYMBOL_NAME_LEN, name);
+    out[record + 16..record + 48].copy_from_slice(&rust_abi_hash);
+    fixed_copy(&mut out, record + 48, ELM_EBI_SYMBOL_NAME_LEN, name);
     fixed_copy(
         &mut out,
-        record + 16 + ELM_EBI_SYMBOL_NAME_LEN,
+        record + 48 + ELM_EBI_SYMBOL_NAME_LEN,
         ELM_NEXUS_CONTRACT_LEN,
         contract,
     );
@@ -2345,6 +2433,7 @@ fn extension_mgr_abi_records_are_fixed_layout() {
 
 #[test]
 fn native_capability_records_are_fixed_layout() {
+    assert_eq!(ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL, 1 << 2);
     let header = ElmNativeCapabilityHeader::new(1, 0, 9);
     assert_eq!(
         header.record_entry_size as usize,
@@ -2645,8 +2734,26 @@ fn ebi_protocol_accepts_payload_segments_and_symbols() {
             512,
             0x1234,
         ))
-        .with_import(ElmEbiImportDecl::new("runtime.invoke", "mgr.action.invoke@1", 1, 0).unwrap())
-        .with_export(ElmEbiExportDecl::new("demo.provider", "demo.provider@1", 1, 0).unwrap());
+        .with_import(
+            ElmEbiImportDecl::new(
+                "runtime.invoke",
+                "mgr.action.invoke@1",
+                1,
+                ELM_EBI_IMPORT_FLAG_MANAGED,
+                [0; 32],
+            )
+            .unwrap(),
+        )
+        .with_export(
+            ElmEbiExportDecl::new(
+                "demo.provider",
+                "demo.provider@1",
+                1,
+                ELM_EBI_EXPORT_FLAG_MANAGED,
+                [0; 32],
+            )
+            .unwrap(),
+        );
 
     assert!(unit.validate(ElmEbiArch::Riscv64).is_ok());
     assert_eq!(unit.segments[0].file_size, 64);
@@ -2702,16 +2809,14 @@ fn ebi_protocol_accepts_declarative_topology_unit() {
 }
 
 #[test]
-fn ebi_protocol_rejects_missing_lifecycle_hooks() {
+fn ebi_protocol_accepts_lifecycle_less_declarative_unit() {
     let unit = ElmEbiUnit::new(
         manifest("missing-hooks"),
         ElmEbiTarget::new(ElmEbiArch::Any),
     );
 
-    assert_eq!(
-        unit.validate(ElmEbiArch::Riscv64),
-        Err(ElmEbiLoadStatus::InvalidManifest)
-    );
+    assert!(unit.validate(ElmEbiArch::Riscv64).is_ok());
+    assert!(unit.lifecycle_hooks.is_none());
 }
 
 #[test]
@@ -2992,6 +3097,7 @@ fn eki_parser_accepts_symbol_locations_and_relocations() {
 #[test]
 fn eki_parser_accepts_import_relocations() {
     let code = vec![0; 40];
+    let rust_abi_hash = crate::sha256(b"fn()->u64");
     let relocs = eki_relocations_block(&[
         (ElmEbiRelocationKind::ImportAbs64, 0, 0, 8, 0),
         (ElmEbiRelocationKind::ImportRel32, 0, 0, 16, 4),
@@ -3004,7 +3110,13 @@ fn eki_parser_accepts_import_relocations() {
         ),
         (
             ElmEkiBlockKind::Imports,
-            eki_symbol_block("runtime.invoke", "mgr.action.invoke@1", 1),
+            eki_symbol_block_with_flags_and_hash(
+                "runtime.invoke",
+                "mgr.action.invoke@1",
+                1,
+                ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+                rust_abi_hash,
+            ),
         ),
         (
             ElmEkiBlockKind::Segments,
@@ -3037,10 +3149,49 @@ fn eki_parser_accepts_import_relocations() {
 
     let image = parse_eki_image(&image).unwrap();
     assert_eq!(image.unit.imports.len(), 1);
+    assert_eq!(image.unit.imports[0].rust_abi_hash, rust_abi_hash);
     assert_eq!(image.relocations.len(), 3);
     assert_eq!(image.relocations[0].kind, ElmEbiRelocationKind::ImportAbs64);
     assert_eq!(image.relocations[1].kind, ElmEbiRelocationKind::ImportRel32);
     assert_eq!(image.relocations[2].kind, ElmEbiRelocationKind::ImportRel64);
+}
+
+#[test]
+fn eki_parser_rejects_callable_import_without_relocation() {
+    for (name, contract, flags) in [
+        (
+            "runtime.direct",
+            "runtime.direct@1",
+            ELM_EBI_IMPORT_FLAG_DIRECT_PINNED,
+        ),
+        (
+            "sched.now_ns_public",
+            "kernel.sched.now-ns@1",
+            ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL,
+        ),
+    ] {
+        let image = eki_image(&[
+            (
+                ElmEkiBlockKind::Manifest,
+                eki_manifest_block("eki-import-without-slot", "0.1.0", ElmKind::Service),
+            ),
+            (
+                ElmEkiBlockKind::Imports,
+                eki_symbol_block_with_flags_and_hash(
+                    name,
+                    contract,
+                    1,
+                    flags,
+                    crate::sha256(b"fn()->u64"),
+                ),
+            ),
+        ]);
+
+        assert_eq!(
+            parse_eki_image(&image),
+            Err(ElmEbiLoadStatus::InvalidTarget)
+        );
+    }
 }
 
 #[test]
@@ -3282,6 +3433,66 @@ fn eki_parser_rejects_elmapi_root_relocation_in_code() {
 }
 
 #[test]
+fn eki_parser_rejects_unaligned_elmapi_root_slot() {
+    let code = vec![0; 8];
+    let data = vec![0; 16];
+    let relocs = eki_relocations_block(&[(ElmEbiRelocationKind::ImportAbs64, 1, 0, 1, 0)]);
+    let image = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("eki-elmapi-unaligned-slot", "0.1.0", ElmKind::Service),
+        ),
+        (
+            ElmEkiBlockKind::Imports,
+            eki_symbol_block(ELM_API_ROOT_IMPORT_NAME, ELM_API_ROOT_IMPORT_CONTRACT, 0),
+        ),
+        (
+            ElmEkiBlockKind::ApiCompatibility,
+            eki_elmapi_block(0, 0, &[1]),
+        ),
+        (
+            ElmEkiBlockKind::Segments,
+            eki_segments_blocks(&[
+                (
+                    ElmEbiSegmentKind::Code,
+                    0,
+                    code.len() as u64,
+                    code.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Data,
+                    0,
+                    data.len() as u64,
+                    data.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Relocation,
+                    0,
+                    relocs.len() as u64,
+                    relocs.len() as u64,
+                ),
+            ]),
+        ),
+        (ElmEkiBlockKind::Code, code),
+        (ElmEkiBlockKind::Data, data),
+        (ElmEkiBlockKind::Relocation, relocs),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 4),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 4, 4),
+            ]),
+        ),
+    ]);
+
+    assert_eq!(
+        parse_eki_image(&image),
+        Err(ElmEbiLoadStatus::InvalidTarget)
+    );
+}
+
+#[test]
 fn eki_parser_rejects_payload_segment_without_declaration() {
     let image = eki_image(&[
         (
@@ -3299,6 +3510,9 @@ fn eki_parser_rejects_payload_segment_without_declaration() {
 
 #[test]
 fn eki_parser_accepts_imports_exports_metadata() {
+    let code = vec![0; 16];
+    let data = vec![0; 8];
+    let relocs = eki_relocations_block(&[(ElmEbiRelocationKind::ImportAbs64, 1, 0, 0, 0)]);
     let image = eki_image(&[
         (
             ElmEkiBlockKind::Manifest,
@@ -3306,13 +3520,57 @@ fn eki_parser_accepts_imports_exports_metadata() {
         ),
         (
             ElmEkiBlockKind::Imports,
-            eki_symbol_block("runtime.invoke", "mgr.action.invoke@1", 1),
+            eki_symbol_block_with_flags(
+                "runtime.invoke",
+                "mgr.action.invoke@1",
+                1,
+                ELM_EBI_IMPORT_FLAG_MANAGED,
+            ),
         ),
         (
             ElmEkiBlockKind::Exports,
-            eki_symbol_block("demo.provider", "demo.provider@1", 1),
+            eki_symbol_block_with_flags(
+                "demo.provider",
+                "demo.provider@1",
+                1,
+                ELM_EBI_EXPORT_FLAG_MANAGED,
+            ),
         ),
+        (
+            ElmEkiBlockKind::Segments,
+            eki_segments_blocks(&[
+                (
+                    ElmEbiSegmentKind::Code,
+                    0,
+                    code.len() as u64,
+                    code.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Data,
+                    0,
+                    data.len() as u64,
+                    data.len() as u64,
+                ),
+                (
+                    ElmEbiSegmentKind::Relocation,
+                    0,
+                    relocs.len() as u64,
+                    relocs.len() as u64,
+                ),
+            ]),
+        ),
+        (ElmEkiBlockKind::Code, code),
+        (ElmEkiBlockKind::Data, data),
+        (ElmEkiBlockKind::Relocation, relocs),
         (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::SymbolLocations,
+            eki_symbol_locations_block(&[
+                (ELM_EBI_HOOK_ON_INITIALIZE, 0, 0, 4),
+                (ELM_EBI_HOOK_ON_FINALIZE, 0, 4, 4),
+                ("demo.provider", 0, 8, 4),
+            ]),
+        ),
     ]);
 
     let unit = parse_eki_ebi_unit(&image).unwrap();
@@ -3320,7 +3578,7 @@ fn eki_parser_accepts_imports_exports_metadata() {
     assert_eq!(unit.exports.len(), 1);
     assert_eq!(unit.imports[0].name, "runtime.invoke");
     assert_eq!(unit.exports[0].contract.as_str(), "demo.provider@1");
-    assert!(!unit.has_native_code());
+    assert!(unit.has_native_code());
 }
 
 #[test]
@@ -3444,16 +3702,14 @@ fn eki_parser_accepts_provider_port_snapshot_symbol() {
 }
 
 #[test]
-fn eki_parser_rejects_missing_lifecycle_hooks() {
+fn eki_parser_accepts_lifecycle_less_declarative_unit() {
     let image = eki_image(&[(
         ElmEkiBlockKind::Manifest,
         eki_manifest_block("missing-hooks", "0.1.0", ElmKind::Service),
     )]);
 
-    assert_eq!(
-        parse_eki_ebi_unit(&image),
-        Err(ElmEbiLoadStatus::InvalidManifest)
-    );
+    let unit = parse_eki_ebi_unit(&image).unwrap();
+    assert!(unit.lifecycle_hooks.is_none());
 }
 
 #[test]

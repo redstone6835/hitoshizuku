@@ -2,23 +2,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use elm::{
     ELM_API_FEATURES_V1, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
+    ELM_API_ROOT_SLOT_SYMBOL, ELM_API_VERSION_V1, ELM_EBI_EXPORT_FLAG_DIRECT_PINNED,
+    ELM_EBI_IMPORT_FLAG_DIRECT_PINNED, ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL, ELM_META_FIELD_ACCESS,
     ELM_META_FIELD_BUS, ELM_META_FIELD_CALLBACK, ELM_META_FIELD_CAPABILITIES,
-    ELM_API_ROOT_SLOT_SYMBOL, ELM_API_VERSION_V1, ELM_META_FIELD_ACCESS, ELM_META_FIELD_CONTRACT,
-    ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS, ELM_META_FIELD_HANDLER_CONTRACT,
-    ELM_META_FIELD_HOOK_KIND, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
-    ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
-    ELM_META_FIELD_MATCH_CALLBACK, ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY,
+    ELM_META_FIELD_CONTRACT, ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS,
+    ELM_META_FIELD_HANDLER_CONTRACT, ELM_META_FIELD_MATCH_CALLBACK, ELM_META_FIELD_MAX_VERSION,
+    ELM_META_FIELD_MIN_VERSION, ELM_META_FIELD_MODE, ELM_META_FIELD_NAME,
+    ELM_META_FIELD_PAYLOAD_CONTRACT, ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY,
     ELM_META_FIELD_PROBE_CALLBACK, ELM_META_FIELD_REMOVE_CALLBACK, ELM_META_FIELD_RESOURCE,
-    ELM_META_FIELD_STAGE, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION,
-    ELM_META_FIELD_WIRE_SIZE, ElmMixinMode,
+    ELM_META_FIELD_RUST_ABI, ELM_META_FIELD_STAGE, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET,
+    ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE, ELM_MODULE_DESCRIPTOR_SYMBOL, ElmMixinMode,
     ElmPortAccessPolicy, ElmRustMetadataKind, ElmRustMetadataRecord, FlowDirection, FlowMode,
-    parse_rust_metadata_section,
+    parse_rust_metadata_section, sha256,
 };
+
+pub fn retain_linked_kernel_symbol_imports(
+    imports: &mut Vec<ImportSpec>,
+    mut is_linked: impl FnMut(&str) -> bool,
+) {
+    imports.retain(|import| {
+        import.flags & ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL == 0
+            || import.slot_symbol.as_deref().is_some_and(&mut is_linked)
+    });
+}
 
 #[derive(Debug, Clone)]
 pub struct NativeMetadata {
-    pub lifecycle: Vec<LifecycleSpec>,
-    pub entry: Option<String>,
+    pub module_descriptor: String,
     pub imports: Vec<ImportSpec>,
     pub exports: Vec<ExportSpec>,
     pub providers: Vec<ProviderSpec>,
@@ -32,19 +42,14 @@ pub struct NativeMetadata {
 }
 
 #[derive(Debug, Clone)]
-pub struct LifecycleSpec {
-    pub kind: u32,
-    pub symbol: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ImportSpec {
-    pub slot_symbol: String,
+    pub slot_symbol: Option<String>,
     pub name: String,
     pub contract: String,
     pub min_version: u32,
     pub max_version: u32,
     pub flags: u32,
+    pub rust_abi_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +59,7 @@ pub struct ExportSpec {
     pub contract: String,
     pub version: u32,
     pub flags: u32,
+    pub rust_abi_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone)]
@@ -117,15 +123,15 @@ impl NativeMetadata {
         if records.is_empty() {
             return Err(".elm.meta 不包含任何 ELM Rust 元数据记录".to_string());
         }
-        let mut lifecycle = Vec::new();
-        let mut entry = None;
+        let mut module_descriptor = None;
         let mut imports = vec![ImportSpec {
-            slot_symbol: ELM_API_ROOT_SLOT_SYMBOL.to_string(),
+            slot_symbol: Some(ELM_API_ROOT_SLOT_SYMBOL.to_string()),
             name: ELM_API_ROOT_IMPORT_NAME.to_string(),
             contract: ELM_API_ROOT_IMPORT_CONTRACT.to_string(),
             min_version: u32::from(ELM_API_VERSION_V1),
             max_version: u32::MAX,
             flags: 0,
+            rust_abi_hash: [0; 32],
         }];
         let mut exports = Vec::new();
         let mut providers = Vec::new();
@@ -142,19 +148,21 @@ impl NativeMetadata {
                 return Err(format!("元数据记录 {:?} 使用了未知 flags", record.kind));
             }
             match record.kind {
-                ElmRustMetadataKind::Lifecycle => {
-                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_HOOK_KIND])?;
-                    let kind = field_u32(record, ELM_META_FIELD_HOOK_KIND)?;
-                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
-                    validate_lifecycle_symbol(kind, &symbol)?;
-                    lifecycle.push(LifecycleSpec { kind, symbol });
-                }
-                ElmRustMetadataKind::Entry => {
+                ElmRustMetadataKind::Module => {
                     expect_fields(record, &[ELM_META_FIELD_SYMBOL])?;
                     let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
-                    if entry.replace(symbol).is_some() {
-                        return Err("一个 ELM 只能声明一个 #[elm::entry]".to_string());
+                    if symbol != ELM_MODULE_DESCRIPTOR_SYMBOL {
+                        return Err(format!("未知统一模块描述符符号 {symbol}"));
                     }
+                    if module_descriptor.replace(symbol).is_some() {
+                        return Err("一个 ELM 只能声明一个 #[elm::module]".to_string());
+                    }
+                }
+                ElmRustMetadataKind::Lifecycle | ElmRustMetadataKind::Entry => {
+                    return Err(
+                        "独立生命周期与 entry 元数据已废止；请使用 #[elm::module] 和 ElmModule trait"
+                            .to_string(),
+                    );
                 }
                 ElmRustMetadataKind::Provider => {
                     expect_fields(
@@ -195,27 +203,42 @@ impl NativeMetadata {
                     });
                 }
                 ElmRustMetadataKind::Export => {
-                    expect_fields(
-                        record,
+                    let flags = field_u32(record, ELM_META_FIELD_FLAGS)?;
+                    let direct = flags & ELM_EBI_EXPORT_FLAG_DIRECT_PINNED != 0;
+                    let expected: &[u16] = if direct {
                         &[
                             ELM_META_FIELD_SYMBOL,
                             ELM_META_FIELD_NAME,
                             ELM_META_FIELD_CONTRACT,
                             ELM_META_FIELD_VERSION,
                             ELM_META_FIELD_FLAGS,
-                        ],
-                    )?;
+                            ELM_META_FIELD_RUST_ABI,
+                        ]
+                    } else {
+                        &[
+                            ELM_META_FIELD_SYMBOL,
+                            ELM_META_FIELD_NAME,
+                            ELM_META_FIELD_CONTRACT,
+                            ELM_META_FIELD_VERSION,
+                            ELM_META_FIELD_FLAGS,
+                        ]
+                    };
+                    expect_fields(record, expected)?;
                     exports.push(ExportSpec {
                         symbol: field_string(record, ELM_META_FIELD_SYMBOL)?,
                         name: field_string(record, ELM_META_FIELD_NAME)?,
                         contract: field_string(record, ELM_META_FIELD_CONTRACT)?,
                         version: field_u32(record, ELM_META_FIELD_VERSION)?,
-                        flags: field_u32(record, ELM_META_FIELD_FLAGS)?,
+                        flags,
+                        rust_abi_hash: rust_abi_hash(record, direct)?,
                     });
                 }
                 ElmRustMetadataKind::Import => {
-                    expect_fields(
-                        record,
+                    let flags = field_u32(record, ELM_META_FIELD_FLAGS)?;
+                    let direct = flags
+                        & (ELM_EBI_IMPORT_FLAG_DIRECT_PINNED | ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL)
+                        != 0;
+                    let expected: &[u16] = if direct {
                         &[
                             ELM_META_FIELD_SYMBOL,
                             ELM_META_FIELD_NAME,
@@ -223,15 +246,27 @@ impl NativeMetadata {
                             ELM_META_FIELD_MIN_VERSION,
                             ELM_META_FIELD_MAX_VERSION,
                             ELM_META_FIELD_FLAGS,
-                        ],
-                    )?;
+                            ELM_META_FIELD_RUST_ABI,
+                        ]
+                    } else {
+                        &[
+                            ELM_META_FIELD_SYMBOL,
+                            ELM_META_FIELD_NAME,
+                            ELM_META_FIELD_CONTRACT,
+                            ELM_META_FIELD_MIN_VERSION,
+                            ELM_META_FIELD_MAX_VERSION,
+                            ELM_META_FIELD_FLAGS,
+                        ]
+                    };
+                    expect_fields(record, expected)?;
                     imports.push(ImportSpec {
-                        slot_symbol: field_string(record, ELM_META_FIELD_SYMBOL)?,
+                        slot_symbol: Some(field_string(record, ELM_META_FIELD_SYMBOL)?),
                         name: field_string(record, ELM_META_FIELD_NAME)?,
                         contract: field_string(record, ELM_META_FIELD_CONTRACT)?,
                         min_version: field_u32(record, ELM_META_FIELD_MIN_VERSION)?,
                         max_version: field_u32(record, ELM_META_FIELD_MAX_VERSION)?,
-                        flags: field_u32(record, ELM_META_FIELD_FLAGS)?,
+                        flags,
+                        rust_abi_hash: rust_abi_hash(record, direct)?,
                     });
                 }
                 ElmRustMetadataKind::ExtensionPoint => {
@@ -342,10 +377,7 @@ impl NativeMetadata {
                 ElmRustMetadataKind::DeviceMatch
                 | ElmRustMetadataKind::DeviceProbe
                 | ElmRustMetadataKind::DeviceRemove => {
-                    expect_fields(
-                        record,
-                        &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CALLBACK],
-                    )?;
+                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CALLBACK])?;
                     let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
                     let role = field_string(record, ELM_META_FIELD_CALLBACK)?;
                     let expected = match record.kind {
@@ -359,10 +391,7 @@ impl NativeMetadata {
                             "设备回调 {symbol} 的角色 {role} 与元数据种类不一致"
                         ));
                     }
-                    if device_callbacks
-                        .insert(symbol.clone(), expected)
-                        .is_some()
-                    {
+                    if device_callbacks.insert(symbol.clone(), expected).is_some() {
                         return Err(format!("重复设备回调符号 {symbol}"));
                     }
                     device_symbols.push(symbol);
@@ -401,10 +430,7 @@ impl NativeMetadata {
                     });
                 }
                 ElmRustMetadataKind::DeviceFunction => {
-                    expect_fields(
-                        record,
-                        &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CONTRACT],
-                    )?;
+                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CONTRACT])?;
                     let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
                     let contract = field_string(record, ELM_META_FIELD_CONTRACT)?;
                     if contract.is_empty() || !contract.contains('@') {
@@ -431,10 +457,7 @@ impl NativeMetadata {
                     device_symbols.push(symbol);
                 }
                 ElmRustMetadataKind::DeviceDiscovery => {
-                    expect_fields(
-                        record,
-                        &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_RESOURCE],
-                    )?;
+                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_RESOURCE])?;
                     let name = field_string(record, ELM_META_FIELD_SYMBOL)?;
                     let bus = field_string(record, ELM_META_FIELD_RESOURCE)?;
                     if name.is_empty() || bus.is_empty() || bus.len() > 64 {
@@ -457,11 +480,13 @@ impl NativeMetadata {
             }
         }
         device_symbols.sort();
-        if device_symbols.windows(2).any(|symbols| symbols[0] == symbols[1]) {
+        if device_symbols
+            .windows(2)
+            .any(|symbols| symbols[0] == symbols[1])
+        {
             return Err("设备 ABI 回调导出符号重复".to_string());
         }
         validate_and_sort(
-            &mut lifecycle,
             &mut imports,
             &mut exports,
             &mut providers,
@@ -471,9 +496,10 @@ impl NativeMetadata {
             &mut payloads,
             &mut kernel_apis,
         )?;
+        let module_descriptor =
+            module_descriptor.ok_or_else(|| "ELM 必须且只能声明一个 #[elm::module]".to_string())?;
         Ok(Self {
-            lifecycle,
-            entry,
+            module_descriptor,
             imports,
             exports,
             providers,
@@ -489,14 +515,11 @@ impl NativeMetadata {
 
     pub fn symbol_names(&self) -> Vec<String> {
         let mut names = BTreeSet::new();
-        for hook in &self.lifecycle {
-            names.insert(hook.symbol.clone());
-        }
-        if let Some(entry) = &self.entry {
-            names.insert(entry.clone());
-        }
+        names.insert(self.module_descriptor.clone());
         for import in &self.imports {
-            names.insert(import.slot_symbol.clone());
+            if let Some(slot_symbol) = &import.slot_symbol {
+                names.insert(slot_symbol.clone());
+            }
         }
         for export in &self.exports {
             names.insert(export.symbol.clone());
@@ -516,7 +539,6 @@ impl NativeMetadata {
 
 #[allow(clippy::too_many_arguments)]
 fn validate_and_sort(
-    lifecycle: &mut Vec<LifecycleSpec>,
     imports: &mut Vec<ImportSpec>,
     exports: &mut Vec<ExportSpec>,
     providers: &mut Vec<ProviderSpec>,
@@ -526,18 +548,6 @@ fn validate_and_sort(
     payloads: &mut Vec<PayloadSpec>,
     kernel_apis: &mut Vec<KernelApiSpec>,
 ) -> Result<(), String> {
-    lifecycle.sort_by_key(|hook| hook.kind);
-    for kind in [1, 2] {
-        if lifecycle.iter().filter(|hook| hook.kind == kind).count() != 1 {
-            return Err(format!("ELM 必须且只能声明一个 lifecycle hook kind={kind}"));
-        }
-    }
-    if lifecycle
-        .windows(2)
-        .any(|hooks| hooks[0].kind == hooks[1].kind)
-    {
-        return Err("重复 lifecycle hook".to_string());
-    }
     imports[1..].sort_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -677,25 +687,6 @@ fn validate_and_sort(
     Ok(())
 }
 
-fn validate_lifecycle_symbol(kind: u32, symbol: &str) -> Result<(), String> {
-    let expected = match kind {
-        1 => "on_initialize",
-        2 => "on_finalize",
-        3 => "on_migrate_export",
-        4 => "on_migrate_import",
-        5 => "on_migrate_abort",
-        6 => "on_quiesce",
-        7 => "on_pause",
-        8 => "on_resume",
-        _ => return Err(format!("未知 lifecycle hook kind={kind}")),
-    };
-    if symbol == expected {
-        Ok(())
-    } else {
-        Err(format!("lifecycle kind={kind} 必须导出符号 {expected}"))
-    }
-}
-
 fn checked_stage(stage: u32) -> Result<u32, String> {
     if (1..=4).contains(&stage) {
         Ok(stage)
@@ -747,6 +738,21 @@ fn field_string(record: &ElmRustMetadataRecord<'_>, tag: u16) -> Result<String, 
         .map_err(|_| format!("元数据 {:?} 字段 {tag} 不是 UTF-8", record.kind))
 }
 
+fn rust_abi_hash(record: &ElmRustMetadataRecord<'_>, required: bool) -> Result<[u8; 32], String> {
+    if !required {
+        return Ok([0; 32]);
+    }
+    let signature = field_string(record, ELM_META_FIELD_RUST_ABI)?;
+    if signature.len() > 4096
+        || signature.bytes().any(|byte| byte.is_ascii_whitespace())
+        || !(signature.starts_with("fn(") || signature.starts_with("unsafefn("))
+        || !signature.contains(")->")
+    {
+        return Err("直接固定符号使用了非规范 Rust ABI 签名".to_string());
+    }
+    Ok(sha256(signature.as_bytes()))
+}
+
 fn field_u32(record: &ElmRustMetadataRecord<'_>, tag: u16) -> Result<u32, String> {
     record
         .require_field(tag)
@@ -786,23 +792,14 @@ mod tests {
 
     #[test]
     fn export_symbol_must_match_export_name() {
-        let mut lifecycle = vec![
-            LifecycleSpec {
-                kind: 1,
-                symbol: "on_initialize".to_string(),
-            },
-            LifecycleSpec {
-                kind: 2,
-                symbol: "on_finalize".to_string(),
-            },
-        ];
         let mut imports = vec![ImportSpec {
-            slot_symbol: ELM_API_ROOT_SLOT_SYMBOL.to_string(),
+            slot_symbol: Some(ELM_API_ROOT_SLOT_SYMBOL.to_string()),
             name: ELM_API_ROOT_IMPORT_NAME.to_string(),
             contract: ELM_API_ROOT_IMPORT_CONTRACT.to_string(),
             min_version: 1,
             max_version: u32::MAX,
             flags: 0,
+            rust_abi_hash: [0; 32],
         }];
         let mut exports = vec![ExportSpec {
             symbol: "hidden_symbol".to_string(),
@@ -810,9 +807,9 @@ mod tests {
             contract: "test.export@1".to_string(),
             version: 1,
             flags: 0,
+            rust_abi_hash: [0; 32],
         }];
         let error = validate_and_sort(
-            &mut lifecycle,
             &mut imports,
             &mut exports,
             &mut Vec::new(),
@@ -833,5 +830,52 @@ mod tests {
         assert!(validate_stage_point("test.point.egress", 1).is_err());
         assert_eq!(expected_stage_mode(2), ElmMixinMode::Exclusive);
         assert_eq!(expected_stage_mode(4), ElmMixinMode::Observer);
+    }
+
+    #[test]
+    fn unreferenced_kernel_symbol_metadata_is_not_projected() {
+        let mut imports = vec![
+            ImportSpec {
+                slot_symbol: Some(ELM_API_ROOT_SLOT_SYMBOL.to_string()),
+                name: ELM_API_ROOT_IMPORT_NAME.to_string(),
+                contract: ELM_API_ROOT_IMPORT_CONTRACT.to_string(),
+                min_version: 1,
+                max_version: u32::MAX,
+                flags: 0,
+                rust_abi_hash: [0; 32],
+            },
+            ImportSpec {
+                slot_symbol: Some("__elm_kernel_symbol_used".to_string()),
+                name: "sched.used".to_string(),
+                contract: "kernel.sched.used@1".to_string(),
+                min_version: 1,
+                max_version: 1,
+                flags: ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL,
+                rust_abi_hash: [1; 32],
+            },
+            ImportSpec {
+                slot_symbol: Some("__elm_kernel_symbol_unused".to_string()),
+                name: "sched.unused".to_string(),
+                contract: "kernel.sched.unused@1".to_string(),
+                min_version: 1,
+                max_version: 1,
+                flags: ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL,
+                rust_abi_hash: [2; 32],
+            },
+        ];
+
+        retain_linked_kernel_symbol_imports(&mut imports, |symbol| {
+            symbol == "__elm_kernel_symbol_used"
+        });
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(
+            imports[0].slot_symbol.as_deref(),
+            Some(ELM_API_ROOT_SLOT_SYMBOL)
+        );
+        assert_eq!(
+            imports[1].slot_symbol.as_deref(),
+            Some("__elm_kernel_symbol_used")
+        );
     }
 }
