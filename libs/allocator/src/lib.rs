@@ -2110,5 +2110,5 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
 #[cfg(feature = "ktest-kernel")]
 mod tests;
 
-#[global_allocator]
+#[cfg_attr(target_os = "none", global_allocator)]
 pub static KERNEL_ALLOCATOR: KernelMemorySubsystem = KernelMemorySubsystem::new();

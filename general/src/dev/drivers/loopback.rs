@@ -1,126 +1,353 @@
-//! Loopback 网络接口驱动。
-//!
-//! TX 帧直接回环到 RX 队列，用于 127.0.0.1 本地通信。
+//! 批量队列的 loopback 设备。
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use core::any::Any;
+use alloc::vec;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use spin::Mutex;
 
-use net::config::{IfConfig, Ipv4Addr};
-use net::device::NetDevice;
-use net::driver::{Duplex, LinkMedium, LinkState, NetDriver, NetStats, RxBuf, TxBuf};
+use net::QueuePairId;
+use net::buf::{
+    CompletionBatch, CompletionToken, NetBufPool, NetBufPoolOwner, NetBufStorage, PacketBatch,
+    PacketMetadata, RxRefillBatch, TxBatch,
+};
+use net::device::{
+    NetDeviceRegistration, NetQueueRegistration, QueueIrqControl, QueueIrqError, QueueIrqStats,
+    QueueWakeHandle,
+};
+use net::queue::{
+    NetQueueCaps, NetQueuePair, QueueFatalError, RxBudget, RxPollResult, RxRefillResult,
+    TxReclaimResult, TxSubmitResult,
+};
 
 use crate::dev::pnp::{PnpError, PnpResourceKind};
 
-const MAX_LOOPBACK_QUEUE_FRAMES: usize = 1024;
-const MAX_LOOPBACK_FREE_FRAMES: usize = 1024;
-/// Linux 兼容的 loopback MTU。
-const LOOPBACK_MTU: usize = 65_536;
-/// 保留传统 loopback 网段：lo 固定为 127.0.0.1/8。
-const LOOPBACK_IPV4_PREFIX: u8 = 8;
+const LOOPBACK_RING_SIZE: usize = 1024;
+const LOOPBACK_MTU: u32 = 65_536;
 
-struct LoopbackDriver {
-    queue: Mutex<VecDeque<(Box<[u8]>, usize)>>,
-    free: Mutex<VecDeque<Box<[u8]>>>,
-    stats: Mutex<NetStats>,
+struct HeapStorage {
+    bytes: Box<[u8]>,
 }
 
-impl LoopbackDriver {
+impl HeapStorage {
+    fn new(size: usize) -> Self {
+        Self {
+            bytes: vec![0; size].into_boxed_slice(),
+        }
+    }
+}
+
+impl NetBufStorage for HeapStorage {
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn base_ptr(&self) -> NonNull<u8> {
+        NonNull::new(self.bytes.as_ptr() as *mut u8).expect("loopback storage 地址为空")
+    }
+
+    fn dma_addr(&self) -> Option<u64> {
+        None
+    }
+
+    fn sync_for_cpu(&self, _offset: usize, _len: usize) {}
+    fn sync_for_device(&self, _offset: usize, _len: usize) {}
+}
+
+fn make_pool(count: usize, size: usize) -> Result<NetBufPoolOwner, PnpError> {
+    let storages = (0..count)
+        .map(|_| Box::new(HeapStorage::new(size)) as Box<dyn NetBufStorage>)
+        .collect::<alloc::vec::Vec<_>>()
+        .into_boxed_slice();
+    NetBufPool::new(storages)
+        .map_err(|_| PnpError::registration_failed(PnpResourceKind::Function, "loopback pool"))
+}
+
+struct LoopbackIrq {
+    pending: AtomicBool,
+    masked: AtomicBool,
+    waker: Mutex<Option<Arc<dyn QueueWakeHandle>>>,
+    irq_total: AtomicU64,
+    irq_mask: AtomicU64,
+    irq_unmask: AtomicU64,
+}
+
+impl LoopbackIrq {
     fn new() -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
-            free: Mutex::new(VecDeque::new()),
-            stats: Mutex::new(NetStats::default()),
+            pending: AtomicBool::new(false),
+            masked: AtomicBool::new(false),
+            waker: Mutex::new(None),
+            irq_total: AtomicU64::new(0),
+            irq_mask: AtomicU64::new(0),
+            irq_unmask: AtomicU64::new(0),
+        }
+    }
+
+    fn signal(&self) {
+        self.pending.store(true, Ordering::Release);
+        if !self.masked.swap(true, Ordering::AcqRel) {
+            self.irq_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(waker) = self.waker.lock().as_ref() {
+                waker.wake();
+            }
         }
     }
 }
 
-impl NetDriver for LoopbackDriver {
-    fn medium(&self) -> LinkMedium {
-        // loopback 没有 Ethernet 二层头，也不需要 ARP/邻居解析；
-        // 直接以 IP packet 形式交给 smoltcp，127.0.0.1 才能在本机闭环。
-        LinkMedium::Ip
-    }
-
-    fn poll_rx(&self) -> Option<RxBuf> {
-        let mut q = self.queue.lock();
-        let (frame, len) = q.pop_front()?;
-        self.stats.lock().rx_packets += 1;
-        self.stats.lock().rx_bytes += len as u64;
-        Some(RxBuf::new(frame, len))
-    }
-
-    fn alloc_tx(&self, len: usize) -> Option<TxBuf> {
-        let mut free = self.free.lock();
-        let buf = free
-            .pop_front()
-            .filter(|buf| buf.len() >= len)
-            .unwrap_or_else(|| alloc::vec![0u8; len].into_boxed_slice());
-        Some(TxBuf::new_heap(buf))
-    }
-
-    fn commit_tx(&self, buf: TxBuf) {
-        let len = buf.len();
-        if len == 0 {
-            return;
+impl QueueIrqControl for LoopbackIrq {
+    fn ack_and_mask(&self) -> bool {
+        if !self.pending.swap(false, Ordering::AcqRel) {
+            return false;
         }
-        let data = buf.into_heap();
+        self.masked.store(true, Ordering::Release);
+        self.irq_mask.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn unmask(&self) {
+        self.pending.store(false, Ordering::Release);
+        self.masked.store(false, Ordering::Release);
+        self.irq_unmask.fetch_add(1, Ordering::Relaxed);
+        if self.pending.load(Ordering::Acquire)
+            && let Some(waker) = self.waker.lock().as_ref()
         {
-            let mut stats = self.stats.lock();
-            stats.tx_packets += 1;
-            stats.tx_bytes += len as u64;
-        }
-        let mut queue = self.queue.lock();
-        if queue.len() >= MAX_LOOPBACK_QUEUE_FRAMES {
-            self.stats.lock().tx_dropped += 1;
-            return;
-        }
-        queue.push_back((data, len));
-    }
-
-    fn recycle_rx(&self, buf: RxBuf) {
-        let storage = buf.into_storage();
-        let mut free = self.free.lock();
-        if free.len() < MAX_LOOPBACK_FREE_FRAMES {
-            free.push_back(storage);
+            waker.wake();
         }
     }
 
-    fn link_state(&self) -> LinkState {
-        LinkState::Up {
-            speed_mbps: None,
-            duplex: Duplex::Full,
+    fn set_waker(&self, waker: Arc<dyn QueueWakeHandle>) -> Result<(), QueueIrqError> {
+        let mut slot = self.waker.lock();
+        if slot.is_some() {
+            return Err(QueueIrqError::WakerAlreadyInstalled);
+        }
+        *slot = Some(waker);
+        Ok(())
+    }
+
+    fn stats(&self) -> QueueIrqStats {
+        QueueIrqStats {
+            irq_total: self.irq_total.load(Ordering::Relaxed),
+            irq_mask: self.irq_mask.load(Ordering::Relaxed),
+            irq_unmask: self.irq_unmask.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct LoopbackQueue {
+    packets: Box<[Option<net::buf::PacketChain>]>,
+    metadata: Box<[Option<PacketMetadata>]>,
+    completions: Box<[Option<CompletionToken>]>,
+    rx_reserve: Box<[Option<net::buf::NetBufLease>]>,
+    rx_reserve_len: usize,
+    packet_head: usize,
+    packet_tail: usize,
+    packet_count: usize,
+    completion_head: usize,
+    completion_tail: usize,
+    completion_count: usize,
+    irq: Arc<LoopbackIrq>,
+    quiesced: bool,
+}
+
+impl LoopbackQueue {
+    fn new(irq: Arc<LoopbackIrq>) -> Self {
+        Self {
+            packets: (0..LOOPBACK_RING_SIZE)
+                .map(|_| None)
+                .collect::<alloc::vec::Vec<_>>()
+                .into_boxed_slice(),
+            metadata: vec![None; LOOPBACK_RING_SIZE].into_boxed_slice(),
+            completions: vec![None; LOOPBACK_RING_SIZE].into_boxed_slice(),
+            rx_reserve: (0..256)
+                .map(|_| None)
+                .collect::<alloc::vec::Vec<_>>()
+                .into_boxed_slice(),
+            rx_reserve_len: 0,
+            packet_head: 0,
+            packet_tail: 0,
+            packet_count: 0,
+            completion_head: 0,
+            completion_tail: 0,
+            completion_count: 0,
+            irq,
+            quiesced: false,
+        }
+    }
+}
+
+impl NetQueuePair for LoopbackQueue {
+    fn id(&self) -> QueuePairId {
+        QueuePairId(0)
+    }
+
+    fn caps(&self) -> NetQueueCaps {
+        NetQueueCaps {
+            queue_size: 256,
+            scatter_gather: true,
+            max_tx_descriptors: 18,
+            max_rx_batch: 32,
+            max_tx_batch: 32,
         }
     }
 
-    fn mac_address(&self) -> [u8; 6] {
-        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    fn refill_rx_batch(&mut self, batch: &mut RxRefillBatch) -> RxRefillResult {
+        let original_len = batch.len();
+        let mut posted = 0u16;
+        for index in 0..original_len {
+            if self.rx_reserve_len == self.rx_reserve.len() {
+                break;
+            }
+            let Some(lease) = batch.take(index) else {
+                continue;
+            };
+            self.rx_reserve[self.rx_reserve_len] = Some(lease);
+            self.rx_reserve_len += 1;
+            posted += 1;
+        }
+        RxRefillResult {
+            posted,
+            descriptor_starved: self.rx_reserve_len == self.rx_reserve.len() && !batch.is_empty(),
+            fatal: None,
+        }
     }
 
-    fn mtu(&self) -> usize {
-        LOOPBACK_MTU
+    fn poll_rx_batch(&mut self, budget: RxBudget, out: &mut PacketBatch) -> RxPollResult {
+        if self.quiesced {
+            return RxPollResult {
+                packets: 0,
+                bytes: 0,
+                ring_empty: true,
+                descriptor_starved: false,
+                fatal: Some(QueueFatalError::DeviceGone),
+            };
+        }
+        let mut packets = 0u16;
+        let mut bytes = 0u32;
+        while self.packet_count != 0 && packets < budget.packets && packets < 32 {
+            let packet_len = self.packets[self.packet_head]
+                .as_ref()
+                .map(|packet| packet.total_len() as u32)
+                .unwrap_or(0);
+            if packets != 0 && bytes.saturating_add(packet_len) > budget.bytes {
+                break;
+            }
+            let packet = self.packets[self.packet_head]
+                .take()
+                .expect("loopback ring 出现空洞");
+            let metadata = self.metadata[self.packet_head].take().unwrap_or_default();
+            self.packet_head = (self.packet_head + 1) % LOOPBACK_RING_SIZE;
+            self.packet_count -= 1;
+            out.push(packet, metadata)
+                .unwrap_or_else(|_| unreachable!());
+            packets += 1;
+            bytes = bytes.saturating_add(packet_len);
+        }
+        RxPollResult {
+            packets,
+            bytes,
+            ring_empty: self.packet_count == 0,
+            descriptor_starved: false,
+            fatal: None,
+        }
     }
 
-    fn stats(&self) -> NetStats {
-        *self.stats.lock()
+    fn reclaim_tx_batch(&mut self, out: &mut CompletionBatch) -> TxReclaimResult {
+        let mut completions = 0u16;
+        while self.completion_count != 0 && completions < 32 {
+            let token = self.completions[self.completion_head]
+                .take()
+                .expect("loopback completion ring 出现空洞");
+            self.completion_head = (self.completion_head + 1) % LOOPBACK_RING_SIZE;
+            self.completion_count -= 1;
+            out.push(token).unwrap_or_else(|_| unreachable!());
+            completions += 1;
+        }
+        TxReclaimResult {
+            completions,
+            descriptors: completions,
+            ring_empty: self.completion_count == 0,
+            fatal: None,
+        }
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn submit_tx_batch(
+        &mut self,
+        batch: &mut TxBatch,
+        _header_pool: &mut NetBufPoolOwner,
+    ) -> TxSubmitResult {
+        let mut packets = 0u16;
+        let mut descriptors = 0u16;
+        let mut bytes = 0u32;
+        let original_len = batch.len();
+        for index in 0..original_len {
+            if self.packet_count == LOOPBACK_RING_SIZE
+                || self.completion_count == LOOPBACK_RING_SIZE
+            {
+                break;
+            }
+            let Some(packet) = batch.take(index) else {
+                continue;
+            };
+            let packet_len = packet.chain.total_len() as u32;
+            descriptors = descriptors.saturating_add(packet.chain.fragment_count() as u16);
+            bytes = bytes.saturating_add(packet_len);
+            self.packets[self.packet_tail] = Some(packet.chain);
+            self.metadata[self.packet_tail] = Some(PacketMetadata {
+                frame_len: packet_len,
+                ..PacketMetadata::default()
+            });
+            self.packet_tail = (self.packet_tail + 1) % LOOPBACK_RING_SIZE;
+            self.packet_count += 1;
+            self.completions[self.completion_tail] = Some(packet.completion);
+            self.completion_tail = (self.completion_tail + 1) % LOOPBACK_RING_SIZE;
+            self.completion_count += 1;
+            packets += 1;
+        }
+        if packets != 0 {
+            self.irq.signal();
+        }
+        TxSubmitResult {
+            packets,
+            descriptors,
+            bytes,
+            queue_full: packets as usize != original_len,
+            fatal: None,
+        }
+    }
+
+    fn has_pending_work(&mut self) -> bool {
+        self.packet_count != 0 || self.completion_count != 0
+    }
+
+    fn quiesce(&mut self) -> Result<(), QueueFatalError> {
+        self.quiesced = true;
+        Ok(())
     }
 }
 
 pub fn register_builtin_driver() -> Result<(), PnpError> {
-    let driver: Arc<dyn NetDriver> = Arc::new(LoopbackDriver::new());
-    let dev = Arc::new(NetDevice::new("lo", driver));
-    // lo 固定使用保留的 127.0.0.1/8 本地回环网段；这里不扩展完整路由策略。
-    let config = IfConfig::static_v4(Ipv4Addr::LOCALHOST, LOOPBACK_IPV4_PREFIX, None);
-    net::stack()
-        .attach(dev, config)
-        .map_err(|_| PnpError::registration_failed(PnpResourceKind::Function, "loopback attach"))?;
-    log::printk!("[loopback] attached lo 127.0.0.1/8");
+    let irq = Arc::new(LoopbackIrq::new());
+    let queue = NetQueueRegistration {
+        id: QueuePairId(0),
+        queue: Box::new(LoopbackQueue::new(Arc::clone(&irq))),
+        rx_pool: make_pool(48, 4096)?,
+        tx_header_pool: make_pool(256, 256)?,
+        tx_payload_pool: make_pool(256, 4096)?,
+        irq,
+    };
+    let registration = NetDeviceRegistration::new(
+        "lo".into(),
+        [0; 6],
+        LOOPBACK_MTU,
+        true,
+        vec![queue].into_boxed_slice(),
+    );
+    net::device::register_device(registration).map_err(|_| {
+        PnpError::registration_failed(PnpResourceKind::Function, "loopback registration")
+    })?;
+    log::printk!("[loopback] registered batch queue");
     Ok(())
 }

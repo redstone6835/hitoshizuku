@@ -229,15 +229,8 @@ pub fn kernel_start_init(context: &StartContext) {
                 crate::vdso::install_realtime_source,
                 crate::vdso::unregister_realtime_source,
             ),
+        rng_seed.as_deref(),
     );
-
-    if let Some(seed) = rng_seed.as_ref() {
-        general::dev::drivers::add_bootloader_randomness(seed);
-        printk!(
-            "[kernel-start][dtb] mixed chosen/rng-seed into random pool: {} bytes",
-            seed.len()
-        );
-    }
 
     let stdout_phys = stdout_serial.as_ref().map(|port| port.phys_addr);
     let mut platform_bound = 0usize;

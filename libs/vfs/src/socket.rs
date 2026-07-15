@@ -32,9 +32,8 @@ use crate::vfs::path::{self, Dirfd, LookupFlags};
 use crate::vfs::stat::{DevId, FileMode, FileType, FsId, Timespec};
 use crate::vfs::superblock::{InodeCache, Superblock, SuperblockOps};
 use crate::vfs::sync::Spinlock;
-// 仅在 setsockopt dispatch 路径上需要按 handle.sock_type 严格分派；引入
-// SocketType 枚举以避免继续依赖裸的 SOCK_* 常量做比较（容易遗漏 RAW/ICMP）。
-use net::{InterfaceId, SocketType as NetSocketType};
+#[cfg(test)]
+use net::NetDeviceId;
 
 pub const AF_UNIX: u16 = 1;
 
@@ -539,6 +538,12 @@ pub fn socket(
         return fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno());
     }
 
+    // 尚未开放 INET fd，必须在解析 type/protocol 前固定失败，避免
+    // 非法组合泄漏 EINVAL/EPROTONOSUPPORT 形成跨阶段可观察差异。
+    if matches!(domain as u16, crate::addr::AF_INET | crate::addr::AF_INET6) {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+
     let (kind, nonblock, cloexec) = parse_type(ty)?;
     let fd_flags = if cloexec {
         FdFlags::CLOEXEC
@@ -555,16 +560,6 @@ pub fn socket(
             let socket =
                 CoreSocket::new_unix(kind, current_identity(ctx)).map_err(map_socket_error)?;
             let file = new_socket_file(socket, Arc::clone(&cred), nonblock);
-            fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
-        }
-        crate::addr::AF_INET | crate::addr::AF_INET6 => {
-            let ops = crate::net_socket::create_net_socket(
-                domain as u16,
-                ty as u16,
-                protocol as u16,
-                nonblock,
-            )?;
-            let file = new_net_socket_file(ops, Arc::clone(&cred), nonblock);
             fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
         }
         17 => {
@@ -1153,76 +1148,6 @@ fn parse_timeval_ns(value: &[u8]) -> u64 {
         .saturating_add(usecs.saturating_mul(1_000))
 }
 
-fn parse_ipv4_multicast_membership(
-    value: &[u8],
-    fallback_iface: InterfaceId,
-) -> Result<(InterfaceId, net::IpAddr), Errno> {
-    if value.len() < 8 {
-        return Err(Errno::EINVAL);
-    }
-    let group = net::Ipv4Addr([value[0], value[1], value[2], value[3]]);
-    let iface_addr = net::Ipv4Addr([value[4], value[5], value[6], value[7]]);
-    let ifindex = if value.len() >= 12 {
-        let raw = i32::from_ne_bytes([value[8], value[9], value[10], value[11]]);
-        interface_id_from_user_ifindex(raw)?
-    } else {
-        None
-    };
-    let iface = if let Some(iface) = ifindex {
-        iface
-    } else if iface_addr != net::Ipv4Addr::UNSPECIFIED {
-        net::stack()
-            .resolve_iface_for_addr(&net::IpAddr::V4(iface_addr))
-            .ok_or(Errno::ENODEV)?
-    } else {
-        fallback_iface
-    };
-    Ok((iface, net::IpAddr::V4(group)))
-}
-
-fn parse_ipv6_multicast_membership(
-    value: &[u8],
-    fallback_iface: InterfaceId,
-) -> Result<(InterfaceId, net::IpAddr), Errno> {
-    if value.len() < 20 {
-        return Err(Errno::EINVAL);
-    }
-    let mut octets = [0u8; 16];
-    octets.copy_from_slice(&value[..16]);
-    let ifindex = u32::from_ne_bytes([value[16], value[17], value[18], value[19]]);
-    let iface = if ifindex == 0 {
-        fallback_iface
-    } else {
-        InterfaceId(ifindex.checked_sub(1).ok_or(Errno::EINVAL)?)
-    };
-    Ok((iface, net::IpAddr::V6(net::Ipv6Addr(octets))))
-}
-
-fn interface_id_from_user_ifindex(ifindex: i32) -> Result<Option<InterfaceId>, Errno> {
-    if ifindex < 0 {
-        return Err(Errno::EINVAL);
-    }
-    Ok((ifindex > 0).then(|| InterfaceId(ifindex as u32 - 1)))
-}
-
-fn map_inet_net_error(err: net::NetError) -> Errno {
-    match err {
-        net::NetError::InterfaceNotFound => Errno::ENODEV,
-        net::NetError::InvalidArgument => Errno::EINVAL,
-        net::NetError::ResourceExhausted => Errno::ENOMEM,
-        net::NetError::WouldBlock => Errno::EAGAIN,
-        net::NetError::AddressInUse => Errno::EADDRINUSE,
-        net::NetError::TimedOut => Errno::ETIMEDOUT,
-        net::NetError::ConnectionRefused => Errno::ECONNREFUSED,
-        net::NetError::ConnectionReset => Errno::ECONNRESET,
-        net::NetError::Closed => Errno::EPIPE,
-        net::NetError::InterfaceExists => Errno::EEXIST,
-        net::NetError::LinkDown | net::NetError::Unreachable | net::NetError::BufferTooSmall => {
-            Errno::EINVAL
-        }
-    }
-}
-
 fn timeval_from_ns(ns: u64) -> [u8; 16] {
     let secs = (ns / 1_000_000_000) as i64;
     let usecs = ((ns % 1_000_000_000) / 1_000) as i64;
@@ -1329,18 +1254,8 @@ fn tcp_info_minimal(net_ops: &NetSocketFileOps) -> Vec<u8> {
     // 104 字节的旧版基础布局，未实现的统计字段保持 0。
     const TCP_INFO_MIN_LEN: usize = 104;
     let mut info = vec![0u8; TCP_INFO_MIN_LEN];
-    let state = net_ops
-        .get_handle_for_opts()
-        .filter(|handle| handle.socket_type() == NetSocketType::Tcp)
-        .map(|handle| match net::stack().socket_state(handle) {
-            net::SocketState::Established => 1, // TCP_ESTABLISHED
-            net::SocketState::Connecting => 2,  // TCP_SYN_SENT/SYN_RECV 近似
-            net::SocketState::Closing => 4,     // TCP_FIN_WAIT1 近似
-            net::SocketState::Closed => 7,      // TCP_CLOSE
-            net::SocketState::Listen => 10,     // TCP_LISTEN
-        })
-        .unwrap_or(7);
-    info[0] = state;
+    let _ = net_ops;
+    info[0] = 7; // TCP_CLOSE；当前不存在可达的 INET fd。
     // tcpi_snd_mss / tcpi_rcv_mss，避免用户程序把 0 当成异常路径。
     info[16..20].copy_from_slice(&1460u32.to_ne_bytes());
     info[20..24].copy_from_slice(&1460u32.to_ne_bytes());
@@ -1357,19 +1272,11 @@ fn inet_setsockopt(
         return Err(Errno::ENOPROTOOPT);
     }
     let mut opts = net_ops.options().lock();
-    let handle = net_ops.get_handle_for_opts();
+    let _handle = net_ops.get_handle_for_opts();
     match level {
         SOL_SOCKET => match optname {
             SO_KEEPALIVE => {
                 opts.keepalive = parse_int_opt(value)? != 0;
-                if let Some(h) = handle.filter(|h| h.socket_type() == NetSocketType::Tcp) {
-                    let secs = if opts.keepalive {
-                        opts.keepidle as u64
-                    } else {
-                        0
-                    };
-                    net::stack().tcp_set_keepalive(h, secs);
-                }
                 Ok(())
             }
             SO_BROADCAST => {
@@ -1451,9 +1358,6 @@ fn inet_setsockopt(
         SOL_TCP => match optname {
             TCP_NODELAY => {
                 opts.nodelay = parse_int_opt(value)? != 0;
-                if let Some(h) = handle {
-                    net::stack().tcp_set_nodelay(h, opts.nodelay);
-                }
                 Ok(())
             }
             TCP_CORK => {
@@ -1462,11 +1366,6 @@ fn inet_setsockopt(
             } // TODO: 应用到 smoltcp — 需要延迟发送小段，smoltcp 无 cork 模式
             TCP_KEEPIDLE => {
                 opts.keepidle = parse_int_opt(value)? as u32;
-                if opts.keepalive {
-                    if let Some(h) = handle {
-                        net::stack().tcp_set_keepalive(h, opts.keepidle as u64);
-                    }
-                }
                 Ok(())
             }
             TCP_KEEPINTVL => {
@@ -1501,24 +1400,6 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 opts.ttl = ttl as u8;
-                if let Some(h) = handle {
-                    // 必须严格按 handle.sock_type 分派：
-                    // - TCP   -> tcp_set_hop_limit
-                    // - UDP   -> udp_set_hop_limit
-                    // - ICMP  -> icmp_set_hop_limit
-                    // - RAW   -> smoltcp 的 raw socket 没有 hop_limit API，仅记录到 opts
-                    // 之前的实现把后两类也错走到 udp_set_hop_limit，调用
-                    // udp_socket_mut(handle.inner) 时下转失败触发
-                    // "handle refers to a socket of a wrong type" panic。
-                    match h.socket_type() {
-                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
-                            net::stack()
-                                .socket_set_hop_limit(h, Some(opts.ttl))
-                                .map_err(map_inet_net_error)?
-                        }
-                        NetSocketType::Raw => {}
-                    }
-                }
                 Ok(())
             }
             IP_TOS => {
@@ -1527,16 +1408,6 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 opts.tos = tos as u8;
-                if let Some(h) = handle {
-                    match h.socket_type() {
-                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
-                            net::stack()
-                                .socket_set_traffic_class(h, Some(opts.tos))
-                                .map_err(map_inet_net_error)?
-                        }
-                        NetSocketType::Raw => {}
-                    }
-                }
                 Ok(())
             }
             IP_MULTICAST_TTL => {
@@ -1548,16 +1419,7 @@ fn inet_setsockopt(
                 Ok(())
             }
             IP_MULTICAST_IF => Ok(()),
-            IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
-                let handle = handle.ok_or(Errno::ENODEV)?;
-                let (iface, group) = parse_ipv4_multicast_membership(value, handle.interface_id())?;
-                let result = if optname == IP_ADD_MEMBERSHIP {
-                    net::stack().join_multicast_group(iface, group)
-                } else {
-                    net::stack().leave_multicast_group(iface, group)
-                };
-                result.map_err(map_inet_net_error)
-            }
+            IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => Err(Errno::EAFNOSUPPORT),
             IP_PKTINFO => {
                 opts.pktinfo = parse_int_opt(value)? != 0;
                 Ok(())
@@ -1594,17 +1456,6 @@ fn inet_setsockopt(
             }
             IPV6_UNICAST_HOPS => {
                 opts.hops_v6 = parse_int_opt(value)? as u8;
-                if let Some(h) = handle {
-                    // 严格按 handle.sock_type 分派，原因同上 IP_TTL。
-                    match h.socket_type() {
-                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
-                            net::stack()
-                                .socket_set_hop_limit(h, Some(opts.hops_v6))
-                                .map_err(map_inet_net_error)?
-                        }
-                        NetSocketType::Raw => {}
-                    }
-                }
                 Ok(())
             }
             IPV6_RECVPKTINFO => {
@@ -1626,29 +1477,9 @@ fn inet_setsockopt(
                     return Err(Errno::EINVAL);
                 }
                 opts.tclass = tclass;
-                if let Some(h) = handle {
-                    let traffic_class = if tclass < 0 { None } else { Some(tclass as u8) };
-                    match h.socket_type() {
-                        NetSocketType::Tcp | NetSocketType::Udp | NetSocketType::Icmp => {
-                            net::stack()
-                                .socket_set_traffic_class(h, traffic_class)
-                                .map_err(map_inet_net_error)?
-                        }
-                        NetSocketType::Raw => {}
-                    }
-                }
                 Ok(())
             }
-            IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => {
-                let handle = handle.ok_or(Errno::ENODEV)?;
-                let (iface, group) = parse_ipv6_multicast_membership(value, handle.interface_id())?;
-                let result = if optname == IPV6_ADD_MEMBERSHIP {
-                    net::stack().join_multicast_group(iface, group)
-                } else {
-                    net::stack().leave_multicast_group(iface, group)
-                };
-                result.map_err(map_inet_net_error)
-            }
+            IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => Err(Errno::EAFNOSUPPORT),
             IPV6_MULTICAST_HOPS | IPV6_MULTICAST_IF | IPV6_MULTICAST_LOOP => Ok(()),
             _ => Err(Errno::ENOPROTOOPT),
         },
@@ -2316,7 +2147,7 @@ mod tests {
                 addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 1, 2, 3)),
                 port: 7783,
             }),
-            interface_id: Some(InterfaceId(4)),
+            interface_id: Some(NetDeviceId(4)),
             hop_limit: Some(37),
             traffic_class: Some(0xbb),
             msg_flags: 0,
@@ -2356,7 +2187,7 @@ mod tests {
                 addr: net::IpAddr::V6(addr),
                 port: 7783,
             }),
-            interface_id: Some(InterfaceId(8)),
+            interface_id: Some(NetDeviceId(8)),
             hop_limit: Some(63),
             traffic_class: Some(0),
             msg_flags: 0,
@@ -2393,7 +2224,7 @@ mod tests {
                 addr: net::IpAddr::V4(net::Ipv4Addr::new(10, 1, 2, 3)),
                 port: 7783,
             }),
-            interface_id: Some(InterfaceId(4)),
+            interface_id: Some(NetDeviceId(4)),
             hop_limit: Some(37),
             traffic_class: Some(0),
             msg_flags: 0,

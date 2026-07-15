@@ -1,6 +1,5 @@
 //! 通用 DMA 分配与同步辅助。
 
-use alloc::boxed::Box;
 use allocator::{KERNEL_ALLOCATOR, PAGE_SIZE, PhysicalAllocRequest, PhysicalAllocation};
 use spin::mutex::Mutex;
 
@@ -166,6 +165,26 @@ impl DmaContext {
 
     pub const fn constraints(self) -> DmaConstraints {
         self.constraints
+    }
+
+    pub(crate) const fn sync_handle(self, region: DmaSyncRegion) -> DmaSyncHandle {
+        DmaSyncHandle {
+            mapper: self.mapper,
+            region,
+        }
+    }
+}
+
+/// 可跨对象保存的 DMA 同步句柄，不拥有底层内存。
+#[derive(Clone, Copy)]
+pub(crate) struct DmaSyncHandle {
+    mapper: &'static dyn DmaMapper,
+    region: DmaSyncRegion,
+}
+
+impl DmaSyncHandle {
+    pub(crate) fn sync_for_device(self) {
+        self.mapper.sync_for_device(self.region);
     }
 }
 
@@ -334,6 +353,10 @@ impl DmaBuffer {
         self.context.mapper.sync_for_cpu(self.sync_region());
     }
 
+    pub(crate) fn sync_handle(&self) -> DmaSyncHandle {
+        self.context.sync_handle(self.sync_region())
+    }
+
     fn sync_region(&self) -> DmaSyncRegion {
         DmaSyncRegion {
             paddr: self.paddr(),
@@ -477,16 +500,40 @@ impl core::ops::DerefMut for DmaPage {
     }
 }
 
-impl net::driver::DmaBackend for DmaBuffer {
-    fn as_slice(&self) -> &[u8] {
-        self.as_slice()
+impl net::buf::NetBufStorage for DmaBuffer {
+    fn capacity(&self) -> usize {
+        self.len()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
+    fn base_ptr(&self) -> core::ptr::NonNull<u8> {
+        core::ptr::NonNull::new(self.vaddr() as *mut u8).expect("DMA buffer 虚拟地址为空")
     }
 
-    fn into_any(self: Box<Self>) -> Box<dyn core::any::Any> {
-        self
+    fn dma_addr(&self) -> Option<u64> {
+        Some(self.dma_addr() as u64)
+    }
+
+    fn sync_for_cpu(&self, offset: usize, len: usize) {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return;
+        }
+        self.context.mapper.sync_for_cpu(DmaSyncRegion {
+            paddr: self.paddr() + offset,
+            vaddr: self.vaddr() + offset,
+            len,
+            direction: self.direction(),
+        });
+    }
+
+    fn sync_for_device(&self, offset: usize, len: usize) {
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return;
+        }
+        self.context.mapper.sync_for_device(DmaSyncRegion {
+            paddr: self.paddr() + offset,
+            vaddr: self.vaddr() + offset,
+            len,
+            direction: self.direction(),
+        });
     }
 }

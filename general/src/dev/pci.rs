@@ -29,6 +29,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use core::ptr::{read_volatile, write_volatile};
 
 use vfs::sync::Spinlock;
 
@@ -397,6 +398,19 @@ const PCI_MSI_MESSAGE_ADDRESS_LO_OFFSET: u16 = 0x04;
 const PCI_MSI_MESSAGE_ADDRESS_HI_OFFSET: u16 = 0x08;
 const PCI_MSI_MESSAGE_DATA_32_OFFSET: u16 = 0x08;
 const PCI_MSI_MESSAGE_DATA_64_OFFSET: u16 = 0x0c;
+const PCI_MSIX_CONTROL_OFFSET: u16 = 0x02;
+const PCI_MSIX_TABLE_OFFSET: u16 = 0x04;
+const PCI_MSIX_CONTROL_TABLE_SIZE_MASK: u16 = 0x07ff;
+const PCI_MSIX_CONTROL_FUNCTION_MASK: u16 = 0x4000;
+const PCI_MSIX_CONTROL_ENABLE: u16 = 0x8000;
+const PCI_MSIX_BIR_MASK: u32 = 0x7;
+const PCI_MSIX_TABLE_ADDR_MASK: u32 = !PCI_MSIX_BIR_MASK;
+const PCI_MSIX_ENTRY_SIZE: usize = 16;
+const PCI_MSIX_ENTRY_ADDR_LO: usize = 0;
+const PCI_MSIX_ENTRY_ADDR_HI: usize = 4;
+const PCI_MSIX_ENTRY_DATA: usize = 8;
+const PCI_MSIX_ENTRY_VECTOR_CONTROL: usize = 12;
+const PCI_MSIX_ENTRY_MASKED: u32 = 1;
 /// PCI 常规配置空间每条 bus 最多有 32 个 device 编号。
 pub const PCI_DEVICES_PER_BUS: u8 = 32;
 /// 每个 PCI device 最多有 8 个 function，0 号 function 必须先探测。
@@ -530,6 +544,79 @@ pub struct PciMsiPnpResource {
     pci: PciDevice,
     handle: PciMsiHandle,
     label: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PciMsixError {
+    NotSupported,
+    InvalidCount,
+    InvalidTable,
+    BarUnavailable,
+    BarTooSmall,
+    NoAllocator,
+    AllocationFailed,
+    Config(PciConfigError),
+}
+
+impl From<PciConfigError> for PciMsixError {
+    fn from(error: PciConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PciMsixVector {
+    table_index: u16,
+    allocation: msi::MsiHandle,
+}
+
+impl PciMsixVector {
+    pub(crate) const fn line(self) -> IrqLine {
+        self.allocation.line()
+    }
+}
+
+pub(crate) struct PciMsixSet {
+    cap_offset: u16,
+    table_vaddr: usize,
+    vectors: Box<[PciMsixVector]>,
+}
+
+impl PciMsixSet {
+    pub(crate) fn len(&self) -> usize {
+        self.vectors.len()
+    }
+
+    pub(crate) fn vector(&self, index: usize) -> Option<PciMsixVector> {
+        self.vectors.get(index).copied()
+    }
+}
+
+pub(crate) struct PciMsixPnpResource {
+    pci: PciDevice,
+    set: PciMsixSet,
+    label: &'static str,
+}
+
+impl PciMsixPnpResource {
+    pub(crate) const fn new(pci: PciDevice, set: PciMsixSet, label: &'static str) -> Self {
+        Self { pci, set, label }
+    }
+}
+
+impl PnpResource for PciMsixPnpResource {
+    fn kind(&self) -> PnpResourceKind {
+        PnpResourceKind::Msi
+    }
+
+    fn label(&self) -> &'static str {
+        self.label
+    }
+
+    fn release(self: Box<Self>) -> Result<(), PnpResourceReleaseError> {
+        self.pci.release_configured_msix(self.set);
+        Ok(())
+    }
 }
 
 impl PciMsiPnpResource {
@@ -1130,6 +1217,152 @@ impl PciDevice {
 
     pub fn msix_capability(&self) -> Option<u16> {
         self.find_capability(PCI_MSIX_CAPABILITY_ID)
+    }
+
+    pub(crate) fn msix_table_size(&self) -> Option<u16> {
+        let capability = self.msix_capability()?;
+        let control = self
+            .try_read_config_u16(capability + PCI_MSIX_CONTROL_OFFSET)
+            .ok()?;
+        Some((control & PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1)
+    }
+
+    pub(crate) fn try_configure_msix(&self, count: u16) -> Result<PciMsixSet, PciMsixError> {
+        let capability = self.msix_capability().ok_or(PciMsixError::NotSupported)?;
+        let control = self.try_read_config_u16(capability + PCI_MSIX_CONTROL_OFFSET)?;
+        let table_size = (control & PCI_MSIX_CONTROL_TABLE_SIZE_MASK) + 1;
+        if count == 0 || count > table_size {
+            return Err(PciMsixError::InvalidCount);
+        }
+        let table = self.try_read_config_u32(capability + PCI_MSIX_TABLE_OFFSET)?;
+        let bir = (table & PCI_MSIX_BIR_MASK) as usize;
+        let table_offset = (table & PCI_MSIX_TABLE_ADDR_MASK) as usize;
+        let (bar, bar_vaddr) = self.map_bar_virt(bir).ok_or(PciMsixError::BarUnavailable)?;
+        if !bar.is_memory() {
+            return Err(PciMsixError::InvalidTable);
+        }
+        let table_bytes = usize::from(count)
+            .checked_mul(PCI_MSIX_ENTRY_SIZE)
+            .ok_or(PciMsixError::InvalidTable)?;
+        if table_offset
+            .checked_add(table_bytes)
+            .is_none_or(|end| end > bar.size as usize)
+        {
+            return Err(PciMsixError::BarTooSmall);
+        }
+        let table_vaddr = bar_vaddr
+            .checked_add(table_offset)
+            .ok_or(PciMsixError::InvalidTable)?;
+        let (segment, bus, device, function) = self.bdf().ok_or(PciMsixError::InvalidTable)?;
+        let allocator = {
+            let guard = PCI_CONFIG.lock();
+            guard
+                .as_ref()
+                .and_then(|config| config.allocate_msi)
+                .ok_or(PciMsixError::NoAllocator)?
+        };
+
+        self.try_write_config_u16(
+            capability + PCI_MSIX_CONTROL_OFFSET,
+            control | PCI_MSIX_CONTROL_ENABLE | PCI_MSIX_CONTROL_FUNCTION_MASK,
+        )?;
+
+        let mut vectors: Vec<PciMsixVector> = Vec::new();
+        if vectors.try_reserve_exact(count as usize).is_err() {
+            let _ = self.try_write_config_u16(
+                capability + PCI_MSIX_CONTROL_OFFSET,
+                (control | PCI_MSIX_CONTROL_FUNCTION_MASK) & !PCI_MSIX_CONTROL_ENABLE,
+            );
+            return Err(PciMsixError::AllocationFailed);
+        }
+        for table_index in 0..count {
+            let Some(allocation) = allocator(segment, bus, device, function) else {
+                for vector in vectors.drain(..) {
+                    let _ = msi::free_msi(vector.allocation);
+                }
+                let _ = self.try_write_config_u16(
+                    capability + PCI_MSIX_CONTROL_OFFSET,
+                    (control | PCI_MSIX_CONTROL_FUNCTION_MASK) & !PCI_MSIX_CONTROL_ENABLE,
+                );
+                return Err(PciMsixError::AllocationFailed);
+            };
+            let entry = table_vaddr + usize::from(table_index) * PCI_MSIX_ENTRY_SIZE;
+            program_msix_entry(entry, allocation.message(), true);
+            vectors.push(PciMsixVector {
+                table_index,
+                allocation,
+            });
+        }
+        Ok(PciMsixSet {
+            cap_offset: capability,
+            table_vaddr,
+            vectors: vectors.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn try_enable_configured_msix(&self, set: &PciMsixSet) -> Result<(), PciMsixError> {
+        for vector in set.vectors.iter().copied() {
+            set_msix_entry_mask(set.table_vaddr, vector.table_index, false);
+        }
+        let control = self.try_read_config_u16(set.cap_offset + PCI_MSIX_CONTROL_OFFSET)?;
+        self.try_write_config_u16(
+            set.cap_offset + PCI_MSIX_CONTROL_OFFSET,
+            (control | PCI_MSIX_CONTROL_ENABLE) & !PCI_MSIX_CONTROL_FUNCTION_MASK,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn release_configured_msix(&self, set: PciMsixSet) {
+        if let Ok(control) = self.try_read_config_u16(set.cap_offset + PCI_MSIX_CONTROL_OFFSET) {
+            let _ = self.try_write_config_u16(
+                set.cap_offset + PCI_MSIX_CONTROL_OFFSET,
+                (control | PCI_MSIX_CONTROL_FUNCTION_MASK) & !PCI_MSIX_CONTROL_ENABLE,
+            );
+        }
+        for vector in set.vectors.iter().copied() {
+            set_msix_entry_mask(set.table_vaddr, vector.table_index, true);
+            let _ = msi::free_msi(vector.allocation);
+        }
+    }
+}
+
+fn program_msix_entry(entry: usize, message: msi::MsiMessage, masked: bool) {
+    // SAFETY: entry 已由 MSI-X capability、BAR 大小和 table index 共同校验。
+    unsafe {
+        write_volatile(
+            (entry + PCI_MSIX_ENTRY_VECTOR_CONTROL) as *mut u32,
+            PCI_MSIX_ENTRY_MASKED,
+        );
+        write_volatile(
+            (entry + PCI_MSIX_ENTRY_ADDR_LO) as *mut u32,
+            message.address as u32,
+        );
+        write_volatile(
+            (entry + PCI_MSIX_ENTRY_ADDR_HI) as *mut u32,
+            (message.address >> 32) as u32,
+        );
+        write_volatile((entry + PCI_MSIX_ENTRY_DATA) as *mut u32, message.data);
+        write_volatile(
+            (entry + PCI_MSIX_ENTRY_VECTOR_CONTROL) as *mut u32,
+            if masked { PCI_MSIX_ENTRY_MASKED } else { 0 },
+        );
+    }
+}
+
+fn set_msix_entry_mask(table_vaddr: usize, table_index: u16, masked: bool) {
+    let entry = table_vaddr + usize::from(table_index) * PCI_MSIX_ENTRY_SIZE;
+    // SAFETY: table_vaddr 和 index 来自已配置的 PciMsixSet。
+    unsafe {
+        let control = (entry + PCI_MSIX_ENTRY_VECTOR_CONTROL) as *mut u32;
+        let current = read_volatile(control);
+        write_volatile(
+            control,
+            if masked {
+                current | PCI_MSIX_ENTRY_MASKED
+            } else {
+                current & !PCI_MSIX_ENTRY_MASKED
+            },
+        );
     }
 }
 

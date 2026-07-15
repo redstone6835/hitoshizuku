@@ -15,7 +15,9 @@ mod bench;
 mod device_init;
 mod dtb;
 mod initramfs;
-mod net_poll;
+mod net_runtime;
+#[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+mod net_tests;
 mod panic;
 mod sched;
 mod start;
@@ -28,13 +30,10 @@ mod vdso;
 fn main() -> ! {
     log::debug!("[main] jumped into main()");
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
-    // 注册协议栈 tick 钩子——每个 timer tick 推一帧 `net::stack().poll()`，
-    // 否则整个协议栈不会推进任何状态（RX 帧进不来、TCP 状态机不前进、
-    // soft-remove 的 socket 永远占着槽位）。详见 [`net_poll`] 模块。
-    net_poll::register();
-
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    // PnP 早于调度器接管的网络 queue 在这里统一创建固定 affinity worker。
+    net_runtime::start_workers();
     // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则
     // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要
     // 调度器 init/idle 完成后才能派生内核线程。
@@ -48,7 +47,11 @@ fn main() -> ! {
     general::mm::smoketest::run();
     */
 
-    #[cfg(any(feature = "kernel-tests", feature = "allocator-tests"))]
+    #[cfg(any(
+        feature = "kernel-tests",
+        feature = "network-tests",
+        feature = "allocator-tests"
+    ))]
     {
         ktest::runner::set_writer(hal::console::early_write_bytes);
         let report = ktest::runner::run_all();

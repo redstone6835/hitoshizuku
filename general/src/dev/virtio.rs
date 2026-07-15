@@ -58,14 +58,17 @@ const VIRTIO_CC_DEVICE_FEATURE_SELECT: usize = 0x00;
 const VIRTIO_CC_DEVICE_FEATURE: usize = 0x04;
 const VIRTIO_CC_DRIVER_FEATURE_SELECT: usize = 0x08;
 const VIRTIO_CC_DRIVER_FEATURE: usize = 0x0c;
+const VIRTIO_CC_CONFIG_MSIX_VECTOR: usize = 0x10;
 const VIRTIO_CC_DEVICE_STATUS: usize = 0x14;
 const VIRTIO_CC_QUEUE_SELECT: usize = 0x16;
 const VIRTIO_CC_QUEUE_SIZE: usize = 0x18;
+const VIRTIO_CC_QUEUE_MSIX_VECTOR: usize = 0x1a;
 const VIRTIO_CC_QUEUE_ENABLE: usize = 0x1c;
 const VIRTIO_CC_QUEUE_NOTIFY_OFF: usize = 0x1e;
 const VIRTIO_CC_QUEUE_DESC: usize = 0x20;
 const VIRTIO_CC_QUEUE_DRIVER: usize = 0x28;
 const VIRTIO_CC_QUEUE_DEVICE: usize = 0x30;
+pub const VIRTIO_MSI_NO_VECTOR: u16 = u16::MAX;
 
 /// VirtIO PCI function 描述。
 ///
@@ -261,6 +264,7 @@ pub enum VirtioPciTransportError {
     NotifyOffsetOverflow,
     NotifyOutOfRange,
     NotifyAddressOverflow,
+    MsixVectorRejected,
 }
 
 /// 已校验的 VirtIO PCI transport 访问器。
@@ -349,6 +353,26 @@ impl VirtioPciTransport {
 
     pub fn set_selected_queue_size(&self, queue_size: u16) {
         wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_SIZE, queue_size);
+    }
+
+    pub fn set_config_msix_vector(&self, vector: u16) -> Result<(), VirtioPciTransportError> {
+        wr_u16(
+            self.caps.common.vaddr + VIRTIO_CC_CONFIG_MSIX_VECTOR,
+            vector,
+        );
+        (rd_u16(self.caps.common.vaddr + VIRTIO_CC_CONFIG_MSIX_VECTOR) != VIRTIO_MSI_NO_VECTOR)
+            .then_some(())
+            .ok_or(VirtioPciTransportError::MsixVectorRejected)
+    }
+
+    pub fn set_selected_queue_msix_vector(
+        &self,
+        vector: u16,
+    ) -> Result<(), VirtioPciTransportError> {
+        wr_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_MSIX_VECTOR, vector);
+        (rd_u16(self.caps.common.vaddr + VIRTIO_CC_QUEUE_MSIX_VECTOR) != VIRTIO_MSI_NO_VECTOR)
+            .then_some(())
+            .ok_or(VirtioPciTransportError::MsixVectorRejected)
     }
 
     pub fn set_selected_queue_addresses(&self, desc: u64, driver: u64, device: u64) {

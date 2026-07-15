@@ -644,6 +644,21 @@ pub fn force_reseed() {
     random_core().reseed_locked();
 }
 
+/// 内核子系统从已初始化 CSPRNG 取得随机材料。
+pub fn fill_kernel_random(out: &mut [u8]) {
+    random_core().read_nonblocking(out);
+}
+
+/// 在依赖随机 key 的 PnP 驱动注册前完成启动 seed 和首次 reseed。
+pub fn initialize_for_kernel(bootloader_seed: Option<&[u8]>) {
+    if let Some(seed) = bootloader_seed {
+        add_bootloader_randomness(seed);
+    }
+    if !random_core().first_seed_done.load(Ordering::Acquire) {
+        seed_from_startup();
+    }
+}
+
 // ──────────────────────── CharDriver 实现 ─────────────────────────────────
 
 /// `/dev/random` 字符设备：阻塞读，熵不足则等待。
@@ -698,7 +713,9 @@ pub static URANDOM_DRIVER: UrandomDriver = UrandomDriver;
 ///      credit reseed 一次。
 ///   2. 标记 `first_seed_done`，供诊断。
 pub fn register_builtin_driver() -> Result<(), PnpError> {
-    seed_from_startup();
+    if !random_core().first_seed_done.load(Ordering::Acquire) {
+        seed_from_startup();
+    }
     Ok(())
 }
 

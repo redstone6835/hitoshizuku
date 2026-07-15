@@ -1,161 +1,310 @@
-//! 网络设备对象。
-//!
-//! [`NetDevice`] 是驱动 probe 后创建的设备实例，持有 [`NetDriver`] 引用和
-//! 接口元数据（名称、ID、状态），表示一个已注册的网络接口在内核中的身份。
-//!
-//! 在 PnP 框架中，`general` 层会把 `NetDevice` 包装进 `NetFunction`
-//! 并注册到 `FunctionRegistry`。本 crate 不依赖 `general`——它只定义
-//! 设备对象本身。
+//! 网络设备注册、boot key 与 IRQ 唤醒边界。
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::driver::NetDriver;
-use crate::error::NetError;
+use spin::Mutex;
 
-// ── 接口 ID ──────────────────────────────────────────────────────────────────
+use crate::buf::NetBufPoolOwner;
+use crate::queue::NetQueuePair;
+use crate::{NetDeviceId, QueuePairId};
 
-/// 网络接口唯一标识。
-///
-/// 由 [`NetDevice::new`] 时自动分配（全局单调递增）。用于
-/// [`NetStack`](crate::stack::NetStack) 中的 attach/detach 索引。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InterfaceId(pub u32);
+static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
+static BOOT_CONFIG: Mutex<Option<NetBootConfig>> = Mutex::new(None);
+static REGISTRAR: Mutex<Option<&'static dyn NetDeviceRegistrar>> = Mutex::new(None);
 
-impl InterfaceId {
-    /// 分配下一个接口 ID（全局唯一）。
-    fn next() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+/// 网络用途的启动期独立 key 材料。
+#[derive(Clone, Copy)]
+pub struct NetBootConfig {
+    rss_key: [u8; 40],
+    tcp_isn_key: [u8; 16],
+    ephemeral_port_key: [u8; 16],
+    hash_seed: [u8; 16],
+    generation_nonce: [u8; 8],
+    mac_seed: [u8; 16],
+    active_cpu_count: u8,
+}
+
+impl NetBootConfig {
+    pub fn from_random_material(material: [u8; 112], active_cpu_count: u8) -> Option<Self> {
+        if active_cpu_count == 0 || active_cpu_count > 8 {
+            return None;
+        }
+        let mut rss_key = [0; 40];
+        let mut tcp_isn_key = [0; 16];
+        let mut ephemeral_port_key = [0; 16];
+        let mut hash_seed = [0; 16];
+        let mut generation_nonce = [0; 8];
+        let mut mac_seed = [0; 16];
+        rss_key.copy_from_slice(&material[0..40]);
+        tcp_isn_key.copy_from_slice(&material[40..56]);
+        ephemeral_port_key.copy_from_slice(&material[56..72]);
+        hash_seed.copy_from_slice(&material[72..88]);
+        generation_nonce.copy_from_slice(&material[88..96]);
+        mac_seed.copy_from_slice(&material[96..112]);
+        Some(Self {
+            rss_key,
+            tcp_isn_key,
+            ephemeral_port_key,
+            hash_seed,
+            generation_nonce,
+            mac_seed,
+            active_cpu_count,
+        })
     }
 
-    /// 获取原始数值表示。
-    pub fn raw(self) -> u32 {
-        self.0
+    pub const fn rss_key(&self) -> &[u8; 40] {
+        &self.rss_key
+    }
+
+    pub const fn tcp_isn_key(&self) -> &[u8; 16] {
+        &self.tcp_isn_key
+    }
+
+    pub const fn ephemeral_port_key(&self) -> &[u8; 16] {
+        &self.ephemeral_port_key
+    }
+
+    pub const fn hash_seed(&self) -> &[u8; 16] {
+        &self.hash_seed
+    }
+
+    pub const fn generation_nonce(&self) -> &[u8; 8] {
+        &self.generation_nonce
+    }
+
+    pub const fn mac_seed(&self) -> &[u8; 16] {
+        &self.mac_seed
+    }
+
+    pub const fn active_cpu_count(&self) -> u8 {
+        self.active_cpu_count
     }
 }
 
-// ── 设备状态 ─────────────────────────────────────────────────────────────────
-
-/// 设备生命周期状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DeviceState {
-    /// 设备已注册且正常工作。
-    Active = 0,
-    /// 设备已被标记为移除（热插拔或驱动卸载）。
-    Gone = 1,
+/// IRQ handler 安装到 queue 的唤醒目标。
+pub trait QueueWakeHandle: Send + Sync {
+    fn wake(&self);
 }
 
-// ── NetDevice ────────────────────────────────────────────────────────────────
-
-/// 一个已注册的网络设备。
-///
-/// 可安全克隆（内部 Arc），用于在协议栈和 PnP 框架之间共享引用。
-pub struct NetDevice {
-    id: InterfaceId,
-    name: Box<str>,
-    driver: Arc<dyn NetDriver>,
-    state: AtomicU8,
-    /// 运行期软件 MTU。0 表示使用驱动声明的硬件 MTU。
-    runtime_mtu: AtomicUsize,
-    /// 因 TX 队列满而丢弃的帧数（adapter 统计）。
-    tx_dropped: AtomicU64,
+/// driver 与 IRQ handler 共享的唯一 queue 控制对象。
+pub trait QueueIrqControl: Send + Sync {
+    fn ack_and_mask(&self) -> bool;
+    fn unmask(&self);
+    fn set_waker(&self, waker: Arc<dyn QueueWakeHandle>) -> Result<(), QueueIrqError>;
+    fn stats(&self) -> QueueIrqStats;
 }
 
-impl NetDevice {
-    /// 创建一个新的网络设备。
-    ///
-    /// - `name`：接口名（如 `"eth0"`），显示用途。
-    /// - `driver`：底层驱动的共享引用。
-    pub fn new(name: &str, driver: Arc<dyn NetDriver>) -> Self {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueIrqError {
+    WakerAlreadyInstalled,
+    DeviceGone,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueueIrqStats {
+    pub irq_total: u64,
+    pub irq_mask: u64,
+    pub irq_unmask: u64,
+}
+
+/// 一个 queue pair 连同其三个独立 pool owner 的原子注册单元。
+pub struct NetQueueRegistration {
+    pub id: QueuePairId,
+    pub queue: Box<dyn NetQueuePair>,
+    pub rx_pool: NetBufPoolOwner,
+    pub tx_header_pool: NetBufPoolOwner,
+    pub tx_payload_pool: NetBufPoolOwner,
+    pub irq: Arc<dyn QueueIrqControl>,
+}
+
+/// driver 完成协商后一次性交给 kernel 的设备资源。
+pub struct NetDeviceRegistration {
+    pub id: NetDeviceId,
+    pub name: Box<str>,
+    pub mac_address: [u8; 6],
+    pub mtu: u32,
+    pub running: bool,
+    pub queues: Box<[NetQueueRegistration]>,
+}
+
+impl NetDeviceRegistration {
+    pub fn new(
+        name: Box<str>,
+        mac_address: [u8; 6],
+        mtu: u32,
+        running: bool,
+        queues: Box<[NetQueueRegistration]>,
+    ) -> Self {
+        let raw = NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed);
+        assert!(raw != 0, "NetDeviceId 已耗尽");
         Self {
-            id: InterfaceId::next(),
-            name: name.into(),
-            driver,
-            state: AtomicU8::new(DeviceState::Active as u8),
-            runtime_mtu: AtomicUsize::new(0),
-            tx_dropped: AtomicU64::new(0),
+            id: NetDeviceId(raw),
+            name,
+            mac_address,
+            mtu,
+            running,
+            queues,
         }
     }
+}
 
-    /// 接口 ID（全局唯一）。
-    pub fn id(&self) -> InterfaceId {
-        self.id
+/// kernel 成功接管设备后的不透明句柄。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct NetDeviceHandle(pub u64);
+
+/// 同步 remove 完成后交还给 driver 的令牌。
+pub struct NetDeviceTeardown {
+    pub handle: NetDeviceHandle,
+}
+
+/// 控制面按需生成的只读设备快照。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetDeviceSnapshot {
+    pub id: NetDeviceId,
+    pub name: Box<str>,
+    pub mac_address: [u8; 6],
+    pub mtu: u32,
+    pub queue_pairs: u16,
+    pub running: bool,
+    pub stats: NetDeviceStats,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetDeviceStats {
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetStat {
+    pub device: NetDeviceId,
+    pub queue: QueuePairId,
+    pub key: &'static str,
+    pub value: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetDeviceRegisterErrorKind {
+    RegistrarNotReady,
+    InvalidRegistration,
+    ResourceExhausted,
+}
+
+/// 注册失败必须原样返还全部 ownership。
+pub struct NetDeviceRegisterError {
+    pub kind: NetDeviceRegisterErrorKind,
+    pub registration: NetDeviceRegistration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetDeviceRemoveError {
+    NoDevice,
+    Busy,
+    AlreadyRemoving,
+}
+
+/// 由 kernel 实现的设备接管入口。
+pub trait NetDeviceRegistrar: Send + Sync {
+    fn register_device(
+        &self,
+        registration: NetDeviceRegistration,
+    ) -> Result<NetDeviceHandle, NetDeviceRegisterError>;
+
+    fn begin_remove(
+        &self,
+        handle: NetDeviceHandle,
+    ) -> Result<NetDeviceTeardown, NetDeviceRemoveError>;
+
+    fn snapshot_devices(&self) -> Vec<NetDeviceSnapshot>;
+
+    fn snapshot_stats(&self) -> Vec<NetStat>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallNetRuntimeError {
+    AlreadyInstalled,
+}
+
+/// 在任何网络 PnP probe 前一次性安装 boot key 与 kernel registrar。
+pub fn install_net_runtime(
+    config: NetBootConfig,
+    registrar: &'static dyn NetDeviceRegistrar,
+) -> Result<(), InstallNetRuntimeError> {
+    let mut config_slot = BOOT_CONFIG.lock();
+    let mut registrar_slot = REGISTRAR.lock();
+    if config_slot.is_some() || registrar_slot.is_some() {
+        return Err(InstallNetRuntimeError::AlreadyInstalled);
     }
+    *config_slot = Some(config);
+    *registrar_slot = Some(registrar);
+    Ok(())
+}
 
-    /// 接口名称。
-    pub fn name(&self) -> &str {
-        &self.name
-    }
+pub fn boot_config() -> Option<NetBootConfig> {
+    *BOOT_CONFIG.lock()
+}
 
-    /// 底层驱动引用。
-    pub fn driver(&self) -> &Arc<dyn NetDriver> {
-        &self.driver
-    }
+pub fn register_device(
+    registration: NetDeviceRegistration,
+) -> Result<NetDeviceHandle, NetDeviceRegisterError> {
+    let registrar = *REGISTRAR.lock();
+    let Some(registrar) = registrar else {
+        return Err(NetDeviceRegisterError {
+            kind: NetDeviceRegisterErrorKind::RegistrarNotReady,
+            registration,
+        });
+    };
+    registrar.register_device(registration)
+}
 
-    /// 当前设备状态。
-    pub fn state(&self) -> DeviceState {
-        match self.state.load(Ordering::Acquire) {
-            0 => DeviceState::Active,
-            _ => DeviceState::Gone,
-        }
-    }
+pub fn begin_remove(handle: NetDeviceHandle) -> Result<NetDeviceTeardown, NetDeviceRemoveError> {
+    let registrar = *REGISTRAR.lock();
+    let Some(registrar) = registrar else {
+        return Err(NetDeviceRemoveError::NoDevice);
+    };
+    registrar.begin_remove(handle)
+}
 
-    /// 设备是否仍然活跃。
-    pub fn is_active(&self) -> bool {
-        self.state() == DeviceState::Active
-    }
+/// registrar 尚未安装时返回空列表，供早期 procfs/sysfs/netlink 安全读取。
+pub fn snapshot_devices() -> Vec<NetDeviceSnapshot> {
+    let registrar = *REGISTRAR.lock();
+    registrar
+        .map(NetDeviceRegistrar::snapshot_devices)
+        .unwrap_or_default()
+}
 
-    /// 标记设备为已移除。
-    ///
-    /// 此操作不可逆——一旦标记为 Gone，设备对象不会复活。
-    /// 后续对 driver 的操作可能返回 None / 失败，但不会 panic。
-    pub fn mark_gone(&self) {
-        self.state.store(DeviceState::Gone as u8, Ordering::Release);
-    }
+pub fn snapshot_stats() -> Vec<NetStat> {
+    let registrar = *REGISTRAR.lock();
+    registrar
+        .map(NetDeviceRegistrar::snapshot_stats)
+        .unwrap_or_default()
+}
 
-    /// 驱动声明的硬件 MTU 上限。
-    pub fn hardware_mtu(&self) -> usize {
-        self.driver.mtu()
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// 当前生效的 MTU。
-    ///
-    /// 运行期 MTU 只能在硬件上限内下调；如果驱动之后报告了更小上限，这里会
-    /// 取两者较小值，避免协议栈继续按过大的帧长发送。
-    pub fn mtu(&self) -> usize {
-        let configured = self.runtime_mtu.load(Ordering::Acquire);
-        let hardware = self.hardware_mtu();
-        if configured == 0 {
-            hardware
-        } else {
-            configured.min(hardware)
-        }
-    }
-
-    /// 设置运行期软件 MTU。
-    ///
-    /// 本接口不修改硬件寄存器，也不尝试扩大驱动声明的能力；它只约束协议栈
-    /// 可发送的最大包长。调用方若要恢复硬件默认值，应重新设置为硬件 MTU。
-    pub fn set_mtu(&self, mtu: usize) -> Result<(), NetError> {
-        const MIN_SOFTWARE_MTU: usize = 68;
-        let hardware = self.hardware_mtu();
-        if mtu < MIN_SOFTWARE_MTU || mtu > hardware {
-            return Err(NetError::InvalidArgument);
-        }
-        self.runtime_mtu.store(mtu, Ordering::Release);
-        Ok(())
-    }
-
-    /// 递增 TX 丢帧计数（adapter 层 alloc_tx 失败时调用）。
-    pub fn inc_tx_dropped(&self) {
-        self.tx_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// 获取 TX 丢帧计数快照。
-    pub fn tx_dropped(&self) -> u64 {
-        self.tx_dropped.load(Ordering::Relaxed)
+    #[test]
+    fn boot_material_is_split_without_overlap() {
+        let material = core::array::from_fn(|index| index as u8);
+        let config = NetBootConfig::from_random_material(material, 4).unwrap();
+        assert_eq!(config.rss_key()[0], 0);
+        assert_eq!(config.rss_key()[39], 39);
+        assert_eq!(config.tcp_isn_key()[0], 40);
+        assert_eq!(config.ephemeral_port_key()[0], 56);
+        assert_eq!(config.hash_seed()[0], 72);
+        assert_eq!(config.generation_nonce()[0], 88);
+        assert_eq!(config.mac_seed()[0], 96);
+        assert_eq!(config.active_cpu_count(), 4);
     }
 }

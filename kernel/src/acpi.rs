@@ -404,6 +404,7 @@ pub fn kernel_start_init(context: &StartContext) {
                 crate::vdso::install_realtime_source,
                 crate::vdso::unregister_realtime_source,
             ),
+        None,
     );
 
     let stdout_phys = console_serial_port_phys;

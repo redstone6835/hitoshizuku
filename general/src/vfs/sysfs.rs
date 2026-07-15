@@ -62,6 +62,7 @@ const KERNEL_OSRELEASE_INO: u64 = 21;
 const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
 const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
+const KERNEL_NET_STATS_INO: u64 = 25;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -837,11 +838,11 @@ impl SysSnapshot {
                 SysClassNodeKind::Symlink { target },
             );
         }
-        for iface in net::stack().snapshot_interfaces() {
+        for iface in net::device::snapshot_devices() {
             push_class_node(
                 &mut snap,
                 SYSFS_NET_CLASS,
-                iface.name,
+                iface.name.into_string(),
                 SysClassNodeKind::NetInterface {
                     iface_id: iface.id.raw(),
                 },
@@ -1149,7 +1150,7 @@ fn class_net_stats_slot_ino(iface_id: u32, slot: u64) -> u64 {
     sysfs_dynamic_ino(SysfsKey::net_stats_slot(iface_id, slot))
 }
 
-fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -> String {
+fn render_netdev_file(iface: &net::device::NetDeviceSnapshot, slot: NetDevSlot) -> String {
     use alloc::fmt::Write;
     let mut s = String::new();
     match slot {
@@ -1159,7 +1160,7 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_link_type_ether);
         }
         NetDevSlot::Address => {
-            let mac = iface.mac;
+            let mac = iface.mac_address;
             let _ = writeln!(
                 s,
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -1170,7 +1171,8 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", iface.mtu);
         }
         NetDevSlot::Flags => {
-            let _ = writeln!(s, "0x{:x}", iface.flags);
+            let flags = if iface.running { 0x41u32 } else { 0 };
+            let _ = writeln!(s, "0x{:x}", flags);
         }
         NetDevSlot::IfIndex => {
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_ifindex(iface.id.raw()));
@@ -1179,19 +1181,11 @@ fn render_netdev_file(iface: &net::stack::InterfaceSnapshot, slot: NetDevSlot) -
             let _ = writeln!(s, "{}", SYSFS_USER_VIEW_POLICY.net_tx_queue_len);
         }
         NetDevSlot::Carrier => {
-            let carrier = if iface.flags & net::stack::IFF_RUNNING != 0 {
-                "1"
-            } else {
-                "0"
-            };
+            let carrier = if iface.running { "1" } else { "0" };
             let _ = writeln!(s, "{}", carrier);
         }
         NetDevSlot::Operstate => {
-            let state = if iface.flags & net::stack::IFF_UP != 0 {
-                "up"
-            } else {
-                "down"
-            };
+            let state = if iface.running { "up" } else { "down" };
             let _ = writeln!(s, "{}", state);
         }
         NetDevSlot::StatisticsRxBytes => {
@@ -1483,6 +1477,7 @@ enum SysRegFile {
     Version,
     Cmdline,
     DeviceFunctions,
+    NetStats,
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
@@ -1874,6 +1869,19 @@ fn render_kernel_cmdline() -> String {
     }
 }
 
+fn render_net_stats() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    for stat in net::device::snapshot_stats() {
+        let _ = writeln!(
+            output,
+            "device={} queue={} key={} value={}",
+            stat.device.0, stat.queue.0, stat.key, stat.value,
+        );
+    }
+    output
+}
+
 fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
     match kind {
         SysRegFile::BlockDev { idx, slot } => render_block_dev_file(snap, idx, slot),
@@ -1900,9 +1908,9 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
             append_function_projection_diagnostics(&mut out);
             out
         }
+        SysRegFile::NetStats => render_net_stats(),
         SysRegFile::NetDev { iface_id, slot } => {
-            if let Some(iface) = net::stack()
-                .snapshot_interfaces()
+            if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
                 .find(|i| i.id.raw() == iface_id)
             {
@@ -2570,6 +2578,7 @@ impl SysDirInodeOps {
                 "device_functions" => {
                     mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
                 }
+                "net_stats" => mk_reg(KERNEL_NET_STATS_INO, SysRegFile::NetStats),
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::Fs => match name {
@@ -3151,6 +3160,7 @@ impl SysDirInodeOps {
                     "device_functions",
                     FileType::Regular,
                 ),
+                mk_dir_entry(KERNEL_NET_STATS_INO, "net_stats", FileType::Regular),
             ],
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),

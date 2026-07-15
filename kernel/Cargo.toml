@@ -21,6 +21,7 @@ kernel-tests = [
     "log/ktest-kernel",
     "allocator/ktest-kernel",
 ]
+network-tests = ["ktest/kernel"]
 
 [[bin]]
 name = "kernel"

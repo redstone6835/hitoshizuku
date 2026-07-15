@@ -38,6 +38,11 @@ SECTIONS
         PROVIDE(__ex_table_start = .);
         KEEP(*(__ex_table))
         PROVIDE(__ex_table_end = .);
+        . = ALIGN(8);
+        PROVIDE(__start_ktest = .);
+        KEEP(*(.ktest .ktest.*))
+        PROVIDE(__stop_ktest = .);
+        . = ALIGN(8);
         *(.eh_frame_hdr)
         *(.eh_frame)
     }

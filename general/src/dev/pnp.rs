@@ -920,6 +920,21 @@ impl PnpDevice {
         Ok(())
     }
 
+    /// 为即将成组登记的资源预留槽位。
+    ///
+    /// 驱动应在创建外部 handle 前调用；预留成功后，同一 probe 事务内后续
+    /// `own_resource` 不会因扩容失败而把尚未登记的 IRQ/MSI handle 泄漏掉。
+    pub(crate) fn reserve_owned_resources(&self, additional: usize) -> Result<(), PnpError> {
+        let mut inner = self.inner.lock();
+        if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
+            return Err(PnpError::InvalidState);
+        }
+        inner
+            .resources
+            .try_reserve(additional)
+            .map_err(|_| PnpError::OutOfMemory)
+    }
+
     fn set_deferred_dependency(&self, dependency: Option<PnpDependency>) {
         self.inner.lock().deferred_dependency = dependency;
     }
