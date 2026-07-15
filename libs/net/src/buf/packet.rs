@@ -41,6 +41,20 @@ impl PacketFragment {
             Self::Shared(_) => Err(super::NetBufPoolError::CorruptState),
         }
     }
+
+    pub fn as_slice(&self) -> Result<&[u8], super::NetBufPoolError> {
+        match self {
+            Self::Exclusive(lease) => lease.as_slice(),
+            Self::Shared(chunk) => chunk.as_slice(),
+        }
+    }
+
+    pub fn as_mut_slice(&mut self) -> Result<&mut [u8], super::NetBufPoolError> {
+        match self {
+            Self::Exclusive(lease) => lease.as_mut_slice(),
+            Self::Shared(_) => Err(super::NetBufPoolError::CorruptState),
+        }
+    }
 }
 
 /// 一个逻辑 packet，最多内联 18 个 fragment。
@@ -124,6 +138,108 @@ impl PacketChain {
             .ok_or(super::NetBufPoolError::InvalidRange)?;
         Ok(())
     }
+
+    /// 从可能分散的 fragment 中复制一个连续字节区间。
+    pub fn copy_out(&self, offset: usize, output: &mut [u8]) -> Result<(), super::NetBufPoolError> {
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(super::NetBufPoolError::InvalidRange)?;
+        if end > self.total_len() {
+            return Err(super::NetBufPoolError::InvalidRange);
+        }
+        let mut packet_offset = 0usize;
+        let mut written = 0usize;
+        for index in 0..self.fragment_count() {
+            let fragment = self
+                .fragment(index)
+                .ok_or(super::NetBufPoolError::CorruptState)?;
+            let bytes = fragment.as_slice()?;
+            let fragment_end = packet_offset + bytes.len();
+            if offset < fragment_end && end > packet_offset {
+                let start = offset.saturating_sub(packet_offset);
+                let stop = bytes.len().min(end - packet_offset);
+                let len = stop - start;
+                output[written..written + len].copy_from_slice(&bytes[start..stop]);
+                written += len;
+            }
+            packet_offset = fragment_end;
+            if written == output.len() {
+                return Ok(());
+            }
+        }
+        Err(super::NetBufPoolError::InvalidRange)
+    }
+
+    /// 写入一个连续字节区间；目标 fragment 必须保持独占。
+    pub fn copy_in(&mut self, offset: usize, input: &[u8]) -> Result<(), super::NetBufPoolError> {
+        let end = offset
+            .checked_add(input.len())
+            .ok_or(super::NetBufPoolError::InvalidRange)?;
+        if end > self.total_len() {
+            return Err(super::NetBufPoolError::InvalidRange);
+        }
+        let mut packet_offset = 0usize;
+        let mut consumed = 0usize;
+        for index in 0..self.fragment_count() {
+            let fragment = self
+                .fragment_mut(index)
+                .ok_or(super::NetBufPoolError::CorruptState)?;
+            let fragment_len = fragment.len();
+            let fragment_end = packet_offset + fragment_len;
+            if offset < fragment_end && end > packet_offset {
+                let start = offset.saturating_sub(packet_offset);
+                let stop = fragment_len.min(end - packet_offset);
+                let len = stop - start;
+                fragment.as_mut_slice()?[start..stop]
+                    .copy_from_slice(&input[consumed..consumed + len]);
+                consumed += len;
+            }
+            packet_offset = fragment_end;
+            if consumed == input.len() {
+                return Ok(());
+            }
+        }
+        Err(super::NetBufPoolError::InvalidRange)
+    }
+
+    /// 逐段访问一个 packet 区间，供校验和等无需线性化的算法使用。
+    pub fn for_each_slice<E>(
+        &self,
+        offset: usize,
+        len: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), PacketRangeError<E>> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(PacketRangeError::InvalidRange)?;
+        if end > self.total_len() {
+            return Err(PacketRangeError::InvalidRange);
+        }
+        let mut packet_offset = 0usize;
+        let mut visited = 0usize;
+        for index in 0..self.fragment_count() {
+            let fragment = self.fragment(index).ok_or(PacketRangeError::InvalidRange)?;
+            let bytes = fragment.as_slice().map_err(PacketRangeError::Buffer)?;
+            let fragment_end = packet_offset + bytes.len();
+            if offset < fragment_end && end > packet_offset {
+                let start = offset.saturating_sub(packet_offset);
+                let stop = bytes.len().min(end - packet_offset);
+                visit(&bytes[start..stop]).map_err(PacketRangeError::Visitor)?;
+                visited += stop - start;
+            }
+            packet_offset = fragment_end;
+            if visited == len {
+                return Ok(());
+            }
+        }
+        Err(PacketRangeError::InvalidRange)
+    }
+}
+
+pub enum PacketRangeError<E> {
+    InvalidRange,
+    Buffer(super::NetBufPoolError),
+    Visitor(E),
 }
 
 impl Default for PacketChain {

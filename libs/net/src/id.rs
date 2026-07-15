@@ -15,3 +15,18 @@ impl NetDeviceId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct QueuePairId(pub u16);
+
+/// 网络接口在配置快照中的稳定编号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct InterfaceId(pub u32);
+
+/// 协议执行分片编号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ShardId(pub u16);
+
+/// 单个分片内可稳定定位的流编号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct FlowId(pub u32);

@@ -1,6 +1,6 @@
 //! 网络栈的架构无关核心。
 //!
-//! 当前提供 buffer 所有权、批量 queue 契约和设备注册边界。
+//! 提供 buffer 所有权、批量 queue、协议数据面和设备注册边界。
 
 #![no_std]
 
@@ -8,10 +8,16 @@ extern crate alloc;
 
 pub mod address;
 pub mod buf;
+pub mod control;
 pub mod device;
+pub mod flow;
 pub mod id;
+pub mod pipeline;
 pub mod queue;
+pub mod ring;
+pub mod transport;
 pub mod tuning;
 
-pub use address::{Endpoint, IpAddr, Ipv4Addr, Ipv6Addr};
-pub use id::{NetDeviceId, QueuePairId};
+pub use address::{AddressFamily, Endpoint, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
+pub use flow::{FlowShard, FlowTurnContext, UdpSendError, UdpSendFailure};
+pub use id::{FlowId, InterfaceId, NetDeviceId, QueuePairId, ShardId};
