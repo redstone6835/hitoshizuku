@@ -197,8 +197,57 @@ static DMA_OPS: Mutex<DmaOps> = Mutex::new(DmaOps::coherent());
 /// 这个入口只定义“未提供设备专属 mapper 时”的平台默认行为。设备的地址位宽、
 /// 段大小、coherency 等能力仍由 [`DmaContext`] 内的 per-device constraints
 /// 表达，驱动不通过这里反推设备能力。
+#[kernel_symbols::export(
+    name = "general.dev.dma.set_dma_ops",
+    contract = "kernel.general.dma-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn set_dma_ops(ops: DmaOps) {
-    *DMA_OPS.lock() = ops;
+    if super::elm_lifecycle::install_dma_ops(ops).is_err() {
+        log::error!("[dma] ELM DMA 平台操作安装失败，原操作保持不变");
+    }
+}
+
+pub(crate) fn replace_dma_ops(ops: DmaOps) -> DmaOps {
+    let mut current = DMA_OPS.lock();
+    core::mem::replace(&mut *current, ops)
+}
+
+/// 使用平台默认 mapper 把 CPU 写入同步给设备。
+#[kernel_symbols::export(
+    name = "general.dev.dma.sync_for_device",
+    contract = "kernel.general.dma-map@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn sync_for_device(region: DmaSyncRegion) {
+    LEGACY_GLOBAL_DMA_MAPPER.sync_for_device(region);
+}
+
+/// 使用平台默认 mapper 把设备写入同步给 CPU。
+#[kernel_symbols::export(
+    name = "general.dev.dma.sync_for_cpu",
+    contract = "kernel.general.dma-map@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn sync_for_cpu(region: DmaSyncRegion) {
+    LEGACY_GLOBAL_DMA_MAPPER.sync_for_cpu(region);
+}
+
+/// 使用平台默认 mapper 生成设备可见 DMA 地址并执行设备约束校验。
+#[kernel_symbols::export(
+    name = "general.dev.dma.phys_to_dma",
+    contract = "kernel.general.dma-map@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DMA
+)]
+pub fn phys_to_dma(region: DmaSyncRegion, constraints: DmaConstraints) -> Option<usize> {
+    LEGACY_GLOBAL_DMA_MAPPER.phys_to_dma(region, constraints)
 }
 
 fn dma_coherent_sync(_region: DmaSyncRegion) {

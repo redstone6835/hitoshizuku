@@ -4,26 +4,32 @@
 //! “未分配”，运行时分配器不得产生零。标识符只在当前启动实例和对应对象生命周期内有效，
 //! 不能当作内核地址，也不保证跨启动稳定。
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// 一个 ELM cell 的运行时标识符。
 pub struct ElmId(pub u64);
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// Nexus 或 provider 端口的运行时标识符。
 pub struct PortId(pub u64);
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// 两个能力端点之间已提交绑定的运行时标识符。
 pub struct BindingId(pub u64);
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// elm-mgr 菜单或可调用管理动作的运行时标识符。
 pub struct ActionId(pub u64);
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// 保护调用、绑定或资源生命周期的租约标识符。
 pub struct LeaseId(pub u64);
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 /// 同一逻辑 cell 的热替换代际。
 ///

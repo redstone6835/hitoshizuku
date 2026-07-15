@@ -7,5 +7,7 @@ edition = "2024"
 
 [dependencies]
 elm = { path = "../../libs/elm", default-features = false, features = ["runtime-model", "macros"] }
-kernel-api = { path = "../../kernel-api", default-features = false, features = ["runtime-model"] }
-ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
+kernel-symbols = { path = "../../libs/kernel-symbols", default-features = false }
+ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }
+quote = "=1.0.45"
+syn = { version = "=2.0.117", features = ["full", "parsing"] }

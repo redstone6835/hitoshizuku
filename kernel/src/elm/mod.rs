@@ -6,11 +6,10 @@ use alloc::string::String;
 
 mod api_registry;
 mod core;
-mod device_api;
 mod event;
 mod executor;
 mod journal;
-mod memory_api;
+mod kernel_symbols;
 mod menu;
 mod mgr_channel;
 mod native;
@@ -25,6 +24,8 @@ mod tests;
 mod trust_config;
 
 pub(crate) fn init_builtin_mgr() {
+    let _ = allocator::kernel_symbol_catalog_anchor();
+    let _ = general::kernel_symbol_catalog_anchor();
     let _ = elm_model::register_current_cpu_id(sched::current_cpu_id);
     if !general::elm_guard::register_task_context_backend() {
         log::error!("[elm] 无法注册任务级执行上下文后端");
@@ -38,16 +39,16 @@ pub(crate) fn init_builtin_mgr() {
         log::error!("[elm] 所有权资源注册表初始化失败");
         return;
     }
+    if !::kernel_symbols::install_runtime_hooks(&KERNEL_SYMBOL_RUNTIME_HOOKS) {
+        log::error!("[elm] 无法安装直接内核符号资源归属钩子");
+        return;
+    }
+    if let Err(err) = kernel_symbols::validate_catalog() {
+        log::error!("[elm] 内核直接符号目录无效: {:?}", err);
+        return;
+    }
     if !api_registry::init() {
-        log::error!("[elm] Kernel API 注册表初始化失败");
-        return;
-    }
-    if let Err(err) = memory_api::init() {
-        log::error!("[elm] kernel.memory@1 注册失败: {:?}", err);
-        return;
-    }
-    if let Err(err) = device_api::init() {
-        log::error!("[elm] kernel.device@1 注册失败: {:?}", err);
+        log::error!("[elm] 运行时 API 注册表初始化失败");
         return;
     }
     if let Err(err) = journal::init() {
@@ -117,55 +118,11 @@ pub(crate) fn register_trust_anchor(
 pub(crate) use core::with_core;
 pub(crate) use journal::{ElmJournalBackendOps, JournalError as ElmJournalError};
 
-/// 注册一个由常驻内核子系统实现的版本化 Kernel API 函数表。
-pub(crate) fn register_kernel_api_namespace(
+/// 注册一个由 ELM 运行时自身实现的版本化函数表。
+pub(crate) fn register_runtime_api_namespace(
     descriptor: &'static elm_model::ElmApiNamespaceDescriptorV1,
 ) -> Result<(), api_registry::ApiRegistryError> {
-    if descriptor.flags & elm_model::ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT != 0 {
-        let address = descriptor.table_address as usize;
-        if descriptor.table_size < ::core::mem::size_of::<kernel_api::ApiTableHeaderV1>() as u32
-            || address % ::core::mem::align_of::<kernel_api::ApiTableHeaderV1>() != 0
-        {
-            return Err(api_registry::ApiRegistryError::InvalidDescriptor);
-        }
-        // Safety: 描述符已经通过非空、尺寸和对齐检查，且只允许常驻静态函数表注册。
-        let header = unsafe { &*(descriptor.table_address as *const kernel_api::ApiTableHeaderV1) };
-        if header.struct_size != descriptor.table_size
-            || header.abi_version != descriptor.version
-            || header.reserved0 != 0
-            || header.capabilities != descriptor.capabilities
-        {
-            return Err(api_registry::ApiRegistryError::InvalidDescriptor);
-        }
-    }
     api_registry::register(descriptor)
-}
-
-/// 在 Kernel API 入口处验证调用令牌并返回当前 ELM 身份。
-///
-/// 子系统 thunk 必须先进入 `ElmExecutionDomain::KernelCall`，再调用本函数；授权成功后仍要
-/// 按具体资源执行所有权、参数范围和预算检查。函数表地址和令牌数值都不是权限真值。
-#[allow(dead_code)]
-pub(crate) fn authorize_kernel_api_call(
-    token: kernel_api::ApiGrantTokenV1,
-    identifier: &'static str,
-    version: u16,
-    required_capabilities: u64,
-) -> Result<elm_model::ElmCurrentContext, api_registry::ApiRegistryError> {
-    let context =
-        elm_model::current_context().ok_or(api_registry::ApiRegistryError::CapabilityDenied)?;
-    if !token.is_well_formed() || token.generation() != context.generation.0 {
-        return Err(api_registry::ApiRegistryError::CapabilityDenied);
-    }
-    api_registry::authorize(
-        token.grant_id(),
-        context.cell_id,
-        context.generation,
-        identifier.as_bytes(),
-        version,
-        required_capabilities,
-    )?;
-    Ok(context)
 }
 
 /// 由子系统 provider 为指定 ELM 登记一个可排空资源。
@@ -207,6 +164,70 @@ fn map_owned_resource_error(error: owned_resource::OwnedResourceError) -> elm_mo
         owned_resource::OwnedResourceError::Duplicate
         | owned_resource::OwnedResourceError::Busy
         | owned_resource::OwnedResourceError::Capacity => elm_model::ElmError::LeaseBusy,
+    }
+}
+
+static KERNEL_SYMBOL_RUNTIME_HOOKS: ::kernel_symbols::KernelSymbolRuntimeHooksV1 =
+    ::kernel_symbols::KernelSymbolRuntimeHooksV1 {
+        abi_version: 1,
+        struct_size: ::core::mem::size_of::<::kernel_symbols::KernelSymbolRuntimeHooksV1>() as u16,
+        reserved: 0,
+        register_owned_resource: register_kernel_symbol_owned_resource,
+        release_owned_resource: release_kernel_symbol_owned_resource,
+    };
+
+fn register_kernel_symbol_owned_resource(
+    kind: u32,
+    handle: u64,
+    ops: ::kernel_symbols::KernelSymbolOwnedResourceOpsV1,
+) -> i32 {
+    let Some(context) = elm_model::current_context() else {
+        return ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_UNMANAGED;
+    };
+    let Some(kind) = elm_model::ElmOwnedResourceKind::from_raw(kind) else {
+        return ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_FAILED;
+    };
+    let ops = elm_model::ElmOwnedResourceOpsV1::new(
+        convert_kernel_symbol_resource_op(ops.suspend),
+        convert_kernel_symbol_resource_op(ops.resume),
+        convert_kernel_symbol_resource_op(ops.quiesce),
+        convert_kernel_symbol_resource_op(ops.cancel),
+        convert_kernel_symbol_resource_op(ops.drain),
+        convert_kernel_symbol_resource_op(ops.release),
+    );
+    match register_owned_resource(context.cell_id, context.generation, kind, handle, ops) {
+        Ok(_) => ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_TRACKED,
+        Err(_) => ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_FAILED,
+    }
+}
+
+fn release_kernel_symbol_owned_resource(kind: u32, handle: u64) -> i32 {
+    let Some(context) = elm_model::current_context() else {
+        return ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_UNMANAGED;
+    };
+    let Some(kind) = elm_model::ElmOwnedResourceKind::from_raw(kind) else {
+        return ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_FAILED;
+    };
+    match owned_resource::release_by_handle(context.cell_id, context.generation, kind, handle) {
+        Ok(()) => ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_TRACKED,
+        Err(_) => ::kernel_symbols::KERNEL_SYMBOL_RESOURCE_STATUS_FAILED,
+    }
+}
+
+fn convert_kernel_symbol_resource_op(
+    operation: ::kernel_symbols::KernelSymbolOwnedResourceOp,
+) -> elm_model::ElmOwnedResourceOp {
+    const {
+        assert!(::core::mem::size_of::<elm_model::ElmId>() == ::core::mem::size_of::<u64>());
+        assert!(::core::mem::size_of::<elm_model::Generation>() == ::core::mem::size_of::<u64>());
+    }
+    // Safety: ElmId 和 Generation 均为 u64 的 repr(transparent) 包装，返回类型完全相同；
+    // Rust 工具链和接口源码摘要还会在装载前验证调用双方来自同一 ABI 构建。
+    unsafe {
+        ::core::mem::transmute::<
+            ::kernel_symbols::KernelSymbolOwnedResourceOp,
+            elm_model::ElmOwnedResourceOp,
+        >(operation)
     }
 }
 

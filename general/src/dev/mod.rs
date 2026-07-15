@@ -42,6 +42,7 @@ pub mod usb;
 pub mod virtio;
 pub mod virtio_mmio;
 
+mod elm_lifecycle;
 mod registry_id;
 
 pub use control::DriverControl;

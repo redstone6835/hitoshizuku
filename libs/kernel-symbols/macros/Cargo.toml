@@ -1,10 +1,13 @@
 [package]
-name = "elm-macros"
+name = "kernel-symbols-macros"
 version.workspace = true
 edition.workspace = true
 
 [lib]
 proc-macro = true
+test = true
+doctest = false
+bench = false
 
 [dependencies]
 proc-macro2 = "=1.0.106"

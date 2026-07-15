@@ -82,8 +82,12 @@
 
 mod boot;
 mod buddy;
+#[path = "kernel_symbols.rs"]
+mod direct_symbols;
 mod error;
 mod gc;
+#[doc(hidden)]
+pub use direct_symbols::catalog_anchor as kernel_symbol_catalog_anchor;
 mod kheap;
 mod managed;
 mod metadata;
@@ -113,8 +117,8 @@ use registry::AllocationRegistry;
 use slab::SlabAllocator;
 
 pub use buddy::{
-    BuddyAllocator as PhysicalAllocator, BuddyAudit, BuddyAuditFlags, BuddyReclaimStats,
-    BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
+    BuddyAllocError as PhysicalAllocError, BuddyAllocator as PhysicalAllocator, BuddyAudit,
+    BuddyAuditFlags, BuddyReclaimStats, BuddySnapshot, BuddyStats, MemorySegment, PAGE_SIZE,
 };
 pub use error::{
     AddressSpaceError, AllocationError, DeallocationError, InitError, ManagedHandleError,
@@ -1399,7 +1403,7 @@ impl KernelMemorySubsystem {
     /// 释放一个由指定非零所有者持有的普通 Kernel 域分配。
     ///
     /// 同一地址的外部操作由分片锁串行化，使 owner 查询与注册表移除之间不会被另一条
-    /// ELM Kernel API 调用插入。普通内核代码仍必须遵守对象自身的独占释放规则。
+    /// ELM 直接符号调用插入。普通内核代码仍必须遵守对象自身的独占释放规则。
     pub fn deallocate_owned(&self, owner: u64, ptr: usize) -> Result<(), OwnedAllocationError> {
         if owner == 0 {
             return Err(OwnedAllocationError::InvalidOwner);
@@ -2041,6 +2045,12 @@ impl KernelMemorySubsystem {
         }
     }
 
+    /// 使用当前已绑定的地址转换规则把物理地址转换为内核虚拟地址。
+    pub fn physical_to_virtual(&self, physical_address: usize) -> Option<usize> {
+        self.load_phys_to_virt()
+            .map(|translate| translate(physical_address))
+    }
+
     pub fn load_virt_to_phys(&self) -> Option<VirtToPhysFn> {
         let raw = self.virt_to_phys.load(Ordering::Acquire);
         if raw == 0 {
@@ -2048,6 +2058,12 @@ impl KernelMemorySubsystem {
         } else {
             Some(unsafe { core::mem::transmute::<usize, VirtToPhysFn>(raw) })
         }
+    }
+
+    /// 使用当前已绑定的地址转换规则把内核虚拟地址转换为物理地址。
+    pub fn virtual_to_physical(&self, virtual_address: usize) -> Option<usize> {
+        self.load_virt_to_phys()
+            .map(|translate| translate(virtual_address))
     }
 
     fn load_cpu_id_fn(&self) -> Option<CpuIdFn> {
@@ -2553,5 +2569,12 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
 #[cfg(feature = "ktest-kernel")]
 mod tests;
 
-#[global_allocator]
+/// 内核内存子系统的唯一状态实例；最终二进制自行选择是否把它安装为全局分配器。
+#[kernel_symbols::export(
+    name = "allocator.KERNEL_ALLOCATOR",
+    contract = "kernel.allocator.root@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub static KERNEL_ALLOCATOR: KernelMemorySubsystem = KernelMemorySubsystem::new();

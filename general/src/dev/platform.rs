@@ -510,6 +510,14 @@ impl PlatformRegistration {
     }
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.platform.register_and_probe_platform_device",
+    contract = "kernel.general.platform-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_and_probe_platform_device(
     info: PlatformDeviceInfo,
 ) -> Result<PlatformRegistration, PnpError> {

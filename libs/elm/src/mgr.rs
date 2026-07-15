@@ -341,10 +341,10 @@ pub const ELM_NATIVE_CAPABILITY_FLAG_KERNEL_SYMBOL: u32 = 1 << 2;
 pub const ELM_NATIVE_CAPABILITY_NAME_LEN: usize = 128;
 /// `ELM_REPLACE_CELL_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_REPLACE_CELL_ABI_VERSION: u16 = 1;
-/// 热替换请求显式批准为新 generation 建立镜像声明的 Kernel API grant。
-pub const ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API: u16 = 1 << 0;
+/// 热替换请求显式允许可信新镜像绑定高权限内核符号。
+pub const ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS: u16 = 1 << 0;
 /// v1 热替换请求支持的全部标志位。
-pub const ELM_REPLACE_CELL_FLAGS_MASK: u16 = ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
+pub const ELM_REPLACE_CELL_FLAGS_MASK: u16 = ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS;
 /// `ELM_REPLACE_MIGRATION_STATE_MAX` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_REPLACE_MIGRATION_STATE_MAX: usize = 64 * 1024;
 /// `ELM_TODO_KIND_RUNTIME` 稳定类别编号，用于在线格式中区分对应记录或对象。
@@ -1192,15 +1192,15 @@ impl ElmReplaceCellRequestV1 {
         }
     }
 
-    /// 显式请求为替换后的新 generation 建立 Kernel API grant。
-    pub const fn with_kernel_api_grant(mut self) -> Self {
-        self.flags |= ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
+    /// 显式请求允许可信的新 generation 绑定高权限内核符号。
+    pub const fn with_privileged_symbol_authorization(mut self) -> Self {
+        self.flags |= ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS;
         self
     }
 
-    /// 返回该替换事务是否请求 Kernel API grant。
-    pub const fn grants_kernel_api(self) -> bool {
-        self.flags & ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API != 0
+    /// 返回该替换事务是否请求高权限内核符号授权。
+    pub const fn authorizes_privileged_symbols(self) -> bool {
+        self.flags & ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS != 0
     }
 }
 
@@ -1590,6 +1590,8 @@ pub struct ElmCellPolicyV1 {
     pub native_flags: u32,
     /// `resource_flags` 标志位集合；必须拒绝相应有效掩码之外的未知位。
     pub resource_flags: u32,
+    /// 该单元获准直接绑定的内核符号能力组；调用期间不再重复查询该字段。
+    pub kernel_symbol_capabilities: u64,
     /// 操作结果状态码；零或专用成功码表示成功，其余值按所属协议解释。
     pub status: i32,
     /// 保留字段；生产者必须写零，消费者在当前版本必须拒绝非零值。
@@ -1617,6 +1619,7 @@ impl ElmCellPolicyV1 {
             extension_flags: ELM_EXTENSION_POLICY_ALL,
             native_flags: ELM_NATIVE_POLICY_ALL,
             resource_flags: ELM_RESOURCE_POLICY_ALL,
+            kernel_symbol_capabilities: kernel_symbols::capability::SAFE_DEFAULT,
             status,
             reserved: 0,
             blockers,

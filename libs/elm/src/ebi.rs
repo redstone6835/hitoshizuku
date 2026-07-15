@@ -21,7 +21,6 @@ use crate::developer::{ELM_MODULE_DESCRIPTOR_SYMBOL, ElmModuleDescriptorV1};
 pub use crate::ebi_wire::*;
 use crate::elmapi::{
     ELM_API_MAX_COMPATIBLE_VERSIONS, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
-    ELM_KERNEL_API_LAYOUT_HASH_LEN, is_valid_kernel_api_identifier,
 };
 use crate::manifest::{ElmManifest, ElmName};
 use crate::menu::{
@@ -45,11 +44,13 @@ pub const ELM_EBI_MAX_EXTENSIONS: usize = 16;
 /// `ELM_EBI_MAX_PROVIDER_PORTS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_PROVIDER_PORTS: usize = 16;
 /// `ELM_EBI_MAX_IMPORTS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
-pub const ELM_EBI_MAX_IMPORTS: usize = 64;
+///
+/// 内核直接符号按细粒度能力和精确 Rust ABI 分别登记，单个驱动可能需要同时引用设备、
+/// 总线、IRQ、DMA 与分配器目录。该上限必须允许完整子系统实现，但仍由 EKI 文件大小、
+/// 表记录尺寸和装载预算共同限制实际资源占用。
+pub const ELM_EBI_MAX_IMPORTS: usize = 1024;
 /// `ELM_EBI_MAX_EXPORTS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_EXPORTS: usize = 64;
-/// 单个 ELM 可以声明的 Kernel API 命名空间依赖上限。
-pub const ELM_EBI_MAX_KERNEL_API_REQUIREMENTS: usize = 64;
 /// `ELM_EBI_MAX_SYMBOL_LOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_SYMBOL_LOCATIONS: usize = 128;
 /// `ELM_EBI_MAX_RELOCATIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
@@ -88,9 +89,11 @@ pub const ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN: u32 = 1 << 4;
 pub const ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL: u32 = 1 << 5;
 /// 表示该内核符号使用精确 Rust API 身份，ABI 摘要同时绑定外部接口目录身份。
 ///
-/// v1 只固化该协议位和摘要算法；当前内核尚未安装对应目录后端，装载时会明确返回
-/// `NativeCodeTodo`。
+/// v1 目录解析器会同时校验规范函数签名和镜像 ABI 指纹中的接口身份，避免把相同函数
+/// 签名错误绑定到不同 crate identity、类型布局或 feature 图。
 pub const ELM_EBI_IMPORT_FLAG_EXACT_RUST_API: u32 = 1 << 6;
+/// 该内核直接导入指向静态对象而不是可调用函数。
+pub const ELM_EBI_IMPORT_FLAG_KERNEL_STATIC: u32 = 1 << 7;
 /// `ELM_EBI_IMPORT_FLAGS_MASK` 定义当前版本认可的全部标志位；输入包含掩码外位时必须拒绝或按调用契约报错。
 pub const ELM_EBI_IMPORT_FLAGS_MASK: u32 = ELM_EBI_IMPORT_FLAG_OPTIONAL
     | ELM_EBI_IMPORT_FLAG_MANAGED
@@ -98,7 +101,8 @@ pub const ELM_EBI_IMPORT_FLAGS_MASK: u32 = ELM_EBI_IMPORT_FLAG_OPTIONAL
     | ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR
     | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN
     | ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL
-    | ELM_EBI_IMPORT_FLAG_EXACT_RUST_API;
+    | ELM_EBI_IMPORT_FLAG_EXACT_RUST_API
+    | ELM_EBI_IMPORT_FLAG_KERNEL_STATIC;
 /// `ELM_EBI_EXPORT_FLAG_MANAGED` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_EXPORT_FLAG_MANAGED: u32 = 1 << 0;
 /// `ELM_EBI_EXPORT_FLAG_DIRECT_PINNED` 协议标志位；可在所属字段允许时与同组标志按位或组合。
@@ -643,6 +647,11 @@ impl ElmEbiImportDecl {
         self.flags & ELM_EBI_IMPORT_FLAG_EXACT_RUST_API != 0
     }
 
+    /// 返回该内核符号导入是否要求解析静态对象。
+    pub const fn is_kernel_static(&self) -> bool {
+        self.flags & ELM_EBI_IMPORT_FLAG_KERNEL_STATIC != 0
+    }
+
     /// 执行 `allows_ancestor` 定义的模型或协议操作；返回值反映校验后的结果。
     pub const fn allows_ancestor(&self) -> bool {
         self.flags & (ELM_EBI_IMPORT_FLAG_ALLOW_ANCESTOR | ELM_EBI_IMPORT_FLAG_ALLOW_BUILTIN) == 0
@@ -1061,38 +1070,6 @@ impl ElmEbiDependencyDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// ELM 对一个版本化 Kernel API 命名空间的装载前依赖声明。
-pub struct ElmEbiKernelApiRequirement {
-    /// 命名空间 identifier。
-    pub identifier: String,
-    /// 当前 v1 使用的精确函数表版本。
-    pub version: u16,
-    /// 模块实际需要的能力位。
-    pub required_capabilities: u64,
-    /// 对应版本函数表的规范布局 SHA-256。
-    pub layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
-}
-
-impl ElmEbiKernelApiRequirement {
-    /// 构造并校验一个 Kernel API 依赖声明。
-    pub fn new(
-        identifier: impl Into<String>,
-        version: u16,
-        required_capabilities: u64,
-        layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
-    ) -> Result<Self, ElmEbiLoadStatus> {
-        let requirement = Self {
-            identifier: identifier.into(),
-            version,
-            required_capabilities,
-            layout_hash,
-        };
-        validate_kernel_api_requirement(&requirement)?;
-        Ok(requirement)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// 目标单元公开的补缀点名称、契约、阶段和组合模式声明。
 pub struct ElmEbiExtensionPointDecl {
     /// 补缀点的完整 identifier，通常包含阶段后缀。
@@ -1259,8 +1236,6 @@ pub struct ElmEbiUnit {
     pub entry: Option<ElmEbiEntry>,
     /// 该单元声明的必需或可选依赖集合。
     pub dependencies: Vec<ElmEbiDependencyDecl>,
-    /// 该单元在执行任何原生代码前必须取得的 Kernel API 命名空间集合。
-    pub kernel_api_requirements: Vec<ElmEbiKernelApiRequirement>,
     /// 该单元允许其他 ELM 附着的补缀点集合。
     pub extension_points: Vec<ElmEbiExtensionPointDecl>,
     /// 该单元声明的 extension/mixin 附着集合。
@@ -1287,7 +1262,6 @@ impl ElmEbiUnit {
             segments: Vec::new(),
             entry: None,
             dependencies: Vec::new(),
-            kernel_api_requirements: Vec::new(),
             extension_points: Vec::new(),
             extensions: Vec::new(),
             provider_ports: Vec::new(),
@@ -1319,12 +1293,6 @@ impl ElmEbiUnit {
     /// 设置 `dependency` 并返回更新后的值，便于构建器式初始化。
     pub fn with_dependency(mut self, dependency: ElmEbiDependencyDecl) -> Self {
         self.dependencies.push(dependency);
-        self
-    }
-
-    /// 添加一个装载前 Kernel API 依赖声明。
-    pub fn with_kernel_api_requirement(mut self, requirement: ElmEbiKernelApiRequirement) -> Self {
-        self.kernel_api_requirements.push(requirement);
         self
     }
 
@@ -1385,7 +1353,6 @@ impl ElmEbiUnit {
             return Err(ElmEbiLoadStatus::InvalidSegment);
         }
         if self.dependencies.len() > ELM_EBI_MAX_DEPENDENCIES
-            || self.kernel_api_requirements.len() > ELM_EBI_MAX_KERNEL_API_REQUIREMENTS
             || self.extension_points.len() > ELM_EBI_MAX_EXTENSION_POINTS
             || self.extensions.len() > ELM_EBI_MAX_EXTENSIONS
             || self.provider_ports.len() > ELM_EBI_MAX_PROVIDER_PORTS
@@ -1408,16 +1375,6 @@ impl ElmEbiUnit {
         for dependency in &self.dependencies {
             validate_ebi_name(&dependency.provider_name)?;
             validate_contract_len(&dependency.contract)?;
-        }
-        for requirement in &self.kernel_api_requirements {
-            validate_kernel_api_requirement(requirement)?;
-        }
-        if self.kernel_api_requirements.windows(2).any(|items| {
-            items[0].identifier >= items[1].identifier
-                || (items[0].identifier == items[1].identifier
-                    && items[0].version >= items[1].version)
-        }) {
-            return Err(ElmEbiLoadStatus::InvalidManifest);
         }
         for point in &self.extension_points {
             validate_ebi_point(&point.point)?;
@@ -1490,18 +1447,6 @@ impl ElmEbiUnit {
                 .iter()
                 .any(ElmEbiSegment::requires_native_loader)
     }
-}
-
-fn validate_kernel_api_requirement(
-    requirement: &ElmEbiKernelApiRequirement,
-) -> Result<(), ElmEbiLoadStatus> {
-    if !is_valid_kernel_api_identifier(&requirement.identifier)
-        || requirement.version == 0
-        || requirement.layout_hash == [0; ELM_KERNEL_API_LAYOUT_HASH_LEN]
-    {
-        return Err(ElmEbiLoadStatus::InvalidManifest);
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1902,6 +1847,7 @@ fn validate_import_decl(import: &ElmEbiImportDecl) -> Result<(), ElmEbiLoadStatu
     validate_contract_len(&import.contract)?;
     let kernel_symbol = import.flags & ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL != 0;
     let exact_rust_api = import.flags & ELM_EBI_IMPORT_FLAG_EXACT_RUST_API != 0;
+    let kernel_static = import.flags & ELM_EBI_IMPORT_FLAG_KERNEL_STATIC != 0;
     let elm_modes =
         import.flags & (ELM_EBI_IMPORT_FLAG_MANAGED | ELM_EBI_IMPORT_FLAG_DIRECT_PINNED);
     let elm_scopes =
@@ -1913,6 +1859,7 @@ fn validate_import_decl(import: &ElmEbiImportDecl) -> Result<(), ElmEbiLoadStatu
         || import.flags & ELM_EBI_IMPORT_FLAG_MANAGED != 0
             && import.flags & ELM_EBI_IMPORT_FLAG_DIRECT_PINNED != 0
         || exact_rust_api && !kernel_symbol
+        || kernel_static && !kernel_symbol
         || kernel_symbol && (elm_modes != 0 || elm_scopes != 0)
         || requires_rust_abi && import.rust_abi_hash == [0; ELM_EBI_RUST_ABI_HASH_LEN]
         || !requires_rust_abi && import.rust_abi_hash != [0; ELM_EBI_RUST_ABI_HASH_LEN]

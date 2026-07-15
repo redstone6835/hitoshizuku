@@ -8,7 +8,7 @@
 //! 最低 epoch、防回滚、容量和持久化策略。
 //!
 //! [`ElmRustAbiFingerprintV1`] 单独绑定 target arch、pointer width、endian、rustc commit、
-//! panic strategy、code model、target features 和 kernel API manifest hash。签名有效但 ABI
+//! panic strategy、code model、target features 和内核接口 manifest hash。签名有效但 ABI
 //! 指纹不兼容的镜像仍必须拒绝执行。
 
 use alloc::string::String;
@@ -66,8 +66,8 @@ pub struct ElmRustAbiFingerprintV1 {
     pub rustc_commit_hash: [u8; ELM_PROOF_SHA256_LEN],
     /// `target_spec_hash` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
     pub target_spec_hash: [u8; ELM_PROOF_SHA256_LEN],
-    /// `kernel_api_hash` 保存对应对象的完整性摘要；安全决策必须按声明算法验证完整字节。
-    pub kernel_api_hash: [u8; ELM_PROOF_SHA256_LEN],
+    /// `kernel_interface_hash` 绑定运行时根表与直接内核符号协议的规范接口摘要。
+    pub kernel_interface_hash: [u8; ELM_PROOF_SHA256_LEN],
     /// `elmapi_version` 是该对象、ABI 或契约的版本值，用于装载和协商兼容性。
     pub elmapi_version: u16,
     /// 镜像声明的 panic 处理策略，必须与运行时 ABI 要求匹配。
@@ -85,7 +85,7 @@ impl ElmRustAbiFingerprintV1 {
     pub const fn new(
         rustc_commit_hash: [u8; ELM_PROOF_SHA256_LEN],
         target_spec_hash: [u8; ELM_PROOF_SHA256_LEN],
-        kernel_api_hash: [u8; ELM_PROOF_SHA256_LEN],
+        kernel_interface_hash: [u8; ELM_PROOF_SHA256_LEN],
         elmapi_version: u16,
         panic_strategy: ElmPanicStrategy,
         code_model: u8,
@@ -94,7 +94,7 @@ impl ElmRustAbiFingerprintV1 {
         Self {
             rustc_commit_hash,
             target_spec_hash,
-            kernel_api_hash,
+            kernel_interface_hash,
             elmapi_version,
             panic_strategy,
             code_model,
@@ -110,7 +110,7 @@ impl ElmRustAbiFingerprintV1 {
             || self.flags != 0
             || self.rustc_commit_hash == [0; ELM_PROOF_SHA256_LEN]
             || self.target_spec_hash == [0; ELM_PROOF_SHA256_LEN]
-            || self.kernel_api_hash == [0; ELM_PROOF_SHA256_LEN]
+            || self.kernel_interface_hash == [0; ELM_PROOF_SHA256_LEN]
         {
             return Err(ElmEbiLoadStatus::UnsupportedAbi);
         }
@@ -120,7 +120,7 @@ impl ElmRustAbiFingerprintV1 {
     fn hash_into(&self, hash: &mut CanonicalHash) {
         hash.bytes(&self.rustc_commit_hash);
         hash.bytes(&self.target_spec_hash);
-        hash.bytes(&self.kernel_api_hash);
+        hash.bytes(&self.kernel_interface_hash);
         hash.u16(self.elmapi_version);
         hash.u8(self.panic_strategy as u8);
         hash.u8(self.code_model);
@@ -792,13 +792,6 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
     for dependency in &unit.dependencies {
         hash.string(&dependency.provider_name);
         hash.string(dependency.contract.as_str());
-    }
-    hash.u64(unit.kernel_api_requirements.len() as u64);
-    for requirement in &unit.kernel_api_requirements {
-        hash.string(&requirement.identifier);
-        hash.u16(requirement.version);
-        hash.u64(requirement.required_capabilities);
-        hash.bytes(&requirement.layout_hash);
     }
     hash.u64(unit.extension_points.len() as u64);
     for point in &unit.extension_points {

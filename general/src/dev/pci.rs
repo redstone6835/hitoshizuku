@@ -217,6 +217,14 @@ static PCI_HOST_BRIDGES: Spinlock<PciHostBridgeRegistry> =
 ///
 /// `pnp` 是可选的固件节点对象；存在时，后续扫描到的 PCI function 会自动挂到
 /// 该节点下形成拓扑树。没有固件节点的早期平台仍可只登记 typed host 描述。
+#[kernel_symbols::export(
+    name = "general.dev.pci.register_host_bridge",
+    contract = "kernel.general.pci-host@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_host_bridge(
     info: PciHostBridgeInfo,
     pnp: Option<Arc<PnpDevice>>,
@@ -251,10 +259,21 @@ pub fn register_host_bridge(
         .bridges
         .push(PciHostBridgeRegistration { handle, info, pnp });
     drop(registry);
+    if super::elm_lifecycle::track_pci_host_bridge(handle).is_err() {
+        let _ = unregister_host_bridge(handle);
+        return Err(PciHostBridgeError::OutOfMemory);
+    }
     pnp_core::notify_dependency_ready(PnpDependency::PciHostBridge(domain));
     Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.pci.unregister_host_bridge",
+    contract = "kernel.general.pci-host@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_host_bridge(handle: PciHostBridgeHandle) -> Result<(), PciHostBridgeError> {
     let mut registry = PCI_HOST_BRIDGES.lock();
     let Some(index) = registry
@@ -265,6 +284,8 @@ pub fn unregister_host_bridge(handle: PciHostBridgeHandle) -> Result<(), PciHost
         return Err(PciHostBridgeError::NotFound);
     };
     registry.bridges.swap_remove(index);
+    drop(registry);
+    super::elm_lifecycle::forget_pci_host_bridge(handle);
     Ok(())
 }
 
@@ -273,6 +294,13 @@ fn release_host_bridge_resource(handle: PciHostBridgeHandle) -> bool {
 }
 
 /// 将 PCI host bridge 登记 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.pci.host_bridge_pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn host_bridge_pnp_resource(
     handle: PciHostBridgeHandle,
     label: &'static str,
@@ -285,6 +313,13 @@ pub fn host_bridge_pnp_resource(
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.pci.host_bridge_snapshot",
+    contract = "kernel.general.pci-host@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn host_bridge_snapshot() -> Vec<PciHostBridgeSnapshot> {
     PCI_HOST_BRIDGES
         .lock()
@@ -299,6 +334,12 @@ pub fn host_bridge_snapshot() -> Vec<PciHostBridgeSnapshot> {
 /// 调用方只需要知道 PCI function 所在的 segment/bus，即可拿到 host bridge 的
 /// ECAM、地址窗口和 DMA 属性；不需要理解 DTB `ranges`、ACPI 资源模板或其它
 /// 固件编码细节。
+#[kernel_symbols::export(
+    name = "general.dev.pci.host_bridge_for_bus",
+    contract = "kernel.general.pci-host@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+)]
 pub fn host_bridge_for_bus(segment: u16, bus: u8) -> Option<PciHostBridgeSnapshot> {
     PCI_HOST_BRIDGES
         .lock()
@@ -426,6 +467,7 @@ pub type PciIrqResolver = fn(
 pub type PciMsiAllocator =
     fn(segment: u16, bus: u8, device: u8, function: u8) -> Option<msi::MsiHandle>;
 
+#[derive(Clone, Copy)]
 pub struct PciConfigAccess {
     pub read_u8: fn(
         segment: u16,
@@ -479,8 +521,190 @@ pub struct PciConfigAccess {
 
 static PCI_CONFIG: Spinlock<Option<PciConfigAccess>> = Spinlock::new(None);
 
+#[kernel_symbols::export(
+    name = "general.dev.pci.set_pci_config_access",
+    contract = "kernel.general.pci-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn set_pci_config_access(access: PciConfigAccess) {
-    *PCI_CONFIG.lock() = Some(access);
+    if super::elm_lifecycle::install_pci_config_access(access).is_err() {
+        log::error!("[pci] ELM PCI config 操作安装失败，原操作保持不变");
+    }
+}
+
+pub(crate) fn replace_pci_config_access(
+    access: Option<PciConfigAccess>,
+) -> Option<PciConfigAccess> {
+    let mut current = PCI_CONFIG.lock();
+    core::mem::replace(&mut *current, access)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.config_read_u8",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS
+)]
+pub fn config_read_u8(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Result<u8, PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    (config.read_u8)(segment, bus, device, function, offset)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.config_read_u16",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS
+)]
+pub fn config_read_u16(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Result<u16, PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    (config.read_u16)(segment, bus, device, function, offset)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.config_read_u32",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS
+)]
+pub fn config_read_u32(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+) -> Result<u32, PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    (config.read_u32)(segment, bus, device, function, offset)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.config_write_u8",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn config_write_u8(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    value: u8,
+) -> Result<(), PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    (config.write_u8)(segment, bus, device, function, offset, value)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.config_write_u16",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn config_write_u16(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    value: u16,
+) -> Result<(), PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    (config.write_u16)(segment, bus, device, function, offset, value)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.config_write_u32",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn config_write_u32(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    offset: u16,
+    value: u32,
+) -> Result<(), PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    (config.write_u32)(segment, bus, device, function, offset, value)
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.device_mmio_to_virt",
+    contract = "kernel.general.pci-config@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+)]
+pub fn device_mmio_to_virt(physical_address: usize) -> Result<usize, PciConfigError> {
+    let guard = PCI_CONFIG.lock();
+    let config = guard.as_ref().ok_or(PciConfigError::Uninitialized)?;
+    Ok((config.device_mmio_to_virt)(physical_address))
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.resolve_irq",
+    contract = "kernel.general.pci-route@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+)]
+pub fn resolve_irq(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+    interrupt_pin: Option<u8>,
+    interrupt_line: Option<u8>,
+) -> Option<IrqLine> {
+    let guard = PCI_CONFIG.lock();
+    let resolver = guard.as_ref()?.resolve_irq?;
+    resolver(
+        segment,
+        bus,
+        device,
+        function,
+        interrupt_pin,
+        interrupt_line,
+    )
+}
+
+#[kernel_symbols::export(
+    name = "general.dev.pci.allocate_msi",
+    contract = "kernel.general.pci-route@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn allocate_msi(segment: u16, bus: u8, device: u8, function: u8) -> Option<msi::MsiHandle> {
+    let guard = PCI_CONFIG.lock();
+    let allocator = guard.as_ref()?.allocate_msi?;
+    allocator(segment, bus, device, function)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1356,6 +1580,69 @@ impl PciDevice {
     }
 }
 
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pci.PciDevice.register_and_probe",
+    contract = "kernel.general.pci-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn direct_pci_register_and_probe(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Result<PciRegistration, PciRegisterError> {
+    PciDevice::register_and_probe(segment, bus, device, function)
+}
+
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pci.PciDevice.read_device_info",
+    contract = "kernel.general.pci-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+)]
+pub fn direct_pci_read_device_info(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Option<PciInfo> {
+    PciDevice::read_device_info(segment, bus, device, function)
+}
+
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pci.PciDevice.new_unregistered",
+    contract = "kernel.general.pci-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn direct_pci_new_unregistered(
+    segment: u16,
+    bus: u8,
+    device: u8,
+    function: u8,
+) -> Option<PciDevice> {
+    PciDevice::new_unregistered(segment, bus, device, function)
+}
+
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pci.PciDevice.remove_from_bus",
+    contract = "kernel.general.pci-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pci_remove_from_bus(device: &PciDevice) {
+    device.remove_from_bus();
+}
+
 // ── PCI Bus 扫描器 ──────────────────────────────────────────────────────
 
 /// 对指定 segment 内的 bus 范围进行 PCI 设备扫描。
@@ -1371,6 +1658,13 @@ impl PciDevice {
 ///
 /// # 返回
 /// 扫描到的设备数量。
+#[kernel_symbols::export(
+    name = "general.dev.pci.pci_scan_bus_range",
+    contract = "kernel.general.pci-scan@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn pci_scan_bus_range(
     segment: u16,
     start_bus: u8,
@@ -1437,6 +1731,13 @@ pub fn pci_scan_bus_range(
 /// [`PciDevice::register_and_probe`] 完成发现→注册→probe 流程。
 ///
 /// 返回成功注册的设备数量。
+#[kernel_symbols::export(
+    name = "general.dev.pci.pci_scan_and_register",
+    contract = "kernel.general.pci-scan@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn pci_scan_and_register(segment: u16, start_bus: u8, end_bus: u8) -> usize {
     let mut count = 0usize;
     pci_scan_bus_range(segment, start_bus, end_bus, &mut |seg, bus, dev, func| {
@@ -1467,6 +1768,13 @@ pub struct PciScanRegisterSummary {
     pub failed: usize,
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.pci.pci_scan_and_register_summary",
+    contract = "kernel.general.pci-scan@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn pci_scan_and_register_summary(
     segment: u16,
     start_bus: u8,
@@ -1528,6 +1836,13 @@ impl PciRawDevice {
     }
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.pci.pci_scan_raw",
+    contract = "kernel.general.pci-scan@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn pci_scan_raw(segment: u16, start_bus: u8, end_bus: u8) -> alloc::vec::Vec<PciRawDevice> {
     let mut devices = alloc::vec::Vec::new();
 

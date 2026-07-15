@@ -4,16 +4,13 @@ use elm::{
     ELM_API_FEATURES_V1, ELM_API_ROOT_IMPORT_CONTRACT, ELM_API_ROOT_IMPORT_NAME,
     ELM_API_ROOT_SLOT_SYMBOL, ELM_API_VERSION_V1, ELM_EBI_EXPORT_FLAG_DIRECT_PINNED,
     ELM_EBI_IMPORT_FLAG_DIRECT_PINNED, ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL, ELM_META_FIELD_ACCESS,
-    ELM_META_FIELD_BUS, ELM_META_FIELD_CALLBACK, ELM_META_FIELD_CAPABILITIES,
     ELM_META_FIELD_CONTRACT, ELM_META_FIELD_DIRECTION, ELM_META_FIELD_FLAGS,
-    ELM_META_FIELD_HANDLER_CONTRACT, ELM_META_FIELD_MATCH_CALLBACK, ELM_META_FIELD_MAX_VERSION,
-    ELM_META_FIELD_MIN_VERSION, ELM_META_FIELD_MODE, ELM_META_FIELD_NAME,
-    ELM_META_FIELD_PAYLOAD_CONTRACT, ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY,
-    ELM_META_FIELD_PROBE_CALLBACK, ELM_META_FIELD_REMOVE_CALLBACK, ELM_META_FIELD_RESOURCE,
-    ELM_META_FIELD_RUST_ABI, ELM_META_FIELD_STAGE, ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET,
-    ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE, ELM_MODULE_DESCRIPTOR_SYMBOL, ElmMixinMode,
-    ElmPortAccessPolicy, ElmRustMetadataKind, ElmRustMetadataRecord, FlowDirection, FlowMode,
-    parse_rust_metadata_section, sha256,
+    ELM_META_FIELD_HANDLER_CONTRACT, ELM_META_FIELD_MAX_VERSION, ELM_META_FIELD_MIN_VERSION,
+    ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
+    ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_RUST_ABI, ELM_META_FIELD_STAGE,
+    ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE,
+    ELM_MODULE_DESCRIPTOR_SYMBOL, ElmMixinMode, ElmPortAccessPolicy, ElmRustMetadataKind,
+    ElmRustMetadataRecord, FlowDirection, FlowMode, parse_rust_metadata_section, sha256,
 };
 
 pub fn retain_linked_kernel_symbol_imports(
@@ -34,8 +31,6 @@ pub struct NativeMetadata {
     pub providers: Vec<ProviderSpec>,
     pub extension_points: Vec<ExtensionPointSpec>,
     pub extensions: Vec<ExtensionSpec>,
-    pub kernel_apis: Vec<KernelApiSpec>,
-    pub device_symbols: Vec<String>,
     pub api_root_import_index: u32,
     pub api_versions: Vec<u16>,
     pub api_required_features: u64,
@@ -96,24 +91,9 @@ pub struct PayloadSpec {
 }
 
 #[derive(Debug, Clone)]
-pub struct KernelApiSpec {
-    pub namespace: String,
-    pub version: u16,
-    pub capabilities: u64,
-    pub layout_hash: [u8; 32],
-}
-
-#[derive(Debug, Clone)]
 struct SnapshotSpec {
     contract: String,
     symbol: String,
-}
-
-#[derive(Debug, Clone)]
-struct DeviceDriverSpec {
-    match_callback: String,
-    probe_callback: String,
-    remove_callback: String,
 }
 
 impl NativeMetadata {
@@ -139,10 +119,6 @@ impl NativeMetadata {
         let mut extension_points = Vec::new();
         let mut extensions = Vec::new();
         let mut payloads = Vec::new();
-        let mut kernel_apis = Vec::new();
-        let mut device_symbols = Vec::new();
-        let mut device_callbacks = BTreeMap::new();
-        let mut device_drivers = Vec::new();
         for record in &records {
             if record.flags != 0 {
                 return Err(format!("元数据记录 {:?} 使用了未知 flags", record.kind));
@@ -344,147 +320,7 @@ impl NativeMetadata {
                         wire_size,
                     });
                 }
-                ElmRustMetadataKind::KernelApi => {
-                    expect_fields(
-                        record,
-                        &[
-                            ELM_META_FIELD_NAME,
-                            ELM_META_FIELD_VERSION,
-                            ELM_META_FIELD_CAPABILITIES,
-                        ],
-                    )?;
-                    let namespace = field_string(record, ELM_META_FIELD_NAME)?;
-                    let raw_version = field_u32(record, ELM_META_FIELD_VERSION)?;
-                    let version = u16::try_from(raw_version)
-                        .map_err(|_| "Kernel API version 超出 u16".to_string())?;
-                    let layout = kernel_api::layout(&namespace, version).ok_or_else(|| {
-                        format!("Kernel API {namespace}@{version} 未由当前 kernel-api crate 发布")
-                    })?;
-                    let capabilities = field_u64(record, ELM_META_FIELD_CAPABILITIES)?;
-                    if capabilities & !layout.capabilities != 0 {
-                        return Err(format!(
-                            "Kernel API {namespace}@{version} 请求了未定义能力位 0x{:x}",
-                            capabilities & !layout.capabilities
-                        ));
-                    }
-                    kernel_apis.push(KernelApiSpec {
-                        namespace,
-                        version,
-                        capabilities,
-                        layout_hash: layout.layout_hash,
-                    });
-                }
-                ElmRustMetadataKind::DeviceMatch
-                | ElmRustMetadataKind::DeviceProbe
-                | ElmRustMetadataKind::DeviceRemove => {
-                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CALLBACK])?;
-                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
-                    let role = field_string(record, ELM_META_FIELD_CALLBACK)?;
-                    let expected = match record.kind {
-                        ElmRustMetadataKind::DeviceMatch => "match",
-                        ElmRustMetadataKind::DeviceProbe => "probe",
-                        ElmRustMetadataKind::DeviceRemove => "remove",
-                        _ => unreachable!(),
-                    };
-                    if role != expected {
-                        return Err(format!(
-                            "设备回调 {symbol} 的角色 {role} 与元数据种类不一致"
-                        ));
-                    }
-                    if device_callbacks.insert(symbol.clone(), expected).is_some() {
-                        return Err(format!("重复设备回调符号 {symbol}"));
-                    }
-                    device_symbols.push(symbol);
-                }
-                ElmRustMetadataKind::DeviceDriver => {
-                    expect_fields(
-                        record,
-                        &[
-                            ELM_META_FIELD_NAME,
-                            ELM_META_FIELD_FLAGS,
-                            ELM_META_FIELD_PRIORITY,
-                            ELM_META_FIELD_BUS,
-                            ELM_META_FIELD_MATCH_CALLBACK,
-                            ELM_META_FIELD_PROBE_CALLBACK,
-                            ELM_META_FIELD_REMOVE_CALLBACK,
-                        ],
-                    )?;
-                    let name = field_string(record, ELM_META_FIELD_NAME)?;
-                    let bus = field_string(record, ELM_META_FIELD_BUS)?;
-                    let flags = field_u32(record, ELM_META_FIELD_FLAGS)?;
-                    let priority = field_i32(record, ELM_META_FIELD_PRIORITY)?;
-                    if name.is_empty()
-                        || name.len() > 64
-                        || bus.is_empty()
-                        || bus.len() > 64
-                        || flags & !1 != 0
-                        || priority < i32::from(i16::MIN)
-                        || priority > i32::from(i16::MAX)
-                    {
-                        return Err(format!("设备驱动 {name} 的固定元数据无效"));
-                    }
-                    device_drivers.push(DeviceDriverSpec {
-                        match_callback: field_string(record, ELM_META_FIELD_MATCH_CALLBACK)?,
-                        probe_callback: field_string(record, ELM_META_FIELD_PROBE_CALLBACK)?,
-                        remove_callback: field_string(record, ELM_META_FIELD_REMOVE_CALLBACK)?,
-                    });
-                }
-                ElmRustMetadataKind::DeviceFunction => {
-                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_CONTRACT])?;
-                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
-                    let contract = field_string(record, ELM_META_FIELD_CONTRACT)?;
-                    if contract.is_empty() || !contract.contains('@') {
-                        return Err(format!("设备 function {symbol} 的契约无效"));
-                    }
-                    device_symbols.push(symbol);
-                }
-                ElmRustMetadataKind::DeviceIrq => {
-                    expect_fields(
-                        record,
-                        &[
-                            ELM_META_FIELD_SYMBOL,
-                            ELM_META_FIELD_CONTRACT,
-                            ELM_META_FIELD_MODE,
-                        ],
-                    )?;
-                    let symbol = field_string(record, ELM_META_FIELD_SYMBOL)?;
-                    let mode = field_u32(record, ELM_META_FIELD_MODE)?;
-                    if !matches!(mode, 1 | 2)
-                        || field_string(record, ELM_META_FIELD_CONTRACT)?.is_empty()
-                    {
-                        return Err(format!("设备 IRQ {symbol} 的元数据无效"));
-                    }
-                    device_symbols.push(symbol);
-                }
-                ElmRustMetadataKind::DeviceDiscovery => {
-                    expect_fields(record, &[ELM_META_FIELD_SYMBOL, ELM_META_FIELD_RESOURCE])?;
-                    let name = field_string(record, ELM_META_FIELD_SYMBOL)?;
-                    let bus = field_string(record, ELM_META_FIELD_RESOURCE)?;
-                    if name.is_empty() || bus.is_empty() || bus.len() > 64 {
-                        return Err("设备发现元数据无效".to_string());
-                    }
-                }
             }
-        }
-        for driver in &device_drivers {
-            for (symbol, expected_role) in [
-                (&driver.match_callback, "match"),
-                (&driver.probe_callback, "probe"),
-                (&driver.remove_callback, "remove"),
-            ] {
-                if device_callbacks.get(symbol).copied() != Some(expected_role) {
-                    return Err(format!(
-                        "设备驱动引用的 {expected_role} 回调 {symbol} 不存在或角色不匹配"
-                    ));
-                }
-            }
-        }
-        device_symbols.sort();
-        if device_symbols
-            .windows(2)
-            .any(|symbols| symbols[0] == symbols[1])
-        {
-            return Err("设备 ABI 回调导出符号重复".to_string());
         }
         validate_and_sort(
             &mut imports,
@@ -494,7 +330,6 @@ impl NativeMetadata {
             &mut extension_points,
             &mut extensions,
             &mut payloads,
-            &mut kernel_apis,
         )?;
         let module_descriptor =
             module_descriptor.ok_or_else(|| "ELM 必须且只能声明一个 #[elm::module]".to_string())?;
@@ -505,8 +340,6 @@ impl NativeMetadata {
             providers,
             extension_points,
             extensions,
-            kernel_apis,
-            device_symbols,
             api_root_import_index: 0,
             api_versions: vec![ELM_API_VERSION_V1],
             api_required_features: ELM_API_FEATURES_V1,
@@ -530,14 +363,10 @@ impl NativeMetadata {
                 names.insert(snapshot.clone());
             }
         }
-        for symbol in &self.device_symbols {
-            names.insert(symbol.clone());
-        }
         names.into_iter().collect()
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_and_sort(
     imports: &mut Vec<ImportSpec>,
     exports: &mut Vec<ExportSpec>,
@@ -546,7 +375,6 @@ fn validate_and_sort(
     extension_points: &mut Vec<ExtensionPointSpec>,
     extensions: &mut Vec<ExtensionSpec>,
     payloads: &mut Vec<PayloadSpec>,
-    kernel_apis: &mut Vec<KernelApiSpec>,
 ) -> Result<(), String> {
     imports[1..].sort_by(|left, right| {
         left.name
@@ -628,17 +456,6 @@ fn validate_and_sort(
         .any(|items| items[0].contract == items[1].contract)
     {
         return Err("重复 payload contract".to_string());
-    }
-    kernel_apis.sort_by(|left, right| {
-        left.namespace
-            .cmp(&right.namespace)
-            .then_with(|| left.version.cmp(&right.version))
-    });
-    if kernel_apis
-        .windows(2)
-        .any(|items| items[0].namespace == items[1].namespace)
-    {
-        return Err("同一 ELM 不能重复声明 Kernel API namespace".to_string());
     }
     for point in extension_points.iter() {
         if !payloads
@@ -769,14 +586,6 @@ fn field_i32(record: &ElmRustMetadataRecord<'_>, tag: u16) -> Result<i32, String
         .map_err(|_| format!("元数据 {:?} 字段 {tag} 不是 i32", record.kind))
 }
 
-fn field_u64(record: &ElmRustMetadataRecord<'_>, tag: u16) -> Result<u64, String> {
-    record
-        .require_field(tag)
-        .map_err(|_| format!("元数据 {:?} 缺少字段 {tag}", record.kind))?
-        .u64()
-        .map_err(|_| format!("元数据 {:?} 字段 {tag} 不是 u64", record.kind))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,7 +623,6 @@ mod tests {
             &mut exports,
             &mut Vec::new(),
             Vec::new(),
-            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),

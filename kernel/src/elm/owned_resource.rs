@@ -279,6 +279,28 @@ pub(crate) fn release(
     Ok(())
 }
 
+pub(crate) fn release_by_handle(
+    owner: ElmId,
+    generation: Generation,
+    kind: ElmOwnedResourceKind,
+    handle: u64,
+) -> Result<(), OwnedResourceError> {
+    let mut registry = OWNED_RESOURCES.lock();
+    let Some(index) = registry.resources.iter().position(|resource| {
+        resource.owner == owner
+            && resource.generation == generation
+            && resource.kind == kind
+            && resource.handle == handle
+    }) else {
+        return Err(OwnedResourceError::NotFound);
+    };
+    if registry.resources[index].state != ElmOwnedResourceState::Active {
+        return Err(OwnedResourceError::Busy);
+    }
+    registry.resources.swap_remove(index);
+    Ok(())
+}
+
 pub(crate) fn count_owned_by(owner: ElmId, generation: Generation) -> usize {
     OWNED_RESOURCES
         .lock()

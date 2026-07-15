@@ -37,3 +37,21 @@ pub mod ipc;
 pub mod mm;
 pub mod syscall;
 pub mod vfs;
+
+/// 强制链接器抽取设备抽象直接符号目录所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    dev::pnp::register_driver_factory as usize
+        ^ dev::pnp::device_mmio_to_virt as usize
+        ^ dev::function::register_function_class as usize
+        ^ dev::firmware_bus::register as usize
+        ^ dev::dma::set_dma_ops as usize
+        ^ dev::irq::register_irq_request as usize
+        ^ dev::irq::register_irq_domain as usize
+        ^ dev::msi::register_msi_controller as usize
+        ^ dev::pci::register_host_bridge as usize
+        ^ dev::pci::pci_scan_and_register as usize
+        ^ dev::platform::register_and_probe_platform_device as usize
+        ^ dev::virtio::parse_virtio_pci_caps as usize
+        ^ dev::virtio_mmio::detect as usize
+}

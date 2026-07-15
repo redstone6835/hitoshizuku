@@ -113,6 +113,14 @@ struct MsiVectorRegistration {
 static MSI_CONTROLLERS: Spinlock<Vec<MsiControllerRegistration>> = Spinlock::new(Vec::new());
 static NEXT_MSI_CONTROLLER_ID: AtomicU64 = AtomicU64::new(1);
 
+#[kernel_symbols::export(
+    name = "general.dev.msi.register_msi_controller",
+    contract = "kernel.general.msi-controller@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_msi_controller(
     controller: u32,
     driver: Arc<dyn MsiController>,
@@ -141,10 +149,21 @@ pub fn register_msi_controller(
     });
     let handle = MsiControllerHandle { controller, id };
     drop(controllers);
+    if super::elm_lifecycle::track_msi_controller(handle).is_err() {
+        let _ = unregister_msi_controller(handle);
+        return Err(MsiError::OutOfMemory);
+    }
     pnp::notify_dependency_ready(PnpDependency::MsiController(controller));
     Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.msi.unregister_msi_controller",
+    contract = "kernel.general.msi-controller@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_msi_controller(handle: MsiControllerHandle) -> Result<(), MsiError> {
     let mut controllers = MSI_CONTROLLERS.lock();
     let Some(index) = controllers
@@ -160,9 +179,19 @@ pub fn unregister_msi_controller(handle: MsiControllerHandle) -> Result<(), MsiE
         return Err(MsiError::Busy);
     }
     controllers.remove(index);
+    drop(controllers);
+    super::elm_lifecycle::forget_msi_controller(handle);
     Ok(())
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.msi.allocate_msi",
+    contract = "kernel.general.msi-vector@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiError> {
     let (controller_id, driver) = {
         let mut controllers = MSI_CONTROLLERS.lock();
@@ -227,15 +256,28 @@ pub fn allocate_msi(controller: u32, requester: u32) -> Result<MsiHandle, MsiErr
         hwirq: vector.hwirq,
         releasing: false,
     });
-    Ok(MsiHandle {
+    let handle = MsiHandle {
         controller,
         controller_id,
         hwirq: vector.hwirq,
         line: vector.line,
         message: vector.message,
-    })
+    };
+    drop(controllers);
+    if super::elm_lifecycle::track_msi_vector(handle).is_err() {
+        let _ = free_msi(handle);
+        return Err(MsiError::OutOfMemory);
+    }
+    Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.msi.free_msi",
+    contract = "kernel.general.msi-vector@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn free_msi(handle: MsiHandle) -> Result<(), MsiError> {
     let driver = {
         let mut controllers = MSI_CONTROLLERS.lock();
@@ -277,6 +319,8 @@ pub fn free_msi(handle: MsiHandle) -> Result<(), MsiError> {
     if controller_ready_to_retire(entry) {
         controllers.remove(index);
     }
+    drop(controllers);
+    super::elm_lifecycle::forget_msi_vector(handle);
     Ok(())
 }
 
@@ -311,6 +355,13 @@ fn release_msi_vector_resource(handle: MsiHandle) -> bool {
 }
 
 /// 将 MSI controller 注册 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.msi.controller_pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn controller_pnp_resource(
     handle: MsiControllerHandle,
     label: &'static str,
@@ -324,6 +375,13 @@ pub fn controller_pnp_resource(
 }
 
 /// 将单个 MSI vector 分配 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.msi.vector_pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn vector_pnp_resource(handle: MsiHandle, label: &'static str) -> PnpHandleResource<MsiHandle> {
     PnpHandleResource::new(
         PnpResourceKind::Msi,

@@ -728,6 +728,13 @@ static NEXT_PNP_DEVICE_ID: AtomicU64 = AtomicU64::new(1);
 /// 安装全局驱动初始化上下文。
 ///
 /// 必须在调用 [`register_driver_factory`] 或内建驱动 bootstrap 前完成。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.set_dev_init_context",
+    contract = "kernel.general.device-admin@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_ADMIN,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn set_dev_init_context(ctx: DevInitContext) {
     *DEV_INIT_CONTEXT.lock() = Some(ctx);
 }
@@ -737,6 +744,12 @@ fn dev_init_context() -> Result<DevInitContext, PnpError> {
 }
 
 /// 使用平台安装的设备 MMIO 转换规则取得内核虚拟地址。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.device_mmio_to_virt",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+)]
 pub fn device_mmio_to_virt(physical_address: usize) -> Result<usize, PnpError> {
     let context = dev_init_context()?;
     Ok((context.device_mmio_to_virt)(physical_address))
@@ -1369,7 +1382,18 @@ impl PnpDriverRegistry {
         factory: Arc<dyn DriverFactory>,
     ) -> Result<DriverHandle, PnpError> {
         let ctx = dev_init_context()?;
-        let driver = factory.create(&ctx)?;
+        let factory_name = factory.name();
+        let driver = match factory.create(&ctx) {
+            Ok(driver) => driver,
+            Err(error) => {
+                log::error!(
+                    "[pnp] driver factory {} create failed: {:?}",
+                    factory_name,
+                    error
+                );
+                return Err(error);
+            }
+        };
         let driver_name = driver.name();
         let id = {
             let mut drivers = self.drivers.lock();
@@ -1377,6 +1401,7 @@ impl PnpDriverRegistry {
                 .iter()
                 .any(|registered| registered.driver.name() == driver_name)
             {
+                log::error!("[pnp] duplicate driver name: {}", driver_name);
                 return Err(PnpError::NameConflict);
             }
             drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
@@ -1410,6 +1435,7 @@ impl PnpDriverRegistry {
             }
         }
 
+        log::debug!("[pnp] registered driver {}", driver_name);
         Ok(DriverHandle { id })
     }
 
@@ -1698,16 +1724,49 @@ fn driver_can_probe_bus(driver: &dyn PnpDriver, bus_type: BusType) -> bool {
 }
 
 /// 注册驱动 factory 的全局便捷入口。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.register_driver_factory",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_driver_factory(factory: Arc<dyn DriverFactory>) -> Result<DriverHandle, PnpError> {
-    PNP_DRIVERS.register_factory(factory)
+    let handle = PNP_DRIVERS.register_factory(factory)?;
+    if super::elm_lifecycle::track_driver(handle).is_err() {
+        log::error!(
+            "[pnp] 无法登记驱动资源归属: driver_id={}",
+            handle.id().raw()
+        );
+        let _ = PNP_DRIVERS.unregister(handle);
+        return Err(PnpError::OutOfMemory);
+    }
+    Ok(handle)
 }
 
 /// 注销驱动的全局便捷入口。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.unregister_driver",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_driver(handle: DriverHandle) -> Result<(), PnpError> {
-    PNP_DRIVERS.unregister(handle)
+    PNP_DRIVERS.unregister(handle)?;
+    super::elm_lifecycle::forget_driver(handle);
+    Ok(())
 }
 
 /// 让指定驱动认领当前尚未绑定的既有设备。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.probe_existing_devices",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn probe_existing_devices(driver_id: DriverId) -> Result<usize, PnpError> {
     PNP_DRIVERS.probe_existing_devices(driver_id)
 }
@@ -1717,6 +1776,13 @@ pub fn probe_existing_devices(driver_id: DriverId) -> Result<usize, PnpError> {
 /// 资源 registry 在成功登记 controller、syscon、fwcfg 等依赖后调用该函数。
 /// PnP core 会只重试记录了同一依赖的设备；旧式没有精确依赖的 deferred 设备仍由
 /// [`PnpDriverRegistry::retry_deferred_devices`] 兜底处理。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.notify_dependency_ready",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn notify_dependency_ready(dependency: PnpDependency) {
     let _ = PNP_DRIVERS.retry_deferred_dependency(dependency);
 }
@@ -1779,11 +1845,24 @@ static PNP_DEVICE_EVENT_SUBSCRIBERS: Spinlock<Vec<PnpDeviceEventSubscriber>> =
     Spinlock::new(Vec::new());
 
 /// 注册 PnP 设备生命周期观察者；相同 owner/name 的重复注册是幂等的。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.subscribe_device_events",
+    contract = "kernel.general.pnp-events@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn subscribe_device_events(
     owner: &'static str,
     name: &'static str,
     callback: PnpDeviceEventCallback,
 ) -> Result<bool, PnpError> {
+    let mut owned_name = String::new();
+    owned_name
+        .try_reserve(name.len())
+        .map_err(|_| PnpError::OutOfMemory)?;
+    owned_name.push_str(name);
     let mut subscribers = PNP_DEVICE_EVENT_SUBSCRIBERS.lock();
     if subscribers
         .iter()
@@ -1799,10 +1878,22 @@ pub fn subscribe_device_events(
         name,
         callback,
     });
+    drop(subscribers);
+    if super::elm_lifecycle::track_event_subscription(owner, owned_name.into_boxed_str()).is_err() {
+        let _ = unsubscribe_device_events(owner, name);
+        return Err(PnpError::OutOfMemory);
+    }
     Ok(true)
 }
 
 /// 注销 PnP 设备生命周期观察者。
+#[kernel_symbols::export(
+    name = "general.dev.pnp.unsubscribe_device_events",
+    contract = "kernel.general.pnp-events@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unsubscribe_device_events(owner: &'static str, name: &str) -> Result<(), PnpError> {
     let mut subscribers = PNP_DEVICE_EVENT_SUBSCRIBERS.lock();
     let Some(index) = subscribers
@@ -1815,6 +1906,8 @@ pub fn unsubscribe_device_events(owner: &'static str, name: &str) -> Result<(), 
         });
     };
     subscribers.swap_remove(index);
+    drop(subscribers);
+    super::elm_lifecycle::forget_event_subscription(owner, name);
     Ok(())
 }
 
@@ -1895,6 +1988,11 @@ impl PnpDeviceList {
             list.push(Arc::clone(&dev));
             drop(list);
             publish_device_event(PnpDeviceEventKind::Registered, Arc::clone(&dev));
+            if super::elm_lifecycle::track_device(Arc::clone(&dev)).is_err() {
+                log::error!("[pnp] 无法登记设备资源归属: {}", dev.id);
+                let _ = self.remove_exact(&dev);
+                return Err(PnpError::OutOfMemory);
+            }
             return Ok(PnpDeviceRegistration {
                 device: dev,
                 inserted: true,
@@ -1915,6 +2013,7 @@ impl PnpDeviceList {
             list.swap_remove(pos)
         };
         publish_device_event(PnpDeviceEventKind::Removed, Arc::clone(&removed));
+        super::elm_lifecycle::forget_device(&removed);
         Some(removed)
     }
 
@@ -1956,6 +2055,110 @@ impl Default for PnpDeviceList {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 为外部同名 Rust 门面构造真实 PnP 设备对象。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.new",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn direct_pnp_device_new(
+    id: PnpId,
+    name: Box<str>,
+    info: Box<dyn PnpBusInfo>,
+) -> Result<Arc<PnpDevice>, PnpError> {
+    PnpDevice::new(id, name, info)
+}
+
+/// 调用全局 PnP 设备表的 `get_or_insert`。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.get_or_insert",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
+pub fn direct_pnp_get_or_insert(
+    devices: &PnpDeviceList,
+    device: Arc<PnpDevice>,
+) -> Result<PnpDeviceRegistration, PnpError> {
+    devices.get_or_insert(device)
+}
+
+/// 调用全局 PnP 设备表的精确移除入口。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.remove_exact",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_remove_exact(
+    devices: &PnpDeviceList,
+    device: &Arc<PnpDevice>,
+) -> Option<Arc<PnpDevice>> {
+    devices.remove_exact(device)
+}
+
+/// 调用全局 PnP 设备表的身份查询入口。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.lookup",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+)]
+pub fn direct_pnp_lookup(devices: &PnpDeviceList, id: &PnpId) -> Option<Arc<PnpDevice>> {
+    devices.lookup(id)
+}
+
+/// 返回全局 PnP 设备表的一致快照。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDeviceList.list",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
+pub fn direct_pnp_list(devices: &PnpDeviceList) -> Vec<Arc<PnpDevice>> {
+    devices.list()
+}
+
+/// 让全局 PnP 驱动表为一个设备执行匹配和 probe。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDriverRegistry.probe_device",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_probe_device(
+    drivers: &PnpDriverRegistry,
+    device: &Arc<PnpDevice>,
+) -> Result<(), PnpError> {
+    drivers.probe_device(device)
+}
+
+/// 重试全部 deferred PnP 设备。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDriverRegistry.retry_deferred_devices",
+    contract = "kernel.general.pnp-driver@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_retry_deferred_devices(drivers: &PnpDriverRegistry) -> Result<usize, PnpError> {
+    drivers.retry_deferred_devices()
 }
 
 // ── 功能注册 helpers ────────────────────────────────────────────────────
@@ -2119,6 +2322,108 @@ impl PnpDevice {
     }
 }
 
+/// 在真实 PnP 对象之间建立父子关系。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.attach_child",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_attach_child(
+    parent: &Arc<PnpDevice>,
+    child: &Arc<PnpDevice>,
+) -> Result<(), PnpError> {
+    parent.attach_child(child)
+}
+
+/// 从真实 PnP 对象中解除父子关系。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.detach_child",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_detach_child(parent: &Arc<PnpDevice>, child: &Arc<PnpDevice>) {
+    parent.detach_child(child);
+}
+
+/// 在真实 PnP 对象上事务式注册一个设备 function。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.register_function",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_register_function(
+    device: &Arc<PnpDevice>,
+    function: Arc<dyn DeviceFunction>,
+) -> Result<(), PnpError> {
+    let class_id = function.class_id();
+    let mut owned_name = String::new();
+    {
+        let name = function.dev_name();
+        owned_name
+            .try_reserve(name.len())
+            .map_err(|_| PnpError::OutOfMemory)?;
+        owned_name.push_str(name);
+    }
+    let mut tracked_name = String::new();
+    tracked_name
+        .try_reserve(owned_name.len())
+        .map_err(|_| PnpError::OutOfMemory)?;
+    tracked_name.push_str(&owned_name);
+    device.register_function(function)?;
+    if super::elm_lifecycle::track_device_function(
+        Arc::clone(device),
+        class_id,
+        tracked_name.into_boxed_str(),
+    )
+    .is_err()
+    {
+        let _ = device.unregister_function(class_id, &owned_name);
+        return Err(PnpError::OutOfMemory);
+    }
+    Ok(())
+}
+
+/// 在真实 PnP 对象上注销一个设备 function。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.unregister_function",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_unregister_function(
+    device: &Arc<PnpDevice>,
+    class_id: crate::dev::function::DeviceClassId,
+    name: &str,
+) -> Result<(), PnpError> {
+    device.unregister_function(class_id, name)?;
+    super::elm_lifecycle::forget_device_function(device, class_id, name);
+    Ok(())
+}
+
+/// 执行真实 PnP 设备的完整热拔流程。
+#[doc(hidden)]
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PnpDevice.remove_device",
+    contract = "kernel.general.pnp-device@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
+pub fn direct_pnp_remove_device(device: &Arc<PnpDevice>) {
+    device.remove_device();
+}
+
 // ── remove_device：热拔移除流程 ─────────────────────────────────────────
 
 impl PnpDevice {
@@ -2212,5 +2517,20 @@ impl PnpDevice {
 
 // ── 全局单例 ─────────────────────────────────────────────────────────────
 
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PNP_DEVICES",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+        | kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub static PNP_DEVICES: PnpDeviceList = PnpDeviceList::new();
+#[kernel_symbols::export(
+    name = "general.dev.pnp.PNP_DRIVERS",
+    contract = "kernel.general.pnp-registry@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub static PNP_DRIVERS: PnpDriverRegistry = PnpDriverRegistry::new();

@@ -81,9 +81,9 @@ pub fn context() -> Result<ElmApiContextV1, RuntimeApiError> {
 
 /// 按 identifier 和兼容版本列表取得一个额外的运行时命名空间。
 ///
-/// 本入口供 `elm.management` 等 ELM 自有命名空间以及当前已经注册的受管内核 API 完成
-/// 统一协商。直接内核符号协议不经过本入口，但其目录后端尚未安装；业务代码不得自行
-/// 解释本函数返回的裸函数表地址。
+/// 本入口只供 `elm.management` 等 ELM 自有命名空间完成统一协商。allocator、设备等
+/// 内核子系统 API 由装载器解析类型化直接符号槽，不经过命名空间查询；业务代码不得
+/// 自行解释本函数返回的裸函数表地址。
 pub fn query_namespace(
     identifier: &str,
     versions: &[u16],

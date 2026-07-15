@@ -5,6 +5,8 @@ extern crate alloc;
 extern crate allocator;
 extern crate hal;
 
+use core::alloc::{GlobalAlloc, Layout};
+
 mod acpi;
 #[cfg(any(
     feature = "bench",
@@ -25,6 +27,33 @@ mod syscalls;
 mod tty_poll;
 mod user;
 mod vdso;
+
+struct KernelGlobalAllocator;
+
+unsafe impl GlobalAlloc for KernelGlobalAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Safety: GlobalAlloc 调用方保证 layout 合法，真实所有权由唯一内核分配器维护。
+        unsafe { allocator::KERNEL_ALLOCATOR.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // Safety: GlobalAlloc 调用方保证 pointer/layout 来自同一个全局分配器。
+        unsafe { allocator::KERNEL_ALLOCATOR.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Safety: GlobalAlloc 调用方保证旧分配及新尺寸满足 realloc 契约。
+        unsafe { allocator::KERNEL_ALLOCATOR.realloc(pointer, layout, new_size) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // Safety: GlobalAlloc 调用方保证 layout 合法。
+        unsafe { allocator::KERNEL_ALLOCATOR.alloc_zeroed(layout) }
+    }
+}
+
+#[global_allocator]
+static KERNEL_GLOBAL_ALLOCATOR: KernelGlobalAllocator = KernelGlobalAllocator;
 
 fn main() -> ! {
     log::debug!("[main] jumped into main()");

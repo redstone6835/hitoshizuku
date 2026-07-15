@@ -20,11 +20,11 @@ pub const ELM_EBI_SOURCE_REQUEST_SIZE: usize = core::mem::size_of::<ElmEbiSource
 pub const ELM_EBI_SOURCE_FLAG_NONE: u32 = 0;
 /// `ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT: u32 = 1 << 0;
-/// 请求运行时根据镜像声明、信任证明和调用主体授予 Kernel API capability。
-pub const ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API: u32 = 1 << 1;
+/// 请求运行时允许可信镜像绑定默认集合之外的高权限内核符号能力组。
+pub const ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS: u32 = 1 << 1;
 /// `ELM_EBI_SOURCE_FLAGS_MASK` 定义当前版本认可的全部标志位；输入包含掩码外位时必须拒绝或按调用契约报错。
 pub const ELM_EBI_SOURCE_FLAGS_MASK: u32 =
-    ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT | ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API;
+    ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT | ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS;
 /// `ELM_EBI_PROJECTION_SOURCE_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_EBI_PROJECTION_SOURCE_ABI_VERSION: u16 = 1;
 /// `ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
@@ -130,15 +130,15 @@ impl ElmEbiSourceRequest {
         self.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0
     }
 
-    /// 显式请求为镜像声明的 Kernel API requirements 建立按代授权。
-    pub const fn with_kernel_api_grant(mut self) -> Self {
-        self.flags |= ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API;
+    /// 显式请求允许可信镜像绑定高权限内核符号。
+    pub const fn with_privileged_symbol_authorization(mut self) -> Self {
+        self.flags |= ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS;
         self
     }
 
-    /// 返回调用方是否显式请求了 Kernel API 授权事务。
-    pub const fn grants_kernel_api(self) -> bool {
-        self.flags & ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API != 0
+    /// 返回调用方是否显式请求了高权限内核符号授权。
+    pub const fn authorizes_privileged_symbols(self) -> bool {
+        self.flags & ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS != 0
     }
 }
 

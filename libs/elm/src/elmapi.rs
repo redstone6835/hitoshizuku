@@ -1,8 +1,9 @@
 //! ELM 原生 API 根协议。
 //!
 //! `elmapi` 是 ELM 原生代码与 ELM 运行时之间的稳定入口。模块只导入一个根槽位，
-//! 再通过根表取得运行时表或按 identifier 查询其他命名空间，避免把内核实现符号直接
-//! 暴露给模块。这里使用固定布局和显式函数指针；Rust 开发包在其上提供安全包装。
+//! 再通过根表取得运行时表或查询 Manager 命名空间。allocator、设备等内核子系统不经
+//! 该根表转发，而是在装载期由直接内核符号目录绑定。这里使用固定布局和显式函数指针；
+//! Rust 开发包在其上提供安全包装。
 //!
 //! 普通模块不应直接解引用这些表，而应使用 [`crate::runtime`]、[`crate::ManagedImport`] 和
 //! [`crate::management::Client`]。本模块主要服务于装载器、ABI 指纹生成、框架 trampoline
@@ -36,29 +37,24 @@ pub const ELM_API_ROOT_IMPORT_CONTRACT: &str = "elm.api.root@1";
 pub const ELM_API_RUNTIME_IDENTIFIER: &str = "elm.runtime";
 /// 受授权 Manager ELM 使用的管理命名空间 identifier。
 pub const ELM_API_MANAGEMENT_IDENTIFIER: &str = "elm.management";
-/// Kernel API 命名空间 identifier 的最大 UTF-8 字节数。
-pub const ELM_KERNEL_API_IDENTIFIER_MAX_LEN: usize = 64;
-/// Kernel API 规范布局摘要的固定 SHA-256 长度。
-pub const ELM_KERNEL_API_LAYOUT_HASH_LEN: usize = 32;
+/// ELM 运行时命名空间 identifier 的最大 UTF-8 字节数。
+pub const ELM_API_NAMESPACE_IDENTIFIER_MAX_LEN: usize = 64;
 /// 命名空间可以被所有 ELM 查询。
 pub const ELM_API_NAMESPACE_FLAG_PUBLIC: u32 = 1 << 0;
-/// 命名空间只允许持有显式 Kernel API 租约的 ELM 查询。
-pub const ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT: u32 = 1 << 1;
 /// 命名空间只允许通过 elm-mgr 管理鉴权的 Manager ELM 查询。
-pub const ELM_API_NAMESPACE_FLAG_MANAGEMENT: u32 = 1 << 2;
+pub const ELM_API_NAMESPACE_FLAG_MANAGEMENT: u32 = 1 << 1;
 /// v1 允许的全部命名空间发布标志。
-pub const ELM_API_NAMESPACE_FLAGS_V1: u32 = ELM_API_NAMESPACE_FLAG_PUBLIC
-    | ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT
-    | ELM_API_NAMESPACE_FLAG_MANAGEMENT;
+pub const ELM_API_NAMESPACE_FLAGS_V1: u32 =
+    ELM_API_NAMESPACE_FLAG_PUBLIC | ELM_API_NAMESPACE_FLAG_MANAGEMENT;
 
-/// 检查一个 identifier 是否属于规范的 Kernel API 命名空间。
+/// 检查一个 identifier 是否属于规范的 ELM 运行时命名空间。
 ///
-/// v1 名称必须以 `kernel.` 开头，只包含小写 ASCII 字母、数字、点、连字符和下划线，
-/// 且不能包含空段。该检查同时被 EBI、内核注册表和开发工具使用，避免各层接受不同名称。
-pub fn is_valid_kernel_api_identifier(identifier: &str) -> bool {
+/// v1 名称必须以 `elm.` 开头，只包含小写 ASCII 字母、数字、点、连字符和下划线，且不能
+/// 包含空段。该规则只适用于根表命名空间，不约束内核直接符号的名称或契约。
+pub fn is_valid_runtime_api_identifier(identifier: &str) -> bool {
     !identifier.is_empty()
-        && identifier.len() <= ELM_KERNEL_API_IDENTIFIER_MAX_LEN
-        && identifier.starts_with("kernel.")
+        && identifier.len() <= ELM_API_NAMESPACE_IDENTIFIER_MAX_LEN
+        && identifier.starts_with("elm.")
         && !identifier.ends_with('.')
         && !identifier.contains("..")
         && identifier.bytes().all(|byte| {
@@ -242,11 +238,6 @@ pub struct ElmApiNamespaceV1 {
     pub table_address: usize,
     /// 发布该命名空间时当前调用 cell 的 generation。
     pub generation: u64,
-    /// 该命名空间授权租约的非零标识；公开和管理命名空间使用零。
-    ///
-    /// Kernel API 函数表入口必须把该值与当前 cell、generation、namespace 和所需能力一起
-    /// 校验，不能只依赖函数表地址的保密性。
-    pub grant_id: u64,
     /// 协商得到的能力位集合；调用可选入口前必须先检查对应位。
     pub capabilities: u64,
 }
@@ -262,7 +253,6 @@ impl ElmApiNamespaceV1 {
             table_size: 0,
             table_address: 0,
             generation: 0,
-            grant_id: 0,
             capabilities: 0,
         }
     }
@@ -271,8 +261,8 @@ impl ElmApiNamespaceV1 {
 #[derive(Debug, Clone, Copy)]
 /// 内核向 ELM 根表注册一个静态版本化函数表所需的完整描述。
 ///
-/// 描述符本身只存在于内核地址空间，不进入 EKI。`identifier`、版本和布局摘要必须与
-/// `kernel-api` crate 发布的契约完全一致；同名同版本描述符只能注册一次。
+/// 描述符本身只存在于内核地址空间，不进入 EKI。它只允许发布 `elm.*` 运行时命名空间；
+/// 同名同版本描述符只能注册一次。
 pub struct ElmApiNamespaceDescriptorV1 {
     /// 命名空间 identifier。
     pub identifier: &'static str,
@@ -286,8 +276,6 @@ pub struct ElmApiNamespaceDescriptorV1 {
     pub table_address: *const (),
     /// 函数表完整字节数。
     pub table_size: u32,
-    /// 规范函数表布局摘要。
-    pub layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
 }
 
 impl ElmApiNamespaceDescriptorV1 {
@@ -298,7 +286,6 @@ impl ElmApiNamespaceDescriptorV1 {
         flags: u32,
         capabilities: u64,
         table: &'static T,
-        layout_hash: [u8; ELM_KERNEL_API_LAYOUT_HASH_LEN],
     ) -> Self {
         Self {
             identifier,
@@ -307,30 +294,18 @@ impl ElmApiNamespaceDescriptorV1 {
             capabilities,
             table_address: table as *const T as *const (),
             table_size: core::mem::size_of::<T>() as u32,
-            layout_hash,
         }
     }
 
     /// 验证不依赖运行时注册表的描述符不变量。
     pub fn validate(&self) -> bool {
-        let kernel_prefixed = self.identifier.starts_with("kernel.");
-        let canonical_kernel_identifier = is_valid_kernel_api_identifier(self.identifier);
-        !self.identifier.is_empty()
-            && self.identifier.len() <= ELM_KERNEL_API_IDENTIFIER_MAX_LEN
-            && self.identifier.is_ascii()
-            && !self.identifier.as_bytes().contains(&0)
+        is_valid_runtime_api_identifier(self.identifier)
             && self.version != 0
             && self.flags != 0
             && self.flags & !ELM_API_NAMESPACE_FLAGS_V1 == 0
             && self.flags.count_ones() == 1
             && !self.table_address.is_null()
             && self.table_size != 0
-            && (!kernel_prefixed
-                || (canonical_kernel_identifier
-                    && self.flags == ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT))
-            && (self.flags & ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT == 0
-                || (self.layout_hash != [0; ELM_KERNEL_API_LAYOUT_HASH_LEN]
-                    && canonical_kernel_identifier))
     }
 }
 
@@ -416,7 +391,7 @@ unsafe impl Sync for ElmApiRootV1 {}
 /// 清单直接读取真实 Rust 类型布局，不依赖人工维护的版本字符串。任何字段顺序、
 /// 大小、对齐、函数签名或表能力变化都会改变清单摘要，从而在装载前拒绝不兼容镜像。
 #[cfg(feature = "runtime-model")]
-pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
+pub fn kernel_interface_manifest_v1(target_arch: u32) -> String {
     macro_rules! write_layout {
         ($out:expr, $ty:ty, $name:literal, [$($field:ident),+ $(,)?]) => {{
             writeln!(
@@ -441,7 +416,7 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
     }
 
     let mut out = String::new();
-    writeln!(out, "domain=elm.kernel-api.manifest.v1").unwrap();
+    writeln!(out, "domain=elm.kernel-interface.manifest.v1").unwrap();
     writeln!(out, "target.arch={target_arch}").unwrap();
     writeln!(out, "target.pointer-width=64").unwrap();
     writeln!(out, "target.endian=little").unwrap();
@@ -456,6 +431,61 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
     writeln!(out, "management.identifier={ELM_API_MANAGEMENT_IDENTIFIER}").unwrap();
     writeln!(out, "runtime.version={ELM_API_VERSION_V1}").unwrap();
     writeln!(out, "runtime.features={ELM_API_FEATURES_V1}").unwrap();
+    writeln!(
+        out,
+        "kernel-symbol.descriptor-abi={}",
+        kernel_symbols::KERNEL_SYMBOL_DESCRIPTOR_ABI_V1
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "kernel-symbol.capabilities={}",
+        kernel_symbols::capability::ALL
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "kernel-symbol.interface-source-files={}",
+        kernel_symbols::KERNEL_INTERFACE_SOURCE_FILE_COUNT
+    )
+    .unwrap();
+    write!(out, "kernel-symbol.interface-source-sha256=").unwrap();
+    for byte in kernel_symbols::KERNEL_INTERFACE_SOURCE_SHA256 {
+        write!(out, "{byte:02x}").unwrap();
+    }
+    writeln!(out).unwrap();
+
+    write_layout!(
+        out,
+        kernel_symbols::KernelSymbolDescriptorV1,
+        "KernelSymbolDescriptorV1",
+        [
+            magic,
+            struct_size,
+            abi_version,
+            kind,
+            execution_domain,
+            reserved0,
+            flags,
+            version,
+            capabilities,
+            retained_argument_mask,
+            interface_hash,
+            api_path,
+            item_path,
+            link_name,
+            contract,
+            rust_abi,
+            address,
+        ]
+    );
+    writeln!(
+        out,
+        "type=DirectImport<fn()> size={} align={}",
+        core::mem::size_of::<crate::DirectImport<fn()>>(),
+        core::mem::align_of::<crate::DirectImport<fn()>>()
+    )
+    .unwrap();
 
     write_layout!(
         out,
@@ -486,7 +516,6 @@ pub fn kernel_api_manifest_v1(target_arch: u32) -> String {
             table_size,
             table_address,
             generation,
-            grant_id,
             capabilities,
         ]
     );

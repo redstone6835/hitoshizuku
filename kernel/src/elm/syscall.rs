@@ -41,7 +41,7 @@ pub(crate) fn sys_elm_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
             let input = read_input_bytes(input_user, input_len, ELM_MGR_MAX_INPUT)?;
             let principal = ElmPrincipal::user_admin(
                 ctx.task().pid_root().unwrap_or(0) as u64,
-                u64::from(ctx.task().credentials().euid.0),
+                user_admin_credential_id(ctx.task().credentials().euid.0),
             );
             let response = mgr_channel::dispatch_mgr_call_as(principal, &input);
             write_bytes(output_user, output_len, &response)
@@ -53,6 +53,16 @@ pub(crate) fn sys_elm_ctl(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> 
         }
     }
 }
+
+const fn user_admin_credential_id(euid: u32) -> u64 {
+    // 运行时以零表示“没有授权主体”；加一后仍保持 UID 到凭据编号的一一映射。
+    euid as u64 + 1
+}
+
+const _: () = {
+    assert!(user_admin_credential_id(0) != 0);
+    assert!(user_admin_credential_id(u32::MAX) != 0);
+};
 
 fn require_sys_admin(ctx: &SyscallContext<'_>) -> Result<(), Errno> {
     if ctx.task().credentials().has_cap(Capability::SysAdmin) {

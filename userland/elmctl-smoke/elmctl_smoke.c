@@ -1827,7 +1827,9 @@ static size_t write_abi_fingerprint_block(uint8_t *payload)
 {
     static const uint8_t rustc_hash[32] = { ELM_FINGERPRINT_RUSTC_HASH_BYTES };
     static const uint8_t target_hash[32] = { ELM_FINGERPRINT_TARGET_HASH_BYTES };
-    static const uint8_t kernel_api_hash[32] = { ELM_FINGERPRINT_KERNEL_API_HASH_BYTES };
+    static const uint8_t kernel_interface_hash[32] = {
+        ELM_FINGERPRINT_KERNEL_INTERFACE_HASH_BYTES
+    };
 
     memset(payload, 0, ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE);
     put_u16(payload, 0, ELM_RUST_ABI_FINGERPRINT_VERSION);
@@ -1836,7 +1838,7 @@ static size_t write_abi_fingerprint_block(uint8_t *payload)
     payload[5] = 1;
     memcpy(payload + 24, rustc_hash, sizeof(rustc_hash));
     memcpy(payload + 56, target_hash, sizeof(target_hash));
-    memcpy(payload + 88, kernel_api_hash, sizeof(kernel_api_hash));
+    memcpy(payload + 88, kernel_interface_hash, sizeof(kernel_interface_hash));
     return ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE;
 }
 

@@ -537,6 +537,16 @@ pub fn request_panic_recovery(cell: u64) -> bool {
     request_abort(cell, ELM_GUARD_ABORT_PANIC)
 }
 
+/// 返回当前任务是否正处于受保护的原生 ELM 调用中。
+///
+/// 架构 trap 入口用它区分“中断了 ELM”的陷入和普通用户系统调用。只有前者需要暂停
+/// 隐式分配计量；否则在系统调用内部新启动的 ELM 会错误继承 trap 的暂停状态。
+pub fn native_execution_active() -> bool {
+    current_state_ref()
+        .and_then(ElmTaskExecutionState::current_frame)
+        .is_some()
+}
+
 /// 为当前保护栈顶登记架构调用门的受控恢复出口。
 pub fn arm_current_recovery(return_pc: usize, return_sp: usize) -> bool {
     if return_pc == 0 || return_sp == 0 || return_sp & 0xf != 0 {

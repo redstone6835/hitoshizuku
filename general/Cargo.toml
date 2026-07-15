@@ -21,6 +21,7 @@ errno = { path = "../libs/errno" }
 extfs = { path = "../libs/extfs" }
 fatfs = { path = "../libs/fatfs" }
 log = { path = "../libs/log" }
+kernel-symbols = { path = "../libs/kernel-symbols" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
 sched = { path = "../libs/sched" }

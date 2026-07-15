@@ -5,13 +5,13 @@ use alloc::vec::Vec;
 use elm_model::{
     ELM_EBI_PROJECTION_SOURCE_ABI_VERSION, ELM_EBI_PROJECTION_SOURCE_FLAG_IMAGE_SESSION,
     ELM_EBI_PROJECTION_SOURCE_FLAGS_MASK, ELM_EBI_PROJECTION_SOURCE_REQUEST_SIZE,
-    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API,
+    ELM_EBI_SOURCE_ABI_VERSION, ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS,
     ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT, ELM_EBI_SOURCE_FLAGS_MASK, ELM_EBI_SOURCE_REQUEST_SIZE,
     ELM_IMAGE_SESSION_ABI_VERSION, ELM_IMAGE_SESSION_FLAG_NONE,
     ELM_IMAGE_SESSION_REFERENCE_ABI_VERSION, ELM_MGR_BUILTIN_ID, ELM_MGR_MAX_INPUT,
     ELM_MGR_STATUS_OK, ELM_MGR_STATUS_PERMISSION, ELM_POLICY_BLOCK_LOAD_REQUIRES_EBI_SOURCE,
     ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAGS_MASK,
-    ELM_REPLACE_CELL_ABI_VERSION, ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API,
+    ELM_REPLACE_CELL_ABI_VERSION, ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS,
     ELM_REPLACE_CELL_FLAGS_MASK, ElmCellPolicyRequest, ElmCellPolicyV1, ElmEbiArch,
     ElmEbiSourceKind, ElmEbiSourceRequest, ElmExtensionAttachRequest, ElmExtensionDetachRequest,
     ElmExtensionDispatchRequest, ElmId, ElmImageSessionBeginRequestV1, ElmImageSessionReferenceV1,
@@ -64,8 +64,10 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
             };
             let parent = ElmId(request.parent_cell_id);
             let grant_management = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0;
-            let grant_kernel_api = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API != 0;
-            if (grant_management || grant_kernel_api) && !privileged_grant_caller_allowed(principal)
+            let authorize_privileged_symbols =
+                request.flags & ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS != 0;
+            if (grant_management || authorize_privileged_symbols)
+                && !privileged_grant_caller_allowed(principal)
             {
                 return response_only(ElmMgrResponseHeader::permission());
             }
@@ -96,7 +98,7 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                         parent,
                         request.budget,
                         grant_management,
-                        grant_kernel_api,
+                        authorize_privileged_symbols,
                         &mut authorization,
                     ) {
                         Ok(response) => response_with_plain_payload(&response),
@@ -116,8 +118,9 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
             let Some(source_kind) = ElmEbiSourceKind::from_raw(request.source_kind) else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
-            let grant_kernel_api = request.flags & ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API != 0;
-            if grant_kernel_api && !privileged_grant_caller_allowed(principal) {
+            let authorize_privileged_symbols =
+                request.flags & ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS != 0;
+            if authorize_privileged_symbols && !privileged_grant_caller_allowed(principal) {
                 return response_only(ElmMgrResponseHeader::permission());
             }
             let Some(mut authorization) = authorize_unlocked_call(
@@ -143,7 +146,7 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                         current_ebi_arch(),
                         request.migration_limit,
                         source_kind,
-                        grant_kernel_api,
+                        authorize_privileged_symbols,
                         &mut authorization,
                     ) {
                         Ok(response) => response_with_plain_payload(&response),
@@ -348,8 +351,10 @@ fn dispatch_mgr_call_on_core_unchecked(
             };
             let parent = ElmId(request.parent_cell_id);
             let grant_management = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT != 0;
-            let grant_kernel_api = request.flags & ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API != 0;
-            if (grant_management || grant_kernel_api) && !privileged_grant_caller_allowed(principal)
+            let authorize_privileged_symbols =
+                request.flags & ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS != 0;
+            if (grant_management || authorize_privileged_symbols)
+                && !privileged_grant_caller_allowed(principal)
             {
                 return response_only(ElmMgrResponseHeader::permission());
             }
@@ -366,9 +371,9 @@ fn dispatch_mgr_call_on_core_unchecked(
                                 ElmMgrCallKind::LoadCell,
                                 ElmMgrAccessTarget::Load(parent, request.budget),
                             );
-                            let kernel_api_grant =
-                                super::core::KernelApiGrantRequest::from_authorization(
-                                    grant_kernel_api,
+                            let symbol_authorization =
+                                super::core::KernelSymbolAuthorization::from_authorization(
+                                    authorize_privileged_symbols,
                                     authorization,
                                 );
                             let response = core.load_ebi_image_in_detached_core(
@@ -378,7 +383,7 @@ fn dispatch_mgr_call_on_core_unchecked(
                                 parent,
                                 request.budget,
                                 grant_management,
-                                kernel_api_grant,
+                                symbol_authorization,
                             );
                             response_with_plain_payload(&response)
                         }
@@ -420,8 +425,9 @@ fn dispatch_mgr_call_on_core_unchecked(
             let Some(source_kind) = ElmEbiSourceKind::from_raw(request.source_kind) else {
                 return response_only(ElmMgrResponseHeader::invalid());
             };
-            let grant_kernel_api = request.flags & ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API != 0;
-            if grant_kernel_api && !privileged_grant_caller_allowed(principal) {
+            let authorize_privileged_symbols =
+                request.flags & ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS != 0;
+            if authorize_privileged_symbols && !privileged_grant_caller_allowed(principal) {
                 return response_only(ElmMgrResponseHeader::permission());
             }
             match source_kind {
@@ -433,19 +439,19 @@ fn dispatch_mgr_call_on_core_unchecked(
                                 ElmMgrCallKind::ReplaceCell,
                                 ElmMgrAccessTarget::Cell(ElmId(request.target_cell_id)),
                             );
-                            let kernel_api_grant =
-                                super::core::KernelApiGrantRequest::from_authorization(
-                                    grant_kernel_api,
+                            let symbol_authorization =
+                                super::core::KernelSymbolAuthorization::from_authorization(
+                                    authorize_privileged_symbols,
                                     authorization,
                                 );
                             let response = core
-                                .replace_declarative_cell_from_ebi_image_with_source_and_kernel_api_grant(
+                                .replace_declarative_cell_from_ebi_image_with_source_and_symbol_authorization(
                                     ElmId(request.target_cell_id),
                                     image,
                                     current_ebi_arch(),
                                     request.migration_limit,
                                     ElmEbiSourceKind::Projection,
-                                    kernel_api_grant,
+                                    symbol_authorization,
                                 );
                             response_with_plain_payload(&response)
                         }
@@ -1113,9 +1119,10 @@ fn read_cell_policy(payload: &[u8]) -> Option<ElmCellPolicyV1> {
         extension_flags: u32::from_le_bytes(payload[36..40].try_into().ok()?),
         native_flags: u32::from_le_bytes(payload[40..44].try_into().ok()?),
         resource_flags: u32::from_le_bytes(payload[44..48].try_into().ok()?),
-        status: i32::from_le_bytes(payload[48..52].try_into().ok()?),
-        reserved: u32::from_le_bytes(payload[52..56].try_into().ok()?),
-        blockers: u64::from_le_bytes(payload[56..64].try_into().ok()?),
+        kernel_symbol_capabilities: u64::from_le_bytes(payload[48..56].try_into().ok()?),
+        status: i32::from_le_bytes(payload[56..60].try_into().ok()?),
+        reserved: u32::from_le_bytes(payload[60..64].try_into().ok()?),
+        blockers: u64::from_le_bytes(payload[64..72].try_into().ok()?),
     };
     if policy.reserved != 0 {
         return None;

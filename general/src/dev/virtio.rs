@@ -160,6 +160,12 @@ pub struct VirtioPciCaps {
 /// capability、长度满足基础结构要求、BAR 必须是 MMIO、offset/length 不能越过
 /// BAR 边界。各设备类型的寄存器访问范围仍由具体驱动按自己的 common/device
 /// config 使用方式继续校验。
+#[kernel_symbols::export(
+    name = "general.dev.virtio.parse_virtio_pci_caps",
+    contract = "kernel.general.virtio-pci@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS
+)]
 pub fn parse_virtio_pci_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
     let mut common: Option<VirtioPciCap> = None;
     let mut notify: Option<VirtioPciCap> = None;
@@ -1262,6 +1268,12 @@ impl SplitVirtQueue {
 ///
 /// VirtIO split queue 的 ring 取模逻辑要求队列大小为 2 的幂；这里把“从设备
 /// 能力中挑一个可用大小”的策略集中到公共层，避免各个传输驱动各自硬编码 128/256。
+#[kernel_symbols::export(
+    name = "general.dev.virtio.choose_split_queue_size",
+    contract = "kernel.general.virtio-queue@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS
+)]
 pub fn choose_split_queue_size(
     max_size: u16,
     preferred_limit: Option<u16>,

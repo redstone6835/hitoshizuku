@@ -709,7 +709,7 @@ static int source_request_from_session(uint64_t session_id, uint8_t *out, size_t
     memset(&reference, 0, sizeof(reference));
     request.abi_version = ELM_EBI_SOURCE_ABI_VERSION;
     request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
-    request.flags = ELM_EBI_SOURCE_FLAG_GRANT_KERNEL_API;
+    request.flags = ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS;
     request.parent_cell_id = ELM_MGR_BUILTIN_ID;
     request.budget.max_provider_ports = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_PORTS;
     request.budget.max_provider_queue = ELM_RESOURCE_BUDGET_DEFAULT_PROVIDER_QUEUE;
@@ -819,7 +819,7 @@ static int cmd_replace_eki(int argc, char **argv)
     memset(&projection, 0, sizeof(projection));
     memset(&reference, 0, sizeof(reference));
     request.abi_version = ELM_REPLACE_CELL_ABI_VERSION;
-    request.flags = ELM_REPLACE_CELL_FLAG_GRANT_KERNEL_API;
+    request.flags = ELM_REPLACE_CELL_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS;
     request.source_kind = ELM_EBI_SOURCE_KIND_PROJECTION;
     request.target_cell_id = cell;
     request.source_payload_len = (uint32_t)(sizeof(projection) + sizeof(reference));

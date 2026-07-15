@@ -7,12 +7,12 @@ use std::path::Path;
 use ed25519_dalek::{Signer, SigningKey};
 
 use elm::{
-    ELM_EBI_ABI_VERSION, ELM_EBI_RUST_ABI_VERSION as RUST_ABI,
+    ELM_EBI_ABI_VERSION, ELM_EBI_IMPORT_FLAG_EXACT_RUST_API, ELM_EBI_IMPORT_FLAG_KERNEL_STATIC,
+    ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL, ELM_EBI_RUST_ABI_VERSION as RUST_ABI,
     ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_WRITE,
-    ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SYMBOL_NAME_LEN,
-    ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE,
-    ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE,
-    ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_KERNEL_API_RECORD_SIZE, ELM_EKI_MAGIC,
+    ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SYMBOL_NAME_LEN, ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE,
+    ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION,
+    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC,
     ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROOF_ALGORITHM_ED25519,
     ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN,
     ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION,
@@ -20,19 +20,23 @@ use elm::{
     ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiArch, ElmEbiProofV1, ElmEbiRelocationKind,
     ElmEbiSegmentKind, ElmEkiBlockKind, ElmKind, ElmModuleDescriptorV1, ElmPanicStrategy,
     ElmRustAbiFingerprintV1, ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest,
-    kernel_api_manifest_v1, parse_eki_image, sha256, sha256_with_zeroed_range,
+    kernel_interface_manifest_v1, parse_eki_image, sha256, sha256_with_zeroed_range,
     sha256_with_zeroed_ranges,
 };
 
+mod kernel_interface;
 mod project;
 mod rust_metadata;
 
+use kernel_interface::{
+    KernelInterfaceManifest, emit_kernel_symbol_probe, export_kernel_interface,
+};
 use project::{
     ElmProjectDependency, ElmProjectManifest, cargo_build, scaffold_project, sync_framework,
 };
 use rust_metadata::{
-    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, KernelApiSpec, NativeMetadata,
-    ProviderSpec, retain_linked_kernel_symbol_imports,
+    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, NativeMetadata, ProviderSpec,
+    retain_linked_kernel_symbol_imports,
 };
 
 const ELM_TOOL_PAGE_SIZE: u64 = 4096;
@@ -54,7 +58,6 @@ const BLOCK_EXTENSION_POINTS: u32 = ElmEkiBlockKind::ExtensionPoints as u32;
 const BLOCK_EXTENSIONS: u32 = ElmEkiBlockKind::Extensions as u32;
 const BLOCK_API_COMPATIBILITY: u32 = ElmEkiBlockKind::ApiCompatibility as u32;
 const BLOCK_ABI_FINGERPRINT: u32 = ElmEkiBlockKind::AbiFingerprint as u32;
-const BLOCK_KERNEL_APIS: u32 = ElmEkiBlockKind::KernelApis as u32;
 const BLOCK_PROOF: u32 = ElmEkiBlockKind::Signature as u32;
 const MENU_KIND_ACTION: u32 = 2;
 const HOOK_INITIALIZE: u32 = 1;
@@ -75,6 +78,8 @@ const ELF_SECTION_RELA: u32 = 4;
 const ELF_SECTION_REL: u32 = 9;
 const ELF_SECTION_FLAG_ALLOC: u64 = 1 << 1;
 const ELF_RELOCATION_RELATIVE: u32 = 3;
+const ELF_RELOCATION_ABS64: u32 = 2;
+const ELF_RELOCATION_JUMP_SLOT: u32 = 5;
 const ELF_SYMBOL_TABLE: u32 = 2;
 const ELF_SYMBOL_BIND_GLOBAL: u8 = 1;
 const ELF_SYMBOL_TYPE_OBJECT: u8 = 1;
@@ -141,6 +146,8 @@ fn run() -> Result<(), String> {
     match command {
         "new" => cmd_new(&args[2..]),
         "sync-framework" => cmd_sync_framework(&args[2..]),
+        "export-interface" => cmd_export_interface(&args[2..]),
+        "emit-symbol-probe" => cmd_emit_symbol_probe(&args[2..]),
         "build" => cmd_build(&args[2..]),
         "pack-metadata" | "pack" => cmd_pack_metadata(&args[2..]),
         "pack-elf" => cmd_pack_elf(&args[2..]),
@@ -162,6 +169,10 @@ fn usage() {
     eprintln!("elm-tools commands:");
     eprintln!("  new <directory> --name <name> --kind <kind> --source <identifier>");
     eprintln!("  sync-framework <project-directory>");
+    eprintln!(
+        "  export-interface <kernel-elf> --target <triple> --profile <profile> --output <directory>"
+    );
+    eprintln!("  emit-symbol-probe <interface-manifest> <output.rs>");
     eprintln!(
         "  build <project-directory> --arch <riscv64|loongarch64|all> --key <seed> --epoch <n>"
     );
@@ -203,6 +214,43 @@ fn cmd_sync_framework(args: &[String]) -> Result<(), String> {
     }
     sync_framework(Path::new(&args[0]))?;
     println!("framework synchronized: {}", args[0]);
+    Ok(())
+}
+
+fn cmd_export_interface(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        usage();
+        return Err("export-interface 缺少内核 ELF".to_string());
+    }
+    let kernel = Path::new(&args[0]);
+    let options = parse_named_options(&args[1..], &["--target", "--profile", "--output"])?;
+    let target = required_option(&options, "--target")?;
+    let profile = required_option(&options, "--profile")?;
+    let output = Path::new(required_option(&options, "--output")?);
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|error| format!("定位内核仓库失败: {error}"))?;
+    let manifest = export_kernel_interface(&repository, target, profile, kernel, output)?;
+    println!(
+        "exported kernel interface: target={} symbols={} output={}",
+        manifest.target,
+        manifest.symbols.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+fn cmd_emit_symbol_probe(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        usage();
+        return Err("emit-symbol-probe 参数无效".to_string());
+    }
+    let count = emit_kernel_symbol_probe(Path::new(&args[0]), Path::new(&args[1]))?;
+    println!(
+        "generated kernel symbol probe: symbols={count} output={}",
+        args[1]
+    );
     Ok(())
 }
 
@@ -347,8 +395,8 @@ fn cmd_fingerprint_header(args: &[String]) -> Result<(), String> {
     append_c_byte_list(&mut header, &fingerprint.rustc_commit_hash);
     header.push_str("\n#define ELM_FINGERPRINT_TARGET_HASH_BYTES ");
     append_c_byte_list(&mut header, &fingerprint.target_spec_hash);
-    header.push_str("\n#define ELM_FINGERPRINT_KERNEL_API_HASH_BYTES ");
-    append_c_byte_list(&mut header, &fingerprint.kernel_api_hash);
+    header.push_str("\n#define ELM_FINGERPRINT_KERNEL_INTERFACE_HASH_BYTES ");
+    append_c_byte_list(&mut header, &fingerprint.kernel_interface_hash);
     header.push_str("\n#endif\n");
     if let Some(parent) = std::path::Path::new(&args[1]).parent() {
         fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
@@ -416,6 +464,18 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
     let elf_bytes =
         fs::read(elf_path).map_err(|err| format!("读取 {} 失败: {err}", elf_path.display()))?;
     let elf = ElfImage::parse(&elf_bytes)?;
+    let interface_target = target_triple_for_arch(elf.arch)?;
+    let interface_path = project
+        .join(".elm/kernel-interface")
+        .join(interface_target)
+        .join("manifest.txt");
+    let interface = KernelInterfaceManifest::load(&interface_path)?;
+    if interface.target != interface_target {
+        return Err(format!(
+            "ELM 目标 {} 与内核接口包 {} 不一致",
+            interface_target, interface.target
+        ));
+    }
     validate_runtime_layout(&elf.load_segments)?;
     let metadata_section = elf.elm_metadata_section(&elf_bytes)?;
     let mut metadata = NativeMetadata::parse(metadata_section)?;
@@ -423,7 +483,8 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
         elf.symbols.iter().any(|candidate| candidate.name == symbol)
     });
     validate_native_symbols(&elf, &metadata)?;
-    let relocation_records = dynamic_relative_relocations(&elf, &elf_bytes)?;
+    let relocation_records =
+        dynamic_runtime_relocations(&elf, &elf_bytes, &interface, &mut metadata.imports)?;
     let relocations = native_relocations_block(&elf, &metadata.imports, relocation_records)?;
     let mut blocks = vec![
         PackerBlock::new(
@@ -445,12 +506,6 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
         blocks.push(PackerBlock::new(
             BLOCK_DEPENDENCIES,
             dependencies_block(&manifest.dependencies)?,
-        ));
-    }
-    if !metadata.kernel_apis.is_empty() {
-        blocks.push(PackerBlock::new(
-            BLOCK_KERNEL_APIS,
-            kernel_api_requirements_block(&metadata.kernel_apis)?,
         ));
     }
     if !metadata.extension_points.is_empty() {
@@ -1123,6 +1178,14 @@ fn arch_from_machine(machine: u16) -> Result<ElmEbiArch, String> {
     }
 }
 
+fn target_triple_for_arch(arch: ElmEbiArch) -> Result<&'static str, String> {
+    match arch {
+        ElmEbiArch::Riscv64 => Ok("riscv64gc-unknown-none-elf"),
+        ElmEbiArch::LoongArch64 => Ok("loongarch64-unknown-none"),
+        ElmEbiArch::Any => Err("原生 ELM 不能使用 Any 架构接口包".to_string()),
+    }
+}
+
 fn parse_elf_load_segments(
     bytes: &[u8],
     header: &ElfHeader,
@@ -1609,7 +1672,7 @@ fn default_abi_fingerprint(arch: ElmEbiArch) -> ElmRustAbiFingerprintV1 {
     ElmRustAbiFingerprintV1::new(
         sha256(&rustc),
         sha256(target),
-        sha256(kernel_api_manifest_v1(arch as u32).as_bytes()),
+        sha256(kernel_interface_manifest_v1(arch as u32).as_bytes()),
         1,
         ElmPanicStrategy::AbortThroughRuntime,
         1,
@@ -1627,7 +1690,7 @@ fn abi_fingerprint_block(fingerprint: &ElmRustAbiFingerprintV1) -> Vec<u8> {
     write_u32(&mut out, 16, fingerprint.flags);
     out[24..56].copy_from_slice(&fingerprint.rustc_commit_hash);
     out[56..88].copy_from_slice(&fingerprint.target_spec_hash);
-    out[88..120].copy_from_slice(&fingerprint.kernel_api_hash);
+    out[88..120].copy_from_slice(&fingerprint.kernel_interface_hash);
     out
 }
 
@@ -1831,23 +1894,6 @@ fn dependencies_block(entries: &[ElmProjectDependency]) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
-fn kernel_api_requirements_block(entries: &[KernelApiSpec]) -> Result<Vec<u8>, String> {
-    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * ELM_EKI_KERNEL_API_RECORD_SIZE];
-    write_u32(&mut out, 0, entries.len() as u32);
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.namespace.len() > elm::ELM_KERNEL_API_IDENTIFIER_MAX_LEN {
-            return Err(format!("Kernel API namespace {} 过长", entry.namespace));
-        }
-        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_KERNEL_API_RECORD_SIZE;
-        write_u16(&mut out, offset, entry.namespace.len() as u16);
-        write_u16(&mut out, offset + 2, entry.version);
-        write_u64(&mut out, offset + 8, entry.capabilities);
-        out[offset + 16..offset + 48].copy_from_slice(&entry.layout_hash);
-        copy_fixed(&mut out, offset + 48, &entry.namespace);
-    }
-    Ok(out)
-}
-
 fn extension_points_block(entries: &[ExtensionPointSpec]) -> Result<Vec<u8>, String> {
     let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_EXTENSION_POINT_RECORD_SIZE];
     write_u32(&mut out, 0, entries.len() as u32);
@@ -2006,6 +2052,137 @@ fn native_relocations_block(
     Ok(out)
 }
 
+fn dynamic_runtime_relocations(
+    elf: &ElfImage,
+    bytes: &[u8],
+    interface: &KernelInterfaceManifest,
+    imports: &mut Vec<ImportSpec>,
+) -> Result<Vec<EkiRelocationSpec>, String> {
+    let mut records = Vec::new();
+    for section in &elf.sections {
+        if section.flags & ELF_SECTION_FLAG_ALLOC == 0
+            || !matches!(section.section_type, ELF_SECTION_RELA | ELF_SECTION_REL)
+        {
+            continue;
+        }
+        if !matches!(section.name.as_str(), ".rela.dyn" | ".rela.plt")
+            || section.section_type != ELF_SECTION_RELA
+        {
+            return Err(format!(
+                "ELM PIE 包含不支持的动态重定位 section: {}",
+                section.name
+            ));
+        }
+        if section.entsize != 24 || section.size % section.entsize != 0 {
+            return Err(format!("{} entry size 无效", section.name));
+        }
+        for index in 0..(section.size / section.entsize) as usize {
+            let offset = checked_add(section.offset as usize, index * section.entsize as usize)?;
+            let target_vaddr = read_u64(bytes, offset)?;
+            let info = read_u64(bytes, offset + 8)?;
+            let addend = read_i64(bytes, offset + 16)?;
+            let relocation_type = info as u32;
+            let symbol_index = (info >> 32) as u32;
+            let (target_segment_index, target_offset) = elf.relocation_target(target_vaddr, 8)?;
+            if relocation_type == ELF_RELOCATION_RELATIVE && symbol_index == 0 {
+                if target_vaddr & 7 != 0 || addend < 0 || !elf.contains_image_address(addend as u64)
+                {
+                    return Err(format!(
+                        "ELM PIE relative relocation 范围无效: target=0x{target_vaddr:x} addend={addend}"
+                    ));
+                }
+                records.push(EkiRelocationSpec {
+                    kind: ElmEbiRelocationKind::ImageBase64,
+                    target_segment_index,
+                    value_index: 0,
+                    target_offset,
+                    addend,
+                });
+                continue;
+            }
+            if !matches!(
+                relocation_type,
+                ELF_RELOCATION_ABS64 | ELF_RELOCATION_JUMP_SLOT
+            ) || symbol_index == 0
+            {
+                return Err(format!(
+                    "ELM PIE 包含不支持的动态重定位: section={} type={} symbol={}",
+                    section.name, relocation_type, symbol_index
+                ));
+            }
+            let link_name = dynamic_symbol_name(bytes, &elf.sections, section.link, symbol_index)?;
+            let symbol = interface
+                .symbol_by_link_name(&link_name)
+                .ok_or_else(|| format!("ELM 引用了未审核或未导出的内核符号: {link_name}"))?;
+            let import_index = match imports.iter().position(|import| {
+                import.name == symbol.api_path
+                    && import.contract == symbol.contract
+                    && import.min_version <= symbol.version
+                    && import.max_version >= symbol.version
+                    && import.rust_abi_hash == symbol.rust_abi_hash
+            }) {
+                Some(index) => index,
+                None => {
+                    let mut flags =
+                        ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL | ELM_EBI_IMPORT_FLAG_EXACT_RUST_API;
+                    if symbol.kind == kernel_symbols::KERNEL_SYMBOL_KIND_STATIC {
+                        flags |= ELM_EBI_IMPORT_FLAG_KERNEL_STATIC;
+                    }
+                    imports.push(ImportSpec {
+                        slot_symbol: None,
+                        name: symbol.api_path.clone(),
+                        contract: symbol.contract.clone(),
+                        min_version: symbol.version,
+                        max_version: symbol.version,
+                        flags,
+                        rust_abi_hash: symbol.rust_abi_hash,
+                    });
+                    imports.len() - 1
+                }
+            };
+            records.push(EkiRelocationSpec {
+                kind: ElmEbiRelocationKind::ImportAbs64,
+                target_segment_index,
+                value_index: import_index as u32,
+                target_offset,
+                addend,
+            });
+        }
+    }
+    Ok(records)
+}
+
+fn dynamic_symbol_name(
+    bytes: &[u8],
+    sections: &[ElfSection],
+    symbol_table_index: u32,
+    symbol_index: u32,
+) -> Result<String, String> {
+    let table = sections
+        .get(symbol_table_index as usize)
+        .ok_or_else(|| "动态重定位引用了无效符号表".to_string())?;
+    if table.entsize != 24 || table.size % table.entsize != 0 {
+        return Err("动态符号表记录尺寸无效".to_string());
+    }
+    if u64::from(symbol_index) >= table.size / table.entsize {
+        return Err("动态重定位符号索引越界".to_string());
+    }
+    let strings = sections
+        .get(table.link as usize)
+        .ok_or_else(|| "动态符号表字符串表索引无效".to_string())?;
+    let strtab = checked_slice(bytes, strings.offset as usize, strings.size as usize)?;
+    let offset = table.offset as usize + symbol_index as usize * table.entsize as usize;
+    if read_u16(bytes, offset + 6)? != ELF_SECTION_INDEX_UNDEFINED {
+        return Err("内核导入动态符号必须保持未定义状态".to_string());
+    }
+    let name = read_cstr(strtab, read_u32(bytes, offset)? as usize)?;
+    if name.is_empty() {
+        return Err("动态重定位引用了空符号名".to_string());
+    }
+    Ok(name)
+}
+
+#[cfg(test)]
 fn dynamic_relative_relocations(
     elf: &ElfImage,
     bytes: &[u8],

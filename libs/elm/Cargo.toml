@@ -16,8 +16,9 @@ management = ["module"]
 macros = ["dep:elm-macros"]
 
 [dependencies]
-ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "zeroize"], optional = true }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "zeroize"], optional = true }
 elm-macros = { path = "macros", optional = true }
+kernel-symbols = { path = "../kernel-symbols", default-features = false }
 
 [dev-dependencies]
-ed25519-dalek = { version = "2.2.0", features = ["zeroize"] }
+ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }

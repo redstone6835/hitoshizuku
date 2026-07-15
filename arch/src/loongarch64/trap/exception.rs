@@ -120,8 +120,11 @@ pub unsafe extern "C" fn loongarch64_handle_exception(
     arg3: usize, // $r7 = SP
     arg4: usize, // $r8 = TrapFrame ptr
 ) -> usize {
-    // trap 内发生的日志、调度和设备分配属于内核基础设施，不能归入被中断的 ELM。
-    let _accounting_suspension = allocator::suspend_implicit_allocation_accounting();
+    // 只有实际中断原生 ELM 时，trap 内部分配才需要排除在该单元账本之外。普通用户
+    // syscall 可能在分派阶段启动 ELM，不能让后创建的执行上下文继承暂停状态。
+    let _accounting_suspension = general::elm_guard::native_execution_active()
+        .then(allocator::suspend_implicit_allocation_accounting)
+        .flatten();
     // 汇编入口已经完成最危险的硬件现场保存；Rust 端从这里开始处理“解释现场并决定命运”。
     // 返回非零表示异常可恢复，汇编端将按该 TrapFrame 恢复寄存器并执行 `ertn`；
     // 返回零表示当前策略认定无法恢复，汇编端进入停机路径。

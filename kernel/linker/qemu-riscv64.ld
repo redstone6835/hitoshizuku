@@ -43,6 +43,10 @@ SECTIONS
         KEEP(*(.ktest .ktest.*))
         PROVIDE(__stop_ktest = .);
         . = ALIGN(8);
+        PROVIDE(__elm_kernel_symbols_start = .);
+        KEEP(*(.elm.kernel_symbols .elm.kernel_symbols.*))
+        PROVIDE(__elm_kernel_symbols_end = .);
+        . = ALIGN(8);
         *(.eh_frame_hdr)
         *(.eh_frame)
     }

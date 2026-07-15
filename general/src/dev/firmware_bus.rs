@@ -74,6 +74,14 @@ impl FirmwareBusRegistry {
 
 static FIRMWARE_BUSES: Spinlock<FirmwareBusRegistry> = Spinlock::new(FirmwareBusRegistry::new());
 
+#[kernel_symbols::export(
+    name = "general.dev.firmware_bus.register",
+    contract = "kernel.general.firmware-bus@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register(bus: Arc<dyn FirmwareBus>) -> Result<FirmwareBusHandle, FirmwareBusError> {
     let mut registry = FIRMWARE_BUSES.lock();
     registry
@@ -86,10 +94,21 @@ pub fn register(bus: Arc<dyn FirmwareBus>) -> Result<FirmwareBusHandle, Firmware
     let handle = FirmwareBusHandle { id };
     registry.buses.push(FirmwareBusRegistration { handle, bus });
     drop(registry);
+    if super::elm_lifecycle::track_firmware_bus(handle).is_err() {
+        let _ = unregister(handle);
+        return Err(FirmwareBusError::OutOfMemory);
+    }
     pnp::notify_dependency_ready(PnpDependency::FirmwareBus);
     Ok(handle)
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.firmware_bus.unregister",
+    contract = "kernel.general.firmware-bus@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_BUS,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister(handle: FirmwareBusHandle) -> Result<(), FirmwareBusError> {
     let mut registry = FIRMWARE_BUSES.lock();
     let Some(index) = registry
@@ -100,6 +119,8 @@ pub fn unregister(handle: FirmwareBusHandle) -> Result<(), FirmwareBusError> {
         return Err(FirmwareBusError::NotFound);
     };
     registry.buses.swap_remove(index);
+    drop(registry);
+    super::elm_lifecycle::forget_firmware_bus(handle);
     Ok(())
 }
 
@@ -108,6 +129,13 @@ fn release_firmware_bus_resource(handle: FirmwareBusHandle) -> bool {
 }
 
 /// 将固件总线登记 handle 包装成 PnP-owned resource。
+#[kernel_symbols::export(
+    name = "general.dev.firmware_bus.pnp_resource",
+    contract = "kernel.general.device-resource@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn pnp_resource(
     handle: FirmwareBusHandle,
     label: &'static str,
@@ -120,6 +148,13 @@ pub fn pnp_resource(
     )
 }
 
+#[kernel_symbols::export(
+    name = "general.dev.firmware_bus.snapshot",
+    contract = "kernel.general.firmware-bus@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn snapshot() -> Vec<Arc<dyn FirmwareBus>> {
     FIRMWARE_BUSES
         .lock()

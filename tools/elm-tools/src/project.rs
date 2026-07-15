@@ -3,6 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::kernel_interface::{
+    KernelInterfaceManifest, LSP_SOURCE_IDENTITY_FILE, LSP_SOURCE_MAGIC,
+    framework_workspace_manifest, metadata_facade_manifest, metadata_facade_source,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElmProjectManifest {
     pub name: String,
@@ -214,6 +219,7 @@ pub fn scaffold_project(
     write_new(&directory.join("Elm.toml"), &elm_toml(name, kind, source))?;
     write_new(&directory.join("src/main.rs"), &main_rs(name))?;
     write_new(&directory.join("elm.ld"), ELM_LINKER_SCRIPT)?;
+    write_new(&directory.join("rust-toolchain.toml"), ELM_RUST_TOOLCHAIN)?;
     write_new(&directory.join(".cargo/config.toml"), ELM_CARGO_CONFIG)?;
     sync_framework(directory)
 }
@@ -231,14 +237,14 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     migrate_cargo_manifest(&manifest, &project_manifest.kind)?;
     let source = framework_source_root()?;
     let elm_source = source.join("libs/elm");
-    let kernel_api_source = source.join("kernel-api");
+    let kernel_symbols_source = source.join("libs/kernel-symbols");
     if !elm_source.join("Cargo.toml").is_file() {
         return Err(format!("找不到框架源目录: {}", elm_source.display()));
     }
-    if !kernel_api_source.join("Cargo.toml").is_file() {
+    if !kernel_symbols_source.join("Cargo.toml").is_file() {
         return Err(format!(
-            "找不到 Kernel API 门面源目录: {}",
-            kernel_api_source.display()
+            "找不到内核符号契约源目录: {}",
+            kernel_symbols_source.display()
         ));
     }
     let elm_root = project.join(".elm");
@@ -252,8 +258,15 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     fs::create_dir_all(&temporary)
         .map_err(|err| format!("创建 {} 失败: {err}", temporary.display()))?;
     copy_tree(&elm_source, &temporary.join("elm"))?;
-    copy_tree(&kernel_api_source, &temporary.join("kernel-api"))?;
-    rewrite_synced_kernel_api_manifest(&temporary.join("kernel-api/Cargo.toml"))?;
+    copy_tree(&kernel_symbols_source, &temporary.join("kernel-symbols"))?;
+    write_metadata_facade(
+        &temporary.join("allocator"),
+        "allocator",
+        "__elm_host_allocator",
+    )?;
+    write_metadata_facade(&temporary.join("general"), "general", "__elm_host_general")?;
+    fs::write(temporary.join("Cargo.toml"), framework_workspace_manifest())
+        .map_err(|err| format!("写入框架 workspace manifest 失败: {err}"))?;
     if destination.exists() {
         fs::rename(&destination, &backup).map_err(|err| {
             format!(
@@ -270,6 +283,15 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
         return Err(format!("原子替换框架失败: {err}"));
     }
     remove_if_exists(&backup)?;
+    fs::write(project.join("elm.ld"), ELM_LINKER_SCRIPT)
+        .map_err(|err| format!("更新 ELM linker script 失败: {err}"))?;
+    fs::write(project.join("rust-toolchain.toml"), ELM_RUST_TOOLCHAIN)
+        .map_err(|err| format!("更新 ELM Rust 工具链声明失败: {err}"))?;
+    fs::create_dir_all(project.join(".cargo"))
+        .map_err(|err| format!("创建 ELM Cargo 配置目录失败: {err}"))?;
+    fs::write(project.join(".cargo/config.toml"), ELM_CARGO_CONFIG)
+        .map_err(|err| format!("更新 ELM Cargo 配置失败: {err}"))?;
+    sync_available_target_interfaces(project)?;
     Ok(())
 }
 
@@ -277,18 +299,51 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
     let project = project
         .canonicalize()
         .map_err(|err| format!("定位 {} 失败: {err}", project.display()))?;
+    prepare_target_interface(&project, target)?;
+    let interface_root = project.join(".elm/kernel-interface").join(target);
+    let manifest = interface_root.join("manifest.txt");
+    let interface = KernelInterfaceManifest::load(&manifest)?;
+    let import_library = interface_root.join(&interface.import_library);
+    let support_library = interface_root.join(&interface.support_library);
+    if !support_library.is_file() {
+        return Err(format!(
+            "目标接口包缺少 Rust 支持归档: {}",
+            support_library.display()
+        ));
+    }
+    if !import_library.is_file() {
+        return Err(format!(
+            "目标接口包缺少内核导入库: {}",
+            import_library.display()
+        ));
+    }
     let mut rustflags = vec![
-        "-Clink-arg=-Telm.ld",
-        "-Crelocation-model=pic",
-        "-Ccode-model=small",
-        "-Clink-arg=-pie",
-        "-Clink-arg=-z",
-        "-Clink-arg=notext",
-        "-Clink-arg=--gc-sections",
-        "-Clink-arg=--build-id=none",
+        "-Clink-arg=-Telm.ld".to_string(),
+        "-Crelocation-model=pic".to_string(),
+        "-Ccode-model=small".to_string(),
+        "-Clink-arg=-pie".to_string(),
+        "-Clink-arg=-z".to_string(),
+        "-Clink-arg=notext".to_string(),
+        "-Clink-arg=--gc-sections".to_string(),
+        "-Clink-arg=--build-id=none".to_string(),
+        format!("-Clink-arg={}", support_library.display()),
+        "-Clink-arg=--no-as-needed".to_string(),
+        format!("-Clink-arg={}", import_library.display()),
+        "-Zplt=yes".to_string(),
+        "-Zshare-generics=no".to_string(),
     ];
+    let metadata = interface_root.join("metadata");
+    rustflags.push(format!("-Ldependency={}", metadata.display()));
+    rustflags.push(format!(
+        "--extern=__elm_host_allocator={}",
+        metadata.join(&interface.allocator_metadata).display()
+    ));
+    rustflags.push(format!(
+        "--extern=__elm_host_general={}",
+        metadata.join(&interface.general_metadata).display()
+    ));
     if target == "loongarch64-unknown-none" {
-        rustflags.push("-Anamed_asm_labels");
+        rustflags.push("-Anamed_asm_labels".to_string());
     }
     let status = Command::new("cargo")
         .current_dir(&project)
@@ -300,6 +355,7 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         .arg(cargo_name)
         .arg("--bin")
         .arg(cargo_name)
+        .arg("--no-default-features")
         .arg("--target")
         .arg(target)
         .arg("--release")
@@ -357,14 +413,275 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn rewrite_synced_kernel_api_manifest(path: &Path) -> Result<(), String> {
-    let input = fs::read_to_string(path)
-        .map_err(|err| format!("读取同步后的 {} 失败: {err}", path.display()))?;
-    let output = input.replace("path = \"../libs/elm\"", "path = \"../elm\"");
-    if output == input {
-        return Err(format!("{} 不包含规范 elm 依赖路径", path.display()));
+fn write_metadata_facade(directory: &Path, name: &str, host_alias: &str) -> Result<(), String> {
+    fs::create_dir_all(directory.join("src"))
+        .map_err(|err| format!("创建 {} 失败: {err}", directory.display()))?;
+    fs::write(
+        directory.join("Cargo.toml"),
+        metadata_facade_manifest(name, host_alias),
+    )
+    .map_err(|err| format!("写入 {name} façade manifest 失败: {err}"))?;
+    fs::write(
+        directory.join("src/lib.rs"),
+        metadata_facade_source(name, host_alias),
+    )
+    .map_err(|err| format!("写入 {name} façade 源码失败: {err}"))
+}
+
+fn interface_bundle_root() -> Result<PathBuf, String> {
+    if let Some(root) = std::env::var_os("ELM_KERNEL_INTERFACE_ROOT") {
+        return Ok(PathBuf::from(root));
     }
-    fs::write(path, output).map_err(|err| format!("重写 {} 失败: {err}", path.display()))
+    Ok(framework_source_root()?.join("build/elm-interface"))
+}
+
+fn sync_available_target_interfaces(project: &Path) -> Result<(), String> {
+    let root = interface_bundle_root()?;
+    let mut installed_source_hash = None;
+    for target in ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"] {
+        let bundle = root.join(target);
+        if bundle.join("manifest.txt").is_file() {
+            let manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
+            if installed_source_hash.is_some_and(|hash| hash != manifest.interface_hash) {
+                return Err("不同目标接口包的规范接口摘要不一致".to_string());
+            }
+            if installed_source_hash.is_none() {
+                install_lsp_source(project, &bundle, &manifest, true)?;
+                installed_source_hash = Some(manifest.interface_hash);
+            }
+            copy_target_interface(project, target, &bundle, false)?;
+        }
+    }
+    Ok(())
+}
+
+fn prepare_target_interface(project: &Path, target: &str) -> Result<(), String> {
+    let destination = project.join(".elm/kernel-interface").join(target);
+    if destination.join("manifest.txt").is_file() {
+        let manifest = KernelInterfaceManifest::load(&destination.join("manifest.txt"))?;
+        if lsp_source_interface_hash(&project.join(".elm/kernel-source"))?
+            == Some(manifest.interface_hash)
+        {
+            return Ok(());
+        }
+        let bundle = interface_bundle_root()?.join(target);
+        if !bundle.join("manifest.txt").is_file() {
+            return Err(format!(
+                "目标 {target} 已有接口包，但缺少与其匹配的 LSP 源码投影；请执行 elm-tools sync-framework"
+            ));
+        }
+        let bundle_manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
+        if bundle_manifest.interface_hash != manifest.interface_hash {
+            return Err(format!(
+                "目标 {target} 的工程接口包与发布接口包摘要不一致；请执行 elm-tools sync-framework"
+            ));
+        }
+        install_lsp_source(project, &bundle, &manifest, true)?;
+        return Ok(());
+    }
+    let bundle = interface_bundle_root()?.join(target);
+    if !bundle.join("manifest.txt").is_file() {
+        return Err(format!(
+            "缺少目标 {target} 的精确内核接口包；先对对应内核执行 elm-tools export-interface"
+        ));
+    }
+    let manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
+    copy_target_interface(project, target, &bundle, true)?;
+    install_lsp_source(project, &bundle, &manifest, false)
+}
+
+fn copy_target_interface(
+    project: &Path,
+    target: &str,
+    bundle: &Path,
+    enforce_existing_coherence: bool,
+) -> Result<(), String> {
+    let manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
+    if manifest.target != target {
+        return Err(format!(
+            "接口包目标不匹配：目录为 {target}，清单为 {}",
+            manifest.target
+        ));
+    }
+    if enforce_existing_coherence {
+        ensure_existing_interface_coherence(project, target, manifest.interface_hash)?;
+    }
+    let root = project.join(".elm/kernel-interface");
+    fs::create_dir_all(&root).map_err(|err| format!("创建 {} 失败: {err}", root.display()))?;
+    let temporary = root.join(format!("{target}.tmp.{}", std::process::id()));
+    let destination = root.join(target);
+    remove_if_exists(&temporary)?;
+    copy_tree(&bundle.join("metadata"), &temporary.join("metadata"))?;
+    let support_library = bundle.join(&manifest.support_library);
+    if !support_library.is_file() {
+        return Err(format!(
+            "接口包缺少 Rust 支持归档: {}",
+            support_library.display()
+        ));
+    }
+    fs::copy(&support_library, temporary.join(&manifest.support_library))
+        .map_err(|err| format!("复制目标 Rust 支持归档失败: {err}"))?;
+    let import_library = bundle.join(&manifest.import_library);
+    if !import_library.is_file() {
+        return Err(format!(
+            "接口包缺少内核导入库: {}",
+            import_library.display()
+        ));
+    }
+    fs::copy(&import_library, temporary.join(&manifest.import_library))
+        .map_err(|err| format!("复制目标内核导入库失败: {err}"))?;
+    fs::copy(bundle.join("manifest.txt"), temporary.join("manifest.txt"))
+        .map_err(|err| format!("复制目标接口清单失败: {err}"))?;
+    remove_if_exists(&destination)?;
+    fs::rename(&temporary, &destination).map_err(|err| format!("安装目标接口包失败: {err}"))?;
+
+    let identity = bundle
+        .join("framework/kernel-symbols")
+        .join(format!("interface.identity.{target}"));
+    if !identity.is_file() {
+        return Err(format!("接口包缺少身份文件: {}", identity.display()));
+    }
+    fs::copy(
+        &identity,
+        project
+            .join(".elm/framework/kernel-symbols")
+            .join(format!("interface.identity.{target}")),
+    )
+    .map_err(|err| format!("安装 kernel-symbols 接口身份失败: {err}"))?;
+    fs::copy(
+        identity,
+        project
+            .join(".elm/framework/kernel-symbols")
+            .join("interface.identity"),
+    )
+    .map_err(|err| format!("安装 host LSP 接口身份失败: {err}"))?;
+    Ok(())
+}
+
+fn ensure_existing_interface_coherence(
+    project: &Path,
+    target: &str,
+    interface_hash: [u8; 32],
+) -> Result<(), String> {
+    let root = project.join(".elm/kernel-interface");
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(&root).map_err(|err| format!("读取 {} 失败: {err}", root.display()))?
+    {
+        let entry = entry.map_err(|err| format!("读取目标接口目录项失败: {err}"))?;
+        if entry.file_name() == target || !entry.path().is_dir() {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.txt");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let existing = KernelInterfaceManifest::load(&manifest_path)?;
+        if existing.interface_hash != interface_hash {
+            return Err(format!(
+                "目标 {target} 与已安装目标 {} 的规范接口摘要不一致；必须整体同步接口包",
+                existing.target
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn install_lsp_source(
+    project: &Path,
+    bundle: &Path,
+    manifest: &KernelInterfaceManifest,
+    force: bool,
+) -> Result<(), String> {
+    let source = bundle.join("kernel-source");
+    let source_hash = lsp_source_interface_hash(&source)?
+        .ok_or_else(|| format!("接口包缺少有效的 LSP 源码投影身份: {}", source.display()))?;
+    if source_hash != manifest.interface_hash {
+        return Err(format!(
+            "接口包 LSP 源码投影与清单摘要不一致: {}",
+            bundle.display()
+        ));
+    }
+    let destination = project.join(".elm/kernel-source");
+    if !force && lsp_source_interface_hash(&destination)? == Some(source_hash) {
+        return Ok(());
+    }
+    let elm_root = project.join(".elm");
+    fs::create_dir_all(&elm_root)
+        .map_err(|err| format!("创建 {} 失败: {err}", elm_root.display()))?;
+    let temporary = elm_root.join(format!("kernel-source.tmp.{}", std::process::id()));
+    let backup = elm_root.join(format!("kernel-source.old.{}", std::process::id()));
+    remove_if_exists(&temporary)?;
+    remove_if_exists(&backup)?;
+    copy_tree(&source, &temporary)?;
+    if destination.exists() {
+        fs::rename(&destination, &backup).map_err(|err| {
+            format!(
+                "备份 LSP 源码投影 {} -> {} 失败: {err}",
+                destination.display(),
+                backup.display()
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&temporary, &destination) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        return Err(format!("原子安装 LSP 源码投影失败: {err}"));
+    }
+    remove_if_exists(&backup)?;
+    Ok(())
+}
+
+fn lsp_source_interface_hash(source: &Path) -> Result<Option<[u8; 32]>, String> {
+    let identity = source.join(LSP_SOURCE_IDENTITY_FILE);
+    if !identity.is_file() {
+        return Ok(None);
+    }
+    let input = fs::read_to_string(&identity)
+        .map_err(|err| format!("读取 {} 失败: {err}", identity.display()))?;
+    let mut lines = input.lines();
+    if lines.next() != Some(LSP_SOURCE_MAGIC) {
+        return Err(format!(
+            "{} 不是有效的 LSP 源码投影身份",
+            identity.display()
+        ));
+    }
+    let mut interface_hash = None;
+    let mut packages = None;
+    for line in lines {
+        if let Some(value) = line.strip_prefix("interface_sha256=") {
+            interface_hash = Some(parse_sha256(value)?);
+        } else if let Some(value) = line.strip_prefix("packages=") {
+            packages = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("{} 的 packages 字段无效", identity.display()))?,
+            );
+        } else if !line.is_empty() {
+            return Err(format!("{} 包含未知字段: {line}", identity.display()));
+        }
+    }
+    if packages == Some(0) || packages.is_none() {
+        return Err(format!("{} 缺少有效 packages 字段", identity.display()));
+    }
+    Ok(Some(interface_hash.ok_or_else(|| {
+        format!("{} 缺少 interface_sha256", identity.display())
+    })?))
+}
+
+fn parse_sha256(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("LSP 源码投影摘要必须包含 64 个十六进制字符".to_string());
+    }
+    let mut output = [0u8; 32];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| "LSP 源码投影摘要包含非十六进制字符".to_string())?;
+    }
+    Ok(output)
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), String> {
@@ -386,23 +703,10 @@ fn write_new(path: &Path, contents: &str) -> Result<(), String> {
 fn cargo_toml(name: &str, kind: &str) -> String {
     let features = elm_features(kind);
     format!(
-        r#"[workspace]
-resolver = "2"
-members = [
-    ".",
-    ".elm/framework/elm",
-    ".elm/framework/elm/macros",
-    ".elm/framework/kernel-api",
-]
-
-[workspace.package]
+        r#"[package]
+name = "{name}"
 version = "0.1.0"
 edition = "2024"
-
-[package]
-name = "{name}"
-version.workspace = true
-edition.workspace = true
 
 [[bin]]
 name = "{name}"
@@ -410,15 +714,23 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+default = ["elm-lsp"]
+elm-lsp = ["allocator/lsp", "general/lsp"]
+
 [dependencies]
 elm = {{ path = ".elm/framework/elm", default-features = false, features = [{features}] }}
-kernel-api = {{ path = ".elm/framework/kernel-api", default-features = false, features = ["module"] }}
+allocator = {{ path = ".elm/framework/allocator", default-features = false }}
+general = {{ path = ".elm/framework/general", default-features = false }}
 
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = false
 strip = false
+
+[profile.dev]
+panic = "abort"
 "#
     )
 }
@@ -444,7 +756,8 @@ extern crate alloc;
 use alloc::{{boxed::Box, string::String, sync::Arc, vec::Vec}};
 use elm::{{ElmModule, HookError, HookResult, LifecycleContext}};
 
-kernel_api::elm_global_allocator!();
+use allocator as _;
+use general as _;
 
 struct Module;
 
@@ -492,12 +805,17 @@ fn elm_features(kind: &str) -> &'static str {
 fn migrate_cargo_manifest(path: &Path, kind: &str) -> Result<(), String> {
     let input =
         fs::read_to_string(path).map_err(|err| format!("读取 {} 失败: {err}", path.display()))?;
-    let mut output = input
-        .replace("    \".elm/framework/elmmgr\",\n", "")
-        .replace("elmmgr = { path = \".elm/framework/elmmgr\" }\n", "");
+    let mut output = remove_retired_standard_manifest_lines(&input);
+    output = migrate_standard_root_workspace(&output)?;
     if output.contains("elmmgr") {
         return Err(format!(
             "{} 仍包含定制化 elmmgr 依赖或路径；ELM v1 只允许 elm::runtime 和 elm::management，请手动移除后重试",
+            path.display()
+        ));
+    }
+    if output.contains("kernel-api") || output.contains("kernel_api") {
+        return Err(format!(
+            "{} 仍包含定制化 kernel-api 依赖或路径；ELM v1 已改用 allocator/general 直接符号门面，请手动迁移后重试",
             path.display()
         ));
     }
@@ -525,31 +843,327 @@ fn migrate_cargo_manifest(path: &Path, kind: &str) -> Result<(), String> {
         ));
     }
 
-    if !output.contains(".elm/framework/kernel-api") {
-        output = output.replace(
-            "    \".elm/framework/elm/macros\",\n",
-            "    \".elm/framework/elm/macros\",\n    \".elm/framework/kernel-api\",\n",
-        );
-        let dependency = "kernel-api = { path = \".elm/framework/kernel-api\", default-features = false, features = [\"module\"] }";
-        if output.contains(desired) {
-            output = output.replace(desired, format!("{desired}\n{dependency}").as_str());
-        } else {
-            let dependencies = "[dependencies]\n";
-            if output.contains(dependencies) {
-                output = output.replace(
-                    dependencies,
-                    format!("{dependencies}{dependency}\n").as_str(),
-                );
-            } else {
-                return Err(format!("{} 缺少 [dependencies]", path.display()));
-            }
-        }
-    }
+    output = ensure_facade_dependency(&output, "allocator")?;
+    output = ensure_facade_dependency(&output, "general")?;
+    output = ensure_lsp_feature(&output)?;
+    output = ensure_profile_dev_abort(&output);
 
     if output != input {
         fs::write(path, output).map_err(|err| format!("迁移 {} 失败: {err}", path.display()))?;
     }
     Ok(())
+}
+
+fn remove_retired_standard_manifest_lines(input: &str) -> String {
+    let trailing_newline = input.ends_with('\n');
+    let mut lines = input
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            !matches!(
+                line,
+                "\".elm/framework/elmmgr\","
+                    | "\".elm/framework/kernel-api\","
+                    | "elmmgr = { path = \".elm/framework/elmmgr\" }"
+                    | "kernel-api = { path = \".elm/framework/kernel-api\" }"
+                    | "kernel-api = { path = \".elm/framework/kernel-api\", default-features = false, features = [\"module\"] }"
+                    | "exclude = [\".elm/kernel-source\"]"
+                    | "exclude = [\".elm/kernel-source/**\"]"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if trailing_newline {
+        lines.push('\n');
+    }
+    lines
+}
+
+fn migrate_standard_root_workspace(input: &str) -> Result<String, String> {
+    let trailing_newline = input.ends_with('\n');
+    let mut lines = input.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(workspace) = manifest_section_range(&lines, "[workspace]") else {
+        if lines.iter().any(|line| {
+            let line = line.trim();
+            line.starts_with("[workspace.") && line.ends_with(']')
+        }) {
+            return Err("Cargo.toml 存在脱离根 workspace 的 workspace 子节".to_string());
+        }
+        return Ok(replace_workspace_package_inheritance(
+            input, "0.1.0", "2024",
+        ));
+    };
+
+    for line in &lines[workspace.0 + 1..workspace.1] {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line == "]" {
+            continue;
+        }
+        if let Some((key, _)) = line.split_once('=') {
+            if !matches!(key.trim(), "resolver" | "members" | "exclude") {
+                return Err(format!(
+                    "ELM 根 Cargo.toml 使用了自定义 workspace 字段 {}；无法自动迁移为独立 package",
+                    key.trim()
+                ));
+            }
+            continue;
+        }
+        if let Some(member) = line
+            .strip_prefix('"')
+            .and_then(|line| line.split_once('"').map(|(member, _)| member))
+        {
+            if !matches!(
+                member,
+                "." | ".elm/framework/elm"
+                    | ".elm/framework/elm/macros"
+                    | ".elm/framework/kernel-symbols"
+                    | ".elm/framework/kernel-symbols/macros"
+                    | ".elm/framework/allocator"
+                    | ".elm/framework/general"
+            ) {
+                return Err(format!(
+                    "ELM 根 Cargo.toml 包含自定义 workspace member {member}；请先把 ELM package 与仓库 workspace 分离"
+                ));
+            }
+            continue;
+        }
+        return Err(format!("无法识别 ELM 根 workspace 行: {line}"));
+    }
+
+    let workspace_package = manifest_section_range(&lines, "[workspace.package]");
+    if lines.iter().any(|line| {
+        let line = line.trim();
+        line.starts_with("[workspace.") && line.ends_with(']') && line != "[workspace.package]"
+    }) {
+        return Err("ELM 根 Cargo.toml 包含自定义 workspace 子节；无法安全自动迁移".to_string());
+    }
+    let version = workspace_package
+        .and_then(|range| manifest_string_assignment(&lines[range.0 + 1..range.1], "version"))
+        .unwrap_or_else(|| "0.1.0".to_string());
+    let edition = workspace_package
+        .and_then(|range| manifest_string_assignment(&lines[range.0 + 1..range.1], "edition"))
+        .unwrap_or_else(|| "2024".to_string());
+
+    let mut ranges = vec![workspace];
+    if let Some(range) = workspace_package {
+        ranges.push(range);
+    }
+    ranges.sort_by_key(|range| core::cmp::Reverse(range.0));
+    for (start, end) in ranges {
+        lines.drain(start..end);
+        while lines.get(start).is_some_and(|line| line.trim().is_empty())
+            && start > 0
+            && lines
+                .get(start - 1)
+                .is_some_and(|line| line.trim().is_empty())
+        {
+            lines.remove(start);
+        }
+    }
+    let mut output = lines.join("\n");
+    if trailing_newline {
+        output.push('\n');
+    }
+    Ok(replace_workspace_package_inheritance(
+        &output, &version, &edition,
+    ))
+}
+
+fn manifest_section_range(lines: &[String], header: &str) -> Option<(usize, usize)> {
+    let start = lines.iter().position(|line| line.trim() == header)?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| {
+            let line = line.trim();
+            line.starts_with('[') && line.ends_with(']')
+        })
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    Some((start, end))
+}
+
+fn manifest_string_assignment(lines: &[String], key: &str) -> Option<String> {
+    for line in lines {
+        let Some((candidate, value)) = line.split_once('=') else {
+            continue;
+        };
+        if candidate.trim() != key {
+            continue;
+        }
+        let value = value.trim();
+        return value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .map(str::to_string);
+    }
+    None
+}
+
+fn replace_workspace_package_inheritance(input: &str, version: &str, edition: &str) -> String {
+    input
+        .replace(
+            "version.workspace = true",
+            &format!("version = {version:?}"),
+        )
+        .replace(
+            "edition.workspace = true",
+            &format!("edition = {edition:?}"),
+        )
+}
+
+fn ensure_facade_dependency(input: &str, name: &str) -> Result<String, String> {
+    let path = format!(".elm/framework/{name}");
+    let desired = format!("{name} = {{ path = {path:?}, default-features = false }}");
+    let trailing_newline = input.ends_with('\n');
+    let mut lines = input.lines().map(str::to_string).collect::<Vec<_>>();
+    let matches = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.split_once('=')
+                .filter(|(key, _)| key.trim() == name)
+                .map(|_| index)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        return Err(format!("Cargo.toml 重复定义 {name} 依赖"));
+    }
+    if let Some(index) = matches.first().copied() {
+        if !lines[index].contains(&path) {
+            return Err(format!(
+                "Cargo.toml 使用了定制化 {name} 依赖；ELM 直接符号接口必须来自 {path}"
+            ));
+        }
+        if lines[index].contains("default-features = true") {
+            lines[index] =
+                lines[index].replace("default-features = true", "default-features = false");
+        } else if !lines[index].contains("default-features = false") {
+            let line = lines[index].clone();
+            let brace = line
+                .rfind('}')
+                .ok_or_else(|| format!("{name} path dependency 必须使用内联表"))?;
+            let prefix = line[..brace].trim_end();
+            let suffix = &line[brace..];
+            lines[index] = format!("{prefix}, default-features = false {suffix}");
+        }
+    } else {
+        let dependencies = manifest_section_range(&lines, "[dependencies]")
+            .ok_or_else(|| "Cargo.toml 缺少 [dependencies]".to_string())?;
+        lines.insert(dependencies.0 + 1, desired);
+    }
+    let mut output = lines.join("\n");
+    if trailing_newline {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn ensure_lsp_feature(input: &str) -> Result<String, String> {
+    const LSP_FEATURE: &str = "elm-lsp = [\"allocator/lsp\", \"general/lsp\"]";
+
+    let trailing_newline = input.ends_with('\n');
+    let mut lines = input.lines().map(str::to_string).collect::<Vec<_>>();
+    let features = if let Some(features) = manifest_section_range(&lines, "[features]") {
+        features
+    } else {
+        let dependencies = manifest_section_range(&lines, "[dependencies]")
+            .ok_or_else(|| "Cargo.toml 缺少 [dependencies]".to_string())?;
+        lines.splice(
+            dependencies.0..dependencies.0,
+            [
+                "[features]".to_string(),
+                "default = [\"elm-lsp\"]".to_string(),
+                LSP_FEATURE.to_string(),
+                String::new(),
+            ],
+        );
+        let mut output = lines.join("\n");
+        if trailing_newline {
+            output.push('\n');
+        }
+        return Ok(output);
+    };
+
+    let section = &lines[features.0 + 1..features.1];
+    if let Some(line) = section.iter().find(|line| {
+        line.split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "elm-lsp")
+    }) {
+        if !line.contains("allocator/lsp") || !line.contains("general/lsp") {
+            return Err(
+                "Cargo.toml 的 elm-lsp feature 未同时启用 allocator/lsp 与 general/lsp".to_string(),
+            );
+        }
+    } else {
+        lines.insert(features.0 + 1, LSP_FEATURE.to_string());
+    }
+
+    let features = manifest_section_range(&lines, "[features]").unwrap();
+    if let Some(index) = lines[features.0 + 1..features.1]
+        .iter()
+        .position(|line| {
+            line.split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "default")
+        })
+        .map(|offset| features.0 + 1 + offset)
+    {
+        if !lines[index].contains("\"elm-lsp\"") {
+            let (key, value) = lines[index]
+                .split_once('=')
+                .ok_or_else(|| "Cargo.toml 的 default feature 定义无效".to_string())?;
+            let value = value.trim();
+            let contents = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .ok_or_else(|| "Cargo.toml 的 default feature 必须使用单行数组".to_string())?
+                .trim();
+            lines[index] = if contents.is_empty() {
+                format!("{} = [\"elm-lsp\"]", key.trim())
+            } else {
+                format!("{} = [{contents}, \"elm-lsp\"]", key.trim())
+            };
+        }
+    } else {
+        lines.insert(features.0 + 1, "default = [\"elm-lsp\"]".to_string());
+    }
+
+    let mut output = lines.join("\n");
+    if trailing_newline {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn ensure_profile_dev_abort(input: &str) -> String {
+    let trailing_newline = input.ends_with('\n');
+    let mut lines = input.lines().map(str::to_string).collect::<Vec<_>>();
+    if let Some(profile) = lines.iter().position(|line| line.trim() == "[profile.dev]") {
+        let section_end = lines[profile + 1..]
+            .iter()
+            .position(|line| {
+                let line = line.trim();
+                line.starts_with('[') && line.ends_with(']')
+            })
+            .map_or(lines.len(), |offset| profile + 1 + offset);
+        if let Some(relative) = lines[profile + 1..section_end]
+            .iter()
+            .position(|line| line.trim_start().starts_with("panic"))
+        {
+            lines[profile + 1 + relative] = "panic = \"abort\"".to_string();
+        } else {
+            lines.insert(profile + 1, "panic = \"abort\"".to_string());
+        }
+    } else {
+        if !lines.last().is_some_and(|line| line.is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push("[profile.dev]".to_string());
+        lines.push("panic = \"abort\"".to_string());
+    }
+    let mut output = lines.join("\n");
+    if trailing_newline {
+        output.push('\n');
+    }
+    output
 }
 
 fn strip_comment(line: &str) -> Result<&str, String> {
@@ -707,6 +1321,12 @@ rustflags = [
 ]
 "#;
 
+const ELM_RUST_TOOLCHAIN: &str = r#"[toolchain]
+channel = "nightly-2025-05-20"
+profile = "minimal"
+targets = ["loongarch64-unknown-none", "riscv64gc-unknown-none-elf"]
+"#;
+
 const ELM_LINKER_SCRIPT: &str = r#"ENTRY(__elm_module_entry_v1)
 
 PHDRS
@@ -737,13 +1357,22 @@ SECTIONS
     {
         KEEP(*(.rela.dyn))
     } :rodata
+    .rela.plt : ALIGN(8) { KEEP(*(.rela.plt)) } :rodata
+
+    .dynsym : ALIGN(8) { KEEP(*(.dynsym)) } :rodata
+    .dynstr : ALIGN(1) { KEEP(*(.dynstr)) } :rodata
+    .hash : ALIGN(8) { KEEP(*(.hash)) } :rodata
+    .gnu.hash : ALIGN(8) { KEEP(*(.gnu.hash)) } :rodata
 
     . = ALIGN(4096);
     .data :
     {
         *(.data .data.* .sdata .sdata.*)
         *(.got .got.*)
+        *(.got.plt)
     } :data
+
+    .dynamic : ALIGN(8) { KEEP(*(.dynamic)) } :data
 
     .bss (NOLOAD) :
     {
@@ -762,11 +1391,6 @@ SECTIONS
         *(.note.gnu.build-id)
         *(.gnu_debuglink)
         *(.interp)
-        *(.dynamic)
-        *(.dynsym)
-        *(.dynstr)
-        *(.hash)
-        *(.gnu.hash)
     }
 }
 "#;
@@ -853,11 +1477,24 @@ uri = "forbidden"
         let service_cargo = fs::read_to_string(service.path().join("Cargo.toml")).unwrap();
         let service_source = fs::read_to_string(service.path().join("src/main.rs")).unwrap();
         assert!(service_cargo.contains("features = [\"module\", \"macros\"]"));
-        assert!(service_cargo.contains(".elm/framework/kernel-api"));
-        assert!(service_cargo.contains("kernel-api ="));
+        assert!(!service_cargo.contains("[workspace]"));
+        assert!(service_cargo.contains("default = [\"elm-lsp\"]"));
+        assert!(service_cargo.contains("elm-lsp = [\"allocator/lsp\", \"general/lsp\"]"));
+        assert!(service_cargo.contains(".elm/framework/allocator"));
+        assert!(service_cargo.contains(".elm/framework/general"));
+        assert!(service_cargo.contains("[profile.dev]\npanic = \"abort\""));
+        assert!(service_cargo.contains(
+            "allocator = { path = \".elm/framework/allocator\", default-features = false }"
+        ));
+        assert!(
+            service_cargo.contains(
+                "general = { path = \".elm/framework/general\", default-features = false }"
+            )
+        );
         assert!(!service_cargo.contains("management"));
         assert!(!service_cargo.contains("elmmgr"));
-        assert!(service_source.contains("kernel_api::elm_global_allocator!()"));
+        assert!(service_source.contains("use allocator as _;"));
+        assert!(service_source.contains("use general as _;"));
         assert!(service_source.contains("extern crate alloc"));
         assert!(service_source.contains("Vec::new()"));
         assert!(service_source.contains("Box::new"));
@@ -875,9 +1512,16 @@ uri = "forbidden"
         assert!(
             service
                 .path()
-                .join(".elm/framework/kernel-api/Cargo.toml")
+                .join(".elm/framework/allocator/Cargo.toml")
                 .is_file()
         );
+        assert!(
+            service
+                .path()
+                .join(".elm/framework/general/Cargo.toml")
+                .is_file()
+        );
+        assert!(service.path().join(".elm/framework/Cargo.toml").is_file());
         assert!(!service.path().join(".elm/framework/elmmgr").exists());
 
         let manager = TestDirectory::new("manager-project");
@@ -889,7 +1533,7 @@ uri = "forbidden"
     }
 
     #[test]
-    fn migrates_only_the_retired_standard_elmmgr_layout() {
+    fn migrates_only_the_retired_standard_framework_layouts() {
         let directory = TestDirectory::new("legacy-migration");
         let manifest = directory.path().join("Cargo.toml");
         fs::write(
@@ -897,23 +1541,32 @@ uri = "forbidden"
             r#"[workspace]
 members = [
     ".",
-    ".elm/framework/elm",
-    ".elm/framework/elm/macros",
-    ".elm/framework/elmmgr",
-]
+	    ".elm/framework/elm",
+	    ".elm/framework/elm/macros",
+	    ".elm/framework/elmmgr",
+	    ".elm/framework/kernel-api",
+	]
 
-[dependencies]
-elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
-elmmgr = { path = ".elm/framework/elmmgr" }
-"#,
+	[dependencies]
+	elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
+	elmmgr = { path = ".elm/framework/elmmgr" }
+	kernel-api = { path = ".elm/framework/kernel-api", default-features = false, features = ["module"] }
+	"#,
         )
         .unwrap();
         migrate_cargo_manifest(&manifest, "manager").unwrap();
         let migrated = fs::read_to_string(&manifest).unwrap();
         assert!(!migrated.contains("elmmgr"));
+        assert!(!migrated.contains("kernel-api"));
         assert!(migrated.contains("features = [\"module\", \"macros\", \"management\"]"));
-        assert!(migrated.contains(".elm/framework/kernel-api"));
-        assert!(migrated.contains("kernel-api ="));
+        assert!(migrated.contains(".elm/framework/allocator"));
+        assert!(migrated.contains(".elm/framework/general"));
+        assert!(migrated.contains("allocator ="));
+        assert!(migrated.contains("general ="));
+        assert!(!migrated.contains("[workspace]"));
+        assert!(migrated.contains("default = [\"elm-lsp\"]"));
+        assert!(migrated.contains("elm-lsp = [\"allocator/lsp\", \"general/lsp\"]"));
+        assert!(migrated.contains("default-features = false"));
 
         fs::write(
             &manifest,
@@ -929,6 +1582,22 @@ elmmgr = { path = "custom/elmmgr" }
             fs::read_to_string(&manifest)
                 .unwrap()
                 .contains("custom/elmmgr")
+        );
+
+        fs::write(
+            &manifest,
+            r#"[dependencies]
+elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
+kernel-api = { path = "custom/kernel-api" }
+"#,
+        )
+        .unwrap();
+        let error = migrate_cargo_manifest(&manifest, "service").unwrap_err();
+        assert!(error.contains("定制化 kernel-api"));
+        assert!(
+            fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("custom/kernel-api")
         );
     }
 
@@ -957,5 +1626,71 @@ elm = { path = "custom/elm", default-features = false, features = ["module", "ma
         .unwrap();
         let error = migrate_cargo_manifest(&manifest, "manager").unwrap_err();
         assert!(error.contains("Manager 工程未启用 management feature"));
+    }
+
+    #[test]
+    fn parses_lsp_source_identity_and_rejects_unknown_fields() {
+        let directory = TestDirectory::new("lsp-source-identity");
+        let source = directory.path().join("kernel-source");
+        fs::create_dir_all(&source).unwrap();
+        let digest = [0x5au8; 32];
+        fs::write(
+            source.join(LSP_SOURCE_IDENTITY_FILE),
+            format!(
+                "{LSP_SOURCE_MAGIC}\ninterface_sha256={}\npackages=3\n",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        assert_eq!(lsp_source_interface_hash(&source).unwrap(), Some(digest));
+
+        fs::write(
+            source.join(LSP_SOURCE_IDENTITY_FILE),
+            format!(
+                "{LSP_SOURCE_MAGIC}\ninterface_sha256={}\npackages=3\nunknown=1\n",
+                digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        assert!(
+            lsp_source_interface_hash(&source)
+                .unwrap_err()
+                .contains("未知字段")
+        );
+    }
+
+    #[test]
+    fn migration_enforces_abort_for_host_lsp_checks() {
+        let inserted = ensure_profile_dev_abort("[package]\nname = \"demo\"\n");
+        assert!(inserted.contains("[profile.dev]\npanic = \"abort\""));
+
+        let replaced = ensure_profile_dev_abort(
+            "[package]\nname = \"demo\"\n\n[profile.dev]\npanic = \"unwind\"\n",
+        );
+        assert!(replaced.contains("[profile.dev]\npanic = \"abort\""));
+        assert!(!replaced.contains("unwind"));
+    }
+
+    #[test]
+    fn migration_rejects_custom_root_workspace_members() {
+        let input = r#"[workspace]
+members = [
+    ".",
+    "helper",
+]
+
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2024"
+"#;
+        let error = migrate_standard_root_workspace(input).unwrap_err();
+        assert!(error.contains("自定义 workspace member helper"));
     }
 }

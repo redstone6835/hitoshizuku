@@ -101,8 +101,8 @@ use elm_model::{
     ElmTrustAcceptance, ElmTrustAnchor, ElmTrustError, ElmTrustRuntimeInfoV1, ElmTrustStore,
     ElmVersion, ExtensionEdge, FlowContract, FlowDirection, FlowMode, Generation, LeaseId,
     LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, first_lifecycle_reason, kernel_api_manifest_v1, planned_final_state,
-    state_code, status_from_blockers,
+    builtin_port_descriptors, first_lifecycle_reason, kernel_interface_manifest_v1,
+    planned_final_state, state_code, status_from_blockers,
 };
 use elm_model::{
     ELM_AUDIT_AUTHORITY_ANCESTOR, ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER,
@@ -206,7 +206,6 @@ static ELM_RUNTIME_NAMESPACE_V1: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDe
     ELM_API_NAMESPACE_FLAG_PUBLIC,
     ELM_API_FEATURES_V1,
     &ELM_RUNTIME_API_V1,
-    [0; 32],
 );
 
 static ELM_MANAGEMENT_NAMESPACE_V1: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDescriptorV1::new(
@@ -215,7 +214,6 @@ static ELM_MANAGEMENT_NAMESPACE_V1: ElmApiNamespaceDescriptorV1 = ElmApiNamespac
     ELM_API_NAMESPACE_FLAG_MANAGEMENT,
     ELM_CELL_POLICY_ALLOW_MANAGEMENT as u64,
     &ELM_MANAGEMENT_API_V1,
-    [0; 32],
 );
 
 pub(crate) trait ElmLifecycleExecutor {
@@ -330,13 +328,13 @@ impl PreparedImageTrust {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct KernelApiGrantRequest {
+pub(crate) struct KernelSymbolAuthorization {
     requested: bool,
     authority: u32,
     authority_id: u64,
 }
 
-impl KernelApiGrantRequest {
+impl KernelSymbolAuthorization {
     pub(crate) const fn none() -> Self {
         Self {
             requested: false,
@@ -546,8 +544,18 @@ struct KernelSymbolImportRuntime {
     min_version: u32,
     max_version: u32,
     selected_version: u32,
+    kind: u8,
+    capabilities: u64,
+    descriptor_flags: u32,
+    retained_argument_mask: u64,
     rust_abi_hash: [u8; 32],
     address: usize,
+}
+
+fn required_kernel_symbol_capabilities(imports: &[KernelSymbolImportRuntime]) -> u64 {
+    imports.iter().fold(0u64, |capabilities, import| {
+        capabilities | import.capabilities
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -929,6 +937,7 @@ struct NativeLoadExecutionPlan {
     loaded: LoadedElmImage,
     exports: Vec<NativeExportRuntime>,
     kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
+    kernel_symbol_capabilities: u64,
     import_stage: NativeImportStageKey,
     initialize: ElmContext,
     trust: PreparedImageTrust,
@@ -965,6 +974,7 @@ struct NativeReplaceExecutionPlan {
     loaded: LoadedElmImage,
     exports: Vec<NativeExportRuntime>,
     kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
+    kernel_symbol_capabilities: u64,
     import_stage: NativeImportStageKey,
     old_executor: NativeHookExecutor,
     new_executor: NativeHookExecutor,
@@ -1976,8 +1986,8 @@ impl ElmCore {
                 != 0
             || fingerprint.rustc_commit_hash != sha256(env!("ELM_RUSTC_VERSION").as_bytes())
             || fingerprint.target_spec_hash != expected_target_spec_hash(image.unit.target.arch)
-            || fingerprint.kernel_api_hash
-                != sha256(kernel_api_manifest_v1(image.unit.target.arch as u32).as_bytes())
+            || fingerprint.kernel_interface_hash
+                != sha256(kernel_interface_manifest_v1(image.unit.target.arch as u32).as_bytes())
         {
             return Err(ElmEbiLoadStatus::AbiFingerprintRejected);
         }
@@ -2014,22 +2024,51 @@ impl ElmCore {
         })
     }
 
-    fn kernel_api_grant_approval(
+    fn privileged_kernel_symbols_authorized(
         source: ElmEbiSourceKind,
-        request: KernelApiGrantRequest,
+        request: KernelSymbolAuthorization,
         trust: &PreparedImageTrust,
-    ) -> Option<super::api_registry::ApiGrantApproval> {
-        if let Some(approval) = super::api_registry::ApiGrantApproval::internal(source) {
-            return Some(approval);
+    ) -> bool {
+        if matches!(source, ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory) {
+            return true;
         }
-        if !request.requested || trust.unsigned || trust.acceptance.is_none() {
-            return None;
+        request.requested
+            && request.authority_id != 0
+            && matches!(
+                request.authority,
+                ELM_AUDIT_AUTHORITY_KERNEL
+                    | ELM_AUDIT_AUTHORITY_USER_ADMIN
+                    | ELM_AUDIT_AUTHORITY_MANAGER
+            )
+            && !trust.unsigned
+            && trust.acceptance.is_some()
+            && trust.signer_key_id != [0; 32]
+    }
+
+    fn kernel_symbol_capabilities_allowed(
+        &self,
+        cell: ElmId,
+        source: ElmEbiSourceKind,
+        request: KernelSymbolAuthorization,
+        trust: &PreparedImageTrust,
+        required: u64,
+    ) -> bool {
+        if required & !::kernel_symbols::capability::ALL != 0 {
+            return false;
         }
-        super::api_registry::ApiGrantApproval::signed_projection(
-            request.authority,
-            request.authority_id,
-            trust.signer_key_id,
-        )
+        let Some(cell) = self.cells.iter().find(|candidate| candidate.id == cell) else {
+            return false;
+        };
+        let ceiling = cell
+            .parent
+            .and_then(|parent| self.cells.iter().find(|candidate| candidate.id == parent))
+            .map(|parent| parent.cell_policy.kernel_symbol_capabilities)
+            .unwrap_or(::kernel_symbols::capability::ALL);
+        if required & !ceiling != 0 {
+            return false;
+        }
+        let privileged = required & !::kernel_symbols::capability::SAFE_DEFAULT;
+        privileged == 0 || Self::privileged_kernel_symbols_authorized(source, request, trust)
     }
 
     fn commit_image_trust(
@@ -2136,9 +2175,9 @@ impl ElmCore {
         if self.initialized {
             return Ok(());
         }
-        super::register_kernel_api_namespace(&ELM_RUNTIME_NAMESPACE_V1)
+        super::register_runtime_api_namespace(&ELM_RUNTIME_NAMESPACE_V1)
             .map_err(|_| ElmError::InvalidTransition)?;
-        super::register_kernel_api_namespace(&ELM_MANAGEMENT_NAMESPACE_V1)
+        super::register_runtime_api_namespace(&ELM_MANAGEMENT_NAMESPACE_V1)
             .map_err(|_| ElmError::InvalidTransition)?;
         if !super::resource_accounting::init()
             || !super::resource_accounting::register_cell(ELM_MGR_ID, ElmResourceBudget::ROOT)
@@ -2211,13 +2250,17 @@ impl ElmCore {
             lifecycle_initialized: true,
             lifecycle_finalized: false,
             resource_budget: ElmResourceBudget::ROOT,
-            cell_policy: ElmCellPolicyV1::new(
-                ELM_MGR_ID.0,
-                Generation::FIRST.0,
-                ELM_CELL_POLICY_ALLOW_ALL | ELM_CELL_POLICY_ALLOW_MANAGEMENT,
-                ELM_MGR_STATUS_OK,
-                0,
-            ),
+            cell_policy: {
+                let mut policy = ElmCellPolicyV1::new(
+                    ELM_MGR_ID.0,
+                    Generation::FIRST.0,
+                    ELM_CELL_POLICY_ALLOW_ALL | ELM_CELL_POLICY_ALLOW_MANAGEMENT,
+                    ELM_MGR_STATUS_OK,
+                    0,
+                );
+                policy.kernel_symbol_capabilities = ::kernel_symbols::capability::ALL;
+                policy
+            },
             policy_epoch: 1,
             active_executions: 0,
             exclusive_execution: false,
@@ -2263,13 +2306,17 @@ impl ElmCore {
             lifecycle_initialized: true,
             lifecycle_finalized: false,
             resource_budget: ElmResourceBudget::DEFAULT,
-            cell_policy: ElmCellPolicyV1::new(
-                ELM_EKI_ID.0,
-                Generation::FIRST.0,
-                ELM_CELL_POLICY_ALLOW_ALL,
-                ELM_MGR_STATUS_OK,
-                0,
-            ),
+            cell_policy: {
+                let mut policy = ElmCellPolicyV1::new(
+                    ELM_EKI_ID.0,
+                    Generation::FIRST.0,
+                    ELM_CELL_POLICY_ALLOW_ALL,
+                    ELM_MGR_STATUS_OK,
+                    0,
+                );
+                policy.kernel_symbol_capabilities = ::kernel_symbols::capability::ALL;
+                policy
+            },
             policy_epoch: 1,
             active_executions: 0,
             exclusive_execution: false,
@@ -2518,6 +2565,7 @@ impl ElmCore {
             || policy.extension_flags & !ELM_EXTENSION_POLICY_ALL != 0
             || policy.native_flags & !ELM_NATIVE_POLICY_ALL != 0
             || policy.resource_flags & !ELM_RESOURCE_POLICY_ALL != 0
+            || policy.kernel_symbol_capabilities & !::kernel_symbols::capability::ALL != 0
         {
             policy.status = ELM_MGR_STATUS_INVALID;
             policy.blockers = ELM_POLICY_BLOCK_INVALID_STATE;
@@ -6109,7 +6157,6 @@ impl ElmCore {
             parent,
             budget,
             false,
-            super::api_registry::ApiGrantApproval::internal(ElmEbiSourceKind::Memory),
             None,
         )
     }
@@ -6123,18 +6170,18 @@ impl ElmCore {
         budget: ElmResourceBudget,
         grant_management: bool,
     ) -> ElmLoadCellResponse {
-        self.load_declarative_ebi_image_from_source_under_parent_with_kernel_api_grant(
+        self.load_declarative_ebi_image_from_source_under_parent_with_symbol_authorization(
             image,
             arch,
             source,
             parent,
             budget,
             grant_management,
-            KernelApiGrantRequest::none(),
+            KernelSymbolAuthorization::none(),
         )
     }
 
-    pub(crate) fn load_declarative_ebi_image_from_source_under_parent_with_kernel_api_grant(
+    pub(crate) fn load_declarative_ebi_image_from_source_under_parent_with_symbol_authorization(
         &mut self,
         image: ElmEbiImage,
         arch: ElmEbiArch,
@@ -6142,7 +6189,7 @@ impl ElmCore {
         parent: ElmId,
         budget: ElmResourceBudget,
         grant_management: bool,
-        kernel_api_grant: KernelApiGrantRequest,
+        _symbol_authorization: KernelSymbolAuthorization,
     ) -> ElmLoadCellResponse {
         if let Err(status) = image.validate(arch) {
             return ElmLoadCellResponse::failed(status);
@@ -6162,7 +6209,6 @@ impl ElmCore {
             self.abort_image_trust(&trust);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::UntrustedImage);
         }
-        let kernel_api_approval = Self::kernel_api_grant_approval(source, kernel_api_grant, &trust);
         let response = self.load_ebi_unit_inner(
             image.unit,
             arch,
@@ -6170,7 +6216,6 @@ impl ElmCore {
             parent,
             budget,
             grant_management,
-            kernel_api_approval,
             None,
         );
         if response.status != ElmEbiLoadStatus::Ok as i32 {
@@ -6203,7 +6248,7 @@ impl ElmCore {
         parent: ElmId,
         budget: ElmResourceBudget,
         grant_management: bool,
-        kernel_api_grant: KernelApiGrantRequest,
+        symbol_authorization: KernelSymbolAuthorization,
     ) -> ElmLoadCellResponse {
         let plan = match self.prepare_native_load_execution(
             image,
@@ -6212,7 +6257,7 @@ impl ElmCore {
             parent,
             budget,
             grant_management,
-            kernel_api_grant,
+            symbol_authorization,
         ) {
             PreparedNativeLoad::Immediate(response) => return response,
             PreparedNativeLoad::Initialize(plan) => plan,
@@ -6259,7 +6304,7 @@ impl ElmCore {
         parent: ElmId,
         budget: ElmResourceBudget,
         grant_management: bool,
-        kernel_api_grant: KernelApiGrantRequest,
+        symbol_authorization: KernelSymbolAuthorization,
     ) -> PreparedNativeLoad {
         if let Err(status) = image.validate(arch) {
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(status));
@@ -6276,14 +6321,14 @@ impl ElmCore {
         }
         if !image.has_code_segment() {
             return PreparedNativeLoad::Immediate(
-                self.load_declarative_ebi_image_from_source_under_parent_with_kernel_api_grant(
+                self.load_declarative_ebi_image_from_source_under_parent_with_symbol_authorization(
                     image,
                     arch,
                     source,
                     parent,
                     budget,
                     grant_management,
-                    kernel_api_grant,
+                    symbol_authorization,
                 ),
             );
         }
@@ -6329,6 +6374,8 @@ impl ElmCore {
                     return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(status));
                 }
             };
+        let kernel_symbol_capabilities =
+            required_kernel_symbol_capabilities(&kernel_symbol_imports);
         if !self.native_exports_available(&image.unit) {
             return PreparedNativeLoad::Immediate(ElmLoadCellResponse::failed(
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -6390,28 +6437,6 @@ impl ElmCore {
                         ElmEbiLoadStatus::UntrustedImage,
                         id.0,
                         state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
-                        ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
-                    ));
-                }
-                let approval = Self::kernel_api_grant_approval(source, kernel_api_grant, &trust);
-                if let Err(err) = super::api_registry::grant_requirements(
-                    id,
-                    Generation::FIRST,
-                    &image.unit.kernel_api_requirements,
-                    approval,
-                ) {
-                    log::error!(
-                        "[elm] 待处理镜像 Kernel API 依赖拒绝 cell={} name={}: {:?}",
-                        id.0,
-                        name,
-                        err
-                    );
-                    self.abort_image_trust(&trust);
-                    self.quarantine_cell_after_hook_failure(id);
-                    return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
-                        ElmEbiLoadStatus::UntrustedImage,
-                        id.0,
-                        state_code(ElmState::Quarantined),
                         ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
                     ));
                 }
@@ -6536,18 +6561,18 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
             ));
         }
-        let approval = Self::kernel_api_grant_approval(source, kernel_api_grant, &trust);
-        if let Err(err) = super::api_registry::grant_requirements(
+        if !self.kernel_symbol_capabilities_allowed(
             id,
-            Generation::FIRST,
-            &image.unit.kernel_api_requirements,
-            approval,
+            source,
+            symbol_authorization,
+            &trust,
+            kernel_symbol_capabilities,
         ) {
             log::error!(
-                "[elm] 原生镜像 Kernel API 依赖拒绝 cell={} name={}: {:?}",
+                "[elm] 原生镜像内核符号能力拒绝 cell={} name={} capabilities=0x{:x}",
                 id.0,
                 name,
-                err
+                kernel_symbol_capabilities,
             );
             self.abort_image_trust(&trust);
             self.release_cell_execution(token);
@@ -6601,6 +6626,7 @@ impl ElmCore {
             loaded,
             exports,
             kernel_symbol_imports,
+            kernel_symbol_capabilities,
             import_stage,
             initialize,
             trust,
@@ -6706,6 +6732,7 @@ impl ElmCore {
         self.kernel_symbol_imports
             .extend(plan.kernel_symbol_imports);
         if let Some(cell) = self.cells.iter_mut().find(|cell| cell.id == plan.id) {
+            cell.cell_policy.kernel_symbol_capabilities = plan.kernel_symbol_capabilities;
             cell.ebi_status = ElmEbiLoadStatus::Ok;
             cell.lifecycle_executor_ready = true;
             cell.lifecycle_initialized = true;
@@ -6770,7 +6797,7 @@ impl ElmCore {
         arch: ElmEbiArch,
         migration_limit: u32,
         source: ElmEbiSourceKind,
-        kernel_api_grant: KernelApiGrantRequest,
+        symbol_authorization: KernelSymbolAuthorization,
     ) -> PreparedNativeReplace {
         let old_state = self.cell_state(id).unwrap_or(ElmState::Retired);
         let old_generation = self
@@ -6781,13 +6808,13 @@ impl ElmCore {
             .unwrap_or(Generation(0));
         if !image.has_code_segment() {
             return PreparedNativeReplace::Immediate(
-                self.replace_declarative_cell_from_ebi_image_with_source_and_kernel_api_grant(
+                self.replace_declarative_cell_from_ebi_image_with_source_and_symbol_authorization(
                     id,
                     image,
                     arch,
                     migration_limit,
                     source,
-                    kernel_api_grant,
+                    symbol_authorization,
                 ),
             );
         }
@@ -6958,6 +6985,8 @@ impl ElmCore {
                     ));
                 }
             };
+        let kernel_symbol_capabilities =
+            required_kernel_symbol_capabilities(&kernel_symbol_imports);
         if !self.replace_surface_compatible(id, &image.unit, &topology) {
             return PreparedNativeReplace::Immediate(self.replace_response(
                 id,
@@ -7235,18 +7264,13 @@ impl ElmCore {
                     ));
                 }
             };
-        if let Err(err) = super::api_registry::grant_requirements(
+        if !self.kernel_symbol_capabilities_allowed(
             id,
-            new_generation,
-            &image.unit.kernel_api_requirements,
-            Self::kernel_api_grant_approval(source, kernel_api_grant, &trust),
+            source,
+            symbol_authorization,
+            &trust,
+            kernel_symbol_capabilities,
         ) {
-            log::error!(
-                "[elm] 替换镜像 Kernel API 依赖拒绝 cell={} generation={}: {:?}",
-                id.0,
-                new_generation.0,
-                err
-            );
             self.discard_native_import_stage(import_stage);
             self.abort_image_trust(&trust);
             let sources_restored = self.resume_projection_sources_for_cell(id, old_generation);
@@ -7278,6 +7302,7 @@ impl ElmCore {
             loaded,
             exports,
             kernel_symbol_imports,
+            kernel_symbol_capabilities,
             import_stage,
             old_executor: self.native_images[old_image_index].lifecycle_executor(),
             new_executor,
@@ -7312,7 +7337,6 @@ impl ElmCore {
                 );
                 self.abort_image_trust(&plan.trust);
                 self.discard_native_import_stage(plan.import_stage);
-                super::api_registry::remove_generation(plan.id, plan.new_generation);
                 self.release_cell_execution(plan.token);
                 if !old_recovered || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
@@ -7344,7 +7368,6 @@ impl ElmCore {
                     plan.new_generation,
                 );
                 self.discard_native_import_stage(plan.import_stage);
-                super::api_registry::remove_generation(plan.id, plan.new_generation);
                 self.release_cell_execution(plan.token);
                 if !old_recovered || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
@@ -7372,6 +7395,7 @@ impl ElmCore {
                         &plan.loaded,
                         plan.exports,
                         plan.kernel_symbol_imports,
+                        plan.kernel_symbol_capabilities,
                         plan.import_stage,
                     )
                 },
@@ -7392,7 +7416,6 @@ impl ElmCore {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
                 self.discard_native_import_stage(plan.import_stage);
-                super::api_registry::remove_generation(plan.id, plan.new_generation);
                 self.release_cell_execution(plan.token);
                 return self.replace_response(
                     plan.id,
@@ -7417,7 +7440,6 @@ impl ElmCore {
                 );
             }
             self.retire_replaced_native_image(plan.id, plan.old_generation);
-            super::api_registry::remove_generation(plan.id, plan.old_generation);
             self.native_images.push(plan.loaded);
             self.release_cell_execution(plan.token);
             return self.replace_response(
@@ -7443,7 +7465,6 @@ impl ElmCore {
         );
         self.abort_image_trust(&plan.trust);
         self.discard_native_import_stage(plan.import_stage);
-        super::api_registry::remove_generation(plan.id, plan.new_generation);
         if !old_recovered || !sources_restored {
             self.quarantine_cell_after_hook_failure(plan.id);
         }
@@ -7485,24 +7506,24 @@ impl ElmCore {
         migration_limit: u32,
         source: ElmEbiSourceKind,
     ) -> ElmReplaceCellResponseV1 {
-        self.replace_declarative_cell_from_ebi_image_with_source_and_kernel_api_grant(
+        self.replace_declarative_cell_from_ebi_image_with_source_and_symbol_authorization(
             id,
             image,
             arch,
             migration_limit,
             source,
-            KernelApiGrantRequest::none(),
+            KernelSymbolAuthorization::none(),
         )
     }
 
-    pub(crate) fn replace_declarative_cell_from_ebi_image_with_source_and_kernel_api_grant(
+    pub(crate) fn replace_declarative_cell_from_ebi_image_with_source_and_symbol_authorization(
         &mut self,
         id: ElmId,
         image: ElmEbiImage,
         arch: ElmEbiArch,
         migration_limit: u32,
         source: ElmEbiSourceKind,
-        kernel_api_grant: KernelApiGrantRequest,
+        _symbol_authorization: KernelSymbolAuthorization,
     ) -> ElmReplaceCellResponseV1 {
         let old_state = self.cell_state(id).unwrap_or(ElmState::Retired);
         let old_generation = self
@@ -7643,28 +7664,7 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_UNTRUSTED_IMAGE,
             );
         }
-        if let Err(err) = super::api_registry::grant_requirements(
-            id,
-            new_generation,
-            &image.unit.kernel_api_requirements,
-            Self::kernel_api_grant_approval(source, kernel_api_grant, &trust),
-        ) {
-            log::error!(
-                "[elm] 声明式替换 Kernel API 依赖拒绝 cell={} generation={}: {:?}",
-                id.0,
-                new_generation.0,
-                err
-            );
-            self.abort_image_trust(&trust);
-            return fail(
-                self,
-                ELM_MGR_STATUS_PERMISSION,
-                ELM_POLICY_BLOCK_CAPABILITY_DENIED,
-                first_lifecycle_reason(ELM_POLICY_BLOCK_CAPABILITY_DENIED),
-            );
-        }
         if !self.commit_replaced_declarative_cell(id, old_state, new_generation, &image.unit) {
-            super::api_registry::remove_generation(id, new_generation);
             self.abort_image_trust(&trust);
             return fail(
                 self,
@@ -7690,7 +7690,6 @@ impl ElmCore {
                 ELM_POLICY_BLOCK_RESOURCE_QUOTA,
             );
         }
-        super::api_registry::remove_generation(id, old_generation);
         self.replace_response(
             id,
             ELM_MGR_STATUS_OK,
@@ -7715,7 +7714,6 @@ impl ElmCore {
             ELM_MGR_ID,
             ElmResourceBudget::DEFAULT,
             false,
-            super::api_registry::ApiGrantApproval::internal(ElmEbiSourceKind::Memory),
             Some(executor),
         )
     }
@@ -7728,7 +7726,6 @@ impl ElmCore {
         parent: ElmId,
         budget: ElmResourceBudget,
         grant_management: bool,
-        kernel_api_approval: Option<super::api_registry::ApiGrantApproval>,
         mut executor: Option<&mut dyn ElmLifecycleExecutor>,
     ) -> ElmLoadCellResponse {
         if let Err(status) = unit.validate(arch) {
@@ -7768,22 +7765,6 @@ impl ElmCore {
             log::error!("[elm] EBI cell rejected by runtime: {:?}", err);
             return ElmLoadCellResponse::failed(ElmEbiLoadStatus::RuntimeRejected);
         }
-        if let Err(err) = super::api_registry::grant_requirements(
-            id,
-            Generation::FIRST,
-            &unit.kernel_api_requirements,
-            kernel_api_approval,
-        ) {
-            log::error!("[elm] Kernel API 依赖拒绝 cell={}: {:?}", id.0, err);
-            self.quarantine_cell_after_hook_failure(id);
-            return ElmLoadCellResponse::new(
-                ElmEbiLoadStatus::RuntimeRejected,
-                id.0,
-                state_code(ElmState::Quarantined),
-                ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
-            );
-        }
-
         if unit.has_native_code() {
             let requires_native_image_loader = unit_requires_native_image_loader(&unit);
             if self.cell_resource_over_quota(id, ElmResourceKind::PendingLoad) {
@@ -9676,17 +9657,19 @@ impl ElmCore {
                     && previous.contract == import.contract
                     && previous.selected_version == import.selected_version
             });
-            if !owner_current {
+            let resolved = super::kernel_symbols::matches_resolved(
+                &import.name,
+                import.contract.as_str(),
+                import.selected_version,
+                import.capabilities,
+                import.rust_abi_hash,
+                import.address,
+            );
+            if !owner_current || !resolved {
                 records.push(ElmCoreHealthRecord::invalid(
                     ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
                     import.owner.0,
                     ELM_HEALTH_DETAIL_DANGLING_REFERENCE,
-                ));
-            } else {
-                records.push(ElmCoreHealthRecord::invalid(
-                    ELM_HEALTH_CHECK_NATIVE_CAPABILITIES,
-                    import.owner.0,
-                    ELM_HEALTH_DETAIL_STATE_INVALID,
                 ));
             }
             if duplicate {
@@ -10325,7 +10308,7 @@ impl ElmCore {
         for import in &self.kernel_symbol_imports {
             out.push_str(
                 format!(
-                    "kernel_symbol_import owner={} generation={} name={} contract={} version_range={}..={} selected_version={} address=0x{:x}\n",
+                    "kernel_symbol_import owner={} generation={} name={} contract={} version_range={}..={} selected_version={} kind={} retained_args=0x{:x} address=0x{:x}\n",
                     import.owner.0,
                     import.owner_generation.0,
                     import.name,
@@ -10333,6 +10316,8 @@ impl ElmCore {
                     import.min_version,
                     import.max_version,
                     import.selected_version,
+                    import.kind,
+                    import.retained_argument_mask,
                     import.address,
                 )
                 .as_str(),
@@ -10926,7 +10911,7 @@ impl ElmCore {
         for import in &self.kernel_symbol_imports {
             out.push_str(
                 format!(
-                    "kernel_symbol_import owner={} generation={} name={} contract={} version_range={}..={} selected_version={} address=0x{:x}\n",
+                    "kernel_symbol_import owner={} generation={} name={} contract={} version_range={}..={} selected_version={} kind={} retained_args=0x{:x} address=0x{:x}\n",
                     import.owner.0,
                     import.owner_generation.0,
                     import.name,
@@ -10934,6 +10919,8 @@ impl ElmCore {
                     import.min_version,
                     import.max_version,
                     import.selected_version,
+                    import.kind,
+                    import.retained_argument_mask,
                     import.address,
                 )
                 .as_str(),
@@ -11701,6 +11688,8 @@ impl ElmCore {
         cell_policy.extension_flags = parent_policy.extension_flags;
         cell_policy.native_flags = parent_policy.native_flags;
         cell_policy.resource_flags = parent_policy.resource_flags;
+        cell_policy.kernel_symbol_capabilities =
+            parent_policy.kernel_symbol_capabilities & ::kernel_symbols::capability::SAFE_DEFAULT;
         self.cells.push(CellRuntime {
             id,
             parent: Some(parent),
@@ -12233,15 +12222,45 @@ impl ElmCore {
                 if elmapi_root {
                     return Err(ElmEbiLoadStatus::InvalidTarget);
                 }
-                log::error!(
-                    "[elm] kernel symbol backend is not installed: name={} contract={} versions={}..={} optional={}",
-                    import.name,
-                    import.contract.as_str(),
-                    import.min_version,
-                    import.max_version,
-                    import.is_optional()
-                );
-                return Err(ElmEbiLoadStatus::NativeCodeTodo);
+                match super::kernel_symbols::resolve(import, ::kernel_symbols::capability::ALL) {
+                    Ok(symbol) => {
+                        values.push(symbol.address);
+                        kernel_symbol_imports.push(KernelSymbolImportRuntime {
+                            owner,
+                            owner_generation,
+                            name: import.name.clone(),
+                            contract: import.contract.clone(),
+                            min_version: import.min_version,
+                            max_version: import.max_version,
+                            selected_version: symbol.version,
+                            kind: symbol.kind,
+                            capabilities: symbol.capabilities,
+                            descriptor_flags: symbol.flags,
+                            retained_argument_mask: symbol.retained_argument_mask,
+                            rust_abi_hash: symbol.rust_abi_hash,
+                            address: symbol.address,
+                        });
+                        continue;
+                    }
+                    Err(super::kernel_symbols::KernelSymbolError::NotFound)
+                        if import.is_optional() =>
+                    {
+                        values.push(0);
+                        continue;
+                    }
+                    Err(err) => {
+                        log::error!(
+                            "[elm] kernel symbol resolve failed: name={} contract={} versions={}..={} optional={} error={:?}",
+                            import.name,
+                            import.contract.as_str(),
+                            import.min_version,
+                            import.max_version,
+                            import.is_optional(),
+                            err,
+                        );
+                        return Err(ElmEbiLoadStatus::RuntimeRejected);
+                    }
+                }
             }
             let required_version = if elmapi_root {
                 Some(u32::from(
@@ -14124,6 +14143,7 @@ impl ElmCore {
         loaded: &LoadedElmImage,
         exports: Vec<NativeExportRuntime>,
         kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
+        kernel_symbol_capabilities: u64,
         import_stage: NativeImportStageKey,
     ) -> bool {
         if !self.replace_commit_capacity_available(id, unit) {
@@ -14163,6 +14183,7 @@ impl ElmCore {
             cell.cell_policy.generation = generation.0;
             cell.policy_epoch += 1;
             cell.cell_policy.policy_epoch = cell.policy_epoch;
+            cell.cell_policy.kernel_symbol_capabilities = kernel_symbol_capabilities;
             cell.elmapi_version = elmapi_version;
             cell.ebi_arch = unit.target.arch;
             cell.ebi_status = ElmEbiLoadStatus::Ok;
@@ -15152,7 +15173,6 @@ impl ElmCore {
     }
 
     fn quarantine_cell_after_hook_failure(&mut self, id: ElmId) {
-        super::api_registry::remove_cell(id);
         self.mark_native_fault(id, ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED);
         match self.cell_state(id) {
             Some(ElmState::Faulted) => {}
@@ -15171,7 +15191,6 @@ impl ElmCore {
     }
 
     fn quarantine_cell_after_resource_failure(&mut self, id: ElmId) {
-        super::api_registry::remove_cell(id);
         self.mark_native_fault(id, ELM_POLICY_BLOCK_LEASE_BUSY);
         match self.cell_state(id) {
             Some(ElmState::Faulted) => {}
@@ -15570,7 +15589,6 @@ impl ElmCore {
             self.mark_native_fault(id, ELM_POLICY_BLOCK_LEASE_BUSY);
             return false;
         }
-        super::api_registry::remove_cell(id);
         self.cells.retain(|cell| cell.id != id);
         true
     }
@@ -15864,7 +15882,7 @@ impl ElmCore {
     }
 
     #[cfg(feature = "kernel-tests")]
-    pub(crate) fn test_kernel_symbol_backend_is_explicit_todo() -> bool {
+    pub(crate) fn test_optional_kernel_symbol_can_remain_unbound() -> bool {
         let mut core = Self::new();
         if core.init_builtin_mgr().is_err() {
             return false;
@@ -15890,8 +15908,12 @@ impl ElmCore {
             ElmEbiUnit::new(manifest, ElmEbiTarget::new(ElmEbiArch::Any)).with_import(import);
 
         matches!(
-            core.resolve_native_imports(ElmId(100), ELM_MGR_ID, Generation::FIRST, &unit,),
-            Err(ElmEbiLoadStatus::NativeCodeTodo)
+            core.resolve_native_imports(ElmId(100), ELM_MGR_ID, Generation::FIRST, &unit),
+            Ok((values, dependencies, imports, kernel_symbols))
+                if values == [0]
+                    && dependencies.is_empty()
+                    && imports.is_empty()
+                    && kernel_symbols.is_empty()
         )
     }
 
@@ -16148,6 +16170,10 @@ impl ElmCore {
                 min_version: 1,
                 max_version: 1,
                 selected_version: 1,
+                kind: ::kernel_symbols::KERNEL_SYMBOL_KIND_FUNCTION,
+                capabilities: ::kernel_symbols::capability::ALLOCATOR_MEMORY,
+                descriptor_flags: 0,
+                retained_argument_mask: 0,
                 rust_abi_hash: [0; 32],
                 address,
             };
@@ -16178,93 +16204,6 @@ pub(crate) fn with_core<R>(f: impl FnOnce(&mut ElmCore) -> R) -> R {
     let mut core = CORE.lock();
     core.reap_retired_native_images();
     f(&mut core)
-}
-
-/// 设备回调持有的 cell 执行许可。
-///
-/// 许可存续期间，暂停、替换、策略更新和隔离事务会观察到活跃执行计数，不能在
-/// 回调中途提交状态或权限变化。
-pub(crate) struct DeviceCallbackExecutionPermit {
-    token: Option<CellExecutionToken>,
-}
-
-impl Drop for DeviceCallbackExecutionPermit {
-    fn drop(&mut self) {
-        let Some(token) = self.token.take() else {
-            return;
-        };
-        CORE.lock().release_cell_execution(token);
-    }
-}
-
-/// 非阻塞地取得一次设备回调执行许可和实时 cell 上下文。
-///
-/// top-half 可能打断正持有 Core 锁的路径，因此这里不能等待。普通设备回调也使用
-/// 同一入口，避免发现/probe 在生命周期提交持锁区内形成递归锁依赖。
-pub(crate) fn try_reserve_device_callback_execution(
-    id: ElmId,
-    generation: Generation,
-    phase: ElmLifecyclePhase,
-) -> Option<(DeviceCallbackExecutionPermit, ElmCurrentContext)> {
-    let mut core = CORE.try_lock()?;
-    let index = core.cell_index(id)?;
-    let cell = &core.cells[index];
-    if cell.isolated {
-        return None;
-    }
-
-    let exact_generation = cell.generation == generation;
-    let staged_generation = cell.exclusive_execution
-        && cell.generation.checked_next() == Some(generation)
-        && matches!(cell.state, ElmState::Active | ElmState::Paused);
-    let exact_state_allows_callback = exact_generation
-        && (matches!(
-            cell.state,
-            ElmState::Loaded | ElmState::Linked | ElmState::Ready
-        ) || cell.state == ElmState::Quiescing
-            || cell.state == ElmState::Active && !cell.exclusive_execution);
-    if !exact_state_allows_callback && !staged_generation {
-        return None;
-    }
-
-    let active_executions = cell.active_executions.checked_add(1)?;
-    let token = CellExecutionToken {
-        cell: id,
-        generation: cell.generation,
-        policy_epoch: cell.policy_epoch,
-        allowed_actions: cell.cell_policy.allowed_actions,
-        exclusive: false,
-    };
-    let context = ElmCurrentContext {
-        cell_id: id,
-        parent_id: cell.parent,
-        generation,
-        state: cell.state,
-        phase,
-        kind: cell.kind,
-        flags: 0,
-        allowed_actions: cell.cell_policy.allowed_actions,
-    };
-    core.cells[index].active_executions = active_executions;
-    drop(core);
-    Some((
-        DeviceCallbackExecutionPermit { token: Some(token) },
-        context,
-    ))
-}
-
-/// 记录设备回调的原生执行故障并隔离对应 cell。
-pub(crate) fn record_device_callback_fault(id: ElmId, generation: Generation) {
-    let mut core = CORE.lock();
-    let Some(cell) = core.cells.iter().find(|cell| cell.id == id) else {
-        return;
-    };
-    let generation_matches = cell.generation == generation
-        || cell.exclusive_execution && cell.generation.checked_next() == Some(generation);
-    if !generation_matches {
-        return;
-    }
-    core.mark_native_fault(id, ELM_POLICY_BLOCK_PROVIDER_CALL_FAILED);
 }
 
 fn prepare_authorized_unlocked<T>(
@@ -16518,12 +16457,12 @@ pub(crate) fn load_ebi_image_unlocked(
     parent: ElmId,
     budget: ElmResourceBudget,
     grant_management: bool,
-    grant_kernel_api: bool,
+    authorize_privileged_symbols: bool,
     authorization: &mut ElmMgrAuthorization,
 ) -> Result<ElmLoadCellResponse, i32> {
     let target = ElmMgrAccessTarget::Load(parent, budget);
-    let kernel_api_grant =
-        KernelApiGrantRequest::from_authorization(grant_kernel_api, *authorization);
+    let symbol_authorization =
+        KernelSymbolAuthorization::from_authorization(authorize_privileged_symbols, *authorization);
     let (prepared, authorization_execution) =
         prepare_authorized_unlocked(authorization, ElmMgrCallKind::LoadCell, target, |core| {
             core.prepare_native_load_execution(
@@ -16533,7 +16472,7 @@ pub(crate) fn load_ebi_image_unlocked(
                 parent,
                 budget,
                 grant_management,
-                kernel_api_grant,
+                symbol_authorization,
             )
         })?;
     let plan = match prepared {
@@ -16624,12 +16563,12 @@ pub(crate) fn replace_cell_unlocked(
     arch: ElmEbiArch,
     migration_limit: u32,
     source: ElmEbiSourceKind,
-    grant_kernel_api: bool,
+    authorize_privileged_symbols: bool,
     authorization: &mut ElmMgrAuthorization,
 ) -> Result<ElmReplaceCellResponseV1, i32> {
     let target = ElmMgrAccessTarget::Cell(id);
-    let kernel_api_grant =
-        KernelApiGrantRequest::from_authorization(grant_kernel_api, *authorization);
+    let symbol_authorization =
+        KernelSymbolAuthorization::from_authorization(authorize_privileged_symbols, *authorization);
     let (prepared, authorization_execution) =
         prepare_authorized_unlocked(authorization, ElmMgrCallKind::ReplaceCell, target, |core| {
             core.prepare_native_replace_execution(
@@ -16638,7 +16577,7 @@ pub(crate) fn replace_cell_unlocked(
                 arch,
                 migration_limit,
                 source,
-                kernel_api_grant,
+                symbol_authorization,
             )
         })?;
     match prepared {
@@ -17872,6 +17811,7 @@ fn policy_capabilities_subset(candidate: ElmCellPolicyV1, ceiling: ElmCellPolicy
         && candidate.extension_flags & !ceiling.extension_flags == 0
         && candidate.native_flags & !ceiling.native_flags == 0
         && candidate.resource_flags & !ceiling.resource_flags == 0
+        && candidate.kernel_symbol_capabilities & !ceiling.kernel_symbol_capabilities == 0
 }
 
 fn policy_is_delegable_from(candidate: ElmCellPolicyV1, parent: ElmCellPolicyV1) -> bool {
@@ -18235,7 +18175,7 @@ extern "C" fn elm_api_query_namespace_v1(
     };
     if identifier.is_null()
         || identifier_len == 0
-        || identifier_len > elm_model::ELM_KERNEL_API_IDENTIFIER_MAX_LEN
+        || identifier_len > elm_model::ELM_API_NAMESPACE_IDENTIFIER_MAX_LEN
         || compatible_versions.is_null()
         || compatible_version_count == 0
         || compatible_version_count > elm_model::ELM_API_MAX_COMPATIBLE_VERSIONS

@@ -194,6 +194,14 @@ static DYNAMIC_CLASSES: Mutex<Vec<FunctionClassRegistration>> = Mutex::new(Vec::
 ///
 /// class identifier 在内核生命周期内单调分配且不复用；这保证旧 function 句柄不会
 /// 在类别注销后错误地指向新类别。名称由内核复制，不依赖调用方镜像存活。
+#[kernel_symbols::export(
+    name = "general.dev.function.register_function_class",
+    contract = "kernel.general.device-function-class@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+        | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+)]
 pub fn register_function_class(
     name: &str,
 ) -> Result<FunctionClassRegistration, FunctionRegistryError> {
@@ -204,9 +212,14 @@ pub fn register_function_class(
     if classes.iter().any(|class| class.name() == name) {
         return Err(FunctionRegistryError::NameExists);
     }
-    classes
-        .try_reserve(1)
-        .map_err(|_| FunctionRegistryError::OutOfMemory)?;
+    {
+        // 注册表容量属于常驻内核元数据；类别名称和返回句柄仍按调用单元计量。
+        let _accounting = allocator::suspend_implicit_allocation_accounting()
+            .ok_or(FunctionRegistryError::OutOfMemory)?;
+        classes
+            .try_reserve(1)
+            .map_err(|_| FunctionRegistryError::OutOfMemory)?;
+    }
     let id = registry_id::alloc_atomic_id(&NEXT_DYNAMIC_CLASS_ID)
         .map_err(|_| FunctionRegistryError::IdExhausted)?;
     let mut owned = alloc::string::String::new();
@@ -219,20 +232,46 @@ pub fn register_function_class(
         name: owned.into_boxed_str(),
     };
     classes.push(registration.clone());
+    drop(classes);
+    if super::elm_lifecycle::track_function_class(registration.class_id()).is_err() {
+        let mut classes = DYNAMIC_CLASSES.lock();
+        if let Some(index) = classes
+            .iter()
+            .position(|class| class.class_id == registration.class_id())
+        {
+            classes.swap_remove(index);
+        }
+        return Err(FunctionRegistryError::OutOfMemory);
+    }
     Ok(registration)
 }
 
 /// 注销一个动态 function class。
+#[kernel_symbols::export(
+    name = "general.dev.function.unregister_function_class",
+    contract = "kernel.general.device-function-class@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+)]
 pub fn unregister_function_class(class_id: DeviceClassId) -> Result<(), FunctionRegistryError> {
     let mut classes = DYNAMIC_CLASSES.lock();
     let Some(index) = classes.iter().position(|class| class.class_id == class_id) else {
         return Err(FunctionRegistryError::NotFound);
     };
     classes.swap_remove(index);
+    drop(classes);
+    super::elm_lifecycle::forget_function_class(class_id);
     Ok(())
 }
 
 /// 查询动态类别名称的拥有副本。
+#[kernel_symbols::export(
+    name = "general.dev.function.function_class_name",
+    contract = "kernel.general.device-function-class@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+)]
 pub fn function_class_name(class_id: DeviceClassId) -> Option<alloc::string::String> {
     let classes = DYNAMIC_CLASSES.lock();
     let class = classes.iter().find(|class| class.class_id == class_id)?;

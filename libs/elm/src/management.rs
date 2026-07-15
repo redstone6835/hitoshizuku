@@ -214,7 +214,6 @@ impl Client {
             || namespace.table_size < core::mem::size_of::<ElmManagementApiV1>() as u32
             || namespace.table_address == 0
             || namespace.generation == 0
-            || namespace.grant_id != 0
             || namespace.capabilities & u64::from(ELM_CELL_POLICY_ALLOW_MANAGEMENT) == 0
         {
             return Err(Error::MalformedResponse);
@@ -1199,7 +1198,6 @@ mod tests {
             table_size: core::mem::size_of::<ElmManagementApiV1>() as u32,
             table_address: table as *const ElmManagementApiV1 as usize,
             generation: 1,
-            grant_id: 0,
             capabilities: u64::from(ELM_CELL_POLICY_ALLOW_MANAGEMENT),
         }
     }
@@ -1269,7 +1267,7 @@ mod tests {
         assert_size!(ElmExtensionDetachRequest, 56);
         assert_size!(ElmExtensionDispatchRequest, 392);
         assert_size!(ElmCellPolicyRequest, 16);
-        assert_size!(ElmCellPolicyV1, 64);
+        assert_size!(ElmCellPolicyV1, 72);
         assert_size!(ElmResourceBudgetRequest, 16);
         assert_size!(ElmResourceBudgetUpdateRequest, 80);
         assert_size!(ElmImageSessionBeginRequestV1, 64);

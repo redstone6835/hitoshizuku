@@ -43,10 +43,9 @@ ELMCTL_SRC := userland/elmctl/elmctl.c userland/elmctl/elmctl_client.c
 ELMCTL_HEADERS := userland/elmctl/include/elmctl_abi.h userland/elmctl/include/elmctl_client.h
 
 cargo-setup:
-	@if [ ! -d .cargo ] && [ -d cargo-config ]; then \
-		cp -r cargo-config .cargo; \
-		echo "cargo-config → .cargo"; \
-	fi
+	@mkdir -p .cargo
+	@cp cargo-config/config.toml .cargo/config.toml
+	@echo "cargo-config/config.toml → .cargo/config.toml"
 
 kernel-la: cargo-setup rootfs-la
 	INITRAMFS_ROOT=$(LA_ROOTFS) INITRAMFS_CPIO=$(LA_INITRAMFS) \

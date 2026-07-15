@@ -1,19 +1,19 @@
-//! ELM Kernel API 命名空间与按代授权注册表。
+//! ELM 运行时 API 命名空间注册表。
+//!
+//! 该注册表只发布 ELM 自身的普通运行时表和 Manager 控制表。allocator、设备及其他
+//! 内核子系统不进入这里，它们由装载器通过直接内核符号目录解析。
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use elm_model::{
-    ELM_API_NAMESPACE_FLAG_MANAGEMENT, ELM_API_NAMESPACE_FLAG_PUBLIC,
-    ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT, ELM_AUDIT_AUTHORITY_KERNEL, ELM_AUDIT_AUTHORITY_MANAGER,
-    ELM_AUDIT_AUTHORITY_USER_ADMIN, ElmApiNamespaceDescriptorV1, ElmApiNamespaceV1,
-    ElmEbiKernelApiRequirement, ElmEbiSourceKind, ElmId, Generation,
+    ELM_API_NAMESPACE_FLAG_MANAGEMENT, ELM_API_NAMESPACE_FLAG_PUBLIC, ElmApiNamespaceDescriptorV1,
+    ElmApiNamespaceV1, ElmId, Generation,
 };
 use sched::sync::Spinlock;
 
-const NAMESPACE_CAPACITY: usize = 64;
-const GRANT_CAPACITY: usize = 512;
+const NAMESPACE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApiRegistryError {
@@ -22,114 +22,23 @@ pub(crate) enum ApiRegistryError {
     NamespaceUnavailable,
     VersionUnsupported,
     CapabilityDenied,
-    LayoutMismatch,
-    DuplicateGrant,
-    CounterExhausted,
     OutOfMemory,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ApiGrantApproval {
-    source: ElmEbiSourceKind,
-    authority: u32,
-    authority_id: u64,
-    signer_key_id: [u8; 32],
-}
-
-impl ApiGrantApproval {
-    pub(crate) const fn internal(source: ElmEbiSourceKind) -> Option<Self> {
-        if matches!(source, ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory) {
-            Some(Self {
-                source,
-                authority: ELM_AUDIT_AUTHORITY_KERNEL,
-                authority_id: 0,
-                signer_key_id: [0; 32],
-            })
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn signed_projection(
-        authority: u32,
-        authority_id: u64,
-        signer_key_id: [u8; 32],
-    ) -> Option<Self> {
-        if signer_key_id == [0; 32]
-            || !matches!(
-                authority,
-                ELM_AUDIT_AUTHORITY_KERNEL
-                    | ELM_AUDIT_AUTHORITY_USER_ADMIN
-                    | ELM_AUDIT_AUTHORITY_MANAGER
-            )
-        {
-            return None;
-        }
-        Some(Self {
-            source: ElmEbiSourceKind::Projection,
-            authority,
-            authority_id,
-            signer_key_id,
-        })
-    }
-
-    fn valid(self) -> bool {
-        match self.source {
-            ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
-                self.authority == ELM_AUDIT_AUTHORITY_KERNEL
-                    && self.authority_id == 0
-                    && self.signer_key_id == [0; 32]
-            }
-            ElmEbiSourceKind::Projection => {
-                self.signer_key_id != [0; 32]
-                    && matches!(
-                        self.authority,
-                        ELM_AUDIT_AUTHORITY_KERNEL
-                            | ELM_AUDIT_AUTHORITY_USER_ADMIN
-                            | ELM_AUDIT_AUTHORITY_MANAGER
-                    )
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ApiGrant {
-    id: u64,
-    cell: ElmId,
-    generation: Generation,
-    descriptor_index: usize,
-    capabilities: u64,
-    approval: ApiGrantApproval,
 }
 
 struct ApiRegistry {
     namespaces: Vec<&'static ElmApiNamespaceDescriptorV1>,
-    grants: Vec<ApiGrant>,
-    next_grant_id: u64,
 }
 
 impl ApiRegistry {
     const fn new() -> Self {
         Self {
             namespaces: Vec::new(),
-            grants: Vec::new(),
-            next_grant_id: 1,
         }
     }
 
     fn initialize_capacity(&mut self) -> bool {
-        let namespace_missing = NAMESPACE_CAPACITY.saturating_sub(self.namespaces.capacity());
-        if namespace_missing != 0
-            && self
-                .namespaces
-                .try_reserve_exact(namespace_missing)
-                .is_err()
-        {
-            return false;
-        }
-        let grant_missing = GRANT_CAPACITY.saturating_sub(self.grants.capacity());
-        grant_missing == 0 || self.grants.try_reserve_exact(grant_missing).is_ok()
+        let missing = NAMESPACE_CAPACITY.saturating_sub(self.namespaces.capacity());
+        missing == 0 || self.namespaces.try_reserve_exact(missing).is_ok()
     }
 
     fn register(
@@ -147,7 +56,6 @@ impl ApiRegistry {
                 && registered.table_size == descriptor.table_size
                 && registered.flags == descriptor.flags
                 && registered.capabilities == descriptor.capabilities
-                && registered.layout_hash == descriptor.layout_hash
             {
                 Ok(())
             } else {
@@ -161,84 +69,8 @@ impl ApiRegistry {
         Ok(())
     }
 
-    fn grant_requirements(
-        &mut self,
-        cell: ElmId,
-        generation: Generation,
-        requirements: &[ElmEbiKernelApiRequirement],
-        approval: Option<ApiGrantApproval>,
-    ) -> Result<usize, ApiRegistryError> {
-        if requirements.is_empty() {
-            return Ok(0);
-        }
-        let approval = approval
-            .filter(|approval| approval.valid())
-            .ok_or(ApiRegistryError::CapabilityDenied)?;
-        let mut resolved = Vec::new();
-        resolved
-            .try_reserve_exact(requirements.len())
-            .map_err(|_| ApiRegistryError::OutOfMemory)?;
-        for requirement in requirements {
-            let Some((descriptor_index, descriptor)) =
-                self.namespaces.iter().enumerate().find(|(_, descriptor)| {
-                    descriptor.identifier == requirement.identifier
-                        && descriptor.version == requirement.version
-                })
-            else {
-                return Err(ApiRegistryError::NamespaceUnavailable);
-            };
-            if descriptor.flags != ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT {
-                return Err(ApiRegistryError::CapabilityDenied);
-            }
-            if requirement.required_capabilities & !descriptor.capabilities != 0 {
-                return Err(ApiRegistryError::CapabilityDenied);
-            }
-            if requirement.layout_hash != descriptor.layout_hash {
-                return Err(ApiRegistryError::LayoutMismatch);
-            }
-            if self.grants.iter().any(|grant| {
-                grant.cell == cell
-                    && grant.generation == generation
-                    && grant.descriptor_index == descriptor_index
-            }) || resolved
-                .iter()
-                .any(|grant: &ApiGrant| grant.descriptor_index == descriptor_index)
-            {
-                return Err(ApiRegistryError::DuplicateGrant);
-            }
-            resolved.push(ApiGrant {
-                id: 0,
-                cell,
-                generation,
-                descriptor_index,
-                capabilities: requirement.required_capabilities,
-                approval,
-            });
-        }
-        self.grants
-            .try_reserve(resolved.len())
-            .map_err(|_| ApiRegistryError::OutOfMemory)?;
-        let count = resolved.len();
-        let count_u64 = u64::try_from(count).map_err(|_| ApiRegistryError::CounterExhausted)?;
-        let next_grant_id = self
-            .next_grant_id
-            .checked_add(count_u64)
-            .ok_or(ApiRegistryError::CounterExhausted)?;
-        for (offset, grant) in resolved.iter_mut().enumerate() {
-            let offset = u64::try_from(offset).map_err(|_| ApiRegistryError::CounterExhausted)?;
-            grant.id = self
-                .next_grant_id
-                .checked_add(offset)
-                .ok_or(ApiRegistryError::CounterExhausted)?;
-        }
-        self.next_grant_id = next_grant_id;
-        self.grants.extend(resolved);
-        Ok(count)
-    }
-
     fn query(
         &self,
-        cell: ElmId,
         generation: Generation,
         identifier: &[u8],
         versions: &[u16],
@@ -251,32 +83,20 @@ impl ApiRegistry {
         {
             return Err(ApiRegistryError::NamespaceUnavailable);
         }
-        let (descriptor_index, descriptor) = self
+        let descriptor = self
             .namespaces
             .iter()
-            .enumerate()
-            .filter(|(_, descriptor)| descriptor.identifier.as_bytes() == identifier)
-            .filter(|(_, descriptor)| versions.contains(&descriptor.version))
-            .max_by_key(|(_, descriptor)| descriptor.version)
+            .copied()
+            .filter(|descriptor| descriptor.identifier.as_bytes() == identifier)
+            .filter(|descriptor| versions.contains(&descriptor.version))
+            .max_by_key(|descriptor| descriptor.version)
             .ok_or(ApiRegistryError::VersionUnsupported)?;
 
-        let (grant_id, capabilities) = match descriptor.flags {
-            ELM_API_NAMESPACE_FLAG_PUBLIC => (0, descriptor.capabilities),
-            ELM_API_NAMESPACE_FLAG_MANAGEMENT if management_allowed => (0, descriptor.capabilities),
-            ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT => {
-                let grant = self
-                    .grants
-                    .iter()
-                    .find(|grant| {
-                        grant.cell == cell
-                            && grant.generation == generation
-                            && grant.descriptor_index == descriptor_index
-                    })
-                    .ok_or(ApiRegistryError::CapabilityDenied)?;
-                (grant.id, grant.capabilities)
-            }
+        match descriptor.flags {
+            ELM_API_NAMESPACE_FLAG_PUBLIC => {}
+            ELM_API_NAMESPACE_FLAG_MANAGEMENT if management_allowed => {}
             _ => return Err(ApiRegistryError::CapabilityDenied),
-        };
+        }
 
         Ok(ElmApiNamespaceV1 {
             struct_size: core::mem::size_of::<ElmApiNamespaceV1>() as u32,
@@ -286,68 +106,8 @@ impl ApiRegistry {
             table_size: descriptor.table_size,
             table_address: descriptor.table_address as usize,
             generation: generation.0,
-            grant_id,
-            capabilities,
+            capabilities: descriptor.capabilities,
         })
-    }
-
-    fn authorize(
-        &self,
-        grant_id: u64,
-        cell: ElmId,
-        generation: Generation,
-        identifier: &[u8],
-        version: u16,
-        required_capabilities: u64,
-    ) -> Result<(), ApiRegistryError> {
-        let (descriptor_index, descriptor) = self
-            .namespaces
-            .iter()
-            .enumerate()
-            .find(|(_, descriptor)| {
-                descriptor.identifier.as_bytes() == identifier && descriptor.version == version
-            })
-            .ok_or_else(|| {
-                if self
-                    .namespaces
-                    .iter()
-                    .any(|descriptor| descriptor.identifier.as_bytes() == identifier)
-                {
-                    ApiRegistryError::VersionUnsupported
-                } else {
-                    ApiRegistryError::NamespaceUnavailable
-                }
-            })?;
-        if descriptor.flags != ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT || grant_id == 0 {
-            return Err(ApiRegistryError::CapabilityDenied);
-        }
-        let grant = self
-            .grants
-            .iter()
-            .find(|grant| grant.id == grant_id)
-            .ok_or(ApiRegistryError::CapabilityDenied)?;
-        if grant.cell != cell
-            || grant.generation != generation
-            || grant.descriptor_index != descriptor_index
-            || required_capabilities & !grant.capabilities != 0
-            || required_capabilities & !descriptor.capabilities != 0
-        {
-            return Err(ApiRegistryError::CapabilityDenied);
-        }
-        Ok(())
-    }
-
-    fn remove_generation(&mut self, cell: ElmId, generation: Generation) -> usize {
-        let before = self.grants.len();
-        self.grants
-            .retain(|grant| grant.cell != cell || grant.generation != generation);
-        before - self.grants.len()
-    }
-
-    fn remove_cell(&mut self, cell: ElmId) -> usize {
-        let before = self.grants.len();
-        self.grants.retain(|grant| grant.cell != cell);
-        before - self.grants.len()
     }
 }
 
@@ -363,19 +123,8 @@ pub(crate) fn register(
     API_REGISTRY.lock().register(descriptor)
 }
 
-pub(crate) fn grant_requirements(
-    cell: ElmId,
-    generation: Generation,
-    requirements: &[ElmEbiKernelApiRequirement],
-    approval: Option<ApiGrantApproval>,
-) -> Result<usize, ApiRegistryError> {
-    API_REGISTRY
-        .lock()
-        .grant_requirements(cell, generation, requirements, approval)
-}
-
 pub(crate) fn query(
-    cell: ElmId,
+    _cell: ElmId,
     generation: Generation,
     identifier: &[u8],
     versions: &[u16],
@@ -383,71 +132,21 @@ pub(crate) fn query(
 ) -> Result<ElmApiNamespaceV1, ApiRegistryError> {
     API_REGISTRY
         .lock()
-        .query(cell, generation, identifier, versions, management_allowed)
-}
-
-pub(crate) fn authorize(
-    grant_id: u64,
-    cell: ElmId,
-    generation: Generation,
-    identifier: &[u8],
-    version: u16,
-    required_capabilities: u64,
-) -> Result<(), ApiRegistryError> {
-    API_REGISTRY.lock().authorize(
-        grant_id,
-        cell,
-        generation,
-        identifier,
-        version,
-        required_capabilities,
-    )
-}
-
-pub(crate) fn remove_generation(cell: ElmId, generation: Generation) -> usize {
-    API_REGISTRY.lock().remove_generation(cell, generation)
-}
-
-pub(crate) fn remove_cell(cell: ElmId) -> usize {
-    API_REGISTRY.lock().remove_cell(cell)
+        .query(generation, identifier, versions, management_allowed)
 }
 
 pub(crate) fn diagnostic_text() -> String {
     let registry = API_REGISTRY.lock();
-    let mut out = format!(
-        "kernel_namespaces={}\nkernel_grants={}\n",
-        registry.namespaces.len(),
-        registry.grants.len()
-    );
+    let mut out = format!("runtime_namespaces={}\n", registry.namespaces.len());
     for descriptor in &registry.namespaces {
         out.push_str(
             format!(
-                "kernel_namespace identifier={} version={} flags=0x{:x} capabilities=0x{:x} table_size={} layout_hash={:02x?}\n",
+                "runtime_namespace identifier={} version={} flags=0x{:x} capabilities=0x{:x} table_size={}\n",
                 descriptor.identifier,
                 descriptor.version,
                 descriptor.flags,
                 descriptor.capabilities,
                 descriptor.table_size,
-                descriptor.layout_hash
-            )
-            .as_str(),
-        );
-    }
-    for grant in &registry.grants {
-        let descriptor = registry.namespaces[grant.descriptor_index];
-        out.push_str(
-            format!(
-                "kernel_grant id={} cell={} generation={} identifier={} version={} capabilities=0x{:x} source={:?} authority={} authority_id={} signer_key_id={:02x?}\n",
-                grant.id,
-                grant.cell.0,
-                grant.generation.0,
-                descriptor.identifier,
-                descriptor.version,
-                grant.capabilities,
-                grant.approval.source,
-                grant.approval.authority,
-                grant.approval.authority_id,
-                grant.approval.signer_key_id
             )
             .as_str(),
         );
@@ -456,170 +155,24 @@ pub(crate) fn diagnostic_text() -> String {
 }
 
 #[cfg(feature = "kernel-tests")]
-pub(crate) fn test_requirement_roundtrip() -> bool {
-    use kernel_api::ApiTableHeaderV1;
-
-    if ApiGrantApproval::signed_projection(ELM_AUDIT_AUTHORITY_MANAGER, 1, [1; 32]).is_none()
-        || ApiGrantApproval::signed_projection(
-            elm_model::ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER,
-            2,
-            [1; 32],
-        )
-        .is_some()
-    {
-        return false;
-    }
-
-    #[repr(C)]
-    struct TestApiV1 {
-        header: ApiTableHeaderV1,
-    }
-
-    static TABLE: TestApiV1 = TestApiV1 {
-        header: ApiTableHeaderV1::new::<TestApiV1>(0x3),
-    };
+pub(crate) fn test_runtime_namespace_roundtrip() -> bool {
+    static TEST_TABLE: [u64; 2] = [1, 2];
     static DESCRIPTOR: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDescriptorV1::new(
-        "kernel.test",
-        1,
-        ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT,
-        0x3,
-        &TABLE,
-        [0x5a; 32],
-    );
-    static OTHER_DESCRIPTOR: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDescriptorV1::new(
-        "kernel.test-other",
-        1,
-        ELM_API_NAMESPACE_FLAG_REQUIRE_GRANT,
-        0x3,
-        &TABLE,
-        [0xa5; 32],
-    );
-    static PUBLIC_DESCRIPTOR: ElmApiNamespaceDescriptorV1 = ElmApiNamespaceDescriptorV1::new(
-        "elm.test-public",
+        "elm.test.runtime",
         1,
         ELM_API_NAMESPACE_FLAG_PUBLIC,
         0x3,
-        &TABLE,
-        [0; 32],
+        &TEST_TABLE,
     );
 
-    let cell = ElmId(u64::MAX - 1);
-    let generation = Generation::FIRST;
-    if super::register_kernel_api_namespace(&DESCRIPTOR).is_err() {
-        return false;
-    }
-    if super::register_kernel_api_namespace(&OTHER_DESCRIPTOR).is_err() {
-        return false;
-    }
-    if super::register_kernel_api_namespace(&PUBLIC_DESCRIPTOR).is_err() {
-        return false;
-    }
-    remove_cell(cell);
-    if query(cell, generation, b"kernel.missing", &[1], false)
-        != Err(ApiRegistryError::NamespaceUnavailable)
-        || query(cell, generation, b"kernel.test", &[2], false)
-            != Err(ApiRegistryError::VersionUnsupported)
-        || query(cell, generation, b"kernel.test", &[1], false)
-            != Err(ApiRegistryError::CapabilityDenied)
-    {
-        return false;
-    }
-    let requirement = match ElmEbiKernelApiRequirement::new("kernel.test", 1, 0x1, [0x5a; 32]) {
-        Ok(requirement) => requirement,
-        Err(_) => return false,
-    };
-    let approval = ApiGrantApproval::internal(ElmEbiSourceKind::Memory);
-    if grant_requirements(cell, generation, &[requirement], approval).ok() != Some(1) {
-        return false;
-    }
-    let duplicate = match ElmEbiKernelApiRequirement::new("kernel.test", 1, 0x1, [0x5a; 32]) {
-        Ok(requirement) => requirement,
-        Err(_) => return false,
-    };
-    if grant_requirements(cell, generation, &[duplicate], approval)
-        != Err(ApiRegistryError::DuplicateGrant)
-    {
-        return false;
-    }
-    let transactional_cell = ElmId(cell.0 - 2);
-    remove_cell(transactional_cell);
-    let transactional = [
-        match ElmEbiKernelApiRequirement::new("kernel.test", 1, 0x1, [0x5a; 32]) {
-            Ok(requirement) => requirement,
-            Err(_) => return false,
-        },
-        match ElmEbiKernelApiRequirement::new("kernel.missing", 1, 0x1, [0x11; 32]) {
-            Ok(requirement) => requirement,
-            Err(_) => return false,
-        },
-    ];
-    if grant_requirements(transactional_cell, generation, &transactional, approval)
-        != Err(ApiRegistryError::NamespaceUnavailable)
-        || query(transactional_cell, generation, b"kernel.test", &[1], false)
-            != Err(ApiRegistryError::CapabilityDenied)
-        || !query(cell, generation, b"elm.test-public", &[1], false)
-            .is_ok_and(|namespace| namespace.grant_id == 0 && namespace.capabilities == 0x3)
-    {
-        remove_cell(cell);
-        return false;
-    }
-    let unauthorized_cell = ElmId(cell.0 - 3);
-    remove_cell(unauthorized_cell);
-    let unauthorized = match ElmEbiKernelApiRequirement::new("kernel.test", 1, 0x1, [0x5a; 32]) {
-        Ok(requirement) => requirement,
-        Err(_) => return false,
-    };
-    if grant_requirements(unauthorized_cell, generation, &[unauthorized], None)
-        != Err(ApiRegistryError::CapabilityDenied)
-    {
-        remove_cell(cell);
-        return false;
-    }
-    let Ok(namespace) = query(cell, generation, b"kernel.test", &[1], false) else {
-        return false;
-    };
-    if namespace.capabilities != 0x1
-        || namespace.table_address == 0
-        || namespace.grant_id == 0
-        || authorize(namespace.grant_id, cell, generation, b"kernel.test", 1, 0x1).is_err()
-        || authorize(
-            namespace.grant_id,
-            ElmId(cell.0 - 1),
-            generation,
-            b"kernel.test",
-            1,
-            0x1,
-        ) != Err(ApiRegistryError::CapabilityDenied)
-        || authorize(
-            namespace.grant_id,
-            cell,
-            Generation(generation.0 + 1),
-            b"kernel.test",
-            1,
-            0x1,
-        ) != Err(ApiRegistryError::CapabilityDenied)
-        || authorize(
-            namespace.grant_id,
-            cell,
-            generation,
-            b"kernel.test-other",
-            1,
-            0x1,
-        ) != Err(ApiRegistryError::CapabilityDenied)
-        || authorize(namespace.grant_id, cell, generation, b"kernel.test", 1, 0x2)
-            != Err(ApiRegistryError::CapabilityDenied)
-    {
-        remove_cell(cell);
-        return false;
-    }
-    if remove_generation(cell, generation) != 1 {
-        remove_cell(cell);
-        return false;
-    }
-    let revoked = authorize(namespace.grant_id, cell, generation, b"kernel.test", 1, 0x1)
-        == Err(ApiRegistryError::CapabilityDenied)
-        && query(cell, generation, b"kernel.test", &[1], false)
-            == Err(ApiRegistryError::CapabilityDenied);
-    remove_cell(cell);
-    revoked
+    let mut registry = ApiRegistry::new();
+    registry.initialize_capacity()
+        && registry.register(&DESCRIPTOR).is_ok()
+        && registry
+            .query(Generation::FIRST, b"elm.test.runtime", &[1], false)
+            .is_ok_and(|namespace| {
+                namespace.selected_version == 1
+                    && namespace.table_address == TEST_TABLE.as_ptr() as usize
+                    && namespace.capabilities == 0x3
+            })
 }
