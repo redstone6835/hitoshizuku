@@ -1971,6 +1971,25 @@ impl ElmCore {
             .abi_fingerprint
             .as_ref()
             .ok_or(ElmEbiLoadStatus::AbiFingerprintRejected)?;
+        let requires_exact_rust_abi = image
+            .unit
+            .imports
+            .iter()
+            .any(elm_model::ElmEbiImportDecl::is_exact_rust_api);
+        let profile_bound = fingerprint.kernel_api_profile_hash != [0; 32];
+        if requires_exact_rust_abi && !profile_bound {
+            return Err(ElmEbiLoadStatus::AbiFingerprintRejected);
+        }
+        if profile_bound {
+            let current_profile = super::kernel_symbols::catalog_profile_hash()
+                .map_err(|_| ElmEbiLoadStatus::AbiFingerprintRejected)?;
+            if fingerprint.kernel_api_bridge_abi_version
+                != super::kernel_symbols::KERNEL_API_BRIDGE_ABI_VERSION
+                || fingerprint.kernel_api_profile_hash != current_profile
+            {
+                return Err(ElmEbiLoadStatus::AbiFingerprintRejected);
+            }
+        }
         if fingerprint.elmapi_version != ELM_API_CURRENT_VERSION
             || fingerprint.panic_strategy != ElmPanicStrategy::AbortThroughRuntime
             || fingerprint.code_model != 1
@@ -1984,7 +2003,8 @@ impl ElmCore {
                     | ELM_RUST_ABI_TARGET_FEATURE_VECTOR
                     | ELM_RUST_ABI_TARGET_FEATURE_SIMD)
                 != 0
-            || fingerprint.rustc_commit_hash != sha256(env!("ELM_RUSTC_VERSION").as_bytes())
+            || requires_exact_rust_abi
+                && fingerprint.rustc_commit_hash != sha256(env!("ELM_RUSTC_VERSION").as_bytes())
             || fingerprint.target_spec_hash != expected_target_spec_hash(image.unit.target.arch)
             || fingerprint.kernel_interface_hash
                 != sha256(kernel_interface_manifest_v1(image.unit.target.arch as u32).as_bytes())
@@ -6350,7 +6370,7 @@ impl ElmCore {
             ));
         };
         let (imports, resolved_native_imports, kernel_symbol_imports) =
-            match self.resolve_native_imports(id, parent, Generation::FIRST, &image.unit) {
+            match self.resolve_native_imports(id, parent, Generation::FIRST, arch, &image.unit) {
                 Ok((imports, dependencies, resolved_imports, kernel_symbol_imports)) => {
                     if topology
                         .dependencies
@@ -6933,47 +6953,13 @@ impl ElmCore {
             ));
         };
         let replace_parent = old_cell.parent.unwrap_or(ELM_MGR_ID);
-        let (imports, resolved_native_imports, kernel_symbol_imports) =
-            match self.resolve_native_imports(id, replace_parent, new_generation, &image.unit) {
-                Ok((imports, dependencies, resolved_imports, kernel_symbol_imports)) => {
-                    if dependencies.iter().any(|(provider, _)| *provider == id)
-                        || resolved_imports.iter().any(|import| import.provider == id)
-                    {
-                        return PreparedNativeReplace::Immediate(self.replace_response(
-                            id,
-                            ELM_MGR_STATUS_INVALID,
-                            old_state,
-                            old_generation,
-                            0,
-                            ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
-                            ELM_POLICY_BLOCK_HAS_DEPENDENTS,
-                        ));
-                    }
-                    if topology
-                        .dependencies
-                        .try_reserve(dependencies.len())
-                        .is_err()
-                    {
-                        return PreparedNativeReplace::Immediate(self.replace_response(
-                            id,
-                            ELM_MGR_STATUS_BUSY,
-                            old_state,
-                            old_generation,
-                            0,
-                            ELM_LIFECYCLE_REASON_LEASE_BUSY,
-                            ELM_POLICY_BLOCK_RESOURCE_QUOTA,
-                        ));
-                    }
-                    for dependency in dependencies {
-                        if !topology.dependencies.iter().any(|existing| {
-                            existing.0 == dependency.0 && existing.1 == dependency.1
-                        }) {
-                            topology.dependencies.push(dependency);
-                        }
-                    }
-                    (imports, resolved_imports, kernel_symbol_imports)
-                }
-                Err(_) => {
+        let (imports, resolved_native_imports, kernel_symbol_imports) = match self
+            .resolve_native_imports(id, replace_parent, new_generation, arch, &image.unit)
+        {
+            Ok((imports, dependencies, resolved_imports, kernel_symbol_imports)) => {
+                if dependencies.iter().any(|(provider, _)| *provider == id)
+                    || resolved_imports.iter().any(|import| import.provider == id)
+                {
                     return PreparedNativeReplace::Immediate(self.replace_response(
                         id,
                         ELM_MGR_STATUS_INVALID,
@@ -6984,7 +6970,44 @@ impl ElmCore {
                         ELM_POLICY_BLOCK_HAS_DEPENDENTS,
                     ));
                 }
-            };
+                if topology
+                    .dependencies
+                    .try_reserve(dependencies.len())
+                    .is_err()
+                {
+                    return PreparedNativeReplace::Immediate(self.replace_response(
+                        id,
+                        ELM_MGR_STATUS_BUSY,
+                        old_state,
+                        old_generation,
+                        0,
+                        ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                        ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+                    ));
+                }
+                for dependency in dependencies {
+                    if !topology
+                        .dependencies
+                        .iter()
+                        .any(|existing| existing.0 == dependency.0 && existing.1 == dependency.1)
+                    {
+                        topology.dependencies.push(dependency);
+                    }
+                }
+                (imports, resolved_imports, kernel_symbol_imports)
+            }
+            Err(_) => {
+                return PreparedNativeReplace::Immediate(self.replace_response(
+                    id,
+                    ELM_MGR_STATUS_INVALID,
+                    old_state,
+                    old_generation,
+                    0,
+                    ELM_LIFECYCLE_REASON_HAS_DEPENDENTS,
+                    ELM_POLICY_BLOCK_HAS_DEPENDENTS,
+                ));
+            }
+        };
         let kernel_symbol_capabilities =
             required_kernel_symbol_capabilities(&kernel_symbol_imports);
         if !self.replace_surface_compatible(id, &image.unit, &topology) {
@@ -12184,6 +12207,7 @@ impl ElmCore {
         owner: ElmId,
         parent: ElmId,
         owner_generation: Generation,
+        arch: ElmEbiArch,
         unit: &ElmEbiUnit,
     ) -> Result<
         (
@@ -12194,7 +12218,11 @@ impl ElmCore {
         ),
         ElmEbiLoadStatus,
     > {
-        let selected_elmapi = self.select_elmapi_version(unit)?;
+        let loader_plan = elm_loader::prepare_ebi_unit(
+            unit,
+            &super::kernel_symbols::KernelSymbolHost::new(arch),
+        )?;
+        let selected_elmapi = loader_plan.selected_elmapi;
         let mut values = Vec::new();
         let mut dependencies = Vec::new();
         let mut imports = Vec::new();
@@ -12222,8 +12250,8 @@ impl ElmCore {
                 if elmapi_root {
                     return Err(ElmEbiLoadStatus::InvalidTarget);
                 }
-                match super::kernel_symbols::resolve(import, ::kernel_symbols::capability::ALL) {
-                    Ok(symbol) => {
+                match loader_plan.imports[import_index] {
+                    elm_loader::ElmPreparedImport::Kernel(symbol) => {
                         values.push(symbol.address);
                         kernel_symbol_imports.push(KernelSymbolImportRuntime {
                             owner,
@@ -12242,23 +12270,20 @@ impl ElmCore {
                         });
                         continue;
                     }
-                    Err(super::kernel_symbols::KernelSymbolError::NotFound)
-                        if import.is_optional() =>
-                    {
+                    elm_loader::ElmPreparedImport::OptionalKernelMissing => {
                         values.push(0);
                         continue;
                     }
-                    Err(err) => {
+                    elm_loader::ElmPreparedImport::ManagedOrModule => {
                         log::error!(
-                            "[elm] kernel symbol resolve failed: name={} contract={} versions={}..={} optional={} error={:?}",
+                            "[elm] Loader 返回了错误的内核符号导入类别: name={} contract={} versions={}..={} optional={}",
                             import.name,
                             import.contract.as_str(),
                             import.min_version,
                             import.max_version,
                             import.is_optional(),
-                            err,
                         );
-                        return Err(ElmEbiLoadStatus::RuntimeRejected);
+                        return Err(ElmEbiLoadStatus::InvalidUnit);
                     }
                 }
             }
@@ -15847,9 +15872,13 @@ impl ElmCore {
             .with_dependency(dependency.clone())
             .with_import(import);
         let owner = ElmId(100);
-        let Ok((values, dependencies, imports, kernel_symbols)) =
-            core.resolve_native_imports(owner, ELM_MGR_ID, Generation::FIRST, &unit)
-        else {
+        let Ok((values, dependencies, imports, kernel_symbols)) = core.resolve_native_imports(
+            owner,
+            ELM_MGR_ID,
+            Generation::FIRST,
+            ElmEbiArch::Any,
+            &unit,
+        ) else {
             return false;
         };
         let resolved = values == [0x4100]
@@ -15874,7 +15903,13 @@ impl ElmCore {
             .with_dependency(dependency)
             .with_import(mismatched_import);
         let mismatch_rejected = matches!(
-            core.resolve_native_imports(owner, ELM_MGR_ID, Generation::FIRST, &mismatched),
+            core.resolve_native_imports(
+                owner,
+                ELM_MGR_ID,
+                Generation::FIRST,
+                ElmEbiArch::Any,
+                &mismatched,
+            ),
             Err(ElmEbiLoadStatus::RuntimeRejected)
         );
 
@@ -15908,7 +15943,13 @@ impl ElmCore {
             ElmEbiUnit::new(manifest, ElmEbiTarget::new(ElmEbiArch::Any)).with_import(import);
 
         matches!(
-            core.resolve_native_imports(ElmId(100), ELM_MGR_ID, Generation::FIRST, &unit),
+            core.resolve_native_imports(
+                ElmId(100),
+                ELM_MGR_ID,
+                Generation::FIRST,
+                ElmEbiArch::Any,
+                &unit,
+            ),
             Ok((values, dependencies, imports, kernel_symbols))
                 if values == [0]
                     && dependencies.is_empty()

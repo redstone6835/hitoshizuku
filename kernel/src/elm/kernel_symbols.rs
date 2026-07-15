@@ -4,14 +4,19 @@
 //! 也不把子系统能力包装成 ELM provider。装载器完成解析后，模块直接调用写入槽位的
 //! Rust 地址。
 
+use alloc::vec::Vec;
 use core::mem::{align_of, size_of};
 use core::slice;
 
-use elm_model::{ElmEbiImportDecl, kernel_symbol_interface_abi_hash, sha256};
+use elm_loader::{ElmHostOps, ElmHostSymbol, ElmHostSymbolError, ElmLoaderTarget};
+use elm_model::{ELM_API_FEATURES_V1, ELM_API_VERSION_V1, ElmEbiArch, ElmEbiImportDecl, sha256};
 use kernel_symbols::{
     KERNEL_SYMBOL_KIND_FUNCTION, KERNEL_SYMBOL_KIND_METHOD, KERNEL_SYMBOL_KIND_STATIC,
     KernelSymbolDescriptorV1,
 };
+
+/// 当前直接内核符号 Profile 使用的桥接 ABI 版本。
+pub(crate) const KERNEL_API_BRIDGE_ABI_VERSION: u16 = 1;
 
 unsafe extern "C" {
     static __elm_kernel_symbols_start: u8;
@@ -36,6 +41,51 @@ pub(crate) struct ResolvedKernelSymbol {
     pub retained_argument_mask: u64,
     pub rust_abi_hash: [u8; 32],
     pub address: usize,
+}
+
+/// 把内核链接期符号目录暴露给容器无关 Loader 的宿主适配器。
+pub(crate) struct KernelSymbolHost {
+    arch: ElmEbiArch,
+}
+
+impl KernelSymbolHost {
+    pub(crate) const fn new(arch: ElmEbiArch) -> Self {
+        Self { arch }
+    }
+}
+
+impl ElmHostOps for KernelSymbolHost {
+    fn target(&self) -> ElmLoaderTarget<'_> {
+        ElmLoaderTarget {
+            arch: self.arch,
+            core_version: 1,
+            elmapi_versions: &[ELM_API_VERSION_V1],
+            elmapi_features: ELM_API_FEATURES_V1,
+        }
+    }
+
+    fn resolve_kernel_symbol(
+        &self,
+        import: &ElmEbiImportDecl,
+    ) -> Result<ElmHostSymbol, ElmHostSymbolError> {
+        resolve(import, ::kernel_symbols::capability::ALL)
+            .map(|symbol| ElmHostSymbol {
+                kind: symbol.kind,
+                version: symbol.version,
+                capabilities: symbol.capabilities,
+                flags: symbol.flags,
+                retained_argument_mask: symbol.retained_argument_mask,
+                rust_abi_hash: symbol.rust_abi_hash,
+                address: symbol.address,
+            })
+            .map_err(|error| match error {
+                KernelSymbolError::NotFound => ElmHostSymbolError::NotFound,
+                KernelSymbolError::CapabilityDenied => ElmHostSymbolError::CapabilityDenied,
+                KernelSymbolError::MalformedCatalog | KernelSymbolError::DuplicateIdentity => {
+                    ElmHostSymbolError::MalformedCatalog
+                }
+            })
+    }
 }
 
 fn catalog() -> Result<&'static [KernelSymbolDescriptorV1], KernelSymbolError> {
@@ -75,6 +125,42 @@ pub(crate) fn validate_catalog() -> Result<(), KernelSymbolError> {
         }
     }
     Ok(())
+}
+
+/// 计算当前链接目录的规范 API Profile 摘要。
+pub(crate) fn catalog_profile_hash() -> Result<[u8; 32], KernelSymbolError> {
+    const DOMAIN: &[u8] = b"ELM-KERNEL-API-PROFILE-V1\0";
+    const ABI_MODE: &[u8] = b"exact-rust";
+
+    let mut symbols = catalog()?.iter().collect::<Vec<_>>();
+    symbols.sort_by(|left, right| {
+        left.api_path
+            .cmp(right.api_path)
+            .then_with(|| left.contract.cmp(right.contract))
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    let mut hash = elm_model::Sha256::new();
+    hash.update(DOMAIN);
+    hash.update(&KERNEL_API_BRIDGE_ABI_VERSION.to_le_bytes());
+    hash.update(&(symbols.len() as u64).to_le_bytes());
+    for symbol in symbols {
+        hash.update(&[symbol.kind]);
+        hash.update(&symbol.flags.to_le_bytes());
+        hash.update(&symbol.version.to_le_bytes());
+        hash.update(&symbol.capabilities.to_le_bytes());
+        hash.update(&symbol.retained_argument_mask.to_le_bytes());
+        hash_profile_field(&mut hash, symbol.api_path.as_bytes());
+        hash_profile_field(&mut hash, symbol.item_path.as_bytes());
+        hash_profile_field(&mut hash, symbol.contract.as_bytes());
+        hash_profile_field(&mut hash, symbol.rust_abi.as_bytes());
+        hash_profile_field(&mut hash, ABI_MODE);
+    }
+    Ok(hash.finish())
+}
+
+fn hash_profile_field(hash: &mut elm_model::Sha256, value: &[u8]) {
+    hash.update(&(value.len() as u64).to_le_bytes());
+    hash.update(value);
 }
 
 /// 按 EBI 导入声明解析一个真实内核函数、方法或静态对象地址。
@@ -145,21 +231,13 @@ pub(crate) fn matches_resolved(
                 && symbol.version == version
                 && symbol.capabilities == capabilities
                 && symbol.address as usize == address
-                && (sha256(symbol.rust_abi.as_bytes()) == rust_abi_hash
-                    || kernel_symbol_interface_abi_hash(
-                        symbol.rust_abi.as_bytes(),
-                        symbol.interface_hash,
-                    ) == rust_abi_hash)
+                && sha256(symbol.rust_abi.as_bytes()) == rust_abi_hash
         })
     })
 }
 
-fn symbol_abi_hash(symbol: &KernelSymbolDescriptorV1, exact: bool) -> [u8; 32] {
-    if exact {
-        kernel_symbol_interface_abi_hash(symbol.rust_abi.as_bytes(), symbol.interface_hash)
-    } else {
-        sha256(symbol.rust_abi.as_bytes())
-    }
+fn symbol_abi_hash(symbol: &KernelSymbolDescriptorV1, _exact: bool) -> [u8; 32] {
+    sha256(symbol.rust_abi.as_bytes())
 }
 
 #[cfg(feature = "kernel-tests")]

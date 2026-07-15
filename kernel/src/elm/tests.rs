@@ -1321,6 +1321,8 @@ fn eki_abi_fingerprint_block(arch: ElmEbiArch) -> Vec<u8> {
     out[24..56].copy_from_slice(&fingerprint.rustc_commit_hash);
     out[56..88].copy_from_slice(&fingerprint.target_spec_hash);
     out[88..120].copy_from_slice(&fingerprint.kernel_interface_hash);
+    out[120..152].copy_from_slice(&fingerprint.kernel_api_profile_hash);
+    write_u16(&mut out, 152, fingerprint.kernel_api_bridge_abi_version);
     out
 }
 
@@ -2316,6 +2318,30 @@ fn elm_trust_rejects_abi_mismatch_before_unsigned_fallback() {
     );
     assert_eq!(core.cells().len(), 2);
     assert_eq!(core.trust_runtime_info().accepted_epoch_count, 0);
+}
+
+#[ktest]
+fn elm_trust_rejects_kernel_api_profile_mismatch() {
+    let mut core = ElmCore::new();
+    core.set_allow_unsigned_external(true).unwrap();
+    core.init_builtin_mgr().unwrap();
+    let unit = ElmEbiUnit::new(
+        manifest("profile-mismatch-cell", ElmKind::Service),
+        ElmEbiTarget::new(ElmEbiArch::Any),
+    )
+    .with_lifecycle_hooks(lifecycle_hooks());
+    let mut fingerprint = kernel_abi_fingerprint(ElmEbiArch::Any);
+    fingerprint.kernel_api_profile_hash = [0xa5; 32];
+    fingerprint.kernel_api_bridge_abi_version =
+        super::kernel_symbols::KERNEL_API_BRIDGE_ABI_VERSION;
+    let image = ElmEbiImage::new(unit).with_abi_fingerprint(fingerprint);
+
+    let response = core.load_ebi_image(image, ElmEbiArch::Any);
+    assert_eq!(
+        response.status,
+        ElmEbiLoadStatus::AbiFingerprintRejected as i32
+    );
+    assert_eq!(core.cells().len(), 2);
 }
 
 #[ktest]

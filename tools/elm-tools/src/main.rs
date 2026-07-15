@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -14,13 +15,14 @@ use elm::{
     ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION,
     ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC,
     ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_PROOF_ALGORITHM_ED25519,
-    ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN,
-    ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN, ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION,
-    ELM_PROOF_ED25519_SIGNATURE_LEN, ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN,
-    ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiArch, ElmEbiProofV1, ElmEbiRelocationKind,
-    ElmEbiSegmentKind, ElmEkiBlockKind, ElmKind, ElmModuleDescriptorV1, ElmPanicStrategy,
-    ElmRustAbiFingerprintV1, ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest,
-    kernel_interface_manifest_v1, parse_eki_image, sha256, sha256_with_zeroed_range,
+    ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_EKI_VARIANT_DIRECTORY_VERSION,
+    ELM_EKI_VARIANT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN,
+    ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION, ELM_PROOF_ED25519_SIGNATURE_LEN,
+    ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN, ELM_RUST_ABI_FINGERPRINT_VERSION,
+    ElmEbiArch, ElmEbiProofV1, ElmEbiRelocationKind, ElmEbiSegmentKind, ElmEkiBlockKind,
+    ElmEkiSelector, ElmKind, ElmModuleDescriptorV1, ElmPanicStrategy, ElmRustAbiFingerprintV1,
+    ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest, kernel_interface_manifest_v1,
+    parse_eki_image, parse_eki_image_for, parse_eki_variants, sha256, sha256_with_zeroed_range,
     sha256_with_zeroed_ranges,
 };
 
@@ -32,7 +34,9 @@ use kernel_interface::{
     KernelInterfaceManifest, emit_kernel_symbol_probe, export_kernel_interface,
 };
 use project::{
-    ElmProjectDependency, ElmProjectManifest, cargo_build, scaffold_project, sync_framework,
+    ElmBuildMode, ElmProjectDependency, ElmProjectManifest, KernelInterfaceBundle,
+    activate_kernel_interface, cargo_build, cargo_build_integrated, cargo_check, cargo_test,
+    diagnose_project, scaffold_project, selected_kernel_interfaces, sync_framework,
 };
 use rust_metadata::{
     ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, NativeMetadata, ProviderSpec,
@@ -59,6 +63,8 @@ const BLOCK_EXTENSIONS: u32 = ElmEkiBlockKind::Extensions as u32;
 const BLOCK_API_COMPATIBILITY: u32 = ElmEkiBlockKind::ApiCompatibility as u32;
 const BLOCK_ABI_FINGERPRINT: u32 = ElmEkiBlockKind::AbiFingerprint as u32;
 const BLOCK_PROOF: u32 = ElmEkiBlockKind::Signature as u32;
+const BLOCK_VARIANT_DIRECTORY: u32 = ElmEkiBlockKind::VariantDirectory as u32;
+const BLOCK_VARIANT_IMAGE: u32 = ElmEkiBlockKind::VariantImage as u32;
 const MENU_KIND_ACTION: u32 = 2;
 const HOOK_INITIALIZE: u32 = 1;
 const HOOK_FINALIZE: u32 = 2;
@@ -132,62 +138,62 @@ struct ElmApiSpec {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("elm-tools: {err}");
+        eprintln!("cargo elm: {err}");
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
-    let Some(command) = args.get(1).map(String::as_str) else {
+    let command_index = usize::from(args.get(1).is_some_and(|argument| argument == "elm")) + 1;
+    let Some(command) = args.get(command_index).map(String::as_str) else {
         usage();
-        return Err("missing command".to_string());
+        return Err("缺少命令".to_string());
     };
+    let command_args = &args[command_index + 1..];
     match command {
-        "new" => cmd_new(&args[2..]),
-        "sync-framework" => cmd_sync_framework(&args[2..]),
-        "export-interface" => cmd_export_interface(&args[2..]),
-        "emit-symbol-probe" => cmd_emit_symbol_probe(&args[2..]),
-        "build" => cmd_build(&args[2..]),
-        "pack-metadata" | "pack" => cmd_pack_metadata(&args[2..]),
-        "pack-elf" => cmd_pack_elf(&args[2..]),
-        "inspect" => cmd_inspect(&args[2..]),
-        "hash" => cmd_hash(&args[2..]),
-        "keygen" => cmd_keygen(&args[2..]),
-        "sign" => cmd_sign(&args[2..]),
-        "verify" => cmd_verify(&args[2..]),
-        "fingerprint-header" => cmd_fingerprint_header(&args[2..]),
+        "new" => cmd_new(command_args),
+        "sync" => cmd_sync_framework(command_args),
+        "build" => cmd_build(command_args),
+        "check" => cmd_check(command_args),
+        "test" => cmd_test(command_args),
+        "doctor" => cmd_doctor(command_args),
+        "inspect" => cmd_inspect(command_args),
+        "profile-export" => cmd_export_interface(command_args),
+        "symbol-probe" => cmd_emit_symbol_probe(command_args),
+        "image-pack-metadata" => cmd_pack_metadata(command_args),
+        "image-pack-elf" => cmd_pack_elf(command_args),
+        "image-bundle" => cmd_bundle(command_args),
+        "image-hash" => cmd_hash(command_args),
+        "image-keygen" => cmd_keygen(command_args),
+        "image-sign" => cmd_sign(command_args),
+        "image-verify" => cmd_verify(command_args),
+        "internal-fingerprint-header" => cmd_fingerprint_header(command_args),
         "help" | "-h" | "--help" => {
             usage();
             Ok(())
         }
-        other => Err(format!("unknown command: {other}")),
+        other => Err(format!("未知命令: {other}")),
     }
 }
 
 fn usage() {
-    eprintln!("elm-tools commands:");
+    eprintln!("cargo elm 命令:");
     eprintln!("  new <directory> --name <name> --kind <kind> --source <identifier>");
-    eprintln!("  sync-framework <project-directory>");
+    eprintln!("  sync [project-directory]");
+    eprintln!("  check [project-directory] --arch <riscv64|loongarch64|all>");
+    eprintln!("  test [project-directory]");
+    eprintln!("  doctor [project-directory]");
     eprintln!(
-        "  export-interface <kernel-elf> --target <triple> --profile <profile> --output <directory>"
+        "  profile-export <kernel-elf> --target <triple> --profile <id> [--cargo-profile <name>] --output <directory>"
     );
-    eprintln!("  emit-symbol-probe <interface-manifest> <output.rs>");
+    eprintln!("  symbol-probe <interface-manifest> <output.rs>");
     eprintln!(
         "  build <project-directory> --arch <riscv64|loongarch64|all> --key <seed> --epoch <n>"
     );
     eprintln!("  build <project-directory> --arch <riscv64|loongarch64|all> --unsigned");
-    eprintln!(
-        "  pack-metadata <out.eki> <name> <version> <kind> [--menu <label> <description> <route>]"
-    );
-    eprintln!("  pack <out.eki> <name> <version> <kind> [--menu <label> <description> <route>]");
-    eprintln!("  pack-elf <project-directory> <image.elf> <out.eki>");
     eprintln!("  inspect <file.eki>");
-    eprintln!("  hash <in.eki> <out.eki>");
-    eprintln!("  keygen <private-seed.bin> <public-key.bin>");
-    eprintln!("  sign <in.eki> <out.eki> <private-seed.bin> <source-id> <release-epoch>");
-    eprintln!("  verify <file.eki>");
-    eprintln!("  fingerprint-header <target-triple> <output-header>");
+    eprintln!("  image-bundle <out.eki> --variant <profile-manifest> <image.eki> <priority> [...]");
 }
 
 fn cmd_new(args: &[String]) -> Result<(), String> {
@@ -208,30 +214,39 @@ fn cmd_new(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_sync_framework(args: &[String]) -> Result<(), String> {
-    if args.len() != 1 {
+    if args.len() > 1 {
         usage();
-        return Err("sync-framework 参数无效".to_string());
+        return Err("sync 参数无效".to_string());
     }
-    sync_framework(Path::new(&args[0]))?;
-    println!("framework synchronized: {}", args[0]);
+    let project = args.first().map_or_else(|| Path::new("."), Path::new);
+    sync_framework(project)?;
+    println!("ELM 工程已同步: {}", project.display());
     Ok(())
 }
 
 fn cmd_export_interface(args: &[String]) -> Result<(), String> {
     if args.is_empty() {
         usage();
-        return Err("export-interface 缺少内核 ELF".to_string());
+        return Err("profile-export 缺少内核 ELF".to_string());
     }
     let kernel = Path::new(&args[0]);
-    let options = parse_named_options(&args[1..], &["--target", "--profile", "--output"])?;
+    let options = parse_named_options(
+        &args[1..],
+        &["--target", "--profile", "--cargo-profile", "--output"],
+    )?;
     let target = required_option(&options, "--target")?;
     let profile = required_option(&options, "--profile")?;
+    let cargo_profile = options
+        .get("--cargo-profile")
+        .map(String::as_str)
+        .unwrap_or("release");
     let output = Path::new(required_option(&options, "--output")?);
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .map_err(|error| format!("定位内核仓库失败: {error}"))?;
-    let manifest = export_kernel_interface(&repository, target, profile, kernel, output)?;
+    let manifest =
+        export_kernel_interface(&repository, target, profile, cargo_profile, kernel, output)?;
     println!(
         "exported kernel interface: target={} symbols={} output={}",
         manifest.target,
@@ -244,7 +259,7 @@ fn cmd_export_interface(args: &[String]) -> Result<(), String> {
 fn cmd_emit_symbol_probe(args: &[String]) -> Result<(), String> {
     if args.len() != 2 {
         usage();
-        return Err("emit-symbol-probe 参数无效".to_string());
+        return Err("symbol-probe 参数无效".to_string());
     }
     let count = emit_kernel_symbol_probe(Path::new(&args[0]), Path::new(&args[1]))?;
     println!(
@@ -293,23 +308,28 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         }
     }
     let arch = arch.ok_or_else(|| "build 必须指定 --arch".to_string())?;
-    if unsigned {
+    let targets = selected_targets(&arch)?;
+    let manifest = ElmProjectManifest::load(project)?;
+    if manifest.mode == ElmBuildMode::Disabled {
+        if unsigned || key.is_some() || epoch.is_some() {
+            return Err("mode=n 不接受镜像签名参数".to_string());
+        }
+        remove_selected_build_artifacts(project, &manifest, targets)?;
+        println!("已跳过禁用组件: {}", manifest.name);
+        return Ok(());
+    }
+    if manifest.mode == ElmBuildMode::Integrated {
+        if unsigned || key.is_some() || epoch.is_some() {
+            return Err("mode=y 不生成 EKI，不能使用签名参数".to_string());
+        }
+    } else if unsigned {
         if key.is_some() || epoch.is_some() {
             return Err("--unsigned 不能与 --key/--epoch 同时使用".to_string());
         }
     } else if key.is_none() || epoch.is_none() || epoch == Some(0) {
         return Err("签名构建必须提供 --key 和非零 --epoch".to_string());
     }
-    let targets: &[(&str, &str)] = match arch.as_str() {
-        "riscv64" => &[("riscv64", "riscv64gc-unknown-none-elf")],
-        "loongarch64" => &[("loongarch64", "loongarch64-unknown-none")],
-        "all" => &[
-            ("riscv64", "riscv64gc-unknown-none-elf"),
-            ("loongarch64", "loongarch64-unknown-none"),
-        ],
-        _ => return Err(format!("未知 build arch: {arch}")),
-    };
-    let manifest = ElmProjectManifest::load(project)?;
+    remove_selected_build_artifacts(project, &manifest, targets)?;
     sync_framework(project)?;
     let output_dir = project.join("dist");
     fs::create_dir_all(&output_dir)
@@ -322,29 +342,224 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         None => None,
     };
     for (arch_name, target) in targets {
-        let elf = cargo_build(project, target, &manifest.cargo_name())?;
-        let unsigned_path = output_dir.join(format!(".{}-{arch_name}.unsigned.eki", manifest.name));
+        let mut interfaces = selected_kernel_interfaces(&manifest, target)?;
+        if manifest.mode == ElmBuildMode::Integrated {
+            build_integrated_profiles(project, &manifest, target, &interfaces)?;
+            continue;
+        }
+        let mut seen_profiles = BTreeSet::new();
+        interfaces.retain(|interface| {
+            seen_profiles.insert((
+                interface.manifest.interface_hash,
+                interface.manifest.bridge_abi_version,
+            ))
+        });
         let output_path = output_dir.join(format!("{}-{arch_name}.eki", manifest.name));
-        pack_elf_project(project, &elf, &unsigned_path)?;
-        if let Some(signing) = &signing {
-            let bytes = fs::read(&unsigned_path)
-                .map_err(|err| format!("读取 {} 失败: {err}", unsigned_path.display()))?;
-            let signed = sign_eki_image(
-                &bytes,
-                signing,
-                &manifest.source,
-                epoch.expect("已校验签名 epoch"),
-            )?;
-            fs::write(&output_path, signed)
+        let mut variants = Vec::new();
+        for interface in &interfaces {
+            activate_kernel_interface(project, interface)?;
+            let elf = cargo_build(project, target, &manifest.cargo_name())?;
+            let variant_path = output_dir.join(format!(
+                ".{}-{arch_name}.variant-{}.eki",
+                manifest.name,
+                short_digest(&interface.manifest.interface_hash)
+            ));
+            pack_elf_project(project, &elf, &variant_path)?;
+            let bytes = fs::read(&variant_path)
+                .map_err(|err| format!("读取 {} 失败: {err}", variant_path.display()))?;
+            fs::remove_file(&variant_path)
+                .map_err(|err| format!("删除临时镜像 {} 失败: {err}", variant_path.display()))?;
+            let bytes = if let Some(signing) = &signing {
+                sign_eki_image(
+                    &bytes,
+                    signing,
+                    &manifest.source,
+                    epoch.expect("已校验签名 epoch"),
+                )?
+            } else {
+                bytes
+            };
+            variants.push((interface.manifest.clone(), bytes, interface.priority));
+        }
+        if variants.len() == 1 {
+            fs::write(&output_path, &variants[0].1)
                 .map_err(|err| format!("写入 {} 失败: {err}", output_path.display()))?;
-            fs::remove_file(&unsigned_path).map_err(|err| format!("删除临时镜像失败: {err}"))?;
         } else {
-            fs::rename(&unsigned_path, &output_path)
-                .map_err(|err| format!("写入 {} 失败: {err}", output_path.display()))?;
+            write_variant_bundle(&output_path, &variants)?;
         }
         println!("built {}", output_path.display());
     }
     Ok(())
+}
+
+fn build_integrated_profiles(
+    project: &Path,
+    manifest: &ElmProjectManifest,
+    target: &str,
+    interfaces: &[KernelInterfaceBundle],
+) -> Result<(), String> {
+    for interface in interfaces {
+        activate_kernel_interface(project, interface)?;
+        let archive = cargo_build_integrated(project, target, &manifest.cargo_name())?;
+        if interfaces.len() == 1 {
+            println!("built {}", archive.display());
+            continue;
+        }
+        let profile = sanitize_file_component(&interface.manifest.profile);
+        let output = project.join("dist").join(format!(
+            "{}-{target}-{profile}-{}.integrated.a",
+            manifest.cargo_name(),
+            short_digest(&interface.manifest.kernel_hash)
+        ));
+        if output.exists() {
+            fs::remove_file(&output)
+                .map_err(|err| format!("删除陈旧集成归档 {} 失败: {err}", output.display()))?;
+        }
+        fs::rename(&archive, &output).map_err(|err| {
+            format!(
+                "安装 Profile {} 的集成归档 {} 失败: {err}",
+                interface.manifest.profile,
+                output.display()
+            )
+        })?;
+        println!("built {}", output.display());
+    }
+    Ok(())
+}
+
+fn short_digest(digest: &[u8; 32]) -> String {
+    hex_digest(digest)[..16].to_string()
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                byte as char
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn remove_selected_build_artifacts(
+    project: &Path,
+    manifest: &ElmProjectManifest,
+    targets: &[(&str, &str)],
+) -> Result<(), String> {
+    let output_dir = project.join("dist");
+    for (arch_name, target) in targets {
+        if !output_dir.is_dir() {
+            continue;
+        }
+        let eki = format!("{}-{arch_name}.eki", manifest.name);
+        let unsigned = format!(".{}-{arch_name}.unsigned.eki", manifest.name);
+        let variant_prefix = format!(".{}-{arch_name}.variant-", manifest.name);
+        let integrated = format!("{}-{target}.integrated.a", manifest.cargo_name());
+        let integrated_prefix = format!("{}-{target}-", manifest.cargo_name());
+        for entry in fs::read_dir(&output_dir)
+            .map_err(|err| format!("读取 {} 失败: {err}", output_dir.display()))?
+        {
+            let entry = entry.map_err(|err| format!("读取构建产物目录项失败: {err}"))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let selected = name == eki
+                || name == unsigned
+                || name.starts_with(&variant_prefix) && name.ends_with(".eki")
+                || name == integrated
+                || name.starts_with(&integrated_prefix) && name.ends_with(".integrated.a");
+            if selected && (entry.path().is_file() || entry.path().is_symlink()) {
+                fs::remove_file(entry.path()).map_err(|err| {
+                    format!("删除陈旧构建产物 {} 失败: {err}", entry.path().display())
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_check(args: &[String]) -> Result<(), String> {
+    let (project, arch) = project_and_arch(args)?;
+    let manifest = ElmProjectManifest::load(project)?;
+    if manifest.mode == ElmBuildMode::Disabled {
+        println!("已跳过禁用组件检查: {}", manifest.name);
+        return Ok(());
+    }
+    sync_framework(project)?;
+    let targets = selected_targets(&arch)?;
+    for (_, target) in targets {
+        for interface in selected_kernel_interfaces(&manifest, target)? {
+            activate_kernel_interface(project, &interface)?;
+            cargo_check(project, target, &manifest.cargo_name())?;
+            println!(
+                "检查通过: {} ({target}, profile={}, hash={})",
+                project.display(),
+                interface.manifest.profile,
+                short_digest(&interface.manifest.interface_hash)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_test(args: &[String]) -> Result<(), String> {
+    if args.len() > 1 {
+        return Err("test 最多接受一个工程目录".to_string());
+    }
+    let project = args.first().map_or_else(|| Path::new("."), Path::new);
+    cargo_test(project)?;
+    println!("开发侧测试通过: {}", project.display());
+    Ok(())
+}
+
+fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    if args.len() > 1 {
+        return Err("doctor 最多接受一个工程目录".to_string());
+    }
+    let project = args.first().map_or_else(|| Path::new("."), Path::new);
+    let report = diagnose_project(project)?;
+    print!("{report}");
+    Ok(())
+}
+
+fn project_and_arch(args: &[String]) -> Result<(&Path, String), String> {
+    let mut project = Path::new(".");
+    let mut arch = None;
+    let mut index = 0usize;
+    if args
+        .first()
+        .is_some_and(|argument| !argument.starts_with('-'))
+    {
+        project = Path::new(&args[0]);
+        index = 1;
+    }
+    while index < args.len() {
+        match args[index].as_str() {
+            "--arch" => {
+                if arch.is_some() {
+                    return Err("--arch 只能指定一次".to_string());
+                }
+                arch = Some(option_arg(args, index + 1, "--arch")?.to_string());
+                index += 2;
+            }
+            option => return Err(format!("未知 check 参数: {option}")),
+        }
+    }
+    Ok((project, arch.unwrap_or_else(|| "all".to_string())))
+}
+
+fn selected_targets(arch: &str) -> Result<&'static [(&'static str, &'static str)], String> {
+    match arch {
+        "riscv64" => Ok(&[("riscv64", "riscv64gc-unknown-none-elf")]),
+        "loongarch64" => Ok(&[("loongarch64", "loongarch64-unknown-none")]),
+        "all" => Ok(&[
+            ("riscv64", "riscv64gc-unknown-none-elf"),
+            ("loongarch64", "loongarch64-unknown-none"),
+        ]),
+        _ => Err(format!("未知架构: {arch}")),
+    }
 }
 
 fn parse_named_options(
@@ -458,6 +673,119 @@ fn cmd_pack_elf(args: &[String]) -> Result<(), String> {
     )
 }
 
+fn cmd_bundle(args: &[String]) -> Result<(), String> {
+    if args.len() < 5 || (args.len() - 1) % 4 != 0 {
+        usage();
+        return Err("image-bundle 参数无效".to_string());
+    }
+    let output = Path::new(&args[0]);
+    let mut variants: Vec<(KernelInterfaceManifest, Vec<u8>, u32)> = Vec::new();
+    let mut index = 1usize;
+    while index < args.len() {
+        if args[index] != "--variant" {
+            return Err(format!("期望 --variant，实际为 {}", args[index]));
+        }
+        let profile = KernelInterfaceManifest::load(Path::new(&args[index + 1]))?;
+        let image_path = Path::new(&args[index + 2]);
+        let image_bytes = fs::read(image_path)
+            .map_err(|error| format!("读取 {} 失败: {error}", image_path.display()))?;
+        let image = parse_eki_image(&image_bytes)
+            .map_err(|status| format!("{} 不是单变体 EKI: {status:?}", image_path.display()))?;
+        let priority = args[index + 3]
+            .parse::<u32>()
+            .map_err(|_| format!("无效变体优先级: {}", args[index + 3]))?;
+        if variants.iter().any(|(existing, _, existing_priority)| {
+            existing.interface_hash == profile.interface_hash
+                && *existing_priority == priority
+                && existing.target == profile.target
+        }) {
+            return Err("变体的 Profile、目标和优先级重复".to_string());
+        }
+        let expected_target = target_triple_for_arch(image.unit.target.arch)?;
+        if profile.target != expected_target {
+            return Err(format!(
+                "变体 {} 的 EKI 架构与 Profile 目标 {} 不一致",
+                image_path.display(),
+                profile.target
+            ));
+        }
+        variants.push((profile, image_bytes, priority));
+        index += 4;
+    }
+    if variants.len() > elm::ELM_EKI_MAX_VARIANTS {
+        return Err("EKI 变体数量超过格式上限".to_string());
+    }
+    write_variant_bundle(output, &variants)?;
+    println!(
+        "已生成多变体 EKI: {} variants={}",
+        output.display(),
+        variants.len()
+    );
+    Ok(())
+}
+
+fn write_variant_bundle(
+    output: &Path,
+    variants: &[(KernelInterfaceManifest, Vec<u8>, u32)],
+) -> Result<(), String> {
+    if variants.is_empty() || variants.len() > elm::ELM_EKI_MAX_VARIANTS {
+        return Err("多变体 EKI 的变体数量无效".to_string());
+    }
+    let mut directory = vec![0u8; 8 + variants.len() * ELM_EKI_VARIANT_RECORD_SIZE];
+    write_u16(&mut directory, 0, ELM_EKI_VARIANT_DIRECTORY_VERSION);
+    write_u16(&mut directory, 2, ELM_EKI_VARIANT_RECORD_SIZE as u16);
+    write_u32(&mut directory, 4, variants.len() as u32);
+    let mut blocks = Vec::with_capacity(variants.len() + 1);
+    let mut directory_block = PackerBlock::new(BLOCK_VARIANT_DIRECTORY, directory);
+    directory_block.flags = elm::ELM_EKI_BLOCK_FLAG_REQUIRED;
+    blocks.push(directory_block);
+    for (_, bytes, _) in variants {
+        let mut block = PackerBlock::new(BLOCK_VARIANT_IMAGE, bytes.clone());
+        block.flags = elm::ELM_EKI_BLOCK_FLAG_REQUIRED;
+        blocks.push(block);
+    }
+    for (variant_index, (profile, bytes, priority)) in variants.iter().enumerate() {
+        let image =
+            parse_eki_image(bytes).map_err(|status| format!("变体自校验失败: {status:?}"))?;
+        let offset = 8 + variant_index * ELM_EKI_VARIANT_RECORD_SIZE;
+        write_u32(&mut blocks[0].payload, offset, (variant_index + 1) as u32);
+        write_u32(
+            &mut blocks[0].payload,
+            offset + 4,
+            image.unit.target.arch as u32,
+        );
+        write_u32(&mut blocks[0].payload, offset + 8, *priority);
+        write_u16(
+            &mut blocks[0].payload,
+            offset + 12,
+            profile.bridge_abi_version,
+        );
+        blocks[0].payload[offset + 16..offset + 48].copy_from_slice(&profile.interface_hash);
+        blocks[0].payload[offset + 48..offset + 80].copy_from_slice(&sha256(bytes));
+    }
+    let bundle = eki_image_with_hash(ElmEbiArch::Any, &blocks);
+    for (profile, bytes, _) in variants {
+        let image =
+            parse_eki_image(bytes).map_err(|status| format!("变体自校验失败: {status:?}"))?;
+        parse_eki_image_for(
+            &bundle,
+            ElmEkiSelector {
+                arch: image.unit.target.arch,
+                profile_hash: profile.interface_hash,
+                bridge_abi_version: profile.bridge_abi_version,
+            },
+        )
+        .map_err(|status| format!("多变体 EKI 选择自校验失败: {status:?}"))?;
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 {} 失败: {error}", parent.display()))?;
+    }
+    fs::write(output, bundle)
+        .map_err(|error| format!("写入 {} 失败: {error}", output.display()))?;
+    Ok(())
+}
+
 fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<(), String> {
     let manifest = ElmProjectManifest::load(project)?;
     let kind = parse_kind(&manifest.kind)?;
@@ -486,6 +814,9 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
     let relocation_records =
         dynamic_runtime_relocations(&elf, &elf_bytes, &interface, &mut metadata.imports)?;
     let relocations = native_relocations_block(&elf, &metadata.imports, relocation_records)?;
+    let mut fingerprint = default_abi_fingerprint(elf.arch);
+    fingerprint.kernel_api_profile_hash = interface.interface_hash;
+    fingerprint.kernel_api_bridge_abi_version = interface.bridge_abi_version;
     let mut blocks = vec![
         PackerBlock::new(
             BLOCK_MANIFEST,
@@ -493,7 +824,7 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
         ),
         PackerBlock::new(
             BLOCK_ABI_FINGERPRINT,
-            abi_fingerprint_block(&default_abi_fingerprint(elf.arch)),
+            abi_fingerprint_block(&fingerprint),
         ),
     ];
     if let Some(menu) = &manifest.menu {
@@ -616,8 +947,30 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
             desc.flags
         );
     }
+    let variants = parse_eki_variants(&bytes)
+        .map_err(|status| format!("EKI variant directory invalid: {status:?}"))?;
+    if !variants.is_empty() {
+        for (index, variant) in variants.iter().enumerate() {
+            println!(
+                "variant[{index}] block={} arch={:?} priority={} bridge_abi={} profile={}",
+                variant.block_index,
+                variant.arch,
+                variant.priority,
+                variant.bridge_abi_version,
+                hex_digest(&variant.profile_hash)
+            );
+        }
+        return Ok(());
+    }
     let image =
         parse_eki_image(&bytes).map_err(|status| format!("EKI parse failed: {status:?}"))?;
+    if let Some(fingerprint) = &image.abi_fingerprint {
+        println!(
+            "kernel_api.profile={} bridge_abi={}",
+            hex_digest(&fingerprint.kernel_api_profile_hash),
+            fingerprint.kernel_api_bridge_abi_version
+        );
+    }
     if let Some(elmapi) = &image.unit.api_compatibility {
         println!("elmapi.root_import_index={}", elmapi.root_import_index);
         println!("elmapi.required_features=0x{:x}", elmapi.required_features);
@@ -1017,7 +1370,7 @@ impl ElfImage {
     fn parse(bytes: &[u8]) -> Result<Self, String> {
         let header = parse_elf_header(bytes)?;
         if header.file_type != ELF_TYPE_DYN {
-            return Err("ELM 原生 ELF 必须是 PIE/ET_DYN；请通过 elm-tools build 构建".to_string());
+            return Err("ELM 原生 ELF 必须是 PIE/ET_DYN；请通过 cargo elm build 构建".to_string());
         }
         let arch = arch_from_machine(header.machine)?;
         let mut load_segments = parse_elf_load_segments(bytes, &header)?;
@@ -1691,6 +2044,12 @@ fn abi_fingerprint_block(fingerprint: &ElmRustAbiFingerprintV1) -> Vec<u8> {
     out[24..56].copy_from_slice(&fingerprint.rustc_commit_hash);
     out[56..88].copy_from_slice(&fingerprint.target_spec_hash);
     out[88..120].copy_from_slice(&fingerprint.kernel_interface_hash);
+    out[120..152].copy_from_slice(&fingerprint.kernel_api_profile_hash);
+    write_u16(
+        &mut out,
+        152,
+        fingerprint.kernel_api_bridge_abi_version,
+    );
     out
 }
 
@@ -2399,5 +2758,44 @@ mod tests {
         assert_eq!(encoded.len(), 64);
         assert!(encoded.starts_with("ab00"));
         assert!(encoded.ends_with("00cd"));
+    }
+
+    #[test]
+    fn disabled_mode_removes_all_selected_stale_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "cargo-elm-disabled-artifacts-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let dist = root.join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        let manifest = ElmProjectManifest {
+            name: "demo.fabric".to_string(),
+            version: "0.1.0".to_string(),
+            kind: "driver".to_string(),
+            source: "local.demo".to_string(),
+            mode: ElmBuildMode::Disabled,
+            menu: None,
+            dependencies: Vec::new(),
+            profiles: Vec::new(),
+        };
+        let files = [
+            dist.join(".demo.fabric-riscv64.unsigned.eki"),
+            dist.join("demo.fabric-riscv64.eki"),
+            dist.join("demo-fabric-riscv64gc-unknown-none-elf.integrated.a"),
+        ];
+        for file in &files {
+            fs::write(file, b"stale").unwrap();
+        }
+
+        remove_selected_build_artifacts(
+            &root,
+            &manifest,
+            &[("riscv64", "riscv64gc-unknown-none-elf")],
+        )
+        .unwrap();
+
+        assert!(files.iter().all(|file| !file.exists()));
+        fs::remove_dir_all(root).unwrap();
     }
 }

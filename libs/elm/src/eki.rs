@@ -38,7 +38,7 @@ use crate::ports::ElmPortAccessPolicy;
 use crate::proof::{
     ELM_PROOF_ED25519_SIGNATURE_LEN, ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN,
     ELM_RUST_ABI_FINGERPRINT_VERSION, ElmEbiProofV1, ElmPanicStrategy, ElmRustAbiFingerprintV1,
-    sha256_with_zeroed_range, sha256_with_zeroed_ranges,
+    sha256, sha256_with_zeroed_range, sha256_with_zeroed_ranges,
 };
 use crate::wire::ElmMixinMode;
 
@@ -67,11 +67,17 @@ pub const ELM_EKI_ELMAPI_BLOCK_VERSION: u16 = 1;
 /// `ELM_EKI_ELMAPI_BLOCK_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_ELMAPI_BLOCK_SIZE: usize = 16 + ELM_API_MAX_COMPATIBLE_VERSIONS * 2;
 /// `ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
-pub const ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE: usize = 120;
+pub const ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE: usize = 160;
 /// `ELM_EKI_PROOF_BLOCK_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_PROOF_BLOCK_SIZE: usize = 280 + ELM_PROOF_ED25519_SIGNATURE_LEN;
 /// EKI proof block 使用 Ed25519 验证规范 EBI 摘要的算法编号。
 pub const ELM_EKI_PROOF_ALGORITHM_ED25519: u16 = 1;
+/// 多变体目录的线格式版本。
+pub const ELM_EKI_VARIANT_DIRECTORY_VERSION: u16 = 1;
+/// 多变体目录中每条记录的固定长度。
+pub const ELM_EKI_VARIANT_RECORD_SIZE: usize = 80;
+/// 一个 EKI 最多携带的目标变体数量。
+pub const ELM_EKI_MAX_VARIANTS: usize = 16;
 
 const EKI_MANIFEST_BLOCK_SIZE: usize =
     16 + ELM_EKI_MANIFEST_NAME_LEN + ELM_EKI_MANIFEST_VERSION_LEN;
@@ -142,6 +148,10 @@ pub enum ElmEkiBlockKind {
     ApiCompatibility = 20,
     /// `AbiFingerprint` 表示 `ElmEkiBlockKind` 的对象类别：`abi fingerprint`。
     AbiFingerprint = 21,
+    /// 多变体 EKI 的选择目录。
+    VariantDirectory = 22,
+    /// 目录引用的一个完整、可独立校验的内层 EKI。
+    VariantImage = 23,
 }
 
 impl ElmEkiBlockKind {
@@ -169,9 +179,39 @@ impl ElmEkiBlockKind {
             19 => Some(Self::SymbolLocations),
             20 => Some(Self::ApiCompatibility),
             21 => Some(Self::AbiFingerprint),
+            22 => Some(Self::VariantDirectory),
+            23 => Some(Self::VariantImage),
             _ => None,
         }
     }
+}
+
+/// 多变体 EKI 的宿主选择条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmEkiSelector {
+    /// 当前内核架构。
+    pub arch: ElmEbiArch,
+    /// 当前发布的内核 API Profile 摘要。
+    pub profile_hash: [u8; 32],
+    /// 动态接口适配器采用的固定桥接 ABI 版本。
+    pub bridge_abi_version: u16,
+}
+
+/// 多变体目录中的一个已验证候选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElmEkiVariantRecord {
+    /// 指向块表中 `VariantImage` 的索引。
+    pub block_index: u32,
+    /// 变体目标架构。
+    pub arch: ElmEbiArch,
+    /// 同等兼容程度下使用的显式优先级。
+    pub priority: u32,
+    /// 变体依赖的桥接 ABI 版本。
+    pub bridge_abi_version: u16,
+    /// 精确 Profile 摘要；全零表示允许按逐导入兼容规则继续验证。
+    pub profile_hash: [u8; 32],
+    /// 完整内层 EKI 的 SHA-256。
+    pub image_hash: [u8; 32],
 }
 
 #[repr(C)]
@@ -255,6 +295,64 @@ pub fn parse_eki_ebi_unit(bytes: &[u8]) -> Result<ElmEbiUnit, ElmEbiLoadStatus> 
 
 /// 执行 `parse_eki_image` 定义的模型或协议操作；返回值反映校验后的结果。
 pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
+    parse_eki_image_selected(bytes, None)
+}
+
+/// 按宿主架构、API Profile 和桥接 ABI 从 EKI 中选择并解析一个变体。
+pub fn parse_eki_image_for(
+    bytes: &[u8],
+    selector: ElmEkiSelector,
+) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
+    parse_eki_image_selected(bytes, Some(selector))
+}
+
+/// 返回多变体 EKI 的已验证目录；普通单变体 EKI 返回空集合。
+pub fn parse_eki_variants(bytes: &[u8]) -> Result<Vec<ElmEkiVariantRecord>, ElmEbiLoadStatus> {
+    let header = parse_header(bytes)?;
+    validate_header(bytes, &header)?;
+    let mut directory = None;
+    for index in 0..header.block_count as usize {
+        let offset = header.block_table_offset as usize + index * ELM_EKI_BLOCK_DESC_SIZE;
+        let desc = parse_block_desc(bytes, offset)?;
+        validate_block_desc(bytes, &desc)?;
+        if ElmEkiBlockKind::from_raw(desc.kind) == Some(ElmEkiBlockKind::VariantDirectory) {
+            if directory.replace((index, desc)).is_some() {
+                return Err(ElmEbiLoadStatus::InvalidUnit);
+            }
+        }
+    }
+    directory.map_or_else(
+        || Ok(Vec::new()),
+        |(directory_index, directory)| {
+            validate_variant_bundle(bytes, &header, directory_index, &directory)
+        },
+    )
+}
+
+fn parse_eki_image_selected(
+    bytes: &[u8],
+    selector: Option<ElmEkiSelector>,
+) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
+    let header = parse_header(bytes)?;
+    validate_header(bytes, &header)?;
+    let mut variant_directory = None;
+    for index in 0..header.block_count as usize {
+        let desc_offset = header.block_table_offset as usize + index * ELM_EKI_BLOCK_DESC_SIZE;
+        let desc = parse_block_desc(bytes, desc_offset)?;
+        validate_block_desc(bytes, &desc)?;
+        if ElmEkiBlockKind::from_raw(desc.kind) == Some(ElmEkiBlockKind::VariantDirectory) {
+            if variant_directory.replace((index, desc)).is_some() {
+                return Err(ElmEbiLoadStatus::InvalidUnit);
+            }
+        }
+    }
+    if let Some((directory_index, directory)) = variant_directory {
+        return parse_variant_bundle(bytes, &header, directory_index, &directory, selector);
+    }
+    parse_single_eki_image(bytes)
+}
+
+fn parse_single_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     let header = parse_header(bytes)?;
     validate_header(bytes, &header)?;
 
@@ -395,6 +493,9 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
                 proof = Some(parse_proof(payload)?);
                 proof_range = Some((desc.offset as usize, desc.file_size as usize));
             }
+            ElmEkiBlockKind::VariantDirectory | ElmEkiBlockKind::VariantImage => {
+                return Err(ElmEbiLoadStatus::InvalidUnit);
+            }
         }
     }
 
@@ -511,6 +612,181 @@ pub fn parse_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     }
     image.validate(ElmEbiArch::Any)?;
     Ok(image)
+}
+
+fn parse_variant_bundle(
+    bytes: &[u8],
+    header: &ElmEkiHeader,
+    directory_index: usize,
+    directory: &ElmEkiBlockDesc,
+    selector: Option<ElmEkiSelector>,
+) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
+    let records = validate_variant_bundle(bytes, header, directory_index, directory)?;
+    let mut selected: Option<(ElmEkiVariantRecord, bool)> = None;
+    for record in records {
+        let exact_profile = selector.is_some_and(|selector| {
+            record.profile_hash != [0; 32] && record.profile_hash == selector.profile_hash
+        });
+        let compatible = selector.map_or(header.block_count == 2, |selector| {
+            (record.arch == ElmEbiArch::Any || record.arch == selector.arch)
+                && (record.profile_hash == [0; 32]
+                    || record.bridge_abi_version == selector.bridge_abi_version && exact_profile)
+        });
+        if !compatible {
+            continue;
+        }
+        match selected {
+            None => selected = Some((record, exact_profile)),
+            Some((current, current_exact))
+                if exact_profile > current_exact
+                    || exact_profile == current_exact && record.priority > current.priority =>
+            {
+                selected = Some((record, exact_profile));
+            }
+            Some((current, current_exact))
+                if exact_profile == current_exact && record.priority == current.priority =>
+            {
+                return Err(ElmEbiLoadStatus::InvalidTarget);
+            }
+            Some(_) => {}
+        }
+    }
+    let (selected, _) = selected.ok_or(ElmEbiLoadStatus::UnsupportedAbi)?;
+    let desc_offset = header.block_table_offset as usize
+        + (selected.block_index as usize)
+            .checked_mul(ELM_EKI_BLOCK_DESC_SIZE)
+            .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+    let desc = parse_block_desc(bytes, desc_offset)?;
+    let payload = block_payload(bytes, &desc)?;
+    let image = parse_single_eki_image(payload)?;
+    if let Some(selector) = selector {
+        image.validate(selector.arch)?;
+    }
+    Ok(image)
+}
+
+fn validate_variant_bundle(
+    bytes: &[u8],
+    header: &ElmEkiHeader,
+    directory_index: usize,
+    directory: &ElmEkiBlockDesc,
+) -> Result<Vec<ElmEkiVariantRecord>, ElmEbiLoadStatus> {
+    if ElmEbiArch::from_raw(header.arch) != Some(ElmEbiArch::Any) {
+        return Err(ElmEbiLoadStatus::InvalidTarget);
+    }
+    for index in 0..header.block_count as usize {
+        let offset = header.block_table_offset as usize + index * ELM_EKI_BLOCK_DESC_SIZE;
+        let desc = parse_block_desc(bytes, offset)?;
+        let kind = ElmEkiBlockKind::from_raw(desc.kind).ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+        if index == directory_index {
+            if kind != ElmEkiBlockKind::VariantDirectory {
+                return Err(ElmEbiLoadStatus::InvalidUnit);
+            }
+        } else if kind != ElmEkiBlockKind::VariantImage {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
+    }
+
+    let records = parse_variant_directory(block_payload(bytes, directory)?)?;
+    let mut referenced = [false; ELM_EKI_MAX_BLOCKS];
+    for record in &records {
+        let block_index = record.block_index as usize;
+        if block_index >= header.block_count as usize
+            || block_index == directory_index
+            || referenced[block_index]
+        {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
+        referenced[block_index] = true;
+        let desc_offset = header.block_table_offset as usize
+            + block_index
+                .checked_mul(ELM_EKI_BLOCK_DESC_SIZE)
+                .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+        let desc = parse_block_desc(bytes, desc_offset)?;
+        if ElmEkiBlockKind::from_raw(desc.kind) != Some(ElmEkiBlockKind::VariantImage) {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
+        let payload = block_payload(bytes, &desc)?;
+        if sha256(payload) != record.image_hash {
+            return Err(ElmEbiLoadStatus::RuntimeRejected);
+        }
+        let image = parse_single_eki_image(payload)?;
+        if image.unit.target.arch != record.arch {
+            return Err(ElmEbiLoadStatus::InvalidTarget);
+        }
+        let fingerprint = image
+            .abi_fingerprint
+            .as_ref()
+            .ok_or(ElmEbiLoadStatus::AbiFingerprintRejected)?;
+        if fingerprint.kernel_api_profile_hash != record.profile_hash
+            || fingerprint.kernel_api_bridge_abi_version != record.bridge_abi_version
+        {
+            return Err(ElmEbiLoadStatus::AbiFingerprintRejected);
+        }
+    }
+    if referenced
+        .iter()
+        .take(header.block_count as usize)
+        .enumerate()
+        .any(|(index, referenced)| index != directory_index && !referenced)
+    {
+        return Err(ElmEbiLoadStatus::InvalidUnit);
+    }
+    Ok(records)
+}
+
+fn parse_variant_directory(payload: &[u8]) -> Result<Vec<ElmEkiVariantRecord>, ElmEbiLoadStatus> {
+    if payload.len() < 8
+        || read_u16(payload, 0)? != ELM_EKI_VARIANT_DIRECTORY_VERSION
+        || read_u16(payload, 2)? as usize != ELM_EKI_VARIANT_RECORD_SIZE
+    {
+        return Err(ElmEbiLoadStatus::InvalidUnit);
+    }
+    let count = read_u32(payload, 4)? as usize;
+    if count == 0 || count > ELM_EKI_MAX_VARIANTS {
+        return Err(ElmEbiLoadStatus::InvalidUnit);
+    }
+    let expected = 8usize
+        .checked_add(
+            count
+                .checked_mul(ELM_EKI_VARIANT_RECORD_SIZE)
+                .ok_or(ElmEbiLoadStatus::InvalidUnit)?,
+        )
+        .ok_or(ElmEbiLoadStatus::InvalidUnit)?;
+    if payload.len() != expected {
+        return Err(ElmEbiLoadStatus::InvalidUnit);
+    }
+    let mut records = Vec::new();
+    records
+        .try_reserve_exact(count)
+        .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
+    for index in 0..count {
+        let offset = 8 + index * ELM_EKI_VARIANT_RECORD_SIZE;
+        let arch = ElmEbiArch::from_raw(read_u32(payload, offset + 4)?)
+            .ok_or(ElmEbiLoadStatus::InvalidTarget)?;
+        let bridge_abi_version = read_u16(payload, offset + 12)?;
+        let mut profile_hash = [0u8; 32];
+        profile_hash.copy_from_slice(read_bytes(payload, offset + 16, 32)?);
+        if read_u16(payload, offset + 14)? != 0
+            || (profile_hash == [0; 32]) != (bridge_abi_version == 0)
+        {
+            return Err(ElmEbiLoadStatus::UnsupportedAbi);
+        }
+        let mut image_hash = [0u8; 32];
+        image_hash.copy_from_slice(read_bytes(payload, offset + 48, 32)?);
+        if image_hash == [0; 32] {
+            return Err(ElmEbiLoadStatus::InvalidUnit);
+        }
+        records.push(ElmEkiVariantRecord {
+            block_index: read_u32(payload, offset)?,
+            arch,
+            priority: read_u32(payload, offset + 8)?,
+            bridge_abi_version,
+            profile_hash,
+            image_hash,
+        });
+    }
+    Ok(records)
 }
 
 fn parse_header(bytes: &[u8]) -> Result<ElmEkiHeader, ElmEbiLoadStatus> {
@@ -717,6 +993,7 @@ fn parse_abi_fingerprint(payload: &[u8]) -> Result<ElmRustAbiFingerprintV1, ElmE
         || read_u16(payload, 0)? != ELM_RUST_ABI_FINGERPRINT_VERSION
         || read_u16(payload, 6)? != 0
         || read_u32(payload, 20)? != 0
+        || read_bytes(payload, 154, 6)?.iter().any(|byte| *byte != 0)
     {
         return Err(ElmEbiLoadStatus::UnsupportedAbi);
     }
@@ -725,13 +1002,17 @@ fn parse_abi_fingerprint(payload: &[u8]) -> Result<ElmRustAbiFingerprintV1, ElmE
     let mut rustc_commit_hash = [0u8; ELM_PROOF_SHA256_LEN];
     let mut target_spec_hash = [0u8; ELM_PROOF_SHA256_LEN];
     let mut kernel_interface_hash = [0u8; ELM_PROOF_SHA256_LEN];
+    let mut kernel_api_profile_hash = [0u8; ELM_PROOF_SHA256_LEN];
     rustc_commit_hash.copy_from_slice(read_bytes(payload, 24, ELM_PROOF_SHA256_LEN)?);
     target_spec_hash.copy_from_slice(read_bytes(payload, 56, ELM_PROOF_SHA256_LEN)?);
     kernel_interface_hash.copy_from_slice(read_bytes(payload, 88, ELM_PROOF_SHA256_LEN)?);
+    kernel_api_profile_hash.copy_from_slice(read_bytes(payload, 120, ELM_PROOF_SHA256_LEN)?);
     let fingerprint = ElmRustAbiFingerprintV1 {
         rustc_commit_hash,
         target_spec_hash,
         kernel_interface_hash,
+        kernel_api_profile_hash,
+        kernel_api_bridge_abi_version: read_u16(payload, 152)?,
         elmapi_version: read_u16(payload, 2)?,
         panic_strategy,
         code_model: payload[5],

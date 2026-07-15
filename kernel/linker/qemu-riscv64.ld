@@ -47,6 +47,10 @@ SECTIONS
         KEEP(*(.elm.kernel_symbols .elm.kernel_symbols.*))
         PROVIDE(__elm_kernel_symbols_end = .);
         . = ALIGN(8);
+        PROVIDE(__kernel_integrated_components_start = .);
+        KEEP(*(.kernel.integrated_components .kernel.integrated_components.*))
+        PROVIDE(__kernel_integrated_components_end = .);
+        . = ALIGN(8);
         *(.eh_frame_hdr)
         *(.eh_frame)
     }

@@ -28,7 +28,7 @@ use crate::menu::{
 };
 use crate::mgr::{ELM_MGR_RELATION_POINT_LEN, ELM_NEXUS_CONTRACT_LEN};
 use crate::nexus::{FlowContract, FlowDirection, FlowMode};
-use crate::proof::{ElmEbiProofV1, ElmRustAbiFingerprintV1, canonical_ebi_digest, sha256};
+use crate::proof::{ElmEbiProofV1, ElmRustAbiFingerprintV1, canonical_ebi_digest};
 use crate::wire::{ElmMixinMode, ElmPortAccessPolicy};
 
 /// `ELM_EBI_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
@@ -126,23 +126,6 @@ pub const ELM_EBI_RELOCATION_FLAG_NONE: u32 = 0;
 /// `ELM_EBI_RUST_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_EBI_RUST_ABI_VERSION: u16 = 1;
 
-/// 计算精确 Rust 内核符号接口使用的 ABI 摘要。
-///
-/// 普通直接符号只摘要规范签名；精确接口导入还必须绑定由具体符号目录定义的完整接口
-/// 身份，防止相同函数签名在不同 crate identity、类型布局或 feature 图之间被错误复用。
-pub fn kernel_symbol_interface_abi_hash(
-    rust_abi: &[u8],
-    interface_hash: [u8; ELM_EBI_RUST_ABI_HASH_LEN],
-) -> [u8; ELM_EBI_RUST_ABI_HASH_LEN] {
-    const DOMAIN: &[u8] = b"ELM-KERNEL-RUST-INTERFACE-V1\0";
-
-    let mut input = Vec::with_capacity(DOMAIN.len() + 8 + rust_abi.len() + interface_hash.len());
-    input.extend_from_slice(DOMAIN);
-    input.extend_from_slice(&(rust_abi.len() as u64).to_le_bytes());
-    input.extend_from_slice(rust_abi);
-    input.extend_from_slice(&interface_hash);
-    sha256(&input)
-}
 /// `ELM_EBI_HOOK_FLAG_NONE` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_HOOK_FLAG_NONE: u32 = 0;
 /// 生命周期 hook presence mask 中表示 `initialize` 钩子已声明的位。

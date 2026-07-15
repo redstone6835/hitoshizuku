@@ -18,6 +18,7 @@ members = [
     "libs/extfs",
     "libs/elm",
     "libs/elm/macros",
+    "libs/elm-loader",
     "libs/kernel-symbols",
     "libs/kernel-symbols/macros",
     "libs/mygo-smoltcp",

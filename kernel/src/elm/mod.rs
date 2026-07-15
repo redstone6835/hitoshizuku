@@ -23,6 +23,10 @@ pub(crate) mod syscall;
 mod tests;
 mod trust_config;
 
+pub(crate) fn kernel_interface_profile_hash() -> Result<[u8; 32], &'static str> {
+    kernel_symbols::catalog_profile_hash().map_err(|_| "内核符号目录无效")
+}
+
 pub(crate) fn init_builtin_mgr() {
     let _ = allocator::kernel_symbol_catalog_anchor();
     let _ = general::kernel_symbol_catalog_anchor();

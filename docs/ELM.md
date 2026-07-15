@@ -651,13 +651,14 @@ demo    source=eki
 - `MGR_CALL(LoadCell)` 接收 96 字节 `ElmEbiSourceRequest`，当 `source_kind == Projection` 时，其后必须是 24 字节 `ElmProjectionSourceRequest` 和对应格式 payload。请求必须显式给出非零父单元 ID 和初始预算。`ELM_EBI_SOURCE_FLAG_GRANT_MANAGEMENT` 只允许 Kernel、UserAdmin 或内建 `elm-mgr` 发起，并且只对经过完整签名验证、kind 为 Manager、父单元已持有 management capability 的镜像生效；普通子单元不会继承该能力。EKI 使用 provider ID `0x454b_4900_0000_0001`；启动期 `elm-mgr` 和 `eki` 均使用 Builtin source，测试和内核内部可直接走 Memory source 的 EBI 单元入口。
 - 内建 EKI Projection Source 会校验 `Code`、`ReadOnlyData`、`Data`、`Bss`、`Relocation`、`Notes` payload block 与 `Segments` 表逐项一致，再展开为 EBI segment 元数据。
 - 内建 EKI Projection Source 支持 header SHA-256 内容证明；`image_hash_offset/image_hash_size` 非 0 时必须指向 32 字节 SHA-256，校验规则为把该 32 字节范围视为全 0 后覆盖整份 EKI 文件计算摘要。
-- 外部 EBI image 必须携带 Rust ABI fingerprint，运行时会校验 `elmapi v1`、panic 策略、代码模型、目标特性、rustc 标识、target spec 和内核 API 标识；不匹配会在执行任何镜像代码前返回 `ABI_FINGERPRINT`。
+- 外部 EBI image 必须携带 Rust ABI fingerprint，运行时会校验 `elmapi v1`、panic 策略、代码模型、目标特性、target spec 和内核 API 标识；只有实际导入 `exact-rust` 内核符号时才强制 rustc 标识一致。不匹配会在执行任何镜像代码前返回 `ABI_FINGERPRINT`。
 - `ElmEbiProofV1` 对 canonical EBI digest、来源 identifier、来源摘要、签名者 key id、公钥、release epoch 和 ABI fingerprint 进行 Ed25519 签名。无效 proof 即使在允许 unsigned 的测试策略下也不能降级为 unsigned 装载。
 - 构建时可通过 `ELM_TRUST_ANCHORS_FILE=<path>` 注入信任根。兼容格式为 `<key-identifier> <64位Ed25519公钥十六进制>`，完整格式为 `<key-identifier> <rollback-authority-identifier> <64位Ed25519公钥十六进制>`；兼容格式把 key identifier 同时作为 rollback authority。多个轮换 key 可以共享同一个稳定 rollback authority，构建脚本会拒绝无效 identifier、公钥长度、十六进制、公钥、重复 key identifier 和重复公钥；信任根在 `elm-mgr` 初始化时恢复持久回滚下界后立即 seal。
 - 信任库按“稳定 rollback authority 摘要 + 模块名摘要”记录已接受 release epoch，而不是按签名 key 划分回滚域。轮换 key 只负责当前镜像验签，不能通过更换 key 绕过已有 epoch；低于已接受 epoch 的镜像会返回 `ROLLBACK_REJECTED`。验签接受记录先写入 runtime journal，再提交内存信任状态；持久 journal 启动回放会压缩并恢复每个回滚域的最高 epoch。`QueryTrustState` 暴露 sealed、anchor、revocation、accepted epoch 和 unsigned-active 状态。
-- 内建 EKI Projection Source 仍能解析旧式 `LifecycleHooks` block，但 `elm-tools` 不再为新 Rust ELM 生成该 block。
+- 内建 EKI Projection Source 仍能解析旧式 `LifecycleHooks` block，但 `cargo elm` 不再为新 Rust ELM 生成该 block。
 - 内建 EKI Projection Source 已支持 `SymbolLocations` 元数据 block，用于定位统一模块描述符、provider、import/export 和其他原生符号。
 - 内建 EKI Projection Source 已支持 imports 和 exports 元数据 block。受管和 `direct-pinned` import 通过 ELM Core 的原生 export 注册表解析；`kernel-symbol` 通过链接期常驻目录解析，并在段重定位前生成真实地址绑定。
+- EKI 已支持 `VariantDirectory` 与 `VariantImage`：外层镜像只包含选择目录和完整内层 EKI，目录记录架构、桥接 ABI、Profile 摘要、优先级和内层 SHA-256。每个内层 EKI 的 ABI 指纹同时携带 Profile 摘要与桥接 ABI，并由 EBI proof 签名；解析器会逐个验证一一引用、无孤儿块、摘要以及目录与内层架构、Profile、桥接 ABI 的严格一致性，目录不能把一个已签名变体重新标记为另一套内核接口。全部候选验证完成后，解析器才执行无歧义选择并把选中镜像投影为 EBI。
 - `MGR_CALL(ReplaceCell)` 接收 `ElmReplaceCellRequestV1 + ElmProjectionSourceRequest + source payload`，适用于所有已注册 Projection Source。`migration_limit == 0` 表示使用默认 64 KiB 上限，非 0 时不得超过该上限。
 - Projection Source 会按 provider ID 调用已注册投影器；注册表负责 owner、generation、影子 source、活动引用、暂停、原子切换和退役。Busy 退役与恢复冲突会在修改状态前失败，不产生半退役 source。Builtin/Memory 外部请求返回 `UNSUPPORTED`。
 - 空 payload、非法 EBI Source 请求、损坏 EKI 或未知 Source kind 会返回 `INVALID`。
@@ -665,7 +666,7 @@ demo    source=eki
 尚未完成的格式与生态边界只有：
 
 - TODO(elm)：未来 soyo ELM profile 和其他容器到 EBI 协议对象的独立 Projection Source。
-- TODO(elm)：外部 Rust ELM 的调试符号归档、依赖锁定和发布仓库流程。attribute 开发框架、独立仓库模板、双架构 PIE 构建、EKI 打包、签名和运行期装载链路已经完成。
+- TODO(elm)：外部 Rust ELM 的调试符号归档和发布仓库流程。`Elm.lock`、attribute 开发框架、独立仓库模板、双架构 PIE 构建、Profile 多变体、EKI 打包、签名和运行期装载链路已经完成。
 
 ## 14. 模型层模块设计：`libs/elm`
 
@@ -1254,9 +1255,12 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - 无 Code/entry/relocation 的声明式 EBI 会由运行时默认生命周期闭合并直接进入 `Active`；带 Code/entry/relocation 但缺少架构映射 ops 的环境会登记为 `Loaded + NativeCodeTodo`，不执行代码。
 - 外部 no_std Rust ELM 使用同名 `allocator` 接口 crate 提供的 `KERNEL_ALLOCATOR` 作为全局分配器，可以直接使用 `Box`、`Vec`、`String` 和 `Arc`。四个 `GlobalAlloc` 入口在装载期绑定到常驻内核全局分配器；分配热路径通过当前 ELM 执行上下文自动计入 cell 预算，不需要 namespace、函数表或授权 token。
 - `elm` 已提供独立的 module 编译面和 attribute 开发框架：`#[elm::module]` 注册唯一 `ElmModule` 实现；provider、export 和 mixin attribute 可以标记该实现的方法；`#[elm::import]`、`#[elm::kernel_symbol]` 和 `#[elm::payload]` 声明显式镜像协议。普通 allocator 与设备代码直接使用原 crate 的类型、trait、方法和静态对象，不需要再用设备专用 attribute 重写一套模型。
-- `tools/elm-tools build` 已能把外部 Rust 仓库固定构建为 ELF64 little-endian PIE，再转换为带 header SHA-256 的 EKI：它会抽取页对齐连续 `PT_LOAD` 段、统一模块描述符、native import/export、Rust ABI 摘要、provider、mixin 和 payload 元数据，并把 `R_RISCV_RELATIVE` / `R_LARCH_RELATIVE` 转换为 EBI `ImageBase64` 重定位。非 `ET_DYN`、text relocation、未知动态重定位或不兼容布局会在打包期被拒绝。
+- `cargo elm build` 已能把外部 Rust 仓库固定构建为 ELF64 little-endian PIE，再转换为带 header SHA-256 的 EKI：它会抽取页对齐连续 `PT_LOAD` 段、统一模块描述符、native import/export、Rust ABI 摘要、provider、mixin 和 payload 元数据，并把 `R_RISCV_RELATIVE` / `R_LARCH_RELATIVE` 转换为 EBI `ImageBase64` 重定位。非 `ET_DYN`、text relocation、未知动态重定位或不兼容布局会在打包期被拒绝。
 - `DirectImport<F>` 和 `direct-pinned` export 已按规范函数签名生成完整 SHA-256，并在 ELM 间解析时要求名称、契约、版本和摘要全部匹配。`#[elm::kernel_symbol]` 使用同一类型化槽协议；常驻目录已实现名称、契约、最高兼容版本、ABI 摘要、接口指纹和能力策略校验，可选导入允许空槽，必需导入失败会在执行任何模块代码前终止装载。
-- `elm-tools new`、`sync-framework`、`build`、`sign` 和 `verify` 已形成独立仓库闭环；同一 hello ELM 已在 RISC-V64 与 LoongArch64 QEMU 中通过签名装载，生命周期日志、`Active` 状态、信任 epoch、故障计数和 Core health 均验证通过。
+- `cargo elm new/sync/check/build/doctor/inspect` 与 `image-*` 命令已形成独立仓库闭环；同一 hello ELM 已在 RISC-V64 与 LoongArch64 QEMU 中通过签名装载，生命周期日志、`Active` 状态、信任 epoch、故障计数和 Core health 均验证通过。
+- `Elm.toml` 的 `mode = "m" | "y" | "n"` 已成为唯一构建模式：`m` 生成受 elm-mgr 管理的 EKI，`y` 生成带 API Profile 摘要的普通内核 initcall 归档且不创建 ELM cell，`n` 清除该组件的陈旧镜像/归档并完全跳过构建。模式切换不会遗留可被误用的旧产物。
+- `[[profiles]]` 可以声明多个内核 API Profile 和优先级；未声明时自动覆盖接口仓库中目标架构的全部可用 Profile。`cargo elm` 为每个接口摘要独立编译同一源码，注入 `elm_kernel_api` 与 `elm_kernel_profile` cfg，并自动生成 EKI Variant Directory。内核按架构、桥接 ABI 和实时符号目录摘要选择唯一变体。
+- `libs/elm-loader` 已承担容器无关 EBI 预检：目标架构、Core/elmapi 版本、必需特性、直接内核符号、可选导入和能力并集只在这一层协商；EKI 只是当前内建 Projection Source，Loader 不依赖 EKI、soyo、VFS 或具体映射器。
 - Core 已记录动态单元生命周期声明、测试执行器可用性、初始化状态、完成卸载状态、pending EBI load 计划、EBI Source kind、资源预算、native fault 次数和软隔离状态；启动期 `elm-mgr` 作为 Builtin Source 根单元进入同一套 EBI 模型，启动期 `eki` 作为 Builtin Source 子单元挂在 `elm-mgr` 下。
 - `ElmContext` 已作为 Rust 生命周期上下文进入模型层，当前不进入 `sys_elm_ctl` 字节 ABI。
 - kernel-tests 已具备受控生命周期测试执行器：可验证无原生镜像单元初始化后激活菜单、拓扑和 provider，初始化失败隔离，卸载前 finalize，以及 finalize 失败保留资源。
@@ -1286,7 +1290,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 - `userland/elmctl/`：正式管理工具骨架，构建后安装为 `/bin/elmctl`。它使用共享 C ABI 头和 client helper，支持 Core query、snapshot、全局事件、debug dump、所有 `elm-mgr` 查询命令、EKI 装载/替换、生命周期操作、绑定/解绑、runtime log/event、provider 注册/注销/调用、异步 provider、provider snapshot 和事件订阅。管理器自有查询表会结构化解码；具体子系统 provider 的业务 payload 保持十六进制输出，由对应子系统协议解释。
 - `userland/elmctl-smoke/elmctl_smoke.c`：运行期验收工具，构建后安装为 `/bin/elmctl-smoke`。它不依赖 Linux 模块 ABI，不使用 ioctl，不读取 `/proc` 或 `/sys`，只直接调用私有系统调用 `SYS_ELM_CTL` 并执行固定验收步骤。
-- `tools/elm-tools/`：宿主侧 EKI 与 Rust ELM 工程工具，不加入主 workspace。当前支持 `new` 创建独立仓库、`sync-framework` 同步 `elm`、`kernel-symbols`、同名 `allocator` 和 `general` 接口 crate、`build` 执行双架构 PIE 构建/打包/签名，以及 `pack-metadata`、`pack-elf`、`inspect`、`hash`、`keygen`、`sign`、`verify`。由于容器默认 Cargo target 是内核 bare-metal 目标，构建该工具时必须显式使用 host target，例如 `cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- verify demo.eki`。
+- `tools/elm-tools/`：`cargo-elm` 的源码目录。安装后以 Cargo 子命令 `cargo elm` 使用，提供 `new`、`sync`、`check`、`test`、`doctor`、`profile-export`、`symbol-probe`、`build`、`inspect` 与 `image-*`。工具自身使用宿主目标构建；外部 ELM 的目标架构由命令显式选择。
 
 ### elmapi v1 与单一 API 根
 
@@ -1305,26 +1309,90 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 内核子系统 API 使用独立于 `elmapi` 的直接符号协议：
 
 1. 中立 crate `libs/kernel-symbols` 定义描述符、能力组和 `#[kernel_symbols::export]`。描述符可以登记经过审核的自由函数、固有方法和非 `static mut` 静态对象；方法接收者是 Rust ABI 的正式组成部分，静态对象则按其真实地址参与重定位。泛型、async、const 和显式外部 ABI 仍不进入当前稳定目录。
-2. `elm-tools export-interface` 从目标架构实际生成的 `allocator`、`general` `.rlib/.rmeta` 提取精确 crate metadata、依赖闭包和 Rust 链接符号。外部工程中的同名 façade 在正式 bare-metal 构建中只 `pub use` 这些 metadata 暴露的真实类型与方法，不保存手写类型副本或第二份运行状态。接口包另外附带与接口摘要绑定的只读 LSP 源码投影，使 rust-analyzer 能定位真实模块、类型、方法和文档。ELM 工程默认启用只用于分析的 `elm-lsp` feature，把 façade 后端切换到源码投影，因此编辑器即使使用 `target_os = "none"` 的目标也能建立完整定义图；正式 `elm-tools build` 传入 `--no-default-features`，把 façade 后端切回目标专属 metadata，并且不会编译源码投影。
+2. `cargo elm profile-export` 从目标架构实际生成的 `allocator`、`general` `.rlib/.rmeta` 提取精确 crate metadata、依赖闭包和 Rust 链接符号。外部工程中的同名 façade 在正式 bare-metal 构建中只 `pub use` 这些 metadata 暴露的真实类型与方法，不保存手写类型副本或第二份运行状态。接口包另外附带与接口摘要绑定的只读 LSP 源码投影，使 rust-analyzer 能定位真实模块、类型、方法和文档。ELM 工程默认启用只用于分析的 `elm-lsp` feature；正式 `cargo elm build` 传入 `--no-default-features`，把 façade 后端切回目标专属 metadata，并且不会编译源码投影。
 3. 普通源码调用由 rustc 产生真实 Rust 符号引用；打包器依据目标接口清单把稳定链接名和审核过的 mangled alias 统一转换为 EBI `kernel-symbol` import。导出工具会重新从源码计算对应公开方法 ABI，接收者或参数不一致时直接拒绝生成接口包。`#[elm::kernel_symbol]` 只保留给确实需要手工声明固定槽的底层场景。
-4. 镜像 ABI 指纹绑定目标架构、rustc、target spec、panic 策略、`elmapi`、内核符号描述符 ABI，以及真实 `allocator/general` 接口源码的规范 SHA-256。单个符号再按名称、契约、版本和规范 Rust ABI 摘要匹配；接口包同时记录目标内核摘要、源文件数量、精确 metadata 文件和实际链接别名。
+4. 镜像 ABI 指纹绑定目标架构、target spec、panic 策略、`elmapi` 和内核符号描述符 ABI；只有镜像实际导入 `exact-rust` 符号时才要求同一 rustc。单个内核符号按名称、契约、版本、能力和完整 Rust ABI 摘要逐项匹配，未被镜像导入的私有实现或其它公开符号变化不会使装载失败。接口包的 `source_hash` 只服务 LSP/缓存，`interface_hash` 是规范公开符号集合的 API Profile 摘要，`framework_hash` 绑定开发框架完整文件分发；三者都不替代逐导入校验。
 5. 装载器先验证链接目录结构和三元身份唯一性，再按父 cell 的 `kernel_symbol_capabilities` 上限解析每个导入。`CORE_SAFE`、普通 allocator 内存和 allocator 诊断属于默认安全组；物理内存、allocator 管理以及所有设备能力属于特权组，外部镜像必须经过签名验证并由合法 authority 显式批准。能力判定只发生在地址提交前，不存在可复用 grant 或每次调用 token。
 6. 地址写入模块可写导入槽并完成重定位后，业务调用直接进入常驻 Rust 实现。`elm-mgr`、namespace 查询、provider dispatch 和管理 syscall 都不在数据路径上；运行时只继续提供当前 cell 上下文、故障边界、预算计量和长期资源归属钩子。
 7. 热替换会为新镜像重新解析全部直接符号并重新执行能力裁决，失败时不改变旧 generation。内核符号本身常驻且不按 ELM generation 路由；ELM 间的 `direct-pinned` import 仍按原有 generation 规则处理，二者不能混淆。
 
 `allocator` 接口 crate 直接实现与内核同名的 `KernelMemorySubsystem` 和 `KERNEL_ALLOCATOR`。普通 `GlobalAlloc`、分配查询、物理页和地址转换入口分别映射到能力组；当前 ELM 调用门通过 allocator 的中立计量回调自动识别 owner、执行预算预留/调整/释放。接口 crate 自身不包含 allocator 算法或第二份堆状态。
 
-固定线协议仍禁止直接放入 `Vec`、`String`、trait object 或 Rust 引用，因此 provider、受管 export、mixin payload 和迁移数据必须使用稳定编码。内核直接符号属于同构 Rust ABI，可以按经审核的真实签名传递 `Arc`、trait object 和其它 Rust 类型；其安全前提是完整接口指纹一致，并且长期对象必须在 finalize/detach 前释放或由常驻子系统登记到资源归属链。
+固定线协议仍禁止直接放入 `Vec`、`String`、trait object 或 Rust 引用，因此 provider、受管 export、mixin payload 和迁移数据必须使用稳定编码。内核直接符号属于同构 Rust ABI，可以按经审核的真实签名传递 `Arc`、trait object 和其它 Rust 类型；其安全前提是实际导入符号的完整 ABI 摘要与 rustc 要求全部满足，并且长期对象必须在 finalize/detach 前释放或由常驻子系统登记到资源归属链。
 
 ### Rust ELM 独立仓库开发框架
 
-外部 ELM 不维护函数表式第二套 API，也不从原内核仓库建立 path dependency。`elm-tools sync-framework` 同步 `libs/elm`、中立 `kernel-symbols`、两个 metadata façade，以及接口包提供的 `.elm/kernel-source` LSP 源码投影；目标专属的真实 `allocator/general` metadata、Rust 单态化支持归档和审核导入库来自 `export-interface` 产物。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，直接按 `allocator::*`、`general::dev::*` 路径调用内核子系统，并通过 `elm::*` 使用固定帧、载荷、import/export 和 attribute；Manager 工程额外启用 `management` feature。源码投影保留发布时的真实模块层级和定义位置，只用于补全、诊断、悬停和跳转；其内部 package 统一使用 `elm-lsp-*` 身份以免与正式 façade 冲突。根 ELM 是独立 Cargo package，`.elm/framework` 与 `.elm/kernel-source` 分别是嵌套 workspace，因此 rust-analyzer 不会把全部内核投影误判为根工程成员；正式构建仍严格使用目标接口包中的二进制 metadata，不编译投影中的子系统实现。
+外部 ELM 不维护函数表式第二套内核 API，也不从原内核仓库建立 path dependency。`cargo elm sync` 同步小型 `elm`/`kernel-symbols` 开发框架和两个 metadata façade；目标专属的真实 `allocator/general` metadata、Rust 支持归档、审核导入库与 LSP 源码投影来自共享接口仓库。工程内 `.elm/kernel-interface/<target>` 和 `.elm/kernel-source` 都是指向共享缓存的符号链接，不复制完整内核接口。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，直接按 `allocator::*`、`general::dev::*` 路径调用真实内核子系统；Manager 工程额外启用 `management` feature。正式构建严格使用目标接口包中的二进制 metadata，源码投影只参与补全、诊断、悬停、跳转和宿主 `cargo check`。
+
+#### Kernel API Profile 与条件编译
+
+Profile 是一个可读 identifier 加一个由规范公开符号集合计算出的 SHA-256。identifier 供源码
+选择兼容分支，摘要才是运行时真值。两个内核即使镜像哈希不同，只要公开路径、契约、版本、
+能力、保留参数语义和 Rust ABI 全部相同，就得到同一个接口摘要；私有实现和未导入 API 的
+变化不会强制 ELM 重编译。
+
+```toml
+[[profiles]]
+id = "contest-2026"
+priority = "100"
+
+[[profiles]]
+id = "next-dev"
+priority = "50"
+```
+
+```rust
+#[cfg(elm_kernel_api = "contest-2026")]
+fn configure_device() {
+    // 直接调用该 Profile 公开的真实 general API。
+}
+
+#[cfg(elm_kernel_api = "next-dev")]
+fn configure_device() {
+    // 使用新内核中仍然位于真实 general 路径下的 API。
+}
+```
+
+`cargo elm check/build` 会为每个所选 Profile 分别运行 rustc。`elm_kernel_api` 的所有声明值
+和 `elm_kernel_profile` 的所有摘要都会写入 check-cfg，因此非当前分支不会产生虚假
+`unexpected_cfgs` 警告。多个受管变体最终封装到一个 EKI；若两个发布包具有相同接口摘要，
+工具自动去重。`y` 归档则绑定精确内核构建和接口摘要，文件名同时包含 Profile 与内核摘要，
+内核在执行 initcall 前再次比较实时符号目录摘要。
+
+同一工程选择的所有 Profile 必须声明相同的 `framework_hash`。`cargo elm sync` 会重新计算
+接口包中 `elm`、`kernel-symbols`、`allocator/general` façade 和 framework workspace 的
+完整摘要，既拒绝声明不一致的多 Profile 组合，也拒绝清单与实际文件不一致的损坏快照。
+
+#### `m/y/n` 构建语义
+
+- `mode = "m"`：生成受管 EKI。代码拥有 ELM 生命周期、依赖、事件、provider、mixin、热替换、故障隔离和审计上下文；内核 API 调用仍是直接符号调用。
+- `mode = "y"`：生成普通静态归档，通过 `ELM_INTEGRATED_ARCHIVES` 链入内核。组件按链接顺序初始化、按逆序终结，不具有 cell、来源、generation、EBI 或 elm-mgr 身份，快照中不会出现它。
+- `mode = "n"`：不编译、不打包，并删除所选架构下属于该组件的旧 EKI、临时变体和集成归档，防止构建系统误用陈旧产物。
+
+`y` 和 `m` 编译同一个 `src/main.rs`。Cargo 的 bin 与 lib 目标共同指向该文件：`m` 选择 bin，
+`y` 选择 lib 并启用 `elm-integrated`。该 feature 只改变生命周期落点、panic 边界和 ELM 元数据
+生成方式，不复制业务实现；直接 `allocator/general` 调用保持完全相同。`y` 不是预加载 ELM，
+也不是 elm-mgr 的 builtin cell。
+
+```sh
+# Elm.toml 中设置 mode = "y" 后生成与目标 Profile 对应的归档。
+cargo elm build ../demo-hello --arch riscv64
+
+# 单 Profile 输出可直接注入；多 Profile 输出应选择与目标内核摘要对应的文件。
+ELM_INTEGRATED_ARCHIVES=../demo-hello/dist/demo-hello-riscv64gc-unknown-none-elf.integrated.a \
+  make kernel-rv
+```
+
+`kernel/build.rs` 以 whole-archive 方式保留 initcall 描述符；链接脚本只保留
+`.kernel.integrated_components`。内核先校验整个描述符区的边界、对齐、ABI 版本和 Profile
+摘要，再按链接顺序初始化。任一初始化失败会逆序回滚此前组件；有序关机时只终结已经成功
+初始化的组件。
 
 创建一个独立仓库：
 
 ```sh
-cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- \
-  new build/demo-hello \
+cargo install --path tools/elm-tools --target x86_64-unknown-linux-gnu
+cargo elm new ../demo-hello \
   --name demo.hello \
   --kind service \
   --source local.demo
@@ -1333,12 +1401,14 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
 生成结果包含：
 
 - `Cargo.toml`：独立 package，依赖同步后的 `elm`、`allocator` 与 `general`；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`。默认 `elm-lsp` feature 只把 `allocator/general` façade 接到源码投影，正式构建关闭根 package 的默认 feature；release 与分析使用的 dev profile 都固定 `panic = "abort"`。
-- `Elm.toml`：名称、版本、种类、来源 identifier、菜单和单元依赖的唯一声明源。
-- `src/main.rs`：`no_std + no_main` 生命周期模板；链接同名 `allocator` 后直接使用内核全局分配器，并用 `Vec`、`String`、`Box` 和 `Arc` 验证 Rust 堆；示例对象在初始化钩子结束前全部析构。
+- `Elm.toml`：名称、版本、种类、来源 identifier、`m/y/n` 模式、菜单、单元依赖和可选 `[[profiles]]` 的唯一声明源。未声明 Profile 时构建接口仓库中全部可用 API Profile。
+- `src/main.rs`：唯一业务源码，包含 `no_std + no_main`、唯一 `ElmModule` 实现，以及仅在受管模式启用的 panic 边界。Cargo 的 bin 与 lib 目标都指向该文件，因此 `m` 与 `y` 不维护源码包装层或双轨实现。
 - `elm.ld`：固定的连续 `PT_LOAD`、非装载 `.elm.meta` 和动态重定位布局。
-- `.cargo/config.toml`：RISC-V64 与 LoongArch64 的 PIE、small code model 和 linker 配置。
-- `.elm/framework`：与内核源码解耦的独立嵌套 workspace，包含 `elm`、`kernel-symbols`、`allocator` 和 `general` 接口 crate；更新工具后使用 `sync-framework` 显式同步。
-- `.elm/kernel-source`：与接口 SHA-256 绑定的独立嵌套 workspace，只用于 LSP 源码投影。rust-analyzer 通过根 package 默认启用的 `elm-lsp` feature 分析它，实际 ELM 目标构建关闭该 feature，因此该目录不会进入代码生成和链接。
+- `.cargo/config.toml`：RISC-V64 与 LoongArch64 的 PIE/linker 配置，以及活动 Profile 的 `elm_kernel_api`、`elm_kernel_profile` 和完整 check-cfg 值域；不强制宿主默认 target，因此普通 `cargo check` 和 rust-analyzer 不要求安装 bare-metal 标准库。
+- `.elm/framework`：与内核源码解耦的独立嵌套 workspace，包含 `elm`、`kernel-symbols` 和 `allocator/general` metadata façade；更新工具后使用 `cargo elm sync` 同步。
+- `.elm/kernel-interface/<target>`：活动目标 Profile 的共享接口包链接。正式构建时工具会原子切换到当前变体。
+- `.elm/kernel-source`：活动接口的共享 LSP 源码投影链接，不进入目标代码生成和链接。
+- `Elm.lock`：记录模块模式、工具版本、rustc、目标、Profile identifier、桥接 ABI、接口摘要、framework 摘要、源码摘要和内核镜像摘要。
 
 最小模块代码不手写任何 EBI ABI：
 
@@ -1367,13 +1437,20 @@ impl ElmModule for Demo {
     }
 }
 
+#[cfg(not(feature = "elm-integrated"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
     elm::runtime::abort_panic()
 }
 ```
 
-`kind = "manager"` 的工程会由 `elm-tools` 自动启用 `management` feature。管理型 ELM
+panic handler 与业务实现位于同一个 `src/main.rs`，但只在非 `elm-integrated` 构建中存在；
+开发者仍不手写 EBI ABI 入口。`y` 模式没有 elm-mgr 调用上下文，因此业务代码若使用
+`elm::runtime::*`，应通过
+`#[cfg(not(feature = "elm-integrated"))]` 提供受管路径，并为集成路径选择直接内核 API 或
+明确的无操作行为；普通 `allocator/general` 调用在两种模式下保持同一源码。
+
+`kind = "manager"` 的工程会由 `cargo elm` 自动启用 `management` feature。管理型 ELM
 通过类型化客户端取得管理命名空间，不接触裸命令号或裸函数指针：
 
 ```rust
@@ -1398,13 +1475,19 @@ let policy = manager
 - `#[elm::mixin_point(..., stages(...))]` 把普通安全 Rust 函数包装为 ingress、substitute、egress、observe 补缀点；`#[elm::mixin(...)]` 生成对应 provider 和拓展声明，支持完整有符号优先级。
 - 宏在编译期拒绝手写 `extern`、`unsafe fn`、泛型 ABI 函数、非法契约、无效版本范围、重复 stage、超长补缀点和越界优先级；打包器再次执行独立的元数据与 EBI 校验。
 
-attribute 生成的记录位于非装载段 `.elm.meta`。该段使用 `ELMMETA1` 固定记录、字段排序、CRC32 和零填充规则，不能进入任何 `PT_LOAD`；`elm-tools` 只读取该协议，不依赖 Rust 符号修饰规则，也不会从函数名猜测拓扑。
+attribute 生成的记录位于非装载段 `.elm.meta`。该段使用 `ELMMETA1` 固定记录、字段排序、CRC32 和零填充规则，不能进入任何 `PT_LOAD`；`cargo elm` 只读取该协议，不依赖 Rust 符号修饰规则，也不会从函数名猜测拓扑。`y` 构建会在编译期完全排除 `.elm.meta`、ELM ABI trampoline 和 ELM 描述符，只保留普通内核 initcall 描述符。
+
+`y` 模式还会彻底关闭 provider、snapshot、managed/direct export 和 mixin 的运行时 ABI
+入口。`#[elm::mixin_point]` 包装的方法在该模式下直接调用原始 Rust 方法，不进入
+elm-mgr 的分阶段补缀调度；`#[elm::mixin]` 方法保留为普通固有方法，但不会注册补缀关系。
+因此集成组件不会因为源码中存在运行时角色 attribute 而链接 `elm::developer` 调度代码，
+也不会在启动后留下隐式 ELM 身份。需要编译期侵入行为时应由普通 Rust 组合、feature 或
+内核构建规则显式完成，不能把受管补缀语义伪装成运行时已生效。
 
 构建签名镜像：
 
 ```sh
-cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- \
-  build build/demo-hello \
+cargo elm build ../demo-hello \
   --arch all \
   --key build/proof-demo.seed \
   --epoch 1
@@ -1416,14 +1499,15 @@ cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-lin
 
 ```text
 Elm.toml + `ElmModule`/Rust attribute 源码
+    -> 对每个所选 Kernel API Profile 注入 cfg 与精确 metadata
     -> rustc/rust-lld PIE（ET_DYN）
     -> 统一模块描述符 + .elm.meta + PT_LOAD + .rela.dyn
-    -> elm-tools 严格解析
+    -> cargo elm 严格解析
     -> R_RISCV_RELATIVE / R_LARCH_RELATIVE 投影为 EBI ImageBase64
-    -> import slot 投影为 EBI ImportAbs64
-    -> EKI header/content hash
-    -> 可选 Ed25519 EBI proof
-    -> parse_eki_image 自校验
+    -> 实际使用的内核符号投影为 EBI ImportAbs64
+    -> 单变体 EKI header/content hash + 可选 Ed25519 EBI proof
+    -> 多 Profile 时封装 Variant Directory/Variant Image
+    -> 每个选择条件与内层 EKI 自校验
 ```
 
 原生 ELF 必须是从虚拟地址 0 开始、页对齐且连续映射的 `ET_DYN`。打包器只接受无符号 `R_*_RELATIVE` 动态重定位，并拒绝 `ET_EXEC`、text relocation、未知动态重定位、重复目标槽、越界 addend 和不连续 `PT_LOAD`。这样 GOT、函数指针和静态表由明确的 ELF 重定位驱动，不通过扫描数据猜测指针。
@@ -1431,18 +1515,15 @@ Elm.toml + `ElmModule`/Rust attribute 源码
 已有 ELF 的低层入口仍保留为：
 
 ```sh
-cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- \
-  pack-elf <project-directory> <image.elf> <out.eki>
+cargo elm image-pack-elf <project-directory> <image.elf> <out.eki>
 ```
 
-`pack-elf` 的身份、版本、来源、菜单和依赖只读取 `Elm.toml`；统一模块描述符、provider、import/export、payload 和 mixin 从 ELF 符号与 `.elm.meta` 读取。命令行不再接受手工重复声明这些信息的参数。签名与验签可以独立执行：
+`image-pack-elf` 的身份、版本、来源、菜单和依赖只读取 `Elm.toml`；统一模块描述符、provider、import/export、payload 和 mixin 从 ELF 符号与 `.elm.meta` 读取。命令行不再接受手工重复声明这些信息的参数。签名与验签可以独立执行：
 
 ```sh
-cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- \
-  sign unsigned.eki signed.eki private-seed.bin local.demo 1
+cargo elm image-sign unsigned.eki signed.eki private-seed.bin local.demo 1
 
-cargo run --manifest-path tools/elm-tools/Cargo.toml --target x86_64-unknown-linux-gnu -- \
-  verify signed.eki
+cargo elm image-verify signed.eki
 ```
 
 运行时通过 `/bin/elmctl load-eki <file>` 装载。仓库中的 `scripts/elm-qemu-smoke-init.sh` 可在测试构建时临时安装为 init，自动执行 trust、load、snapshot 和 health 检查；该脚本不进入正常 initramfs。统一模块描述符会在执行 `initialize` 前完成固定头、实例布局、只读段位置和全部入口地址校验。

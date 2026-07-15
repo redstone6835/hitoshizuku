@@ -68,6 +68,10 @@ pub struct ElmRustAbiFingerprintV1 {
     pub target_spec_hash: [u8; ELM_PROOF_SHA256_LEN],
     /// `kernel_interface_hash` 绑定运行时根表与直接内核符号协议的规范接口摘要。
     pub kernel_interface_hash: [u8; ELM_PROOF_SHA256_LEN],
+    /// 编译该镜像时选择的内核 API Profile 摘要；全零表示镜像不绑定直接内核 API。
+    pub kernel_api_profile_hash: [u8; ELM_PROOF_SHA256_LEN],
+    /// 内核 API Profile 使用的桥接 ABI；未绑定 Profile 时必须为零。
+    pub kernel_api_bridge_abi_version: u16,
     /// `elmapi_version` 是该对象、ABI 或契约的版本值，用于装载和协商兼容性。
     pub elmapi_version: u16,
     /// 镜像声明的 panic 处理策略，必须与运行时 ABI 要求匹配。
@@ -95,6 +99,8 @@ impl ElmRustAbiFingerprintV1 {
             rustc_commit_hash,
             target_spec_hash,
             kernel_interface_hash,
+            kernel_api_profile_hash: [0; ELM_PROOF_SHA256_LEN],
+            kernel_api_bridge_abi_version: 0,
             elmapi_version,
             panic_strategy,
             code_model,
@@ -111,6 +117,8 @@ impl ElmRustAbiFingerprintV1 {
             || self.rustc_commit_hash == [0; ELM_PROOF_SHA256_LEN]
             || self.target_spec_hash == [0; ELM_PROOF_SHA256_LEN]
             || self.kernel_interface_hash == [0; ELM_PROOF_SHA256_LEN]
+            || (self.kernel_api_profile_hash == [0; ELM_PROOF_SHA256_LEN])
+                != (self.kernel_api_bridge_abi_version == 0)
         {
             return Err(ElmEbiLoadStatus::UnsupportedAbi);
         }
@@ -121,6 +129,8 @@ impl ElmRustAbiFingerprintV1 {
         hash.bytes(&self.rustc_commit_hash);
         hash.bytes(&self.target_spec_hash);
         hash.bytes(&self.kernel_interface_hash);
+        hash.bytes(&self.kernel_api_profile_hash);
+        hash.u16(self.kernel_api_bridge_abi_version);
         hash.u16(self.elmapi_version);
         hash.u8(self.panic_strategy as u8);
         hash.u8(self.code_model);

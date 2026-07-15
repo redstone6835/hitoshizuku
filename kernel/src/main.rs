@@ -18,6 +18,7 @@ mod device_init;
 mod dtb;
 mod elm;
 mod initramfs;
+mod integrated_components;
 mod net_poll;
 mod panic;
 mod sched;
@@ -65,6 +66,14 @@ fn main() -> ! {
 
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    let integrated = integrated_components::initialize_all()
+        .unwrap_or_else(|error| panic!("[kernel] 集成组件初始化失败: {error}"));
+    if integrated != 0 {
+        log::info!(
+            "[kernel] initialized {} integrated component(s)",
+            integrated
+        );
+    }
     elm::init_builtin_mgr();
     // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则
     // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要

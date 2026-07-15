@@ -4,7 +4,7 @@
 //!
 //! 本 crate 实现 ELM 模块源码到 EBI Rust ABI v1 的编译期适配。模块作者只编写安全
 //! Rust 函数、静态导入槽和固定载荷结构体；宏负责生成稳定导出符号、原始 ABI
-//! trampoline，以及供 `elm-tools` 消费的 `.elm.meta` 元数据。业务代码不应手写
+//! trampoline，以及供 `cargo elm` 消费的 `.elm.meta` 元数据。业务代码不应手写
 //! `extern "C"`、`export_name`、`link_section` 或 EBI 元数据记录。
 //!
 //! # 共同函数约束
@@ -30,13 +30,13 @@
 //! `.elm.meta` 中生成一个或多个八字节对齐的 `ELMMETA1` 记录。记录字段按 tag 排序，
 //! payload 使用 CRC32 校验并以零填充到八字节边界。
 //!
-//! `.elm.meta` 只供构建工具读取，不得进入 EKI 的可装载段。`elm-tools` 会再次独立校验
+//! `.elm.meta` 只供构建工具读取，不得进入 EKI 的可装载段。`cargo elm` 会再次独立校验
 //! 元数据、符号、契约、ELF 段和重定位，因此通过宏展开不等于镜像已经获得装载资格。
 //!
 //! # 完整示例
 //!
 //! 以下代码展示根模块、固定载荷和 provider 的组合。示例标记为 `ignore`，因为实际
-//! ELM 工程还需要 `#![no_std]`、`#![no_main]`、专用链接脚本和 `elm-tools` 打包步骤。
+//! ELM 工程还需要 `#![no_std]`、`#![no_main]`、专用链接脚本和 `cargo elm` 打包步骤。
 //!
 //! ```ignore
 //! use elm::{ElmModule, HookError, HookResult, LifecycleContext, ProviderReply,
@@ -90,6 +90,8 @@ const KIND_MODULE: u16 = 18;
 const VALUE_UTF8: u16 = 1;
 const VALUE_U32: u16 = 2;
 const VALUE_I32: u16 = 3;
+// 元数据线格式已经分配 u64 类型编号，当前 attribute 尚未消费该宽度。
+#[allow(dead_code)]
 const VALUE_U64: u16 = 4;
 
 const FIELD_SYMBOL: u16 = 1;
@@ -424,7 +426,7 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 /// 声明一个由内核直接符号目录解析的 Rust 函数地址槽。
 ///
-/// 该 attribute 只供 `elm-tools` 同步的子系统接口投影使用。它必须标记不可变
+/// 该 attribute 只供 `cargo elm` 同步的子系统接口投影使用。它必须标记不可变
 /// `static elm::DirectImport<fn(...) -> ...>`，并要求 `name`、`contract` 与非零 `version`。宏会
 /// 生成内核符号 import 元数据和八字节地址槽；装载器在调用任何模块代码前按名称、契约和
 /// 版本精确解析并写入地址。解析过程不经过 elm-mgr、provider、受管调用帧或 ELM export。
@@ -435,7 +437,7 @@ pub fn import(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// 每个槽使用确定名称的内部链接和独立 `.data.elm_imports.<slot>` 输入段。接口投影必须启用
 /// nightly `linkage` feature，并以非内联薄包装引用槽；链接器因此只保留业务代码实际调用的
-/// 槽。`.elm.meta` 可以保存完整接口目录，但 `elm-tools` 只把最终 ELF 中仍存在的槽投影为
+/// 槽。`.elm.meta` 可以保存完整接口目录，但 `cargo elm` 只把最终 ELF 中仍存在的槽投影为
 /// EBI import，避免“依赖一个接口 crate 就获得整组符号”的权限扩张。
 ///
 /// ```ignore
@@ -839,7 +841,7 @@ fn expand_module_method(
     mut method: ImplItemFn,
 ) -> syn::Result<ModuleMethodExpansion> {
     let ident = method.sig.ident.clone();
-    let (inherent_methods, generated) = match kind {
+    let (mut inherent_methods, generated) = match kind {
         ModuleMethodKind::Provider => {
             validate_module_callback_method(&method, 1, false, true)?;
             let proxy = module_result_proxy(&method, &ident)?;
@@ -894,7 +896,11 @@ fn expand_module_method(
             let mut original = method.clone();
             original.sig.ident = original_ident.clone();
             method.block = syn::parse_quote!({
-                #ident(#(#arguments),*)
+                #[cfg(feature = "elm-integrated")]
+                let __elm_result = self.#original_ident(#(#arguments),*);
+                #[cfg(not(feature = "elm-integrated"))]
+                let __elm_result = #ident(#(#arguments),*);
+                __elm_result
             });
             let proxy = module_result_proxy(&original, &original_ident).map(|mut proxy| {
                 proxy.sig.ident = ident.clone();
@@ -903,6 +909,12 @@ fn expand_module_method(
             (vec![original, method], mixin_point_impl(attr, proxy)?)
         }
     };
+    for method in &mut inherent_methods {
+        method.attrs.push(syn::parse_quote!(#[cfg_attr(
+            feature = "elm-integrated",
+            allow(dead_code)
+        )]));
+    }
     Ok(ModuleMethodExpansion {
         inherent_methods,
         generated,
@@ -974,6 +986,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
     }
     implementation.items = trait_items;
     let metadata_anchor = format_ident!("__elm_module");
+    let integrated_profile_hash = integrated_profile_hash_tokens()?;
     let metadata = metadata_item(
         &metadata_anchor,
         "descriptor",
@@ -996,6 +1009,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         static __ELM_MODULE_SLOT_V1: ::elm::ModuleSlot<#module_ty> = ::elm::ModuleSlot::new();
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_initialize_v1(
             context: *mut ::elm::ElmNativeHookContextV1,
@@ -1006,6 +1020,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_finalize_v1(
             context: *mut ::elm::ElmNativeHookContextV1,
@@ -1016,6 +1031,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_quiesce_v1(
             context: *mut ::elm::ElmNativeHookContextV1,
@@ -1026,6 +1042,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_pause_v1(
             context: *mut ::elm::ElmNativeHookContextV1,
@@ -1036,6 +1053,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_resume_v1(
             context: *mut ::elm::ElmNativeHookContextV1,
@@ -1046,6 +1064,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_migrate_export_v1(
             context: *mut ::elm::ElmNativeMigrationContextV1,
@@ -1059,6 +1078,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_migrate_import_v1(
             context: *mut ::elm::ElmNativeMigrationContextV1,
@@ -1072,6 +1092,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_migrate_abort_v1(
             context: *mut ::elm::ElmNativeMigrationContextV1,
@@ -1085,6 +1106,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(export_name = "__elm_module_entry_v1")]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn __elm_module_entry_v1(
@@ -1094,6 +1116,7 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
         }
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[used]
         #[unsafe(export_name = "__elm_module_descriptor_v1")]
         #[unsafe(link_section = ".rodata.elm.module")]
@@ -1110,7 +1133,39 @@ fn module_impl(attr: TokenStream2, mut implementation: ItemImpl) -> syn::Result<
                 __elm_module_entry_v1,
             );
 
+        #[cfg(not(feature = "elm-integrated"))]
         #metadata
+
+        #[doc(hidden)]
+        #[cfg(feature = "elm-integrated")]
+        fn __elm_integrated_initialize_v1() -> i32 {
+            let context = ::elm::LifecycleContext::integrated(1);
+            match __ELM_MODULE_SLOT_V1.initialize(&context) {
+                Ok(()) => 0,
+                Err(error) => error.status(),
+            }
+        }
+
+        #[doc(hidden)]
+        #[cfg(feature = "elm-integrated")]
+        fn __elm_integrated_finalize_v1() -> i32 {
+            let context = ::elm::LifecycleContext::integrated(2);
+            match __ELM_MODULE_SLOT_V1.finalize(&context) {
+                Ok(()) => 0,
+                Err(error) => error.status(),
+            }
+        }
+
+        #[doc(hidden)]
+        #[cfg(feature = "elm-integrated")]
+        #[used]
+        #[unsafe(link_section = ".kernel.integrated_components")]
+        static __ELM_INTEGRATED_COMPONENT_V1: ::elm::KernelIntegratedComponentV1 =
+            ::elm::KernelIntegratedComponentV1::new(
+                __elm_integrated_initialize_v1,
+                __elm_integrated_finalize_v1,
+                #integrated_profile_hash,
+            );
     })
 }
 
@@ -1146,6 +1201,7 @@ fn provider_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStrea
         #function
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(export_name = #symbol)]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn #abi_ident(
@@ -1183,6 +1239,7 @@ fn provider_snapshot_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<T
         #function
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(export_name = #symbol)]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn #abi_ident(
@@ -1241,12 +1298,14 @@ fn export_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<TokenStr
     }
     let metadata = metadata_item(ident, "export", metadata_record(KIND_EXPORT, fields));
     if rust_abi.is_some() {
-        function
-            .attrs
-            .push(syn::parse_quote!(#[unsafe(export_name = #name)]));
-        function
-            .attrs
-            .push(syn::parse_quote!(#[unsafe(link_section = ".text.elm.abi")]));
+        function.attrs.push(syn::parse_quote!(#[cfg_attr(
+            not(feature = "elm-integrated"),
+            unsafe(export_name = #name)
+        )]));
+        function.attrs.push(syn::parse_quote!(#[cfg_attr(
+            not(feature = "elm-integrated"),
+            unsafe(link_section = ".text.elm.abi")
+        )]));
         Ok(quote! {
             #function
             #metadata
@@ -1257,6 +1316,7 @@ fn export_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<TokenStr
             #function
 
             #[doc(hidden)]
+            #[cfg(not(feature = "elm-integrated"))]
             #[unsafe(export_name = #name)]
             #[unsafe(link_section = ".text.elm.abi")]
             pub unsafe extern "C" fn #abi_ident(
@@ -1544,6 +1604,7 @@ fn mixin_point_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<Tok
         #function
 
         #(#wrapper_attrs)*
+        #[cfg(not(feature = "elm-integrated"))]
         #visibility #signature {
             ::elm::run_mixin_point(
                 ::elm::MixinPointDescriptor {
@@ -1556,6 +1617,12 @@ fn mixin_point_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<Tok
                 #argument,
                 #original_ident,
             )
+        }
+
+        #(#wrapper_attrs)*
+        #[cfg(feature = "elm-integrated")]
+        #visibility #signature {
+            #original_ident(#argument)
         }
 
         #metadata
@@ -1614,6 +1681,7 @@ fn mixin_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2>
         #function
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[unsafe(export_name = #symbol)]
         #[unsafe(link_section = ".text.elm.abi")]
         pub unsafe extern "C" fn #abi_ident(
@@ -1967,6 +2035,7 @@ fn require_empty_attr(attr: TokenStream2) -> syn::Result<()> {
 enum MetaValue {
     String(String),
     U32(u32),
+    #[allow(dead_code)]
     U64(u64),
     I32(i32),
     Bool(bool),
@@ -2063,6 +2132,7 @@ impl MetaArgs {
         }
     }
 
+    #[allow(dead_code)]
     fn u64_or(&self, name: &str, default: u64) -> syn::Result<u64> {
         match self.values.borrow_mut().remove(name) {
             Some(MetaValue::U32(value)) => Ok(u64::from(value)),
@@ -2365,6 +2435,7 @@ impl MetaField {
         }
     }
 
+    #[allow(dead_code)]
     fn u64(tag: u16, value: u64) -> Self {
         Self {
             tag,
@@ -2418,15 +2489,43 @@ fn metadata_item(anchor: &Ident, suffix: &str, bytes: Vec<u8>) -> TokenStream2 {
     let values = bytes.iter();
     quote! {
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[repr(C, align(8))]
         struct #align_ident([u8; #length]);
 
         #[doc(hidden)]
+        #[cfg(not(feature = "elm-integrated"))]
         #[used]
         #[allow(non_upper_case_globals)]
         #[unsafe(link_section = ".elm.meta")]
         static #static_ident: #align_ident = #align_ident([#(#values),*]);
     }
+}
+
+fn integrated_profile_hash_tokens() -> syn::Result<TokenStream2> {
+    let Some(value) = std::env::var_os("ELM_KERNEL_PROFILE_HASH") else {
+        return Ok(quote!([0u8; 32]));
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| syn::Error::new(Span::call_site(), "ELM_KERNEL_PROFILE_HASH 不是 UTF-8"))?;
+    if value.len() != 64 {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "ELM_KERNEL_PROFILE_HASH 必须包含 64 个十六进制字符",
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+            syn::Error::new(
+                Span::call_site(),
+                "ELM_KERNEL_PROFILE_HASH 包含非十六进制字符",
+            )
+        })?;
+    }
+    let values = bytes.iter();
+    Ok(quote!([#(#values),*]))
 }
 
 fn sanitize_ident(value: &str) -> String {
@@ -2496,5 +2595,63 @@ mod tests {
         assert!(validate_contract("test.contract@1.0").is_ok());
         assert!(validate_contract("test.contract@1..0").is_err());
         assert!(validate_contract("test.contract@.").is_err());
+    }
+
+    #[test]
+    fn integrated_build_excludes_complete_metadata_item() {
+        let tokens = metadata_item(
+            &format_ident!("sample"),
+            "descriptor",
+            metadata_record(KIND_MODULE, Vec::new()),
+        )
+        .to_string();
+
+        assert_eq!(tokens.matches("elm-integrated").count(), 2);
+        assert!(tokens.contains(".elm.meta"));
+    }
+
+    #[test]
+    fn integrated_mixin_point_calls_original_method_without_runtime_dispatch() {
+        let implementation: ItemImpl = syn::parse_quote! {
+            impl ::elm::ElmModule for Module {
+                fn create(
+                    _context: &::elm::LifecycleContext,
+                ) -> Result<Self, ::elm::HookError> {
+                    Ok(Self)
+                }
+
+                fn initialize(
+                    &mut self,
+                    _context: &::elm::LifecycleContext,
+                ) -> ::elm::HookResult {
+                    Ok(())
+                }
+
+                fn finalize(
+                    &mut self,
+                    _context: &::elm::LifecycleContext,
+                ) -> ::elm::HookResult {
+                    Ok(())
+                }
+
+                #[elm::mixin_point(
+                    name = "demo.point",
+                    contract = "demo.frame@1",
+                    stages(ingress, observe)
+                )]
+                fn select(&self, frame: &mut Frame) -> ::elm::PointResult {
+                    frame.value += 1;
+                    Ok(())
+                }
+            }
+        };
+        let tokens = module_impl(TokenStream2::new(), implementation)
+            .unwrap()
+            .to_string();
+
+        assert!(tokens.contains("self . __elm_module_original_select (frame)"));
+        assert!(tokens.contains("cfg (feature = \"elm-integrated\")"));
+        assert!(tokens.contains("cfg (not (feature = \"elm-integrated\"))"));
+        assert!(tokens.contains(":: elm :: run_mixin_point"));
     }
 }

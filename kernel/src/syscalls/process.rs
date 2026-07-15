@@ -380,16 +380,19 @@ pub(super) fn sys_reboot(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         LINUX_REBOOT_CMD_CAD_ON | LINUX_REBOOT_CMD_CAD_OFF => Ok(0),
         LINUX_REBOOT_CMD_RESTART | LINUX_REBOOT_CMD_RESTART2 => {
             log::emergency!("[syscall][reboot] restart requested");
+            let _ = crate::integrated_components::finalize_all();
             power::reboot().map_err(map_power_error)?;
             halt_after_power_request()
         }
         LINUX_REBOOT_CMD_HALT => {
             log::emergency!("[syscall][reboot] halt requested");
+            let _ = crate::integrated_components::finalize_all();
             power::shutdown().map_err(map_power_error)?;
             halt_after_power_request()
         }
         LINUX_REBOOT_CMD_POWER_OFF => {
             log::emergency!("[syscall][reboot] poweroff requested");
+            let _ = crate::integrated_components::finalize_all();
             power::shutdown().map_err(map_power_error)?;
             halt_after_power_request()
         }

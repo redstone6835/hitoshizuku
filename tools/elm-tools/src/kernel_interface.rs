@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-use elm::{kernel_symbol_interface_abi_hash, sha256};
+use elm::{Sha256, sha256};
 use kernel_symbols::{
     KERNEL_SYMBOL_KIND_FUNCTION, KERNEL_SYMBOL_KIND_METHOD, KERNEL_SYMBOL_KIND_STATIC,
 };
@@ -14,6 +14,10 @@ use syn::parse::{Parse, ParseStream};
 use syn::{Expr, Ident, Item, LitInt, LitStr, ReturnType, Signature, Token, Type};
 
 const INTERFACE_MAGIC: &str = "ELM-KERNEL-INTERFACE-V1";
+const KERNEL_API_PROFILE_DOMAIN: &[u8] = b"ELM-KERNEL-API-PROFILE-V1\0";
+const FRAMEWORK_DISTRIBUTION_DOMAIN: &[u8] = b"ELM-FRAMEWORK-DISTRIBUTION-V1\0";
+pub(crate) const KERNEL_API_BRIDGE_ABI_V1: u16 = 1;
+pub(crate) const KERNEL_API_MODE_EXACT_RUST: &str = "exact-rust";
 pub(crate) const LSP_SOURCE_IDENTITY_FILE: &str = "interface.identity";
 pub(crate) const LSP_SOURCE_MAGIC: &str = "ELM-KERNEL-LSP-SOURCE-V1";
 
@@ -31,14 +35,19 @@ pub struct KernelInterfaceSymbol {
     pub contract: String,
     pub rust_abi: String,
     pub rust_abi_hash: [u8; 32],
+    pub abi_mode: String,
     pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct KernelInterfaceManifest {
     pub target: String,
+    pub profile: String,
+    pub bridge_abi_version: u16,
     pub kernel_hash: [u8; 32],
     pub interface_hash: [u8; 32],
+    pub source_hash: [u8; 32],
+    pub framework_hash: [u8; 32],
     pub source_file_count: usize,
     pub allocator_metadata: String,
     pub general_metadata: String,
@@ -56,8 +65,12 @@ impl KernelInterfaceManifest {
             return Err(format!("{} 不是 ELM 内核接口清单", path.display()));
         }
         let mut target = None;
+        let mut profile = None;
+        let mut bridge_abi_version = None;
         let mut kernel_hash = None;
         let mut interface_hash = None;
+        let mut source_hash = None;
+        let mut framework_hash = None;
         let mut source_file_count = None;
         let mut allocator_metadata = None;
         let mut general_metadata = None;
@@ -67,10 +80,22 @@ impl KernelInterfaceManifest {
         for line in lines {
             if let Some(value) = line.strip_prefix("target=") {
                 target = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("profile=") {
+                profile = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("bridge_abi=") {
+                bridge_abi_version = Some(
+                    value
+                        .parse::<u16>()
+                        .map_err(|_| "接口清单 bridge_abi 无效".to_string())?,
+                );
             } else if let Some(value) = line.strip_prefix("kernel_sha256=") {
                 kernel_hash = Some(parse_digest(value)?);
             } else if let Some(value) = line.strip_prefix("interface_sha256=") {
                 interface_hash = Some(parse_digest(value)?);
+            } else if let Some(value) = line.strip_prefix("source_sha256=") {
+                source_hash = Some(parse_digest(value)?);
+            } else if let Some(value) = line.strip_prefix("framework_sha256=") {
+                framework_hash = Some(parse_digest(value)?);
             } else if let Some(value) = line.strip_prefix("source_files=") {
                 source_file_count = Some(
                     value
@@ -97,13 +122,18 @@ impl KernelInterfaceManifest {
             interface_hash.ok_or_else(|| "接口清单缺少 interface hash".to_string())?;
         for symbol in &mut symbols {
             symbol.interface_hash = interface_hash;
-            symbol.rust_abi_hash =
-                kernel_symbol_interface_abi_hash(symbol.rust_abi.as_bytes(), interface_hash);
+            symbol.rust_abi_hash = sha256(symbol.rust_abi.as_bytes());
         }
         let manifest = Self {
             target: target.ok_or_else(|| "接口清单缺少 target".to_string())?,
+            profile: profile.ok_or_else(|| "接口清单缺少 profile".to_string())?,
+            bridge_abi_version: bridge_abi_version
+                .ok_or_else(|| "接口清单缺少 bridge_abi".to_string())?,
             kernel_hash: kernel_hash.ok_or_else(|| "接口清单缺少 kernel hash".to_string())?,
             interface_hash,
+            source_hash: source_hash.ok_or_else(|| "接口清单缺少 source hash".to_string())?,
+            framework_hash: framework_hash
+                .ok_or_else(|| "接口清单缺少 framework hash".to_string())?,
             source_file_count: source_file_count
                 .ok_or_else(|| "接口清单缺少 source_files".to_string())?,
             allocator_metadata: allocator_metadata
@@ -122,7 +152,11 @@ impl KernelInterfaceManifest {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.target.is_empty()
+            || self.profile.is_empty()
+            || self.bridge_abi_version != KERNEL_API_BRIDGE_ABI_V1
             || self.interface_hash == [0; 32]
+            || self.source_hash == [0; 32]
+            || self.framework_hash == [0; 32]
             || self.kernel_hash == [0; 32]
             || self.source_file_count == 0
             || self.support_library.is_empty()
@@ -131,17 +165,36 @@ impl KernelInterfaceManifest {
         {
             return Err("内核接口清单缺少必需身份信息".to_string());
         }
+        if self.profile.len() > 64
+            || !self.profile.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'.' | b'-' | b'_')
+            })
+        {
+            return Err(format!(
+                "内核 API Profile identifier 无效: {}",
+                self.profile
+            ));
+        }
+        if kernel_api_profile_hash(&self.target, &self.profile, &self.symbols)
+            != self.interface_hash
+        {
+            return Err("内核 API Profile 摘要与符号清单不一致".to_string());
+        }
         let mut api_paths = BTreeSet::new();
         let mut link_names = BTreeMap::new();
         for symbol in &self.symbols {
             if symbol.interface_hash != self.interface_hash
-                || symbol.rust_abi_hash
-                    != kernel_symbol_interface_abi_hash(
-                        symbol.rust_abi.as_bytes(),
-                        self.interface_hash,
-                    )
+                || symbol.rust_abi_hash != sha256(symbol.rust_abi.as_bytes())
             {
                 return Err(format!("内核接口符号摘要错误: {}", symbol.api_path));
+            }
+            if symbol.abi_mode != KERNEL_API_MODE_EXACT_RUST {
+                return Err(format!(
+                    "内核接口 {} 声明了尚未实现的 ABI 模式 {}",
+                    symbol.api_path, symbol.abi_mode
+                ));
             }
             if !api_paths.insert(symbol.api_path.as_str()) {
                 return Err(format!("内核接口 API 路径冲突: {}", symbol.api_path));
@@ -190,11 +243,21 @@ impl KernelInterfaceManifest {
         output.push_str("target=");
         output.push_str(&self.target);
         output.push('\n');
+        output.push_str("profile=");
+        output.push_str(&self.profile);
+        output.push('\n');
+        output.push_str(&format!("bridge_abi={}\n", self.bridge_abi_version));
         output.push_str("kernel_sha256=");
         output.push_str(&hex_digest(&self.kernel_hash));
         output.push('\n');
         output.push_str("interface_sha256=");
         output.push_str(&hex_digest(&self.interface_hash));
+        output.push('\n');
+        output.push_str("source_sha256=");
+        output.push_str(&hex_digest(&self.source_hash));
+        output.push('\n');
+        output.push_str("framework_sha256=");
+        output.push_str(&hex_digest(&self.framework_hash));
         output.push('\n');
         output.push_str(&format!("source_files={}\n", self.source_file_count));
         output.push_str("allocator_metadata=");
@@ -232,6 +295,8 @@ impl KernelInterfaceManifest {
             output.push('\t');
             output.push_str(&hex_bytes(symbol.rust_abi.as_bytes()));
             output.push('\t');
+            output.push_str(&symbol.abi_mode);
+            output.push('\t');
             output.push_str(&symbol.aliases.join(","));
             output.push('\n');
         }
@@ -243,19 +308,27 @@ pub fn export_kernel_interface(
     repository: &Path,
     target: &str,
     profile: &str,
+    cargo_profile: &str,
     kernel: &Path,
     output: &Path,
 ) -> Result<KernelInterfaceManifest, String> {
     let kernel_bytes = fs::read(kernel)
         .map_err(|error| format!("读取内核镜像 {} 失败: {error}", kernel.display()))?;
-    let (interface_hash, source_file_count) = repository_interface_hash(repository)?;
-    let mut symbols = scan_repository_exports(repository, interface_hash)?;
+    let (source_hash, source_file_count) = repository_interface_hash(repository)?;
+    let framework_hash = framework_distribution_hash(repository)?;
+    let mut symbols = scan_repository_exports(repository, [0; 32])?;
 
-    let deps = repository
-        .join("target")
-        .join(target)
-        .join(profile)
-        .join("deps");
+    let target_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                repository.join(path)
+            }
+        })
+        .unwrap_or_else(|| repository.join("target"));
+    let deps = target_root.join(target).join(cargo_profile).join("deps");
     let general_path = newest_matching_file(&deps, "libgeneral-", ".rmeta")?;
     let general_file = general_path
         .file_name()
@@ -277,11 +350,20 @@ pub fn export_kernel_interface(
     )?;
     let public_api_abis = scan_repository_api_abis(repository, &symbols)?;
     populate_link_aliases(target, &interface_rlibs, &public_api_abis, &mut symbols)?;
+    let interface_hash = kernel_api_profile_hash(target, profile, &symbols);
+    for symbol in &mut symbols {
+        symbol.interface_hash = interface_hash;
+        symbol.rust_abi_hash = sha256(symbol.rust_abi.as_bytes());
+    }
 
     let manifest = KernelInterfaceManifest {
         target: target.to_string(),
+        profile: profile.to_string(),
+        bridge_abi_version: KERNEL_API_BRIDGE_ABI_V1,
         kernel_hash: sha256(&kernel_bytes),
         interface_hash,
+        source_hash,
+        framework_hash,
         source_file_count,
         allocator_metadata: allocator_file,
         general_metadata: general_file,
@@ -297,7 +379,7 @@ pub fn export_kernel_interface(
         .map_err(|error| format!("创建接口包临时目录失败: {error}"))?;
     copy_metadata_rlibs(&metadata_rlibs, &temporary.join("metadata"))?;
     copy_proc_macro_directory(
-        &repository.join("target/release/deps"),
+        &target_root.join("release/deps"),
         &temporary.join("metadata"),
     )?;
     build_rust_support_library(
@@ -309,7 +391,7 @@ pub fn export_kernel_interface(
     copy_lsp_source_snapshot(
         repository,
         &temporary.join("kernel-source"),
-        manifest.interface_hash,
+        manifest.source_hash,
     )?;
     copy_framework(repository, &temporary.join("framework"), target, &manifest)?;
     fs::write(temporary.join("manifest.txt"), manifest.encode())
@@ -323,7 +405,7 @@ pub fn export_kernel_interface(
 pub fn emit_kernel_symbol_probe(manifest_path: &Path, output: &Path) -> Result<usize, String> {
     let manifest = KernelInterfaceManifest::load(manifest_path)?;
     let mut source = String::from(
-        "//! 由 elm-tools 按精确内核接口清单生成。\n\
+        "//! 由 `cargo elm` 按精确内核接口清单生成。\n\
          //! 本文件只取得符号地址，不调用具有副作用或硬件约束的入口。\n\n",
     );
     writeln!(
@@ -412,6 +494,105 @@ fn repository_interface_hash(repository: &Path) -> Result<([u8; 32], usize), Str
         input.extend_from_slice(&contents);
     }
     Ok((sha256(&input), files.len()))
+}
+
+fn framework_distribution_hash(repository: &Path) -> Result<[u8; 32], String> {
+    let mut files = Vec::new();
+    collect_framework_files(&repository.join("libs/elm"), "elm", &mut files)?;
+    collect_framework_files(
+        &repository.join("libs/kernel-symbols"),
+        "kernel-symbols",
+        &mut files,
+    )?;
+    files.push((
+        "allocator/Cargo.toml".to_string(),
+        metadata_facade_manifest("allocator", "__elm_host_allocator").into_bytes(),
+    ));
+    files.push((
+        "allocator/src/lib.rs".to_string(),
+        metadata_facade_source("allocator", "__elm_host_allocator").into_bytes(),
+    ));
+    files.push((
+        "general/Cargo.toml".to_string(),
+        metadata_facade_manifest("general", "__elm_host_general").into_bytes(),
+    ));
+    files.push((
+        "general/src/lib.rs".to_string(),
+        metadata_facade_source("general", "__elm_host_general").into_bytes(),
+    ));
+    files.push((
+        "Cargo.toml".to_string(),
+        framework_workspace_manifest().as_bytes().to_vec(),
+    ));
+    Ok(hash_framework_distribution(files))
+}
+
+pub(crate) fn packaged_framework_hash(framework: &Path) -> Result<[u8; 32], String> {
+    let mut files = Vec::new();
+    collect_framework_files(framework, "", &mut files)?;
+    Ok(hash_framework_distribution(files))
+}
+
+fn hash_framework_distribution(mut files: Vec<(String, Vec<u8>)>) -> [u8; 32] {
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hash = Sha256::new();
+    hash.update(FRAMEWORK_DISTRIBUTION_DOMAIN);
+    hash.update(&(files.len() as u64).to_le_bytes());
+    for (logical, contents) in files {
+        hash_field(&mut hash, logical.as_bytes());
+        hash_field(&mut hash, &contents);
+    }
+    hash.finish()
+}
+
+fn collect_framework_files(
+    directory: &Path,
+    prefix: &str,
+    output: &mut Vec<(String, Vec<u8>)>,
+) -> Result<(), String> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| format!("读取 framework 目录 {} 失败: {error}", directory.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("读取 framework 目录项失败: {error}"))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        if matches!(entry.file_name().to_str(), Some("target" | ".git")) {
+            continue;
+        }
+        if prefix == "kernel-symbols"
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("interface.identity"))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("读取 framework 文件类型失败: {error}"))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let logical = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if file_type.is_dir() {
+            collect_framework_files(&path, &logical, output)?;
+        } else if file_type.is_file() {
+            let contents = fs::read(&path)
+                .map_err(|error| format!("读取 framework 文件 {} 失败: {error}", path.display()))?;
+            output.push((logical, contents));
+        } else {
+            return Err(format!(
+                "framework 源包含不支持的文件类型: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_rust_sources(
@@ -738,7 +919,8 @@ fn make_symbol(
         capabilities,
         retained_argument_mask,
         interface_hash,
-        rust_abi_hash: kernel_symbol_interface_abi_hash(rust_abi.as_bytes(), interface_hash),
+        rust_abi_hash: sha256(rust_abi.as_bytes()),
+        abi_mode: KERNEL_API_MODE_EXACT_RUST.to_string(),
         api_path,
         item_path,
         link_name,
@@ -775,6 +957,42 @@ fn eval_u64(expression: &Expr) -> Result<u64, String> {
             expression.to_token_stream()
         )),
     }
+}
+
+fn kernel_api_profile_hash(
+    _target: &str,
+    _profile: &str,
+    symbols: &[KernelInterfaceSymbol],
+) -> [u8; 32] {
+    let mut ordered = symbols.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.api_path
+            .cmp(&right.api_path)
+            .then_with(|| left.contract.cmp(&right.contract))
+            .then_with(|| left.version.cmp(&right.version))
+    });
+    let mut hash = Sha256::new();
+    hash.update(KERNEL_API_PROFILE_DOMAIN);
+    hash.update(&KERNEL_API_BRIDGE_ABI_V1.to_le_bytes());
+    hash.update(&(ordered.len() as u64).to_le_bytes());
+    for symbol in ordered {
+        hash.update(&[symbol.kind]);
+        hash.update(&symbol.flags.to_le_bytes());
+        hash.update(&symbol.version.to_le_bytes());
+        hash.update(&symbol.capabilities.to_le_bytes());
+        hash.update(&symbol.retained_argument_mask.to_le_bytes());
+        hash_field(&mut hash, symbol.api_path.as_bytes());
+        hash_field(&mut hash, symbol.item_path.as_bytes());
+        hash_field(&mut hash, symbol.contract.as_bytes());
+        hash_field(&mut hash, symbol.rust_abi.as_bytes());
+        hash_field(&mut hash, symbol.abi_mode.as_bytes());
+    }
+    hash.finish()
+}
+
+fn hash_field(hash: &mut Sha256, value: &[u8]) {
+    hash.update(&(value.len() as u64).to_le_bytes());
+    hash.update(value);
 }
 
 fn exported_constant(name: &str) -> Option<u64> {
@@ -1684,7 +1902,7 @@ fn copy_lsp_source_snapshot(
     .map_err(|error| format!("写入 LSP 源码身份失败: {error}"))?;
     fs::write(
         destination.join("README.md"),
-        "# ELM 内核源码投影\n\n该目录由 `elm-tools` 按接口包生成，只用于 rust-analyzer 和 host `cargo check` 建立精确源码导航。正式 ELM 构建不会编译这里的实现，而是使用目标内核发布的 `.rlib/.rmeta` 和直接符号目录。\n",
+        "# ELM 内核源码投影\n\n该目录由 `cargo elm` 按接口包生成，只用于 rust-analyzer 和宿主 `cargo check` 建立精确源码导航。正式 ELM 构建不会编译这里的实现，而是使用目标内核发布的 `.rlib/.rmeta` 和直接符号目录。\n",
     )
     .map_err(|error| format!("写入 LSP 源码说明失败: {error}"))?;
     Ok(())
@@ -1931,7 +2149,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn remove_path(path: &Path) -> Result<(), String> {
-    if path.is_dir() {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        fs::remove_file(path).map_err(|error| format!("删除 {} 失败: {error}", path.display()))
+    } else if path.is_dir() {
         fs::remove_dir_all(path).map_err(|error| format!("删除 {} 失败: {error}", path.display()))
     } else if path.exists() {
         fs::remove_file(path).map_err(|error| format!("删除 {} 失败: {error}", path.display()))
@@ -1942,7 +2162,7 @@ fn remove_path(path: &Path) -> Result<(), String> {
 
 fn parse_symbol_record(value: &str) -> Result<KernelInterfaceSymbol, String> {
     let fields = value.split('\t').collect::<Vec<_>>();
-    if fields.len() != 11 {
+    if fields.len() != 12 {
         return Err("内核接口 symbol 记录字段数量错误".to_string());
     }
     let interface_hash = [0; 32];
@@ -1971,10 +2191,11 @@ fn parse_symbol_record(value: &str) -> Result<KernelInterfaceSymbol, String> {
         rust_abi,
         rust_abi_hash: [0; 32],
         interface_hash,
-        aliases: if fields[10].is_empty() {
+        abi_mode: fields[10].to_string(),
+        aliases: if fields[11].is_empty() {
             Vec::new()
         } else {
-            fields[10].split(',').map(str::to_string).collect()
+            fields[11].split(',').map(str::to_string).collect()
         },
     })
 }
@@ -1999,7 +2220,7 @@ fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn hex_digest(value: &[u8; 32]) -> String {
+pub(crate) fn hex_digest(value: &[u8; 32]) -> String {
     hex_bytes(value)
 }
 
@@ -2045,9 +2266,47 @@ mod tests {
     }
 
     #[test]
+    fn packaged_framework_hash_covers_the_complete_distribution() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let root =
+            std::env::temp_dir().join(format!("cargo-elm-framework-hash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let manifest = KernelInterfaceManifest {
+            target: "test-target".to_string(),
+            profile: "test-profile".to_string(),
+            bridge_abi_version: KERNEL_API_BRIDGE_ABI_V1,
+            kernel_hash: [1; 32],
+            interface_hash: [2; 32],
+            source_hash: [3; 32],
+            framework_hash: framework_distribution_hash(&repository).unwrap(),
+            source_file_count: 1,
+            allocator_metadata: "allocator.rlib".to_string(),
+            general_metadata: "general.rlib".to_string(),
+            support_library: "support.a".to_string(),
+            import_library: "imports.so".to_string(),
+            symbols: Vec::new(),
+        };
+        copy_framework(&repository, &root, &manifest.target, &manifest).unwrap();
+        assert_eq!(
+            packaged_framework_hash(&root).unwrap(),
+            manifest.framework_hash
+        );
+
+        fs::write(root.join("unexpected.cfg"), b"tampered").unwrap();
+        assert_ne!(
+            packaged_framework_hash(&root).unwrap(),
+            manifest.framework_hash
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn lsp_projection_namespaces_packages_and_path_dependencies() {
         let root =
-            std::env::temp_dir().join(format!("elm-tools-lsp-projection-{}", std::process::id()));
+            std::env::temp_dir().join(format!("cargo-elm-lsp-projection-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("alpha/src")).unwrap();
         fs::create_dir_all(root.join("beta/src")).unwrap();

@@ -12,8 +12,9 @@ use elm_model::{
     ELM_IMAGE_SESSION_MAX_RESERVED_BYTES, ELM_IMAGE_SESSION_MAX_TTL_MS, ELM_MGR_BUILTIN_ID,
     ELM_MGR_STATUS_BUSY, ELM_MGR_STATUS_EXPIRED, ELM_MGR_STATUS_INTEGRITY, ELM_MGR_STATUS_INVALID,
     ELM_MGR_STATUS_NO_MEMORY, ELM_MGR_STATUS_NOT_FOUND, ELM_MGR_STATUS_PERMISSION, ElmEbiArch,
-    ElmEbiImage, ElmEbiLoadStatus, ElmId, ElmImageReader, ElmImageSessionBeginRequestV1,
-    ElmImageSessionInfoV1, ElmImageSessionState, ElmPrincipal, Generation, Sha256, parse_eki_image,
+    ElmEbiImage, ElmEbiLoadStatus, ElmEkiSelector, ElmId, ElmImageReader,
+    ElmImageSessionBeginRequestV1, ElmImageSessionInfoV1, ElmImageSessionState, ElmPrincipal,
+    Generation, Sha256, parse_eki_image_for,
 };
 use sched::sync::Spinlock;
 
@@ -793,7 +794,16 @@ pub(crate) fn project_builtin_eki_image(
 ) -> Result<ElmEbiImage, ElmEbiLoadStatus> {
     // 这是内建 `eki` 子单元的投影入口；管理通道只选择 Source，不直接拥有格式解析。
     let payload = reader.read_all(ELM_IMAGE_SESSION_MAX_LENGTH)?;
-    let image = parse_eki_image(&payload)?;
+    let profile_hash = super::kernel_symbols::catalog_profile_hash()
+        .map_err(|_| ElmEbiLoadStatus::RuntimeRejected)?;
+    let image = parse_eki_image_for(
+        &payload,
+        ElmEkiSelector {
+            arch,
+            profile_hash,
+            bridge_abi_version: super::kernel_symbols::KERNEL_API_BRIDGE_ABI_VERSION,
+        },
+    )?;
     image.validate(arch)?;
     Ok(image)
 }

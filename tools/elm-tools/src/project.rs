@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::kernel_interface::{
-    KernelInterfaceManifest, LSP_SOURCE_IDENTITY_FILE, LSP_SOURCE_MAGIC,
-    framework_workspace_manifest, metadata_facade_manifest, metadata_facade_source,
+    KernelInterfaceManifest, LSP_SOURCE_IDENTITY_FILE, LSP_SOURCE_MAGIC, hex_digest,
+    metadata_facade_manifest, metadata_facade_source, packaged_framework_hash,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,8 +14,27 @@ pub struct ElmProjectManifest {
     pub version: String,
     pub kind: String,
     pub source: String,
+    pub mode: ElmBuildMode,
     pub menu: Option<ElmProjectMenu>,
     pub dependencies: Vec<ElmProjectDependency>,
+    pub profiles: Vec<ElmProjectProfile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElmBuildMode {
+    Integrated,
+    Managed,
+    Disabled,
+}
+
+impl ElmBuildMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Integrated => "y",
+            Self::Managed => "m",
+            Self::Disabled => "n",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,11 +50,25 @@ pub struct ElmProjectDependency {
     pub contract: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElmProjectProfile {
+    pub id: String,
+    pub priority: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct KernelInterfaceBundle {
+    pub root: PathBuf,
+    pub manifest: KernelInterfaceManifest,
+    pub priority: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     Elm,
     Menu,
     Dependency(usize),
+    Profile(usize),
 }
 
 impl ElmProjectManifest {
@@ -51,6 +84,7 @@ impl ElmProjectManifest {
         let mut elm = BTreeMap::new();
         let mut menu = BTreeMap::new();
         let mut dependencies: Vec<BTreeMap<String, String>> = Vec::new();
+        let mut profiles: Vec<BTreeMap<String, String>> = Vec::new();
         for (line_index, raw_line) in input.lines().enumerate() {
             let line_number = line_index + 1;
             let line = strip_comment(raw_line)?.trim();
@@ -68,6 +102,11 @@ impl ElmProjectManifest {
             if line == "[[dependencies]]" {
                 dependencies.push(BTreeMap::new());
                 section = Some(Section::Dependency(dependencies.len() - 1));
+                continue;
+            }
+            if line == "[[profiles]]" {
+                profiles.push(BTreeMap::new());
+                section = Some(Section::Profile(profiles.len() - 1));
                 continue;
             }
             if line.starts_with('[') {
@@ -89,6 +128,7 @@ impl ElmProjectManifest {
                 Some(Section::Elm) => &mut elm,
                 Some(Section::Menu) => &mut menu,
                 Some(Section::Dependency(index)) => &mut dependencies[index],
+                Some(Section::Profile(index)) => &mut profiles[index],
                 None => return Err(format!("Elm.toml 第 {line_number} 行位于 section 之外")),
             };
             if target.insert(key.to_string(), value).is_some() {
@@ -96,12 +136,22 @@ impl ElmProjectManifest {
             }
         }
 
-        reject_unknown_keys(&elm, &["name", "version", "kind", "source"], "[elm]")?;
+        reject_unknown_keys(
+            &elm,
+            &["name", "version", "kind", "source", "mode"],
+            "[elm]",
+        )?;
         reject_unknown_keys(&menu, &["label", "description", "route"], "[menu]")?;
         let name = take_required(&elm, "name", "[elm]")?;
         let version = take_required(&elm, "version", "[elm]")?;
         let kind = take_required(&elm, "kind", "[elm]")?;
         let source = take_required(&elm, "source", "[elm]")?;
+        let mode = match elm.get("mode").map(String::as_str).unwrap_or("m") {
+            "y" => ElmBuildMode::Integrated,
+            "m" => ElmBuildMode::Managed,
+            "n" => ElmBuildMode::Disabled,
+            mode => return Err(format!("未知 ELM 构建模式: {mode}")),
+        };
         validate_identifier(&name, 128, "ELM 名称")?;
         validate_version(&version)?;
         validate_source(&source)?;
@@ -162,13 +212,38 @@ impl ElmProjectManifest {
             }
             parsed_dependencies.push(ElmProjectDependency { provider, contract });
         }
+        let mut parsed_profiles = Vec::new();
+        for (index, profile) in profiles.iter().enumerate() {
+            reject_unknown_keys(
+                profile,
+                &["id", "priority"],
+                &format!("[[profiles]] #{}", index + 1),
+            )?;
+            let id = take_required(profile, "id", "[[profiles]]")?;
+            validate_identifier(&id, 64, "内核 API Profile")?;
+            let priority = profile
+                .get("priority")
+                .map(String::as_str)
+                .unwrap_or("0")
+                .parse::<u32>()
+                .map_err(|_| format!("Profile {id} 的 priority 不是 u32"))?;
+            if parsed_profiles
+                .iter()
+                .any(|item: &ElmProjectProfile| item.id == id)
+            {
+                return Err(format!("重复内核 API Profile: {id}"));
+            }
+            parsed_profiles.push(ElmProjectProfile { id, priority });
+        }
         Ok(Self {
             name,
             version,
             kind,
             source,
+            mode,
             menu,
             dependencies: parsed_dependencies,
+            profiles: parsed_profiles,
         })
     }
 
@@ -217,10 +292,13 @@ pub fn scaffold_project(
         &cargo_toml(&cargo_name, kind),
     )?;
     write_new(&directory.join("Elm.toml"), &elm_toml(name, kind, source))?;
-    write_new(&directory.join("src/main.rs"), &main_rs(name))?;
+    write_new(&directory.join("src/main.rs"), &module_rs(name))?;
     write_new(&directory.join("elm.ld"), ELM_LINKER_SCRIPT)?;
     write_new(&directory.join("rust-toolchain.toml"), ELM_RUST_TOOLCHAIN)?;
-    write_new(&directory.join(".cargo/config.toml"), ELM_CARGO_CONFIG)?;
+    write_new(
+        &directory.join(".cargo/config.toml"),
+        &elm_cargo_config(None, &[], &[]),
+    )?;
     sync_framework(directory)
 }
 
@@ -235,18 +313,6 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     }
     let project_manifest = ElmProjectManifest::load(project)?;
     migrate_cargo_manifest(&manifest, &project_manifest.kind)?;
-    let source = framework_source_root()?;
-    let elm_source = source.join("libs/elm");
-    let kernel_symbols_source = source.join("libs/kernel-symbols");
-    if !elm_source.join("Cargo.toml").is_file() {
-        return Err(format!("找不到框架源目录: {}", elm_source.display()));
-    }
-    if !kernel_symbols_source.join("Cargo.toml").is_file() {
-        return Err(format!(
-            "找不到内核符号契约源目录: {}",
-            kernel_symbols_source.display()
-        ));
-    }
     let elm_root = project.join(".elm");
     fs::create_dir_all(&elm_root)
         .map_err(|err| format!("创建 {} 失败: {err}", elm_root.display()))?;
@@ -257,16 +323,35 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
     remove_if_exists(&backup)?;
     fs::create_dir_all(&temporary)
         .map_err(|err| format!("创建 {} 失败: {err}", temporary.display()))?;
-    copy_tree(&elm_source, &temporary.join("elm"))?;
-    copy_tree(&kernel_symbols_source, &temporary.join("kernel-symbols"))?;
-    write_metadata_facade(
-        &temporary.join("allocator"),
-        "allocator",
-        "__elm_host_allocator",
-    )?;
-    write_metadata_facade(&temporary.join("general"), "general", "__elm_host_general")?;
-    fs::write(temporary.join("Cargo.toml"), framework_workspace_manifest())
+    if let Some(packaged) = packaged_framework_root(&project_manifest)? {
+        copy_tree(&packaged, &temporary)?;
+    } else {
+        let source = framework_source_root()?;
+        let elm_source = source.join("libs/elm");
+        let kernel_symbols_source = source.join("libs/kernel-symbols");
+        if !elm_source.join("Cargo.toml").is_file() {
+            return Err(format!("找不到框架源目录: {}", elm_source.display()));
+        }
+        if !kernel_symbols_source.join("Cargo.toml").is_file() {
+            return Err(format!(
+                "找不到内核符号契约源目录: {}",
+                kernel_symbols_source.display()
+            ));
+        }
+        copy_tree(&elm_source, &temporary.join("elm"))?;
+        copy_tree(&kernel_symbols_source, &temporary.join("kernel-symbols"))?;
+        write_metadata_facade(
+            &temporary.join("allocator"),
+            "allocator",
+            "__elm_host_allocator",
+        )?;
+        write_metadata_facade(&temporary.join("general"), "general", "__elm_host_general")?;
+        fs::write(
+            temporary.join("Cargo.toml"),
+            crate::kernel_interface::framework_workspace_manifest(),
+        )
         .map_err(|err| format!("写入框架 workspace manifest 失败: {err}"))?;
+    }
     if destination.exists() {
         fs::rename(&destination, &backup).map_err(|err| {
             format!(
@@ -289,10 +374,97 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
         .map_err(|err| format!("更新 ELM Rust 工具链声明失败: {err}"))?;
     fs::create_dir_all(project.join(".cargo"))
         .map_err(|err| format!("创建 ELM Cargo 配置目录失败: {err}"))?;
-    fs::write(project.join(".cargo/config.toml"), ELM_CARGO_CONFIG)
-        .map_err(|err| format!("更新 ELM Cargo 配置失败: {err}"))?;
-    sync_available_target_interfaces(project)?;
+    sync_available_target_interfaces(project, &project_manifest)?;
+    let active_interface = ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"]
+        .into_iter()
+        .find_map(|target| {
+            KernelInterfaceManifest::load(
+                &project
+                    .join(".elm/kernel-interface")
+                    .join(target)
+                    .join("manifest.txt"),
+            )
+            .ok()
+        });
+    let (api_profiles, profile_hashes) = active_interface
+        .as_ref()
+        .and_then(|interface| kernel_profile_cfg_values(&project_manifest, &interface.target).ok())
+        .unwrap_or_default();
+    fs::write(
+        project.join(".cargo/config.toml"),
+        elm_cargo_config(active_interface.as_ref(), &api_profiles, &profile_hashes),
+    )
+    .map_err(|err| format!("更新 ELM Cargo 配置失败: {err}"))?;
+    write_elm_lock(project, &project_manifest)?;
     Ok(())
+}
+
+fn write_elm_lock(project: &Path, manifest: &ElmProjectManifest) -> Result<(), String> {
+    let rustc = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("读取 rustc 版本失败: {err}"))?;
+    if !rustc.status.success() {
+        return Err("rustc --version 执行失败".to_string());
+    }
+    let rustc = String::from_utf8(rustc.stdout)
+        .map_err(|_| "rustc 版本不是 UTF-8".to_string())?
+        .trim()
+        .to_string();
+    let mut interfaces = Vec::new();
+    for target in ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"] {
+        let Ok(available) = available_kernel_interfaces(target) else {
+            continue;
+        };
+        for bundle in available {
+            if manifest.profiles.is_empty()
+                || manifest
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.id == bundle.manifest.profile)
+            {
+                interfaces.push(bundle.manifest);
+            }
+        }
+    }
+    interfaces.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.profile.cmp(&right.profile))
+            .then_with(|| left.interface_hash.cmp(&right.interface_hash))
+            .then_with(|| left.kernel_hash.cmp(&right.kernel_hash))
+    });
+    let mut seen = BTreeSet::new();
+    interfaces.retain(|interface| {
+        if manifest.mode == ElmBuildMode::Integrated {
+            seen.insert((interface.target.clone(), interface.kernel_hash))
+        } else {
+            seen.insert((interface.target.clone(), interface.interface_hash))
+        }
+    });
+    let mut output = String::from("ELM-LOCK-V1\n");
+    output.push_str(&format!("module={}\n", manifest.name));
+    output.push_str(&format!("version={}\n", manifest.version));
+    output.push_str(&format!("mode={}\n", manifest.mode.as_str()));
+    output.push_str(&format!("cargo_elm={}\n", env!("CARGO_PKG_VERSION")));
+    output.push_str(&format!("rustc={}\n", rustc));
+    for interface in interfaces {
+        output.push_str(&format!(
+            "profile\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            interface.target,
+            interface.profile,
+            interface.bridge_abi_version,
+            hex_digest(&interface.interface_hash),
+            hex_digest(&interface.source_hash),
+            hex_digest(&interface.framework_hash),
+            hex_digest(&interface.kernel_hash),
+        ));
+    }
+    let temporary = project.join(format!("Elm.lock.tmp.{}", std::process::id()));
+    fs::write(&temporary, output)
+        .map_err(|err| format!("写入 {} 失败: {err}", temporary.display()))?;
+    fs::rename(&temporary, project.join("Elm.lock"))
+        .map_err(|err| format!("安装 Elm.lock 失败: {err}"))
 }
 
 pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<PathBuf, String> {
@@ -300,6 +472,8 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         .canonicalize()
         .map_err(|err| format!("定位 {} 失败: {err}", project.display()))?;
     prepare_target_interface(&project, target)?;
+    let project_manifest = ElmProjectManifest::load(&project)?;
+    write_elm_lock(&project, &project_manifest)?;
     let interface_root = project.join(".elm/kernel-interface").join(target);
     let manifest = interface_root.join("manifest.txt");
     let interface = KernelInterfaceManifest::load(&manifest)?;
@@ -342,6 +516,8 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         "--extern=__elm_host_general={}",
         metadata.join(&interface.general_metadata).display()
     ));
+    let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
+    append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
     if target == "loongarch64-unknown-none" {
         rustflags.push("-Anamed_asm_labels".to_string());
     }
@@ -371,10 +547,339 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         .join(cargo_name))
 }
 
+pub fn cargo_build_integrated(
+    project: &Path,
+    target: &str,
+    cargo_name: &str,
+) -> Result<PathBuf, String> {
+    let project = project
+        .canonicalize()
+        .map_err(|err| format!("定位 {} 失败: {err}", project.display()))?;
+    prepare_target_interface(&project, target)?;
+    let project_manifest = ElmProjectManifest::load(&project)?;
+    write_elm_lock(&project, &project_manifest)?;
+    let interface_root = project.join(".elm/kernel-interface").join(target);
+    let interface = KernelInterfaceManifest::load(&interface_root.join("manifest.txt"))?;
+    let metadata = interface_root.join("metadata");
+    let mut rustflags = vec![
+        format!("-Ldependency={}", metadata.display()),
+        format!(
+            "--extern=__elm_host_allocator={}",
+            metadata.join(&interface.allocator_metadata).display()
+        ),
+        format!(
+            "--extern=__elm_host_general={}",
+            metadata.join(&interface.general_metadata).display()
+        ),
+    ];
+    let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
+    append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
+    let status = Command::new("cargo")
+        .current_dir(&project)
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
+        .env("ELM_KERNEL_PROFILE_ID", &interface.profile)
+        .env(
+            "ELM_KERNEL_PROFILE_HASH",
+            hex_digest(&interface.interface_hash),
+        )
+        .arg("rustc")
+        .arg("--manifest-path")
+        .arg(project.join("Cargo.toml"))
+        .arg("--package")
+        .arg(cargo_name)
+        .arg("--lib")
+        .arg("--no-default-features")
+        .arg("--features")
+        .arg("elm-integrated")
+        .arg("--target")
+        .arg(target)
+        .arg("--release")
+        .arg("--")
+        .arg("--emit=link")
+        .status()
+        .map_err(|err| format!("启动集成组件 cargo rustc 失败: {err}"))?;
+    if !status.success() {
+        return Err(format!("集成组件 Rust 构建失败，退出状态 {status}"));
+    }
+
+    let crate_name = cargo_name.replace('-', "_");
+    let rlib = project
+        .join("target")
+        .join(target)
+        .join("release")
+        .join(format!("lib{crate_name}.rlib"));
+    if !rlib.is_file() {
+        return Err(format!("集成组件构建没有生成 {}", rlib.display()));
+    }
+    let temporary = project
+        .join("target/elm/integrated")
+        .join(format!("{target}.tmp.{}", std::process::id()));
+    remove_if_exists(&temporary)?;
+    fs::create_dir_all(&temporary)
+        .map_err(|err| format!("创建 {} 失败: {err}", temporary.display()))?;
+    let extract = Command::new("llvm-ar")
+        .current_dir(&temporary)
+        .arg("x")
+        .arg(&rlib)
+        .output()
+        .map_err(|err| format!("解包 {} 失败: {err}", rlib.display()))?;
+    if !extract.status.success() {
+        return Err(format!(
+            "llvm-ar 无法解包集成组件: {}",
+            String::from_utf8_lossy(&extract.stderr)
+        ));
+    }
+    let mut objects = fs::read_dir(&temporary)
+        .map_err(|err| format!("读取 {} 失败: {err}", temporary.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("读取集成组件对象失败: {err}"))?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "o"))
+        .collect::<Vec<_>>();
+    objects.sort();
+    if objects.is_empty() {
+        return Err("集成组件 rlib 不包含目标对象".to_string());
+    }
+    let mut has_initcall = false;
+    for object in &objects {
+        let sections = Command::new("llvm-objdump")
+            .arg("-h")
+            .arg(object)
+            .output()
+            .map_err(|err| format!("检查 {} 段表失败: {err}", object.display()))?;
+        if !sections.status.success() {
+            return Err(format!("llvm-objdump 无法读取 {}", object.display()));
+        }
+        has_initcall |=
+            String::from_utf8_lossy(&sections.stdout).contains(".kernel.integrated_components");
+    }
+    if !has_initcall {
+        return Err("集成构建没有生成普通内核 initcall 描述符".to_string());
+    }
+    let output_dir = project.join("dist");
+    fs::create_dir_all(&output_dir)
+        .map_err(|err| format!("创建 {} 失败: {err}", output_dir.display()))?;
+    let output = output_dir.join(format!("{cargo_name}-{target}.integrated.a"));
+    remove_if_exists(&output)?;
+    let archive = Command::new("llvm-ar")
+        .arg("crs")
+        .arg(&output)
+        .args(&objects)
+        .output()
+        .map_err(|err| format!("生成集成组件归档失败: {err}"))?;
+    if !archive.status.success() {
+        return Err(format!(
+            "llvm-ar 生成集成组件归档失败: {}",
+            String::from_utf8_lossy(&archive.stderr)
+        ));
+    }
+    remove_if_exists(&temporary)?;
+    Ok(output)
+}
+
+pub fn cargo_check(project: &Path, target: &str, cargo_name: &str) -> Result<(), String> {
+    let project = project
+        .canonicalize()
+        .map_err(|err| format!("定位 {} 失败: {err}", project.display()))?;
+    prepare_target_interface(&project, target)?;
+    let project_manifest = ElmProjectManifest::load(&project)?;
+    write_elm_lock(&project, &project_manifest)?;
+    let interface_root = project.join(".elm/kernel-interface").join(target);
+    let interface = KernelInterfaceManifest::load(&interface_root.join("manifest.txt"))?;
+    let metadata = interface_root.join("metadata");
+    let mut rustflags = vec![
+        format!("-Ldependency={}", metadata.display()),
+        format!(
+            "--extern=__elm_host_allocator={}",
+            metadata.join(&interface.allocator_metadata).display()
+        ),
+        format!(
+            "--extern=__elm_host_general={}",
+            metadata.join(&interface.general_metadata).display()
+        ),
+    ];
+    let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
+    append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
+    let status = Command::new("cargo")
+        .current_dir(&project)
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"))
+        .arg("check")
+        .arg("--manifest-path")
+        .arg(project.join("Cargo.toml"))
+        .arg("--package")
+        .arg(cargo_name)
+        .arg("--no-default-features")
+        .arg("--target")
+        .arg(target)
+        .status()
+        .map_err(|err| format!("启动 cargo check 失败: {err}"))?;
+    if !status.success() {
+        return Err(format!("ELM 检查失败，退出状态 {status}"));
+    }
+    Ok(())
+}
+
+fn append_kernel_profile_flags(
+    rustflags: &mut Vec<String>,
+    interface: &KernelInterfaceManifest,
+    api_profiles: &[String],
+    profile_hashes: &[String],
+) {
+    let profile_hash = hex_digest(&interface.interface_hash);
+    rustflags.push(format!("--cfg=elm_kernel_api=\"{}\"", interface.profile));
+    rustflags.push(check_cfg_values("elm_kernel_api", api_profiles));
+    rustflags.push(format!("--cfg=elm_kernel_profile=\"{profile_hash}\""));
+    rustflags.push(check_cfg_values("elm_kernel_profile", profile_hashes));
+}
+
+fn check_cfg_values(name: &str, values: &[String]) -> String {
+    let values = values
+        .iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("--check-cfg=cfg({name},values({values}))")
+}
+
+fn kernel_profile_cfg_values(
+    manifest: &ElmProjectManifest,
+    target: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let interfaces = selected_kernel_interfaces(manifest, target)?;
+    let mut api_profiles = interfaces
+        .iter()
+        .map(|interface| interface.manifest.profile.clone())
+        .collect::<Vec<_>>();
+    let mut profile_hashes = interfaces
+        .iter()
+        .map(|interface| hex_digest(&interface.manifest.interface_hash))
+        .collect::<Vec<_>>();
+    api_profiles.sort();
+    api_profiles.dedup();
+    profile_hashes.sort();
+    profile_hashes.dedup();
+    Ok((api_profiles, profile_hashes))
+}
+
+pub fn cargo_test(project: &Path) -> Result<(), String> {
+    let project = project
+        .canonicalize()
+        .map_err(|err| format!("定位 {} 失败: {err}", project.display()))?;
+    ElmProjectManifest::load(&project)?;
+    let status = Command::new("cargo")
+        .current_dir(&project)
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(project.join("Cargo.toml"))
+        .arg("--target")
+        .arg("x86_64-unknown-linux-gnu")
+        .status()
+        .map_err(|err| format!("启动开发侧 cargo test 失败: {err}"))?;
+    if !status.success() {
+        return Err(format!("ELM 开发侧测试失败，退出状态 {status}"));
+    }
+    Ok(())
+}
+
+pub fn diagnose_project(project: &Path) -> Result<String, String> {
+    let project = project
+        .canonicalize()
+        .map_err(|err| format!("定位 {} 失败: {err}", project.display()))?;
+    let manifest = ElmProjectManifest::load(&project)?;
+    if !project.join("Cargo.toml").is_file() {
+        return Err("工程缺少 Cargo.toml".to_string());
+    }
+    if !project.join("rust-toolchain.toml").is_file() {
+        return Err("工程缺少 rust-toolchain.toml".to_string());
+    }
+    let mut report = format!(
+        "ELM 工程诊断\nname={}\nversion={}\nkind={}\nsource={}\n",
+        manifest.name, manifest.version, manifest.kind, manifest.source
+    );
+    for target in ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"] {
+        match selected_kernel_interfaces(&manifest, target) {
+            Ok(interfaces) => {
+                for bundle in interfaces {
+                    let interface = bundle.manifest;
+                    report.push_str(&format!(
+                        "target={} profile={} profile_hash={} framework_hash={} symbols={} bridge_abi={} priority={} status=ok\n",
+                        target,
+                        interface.profile,
+                        hex_digest(&interface.interface_hash),
+                        hex_digest(&interface.framework_hash),
+                        interface.symbols.len(),
+                        interface.bridge_abi_version,
+                        bundle.priority,
+                    ));
+                }
+            }
+            Err(error) => {
+                report.push_str(&format!(
+                    "target={target} status=unavailable reason={error}\n"
+                ));
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn framework_source_root() -> Result<PathBuf, String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     root.canonicalize()
         .map_err(|err| format!("定位 ELM 框架源码失败: {err}"))
+}
+
+fn packaged_framework_root(manifest: &ElmProjectManifest) -> Result<Option<PathBuf>, String> {
+    let mut selected_framework = None;
+    for target in ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"] {
+        let Ok(available) = available_kernel_interfaces(target) else {
+            continue;
+        };
+        for bundle in available.iter().filter(|bundle| {
+            manifest.profiles.is_empty()
+                || manifest
+                    .profiles
+                    .iter()
+                    .any(|requested| requested.id == bundle.manifest.profile)
+        }) {
+            let framework = bundle.root.join("framework");
+            if !framework.join("Cargo.toml").is_file()
+                || !framework.join("elm/Cargo.toml").is_file()
+                || !framework.join("kernel-symbols/Cargo.toml").is_file()
+                || !framework.join("allocator/Cargo.toml").is_file()
+                || !framework.join("general/Cargo.toml").is_file()
+            {
+                return Err(format!(
+                    "接口包 {} 缺少完整 ELM framework",
+                    bundle.root.display()
+                ));
+            }
+            let actual_framework_hash = packaged_framework_hash(&framework)?;
+            if actual_framework_hash != bundle.manifest.framework_hash {
+                return Err(format!(
+                    "接口包 {} 的 ELM framework 摘要不匹配：声明 {}，实际 {}",
+                    bundle.root.display(),
+                    hex_digest(&bundle.manifest.framework_hash),
+                    hex_digest(&actual_framework_hash)
+                ));
+            }
+            match &selected_framework {
+                None => {
+                    selected_framework = Some((bundle.manifest.framework_hash, framework.clone()));
+                }
+                Some((hash, _)) if *hash == bundle.manifest.framework_hash => {}
+                Some((hash, _)) => {
+                    return Err(format!(
+                        "所选内核 Profile 混用了不同 ELM framework：{} 与 {}；请统一工具链后重新导出接口包",
+                        hex_digest(hash),
+                        hex_digest(&bundle.manifest.framework_hash)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(selected_framework.map(|(_, framework)| framework))
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
@@ -432,24 +937,184 @@ fn interface_bundle_root() -> Result<PathBuf, String> {
     if let Some(root) = std::env::var_os("ELM_KERNEL_INTERFACE_ROOT") {
         return Ok(PathBuf::from(root));
     }
-    Ok(framework_source_root()?.join("build/elm-interface"))
+    if let Some(home) = std::env::var_os("ELM_HOME") {
+        return Ok(PathBuf::from(home).join("interfaces"));
+    }
+    if let Ok(repository) = framework_source_root() {
+        let repository_cache = repository.join("build/elm-interface");
+        if repository_cache.exists() {
+            return Ok(repository_cache);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".cache/elm/interfaces"));
+    }
+    Err("无法定位 ELM 接口仓库；请设置 ELM_KERNEL_INTERFACE_ROOT".to_string())
 }
 
-fn sync_available_target_interfaces(project: &Path) -> Result<(), String> {
-    let root = interface_bundle_root()?;
-    let mut installed_source_hash = None;
+pub fn available_kernel_interfaces(target: &str) -> Result<Vec<KernelInterfaceBundle>, String> {
+    let root = interface_bundle_root()?.join(target);
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut manifests = Vec::new();
+    collect_interface_manifests(&root, 0, &mut manifests)?;
+    manifests.sort();
+    let mut seen = BTreeSet::new();
+    let mut bundles = Vec::new();
+    for path in manifests {
+        let manifest = KernelInterfaceManifest::load(&path)?;
+        if manifest.target != target {
+            return Err(format!(
+                "接口包目录目标为 {target}，但 {} 声明目标 {}",
+                path.display(),
+                manifest.target
+            ));
+        }
+        if !seen.insert((manifest.interface_hash, manifest.kernel_hash)) {
+            continue;
+        }
+        let root = path
+            .parent()
+            .ok_or_else(|| format!("接口清单没有父目录: {}", path.display()))?
+            .canonicalize()
+            .map_err(|err| format!("定位接口包 {} 失败: {err}", path.display()))?;
+        bundles.push(KernelInterfaceBundle {
+            root,
+            manifest,
+            priority: 0,
+        });
+    }
+    bundles.sort_by(|left, right| {
+        left.manifest
+            .profile
+            .cmp(&right.manifest.profile)
+            .then_with(|| {
+                left.manifest
+                    .interface_hash
+                    .cmp(&right.manifest.interface_hash)
+            })
+            .then_with(|| left.manifest.kernel_hash.cmp(&right.manifest.kernel_hash))
+    });
+    Ok(bundles)
+}
+
+pub fn selected_kernel_interfaces(
+    manifest: &ElmProjectManifest,
+    target: &str,
+) -> Result<Vec<KernelInterfaceBundle>, String> {
+    let available = available_kernel_interfaces(target)?;
+    if manifest.profiles.is_empty() {
+        if available.is_empty() {
+            return Err(format!("目标 {target} 没有可用的内核 API Profile"));
+        }
+        if available.len() > elm::ELM_EKI_MAX_VARIANTS {
+            return Err(format!(
+                "目标 {target} 的可用 Profile 数量超过 EKI 上限 {}",
+                elm::ELM_EKI_MAX_VARIANTS
+            ));
+        }
+        return Ok(available);
+    }
+
+    let mut selected = Vec::new();
+    for requested in &manifest.profiles {
+        let mut matched = 0usize;
+        for bundle in &available {
+            if bundle.manifest.profile == requested.id {
+                let mut bundle = bundle.clone();
+                bundle.priority = requested.priority;
+                selected.push(bundle);
+                matched += 1;
+            }
+        }
+        if matched == 0 {
+            return Err(format!(
+                "目标 {target} 缺少 Elm.toml 请求的内核 API Profile {}",
+                requested.id
+            ));
+        }
+    }
+    if selected.len() > elm::ELM_EKI_MAX_VARIANTS {
+        return Err(format!(
+            "目标 {target} 的所选 Profile 数量超过 EKI 上限 {}",
+            elm::ELM_EKI_MAX_VARIANTS
+        ));
+    }
+    Ok(selected)
+}
+
+pub fn activate_kernel_interface(
+    project: &Path,
+    bundle: &KernelInterfaceBundle,
+) -> Result<(), String> {
+    copy_target_interface(project, &bundle.manifest.target, &bundle.root)?;
+    install_lsp_source(project, &bundle.root, &bundle.manifest, true)?;
+    let project_manifest = ElmProjectManifest::load(project)?;
+    let (api_profiles, profile_hashes) =
+        kernel_profile_cfg_values(&project_manifest, &bundle.manifest.target)?;
+    fs::write(
+        project.join(".cargo/config.toml"),
+        elm_cargo_config(Some(&bundle.manifest), &api_profiles, &profile_hashes),
+    )
+    .map_err(|err| format!("更新活动 Profile 的 Cargo 配置失败: {err}"))
+}
+
+fn collect_interface_manifests(
+    directory: &Path,
+    depth: usize,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if depth > 3 {
+        return Ok(());
+    }
+    let manifest = directory.join("manifest.txt");
+    if manifest.is_file() {
+        output.push(manifest);
+    }
+    for entry in fs::read_dir(directory)
+        .map_err(|err| format!("读取接口仓库 {} 失败: {err}", directory.display()))?
+    {
+        let entry = entry.map_err(|err| format!("读取接口仓库目录项失败: {err}"))?;
+        if matches!(
+            entry.file_name().to_str(),
+            Some("metadata" | "framework" | "kernel-source" | "target")
+        ) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            collect_interface_manifests(&path, depth + 1, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_available_target_interfaces(
+    project: &Path,
+    manifest: &ElmProjectManifest,
+) -> Result<(), String> {
+    let mut installed_lsp = false;
     for target in ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"] {
-        let bundle = root.join(target);
-        if bundle.join("manifest.txt").is_file() {
-            let manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
-            if installed_source_hash.is_some_and(|hash| hash != manifest.interface_hash) {
-                return Err("不同目标接口包的规范接口摘要不一致".to_string());
-            }
-            if installed_source_hash.is_none() {
-                install_lsp_source(project, &bundle, &manifest, true)?;
-                installed_source_hash = Some(manifest.interface_hash);
-            }
-            copy_target_interface(project, target, &bundle, false)?;
+        let Ok(available) = available_kernel_interfaces(target) else {
+            // 新建工程不能被仓库中遗留的旧版生成缓存阻断；正式 build/doctor 会对
+            // 所选 Profile 返回完整格式错误。
+            continue;
+        };
+        let selected = manifest
+            .profiles
+            .iter()
+            .find_map(|requested| {
+                available
+                    .iter()
+                    .find(|bundle| bundle.manifest.profile == requested.id)
+            })
+            .or_else(|| available.first());
+        let Some(bundle) = selected else { continue };
+        copy_target_interface(project, target, &bundle.root)?;
+        if !installed_lsp {
+            install_lsp_source(project, &bundle.root, &bundle.manifest, true)?;
+            installed_lsp = true;
         }
     }
     Ok(())
@@ -460,42 +1125,35 @@ fn prepare_target_interface(project: &Path, target: &str) -> Result<(), String> 
     if destination.join("manifest.txt").is_file() {
         let manifest = KernelInterfaceManifest::load(&destination.join("manifest.txt"))?;
         if lsp_source_interface_hash(&project.join(".elm/kernel-source"))?
-            == Some(manifest.interface_hash)
+            == Some(manifest.source_hash)
         {
             return Ok(());
         }
-        let bundle = interface_bundle_root()?.join(target);
-        if !bundle.join("manifest.txt").is_file() {
+        let bundle = available_kernel_interfaces(target)?
+            .into_iter()
+            .find(|bundle| bundle.manifest.interface_hash == manifest.interface_hash)
+            .ok_or_else(|| {
+                format!("目标 {target} 已激活的 Profile 已不在接口仓库中；请执行 cargo elm sync")
+            })?;
+        if bundle.manifest.source_hash != manifest.source_hash {
             return Err(format!(
-                "目标 {target} 已有接口包，但缺少与其匹配的 LSP 源码投影；请执行 elm-tools sync-framework"
+                "目标 {target} 的工程 Profile 与发布接口包源码摘要不一致；请执行 cargo elm sync"
             ));
         }
-        let bundle_manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
-        if bundle_manifest.interface_hash != manifest.interface_hash {
-            return Err(format!(
-                "目标 {target} 的工程接口包与发布接口包摘要不一致；请执行 elm-tools sync-framework"
-            ));
-        }
-        install_lsp_source(project, &bundle, &manifest, true)?;
+        install_lsp_source(project, &bundle.root, &manifest, true)?;
         return Ok(());
     }
-    let bundle = interface_bundle_root()?.join(target);
-    if !bundle.join("manifest.txt").is_file() {
-        return Err(format!(
-            "缺少目标 {target} 的精确内核接口包；先对对应内核执行 elm-tools export-interface"
-        ));
-    }
-    let manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
-    copy_target_interface(project, target, &bundle, true)?;
-    install_lsp_source(project, &bundle, &manifest, false)
+    let bundle = available_kernel_interfaces(target)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            format!("缺少目标 {target} 的内核 API Profile；先执行 cargo elm profile-export")
+        })?;
+    copy_target_interface(project, target, &bundle.root)?;
+    install_lsp_source(project, &bundle.root, &bundle.manifest, false)
 }
 
-fn copy_target_interface(
-    project: &Path,
-    target: &str,
-    bundle: &Path,
-    enforce_existing_coherence: bool,
-) -> Result<(), String> {
+fn copy_target_interface(project: &Path, target: &str, bundle: &Path) -> Result<(), String> {
     let manifest = KernelInterfaceManifest::load(&bundle.join("manifest.txt"))?;
     if manifest.target != target {
         return Err(format!(
@@ -503,15 +1161,14 @@ fn copy_target_interface(
             manifest.target
         ));
     }
-    if enforce_existing_coherence {
-        ensure_existing_interface_coherence(project, target, manifest.interface_hash)?;
-    }
     let root = project.join(".elm/kernel-interface");
     fs::create_dir_all(&root).map_err(|err| format!("创建 {} 失败: {err}", root.display()))?;
     let temporary = root.join(format!("{target}.tmp.{}", std::process::id()));
     let destination = root.join(target);
     remove_if_exists(&temporary)?;
-    copy_tree(&bundle.join("metadata"), &temporary.join("metadata"))?;
+    let bundle = bundle
+        .canonicalize()
+        .map_err(|err| format!("定位接口缓存 {} 失败: {err}", bundle.display()))?;
     let support_library = bundle.join(&manifest.support_library);
     if !support_library.is_file() {
         return Err(format!(
@@ -519,8 +1176,6 @@ fn copy_target_interface(
             support_library.display()
         ));
     }
-    fs::copy(&support_library, temporary.join(&manifest.support_library))
-        .map_err(|err| format!("复制目标 Rust 支持归档失败: {err}"))?;
     let import_library = bundle.join(&manifest.import_library);
     if !import_library.is_file() {
         return Err(format!(
@@ -528,10 +1183,8 @@ fn copy_target_interface(
             import_library.display()
         ));
     }
-    fs::copy(&import_library, temporary.join(&manifest.import_library))
-        .map_err(|err| format!("复制目标内核导入库失败: {err}"))?;
-    fs::copy(bundle.join("manifest.txt"), temporary.join("manifest.txt"))
-        .map_err(|err| format!("复制目标接口清单失败: {err}"))?;
+    std::os::unix::fs::symlink(&bundle, &temporary)
+        .map_err(|err| format!("建立接口缓存链接失败: {err}"))?;
     remove_if_exists(&destination)?;
     fs::rename(&temporary, &destination).map_err(|err| format!("安装目标接口包失败: {err}"))?;
 
@@ -558,37 +1211,6 @@ fn copy_target_interface(
     Ok(())
 }
 
-fn ensure_existing_interface_coherence(
-    project: &Path,
-    target: &str,
-    interface_hash: [u8; 32],
-) -> Result<(), String> {
-    let root = project.join(".elm/kernel-interface");
-    if !root.is_dir() {
-        return Ok(());
-    }
-    for entry in
-        fs::read_dir(&root).map_err(|err| format!("读取 {} 失败: {err}", root.display()))?
-    {
-        let entry = entry.map_err(|err| format!("读取目标接口目录项失败: {err}"))?;
-        if entry.file_name() == target || !entry.path().is_dir() {
-            continue;
-        }
-        let manifest_path = entry.path().join("manifest.txt");
-        if !manifest_path.is_file() {
-            continue;
-        }
-        let existing = KernelInterfaceManifest::load(&manifest_path)?;
-        if existing.interface_hash != interface_hash {
-            return Err(format!(
-                "目标 {target} 与已安装目标 {} 的规范接口摘要不一致；必须整体同步接口包",
-                existing.target
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn install_lsp_source(
     project: &Path,
     bundle: &Path,
@@ -598,7 +1220,7 @@ fn install_lsp_source(
     let source = bundle.join("kernel-source");
     let source_hash = lsp_source_interface_hash(&source)?
         .ok_or_else(|| format!("接口包缺少有效的 LSP 源码投影身份: {}", source.display()))?;
-    if source_hash != manifest.interface_hash {
+    if source_hash != manifest.source_hash {
         return Err(format!(
             "接口包 LSP 源码投影与清单摘要不一致: {}",
             bundle.display()
@@ -615,7 +1237,11 @@ fn install_lsp_source(
     let backup = elm_root.join(format!("kernel-source.old.{}", std::process::id()));
     remove_if_exists(&temporary)?;
     remove_if_exists(&backup)?;
-    copy_tree(&source, &temporary)?;
+    let source = source
+        .canonicalize()
+        .map_err(|err| format!("定位 LSP 源码缓存 {} 失败: {err}", source.display()))?;
+    std::os::unix::fs::symlink(&source, &temporary)
+        .map_err(|err| format!("建立 LSP 源码缓存链接失败: {err}"))?;
     if destination.exists() {
         fs::rename(&destination, &backup).map_err(|err| {
             format!(
@@ -685,7 +1311,9 @@ fn parse_sha256(value: &str) -> Result<[u8; 32], String> {
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), String> {
-    if path.is_dir() {
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        fs::remove_file(path).map_err(|err| format!("删除 {} 失败: {err}", path.display()))?;
+    } else if path.is_dir() {
         fs::remove_dir_all(path).map_err(|err| format!("删除 {} 失败: {err}", path.display()))?;
     } else if path.exists() {
         fs::remove_file(path).map_err(|err| format!("删除 {} 失败: {err}", path.display()))?;
@@ -714,9 +1342,17 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[lib]
+name = "{crate_name}"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
 [features]
 default = ["elm-lsp"]
 elm-lsp = ["allocator/lsp", "general/lsp"]
+elm-integrated = []
 
 [dependencies]
 elm = {{ path = ".elm/framework/elm", default-features = false, features = [{features}] }}
@@ -731,7 +1367,8 @@ strip = false
 
 [profile.dev]
 panic = "abort"
-"#
+"#,
+        crate_name = name.replace('-', "_")
     )
 }
 
@@ -742,11 +1379,12 @@ name = "{name}"
 version = "0.1.0"
 kind = "{kind}"
 source = "{source}"
+mode = "m"
 "#
     )
 }
 
-fn main_rs(name: &str) -> String {
+fn module_rs(name: &str) -> String {
     format!(
         r#"#![no_std]
 #![no_main]
@@ -776,16 +1414,28 @@ impl ElmModule for Module {{
         if *boxed != 6 || Arc::strong_count(&shared) != 1 {{
             return Err(HookError::new(-1));
         }}
-        elm::runtime::log(6, shared.as_str()).map_err(|_| HookError::new(-1))?;
+        report(6, shared.as_str())?;
         Ok(())
     }}
 
     fn finalize(&mut self, _context: &LifecycleContext) -> HookResult {{
-        elm::runtime::log(6, "{name}: finalized").map_err(|_| HookError::new(-1))?;
+        report(6, "{name}: finalized")?;
         Ok(())
     }}
 }}
 
+#[cfg(not(feature = "elm-integrated"))]
+fn report(level: u32, message: &str) -> HookResult {{
+    elm::runtime::log(level, message).map_err(|_| HookError::new(-1))
+}}
+
+#[cfg(feature = "elm-integrated")]
+fn report(_level: u32, message: &str) -> HookResult {{
+    core::hint::black_box(message);
+    Ok(())
+}}
+
+#[cfg(not(feature = "elm-integrated"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {{
     elm::runtime::abort_panic()
@@ -1293,33 +1943,83 @@ fn validate_source(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-const ELM_CARGO_CONFIG: &str = r#"[target.riscv64gc-unknown-none-elf]
-linker = "rust-lld"
-rustflags = [
-    "-C", "link-arg=-Telm.ld",
-    "-C", "relocation-model=pic",
-    "-C", "code-model=small",
-    "-C", "link-arg=-pie",
-    "-C", "link-arg=-z",
-    "-C", "link-arg=notext",
-    "-C", "link-arg=--gc-sections",
-    "-C", "link-arg=--build-id=none",
-]
+fn elm_cargo_config(
+    interface: Option<&KernelInterfaceManifest>,
+    api_profiles: &[String],
+    profile_hashes: &[String],
+) -> String {
+    let profile_flags = interface.map_or_else(Vec::new, |interface| {
+        let profile_hash = hex_digest(&interface.interface_hash);
+        let api_profiles = if api_profiles.is_empty() {
+            vec![interface.profile.clone()]
+        } else {
+            api_profiles.to_vec()
+        };
+        let profile_hashes = if profile_hashes.is_empty() {
+            vec![profile_hash.clone()]
+        } else {
+            profile_hashes.to_vec()
+        };
+        vec![
+            format!("--cfg=elm_kernel_api=\"{}\"", interface.profile),
+            check_cfg_values("elm_kernel_api", &api_profiles),
+            format!("--cfg=elm_kernel_profile=\"{profile_hash}\""),
+            check_cfg_values("elm_kernel_profile", &profile_hashes),
+        ]
+    });
+    let mut output = String::from("[build]\n");
+    if !profile_flags.is_empty() {
+        output.push_str("rustflags = [\n");
+        append_toml_array(&mut output, &profile_flags);
+        output.push_str("]\n");
+    }
+    output
+        .push_str("\n[target.riscv64gc-unknown-none-elf]\nlinker = \"rust-lld\"\nrustflags = [\n");
+    let mut riscv_flags = elm_link_flags(false);
+    riscv_flags.extend(profile_flags.iter().cloned());
+    append_toml_array(&mut output, &riscv_flags);
+    output
+        .push_str("]\n\n[target.loongarch64-unknown-none]\nlinker = \"rust-lld\"\nrustflags = [\n");
+    let mut loongarch_flags = elm_link_flags(true);
+    loongarch_flags.extend(profile_flags);
+    append_toml_array(&mut output, &loongarch_flags);
+    output.push_str("]\n");
+    output
+}
 
-[target.loongarch64-unknown-none]
-linker = "rust-lld"
-rustflags = [
-    "-C", "link-arg=-Telm.ld",
-    "-C", "relocation-model=pic",
-    "-C", "code-model=small",
-    "-C", "link-arg=-pie",
-    "-C", "link-arg=-z",
-    "-C", "link-arg=notext",
-    "-C", "link-arg=--gc-sections",
-    "-C", "link-arg=--build-id=none",
-    "-A", "named_asm_labels",
-]
-"#;
+fn elm_link_flags(loongarch: bool) -> Vec<String> {
+    let mut flags = vec![
+        "-C".to_string(),
+        "link-arg=-Telm.ld".to_string(),
+        "-C".to_string(),
+        "relocation-model=pic".to_string(),
+        "-C".to_string(),
+        "code-model=small".to_string(),
+        "-C".to_string(),
+        "link-arg=-pie".to_string(),
+        "-C".to_string(),
+        "link-arg=-z".to_string(),
+        "-C".to_string(),
+        "link-arg=notext".to_string(),
+        "-C".to_string(),
+        "link-arg=--gc-sections".to_string(),
+        "-C".to_string(),
+        "link-arg=--build-id=none".to_string(),
+    ];
+    if loongarch {
+        flags.push("-A".to_string());
+        flags.push("named_asm_labels".to_string());
+    }
+    flags
+}
+
+fn append_toml_array(output: &mut String, values: &[String]) {
+    use std::fmt::Write as _;
+
+    for value in values {
+        writeln!(output, "    {value:?},").expect("写入 String 不会失败");
+    }
+}
 
 const ELM_RUST_TOOLCHAIN: &str = r#"[toolchain]
 channel = "nightly-2025-05-20"
@@ -1409,7 +2109,7 @@ mod tests {
         fn new(name: &str) -> Self {
             let sequence = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "elm-tools-{name}-{}-{sequence}",
+                "cargo-elm-{name}-{}-{sequence}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&path);
@@ -1446,11 +2146,18 @@ route = "demo.echo"
 [[dependencies]]
 provider = "demo.base"
 contract = "demo.echo@1"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"
 "#,
         )
         .unwrap();
         assert_eq!(manifest.name, "demo.echo");
         assert_eq!(manifest.dependencies.len(), 1);
+        assert_eq!(manifest.profiles.len(), 1);
+        assert_eq!(manifest.profiles[0].id, "contest-2026");
+        assert_eq!(manifest.profiles[0].priority, 100);
         assert_eq!(manifest.menu.unwrap().route, "demo.echo");
     }
 
@@ -1477,6 +2184,8 @@ uri = "forbidden"
         let service_cargo = fs::read_to_string(service.path().join("Cargo.toml")).unwrap();
         let service_source = fs::read_to_string(service.path().join("src/main.rs")).unwrap();
         assert!(service_cargo.contains("features = [\"module\", \"macros\"]"));
+        assert!(service_cargo.contains("[lib]\nname = \"demo_service\"\npath = \"src/main.rs\""));
+        assert!(service_cargo.contains("[[bin]]\nname = \"demo-service\"\npath = \"src/main.rs\""));
         assert!(!service_cargo.contains("[workspace]"));
         assert!(service_cargo.contains("default = [\"elm-lsp\"]"));
         assert!(service_cargo.contains("elm-lsp = [\"allocator/lsp\", \"general/lsp\"]"));
@@ -1501,8 +2210,10 @@ uri = "forbidden"
         assert!(service_source.contains("Arc::new"));
         assert!(service_source.contains("core::hint::black_box"));
         assert!(service_source.contains("elm::runtime::log"));
-        assert!(service_source.contains("elm::runtime::abort_panic"));
         assert!(service_source.contains("impl ElmModule for Module"));
+        assert!(service_source.contains("#[cfg(not(feature = \"elm-integrated\"))]\n#[panic_handler]"));
+        assert!(service_source.contains("elm::runtime::abort_panic"));
+        assert!(!service.path().join("src/lib.rs").exists());
         assert!(
             service
                 .path()

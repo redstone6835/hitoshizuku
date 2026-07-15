@@ -443,17 +443,8 @@ pub fn kernel_interface_manifest_v1(target_arch: u32) -> String {
         kernel_symbols::capability::ALL
     )
     .unwrap();
-    writeln!(
-        out,
-        "kernel-symbol.interface-source-files={}",
-        kernel_symbols::KERNEL_INTERFACE_SOURCE_FILE_COUNT
-    )
-    .unwrap();
-    write!(out, "kernel-symbol.interface-source-sha256=").unwrap();
-    for byte in kernel_symbols::KERNEL_INTERFACE_SOURCE_SHA256 {
-        write!(out, "{byte:02x}").unwrap();
-    }
-    writeln!(out).unwrap();
+    // allocator/general 的发行摘要只用于接口包缓存。ELM 运行时 ABI 清单不能绑定整个
+    // 子系统源码，否则未被模块导入的私有实现变化也会错误地破坏兼容性。
 
     write_layout!(
         out,

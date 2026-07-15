@@ -266,6 +266,33 @@ fn eki_menu_block(label: &str, description: &str, route: &str) -> Vec<u8> {
     out
 }
 
+fn eki_abi_fingerprint_block(profile_hash: [u8; 32], bridge_abi_version: u16) -> Vec<u8> {
+    let mut fingerprint = ElmRustAbiFingerprintV1::new(
+        [0x31; 32],
+        [0x32; 32],
+        [0x33; 32],
+        1,
+        ElmPanicStrategy::AbortThroughRuntime,
+        1,
+        0,
+    );
+    fingerprint.kernel_api_profile_hash = profile_hash;
+    fingerprint.kernel_api_bridge_abi_version = bridge_abi_version;
+    let mut out = vec![0; crate::ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE];
+    write_u16(&mut out, 0, crate::ELM_RUST_ABI_FINGERPRINT_VERSION);
+    write_u16(&mut out, 2, fingerprint.elmapi_version);
+    out[4] = fingerprint.panic_strategy as u8;
+    out[5] = fingerprint.code_model;
+    write_u64(&mut out, 8, fingerprint.target_features);
+    write_u32(&mut out, 16, fingerprint.flags);
+    out[24..56].copy_from_slice(&fingerprint.rustc_commit_hash);
+    out[56..88].copy_from_slice(&fingerprint.target_spec_hash);
+    out[88..120].copy_from_slice(&fingerprint.kernel_interface_hash);
+    out[120..152].copy_from_slice(&fingerprint.kernel_api_profile_hash);
+    write_u16(&mut out, 152, fingerprint.kernel_api_bridge_abi_version);
+    out
+}
+
 fn eki_segments_block(
     kind: ElmEbiSegmentKind,
     flags: u32,
@@ -739,6 +766,22 @@ fn trust_store_commits_epoch_only_after_acceptance() {
     store.try_accept(acceptance).unwrap();
     assert_eq!(store.accepted_epochs().len(), 1);
     assert_eq!(store.accepted_epochs()[0].release_epoch(), 3);
+}
+
+#[test]
+fn proof_signature_message_binds_kernel_api_profile_and_bridge() {
+    let signing = SigningKey::from_bytes(&[29; 32]);
+    let (_, fingerprint, proof) = trust_fixture("profile-bound-proof", 1, &signing);
+    let original = proof.unsigned_message(&fingerprint);
+    let mut profile_changed = fingerprint.clone();
+    profile_changed.kernel_api_profile_hash = [0x61; 32];
+    profile_changed.kernel_api_bridge_abi_version = 1;
+    let profile_message = proof.unsigned_message(&profile_changed);
+    let mut bridge_changed = profile_changed;
+    bridge_changed.kernel_api_bridge_abi_version = 2;
+
+    assert_ne!(original, profile_message);
+    assert_ne!(profile_message, proof.unsigned_message(&bridge_changed));
 }
 
 #[test]
@@ -2919,6 +2962,144 @@ fn eki_parser_accepts_menu_unit() {
     assert_eq!(unit.manifest.kind, ElmKind::Extension);
     assert!(unit.menu.is_some());
     assert!(!unit.has_native_code());
+}
+
+#[test]
+fn eki_parser_selects_exact_profile_from_multi_variant_bundle() {
+    let first_profile = [0x11; 32];
+    let second_profile = [0x22; 32];
+    let first = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("variant-first", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::AbiFingerprint,
+            eki_abi_fingerprint_block(first_profile, 1),
+        ),
+    ]);
+    let second = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("variant-second", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::AbiFingerprint,
+            eki_abi_fingerprint_block(second_profile, 1),
+        ),
+    ]);
+    let mut directory = vec![0u8; 8 + crate::ELM_EKI_VARIANT_RECORD_SIZE * 2];
+    write_u16(&mut directory, 0, crate::ELM_EKI_VARIANT_DIRECTORY_VERSION);
+    write_u16(&mut directory, 2, crate::ELM_EKI_VARIANT_RECORD_SIZE as u16);
+    write_u32(&mut directory, 4, 2);
+    for (index, (profile, image, priority)) in [
+        (first_profile, first.as_slice(), 10u32),
+        (second_profile, second.as_slice(), 20u32),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let offset = 8 + index * crate::ELM_EKI_VARIANT_RECORD_SIZE;
+        write_u32(&mut directory, offset, (index + 1) as u32);
+        write_u32(&mut directory, offset + 4, ElmEbiArch::Any as u32);
+        write_u32(&mut directory, offset + 8, *priority);
+        write_u16(&mut directory, offset + 12, 1);
+        directory[offset + 16..offset + 48].copy_from_slice(profile);
+        directory[offset + 48..offset + 80].copy_from_slice(&crate::sha256(image));
+    }
+    let bundle = eki_image(&[
+        (ElmEkiBlockKind::VariantDirectory, directory),
+        (ElmEkiBlockKind::VariantImage, first),
+        (ElmEkiBlockKind::VariantImage, second),
+    ]);
+
+    let variants = crate::parse_eki_variants(&bundle).unwrap();
+    assert_eq!(variants.len(), 2);
+    let selected = crate::parse_eki_image_for(
+        &bundle,
+        crate::ElmEkiSelector {
+            arch: ElmEbiArch::Riscv64,
+            profile_hash: first_profile,
+            bridge_abi_version: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(selected.unit.manifest.name.as_str(), "variant-first");
+    assert_eq!(
+        crate::parse_eki_image(&bundle),
+        Err(ElmEbiLoadStatus::UnsupportedAbi)
+    );
+}
+
+#[test]
+fn eki_parser_rejects_variant_directory_profile_relabel() {
+    let inner_profile = [0x41; 32];
+    let directory_profile = [0x42; 32];
+    let inner = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("variant-profile-relabel", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::AbiFingerprint,
+            eki_abi_fingerprint_block(inner_profile, 1),
+        ),
+    ]);
+    let mut directory = vec![0u8; 8 + crate::ELM_EKI_VARIANT_RECORD_SIZE];
+    write_u16(&mut directory, 0, crate::ELM_EKI_VARIANT_DIRECTORY_VERSION);
+    write_u16(&mut directory, 2, crate::ELM_EKI_VARIANT_RECORD_SIZE as u16);
+    write_u32(&mut directory, 4, 1);
+    write_u32(&mut directory, 8, 1);
+    write_u32(&mut directory, 12, ElmEbiArch::Any as u32);
+    write_u16(&mut directory, 20, 1);
+    directory[24..56].copy_from_slice(&directory_profile);
+    directory[56..88].copy_from_slice(&sha256(&inner));
+    let bundle = eki_image(&[
+        (ElmEkiBlockKind::VariantDirectory, directory),
+        (ElmEkiBlockKind::VariantImage, inner),
+    ]);
+
+    assert_eq!(
+        crate::parse_eki_variants(&bundle),
+        Err(ElmEbiLoadStatus::AbiFingerprintRejected)
+    );
+}
+
+#[test]
+fn eki_parser_rejects_variant_directory_bridge_relabel() {
+    let profile = [0x51; 32];
+    let inner = eki_image(&[
+        (
+            ElmEkiBlockKind::Manifest,
+            eki_manifest_block("variant-bridge-relabel", "0.1.0", ElmKind::Service),
+        ),
+        (ElmEkiBlockKind::LifecycleHooks, eki_lifecycle_hooks_block()),
+        (
+            ElmEkiBlockKind::AbiFingerprint,
+            eki_abi_fingerprint_block(profile, 1),
+        ),
+    ]);
+    let mut directory = vec![0u8; 8 + crate::ELM_EKI_VARIANT_RECORD_SIZE];
+    write_u16(&mut directory, 0, crate::ELM_EKI_VARIANT_DIRECTORY_VERSION);
+    write_u16(&mut directory, 2, crate::ELM_EKI_VARIANT_RECORD_SIZE as u16);
+    write_u32(&mut directory, 4, 1);
+    write_u32(&mut directory, 8, 1);
+    write_u32(&mut directory, 12, ElmEbiArch::Any as u32);
+    write_u16(&mut directory, 20, 2);
+    directory[24..56].copy_from_slice(&profile);
+    directory[56..88].copy_from_slice(&sha256(&inner));
+    let bundle = eki_image(&[
+        (ElmEkiBlockKind::VariantDirectory, directory),
+        (ElmEkiBlockKind::VariantImage, inner),
+    ]);
+
+    assert_eq!(
+        crate::parse_eki_image(&bundle),
+        Err(ElmEbiLoadStatus::AbiFingerprintRejected)
+    );
 }
 
 #[test]

@@ -30,6 +30,70 @@ pub const KERNEL_SYMBOL_RUST_ABI_MAX_LEN: usize = 1024;
 /// 工具链链接符号允许的最大字节数。
 pub const KERNEL_SYMBOL_LINK_NAME_MAX_LEN: usize = 96;
 
+/// 集成组件描述符的固定魔数。
+pub const KERNEL_INTEGRATED_COMPONENT_MAGIC: u64 = u64::from_le_bytes(*b"KINIT001");
+/// 集成组件描述符 ABI 版本。
+pub const KERNEL_INTEGRATED_COMPONENT_ABI_V1: u16 = 1;
+
+/// 直接链接进内核镜像的普通组件初始化入口。
+pub type KernelIntegratedInit = fn() -> i32;
+/// 直接链接进内核镜像的普通组件终结入口。
+pub type KernelIntegratedFinalize = fn() -> i32;
+
+/// 由构建期集成组件放入 `.kernel.integrated_components` 的普通内核 initcall 描述符。
+///
+/// 该结构不表示 ELM cell，也不包含 EBI、来源、代际或 elm-mgr 元数据。ELM attribute 在
+/// `y` 模式只负责生成该普通链接记录，运行时执行后不会保留任何 ELM 管理身份。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct KernelIntegratedComponentV1 {
+    /// 固定魔数。
+    pub magic: u64,
+    /// 描述符 ABI 版本。
+    pub abi_version: u16,
+    /// 当前结构完整长度。
+    pub struct_size: u16,
+    /// v1 必须为零。
+    pub flags: u32,
+    /// 组件编译时使用的内核 API Profile 摘要。
+    pub interface_hash: [u8; 32],
+    /// 普通内核初始化入口。
+    pub initialize: KernelIntegratedInit,
+    /// 内核有序停机时调用的终结入口。
+    pub finalize: KernelIntegratedFinalize,
+}
+
+impl KernelIntegratedComponentV1 {
+    /// 构造一个完整的集成组件描述符。
+    pub const fn new(
+        initialize: KernelIntegratedInit,
+        finalize: KernelIntegratedFinalize,
+        interface_hash: [u8; 32],
+    ) -> Self {
+        Self {
+            magic: KERNEL_INTEGRATED_COMPONENT_MAGIC,
+            abi_version: KERNEL_INTEGRATED_COMPONENT_ABI_V1,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            flags: 0,
+            interface_hash,
+            initialize,
+            finalize,
+        }
+    }
+
+    /// 校验链接记录的固定布局和入口。
+    pub fn valid(&self, interface_hash: [u8; 32]) -> bool {
+        self.magic == KERNEL_INTEGRATED_COMPONENT_MAGIC
+            && self.abi_version == KERNEL_INTEGRATED_COMPONENT_ABI_V1
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.flags == 0
+            && self.interface_hash != [0; 32]
+            && self.interface_hash == interface_hash
+            && self.initialize as usize != 0
+            && self.finalize as usize != 0
+    }
+}
+
 /// 描述符表示可调用的 Rust 函数。
 pub const KERNEL_SYMBOL_KIND_FUNCTION: u8 = 1;
 /// 描述符表示具有静态存储期的对象。
@@ -484,5 +548,22 @@ mod tests {
         let mut invalid = valid;
         invalid.capabilities = 1 << 63;
         assert!(!invalid.validate());
+    }
+
+    #[test]
+    fn integrated_component_requires_exact_interface_profile() {
+        fn initialize() -> i32 {
+            0
+        }
+        fn finalize() -> i32 {
+            0
+        }
+
+        let profile = [0x5a; 32];
+        let component = KernelIntegratedComponentV1::new(initialize, finalize, profile);
+
+        assert!(component.valid(profile));
+        assert!(!component.valid([0xa5; 32]));
+        assert!(!KernelIntegratedComponentV1::new(initialize, finalize, [0; 32]).valid([0; 32]));
     }
 }

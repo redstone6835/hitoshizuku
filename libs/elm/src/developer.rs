@@ -518,6 +518,19 @@ impl LifecycleContext {
         }
     }
 
+    #[doc(hidden)]
+    /// 为直接编入内核的普通组件构造不携带 ELM 身份的生命周期上下文。
+    pub const fn integrated(phase: u16) -> Self {
+        Self {
+            cell_id: 0,
+            parent_id: 0,
+            generation: 0,
+            state: 0,
+            phase,
+            flags: 0,
+        }
+    }
+
     /// 返回正在执行生命周期钩子的 cell id。
     pub const fn cell_id(self) -> u64 {
         self.cell_id

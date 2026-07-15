@@ -14,6 +14,7 @@ runtime-model = ["dep:ed25519-dalek"]
 module = []
 management = ["module"]
 macros = ["dep:elm-macros"]
+elm-integrated = []
 
 [dependencies]
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["alloc", "zeroize"], optional = true }

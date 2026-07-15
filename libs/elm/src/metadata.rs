@@ -7,7 +7,7 @@
 //! parser 拒绝重复/乱序字段、未知 value kind、非零 padding、非法 UTF-8、越界长度和错误
 //! checksum。`.elm.meta` 不属于运行时映射，打包器读取后将其规范化为 EBI 声明。
 //!
-//! 该协议是 Rust attribute 与 `elm-tools` 之间的构建协议，不是模块运行时 API，也不能被
+//! 该协议是 Rust attribute 与 `cargo elm` 之间的构建协议，不是模块运行时 API，也不能被
 //! 模块用来在装载后修改自身拓扑。
 
 use alloc::vec::Vec;

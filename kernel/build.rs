@@ -14,6 +14,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo 未设置 OUT_DIR"));
 
     generate_elm_trust_anchors(&root, &out_dir);
+    link_integrated_components();
 
     let initramfs_root = env_path("INITRAMFS_ROOT", &root).unwrap_or_else(|| {
         root.join(
@@ -40,6 +41,28 @@ fn main() {
     );
     println!("cargo:rustc-env=ELM_TARGET_TRIPLE={target}");
     println!("cargo:rustc-env=ELM_RUSTC_VERSION={}", rustc_version_line());
+}
+
+fn link_integrated_components() {
+    println!("cargo:rerun-if-env-changed=ELM_INTEGRATED_ARCHIVES");
+    let Some(value) = std::env::var_os("ELM_INTEGRATED_ARCHIVES") else {
+        return;
+    };
+    let archives = std::env::split_paths(&value).collect::<Vec<_>>();
+    assert!(
+        !archives.is_empty(),
+        "ELM_INTEGRATED_ARCHIVES 不得是空路径列表"
+    );
+    println!("cargo:rustc-link-arg-bin=kernel=--whole-archive");
+    for archive in archives {
+        let archive = archive
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("定位集成组件归档 {archive:?} 失败：{error}"));
+        assert!(archive.is_file(), "集成组件归档不是普通文件：{archive:?}");
+        println!("cargo:rerun-if-changed={}", archive.display());
+        println!("cargo:rustc-link-arg-bin=kernel={}", archive.display());
+    }
+    println!("cargo:rustc-link-arg-bin=kernel=--no-whole-archive");
 }
 
 struct ConfiguredTrustAnchor {
