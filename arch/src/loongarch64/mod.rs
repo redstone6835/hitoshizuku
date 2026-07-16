@@ -34,7 +34,9 @@ pub mod vdso;
 
 pub use boot::*;
 pub use early_console::*;
-pub use elm_native::{call_elm_native, elm_native_recovery_address, resume_elm_panic};
+pub use elm_native::{
+    call_elm_native, call_elm_native_current_stack, elm_native_recovery_address, resume_elm_panic,
+};
 // efi_stub 通过 #[unsafe(no_mangle)] 暴露入口符号，其内部项无需 re-export。
 pub use heap_vm::*;
 pub use loader::*;

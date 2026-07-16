@@ -51,6 +51,10 @@ SECTIONS
         KEEP(*(.elm.kernel_symbols .elm.kernel_symbols.*))
         PROVIDE(__elm_kernel_symbols_end = .);
         . = ALIGN(8);
+        PROVIDE(__elm_kernel_mixin_sites_start = .);
+        KEEP(*(.elm.kernel_mixin_sites .elm.kernel_mixin_sites.*))
+        PROVIDE(__elm_kernel_mixin_sites_end = .);
+        . = ALIGN(8);
         PROVIDE(__kernel_integrated_components_start = .);
         KEEP(*(.kernel.integrated_components .kernel.integrated_components.*))
         PROVIDE(__kernel_integrated_components_end = .);

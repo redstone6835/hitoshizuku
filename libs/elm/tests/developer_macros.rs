@@ -3,9 +3,9 @@
 use elm::{
     DirectImport, ElmCallFrame, ElmContext, ElmId, ElmLifecyclePhase, ElmModule,
     ElmNativeHookContextV1, ElmPayload, ElmState, Generation, HookError, HookResult,
-    LifecycleContext, ManagedImport, ManagedRequest, ManagedResult, MigrationContext,
-    MigrationExportResult, MixinControl, PointResult, ProviderReply, ProviderRequest,
-    ProviderResult, SnapshotReply, SnapshotRequest, SnapshotResult,
+    KernelMixinContext, LifecycleContext, ManagedImport, ManagedRequest, ManagedResult,
+    MigrationContext, MigrationExportResult, MixinControl, PointResult, ProviderReply,
+    ProviderRequest, ProviderResult, SnapshotReply, SnapshotRequest, SnapshotResult,
 };
 
 #[elm::payload("test.frame@1")]
@@ -105,6 +105,14 @@ impl ElmModule for TestModule {
     fn patch(&self, frame: &mut TestFrame) -> MixinControl {
         frame.value += 2;
         MixinControl::Replace
+    }
+}
+
+#[elm::mixin(target = "allocator")]
+impl TestModule {
+    #[elm::inject(method = "GlobalAlloc.alloc", at = "head", priority = 10)]
+    fn trace_global_alloc(&self, _context: &mut KernelMixinContext<'_>) -> HookResult {
+        Ok(())
     }
 }
 

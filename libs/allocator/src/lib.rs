@@ -2407,7 +2407,15 @@ pub(crate) fn alloc_internal_metadata(layout: Layout) -> *mut u8 {
     KERNEL_ALLOCATOR.allocate_internal_metadata(layout)
 }
 
+#[kernel_symbols::export]
 unsafe impl GlobalAlloc for KernelMemorySubsystem {
+    #[kernel_symbols::export(
+        name = "allocator.GlobalAlloc.alloc",
+        contract = "kernel.allocator.global-alloc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.total_allocs.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_allocated
@@ -2425,6 +2433,13 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         ptr
     }
 
+    #[kernel_symbols::export(
+        name = "allocator.GlobalAlloc.dealloc",
+        contract = "kernel.allocator.global-alloc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() {
             return;
@@ -2443,6 +2458,13 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         }
     }
 
+    #[kernel_symbols::export(
+        name = "allocator.GlobalAlloc.realloc",
+        contract = "kernel.allocator.global-alloc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         self.total_reallocs.fetch_add(1, Ordering::Relaxed);
         self.kheap.record_realloc();
@@ -2547,6 +2569,13 @@ unsafe impl GlobalAlloc for KernelMemorySubsystem {
         new_ptr
     }
 
+    #[kernel_symbols::export(
+        name = "allocator.GlobalAlloc.alloc_zeroed",
+        contract = "kernel.allocator.global-alloc@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         self.total_allocs.fetch_add(1, Ordering::Relaxed);
         self.total_bytes_allocated

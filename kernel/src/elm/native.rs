@@ -16,17 +16,17 @@ use elm_model::{
     ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_MORE, ELM_NATIVE_PROVIDER_SNAPSHOT_FLAG_PAGED,
     ELM_NATIVE_PROVIDER_SNAPSHOT_FLAGS_MASK, ELM_PROVIDER_SNAPSHOT_REQUEST_FLAG_PAGED,
     ELM_PROVIDER_SNAPSHOT_RESPONSE_FLAG_MORE, ElmCallFrame, ElmContext, ElmEbiImage,
-    ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiRelocationKind, ElmEbiSegmentKind,
-    ElmEbiSegmentPayload, ElmError, ElmId, ElmLifecyclePhase, ElmModuleDescriptorV1,
-    ElmNativeEntryFrameV1, ElmNativeHookContextV1, ElmNativeManagedCallV1,
+    ElmEbiKernelMixinDecl, ElmEbiLoadStatus, ElmEbiProviderPortDecl, ElmEbiRelocationKind,
+    ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmError, ElmId, ElmLifecyclePhase,
+    ElmModuleDescriptorV1, ElmNativeEntryFrameV1, ElmNativeHookContextV1, ElmNativeManagedCallV1,
     ElmNativeMigrationContextV1, ElmNativeProviderCallV1, ElmNativeProviderSnapshotV1,
     ElmReplyFrame, ElmResult, ElmState, Generation, LeaseId, PortId, relocation_width, state_code,
     try_enter_current_context,
 };
 use general::elm_guard::{
-    ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_MANAGED_CALL,
-    ELM_GUARD_PHASE_MIGRATION, ELM_GUARD_PHASE_PROVIDER_CALL, ELM_GUARD_PHASE_PROVIDER_SNAPSHOT,
-    ElmExecutionDomain, ElmGuard,
+    ELM_GUARD_PHASE_ENTRY, ELM_GUARD_PHASE_HOOK, ELM_GUARD_PHASE_KERNEL_MIXIN,
+    ELM_GUARD_PHASE_MANAGED_CALL, ELM_GUARD_PHASE_MIGRATION, ELM_GUARD_PHASE_PROVIDER_CALL,
+    ELM_GUARD_PHASE_PROVIDER_SNAPSHOT, ElmExecutionDomain, ElmGuard,
 };
 
 use super::core::ElmLifecycleExecutor;
@@ -516,6 +516,18 @@ impl LoadedElmImage {
         };
         self.symbol_address(symbol)
             .map(Some)
+            .ok_or(ElmEbiLoadStatus::InvalidManifest)
+    }
+
+    pub(crate) fn kernel_mixin_handler_for_decl(
+        &self,
+        decl: &ElmEbiKernelMixinDecl,
+    ) -> Result<usize, ElmEbiLoadStatus> {
+        let address = self
+            .symbol_address(&decl.handler_symbol)
+            .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
+        self.code_contains(address)
+            .then_some(address)
             .ok_or(ElmEbiLoadStatus::InvalidManifest)
     }
 
@@ -1292,6 +1304,119 @@ pub(crate) fn test_call_native_entry(
             image_end: page_end,
         },
     )
+}
+
+/// 在当前任务内核栈上执行一个内核符号级 Mixin 处理器。
+///
+/// 该路径不分配隔离栈，也不取得 ELM Core 锁；故障恢复仍由架构调用门和任务级 guard
+/// 完成。调用者必须通过路由快照保证镜像在返回前不会被卸载。
+pub(crate) fn invoke_kernel_mixin_handler(
+    cell: ElmId,
+    generation: Generation,
+    address: usize,
+    bounds: NativeExecutionBounds,
+    frame: &mut kernel_symbols::KernelMixinFrameV1,
+) -> i32 {
+    if !frame.valid()
+        || address < bounds.code_start
+        || address >= bounds.code_end
+        || general::elm_guard::active_phase() == ELM_GUARD_PHASE_KERNEL_MIXIN
+    {
+        return kernel_symbols::KERNEL_MIXIN_DISPATCH_INVALID;
+    }
+    let now_ns = sched::now_ns_public();
+    let Ok(accounting) = super::resource_accounting::begin_native_call(cell, 0, 0, now_ns) else {
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let Some(guard) = ElmGuard::enter(cell.0, ELM_GUARD_PHASE_KERNEL_MIXIN, 0) else {
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let Some((stack_start, stack_end)) = sched::current_task_ref().kernel_stack_bounds() else {
+        drop(guard);
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let frame_start = core::ptr::from_mut(frame) as usize;
+    let Some(frame_end) = frame_start.checked_add(core::mem::size_of_val(frame)) else {
+        drop(guard);
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let mut host_ranges = [(0usize, 0usize); general::elm_guard::ELM_GUARD_MAX_HOST_RANGES];
+    let mut host_count = 1usize;
+    host_ranges[0] = (frame_start, frame_end);
+    if frame.argument_count != 0 {
+        let start = frame.arguments as usize;
+        let Some(size) = (frame.argument_count as usize)
+            .checked_mul(core::mem::size_of::<kernel_symbols::KernelMixinValueV1>())
+        else {
+            drop(guard);
+            let _ = accounting.finish(sched::now_ns_public());
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        };
+        let Some(end) = start.checked_add(size) else {
+            drop(guard);
+            let _ = accounting.finish(sched::now_ns_public());
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        };
+        host_ranges[host_count] = (start, end);
+        host_count += 1;
+    }
+    if !frame.result.is_null() {
+        let start = frame.result as usize;
+        let Some(end) =
+            start.checked_add(core::mem::size_of::<kernel_symbols::KernelMixinValueV1>())
+        else {
+            drop(guard);
+            let _ = accounting.finish(sched::now_ns_public());
+            return ELM_CALL_STATUS_PROVIDER_FAULT;
+        };
+        host_ranges[host_count] = (start, end);
+        host_count += 1;
+    }
+    if !guard.configure_native_bounds(
+        bounds.code_start,
+        bounds.code_end,
+        bounds.image_start,
+        bounds.image_end,
+        stack_start,
+        stack_end,
+        &host_ranges[..host_count],
+    ) {
+        drop(guard);
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    }
+    let context = ElmContext::new(
+        cell,
+        None,
+        generation,
+        ElmState::Active,
+        ElmLifecyclePhase::Initialize,
+        0,
+    );
+    let Some(_current) = try_enter_current_context(&context) else {
+        drop(guard);
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    let Some(_domain) = guard.enter_domain(ElmExecutionDomain::ElmCode) else {
+        drop(guard);
+        let _ = accounting.finish(sched::now_ns_public());
+        return ELM_CALL_STATUS_PROVIDER_FAULT;
+    };
+    // Safety: 地址和边界来自已验证、仍由路由快照固定的 RX 镜像；处理器 ABI 只接收该帧。
+    let status = unsafe {
+        arch::call_elm_native_current_stack(address, core::ptr::from_mut(frame).cast::<u8>())
+    };
+    let aborted = guard.aborted();
+    let accounting = accounting.finish(sched::now_ns_public());
+    if aborted || accounting.call_budget_exceeded || accounting.period_budget_exceeded {
+        ELM_CALL_STATUS_PROVIDER_FAULT
+    } else {
+        status
+    }
 }
 
 pub(crate) fn invoke_managed_export(

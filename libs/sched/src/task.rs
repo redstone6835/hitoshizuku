@@ -320,6 +320,11 @@ impl KernelStack {
         self.base.as_ptr() as usize + self.layout.size()
     }
 
+    /// 逻辑栈底（低地址端）。
+    pub fn start(&self) -> usize {
+        self.base.as_ptr() as usize
+    }
+
     pub fn size(&self) -> usize {
         self.layout.size()
     }
@@ -882,6 +887,14 @@ impl Task {
     /// 内核栈栈顶。trap 处理程序需要用它重设当前架构的内核 trap 栈寄存器。
     pub fn kernel_stack_top(&self) -> Option<usize> {
         self.kstack.lock().as_ref().map(|s| s.top())
+    }
+
+    /// 当前任务拥有的完整内核栈地址范围。
+    pub fn kernel_stack_bounds(&self) -> Option<(usize, usize)> {
+        self.kstack
+            .lock()
+            .as_ref()
+            .map(|stack| (stack.start(), stack.top()))
     }
 
     /// 释放已经不会再运行的任务执行上下文。

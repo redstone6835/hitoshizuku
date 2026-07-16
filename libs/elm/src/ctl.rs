@@ -2,7 +2,7 @@
 //!
 //! `ElmCtlHeader` 包围 core query、管理调用、事件读取/确认、快照和 debug dump。它只负责
 //! 选择控制命令和描述输入/输出缓冲区，不直接定义每个 elm-mgr 动作的 payload；具体管理
-//! 请求和回复由 [`crate::management`] 以及 `ElmMgr*` 固定布局类型定义。
+//! 请求和回复由 `crate::management` 以及 `ElmMgr*` 固定布局类型定义。
 //!
 //! 用户态必须先校验 magic、ABI 版本、命令和长度。内核返回的 [`ElmCtlStatus`] 只描述控制
 //! 传输层结果，管理动作自身状态仍位于管理回复头中。

@@ -3,10 +3,11 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
+use sha2::{Digest, Sha256};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Attribute, Expr, Ident, ImplItem, Item, ItemFn, ItemImpl, ItemStatic, LitInt, LitStr, Meta,
-    ReturnType, Signature, Token, Type, Visibility, parse_macro_input,
+    Attribute, Block, Expr, FnArg, Ident, ImplItem, Item, ItemFn, ItemImpl, ItemStatic, LitInt,
+    LitStr, Meta, Pat, ReturnType, Signature, Token, Type, Visibility, parse_macro_input,
 };
 
 struct ExportArgs {
@@ -76,7 +77,43 @@ fn assign_once<T>(slot: &mut Option<T>, value: T, key: &Ident) -> syn::Result<()
     }
 }
 
-/// 把常驻 Rust 函数或静态对象登记到内核直接符号目录。
+/// 把常驻 Rust 函数、方法或静态对象登记到内核直接符号目录。
+///
+/// 函数和方法会同时获得稳定链接名、只读目录描述符，以及 `head`、`return` 两个内核
+/// 符号级 Mixin 站点。没有安装处理器时，包装器只执行原子空路由快查并直接进入原函数体；
+/// 静态对象只登记地址，不生成调用站点。
+///
+/// # 参数
+///
+/// - `name`：稳定 API 路径，必须在当前内核目录中唯一；
+/// - `contract`：语义契约 identifier；
+/// - `version`：非零契约版本；
+/// - `capabilities`：装载器解析该地址前必须批准的能力位；
+/// - `flags`：可选符号属性，默认 0；
+/// - `retained_args`：可选参数保留位图，默认 0。非零时自动设置长期保留模块代码标志。
+///
+/// 标记固有或 trait `impl` 时，外层 attribute 不接受参数；需要导出的方法分别携带完整参数。
+/// 方法接收者会进入规范 Rust ABI 和 Mixin 参数槽，索引为 0。
+///
+/// # 限制
+///
+/// v1 不接受泛型、async、const、可变参数、显式外部 ABI、手写链接属性或不能形成稳定同步
+/// 调用帧的参数模式。函数参数必须使用简单标识符，因为 `head` 站点需要为每个实参建立精确
+/// 类型槽。内部调用、局部变量和字段站点不由该宏生成，等待 `TODO(ELM-MIR)`。
+///
+/// # 示例
+///
+/// ```ignore
+/// #[kernel_symbols::export(
+///     name = "subsystem.query",
+///     contract = "kernel.subsystem.query@1",
+///     version = 1,
+///     capabilities = kernel_symbols::capability::CORE_SAFE
+/// )]
+/// pub fn query(index: usize) -> Option<u64> {
+///     Some(index as u64)
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn export(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = parse_macro_input!(item as Item);
@@ -113,11 +150,19 @@ fn export_impl(args: ExportArgs, item: Item) -> syn::Result<TokenStream2> {
 
 fn export_function(args: ExportArgs, mut function: ItemFn) -> syn::Result<TokenStream2> {
     let abi = canonical_function_abi(&function.sig)?;
-    let ident = &function.sig.ident;
-    let descriptor = descriptor_ident(ident);
+    let ident = function.sig.ident.clone();
+    let descriptor = descriptor_ident(&ident);
     let name = args.name;
     let link_name = stable_link_name(&name);
     reject_explicit_linkage(&function.attrs)?;
+    let mixin_descriptors = instrument_exported_body(
+        &mut function.sig,
+        function.block.as_mut(),
+        None,
+        &name,
+        &abi,
+        &descriptor,
+    )?;
     function
         .attrs
         .push(syn::parse_quote!(#[unsafe(export_name = #link_name)]));
@@ -157,6 +202,8 @@ fn export_function(args: ExportArgs, mut function: ItemFn) -> syn::Result<TokenS
                 #abi,
                 #ident as *const (),
             );
+
+        #mixin_descriptors
     })
 }
 
@@ -208,16 +255,14 @@ fn export_static(args: ExportArgs, mut item: ItemStatic) -> syn::Result<TokenStr
 }
 
 fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
-    if item.trait_.is_some()
-        || !item.generics.params.is_empty()
-        || item.generics.where_clause.is_some()
-    {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
         return Err(syn::Error::new_spanned(
             &item,
-            "直接内核方法只能来自非泛型固有 impl",
+            "直接内核方法只能来自非泛型 impl",
         ));
     }
     let self_ty = (*item.self_ty).clone();
+    let trait_path = item.trait_.as_ref().map(|(_, path, _)| path.clone());
     let mut descriptors = Vec::new();
     for implementation_item in &mut item.items {
         let ImplItem::Fn(method) = implementation_item else {
@@ -227,18 +272,26 @@ fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
             continue;
         };
         method.attrs.remove(attribute_index);
-        if !matches!(method.vis, Visibility::Public(_)) {
+        if trait_path.is_none() && !matches!(method.vis, Visibility::Public(_)) {
             return Err(syn::Error::new_spanned(
                 &method.sig,
                 "导出的固有方法必须是 pub",
             ));
         }
         let abi = canonical_method_abi(&method.sig, &self_ty)?;
-        let ident = &method.sig.ident;
+        let ident = method.sig.ident.clone();
         let descriptor = descriptor_ident_from_path(&args.name);
         let name = args.name;
         let link_name = stable_link_name(&name);
         reject_explicit_linkage(&method.attrs)?;
+        let mixin_descriptors = instrument_exported_body(
+            &mut method.sig,
+            &mut method.block,
+            Some(&self_ty),
+            &name,
+            &abi,
+            &descriptor,
+        )?;
         method
             .attrs
             .push(syn::parse_quote!(#[unsafe(export_name = #link_name)]));
@@ -259,6 +312,30 @@ fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
         } else {
             quote!(0u32)
         };
+        let item_path = if let Some(trait_path) = trait_path.as_ref() {
+            quote!(concat!(
+                module_path!(),
+                "::",
+                stringify!(#self_ty),
+                " as ",
+                stringify!(#trait_path),
+                "::",
+                stringify!(#ident)
+            ))
+        } else {
+            quote!(concat!(
+                module_path!(),
+                "::",
+                stringify!(#self_ty),
+                "::",
+                stringify!(#ident)
+            ))
+        };
+        let address = if let Some(trait_path) = trait_path.as_ref() {
+            quote!(<#self_ty as #trait_path>::#ident as *const ())
+        } else {
+            quote!(<#self_ty>::#ident as *const ())
+        };
         descriptors.push(quote! {
             #[doc(hidden)]
             #[used]
@@ -271,17 +348,13 @@ fn export_inherent_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
                     #capabilities,
                     (#flags) | #automatic_flags | #retention_flag,
                     #retained_args,
-                    concat!(
-                        module_path!(),
-                        "::",
-                        stringify!(#self_ty),
-                        "::",
-                        stringify!(#ident)
-                    ),
+                    #item_path,
                     #link_name,
                     #abi,
-                    <#self_ty>::#ident as *const (),
+                    #address,
                 );
+
+            #mixin_descriptors
         });
     }
     if descriptors.is_empty() {
@@ -477,6 +550,239 @@ fn normalize_abi_tokens(tokens: TokenStream2) -> String {
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect()
+}
+
+fn instrument_exported_body(
+    signature: &mut Signature,
+    block: &mut Block,
+    self_ty: Option<&Type>,
+    api_path: &LitStr,
+    abi: &str,
+    descriptor: &Ident,
+) -> syn::Result<TokenStream2> {
+    if signature.inputs.len() > 64 {
+        return Err(syn::Error::new_spanned(
+            signature,
+            "可织入内核函数最多允许 64 个参数",
+        ));
+    }
+
+    let original = block.clone();
+    let function_tokens = normalize_abi_tokens(quote!(#signature #original));
+    let function_hash = digest_tokens(function_tokens.as_bytes());
+    let frame_abi_hash = digest_tokens(abi.as_bytes());
+    let head_hash = site_digest(
+        api_path.value().as_bytes(),
+        &function_hash,
+        1,
+        0,
+        b"head",
+        abi,
+    );
+    let return_hash = site_digest(
+        api_path.value().as_bytes(),
+        &function_hash,
+        2,
+        0,
+        b"return",
+        abi,
+    );
+    let function_hash_tokens = byte_array(&function_hash);
+    let frame_hash_tokens = byte_array(&frame_abi_hash);
+    let head_hash_tokens = byte_array(&head_hash);
+    let return_hash_tokens = byte_array(&return_hash);
+    let head_descriptor = format_ident!("{}_MIXIN_HEAD", descriptor);
+    let return_descriptor = format_ident!("{}_MIXIN_RETURN", descriptor);
+    let head_route = format_ident!("{}_MIXIN_HEAD_ROUTE", descriptor);
+    let return_route = format_ident!("{}_MIXIN_RETURN_ROUTE", descriptor);
+
+    let mut slots = Vec::with_capacity(signature.inputs.len());
+    for argument in &mut signature.inputs {
+        match argument {
+            FnArg::Typed(argument) => {
+                let Pat::Ident(pattern) = argument.pat.as_mut() else {
+                    return Err(syn::Error::new_spanned(
+                        &argument.pat,
+                        "可织入内核函数参数必须使用简单标识符",
+                    ));
+                };
+                if pattern.subpat.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        pattern,
+                        "可织入内核函数参数不能包含子模式",
+                    ));
+                }
+                pattern.mutability = Some(Token![mut](pattern.ident.span()));
+                let ident = &pattern.ident;
+                slots.push(quote!(
+                    ::kernel_symbols::KernelMixinValueV1::from_mut(&mut #ident)
+                ));
+            }
+            FnArg::Receiver(receiver) => {
+                let self_ty = self_ty.ok_or_else(|| {
+                    syn::Error::new_spanned(&*receiver, "自由函数不能包含 self 接收者")
+                })?;
+                if receiver.reference.is_some() {
+                    let read_only = receiver.mutability.is_none();
+                    let pointer = if read_only {
+                        quote!(self as *const #self_ty as *mut #self_ty)
+                    } else {
+                        quote!(self as *mut #self_ty)
+                    };
+                    slots.push(quote!(
+                        unsafe {
+                            ::kernel_symbols::KernelMixinValueV1::from_raw::<#self_ty>(
+                                #pointer,
+                                #read_only,
+                            )
+                        }
+                    ));
+                } else {
+                    receiver.mutability = Some(Token![mut](receiver.self_token.span));
+                    slots.push(quote!(::kernel_symbols::KernelMixinValueV1::from_mut(
+                        &mut self
+                    )));
+                }
+            }
+        }
+    }
+
+    let argument_count = slots.len();
+    let result: Type = match &signature.output {
+        ReturnType::Default => syn::parse_quote!(()),
+        ReturnType::Type(_, result) => (**result).clone(),
+    };
+
+    *block = syn::parse_quote!({
+        if !#head_descriptor.has_handlers() && !#return_descriptor.has_handlers() {
+            #original
+        } else {
+        let mut __elm_mixin_arguments: [::kernel_symbols::KernelMixinValueV1; #argument_count] = [
+            #(#slots),*
+        ];
+        let mut __elm_mixin_result = ::core::mem::MaybeUninit::<#result>::uninit();
+        let mut __elm_mixin_result_slot =
+            ::kernel_symbols::KernelMixinValueV1::from_uninit(&mut __elm_mixin_result);
+        let mut __elm_mixin_frame = ::kernel_symbols::KernelMixinFrameV1::new(
+            ::kernel_symbols::KERNEL_MIXIN_SITE_HEAD,
+            &mut __elm_mixin_arguments,
+            Some(&mut __elm_mixin_result_slot),
+        );
+        let mut __elm_mixin_original = ::kernel_symbols::KernelMixinOriginal::new(
+            || -> #result #original,
+            &mut __elm_mixin_result,
+        );
+        __elm_mixin_original.bind(&mut __elm_mixin_frame);
+        let __elm_mixin_head_status = unsafe {
+            ::kernel_symbols::dispatch_kernel_mixin(
+                &#head_descriptor,
+                &mut __elm_mixin_frame,
+            )
+        };
+        if __elm_mixin_head_status < 0 {
+            __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
+        }
+        if __elm_mixin_frame.flags & ::kernel_symbols::KERNEL_MIXIN_FRAME_RESULT_READY == 0 {
+            let __elm_mixin_original_status = unsafe {
+                __elm_mixin_frame.call_original()
+            };
+            if __elm_mixin_original_status != ::kernel_symbols::KERNEL_MIXIN_DISPATCH_OK {
+                __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
+            }
+        }
+        __elm_mixin_frame.site_kind = ::kernel_symbols::KERNEL_MIXIN_SITE_RETURN;
+        __elm_mixin_frame.next = None;
+        __elm_mixin_frame.next_context = ::core::ptr::null_mut();
+        __elm_mixin_frame.original = None;
+        __elm_mixin_frame.original_context = ::core::ptr::null_mut();
+        let __elm_mixin_return_status = unsafe {
+            ::kernel_symbols::dispatch_kernel_mixin(
+                &#return_descriptor,
+                &mut __elm_mixin_frame,
+            )
+        };
+        if __elm_mixin_return_status < 0 {
+            __elm_mixin_frame.flags |= ::kernel_symbols::KERNEL_MIXIN_FRAME_FAULTED;
+        }
+        ::kernel_symbols::finish_kernel_mixin_result(
+            __elm_mixin_result,
+            &__elm_mixin_frame,
+        )
+        }
+    });
+
+    Ok(quote! {
+        #[doc(hidden)]
+        static #head_route: ::core::sync::atomic::AtomicPtr<()> =
+            ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
+
+        #[doc(hidden)]
+        #[used]
+        #[unsafe(link_section = ".elm.kernel_mixin_sites")]
+        static #head_descriptor: ::kernel_symbols::KernelMixinSiteDescriptorV1 =
+            ::kernel_symbols::KernelMixinSiteDescriptorV1::new(
+                ::kernel_symbols::KERNEL_MIXIN_SITE_HEAD,
+                0,
+                #function_hash_tokens,
+                #head_hash_tokens,
+                #frame_hash_tokens,
+                #api_path,
+                "head",
+                &#head_route,
+            );
+
+        #[doc(hidden)]
+        static #return_route: ::core::sync::atomic::AtomicPtr<()> =
+            ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
+
+        #[doc(hidden)]
+        #[used]
+        #[unsafe(link_section = ".elm.kernel_mixin_sites")]
+        static #return_descriptor: ::kernel_symbols::KernelMixinSiteDescriptorV1 =
+            ::kernel_symbols::KernelMixinSiteDescriptorV1::new(
+                ::kernel_symbols::KERNEL_MIXIN_SITE_RETURN,
+                0,
+                #function_hash_tokens,
+                #return_hash_tokens,
+                #frame_hash_tokens,
+                #api_path,
+                "return",
+                &#return_route,
+            );
+    })
+}
+
+fn digest_tokens(input: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(input);
+    digest.finalize().into()
+}
+
+fn site_digest(
+    api_path: &[u8],
+    function_hash: &[u8; 32],
+    kind: u16,
+    ordinal: u32,
+    selector: &[u8],
+    abi: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ELM-KERNEL-MIXIN-SITE-V1\0");
+    digest.update((api_path.len() as u32).to_le_bytes());
+    digest.update(api_path);
+    digest.update(function_hash);
+    digest.update(kind.to_le_bytes());
+    digest.update(ordinal.to_le_bytes());
+    digest.update((selector.len() as u32).to_le_bytes());
+    digest.update(selector);
+    digest.update((abi.len() as u32).to_le_bytes());
+    digest.update(abi.as_bytes());
+    digest.finalize().into()
+}
+
+fn byte_array(bytes: &[u8; 32]) -> TokenStream2 {
+    let bytes = bytes.iter();
+    quote!([#(#bytes),*])
 }
 
 fn validate_identifier(value: &LitStr, field: &str) -> syn::Result<()> {

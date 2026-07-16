@@ -805,8 +805,6 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
         .arg("build")
         .arg("--manifest-path")
         .arg(project.join("Cargo.toml"))
-        .arg("--package")
-        .arg(cargo_name)
         .arg("--bin")
         .arg(cargo_name)
         .arg("--no-default-features");
@@ -820,8 +818,7 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
     if !status.success() {
         return Err(format!("ELM Rust 构建失败，退出状态 {status}"));
     }
-    Ok(project
-        .join("target")
+    Ok(cargo_target_directory(&project)
         .join(target)
         .join("release")
         .join(cargo_name))
@@ -874,8 +871,6 @@ pub fn cargo_build_integrated(
         .arg("rustc")
         .arg("--manifest-path")
         .arg(project.join("Cargo.toml"))
-        .arg("--package")
-        .arg(cargo_name)
         .arg("--lib")
         .arg("--no-default-features");
     append_extra_features(&mut command, &["elm-integrated"]);
@@ -892,16 +887,16 @@ pub fn cargo_build_integrated(
     }
 
     let crate_name = cargo_name.replace('-', "_");
-    let rlib = project
-        .join("target")
+    let target_directory = cargo_target_directory(&project);
+    let rlib = target_directory
         .join(target)
         .join("release")
         .join(format!("lib{crate_name}.rlib"));
     if !rlib.is_file() {
         return Err(format!("集成组件构建没有生成 {}", rlib.display()));
     }
-    let temporary = project
-        .join("target/elm/integrated")
+    let temporary = target_directory
+        .join("elm/integrated")
         .join(format!("{target}.tmp.{}", std::process::id()));
     remove_if_exists(&temporary)?;
     fs::create_dir_all(&temporary)
@@ -917,7 +912,7 @@ pub fn cargo_build_integrated(
     }
     local_api_crates.sort();
     local_api_crates.dedup();
-    let deps = project.join("target").join(target).join("release/deps");
+    let deps = target_directory.join(target).join("release/deps");
     for crate_name in local_api_crates {
         archives.push(newest_rlib_for_crate(&deps, &crate_name)?);
     }
@@ -1076,7 +1071,7 @@ pub fn cargo_check(project: &Path, target: &str, cargo_name: &str) -> Result<(),
         .arg("check")
         .arg("--manifest-path")
         .arg(project.join("Cargo.toml"))
-        .arg("--package")
+        .arg("--bin")
         .arg(cargo_name)
         .arg("--no-default-features")
         .arg("--target")
@@ -1087,6 +1082,18 @@ pub fn cargo_check(project: &Path, target: &str, cargo_name: &str) -> Result<(),
         return Err(format!("ELM 检查失败，退出状态 {status}"));
     }
     Ok(())
+}
+
+fn cargo_target_directory(project: &Path) -> PathBuf {
+    let Some(configured) = std::env::var_os("CARGO_TARGET_DIR") else {
+        return project.join("target");
+    };
+    let configured = PathBuf::from(configured);
+    if configured.is_absolute() {
+        configured
+    } else {
+        project.join(configured)
+    }
 }
 
 fn append_kernel_profile_flags(
@@ -1201,8 +1208,17 @@ fn framework_source_root() -> Result<PathBuf, String> {
 
 fn packaged_framework_root(manifest: &ElmProjectManifest) -> Result<Option<PathBuf>, String> {
     let mut selected_framework = None;
-    for target in ["riscv64gc-unknown-none-elf", "loongarch64-unknown-none"] {
-        let Ok(available) = available_kernel_interfaces(target) else {
+    let bundle_root = interface_bundle_root()?;
+    let targets = if bundle_root.join("manifest.txt").is_file() {
+        vec![KernelInterfaceManifest::load(&bundle_root.join("manifest.txt"))?.target]
+    } else {
+        vec![
+            "riscv64gc-unknown-none-elf".to_string(),
+            "loongarch64-unknown-none".to_string(),
+        ]
+    };
+    for target in targets {
+        let Ok(available) = available_kernel_interfaces(&target) else {
             continue;
         };
         for bundle in available.iter().filter(|bundle| {
@@ -1322,7 +1338,14 @@ fn interface_bundle_root() -> Result<PathBuf, String> {
 }
 
 pub fn available_kernel_interfaces(target: &str) -> Result<Vec<KernelInterfaceBundle>, String> {
-    let root = interface_bundle_root()?.join(target);
+    let bundle_root = interface_bundle_root()?;
+    let root = if bundle_root.join("manifest.txt").is_file()
+        && bundle_root.join("framework/Cargo.toml").is_file()
+    {
+        bundle_root
+    } else {
+        bundle_root.join(target)
+    };
     if !root.exists() {
         return Ok(Vec::new());
     }

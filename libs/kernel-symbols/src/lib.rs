@@ -9,13 +9,655 @@
 //! 摘要解析地址。地址写入完成后，调用路径就是普通 Rust 间接调用，不经过 elm-mgr、
 //! provider 或命名空间函数表。
 
+use core::any::type_name;
 use core::fmt;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 include!(concat!(env!("OUT_DIR"), "/interface_source.rs"));
 
 #[cfg(feature = "macros")]
 pub use kernel_symbols_macros::export;
+
+/// 内核 Mixin 站点描述符的固定魔数。
+pub const KERNEL_MIXIN_SITE_DESCRIPTOR_MAGIC: u64 = u64::from_le_bytes(*b"KMSIT001");
+/// 当前内核 Mixin 站点描述符 ABI 版本。
+pub const KERNEL_MIXIN_SITE_DESCRIPTOR_ABI_V1: u16 = 1;
+/// 内核 Mixin 调用帧的固定魔数。
+pub const KERNEL_MIXIN_FRAME_MAGIC: u64 = u64::from_le_bytes(*b"KMFRM001");
+/// 当前内核 Mixin 调用帧 ABI 版本。
+pub const KERNEL_MIXIN_FRAME_ABI_V1: u16 = 1;
+/// 一个可织入函数允许暴露的最大参数数量。
+pub const KERNEL_MIXIN_MAX_ARGUMENTS: usize = 64;
+
+/// 函数入口站点。
+pub const KERNEL_MIXIN_SITE_HEAD: u16 = 1;
+/// 函数统一返回站点。
+pub const KERNEL_MIXIN_SITE_RETURN: u16 = 2;
+/// 源码可见调用执行前站点。
+pub const KERNEL_MIXIN_SITE_CALL_BEFORE: u16 = 3;
+/// 源码可见调用执行后站点。
+pub const KERNEL_MIXIN_SITE_CALL_AFTER: u16 = 4;
+/// 局部变量生命周期站点。
+pub const KERNEL_MIXIN_SITE_LOCAL: u16 = 5;
+/// 字段访问站点。
+pub const KERNEL_MIXIN_SITE_FIELD: u16 = 6;
+
+/// 该帧已经由原函数或覆盖处理器产生返回值。
+pub const KERNEL_MIXIN_FRAME_RESULT_READY: u32 = 1 << 0;
+/// 入口注入请求跳过后续处理器和原函数。
+pub const KERNEL_MIXIN_FRAME_CANCELLED: u32 = 1 << 1;
+/// 当前处理器请求停止同一阶段的后续普通处理器。
+pub const KERNEL_MIXIN_FRAME_STOP: u32 = 1 << 2;
+/// 当前处理器或 continuation 发生故障，调用侧应回退原逻辑。
+pub const KERNEL_MIXIN_FRAME_FAULTED: u32 = 1 << 3;
+/// 当前版本认识的全部帧控制位。
+pub const KERNEL_MIXIN_FRAME_FLAGS_MASK: u32 = KERNEL_MIXIN_FRAME_RESULT_READY
+    | KERNEL_MIXIN_FRAME_CANCELLED
+    | KERNEL_MIXIN_FRAME_STOP
+    | KERNEL_MIXIN_FRAME_FAULTED;
+
+/// 当前站点没有活动处理链，调用侧应直接执行原逻辑。
+pub const KERNEL_MIXIN_DISPATCH_UNHANDLED: i32 = 1;
+/// 站点处理链执行成功。
+pub const KERNEL_MIXIN_DISPATCH_OK: i32 = 0;
+/// 站点处理链或调用帧无效。
+pub const KERNEL_MIXIN_DISPATCH_INVALID: i32 = -1;
+/// 借用槽只允许共享读取。
+pub const KERNEL_MIXIN_VALUE_READ_ONLY: u32 = 1 << 0;
+/// 借用槽指向尚未初始化的结果存储，只允许通过写入接口完成初始化。
+pub const KERNEL_MIXIN_VALUE_UNINITIALIZED: u32 = 1 << 1;
+/// 当前版本认识的全部借用槽标志。
+pub const KERNEL_MIXIN_VALUE_FLAGS_MASK: u32 =
+    KERNEL_MIXIN_VALUE_READ_ONLY | KERNEL_MIXIN_VALUE_UNINITIALIZED;
+
+/// 普通注入处理器；运行时在处理器成功返回后自动继续后续处理链。
+pub const KERNEL_MIXIN_HANDLER_INJECT: u16 = 1;
+/// 参数修改处理器；只允许挂接到函数入口或调用前站点。
+pub const KERNEL_MIXIN_HANDLER_MODIFY_ARGUMENT: u16 = 2;
+/// 返回值修改处理器；只允许挂接到函数返回或调用后站点。
+pub const KERNEL_MIXIN_HANDLER_MODIFY_RETURN: u16 = 3;
+/// 局部变量修改处理器；只允许挂接到局部变量站点。
+pub const KERNEL_MIXIN_HANDLER_MODIFY_LOCAL: u16 = 4;
+/// 调用重定向处理器；处理器自行决定是否调用下一处理器或原操作。
+pub const KERNEL_MIXIN_HANDLER_REDIRECT: u16 = 5;
+/// 操作包装处理器；处理器通过 continuation 包围后续处理链。
+pub const KERNEL_MIXIN_HANDLER_WRAP_OPERATION: u16 = 6;
+/// 函数覆盖处理器；处理器通过 continuation 组成可回退的覆盖链。
+pub const KERNEL_MIXIN_HANDLER_OVERWRITE: u16 = 7;
+
+/// 处理器由运行时自动继续处理链。
+pub const KERNEL_MIXIN_HANDLER_FLAG_AUTO_CONTINUE: u16 = 1 << 0;
+/// 处理器拥有调用 continuation 的权限。
+pub const KERNEL_MIXIN_HANDLER_FLAG_CONTINUATION: u16 = 1 << 1;
+/// 当前版本认识的全部处理器标志。
+pub const KERNEL_MIXIN_HANDLER_FLAGS_MASK: u16 =
+    KERNEL_MIXIN_HANDLER_FLAG_AUTO_CONTINUE | KERNEL_MIXIN_HANDLER_FLAG_CONTINUATION;
+/// 所有动态内核 Mixin trampoline 使用的规范 Rust ABI 字符串。
+pub const KERNEL_MIXIN_HANDLER_RUST_ABI_V1: &str =
+    "unsafeextern\"C\"fn(*mutkernel_symbols::KernelMixinFrameV1)->i32";
+
+/// 一个处理链 continuation 的固定调用约定。
+pub type KernelMixinContinuationV1 = unsafe extern "C" fn(*mut (), *mut KernelMixinFrameV1) -> i32;
+
+/// 动态 ELM 内核 Mixin 处理器的固定调用约定。
+pub type KernelMixinHandlerV1 = unsafe extern "C" fn(*mut KernelMixinFrameV1) -> i32;
+
+/// 类型擦除但携带完整 Rust 类型名称的借用槽。
+///
+/// 槽本身只在一次同步调用的栈帧中存活。处理器必须先使用 [`Self::is`] 校验类型，再把
+/// `pointer` 转换成相应 Rust 引用；任何借用都不得逃逸本次 Mixin 调用。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KernelMixinValueV1 {
+    /// 被借用值的地址。
+    pub pointer: *mut (),
+    /// `core::any::type_name::<T>()` 返回字符串的首地址。
+    pub type_name_pointer: *const u8,
+    /// 类型名称字节长度。
+    pub type_name_len: u32,
+    /// 当前必须为零。
+    pub flags: u32,
+}
+
+impl KernelMixinValueV1 {
+    /// 构造一个可变借用槽。
+    pub fn from_mut<T>(value: &mut T) -> Self {
+        let name = type_name::<T>();
+        Self {
+            pointer: core::ptr::from_mut(value).cast(),
+            type_name_pointer: name.as_ptr(),
+            type_name_len: name.len() as u32,
+            flags: 0,
+        }
+    }
+
+    /// 构造一个尚未初始化、仅允许处理器写入的结果槽。
+    pub fn from_uninit<T>(value: &mut MaybeUninit<T>) -> Self {
+        let name = type_name::<T>();
+        Self {
+            pointer: value.as_mut_ptr().cast(),
+            type_name_pointer: name.as_ptr(),
+            type_name_len: name.len() as u32,
+            flags: KERNEL_MIXIN_VALUE_UNINITIALIZED,
+        }
+    }
+
+    /// 从已由调用方验证的对象地址构造借用槽。
+    ///
+    /// # Safety
+    ///
+    /// `pointer` 必须指向一个在整个同步调用期间存活的 `T`；只读槽不得通过其它方式转换成
+    /// 可变借用。
+    pub unsafe fn from_raw<T>(pointer: *mut T, read_only: bool) -> Self {
+        let name = type_name::<T>();
+        Self {
+            pointer: pointer.cast(),
+            type_name_pointer: name.as_ptr(),
+            type_name_len: name.len() as u32,
+            flags: if read_only {
+                KERNEL_MIXIN_VALUE_READ_ONLY
+            } else {
+                0
+            },
+        }
+    }
+
+    /// 返回槽中记录的类型是否与 `T` 完全一致。
+    pub fn is<T>(&self) -> bool {
+        let expected = type_name::<T>().as_bytes();
+        if self.pointer.is_null()
+            || self.type_name_pointer.is_null()
+            || self.type_name_len as usize != expected.len()
+            || self.flags & !KERNEL_MIXIN_VALUE_FLAGS_MASK != 0
+        {
+            return false;
+        }
+        // Safety: 类型名称来自具有静态存储期的 `type_name` 字符串，并已验证长度。
+        let actual = unsafe {
+            core::slice::from_raw_parts(self.type_name_pointer, self.type_name_len as usize)
+        };
+        actual == expected
+    }
+
+    /// 在完成类型校验后取得共享借用。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证槽仍属于当前活动调用帧，并且没有同时创建违反 Rust 别名规则的可变借用。
+    pub unsafe fn cast_ref<T>(&self) -> Option<&T> {
+        if self.flags & KERNEL_MIXIN_VALUE_UNINITIALIZED != 0 || !self.is::<T>() {
+            return None;
+        }
+        // Safety: 上面的完整类型名称校验和调用方承担的帧生命周期保证转换有效。
+        Some(unsafe { &*self.pointer.cast::<T>() })
+    }
+
+    /// 在完成类型校验后取得可变借用。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须独占该槽对应值，并保证借用不逃逸当前处理器调用。
+    pub unsafe fn cast_mut<T>(&mut self) -> Option<&mut T> {
+        if self.flags & (KERNEL_MIXIN_VALUE_READ_ONLY | KERNEL_MIXIN_VALUE_UNINITIALIZED) != 0
+            || !self.is::<T>()
+        {
+            return None;
+        }
+        // Safety: 上面的完整类型名称校验和调用方承担的独占性保证转换有效。
+        Some(unsafe { &mut *self.pointer.cast::<T>() })
+    }
+
+    /// 把值写入尚未初始化且类型完全匹配的结果槽。
+    pub fn write<T>(&mut self, value: T) -> Result<(), T> {
+        if self.flags & KERNEL_MIXIN_VALUE_READ_ONLY != 0
+            || self.flags & KERNEL_MIXIN_VALUE_UNINITIALIZED == 0
+            || !self.is::<T>()
+        {
+            return Err(value);
+        }
+        // Safety: 槽由 `from_uninit` 从有效 `MaybeUninit<T>` 创建，完整类型名称已经匹配。
+        unsafe { self.pointer.cast::<T>().write(value) };
+        self.flags &= !KERNEL_MIXIN_VALUE_UNINITIALIZED;
+        Ok(())
+    }
+
+    /// 把由原逻辑直接写入的结果槽标记为已经初始化。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须已经使用完全匹配的 `T` 初始化 `pointer` 指向的存储。
+    pub unsafe fn mark_initialized<T>(&mut self) -> bool {
+        if self.flags & KERNEL_MIXIN_VALUE_UNINITIALIZED == 0 || !self.is::<T>() {
+            return false;
+        }
+        self.flags &= !KERNEL_MIXIN_VALUE_UNINITIALIZED;
+        true
+    }
+}
+
+/// 内核函数执行一次 Mixin 处理链时使用的固定栈帧。
+#[repr(C)]
+pub struct KernelMixinFrameV1 {
+    /// 固定魔数。
+    pub magic: u64,
+    /// ABI 版本。
+    pub abi_version: u16,
+    /// 当前结构完整长度。
+    pub struct_size: u16,
+    /// [`KERNEL_MIXIN_SITE_HEAD`] 等站点类别。
+    pub site_kind: u16,
+    /// 参数槽数量。
+    pub argument_count: u16,
+    /// `KERNEL_MIXIN_FRAME_*` 控制位。
+    pub flags: u32,
+    /// 处理器或运行时写入的状态码。
+    pub status: i32,
+    /// 当前必须为零。
+    pub reserved0: u32,
+    /// 参数槽数组。
+    pub arguments: *mut KernelMixinValueV1,
+    /// 返回值槽；无返回槽时为空。
+    pub result: *mut KernelMixinValueV1,
+    /// 调用下一优先级处理器的入口。
+    pub next: Option<KernelMixinContinuationV1>,
+    /// `next` 私有上下文。
+    pub next_context: *mut (),
+    /// 调用最终原逻辑的入口。
+    pub original: Option<KernelMixinContinuationV1>,
+    /// `original` 私有上下文。
+    pub original_context: *mut (),
+}
+
+impl KernelMixinFrameV1 {
+    /// 构造一个只借用调用方栈上参数和结果槽的帧。
+    pub fn new(
+        site_kind: u16,
+        arguments: &mut [KernelMixinValueV1],
+        result: Option<&mut KernelMixinValueV1>,
+    ) -> Self {
+        Self {
+            magic: KERNEL_MIXIN_FRAME_MAGIC,
+            abi_version: KERNEL_MIXIN_FRAME_ABI_V1,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            site_kind,
+            argument_count: arguments.len() as u16,
+            flags: 0,
+            status: 0,
+            reserved0: 0,
+            arguments: arguments.as_mut_ptr(),
+            result: result.map_or(core::ptr::null_mut(), core::ptr::from_mut),
+            next: None,
+            next_context: core::ptr::null_mut(),
+            original: None,
+            original_context: core::ptr::null_mut(),
+        }
+    }
+
+    /// 校验固定头部、槽数量和控制位。
+    pub fn valid(&self) -> bool {
+        self.magic == KERNEL_MIXIN_FRAME_MAGIC
+            && self.abi_version == KERNEL_MIXIN_FRAME_ABI_V1
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && matches!(
+                self.site_kind,
+                KERNEL_MIXIN_SITE_HEAD
+                    | KERNEL_MIXIN_SITE_RETURN
+                    | KERNEL_MIXIN_SITE_CALL_BEFORE
+                    | KERNEL_MIXIN_SITE_CALL_AFTER
+                    | KERNEL_MIXIN_SITE_LOCAL
+                    | KERNEL_MIXIN_SITE_FIELD
+            )
+            && self.argument_count as usize <= KERNEL_MIXIN_MAX_ARGUMENTS
+            && (self.argument_count == 0 || !self.arguments.is_null())
+            && self.flags & !KERNEL_MIXIN_FRAME_FLAGS_MASK == 0
+            && self.reserved0 == 0
+    }
+
+    /// 返回参数槽切片。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证帧仍处于目标函数建立的同步调用范围内。
+    pub unsafe fn arguments_mut(&mut self) -> Option<&mut [KernelMixinValueV1]> {
+        if !self.valid() {
+            return None;
+        }
+        // Safety: `valid` 已验证空指针和数量，目标包装器保证数组存活。
+        Some(unsafe {
+            core::slice::from_raw_parts_mut(self.arguments, self.argument_count as usize)
+        })
+    }
+
+    /// 按索引和完整类型名称取得一个参数的共享借用。
+    ///
+    /// # Safety
+    ///
+    /// 借用不得逃逸当前同步处理器调用，且调用方不得同时创建冲突的可变借用。
+    pub unsafe fn argument<T>(&mut self, index: usize) -> Option<&T> {
+        let arguments = unsafe { self.arguments_mut()? };
+        // Safety: 槽仍属于当前帧，类型和初始化状态由 `cast_ref` 校验。
+        unsafe { arguments.get(index)?.cast_ref::<T>() }
+    }
+
+    /// 按索引和完整类型名称取得一个参数的可变借用。
+    ///
+    /// # Safety
+    ///
+    /// 借用不得逃逸当前同步处理器调用，且调用方必须保证该参数当前可独占修改。
+    pub unsafe fn argument_mut<T>(&mut self, index: usize) -> Option<&mut T> {
+        let arguments = unsafe { self.arguments_mut()? };
+        // Safety: 槽仍属于当前帧，只读、类型和初始化状态由 `cast_mut` 校验。
+        unsafe { arguments.get_mut(index)?.cast_mut::<T>() }
+    }
+
+    /// 取得已经初始化的返回值共享借用。
+    ///
+    /// # Safety
+    ///
+    /// 借用不得逃逸当前同步处理器调用。
+    pub unsafe fn result<T>(&mut self) -> Option<&T> {
+        if self.flags & KERNEL_MIXIN_FRAME_RESULT_READY == 0 || self.result.is_null() {
+            return None;
+        }
+        // Safety: 结果槽由目标包装器创建并在整个同步调用期间存活。
+        unsafe { (*self.result).cast_ref::<T>() }
+    }
+
+    /// 取得已经初始化的返回值可变借用。
+    ///
+    /// # Safety
+    ///
+    /// 借用不得逃逸当前同步处理器调用，且调用方必须独占返回值。
+    pub unsafe fn result_mut<T>(&mut self) -> Option<&mut T> {
+        if self.flags & KERNEL_MIXIN_FRAME_RESULT_READY == 0 || self.result.is_null() {
+            return None;
+        }
+        // Safety: 结果槽由目标包装器创建并在整个同步调用期间存活。
+        unsafe { (*self.result).cast_mut::<T>() }
+    }
+
+    /// 写入提前返回或覆盖处理器产生的返回值。
+    pub fn set_result<T>(&mut self, value: T) -> Result<(), T> {
+        if self.result.is_null() || self.flags & KERNEL_MIXIN_FRAME_RESULT_READY != 0 {
+            return Err(value);
+        }
+        // Safety: 结果槽指针由目标包装器创建并在当前同步调用期间保持有效。
+        let result = unsafe { &mut *self.result };
+        result.write(value)?;
+        self.flags |= KERNEL_MIXIN_FRAME_RESULT_READY;
+        Ok(())
+    }
+
+    /// 调用当前 continuation。
+    ///
+    /// # Safety
+    ///
+    /// 只能由当前处理器在同步调用期间调用，且同一个 continuation 最多调用一次。
+    pub unsafe fn call_next(&mut self) -> i32 {
+        let Some(next) = self.next.take() else {
+            return KERNEL_MIXIN_DISPATCH_INVALID;
+        };
+        let context = core::mem::replace(&mut self.next_context, core::ptr::null_mut());
+        // Safety: continuation 和上下文由内核运行时成对安装，并只在本次同步调用中有效。
+        unsafe { next(context, self) }
+    }
+
+    /// 调用目标函数提供的最终原逻辑。
+    ///
+    /// # Safety
+    ///
+    /// 只能由处理链 continuation 调用一次；目标包装器保证上下文和结果槽有效。
+    pub unsafe fn call_original(&mut self) -> i32 {
+        let Some(original) = self.original.take() else {
+            return KERNEL_MIXIN_DISPATCH_INVALID;
+        };
+        let context = core::mem::replace(&mut self.original_context, core::ptr::null_mut());
+        // Safety: 原逻辑入口和上下文由目标包装器成对安装。
+        unsafe { original(context, self) }
+    }
+}
+
+/// 编译进内核镜像的一个可注入源码站点。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KernelMixinSiteDescriptorV1 {
+    /// 固定魔数。
+    pub magic: u64,
+    /// ABI 版本。
+    pub abi_version: u16,
+    /// 当前结构完整长度。
+    pub struct_size: u16,
+    /// 站点类别。
+    pub kind: u16,
+    /// 当前必须为零。
+    pub flags: u16,
+    /// 站点在所属目标函数中的稳定遍历序号。
+    pub ordinal: u32,
+    /// 产生该站点的内核接口源码摘要。
+    pub source_hash: [u8; 32],
+    /// 目标函数体规范 token 摘要。
+    pub function_hash: [u8; 32],
+    /// 站点身份完整摘要。
+    pub site_hash: [u8; 32],
+    /// 目标函数规范 Rust ABI 摘要。
+    pub frame_abi_hash: [u8; 32],
+    /// 稳定 API 路径。
+    pub api_path: &'static str,
+    /// 人类可读且可由构建工具重新解析的 selector。
+    pub selector: &'static str,
+    /// 该站点当前安装的不可变处理链；空指针表示完全绕过 Mixin 慢路径。
+    pub route: &'static AtomicPtr<()>,
+}
+
+// Safety: 描述符只包含静态只读数据。
+unsafe impl Sync for KernelMixinSiteDescriptorV1 {}
+
+impl KernelMixinSiteDescriptorV1 {
+    /// 构造一个完整站点描述符。
+    pub const fn new(
+        kind: u16,
+        ordinal: u32,
+        function_hash: [u8; 32],
+        site_hash: [u8; 32],
+        frame_abi_hash: [u8; 32],
+        api_path: &'static str,
+        selector: &'static str,
+        route: &'static AtomicPtr<()>,
+    ) -> Self {
+        Self {
+            magic: KERNEL_MIXIN_SITE_DESCRIPTOR_MAGIC,
+            abi_version: KERNEL_MIXIN_SITE_DESCRIPTOR_ABI_V1,
+            struct_size: core::mem::size_of::<Self>() as u16,
+            kind,
+            flags: 0,
+            ordinal,
+            source_hash: KERNEL_INTERFACE_SOURCE_SHA256,
+            function_hash,
+            site_hash,
+            frame_abi_hash,
+            api_path,
+            selector,
+            route,
+        }
+    }
+
+    /// 校验站点描述符固定字段。
+    pub fn valid(&self) -> bool {
+        self.magic == KERNEL_MIXIN_SITE_DESCRIPTOR_MAGIC
+            && self.abi_version == KERNEL_MIXIN_SITE_DESCRIPTOR_ABI_V1
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && matches!(
+                self.kind,
+                KERNEL_MIXIN_SITE_HEAD
+                    | KERNEL_MIXIN_SITE_RETURN
+                    | KERNEL_MIXIN_SITE_CALL_BEFORE
+                    | KERNEL_MIXIN_SITE_CALL_AFTER
+                    | KERNEL_MIXIN_SITE_LOCAL
+                    | KERNEL_MIXIN_SITE_FIELD
+            )
+            && self.flags == 0
+            && self.source_hash != [0; 32]
+            && self.function_hash != [0; 32]
+            && self.site_hash != [0; 32]
+            && self.frame_abi_hash != [0; 32]
+            && valid_identifier(self.api_path, KERNEL_SYMBOL_NAME_MAX_LEN)
+            && !self.selector.is_empty()
+            && self.selector.len() <= KERNEL_SYMBOL_RUST_ABI_MAX_LEN
+    }
+
+    /// 返回该站点当前是否安装了处理链。
+    #[inline]
+    pub fn has_handlers(&self) -> bool {
+        !self.route.load(Ordering::Acquire).is_null()
+    }
+}
+
+/// 常驻内核 Mixin 路由器的零分配分发入口。
+pub type KernelMixinDispatchV1 =
+    unsafe extern "C" fn(*const KernelMixinSiteDescriptorV1, *mut KernelMixinFrameV1) -> i32;
+
+/// ELM 运行时向所有导出符号包装器安装的 Mixin 钩子表。
+#[repr(C)]
+pub struct KernelMixinRuntimeHooksV1 {
+    /// 当前必须为 1。
+    pub abi_version: u16,
+    /// 当前结构完整长度。
+    pub struct_size: u16,
+    /// 当前必须为零。
+    pub flags: u32,
+    /// 零分配同步分发入口。
+    pub dispatch: KernelMixinDispatchV1,
+}
+
+impl KernelMixinRuntimeHooksV1 {
+    /// 校验钩子表固定字段和入口。
+    pub fn valid(&self) -> bool {
+        self.abi_version == 1
+            && self.struct_size as usize == core::mem::size_of::<Self>()
+            && self.flags == 0
+            && self.dispatch as usize != 0
+    }
+}
+
+static MIXIN_RUNTIME_HOOKS: AtomicPtr<KernelMixinRuntimeHooksV1> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// 安装一次内核 Mixin 运行时钩子。
+pub fn install_mixin_runtime_hooks(hooks: &'static KernelMixinRuntimeHooksV1) -> bool {
+    if !hooks.valid() {
+        return false;
+    }
+    let pointer = core::ptr::from_ref(hooks).cast_mut();
+    MIXIN_RUNTIME_HOOKS
+        .compare_exchange(
+            core::ptr::null_mut(),
+            pointer,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+        || MIXIN_RUNTIME_HOOKS.load(Ordering::Acquire) == pointer
+}
+
+/// 把栈上调用帧交给已安装的内核 Mixin 路由器。
+///
+/// # Safety
+///
+/// `site` 和 `frame` 必须在整个同步调用期间有效，且帧内所有槽满足其 Rust 类型和别名规则。
+pub unsafe fn dispatch_kernel_mixin(
+    site: &KernelMixinSiteDescriptorV1,
+    frame: &mut KernelMixinFrameV1,
+) -> i32 {
+    if !site.has_handlers() {
+        return KERNEL_MIXIN_DISPATCH_UNHANDLED;
+    }
+    let hooks = MIXIN_RUNTIME_HOOKS.load(Ordering::Acquire);
+    if hooks.is_null() {
+        return KERNEL_MIXIN_DISPATCH_UNHANDLED;
+    }
+    // Safety: 指针只由安装函数写入经过校验的静态钩子表。
+    let hooks = unsafe { &*hooks };
+    // Safety: 调用方承担站点和帧生命周期，钩子表保证同步返回。
+    unsafe { (hooks.dispatch)(core::ptr::from_ref(site), core::ptr::from_mut(frame)) }
+}
+
+/// 目标函数在栈上保存的原逻辑 continuation。
+///
+/// 该类型把任意 `FnOnce() -> R` 擦除成 [`KernelMixinContinuationV1`]，使覆盖处理器能够
+/// 通过帧中的 `original` 入口调用真实函数体，同时保持返回值写入调用方的栈槽。
+pub struct KernelMixinOriginal<F, R>
+where
+    F: FnOnce() -> R,
+{
+    callback: Option<F>,
+    result: *mut MaybeUninit<R>,
+}
+
+impl<F, R> KernelMixinOriginal<F, R>
+where
+    F: FnOnce() -> R,
+{
+    /// 构造一个尚未执行的原逻辑 continuation。
+    pub fn new(callback: F, result: &mut MaybeUninit<R>) -> Self {
+        Self {
+            callback: Some(callback),
+            result: core::ptr::from_mut(result),
+        }
+    }
+
+    /// 把该 continuation 安装到调用帧。
+    pub fn bind(&mut self, frame: &mut KernelMixinFrameV1) {
+        frame.original = Some(call_kernel_mixin_original::<F, R>);
+        frame.original_context = core::ptr::from_mut(self).cast();
+    }
+}
+
+unsafe extern "C" fn call_kernel_mixin_original<F, R>(
+    context: *mut (),
+    frame: *mut KernelMixinFrameV1,
+) -> i32
+where
+    F: FnOnce() -> R,
+{
+    if context.is_null() || frame.is_null() {
+        return KERNEL_MIXIN_DISPATCH_INVALID;
+    }
+    // Safety: `bind` 只写入同一栈帧中仍然存活的 `KernelMixinOriginal<F, R>` 地址。
+    let original = unsafe { &mut *context.cast::<KernelMixinOriginal<F, R>>() };
+    let Some(callback) = original.callback.take() else {
+        return KERNEL_MIXIN_DISPATCH_INVALID;
+    };
+    // Safety: 结果指针来自调用方仍存活的 `MaybeUninit<R>` 栈槽。
+    unsafe { (*original.result).write(callback()) };
+    // Safety: 调用方保证帧在 continuation 同步调用期间存活。
+    let frame = unsafe { &mut *frame };
+    if frame.result.is_null() {
+        return KERNEL_MIXIN_DISPATCH_INVALID;
+    }
+    // Safety: 上面已经用同一个 `R` 初始化结果存储，槽属于当前活动帧。
+    if !unsafe { (*frame.result).mark_initialized::<R>() } {
+        return KERNEL_MIXIN_DISPATCH_INVALID;
+    }
+    frame.flags |= KERNEL_MIXIN_FRAME_RESULT_READY;
+    KERNEL_MIXIN_DISPATCH_OK
+}
+
+/// 在确认调用帧已经产生返回值后取出结果。
+///
+/// 目标包装器只在原函数、取消处理器或覆盖链成功写入结果后调用本函数；缺少结果表示
+/// Mixin 路由器违反固定协议，因此立即终止当前调用。
+pub fn finish_kernel_mixin_result<R>(result: MaybeUninit<R>, frame: &KernelMixinFrameV1) -> R {
+    assert!(
+        frame.flags & KERNEL_MIXIN_FRAME_RESULT_READY != 0
+            && !frame.result.is_null()
+            // Safety: 这里只读取调用方栈上仍存活的结果槽标志。
+            && unsafe { (*frame.result).flags & KERNEL_MIXIN_VALUE_UNINITIALIZED == 0 },
+        "内核 Mixin 调用没有产生返回值"
+    );
+    // Safety: RESULT_READY 只能由写入同一 `MaybeUninit<R>` 的原逻辑或已验证处理器设置。
+    unsafe { result.assume_init() }
+}
 
 /// 内核符号描述符的固定魔数。
 pub const KERNEL_SYMBOL_DESCRIPTOR_MAGIC: u64 = u64::from_le_bytes(*b"KRSYM001");

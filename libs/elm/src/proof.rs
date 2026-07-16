@@ -807,12 +807,31 @@ pub fn canonical_ebi_digest(image: &ElmEbiImage) -> [u8; ELM_PROOF_SHA256_LEN] {
     for point in &unit.extension_points {
         hash.string(&point.point);
         hash.string(point.contract.as_str());
+        hash.u32(point.mode as u32);
     }
     hash.u64(unit.extensions.len() as u64);
     for extension in &unit.extensions {
         hash.string(&extension.target_name);
         hash.string(&extension.point);
         hash.string(extension.contract.as_str());
+        hash.string(extension.handler_contract.as_str());
+        hash.i64(i64::from(extension.priority));
+    }
+    hash.u64(unit.kernel_mixins.len() as u64);
+    for mixin in &unit.kernel_mixins {
+        hash.string(&mixin.target_api);
+        hash.string(&mixin.selector);
+        hash.string(&mixin.handler_symbol);
+        hash.u16(mixin.kind as u16);
+        hash.u16(mixin.flags);
+        hash.i64(i64::from(mixin.priority));
+        hash.u32(mixin.ordinal);
+        hash.bytes(&mixin.profile_hash);
+        hash.bytes(&mixin.source_hash);
+        hash.bytes(&mixin.function_hash);
+        hash.bytes(&mixin.site_hash);
+        hash.bytes(&mixin.frame_abi_hash);
+        hash.bytes(&mixin.handler_abi_hash);
     }
     hash.u64(unit.provider_ports.len() as u64);
     for provider in &unit.provider_ports {

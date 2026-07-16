@@ -4,62 +4,12 @@
 //! 都直接进入传入的 [`crate::KernelMemorySubsystem`]，不经过 ELM 运行时、授权令牌或
 //! 函数表。权限只在镜像装载阶段按描述符能力组裁决。
 
-use core::alloc::{GlobalAlloc, Layout};
-
 use crate::buddy;
 use crate::{
     AllocStats, AllocationError, AllocationKind, AllocationRecord, AllocatorCapabilities,
-    AllocatorHotspotSummary, DeallocationError, KERNEL_ALLOCATOR, KernelMemorySubsystem,
-    MemoryRequest, OwnershipError, PhysicalAllocRequest, PhysicalAllocation, PhysicalFreeError,
+    AllocatorHotspotSummary, DeallocationError, KernelMemorySubsystem, MemoryRequest,
+    OwnershipError, PhysicalAllocRequest, PhysicalAllocation, PhysicalFreeError,
 };
-
-#[kernel_symbols::export(
-    name = "allocator.GlobalAlloc.alloc",
-    contract = "kernel.allocator.global-alloc@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
-)]
-pub unsafe fn global_alloc(layout: Layout) -> *mut u8 {
-    // Safety: 调用方遵守 `GlobalAlloc::alloc` 的 Layout 与返回指针契约。
-    unsafe { GlobalAlloc::alloc(&KERNEL_ALLOCATOR, layout) }
-}
-
-#[kernel_symbols::export(
-    name = "allocator.GlobalAlloc.dealloc",
-    contract = "kernel.allocator.global-alloc@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
-)]
-pub unsafe fn global_dealloc(pointer: *mut u8, layout: Layout) {
-    // Safety: 调用方保证指针由同一全局分配器按给定 Layout 创建且仍由调用方持有。
-    unsafe { GlobalAlloc::dealloc(&KERNEL_ALLOCATOR, pointer, layout) }
-}
-
-#[kernel_symbols::export(
-    name = "allocator.GlobalAlloc.realloc",
-    contract = "kernel.allocator.global-alloc@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
-)]
-pub unsafe fn global_realloc(pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    // Safety: 调用方保证旧指针与 Layout 匹配，并遵守 `GlobalAlloc::realloc` 所有权语义。
-    unsafe { GlobalAlloc::realloc(&KERNEL_ALLOCATOR, pointer, layout, new_size) }
-}
-
-#[kernel_symbols::export(
-    name = "allocator.GlobalAlloc.alloc_zeroed",
-    contract = "kernel.allocator.global-alloc@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::ALLOCATOR_MEMORY,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
-)]
-pub unsafe fn global_alloc_zeroed(layout: Layout) -> *mut u8 {
-    // Safety: 调用方遵守 `GlobalAlloc::alloc_zeroed` 的 Layout 与返回指针契约。
-    unsafe { GlobalAlloc::alloc_zeroed(&KERNEL_ALLOCATOR, layout) }
-}
 
 #[kernel_symbols::export(
     name = "allocator.KernelMemorySubsystem.is_active",
@@ -356,8 +306,8 @@ pub fn virtual_to_physical(
 
 /// 强制链接器抽取包含 allocator 符号目录的代码生成单元。
 pub fn catalog_anchor() -> usize {
-    global_alloc as usize
-        ^ global_dealloc as usize
+    <KernelMemorySubsystem as core::alloc::GlobalAlloc>::alloc as usize
+        ^ <KernelMemorySubsystem as core::alloc::GlobalAlloc>::dealloc as usize
         ^ allocate as usize
         ^ allocate_physical as usize
         ^ query_physical_allocation as usize

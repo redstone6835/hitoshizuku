@@ -16,16 +16,17 @@ use alloc::vec::Vec;
 use core::str;
 
 use crate::ebi::{
-    ELM_EBI_ABI_VERSION, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
-    ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
-    ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS,
-    ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN, ELM_EBI_RUST_ABI_HASH_LEN,
-    ELM_EBI_SYMBOL_NAME_LEN, ElmEbiApiCompatibility, ElmEbiArch, ElmEbiDependencyDecl, ElmEbiEntry,
-    ElmEbiExportDecl, ElmEbiExtensionDecl, ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl,
+    ELM_EBI_ABI_VERSION, ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN, ELM_EBI_MAX_DEPENDENCIES,
+    ELM_EBI_MAX_EXPORTS, ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
+    ELM_EBI_MAX_KERNEL_MIXINS, ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS,
+    ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN,
+    ELM_EBI_RUST_ABI_HASH_LEN, ELM_EBI_SYMBOL_NAME_LEN, ElmEbiApiCompatibility, ElmEbiArch,
+    ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiKernelMixinDecl,
     ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiLoadStatus,
     ElmEbiMenuDecl, ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind,
     ElmEbiRustHookSignature, ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload,
-    ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
+    ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit, ElmKernelMixinKind,
 };
 use crate::elmapi::ELM_API_MAX_COMPATIBLE_VERSIONS;
 use crate::manifest::{ElmKind, ElmManifest, ElmName, ElmVersion};
@@ -91,6 +92,9 @@ const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
     16 + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_RECORD_SIZE: usize =
     24 + ELM_EBI_NAME_LEN + ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN * 2;
+/// EKI 内核符号级 Mixin 表记录的固定长度。
+pub const ELM_EKI_KERNEL_MIXIN_RECORD_SIZE: usize =
+    24 + 32 * 6 + ELM_EBI_SYMBOL_NAME_LEN * 2 + ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN;
 /// `ELM_EKI_PROVIDER_PORT_RECORD_SIZE` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EKI_PROVIDER_PORT_RECORD_SIZE: usize =
     24 + ELM_NEXUS_CONTRACT_LEN + ELM_EBI_SYMBOL_NAME_LEN * 2;
@@ -152,6 +156,8 @@ pub enum ElmEkiBlockKind {
     VariantDirectory = 22,
     /// 目录引用的一个完整、可独立校验的内层 EKI。
     VariantImage = 23,
+    /// 精确绑定到内核导出函数源码站点的原生 Mixin 声明表。
+    KernelMixins = 24,
 }
 
 impl ElmEkiBlockKind {
@@ -181,6 +187,7 @@ impl ElmEkiBlockKind {
             21 => Some(Self::AbiFingerprint),
             22 => Some(Self::VariantDirectory),
             23 => Some(Self::VariantImage),
+            24 => Some(Self::KernelMixins),
             _ => None,
         }
     }
@@ -364,6 +371,7 @@ fn parse_single_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus>
     let mut dependencies = None;
     let mut extension_points = None;
     let mut extensions = None;
+    let mut kernel_mixins = None;
     let mut provider_ports = None;
     let mut imports = None;
     let mut exports = None;
@@ -468,6 +476,12 @@ fn parse_single_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus>
                 }
                 extensions = Some(parse_extensions(payload)?);
             }
+            ElmEkiBlockKind::KernelMixins => {
+                if kernel_mixins.is_some() {
+                    return Err(ElmEbiLoadStatus::InvalidManifest);
+                }
+                kernel_mixins = Some(parse_kernel_mixins(payload)?);
+            }
             ElmEkiBlockKind::ProviderPorts => {
                 if provider_ports.is_some() {
                     return Err(ElmEbiLoadStatus::InvalidManifest);
@@ -527,6 +541,11 @@ fn parse_single_eki_image(bytes: &[u8]) -> Result<ElmEbiImage, ElmEbiLoadStatus>
     if let Some(extensions) = extensions {
         for extension in extensions {
             unit = unit.with_extension(extension);
+        }
+    }
+    if let Some(kernel_mixins) = kernel_mixins {
+        for mixin in kernel_mixins {
+            unit = unit.with_kernel_mixin(mixin);
         }
     }
     if let Some(provider_ports) = provider_ports {
@@ -1283,6 +1302,50 @@ fn parse_extensions(payload: &[u8]) -> Result<Vec<ElmEbiExtensionDecl>, ElmEbiLo
         );
     }
     Ok(extensions)
+}
+
+fn parse_kernel_mixins(payload: &[u8]) -> Result<Vec<ElmEbiKernelMixinDecl>, ElmEbiLoadStatus> {
+    let count = parse_table_count(
+        payload,
+        ELM_EBI_MAX_KERNEL_MIXINS,
+        ELM_EKI_KERNEL_MIXIN_RECORD_SIZE,
+    )?;
+    let mut mixins = Vec::new();
+    for index in 0..count {
+        let offset = EKI_TABLE_HEADER_SIZE + index * ELM_EKI_KERNEL_MIXIN_RECORD_SIZE;
+        let kind = ElmKernelMixinKind::from_raw(read_u16(payload, offset)?)
+            .ok_or(ElmEbiLoadStatus::InvalidManifest)?;
+        let flags = read_u16(payload, offset + 2)?;
+        let ordinal = read_u32(payload, offset + 4)?;
+        let priority = read_u32(payload, offset + 8)? as i32;
+        let target_len = read_u16(payload, offset + 12)? as usize;
+        let selector_len = read_u16(payload, offset + 14)? as usize;
+        let handler_len = read_u16(payload, offset + 16)? as usize;
+        if read_u16(payload, offset + 18)? != 0 || read_u32(payload, offset + 20)? != 0 {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        let mut hashes = [[0u8; 32]; 6];
+        for (hash_index, hash) in hashes.iter_mut().enumerate() {
+            hash.copy_from_slice(read_bytes(payload, offset + 24 + hash_index * 32, 32)?);
+        }
+        let target_start = offset + 24 + 32 * 6;
+        let selector_start = target_start + ELM_EBI_SYMBOL_NAME_LEN;
+        let handler_start = selector_start + ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN;
+        let mut mixin = ElmEbiKernelMixinDecl::new(
+            fixed_str(payload, target_start, target_len)?,
+            fixed_str(payload, selector_start, selector_len)?,
+            fixed_str(payload, handler_start, handler_len)?,
+            kind,
+            priority,
+        )?
+        .with_site_identity(
+            ordinal, hashes[0], hashes[1], hashes[2], hashes[3], hashes[4], hashes[5],
+        );
+        mixin.flags = flags;
+        mixin.validate()?;
+        mixins.push(mixin);
+    }
+    Ok(mixins)
 }
 
 fn parse_provider_ports(payload: &[u8]) -> Result<Vec<ElmEbiProviderPortDecl>, ElmEbiLoadStatus> {

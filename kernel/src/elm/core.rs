@@ -918,6 +918,7 @@ struct NativeLifecycleExecutionPlan {
     executor: Option<NativeHookExecutor>,
     work: NativeLifecycleWork,
     source_suspension: Option<super::source::ProjectionSourceSuspension>,
+    kernel_mixin_suspension: Option<super::kernel_mixin::SuspendedKernelMixins>,
 }
 
 struct NativeLifecycleExecutionOutcome {
@@ -940,6 +941,7 @@ struct NativeLoadExecutionPlan {
     unit: ElmEbiUnit,
     topology: ResolvedEbiTopology,
     loaded: LoadedElmImage,
+    kernel_mixins: super::kernel_mixin::PreparedKernelMixins,
     exports: Vec<NativeExportRuntime>,
     kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
     kernel_symbol_capabilities: u64,
@@ -977,6 +979,8 @@ struct NativeReplaceExecutionPlan {
     suspended_projection_sources: usize,
     unit: ElmEbiUnit,
     loaded: LoadedElmImage,
+    kernel_mixins: super::kernel_mixin::PreparedKernelMixins,
+    kernel_mixin_suspension: super::kernel_mixin::SuspendedKernelMixins,
     exports: Vec<NativeExportRuntime>,
     kernel_symbol_imports: Vec<KernelSymbolImportRuntime>,
     kernel_symbol_capabilities: u64,
@@ -6549,6 +6553,25 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
             ));
         }
+        let kernel_mixins =
+            match Self::prepare_kernel_mixins(id, Generation::FIRST, &image, &loaded) {
+                Ok(kernel_mixins) => kernel_mixins,
+                Err(status) => {
+                    log::error!(
+                        "[elm] 内核 Mixin 准备失败 cell={} name={} status={:?}",
+                        id.0,
+                        name,
+                        status
+                    );
+                    self.quarantine_cell_after_hook_failure(id);
+                    return PreparedNativeLoad::Immediate(ElmLoadCellResponse::new(
+                        status,
+                        id.0,
+                        state_code(self.cell_state(id).unwrap_or(ElmState::Quarantined)),
+                        ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+                    ));
+                }
+            };
         let exports = match self.collect_native_exports(id, Generation::FIRST, &image, &loaded) {
             Ok(exports) => exports,
             Err(status) => {
@@ -6681,6 +6704,7 @@ impl ElmCore {
             unit: image.unit,
             topology,
             loaded,
+            kernel_mixins,
             exports,
             kernel_symbol_imports,
             kernel_symbol_capabilities,
@@ -6758,12 +6782,28 @@ impl ElmCore {
                 ELM_LIFECYCLE_REASON_LEASE_BUSY,
             ));
         }
+        if let Err(error) = super::kernel_mixin::install(&plan.kernel_mixins) {
+            log::error!(
+                "[elm] 内核 Mixin 路由安装失败 cell={} generation={} error={:?}",
+                plan.id.0,
+                plan.token.generation.0,
+                error
+            );
+            return NativeLoadCommit::Finalize(self.abort_native_load_after_initialize(
+                plan,
+                super::kernel_mixin::map_load_status(error),
+                ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+            ));
+        }
         if let Err(err) = self.commit_image_trust(plan.id, &plan.trust) {
             log::error!(
                 "[elm] trust acceptance commit failed cell={}: {:?}",
                 plan.id.0,
                 err
             );
+            if !Self::retire_kernel_mixins(plan.id, plan.token.generation) {
+                self.quarantine_cell_after_hook_failure(plan.id);
+            }
             return NativeLoadCommit::Finalize(self.abort_native_load_after_initialize(
                 plan,
                 ElmEbiLoadStatus::RuntimeRejected,
@@ -6776,6 +6816,9 @@ impl ElmCore {
                 plan.id.0,
                 plan.token.generation.0
             );
+            if !Self::retire_kernel_mixins(plan.id, plan.token.generation) {
+                self.quarantine_cell_after_hook_failure(plan.id);
+            }
             self.rollback_activated_cell_to_quarantine(plan.id);
             self.release_cell_execution(plan.token);
             return NativeLoadCommit::Complete(ElmLoadCellResponse::new(
@@ -7116,6 +7159,32 @@ impl ElmCore {
                 ELM_POLICY_BLOCK_CONTRACT_MISMATCH,
             ));
         }
+        let kernel_mixins = match Self::prepare_kernel_mixins(id, new_generation, &image, &loaded) {
+            Ok(kernel_mixins) => kernel_mixins,
+            Err(status) => {
+                return PreparedNativeReplace::Immediate(self.replace_response(
+                    id,
+                    if status == ElmEbiLoadStatus::AbiFingerprintRejected {
+                        ELM_MGR_STATUS_PERMISSION
+                    } else {
+                        ELM_MGR_STATUS_INVALID
+                    },
+                    old_state,
+                    old_generation,
+                    0,
+                    if status == ElmEbiLoadStatus::AbiFingerprintRejected {
+                        first_lifecycle_reason(ELM_POLICY_BLOCK_ABI_FINGERPRINT)
+                    } else {
+                        ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT
+                    },
+                    if status == ElmEbiLoadStatus::AbiFingerprintRejected {
+                        ELM_POLICY_BLOCK_ABI_FINGERPRINT
+                    } else {
+                        ELM_POLICY_BLOCK_GRAPH_INCONSISTENT
+                    },
+                ));
+            }
+        };
         let exports = match self.collect_native_exports(id, new_generation, &image, &loaded) {
             Ok(exports) => exports,
             Err(_) => {
@@ -7350,6 +7419,33 @@ impl ElmCore {
                 blockers,
             ));
         }
+        let kernel_mixin_suspension = match super::kernel_mixin::suspend(id, old_generation) {
+            Ok(suspension) => suspension,
+            Err(error) => {
+                log::error!(
+                    "[elm] 热替换无法暂停旧内核 Mixin 路由 cell={} generation={} error={:?}",
+                    id.0,
+                    old_generation.0,
+                    error
+                );
+                self.discard_native_import_stage(import_stage);
+                self.abort_image_trust(&trust);
+                let sources_restored = self.resume_projection_sources_for_cell(id, old_generation);
+                self.release_cell_execution(token);
+                if !sources_restored {
+                    self.quarantine_cell_after_hook_failure(id);
+                }
+                return PreparedNativeReplace::Immediate(self.replace_response(
+                    id,
+                    ELM_MGR_STATUS_BUSY,
+                    self.cell_state(id).unwrap_or(old_state),
+                    old_generation,
+                    0,
+                    ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                    ELM_POLICY_BLOCK_PROVIDER_BUSY,
+                ));
+            }
+        };
         let new_executor = loaded.lifecycle_executor();
         PreparedNativeReplace::Execute(NativeReplaceExecutionPlan {
             token,
@@ -7360,6 +7456,8 @@ impl ElmCore {
             suspended_projection_sources,
             unit: image.unit,
             loaded,
+            kernel_mixins,
+            kernel_mixin_suspension,
             exports,
             kernel_symbol_imports,
             kernel_symbol_capabilities,
@@ -7390,6 +7488,11 @@ impl ElmCore {
                     plan.old_resume.as_mut(),
                     outcome.old_execution,
                 );
+                let mixins_restored = if old_recovered {
+                    Self::restore_kernel_mixins(plan.kernel_mixin_suspension)
+                } else {
+                    false
+                };
                 let sources_restored = self.rollback_projection_source_replace(
                     plan.id,
                     plan.old_generation,
@@ -7398,7 +7501,7 @@ impl ElmCore {
                 self.abort_image_trust(&plan.trust);
                 self.discard_native_import_stage(plan.import_stage);
                 self.release_cell_execution(plan.token);
-                if !old_recovered || !sources_restored {
+                if !old_recovered || !mixins_restored || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
                 return self.replace_response(
@@ -7422,6 +7525,11 @@ impl ElmCore {
                     plan.old_resume.as_mut(),
                     outcome.old_execution,
                 );
+                let mixins_restored = if old_recovered {
+                    Self::restore_kernel_mixins(plan.kernel_mixin_suspension)
+                } else {
+                    false
+                };
                 let sources_restored = self.rollback_projection_source_replace(
                     plan.id,
                     plan.old_generation,
@@ -7429,7 +7537,7 @@ impl ElmCore {
                 );
                 self.discard_native_import_stage(plan.import_stage);
                 self.release_cell_execution(plan.token);
-                if !old_recovered || !sources_restored {
+                if !old_recovered || !mixins_restored || !sources_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
                 return self.replace_response(
@@ -7440,6 +7548,49 @@ impl ElmCore {
                     outcome.migrated_len as u32,
                     ELM_LIFECYCLE_REASON_LEASE_BUSY,
                     ELM_POLICY_BLOCK_RESOURCE_QUOTA,
+                );
+            }
+            if let Err(error) = super::kernel_mixin::replace(
+                plan.id,
+                plan.old_generation,
+                &plan.kernel_mixins,
+                plan.old_state == ElmState::Active,
+            ) {
+                log::error!(
+                    "[elm] 无法提交新代际内核 Mixin 路由 cell={} old_generation={} new_generation={} error={:?}",
+                    plan.id.0,
+                    plan.old_generation.0,
+                    plan.new_generation.0,
+                    error
+                );
+                let old_recovered = recover_old_replace_generation(
+                    &mut plan.old_executor,
+                    plan.old_resume.as_mut(),
+                    outcome.old_execution,
+                );
+                let mixins_restored = if old_recovered {
+                    Self::restore_kernel_mixins(plan.kernel_mixin_suspension)
+                } else {
+                    false
+                };
+                let sources_restored = self.rollback_projection_source_replace(
+                    plan.id,
+                    plan.old_generation,
+                    plan.new_generation,
+                );
+                self.discard_native_import_stage(plan.import_stage);
+                self.release_cell_execution(plan.token);
+                if !old_recovered || !mixins_restored || !sources_restored {
+                    self.quarantine_cell_after_hook_failure(plan.id);
+                }
+                return self.replace_response(
+                    plan.id,
+                    ELM_MGR_STATUS_INVALID,
+                    self.cell_state(plan.id).unwrap_or(plan.old_state),
+                    plan.old_generation,
+                    outcome.migrated_len as u32,
+                    ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+                    ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
                 );
             }
             let committed = super::source::commit_projection_source_generation(
@@ -7472,7 +7623,12 @@ impl ElmCore {
                     plan.old_resume.as_mut(),
                     outcome.old_execution,
                 );
-                if !sources_restored || !old_recovered {
+                let mixins_restored = Self::rollback_kernel_mixin_replace(
+                    plan.kernel_mixin_suspension,
+                    plan.new_generation,
+                    old_recovered,
+                );
+                if !sources_restored || !old_recovered || !mixins_restored {
                     self.quarantine_cell_after_hook_failure(plan.id);
                 }
                 self.discard_native_import_stage(plan.import_stage);
@@ -7487,6 +7643,7 @@ impl ElmCore {
                     ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
                 );
             }
+            super::kernel_mixin::commit_replace(plan.kernel_mixin_suspension, plan.new_generation);
             self.apply_image_trust_metadata(plan.id, &plan.trust);
             if plan
                 .old_executor
@@ -7518,6 +7675,11 @@ impl ElmCore {
             plan.old_resume.as_mut(),
             outcome.old_execution,
         );
+        let mixins_restored = if old_recovered {
+            Self::restore_kernel_mixins(plan.kernel_mixin_suspension)
+        } else {
+            false
+        };
         let sources_restored = self.rollback_projection_source_replace(
             plan.id,
             plan.old_generation,
@@ -7525,7 +7687,7 @@ impl ElmCore {
         );
         self.abort_image_trust(&plan.trust);
         self.discard_native_import_stage(plan.import_stage);
-        if !old_recovered || !sources_restored {
+        if !old_recovered || !mixins_restored || !sources_restored {
             self.quarantine_cell_after_hook_failure(plan.id);
         }
         self.release_cell_execution(plan.token);
@@ -7535,6 +7697,9 @@ impl ElmCore {
             outcome.blockers
         };
         if !sources_restored {
+            blockers |= ELM_POLICY_BLOCK_GRAPH_INCONSISTENT;
+        }
+        if !mixins_restored {
             blockers |= ELM_POLICY_BLOCK_GRAPH_INCONSISTENT;
         }
         let status = if outcome.commit && !current {
@@ -8209,12 +8374,45 @@ impl ElmCore {
         } else {
             None
         };
+        let kernel_mixin_suspension = if matches!(
+            action,
+            ElmLifecycleAction::Pause | ElmLifecycleAction::Detach
+        ) {
+            match super::kernel_mixin::suspend(id, token.generation) {
+                Ok(suspension) => Some(suspension),
+                Err(error) => {
+                    log::error!(
+                        "[elm] 生命周期事务无法暂停内核 Mixin 路由 cell={} generation={} action={:?} error={:?}",
+                        id.0,
+                        token.generation.0,
+                        action,
+                        error
+                    );
+                    self.release_cell_execution(token);
+                    let blockers = ELM_POLICY_BLOCK_PROVIDER_BUSY;
+                    return PreparedNativeLifecycle::Immediate(self.finish_lifecycle(
+                        action,
+                        self.lifecycle_response(
+                            id,
+                            ELM_MGR_STATUS_BUSY,
+                            ELM_LIFECYCLE_REASON_LEASE_BUSY,
+                            0,
+                            0,
+                        ),
+                        blockers,
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         PreparedNativeLifecycle::External(NativeLifecycleExecutionPlan {
             token,
             action,
             executor,
             work,
             source_suspension,
+            kernel_mixin_suspension,
         })
     }
 
@@ -8248,18 +8446,27 @@ impl ElmCore {
             let lifecycle_hook_failed =
                 outcome.blockers & ELM_POLICY_BLOCK_LIFECYCLE_HOOK_FAILED != 0;
             let resource_rollback_failed = outcome.resource_rollback_failed;
+            let mut blockers = outcome.blockers;
             if (lifecycle_hook_failed || resource_rollback_failed)
                 && let Some(suspension) = plan.source_suspension.take()
             {
                 let _ = suspension.keep_suspended();
+            }
+            if !lifecycle_hook_failed
+                && !resource_rollback_failed
+                && let Some(suspension) = plan.kernel_mixin_suspension.take()
+                && !Self::restore_kernel_mixins(suspension)
+            {
+                blockers |= ELM_POLICY_BLOCK_GRAPH_INCONSISTENT;
+                self.quarantine_cell_after_hook_failure(id);
             }
             if outcome.drained_resources != 0 || outcome.blockers & ELM_POLICY_BLOCK_LEASE_BUSY != 0
             {
                 self.push_resource_trace(
                     id.0,
                     u64::from(outcome.drained_resources),
-                    status_from_blockers(outcome.blockers),
-                    outcome.blockers,
+                    status_from_blockers(blockers),
+                    blockers,
                 );
             }
             if lifecycle_hook_failed {
@@ -8269,14 +8476,8 @@ impl ElmCore {
             }
             return self.finish_lifecycle(
                 plan.action,
-                self.lifecycle_response(
-                    id,
-                    status_from_blockers(outcome.blockers),
-                    outcome.reason,
-                    0,
-                    0,
-                ),
-                outcome.blockers,
+                self.lifecycle_response(id, status_from_blockers(blockers), outcome.reason, 0, 0),
+                blockers,
             );
         }
 
@@ -8287,7 +8488,15 @@ impl ElmCore {
                 {
                     let resources_resumed =
                         super::owned_resource::resume_owner(id, plan.token.generation).is_ok();
-                    if self.transition_cell_state(id, ElmState::Active).is_err() {
+                    let state_restored = self.transition_cell_state(id, ElmState::Active).is_ok();
+                    let mixins_restored = if resources_resumed && state_restored {
+                        plan.kernel_mixin_suspension
+                            .take()
+                            .is_none_or(Self::restore_kernel_mixins)
+                    } else {
+                        false
+                    };
+                    if !state_restored || !mixins_restored {
                         if let Some(suspension) = plan.source_suspension.take() {
                             let _ = suspension.keep_suspended();
                         }
@@ -8349,6 +8558,29 @@ impl ElmCore {
                         ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
                     );
                 }
+                if let Err(error) = super::kernel_mixin::resume(id, plan.token.generation) {
+                    log::error!(
+                        "[elm] 恢复内核 Mixin 路由失败 cell={} generation={} error={:?}",
+                        id.0,
+                        plan.token.generation.0,
+                        error
+                    );
+                    let _ = self.transition_cell_state(id, ElmState::Paused);
+                    let _ = super::owned_resource::suspend_owner(id, plan.token.generation);
+                    let _ = super::source::suspend_projection_sources(id, plan.token.generation);
+                    self.quarantine_cell_after_hook_failure(id);
+                    return self.finish_lifecycle(
+                        plan.action,
+                        self.lifecycle_response(
+                            id,
+                            ELM_MGR_STATUS_INVALID,
+                            ELM_LIFECYCLE_REASON_GRAPH_INCONSISTENT,
+                            0,
+                            0,
+                        ),
+                        ELM_POLICY_BLOCK_GRAPH_INCONSISTENT,
+                    );
+                }
                 self.finish_lifecycle(
                     plan.action,
                     self.lifecycle_response(id, ELM_MGR_STATUS_OK, ELM_LIFECYCLE_REASON_NONE, 0, 0),
@@ -8376,6 +8608,9 @@ impl ElmCore {
                 let response =
                     self.commit_detached_cell(id, plan.token.generation, source_suspension);
                 if response.status == ELM_MGR_STATUS_OK {
+                    if let Some(suspension) = plan.kernel_mixin_suspension.take() {
+                        suspension.retire();
+                    }
                     self.remove_native_image(id);
                 }
                 response
@@ -15049,7 +15284,11 @@ impl ElmCore {
     }
 
     fn native_unit_allowed_by_policy(&self, authority: ElmId, unit: &ElmEbiUnit) -> bool {
-        if !unit.has_native_code() && unit.imports.is_empty() && unit.exports.is_empty() {
+        if !unit.has_native_code()
+            && unit.imports.is_empty()
+            && unit.exports.is_empty()
+            && unit.kernel_mixins.is_empty()
+        {
             return true;
         }
         let Some(policy) = self
@@ -15063,6 +15302,83 @@ impl ElmCore {
         policy.native_flags & ELM_NATIVE_POLICY_EXECUTE != 0
             && (unit.imports.is_empty() || policy.native_flags & ELM_NATIVE_POLICY_IMPORT != 0)
             && (unit.exports.is_empty() || policy.native_flags & ELM_NATIVE_POLICY_EXPORT != 0)
+            && (unit.kernel_mixins.is_empty()
+                || policy.native_flags & ELM_NATIVE_POLICY_MIXIN_PATCH != 0
+                    && policy.extension_flags & ELM_EXTENSION_POLICY_MIXIN_PATCH != 0)
+    }
+
+    fn prepare_kernel_mixins(
+        id: ElmId,
+        generation: Generation,
+        image: &ElmEbiImage,
+        loaded: &LoadedElmImage,
+    ) -> Result<super::kernel_mixin::PreparedKernelMixins, ElmEbiLoadStatus> {
+        if image.unit.kernel_mixins.is_empty() {
+            return super::kernel_mixin::prepare(id, generation, &image.unit, loaded, [0; 32])
+                .map_err(super::kernel_mixin::map_load_status);
+        }
+        let fingerprint = image
+            .abi_fingerprint
+            .as_ref()
+            .ok_or(ElmEbiLoadStatus::AbiFingerprintRejected)?;
+        let current_profile = super::kernel_symbols::catalog_profile_hash()
+            .map_err(|_| ElmEbiLoadStatus::AbiFingerprintRejected)?;
+        if fingerprint.kernel_api_profile_hash == [0; 32]
+            || fingerprint.kernel_api_profile_hash != current_profile
+            || fingerprint.kernel_api_bridge_abi_version
+                != super::kernel_symbols::KERNEL_API_BRIDGE_ABI_VERSION
+        {
+            return Err(ElmEbiLoadStatus::AbiFingerprintRejected);
+        }
+        super::kernel_mixin::prepare(id, generation, &image.unit, loaded, current_profile)
+            .map_err(super::kernel_mixin::map_load_status)
+    }
+
+    fn retire_kernel_mixins(id: ElmId, generation: Generation) -> bool {
+        match super::kernel_mixin::suspend(id, generation) {
+            Ok(suspended) => {
+                suspended.retire();
+                true
+            }
+            Err(error) => {
+                log::error!(
+                    "[elm] 无法退役内核 Mixin 路由 cell={} generation={} error={:?}",
+                    id.0,
+                    generation.0,
+                    error
+                );
+                false
+            }
+        }
+    }
+
+    fn restore_kernel_mixins(suspended: super::kernel_mixin::SuspendedKernelMixins) -> bool {
+        match suspended.restore() {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!("[elm] 无法恢复内核 Mixin 路由 error={:?}", error);
+                false
+            }
+        }
+    }
+
+    fn rollback_kernel_mixin_replace(
+        suspended: super::kernel_mixin::SuspendedKernelMixins,
+        new_generation: Generation,
+        restore_old: bool,
+    ) -> bool {
+        match super::kernel_mixin::rollback_replace(suspended, new_generation, restore_old) {
+            Ok(()) => true,
+            Err(error) => {
+                log::error!(
+                    "[elm] 无法回滚内核 Mixin 热替换 generation={} restore_old={} error={:?}",
+                    new_generation.0,
+                    restore_old,
+                    error
+                );
+                false
+            }
+        }
     }
 
     pub(crate) fn cell_resource_usage(&self, id: ElmId) -> ElmResourceUsage {

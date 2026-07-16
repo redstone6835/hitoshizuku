@@ -46,6 +46,22 @@ pub unsafe fn call_elm_native(entry: usize, context: *mut u8, stack_top: usize) 
     result
 }
 
+/// 在当前任务内核栈上通过同一故障恢复门执行原生 ELM 入口。
+///
+/// 该入口供零分配热路径使用；调用方必须已经验证当前任务栈范围并配置 ELM guard。
+///
+/// # Safety
+///
+/// `entry` 和 `context` 必须满足 [`call_elm_native`] 的全部约束，当前栈还必须具有足够余量。
+pub unsafe fn call_elm_native_current_stack(entry: usize, context: *mut u8) -> i32 {
+    let interrupt_state = unsafe { LoongArch64InterruptOps::save_interrupt_state() };
+    unsafe { LoongArch64InterruptOps::enable_interrupts() };
+    // Safety: 零值栈顶由汇编门解释为在保存边界帧下方继续使用当前栈。
+    let result = unsafe { __loongarch64_elm_native_call(entry, context, 0) };
+    unsafe { LoongArch64InterruptOps::restore_interrupt_state(interrupt_state) };
+    result
+}
+
 /// 返回 trap frame 必须重定向到的固定恢复出口。
 pub fn elm_native_recovery_address() -> usize {
     __loongarch64_elm_native_return as *const () as usize
@@ -119,6 +135,9 @@ unsafe extern "C" fn __loongarch64_elm_native_call(
         "ld.d $t0, $sp, {entry_offset}",
         "ld.d $a0, $sp, {context_offset}",
         "ld.d $t1, $sp, {stack_top_offset}",
+        "bnez $t1, 1f",
+        "or $t1, $sp, $zero",
+        "1:",
         "addi.d $t1, $t1, -{native_return_frame_size}",
         "st.d $sp, $t1, {native_kernel_sp_offset}",
         "or $sp, $t1, $zero",

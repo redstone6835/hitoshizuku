@@ -1270,6 +1270,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - `DetachCell` 会阻断仍有子单元、依赖者、拓展项、忙碌租约、provider 队列/保留结果/运行中调用或 native export 被其他单元 import 的目标单元，避免破坏当前拓扑。
 - `ReplaceCell` 已支持所有已注册 Projection Source 的热替换入口：声明式 image 可直接提交 generation 和元数据更新；原生 image 支持迁移式事务，包括新镜像影子装载、初始化期 import 暂存、新 `initialize`、旧 `quiesce`、旧 `migrate_export`、新 `migrate_import`、暂存 import 提升、旧 `finalize`、失败 abort/finalize、旧代恢复、source 回滚和 generation 提交；Builtin/Memory 外部请求不进入替换事务。
 - 直接符号链路已经使用独立仓库 ELM 在 RISC-V64 与 LoongArch64 QEMU 中完成验证：镜像能够解析并调用 allocator 分配、释放、扩容、查询以及 `general::dev` 查询符号，随后完成 initialize、健康快照、finalize 和 detach。启动期 `kernel-tests` 同时覆盖目录校验、能力拒绝、可选槽、事务回滚和设备资源归属。
+- 内核符号级 Mixin 已完成 `HEAD/RETURN` 稳定链路：145 个导出符号中的 142 个函数生成 284 个真实站点，运行时使用零分配不可变路由、优先级处理链、continuation、故障禁用、暂停/恢复和 generation 事务。`tests/elm/kernel-mixin` 已在 LoongArch64 QEMU 中对真实 `allocator.GlobalAlloc.alloc` 完成首次装载、参数修改、覆盖、返回值观察、迁移拒绝回滚、成功热替换和卸载验证；189 项启动期内核测试同时通过。
 
 ## 18. 运行期 smoke 测试链路
 
@@ -1311,7 +1312,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 1. 中立 crate `libs/kernel-symbols` 定义描述符、能力组和 `#[kernel_symbols::export]`。描述符可以登记经过审核的自由函数、固有方法和非 `static mut` 静态对象；方法接收者是 Rust ABI 的正式组成部分，静态对象则按其真实地址参与重定位。泛型、async、const 和显式外部 ABI 仍不进入当前稳定目录。
 2. `cargo elm profile-export` 从目标架构实际生成的 `allocator`、`general`、`log`、`sched` `.rlib/.rmeta` 提取精确 crate metadata、依赖闭包和 Rust 链接符号。外部工程中的同名 façade 在正式 bare-metal 构建中只 `pub use` 这些 metadata 暴露的真实类型与方法，不保存手写类型副本或第二份运行状态。接口包另外附带与接口摘要绑定的只读 LSP 源码投影，使 rust-analyzer 能定位真实模块、类型、方法和文档。ELM 工程默认启用只用于分析的 `elm-lsp` feature；正式 `cargo elm build` 传入 `--no-default-features`，把 façade 后端切回目标专属 metadata，并且不会编译源码投影。
 3. 普通源码调用由 rustc 产生真实 Rust 符号引用；打包器依据目标接口清单把稳定链接名和审核过的 mangled alias 统一转换为 EBI `kernel-symbol` import。导出工具会重新从源码计算对应公开方法 ABI，接收者或参数不一致时直接拒绝生成接口包。`#[elm::kernel_symbol]` 只保留给确实需要手工声明固定槽的底层场景。
-4. 镜像 ABI 指纹绑定目标架构、target spec、panic 策略、`elmapi` 和内核符号描述符 ABI；只有镜像实际导入 `exact-rust` 符号时才要求同一 rustc。单个内核符号按名称、契约、版本、能力和完整 Rust ABI 摘要逐项匹配，未被镜像导入的私有实现或其它公开符号变化不会使装载失败。接口包的 `source_hash` 只服务 LSP/缓存，`interface_hash` 是规范公开符号集合的 API Profile 摘要，`framework_hash` 绑定开发框架完整文件分发；三者都不替代逐导入校验。
+4. 镜像 ABI 指纹绑定目标架构、target spec、panic 策略、`elmapi` 和内核符号描述符 ABI；只有镜像实际导入 `exact-rust` 符号时才要求同一 rustc。单个内核符号按名称、契约、版本、能力和完整 Rust ABI 摘要逐项匹配，未被镜像导入的私有实现或其它公开符号变化不会使装载失败。`interface_hash` 是规范公开符号集合的 API Profile 摘要，`framework_hash` 绑定开发框架完整文件分发；`source_hash` 除服务 LSP 和构建缓存外，还绑定内核符号级 Mixin 的精确源码站点，因此声明 Mixin 的镜像必须与运行中站点逐字段一致。三类摘要用途相互独立，都不替代逐导入校验。
 5. 装载器先验证链接目录结构和三元身份唯一性，再按父 cell 的 `kernel_symbol_capabilities` 上限解析每个导入。`CORE_SAFE`、普通 allocator 内存和 allocator 诊断属于默认安全组；物理内存、allocator 管理以及所有设备能力属于特权组，外部镜像必须经过签名验证并由合法 authority 显式批准。能力判定只发生在地址提交前，不存在可复用 grant 或每次调用 token。
 6. 地址写入模块可写导入槽并完成重定位后，业务调用直接进入常驻 Rust 实现。`elm-mgr`、namespace 查询、provider dispatch 和管理 syscall 都不在数据路径上；运行时只继续提供当前 cell 上下文、故障边界、预算计量和长期资源归属钩子。
 7. 热替换会为新镜像重新解析全部直接符号并重新执行能力裁决，失败时不改变旧 generation。内核符号本身常驻且不按 ELM generation 路由；ELM 间的 `direct-pinned` import 仍按原有 generation 规则处理，二者不能混淆。
@@ -1319,6 +1320,26 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 `allocator` 接口 crate 直接实现与内核同名的 `KernelMemorySubsystem` 和 `KERNEL_ALLOCATOR`。普通 `GlobalAlloc`、分配查询、物理页和地址转换入口分别映射到能力组；当前 ELM 调用门通过 allocator 的中立计量回调自动识别 owner、执行预算预留/调整/释放。接口 crate 自身不包含 allocator 算法或第二份堆状态。
 
 固定线协议仍禁止直接放入 `Vec`、`String`、trait object 或 Rust 引用，因此 provider、受管 export、mixin payload 和迁移数据必须使用稳定编码。内核直接符号属于同构 Rust ABI，可以按经审核的真实签名传递 `Arc`、trait object 和其它 Rust 类型；其安全前提是实际导入符号的完整 ABI 摘要与 rustc 要求全部满足，并且长期对象必须在 finalize/detach 前释放或由常驻子系统登记到资源归属链。
+
+### 内核符号级 Mixin
+
+内核符号级 Mixin 与 ELM 间的声明式补缀点是两条不同链路。前者直接附着到
+`#[kernel_symbols::export]` 登记的真实 Rust 函数或方法，目标函数仍是唯一实现，不需要在业务
+源码中手写 patch point，也不经过 provider、`elm-mgr` 管理调用或固定线格式 payload。
+
+1. `#[kernel_symbols::export]` 为每个可导出函数生成 `HEAD` 和 `RETURN` 两个站点描述符，并把原函数体包进同构 Rust 调用帧。站点没有处理器时只进行两个原子空指针快查后直接执行原函数体；运行时不会查询 Core、图或字符串目录。
+2. `cargo elm profile-export` 从同一份源码重新计算 `source_hash`、规范函数 token 摘要、站点摘要和调用帧 ABI 摘要。`cargo elm build` 根据 `target_api + selector + ordinal` 解析唯一站点，把完整身份和固定处理器 ABI 写入 EKI `KernelMixins` 表；装载器拒绝任何字段不一致、处理器符号缺失、站点类别不兼容或重复声明。
+3. 外部模块使用 `#[elm::mixin(target = "crate-or-prefix")]` 标记一个安全、非泛型固有 `impl`。当前稳定方法 attribute 为 `#[elm::inject(method = "...", at = "head|return", priority = N)]`、`#[elm::modify_arg(method = "...", priority = N)]`、`#[elm::modify_return(method = "...", priority = N)]` 和 `#[elm::overwrite(method = "...", priority = N)]`。处理器签名统一为 `fn(&self, &mut KernelMixinContext<'_>) -> HookResult`，开发者不手写 `extern`、导出名或 trampoline。
+4. `inject`、`modify_arg` 和 `modify_return` 属于自动继续处理器；`overwrite` 属于 continuation 处理器，必须通过 `context.proceed()` 进入下一覆盖或原函数，或者通过 `cancel`/`set_result` 明确产生结果。相同站点按“优先级降序、cell ID 升序、generation 升序、处理器地址升序”形成确定性不可变处理链。
+5. 参数、返回值和 continuation 只在当前同步内核栈帧中有效。`KernelMixinContext` 不能构造、复制、跨线程发送或保存；类型化访问还会检查槽大小、对齐、类型名称、只读位和初始化状态。native fault、panic、超时或协议错误会禁用故障处理器并回退到下一处理器或原逻辑，不允许一个故障处理器持续破坏热路径。
+6. 暂停会原子撤下该 generation 的全部处理器，恢复会原样重建路由。热替换先准备新镜像和新处理器，旧 generation 在迁移事务中进入 suspended 集；失败时恢复旧不可变路由，成功时一次发布新 generation 并退役旧路由。卸载必须先撤路由并等待读侧计数归零，再释放镜像代码。
+7. `mode = "y"` 不保留动态处理器 trampoline 或 EKI Mixin 元数据。集成组件若需要编译期侵入行为，必须使用普通 Rust 组合或内核构建规则，不能伪装成运行时 Mixin。
+8. 当前稳定站点范围严格限定为函数 `HEAD` 和 `RETURN`。内部调用前后、局部变量和字段访问虽然已经预留站点类别与 ABI 常量，但没有生成器；`redirect`、`wrap_operation` 和 `modify_local` 会在编译期以 `TODO(ELM-MIR)` 拒绝。它们必须由后续带完整类型、借用和控制流信息的 MIR 级织入器实现，禁止用 proc-macro 猜测表达式语义。
+
+仓库中的 `tests/elm/kernel-mixin` 使用真实 `allocator.GlobalAlloc.alloc` 验证 `inject(head)`、
+`modify_arg`、`overwrite + proceed` 和 `modify_return`。自动 QEMU 链路覆盖首次装载、暂停、恢复、
+迁移拒绝回滚、成功替换、generation 切换、卸载和 Core health，不使用测试 shim 或预定义业务
+补缀点。
 
 ### Rust ELM 独立仓库开发框架
 
@@ -1479,7 +1500,7 @@ let policy = manager
 - `#[elm::kernel_symbol(...)]` 声明由内核直接符号目录解析的 `DirectImport<F>`。宏验证显式 ABI 字符串与函数指针类型一致；打包器裁剪未链接槽，装载器完成目录、接口指纹、能力和地址校验后才允许模块进入生命周期入口。
 - `#[elm::export(...)]` 在 `managed` 模式生成固定调用帧 trampoline，在 `direct-pinned` 模式导出真实 Rust 函数并写入规范签名摘要；工具拒绝名称、符号、模式或摘要不一致的元数据。
 - `#[elm::payload("contract@version")]` 为具名字段结构体生成固定小端线编码，只接受定宽整数、`bool` 和 `[u8; N]`，v1 总尺寸不得超过 256 字节。
-- `#[elm::mixin_point(..., stages(...))]` 把普通安全 Rust 函数包装为 ingress、substitute、egress、observe 补缀点；`#[elm::mixin(...)]` 生成对应 provider 和拓展声明，支持完整有符号优先级。
+- `#[elm::mixin_point(..., stages(...))]` 把普通安全 Rust 函数包装为 ingress、substitute、egress、observe 声明式补缀点；`#[elm::mixin(...)]` 标记独立函数时生成对应 provider 和拓展声明，标记固有 `impl` 时则声明内核符号级 Mixin。固有 `impl` 当前稳定支持 `inject`、`modify_arg`、`modify_return` 和 `overwrite`；`modify_local`、`redirect`、`wrap_operation` 明确等待 `TODO(ELM-MIR)`，不会生成不完整运行时代码。
 - 宏在编译期拒绝手写 `extern`、`unsafe fn`、泛型 ABI 函数、非法契约、无效版本范围、重复 stage、超长补缀点和越界优先级；打包器再次执行独立的元数据与 EBI 校验。
 
 attribute 生成的记录位于非装载段 `.elm.meta`。该段使用 `ELMMETA1` 固定记录、字段排序、CRC32 和零填充规则，不能进入任何 `PT_LOAD`；`cargo elm` 只读取该协议，不依赖 Rust 符号修饰规则，也不会从函数名猜测拓扑。`y` 构建会在编译期完全排除 `.elm.meta`、ELM ABI trampoline 和 ELM 描述符，只保留普通内核 initcall 描述符。
@@ -1619,6 +1640,7 @@ qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
 当前剩余主线：
 
 - 内核直接符号导出：当前已完成 allocator 与 `general::dev` 的真实 Rust 符号、同名接口 crate、能力策略和资源归属链；后续子系统必须沿相同目录协议分批审核，不能重新引入 namespace 函数表或占位接口。计划迁出内核的网络栈不从常驻实现导出。
+- MIR 级 Mixin 织入器：当前 `HEAD/RETURN` 已稳定，后续若需要内部调用、局部变量或字段站点，必须以独立编译器组件实现类型化站点发现、借用保持、控制流重写和可复现站点身份；在此之前对应 attribute 保持编译期 `TODO(ELM-MIR)` 拒绝。
 - 子系统 provider：设备、VFS、网络、IRQ、DMA、MMIO 等真实能力必须在各自子系统内部实现并显式注册。
 - 用户态管理工具：补齐面向实际部署的策略编辑、镜像仓库、交互式诊断和运维工作流。
 - ELM 调试与发布生态：补齐调试符号归档、IDE 映射、依赖锁定、可复现发布索引和镜像仓库；attribute、独立仓库模板、双架构 PIE、EKI、签名和运行期装载链路已经具备。

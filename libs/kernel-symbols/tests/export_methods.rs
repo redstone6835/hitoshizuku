@@ -35,6 +35,18 @@ impl Counter {
     pub fn read_arc(self: &Arc<Self>) -> u64 {
         self.0
     }
+
+    #[kernel_symbols::export(
+        name = "tests.Counter.local_semantics",
+        contract = "kernel.tests.counter@1",
+        version = 1,
+        capabilities = capability::CORE_SAFE
+    )]
+    pub fn local_semantics(&self, value: u64) -> u64 {
+        let add = || self.0;
+        let borrowed = &value;
+        add() + *borrowed
+    }
 }
 
 #[test]
@@ -45,5 +57,6 @@ fn exported_inherent_methods_remain_callable() {
     assert_eq!(counter.read(), 7);
     let counter = Arc::new(counter);
     assert_eq!(counter.read_arc(), 7);
+    assert_eq!(counter.local_semantics(5), 12);
     assert!(core::mem::size_of::<KernelSymbolDescriptorV1>() >= 96);
 }

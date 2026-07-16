@@ -21,7 +21,7 @@
 //!
 //! - `module`：外部 ELM 的最小编译面，包含稳定 ABI 类型和安全开发包装；
 //! - `macros`：重导出根模块、provider、import/export、payload 和 mixin attribute；
-//! - `management`：仅供受授权 Manager 类型 ELM 使用的 [`management::Client`]；
+//! - `management`：仅供受授权 Manager 类型 ELM 使用的 `management::Client`；
 //! - `runtime-model`：内核侧运行时模型，默认启用，不应成为普通外部 ELM 的依赖。
 //! - `elm-integrated`：由 `cargo elm` 在 `mode = "y"` 时内部启用，模块作者不应手工选择。
 //!
@@ -64,7 +64,7 @@
 //! # 开发 API 分层
 //!
 //! - [`runtime`]：所有普通 ELM 都可使用的当前上下文、日志和主动中止接口；
-//! - [`management`]：Manager ELM 的类型化控制、查询、装载、热替换和策略接口；
+//! - `management`：Manager ELM 的类型化控制、查询、装载、热替换和策略接口；
 //! - [`ElmPayload`]：跨单元固定载荷的编码协议，通常由 [`payload`] 生成；
 //! - [`ManagedImport`]：推荐的受管 import 槽，提供代际路由和回复校验；
 //! - [`ProviderRequest`]、[`ManagedRequest`] 和 [`SnapshotRequest`]：宏 trampoline 已校验后
@@ -120,6 +120,7 @@ pub mod frame;
 #[cfg(feature = "runtime-model")]
 pub mod graph;
 pub mod ids;
+pub mod kernel_mixin;
 pub mod kind;
 #[cfg(feature = "runtime-model")]
 pub mod lease;
@@ -202,6 +203,7 @@ pub use kernel_symbols::KernelIntegratedComponentV1;
 #[doc(hidden)]
 pub mod __private {
     pub use crate::developer::__private::*;
+    pub use crate::kernel_mixin::kernel_mixin_trampoline;
 }
 #[cfg(feature = "runtime-model")]
 pub use ebi::{
@@ -214,33 +216,35 @@ pub use ebi::{
     ELM_EBI_IMPORT_FLAG_DIRECT_PINNED, ELM_EBI_IMPORT_FLAG_EXACT_RUST_API,
     ELM_EBI_IMPORT_FLAG_KERNEL_STATIC, ELM_EBI_IMPORT_FLAG_KERNEL_SYMBOL,
     ELM_EBI_IMPORT_FLAG_MANAGED, ELM_EBI_IMPORT_FLAG_OPTIONAL, ELM_EBI_IMPORT_FLAGS_MASK,
-    ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS, ELM_EBI_MAX_EXTENSION_POINTS,
-    ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS, ELM_EBI_MAX_PROVIDER_PORTS,
-    ELM_EBI_MAX_RELOCATIONS, ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN,
+    ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN, ELM_EBI_MAX_DEPENDENCIES, ELM_EBI_MAX_EXPORTS,
+    ELM_EBI_MAX_EXTENSION_POINTS, ELM_EBI_MAX_EXTENSIONS, ELM_EBI_MAX_IMPORTS,
+    ELM_EBI_MAX_KERNEL_MIXINS, ELM_EBI_MAX_PROVIDER_PORTS, ELM_EBI_MAX_RELOCATIONS,
+    ELM_EBI_MAX_SEGMENTS, ELM_EBI_MAX_SYMBOL_LOCATIONS, ELM_EBI_NAME_LEN,
     ELM_EBI_RELOCATION_FLAG_NONE, ELM_EBI_RUST_ABI_HASH_LEN, ELM_EBI_RUST_ABI_VERSION,
     ELM_EBI_SEGMENT_FLAG_EXECUTE, ELM_EBI_SEGMENT_FLAG_READ, ELM_EBI_SEGMENT_FLAG_RELOCATION_INPUT,
     ELM_EBI_SEGMENT_FLAG_WRITE, ELM_EBI_SEGMENT_FLAG_ZERO_FILL, ELM_EBI_SEGMENT_SOURCE_NONE,
     ELM_EBI_SYMBOL_FLAG_NONE, ELM_EBI_SYMBOL_LOCATION_FLAG_NONE, ELM_EBI_SYMBOL_NAME_LEN,
     ELM_EKI_PROJECTION_SOURCE_ID, ELM_MIGRATION_STATE_MAX, ElmEbiApiCompatibility, ElmEbiArch,
     ElmEbiDependencyDecl, ElmEbiEntry, ElmEbiExportDecl, ElmEbiExtensionDecl,
-    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiLifecycleHookDecl,
-    ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiMenuDecl, ElmEbiProviderPortDecl,
-    ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature, ElmEbiSegment,
-    ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget, ElmEbiUnit,
-    ElmImageReader, ElmSliceImageReader, default_segment_flags, relocation_width,
+    ElmEbiExtensionPointDecl, ElmEbiImage, ElmEbiImportDecl, ElmEbiKernelMixinDecl,
+    ElmEbiLifecycleHookDecl, ElmEbiLifecycleHookKind, ElmEbiLifecycleHooks, ElmEbiMenuDecl,
+    ElmEbiProviderPortDecl, ElmEbiRelocationDecl, ElmEbiRelocationKind, ElmEbiRustHookSignature,
+    ElmEbiSegment, ElmEbiSegmentKind, ElmEbiSegmentPayload, ElmEbiSymbolLocationDecl, ElmEbiTarget,
+    ElmEbiUnit, ElmImageReader, ElmKernelMixinKind, ElmSliceImageReader, default_segment_flags,
+    relocation_width,
 };
 #[cfg(feature = "runtime-model")]
 pub use eki::{
     ELM_EKI_ABI_FINGERPRINT_BLOCK_SIZE, ELM_EKI_BLOCK_DESC_SIZE, ELM_EKI_BLOCK_FLAG_REQUIRED,
     ELM_EKI_ELMAPI_BLOCK_SIZE, ELM_EKI_ELMAPI_BLOCK_VERSION, ELM_EKI_ENTRY_SYMBOL_LEN,
-    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE, ELM_EKI_MAGIC,
-    ELM_EKI_MANIFEST_NAME_LEN, ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_MAX_BLOCKS,
-    ELM_EKI_MAX_VARIANTS, ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE,
-    ELM_EKI_PROVIDER_PORT_RECORD_SIZE, ELM_EKI_RELOCATION_RECORD_SIZE,
-    ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE, ELM_EKI_VARIANT_DIRECTORY_VERSION,
-    ELM_EKI_VARIANT_RECORD_SIZE, ElmEkiBlockDesc, ElmEkiBlockKind, ElmEkiHeader, ElmEkiSelector,
-    ElmEkiVariantRecord, parse_eki_ebi_unit, parse_eki_image, parse_eki_image_for,
-    parse_eki_variants,
+    ELM_EKI_FORMAT_VERSION, ELM_EKI_HEADER_SIZE, ELM_EKI_IMAGE_HASH_SHA256_SIZE,
+    ELM_EKI_KERNEL_MIXIN_RECORD_SIZE, ELM_EKI_MAGIC, ELM_EKI_MANIFEST_NAME_LEN,
+    ELM_EKI_MANIFEST_VERSION_LEN, ELM_EKI_MAX_BLOCKS, ELM_EKI_MAX_VARIANTS,
+    ELM_EKI_PROOF_ALGORITHM_ED25519, ELM_EKI_PROOF_BLOCK_SIZE, ELM_EKI_PROVIDER_PORT_RECORD_SIZE,
+    ELM_EKI_RELOCATION_RECORD_SIZE, ELM_EKI_SYMBOL_LOCATION_RECORD_SIZE,
+    ELM_EKI_VARIANT_DIRECTORY_VERSION, ELM_EKI_VARIANT_RECORD_SIZE, ElmEkiBlockDesc,
+    ElmEkiBlockKind, ElmEkiHeader, ElmEkiSelector, ElmEkiVariantRecord, parse_eki_ebi_unit,
+    parse_eki_image, parse_eki_image_for, parse_eki_variants,
 };
 #[cfg(feature = "runtime-model")]
 pub use elmapi::kernel_interface_manifest_v1;
@@ -280,6 +284,7 @@ pub use graph::{
 pub use ids::{
     ActionId, BindingId, ELM_EKI_BUILTIN_ID, ELM_MGR_BUILTIN_ID, ElmId, Generation, LeaseId, PortId,
 };
+pub use kernel_mixin::{KernelMixinContext, KernelMixinFrameV1};
 /// 内核直接符号按装载期策略划分的能力组。
 pub use kernel_symbols::capability as kernel_symbol_capability;
 pub use kind::ElmKind;

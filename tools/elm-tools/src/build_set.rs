@@ -414,11 +414,12 @@ fn selected_interface(target: &str) -> Result<crate::project::KernelInterfaceBun
 fn interface_repository_root(
     interface: &crate::project::KernelInterfaceBundle,
 ) -> Result<PathBuf, String> {
-    interface
-        .root
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "接口包目录层级无效".to_string())
+    if !interface.root.join("manifest.txt").is_file()
+        || !interface.root.join("framework/Cargo.toml").is_file()
+    {
+        return Err("接口包目录缺少 manifest.txt 或 framework/Cargo.toml".to_string());
+    }
+    Ok(interface.root.clone())
 }
 
 fn inspect_managed_module(

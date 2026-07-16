@@ -30,6 +30,7 @@ members = [
 exclude = [
     "drivers/virtio",
     "drivers/virtio-blk",
+    "tests/elm/kernel-mixin",
 ]
 
 [workspace.package]

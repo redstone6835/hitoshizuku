@@ -119,6 +119,24 @@ fn ebi_unit(name: &str) -> ElmEbiUnit {
 }
 
 #[test]
+fn ebi_protocol_rejects_kernel_mixin_without_native_code() {
+    let mixin = crate::ElmEbiKernelMixinDecl::new(
+        "allocator.GlobalAlloc.alloc",
+        "head",
+        "__elm_kernel_mixin_trace_alloc",
+        crate::ElmKernelMixinKind::Inject,
+        0,
+    )
+    .unwrap()
+    .with_site_identity(0, [1; 32], [2; 32], [3; 32], [4; 32], [5; 32], [6; 32]);
+    let unit = ebi_unit("kernel-mixin-without-code").with_kernel_mixin(mixin);
+    assert_eq!(
+        unit.validate(ElmEbiArch::Any),
+        Err(ElmEbiLoadStatus::InvalidManifest)
+    );
+}
+
+#[test]
 fn ebi_direct_symbols_require_exact_rust_abi_hashes() {
     assert_eq!(
         ElmEbiExportDecl::new("test.legacy", "test.legacy@1", 1, 0, [0; 32]),
@@ -2927,7 +2945,11 @@ fn ebi_source_request_is_fixed_layout() {
         kernel_symbols.flags,
         crate::ELM_EBI_SOURCE_FLAG_AUTHORIZE_PRIVILEGED_SYMBOLS
     );
-    assert_eq!(ElmEbiSourceKind::from_raw(5), None);
+    assert_eq!(
+        ElmEbiSourceKind::from_raw(5),
+        Some(ElmEbiSourceKind::BuildBound)
+    );
+    assert_eq!(ElmEbiSourceKind::from_raw(6), None);
 }
 
 #[test]

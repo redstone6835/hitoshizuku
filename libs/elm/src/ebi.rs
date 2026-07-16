@@ -41,6 +41,8 @@ pub const ELM_EBI_MAX_DEPENDENCIES: usize = 16;
 pub const ELM_EBI_MAX_EXTENSION_POINTS: usize = 16;
 /// `ELM_EBI_MAX_EXTENSIONS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_EXTENSIONS: usize = 16;
+/// 单个 EBI 单元允许声明的内核符号级 Mixin 处理器上限。
+pub const ELM_EBI_MAX_KERNEL_MIXINS: usize = 256;
 /// `ELM_EBI_MAX_PROVIDER_PORTS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
 pub const ELM_EBI_MAX_PROVIDER_PORTS: usize = 16;
 /// `ELM_EBI_MAX_IMPORTS` 当前 ABI 允许的硬上限；构造器和解析器必须在分配或复制前检查该限制。
@@ -59,6 +61,8 @@ pub const ELM_EBI_MAX_RELOCATIONS: usize = 512;
 pub const ELM_EBI_NAME_LEN: usize = 128;
 /// `ELM_EBI_SYMBOL_NAME_LEN` 固定布局使用的字节长度或对齐值；不得用宿主平台的隐式布局替代。
 pub const ELM_EBI_SYMBOL_NAME_LEN: usize = 128;
+/// 内核 Mixin 源码站点 selector 的固定最大长度。
+pub const ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN: usize = 128;
 /// 直接固定 Rust 符号签名使用的完整 SHA-256 摘要长度。
 pub const ELM_EBI_RUST_ABI_HASH_LEN: usize = 32;
 /// 表示该 EBI 段没有外部 payload 来源，通常用于 BSS 零填充段。
@@ -125,6 +129,84 @@ pub const ELM_EBI_SYMBOL_LOCATION_FLAG_NONE: u32 = 0;
 pub const ELM_EBI_RELOCATION_FLAG_NONE: u32 = 0;
 /// `ELM_EBI_RUST_ABI_VERSION` 所属结构或协议的版本号；生产者和消费者必须据此执行兼容性检查。
 pub const ELM_EBI_RUST_ABI_VERSION: u16 = 1;
+
+/// 内核符号级 Mixin 处理器类别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum ElmKernelMixinKind {
+    /// 在目标站点执行普通注入，完成后由运行时继续处理链。
+    Inject = kernel_symbols::KERNEL_MIXIN_HANDLER_INJECT,
+    /// 修改函数或调用参数。
+    ModifyArgument = kernel_symbols::KERNEL_MIXIN_HANDLER_MODIFY_ARGUMENT,
+    /// 修改函数或调用返回值。
+    ModifyReturn = kernel_symbols::KERNEL_MIXIN_HANDLER_MODIFY_RETURN,
+    /// 修改源码可见的局部变量。
+    ModifyLocal = kernel_symbols::KERNEL_MIXIN_HANDLER_MODIFY_LOCAL,
+    /// 重定向一个源码可见调用。
+    Redirect = kernel_symbols::KERNEL_MIXIN_HANDLER_REDIRECT,
+    /// 用 continuation 包装一个源码可见操作。
+    WrapOperation = kernel_symbols::KERNEL_MIXIN_HANDLER_WRAP_OPERATION,
+    /// 覆盖目标函数，并可显式调用下一覆盖或原函数。
+    Overwrite = kernel_symbols::KERNEL_MIXIN_HANDLER_OVERWRITE,
+}
+
+impl ElmKernelMixinKind {
+    /// 从固定协议数值恢复处理器类别。
+    pub const fn from_raw(raw: u16) -> Option<Self> {
+        match raw {
+            kernel_symbols::KERNEL_MIXIN_HANDLER_INJECT => Some(Self::Inject),
+            kernel_symbols::KERNEL_MIXIN_HANDLER_MODIFY_ARGUMENT => Some(Self::ModifyArgument),
+            kernel_symbols::KERNEL_MIXIN_HANDLER_MODIFY_RETURN => Some(Self::ModifyReturn),
+            kernel_symbols::KERNEL_MIXIN_HANDLER_MODIFY_LOCAL => Some(Self::ModifyLocal),
+            kernel_symbols::KERNEL_MIXIN_HANDLER_REDIRECT => Some(Self::Redirect),
+            kernel_symbols::KERNEL_MIXIN_HANDLER_WRAP_OPERATION => Some(Self::WrapOperation),
+            kernel_symbols::KERNEL_MIXIN_HANDLER_OVERWRITE => Some(Self::Overwrite),
+            _ => None,
+        }
+    }
+
+    /// 返回该类别要求的固定处理器标志。
+    pub const fn required_flags(self) -> u16 {
+        match self {
+            Self::Inject | Self::ModifyArgument | Self::ModifyReturn | Self::ModifyLocal => {
+                kernel_symbols::KERNEL_MIXIN_HANDLER_FLAG_AUTO_CONTINUE
+            }
+            Self::Redirect | Self::WrapOperation | Self::Overwrite => {
+                kernel_symbols::KERNEL_MIXIN_HANDLER_FLAG_CONTINUATION
+            }
+        }
+    }
+
+    /// 返回该处理器类别是否允许挂接到给定站点类别。
+    pub const fn accepts_site(self, site_kind: u16) -> bool {
+        match self {
+            Self::Inject => matches!(
+                site_kind,
+                kernel_symbols::KERNEL_MIXIN_SITE_HEAD
+                    | kernel_symbols::KERNEL_MIXIN_SITE_RETURN
+                    | kernel_symbols::KERNEL_MIXIN_SITE_CALL_BEFORE
+                    | kernel_symbols::KERNEL_MIXIN_SITE_CALL_AFTER
+                    | kernel_symbols::KERNEL_MIXIN_SITE_LOCAL
+                    | kernel_symbols::KERNEL_MIXIN_SITE_FIELD
+            ),
+            Self::ModifyArgument => matches!(
+                site_kind,
+                kernel_symbols::KERNEL_MIXIN_SITE_HEAD
+                    | kernel_symbols::KERNEL_MIXIN_SITE_CALL_BEFORE
+            ),
+            Self::ModifyReturn => matches!(
+                site_kind,
+                kernel_symbols::KERNEL_MIXIN_SITE_RETURN
+                    | kernel_symbols::KERNEL_MIXIN_SITE_CALL_AFTER
+            ),
+            Self::ModifyLocal => site_kind == kernel_symbols::KERNEL_MIXIN_SITE_LOCAL,
+            Self::Redirect | Self::WrapOperation => {
+                site_kind == kernel_symbols::KERNEL_MIXIN_SITE_CALL_BEFORE
+            }
+            Self::Overwrite => site_kind == kernel_symbols::KERNEL_MIXIN_SITE_HEAD,
+        }
+    }
+}
 
 /// `ELM_EBI_HOOK_FLAG_NONE` 协议标志位；可在所属字段允许时与同组标志按位或组合。
 pub const ELM_EBI_HOOK_FLAG_NONE: u32 = 0;
@@ -1141,6 +1223,114 @@ impl ElmEbiExtensionDecl {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// 一个精确绑定到内核导出函数源码站点的原生 Mixin 处理器声明。
+///
+/// 该声明不依赖传统 extension point、provider 或线格式载荷。构建工具必须从所选内核
+/// 接口清单解析 `target_api + selector`，并把完整站点摘要固化到镜像；装载器只接受与
+/// 当前内核目录逐字段一致的声明。
+pub struct ElmEbiKernelMixinDecl {
+    /// 目标内核函数的稳定 API 路径。
+    pub target_api: String,
+    /// 目标函数内部的精确源码站点 selector。
+    pub selector: String,
+    /// ELM 镜像内固定处理器 trampoline 的符号名称。
+    pub handler_symbol: String,
+    /// 处理器行为类别。
+    pub kind: ElmKernelMixinKind,
+    /// 处理链控制标志，必须与 `kind` 的固定语义完全一致。
+    pub flags: u16,
+    /// 同一站点中的优先级；数值较大者先执行。
+    pub priority: i32,
+    /// 站点在目标函数中的稳定遍历序号。
+    pub ordinal: u32,
+    /// 构建该模块时选择的完整内核 API Profile 摘要。
+    pub profile_hash: [u8; 32],
+    /// 产生站点目录的 allocator/general 接口源码摘要。
+    pub source_hash: [u8; 32],
+    /// 目标函数规范 token 摘要。
+    pub function_hash: [u8; 32],
+    /// 目标站点完整身份摘要。
+    pub site_hash: [u8; 32],
+    /// 目标调用帧 Rust ABI 摘要。
+    pub frame_abi_hash: [u8; 32],
+    /// 固定处理器调用约定摘要。
+    pub handler_abi_hash: [u8; 32],
+}
+
+impl ElmEbiKernelMixinDecl {
+    /// 构造尚未绑定内核目录摘要的处理器声明。
+    pub fn new(
+        target_api: impl Into<String>,
+        selector: impl Into<String>,
+        handler_symbol: impl Into<String>,
+        kind: ElmKernelMixinKind,
+        priority: i32,
+    ) -> Result<Self, ElmEbiLoadStatus> {
+        let target_api = target_api.into();
+        let selector = selector.into();
+        let handler_symbol = handler_symbol.into();
+        validate_symbol_name(&target_api)?;
+        validate_kernel_mixin_selector(&selector)?;
+        validate_symbol_name(&handler_symbol)?;
+        Ok(Self {
+            target_api,
+            selector,
+            handler_symbol,
+            kind,
+            flags: kind.required_flags(),
+            priority,
+            ordinal: 0,
+            profile_hash: [0; 32],
+            source_hash: [0; 32],
+            function_hash: [0; 32],
+            site_hash: [0; 32],
+            frame_abi_hash: [0; 32],
+            handler_abi_hash: [0; 32],
+        })
+    }
+
+    /// 固化由内核接口清单解析出的完整站点身份。
+    #[allow(clippy::too_many_arguments)]
+    pub const fn with_site_identity(
+        mut self,
+        ordinal: u32,
+        profile_hash: [u8; 32],
+        source_hash: [u8; 32],
+        function_hash: [u8; 32],
+        site_hash: [u8; 32],
+        frame_abi_hash: [u8; 32],
+        handler_abi_hash: [u8; 32],
+    ) -> Self {
+        self.ordinal = ordinal;
+        self.profile_hash = profile_hash;
+        self.source_hash = source_hash;
+        self.function_hash = function_hash;
+        self.site_hash = site_hash;
+        self.frame_abi_hash = frame_abi_hash;
+        self.handler_abi_hash = handler_abi_hash;
+        self
+    }
+
+    /// 验证声明已经完全绑定到一个确定的内核源码站点。
+    pub fn validate(&self) -> Result<(), ElmEbiLoadStatus> {
+        validate_symbol_name(&self.target_api)?;
+        validate_kernel_mixin_selector(&self.selector)?;
+        validate_symbol_name(&self.handler_symbol)?;
+        if self.flags != self.kind.required_flags()
+            || self.profile_hash == [0; 32]
+            || self.source_hash == [0; 32]
+            || self.function_hash == [0; 32]
+            || self.site_hash == [0; 32]
+            || self.frame_abi_hash == [0; 32]
+            || self.handler_abi_hash == [0; 32]
+        {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// 原生 provider 端口的契约、访问策略、方向、模式和处理符号声明。
 pub struct ElmEbiProviderPortDecl {
     /// 端口、调用或载荷采用的完整契约 identifier。
@@ -1223,6 +1413,8 @@ pub struct ElmEbiUnit {
     pub extension_points: Vec<ElmEbiExtensionPointDecl>,
     /// 该单元声明的 extension/mixin 附着集合。
     pub extensions: Vec<ElmEbiExtensionDecl>,
+    /// 该单元声明的内核符号级 Mixin 处理器集合。
+    pub kernel_mixins: Vec<ElmEbiKernelMixinDecl>,
     /// `provider_ports` 保存所属对象声明或快照中的有序记录集合。
     pub provider_ports: Vec<ElmEbiProviderPortDecl>,
     /// 该单元声明的 import 集合。
@@ -1247,6 +1439,7 @@ impl ElmEbiUnit {
             dependencies: Vec::new(),
             extension_points: Vec::new(),
             extensions: Vec::new(),
+            kernel_mixins: Vec::new(),
             provider_ports: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -1288,6 +1481,12 @@ impl ElmEbiUnit {
     /// 设置 `extension` 并返回更新后的值，便于构建器式初始化。
     pub fn with_extension(mut self, extension: ElmEbiExtensionDecl) -> Self {
         self.extensions.push(extension);
+        self
+    }
+
+    /// 添加一个已经精确绑定内核站点的符号级 Mixin 声明。
+    pub fn with_kernel_mixin(mut self, mixin: ElmEbiKernelMixinDecl) -> Self {
+        self.kernel_mixins.push(mixin);
         self
     }
 
@@ -1338,6 +1537,7 @@ impl ElmEbiUnit {
         if self.dependencies.len() > ELM_EBI_MAX_DEPENDENCIES
             || self.extension_points.len() > ELM_EBI_MAX_EXTENSION_POINTS
             || self.extensions.len() > ELM_EBI_MAX_EXTENSIONS
+            || self.kernel_mixins.len() > ELM_EBI_MAX_KERNEL_MIXINS
             || self.provider_ports.len() > ELM_EBI_MAX_PROVIDER_PORTS
             || self.imports.len() > ELM_EBI_MAX_IMPORTS
             || self.exports.len() > ELM_EBI_MAX_EXPORTS
@@ -1368,6 +1568,18 @@ impl ElmEbiUnit {
             validate_ebi_point(&extension.point)?;
             validate_contract_len(&extension.contract)?;
             validate_contract_len(&extension.handler_contract)?;
+        }
+        for (index, mixin) in self.kernel_mixins.iter().enumerate() {
+            mixin.validate()?;
+            if self.kernel_mixins[..index]
+                .iter()
+                .any(|previous| previous.handler_symbol == mixin.handler_symbol)
+            {
+                return Err(ElmEbiLoadStatus::InvalidManifest);
+            }
+        }
+        if !self.kernel_mixins.is_empty() && !self.has_native_code() {
+            return Err(ElmEbiLoadStatus::InvalidManifest);
         }
         for provider in &self.provider_ports {
             if provider.flags != 0 {
@@ -1758,6 +1970,17 @@ fn validate_ebi_point(point: &str) -> Result<(), ElmEbiLoadStatus> {
         || !point.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
         })
+    {
+        return Err(ElmEbiLoadStatus::InvalidManifest);
+    }
+    Ok(())
+}
+
+fn validate_kernel_mixin_selector(selector: &str) -> Result<(), ElmEbiLoadStatus> {
+    if selector.is_empty()
+        || selector.len() > ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN
+        || selector.as_bytes().contains(&0)
+        || !selector.is_ascii()
     {
         return Err(ElmEbiLoadStatus::InvalidManifest);
     }

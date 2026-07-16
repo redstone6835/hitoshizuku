@@ -6,7 +6,7 @@
 //! Rust 开发包在其上提供安全包装。
 //!
 //! 普通模块不应直接解引用这些表，而应使用 [`crate::runtime`]、[`crate::ManagedImport`] 和
-//! [`crate::management::Client`]。本模块主要服务于装载器、ABI 指纹生成、框架 trampoline
+//! `crate::management::Client`。本模块主要服务于装载器、ABI 指纹生成、框架 trampoline
 //! 和实现其他语言绑定的低层代码。
 //!
 //! 所有表遵循“前缀稳定、尾部扩展”规则：先验证 `struct_size` 和版本，只读取已声明存在的
@@ -343,7 +343,7 @@ pub struct ElmRuntimeApiV1 {
 #[derive(Debug, Clone, Copy)]
 /// 受授权 Manager ELM 获得的 v1 管理函数表。
 ///
-/// 该表只有一个统一 dispatch 入口，具体请求/回复由 [`crate::management::Client`] 类型化。
+/// 该表只有一个统一 dispatch 入口，具体请求/回复由 `crate::management::Client` 类型化。
 /// 普通模块不应直接请求或调用此表。
 pub struct ElmManagementApiV1 {
     /// 生产者写入的完整结构字节数，用于向前兼容地判断可读取字段范围。

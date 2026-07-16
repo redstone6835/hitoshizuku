@@ -104,7 +104,7 @@ elm-modules-la: cargo-setup $(CONFIG_FILE) rootfs-la $(ELM_TOOL)
 		cargo build -p kernel --target $(LA_TARGET) --features "$(CARGO_FEATURES)" --release
 	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(LA_TARGET)/release/kernel \
 		--target $(LA_TARGET) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(LA_TARGET)
-	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)) \
+	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(LA_TARGET)) \
 		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --target $(LA_TARGET) \
 		--output $(LA_MODULE_OUTPUT) $(ELM_DRIVER_FEATURE_ARGS)
 	mkdir -p $(LA_ROOTFS)/lib/elm
@@ -118,7 +118,7 @@ elm-modules-rv: cargo-setup $(CONFIG_FILE) rootfs-rv $(ELM_TOOL)
 		cargo build -p kernel --target $(RV_TARGET) --features "$(CARGO_FEATURES)" --release
 	$(ELM_TOOL) elm profile-export $(CARGO_TARGET_DIR)/$(RV_TARGET)/release/kernel \
 		--target $(RV_TARGET) --profile contest-2026 --output $(ELM_INTERFACE_ROOT)/$(RV_TARGET)
-	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)) \
+	ELM_KERNEL_INTERFACE_ROOT=$(abspath $(ELM_INTERFACE_ROOT)/$(RV_TARGET)) \
 		$(ELM_TOOL) elm build-set $(ELM_MODULE_SET) --config $(CONFIG_FILE) --target $(RV_TARGET) \
 		--output $(RV_MODULE_OUTPUT) $(ELM_DRIVER_FEATURE_ARGS)
 	mkdir -p $(RV_ROOTFS)/lib/elm

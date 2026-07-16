@@ -19,11 +19,11 @@ use elm::{
     ELM_EKI_VARIANT_RECORD_SIZE, ELM_MENU_DESCRIPTION_LEN, ELM_MENU_LABEL_LEN, ELM_MENU_ROUTE_LEN,
     ELM_NEXUS_CONTRACT_LEN, ELM_PROOF_ABI_VERSION, ELM_PROOF_ED25519_SIGNATURE_LEN,
     ELM_PROOF_SHA256_LEN, ELM_PROOF_SOURCE_IDENTIFIER_LEN, ELM_RUST_ABI_FINGERPRINT_VERSION,
-    ElmEbiArch, ElmEbiProofV1, ElmEbiRelocationKind, ElmEbiSegmentKind, ElmEkiBlockKind,
-    ElmEkiSelector, ElmKind, ElmModuleDescriptorV1, ElmPanicStrategy, ElmRustAbiFingerprintV1,
-    ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest, kernel_interface_manifest_v1,
-    parse_eki_image, parse_eki_image_for, parse_eki_variants, sha256, sha256_with_zeroed_range,
-    sha256_with_zeroed_ranges,
+    ElmEbiArch, ElmEbiKernelMixinDecl, ElmEbiProofV1, ElmEbiRelocationKind, ElmEbiSegmentKind,
+    ElmEkiBlockKind, ElmEkiSelector, ElmKind, ElmModuleDescriptorV1, ElmPanicStrategy,
+    ElmRustAbiFingerprintV1, ElmTrustAnchor, ElmTrustStore, canonical_ebi_digest,
+    kernel_interface_manifest_v1, parse_eki_image, parse_eki_image_for, parse_eki_variants, sha256,
+    sha256_with_zeroed_range, sha256_with_zeroed_ranges,
 };
 
 mod build_set;
@@ -40,8 +40,8 @@ use project::{
     diagnose_project, scaffold_project, selected_kernel_interfaces, sync_framework,
 };
 use rust_metadata::{
-    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, NativeMetadata, ProviderSpec,
-    retain_linked_kernel_symbol_imports,
+    ExportSpec, ExtensionPointSpec, ExtensionSpec, ImportSpec, KernelMixinSpec, NativeMetadata,
+    ProviderSpec, retain_linked_kernel_symbol_imports,
 };
 
 const ELM_TOOL_PAGE_SIZE: u64 = 4096;
@@ -66,6 +66,7 @@ const BLOCK_ABI_FINGERPRINT: u32 = ElmEkiBlockKind::AbiFingerprint as u32;
 const BLOCK_PROOF: u32 = ElmEkiBlockKind::Signature as u32;
 const BLOCK_VARIANT_DIRECTORY: u32 = ElmEkiBlockKind::VariantDirectory as u32;
 const BLOCK_VARIANT_IMAGE: u32 = ElmEkiBlockKind::VariantImage as u32;
+const BLOCK_KERNEL_MIXINS: u32 = ElmEkiBlockKind::KernelMixins as u32;
 const MENU_KIND_ACTION: u32 = 2;
 const HOOK_INITIALIZE: u32 = 1;
 const HOOK_FINALIZE: u32 = 2;
@@ -80,6 +81,7 @@ const EKI_EXTENSION_POINT_RECORD_SIZE: usize =
     16 + elm::ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN;
 const EKI_EXTENSION_RECORD_SIZE: usize =
     24 + elm::ELM_EBI_NAME_LEN + elm::ELM_MGR_RELATION_POINT_LEN + ELM_NEXUS_CONTRACT_LEN * 2;
+const EKI_KERNEL_MIXIN_RECORD_SIZE: usize = elm::ELM_EKI_KERNEL_MIXIN_RECORD_SIZE;
 const ELF_TYPE_DYN: u16 = 3;
 const ELF_SECTION_RELA: u32 = 4;
 const ELF_SECTION_REL: u32 = 9;
@@ -886,6 +888,7 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
         elf.symbols.iter().any(|candidate| candidate.name == symbol)
     });
     validate_native_symbols(&elf, &metadata)?;
+    let kernel_mixins = resolve_kernel_mixins(&metadata.kernel_mixins, &interface)?;
     let relocation_records =
         dynamic_runtime_relocations(&elf, &elf_bytes, &interface, &mut metadata.imports)?;
     let relocations = native_relocations_block(&elf, &metadata.imports, relocation_records)?;
@@ -921,6 +924,12 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
         blocks.push(PackerBlock::new(
             BLOCK_EXTENSIONS,
             extensions_block(&metadata.extensions)?,
+        ));
+    }
+    if !kernel_mixins.is_empty() {
+        blocks.push(PackerBlock::new(
+            BLOCK_KERNEL_MIXINS,
+            kernel_mixins_block(&kernel_mixins)?,
         ));
     }
     blocks.push(PackerBlock::new(
@@ -1072,6 +1081,32 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
             export.flags,
             export.is_direct_pinned(),
             hex_digest(&export.rust_abi_hash),
+        );
+    }
+    for (index, mixin) in image.unit.kernel_mixins.iter().enumerate() {
+        let location = image.symbol_location(&mixin.handler_symbol);
+        println!(
+            "kernel_mixin[{index}] target={} selector={} ordinal={} kind={:?} flags=0x{:x} priority={} handler={} handler_location={} profile={} source={} function={} site={} frame_abi={} handler_abi={}",
+            mixin.target_api,
+            mixin.selector,
+            mixin.ordinal,
+            mixin.kind,
+            mixin.flags,
+            mixin.priority,
+            mixin.handler_symbol,
+            location.map_or_else(
+                || "missing".to_string(),
+                |symbol| format!(
+                    "segment:{}+0x{:x}/0x{:x}",
+                    symbol.segment_index, symbol.offset, symbol.size
+                )
+            ),
+            hex_digest(&mixin.profile_hash),
+            hex_digest(&mixin.source_hash),
+            hex_digest(&mixin.function_hash),
+            hex_digest(&mixin.site_hash),
+            hex_digest(&mixin.frame_abi_hash),
+            hex_digest(&mixin.handler_abi_hash),
         );
     }
     Ok(())
@@ -1881,6 +1916,9 @@ fn validate_native_symbols(elf: &ElfImage, metadata: &NativeMetadata) -> Result<
             validate_code_symbol(elf, snapshot)?;
         }
     }
+    for mixin in &metadata.kernel_mixins {
+        validate_code_symbol(elf, &mixin.handler_symbol)?;
+    }
     for import in &metadata.imports {
         let Some(slot_symbol) = import.slot_symbol.as_deref() else {
             continue;
@@ -2373,6 +2411,122 @@ fn extensions_block(entries: &[ExtensionSpec]) -> Result<Vec<u8>, String> {
         copy_fixed(&mut out, point_start, &extension.point);
         copy_fixed(&mut out, contract_start, &extension.contract);
         copy_fixed(&mut out, handler_start, &extension.handler_contract);
+    }
+    Ok(out)
+}
+
+fn resolve_kernel_mixins(
+    entries: &[KernelMixinSpec],
+    interface: &KernelInterfaceManifest,
+) -> Result<Vec<ElmEbiKernelMixinDecl>, String> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(entries.len())
+        .map_err(|_| "无法为内核 Mixin 声明分配空间".to_string())?;
+    for entry in entries {
+        let mut matches = interface
+            .mixin_sites
+            .iter()
+            .filter(|site| site.api_path == entry.target_api && site.selector == entry.selector);
+        let site = matches.next().ok_or_else(|| {
+            format!(
+                "内核接口不存在 Mixin 站点 {} at {}",
+                entry.target_api, entry.selector
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "内核接口 Mixin 站点不唯一: {} at {}",
+                entry.target_api, entry.selector
+            ));
+        }
+        if !entry.kind.accepts_site(site.kind) {
+            return Err(format!(
+                "Mixin 行为 {:?} 不能挂接到站点类别 {}: {} at {}",
+                entry.kind, site.kind, entry.target_api, entry.selector
+            ));
+        }
+        if entry.kind == elm::ElmKernelMixinKind::ModifyArgument
+            && site.selector.starts_with("method:")
+        {
+            return Err(format!(
+                "方法调用依赖 Rust 自动借用语义，不能安全暴露参数修改站点: {} at {}",
+                entry.target_api, entry.selector
+            ));
+        }
+        if entry.flags != entry.kind.required_flags()
+            || entry.handler_abi_hash
+                != elm::sha256(kernel_symbols::KERNEL_MIXIN_HANDLER_RUST_ABI_V1.as_bytes())
+        {
+            return Err(format!(
+                "内核 Mixin handler ABI 或 flags 无效: {}",
+                entry.handler_symbol
+            ));
+        }
+        output.push(
+            ElmEbiKernelMixinDecl::new(
+                entry.target_api.clone(),
+                entry.selector.clone(),
+                entry.handler_symbol.clone(),
+                entry.kind,
+                entry.priority,
+            )
+            .map_err(|status| format!("内核 Mixin 声明无效: {status:?}"))?
+            .with_site_identity(
+                site.ordinal,
+                interface.interface_hash,
+                site.source_hash,
+                site.function_hash,
+                site.site_hash,
+                site.frame_abi_hash,
+                entry.handler_abi_hash,
+            ),
+        );
+    }
+    Ok(output)
+}
+
+fn kernel_mixins_block(entries: &[ElmEbiKernelMixinDecl]) -> Result<Vec<u8>, String> {
+    let mut out = vec![0; EKI_TABLE_HEADER_SIZE + entries.len() * EKI_KERNEL_MIXIN_RECORD_SIZE];
+    write_u32(&mut out, 0, entries.len() as u32);
+    for (index, entry) in entries.iter().enumerate() {
+        entry
+            .validate()
+            .map_err(|status| format!("内核 Mixin EBI 声明无效: {status:?}"))?;
+        if entry.target_api.len() > elm::ELM_EBI_SYMBOL_NAME_LEN
+            || entry.selector.len() > elm::ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN
+            || entry.handler_symbol.len() > elm::ELM_EBI_SYMBOL_NAME_LEN
+        {
+            return Err("内核 Mixin 字段超过 EKI v1 上限".to_string());
+        }
+        let offset = EKI_TABLE_HEADER_SIZE + index * EKI_KERNEL_MIXIN_RECORD_SIZE;
+        write_u16(&mut out, offset, entry.kind as u16);
+        write_u16(&mut out, offset + 2, entry.flags);
+        write_u32(&mut out, offset + 4, entry.ordinal);
+        write_u32(&mut out, offset + 8, entry.priority as u32);
+        write_u16(&mut out, offset + 12, entry.target_api.len() as u16);
+        write_u16(&mut out, offset + 14, entry.selector.len() as u16);
+        write_u16(&mut out, offset + 16, entry.handler_symbol.len() as u16);
+        for (hash_index, hash) in [
+            &entry.profile_hash,
+            &entry.source_hash,
+            &entry.function_hash,
+            &entry.site_hash,
+            &entry.frame_abi_hash,
+            &entry.handler_abi_hash,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = offset + 24 + hash_index * 32;
+            out[start..start + 32].copy_from_slice(hash);
+        }
+        let target_start = offset + 24 + 32 * 6;
+        let selector_start = target_start + elm::ELM_EBI_SYMBOL_NAME_LEN;
+        let handler_start = selector_start + elm::ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN;
+        copy_fixed(&mut out, target_start, &entry.target_api);
+        copy_fixed(&mut out, selector_start, &entry.selector);
+        copy_fixed(&mut out, handler_start, &entry.handler_symbol);
     }
     Ok(out)
 }

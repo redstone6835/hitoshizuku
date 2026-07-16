@@ -23,6 +23,11 @@ userland/rootfs-la/lib/elm/
 userland/rootfs-rv/lib/elm/
 drivers/*/.elm/
 drivers/*/dist/
+tests/elm/*/.cargo/
+tests/elm/*/.elm/
+tests/elm/*/dist/
+tests/elm/*/elm.ld
+tests/elm/*/rust-toolchain.toml
 
 # vendor 不受上述规则限制
 !vendor/**

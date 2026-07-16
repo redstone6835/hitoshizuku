@@ -69,9 +69,9 @@ use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::{
-    Expr, ExprLit, ExprUnary, Fields, FnArg, GenericArgument, ImplItem, ImplItemFn, ItemFn,
-    ItemImpl, ItemStatic, ItemStruct, Lit, LitStr, Meta, Pat, PathArguments, ReturnType, Signature,
-    Token, Type, TypeBareFn, UnOp, parse_macro_input,
+    Attribute, Expr, ExprLit, ExprUnary, Fields, FnArg, GenericArgument, ImplItem, ImplItemFn,
+    Item, ItemFn, ItemImpl, ItemStatic, ItemStruct, Lit, LitStr, Meta, Pat, PathArguments,
+    ReturnType, Signature, Token, Type, TypeBareFn, UnOp, parse_macro_input,
 };
 
 const META_MAGIC: &[u8; 8] = b"ELMMETA1";
@@ -85,6 +85,7 @@ const KIND_IMPORT: u16 = 6;
 const KIND_EXTENSION_POINT: u16 = 7;
 const KIND_EXTENSION: u16 = 8;
 const KIND_PAYLOAD: u16 = 9;
+const KIND_KERNEL_MIXIN: u16 = 10;
 const KIND_MODULE: u16 = 18;
 
 const VALUE_UTF8: u16 = 1;
@@ -578,7 +579,16 @@ pub fn mixin_point(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
-/// 声明一个附着到其他 ELM 补缀点的 mixin 处理器。
+/// 声明一个 ELM 补缀处理器或内核符号级 Mixin 处理器集合。
+///
+/// 该 attribute 有两种互斥形态：
+///
+/// - 标记独立函数时，声明附着到其他 ELM 显式补缀点的线协议处理器；
+/// - 标记固有 `impl` 时，声明附着到内核直接符号目录中真实 Rust 函数站点的处理器集合。
+///
+/// 两种形态共享名称只是为了表达“对既有行为进行组合”，其装载协议和热路径完全不同。
+/// 独立函数形态经过 provider 与固定 payload；固有 `impl` 形态经过 EKI `KernelMixins` 表、
+/// 精确源码站点身份和同步 Rust 调用帧，不经过 provider 或 `elm-mgr` 数据路径。
 ///
 /// # 参数语法
 ///
@@ -641,9 +651,74 @@ pub fn mixin_point(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     MixinControl::ReplaceAndStop
 /// }
 /// ```
+///
+/// # 内核符号级形态
+///
+/// ```text
+/// #[elm::mixin(target = "allocator")]
+/// impl ModuleType {
+///     #[elm::inject(method = "GlobalAlloc.alloc", at = "head", priority = 300)]
+///     fn trace(&self, context: &mut elm::KernelMixinContext<'_>) -> elm::HookResult;
+/// }
+/// ```
+///
+/// `target` 是稳定 API 路径前缀。若 `method` 已经以该前缀开头则直接使用，否则宏以
+/// `target + "." + method` 组成完整路径。固有 `impl` 必须属于模块类型、使用安全非泛型
+/// 方法，并且每个处理器签名必须是：
+///
+/// ```text
+/// fn(&self, &mut elm::KernelMixinContext<'_>) -> elm::HookResult
+/// ```
+///
+/// 当前稳定方法 attribute：
+///
+/// - `#[elm::inject(method = "...", at = "head|return", priority = N)]`：观察或修改当前帧，
+///   返回后自动继续；`at` 默认是 `head`；
+/// - `#[elm::modify_arg(method = "...", priority = N)]`：在 `head` 站点修改允许写入的参数；
+/// - `#[elm::modify_return(method = "...", priority = N)]`：在 `return` 站点读取或修改结果；
+/// - `#[elm::overwrite(method = "...", priority = N)]`：在 `head` 站点取得 continuation，必须
+///   调用 `context.proceed()` 或明确写入/取消结果。
+///
+/// `priority` 是可选 `i32`，默认 0，数值较大者先执行。宏会生成固定 C ABI trampoline，
+/// 但该 ABI 是框架内部细节，开发者不得手写 `extern`、`export_name` 或同名符号。
+///
+/// `modify_local`、`redirect` 和 `wrap_operation` 已保留语法名称，但当前会以
+/// `TODO(ELM-MIR)` 在编译期拒绝。内部调用、局部变量和字段访问必须由后续 MIR 级织入器
+/// 在掌握类型、借用、临时值和控制流信息后生成，proc-macro 不提供不完整替代实现。
+///
+/// # 内核符号级示例
+///
+/// ```ignore
+/// use core::alloc::Layout;
+/// use elm::{HookError, HookResult, KernelMixinContext};
+///
+/// struct ModuleType;
+///
+/// #[elm::mixin(target = "allocator")]
+/// impl ModuleType {
+///     #[elm::inject(method = "GlobalAlloc.alloc", at = "head", priority = 300)]
+///     fn trace(&self, context: &mut KernelMixinContext<'_>) -> HookResult {
+///         let _layout = context.argument::<Layout>(1).ok_or(HookError::new(-1))?;
+///         Ok(())
+///     }
+///
+///     #[elm::overwrite(method = "GlobalAlloc.alloc", priority = 100)]
+///     fn wrap(&self, context: &mut KernelMixinContext<'_>) -> HookResult {
+///         context.proceed()
+///     }
+/// }
+/// ```
 pub fn mixin(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let function = parse_macro_input!(item as ItemFn);
-    match mixin_impl(attr.into(), function) {
+    let item = parse_macro_input!(item as Item);
+    let result = match item {
+        Item::Impl(implementation) => kernel_mixin_impl(attr.into(), implementation),
+        Item::Fn(function) => mixin_impl(attr.into(), function),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[elm::mixin] 只能标记独立 Mixin impl",
+        )),
+    };
+    match result {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
@@ -1627,6 +1702,263 @@ fn mixin_point_impl(attr: TokenStream2, mut function: ItemFn) -> syn::Result<Tok
 
         #metadata
     })
+}
+
+#[derive(Clone, Copy)]
+enum KernelMixinMethodKind {
+    Inject,
+    ModifyArgument,
+    ModifyReturn,
+    ModifyLocal,
+    Redirect,
+    WrapOperation,
+    Overwrite,
+}
+
+impl KernelMixinMethodKind {
+    const fn raw(self) -> u32 {
+        match self {
+            Self::Inject => 1,
+            Self::ModifyArgument => 2,
+            Self::ModifyReturn => 3,
+            Self::ModifyLocal => 4,
+            Self::Redirect => 5,
+            Self::WrapOperation => 6,
+            Self::Overwrite => 7,
+        }
+    }
+
+    const fn flags(self) -> u32 {
+        match self {
+            Self::Inject | Self::ModifyArgument | Self::ModifyReturn | Self::ModifyLocal => 1,
+            Self::Redirect | Self::WrapOperation | Self::Overwrite => 2,
+        }
+    }
+
+    const fn default_selector(self) -> Option<&'static str> {
+        match self {
+            Self::Inject | Self::ModifyArgument | Self::Overwrite => Some("head"),
+            Self::ModifyReturn => Some("return"),
+            Self::ModifyLocal | Self::Redirect | Self::WrapOperation => None,
+        }
+    }
+}
+
+fn kernel_mixin_impl(
+    attr: TokenStream2,
+    mut implementation: ItemImpl,
+) -> syn::Result<TokenStream2> {
+    if implementation.trait_.is_some()
+        || implementation.unsafety.is_some()
+        || !implementation.generics.params.is_empty()
+        || implementation.generics.where_clause.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            &implementation,
+            "#[elm::mixin] 必须标记模块类型的非泛型安全固有 impl",
+        ));
+    }
+    let args = MetaArgs::parse(attr)?;
+    let target = args.required_string("target")?;
+    args.finish()?;
+    validate_symbol(&target, "内核 Mixin target")?;
+
+    let module_ty = implementation.self_ty.clone();
+    let mut generated = Vec::new();
+    for item in &mut implementation.items {
+        let ImplItem::Fn(method) = item else {
+            continue;
+        };
+        let Some((kind, method_attr)) = take_kernel_mixin_method_attribute(&mut method.attrs)?
+        else {
+            continue;
+        };
+        // TODO(ELM-MIR)：内部调用、局部变量和字段站点必须由带类型信息的 MIR pass 生成；
+        // proc-macro 改写会破坏自动借用、临时值延寿、闭包类型和强制类型转换。
+        if matches!(
+            kind,
+            KernelMixinMethodKind::ModifyLocal
+                | KernelMixinMethodKind::Redirect
+                | KernelMixinMethodKind::WrapOperation
+        ) {
+            return Err(syn::Error::new_spanned(
+                &method.sig,
+                "TODO(ELM-MIR)：modify_local、redirect 和 wrap_operation 等待 MIR 级站点织入器",
+            ));
+        }
+        validate_kernel_mixin_method(method)?;
+        let method_args = MetaArgs::parse(method_attr)?;
+        let method_path = method_args.required_string("method")?;
+        let selector = match kind.default_selector() {
+            Some(default) => method_args.string_or("at", default)?,
+            None => method_args.required_string("at")?,
+        };
+        let priority = method_args.i32_or("priority", 0)?;
+        method_args.finish()?;
+        let target_api = if method_path == target || method_path.starts_with(&format!("{target}."))
+        {
+            method_path
+        } else {
+            format!("{target}.{method_path}")
+        };
+        validate_symbol(&target_api, "内核 Mixin method")?;
+        validate_kernel_mixin_selector(&selector)?;
+
+        let ident = method.sig.ident.clone();
+        let trampoline = format_ident!("__elm_kernel_mixin_{}", ident);
+        let symbol = trampoline.to_string();
+        validate_symbol(&symbol, "内核 Mixin handler symbol")?;
+        let metadata = metadata_item(
+            &ident,
+            "kernel_mixin",
+            metadata_record(
+                KIND_KERNEL_MIXIN,
+                vec![
+                    MetaField::utf8(FIELD_SYMBOL, &symbol),
+                    MetaField::utf8(FIELD_NAME, &target_api),
+                    MetaField::u32(FIELD_FLAGS, kind.flags()),
+                    MetaField::u32(FIELD_MODE, kind.raw()),
+                    MetaField::utf8(FIELD_POINT, &selector),
+                    MetaField::i32(FIELD_PRIORITY, priority),
+                    MetaField::utf8(
+                        FIELD_RUST_ABI,
+                        "unsafeextern\"C\"fn(*mutkernel_symbols::KernelMixinFrameV1)->i32",
+                    ),
+                ],
+            ),
+        );
+        generated.push(quote! {
+            #[doc(hidden)]
+            #[cfg(not(feature = "elm-integrated"))]
+            #[unsafe(export_name = #symbol)]
+            #[unsafe(link_section = ".text.elm.abi")]
+            pub unsafe extern "C" fn #trampoline(
+                frame: *mut ::elm::KernelMixinFrameV1,
+            ) -> i32 {
+                unsafe {
+                    ::elm::__private::kernel_mixin_trampoline(
+                        &__ELM_MODULE_SLOT_V1,
+                        frame,
+                        <#module_ty>::#ident,
+                    )
+                }
+            }
+
+            #metadata
+        });
+    }
+    if generated.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &implementation,
+            "#[elm::mixin] impl 中没有 inject/modify/redirect/wrap/overwrite 方法",
+        ));
+    }
+    Ok(quote! {
+        #implementation
+        #(#generated)*
+    })
+}
+
+fn take_kernel_mixin_method_attribute(
+    attributes: &mut Vec<Attribute>,
+) -> syn::Result<Option<(KernelMixinMethodKind, TokenStream2)>> {
+    let mut selected = None;
+    let mut retained = Vec::with_capacity(attributes.len());
+    for attribute in core::mem::take(attributes) {
+        let kind = match attribute
+            .path()
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .as_deref()
+        {
+            Some("inject") => Some(KernelMixinMethodKind::Inject),
+            Some("modify_arg") => Some(KernelMixinMethodKind::ModifyArgument),
+            Some("modify_return") => Some(KernelMixinMethodKind::ModifyReturn),
+            Some("modify_local") => Some(KernelMixinMethodKind::ModifyLocal),
+            Some("redirect") => Some(KernelMixinMethodKind::Redirect),
+            Some("wrap_operation") => Some(KernelMixinMethodKind::WrapOperation),
+            Some("overwrite") => Some(KernelMixinMethodKind::Overwrite),
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            retained.push(attribute);
+            continue;
+        };
+        if selected.is_some() {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "同一个方法只能声明一种内核 Mixin 行为",
+            ));
+        }
+        let Meta::List(list) = attribute.meta else {
+            return Err(syn::Error::new_spanned(
+                attribute,
+                "内核 Mixin 方法必须提供 method/at 等参数",
+            ));
+        };
+        selected = Some((kind, list.tokens));
+    }
+    *attributes = retained;
+    Ok(selected)
+}
+
+fn validate_kernel_mixin_method(method: &ImplItemFn) -> syn::Result<()> {
+    if method.sig.constness.is_some()
+        || method.sig.asyncness.is_some()
+        || method.sig.unsafety.is_some()
+        || method.sig.abi.is_some()
+        || method.sig.variadic.is_some()
+        || !method.sig.generics.params.is_empty()
+        || method.sig.generics.where_clause.is_some()
+        || method.sig.inputs.len() != 2
+        || matches!(method.sig.output, ReturnType::Default)
+    {
+        return Err(syn::Error::new_spanned(
+            &method.sig,
+            "内核 Mixin 方法必须是 fn(&self, &mut elm::KernelMixinContext<'_>) -> elm::HookResult",
+        ));
+    }
+    let Some(FnArg::Receiver(receiver)) = method.sig.inputs.first() else {
+        return Err(syn::Error::new_spanned(
+            &method.sig.inputs,
+            "内核 Mixin 方法缺少 &self 接收者",
+        ));
+    };
+    if receiver.reference.is_none()
+        || receiver.mutability.is_some()
+        || receiver.colon_token.is_some()
+    {
+        return Err(syn::Error::new_spanned(
+            receiver,
+            "内核 Mixin 方法接收者必须是 &self",
+        ));
+    }
+    let Some(FnArg::Typed(context)) = method.sig.inputs.iter().nth(1) else {
+        unreachable!();
+    };
+    if !matches!(context.ty.as_ref(), Type::Reference(reference) if reference.mutability.is_some())
+    {
+        return Err(syn::Error::new_spanned(
+            &context.ty,
+            "内核 Mixin 上下文参数必须是可变借用",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_kernel_mixin_selector(selector: &str) -> syn::Result<()> {
+    if selector.is_empty()
+        || selector.len() > EBI_SYMBOL_NAME_LEN
+        || selector.as_bytes().contains(&0)
+        || !selector.is_ascii()
+    {
+        return Err(syn::Error::new(
+            Span::call_site(),
+            "内核 Mixin at selector 必须是长度不超过 128 的非空 ASCII 字符串",
+        ));
+    }
+    Ok(())
 }
 
 fn mixin_impl(attr: TokenStream2, function: ItemFn) -> syn::Result<TokenStream2> {

@@ -17,6 +17,7 @@ mod core;
 mod event;
 mod executor;
 mod journal;
+mod kernel_mixin;
 mod kernel_symbols;
 mod menu;
 mod mgr_channel;
@@ -57,6 +58,14 @@ pub(crate) fn init_builtin_mgr() {
     }
     if let Err(err) = kernel_symbols::validate_catalog() {
         log::error!("[elm] 内核直接符号目录无效: {:?}", err);
+        return;
+    }
+    if let Err(err) = kernel_mixin::validate_catalog() {
+        log::error!("[elm] 内核 Mixin 站点目录无效: {:?}", err);
+        return;
+    }
+    if !::kernel_symbols::install_mixin_runtime_hooks(&kernel_mixin::RUNTIME_HOOKS) {
+        log::error!("[elm] 无法安装内核 Mixin 路由钩子");
         return;
     }
     if !api_registry::init() {

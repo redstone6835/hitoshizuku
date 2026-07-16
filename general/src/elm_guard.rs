@@ -26,6 +26,8 @@ pub const ELM_GUARD_PHASE_DEVICE_REMOVE: u32 = 9;
 pub const ELM_GUARD_PHASE_DEVICE_IO: u32 = 10;
 pub const ELM_GUARD_PHASE_DEVICE_IRQ: u32 = 11;
 pub const ELM_GUARD_PHASE_DEVICE_DISCOVERY: u32 = 12;
+/// 内核符号级 Mixin 处理器调用阶段。
+pub const ELM_GUARD_PHASE_KERNEL_MIXIN: u32 = 13;
 
 pub const ELM_GUARD_ABORT_NONE: usize = 0;
 pub const ELM_GUARD_ABORT_CANCEL: usize = 1;

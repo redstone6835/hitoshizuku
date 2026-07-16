@@ -3550,14 +3550,14 @@ fn elm_mgr_load_cell_empty_payload_reports_ebi_source_todo() {
 }
 
 #[ktest]
-fn elm_mgr_rejects_external_distribution_source_kind() {
+fn elm_mgr_rejects_build_bound_source_from_management_channel() {
     let mut core = ElmCore::new();
     core.init_builtin_mgr().unwrap();
     let payload = raw_ebi_source_payload(5, &[]);
 
     let response =
         dispatch_mgr_call_on_core(&mut core, &mgr_call(ElmMgrCallKind::LoadCell, &payload));
-    assert_eq!(response_status(&response), ELM_MGR_STATUS_INVALID);
+    assert_eq!(response_status(&response), ELM_MGR_STATUS_UNSUPPORTED);
 }
 
 #[ktest]

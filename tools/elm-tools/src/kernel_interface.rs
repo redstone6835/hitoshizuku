@@ -40,6 +40,18 @@ pub struct KernelInterfaceSymbol {
 }
 
 #[derive(Debug, Clone)]
+pub struct KernelInterfaceMixinSite {
+    pub kind: u16,
+    pub ordinal: u32,
+    pub source_hash: [u8; 32],
+    pub function_hash: [u8; 32],
+    pub site_hash: [u8; 32],
+    pub frame_abi_hash: [u8; 32],
+    pub api_path: String,
+    pub selector: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct KernelInterfaceManifest {
     pub target: String,
     pub profile: String,
@@ -56,6 +68,7 @@ pub struct KernelInterfaceManifest {
     pub support_library: String,
     pub import_library: String,
     pub symbols: Vec<KernelInterfaceSymbol>,
+    pub mixin_sites: Vec<KernelInterfaceMixinSite>,
 }
 
 impl KernelInterfaceManifest {
@@ -81,6 +94,7 @@ impl KernelInterfaceManifest {
         let mut support_library = None;
         let mut import_library = None;
         let mut symbols = Vec::new();
+        let mut mixin_sites = Vec::new();
         for line in lines {
             if let Some(value) = line.strip_prefix("target=") {
                 target = Some(value.to_string());
@@ -120,7 +134,12 @@ impl KernelInterfaceManifest {
                 import_library = Some(value.to_string());
             } else if let Some(value) = line.strip_prefix("symbol\t") {
                 symbols.push(parse_symbol_record(value)?);
-            } else if line.starts_with("symbol_count=") || line.is_empty() {
+            } else if let Some(value) = line.strip_prefix("mixin_site\t") {
+                mixin_sites.push(parse_mixin_site_record(value)?);
+            } else if line.starts_with("symbol_count=")
+                || line.starts_with("mixin_site_count=")
+                || line.is_empty()
+            {
                 continue;
             } else {
                 return Err(format!("{} 包含未知接口清单记录: {line}", path.display()));
@@ -156,6 +175,7 @@ impl KernelInterfaceManifest {
             import_library: import_library
                 .ok_or_else(|| "接口清单缺少 import library".to_string())?,
             symbols,
+            mixin_sites,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -236,6 +256,37 @@ impl KernelInterfaceManifest {
                         symbol.api_path
                     ));
                 }
+            }
+        }
+        let mut site_hashes = BTreeSet::new();
+        for site in &self.mixin_sites {
+            let Some(symbol) = self
+                .symbols
+                .iter()
+                .find(|symbol| symbol.api_path == site.api_path)
+            else {
+                return Err(format!("Mixin 站点目标未导出: {}", site.api_path));
+            };
+            if site.source_hash != self.source_hash
+                || site.function_hash == [0; 32]
+                || site.site_hash == [0; 32]
+                || site.frame_abi_hash != sha256(symbol.rust_abi.as_bytes())
+                || site.selector.is_empty()
+                || site.selector.len() > kernel_symbols::KERNEL_SYMBOL_RUST_ABI_MAX_LEN
+                || site_digest(
+                    site.api_path.as_bytes(),
+                    &site.function_hash,
+                    site.kind,
+                    site.ordinal,
+                    site.selector.as_bytes(),
+                    &symbol.rust_abi,
+                ) != site.site_hash
+                || !site_hashes.insert(site.site_hash)
+            {
+                return Err(format!(
+                    "Mixin 站点目录无效: {} {}",
+                    site.api_path, site.selector
+                ));
             }
         }
         Ok(())
@@ -321,6 +372,26 @@ impl KernelInterfaceManifest {
             output.push_str(&symbol.aliases.join(","));
             output.push('\n');
         }
+        output.push_str(&format!("mixin_site_count={}\n", self.mixin_sites.len()));
+        for site in &self.mixin_sites {
+            output.push_str("mixin_site\t");
+            output.push_str(&site.kind.to_string());
+            output.push('\t');
+            output.push_str(&site.ordinal.to_string());
+            output.push('\t');
+            output.push_str(&site.api_path);
+            output.push('\t');
+            output.push_str(&hex_bytes(site.selector.as_bytes()));
+            output.push('\t');
+            output.push_str(&hex_digest(&site.source_hash));
+            output.push('\t');
+            output.push_str(&hex_digest(&site.function_hash));
+            output.push('\t');
+            output.push_str(&hex_digest(&site.site_hash));
+            output.push('\t');
+            output.push_str(&hex_digest(&site.frame_abi_hash));
+            output.push('\n');
+        }
         output
     }
 }
@@ -384,6 +455,7 @@ pub fn export_kernel_interface(
         symbol.interface_hash = interface_hash;
         symbol.rust_abi_hash = sha256(symbol.rust_abi.as_bytes());
     }
+    let mixin_sites = scan_repository_mixin_sites(repository, source_hash, &symbols)?;
 
     let manifest = KernelInterfaceManifest {
         target: target.to_string(),
@@ -401,6 +473,7 @@ pub fn export_kernel_interface(
         support_library: "libelm-rust-support.a".to_string(),
         import_library: "libelm-kernel-imports.so".to_string(),
         symbols,
+        mixin_sites,
     };
     manifest.validate()?;
 
@@ -756,6 +829,7 @@ fn scan_repository_exports(
                 }
                 Item::Impl(item) => {
                     let self_ty = item.self_ty.as_ref();
+                    let trait_path = item.trait_.as_ref().map(|(_, path, _)| path);
                     for implementation_item in item.items {
                         let syn::ImplItem::Fn(method) = implementation_item else {
                             continue;
@@ -777,17 +851,27 @@ fn scan_repository_exports(
                         if method.sig.unsafety.is_some() {
                             flags |= kernel_symbols::KERNEL_SYMBOL_FLAG_UNSAFE;
                         }
+                        let item_path = if let Some(trait_path) = trait_path {
+                            format!(
+                                "{module_path}::{} as {}::{}",
+                                normalize_abi_tokens(self_ty.to_token_stream()),
+                                normalize_abi_tokens(trait_path.to_token_stream()),
+                                method.sig.ident
+                            )
+                        } else {
+                            format!(
+                                "{module_path}::{}::{}",
+                                normalize_abi_tokens(self_ty.to_token_stream()),
+                                method.sig.ident
+                            )
+                        };
                         symbols.push(make_symbol(
                             KERNEL_SYMBOL_KIND_METHOD,
                             flags,
                             &args,
                             retained,
                             interface_hash,
-                            format!(
-                                "{module_path}::{}::{}",
-                                normalize_abi_tokens(self_ty.to_token_stream()),
-                                method.sig.ident
-                            ),
+                            item_path,
                             canonical_method_abi(&method.sig, self_ty)?,
                         )?);
                     }
@@ -801,6 +885,148 @@ fn scan_repository_exports(
         return Err("内核仓库没有任何直接符号导出".to_string());
     }
     Ok(symbols)
+}
+
+fn scan_repository_mixin_sites(
+    repository: &Path,
+    source_hash: [u8; 32],
+    symbols: &[KernelInterfaceSymbol],
+) -> Result<Vec<KernelInterfaceMixinSite>, String> {
+    let mut sources = vec![
+        repository.join("libs/allocator/src/lib.rs"),
+        repository.join("libs/allocator/src/kernel_symbols.rs"),
+        repository.join("libs/log/src/lib.rs"),
+    ];
+    let mut exported_sources = Vec::new();
+    collect_export_sources(
+        &repository.join("general/src/dev"),
+        "general::dev",
+        &mut exported_sources,
+    )?;
+    sources.extend(exported_sources.into_iter().map(|(path, _)| path));
+
+    let known = symbols
+        .iter()
+        .map(|symbol| (symbol.api_path.as_str(), symbol.rust_abi.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut sites = Vec::new();
+    for path in sources {
+        let input = fs::read_to_string(&path)
+            .map_err(|error| format!("读取 Mixin 站点源码 {} 失败: {error}", path.display()))?;
+        if !input.contains("kernel_symbols::export") {
+            continue;
+        }
+        let syntax = syn::parse_file(&input)
+            .map_err(|error| format!("解析 Mixin 站点源码 {} 失败: {error}", path.display()))?;
+        for item in syntax.items {
+            match item {
+                Item::Fn(function) => {
+                    let Some(args) = export_args(&function.attrs)? else {
+                        continue;
+                    };
+                    let api_path = args.name.value();
+                    let abi = known
+                        .get(api_path.as_str())
+                        .ok_or_else(|| format!("Mixin 站点目标没有对应符号清单记录: {api_path}"))?;
+                    append_function_mixin_sites(
+                        &mut sites,
+                        source_hash,
+                        &api_path,
+                        abi,
+                        &function.sig,
+                        &function.block,
+                    );
+                }
+                Item::Impl(implementation) => {
+                    for item in implementation.items {
+                        let syn::ImplItem::Fn(method) = item else {
+                            continue;
+                        };
+                        let Some(args) = export_args(&method.attrs)? else {
+                            continue;
+                        };
+                        let api_path = args.name.value();
+                        let abi = known.get(api_path.as_str()).ok_or_else(|| {
+                            format!("Mixin 站点目标没有对应符号清单记录: {api_path}")
+                        })?;
+                        append_function_mixin_sites(
+                            &mut sites,
+                            source_hash,
+                            &api_path,
+                            abi,
+                            &method.sig,
+                            &method.block,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    sites.sort_by(|left, right| {
+        left.api_path
+            .cmp(&right.api_path)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.ordinal.cmp(&right.ordinal))
+    });
+    Ok(sites)
+}
+
+fn append_function_mixin_sites(
+    output: &mut Vec<KernelInterfaceMixinSite>,
+    source_hash: [u8; 32],
+    api_path: &str,
+    abi: &str,
+    signature: &Signature,
+    block: &syn::Block,
+) {
+    let function_tokens = normalize_abi_tokens(quote!(#signature #block));
+    let function_hash = sha256(function_tokens.as_bytes());
+    let frame_abi_hash = sha256(abi.as_bytes());
+    for (kind, selector) in [
+        (kernel_symbols::KERNEL_MIXIN_SITE_HEAD, "head"),
+        (kernel_symbols::KERNEL_MIXIN_SITE_RETURN, "return"),
+    ] {
+        output.push(KernelInterfaceMixinSite {
+            kind,
+            ordinal: 0,
+            source_hash,
+            function_hash,
+            site_hash: site_digest(
+                api_path.as_bytes(),
+                &function_hash,
+                kind,
+                0,
+                selector.as_bytes(),
+                abi,
+            ),
+            frame_abi_hash,
+            api_path: api_path.to_string(),
+            selector: selector.to_string(),
+        });
+    }
+}
+
+fn site_digest(
+    api_path: &[u8],
+    function_hash: &[u8; 32],
+    kind: u16,
+    ordinal: u32,
+    selector: &[u8],
+    abi: &str,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"ELM-KERNEL-MIXIN-SITE-V1\0");
+    digest.update(&(api_path.len() as u32).to_le_bytes());
+    digest.update(api_path);
+    digest.update(function_hash);
+    digest.update(&kind.to_le_bytes());
+    digest.update(&ordinal.to_le_bytes());
+    digest.update(&(selector.len() as u32).to_le_bytes());
+    digest.update(selector);
+    digest.update(&(abi.len() as u32).to_le_bytes());
+    digest.update(abi.as_bytes());
+    digest.finish()
 }
 
 fn scan_repository_api_abis(
@@ -1779,7 +2005,7 @@ fn copy_framework(
             .join(format!("interface.identity.{target}")),
         format!(
             "sha256={}\nfiles={}\n",
-            hex_digest(&manifest.interface_hash),
+            hex_digest(&manifest.source_hash),
             manifest.source_file_count
         ),
     )
@@ -1790,7 +2016,7 @@ fn copy_framework(
             .join("interface.identity"),
         format!(
             "sha256={}\nfiles={}\n",
-            hex_digest(&manifest.interface_hash),
+            hex_digest(&manifest.source_hash),
             manifest.source_file_count
         ),
     )
@@ -2264,6 +2490,29 @@ fn parse_symbol_record(value: &str) -> Result<KernelInterfaceSymbol, String> {
     })
 }
 
+fn parse_mixin_site_record(value: &str) -> Result<KernelInterfaceMixinSite, String> {
+    let fields = value.split('\t').collect::<Vec<_>>();
+    if fields.len() != 8 {
+        return Err("内核接口 mixin_site 记录字段数量错误".to_string());
+    }
+    let selector = String::from_utf8(parse_hex_bytes(fields[3])?)
+        .map_err(|_| "内核接口 Mixin selector 不是 UTF-8".to_string())?;
+    Ok(KernelInterfaceMixinSite {
+        kind: fields[0]
+            .parse()
+            .map_err(|_| "Mixin site kind 无效".to_string())?,
+        ordinal: fields[1]
+            .parse()
+            .map_err(|_| "Mixin site ordinal 无效".to_string())?,
+        api_path: fields[2].to_string(),
+        selector,
+        source_hash: parse_digest(fields[4])?,
+        function_hash: parse_digest(fields[5])?,
+        site_hash: parse_digest(fields[6])?,
+        frame_abi_hash: parse_digest(fields[7])?,
+    })
+}
+
 fn parse_digest(value: &str) -> Result<[u8; 32], String> {
     parse_hex_bytes(value)?
         .try_into()
@@ -2354,12 +2603,20 @@ mod tests {
             support_library: "support.a".to_string(),
             import_library: "imports.so".to_string(),
             symbols: Vec::new(),
+            mixin_sites: Vec::new(),
         };
         copy_framework(&repository, &root, &manifest.target, &manifest).unwrap();
         assert_eq!(
             packaged_framework_hash(&root).unwrap(),
             manifest.framework_hash
         );
+        let identity = fs::read_to_string(
+            root.join("kernel-symbols")
+                .join("interface.identity.test-target"),
+        )
+        .unwrap();
+        assert!(identity.contains(&format!("sha256={}", hex_digest(&manifest.source_hash))));
+        assert!(!identity.contains(&format!("sha256={}", hex_digest(&manifest.interface_hash))));
 
         fs::write(root.join("unexpected.cfg"), b"tampered").unwrap();
         assert_ne!(

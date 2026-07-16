@@ -8,9 +8,9 @@ fn main() {
     let (digest, file_count) = repository_interface_identity(&manifest_dir)
         .unwrap_or_else(|| bundled_interface_identity(&manifest_dir));
     let generated = format!(
-        "/// 当前内核构建的 allocator/general 规范接口 SHA-256。\n\
+        "/// 当前内核构建的 allocator/general/log/sched 规范源码 SHA-256。\n\
          pub const KERNEL_INTERFACE_SOURCE_SHA256: [u8; 32] = {digest:?};\n\
-         /// 参与规范接口摘要的源码和 manifest 文件数量。\n\
+         /// 参与规范源码摘要的源码和 manifest 文件数量。\n\
          pub const KERNEL_INTERFACE_SOURCE_FILE_COUNT: usize = {file_count};\n"
     );
     let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("interface_source.rs");
@@ -22,20 +22,30 @@ fn repository_interface_identity(manifest_dir: &Path) -> Option<([u8; 32], usize
     let repository = manifest_dir.join("../..");
     let allocator = repository.join("libs/allocator");
     let general = repository.join("general");
-    if !allocator.join("src/lib.rs").is_file() || !general.join("src/dev/mod.rs").is_file() {
+    let log = repository.join("libs/log");
+    let sched = repository.join("libs/sched");
+    if !allocator.join("src/lib.rs").is_file()
+        || !general.join("src/dev/mod.rs").is_file()
+        || !log.join("src/lib.rs").is_file()
+        || !sched.join("src/lib.rs").is_file()
+    {
         return None;
     }
     let mut files = Vec::new();
     collect_rust_sources(&allocator.join("src"), "allocator/src", &mut files);
     collect_rust_sources(&general.join("src/dev"), "general/src/dev", &mut files);
+    collect_rust_sources(&log.join("src"), "log/src", &mut files);
+    collect_rust_sources(&sched.join("src"), "sched/src", &mut files);
     files.push((
         "allocator/Cargo.toml".to_string(),
         allocator.join("Cargo.toml"),
     ));
     files.push(("general/Cargo.toml".to_string(), general.join("Cargo.toml")));
+    files.push(("log/Cargo.toml".to_string(), log.join("Cargo.toml")));
+    files.push(("sched/Cargo.toml".to_string(), sched.join("Cargo.toml")));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     if files.is_empty() {
-        panic!("没有找到 allocator/general 规范接口源码");
+        panic!("没有找到 allocator/general/log/sched 规范接口源码");
     }
 
     let mut hash = Sha256::new();

@@ -9,8 +9,9 @@ use elm::{
     ELM_META_FIELD_MODE, ELM_META_FIELD_NAME, ELM_META_FIELD_PAYLOAD_CONTRACT,
     ELM_META_FIELD_POINT, ELM_META_FIELD_PRIORITY, ELM_META_FIELD_RUST_ABI, ELM_META_FIELD_STAGE,
     ELM_META_FIELD_SYMBOL, ELM_META_FIELD_TARGET, ELM_META_FIELD_VERSION, ELM_META_FIELD_WIRE_SIZE,
-    ELM_MODULE_DESCRIPTOR_SYMBOL, ElmMixinMode, ElmPortAccessPolicy, ElmRustMetadataKind,
-    ElmRustMetadataRecord, FlowDirection, FlowMode, parse_rust_metadata_section, sha256,
+    ELM_MODULE_DESCRIPTOR_SYMBOL, ElmKernelMixinKind, ElmMixinMode, ElmPortAccessPolicy,
+    ElmRustMetadataKind, ElmRustMetadataRecord, FlowDirection, FlowMode,
+    parse_rust_metadata_section, sha256,
 };
 
 pub fn retain_linked_kernel_symbol_imports(
@@ -31,6 +32,7 @@ pub struct NativeMetadata {
     pub providers: Vec<ProviderSpec>,
     pub extension_points: Vec<ExtensionPointSpec>,
     pub extensions: Vec<ExtensionSpec>,
+    pub kernel_mixins: Vec<KernelMixinSpec>,
     pub api_root_import_index: u32,
     pub api_versions: Vec<u16>,
     pub api_required_features: u64,
@@ -85,6 +87,17 @@ pub struct ExtensionSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct KernelMixinSpec {
+    pub target_api: String,
+    pub selector: String,
+    pub handler_symbol: String,
+    pub kind: ElmKernelMixinKind,
+    pub flags: u16,
+    pub priority: i32,
+    pub handler_abi_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
 pub struct PayloadSpec {
     pub contract: String,
     pub wire_size: u32,
@@ -118,6 +131,7 @@ impl NativeMetadata {
         let mut snapshots = Vec::new();
         let mut extension_points = Vec::new();
         let mut extensions = Vec::new();
+        let mut kernel_mixins = Vec::new();
         let mut payloads = Vec::new();
         for record in &records {
             if record.flags != 0 {
@@ -306,6 +320,42 @@ impl NativeMetadata {
                         priority: field_i32(record, ELM_META_FIELD_PRIORITY)?,
                     });
                 }
+                ElmRustMetadataKind::KernelMixin => {
+                    expect_fields(
+                        record,
+                        &[
+                            ELM_META_FIELD_SYMBOL,
+                            ELM_META_FIELD_NAME,
+                            ELM_META_FIELD_FLAGS,
+                            ELM_META_FIELD_MODE,
+                            ELM_META_FIELD_POINT,
+                            ELM_META_FIELD_PRIORITY,
+                            ELM_META_FIELD_RUST_ABI,
+                        ],
+                    )?;
+                    let kind_raw = u16::try_from(field_u32(record, ELM_META_FIELD_MODE)?)
+                        .map_err(|_| "内核 Mixin kind 超出 u16".to_string())?;
+                    let kind = ElmKernelMixinKind::from_raw(kind_raw)
+                        .ok_or_else(|| "内核 Mixin kind 无效".to_string())?;
+                    let flags = u16::try_from(field_u32(record, ELM_META_FIELD_FLAGS)?)
+                        .map_err(|_| "内核 Mixin flags 超出 u16".to_string())?;
+                    if flags != kind.required_flags() {
+                        return Err("内核 Mixin kind 与 flags 不一致".to_string());
+                    }
+                    let handler_abi = field_string(record, ELM_META_FIELD_RUST_ABI)?;
+                    if handler_abi != kernel_symbols::KERNEL_MIXIN_HANDLER_RUST_ABI_V1 {
+                        return Err("内核 Mixin handler ABI 不符合 v1".to_string());
+                    }
+                    kernel_mixins.push(KernelMixinSpec {
+                        target_api: field_string(record, ELM_META_FIELD_NAME)?,
+                        selector: field_string(record, ELM_META_FIELD_POINT)?,
+                        handler_symbol: field_string(record, ELM_META_FIELD_SYMBOL)?,
+                        kind,
+                        flags,
+                        priority: field_i32(record, ELM_META_FIELD_PRIORITY)?,
+                        handler_abi_hash: sha256(handler_abi.as_bytes()),
+                    });
+                }
                 ElmRustMetadataKind::Payload => {
                     expect_fields(
                         record,
@@ -329,6 +379,7 @@ impl NativeMetadata {
             snapshots,
             &mut extension_points,
             &mut extensions,
+            &mut kernel_mixins,
             &mut payloads,
         )?;
         let module_descriptor =
@@ -340,6 +391,7 @@ impl NativeMetadata {
             providers,
             extension_points,
             extensions,
+            kernel_mixins,
             api_root_import_index: 0,
             api_versions: vec![ELM_API_VERSION_V1],
             api_required_features: ELM_API_FEATURES_V1,
@@ -363,6 +415,9 @@ impl NativeMetadata {
                 names.insert(snapshot.clone());
             }
         }
+        for mixin in &self.kernel_mixins {
+            names.insert(mixin.handler_symbol.clone());
+        }
         names.into_iter().collect()
     }
 }
@@ -374,6 +429,7 @@ fn validate_and_sort(
     snapshots: Vec<SnapshotSpec>,
     extension_points: &mut Vec<ExtensionPointSpec>,
     extensions: &mut Vec<ExtensionSpec>,
+    kernel_mixins: &mut Vec<KernelMixinSpec>,
     payloads: &mut Vec<PayloadSpec>,
 ) -> Result<(), String> {
     imports[1..].sort_by(|left, right| {
@@ -449,6 +505,30 @@ fn validate_and_sort(
         .any(|items| items[0].target == items[1].target && items[0].point == items[1].point)
     {
         return Err("同一 ELM 不能重复挂接同一个目标补缀点".to_string());
+    }
+    kernel_mixins.sort_by(|left, right| {
+        left.target_api
+            .cmp(&right.target_api)
+            .then_with(|| left.selector.cmp(&right.selector))
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.handler_symbol.cmp(&right.handler_symbol))
+    });
+    if kernel_mixins
+        .windows(2)
+        .any(|items| items[0].handler_symbol == items[1].handler_symbol)
+    {
+        return Err("重复内核 Mixin handler symbol".to_string());
+    }
+    for mixin in kernel_mixins.iter() {
+        if mixin.target_api.is_empty()
+            || mixin.target_api.len() > elm::ELM_EBI_SYMBOL_NAME_LEN
+            || mixin.selector.is_empty()
+            || mixin.selector.len() > elm::ELM_EBI_KERNEL_MIXIN_SELECTOR_LEN
+            || mixin.handler_symbol.is_empty()
+            || mixin.handler_symbol.len() > elm::ELM_EBI_SYMBOL_NAME_LEN
+        {
+            return Err("内核 Mixin 元数据字段超过 EBI v1 上限".to_string());
+        }
     }
     payloads.sort_by(|left, right| left.contract.cmp(&right.contract));
     if payloads
@@ -623,6 +703,7 @@ mod tests {
             &mut exports,
             &mut Vec::new(),
             Vec::new(),
+            &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),

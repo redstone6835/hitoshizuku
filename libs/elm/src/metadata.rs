@@ -92,6 +92,8 @@ pub enum ElmRustMetadataKind {
     Extension = 8,
     /// `Payload` 表示 `ElmRustMetadataKind` 的对象类别：`payload`。
     Payload = 9,
+    /// `KernelMixin` 表示精确绑定内核导出函数源码站点的原生处理器。
+    KernelMixin = 10,
     /// `Module` 表示当前镜像唯一的统一模块描述符。
     Module = 18,
 }
@@ -109,6 +111,7 @@ impl ElmRustMetadataKind {
             7 => Some(Self::ExtensionPoint),
             8 => Some(Self::Extension),
             9 => Some(Self::Payload),
+            10 => Some(Self::KernelMixin),
             18 => Some(Self::Module),
             _ => None,
         }
