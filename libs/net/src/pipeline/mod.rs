@@ -3,6 +3,7 @@
 use crate::buf::{DropReason, NetBufPoolError, PacketBatch, PacketChain, PacketMetadata};
 use crate::control::ConfigSnapshot;
 use crate::flow::{FlowKey, rss_hash};
+use crate::transport::{TCP_PROTOCOL_NUMBER, TcpPacket, parse_tcp_packet};
 use crate::tuning::PACKET_BATCH_CAPACITY;
 use crate::{Endpoint, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
 
@@ -71,6 +72,7 @@ pub enum ControlPacket {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrontendDisposition {
+    Tcp,
     Udp,
     Control(ControlPacket),
     Drop(DropReason),
@@ -80,6 +82,7 @@ pub enum FrontendDisposition {
 pub struct ParsedPacket {
     pub ethernet: EthernetHeader,
     pub ip: Option<IpPacket>,
+    pub tcp: Option<TcpPacket>,
     pub udp: Option<UdpPacket>,
     pub flow: Option<FlowKey>,
     pub rss_hash: Option<u32>,
@@ -194,6 +197,7 @@ impl VectorFrontend {
                 parsed: ParsedPacket {
                     ethernet,
                     ip: None,
+                    tcp: None,
                     udp: None,
                     flow: None,
                     rss_hash: None,
@@ -300,6 +304,28 @@ impl VectorFrontend {
                 continue;
             }
             match ip.next_header {
+                TCP_PROTOCOL_NUMBER => match parse_tcp_packet(&packet.chain, ip) {
+                    Ok(tcp) => {
+                        packet.parsed.tcp = Some(tcp);
+                        packet.parsed.flow = FlowKey::new(
+                            Endpoint {
+                                addr: ip.source,
+                                port: tcp.source_port,
+                            },
+                            Endpoint {
+                                addr: ip.destination,
+                                port: tcp.destination_port,
+                            },
+                            TransportProtocol::Tcp,
+                        );
+                        if packet.parsed.flow.is_some() {
+                            packet.parsed.disposition = FrontendDisposition::Tcp;
+                        } else {
+                            set_drop(packet, DropReason::MalformedTcp);
+                        }
+                    }
+                    Err(reason) => set_drop(packet, reason),
+                },
                 IP_PROTOCOL_UDP => match parse_udp(&packet.chain, ip) {
                     Ok(udp) => {
                         packet.parsed.udp = Some(udp);
@@ -746,6 +772,7 @@ mod tests {
     use crate::NetDeviceId;
     use crate::buf::{NetBufPool, NetBufStorage};
     use crate::control::{AddressEntry, InterfaceSnapshot, RouteEntry};
+    use crate::transport::{TcpFlags, TcpSequence};
 
     struct Storage {
         bytes: Box<[u8]>,
@@ -819,6 +846,38 @@ mod tests {
         frame
     }
 
+    fn tcp_frame() -> [u8; 54] {
+        let source = Ipv4Addr::new(10, 0, 2, 2);
+        let destination = Ipv4Addr::new(10, 0, 2, 15);
+        let mut frame = [0u8; 54];
+        frame[0..6].copy_from_slice(&[2; 6]);
+        frame[6..12].copy_from_slice(&[1; 6]);
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&40u16.to_be_bytes());
+        frame[22] = 64;
+        frame[23] = TCP_PROTOCOL_NUMBER;
+        frame[26..30].copy_from_slice(&source.0);
+        frame[30..34].copy_from_slice(&destination.0);
+        frame[34..36].copy_from_slice(&1000u16.to_be_bytes());
+        frame[36..38].copy_from_slice(&9000u16.to_be_bytes());
+        frame[38..42].copy_from_slice(&123u32.to_be_bytes());
+        frame[46] = 5 << 4;
+        frame[47] = TcpFlags::SYN.bits() as u8;
+        frame[48..50].copy_from_slice(&32768u16.to_be_bytes());
+
+        let mut tcp_checksum = InternetChecksum::new();
+        tcp_checksum.add(&source.0);
+        tcp_checksum.add(&destination.0);
+        tcp_checksum.add(&[0, TCP_PROTOCOL_NUMBER]);
+        tcp_checksum.add(&20u16.to_be_bytes());
+        tcp_checksum.add(&frame[34..54]);
+        frame[50..52].copy_from_slice(&tcp_checksum.finish().to_be_bytes());
+        let ip_checksum = checksum_bytes(&frame[14..34]);
+        frame[24..26].copy_from_slice(&ip_checksum.to_be_bytes());
+        frame
+    }
+
     #[test]
     fn batch_frontend_parses_ipv4_udp_without_linearizing() {
         let storage = (0..2)
@@ -852,6 +911,41 @@ mod tests {
     }
 
     #[test]
+    fn batch_frontend_classifies_ipv4_tcp_without_linearizing() {
+        let storage = (0..2)
+            .map(|_| {
+                Box::new(Storage {
+                    bytes: vec![0; 128].into_boxed_slice(),
+                }) as Box<dyn NetBufStorage>
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .into_boxed_slice();
+        let mut owner = NetBufPool::new(storage).unwrap();
+        let frame = tcp_frame();
+        let mut first = owner.lease(0, 37, PacketMetadata::default()).unwrap();
+        first.as_mut_slice().unwrap().copy_from_slice(&frame[..37]);
+        let mut second = owner
+            .lease(0, (frame.len() - 37) as u16, PacketMetadata::default())
+            .unwrap();
+        second.as_mut_slice().unwrap().copy_from_slice(&frame[37..]);
+        let mut chain = PacketChain::from_lease(first);
+        assert!(
+            chain
+                .push(crate::buf::PacketFragment::Exclusive(second))
+                .is_ok()
+        );
+        let mut input = PacketBatch::new();
+        assert!(input.push(chain, PacketMetadata::default()).is_ok());
+        let mut output = FrontendBatch::new();
+        VectorFrontend::new([1; 40], 1).process(InterfaceId(1), &config(), &mut input, &mut output);
+        let packet = output.packet(0).unwrap();
+        assert_eq!(packet.parsed.disposition, FrontendDisposition::Tcp);
+        assert_eq!(packet.parsed.tcp.unwrap().sequence, TcpSequence(123));
+        assert_eq!(packet.parsed.flow.unwrap().protocol, TransportProtocol::Tcp);
+        assert!(packet.parsed.rss_hash.is_some());
+    }
+
+    #[test]
     fn vlan_is_rejected_with_stable_reason() {
         let storage = vec![Box::new(Storage {
             bytes: vec![0; 64].into_boxed_slice(),
@@ -877,6 +971,45 @@ mod tests {
     #[test]
     fn every_ipv4_udp_truncation_is_bounded() {
         let frame = udp_frame();
+        let storage = (0..frame.len())
+            .map(|_| {
+                Box::new(Storage {
+                    bytes: vec![0; 64].into_boxed_slice(),
+                }) as Box<dyn NetBufStorage>
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .into_boxed_slice();
+        let mut owner = NetBufPool::new(storage).unwrap();
+        for len in 0..frame.len() {
+            let mut lease = owner
+                .lease(0, len as u16, PacketMetadata::default())
+                .unwrap();
+            lease.as_mut_slice().unwrap().copy_from_slice(&frame[..len]);
+            let mut input = PacketBatch::new();
+            assert!(
+                input
+                    .push(PacketChain::from_lease(lease), PacketMetadata::default())
+                    .is_ok()
+            );
+            let mut output = FrontendBatch::new();
+            VectorFrontend::new([1; 40], 1).process(
+                InterfaceId(1),
+                &config(),
+                &mut input,
+                &mut output,
+            );
+            assert!(matches!(
+                output.packet(0).unwrap().parsed.disposition,
+                FrontendDisposition::Drop(_)
+            ));
+            output.clear();
+            owner.drain_remote();
+        }
+    }
+
+    #[test]
+    fn every_ipv4_tcp_truncation_is_bounded() {
+        let frame = tcp_frame();
         let storage = (0..frame.len())
             .map(|_| {
                 Box::new(Storage {

@@ -31,6 +31,7 @@ pub const SOCK_DGRAM_PUB: u16 = SOCK_DGRAM;
 #[derive(Debug, Clone, Copy)]
 pub struct InetSendOptions {
     pub nonblocking: bool,
+    pub more: bool,
     pub deadline_ns: Option<u64>,
 }
 
@@ -158,18 +159,39 @@ impl NetSocketFileOps {
             .map_err(map_socket_error)
     }
 
-    pub fn listen(&self, _backlog: u32) -> Result<(), Errno> {
-        Err(Errno::EOPNOTSUPP)
+    pub fn listen(&self, backlog: u32) -> Result<(), Errno> {
+        if self.sock_type != SOCK_STREAM {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.facade.listen(backlog).map_err(map_socket_error)
     }
 
-    pub fn accept(&self, _nonblock: bool) -> Result<Self, Errno> {
-        Err(Errno::EOPNOTSUPP)
+    pub fn accept(
+        &self,
+        wait_nonblocking: bool,
+        accepted_nonblocking: bool,
+    ) -> Result<Self, Errno> {
+        if self.sock_type != SOCK_STREAM {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let facade = self
+            .facade
+            .accept(wait_nonblocking, self.recv_deadline())
+            .map_err(map_socket_error)?;
+        Ok(Self::from_facade(
+            self.family,
+            self.sock_type,
+            self.protocol,
+            facade,
+            accepted_nonblocking,
+            self.options.lock().clone(),
+        ))
     }
 
-    pub fn connect(&self, sockaddr: &[u8], _nonblocking: bool) -> Result<(), Errno> {
+    pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
         let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
         self.facade
-            .connect(peer, None, self.bind_options())
+            .connect_with_mode(peer, None, self.bind_options(), nonblocking)
             .map_err(map_socket_error)
     }
 
@@ -189,6 +211,20 @@ impl NetSocketFileOps {
         sockaddr: Option<&[u8]>,
         opts: InetSendOptions,
     ) -> Result<usize, Errno> {
+        if self.sock_type == SOCK_STREAM {
+            if sockaddr.is_some() {
+                return Err(Errno::EISCONN);
+            }
+            let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
+            self.facade.set_tcp_more(opts.more);
+            return self
+                .facade
+                .send_stream(data, opts.nonblocking, deadline)
+                .map_err(map_socket_error);
+        }
+        if opts.more {
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.ensure_bound()?;
         let destination = sockaddr
             .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family))
@@ -200,8 +236,23 @@ impl NetSocketFileOps {
     }
 
     pub fn recvfrom(&self, buf: &mut [u8], opts: InetRecvOptions) -> Result<InetRecvResult, Errno> {
-        self.ensure_bound()?;
         let deadline = opts.deadline_ns.or_else(|| self.recv_deadline());
+        if self.sock_type == SOCK_STREAM {
+            let len = self
+                .facade
+                .recv_stream(buf, opts.peek, opts.wait_all, opts.nonblocking, deadline)
+                .map_err(map_socket_error)?;
+            return Ok(InetRecvResult {
+                len,
+                remote: self.facade.peer_endpoint(),
+                local: self.facade.local_endpoint(),
+                interface_id: None,
+                hop_limit: None,
+                traffic_class: None,
+                msg_flags: 0,
+            });
+        }
+        self.ensure_bound()?;
         let received = self
             .facade
             .recv(buf, opts.peek, opts.trunc, opts.nonblocking, deadline)
@@ -275,6 +326,32 @@ impl NetSocketFileOps {
     fn send_deadline(&self) -> Option<u64> {
         timeout_deadline(self.send_timeout_ns.load(Ordering::Relaxed))
     }
+
+    fn from_facade(
+        family: u16,
+        sock_type: u16,
+        protocol: u16,
+        facade: Arc<net::SocketFacade>,
+        nonblock: bool,
+        options: SocketOptions,
+    ) -> Self {
+        let readiness = facade.readiness();
+        let poll_source = Arc::new(PollSource::new(PollEvents::default()));
+        let observer: Arc<dyn net::ReadinessObserver> = poll_source.clone();
+        facade.set_observer(Arc::downgrade(&observer));
+        observer.readiness_changed(readiness.0, readiness.1);
+        Self {
+            family,
+            sock_type,
+            protocol,
+            facade,
+            poll_source,
+            nonblock: AtomicBool::new(nonblock),
+            recv_timeout_ns: AtomicU64::new(0),
+            send_timeout_ns: AtomicU64::new(0),
+            options: Mutex::new(options),
+        }
+    }
 }
 
 impl FileOps for NetSocketFileOps {
@@ -299,6 +376,7 @@ impl FileOps for NetSocketFileOps {
             None,
             InetSendOptions {
                 nonblocking: self.nonblock.load(Ordering::Relaxed),
+                more: false,
                 deadline_ns: None,
             },
         )
@@ -407,28 +485,39 @@ pub fn create_net_socket(
         crate::addr::AF_INET6 => net::AddressFamily::Ipv6,
         _ => return Err(Errno::EAFNOSUPPORT),
     };
-    if sock_type != SOCK_DGRAM || !matches!(protocol, 0 | 17) {
-        return Err(Errno::Other(93));
+    match sock_type {
+        SOCK_DGRAM if matches!(protocol, 0 | 17) => {
+            let facade = net::new_socket_facade(address_family).map_err(map_socket_error)?;
+            Ok(NetSocketFileOps::from_facade(
+                family,
+                sock_type,
+                17,
+                facade,
+                nonblock,
+                SocketOptions {
+                    sndbuf: 128 * 1024,
+                    rcvbuf: 128 * 1024,
+                    ..SocketOptions::default()
+                },
+            ))
+        }
+        SOCK_STREAM if matches!(protocol, 0 | 6) => {
+            let facade = net::new_tcp_socket_facade(address_family).map_err(map_socket_error)?;
+            Ok(NetSocketFileOps::from_facade(
+                family,
+                sock_type,
+                6,
+                facade,
+                nonblock,
+                SocketOptions {
+                    sndbuf: 256 * 1024,
+                    rcvbuf: 256 * 1024,
+                    ..SocketOptions::default()
+                },
+            ))
+        }
+        _ => Err(Errno::Other(93)),
     }
-    let facade = net::new_socket_facade(address_family).map_err(map_socket_error)?;
-    let poll_source = Arc::new(PollSource::new(PollEvents::POLLOUT));
-    let observer: Arc<dyn net::ReadinessObserver> = poll_source.clone();
-    facade.set_observer(Arc::downgrade(&observer));
-    Ok(NetSocketFileOps {
-        family,
-        sock_type,
-        protocol: 17,
-        facade,
-        poll_source,
-        nonblock: AtomicBool::new(nonblock),
-        recv_timeout_ns: AtomicU64::new(0),
-        send_timeout_ns: AtomicU64::new(0),
-        options: Mutex::new(SocketOptions {
-            sndbuf: 128 * 1024,
-            rcvbuf: 128 * 1024,
-            ..SocketOptions::default()
-        }),
-    })
 }
 
 fn unspecified(family: u16) -> net::IpAddr {
@@ -453,8 +542,10 @@ fn map_socket_error(error: net::SocketError) -> Errno {
         net::SocketError::NotConnected => Errno::ENOTCONN,
         net::SocketError::DestinationRequired => Errno::EDESTADDRREQ,
         net::SocketError::AlreadyConnected => Errno::EISCONN,
+        net::SocketError::AlreadyInProgress => Errno::EALREADY,
+        net::SocketError::InProgress => Errno::EINPROGRESS,
         net::SocketError::Interrupted => Errno::EINTR,
-        net::SocketError::TimedOut => Errno::EAGAIN,
+        net::SocketError::TimedOut => Errno::ETIMEDOUT,
         net::SocketError::MessageTooLarge => Errno::EMSGSIZE,
         net::SocketError::ReadShutdown => Errno::ENOTCONN,
         net::SocketError::WriteShutdown => Errno::EPIPE,
@@ -462,6 +553,8 @@ fn map_socket_error(error: net::SocketError) -> Errno {
         net::SocketError::NetworkUnreachable => Errno::Other(101),
         net::SocketError::HostUnreachable => Errno::Other(113),
         net::SocketError::Buffer => Errno::ENOMEM,
+        net::SocketError::ConnectionRefused => Errno::ECONNREFUSED,
+        net::SocketError::ConnectionReset => Errno::ECONNRESET,
     }
 }
 

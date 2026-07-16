@@ -42,10 +42,14 @@ pub enum DropReason {
     RouteUnavailable,
     TxQueueFull,
     IngressRingFull,
+    MalformedTcp,
+    TcpChecksum,
+    TcpNoEndpoint,
+    TcpRingFull,
 }
 
 impl DropReason {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 27] = [
         Self::None,
         Self::NoConsumer,
         Self::MalformedDescriptor,
@@ -69,9 +73,13 @@ impl DropReason {
         Self::RouteUnavailable,
         Self::TxQueueFull,
         Self::IngressRingFull,
+        Self::MalformedTcp,
+        Self::TcpChecksum,
+        Self::TcpNoEndpoint,
+        Self::TcpRingFull,
     ];
 
-    pub const COUNT: usize = 23;
+    pub const COUNT: usize = 27;
 
     pub const fn index(self) -> usize {
         self as usize
@@ -99,6 +107,10 @@ impl DropReason {
             Self::UdpChecksum => "drop_udp_checksum",
             Self::UdpNoEndpoint => "drop_udp_no_endpoint",
             Self::UdpRingFull => "drop_udp_ring_full",
+            Self::MalformedTcp => "drop_malformed_tcp",
+            Self::TcpChecksum => "drop_tcp_checksum",
+            Self::TcpNoEndpoint => "drop_tcp_no_endpoint",
+            Self::TcpRingFull => "drop_tcp_ring_full",
             Self::FlowTableFull => "drop_flow_table_full",
             Self::RouteUnavailable => "drop_route_unavailable",
             Self::TxQueueFull => "drop_tx_queue_full",

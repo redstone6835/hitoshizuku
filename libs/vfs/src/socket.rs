@@ -47,6 +47,18 @@ pub const SOCK_NONBLOCK: usize = 0o00004000;
 pub const SOCK_CLOEXEC: usize = 0o02000000;
 
 pub const SOL_SOCKET: i32 = 1;
+pub const SOL_TCP: i32 = 6;
+pub const TCP_NODELAY: i32 = 1;
+pub const TCP_MAXSEG: i32 = 2;
+pub const TCP_CORK: i32 = 3;
+pub const TCP_KEEPIDLE: i32 = 4;
+pub const TCP_KEEPINTVL: i32 = 5;
+pub const TCP_KEEPCNT: i32 = 6;
+pub const TCP_INFO: i32 = 11;
+pub const TCP_QUICKACK: i32 = 12;
+pub const TCP_CONGESTION: i32 = 13;
+pub const TCP_USER_TIMEOUT: i32 = 18;
+pub const TCP_FASTOPEN: i32 = 23;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_BROADCAST: i32 = 6;
 pub const SO_KEEPALIVE: i32 = 9;
@@ -598,12 +610,16 @@ pub fn socket(
 
     match domain as u16 {
         crate::addr::AF_INET | crate::addr::AF_INET6 => {
-            if kind != SocketType::Datagram {
+            if !matches!(kind, SocketType::Datagram | SocketType::Stream) {
                 return Err(Errno::Other(93));
             }
             let ops = crate::net_socket::create_net_socket(
                 domain as u16,
-                SOCK_DGRAM as u16,
+                match kind {
+                    SocketType::Stream => SOCK_STREAM as u16,
+                    SocketType::Datagram => SOCK_DGRAM as u16,
+                    _ => unreachable!(),
+                },
                 protocol as u16,
                 nonblock,
             )?;
@@ -721,7 +737,7 @@ pub fn accept(
     };
 
     if let Some(net_ops) = file.downcast_ops::<NetSocketFileOps>() {
-        let accepted = net_ops.accept(file.flags().nonblock || nonblock)?;
+        let accepted = net_ops.accept(file.flags().nonblock || nonblock, nonblock)?;
         let peer = {
             let mut buf = vec![0u8; 28];
             let len = accepted.getpeername(&mut buf)?;
@@ -841,17 +857,22 @@ pub fn send(
         if !control.is_empty() {
             return Err(Errno::ENOPROTOOPT);
         }
-        if (flags & (MSG_OOB | MSG_MORE | MSG_DONTROUTE | MSG_CONFIRM)) != 0 {
+        if (flags & (MSG_OOB | MSG_DONTROUTE | MSG_CONFIRM)) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
-        return net_ops.sendto(
+        let result = net_ops.sendto(
             data,
             raw_addr,
             InetSendOptions {
                 nonblocking: file.flags().nonblock || (flags & MSG_DONTWAIT) != 0,
+                more: (flags & MSG_MORE) != 0,
                 deadline_ns: None,
             },
         );
+        if result == Err(Errno::EPIPE) && (flags & MSG_NOSIGNAL) == 0 {
+            deliver_inet_sigpipe();
+        }
+        return result;
     }
     if let Some(nl_ops) = file.downcast_ops::<crate::netlink_socket::NetlinkSocketFileOps>() {
         return nl_ops.write_at(data, 0).map_err(|e| e.to_errno());
@@ -881,6 +902,24 @@ pub fn send(
     }
     result
 }
+
+#[cfg(not(test))]
+fn deliver_inet_sigpipe() {
+    let task = sched::current_task();
+    let credentials = task.credentials();
+    let info = sched::SigInfo {
+        sig: sched::SignalNumber::SIGPIPE,
+        code: 0,
+        sender_pid: task.pid_root().unwrap_or(0),
+        sender_uid: credentials.uid,
+        raw: None,
+    };
+    task.signal.deliver(info);
+    sched::signal_wakeup(&task, &info);
+}
+
+#[cfg(test)]
+fn deliver_inet_sigpipe() {}
 
 pub fn recv(
     fdt: &FdTable,
@@ -1190,6 +1229,30 @@ fn timeval_from_ns(ns: u64) -> [u8; 16] {
     buf
 }
 
+fn encode_tcp_info(info: net::TcpInfoSnapshot) -> Vec<u8> {
+    let mut output = vec![0u8; 136];
+    output[0] = info.state;
+    output[8..12].copy_from_slice(&info.rto_us.to_ne_bytes());
+    output[12..16].copy_from_slice(&40_000u32.to_ne_bytes());
+    output[16..20].copy_from_slice(&info.send_mss.to_ne_bytes());
+    output[20..24].copy_from_slice(&info.send_mss.to_ne_bytes());
+    output[24..28].copy_from_slice(&info.unacknowledged.to_ne_bytes());
+    output[32..36].copy_from_slice(&info.retransmitted.to_ne_bytes());
+    output[60..64].copy_from_slice(&info.send_mss.saturating_add(40).to_ne_bytes());
+    output[64..68].copy_from_slice(&info.receive_space.to_ne_bytes());
+    output[68..72].copy_from_slice(&info.rtt_us.to_ne_bytes());
+    output[72..76].copy_from_slice(&info.rtt_variance_us.to_ne_bytes());
+    output[76..80].copy_from_slice(&info.send_ssthresh.to_ne_bytes());
+    output[80..84].copy_from_slice(&info.congestion_window.to_ne_bytes());
+    output[84..88].copy_from_slice(&info.send_mss.to_ne_bytes());
+    output[88..92].copy_from_slice(&3u32.to_ne_bytes());
+    output[96..100].copy_from_slice(&info.receive_space.to_ne_bytes());
+    output[100..104].copy_from_slice(&info.total_retransmitted.to_ne_bytes());
+    output[120..128].copy_from_slice(&info.bytes_sent.to_ne_bytes());
+    output[128..136].copy_from_slice(&info.bytes_received.to_ne_bytes());
+    output
+}
+
 fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
     let opts = net_ops.options().lock();
     match level {
@@ -1198,6 +1261,11 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             SO_TYPE => Ok((net_ops.sock_type() as i32).to_ne_bytes().to_vec()),
             SO_PROTOCOL => Ok((net_ops.protocol() as i32).to_ne_bytes().to_vec()),
             SO_ERROR => Ok(net_ops.take_last_error_code().to_ne_bytes().to_vec()),
+            SO_ACCEPTCONN => Ok(
+                (matches!(net_ops.facade().owner(), net::OwnerRef::Listener { .. }) as i32)
+                    .to_ne_bytes()
+                    .to_vec(),
+            ),
             SO_SNDBUF => Ok((net_ops.facade().buffer_limits().0 as i32)
                 .to_ne_bytes()
                 .to_vec()),
@@ -1219,6 +1287,11 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 Ok(timeval_from_ns(ns).to_vec())
             }
             SO_TIMESTAMP => Ok((opts.timestamp as i32).to_ne_bytes().to_vec()),
+            SO_KEEPALIVE if net_ops.sock_type() == SOCK_STREAM as u16 => {
+                Ok((net_ops.facade().tcp_keepalive_enabled() as i32)
+                    .to_ne_bytes()
+                    .to_vec())
+            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
@@ -1231,6 +1304,43 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             IPV6_V6ONLY => Ok((opts.v6only as i32).to_ne_bytes().to_vec()),
             IPV6_RECVPKTINFO => Ok((opts.recv_pktinfo_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_RECVHOPLIMIT => Ok((opts.recv_hoplimit_v6 as i32).to_ne_bytes().to_vec()),
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_TCP if net_ops.sock_type() == SOCK_STREAM as u16 => match optname {
+            TCP_NODELAY => Ok((net_ops.facade().tcp_nodelay() as i32)
+                .to_ne_bytes()
+                .to_vec()),
+            TCP_MAXSEG => {
+                let info = net_ops.facade().tcp_info();
+                let mss = if info.send_mss == 0 {
+                    u32::from(net_ops.facade().tcp_maxseg())
+                } else {
+                    info.send_mss
+                };
+                Ok((mss as i32).to_ne_bytes().to_vec())
+            }
+            TCP_CORK => Ok((net_ops.facade().tcp_cork() as i32).to_ne_bytes().to_vec()),
+            TCP_KEEPIDLE => Ok(
+                ((net_ops.facade().tcp_keepidle_ns() / 1_000_000_000) as i32)
+                    .to_ne_bytes()
+                    .to_vec(),
+            ),
+            TCP_KEEPINTVL => Ok(
+                ((net_ops.facade().tcp_keepintvl_ns() / 1_000_000_000) as i32)
+                    .to_ne_bytes()
+                    .to_vec(),
+            ),
+            TCP_KEEPCNT => Ok((i32::from(net_ops.facade().tcp_keepcount()))
+                .to_ne_bytes()
+                .to_vec()),
+            TCP_INFO => Ok(encode_tcp_info(net_ops.facade().tcp_info())),
+            TCP_QUICKACK => Ok(0i32.to_ne_bytes().to_vec()),
+            TCP_CONGESTION => Ok(b"newreno\0".to_vec()),
+            TCP_USER_TIMEOUT => Ok(
+                ((net_ops.facade().tcp_user_timeout_ns() / 1_000_000) as i32)
+                    .to_ne_bytes()
+                    .to_vec(),
+            ),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
@@ -1284,6 +1394,12 @@ fn inet_setsockopt(
                 opts.timestamp = parse_int_opt(value)? != 0;
                 Ok(())
             }
+            SO_KEEPALIVE if net_ops.sock_type() == SOCK_STREAM as u16 => {
+                net_ops
+                    .facade()
+                    .set_tcp_keepalive(parse_int_opt(value)? != 0);
+                Ok(())
+            }
             SO_OOBINLINE => {
                 if parse_int_opt(value)? == 0 {
                     Ok(())
@@ -1321,6 +1437,80 @@ fn inet_setsockopt(
                 opts.recv_hoplimit_v6 = parse_int_opt(value)? != 0;
                 Ok(())
             }
+            _ => Err(Errno::ENOPROTOOPT),
+        },
+        SOL_TCP if net_ops.sock_type() == SOCK_STREAM as u16 => match optname {
+            TCP_NODELAY => {
+                net_ops.facade().set_tcp_nodelay(parse_int_opt(value)? != 0);
+                Ok(())
+            }
+            TCP_MAXSEG => {
+                if matches!(net_ops.facade().owner(), net::OwnerRef::Flow { .. }) {
+                    return Err(Errno::EISCONN);
+                }
+                let mss = parse_int_opt(value)?;
+                if !(536..=u16::MAX as i32).contains(&mss) {
+                    return Err(Errno::EINVAL);
+                }
+                net_ops.facade().set_tcp_maxseg(mss as u16);
+                Ok(())
+            }
+            TCP_CORK => {
+                net_ops.facade().set_tcp_cork(parse_int_opt(value)? != 0);
+                Ok(())
+            }
+            TCP_KEEPIDLE => {
+                let seconds = parse_int_opt(value)?;
+                if seconds < 1 {
+                    return Err(Errno::EINVAL);
+                }
+                net_ops
+                    .facade()
+                    .set_tcp_keepidle_ns((seconds as u64).saturating_mul(1_000_000_000));
+                Ok(())
+            }
+            TCP_KEEPINTVL => {
+                let seconds = parse_int_opt(value)?;
+                if seconds < 1 {
+                    return Err(Errno::EINVAL);
+                }
+                net_ops
+                    .facade()
+                    .set_tcp_keepintvl_ns((seconds as u64).saturating_mul(1_000_000_000));
+                Ok(())
+            }
+            TCP_KEEPCNT => {
+                let count = parse_int_opt(value)?;
+                if !(1..=u16::MAX as i32).contains(&count) {
+                    return Err(Errno::EINVAL);
+                }
+                net_ops.facade().set_tcp_keepcount(count as u16);
+                Ok(())
+            }
+            TCP_CONGESTION => {
+                let end = value
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(value.len());
+                match &value[..end] {
+                    b"reno" | b"newreno" => Ok(()),
+                    _ => Err(Errno::ENOENT),
+                }
+            }
+            TCP_QUICKACK => {
+                if parse_int_opt(value)? != 0 {
+                    net_ops.facade().request_quick_ack();
+                }
+                Ok(())
+            }
+            TCP_USER_TIMEOUT => {
+                let timeout_ms = parse_int_opt(value)?.max(0) as u64;
+                net_ops
+                    .facade()
+                    .set_tcp_user_timeout_ns(timeout_ms.saturating_mul(1_000_000));
+                Ok(())
+            }
+            TCP_FASTOPEN => Err(Errno::EOPNOTSUPP),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),

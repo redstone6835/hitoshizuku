@@ -1037,6 +1037,7 @@ fn prepare_device(
     transport: Arc<dyn NetTransport>,
     context: DmaContext,
     identity: u64,
+    use_msix: bool,
 ) -> Result<PreparedDevice, &'static str> {
     let boot = net::device::boot_config().ok_or("NetBootConfig 尚未安装")?;
     if !transport.reset() {
@@ -1057,9 +1058,14 @@ fn prepare_device(
     } else {
         1
     };
-    // 单队列初始化明确按“无 per-queue vector”评估并记录 fallback，不能因为
-    // 设备公布 MQ/RSS feature 就伪报多队列成功。
-    let mq_plan = plan_mq_rss(offered, boot.active_cpu_count(), device_pairs, 0);
+    // 单队列仍可使用 MSI-X，但不会因此伪报 MQ/RSS 已启用。
+    let available_vectors = if use_msix { 2 } else { 0 };
+    let mq_plan = plan_mq_rss(
+        offered,
+        boot.active_cpu_count(),
+        device_pairs,
+        available_vectors,
+    );
     if let MqRssPlan::Single(reason) = mq_plan {
         log::printk!(
             "[virtio-net] single-queue fallback: {:?} offered={:#x} pairs={}",
@@ -1081,8 +1087,12 @@ fn prepare_device(
         transport.set_status(u32::from(VIRTIO_STATUS_FAILED));
         return Err("设备拒绝 FEATURES_OK");
     }
-    let rx = setup_data_queue(transport.as_ref(), context, RX_QUEUE, None)?;
-    let tx = setup_data_queue(transport.as_ref(), context, TX_QUEUE, None)?;
+    if use_msix {
+        transport.set_config_msix_vector(1)?;
+    }
+    let queue_vector = use_msix.then_some(0);
+    let rx = setup_data_queue(transport.as_ref(), context, RX_QUEUE, queue_vector)?;
+    let tx = setup_data_queue(transport.as_ref(), context, TX_QUEUE, queue_vector)?;
     let queue_size = rx.size.min(tx.size) as usize;
     let irq = Arc::new(VirtioQueueIrq {
         transport: Arc::clone(&transport),
@@ -1090,7 +1100,7 @@ fn prepare_device(
         tx_avail: tx.avail,
         rx_avail_sync: rx.avail_dma.sync_handle(),
         tx_avail_sync: tx.avail_dma.sync_handle(),
-        uses_isr_status: true,
+        uses_isr_status: !use_msix,
         waker: Mutex::new(None),
         masked: AtomicBool::new(true),
         pending: AtomicBool::new(false),
@@ -1466,7 +1476,12 @@ impl MqSetupTransaction for VirtioMqSetupTransaction<'_> {
     }
 
     fn prepare_single(&mut self) -> Result<Self::Prepared, Self::SingleError> {
-        prepare_device(Arc::clone(&self.transport), self.context, self.identity)
+        prepare_device(
+            Arc::clone(&self.transport),
+            self.context,
+            self.identity,
+            false,
+        )
     }
 }
 
@@ -1673,7 +1688,7 @@ impl PnpDriver for VirtioNetPciDriver {
             .unwrap_or(0);
         let transport: Arc<dyn NetTransport> = Arc::new(PciNetTransport(pci_transport));
         let mq_plan = inspect_mq_plan(transport.as_ref(), pci.msix_table_size().unwrap_or(0));
-        let (prepared, multi_irq) = match mq_plan {
+        let (prepared, multi_irq, single_msix) = match mq_plan {
             MqRssPlan::Multi { pairs } => {
                 let mut transaction = VirtioMqSetupTransaction {
                     device,
@@ -1689,23 +1704,34 @@ impl PnpDriver for VirtioNetPciDriver {
                     MqSetupOutcome::Multi {
                         prepared,
                         activation,
-                    } => (prepared, Some(activation)),
+                    } => (prepared, Some(activation), None),
                     MqSetupOutcome::Single { prepared, reason } => {
                         log::printk!(
                             "[virtio-net] MQ/RSS 候选失败，reset-to-single: {}",
                             reason.describe()
                         );
-                        (prepared, None)
+                        (prepared, None, None)
                     }
                 }
             }
             MqRssPlan::Single(_) => {
-                let prepared = prepare_device(Arc::clone(&transport), pci.dma_context(), identity)
-                    .map_err(|message| {
+                let single_msix = pci.try_configure_msix(2).ok();
+                let prepared = match prepare_device(
+                    Arc::clone(&transport),
+                    pci.dma_context(),
+                    identity,
+                    single_msix.is_some(),
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(message) => {
+                        if let Some(set) = single_msix {
+                            pci.release_configured_msix(set);
+                        }
                         log::printk!("[virtio-net] probe 失败: {}", message);
-                        PnpError::hardware_failure("virtio-net init failed")
-                    })?;
-                (prepared, None)
+                        return Err(PnpError::hardware_failure("virtio-net init failed"));
+                    }
+                };
+                (prepared, None, single_msix)
             }
         };
         let name = NET_IFACE_NAMES
@@ -1713,6 +1739,8 @@ impl PnpDriver for VirtioNetPciDriver {
             .into_string();
         let irq_registration = if let Some(registration) = multi_irq {
             Some(registration)
+        } else if let Some(set) = single_msix {
+            Some(register_msix_irqs(device, &pci, set, &prepared.queues)?)
         } else {
             Some(register_irq(
                 device,
@@ -1929,8 +1957,8 @@ impl PnpDriver for VirtioNetMmioDriver {
             ));
         }
         let transport: Arc<dyn NetTransport> = Arc::new(MmioNetTransport { inner });
-        let prepared =
-            prepare_device(transport, info.dma_context(), physical as u64).map_err(|message| {
+        let prepared = prepare_device(transport, info.dma_context(), physical as u64, false)
+            .map_err(|message| {
                 log::printk!("[virtio-mmio-net] probe 失败: {}", message);
                 PnpError::hardware_failure("virtio-mmio net init failed")
             })?;

@@ -23,11 +23,11 @@ use net::device::{
 };
 use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
-use net::transport::{PreparedUdpTx, build_udp_packet};
+use net::transport::{PreparedTcpTx, PreparedUdpTx, build_tcp_packet, build_udp_packet};
 use net::{
     AddressFamily, Endpoint, FlowId, FlowShard, FlowTurnContext, InterfaceId, IpAddr, Ipv4Addr,
-    Ipv6Addr, OwnerRef, ShardId, SocketCommand, SocketError, SocketFacade, SocketRuntime,
-    TransportProtocol,
+    Ipv6Addr, OwnerRef, ShardId, SocketCommand, SocketError, SocketFacade, SocketKind,
+    SocketRuntime, TransportProtocol,
 };
 use sched::sync::Spinlock;
 
@@ -195,6 +195,7 @@ struct QueueRuntimeStats {
     fatal_dma_fault: AtomicU64,
     fatal_ring_corrupt: AtomicU64,
     drop_reasons: [AtomicU64; DropReason::COUNT],
+    protocol_tcp_delivered: AtomicU64,
     protocol_udp_delivered: AtomicU64,
     protocol_control_packets: AtomicU64,
     protocol_tx_formed: AtomicU64,
@@ -232,6 +233,7 @@ impl QueueRuntimeStats {
             fatal_dma_fault: AtomicU64::new(0),
             fatal_ring_corrupt: AtomicU64::new(0),
             drop_reasons: core::array::from_fn(|_| AtomicU64::new(0)),
+            protocol_tcp_delivered: AtomicU64::new(0),
             protocol_udp_delivered: AtomicU64::new(0),
             protocol_control_packets: AtomicU64::new(0),
             protocol_tx_formed: AtomicU64::new(0),
@@ -455,6 +457,10 @@ impl NetDeviceRegistrar for KernelNetRegistrar {
                         stats.protocol_tx_formed.load(Ordering::Relaxed),
                     ),
                     (
+                        "protocol_tcp_delivered",
+                        stats.protocol_tcp_delivered.load(Ordering::Relaxed),
+                    ),
+                    (
                         "protocol_udp_delivered",
                         stats.protocol_udp_delivered.load(Ordering::Relaxed),
                     ),
@@ -535,6 +541,7 @@ enum IngressWork {
 
 enum EgressWork {
     Packet(TxPacket),
+    Tcp(PreparedTcpTx),
     Udp(PreparedUdpTx),
 }
 
@@ -605,6 +612,9 @@ struct ProtocolRuntime {
     lifecycle: BoundedMpsc<Arc<SocketFacade>>,
     pending: AtomicBool,
     owner_task: Spinlock<Option<Arc<sched::Task>>>,
+    deadline_registration: AtomicU64,
+    deadline_ns: AtomicU64,
+    timer_fired: AtomicBool,
     egress: Box<[Arc<EgressChannel>]>,
 }
 
@@ -617,6 +627,9 @@ impl ProtocolRuntime {
             lifecycle: BoundedMpsc::new(4096),
             pending: AtomicBool::new(false),
             owner_task: Spinlock::new(None),
+            deadline_registration: AtomicU64::new(0),
+            deadline_ns: AtomicU64::new(0),
+            timer_fired: AtomicBool::new(false),
             egress: egress.into_boxed_slice(),
         }
     }
@@ -628,6 +641,37 @@ impl ProtocolRuntime {
     fn wake_owner(&self) {
         if let Some(task) = self.owner_task.lock().as_ref().cloned() {
             let _ = sched::activate_task(&task);
+        }
+    }
+
+    fn arm_timer(self: &Arc<Self>, deadline_ns: Option<u64>) {
+        let deadline_ns = deadline_ns.unwrap_or(0);
+        let current = self.deadline_registration.load(Ordering::Acquire);
+        if current != 0 && self.deadline_ns.load(Ordering::Acquire) == deadline_ns {
+            return;
+        }
+        if current != 0 {
+            sched::cancel_deadline_observer(current);
+            self.deadline_registration.store(0, Ordering::Release);
+        }
+        self.deadline_ns.store(deadline_ns, Ordering::Release);
+        if deadline_ns == 0 {
+            return;
+        }
+        let registration = sched::reserve_deadline_observer_id();
+        self.deadline_registration
+            .store(registration, Ordering::Release);
+        let observer: Arc<dyn sched::DeadlineObserver> = self.clone();
+        if !sched::register_deadline_observer(registration, deadline_ns, Arc::downgrade(&observer))
+        {
+            self.deadline_registration
+                .compare_exchange(registration, 0, Ordering::AcqRel, Ordering::Acquire)
+                .ok();
+            self.deadline_ns.store(0, Ordering::Release);
+            self.timer_fired.store(true, Ordering::Release);
+            if !self.pending.swap(true, Ordering::AcqRel) {
+                self.wake_owner();
+            }
         }
     }
 
@@ -646,12 +690,29 @@ impl ProtocolRuntime {
             || !self.control.is_empty()
             || !self.dirty.is_empty()
             || !self.lifecycle.is_empty()
+            || self.timer_fired.load(Ordering::Acquire)
         {
             self.pending.store(true, Ordering::Release);
             true
         } else {
             false
         }
+    }
+}
+
+impl sched::DeadlineObserver for ProtocolRuntime {
+    fn deadline_expired(&self, registration: u64, _now_ns: u64) -> Option<u64> {
+        if self
+            .deadline_registration
+            .compare_exchange(registration, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.deadline_ns.store(0, Ordering::Release);
+            self.timer_fired.store(true, Ordering::Release);
+            self.pending.store(true, Ordering::Release);
+            self.wake_owner();
+        }
+        None
     }
 }
 
@@ -915,6 +976,7 @@ pub fn start_workers() {
         *boot.rss_key(),
         rss_generation,
         *boot.hash_seed(),
+        *boot.tcp_isn_key(),
         sched::now_ns_public(),
     );
     *PROTOCOL_START.lock() = Some(Box::new(ProtocolContext {
@@ -1056,6 +1118,11 @@ impl ProtocolContext {
                 processed += count;
                 self.process_pending(count, &config);
             }
+            self.runtime.timer_fired.store(false, Ordering::Release);
+            self.protocol.run_due_timers(sched::now_ns_public());
+            self.dispatch_tcp_output();
+            self.runtime
+                .arm_timer(self.protocol.next_timer_deadline_ns());
             if processed == 128
                 || lifecycle == 256
                 || control == 256
@@ -1100,11 +1167,39 @@ impl ProtocolContext {
                     peer,
                     interface,
                     options,
+                    nonblocking,
+                } => {
+                    let result = if facade.generation() != generation {
+                        Some(Err(SocketError::Closed))
+                    } else {
+                        match self.connect_facade(
+                            &facade,
+                            sequence,
+                            peer,
+                            interface,
+                            options,
+                            nonblocking,
+                            config,
+                        ) {
+                            Ok(true) => Some(Ok(())),
+                            Ok(false) => None,
+                            Err(error) => Some(Err(error)),
+                        }
+                    };
+                    if let Some(result) = result {
+                        facade.complete_control(sequence, result);
+                    }
+                }
+                SocketCommand::Listen {
+                    facade,
+                    sequence,
+                    generation,
+                    backlog,
                 } => {
                     let result = if facade.generation() != generation {
                         Err(SocketError::Closed)
                     } else {
-                        self.connect_facade(&facade, peer, interface, options, config)
+                        self.listen_facade(&facade, backlog, config)
                     };
                     facade.complete_control(sequence, result);
                 }
@@ -1114,6 +1209,28 @@ impl ProtocolContext {
     }
 
     fn bind_facade(
+        &mut self,
+        facade: &Arc<SocketFacade>,
+        local: Endpoint,
+        peer: Option<Endpoint>,
+        interface: Option<InterfaceId>,
+        options: BindOptions,
+        config: &ConfigSnapshot,
+    ) -> Result<(), SocketError> {
+        match facade.kind() {
+            SocketKind::Datagram => self
+                .bind_udp_facade(facade, local, peer, interface, options, config)
+                .map(|_| ()),
+            SocketKind::Stream => {
+                if peer.is_some() {
+                    return Err(SocketError::InvalidState);
+                }
+                self.bind_tcp_facade(facade, local, interface, options, config)
+            }
+        }
+    }
+
+    fn bind_udp_facade(
         &mut self,
         facade: &Arc<SocketFacade>,
         mut local: Endpoint,
@@ -1182,16 +1299,127 @@ impl ProtocolContext {
         Ok(flow)
     }
 
-    fn connect_facade(
+    fn bind_tcp_facade(
         &mut self,
         facade: &Arc<SocketFacade>,
-        peer: Endpoint,
+        mut local: Endpoint,
         interface: Option<InterfaceId>,
         options: BindOptions,
         config: &ConfigSnapshot,
     ) -> Result<(), SocketError> {
+        let family = facade.family();
+        if !address_matches_family(family, local.addr) {
+            return Err(SocketError::AddressUnavailable);
+        }
+        if !local.addr.is_unspecified()
+            && !config.addresses.iter().any(|entry| {
+                entry.address == local.addr && interface.is_none_or(|id| id == entry.interface)
+            })
+        {
+            return Err(SocketError::AddressUnavailable);
+        }
+        let request = BindRequest {
+            owner: facade.id().counter,
+            family,
+            protocol: TransportProtocol::Tcp,
+            address: if local.addr.is_unspecified() {
+                BindAddress::Any
+            } else {
+                BindAddress::Specified(local.addr)
+            },
+            port: local.port,
+            interface,
+            options,
+        };
+        let token = if local.port == 0 {
+            self.bind_registry
+                .reserve_ephemeral(request, ShardId(0))
+                .map_err(map_bind_error)?
+        } else {
+            self.bind_registry
+                .reserve(request)
+                .map_err(map_bind_error)?
+        };
+        local.port = token.port;
+        self.bindings.insert(facade.id(), token);
+        facade.publish_binding(
+            OwnerRef::Bound {
+                shard: ShardId(0),
+                generation: facade.generation(),
+            },
+            local,
+            None,
+            interface,
+        );
+        Ok(())
+    }
+
+    fn connect_facade(
+        &mut self,
+        facade: &Arc<SocketFacade>,
+        control_sequence: u64,
+        peer: Endpoint,
+        interface: Option<InterfaceId>,
+        options: BindOptions,
+        _nonblocking: bool,
+        config: &ConfigSnapshot,
+    ) -> Result<bool, SocketError> {
         if !address_matches_family(facade.family(), peer.addr) {
             return Err(SocketError::AddressUnavailable);
+        }
+        if facade.kind() == SocketKind::Stream {
+            let bound = facade.local_endpoint();
+            let bound_source =
+                bound.and_then(|local| (!local.addr.is_unspecified()).then_some(local.addr));
+            let path = self.protocol.resolve_tcp_path(
+                peer.addr,
+                bound_source,
+                interface.or_else(|| facade.interface()),
+                config,
+                sched::now_ns_public(),
+            )?;
+            if matches!(facade.owner(), OwnerRef::Unassigned) {
+                self.bind_tcp_facade(
+                    facade,
+                    Endpoint {
+                        addr: path.route.source,
+                        port: 0,
+                    },
+                    Some(path.route.interface),
+                    options,
+                    config,
+                )?;
+            }
+            let mut local = facade.local_endpoint().ok_or(SocketError::InvalidState)?;
+            if local.addr.is_unspecified() {
+                local.addr = path.route.source;
+            }
+            if !matches!(facade.owner(), OwnerRef::Bound { .. }) {
+                return Err(SocketError::AlreadyConnected);
+            }
+            let flow = self
+                .protocol
+                .connect_tcp(
+                    local,
+                    peer,
+                    path,
+                    Arc::clone(facade),
+                    control_sequence,
+                    sched::now_ns_public(),
+                )
+                .map_err(map_tcp_bind_error)?;
+            facade.publish_binding(
+                OwnerRef::Flow {
+                    shard: ShardId(0),
+                    flow,
+                    generation: facade.generation(),
+                },
+                local,
+                Some(peer),
+                Some(path.route.interface),
+            );
+            self.dispatch_tcp_output();
+            return Ok(false);
         }
         match facade.owner() {
             OwnerRef::Unassigned => {
@@ -1199,8 +1427,8 @@ impl ProtocolContext {
                     addr: unspecified_address(facade.family()),
                     port: 0,
                 };
-                self.bind_facade(facade, local, Some(peer), interface, options, config)?;
-                Ok(())
+                self.bind_udp_facade(facade, local, Some(peer), interface, options, config)?;
+                Ok(true)
             }
             OwnerRef::Flow { flow, .. } => {
                 let local = facade.local_endpoint().ok_or(SocketError::InvalidState)?;
@@ -1218,10 +1446,55 @@ impl ProtocolContext {
                     Some(peer),
                     interface.or_else(|| facade.interface()),
                 );
-                Ok(())
+                Ok(true)
             }
+            OwnerRef::Bound { .. } | OwnerRef::Listener { .. } => Err(SocketError::InvalidState),
             OwnerRef::Closed { .. } => Err(SocketError::Closed),
         }
+    }
+
+    fn listen_facade(
+        &mut self,
+        facade: &Arc<SocketFacade>,
+        backlog: u32,
+        config: &ConfigSnapshot,
+    ) -> Result<(), SocketError> {
+        if facade.kind() != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if matches!(facade.owner(), OwnerRef::Unassigned) {
+            self.bind_tcp_facade(
+                facade,
+                Endpoint {
+                    addr: unspecified_address(facade.family()),
+                    port: 0,
+                },
+                None,
+                BindOptions::default(),
+                config,
+            )?;
+        }
+        if !matches!(
+            facade.owner(),
+            OwnerRef::Bound { .. } | OwnerRef::Listener { .. }
+        ) {
+            return Err(SocketError::InvalidState);
+        }
+        let local = facade.local_endpoint().ok_or(SocketError::InvalidState)?;
+        facade.configure_listener(backlog);
+        self.protocol
+            .listen_tcp(local, facade.interface(), Arc::clone(facade))
+            .map_err(map_tcp_bind_error)?;
+        facade.publish_binding(
+            OwnerRef::Listener {
+                shard: ShardId(0),
+                generation: facade.generation(),
+            },
+            local,
+            None,
+            facade.interface(),
+        );
+        Ok(())
     }
 
     fn drain_socket_tx(&mut self, budget: usize, config: &ConfigSnapshot) -> usize {
@@ -1243,38 +1516,54 @@ impl ProtocolContext {
                     continue;
                 }
             };
-            for _ in 0..32 {
-                let Some(payload) = facade.take_tx() else {
-                    break;
-                };
-                match self
-                    .protocol
-                    .prepare_udp_tx(flow, payload, 0, config, sched::now_ns_public())
-                {
-                    Ok(work) => {
-                        let Some(target) = self
-                            .runtime
-                            .egress
-                            .iter()
-                            .find(|target| target.interface == work.route.interface)
-                        else {
-                            work.payload
-                                .facade()
-                                .set_pending_error(SocketError::NetworkUnreachable);
-                            continue;
+            match facade.kind() {
+                SocketKind::Stream => {
+                    self.protocol.drain_tcp_send(flow, sched::now_ns_public());
+                    self.dispatch_tcp_output();
+                    facade.finish_stream_tx_drain();
+                }
+                SocketKind::Datagram => {
+                    for _ in 0..32 {
+                        let Some(payload) = facade.take_tx() else {
+                            break;
                         };
-                        if let Err(EgressWork::Udp(work)) = target.try_push(EgressWork::Udp(work)) {
-                            work.payload
-                                .facade()
-                                .set_pending_error(SocketError::WouldBlock);
+                        match self.protocol.prepare_udp_tx(
+                            flow,
+                            payload,
+                            0,
+                            config,
+                            sched::now_ns_public(),
+                        ) {
+                            Ok(work) => {
+                                let Some(target) = self
+                                    .runtime
+                                    .egress
+                                    .iter()
+                                    .find(|target| target.interface == work.route.interface)
+                                else {
+                                    work.payload
+                                        .facade()
+                                        .set_pending_error(SocketError::NetworkUnreachable);
+                                    continue;
+                                };
+                                if let Err(EgressWork::Udp(work)) =
+                                    target.try_push(EgressWork::Udp(work))
+                                {
+                                    work.payload
+                                        .facade()
+                                        .set_pending_error(SocketError::WouldBlock);
+                                }
+                            }
+                            Err((error, payload)) => {
+                                payload.facade().set_pending_error(error);
+                            }
                         }
-                    }
-                    Err((error, payload)) => {
-                        payload.facade().set_pending_error(error);
                     }
                 }
             }
-            facade.finish_tx_drain();
+            if facade.kind() == SocketKind::Datagram {
+                facade.finish_tx_drain();
+            }
         }
         processed
     }
@@ -1286,17 +1575,44 @@ impl ProtocolContext {
                 break;
             };
             processed += 1;
-            if !matches!(facade.owner(), OwnerRef::Closed { .. })
-                && facade.generation() != 0
-                && matches!(facade.readiness().0, readiness if readiness.contains(net::Readiness::HANGUP))
-            {
-                if let OwnerRef::Flow { flow, .. } = facade.owner() {
+            match facade.owner() {
+                OwnerRef::Flow { flow, .. } if facade.kind() == SocketKind::Stream => {
+                    if facade.is_closing() {
+                        self.protocol.close_tcp(flow, sched::now_ns_public());
+                        if let Some(token) = self.bindings.remove(&facade.id()) {
+                            let _ = self.bind_registry.release(token);
+                        }
+                    } else if facade.write_is_shutdown() {
+                        self.protocol
+                            .shutdown_tcp_write(flow, sched::now_ns_public());
+                    }
+                    self.dispatch_tcp_output();
+                }
+                OwnerRef::Flow { flow, .. } if facade.is_closing() => {
                     self.protocol.close_udp(flow);
+                    if let Some(token) = self.bindings.remove(&facade.id()) {
+                        let _ = self.bind_registry.release(token);
+                    }
+                    facade.publish_closed();
                 }
-                if let Some(token) = self.bindings.remove(&facade.id()) {
-                    let _ = self.bind_registry.release(token);
+                OwnerRef::Listener { .. } if facade.is_closing() => {
+                    self.protocol.close_tcp_listener(&facade);
+                    if let Some(token) = self.bindings.remove(&facade.id()) {
+                        let _ = self.bind_registry.release(token);
+                    }
+                    facade.publish_closed();
                 }
-                facade.publish_closed();
+                OwnerRef::Bound { .. } | OwnerRef::Unassigned if facade.is_closing() => {
+                    if let Some(token) = self.bindings.remove(&facade.id()) {
+                        let _ = self.bind_registry.release(token);
+                    }
+                    facade.publish_closed();
+                }
+                OwnerRef::Closed { .. }
+                | OwnerRef::Flow { .. }
+                | OwnerRef::Listener { .. }
+                | OwnerRef::Bound { .. }
+                | OwnerRef::Unassigned => {}
             }
         }
         processed
@@ -1389,8 +1705,12 @@ impl ProtocolContext {
             },
         );
         self.recycle.clear();
+        self.dispatch_tcp_output();
         self.dispatch_tx(egress);
         let protocol_stats = self.protocol.stats();
+        stats
+            .protocol_tcp_delivered
+            .store(protocol_stats.tcp_delivered, Ordering::Relaxed);
         stats
             .protocol_udp_delivered
             .store(protocol_stats.udp_delivered, Ordering::Relaxed);
@@ -1423,6 +1743,24 @@ impl ProtocolContext {
                 target.stats.tx_dropped.fetch_add(1, Ordering::Relaxed);
                 target.stats.drop_reasons[DropReason::TxQueueFull.index()]
                     .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn dispatch_tcp_output(&mut self) {
+        while let Some(work) = self.protocol.take_tcp_output() {
+            let Some(target) = self
+                .runtime
+                .egress
+                .iter()
+                .find(|target| target.interface == work.path.route.interface)
+            else {
+                work.facade
+                    .set_pending_error(SocketError::NetworkUnreachable);
+                continue;
+            };
+            if let Err(EgressWork::Tcp(work)) = target.try_push(EgressWork::Tcp(work)) {
+                work.facade.set_pending_error(SocketError::WouldBlock);
             }
         }
     }
@@ -1630,6 +1968,15 @@ fn map_udp_bind_error(error: net::transport::UdpBindError) -> SocketError {
     }
 }
 
+fn map_tcp_bind_error(error: net::transport::TcpBindError) -> SocketError {
+    match error {
+        net::transport::TcpBindError::Duplicate => SocketError::AddressInUse,
+        net::transport::TcpBindError::Full => SocketError::RuntimeBusy,
+        net::transport::TcpBindError::InvalidEndpoint => SocketError::AddressUnavailable,
+        net::transport::TcpBindError::NotListener => SocketError::InvalidState,
+    }
+}
+
 impl WorkerContext {
     fn run(&mut self) -> ! {
         loop {
@@ -1773,6 +2120,7 @@ impl WorkerContext {
                     .tx_batch
                     .push(packet)
                     .unwrap_or_else(|_| unreachable!()),
+                EgressWork::Tcp(work) => self.materialize_tcp(work),
                 EgressWork::Udp(work) => self.materialize_udp(work),
             }
         }
@@ -1827,6 +2175,47 @@ impl WorkerContext {
         };
         if self.tx_batch.push(packet).is_err() {
             facade.set_pending_error(SocketError::WouldBlock);
+        }
+    }
+
+    fn materialize_tcp(&mut self, work: PreparedTcpTx) {
+        let payload_len = work.payload.as_ref().map_or(0, |payload| payload.len);
+        let Ok(mut lease) = self.tx_payload_pool.as_mut().unwrap().lease(
+            128,
+            payload_len,
+            PacketMetadata::default(),
+        ) else {
+            work.facade.set_pending_error(SocketError::WouldBlock);
+            return;
+        };
+        if let Some(payload) = work.payload.as_ref()
+            && payload
+                .copy_out(
+                    lease
+                        .as_mut_slice()
+                        .expect("TCP payload lease 范围必须有效"),
+                )
+                .is_err()
+        {
+            work.facade.set_pending_error(SocketError::Buffer);
+            return;
+        }
+        let low_latency = work.low_latency;
+        let completion = net::buf::CompletionToken(work.completion);
+        let chain = match build_tcp_packet(PacketChain::from_lease(lease), &work) {
+            Ok(chain) => chain,
+            Err(_) => {
+                work.facade.set_pending_error(SocketError::Buffer);
+                return;
+            }
+        };
+        let packet = TxPacket {
+            chain,
+            completion,
+            low_latency,
+        };
+        if self.tx_batch.push(packet).is_err() {
+            work.facade.set_pending_error(SocketError::WouldBlock);
         }
     }
 

@@ -6,7 +6,7 @@ use crate::buf::{CompletionToken, DropReason, PacketChain};
 use crate::control::RouteDecision;
 use crate::flow::{DIRTY_INGRESS, FlowKey, FlowTable, flow_hash64, rss_hash};
 use crate::pipeline::{FrontendPacket, transport_checksum};
-use crate::transport::UdpControlError;
+use crate::transport::TransportControlError;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::{SocketFacade, UdpTxLease};
 
@@ -71,7 +71,7 @@ struct UdpEndpoint {
     peer: Option<Endpoint>,
     interface: Option<InterfaceId>,
     rx: DatagramRing,
-    pending_error: Option<UdpControlError>,
+    pending_error: Option<TransportControlError>,
     facade: Option<Arc<SocketFacade>>,
 }
 
@@ -288,7 +288,7 @@ impl UdpEndpointTable {
         &mut self,
         interface: InterfaceId,
         flow: FlowKey,
-        error: UdpControlError,
+        error: TransportControlError,
     ) -> Option<FlowId> {
         let hash = flow_hash64(rss_hash(&self.rss_key, &flow));
         let id = self
@@ -304,7 +304,7 @@ impl UdpEndpointTable {
         Some(id)
     }
 
-    pub fn take_control_error(&mut self, id: FlowId) -> Option<UdpControlError> {
+    pub fn take_control_error(&mut self, id: FlowId) -> Option<TransportControlError> {
         self.flows.get_mut(id)?.pending_error.take()
     }
 
@@ -521,6 +521,7 @@ mod tests {
                     hop_limit: 64,
                     fragment: None,
                 }),
+                tcp: None,
                 udp: Some(UdpPacket {
                     source_port: remote_port,
                     destination_port: local_port,
@@ -596,12 +597,16 @@ mod tests {
         let id = table.bind(local, Some(peer), None).unwrap();
         let flow = FlowKey::new(peer, local, TransportProtocol::Udp).unwrap();
         assert_eq!(
-            table.record_control_error(InterfaceId(1), flow, UdpControlError::PortUnreachable,),
+            table.record_control_error(
+                InterfaceId(1),
+                flow,
+                TransportControlError::PortUnreachable,
+            ),
             Some(id)
         );
         assert_eq!(
             table.take_control_error(id),
-            Some(UdpControlError::PortUnreachable)
+            Some(TransportControlError::PortUnreachable)
         );
         assert!(table.take_control_error(id).is_none());
     }

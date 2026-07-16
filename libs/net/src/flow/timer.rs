@@ -38,6 +38,8 @@ impl TimerNode {
 pub struct TimerWheel {
     now_ms: u64,
     heads: [[Option<u16>; SLOTS]; LEVELS],
+    slot_deadlines: [[u64; SLOTS]; LEVELS],
+    earliest_deadline_ms: Option<u64>,
     nodes: Vec<TimerNode>,
 }
 
@@ -49,12 +51,19 @@ impl TimerWheel {
         Self {
             now_ms,
             heads: [[None; SLOTS]; LEVELS],
+            slot_deadlines: [[u64::MAX; SLOTS]; LEVELS],
+            earliest_deadline_ms: None,
             nodes,
         }
     }
 
     pub const fn now_ms(&self) -> u64 {
         self.now_ms
+    }
+
+    pub fn next_deadline_ns(&self) -> Option<u64> {
+        self.earliest_deadline_ms
+            .map(|deadline| deadline.saturating_mul(1_000_000))
     }
 
     pub fn schedule(&mut self, owner: u16, generation: u32, deadline_ns: u64) -> bool {
@@ -102,6 +111,8 @@ impl TimerWheel {
             }
             let slot = (self.now_ms & 0xff) as usize;
             let mut current = self.heads[0][slot].take();
+            let had_nodes = current.is_some();
+            self.slot_deadlines[0][slot] = u64::MAX;
             while let Some(owner) = current {
                 let node = self.nodes[usize::from(owner)];
                 current = node.next;
@@ -115,6 +126,9 @@ impl TimerWheel {
                 } else {
                     self.insert(owner, node.generation, node.deadline_ms);
                 }
+            }
+            if had_nodes {
+                self.refresh_earliest();
             }
         }
         self.now_ms < target_ms
@@ -147,6 +161,11 @@ impl TimerWheel {
             self.nodes[usize::from(head)].previous = Some(owner);
         }
         self.heads[level][slot] = Some(owner);
+        self.slot_deadlines[level][slot] = self.slot_deadlines[level][slot].min(deadline_ms);
+        self.earliest_deadline_ms = Some(
+            self.earliest_deadline_ms
+                .map_or(deadline_ms, |earliest| earliest.min(deadline_ms)),
+        );
     }
 
     fn detach(&mut self, owner: u16) {
@@ -159,17 +178,48 @@ impl TimerWheel {
         if let Some(next) = node.next {
             self.nodes[usize::from(next)].previous = node.previous;
         }
+        if self.slot_deadlines[usize::from(node.level)][usize::from(node.slot)] == node.deadline_ms
+        {
+            self.refresh_slot_deadline(usize::from(node.level), usize::from(node.slot));
+        }
+        if self.earliest_deadline_ms == Some(node.deadline_ms) {
+            self.refresh_earliest();
+        }
     }
 
     fn cascade(&mut self, level: usize) {
         let slot = ((self.now_ms >> (level * 8)) & 0xff) as usize;
         let mut current = self.heads[level][slot].take();
+        self.slot_deadlines[level][slot] = u64::MAX;
         while let Some(owner) = current {
             let node = self.nodes[usize::from(owner)];
             current = node.next;
             self.nodes[usize::from(owner)] = TimerNode::empty();
             self.insert(owner, node.generation, node.deadline_ms);
         }
+        self.refresh_earliest();
+    }
+
+    fn refresh_slot_deadline(&mut self, level: usize, slot: usize) {
+        let mut deadline = u64::MAX;
+        let mut current = self.heads[level][slot];
+        while let Some(owner) = current {
+            let node = self.nodes[usize::from(owner)];
+            deadline = deadline.min(node.deadline_ms);
+            current = node.next;
+        }
+        self.slot_deadlines[level][slot] = deadline;
+    }
+
+    fn refresh_earliest(&mut self) {
+        let deadline = self
+            .slot_deadlines
+            .iter()
+            .flat_map(|level| level.iter())
+            .copied()
+            .min()
+            .unwrap_or(u64::MAX);
+        self.earliest_deadline_ms = (deadline != u64::MAX).then_some(deadline);
     }
 }
 
@@ -202,5 +252,19 @@ mod tests {
         wheel.advance(20_000_000, 32, |entry| expired.push(entry));
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].generation, 2);
+    }
+
+    #[test]
+    fn cached_deadline_tracks_cancel_and_cascade() {
+        let mut wheel = TimerWheel::new(8, 0);
+        wheel.schedule(1, 1, 300_000_000);
+        wheel.schedule(2, 1, 20_000_000);
+        assert_eq!(wheel.next_deadline_ns(), Some(20_000_000));
+        assert!(wheel.cancel(2));
+        assert_eq!(wheel.next_deadline_ns(), Some(300_000_000));
+        wheel.advance(256_000_000, 256, |_| {});
+        assert_eq!(wheel.next_deadline_ns(), Some(300_000_000));
+        wheel.advance(300_000_000, 64, |_| {});
+        assert_eq!(wheel.next_deadline_ns(), None);
     }
 }

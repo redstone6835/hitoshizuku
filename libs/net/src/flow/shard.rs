@@ -2,10 +2,11 @@ use crate::buf::{CompletionToken, DropReason, PacketBatch, PacketChain, TxBatch,
 use crate::control::{ConfigError, ConfigSnapshot, NeighborKey, NeighborTable};
 use crate::pipeline::{FrontendBatch, FrontendDisposition, VectorFrontend};
 use crate::transport::{
-    ControlPacketResult, PreparedUdpTx, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
-    build_udp_packet, handle_control_packet,
+    ControlPacketResult, PreparedTcpTx, PreparedUdpTx, TcpBindError, TcpEndpointTable,
+    TcpIngressError, TcpPath, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
+    build_tcp_reset, build_udp_packet, handle_control_packet,
 };
-use crate::{Endpoint, FlowId, InterfaceId, ShardId};
+use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ShardId};
 use crate::{OwnerRef, SocketError, SocketFacade, UdpTxLease};
 use alloc::sync::Arc;
 
@@ -13,6 +14,7 @@ use super::TimerWheel;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FlowShardStats {
+    pub tcp_delivered: u64,
     pub udp_delivered: u64,
     pub control_packets: u64,
     pub tx_formed: u64,
@@ -46,6 +48,7 @@ pub struct FlowShard {
     frontend: VectorFrontend,
     frontend_batch: FrontendBatch,
     udp: UdpEndpointTable,
+    tcp: TcpEndpointTable,
     neighbors: NeighborTable,
     timers: TimerWheel,
     next_completion: u64,
@@ -58,6 +61,7 @@ impl FlowShard {
         rss_key: [u8; 40],
         rss_generation: u32,
         hash_seed: [u8; 16],
+        tcp_isn_key: [u8; 16],
         now_ns: u64,
     ) -> Self {
         Self {
@@ -65,8 +69,9 @@ impl FlowShard {
             frontend: VectorFrontend::new(rss_key, rss_generation),
             frontend_batch: FrontendBatch::new(),
             udp: UdpEndpointTable::new(rss_key),
+            tcp: TcpEndpointTable::new(rss_key, tcp_isn_key),
             neighbors: NeighborTable::new(hash_seed),
-            timers: TimerWheel::new(4096, now_ns / 1_000_000),
+            timers: TimerWheel::new(8192, now_ns / 1_000_000),
             next_completion: 1,
             stats: FlowShardStats::default(),
         }
@@ -105,6 +110,99 @@ impl FlowShard {
         }
     }
 
+    pub fn listen_tcp(
+        &mut self,
+        local: Endpoint,
+        interface: Option<InterfaceId>,
+        facade: Arc<SocketFacade>,
+    ) -> Result<(), TcpBindError> {
+        self.tcp.listen(local, interface, facade)
+    }
+
+    pub fn connect_tcp(
+        &mut self,
+        local: Endpoint,
+        remote: Endpoint,
+        path: TcpPath,
+        facade: Arc<SocketFacade>,
+        control_sequence: u64,
+        now_ns: u64,
+    ) -> Result<FlowId, TcpBindError> {
+        let id = self
+            .tcp
+            .connect(local, remote, path, facade, control_sequence, now_ns)?;
+        self.reschedule_tcp(id);
+        Ok(id)
+    }
+
+    pub fn close_tcp(&mut self, flow: FlowId, now_ns: u64) {
+        if self.tcp.close_flow(flow, now_ns) {
+            self.reschedule_tcp(flow);
+        }
+    }
+
+    pub fn shutdown_tcp_write(&mut self, flow: FlowId, now_ns: u64) {
+        if self.tcp.shutdown_write(flow, now_ns) {
+            self.reschedule_tcp(flow);
+        }
+    }
+
+    pub fn close_tcp_listener(&mut self, facade: &Arc<SocketFacade>) -> bool {
+        self.tcp.close_listener(facade)
+    }
+
+    pub fn drain_tcp_send(&mut self, flow: FlowId, now_ns: u64) {
+        self.tcp.drain_send(flow, now_ns);
+        self.reschedule_tcp(flow);
+    }
+
+    pub fn take_tcp_output(&mut self) -> Option<PreparedTcpTx> {
+        self.tcp.take_output()
+    }
+
+    pub fn next_timer_deadline_ns(&self) -> Option<u64> {
+        self.timers.next_deadline_ns()
+    }
+
+    pub fn resolve_tcp_path(
+        &mut self,
+        destination: IpAddr,
+        bound_source: Option<IpAddr>,
+        interface: Option<InterfaceId>,
+        config: &ConfigSnapshot,
+        now_ns: u64,
+    ) -> Result<TcpPath, SocketError> {
+        let route = config
+            .route(destination, 0, bound_source, interface)
+            .map_err(|_| SocketError::NetworkUnreachable)?;
+        let interface = config
+            .interfaces
+            .iter()
+            .find(|candidate| candidate.id == route.interface)
+            .ok_or(SocketError::NetworkUnreachable)?;
+        let destination_mac = if interface.loopback {
+            interface.mac_address
+        } else {
+            let key = NeighborKey {
+                interface: route.interface,
+                address: route.next_hop,
+            };
+            self.neighbors
+                .lookup(key, now_ns)
+                .map(|entry| entry.0)
+                .ok_or(SocketError::HostUnreachable)?
+        };
+        Ok(TcpPath {
+            route,
+            source_mac: interface.mac_address,
+            destination_mac,
+        })
+    }
+
+    pub fn run_due_timers(&mut self, now_ns: u64) {
+        self.run_timers(now_ns);
+    }
+
     pub fn reconnect_udp_facade(
         &mut self,
         flow: FlowId,
@@ -136,7 +234,10 @@ impl FlowShard {
         self.udp.recv(flow)
     }
 
-    pub fn take_udp_error(&mut self, flow: FlowId) -> Option<crate::transport::UdpControlError> {
+    pub fn take_udp_error(
+        &mut self,
+        flow: FlowId,
+    ) -> Option<crate::transport::TransportControlError> {
         self.udp.take_control_error(flow)
     }
 
@@ -242,6 +343,72 @@ impl FlowShard {
                 continue;
             };
             match packet.parsed.disposition {
+                FrontendDisposition::Tcp => {
+                    let ip = packet.parsed.ip.expect("TCP packet 必须携带 IP sidecar");
+                    let tcp = packet.parsed.tcp.expect("TCP packet 必须携带 TCP sidecar");
+                    let ethernet = packet.parsed.ethernet;
+                    let interface_snapshot = context
+                        .config
+                        .interfaces
+                        .iter()
+                        .find(|candidate| candidate.id == context.interface)
+                        .expect("ingress interface 必须存在于配置快照");
+                    let path = TcpPath {
+                        route: crate::control::RouteDecision {
+                            interface: context.interface,
+                            source: ip.destination,
+                            next_hop: ip.source,
+                            mtu: interface_snapshot.mtu,
+                            table: 0,
+                        },
+                        source_mac: packet.parsed.ethernet.destination,
+                        destination_mac: packet.parsed.ethernet.source,
+                    };
+                    match self
+                        .tcp
+                        .ingest(context.interface, path, packet, context.now_ns)
+                    {
+                        Ok((flow, chain, metadata)) => {
+                            self.stats.tcp_delivered = self.stats.tcp_delivered.saturating_add(1);
+                            recycle_packet(recycle, chain, metadata);
+                            self.reschedule_tcp(flow);
+                        }
+                        Err((error, chain, mut metadata)) => {
+                            let reason = match error {
+                                TcpIngressError::NoEndpoint => DropReason::TcpNoEndpoint,
+                                TcpIngressError::ReceiveBufferFull => DropReason::TcpRingFull,
+                                TcpIngressError::Malformed => DropReason::MalformedTcp,
+                                TcpIngressError::FlowTableFull => DropReason::FlowTableFull,
+                            };
+                            metadata.drop_reason = reason;
+                            record_drop(reason);
+                            if error == TcpIngressError::NoEndpoint
+                                && !tcp.flags.contains(crate::transport::TcpFlags::RST)
+                            {
+                                match build_tcp_reset(chain, ethernet, ip, tcp) {
+                                    Ok(chain) => {
+                                        let packet = TxPacket {
+                                            chain,
+                                            completion: CompletionToken(self.next_completion),
+                                            low_latency: true,
+                                        };
+                                        self.next_completion =
+                                            self.next_completion.wrapping_add(1).max(1);
+                                        if let Err(packet) = tx.push(packet) {
+                                            recycle_packet(recycle, packet.chain, metadata);
+                                        } else {
+                                            self.stats.tx_formed =
+                                                self.stats.tx_formed.saturating_add(1);
+                                        }
+                                    }
+                                    Err(chain) => recycle_packet(recycle, chain, metadata),
+                                }
+                            } else {
+                                recycle_packet(recycle, chain, metadata);
+                            }
+                        }
+                    }
+                }
                 FrontendDisposition::Udp => match self.udp.ingest(context.interface, packet) {
                     Ok(_) => self.stats.udp_delivered = self.stats.udp_delivered.saturating_add(1),
                     Err(error) => {
@@ -291,14 +458,23 @@ impl FlowShard {
                             record_drop(reason);
                             recycle_packet(recycle, chain, metadata);
                         }
-                        ControlPacketResult::UdpError {
+                        ControlPacketResult::TransportError {
                             flow,
                             error,
                             packet: chain,
                         } => {
-                            let _ = self
-                                .udp
-                                .record_control_error(context.interface, flow, error);
+                            match flow.protocol {
+                                crate::TransportProtocol::Udp => {
+                                    let _ = self.udp.record_control_error(
+                                        context.interface,
+                                        flow,
+                                        error,
+                                    );
+                                }
+                                crate::TransportProtocol::Tcp => {
+                                    self.tcp.record_control_error(flow, error, context.now_ns);
+                                }
+                            }
                             recycle_packet(recycle, chain, packet_metadata);
                         }
                     }
@@ -315,13 +491,26 @@ impl FlowShard {
 
     fn run_timers(&mut self, now_ns: u64) {
         let udp = &mut self.udp;
+        let tcp = &mut self.tcp;
         let stats = &mut self.stats;
+        let mut tcp_expired = alloc::vec::Vec::new();
         let _behind = self.timers.advance(now_ns, 256, |expiry| {
-            let id = FlowId(u32::from(expiry.owner) + 1);
-            if udp.mark_timer(id, expiry.generation) {
-                stats.timer_expired = stats.timer_expired.saturating_add(1);
+            if expiry.owner < 4096 {
+                let id = FlowId(u32::from(expiry.owner) + 1);
+                if udp.mark_timer(id, expiry.generation) {
+                    stats.timer_expired = stats.timer_expired.saturating_add(1);
+                }
+            } else {
+                let id = FlowId(u32::from(expiry.owner - 4096) + 1);
+                if tcp.handle_timer(id, expiry.generation, now_ns) {
+                    stats.timer_expired = stats.timer_expired.saturating_add(1);
+                    tcp_expired.push(id);
+                }
             }
         });
+        for flow in tcp_expired {
+            self.reschedule_tcp(flow);
+        }
     }
 
     fn run_dirty(&mut self, budget: usize) {
@@ -383,7 +572,23 @@ impl FlowShard {
     }
 
     pub fn facade_owner(&self, flow: FlowId) -> Option<OwnerRef> {
-        self.udp.facade(flow).map(|facade| facade.owner())
+        self.udp
+            .facade(flow)
+            .or_else(|| self.tcp.facade(flow))
+            .map(|facade| facade.owner())
+    }
+
+    fn reschedule_tcp(&mut self, flow: FlowId) {
+        let owner = 4096u16.saturating_add(flow.0.saturating_sub(1) as u16);
+        let Some(generation) = self.tcp.generation(flow) else {
+            self.timers.cancel(owner);
+            return;
+        };
+        if let Some(deadline) = self.tcp.earliest_deadline(flow) {
+            self.timers.schedule(owner, generation, deadline);
+        } else {
+            self.timers.cancel(owner);
+        }
     }
 }
 

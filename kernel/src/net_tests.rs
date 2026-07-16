@@ -50,13 +50,10 @@ fn sockaddr_in(address: [u8; 4], port: u16) -> [u8; 16] {
     raw
 }
 
-fn wait_readable(file: &vfs::file::File) {
+fn wait_poll(file: &vfs::file::File, events: vfs::file::PollEvents) {
     let deadline = sched::now_ns_public().saturating_add(1_000_000_000);
     while sched::now_ns_public() < deadline {
-        if file
-            .poll(vfs::file::PollEvents::POLLIN)
-            .has(vfs::file::PollEvents::POLLIN)
-        {
+        if file.poll(events).intersect(events).raw() != 0 {
             return;
         }
         let task = sched::current_task();
@@ -67,23 +64,17 @@ fn wait_readable(file: &vfs::file::File) {
             sched::schedule_once(sched::now_ns_public());
         }
     }
-    panic!("1 秒内 UDP socket 未变为可读");
+    panic!("1 秒内 socket 未出现预期 poll 事件");
+}
+
+fn wait_readable(file: &vfs::file::File) {
+    wait_poll(file, vfs::file::PollEvents::POLLIN);
 }
 
 #[ktest]
 fn udp_vfs_fd_and_epoll_roundtrip() {
     let (context, table) = current_vfs();
     let unsupported = errno::Errno::Other(93);
-    assert_eq!(
-        vfs::socket::socket(
-            &context,
-            &table,
-            vfs::addr::AF_INET as usize,
-            vfs::socket::SOCK_STREAM,
-            6,
-        ),
-        Err(unsupported)
-    );
     assert_eq!(
         vfs::socket::socket(
             &context,
@@ -234,6 +225,106 @@ fn udp_vfs_fd_and_epoll_roundtrip() {
     table.close_fd(epoll).expect("关闭 epoll");
     table.close_fd(receiver).expect("关闭 receiver");
     table.close_fd(sender_alias).expect("关闭 sender alias");
+}
+
+#[ktest]
+fn tcp_vfs_loopback_connect_accept_stream_and_eof() {
+    let (context, table) = current_vfs();
+    let server = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET as usize,
+        vfs::socket::SOCK_STREAM | vfs::socket::SOCK_NONBLOCK,
+        6,
+    )
+    .expect("创建 TCP server");
+    let local = sockaddr_in([127, 0, 0, 1], 19_004);
+    vfs::socket::bind(&context, &table, server, &local).expect("绑定 TCP server");
+    vfs::socket::listen(&table, server, 4).expect("监听 TCP server");
+
+    let epoll = vfs::epoll::create(&table, context.cred(), false).expect("创建 TCP epoll");
+    vfs::epoll::ctl(
+        &table,
+        epoll,
+        vfs::epoll::EPOLL_CTL_ADD,
+        server,
+        Some(vfs::epoll::EpollEvent {
+            events: vfs::file::PollEvents::POLLIN.raw() as u32,
+            data: 0x66,
+        }),
+    )
+    .expect("注册 TCP listener epoll watch");
+
+    let client = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET as usize,
+        vfs::socket::SOCK_STREAM | vfs::socket::SOCK_NONBLOCK,
+        6,
+    )
+    .expect("创建 TCP client");
+    assert_eq!(
+        vfs::socket::connect(&context, &table, client, &local),
+        Err(errno::Errno::EINPROGRESS)
+    );
+    assert_eq!(
+        vfs::socket::connect(&context, &table, client, &local),
+        Err(errno::Errno::EALREADY)
+    );
+
+    let server_file = table.get_file(server).unwrap();
+    wait_readable(&server_file);
+    let events = vfs::epoll::wait(&table, epoll, 1, 0).expect("读取 TCP accept epoll event");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data, 0x66);
+    let client_file = table.get_file(client).unwrap();
+    wait_poll(&client_file, vfs::file::PollEvents::POLLOUT);
+    let error = vfs::socket::getsockopt(
+        &table,
+        client,
+        vfs::socket::SOL_SOCKET,
+        vfs::socket::SO_ERROR,
+    )
+    .expect("读取 TCP connect SO_ERROR");
+    assert_eq!(i32::from_ne_bytes(error[..4].try_into().unwrap()), 0);
+
+    let (accepted, peer) =
+        vfs::socket::accept(&context, &table, server, vfs::socket::SOCK_NONBLOCK)
+            .expect("accept TCP child");
+    assert!(peer.is_some());
+    assert_eq!(
+        vfs::socket::send(&context, &table, client, b"ping", &[], None, 0),
+        Ok(4)
+    );
+    let accepted_file = table.get_file(accepted).unwrap();
+    wait_readable(&accepted_file);
+    let mut bytes = [0u8; 8];
+    let received = vfs::socket::recv(&table, accepted, &mut bytes, 0, false, 0, None)
+        .expect("server 接收 TCP payload");
+    assert_eq!(received.len, 4);
+    assert_eq!(&bytes[..4], b"ping");
+
+    assert_eq!(
+        vfs::socket::send(&context, &table, accepted, b"pong", &[], None, 0),
+        Ok(4)
+    );
+    wait_readable(&client_file);
+    bytes.fill(0);
+    let received = vfs::socket::recv(&table, client, &mut bytes, 0, false, 0, None)
+        .expect("client 接收 TCP payload");
+    assert_eq!(received.len, 4);
+    assert_eq!(&bytes[..4], b"pong");
+
+    vfs::socket::shutdown(&table, client, vfs::socket::SHUT_WR).expect("关闭 client 写方向");
+    wait_readable(&accepted_file);
+    let eof = vfs::socket::recv(&table, accepted, &mut bytes, 0, false, 0, None)
+        .expect("server 观察 TCP EOF");
+    assert_eq!(eof.len, 0);
+
+    table.close_fd(accepted).expect("关闭 accepted TCP fd");
+    table.close_fd(client).expect("关闭 TCP client");
+    table.close_fd(server).expect("关闭 TCP server");
+    table.close_fd(epoll).expect("关闭 TCP epoll");
 }
 
 #[ktest]

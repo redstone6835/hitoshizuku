@@ -5,7 +5,7 @@ use crate::pipeline::{ControlPacket, FrontendPacket, packet_checksum, transport_
 use crate::{Endpoint, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UdpControlError {
+pub enum TransportControlError {
     PortUnreachable,
     PacketTooBig { mtu: u32 },
     TimeExceeded,
@@ -16,9 +16,9 @@ pub enum ControlPacketResult {
     Consumed(PacketChain),
     Reply(PacketChain),
     Drop(DropReason, PacketChain),
-    UdpError {
+    TransportError {
         flow: FlowKey,
-        error: UdpControlError,
+        error: TransportControlError,
         packet: PacketChain,
     },
 }
@@ -98,7 +98,7 @@ fn handle_icmpv4(mut packet: FrontendPacket, offset: u16, len: u32) -> ControlPa
         || icmp[1] != 0
     {
         return match parse_icmpv4_error(&packet.chain, offset, len) {
-            Some((flow, error)) => ControlPacketResult::UdpError {
+            Some((flow, error)) => ControlPacketResult::TransportError {
                 flow,
                 error,
                 packet: packet.chain,
@@ -181,7 +181,7 @@ fn handle_icmpv6(mut packet: FrontendPacket, offset: u16, len: u32) -> ControlPa
         || icmp[1] != 0
     {
         return match parse_icmpv6_error(&packet.chain, offset, len) {
-            Some((flow, error)) => ControlPacketResult::UdpError {
+            Some((flow, error)) => ControlPacketResult::TransportError {
                 flow,
                 error,
                 packet: packet.chain,
@@ -231,33 +231,34 @@ fn parse_icmpv4_error(
     packet: &PacketChain,
     offset: u16,
     len: u32,
-) -> Option<(FlowKey, UdpControlError)> {
+) -> Option<(FlowKey, TransportControlError)> {
     if len < 8 + 20 + 8 {
         return None;
     }
     let mut icmp = [0u8; 8];
     packet.copy_out(usize::from(offset), &mut icmp).ok()?;
     let error = match (icmp[0], icmp[1]) {
-        (3, 3) => UdpControlError::PortUnreachable,
-        (3, 4) => UdpControlError::PacketTooBig {
+        (3, 3) => TransportControlError::PortUnreachable,
+        (3, 4) => TransportControlError::PacketTooBig {
             mtu: u32::from(u16::from_be_bytes([icmp[6], icmp[7]])),
         },
-        (11, _) => UdpControlError::TimeExceeded,
-        (12, _) => UdpControlError::ParameterProblem,
+        (11, _) => TransportControlError::TimeExceeded,
+        (12, _) => TransportControlError::ParameterProblem,
         _ => return None,
     };
     let inner = usize::from(offset) + 8;
     let mut ipv4 = [0u8; 20];
     packet.copy_out(inner, &mut ipv4).ok()?;
     let header_len = usize::from(ipv4[0] & 0x0f) * 4;
-    if ipv4[0] >> 4 != 4 || !(20..=60).contains(&header_len) || ipv4[9] != 17 {
+    if ipv4[0] >> 4 != 4 || !(20..=60).contains(&header_len) || !matches!(ipv4[9], 6 | 17) {
         return None;
     }
-    quoted_udp_flow(
+    quoted_transport_flow(
         packet,
         inner + header_len,
         IpAddr::V4(Ipv4Addr(ipv4[12..16].try_into().ok()?)),
         IpAddr::V4(Ipv4Addr(ipv4[16..20].try_into().ok()?)),
+        ipv4[9],
     )
     .map(|flow| (flow, error))
 }
@@ -266,53 +267,59 @@ fn parse_icmpv6_error(
     packet: &PacketChain,
     offset: u16,
     len: u32,
-) -> Option<(FlowKey, UdpControlError)> {
+) -> Option<(FlowKey, TransportControlError)> {
     if len < 8 + 40 + 8 {
         return None;
     }
     let mut icmp = [0u8; 8];
     packet.copy_out(usize::from(offset), &mut icmp).ok()?;
     let error = match (icmp[0], icmp[1]) {
-        (1, 4) => UdpControlError::PortUnreachable,
-        (2, _) => UdpControlError::PacketTooBig {
+        (1, 4) => TransportControlError::PortUnreachable,
+        (2, _) => TransportControlError::PacketTooBig {
             mtu: u32::from_be_bytes(icmp[4..8].try_into().ok()?),
         },
-        (3, _) => UdpControlError::TimeExceeded,
-        (4, _) => UdpControlError::ParameterProblem,
+        (3, _) => TransportControlError::TimeExceeded,
+        (4, _) => TransportControlError::ParameterProblem,
         _ => return None,
     };
     let inner = usize::from(offset) + 8;
     let mut ipv6 = [0u8; 40];
     packet.copy_out(inner, &mut ipv6).ok()?;
-    if ipv6[0] >> 4 != 6 || ipv6[6] != 17 {
+    if ipv6[0] >> 4 != 6 || !matches!(ipv6[6], 6 | 17) {
         return None;
     }
-    quoted_udp_flow(
+    quoted_transport_flow(
         packet,
         inner + 40,
         IpAddr::V6(Ipv6Addr(ipv6[8..24].try_into().ok()?)),
         IpAddr::V6(Ipv6Addr(ipv6[24..40].try_into().ok()?)),
+        ipv6[6],
     )
     .map(|flow| (flow, error))
 }
 
-fn quoted_udp_flow(
+fn quoted_transport_flow(
     packet: &PacketChain,
     udp_offset: usize,
     local_address: IpAddr,
     remote_address: IpAddr,
+    protocol: u8,
 ) -> Option<FlowKey> {
-    let mut udp = [0u8; 4];
-    packet.copy_out(udp_offset, &mut udp).ok()?;
+    let mut ports = [0u8; 4];
+    packet.copy_out(udp_offset, &mut ports).ok()?;
     FlowKey::new(
         Endpoint {
             addr: remote_address,
-            port: u16::from_be_bytes([udp[2], udp[3]]),
+            port: u16::from_be_bytes([ports[2], ports[3]]),
         },
         Endpoint {
             addr: local_address,
-            port: u16::from_be_bytes([udp[0], udp[1]]),
+            port: u16::from_be_bytes([ports[0], ports[1]]),
         },
-        TransportProtocol::Udp,
+        if protocol == 6 {
+            TransportProtocol::Tcp
+        } else {
+            TransportProtocol::Udp
+        },
     )
 }

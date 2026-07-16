@@ -24,5 +24,6 @@ pub use flow::{FlowShard, FlowTurnContext, UdpSendError, UdpSendFailure};
 pub use id::{FlowId, InterfaceId, NetDeviceId, QueuePairId, ShardId, SocketId};
 pub use socket::{
     InstallSocketRuntimeError, OwnerRef, Readiness, ReadinessObserver, SocketCommand, SocketError,
-    SocketFacade, SocketRuntime, UdpReceive, UdpTxLease, install_socket_runtime, new_socket_facade,
+    SocketFacade, SocketKind, SocketRuntime, TcpInfoSnapshot, TcpTxLease, UdpReceive, UdpTxLease,
+    install_socket_runtime, new_socket_facade, new_tcp_socket_facade,
 };

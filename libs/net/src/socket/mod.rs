@@ -1,4 +1,4 @@
-//! 跨 CPU 稳定 socket facade、UDP 数据环与精确 readiness。
+//! 跨 CPU 稳定 socket facade、协议数据环与精确 readiness。
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -19,6 +19,12 @@ const UDP_BUFFER_HARD_LIMIT: usize = 512 * 1024;
 const SOCKET_CHUNK_BYTES: usize = 4096;
 const MAX_DATAGRAM_CHUNKS: usize = 17;
 const MAX_UDP_PAYLOAD: usize = 65_507;
+const TCP_BUFFER_BYTES: usize = 256 * 1024;
+const TCP_BUFFER_HARD_LIMIT: usize = 1024 * 1024;
+const TCP_INITIAL_CHUNKS: usize = 2;
+const TCP_KEEPIDLE_DEFAULT_NS: u64 = 7_200_000_000_000;
+const TCP_KEEPINTVL_DEFAULT_NS: u64 = 75_000_000_000;
+const TCP_KEEPCNT_DEFAULT: u16 = 9;
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(1);
 static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(None);
@@ -26,6 +32,14 @@ static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerRef {
     Unassigned,
+    Bound {
+        shard: ShardId,
+        generation: u32,
+    },
+    Listener {
+        shard: ShardId,
+        generation: u32,
+    },
     Flow {
         shard: ShardId,
         flow: FlowId,
@@ -34,6 +48,12 @@ pub enum OwnerRef {
     Closed {
         generation: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketKind {
+    Datagram,
+    Stream,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -79,6 +99,8 @@ pub enum SocketError {
     NotConnected,
     DestinationRequired,
     AlreadyConnected,
+    AlreadyInProgress,
+    InProgress,
     WouldBlock,
     Interrupted,
     TimedOut,
@@ -89,6 +111,8 @@ pub enum SocketError {
     NetworkUnreachable,
     HostUnreachable,
     Buffer,
+    ConnectionRefused,
+    ConnectionReset,
 }
 
 pub enum SocketCommand {
@@ -107,6 +131,13 @@ pub enum SocketCommand {
         peer: Endpoint,
         interface: Option<InterfaceId>,
         options: BindOptions,
+        nonblocking: bool,
+    },
+    Listen {
+        facade: Arc<SocketFacade>,
+        sequence: u64,
+        generation: u32,
+        backlog: u32,
     },
 }
 
@@ -137,6 +168,14 @@ fn socket_runtime() -> Result<&'static dyn SocketRuntime, SocketError> {
 }
 
 pub fn new_socket_facade(family: AddressFamily) -> Result<Arc<SocketFacade>, SocketError> {
+    new_facade(family, SocketKind::Datagram)
+}
+
+pub fn new_tcp_socket_facade(family: AddressFamily) -> Result<Arc<SocketFacade>, SocketError> {
+    new_facade(family, SocketKind::Stream)
+}
+
+fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacade>, SocketError> {
     let boot = boot_config().ok_or(SocketError::RuntimeUnavailable)?;
     let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
     let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
@@ -147,7 +186,220 @@ pub fn new_socket_facade(family: AddressFamily) -> Result<Arc<SocketFacade>, Soc
             counter,
         },
         family,
+        kind,
     )))
+}
+
+struct ByteRing {
+    arena: Box<[u8]>,
+    head: usize,
+    len: usize,
+    limit: usize,
+}
+
+impl ByteRing {
+    fn new() -> Self {
+        Self {
+            arena: alloc::vec![0; TCP_INITIAL_CHUNKS * SOCKET_CHUNK_BYTES].into_boxed_slice(),
+            head: 0,
+            len: 0,
+            limit: TCP_BUFFER_BYTES,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.limit.saturating_sub(self.len)
+    }
+
+    fn grow_for(&mut self, additional: usize) {
+        let required = self.len.saturating_add(additional).min(self.limit);
+        if required <= self.arena.len() {
+            return;
+        }
+        let capacity = required
+            .next_multiple_of(SOCKET_CHUNK_BYTES)
+            .min(self.limit);
+        let mut arena = alloc::vec![0; capacity].into_boxed_slice();
+        self.copy_range(0, &mut arena[..self.len]);
+        self.arena = arena;
+        self.head = 0;
+    }
+
+    fn push(&mut self, input: &[u8]) -> usize {
+        let len = input.len().min(self.available());
+        self.grow_for(len);
+        if len == 0 {
+            return 0;
+        }
+        let tail = (self.head + self.len) % self.arena.len();
+        let first = len.min(self.arena.len() - tail);
+        self.arena[tail..tail + first].copy_from_slice(&input[..first]);
+        self.arena[..len - first].copy_from_slice(&input[first..len]);
+        self.len += len;
+        len
+    }
+
+    fn copy_range(&self, offset: usize, output: &mut [u8]) -> bool {
+        if offset.saturating_add(output.len()) > self.len {
+            return false;
+        }
+        if output.is_empty() {
+            return true;
+        }
+        let output_len = output.len();
+        let start = (self.head + offset) % self.arena.len();
+        let first = output_len.min(self.arena.len() - start);
+        output[..first].copy_from_slice(&self.arena[start..start + first]);
+        output[first..].copy_from_slice(&self.arena[..output_len - first]);
+        true
+    }
+
+    fn consume(&mut self, len: usize) -> usize {
+        let len = len.min(self.len);
+        if !self.arena.is_empty() {
+            self.head = (self.head + len) % self.arena.len();
+        }
+        self.len -= len;
+        len
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+
+    fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.clamp(16 * 1024, TCP_BUFFER_HARD_LIMIT);
+    }
+}
+
+struct StreamTxRing {
+    bytes: ByteRing,
+    base: u64,
+    sent: usize,
+}
+
+impl StreamTxRing {
+    fn new() -> Self {
+        Self {
+            bytes: ByteRing::new(),
+            base: 0,
+            sent: 0,
+        }
+    }
+
+    fn push(&mut self, input: &[u8]) -> usize {
+        self.bytes.push(input)
+    }
+
+    fn take_unsent(&mut self, max_len: usize) -> Option<(u64, usize)> {
+        let len = self.bytes.len.saturating_sub(self.sent).min(max_len);
+        if len == 0 {
+            return None;
+        }
+        let start = self.base + self.sent as u64;
+        self.sent += len;
+        Some((start, len))
+    }
+
+    fn copy_absolute(&self, start: u64, output: &mut [u8]) -> bool {
+        let Some(offset) = start.checked_sub(self.base) else {
+            return false;
+        };
+        self.bytes.copy_range(offset as usize, output)
+    }
+
+    fn contains(&self, start: u64, len: usize) -> bool {
+        start
+            .checked_sub(self.base)
+            .and_then(|offset| (offset as usize).checked_add(len))
+            .is_some_and(|end| end <= self.bytes.len)
+    }
+
+    fn acknowledge(&mut self, len: usize) -> usize {
+        let consumed = self.bytes.consume(len.min(self.sent));
+        self.base = self.base.saturating_add(consumed as u64);
+        self.sent -= consumed;
+        consumed
+    }
+
+    fn abort(&mut self) {
+        self.bytes.clear();
+        self.base = self.base.saturating_add(self.sent as u64);
+        self.sent = 0;
+    }
+}
+
+struct StreamRxRing {
+    bytes: ByteRing,
+    eof: bool,
+}
+
+impl StreamRxRing {
+    fn new() -> Self {
+        Self {
+            bytes: ByteRing::new(),
+            eof: false,
+        }
+    }
+}
+
+struct AcceptQueue {
+    backlog: usize,
+    children: VecDeque<Arc<SocketFacade>>,
+}
+
+impl AcceptQueue {
+    fn new() -> Self {
+        Self {
+            backlog: 0,
+            children: VecDeque::new(),
+        }
+    }
+}
+
+pub struct TcpTxLease {
+    facade: Arc<SocketFacade>,
+    pub start: u64,
+    pub len: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpInfoSnapshot {
+    pub state: u8,
+    pub rto_us: u32,
+    pub rtt_us: u32,
+    pub rtt_variance_us: u32,
+    pub send_mss: u32,
+    pub congestion_window: u32,
+    pub send_ssthresh: u32,
+    pub unacknowledged: u32,
+    pub retransmitted: u32,
+    pub total_retransmitted: u32,
+    pub receive_space: u32,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+impl TcpTxLease {
+    pub fn facade(&self) -> Arc<SocketFacade> {
+        Arc::clone(&self.facade)
+    }
+
+    pub fn copy_out(&self, output: &mut [u8]) -> Result<usize, SocketError> {
+        if output.len() < usize::from(self.len) {
+            return Err(SocketError::Buffer);
+        }
+        if !self
+            .facade
+            .stream_tx
+            .lock()
+            .copy_absolute(self.start, &mut output[..usize::from(self.len)])
+        {
+            return Err(SocketError::Closed);
+        }
+        Ok(usize::from(self.len))
+    }
 }
 
 struct TxEntry {
@@ -401,6 +653,8 @@ impl UdpTxLease {
         self.facade
             .tx
             .lock()
+            .as_ref()
+            .expect("UDP facade 必须拥有 TX ring")
             .copy_out(self.slot, self.generation, output)
     }
 
@@ -415,6 +669,7 @@ impl UdpTxLease {
         self.completed = true;
         let writable = {
             let mut tx = self.facade.tx.lock();
+            let tx = tx.as_mut().expect("UDP facade 必须拥有 TX ring");
             tx.complete(self.slot, self.generation) && tx.writable()
         };
         if writable {
@@ -444,12 +699,16 @@ pub struct UdpReceive {
 pub struct SocketFacade {
     id: SocketId,
     family: AddressFamily,
+    kind: SocketKind,
     generation: AtomicU32,
     owner: Mutex<OwnerRef>,
     local: Mutex<Option<Endpoint>>,
     peer: Mutex<Option<Endpoint>>,
-    tx: Mutex<TxRing>,
-    rx: Mutex<RxRing>,
+    tx: Mutex<Option<TxRing>>,
+    rx: Mutex<Option<RxRing>>,
+    stream_tx: Mutex<StreamTxRing>,
+    stream_rx: Mutex<StreamRxRing>,
+    accept_queue: Mutex<AcceptQueue>,
     readiness: AtomicU16,
     readiness_generation: AtomicU64,
     observer: Mutex<Option<Weak<dyn ReadinessObserver>>>,
@@ -466,20 +725,53 @@ pub struct SocketFacade {
     write_shutdown: AtomicBool,
     pending_error: AtomicU32,
     interface: Mutex<Option<InterfaceId>>,
+    tcp_nodelay: AtomicBool,
+    tcp_cork: AtomicBool,
+    tcp_more: AtomicBool,
+    tcp_quick_ack: AtomicBool,
+    tcp_user_timeout_ns: AtomicU64,
+    tcp_keepalive: AtomicBool,
+    tcp_keepidle_ns: AtomicU64,
+    tcp_keepintvl_ns: AtomicU64,
+    tcp_keepcount: AtomicU16,
+    tcp_maxseg: AtomicU16,
+    tcp_state: AtomicU16,
+    tcp_rto_us: AtomicU32,
+    tcp_rtt_us: AtomicU32,
+    tcp_rtt_variance_us: AtomicU32,
+    tcp_send_mss: AtomicU32,
+    tcp_congestion_window: AtomicU32,
+    tcp_send_ssthresh: AtomicU32,
+    tcp_unacknowledged: AtomicU32,
+    tcp_retransmitted: AtomicU32,
+    tcp_total_retransmitted: AtomicU32,
+    tcp_bytes_sent: AtomicU64,
+    tcp_bytes_received: AtomicU64,
+    receive_window_update: AtomicBool,
+    connect_pending: AtomicBool,
+    stream_connected: AtomicBool,
 }
 
 impl SocketFacade {
-    fn new(id: SocketId, family: AddressFamily) -> Self {
+    pub(crate) fn new(id: SocketId, family: AddressFamily, kind: SocketKind) -> Self {
         Self {
             id,
             family,
+            kind,
             generation: AtomicU32::new(1),
             owner: Mutex::new(OwnerRef::Unassigned),
             local: Mutex::new(None),
             peer: Mutex::new(None),
-            tx: Mutex::new(TxRing::new()),
-            rx: Mutex::new(RxRing::new()),
-            readiness: AtomicU16::new(Readiness::WRITABLE.0),
+            tx: Mutex::new((kind == SocketKind::Datagram).then(TxRing::new)),
+            rx: Mutex::new((kind == SocketKind::Datagram).then(RxRing::new)),
+            stream_tx: Mutex::new(StreamTxRing::new()),
+            stream_rx: Mutex::new(StreamRxRing::new()),
+            accept_queue: Mutex::new(AcceptQueue::new()),
+            readiness: AtomicU16::new(if kind == SocketKind::Datagram {
+                Readiness::WRITABLE.0
+            } else {
+                0
+            }),
             readiness_generation: AtomicU64::new(1),
             observer: Mutex::new(None),
             read_wait: WaitQueue::new(),
@@ -495,6 +787,31 @@ impl SocketFacade {
             write_shutdown: AtomicBool::new(false),
             pending_error: AtomicU32::new(0),
             interface: Mutex::new(None),
+            tcp_nodelay: AtomicBool::new(false),
+            tcp_cork: AtomicBool::new(false),
+            tcp_more: AtomicBool::new(false),
+            tcp_quick_ack: AtomicBool::new(false),
+            tcp_user_timeout_ns: AtomicU64::new(0),
+            tcp_keepalive: AtomicBool::new(false),
+            tcp_keepidle_ns: AtomicU64::new(TCP_KEEPIDLE_DEFAULT_NS),
+            tcp_keepintvl_ns: AtomicU64::new(TCP_KEEPINTVL_DEFAULT_NS),
+            tcp_keepcount: AtomicU16::new(TCP_KEEPCNT_DEFAULT),
+            tcp_maxseg: AtomicU16::new(0),
+            tcp_state: AtomicU16::new(7),
+            tcp_rto_us: AtomicU32::new(1_000_000),
+            tcp_rtt_us: AtomicU32::new(0),
+            tcp_rtt_variance_us: AtomicU32::new(0),
+            tcp_send_mss: AtomicU32::new(0),
+            tcp_congestion_window: AtomicU32::new(0),
+            tcp_send_ssthresh: AtomicU32::new(u32::MAX),
+            tcp_unacknowledged: AtomicU32::new(0),
+            tcp_retransmitted: AtomicU32::new(0),
+            tcp_total_retransmitted: AtomicU32::new(0),
+            tcp_bytes_sent: AtomicU64::new(0),
+            tcp_bytes_received: AtomicU64::new(0),
+            receive_window_update: AtomicBool::new(false),
+            connect_pending: AtomicBool::new(false),
+            stream_connected: AtomicBool::new(false),
         }
     }
 
@@ -506,8 +823,20 @@ impl SocketFacade {
         self.family
     }
 
+    pub const fn kind(&self) -> SocketKind {
+        self.kind
+    }
+
     pub fn generation(&self) -> u32 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn write_is_shutdown(&self) -> bool {
+        self.write_shutdown.load(Ordering::Acquire)
     }
 
     pub fn owner(&self) -> OwnerRef {
@@ -594,9 +923,31 @@ impl SocketFacade {
         interface: Option<InterfaceId>,
         options: BindOptions,
     ) -> Result<(), SocketError> {
+        self.connect_with_mode(peer, interface, options, false)
+    }
+
+    pub fn connect_with_mode(
+        self: &Arc<Self>,
+        peer: Endpoint,
+        interface: Option<InterfaceId>,
+        options: BindOptions,
+        nonblocking: bool,
+    ) -> Result<(), SocketError> {
         let _control = self.control_lock.lock();
+        if self.kind == SocketKind::Stream && self.connect_pending.swap(true, Ordering::AcqRel) {
+            return Err(SocketError::AlreadyInProgress);
+        }
         if self.peer_endpoint().is_some() {
-            return Err(SocketError::AlreadyConnected);
+            let error = if self.kind == SocketKind::Stream
+                && !self.stream_connected.load(Ordering::Acquire)
+                && matches!(self.owner(), OwnerRef::Flow { .. })
+            {
+                SocketError::AlreadyInProgress
+            } else {
+                SocketError::AlreadyConnected
+            };
+            self.connect_pending.store(false, Ordering::Release);
+            return Err(error);
         }
         let sequence = self.next_control_sequence();
         let command = SocketCommand::Connect {
@@ -606,11 +957,89 @@ impl SocketFacade {
             peer,
             interface,
             options,
+            nonblocking,
+        };
+        if socket_runtime()?.submit_control(command).is_err() {
+            self.connect_pending.store(false, Ordering::Release);
+            return Err(SocketError::RuntimeBusy);
+        }
+        if nonblocking && self.kind == SocketKind::Stream {
+            return Err(SocketError::InProgress);
+        }
+        let result = self.wait_control(sequence);
+        self.connect_pending.store(false, Ordering::Release);
+        result
+    }
+
+    pub fn listen(self: &Arc<Self>, backlog: u32) -> Result<(), SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        let _control = self.control_lock.lock();
+        let sequence = self.next_control_sequence();
+        let command = SocketCommand::Listen {
+            facade: Arc::clone(self),
+            sequence,
+            generation: self.generation(),
+            backlog,
         };
         socket_runtime()?
             .submit_control(command)
             .map_err(|_| SocketError::RuntimeBusy)?;
         self.wait_control(sequence)
+    }
+
+    pub fn accept(
+        self: &Arc<Self>,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<Arc<SocketFacade>, SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        loop {
+            let child = self.accept_queue.lock().children.pop_front();
+            if let Some(child) = child {
+                self.refresh_accept_readiness();
+                return Ok(child);
+            }
+            if self.closing.load(Ordering::Acquire) {
+                return Err(SocketError::Closed);
+            }
+            if nonblocking {
+                return Err(SocketError::WouldBlock);
+            }
+            self.wait_accept(deadline_ns)?;
+        }
+    }
+
+    pub fn configure_listener(&self, backlog: u32) {
+        self.accept_queue.lock().backlog = (backlog as usize).clamp(1, 4096);
+    }
+
+    pub fn listener_backlog(&self) -> usize {
+        self.accept_queue.lock().backlog.max(1)
+    }
+
+    pub fn push_accepted(&self, child: Arc<SocketFacade>) -> Result<(), Arc<SocketFacade>> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(child);
+        }
+        let was_empty = {
+            let mut queue = self.accept_queue.lock();
+            if queue.children.len() >= queue.backlog {
+                return Err(child);
+            }
+            let was_empty = queue.children.is_empty();
+            queue.children.push_back(child);
+            was_empty
+        };
+        if was_empty {
+            self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
+            self.accept_wait.wake_one_default();
+            self.read_wait.wake_one_default();
+        }
+        Ok(())
     }
 
     pub fn send(
@@ -631,12 +1060,13 @@ impl SocketFacade {
             .ok_or(SocketError::DestinationRequired)?;
         loop {
             let was_empty = {
-                let mut tx = self.tx.lock();
+                let mut tx_guard = self.tx.lock();
+                let tx = tx_guard.as_mut().expect("UDP facade 必须拥有 TX ring");
                 let was_empty = tx.is_empty();
                 match tx.push(payload, destination) {
                     Ok(()) => was_empty,
                     Err(SocketError::WouldBlock) if !nonblocking => {
-                        drop(tx);
+                        drop(tx_guard);
                         self.wait_write(deadline_ns)?;
                         continue;
                     }
@@ -652,16 +1082,388 @@ impl SocketFacade {
     }
 
     pub fn take_tx(self: &Arc<Self>) -> Option<UdpTxLease> {
-        self.tx.lock().take(Arc::clone(self))
+        self.tx
+            .lock()
+            .as_mut()
+            .expect("UDP facade 必须拥有 TX ring")
+            .take(Arc::clone(self))
     }
 
     pub fn finish_tx_drain(self: &Arc<Self>) {
         self.tx_notified.store(false, Ordering::Release);
         fence(Ordering::SeqCst);
-        if !self.tx.lock().is_empty() && !self.tx_notified.swap(true, Ordering::AcqRel) {
+        let pending = match self.kind {
+            SocketKind::Datagram => !self
+                .tx
+                .lock()
+                .as_ref()
+                .expect("UDP facade 必须拥有 TX ring")
+                .is_empty(),
+            SocketKind::Stream => {
+                let tx = self.stream_tx.lock();
+                tx.sent < tx.bytes.len
+            }
+        };
+        if pending && !self.tx_notified.swap(true, Ordering::AcqRel) {
             socket_runtime()
                 .expect("socket runtime 必须保持安装")
                 .notify_tx(Arc::clone(self));
+        }
+    }
+
+    pub fn finish_stream_tx_drain(&self) {
+        self.tx_notified.store(false, Ordering::Release);
+    }
+
+    pub fn tcp_nodelay(&self) -> bool {
+        self.tcp_nodelay.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_nodelay(self: &Arc<Self>, enabled: bool) {
+        let changed = self.tcp_nodelay.swap(enabled, Ordering::AcqRel) != enabled;
+        if changed && enabled {
+            self.notify_stream_pending();
+        }
+    }
+
+    pub fn tcp_cork(&self) -> bool {
+        self.tcp_cork.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_cork(self: &Arc<Self>, enabled: bool) {
+        let changed = self.tcp_cork.swap(enabled, Ordering::AcqRel) != enabled;
+        if changed && !enabled {
+            self.notify_stream_pending();
+        }
+    }
+
+    pub fn tcp_more(&self) -> bool {
+        self.tcp_more.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_more(&self, enabled: bool) {
+        self.tcp_more.store(enabled, Ordering::Release);
+    }
+
+    fn notify_stream_pending(self: &Arc<Self>) {
+        if self.stream_unsent_len() != 0 && !self.tx_notified.swap(true, Ordering::AcqRel) {
+            if let Ok(runtime) = socket_runtime() {
+                runtime.notify_tx(Arc::clone(self));
+            }
+        }
+    }
+
+    pub fn request_quick_ack(&self) {
+        self.tcp_quick_ack.store(true, Ordering::Release);
+    }
+
+    pub fn take_quick_ack(&self) -> bool {
+        self.tcp_quick_ack.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn tcp_user_timeout_ns(&self) -> u64 {
+        self.tcp_user_timeout_ns.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_user_timeout_ns(&self, timeout_ns: u64) {
+        self.tcp_user_timeout_ns
+            .store(timeout_ns, Ordering::Release);
+    }
+
+    pub fn tcp_keepalive_enabled(&self) -> bool {
+        self.tcp_keepalive.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_keepalive(self: &Arc<Self>, enabled: bool) {
+        if self.tcp_keepalive.swap(enabled, Ordering::AcqRel) != enabled {
+            self.notify_tcp_state_change();
+        }
+    }
+
+    pub fn tcp_keepidle_ns(&self) -> u64 {
+        self.tcp_keepidle_ns.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_keepidle_ns(self: &Arc<Self>, value: u64) {
+        self.tcp_keepidle_ns
+            .store(value.max(1_000_000_000), Ordering::Release);
+        self.notify_tcp_state_change();
+    }
+
+    pub fn tcp_keepintvl_ns(&self) -> u64 {
+        self.tcp_keepintvl_ns.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_keepintvl_ns(self: &Arc<Self>, value: u64) {
+        self.tcp_keepintvl_ns
+            .store(value.max(1_000_000_000), Ordering::Release);
+        self.notify_tcp_state_change();
+    }
+
+    pub fn tcp_keepcount(&self) -> u8 {
+        self.tcp_keepcount
+            .load(Ordering::Acquire)
+            .min(u16::from(u8::MAX)) as u8
+    }
+
+    pub fn tcp_maxseg(&self) -> u16 {
+        self.tcp_maxseg.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_maxseg(&self, value: u16) {
+        self.tcp_maxseg.store(value, Ordering::Release);
+    }
+
+    pub fn update_tcp_info(
+        &self,
+        state: u8,
+        rto_us: u32,
+        rtt_us: u32,
+        rtt_variance_us: u32,
+        send_mss: u32,
+        congestion_window: u32,
+        send_ssthresh: u32,
+        unacknowledged: u32,
+        retransmitted: u32,
+    ) {
+        self.tcp_state.store(u16::from(state), Ordering::Release);
+        self.tcp_rto_us.store(rto_us, Ordering::Release);
+        self.tcp_rtt_us.store(rtt_us, Ordering::Release);
+        self.tcp_rtt_variance_us
+            .store(rtt_variance_us, Ordering::Release);
+        self.tcp_send_mss.store(send_mss, Ordering::Release);
+        self.tcp_congestion_window
+            .store(congestion_window, Ordering::Release);
+        self.tcp_send_ssthresh
+            .store(send_ssthresh, Ordering::Release);
+        self.tcp_unacknowledged
+            .store(unacknowledged, Ordering::Release);
+        self.tcp_retransmitted
+            .store(retransmitted, Ordering::Release);
+    }
+
+    pub fn record_tcp_retransmission(&self) {
+        self.tcp_total_retransmitted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn tcp_info(&self) -> TcpInfoSnapshot {
+        TcpInfoSnapshot {
+            state: self.tcp_state.load(Ordering::Acquire) as u8,
+            rto_us: self.tcp_rto_us.load(Ordering::Acquire),
+            rtt_us: self.tcp_rtt_us.load(Ordering::Acquire),
+            rtt_variance_us: self.tcp_rtt_variance_us.load(Ordering::Acquire),
+            send_mss: self.tcp_send_mss.load(Ordering::Acquire),
+            congestion_window: self.tcp_congestion_window.load(Ordering::Acquire),
+            send_ssthresh: self.tcp_send_ssthresh.load(Ordering::Acquire),
+            unacknowledged: self.tcp_unacknowledged.load(Ordering::Acquire),
+            retransmitted: self.tcp_retransmitted.load(Ordering::Acquire),
+            total_retransmitted: self.tcp_total_retransmitted.load(Ordering::Acquire),
+            receive_space: self.stream_receive_window().min(u32::MAX as usize) as u32,
+            bytes_sent: self.tcp_bytes_sent.load(Ordering::Acquire),
+            bytes_received: self.tcp_bytes_received.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn set_tcp_keepcount(self: &Arc<Self>, value: u16) {
+        self.tcp_keepcount.store(value.max(1), Ordering::Release);
+        self.notify_tcp_state_change();
+    }
+
+    pub fn take_receive_window_update(&self) -> bool {
+        self.receive_window_update.swap(false, Ordering::AcqRel)
+    }
+
+    fn notify_tcp_state_change(self: &Arc<Self>) {
+        if matches!(self.owner(), OwnerRef::Flow { .. })
+            && !self.tx_notified.swap(true, Ordering::AcqRel)
+            && let Ok(runtime) = socket_runtime()
+        {
+            runtime.notify_tx(Arc::clone(self));
+        }
+    }
+
+    pub fn send_stream(
+        self: &Arc<Self>,
+        payload: &[u8],
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if self.closing.load(Ordering::Acquire) {
+            return Err(SocketError::Closed);
+        }
+        if self.write_shutdown.load(Ordering::Acquire) {
+            return Err(SocketError::WriteShutdown);
+        }
+        let owner = self.owner();
+        if !matches!(owner, OwnerRef::Flow { .. }) || !self.stream_connected.load(Ordering::Acquire)
+        {
+            return if matches!(owner, OwnerRef::Closed { .. }) && self.peer_endpoint().is_some() {
+                Err(SocketError::WriteShutdown)
+            } else {
+                Err(SocketError::NotConnected)
+            };
+        }
+        if payload.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let copied = self.stream_tx.lock().push(payload);
+            if copied != 0 {
+                self.refresh_tx_readiness();
+                if !self.tx_notified.swap(true, Ordering::AcqRel) {
+                    socket_runtime()?.notify_tx(Arc::clone(self));
+                }
+                return Ok(copied);
+            }
+            self.refresh_tx_readiness();
+            if nonblocking {
+                return Err(SocketError::WouldBlock);
+            }
+            self.wait_write(deadline_ns)?;
+        }
+    }
+
+    pub fn take_stream_tx(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
+        let (start, len) = self.stream_tx.lock().take_unsent(max_len)?;
+        self.tcp_bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        Some(TcpTxLease {
+            facade: Arc::clone(self),
+            start,
+            len: len as u16,
+        })
+    }
+
+    pub fn stream_unsent_len(&self) -> usize {
+        let tx = self.stream_tx.lock();
+        tx.bytes.len.saturating_sub(tx.sent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_push_stream_tx(&self, payload: &[u8]) -> usize {
+        self.stream_tx.lock().push(payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_stream_tx_len(&self) -> usize {
+        self.stream_tx.lock().bytes.len
+    }
+
+    pub fn retransmit_stream(self: &Arc<Self>, start: u64, len: usize) -> Option<TcpTxLease> {
+        let tx = self.stream_tx.lock();
+        if len > u16::MAX as usize || !tx.contains(start, len) {
+            return None;
+        }
+        drop(tx);
+        Some(TcpTxLease {
+            facade: Arc::clone(self),
+            start,
+            len: len as u16,
+        })
+    }
+
+    pub fn acknowledge_stream(&self, len: usize) -> usize {
+        let writable = {
+            let mut tx = self.stream_tx.lock();
+            let consumed = tx.acknowledge(len);
+            let writable = tx.bytes.available() != 0;
+            (consumed, writable)
+        };
+        if writable.1 {
+            self.set_ready(Readiness::WRITABLE);
+            self.write_wait.wake_one_default();
+        }
+        writable.0
+    }
+
+    pub fn abort_stream_tx(&self) {
+        self.stream_tx.lock().abort();
+        self.refresh_tx_readiness();
+    }
+
+    pub fn push_stream_rx(&self, payload: &[u8]) -> Result<usize, SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return Ok(payload.len());
+        }
+        let was_empty;
+        let copied;
+        {
+            let mut rx = self.stream_rx.lock();
+            if rx.bytes.available() < payload.len() {
+                return Err(SocketError::WouldBlock);
+            }
+            was_empty = rx.bytes.len == 0;
+            copied = rx.bytes.push(payload);
+        }
+        debug_assert_eq!(copied, payload.len());
+        self.tcp_bytes_received
+            .fetch_add(copied as u64, Ordering::Relaxed);
+        if was_empty && copied != 0 {
+            self.set_ready(Readiness::READABLE);
+            self.read_wait.wake_one_default();
+        }
+        Ok(copied)
+    }
+
+    pub fn publish_stream_eof(&self) {
+        self.stream_rx.lock().eof = true;
+        self.set_ready(Readiness::READABLE | Readiness::READ_HANGUP);
+        self.read_wait.wake_all();
+        self.state_wait.wake_all();
+    }
+
+    pub fn recv_stream(
+        self: &Arc<Self>,
+        output: &mut [u8],
+        peek: bool,
+        wait_all: bool,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+    ) -> Result<usize, SocketError> {
+        let mut total = 0usize;
+        loop {
+            let (copied, eof) = {
+                let mut rx = self.stream_rx.lock();
+                let copied = (output.len() - total).min(rx.bytes.len);
+                if copied != 0 && !rx.bytes.copy_range(0, &mut output[total..total + copied]) {
+                    return Err(SocketError::Buffer);
+                }
+                if copied != 0 && !peek {
+                    rx.bytes.consume(copied);
+                }
+                (copied, rx.eof)
+            };
+            total += copied;
+            if copied != 0 && !peek {
+                self.receive_window_update.store(true, Ordering::Release);
+                self.notify_tcp_state_change();
+            }
+            self.refresh_rx_readiness();
+            if total != 0 && (!wait_all || total == output.len() || peek || eof) {
+                return Ok(total);
+            }
+            if total == 0
+                && let Some(error) = self.take_pending_error()
+            {
+                self.refresh_rx_readiness();
+                return Err(error);
+            }
+            if eof || self.read_shutdown.load(Ordering::Acquire) {
+                return Ok(total);
+            }
+            if nonblocking {
+                return if total == 0 {
+                    Err(SocketError::WouldBlock)
+                } else {
+                    Ok(total)
+                };
+            }
+            self.wait_read(deadline_ns)?;
         }
     }
 
@@ -674,6 +1476,7 @@ impl SocketFacade {
         }
         let was_empty = {
             let mut rx = self.rx.lock();
+            let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
             let was_empty = rx.is_empty();
             rx.push(datagram)?;
             was_empty
@@ -734,7 +1537,8 @@ impl SocketFacade {
         peek: bool,
         report_original_len: bool,
     ) -> Result<Option<UdpReceive>, SocketError> {
-        let mut rx = self.rx.lock();
+        let mut rx_guard = self.rx.lock();
+        let rx = rx_guard.as_mut().expect("UDP facade 必须拥有 RX ring");
         let Some(datagram) = rx.front() else {
             return Ok(None);
         };
@@ -761,7 +1565,7 @@ impl SocketFacade {
         if !peek {
             let datagram = rx.pop().unwrap();
             let empty = rx.is_empty();
-            drop(rx);
+            drop(rx_guard);
             drop(datagram);
             if empty {
                 self.refresh_rx_readiness();
@@ -778,17 +1582,27 @@ impl SocketFacade {
         }
         if read {
             self.read_shutdown.store(true, Ordering::Release);
-            let mut rx = self.rx.lock();
-            while let Some(datagram) = rx.pop() {
-                drop(datagram);
+            match self.kind {
+                SocketKind::Datagram => {
+                    let mut rx = self.rx.lock();
+                    let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
+                    while let Some(datagram) = rx.pop() {
+                        drop(datagram);
+                    }
+                }
+                SocketKind::Stream => self.stream_rx.lock().bytes.clear(),
             }
-            drop(rx);
             self.clear_ready(Readiness::READABLE);
             self.set_ready(Readiness::READ_HANGUP);
         }
         if write {
             self.write_shutdown.store(true, Ordering::Release);
             self.clear_ready(Readiness::WRITABLE);
+            if self.kind == SocketKind::Stream
+                && let Ok(runtime) = socket_runtime()
+            {
+                runtime.notify_lifecycle(Arc::clone(self));
+            }
         }
         self.state_wait.wake_all();
         self.read_wait.wake_all();
@@ -806,6 +1620,15 @@ impl SocketFacade {
         self.write_wait.wake_all();
         self.accept_wait.wake_all();
         self.state_wait.wake_all();
+        if self.kind == SocketKind::Stream {
+            let children = {
+                let mut queue = self.accept_queue.lock();
+                core::mem::take(&mut queue.children)
+            };
+            for child in children {
+                child.close();
+            }
+        }
         if let Ok(runtime) = socket_runtime() {
             runtime.notify_lifecycle(Arc::clone(self));
         } else {
@@ -814,6 +1637,12 @@ impl SocketFacade {
     }
 
     pub fn complete_control(&self, sequence: u64, result: Result<(), SocketError>) {
+        if let Err(error) = result
+            && self.kind == SocketKind::Stream
+            && self.connect_pending.swap(false, Ordering::AcqRel)
+        {
+            self.publish_connection_error(error);
+        }
         *self.control_result.lock() = Some((sequence, result));
         self.state_wait.wake_all();
     }
@@ -829,6 +1658,36 @@ impl SocketFacade {
         *self.peer.lock() = peer;
         *self.interface.lock() = interface;
         *self.owner.lock() = owner;
+    }
+
+    pub fn publish_connecting(&self) {
+        self.stream_connected.store(false, Ordering::Release);
+        self.clear_ready(Readiness::WRITABLE);
+    }
+
+    pub fn publish_connected(&self) {
+        self.connect_pending.store(false, Ordering::Release);
+        self.stream_connected.store(true, Ordering::Release);
+        self.set_ready(Readiness::WRITABLE);
+        self.write_wait.wake_all();
+        self.state_wait.wake_all();
+    }
+
+    pub fn publish_connection_error(&self, error: SocketError) {
+        self.connect_pending.store(false, Ordering::Release);
+        self.stream_connected.store(false, Ordering::Release);
+        self.stream_rx.lock().eof = true;
+        self.set_pending_error(error);
+        self.set_ready(
+            Readiness::READABLE | Readiness::WRITABLE | Readiness::HANGUP | Readiness::READ_HANGUP,
+        );
+        self.read_wait.wake_all();
+        self.write_wait.wake_all();
+        self.state_wait.wake_all();
+    }
+
+    pub fn stream_receive_window(&self) -> usize {
+        self.stream_rx.lock().bytes.available()
     }
 
     pub fn publish_closed(&self) {
@@ -860,16 +1719,50 @@ impl SocketFacade {
 
     pub fn set_buffer_limits(&self, send: Option<usize>, receive: Option<usize>) {
         if let Some(limit) = send {
-            self.tx.lock().set_limit(limit);
+            match self.kind {
+                SocketKind::Datagram => self
+                    .tx
+                    .lock()
+                    .as_mut()
+                    .expect("UDP facade 必须拥有 TX ring")
+                    .set_limit(limit),
+                SocketKind::Stream => self.stream_tx.lock().bytes.set_limit(limit),
+            }
             self.refresh_tx_readiness();
         }
         if let Some(limit) = receive {
-            self.rx.lock().limit = limit.clamp(16 * 1024, UDP_BUFFER_HARD_LIMIT);
+            match self.kind {
+                SocketKind::Datagram => {
+                    self.rx
+                        .lock()
+                        .as_mut()
+                        .expect("UDP facade 必须拥有 RX ring")
+                        .limit = limit.clamp(16 * 1024, UDP_BUFFER_HARD_LIMIT)
+                }
+                SocketKind::Stream => self.stream_rx.lock().bytes.set_limit(limit),
+            }
         }
     }
 
     pub fn buffer_limits(&self) -> (usize, usize) {
-        (self.tx.lock().limit, self.rx.lock().limit)
+        match self.kind {
+            SocketKind::Datagram => (
+                self.tx
+                    .lock()
+                    .as_ref()
+                    .expect("UDP facade 必须拥有 TX ring")
+                    .limit,
+                self.rx
+                    .lock()
+                    .as_ref()
+                    .expect("UDP facade 必须拥有 RX ring")
+                    .limit,
+            ),
+            SocketKind::Stream => (
+                self.stream_tx.lock().bytes.limit,
+                self.stream_rx.lock().bytes.limit,
+            ),
+        }
     }
 
     fn refresh_tx_readiness(&self) {
@@ -877,13 +1770,31 @@ impl SocketFacade {
             self.clear_ready(Readiness::WRITABLE);
             return;
         }
-        if self.tx.lock().writable() {
+        let writable = match self.kind {
+            SocketKind::Datagram => self
+                .tx
+                .lock()
+                .as_ref()
+                .expect("UDP facade 必须拥有 TX ring")
+                .writable(),
+            SocketKind::Stream => self.stream_tx.lock().bytes.available() != 0,
+        };
+        if writable {
             self.set_ready(Readiness::WRITABLE);
             return;
         }
         self.clear_ready(Readiness::WRITABLE);
         fence(Ordering::SeqCst);
-        if self.tx.lock().writable() {
+        let writable = match self.kind {
+            SocketKind::Datagram => self
+                .tx
+                .lock()
+                .as_ref()
+                .expect("UDP facade 必须拥有 TX ring")
+                .writable(),
+            SocketKind::Stream => self.stream_tx.lock().bytes.available() != 0,
+        };
+        if writable {
             self.set_ready(Readiness::WRITABLE);
         }
     }
@@ -893,14 +1804,47 @@ impl SocketFacade {
             self.clear_ready(Readiness::READABLE);
             return;
         }
-        if !self.rx.lock().is_empty() {
+        let readable = match self.kind {
+            SocketKind::Datagram => !self
+                .rx
+                .lock()
+                .as_ref()
+                .expect("UDP facade 必须拥有 RX ring")
+                .is_empty(),
+            SocketKind::Stream => {
+                let rx = self.stream_rx.lock();
+                rx.bytes.len != 0 || rx.eof
+            }
+        };
+        if readable {
             self.set_ready(Readiness::READABLE);
             return;
         }
         self.clear_ready(Readiness::READABLE);
         fence(Ordering::SeqCst);
-        if !self.rx.lock().is_empty() {
+        let readable = match self.kind {
+            SocketKind::Datagram => !self
+                .rx
+                .lock()
+                .as_ref()
+                .expect("UDP facade 必须拥有 RX ring")
+                .is_empty(),
+            SocketKind::Stream => {
+                let rx = self.stream_rx.lock();
+                rx.bytes.len != 0 || rx.eof
+            }
+        };
+        if readable {
             self.set_ready(Readiness::READABLE);
+        }
+    }
+
+    fn refresh_accept_readiness(&self) {
+        if self.accept_queue.lock().children.is_empty() {
+            self.clear_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
+        } else {
+            self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
+            self.accept_wait.wake_one_default();
         }
     }
 
@@ -945,6 +1889,10 @@ impl SocketFacade {
 
     fn wait_write(&self, deadline_ns: Option<u64>) -> Result<(), SocketError> {
         self.wait_io(&self.write_wait, Readiness::WRITABLE, deadline_ns)
+    }
+
+    fn wait_accept(&self, deadline_ns: Option<u64>) -> Result<(), SocketError> {
+        self.wait_io(&self.accept_wait, Readiness::ACCEPTABLE, deadline_ns)
     }
 
     fn wait_io(
@@ -1032,7 +1980,7 @@ fn error_code(error: SocketError) -> u32 {
 
 fn error_from_code(code: u32) -> Option<SocketError> {
     let raw = code.checked_sub(1)?;
-    const ALL: [SocketError; 18] = [
+    const ALL: [SocketError; 22] = [
         SocketError::RuntimeUnavailable,
         SocketError::RuntimeBusy,
         SocketError::InvalidState,
@@ -1041,6 +1989,8 @@ fn error_from_code(code: u32) -> Option<SocketError> {
         SocketError::NotConnected,
         SocketError::DestinationRequired,
         SocketError::AlreadyConnected,
+        SocketError::AlreadyInProgress,
+        SocketError::InProgress,
         SocketError::WouldBlock,
         SocketError::Interrupted,
         SocketError::TimedOut,
@@ -1051,6 +2001,8 @@ fn error_from_code(code: u32) -> Option<SocketError> {
         SocketError::NetworkUnreachable,
         SocketError::HostUnreachable,
         SocketError::Buffer,
+        SocketError::ConnectionRefused,
+        SocketError::ConnectionReset,
     ];
     ALL.get(raw as usize).copied()
 }
@@ -1067,7 +2019,77 @@ mod tests {
                 counter: 1,
             },
             AddressFamily::Ipv4,
+            SocketKind::Datagram,
         ))
+    }
+
+    #[test]
+    fn stream_facade_does_not_allocate_udp_rings() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 2,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        assert!(facade.tx.lock().is_none());
+        assert!(facade.rx.lock().is_none());
+        assert_eq!(
+            facade.stream_tx.lock().bytes.arena.len(),
+            2 * SOCKET_CHUNK_BYTES
+        );
+        assert_eq!(
+            facade.stream_rx.lock().bytes.arena.len(),
+            2 * SOCKET_CHUNK_BYTES
+        );
+    }
+
+    #[test]
+    fn stream_rx_rejects_whole_segment_when_space_is_insufficient() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 3,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        facade.set_buffer_limits(None, Some(16 * 1024));
+        assert_eq!(facade.push_stream_rx(&[1; 15 * 1024]), Ok(15 * 1024));
+        assert_eq!(
+            facade.push_stream_rx(&[2; 2 * 1024]),
+            Err(SocketError::WouldBlock)
+        );
+        assert_eq!(facade.stream_rx.lock().bytes.len, 15 * 1024);
+    }
+
+    #[test]
+    fn stream_reset_is_delivered_after_buffered_data_then_eof() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 4,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        facade.push_stream_rx(b"data").unwrap();
+        facade.publish_connection_error(SocketError::ConnectionReset);
+        let mut output = [0u8; 8];
+        assert_eq!(
+            facade.recv_stream(&mut output, false, false, true, None),
+            Ok(4)
+        );
+        assert_eq!(&output[..4], b"data");
+        assert_eq!(
+            facade.recv_stream(&mut output, false, false, true, None),
+            Err(SocketError::ConnectionReset)
+        );
+        assert_eq!(
+            facade.recv_stream(&mut output, false, false, true, None),
+            Ok(0)
+        );
     }
 
     #[test]
@@ -1077,8 +2099,20 @@ mod tests {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 9000,
         };
-        facade.tx.lock().push(b"first", destination).unwrap();
-        facade.tx.lock().push(b"second", destination).unwrap();
+        facade
+            .tx
+            .lock()
+            .as_mut()
+            .unwrap()
+            .push(b"first", destination)
+            .unwrap();
+        facade
+            .tx
+            .lock()
+            .as_mut()
+            .unwrap()
+            .push(b"second", destination)
+            .unwrap();
         let first = facade.take_tx().unwrap();
         let second = facade.take_tx().unwrap();
         let mut output = [0u8; 8];
@@ -1090,6 +2124,7 @@ mod tests {
         first.complete();
         second.complete();
         let tx = facade.tx.lock();
+        let tx = tx.as_ref().unwrap();
         assert_eq!(tx.used_bytes, 0);
         assert_eq!(tx.free_chunk_count(), UDP_BUFFER_BYTES / SOCKET_CHUNK_BYTES);
     }
@@ -1101,10 +2136,18 @@ mod tests {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 9000,
         };
-        facade.tx.lock().limit = 16 * 1024;
-        assert!(facade.tx.lock().push(&[1; 16 * 1024], destination).is_ok());
+        facade.tx.lock().as_mut().unwrap().limit = 16 * 1024;
+        assert!(
+            facade
+                .tx
+                .lock()
+                .as_mut()
+                .unwrap()
+                .push(&[1; 16 * 1024], destination)
+                .is_ok()
+        );
         assert_eq!(
-            facade.tx.lock().push(&[2], destination),
+            facade.tx.lock().as_mut().unwrap().push(&[2], destination),
             Err(SocketError::WouldBlock)
         );
     }
@@ -1123,12 +2166,19 @@ mod tests {
                 facade
                     .tx
                     .lock()
+                    .as_mut()
+                    .unwrap()
                     .push(&[7; MAX_UDP_PAYLOAD], destination)
                     .is_ok()
             );
         }
         assert_eq!(
-            facade.tx.lock().push(&[7; MAX_UDP_PAYLOAD], destination),
+            facade
+                .tx
+                .lock()
+                .as_mut()
+                .unwrap()
+                .push(&[7; MAX_UDP_PAYLOAD], destination),
             Err(SocketError::WouldBlock)
         );
     }
