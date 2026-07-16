@@ -510,20 +510,7 @@ impl LoongArch64Paging {
     /// 粒度做细，这个接口也足够承载按 ASID、按虚拟地址的精确失效。
     #[inline]
     pub unsafe fn flush_tlb_with_asid(asid: usize, vaddr: Option<VirtAddr>) {
-        Self::page_table_barrier();
-        let asid = asid_bits(asid);
-        unsafe {
-            if let Some(addr) = vaddr {
-                core::arch::asm!(
-                    "invtlb 0x5, {asid}, {va}",
-                    asid = in(reg) asid,
-                    va = in(reg) addr.as_usize(),
-                    options(nostack)
-                );
-            } else {
-                core::arch::asm!("invtlb 0x0, $zero, $zero", options(nostack));
-            }
-        }
+        crate::loongarch64::smp::flush_tlb_all_cpus(asid, vaddr.map(VirtAddr::as_usize));
     }
 
     /// 使用当前 CSR_ASID 刷新当前核 TLB。

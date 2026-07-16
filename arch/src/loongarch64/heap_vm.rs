@@ -417,6 +417,15 @@ pub fn init_kernel_page_table() {
     log::debug!("[arch][heap_vm] kernel page table activated (DMW still active)");
 }
 
+/// 在辅助 CPU 上激活 boot CPU 已建立的内核页表。
+pub(crate) unsafe fn activate_kernel_page_table_for_secondary() {
+    let root_paddr = KERNEL_PAGE_TABLE_ROOT.load(Ordering::Acquire);
+    assert_ne!(root_paddr, 0, "[smp] kernel page table is not ready");
+    unsafe {
+        LoongArch64Paging::activate(PhysPageTableRoot::new(root_paddr));
+    }
+}
+
 /// 分配页表页
 fn allocate_page_table_page() -> Result<usize, MapError> {
     let request = PhysicalAllocRequest::new(PAGE_SIZE, PAGE_SIZE);

@@ -26,7 +26,7 @@ use crate::scheduler::{
     NR_CPUS, continue_task, current_cpu_id, current_task, enqueue_task_deferred, mark_task_stopped,
     migrate_task, online_cpu_mask, request_balance, request_post_syscall_handoff, request_resched,
     root_pid_ns, runqueue_of, schedule_once, select_cpu_for_mask, signal_wakeup,
-    supported_cpu_mask,
+    supported_cpu_mask, task_runqueue_cpu,
 };
 use crate::signal::{
     DefaultAction, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow, SigSet,
@@ -360,23 +360,8 @@ fn update_task_sched_entity(
     mut update: impl FnMut(usize, &Arc<Task>, u64) -> bool,
 ) -> Result<(), Errno> {
     let now_ns = crate::scheduler::now_ns_public();
-    let owner = task.current_cpu();
-    if owner < NR_CPUS && update(owner, task, now_ns) {
-        return Ok(());
-    }
-
-    for cpu_id in 0..NR_CPUS {
-        if cpu_id == owner {
-            continue;
-        }
-        if update(cpu_id, task, now_ns) {
-            return Ok(());
-        }
-    }
-
-    if task.sched.on_rq() {
-        Err(Errno::EBUSY)
-    } else if update(task.current_cpu().min(NR_CPUS - 1), task, now_ns) {
+    let owner = task_runqueue_cpu(task).map_or(0, CpuId::get);
+    if update(owner, task, now_ns) {
         Ok(())
     } else {
         Err(Errno::EBUSY)
@@ -405,11 +390,8 @@ pub fn sched_reset_on_fork(pid: PidT) -> Result<bool, Errno> {
 pub fn set_task_nice(task: &Arc<Task>, nice: i8) {
     let mut attr = task.sched.sched_attr();
     attr.nice = nice.clamp(crate::eevdf::NICE_MIN, crate::eevdf::NICE_MAX);
-    runqueue_of(task.current_cpu()).update_sched_attr(
-        task,
-        attr,
-        crate::scheduler::now_ns_public(),
-    );
+    let owner = task_runqueue_cpu(task).map_or(0, CpuId::get);
+    runqueue_of(owner).update_sched_attr(task, attr, crate::scheduler::now_ns_public());
 }
 
 #[kernel_symbols::export(name = "sched.operation.task_usage", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
@@ -599,19 +581,18 @@ pub fn clone_with_context_outcome(
                 break;
             }
             let parent = current_task();
-            wait_child
+            let entry = wait_child
                 .vfork_done
                 .prepare_to_wait(&parent, TaskState::Sleeping);
             if !wait_child.is_vforking() {
-                wait_child.vfork_done.finish_wait(&parent);
+                wait_child.vfork_done.finish_wait(&entry);
                 break;
             }
             drop(wait_child);
             drop(parent);
             schedule_once(crate::scheduler::now_ns_public());
-            let parent = current_task();
             if let Some(wait_child) = child_wait.upgrade() {
-                wait_child.vfork_done.finish_wait(&parent);
+                wait_child.vfork_done.finish_wait(&entry);
             }
         }
     } else if !args.flags.has(CloneFlags::CLONE_THREAD) {
@@ -855,7 +836,7 @@ fn wait_common(
         if has_interrupting_signal(&me) {
             return Err(Errno::EINTR);
         }
-        me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
+        let entry = me.exit_waiters.prepare_to_wait(&me, TaskState::Sleeping);
         if wait_child_observable(
             &me,
             target.clone(),
@@ -863,13 +844,13 @@ fn wait_common(
             wait_stopped,
             wait_continued,
         ) {
-            me.exit_waiters.finish_wait(&me);
+            me.exit_waiters.finish_wait(&entry);
             continue;
         }
         drop(me);
         schedule_once(crate::scheduler::now_ns_public());
         me = current_task();
-        me.exit_waiters.finish_wait(&me);
+        me.exit_waiters.finish_wait(&entry);
         if has_interrupting_signal(&me) {
             return Err(Errno::EINTR);
         }

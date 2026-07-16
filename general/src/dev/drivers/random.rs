@@ -498,16 +498,17 @@ impl RandomCore {
                 if sched::operation::has_interrupting_signal(&task) {
                     return Err(CharIoError::Interrupted);
                 }
-                self.entropy_wait
+                let entry = self
+                    .entropy_wait
                     .prepare_to_wait(&task, sched::TaskState::Sleeping);
                 if self.estimated_entropy_bits() >= bits {
-                    self.entropy_wait.finish_wait(&task);
+                    self.entropy_wait.finish_wait(&entry);
                     return Ok(());
                 }
                 drop(task);
                 sched::schedule_once(sched::now_ns_public());
                 let task = sched::current_task();
-                self.entropy_wait.finish_wait(&task);
+                self.entropy_wait.finish_wait(&entry);
                 if sched::operation::has_interrupting_signal(&task) {
                     return Err(CharIoError::Interrupted);
                 }

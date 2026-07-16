@@ -5,8 +5,27 @@ use core::cell::Cell;
 use ktest::ktest;
 
 use crate::cpu::{CpuId, CpuMask, MAX_CPUS, ROOT_SCHED_DOMAIN_ID, SchedDomain, SchedTopology};
-use crate::scheduler::{RunqueueLoadSnapshot, select_balance_source};
-use crate::{NR_CPUS, supported_cpu_mask};
+use crate::scheduler::{
+    RunqueueLoadSnapshot, deadline_has_capacity, select_balance_source_for_class,
+};
+use crate::{NR_CPUS, RunqueueClassLoad, SCHED_CAPACITY_SCALE, SchedClass, supported_cpu_mask};
+
+fn class_load(class: SchedClass, tasks: usize) -> RunqueueClassLoad {
+    let mut load = RunqueueClassLoad::default();
+    match class {
+        SchedClass::Deadline => {
+            load.deadline = tasks;
+            load.deadline_utilization = tasks as u64 * (SCHED_CAPACITY_SCALE / 4);
+        }
+        SchedClass::Realtime => load.realtime = tasks,
+        SchedClass::Fair => {
+            load.fair = tasks;
+            load.fair_weight = tasks as u64 * 1024;
+        }
+        SchedClass::Idle => {}
+    }
+    load
+}
 
 #[ktest]
 fn cpu_mask_truncates_to_supported_capacity() {
@@ -93,6 +112,35 @@ fn sched_topology_allows_nested_overlapping_domains() {
             .id(),
         1
     );
+}
+
+#[ktest]
+fn sched_domain_capacity_tracks_online_cpus() {
+    let domain = SchedDomain::with_capacity(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+        1536,
+    )
+    .expect("domain with explicit capacity");
+
+    assert_eq!(domain.capacity(), 1536);
+    assert_eq!(domain.effective_capacity(CpuMask::single_raw(0)), 768);
+    assert_eq!(domain.effective_capacity(CpuMask::EMPTY), 0);
+}
+
+#[ktest]
+fn synthetic_topology_assigns_each_cpu_to_its_own_domain() {
+    let topology = SchedTopology::with_cpu_domains();
+
+    assert_eq!(topology.len(), MAX_CPUS + 1);
+    for cpu_id in 0..MAX_CPUS {
+        let cpu = CpuId::new(cpu_id).expect("cpu");
+        let domain = topology.domain_for_cpu(cpu).expect("cpu domain");
+        assert_eq!(domain.span(), CpuMask::single(cpu));
+        assert_eq!(domain.parent(), Some(ROOT_SCHED_DOMAIN_ID));
+    }
 }
 
 #[ktest]
@@ -257,14 +305,160 @@ fn balance_source_allows_single_remote_task_when_local_is_idle() {
     let topology = SchedTopology::bootstrap();
     let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
 
-    let source = select_balance_source(topology, CpuId::new(1).unwrap(), online, 0, |cpu| {
-        if cpu.get() == 0 { 1 } else { 0 }
-    })
+    let source = select_balance_source_for_class(
+        topology,
+        CpuId::new(1).unwrap(),
+        online,
+        SchedClass::Fair,
+        |cpu| class_load(SchedClass::Fair, usize::from(cpu.get() == 0)),
+    )
     .expect("idle cpu should pull the only remote task");
     assert_eq!(source.get(), 0);
 
-    let no_pull = select_balance_source(topology, CpuId::new(1).unwrap(), online, 1, |cpu| {
-        if cpu.get() == 0 { 2 } else { 1 }
-    });
+    let no_pull = select_balance_source_for_class(
+        topology,
+        CpuId::new(1).unwrap(),
+        online,
+        SchedClass::Fair,
+        |cpu| class_load(SchedClass::Fair, if cpu.get() == 0 { 2 } else { 1 }),
+    );
     assert!(no_pull.is_none());
+}
+
+#[ktest]
+fn sched_topology_prefers_capacity_when_load_is_equal() {
+    let root = SchedDomain::root();
+    let slow = SchedDomain::with_capacity(1, CpuMask::single_raw(0), 1, Some(0), 512)
+        .expect("slow cpu domain");
+    let fast = SchedDomain::with_capacity(2, CpuMask::single_raw(1), 1, Some(0), 1024)
+        .expect("fast cpu domain");
+    let topology = SchedTopology::from_domains(&[root, slow, fast]).expect("topology");
+    let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
+
+    let chosen = topology
+        .select_cpu(online, online, None, false, |_| 1)
+        .expect("selected cpu");
+    assert_eq!(chosen.get(), 1);
+}
+
+#[ktest]
+fn balance_source_checks_parent_when_near_domain_is_balanced() {
+    let root = SchedDomain::root();
+    let cluster = SchedDomain::new(
+        1,
+        CpuMask::single_raw(0).union(CpuMask::single_raw(1)),
+        1,
+        Some(0),
+    )
+    .expect("cluster domain");
+    let leaf = SchedDomain::new(2, CpuMask::single_raw(0), 2, Some(1)).expect("leaf domain");
+    let remote = SchedDomain::new(3, CpuMask::single_raw(2), 1, Some(0)).expect("remote domain");
+    let topology = SchedTopology::from_domains(&[root, cluster, leaf, remote]).expect("topology");
+    let online = CpuMask::single_raw(0)
+        .union(CpuMask::single_raw(1))
+        .union(CpuMask::single_raw(2));
+
+    let source = select_balance_source_for_class(
+        topology,
+        CpuId::new(0).unwrap(),
+        online,
+        SchedClass::Fair,
+        |cpu| {
+            class_load(
+                SchedClass::Fair,
+                match cpu.get() {
+                    0 | 1 => 1,
+                    2 => 4,
+                    _ => 0,
+                },
+            )
+        },
+    )
+    .expect("parent domain should provide a source");
+    assert_eq!(source.get(), 2);
+}
+
+#[ktest]
+fn deadline_balance_does_not_move_single_task() {
+    let topology = SchedTopology::bootstrap();
+    let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
+
+    let single = select_balance_source_for_class(
+        topology,
+        CpuId::new(1).unwrap(),
+        online,
+        SchedClass::Deadline,
+        |cpu| class_load(SchedClass::Deadline, usize::from(cpu.get() == 0)),
+    );
+    assert!(single.is_none());
+
+    let overloaded = select_balance_source_for_class(
+        topology,
+        CpuId::new(1).unwrap(),
+        online,
+        SchedClass::Deadline,
+        |cpu| class_load(SchedClass::Deadline, if cpu.get() == 0 { 2 } else { 0 }),
+    );
+    assert_eq!(overloaded, CpuId::new(0));
+}
+
+#[ktest]
+fn deadline_balance_checks_target_capacity() {
+    let mut target = RunqueueClassLoad::default();
+    target.deadline_utilization = 800;
+
+    assert!(deadline_has_capacity(target, 200, SCHED_CAPACITY_SCALE));
+    assert!(!deadline_has_capacity(target, 300, SCHED_CAPACITY_SCALE));
+}
+
+#[ktest]
+fn fair_balance_uses_weight_instead_of_task_count() {
+    let topology = SchedTopology::bootstrap();
+    let online = CpuMask::single_raw(0).union(CpuMask::single_raw(1));
+    let mut local = class_load(SchedClass::Fair, 1);
+    local.fair_weight = 4096;
+    let mut source = class_load(SchedClass::Fair, 3);
+    source.fair_weight = 3072;
+
+    let no_pull = select_balance_source_for_class(
+        topology,
+        CpuId::new(1).unwrap(),
+        online,
+        SchedClass::Fair,
+        |cpu| if cpu.get() == 0 { source } else { local },
+    );
+    assert!(no_pull.is_none());
+
+    source.fair_weight = 6144;
+    let pull = select_balance_source_for_class(
+        topology,
+        CpuId::new(1).unwrap(),
+        online,
+        SchedClass::Fair,
+        |cpu| if cpu.get() == 0 { source } else { local },
+    );
+    assert_eq!(pull, CpuId::new(0));
+}
+
+#[ktest]
+fn balance_source_normalizes_load_by_cpu_capacity() {
+    let root = SchedDomain::root();
+    let slow = SchedDomain::with_capacity(1, CpuMask::single_raw(0), 1, Some(0), 512)
+        .expect("slow cpu domain");
+    let fast = SchedDomain::with_capacity(2, CpuMask::single_raw(1), 1, Some(0), 1024)
+        .expect("fast cpu domain");
+    let local = SchedDomain::new(3, CpuMask::single_raw(2), 1, Some(0)).expect("local cpu domain");
+    let topology = SchedTopology::from_domains(&[root, slow, fast, local]).expect("topology");
+    let online = CpuMask::single_raw(0)
+        .union(CpuMask::single_raw(1))
+        .union(CpuMask::single_raw(2));
+
+    let source = select_balance_source_for_class(
+        topology,
+        CpuId::new(2).unwrap(),
+        online,
+        SchedClass::Fair,
+        |cpu| class_load(SchedClass::Fair, usize::from(cpu.get() != 2)),
+    );
+    assert_eq!(source, CpuId::new(0));
 }
