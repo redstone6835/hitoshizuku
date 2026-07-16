@@ -1,5 +1,8 @@
 //! 无堆分配的固定容量 packet、TX 与 completion batch。
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use super::{ChunkRef, NetBufLease, PacketMetadata};
 use crate::tuning::{PACKET_BATCH_CAPACITY, PACKET_FRAGMENT_CAPACITY};
 
@@ -7,6 +10,8 @@ use crate::tuning::{PACKET_BATCH_CAPACITY, PACKET_FRAGMENT_CAPACITY};
 pub enum PacketFragment {
     Exclusive(NetBufLease),
     Shared(ChunkRef),
+    /// IP 重组等有界慢路径拥有的普通内存，不可直接提交给 DMA queue。
+    Owned(Box<[u8]>),
 }
 
 impl PacketFragment {
@@ -14,6 +19,7 @@ impl PacketFragment {
         match self {
             Self::Exclusive(lease) => lease.len(),
             Self::Shared(chunk) => chunk.len(),
+            Self::Owned(bytes) => bytes.len(),
         }
     }
 
@@ -25,6 +31,7 @@ impl PacketFragment {
         match self {
             Self::Exclusive(lease) => lease.dma_addr(),
             Self::Shared(chunk) => chunk.dma_addr(),
+            Self::Owned(_) => Ok(None),
         }
     }
 
@@ -32,13 +39,14 @@ impl PacketFragment {
         match self {
             Self::Exclusive(lease) => lease.sync_for_device(),
             Self::Shared(chunk) => chunk.sync_for_device(),
+            Self::Owned(_) => Ok(()),
         }
     }
 
     pub fn prepend_zeroed(&mut self, len: u16) -> Result<(), super::NetBufPoolError> {
         match self {
             Self::Exclusive(lease) => lease.prepend_zeroed(len),
-            Self::Shared(_) => Err(super::NetBufPoolError::CorruptState),
+            Self::Shared(_) | Self::Owned(_) => Err(super::NetBufPoolError::CorruptState),
         }
     }
 
@@ -46,6 +54,7 @@ impl PacketFragment {
         match self {
             Self::Exclusive(lease) => lease.as_slice(),
             Self::Shared(chunk) => chunk.as_slice(),
+            Self::Owned(bytes) => Ok(bytes),
         }
     }
 
@@ -53,6 +62,7 @@ impl PacketFragment {
         match self {
             Self::Exclusive(lease) => lease.as_mut_slice(),
             Self::Shared(_) => Err(super::NetBufPoolError::CorruptState),
+            Self::Owned(bytes) => Ok(bytes),
         }
     }
 }
@@ -77,6 +87,14 @@ impl PacketChain {
         let mut chain = Self::new();
         chain
             .push(PacketFragment::Exclusive(lease))
+            .unwrap_or_else(|_| unreachable!());
+        chain
+    }
+
+    pub fn from_owned(bytes: Vec<u8>) -> Self {
+        let mut chain = Self::new();
+        chain
+            .push(PacketFragment::Owned(bytes.into_boxed_slice()))
             .unwrap_or_else(|_| unreachable!());
         chain
     }
@@ -147,6 +165,9 @@ impl PacketChain {
         if end > self.total_len() {
             return Err(super::NetBufPoolError::InvalidRange);
         }
+        if output.is_empty() {
+            return Ok(());
+        }
         let mut packet_offset = 0usize;
         let mut written = 0usize;
         for index in 0..self.fragment_count() {
@@ -177,6 +198,9 @@ impl PacketChain {
             .ok_or(super::NetBufPoolError::InvalidRange)?;
         if end > self.total_len() {
             return Err(super::NetBufPoolError::InvalidRange);
+        }
+        if input.is_empty() {
+            return Ok(());
         }
         let mut packet_offset = 0usize;
         let mut consumed = 0usize;
@@ -214,6 +238,9 @@ impl PacketChain {
             .ok_or(PacketRangeError::InvalidRange)?;
         if end > self.total_len() {
             return Err(PacketRangeError::InvalidRange);
+        }
+        if len == 0 {
+            return Ok(());
         }
         let mut packet_offset = 0usize;
         let mut visited = 0usize;

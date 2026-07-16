@@ -13,6 +13,7 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering, 
 use sched::{TaskState, WaitQueue};
 use spin::{Mutex, RwLock};
 
+use crate::IpAddr;
 use crate::control::BindOptions;
 use crate::device::boot_config;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, ListenGroupId, ShardId, SocketId};
@@ -22,7 +23,8 @@ const UDP_BUFFER_BYTES: usize = 128 * 1024;
 const UDP_BUFFER_HARD_LIMIT: usize = 512 * 1024;
 const SOCKET_CHUNK_BYTES: usize = 4096;
 const MAX_DATAGRAM_CHUNKS: usize = 17;
-const MAX_UDP_PAYLOAD: usize = 65_507;
+const MAX_UDP4_PAYLOAD: usize = 65_507;
+const MAX_UDP6_PAYLOAD: usize = 65_527;
 const TCP_BUFFER_BYTES: usize = 256 * 1024;
 const TCP_BUFFER_HARD_LIMIT: usize = 1024 * 1024;
 const TCP_INITIAL_CHUNKS: usize = 2;
@@ -57,6 +59,7 @@ pub enum OwnerRef {
 pub enum SocketKind {
     Datagram,
     Stream,
+    Raw,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +121,31 @@ pub enum SocketError {
     ConnectionReset,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MulticastMembership {
+    pub group: IpAddr,
+    pub interface: Option<InterfaceId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketErrorOrigin {
+    Local,
+    Icmp,
+    Icmpv6,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketErrorRecord {
+    pub sequence: u64,
+    pub generation: u32,
+    pub error: SocketError,
+    pub origin: SocketErrorOrigin,
+    pub kind: u8,
+    pub code: u8,
+    pub info: u32,
+    pub offender: Option<Endpoint>,
+}
+
 pub enum SocketCommand {
     Bind {
         facade: Arc<SocketFacade>,
@@ -148,6 +176,13 @@ pub trait SocketRuntime: Send + Sync {
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand>;
     fn notify_tx(&self, facade: Arc<SocketFacade>);
     fn notify_lifecycle(&self, facade: Arc<SocketFacade>);
+    fn update_multicast(
+        &self,
+        facade: Arc<SocketFacade>,
+        membership: MulticastMembership,
+        joined: bool,
+    ) -> Result<(), SocketError>;
+    fn interface_by_name(&self, name: &[u8]) -> Option<InterfaceId>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,12 +205,40 @@ fn socket_runtime() -> Result<&'static dyn SocketRuntime, SocketError> {
     (*SOCKET_RUNTIME.read()).ok_or(SocketError::RuntimeUnavailable)
 }
 
+pub fn interface_by_name(name: &[u8]) -> Result<InterfaceId, SocketError> {
+    socket_runtime()?
+        .interface_by_name(name)
+        .ok_or(SocketError::AddressUnavailable)
+}
+
 pub fn new_socket_facade(family: AddressFamily) -> Result<Arc<SocketFacade>, SocketError> {
     new_facade(family, SocketKind::Datagram)
 }
 
 pub fn new_tcp_socket_facade(family: AddressFamily) -> Result<Arc<SocketFacade>, SocketError> {
     new_facade(family, SocketKind::Stream)
+}
+
+pub fn new_raw_socket_facade(
+    family: AddressFamily,
+    protocol: u8,
+) -> Result<Arc<SocketFacade>, SocketError> {
+    if protocol == 0 {
+        return Err(SocketError::InvalidState);
+    }
+    let boot = boot_config().ok_or(SocketError::RuntimeUnavailable)?;
+    let boot_nonce = u64::from_le_bytes(boot.generation_nonce()[..8].try_into().unwrap());
+    let counter = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(counter != 0, "SocketId 已耗尽");
+    Ok(Arc::new(SocketFacade::new_with_protocol(
+        SocketId {
+            boot_nonce,
+            counter,
+        },
+        family,
+        SocketKind::Raw,
+        protocol,
+    )))
 }
 
 fn new_facade(family: AddressFamily, kind: SocketKind) -> Result<Arc<SocketFacade>, SocketError> {
@@ -397,6 +460,8 @@ struct TxEntry {
     chunk_count: u8,
     len: u16,
     destination: Endpoint,
+    dont_route: bool,
+    confirm: bool,
 }
 
 struct TxRing {
@@ -439,10 +504,13 @@ impl TxRing {
         self.queued.is_empty()
     }
 
-    fn push(&mut self, payload: &[u8], destination: Endpoint) -> Result<(), SocketError> {
-        if payload.len() > MAX_UDP_PAYLOAD {
-            return Err(SocketError::MessageTooLarge);
-        }
+    fn push(
+        &mut self,
+        payload: &[u8],
+        destination: Endpoint,
+        dont_route: bool,
+        confirm: bool,
+    ) -> Result<(), SocketError> {
         let chunk_count = payload.len().div_ceil(SOCKET_CHUNK_BYTES);
         if chunk_count > MAX_DATAGRAM_CHUNKS
             || self.used_bytes.saturating_add(payload.len()) > self.limit
@@ -468,6 +536,8 @@ impl TxRing {
             chunk_count: chunk_count as u8,
             len: payload.len() as u16,
             destination,
+            dont_route,
+            confirm,
         });
         self.queued.push_back(slot);
         self.used_bytes += payload.len();
@@ -483,6 +553,8 @@ impl TxRing {
             generation: entry.generation,
             destination: entry.destination,
             len: entry.len,
+            dont_route: entry.dont_route,
+            confirm: entry.confirm,
             completed: false,
         })
     }
@@ -630,6 +702,8 @@ pub struct UdpTxLease {
     generation: u32,
     pub destination: Endpoint,
     pub len: u16,
+    pub dont_route: bool,
+    pub confirm: bool,
     completed: bool,
 }
 
@@ -681,6 +755,7 @@ pub struct UdpReceive {
     pub destination: Endpoint,
     pub ingress_interface: InterfaceId,
     pub hop_limit: u8,
+    pub traffic_class: u8,
     pub rx_timestamp_ns: u64,
     pub truncated: bool,
 }
@@ -689,6 +764,7 @@ pub struct SocketFacade {
     id: SocketId,
     family: AddressFamily,
     kind: SocketKind,
+    protocol: u8,
     generation: AtomicU32,
     owner: Mutex<OwnerRef>,
     local: Mutex<Option<Endpoint>>,
@@ -711,14 +787,20 @@ pub struct SocketFacade {
     tx_notified: AtomicBool,
     lifecycle_notified: AtomicBool,
     closing: AtomicBool,
+    abortive_close: AtomicBool,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
     pending_error: AtomicU32,
+    error_queue: Mutex<VecDeque<SocketErrorRecord>>,
+    next_error_sequence: AtomicU64,
+    error_queue_overflow: AtomicU64,
     interface: Mutex<Option<InterfaceId>>,
     tcp_nodelay: AtomicBool,
     tcp_cork: AtomicBool,
     tcp_more: AtomicBool,
     tcp_quick_ack: AtomicBool,
+    tcp_defer_accept_ns: AtomicU64,
+    tcp_notsent_lowat: AtomicU32,
     tcp_user_timeout_ns: AtomicU64,
     tcp_keepalive: AtomicBool,
     tcp_keepidle_ns: AtomicU64,
@@ -737,6 +819,18 @@ pub struct SocketFacade {
     tcp_total_retransmitted: AtomicU32,
     tcp_bytes_sent: AtomicU64,
     tcp_bytes_received: AtomicU64,
+    raw_header_included: AtomicBool,
+    free_bind: AtomicBool,
+    v6_only: AtomicBool,
+    ip_hop_limit: AtomicU16,
+    ip_traffic_class: AtomicU16,
+    multicast_memberships: Mutex<Vec<MulticastMembership>>,
+    multicast_interface: AtomicU32,
+    multicast_hops: AtomicU16,
+    multicast_loop: AtomicBool,
+    socket_mark: AtomicU32,
+    socket_priority: AtomicU32,
+    rx_dropped: AtomicU64,
     receive_window_update: AtomicBool,
     connect_pending: AtomicBool,
     stream_connected: AtomicBool,
@@ -744,20 +838,35 @@ pub struct SocketFacade {
 
 impl SocketFacade {
     pub(crate) fn new(id: SocketId, family: AddressFamily, kind: SocketKind) -> Self {
+        let protocol = match kind {
+            SocketKind::Datagram => 17,
+            SocketKind::Stream => 6,
+            SocketKind::Raw => 0,
+        };
+        Self::new_with_protocol(id, family, kind, protocol)
+    }
+
+    pub(crate) fn new_with_protocol(
+        id: SocketId,
+        family: AddressFamily,
+        kind: SocketKind,
+        protocol: u8,
+    ) -> Self {
         Self {
             id,
             family,
             kind,
+            protocol,
             generation: AtomicU32::new(1),
             owner: Mutex::new(OwnerRef::Unassigned),
             local: Mutex::new(None),
             peer: Mutex::new(None),
-            tx: Mutex::new((kind == SocketKind::Datagram).then(TxRing::new)),
-            rx: Mutex::new((kind == SocketKind::Datagram).then(RxRing::new)),
+            tx: Mutex::new((kind != SocketKind::Stream).then(TxRing::new)),
+            rx: Mutex::new((kind != SocketKind::Stream).then(RxRing::new)),
             stream_tx: Mutex::new(StreamTxRing::new()),
             stream_rx: Mutex::new(StreamRxRing::new()),
             listen_group: Mutex::new(None),
-            readiness: AtomicU16::new(if kind == SocketKind::Datagram {
+            readiness: AtomicU16::new(if kind != SocketKind::Stream {
                 Readiness::WRITABLE.0
             } else {
                 0
@@ -774,14 +883,20 @@ impl SocketFacade {
             tx_notified: AtomicBool::new(false),
             lifecycle_notified: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            abortive_close: AtomicBool::new(false),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
             pending_error: AtomicU32::new(0),
+            error_queue: Mutex::new(VecDeque::with_capacity(32)),
+            next_error_sequence: AtomicU64::new(1),
+            error_queue_overflow: AtomicU64::new(0),
             interface: Mutex::new(None),
             tcp_nodelay: AtomicBool::new(false),
             tcp_cork: AtomicBool::new(false),
             tcp_more: AtomicBool::new(false),
             tcp_quick_ack: AtomicBool::new(false),
+            tcp_defer_accept_ns: AtomicU64::new(0),
+            tcp_notsent_lowat: AtomicU32::new(u32::MAX),
             tcp_user_timeout_ns: AtomicU64::new(0),
             tcp_keepalive: AtomicBool::new(false),
             tcp_keepidle_ns: AtomicU64::new(TCP_KEEPIDLE_DEFAULT_NS),
@@ -800,6 +915,18 @@ impl SocketFacade {
             tcp_total_retransmitted: AtomicU32::new(0),
             tcp_bytes_sent: AtomicU64::new(0),
             tcp_bytes_received: AtomicU64::new(0),
+            raw_header_included: AtomicBool::new(false),
+            free_bind: AtomicBool::new(false),
+            v6_only: AtomicBool::new(false),
+            ip_hop_limit: AtomicU16::new(64),
+            ip_traffic_class: AtomicU16::new(0),
+            multicast_memberships: Mutex::new(Vec::new()),
+            multicast_interface: AtomicU32::new(0),
+            multicast_hops: AtomicU16::new(1),
+            multicast_loop: AtomicBool::new(true),
+            socket_mark: AtomicU32::new(0),
+            socket_priority: AtomicU32::new(0),
+            rx_dropped: AtomicU64::new(0),
             receive_window_update: AtomicBool::new(false),
             connect_pending: AtomicBool::new(false),
             stream_connected: AtomicBool::new(false),
@@ -818,12 +945,178 @@ impl SocketFacade {
         self.kind
     }
 
+    pub const fn protocol(&self) -> u8 {
+        self.protocol
+    }
+
+    pub fn raw_header_included(&self) -> bool {
+        self.raw_header_included.load(Ordering::Acquire)
+    }
+
+    pub fn set_raw_header_included(&self, enabled: bool) {
+        self.raw_header_included.store(enabled, Ordering::Release);
+    }
+
+    pub fn set_free_bind(&self, enabled: bool) {
+        self.free_bind.store(enabled, Ordering::Release);
+    }
+
+    pub fn free_bind(&self) -> bool {
+        self.free_bind.load(Ordering::Acquire)
+    }
+
+    pub fn set_v6_only(&self, enabled: bool) {
+        self.v6_only.store(enabled, Ordering::Release);
+    }
+
+    pub fn v6_only(&self) -> bool {
+        self.v6_only.load(Ordering::Acquire)
+    }
+
+    pub fn ip_hop_limit(&self) -> u8 {
+        self.ip_hop_limit.load(Ordering::Acquire) as u8
+    }
+
+    pub fn set_ip_hop_limit(&self, value: u8) {
+        self.ip_hop_limit.store(u16::from(value), Ordering::Release);
+    }
+
+    pub fn ip_traffic_class(&self) -> u8 {
+        self.ip_traffic_class.load(Ordering::Acquire) as u8
+    }
+
+    pub fn set_ip_traffic_class(&self, value: u8) {
+        self.ip_traffic_class
+            .store(u16::from(value), Ordering::Release);
+    }
+
+    pub fn add_multicast_membership(
+        self: &Arc<Self>,
+        membership: MulticastMembership,
+    ) -> Result<(), SocketError> {
+        if !membership.group.is_multicast()
+            || matches!(
+                (self.family, membership.group),
+                (AddressFamily::Ipv4, IpAddr::V6(_)) | (AddressFamily::Ipv6, IpAddr::V4(_))
+            )
+        {
+            return Err(SocketError::AddressUnavailable);
+        }
+        let mut memberships = self.multicast_memberships.lock();
+        if memberships.contains(&membership) {
+            return Err(SocketError::AddressInUse);
+        }
+        if memberships.len() >= 64 {
+            return Err(SocketError::Buffer);
+        }
+        memberships.push(membership);
+        drop(memberships);
+        if let Ok(runtime) = socket_runtime()
+            && let Err(error) = runtime.update_multicast(Arc::clone(self), membership, true)
+        {
+            self.multicast_memberships
+                .lock()
+                .retain(|entry| *entry != membership);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn drop_multicast_membership(
+        self: &Arc<Self>,
+        membership: MulticastMembership,
+    ) -> Result<(), SocketError> {
+        let mut memberships = self.multicast_memberships.lock();
+        let Some(index) = memberships.iter().position(|entry| *entry == membership) else {
+            return Err(SocketError::AddressUnavailable);
+        };
+        memberships.swap_remove(index);
+        drop(memberships);
+        if let Ok(runtime) = socket_runtime()
+            && let Err(error) = runtime.update_multicast(Arc::clone(self), membership, false)
+        {
+            self.multicast_memberships.lock().push(membership);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn accepts_multicast(&self, group: IpAddr, interface: InterfaceId) -> bool {
+        self.multicast_memberships.lock().iter().any(|entry| {
+            entry.group == group && entry.interface.is_none_or(|scope| scope == interface)
+        })
+    }
+
+    pub fn has_multicast_memberships(&self) -> bool {
+        !self.multicast_memberships.lock().is_empty()
+    }
+
+    pub fn set_multicast_interface(&self, interface: Option<InterfaceId>) {
+        self.multicast_interface.store(
+            interface.map_or(0, |interface| interface.0),
+            Ordering::Release,
+        );
+    }
+
+    pub fn multicast_interface(&self) -> Option<InterfaceId> {
+        let raw = self.multicast_interface.load(Ordering::Acquire);
+        (raw != 0).then_some(InterfaceId(raw))
+    }
+
+    pub fn set_multicast_hops(&self, hops: u8) {
+        self.multicast_hops
+            .store(u16::from(hops), Ordering::Release);
+    }
+
+    pub fn multicast_hops(&self) -> u8 {
+        self.multicast_hops.load(Ordering::Acquire) as u8
+    }
+
+    pub fn set_multicast_loop(&self, enabled: bool) {
+        self.multicast_loop.store(enabled, Ordering::Release);
+    }
+
+    pub fn multicast_loop(&self) -> bool {
+        self.multicast_loop.load(Ordering::Acquire)
+    }
+
+    pub fn set_socket_mark(&self, mark: u32) {
+        self.socket_mark.store(mark, Ordering::Release);
+    }
+
+    pub fn socket_mark(&self) -> u32 {
+        self.socket_mark.load(Ordering::Acquire)
+    }
+
+    pub fn set_socket_priority(&self, priority: i32) {
+        self.socket_priority
+            .store(priority as u32, Ordering::Release);
+    }
+
+    pub fn socket_priority(&self) -> i32 {
+        self.socket_priority.load(Ordering::Acquire) as i32
+    }
+
+    pub fn take_rx_overflow(&self) -> u32 {
+        self.rx_dropped
+            .swap(0, Ordering::AcqRel)
+            .min(u64::from(u32::MAX)) as u32
+    }
+
     pub fn generation(&self) -> u32 {
         self.generation.load(Ordering::Acquire)
     }
 
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn request_abortive_close(&self) {
+        self.abortive_close.store(true, Ordering::Release);
+    }
+
+    pub fn is_abortive_close(&self) -> bool {
+        self.abortive_close.load(Ordering::Acquire)
     }
 
     pub fn write_is_shutdown(&self) -> bool {
@@ -1043,6 +1336,18 @@ impl SocketFacade {
         nonblocking: bool,
         deadline_ns: Option<u64>,
     ) -> Result<usize, SocketError> {
+        self.send_datagram(payload, destination, nonblocking, deadline_ns, false, false)
+    }
+
+    pub fn send_datagram(
+        self: &Arc<Self>,
+        payload: &[u8],
+        destination: Option<Endpoint>,
+        nonblocking: bool,
+        deadline_ns: Option<u64>,
+        dont_route: bool,
+        confirm: bool,
+    ) -> Result<usize, SocketError> {
         if self.closing.load(Ordering::Acquire) {
             return Err(SocketError::Closed);
         }
@@ -1052,12 +1357,21 @@ impl SocketFacade {
         let destination = destination
             .or_else(|| self.peer_endpoint())
             .ok_or(SocketError::DestinationRequired)?;
+        let max_payload = match (self.kind, self.family) {
+            (SocketKind::Raw, _) => u16::MAX as usize,
+            (SocketKind::Datagram, AddressFamily::Ipv4) => MAX_UDP4_PAYLOAD,
+            (SocketKind::Datagram, AddressFamily::Ipv6) => MAX_UDP6_PAYLOAD,
+            (SocketKind::Stream, _) => return Err(SocketError::InvalidState),
+        };
+        if payload.len() > max_payload {
+            return Err(SocketError::MessageTooLarge);
+        }
         loop {
             let was_empty = {
                 let mut tx_guard = self.tx.lock();
                 let tx = tx_guard.as_mut().expect("UDP facade 必须拥有 TX ring");
                 let was_empty = tx.is_empty();
-                match tx.push(payload, destination) {
+                match tx.push(payload, destination, dont_route, confirm) {
                     Ok(()) => was_empty,
                     Err(SocketError::WouldBlock) if !nonblocking => {
                         drop(tx_guard);
@@ -1087,7 +1401,7 @@ impl SocketFacade {
         self.tx_notified.store(false, Ordering::Release);
         fence(Ordering::SeqCst);
         let pending = match self.kind {
-            SocketKind::Datagram => !self
+            SocketKind::Datagram | SocketKind::Raw => !self
                 .tx
                 .lock()
                 .as_ref()
@@ -1153,6 +1467,24 @@ impl SocketFacade {
 
     pub fn take_quick_ack(&self) -> bool {
         self.tcp_quick_ack.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn tcp_defer_accept_ns(&self) -> u64 {
+        self.tcp_defer_accept_ns.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_defer_accept_ns(&self, timeout_ns: u64) {
+        self.tcp_defer_accept_ns
+            .store(timeout_ns, Ordering::Release);
+    }
+
+    pub fn tcp_notsent_lowat(&self) -> u32 {
+        self.tcp_notsent_lowat.load(Ordering::Acquire)
+    }
+
+    pub fn set_tcp_notsent_lowat(&self, value: u32) {
+        self.tcp_notsent_lowat.store(value, Ordering::Release);
+        self.refresh_tx_readiness();
     }
 
     pub fn tcp_user_timeout_ns(&self) -> u64 {
@@ -1323,6 +1655,7 @@ impl SocketFacade {
     pub fn take_stream_tx(self: &Arc<Self>, max_len: usize) -> Option<TcpTxLease> {
         let (start, len) = self.stream_tx.lock().take_unsent(max_len)?;
         self.tcp_bytes_sent.fetch_add(len as u64, Ordering::Relaxed);
+        self.refresh_tx_readiness();
         Some(TcpTxLease {
             facade: Arc::clone(self),
             start,
@@ -1338,6 +1671,21 @@ impl SocketFacade {
     #[cfg(test)]
     pub(crate) fn test_push_stream_tx(&self, payload: &[u8]) -> usize {
         self.stream_tx.lock().push(payload)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_udp_tx_lease(
+        self: &Arc<Self>,
+        payload: &[u8],
+        destination: Endpoint,
+    ) -> UdpTxLease {
+        self.tx
+            .lock()
+            .as_mut()
+            .expect("datagram facade 必须拥有 TX ring")
+            .push(payload, destination, false, false)
+            .unwrap();
+        self.take_tx().unwrap()
     }
 
     #[cfg(test)]
@@ -1472,7 +1820,10 @@ impl SocketFacade {
             let mut rx = self.rx.lock();
             let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
             let was_empty = rx.is_empty();
-            rx.push(datagram)?;
+            if let Err(datagram) = rx.push(datagram) {
+                self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                return Err(datagram);
+            }
             was_empty
         };
         if was_empty {
@@ -1514,6 +1865,7 @@ impl SocketFacade {
                     }),
                     ingress_interface: InterfaceId(0),
                     hop_limit: 0,
+                    traffic_class: 0,
                     rx_timestamp_ns: 0,
                     truncated: false,
                 });
@@ -1553,6 +1905,7 @@ impl SocketFacade {
             destination: datagram.destination,
             ingress_interface: datagram.ingress_interface,
             hop_limit: datagram.hop_limit,
+            traffic_class: datagram.traffic_class,
             rx_timestamp_ns: datagram.rx_timestamp_ns,
             truncated: copied < original_len,
         };
@@ -1577,7 +1930,7 @@ impl SocketFacade {
         if read {
             self.read_shutdown.store(true, Ordering::Release);
             match self.kind {
-                SocketKind::Datagram => {
+                SocketKind::Datagram | SocketKind::Raw => {
                     let mut rx = self.rx.lock();
                     let rx = rx.as_mut().expect("UDP facade 必须拥有 RX ring");
                     while let Some(datagram) = rx.pop() {
@@ -1695,33 +2048,217 @@ impl SocketFacade {
         *self.owner.lock() = OwnerRef::Closed {
             generation: self.generation(),
         };
+        self.state_wait.wake_all();
+    }
+
+    pub fn wait_closed(&self, deadline_ns: u64) -> Result<(), SocketError> {
+        loop {
+            if matches!(self.owner(), OwnerRef::Closed { .. }) {
+                return Ok(());
+            }
+            if sched::now_ns_public() >= deadline_ns {
+                return Err(SocketError::TimedOut);
+            }
+            let task = sched::current_task();
+            self.state_wait.prepare_to_wait(&task, TaskState::Sleeping);
+            if matches!(self.owner(), OwnerRef::Closed { .. }) {
+                self.state_wait.finish_wait(&task);
+                return Ok(());
+            }
+            if sched::operation::has_interrupting_signal(&task) {
+                self.state_wait.finish_wait(&task);
+                return Err(SocketError::Interrupted);
+            }
+            let armed = sched::register_sleep_deadline(&task, deadline_ns);
+            drop(task);
+            sched::schedule_once(sched::now_ns_public());
+            let task = sched::current_task();
+            self.state_wait.finish_wait(&task);
+            if armed {
+                sched::cancel_sleep_deadline(&task);
+            }
+        }
     }
 
     pub fn set_pending_error(&self, error: SocketError) {
-        let code = error_code(error);
-        let _ = self
-            .pending_error
-            .compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        self.queue_error(SocketErrorRecord {
+            sequence: 0,
+            generation: self.generation(),
+            error,
+            origin: SocketErrorOrigin::Local,
+            kind: 0,
+            code: 0,
+            info: 0,
+            offender: self.peer_endpoint(),
+        });
+    }
+
+    pub fn set_transport_error(
+        &self,
+        error: crate::transport::TransportControlError,
+        offender: Option<Endpoint>,
+    ) {
+        let (socket_error, origin, kind, code, info) = match (self.family, error) {
+            (_, crate::transport::TransportControlError::NetworkUnreachable) => (
+                SocketError::NetworkUnreachable,
+                if self.family == AddressFamily::Ipv4 {
+                    SocketErrorOrigin::Icmp
+                } else {
+                    SocketErrorOrigin::Icmpv6
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    3
+                } else {
+                    1
+                },
+                0,
+                0,
+            ),
+            (_, crate::transport::TransportControlError::HostUnreachable) => (
+                SocketError::HostUnreachable,
+                if self.family == AddressFamily::Ipv4 {
+                    SocketErrorOrigin::Icmp
+                } else {
+                    SocketErrorOrigin::Icmpv6
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    3
+                } else {
+                    1
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    1
+                } else {
+                    3
+                },
+                0,
+            ),
+            (_, crate::transport::TransportControlError::PortUnreachable) => (
+                SocketError::ConnectionRefused,
+                if self.family == AddressFamily::Ipv4 {
+                    SocketErrorOrigin::Icmp
+                } else {
+                    SocketErrorOrigin::Icmpv6
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    3
+                } else {
+                    1
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    3
+                } else {
+                    4
+                },
+                0,
+            ),
+            (_, crate::transport::TransportControlError::PacketTooBig { mtu }) => (
+                SocketError::MessageTooLarge,
+                if self.family == AddressFamily::Ipv4 {
+                    SocketErrorOrigin::Icmp
+                } else {
+                    SocketErrorOrigin::Icmpv6
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    3
+                } else {
+                    2
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    4
+                } else {
+                    0
+                },
+                mtu,
+            ),
+            (_, crate::transport::TransportControlError::TimeExceeded) => (
+                SocketError::HostUnreachable,
+                if self.family == AddressFamily::Ipv4 {
+                    SocketErrorOrigin::Icmp
+                } else {
+                    SocketErrorOrigin::Icmpv6
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    11
+                } else {
+                    3
+                },
+                0,
+                0,
+            ),
+            (_, crate::transport::TransportControlError::ParameterProblem) => (
+                SocketError::HostUnreachable,
+                if self.family == AddressFamily::Ipv4 {
+                    SocketErrorOrigin::Icmp
+                } else {
+                    SocketErrorOrigin::Icmpv6
+                },
+                if self.family == AddressFamily::Ipv4 {
+                    12
+                } else {
+                    4
+                },
+                0,
+                0,
+            ),
+        };
+        self.queue_error(SocketErrorRecord {
+            sequence: 0,
+            generation: self.generation(),
+            error: socket_error,
+            origin,
+            kind,
+            code,
+            info,
+            offender,
+        });
+    }
+
+    fn queue_error(&self, mut record: SocketErrorRecord) {
+        let sequence = self.next_error_sequence.fetch_add(1, Ordering::Relaxed);
+        record.sequence = sequence.max(1);
+        let code = error_code(record.error);
+        let mut queue = self.error_queue.lock();
+        if queue.len() == 32 {
+            self.error_queue_overflow.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let was_empty = queue.is_empty();
+        queue.push_back(record);
+        if was_empty {
+            self.pending_error.store(code, Ordering::Release);
+        }
+        drop(queue);
         self.set_ready(Readiness::ERROR);
         self.state_wait.wake_all();
     }
 
+    pub fn error_queue_overflow(&self) -> u64 {
+        self.error_queue_overflow.load(Ordering::Acquire)
+    }
+
     pub fn take_pending_error(&self) -> Option<SocketError> {
-        let code = self.pending_error.swap(0, Ordering::AcqRel);
-        if code == 0 {
-            return None;
-        }
-        self.clear_ready(Readiness::ERROR);
-        if self.pending_error.load(Ordering::Acquire) != 0 {
+        self.take_error_record().map(|record| record.error)
+    }
+
+    pub fn take_error_record(&self) -> Option<SocketErrorRecord> {
+        let mut queue = self.error_queue.lock();
+        let record = queue.pop_front()?;
+        let next = queue.front().map_or(0, |record| error_code(record.error));
+        self.pending_error.store(next, Ordering::Release);
+        drop(queue);
+        if next == 0 {
+            self.clear_ready(Readiness::ERROR);
+        } else {
             self.set_ready(Readiness::ERROR);
         }
-        error_from_code(code)
+        Some(record)
     }
 
     pub fn set_buffer_limits(&self, send: Option<usize>, receive: Option<usize>) {
         if let Some(limit) = send {
             match self.kind {
-                SocketKind::Datagram => self
+                SocketKind::Datagram | SocketKind::Raw => self
                     .tx
                     .lock()
                     .as_mut()
@@ -1733,7 +2270,7 @@ impl SocketFacade {
         }
         if let Some(limit) = receive {
             match self.kind {
-                SocketKind::Datagram => {
+                SocketKind::Datagram | SocketKind::Raw => {
                     self.rx
                         .lock()
                         .as_mut()
@@ -1747,7 +2284,7 @@ impl SocketFacade {
 
     pub fn buffer_limits(&self) -> (usize, usize) {
         match self.kind {
-            SocketKind::Datagram => (
+            SocketKind::Datagram | SocketKind::Raw => (
                 self.tx
                     .lock()
                     .as_ref()
@@ -1772,13 +2309,13 @@ impl SocketFacade {
             return;
         }
         let writable = match self.kind {
-            SocketKind::Datagram => self
+            SocketKind::Datagram | SocketKind::Raw => self
                 .tx
                 .lock()
                 .as_ref()
                 .expect("UDP facade 必须拥有 TX ring")
                 .writable(),
-            SocketKind::Stream => self.stream_tx.lock().bytes.available() != 0,
+            SocketKind::Stream => self.stream_is_writable(),
         };
         if writable {
             self.set_ready(Readiness::WRITABLE);
@@ -1787,17 +2324,24 @@ impl SocketFacade {
         self.clear_ready(Readiness::WRITABLE);
         fence(Ordering::SeqCst);
         let writable = match self.kind {
-            SocketKind::Datagram => self
+            SocketKind::Datagram | SocketKind::Raw => self
                 .tx
                 .lock()
                 .as_ref()
                 .expect("UDP facade 必须拥有 TX ring")
                 .writable(),
-            SocketKind::Stream => self.stream_tx.lock().bytes.available() != 0,
+            SocketKind::Stream => self.stream_is_writable(),
         };
         if writable {
             self.set_ready(Readiness::WRITABLE);
         }
+    }
+
+    fn stream_is_writable(&self) -> bool {
+        let tx = self.stream_tx.lock();
+        tx.bytes.available() != 0
+            && tx.bytes.len.saturating_sub(tx.sent)
+                < self.tcp_notsent_lowat.load(Ordering::Acquire) as usize
     }
 
     fn refresh_rx_readiness(&self) {
@@ -1806,7 +2350,7 @@ impl SocketFacade {
             return;
         }
         let readable = match self.kind {
-            SocketKind::Datagram => !self
+            SocketKind::Datagram | SocketKind::Raw => !self
                 .rx
                 .lock()
                 .as_ref()
@@ -1824,7 +2368,7 @@ impl SocketFacade {
         self.clear_ready(Readiness::READABLE);
         fence(Ordering::SeqCst);
         let readable = match self.kind {
-            SocketKind::Datagram => !self
+            SocketKind::Datagram | SocketKind::Raw => !self
                 .rx
                 .lock()
                 .as_ref()
@@ -1984,35 +2528,6 @@ fn error_code(error: SocketError) -> u32 {
     error as u32 + 1
 }
 
-fn error_from_code(code: u32) -> Option<SocketError> {
-    let raw = code.checked_sub(1)?;
-    const ALL: [SocketError; 22] = [
-        SocketError::RuntimeUnavailable,
-        SocketError::RuntimeBusy,
-        SocketError::InvalidState,
-        SocketError::AddressInUse,
-        SocketError::AddressUnavailable,
-        SocketError::NotConnected,
-        SocketError::DestinationRequired,
-        SocketError::AlreadyConnected,
-        SocketError::AlreadyInProgress,
-        SocketError::InProgress,
-        SocketError::WouldBlock,
-        SocketError::Interrupted,
-        SocketError::TimedOut,
-        SocketError::MessageTooLarge,
-        SocketError::ReadShutdown,
-        SocketError::WriteShutdown,
-        SocketError::Closed,
-        SocketError::NetworkUnreachable,
-        SocketError::HostUnreachable,
-        SocketError::Buffer,
-        SocketError::ConnectionRefused,
-        SocketError::ConnectionReset,
-    ];
-    ALL.get(raw as usize).copied()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2110,14 +2625,14 @@ mod tests {
             .lock()
             .as_mut()
             .unwrap()
-            .push(b"first", destination)
+            .push(b"first", destination, false, false)
             .unwrap();
         facade
             .tx
             .lock()
             .as_mut()
             .unwrap()
-            .push(b"second", destination)
+            .push(b"second", destination, false, false)
             .unwrap();
         let first = facade.take_tx().unwrap();
         let second = facade.take_tx().unwrap();
@@ -2149,11 +2664,16 @@ mod tests {
                 .lock()
                 .as_mut()
                 .unwrap()
-                .push(&[1; 16 * 1024], destination)
+                .push(&[1; 16 * 1024], destination, false, false)
                 .is_ok()
         );
         assert_eq!(
-            facade.tx.lock().as_mut().unwrap().push(&[2], destination),
+            facade
+                .tx
+                .lock()
+                .as_mut()
+                .unwrap()
+                .push(&[2], destination, false, false),
             Err(SocketError::WouldBlock)
         );
     }
@@ -2174,18 +2694,56 @@ mod tests {
                     .lock()
                     .as_mut()
                     .unwrap()
-                    .push(&[7; MAX_UDP_PAYLOAD], destination)
+                    .push(&[7; MAX_UDP4_PAYLOAD], destination, false, false)
                     .is_ok()
             );
         }
         assert_eq!(
-            facade
-                .tx
-                .lock()
-                .as_mut()
-                .unwrap()
-                .push(&[7; MAX_UDP_PAYLOAD], destination),
+            facade.tx.lock().as_mut().unwrap().push(
+                &[7; MAX_UDP4_PAYLOAD],
+                destination,
+                false,
+                false
+            ),
             Err(SocketError::WouldBlock)
         );
+    }
+
+    #[test]
+    fn error_queue_is_fifo_and_drops_newest_when_full() {
+        let facade = facade();
+        for index in 0..33 {
+            facade.set_transport_error(
+                crate::transport::TransportControlError::PacketTooBig { mtu: 1200 + index },
+                None,
+            );
+        }
+        assert_eq!(facade.error_queue_overflow(), 1);
+        let first = facade.take_error_record().unwrap();
+        assert_eq!(first.info, 1200);
+        assert_eq!(first.sequence, 1);
+        for expected in 1201..1232 {
+            assert_eq!(facade.take_error_record().unwrap().info, expected);
+        }
+        assert!(facade.take_error_record().is_none());
+        assert!(!facade.readiness().0.contains(Readiness::ERROR));
+    }
+
+    #[test]
+    fn notsent_lowat_controls_stream_writable_readiness() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 9,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        facade.set_tcp_notsent_lowat(4);
+        assert_eq!(facade.test_push_stream_tx(b"abcdefgh"), 8);
+        facade.refresh_tx_readiness();
+        assert!(!facade.readiness().0.contains(Readiness::WRITABLE));
+        assert_eq!(facade.take_stream_tx(5).unwrap().len, 5);
+        assert!(facade.readiness().0.contains(Readiness::WRITABLE));
     }
 }

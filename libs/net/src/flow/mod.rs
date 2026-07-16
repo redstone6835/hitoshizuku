@@ -1,5 +1,6 @@
 //! 分片内流目录、dirty 调度和分层定时器。
 
+mod reassembly;
 mod shard;
 mod table;
 mod timer;
@@ -7,6 +8,6 @@ mod timer;
 pub use shard::{FlowShard, FlowShardStats, FlowTurnContext, UdpSendError, UdpSendFailure};
 pub use table::{
     DIRTY_CONTROL, DIRTY_INGRESS, DIRTY_ROUTE, DIRTY_TIMER, DIRTY_TX, FlowInsertError, FlowKey,
-    FlowTable, flow_hash64, rss_hash,
+    FlowTable, flow_hash64, fragment_rss_hash, rss_hash,
 };
 pub use timer::{TimerExpiry, TimerWheel};

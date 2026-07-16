@@ -684,6 +684,7 @@ mod tests {
             payload_offset: 0,
             payload_len: len as u32,
             hop_limit: 64,
+            traffic_class: 0,
             fragment: None,
         }
     }

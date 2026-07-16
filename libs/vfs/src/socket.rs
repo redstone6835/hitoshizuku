@@ -54,11 +54,13 @@ pub const TCP_CORK: i32 = 3;
 pub const TCP_KEEPIDLE: i32 = 4;
 pub const TCP_KEEPINTVL: i32 = 5;
 pub const TCP_KEEPCNT: i32 = 6;
+pub const TCP_DEFER_ACCEPT: i32 = 9;
 pub const TCP_INFO: i32 = 11;
 pub const TCP_QUICKACK: i32 = 12;
 pub const TCP_CONGESTION: i32 = 13;
 pub const TCP_USER_TIMEOUT: i32 = 18;
 pub const TCP_FASTOPEN: i32 = 23;
+pub const TCP_NOTSENT_LOWAT: i32 = 25;
 pub const SO_REUSEADDR: i32 = 2;
 pub const SO_BROADCAST: i32 = 6;
 pub const SO_KEEPALIVE: i32 = 9;
@@ -79,6 +81,9 @@ pub const SO_ACCEPTCONN: i32 = 30;
 pub const SO_PROTOCOL: i32 = 38;
 pub const SO_DOMAIN: i32 = 39;
 pub const SO_RXQ_OVFL: i32 = 40;
+pub const SO_PRIORITY: i32 = 12;
+pub const SO_BINDTODEVICE: i32 = 25;
+pub const SO_MARK: i32 = 36;
 
 pub const MSG_PEEK: usize = 0x0002;
 pub const MSG_TRUNC: usize = 0x0020;
@@ -610,7 +615,10 @@ pub fn socket(
 
     match domain as u16 {
         crate::addr::AF_INET | crate::addr::AF_INET6 => {
-            if !matches!(kind, SocketType::Datagram | SocketType::Stream) {
+            if !matches!(
+                kind,
+                SocketType::Datagram | SocketType::Stream | SocketType::Raw
+            ) {
                 return Err(Errno::Other(93));
             }
             let ops = crate::net_socket::create_net_socket(
@@ -618,6 +626,7 @@ pub fn socket(
                 match kind {
                     SocketType::Stream => SOCK_STREAM as u16,
                     SocketType::Datagram => SOCK_DGRAM as u16,
+                    SocketType::Raw => SOCK_RAW as u16,
                     _ => unreachable!(),
                 },
                 protocol as u16,
@@ -857,7 +866,7 @@ pub fn send(
         if !control.is_empty() {
             return Err(Errno::ENOPROTOOPT);
         }
-        if (flags & (MSG_OOB | MSG_DONTROUTE | MSG_CONFIRM)) != 0 {
+        if (flags & MSG_OOB) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         let result = net_ops.sendto(
@@ -866,6 +875,8 @@ pub fn send(
             InetSendOptions {
                 nonblocking: file.flags().nonblock || (flags & MSG_DONTWAIT) != 0,
                 more: (flags & MSG_MORE) != 0,
+                dont_route: (flags & MSG_DONTROUTE) != 0,
+                confirm: (flags & MSG_CONFIRM) != 0,
                 deadline_ns: None,
             },
         );
@@ -960,7 +971,27 @@ pub fn recv(
             return Err(Errno::EOPNOTSUPP);
         }
         if (flags & MSG_ERRQUEUE) != 0 {
-            return Err(Errno::EAGAIN);
+            let record = net_ops.take_error_record()?;
+            let address = if want_addr {
+                record.offender.and_then(|endpoint| {
+                    let mut buf = vec![0u8; 28];
+                    crate::addr::encode_inet_sockaddr(&endpoint, net_ops.family(), &mut buf)
+                        .ok()
+                        .map(|len| {
+                            buf.truncate(len);
+                            buf
+                        })
+                })
+            } else {
+                None
+            };
+            let (control, truncated) = encode_inet_error_control(net_ops, record, control_len);
+            return Ok(RecvOutput {
+                len: 0,
+                address,
+                control,
+                msg_flags: MSG_ERRQUEUE | usize::from(truncated) * MSG_CTRUNC,
+            });
         }
         let result = net_ops.recvfrom(
             data,
@@ -1181,15 +1212,32 @@ const SOL_IPV6: i32 = 41;
 
 const IP_TOS: i32 = 1;
 const IP_TTL: i32 = 2;
+const IP_HDRINCL: i32 = 3;
+const IP_OPTIONS: i32 = 4;
 const IP_PKTINFO: i32 = 8;
+const IP_RECVERR: i32 = 11;
 const IP_RECVTTL: i32 = 12;
 const IP_RECVTOS: i32 = 13;
+const IP_FREEBIND: i32 = 15;
+const IP_MULTICAST_IF: i32 = 32;
+const IP_MULTICAST_TTL: i32 = 33;
+const IP_MULTICAST_LOOP: i32 = 34;
+const IP_ADD_MEMBERSHIP: i32 = 35;
+const IP_DROP_MEMBERSHIP: i32 = 36;
 
+const IPV6_RECVERR: i32 = 25;
 const IPV6_V6ONLY: i32 = 26;
+const IPV6_UNICAST_HOPS: i32 = 16;
+const IPV6_TCLASS: i32 = 67;
 const IPV6_RECVPKTINFO: i32 = 49;
 const IPV6_PKTINFO: i32 = 50;
 const IPV6_RECVHOPLIMIT: i32 = 51;
 const IPV6_HOPLIMIT: i32 = 52;
+const IPV6_MULTICAST_IF: i32 = 17;
+const IPV6_MULTICAST_HOPS: i32 = 18;
+const IPV6_MULTICAST_LOOP: i32 = 19;
+const IPV6_ADD_MEMBERSHIP: i32 = 20;
+const IPV6_DROP_MEMBERSHIP: i32 = 21;
 
 const SO_TIMESTAMP: i32 = 29;
 const SO_OOBINLINE: i32 = 10;
@@ -1201,6 +1249,68 @@ fn parse_int_opt(value: &[u8]) -> Result<i32, Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(i32::from_ne_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn parse_int_or_byte_opt(value: &[u8]) -> Result<i32, Errno> {
+    if value.len() >= 4 {
+        parse_int_opt(value)
+    } else {
+        value.first().copied().map(i32::from).ok_or(Errno::EINVAL)
+    }
+}
+
+fn parse_u8_socket_opt(value: &[u8]) -> Result<u8, Errno> {
+    let value = parse_int_or_byte_opt(value)?;
+    u8::try_from(value).map_err(|_| Errno::EINVAL)
+}
+
+fn parse_multicast_interface(value: &[u8]) -> Result<Option<net::InterfaceId>, Errno> {
+    if value.len() >= 12 {
+        let index = i32::from_ne_bytes(value[8..12].try_into().unwrap());
+        if index < 0 {
+            return Err(Errno::ENODEV);
+        }
+        return Ok((index != 0).then_some(net::InterfaceId(index as u32)));
+    }
+    if value.len() < 4 {
+        return Err(Errno::EINVAL);
+    }
+    if value[..4] == [0; 4] {
+        Ok(None)
+    } else {
+        Err(Errno::EADDRNOTAVAIL)
+    }
+}
+
+fn parse_ipv4_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno> {
+    if value.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let group = net::IpAddr::V4(net::Ipv4Addr(value[..4].try_into().unwrap()));
+    let interface = if value.len() >= 12 {
+        let index = i32::from_ne_bytes(value[8..12].try_into().unwrap());
+        if index < 0 {
+            return Err(Errno::ENODEV);
+        }
+        (index != 0).then_some(net::InterfaceId(index as u32))
+    } else if value[4..8] == [0; 4] {
+        None
+    } else {
+        return Err(Errno::EADDRNOTAVAIL);
+    };
+    Ok(net::MulticastMembership { group, interface })
+}
+
+fn parse_ipv6_membership(value: &[u8]) -> Result<net::MulticastMembership, Errno> {
+    if value.len() < 20 {
+        return Err(Errno::EINVAL);
+    }
+    let group = net::IpAddr::V6(net::Ipv6Addr(value[..16].try_into().unwrap()));
+    let index = u32::from_ne_bytes(value[16..20].try_into().unwrap());
+    Ok(net::MulticastMembership {
+        group,
+        interface: (index != 0).then_some(net::InterfaceId(index)),
+    })
 }
 
 /// 解析 `struct timeval { tv_sec; tv_usec; }`（每个字段 8 字节，LP64 ABI）。
@@ -1274,6 +1384,16 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 .to_vec()),
             SO_REUSEADDR => Ok((opts.reuseaddr as i32).to_ne_bytes().to_vec()),
             SO_REUSEPORT => Ok((opts.reuseport as i32).to_ne_bytes().to_vec()),
+            SO_BROADCAST => Ok((opts.broadcast as i32).to_ne_bytes().to_vec()),
+            SO_DONTROUTE => Ok((opts.dont_route as i32).to_ne_bytes().to_vec()),
+            SO_LINGER => Ok(encode_linger(SocketLinger {
+                enabled: opts.linger_enabled,
+                seconds: opts.linger_seconds,
+            })),
+            SO_BINDTODEVICE => Ok(opts.bind_device_name.clone()),
+            SO_MARK => Ok(opts.mark.to_ne_bytes().to_vec()),
+            SO_PRIORITY => Ok(opts.priority.to_ne_bytes().to_vec()),
+            SO_RXQ_OVFL => Ok((opts.receive_overflow as i32).to_ne_bytes().to_vec()),
             SO_RCVTIMEO => {
                 let ns = net_ops
                     .recv_timeout_ns()
@@ -1295,15 +1415,39 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
+            IP_TTL => Ok((i32::from(opts.ttl)).to_ne_bytes().to_vec()),
+            IP_TOS => Ok((i32::from(opts.traffic_class)).to_ne_bytes().to_vec()),
+            IP_HDRINCL if net_ops.sock_type() == SOCK_RAW as u16 => {
+                Ok((opts.header_included as i32).to_ne_bytes().to_vec())
+            }
             IP_PKTINFO => Ok((opts.pktinfo as i32).to_ne_bytes().to_vec()),
             IP_RECVTTL => Ok((opts.recvttl as i32).to_ne_bytes().to_vec()),
             IP_RECVTOS => Ok((opts.recvtos as i32).to_ne_bytes().to_vec()),
+            IP_RECVERR => Ok((opts.receive_errors_v4 as i32).to_ne_bytes().to_vec()),
+            IP_FREEBIND => Ok((opts.free_bind as i32).to_ne_bytes().to_vec()),
+            IP_MULTICAST_IF => Ok(opts
+                .multicast_interface
+                .map_or(0, |interface| interface.0)
+                .to_ne_bytes()
+                .to_vec()),
+            IP_MULTICAST_TTL => Ok((i32::from(opts.multicast_hops)).to_ne_bytes().to_vec()),
+            IP_MULTICAST_LOOP => Ok((opts.multicast_loop as i32).to_ne_bytes().to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
+            IPV6_UNICAST_HOPS => Ok((i32::from(opts.ipv6_hops)).to_ne_bytes().to_vec()),
+            IPV6_TCLASS => Ok((i32::from(opts.ipv6_traffic_class)).to_ne_bytes().to_vec()),
             IPV6_V6ONLY => Ok((opts.v6only as i32).to_ne_bytes().to_vec()),
             IPV6_RECVPKTINFO => Ok((opts.recv_pktinfo_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_RECVHOPLIMIT => Ok((opts.recv_hoplimit_v6 as i32).to_ne_bytes().to_vec()),
+            IPV6_RECVERR => Ok((opts.receive_errors_v6 as i32).to_ne_bytes().to_vec()),
+            IPV6_MULTICAST_IF => Ok(opts
+                .multicast_interface
+                .map_or(0, |interface| interface.0)
+                .to_ne_bytes()
+                .to_vec()),
+            IPV6_MULTICAST_HOPS => Ok((i32::from(opts.multicast_hops)).to_ne_bytes().to_vec()),
+            IPV6_MULTICAST_LOOP => Ok((opts.multicast_loop as i32).to_ne_bytes().to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_TCP if net_ops.sock_type() == SOCK_STREAM as u16 => match optname {
@@ -1341,6 +1485,11 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                     .to_ne_bytes()
                     .to_vec(),
             ),
+            TCP_DEFER_ACCEPT => Ok(((net_ops.facade().tcp_defer_accept_ns() / 1_000_000_000)
+                as i32)
+                .to_ne_bytes()
+                .to_vec()),
+            TCP_NOTSENT_LOWAT => Ok(net_ops.facade().tcp_notsent_lowat().to_ne_bytes().to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
@@ -1362,6 +1511,61 @@ fn inet_setsockopt(
             }
             SO_REUSEPORT => {
                 opts.reuseport = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            SO_BROADCAST => {
+                opts.broadcast = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            SO_DONTROUTE => {
+                opts.dont_route = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            SO_LINGER => {
+                let linger = parse_linger(value)?;
+                opts.linger_enabled = linger.enabled;
+                opts.linger_seconds = linger.seconds;
+                Ok(())
+            }
+            SO_BINDTODEVICE => {
+                let end = value
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(value.len());
+                if end == 0 {
+                    opts.bind_interface = None;
+                    opts.bind_device_name.clear();
+                    return Ok(());
+                }
+                if end >= 16 {
+                    return Err(Errno::ENODEV);
+                }
+                let interface = net::interface_by_name(&value[..end]).map_err(|_| Errno::ENODEV)?;
+                opts.bind_interface = Some(interface);
+                opts.bind_device_name.clear();
+                opts.bind_device_name.extend_from_slice(&value[..end]);
+                opts.bind_device_name.push(0);
+                Ok(())
+            }
+            SO_MARK => {
+                if value.len() < 4 {
+                    return Err(Errno::EINVAL);
+                }
+                opts.mark = u32::from_ne_bytes(value[..4].try_into().unwrap());
+                net_ops.facade().set_socket_mark(opts.mark);
+                Ok(())
+            }
+            SO_PRIORITY => {
+                let priority = parse_int_opt(value)?;
+                if priority < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                opts.priority = priority;
+                net_ops.facade().set_socket_priority(priority);
+                Ok(())
+            }
+            SO_RXQ_OVFL => {
+                opts.receive_overflow = parse_int_opt(value)? != 0;
                 Ok(())
             }
             SO_RCVTIMEO => {
@@ -1410,6 +1614,42 @@ fn inet_setsockopt(
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
+            IP_TTL => {
+                let value = parse_int_opt(value)?;
+                let ttl = match value {
+                    -1 => 64,
+                    1..=255 => value as u8,
+                    _ => return Err(Errno::EINVAL),
+                };
+                opts.ttl = ttl;
+                net_ops.facade().set_ip_hop_limit(ttl);
+                Ok(())
+            }
+            IP_TOS => {
+                let value = parse_int_opt(value)?;
+                if !(0..=255).contains(&value) {
+                    return Err(Errno::EINVAL);
+                }
+                opts.traffic_class = value as u8;
+                net_ops.facade().set_ip_traffic_class(value as u8);
+                Ok(())
+            }
+            IP_HDRINCL
+                if net_ops.sock_type() == SOCK_RAW as u16
+                    && net_ops.family() == crate::addr::AF_INET =>
+            {
+                let enabled = parse_int_opt(value)? != 0;
+                opts.header_included = enabled;
+                net_ops.facade().set_raw_header_included(enabled);
+                Ok(())
+            }
+            IP_OPTIONS => {
+                if value.is_empty() || value.iter().all(|byte| *byte == 0) {
+                    Ok(())
+                } else {
+                    Err(Errno::EOPNOTSUPP)
+                }
+            }
             IP_PKTINFO => {
                 opts.pktinfo = parse_int_opt(value)? != 0;
                 Ok(())
@@ -1422,11 +1662,72 @@ fn inet_setsockopt(
                 opts.recvtos = parse_int_opt(value)? != 0;
                 Ok(())
             }
+            IP_RECVERR => {
+                opts.receive_errors_v4 = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            IP_FREEBIND => {
+                opts.free_bind = parse_int_opt(value)? != 0;
+                net_ops.facade().set_free_bind(opts.free_bind);
+                Ok(())
+            }
+            IP_MULTICAST_IF => {
+                opts.multicast_interface = parse_multicast_interface(value)?;
+                net_ops
+                    .facade()
+                    .set_multicast_interface(opts.multicast_interface);
+                Ok(())
+            }
+            IP_MULTICAST_TTL => {
+                opts.multicast_hops = parse_u8_socket_opt(value)?;
+                net_ops.facade().set_multicast_hops(opts.multicast_hops);
+                Ok(())
+            }
+            IP_MULTICAST_LOOP => {
+                opts.multicast_loop = parse_int_or_byte_opt(value)? != 0;
+                net_ops.facade().set_multicast_loop(opts.multicast_loop);
+                Ok(())
+            }
+            IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
+                let membership = parse_ipv4_membership(value)?;
+                if optname == IP_ADD_MEMBERSHIP {
+                    net_ops.facade().add_multicast_membership(membership)
+                } else {
+                    net_ops.facade().drop_multicast_membership(membership)
+                }
+                .map_err(crate::net_socket::map_socket_error_public)
+            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
+            IPV6_UNICAST_HOPS => {
+                let value = parse_int_opt(value)?;
+                let hops = match value {
+                    -1 => 64,
+                    0..=255 => value as u8,
+                    _ => return Err(Errno::EINVAL),
+                };
+                opts.ipv6_hops = hops;
+                net_ops.facade().set_ip_hop_limit(hops);
+                Ok(())
+            }
+            IPV6_TCLASS => {
+                let value = parse_int_opt(value)?;
+                let class = match value {
+                    -1 => 0,
+                    0..=255 => value as u8,
+                    _ => return Err(Errno::EINVAL),
+                };
+                opts.ipv6_traffic_class = class;
+                net_ops.facade().set_ip_traffic_class(class);
+                Ok(())
+            }
             IPV6_V6ONLY => {
+                if !matches!(net_ops.facade().owner(), net::OwnerRef::Unassigned) {
+                    return Err(Errno::EINVAL);
+                }
                 opts.v6only = parse_int_opt(value)? != 0;
+                net_ops.facade().set_v6_only(opts.v6only);
                 Ok(())
             }
             IPV6_RECVPKTINFO => {
@@ -1436,6 +1737,46 @@ fn inet_setsockopt(
             IPV6_RECVHOPLIMIT => {
                 opts.recv_hoplimit_v6 = parse_int_opt(value)? != 0;
                 Ok(())
+            }
+            IPV6_RECVERR => {
+                opts.receive_errors_v6 = parse_int_opt(value)? != 0;
+                Ok(())
+            }
+            IPV6_MULTICAST_IF => {
+                let interface = parse_int_opt(value)?;
+                if interface < 0 {
+                    return Err(Errno::ENODEV);
+                }
+                opts.multicast_interface =
+                    (interface != 0).then_some(net::InterfaceId(interface as u32));
+                net_ops
+                    .facade()
+                    .set_multicast_interface(opts.multicast_interface);
+                Ok(())
+            }
+            IPV6_MULTICAST_HOPS => {
+                let hops = parse_int_opt(value)?;
+                opts.multicast_hops = match hops {
+                    -1 => 1,
+                    0..=255 => hops as u8,
+                    _ => return Err(Errno::EINVAL),
+                };
+                net_ops.facade().set_multicast_hops(opts.multicast_hops);
+                Ok(())
+            }
+            IPV6_MULTICAST_LOOP => {
+                opts.multicast_loop = parse_int_opt(value)? != 0;
+                net_ops.facade().set_multicast_loop(opts.multicast_loop);
+                Ok(())
+            }
+            IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => {
+                let membership = parse_ipv6_membership(value)?;
+                if optname == IPV6_ADD_MEMBERSHIP {
+                    net_ops.facade().add_multicast_membership(membership)
+                } else {
+                    net_ops.facade().drop_multicast_membership(membership)
+                }
+                .map_err(crate::net_socket::map_socket_error_public)
             }
             _ => Err(Errno::ENOPROTOOPT),
         },
@@ -1508,6 +1849,21 @@ fn inet_setsockopt(
                 net_ops
                     .facade()
                     .set_tcp_user_timeout_ns(timeout_ms.saturating_mul(1_000_000));
+                Ok(())
+            }
+            TCP_DEFER_ACCEPT => {
+                let seconds = parse_int_opt(value)?.max(0) as u64;
+                net_ops
+                    .facade()
+                    .set_tcp_defer_accept_ns(seconds.saturating_mul(1_000_000_000));
+                Ok(())
+            }
+            TCP_NOTSENT_LOWAT => {
+                let value = parse_int_opt(value)?;
+                if value < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                net_ops.facade().set_tcp_notsent_lowat(value as u32);
                 Ok(())
             }
             TCP_FASTOPEN => Err(Errno::EOPNOTSUPP),
@@ -2018,6 +2374,11 @@ fn encode_inet6_hoplimit(result: &InetRecvResult) -> Option<Vec<u8>> {
     ))
 }
 
+fn encode_inet_timestamp(result: &InetRecvResult) -> Vec<u8> {
+    let realtime = crate::net_socket::packet_realtime_ns(result.rx_timestamp_ns);
+    encode_cmsg(SOL_SOCKET, SO_TIMESTAMP, &timeval_from_ns(realtime))
+}
+
 fn append_receive_cmsg(out: &mut Vec<u8>, control_len: usize, cmsg: Vec<u8>) -> bool {
     if out.len() + cmsg.len() <= control_len {
         out.extend_from_slice(&cmsg);
@@ -2027,13 +2388,62 @@ fn append_receive_cmsg(out: &mut Vec<u8>, control_len: usize, cmsg: Vec<u8>) -> 
     }
 }
 
+fn encode_inet_error_control(
+    net_ops: &NetSocketFileOps,
+    record: net::SocketErrorRecord,
+    control_len: usize,
+) -> (Vec<u8>, bool) {
+    let errno = crate::net_socket::map_socket_error_public(record.error);
+    let mut payload = vec![0u8; 16];
+    payload[0..4].copy_from_slice(&(i32::from(errno) as u32).to_ne_bytes());
+    payload[4] = match record.origin {
+        net::SocketErrorOrigin::Local => 1,
+        net::SocketErrorOrigin::Icmp => 2,
+        net::SocketErrorOrigin::Icmpv6 => 3,
+    };
+    payload[5] = record.kind;
+    payload[6] = record.code;
+    payload[8..12].copy_from_slice(&record.info.to_ne_bytes());
+    if let Some(offender) = record.offender {
+        let mut encoded = [0u8; 28];
+        if let Ok(len) =
+            crate::addr::encode_inet_sockaddr(&offender, net_ops.family(), &mut encoded)
+        {
+            payload.extend_from_slice(&encoded[..len]);
+        }
+    }
+    let (level, kind) = if net_ops.family() == crate::addr::AF_INET {
+        (SOL_IP, IP_RECVERR)
+    } else {
+        (SOL_IPV6, IPV6_RECVERR)
+    };
+    let cmsg = encode_cmsg(level, kind, &payload);
+    if cmsg.len() > control_len {
+        (Vec::new(), true)
+    } else {
+        (cmsg, false)
+    }
+}
+
 fn encode_inet_receive_control(
     net_ops: &NetSocketFileOps,
     result: &InetRecvResult,
     control_len: usize,
 ) -> (Vec<u8>, bool) {
     let opts = net_ops.options().lock().clone();
-    encode_inet_receive_control_with_options(&opts, result, control_len)
+    let (mut out, mut truncated) =
+        encode_inet_receive_control_with_options(&opts, result, control_len);
+    if !truncated && opts.receive_overflow {
+        let dropped = net_ops.facade().take_rx_overflow();
+        if dropped != 0 {
+            truncated |= append_receive_cmsg(
+                &mut out,
+                control_len,
+                encode_cmsg(SOL_SOCKET, SO_RXQ_OVFL, &dropped.to_ne_bytes()),
+            );
+        }
+    }
+    (out, truncated)
 }
 
 fn encode_inet_receive_control_with_options(
@@ -2043,7 +2453,10 @@ fn encode_inet_receive_control_with_options(
 ) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut truncated = false;
-    if opts.pktinfo {
+    if opts.timestamp {
+        truncated |= append_receive_cmsg(&mut out, control_len, encode_inet_timestamp(result));
+    }
+    if !truncated && opts.pktinfo {
         if let Some(cmsg) = encode_inet_pktinfo(result) {
             truncated |= append_receive_cmsg(&mut out, control_len, cmsg);
         }
@@ -2174,6 +2587,7 @@ mod tests {
             interface_id: Some(NetDeviceId(4)),
             hop_limit: Some(37),
             traffic_class: Some(0xbb),
+            rx_timestamp_ns: 0,
             msg_flags: 0,
         };
 
@@ -2214,6 +2628,7 @@ mod tests {
             interface_id: Some(NetDeviceId(8)),
             hop_limit: Some(63),
             traffic_class: Some(0),
+            rx_timestamp_ns: 0,
             msg_flags: 0,
         };
 
@@ -2251,6 +2666,7 @@ mod tests {
             interface_id: Some(NetDeviceId(4)),
             hop_limit: Some(37),
             traffic_class: Some(0),
+            rx_timestamp_ns: 0,
             msg_flags: 0,
         };
 

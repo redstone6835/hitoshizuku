@@ -17,11 +17,27 @@ use crate::poll_source::PollSource;
 
 const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
+const SOCK_RAW: u16 = 3;
 
 static NET_IOCTL_HANDLER: Mutex<Option<fn(u32, usize) -> Result<usize, Errno>>> = Mutex::new(None);
+static NET_REALTIME_CLOCK: Mutex<Option<fn() -> u64>> = Mutex::new(None);
 
 pub fn install_net_ioctl_handler(handler: fn(u32, usize) -> Result<usize, Errno>) {
     *NET_IOCTL_HANDLER.lock() = Some(handler);
+}
+
+pub fn install_net_realtime_clock(clock: fn() -> u64) {
+    *NET_REALTIME_CLOCK.lock() = Some(clock);
+}
+
+pub fn packet_realtime_ns(monotonic_ns: u64) -> u64 {
+    NET_REALTIME_CLOCK
+        .lock()
+        .map(|clock| {
+            let now_monotonic = sched::now_ns_public();
+            clock().saturating_sub(now_monotonic.saturating_sub(monotonic_ns))
+        })
+        .unwrap_or(monotonic_ns)
 }
 
 pub const SOCK_STREAM_PUB: u16 = SOCK_STREAM;
@@ -32,6 +48,8 @@ pub const SOCK_DGRAM_PUB: u16 = SOCK_DGRAM;
 pub struct InetSendOptions {
     pub nonblocking: bool,
     pub more: bool,
+    pub dont_route: bool,
+    pub confirm: bool,
     pub deadline_ns: Option<u64>,
 }
 
@@ -52,6 +70,7 @@ pub struct InetRecvResult {
     pub interface_id: Option<net::NetDeviceId>,
     pub hop_limit: Option<u8>,
     pub traffic_class: Option<u8>,
+    pub rx_timestamp_ns: u64,
     pub msg_flags: usize,
 }
 
@@ -68,6 +87,26 @@ pub struct SocketOptions {
     pub v6only: bool,
     pub recv_pktinfo_v6: bool,
     pub recv_hoplimit_v6: bool,
+    pub ttl: u8,
+    pub traffic_class: u8,
+    pub header_included: bool,
+    pub ipv6_hops: u8,
+    pub ipv6_traffic_class: u8,
+    pub multicast_interface: Option<net::InterfaceId>,
+    pub multicast_hops: u8,
+    pub multicast_loop: bool,
+    pub receive_errors_v4: bool,
+    pub receive_errors_v6: bool,
+    pub broadcast: bool,
+    pub dont_route: bool,
+    pub bind_interface: Option<net::InterfaceId>,
+    pub bind_device_name: alloc::vec::Vec<u8>,
+    pub mark: u32,
+    pub priority: i32,
+    pub receive_overflow: bool,
+    pub free_bind: bool,
+    pub linger_enabled: bool,
+    pub linger_seconds: u32,
 }
 
 impl Default for SocketOptions {
@@ -84,6 +123,26 @@ impl Default for SocketOptions {
             v6only: false,
             recv_pktinfo_v6: false,
             recv_hoplimit_v6: false,
+            ttl: 64,
+            traffic_class: 0,
+            header_included: false,
+            ipv6_hops: 64,
+            ipv6_traffic_class: 0,
+            multicast_interface: None,
+            multicast_hops: 1,
+            multicast_loop: true,
+            receive_errors_v4: false,
+            receive_errors_v6: false,
+            broadcast: false,
+            dont_route: false,
+            bind_interface: None,
+            bind_device_name: alloc::vec::Vec::new(),
+            mark: 0,
+            priority: 0,
+            receive_overflow: false,
+            free_bind: false,
+            linger_enabled: false,
+            linger_seconds: 0,
         }
     }
 }
@@ -143,6 +202,20 @@ impl NetSocketFileOps {
             .unwrap_or(0)
     }
 
+    pub fn take_error_record(&self) -> Result<net::SocketErrorRecord, Errno> {
+        let options = self.options.lock();
+        let enabled = if self.family == crate::addr::AF_INET {
+            options.receive_errors_v4
+        } else {
+            options.receive_errors_v6
+        };
+        drop(options);
+        if !enabled {
+            return Err(Errno::EAGAIN);
+        }
+        self.facade.take_error_record().ok_or(Errno::EAGAIN)
+    }
+
     pub fn recv_timeout_ns(&self) -> &AtomicU64 {
         &self.recv_timeout_ns
     }
@@ -153,9 +226,10 @@ impl NetSocketFileOps {
 
     pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
         let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
-        let options = self.bind_options();
+        let options = self.bind_options_for(local.addr);
+        let interface = self.options.lock().bind_interface;
         self.facade
-            .bind(local, None, options)
+            .bind(local, interface, options)
             .map_err(map_socket_error)
     }
 
@@ -190,8 +264,10 @@ impl NetSocketFileOps {
 
     pub fn connect(&self, sockaddr: &[u8], nonblocking: bool) -> Result<(), Errno> {
         let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
+        let interface = self.options.lock().bind_interface;
+        let options = self.bind_options();
         self.facade
-            .connect_with_mode(peer, None, self.bind_options(), nonblocking)
+            .connect_with_mode(peer, interface, options, nonblocking)
             .map_err(map_socket_error)
     }
 
@@ -229,9 +305,23 @@ impl NetSocketFileOps {
         let destination = sockaddr
             .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family))
             .transpose()?;
+        let socket_options = self.options.lock().clone();
+        if destination.is_some_and(
+            |endpoint| matches!(endpoint.addr, net::IpAddr::V4(address) if address.is_broadcast()),
+        ) && !socket_options.broadcast
+        {
+            return Err(Errno::EACCES);
+        }
         let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
         self.facade
-            .send(data, destination, opts.nonblocking, deadline)
+            .send_datagram(
+                data,
+                destination,
+                opts.nonblocking,
+                deadline,
+                opts.dont_route || socket_options.dont_route,
+                opts.confirm,
+            )
             .map_err(map_socket_error)
     }
 
@@ -249,6 +339,7 @@ impl NetSocketFileOps {
                 interface_id: None,
                 hop_limit: None,
                 traffic_class: None,
+                rx_timestamp_ns: 0,
                 msg_flags: 0,
             });
         }
@@ -263,7 +354,8 @@ impl NetSocketFileOps {
             local: Some(received.destination),
             interface_id: Some(net::NetDeviceId(received.ingress_interface.0)),
             hop_limit: Some(received.hop_limit),
-            traffic_class: None,
+            traffic_class: Some(received.traffic_class),
+            rx_timestamp_ns: received.rx_timestamp_ns,
             msg_flags: usize::from(received.truncated) * 0x20,
         })
     }
@@ -291,13 +383,15 @@ impl NetSocketFileOps {
 
     fn ensure_bound(&self) -> Result<(), Errno> {
         if matches!(self.facade.owner(), net::OwnerRef::Unassigned) {
+            let interface = self.options.lock().bind_interface;
+            let options = self.bind_options();
             let result = self.facade.bind(
                 net::Endpoint {
                     addr: unspecified(self.family),
                     port: 0,
                 },
-                None,
-                self.bind_options(),
+                interface,
+                options,
             );
             if let Err(error) = result
                 && !(error == net::SocketError::InvalidState
@@ -315,8 +409,16 @@ impl NetSocketFileOps {
             reuse_address: options.reuseaddr,
             reuse_port: options.reuseport,
             v6_only: options.v6only,
-            multicast_or_broadcast: false,
+            multicast_or_broadcast: self.facade.has_multicast_memberships(),
+            free_bind: options.free_bind,
         }
+    }
+
+    fn bind_options_for(&self, address: net::IpAddr) -> net::control::BindOptions {
+        let mut options = self.bind_options();
+        options.multicast_or_broadcast |= address.is_multicast()
+            || matches!(address, net::IpAddr::V4(address) if address.is_broadcast());
+        options
     }
 
     fn recv_deadline(&self) -> Option<u64> {
@@ -377,6 +479,8 @@ impl FileOps for NetSocketFileOps {
             InetSendOptions {
                 nonblocking: self.nonblock.load(Ordering::Relaxed),
                 more: false,
+                dont_route: false,
+                confirm: false,
                 deadline_ns: None,
             },
         )
@@ -449,7 +553,16 @@ impl FileOps for NetSocketFileOps {
     }
 
     fn release(&self) {
+        let options = self.options.lock().clone();
+        if self.sock_type == SOCK_STREAM && options.linger_enabled && options.linger_seconds == 0 {
+            self.facade.request_abortive_close();
+        }
         self.facade.close();
+        if self.sock_type == SOCK_STREAM && options.linger_enabled && options.linger_seconds != 0 {
+            let deadline = sched::now_ns_public()
+                .saturating_add(u64::from(options.linger_seconds).saturating_mul(1_000_000_000));
+            let _ = self.facade.wait_closed(deadline);
+        }
     }
 
     fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
@@ -516,6 +629,23 @@ pub fn create_net_socket(
                 },
             ))
         }
+        SOCK_RAW if (1..=u8::MAX as u16).contains(&protocol) => {
+            let facade = net::new_raw_socket_facade(address_family, protocol as u8)
+                .map_err(map_socket_error)?;
+            facade.set_buffer_limits(Some(64 * 1024), Some(64 * 1024));
+            Ok(NetSocketFileOps::from_facade(
+                family,
+                sock_type,
+                protocol,
+                facade,
+                nonblock,
+                SocketOptions {
+                    sndbuf: 64 * 1024,
+                    rcvbuf: 64 * 1024,
+                    ..SocketOptions::default()
+                },
+            ))
+        }
         _ => Err(Errno::Other(93)),
     }
 }
@@ -532,7 +662,7 @@ fn timeout_deadline(timeout_ns: u64) -> Option<u64> {
     (timeout_ns != 0).then(|| sched::now_ns_public().saturating_add(timeout_ns))
 }
 
-fn map_socket_error(error: net::SocketError) -> Errno {
+pub(crate) fn map_socket_error_public(error: net::SocketError) -> Errno {
     match error {
         net::SocketError::RuntimeUnavailable => Errno::ENODEV,
         net::SocketError::RuntimeBusy | net::SocketError::WouldBlock => Errno::EAGAIN,
@@ -556,6 +686,10 @@ fn map_socket_error(error: net::SocketError) -> Errno {
         net::SocketError::ConnectionRefused => Errno::ECONNREFUSED,
         net::SocketError::ConnectionReset => Errno::ECONNRESET,
     }
+}
+
+fn map_socket_error(error: net::SocketError) -> Errno {
+    map_socket_error_public(error)
 }
 
 fn map_errno_to_vfs(error: Errno) -> VfsError {

@@ -20,6 +20,7 @@ pub struct BindOptions {
     pub reuse_port: bool,
     pub v6_only: bool,
     pub multicast_or_broadcast: bool,
+    pub free_bind: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -25,7 +25,9 @@ pub use address::{AddressFamily, Endpoint, IpAddr, Ipv4Addr, Ipv6Addr, Transport
 pub use flow::{FlowShard, FlowTurnContext, UdpSendError, UdpSendFailure};
 pub use id::{FlowId, InterfaceId, ListenGroupId, NetDeviceId, QueuePairId, ShardId, SocketId};
 pub use socket::{
-    InstallSocketRuntimeError, ListenGroup, OwnerRef, Readiness, ReadinessObserver, SocketCommand,
-    SocketError, SocketFacade, SocketKind, SocketRuntime, TcpInfoSnapshot, TcpTxLease, UdpReceive,
-    UdpTxLease, install_socket_runtime, new_socket_facade, new_tcp_socket_facade,
+    InstallSocketRuntimeError, ListenGroup, MulticastMembership, OwnerRef, Readiness,
+    ReadinessObserver, SocketCommand, SocketError, SocketErrorOrigin, SocketErrorRecord,
+    SocketFacade, SocketKind, SocketRuntime, TcpInfoSnapshot, TcpTxLease, UdpReceive, UdpTxLease,
+    install_socket_runtime, interface_by_name, new_raw_socket_facade, new_socket_facade,
+    new_tcp_socket_facade,
 };

@@ -175,6 +175,7 @@ impl RouteTable {
 #[derive(Clone)]
 pub struct RouteSnapshot {
     tables: Vec<RouteTable>,
+    entries: Vec<RouteEntry>,
 }
 
 impl RouteSnapshot {
@@ -207,7 +208,14 @@ impl RouteSnapshot {
                 .expect("route table 已创建")
                 .insert(*route)?;
         }
-        Ok(Self { tables })
+        Ok(Self {
+            tables,
+            entries: routes.to_vec(),
+        })
+    }
+
+    pub fn entries(&self) -> &[RouteEntry] {
+        &self.entries
     }
 
     pub fn lookup(&self, table: u8, address: IpAddr) -> Option<RouteEntry> {
@@ -225,6 +233,7 @@ pub struct ConfigSnapshot {
     pub addresses: Vec<AddressEntry>,
     pub routes: RouteSnapshot,
     pub policy: Vec<PolicyRule>,
+    pub dns_servers: Vec<IpAddr>,
 }
 
 impl ConfigSnapshot {
@@ -234,6 +243,24 @@ impl ConfigSnapshot {
         addresses: Vec<AddressEntry>,
         routes: Vec<RouteEntry>,
         policy: Vec<PolicyRule>,
+    ) -> Result<Self, ConfigError> {
+        Self::new_with_dns(
+            generation,
+            interfaces,
+            addresses,
+            routes,
+            policy,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_dns(
+        generation: u64,
+        interfaces: Vec<InterfaceSnapshot>,
+        addresses: Vec<AddressEntry>,
+        routes: Vec<RouteEntry>,
+        policy: Vec<PolicyRule>,
+        dns_servers: Vec<IpAddr>,
     ) -> Result<Self, ConfigError> {
         if policy.len() > MAX_POLICY_RULES {
             return Err(ConfigError::TooManyPolicyRules);
@@ -292,6 +319,7 @@ impl ConfigSnapshot {
             addresses,
             routes: route_snapshot,
             policy,
+            dns_servers,
         })
     }
 
@@ -302,6 +330,7 @@ impl ConfigSnapshot {
             addresses: Vec::new(),
             routes: RouteSnapshot::build(&[]).expect("空路由表有效"),
             policy: Vec::new(),
+            dns_servers: Vec::new(),
         }
     }
 
@@ -317,6 +346,18 @@ impl ConfigSnapshot {
         mark: u32,
         bound_source: Option<IpAddr>,
         interface_scope: Option<InterfaceId>,
+    ) -> Result<RouteDecision, ConfigError> {
+        self.route_with_source_policy(destination, mark, bound_source, interface_scope, false)
+    }
+
+    /// FREEBIND 仅放宽显式源地址的本地归属检查，其余路由和接口约束保持不变。
+    pub fn route_with_source_policy(
+        &self,
+        destination: IpAddr,
+        mark: u32,
+        bound_source: Option<IpAddr>,
+        interface_scope: Option<InterfaceId>,
+        allow_nonlocal_source: bool,
     ) -> Result<RouteDecision, ConfigError> {
         let table = self
             .policy
@@ -338,8 +379,9 @@ impl ConfigSnapshot {
             .ok_or(ConfigError::NoRoute)?;
         let source = match bound_source {
             Some(source)
-                if self.is_local_address(route.interface, source)
-                    && same_family(source, destination) =>
+                if same_family(source, destination)
+                    && (allow_nonlocal_source
+                        || self.is_local_address(route.interface, source)) =>
             {
                 source
             }
@@ -352,6 +394,48 @@ impl ConfigSnapshot {
             next_hop: route.gateway.unwrap_or(destination),
             mtu: route.mtu.unwrap_or(interface.mtu).min(interface.mtu),
             table,
+        })
+    }
+
+    /// 组播不依赖单播前缀表；按显式接口或首个具有同族源地址的运行接口选路。
+    pub fn multicast_route(
+        &self,
+        destination: IpAddr,
+        bound_source: Option<IpAddr>,
+        interface_scope: Option<InterfaceId>,
+        allow_nonlocal_source: bool,
+    ) -> Result<RouteDecision, ConfigError> {
+        if !destination.is_multicast() {
+            return Err(ConfigError::NoRoute);
+        }
+        let interface = self
+            .interfaces
+            .iter()
+            .filter(|interface| interface.running && !interface.loopback)
+            .filter(|interface| interface_scope.is_none_or(|scope| scope == interface.id))
+            .find(|interface| {
+                bound_source.is_some_and(|source| same_family(source, destination))
+                    || self.addresses.iter().any(|entry| {
+                        entry.interface == interface.id && same_family(entry.address, destination)
+                    })
+            })
+            .ok_or(ConfigError::NoRoute)?;
+        let source = match bound_source {
+            Some(source)
+                if same_family(source, destination)
+                    && (allow_nonlocal_source || self.is_local_address(interface.id, source)) =>
+            {
+                source
+            }
+            Some(_) => return Err(ConfigError::NoSourceAddress),
+            None => self.select_source(interface.id, destination)?,
+        };
+        Ok(RouteDecision {
+            interface: interface.id,
+            source,
+            next_hop: destination,
+            mtu: interface.mtu,
+            table: MAIN_ROUTE_TABLE,
         })
     }
 
@@ -520,5 +604,66 @@ mod tests {
             store.publish(ConfigSnapshot::empty()),
             Err(ConfigError::GenerationNotIncreasing)
         );
+    }
+
+    #[test]
+    fn freebind_only_relaxes_explicit_source_ownership() {
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![interface(1)],
+            alloc::vec![AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
+                prefix_len: 24,
+                primary: true,
+            }],
+            alloc::vec![RouteEntry {
+                table: 0,
+                network: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_len: 0,
+                gateway: None,
+                interface: InterfaceId(1),
+                metric: 0,
+                mtu: None,
+            }],
+            Vec::new(),
+        )
+        .unwrap();
+        let source = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+        let destination = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        assert_eq!(
+            config.route(destination, 0, Some(source), None),
+            Err(ConfigError::NoSourceAddress)
+        );
+        assert_eq!(
+            config
+                .route_with_source_policy(destination, 0, Some(source), None, true)
+                .unwrap()
+                .source,
+            source
+        );
+    }
+
+    #[test]
+    fn multicast_route_uses_selected_interface_without_unicast_prefix() {
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![interface(1)],
+            alloc::vec![AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V4(Ipv4Addr::new(10, 0, 2, 15)),
+                prefix_len: 24,
+                primary: true,
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let route = config
+            .multicast_route(group, None, Some(InterfaceId(1)), false)
+            .unwrap();
+        assert_eq!(route.interface, InterfaceId(1));
+        assert_eq!(route.next_hop, group);
     }
 }

@@ -4,7 +4,7 @@ use crate::{InterfaceId, IpAddr};
 
 const MAX_NEIGHBORS: usize = 512;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NeighborKey {
     pub interface: InterfaceId,
     pub address: IpAddr,
@@ -88,6 +88,26 @@ impl NeighborTable {
             entry.generation,
             now_ns >= entry.reachable_until_ns,
         ))
+    }
+
+    pub fn confirm(&mut self, key: NeighborKey, now_ns: u64) -> bool {
+        let hash = neighbor_hash(&self.seed, key);
+        let Some(entry) = self.entries.find_mut(hash, |entry| entry.key == key) else {
+            return false;
+        };
+        if now_ns >= entry.stale_until_ns {
+            return false;
+        }
+        entry.reachable_until_ns = now_ns.saturating_add(30_000_000_000);
+        entry.stale_until_ns = now_ns.saturating_add(90_000_000_000);
+        true
+    }
+
+    pub fn invalidate_interface(&mut self, interface: InterfaceId) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|entry| entry.key.interface != interface);
+        before - self.entries.len()
     }
 }
 

@@ -46,10 +46,16 @@ pub enum DropReason {
     TcpChecksum,
     TcpNoEndpoint,
     TcpRingFull,
+    FragmentMalformed,
+    FragmentOverlap,
+    FragmentLimit,
+    FragmentTimeout,
+    RawNoEndpoint,
+    RawRingFull,
 }
 
 impl DropReason {
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 33] = [
         Self::None,
         Self::NoConsumer,
         Self::MalformedDescriptor,
@@ -77,9 +83,15 @@ impl DropReason {
         Self::TcpChecksum,
         Self::TcpNoEndpoint,
         Self::TcpRingFull,
+        Self::FragmentMalformed,
+        Self::FragmentOverlap,
+        Self::FragmentLimit,
+        Self::FragmentTimeout,
+        Self::RawNoEndpoint,
+        Self::RawRingFull,
     ];
 
-    pub const COUNT: usize = 27;
+    pub const COUNT: usize = 33;
 
     pub const fn index(self) -> usize {
         self as usize
@@ -111,6 +123,12 @@ impl DropReason {
             Self::TcpChecksum => "drop_tcp_checksum",
             Self::TcpNoEndpoint => "drop_tcp_no_endpoint",
             Self::TcpRingFull => "drop_tcp_ring_full",
+            Self::FragmentMalformed => "drop_fragment_malformed",
+            Self::FragmentOverlap => "drop_fragment_overlap",
+            Self::FragmentLimit => "drop_fragment_limit",
+            Self::FragmentTimeout => "drop_fragment_timeout",
+            Self::RawNoEndpoint => "drop_raw_no_endpoint",
+            Self::RawRingFull => "drop_raw_ring_full",
             Self::FlowTableFull => "drop_flow_table_full",
             Self::RouteUnavailable => "drop_route_unavailable",
             Self::TxQueueFull => "drop_tx_queue_full",

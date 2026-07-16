@@ -3,6 +3,7 @@
 mod bind;
 mod config;
 mod neighbor;
+mod pmtu;
 
 pub use bind::{BindAddress, BindError, BindOptions, BindRegistry, BindRequest, BindToken};
 pub use config::{
@@ -10,3 +11,4 @@ pub use config::{
     RouteDecision, RouteEntry, RouteSnapshot,
 };
 pub use neighbor::{NeighborError, NeighborKey, NeighborTable};
+pub use pmtu::{PmtuCache, PmtuKey};

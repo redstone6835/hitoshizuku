@@ -41,6 +41,7 @@ pub struct IpPacket {
     pub payload_offset: u16,
     pub payload_len: u32,
     pub hop_limit: u8,
+    pub traffic_class: u8,
     pub fragment: Option<IpFragment>,
 }
 
@@ -68,12 +69,23 @@ pub enum ControlPacket {
         packet_len: u32,
     },
     Fragment(IpPacket),
+    Ipv6ParameterProblem {
+        pointer: u32,
+        suppress_for_multicast: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ipv6OptionProblem {
+    pointer: u32,
+    suppress_for_multicast: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrontendDisposition {
     Tcp,
     Udp,
+    Raw,
     Control(ControlPacket),
     Drop(DropReason),
 }
@@ -276,9 +288,14 @@ impl VectorFrontend {
                     Err(reason) => set_drop(packet, reason),
                 },
                 ETHERTYPE_IPV6 => match parse_ipv6(&packet.chain) {
-                    Ok(ip) if is_local_ip(config, interface, ip.destination) => {
+                    Ok((ip, problem)) if is_local_ip(config, interface, ip.destination) => {
                         packet.parsed.ip = Some(ip);
-                        packet.parsed.disposition = if ip.fragment.is_some() {
+                        packet.parsed.disposition = if let Some(problem) = problem {
+                            FrontendDisposition::Control(ControlPacket::Ipv6ParameterProblem {
+                                pointer: problem.pointer,
+                                suppress_for_multicast: problem.suppress_for_multicast,
+                            })
+                        } else if ip.fragment.is_some() {
                             FrontendDisposition::Control(ControlPacket::Fragment(ip))
                         } else {
                             FrontendDisposition::Drop(DropReason::UnsupportedIpProtocol)
@@ -297,6 +314,12 @@ impl VectorFrontend {
             let Some(packet) = batch.packet_mut(index) else {
                 continue;
             };
+            if matches!(
+                packet.parsed.disposition,
+                FrontendDisposition::Control(ControlPacket::Ipv6ParameterProblem { .. })
+            ) {
+                continue;
+            }
             let Some(ip) = packet.parsed.ip else {
                 continue;
             };
@@ -355,7 +378,7 @@ impl VectorFrontend {
                         packet_len: ip.payload_len,
                     });
                 }
-                _ => set_drop(packet, DropReason::UnsupportedIpProtocol),
+                _ => packet.parsed.disposition = FrontendDisposition::Raw,
             }
         }
     }
@@ -446,11 +469,12 @@ fn parse_ipv4(chain: &PacketChain) -> Result<IpPacket, DropReason> {
         payload_offset: (14 + header_len) as u16,
         payload_len: (total_len - header_len) as u32,
         hop_limit: base[8],
+        traffic_class: base[1],
         fragment,
     })
 }
 
-fn parse_ipv6(chain: &PacketChain) -> Result<IpPacket, DropReason> {
+fn parse_ipv6(chain: &PacketChain) -> Result<(IpPacket, Option<Ipv6OptionProblem>), DropReason> {
     let mut base = [0u8; 40];
     chain
         .copy_out(14, &mut base)
@@ -470,6 +494,7 @@ fn parse_ipv6(chain: &PacketChain) -> Result<IpPacket, DropReason> {
     let mut extension_count = 0usize;
     let mut extension_bytes = 0usize;
     let mut fragment = None;
+    let mut option_problem = None;
     loop {
         match next_header {
             0 | 60 => {
@@ -482,7 +507,21 @@ fn parse_ipv6(chain: &PacketChain) -> Result<IpPacket, DropReason> {
                 if offset.saturating_add(len) > end {
                     return Err(DropReason::MalformedIpv6);
                 }
-                validate_ipv6_options(chain, offset + 2, len - 2)?;
+                match validate_ipv6_options(chain, offset + 2, len - 2) {
+                    Ok(()) => {}
+                    Err(Ipv6OptionError::Malformed) => {
+                        return Err(DropReason::MalformedIpv6);
+                    }
+                    Err(Ipv6OptionError::Silent) => {
+                        return Err(DropReason::UnsupportedIpProtocol);
+                    }
+                    Err(Ipv6OptionError::Parameter(problem)) => {
+                        option_problem = Some(problem);
+                        next_header = extension[0];
+                        offset += len;
+                        break;
+                    }
+                }
                 next_header = extension[0];
                 offset += len;
                 extension_bytes += len;
@@ -496,16 +535,18 @@ fn parse_ipv6(chain: &PacketChain) -> Result<IpPacket, DropReason> {
                     .copy_out(offset, &mut header)
                     .map_err(|_| DropReason::MalformedIpv6)?;
                 let field = u16::from_be_bytes([header[2], header[3]]);
-                fragment = Some(IpFragment {
+                let offset_field = field >> 3;
+                let more = field & 1 != 0;
+                fragment = (offset_field != 0 || more).then_some(IpFragment {
                     identification: u32::from_be_bytes(header[4..8].try_into().unwrap()),
-                    offset: field >> 3,
-                    more: field & 1 != 0,
+                    offset: offset_field,
+                    more,
                 });
                 next_header = header[0];
                 offset += 8;
                 break;
             }
-            43 | 50 | 51 => return Err(DropReason::UnsupportedIpProtocol),
+            43 | 50 | 51 => break,
             _ => break,
         }
         if extension_count > 8 || extension_bytes > 256 {
@@ -515,46 +556,71 @@ fn parse_ipv6(chain: &PacketChain) -> Result<IpPacket, DropReason> {
     if offset > end {
         return Err(DropReason::MalformedIpv6);
     }
-    Ok(IpPacket {
-        source,
-        destination,
-        next_header,
-        header_len: (offset - 14) as u16,
-        payload_offset: offset as u16,
-        payload_len: (end - offset) as u32,
-        hop_limit: base[7],
-        fragment,
-    })
+    Ok((
+        IpPacket {
+            source,
+            destination,
+            next_header,
+            header_len: (offset - 14) as u16,
+            payload_offset: offset as u16,
+            payload_len: (end - offset) as u32,
+            hop_limit: base[7],
+            traffic_class: ((u16::from(base[0] & 0x0f) << 4) | u16::from(base[1] >> 4)) as u8,
+            fragment,
+        },
+        option_problem,
+    ))
+}
+
+enum Ipv6OptionError {
+    Malformed,
+    Silent,
+    Parameter(Ipv6OptionProblem),
 }
 
 fn validate_ipv6_options(
     chain: &PacketChain,
     mut offset: usize,
     mut remaining: usize,
-) -> Result<(), DropReason> {
+) -> Result<(), Ipv6OptionError> {
     while remaining != 0 {
         let mut kind = [0u8; 1];
         chain
             .copy_out(offset, &mut kind)
-            .map_err(|_| DropReason::MalformedIpv6)?;
+            .map_err(|_| Ipv6OptionError::Malformed)?;
         if kind[0] == 0 {
             offset += 1;
             remaining -= 1;
             continue;
         }
         if remaining < 2 {
-            return Err(DropReason::MalformedIpv6);
+            return Err(Ipv6OptionError::Malformed);
         }
         let mut header = [0u8; 2];
         chain
             .copy_out(offset, &mut header)
-            .map_err(|_| DropReason::MalformedIpv6)?;
+            .map_err(|_| Ipv6OptionError::Malformed)?;
         let option_len = usize::from(header[1]) + 2;
         if option_len > remaining {
-            return Err(DropReason::MalformedIpv6);
+            return Err(Ipv6OptionError::Malformed);
         }
-        if header[0] != 1 && header[0] >> 6 != 0 {
-            return Err(DropReason::UnsupportedIpProtocol);
+        if header[0] != 1 {
+            match header[0] >> 6 {
+                0 => {}
+                1 => return Err(Ipv6OptionError::Silent),
+                2 => {
+                    return Err(Ipv6OptionError::Parameter(Ipv6OptionProblem {
+                        pointer: offset.saturating_sub(14) as u32,
+                        suppress_for_multicast: false,
+                    }));
+                }
+                _ => {
+                    return Err(Ipv6OptionError::Parameter(Ipv6OptionProblem {
+                        pointer: offset.saturating_sub(14) as u32,
+                        suppress_for_multicast: true,
+                    }));
+                }
+            }
         }
         offset += option_len;
         remaining -= option_len;
@@ -965,6 +1031,58 @@ mod tests {
         assert_eq!(
             output.packet(0).unwrap().parsed.disposition,
             FrontendDisposition::Drop(DropReason::VlanUnsupported)
+        );
+    }
+
+    #[test]
+    fn ipv6_unknown_option_action_requests_parameter_problem() {
+        let source = Ipv6Addr([0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let destination = Ipv6Addr([0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let mut frame = alloc::vec![0; 14 + 40 + 8 + 8];
+        frame[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
+        frame[14..18].copy_from_slice(&0x6000_0000u32.to_be_bytes());
+        frame[18..20].copy_from_slice(&16u16.to_be_bytes());
+        frame[20] = 0;
+        frame[21] = 64;
+        frame[22..38].copy_from_slice(&source.0);
+        frame[38..54].copy_from_slice(&destination.0);
+        frame[54] = IP_PROTOCOL_UDP;
+        frame[56] = 0x80;
+        frame[57] = 0;
+        let config = ConfigSnapshot::new(
+            1,
+            alloc::vec![InterfaceSnapshot {
+                id: InterfaceId(1),
+                device: NetDeviceId(1),
+                mac_address: [2; 6],
+                mtu: 1500,
+                running: true,
+                loopback: false,
+            }],
+            alloc::vec![AddressEntry {
+                interface: InterfaceId(1),
+                address: IpAddr::V6(destination),
+                prefix_len: 64,
+                primary: true,
+            }],
+            alloc::vec![],
+            alloc::vec![],
+        )
+        .unwrap();
+        let mut input = PacketBatch::new();
+        assert!(
+            input
+                .push(PacketChain::from_owned(frame), PacketMetadata::default())
+                .is_ok()
+        );
+        let mut output = FrontendBatch::new();
+        VectorFrontend::new([3; 40], 1).process(InterfaceId(1), &config, &mut input, &mut output);
+        assert_eq!(
+            output.packet(0).unwrap().parsed.disposition,
+            FrontendDisposition::Control(ControlPacket::Ipv6ParameterProblem {
+                pointer: 42,
+                suppress_for_multicast: false,
+            })
         );
     }
 

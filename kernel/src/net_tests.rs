@@ -50,6 +50,14 @@ fn sockaddr_in(address: [u8; 4], port: u16) -> [u8; 16] {
     raw
 }
 
+fn sockaddr_in6(address: [u8; 16], port: u16) -> [u8; 28] {
+    let mut raw = [0u8; 28];
+    raw[..2].copy_from_slice(&vfs::addr::AF_INET6.to_ne_bytes());
+    raw[2..4].copy_from_slice(&port.to_be_bytes());
+    raw[8..24].copy_from_slice(&address);
+    raw
+}
+
 fn wait_poll(file: &vfs::file::File, events: vfs::file::PollEvents) {
     let deadline = sched::now_ns_public().saturating_add(1_000_000_000);
     while sched::now_ns_public() < deadline {
@@ -74,17 +82,15 @@ fn wait_readable(file: &vfs::file::File) {
 #[ktest]
 fn udp_vfs_fd_and_epoll_roundtrip() {
     let (context, table) = current_vfs();
-    let unsupported = errno::Errno::Other(93);
-    assert_eq!(
-        vfs::socket::socket(
-            &context,
-            &table,
-            vfs::addr::AF_INET as usize,
-            vfs::socket::SOCK_RAW,
-            1,
-        ),
-        Err(unsupported)
-    );
+    let raw = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET as usize,
+        vfs::socket::SOCK_RAW | vfs::socket::SOCK_NONBLOCK,
+        1,
+    )
+    .expect("创建 IPv4 ICMP raw socket");
+    table.close_fd(raw).expect("关闭 IPv4 ICMP raw socket");
 
     let ipv6 = vfs::socket::socket(
         &context,
@@ -469,6 +475,133 @@ fn virtio_udp_dns_roundtrip() {
         "5 秒内未完成 QEMU DNS UDP 收发与 buffer 回收: {:?}",
         net_runtime::physical_udp_probe_state()
     );
+}
+
+#[ktest]
+fn socket_priority_maps_to_four_tx_classes() {
+    assert_eq!(net_runtime::tx_priority_class(-1), 0);
+    assert_eq!(net_runtime::tx_priority_class(0), 0);
+    assert_eq!(net_runtime::tx_priority_class(2), 1);
+    assert_eq!(net_runtime::tx_priority_class(5), 2);
+    assert_eq!(net_runtime::tx_priority_class(6), 3);
+}
+
+#[ktest]
+fn multicast_reports_have_valid_checksums() {
+    let interface = net::InterfaceId(77);
+    let ipv6 = net::Ipv6Addr([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe, 0, 0, 0, 1]);
+    let config = net::control::ConfigSnapshot::new(
+        1,
+        alloc::vec![net::control::InterfaceSnapshot {
+            id: interface,
+            device: net::NetDeviceId(77),
+            mac_address: [2, 0, 0, 0, 0, 1],
+            mtu: 1500,
+            running: true,
+            loopback: false,
+        }],
+        alloc::vec![
+            net::control::AddressEntry {
+                interface,
+                address: net::IpAddr::V4(net::Ipv4Addr::new(10, 0, 0, 1)),
+                prefix_len: 24,
+                primary: true,
+            },
+            net::control::AddressEntry {
+                interface,
+                address: net::IpAddr::V6(ipv6),
+                prefix_len: 64,
+                primary: true,
+            },
+        ],
+        alloc::vec![],
+        alloc::vec![],
+    )
+    .unwrap();
+    let igmp = net_runtime::build_multicast_control_frame(
+        interface,
+        net::IpAddr::V4(net::Ipv4Addr::new(239, 1, 2, 3)),
+        true,
+        &config,
+    )
+    .unwrap();
+    assert_eq!(igmp[38], 0x16);
+    assert_eq!(net::pipeline::checksum_bytes(&igmp[14..38]), 0);
+    assert_eq!(net::pipeline::checksum_bytes(&igmp[38..]), 0);
+
+    let group = net::Ipv6Addr([0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+    let mld = net_runtime::build_multicast_control_frame(
+        interface,
+        net::IpAddr::V6(group),
+        true,
+        &config,
+    )
+    .unwrap();
+    assert_eq!(mld[62], 131);
+    assert_eq!(
+        net::pipeline::transport_checksum(
+            &net::buf::PacketChain::from_owned(mld),
+            62,
+            24,
+            net::IpAddr::V6(ipv6),
+            net::IpAddr::V6(group),
+            58,
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[ktest]
+fn ipv6_wildcard_listener_accepts_ipv4_mapped_peer() {
+    let (context, table) = current_vfs();
+    let server = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET6 as usize,
+        vfs::socket::SOCK_STREAM | vfs::socket::SOCK_NONBLOCK,
+        6,
+    )
+    .expect("创建 dual-stack TCP server");
+    let local6 = sockaddr_in6([0; 16], 19_006);
+    vfs::socket::bind(&context, &table, server, &local6).expect("绑定 IPv6 wildcard");
+    vfs::socket::listen(&table, server, 4).expect("监听 IPv6 wildcard");
+
+    let client = vfs::socket::socket(
+        &context,
+        &table,
+        vfs::addr::AF_INET as usize,
+        vfs::socket::SOCK_STREAM | vfs::socket::SOCK_NONBLOCK,
+        6,
+    )
+    .expect("创建 IPv4 TCP client");
+    let local4 = sockaddr_in([127, 0, 0, 1], 19_006);
+    assert_eq!(
+        vfs::socket::connect(&context, &table, client, &local4),
+        Err(errno::Errno::EINPROGRESS)
+    );
+    let server_file = table.get_file(server).unwrap();
+    wait_readable(&server_file);
+    let (accepted, peer) =
+        vfs::socket::accept(&context, &table, server, vfs::socket::SOCK_NONBLOCK)
+            .expect("accept IPv4-mapped child");
+    let peer = peer.expect("accept 返回 peer address");
+    assert_eq!(
+        u16::from_ne_bytes(peer[..2].try_into().unwrap()),
+        vfs::addr::AF_INET6
+    );
+    assert_eq!(&peer[8..20], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
+    assert_eq!(&peer[20..24], &[127, 0, 0, 1]);
+    table.close_fd(accepted).expect("关闭 mapped child");
+    table.close_fd(client).expect("关闭 IPv4 client");
+    table.close_fd(server).expect("关闭 IPv6 server");
+}
+
+#[ktest]
+fn dhcp_rebind_deadline_stays_between_renew_and_expiry() {
+    assert_eq!(net_runtime::dhcp_rebind_seconds(800, 400, None), 700);
+    assert_eq!(net_runtime::dhcp_rebind_seconds(800, 400, Some(600)), 600);
+    assert_eq!(net_runtime::dhcp_rebind_seconds(800, 799, Some(1)), 799);
 }
 
 #[ktest]

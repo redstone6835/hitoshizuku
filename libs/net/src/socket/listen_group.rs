@@ -127,25 +127,44 @@ impl ListenGroup {
         debug_assert!(previous != 0, "ListenGroup SYN 计数下溢");
     }
 
+    /// 将半连接容量转换为尚不可见的 accept backlog 预约。
+    pub fn reserve_deferred(&self) -> bool {
+        self.release_syn();
+        reserve_bounded(&self.accept_count, &self.accept_limit, &self.closing)
+    }
+
+    pub fn release_deferred(&self) {
+        let previous = self.accept_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "ListenGroup accept 计数下溢");
+    }
+
     /// 将一个半连接原子转换为 accept backlog 项。
     pub fn publish_established(
         &self,
         shard: ShardId,
         child: Arc<SocketFacade>,
     ) -> Result<(), Arc<SocketFacade>> {
-        self.release_syn();
-        if !reserve_bounded(&self.accept_count, &self.accept_limit, &self.closing) {
+        if !self.reserve_deferred() {
             return Err(child);
         }
+        self.publish_deferred(shard, child)
+    }
+
+    /// 发布一个已经占用 accept backlog 的 deferred connection。
+    pub fn publish_deferred(
+        &self,
+        shard: ShardId,
+        child: Arc<SocketFacade>,
+    ) -> Result<(), Arc<SocketFacade>> {
         let index = usize::from(shard.0);
         let Some(queue) = self.shards.get(index) else {
-            self.accept_count.fetch_sub(1, Ordering::AcqRel);
+            self.release_deferred();
             return Err(child);
         };
         {
             let mut accepted = queue.accepted.lock();
             if self.closing.load(Ordering::Acquire) {
-                self.accept_count.fetch_sub(1, Ordering::AcqRel);
+                self.release_deferred();
                 return Err(child);
             }
             accepted.push_back(child);

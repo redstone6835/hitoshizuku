@@ -47,6 +47,8 @@ pub struct TcpPath {
     pub route: RouteDecision,
     pub source_mac: [u8; 6],
     pub destination_mac: [u8; 6],
+    pub unresolved_neighbor: Option<crate::control::NeighborKey>,
+    pub config_generation: u64,
 }
 
 pub struct PreparedTcpTx {
@@ -121,6 +123,7 @@ struct TcpDeadlines {
     time_wait: Option<u64>,
     cork: Option<u64>,
     keepalive: Option<u64>,
+    defer_accept: Option<u64>,
 }
 
 impl TcpDeadlines {
@@ -132,6 +135,7 @@ impl TcpDeadlines {
             time_wait: None,
             cork: None,
             keepalive: None,
+            defer_accept: None,
         }
     }
 
@@ -143,6 +147,7 @@ impl TcpDeadlines {
             self.time_wait,
             self.cork,
             self.keepalive,
+            self.defer_accept,
         ]
         .into_iter()
         .flatten()
@@ -251,6 +256,7 @@ struct TcpFlow {
     local: Endpoint,
     pending_connect: Option<u64>,
     accept_group: Option<Arc<ListenGroup>>,
+    accept_reserved: bool,
     retransmit: VecDeque<SentSegment>,
     reassembly: Vec<ReassemblyFragment>,
     reassembly_bytes: usize,
@@ -347,29 +353,45 @@ impl TcpEndpointTable {
     }
 
     pub fn close_listener(&mut self, group: ListenGroupId) -> bool {
-        let key = self
+        let keys = self
             .listeners
             .iter()
-            .find(|(_, listener)| listener.group.id() == group)
-            .map(|(key, _)| *key);
-        let Some(key) = key else {
+            .filter(|(_, listener)| listener.group.id() == group)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
             return false;
-        };
-        if self.listeners.remove(&key).is_none() {
-            return false;
+        }
+        for key in &keys {
+            self.listeners.remove(key);
         }
         let pending: Vec<_> = (1..=4096)
             .map(FlowId)
             .filter(|id| {
                 self.flows
                     .get(*id)
-                    .is_some_and(|flow| flow.listener_key == Some(key))
+                    .is_some_and(|flow| flow.listener_key.is_some_and(|key| keys.contains(&key)))
             })
             .collect();
         for id in pending {
             self.reap(id, Some(SocketError::ConnectionReset));
         }
         true
+    }
+
+    pub fn invalidate_interface(&mut self, interface: InterfaceId) -> usize {
+        let affected = (1..=4096)
+            .map(FlowId)
+            .filter(|id| {
+                self.flows
+                    .get(*id)
+                    .is_some_and(|flow| flow.path.route.interface == interface)
+            })
+            .collect::<Vec<_>>();
+        for id in &affected {
+            self.reap(*id, Some(SocketError::NetworkUnreachable));
+        }
+        affected.len()
     }
 
     pub fn connect(
@@ -397,6 +419,7 @@ impl TcpEndpointTable {
             local,
             pending_connect: Some(control_sequence),
             accept_group: None,
+            accept_reserved: false,
             retransmit: VecDeque::new(),
             reassembly: Vec::new(),
             reassembly_bytes: 0,
@@ -580,6 +603,21 @@ impl TcpEndpointTable {
         true
     }
 
+    pub fn abort_flow(&mut self, id: FlowId, now_ns: u64) -> bool {
+        let Some(flow) = self.flows.get(id) else {
+            return false;
+        };
+        let transmit = TcpTransmit {
+            sequence: flow.machine.send_next(),
+            acknowledgement: flow.machine.receive_next(),
+            flags: TcpFlags::RST | TcpFlags::ACK,
+            window: 0,
+        };
+        self.queue_transmit(id, transmit, None, now_ns, true, false);
+        self.reap(id, None);
+        true
+    }
+
     pub fn shutdown_write(&mut self, id: FlowId, now_ns: u64) -> bool {
         self.close_flow(id, now_ns)
     }
@@ -709,6 +747,13 @@ impl TcpEndpointTable {
             };
             self.queue_transmit(id, transmit, None, now_ns, true, false);
         }
+        if deadlines
+            .defer_accept
+            .is_some_and(|deadline| deadline <= now_ns)
+            && !self.promote_deferred(id, now_ns)
+        {
+            return true;
+        }
         true
     }
 
@@ -739,6 +784,16 @@ impl TcpEndpointTable {
             return false;
         };
         match error {
+            TransportControlError::NetworkUnreachable
+                if self.flows.get(id).unwrap().machine.state() == TcpState::SynSent =>
+            {
+                self.reap(id, Some(SocketError::NetworkUnreachable));
+            }
+            TransportControlError::HostUnreachable
+                if self.flows.get(id).unwrap().machine.state() == TcpState::SynSent =>
+            {
+                self.reap(id, Some(SocketError::HostUnreachable));
+            }
             TransportControlError::PortUnreachable
                 if self.flows.get(id).unwrap().machine.state() == TcpState::SynSent =>
             {
@@ -747,20 +802,24 @@ impl TcpEndpointTable {
             TransportControlError::PacketTooBig { mtu } => {
                 let flow = self.flows.get_mut(id).unwrap();
                 flow.peer_mss = flow.peer_mss.min(path_mss(mtu, flow.local.addr));
+                flow.facade.set_transport_error(error, Some(flow.remote));
             }
-            TransportControlError::TimeExceeded | TransportControlError::ParameterProblem => {
+            TransportControlError::NetworkUnreachable
+            | TransportControlError::HostUnreachable
+            | TransportControlError::TimeExceeded
+            | TransportControlError::ParameterProblem => {
                 self.flows
                     .get(id)
                     .unwrap()
                     .facade
-                    .set_pending_error(SocketError::HostUnreachable);
+                    .set_transport_error(error, Some(key.remote));
             }
             TransportControlError::PortUnreachable => {
                 self.flows
                     .get(id)
                     .unwrap()
                     .facade
-                    .set_pending_error(SocketError::ConnectionReset);
+                    .set_transport_error(error, Some(key.remote));
             }
         }
         true
@@ -785,11 +844,12 @@ impl TcpEndpointTable {
             group.release_syn();
             return Err(TcpIngressError::NoEndpoint);
         };
-        let child = create_child_facade(address_family(key.local.addr)).map_err(|_| {
+        let child = create_child_facade(parent.family()).map_err(|_| {
             group.release_syn();
             TcpIngressError::FlowTableFull
         })?;
         child.set_tcp_maxseg(parent.tcp_maxseg());
+        child.set_tcp_defer_accept_ns(parent.tcp_defer_accept_ns());
         let mss = apply_user_mss(path_mss(path.route.mtu, key.local.addr), child.tcp_maxseg());
         let iss = self.initial_sequence(key, now_ns);
         let mut machine = TcpStateMachine::new(iss, advertised_window(&child, 0));
@@ -805,6 +865,7 @@ impl TcpEndpointTable {
             local: key.local,
             pending_connect: None,
             accept_group: Some(Arc::clone(&group)),
+            accept_reserved: false,
             retransmit: VecDeque::new(),
             reassembly: Vec::new(),
             reassembly_bytes: 0,
@@ -942,6 +1003,9 @@ impl TcpEndpointTable {
 
         if !payload.is_empty() {
             self.receive_payload(id, receive_before, tcp.sequence, payload, now_ns)?;
+            if !self.promote_deferred(id, now_ns) {
+                return Ok(());
+            }
         }
         if tcp.flags.contains(TcpFlags::FIN) {
             self.flows.get(id).unwrap().facade.publish_stream_eof();
@@ -1193,11 +1257,24 @@ impl TcpEndpointTable {
         if let Some(sequence) = flow.pending_connect.take() {
             flow.facade.complete_control(sequence, Ok(()));
         }
-        let rejected = flow.accept_group.take().is_some_and(|group| {
-            group
-                .publish_established(self.shard, Arc::clone(&flow.facade))
-                .is_err()
-        });
+        let defer_accept_ns = flow.facade.tcp_defer_accept_ns();
+        let rejected = if defer_accept_ns != 0 {
+            flow.accept_group.as_ref().is_some_and(|group| {
+                if group.reserve_deferred() {
+                    flow.accept_reserved = true;
+                    flow.deadlines.defer_accept = Some(now_ns.saturating_add(defer_accept_ns));
+                    false
+                } else {
+                    true
+                }
+            })
+        } else {
+            flow.accept_group.take().is_some_and(|group| {
+                group
+                    .publish_established(self.shard, Arc::clone(&flow.facade))
+                    .is_err()
+            })
+        };
         if rejected {
             let transmit = TcpTransmit {
                 sequence: flow.machine.send_next(),
@@ -1212,6 +1289,36 @@ impl TcpEndpointTable {
         self.stats.established = self.stats.established.saturating_add(1);
         publish_tcp_info(self.flows.get(id).unwrap());
         true
+    }
+
+    fn promote_deferred(&mut self, id: FlowId, now_ns: u64) -> bool {
+        let Some(flow) = self.flows.get_mut(id) else {
+            return false;
+        };
+        if !flow.accept_reserved {
+            return true;
+        }
+        flow.accept_reserved = false;
+        flow.deadlines.defer_accept = None;
+        let group = flow
+            .accept_group
+            .take()
+            .expect("deferred flow 必须保留 ListenGroup");
+        if group
+            .publish_deferred(self.shard, Arc::clone(&flow.facade))
+            .is_ok()
+        {
+            return true;
+        }
+        let transmit = TcpTransmit {
+            sequence: flow.machine.send_next(),
+            acknowledgement: flow.machine.receive_next(),
+            flags: TcpFlags::RST | TcpFlags::ACK,
+            window: 0,
+        };
+        self.queue_transmit(id, transmit, None, now_ns, true, false);
+        self.reap(id, Some(SocketError::ConnectionReset));
+        false
     }
 
     fn maybe_send_fin(&mut self, id: FlowId, now_ns: u64) {
@@ -1342,10 +1449,12 @@ impl TcpEndpointTable {
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         if let Some(flow) = self.flows.remove(&key, hash) {
-            if flow.listener_key.is_some()
-                && let Some(group) = flow.accept_group
-            {
-                group.release_syn();
+            if let Some(group) = flow.accept_group {
+                if flow.accept_reserved {
+                    group.release_deferred();
+                } else if flow.listener_key.is_some() {
+                    group.release_syn();
+                }
             }
             if let Some(sequence) = flow.pending_connect {
                 let result = Err(error.unwrap_or(SocketError::Closed));
@@ -1945,6 +2054,8 @@ mod tests {
             },
             source_mac: [2; 6],
             destination_mac: [1; 6],
+            unresolved_neighbor: None,
+            config_generation: 0,
         }
     }
 
@@ -2082,6 +2193,7 @@ mod tests {
             payload_offset: 34,
             payload_len: 20,
             hop_limit: 64,
+            traffic_class: 0,
             fragment: None,
         };
         let incoming = packet(40_000, 9_999, 123, 0, TcpFlags::SYN, 0);
@@ -2097,6 +2209,7 @@ mod tests {
             payload_offset: 34,
             payload_len: 20,
             hop_limit: 64,
+            traffic_class: 0,
             fragment: None,
         };
         let tcp = crate::transport::parse_tcp_packet(&reset, output_ip).unwrap();
@@ -2296,6 +2409,59 @@ mod tests {
             listener.accept(true, None),
             Err(SocketError::WouldBlock)
         ));
+    }
+
+    #[test]
+    fn defer_accept_reserves_backlog_until_timeout() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9002,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_002,
+        };
+        let listener = facade(22);
+        listener.set_tcp_defer_accept_ns(1_000_000_000);
+        let group = listen_group(&listener, 22, 1, 4);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        table
+            .listen(local, Some(InterfaceId(1)), Arc::clone(&group))
+            .unwrap();
+        let key = FlowKey::new(remote, local, TransportProtocol::Tcp).unwrap();
+        let flow = table
+            .accept_syn(
+                InterfaceId(1),
+                path(local.addr, remote.addr),
+                key,
+                packet(remote.port, local.port, 900, 0, TcpFlags::SYN, 0),
+                1_000,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        table
+            .process_segment(
+                flow,
+                packet(
+                    remote.port,
+                    local.port,
+                    901,
+                    syn_ack.sequence.0.wrapping_add(1),
+                    TcpFlags::ACK,
+                    0,
+                ),
+                Vec::new(),
+                2_000,
+            )
+            .unwrap();
+        assert_eq!(group.accept_count(), 1);
+        assert!(matches!(
+            listener.accept(true, None),
+            Err(SocketError::WouldBlock)
+        ));
+        let generation = table.generation(flow).unwrap();
+        assert!(table.handle_timer(flow, generation, 1_000_002_000));
+        assert!(listener.accept(true, None).is_ok());
     }
 
     #[test]

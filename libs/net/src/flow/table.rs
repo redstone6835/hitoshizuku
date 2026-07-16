@@ -55,6 +55,7 @@ struct FlowCell<T> {
     id: FlowId,
     generation: u32,
     key: FlowKey,
+    hash: u64,
     value: T,
     dirty_bits: u32,
     dirty_queued: bool,
@@ -94,11 +95,11 @@ impl<T> FlowTable<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.index.len()
+        MAX_FLOWS - self.free.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.len() == 0
     }
 
     pub fn insert(&mut self, key: FlowKey, value: T) -> Result<FlowId, FlowInsertError> {
@@ -123,6 +124,7 @@ impl<T> FlowTable<T> {
             id,
             generation,
             key,
+            hash,
             value,
             dirty_bits: 0,
             dirty_queued: false,
@@ -141,6 +143,30 @@ impl<T> FlowTable<T> {
             },
             |entry| entry.hash,
         );
+        Ok(id)
+    }
+
+    /// 为 bind/reuse group 分配稳定 cell，但不把重复 wildcard key 放入精确流索引。
+    pub fn insert_unindexed(
+        &mut self,
+        key: FlowKey,
+        hash: u64,
+        value: T,
+    ) -> Result<FlowId, FlowInsertError> {
+        let cell_index = self.free.pop().ok_or(FlowInsertError::Full)?;
+        let id = FlowId(u32::from(cell_index) + 1);
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        self.cells[usize::from(cell_index)] = Some(FlowCell {
+            id,
+            generation,
+            key,
+            hash,
+            value,
+            dirty_bits: 0,
+            dirty_queued: false,
+            dirty_next: None,
+        });
         Ok(id)
     }
 
@@ -181,6 +207,24 @@ impl<T> FlowTable<T> {
         self.unlink_dirty(entry.slot.cell_index);
         let cell = self.cells[index].take()?;
         self.free.push(entry.slot.cell_index);
+        Some(cell.value)
+    }
+
+    pub fn remove_id(&mut self, id: FlowId) -> Option<T> {
+        let cell_index = self.cell_index(id)?;
+        let (hash, key) = {
+            let cell = self.cells[usize::from(cell_index)].as_ref()?;
+            (cell.hash, cell.key)
+        };
+        if let Ok(entry) = self
+            .index
+            .find_entry(hash, |entry| entry.key == key && entry.slot.id == id)
+        {
+            let _ = entry.remove();
+        }
+        self.unlink_dirty(cell_index);
+        let cell = self.cells[usize::from(cell_index)].take()?;
+        self.free.push(cell_index);
         Some(cell.value)
     }
 
@@ -298,6 +342,36 @@ pub fn rss_hash(key: &[u8; 40], flow: &FlowKey) -> u32 {
     toeplitz(key, &input[..len])
 }
 
+pub fn fragment_rss_hash(
+    key: &[u8; 40],
+    interface: crate::InterfaceId,
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: u8,
+    identification: u32,
+) -> u32 {
+    let mut input = [0u8; 42];
+    input[..4].copy_from_slice(&interface.0.to_be_bytes());
+    let offset = match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            input[4] = 4;
+            input[5..9].copy_from_slice(&source.0);
+            input[9..13].copy_from_slice(&destination.0);
+            13
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            input[4] = 6;
+            input[5..21].copy_from_slice(&source.0);
+            input[21..37].copy_from_slice(&destination.0);
+            37
+        }
+        _ => return 0,
+    };
+    input[offset] = protocol;
+    input[offset + 1..offset + 5].copy_from_slice(&identification.to_be_bytes());
+    toeplitz(key, &input[..offset + 5])
+}
+
 fn toeplitz(key: &[u8; 40], input: &[u8]) -> u32 {
     let mut result = 0u32;
     let mut window = u32::from_be_bytes(key[0..4].try_into().unwrap());
@@ -378,5 +452,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rss_hash(&key, &flow), 0x51cc_c178);
+    }
+
+    #[test]
+    fn fragment_hash_ignores_missing_transport_ports_but_keeps_identity() {
+        let key = [0x5a; 40];
+        let source = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let destination = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let first = fragment_rss_hash(&key, crate::InterfaceId(2), source, destination, 17, 0x1234);
+        assert_eq!(
+            first,
+            fragment_rss_hash(&key, crate::InterfaceId(2), source, destination, 17, 0x1234,)
+        );
+        assert_ne!(
+            first,
+            fragment_rss_hash(&key, crate::InterfaceId(2), source, destination, 17, 0x1235,)
+        );
     }
 }
