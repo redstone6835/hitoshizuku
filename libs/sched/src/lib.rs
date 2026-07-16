@@ -118,8 +118,8 @@ pub use signal::{
 };
 pub use spawn::{
     SpawnKind, abort_new_task, activate_task, clone_task, exit_task, kthread_create,
-    kthread_finish, kthread_spawn, list_zombie_children, reap_child, reap_matching,
-    reparent_to_init, spawn_child,
+    kthread_finish, kthread_spawn, kthread_spawn_on_cpu, list_zombie_children, reap_child,
+    reap_matching, reparent_to_init, spawn_child,
 };
 pub use task::{
     ExitCode, RobustListState, RseqRegistration, SigAltStack, TASK_COMM_LEN, TASKEXT_ELM_EXECUTION,

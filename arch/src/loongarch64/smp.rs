@@ -245,21 +245,59 @@ fn publish_shootdown(kind: usize, asid: usize, address: usize, action: u32) {
         return;
     }
 
+    let mut expected = [0usize; MAX_CPUS];
     for logical_id in 0..MAX_CPUS {
         if targets & (1 << logical_id) == 0 {
             continue;
         }
-        match kind {
-            SHOOTDOWN_TLB => {
-                TLB_REQUESTED[logical_id].fetch_add(1, Ordering::Release);
-            }
-            SHOOTDOWN_ICACHE => {
-                ICACHE_REQUESTED[logical_id].fetch_add(1, Ordering::Release);
-            }
-            _ => {}
-        }
+        expected[logical_id] = match kind {
+            SHOOTDOWN_TLB => TLB_REQUESTED[logical_id]
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1),
+            SHOOTDOWN_ICACHE => ICACHE_REQUESTED[logical_id]
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1),
+            _ => 0,
+        };
     }
     send_action_to_mask(targets, action);
+    wait_for_shootdown(kind, targets, &expected);
+}
+
+fn wait_for_shootdown(kind: usize, targets: usize, expected: &[usize; MAX_CPUS]) {
+    let started_at = stable_counter_raw();
+    let timeout_ticks = stable_counter_hz().max(1);
+    for logical_id in 0..MAX_CPUS {
+        if targets & (1 << logical_id) == 0 {
+            continue;
+        }
+        let completed = match kind {
+            SHOOTDOWN_TLB => &TLB_COMPLETED[logical_id],
+            SHOOTDOWN_ICACHE => &ICACHE_COMPLETED[logical_id],
+            _ => return,
+        };
+        while !shootdown_sequence_reached(completed.load(Ordering::Acquire), expected[logical_id]) {
+            // 两个 CPU 可能同时发起 shootdown。在等待对端时主动消费本核请求，
+            // 避免双方都处于关中断临界区时相互等待。
+            handle_shootdown_requests();
+            if stable_counter_raw().wrapping_sub(started_at) >= timeout_ticks {
+                panic!(
+                    "[smp] shootdown 确认超时 kind={} source={} target={} expected={} completed={} online={:#x}",
+                    kind,
+                    LoongArch64MessageInterruptOps::current_cpu_id(),
+                    logical_id,
+                    expected[logical_id],
+                    completed.load(Ordering::Acquire),
+                    ONLINE_CPUS.load(Ordering::Acquire),
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+const fn shootdown_sequence_reached(completed: usize, expected: usize) -> bool {
+    completed.wrapping_sub(expected) <= usize::MAX / 2
 }
 
 fn send_action_to_mask(mask: usize, action: u32) {

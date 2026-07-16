@@ -1027,7 +1027,7 @@ demo    source=eki
 - 异步 provider 队列由 `ProviderAsyncJob`、running 调用表和 `ProviderAsyncResult` 分离建模；job 表示仍等待执行的调用，running 表示已经被 worker 取走但尚未完成的调用，result 表示已完成、失败、取消或过期并等待外部领取的终态。
 - 提交异步 job 时会给 binding lease 增加 active ref；job 被取消、result 被 poll、result TTL 过期或结果环淘汰时释放 active ref，因此 `PreflightUnbind` 和生命周期预检能观察到真实忙碌状态。
 - 队列容量按 provider 端口计算，默认上限为 64；`Exclusive` 端口上限为 1，`Ordered` 端口上限为 32，`Shared`、`Pipeline` 和 `Broadcast` 使用默认上限。
-- provider worker 从队列中取出可运行 job，复用同步 provider 后端执行逻辑，并把 `ElmReplyFrame.status != OK` 计为业务失败和 `PROVIDER_CALL_FAILED` 审计。
+- provider worker 按调度器 active CPU 集合建立，每个 CPU 使用一个在入队前完成亲和性绑定的内核线程。worker 从共享队列中取出可运行 job，复用同步 provider 后端执行逻辑，并把 `ElmReplyFrame.status != OK` 计为业务失败和 `PROVIDER_CALL_FAILED` 审计。
 - 排队超时会生成 `Expired` 结果并保留到 poll 或 TTL 清理；运行中调用可被 poll 观测并可接收取消意图。ELM 原生 provider handler 受原生调用门 deadline 和 timer trap 强制退出保护；内核 provider 回调不由 ELM 抢占。运行中调用带取消意图返回时标记为 `Canceled`，否则完成时已经超过 deadline 会标记为 `Expired`。
 - `ProviderRuntime::record_flags()` 是 provider 观测 flags 的唯一派生入口，`QueryProviderPorts` 和 `QueryProviderStats` 使用同一套 flags 语义。
 - detach 会阻断仍有子单元、依赖者、拓展项或 busy 租约的目标单元。
@@ -1038,8 +1038,8 @@ demo    source=eki
 - `ElmKernelProviderSpec` 是当前子系统接入 `elm-mgr` 的统一规格形状，负责 API 描述、端口描述、invoke、单页 snapshot、分页 snapshot 和 revoke 回调；当前子系统回调先返回 `UNSUPPORTED`，但已经走完整 provider runtime 链路。
 - `health_bytes()` 会输出 17 类结构健康记录：graph、cells、ports、providers、bindings、runtime ports、menu、events、audits、native capabilities、TODO registry、trust、projection sources、journal、resources、executions 和 sequences。
 - 健康检查会交叉校验事件订阅与租约、source owner/generation、信任接受记录、journal hash chain、资源账本、执行引用和全部单调 ID，避免各运行时表之间形成悬空状态。
-- `/sys/kernel/elm` 提供 18 个只读节点：`core`、`policy`、`health`、`menu`、`topology`、`ports`、`providers`、`bindings`、`events`、`audit`、`api`、`trust`、`projection-sources`、`journal`、`executions`、`owned-resources`、`resource-accounting` 和 `diagnostics`。
-- debug dump 会输出 cells、ports、bindings、leases、runtime ports、source、执行、fault、native capability、TODO registry 和 health 摘要，并保留后续独立主线说明。
+- `/sys/kernel/elm` 提供 19 个只读节点：`core`、`policy`、`health`、`menu`、`topology`、`ports`、`providers`、`bindings`、`events`、`audit`、`api`、`trust`、`projection-sources`、`journal`、`executions`、`owned-resources`、`resource-accounting`、`workers` 和 `diagnostics`。`workers` 输出 online/active/worker/busy mask，以及每核完成量和等待次数。
+- debug dump 会输出 cells、ports、bindings、leases、runtime ports、source、执行、fault、native capability、TODO registry、SMP worker 和 health 摘要，并保留后续独立主线说明。
 - runtime journal 由审计路径、启动路径和镜像信任接受路径共同写入。v1 记录固定为 240 字节，包含单调 sequence、前序哈希、记录哈希以及信任记录使用的完整 rollback authority 摘要、模块摘要和 signer key 摘要。`kernel::elm` 以 `ElmJournalBackendOps` 暴露 `capacity/read/append/sync` 四个静态回调，并要求后端在 ELM 初始化前通过 `register_journal_backend` 登记；运行时随后执行顺序回放、哈希链校验、容量检查和同步提交，回放得到的最高 release epoch 会在信任库 seal 前恢复。未登记后端时运行在可观测的易失模式；可选后端失败后降级为易失模式并停止向不确定尾部追加；强制后端失败会封闭后续变更操作。
 - 当前热替换已有迁移钩子、受管 import 唯一最高版本选择与回滚、provider 后端原位切换、Projection Source 原子 generation 切换和 replace trace。v1 明确定义为排空后切换，不把跨 generation 迁移运行中调用作为隐含语义。
 
@@ -1063,10 +1063,13 @@ demo    source=eki
 
 设计细节：
 
-- provider worker 在 `elm-mgr` 初始化成功后启动。
-- worker 只负责等待、唤醒和循环驱动 `ElmCore::run_one_async_provider_job_at`，不直接修改队列内部结构。
+- `elm-mgr` 初始化成功后先为启动 CPU 创建 worker；架构完成 AP 激活后再按 `active_cpu_mask` 幂等补齐 worker 集合。
+- `kthread_spawn_on_cpu` 在调度器 CPU 热插拔锁内完成 active 校验、亲和性安装和首次入队，worker 不存在先在错误 CPU 运行再迁移的窗口，也不会与并发下线操作形成检查后失效。
+- worker 只负责等待、唤醒和循环驱动已解锁的 provider 执行计划，不直接修改队列内部结构。多个 worker 可并行执行已从 Core 预留的外部回调，准备和完成阶段仍由 Core 锁保护。
 - worker 在空队列时睡眠在 `WaitQueue` 上，`SubmitProviderCall` 成功入队后唤醒。
 - 队列状态、租约 active ref、结果 TTL、审计和统计全部仍由 `core.rs` 维护，避免后台线程复制策略。
+- 编译期强制 `ELM_CONTEXT_MAX_CPUS` 和 allocator CPU 本地槽位覆盖 `sched::NR_CPUS`；不允许在运行时通过截断 CPU id 隐藏容量不匹配。
+- LoongArch64 上的原生 ELM 映射变更使用全核 I-cache 同步和 TLB shootdown，发布方必须等待所有目标 CPU 提交完成代际后才能返回。
 
 ### `menu.rs`
 

@@ -13,8 +13,8 @@ use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    current_task, enqueue_task, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
-    root_pid_ns, schedule_once,
+    activate_task_on_cpu, current_task, enqueue_task, init_task, is_current_on_any_cpu,
+    mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -512,6 +512,25 @@ pub fn kthread_spawn(entry: KernelEntry, arg: usize, params: SchedParams) -> Arc
         entry as *const () as usize,
     );
     child
+}
+
+/// 在指定活动 CPU 上创建并启动一个内核线程。
+///
+/// CPU 亲和性会在任务暴露给运行队列之前安装，因此不存在线程先在其它
+/// CPU 上运行、随后再迁移的窗口。该接口不接受仅 online 但尚未 active 的 CPU。
+#[kernel_symbols::export(name = "sched.spawn.kthread_spawn_on_cpu", contract = "kernel.sched.kernel-thread@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED, retained_args = 1 << 0)]
+pub fn kthread_spawn_on_cpu(
+    entry: KernelEntry,
+    arg: usize,
+    params: SchedParams,
+    cpu_id: usize,
+) -> Result<Arc<Task>, errno::Errno> {
+    let child = kthread_create(entry, arg, params);
+    if let Err(error) = activate_task_on_cpu(&child, cpu_id, now_ns_public()) {
+        abort_new_task(&child);
+        return Err(error);
+    }
+    Ok(child)
 }
 
 /// 内核线程的退出点：标记 Zombie、让出 CPU。控制流不返回。

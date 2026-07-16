@@ -78,6 +78,24 @@ static OWNED_RESOURCE_TRACE: AtomicU64 = AtomicU64::new(0);
 static OWNED_RESOURCE_FAILURE_MODE: AtomicU64 = AtomicU64::new(0);
 
 #[ktest]
+fn provider_worker_reconcile_selects_only_missing_supported_cpus() {
+    assert_eq!(
+        super::executor::missing_provider_worker_mask(0b1011, 0b0011),
+        0b1000
+    );
+    assert_eq!(
+        super::executor::missing_provider_worker_mask(0b0101, 0b1111),
+        0
+    );
+    if sched::NR_CPUS < u64::BITS as usize {
+        assert_eq!(
+            super::executor::missing_provider_worker_mask(u64::MAX, 0),
+            (1u64 << sched::NR_CPUS) - 1
+        );
+    }
+}
+
+#[ktest]
 fn elm_runtime_namespace_registry_resolves_declared_namespace() {
     assert!(super::api_registry::test_runtime_namespace_roundtrip());
 }
@@ -542,6 +560,8 @@ impl ElmLifecycleExecutor for RecordingLifecycleExecutor {
 
 static TEST_PROVIDER_REVOKES: AtomicUsize = AtomicUsize::new(0);
 static TEST_NATIVE_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+static SMP_NATIVE_FAULT_TEST_STATE: AtomicUsize = AtomicUsize::new(0);
+static SMP_NATIVE_FAULT_TEST_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 unsafe extern "C" fn test_native_entry_ok(frame: *mut ElmNativeEntryFrameV1) -> i32 {
     if frame.is_null() {
@@ -623,6 +643,25 @@ unsafe extern "C" fn test_native_entry_nested_fault(frame: *mut ElmNativeEntryFr
     }
     // 安全性：调用方已经通过原生调用门建立受控恢复边界。
     unsafe { test_native_nested_fault_middle() }
+}
+
+unsafe extern "C" fn test_secondary_cpu_native_fault(_arg: usize) -> ! {
+    SMP_NATIVE_FAULT_TEST_STATE.store(10, Ordering::Release);
+    let cell = ElmId(0x7003);
+    let result = super::native::test_call_native_entry(
+        test_native_entry_nested_fault as usize,
+        cell,
+        Some(ELM_MGR_ID),
+        Generation(3),
+        ElmState::Active,
+    );
+    let valid = result.is_err()
+        && general::elm_guard::last_fault_snapshot().is_some_and(|snapshot| {
+            SMP_NATIVE_FAULT_TEST_CPU.store(snapshot.cpu_id as usize, Ordering::Release);
+            snapshot.cell == cell.0 && snapshot.reason == general::elm_guard::ELM_GUARD_ABORT_TRAP
+        });
+    SMP_NATIVE_FAULT_TEST_STATE.store(if valid { 1 } else { 2 }, Ordering::Release);
+    sched::kthread_finish(sched::ExitCode(0));
 }
 
 fn test_revoke_provider_invoke(frame: ElmCallFrame) -> ElmReplyFrame {
@@ -3971,6 +4010,78 @@ fn elm_native_nested_fault_uses_controlled_recovery_exit() {
     assert_ne!(snapshot.pc, snapshot.return_pc);
     assert_ne!(snapshot.return_sp, 0);
     assert_eq!(snapshot.return_sp & 0xf, 0);
+}
+
+#[ktest]
+fn elm_native_fault_recovers_on_secondary_cpu() {
+    if sched::active_cpu_mask().count_ones() < 2 {
+        return;
+    }
+    SMP_NATIVE_FAULT_TEST_STATE.store(0, Ordering::Release);
+    SMP_NATIVE_FAULT_TEST_CPU.store(usize::MAX, Ordering::Release);
+    #[cfg(target_arch = "loongarch64")]
+    // Safety: 这里只读取当前 CPU 的 CRMD.IE，不修改中断状态。
+    let interrupts_enabled_before =
+        unsafe { arch::LoongArch64InterruptOps::is_interrupt_enabled() };
+    #[cfg(target_arch = "loongarch64")]
+    // BSP 在启动用户态前保持关中断。测试等待 AP 修改共享映射时必须临时响应 IPI，
+    // 否则 CPU 1 发出的 TLB shootdown 无法获得 CPU 0 的确认。
+    // Safety: 保存和开启操作只影响当前 CPU，原状态会在等待结束后恢复。
+    let interrupt_state = unsafe {
+        let state = arch::LoongArch64InterruptOps::save_interrupt_state();
+        arch::LoongArch64InterruptOps::enable_interrupts();
+        state
+    };
+    let task = sched::kthread_spawn_on_cpu(
+        test_secondary_cpu_native_fault,
+        0,
+        sched::SchedParams {
+            nice: 0,
+            slice_ns: 0,
+        },
+        1,
+    )
+    .expect("无法在辅助 CPU 启动 ELM fault 测试线程");
+
+    let deadline = sched::now_ns_public().saturating_add(2_000_000_000);
+    while matches!(SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire), 0 | 10)
+        && sched::now_ns_public() < deadline
+    {
+        core::hint::spin_loop();
+    }
+    let cleanup_deadline = sched::now_ns_public().saturating_add(1_000_000_000);
+    while (task.state() != sched::TaskState::Dead
+        || sched::current_task_on(1).is_some_and(|current| Arc::ptr_eq(&current, &task)))
+        && sched::now_ns_public() < cleanup_deadline
+    {
+        core::hint::spin_loop();
+    }
+    #[cfg(target_arch = "loongarch64")]
+    // Safety: 恢复值来自同一 CPU 上成对调用的 save_interrupt_state。
+    unsafe {
+        arch::LoongArch64InterruptOps::restore_interrupt_state(interrupt_state);
+    }
+    #[cfg(target_arch = "loongarch64")]
+    assert_eq!(
+        // Safety: 这里只读取当前 CPU 的 CRMD.IE，不修改中断状态。
+        unsafe { arch::LoongArch64InterruptOps::is_interrupt_enabled() },
+        interrupts_enabled_before
+    );
+    if SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire) != 1 {
+        log::error!(
+            "[elm][test] AP native fault timeout: state={} task_state={:?} placement={:?} on_rq={} current_cpu={} cpu1_current={:?}",
+            SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire),
+            task.state(),
+            task.placement(),
+            task.sched.on_rq(),
+            task.current_cpu(),
+            sched::current_task_on(1).map(|current| current.pid_root()),
+        );
+    }
+    assert_eq!(task.state(), sched::TaskState::Dead);
+    assert!(sched::current_task_on(1).is_none_or(|current| !Arc::ptr_eq(&current, &task)));
+    assert_eq!(SMP_NATIVE_FAULT_TEST_STATE.load(Ordering::Acquire), 1);
+    assert_eq!(SMP_NATIVE_FAULT_TEST_CPU.load(Ordering::Acquire), 1);
 }
 
 #[ktest]

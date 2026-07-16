@@ -1539,6 +1539,7 @@ enum ElmSysfsSlot {
     Executions,
     OwnedResources,
     ResourceAccounting,
+    Workers,
     Diagnostics,
 }
 
@@ -1561,6 +1562,7 @@ impl ElmSysfsSlot {
         Self::Executions,
         Self::OwnedResources,
         Self::ResourceAccounting,
+        Self::Workers,
         Self::Diagnostics,
     ];
 
@@ -1583,6 +1585,7 @@ impl ElmSysfsSlot {
             Self::Executions => 14,
             Self::OwnedResources => 15,
             Self::ResourceAccounting => 16,
+            Self::Workers => 18,
             Self::Diagnostics => 17,
         }
     }
@@ -1606,6 +1609,7 @@ impl ElmSysfsSlot {
             Self::Executions => "executions",
             Self::OwnedResources => "owned-resources",
             Self::ResourceAccounting => "resource-accounting",
+            Self::Workers => "workers",
             Self::Diagnostics => "diagnostics",
         }
     }

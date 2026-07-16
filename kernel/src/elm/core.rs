@@ -10468,12 +10468,15 @@ impl ElmCore {
         let (health_status, health_records) = self.health_records();
         let projection_sources = super::source::projection_source_snapshots().unwrap_or_default();
         let journal_info = super::journal::runtime_info();
+        let worker_info = super::executor::snapshot();
+        let worker_completed = worker_info.completed.iter().copied().sum::<u64>();
+        let worker_waits = worker_info.waits.iter().copied().sum::<u64>();
         let health_failures = health_records
             .iter()
             .filter(|record| record.status != ELM_MGR_STATUS_OK)
             .count();
         let mut out = format!(
-            "ELM Core 诊断\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nmenu_items={}\nnative_exports={}\nnative_imports={}\nprojection_sources={}\nactive_provider_executions={}\ntrust_anchors={}\ntrust_revoked={}\ntrust_epochs={}\ntrust_flags=0x{:x}\njournal_configured={}\njournal_persistent={}\njournal_required={}\njournal_failed={}\njournal_last_error={}\njournal_last_sequence={}\njournal_dropped={}\nlast_event_sequence={}\ndropped_events={}\ndropped_audits={}\ndropped_faults={}\nhealth_status={}\nhealth_records={}\nhealth_failures={}\n",
+            "ELM Core 诊断\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nmenu_items={}\nnative_exports={}\nnative_imports={}\nprojection_sources={}\nactive_provider_executions={}\nworker_online_mask=0x{:x}\nworker_active_mask=0x{:x}\nworker_mask=0x{:x}\nworker_busy_mask=0x{:x}\nworker_wakeups={}\nworker_completed={}\nworker_waits={}\ntrust_anchors={}\ntrust_revoked={}\ntrust_epochs={}\ntrust_flags=0x{:x}\njournal_configured={}\njournal_persistent={}\njournal_required={}\njournal_failed={}\njournal_last_error={}\njournal_last_sequence={}\njournal_dropped={}\nlast_event_sequence={}\ndropped_events={}\ndropped_audits={}\ndropped_faults={}\nhealth_status={}\nhealth_records={}\nhealth_failures={}\n",
             self.cells.len(),
             self.ports.len(),
             self.providers.len(),
@@ -10487,6 +10490,13 @@ impl ElmCore {
                 .saturating_add(self.kernel_symbol_imports.len()),
             projection_sources.len(),
             self.active_provider_executions.len(),
+            worker_info.online_mask,
+            worker_info.active_mask,
+            worker_info.worker_mask,
+            worker_info.busy_mask,
+            worker_info.wakeups,
+            worker_completed,
+            worker_waits,
             self.trust_store.anchors().len(),
             self.trust_store.revoked().len(),
             self.trust_store.accepted_epochs().len(),
@@ -10506,6 +10516,23 @@ impl ElmCore {
             health_records.len(),
             health_failures,
         );
+        out.push_str("[workers]\n");
+        for cpu_id in 0..sched::NR_CPUS {
+            let bit = 1u64 << cpu_id;
+            out.push_str(
+                format!(
+                    "worker cpu={} online={} active={} started={} busy={} completed={} waits={}\n",
+                    cpu_id,
+                    u32::from(worker_info.online_mask & bit != 0),
+                    u32::from(worker_info.active_mask & bit != 0),
+                    u32::from(worker_info.worker_mask & bit != 0),
+                    u32::from(worker_info.busy_mask & bit != 0),
+                    worker_info.completed[cpu_id],
+                    worker_info.waits[cpu_id],
+                )
+                .as_str(),
+            );
+        }
         out.push_str("[cells]\n");
         for cell in &self.cells {
             out.push_str(
@@ -10737,6 +10764,7 @@ impl ElmCore {
             "executions" => self.sysfs_executions_text(),
             "owned-resources" => self.sysfs_owned_resources_text(),
             "resource-accounting" | "accounting" => self.sysfs_resource_accounting_text(),
+            "workers" => self.sysfs_workers_text(),
             "diagnostics" => String::from_utf8_lossy(&self.debug_dump_bytes()).into_owned(),
             "native-capabilities" | "native" => self.sysfs_native_capabilities_text(),
             "todo" | "todo-registry" => self.sysfs_todo_text(),
@@ -10746,8 +10774,9 @@ impl ElmCore {
 
     fn sysfs_core_text(&self) -> String {
         let (health_status, health_records) = self.health_records();
+        let worker_info = super::executor::snapshot();
         format!(
-            "name=elm-mgr\ninitialized={}\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nsubscriptions={}\nmenu_items={}\napi_records={}\nnative_exports={}\nnative_imports={}\nlast_event_sequence={}\nhealth_status={}\nhealth_records={}\n",
+            "name=elm-mgr\ninitialized={}\ncells={}\nports={}\nproviders={}\nbindings={}\nleases={}\nruntime_ports={}\nsubscriptions={}\nmenu_items={}\napi_records={}\nnative_exports={}\nnative_imports={}\nonline_cpu_mask=0x{:x}\nactive_cpu_mask=0x{:x}\nworker_mask=0x{:x}\nworker_busy_mask=0x{:x}\nlast_event_sequence={}\nhealth_status={}\nhealth_records={}\n",
             u32::from(self.initialized),
             self.cells.len(),
             self.ports.len(),
@@ -10762,10 +10791,43 @@ impl ElmCore {
             self.native_imports
                 .len()
                 .saturating_add(self.kernel_symbol_imports.len()),
+            worker_info.online_mask,
+            worker_info.active_mask,
+            worker_info.worker_mask,
+            worker_info.busy_mask,
             self.last_event_sequence(),
             health_status,
             health_records.len(),
         )
+    }
+
+    fn sysfs_workers_text(&self) -> String {
+        let snapshot = super::executor::snapshot();
+        let mut out = format!(
+            "online_mask=0x{:x}\nactive_mask=0x{:x}\nworker_mask=0x{:x}\nbusy_mask=0x{:x}\nwakeups={}\n",
+            snapshot.online_mask,
+            snapshot.active_mask,
+            snapshot.worker_mask,
+            snapshot.busy_mask,
+            snapshot.wakeups,
+        );
+        for cpu_id in 0..sched::NR_CPUS {
+            let bit = 1u64 << cpu_id;
+            out.push_str(
+                format!(
+                    "cpu={} online={} active={} started={} busy={} completed={} waits={}\n",
+                    cpu_id,
+                    u32::from(snapshot.online_mask & bit != 0),
+                    u32::from(snapshot.active_mask & bit != 0),
+                    u32::from(snapshot.worker_mask & bit != 0),
+                    u32::from(snapshot.busy_mask & bit != 0),
+                    snapshot.completed[cpu_id],
+                    snapshot.waits[cpu_id],
+                )
+                .as_str(),
+            );
+        }
+        out
     }
 
     fn sysfs_policy_text(&self) -> String {

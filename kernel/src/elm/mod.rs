@@ -32,6 +32,19 @@ pub(crate) mod syscall;
 mod tests;
 mod trust_config;
 
+const _: () = assert!(
+    elm_model::ELM_CONTEXT_MAX_CPUS >= sched::NR_CPUS,
+    "ELM 执行上下文容量小于调度器 CPU 容量"
+);
+const _: () = assert!(
+    sched::NR_CPUS <= u64::BITS as usize,
+    "ELM worker 位图无法覆盖调度器 CPU 容量"
+);
+const _: () = assert!(
+    allocator::MAX_CPUS >= sched::NR_CPUS,
+    "分配器 CPU 本地槽位少于 ELM 可运行 CPU 数"
+);
+
 pub(crate) fn kernel_interface_profile_hash() -> Result<[u8; 32], &'static str> {
     kernel_symbols::catalog_profile_hash().map_err(|_| "内核符号目录无效")
 }
@@ -133,10 +146,37 @@ pub(crate) fn init_builtin_mgr() {
                 );
             }
             general::vfs::sysfs::register_elm_renderer(render_sysfs_file);
-            executor::start_provider_worker();
+            let _ = executor::reconcile_provider_workers();
         }
         Err(err) => log::error!("[elm] init builtin elm-mgr failed: {:?}", err),
     }
+}
+
+/// 在架构完成 AP 启动后，使 ELM 后台执行器与调度器 active CPU 集合保持一致。
+pub(crate) fn synchronize_smp_runtime() {
+    if !core::with_core(|core| core.initialized()) {
+        log::warning!("[elm][executor] elm-mgr 未初始化，跳过 SMP worker 同步");
+        return;
+    }
+    let started = executor::reconcile_provider_workers();
+    let snapshot = executor::snapshot();
+    let missing = snapshot.active_mask & !snapshot.worker_mask;
+    if missing != 0 {
+        log::error!(
+            "[elm][executor] SMP worker 集合不完整: active={:#x} workers={:#x} missing={:#x}",
+            snapshot.active_mask,
+            snapshot.worker_mask,
+            missing
+        );
+        return;
+    }
+    log::info!(
+        "[elm][executor] SMP runtime synchronized: online={:#x} active={:#x} workers={:#x} added={}",
+        snapshot.online_mask,
+        snapshot.active_mask,
+        snapshot.worker_mask,
+        started
+    );
 }
 
 pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String> {

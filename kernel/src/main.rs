@@ -94,6 +94,7 @@ fn main() -> ! {
         ::sched::online_cpu_mask(),
         ::sched::active_cpu_mask(),
     );
+    elm::synchronize_smp_runtime();
     /*
     #[cfg(debug_assertions)]
     sched::smoketest();

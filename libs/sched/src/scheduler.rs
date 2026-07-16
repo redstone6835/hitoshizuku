@@ -458,11 +458,13 @@ pub fn online_cpu_mask() -> u64 {
     SCHEDULER.online_set().bits()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.active_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn active_cpu_mask() -> u64 {
     SCHEDULER.active_set().bits()
 }
 
-pub const fn supported_cpu_mask() -> u64 {
+#[kernel_symbols::export(name = "sched.scheduler.supported_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
+pub fn supported_cpu_mask() -> u64 {
     CpuMask::SUPPORTED.bits()
 }
 
@@ -535,6 +537,7 @@ pub(crate) fn task_runqueue_cpu(task: &Task) -> Option<CpuId> {
     task_runqueue_cpu_on(&SCHEDULER, task)
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.current_sched_domain_id", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
     let cpu = CpuId::new(cpu_id)?;
     sched_topology()
@@ -543,6 +546,7 @@ pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
 }
 
 /// 刷新并返回指定调度域的负载统计。
+#[kernel_symbols::export(name = "sched.scheduler.sched_domain_stats", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn sched_domain_stats(domain_id: usize) -> Option<crate::SchedDomainStats> {
     refresh_domain_stats();
     SCHEDULER.domain_stats(domain_id)
@@ -619,10 +623,12 @@ pub fn is_cpu_online(cpu_id: usize) -> bool {
     CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.online_set().contains(cpu))
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.is_cpu_active", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_cpu_active(cpu_id: usize) -> bool {
     CpuId::new(cpu_id).is_some_and(|cpu| SCHEDULER.active_set().contains(cpu))
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.mark_cpu_online", contract = "kernel.sched.cpu-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
@@ -632,6 +638,7 @@ pub fn mark_cpu_online(cpu_id: usize) -> Result<(), errno::Errno> {
 
 /// TODO(smp): AP 只能在 current 和 idle 都安装完成后激活；底层通常应通过
 /// [`cpu_start_scheduling`] 完成这一步，而不是提前直接调用本函数。
+#[kernel_symbols::export(name = "sched.scheduler.activate_cpu", contract = "kernel.sched.cpu-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn activate_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
@@ -678,6 +685,7 @@ struct CpuOfflineTask {
 }
 
 /// 将一个非启动 CPU 下线并迁移其排队任务。
+#[kernel_symbols::export(name = "sched.scheduler.offline_cpu", contract = "kernel.sched.cpu-lifecycle@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn offline_cpu(cpu_id: usize) -> Result<(), errno::Errno> {
     let _guard = CPU_HOTPLUG_LOCK.lock();
     offline_cpu_with_scheduler(&SCHEDULER, cpu_id, now_ns_internal())
@@ -998,6 +1006,40 @@ pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
     let cpu_id = enqueue_task_locked(task, now_ns, true);
     notify_resched(cpu_id);
     cpu_id
+}
+
+/// 将尚未运行的任务原子绑定并首次加入指定活动 CPU。
+///
+/// active 状态检查、亲和性安装和入队受同一热插拔锁保护，避免 CPU 在检查后、
+/// 任务真正进入 runqueue 前被下线。该接口只供创建路径使用。
+pub(crate) fn activate_task_on_cpu(
+    task: &Arc<Task>,
+    cpu_id: usize,
+    now_ns: u64,
+) -> Result<usize, errno::Errno> {
+    if task.arch_context().is_none()
+        || !matches!(
+            task.state(),
+            TaskState::New | TaskState::Runnable | TaskState::Sleeping
+        )
+    {
+        return Err(errno::Errno::EINVAL);
+    }
+
+    let selected = {
+        let _guard = CPU_HOTPLUG_LOCK.lock();
+        let cpu = CpuId::new(cpu_id).ok_or(errno::Errno::EINVAL)?;
+        if !SCHEDULER.active_set().contains(cpu) {
+            return Err(errno::Errno::EINVAL);
+        }
+        task.set_cpu_affinity(cpu.mask().bits());
+        task.set_current_cpu(cpu_id);
+        let selected = enqueue_task_on_scheduler(&SCHEDULER, Arc::clone(task), now_ns, false, true);
+        debug_assert_eq!(selected, cpu_id);
+        selected
+    };
+    notify_resched(selected);
+    Ok(selected)
 }
 
 /// futex 唤醒热路径入口：入队后让下一次本地调度优先尝试运行该任务。
