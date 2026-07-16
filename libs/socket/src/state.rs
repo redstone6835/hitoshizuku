@@ -19,7 +19,7 @@ use crate::types::{
     SendOptions, SharedHandle, SocketError, SocketLinger, SocketShutdown, SocketTimeval,
     SocketType, UnixAddress,
 };
-use crate::wait::wake_task;
+use crate::wait::{SocketReadinessObserver, SocketWaitQueue, wake_task};
 
 /// Stream 单次发送缓冲区总容量(64 KiB)
 pub(crate) const STREAM_BUFFER_LIMIT: usize = 64 * 1024;
@@ -75,8 +75,8 @@ impl Socket {
         let kind_impl = match kind {
             SocketType::Stream => SocketKind::Stream(StreamSocket {
                 state: Spinlock::new(StreamState::Init),
-                accept_wait: sched::WaitQueue::new(),
-                connect_wait: sched::WaitQueue::new(),
+                accept_wait: SocketWaitQueue::new(),
+                connect_wait: SocketWaitQueue::new(),
             }),
             SocketType::Datagram => SocketKind::Datagram(DatagramSocket {
                 state: Spinlock::new(DatagramState {
@@ -88,13 +88,13 @@ impl Socket {
                     read_shutdown: false,
                     write_shutdown: false,
                 }),
-                read_wait: sched::WaitQueue::new(),
-                write_wait: sched::WaitQueue::new(),
+                read_wait: SocketWaitQueue::new(),
+                write_wait: SocketWaitQueue::new(),
             }),
             SocketType::Sequenced => SocketKind::Sequenced(SequencedSocket {
                 state: Spinlock::new(SequencedState::Init),
-                accept_wait: sched::WaitQueue::new(),
-                connect_wait: sched::WaitQueue::new(),
+                accept_wait: SocketWaitQueue::new(),
+                connect_wait: SocketWaitQueue::new(),
             }),
             SocketType::Raw => return Err(SocketError::InvalidInput),
         };
@@ -108,6 +108,7 @@ impl Socket {
                 closed: Spinlock::new(false),
                 last_error: Spinlock::new(None),
                 options: Spinlock::new(options),
+                readiness_observer: Spinlock::new(None),
                 kind_impl,
             }),
         };
@@ -349,6 +350,39 @@ impl Socket {
         }
     }
 
+    pub fn set_readiness_observer(&self, observer: Weak<dyn SocketReadinessObserver>) {
+        *self.inner.readiness_observer.lock() = Some(observer);
+        self.attach_readiness_observer();
+    }
+
+    pub(crate) fn attach_readiness_observer(&self) {
+        let Some(observer) = self.inner.readiness_observer.lock().as_ref().cloned() else {
+            return;
+        };
+        match &self.inner.kind_impl {
+            SocketKind::Stream(stream) => {
+                stream.accept_wait.set_observer(observer.clone());
+                stream.connect_wait.set_observer(observer.clone());
+                if let StreamState::Connected(connection) = &*stream.state.lock() {
+                    connection.rx.read_wait.set_observer(observer.clone());
+                    connection.tx.write_wait.set_observer(observer);
+                }
+            }
+            SocketKind::Datagram(datagram) => {
+                datagram.read_wait.set_observer(observer.clone());
+                datagram.write_wait.set_observer(observer);
+            }
+            SocketKind::Sequenced(sequence) => {
+                sequence.accept_wait.set_observer(observer.clone());
+                sequence.connect_wait.set_observer(observer.clone());
+                if let SequencedState::Connected(connection) = &*sequence.state.lock() {
+                    connection.rx.read_wait.set_observer(observer.clone());
+                    connection.tx.write_wait.set_observer(observer);
+                }
+            }
+        }
+    }
+
     pub fn register_waiter(&self, task: &Arc<Task>, interest: Readiness) -> bool {
         match &self.inner.kind_impl {
             SocketKind::Stream(stream) => io::register_stream_waiter(stream, task, interest),
@@ -583,6 +617,7 @@ pub(crate) struct SocketInner {
     /// 套接字选项
     pub(crate) options: Spinlock<SocketOptions>,
     /// 按类型分发的具体实现
+    pub(crate) readiness_observer: Spinlock<Option<Weak<dyn SocketReadinessObserver>>>,
     pub(crate) kind_impl: SocketKind,
 }
 
@@ -596,8 +631,8 @@ pub(crate) enum SocketKind {
 /// Stream 套接字:状态机 + accept/connect 等待队列。
 pub(crate) struct StreamSocket {
     pub(crate) state: Spinlock<StreamState>,
-    pub(crate) accept_wait: sched::WaitQueue,
-    pub(crate) connect_wait: sched::WaitQueue,
+    pub(crate) accept_wait: SocketWaitQueue,
+    pub(crate) connect_wait: SocketWaitQueue,
 }
 
 /// Stream 套接字状态机。
@@ -662,8 +697,8 @@ pub(crate) struct ListenerState<T> {
 /// read_wait 在数据到达时唤醒读者,write_wait 在空间释放时唤醒写者。
 pub(crate) struct StreamQueue {
     pub(crate) state: Spinlock<StreamQueueState>,
-    pub(crate) read_wait: sched::WaitQueue,
-    pub(crate) write_wait: sched::WaitQueue,
+    pub(crate) read_wait: SocketWaitQueue,
+    pub(crate) write_wait: SocketWaitQueue,
 }
 
 impl StreamQueue {
@@ -676,8 +711,8 @@ impl StreamQueue {
                 write_closed: false,
                 read_closed: false,
             }),
-            read_wait: sched::WaitQueue::new(),
-            write_wait: sched::WaitQueue::new(),
+            read_wait: SocketWaitQueue::new(),
+            write_wait: SocketWaitQueue::new(),
         }
     }
 }
@@ -714,8 +749,8 @@ impl StreamChunk {
 /// Datagram 套接字:无连接消息收发。
 pub(crate) struct DatagramSocket {
     pub(crate) state: Spinlock<DatagramState>,
-    pub(crate) read_wait: sched::WaitQueue,
-    pub(crate) write_wait: sched::WaitQueue,
+    pub(crate) read_wait: SocketWaitQueue,
+    pub(crate) write_wait: SocketWaitQueue,
 }
 
 /// Datagram 状态:消息队列 + 流控。
@@ -755,8 +790,8 @@ impl DatagramPeer {
 /// Sequenced 套接字:面向连接的消息报文。
 pub(crate) struct SequencedSocket {
     pub(crate) state: Spinlock<SequencedState>,
-    pub(crate) accept_wait: sched::WaitQueue,
-    pub(crate) connect_wait: sched::WaitQueue,
+    pub(crate) accept_wait: SocketWaitQueue,
+    pub(crate) connect_wait: SocketWaitQueue,
 }
 
 /// Sequenced 套接字状态机。
@@ -809,8 +844,8 @@ impl SeqpacketConnectedState {
 /// Sequenced/Datagram 消息队列:保留消息边界。
 pub(crate) struct PacketQueue {
     pub(crate) state: Spinlock<PacketQueueState>,
-    pub(crate) read_wait: sched::WaitQueue,
-    pub(crate) write_wait: sched::WaitQueue,
+    pub(crate) read_wait: SocketWaitQueue,
+    pub(crate) write_wait: SocketWaitQueue,
 }
 
 impl PacketQueue {
@@ -823,8 +858,8 @@ impl PacketQueue {
                 write_closed: false,
                 read_closed: false,
             }),
-            read_wait: sched::WaitQueue::new(),
-            write_wait: sched::WaitQueue::new(),
+            read_wait: SocketWaitQueue::new(),
+            write_wait: SocketWaitQueue::new(),
         }
     }
 }

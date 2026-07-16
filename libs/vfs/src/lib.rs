@@ -29,6 +29,7 @@ pub mod netlink_socket;
 pub mod operation;
 pub mod path;
 pub mod pipe;
+pub mod poll_source;
 pub mod record_lock;
 pub mod signalfd;
 pub mod socket;

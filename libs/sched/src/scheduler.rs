@@ -137,6 +137,29 @@ struct TimedSleeper {
 
 static TIMED_SLEEPERS: Spinlock<Vec<TimedSleeper>> = Spinlock::new(Vec::new());
 
+/// 由调度定时器在指定 deadline 到期后定向通知的对象。
+pub trait DeadlineObserver: Send + Sync {
+    fn deadline_expired(&self, registration: u64, now_ns: u64) -> Option<u64>;
+}
+
+struct DeadlineEntry {
+    id: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+    firing: bool,
+}
+
+struct DeadlineObservers {
+    next_id: u64,
+    entries: Vec<DeadlineEntry>,
+}
+
+static DEADLINE_OBSERVERS: Spinlock<DeadlineObservers> = Spinlock::new(DeadlineObservers {
+    next_id: 1,
+    entries: Vec::new(),
+});
+static HAS_DEADLINE_OBSERVERS: AtomicBool = AtomicBool::new(false);
+
 /// POSIX `ITIMER_REAL` 的纳秒级内核表示。
 ///
 /// `value_ns == 0` 表示当前未 armed；`interval_ns != 0` 表示到期后按该周期重装。
@@ -775,6 +798,92 @@ pub fn cancel_sleep_deadline(task: &Arc<Task>) {
     });
 }
 
+/// 预留一个不重复的 deadline 注册号，供调用方在入队前发布身份。
+pub fn reserve_deadline_observer_id() -> u64 {
+    let mut observers = DEADLINE_OBSERVERS.lock();
+    let id = observers.next_id;
+    observers.next_id = observers.next_id.wrapping_add(1).max(1);
+    assert!(id != 0, "deadline observer id 已耗尽");
+    id
+}
+
+/// 将 observer 按 deadline 放入调度定时器；deadline 已过期时返回 `false`。
+pub fn register_deadline_observer(
+    registration: u64,
+    deadline_ns: u64,
+    observer: Weak<dyn DeadlineObserver>,
+) -> bool {
+    if now_ns_internal() >= deadline_ns {
+        return false;
+    }
+    let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.push(DeadlineEntry {
+        id: registration,
+        deadline_ns,
+        observer,
+        firing: false,
+    });
+    observers
+        .entries
+        .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
+    HAS_DEADLINE_OBSERVERS.store(true, Ordering::Release);
+    true
+}
+
+/// 取消尚未到期的 observer 注册。
+pub fn cancel_deadline_observer(registration: u64) {
+    let mut observers = DEADLINE_OBSERVERS.lock();
+    observers.entries.retain(|entry| entry.id != registration);
+    if observers.entries.is_empty() {
+        HAS_DEADLINE_OBSERVERS.store(false, Ordering::Release);
+    }
+}
+
+fn fire_expired_deadline_observers(now_ns: u64) {
+    if !HAS_DEADLINE_OBSERVERS.load(Ordering::Acquire) {
+        return;
+    }
+    loop {
+        let expired = {
+            let mut observers = DEADLINE_OBSERVERS.lock();
+            let Some(entry) = observers.entries.first_mut() else {
+                HAS_DEADLINE_OBSERVERS.store(false, Ordering::Release);
+                return;
+            };
+            if entry.deadline_ns > now_ns || entry.firing {
+                return;
+            }
+            entry.firing = true;
+            (entry.id, entry.observer.clone())
+        };
+        let next = expired
+            .1
+            .upgrade()
+            .and_then(|observer| observer.deadline_expired(expired.0, now_ns));
+        let mut observers = DEADLINE_OBSERVERS.lock();
+        let Some(index) = observers
+            .entries
+            .iter()
+            .position(|entry| entry.id == expired.0)
+        else {
+            continue;
+        };
+        if let Some(deadline_ns) = next.filter(|deadline| *deadline > now_ns) {
+            let entry = &mut observers.entries[index];
+            entry.deadline_ns = deadline_ns;
+            entry.firing = false;
+            observers
+                .entries
+                .sort_unstable_by_key(|entry| (entry.deadline_ns, entry.id));
+        } else {
+            observers.entries.remove(index);
+            if observers.entries.is_empty() {
+                HAS_DEADLINE_OBSERVERS.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
 /// 查询当前线程组的 `ITIMER_REAL`。
 pub fn get_realtime_itimer(task: &Arc<Task>) -> RealtimeItimerSpec {
     let tg = task.thread_group();
@@ -1230,6 +1339,7 @@ pub fn on_timer_tick(now_ns: u64) {
         return;
     }
     wake_expired_sleepers(now_ns);
+    fire_expired_deadline_observers(now_ns);
     fire_expired_realtime_itimers(now_ns);
     let cpu_id = cpu();
     if RUNQUEUES[cpu_id].tick(now_ns) {
@@ -1394,4 +1504,38 @@ fn stopped_signal_is_fatal(target: &Arc<Task>, info: &SigInfo) -> bool {
         default_action(info.sig),
         DefaultAction::Term | DefaultAction::Core
     )
+}
+
+#[cfg(test)]
+mod deadline_observer_tests {
+    use super::*;
+    use core::sync::atomic::AtomicU64;
+
+    struct RearmObserver(AtomicU64);
+
+    impl DeadlineObserver for RearmObserver {
+        fn deadline_expired(&self, _registration: u64, now_ns: u64) -> Option<u64> {
+            let calls = self.0.fetch_add(1, Ordering::AcqRel) + 1;
+            (calls == 1).then_some(now_ns.saturating_add(10))
+        }
+    }
+
+    #[test]
+    fn periodic_deadline_reuses_registration_until_observer_stops() {
+        let observer = Arc::new(RearmObserver(AtomicU64::new(0)));
+        let subscriber: Arc<dyn DeadlineObserver> = observer.clone();
+        let registration = reserve_deadline_observer_id();
+        let deadline = u64::MAX - 100;
+        assert!(register_deadline_observer(
+            registration,
+            deadline,
+            Arc::downgrade(&subscriber),
+        ));
+        fire_expired_deadline_observers(deadline - 1);
+        assert_eq!(observer.0.load(Ordering::Acquire), 0);
+        fire_expired_deadline_observers(deadline);
+        assert_eq!(observer.0.load(Ordering::Acquire), 1);
+        fire_expired_deadline_observers(deadline + 10);
+        assert_eq!(observer.0.load(Ordering::Acquire), 2);
+    }
 }

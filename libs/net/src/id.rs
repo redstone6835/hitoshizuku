@@ -30,3 +30,10 @@ pub struct ShardId(pub u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct FlowId(pub u32);
+
+/// 一次启动内永不复用的 socket 身份。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SocketId {
+    pub boot_nonce: u64,
+    pub counter: u64,
+}

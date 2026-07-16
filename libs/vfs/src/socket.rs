@@ -20,6 +20,7 @@ use crate::net_socket::{
     InetRecvOptions, InetRecvResult, InetSendOptions, NetSocketFileOps, SocketOptions,
 };
 use crate::operation;
+use crate::poll_source::PollSource;
 use crate::vfs::VfsContext;
 use crate::vfs::cred::Credentials;
 use crate::vfs::dentry::Dentry;
@@ -229,65 +230,17 @@ impl SocketHandle for SocketHandleRef {
 
 struct SocketFileOps {
     socket: CoreSocket,
+    poll_observer: Arc<UnixPollObserver>,
 }
 
-impl SocketFileOps {
-    fn new(socket: CoreSocket) -> Self {
-        Self { socket }
-    }
-
-    fn socket(&self) -> CoreSocket {
-        self.socket.clone()
-    }
+struct UnixPollObserver {
+    socket: CoreSocket,
+    source: PollSource,
 }
 
-impl FileOps for SocketFileOps {
-    fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        self.socket
-            .receive(
-                buf,
-                ReceiveOptions {
-                    nonblocking: true,
-                    peek: false,
-                    wait_all: false,
-                    deadline_ns: None,
-                },
-            )
-            .map(|result| result.length)
-            .map_err(map_socket_io_error)
-    }
-
-    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        self.socket
-            .send(
-                buf,
-                &[],
-                None,
-                SendOptions {
-                    nonblocking: true,
-                    sender_identity: None,
-                    explicit_credentials: false,
-                    end_of_record: false,
-                    deadline_ns: None,
-                },
-            )
-            .map_err(map_socket_io_error)
-    }
-
-    fn readdir(
-        &self,
-        _pos: u64,
-        _sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
-    ) -> VfsResult<u64> {
-        Err(VfsError::NotADirectory)
-    }
-
-    fn sync(&self) -> VfsResult<()> {
-        Ok(())
-    }
-
-    fn poll(&self, interest: PollEvents) -> PollEvents {
-        let ready = self.socket.readiness();
+impl UnixPollObserver {
+    fn readiness(socket: &CoreSocket) -> PollEvents {
+        let ready = socket.readiness();
         let mut events = PollEvents::default();
         if ready.has(Readiness::READABLE) {
             events = events.with(PollEvents::POLLIN);
@@ -304,7 +257,100 @@ impl FileOps for SocketFileOps {
         if ready.has(Readiness::FAULT) {
             events = events.with(PollEvents::POLLERR);
         }
-        events.intersect(interest.with(PollEvents::POLLERR).with(PollEvents::POLLHUP))
+        events
+    }
+
+    fn publish(&self) {
+        let version = self.source.reserve_version();
+        let readiness = Self::readiness(&self.socket);
+        self.source.publish_versioned(readiness, version);
+    }
+}
+
+impl socket::SocketReadinessObserver for UnixPollObserver {
+    fn readiness_changed(&self) {
+        self.publish();
+    }
+}
+
+impl SocketFileOps {
+    fn new(socket: CoreSocket) -> Self {
+        let poll_observer = Arc::new(UnixPollObserver {
+            source: PollSource::new(UnixPollObserver::readiness(&socket)),
+            socket: socket.clone(),
+        });
+        let observer: Arc<dyn socket::SocketReadinessObserver> = poll_observer.clone();
+        socket.set_readiness_observer(Arc::downgrade(&observer));
+        Self {
+            socket,
+            poll_observer,
+        }
+    }
+
+    fn socket(&self) -> CoreSocket {
+        self.socket.clone()
+    }
+}
+
+impl FileOps for SocketFileOps {
+    fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        let result = self
+            .socket
+            .receive(
+                buf,
+                ReceiveOptions {
+                    nonblocking: true,
+                    peek: false,
+                    wait_all: false,
+                    deadline_ns: None,
+                },
+            )
+            .map(|result| result.length)
+            .map_err(map_socket_io_error);
+        self.poll_observer.publish();
+        result
+    }
+
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        let result = self
+            .socket
+            .send(
+                buf,
+                &[],
+                None,
+                SendOptions {
+                    nonblocking: true,
+                    sender_identity: None,
+                    explicit_credentials: false,
+                    end_of_record: false,
+                    deadline_ns: None,
+                },
+            )
+            .map_err(map_socket_io_error);
+        self.poll_observer.publish();
+        result
+    }
+
+    fn readdir(
+        &self,
+        _pos: u64,
+        _sink: &mut dyn FnMut(DirEntry) -> ControlFlow<()>,
+    ) -> VfsResult<u64> {
+        Err(VfsError::NotADirectory)
+    }
+
+    fn sync(&self) -> VfsResult<()> {
+        Ok(())
+    }
+
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        self.poll_observer.publish();
+        self.poll_observer.source.snapshot().0.intersect(
+            interest
+                .with(PollEvents::POLLERR)
+                .with(PollEvents::POLLHUP)
+                .with(PollEvents::POLLRDHUP),
+        )
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
@@ -314,6 +360,10 @@ impl FileOps for SocketFileOps {
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
         self.socket.unregister_waiter(task)
+    }
+
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.poll_observer.source)
     }
 
     fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
@@ -538,12 +588,6 @@ pub fn socket(
         return fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno());
     }
 
-    // 尚未开放 INET fd，必须在解析 type/protocol 前固定失败，避免
-    // 非法组合泄漏 EINVAL/EPROTONOSUPPORT 形成跨阶段可观察差异。
-    if matches!(domain as u16, crate::addr::AF_INET | crate::addr::AF_INET6) {
-        return Err(Errno::EAFNOSUPPORT);
-    }
-
     let (kind, nonblock, cloexec) = parse_type(ty)?;
     let fd_flags = if cloexec {
         FdFlags::CLOEXEC
@@ -553,6 +597,19 @@ pub fn socket(
     let cred = ctx.cred();
 
     match domain as u16 {
+        crate::addr::AF_INET | crate::addr::AF_INET6 => {
+            if kind != SocketType::Datagram {
+                return Err(Errno::Other(93));
+            }
+            let ops = crate::net_socket::create_net_socket(
+                domain as u16,
+                SOCK_DGRAM as u16,
+                protocol as u16,
+                nonblock,
+            )?;
+            let file = new_net_socket_file(ops, Arc::clone(&cred), nonblock);
+            fdt.alloc_fd(file, fd_flags).map_err(|e| e.to_errno())
+        }
         AF_UNIX => {
             if protocol != 0 {
                 return Err(Errno::EOPNOTSUPP);
@@ -703,7 +760,7 @@ pub fn connect(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Resu
     let socket = socket_from_file(&file)?;
     socket.validate_connect_ready().map_err(map_socket_error)?;
     let address = resolve_connect_address(ctx, raw_addr)?;
-    socket
+    let result = socket
         .connect(
             address,
             current_identity(ctx),
@@ -715,7 +772,11 @@ pub fn connect(ctx: &VfsContext, fdt: &FdTable, fd: Fd, raw_addr: &[u8]) -> Resu
                 deadline_ns: None,
             },
         )
-        .map_err(map_socket_error)
+        .map_err(map_socket_error);
+    if let Some(ops) = file.downcast_ops::<SocketFileOps>() {
+        ops.poll_observer.publish();
+    }
+    result
 }
 
 pub fn getsockname(fdt: &FdTable, fd: Fd) -> Result<Vec<u8>, Errno> {
@@ -780,7 +841,7 @@ pub fn send(
         if !control.is_empty() {
             return Err(Errno::ENOPROTOOPT);
         }
-        if (flags & MSG_OOB) != 0 {
+        if (flags & (MSG_OOB | MSG_MORE | MSG_DONTROUTE | MSG_CONFIRM)) != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         return net_ops.sendto(
@@ -801,7 +862,7 @@ pub fn send(
         Some(raw) => Some(resolve_connect_address(ctx, raw)?),
         None => None,
     };
-    socket
+    let result = socket
         .send(
             data,
             &decoded.handles,
@@ -814,7 +875,11 @@ pub fn send(
                 deadline_ns: None,
             },
         )
-        .map_err(map_socket_error)
+        .map_err(map_socket_error);
+    if let Some(ops) = file.downcast_ops::<SocketFileOps>() {
+        ops.poll_observer.publish();
+    }
+    result
 }
 
 pub fn recv(
@@ -915,6 +980,9 @@ pub fn recv(
             },
         )
         .map_err(map_socket_error)?;
+    if let Some(ops) = file.downcast_ops::<SocketFileOps>() {
+        ops.poll_observer.publish();
+    }
     let cloexec = (flags & MSG_CMSG_CLOEXEC) != 0;
     let mut msg_flags = 0usize;
     if result.data_truncated {
@@ -1070,56 +1138,21 @@ fn parse_accept_flags(flags: usize) -> Result<(bool, bool), Errno> {
 // ── AF_INET / AF_INET6 sockopt ──────────────────────────────────────────────
 
 const SOL_IP: i32 = 0;
-const SOL_TCP: i32 = 6;
 const SOL_IPV6: i32 = 41;
-
-const TCP_NODELAY: i32 = 1;
-const TCP_MAXSEG: i32 = 2;
-const TCP_CORK: i32 = 3;
-const TCP_KEEPIDLE: i32 = 4;
-const TCP_KEEPINTVL: i32 = 5;
-const TCP_KEEPCNT: i32 = 6;
-const TCP_INFO: i32 = 11;
-const TCP_CONGESTION: i32 = 13;
-const TCP_DEFER_ACCEPT: i32 = 9;
-const TCP_QUICKACK: i32 = 12;
-const TCP_USER_TIMEOUT: i32 = 18;
-const TCP_FASTOPEN: i32 = 23;
-const TCP_NOTSENT_LOWAT: i32 = 25;
 
 const IP_TOS: i32 = 1;
 const IP_TTL: i32 = 2;
-const IP_HDRINCL: i32 = 3;
-const IP_OPTIONS: i32 = 4;
 const IP_PKTINFO: i32 = 8;
-const IP_RECVERR: i32 = 11;
 const IP_RECVTTL: i32 = 12;
 const IP_RECVTOS: i32 = 13;
-const IP_FREEBIND: i32 = 15;
-const IP_MULTICAST_IF: i32 = 32;
-const IP_MULTICAST_TTL: i32 = 33;
-const IP_MULTICAST_LOOP: i32 = 34;
-const IP_ADD_MEMBERSHIP: i32 = 35;
-const IP_DROP_MEMBERSHIP: i32 = 36;
 
 const IPV6_V6ONLY: i32 = 26;
-const IPV6_UNICAST_HOPS: i32 = 16;
 const IPV6_RECVPKTINFO: i32 = 49;
 const IPV6_PKTINFO: i32 = 50;
 const IPV6_RECVHOPLIMIT: i32 = 51;
 const IPV6_HOPLIMIT: i32 = 52;
-const IPV6_TCLASS: i32 = 67;
-const IPV6_ADD_MEMBERSHIP: i32 = 20;
-const IPV6_DROP_MEMBERSHIP: i32 = 21;
-const IPV6_RECVERR: i32 = 25;
-const IPV6_MULTICAST_HOPS: i32 = 18;
-const IPV6_MULTICAST_IF: i32 = 17;
-const IPV6_MULTICAST_LOOP: i32 = 19;
 
 const SO_TIMESTAMP: i32 = 29;
-const SO_BINDTODEVICE: i32 = 25;
-const SO_MARK: i32 = 36;
-const SO_PRIORITY: i32 = 12;
 const SO_OOBINLINE: i32 = 10;
 
 // ── 选项值解析辅助 ──────────────────────────────────────────────────────────
@@ -1158,28 +1191,21 @@ fn timeval_from_ns(ns: u64) -> [u8; 16] {
 }
 
 fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Result<Vec<u8>, Errno> {
-    if level == SOL_TCP && net_ops.sock_type() != SOCK_STREAM as u16 {
-        return Err(Errno::ENOPROTOOPT);
-    }
     let opts = net_ops.options().lock();
     match level {
         SOL_SOCKET => match optname {
             SO_DOMAIN => Ok((net_ops.family() as i32).to_ne_bytes().to_vec()),
             SO_TYPE => Ok((net_ops.sock_type() as i32).to_ne_bytes().to_vec()),
-            SO_PROTOCOL => Ok(0i32.to_ne_bytes().to_vec()),
+            SO_PROTOCOL => Ok((net_ops.protocol() as i32).to_ne_bytes().to_vec()),
             SO_ERROR => Ok(net_ops.take_last_error_code().to_ne_bytes().to_vec()),
-            SO_SNDBUF => Ok(opts.sndbuf.to_ne_bytes().to_vec()),
-            SO_RCVBUF => Ok(opts.rcvbuf.to_ne_bytes().to_vec()),
-            SO_KEEPALIVE => Ok((opts.keepalive as i32).to_ne_bytes().to_vec()),
-            SO_BROADCAST => Ok((opts.broadcast as i32).to_ne_bytes().to_vec()),
+            SO_SNDBUF => Ok((net_ops.facade().buffer_limits().0 as i32)
+                .to_ne_bytes()
+                .to_vec()),
+            SO_RCVBUF => Ok((net_ops.facade().buffer_limits().1 as i32)
+                .to_ne_bytes()
+                .to_vec()),
             SO_REUSEADDR => Ok((opts.reuseaddr as i32).to_ne_bytes().to_vec()),
             SO_REUSEPORT => Ok((opts.reuseport as i32).to_ne_bytes().to_vec()),
-            SO_LINGER => {
-                let mut buf = [0u8; 8];
-                buf[0..4].copy_from_slice(&(opts.linger_on as i32).to_ne_bytes());
-                buf[4..8].copy_from_slice(&(opts.linger_secs as i32).to_ne_bytes());
-                Ok(buf.to_vec())
-            }
             SO_RCVTIMEO => {
                 let ns = net_ops
                     .recv_timeout_ns()
@@ -1193,73 +1219,22 @@ fn inet_getsockopt(net_ops: &NetSocketFileOps, level: i32, optname: i32) -> Resu
                 Ok(timeval_from_ns(ns).to_vec())
             }
             SO_TIMESTAMP => Ok((opts.timestamp as i32).to_ne_bytes().to_vec()),
-            SO_DONTROUTE => Ok((opts.dontroute as i32).to_ne_bytes().to_vec()),
-            SO_RXQ_OVFL => Ok((opts.rxq_ovfl as i32).to_ne_bytes().to_vec()),
-            SO_MARK => Ok((opts.mark as i32).to_ne_bytes().to_vec()),
-            SO_PRIORITY => Ok(opts.priority.to_ne_bytes().to_vec()),
-            SO_OOBINLINE => Ok((opts.oobinline as i32).to_ne_bytes().to_vec()),
-            SO_BINDTODEVICE => Ok(vec![0u8; 16]), // TODO: 记录并返回绑定设备名，影响路由选择（需多接口支持）
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        SOL_TCP => match optname {
-            TCP_NODELAY => Ok((opts.nodelay as i32).to_ne_bytes().to_vec()),
-            TCP_CORK => Ok((opts.cork as i32).to_ne_bytes().to_vec()), // TODO: TCP_CORK 仅存储未应用，smoltcp 无 cork 模式
-            TCP_MAXSEG => Ok(1460i32.to_ne_bytes().to_vec()), // TODO: 从 smoltcp TCP socket 的 MSS 状态读取
-            TCP_KEEPIDLE => Ok((opts.keepidle as i32).to_ne_bytes().to_vec()),
-            TCP_KEEPINTVL => Ok((opts.keepintvl as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 不支持单独设置 intvl
-            TCP_KEEPCNT => Ok((opts.keepcnt as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 不支持探测次数
-            TCP_INFO => Ok(tcp_info_minimal(net_ops)), // TODO: 仅填最小状态字段，缺少 RTT/cwnd/retrans 等完整 TCP 统计
-            TCP_CONGESTION => Ok(b"cubic\0".to_vec()), // TODO: smoltcp 仅支持 Reno/Cubic 切换，未对接
-            TCP_DEFER_ACCEPT => Ok((opts.defer_accept as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 无 defer accept
-            TCP_QUICKACK => Ok((opts.quickack as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，smoltcp 无 quickack
-            TCP_USER_TIMEOUT => Ok((opts.user_timeout as i32).to_ne_bytes().to_vec()), // TODO: 仅存储，可对接 smoltcp 的 set_timeout
-            TCP_FASTOPEN => Ok(0i32.to_ne_bytes().to_vec()), // TODO: smoltcp 不支持 TFO
-            TCP_NOTSENT_LOWAT => Ok((-1i32).to_ne_bytes().to_vec()), // TODO: smoltcp 不支持低水位通知
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
-            IP_TTL => Ok((opts.ttl as i32).to_ne_bytes().to_vec()),
-            IP_TOS => Ok((opts.tos as i32).to_ne_bytes().to_vec()),
-            IP_MULTICAST_TTL => Ok((opts.mcast_ttl as i32).to_ne_bytes().to_vec()),
-            IP_MULTICAST_LOOP => Ok((opts.mcast_loop as i32).to_ne_bytes().to_vec()),
-            IP_MULTICAST_IF => Ok(vec![0u8; 4]), // TODO: 返回当前组播出接口 index，需要 IGMP 和多接口路由
             IP_PKTINFO => Ok((opts.pktinfo as i32).to_ne_bytes().to_vec()),
-            IP_HDRINCL => Ok((opts.hdrincl as i32).to_ne_bytes().to_vec()),
-            IP_OPTIONS => Ok(Vec::new()), // TODO: 返回当前 IP options（smoltcp 不支持 IP options）
-            IP_RECVERR => Ok((opts.recverr as i32).to_ne_bytes().to_vec()),
             IP_RECVTTL => Ok((opts.recvttl as i32).to_ne_bytes().to_vec()),
             IP_RECVTOS => Ok((opts.recvtos as i32).to_ne_bytes().to_vec()),
-            IP_FREEBIND => Ok((opts.freebind as i32).to_ne_bytes().to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
             IPV6_V6ONLY => Ok((opts.v6only as i32).to_ne_bytes().to_vec()),
-            IPV6_UNICAST_HOPS => Ok((opts.hops_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_RECVPKTINFO => Ok((opts.recv_pktinfo_v6 as i32).to_ne_bytes().to_vec()),
             IPV6_RECVHOPLIMIT => Ok((opts.recv_hoplimit_v6 as i32).to_ne_bytes().to_vec()),
-            IPV6_RECVERR => Ok((opts.recverr_v6 as i32).to_ne_bytes().to_vec()),
-            IPV6_TCLASS => Ok(opts.tclass.to_ne_bytes().to_vec()),
-            IPV6_MULTICAST_HOPS => Ok((opts.mcast_hops_v6 as i32).to_ne_bytes().to_vec()),
-            IPV6_MULTICAST_IF => Ok(0i32.to_ne_bytes().to_vec()), // TODO: 返回当前 IPv6 组播出接口 index
-            IPV6_MULTICAST_LOOP => Ok((opts.mcast_loop as i32).to_ne_bytes().to_vec()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
     }
-}
-
-fn tcp_info_minimal(net_ops: &NetSocketFileOps) -> Vec<u8> {
-    // Linux struct tcp_info 在不同内核版本里持续追加字段。iperf3 只要求
-    // getsockopt(TCP_INFO) 成功，并能读取开头的 state/基本计数；这里返回
-    // 104 字节的旧版基础布局，未实现的统计字段保持 0。
-    const TCP_INFO_MIN_LEN: usize = 104;
-    let mut info = vec![0u8; TCP_INFO_MIN_LEN];
-    let _ = net_ops;
-    info[0] = 7; // TCP_CLOSE；当前不存在可达的 INET fd。
-    // tcpi_snd_mss / tcpi_rcv_mss，避免用户程序把 0 当成异常路径。
-    info[16..20].copy_from_slice(&1460u32.to_ne_bytes());
-    info[20..24].copy_from_slice(&1460u32.to_ne_bytes());
-    info
 }
 
 fn inet_setsockopt(
@@ -1268,36 +1243,15 @@ fn inet_setsockopt(
     optname: i32,
     value: &[u8],
 ) -> Result<(), Errno> {
-    if level == SOL_TCP && net_ops.sock_type() != SOCK_STREAM as u16 {
-        return Err(Errno::ENOPROTOOPT);
-    }
     let mut opts = net_ops.options().lock();
-    let _handle = net_ops.get_handle_for_opts();
     match level {
         SOL_SOCKET => match optname {
-            SO_KEEPALIVE => {
-                opts.keepalive = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            SO_BROADCAST => {
-                opts.broadcast = parse_int_opt(value)? != 0;
-                Ok(())
-            }
             SO_REUSEADDR => {
                 opts.reuseaddr = parse_int_opt(value)? != 0;
                 Ok(())
             }
             SO_REUSEPORT => {
                 opts.reuseport = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            SO_LINGER => {
-                if value.len() >= 8 {
-                    opts.linger_on =
-                        i32::from_ne_bytes([value[0], value[1], value[2], value[3]]) != 0;
-                    opts.linger_secs =
-                        i32::from_ne_bytes([value[4], value[5], value[6], value[7]]) as u32;
-                }
                 Ok(())
             }
             SO_RCVTIMEO => {
@@ -1315,124 +1269,33 @@ fn inet_setsockopt(
                 Ok(())
             }
             SO_SNDBUF => {
-                opts.sndbuf = parse_int_opt(value)?.max(1);
+                let requested = parse_int_opt(value)?.max(0) as usize;
+                net_ops.facade().set_buffer_limits(Some(requested), None);
+                opts.sndbuf = net_ops.facade().buffer_limits().0 as i32;
                 Ok(())
             }
             SO_RCVBUF => {
-                opts.rcvbuf = parse_int_opt(value)?.max(1);
+                let requested = parse_int_opt(value)?.max(0) as usize;
+                net_ops.facade().set_buffer_limits(None, Some(requested));
+                opts.rcvbuf = net_ops.facade().buffer_limits().1 as i32;
                 Ok(())
             }
             SO_TIMESTAMP => {
                 opts.timestamp = parse_int_opt(value)? != 0;
                 Ok(())
             }
-            SO_DONTROUTE => {
-                // 当前路由层还没有“只走直连链路”的独立策略；先保存开关
-                // 并按 no-op 成功返回，避免 netperf/traceroute 把兼容缺口
-                // 当成致命错误。
-                opts.dontroute = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            SO_RXQ_OVFL => {
-                // Linux 用该选项请求在控制消息中报告 socket RX 溢出计数。
-                // 本栈暂未生成 ancillary data，但接受并保存该开关可兼容
-                // netperf 的 enable_enobufs 探测路径。
-                opts.rxq_ovfl = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            SO_MARK => {
-                opts.mark = parse_int_opt(value)? as u32;
-                Ok(())
-            }
-            SO_PRIORITY => {
-                opts.priority = parse_int_opt(value)?;
-                Ok(())
-            }
             SO_OOBINLINE => {
-                opts.oobinline = parse_int_opt(value)? != 0;
-                Ok(())
+                if parse_int_opt(value)? == 0 {
+                    Ok(())
+                } else {
+                    Err(Errno::EOPNOTSUPP)
+                }
             }
-            SO_BINDTODEVICE => Ok(()), // TODO: 记录绑定设备名并影响路由选择（需多接口路由基础设施）
-            _ => Err(Errno::ENOPROTOOPT),
-        },
-        SOL_TCP => match optname {
-            TCP_NODELAY => {
-                opts.nodelay = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            TCP_CORK => {
-                opts.cork = parse_int_opt(value)? != 0;
-                Ok(())
-            } // TODO: 应用到 smoltcp — 需要延迟发送小段，smoltcp 无 cork 模式
-            TCP_KEEPIDLE => {
-                opts.keepidle = parse_int_opt(value)? as u32;
-                Ok(())
-            }
-            TCP_KEEPINTVL => {
-                opts.keepintvl = parse_int_opt(value)? as u32;
-                Ok(())
-            } // TODO: 传播到 smoltcp — 当前仅存储，smoltcp 不支持单独设置探测间隔
-            TCP_KEEPCNT => {
-                opts.keepcnt = parse_int_opt(value)? as u32;
-                Ok(())
-            } // TODO: 传播到 smoltcp — 当前仅存储，smoltcp 不支持探测次数
-            TCP_CONGESTION => Ok(()), // TODO: 对接 smoltcp 拥塞算法切换（仅 Reno/Cubic）
-            TCP_DEFER_ACCEPT => {
-                opts.defer_accept = parse_int_opt(value)? as u32;
-                Ok(())
-            } // TODO: smoltcp 无 defer accept 模式
-            TCP_QUICKACK => {
-                opts.quickack = parse_int_opt(value)? != 0;
-                Ok(())
-            } // TODO: smoltcp 无 quickack 控制
-            TCP_USER_TIMEOUT => {
-                opts.user_timeout = parse_int_opt(value)? as u32;
-                Ok(())
-            } // TODO: 可对接 smoltcp set_timeout()
-            TCP_FASTOPEN => Ok(()),   // TODO: smoltcp 不支持 TFO
-            TCP_NOTSENT_LOWAT => Ok(()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IP => match optname {
-            IP_TTL => {
-                let ttl = parse_int_opt(value)?;
-                if !(1..=255).contains(&ttl) {
-                    return Err(Errno::EINVAL);
-                }
-                opts.ttl = ttl as u8;
-                Ok(())
-            }
-            IP_TOS => {
-                let tos = parse_int_opt(value)?;
-                if !(0..=255).contains(&tos) {
-                    return Err(Errno::EINVAL);
-                }
-                opts.tos = tos as u8;
-                Ok(())
-            }
-            IP_MULTICAST_TTL => {
-                opts.mcast_ttl = parse_int_opt(value)? as u8;
-                Ok(())
-            }
-            IP_MULTICAST_LOOP => {
-                opts.mcast_loop = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            IP_MULTICAST_IF => Ok(()),
-            IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => Err(Errno::EAFNOSUPPORT),
             IP_PKTINFO => {
                 opts.pktinfo = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            IP_HDRINCL => {
-                opts.hdrincl = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            IP_RECVERR => {
-                // Linux 使用该选项把异步网络错误送入 MSG_ERRQUEUE。
-                // 当前栈尚未实现错误队列；先保存开关并返回成功，避免 netperf
-                // 的 enable_enobufs 探测路径因为 ENOPROTOOPT 中断。
-                opts.recverr = parse_int_opt(value)? != 0;
                 Ok(())
             }
             IP_RECVTTL => {
@@ -1443,19 +1306,11 @@ fn inet_setsockopt(
                 opts.recvtos = parse_int_opt(value)? != 0;
                 Ok(())
             }
-            IP_FREEBIND => {
-                opts.freebind = parse_int_opt(value)? != 0;
-                Ok(())
-            }
             _ => Err(Errno::ENOPROTOOPT),
         },
         SOL_IPV6 => match optname {
             IPV6_V6ONLY => {
                 opts.v6only = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            IPV6_UNICAST_HOPS => {
-                opts.hops_v6 = parse_int_opt(value)? as u8;
                 Ok(())
             }
             IPV6_RECVPKTINFO => {
@@ -1466,21 +1321,6 @@ fn inet_setsockopt(
                 opts.recv_hoplimit_v6 = parse_int_opt(value)? != 0;
                 Ok(())
             }
-            IPV6_RECVERR => {
-                // IPv6 error queue 语义同 IP_RECVERR；目前作为兼容开关保存。
-                opts.recverr_v6 = parse_int_opt(value)? != 0;
-                Ok(())
-            }
-            IPV6_TCLASS => {
-                let tclass = parse_int_opt(value)?;
-                if !(-1..=255).contains(&tclass) {
-                    return Err(Errno::EINVAL);
-                }
-                opts.tclass = tclass;
-                Ok(())
-            }
-            IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP => Err(Errno::EAFNOSUPPORT),
-            IPV6_MULTICAST_HOPS | IPV6_MULTICAST_IF | IPV6_MULTICAST_LOOP => Ok(()),
             _ => Err(Errno::ENOPROTOOPT),
         },
         _ => Err(Errno::ENOPROTOOPT),
@@ -1528,10 +1368,6 @@ fn netlink_setsockopt(level: i32, optname: i32, _value: &[u8]) -> Result<(), Err
 fn validate_send_flags(flags: usize) -> Result<(), Errno> {
     let allowed =
         MSG_DONTWAIT | MSG_NOSIGNAL | MSG_EOR | MSG_MORE | MSG_OOB | MSG_DONTROUTE | MSG_CONFIRM;
-    // TODO: 实际处理 MSG_MORE（TCP cork 语义，合并小段后发送）— 需要 smoltcp cork 支持
-    // TODO: 实际处理 MSG_OOB（TCP urgent data）— smoltcp 不支持 urgent pointer
-    // TODO: 实际处理 MSG_DONTROUTE（绕过路由表直接发往链路层）— 单接口场景无意义
-    // TODO: 实际处理 MSG_CONFIRM（确认链路层邻居可达）— smoltcp 内部自动管理 ARP
     if (flags & !allowed) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -1546,8 +1382,6 @@ fn validate_recv_flags(flags: usize) -> Result<(), Errno> {
         | MSG_WAITALL
         | MSG_OOB
         | MSG_ERRQUEUE;
-    // TODO: 实际处理 MSG_OOB（TCP urgent data 接收）— smoltcp 不支持 urgent pointer
-    // TODO: 实际处理 MSG_ERRQUEUE（接收 IP 层错误队列）— smoltcp 无错误队列机制
     if (flags & !allowed) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -2237,5 +2071,42 @@ mod tests {
         let cmsgs = parse_cmsgs(&control);
         assert_eq!(cmsgs.len(), 1);
         assert_eq!(cmsgs[0].1, IP_PKTINFO);
+    }
+
+    #[test]
+    fn unix_socket_poll_source_tracks_peer_io() {
+        let identity = PeerIdentity {
+            process: 1,
+            user: 0,
+            group: 0,
+        };
+        let (left, right) = CoreSocket::pair_unix(SocketType::Stream, identity).unwrap();
+        let left = SocketFileOps::new(left);
+        let right = SocketFileOps::new(right);
+        assert!(
+            left.poll_observer
+                .source
+                .snapshot()
+                .0
+                .has(PollEvents::POLLOUT)
+        );
+        assert_eq!(right.write_at(b"x", 0), Ok(1));
+        assert!(
+            left.poll_observer
+                .source
+                .snapshot()
+                .0
+                .has(PollEvents::POLLIN)
+        );
+        let mut byte = [0u8; 1];
+        assert_eq!(left.read_at(&mut byte, 0), Ok(1));
+        assert!(
+            !left
+                .poll_observer
+                .source
+                .snapshot()
+                .0
+                .has(PollEvents::POLLIN)
+        );
     }
 }

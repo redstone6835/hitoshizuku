@@ -10,4 +10,5 @@ bench = false
 
 [dependencies]
 hashbrown = { version = "0.17.1", default-features = false }
+sched = { path = "../sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }

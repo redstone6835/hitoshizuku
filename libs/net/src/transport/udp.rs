@@ -1,12 +1,14 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 
-use crate::buf::{DropReason, PacketChain};
+use crate::buf::{CompletionToken, DropReason, PacketChain};
 use crate::control::RouteDecision;
 use crate::flow::{DIRTY_INGRESS, FlowKey, FlowTable, flow_hash64, rss_hash};
 use crate::pipeline::{FrontendPacket, transport_checksum};
 use crate::transport::UdpControlError;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr};
+use crate::{SocketFacade, UdpTxLease};
 
 const UDP_RX_DATAGRAMS: usize = 256;
 const IP_PROTOCOL_UDP: u8 = 17;
@@ -70,6 +72,7 @@ struct UdpEndpoint {
     interface: Option<InterfaceId>,
     rx: DatagramRing,
     pending_error: Option<UdpControlError>,
+    facade: Option<Arc<SocketFacade>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,7 +99,18 @@ pub enum UdpBindError {
 
 pub struct UdpIngressError {
     pub reason: DropReason,
-    pub packet: FrontendPacket,
+    pub chain: PacketChain,
+    pub metadata: crate::buf::PacketMetadata,
+}
+
+pub struct PreparedUdpTx {
+    pub payload: UdpTxLease,
+    pub route: RouteDecision,
+    pub destination: Endpoint,
+    pub source_port: u16,
+    pub source_mac: [u8; 6],
+    pub destination_mac: [u8; 6],
+    pub completion: CompletionToken,
 }
 
 pub struct UdpEndpointTable {
@@ -119,6 +133,26 @@ impl UdpEndpointTable {
         local: Endpoint,
         peer: Option<Endpoint>,
         interface: Option<InterfaceId>,
+    ) -> Result<FlowId, UdpBindError> {
+        self.bind_inner(local, peer, interface, None)
+    }
+
+    pub fn bind_facade(
+        &mut self,
+        local: Endpoint,
+        peer: Option<Endpoint>,
+        interface: Option<InterfaceId>,
+        facade: Arc<SocketFacade>,
+    ) -> Result<FlowId, UdpBindError> {
+        self.bind_inner(local, peer, interface, Some(facade))
+    }
+
+    fn bind_inner(
+        &mut self,
+        local: Endpoint,
+        peer: Option<Endpoint>,
+        interface: Option<InterfaceId>,
+        facade: Option<Arc<SocketFacade>>,
     ) -> Result<FlowId, UdpBindError> {
         let address_family = family(local.addr);
         if local.port == 0
@@ -153,6 +187,7 @@ impl UdpEndpointTable {
                     interface,
                     rx: DatagramRing::new(),
                     pending_error: None,
+                    facade,
                 },
             )
             .map_err(|_| UdpBindError::FlowTableFull)?;
@@ -178,7 +213,8 @@ impl UdpEndpointTable {
         let Some(id) = id else {
             return Err(UdpIngressError {
                 reason: DropReason::UdpNoEndpoint,
-                packet,
+                chain: packet.chain,
+                metadata: packet.metadata,
             });
         };
         let endpoint = self
@@ -190,13 +226,15 @@ impl UdpEndpointTable {
         {
             return Err(UdpIngressError {
                 reason: DropReason::UdpNoEndpoint,
-                packet,
+                chain: packet.chain,
+                metadata: packet.metadata,
             });
         }
-        if endpoint.rx.is_full() {
+        if endpoint.facade.is_none() && endpoint.rx.is_full() {
             return Err(UdpIngressError {
                 reason: DropReason::UdpRingFull,
-                packet,
+                chain: packet.chain,
+                metadata: packet.metadata,
             });
         }
         let destination = if endpoint.local.addr.is_unspecified() {
@@ -214,7 +252,17 @@ impl UdpEndpointTable {
             ingress_interface: interface,
             rx_timestamp_ns: packet.metadata.rx_timestamp_ns,
         };
-        endpoint.rx.push(datagram);
+        if let Some(facade) = endpoint.facade.as_ref() {
+            if let Err(datagram) = facade.push_rx(datagram) {
+                return Err(UdpIngressError {
+                    reason: DropReason::UdpRingFull,
+                    chain: datagram.packet,
+                    metadata: packet.metadata,
+                });
+            }
+        } else {
+            endpoint.rx.push(datagram);
+        }
         self.flows.mark_dirty(id, DIRTY_INGRESS);
         Ok(id)
     }
@@ -265,6 +313,18 @@ impl UdpEndpointTable {
             return false;
         }
         self.flows.mark_dirty(id, crate::flow::DIRTY_TIMER)
+    }
+
+    pub fn unbind(&mut self, id: FlowId) -> Option<Arc<SocketFacade>> {
+        let key = self.flows.key(id)?;
+        let hash = flow_hash64(rss_hash(&self.rss_key, &key));
+        let endpoint = self.flows.remove(&key, hash)?;
+        self.binds.retain(|_, bound| *bound != id);
+        endpoint.facade
+    }
+
+    pub fn facade(&self, id: FlowId) -> Option<Arc<SocketFacade>> {
+        self.flows.get(id)?.facade.as_ref().map(Arc::clone)
     }
 
     fn lookup_bound(&self, interface: InterfaceId, local: Endpoint) -> Option<FlowId> {

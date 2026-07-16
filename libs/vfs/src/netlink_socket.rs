@@ -17,6 +17,7 @@ use spin::Mutex;
 
 use crate::error::{VfsError, VfsResult};
 use crate::file::{DirEntry, FileOps, PollEvents};
+use crate::poll_source::PollSource;
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -47,6 +48,7 @@ pub struct NetlinkSocketFileOps {
     wait_queue: WaitQueue,
     nonblock: AtomicBool,
     bound: AtomicBool,
+    poll_source: PollSource,
 }
 
 impl NetlinkSocketFileOps {
@@ -57,7 +59,18 @@ impl NetlinkSocketFileOps {
             wait_queue: WaitQueue::new(),
             nonblock: AtomicBool::new(nonblock),
             bound: AtomicBool::new(false),
+            poll_source: PollSource::new(PollEvents::POLLOUT),
         }
+    }
+
+    fn refresh_readiness(&self) {
+        let version = self.poll_source.reserve_version();
+        let readiness = if self.rx_buf.lock().is_empty() {
+            PollEvents::POLLOUT
+        } else {
+            PollEvents::POLLIN.with(PollEvents::POLLOUT)
+        };
+        self.poll_source.publish_versioned(readiness, version);
     }
 
     pub fn bind(&self, _addr: &[u8]) -> Result<(), Errno> {
@@ -72,9 +85,11 @@ impl NetlinkSocketFileOps {
         deadline_ns: Option<u64>,
     ) -> Result<usize, Errno> {
         loop {
-            if let Some(msg) = self.rx_buf.lock().pop_front() {
+            let message = { self.rx_buf.lock().pop_front() };
+            if let Some(msg) = message {
                 let len = msg.len().min(buf.len());
                 buf[..len].copy_from_slice(&msg[..len]);
+                self.refresh_readiness();
                 return Ok(len);
             }
             if nonblocking || self.nonblock.load(Ordering::Relaxed) {
@@ -108,6 +123,7 @@ impl NetlinkSocketFileOps {
             combined.extend_from_slice(&response);
         }
         self.rx_buf.lock().push_back(combined);
+        self.refresh_readiness();
         self.wait_queue.wake_all();
         Ok(buf.len())
     }
@@ -116,9 +132,11 @@ impl NetlinkSocketFileOps {
 impl FileOps for NetlinkSocketFileOps {
     fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
         loop {
-            if let Some(msg) = self.rx_buf.lock().pop_front() {
+            let message = { self.rx_buf.lock().pop_front() };
+            if let Some(msg) = message {
                 let len = msg.len().min(buf.len());
                 buf[..len].copy_from_slice(&msg[..len]);
+                self.refresh_readiness();
                 return Ok(len);
             }
             if self.nonblock.load(Ordering::Relaxed) {
@@ -143,14 +161,7 @@ impl FileOps for NetlinkSocketFileOps {
     }
 
     fn poll(&self, interest: PollEvents) -> PollEvents {
-        let mut events = PollEvents(0);
-        if interest.has(PollEvents::POLLIN) && !self.rx_buf.lock().is_empty() {
-            events = events.with(PollEvents::POLLIN);
-        }
-        if interest.has(PollEvents::POLLOUT) {
-            events = events.with(PollEvents::POLLOUT);
-        }
-        events
+        self.poll_source.snapshot().0.intersect(interest)
     }
 
     fn poll_add_waiter(&self, task: &Arc<Task>, _: PollEvents) -> bool {
@@ -160,6 +171,10 @@ impl FileOps for NetlinkSocketFileOps {
 
     fn poll_remove_waiter(&self, task: &Arc<Task>) {
         self.wait_queue.remove(task);
+    }
+
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.poll_source)
     }
 
     fn is_seekable(&self) -> bool {

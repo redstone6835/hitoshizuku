@@ -2,10 +2,12 @@ use crate::buf::{CompletionToken, DropReason, PacketBatch, PacketChain, TxBatch,
 use crate::control::{ConfigError, ConfigSnapshot, NeighborKey, NeighborTable};
 use crate::pipeline::{FrontendBatch, FrontendDisposition, VectorFrontend};
 use crate::transport::{
-    ControlPacketResult, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError, build_udp_packet,
-    handle_control_packet,
+    ControlPacketResult, PreparedUdpTx, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
+    build_udp_packet, handle_control_packet,
 };
 use crate::{Endpoint, FlowId, InterfaceId, ShardId};
+use crate::{OwnerRef, SocketError, SocketFacade, UdpTxLease};
+use alloc::sync::Arc;
 
 use super::TimerWheel;
 
@@ -85,6 +87,49 @@ impl FlowShard {
         interface: Option<InterfaceId>,
     ) -> Result<FlowId, UdpBindError> {
         self.udp.bind(local, peer, interface)
+    }
+
+    pub fn bind_udp_facade(
+        &mut self,
+        local: Endpoint,
+        peer: Option<Endpoint>,
+        interface: Option<InterfaceId>,
+        facade: Arc<SocketFacade>,
+    ) -> Result<FlowId, UdpBindError> {
+        self.udp.bind_facade(local, peer, interface, facade)
+    }
+
+    pub fn close_udp(&mut self, flow: FlowId) {
+        if let Some(facade) = self.udp.unbind(flow) {
+            facade.publish_closed();
+        }
+    }
+
+    pub fn reconnect_udp_facade(
+        &mut self,
+        flow: FlowId,
+        peer: Endpoint,
+        facade: Arc<SocketFacade>,
+    ) -> Result<FlowId, UdpBindError> {
+        let endpoint = self
+            .udp
+            .endpoint_info(flow)
+            .ok_or(UdpBindError::InvalidEndpoint)?;
+        let _ = self.udp.unbind(flow);
+        match self.udp.bind_facade(
+            endpoint.local,
+            Some(peer),
+            endpoint.interface,
+            Arc::clone(&facade),
+        ) {
+            Ok(flow) => Ok(flow),
+            Err(error) => {
+                self.udp
+                    .bind_facade(endpoint.local, endpoint.peer, endpoint.interface, facade)
+                    .unwrap_or_else(|_| panic!("UDP connect 回滚失败"));
+                Err(error)
+            }
+        }
     }
 
     pub fn recv_udp(&mut self, flow: FlowId) -> Option<UdpDatagram> {
@@ -199,10 +244,11 @@ impl FlowShard {
             match packet.parsed.disposition {
                 FrontendDisposition::Udp => match self.udp.ingest(context.interface, packet) {
                     Ok(_) => self.stats.udp_delivered = self.stats.udp_delivered.saturating_add(1),
-                    Err(mut error) => {
-                        error.packet.metadata.drop_reason = error.reason;
+                    Err(error) => {
+                        let mut metadata = error.metadata;
+                        metadata.drop_reason = error.reason;
                         record_drop(error.reason);
-                        recycle_packet(recycle, error.packet.chain, error.packet.metadata);
+                        recycle_packet(recycle, error.chain, metadata);
                     }
                 },
                 FrontendDisposition::Control(_) => {
@@ -285,6 +331,59 @@ impl FlowShard {
             }
             self.stats.dirty_runs = self.stats.dirty_runs.saturating_add(1);
         }
+    }
+
+    pub fn prepare_udp_tx(
+        &mut self,
+        flow: FlowId,
+        payload: UdpTxLease,
+        mark: u32,
+        config: &ConfigSnapshot,
+        now_ns: u64,
+    ) -> Result<PreparedUdpTx, (SocketError, UdpTxLease)> {
+        let Some(endpoint) = self.udp.endpoint_info(flow) else {
+            return Err((SocketError::Closed, payload));
+        };
+        let destination = payload.destination;
+        let bound_source = (!endpoint.local.addr.is_unspecified()).then_some(endpoint.local.addr);
+        let route = match config.route(destination.addr, mark, bound_source, endpoint.interface) {
+            Ok(route) => route,
+            Err(_) => return Err((SocketError::NetworkUnreachable, payload)),
+        };
+        let interface = config
+            .interfaces
+            .iter()
+            .find(|interface| interface.id == route.interface)
+            .expect("route 指向已验证的接口");
+        let destination_mac = if interface.loopback {
+            interface.mac_address
+        } else {
+            let key = NeighborKey {
+                interface: route.interface,
+                address: route.next_hop,
+            };
+            let Some((mac_address, _, _)) = self.neighbors.lookup(key, now_ns) else {
+                return Err((SocketError::HostUnreachable, payload));
+            };
+            mac_address
+        };
+        Ok(PreparedUdpTx {
+            payload,
+            route,
+            destination,
+            source_port: endpoint.local.port,
+            source_mac: interface.mac_address,
+            destination_mac,
+            completion: {
+                let completion = CompletionToken(self.next_completion);
+                self.next_completion = self.next_completion.wrapping_add(1).max(1);
+                completion
+            },
+        })
+    }
+
+    pub fn facade_owner(&self, flow: FlowId) -> Option<OwnerRef> {
+        self.udp.facade(flow).map(|facade| facade.owner())
     }
 }
 

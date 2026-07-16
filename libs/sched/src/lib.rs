@@ -86,7 +86,10 @@ pub use sched_class::{
     DEFAULT_DL_DEADLINE_NS, DEFAULT_DL_PERIOD_NS, DEFAULT_DL_RUNTIME_NS, DEFAULT_RR_SLICE_NS,
     RT_PRIO_MAX, RT_PRIO_MIN, SchedAttr, SchedClass, SchedPolicy,
 };
-pub use scheduler::cancel_sleep_deadline;
+pub use scheduler::{
+    DeadlineObserver, cancel_deadline_observer, cancel_sleep_deadline, register_deadline_observer,
+    reserve_deadline_observer_id,
+};
 pub use scheduler::{
     NR_CPUS, balance_once, current_cpu_id, current_task, current_task_fast, current_task_on,
     current_task_ref, enqueue_task, enqueue_task_preferred, idle_task, init, init_task,
@@ -104,7 +107,7 @@ pub use scheduler::{
 };
 pub use signal::{
     DefaultAction, SharedSignal, SigAction, SigActionFlags, SigHandler, SigInfo, SigProcMaskHow,
-    SigSet, SignalNumber, SignalState,
+    SigSet, SignalNumber, SignalObserver, SignalState,
 };
 pub use spawn::{
     SpawnKind, abort_new_task, activate_task, clone_task, exit_task, kthread_create,

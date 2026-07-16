@@ -1,12 +1,11 @@
-//! 尚未启用 INET 协议实现时的 socket 边界。
+//! INET socket 的 VFS 适配层。
 //!
-//! AF_INET/AF_INET6 在创建点固定返回 `EAFNOSUPPORT`。本文件只保留通用
-//! socket syscall 编译所需的数据结构，不能持有协议 handle、waiter 或网络状态。
+//! 本层只保存稳定的 `SocketFacade` 引用和 VFS 可见 option，不保存协议状态。
 
 use alloc::sync::Arc;
 use core::any::Any;
 use core::ops::ControlFlow;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use errno::Errno;
 use sched::Task;
@@ -14,6 +13,7 @@ use spin::Mutex;
 
 use crate::error::{VfsError, VfsResult};
 use crate::file::{DirEntry, FileOps, IoctlCmd, OpenOptions, PollEvents};
+use crate::poll_source::PollSource;
 
 const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
@@ -54,136 +54,71 @@ pub struct InetRecvResult {
     pub msg_flags: usize,
 }
 
-/// 协议 socket 接入前用于编译通用 option 代码的不可达类型。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InetSocketType {
-    Tcp,
-    Udp,
-    Icmp,
-    Raw,
-}
-
-/// 不携带协议状态的值句柄。当前实现不会构造该类型。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InetSocketHandle {
-    socket_type: InetSocketType,
-    device: net::NetDeviceId,
-}
-
-impl InetSocketHandle {
-    pub const fn socket_type(self) -> InetSocketType {
-        self.socket_type
-    }
-
-    pub const fn interface_id(self) -> net::NetDeviceId {
-        self.device
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SocketOptions {
-    pub keepalive: bool,
-    pub broadcast: bool,
     pub reuseaddr: bool,
     pub reuseport: bool,
-    pub linger_on: bool,
-    pub linger_secs: u32,
     pub sndbuf: i32,
     pub rcvbuf: i32,
-    pub passcred: bool,
-    pub priority: i32,
-    pub mark: u32,
     pub timestamp: bool,
-    pub dontroute: bool,
-    pub rxq_ovfl: bool,
-    pub oobinline: bool,
-    pub nodelay: bool,
-    pub cork: bool,
-    pub keepidle: u32,
-    pub keepintvl: u32,
-    pub keepcnt: u32,
-    pub defer_accept: u32,
-    pub quickack: bool,
-    pub user_timeout: u32,
-    pub ttl: u8,
-    pub tos: u8,
-    pub mcast_ttl: u8,
-    pub mcast_loop: bool,
     pub recvttl: bool,
     pub recvtos: bool,
-    pub recverr: bool,
     pub pktinfo: bool,
-    pub freebind: bool,
-    pub hdrincl: bool,
     pub v6only: bool,
-    pub hops_v6: u8,
-    pub mcast_hops_v6: u8,
     pub recv_pktinfo_v6: bool,
     pub recv_hoplimit_v6: bool,
-    pub recverr_v6: bool,
-    pub tclass: i32,
-    pub read_shutdown: bool,
-    pub write_shutdown: bool,
 }
 
 impl Default for SocketOptions {
     fn default() -> Self {
         Self {
-            keepalive: false,
-            broadcast: false,
             reuseaddr: false,
             reuseport: false,
-            linger_on: false,
-            linger_secs: 0,
             sndbuf: 212_992,
             rcvbuf: 212_992,
-            passcred: false,
-            priority: 0,
-            mark: 0,
             timestamp: false,
-            dontroute: false,
-            rxq_ovfl: false,
-            oobinline: false,
-            nodelay: false,
-            cork: false,
-            keepidle: 7200,
-            keepintvl: 75,
-            keepcnt: 9,
-            defer_accept: 0,
-            quickack: false,
-            user_timeout: 0,
-            ttl: 64,
-            tos: 0,
-            mcast_ttl: 1,
-            mcast_loop: true,
             recvttl: false,
             recvtos: false,
-            recverr: false,
             pktinfo: false,
-            freebind: false,
-            hdrincl: false,
             v6only: false,
-            hops_v6: 64,
-            mcast_hops_v6: 1,
             recv_pktinfo_v6: false,
             recv_hoplimit_v6: false,
-            recverr_v6: false,
-            tclass: 0,
-            read_shutdown: false,
-            write_shutdown: false,
         }
     }
 }
 
-/// 不可达的 INET 文件操作对象，用于尚未安装协议实现时的 syscall 分派。
 pub struct NetSocketFileOps {
     family: u16,
     sock_type: u16,
+    protocol: u16,
+    facade: Arc<net::SocketFacade>,
+    poll_source: Arc<PollSource>,
     nonblock: AtomicBool,
     recv_timeout_ns: AtomicU64,
     send_timeout_ns: AtomicU64,
-    last_error: AtomicI32,
     options: Mutex<SocketOptions>,
+}
+
+impl net::ReadinessObserver for PollSource {
+    fn readiness_changed(&self, readiness: net::Readiness, generation: u64) {
+        let mut events = PollEvents::default();
+        if readiness.contains(net::Readiness::READABLE) {
+            events = events.with(PollEvents::POLLIN);
+        }
+        if readiness.contains(net::Readiness::WRITABLE) {
+            events = events.with(PollEvents::POLLOUT);
+        }
+        if readiness.contains(net::Readiness::ERROR) {
+            events = events.with(PollEvents::POLLERR);
+        }
+        if readiness.contains(net::Readiness::HANGUP) {
+            events = events.with(PollEvents::POLLHUP);
+        }
+        if readiness.contains(net::Readiness::READ_HANGUP) {
+            events = events.with(PollEvents::POLLRDHUP);
+        }
+        self.publish_versioned(events, generation);
+    }
 }
 
 impl NetSocketFileOps {
@@ -200,7 +135,11 @@ impl NetSocketFileOps {
     }
 
     pub fn take_last_error_code(&self) -> i32 {
-        self.last_error.swap(0, Ordering::AcqRel)
+        self.facade
+            .take_pending_error()
+            .map(map_socket_error)
+            .map(i32::from)
+            .unwrap_or(0)
     }
 
     pub fn recv_timeout_ns(&self) -> &AtomicU64 {
@@ -211,63 +150,159 @@ impl NetSocketFileOps {
         &self.send_timeout_ns
     }
 
-    pub fn get_handle_for_opts(&self) -> Option<InetSocketHandle> {
-        None
-    }
-
-    pub fn bind(&self, _sockaddr: &[u8]) -> Result<(), Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    pub fn bind(&self, sockaddr: &[u8]) -> Result<(), Errno> {
+        let local = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
+        let options = self.bind_options();
+        self.facade
+            .bind(local, None, options)
+            .map_err(map_socket_error)
     }
 
     pub fn listen(&self, _backlog: u32) -> Result<(), Errno> {
-        Err(Errno::EAFNOSUPPORT)
+        Err(Errno::EOPNOTSUPP)
     }
 
     pub fn accept(&self, _nonblock: bool) -> Result<Self, Errno> {
-        Err(Errno::EAFNOSUPPORT)
+        Err(Errno::EOPNOTSUPP)
     }
 
-    pub fn connect(&self, _sockaddr: &[u8], _nonblocking: bool) -> Result<(), Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    pub fn connect(&self, sockaddr: &[u8], _nonblocking: bool) -> Result<(), Errno> {
+        let peer = crate::addr::parse_inet_sockaddr_for_socket(sockaddr, self.family)?;
+        self.facade
+            .connect(peer, None, self.bind_options())
+            .map_err(map_socket_error)
     }
 
-    pub fn shutdown(&self, _how: u32) -> Result<(), Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    pub fn shutdown(&self, how: u32) -> Result<(), Errno> {
+        let (read, write) = match how {
+            0 => (true, false),
+            1 => (false, true),
+            2 => (true, true),
+            _ => return Err(Errno::EINVAL),
+        };
+        self.facade.shutdown(read, write).map_err(map_socket_error)
     }
 
     pub fn sendto(
         &self,
-        _data: &[u8],
-        _sockaddr: Option<&[u8]>,
-        _opts: InetSendOptions,
+        data: &[u8],
+        sockaddr: Option<&[u8]>,
+        opts: InetSendOptions,
     ) -> Result<usize, Errno> {
-        Err(Errno::EAFNOSUPPORT)
+        self.ensure_bound()?;
+        let destination = sockaddr
+            .map(|raw| crate::addr::parse_inet_sockaddr_for_socket(raw, self.family))
+            .transpose()?;
+        let deadline = opts.deadline_ns.or_else(|| self.send_deadline());
+        self.facade
+            .send(data, destination, opts.nonblocking, deadline)
+            .map_err(map_socket_error)
     }
 
-    pub fn recvfrom(
-        &self,
-        _buf: &mut [u8],
-        _opts: InetRecvOptions,
-    ) -> Result<InetRecvResult, Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    pub fn recvfrom(&self, buf: &mut [u8], opts: InetRecvOptions) -> Result<InetRecvResult, Errno> {
+        self.ensure_bound()?;
+        let deadline = opts.deadline_ns.or_else(|| self.recv_deadline());
+        let received = self
+            .facade
+            .recv(buf, opts.peek, opts.trunc, opts.nonblocking, deadline)
+            .map_err(map_socket_error)?;
+        Ok(InetRecvResult {
+            len: received.len,
+            remote: Some(received.source),
+            local: Some(received.destination),
+            interface_id: Some(net::NetDeviceId(received.ingress_interface.0)),
+            hop_limit: Some(received.hop_limit),
+            traffic_class: None,
+            msg_flags: usize::from(received.truncated) * 0x20,
+        })
     }
 
-    pub fn getsockname(&self, _buf: &mut [u8]) -> Result<usize, Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    pub fn getsockname(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let endpoint = self.facade.local_endpoint().unwrap_or(net::Endpoint {
+            addr: unspecified(self.family),
+            port: 0,
+        });
+        crate::addr::encode_inet_sockaddr(&endpoint, self.family, buf)
     }
 
-    pub fn getpeername(&self, _buf: &mut [u8]) -> Result<usize, Errno> {
-        Err(Errno::EAFNOSUPPORT)
+    pub fn getpeername(&self, buf: &mut [u8]) -> Result<usize, Errno> {
+        let endpoint = self.facade.peer_endpoint().ok_or(Errno::ENOTCONN)?;
+        crate::addr::encode_inet_sockaddr(&endpoint, self.family, buf)
+    }
+
+    pub fn protocol(&self) -> u16 {
+        self.protocol
+    }
+
+    pub fn facade(&self) -> &Arc<net::SocketFacade> {
+        &self.facade
+    }
+
+    fn ensure_bound(&self) -> Result<(), Errno> {
+        if matches!(self.facade.owner(), net::OwnerRef::Unassigned) {
+            let result = self.facade.bind(
+                net::Endpoint {
+                    addr: unspecified(self.family),
+                    port: 0,
+                },
+                None,
+                self.bind_options(),
+            );
+            if let Err(error) = result
+                && !(error == net::SocketError::InvalidState
+                    && matches!(self.facade.owner(), net::OwnerRef::Flow { .. }))
+            {
+                return Err(map_socket_error(error));
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_options(&self) -> net::control::BindOptions {
+        let options = self.options.lock();
+        net::control::BindOptions {
+            reuse_address: options.reuseaddr,
+            reuse_port: options.reuseport,
+            v6_only: options.v6only,
+            multicast_or_broadcast: false,
+        }
+    }
+
+    fn recv_deadline(&self) -> Option<u64> {
+        timeout_deadline(self.recv_timeout_ns.load(Ordering::Relaxed))
+    }
+
+    fn send_deadline(&self) -> Option<u64> {
+        timeout_deadline(self.send_timeout_ns.load(Ordering::Relaxed))
     }
 }
 
 impl FileOps for NetSocketFileOps {
-    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
-        Err(VfsError::Io)
+    fn read_at(&self, buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+        self.recvfrom(
+            buf,
+            InetRecvOptions {
+                nonblocking: self.nonblock.load(Ordering::Relaxed),
+                peek: false,
+                wait_all: false,
+                trunc: false,
+                deadline_ns: None,
+            },
+        )
+        .map(|result| result.len)
+        .map_err(map_errno_to_vfs)
     }
 
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
-        Err(VfsError::Io)
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        self.sendto(
+            buf,
+            None,
+            InetSendOptions {
+                nonblocking: self.nonblock.load(Ordering::Relaxed),
+                deadline_ns: None,
+            },
+        )
+        .map_err(map_errno_to_vfs)
     }
 
     fn readdir(
@@ -282,15 +317,50 @@ impl FileOps for NetSocketFileOps {
         Ok(())
     }
 
-    fn poll(&self, _interest: PollEvents) -> PollEvents {
-        PollEvents::POLLHUP
+    fn poll(&self, interest: PollEvents) -> PollEvents {
+        let readiness = self.facade.readiness().0;
+        let mut ready = PollEvents::default();
+        if readiness.contains(net::Readiness::READABLE) {
+            ready = ready.with(PollEvents::POLLIN);
+        }
+        if readiness.contains(net::Readiness::WRITABLE) {
+            ready = ready.with(PollEvents::POLLOUT);
+        }
+        if readiness.contains(net::Readiness::ERROR) {
+            ready = ready.with(PollEvents::POLLERR);
+        }
+        if readiness.contains(net::Readiness::HANGUP) {
+            ready = ready.with(PollEvents::POLLHUP);
+        }
+        if readiness.contains(net::Readiness::READ_HANGUP) {
+            ready = ready.with(PollEvents::POLLRDHUP);
+        }
+        ready.intersect(
+            interest
+                .with(PollEvents::POLLERR)
+                .with(PollEvents::POLLHUP)
+                .with(PollEvents::POLLRDHUP),
+        )
     }
 
-    fn poll_add_waiter(&self, _task: &Arc<Task>, _interest: PollEvents) -> bool {
-        false
+    fn poll_add_waiter(&self, task: &Arc<Task>, interest: PollEvents) -> bool {
+        self.facade.add_poll_waiter(
+            task,
+            interest.has(PollEvents::POLLIN) || interest.has(PollEvents::POLLPRI),
+            interest.has(PollEvents::POLLOUT),
+            interest.has(PollEvents::POLLERR)
+                || interest.has(PollEvents::POLLHUP)
+                || interest.has(PollEvents::POLLRDHUP),
+        )
     }
 
-    fn poll_remove_waiter(&self, _task: &Arc<Task>) {}
+    fn poll_remove_waiter(&self, task: &Arc<Task>) {
+        self.facade.remove_poll_waiter(task);
+    }
+
+    fn poll_source(&self) -> Option<&PollSource> {
+        Some(&self.poll_source)
+    }
 
     fn is_seekable(&self) -> bool {
         false
@@ -300,7 +370,19 @@ impl FileOps for NetSocketFileOps {
         self.nonblock.store(flags.nonblock, Ordering::Relaxed);
     }
 
-    fn release(&self) {}
+    fn release(&self) {
+        self.facade.close();
+    }
+
+    fn io_timeout_deadline(&self, interest: PollEvents) -> Option<u64> {
+        if interest.has(PollEvents::POLLIN) {
+            self.recv_deadline()
+        } else if interest.has(PollEvents::POLLOUT) {
+            self.send_deadline()
+        } else {
+            None
+        }
+    }
 
     fn ioctl(&self, cmd: IoctlCmd, arg: usize) -> Result<usize, Errno> {
         let Some(handler) = *NET_IOCTL_HANDLER.lock() else {
@@ -315,10 +397,79 @@ impl FileOps for NetSocketFileOps {
 }
 
 pub fn create_net_socket(
-    _family: u16,
-    _sock_type: u16,
-    _protocol: u16,
-    _nonblock: bool,
+    family: u16,
+    sock_type: u16,
+    protocol: u16,
+    nonblock: bool,
 ) -> Result<NetSocketFileOps, Errno> {
-    Err(Errno::EAFNOSUPPORT)
+    let address_family = match family {
+        crate::addr::AF_INET => net::AddressFamily::Ipv4,
+        crate::addr::AF_INET6 => net::AddressFamily::Ipv6,
+        _ => return Err(Errno::EAFNOSUPPORT),
+    };
+    if sock_type != SOCK_DGRAM || !matches!(protocol, 0 | 17) {
+        return Err(Errno::Other(93));
+    }
+    let facade = net::new_socket_facade(address_family).map_err(map_socket_error)?;
+    let poll_source = Arc::new(PollSource::new(PollEvents::POLLOUT));
+    let observer: Arc<dyn net::ReadinessObserver> = poll_source.clone();
+    facade.set_observer(Arc::downgrade(&observer));
+    Ok(NetSocketFileOps {
+        family,
+        sock_type,
+        protocol: 17,
+        facade,
+        poll_source,
+        nonblock: AtomicBool::new(nonblock),
+        recv_timeout_ns: AtomicU64::new(0),
+        send_timeout_ns: AtomicU64::new(0),
+        options: Mutex::new(SocketOptions {
+            sndbuf: 128 * 1024,
+            rcvbuf: 128 * 1024,
+            ..SocketOptions::default()
+        }),
+    })
+}
+
+fn unspecified(family: u16) -> net::IpAddr {
+    match family {
+        crate::addr::AF_INET => net::IpAddr::V4(net::Ipv4Addr::UNSPECIFIED),
+        crate::addr::AF_INET6 => net::IpAddr::V6(net::Ipv6Addr::UNSPECIFIED),
+        _ => unreachable!(),
+    }
+}
+
+fn timeout_deadline(timeout_ns: u64) -> Option<u64> {
+    (timeout_ns != 0).then(|| sched::now_ns_public().saturating_add(timeout_ns))
+}
+
+fn map_socket_error(error: net::SocketError) -> Errno {
+    match error {
+        net::SocketError::RuntimeUnavailable => Errno::ENODEV,
+        net::SocketError::RuntimeBusy | net::SocketError::WouldBlock => Errno::EAGAIN,
+        net::SocketError::InvalidState => Errno::EINVAL,
+        net::SocketError::AddressInUse => Errno::EADDRINUSE,
+        net::SocketError::AddressUnavailable => Errno::EADDRNOTAVAIL,
+        net::SocketError::NotConnected => Errno::ENOTCONN,
+        net::SocketError::DestinationRequired => Errno::EDESTADDRREQ,
+        net::SocketError::AlreadyConnected => Errno::EISCONN,
+        net::SocketError::Interrupted => Errno::EINTR,
+        net::SocketError::TimedOut => Errno::EAGAIN,
+        net::SocketError::MessageTooLarge => Errno::EMSGSIZE,
+        net::SocketError::ReadShutdown => Errno::ENOTCONN,
+        net::SocketError::WriteShutdown => Errno::EPIPE,
+        net::SocketError::Closed => Errno::EBADF,
+        net::SocketError::NetworkUnreachable => Errno::Other(101),
+        net::SocketError::HostUnreachable => Errno::Other(113),
+        net::SocketError::Buffer => Errno::ENOMEM,
+    }
+}
+
+fn map_errno_to_vfs(error: Errno) -> VfsError {
+    match error {
+        Errno::EAGAIN => VfsError::WouldBlock,
+        Errno::EINVAL => VfsError::InvalidArgument,
+        Errno::EBADF => VfsError::BadFileDescriptor,
+        _ => VfsError::Io,
+    }
 }

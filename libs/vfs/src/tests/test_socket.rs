@@ -430,11 +430,11 @@ fn socket_creation_validates_domain_type_protocol_and_flags() {
     );
     assert_eq!(
         vsock::socket(&fx.ctx, &fx.fdt, 2, 99, usize::MAX),
-        Err(Errno::EAFNOSUPPORT)
+        Err(Errno::EINVAL)
     );
     assert_eq!(
         vsock::socket(&fx.ctx, &fx.fdt, 10, 99, usize::MAX),
-        Err(Errno::EAFNOSUPPORT)
+        Err(Errno::EINVAL)
     );
     assert_eq!(
         vsock::socket(

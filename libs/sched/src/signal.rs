@@ -3,8 +3,9 @@
 //! 本实现覆盖 Linux 常用 64 个信号（标准 1..=31 + 实时 32..=64）。SIGKILL/SIGSTOP
 //! 不可被 handler / blocked / ignored —— 投递路径直接走默认动作。
 
+use alloc::sync::Weak;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::ids::Uid;
 use crate::pid::PidT;
@@ -224,6 +225,72 @@ pub const fn default_action(sig: SignalNumber) -> DefaultAction {
 
 // ── per-task 信号状态 ────────────────────────────────────────────────────────
 
+/// 订阅某个 per-task 或 thread-group 信号状态的定向观察者。
+pub trait SignalObserver: Send + Sync {
+    fn signal_state_changed(&self);
+}
+
+struct SignalSubscription {
+    id: u64,
+    observer: Weak<dyn SignalObserver>,
+}
+
+struct SignalObservers {
+    has_entries: AtomicBool,
+    next_id: AtomicU64,
+    entries: Spinlock<Vec<SignalSubscription>>,
+}
+
+impl SignalObservers {
+    const fn new() -> Self {
+        Self {
+            has_entries: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            entries: Spinlock::new(Vec::new()),
+        }
+    }
+
+    fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "signal observer id 已耗尽");
+        self.entries
+            .lock()
+            .push(SignalSubscription { id, observer });
+        self.has_entries.store(true, Ordering::Release);
+    }
+
+    fn notify(&self) {
+        if !self.has_entries.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            entries.retain(|entry| entry.observer.strong_count() != 0);
+            if entries.is_empty() {
+                self.has_entries.store(false, Ordering::Release);
+                return;
+            }
+        }
+        let mut after = 0u64;
+        loop {
+            let next = {
+                let entries = self.entries.lock();
+                let index = entries.partition_point(|entry| entry.id <= after);
+                entries
+                    .get(index)
+                    .map(|entry| (entry.id, entry.observer.clone()))
+            };
+            let Some((id, observer)) = next else {
+                break;
+            };
+            after = id;
+            if let Some(observer) = observer.upgrade() {
+                observer.signal_state_changed();
+            }
+        }
+    }
+}
+
 /// 每个 Task 自带的信号上下文。
 pub struct SignalState {
     pending_bits: AtomicU64,
@@ -231,6 +298,7 @@ pub struct SignalState {
     blocked: AtomicU64,
     saved_blocked: AtomicU64,
     sigtimedwait_mask: AtomicU64,
+    observers: SignalObservers,
 }
 
 impl SignalState {
@@ -241,13 +309,20 @@ impl SignalState {
             blocked: AtomicU64::new(0),
             saved_blocked: AtomicU64::new(0),
             sigtimedwait_mask: AtomicU64::new(0),
+            observers: SignalObservers::new(),
         }
+    }
+
+    /// 订阅当前任务的 pending 信号变化。
+    pub fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
+        self.observers.subscribe(observer);
     }
 
     /// 把一条信号投到本 task 的 pending。
     pub fn deliver(&self, info: SigInfo) {
         self.pending_bits.fetch_or(info.sig.bit(), Ordering::AcqRel);
         self.pending_infos.lock().push(info);
+        self.observers.notify();
     }
 
     /// 取出一条当前未被 block 的信号；无匹配返回 None。
@@ -262,6 +337,8 @@ impl SignalState {
             self.pending_bits
                 .fetch_and(!info.sig.bit(), Ordering::AcqRel);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
@@ -276,6 +353,8 @@ impl SignalState {
             self.pending_bits
                 .fetch_and(!info.sig.bit(), Ordering::AcqRel);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
@@ -360,6 +439,7 @@ pub struct SharedSignal {
     actions: Spinlock<[SigAction; NSIG]>,
     shared_pending_bits: AtomicU64,
     shared_pending_infos: Spinlock<Vec<SigInfo>>,
+    observers: SignalObservers,
 }
 
 impl SharedSignal {
@@ -368,6 +448,7 @@ impl SharedSignal {
             actions: Spinlock::new([SigAction::default_new(); NSIG]),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
+            observers: SignalObservers::new(),
         }
     }
 
@@ -378,7 +459,13 @@ impl SharedSignal {
             actions: Spinlock::new(actions_copy),
             shared_pending_bits: AtomicU64::new(0),
             shared_pending_infos: Spinlock::new(Vec::new()),
+            observers: SignalObservers::new(),
         }
+    }
+
+    /// 订阅当前线程组共享 pending 信号变化。
+    pub fn subscribe(&self, observer: Weak<dyn SignalObserver>) {
+        self.observers.subscribe(observer);
     }
 
     pub fn get_action(&self, sig: SignalNumber) -> SigAction {
@@ -425,6 +512,7 @@ impl SharedSignal {
         self.shared_pending_bits
             .fetch_or(info.sig.bit(), Ordering::AcqRel);
         self.shared_pending_infos.lock().push(info);
+        self.observers.notify();
     }
 
     /// 取出一条与 per-task `blocked` 不冲突的信号。
@@ -437,6 +525,8 @@ impl SharedSignal {
             self.shared_pending_bits
                 .fetch_and(!info.sig.bit(), Ordering::AcqRel);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
@@ -454,6 +544,8 @@ impl SharedSignal {
             self.shared_pending_bits
                 .fetch_and(!info.sig.bit(), Ordering::AcqRel);
         }
+        drop(queue);
+        self.observers.notify();
         Some(info)
     }
 
@@ -474,5 +566,38 @@ impl SharedSignal {
 impl Default for SharedSignal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod observer_tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::AtomicU64;
+
+    struct Observer(AtomicU64);
+
+    impl SignalObserver for Observer {
+        fn signal_state_changed(&self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn signal_state_notifies_only_its_subscribers_on_enqueue_and_dequeue() {
+        let state = SignalState::new();
+        let observer = Arc::new(Observer(AtomicU64::new(0)));
+        let subscriber: Arc<dyn SignalObserver> = observer.clone();
+        state.subscribe(Arc::downgrade(&subscriber));
+        state.deliver(SigInfo {
+            sig: SignalNumber::SIGUSR1,
+            code: 0,
+            sender_pid: 1,
+            sender_uid: Uid(0),
+            raw: None,
+        });
+        assert_eq!(observer.0.load(Ordering::Acquire), 1);
+        assert!(state.dequeue_one_in(SignalNumber::SIGUSR1.bit()).is_some());
+        assert_eq!(observer.0.load(Ordering::Acquire), 2);
     }
 }
