@@ -146,7 +146,7 @@ impl FrontendBatch {
         self.len = 0;
     }
 
-    fn push(&mut self, packet: FrontendPacket) {
+    pub fn push(&mut self, packet: FrontendPacket) {
         assert!(self.len as usize != self.packets.len());
         self.packets[self.len as usize] = Some(packet);
         self.len += 1;

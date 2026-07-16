@@ -16,8 +16,8 @@ use crate::transport::{
     TcpTransmit, TransportControlError,
 };
 use crate::{
-    AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, OwnerRef,
-    SocketError, SocketFacade, TcpTxLease, TransportProtocol,
+    AddressFamily, Endpoint, FlowId, InterfaceId, IpAddr, Ipv4Addr, Ipv6Addr, ListenGroup,
+    ListenGroupId, OwnerRef, ShardId, SocketError, SocketFacade, TcpTxLease, TransportProtocol,
 };
 
 #[cfg(not(test))]
@@ -93,8 +93,7 @@ pub struct TcpEngineStats {
 }
 
 struct Listener {
-    facade: Arc<SocketFacade>,
-    syn_count: usize,
+    group: Arc<ListenGroup>,
 }
 
 struct SentSegment {
@@ -251,7 +250,7 @@ struct TcpFlow {
     remote: Endpoint,
     local: Endpoint,
     pending_connect: Option<u64>,
-    accept_parent: Option<Arc<SocketFacade>>,
+    accept_group: Option<Arc<ListenGroup>>,
     retransmit: VecDeque<SentSegment>,
     reassembly: Vec<ReassemblyFragment>,
     reassembly_bytes: usize,
@@ -297,6 +296,7 @@ impl TcpFlow {
 }
 
 pub struct TcpEndpointTable {
+    shard: ShardId,
     rss_key: [u8; 40],
     isn_key: [u8; 16],
     flows: FlowTable<TcpFlow>,
@@ -307,8 +307,14 @@ pub struct TcpEndpointTable {
 }
 
 impl TcpEndpointTable {
+    #[cfg(test)]
     pub fn new(rss_key: [u8; 40], isn_key: [u8; 16]) -> Self {
+        Self::new_on_shard(ShardId(0), rss_key, isn_key)
+    }
+
+    pub fn new_on_shard(shard: ShardId, rss_key: [u8; 40], isn_key: [u8; 16]) -> Self {
         Self {
+            shard,
             rss_key,
             isn_key,
             flows: FlowTable::new(),
@@ -327,7 +333,7 @@ impl TcpEndpointTable {
         &mut self,
         local: Endpoint,
         interface: Option<InterfaceId>,
-        facade: Arc<SocketFacade>,
+        group: Arc<ListenGroup>,
     ) -> Result<(), TcpBindError> {
         if local.port == 0 {
             return Err(TcpBindError::InvalidEndpoint);
@@ -336,21 +342,15 @@ impl TcpEndpointTable {
         if self.listeners.contains_key(&key) {
             return Err(TcpBindError::Duplicate);
         }
-        self.listeners.insert(
-            key,
-            Listener {
-                facade,
-                syn_count: 0,
-            },
-        );
+        self.listeners.insert(key, Listener { group });
         Ok(())
     }
 
-    pub fn close_listener(&mut self, facade: &Arc<SocketFacade>) -> bool {
+    pub fn close_listener(&mut self, group: ListenGroupId) -> bool {
         let key = self
             .listeners
             .iter()
-            .find(|(_, listener)| Arc::ptr_eq(&listener.facade, facade))
+            .find(|(_, listener)| listener.group.id() == group)
             .map(|(key, _)| *key);
         let Some(key) = key else {
             return false;
@@ -396,7 +396,7 @@ impl TcpEndpointTable {
             remote,
             local,
             pending_connect: Some(control_sequence),
-            accept_parent: None,
+            accept_group: None,
             retransmit: VecDeque::new(),
             reassembly: Vec::new(),
             reassembly_bytes: 0,
@@ -777,14 +777,16 @@ impl TcpEndpointTable {
         let listener_key = self
             .find_listener_key(key.local, interface)
             .ok_or(TcpIngressError::NoEndpoint)?;
-        let listener = self.listeners.get_mut(&listener_key).unwrap();
-        if listener.syn_count >= listener.facade.listener_backlog() {
+        let group = Arc::clone(&self.listeners.get(&listener_key).unwrap().group);
+        if !group.reserve_syn() {
             return Err(TcpIngressError::FlowTableFull);
         }
-        listener.syn_count += 1;
-        let parent = Arc::clone(&listener.facade);
+        let Some(parent) = group.parent() else {
+            group.release_syn();
+            return Err(TcpIngressError::NoEndpoint);
+        };
         let child = create_child_facade(address_family(key.local.addr)).map_err(|_| {
-            self.listeners.get_mut(&listener_key).unwrap().syn_count -= 1;
+            group.release_syn();
             TcpIngressError::FlowTableFull
         })?;
         child.set_tcp_maxseg(parent.tcp_maxseg());
@@ -802,7 +804,7 @@ impl TcpEndpointTable {
             remote: key.remote,
             local: key.local,
             pending_connect: None,
-            accept_parent: Some(parent),
+            accept_group: Some(Arc::clone(&group)),
             retransmit: VecDeque::new(),
             reassembly: Vec::new(),
             reassembly_bytes: 0,
@@ -828,14 +830,14 @@ impl TcpEndpointTable {
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         let id = self.flows.insert_prehashed(key, hash, flow).map_err(|_| {
-            self.listeners.get_mut(&listener_key).unwrap().syn_count -= 1;
+            group.release_syn();
             TcpIngressError::FlowTableFull
         })?;
         publish_tcp_info(self.flows.get(id).unwrap());
         let generation = self.flows.generation(id).unwrap();
         child.publish_binding(
             OwnerRef::Flow {
-                shard: crate::ShardId(0),
+                shard: self.shard,
                 flow: id,
                 generation: child.generation(),
             },
@@ -1181,13 +1183,8 @@ impl TcpEndpointTable {
     }
 
     fn on_established(&mut self, id: FlowId, now_ns: u64) -> bool {
-        let listener_key = self.flows.get_mut(id).unwrap().listener_key.take();
-        if let Some(key) = listener_key
-            && let Some(listener) = self.listeners.get_mut(&key)
-        {
-            listener.syn_count = listener.syn_count.saturating_sub(1);
-        }
         let flow = self.flows.get_mut(id).unwrap();
+        flow.listener_key.take();
         flow.facade.publish_connected();
         flow.deadlines.keepalive = flow
             .facade
@@ -1196,10 +1193,11 @@ impl TcpEndpointTable {
         if let Some(sequence) = flow.pending_connect.take() {
             flow.facade.complete_control(sequence, Ok(()));
         }
-        let rejected = flow
-            .accept_parent
-            .take()
-            .is_some_and(|parent| parent.push_accepted(Arc::clone(&flow.facade)).is_err());
+        let rejected = flow.accept_group.take().is_some_and(|group| {
+            group
+                .publish_established(self.shard, Arc::clone(&flow.facade))
+                .is_err()
+        });
         if rejected {
             let transmit = TcpTransmit {
                 sequence: flow.machine.send_next(),
@@ -1344,10 +1342,10 @@ impl TcpEndpointTable {
         };
         let hash = flow_hash64(rss_hash(&self.rss_key, &key));
         if let Some(flow) = self.flows.remove(&key, hash) {
-            if let Some(listener_key) = flow.listener_key
-                && let Some(listener) = self.listeners.get_mut(&listener_key)
+            if flow.listener_key.is_some()
+                && let Some(group) = flow.accept_group
             {
-                listener.syn_count = listener.syn_count.saturating_sub(1);
+                group.release_syn();
             }
             if let Some(sequence) = flow.pending_connect {
                 let result = Err(error.unwrap_or(SocketError::Closed));
@@ -1876,6 +1874,7 @@ pub fn build_tcp_reset(
 mod tests {
     use alloc::boxed::Box;
     use core::ptr::NonNull;
+    use std::thread;
 
     use super::*;
     use crate::buf::{NetBufPool, NetBufStorage};
@@ -1922,6 +1921,17 @@ mod tests {
             AddressFamily::Ipv4,
             crate::SocketKind::Stream,
         ))
+    }
+
+    fn listen_group(
+        listener: &Arc<SocketFacade>,
+        id: u64,
+        shard_count: usize,
+        backlog: u32,
+    ) -> Arc<ListenGroup> {
+        let group = ListenGroup::new(crate::ListenGroupId(id), listener, shard_count, backlog);
+        listener.install_listen_group(Arc::clone(&group));
+        group
     }
 
     fn path(local: IpAddr, remote: IpAddr) -> TcpPath {
@@ -2005,6 +2015,40 @@ mod tests {
             .unwrap();
         assert_eq!(table.take_output().unwrap().flags, TcpFlags::ACK);
         flow
+    }
+
+    fn establish_passive(
+        table: &mut TcpEndpointTable,
+        local: Endpoint,
+        remote: Endpoint,
+        now_ns: u64,
+    ) {
+        let key = FlowKey::new(remote, local, TransportProtocol::Tcp).unwrap();
+        let flow = table
+            .accept_syn(
+                InterfaceId(1),
+                path(local.addr, remote.addr),
+                key,
+                packet(remote.port, local.port, 700, 0, TcpFlags::SYN, 0),
+                now_ns,
+            )
+            .unwrap();
+        let syn_ack = table.take_output().unwrap();
+        table
+            .process_segment(
+                flow,
+                packet(
+                    remote.port,
+                    local.port,
+                    701,
+                    syn_ack.sequence.0.wrapping_add(1),
+                    TcpFlags::ACK,
+                    0,
+                ),
+                Vec::new(),
+                now_ns + 1_000,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -2214,11 +2258,9 @@ mod tests {
             port: 40_000,
         };
         let listener = facade(2);
-        listener.configure_listener(4);
+        let group = listen_group(&listener, 1, 1, 4);
         let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
-        table
-            .listen(local, Some(InterfaceId(1)), Arc::clone(&listener))
-            .unwrap();
+        table.listen(local, Some(InterfaceId(1)), group).unwrap();
         let key = FlowKey::new(remote, local, TransportProtocol::Tcp).unwrap();
         let syn = packet(remote.port, local.port, 700, 0, TcpFlags::SYN, 0);
         let flow = table
@@ -2254,6 +2296,69 @@ mod tests {
             listener.accept(true, None),
             Err(SocketError::WouldBlock)
         ));
+    }
+
+    #[test]
+    fn one_listener_accepts_connections_owned_by_different_shards() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9006,
+        };
+        let listener = facade(20);
+        let group = listen_group(&listener, 4, 2, 8);
+        let first_group = Arc::clone(&group);
+        let second_group = Arc::clone(&group);
+        let first = thread::spawn(move || {
+            let mut table = TcpEndpointTable::new_on_shard(ShardId(0), [1; 40], [2; 16]);
+            table
+                .listen(local, Some(InterfaceId(1)), first_group)
+                .unwrap();
+            establish_passive(
+                &mut table,
+                local,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port: 42_000,
+                },
+                1_000,
+            );
+        });
+        let second = thread::spawn(move || {
+            let mut table = TcpEndpointTable::new_on_shard(ShardId(1), [1; 40], [2; 16]);
+            table
+                .listen(local, Some(InterfaceId(1)), second_group)
+                .unwrap();
+            establish_passive(
+                &mut table,
+                local,
+                Endpoint {
+                    addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port: 42_001,
+                },
+                2_000,
+            );
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let owners = [
+            listener.accept(true, None).unwrap().owner(),
+            listener.accept(true, None).unwrap().owner(),
+        ];
+        assert!(owners.iter().any(|owner| matches!(
+            owner,
+            OwnerRef::Flow {
+                shard: ShardId(0),
+                ..
+            }
+        )));
+        assert!(owners.iter().any(|owner| matches!(
+            owner,
+            OwnerRef::Flow {
+                shard: ShardId(1),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -2451,11 +2556,9 @@ mod tests {
             port: 9005,
         };
         let listener = facade(7);
-        listener.configure_listener(1);
+        let group = listen_group(&listener, 2, 1, 1);
         let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
-        table
-            .listen(local, Some(InterfaceId(1)), Arc::clone(&listener))
-            .unwrap();
+        table.listen(local, Some(InterfaceId(1)), group).unwrap();
         for index in 0..2u16 {
             let remote = Endpoint {
                 addr: IpAddr::V4(Ipv4Addr::LOCALHOST),

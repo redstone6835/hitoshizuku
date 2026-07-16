@@ -21,13 +21,14 @@ use net::device::{
     NetDeviceRegistration, NetDeviceRemoveError, NetDeviceSnapshot, NetDeviceStats,
     NetDeviceTeardown, NetQueueRegistration, NetStat, QueueIrqControl, QueueWakeHandle,
 };
+use net::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
 use net::queue::{NetQueuePair, RxBudget};
 use net::ring::BoundedMpsc;
-use net::transport::{PreparedTcpTx, PreparedUdpTx, build_tcp_packet, build_udp_packet};
+use net::transport::{PreparedTcpTx, PreparedUdpTx, TcpPath, build_tcp_packet, build_udp_packet};
 use net::{
     AddressFamily, Endpoint, FlowId, FlowShard, FlowTurnContext, InterfaceId, IpAddr, Ipv4Addr,
-    Ipv6Addr, OwnerRef, ShardId, SocketCommand, SocketError, SocketFacade, SocketKind,
-    SocketRuntime, TransportProtocol,
+    Ipv6Addr, ListenGroup, ListenGroupId, OwnerRef, ShardId, SocketCommand, SocketError,
+    SocketFacade, SocketKind, SocketRuntime, TransportProtocol,
 };
 use sched::sync::Spinlock;
 
@@ -35,8 +36,8 @@ static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 static DEVICES: Spinlock<Vec<DeviceRecord>> = Spinlock::new(Vec::new());
 static CONFIG_STORE: Spinlock<Option<Arc<ConfigStore>>> = Spinlock::new(None);
 static WORKER_STARTS: Spinlock<Vec<Option<Box<WorkerContext>>>> = Spinlock::new(Vec::new());
-static PROTOCOL_START: Spinlock<Option<Box<ProtocolContext>>> = Spinlock::new(None);
-static PROTOCOL_RUNTIME: Spinlock<Option<Arc<ProtocolRuntime>>> = Spinlock::new(None);
+static PROTOCOL_STARTS: Spinlock<Vec<Option<Box<ProtocolContext>>>> = Spinlock::new(Vec::new());
+static PROTOCOL_CLUSTER: Spinlock<Option<Arc<ProtocolCluster>>> = Spinlock::new(None);
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 static WORKER_TASKS: Spinlock<Vec<Arc<sched::Task>>> = Spinlock::new(Vec::new());
 static REGISTRAR: KernelNetRegistrar = KernelNetRegistrar;
@@ -83,8 +84,8 @@ pub fn arp_probe_complete() -> bool {
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 pub fn request_udp_loopback_probe() {
     UDP_PROBE_REQUESTED.store(true, Ordering::Release);
-    if let Some(runtime) = PROTOCOL_RUNTIME.lock().as_ref() {
-        runtime.wake_owner();
+    if let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref() {
+        cluster.coordinator().wake_owner();
     }
     for task in WORKER_TASKS.lock().iter() {
         let _ = sched::activate_task(task);
@@ -100,8 +101,8 @@ pub fn udp_loopback_probe_complete() -> bool {
 pub fn request_physical_udp_probe() {
     ARP_PROBE_REQUESTED.store(true, Ordering::Release);
     PHYSICAL_UDP_PROBE_REQUESTED.store(true, Ordering::Release);
-    if let Some(runtime) = PROTOCOL_RUNTIME.lock().as_ref() {
-        runtime.wake_owner();
+    if let Some(cluster) = PROTOCOL_CLUSTER.lock().as_ref() {
+        cluster.coordinator().wake_owner();
     }
     for task in WORKER_TASKS.lock().iter() {
         let _ = sched::activate_task(task);
@@ -521,8 +522,7 @@ struct IngressPacket {
     egress: usize,
     interface: InterfaceId,
     local_mac: [u8; 6],
-    packet: PacketChain,
-    metadata: PacketMetadata,
+    packet: FrontendPacket,
 }
 
 enum IngressWork {
@@ -543,6 +543,159 @@ enum EgressWork {
     Packet(TxPacket),
     Tcp(PreparedTcpTx),
     Udp(PreparedUdpTx),
+}
+
+enum ControlWork {
+    Socket(SocketCommand),
+    ConnectTcp {
+        facade: Arc<SocketFacade>,
+        sequence: u64,
+        generation: u32,
+        local: Endpoint,
+        peer: Endpoint,
+        path: TcpPath,
+    },
+    InstallListener {
+        transaction: Arc<ListenerInstall>,
+    },
+    RemoveListener {
+        transaction: Arc<ListenerRemove>,
+    },
+    DiscardListener {
+        group: ListenGroupId,
+    },
+}
+
+struct ControlPlane {
+    bind_registry: BindRegistry,
+    bindings: Spinlock<BTreeMap<net::SocketId, BindToken>>,
+    listeners: Spinlock<BTreeMap<ListenGroupId, Arc<ListenGroup>>>,
+    next_listener: AtomicU64,
+    rss_key: [u8; 40],
+    shard_count: usize,
+}
+
+impl ControlPlane {
+    fn new(shard_count: usize, rss_key: [u8; 40], hash_seed: &[u8; 16]) -> Self {
+        Self {
+            bind_registry: BindRegistry::new(shard_count, hash_seed),
+            bindings: Spinlock::new(BTreeMap::new()),
+            listeners: Spinlock::new(BTreeMap::new()),
+            next_listener: AtomicU64::new(1),
+            rss_key,
+            shard_count,
+        }
+    }
+
+    fn allocate_listener_id(&self) -> ListenGroupId {
+        let id = self.next_listener.fetch_add(1, Ordering::Relaxed);
+        assert!(id != 0, "ListenGroupId 已耗尽");
+        ListenGroupId(id)
+    }
+
+    fn flow_shard(
+        &self,
+        remote: Endpoint,
+        local: Endpoint,
+        protocol: TransportProtocol,
+    ) -> ShardId {
+        let key = net::flow::FlowKey::new(remote, local, protocol)
+            .expect("协议 flow 端点必须属于同一地址族");
+        ShardId((net::flow::rss_hash(&self.rss_key, &key) as usize % self.shard_count) as u16)
+    }
+
+    fn remember_binding(&self, socket: net::SocketId, token: BindToken) {
+        self.bindings.lock().insert(socket, token);
+    }
+
+    fn release_binding(&self, socket: net::SocketId) {
+        if let Some(token) = self.bindings.lock().remove(&socket) {
+            let _ = self.bind_registry.release(token);
+        }
+    }
+}
+
+struct ListenerInstall {
+    facade: Arc<SocketFacade>,
+    group: Arc<ListenGroup>,
+    local: Endpoint,
+    interface: Option<InterfaceId>,
+    sequence: u64,
+    generation: u32,
+    remaining: AtomicUsize,
+    failed: AtomicBool,
+    control: Arc<ControlPlane>,
+    cluster: Arc<ProtocolCluster>,
+}
+
+impl ListenerInstall {
+    fn finish(&self, result: Result<(), SocketError>) {
+        if result.is_err() {
+            self.failed.store(true, Ordering::Release);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        if self.failed.load(Ordering::Acquire) || self.facade.generation() != self.generation {
+            self.group.close();
+            for runtime in &self.cluster.shards {
+                let mut work = ControlWork::DiscardListener {
+                    group: self.group.id(),
+                };
+                loop {
+                    match runtime.control.try_push(work) {
+                        Ok(()) => {
+                            if !runtime.pending.swap(true, Ordering::AcqRel) {
+                                runtime.wake_owner();
+                            }
+                            break;
+                        }
+                        Err(pending) => {
+                            work = pending;
+                            runtime.wake_owner();
+                            let _ = sched::operation::sched_yield();
+                        }
+                    }
+                }
+            }
+            self.facade
+                .complete_control(self.sequence, Err(SocketError::InvalidState));
+            return;
+        }
+        self.control
+            .listeners
+            .lock()
+            .insert(self.group.id(), Arc::clone(&self.group));
+        self.facade.install_listen_group(Arc::clone(&self.group));
+        self.facade.publish_binding(
+            OwnerRef::Listener {
+                group: self.group.id(),
+                generation: self.facade.generation(),
+            },
+            self.local,
+            None,
+            self.interface,
+        );
+        self.facade.complete_control(self.sequence, Ok(()));
+    }
+}
+
+struct ListenerRemove {
+    facade: Arc<SocketFacade>,
+    group: ListenGroupId,
+    remaining: AtomicUsize,
+    control: Arc<ControlPlane>,
+}
+
+impl ListenerRemove {
+    fn finish(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        self.control.listeners.lock().remove(&self.group);
+        self.control.release_binding(self.facade.id());
+        self.facade.publish_closed();
+    }
 }
 
 struct EgressChannel {
@@ -606,8 +759,10 @@ impl EgressChannel {
 }
 
 struct ProtocolRuntime {
+    id: ShardId,
+    cpu: usize,
     ingress: BoundedMpsc<IngressWork>,
-    control: BoundedMpsc<SocketCommand>,
+    control: BoundedMpsc<ControlWork>,
     dirty: BoundedMpsc<Arc<SocketFacade>>,
     lifecycle: BoundedMpsc<Arc<SocketFacade>>,
     pending: AtomicBool,
@@ -619,8 +774,10 @@ struct ProtocolRuntime {
 }
 
 impl ProtocolRuntime {
-    fn new(egress: Vec<Arc<EgressChannel>>) -> Self {
+    fn new(id: ShardId, cpu: usize, egress: Vec<Arc<EgressChannel>>) -> Self {
         Self {
+            id,
+            cpu,
             ingress: BoundedMpsc::new(1024),
             control: BoundedMpsc::new(256),
             dirty: BoundedMpsc::new(4096),
@@ -640,7 +797,7 @@ impl ProtocolRuntime {
 
     fn wake_owner(&self) {
         if let Some(task) = self.owner_task.lock().as_ref().cloned() {
-            let _ = sched::activate_task(&task);
+            let _ = sched::activate_task_with_cpu_hint(&task, self.cpu);
         }
     }
 
@@ -700,6 +857,46 @@ impl ProtocolRuntime {
     }
 }
 
+struct ProtocolCluster {
+    shards: Box<[Arc<ProtocolRuntime>]>,
+}
+
+impl ProtocolCluster {
+    fn coordinator(&self) -> &Arc<ProtocolRuntime> {
+        &self.shards[0]
+    }
+
+    fn shard(&self, id: ShardId) -> Option<&Arc<ProtocolRuntime>> {
+        self.shards.get(usize::from(id.0))
+    }
+
+    fn ingress_target(&self, hash: Option<u32>) -> &Arc<ProtocolRuntime> {
+        let index = hash.map_or(0, |hash| hash as usize % self.shards.len());
+        &self.shards[index]
+    }
+
+    fn owner_target(&self, owner: OwnerRef) -> &Arc<ProtocolRuntime> {
+        match owner {
+            OwnerRef::Flow { shard, .. } => self.shard(shard).unwrap_or_else(|| self.coordinator()),
+            OwnerRef::Unassigned
+            | OwnerRef::Bound { .. }
+            | OwnerRef::Listener { .. }
+            | OwnerRef::Closed { .. } => self.coordinator(),
+        }
+    }
+
+    fn publish_control(&self, target: ShardId, work: ControlWork) -> Result<(), ControlWork> {
+        let Some(runtime) = self.shard(target) else {
+            return Err(work);
+        };
+        runtime.control.try_push(work)?;
+        if !runtime.pending.swap(true, Ordering::AcqRel) {
+            runtime.wake_owner();
+        }
+        Ok(())
+    }
+}
+
 impl sched::DeadlineObserver for ProtocolRuntime {
     fn deadline_expired(&self, registration: u64, _now_ns: u64) -> Option<u64> {
         if self
@@ -719,8 +916,8 @@ impl sched::DeadlineObserver for ProtocolRuntime {
 struct KernelSocketRuntime;
 
 impl KernelSocketRuntime {
-    fn runtime(&self) -> Option<Arc<ProtocolRuntime>> {
-        PROTOCOL_RUNTIME.lock().as_ref().cloned()
+    fn cluster(&self) -> Option<Arc<ProtocolCluster>> {
+        PROTOCOL_CLUSTER.lock().as_ref().cloned()
     }
 
     fn publish_work(&self, runtime: &ProtocolRuntime) {
@@ -732,19 +929,20 @@ impl KernelSocketRuntime {
 
 impl SocketRuntime for KernelSocketRuntime {
     fn submit_control(&self, command: SocketCommand) -> Result<(), SocketCommand> {
-        let Some(runtime) = self.runtime() else {
+        let Some(cluster) = self.cluster() else {
             return Err(command);
         };
-        let mut command = command;
+        let runtime = cluster.coordinator();
+        let mut work = ControlWork::Socket(command);
         loop {
-            match runtime.control.try_push(command) {
+            match runtime.control.try_push(work) {
                 Ok(()) => {
-                    self.publish_work(&runtime);
+                    self.publish_work(runtime);
                     return Ok(());
                 }
                 Err(pending) => {
-                    command = pending;
-                    self.publish_work(&runtime);
+                    work = pending;
+                    self.publish_work(runtime);
                     let _ = sched::operation::sched_yield();
                 }
             }
@@ -752,21 +950,32 @@ impl SocketRuntime for KernelSocketRuntime {
     }
 
     fn notify_tx(&self, facade: Arc<SocketFacade>) {
-        let runtime = self.runtime().expect("socket runtime 尚未启动");
+        let cluster = self.cluster().expect("socket runtime 尚未启动");
+        let runtime = cluster.owner_target(facade.owner());
         runtime
             .dirty
             .try_push(facade)
             .unwrap_or_else(|_| panic!("socket dirty queue 超出流表上限"));
-        self.publish_work(&runtime);
+        self.publish_work(runtime);
     }
 
     fn notify_lifecycle(&self, facade: Arc<SocketFacade>) {
-        let runtime = self.runtime().expect("socket runtime 尚未启动");
-        runtime
-            .lifecycle
-            .try_push(facade)
-            .unwrap_or_else(|_| panic!("socket lifecycle queue 超出流表上限"));
-        self.publish_work(&runtime);
+        let cluster = self.cluster().expect("socket runtime 尚未启动");
+        let runtime = cluster.owner_target(facade.owner());
+        let mut facade = facade;
+        loop {
+            match runtime.lifecycle.try_push(facade) {
+                Ok(()) => {
+                    self.publish_work(runtime);
+                    return;
+                }
+                Err(pending) => {
+                    facade = pending;
+                    self.publish_work(runtime);
+                    let _ = sched::operation::sched_yield();
+                }
+            }
+        }
     }
 }
 
@@ -866,13 +1075,16 @@ struct WorkerContext {
     tx_payload_pool: Option<NetBufPoolOwner>,
     irq: Arc<dyn QueueIrqControl>,
     rx_batch: PacketBatch,
+    frontend: VectorFrontend,
+    frontend_batch: FrontendBatch,
     refill_batch: RxRefillBatch,
     completion_batch: CompletionBatch,
     tx_batch: TxBatch,
     ingress_device: net::NetDeviceId,
     interface: InterfaceId,
     local_mac: [u8; 6],
-    protocol_runtime: Arc<ProtocolRuntime>,
+    protocol_cluster: Arc<ProtocolCluster>,
+    config: Arc<ConfigStore>,
     egress_index: usize,
     egress: Arc<EgressChannel>,
     rss_generation: u32,
@@ -890,14 +1102,13 @@ struct WorkerContext {
 
 struct ProtocolContext {
     runtime: Arc<ProtocolRuntime>,
+    cluster: Arc<ProtocolCluster>,
+    control_plane: Arc<ControlPlane>,
     config: Arc<ConfigStore>,
     protocol: FlowShard,
-    input: PacketBatch,
     recycle: PacketBatch,
     tx: TxBatch,
     pending: [Option<IngressWork>; 32],
-    bind_registry: BindRegistry,
-    bindings: BTreeMap<net::SocketId, BindToken>,
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
     udp_probe_flow: Option<FlowId>,
     #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
@@ -965,49 +1176,74 @@ pub fn start_workers() {
     drop(devices);
 
     assert!(!pending_workers.is_empty(), "没有可启动的网络 queue");
-    let runtime = Arc::new(ProtocolRuntime::new(
-        pending_workers
-            .iter()
-            .map(|worker| Arc::clone(&worker.egress))
-            .collect(),
-    ));
-    let protocol = FlowShard::new(
-        ShardId(0),
+    let egress = pending_workers
+        .iter()
+        .map(|worker| Arc::clone(&worker.egress))
+        .collect::<Vec<_>>();
+    let control_plane = Arc::new(ControlPlane::new(
+        active_cpus.len(),
         *boot.rss_key(),
-        rss_generation,
-        *boot.hash_seed(),
-        *boot.tcp_isn_key(),
-        sched::now_ns_public(),
-    );
-    *PROTOCOL_START.lock() = Some(Box::new(ProtocolContext {
-        runtime: Arc::clone(&runtime),
-        config: Arc::clone(&config),
-        protocol,
-        input: PacketBatch::new(),
-        recycle: PacketBatch::new(),
-        tx: TxBatch::new(),
-        pending: core::array::from_fn(|_| None),
-        bind_registry: BindRegistry::new(1, boot.hash_seed()),
-        bindings: BTreeMap::new(),
-        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-        udp_probe_flow: None,
-        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-        udp_probe_sender: None,
-        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-        physical_udp_probe_flow: None,
-        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-        physical_udp_probe_sender: None,
-    }));
-    let protocol_task = sched::kthread_create(
-        protocol_worker_entry,
-        0,
-        sched::SchedParams {
-            nice: -5,
-            slice_ns: 0,
-        },
-    );
-    protocol_task.set_cpu_affinity(1u64 << active_cpus[0]);
-    runtime.set_owner_task(Arc::clone(&protocol_task));
+        boot.hash_seed(),
+    ));
+    let runtimes = active_cpus
+        .iter()
+        .enumerate()
+        .map(|(index, cpu)| {
+            Arc::new(ProtocolRuntime::new(
+                ShardId(index as u16),
+                *cpu,
+                egress.iter().map(Arc::clone).collect(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let cluster = Arc::new(ProtocolCluster {
+        shards: runtimes.clone().into_boxed_slice(),
+    });
+    let mut protocol_tasks = Vec::with_capacity(runtimes.len());
+    for runtime in &runtimes {
+        let protocol = FlowShard::new(
+            runtime.id,
+            *boot.rss_key(),
+            rss_generation,
+            *boot.hash_seed(),
+            *boot.tcp_isn_key(),
+            sched::now_ns_public(),
+        );
+        let slot = {
+            let mut starts = PROTOCOL_STARTS.lock();
+            let slot = starts.len();
+            starts.push(Some(Box::new(ProtocolContext {
+                runtime: Arc::clone(runtime),
+                cluster: Arc::clone(&cluster),
+                control_plane: Arc::clone(&control_plane),
+                config: Arc::clone(&config),
+                protocol,
+                recycle: PacketBatch::new(),
+                tx: TxBatch::new(),
+                pending: core::array::from_fn(|_| None),
+                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+                udp_probe_flow: None,
+                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+                udp_probe_sender: None,
+                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+                physical_udp_probe_flow: None,
+                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+                physical_udp_probe_sender: None,
+            })));
+            slot
+        };
+        let task = sched::kthread_create(
+            protocol_worker_entry,
+            slot,
+            sched::SchedParams {
+                nice: -5,
+                slice_ns: 0,
+            },
+        );
+        task.set_cpu_affinity(online);
+        runtime.set_owner_task(Arc::clone(&task));
+        protocol_tasks.push((task, runtime.cpu));
+    }
 
     let mut queue_tasks = Vec::new();
     for (egress_index, pending) in pending_workers.into_iter().enumerate() {
@@ -1028,13 +1264,16 @@ pub fn start_workers() {
             tx_payload_pool: Some(tx_payload_pool),
             irq: Arc::clone(&irq),
             rx_batch: PacketBatch::new(),
+            frontend: VectorFrontend::new(*boot.rss_key(), rss_generation),
+            frontend_batch: FrontendBatch::new(),
             refill_batch: RxRefillBatch::new(),
             completion_batch: CompletionBatch::new(),
             tx_batch: TxBatch::new(),
             ingress_device: pending.ingress_device,
             interface: pending.interface,
             local_mac: pending.local_mac,
-            protocol_runtime: Arc::clone(&runtime),
+            protocol_cluster: Arc::clone(&cluster),
+            config: Arc::clone(&config),
             egress_index,
             egress: Arc::clone(&egress),
             rss_generation,
@@ -1074,11 +1313,13 @@ pub fn start_workers() {
         .unwrap_or_else(|error| panic!("NetWorker waker 安装失败: {:?}", error));
         queue_tasks.push(task);
     }
-    *PROTOCOL_RUNTIME.lock() = Some(runtime);
+    *PROTOCOL_CLUSTER.lock() = Some(cluster);
     net::install_socket_runtime(&SOCKET_RUNTIME_ADAPTER)
         .unwrap_or_else(|_| panic!("socket runtime 重复安装"));
-    sched::activate_task(&protocol_task)
-        .unwrap_or_else(|error| panic!("协议 worker 启动失败: {:?}", error));
+    for (task, cpu) in protocol_tasks {
+        sched::activate_task_with_cpu_hint(&task, cpu)
+            .unwrap_or_else(|error| panic!("协议 worker 启动失败: {:?}", error));
+    }
     for task in queue_tasks {
         sched::activate_task(&task)
             .unwrap_or_else(|error| panic!("NetWorker 启动失败: {:?}", error));
@@ -1094,10 +1335,11 @@ unsafe extern "C" fn net_worker_entry(slot: usize) -> ! {
     context.run()
 }
 
-unsafe extern "C" fn protocol_worker_entry(_unused: usize) -> ! {
-    let mut context = PROTOCOL_START
+unsafe extern "C" fn protocol_worker_entry(slot: usize) -> ! {
+    let mut context = PROTOCOL_STARTS
         .lock()
-        .take()
+        .get_mut(slot)
+        .and_then(Option::take)
         .expect("协议 worker 启动上下文不存在");
     context.run()
 }
@@ -1139,69 +1381,115 @@ impl ProtocolContext {
     fn drain_control(&mut self, budget: usize, config: &ConfigSnapshot) -> usize {
         let mut processed = 0;
         while processed < budget {
-            let Some(command) = self.runtime.control.try_pop() else {
+            let Some(work) = self.runtime.control.try_pop() else {
                 break;
             };
             processed += 1;
-            match command {
-                SocketCommand::Bind {
+            match work {
+                ControlWork::Socket(command) => match command {
+                    SocketCommand::Bind {
+                        facade,
+                        sequence,
+                        generation,
+                        local,
+                        interface,
+                        options,
+                    } => {
+                        let result = if facade.generation() != generation {
+                            Err(SocketError::Closed)
+                        } else {
+                            self.bind_facade(&facade, local, None, interface, options, config)
+                                .map(|_| ())
+                        };
+                        facade.complete_control(sequence, result);
+                    }
+                    SocketCommand::Connect {
+                        facade,
+                        sequence,
+                        generation,
+                        peer,
+                        interface,
+                        options,
+                        nonblocking,
+                    } => {
+                        let result = if facade.generation() != generation {
+                            Some(Err(SocketError::Closed))
+                        } else {
+                            match self.connect_facade(
+                                &facade,
+                                sequence,
+                                peer,
+                                interface,
+                                options,
+                                nonblocking,
+                                config,
+                            ) {
+                                Ok(true) => Some(Ok(())),
+                                Ok(false) => None,
+                                Err(error) => Some(Err(error)),
+                            }
+                        };
+                        if let Some(result) = result {
+                            facade.complete_control(sequence, result);
+                        }
+                    }
+                    SocketCommand::Listen {
+                        facade,
+                        sequence,
+                        generation,
+                        backlog,
+                    } => {
+                        let result = if facade.generation() != generation {
+                            Some(Err(SocketError::Closed))
+                        } else {
+                            match self.listen_facade(&facade, sequence, backlog, config) {
+                                Ok(true) => Some(Ok(())),
+                                Ok(false) => None,
+                                Err(error) => Some(Err(error)),
+                            }
+                        };
+                        if let Some(result) = result {
+                            facade.complete_control(sequence, result);
+                        }
+                    }
+                },
+                ControlWork::ConnectTcp {
                     facade,
                     sequence,
                     generation,
                     local,
-                    interface,
-                    options,
-                } => {
-                    let result = if facade.generation() != generation {
-                        Err(SocketError::Closed)
-                    } else {
-                        self.bind_facade(&facade, local, None, interface, options, config)
-                            .map(|_| ())
-                    };
-                    facade.complete_control(sequence, result);
-                }
-                SocketCommand::Connect {
-                    facade,
-                    sequence,
-                    generation,
                     peer,
-                    interface,
-                    options,
-                    nonblocking,
+                    path,
                 } => {
-                    let result = if facade.generation() != generation {
-                        Some(Err(SocketError::Closed))
-                    } else {
-                        match self.connect_facade(
-                            &facade,
-                            sequence,
-                            peer,
-                            interface,
-                            options,
-                            nonblocking,
-                            config,
-                        ) {
-                            Ok(true) => Some(Ok(())),
-                            Ok(false) => None,
-                            Err(error) => Some(Err(error)),
+                    if facade.generation() == generation {
+                        if let Err(error) =
+                            self.install_tcp_flow(&facade, sequence, local, peer, path)
+                        {
+                            facade.complete_control(sequence, Err(error));
                         }
-                    };
-                    if let Some(result) = result {
-                        facade.complete_control(sequence, result);
+                    } else {
+                        facade.complete_control(sequence, Err(SocketError::Closed));
                     }
                 }
-                SocketCommand::Listen {
-                    facade,
-                    sequence,
-                    generation,
-                    backlog,
-                } => {
-                    let result = if facade.generation() != generation {
-                        Err(SocketError::Closed)
-                    } else {
-                        self.listen_facade(&facade, backlog, config)
-                    };
-                    facade.complete_control(sequence, result);
+                ControlWork::InstallListener { transaction } => {
+                    let result = self
+                        .protocol
+                        .listen_tcp(
+                            transaction.local,
+                            transaction.interface,
+                            Arc::clone(&transaction.group),
+                        )
+                        .map_err(map_tcp_bind_error);
+                    transaction.finish(result);
+                }
+                ControlWork::RemoveListener { transaction } => {
+                    self.protocol.close_tcp_listener(transaction.group);
+                    self.dispatch_tcp_output();
+                    transaction.finish();
+                }
+                ControlWork::DiscardListener { group } => {
+                    self.protocol.close_tcp_listener(group);
+                    self.dispatch_tcp_output();
                 }
             }
         }
@@ -1266,11 +1554,13 @@ impl ProtocolContext {
             options,
         };
         let token = if local.port == 0 {
-            self.bind_registry
-                .reserve_ephemeral(request, ShardId(0))
+            self.control_plane
+                .bind_registry
+                .reserve_ephemeral(request, self.runtime.id)
                 .map_err(map_bind_error)?
         } else {
-            self.bind_registry
+            self.control_plane
+                .bind_registry
                 .reserve(request)
                 .map_err(map_bind_error)?
         };
@@ -1281,14 +1571,14 @@ impl ProtocolContext {
         {
             Ok(flow) => flow,
             Err(error) => {
-                let _ = self.bind_registry.release(token);
+                let _ = self.control_plane.bind_registry.release(token);
                 return Err(map_udp_bind_error(error));
             }
         };
-        self.bindings.insert(facade.id(), token);
+        self.control_plane.remember_binding(facade.id(), token);
         facade.publish_binding(
             OwnerRef::Flow {
-                shard: ShardId(0),
+                shard: self.runtime.id,
                 flow,
                 generation: facade.generation(),
             },
@@ -1332,19 +1622,20 @@ impl ProtocolContext {
             options,
         };
         let token = if local.port == 0 {
-            self.bind_registry
-                .reserve_ephemeral(request, ShardId(0))
+            self.control_plane
+                .bind_registry
+                .reserve_ephemeral(request, self.runtime.id)
                 .map_err(map_bind_error)?
         } else {
-            self.bind_registry
+            self.control_plane
+                .bind_registry
                 .reserve(request)
                 .map_err(map_bind_error)?
         };
         local.port = token.port;
-        self.bindings.insert(facade.id(), token);
+        self.control_plane.remember_binding(facade.id(), token);
         facade.publish_binding(
             OwnerRef::Bound {
-                shard: ShardId(0),
                 generation: facade.generation(),
             },
             local,
@@ -1397,28 +1688,26 @@ impl ProtocolContext {
             if !matches!(facade.owner(), OwnerRef::Bound { .. }) {
                 return Err(SocketError::AlreadyConnected);
             }
-            let flow = self
-                .protocol
-                .connect_tcp(
-                    local,
-                    peer,
-                    path,
-                    Arc::clone(facade),
-                    control_sequence,
-                    sched::now_ns_public(),
-                )
-                .map_err(map_tcp_bind_error)?;
-            facade.publish_binding(
-                OwnerRef::Flow {
-                    shard: ShardId(0),
-                    flow,
-                    generation: facade.generation(),
-                },
-                local,
-                Some(peer),
-                Some(path.route.interface),
-            );
-            self.dispatch_tcp_output();
+            let target = self
+                .control_plane
+                .flow_shard(peer, local, TransportProtocol::Tcp);
+            if target == self.runtime.id {
+                self.install_tcp_flow(facade, control_sequence, local, peer, path)?;
+            } else {
+                self.cluster
+                    .publish_control(
+                        target,
+                        ControlWork::ConnectTcp {
+                            facade: Arc::clone(facade),
+                            sequence: control_sequence,
+                            generation: facade.generation(),
+                            local,
+                            peer,
+                            path,
+                        },
+                    )
+                    .map_err(|_| SocketError::RuntimeBusy)?;
+            }
             return Ok(false);
         }
         match facade.owner() {
@@ -1438,7 +1727,7 @@ impl ProtocolContext {
                     .map_err(map_udp_bind_error)?;
                 facade.publish_binding(
                     OwnerRef::Flow {
-                        shard: ShardId(0),
+                        shard: self.runtime.id,
                         flow,
                         generation: facade.generation(),
                     },
@@ -1453,12 +1742,47 @@ impl ProtocolContext {
         }
     }
 
+    fn install_tcp_flow(
+        &mut self,
+        facade: &Arc<SocketFacade>,
+        control_sequence: u64,
+        local: Endpoint,
+        peer: Endpoint,
+        path: TcpPath,
+    ) -> Result<(), SocketError> {
+        let interface = path.route.interface;
+        let flow = self
+            .protocol
+            .connect_tcp(
+                local,
+                peer,
+                path,
+                Arc::clone(facade),
+                control_sequence,
+                sched::now_ns_public(),
+            )
+            .map_err(map_tcp_bind_error)?;
+        facade.publish_binding(
+            OwnerRef::Flow {
+                shard: self.runtime.id,
+                flow,
+                generation: facade.generation(),
+            },
+            local,
+            Some(peer),
+            Some(interface),
+        );
+        self.dispatch_tcp_output();
+        Ok(())
+    }
+
     fn listen_facade(
         &mut self,
         facade: &Arc<SocketFacade>,
+        control_sequence: u64,
         backlog: u32,
         config: &ConfigSnapshot,
-    ) -> Result<(), SocketError> {
+    ) -> Result<bool, SocketError> {
         if facade.kind() != SocketKind::Stream {
             return Err(SocketError::InvalidState);
         }
@@ -1474,27 +1798,60 @@ impl ProtocolContext {
                 config,
             )?;
         }
-        if !matches!(
-            facade.owner(),
-            OwnerRef::Bound { .. } | OwnerRef::Listener { .. }
-        ) {
+        if matches!(facade.owner(), OwnerRef::Listener { .. }) {
+            let group = facade.listen_group().ok_or(SocketError::InvalidState)?;
+            group.update_backlog(backlog);
+            return Ok(true);
+        }
+        if !matches!(facade.owner(), OwnerRef::Bound { .. }) {
             return Err(SocketError::InvalidState);
         }
         let local = facade.local_endpoint().ok_or(SocketError::InvalidState)?;
-        facade.configure_listener(backlog);
-        self.protocol
-            .listen_tcp(local, facade.interface(), Arc::clone(facade))
-            .map_err(map_tcp_bind_error)?;
-        facade.publish_binding(
-            OwnerRef::Listener {
-                shard: ShardId(0),
-                generation: facade.generation(),
-            },
-            local,
-            None,
-            facade.interface(),
+        let cpu_hints = self
+            .cluster
+            .shards
+            .iter()
+            .map(|runtime| runtime.cpu)
+            .collect::<Vec<_>>();
+        let group = ListenGroup::new_with_cpu_hints(
+            self.control_plane.allocate_listener_id(),
+            facade,
+            &cpu_hints,
+            backlog,
         );
-        Ok(())
+        let transaction = Arc::new(ListenerInstall {
+            facade: Arc::clone(facade),
+            group,
+            local,
+            interface: facade.interface(),
+            sequence: control_sequence,
+            generation: facade.generation(),
+            remaining: AtomicUsize::new(self.cluster.shards.len()),
+            failed: AtomicBool::new(false),
+            control: Arc::clone(&self.control_plane),
+            cluster: Arc::clone(&self.cluster),
+        });
+        for runtime in &self.cluster.shards {
+            let mut work = ControlWork::InstallListener {
+                transaction: Arc::clone(&transaction),
+            };
+            loop {
+                match runtime.control.try_push(work) {
+                    Ok(()) => {
+                        if !runtime.pending.swap(true, Ordering::AcqRel) {
+                            runtime.wake_owner();
+                        }
+                        break;
+                    }
+                    Err(pending) => {
+                        work = pending;
+                        runtime.wake_owner();
+                        let _ = sched::operation::sched_yield();
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn drain_socket_tx(&mut self, budget: usize, config: &ConfigSnapshot) -> usize {
@@ -1506,10 +1863,10 @@ impl ProtocolContext {
             processed += 1;
             let flow = match facade.owner() {
                 OwnerRef::Flow {
-                    shard: ShardId(0),
+                    shard,
                     flow,
                     generation,
-                } if generation == facade.generation() => flow,
+                } if shard == self.runtime.id && generation == facade.generation() => flow,
                 _ => {
                     facade.set_pending_error(SocketError::Closed);
                     facade.finish_tx_drain();
@@ -1575,37 +1932,62 @@ impl ProtocolContext {
                 break;
             };
             processed += 1;
+            facade.begin_lifecycle_drain();
             match facade.owner() {
-                OwnerRef::Flow { flow, .. } if facade.kind() == SocketKind::Stream => {
+                OwnerRef::Flow { shard, flow, .. }
+                    if shard == self.runtime.id && facade.kind() == SocketKind::Stream =>
+                {
                     if facade.is_closing() {
                         self.protocol.close_tcp(flow, sched::now_ns_public());
-                        if let Some(token) = self.bindings.remove(&facade.id()) {
-                            let _ = self.bind_registry.release(token);
-                        }
+                        self.control_plane.release_binding(facade.id());
                     } else if facade.write_is_shutdown() {
                         self.protocol
                             .shutdown_tcp_write(flow, sched::now_ns_public());
                     }
                     self.dispatch_tcp_output();
                 }
-                OwnerRef::Flow { flow, .. } if facade.is_closing() => {
+                OwnerRef::Flow { shard, flow, .. }
+                    if shard == self.runtime.id && facade.is_closing() =>
+                {
                     self.protocol.close_udp(flow);
-                    if let Some(token) = self.bindings.remove(&facade.id()) {
-                        let _ = self.bind_registry.release(token);
-                    }
+                    self.control_plane.release_binding(facade.id());
                     facade.publish_closed();
                 }
-                OwnerRef::Listener { .. } if facade.is_closing() => {
-                    self.protocol.close_tcp_listener(&facade);
-                    if let Some(token) = self.bindings.remove(&facade.id()) {
-                        let _ = self.bind_registry.release(token);
+                OwnerRef::Listener { group, .. } if facade.is_closing() => {
+                    if self.control_plane.listeners.lock().contains_key(&group) {
+                        let transaction = Arc::new(ListenerRemove {
+                            facade: Arc::clone(&facade),
+                            group,
+                            remaining: AtomicUsize::new(self.cluster.shards.len()),
+                            control: Arc::clone(&self.control_plane),
+                        });
+                        for runtime in &self.cluster.shards {
+                            let mut work = ControlWork::RemoveListener {
+                                transaction: Arc::clone(&transaction),
+                            };
+                            loop {
+                                match runtime.control.try_push(work) {
+                                    Ok(()) => {
+                                        if !runtime.pending.swap(true, Ordering::AcqRel) {
+                                            runtime.wake_owner();
+                                        }
+                                        break;
+                                    }
+                                    Err(pending) => {
+                                        work = pending;
+                                        runtime.wake_owner();
+                                        let _ = sched::operation::sched_yield();
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        self.control_plane.release_binding(facade.id());
+                        facade.publish_closed();
                     }
-                    facade.publish_closed();
                 }
                 OwnerRef::Bound { .. } | OwnerRef::Unassigned if facade.is_closing() => {
-                    if let Some(token) = self.bindings.remove(&facade.id()) {
-                        let _ = self.bind_registry.release(token);
-                    }
+                    self.control_plane.release_binding(facade.id());
                     facade.publish_closed();
                 }
                 OwnerRef::Closed { .. }
@@ -1640,9 +2022,7 @@ impl ProtocolContext {
                     let egress = packet.egress;
                     let interface = packet.interface;
                     let local_mac = packet.local_mac;
-                    self.input
-                        .push(packet.packet, packet.metadata)
-                        .unwrap_or_else(|_| unreachable!());
+                    self.protocol.push_frontend(packet.packet);
                     for candidate in index + 1..count {
                         let same_source = matches!(
                             self.pending[candidate].as_ref(),
@@ -1656,9 +2036,7 @@ impl ProtocolContext {
                         else {
                             unreachable!();
                         };
-                        self.input
-                            .push(packet.packet, packet.metadata)
-                            .unwrap_or_else(|_| unreachable!());
+                        self.protocol.push_frontend(packet.packet);
                     }
                     self.process_packet_batch(egress, interface, local_mac, config);
                 }
@@ -1686,14 +2064,13 @@ impl ProtocolContext {
     ) {
         let target = Arc::clone(&self.runtime.egress[egress]);
         let stats = Arc::clone(&target.stats);
-        self.protocol.process_rx(
+        self.protocol.process_frontend_batch(
             FlowTurnContext {
                 interface,
                 local_mac,
                 config,
                 now_ns: sched::now_ns_public(),
             },
-            &mut self.input,
             &mut self.tx,
             &mut self.recycle,
             |reason| {
@@ -2089,23 +2466,41 @@ impl WorkerContext {
     }
 
     fn enqueue_rx_batch(&mut self) {
-        let len = self.rx_batch.len();
+        let config = self.config.snapshot();
+        self.frontend.process(
+            self.interface,
+            &config,
+            &mut self.rx_batch,
+            &mut self.frontend_batch,
+        );
+        let len = self.frontend_batch.len();
         for index in 0..len {
-            let Some((packet, metadata)) = self.rx_batch.take(index) else {
+            let Some(packet) = self.frontend_batch.take(index) else {
                 continue;
+            };
+            let target = match packet.parsed.disposition {
+                FrontendDisposition::Tcp => {
+                    self.protocol_cluster.ingress_target(packet.parsed.rss_hash)
+                }
+                FrontendDisposition::Udp
+                | FrontendDisposition::Control(_)
+                | FrontendDisposition::Drop(_) => self.protocol_cluster.coordinator(),
             };
             let work = IngressWork::Packet(IngressPacket {
                 egress: self.egress_index,
                 interface: self.interface,
                 local_mac: self.local_mac,
                 packet,
-                metadata,
             });
-            if let Err(IngressWork::Packet(packet)) = self.protocol_runtime.try_push(work) {
+            if let Err(IngressWork::Packet(packet)) = target.try_push(work) {
                 self.stats.rx_dropped.fetch_add(1, Ordering::Relaxed);
                 self.stats.drop_reasons[DropReason::IngressRingFull.index()]
                     .fetch_add(1, Ordering::Relaxed);
-                self.recycle_chain(packet.packet, packet.metadata, DropReason::IngressRingFull);
+                self.recycle_chain(
+                    packet.packet.chain,
+                    packet.packet.metadata,
+                    DropReason::IngressRingFull,
+                );
             }
         }
     }
@@ -2384,7 +2779,7 @@ impl WorkerContext {
             egress: self.egress_index,
             payload: PacketChain::from_lease(lease),
         };
-        match self.protocol_runtime.try_push(work) {
+        match self.protocol_cluster.coordinator().try_push(work) {
             Ok(()) => self.udp_probe_queued = true,
             Err(IngressWork::UdpProbe { payload, .. }) => {
                 self.recycle_chain(
@@ -2427,7 +2822,7 @@ impl WorkerContext {
             egress: self.egress_index,
             payload: PacketChain::from_lease(lease),
         };
-        match self.protocol_runtime.try_push(work) {
+        match self.protocol_cluster.coordinator().try_push(work) {
             Ok(()) => self.physical_udp_probe_queued = true,
             Err(IngressWork::PhysicalUdpProbe { payload, .. }) => {
                 self.recycle_chain(

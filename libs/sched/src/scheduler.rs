@@ -716,6 +716,13 @@ pub fn enqueue_task_preferred(task: Arc<Task>, now_ns: u64) -> usize {
     cpu_id
 }
 
+/// 按一次性 CPU 提示入队；提示不在线或不在 affinity 中时退回正常放置。
+pub fn enqueue_task_with_hint(task: Arc<Task>, cpu_hint: usize, now_ns: u64) -> usize {
+    let cpu_id = enqueue_task_locked_with_hint(task, now_ns, cpu_hint);
+    request_resched(cpu_id);
+    cpu_id
+}
+
 /// 只把任务放回 runqueue，不主动抢占当前任务。
 ///
 /// vfork child 在 exec 完成时需要唤醒父进程，但 child 自己也刚拿到新的用户态
@@ -755,6 +762,27 @@ fn enqueue_task_locked_with_preference(task: Arc<Task>, now_ns: u64, preferred: 
     } else {
         RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
     }
+    cpu_id
+}
+
+fn enqueue_task_locked_with_hint(task: Arc<Task>, now_ns: u64, cpu_hint: usize) -> usize {
+    if task.arch_context().is_none() || matches!(task.state(), TaskState::Zombie | TaskState::Dead)
+    {
+        task.sched.set_on_rq(false);
+        return task.current_cpu().min(NR_CPUS - 1);
+    }
+    if task.sched.on_rq() {
+        return task.current_cpu().min(NR_CPUS - 1);
+    }
+    let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
+    let hinted = CpuId::new(cpu_hint)
+        .filter(|cpu| affinity.contains(*cpu) && online_cpu_set().contains(*cpu));
+    let cpu_id = hinted
+        .or_else(|| select_cpu_for_mask(affinity, None, false))
+        .unwrap_or_else(CpuId::boot)
+        .get();
+    task.set_current_cpu(cpu_id);
+    RUNQUEUES[cpu_id].enqueue(Arc::clone(&task), now_ns);
     cpu_id
 }
 

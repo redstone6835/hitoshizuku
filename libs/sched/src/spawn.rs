@@ -13,8 +13,8 @@ use crate::eevdf::SchedParams;
 use crate::group::{ProcessGroup, Session, ThreadGroup};
 use crate::sched_class::{SchedAttr, SchedPolicy};
 use crate::scheduler::{
-    current_task, enqueue_task, init_task, is_current_on_any_cpu, mark_task_exited, now_ns_public,
-    root_pid_ns, schedule_once,
+    current_task, enqueue_task, enqueue_task_with_hint, init_task, is_current_on_any_cpu,
+    mark_task_exited, now_ns_public, root_pid_ns, schedule_once,
 };
 use crate::signal::SignalNumber;
 use crate::task::{Task, ext_clone_hook};
@@ -113,6 +113,30 @@ pub fn activate_task(task: &Arc<Task>) -> Result<usize, errno::Errno> {
         | TaskState::Dead => return Err(errno::Errno::EINVAL),
     }
     Ok(enqueue_task(Arc::clone(task), now_ns_public()))
+}
+
+/// 唤醒任务并优先放到指定 CPU；提示不可用时仍会选择其它合法 CPU。
+pub fn activate_task_with_cpu_hint(
+    task: &Arc<Task>,
+    cpu_hint: usize,
+) -> Result<usize, errno::Errno> {
+    if task.arch_context().is_none() {
+        return Err(errno::Errno::EINVAL);
+    }
+    match task.state() {
+        TaskState::New | TaskState::Runnable | TaskState::Sleeping => {}
+        TaskState::Running
+        | TaskState::Uninterruptible
+        | TaskState::Stopped
+        | TaskState::Continued
+        | TaskState::Zombie
+        | TaskState::Dead => return Err(errno::Errno::EINVAL),
+    }
+    Ok(enqueue_task_with_hint(
+        Arc::clone(task),
+        cpu_hint,
+        now_ns_public(),
+    ))
 }
 
 /// 回滚尚未运行、尚未入队的新任务。用于 clone/exec 安装用户上下文失败的路径。

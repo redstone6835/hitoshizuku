@@ -1,12 +1,12 @@
 use crate::buf::{CompletionToken, DropReason, PacketBatch, PacketChain, TxBatch, TxPacket};
 use crate::control::{ConfigError, ConfigSnapshot, NeighborKey, NeighborTable};
-use crate::pipeline::{FrontendBatch, FrontendDisposition, VectorFrontend};
+use crate::pipeline::{FrontendBatch, FrontendDisposition, FrontendPacket, VectorFrontend};
 use crate::transport::{
     ControlPacketResult, PreparedTcpTx, PreparedUdpTx, TcpBindError, TcpEndpointTable,
     TcpIngressError, TcpPath, UdpBindError, UdpDatagram, UdpEndpointTable, UdpTxError,
     build_tcp_reset, build_udp_packet, handle_control_packet,
 };
-use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ShardId};
+use crate::{Endpoint, FlowId, InterfaceId, IpAddr, ListenGroup, ListenGroupId, ShardId};
 use crate::{OwnerRef, SocketError, SocketFacade, UdpTxLease};
 use alloc::sync::Arc;
 
@@ -69,7 +69,7 @@ impl FlowShard {
             frontend: VectorFrontend::new(rss_key, rss_generation),
             frontend_batch: FrontendBatch::new(),
             udp: UdpEndpointTable::new(rss_key),
-            tcp: TcpEndpointTable::new(rss_key, tcp_isn_key),
+            tcp: TcpEndpointTable::new_on_shard(id, rss_key, tcp_isn_key),
             neighbors: NeighborTable::new(hash_seed),
             timers: TimerWheel::new(8192, now_ns / 1_000_000),
             next_completion: 1,
@@ -114,9 +114,9 @@ impl FlowShard {
         &mut self,
         local: Endpoint,
         interface: Option<InterfaceId>,
-        facade: Arc<SocketFacade>,
+        group: Arc<ListenGroup>,
     ) -> Result<(), TcpBindError> {
-        self.tcp.listen(local, interface, facade)
+        self.tcp.listen(local, interface, group)
     }
 
     pub fn connect_tcp(
@@ -147,8 +147,8 @@ impl FlowShard {
         }
     }
 
-    pub fn close_tcp_listener(&mut self, facade: &Arc<SocketFacade>) -> bool {
-        self.tcp.close_listener(facade)
+    pub fn close_tcp_listener(&mut self, group: ListenGroupId) -> bool {
+        self.tcp.close_listener(group)
     }
 
     pub fn drain_tcp_send(&mut self, flow: FlowId, now_ns: u64) {
@@ -329,7 +329,7 @@ impl FlowShard {
         input: &mut PacketBatch,
         tx: &mut TxBatch,
         recycle: &mut PacketBatch,
-        mut record_drop: impl FnMut(DropReason),
+        record_drop: impl FnMut(DropReason),
     ) {
         self.frontend.process(
             context.interface,
@@ -337,6 +337,16 @@ impl FlowShard {
             input,
             &mut self.frontend_batch,
         );
+        self.process_frontend_batch(context, tx, recycle, record_drop);
+    }
+
+    pub fn process_frontend_batch(
+        &mut self,
+        context: FlowTurnContext<'_>,
+        tx: &mut TxBatch,
+        recycle: &mut PacketBatch,
+        mut record_drop: impl FnMut(DropReason),
+    ) {
         let len = self.frontend_batch.len();
         for index in 0..len {
             let Some(packet) = self.frontend_batch.take(index) else {
@@ -487,6 +497,10 @@ impl FlowShard {
         }
         self.run_timers(context.now_ns);
         self.run_dirty(256);
+    }
+
+    pub fn push_frontend(&mut self, packet: FrontendPacket) {
+        self.frontend_batch.push(packet);
     }
 
     fn run_timers(&mut self, now_ns: u64) {

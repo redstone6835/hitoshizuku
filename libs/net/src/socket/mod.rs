@@ -1,5 +1,9 @@
 //! 跨 CPU 稳定 socket facade、协议数据环与精确 readiness。
 
+mod listen_group;
+
+pub use listen_group::ListenGroup;
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -11,7 +15,7 @@ use spin::{Mutex, RwLock};
 
 use crate::control::BindOptions;
 use crate::device::boot_config;
-use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, ShardId, SocketId};
+use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, ListenGroupId, ShardId, SocketId};
 
 const UDP_RING_ENTRIES: usize = 256;
 const UDP_BUFFER_BYTES: usize = 128 * 1024;
@@ -33,11 +37,10 @@ static SOCKET_RUNTIME: RwLock<Option<&'static dyn SocketRuntime>> = RwLock::new(
 pub enum OwnerRef {
     Unassigned,
     Bound {
-        shard: ShardId,
         generation: u32,
     },
     Listener {
-        shard: ShardId,
+        group: ListenGroupId,
         generation: u32,
     },
     Flow {
@@ -340,20 +343,6 @@ impl StreamRxRing {
         Self {
             bytes: ByteRing::new(),
             eof: false,
-        }
-    }
-}
-
-struct AcceptQueue {
-    backlog: usize,
-    children: VecDeque<Arc<SocketFacade>>,
-}
-
-impl AcceptQueue {
-    fn new() -> Self {
-        Self {
-            backlog: 0,
-            children: VecDeque::new(),
         }
     }
 }
@@ -708,7 +697,7 @@ pub struct SocketFacade {
     rx: Mutex<Option<RxRing>>,
     stream_tx: Mutex<StreamTxRing>,
     stream_rx: Mutex<StreamRxRing>,
-    accept_queue: Mutex<AcceptQueue>,
+    listen_group: Mutex<Option<Arc<ListenGroup>>>,
     readiness: AtomicU16,
     readiness_generation: AtomicU64,
     observer: Mutex<Option<Weak<dyn ReadinessObserver>>>,
@@ -720,6 +709,7 @@ pub struct SocketFacade {
     control_sequence: AtomicU64,
     control_result: Mutex<Option<(u64, Result<(), SocketError>)>>,
     tx_notified: AtomicBool,
+    lifecycle_notified: AtomicBool,
     closing: AtomicBool,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
@@ -766,7 +756,7 @@ impl SocketFacade {
             rx: Mutex::new((kind == SocketKind::Datagram).then(RxRing::new)),
             stream_tx: Mutex::new(StreamTxRing::new()),
             stream_rx: Mutex::new(StreamRxRing::new()),
-            accept_queue: Mutex::new(AcceptQueue::new()),
+            listen_group: Mutex::new(None),
             readiness: AtomicU16::new(if kind == SocketKind::Datagram {
                 Readiness::WRITABLE.0
             } else {
@@ -782,6 +772,7 @@ impl SocketFacade {
             control_sequence: AtomicU64::new(1),
             control_result: Mutex::new(None),
             tx_notified: AtomicBool::new(false),
+            lifecycle_notified: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
@@ -998,8 +989,15 @@ impl SocketFacade {
             return Err(SocketError::InvalidState);
         }
         loop {
-            let child = self.accept_queue.lock().children.pop_front();
-            if let Some(child) = child {
+            let group = self.listen_group.lock().as_ref().cloned();
+            let Some(group) = group else {
+                return Err(if self.closing.load(Ordering::Acquire) {
+                    SocketError::Closed
+                } else {
+                    SocketError::InvalidState
+                });
+            };
+            if let Some(child) = group.accept() {
                 self.refresh_accept_readiness();
                 return Ok(child);
             }
@@ -1013,33 +1011,29 @@ impl SocketFacade {
         }
     }
 
-    pub fn configure_listener(&self, backlog: u32) {
-        self.accept_queue.lock().backlog = (backlog as usize).clamp(1, 4096);
+    pub fn install_listen_group(&self, group: Arc<ListenGroup>) {
+        *self.listen_group.lock() = Some(group);
     }
 
     pub fn listener_backlog(&self) -> usize {
-        self.accept_queue.lock().backlog.max(1)
+        self.listen_group
+            .lock()
+            .as_ref()
+            .map_or(1, |group| group.accept_limit())
     }
 
-    pub fn push_accepted(&self, child: Arc<SocketFacade>) -> Result<(), Arc<SocketFacade>> {
-        if self.closing.load(Ordering::Acquire) {
-            return Err(child);
-        }
-        let was_empty = {
-            let mut queue = self.accept_queue.lock();
-            if queue.children.len() >= queue.backlog {
-                return Err(child);
-            }
-            let was_empty = queue.children.is_empty();
-            queue.children.push_back(child);
-            was_empty
-        };
-        if was_empty {
-            self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
-            self.accept_wait.wake_one_default();
-            self.read_wait.wake_one_default();
-        }
-        Ok(())
+    pub fn listen_group(&self) -> Option<Arc<ListenGroup>> {
+        self.listen_group.lock().as_ref().cloned()
+    }
+
+    pub(crate) fn notify_accept_ready(&self, cpu_hint: usize) {
+        self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
+        self.accept_wait.wake_one_with(|task| {
+            let _ = sched::activate_task_with_cpu_hint(task, cpu_hint);
+        });
+        self.read_wait.wake_one_with(|task| {
+            let _ = sched::activate_task_with_cpu_hint(task, cpu_hint);
+        });
     }
 
     pub fn send(
@@ -1600,6 +1594,7 @@ impl SocketFacade {
             self.clear_ready(Readiness::WRITABLE);
             if self.kind == SocketKind::Stream
                 && let Ok(runtime) = socket_runtime()
+                && !self.lifecycle_notified.swap(true, Ordering::AcqRel)
             {
                 runtime.notify_lifecycle(Arc::clone(self));
             }
@@ -1621,18 +1616,19 @@ impl SocketFacade {
         self.accept_wait.wake_all();
         self.state_wait.wake_all();
         if self.kind == SocketKind::Stream {
-            let children = {
-                let mut queue = self.accept_queue.lock();
-                core::mem::take(&mut queue.children)
-            };
-            for child in children {
-                child.close();
+            if let Some(group) = self.listen_group.lock().take() {
+                for child in group.close() {
+                    child.close();
+                }
             }
         }
-        if let Ok(runtime) = socket_runtime() {
-            runtime.notify_lifecycle(Arc::clone(self));
-        } else {
-            *self.owner.lock() = OwnerRef::Closed { generation };
+        match socket_runtime() {
+            Ok(runtime) => {
+                if !self.lifecycle_notified.swap(true, Ordering::AcqRel) {
+                    runtime.notify_lifecycle(Arc::clone(self));
+                }
+            }
+            Err(_) => *self.owner.lock() = OwnerRef::Closed { generation },
         }
     }
 
@@ -1645,6 +1641,11 @@ impl SocketFacade {
         }
         *self.control_result.lock() = Some((sequence, result));
         self.state_wait.wake_all();
+    }
+
+    pub fn begin_lifecycle_drain(&self) {
+        self.lifecycle_notified.store(false, Ordering::Release);
+        fence(Ordering::SeqCst);
     }
 
     pub fn publish_binding(
@@ -1840,7 +1841,12 @@ impl SocketFacade {
     }
 
     fn refresh_accept_readiness(&self) {
-        if self.accept_queue.lock().children.is_empty() {
+        if self
+            .listen_group
+            .lock()
+            .as_ref()
+            .is_none_or(|group| !group.has_ready())
+        {
             self.clear_ready(Readiness::ACCEPTABLE | Readiness::READABLE);
         } else {
             self.set_ready(Readiness::ACCEPTABLE | Readiness::READABLE);

@@ -26,6 +26,11 @@ pub struct InterfaceId(pub u32);
 #[repr(transparent)]
 pub struct ShardId(pub u16);
 
+/// 一次启动内不复用的监听组编号。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ListenGroupId(pub u64);
+
 /// 单个分片内可稳定定位的流编号。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]

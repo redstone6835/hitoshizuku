@@ -5,6 +5,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod address;
 pub mod buf;
@@ -21,9 +23,9 @@ pub mod tuning;
 
 pub use address::{AddressFamily, Endpoint, IpAddr, Ipv4Addr, Ipv6Addr, TransportProtocol};
 pub use flow::{FlowShard, FlowTurnContext, UdpSendError, UdpSendFailure};
-pub use id::{FlowId, InterfaceId, NetDeviceId, QueuePairId, ShardId, SocketId};
+pub use id::{FlowId, InterfaceId, ListenGroupId, NetDeviceId, QueuePairId, ShardId, SocketId};
 pub use socket::{
-    InstallSocketRuntimeError, OwnerRef, Readiness, ReadinessObserver, SocketCommand, SocketError,
-    SocketFacade, SocketKind, SocketRuntime, TcpInfoSnapshot, TcpTxLease, UdpReceive, UdpTxLease,
-    install_socket_runtime, new_socket_facade, new_tcp_socket_facade,
+    InstallSocketRuntimeError, ListenGroup, OwnerRef, Readiness, ReadinessObserver, SocketCommand,
+    SocketError, SocketFacade, SocketKind, SocketRuntime, TcpInfoSnapshot, TcpTxLease, UdpReceive,
+    UdpTxLease, install_socket_runtime, new_socket_facade, new_tcp_socket_facade,
 };
