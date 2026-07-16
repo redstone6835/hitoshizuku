@@ -82,7 +82,9 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                 ElmEbiSourceKind::Projection => {
                     load_projection_image(principal, source_payload, current_ebi_arch())
                 }
-                ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                ElmEbiSourceKind::Builtin
+                | ElmEbiSourceKind::Memory
+                | ElmEbiSourceKind::BuildBound => {
                     return response_only(ElmMgrResponseHeader::unsupported());
                 }
             };
@@ -134,7 +136,9 @@ pub(crate) fn dispatch_mgr_call_as(principal: ElmPrincipal, input: &[u8]) -> Vec
                 ElmEbiSourceKind::Projection => {
                     load_projection_image(principal, source_payload, current_ebi_arch())
                 }
-                ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                ElmEbiSourceKind::Builtin
+                | ElmEbiSourceKind::Memory
+                | ElmEbiSourceKind::BuildBound => {
                     return response_only(ElmMgrResponseHeader::unsupported());
                 }
             };
@@ -390,7 +394,9 @@ fn dispatch_mgr_call_on_core_unchecked(
                         Err(status) => response_only(response_header_from_status(status)),
                     }
                 }
-                ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                ElmEbiSourceKind::Builtin
+                | ElmEbiSourceKind::Memory
+                | ElmEbiSourceKind::BuildBound => {
                     response_only(ElmMgrResponseHeader::unsupported())
                 }
             }
@@ -458,7 +464,9 @@ fn dispatch_mgr_call_on_core_unchecked(
                         Err(status) => response_only(response_header_from_status(status)),
                     }
                 }
-                ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory => {
+                ElmEbiSourceKind::Builtin
+                | ElmEbiSourceKind::Memory
+                | ElmEbiSourceKind::BuildBound => {
                     response_only(ElmMgrResponseHeader::unsupported())
                 }
             }

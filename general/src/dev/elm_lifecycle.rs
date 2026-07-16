@@ -362,7 +362,7 @@ pub(crate) fn track_device_function(
     })
 }
 
-pub(crate) fn forget_device_function(device: &Arc<PnpDevice>, class_id: DeviceClassId, name: &str) {
+pub(crate) fn forget_device_function(device: &PnpDevice, class_id: DeviceClassId, name: &str) {
     forget(ResourceKey::DeviceFunction {
         device_id: device.runtime_id(),
         class_id,

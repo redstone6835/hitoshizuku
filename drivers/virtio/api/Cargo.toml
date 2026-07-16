@@ -1,0 +1,19 @@
+[package]
+name = "virtio"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+test = false
+doctest = false
+bench = false
+
+[features]
+default = []
+elm-provider = []
+elm-consumer = []
+elm-integrated = []
+
+[dependencies]
+elm = { path = "../.elm/framework/elm", default-features = false, features = ["module", "macros"] }
+general = { path = "../.elm/framework/general", default-features = false }

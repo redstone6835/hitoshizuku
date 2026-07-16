@@ -140,8 +140,8 @@ pub use managed::{
 };
 pub use metadata::MetadataStats;
 pub use registry::{
-    AllocationRegistryAudit, AllocationRegistryAuditFlags, AllocationRegistrySnapshot,
-    AllocationRegistryStats,
+    AllocationOwnerStats, AllocationRegistryAudit, AllocationRegistryAuditFlags,
+    AllocationRegistrySnapshot, AllocationRegistryStats,
 };
 pub use request::{
     AllocationArena, AllocationKind, AllocationRecord, AllocationRequestError, ManagedAllocFlags,
@@ -1021,6 +1021,11 @@ impl KernelMemorySubsystem {
 
     pub fn registry_stats(&self) -> AllocationRegistryStats {
         self.registry.stats()
+    }
+
+    /// 返回指定外部所有者当前仍存活的 allocator 分配摘要。
+    pub fn owner_allocation_stats(&self, owner: u64) -> AllocationOwnerStats {
+        self.registry.owner_stats(owner)
     }
 
     /// 扫描 registry 内部链表并返回结构审计结果。

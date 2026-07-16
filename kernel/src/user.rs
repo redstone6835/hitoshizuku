@@ -1191,7 +1191,10 @@ fn read_exact_file(file: &File, offset: u64, buf: &mut [u8]) -> Result<(), errno
     Ok(())
 }
 
-fn load_file_from_task_vfs(task: &Arc<Task>, path: &str) -> Result<Vec<u8>, errno::Errno> {
+pub(crate) fn load_file_from_task_vfs(
+    task: &Arc<Task>,
+    path: &str,
+) -> Result<Vec<u8>, errno::Errno> {
     let file = open_file_from_task_vfs(task, path)?;
     let size = usize::try_from(file_size(&file)?).map_err(|_| errno::Errno::EFBIG)?;
     if size == 0 {

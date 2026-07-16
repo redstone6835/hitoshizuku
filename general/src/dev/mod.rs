@@ -39,8 +39,6 @@ pub mod random_source;
 pub mod rtc;
 pub mod syscon;
 pub mod usb;
-pub mod virtio;
-pub mod virtio_mmio;
 
 mod elm_lifecycle;
 mod registry_id;

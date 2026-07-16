@@ -11,8 +11,7 @@
 //! - 链路状态、MAC、MTU 等元数据通过单独的访问器查询，不放进每帧路径。
 //!
 //! 任何想接入本协议栈的硬件驱动只需要实现 [`NetDriver`]，无需关心
-//! smoltcp 或者具体协议。`general/src/dev/drivers/virtio_net.rs` 是
-//! 第一个实例。
+//! smoltcp 或者具体协议；具体硬件实现可以由独立 ELM 驱动提供。
 
 use alloc::boxed::Box;
 use core::any::Any;

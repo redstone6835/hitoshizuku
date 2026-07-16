@@ -1,0 +1,16 @@
+[elm]
+name = "virtio.framework"
+version = "0.1.0"
+kind = "service"
+source = "kernel-tree:drivers.virtio"
+mode = "m"
+
+[api]
+crate = "virtio"
+path = "api"
+contract = "driver.virtio.framework@1"
+version = "1"
+
+[[profiles]]
+id = "contest-2026"
+priority = "100"

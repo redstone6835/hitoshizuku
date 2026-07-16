@@ -1,16 +1,63 @@
+#![no_std]
+
 //! VirtIO 公共传输与 split virtqueue 支持。
 //!
 //! 本模块只放 VirtIO 协议本身的公共概念：PCI 传输层设备匹配、capability 类型、
 //! device status 位，以及 split virtqueue 的 DMA 布局和描述符记账。具体驱动仍负责
 //! 选择队列编号、编程设备寄存器，并在 [`SplitVirtQueue::push_avail`] 后通知设备。
 
+extern crate alloc;
+
 use alloc::vec::Vec;
 use core::mem;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 
-use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
-use crate::dev::pci::{PciBarType, PciDevice};
+use general::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
+use general::dev::pci::{PciBarType, PciDevice};
+
+pub mod virtio_mmio;
+
+#[cfg(all(feature = "elm-provider", feature = "elm-consumer"))]
+compile_error!("virtio API crate 不能同时作为 provider 与 consumer 构建");
+
+#[cfg(feature = "elm-provider")]
+#[elm::export(
+    name = "virtio.framework.revision",
+    contract = "driver.virtio.framework@1",
+    version = 1,
+    mode = "direct-pinned",
+    visibility = "dependency"
+)]
+pub fn framework_revision() -> u32 {
+    1
+}
+
+#[cfg(all(feature = "elm-consumer", not(feature = "elm-integrated")))]
+#[elm::import(
+    name = "virtio.framework.revision",
+    contract = "driver.virtio.framework@1",
+    version = 1,
+    mode = "direct-pinned"
+)]
+static FRAMEWORK_REVISION: elm::DirectImport<fn() -> u32> = elm::DirectImport::new();
+
+/// 验证当前 Block ELM 已经绑定到兼容的 VirtIO Framework。
+///
+/// 动态 ELM 通过 direct-pinned import 固定 provider generation；集成构建中的协议逻辑
+/// 已经编译进同一内核镜像，因此只校验编译期 API 版本。
+#[cfg(feature = "elm-consumer")]
+pub fn framework_ready() -> bool {
+    #[cfg(feature = "elm-integrated")]
+    {
+        true
+    }
+    #[cfg(not(feature = "elm-integrated"))]
+    {
+        // Safety: ELM 装载器已按精确 Rust ABI 摘要绑定该不可变函数指针槽。
+        unsafe { FRAMEWORK_REVISION.get() }.is_some_and(|revision| revision() == 1)
+    }
+}
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -104,19 +151,6 @@ impl VirtioPciFunction {
     }
 }
 
-/// VirtIO PCI network function。
-pub const VIRTIO_PCI_FUNCTION_NETWORK: VirtioPciFunction =
-    VirtioPciFunction::new("network", 0x1000, 0x1041);
-/// VirtIO PCI block function。
-pub const VIRTIO_PCI_FUNCTION_BLOCK: VirtioPciFunction =
-    VirtioPciFunction::new("block", 0x1001, 0x1042);
-
-/// 当前公共层认识的 VirtIO PCI function 描述表。
-///
-/// 表本身只表达协议级 ID 映射；具体是否有驱动绑定由 PnP driver catalog 决定。
-pub const VIRTIO_PCI_FUNCTIONS: &[VirtioPciFunction] =
-    &[VIRTIO_PCI_FUNCTION_NETWORK, VIRTIO_PCI_FUNCTION_BLOCK];
-
 /// VirtIO PCI capability 对应的一段 BAR 内 MMIO 窗口。
 #[derive(Clone, Copy, Debug)]
 pub struct VirtioPciCap {
@@ -160,12 +194,6 @@ pub struct VirtioPciCaps {
 /// capability、长度满足基础结构要求、BAR 必须是 MMIO、offset/length 不能越过
 /// BAR 边界。各设备类型的寄存器访问范围仍由具体驱动按自己的 common/device
 /// config 使用方式继续校验。
-#[kernel_symbols::export(
-    name = "general.dev.virtio.parse_virtio_pci_caps",
-    contract = "kernel.general.virtio-pci@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_BUS
-)]
 pub fn parse_virtio_pci_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
     let mut common: Option<VirtioPciCap> = None;
     let mut notify: Option<VirtioPciCap> = None;
@@ -173,7 +201,8 @@ pub fn parse_virtio_pci_caps(pci: &PciDevice) -> Option<VirtioPciCaps> {
     let mut device: Option<VirtioPciCap> = None;
 
     for cap_header in pci
-        .capabilities()
+        .capabilities_snapshot()
+        .into_iter()
         .filter(|cap| cap.id == VIRTIO_PCI_CAP_VENDOR_SPECIFIC)
     {
         let ptr = cap_header.offset;
@@ -1268,12 +1297,6 @@ impl SplitVirtQueue {
 ///
 /// VirtIO split queue 的 ring 取模逻辑要求队列大小为 2 的幂；这里把“从设备
 /// 能力中挑一个可用大小”的策略集中到公共层，避免各个传输驱动各自硬编码 128/256。
-#[kernel_symbols::export(
-    name = "general.dev.virtio.choose_split_queue_size",
-    contract = "kernel.general.virtio-queue@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_BUS
-)]
 pub fn choose_split_queue_size(
     max_size: u16,
     preferred_limit: Option<u16>,

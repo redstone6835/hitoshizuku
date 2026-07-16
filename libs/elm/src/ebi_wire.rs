@@ -47,6 +47,8 @@ pub enum ElmEbiSourceKind {
     Builtin = 3,
     /// `Memory` 表示 `ElmEbiSourceKind` 的对象类别：`memory`。
     Memory = 4,
+    /// `BuildBound` 表示镜像由当前内核构建产物的不可变清单精确绑定。
+    BuildBound = 5,
 }
 
 impl ElmEbiSourceKind {
@@ -56,6 +58,7 @@ impl ElmEbiSourceKind {
             2 => Some(Self::Projection),
             3 => Some(Self::Builtin),
             4 => Some(Self::Memory),
+            5 => Some(Self::BuildBound),
             _ => None,
         }
     }

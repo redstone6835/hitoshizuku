@@ -1,0 +1,13 @@
+format = "ELM-MODULE-SET-V1"
+
+[[modules]]
+name = "virtio.framework"
+path = "virtio"
+config = "CONFIG_VIRTIO"
+
+[[modules]]
+name = "virtio.block"
+path = "virtio-blk"
+config = "CONFIG_VIRTIO_BLK"
+depends = "virtio.framework"
+inherit_mode = "virtio.framework"

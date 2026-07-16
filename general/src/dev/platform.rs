@@ -241,11 +241,24 @@ pub struct PlatformDeviceInfo {
     pub fw_properties: Vec<FirmwareProperty>,
 }
 
+#[kernel_symbols::export]
 impl PlatformDeviceInfo {
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.has_id",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY
+    )]
     pub fn has_id(&self, expected: &str) -> bool {
         self.ids.iter().any(|id| id.matches_str(expected))
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.first_mmio",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn first_mmio(&self) -> Option<(usize, usize)> {
         self.mmio_at(0)
     }
@@ -285,6 +298,12 @@ impl PlatformDeviceInfo {
     ///
     /// platform 设备没有统一可枚举配置空间，DMA coherent 等能力来自固件属性。
     /// 未声明时不假设设备 cache coherent；地址转换仍走平台 mapper 的默认入口。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.dma_context",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA
+    )]
     pub fn dma_context(&self) -> DmaContext {
         DmaContext::with_constraints(DmaConstraints {
             address_mask: usize::MAX,
@@ -342,6 +361,15 @@ impl PlatformDeviceInfo {
     /// 多个 IRQ 资源按固件声明顺序检查；已经声明但暂时无法翻译时返回
     /// [`PlatformIrqRegistrationError::Unresolved`]，让 PnP core 保留设备并等待
     /// interrupt-controller 驱动完成注册后重试 probe。
+    #[kernel_symbols::export(
+        name = "general.dev.platform.PlatformDeviceInfo.register_first_irq_handler",
+        contract = "kernel.general.platform-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 2u64
+    )]
     pub fn register_first_irq_handler(
         &self,
         handler: Arc<dyn IrqHandler>,

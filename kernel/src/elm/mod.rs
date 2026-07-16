@@ -2,7 +2,15 @@
 //!
 //! 本模块只实现 ELM 自己的枢纽连接层和管理入口，不复用 Linux 模块系统调用。
 
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+
+use elm_model::{
+    ELM_MGR_BUILTIN_ID, ElmEbiLoadStatus, ElmEbiSourceKind, ElmPrincipal, ElmResourceBudget,
+    ElmSliceImageReader, canonical_ebi_digest, sha256,
+};
+use sched::Task;
 
 mod api_registry;
 mod core;
@@ -109,6 +117,91 @@ pub(crate) fn init_builtin_mgr() {
             executor::start_provider_worker();
         }
         Err(err) => log::error!("[elm] init builtin elm-mgr failed: {:?}", err),
+    }
+}
+
+pub(crate) fn load_build_bound_modules(init: &Arc<Task>) -> Result<usize, String> {
+    let modules = trust_config::build_bound_modules();
+    if modules.is_empty() {
+        return Ok(0);
+    }
+    let current_profile = kernel_interface_profile_hash()?;
+    if current_profile != trust_config::build_profile_hash() {
+        return Err("BuildBound Profile 与当前内核符号目录不一致".to_string());
+    }
+    let manifest = crate::user::load_file_from_task_vfs(init, "/lib/elm/modules.manifest")
+        .map_err(|err| format!("读取 BuildBound 清单失败: {err:?}"))?;
+    if sha256(&manifest) != trust_config::build_manifest_hash() {
+        return Err("initramfs 中的 BuildBound 清单摘要不匹配".to_string());
+    }
+
+    let arch = current_ebi_arch();
+    let mut loaded = 0usize;
+    for module in modules {
+        let path = format!("/lib/elm/{}", module.file_name);
+        let bytes = crate::user::load_file_from_task_vfs(init, &path)
+            .map_err(|err| format!("读取 BuildBound 模块 {} 失败: {err:?}", module.name))?;
+        if sha256(&bytes) != module.eki_hash {
+            return Err(format!("BuildBound 模块 {} 的 EKI 摘要不匹配", module.name));
+        }
+        let reader = ElmSliceImageReader::new(&bytes);
+        let image = source::project_ebi_image(module.provider_id, &reader, arch)
+            .map_err(|status| format!("投影 BuildBound 模块 {} 失败: {status:?}", module.name))?;
+        if image.unit.manifest.name.as_str() != module.name
+            || canonical_ebi_digest(&image) != module.ebi_hash
+        {
+            return Err(format!("BuildBound 模块 {} 的 EBI 身份不匹配", module.name));
+        }
+        let budget = ElmResourceBudget::DEFAULT;
+        let mut authorization = with_core(|core| {
+            core.authorize_mgr_call(
+                ElmPrincipal::kernel(),
+                elm_model::ElmMgrCallKind::LoadCell,
+                core::ElmMgrAccessTarget::Load(ELM_MGR_BUILTIN_ID, budget),
+            )
+        });
+        if !authorization.allowed() {
+            return Err(format!(
+                "BuildBound 模块 {} 未通过内核装载策略",
+                module.name
+            ));
+        }
+        let response = core::load_ebi_image_unlocked(
+            image,
+            arch,
+            ElmEbiSourceKind::BuildBound,
+            ELM_MGR_BUILTIN_ID,
+            budget,
+            false,
+            true,
+            &mut authorization,
+        )
+        .map_err(|status| format!("装载 BuildBound 模块 {} 失败: {status}", module.name))?;
+        if response.status != ElmEbiLoadStatus::Ok as i32 {
+            return Err(format!(
+                "装载 BuildBound 模块 {} 被运行时拒绝: {}",
+                module.name, response.status
+            ));
+        }
+        loaded += 1;
+        log::info!(
+            "[elm] BuildBound module active: name={} cell={} order={}",
+            module.name,
+            response.cell_id,
+            module.order
+        );
+    }
+    Ok(loaded)
+}
+
+fn current_ebi_arch() -> elm_model::ElmEbiArch {
+    #[cfg(target_arch = "riscv64")]
+    {
+        elm_model::ElmEbiArch::Riscv64
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        elm_model::ElmEbiArch::LoongArch64
     }
 }
 

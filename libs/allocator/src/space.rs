@@ -652,6 +652,14 @@ impl KernelAddressSpace {
                 return Err(AddressSpaceError::MappingUnavailable);
             };
 
+            // 架构回调可能按需分配长期存在的页表页；它们属于内核地址空间元数据，
+            // 不能继承触发本次堆扩展的 ELM owner。
+            let Some(_accounting) = crate::suspend_implicit_allocation_accounting() else {
+                let _ = self.arena_lock(arena).lock().free(vaddr, size);
+                let mut phys = phys.lock();
+                let _ = phys.free_pages(allocation.paddr, allocation.order);
+                return Err(AddressSpaceError::MappingFailed);
+            };
             // 在没有任何 allocator 锁的情况下调用 map_fn
             if !map_fn(vaddr, allocation.paddr, allocation.size, page_policy) {
                 // 回滚：同时释放虚拟地址和物理页
@@ -733,6 +741,14 @@ impl KernelAddressSpace {
                 let _ = phys.free_pages(allocation.paddr, allocation.order);
                 return Err(AddressSpaceError::MappingUnavailable);
             };
+            // 与普通地址分配路径保持相同的 owner 隔离语义，避免固定地址映射所需的
+            // 页表页被记到调用方 ELM 名下。
+            let Some(_accounting) = crate::suspend_implicit_allocation_accounting() else {
+                let _ = self.arena_lock(arena).lock().free(vaddr, size);
+                let mut phys = phys.lock();
+                let _ = phys.free_pages(allocation.paddr, allocation.order);
+                return Err(AddressSpaceError::MappingFailed);
+            };
             if !map_fn(vaddr, allocation.paddr, allocation.size, page_policy) {
                 let _ = self.arena_lock(arena).lock().free(vaddr, size);
                 let mut phys = phys.lock();
@@ -769,6 +785,13 @@ impl KernelAddressSpace {
                     range.arena, range.vaddr, range.size,
                 );
             };
+            // 解除映射也可能触发架构级元数据维护，必须与映射路径使用同一归属边界。
+            let _accounting = crate::suspend_implicit_allocation_accounting().unwrap_or_else(|| {
+                panic!(
+                    "[alloc][invariant] failed to suspend implicit accounting while unmapping arena={:?} vaddr={:#x} size={}",
+                    range.arena, range.vaddr, range.size,
+                )
+            });
             if !unmap_fn(range.vaddr, range.size) {
                 panic!(
                     "[alloc][invariant] backed free unmap failed arena={:?} vaddr={:#x} size={}",

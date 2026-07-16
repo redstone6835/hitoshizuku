@@ -233,7 +233,12 @@ impl IrqRegistry {
         }) {
             return Err(IrqError::AlreadyRegistered);
         }
-        handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        {
+            // handler 表容量在注销单个 handler 后仍由内核复用，不归动态单元所有。
+            let _accounting =
+                allocator::suspend_implicit_allocation_accounting().ok_or(IrqError::OutOfMemory)?;
+            handlers.try_reserve(1).map_err(|_| IrqError::OutOfMemory)?;
+        }
         let id = registry_id::alloc_atomic_id(&self.next_id).map_err(|_| IrqError::OutOfMemory)?;
         let line = request.line;
         handlers.push(IrqRegistration {

@@ -28,8 +28,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::mutex::Mutex;
 
 #[cfg(feature = "block-profile")]
-use super::virtio_block_common::VirtioBlkProfile;
-use super::virtio_block_common::{
+use super::common::VirtioBlkProfile;
+use super::common::{
     MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest, VirtioBlkCapabilities,
     VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore, VirtioBlkQueueId,
     VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits, free_allocated_request,
@@ -38,25 +38,27 @@ use super::virtio_block_common::{
     write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
-use crate::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
-use crate::dev::block::{
+use general::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
+use general::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
 #[cfg(feature = "block-profile")]
-use crate::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
-use crate::dev::function::BlockFunction;
-use crate::dev::irq::{self, IrqError, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource};
-use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDevice, PnpDriver, PnpError, PnpId,
-    PnpResourceKind, register_driver_factory,
+use general::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
+use general::dev::function::BlockFunction;
+use general::dev::irq::{self, IrqError, IrqHandler, IrqLine, IrqStatus};
+use general::dev::pci::{PciDevice, PciInfo, PciMsiPnpResource};
+use general::dev::pnp::{
+    BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDevice, PnpDriver,
+    PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
-use crate::dev::virtio::{
-    SplitVirtQueue, VIRTIO_PCI_FUNCTION_BLOCK, VIRTIO_PCI_RESET_SPIN_LIMIT,
-    VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED,
-    VIRTIO_STATUS_FEATURES_OK, VirtioPciCap, VirtioPciTransport, choose_split_queue_size,
-    parse_virtio_pci_caps,
+use virtio::{
+    SplitVirtQueue, VIRTIO_PCI_RESET_SPIN_LIMIT, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER,
+    VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK, VirtioPciCap,
+    VirtioPciFunction, VirtioPciTransport, choose_split_queue_size, parse_virtio_pci_caps,
 };
+
+const VIRTIO_PCI_FUNCTION_BLOCK: VirtioPciFunction =
+    VirtioPciFunction::new("block", 0x1001, 0x1042);
 
 // ── 队列状态 ────────────────────────────────────────────────────────────
 
@@ -661,7 +663,7 @@ fn register_virtio_pci_irq(
                 if pci.try_enable_configured_msi(msi_handle).is_ok() {
                     // MSI 已启用；同时屏蔽 INTx，避免同一设备双路上报。
                     pci.disable_interrupts();
-                    if let Err(err) = dev.own_resource(PciMsiPnpResource::new(
+                    if let Err(err) = dev.own_boxed_resource(PciMsiPnpResource::boxed(
                         pci.clone(),
                         msi_handle,
                         "virtio-pci-blk-msi",
@@ -760,9 +762,7 @@ impl PnpDriver for VirtioPciBlkDriver {
         })?;
         let irq = register_virtio_pci_irq(dev, &pci, Arc::clone(&driver))?;
 
-        let func = Arc::new(BlockFunction::with_projection_name(
-            &dev.name, &dev_name, block_dev,
-        ));
+        let func = BlockFunction::with_projection_name_arc(&dev.name, &dev_name, block_dev);
         if let Err(err) = dev.register_function(func) {
             if let Some(registration) = irq {
                 unregister_virtio_pci_irq(&pci, registration);
@@ -770,7 +770,7 @@ impl PnpDriver for VirtioPciBlkDriver {
             return Err(err);
         }
         dev.set_driver_data(Arc::new(VirtioPciBlkBinding { irq }));
-        log::printk!("[virtio-pci] bound {} → /dev/{}", dev.id, dev_name);
+        log::printk!("[virtio-pci] bound {} → /dev/{}", dev.name, dev_name);
         Ok(())
     }
 
@@ -787,7 +787,7 @@ impl PnpDriver for VirtioPciBlkDriver {
         // VirtioBlkPci 的 Drop 会 reset device；PnpDevice::remove_device 在
         // function drain 之后调用本 remove，因此这里先撤销 IRQ 入口，再让
         // 设备对象按引用计数自然释放。
-        log::printk!("[virtio-pci] remove {}", dev.id);
+        log::printk!("[virtio-pci] remove {}", dev.name);
     }
 }
 
@@ -803,7 +803,7 @@ impl DriverFactory for VirtioPciBlkFactory {
     }
 }
 
-/// 注册 VirtIO-PCI block 内建驱动 factory。
-pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
-    register_driver_factory(Arc::new(VirtioPciBlkFactory)).map(|_| ())
+/// 注册 VirtIO-PCI block 驱动 factory。
+pub(super) fn register_driver() -> Result<DriverHandle, PnpError> {
+    register_driver_factory(Arc::new(VirtioPciBlkFactory))
 }

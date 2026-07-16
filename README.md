@@ -66,6 +66,23 @@ make kernel-rv      # 构建 RISC-V64 内核，输出 ./kernel-rv
 cargo fmt --all     # 格式化 workspace
 ```
 
+VirtIO Framework 和 VirtIO Block 由根目录 `.config` 控制，初次构建会从
+`configs/default.config` 生成默认配置：
+
+```text
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_BLK=y
+```
+
+- `CONFIG_VIRTIO=y`：把 VirtIO Framework 及启用的依赖驱动直接链接进内核。
+- `CONFIG_VIRTIO=m`：把它们构建为受管 ELM，并安装到 initramfs 的 `/lib/elm`。
+- `CONFIG_VIRTIO=n`：完全不构建 VirtIO；此时 `CONFIG_VIRTIO_BLK` 必须为 `n`。
+- `CONFIG_VIRTIO_BLK=y`：启用块设备 ELM，其实际 `y/m` 模式继承 VirtIO Framework。
+- `CONFIG_VIRTIO_BLK=n`：只保留已启用的 VirtIO Framework，不构建块设备驱动。
+
+修改后可用 `make defconfig` 恢复默认配置。动态和集成构建产物分别位于
+`build/modules/<target>/*.eki` 与 `build/modules/<target>/*.integrated.a`。
+
 ## QEMU 运行示例
 
 LoongArch64：
@@ -73,8 +90,7 @@ LoongArch64：
 ```sh
 qemu-system-loongarch64 -kernel kernel-la -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-la.img,if=none,format=raw,id=x0 \
-  -device virtio-blk-pci,drive=x0 -no-reboot \
-  -device virtio-net-pci,netdev=net0 -netdev user,id=net0 -rtc base=utc
+  -device virtio-blk-pci,drive=x0 -no-reboot -rtc base=utc
 ```
 
 RISC-V64：
@@ -82,8 +98,7 @@ RISC-V64：
 ```sh
 qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-rv.img,if=none,format=raw,id=x0 \
-  -device virtio-blk-device,drive=x0 -no-reboot \
-  -device virtio-net-device,netdev=net0 -netdev user,id=net0 -rtc base=utc
+  -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```
 
 ## 测试入口

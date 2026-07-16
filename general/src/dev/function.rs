@@ -345,6 +345,7 @@ pub struct BlockFunction {
     dev: Arc<BlockDevice>,
 }
 
+#[kernel_symbols::export]
 impl BlockFunction {
     /// 创建一个块设备 function。
     pub fn new(dev_name: &str, dev: Arc<BlockDevice>) -> Self {
@@ -365,6 +366,27 @@ impl BlockFunction {
             projection_name: projection_name.into(),
             dev,
         }
+    }
+
+    /// 在常驻内核侧构造完成类型擦除的块设备 function。
+    ///
+    /// 动态 ELM 使用该入口时，`DeviceFunction` vtable 由定义 `BlockFunction` 的
+    /// 常驻 crate 生成；模块只持有标准 `Arc<dyn DeviceFunction>`，不会隐式依赖
+    /// 常驻 trait impl 的私有 Rust 链接符号。
+    #[kernel_symbols::export(
+        name = "general.dev.function.BlockFunction.with_projection_name_arc",
+        contract = "kernel.general.device-function@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED,
+        retained_args = 4u64
+    )]
+    pub fn with_projection_name_arc(
+        dev_name: &str,
+        projection_name: &str,
+        dev: Arc<BlockDevice>,
+    ) -> Arc<dyn DeviceFunction> {
+        Arc::new(Self::with_projection_name(dev_name, projection_name, dev))
     }
 
     /// 返回内部块设备对象。
@@ -471,9 +493,14 @@ impl FunctionRegistry {
                 .checked_add(1)
                 .ok_or(FunctionRegistryError::OutOfMemory)?;
             let mut replacement = Vec::new();
-            replacement
-                .try_reserve(needed)
-                .map_err(|_| FunctionRegistryError::OutOfMemory)?;
+            {
+                // 全局 function 表保留扩容后的容量；容量本身属于常驻内核元数据。
+                let _accounting = allocator::suspend_implicit_allocation_accounting()
+                    .ok_or(FunctionRegistryError::OutOfMemory)?;
+                replacement
+                    .try_reserve(needed)
+                    .map_err(|_| FunctionRegistryError::OutOfMemory)?;
+            }
 
             let mut list = self.functions.lock();
             if list.iter().any(|existing| {

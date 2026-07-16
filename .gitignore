@@ -1,5 +1,6 @@
 # 构建输出
 target/
+.config
 Cargo.lock
 kernel-la
 kernel-rv
@@ -18,6 +19,10 @@ build
 *.pdf
 userland/rootfs-la/bin/
 userland/rootfs-rv/bin/
+userland/rootfs-la/lib/elm/
+userland/rootfs-rv/lib/elm/
+drivers/*/.elm/
+drivers/*/dist/
 
 # vendor 不受上述规则限制
 !vendor/**

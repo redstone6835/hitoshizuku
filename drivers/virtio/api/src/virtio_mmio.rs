@@ -309,13 +309,6 @@ impl VirtioMmioTransport for LegacyMmioTransport {
 // ── 工厂函数 ─────────────────────────────────────────────────────────────────
 
 /// 读取 Magic+Version，返回对应版本的 transport 实现。
-#[kernel_symbols::export(
-    name = "general.dev.virtio_mmio.detect",
-    contract = "kernel.general.virtio-mmio@1",
-    version = 1,
-    capabilities = kernel_symbols::capability::DEVICE_BUS,
-    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
-)]
 pub fn detect(mmio_base: usize) -> Result<Box<dyn VirtioMmioTransport>, &'static str> {
     let magic = unsafe { core::ptr::read_volatile((mmio_base + 0x000) as *const u32) };
     if magic != VIRTIO_MMIO_MAGIC_VALUE {
@@ -325,9 +318,6 @@ pub fn detect(mmio_base: usize) -> Result<Box<dyn VirtioMmioTransport>, &'static
     match version {
         1 => Ok(Box::new(LegacyMmioTransport::new(mmio_base))),
         2 => Ok(Box::new(ModernMmioTransport::new(mmio_base))),
-        v => {
-            log::printk!("[virtio-mmio] unsupported version {:#x}", v);
-            Err("Unsupported VirtIO version")
-        }
+        _ => Err("Unsupported VirtIO version"),
     }
 }

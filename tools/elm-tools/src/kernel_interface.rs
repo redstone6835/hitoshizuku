@@ -51,6 +51,8 @@ pub struct KernelInterfaceManifest {
     pub source_file_count: usize,
     pub allocator_metadata: String,
     pub general_metadata: String,
+    pub log_metadata: String,
+    pub sched_metadata: String,
     pub support_library: String,
     pub import_library: String,
     pub symbols: Vec<KernelInterfaceSymbol>,
@@ -74,6 +76,8 @@ impl KernelInterfaceManifest {
         let mut source_file_count = None;
         let mut allocator_metadata = None;
         let mut general_metadata = None;
+        let mut log_metadata = None;
+        let mut sched_metadata = None;
         let mut support_library = None;
         let mut import_library = None;
         let mut symbols = Vec::new();
@@ -106,6 +110,10 @@ impl KernelInterfaceManifest {
                 allocator_metadata = Some(value.to_string());
             } else if let Some(value) = line.strip_prefix("general_metadata=") {
                 general_metadata = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("log_metadata=") {
+                log_metadata = Some(value.to_string());
+            } else if let Some(value) = line.strip_prefix("sched_metadata=") {
+                sched_metadata = Some(value.to_string());
             } else if let Some(value) = line.strip_prefix("support_library=") {
                 support_library = Some(value.to_string());
             } else if let Some(value) = line.strip_prefix("import_library=") {
@@ -140,6 +148,9 @@ impl KernelInterfaceManifest {
                 .ok_or_else(|| "接口清单缺少 allocator metadata".to_string())?,
             general_metadata: general_metadata
                 .ok_or_else(|| "接口清单缺少 general metadata".to_string())?,
+            log_metadata: log_metadata.ok_or_else(|| "接口清单缺少 log metadata".to_string())?,
+            sched_metadata: sched_metadata
+                .ok_or_else(|| "接口清单缺少 sched metadata".to_string())?,
             support_library: support_library
                 .ok_or_else(|| "接口清单缺少 support library".to_string())?,
             import_library: import_library
@@ -159,6 +170,10 @@ impl KernelInterfaceManifest {
             || self.framework_hash == [0; 32]
             || self.kernel_hash == [0; 32]
             || self.source_file_count == 0
+            || self.allocator_metadata.is_empty()
+            || self.general_metadata.is_empty()
+            || self.log_metadata.is_empty()
+            || self.sched_metadata.is_empty()
             || self.support_library.is_empty()
             || self.import_library.is_empty()
             || self.symbols.is_empty()
@@ -266,6 +281,12 @@ impl KernelInterfaceManifest {
         output.push_str("general_metadata=");
         output.push_str(&self.general_metadata);
         output.push('\n');
+        output.push_str("log_metadata=");
+        output.push_str(&self.log_metadata);
+        output.push('\n');
+        output.push_str("sched_metadata=");
+        output.push_str(&self.sched_metadata);
+        output.push('\n');
         output.push_str("support_library=");
         output.push_str(&self.support_library);
         output.push('\n');
@@ -338,8 +359,16 @@ pub fn export_kernel_interface(
     let root = rustc_crate_root(&general_path)?;
     let allocator_metadata = dependency_metadata_name(&root, "allocator")?;
     let allocator_file = format!("lib{allocator_metadata}.rlib");
-    if !deps.join(&allocator_file).is_file() || !deps.join(&general_file).is_file() {
-        return Err("kernel rmeta 引用的 allocator/general 精确元数据不存在".to_string());
+    let log_metadata = dependency_metadata_name(&root, "log")?;
+    let log_file = format!("lib{log_metadata}.rlib");
+    let sched_metadata = dependency_metadata_name(&root, "sched")?;
+    let sched_file = format!("lib{sched_metadata}.rlib");
+    if !deps.join(&allocator_file).is_file()
+        || !deps.join(&general_file).is_file()
+        || !deps.join(&log_file).is_file()
+        || !deps.join(&sched_file).is_file()
+    {
+        return Err("kernel rmeta 引用的 allocator/general/log/sched 精确元数据不存在".to_string());
     }
     let interface_rlibs = vec![deps.join(&allocator_file), deps.join(&general_file)];
     let allocator_root = rustc_crate_root(&deps.join(&allocator_file))?;
@@ -367,6 +396,8 @@ pub fn export_kernel_interface(
         source_file_count,
         allocator_metadata: allocator_file,
         general_metadata: general_file,
+        log_metadata: log_file,
+        sched_metadata: sched_file,
         support_library: "libelm-rust-support.a".to_string(),
         import_library: "libelm-kernel-imports.so".to_string(),
         symbols,
@@ -474,6 +505,8 @@ fn repository_interface_hash(repository: &Path) -> Result<([u8; 32], usize), Str
         "general/src/dev",
         &mut files,
     )?;
+    collect_rust_sources(&repository.join("libs/log/src"), "log/src", &mut files)?;
+    collect_rust_sources(&repository.join("libs/sched/src"), "sched/src", &mut files)?;
     files.push((
         "allocator/Cargo.toml".to_string(),
         repository.join("libs/allocator/Cargo.toml"),
@@ -481,6 +514,14 @@ fn repository_interface_hash(repository: &Path) -> Result<([u8; 32], usize), Str
     files.push((
         "general/Cargo.toml".to_string(),
         repository.join("general/Cargo.toml"),
+    ));
+    files.push((
+        "log/Cargo.toml".to_string(),
+        repository.join("libs/log/Cargo.toml"),
+    ));
+    files.push((
+        "sched/Cargo.toml".to_string(),
+        repository.join("libs/sched/Cargo.toml"),
     ));
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let mut input = Vec::new();
@@ -519,6 +560,22 @@ fn framework_distribution_hash(repository: &Path) -> Result<[u8; 32], String> {
     files.push((
         "general/src/lib.rs".to_string(),
         metadata_facade_source("general", "__elm_host_general").into_bytes(),
+    ));
+    files.push((
+        "log/Cargo.toml".to_string(),
+        metadata_facade_manifest("log", "__elm_host_log").into_bytes(),
+    ));
+    files.push((
+        "log/src/lib.rs".to_string(),
+        metadata_facade_source("log", "__elm_host_log").into_bytes(),
+    ));
+    files.push((
+        "sched/Cargo.toml".to_string(),
+        metadata_facade_manifest("sched", "__elm_host_sched").into_bytes(),
+    ));
+    files.push((
+        "sched/src/lib.rs".to_string(),
+        metadata_facade_source("sched", "__elm_host_sched").into_bytes(),
     ));
     files.push((
         "Cargo.toml".to_string(),
@@ -632,6 +689,7 @@ fn scan_repository_exports(
             repository.join("libs/allocator/src/kernel_symbols.rs"),
             "allocator::direct_symbols".to_string(),
         ),
+        (repository.join("libs/log/src/lib.rs"), "log".to_string()),
     ];
     collect_export_sources(
         &repository.join("general/src/dev"),
@@ -740,7 +798,7 @@ fn scan_repository_exports(
     }
     symbols.sort_by(|left, right| left.api_path.cmp(&right.api_path));
     if symbols.is_empty() {
-        return Err("allocator/general 没有任何内核符号导出".to_string());
+        return Err("内核仓库没有任何直接符号导出".to_string());
     }
     Ok(symbols)
 }
@@ -1747,6 +1805,8 @@ fn copy_framework(
         "general",
         "__elm_host_general",
     )?;
+    write_facade(&destination.join("log"), "log", "__elm_host_log")?;
+    write_facade(&destination.join("sched"), "sched", "__elm_host_sched")?;
     fs::write(
         destination.join("Cargo.toml"),
         framework_workspace_manifest(),
@@ -1773,6 +1833,8 @@ pub(crate) fn metadata_facade_manifest(name: &str, host_alias: &str) -> String {
     let source_path = match name {
         "allocator" => "../../kernel-source/libs/allocator",
         "general" => "../../kernel-source/general",
+        "log" => "../../kernel-source/libs/log",
+        "sched" => "../../kernel-source/libs/sched",
         _ => panic!("不支持的内核元数据 facade: {name}"),
     };
     let lsp_alias = format!("__elm_lsp_{name}");
@@ -1858,6 +1920,8 @@ members = [
     "kernel-symbols/macros",
     "allocator",
     "general",
+    "log",
+    "sched",
 ]
 
 [workspace.package]
@@ -2285,6 +2349,8 @@ mod tests {
             source_file_count: 1,
             allocator_metadata: "allocator.rlib".to_string(),
             general_metadata: "general.rlib".to_string(),
+            log_metadata: "log.rlib".to_string(),
+            sched_metadata: "sched.rlib".to_string(),
             support_library: "support.a".to_string(),
             import_library: "imports.so".to_string(),
             symbols: Vec::new(),

@@ -756,9 +756,30 @@ pub struct PciMsiPnpResource {
     label: &'static str,
 }
 
+#[kernel_symbols::export]
 impl PciMsiPnpResource {
     pub const fn new(pci: PciDevice, handle: PciMsiHandle, label: &'static str) -> Self {
         Self { pci, handle, label }
+    }
+
+    /// 在常驻内核侧构造完成类型擦除的 MSI 资源。
+    ///
+    /// 这样动态 ELM 不需要链接 `PciMsiPnpResource` 的私有 trait vtable，资源仍由
+    /// PnP 设备按统一逆序释放规则管理。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciMsiPnpResource.boxed",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+            | kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn boxed(
+        pci: PciDevice,
+        handle: PciMsiHandle,
+        label: &'static str,
+    ) -> Box<dyn PnpResource> {
+        Box::new(Self::new(pci, handle, label))
     }
 }
 
@@ -841,7 +862,15 @@ impl fmt::Debug for PciDevice {
     }
 }
 
+#[kernel_symbols::export]
 impl PciDevice {
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.from_pnp",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn from_pnp(pnp: &Arc<PnpDevice>) -> Option<Self> {
         let PnpId::Pci { .. } = pnp.id else {
             return None;
@@ -871,6 +900,12 @@ impl PciDevice {
     /// DMA 能力来自设备所在 host bridge，而不是全局静态假设。当前固件只提供
     /// coherent 属性时，地址窗口仍采用 identity 兼容策略；后续接入 `dma-ranges`
     /// 或 IOMMU 后只需要在这里构造更精确的 constraints/mapper。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.dma_context",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA
+    )]
     pub fn dma_context(&self) -> DmaContext {
         let Some((segment, bus, _, _)) = self.bdf() else {
             return DmaContext::default_coherent();
@@ -902,6 +937,12 @@ impl PciDevice {
 
     // ── Config space 访问 ──
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_read_config_u8",
+        contract = "kernel.general.pci-config@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS
+    )]
     pub fn try_read_config_u8(&self, offset: u16) -> Result<u8, PciConfigError> {
         if !pci_config_access_valid(offset, 1, 1) {
             return Err(PciConfigError::InvalidOffset);
@@ -922,6 +963,12 @@ impl PciDevice {
         (cfg.read_u16)(seg, bus, dev, func, offset)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_read_config_u32",
+        contract = "kernel.general.pci-config@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS
+    )]
     pub fn try_read_config_u32(&self, offset: u16) -> Result<u32, PciConfigError> {
         if !pci_config_access_valid(offset, 4, 4) {
             return Err(PciConfigError::InvalidOffset);
@@ -1083,6 +1130,12 @@ impl PciDevice {
         })
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.map_bar_virt",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE
+    )]
     pub fn map_bar_virt(&self, idx: usize) -> Option<(PciBar, usize)> {
         let bar = self.map_bar(idx)?;
         let guard = PCI_CONFIG.lock();
@@ -1117,6 +1170,13 @@ impl PciDevice {
         self.try_set_command((cmd | set) & !clear)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_enable_bus_master",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn try_enable_bus_master(&self) -> Result<(), PciConfigError> {
         self.try_update_command(PCI_COMMAND_BUS_MASTER, 0)
     }
@@ -1138,6 +1198,13 @@ impl PciDevice {
             .is_ok_and(|cmd| cmd & PCI_COMMAND_BUS_MASTER != 0)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_enable_mmio",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_BUS,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn try_enable_mmio(&self) -> Result<(), PciConfigError> {
         self.try_update_command(PCI_COMMAND_MEMORY_SPACE, 0)
     }
@@ -1174,6 +1241,13 @@ impl PciDevice {
         self.try_update_command(PCI_COMMAND_INTERRUPT_DISABLE, 0)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.disable_interrupts",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn disable_interrupts(&self) {
         let _ = self.try_disable_interrupts();
     }
@@ -1182,6 +1256,13 @@ impl PciDevice {
         self.try_update_command(0, PCI_COMMAND_INTERRUPT_DISABLE)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.enable_interrupts",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn enable_interrupts(&self) {
         let _ = self.try_enable_interrupts();
     }
@@ -1206,6 +1287,12 @@ impl PciDevice {
     ///
     /// 这里不把 PCI config space 的 interrupt line 字节直接解释为 CPU 中断号；
     /// 该字节只是一段桥接路由输入，具体含义必须由 host bridge/固件层解析。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.routed_irq_line",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT
+    )]
     pub fn routed_irq_line(&self) -> Option<IrqLine> {
         let (segment, bus, device, function) = self.bdf()?;
         let pin = self.irq_pin();
@@ -1215,6 +1302,14 @@ impl PciDevice {
         resolver(segment, bus, device, function, pin, line)
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_configure_single_msi",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn try_configure_single_msi(&self) -> Result<PciMsiHandle, PciMsiError> {
         let cap_offset = self.msi_capability().ok_or(PciMsiError::NotSupported)?;
         let (segment, bus, device, function) = self.bdf().ok_or(PciConfigError::InvalidDevice)?;
@@ -1241,11 +1336,25 @@ impl PciDevice {
         self.try_configure_single_msi().ok()
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.release_configured_msi",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn release_configured_msi(&self, handle: PciMsiHandle) {
         let _ = self.try_msi_disable(handle.cap_offset);
         let _ = msi::free_msi(handle.allocation);
     }
 
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.try_enable_configured_msi",
+        contract = "kernel.general.pci-route@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_INTERRUPT,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn try_enable_configured_msi(&self, handle: PciMsiHandle) -> Result<(), PciMsiError> {
         let ctrl = self.try_read_config_u16(handle.cap_offset + PCI_MSI_CONTROL_OFFSET)?;
         self.try_write_config_u16(
@@ -1277,6 +1386,21 @@ impl PciDevice {
 
     pub fn capabilities(&self) -> PciCapabilityIter<'_> {
         PciCapabilityIter::new(self)
+    }
+
+    /// 返回 capability chain 的已校验快照。
+    ///
+    /// 快照在常驻 PCI 子系统内完成迭代，动态 ELM 不需要把
+    /// `PciCapabilityIter::next` 的私有 trait 实现当成链接 ABI。
+    #[kernel_symbols::export(
+        name = "general.dev.pci.PciDevice.capabilities_snapshot",
+        contract = "kernel.general.pci-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DISCOVERY,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
+    pub fn capabilities_snapshot(&self) -> Vec<PciCapability> {
+        self.capabilities().collect()
     }
 
     pub fn find_capability(&self, cap_id: u8) -> Option<u16> {

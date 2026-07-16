@@ -101,8 +101,8 @@ use elm_model::{
     ElmTrustAcceptance, ElmTrustAnchor, ElmTrustError, ElmTrustRuntimeInfoV1, ElmTrustStore,
     ElmVersion, ExtensionEdge, FlowContract, FlowDirection, FlowMode, Generation, LeaseId,
     LeaseKind, LeaseRegistry, LeaseRights, NexusOffer, PortId, ResourceLease, TopologyEventKind,
-    builtin_port_descriptors, first_lifecycle_reason, kernel_interface_manifest_v1,
-    planned_final_state, state_code, status_from_blockers,
+    builtin_port_descriptors, canonical_ebi_digest, first_lifecycle_reason,
+    kernel_interface_manifest_v1, planned_final_state, state_code, status_from_blockers,
 };
 use elm_model::{
     ELM_AUDIT_AUTHORITY_ANCESTOR, ELM_AUDIT_AUTHORITY_DELEGATED_MANAGER,
@@ -300,6 +300,7 @@ pub(crate) struct CellRuntime {
     pub isolated: bool,
     pub isolation_blocker: u64,
     pub trust_unsigned: bool,
+    pub trust_build_bound: bool,
     pub signer_key_id: [u8; 32],
     pub release_epoch: u64,
     pub owned_bindings: Vec<BindingId>,
@@ -311,6 +312,8 @@ struct PreparedImageTrust {
     acceptance: Option<ElmTrustAcceptance>,
     acceptance_reserved: bool,
     unsigned: bool,
+    build_bound: bool,
+    capability_mask: u64,
     signer_key_id: [u8; 32],
     release_epoch: u64,
 }
@@ -321,6 +324,8 @@ impl PreparedImageTrust {
             acceptance: None,
             acceptance_reserved: false,
             unsigned: false,
+            build_bound: false,
+            capability_mask: ::kernel_symbols::capability::ALL,
             signer_key_id: [0; 32],
             release_epoch: 0,
         }
@@ -2012,12 +2017,33 @@ impl ElmCore {
             return Err(ElmEbiLoadStatus::AbiFingerprintRejected);
         }
 
+        if source == ElmEbiSourceKind::BuildBound {
+            let ebi_hash = canonical_ebi_digest(image);
+            let record = super::trust_config::find_build_bound_module(
+                image.unit.manifest.name.as_str(),
+                ebi_hash,
+                fingerprint.kernel_api_profile_hash,
+            )
+            .ok_or(ElmEbiLoadStatus::UntrustedImage)?;
+            return Ok(PreparedImageTrust {
+                acceptance: None,
+                acceptance_reserved: false,
+                unsigned: false,
+                build_bound: true,
+                capability_mask: record.capabilities,
+                signer_key_id: [0; 32],
+                release_epoch: 0,
+            });
+        }
+
         let Some(proof) = image.proof.as_ref() else {
             if self.allow_unsigned_external {
                 return Ok(PreparedImageTrust {
                     acceptance: None,
                     acceptance_reserved: false,
                     unsigned: true,
+                    build_bound: false,
+                    capability_mask: ::kernel_symbols::capability::ALL,
                     signer_key_id: [0; 32],
                     release_epoch: 0,
                 });
@@ -2041,6 +2067,8 @@ impl ElmCore {
             acceptance: Some(acceptance),
             acceptance_reserved,
             unsigned: false,
+            build_bound: false,
+            capability_mask: ::kernel_symbols::capability::ALL,
         })
     }
 
@@ -2051,6 +2079,9 @@ impl ElmCore {
     ) -> bool {
         if matches!(source, ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory) {
             return true;
+        }
+        if source == ElmEbiSourceKind::BuildBound {
+            return trust.build_bound;
         }
         request.requested
             && request.authority_id != 0
@@ -2085,6 +2116,9 @@ impl ElmCore {
             .map(|parent| parent.cell_policy.kernel_symbol_capabilities)
             .unwrap_or(::kernel_symbols::capability::ALL);
         if required & !ceiling != 0 {
+            return false;
+        }
+        if trust.build_bound && required & !trust.capability_mask != 0 {
             return false;
         }
         let privileged = required & !::kernel_symbols::capability::SAFE_DEFAULT;
@@ -2153,6 +2187,7 @@ impl ElmCore {
     fn apply_image_trust_metadata(&mut self, cell: ElmId, trust: &PreparedImageTrust) {
         if let Some(runtime) = self.cells.iter_mut().find(|runtime| runtime.id == cell) {
             runtime.trust_unsigned = trust.unsigned;
+            runtime.trust_build_bound = trust.build_bound;
             runtime.signer_key_id = trust.signer_key_id;
             runtime.release_epoch = trust.release_epoch;
         }
@@ -2288,6 +2323,7 @@ impl ElmCore {
             isolated: false,
             isolation_blocker: 0,
             trust_unsigned: false,
+            trust_build_bound: false,
             signer_key_id: [0; 32],
             release_epoch: 0,
             owned_bindings: Vec::new(),
@@ -2344,6 +2380,7 @@ impl ElmCore {
             isolated: false,
             isolation_blocker: 0,
             trust_unsigned: false,
+            trust_build_bound: false,
             signer_key_id: [0; 32],
             release_epoch: 0,
             owned_bindings: Vec::new(),
@@ -9747,11 +9784,29 @@ impl ElmCore {
                 cell.ebi_source,
                 ElmEbiSourceKind::Builtin | ElmEbiSourceKind::Memory
             ) {
-                if cell.trust_unsigned || cell.signer_key_id != [0; 32] || cell.release_epoch != 0 {
+                if cell.trust_unsigned
+                    || cell.trust_build_bound
+                    || cell.signer_key_id != [0; 32]
+                    || cell.release_epoch != 0
+                {
                     records.push(ElmCoreHealthRecord::invalid(
                         ELM_HEALTH_CHECK_TRUST,
                         cell.id.0,
                         ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                    ));
+                }
+                continue;
+            }
+            if cell.ebi_source == ElmEbiSourceKind::BuildBound {
+                if !cell.trust_build_bound
+                    || cell.trust_unsigned
+                    || cell.signer_key_id != [0; 32]
+                    || cell.release_epoch != 0
+                {
+                    records.push(ElmCoreHealthRecord::invalid(
+                        ELM_HEALTH_CHECK_TRUST,
+                        cell.id.0,
+                        ELM_HEALTH_DETAIL_STATE_INVALID,
                     ));
                 }
                 continue;
@@ -9774,6 +9829,14 @@ impl ElmCore {
                         ELM_HEALTH_DETAIL_STATE_INVALID,
                     ));
                 }
+                continue;
+            }
+            if cell.trust_build_bound {
+                records.push(ElmCoreHealthRecord::invalid(
+                    ELM_HEALTH_CHECK_TRUST,
+                    cell.id.0,
+                    ELM_HEALTH_DETAIL_KIND_MISMATCH,
+                ));
                 continue;
             }
             let module_digest = sha256(cell.name.as_bytes());
@@ -10212,7 +10275,7 @@ impl ElmCore {
         for cell in &self.cells {
             out.push_str(
                 format!(
-                    "cell id={} parent={} name={} state={:?} kind={:?} generation={} elmapi={} policy_epoch={} active_executions={} exclusive_execution={} source={:?} ebi_arch={:?} ebi_status={:?} trust_unsigned={} release_epoch={} signer_key_id={:02x?} native_code={} native_segments={} native_imports={} native_exports={} lifecycle_hooks={} lifecycle_executor_ready={} lifecycle_initialized={} lifecycle_finalized={} isolated={} native_faults={} isolation_blocker=0x{:x} pending_loads={} owned_bindings={} owned_menu_items={}\n",
+                    "cell id={} parent={} name={} state={:?} kind={:?} generation={} elmapi={} policy_epoch={} active_executions={} exclusive_execution={} source={:?} ebi_arch={:?} ebi_status={:?} trust_unsigned={} trust_build_bound={} release_epoch={} signer_key_id={:02x?} native_code={} native_segments={} native_imports={} native_exports={} lifecycle_hooks={} lifecycle_executor_ready={} lifecycle_initialized={} lifecycle_finalized={} isolated={} native_faults={} isolation_blocker=0x{:x} pending_loads={} owned_bindings={} owned_menu_items={}\n",
                     cell.id.0,
                     cell.parent.map(|id| id.0).unwrap_or(0),
                     cell.name,
@@ -10227,6 +10290,7 @@ impl ElmCore {
                     cell.ebi_arch,
                     cell.ebi_status,
                     u32::from(cell.trust_unsigned),
+                    u32::from(cell.trust_build_bound),
                     cell.release_epoch,
                     cell.signer_key_id,
                     cell.has_native_code,
@@ -10437,6 +10501,7 @@ impl ElmCore {
             "journal" => self.sysfs_journal_text(),
             "executions" => self.sysfs_executions_text(),
             "owned-resources" => self.sysfs_owned_resources_text(),
+            "resource-accounting" | "accounting" => self.sysfs_resource_accounting_text(),
             "diagnostics" => String::from_utf8_lossy(&self.debug_dump_bytes()).into_owned(),
             "native-capabilities" | "native" => self.sysfs_native_capabilities_text(),
             "todo" | "todo-registry" => self.sysfs_todo_text(),
@@ -10514,10 +10579,11 @@ impl ElmCore {
         for cell in &self.cells {
             out.push_str(
                 format!(
-                    "cell={} source={:?} unsigned={} release_epoch={} signer_key_id={:02x?}\n",
+                    "cell={} source={:?} unsigned={} build_bound={} release_epoch={} signer_key_id={:02x?}\n",
                     cell.id.0,
                     cell.ebi_source,
                     u32::from(cell.trust_unsigned),
+                    u32::from(cell.trust_build_bound),
                     cell.release_epoch,
                     cell.signer_key_id,
                 )
@@ -10639,6 +10705,43 @@ impl ElmCore {
                     resource.handle,
                     resource.state,
                     resource.last_status,
+                )
+                .as_str(),
+            );
+        }
+        out
+    }
+
+    fn sysfs_resource_accounting_text(&self) -> String {
+        let now_ns = sched::now_ns_public();
+        let mut out = format!("status=ok\ncells={}\n", self.cells.len());
+        for cell in &self.cells {
+            let usage = super::resource_accounting::snapshot(cell.id, now_ns);
+            let allocations = allocator::KERNEL_ALLOCATOR.owner_allocation_stats(cell.id.0);
+            out.push_str(
+                format!(
+                    "cell={} dynamic_alloc_bytes={} peak_dynamic_alloc_bytes={} max_dynamic_alloc_bytes={} native_stack_bytes={} active_native_calls={} cpu_time_ns_total={} cpu_time_ns_period={} quota_denials={} accounting_errors={} live_allocs={} alloc_requested_bytes={} alloc_usable_bytes={} alloc_boot={} alloc_small={} alloc_large={} alloc_managed={} alloc_physical={} alloc_largest={} alloc_largest_usable={} alloc_scan_errors={}\n",
+                    cell.id.0,
+                    usage.dynamic_alloc_bytes,
+                    usage.peak_dynamic_alloc_bytes,
+                    usage.max_dynamic_alloc_bytes,
+                    usage.native_stack_bytes,
+                    usage.active_native_calls,
+                    usage.cpu_time_ns_total,
+                    usage.cpu_time_ns_period,
+                    usage.quota_denials,
+                    usage.accounting_errors,
+                    allocations.records,
+                    allocations.requested_bytes,
+                    allocations.usable_bytes,
+                    allocations.boot_records,
+                    allocations.small_records,
+                    allocations.large_records,
+                    allocations.managed_records,
+                    allocations.physical_records,
+                    allocations.largest_requested_bytes,
+                    allocations.largest_usable_bytes,
+                    allocations.scan_errors,
                 )
                 .as_str(),
             );
@@ -11745,6 +11848,7 @@ impl ElmCore {
             isolated: false,
             isolation_blocker: 0,
             trust_unsigned: false,
+            trust_build_bound: false,
             signer_key_id: [0; 32],
             release_epoch: 0,
             owned_bindings: Vec::new(),

@@ -4,7 +4,7 @@
 
 ELM，全称 **Extensible Loadable Module**，中文统一称为 **可拓展内核单元**。
 
-ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。外部 ELM 使用目标内核发布的精确 `allocator`、`general` Rust metadata，并按与内核源码相同的路径编写普通 Rust 代码；编译器产生的真实函数、固有方法和静态对象引用在打包期映射到由 `#[kernel_symbols::export]` 登记的稳定目录项。名称、契约、版本、规范 Rust ABI、接口源码摘要、能力策略和镜像信任全部通过后，调用就是普通 Rust 调用，不经过 `elm-mgr`、provider、函数表、grant 或 token。只有需要运行时发现、绑定、审计、异步流控或跨单元服务语义的能力才通过 provider 端口进入枢纽连接层。
+ELM 不是 Linux 模块 ABI 的兼容层，也不是传统动态内核模块机制。ELM 的目标是在当前内核中提供一种面向 Rust 的运行时拓展体系：内核提供可信执行底座、资源所有权、状态机、能力边界和可观测拓扑；`elm-mgr` 作为 ELM 外界接口核心和运行时管理器，负责把策略、菜单、依赖选择、事件订阅、运行时 API 和外部管理入口统一收口。外部 ELM 使用目标内核发布的精确 `allocator`、`general`、`log` 和 `sched` Rust metadata，并按与内核源码相同的路径编写普通 Rust 代码；编译器产生的真实函数、固有方法和静态对象引用在打包期映射到由 `#[kernel_symbols::export]` 登记的稳定目录项。名称、契约、版本、规范 Rust ABI、接口源码摘要、能力策略和镜像信任全部通过后，调用就是普通 Rust 调用，不经过 `elm-mgr`、provider、函数表、grant 或 token。只有需要运行时发现、绑定、审计、异步流控或跨单元服务语义的能力才通过 provider 端口进入枢纽连接层。
 
 ELM 的基本原则：
 
@@ -229,7 +229,7 @@ ELM 不允许扫描未登记符号或按地址猜测内核布局。运行时交�
 
 ### `general::dev` 直接符号接口
 
-设备能力不再压缩成单一版本化函数表，也不再维护第二套设备对象模型。外部工程中的同名 `general` crate 投影常驻 `general::dev` 的公开路径、数据类型和 trait；薄包装只把方法调用转成已经绑定的真实 Rust 函数指针。ELM 因而可以按与内核代码相同的方式实现 PnP 身份、发现源、驱动 factory、`match/probe/remove`、设备 function、固件总线、platform、PCI、virtio、DMA、IRQ 和 MSI 逻辑，同时继续遵守当前内核特有的 `PnP -> DeviceFunction -> 可选投影` 抽象，而不是套用 Unix 设备号或 `file_operations`。
+设备能力不再压缩成单一版本化函数表，也不再维护第二套设备对象模型。外部工程中的同名 `general` crate 投影常驻 `general::dev` 的公开路径、数据类型和 trait；薄包装只把方法调用转成已经绑定的真实 Rust 函数指针。ELM 因而可以按与内核代码相同的方式实现 PnP 身份、发现源、驱动 factory、`match/probe/remove`、设备 function、固件总线、platform、PCI、DMA、IRQ 和 MSI 逻辑，同时继续遵守当前内核特有的 `PnP -> DeviceFunction -> 可选投影` 抽象，而不是套用 Unix 设备号或 `file_operations`。VirtIO 这类可独立演进的协议框架不属于 `general` 的硬编码设备类型；它由 Framework ELM 发布 API crate，具体驱动通过 ELM 依赖和 `direct-pinned` 导入复用同一套 Rust API。
 
 设备直接符号按职责拆分能力组：`DEVICE_DISCOVERY`、`DEVICE_DRIVER`、`DEVICE_RESOURCE`、`DEVICE_DMA`、`DEVICE_INTERRUPT`、`DEVICE_BUS` 和 `DEVICE_ADMIN`。符号描述符同时声明是否修改状态、是否为 `unsafe fn`、是否返回长期对象以及是否只用于诊断。装载器只保留最终 ELF 确实引用的符号槽，并在执行模块代码前检查父策略上限；设备能力属于特权组，外部镜像还必须通过签名信任验证并由 Kernel、UserAdmin 或受权 Manager 明确批准。
 
@@ -1038,7 +1038,7 @@ demo    source=eki
 - `ElmKernelProviderSpec` 是当前子系统接入 `elm-mgr` 的统一规格形状，负责 API 描述、端口描述、invoke、单页 snapshot、分页 snapshot 和 revoke 回调；当前子系统回调先返回 `UNSUPPORTED`，但已经走完整 provider runtime 链路。
 - `health_bytes()` 会输出 17 类结构健康记录：graph、cells、ports、providers、bindings、runtime ports、menu、events、audits、native capabilities、TODO registry、trust、projection sources、journal、resources、executions 和 sequences。
 - 健康检查会交叉校验事件订阅与租约、source owner/generation、信任接受记录、journal hash chain、资源账本、执行引用和全部单调 ID，避免各运行时表之间形成悬空状态。
-- `/sys/kernel/elm` 提供 16 个只读节点：`core`、`policy`、`health`、`menu`、`topology`、`ports`、`providers`、`bindings`、`events`、`audit`、`api`、`trust`、`projection-sources`、`journal`、`executions` 和 `diagnostics`。
+- `/sys/kernel/elm` 提供 18 个只读节点：`core`、`policy`、`health`、`menu`、`topology`、`ports`、`providers`、`bindings`、`events`、`audit`、`api`、`trust`、`projection-sources`、`journal`、`executions`、`owned-resources`、`resource-accounting` 和 `diagnostics`。
 - debug dump 会输出 cells、ports、bindings、leases、runtime ports、source、执行、fault、native capability、TODO registry 和 health 摘要，并保留后续独立主线说明。
 - runtime journal 由审计路径、启动路径和镜像信任接受路径共同写入。v1 记录固定为 240 字节，包含单调 sequence、前序哈希、记录哈希以及信任记录使用的完整 rollback authority 摘要、模块摘要和 signer key 摘要。`kernel::elm` 以 `ElmJournalBackendOps` 暴露 `capacity/read/append/sync` 四个静态回调，并要求后端在 ELM 初始化前通过 `register_journal_backend` 登记；运行时随后执行顺序回放、哈希链校验、容量检查和同步提交，回放得到的最高 release epoch 会在信任库 seal 前恢复。未登记后端时运行在可观测的易失模式；可选后端失败后降级为易失模式并停止向不确定尾部追加；强制后端失败会封闭后续变更操作。
 - 当前热替换已有迁移钩子、受管 import 唯一最高版本选择与回滚、provider 后端原位切换、Projection Source 原子 generation 切换和 replace trace。v1 明确定义为排空后切换，不把跨 generation 迁移运行中调用作为隐含语义。
@@ -1239,7 +1239,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 - `MGR_CALL(QueryTodoRegistry)` 已返回统一 TODO registry，静态项只保留 soyo/其他格式 Projection Source 与外部 Rust ELM 的调试、依赖锁定和发布生态；pending native EBI、缺少 handler 的 provider 和资源超限状态会作为动态记录出现。同步 fault、panic 和 timer 强制退出边界不再登记为 TODO。
 - `MGR_CALL(QueryExtensions/PreflightExtensionAttach/CommitExtensionAttach/CommitExtensionDetach/DispatchExtension)` 已提供 mixin 管理面固定布局 ABI：拓展点声明 `Chain`、`Observer` 或 `Exclusive` 组合模式，拓展边声明独立 `handler_contract` 和有符号优先级。`Chain` 按“优先级降序、单元 ID 升序”稳定执行，并允许 `REPLACE`、`STOP` 和 `DENY`；mixin provider 调用边只放行 `ELM_MIXIN_REPLY_FLAGS_MASK` 中定义的控制位，普通 provider 仍严格要求 reply flags 为 0。`Observer` 向全部观察者传递同一份原始 payload，拒绝任何控制型 reply flag，单个观察者失败不会截断其余观察者；`Exclusive` 在图校验和挂接预检阶段强制最多一个拓展项。dispatch 优先按 `handler_contract` 精确选择 extension cell 拥有的可调用 provider，仅在该单元恰好只有一个可调用 provider 时允许无歧义回退，并通过临时租约和合成调用边执行。mixin 因此具备对显式 patch point 的运行时补丁能力，但不提供任意地址内存改写。
 - `MGR_CALL(SubscribeEvent/UnsubscribeEvent/QueryEventSubscriptions/ReadSubscribedEvents)` 已形成事件订阅闭环，支持订阅租约、独立游标、过滤器、只读不推进和读取后推进两种模式。
-- `/sys/kernel/elm` 已提供 16 个只读文本观测节点，并把 fault、native capability、TODO 和 trace 汇总到 `diagnostics`，同时单独公开 trust、projection sources、journal 与 executions。
+- `/sys/kernel/elm` 已提供 18 个只读文本观测节点，并把 fault、native capability、TODO 和 trace 汇总到 `diagnostics`，同时单独公开 trust、projection sources、journal、executions、owned resources 与 allocator owner 账本。
 - `MGR_CALL(QueryHealth)` 已返回 17 类结构化 Core 健康记录，可定位 graph、cell、port、provider、binding、runtime port、menu、event、audit、native capability、TODO registry、trust、source、journal、resource、execution 和 sequence 不变量破坏。
 - `MGR_CALL` 管理通道已收口输入上限、请求头构造器、保留位零值策略和无 payload 查询命令校验；格式错误统一返回 `INVALID`，未知命令号返回 `UNSUPPORTED`。
 - 动态 provider 端口已支持 `Public`、`ExtensionOnly` 和 `Internal` 三类访问策略。
@@ -1309,7 +1309,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 内核子系统 API 使用独立于 `elmapi` 的直接符号协议：
 
 1. 中立 crate `libs/kernel-symbols` 定义描述符、能力组和 `#[kernel_symbols::export]`。描述符可以登记经过审核的自由函数、固有方法和非 `static mut` 静态对象；方法接收者是 Rust ABI 的正式组成部分，静态对象则按其真实地址参与重定位。泛型、async、const 和显式外部 ABI 仍不进入当前稳定目录。
-2. `cargo elm profile-export` 从目标架构实际生成的 `allocator`、`general` `.rlib/.rmeta` 提取精确 crate metadata、依赖闭包和 Rust 链接符号。外部工程中的同名 façade 在正式 bare-metal 构建中只 `pub use` 这些 metadata 暴露的真实类型与方法，不保存手写类型副本或第二份运行状态。接口包另外附带与接口摘要绑定的只读 LSP 源码投影，使 rust-analyzer 能定位真实模块、类型、方法和文档。ELM 工程默认启用只用于分析的 `elm-lsp` feature；正式 `cargo elm build` 传入 `--no-default-features`，把 façade 后端切回目标专属 metadata，并且不会编译源码投影。
+2. `cargo elm profile-export` 从目标架构实际生成的 `allocator`、`general`、`log`、`sched` `.rlib/.rmeta` 提取精确 crate metadata、依赖闭包和 Rust 链接符号。外部工程中的同名 façade 在正式 bare-metal 构建中只 `pub use` 这些 metadata 暴露的真实类型与方法，不保存手写类型副本或第二份运行状态。接口包另外附带与接口摘要绑定的只读 LSP 源码投影，使 rust-analyzer 能定位真实模块、类型、方法和文档。ELM 工程默认启用只用于分析的 `elm-lsp` feature；正式 `cargo elm build` 传入 `--no-default-features`，把 façade 后端切回目标专属 metadata，并且不会编译源码投影。
 3. 普通源码调用由 rustc 产生真实 Rust 符号引用；打包器依据目标接口清单把稳定链接名和审核过的 mangled alias 统一转换为 EBI `kernel-symbol` import。导出工具会重新从源码计算对应公开方法 ABI，接收者或参数不一致时直接拒绝生成接口包。`#[elm::kernel_symbol]` 只保留给确实需要手工声明固定槽的底层场景。
 4. 镜像 ABI 指纹绑定目标架构、target spec、panic 策略、`elmapi` 和内核符号描述符 ABI；只有镜像实际导入 `exact-rust` 符号时才要求同一 rustc。单个内核符号按名称、契约、版本、能力和完整 Rust ABI 摘要逐项匹配，未被镜像导入的私有实现或其它公开符号变化不会使装载失败。接口包的 `source_hash` 只服务 LSP/缓存，`interface_hash` 是规范公开符号集合的 API Profile 摘要，`framework_hash` 绑定开发框架完整文件分发；三者都不替代逐导入校验。
 5. 装载器先验证链接目录结构和三元身份唯一性，再按父 cell 的 `kernel_symbol_capabilities` 上限解析每个导入。`CORE_SAFE`、普通 allocator 内存和 allocator 诊断属于默认安全组；物理内存、allocator 管理以及所有设备能力属于特权组，外部镜像必须经过签名验证并由合法 authority 显式批准。能力判定只发生在地址提交前，不存在可复用 grant 或每次调用 token。
@@ -1322,7 +1322,7 @@ Cell snapshot 当前不仅包含单元 ID、父单元、状态、类型、genera
 
 ### Rust ELM 独立仓库开发框架
 
-外部 ELM 不维护函数表式第二套内核 API，也不从原内核仓库建立 path dependency。`cargo elm sync` 同步小型 `elm`/`kernel-symbols` 开发框架和两个 metadata façade；目标专属的真实 `allocator/general` metadata、Rust 支持归档、审核导入库与 LSP 源码投影来自共享接口仓库。工程内 `.elm/kernel-interface/<target>` 和 `.elm/kernel-source` 都是指向共享缓存的符号链接，不复制完整内核接口。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，直接按 `allocator::*`、`general::dev::*` 路径调用真实内核子系统；Manager 工程额外启用 `management` feature。正式构建严格使用目标接口包中的二进制 metadata，源码投影只参与补全、诊断、悬停、跳转和宿主 `cargo check`。
+外部 ELM 不维护函数表式第二套内核 API，也不从原内核仓库建立 path dependency。`cargo elm sync` 同步小型 `elm`/`kernel-symbols` 开发框架和四个 metadata façade；目标专属的真实 `allocator/general/log/sched` metadata、Rust 支持归档、审核导入库与 LSP 源码投影来自共享接口仓库。工程内 `.elm/kernel-interface/<target>` 和 `.elm/kernel-source` 都是指向共享缓存的符号链接，不复制完整内核接口。普通开发代码通过 `elm::runtime::*` 使用 ELM 自身运行时能力，直接按 `allocator::*`、`general::dev::*`、`log::*` 和 `sched::*` 路径调用真实内核能力；Manager 工程额外启用 `management` feature。正式构建严格使用目标接口包中的二进制 metadata，源码投影只参与补全、诊断、悬停、跳转和宿主 `cargo check`。
 
 #### Kernel API Profile 与条件编译
 
@@ -1360,7 +1360,7 @@ fn configure_device() {
 内核在执行 initcall 前再次比较实时符号目录摘要。
 
 同一工程选择的所有 Profile 必须声明相同的 `framework_hash`。`cargo elm sync` 会重新计算
-接口包中 `elm`、`kernel-symbols`、`allocator/general` façade 和 framework workspace 的
+接口包中 `elm`、`kernel-symbols`、`allocator/general/log/sched` façade 和 framework workspace 的
 完整摘要，既拒绝声明不一致的多 Profile 组合，也拒绝清单与实际文件不一致的损坏快照。
 
 #### `m/y/n` 构建语义
@@ -1371,7 +1371,7 @@ fn configure_device() {
 
 `y` 和 `m` 编译同一个 `src/main.rs`。Cargo 的 bin 与 lib 目标共同指向该文件：`m` 选择 bin，
 `y` 选择 lib 并启用 `elm-integrated`。该 feature 只改变生命周期落点、panic 边界和 ELM 元数据
-生成方式，不复制业务实现；直接 `allocator/general` 调用保持完全相同。`y` 不是预加载 ELM，
+生成方式，不复制业务实现；直接 `allocator/general/log/sched` 调用保持完全相同。`y` 不是预加载 ELM，
 也不是 elm-mgr 的 builtin cell。
 
 ```sh
@@ -1388,6 +1388,13 @@ ELM_INTEGRATED_ARCHIVES=../demo-hello/dist/demo-hello-riscv64gc-unknown-none-elf
 摘要，再按链接顺序初始化。任一初始化失败会逆序回滚此前组件；有序关机时只终结已经成功
 初始化的组件。
 
+仓库内模块集合由 `drivers/Modules.toml` 编排。每条记录声明模块路径、配置键、显式依赖和
+可选的 `inherit_mode`；构建工具先做拓扑排序，再拒绝依赖环、未知依赖、隐式模式继承和
+父模块禁用但子模块启用等无效组合。根目录 `.config` 只选择部署方式，不改写模块源码：
+`CONFIG_VIRTIO=y/m/n` 分别选择集成、受管和禁用，`CONFIG_VIRTIO_BLK=y` 继承 Framework
+的实际 `y/m` 模式，`n` 则独立关闭块驱动。受管模块按依赖顺序写入 BuildBound 清单并安装
+到 initramfs；集成模块按同一顺序写入归档列表并直接链接内核。
+
 创建一个独立仓库：
 
 ```sh
@@ -1400,12 +1407,12 @@ cargo elm new ../demo-hello \
 
 生成结果包含：
 
-- `Cargo.toml`：独立 package，依赖同步后的 `elm`、`allocator` 与 `general`；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`。默认 `elm-lsp` feature 只把 `allocator/general` façade 接到源码投影，正式构建关闭根 package 的默认 feature；release 与分析使用的 dev profile 都固定 `panic = "abort"`。
+- `Cargo.toml`：独立 package，依赖同步后的 `elm`、`allocator`、`general`、`log` 与 `sched`；普通工程为 `elm` 启用 `module, macros`，Manager 工程额外启用 `management`。默认 `elm-lsp` feature 只把四个 metadata façade 接到源码投影，正式构建关闭根 package 的默认 feature；release 与分析使用的 dev profile 都固定 `panic = "abort"`。
 - `Elm.toml`：名称、版本、种类、来源 identifier、`m/y/n` 模式、菜单、单元依赖和可选 `[[profiles]]` 的唯一声明源。未声明 Profile 时构建接口仓库中全部可用 API Profile。
 - `src/main.rs`：唯一业务源码，包含 `no_std + no_main`、唯一 `ElmModule` 实现，以及仅在受管模式启用的 panic 边界。Cargo 的 bin 与 lib 目标都指向该文件，因此 `m` 与 `y` 不维护源码包装层或双轨实现。
 - `elm.ld`：固定的连续 `PT_LOAD`、非装载 `.elm.meta` 和动态重定位布局。
 - `.cargo/config.toml`：RISC-V64 与 LoongArch64 的 PIE/linker 配置，以及活动 Profile 的 `elm_kernel_api`、`elm_kernel_profile` 和完整 check-cfg 值域；不强制宿主默认 target，因此普通 `cargo check` 和 rust-analyzer 不要求安装 bare-metal 标准库。
-- `.elm/framework`：与内核源码解耦的独立嵌套 workspace，包含 `elm`、`kernel-symbols` 和 `allocator/general` metadata façade；更新工具后使用 `cargo elm sync` 同步。
+- `.elm/framework`：与内核源码解耦的独立嵌套 workspace，包含 `elm`、`kernel-symbols` 和 `allocator/general/log/sched` metadata façade；更新工具后使用 `cargo elm sync` 同步。
 - `.elm/kernel-interface/<target>`：活动目标 Profile 的共享接口包链接。正式构建时工具会原子切换到当前变体。
 - `.elm/kernel-source`：活动接口的共享 LSP 源码投影链接，不进入目标代码生成和链接。
 - `Elm.lock`：记录模块模式、工具版本、rustc、目标、Profile identifier、桥接 ABI、接口摘要、framework 摘要、源码摘要和内核镜像摘要。
@@ -1448,7 +1455,7 @@ panic handler 与业务实现位于同一个 `src/main.rs`，但只在非 `elm-i
 开发者仍不手写 EBI ABI 入口。`y` 模式没有 elm-mgr 调用上下文，因此业务代码若使用
 `elm::runtime::*`，应通过
 `#[cfg(not(feature = "elm-integrated"))]` 提供受管路径，并为集成路径选择直接内核 API 或
-明确的无操作行为；普通 `allocator/general` 调用在两种模式下保持同一源码。
+明确的无操作行为；普通 `allocator/general/log/sched` 调用在两种模式下保持同一源码。
 
 `kind = "manager"` 的工程会由 `cargo elm` 自动启用 `management` feature。管理型 ELM
 通过类型化客户端取得管理命名空间，不接触裸命令号或裸函数指针：
@@ -1562,8 +1569,7 @@ RISC-V64 手动运行方式：
 ```sh
 qemu-system-riscv64 -machine virt -kernel kernel-rv -m 1G -nographic -smp 1 \
   -drive file=./build/sdcard-rv.img,if=none,format=raw,id=x0 \
-  -device virtio-blk-device,drive=x0 -no-reboot \
-  -device virtio-net-device,netdev=net0 -netdev user,id=net0 -rtc base=utc
+  -device virtio-blk-device,drive=x0 -no-reboot -rtc base=utc
 ```
 
 启动后在 `press Ctrl+C within 3 seconds to enter shell` 窗口按 `Ctrl+C` 进入 shell，然后运行：

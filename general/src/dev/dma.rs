@@ -141,6 +141,7 @@ pub struct DmaContext {
     mapper: &'static dyn DmaMapper,
 }
 
+#[kernel_symbols::export]
 impl DmaContext {
     pub const fn new(constraints: DmaConstraints, mapper: &'static dyn DmaMapper) -> Self {
         Self {
@@ -157,7 +158,13 @@ impl DmaContext {
         Self::new(constraints, &LEGACY_GLOBAL_DMA_MAPPER)
     }
 
-    pub const fn default_coherent() -> Self {
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaContext.default_coherent",
+        contract = "kernel.general.dma-map@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA
+    )]
+    pub fn default_coherent() -> Self {
         Self::new(
             DmaConstraints::coherent_identity(),
             &LEGACY_GLOBAL_DMA_MAPPER,
@@ -270,6 +277,7 @@ pub struct DmaBuffer {
     direction: DmaDirection,
 }
 
+#[kernel_symbols::export]
 impl DmaBuffer {
     /// 分配一个已清零的 DMA 缓冲区，至少暴露 `len` 字节可用空间。
     pub fn new(len: usize, align: usize, direction: DmaDirection) -> Result<Self, &'static str> {
@@ -277,6 +285,14 @@ impl DmaBuffer {
     }
 
     /// 使用指定设备 DMA 上下文分配缓冲区。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.new_in",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new_in(
         context: DmaContext,
         len: usize,
@@ -374,11 +390,25 @@ impl DmaBuffer {
     }
 
     /// 将 CPU 写入的内容同步到设备可见状态。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.sync_for_device",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync_for_device(&self) {
         self.context.mapper.sync_for_device(self.sync_region());
     }
 
     /// 将设备写入的内容同步到 CPU 可见状态。
+    #[kernel_symbols::export(
+        name = "general.dev.dma.DmaBuffer.sync_for_cpu",
+        contract = "kernel.general.dma-buffer@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DMA,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn sync_for_cpu(&self) {
         self.context.mapper.sync_for_cpu(self.sync_region());
     }
@@ -478,8 +508,19 @@ impl DmaBuffer {
 }
 
 impl Drop for DmaBuffer {
+    #[inline]
     fn drop(&mut self) {
-        let _ = KERNEL_ALLOCATOR.free_physical(self.allocation);
+        if self.allocation.size == 0 {
+            return;
+        }
+        if let Err(error) = KERNEL_ALLOCATOR.try_free_physical(self.allocation) {
+            log::error!(
+                "[dma] 释放 DMA 缓冲失败: paddr={:#x} size={} error={:?}",
+                self.allocation.paddr,
+                self.allocation.size,
+                error
+            );
+        }
     }
 }
 

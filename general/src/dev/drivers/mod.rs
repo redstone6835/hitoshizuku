@@ -25,21 +25,9 @@ mod fw_cfg;
 
 mod cfi_flash;
 
-mod virtio_block_common;
-
-mod virtio_blk;
-pub use virtio_blk::*;
-
-mod virtio_net;
-pub use virtio_net::*;
-
-mod virtio_pci;
-pub use virtio_pci::*;
-
 mod random;
 pub use random::*;
 
-use crate::dev::function::{FunctionProjectionNameAllocError, FunctionProjectionNameAllocator};
 use crate::dev::pnp::PnpError;
 
 /// 一个编译进内核的内建设备驱动注册项。
@@ -88,23 +76,6 @@ impl BuiltinDriverRegisterError {
     }
 }
 
-/// VirtIO block 的用户可见 `vd*` 投影名由所有传输层共享分配。
-///
-/// 这只是用户可见节点名，不参与底层设备身份；底层身份仍来自 PnP id。
-static VIRTIO_BLK_PROJECTION_NAMES: FunctionProjectionNameAllocator =
-    FunctionProjectionNameAllocator::new("vd");
-/// VirtIO block request 的 sector 字段固定以 512 字节为单位；这是协议常量，
-/// 不是底层块设备逻辑块大小。
-pub(super) const VIRTIO_BLK_SECTOR_SIZE: u32 = 512;
-
-pub(super) fn alloc_virtio_blk_dev_name(
-    stable_key: &str,
-) -> Result<alloc::string::String, FunctionProjectionNameAllocError> {
-    VIRTIO_BLK_PROJECTION_NAMES
-        .try_alloc_stable(stable_key)
-        .map(|name| name.into_string())
-}
-
 /// 注册当前内核镜像内建的所有 PnP 驱动。
 ///
 /// 调用前必须已经通过 `set_dev_init_context()` 安装驱动初始化上下文。
@@ -119,9 +90,6 @@ const BUILTIN_DRIVER_CATALOG: &[BuiltinDriverRegistration] = &[
     BuiltinDriverRegistration::new("fw-cfg", fw_cfg::register_builtin_driver),
     BuiltinDriverRegistration::new("cfi-flash", cfi_flash::register_builtin_driver),
     BuiltinDriverRegistration::new("uart16550", uart16550::register_builtin_driver),
-    BuiltinDriverRegistration::new("virtio-blk", virtio_blk::register_builtin_driver),
-    BuiltinDriverRegistration::new("virtio-net", virtio_net::register_builtin_driver),
-    BuiltinDriverRegistration::new("virtio-pci", virtio_pci::register_builtin_driver),
     BuiltinDriverRegistration::new("random", random::register_builtin_driver),
 ];
 

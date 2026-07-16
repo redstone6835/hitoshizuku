@@ -9,10 +9,10 @@ use core::num::NonZeroU32;
 #[cfg(feature = "block-profile")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
-use crate::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
-use crate::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
-use crate::dev::virtio::{
+use general::dev::bio::{Bio, BioBuffer, BioIoError, BioOp, BioReqError, SubmitError};
+use general::dev::block::{BlockFeatures, BlockLimits, BlockRangeLimits};
+use general::dev::dma::{DmaBuffer, DmaContext, DmaDirection};
+use virtio::{
     DescriptorChain, SplitVirtQueue, VIRTIO_F_VERSION_1, VIRTQ_DESC_F_WRITE, VirtqDescUpdate,
 };
 

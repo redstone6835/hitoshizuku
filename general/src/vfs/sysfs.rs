@@ -25,10 +25,9 @@ use vfs::stat::{DevId, FileMode, FileType, FsId, FsStat, Timespec};
 use vfs::superblock::{FsDriver, FsDriverFlags, Superblock, SuperblockOps};
 use vfs::sync::Spinlock;
 
-use crate::dev::block::BlockDevice;
+use crate::dev::block::{BlockAttributes, BlockFeatures, BlockGeometry, BlockIoStatsSnapshot};
 use crate::dev::cpu;
 use crate::dev::enumerate::{DEVICES, PNP_DEVICES};
-use crate::dev::function::DeviceFunction;
 use crate::dev::net::NET_CLASS;
 use crate::dev::pnp::{PnpDependency, PnpId, PnpOwnedResourceSnapshot, PnpResourceKind, PnpState};
 use crate::vfs::device_files::projection::{
@@ -355,7 +354,10 @@ struct BlockDevSnapshot {
     /// /sys/block/ 与 /sys/dev/block/ 下的目录名 = `dev.name()`（如 "vd0"）。
     sysfs_name: String,
     rdev: DevId,
-    dev: Arc<BlockDevice>,
+    geometry: BlockGeometry,
+    features: BlockFeatures,
+    attributes: BlockAttributes,
+    io_stats: BlockIoStatsSnapshot,
     class_name: &'static str,
 }
 
@@ -394,9 +396,15 @@ struct SysPnpDeviceSnapshot {
     driver: Option<String>,
     parent: Option<String>,
     child_count: usize,
-    functions: Vec<Arc<dyn DeviceFunction>>,
+    functions: Vec<SysPnpFunctionSnapshot>,
     resources: Vec<PnpOwnedResourceSnapshot>,
     deferred_dependency: Option<PnpDependency>,
+}
+
+#[derive(Clone)]
+struct SysPnpFunctionSnapshot {
+    class_name: String,
+    dev_name: String,
 }
 
 #[derive(Clone)]
@@ -653,7 +661,15 @@ impl SysSnapshot {
                 sysfs_name = sysfs_component_name(&format!("{}-{}-{suffix}", dev.name, dev.id));
                 suffix = suffix.saturating_add(1);
             }
-            let functions = dev.try_functions().unwrap_or_default();
+            let functions = dev
+                .try_functions()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|function| SysPnpFunctionSnapshot {
+                    class_name: function.class_name().to_string(),
+                    dev_name: function.dev_name().to_string(),
+                })
+                .collect();
             let resources = dev.try_owned_resources().unwrap_or_default();
             let parent = dev.parent().map(|parent| parent.name.to_string());
             let child_count = dev
@@ -682,14 +698,17 @@ impl SysSnapshot {
         // projection 层已经确认发布的 devtmpfs+device_numbers 联合快照，sysfs
         // 不再重复解释 `/dev` 节点和设备号表的关联规则。
         for projection in published_block_devnodes(&DEVICES.functions) {
-            let dev = Arc::clone(projection.dev());
+            let dev = projection.dev();
             let sysfs_name = sysfs_unique_name_with_rdev(dev.name(), projection.rdev(), |name| {
                 snap.blocks.iter().any(|block| block.sysfs_name == name)
             });
             snap.blocks.push(BlockDevSnapshot {
                 sysfs_name,
                 rdev: projection.rdev(),
-                dev,
+                geometry: *dev.geometry(),
+                features: dev.features(),
+                attributes: dev.attributes(),
+                io_stats: dev.io_stats(),
                 class_name: projection.class_id().as_str(),
             });
         }
@@ -1519,6 +1538,7 @@ enum ElmSysfsSlot {
     Journal,
     Executions,
     OwnedResources,
+    ResourceAccounting,
     Diagnostics,
 }
 
@@ -1540,6 +1560,7 @@ impl ElmSysfsSlot {
         Self::Journal,
         Self::Executions,
         Self::OwnedResources,
+        Self::ResourceAccounting,
         Self::Diagnostics,
     ];
 
@@ -1561,7 +1582,8 @@ impl ElmSysfsSlot {
             Self::Journal => 13,
             Self::Executions => 14,
             Self::OwnedResources => 15,
-            Self::Diagnostics => 16,
+            Self::ResourceAccounting => 16,
+            Self::Diagnostics => 17,
         }
     }
 
@@ -1583,6 +1605,7 @@ impl ElmSysfsSlot {
             Self::Journal => "journal",
             Self::Executions => "executions",
             Self::OwnedResources => "owned-resources",
+            Self::ResourceAccounting => "resource-accounting",
             Self::Diagnostics => "diagnostics",
         }
     }
@@ -1602,9 +1625,9 @@ fn kernel_elm_slot_ino(slot: ElmSysfsSlot) -> u64 {
 // ─── 内容渲染 ────────────────────────────────────────────────
 
 fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> String {
-    let dev = &snap.blocks[idx].dev;
-    let geom = dev.geometry();
-    let features = dev.features();
+    let dev = &snap.blocks[idx];
+    let geom = &dev.geometry;
+    let features = dev.features;
     match slot {
         BlockDevSlot::Size => {
             let sectors = geom
@@ -1621,7 +1644,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             }
         }
         BlockDevSlot::Removable => {
-            if dev.attributes().removable() {
+            if dev.attributes.removable() {
                 "1\n".into()
             } else {
                 "0\n".into()
@@ -1631,7 +1654,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
         BlockDevSlot::Range => "1\n".into(),
         BlockDevSlot::Holders => String::new(),
         BlockDevSlot::Stat => {
-            let stats = dev.io_stats();
+            let stats = dev.io_stats;
             // 这里输出通用块层维护的兼容 diskstats 字段。合并计数和队列总耗时
             // 当前没有独立数据源，保持为 0；完成数、扇区数、inflight 和操作耗时
             // 均来自 BlockDevice 的 BIO 统计。
@@ -1652,7 +1675,7 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
             )
         }
         BlockDevSlot::Inflight => {
-            let stats = dev.io_stats();
+            let stats = dev.io_stats;
             format!("{} {}\n", stats.read_inflight, stats.write_inflight)
         }
         BlockDevSlot::Periodic => String::new(),
@@ -1661,14 +1684,14 @@ fn render_block_dev_file(snap: &SysSnapshot, idx: usize, slot: BlockDevSlot) -> 
 }
 
 fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot) -> String {
-    let dev = &snap.blocks[idx].dev;
-    let geom = dev.geometry();
-    let features = dev.features();
+    let dev = &snap.blocks[idx];
+    let geom = &dev.geometry;
+    let features = dev.features;
     match slot {
         BlockQueueSlot::Lbs => format!("{}\n", geom.logical_block_size().get()),
         BlockQueueSlot::Pbs => format!("{}\n", geom.physical_block_size().get()),
         BlockQueueSlot::Rotational => {
-            if dev.attributes().rotational() {
+            if dev.attributes.rotational() {
                 "1\n".into()
             } else {
                 "0\n".into()
@@ -1677,7 +1700,7 @@ fn render_block_queue_file(snap: &SysSnapshot, idx: usize, slot: BlockQueueSlot)
         BlockQueueSlot::NrRequests => {
             // 没有真实队列深度的设备使用 sysfs 用户视图默认值；VirtIO 等驱动会填实际协商值。
             let depth = dev
-                .attributes()
+                .attributes
                 .queue_depth()
                 .map(|n| n.get())
                 .unwrap_or(SYSFS_USER_VIEW_POLICY.block_nr_requests);
@@ -1746,7 +1769,7 @@ fn render_pnp_device_file(snap: &SysSnapshot, idx: usize, slot: PnpDeviceSlot) -
             for function in &dev.functions {
                 let _ = core::fmt::Write::write_fmt(
                     &mut out,
-                    format_args!("{}:{}\n", function.class_id().as_str(), function.dev_name()),
+                    format_args!("{}:{}\n", function.class_name, function.dev_name),
                 );
             }
             out

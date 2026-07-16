@@ -26,6 +26,7 @@ use elm::{
     sha256_with_zeroed_ranges,
 };
 
+mod build_set;
 mod kernel_interface;
 mod project;
 mod rust_metadata;
@@ -155,6 +156,7 @@ fn run() -> Result<(), String> {
         "new" => cmd_new(command_args),
         "sync" => cmd_sync_framework(command_args),
         "build" => cmd_build(command_args),
+        "build-set" => cmd_build_set(command_args),
         "check" => cmd_check(command_args),
         "test" => cmd_test(command_args),
         "doctor" => cmd_doctor(command_args),
@@ -192,6 +194,9 @@ fn usage() {
         "  build <project-directory> --arch <riscv64|loongarch64|all> --key <seed> --epoch <n>"
     );
     eprintln!("  build <project-directory> --arch <riscv64|loongarch64|all> --unsigned");
+    eprintln!(
+        "  build-set <Modules.toml> --config <.config> --target <triple> --output <directory> [--features <a,b>]"
+    );
     eprintln!("  inspect <file.eki>");
     eprintln!("  image-bundle <out.eki> --variant <profile-manifest> <image.eki> <priority> [...]");
 }
@@ -279,6 +284,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let mut key = None;
     let mut epoch = None;
     let mut unsigned = false;
+    let mut extra_features = Vec::new();
     let mut index = 1usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -304,10 +310,19 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
                 unsigned = true;
                 index += 1;
             }
+            "--features" => {
+                let value = option_arg(args, index + 1, "--features")?;
+                extra_features = parse_feature_list(value)?;
+                index += 2;
+            }
             option => return Err(format!("未知 build 参数: {option}")),
         }
     }
     let arch = arch.ok_or_else(|| "build 必须指定 --arch".to_string())?;
+    if !extra_features.is_empty() {
+        // Safety: cargo-elm 构建命令是单线程编排，变量只传给随后创建的 Cargo 子进程。
+        unsafe { std::env::set_var("ELM_EXTRA_FEATURES", extra_features.join(",")) };
+    }
     let targets = selected_targets(&arch)?;
     let manifest = ElmProjectManifest::load(project)?;
     if manifest.mode == ElmBuildMode::Disabled {
@@ -392,6 +407,66 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_build_set(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        usage();
+        return Err("build-set 缺少 Modules.toml".to_string());
+    }
+    let set = Path::new(&args[0]);
+    let mut config = None;
+    let mut target = None;
+    let mut output = None;
+    let mut features = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                config = Some(Path::new(option_arg(args, index + 1, "--config")?).to_path_buf());
+                index += 2;
+            }
+            "--target" => {
+                target = Some(option_arg(args, index + 1, "--target")?.to_string());
+                index += 2;
+            }
+            "--output" => {
+                output = Some(Path::new(option_arg(args, index + 1, "--output")?).to_path_buf());
+                index += 2;
+            }
+            "--features" => {
+                features = parse_feature_list(option_arg(args, index + 1, "--features")?)?;
+                index += 2;
+            }
+            option => return Err(format!("未知 build-set 参数: {option}")),
+        }
+    }
+    build_set::build_set(
+        set,
+        config.as_deref().ok_or("build-set 缺少 --config")?,
+        target.as_deref().ok_or("build-set 缺少 --target")?,
+        output.as_deref().ok_or("build-set 缺少 --output")?,
+        &features,
+    )
+}
+
+fn parse_feature_list(value: &str) -> Result<Vec<String>, String> {
+    let mut features = Vec::new();
+    for feature in value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !feature.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        }) {
+            return Err(format!("无效 Cargo feature: {feature}"));
+        }
+        if !features.iter().any(|existing| existing == feature) {
+            features.push(feature.to_string());
+        }
+    }
+    Ok(features)
+}
+
 fn build_integrated_profiles(
     project: &Path,
     manifest: &ElmProjectManifest,
@@ -409,7 +484,7 @@ fn build_integrated_profiles(
         let output = project.join("dist").join(format!(
             "{}-{target}-{profile}-{}.integrated.a",
             manifest.cargo_name(),
-            short_digest(&interface.manifest.kernel_hash)
+            short_digest(&interface.manifest.interface_hash)
         ));
         if output.exists() {
             fs::remove_file(&output)
@@ -822,10 +897,7 @@ fn pack_elf_project(project: &Path, elf_path: &Path, output: &Path) -> Result<()
             BLOCK_MANIFEST,
             manifest_block(&manifest.name, &manifest.version, kind)?,
         ),
-        PackerBlock::new(
-            BLOCK_ABI_FINGERPRINT,
-            abi_fingerprint_block(&fingerprint),
-        ),
+        PackerBlock::new(BLOCK_ABI_FINGERPRINT, abi_fingerprint_block(&fingerprint)),
     ];
     if let Some(menu) = &manifest.menu {
         blocks.push(PackerBlock::new(
@@ -2045,11 +2117,7 @@ fn abi_fingerprint_block(fingerprint: &ElmRustAbiFingerprintV1) -> Vec<u8> {
     out[56..88].copy_from_slice(&fingerprint.target_spec_hash);
     out[88..120].copy_from_slice(&fingerprint.kernel_interface_hash);
     out[120..152].copy_from_slice(&fingerprint.kernel_api_profile_hash);
-    write_u16(
-        &mut out,
-        152,
-        fingerprint.kernel_api_bridge_abi_version,
-    );
+    write_u16(&mut out, 152, fingerprint.kernel_api_bridge_abi_version);
     out
 }
 
@@ -2775,6 +2843,7 @@ mod tests {
             kind: "driver".to_string(),
             source: "local.demo".to_string(),
             mode: ElmBuildMode::Disabled,
+            api: None,
             menu: None,
             dependencies: Vec::new(),
             profiles: Vec::new(),

@@ -1,0 +1,41 @@
+[package]
+name = "virtio-block"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "virtio-block"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lib]
+name = "virtio_block"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[features]
+default = ["elm-lsp"]
+elm-lsp = ["allocator/lsp", "general/lsp", "log/lsp", "sched/lsp"]
+elm-integrated = ["virtio/elm-integrated"]
+block-profile = []
+
+[dependencies]
+elm = { path = ".elm/framework/elm", default-features = false, features = ["module", "macros"] }
+allocator = { path = ".elm/framework/allocator", default-features = false }
+general = { path = ".elm/framework/general", default-features = false }
+log = { path = ".elm/framework/log", default-features = false }
+sched = { path = ".elm/framework/sched", default-features = false }
+virtio = { path = ".elm/dependencies/virtio", default-features = false, features = ["elm-consumer"] }
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = false
+strip = false
+
+[profile.dev]
+panic = "abort"

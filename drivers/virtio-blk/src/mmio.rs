@@ -20,8 +20,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::mutex::Mutex;
 
 #[cfg(feature = "block-profile")]
-use super::virtio_block_common::VirtioBlkProfile;
-use super::virtio_block_common::{
+use super::common::VirtioBlkProfile;
+use super::common::{
     MIN_QUEUE_SIZE as VIRTIO_BLK_MIN_QUEUE_SIZE, VirtioBlkAllocatedRequest, VirtioBlkCapabilities,
     VirtioBlkConfigReader, VirtioBlkPendingRequest, VirtioBlkQueueCore, VirtioBlkQueueId,
     VirtioBlkReqMeta, VirtioBlkRequestPlan, allocate_request, block_limits, free_allocated_request,
@@ -30,25 +30,25 @@ use super::virtio_block_common::{
     write_data_payload,
 };
 use super::{VIRTIO_BLK_SECTOR_SIZE, alloc_virtio_blk_dev_name};
-use crate::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
-use crate::dev::block::{
+use general::dev::bio::{Bio, BioIoError, BioOp, SubmitError};
+use general::dev::block::{
     BlockAttributes, BlockClass, BlockDevice, BlockDeviceInit, BlockDriver, BlockGeometry,
 };
 #[cfg(feature = "block-profile")]
-use crate::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
-use crate::dev::dma::DmaContext;
-use crate::dev::function::BlockFunction;
-use crate::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
-use crate::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
-use crate::dev::pnp::{
-    BusType, DevInitContext, DriverFactory, PnpBusInfo, PnpDependency, PnpDevice, PnpDriver,
-    PnpError, PnpId, PnpResourceKind, register_driver_factory,
+use general::dev::control::{BlockControlRequest, BlockControlResponse, ControlError};
+use general::dev::dma::DmaContext;
+use general::dev::function::BlockFunction;
+use general::dev::irq::{self, IrqError, IrqHandle, IrqHandler, IrqLine, IrqStatus};
+use general::dev::platform::{PlatformDeviceInfo, PlatformIrqRegistrationError};
+use general::dev::pnp::{
+    BusType, DevInitContext, DriverFactory, DriverHandle, PnpBusInfo, PnpDependency, PnpDevice,
+    PnpDriver, PnpError, PnpId, PnpResourceKind, register_driver_factory,
 };
-use crate::dev::virtio::{SplitVirtQueue, choose_split_queue_size};
-use crate::dev::virtio_mmio::{
+use virtio::virtio_mmio::{
     VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED,
     VIRTIO_STATUS_FEATURES_OK, VirtioMmioTransport, detect as detect_virtio_mmio,
 };
+use virtio::{SplitVirtQueue, choose_split_queue_size};
 
 // ───────── VirtIO MMIO 寄存器布局 ─────────
 
@@ -811,12 +811,12 @@ impl PnpDriver for VirtioMmioBlkDriver {
             let _ = irq::unregister_irq_handler(handle);
             return Err(err);
         }
-        dev.register_function(Arc::new(BlockFunction::with_projection_name(
+        dev.register_function(BlockFunction::with_projection_name_arc(
             &dev.name, &dev_name, block_dev,
-        )))?;
+        ))?;
         log::printk!(
             "[platform-virtio-mmio-blk] bound {} phys={:#x} -> /dev/{}",
-            dev.id,
+            dev.name,
             phys,
             dev_name
         );
@@ -824,7 +824,7 @@ impl PnpDriver for VirtioMmioBlkDriver {
     }
 
     fn remove(&self, dev: &Arc<PnpDevice>) {
-        log::printk!("[platform-virtio-mmio-blk] removed {}", dev.id);
+        log::printk!("[platform-virtio-mmio-blk] removed {}", dev.name);
     }
 }
 
@@ -840,7 +840,7 @@ impl DriverFactory for VirtioMmioBlkFactory {
     }
 }
 
-/// 注册 VirtIO-MMIO block 内建驱动 factory。
-pub(super) fn register_builtin_driver() -> Result<(), PnpError> {
-    register_driver_factory(Arc::new(VirtioMmioBlkFactory)).map(|_| ())
+/// 注册 VirtIO-MMIO block 驱动 factory。
+pub(super) fn register_driver() -> Result<DriverHandle, PnpError> {
+    register_driver_factory(Arc::new(VirtioMmioBlkFactory))
 }

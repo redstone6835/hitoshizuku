@@ -958,6 +958,7 @@ impl Debug for PnpDevice {
     }
 }
 
+#[kernel_symbols::export]
 impl PnpDevice {
     /// 构造一个尚未进入全局设备表的 PnP 对象。
     ///
@@ -1089,11 +1090,27 @@ impl PnpDevice {
     }
 
     /// 保存驱动私有数据。
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpDevice.set_driver_data",
+        contract = "kernel.general.pnp-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 2u64
+    )]
     pub fn set_driver_data(&self, data: Arc<dyn Any + Send + Sync>) {
         self.inner.lock().driver_data = Some(data);
     }
 
     /// 取出并清空驱动私有数据。
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpDevice.take_driver_data",
+        contract = "kernel.general.pnp-device@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn take_driver_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.inner.lock().driver_data.take()
     }
@@ -1193,6 +1210,22 @@ impl PnpDevice {
     where
         R: PnpResource + 'static,
     {
+        self.own_boxed_resource(Box::new(resource))
+    }
+
+    /// 将已经完成类型擦除的资源交给当前 PnP 设备拥有。
+    ///
+    /// 该入口允许常驻子系统在内核侧构造 trait object，再交给动态 ELM 使用，
+    /// 避免把常驻类型的私有 vtable 当成模块链接 ABI。
+    #[kernel_symbols::export(
+        name = "general.dev.pnp.PnpDevice.own_boxed_resource",
+        contract = "kernel.general.device-resource@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::DEVICE_RESOURCE,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 2u64
+    )]
+    pub fn own_boxed_resource(&self, resource: Box<dyn PnpResource>) -> Result<(), PnpError> {
         let mut inner = self.inner.lock();
         if !matches!(inner.state, PnpState::Probing | PnpState::Bound) {
             return Err(PnpError::InvalidState);
@@ -1201,7 +1234,7 @@ impl PnpDevice {
             .resources
             .try_reserve(1)
             .map_err(|_| PnpError::OutOfMemory)?;
-        inner.resources.push(Box::new(resource));
+        inner.resources.push(resource);
         Ok(())
     }
 
@@ -1404,7 +1437,12 @@ impl PnpDriverRegistry {
                 log::error!("[pnp] duplicate driver name: {}", driver_name);
                 return Err(PnpError::NameConflict);
             }
-            drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+            {
+                // 驱动表容量属于常驻内核注册表，不能在动态 ELM 卸载后继续计入该单元。
+                let _accounting = allocator::suspend_implicit_allocation_accounting()
+                    .ok_or(PnpError::OutOfMemory)?;
+                drivers.try_reserve(1).map_err(|_| PnpError::OutOfMemory)?;
+            }
             let id = alloc_driver_id(&self.next_driver_id)?;
             drivers.push(RegisteredDriver {
                 id,
@@ -2220,6 +2258,7 @@ impl PnpDevice {
 
     fn unregister_function_external(&self, func: &Arc<dyn DeviceFunction>) {
         DEVICES.unregister_quiesced_function(func);
+        super::elm_lifecycle::forget_device_function(self, func.class_id(), func.dev_name());
     }
 
     fn rollback_probe_side_effects(self: &Arc<Self>) {
@@ -2406,9 +2445,7 @@ pub fn direct_pnp_unregister_function(
     class_id: crate::dev::function::DeviceClassId,
     name: &str,
 ) -> Result<(), PnpError> {
-    device.unregister_function(class_id, name)?;
-    super::elm_lifecycle::forget_device_function(device, class_id, name);
-    Ok(())
+    device.unregister_function(class_id, name)
 }
 
 /// 执行真实 PnP 设备的完整热拔流程。

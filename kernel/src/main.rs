@@ -75,6 +75,11 @@ fn main() -> ! {
         );
     }
     elm::init_builtin_mgr();
+    let build_bound = elm::load_build_bound_modules(&init)
+        .unwrap_or_else(|error| panic!("[kernel] BuildBound ELM 自动装载失败: {error}"));
+    if build_bound != 0 {
+        log::info!("[kernel] activated {} BuildBound ELM(s)", build_bound);
+    }
     // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则
     // `sleep` 这类程序运行时 Ctrl-C 会滞留在 UART FIFO。poller 需要
     // 调度器 init/idle 完成后才能派生内核线程。

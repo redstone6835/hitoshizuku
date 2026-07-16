@@ -52,6 +52,4 @@ pub fn kernel_symbol_catalog_anchor() -> usize {
         ^ dev::pci::register_host_bridge as usize
         ^ dev::pci::pci_scan_and_register as usize
         ^ dev::platform::register_and_probe_platform_device as usize
-        ^ dev::virtio::parse_virtio_pci_caps as usize
-        ^ dev::virtio_mmio::detect as usize
 }
