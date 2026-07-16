@@ -2,8 +2,8 @@
 rustflags = [
     "--cfg=elm_kernel_api=\"contest-2026\"",
     "--check-cfg=cfg(elm_kernel_api,values(\"contest-2026\"))",
-    "--cfg=elm_kernel_profile=\"d324fcdf1778f2be3b34307920e94c9b9a7cc3d4c882d0c90c5e36522d57b9b6\"",
-    "--check-cfg=cfg(elm_kernel_profile,values(\"d324fcdf1778f2be3b34307920e94c9b9a7cc3d4c882d0c90c5e36522d57b9b6\"))",
+    "--cfg=elm_kernel_profile=\"035f323b73bf4db169bc1d69e615f0a5f7c35393a5d2d0055895c289e27ae384\"",
+    "--check-cfg=cfg(elm_kernel_profile,values(\"035f323b73bf4db169bc1d69e615f0a5f7c35393a5d2d0055895c289e27ae384\"))",
 ]
 
 [target.riscv64gc-unknown-none-elf]
@@ -27,8 +27,8 @@ rustflags = [
     "link-arg=--build-id=none",
     "--cfg=elm_kernel_api=\"contest-2026\"",
     "--check-cfg=cfg(elm_kernel_api,values(\"contest-2026\"))",
-    "--cfg=elm_kernel_profile=\"d324fcdf1778f2be3b34307920e94c9b9a7cc3d4c882d0c90c5e36522d57b9b6\"",
-    "--check-cfg=cfg(elm_kernel_profile,values(\"d324fcdf1778f2be3b34307920e94c9b9a7cc3d4c882d0c90c5e36522d57b9b6\"))",
+    "--cfg=elm_kernel_profile=\"035f323b73bf4db169bc1d69e615f0a5f7c35393a5d2d0055895c289e27ae384\"",
+    "--check-cfg=cfg(elm_kernel_profile,values(\"035f323b73bf4db169bc1d69e615f0a5f7c35393a5d2d0055895c289e27ae384\"))",
 ]
 
 [target.loongarch64-unknown-none]
@@ -54,6 +54,6 @@ rustflags = [
     "named_asm_labels",
     "--cfg=elm_kernel_api=\"contest-2026\"",
     "--check-cfg=cfg(elm_kernel_api,values(\"contest-2026\"))",
-    "--cfg=elm_kernel_profile=\"d324fcdf1778f2be3b34307920e94c9b9a7cc3d4c882d0c90c5e36522d57b9b6\"",
-    "--check-cfg=cfg(elm_kernel_profile,values(\"d324fcdf1778f2be3b34307920e94c9b9a7cc3d4c882d0c90c5e36522d57b9b6\"))",
+    "--cfg=elm_kernel_profile=\"035f323b73bf4db169bc1d69e615f0a5f7c35393a5d2d0055895c289e27ae384\"",
+    "--check-cfg=cfg(elm_kernel_profile,values(\"035f323b73bf4db169bc1d69e615f0a5f7c35393a5d2d0055895c289e27ae384\"))",
 ]

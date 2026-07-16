@@ -40,6 +40,7 @@ use crate::{ExitCode, TaskState};
 // ── 无副作用查询 ──────────────────────────────────────────────────────────────
 
 /// 当前进程 pid（Linux 语义：线程组 leader 的 pid）。
+#[kernel_symbols::export(name = "sched.operation.getpid", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn getpid() -> PidT {
     let me = current_task();
     me.thread_group()
@@ -50,11 +51,13 @@ pub fn getpid() -> PidT {
 }
 
 /// 当前线程 tid。
+#[kernel_symbols::export(name = "sched.operation.gettid", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn gettid() -> PidT {
     current_task().pid_root().unwrap_or(0)
 }
 
 /// 父进程 pid。父若不在根 ns 或已被 reparent，会返回 reparent 后的新父。
+#[kernel_symbols::export(name = "sched.operation.getppid", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn getppid() -> PidT {
     current_task()
         .parent()
@@ -293,6 +296,7 @@ pub fn exit_group(code: i32) -> ! {
 
 // ── 调度器相关 ────────────────────────────────────────────────────────────────
 
+#[kernel_symbols::export(name = "sched.operation.sched_yield", contract = "kernel.sched.process-control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn sched_yield() -> Result<(), Errno> {
     current_task().record_voluntary_context_switch();
     schedule_once(0);
@@ -379,6 +383,7 @@ fn update_task_sched_entity(
     }
 }
 
+#[kernel_symbols::export(name = "sched.operation.sched_getattr", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn sched_getattr(pid: PidT) -> Result<SchedAttr, Errno> {
     let task = lookup_pid(pid)?;
     Ok(sched_getattr_for_task(&task))
@@ -407,6 +412,7 @@ pub fn set_task_nice(task: &Arc<Task>, nice: i8) {
     );
 }
 
+#[kernel_symbols::export(name = "sched.operation.task_usage", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn task_usage(pid: PidT) -> Result<TaskUsage, Errno> {
     Ok(lookup_pid(pid)?.usage_snapshot(crate::scheduler::now_ns_public()))
 }
@@ -415,6 +421,7 @@ pub fn children_usage(pid: PidT) -> Result<TaskUsage, Errno> {
     Ok(lookup_pid(pid)?.child_usage_snapshot())
 }
 
+#[kernel_symbols::export(name = "sched.operation.all_tasks_snapshot", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED | kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn all_tasks_snapshot() -> Vec<Arc<Task>> {
     root_pid_ns()
         .registry()
@@ -424,6 +431,7 @@ pub fn all_tasks_snapshot() -> Vec<Arc<Task>> {
         .collect()
 }
 
+#[kernel_symbols::export(name = "sched.operation.sched_getaffinity", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn sched_getaffinity(pid: PidT) -> Result<u64, Errno> {
     let task = lookup_pid(pid)?;
     Ok(sched_getaffinity_for_task(&task))
@@ -433,6 +441,7 @@ pub fn sched_getaffinity_for_task(task: &Arc<Task>) -> u64 {
     task.cpu_affinity() & supported_cpu_mask()
 }
 
+#[kernel_symbols::export(name = "sched.operation.sched_setaffinity", contract = "kernel.sched.process-control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn sched_setaffinity(pid: PidT, mask: u64) -> Result<(), Errno> {
     let task = lookup_pid(pid)?;
     sched_setaffinity_for_task(&task, mask)
@@ -472,6 +481,7 @@ pub fn sched_setaffinity_for_task(task: &Arc<Task>, mask: u64) -> Result<(), Err
 }
 
 /// getcpu：返回当前调度 CPU；节点编号由兼容层保持 UMA 语义。
+#[kernel_symbols::export(name = "sched.operation.getcpu", contract = "kernel.sched.process-query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn getcpu() -> Result<(u32, u32), Errno> {
     Ok((current_cpu_id() as u32, 0))
 }
@@ -743,6 +753,7 @@ fn child_exit_status(child: &Arc<Task>, fallback: ExitCode) -> WaitStatus {
 
 /// `wait4(pid, &mut status, opts, _rusage)`：阻塞等待子退出。
 /// 返回 `(pid, status)`。`WNOHANG` 下无 zombie 返回 `WaitResult { pid: 0, ... }`。
+#[kernel_symbols::export(name = "sched.operation.wait4", contract = "kernel.sched.process-control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn wait4(pid: PidT, options: WaitOptions) -> Result<WaitResult, Errno> {
     let target = WaitId::from_wait4_pid(pid);
     wait_common(target, options, true)
@@ -971,6 +982,7 @@ fn deliver_to_thread_group(target: &Arc<Task>, info: SigInfo) -> bool {
 /// - pid == 0：送到调用者同 pgroup 的所有进程。
 /// - pid == -1：送到 init 外的所有进程（精简实现：枚举当前 ns 所有 pid）。
 /// - pid < -1：送到 pgid==-pid 的所有进程。
+#[kernel_symbols::export(name = "sched.operation.kill", contract = "kernel.sched.signal@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn kill(pid: PidT, sig: Option<SignalNumber>) -> Result<(), Errno> {
     let me = current_task();
     if pid > 0 {
@@ -1219,6 +1231,7 @@ pub fn sigprocmask(how: SigProcMaskHow, set: SigSet) -> Result<SigSet, Errno> {
 }
 
 /// `sigpending()`：返回 per-task + tg-shared 的 pending 合集。
+#[kernel_symbols::export(name = "sched.operation.sigpending", contract = "kernel.sched.signal@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn sigpending() -> Result<SigSet, Errno> {
     let me = current_task();
     let per_task = me.signal.pending_snapshot();
@@ -1402,6 +1415,7 @@ fn rlimit_err_to_errno(e: RlimitError) -> Errno {
 }
 
 /// `getrlimit(resource)` 拿到调用者 tg 的 (soft, hard)。
+#[kernel_symbols::export(name = "sched.operation.get_rlimit", contract = "kernel.sched.rlimit@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
     let me = current_task();
     let pair = me.thread_group().rlimits().lock().get(resource);
@@ -1421,6 +1435,7 @@ pub fn get_rlimit(resource: Resource) -> Result<RlimitPair, Errno> {
 /// `setrlim.c:21` 典型用法 `setrlimit(RLIMIT_STACK, 102400)` 会把
 /// `rlim_max = 102400`，当前 soft 可能是 8MB，老式"hard 不能降到
 /// 软以下"校验会误返 EINVAL。
+#[kernel_symbols::export(name = "sched.operation.set_rlimit", contract = "kernel.sched.rlimit@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn set_rlimit(resource: Resource, new: RlimitPair) -> Result<RlimitPair, Errno> {
     let me = current_task();
     let tg = me.thread_group();
@@ -1491,6 +1506,7 @@ pub fn prlimit64(
 }
 
 /// 返回整个 rlimit 表（用于调试/procfs）。
+#[kernel_symbols::export(name = "sched.operation.rlimits_snapshot", contract = "kernel.sched.rlimit@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn rlimits_snapshot() -> Rlimits {
     let me = current_task();
     *me.thread_group().rlimits().lock()

@@ -5,6 +5,12 @@
 
 #![no_std]
 
+/// 强制链接器保留 EFI 查询直接符号目录。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    status_success as usize ^ guid_equal as usize
+}
+
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
@@ -561,18 +567,22 @@ fn c_ascii_str(ptr: *const u8, max_len: usize) -> &'static str {
     core::str::from_utf8(bytes).unwrap_or("")
 }
 
+#[kernel_symbols::export(name = "efi.status_success", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_success() -> EfiStatus {
     unsafe { EFI_STATUS_SUCCESS }
 }
 
+#[kernel_symbols::export(name = "efi.status_load_error", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_load_error() -> EfiStatus {
     unsafe { EFI_STATUS_LOAD_ERROR }
 }
 
+#[kernel_symbols::export(name = "efi.status_invalid_parameter", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_invalid_parameter() -> EfiStatus {
     unsafe { EFI_STATUS_INVALID_PARAMETER }
 }
 
+#[kernel_symbols::export(name = "efi.status_unsupported", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_unsupported() -> EfiStatus {
     unsafe { EFI_STATUS_UNSUPPORTED }
 }
@@ -589,24 +599,29 @@ pub fn status_out_of_resources() -> EfiStatus {
     unsafe { EFI_STATUS_OUT_OF_RESOURCES }
 }
 
+#[kernel_symbols::export(name = "efi.status_is_error", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_is_error(status: EfiStatus) -> bool {
     unsafe { efi_status_is_error(status) != 0 }
 }
 
+#[kernel_symbols::export(name = "efi.status_is_success", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_is_success(status: EfiStatus) -> bool {
     unsafe { efi_status_is_success(status) != 0 }
 }
 
+#[kernel_symbols::export(name = "efi.status_name", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn status_name(status: EfiStatus) -> &'static str {
     let ptr = unsafe { efi_status_name(status) };
     c_ascii_str(ptr, 96)
 }
 
+#[kernel_symbols::export(name = "efi.memory_type_name", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn memory_type_name(type_: u32) -> &'static str {
     let ptr = unsafe { efi_memory_type_name(type_) };
     c_ascii_str(ptr, 96)
 }
 
+#[kernel_symbols::export(name = "efi.memory_type_is_usable_after_exit_boot_services", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn memory_type_is_usable_after_exit_boot_services(type_: u32) -> bool {
     unsafe { efi_memory_type_is_usable_after_exit_boot_services(type_) != 0 }
 }
@@ -631,14 +646,17 @@ pub fn memory_type_conventional_memory() -> u32 {
     unsafe { EFI_MEMORY_TYPE_CONVENTIONAL_MEMORY }
 }
 
+#[kernel_symbols::export(name = "efi.acpi_20_table_guid", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn acpi_20_table_guid() -> &'static EfiGuid {
     unsafe { &ACPI_20_TABLE_GUID }
 }
 
+#[kernel_symbols::export(name = "efi.acpi_table_guid", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn acpi_table_guid() -> &'static EfiGuid {
     unsafe { &ACPI_TABLE_GUID }
 }
 
+#[kernel_symbols::export(name = "efi.fdt_table_guid", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn fdt_table_guid() -> &'static EfiGuid {
     unsafe { &FDT_TABLE_GUID }
 }
@@ -663,10 +681,12 @@ pub fn simple_text_output_protocol_guid() -> &'static EfiGuid {
     unsafe { &SIMPLE_TEXT_OUTPUT_PROTOCOL_GUID }
 }
 
+#[kernel_symbols::export(name = "efi.guid_equal", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn guid_equal(lhs: &EfiGuid, rhs: &EfiGuid) -> bool {
     unsafe { efi_guid_equal(lhs as *const EfiGuid, rhs as *const EfiGuid) != 0 }
 }
 
+#[kernel_symbols::export(name = "efi.known_config_table_name", contract = "kernel.firmware.efi-query@1", version = 1, capabilities = kernel_symbols::capability::FIRMWARE_QUERY)]
 pub fn known_config_table_name(guid: &EfiGuid) -> &'static str {
     let ptr = unsafe { efi_known_config_table_name(guid as *const EfiGuid) };
     c_ascii_str(ptr, 128)

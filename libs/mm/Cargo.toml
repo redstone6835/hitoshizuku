@@ -13,6 +13,7 @@ ktest-kernel = ["ktest/kernel"]
 
 [dependencies]
 errno = { path = "../errno" }
+kernel-symbols = { path = "../kernel-symbols" }
 log = { path = "../log" }
 ktest = { path = "../ktest", optional = true }
 

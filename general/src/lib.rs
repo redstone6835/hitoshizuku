@@ -52,4 +52,9 @@ pub fn kernel_symbol_catalog_anchor() -> usize {
         ^ dev::pci::register_host_bridge as usize
         ^ dev::pci::pci_scan_and_register as usize
         ^ dev::platform::register_and_probe_platform_device as usize
+        ^ console::console_write as usize
+        ^ firmware::power::shutdown as usize
+        ^ ipc::ShmManager::info as usize
+        ^ mm::page_size as usize
+        ^ mm::VmSpace::mapped_pages as usize
 }

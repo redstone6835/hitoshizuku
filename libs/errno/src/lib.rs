@@ -86,10 +86,18 @@ pub enum Errno {
     Other(i32),
 }
 
+/// 强制链接器保留错误码转换直接符号目录。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    Errno::from_i32 as usize ^ Errno::as_i32 as usize
+}
+
+#[kernel_symbols::export]
 impl Errno {
     pub const EWOULDBLOCK: Self = Self::EAGAIN;
     pub const ENOTSUP: Self = Self::EOPNOTSUPP;
 
+    #[kernel_symbols::export(name = "errno.Errno.from_i32", contract = "kernel.errno.conversion@1", version = 1, capabilities = kernel_symbols::capability::CORE_SAFE)]
     pub fn from_i32(code: i32) -> Self {
         match code {
             0 => Errno::ESUCCESS,
@@ -176,6 +184,7 @@ impl Errno {
         }
     }
 
+    #[kernel_symbols::export(name = "errno.Errno.as_i32", contract = "kernel.errno.conversion@1", version = 1, capabilities = kernel_symbols::capability::CORE_SAFE)]
     pub fn as_i32(self) -> i32 {
         match self {
             Errno::ESUCCESS => 0,

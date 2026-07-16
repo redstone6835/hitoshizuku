@@ -238,6 +238,7 @@ pub struct FatFsDriver {
     force_ro: bool,
 }
 
+#[kernel_symbols::export]
 impl FatFsDriver {
     /// 创建新驱动。需要在调用 VFS mount 前 [`bind_backend`]。
     pub const fn new() -> Self {
@@ -256,6 +257,14 @@ impl FatFsDriver {
     }
 
     /// 绑定底层块设备。必须在 mount 之前调用。
+    #[kernel_symbols::export(
+        name = "fatfs.FatFsDriver.bind_backend",
+        contract = "kernel.filesystem.fat-driver@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::FILESYSTEM_DRIVER,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE,
+        retained_args = 1 << 1
+    )]
     pub fn bind_backend(&self, backend: Arc<dyn BlockBackend>) {
         *self.backend.lock() = Some(backend);
     }

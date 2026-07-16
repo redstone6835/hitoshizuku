@@ -12,3 +12,4 @@ bench = false
 arch = { path = "../arch" }
 elf = { path = "../libs/elf" }
 general = { path = "../general" }
+kernel-symbols = { path = "../libs/kernel-symbols" }

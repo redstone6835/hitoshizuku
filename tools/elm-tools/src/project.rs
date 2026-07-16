@@ -7,7 +7,8 @@ use elm::Sha256;
 
 use crate::kernel_interface::{
     KernelInterfaceManifest, LSP_SOURCE_IDENTITY_FILE, LSP_SOURCE_MAGIC, hex_digest,
-    metadata_facade_manifest, metadata_facade_source, packaged_framework_hash,
+    kernel_api_crates, kernel_api_host_alias, metadata_facade_manifest, metadata_facade_source,
+    packaged_framework_hash,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,14 +401,13 @@ pub fn sync_framework(project: &Path) -> Result<(), String> {
         }
         copy_tree(&elm_source, &temporary.join("elm"))?;
         copy_tree(&kernel_symbols_source, &temporary.join("kernel-symbols"))?;
-        write_metadata_facade(
-            &temporary.join("allocator"),
-            "allocator",
-            "__elm_host_allocator",
-        )?;
-        write_metadata_facade(&temporary.join("general"), "general", "__elm_host_general")?;
-        write_metadata_facade(&temporary.join("log"), "log", "__elm_host_log")?;
-        write_metadata_facade(&temporary.join("sched"), "sched", "__elm_host_sched")?;
+        for spec in kernel_api_crates() {
+            write_metadata_facade(
+                &temporary.join(spec.name),
+                spec.name,
+                &kernel_api_host_alias(spec.name),
+            )?;
+        }
         fs::write(
             temporary.join("Cargo.toml"),
             crate::kernel_interface::framework_workspace_manifest(),
@@ -777,22 +777,7 @@ pub fn cargo_build(project: &Path, target: &str, cargo_name: &str) -> Result<Pat
     ];
     let metadata = interface_root.join("metadata");
     rustflags.push(format!("-Ldependency={}", metadata.display()));
-    rustflags.push(format!(
-        "--extern=__elm_host_allocator={}",
-        metadata.join(&interface.allocator_metadata).display()
-    ));
-    rustflags.push(format!(
-        "--extern=__elm_host_general={}",
-        metadata.join(&interface.general_metadata).display()
-    ));
-    rustflags.push(format!(
-        "--extern=__elm_host_log={}",
-        metadata.join(&interface.log_metadata).display()
-    ));
-    rustflags.push(format!(
-        "--extern=__elm_host_sched={}",
-        metadata.join(&interface.sched_metadata).display()
-    ));
+    append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
     if target == "loongarch64-unknown-none" {
@@ -838,25 +823,8 @@ pub fn cargo_build_integrated(
     let interface_root = project.join(".elm/kernel-interface").join(target);
     let interface = KernelInterfaceManifest::load(&interface_root.join("manifest.txt"))?;
     let metadata = interface_root.join("metadata");
-    let mut rustflags = vec![
-        format!("-Ldependency={}", metadata.display()),
-        format!(
-            "--extern=__elm_host_allocator={}",
-            metadata.join(&interface.allocator_metadata).display()
-        ),
-        format!(
-            "--extern=__elm_host_general={}",
-            metadata.join(&interface.general_metadata).display()
-        ),
-        format!(
-            "--extern=__elm_host_log={}",
-            metadata.join(&interface.log_metadata).display()
-        ),
-        format!(
-            "--extern=__elm_host_sched={}",
-            metadata.join(&interface.sched_metadata).display()
-        ),
-    ];
+    let mut rustflags = vec![format!("-Ldependency={}", metadata.display())];
+    append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
     let mut command = Command::new("cargo");
@@ -1044,25 +1012,8 @@ pub fn cargo_check(project: &Path, target: &str, cargo_name: &str) -> Result<(),
     let interface_root = project.join(".elm/kernel-interface").join(target);
     let interface = KernelInterfaceManifest::load(&interface_root.join("manifest.txt"))?;
     let metadata = interface_root.join("metadata");
-    let mut rustflags = vec![
-        format!("-Ldependency={}", metadata.display()),
-        format!(
-            "--extern=__elm_host_allocator={}",
-            metadata.join(&interface.allocator_metadata).display()
-        ),
-        format!(
-            "--extern=__elm_host_general={}",
-            metadata.join(&interface.general_metadata).display()
-        ),
-        format!(
-            "--extern=__elm_host_log={}",
-            metadata.join(&interface.log_metadata).display()
-        ),
-        format!(
-            "--extern=__elm_host_sched={}",
-            metadata.join(&interface.sched_metadata).display()
-        ),
-    ];
+    let mut rustflags = vec![format!("-Ldependency={}", metadata.display())];
+    append_kernel_metadata_flags(&mut rustflags, &metadata, &interface)?;
     let (api_profiles, profile_hashes) = kernel_profile_cfg_values(&project_manifest, target)?;
     append_kernel_profile_flags(&mut rustflags, &interface, &api_profiles, &profile_hashes);
     let status = Command::new("cargo")
@@ -1094,6 +1045,25 @@ fn cargo_target_directory(project: &Path) -> PathBuf {
     } else {
         project.join(configured)
     }
+}
+
+fn append_kernel_metadata_flags(
+    rustflags: &mut Vec<String>,
+    directory: &Path,
+    interface: &KernelInterfaceManifest,
+) -> Result<(), String> {
+    for spec in kernel_api_crates() {
+        let file = interface
+            .metadata
+            .get(spec.name)
+            .ok_or_else(|| format!("接口清单缺少 {} metadata", spec.name))?;
+        rustflags.push(format!(
+            "--extern={}={}",
+            kernel_api_host_alias(spec.name),
+            directory.join(file).display()
+        ));
+    }
+    Ok(())
 }
 
 fn append_kernel_profile_flags(
@@ -1722,6 +1692,21 @@ fn write_new(path: &Path, contents: &str) -> Result<(), String> {
 
 fn cargo_toml(name: &str, kind: &str) -> String {
     let features = elm_features(kind);
+    let lsp_features = kernel_api_crates()
+        .iter()
+        .map(|spec| format!("\"{}/lsp\"", spec.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let facades = kernel_api_crates()
+        .iter()
+        .map(|spec| {
+            format!(
+                "{} = {{ path = \".elm/framework/{}\", default-features = false }}",
+                spec.name, spec.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         r#"[package]
 name = "{name}"
@@ -1743,15 +1728,12 @@ bench = false
 
 [features]
 default = ["elm-lsp"]
-elm-lsp = ["allocator/lsp", "general/lsp", "log/lsp", "sched/lsp"]
+elm-lsp = [{lsp_features}]
 elm-integrated = []
 
 [dependencies]
 elm = {{ path = ".elm/framework/elm", default-features = false, features = [{features}] }}
-allocator = {{ path = ".elm/framework/allocator", default-features = false }}
-general = {{ path = ".elm/framework/general", default-features = false }}
-log = {{ path = ".elm/framework/log", default-features = false }}
-sched = {{ path = ".elm/framework/sched", default-features = false }}
+{facades}
 
 [profile.release]
 panic = "abort"
@@ -1887,10 +1869,9 @@ fn migrate_cargo_manifest(path: &Path, manifest: &ElmProjectManifest) -> Result<
         ));
     }
 
-    output = ensure_facade_dependency(&output, "allocator")?;
-    output = ensure_facade_dependency(&output, "general")?;
-    output = ensure_facade_dependency(&output, "log")?;
-    output = ensure_facade_dependency(&output, "sched")?;
+    for spec in kernel_api_crates() {
+        output = ensure_facade_dependency(&output, spec.name)?;
+    }
     for dependency in manifest
         .dependencies
         .iter()
@@ -1966,17 +1947,16 @@ fn migrate_standard_root_workspace(input: &str) -> Result<String, String> {
             .strip_prefix('"')
             .and_then(|line| line.split_once('"').map(|(member, _)| member))
         {
-            if !matches!(
+            let standard = matches!(
                 member,
                 "." | ".elm/framework/elm"
                     | ".elm/framework/elm/macros"
                     | ".elm/framework/kernel-symbols"
                     | ".elm/framework/kernel-symbols/macros"
-                    | ".elm/framework/allocator"
-                    | ".elm/framework/general"
-                    | ".elm/framework/log"
-                    | ".elm/framework/sched"
-            ) {
+            ) || kernel_api_crates()
+                .iter()
+                .any(|spec| member == format!(".elm/framework/{}", spec.name));
+            if !standard {
                 return Err(format!(
                     "ELM 根 Cargo.toml 包含自定义 workspace member {member}；请先把 ELM package 与仓库 workspace 分离"
                 ));
@@ -2152,8 +2132,14 @@ fn ensure_elm_api_dependency(input: &str, name: &str) -> Result<String, String> 
 }
 
 fn ensure_lsp_feature(input: &str, _manifest: &ElmProjectManifest) -> Result<String, String> {
-    const LSP_FEATURE: &str =
-        "elm-lsp = [\"allocator/lsp\", \"general/lsp\", \"log/lsp\", \"sched/lsp\"]";
+    let lsp_feature = format!(
+        "elm-lsp = [{}]",
+        kernel_api_crates()
+            .iter()
+            .map(|spec| format!("\"{}/lsp\"", spec.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let trailing_newline = input.ends_with('\n');
     let mut lines = input.lines().map(str::to_string).collect::<Vec<_>>();
@@ -2167,7 +2153,7 @@ fn ensure_lsp_feature(input: &str, _manifest: &ElmProjectManifest) -> Result<Str
             [
                 "[features]".to_string(),
                 "default = [\"elm-lsp\"]".to_string(),
-                LSP_FEATURE.to_string(),
+                lsp_feature.clone(),
                 String::new(),
             ],
         );
@@ -2179,21 +2165,17 @@ fn ensure_lsp_feature(input: &str, _manifest: &ElmProjectManifest) -> Result<Str
     };
 
     let section = &lines[features.0 + 1..features.1];
-    if let Some(line) = section.iter().find(|line| {
-        line.split_once('=')
-            .is_some_and(|(key, _)| key.trim() == "elm-lsp")
-    }) {
-        if !line.contains("allocator/lsp")
-            || !line.contains("general/lsp")
-            || !line.contains("log/lsp")
-            || !line.contains("sched/lsp")
-        {
-            return Err(
-                "Cargo.toml 的 elm-lsp feature 未启用全部标准内核元数据 facade".to_string(),
-            );
-        }
+    if let Some(index) = section
+        .iter()
+        .position(|line| {
+            line.split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "elm-lsp")
+        })
+        .map(|offset| features.0 + 1 + offset)
+    {
+        lines[index] = lsp_feature;
     } else {
-        lines.insert(features.0 + 1, LSP_FEATURE.to_string());
+        lines.insert(features.0 + 1, lsp_feature);
     }
 
     let features = manifest_section_range(&lines, "[features]").unwrap();
@@ -2720,9 +2702,12 @@ uri = "forbidden"
         assert!(service_cargo.contains("[[bin]]\nname = \"demo-service\"\npath = \"src/main.rs\""));
         assert!(!service_cargo.contains("[workspace]"));
         assert!(service_cargo.contains("default = [\"elm-lsp\"]"));
-        assert!(service_cargo.contains("\"log/lsp\", \"sched/lsp\""));
+        assert!(service_cargo.contains("\"sched/lsp\", \"vfs/lsp\""));
+        assert!(!service_cargo.contains("\"net/lsp\""));
         assert!(service_cargo.contains(".elm/framework/allocator"));
         assert!(service_cargo.contains(".elm/framework/general"));
+        assert!(service_cargo.contains(".elm/framework/vfs"));
+        assert!(service_cargo.contains(".elm/framework/hal"));
         assert!(service_cargo.contains("[profile.dev]\npanic = \"abort\""));
         assert!(service_cargo.contains(
             "allocator = { path = \".elm/framework/allocator\", default-features = false }"
@@ -2764,6 +2749,12 @@ uri = "forbidden"
             service
                 .path()
                 .join(".elm/framework/general/Cargo.toml")
+                .is_file()
+        );
+        assert!(
+            service
+                .path()
+                .join(".elm/framework/vfs/Cargo.toml")
                 .is_file()
         );
         assert!(service.path().join(".elm/framework/Cargo.toml").is_file());
@@ -2810,7 +2801,8 @@ members = [
         assert!(migrated.contains("general ="));
         assert!(!migrated.contains("[workspace]"));
         assert!(migrated.contains("default = [\"elm-lsp\"]"));
-        assert!(migrated.contains("\"log/lsp\", \"sched/lsp\""));
+        assert!(migrated.contains("\"sched/lsp\", \"vfs/lsp\""));
+        assert!(!migrated.contains("\"net/lsp\""));
         assert!(migrated.contains("default-features = false"));
 
         fs::write(

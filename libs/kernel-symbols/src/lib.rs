@@ -907,6 +907,29 @@ pub mod capability {
     /// allocator 初始化、后端安装和全局策略修改。
     pub const ALLOCATOR_ADMIN: u64 = 1 << 5;
 
+    /// VFS 元数据、路径和只读状态查询。
+    pub const VFS_QUERY: u64 = 1 << 6;
+    /// 文件、目录、管道和描述符 I/O 操作。
+    pub const VFS_IO: u64 = 1 << 7;
+    /// 挂载命名空间、全局缓存和 VFS 策略修改。
+    pub const VFS_ADMIN: u64 = 1 << 8;
+    /// 文件系统驱动及 VFS 扩展对象注册。
+    pub const VFS_DRIVER: u64 = 1 << 9;
+
+    /// 调度器、任务和 CPU 拓扑的只读查询。
+    pub const SCHED_QUERY: u64 = 1 << 10;
+    /// 任务创建、唤醒、等待、信号和生命周期操作。
+    pub const SCHED_TASK: u64 = 1 << 11;
+    /// 全局调度策略、拓扑和 CPU 状态修改。
+    pub const SCHED_ADMIN: u64 = 1 << 12;
+    /// 架构、任务扩展和生命周期钩子注册。
+    pub const SCHED_HOOK: u64 = 1 << 13;
+
+    /// 地址空间模型和映射状态的只读查询。
+    pub const MM_QUERY: u64 = 1 << 14;
+    /// VMA、用户地址空间和映射内容修改。
+    pub const MM_MEMORY: u64 = 1 << 15;
+
     /// 设备、总线和函数对象的只读发现与快照。
     pub const DEVICE_DISCOVERY: u64 = 1 << 16;
     /// 设备驱动、工厂、函数和热插拔生命周期注册。
@@ -922,8 +945,33 @@ pub mod capability {
     /// 安装全局总线后端、配置访问器或平台级设备策略。
     pub const DEVICE_ADMIN: u64 = 1 << 22;
 
+    /// 页表后端、全局地址空间策略和内存管理后端修改。
+    pub const MM_ADMIN: u64 = 1 << 23;
+    /// ELF 等非网络镜像格式的解析和验证。
+    pub const IMAGE_PARSE: u64 = 1 << 24;
+    /// EFI、ACPI、DTB 等固件信息的只读访问。
+    pub const FIRMWARE_QUERY: u64 = 1 << 25;
+    /// 固件处理器、事件和平台控制后端安装。
+    pub const FIRMWARE_ADMIN: u64 = 1 << 26;
+    /// FAT、Ext 等具体文件系统驱动的构造和注册。
+    pub const FILESYSTEM_DRIVER: u64 = 1 << 27;
+    /// 非网络 IPC 对象的创建、查询和操作。
+    pub const IPC: u64 = 1 << 28;
+    /// 稳定 HAL 参数、时间和平台能力查询。
+    pub const HAL_QUERY: u64 = 1 << 29;
+    /// HAL 钩子、硬件控制和用户上下文状态修改。
+    pub const HAL_CONTROL: u64 = 1 << 30;
+
     /// 默认不需要额外管理员批准的能力组。
-    pub const SAFE_DEFAULT: u64 = CORE_SAFE | ALLOCATOR_MEMORY | ALLOCATOR_DIAGNOSTIC;
+    pub const SAFE_DEFAULT: u64 = CORE_SAFE
+        | ALLOCATOR_MEMORY
+        | ALLOCATOR_DIAGNOSTIC
+        | VFS_QUERY
+        | SCHED_QUERY
+        | MM_QUERY
+        | IMAGE_PARSE
+        | FIRMWARE_QUERY
+        | HAL_QUERY;
     /// allocator 当前定义的全部能力组。
     pub const ALLOCATOR_ALL: u64 = ALLOCATOR_MEMORY
         | ALLOCATOR_DIAGNOSTIC
@@ -938,8 +986,28 @@ pub mod capability {
         | DEVICE_INTERRUPT
         | DEVICE_BUS
         | DEVICE_ADMIN;
+    /// VFS 当前定义的全部能力组。
+    pub const VFS_ALL: u64 = VFS_QUERY | VFS_IO | VFS_ADMIN | VFS_DRIVER;
+    /// 调度器当前定义的全部能力组。
+    pub const SCHED_ALL: u64 = SCHED_QUERY | SCHED_TASK | SCHED_ADMIN | SCHED_HOOK;
+    /// 内存模型和地址空间当前定义的全部能力组。
+    pub const MM_ALL: u64 = MM_QUERY | MM_MEMORY | MM_ADMIN;
+    /// 固件访问当前定义的全部能力组。
+    pub const FIRMWARE_ALL: u64 = FIRMWARE_QUERY | FIRMWARE_ADMIN;
+    /// HAL 当前定义的全部能力组。
+    pub const HAL_ALL: u64 = HAL_QUERY | HAL_CONTROL;
     /// 当前协议认识的全部能力组。
-    pub const ALL: u64 = CORE_SAFE | ALLOCATOR_ALL | DEVICE_ALL;
+    pub const ALL: u64 = CORE_SAFE
+        | ALLOCATOR_ALL
+        | VFS_ALL
+        | SCHED_ALL
+        | MM_ALL
+        | DEVICE_ALL
+        | IMAGE_PARSE
+        | FIRMWARE_ALL
+        | FILESYSTEM_DRIVER
+        | IPC
+        | HAL_ALL;
 }
 
 /// 链接到内核镜像中的直接符号描述符。

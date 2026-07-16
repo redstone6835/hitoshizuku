@@ -37,8 +37,18 @@ pub(crate) fn kernel_interface_profile_hash() -> Result<[u8; 32], &'static str> 
 }
 
 pub(crate) fn init_builtin_mgr() {
+    let _ = acpi::kernel_symbol_catalog_anchor();
     let _ = allocator::kernel_symbol_catalog_anchor();
+    let _ = efi::kernel_symbol_catalog_anchor();
+    let _ = elf::kernel_symbol_catalog_anchor();
+    let _ = errno::kernel_symbol_catalog_anchor();
+    let _ = extfs::kernel_symbol_catalog_anchor();
+    let _ = fatfs::kernel_symbol_catalog_anchor();
     let _ = general::kernel_symbol_catalog_anchor();
+    let _ = hal::kernel_symbol_catalog_anchor();
+    let _ = mm::kernel_symbol_catalog_anchor();
+    let _ = sched::kernel_symbol_catalog_anchor();
+    let _ = vfs::kernel_symbol_catalog_anchor();
     let _ = elm_model::register_current_cpu_id(sched::current_cpu_id);
     if !general::elm_guard::register_task_context_backend() {
         log::error!("[elm] 无法注册任务级执行上下文后端");

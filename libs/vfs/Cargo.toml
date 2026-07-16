@@ -11,6 +11,7 @@ bench = false
 [dependencies]
 elm_model = { package = "elm", path = "../elm" }
 errno = { path = "../errno" }
+kernel-symbols = { path = "../kernel-symbols" }
 mm = { path = "../mm" }
 net = { path = "../net" }
 sched = { path = "../sched" }

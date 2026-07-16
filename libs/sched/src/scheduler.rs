@@ -189,6 +189,7 @@ fn publish_current_task(cpu_id: usize, task: Arc<Task>) {
     }
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.current_cpu_id", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_cpu_id() -> usize {
     cpu()
 }
@@ -200,6 +201,7 @@ fn now_ns_internal() -> u64 {
 }
 
 /// 对外导出的时间戳访问器。上层 idle / main loop 要喂 `schedule_once` 用。
+#[kernel_symbols::export(name = "sched.scheduler.now_ns_public", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn now_ns_public() -> u64 {
     now_ns_internal()
 }
@@ -291,6 +293,7 @@ pub fn init() -> Arc<Task> {
 // ── 全局访问器 ────────────────────────────────────────────────────────────────
 
 /// 获取 init 任务句柄。init 建立前调用会 panic。
+#[kernel_symbols::export(name = "sched.scheduler.init_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn init_task() -> Arc<Task> {
     assert!(
         INIT_READY.load(Ordering::Acquire),
@@ -317,6 +320,7 @@ pub fn runqueue_of(cpu_id: usize) -> &'static Runqueue {
 }
 
 /// 根 PID namespace。
+#[kernel_symbols::export(name = "sched.scheduler.root_pid_ns", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn root_pid_ns() -> Arc<PidNamespace> {
     assert!(
         INIT_READY.load(Ordering::Acquire),
@@ -331,6 +335,7 @@ pub fn root_pid_ns() -> Arc<PidNamespace> {
 }
 
 /// 统计：当前根 ns 已占用的 pid 数（含 init）。
+#[kernel_symbols::export(name = "sched.scheduler.pid_count", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn pid_count() -> usize {
     root_pid_ns().registry().allocated()
 }
@@ -339,6 +344,7 @@ pub fn pid_count() -> usize {
 ///
 /// [`init`] 之后，在 CPU 0 上必然非空。AP 启动路径落地前，其它 CPU 调用此
 /// 函数会 panic（目前不会发生，因为只有 CPU 0 跑代码）。
+#[kernel_symbols::export(name = "sched.scheduler.current_task", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task() -> Arc<Task> {
     let id = cpu();
     CURRENT_TASKS[id]
@@ -364,6 +370,7 @@ pub fn current_task_ref() -> &'static Task {
 /// 当前 CPU 上正在执行的任务句柄，热路径版本。
 ///
 /// 与 [`current_task`] 语义相同，但不进入 `CURRENT_TASKS` 锁。
+#[kernel_symbols::export(name = "sched.scheduler.current_task_fast", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_fast() -> Arc<Task> {
     let id = cpu();
     let ptr = CURRENT_TASK_RAW[id].load(Ordering::Acquire);
@@ -379,6 +386,7 @@ pub fn current_task_fast() -> Arc<Task> {
 }
 
 /// 查询指定 CPU 上的 current；未登记时返回 None。
+#[kernel_symbols::export(name = "sched.scheduler.current_task_on", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn current_task_on(cpu_id: usize) -> Option<Arc<Task>> {
     if cpu_id >= NR_CPUS {
         return None;
@@ -386,6 +394,7 @@ pub fn current_task_on(cpu_id: usize) -> Option<Arc<Task>> {
     CURRENT_TASKS[cpu_id].lock().clone()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.scheduler_diag", contract = "kernel.sched.diagnostic@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC)]
 pub fn scheduler_diag() -> SchedulerDiag {
     let mut diag = SchedulerDiag::default();
     for slot in &CURRENT_TASKS {
@@ -448,10 +457,12 @@ pub fn idle_task(cpu_id: usize) -> Option<Arc<Task>> {
 }
 
 /// 是否已完成 init（避免有人在早期路径误调 current_task）。
+#[kernel_symbols::export(name = "sched.scheduler.is_ready", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_ready() -> bool {
     INIT_READY.load(Ordering::Acquire)
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.online_cpu_mask", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn online_cpu_mask() -> u64 {
     online_cpu_set().bits()
 }
@@ -464,10 +475,12 @@ fn online_cpu_set() -> CpuMask {
     CpuMask::from_bits_truncate(CPU_ONLINE.load(Ordering::Acquire)).or_boot()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.sched_topology", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn sched_topology() -> SchedTopology {
     *SCHED_TOPOLOGY.lock()
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.install_sched_topology", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_ADMIN, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn install_sched_topology(topology: SchedTopology) -> Result<(), errno::Errno> {
     if !topology
         .root_domain()
@@ -491,6 +504,7 @@ pub fn current_sched_domain_id(cpu_id: usize) -> Option<usize> {
 ///
 /// 返回值只是快照：函数不会迁移任务，也不承诺下一次入队一定选中同一 CPU。
 /// 调用方可用它向用户态或诊断路径解释“为什么这个任务能在哪些 CPU 上运行”。
+#[kernel_symbols::export(name = "sched.scheduler.task_sched_placement", contract = "kernel.sched.topology@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn task_sched_placement(task: &Arc<Task>) -> SchedPlacement {
     let affinity = CpuMask::from_bits_or_boot(task.cpu_affinity());
     let online = online_cpu_set();
@@ -521,6 +535,7 @@ pub(crate) fn select_cpu_for_mask(
     })
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.is_cpu_online", contract = "kernel.sched.query@1", version = 1, capabilities = kernel_symbols::capability::SCHED_QUERY)]
 pub fn is_cpu_online(cpu_id: usize) -> bool {
     CpuId::new(cpu_id).is_some_and(|cpu| online_cpu_set().contains(cpu))
 }
@@ -560,6 +575,7 @@ pub fn needs_resched_current() -> bool {
     NEED_RESCHED[cpu()].load(Ordering::Acquire)
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.request_resched", contract = "kernel.sched.control@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn request_resched(cpu_id: usize) {
     if cpu_id >= NR_CPUS {
         return;
@@ -676,6 +692,7 @@ pub fn select_task_cpu(task: &Arc<Task>) -> usize {
 }
 
 /// 统一入队入口：设置任务 CPU 归属、入目标 runqueue、请求该 CPU 调度。
+#[kernel_symbols::export(name = "sched.scheduler.enqueue_task", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn enqueue_task(task: Arc<Task>, now_ns: u64) -> usize {
     let cpu_id = enqueue_task_locked(task, now_ns);
     request_resched(cpu_id);
@@ -919,6 +936,7 @@ fn deliver_sigalrm_to_thread_group(tg: &Arc<ThreadGroup>) {
     }
 }
 
+#[kernel_symbols::export(name = "sched.scheduler.migrate_task", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn migrate_task(task: &Arc<Task>, target_cpu: usize) -> Result<(), errno::Errno> {
     let Some(target) = CpuId::new(target_cpu) else {
         return Err(errno::Errno::EINVAL);
@@ -1067,6 +1085,7 @@ fn migrate_local_ineligible_or_request_balance(task: &Arc<Task>, source_cpu: usi
 ///
 /// 调用方已经把 `info` 放进了 target 的 per-task 或共享 pending 队列，这里
 /// 只负责"是否需要唤醒"。`Uninterruptible` 任务不会被打断（Linux 语义）。
+#[kernel_symbols::export(name = "sched.scheduler.signal_wakeup", contract = "kernel.sched.task@1", version = 1, capabilities = kernel_symbols::capability::SCHED_TASK, flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE)]
 pub fn signal_wakeup(target: &Arc<Task>, info: &SigInfo) {
     if info.sig == SignalNumber::SIGCONT && continue_task(target) {
         return;

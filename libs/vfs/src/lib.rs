@@ -76,6 +76,16 @@ pub static DCACHE: DentryCache = DentryCache::new();
 /// 内核全局文件系统驱动注册表。
 pub static FS_REGISTRY: superblock::FsRegistry = superblock::FsRegistry::new();
 
+/// 强制链接器保留 VFS 直接符号所在的代码生成单元。
+#[doc(hidden)]
+pub fn kernel_symbol_catalog_anchor() -> usize {
+    vfs_context_diag as usize
+        ^ file::file_diag as usize
+        ^ path::normalize_path as usize
+        ^ operation::openat as usize
+        ^ superblock::FsRegistry::register as usize
+}
+
 static VFS_CONTEXT_LIVE: AtomicUsize = AtomicUsize::new(0);
 static VFS_CONTEXT_CREATED: AtomicUsize = AtomicUsize::new(0);
 static VFS_CONTEXT_DROPPED: AtomicUsize = AtomicUsize::new(0);
@@ -87,6 +97,13 @@ pub struct VfsContextDiag {
     pub dropped: usize,
 }
 
+#[kernel_symbols::export(
+    name = "vfs.vfs_context_diag",
+    contract = "kernel.vfs.context-diagnostic@1",
+    version = 1,
+    capabilities = kernel_symbols::capability::VFS_QUERY,
+    flags = kernel_symbols::KERNEL_SYMBOL_FLAG_DIAGNOSTIC
+)]
 pub fn vfs_context_diag() -> VfsContextDiag {
     VfsContextDiag {
         live: VFS_CONTEXT_LIVE.load(Ordering::Acquire),
@@ -110,7 +127,16 @@ pub struct VfsContext {
     pub limits: Arc<VfsLimits>,
 }
 
+#[kernel_symbols::export]
 impl VfsContext {
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.new",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn new(
         cwd: Arc<Dentry>,
         cwd_mount: Arc<mount::Mount>,
@@ -134,18 +160,43 @@ impl VfsContext {
     }
 
     /// 返回当前 VFS 权限检查使用的凭据快照。
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.cred",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn cred(&self) -> Arc<Credentials> {
         Arc::clone(&self.cred.lock())
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.cwd",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn cwd(&self) -> Arc<Dentry> {
         Arc::clone(&self.cwd_state.lock().cwd)
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.cwd_mount",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn cwd_mount(&self) -> Arc<mount::Mount> {
         Arc::clone(&self.cwd_state.lock().cwd_mount)
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.set_cwd",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_cwd(&self, new_cwd: Arc<Dentry>, new_mount: Arc<mount::Mount>) -> VfsResult<()> {
         if let Some(inode) = new_cwd.inode() {
             if inode.kind() != FileType::Directory {
@@ -163,6 +214,13 @@ impl VfsContext {
         Ok(())
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.set_root",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_root(&self, new_root: Arc<Dentry>, new_mount: Arc<mount::Mount>) -> VfsResult<()> {
         if let Some(inode) = new_root.inode() {
             if inode.kind() != FileType::Directory {
@@ -179,10 +237,24 @@ impl VfsContext {
     ///
     /// `setuid`/`capset` 等 syscall 会先替换调度层凭据，再把派生出的 VFS 凭据同步到
     /// 这里；路径解析和文件创建随后读取该快照，避免继续使用旧的 root 权限。
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.set_cred",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_cred(&self, new_cred: Arc<Credentials>) {
         *self.cred.lock() = new_cred;
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.set_umask",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+    )]
     pub fn set_umask(&self, new_mask: FileMode) -> FileMode {
         let mut umask = self.umask.lock();
         let old = *umask;
@@ -190,10 +262,23 @@ impl VfsContext {
         old
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.apply_umask",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_QUERY
+    )]
     pub fn apply_umask(&self, requested: FileMode) -> FileMode {
         requested.without(*self.umask.lock())
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.fork",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn fork(&self) -> VfsResult<Self> {
         let cwd_st = self.cwd_state.lock();
         let cwd = Arc::clone(&cwd_st.cwd);
@@ -211,6 +296,14 @@ impl VfsContext {
         })
     }
 
+    #[kernel_symbols::export(
+        name = "vfs.VfsContext.clone_with_new_ns",
+        contract = "kernel.vfs.context@1",
+        version = 1,
+        capabilities = kernel_symbols::capability::VFS_ADMIN,
+        flags = kernel_symbols::KERNEL_SYMBOL_FLAG_MUTATES_STATE
+            | kernel_symbols::KERNEL_SYMBOL_FLAG_RETURNS_OWNED
+    )]
     pub fn clone_with_new_ns(&self) -> VfsResult<Self> {
         let new_ns = self.mount_ns.clone_namespace()?;
         let cwd_st = self.cwd_state.lock();
