@@ -85,16 +85,6 @@ impl LoopbackIrq {
             irq_unmask: AtomicU64::new(0),
         }
     }
-
-    fn signal(&self) {
-        self.pending.store(true, Ordering::Release);
-        if !self.masked.swap(true, Ordering::AcqRel) {
-            self.irq_total.fetch_add(1, Ordering::Relaxed);
-            if let Some(waker) = self.waker.lock().as_ref() {
-                waker.wake();
-            }
-        }
-    }
 }
 
 impl QueueIrqControl for LoopbackIrq {
@@ -148,12 +138,11 @@ struct LoopbackQueue {
     completion_head: usize,
     completion_tail: usize,
     completion_count: usize,
-    irq: Arc<LoopbackIrq>,
     quiesced: bool,
 }
 
 impl LoopbackQueue {
-    fn new(irq: Arc<LoopbackIrq>) -> Self {
+    fn new() -> Self {
         Self {
             packets: (0..LOOPBACK_RING_SIZE)
                 .map(|_| None)
@@ -172,7 +161,6 @@ impl LoopbackQueue {
             completion_head: 0,
             completion_tail: 0,
             completion_count: 0,
-            irq,
             quiesced: false,
         }
     }
@@ -191,6 +179,10 @@ impl NetQueuePair for LoopbackQueue {
             max_rx_batch: 32,
             max_tx_batch: 32,
         }
+    }
+
+    fn tx_produces_rx_synchronously(&self) -> bool {
+        true
     }
 
     fn refill_rx_batch(&mut self, batch: &mut RxRefillBatch) -> RxRefillResult {
@@ -306,9 +298,6 @@ impl NetQueuePair for LoopbackQueue {
             self.completion_count += 1;
             packets += 1;
         }
-        if packets != 0 {
-            self.irq.signal();
-        }
         TxSubmitResult {
             packets,
             descriptors,
@@ -332,7 +321,7 @@ pub fn register_builtin_driver() -> Result<(), PnpError> {
     let irq = Arc::new(LoopbackIrq::new());
     let queue = NetQueueRegistration {
         id: QueuePairId(0),
-        queue: Box::new(LoopbackQueue::new(Arc::clone(&irq))),
+        queue: Box::new(LoopbackQueue::new()),
         rx_pool: make_pool(48, 4096)?,
         tx_header_pool: make_pool(256, 256)?,
         tx_payload_pool: make_pool(256, 4096)?,
@@ -350,4 +339,52 @@ pub fn register_builtin_driver() -> Result<(), PnpError> {
     })?;
     log::printk!("[loopback] registered batch queue");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use net::buf::{PacketChain, TxPacket};
+
+    #[test]
+    fn tx_submission_exposes_rx_and_completion_synchronously() {
+        let mut queue = LoopbackQueue::new();
+        assert!(queue.tx_produces_rx_synchronously());
+
+        let mut payload_pool = make_pool(1, 256).unwrap();
+        let lease = payload_pool
+            .lease(32, 64, PacketMetadata::default())
+            .unwrap();
+        let mut tx = TxBatch::new();
+        tx.push(TxPacket {
+            chain: PacketChain::from_lease(lease),
+            completion: CompletionToken(7),
+            low_latency: false,
+        })
+        .unwrap_or_else(|_| unreachable!());
+        let mut header_pool = make_pool(1, 256).unwrap();
+
+        let submitted = queue.submit_tx_batch(&mut tx, &mut header_pool);
+        assert_eq!(submitted.packets, 1);
+        assert_eq!(submitted.bytes, 64);
+        assert!(tx.is_empty());
+
+        let mut rx = PacketBatch::new();
+        let polled = queue.poll_rx_batch(
+            RxBudget {
+                packets: 32,
+                bytes: 256 * 1024,
+            },
+            &mut rx,
+        );
+        assert_eq!(polled.packets, 1);
+        assert_eq!(polled.bytes, 64);
+        assert!(polled.ring_empty);
+
+        let mut completions = CompletionBatch::new();
+        let reclaimed = queue.reclaim_tx_batch(&mut completions);
+        assert_eq!(reclaimed.completions, 1);
+        assert_eq!(completions.token(0), Some(CompletionToken(7)));
+        assert!(reclaimed.ring_empty);
+    }
 }

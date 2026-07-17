@@ -4803,18 +4803,7 @@ impl WorkerContext {
             #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
             self.prepare_physical_udp_probe();
             self.drain_egress();
-            self.completion_batch.clear();
-            let _reclaimed = self
-                .queue
-                .as_mut()
-                .unwrap()
-                .reclaim_tx_batch(&mut self.completion_batch);
-            #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-            for index in 0..self.completion_batch.len() {
-                if self.completion_batch.token(index) == Some(CompletionToken(0x4152_5001)) {
-                    ARP_TX_COMPLETED.store(true, Ordering::Release);
-                }
-            }
+            self.reclaim_tx();
             let turn_start = sched::now_ns_public();
             let mut packet_budget = 128u16;
             let mut byte_budget = 256 * 1024u32;
@@ -4822,23 +4811,10 @@ impl WorkerContext {
                 && byte_budget != 0
                 && sched::now_ns_public().saturating_sub(turn_start) < 200_000
             {
-                self.rx_batch.clear();
-                let result = self.queue.as_mut().unwrap().poll_rx_batch(
-                    RxBudget {
-                        packets: packet_budget.min(32),
-                        bytes: byte_budget,
-                    },
-                    &mut self.rx_batch,
-                );
-                self.complete_rx_metadata();
-                self.record_rx_result(&result);
-                #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
-                for index in 0..self.rx_batch.len() {
-                    if let Some(packet) = self.rx_batch.packet(index) {
-                        self.observe_arp_reply(packet);
-                    }
-                }
-                self.enqueue_rx_batch();
+                let result = self.poll_rx_once(RxBudget {
+                    packets: packet_budget.min(32),
+                    bytes: byte_budget,
+                });
                 packet_budget = packet_budget.saturating_sub(result.packets);
                 byte_budget = byte_budget.saturating_sub(result.bytes);
                 if result.fatal.is_some() || result.ring_empty || result.packets == 0 {
@@ -4855,7 +4831,15 @@ impl WorkerContext {
                 self.stats.budget_time.fetch_add(1, Ordering::Relaxed);
             }
             self.drain_egress();
-            self.submit_tx();
+            let submitted = self.submit_tx();
+            if submitted && self.queue.as_ref().unwrap().tx_produces_rx_synchronously() {
+                // loopback 的 RX 在 TX 返回时已经可见。
+                self.reclaim_tx();
+                self.poll_rx_once(RxBudget {
+                    packets: 32,
+                    bytes: 256 * 1024,
+                });
+            }
             self.rx_pool.as_mut().unwrap().drain_remote();
             self.tx_header_pool.as_mut().unwrap().drain_remote();
             self.tx_payload_pool.as_mut().unwrap().drain_remote();
@@ -4955,6 +4939,25 @@ impl WorkerContext {
                 );
             }
         }
+    }
+
+    fn poll_rx_once(&mut self, budget: RxBudget) -> net::queue::RxPollResult {
+        self.rx_batch.clear();
+        let result = self
+            .queue
+            .as_mut()
+            .unwrap()
+            .poll_rx_batch(budget, &mut self.rx_batch);
+        self.complete_rx_metadata();
+        self.record_rx_result(&result);
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        for index in 0..self.rx_batch.len() {
+            if let Some(packet) = self.rx_batch.packet(index) {
+                self.observe_arp_reply(packet);
+            }
+        }
+        self.enqueue_rx_batch();
+        result
     }
 
     fn drain_egress(&mut self) {
@@ -5510,9 +5513,24 @@ impl WorkerContext {
         }
     }
 
-    fn submit_tx(&mut self) {
+    fn reclaim_tx(&mut self) {
+        self.completion_batch.clear();
+        let _ = self
+            .queue
+            .as_mut()
+            .unwrap()
+            .reclaim_tx_batch(&mut self.completion_batch);
+        #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
+        for index in 0..self.completion_batch.len() {
+            if self.completion_batch.token(index) == Some(CompletionToken(0x4152_5001)) {
+                ARP_TX_COMPLETED.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn submit_tx(&mut self) -> bool {
         if self.tx_batch.is_empty() {
-            return;
+            return false;
         }
         let original_len = self.tx_batch.len();
         let result = self
@@ -5542,6 +5560,7 @@ impl WorkerContext {
         if result.queue_full && self.tx_batch.len() == original_len {
             let _ = sched::operation::sched_yield();
         }
+        result.packets != 0 && result.fatal.is_none()
     }
 
     /// detach 前停止 IRQ、排空可观察 completion，并在释放 queue 前回收所有 batch lease。

@@ -84,6 +84,10 @@ pub enum QueueFatalError {
 pub trait NetQueuePair: Send {
     fn id(&self) -> QueuePairId;
     fn caps(&self) -> NetQueueCaps;
+    /// TX 提交成功后，是否保证同一 queue 的 RX 立即可见。
+    fn tx_produces_rx_synchronously(&self) -> bool {
+        false
+    }
     fn refill_rx_batch(&mut self, batch: &mut RxRefillBatch) -> RxRefillResult;
     fn poll_rx_batch(&mut self, budget: RxBudget, out: &mut PacketBatch) -> RxPollResult;
     fn reclaim_tx_batch(&mut self, out: &mut CompletionBatch) -> TxReclaimResult;
