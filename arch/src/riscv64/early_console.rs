@@ -95,7 +95,6 @@ pub fn e_write_bytes(bytes: &[u8]) {
 ///
 /// 防重入：若初始化过程中被中断且中断 handler 也调 e_print，跳过初始化直接写。
 fn write_bytes(bytes: &[u8]) {
-    use core::sync::atomic::AtomicBool;
     static INITIALIZING: AtomicBool = AtomicBool::new(false);
 
     let base = BASE.load(Ordering::Acquire);

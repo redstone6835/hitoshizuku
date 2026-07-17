@@ -15,8 +15,6 @@ use core::mem::size_of;
 use core::ptr::addr_of;
 use core::slice;
 
-global_asm!(include_str!("vdso_text.S"));
-
 // ── 常量 ──────────────────────────────────────────────────────────────────────
 
 const TEXT_OFF: usize = 0x200;
@@ -31,6 +29,30 @@ pub const VDSO_DATA_PAGE_OFFSET: usize = 0x1000;
 pub const VDSO_TEXT_PAGE_SIZE: usize = VDSO_DATA_PAGE_OFFSET;
 /// vDSO 总映射长度（text + data，各 4KiB）。
 pub const VDSO_TOTAL_SIZE: usize = 8192;
+
+// 与 kernel/src/vdso.rs::VdsoData 的 repr(C) 布局保持一致。用户态汇编只读共享页。
+pub const VDSO_DATA_SEQ_OFFSET: usize = 0x00;
+pub const VDSO_DATA_CLOCK_MODE_OFFSET: usize = 0x04;
+pub const VDSO_DATA_HZ_OFFSET: usize = 0x08;
+pub const VDSO_DATA_WALL_TIME_SEC_OFFSET: usize = 0x10;
+pub const VDSO_DATA_WALL_TIME_NSEC_OFFSET: usize = 0x18;
+pub const VDSO_DATA_MONOTONIC_BASE_NS_OFFSET: usize = 0x20;
+pub const VDSO_DATA_CS_CYCLE_LAST_OFFSET: usize = 0x28;
+pub const VDSO_DATA_CS_MULT_OFFSET: usize = 0x30;
+pub const VDSO_DATA_CS_SHIFT_OFFSET: usize = 0x38;
+pub const VDSO_DATA_CPU_ID_OFFSET: usize = 0x3c;
+pub const VDSO_DATA_NODE_ID_OFFSET: usize = 0x40;
+pub const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET: usize = 0x44;
+
+global_asm!(
+    include_str!("vdso_text.S"),
+    vdso_data_seq_offset = const VDSO_DATA_SEQ_OFFSET,
+    vdso_data_clock_mode_offset = const VDSO_DATA_CLOCK_MODE_OFFSET,
+    vdso_data_hz_offset = const VDSO_DATA_HZ_OFFSET,
+    vdso_data_cpu_id_offset = const VDSO_DATA_CPU_ID_OFFSET,
+    vdso_data_node_id_offset = const VDSO_DATA_NODE_ID_OFFSET,
+    vdso_data_clock_realtime_res_offset = const VDSO_DATA_CLOCK_REALTIME_RES_OFFSET,
+);
 
 // 编译期验证：fn 指针与 usize 同宽
 const _: () = assert!(size_of::<fn(u64)>() == size_of::<usize>());
@@ -58,44 +80,46 @@ static TIMER_TICK_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static NET_POLL_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static TTY_POLL_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
+#[inline]
+fn register_hook(slot: &AtomicPtr<()>, hook: TickHookFn) {
+    slot.store(hook as *mut (), Ordering::Release);
+}
+
+#[inline]
+fn run_hook(slot: &AtomicPtr<()>, now_ns: u64) {
+    let raw = slot.load(Ordering::Acquire);
+    if !raw.is_null() {
+        let hook: TickHookFn = unsafe { core::mem::transmute::<*mut (), TickHookFn>(raw) };
+        hook(now_ns);
+    }
+}
+
 pub fn sigreturn_entry_offset() -> usize {
     symbol_offset(addr_of!(__mygo_rv64_vdso_rt_sigreturn))
 }
 
 pub fn register_timer_tick_hook(hook: fn(u64)) {
-    TIMER_TICK_HOOK.store(hook as *mut (), Ordering::Release);
+    register_hook(&TIMER_TICK_HOOK, hook);
 }
 
 pub fn run_timer_tick_hook(now_ns: u64) {
-    let raw = TIMER_TICK_HOOK.load(Ordering::Acquire);
-    if !raw.is_null() {
-        let hook: TickHookFn = unsafe { core::mem::transmute::<*mut (), TickHookFn>(raw) };
-        hook(now_ns);
-    }
+    run_hook(&TIMER_TICK_HOOK, now_ns);
 }
 
 pub fn register_net_poll_hook(hook: fn(u64)) {
-    NET_POLL_HOOK.store(hook as *mut (), Ordering::Release);
+    register_hook(&NET_POLL_HOOK, hook);
 }
 
 pub fn run_net_poll_hook(now_ns: u64) {
-    let raw = NET_POLL_HOOK.load(Ordering::Acquire);
-    if !raw.is_null() {
-        let hook: TickHookFn = unsafe { core::mem::transmute::<*mut (), TickHookFn>(raw) };
-        hook(now_ns);
-    }
+    run_hook(&NET_POLL_HOOK, now_ns);
 }
 
 pub fn register_tty_poll_hook(hook: fn(u64)) {
-    TTY_POLL_HOOK.store(hook as *mut (), Ordering::Release);
+    register_hook(&TTY_POLL_HOOK, hook);
 }
 
 pub fn run_tty_poll_hook(now_ns: u64) {
-    let raw = TTY_POLL_HOOK.load(Ordering::Acquire);
-    if !raw.is_null() {
-        let hook: TickHookFn = unsafe { core::mem::transmute::<*mut (), TickHookFn>(raw) };
-        hook(now_ns);
-    }
+    run_hook(&TTY_POLL_HOOK, now_ns);
 }
 
 // ── vDSO ELF 镜像生成 ────────────────────────────────────────────────────────

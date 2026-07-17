@@ -179,6 +179,10 @@ fn detect_isa_extensions(dtb: &Dtb<'_>) {
                 HAS_ZICBOZ.store(true, Ordering::Release);
                 log::info!("[loader] ISA: Zicboz detected");
             }
+            if contains_extension(isa_bytes, b"sstc") {
+                crate::riscv64::time::set_sstc_available(true);
+                log::info!("[loader] ISA: Sstc detected; timer uses stimecmp");
+            }
             crate::riscv64::vector::detect_vector_from_isa(isa_bytes);
             // 检查 riscv,cboz-block-size（如果有）
             if let Some(bs_prop) = cpu_node.find_property("riscv,cboz-block-size") {
@@ -209,6 +213,7 @@ fn contains_extension(isa: &[u8], ext: &[u8]) -> bool {
     false
 }
 
+/// 读取 DTB 属性开头的大端 `u32`；不足 4 字节时返回 `None`。
 fn read_be_u32_prop(value: &[u8]) -> Option<u32> {
     Some(u32::from_be_bytes(value.get(..4)?.try_into().ok()?))
 }
@@ -248,12 +253,36 @@ fn configure_timer_from_dtb(dtb: &Dtb<'_>) {
 
 /// allocator 扩展堆时调用，将虚拟地址映射到物理页。
 fn map_kernel_heap(vaddr: usize, paddr: usize, size: usize, policy: allocator::PagePolicy) -> bool {
-    heap_vm::map_kernel_heap_range(vaddr, paddr, size, policy).is_ok()
+    match heap_vm::map_kernel_heap_range(vaddr, paddr, size, policy) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!(
+                "[loader][heap_vm] map failed vaddr={:#x} paddr={:#x} size={:#x} policy={:?}: {:?}",
+                vaddr,
+                paddr,
+                size,
+                policy,
+                err
+            );
+            false
+        }
+    }
 }
 
 /// allocator 收缩堆时调用，解除虚拟地址映射。
 fn unmap_kernel_heap(vaddr: usize, size: usize) -> bool {
-    heap_vm::unmap_kernel_heap_range(vaddr, size).is_ok()
+    match heap_vm::unmap_kernel_heap_range(vaddr, size) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!(
+                "[loader][heap_vm] unmap failed vaddr={:#x} size={:#x}: {:?}",
+                vaddr,
+                size,
+                err
+            );
+            false
+        }
+    }
 }
 
 // ── 主入口 ────────────────────────────────────────────────────────────────────

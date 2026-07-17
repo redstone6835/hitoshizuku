@@ -4,6 +4,8 @@
 //! 本模块统一重导出所有公共符号，保持 `use crate::riscv64::specific::*` 的
 //! 对外接口不变。HartLocal（per-hart 数据）因跨模块性质保留在此处。
 
+use core::mem::offset_of;
+
 // 子模块重导出
 pub use crate::riscv64::addr::*;
 pub use crate::riscv64::csr::*;
@@ -27,21 +29,31 @@ pub struct HartLocal {
     pub kernel_stack_top: usize,
     pub preempt_count: usize,
     pub kernel_gp: usize,
-    /// 中断栈栈顶（高地址端）。trap entry from_kernel 路径切换到此栈。
+    /// 紧急栈栈顶（高地址端）。仅最终 return-to-user 窗口中的 S-mode trap 使用。
     pub irq_stack_top: usize,
+    /// trap 入口在读取 SPP 前暂存原始 t5；仅由当前 hart、关中断窗口访问。
+    pub trap_entry_t5: usize,
 }
-/// 中断栈大小：8 KiB（足够处理嵌套中断 + Rust handler 栈帧）。
-pub const IRQ_STACK_SIZE: usize = 8192;
+/// 最终 return-to-user 窗口使用的紧急栈可用大小。
+///
+/// debug 构建中的 trap/scheduler/allocator 调用链可能超过 8 KiB，因此保留 32 KiB；
+/// 普通 kernel-origin trap 继续使用任务自身的 64 KiB 内核栈。
+pub const IRQ_STACK_SIZE: usize = 32 * 1024;
+/// 紧急栈低地址端的缓冲区，避免轻微越界直接覆盖相邻静态对象。
+pub const IRQ_STACK_GUARD_SIZE: usize = 4 * 1024;
+pub const IRQ_STACK_ALLOCATION_SIZE: usize = IRQ_STACK_GUARD_SIZE + IRQ_STACK_SIZE;
 
-/// HartLocal.irq_stack_top 在结构体中的字节偏移。
-pub const HART_LOCAL_KERNEL_GP_OFF: usize = 24; // 3 * size_of::<usize>()
-pub const HART_LOCAL_IRQ_STACK_TOP_OFF: usize = 32; // 4 * size_of::<usize>()
+/// 汇编入口使用的 HartLocal 字段偏移。
+pub const HART_LOCAL_KERNEL_STACK_TOP_OFF: usize = offset_of!(HartLocal, kernel_stack_top);
+pub const HART_LOCAL_KERNEL_GP_OFF: usize = offset_of!(HartLocal, kernel_gp);
+pub const HART_LOCAL_IRQ_STACK_TOP_OFF: usize = offset_of!(HartLocal, irq_stack_top);
+pub const HART_LOCAL_TRAP_ENTRY_T5_OFF: usize = offset_of!(HartLocal, trap_entry_t5);
 
-/// 全部 hart 的中断栈（静态分配，按 hart index 索引）。
-#[repr(C, align(16))]
-pub(crate) struct IrqStack(pub(crate) [u8; IRQ_STACK_SIZE]);
+/// 全部 hart 的紧急栈（静态分配，按 hart index 索引）。低地址端第一页仅作缓冲。
+#[repr(C, align(4096))]
+pub(crate) struct IrqStack(pub(crate) [u8; IRQ_STACK_ALLOCATION_SIZE]);
 pub(crate) static mut IRQ_STACKS: [IrqStack; MAX_HARTS] = {
-    const EMPTY: IrqStack = IrqStack([0; IRQ_STACK_SIZE]);
+    const EMPTY: IrqStack = IrqStack([0; IRQ_STACK_ALLOCATION_SIZE]);
     [EMPTY; MAX_HARTS]
 };
 
@@ -50,7 +62,8 @@ pub(crate) static mut IRQ_STACKS: [IrqStack; MAX_HARTS] = {
 ///
 /// # Safety
 ///
-/// 仅在 boot 阶段由 boot hart 初始化，之后通过 tp 寄存器只读访问。
+/// boot 阶段初始化固定字段；运行期仅当前 hart 通过 tp 裸指针或 trap 汇编更新
+/// `kernel_stack_top` / `trap_entry_t5`，不得为整块对象构造长期共享引用。
 pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
     const EMPTY: HartLocal = HartLocal {
         hart_id: 0,
@@ -58,35 +71,85 @@ pub(crate) static mut HART_LOCALS: [HartLocal; MAX_HARTS] = {
         preempt_count: 0,
         kernel_gp: 0,
         irq_stack_top: 0,
+        trap_entry_t5: 0,
     };
     [EMPTY; MAX_HARTS]
 };
 
-/// 向后兼容：boot hart 的 HartLocal 引用（实际指向 HART_LOCALS[0]）。
+/// boot hart 的 HartLocal 裸指针（实际指向 HART_LOCALS[0]）。
 ///
 /// # Safety
 ///
-/// 仅在 boot 阶段单核初始化时写入（pre_boot_init），之后通过 tp 寄存器只读访问。
+/// 仅在 boot 阶段单核初始化时取得；运行期访问改由 tp 裸指针完成。
 #[inline]
 pub(crate) unsafe fn boot_hart_local_ptr() -> *mut HartLocal {
     // Safety: 调用方保证在单核 boot 阶段调用（pre_boot_init），此时无并发访问 HART_LOCALS。
     core::ptr::addr_of_mut!(HART_LOCALS) as *mut HartLocal
 }
+/// 读取 tp 中的当前 HartLocal 裸指针。
+///
+/// `kernel_stack_top` 和 `trap_entry_t5` 会被汇编入口异步修改，因此不能为整块
+/// HartLocal 构造长期 `&'static` 共享引用；所有运行期访问都通过裸指针完成。
 #[inline]
-pub fn current_hart() -> &'static HartLocal {
-    let ptr: *const HartLocal;
+pub(crate) fn current_hart_ptr() -> *mut HartLocal {
+    let ptr: *mut HartLocal;
     unsafe { core::arch::asm!("mv {}, tp", out(reg) ptr, options(nomem, nostack)) };
     debug_assert!(
         !ptr.is_null(),
-        "tp not initialized: current_hart() called before pre_boot_init"
+        "tp not initialized: HartLocal accessed before pre_boot_init"
     );
-    unsafe { &*ptr }
+    ptr
+}
+
+#[inline]
+pub fn current_kernel_stack_top() -> usize {
+    let ptr = current_hart_ptr();
+    unsafe { core::ptr::addr_of!((*ptr).kernel_stack_top).read_volatile() }
+}
+
+/// 更新当前 hart 上正在运行任务的内核栈顶。
+///
+/// # Safety
+///
+/// 只能由当前 hart 在调度切换或用户上下文安装期间调用；调用方必须保证不会由其它
+/// hart 并发写当前 HartLocal。
+#[inline]
+pub unsafe fn set_current_kernel_stack_top(stack_top: usize) {
+    let ptr = current_hart_ptr();
+    unsafe { core::ptr::addr_of_mut!((*ptr).kernel_stack_top).write_volatile(stack_top) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+}
+
+/// 最终返回窗口的紧急栈使用完毕后检查低地址缓冲区。
+///
+/// 该检查不替代栈大小预算，但能在越界继续破坏相邻静态对象前尽早终止。
+#[unsafe(no_mangle)]
+pub extern "C" fn riscv64_check_irq_stack_guard() {
+    let ptr = current_hart_ptr();
+    let top = unsafe { core::ptr::addr_of!((*ptr).irq_stack_top).read_volatile() };
+    if top == 0 {
+        return;
+    }
+
+    let guard_start = top - IRQ_STACK_SIZE - IRQ_STACK_GUARD_SIZE;
+    let guard_end = guard_start + IRQ_STACK_GUARD_SIZE;
+    let mut cursor = guard_start;
+    while cursor < guard_end {
+        let value = unsafe { core::ptr::read_volatile(cursor as *const usize) };
+        assert_eq!(
+            value, 0,
+            "RISC-V emergency trap stack overflowed into its guard buffer"
+        );
+        cursor += core::mem::size_of::<usize>();
+    }
 }
 
 #[inline]
 pub fn current_cpu_id() -> usize {
-    // TODO(SMP): 调度器 CURRENT_TASKS[0] 硬编槽位 0，
-    let _ = current_hart(); // 确保 tp 已初始化
+    // 当前启动链只会让 boot hart 进入调度器，因此逻辑 CPU 固定为 0。
+    // TODO(SMP): secondary hart 启动后建立 hart ID 到调度器逻辑 CPU ID 的映射；
+    // 不能直接把 HartLocal.hart_id 当作数组下标，因为固件 hart ID 未必连续。
+    let _ = current_hart_ptr(); // 确保当前 hart 已完成 HartLocal 初始化。
     0
 }
 

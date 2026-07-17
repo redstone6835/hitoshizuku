@@ -29,6 +29,7 @@ use core::arch::naked_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::clear_bss;
+use crate::riscv64::csr::SATP_MODE_SV48;
 
 // ── 启动参数 ──────────────────────────────────────────────────────────────────
 
@@ -39,32 +40,26 @@ pub static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(0);
 pub static BOOT_DTB_ADDR: AtomicUsize = AtomicUsize::new(0);
 
 // ── 早期页表常量 ──────────────────────────────────────────────────────────────
-// 以下常量记录汇编中使用的立即数含义，naked_asm! 无法直接引用 Rust const，
-// 因此汇编中仍使用字面值，这里仅作文档用途。
-
-/// Sv48 模式的 MODE 字段（satp[63:60] = 9）。
-#[allow(dead_code)]
-const SATP_MODE_SV48: u64 = 9 << 60;
+// 这些值通过 `naked_asm!` 的 const operand 传入启动汇编，避免 Rust 注释常量
+// 与真正执行的立即数发生漂移。
 
 /// 内核虚拟地址偏移的高 32 位，必须与 `addr.rs::KERNEL_VA_OFFSET` 一致。
-#[allow(dead_code)]
-const VA_OFFSET_HI32: u64 = 0xFFFF_FF80;
+const VA_OFFSET_HI32: usize = 0xFFFF_FF80;
 
 // PTE flags（Sv48 叶节点）
 /// MMIO 区域：V|R|W|A|D（无 X，防止投机执行 MMIO）
-#[allow(dead_code)]
-const PTE_MMIO_LEAF: u64 = 0xC7; // 1100_0111
+const PTE_MMIO_LEAF: usize = 0xC7; // 1100_0111
 /// RAM 区域：V|R|W|X|A|D
-#[allow(dead_code)]
-const PTE_RAM_LEAF: u64 = 0xCF; // 1100_1111
+const PTE_RAM_LEAF: usize = 0xCF; // 1100_1111
 /// 非叶 PTE：仅 V 位
-#[allow(dead_code)]
-const PTE_NONLEAF_V: u64 = 0x01;
+const PTE_NONLEAF_V: usize = 0x01;
 
-/// 1GiB RAM 区域（物理地址 0x8000_0000）的 PPN 高位部分。
+/// 首个 1GiB RAM 区域（物理地址 0x8000_0000）的 PPN 高位部分。
 /// 计算方式：(0x8000_0000 >> 12) = 0x20000，通过 lui 指令加载。
-#[allow(dead_code)]
-const RAM_1G_PPN_LUI: u64 = 0x20000;
+const RAM_BASE_PPN_LUI: usize = 0x20000;
+
+/// 后续 1GiB RAM 区域（物理地址 0xC000_0000）的 PPN 高位部分。
+const RAM_UPPER_PPN_LUI: usize = 0x30000;
 
 // ── 早期页表存储 ──────────────────────────────────────────────────────────────
 
@@ -115,43 +110,43 @@ pub unsafe extern "C" fn _start() {
 
         // PGD[0] → PUD_identity（非叶：PPN | V）
         "srli t2, t1, 2",
-        "ori t2, t2, 1",
+        "ori t2, t2, {pte_nonleaf_v}",
         "sd t2, 0(t0)",
 
         // PGD[511] → PUD_kernel
         "srli t2, t3, 2",
-        "ori t2, t2, 1",
+        "ori t2, t2, {pte_nonleaf_v}",
         "li t4, 511 * 8",
         "add t4, t0, t4",
         "sd t2, 0(t4)",
 
         // PUD_identity[0] = 1G → PA 0 (MMIO, RW, no X)
-        "li t2, 0xC7",
+        "li t2, {pte_mmio_leaf}",
         "sd t2, 0(t1)",
 
         // PUD_identity[2] = 1G → PA 0x8000_0000 (identity)
-        "lui t2, 0x20000",
-        "addi t2, t2, 0xCF",
+        "lui t2, {ram_base_ppn_lui}",
+        "addi t2, t2, {pte_ram_leaf}",
         "sd t2, 16(t1)",
 
         // PUD_identity[3] = 1G → PA 0xC000_0000 (identity, 覆盖 DTB)
-        "lui t2, 0x30000",
-        "addi t2, t2, 0xCF",
+        "lui t2, {ram_upper_ppn_lui}",
+        "addi t2, t2, {pte_ram_leaf}",
         "sd t2, 24(t1)",
 
         // PUD_kernel[2] = 1G → PA 0x8000_0000 (高半区)
-        "lui t2, 0x20000",
-        "addi t2, t2, 0xCF",
+        "lui t2, {ram_base_ppn_lui}",
+        "addi t2, t2, {pte_ram_leaf}",
         "sd t2, 16(t3)",
 
         // PUD_kernel[3] = 1G → PA 0xC000_0000 (高半区, 覆盖 DTB)
-        "lui t2, 0x30000",
-        "addi t2, t2, 0xCF",
+        "lui t2, {ram_upper_ppn_lui}",
+        "addi t2, t2, {pte_ram_leaf}",
         "sd t2, 24(t3)",
 
         // ── 激活 Sv48 ──
         "srli t2, t0, 12",           // PPN
-        "li t3, 9",
+        "li t3, {satp_mode}",
         "slli t3, t3, 60",           // MODE = Sv48
         "or t2, t2, t3",
 
@@ -168,7 +163,13 @@ pub unsafe extern "C" fn _start() {
 
         virt_entry = sym _start_virtualized,
         early_pt = sym EARLY_PT,
-        va_hi32 = const 0xFFFFFF80u64,
+        pte_nonleaf_v = const PTE_NONLEAF_V,
+        pte_mmio_leaf = const PTE_MMIO_LEAF,
+        pte_ram_leaf = const PTE_RAM_LEAF,
+        ram_base_ppn_lui = const RAM_BASE_PPN_LUI,
+        ram_upper_ppn_lui = const RAM_UPPER_PPN_LUI,
+        satp_mode = const (SATP_MODE_SV48 >> 60),
+        va_hi32 = const VA_OFFSET_HI32,
     )
 }
 
@@ -210,7 +211,7 @@ unsafe extern "C" fn _start_virtualized() {
 /// 必须先 clear_bss 再写静态变量，否则 BSS 清零会覆盖已写入的值。
 #[unsafe(no_mangle)]
 unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
-    use crate::riscv64::specific::{IRQ_STACK_SIZE, IRQ_STACKS};
+    use crate::riscv64::specific::{IRQ_STACK_ALLOCATION_SIZE, IRQ_STACKS};
 
     unsafe { clear_bss() };
 
@@ -227,7 +228,7 @@ unsafe extern "C" fn pre_boot_init(hartid: usize, dtb_addr: usize) {
         (*hl).hart_id = hartid;
         (*hl).kernel_gp = kernel_gp;
         // 中断栈栈顶 = IRQ_STACKS[0] 末尾（栈向低地址增长）
-        (*hl).irq_stack_top = core::ptr::addr_of!(IRQ_STACKS) as usize + IRQ_STACK_SIZE;
+        (*hl).irq_stack_top = core::ptr::addr_of!(IRQ_STACKS) as usize + IRQ_STACK_ALLOCATION_SIZE;
         core::sync::atomic::compiler_fence(Ordering::Release);
         core::arch::asm!("mv tp, {}", in(reg) hl as usize, options(nomem, nostack));
     }
