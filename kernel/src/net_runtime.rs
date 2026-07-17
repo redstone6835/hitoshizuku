@@ -1039,10 +1039,16 @@ impl EgressChannel {
     }
 
     fn push_wait(&self, mut work: EgressWork) -> Result<(), EgressWork> {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = None;
         loop {
             match self.try_push(work) {
                 Ok(()) => return Ok(()),
                 Err(pending) => {
+                    #[cfg(feature = "performance-profile")]
+                    if profile.is_none() {
+                        profile = Some(profiling::scope(profiling::Event::NetEgressBackpressure));
+                    }
                     if !self.lifecycle.0.active.load(Ordering::Acquire) {
                         return Err(pending);
                     }
@@ -2361,6 +2367,8 @@ unsafe extern "C" fn protocol_worker_entry(slot: usize) -> ! {
 impl ProtocolContext {
     fn run(&mut self) -> ! {
         loop {
+            #[cfg(feature = "performance-profile")]
+            let profile_turn = profiling::scope(profiling::Event::NetProtocolTurn);
             let config = self.config.snapshot();
             let lifecycle = self.drain_lifecycle(256);
             let control = self.drain_control(256, &config);
@@ -2392,13 +2400,15 @@ impl ProtocolContext {
                 .flatten()
                 .min(),
             );
-            if processed == 128
+            let keep_running = processed == 128
                 || lifecycle == 256
                 || control == 256
                 || dirty == 256
                 || self.protocol.has_blocked_tcp_output()
-                || self.runtime.finish_drain()
-            {
+                || self.runtime.finish_drain();
+            #[cfg(feature = "performance-profile")]
+            drop(profile_turn);
+            if keep_running {
                 let _ = sched::operation::sched_yield();
                 continue;
             }
@@ -4011,6 +4021,8 @@ impl ProtocolContext {
     }
 
     fn process_pending(&mut self, count: usize, config: &ConfigSnapshot) {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::NetProtocolIngress).packets(count);
         for index in 0..count {
             let Some(work) = self.pending[index].take() else {
                 continue;
@@ -4275,6 +4287,8 @@ impl ProtocolContext {
     }
 
     fn dispatch_tcp_output(&mut self) {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::NetTcpOutput);
         let config = self.config.snapshot();
         let now_ns = sched::now_ns_public();
         let mut resume_budget = 256;
@@ -4773,6 +4787,8 @@ fn map_tcp_bind_error(error: net::transport::TcpBindError) -> SocketError {
 impl WorkerContext {
     fn run(&mut self) -> ! {
         loop {
+            #[cfg(feature = "performance-profile")]
+            let profile_turn = profiling::scope(profiling::Event::NetWorkerTurn);
             if self.control.remove_requested.load(Ordering::Acquire) {
                 self.shutdown();
             }
@@ -4870,6 +4886,8 @@ impl WorkerContext {
             self.refill_rx();
 
             let queue_pending = self.queue.as_mut().unwrap().has_pending_work();
+            #[cfg(feature = "performance-profile")]
+            drop(profile_turn);
             if queue_pending
                 || self.egress.has_pending()
                 || !self.tx_batch.is_empty()
@@ -4978,6 +4996,8 @@ impl WorkerContext {
     }
 
     fn materialize_egress(&mut self, work: EgressWork) -> Result<(), EgressWork> {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::NetTxMaterialize).packets(1);
         match work {
             EgressWork::Packet(packet) => {
                 self.tx_batch

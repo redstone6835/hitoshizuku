@@ -1642,7 +1642,11 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
     }
     if len <= COPY_CHUNK {
         let mut data = [0u8; COPY_CHUNK];
-        copy_from_user(ctx.args[1], &mut data[..len]).map_err(|e| e.as_errno())?;
+        {
+            #[cfg(feature = "performance-profile")]
+            let _profile = profiling::scope(profiling::Event::SysSendCopy).bytes(len);
+            copy_from_user(ctx.args[1], &mut data[..len]).map_err(|e| e.as_errno())?;
+        }
         send_socket_payload(
             &vfs_ctx,
             &fdt,
@@ -1653,7 +1657,11 @@ pub(super) fn sys_sendto(ctx: &mut SyscallContext<'_>) -> Result<usize, Errno> {
         )
     } else {
         let mut data = zeroed_vec(len)?;
-        copy_from_user(ctx.args[1], &mut data).map_err(|e| e.as_errno())?;
+        {
+            #[cfg(feature = "performance-profile")]
+            let _profile = profiling::scope(profiling::Event::SysSendCopy).bytes(len);
+            copy_from_user(ctx.args[1], &mut data).map_err(|e| e.as_errno())?;
+        }
         send_socket_payload(&vfs_ctx, &fdt, fd, &data, addr.as_deref(), ctx.args[3])
     }
 }
@@ -1743,7 +1751,9 @@ fn recv_inet_stream_to_user(
                 if received != 0 {
                     chunk_flags |= vfs_socket::MSG_DONTWAIT;
                 }
-                vfs_socket::recv(
+                #[cfg(feature = "performance-profile")]
+                let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+                let result = vfs_socket::recv(
                     fdt,
                     fd,
                     data,
@@ -1751,8 +1761,12 @@ fn recv_inet_stream_to_user(
                     want_addr && received == 0,
                     chunk_flags,
                     None,
-                )
-                .map(|output| (output, data.len()))
+                );
+                #[cfg(feature = "performance-profile")]
+                if let Ok(output) = &result {
+                    profile.set_bytes(output.len);
+                }
+                result.map(|output| (output, data.len()))
             })
         };
         let (output, window_len) = match result {
@@ -1791,6 +1805,8 @@ fn send_socket_payload(
     addr: Option<&[u8]>,
     flags: usize,
 ) -> Result<usize, Errno> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::SysSendSocket).bytes(data.len());
     vfs_socket::send(vfs_ctx, fdt, fd, data, &[], addr, flags).map_err(|err| {
         if err == Errno::EPIPE && (flags & vfs_socket::MSG_NOSIGNAL) == 0 {
             deliver_sigpipe();
@@ -1807,8 +1823,17 @@ fn recv_socket_payload(
     want_addr: bool,
     ctx: &SyscallContext<'_>,
 ) -> Result<usize, Errno> {
-    let out = vfs_socket::recv(fdt, fd, data, 0, want_addr, ctx.args[3], None)?;
+    let out = {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::SysRecvSocket);
+        let out = vfs_socket::recv(fdt, fd, data, 0, want_addr, ctx.args[3], None)?;
+        #[cfg(feature = "performance-profile")]
+        profile.set_bytes(out.len);
+        out
+    };
     if out.len != 0 {
+        #[cfg(feature = "performance-profile")]
+        let _profile = profiling::scope(profiling::Event::SysRecvCopy).bytes(out.len);
         copy_to_user(user_buf, &data[..out.len]).map_err(|e| e.as_errno())?;
     }
     if want_addr {

@@ -32,6 +32,15 @@ fn main() -> ! {
     hal::user::register_vdso_tick_hook(vdso::update_on_timer_tick);
     // ── 调度子系统：建立 init 任务，准备后续派生 ─────────────────────────────
     let init = sched::boot_init();
+    #[cfg(feature = "performance-profile")]
+    {
+        profiling::install(
+            hal::time::stable_counter_raw,
+            ::sched::current_cpu_id,
+            hal::time::stable_counter_hz(),
+        );
+        profiling::set_enabled(true);
+    }
     // PnP 早于调度器接管的网络 queue 在这里统一创建固定 affinity worker。
     net_runtime::start_workers();
     // 注册 TTY 输入泵——控制字符不能依赖前台任务主动 read 终端，否则

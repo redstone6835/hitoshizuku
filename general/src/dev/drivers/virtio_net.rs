@@ -723,6 +723,8 @@ impl NetQueuePair for VirtioNetQueuePair {
     }
 
     fn reclaim_tx_batch(&mut self, out: &mut CompletionBatch) -> TxReclaimResult {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::NetVirtioReclaim);
         let used_index = self.tx.used_index();
         let mut completions = 0u16;
         let mut descriptors = 0u16;
@@ -754,6 +756,8 @@ impl NetQueuePair for VirtioNetQueuePair {
                 .unwrap_or_else(|_| unreachable!());
             completions += 1;
         }
+        #[cfg(feature = "performance-profile")]
+        profile.set_packets(usize::from(completions));
         TxReclaimResult {
             completions,
             descriptors,
@@ -767,6 +771,8 @@ impl NetQueuePair for VirtioNetQueuePair {
         batch: &mut TxBatch,
         header_pool: &mut NetBufPoolOwner,
     ) -> TxSubmitResult {
+        #[cfg(feature = "performance-profile")]
+        let mut profile = profiling::scope(profiling::Event::NetVirtioSubmit);
         if self.quiesced {
             return TxSubmitResult {
                 packets: 0,
@@ -876,6 +882,11 @@ impl NetQueuePair for VirtioNetQueuePair {
             self.tx.avail_dma.sync_for_device();
             self.transport
                 .notify_queue(self.tx.notify_addr, self.tx_queue_index());
+        }
+        #[cfg(feature = "performance-profile")]
+        {
+            profile.set_packets(usize::from(submitted));
+            profile.set_bytes(bytes as usize);
         }
         TxSubmitResult {
             packets: submitted,

@@ -63,6 +63,10 @@ const KERNEL_VERSION_INO: u64 = 22;
 const KERNEL_CMDLINE_INO: u64 = 23;
 const KERNEL_DEVICE_FUNCTIONS_INO: u64 = 24;
 const KERNEL_NET_STATS_INO: u64 = 25;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_STATS_INO: u64 = 26;
+#[cfg(feature = "performance-profile")]
+const KERNEL_PROFILE_CONTROL_INO: u64 = 27;
 const DEV_BLOCK_DIR_INO: u64 = 30;
 const DEV_CHAR_DIR_INO: u64 = 31;
 const FS_CGROUP_INO: u64 = 40;
@@ -1478,6 +1482,10 @@ enum SysRegFile {
     Cmdline,
     DeviceFunctions,
     NetStats,
+    #[cfg(feature = "performance-profile")]
+    ProfileStats,
+    #[cfg(feature = "performance-profile")]
+    ProfileControl,
     NetDev {
         iface_id: u32,
         slot: NetDevSlot,
@@ -1882,6 +1890,48 @@ fn render_net_stats() -> String {
     output
 }
 
+#[cfg(feature = "performance-profile")]
+fn render_profile_stats() -> String {
+    use alloc::fmt::Write;
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "enabled={} generation={} counter_hz={}",
+        u8::from(profiling::enabled()),
+        profiling::generation(),
+        profiling::counter_hz(),
+    );
+    for cpu in 0..profiling::MAX_CPUS {
+        for event in profiling::Event::ALL {
+            let value = profiling::snapshot(cpu, event);
+            if value.calls == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                output,
+                "cpu={} event={} calls={} cycles={} bytes={} packets={} max_cycles={}",
+                cpu,
+                event.name(),
+                value.calls,
+                value.cycles,
+                value.bytes,
+                value.packets,
+                value.max_cycles,
+            );
+        }
+    }
+    output
+}
+
+#[cfg(feature = "performance-profile")]
+fn render_profile_control() -> String {
+    format!(
+        "enabled={} generation={}\n",
+        u8::from(profiling::enabled()),
+        profiling::generation(),
+    )
+}
+
 fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
     match kind {
         SysRegFile::BlockDev { idx, slot } => render_block_dev_file(snap, idx, slot),
@@ -1909,6 +1959,10 @@ fn render_reg_file(snap: &SysSnapshot, kind: SysRegFile) -> String {
             out
         }
         SysRegFile::NetStats => render_net_stats(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileStats => render_profile_stats(),
+        #[cfg(feature = "performance-profile")]
+        SysRegFile::ProfileControl => render_profile_control(),
         SysRegFile::NetDev { iface_id, slot } => {
             if let Some(iface) = net::device::snapshot_devices()
                 .into_iter()
@@ -2064,7 +2118,23 @@ impl FileOps for SysRegFileOps {
         buf[..n].copy_from_slice(&bytes[off..off + n]);
         Ok(n)
     }
-    fn write_at(&self, _: &[u8], _: u64) -> VfsResult<usize> {
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        #[cfg(feature = "performance-profile")]
+        if matches!(self.kind, SysRegFile::ProfileControl) {
+            if _offset != 0 {
+                return Err(VfsError::InvalidArgument);
+            }
+            let command = core::str::from_utf8(_buf)
+                .map_err(|_| VfsError::InvalidArgument)?
+                .trim();
+            match command {
+                "0" | "disable" => profiling::set_enabled(false),
+                "1" | "enable" => profiling::set_enabled(true),
+                "reset" => profiling::reset(),
+                _ => return Err(VfsError::InvalidArgument),
+            }
+            return Ok(_buf.len());
+        }
         Err(VfsError::ReadOnlyFilesystem)
     }
     fn readdir(&self, _: u64, _: &mut dyn FnMut(DirEntry) -> ControlFlow<()>) -> VfsResult<u64> {
@@ -2100,12 +2170,20 @@ fn build_child_inode(
         kind,
         snap: Arc::clone(snap),
     });
+    #[cfg(feature = "performance-profile")]
+    let mode = if matches!(kind, SysRegFile::ProfileControl) {
+        0o644
+    } else {
+        0o444
+    };
+    #[cfg(not(feature = "performance-profile"))]
+    let mode = 0o444;
     Some(mk_inode(
         fs_id,
         weak_sb,
         ino,
         FileType::Regular,
-        0o444,
+        mode,
         1,
         ops,
     ))
@@ -2579,6 +2657,10 @@ impl SysDirInodeOps {
                     mk_reg(KERNEL_DEVICE_FUNCTIONS_INO, SysRegFile::DeviceFunctions)
                 }
                 "net_stats" => mk_reg(KERNEL_NET_STATS_INO, SysRegFile::NetStats),
+                #[cfg(feature = "performance-profile")]
+                "profile_stats" => mk_reg(KERNEL_PROFILE_STATS_INO, SysRegFile::ProfileStats),
+                #[cfg(feature = "performance-profile")]
+                "profile_control" => mk_reg(KERNEL_PROFILE_CONTROL_INO, SysRegFile::ProfileControl),
                 _ => Err(VfsError::NotFound),
             },
             SysDirKind::Fs => match name {
@@ -3161,6 +3243,14 @@ impl SysDirInodeOps {
                     FileType::Regular,
                 ),
                 mk_dir_entry(KERNEL_NET_STATS_INO, "net_stats", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(KERNEL_PROFILE_STATS_INO, "profile_stats", FileType::Regular),
+                #[cfg(feature = "performance-profile")]
+                mk_dir_entry(
+                    KERNEL_PROFILE_CONTROL_INO,
+                    "profile_control",
+                    FileType::Regular,
+                ),
             ],
             SysDirKind::Fs => vec![mk_dir_entry(FS_CGROUP_INO, "cgroup", FileType::Directory)],
             SysDirKind::FsCgroup => Vec::new(),

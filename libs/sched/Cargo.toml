@@ -10,10 +10,12 @@ bench = false
 
 [features]
 trace-task-lifecycle = []
+performance-profile = ["dep:profiling"]
 
 [dependencies]
 errno = { path = "../errno" }
 log = { path = "../log" }
+profiling = { path = "../profiling", optional = true }
 
 [dev-dependencies]
 ktest = { path = "../ktest" }

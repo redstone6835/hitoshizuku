@@ -711,6 +711,8 @@ fn is_local_ipv4(config: &ConfigSnapshot, interface: InterfaceId, address: Ipv4A
 }
 
 pub fn checksum_bytes(bytes: &[u8]) -> u16 {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::NetChecksum).bytes(bytes.len());
     let mut checksum = InternetChecksum::new();
     checksum.add(bytes);
     checksum.finish()
@@ -732,6 +734,8 @@ pub fn transport_checksum(
     destination: IpAddr,
     protocol: u8,
 ) -> Result<u16, NetBufPoolError> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::NetChecksum).bytes(len);
     let mut checksum = InternetChecksum::new();
     match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
@@ -772,6 +776,8 @@ fn checksum_packet(
     len: usize,
     prefix: &[&[u8]],
 ) -> Result<u16, NetBufPoolError> {
+    #[cfg(feature = "performance-profile")]
+    let _profile = profiling::scope(profiling::Event::NetChecksum).bytes(len);
     let mut checksum = InternetChecksum::new();
     for bytes in prefix {
         checksum.add(bytes);

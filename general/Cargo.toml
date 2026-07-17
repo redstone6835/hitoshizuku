@@ -11,6 +11,7 @@ bench = false
 [features]
 block-profile = []
 trace-syscall = []
+performance-profile = ["dep:profiling"]
 
 [dependencies]
 acpi = { path = "../libs/acpi", default-features = false }
@@ -22,6 +23,7 @@ fatfs = { path = "../libs/fatfs" }
 log = { path = "../libs/log" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
+profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 socket = { path = "../libs/socket" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }

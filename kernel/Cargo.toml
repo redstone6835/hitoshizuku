@@ -9,6 +9,12 @@ block-bench = ["general/block-profile"]
 allocator-bench = []
 embedded-initramfs = []
 trace-task-lifecycle = ["sched/trace-task-lifecycle"]
+performance-profile = [
+    "dep:profiling",
+    "general/performance-profile",
+    "net/performance-profile",
+    "sched/performance-profile",
+]
 allocator-tests = [
     "ktest/kernel",
     "allocator/ktest-kernel",
@@ -44,5 +50,6 @@ allocator ={ path = "../libs/allocator" }
 hal = { path = "../hal" }
 mm = { path = "../libs/mm" }
 net = { path = "../libs/net" }
+profiling = { path = "../libs/profiling", optional = true }
 sched = { path = "../libs/sched" }
 vfs = { path = "../libs/vfs" }

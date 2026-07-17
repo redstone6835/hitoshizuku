@@ -5,6 +5,7 @@ members = [
     "libs/ktest/ktest-mock",
     "libs/errno",
     "libs/log",
+    "libs/profiling",
     "libs/efi",
     "libs/elf",
     "libs/mm",

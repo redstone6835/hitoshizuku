@@ -8,7 +8,11 @@ test = true
 doctest = false
 bench = false
 
+[features]
+performance-profile = ["dep:profiling"]
+
 [dependencies]
 hashbrown = { version = "0.17.1", default-features = false }
+profiling = { path = "../profiling", optional = true }
 sched = { path = "../sched" }
 spin = { version = "0.9", default-features = false, features = ["spin_mutex", "rwlock"] }

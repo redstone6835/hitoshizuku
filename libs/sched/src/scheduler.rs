@@ -1303,6 +1303,8 @@ pub fn schedule_once(now_ns: u64) {
     if Arc::ptr_eq(&prev, &next) {
         return;
     }
+    #[cfg(feature = "performance-profile")]
+    profiling::record(profiling::Event::SchedSwitch, 0, 0, 1);
     prev.record_involuntary_context_switch();
     let final_prev = matches!(prev.state(), TaskState::Zombie | TaskState::Dead);
 
