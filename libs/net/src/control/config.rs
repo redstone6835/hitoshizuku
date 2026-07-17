@@ -483,6 +483,19 @@ impl ConfigStore {
         *current = next;
         Ok(())
     }
+
+    pub fn update(
+        &self,
+        build: impl FnOnce(&ConfigSnapshot) -> Result<ConfigSnapshot, ConfigError>,
+    ) -> Result<(), ConfigError> {
+        let mut current = self.current.write();
+        let next = Arc::new(build(&current)?);
+        if next.generation <= current.generation {
+            return Err(ConfigError::GenerationNotIncreasing);
+        }
+        *current = next;
+        Ok(())
+    }
 }
 
 fn validate_route(route: RouteEntry) -> Result<(), ConfigError> {
@@ -604,6 +617,18 @@ mod tests {
             store.publish(ConfigSnapshot::empty()),
             Err(ConfigError::GenerationNotIncreasing)
         );
+        store
+            .update(|current| {
+                ConfigSnapshot::new(
+                    current.generation + 1,
+                    current.interfaces.clone(),
+                    current.addresses.clone(),
+                    current.routes.entries().to_vec(),
+                    current.policy.clone(),
+                )
+            })
+            .unwrap();
+        assert_eq!(store.snapshot().generation, 1);
     }
 
     #[test]

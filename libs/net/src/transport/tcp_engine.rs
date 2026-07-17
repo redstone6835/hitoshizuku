@@ -613,6 +613,9 @@ impl TcpEndpointTable {
             ) {
                 break;
             }
+            if flow.retransmit.len() >= MAX_RETRANSMIT_SEGMENTS {
+                break;
+            }
             if flow.peer_window == 0 {
                 flow.deadlines
                     .persist
@@ -1485,6 +1488,7 @@ impl TcpEndpointTable {
         let ready = self.flows.get(id).is_some_and(|flow| {
             flow.close_requested
                 && flow.facade.stream_unsent_len() == 0
+                && flow.retransmit.len() < MAX_RETRANSMIT_SEGMENTS
                 && matches!(
                     flow.machine.state(),
                     TcpState::Established | TcpState::CloseWait
@@ -1531,27 +1535,29 @@ impl TcpEndpointTable {
         }
         let flow = self.flows.get_mut(id).unwrap();
         let payload_len = payload.as_ref().map_or(0, |payload| payload.len);
-        if track && flow.retransmit.len() < MAX_RETRANSMIT_SEGMENTS {
-            let sequence_len = u32::from(payload_len)
-                + transmit.flags.contains(TcpFlags::SYN) as u32
-                + transmit.flags.contains(TcpFlags::FIN) as u32;
-            if sequence_len != 0 {
-                flow.retransmit.push_back(SentSegment {
-                    sequence: transmit.sequence,
-                    end: transmit.sequence + sequence_len,
-                    stream_start: payload.as_ref().map(|payload| payload.start),
-                    payload_len,
-                    flags: transmit.flags,
-                    sent_ns: now_ns,
-                    first_sent_ns: now_ns,
-                    transmissions: 1,
-                    sacked: false,
-                });
-                flow.flight_bytes = flow.flight_bytes.saturating_add(sequence_len);
-                flow.deadlines
-                    .retransmit
-                    .get_or_insert(now_ns.saturating_add(flow.rtt.rto_ns));
-            }
+        let sequence_len = u32::from(payload_len)
+            + transmit.flags.contains(TcpFlags::SYN) as u32
+            + transmit.flags.contains(TcpFlags::FIN) as u32;
+        if track && sequence_len != 0 {
+            assert!(
+                flow.retransmit.len() < MAX_RETRANSMIT_SEGMENTS,
+                "可确认 TCP 段必须在推进状态前预留重传账本"
+            );
+            flow.retransmit.push_back(SentSegment {
+                sequence: transmit.sequence,
+                end: transmit.sequence + sequence_len,
+                stream_start: payload.as_ref().map(|payload| payload.start),
+                payload_len,
+                flags: transmit.flags,
+                sent_ns: now_ns,
+                first_sent_ns: now_ns,
+                transmissions: 1,
+                sacked: false,
+            });
+            flow.flight_bytes = flow.flight_bytes.saturating_add(sequence_len);
+            flow.deadlines
+                .retransmit
+                .get_or_insert(now_ns.saturating_add(flow.rtt.rto_ns));
         }
         let (options, options_len) = wire_options(flow, transmit.flags, now_ns);
         let advertised = advertised_window(&flow.facade, flow.local_window_scale);
@@ -2595,6 +2601,57 @@ mod tests {
         table.queue_ack(flow, 30_000);
         assert_eq!(table.output.len(), MAX_PENDING_OUTPUT + 1);
         assert_eq!(facade.take_pending_error(), None);
+    }
+
+    #[test]
+    fn retransmit_limit_stops_new_data_until_ack_frees_a_slot() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_013,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9_013,
+        };
+        let facade = facade(13);
+        facade.set_tcp_maxseg(536);
+        facade.set_tcp_nodelay(true);
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        {
+            let state = table.flows.get_mut(flow).unwrap();
+            state.peer_window = u32::MAX;
+            state.peer_window_scale = 4;
+            state.congestion.cwnd = u32::MAX;
+        }
+        let payload = alloc::vec![0x6b; 256 * 1024];
+        assert_eq!(facade.test_push_stream_tx(&payload), payload.len());
+
+        assert!(table.drain_send(flow, 20_000));
+        assert_eq!(table.flows.get(flow).unwrap().retransmit.len(), 256);
+        assert_eq!(table.output.len(), 256);
+        let unsent_before = facade.stream_unsent_len();
+        assert_ne!(unsent_before, 0);
+
+        let first = table.take_output().unwrap();
+        let first_len = u32::from(first.payload.as_ref().unwrap().len);
+        table
+            .process_segment(
+                flow,
+                packet(
+                    remote.port,
+                    local.port,
+                    501,
+                    (first.sequence + first_len).0,
+                    TcpFlags::ACK,
+                    0,
+                ),
+                Vec::new(),
+                30_000,
+            )
+            .unwrap();
+        assert_eq!(table.flows.get(flow).unwrap().retransmit.len(), 256);
+        assert!(facade.stream_unsent_len() < unsent_before);
     }
 
     #[test]
