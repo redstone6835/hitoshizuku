@@ -11,12 +11,15 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
+#[repr(align(64))]
+struct CacheLine<T>(T);
+
 /// 容量在创建时固定，满队列拒绝最新元素。
 pub struct BoundedMpsc<T> {
     slots: Box<[Slot<T>]>,
     mask: usize,
-    enqueue: AtomicUsize,
-    dequeue: AtomicUsize,
+    enqueue: CacheLine<AtomicUsize>,
+    dequeue: CacheLine<AtomicUsize>,
 }
 
 impl<T> BoundedMpsc<T> {
@@ -34,8 +37,8 @@ impl<T> BoundedMpsc<T> {
         Self {
             slots: slots.into_boxed_slice(),
             mask: capacity - 1,
-            enqueue: AtomicUsize::new(0),
-            dequeue: AtomicUsize::new(0),
+            enqueue: CacheLine(AtomicUsize::new(0)),
+            dequeue: CacheLine(AtomicUsize::new(0)),
         }
     }
 
@@ -49,19 +52,20 @@ impl<T> BoundedMpsc<T> {
 
     pub fn len(&self) -> usize {
         self.enqueue
+            .0
             .load(Ordering::Acquire)
-            .wrapping_sub(self.dequeue.load(Ordering::Acquire))
+            .wrapping_sub(self.dequeue.0.load(Ordering::Acquire))
             .min(self.capacity())
     }
 
     pub fn try_push(&self, value: T) -> Result<(), T> {
-        let mut position = self.enqueue.load(Ordering::Relaxed);
+        let mut position = self.enqueue.0.load(Ordering::Relaxed);
         loop {
             let slot = &self.slots[position & self.mask];
             let sequence = slot.sequence.load(Ordering::Acquire);
             let distance = sequence.wrapping_sub(position) as isize;
             if distance == 0 {
-                match self.enqueue.compare_exchange_weak(
+                match self.enqueue.0.compare_exchange_weak(
                     position,
                     position.wrapping_add(1),
                     Ordering::Relaxed,
@@ -79,20 +83,21 @@ impl<T> BoundedMpsc<T> {
             } else if distance < 0 {
                 return Err(value);
             } else {
-                position = self.enqueue.load(Ordering::Relaxed);
+                position = self.enqueue.0.load(Ordering::Relaxed);
             }
         }
     }
 
     /// 只能由队列的唯一消费者调用。
     pub fn try_pop(&self) -> Option<T> {
-        let position = self.dequeue.load(Ordering::Relaxed);
+        let position = self.dequeue.0.load(Ordering::Relaxed);
         let slot = &self.slots[position & self.mask];
         let sequence = slot.sequence.load(Ordering::Acquire);
         if sequence.wrapping_sub(position.wrapping_add(1)) as isize != 0 {
             return None;
         }
         self.dequeue
+            .0
             .store(position.wrapping_add(1), Ordering::Relaxed);
         // sequence 的 acquire 已确认生产者完成写入，且只有本消费者读取。
         let value = unsafe { (*slot.value.get()).assume_init_read() };

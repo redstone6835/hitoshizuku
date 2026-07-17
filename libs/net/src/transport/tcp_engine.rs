@@ -115,6 +115,60 @@ struct ReassemblyFragment {
     bytes: Vec<u8>,
 }
 
+enum IngressPayload<'a> {
+    #[cfg(test)]
+    Owned(Vec<u8>),
+    Packet {
+        chain: &'a PacketChain,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl IngressPayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            #[cfg(test)]
+            Self::Owned(bytes) => bytes.len(),
+            Self::Packet { len, .. } => *len,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn copy_to_socket(
+        &self,
+        facade: &SocketFacade,
+        payload_offset: usize,
+    ) -> Result<usize, SocketError> {
+        let len = self.len().saturating_sub(payload_offset);
+        match self {
+            #[cfg(test)]
+            Self::Owned(bytes) => facade.push_stream_rx(&bytes[payload_offset..]),
+            Self::Packet { chain, offset, .. } => {
+                facade.push_stream_rx_chain(chain, offset + payload_offset, len)
+            }
+        }
+    }
+
+    fn into_vec(self) -> Result<Vec<u8>, TcpIngressError> {
+        match self {
+            #[cfg(test)]
+            Self::Owned(bytes) => Ok(bytes),
+            Self::Packet { chain, offset, len } => {
+                let mut bytes = Vec::new();
+                bytes.resize(len, 0);
+                chain
+                    .copy_out(offset, &mut bytes)
+                    .map_err(|_| TcpIngressError::Malformed)?;
+                Ok(bytes)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TcpDeadlines {
     retransmit: Option<u64>,
@@ -258,6 +312,7 @@ struct TcpFlow {
     accept_group: Option<Arc<ListenGroup>>,
     accept_reserved: bool,
     retransmit: VecDeque<SentSegment>,
+    flight_bytes: u32,
     reassembly: Vec<ReassemblyFragment>,
     reassembly_bytes: usize,
     deadlines: TcpDeadlines,
@@ -283,11 +338,7 @@ struct TcpFlow {
 
 impl TcpFlow {
     fn flight_size(&self) -> u32 {
-        self.retransmit
-            .iter()
-            .filter(|segment| !segment.sacked)
-            .map(|segment| segment.end.distance_from(segment.sequence))
-            .sum()
+        self.flight_bytes
     }
 
     fn send_allowance(&self) -> u32 {
@@ -421,6 +472,7 @@ impl TcpEndpointTable {
             accept_group: None,
             accept_reserved: false,
             retransmit: VecDeque::new(),
+            flight_bytes: 0,
             reassembly: Vec::new(),
             reassembly_bytes: 0,
             deadlines: TcpDeadlines::new(),
@@ -485,17 +537,24 @@ impl TcpEndpointTable {
             None => return Err((TcpIngressError::NoEndpoint, chain, metadata)),
         };
 
-        let mut payload = Vec::new();
-        if tcp.payload_len != 0 {
-            payload.resize(tcp.payload_len as usize, 0);
-            if chain
-                .copy_out(usize::from(tcp.payload_offset), &mut payload)
-                .is_err()
-            {
-                return Err((TcpIngressError::Malformed, chain, metadata));
-            }
+        let payload_offset = usize::from(tcp.payload_offset);
+        let payload_len = tcp.payload_len as usize;
+        if payload_offset
+            .checked_add(payload_len)
+            .is_none_or(|end| end > chain.total_len())
+        {
+            return Err((TcpIngressError::Malformed, chain, metadata));
         }
-        let result = self.process_segment(id, tcp, payload, now_ns);
+        let result = self.process_segment_inner(
+            id,
+            tcp,
+            IngressPayload::Packet {
+                chain: &chain,
+                offset: payload_offset,
+                len: payload_len,
+            },
+            now_ns,
+        );
         match result {
             Ok(()) => {
                 self.stats.delivered = self.stats.delivered.saturating_add(1);
@@ -535,6 +594,7 @@ impl TcpEndpointTable {
             self.queue_ack(id, now_ns);
             queued = true;
         }
+        let mut unsent_hint = None;
         loop {
             let Some(flow) = self.flows.get_mut(id) else {
                 break;
@@ -551,7 +611,7 @@ impl TcpEndpointTable {
                     .get_or_insert(now_ns.saturating_add(flow.persist_ns));
                 break;
             }
-            let unsent = flow.facade.stream_unsent_len();
+            let unsent = unsent_hint.unwrap_or_else(|| flow.facade.stream_unsent_len());
             if (flow.facade.tcp_cork() || flow.facade.tcp_more())
                 && !flow.cork_force
                 && unsent < usize::from(flow.peer_mss)
@@ -574,6 +634,7 @@ impl TcpEndpointTable {
             let Some(payload) = flow.facade.take_stream_tx(allowance as usize) else {
                 break;
             };
+            unsent_hint = Some(unsent.saturating_sub(usize::from(payload.len)));
             let Some(sequence) = flow.machine.reserve_send(u32::from(payload.len)) else {
                 break;
             };
@@ -867,6 +928,7 @@ impl TcpEndpointTable {
             accept_group: Some(Arc::clone(&group)),
             accept_reserved: false,
             retransmit: VecDeque::new(),
+            flight_bytes: 0,
             reassembly: Vec::new(),
             reassembly_bytes: 0,
             deadlines: TcpDeadlines::new(),
@@ -913,11 +975,22 @@ impl TcpEndpointTable {
         Ok(id)
     }
 
+    #[cfg(test)]
     fn process_segment(
         &mut self,
         id: FlowId,
         tcp: TcpPacket,
         payload: Vec<u8>,
+        now_ns: u64,
+    ) -> Result<(), TcpIngressError> {
+        self.process_segment_inner(id, tcp, IngressPayload::Owned(payload), now_ns)
+    }
+
+    fn process_segment_inner(
+        &mut self,
+        id: FlowId,
+        tcp: TcpPacket,
+        payload: IngressPayload<'_>,
         now_ns: u64,
     ) -> Result<(), TcpIngressError> {
         let state_before = self
@@ -969,6 +1042,25 @@ impl TcpEndpointTable {
 
         let previous_una = self.flows.get(id).unwrap().machine.send_unacknowledged();
         let receive_before = self.flows.get(id).unwrap().machine.receive_next();
+        if !payload.is_empty()
+            && !tcp.flags.contains(TcpFlags::RST)
+            && matches!(
+                state_before,
+                TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+            )
+            && tcp.sequence.before_or_equal(receive_before)
+        {
+            let payload_start = tcp
+                .sequence
+                .before(receive_before)
+                .then(|| receive_before.distance_from(tcp.sequence) as usize)
+                .unwrap_or(0);
+            let accepted = payload.len().saturating_sub(payload_start);
+            if accepted > self.flows.get(id).unwrap().facade.stream_receive_window() {
+                self.queue_ack(id, now_ns);
+                return Ok(());
+            }
+        }
         let output = self
             .flows
             .get_mut(id)
@@ -1046,7 +1138,7 @@ impl TcpEndpointTable {
         id: FlowId,
         expected: TcpSequence,
         sequence: TcpSequence,
-        payload: Vec<u8>,
+        payload: IngressPayload<'_>,
         now_ns: u64,
     ) -> Result<(), TcpIngressError> {
         let payload_start = sequence
@@ -1054,13 +1146,13 @@ impl TcpEndpointTable {
             .then(|| expected.distance_from(sequence) as usize)
             .unwrap_or(0);
         if sequence.before_or_equal(expected) && payload_start < payload.len() {
-            let accepted = &payload[payload_start..];
+            let accepted = payload.len() - payload_start;
             let flow = self.flows.get_mut(id).unwrap();
-            flow.facade
-                .push_stream_rx(accepted)
+            payload
+                .copy_to_socket(&flow.facade, payload_start)
                 .map_err(|_| TcpIngressError::ReceiveBufferFull)?;
             if sequence.before(expected) {
-                flow.machine.advance_receive(accepted.len() as u32);
+                flow.machine.advance_receive(accepted as u32);
             }
             self.drain_reassembly(id)?;
             let flow = self.flows.get_mut(id).unwrap();
@@ -1068,14 +1160,16 @@ impl TcpEndpointTable {
             return Ok(());
         }
         if sequence.after(expected) {
+            let payload_len = payload.len();
             let flow = self.flows.get_mut(id).unwrap();
             if flow.reassembly.len() >= MAX_REASSEMBLY_FRAGMENTS
-                || flow.reassembly_bytes.saturating_add(payload.len()) > MAX_REASSEMBLY_BYTES
-                || payload.len() > flow.facade.stream_receive_window()
+                || flow.reassembly_bytes.saturating_add(payload_len) > MAX_REASSEMBLY_BYTES
+                || payload_len > flow.facade.stream_receive_window()
             {
                 self.queue_ack(id, now_ns);
                 return Ok(());
             }
+            let payload = payload.into_vec()?;
             if insert_reassembly(flow, expected, sequence, payload) {
                 self.stats.out_of_order = self.stats.out_of_order.saturating_add(1);
             }
@@ -1146,6 +1240,9 @@ impl TcpEndpointTable {
             }
             if acknowledgement.before(segment.end) {
                 let acknowledged = acknowledgement.distance_from(segment.sequence) as usize;
+                if !segment.sacked {
+                    flow.flight_bytes = flow.flight_bytes.saturating_sub(acknowledged as u32);
+                }
                 if segment.payload_len != 0 {
                     let payload_ack = acknowledged.min(usize::from(segment.payload_len));
                     acknowledged_payload += payload_ack;
@@ -1158,6 +1255,11 @@ impl TcpEndpointTable {
                 break;
             }
             let segment = flow.retransmit.pop_front().unwrap();
+            if !segment.sacked {
+                flow.flight_bytes = flow
+                    .flight_bytes
+                    .saturating_sub(segment.end.distance_from(segment.sequence));
+            }
             acknowledged_payload += usize::from(segment.payload_len);
             if segment.transmissions == 1 {
                 rtt_sample = Some(now_ns.saturating_sub(segment.sent_ns));
@@ -1387,6 +1489,7 @@ impl TcpEndpointTable {
                     transmissions: 1,
                     sacked: false,
                 });
+                flow.flight_bytes = flow.flight_bytes.saturating_add(sequence_len);
                 flow.deadlines
                     .retransmit
                     .get_or_insert(now_ns.saturating_add(flow.rtt.rto_ns));
@@ -1551,15 +1654,20 @@ fn ack_for(flow: &TcpFlow) -> TcpTransmit {
 }
 
 fn apply_sack(flow: &mut TcpFlow, blocks: &[Option<TcpSackBlock>; 4]) {
+    let mut newly_sacked = 0u32;
     for block in blocks.iter().flatten() {
         for segment in &mut flow.retransmit {
             if segment.sequence.after_or_equal(block.left)
                 && segment.end.before_or_equal(block.right)
+                && !segment.sacked
             {
                 segment.sacked = true;
+                newly_sacked =
+                    newly_sacked.saturating_add(segment.end.distance_from(segment.sequence));
             }
         }
     }
+    flow.flight_bytes = flow.flight_bytes.saturating_sub(newly_sacked);
 }
 
 fn wire_options(flow: &TcpFlow, flags: TcpFlags, now_ns: u64) -> ([u8; 40], u8) {
@@ -2318,6 +2426,7 @@ mod tests {
         assert!(table.drain_send(flow, 20_000));
         let data = table.take_output().unwrap();
         assert_eq!(data.payload.as_ref().unwrap().len, 11);
+        assert_eq!(table.flows.get(flow).unwrap().flight_size(), 11);
         table
             .process_segment(
                 flow,
@@ -2334,6 +2443,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(facade.test_stream_tx_len(), 0);
+        assert_eq!(table.flows.get(flow).unwrap().flight_size(), 0);
 
         table
             .process_segment(
@@ -2358,6 +2468,44 @@ mod tests {
             5
         );
         assert_eq!(&received[..5], b"reply");
+    }
+
+    #[test]
+    fn full_receive_ring_does_not_advance_sequence() {
+        let local = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 40_010,
+        };
+        let remote = Endpoint {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9010,
+        };
+        let facade = facade(30);
+        facade.set_buffer_limits(None, Some(16 * 1024));
+        let mut table = TcpEndpointTable::new([1; 40], [2; 16]);
+        let flow = establish_active(&mut table, &facade, local, remote);
+        assert_eq!(facade.push_stream_rx(&[0; 16 * 1024]), Ok(16 * 1024));
+        let receive_before = table.flows.get(flow).unwrap().machine.receive_next();
+        table
+            .process_segment(
+                flow,
+                packet(
+                    remote.port,
+                    local.port,
+                    receive_before.0,
+                    table.flows.get(flow).unwrap().machine.send_next().0,
+                    TcpFlags::ACK | TcpFlags::PSH,
+                    1,
+                ),
+                alloc::vec![1],
+                20_000,
+            )
+            .unwrap();
+        assert_eq!(
+            table.flows.get(flow).unwrap().machine.receive_next(),
+            receive_before
+        );
+        assert_eq!(table.take_output().unwrap().flags, TcpFlags::ACK);
     }
 
     #[test]

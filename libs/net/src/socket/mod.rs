@@ -14,6 +14,7 @@ use sched::{TaskState, WaitQueue};
 use spin::{Mutex, RwLock};
 
 use crate::IpAddr;
+use crate::buf::PacketChain;
 use crate::control::BindOptions;
 use crate::device::boot_config;
 use crate::{AddressFamily, Endpoint, FlowId, InterfaceId, ListenGroupId, ShardId, SocketId};
@@ -1752,6 +1753,43 @@ impl SocketFacade {
         Ok(copied)
     }
 
+    pub fn push_stream_rx_chain(
+        &self,
+        packet: &PacketChain,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize, SocketError> {
+        if self.kind != SocketKind::Stream {
+            return Err(SocketError::InvalidState);
+        }
+        if self.read_shutdown.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return Ok(len);
+        }
+        let was_empty;
+        {
+            let mut rx = self.stream_rx.lock();
+            if rx.bytes.available() < len {
+                return Err(SocketError::WouldBlock);
+            }
+            was_empty = rx.bytes.len == 0;
+            let mut copied = 0usize;
+            packet
+                .for_each_slice(offset, len, |payload| {
+                    copied += rx.bytes.push(payload);
+                    Ok::<_, ()>(())
+                })
+                .map_err(|_| SocketError::Buffer)?;
+            debug_assert_eq!(copied, len);
+        }
+        self.tcp_bytes_received
+            .fetch_add(len as u64, Ordering::Relaxed);
+        if was_empty && len != 0 {
+            self.set_ready(Readiness::READABLE);
+            self.read_wait.wake_one_default();
+        }
+        Ok(len)
+    }
+
     pub fn publish_stream_eof(&self) {
         self.stream_rx.lock().eof = true;
         self.set_ready(Readiness::READABLE | Readiness::READ_HANGUP);
@@ -2531,6 +2569,7 @@ fn error_code(error: SocketError) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buf::PacketFragment;
     use crate::{IpAddr, Ipv4Addr};
 
     fn facade() -> Arc<SocketFacade> {
@@ -2583,6 +2622,34 @@ mod tests {
             Err(SocketError::WouldBlock)
         );
         assert_eq!(facade.stream_rx.lock().bytes.len, 15 * 1024);
+    }
+
+    #[test]
+    fn stream_rx_copies_packet_chain_without_linearizing() {
+        let facade = Arc::new(SocketFacade::new(
+            SocketId {
+                boot_nonce: 7,
+                counter: 5,
+            },
+            AddressFamily::Ipv4,
+            SocketKind::Stream,
+        ));
+        let mut packet = PacketChain::from_owned(alloc::vec![0, 1, 2, 3]);
+        packet
+            .push(PacketFragment::Owned(
+                alloc::vec![4, 5, 6, 7].into_boxed_slice(),
+            ))
+            .unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(facade.push_stream_rx_chain(&packet, 2, 5), Ok(5));
+        let mut output = [0u8; 8];
+        assert_eq!(
+            facade
+                .recv_stream(&mut output, false, false, true, None)
+                .unwrap(),
+            5
+        );
+        assert_eq!(&output[..5], &[2, 3, 4, 5, 6]);
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub struct TimerWheel {
     now_ms: u64,
     heads: [[Option<u16>; SLOTS]; LEVELS],
     slot_deadlines: [[u64; SLOTS]; LEVELS],
+    level_deadlines: [u64; LEVELS],
     earliest_deadline_ms: Option<u64>,
     nodes: Vec<TimerNode>,
 }
@@ -52,6 +53,7 @@ impl TimerWheel {
             now_ms,
             heads: [[None; SLOTS]; LEVELS],
             slot_deadlines: [[u64::MAX; SLOTS]; LEVELS],
+            level_deadlines: [u64::MAX; LEVELS],
             earliest_deadline_ms: None,
             nodes,
         }
@@ -112,7 +114,11 @@ impl TimerWheel {
             let slot = (self.now_ms & 0xff) as usize;
             let mut current = self.heads[0][slot].take();
             let had_nodes = current.is_some();
+            let previous_deadline = self.slot_deadlines[0][slot];
             self.slot_deadlines[0][slot] = u64::MAX;
+            if self.level_deadlines[0] == previous_deadline {
+                self.refresh_level_deadline(0);
+            }
             while let Some(owner) = current {
                 let node = self.nodes[usize::from(owner)];
                 current = node.next;
@@ -162,6 +168,7 @@ impl TimerWheel {
         }
         self.heads[level][slot] = Some(owner);
         self.slot_deadlines[level][slot] = self.slot_deadlines[level][slot].min(deadline_ms);
+        self.level_deadlines[level] = self.level_deadlines[level].min(deadline_ms);
         self.earliest_deadline_ms = Some(
             self.earliest_deadline_ms
                 .map_or(deadline_ms, |earliest| earliest.min(deadline_ms)),
@@ -190,7 +197,11 @@ impl TimerWheel {
     fn cascade(&mut self, level: usize) {
         let slot = ((self.now_ms >> (level * 8)) & 0xff) as usize;
         let mut current = self.heads[level][slot].take();
+        let previous_deadline = self.slot_deadlines[level][slot];
         self.slot_deadlines[level][slot] = u64::MAX;
+        if self.level_deadlines[level] == previous_deadline {
+            self.refresh_level_deadline(level);
+        }
         while let Some(owner) = current {
             let node = self.nodes[usize::from(owner)];
             current = node.next;
@@ -201,6 +212,7 @@ impl TimerWheel {
     }
 
     fn refresh_slot_deadline(&mut self, level: usize, slot: usize) {
+        let previous_deadline = self.slot_deadlines[level][slot];
         let mut deadline = u64::MAX;
         let mut current = self.heads[level][slot];
         while let Some(owner) = current {
@@ -209,13 +221,23 @@ impl TimerWheel {
             current = node.next;
         }
         self.slot_deadlines[level][slot] = deadline;
+        if self.level_deadlines[level] == previous_deadline {
+            self.refresh_level_deadline(level);
+        }
+    }
+
+    fn refresh_level_deadline(&mut self, level: usize) {
+        self.level_deadlines[level] = self.slot_deadlines[level]
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(u64::MAX);
     }
 
     fn refresh_earliest(&mut self) {
         let deadline = self
-            .slot_deadlines
+            .level_deadlines
             .iter()
-            .flat_map(|level| level.iter())
             .copied()
             .min()
             .unwrap_or(u64::MAX);

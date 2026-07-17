@@ -844,6 +844,13 @@ pub fn shutdown(fdt: &FdTable, fd: Fd, how: usize) -> Result<(), Errno> {
     socket.shutdown(how).map_err(map_socket_error)
 }
 
+pub fn inet_socket_type(fdt: &FdTable, fd: Fd) -> Result<Option<usize>, Errno> {
+    let file = file_from_fd(fdt, fd)?;
+    Ok(file
+        .downcast_ops::<NetSocketFileOps>()
+        .map(|ops| usize::from(ops.sock_type())))
+}
+
 pub struct RecvOutput {
     pub len: usize,
     pub address: Option<Vec<u8>>,

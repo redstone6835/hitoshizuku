@@ -69,6 +69,9 @@ static PHYSICAL_UDP_POOL_CONSERVED: AtomicBool = AtomicBool::new(false);
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 static PHYSICAL_UDP_TX_SUBMITTED: AtomicBool = AtomicBool::new(false);
 
+#[repr(align(64))]
+struct CacheLine<T>(T);
+
 /// 请求一个真实设备发送固定 ARP probe。只供内核网络测试使用。
 #[cfg(any(feature = "kernel-tests", feature = "network-tests"))]
 pub fn request_arp_probe() {
@@ -917,11 +920,15 @@ impl ListenerRemove {
 struct EgressChannel {
     interface: InterfaceId,
     rings: [BoundedMpsc<EgressWork>; 4],
-    pending: AtomicBool,
-    active: AtomicBool,
-    pushers: AtomicUsize,
+    pending: CacheLine<AtomicBool>,
+    lifecycle: CacheLine<EgressLifecycle>,
     task: Spinlock<Option<Arc<sched::Task>>>,
     stats: Arc<QueueRuntimeStats>,
+}
+
+struct EgressLifecycle {
+    active: AtomicBool,
+    pushers: AtomicUsize,
 }
 
 impl EgressChannel {
@@ -929,9 +936,11 @@ impl EgressChannel {
         Self {
             interface,
             rings: core::array::from_fn(|_| BoundedMpsc::new(256)),
-            pending: AtomicBool::new(false),
-            active: AtomicBool::new(true),
-            pushers: AtomicUsize::new(0),
+            pending: CacheLine(AtomicBool::new(false)),
+            lifecycle: CacheLine(EgressLifecycle {
+                active: AtomicBool::new(true),
+                pushers: AtomicUsize::new(0),
+            }),
             task: Spinlock::new(None),
             stats,
         }
@@ -942,19 +951,19 @@ impl EgressChannel {
     }
 
     fn try_push(&self, work: EgressWork) -> Result<(), EgressWork> {
-        if !self.active.load(Ordering::Acquire) {
+        if !self.lifecycle.0.active.load(Ordering::Acquire) {
             return Err(work);
         }
-        self.pushers.fetch_add(1, Ordering::AcqRel);
-        if !self.active.load(Ordering::Acquire) {
-            self.pushers.fetch_sub(1, Ordering::AcqRel);
+        self.lifecycle.0.pushers.fetch_add(1, Ordering::Release);
+        if !self.lifecycle.0.active.load(Ordering::Acquire) {
+            self.lifecycle.0.pushers.fetch_sub(1, Ordering::Release);
             return Err(work);
         }
         let class = work.priority_class();
         let result = self.rings[class].try_push(work);
-        self.pushers.fetch_sub(1, Ordering::AcqRel);
+        self.lifecycle.0.pushers.fetch_sub(1, Ordering::Release);
         result?;
-        if !self.pending.swap(true, Ordering::AcqRel) {
+        if !self.pending.0.swap(true, Ordering::AcqRel) {
             if let Some(task) = self.task.lock().as_ref().cloned() {
                 let _ = sched::activate_task(&task);
             }
@@ -963,10 +972,10 @@ impl EgressChannel {
     }
 
     fn finish_drain(&self) -> bool {
-        self.pending.store(false, Ordering::Release);
+        self.pending.0.store(false, Ordering::Release);
         fence(Ordering::SeqCst);
         if self.rings.iter().any(|ring| !ring.is_empty()) {
-            self.pending.store(true, Ordering::Release);
+            self.pending.0.store(true, Ordering::Release);
             true
         } else {
             false
@@ -974,12 +983,12 @@ impl EgressChannel {
     }
 
     fn has_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire) || self.rings.iter().any(|ring| !ring.is_empty())
+        self.pending.0.load(Ordering::Acquire) || self.rings.iter().any(|ring| !ring.is_empty())
     }
 
     fn deactivate(&self) {
-        self.active.store(false, Ordering::Release);
-        while self.pushers.load(Ordering::Acquire) != 0 {
+        self.lifecycle.0.active.store(false, Ordering::Release);
+        while self.lifecycle.0.pushers.load(Ordering::Acquire) != 0 {
             let _ = sched::operation::sched_yield();
         }
         for ring in &self.rings {
@@ -987,7 +996,7 @@ impl EgressChannel {
                 fail_egress_work(work, SocketError::NetworkUnreachable);
             }
         }
-        self.pending.store(false, Ordering::Release);
+        self.pending.0.store(false, Ordering::Release);
     }
 
     fn try_pop_class(&self, class: usize) -> Option<EgressWork> {

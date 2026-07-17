@@ -808,11 +808,18 @@ impl InternetChecksum {
                 return;
             }
         }
-        let mut chunks = bytes.chunks_exact(2);
-        for chunk in &mut chunks {
+        let mut wide = bytes.chunks_exact(8);
+        for chunk in &mut wide {
+            self.sum += u64::from(u16::from_be_bytes([chunk[0], chunk[1]]))
+                + u64::from(u16::from_be_bytes([chunk[2], chunk[3]]))
+                + u64::from(u16::from_be_bytes([chunk[4], chunk[5]]))
+                + u64::from(u16::from_be_bytes([chunk[6], chunk[7]]));
+        }
+        let mut words = wide.remainder().chunks_exact(2);
+        for chunk in &mut words {
             self.sum += u64::from(u16::from_be_bytes([chunk[0], chunk[1]]));
         }
-        if let Some(&last) = chunks.remainder().first() {
+        if let Some(&last) = words.remainder().first() {
             self.odd = Some(last);
         }
     }
@@ -833,6 +840,42 @@ mod tests {
     use super::*;
     use alloc::boxed::Box;
     use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn reference_checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u64;
+        let mut words = bytes.chunks_exact(2);
+        for word in &mut words {
+            sum += u64::from(u16::from_be_bytes([word[0], word[1]]));
+        }
+        if let Some(&last) = words.remainder().first() {
+            sum += u64::from(u16::from_be_bytes([last, 0]));
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn checksum_unrolling_matches_reference_across_fragment_boundaries() {
+        let bytes = (0..257)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect::<Vec<_>>();
+        for len in 0..=bytes.len() {
+            assert_eq!(
+                checksum_bytes(&bytes[..len]),
+                reference_checksum(&bytes[..len])
+            );
+            for split in [0, 1, 2, 3, 7, 8, 9, len / 2, len] {
+                let split = split.min(len);
+                let mut checksum = InternetChecksum::new();
+                checksum.add(&bytes[..split]);
+                checksum.add(&bytes[split..len]);
+                assert_eq!(checksum.finish(), reference_checksum(&bytes[..len]));
+            }
+        }
+    }
     use core::ptr::NonNull;
 
     use crate::NetDeviceId;
